@@ -54,7 +54,7 @@ fn repl(allocator: std.mem.Allocator, vm: *VM) !void {
     while (true) {
         if (ln.linenoise("> ")) |bytes| {
             const line = std.mem.span(bytes);
-            vm.interpret(allocator, line) catch continue;
+            vm.interpret(allocator, line) catch {};
             _ = ln.linenoiseHistoryAdd(bytes);
             _ = ln.linenoiseHistorySave(history_path);
         } else {

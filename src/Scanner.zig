@@ -15,7 +15,7 @@ pub const Token = struct {
 
     // must be the same order as compiler.Parser.rules
     pub const Tag = enum {
-        // add %, ^, &, |, ~, <<, >>, %=, ^=, &=, |=, ~=, <<=, >>=?
+        // add ^, &, |, ~, <<, >>, %=, ^=, &=, |=, ~=, <<=, >>=?
         // add ' for char literals
         l_paren,
         r_paren,
@@ -45,18 +45,18 @@ pub const Token = struct {
         keyword_and,
         keyword_or,
         keyword_else,
-        // keyword_false,
-        // keyword_true,
-        keyword_for,
         keyword_if,
+        keyword_match,
         keyword_print,
         keyword_return,
         keyword_let,
-        keyword_while,
+        keyword_mut,
+        keyword_loop,
+        keyword_while, // TODO: remove?
+        keyword_for,
+        keyword_break,
+        keyword_continue,
         // keyword_nil,
-        // keyword_mut,
-        // keyword_define,
-        // keyword_const,
         identifier,
         string,
         number,
@@ -104,14 +104,17 @@ pub const Token = struct {
                 .keyword_and => "and",
                 .keyword_or => "or",
                 .keyword_else => "else",
-                // .keyword_false => "false",
-                // .keyword_true => "true",
-                .keyword_for => "for",
                 .keyword_if => "if",
+                .keyword_match => "match",
                 .keyword_print => "print",
                 .keyword_return => "return",
                 .keyword_let => "let",
+                .keyword_mut => "mut",
+                .keyword_loop => "loop",
                 .keyword_while => "while",
+                .keyword_for => "for",
+                .keyword_break => "break",
+                .keyword_continue => "continue",
             };
         }
     };
@@ -126,14 +129,17 @@ pub const Token = struct {
         .{ "and", .keyword_and },
         .{ "or", .keyword_or },
         .{ "else", .keyword_else },
-        // .{ "false", .keyword_false },
-        // .{ "true", .keyword_true },
-        .{ "for", .keyword_for },
         .{ "if", .keyword_if },
+        .{ "match", .keyword_match },
         .{ "print", .keyword_print },
         .{ "return", .keyword_return },
         .{ "let", .keyword_let },
+        .{ "mut", .keyword_mut },
+        .{ "loop", .keyword_loop },
         .{ "while", .keyword_while },
+        .{ "for", .keyword_for },
+        .{ "break", .keyword_break },
+        .{ "continue", .keyword_continue },
     });
 
     pub fn getKeyword(bytes: []const u8) ?Tag {

@@ -91,15 +91,7 @@ pub const VM = struct {
                 .equal => {
                     const b = try self.pop();
                     const a = try self.pop();
-                    if (std.meta.activeTag(a) != std.meta.activeTag(b)) {
-                        try self.push(.{ .bool = false });
-                    } else {
-                        try self.push(.{ .bool = switch (a) {
-                            .number => a.number == b.number,
-                            .bool => a.bool == b.bool,
-                            .string => std.mem.eql(u8, a.string, b.string),
-                        } });
-                    }
+                    try self.push(.{ .bool = a.eql(b) });
                 },
                 .greater => {
                     const b = (try self.pop()).number;
@@ -111,11 +103,6 @@ pub const VM = struct {
                     const a = (try self.pop()).number;
                     try self.push(.{ .bool = a < b });
                 },
-                .@"or" => {
-                    const b = (try self.pop()).bool;
-                    const a = (try self.pop()).bool;
-                    try self.push(.{ .bool = a or b });
-                },
                 .add => {
                     const b = try self.pop();
                     const a = try self.pop();
@@ -124,6 +111,7 @@ pub const VM = struct {
                     } else if (a == .string and b == .string) {
                         const len = a.string.len + b.string.len;
                         const buf = try self.arena.allocator().alloc(u8, len);
+                        errdefer self.arena.allocator().free(buf);
                         @memcpy(buf[0..a.string.len], a.string);
                         @memcpy(buf[a.string.len..], b.string);
                         try self.push(.{ .string = buf });
@@ -148,6 +136,7 @@ pub const VM = struct {
                         else
                             .{ @intFromFloat(b.number), a.string };
                         const buf = try self.arena.allocator().alloc(u8, s.len * n);
+                        errdefer self.arena.allocator().free(buf);
                         for (0..n) |i| {
                             @memcpy(buf[i * s.len .. (i + 1) * s.len], s);
                         }
@@ -182,6 +171,17 @@ pub const VM = struct {
                 .pop => {
                     _ = try self.pop();
                 },
+                .get_local => {
+                    const slot = self.chunk.code.items[self.idx];
+                    self.idx += 1;
+                    try self.push(self.stack.get(slot));
+                },
+                // TODO: handle string for get/set local
+                .set_local => {
+                    const slot = self.chunk.code.items[self.idx];
+                    self.idx += 1;
+                    self.stack.set(slot, self.peek(0));
+                },
                 .get_global => {
                     const name = self.readConstant().string;
                     if (self.globals.get(name)) |value| {
@@ -201,7 +201,7 @@ pub const VM = struct {
                         },
                         .number, .bool => raw_new_value,
                     };
-                    errdefer self.allocator.free(new_value.string);
+                    errdefer if (new_value == .string) self.allocator.free(new_value.string);
 
                     if (try self.globals.fetchPut(self.allocator, name, new_value)) |old_kv| {
                         const old_value = old_kv.value;
@@ -241,9 +241,39 @@ pub const VM = struct {
                         }
                     }
                 },
+                // TODO: move to stdlib -> when import and call are implemented
                 .print => {
                     const stdout = std.io.getStdOut().writer();
                     stdout.print("{}\n", .{try self.pop()}) catch {};
+                },
+                .jump => {
+                    const offset = std.mem.readInt(
+                        u16,
+                        @ptrCast(self.chunk.code.items[self.idx .. self.idx + @sizeOf(u16)]),
+                        .big,
+                    );
+                    self.idx += @sizeOf(u16);
+                    self.idx += offset;
+                },
+                .jump_if_false => {
+                    const offset = std.mem.readInt(
+                        u16,
+                        @ptrCast(self.chunk.code.items[self.idx .. self.idx + @sizeOf(u16)]),
+                        .big,
+                    );
+                    self.idx += @sizeOf(u16);
+                    if (!self.peek(0).bool) {
+                        self.idx += offset;
+                    }
+                },
+                .loop => {
+                    const offset = std.mem.readInt(
+                        u16,
+                        @ptrCast(self.chunk.code.items[self.idx .. self.idx + @sizeOf(u16)]),
+                        .big,
+                    );
+                    self.idx += @sizeOf(u16);
+                    self.idx -= offset;
                 },
                 .@"return" => {
                     return;

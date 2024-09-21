@@ -15,7 +15,6 @@ pub const OpCode = enum(u8) {
     equal,
     greater,
     less,
-    @"or",
     add,
     sub,
     mul,
@@ -24,10 +23,15 @@ pub const OpCode = enum(u8) {
     not,
     negation,
     pop,
+    get_local,
+    set_local,
     get_global,
     set_global,
     define_global,
     print,
+    jump,
+    jump_if_false,
+    loop,
     @"return",
 };
 
