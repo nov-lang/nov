@@ -108,7 +108,7 @@ pub const Parser = struct {
         equality, // == !=
         comparison, // < > <= >=
         term, // + -
-        factor, // * /
+        factor, // * / %
         unary, // ! -
         call, // . ()
         primary,
@@ -134,7 +134,6 @@ pub const Parser = struct {
         .{ .precedence = .factor, .prefix = null, .infix = binary }, // asterisk
         .{ .precedence = .factor, .prefix = null, .infix = binary }, // slash
         .{ .precedence = .factor, .prefix = null, .infix = binary }, // percent
-                       //.unary?
         .{ .precedence = .none, .prefix = unary, .infix = null }, // bang
         .{ .precedence = .equality, .prefix = null, .infix = binary }, // bang_equal
         .{ .precedence = .assignment, .prefix = null, .infix = null }, // equal
@@ -192,11 +191,12 @@ pub const Parser = struct {
             if (self.current.tag != .invalid) {
                 break;
             }
-            self.errorAtCurrent(self.current.literal.?.string);
+            self.errorAtCurrent("{s}", .{self.current.literal.?.string});
         }
     }
 
     fn expression(self: *Parser) void {
+        // TODO: don't allow assignment everywhere
         self.parsePrecedence(.assignment);
     }
 
@@ -213,15 +213,47 @@ pub const Parser = struct {
     }
 
     fn letDeclaration(self: *Parser) void {
+        const is_mut = self.match(.keyword_mut);
+        _ = is_mut; // TODO
         const global = self.parseVariable("Expect variable name");
-        // TODO: check type and infer type if there is none
-        if (self.match(.colon)) {
-            self.consume(.identifier, "Expect type after ':'"); // TODO
-        }
+        const tag = blk: {
+            if (!self.match(.colon)) {
+                break :blk null;
+            }
+            self.consume(.identifier, "Expect type after ':'");
+            const type_name = self.previous.literal.?.string;
+            // TODO: support custom types
+            if (std.mem.eql(u8, type_name, "number")) {
+                break :blk Token.Tag.number;
+            } else if (std.mem.eql(u8, type_name, "bool")) {
+                break :blk Token.Tag.bool;
+            } else if (std.mem.eql(u8, type_name, "string")) {
+                break :blk Token.Tag.string;
+            } else {
+                self.errorAtPrevious("Invalid type", .{});
+                break :blk null;
+            }
+        };
         if (self.match(.equal)) {
             self.expression();
+            if (tag != null and self.previous.tag != tag.?) {
+                self.errorAtPrevious("Type mismatch: expected '{s}' got '{s}'", .{
+                    @tagName(tag.?),
+                    @tagName(self.previous.tag),
+                });
+            }
         } else {
-            // self.emitByte(@intFromEnum(Chunk.OpCode.nil));
+            if (tag) |t| {
+                switch (t) {
+                    .number => self.emitConstant(.{ .number = undefined }),
+                    .bool => self.emitConstant(.{ .bool = undefined }),
+                    .string => self.emitConstant(.{ .string = undefined }),
+                    else => unreachable,
+                }
+            } else  {
+                self.errorAtPrevious("Expect type or '=' after variable name", .{});
+            }
+            // self.emitByte(@intFromEnum(Chunk.OpCode.void));
         }
         // self.consume(.semicolon, "Expect ';' after value");
         self.defineVariable(global);
@@ -260,7 +292,7 @@ pub const Parser = struct {
             //     break;
             // }
             if (eqlIdentifier(name, local.name)) {
-                self.errorAtPrevious("Variable with this name already declared in this scope");
+                self.errorAtPrevious("Variable with name '{s}' already declared in this scope", .{name.literal.?.string},);
             }
         }
         addLocal(name);
@@ -348,7 +380,7 @@ pub const Parser = struct {
         // -2 to adjust for the bytecode for the jump offset itself.
         const jump = self.chunk.code.items.len - offset - 2;
         if (jump > std.math.maxInt(u16)) {
-            self.errorAtPrevious("Too much code to jump over");
+            self.errorAtPrevious("Too much code to jump over", .{});
         }
         self.chunk.code.items[offset] = @truncate(jump >> 8);
         self.chunk.code.items[offset + 1] = @truncate(jump);
@@ -385,7 +417,7 @@ pub const Parser = struct {
         self.emitByte(@intFromEnum(Chunk.OpCode.loop));
         const offset = self.chunk.code.items.len - loop_start + 2;
         if (offset > std.math.maxInt(u16)) {
-            self.errorAtPrevious("Loop body too large");
+            self.errorAtPrevious("Loop body too large", .{});
         }
         self.emitByte(@truncate(offset >> 8));
         self.emitByte(@truncate(offset));
@@ -394,7 +426,7 @@ pub const Parser = struct {
     fn parsePrecedence(self: *Parser, precedence: Precedence) void {
         self.advance();
         const prefixRule = getRule(self.previous.tag).prefix orelse {
-            self.errorAtPrevious("Expect expression");
+            self.errorAtPrevious("Expect expression", .{});
             return;
         };
         const can_assign = @intFromEnum(precedence) <= @intFromEnum(Precedence.assignment);
@@ -406,7 +438,7 @@ pub const Parser = struct {
         }
 
         if (can_assign and self.match(.equal)) {
-            self.errorAtPrevious("Invalid assignment target");
+            self.errorAtPrevious("Invalid assignment target", .{});
         }
     }
 
@@ -415,7 +447,7 @@ pub const Parser = struct {
             self.advance();
             return;
         }
-        self.errorAtCurrent(message);
+        self.errorAtCurrent("{s}", .{message});
     }
 
     fn emitByte(self: *Parser, byte: u8) void {
@@ -430,7 +462,7 @@ pub const Parser = struct {
     fn makeConstant(self: *Parser, value: Value) u8 {
         const constant = self.chunk.addConstant(value) catch unreachable;
         if (constant > std.math.maxInt(u8)) {
-            self.errorAtPrevious("Too many constants in one chunk");
+            self.errorAtPrevious("Too many constants in one chunk", .{});
             return 0;
         }
         return @intCast(constant);
@@ -453,15 +485,15 @@ pub const Parser = struct {
         self.emitConstant(.{ .string = value }); // TODO: could be invalid pointer later
     }
 
-    fn errorAtCurrent(self: *Parser, message: []const u8) void {
-        self.errorAt(&self.current, message);
+    fn errorAtCurrent(self: *Parser, comptime fmt: []const u8, args: anytype) void {
+        self.errorAt(&self.current, fmt, args);
     }
 
-    fn errorAtPrevious(self: *Parser, message: []const u8) void {
-        self.errorAt(&self.previous, message);
+    fn errorAtPrevious(self: *Parser, comptime fmt: []const u8, args: anytype) void {
+        self.errorAt(&self.previous, fmt, args);
     }
 
-    fn errorAt(self: *Parser, token: *const Token, message: []const u8) void {
+    fn errorAt(self: *Parser, token: *const Token, comptime fmt: []const u8, args: anytype) void {
         if (self.panic_mode) {
             return;
         }
@@ -476,7 +508,7 @@ pub const Parser = struct {
         //     debug.print(" at '{}'", .{token.tag.lexeme() orelse ""});
         // }
 
-        debug.print(": {s}\n", .{message});
+        debug.print(": " ++ fmt ++ "\n", args);
         self.had_error = true;
     }
 
@@ -490,9 +522,13 @@ pub const Parser = struct {
 
             switch (self.current.tag) {
                 .keyword_let,
-                .keyword_for,
                 .keyword_if,
+                .keyword_match,
+                .keyword_loop,
                 .keyword_while,
+                .keyword_for,
+                .keyword_break,
+                .keyword_continue,
                 .keyword_print,
                 .keyword_return,
                 => return,

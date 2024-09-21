@@ -5,22 +5,22 @@ const Value = @import("value.zig").Value;
 const compiler = @import("compiler.zig");
 const debug = @import("debug.zig");
 
-pub const Error = std.mem.Allocator.Error || error{ CompileError, RuntimeError };
+pub const Error = error{ CompileError, RuntimeError, StackOverflow } || std.mem.Allocator.Error;
 
 pub const VM = struct {
     chunk: *Chunk,
-    idx: usize, // instruction pointer
-    stack: std.BoundedArray(Value, stack_max), // make the stack dynamic?
+    ip: usize, // instruction pointer
+    stack: std.BoundedArray(Value, stack_size), // make the stack dynamic?
     arena: std.heap.ArenaAllocator, // TODO: remove
     globals: std.StringHashMapUnmanaged(Value),
     allocator: std.mem.Allocator,
 
-    const stack_max = 256;
+    const stack_size = 16 * 1024;
 
     pub fn init(allocator: std.mem.Allocator) VM {
         return .{
             .chunk = undefined,
-            .idx = 0,
+            .ip = 0,
             .stack = .{},
             .globals = .{},
             .allocator = allocator,
@@ -49,7 +49,7 @@ pub const VM = struct {
             return error.CompileError;
         }
         self.chunk = &chunk;
-        self.idx = 0;
+        self.ip = 0;
         try self.run();
     }
 
@@ -66,8 +66,8 @@ pub const VM = struct {
     }
 
     inline fn readConstant(self: *VM) Value {
-        const value = self.chunk.constants.items[self.chunk.code.items[self.idx]];
-        self.idx += 1;
+        const value = self.chunk.constants.items[self.chunk.code.items[self.ip]];
+        self.ip += 1;
         return value;
     }
 
@@ -80,10 +80,10 @@ pub const VM = struct {
                     debug.print("[ {} ]", .{value});
                 }
                 debug.print("\n", .{});
-                _ = debug.disassembleInstruction(self.chunk, self.idx);
+                _ = debug.disassembleInstruction(self.chunk, self.ip);
             }
-            const instruction: Chunk.OpCode = @enumFromInt(self.chunk.code.items[self.idx]);
-            self.idx += 1;
+            const instruction: Chunk.OpCode = @enumFromInt(self.chunk.code.items[self.ip]);
+            self.ip += 1;
             switch (instruction) {
                 .constant => {
                     try self.push(self.readConstant());
@@ -116,8 +116,7 @@ pub const VM = struct {
                         @memcpy(buf[a.string.len..], b.string);
                         try self.push(.{ .string = buf });
                     } else {
-                        self.runtimeError("Operands must be two numbers or two strings", .{});
-                        return error.RuntimeError;
+                        return self.runtimeError("Operands must be two numbers or two strings", .{});
                     }
                 },
                 .sub => {
@@ -142,8 +141,7 @@ pub const VM = struct {
                         }
                         try self.push(.{ .string = buf });
                     } else {
-                        self.runtimeError("Operands must be two numbers or a number and a string", .{});
-                        return error.RuntimeError;
+                        return self.runtimeError("Operands must be two numbers or a number and a string", .{});
                     }
                 },
                 .div => {
@@ -163,8 +161,7 @@ pub const VM = struct {
                 .negation => {
                     const value = (try self.pop()).number;
                     // if (value != .number) {
-                    //     self.runtimeError("Operand must be a number", .{});
-                    //     return error.RuntimeError;
+                    //     return self.runtimeError("Operand must be a number", .{});
                     // }
                     try self.push(.{ .number = -value });
                 },
@@ -172,14 +169,14 @@ pub const VM = struct {
                     _ = try self.pop();
                 },
                 .get_local => {
-                    const slot = self.chunk.code.items[self.idx];
-                    self.idx += 1;
+                    const slot = self.chunk.code.items[self.ip];
+                    self.ip += 1;
                     try self.push(self.stack.get(slot));
                 },
                 // TODO: handle string for get/set local
                 .set_local => {
-                    const slot = self.chunk.code.items[self.idx];
-                    self.idx += 1;
+                    const slot = self.chunk.code.items[self.ip];
+                    self.ip += 1;
                     self.stack.set(slot, self.peek(0));
                 },
                 .get_global => {
@@ -187,8 +184,7 @@ pub const VM = struct {
                     if (self.globals.get(name)) |value| {
                         try self.push(value);
                     } else {
-                        self.runtimeError("Undefined variable '{s}'", .{name});
-                        return error.RuntimeError;
+                        return self.runtimeError("Undefined variable '{s}'", .{name});
                     }
                 },
                 .set_global => {
@@ -207,11 +203,10 @@ pub const VM = struct {
                         const old_value = old_kv.value;
                         if (std.meta.activeTag(new_value) != std.meta.activeTag(old_value)) {
                             self.globals.put(self.allocator, name, old_value) catch {};
-                            self.runtimeError(
+                            return self.runtimeError(
                                 "Cannot assign a value of type '{s}' to a variable of type '{s}'",
                                 .{ @tagName(new_value), @tagName(old_value) },
                             );
-                            return error.RuntimeError;
                         }
                         switch (old_value) {
                             .string => self.allocator.free(old_value.string),
@@ -219,8 +214,7 @@ pub const VM = struct {
                         }
                     } else {
                         std.debug.assert(self.globals.remove(name) == true);
-                        self.runtimeError("Undefined variable '{s}'", .{name});
-                        return error.RuntimeError;
+                        return self.runtimeError("Undefined variable '{s}'", .{name});
                     }
                 },
                 .define_global => {
@@ -228,8 +222,7 @@ pub const VM = struct {
                     errdefer self.allocator.free(name);
                     const gop = try self.globals.getOrPut(self.allocator, name);
                     if (gop.found_existing) {
-                        self.runtimeError("Variable '{s}' already defined", .{name});
-                        return error.RuntimeError;
+                        return self.runtimeError("Variable '{s}' already defined", .{name});
                     } else {
                         const value = try self.pop();
                         switch (value) {
@@ -249,31 +242,31 @@ pub const VM = struct {
                 .jump => {
                     const offset = std.mem.readInt(
                         u16,
-                        @ptrCast(self.chunk.code.items[self.idx .. self.idx + @sizeOf(u16)]),
+                        @ptrCast(self.chunk.code.items[self.ip .. self.ip + @sizeOf(u16)]),
                         .big,
                     );
-                    self.idx += @sizeOf(u16);
-                    self.idx += offset;
+                    self.ip += @sizeOf(u16);
+                    self.ip += offset;
                 },
                 .jump_if_false => {
                     const offset = std.mem.readInt(
                         u16,
-                        @ptrCast(self.chunk.code.items[self.idx .. self.idx + @sizeOf(u16)]),
+                        @ptrCast(self.chunk.code.items[self.ip .. self.ip + @sizeOf(u16)]),
                         .big,
                     );
-                    self.idx += @sizeOf(u16);
+                    self.ip += @sizeOf(u16);
                     if (!self.peek(0).bool) {
-                        self.idx += offset;
+                        self.ip += offset;
                     }
                 },
                 .loop => {
                     const offset = std.mem.readInt(
                         u16,
-                        @ptrCast(self.chunk.code.items[self.idx .. self.idx + @sizeOf(u16)]),
+                        @ptrCast(self.chunk.code.items[self.ip .. self.ip + @sizeOf(u16)]),
                         .big,
                     );
-                    self.idx += @sizeOf(u16);
-                    self.idx -= offset;
+                    self.ip += @sizeOf(u16);
+                    self.ip -= offset;
                 },
                 .@"return" => {
                     return;
@@ -282,11 +275,12 @@ pub const VM = struct {
         }
     }
 
-    fn runtimeError(self: *VM, comptime fmt: []const u8, args: anytype) void {
+    fn runtimeError(self: *VM, comptime fmt: []const u8, args: anytype) Error {
         const stderr = std.io.getStdErr().writer();
         stderr.print("Runtime Error: " ++ fmt ++ "\n", args) catch {};
-        const line = self.chunk.lines.items[self.idx - 1];
+        const line = self.chunk.lines.items[self.ip - 1];
         stderr.print("[line {d}] in script\n", .{line}) catch {};
         self.stack.resize(0) catch unreachable;
+        return error.RuntimeError;
     }
 };

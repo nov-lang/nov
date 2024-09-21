@@ -2,3 +2,7 @@ https://craftinginterpreters.com/chunks-of-bytecode.html#challenges
 https://craftinginterpreters.com/global-variables.html#challenges
 https://craftinginterpreters.com/local-variables.html#challenges
 match, break, continue: https://craftinginterpreters.com/jumping-back-and-forth.html#challenges
+
+grammar https://craftinginterpreters.com/appendix-i.html
+
+add opt to output bytecode and to run bytecode instead of interpreting
