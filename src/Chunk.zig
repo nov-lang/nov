@@ -20,8 +20,14 @@ pub const OpCode = enum(u8) {
     sub,
     mul,
     div,
+    mod,
     not,
     negation,
+    pop,
+    get_global,
+    set_global,
+    define_global,
+    print,
     @"return",
 };
 

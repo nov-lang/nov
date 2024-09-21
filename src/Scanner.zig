@@ -23,10 +23,12 @@ pub const Token = struct {
         r_brace,
         comma,
         period,
+        colon,
         minus,
         plus,
-        slash,
         asterisk,
+        slash,
+        percent,
         bang,
         bang_equal,
         equal,
@@ -39,6 +41,7 @@ pub const Token = struct {
         minus_equal,
         asterisk_equal,
         slash_equal,
+        percent_equal,
         keyword_and,
         keyword_or,
         keyword_else,
@@ -79,10 +82,12 @@ pub const Token = struct {
                 .r_brace => "}",
                 .comma => ",",
                 .period => ".",
+                .colon => ":",
                 .minus => "-",
                 .plus => "+",
-                .slash => "/",
                 .asterisk => "*",
+                .slash => "/",
+                .percent => "%",
                 .bang => "!",
                 .bang_equal => "!=",
                 .equal => "=",
@@ -95,6 +100,7 @@ pub const Token = struct {
                 .minus_equal => "-=",
                 .asterisk_equal => "*=",
                 .slash_equal => "/=",
+                .percent_equal => "%=",
                 .keyword_and => "and",
                 .keyword_or => "or",
                 .keyword_else => "else",
@@ -111,7 +117,6 @@ pub const Token = struct {
     };
 
     pub const Literal = union {
-        identifier: []const u8,
         string: []const u8,
         number: f64,
         bool: bool,
@@ -147,8 +152,7 @@ pub const Token = struct {
         try writer.print("{d}:{d}: {}: ", .{ self.line, self.col, self.tag });
         if (self.literal) |literal| {
             switch (self.tag) {
-                .identifier => try writer.writeAll(literal.identifier),
-                .string => try writer.writeAll(literal.string),
+                .string, .identifier => try writer.writeAll(literal.string),
                 .number => try writer.print("{d}", .{literal.number}),
                 .bool => try writer.print("{}", .{literal.bool}),
                 else => unreachable,
@@ -204,10 +208,12 @@ pub fn next(self: *Scanner) Token {
             '}' => return self.token(.r_brace),
             ',' => return self.token(.comma),
             '.' => return self.token(.period),
+            ':' => return self.token(.colon),
             '-' => return self.tokenWithEqual(.minus),
             '+' => return self.tokenWithEqual(.plus),
-            '/' => return self.tokenWithEqual(.slash),
             '*' => return self.tokenWithEqual(.asterisk),
+            '/' => return self.tokenWithEqual(.slash),
+            '%' => return self.tokenWithEqual(.percent),
             '!' => return self.tokenWithEqual(.bang),
             '=' => return self.tokenWithEqual(.equal),
             '<' => return self.tokenWithEqual(.l_angle_bracket),
@@ -356,7 +362,7 @@ fn identifier(self: *Scanner) Token {
     const tag = Token.getKeyword(bytes) orelse .identifier;
     return .{
         .tag = tag,
-        .literal = if (tag == .identifier) .{ .identifier = bytes } else null,
+        .literal = if (tag == .identifier) .{ .string = bytes } else null,
         .line = self.line,
         .col = col,
     };

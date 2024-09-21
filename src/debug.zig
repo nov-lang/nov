@@ -30,8 +30,14 @@ pub fn disassembleInstruction(chunk: *const Chunk, offset: usize) usize {
         @intFromEnum(Chunk.OpCode.sub) => return simpleInstruction("OP_SUBTRACT", offset),
         @intFromEnum(Chunk.OpCode.mul) => return simpleInstruction("OP_MULTIPLY", offset),
         @intFromEnum(Chunk.OpCode.div) => return simpleInstruction("OP_DIVIDE", offset),
+        @intFromEnum(Chunk.OpCode.mod) => return simpleInstruction("OP_MODULO", offset),
         @intFromEnum(Chunk.OpCode.not) => return simpleInstruction("OP_NOT", offset),
         @intFromEnum(Chunk.OpCode.negation) => return simpleInstruction("OP_NEGATE", offset),
+        @intFromEnum(Chunk.OpCode.pop) => return simpleInstruction("OP_POP", offset),
+        @intFromEnum(Chunk.OpCode.get_global) => return constantInstruction("OP_GET_GLOBAL", chunk, offset),
+        @intFromEnum(Chunk.OpCode.set_global) => return constantInstruction("OP_SET_GLOBAL", chunk, offset),
+        @intFromEnum(Chunk.OpCode.define_global) => return constantInstruction("OP_DEFINE_GLOBAL", chunk, offset),
+        @intFromEnum(Chunk.OpCode.print) => return simpleInstruction("OP_PRINT", offset),
         @intFromEnum(Chunk.OpCode.@"return") => return simpleInstruction("OP_RETURN", offset),
         else => {
             print("Unknown opcode: {}\n", .{op});

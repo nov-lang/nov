@@ -12,6 +12,8 @@ pub const VM = struct {
     idx: usize, // instruction pointer
     stack: std.BoundedArray(Value, stack_max), // make the stack dynamic?
     arena: std.heap.ArenaAllocator, // TODO: remove
+    globals: std.StringHashMapUnmanaged(Value),
+    allocator: std.mem.Allocator,
 
     const stack_max = 256;
 
@@ -20,12 +22,24 @@ pub const VM = struct {
             .chunk = undefined,
             .idx = 0,
             .stack = .{},
+            .globals = .{},
+            .allocator = allocator,
             .arena = std.heap.ArenaAllocator.init(allocator),
         };
     }
 
     pub fn deinit(self: *VM) void {
         self.arena.deinit();
+
+        var it = self.globals.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            switch (entry.value_ptr.*) {
+                .number, .bool => {},
+                .string => self.allocator.free(entry.value_ptr.string),
+            }
+        }
+        self.globals.deinit(self.allocator);
     }
 
     pub fn interpret(self: *VM, allocator: std.mem.Allocator, source: [:0]const u8) Error!void {
@@ -47,9 +61,15 @@ pub const VM = struct {
         return self.stack.popOrNull() orelse return error.RuntimeError;
     }
 
-    // fn peek(self: *VM, distance: usize) Value {
-    //     return self.stack.items[self.stack.len - 1 - distance];
-    // }
+    fn peek(self: *VM, distance: usize) Value {
+        return self.stack.get(self.stack.len - 1 - distance);
+    }
+
+    inline fn readConstant(self: *VM) Value {
+        const value = self.chunk.constants.items[self.chunk.code.items[self.idx]];
+        self.idx += 1;
+        return value;
+    }
 
     fn run(self: *VM) Error!void {
         while (true) {
@@ -66,9 +86,7 @@ pub const VM = struct {
             self.idx += 1;
             switch (instruction) {
                 .constant => {
-                    const constant = self.chunk.constants.items[self.chunk.code.items[self.idx]];
-                    self.idx += 1;
-                    try self.push(constant);
+                    try self.push(self.readConstant());
                 },
                 .equal => {
                     const b = try self.pop();
@@ -120,14 +138,34 @@ pub const VM = struct {
                     try self.push(.{ .number = a - b });
                 },
                 .mul => {
-                    const b = (try self.pop()).number;
-                    const a = (try self.pop()).number;
-                    try self.push(.{ .number = a * b });
+                    const b = try self.pop();
+                    const a = try self.pop();
+                    if (a == .number and b == .number) {
+                        try self.push(.{ .number = a.number * b.number });
+                    } else if ((a == .string and b == .number) or (a == .number and b == .string)) {
+                        const n: usize, const s = if (a == .number)
+                            .{ @intFromFloat(a.number), b.string }
+                        else
+                            .{ @intFromFloat(b.number), a.string };
+                        const buf = try self.arena.allocator().alloc(u8, s.len * n);
+                        for (0..n) |i| {
+                            @memcpy(buf[i * s.len .. (i + 1) * s.len], s);
+                        }
+                        try self.push(.{ .string = buf });
+                    } else {
+                        self.runtimeError("Operands must be two numbers or a number and a string", .{});
+                        return error.RuntimeError;
+                    }
                 },
                 .div => {
                     const b = (try self.pop()).number;
                     const a = (try self.pop()).number;
                     try self.push(.{ .number = a / b });
+                },
+                .mod => {
+                    const b = (try self.pop()).number;
+                    const a = (try self.pop()).number;
+                    try self.push(.{ .number = @mod(a, b) });
                 },
                 .not => {
                     const value = (try self.pop()).bool;
@@ -141,8 +179,73 @@ pub const VM = struct {
                     // }
                     try self.push(.{ .number = -value });
                 },
+                .pop => {
+                    _ = try self.pop();
+                },
+                .get_global => {
+                    const name = self.readConstant().string;
+                    if (self.globals.get(name)) |value| {
+                        try self.push(value);
+                    } else {
+                        self.runtimeError("Undefined variable '{s}'", .{name});
+                        return error.RuntimeError;
+                    }
+                },
+                .set_global => {
+                    const name = self.readConstant().string;
+                    const raw_new_value = self.peek(0);
+                    const new_value: Value = switch (raw_new_value) {
+                        .string => blk: {
+                            const dupe = try self.allocator.dupe(u8, raw_new_value.string);
+                            break :blk .{ .string = dupe };
+                        },
+                        .number, .bool => raw_new_value,
+                    };
+                    errdefer self.allocator.free(new_value.string);
+
+                    if (try self.globals.fetchPut(self.allocator, name, new_value)) |old_kv| {
+                        const old_value = old_kv.value;
+                        if (std.meta.activeTag(new_value) != std.meta.activeTag(old_value)) {
+                            self.globals.put(self.allocator, name, old_value) catch {};
+                            self.runtimeError(
+                                "Cannot assign a value of type '{s}' to a variable of type '{s}'",
+                                .{ @tagName(new_value), @tagName(old_value) },
+                            );
+                            return error.RuntimeError;
+                        }
+                        switch (old_value) {
+                            .string => self.allocator.free(old_value.string),
+                            .number, .bool => {},
+                        }
+                    } else {
+                        std.debug.assert(self.globals.remove(name) == true);
+                        self.runtimeError("Undefined variable '{s}'", .{name});
+                        return error.RuntimeError;
+                    }
+                },
+                .define_global => {
+                    const name = try self.allocator.dupe(u8, self.readConstant().string);
+                    errdefer self.allocator.free(name);
+                    const gop = try self.globals.getOrPut(self.allocator, name);
+                    if (gop.found_existing) {
+                        self.runtimeError("Variable '{s}' already defined", .{name});
+                        return error.RuntimeError;
+                    } else {
+                        const value = try self.pop();
+                        switch (value) {
+                            .string => {
+                                const dupe = try self.allocator.dupe(u8, value.string);
+                                gop.value_ptr.* = .{ .string = dupe };
+                            },
+                            .number, .bool => gop.value_ptr.* = value,
+                        }
+                    }
+                },
+                .print => {
+                    const stdout = std.io.getStdOut().writer();
+                    stdout.print("{}\n", .{try self.pop()}) catch {};
+                },
                 .@"return" => {
-                    debug.print("{}\n", .{try self.pop()});
                     return;
                 },
             }

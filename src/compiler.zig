@@ -11,8 +11,11 @@ const debug = @import("debug.zig");
 pub fn compile(source: [:0]const u8, chunk: *Chunk) bool {
     var parser = Parser.init(source, chunk);
     parser.advance();
-    parser.expression();
-    parser.consume(.eof, "Expect end of expression.");
+    while (!parser.match(.eof)) {
+        parser.declaration();
+    }
+    // parser.expression();
+    // parser.consume(.eof, "Expect end of expression");
     endCompiler(&parser);
     return !parser.had_error;
     // var scanner = Scanner.init(source);
@@ -41,12 +44,12 @@ fn endCompiler(parser: *Parser) void {
     }
 }
 
-fn grouping(parser: *Parser) void {
+fn grouping(parser: *Parser, _: bool) void {
     parser.expression();
-    parser.consume(.r_paren, "Expect ')' after expression.");
+    parser.consume(.r_paren, "Expect ')' after expression");
 }
 
-fn unary(parser: *Parser) void {
+fn unary(parser: *Parser, _: bool) void {
     const tag = parser.previous.tag;
     parser.parsePrecedence(.unary);
     switch (tag) {
@@ -56,10 +59,10 @@ fn unary(parser: *Parser) void {
     }
 }
 
-fn binary(parser: *Parser) void {
+fn binary(parser: *Parser, _: bool) void {
     const tag = parser.previous.tag;
     const rule = Parser.getRule(tag);
-    parser.parsePrecedence(@enumFromInt(@intFromEnum(rule.precedence) + 1)); // TODO why?
+    parser.parsePrecedence(@enumFromInt(@intFromEnum(rule.precedence) + 1));
     switch (tag) {
         .bang_equal => parser.emitTwoBytes(
             @intFromEnum(Chunk.OpCode.equal),
@@ -87,19 +90,67 @@ fn binary(parser: *Parser) void {
         .minus => parser.emitByte(@intFromEnum(Chunk.OpCode.sub)),
         .asterisk => parser.emitByte(@intFromEnum(Chunk.OpCode.mul)),
         .slash => parser.emitByte(@intFromEnum(Chunk.OpCode.div)),
+        .percent => parser.emitByte(@intFromEnum(Chunk.OpCode.mod)),
         else => unreachable,
     }
 }
 
-fn literal(parser: *Parser) void {
+fn literal(parser: *Parser, can_assign: bool) void {
     switch (parser.previous.tag) {
-        .number => parser.number(),
+        .number => parser.number(can_assign),
         .bool => {
             const value = parser.previous.literal.?.bool;
             parser.emitConstant(.{ .bool = value });
         },
         else => unreachable,
     }
+}
+
+fn variable(parser: *Parser, can_assign: bool) void {
+    namedVariable(parser, parser.previous, can_assign);
+}
+
+fn namedVariable(parser: *Parser, name: Token, can_assign: bool) void {
+    const global = parser.identifierConstant(name);
+    if (can_assign) {
+        if (parser.match(.equal)) {
+            parser.expression();
+            parser.emitTwoBytes(@intFromEnum(Chunk.OpCode.set_global), global);
+            return;
+        } else if (parser.match(.plus_equal)) {
+            parser.emitTwoBytes(@intFromEnum(Chunk.OpCode.get_global), global);
+            parser.expression();
+            parser.emitByte(@intFromEnum(Chunk.OpCode.add));
+            parser.emitTwoBytes(@intFromEnum(Chunk.OpCode.set_global), global);
+            return;
+        } else if (parser.match(.minus_equal)) {
+            parser.emitTwoBytes(@intFromEnum(Chunk.OpCode.get_global), global);
+            parser.expression();
+            parser.emitByte(@intFromEnum(Chunk.OpCode.sub));
+            parser.emitTwoBytes(@intFromEnum(Chunk.OpCode.set_global), global);
+            return;
+        } else if (parser.match(.asterisk_equal)) {
+            parser.emitTwoBytes(@intFromEnum(Chunk.OpCode.get_global), global);
+            parser.expression();
+            parser.emitByte(@intFromEnum(Chunk.OpCode.mul));
+            parser.emitTwoBytes(@intFromEnum(Chunk.OpCode.set_global), global);
+            return;
+        } else if (parser.match(.slash_equal)) {
+            parser.emitTwoBytes(@intFromEnum(Chunk.OpCode.get_global), global);
+            parser.expression();
+            parser.emitByte(@intFromEnum(Chunk.OpCode.div));
+            parser.emitTwoBytes(@intFromEnum(Chunk.OpCode.set_global), global);
+            return;
+        } else if (parser.match(.percent_equal)) {
+            parser.emitTwoBytes(@intFromEnum(Chunk.OpCode.get_global), global);
+            parser.expression();
+            parser.emitByte(@intFromEnum(Chunk.OpCode.mod));
+            parser.emitTwoBytes(@intFromEnum(Chunk.OpCode.set_global), global);
+            return;
+        }
+    }
+
+    parser.emitTwoBytes(@intFromEnum(Chunk.OpCode.get_global), global);
 }
 
 pub const Parser = struct {
@@ -124,12 +175,10 @@ pub const Parser = struct {
         primary,
     };
 
-    const ParseFn = *const fn (*Parser) void;
-
     const Rule = struct {
         precedence: Precedence,
-        prefix: ?ParseFn,
-        infix: ?ParseFn,
+        prefix: ?*const fn (*Parser, bool) void,
+        infix: ?*const fn (*Parser, bool) void,
     };
 
     // must tbe in the same order as Scanner.Token.Tag
@@ -140,23 +189,26 @@ pub const Parser = struct {
         .{ .precedence = .none, .prefix = null, .infix = null }, // r_brace
         .{ .precedence = .none, .prefix = null, .infix = null }, // comma
         .{ .precedence = .none, .prefix = null, .infix = null }, // period
+        .{ .precedence = .none, .prefix = null, .infix = null }, // colon
         .{ .precedence = .term, .prefix = unary, .infix = binary }, // minus
         .{ .precedence = .term, .prefix = null, .infix = binary }, // plus
-        .{ .precedence = .factor, .prefix = null, .infix = binary }, // slash
         .{ .precedence = .factor, .prefix = null, .infix = binary }, // asterisk
+        .{ .precedence = .factor, .prefix = null, .infix = binary }, // slash
+        .{ .precedence = .factor, .prefix = null, .infix = binary }, // percent
                        //.unary?
         .{ .precedence = .none, .prefix = unary, .infix = null }, // bang
         .{ .precedence = .equality, .prefix = null, .infix = binary }, // bang_equal
-        .{ .precedence = .assignment, .prefix = null, .infix = binary }, // equal
+        .{ .precedence = .assignment, .prefix = null, .infix = null }, // equal
         .{ .precedence = .equality, .prefix = null, .infix = binary }, // equal_equal
         .{ .precedence = .comparison, .prefix = null, .infix = binary }, // l_angle_bracket
         .{ .precedence = .comparison, .prefix = null, .infix = binary }, // r_angle_bracket
         .{ .precedence = .comparison, .prefix = null, .infix = binary }, // l_angle_bracket_equal
         .{ .precedence = .comparison, .prefix = null, .infix = binary }, // r_angle_bracket_equal
-        .{ .precedence = .assignment, .prefix = null, .infix = binary }, // plus_equal
-        .{ .precedence = .assignment, .prefix = null, .infix = binary }, // minus_equal
-        .{ .precedence = .assignment, .prefix = null, .infix = binary }, // asterisk_equal
-        .{ .precedence = .assignment, .prefix = null, .infix = binary }, // slash_equal
+        .{ .precedence = .assignment, .prefix = null, .infix = null }, // plus_equal
+        .{ .precedence = .assignment, .prefix = null, .infix = null }, // minus_equal
+        .{ .precedence = .assignment, .prefix = null, .infix = null }, // asterisk_equal
+        .{ .precedence = .assignment, .prefix = null, .infix = null }, // slash_equal
+        .{ .precedence = .assignment, .prefix = null, .infix = null }, // percent_equal
         .{ .precedence = .@"and", .prefix = null, .infix = binary }, // keyword_and
         .{ .precedence = .@"or", .prefix = null, .infix = binary }, // keyword_or
         .{ .precedence = .none, .prefix = null, .infix = null }, // keyword_else
@@ -166,7 +218,7 @@ pub const Parser = struct {
         .{ .precedence = .none, .prefix = null, .infix = null }, // keyword_return
         .{ .precedence = .none, .prefix = null, .infix = null }, // keyword_let
         .{ .precedence = .none, .prefix = null, .infix = null }, // keyword_while
-        .{ .precedence = .none, .prefix = null, .infix = null }, // identifier
+        .{ .precedence = .none, .prefix = variable, .infix = null }, // identifier
         .{ .precedence = .none, .prefix = string, .infix = null }, // string
         .{ .precedence = .none, .prefix = number, .infix = null }, // number
         .{ .precedence = .none, .prefix = literal, .infix = null }, // bool
@@ -204,17 +256,86 @@ pub const Parser = struct {
         self.parsePrecedence(.assignment);
     }
 
+    fn declaration(self: *Parser) void {
+        if (self.match(.keyword_let)) {
+            self.letDeclaration();
+        } else {
+            self.statement();
+        }
+
+        if (self.panic_mode) {
+            self.synchronize();
+        }
+    }
+
+    fn letDeclaration(self: *Parser) void {
+        const global = self.parseVariable("Expect variable name");
+        // TODO: check type and infer type if there is none
+        if (self.match(.colon)) {
+            self.consume(.identifier, "Expect type after ':'"); // TODO
+        }
+        if (self.match(.equal)) {
+            self.expression();
+        } else {
+            // self.emitByte(@intFromEnum(Chunk.OpCode.nil));
+        }
+        // self.consume(.semicolon, "Expect ';' after value");
+        self.emitTwoBytes(@intFromEnum(Chunk.OpCode.define_global), global);
+    }
+
+    fn parseVariable(self: *Parser, error_message: []const u8) u8 {
+        self.consume(.identifier, error_message);
+        return self.identifierConstant(self.previous);
+    }
+
+    fn identifierConstant(self: *Parser, name: Token) u8 {
+        return self.makeConstant(.{ .string = name.literal.?.string }); // TODO: dupe string?
+    }
+
+    fn statement(self: *Parser) void {
+        if (self.match(.keyword_print)) {
+            self.printStatement();
+        } else {
+            self.expressionStatement();
+        }
+    }
+
+    fn expressionStatement(self: *Parser) void {
+        self.expression();
+        // self.consume(.semicolon, "Expect ';' after value");
+        self.emitByte(@intFromEnum(Chunk.OpCode.pop));
+    }
+
+    fn match(self: *Parser, tag: Token.Tag) bool {
+        if (self.current.tag != tag) {
+            return false;
+        }
+        self.advance();
+        return true;
+    }
+
+    fn printStatement(self: *Parser) void {
+        self.expression();
+        // self.consume(.semicolon, "Expect ';' after value");
+        self.emitByte(@intFromEnum(Chunk.OpCode.print));
+    }
+
     fn parsePrecedence(self: *Parser, precedence: Precedence) void {
         self.advance();
         const prefixRule = getRule(self.previous.tag).prefix orelse {
-            self.errorAtPrevious("Expect expression.");
+            self.errorAtPrevious("Expect expression");
             return;
         };
-        prefixRule(self);
+        const can_assign = @intFromEnum(precedence) <= @intFromEnum(Precedence.assignment);
+        prefixRule(self, can_assign);
         while (@intFromEnum(precedence) <= @intFromEnum(getRule(self.current.tag).precedence)) {
             self.advance();
             const infixRule = getRule(self.previous.tag).infix.?;
-            infixRule(self);
+            infixRule(self, can_assign);
+        }
+
+        if (can_assign and self.match(.equal)) {
+            self.errorAtPrevious("Invalid assignment target");
         }
     }
 
@@ -238,7 +359,7 @@ pub const Parser = struct {
     fn makeConstant(self: *Parser, value: Value) u8 {
         const constant = self.chunk.addConstant(value) catch unreachable;
         if (constant > std.math.maxInt(u8)) {
-            self.errorAtPrevious("Too many constants in one chunk.");
+            self.errorAtPrevious("Too many constants in one chunk");
             return 0;
         }
         return @intCast(constant);
@@ -251,14 +372,14 @@ pub const Parser = struct {
         );
     }
 
-    fn number(self: *Parser) void {
+    fn number(self: *Parser, _: bool) void {
         const value = self.previous.literal.?.number; // TODO: parse number here?
         self.emitConstant(.{ .number = value });
     }
 
-    fn string(self: *Parser) void {
+    fn string(self: *Parser, _: bool) void {
         const value = self.previous.literal.?.string;
-        self.emitConstant(.{ .string = value });
+        self.emitConstant(.{ .string = value }); // TODO: could be invalid pointer later
     }
 
     fn errorAtCurrent(self: *Parser, message: []const u8) void {
@@ -286,5 +407,28 @@ pub const Parser = struct {
 
         debug.print(": {s}\n", .{message});
         self.had_error = true;
+    }
+
+    fn synchronize(self: *Parser) void {
+        self.panic_mode = false;
+
+        while (self.current.tag != .eof) {
+            // if (self.previous.tag == .semicolon) {
+            //     return;
+            // }
+
+            switch (self.current.tag) {
+                .keyword_let,
+                .keyword_for,
+                .keyword_if,
+                .keyword_while,
+                .keyword_print,
+                .keyword_return,
+                => return,
+                else => {},
+            }
+
+            self.advance();
+        }
     }
 };
