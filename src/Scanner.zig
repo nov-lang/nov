@@ -1,19 +1,22 @@
 const std = @import("std");
-const err = @import("main.zig").err;
 
 const Scanner = @This();
 
 buffer: [:0]const u8,
 index: usize,
 line: usize,
+col: usize,
 
 pub const Token = struct {
     tag: Tag,
     literal: ?Literal,
-    line: usize, // TODO: add column (check std.zig.Token.Loc)
+    line: usize,
+    col: usize,
 
+    // must be the same order as compiler.Parser.rules
     pub const Tag = enum {
         // add %, ^, &, |, ~, <<, >>, %=, ^=, &=, |=, ~=, <<=, >>=?
+        // add ' for char literals
         l_paren,
         r_paren,
         l_brace,
@@ -54,6 +57,7 @@ pub const Token = struct {
         identifier,
         string,
         number,
+        bool,
         // int,
         // float,
         eof,
@@ -66,6 +70,7 @@ pub const Token = struct {
                 .identifier,
                 .string,
                 .number,
+                .bool,
                 => null,
 
                 .l_paren => "(",
@@ -109,6 +114,7 @@ pub const Token = struct {
         identifier: []const u8,
         string: []const u8,
         number: f64,
+        bool: bool,
     };
 
     pub const keywords = std.StaticStringMap(Tag).initComptime(.{
@@ -138,12 +144,13 @@ pub const Token = struct {
         if (fmt.len != 0) {
             std.fmt.invalidFmtError(fmt, self);
         }
-        try writer.print("{d}: {}: ", .{ self.line, self.tag });
+        try writer.print("{d}:{d}: {}: ", .{ self.line, self.col, self.tag });
         if (self.literal) |literal| {
             switch (self.tag) {
                 .identifier => try writer.writeAll(literal.identifier),
                 .string => try writer.writeAll(literal.string),
                 .number => try writer.print("{d}", .{literal.number}),
+                .bool => try writer.print("{}", .{literal.bool}),
                 else => unreachable,
             }
         } else {
@@ -157,33 +164,39 @@ pub fn init(buffer: [:0]const u8) Scanner {
         .buffer = buffer,
         .index = 0,
         .line = 1,
+        .col = 1,
     };
 }
 
-pub fn next(self: *Scanner) ?Token {
+pub fn next(self: *Scanner) Token {
     while (true) {
         const c = self.buffer[self.index];
         switch (c) {
             0 => {
                 if (self.index != self.buffer.len) {
-                    err(self.line, "Unexpected character: '\\0'", .{});
-                    self.index += 1;
-                    return self.token(.invalid);
+                    defer self.advance();
+                    return .{
+                        .tag = .invalid,
+                        .literal = .{ .string = "Unexpected character" },
+                        .line = self.line,
+                        .col = self.col,
+                    };
                 }
-                // return self.token(.eof);
-                return null;
+                return self.token(.eof);
             },
-            ' ', '\r', '\t' => self.index += 1,
+            ' ', '\r', '\t' => self.advance(),
             '\n' => {
                 self.index += 1;
                 self.line += 1;
+                self.col = 1;
             },
             ';', '#' => {
                 const eoc = std.mem.indexOfScalar(u8, self.buffer[self.index..], '\n') orelse {
                     self.index = self.buffer.len;
-                    return null;
+                    return self.token(.eof); // invalid?
                 };
                 self.index += eoc;
+                // self.col will be reset by next iteration
             },
             '(' => return self.token(.l_paren),
             ')' => return self.token(.r_paren),
@@ -203,20 +216,32 @@ pub fn next(self: *Scanner) ?Token {
             '0'...'9' => return self.number(),
             'A'...'Z', 'a'...'z', '_' => return self.identifier(),
             else => {
-                err(self.line, "Unexpected character: {c}", .{c});
-                self.index += 1;
-                return self.token(.invalid);
+                defer self.advance();
+                return .{
+                    .tag = .invalid,
+                    .literal = .{ .string = "Unexpected character" },
+                    .line = self.line,
+                    .col = self.col,
+                };
             },
         }
     }
 }
 
+inline fn advance(self: *Scanner) void {
+    self.index += 1;
+    self.col += 1;
+}
+
 inline fn token(self: *Scanner, comptime tag: Token.Tag) Token {
-    self.index += comptime if (tag.lexeme()) |lexeme| lexeme.len else 0;
+    const len = comptime if (tag.lexeme()) |lexeme| lexeme.len else 0;
+    self.index += len;
+    defer self.col += len;
     return .{
         .tag = tag,
         .literal = null,
         .line = self.line,
+        .col = self.col,
     };
 }
 
@@ -230,43 +255,60 @@ inline fn tokenWithEqual(self: *Scanner, comptime tag: Token.Tag) Token {
     }
 }
 
+// TODO: escape sequences
+// TODO: multiline strings
+// TODO: string interpolation?
 fn string(self: *Scanner) Token {
     std.debug.assert(self.buffer[self.index] == '"');
-    self.index += 1;
+    const col = self.col;
+    self.advance();
     const start = self.index;
     const end = std.mem.indexOfScalar(u8, self.buffer[self.index..], '"') orelse {
-        err(self.line, "Unterminated string", .{});
         self.index = self.buffer.len;
-        return self.token(.invalid);
+        return .{
+            .tag = .invalid,
+            .literal = .{ .string = "Unterminated string" },
+            .line = self.line,
+            .col = col,
+        };
     };
     self.index += end + 1;
+    self.col += end + 1;
     std.debug.assert(self.buffer[self.index - 1] == '"');
     const bytes = self.buffer[start .. start + end];
 
-    if (std.mem.indexOfScalar(u8, bytes, '\n')) |_| {
-        err(self.line, "Multiline string", .{});
-        return self.token(.invalid);
+    if (std.mem.indexOfScalar(u8, bytes, '\n')) |i| {
+        self.col = bytes.len - i; // TODO
+        return .{
+            .tag = .invalid,
+            .literal = .{ .string = "Multiline string" },
+            .line = self.line,
+            .col = col,
+        };
     }
 
     return .{
         .tag = .string,
         .literal = .{ .string = bytes },
         .line = self.line,
+        .col = col,
     };
 }
 
 fn number(self: *Scanner) Token {
     std.debug.assert(std.ascii.isDigit(self.buffer[self.index]));
+    const col = self.col;
     const start = self.index;
-    self.index += 1;
+    self.advance();
     while (std.ascii.isDigit(self.buffer[self.index])) {
-        self.index += 1;
+        self.advance();
     }
 
     if (self.buffer[self.index] == '.' and std.ascii.isDigit(self.buffer[self.index + 1])) {
         self.index += 2;
+        self.col += 2;
         while (std.ascii.isDigit(self.buffer[self.index])) {
-            self.index += 1;
+            self.advance();
         }
     } else {
         // unsigned integer
@@ -278,162 +320,44 @@ fn number(self: *Scanner) Token {
         .tag = .number,
         .literal = .{ .number = value },
         .line = self.line,
+        .col = col,
     };
 }
 
 fn identifier(self: *Scanner) Token {
+    const col = self.col;
     const start = self.index;
-    self.index += 1;
+    self.advance();
     while (true) {
         switch (self.buffer[self.index]) {
-            'A'...'Z', 'a'...'z', '0'...'9', '_' => self.index += 1,
+            'A'...'Z', 'a'...'z', '0'...'9', '_' => self.advance(),
             else => break,
         }
     }
     const end = self.index;
     const bytes = self.buffer[start..end];
+
+    if (std.mem.eql(u8, bytes, "true")) {
+        return .{
+            .tag = .bool,
+            .literal = .{ .bool = true },
+            .line = self.line,
+            .col = col,
+        };
+    } else if (std.mem.eql(u8, bytes, "false")) {
+        return .{
+            .tag = .bool,
+            .literal = .{ .bool = false },
+            .line = self.line,
+            .col = col,
+        };
+    }
+
     const tag = Token.getKeyword(bytes) orelse .identifier;
     return .{
         .tag = tag,
         .literal = if (tag == .identifier) .{ .identifier = bytes } else null,
         .line = self.line,
+        .col = col,
     };
 }
-
-// pub fn scanTokens(self: *Scanner) !void {
-//     while (!self.isAtEnd()) {
-//         self.start = self.current;
-//         try self.scanToken();
-//     }
-//     try self.tokens.append(.{
-//         .tag = .eof,
-//         .lexeme = "",
-//         .literal = null,
-//         .line = self.line,
-//     });
-// }
-
-// fn isAtEnd(self: *const Scanner) bool {
-//     return self.index >= self.source.len;
-// }
-
-// fn scanToken(self: *Scanner) !void {
-//     const c = self.advance();
-//     switch (c) {
-//         '(' => try self.addToken(.@"(", null),
-//         ')' => try self.addToken(.@")", null),
-//         '{' => try self.addToken(.@"{", null),
-//         '}' => try self.addToken(.@"}", null),
-//         ',' => try self.addToken(.@",", null),
-//         '.' => try self.addToken(.@".", null),
-//         '-' => try self.addToken(.@"-", null),
-//         '+' => try self.addToken(.@"+", null),
-//         ';' => try self.addToken(.@";", null),
-//         '*' => try self.addToken(.@"*", null),
-//         '!' => try self.addToken(if (self.match('=')) .@"!=" else .@"!", null),
-//         '=' => try self.addToken(if (self.match('=')) .@"==" else .@"=", null),
-//         '<' => try self.addToken(if (self.match('=')) .@"<=" else .@"<", null),
-//         '>' => try self.addToken(if (self.match('=')) .@">=" else .@">", null),
-//         '/' => {
-//             if (self.match('/')) {
-//                 while (self.peek() != '\n' and !self.isAtEnd()) {
-//                     _ = self.advance();
-//                 }
-//             } else {
-//                 try self.addToken(.@"/", null);
-//             }
-//         },
-//         ' ', '\r', '\t' => {},
-//         '\n' => self.line += 1,
-//         '"' => try self.string(),
-//         '0'...'9' => try self.number(),
-//         'A'...'Z', 'a'...'z', '_' => try self.identifier(),
-//         else => err(self.line, "Unexpected character."),
-//     }
-// }
-
-// fn advance(self: *Scanner) u8 {
-//     const c = self.source[self.current];
-//     self.current += 1;
-//     return c;
-// }
-
-// fn addToken(self: *Scanner, tag: Token.Tag, literal: ?Token.Literal) !void {
-//     const text = self.source[self.start..self.current];
-//     try self.tokens.append(.{
-//         .tag = tag,
-//         .lexeme = text,
-//         .literal = literal,
-//         .line = self.line,
-//     });
-// }
-
-// fn match(self: *Scanner, expected: u8) bool {
-//     if (self.buffer[self.index] != expected) {
-//         return false;
-//     }
-//     self.index += 1;
-//     return true;
-// }
-
-// fn peek(self: *const Scanner) u8 {
-//     if (self.isAtEnd()) {
-//         return '\x00';
-//     }
-//     return self.source[self.current];
-// }
-
-// fn peekNext(self: *const Scanner) u8 {
-//     if (self.current + 1 >= self.source.len) {
-//         return '\x00';
-//     }
-//     return self.source[self.current + 1];
-// }
-
-// fn string(self: *Scanner) !void {
-//     while (self.peek() != '"' and !self.isAtEnd()) {
-//         if (self.peek() == '\n') {
-//             self.line += 1;
-//         }
-//         _ = self.advance();
-//     }
-
-//     if (self.isAtEnd()) {
-//         err(self.line, "Unterminated string.");
-//         return;
-//     }
-
-//     _ = self.advance();
-
-//     const value = self.source[self.start + 1 .. self.current - 1];
-//     try self.addToken(.string, .{ .string = value });
-// }
-
-// fn number(self: *Scanner) !void {
-//     while (std.ascii.isDigit(self.peek())) {
-//         _ = self.advance();
-//     }
-
-//     if (self.peek() == '.' and std.ascii.isDigit(self.peekNext())) {
-//         _ = self.advance();
-//         while (std.ascii.isDigit(self.peek())) {
-//             _ = self.advance();
-//         }
-//     }
-
-//     const value = try std.fmt.parseFloat(f64, self.source[self.start..self.current]);
-//     try self.addToken(.number, .{ .number = value });
-// }
-
-// fn identifier(self: *Scanner) !void {
-//     while (true) {
-//         switch (self.peek()) {
-//             'A'...'Z', 'a'...'z', '0'...'9', '_' => _ = self.advance(),
-//             else => break,
-//         }
-//     }
-
-//     const text = self.source[self.start..self.current];
-//     const tag = Token.getKeyword(text) orelse .identifier;
-//     try self.addToken(tag, null);
-// }
