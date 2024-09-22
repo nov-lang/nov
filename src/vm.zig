@@ -63,14 +63,12 @@ pub const VM = struct {
         return self.stack.get(self.stack.len - 1 - distance);
     }
 
-    inline fn readConstant(self: *VM) Value {
-        const value = self.chunk.constants.items[self.chunk.code.items[self.ip]];
-        self.ip += 1;
-        return value;
+    inline fn readConstant(self: *VM, arg: u24) Value {
+        return self.chunk.constants.items[arg];
     }
 
     fn run(self: *VM) Error!void {
-        while (true) {
+        while (true) : (self.ip += 1) {
             if (builtin.mode == .Debug) {
                 debug.print("          ", .{});
                 var it = std.mem.reverseIterator(self.stack.constSlice());
@@ -80,11 +78,12 @@ pub const VM = struct {
                 debug.print("\n", .{});
                 _ = debug.disassembleInstruction(self.chunk, self.ip);
             }
-            const instruction: Chunk.OpCode = @enumFromInt(self.chunk.code.items[self.ip]);
-            self.ip += 1;
+            const code = self.chunk.code.items[self.ip];
+            const instruction: Chunk.OpCode = @enumFromInt(@as(u8, @truncate(code)));
             switch (instruction) {
                 .constant => {
-                    try self.push(self.readConstant());
+                    const arg: u24 = @intCast(code >> 8);
+                    try self.push(self.readConstant(arg));
                 },
                 .equal => {
                     const b = try self.pop();
@@ -166,18 +165,17 @@ pub const VM = struct {
                     _ = try self.pop();
                 },
                 .get_local => {
-                    const slot = self.chunk.code.items[self.ip];
-                    self.ip += 1;
+                    const slot: u24 = @intCast(code >> 8);
                     try self.push(self.stack.get(slot));
                 },
                 // TODO: handle string for get/set local
                 .set_local => {
-                    const slot = self.chunk.code.items[self.ip];
-                    self.ip += 1;
+                    const slot: u24 = @intCast(code >> 8);
                     self.stack.set(slot, self.peek(0));
                 },
                 .get_global => {
-                    const name = self.readConstant().string.data;
+                    const arg: u24 = @intCast(code >> 8);
+                    const name = self.readConstant(arg).string.data;
                     if (self.globals.get(name)) |value| {
                         try self.push(value);
                     } else {
@@ -185,7 +183,8 @@ pub const VM = struct {
                     }
                 },
                 .set_global => {
-                    const name = self.readConstant().string.data;
+                    const arg: u24 = @intCast(code >> 8);
+                    const name = self.readConstant(arg).string.data;
                     const new_value = try Value.dupe(self.peek(0), self.allocator);
                     errdefer new_value.destroy(self.allocator);
 
@@ -205,7 +204,8 @@ pub const VM = struct {
                     }
                 },
                 .define_global => {
-                    const name = try self.allocator.dupe(u8, self.readConstant().string.data);
+                    const arg: u24 = @intCast(code >> 8);
+                    const name = try self.allocator.dupe(u8, self.readConstant(arg).string.data);
                     errdefer self.allocator.free(name);
                     const gop = try self.globals.getOrPut(self.allocator, name);
                     if (gop.found_existing) {
@@ -221,32 +221,17 @@ pub const VM = struct {
                     stdout.print("{}\n", .{try self.pop()}) catch {};
                 },
                 .jump => {
-                    const offset = std.mem.readInt(
-                        u16,
-                        @ptrCast(self.chunk.code.items[self.ip .. self.ip + @sizeOf(u16)]),
-                        .big,
-                    );
-                    self.ip += @sizeOf(u16);
+                    const offset: u24 = @intCast(code >> 8);
                     self.ip += offset;
                 },
                 .jump_if_false => {
-                    const offset = std.mem.readInt(
-                        u16,
-                        @ptrCast(self.chunk.code.items[self.ip .. self.ip + @sizeOf(u16)]),
-                        .big,
-                    );
-                    self.ip += @sizeOf(u16);
+                    const offset: u24 = @intCast(code >> 8);
                     if (!self.peek(0).bool) {
                         self.ip += offset;
                     }
                 },
                 .loop => {
-                    const offset = std.mem.readInt(
-                        u16,
-                        @ptrCast(self.chunk.code.items[self.ip .. self.ip + @sizeOf(u16)]),
-                        .big,
-                    );
-                    self.ip += @sizeOf(u16);
+                    const offset: u24 = @intCast(code >> 8);
                     self.ip -= offset;
                 },
                 .@"return" => {

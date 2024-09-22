@@ -19,34 +19,31 @@ pub fn disassembleInstruction(chunk: *const Chunk, offset: usize) usize {
         print("{d:0>4} ", .{chunk.lines.items[offset]});
     }
 
-    const op = chunk.code.items[offset];
-    switch (op) {
-        @intFromEnum(Chunk.OpCode.constant) => return constantInstruction("OP_CONSTANT", chunk, offset),
-        @intFromEnum(Chunk.OpCode.equal) => return simpleInstruction("OP_EQUAL", offset),
-        @intFromEnum(Chunk.OpCode.greater) => return simpleInstruction("OP_GREATER", offset),
-        @intFromEnum(Chunk.OpCode.less) => return simpleInstruction("OP_LESS", offset),
-        @intFromEnum(Chunk.OpCode.add) => return simpleInstruction("OP_ADD", offset),
-        @intFromEnum(Chunk.OpCode.sub) => return simpleInstruction("OP_SUBTRACT", offset),
-        @intFromEnum(Chunk.OpCode.mul) => return simpleInstruction("OP_MULTIPLY", offset),
-        @intFromEnum(Chunk.OpCode.div) => return simpleInstruction("OP_DIVIDE", offset),
-        @intFromEnum(Chunk.OpCode.mod) => return simpleInstruction("OP_MODULO", offset),
-        @intFromEnum(Chunk.OpCode.not) => return simpleInstruction("OP_NOT", offset),
-        @intFromEnum(Chunk.OpCode.negation) => return simpleInstruction("OP_NEGATE", offset),
-        @intFromEnum(Chunk.OpCode.pop) => return simpleInstruction("OP_POP", offset),
-        @intFromEnum(Chunk.OpCode.get_local) => return byteInstruction("OP_GET_LOCAL", chunk, offset),
-        @intFromEnum(Chunk.OpCode.set_local) => return byteInstruction("OP_SET_LOCAL", chunk, offset),
-        @intFromEnum(Chunk.OpCode.get_global) => return constantInstruction("OP_GET_GLOBAL", chunk, offset),
-        @intFromEnum(Chunk.OpCode.set_global) => return constantInstruction("OP_SET_GLOBAL", chunk, offset),
-        @intFromEnum(Chunk.OpCode.define_global) => return constantInstruction("OP_DEFINE_GLOBAL", chunk, offset),
-        @intFromEnum(Chunk.OpCode.print) => return simpleInstruction("OP_PRINT", offset),
-        @intFromEnum(Chunk.OpCode.jump) => return jumpInstruction("OP_JUMP", true, chunk, offset),
-        @intFromEnum(Chunk.OpCode.jump_if_false) => return jumpInstruction("OP_JUMP_IF_FALSE", true, chunk, offset),
-        @intFromEnum(Chunk.OpCode.loop) => return jumpInstruction("OP_LOOP", false, chunk, offset),
-        @intFromEnum(Chunk.OpCode.@"return") => return simpleInstruction("OP_RETURN", offset),
-        else => {
-            print("Unknown opcode: {}\n", .{op});
-            return offset + 1;
-        }
+    const code = chunk.code.items[offset];
+    const instruction: Chunk.OpCode = @enumFromInt(@as(u8, @truncate(code)));
+    switch (instruction) {
+        .constant => return constantInstruction("OP_CONSTANT", chunk, offset),
+        .equal => return simpleInstruction("OP_EQUAL", offset),
+        .greater => return simpleInstruction("OP_GREATER", offset),
+        .less => return simpleInstruction("OP_LESS", offset),
+        .add => return simpleInstruction("OP_ADD", offset),
+        .sub => return simpleInstruction("OP_SUBTRACT", offset),
+        .mul => return simpleInstruction("OP_MULTIPLY", offset),
+        .div => return simpleInstruction("OP_DIVIDE", offset),
+        .mod => return simpleInstruction("OP_MODULO", offset),
+        .not => return simpleInstruction("OP_NOT", offset),
+        .negation => return simpleInstruction("OP_NEGATE", offset),
+        .pop => return simpleInstruction("OP_POP", offset),
+        .get_local => return byteInstruction("OP_GET_LOCAL", chunk, offset),
+        .set_local => return byteInstruction("OP_SET_LOCAL", chunk, offset),
+        .get_global => return constantInstruction("OP_GET_GLOBAL", chunk, offset),
+        .set_global => return constantInstruction("OP_SET_GLOBAL", chunk, offset),
+        .define_global => return constantInstruction("OP_DEFINE_GLOBAL", chunk, offset),
+        .print => return simpleInstruction("OP_PRINT", offset),
+        .jump => return jumpInstruction("OP_JUMP", true, chunk, offset),
+        .jump_if_false => return jumpInstruction("OP_JUMP_IF_FALSE", true, chunk, offset),
+        .loop => return jumpInstruction("OP_LOOP", false, chunk, offset),
+        .@"return" => return simpleInstruction("OP_RETURN", offset),
     }
 }
 
@@ -56,23 +53,24 @@ fn simpleInstruction(name: []const u8, offset: usize) usize {
 }
 
 fn constantInstruction(name: []const u8, chunk: *const Chunk, offset: usize) usize {
-    const constant = chunk.code.items[offset + 1];
-    print("{s: <16} {d:0>4} '{}'\n", .{name, constant, chunk.constants.items[constant]});
-    return offset + 2;
+    const constant: u24 = @intCast(chunk.code.items[offset] >> 8);
+    const value = chunk.constants.items[constant];
+    print("{s: <16} {d:0>4} '{}'\n", .{ name, constant, value });
+    return offset + 1;
 }
 
 fn byteInstruction(name: []const u8, chunk: *const Chunk, offset: usize) usize {
-    const slot = chunk.code.items[offset + 1];
-    print("{s: <16} {d:0>4}\n", .{name, slot});
-    return offset + 2;
+    const slot: u24 = @intCast(chunk.code.items[offset] >> 8);
+    print("{s: <16} {d:0>4}\n", .{ name, slot });
+    return offset + 1;
 }
 
 fn jumpInstruction(name: []const u8, forward: bool, chunk: *const Chunk, offset: usize) usize {
-    const jump = std.mem.readInt(u16, @ptrCast(chunk.code.items[offset + 1 .. offset + 3]), .big);
+    const jump: u24 = @intCast(chunk.code.items[offset] >> 8);
     if (forward) {
-        print("{s: <16} {d:0>4} -> {d}\n", .{name, offset, offset + 3 + jump});
+        print("{s: <16} {d:0>4} -> {d}\n", .{ name, offset, offset + 1 + jump });
     } else {
-        print("{s: <16} {d:0>4} -> {d}\n", .{name, offset, offset + 3 - jump});
+        print("{s: <16} {d:0>4} -> {d}\n", .{ name, offset, offset + 1 - jump });
     }
-    return offset + 3;
+    return offset + 1;
 }

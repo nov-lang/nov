@@ -69,7 +69,7 @@ fn buildLinenoise(
     lib.addIncludePath(b.path("vendor/linenoise"));
     lib.addCSourceFile(.{
         .file = b.path("vendor/linenoise/linenoise.c"),
-        .flags = &[_][]const u8{ "-Os" },
+        .flags = &[_][]const u8{"-Os"},
     });
     lib.linkLibC();
     b.installArtifact(lib);

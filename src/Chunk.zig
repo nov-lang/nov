@@ -3,8 +3,8 @@ const Value = @import("value.zig").Value;
 
 const Chunk = @This();
 
-code: std.ArrayListUnmanaged(u8),
-lines: std.ArrayListUnmanaged(usize), // use std.MultiArrayList with code?
+code: std.ArrayListUnmanaged(u32),
+lines: std.ArrayListUnmanaged(usize), // use RLE to save memory
 constants: std.ArrayListUnmanaged(Value),
 allocator: std.mem.Allocator,
 
@@ -50,12 +50,12 @@ pub fn deinit(self: *Chunk) void {
     self.constants.clearAndFree(self.allocator);
 }
 
-pub fn write(self: *Chunk, byte: u8, line: usize) !void {
-    try self.code.append(self.allocator, byte);
+pub fn write(self: *Chunk, code: u32, line: usize) !void {
+    try self.code.append(self.allocator, code);
     try self.lines.append(self.allocator, line);
 }
 
-pub fn addConstant(self: *Chunk, value: Value) !usize {
+pub fn addConstant(self: *Chunk, value: Value) !u24 {
     try self.constants.append(self.allocator, value);
-    return self.constants.items.len - 1;
+    return @intCast(self.constants.items.len - 1);
 }

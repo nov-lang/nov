@@ -60,7 +60,7 @@ const Local = struct {
 };
 
 fn endCompiler(parser: *Parser) void {
-    parser.emitByte(@intFromEnum(Chunk.OpCode.@"return"));
+    parser.emitOpCode(.@"return");
     if (builtin.mode == .Debug) {
         if (!parser.had_error) {
             debug.disassembleChunk(parser.chunk, "code");
@@ -79,7 +79,7 @@ fn endScope() void {
         if (local.depth <= current.scope_depth) {
             break;
         }
-        current.parser.emitByte(@intFromEnum(Chunk.OpCode.pop));
+        current.parser.emitOpCode(.pop);
         _ = current.locals.pop(); // TODO: will the iterator be invalidated?
     }
 }
@@ -253,7 +253,7 @@ pub const Parser = struct {
                     .string => self.emitConstant(.{ .string = undefined }),
                     else => unreachable,
                 }
-            } else  {
+            } else {
                 self.errorAtPrevious("Expect type or '=' after variable name", .{});
             }
             // self.emitByte(@intFromEnum(Chunk.OpCode.void));
@@ -262,14 +262,14 @@ pub const Parser = struct {
         self.defineVariable(global);
     }
 
-    fn defineVariable(self: *Parser, global: u8) void {
+    fn defineVariable(self: *Parser, global: u24) void {
         if (current.scope_depth > 0) {
             return;
         }
-        self.emitTwoBytes(@intFromEnum(Chunk.OpCode.define_global), global);
+        self.emitCodeArg(.define_global, global);
     }
 
-    fn parseVariable(self: *Parser, error_message: []const u8) u8 {
+    fn parseVariable(self: *Parser, error_message: []const u8) u24 {
         self.consume(.identifier, error_message);
         self.declareVariable();
         if (current.scope_depth > 0) {
@@ -278,7 +278,7 @@ pub const Parser = struct {
         return self.identifierConstant(self.previous);
     }
 
-    fn identifierConstant(self: *Parser, name: Token) u8 {
+    fn identifierConstant(self: *Parser, name: Token) u24 {
         // TODO: could be invalid pointer later (do not use Value.createObject with this allocator!)
         const value = String.create(self.allocator, name.literal.?.string) catch unreachable;
         return self.makeConstant(value);
@@ -297,7 +297,10 @@ pub const Parser = struct {
             //     break;
             // }
             if (eqlIdentifier(name, local.name)) {
-                self.errorAtPrevious("Variable with name '{s}' already declared in this scope", .{name.literal.?.string},);
+                self.errorAtPrevious(
+                    "Variable with name '{s}' already declared in this scope",
+                    .{name.literal.?.string},
+                );
             }
         }
         addLocal(name);
@@ -309,7 +312,7 @@ pub const Parser = struct {
             self.printStatement();
         } else if (self.match(.keyword_if)) {
             self.ifStatement();
-        } else if (self.match (.keyword_loop)) {
+        } else if (self.match(.keyword_loop)) {
             self.loopStatement();
         } else if (self.match(.keyword_while)) {
             self.whileStatement();
@@ -338,7 +341,7 @@ pub const Parser = struct {
     fn expressionStatement(self: *Parser) void {
         self.expression();
         // self.consume(.semicolon, "Expect ';' after value");
-        self.emitByte(@intFromEnum(Chunk.OpCode.pop));
+        self.emitOpCode(.pop);
     }
 
     fn match(self: *Parser, tag: Token.Tag) bool {
@@ -349,10 +352,14 @@ pub const Parser = struct {
         return true;
     }
 
+    inline fn currentCode(self: *Parser) usize {
+        return self.chunk.code.items.len;
+    }
+
     fn printStatement(self: *Parser) void {
         self.expression();
         // self.consume(.semicolon, "Expect ';' after value");
-        self.emitByte(@intFromEnum(Chunk.OpCode.print));
+        self.emitOpCode(.print);
     }
 
     fn ifStatement(self: *Parser) void {
@@ -360,13 +367,13 @@ pub const Parser = struct {
         self.expression();
         self.consume(.r_paren, "Expect ')' after condition");
 
-        const then_jump = self.emitJump(@intFromEnum(Chunk.OpCode.jump_if_false));
-        self.emitByte(@intFromEnum(Chunk.OpCode.pop));
+        const then_jump = self.emitJump(.jump_if_false);
+        self.emitOpCode(.pop);
         self.statement();
-        const else_jump = self.emitJump(@intFromEnum(Chunk.OpCode.jump));
+        const else_jump = self.emitJump(.jump);
 
         self.patchJump(then_jump);
-        self.emitByte(@intFromEnum(Chunk.OpCode.pop));
+        self.emitOpCode(.pop);
 
         if (self.match(.keyword_else)) {
             self.statement();
@@ -374,42 +381,39 @@ pub const Parser = struct {
         self.patchJump(else_jump);
     }
 
-    fn emitJump(self: *Parser, instruction: u8) usize {
-        self.emitByte(instruction);
-        self.emitByte(0xff);
-        self.emitByte(0xff);
-        return self.chunk.code.items.len - 2;
+    fn emitJump(self: *Parser, instruction: Chunk.OpCode) usize {
+        self.emitCodeArg(instruction, std.math.maxInt(u24));
+        return self.currentCode() - 1;
     }
 
     fn patchJump(self: *Parser, offset: usize) void {
-        // -2 to adjust for the bytecode for the jump offset itself.
-        const jump = self.chunk.code.items.len - offset - 2;
+        const jump = self.currentCode() - offset - 1;
         if (jump > std.math.maxInt(u16)) {
             self.errorAtPrevious("Too much code to jump over", .{});
         }
-        self.chunk.code.items[offset] = @truncate(jump >> 8);
-        self.chunk.code.items[offset + 1] = @truncate(jump);
+        const instruction: u8 = @truncate(self.chunk.code.items[offset]);
+        self.chunk.code.items[offset] = @as(u32, @intCast(instruction)) | (@as(u32, @intCast(jump)) << 8);
     }
 
     fn loopStatement(self: *Parser) void {
-        const loop_start = self.chunk.code.items.len;
+        const loop_start = self.currentCode();
         self.statement();
         self.emitLoop(loop_start);
     }
 
     fn whileStatement(self: *Parser) void {
-        const loop_start = self.chunk.code.items.len;
+        const loop_start = self.currentCode();
         self.consume(.l_paren, "Expect '(' after 'while'");
         self.expression();
         self.consume(.r_paren, "Expect ')' after condition");
 
-        const exit_jump = self.emitJump(@intFromEnum(Chunk.OpCode.jump_if_false));
-        self.emitByte(@intFromEnum(Chunk.OpCode.pop));
+        const exit_jump = self.emitJump(.jump_if_false);
+        self.emitOpCode(.pop);
         self.statement();
         self.emitLoop(loop_start);
 
         self.patchJump(exit_jump);
-        self.emitByte(@intFromEnum(Chunk.OpCode.pop));
+        self.emitOpCode(.pop);
     }
 
     // TODO: foreach loop, see https://craftinginterpreters.com/jumping-back-and-forth.html#for-statements
@@ -419,13 +423,12 @@ pub const Parser = struct {
     }
 
     fn emitLoop(self: *Parser, loop_start: usize) void {
-        self.emitByte(@intFromEnum(Chunk.OpCode.loop));
-        const offset = self.chunk.code.items.len - loop_start + 2;
-        if (offset > std.math.maxInt(u16)) {
+        self.emitOpCode(.loop);
+        const offset = self.currentCode() - loop_start + 1;
+        if (offset > std.math.maxInt(u24)) {
             self.errorAtPrevious("Loop body too large", .{});
         }
-        self.emitByte(@truncate(offset >> 8));
-        self.emitByte(@truncate(offset));
+        self.emitCodeArg(.loop, @intCast(offset));
     }
 
     fn parsePrecedence(self: *Parser, precedence: Precedence) void {
@@ -455,29 +458,24 @@ pub const Parser = struct {
         self.errorAtCurrent("{s}", .{message});
     }
 
-    fn emitByte(self: *Parser, byte: u8) void {
-        self.chunk.write(byte, self.previous.line) catch unreachable;
+    fn emit(self: *Parser, code: u32) void {
+        self.chunk.write(code, self.previous.line) catch unreachable;
     }
 
-    fn emitTwoBytes(self: *Parser, byte1: u8, byte2: u8) void {
-        self.emitByte(byte1);
-        self.emitByte(byte2);
+    fn emitOpCode(self: *Parser, code: Chunk.OpCode) void {
+        self.emit(@intFromEnum(code));
     }
 
-    fn makeConstant(self: *Parser, value: Value) u8 {
-        const constant = self.chunk.addConstant(value) catch unreachable;
-        if (constant > std.math.maxInt(u8)) {
-            self.errorAtPrevious("Too many constants in one chunk", .{});
-            return 0;
-        }
-        return @intCast(constant);
+    fn emitCodeArg(self: *Parser, code: Chunk.OpCode, arg: u24) void {
+        self.emit(@as(u32, @intFromEnum(code)) | (@as(u32, @intCast(arg)) << 8));
+    }
+
+    fn makeConstant(self: *Parser, value: Value) u24 {
+        return self.chunk.addConstant(value) catch unreachable;
     }
 
     fn emitConstant(self: *Parser, value: Value) void {
-        self.emitTwoBytes(
-            @intFromEnum(Chunk.OpCode.constant),
-            self.makeConstant(value),
-        );
+        self.emitCodeArg(.constant, self.makeConstant(value));
     }
 
     fn number(self: *Parser, _: bool) void {
@@ -558,8 +556,8 @@ fn unary(parser: *Parser, _: bool) void {
     const tag = parser.previous.tag;
     parser.parsePrecedence(.unary);
     switch (tag) {
-        .bang => parser.emitByte(@intFromEnum(Chunk.OpCode.not)),
-        .minus => parser.emitByte(@intFromEnum(Chunk.OpCode.negation)),
+        .bang => parser.emitOpCode(.not),
+        .minus => parser.emitOpCode(.negation),
         else => unreachable,
     }
 }
@@ -569,26 +567,26 @@ fn binary(parser: *Parser, _: bool) void {
     const rule = Parser.getRule(tag);
     parser.parsePrecedence(@enumFromInt(@intFromEnum(rule.precedence) + 1));
     switch (tag) {
-        .bang_equal => parser.emitTwoBytes(
-            @intFromEnum(Chunk.OpCode.equal),
-            @intFromEnum(Chunk.OpCode.not),
-        ),
-        .equal_equal => parser.emitByte(@intFromEnum(Chunk.OpCode.equal)),
-        .l_angle_bracket => parser.emitByte(@intFromEnum(Chunk.OpCode.less)),
-        .l_angle_bracket_equal => parser.emitTwoBytes(
-            @intFromEnum(Chunk.OpCode.greater),
-            @intFromEnum(Chunk.OpCode.not),
-        ),
-        .r_angle_bracket => parser.emitByte(@intFromEnum(Chunk.OpCode.greater)),
-        .r_angle_bracket_equal => parser.emitTwoBytes(
-            @intFromEnum(Chunk.OpCode.less),
-            @intFromEnum(Chunk.OpCode.not),
-        ),
-        .plus => parser.emitByte(@intFromEnum(Chunk.OpCode.add)),
-        .minus => parser.emitByte(@intFromEnum(Chunk.OpCode.sub)),
-        .asterisk => parser.emitByte(@intFromEnum(Chunk.OpCode.mul)),
-        .slash => parser.emitByte(@intFromEnum(Chunk.OpCode.div)),
-        .percent => parser.emitByte(@intFromEnum(Chunk.OpCode.mod)),
+        .bang_equal => {
+            parser.emitOpCode(.equal);
+            parser.emitOpCode(.not);
+        },
+        .equal_equal => parser.emitOpCode(.equal),
+        .l_angle_bracket => parser.emitOpCode(.less),
+        .l_angle_bracket_equal => {
+            parser.emitOpCode(.greater);
+            parser.emitOpCode(.not);
+        },
+        .r_angle_bracket => parser.emitOpCode(.greater),
+        .r_angle_bracket_equal => {
+            parser.emitOpCode(.less);
+            parser.emitOpCode(.not);
+        },
+        .plus => parser.emitOpCode(.add),
+        .minus => parser.emitOpCode(.sub),
+        .asterisk => parser.emitOpCode(.mul),
+        .slash => parser.emitOpCode(.div),
+        .percent => parser.emitOpCode(.mod),
         else => unreachable,
     }
 }
@@ -598,7 +596,7 @@ fn literal(parser: *Parser, can_assign: bool) void {
         .number => parser.number(can_assign),
         .bool => {
             const value = parser.previous.literal.?.bool;
-            parser.emitConstant(.{ .bool = value });
+            parser.emitConstant(Value.create(value));
         },
         else => unreachable,
     }
@@ -609,53 +607,53 @@ fn variable(parser: *Parser, can_assign: bool) void {
 }
 
 fn namedVariable(parser: *Parser, name: Token, can_assign: bool) void {
-    var get_op = @intFromEnum(Chunk.OpCode.get_local);
-    var set_op = @intFromEnum(Chunk.OpCode.set_local);
+    var get_op: Chunk.OpCode = .get_local;
+    var set_op: Chunk.OpCode = .set_local;
     const arg = resolveLocal(current, name) orelse blk: {
-        get_op = @intFromEnum(Chunk.OpCode.get_global);
-        set_op = @intFromEnum(Chunk.OpCode.set_global);
+        get_op = .get_global;
+        set_op = .set_global;
         break :blk parser.identifierConstant(name);
     };
 
     if (can_assign) {
         if (parser.match(.equal)) {
             parser.expression();
-            parser.emitTwoBytes(set_op, arg);
+            parser.emitCodeArg(set_op, arg);
             return;
         } else if (parser.match(.plus_equal)) {
-            parser.emitTwoBytes(get_op, arg);
+            parser.emitCodeArg(get_op, arg);
             parser.expression();
-            parser.emitByte(@intFromEnum(Chunk.OpCode.add));
-            parser.emitTwoBytes(set_op, arg);
+            parser.emitOpCode(.add);
+            parser.emitCodeArg(set_op, arg);
             return;
         } else if (parser.match(.minus_equal)) {
-            parser.emitTwoBytes(get_op, arg);
+            parser.emitCodeArg(get_op, arg);
             parser.expression();
-            parser.emitByte(@intFromEnum(Chunk.OpCode.sub));
-            parser.emitTwoBytes(set_op, arg);
+            parser.emitOpCode(.sub);
+            parser.emitCodeArg(set_op, arg);
             return;
         } else if (parser.match(.asterisk_equal)) {
-            parser.emitTwoBytes(get_op, arg);
+            parser.emitCodeArg(get_op, arg);
             parser.expression();
-            parser.emitByte(@intFromEnum(Chunk.OpCode.mul));
-            parser.emitTwoBytes(set_op, arg);
+            parser.emitOpCode(.mul);
+            parser.emitCodeArg(set_op, arg);
             return;
         } else if (parser.match(.slash_equal)) {
-            parser.emitTwoBytes(get_op, arg);
+            parser.emitCodeArg(get_op, arg);
             parser.expression();
-            parser.emitByte(@intFromEnum(Chunk.OpCode.div));
-            parser.emitTwoBytes(set_op, arg);
+            parser.emitOpCode(.div);
+            parser.emitCodeArg(set_op, arg);
             return;
         } else if (parser.match(.percent_equal)) {
-            parser.emitTwoBytes(get_op, arg);
+            parser.emitCodeArg(get_op, arg);
             parser.expression();
-            parser.emitByte(@intFromEnum(Chunk.OpCode.mod));
-            parser.emitTwoBytes(set_op, arg);
+            parser.emitOpCode(.mod);
+            parser.emitCodeArg(set_op, arg);
             return;
         }
     }
 
-    parser.emitTwoBytes(get_op, arg);
+    parser.emitCodeArg(get_op, arg);
 }
 
 fn eqlIdentifier(a: Token, b: Token) bool {
@@ -673,17 +671,17 @@ fn resolveLocal(compiler: *Compiler, name: Token) ?u8 {
 }
 
 fn @"and"(parser: *Parser, _: bool) void {
-    const end_jump = parser.emitJump(@intFromEnum(Chunk.OpCode.jump_if_false));
-    parser.emitByte(@intFromEnum(Chunk.OpCode.pop));
+    const end_jump = parser.emitJump(.jump_if_false);
+    parser.emitOpCode(.pop);
     parser.parsePrecedence(.@"and");
     parser.patchJump(end_jump);
 }
 
 fn @"or"(parser: *Parser, _: bool) void {
-    const else_jump = parser.emitJump(@intFromEnum(Chunk.OpCode.jump_if_false));
-    const end_jump = parser.emitJump(@intFromEnum(Chunk.OpCode.jump));
+    const else_jump = parser.emitJump(.jump_if_false);
+    const end_jump = parser.emitJump(.jump);
     parser.patchJump(else_jump);
-    parser.emitByte(@intFromEnum(Chunk.OpCode.pop));
+    parser.emitOpCode(.pop);
     parser.parsePrecedence(.@"or");
     parser.patchJump(end_jump);
 }

@@ -53,7 +53,7 @@ fn repl(allocator: std.mem.Allocator, vm: *VM) !void {
 
     var buf: [32]u8 = undefined;
     var i: usize = 1;
-    while (true) : (i += 1){
+    while (true) : (i += 1) {
         const prompt = try std.fmt.bufPrintZ(&buf, "{d}> ", .{i});
         if (ln.linenoise(prompt)) |bytes| {
             const line = std.mem.span(bytes);
