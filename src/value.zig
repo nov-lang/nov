@@ -91,5 +91,6 @@ pub const String = struct {
 
     pub fn destroy(self: *String, allocator: std.mem.Allocator) void {
         allocator.free(self.data);
+        allocator.destroy(self);
     }
 };

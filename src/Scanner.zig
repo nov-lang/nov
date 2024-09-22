@@ -57,6 +57,7 @@ pub const Token = struct {
         keyword_break,
         keyword_continue,
         // keyword_nil,
+        // keyword_void,
         identifier,
         string,
         number,
@@ -125,22 +126,16 @@ pub const Token = struct {
         bool: bool,
     };
 
-    pub const keywords = std.StaticStringMap(Tag).initComptime(.{
-        .{ "and", .keyword_and },
-        .{ "or", .keyword_or },
-        .{ "else", .keyword_else },
-        .{ "if", .keyword_if },
-        .{ "match", .keyword_match },
-        .{ "print", .keyword_print },
-        .{ "return", .keyword_return },
-        .{ "let", .keyword_let },
-        .{ "mut", .keyword_mut },
-        .{ "loop", .keyword_loop },
-        .{ "while", .keyword_while },
-        .{ "for", .keyword_for },
-        .{ "break", .keyword_break },
-        .{ "continue", .keyword_continue },
-    });
+    pub const keywords = blk: {
+        const values = std.enums.values(Tag);
+        var kvs: std.BoundedArray(struct { []const u8, Tag }, values.len) = .{};
+        for (values) |tag| {
+            if (std.mem.startsWith(u8, @tagName(tag), "keyword_")) {
+                kvs.append(.{ tag.lexeme().?, tag }) catch unreachable;
+            }
+        }
+        break :blk std.StaticStringMap(Tag).initComptime(kvs.constSlice());
+    };
 
     pub fn getKeyword(bytes: []const u8) ?Tag {
         return keywords.get(bytes);

@@ -3,12 +3,13 @@ const Chunk = @import("Chunk.zig");
 pub const print = std.debug.print;
 
 pub fn disassembleChunk(chunk: *const Chunk, name: []const u8) void {
+    print("\x1b[2m", .{}); // dim
     print("== {s} ==\n", .{name});
-
     var offset: usize = 0;
     while (offset < chunk.code.items.len) {
         offset = disassembleInstruction(chunk, offset);
     }
+    print("\x1b[m", .{});
 }
 
 pub fn disassembleInstruction(chunk: *const Chunk, offset: usize) usize {

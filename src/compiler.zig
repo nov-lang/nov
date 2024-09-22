@@ -80,7 +80,7 @@ fn endScope() void {
             break;
         }
         current.parser.emitOpCode(.pop);
-        _ = current.locals.pop(); // TODO: will the iterator be invalidated?
+        _ = current.locals.pop();
     }
 }
 
@@ -248,6 +248,7 @@ pub const Parser = struct {
         } else {
             if (tag) |t| {
                 switch (t) {
+                    // TODO: very wrong
                     .number => self.emitConstant(.{ .number = undefined }),
                     .bool => self.emitConstant(.{ .bool = undefined }),
                     .string => self.emitConstant(.{ .string = undefined }),
@@ -423,7 +424,6 @@ pub const Parser = struct {
     }
 
     fn emitLoop(self: *Parser, loop_start: usize) void {
-        self.emitOpCode(.loop);
         const offset = self.currentCode() - loop_start + 1;
         if (offset > std.math.maxInt(u24)) {
             self.errorAtPrevious("Loop body too large", .{});

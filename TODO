@@ -2,8 +2,8 @@ move Parser to its own file
 add AST
 it's fine to keep arena fucked up allocation fest until GC implementation
 
-https://craftinginterpreters.com/global-variables.html#challenges
 https://craftinginterpreters.com/local-variables.html#challenges
+https://craftinginterpreters.com/global-variables.html#challenges
 match, break, continue: https://craftinginterpreters.com/jumping-back-and-forth.html#challenges
 
 grammar https://craftinginterpreters.com/appendix-i.html

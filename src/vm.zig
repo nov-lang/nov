@@ -68,7 +68,7 @@ pub const VM = struct {
     }
 
     fn run(self: *VM) Error!void {
-        while (true) : (self.ip += 1) {
+        while (true) {
             if (builtin.mode == .Debug) {
                 debug.print("          ", .{});
                 var it = std.mem.reverseIterator(self.stack.constSlice());
@@ -79,6 +79,7 @@ pub const VM = struct {
                 _ = debug.disassembleInstruction(self.chunk, self.ip);
             }
             const code = self.chunk.code.items[self.ip];
+            self.ip += 1;
             const instruction: Chunk.OpCode = @enumFromInt(@as(u8, @truncate(code)));
             switch (instruction) {
                 .constant => {
@@ -198,6 +199,9 @@ pub const VM = struct {
                             );
                         }
                         old_value.destroy(self.allocator);
+                        // TODO: freeing old value produce crash in debug build for
+                        // let x = "aaa"
+                        // x = x
                     } else {
                         std.debug.assert(self.globals.remove(name) == true);
                         return self.runtimeError("Undefined variable '{s}'", .{name});
