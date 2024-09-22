@@ -1,29 +1,73 @@
 const std = @import("std");
+const builtin = @import("builtin");
+const clap = @import("clap");
 const Scanner = @import("Scanner.zig");
 const Chunk = @import("Chunk.zig");
 const VM = @import("vm.zig").VM;
 const debug = @import("debug.zig");
 const ln = @import("linenoise.zig");
 
+fn usage(comptime params: anytype) !void {
+    const stderr = std.io.getStdErr().writer();
+    try stderr.writeAll("Usage: nov ");
+    try clap.usage(stderr, clap.Help, params);
+    try stderr.writeAll("\n\nOptions:\n");
+    try clap.help(stderr, clap.Help, params, .{
+        .description_on_new_line = false,
+        .description_indent = 2,
+        .spacing_between_parameters = 0,
+        .indent = 2,
+    });
+}
+
 pub fn main() !void {
-    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
-    defer std.debug.assert(gpa.deinit() == .ok);
-    const allocator = gpa.allocator();
+    var gpa: std.heap.GeneralPurposeAllocator(.{ .verbose_log = false }) = .{};
+    defer if (builtin.mode == .Debug) std.debug.assert(gpa.deinit() == .ok);
+    const allocator = if (builtin.mode == .Debug) gpa.allocator() else std.heap.c_allocator;
+
+    const params = comptime clap.parseParamsComptime(
+        \\-h, --help             Display this help and exit.
+        \\-v, --version          Display the version and exit.
+        \\<file>...
+        \\
+    );
+
+    const parsers = comptime .{
+        .file = clap.parsers.string,
+    };
+
+    var diag: clap.Diagnostic = .{};
+    var res = clap.parse(clap.Help, &params, parsers, .{
+        .allocator = allocator,
+        .diagnostic = &diag,
+    }) catch |err| {
+        diag.report(std.io.getStdErr().writer(), err) catch {};
+        usage(&params) catch {};
+        std.process.exit(1);
+    };
+    defer res.deinit();
+
+    if (res.args.version != 0) {
+        const stdout = std.io.getStdOut().writer();
+        try stdout.print("nov 0.0.0", .{});
+        return;
+    }
+
+    if (res.args.help != 0) {
+        try usage(&params);
+        return;
+    }
 
     var vm = VM.init(allocator);
     defer vm.deinit();
 
-    var args = try std.process.argsWithAllocator(allocator);
-    defer args.deinit();
-    const progname = args.next().?;
-
-    if (args.next()) |arg| {
-        if (args.next()) |_| {
-            std.zig.fatal("Usage: {s} [script]", .{progname});
-        }
-        try runFile(allocator, &vm, arg);
-    } else {
+    if (res.positionals.len == 0) {
         try repl(allocator, &vm);
+    } else {
+        for (res.positionals) |path| {
+            try runFile(allocator, &vm, path);
+            break; // TODO: support multiple files
+        }
     }
 }
 

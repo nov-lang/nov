@@ -2,7 +2,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Chunk = @import("Chunk.zig");
 const Value = @import("value.zig").Value;
-const String = @import("value.zig").String;
 const compiler = @import("compiler.zig");
 const debug = @import("debug.zig");
 

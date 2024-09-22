@@ -5,12 +5,14 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const linenoise = buildLinenoise(b, target, optimize);
+    const clap = b.dependency("clap", .{}).module("clap");
     const exe = b.addExecutable(.{
         .name = "nov",
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
+    exe.root_module.addImport("clap", clap);
     exe.linkLibC();
     exe.linkLibrary(linenoise);
     b.installArtifact(exe);

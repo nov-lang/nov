@@ -9,3 +9,6 @@ match, break, continue: https://craftinginterpreters.com/jumping-back-and-forth.
 grammar https://craftinginterpreters.com/appendix-i.html
 
 add opt to output bytecode and to run bytecode instead of interpreting
+
+add test
+add Error type for each step (Tokenizer, Parser, Compiler, Runtime)
