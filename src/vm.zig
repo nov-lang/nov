@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Chunk = @import("Chunk.zig");
 const Value = @import("value.zig").Value;
+const String = @import("value.zig").String;
 const compiler = @import("compiler.zig");
 const debug = @import("debug.zig");
 
@@ -34,10 +35,7 @@ pub const VM = struct {
         var it = self.globals.iterator();
         while (it.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
-            switch (entry.value_ptr.*) {
-                .number, .bool => {},
-                .string => self.allocator.free(entry.value_ptr.string),
-            }
+            entry.value_ptr.*.destroy(self.allocator);
         }
         self.globals.deinit(self.allocator);
     }
@@ -45,7 +43,7 @@ pub const VM = struct {
     pub fn interpret(self: *VM, allocator: std.mem.Allocator, source: [:0]const u8) Error!void {
         var chunk = Chunk.init(allocator);
         defer chunk.deinit();
-        if (!compiler.compile(source, &chunk)) {
+        if (!compiler.compile(self.arena.allocator(), source, &chunk)) {
             return error.CompileError;
         }
         self.chunk = &chunk;
@@ -91,30 +89,31 @@ pub const VM = struct {
                 .equal => {
                     const b = try self.pop();
                     const a = try self.pop();
-                    try self.push(.{ .bool = a.eql(b) });
+                    try self.push(Value.create(a.eql(b)));
                 },
                 .greater => {
                     const b = (try self.pop()).number;
                     const a = (try self.pop()).number;
-                    try self.push(.{ .bool = a > b });
+                    try self.push(Value.create(a > b));
                 },
                 .less => {
                     const b = (try self.pop()).number;
                     const a = (try self.pop()).number;
-                    try self.push(.{ .bool = a < b });
+                    try self.push(Value.create(a < b));
                 },
                 .add => {
                     const b = try self.pop();
                     const a = try self.pop();
                     if (a == .number and b == .number) {
-                        try self.push(.{ .number = a.number + b.number });
+                        try self.push(Value.create(a.number + b.number));
                     } else if (a == .string and b == .string) {
-                        const len = a.string.len + b.string.len;
-                        const buf = try self.arena.allocator().alloc(u8, len);
-                        errdefer self.arena.allocator().free(buf);
-                        @memcpy(buf[0..a.string.len], a.string);
-                        @memcpy(buf[a.string.len..], b.string);
-                        try self.push(.{ .string = buf });
+                        const allocator = self.arena.allocator();
+                        const len = a.string.data.len + b.string.data.len;
+                        const buf = try allocator.alloc(u8, len);
+                        errdefer allocator.free(buf);
+                        @memcpy(buf[0..a.string.data.len], a.string.data);
+                        @memcpy(buf[a.string.data.len..], b.string.data);
+                        try self.push(try Value.createObject(allocator, buf));
                     } else {
                         return self.runtimeError("Operands must be two numbers or two strings", .{});
                     }
@@ -122,24 +121,25 @@ pub const VM = struct {
                 .sub => {
                     const b = (try self.pop()).number;
                     const a = (try self.pop()).number;
-                    try self.push(.{ .number = a - b });
+                    try self.push(Value.create(a - b));
                 },
                 .mul => {
                     const b = try self.pop();
                     const a = try self.pop();
                     if (a == .number and b == .number) {
-                        try self.push(.{ .number = a.number * b.number });
+                        try self.push(Value.create(a.number * b.number));
                     } else if ((a == .string and b == .number) or (a == .number and b == .string)) {
+                        const allocator = self.arena.allocator();
                         const n: usize, const s = if (a == .number)
-                            .{ @intFromFloat(a.number), b.string }
+                            .{ @intFromFloat(a.number), b.string.data }
                         else
-                            .{ @intFromFloat(b.number), a.string };
-                        const buf = try self.arena.allocator().alloc(u8, s.len * n);
-                        errdefer self.arena.allocator().free(buf);
+                            .{ @intFromFloat(b.number), a.string.data };
+                        const buf = try allocator.alloc(u8, s.len * n);
+                        errdefer allocator.free(buf);
                         for (0..n) |i| {
                             @memcpy(buf[i * s.len .. (i + 1) * s.len], s);
                         }
-                        try self.push(.{ .string = buf });
+                        try self.push(try Value.createObject(allocator, buf));
                     } else {
                         return self.runtimeError("Operands must be two numbers or a number and a string", .{});
                     }
@@ -147,23 +147,20 @@ pub const VM = struct {
                 .div => {
                     const b = (try self.pop()).number;
                     const a = (try self.pop()).number;
-                    try self.push(.{ .number = a / b });
+                    try self.push(Value.create(a / b));
                 },
                 .mod => {
                     const b = (try self.pop()).number;
                     const a = (try self.pop()).number;
-                    try self.push(.{ .number = @mod(a, b) });
+                    try self.push(Value.create(@mod(a, b)));
                 },
                 .not => {
                     const value = (try self.pop()).bool;
-                    try self.push(.{ .bool = !value });
+                    try self.push(Value.create(!value));
                 },
                 .negation => {
                     const value = (try self.pop()).number;
-                    // if (value != .number) {
-                    //     return self.runtimeError("Operand must be a number", .{});
-                    // }
-                    try self.push(.{ .number = -value });
+                    try self.push(Value.create(-value));
                 },
                 .pop => {
                     _ = try self.pop();
@@ -180,7 +177,7 @@ pub const VM = struct {
                     self.stack.set(slot, self.peek(0));
                 },
                 .get_global => {
-                    const name = self.readConstant().string;
+                    const name = self.readConstant().string.data;
                     if (self.globals.get(name)) |value| {
                         try self.push(value);
                     } else {
@@ -188,16 +185,9 @@ pub const VM = struct {
                     }
                 },
                 .set_global => {
-                    const name = self.readConstant().string;
-                    const raw_new_value = self.peek(0);
-                    const new_value: Value = switch (raw_new_value) {
-                        .string => blk: {
-                            const dupe = try self.allocator.dupe(u8, raw_new_value.string);
-                            break :blk .{ .string = dupe };
-                        },
-                        .number, .bool => raw_new_value,
-                    };
-                    errdefer if (new_value == .string) self.allocator.free(new_value.string);
+                    const name = self.readConstant().string.data;
+                    const new_value = try Value.dupe(self.peek(0), self.allocator);
+                    errdefer new_value.destroy(self.allocator);
 
                     if (try self.globals.fetchPut(self.allocator, name, new_value)) |old_kv| {
                         const old_value = old_kv.value;
@@ -208,30 +198,21 @@ pub const VM = struct {
                                 .{ @tagName(new_value), @tagName(old_value) },
                             );
                         }
-                        switch (old_value) {
-                            .string => self.allocator.free(old_value.string),
-                            .number, .bool => {},
-                        }
+                        old_value.destroy(self.allocator);
                     } else {
                         std.debug.assert(self.globals.remove(name) == true);
                         return self.runtimeError("Undefined variable '{s}'", .{name});
                     }
                 },
                 .define_global => {
-                    const name = try self.allocator.dupe(u8, self.readConstant().string);
+                    const name = try self.allocator.dupe(u8, self.readConstant().string.data);
                     errdefer self.allocator.free(name);
                     const gop = try self.globals.getOrPut(self.allocator, name);
                     if (gop.found_existing) {
                         return self.runtimeError("Variable '{s}' already defined", .{name});
                     } else {
                         const value = try self.pop();
-                        switch (value) {
-                            .string => {
-                                const dupe = try self.allocator.dupe(u8, value.string);
-                                gop.value_ptr.* = .{ .string = dupe };
-                            },
-                            .number, .bool => gop.value_ptr.* = value,
-                        }
+                        gop.value_ptr.* = try Value.dupe(value, self.allocator);
                     }
                 },
                 // TODO: move to stdlib -> when import and call are implemented

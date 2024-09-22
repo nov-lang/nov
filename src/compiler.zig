@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const Chunk = @import("Chunk.zig");
 const Scanner = @import("Scanner.zig");
 const Value = @import("value.zig").Value;
+const String = @import("value.zig").String;
 const Token = Scanner.Token;
 const debug = @import("debug.zig");
 
@@ -10,8 +11,8 @@ const debug = @import("debug.zig");
 
 var current: *Compiler = undefined; // TODO: a global!?
 
-pub fn compile(source: [:0]const u8, chunk: *Chunk) bool {
-    var parser = Parser.init(source, chunk);
+pub fn compile(arena_allocator: std.mem.Allocator, source: [:0]const u8, chunk: *Chunk) bool {
+    var parser = Parser.init(source, chunk, arena_allocator);
     var compiler = Compiler.init(&parser);
     current = &compiler;
     parser.advance();
@@ -99,6 +100,7 @@ pub const Parser = struct {
     previous: Token,
     had_error: bool,
     panic_mode: bool,
+    allocator: std.mem.Allocator,
 
     const Precedence = enum {
         none,
@@ -173,7 +175,7 @@ pub const Parser = struct {
         return rules[@intFromEnum(tag)];
     }
 
-    pub fn init(source: [:0]const u8, chunk: *Chunk) Parser {
+    pub fn init(source: [:0]const u8, chunk: *Chunk, allocator: std.mem.Allocator) Parser {
         return .{
             .scanner = Scanner.init(source),
             .chunk = chunk,
@@ -181,6 +183,7 @@ pub const Parser = struct {
             .previous = undefined,
             .had_error = false,
             .panic_mode = false,
+            .allocator = allocator,
         };
     }
 
@@ -276,7 +279,9 @@ pub const Parser = struct {
     }
 
     fn identifierConstant(self: *Parser, name: Token) u8 {
-        return self.makeConstant(.{ .string = name.literal.?.string }); // TODO: dupe string?
+        // TODO: could be invalid pointer later (do not use Value.createObject with this allocator!)
+        const value = String.create(self.allocator, name.literal.?.string) catch unreachable;
+        return self.makeConstant(value);
     }
 
     fn declareVariable(self: *Parser) void {
@@ -477,12 +482,14 @@ pub const Parser = struct {
 
     fn number(self: *Parser, _: bool) void {
         const value = self.previous.literal.?.number; // TODO: parse number here?
-        self.emitConstant(.{ .number = value });
+        self.emitConstant(Value.create(value));
     }
 
     fn string(self: *Parser, _: bool) void {
-        const value = self.previous.literal.?.string;
-        self.emitConstant(.{ .string = value }); // TODO: could be invalid pointer later
+        // TODO: could be invalid pointer later (do not use Value.createObject with this allocator!)
+        // TODO: very very wrong same for identifierConstant
+        const value = String.create(self.allocator, self.previous.literal.?.string) catch unreachable;
+        self.emitConstant(value);
     }
 
     fn errorAtCurrent(self: *Parser, comptime fmt: []const u8, args: anytype) void {
