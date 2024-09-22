@@ -22,7 +22,7 @@ pub fn compile(arena_allocator: std.mem.Allocator, source: [:0]const u8, chunk: 
         parser.declaration();
     }
     // parser.expression();
-    // parser.consume(.eof, "Expect end of expression");
+    // parser.consume(.eof, "Expected end of expression");
     endCompiler(&parser);
     return !parser.had_error;
     // var scanner = Scanner.init(source);
@@ -225,12 +225,12 @@ pub const Parser = struct {
     fn letDeclaration(self: *Parser) void {
         const is_mut = self.match(.keyword_mut);
         _ = is_mut; // TODO
-        const global = self.parseVariable("Expect variable name");
+        const global = self.parseVariable("Expected variable name");
         const tag = blk: {
             if (!self.match(.colon)) {
                 break :blk null;
             }
-            self.consume(.identifier, "Expect type after ':'");
+            self.consume(.identifier, "Expected type after ':'");
             const type_name = self.previous.literal.?.string;
             // TODO: support custom types
             if (std.mem.eql(u8, type_name, "number")) {
@@ -262,11 +262,11 @@ pub const Parser = struct {
                     else => unreachable,
                 }
             } else {
-                self.errorAtPrevious("Expect type or '=' after variable name", .{});
+                self.errorAtPrevious("Expected type or '=' after variable name", .{});
             }
             // self.emitByte(@intFromEnum(Chunk.OpCode.void));
         }
-        // self.consume(.semicolon, "Expect ';' after value");
+        // self.consume(.semicolon, "Expected ';' after value");
         self.defineVariable(global);
     }
 
@@ -344,12 +344,12 @@ pub const Parser = struct {
         while (!self.check(.r_brace) and !self.check(.eof)) {
             self.declaration();
         }
-        self.consume(.r_brace, "Expect '}' after block");
+        self.consume(.r_brace, "Expected '}' after block");
     }
 
     fn expressionStatement(self: *Parser) void {
         self.expression();
-        // self.consume(.semicolon, "Expect ';' after value");
+        // self.consume(.semicolon, "Expected ';' after value");
         self.emitOpCode(.pop);
     }
 
@@ -367,18 +367,22 @@ pub const Parser = struct {
 
     fn printStatement(self: *Parser) void {
         self.expression();
-        // self.consume(.semicolon, "Expect ';' after value");
+        // self.consume(.semicolon, "Expected ';' after value");
         self.emitOpCode(.print);
     }
 
     fn ifStatement(self: *Parser) void {
-        self.consume(.l_paren, "Expect '(' after 'if'");
+        self.consume(.l_paren, "Expected '(' after 'if'");
         self.expression();
-        self.consume(.r_paren, "Expect ')' after condition");
+        self.consume(.r_paren, "Expected ')' after condition");
 
         const then_jump = self.emitJump(.jump_if_false);
         self.emitOpCode(.pop);
+        // self.consume(.l_brace, "Expected '{' after condition");
+        // beginScope();
         self.statement();
+        // self.block();
+        // endScope();
         const else_jump = self.emitJump(.jump);
 
         self.patchJump(then_jump);
@@ -412,9 +416,9 @@ pub const Parser = struct {
 
     fn whileStatement(self: *Parser) void {
         const loop_start = self.currentCode();
-        self.consume(.l_paren, "Expect '(' after 'while'");
+        self.consume(.l_paren, "Expected '(' after 'while'");
         self.expression();
-        self.consume(.r_paren, "Expect ')' after condition");
+        self.consume(.r_paren, "Expected ')' after condition");
 
         const exit_jump = self.emitJump(.jump_if_false);
         self.emitOpCode(.pop);
@@ -442,7 +446,7 @@ pub const Parser = struct {
     fn parsePrecedence(self: *Parser, precedence: Precedence) void {
         self.advance();
         const prefixRule = getRule(self.previous.tag).prefix orelse {
-            self.errorAtPrevious("Expect expression", .{});
+            self.errorAtPrevious("Expected expression", .{});
             return;
         };
         const can_assign = @intFromEnum(precedence) <= @intFromEnum(Precedence.assignment);
@@ -558,7 +562,7 @@ pub const Parser = struct {
 
 fn grouping(parser: *Parser, _: bool) void {
     parser.expression();
-    parser.consume(.r_paren, "Expect ')' after expression");
+    parser.consume(.r_paren, "Expected ')' after expression");
 }
 
 fn unary(parser: *Parser, _: bool) void {
