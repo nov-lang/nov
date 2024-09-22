@@ -13,3 +13,7 @@ add opt to output bytecode and to run bytecode instead of interpreting
 add test
 add Error type for each step (Tokenizer, Parser, Compiler, Runtime)
 forward reference
+
+replace Scanner with Tokenizer
+
+Check std.zing.Ast.parse and std.zig.Ast.tokenLocation

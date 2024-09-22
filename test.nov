@@ -1,0 +1,21 @@
+let cond = true
+if (cond) {
+    let mut x = "outer"
+    {
+        x = (x + " ") * 3
+        x *= 2
+    }
+    print x
+} else {
+    print "Hello world!"
+}
+
+let mut i: number = 0
+while (i < 10) {
+    print i
+    i += 1
+}
+
+#my_func(arg1: int, arg2: str) {
+#    print arg1
+#}
