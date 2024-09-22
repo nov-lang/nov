@@ -2,8 +2,10 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Chunk = @import("Chunk.zig");
 const Scanner = @import("Scanner.zig");
-const Value = @import("value.zig").Value;
-const String = @import("value.zig").String;
+const _value = @import("value.zig");
+const Value = _value.Value;
+const String = _value.String;
+const Function = _value.Function;
 const Token = Scanner.Token;
 const debug = @import("debug.zig");
 
@@ -41,6 +43,7 @@ pub fn compile(arena_allocator: std.mem.Allocator, source: [:0]const u8, chunk: 
 }
 
 const Compiler = struct {
+    // function: *Function,
     locals: std.BoundedArray(Local, 256),
     scope_depth: usize,
     parser: *Parser,
@@ -52,6 +55,10 @@ const Compiler = struct {
             .parser = parser,
         };
     }
+
+    // pub fn chunk(self: *Compiler) *Chunk {
+    //     return &self.function.chunk;
+    // }
 };
 
 const Local = struct {
@@ -281,7 +288,8 @@ pub const Parser = struct {
 
     fn identifierConstant(self: *Parser, name: Token) u24 {
         // TODO: could be invalid pointer later (do not use Value.createObject with this allocator!)
-        const value = String.create(self.allocator, name.literal.?.string) catch unreachable;
+        const str = String.init(self.allocator, name.literal.?.string) catch unreachable;
+        const value = Value.create(str);
         return self.makeConstant(value);
     }
 
@@ -486,7 +494,8 @@ pub const Parser = struct {
     fn string(self: *Parser, _: bool) void {
         // TODO: could be invalid pointer later (do not use Value.createObject with this allocator!)
         // TODO: very very wrong same for identifierConstant
-        const value = String.create(self.allocator, self.previous.literal.?.string) catch unreachable;
+        const str = String.init(self.allocator, self.previous.literal.?.string) catch unreachable;
+        const value = Value.create(str);
         self.emitConstant(value);
     }
 
