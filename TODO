@@ -7,13 +7,21 @@ https://craftinginterpreters.com/global-variables.html#challenges
 match, break, continue: https://craftinginterpreters.com/jumping-back-and-forth.html#challenges
 
 grammar https://craftinginterpreters.com/appendix-i.html
+https://ocaml.org/docs/values-and-functions#the-pipe-operator
 
 add opt to output bytecode and to run bytecode instead of interpreting
 
 add test
 add Error type for each step (Tokenizer, Parser, Compiler, Runtime)
 forward reference
+string interpolation
 
 replace Scanner with Tokenizer
 
 Check std.zing.Ast.parse and std.zig.Ast.tokenLocation
+
+.nov source file
+.novc bytecode file
+.nova readable bytecode file
+
+primitive types: bool, int, float, str

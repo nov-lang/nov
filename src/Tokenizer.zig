@@ -1,3 +1,26 @@
+// Based on std.zig.Tokenizer
+// The MIT License (Expat)
+//
+// Copyright (c) Zig contributors
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
+
 const std = @import("std");
 
 const Tokenizer = @This();
@@ -16,37 +39,54 @@ pub const Token = struct {
 
     // must be the same order as compiler.Parser.rules
     pub const Tag = enum {
-        // add ^, &, |, ~, <<, >>, %=, ^=, &=, |=, ~=, <<=, >>=?
-        // add ' for char literals
+        newline,
         l_paren,
         r_paren,
+        l_bracket,
+        r_bracket,
         l_brace,
         r_brace,
         comma,
         period,
+        ellipsis2,
         colon,
-        minus,
-        plus,
-        asterisk,
-        slash,
-        percent,
         bang,
         bang_equal,
         equal,
         equal_equal,
+        equal_r_angle_bracket,
         l_angle_bracket,
-        r_angle_bracket,
         l_angle_bracket_equal,
+        l_angle_bracket_angle_bracket,
+        l_angle_bracket_angle_bracket_equal,
+        r_angle_bracket,
         r_angle_bracket_equal,
+        r_angle_bracket_angle_bracket,
+        r_angle_bracket_angle_bracket_equal,
+        plus,
         plus_equal,
+        minus,
         minus_equal,
+        minus_r_angle_bracket,
+        asterisk,
         asterisk_equal,
+        slash,
         slash_equal,
+        percent,
         percent_equal,
+        pipe,
+        pipe_equal,
+        pipe_r_angle_bracket,
+        caret,
+        caret_equal,
+        ampersand,
+        ampersand_equal,
+        tilde,
+        tilde_equal,
         keyword_and,
         keyword_or,
-        keyword_else,
         keyword_if,
+        keyword_else,
         keyword_match,
         keyword_print,
         keyword_return,
@@ -59,19 +99,12 @@ pub const Token = struct {
         keyword_continue,
         keyword_true,
         keyword_false,
-        keyword_bool,
-        keyword_number, // TODO: replace with int/float
-        // keyword_int,
-        // keyword_float,
-        keyword_str,
-        // keyword_char,
-        // keyword_nil,
         // keyword_void,
         identifier,
         string_literal,
-        number_literal,
-        // int,
-        // float,
+        multiline_string_literal_line,
+        int_literal,
+        float_literal,
         eof,
         invalid,
 
@@ -80,40 +113,60 @@ pub const Token = struct {
                 .eof,
                 .invalid,
                 .identifier,
-                .string,
-                .number,
-                .bool,
+                .string_literal,
+                .multiline_string_literal_line,
+                .int_literal,
+                .float_literal,
                 => null,
 
+                .newline => "\n",
                 .l_paren => "(",
                 .r_paren => ")",
+                .l_bracket => "[",
+                .r_bracket => "]",
                 .l_brace => "{",
                 .r_brace => "}",
                 .comma => ",",
                 .period => ".",
+                .ellipsis2 => "..",
                 .colon => ":",
-                .minus => "-",
-                .plus => "+",
-                .asterisk => "*",
-                .slash => "/",
-                .percent => "%",
                 .bang => "!",
                 .bang_equal => "!=",
                 .equal => "=",
                 .equal_equal => "==",
+                .equal_r_angle_bracket => "=>",
                 .l_angle_bracket => "<",
-                .r_angle_bracket => ">",
                 .l_angle_bracket_equal => "<=",
+                .l_angle_bracket_angle_bracket => "<<",
+                .l_angle_bracket_angle_bracket_equal => "<<=",
+                .r_angle_bracket => ">",
                 .r_angle_bracket_equal => ">=",
+                .r_angle_bracket_angle_bracket => ">>",
+                .r_angle_bracket_angle_bracket_equal => ">>=",
+                .plus => "+",
                 .plus_equal => "+=",
+                .minus => "-",
                 .minus_equal => "-=",
+                .minus_r_angle_bracket => "->",
+                .asterisk => "*",
                 .asterisk_equal => "*=",
+                .slash => "/",
                 .slash_equal => "/=",
+                .percent => "%",
                 .percent_equal => "%=",
+                .pipe => "|",
+                .pipe_equal => "|=",
+                .pipe_r_angle_bracket => "|>",
+                .caret => "^",
+                .caret_equal => "^=",
+                .ampersand => "&",
+                .ampersand_equal => "&=",
+                .tilde => "~",
+                .tilde_equal => "~=",
                 .keyword_and => "and",
                 .keyword_or => "or",
-                .keyword_else => "else",
                 .keyword_if => "if",
+                .keyword_else => "else",
                 .keyword_match => "match",
                 .keyword_print => "print",
                 .keyword_return => "return",
@@ -124,12 +177,8 @@ pub const Token = struct {
                 .keyword_for => "for",
                 .keyword_break => "break",
                 .keyword_continue => "continue",
-            };
-        }
-
-        pub fn symbol(tag: Tag) []const u8 {
-            return tag.lexeme() orelse switch (tag) {
-                else => unreachable, // TODO
+                .keyword_true => "true",
+                .keyword_false => "false",
             };
         }
     };
@@ -137,6 +186,7 @@ pub const Token = struct {
     pub const keywords = blk: {
         const values = std.enums.values(Tag);
         var kvs: std.BoundedArray(struct { []const u8, Tag }, values.len) = .{};
+        @setEvalBranchQuota(10_000);
         for (values) |tag| {
             if (std.mem.startsWith(u8, @tagName(tag), "keyword_")) {
                 kvs.append(.{ tag.lexeme().?, tag }) catch unreachable;
@@ -148,216 +198,1015 @@ pub const Token = struct {
     pub fn getKeyword(bytes: []const u8) ?Tag {
         return keywords.get(bytes);
     }
-
-    // pub fn format(
-    //     self: Token,
-    //     comptime fmt: []const u8,
-    //     _: std.fmt.FormatOptions,
-    //     writer: anytype,
-    // ) @TypeOf(writer).Error!void {
-    //     if (fmt.len != 0) {
-    //         std.fmt.invalidFmtError(fmt, self);
-    //     }
-    //     try writer.print("{d}:{d}: {}: ", .{ self.line, self.col, self.tag });
-    //     if (self.literal) |literal| {
-    //         switch (self.tag) {
-    //             .string, .identifier => try writer.writeAll(literal.string),
-    //             .number => try writer.print("{d}", .{literal.number}),
-    //             .bool => try writer.print("{}", .{literal.bool}),
-    //             else => unreachable,
-    //         }
-    //     } else {
-    //         try writer.print("{?s}", .{self.tag.lexeme()});
-    //     }
-    // }
 };
 
 pub fn init(buffer: [:0]const u8) Tokenizer {
+    // Skip the UTF-8 BOM if present
+    const src_start: usize = if (std.mem.startsWith(u8, buffer, "\xEF\xBB\xBF")) 3 else 0;
     return .{
         .buffer = buffer,
-        .index = 0,
-        .line = 1,
-        .col = 1,
+        .index = src_start,
     };
 }
 
-// TODO: check std.zig.Tokenizer
+const State = enum {
+    start,
+    ampersand,
+    caret,
+    identifier,
+    string_literal,
+    string_literal_single_quote,
+    string_literal_backslash,
+    multiline_string_literal_line,
+    comment_line,
+    equal,
+    bang,
+    pipe,
+    percent,
+    asterisk,
+    plus,
+    minus,
+    slash,
+    tilde,
+    l_angle_bracket,
+    l_angle_bracket_angle_bracket,
+    r_angle_bracket,
+    r_angle_bracket_angle_bracket,
+    backslash,
+    period,
+    int,
+    int_period,
+    int_exponent,
+    float,
+    float_exponent,
+};
+
+// this could be "simplified" with functions for similar cases and optimized
+// with SIMD but it's probably not worth it
 pub fn next(self: *Tokenizer) Token {
-    while (true) {
+    var state: State = .start;
+    var result: Token = .{
+        .tag = .eof,
+        .loc = .{
+            .start = self.index,
+            .end = undefined,
+        },
+    };
+    while (true) : (self.index += 1) {
         const c = self.buffer[self.index];
-        switch (c) {
-            0 => {
-                if (self.index != self.buffer.len) {
-                    defer self.advance();
-                    return .{
-                        .tag = .invalid,
-                        .literal = .{ .string = "Unexpected character" },
-                        .line = self.line,
-                        .col = self.col,
-                    };
-                }
-                return self.token(.eof);
+        switch (state) {
+            .start => switch (c) {
+                0 => {
+                    if (self.index != self.buffer.len) {
+                        result.tag = .invalid;
+                        result.loc.start = self.index;
+                        self.index += 1;
+                        result.loc.end = self.index;
+                        return result;
+                    }
+                    break;
+                },
+                ' ', '\r', '\t' => {
+                    result.loc.start = self.index + 1;
+                },
+                '"' => {
+                    state = .string_literal;
+                    result.tag = .string_literal;
+                },
+                '\'' => {
+                    state = .string_literal_single_quote;
+                    result.tag = .string_literal;
+                },
+                '#', ';' => {
+                    state = .comment_line;
+                },
+                'A'...'Z', 'a'...'z', '_' => {
+                    state = .identifier;
+                    result.tag = .identifier;
+                },
+                '=' => {
+                    state = .equal;
+                },
+                '!' => {
+                    state = .bang;
+                },
+                '|' => {
+                    state = .pipe;
+                },
+                '\n' => {
+                    result.tag = .newline;
+                    self.index += 1;
+                    break;
+                },
+                '(' => {
+                    result.tag = .l_paren;
+                    self.index += 1;
+                    break;
+                },
+                ')' => {
+                    result.tag = .r_paren;
+                    self.index += 1;
+                    break;
+                },
+                '[' => {
+                    result.tag = .l_bracket;
+                    self.index += 1;
+                    break;
+                },
+                ']' => {
+                    result.tag = .r_bracket;
+                    self.index += 1;
+                    break;
+                },
+                '{' => {
+                    result.tag = .l_brace;
+                    self.index += 1;
+                    break;
+                },
+                '}' => {
+                    result.tag = .r_brace;
+                    self.index += 1;
+                    break;
+                },
+                ',' => {
+                    result.tag = .comma;
+                    self.index += 1;
+                    break;
+                },
+                ':' => {
+                    result.tag = .colon;
+                    self.index += 1;
+                    break;
+                },
+                '%' => {
+                    state = .percent;
+                },
+                '*' => {
+                    state = .asterisk;
+                },
+                '+' => {
+                    state = .plus;
+                },
+                '-' => {
+                    state = .minus;
+                },
+                '/' => {
+                    state = .slash;
+                },
+                '<' => {
+                    state = .l_angle_bracket;
+                },
+                '>' => {
+                    state = .r_angle_bracket;
+                },
+                '&' => {
+                    state = .ampersand;
+                },
+                '^' => {
+                    state = .caret;
+                },
+                '~' => {
+                    state = .tilde;
+                },
+                '\\' => {
+                    state = .backslash;
+                    result.tag = .multiline_string_literal_line;
+                },
+                '.' => {
+                    state = .period;
+                },
+                '0'...'9' => {
+                    state = .int;
+                    result.tag = .int_literal;
+                },
+                else => {
+                    result.tag = .invalid;
+                    self.index += 1;
+                    break;
+                },
             },
-            ' ', '\r', '\t' => self.advance(),
-            '\n' => {
-                self.index += 1;
-                self.line += 1;
-                self.col = 1;
+            .ampersand => switch (c) {
+                '=' => {
+                    result.tag = .ampersand_equal;
+                    self.index += 1;
+                    break;
+                },
+                else => {
+                    result.tag = .ampersand;
+                    break;
+                },
             },
-            ';', '#' => {
-                const eoc = std.mem.indexOfScalar(u8, self.buffer[self.index..], '\n') orelse {
-                    self.index = self.buffer.len;
-                    return self.token(.eof); // invalid?
-                };
-                self.index += eoc;
-                // self.col will be reset by next iteration
+            .asterisk => switch (c) {
+                '=' => {
+                    result.tag = .asterisk_equal;
+                    self.index += 1;
+                    break;
+                },
+                else => {
+                    result.tag = .asterisk;
+                    break;
+                },
             },
-            '(' => return self.token(.l_paren),
-            ')' => return self.token(.r_paren),
-            '{' => return self.token(.l_brace),
-            '}' => return self.token(.r_brace),
-            ',' => return self.token(.comma),
-            '.' => return self.token(.period),
-            ':' => return self.token(.colon),
-            '-' => return self.tokenWithEqual(.minus),
-            '+' => return self.tokenWithEqual(.plus),
-            '*' => return self.tokenWithEqual(.asterisk),
-            '/' => return self.tokenWithEqual(.slash),
-            '%' => return self.tokenWithEqual(.percent),
-            '!' => return self.tokenWithEqual(.bang),
-            '=' => return self.tokenWithEqual(.equal),
-            '<' => return self.tokenWithEqual(.l_angle_bracket),
-            '>' => return self.tokenWithEqual(.r_angle_bracket),
-            '"' => return self.string(),
-            '0'...'9' => return self.number(),
-            'A'...'Z', 'a'...'z', '_' => return self.identifier(),
-            else => {
-                defer self.advance();
-                return .{
-                    .tag = .invalid,
-                    .literal = .{ .string = "Unexpected character" },
-                    .line = self.line,
-                    .col = self.col,
-                };
+            .percent => switch (c) {
+                '=' => {
+                    result.tag = .percent_equal;
+                    self.index += 1;
+                    break;
+                },
+                else => {
+                    result.tag = .percent;
+                    break;
+                },
+            },
+            .plus => switch (c) {
+                '=' => {
+                    result.tag = .plus_equal;
+                    self.index += 1;
+                    break;
+                },
+                else => {
+                    result.tag = .plus;
+                    break;
+                },
+            },
+            .caret => switch (c) {
+                '=' => {
+                    result.tag = .caret_equal;
+                    self.index += 1;
+                    break;
+                },
+                else => {
+                    result.tag = .caret;
+                    break;
+                },
+            },
+            .tilde => switch (c) {
+                '=' => {
+                    result.tag = .tilde_equal;
+                    self.index += 1;
+                    break;
+                },
+                else => {
+                    result.tag = .tilde;
+                    break;
+                },
+            },
+            .identifier => switch (c) {
+                'A'...'Z', 'a'...'z', '0'...'9', '_' => {},
+                else => {
+                    if (Token.getKeyword(self.buffer[result.loc.start..self.index])) |tag| {
+                        result.tag = tag;
+                    }
+                    break;
+                },
+            },
+            .backslash => switch (c) {
+                '\\' => {
+                    state = .multiline_string_literal_line;
+                },
+                else => {
+                    result.tag = .invalid;
+                    break;
+                },
+            },
+            .string_literal => switch (c) {
+                '\\' => {
+                    state = .string_literal_backslash;
+                },
+                '"' => {
+                    self.index += 1;
+                    break;
+                },
+                0 => {
+                    if (self.index == self.buffer.len) {
+                        result.tag = .invalid;
+                        break;
+                    }
+                },
+                '\n' => {
+                    result.tag = .invalid;
+                    break;
+                },
+                else => {},
+            },
+            .string_literal_single_quote => switch (c) {
+                '\\' => {
+                    state = .string_literal_backslash;
+                },
+                '\'' => {
+                    self.index += 1;
+                    break;
+                },
+                0 => {
+                    if (self.index == self.buffer.len) {
+                        result.tag = .invalid;
+                        break;
+                    }
+                },
+                '\n' => {
+                    result.tag = .invalid;
+                    break;
+                },
+                else => {},
+            },
+            .string_literal_backslash => switch (c) {
+                0, '\n' => {
+                    result.tag = .invalid;
+                    break;
+                },
+                else => {
+                    state = .string_literal;
+                },
+            },
+            .multiline_string_literal_line => switch (c) {
+                0 => {
+                    break;
+                },
+                '\n' => {
+                    self.index += 1;
+                    break;
+                },
+                else => {},
+            },
+            .bang => switch (c) {
+                '=' => {
+                    result.tag = .bang_equal;
+                    self.index += 1;
+                    break;
+                },
+                else => {
+                    result.tag = .bang;
+                    break;
+                },
+            },
+            .pipe => switch (c) {
+                '=' => {
+                    result.tag = .pipe_equal;
+                    self.index += 1;
+                    break;
+                },
+                '>' => {
+                    result.tag = .pipe_r_angle_bracket;
+                    self.index += 1;
+                    break;
+                },
+                else => {
+                    result.tag = .pipe;
+                    break;
+                },
+            },
+            .equal => switch (c) {
+                '=' => {
+                    result.tag = .equal_equal;
+                    self.index += 1;
+                    break;
+                },
+                '>' => {
+                    result.tag = .equal_r_angle_bracket;
+                    self.index += 1;
+                    break;
+                },
+                else => {
+                    result.tag = .equal;
+                    break;
+                },
+            },
+            .minus => switch (c) {
+                '=' => {
+                    result.tag = .minus_equal;
+                    self.index += 1;
+                    break;
+                },
+                '>' => {
+                    result.tag = .minus_r_angle_bracket;
+                    self.index += 1;
+                    break;
+                },
+                else => {
+                    result.tag = .minus;
+                    break;
+                },
+            },
+            .l_angle_bracket => switch (c) {
+                '=' => {
+                    result.tag = .l_angle_bracket_equal;
+                    self.index += 1;
+                    break;
+                },
+                '<' => {
+                    state = .l_angle_bracket_angle_bracket;
+                },
+                else => {
+                    result.tag = .l_angle_bracket;
+                    break;
+                },
+            },
+            .l_angle_bracket_angle_bracket => switch (c) {
+                '=' => {
+                    result.tag = .l_angle_bracket_angle_bracket_equal;
+                    self.index += 1;
+                    break;
+                },
+                else => {
+                    result.tag = .l_angle_bracket_angle_bracket;
+                    break;
+                },
+            },
+            .r_angle_bracket => switch (c) {
+                '=' => {
+                    result.tag = .r_angle_bracket_equal;
+                    self.index += 1;
+                    break;
+                },
+                '>' => {
+                    state = .r_angle_bracket_angle_bracket;
+                },
+                else => {
+                    result.tag = .r_angle_bracket;
+                    break;
+                },
+            },
+            .r_angle_bracket_angle_bracket => switch (c) {
+                '=' => {
+                    result.tag = .r_angle_bracket_angle_bracket_equal;
+                    self.index += 1;
+                    break;
+                },
+                else => {
+                    result.tag = .r_angle_bracket_angle_bracket;
+                    break;
+                },
+            },
+            .period => switch (c) {
+                '.' => {
+                    result.tag = .ellipsis2;
+                    self.index += 1;
+                    break;
+                },
+                else => {
+                    result.tag = .period;
+                    break;
+                },
+            },
+            .slash => switch (c) {
+                '=' => {
+                    result.tag = .slash_equal;
+                    self.index += 1;
+                    break;
+                },
+                else => {
+                    result.tag = .slash;
+                    break;
+                },
+            },
+            .comment_line => switch (c) {
+                0 => {
+                    if (self.index != self.buffer.len) {
+                        result.tag = .invalid;
+                        self.index += 1;
+                    }
+                    break;
+                },
+                '\n' => {
+                    result.tag = .newline;
+                    result.loc.start = self.index;
+                    self.index += 1;
+                    break;
+                },
+                else => {},
+            },
+            .int => switch (c) {
+                '.' => {
+                    state = .int_period;
+                },
+                '_', 'a'...'d', 'f'...'o', 'q'...'z', 'A'...'D', 'F'...'O', 'Q'...'Z', '0'...'9' => {},
+                'e', 'E', 'p', 'P' => {
+                    state = .int_exponent;
+                },
+                else => {
+                    break;
+                },
+            },
+            .int_exponent => switch (c) {
+                '-', '+' => {
+                    state = .float;
+                    result.tag = .float_literal;
+                },
+                else => {
+                    self.index -= 1;
+                    state = .int;
+                },
+            },
+            .int_period => switch (c) {
+                '_', 'a'...'d', 'f'...'o', 'q'...'z', 'A'...'D', 'F'...'O', 'Q'...'Z', '0'...'9' => {
+                    state = .float;
+                    result.tag = .float_literal;
+                },
+                'e', 'E', 'p', 'P' => {
+                    state = .float_exponent;
+                    result.tag = .float_literal;
+                },
+                else => {
+                    self.index -= 1;
+                    break;
+                },
+            },
+            .float => switch (c) {
+                '_', 'a'...'d', 'f'...'o', 'q'...'z', 'A'...'D', 'F'...'O', 'Q'...'Z', '0'...'9' => {},
+                'e', 'E', 'p', 'P' => {
+                    state = .float_exponent;
+                },
+                else => {
+                    break;
+                },
+            },
+            .float_exponent => switch (c) {
+                '-', '+' => {
+                    state = .float;
+                },
+                else => {
+                    self.index -= 1;
+                    state = .float;
+                },
             },
         }
     }
-}
 
-inline fn advance(self: *Tokenizer) void {
-    self.index += 1;
-    self.col += 1;
-}
-
-inline fn token(self: *Tokenizer, comptime tag: Token.Tag) Token {
-    const len = comptime if (tag.lexeme()) |lexeme| lexeme.len else 0;
-    self.index += len;
-    defer self.col += len;
-    return .{
-        .tag = tag,
-        .literal = null,
-        .line = self.line,
-        .col = self.col,
-    };
-}
-
-inline fn tokenWithEqual(self: *Tokenizer, comptime tag: Token.Tag) Token {
-    if (self.buffer[self.index + 1] == '=') {
-        @setEvalBranchQuota(100_000);
-        const tag_equal = comptime std.meta.stringToEnum(Token.Tag, @tagName(tag) ++ "_equal").?;
-        return self.token(tag_equal);
-    } else {
-        return self.token(tag);
-    }
-}
-
-// TODO: escape sequences
-// TODO: multiline strings
-// TODO: string interpolation?
-fn string(self: *Tokenizer) Token {
-    std.debug.assert(self.buffer[self.index] == '"');
-    const col = self.col;
-    self.advance();
-    const start = self.index;
-    const end = std.mem.indexOfScalar(u8, self.buffer[self.index..], '"') orelse {
-        self.index = self.buffer.len;
-        return .{
-            .tag = .invalid,
-            .literal = .{ .string = "Unterminated string" },
-            .line = self.line,
-            .col = col,
-        };
-    };
-    self.index += end + 1;
-    self.col += end + 1;
-    std.debug.assert(self.buffer[self.index - 1] == '"');
-    const bytes = self.buffer[start .. start + end];
-
-    if (std.mem.indexOfScalar(u8, bytes, '\n')) |i| {
-        self.col = bytes.len - i; // TODO
-        return .{
-            .tag = .invalid,
-            .literal = .{ .string = "Multiline string" },
-            .line = self.line,
-            .col = col,
-        };
+    if (result.tag == .eof) {
+        result.loc.start = self.index;
     }
 
-    return .{
-        .tag = .string,
-        .literal = .{ .string = bytes },
-        .line = self.line,
-        .col = col,
-    };
+    result.loc.end = self.index;
+    return result;
 }
 
-fn number(self: *Tokenizer) Token {
-    std.debug.assert(std.ascii.isDigit(self.buffer[self.index]));
-    const col = self.col;
-    const start = self.index;
-    self.advance();
-    while (std.ascii.isDigit(self.buffer[self.index])) {
-        self.advance();
-    }
-
-    if (self.buffer[self.index] == '.' and std.ascii.isDigit(self.buffer[self.index + 1])) {
-        self.index += 2;
-        self.col += 2;
-        while (std.ascii.isDigit(self.buffer[self.index])) {
-            self.advance();
-        }
-    } else {
-        // unsigned integer
-    }
-
-    const end = self.index;
-    const value = std.fmt.parseFloat(f64, self.buffer[start..end]) catch unreachable;
-    return .{
-        .tag = .number,
-        .literal = .{ .number = value },
-        .line = self.line,
-        .col = col,
-    };
+test "keywords" {
+    const source = try std.mem.joinZ(std.testing.allocator, " ", Token.keywords.keys());
+    defer std.testing.allocator.free(source);
+    try testTokenize(source, Token.keywords.values());
 }
 
-fn identifier(self: *Tokenizer) Token {
-    const col = self.col;
-    const start = self.index;
-    self.advance();
-    while (true) {
-        switch (self.buffer[self.index]) {
-            'A'...'Z', 'a'...'z', '0'...'9', '_' => self.advance(),
-            else => break,
-        }
-    }
-    const end = self.index;
-    const bytes = self.buffer[start..end];
+test "line comment followed by statement" {
+    try testTokenize(
+        \\# comment
+        \\let x: int = 32
+        \\
+    , &.{
+        .newline,
+        .keyword_let,
+        .identifier,
+        .colon,
+        .identifier,
+        .equal,
+        .int_literal,
+        .newline,
+    });
+}
 
-    const tag = Token.getKeyword(bytes) orelse .identifier;
-    return .{
-        .tag = tag,
-        .literal = if (tag == .identifier) .{ .string = bytes } else null,
-        .line = self.line,
-        .col = col,
-    };
+test "string literal with single quotes" {
+    try testTokenize(
+        \\'hello "world"'
+        \\
+    , &.{
+        .string_literal,
+        .newline,
+    });
+}
+
+test "multiline string literal" {
+    try testTokenize(
+        \\\\hello
+        \\\\world
+        \\\\
+    , &.{
+        .multiline_string_literal_line,
+        .multiline_string_literal_line,
+        .multiline_string_literal_line,
+    });
+}
+
+test "statement with comment" {
+    try testTokenize(
+        \\let x = "string" ; this is a comment
+        \\
+    , &.{
+        .keyword_let,
+        .identifier,
+        .equal,
+        .string_literal,
+        .newline,
+    });
+}
+
+test "newline in string literal" {
+    try testTokenize(
+        \\"
+        \\"
+    , &.{
+        .invalid,
+        .newline,
+        .invalid,
+    });
+}
+
+test "multiple comment lines" {
+    try testTokenize(
+        \\# a
+        \\; b
+        \\# a
+        \\# c
+        \\
+    , &.{
+        .newline,
+        .newline,
+        .newline,
+        .newline,
+    });
+}
+
+test "fake multiline string" {
+    try testTokenize(
+        \\"     \
+        \\      \
+        \\"
+    , &.{
+        .invalid,
+        .newline,
+        .invalid,
+        .newline,
+        .invalid,
+    });
+}
+
+test "UTF-8 BOM is recognized and skipped" {
+    try testTokenize("\xEF\xBB\xBFa\n", &.{
+        .identifier,
+        .newline,
+    });
+}
+
+test "small program" {
+    try testTokenize(
+        \\doNothing(arg: str) str {
+        \\    return arg
+        \\}
+        \\main() {
+        \\    doNothing("hello")
+        \\}
+        \\
+    , &.{
+        .identifier,
+        .l_paren,
+        .identifier,
+        .colon,
+        .identifier,
+        .r_paren,
+        .identifier,
+        .l_brace,
+        .newline,
+        .keyword_return,
+        .identifier,
+        .newline,
+        .r_brace,
+        .newline,
+        .identifier,
+        .l_paren,
+        .r_paren,
+        .l_brace,
+        .newline,
+        .identifier,
+        .l_paren,
+        .string_literal,
+        .r_paren,
+        .newline,
+        .r_brace,
+        .newline,
+    });
+}
+
+test "assignment operators" {
+    try testTokenize(
+        \\x = 1
+        \\x += 1
+        \\x -= 1
+        \\x *= 1
+        \\x /= 1
+        \\x %= 1
+        \\x &= 1
+        \\x |= 1
+        \\x ^= 1
+        \\x <<= 1
+        \\x >>= 1
+        \\
+    , &.{
+        .identifier, .equal,                               .int_literal, .newline,
+        .identifier, .plus_equal,                          .int_literal, .newline,
+        .identifier, .minus_equal,                         .int_literal, .newline,
+        .identifier, .asterisk_equal,                      .int_literal, .newline,
+        .identifier, .slash_equal,                         .int_literal, .newline,
+        .identifier, .percent_equal,                       .int_literal, .newline,
+        .identifier, .ampersand_equal,                     .int_literal, .newline,
+        .identifier, .pipe_equal,                          .int_literal, .newline,
+        .identifier, .caret_equal,                         .int_literal, .newline,
+        .identifier, .l_angle_bracket_angle_bracket_equal, .int_literal, .newline,
+        .identifier, .r_angle_bracket_angle_bracket_equal, .int_literal, .newline,
+    });
+}
+
+test "pipe into functions" {
+    try testTokenize(
+        \\"81" |> int_of_string |> float_of_int |> sqrt |> int_of_float
+        \\
+    , &.{
+        .string_literal,
+        .pipe_r_angle_bracket,
+        .identifier,
+        .pipe_r_angle_bracket,
+        .identifier,
+        .pipe_r_angle_bracket,
+        .identifier,
+        .pipe_r_angle_bracket,
+        .identifier,
+        .newline,
+    });
+}
+
+test "range literals" {
+    try testTokenize("0..9", &.{ .int_literal, .ellipsis2, .int_literal });
+    try testTokenize("0x00..0x09", &.{ .int_literal, .ellipsis2, .int_literal });
+    try testTokenize("0b00..0b11", &.{ .int_literal, .ellipsis2, .int_literal });
+    try testTokenize("0o00..0o11", &.{ .int_literal, .ellipsis2, .int_literal });
+}
+
+test "int literals decimal" {
+    try testTokenize("0", &.{.int_literal});
+    try testTokenize("1", &.{.int_literal});
+    try testTokenize("2", &.{.int_literal});
+    try testTokenize("3", &.{.int_literal});
+    try testTokenize("4", &.{.int_literal});
+    try testTokenize("5", &.{.int_literal});
+    try testTokenize("6", &.{.int_literal});
+    try testTokenize("7", &.{.int_literal});
+    try testTokenize("8", &.{.int_literal});
+    try testTokenize("9", &.{.int_literal});
+    try testTokenize("1..", &.{ .int_literal, .ellipsis2 });
+    try testTokenize("0a", &.{.int_literal});
+    try testTokenize("9b", &.{.int_literal});
+    try testTokenize("1z", &.{.int_literal});
+    try testTokenize("1z_1", &.{.int_literal});
+    try testTokenize("9z3", &.{.int_literal});
+
+    try testTokenize("0_0", &.{.int_literal});
+    try testTokenize("0001", &.{.int_literal});
+    try testTokenize("01234567890", &.{.int_literal});
+    try testTokenize("012_345_6789_0", &.{.int_literal});
+    try testTokenize("0_1_2_3_4_5_6_7_8_9_0", &.{.int_literal});
+
+    try testTokenize("00_", &.{.int_literal});
+    try testTokenize("0_0_", &.{.int_literal});
+    try testTokenize("0__0", &.{.int_literal});
+    try testTokenize("0_0f", &.{.int_literal});
+    try testTokenize("0_0_f", &.{.int_literal});
+    try testTokenize("0_0_f_00", &.{.int_literal});
+    try testTokenize("1_,", &.{ .int_literal, .comma });
+
+    try testTokenize("0e0", &.{.int_literal});
+    try testTokenize("1e0", &.{.int_literal});
+    try testTokenize("1e100", &.{.int_literal});
+    try testTokenize("1e", &.{.int_literal});
+}
+
+test "float literals decimal" {
+    try testTokenize("1.", &.{ .int_literal, .period });
+    try testTokenize("1.+", &.{ .int_literal, .period, .plus });
+
+    try testTokenize("0.0", &.{.float_literal});
+    try testTokenize("1.0", &.{.float_literal});
+    try testTokenize("0._", &.{.float_literal});
+    try testTokenize("10.0", &.{.float_literal});
+    try testTokenize("1.0e100", &.{.float_literal});
+    try testTokenize("1.0e+100", &.{.float_literal});
+    try testTokenize("1.0e-100", &.{.float_literal});
+    try testTokenize("1_0_0_0.0_0_0_0_0_1e1_0_0_0", &.{.float_literal});
+
+    try testTokenize("1.e100", &.{.float_literal});
+    try testTokenize("1.0e1f0", &.{.float_literal});
+    try testTokenize("1.0p100", &.{.float_literal});
+    try testTokenize("1.0p-100", &.{.float_literal});
+    try testTokenize("1.0p1f0", &.{.float_literal});
+    try testTokenize("1.0_,", &.{ .float_literal, .comma });
+    try testTokenize("1_.0", &.{.float_literal});
+    try testTokenize("1._", &.{.float_literal});
+    try testTokenize("1.a", &.{.float_literal});
+    try testTokenize("1.z", &.{.float_literal});
+    try testTokenize("1._0", &.{.float_literal});
+    try testTokenize("1._+", &.{ .float_literal, .plus });
+    try testTokenize("1._e", &.{.float_literal});
+    try testTokenize("1.0e", &.{.float_literal});
+    try testTokenize("1.0e,", &.{ .float_literal, .comma });
+    try testTokenize("1.0e_", &.{.float_literal});
+    try testTokenize("1.0e+_", &.{.float_literal});
+    try testTokenize("1.0e-_", &.{.float_literal});
+    try testTokenize("1.0e0_+", &.{ .float_literal, .plus });
+}
+
+test "number literals binary" {
+    try testTokenize("0b0", &.{.int_literal});
+    try testTokenize("0b1", &.{.int_literal});
+    try testTokenize("0b2", &.{.int_literal});
+    try testTokenize("0b3", &.{.int_literal});
+    try testTokenize("0b4", &.{.int_literal});
+    try testTokenize("0b5", &.{.int_literal});
+    try testTokenize("0b6", &.{.int_literal});
+    try testTokenize("0b7", &.{.int_literal});
+    try testTokenize("0b8", &.{.int_literal});
+    try testTokenize("0b9", &.{.int_literal});
+    try testTokenize("0ba", &.{.int_literal});
+    try testTokenize("0bb", &.{.int_literal});
+    try testTokenize("0bc", &.{.int_literal});
+    try testTokenize("0bd", &.{.int_literal});
+    try testTokenize("0be", &.{.int_literal});
+    try testTokenize("0bf", &.{.int_literal});
+    try testTokenize("0bz", &.{.int_literal});
+
+    try testTokenize("0b0000_0000", &.{.int_literal});
+    try testTokenize("0b1111_1111", &.{.int_literal});
+    try testTokenize("0b10_10_10_10", &.{.int_literal});
+    try testTokenize("0b0_1_0_1_0_1_0_1", &.{.int_literal});
+    try testTokenize("0b1.", &.{ .int_literal, .period });
+    try testTokenize("0b1.0", &.{.float_literal});
+
+    try testTokenize("0B0", &.{.int_literal});
+    try testTokenize("0b_", &.{.int_literal});
+    try testTokenize("0b_0", &.{.int_literal});
+    try testTokenize("0b1_", &.{.int_literal});
+    try testTokenize("0b0__1", &.{.int_literal});
+    try testTokenize("0b0_1_", &.{.int_literal});
+    try testTokenize("0b1e", &.{.int_literal});
+    try testTokenize("0b1p", &.{.int_literal});
+    try testTokenize("0b1e0", &.{.int_literal});
+    try testTokenize("0b1p0", &.{.int_literal});
+    try testTokenize("0b1_,", &.{ .int_literal, .comma });
+}
+
+test "number literals octal" {
+    try testTokenize("0o0", &.{.int_literal});
+    try testTokenize("0o1", &.{.int_literal});
+    try testTokenize("0o2", &.{.int_literal});
+    try testTokenize("0o3", &.{.int_literal});
+    try testTokenize("0o4", &.{.int_literal});
+    try testTokenize("0o5", &.{.int_literal});
+    try testTokenize("0o6", &.{.int_literal});
+    try testTokenize("0o7", &.{.int_literal});
+    try testTokenize("0o8", &.{.int_literal});
+    try testTokenize("0o9", &.{.int_literal});
+    try testTokenize("0oa", &.{.int_literal});
+    try testTokenize("0ob", &.{.int_literal});
+    try testTokenize("0oc", &.{.int_literal});
+    try testTokenize("0od", &.{.int_literal});
+    try testTokenize("0oe", &.{.int_literal});
+    try testTokenize("0of", &.{.int_literal});
+    try testTokenize("0oz", &.{.int_literal});
+
+    try testTokenize("0o01234567", &.{.int_literal});
+    try testTokenize("0o0123_4567", &.{.int_literal});
+    try testTokenize("0o01_23_45_67", &.{.int_literal});
+    try testTokenize("0o0_1_2_3_4_5_6_7", &.{.int_literal});
+    try testTokenize("0o7.", &.{ .int_literal, .period });
+    try testTokenize("0o7.0", &.{.float_literal});
+
+    try testTokenize("0O0", &.{.int_literal});
+    try testTokenize("0o_", &.{.int_literal});
+    try testTokenize("0o_0", &.{.int_literal});
+    try testTokenize("0o1_", &.{.int_literal});
+    try testTokenize("0o0__1", &.{.int_literal});
+    try testTokenize("0o0_1_", &.{.int_literal});
+    try testTokenize("0o1e", &.{.int_literal});
+    try testTokenize("0o1p", &.{.int_literal});
+    try testTokenize("0o1e0", &.{.int_literal});
+    try testTokenize("0o1p0", &.{.int_literal});
+    try testTokenize("0o_,", &.{ .int_literal, .comma });
+}
+
+test "number literals hexadecimal" {
+    try testTokenize("0x0", &.{.int_literal});
+    try testTokenize("0x1", &.{.int_literal});
+    try testTokenize("0x2", &.{.int_literal});
+    try testTokenize("0x3", &.{.int_literal});
+    try testTokenize("0x4", &.{.int_literal});
+    try testTokenize("0x5", &.{.int_literal});
+    try testTokenize("0x6", &.{.int_literal});
+    try testTokenize("0x7", &.{.int_literal});
+    try testTokenize("0x8", &.{.int_literal});
+    try testTokenize("0x9", &.{.int_literal});
+    try testTokenize("0xa", &.{.int_literal});
+    try testTokenize("0xb", &.{.int_literal});
+    try testTokenize("0xc", &.{.int_literal});
+    try testTokenize("0xd", &.{.int_literal});
+    try testTokenize("0xe", &.{.int_literal});
+    try testTokenize("0xf", &.{.int_literal});
+    try testTokenize("0xA", &.{.int_literal});
+    try testTokenize("0xB", &.{.int_literal});
+    try testTokenize("0xC", &.{.int_literal});
+    try testTokenize("0xD", &.{.int_literal});
+    try testTokenize("0xE", &.{.int_literal});
+    try testTokenize("0xF", &.{.int_literal});
+    try testTokenize("0x0z", &.{.int_literal});
+    try testTokenize("0xz", &.{.int_literal});
+
+    try testTokenize("0x0123456789ABCDEF", &.{.int_literal});
+    try testTokenize("0x0123_4567_89AB_CDEF", &.{.int_literal});
+    try testTokenize("0x01_23_45_67_89AB_CDE_F", &.{.int_literal});
+    try testTokenize("0x0_1_2_3_4_5_6_7_8_9_A_B_C_D_E_F", &.{.int_literal});
+
+    try testTokenize("0X0", &.{.int_literal});
+    try testTokenize("0x_", &.{.int_literal});
+    try testTokenize("0x_1", &.{.int_literal});
+    try testTokenize("0x1_", &.{.int_literal});
+    try testTokenize("0x0__1", &.{.int_literal});
+    try testTokenize("0x0_1_", &.{.int_literal});
+    try testTokenize("0x_,", &.{ .int_literal, .comma });
+    try testTokenize("0x1p0", &.{.int_literal});
+    try testTokenize("0xfp0", &.{.int_literal});
+
+    try testTokenize("0x1e", &.{.int_literal});
+    try testTokenize("0x1e0", &.{.int_literal});
+    try testTokenize("0x1p", &.{.int_literal});
+    try testTokenize("0xfp0z1", &.{.int_literal});
+    try testTokenize("0x0p0", &.{.int_literal});
+    try testTokenize("0x0_p0", &.{.int_literal});
+    try testTokenize("0xffp10", &.{.int_literal});
+}
+
+test "float literals hexadecimal" {
+    try testTokenize("0x1.", &.{ .int_literal, .period });
+    try testTokenize("0xF.", &.{ .int_literal, .period });
+    try testTokenize("0x1.+0xF.", &.{ .int_literal, .period, .plus, .int_literal, .period });
+    try testTokenize("0x0_.0.0", &.{ .float_literal, .period, .int_literal });
+
+    try testTokenize("0x1.0", &.{.float_literal});
+    try testTokenize("0xF.0", &.{.float_literal});
+    try testTokenize("0xF.F", &.{.float_literal});
+    try testTokenize("0xF.Fp0", &.{.float_literal});
+    try testTokenize("0xF.FP0", &.{.float_literal});
+    try testTokenize("0x1.0+0xF.0", &.{ .float_literal, .plus, .float_literal });
+
+    try testTokenize("0x0123456.789ABCDEF", &.{.float_literal});
+    try testTokenize("0x0_123_456.789_ABC_DEF", &.{.float_literal});
+    try testTokenize("0x0_1_2_3_4_5_6.7_8_9_A_B_C_D_E_F", &.{.float_literal});
+    try testTokenize("0x0.0p0", &.{.float_literal});
+    try testTokenize("0xff.ffp10", &.{.float_literal});
+    try testTokenize("0xff.ffP10", &.{.float_literal});
+    try testTokenize("0xff_ff.ff_ffp1_0_0_0", &.{.float_literal});
+    try testTokenize("0xf_f_f_f.f_f_f_fp+1_000", &.{.float_literal});
+    try testTokenize("0xf_f_f_f.f_f_f_fp-1_00_0", &.{.float_literal});
+
+    try testTokenize("0xff.p10", &.{.float_literal});
+    try testTokenize("0xff.ffpff", &.{.float_literal});
+    try testTokenize("0x0.p", &.{.float_literal});
+    try testTokenize("0x0.z", &.{.float_literal});
+    try testTokenize("0x0._", &.{.float_literal});
+    try testTokenize("0x0_.0", &.{.float_literal});
+    try testTokenize("0x0._0", &.{.float_literal});
+    try testTokenize("0x0.0_", &.{.float_literal});
+    try testTokenize("0x0_.p0", &.{.float_literal});
+    try testTokenize("0x0._p0", &.{.float_literal});
+    try testTokenize("0x0.0_p0", &.{.float_literal});
+    try testTokenize("0x0._0p0", &.{.float_literal});
+    try testTokenize("0x0.0p_0", &.{.float_literal});
+    try testTokenize("0x0.0p+_0", &.{.float_literal});
+    try testTokenize("0x0.0p-_0", &.{.float_literal});
+    try testTokenize("0x0.0p0_", &.{.float_literal});
+}
+
+test "multi line string literal with only 1 backslash" {
+    try testTokenize("x \\\n", &.{ .identifier, .invalid, .newline });
+}
+
+test "invalid token with unfinished escape right before eof" {
+    try testTokenize("\"\\", &.{.invalid});
+    try testTokenize("'\\", &.{.invalid});
+    try testTokenize("'\\u", &.{.invalid});
+}
+
+test "null byte before eof" {
+    try testTokenize("123 \x00 456", &.{ .int_literal, .invalid, .int_literal });
+    try testTokenize("#\x00", &.{.invalid});
+    try testTokenize("\\\\\x00", &.{ .multiline_string_literal_line, .invalid });
+    try testTokenize("\x00", &.{.invalid});
+    try testTokenize("# NUL\x00", &.{.invalid});
+    try testTokenize("#\x00", &.{.invalid});
+    try testTokenize("# NUL\x00", &.{.invalid});
+}
+
+fn testTokenize(source: [:0]const u8, expected_token_tags: []const Token.Tag) !void {
+    var tokenizer = Tokenizer.init(source);
+    for (expected_token_tags) |expected_token_tag| {
+        const token = tokenizer.next();
+        try std.testing.expectEqual(expected_token_tag, token.tag);
+    }
+    const last_token = tokenizer.next();
+    try std.testing.expectEqual(Token.Tag.eof, last_token.tag);
+    try std.testing.expectEqual(source.len, last_token.loc.start);
+    try std.testing.expectEqual(source.len, last_token.loc.end);
 }

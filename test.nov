@@ -16,6 +16,8 @@ while (i < 10) {
     i += 1
 }
 
-#my_func(arg1: int, arg2: str) {
+#my_func(arg1: int, mut arg2: str) {
+#    arg2 += 1
 #    print arg1
 #}
+#print arg2

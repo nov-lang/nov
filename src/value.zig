@@ -94,9 +94,9 @@ pub const String = struct {
         return string;
     }
 
-    pub fn dupe(allocator: std.mem.Allocator, const_data: []const u8) !*String {
-        const data = try allocator.dupe(u8, const_data);
-        return String.init(allocator, data);
+    pub fn dupe(allocator: std.mem.Allocator, data: []const u8) !*String {
+        const dupe_data = try allocator.dupe(u8, data);
+        return String.init(allocator, dupe_data);
     }
 
     pub fn deinit(self: *String, allocator: std.mem.Allocator) void {
