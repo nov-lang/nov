@@ -1,11 +1,11 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const clap = @import("clap");
+const ic = @import("isocline");
 const Scanner = @import("Scanner.zig");
 const Chunk = @import("Chunk.zig");
 const VM = @import("vm.zig").VM;
 const debug = @import("debug.zig");
-const ln = @import("linenoise.zig");
 
 fn usage(comptime params: anytype) !void {
     const stderr = std.io.getStdErr().writer();
@@ -91,22 +91,17 @@ fn repl(allocator: std.mem.Allocator, vm: *VM) !void {
     else
         try allocator.dupeZ(u8, "./nov-history");
     defer allocator.free(history_path);
+    ic.setHistory(history_path, 1000);
 
-    _ = ln.linenoiseHistorySetMaxLen(1000);
-    _ = ln.linenoiseHistoryLoad(history_path);
-
-    var buf: [32]u8 = undefined;
-    var i: usize = 1;
-    while (true) : (i += 1) {
-        const prompt = try std.fmt.bufPrintZ(&buf, "{d}> ", .{i});
-        if (ln.linenoise(prompt)) |bytes| {
-            const line = std.mem.span(bytes);
-            vm.interpret(allocator, line) catch {};
-            _ = ln.linenoiseHistoryAdd(bytes);
-            _ = ln.linenoiseHistorySave(history_path);
-        } else {
-            break;
-        }
+    // TODO for prompt do:
+    //> while (false) {
+    //while> i += 1
+    //while> }
+    //> print(i)
+    while (ic.readline(null)) |bytes| {
+        defer ic.free(bytes);
+        const line = std.mem.span(bytes);
+        vm.interpret(allocator, line) catch {};
     }
 }
 

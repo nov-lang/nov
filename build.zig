@@ -20,7 +20,7 @@ pub fn build(b: *std.Build) void {
         .{ .cpu_arch = .aarch64, .os_tag = .macos },
         .{ .cpu_arch = .aarch64, .os_tag = .linux },
         .{ .cpu_arch = .x86_64, .os_tag = .linux },
-        // .{ .cpu_arch = .x86_64, .os_tag = .windows }, // linenoise doesn't have windows support
+        // .{ .cpu_arch = .x86_64, .os_tag = .windows },
     };
     for (release_targets) |target_query| {
         const rel_target = b.resolveTargetQuery(target_query);
@@ -58,7 +58,7 @@ fn makeExe(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
 ) *std.Build.Step.Compile {
-    const linenoise = buildLinenoise(b, target, optimize);
+    const isocline = b.dependency("isocline-zig", .{}).module("isocline");
     const clap = b.dependency("clap", .{}).module("clap");
     const exe = b.addExecutable(.{
         .name = "nov",
@@ -66,27 +66,8 @@ fn makeExe(
         .target = target,
         .optimize = optimize,
     });
+    exe.root_module.addImport("isocline", isocline);
     exe.root_module.addImport("clap", clap);
     exe.linkLibC();
-    exe.linkLibrary(linenoise);
     return exe;
-}
-
-fn buildLinenoise(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-) *std.Build.Step.Compile {
-    const lib = b.addStaticLibrary(.{
-        .name = "linenoise",
-        .target = target,
-        .optimize = optimize,
-    });
-    lib.addIncludePath(b.path("vendor/linenoise"));
-    lib.addCSourceFile(.{
-        .file = b.path("vendor/linenoise/linenoise.c"),
-        .flags = &[_][]const u8{"-Os"},
-    });
-    lib.linkLibC();
-    return lib;
 }
