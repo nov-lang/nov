@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const clap = @import("clap");
+const kf = @import("known-folders");
 const ic = @import("isocline");
 const Scanner = @import("Scanner.zig");
 const Chunk = @import("Chunk.zig");
@@ -84,14 +85,14 @@ fn runFile(allocator: std.mem.Allocator, vm: *VM, path: []const u8) !void {
 }
 
 fn repl(allocator: std.mem.Allocator, vm: *VM) !void {
-    const history_path = if (std.posix.getenv("XDG_STATE_HOME")) |xdg_state|
-        try std.fmt.allocPrintZ(allocator, "{s}/nov-history", .{xdg_state})
-    else if (std.posix.getenv("HOME")) |home|
-        try std.fmt.allocPrintZ(allocator, "{s}/.local/state/nov-history", .{home})
-    else
-        try allocator.dupeZ(u8, "./nov-history");
-    defer allocator.free(history_path);
-    ic.setHistory(history_path, 1000);
+    if (try kf.getPath(allocator, .state)) |state_dir| {
+        defer allocator.free(state_dir);
+        const history_path = try std.fs.path.joinZ(allocator, &.{ state_dir, "nov-history" });
+        defer allocator.free(history_path);
+        ic.setHistory(history_path, 1000);
+    } else {
+        ic.setHistory(null, -1);
+    }
 
     // TODO for prompt do:
     //> while (false) {

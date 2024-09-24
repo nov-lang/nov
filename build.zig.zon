@@ -8,8 +8,13 @@
             .hash = "122062d301a203d003547b414237229b09a7980095061697349f8bef41be9c30266b",
         },
         .@"isocline-zig" = .{
-            .url = "git+https://github.com/ratakor/isocline-zig#88856ad4c7633760eb3f4e93c91abe653c5e97fe",
-            .hash = "12207e3c7338e43d2f0687b04f73fb4a07849fce1159e00f3e66cdbf3e42adbc466e",
+            .url = "git+https://github.com/ratakor/isocline-zig#949b42087c64a58307424a1d30765183171b851f",
+            .hash = "1220a6931c89c1a5d891015857e265544cdee0520b7af905103fabeaf35aa7546e18",
+        },
+        .@"known-folders" = .{
+            // TODO: replace with ziglibs once https://github.com/ziglibs/known-folders/pull/55 gets merged
+            .url = "git+https://github.com/ratakor/known-folders.git#fb176575f1ba9c0042d5a866a900f44ec6deb8f2",
+            .hash = "122019466baf1594cc2a939864890b7f9743db30f92da2e514ccc3cc03a859abc5fd",
         },
     },
     .paths = .{

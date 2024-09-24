@@ -20,7 +20,7 @@ pub fn build(b: *std.Build) void {
         .{ .cpu_arch = .aarch64, .os_tag = .macos },
         .{ .cpu_arch = .aarch64, .os_tag = .linux },
         .{ .cpu_arch = .x86_64, .os_tag = .linux },
-        // .{ .cpu_arch = .x86_64, .os_tag = .windows },
+        .{ .cpu_arch = .x86_64, .os_tag = .windows },
     };
     for (release_targets) |target_query| {
         const rel_target = b.resolveTargetQuery(target_query);
@@ -60,6 +60,7 @@ fn makeExe(
 ) *std.Build.Step.Compile {
     const isocline = b.dependency("isocline-zig", .{}).module("isocline");
     const clap = b.dependency("clap", .{}).module("clap");
+    const known_folders = b.dependency("known-folders", .{}).module("known-folders");
     const exe = b.addExecutable(.{
         .name = "nov",
         .root_source_file = b.path("src/main.zig"),
@@ -68,6 +69,7 @@ fn makeExe(
     });
     exe.root_module.addImport("isocline", isocline);
     exe.root_module.addImport("clap", clap);
+    exe.root_module.addImport("known-folders", known_folders);
     exe.linkLibC();
     return exe;
 }
