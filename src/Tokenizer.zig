@@ -93,13 +93,12 @@ pub const Token = struct {
         keyword_let,
         keyword_mut,
         keyword_loop,
-        keyword_while, // TODO: remove?
+        keyword_while,
         keyword_for,
         keyword_break,
         keyword_continue,
         keyword_true,
         keyword_false,
-        // keyword_void,
         identifier,
         string_literal,
         multiline_string_literal_line,
@@ -740,10 +739,23 @@ pub fn next(self: *Tokenizer) Token {
     return result;
 }
 
-test "keywords" {
+test "all keywords" {
     const source = try std.mem.joinZ(std.testing.allocator, " ", Token.keywords.keys());
     defer std.testing.allocator.free(source);
     try testTokenize(source, Token.keywords.values());
+}
+
+test "all tokens with lexeme" {
+    var builder: std.MultiArrayList(struct { lexeme: []const u8, tag: Token.Tag }) = .{};
+    defer builder.deinit(std.testing.allocator);
+    for (std.enums.values(Token.Tag)) |tag| {
+        if (tag.lexeme()) |lexeme| {
+            try builder.append(std.testing.allocator, .{ .lexeme = lexeme, .tag = tag });
+        }
+    }
+    const source = try std.mem.joinZ(std.testing.allocator, " ", builder.items(.lexeme));
+    defer std.testing.allocator.free(source);
+    try testTokenize(source, builder.items(.tag));
 }
 
 test "line comment followed by statement" {

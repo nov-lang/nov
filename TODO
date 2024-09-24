@@ -8,6 +8,7 @@ match, break, continue: https://craftinginterpreters.com/jumping-back-and-forth.
 
 grammar https://craftinginterpreters.com/appendix-i.html
 https://ocaml.org/docs/values-and-functions#the-pipe-operator
+https://ocaml.org/docs/basic-data-types#options--results
 
 add opt to output bytecode and to run bytecode instead of interpreting
 
@@ -25,3 +26,10 @@ Check std.zing.Ast.parse and std.zig.Ast.tokenLocation
 .nova readable bytecode file
 
 primitive types: bool, int, float, str
+** for exponential?
+handle SIG.INT
+in repl mode output statement result by default
+
+separate codegen, VM and CLI to allow embedding nov into another project and to
+make it easier to implement JIT or native compilation
+see [this](https://wren.io/embedding/) for embedding

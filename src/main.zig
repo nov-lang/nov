@@ -87,7 +87,7 @@ fn runFile(allocator: std.mem.Allocator, vm: *VM, path: []const u8) !void {
 fn repl(allocator: std.mem.Allocator, vm: *VM) !void {
     if (try kf.getPath(allocator, .state)) |state_dir| {
         defer allocator.free(state_dir);
-        const history_path = try std.fs.path.joinZ(allocator, &.{ state_dir, "nov-history" });
+        const history_path = try std.fs.path.joinZ(allocator, &.{ state_dir, "nov_history" });
         defer allocator.free(history_path);
         ic.setHistory(history_path, 1000);
     } else {
