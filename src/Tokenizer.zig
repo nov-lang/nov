@@ -70,7 +70,6 @@ pub const Token = struct {
         keyword_if,
         keyword_else,
         keyword_match,
-        keyword_print,
         keyword_return,
         keyword_let,
         keyword_mut,
@@ -100,7 +99,7 @@ pub const Token = struct {
                 .float_literal,
                 => null,
 
-                .newline => "\\n", // care, actual lexeme is "\n"
+                .newline => "\n",
                 .l_paren => "(",
                 .r_paren => ")",
                 .l_bracket => "[",
@@ -152,7 +151,6 @@ pub const Token = struct {
                 .keyword_if => "if",
                 .keyword_else => "else",
                 .keyword_match => "match",
-                .keyword_print => "print",
                 .keyword_return => "return",
                 .keyword_let => "let",
                 .keyword_mut => "mut",
@@ -167,6 +165,10 @@ pub const Token = struct {
         }
 
         pub fn symbol(tag: Tag) []const u8 {
+            if (tag == .newline) {
+                return "\\n";
+            }
+
             return tag.lexeme() orelse switch (tag) {
                 .eof => "EOF",
                 .invalid => "invalid bytes",
@@ -773,12 +775,6 @@ test "all tokens with lexeme" {
     var builder: std.MultiArrayList(struct { lexeme: []const u8, tag: Token.Tag }) = .{};
     defer builder.deinit(std.testing.allocator);
     for (std.enums.values(Token.Tag)) |tag| {
-        if (tag == .newline) {
-            // the lexeme is not the actual newline character
-            try builder.append(std.testing.allocator, .{ .lexeme = "\n", .tag = tag });
-            continue;
-        }
-
         if (tag.lexeme()) |lexeme| {
             try builder.append(std.testing.allocator, .{ .lexeme = lexeme, .tag = tag });
         }

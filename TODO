@@ -53,3 +53,9 @@ add a try catch system or something to deal with errors
 slice_type is maybe a little doomed because it's a pointer in the original parser -> fix that
 
 replace comma at the end of a match prong with newline?
+
+render parser error with caret under the error + full line info
+
+`print i` throw a expected new line after statement which is not a very good error message
+
+giving "}}" to Parser result in an infinite loop

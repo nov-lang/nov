@@ -138,7 +138,7 @@ pub fn tokenSlice(self: Ast, token_index: TokenIndex) []const u8 {
     }
 
     // For some tokens, re-tokenization is needed to find the end.
-    var tokenizer: std.zig.Tokenizer = .{
+    var tokenizer: Tokenizer = .{
         .buffer = self.source,
         .index = token_starts[token_index],
     };
@@ -794,12 +794,428 @@ pub fn getNodeSource(self: Ast, node: Node.Index) []const u8 {
     return self.source[start..end];
 }
 
-// TODO: globalVarDecl() ...
+pub fn varDecl(self: Ast, node: Node.Index) full.VarDecl {
+    assert(self.nodes.items(.tag)[node] == .var_decl);
+    const data = self.nodes.items(.data)[node];
+    return (.{
+        .ast = .{
+            .let_token = self.nodes.items(.main_token)[node],
+            .mut_token = null,
+            .type_node = data.lhs,
+            .init_node = data.rhs,
+        },
+    });
+}
 
-// TODO: fullVarDecl() ...
+pub fn mutVarDecl(self: Ast, node: Node.Index) full.VarDecl {
+    assert(self.nodes.items(.tag)[node] == .mut_var_decl);
+    const data = self.nodes.items(.data)[node];
+    return (.{
+        .ast = .{
+            .let_token = self.nodes.items(.main_token)[node],
+            .mut_token = self.nodes.items(.main_token)[node] + 1,
+            .type_node = data.lhs,
+            .init_node = data.rhs,
+        },
+    });
+}
 
+// TODO: assignDestructure
+
+pub fn ifSimple(self: Ast, node: Node.Index) full.If {
+    assert(self.nodes.items(.tag)[node] == .@"if");
+    const data = self.nodes.items(.data)[node];
+    return (.{
+        .else_token = undefined,
+        .ast = .{
+            .if_token = self.nodes.items(.main_token)[node],
+            .cond_expr = data.lhs,
+            .then_expr = data.rhs,
+            .else_expr = 0,
+        },
+    });
+}
+
+pub fn ifElse(self: Ast, node: Node.Index) full.If {
+    assert(self.nodes.items(.tag)[node] == .if_else);
+    const data = self.nodes.items(.data)[node];
+    const extra = self.extraData(data.rhs, Node.If);
+    return (.{
+        .else_token = self.lastToken(extra.then_expr) + 1,
+        .ast = .{
+            .if_token = self.nodes.items(.main_token)[node],
+            .cond_expr = data.lhs,
+            .then_expr = extra.then_expr,
+            .else_expr = extra.then_expr,
+        },
+    });
+}
+
+pub fn fnProtoOne(self: Ast, node: Node.Index) full.FnProto {
+    assert(self.nodes.items(.tag)[node] == .fn_proto_one);
+    const data = self.nodes.items(.data)[node];
+    const params: *const [1]Node.Index = @ptrCast(&data.lhs);
+    return self.fullFnProtoComponents(.{
+        .proto_node = node,
+        .fn_token = self.nodes.items(.main_token)[node],
+        .return_type = data.rhs,
+        .params = if (data.lhs == 0) params[0..0] else params[0..1],
+    });
+}
+
+pub fn fnProto(self: Ast, node: Node.Index) full.FnProto {
+    assert(self.nodes.items(.tag)[node] == .fn_proto);
+    const data = self.nodes.items(.data)[node];
+    const params_range = self.extraData(data.lhs, Node.SubRange);
+    const params = self.extra_data[params_range.start..params_range.end];
+    return self.fullFnProtoComponents(.{
+        .proto_node = node,
+        .fn_token = self.nodes.items(.main_token)[node],
+        .return_type = data.rhs,
+        .params = params,
+    });
+}
+
+pub fn sliceInitOne(self: Ast, buffer: *[1]Node.Index, node: Node.Index) full.SliceInit {
+    assert(self.nodes.items(.tag)[node] == .slice_init_one);
+    const data = self.nodes.items(.data)[node];
+    buffer[0] = data.rhs;
+    const elements = if (data.rhs == 0) buffer[0..0] else buffer[0..1];
+    return .{
+        .ast = .{
+            .lbrace = self.nodes.items(.main_token)[node],
+            .elements = elements,
+            .type_expr = data.lhs,
+        },
+    };
+}
+
+pub fn sliceInitDotTwo(self: Ast, buffer: *[2]Node.Index, node: Node.Index) full.SliceInit {
+    assert(self.nodes.items(.tag)[node] == .slice_init_dot_two);
+    const data = self.nodes.items(.data)[node];
+    buffer.* = .{ data.lhs, data.rhs };
+    const elements = if (data.rhs != 0)
+        buffer[0..2]
+    else if (data.lhs != 0)
+        buffer[0..1]
+    else
+        buffer[0..0];
+    return .{
+        .ast = .{
+            .lbrace = self.nodes.items(.main_token)[node],
+            .elements = elements,
+            .type_expr = 0,
+        },
+    };
+}
+
+pub fn sliceInitDot(self: Ast, node: Node.Index) full.SliceInit {
+    assert(self.nodes.items(.tag)[node] == .slice_init_dot);
+    const data = self.nodes.items(.data)[node];
+    return .{
+        .ast = .{
+            .lbrace = self.nodes.items(.main_token)[node],
+            .elements = self.extra_data[data.lhs..data.rhs],
+            .type_expr = 0,
+        },
+    };
+}
+
+pub fn sliceInit(self: Ast, node: Node.Index) full.SliceInit {
+    assert(self.nodes.items(.tag)[node] == .slice_init or
+        self.nodes.items(.tag)[node] == .slice_init_comma);
+    const data = self.nodes.items(.data)[node];
+    const elem_range = self.extraData(data.rhs, Node.SubRange);
+    return .{
+        .ast = .{
+            .lbrace = self.nodes.items(.main_token)[node],
+            .elements = self.extra_data[elem_range.start..elem_range.end],
+            .type_expr = data.lhs,
+        },
+    };
+}
+
+pub fn sliceOpen(self: Ast, node: Node.Index) full.Slice {
+    assert(self.nodes.items(.tag)[node] == .slice_open);
+    const data = self.nodes.items(.data)[node];
+    return .{
+        .ast = .{
+            .sliced = data.lhs,
+            .lbracket = self.nodes.items(.main_token)[node],
+            .start = data.rhs,
+            .end = 0,
+        },
+    };
+}
+
+pub fn slice(self: Ast, node: Node.Index) full.Slice {
+    assert(self.nodes.items(.tag)[node] == .slice);
+    const data = self.nodes.items(.data)[node];
+    const extra = self.extraData(data.rhs, Node.Slice);
+    return .{
+        .ast = .{
+            .sliced = data.lhs,
+            .lbracket = self.nodes.items(.main_token)[node],
+            .start = extra.start,
+            .end = extra.end,
+        },
+    };
+}
+
+pub fn matchCaseOne(tree: Ast, node: Node.Index) full.MatchCase {
+    const data = &tree.nodes.items(.data)[node];
+    const values: *const [1]Node.Index = @ptrCast(&data.lhs);
+    return .{
+        .ast = .{
+            .values = if (data.lhs == 0) values[0..0] else values[0..1],
+            .arrow_token = tree.nodes.items(.main_token)[node],
+            .target_expr = data.rhs,
+        },
+    };
+}
+
+pub fn matchCase(tree: Ast, node: Node.Index) full.MatchCase {
+    const data = tree.nodes.items(.data)[node];
+    const extra = tree.extraData(data.lhs, Node.SubRange);
+    return .{
+        .ast = .{
+            .values = tree.extra_data[extra.start..extra.end],
+            .arrow_token = tree.nodes.items(.main_token)[node],
+            .target_expr = data.rhs,
+        },
+    };
+}
+
+// TODO: while
+// TODO: for
+
+pub fn callOne(tree: Ast, node: Node.Index) full.Call {
+    const data = tree.nodes.items(.data)[node];
+    const args: *const [1]Node.Index = @ptrCast(&data.rhs);
+    return .{
+        .ast = .{
+            .lparen = tree.nodes.items(.main_token)[node],
+            .fn_expr = data.lhs,
+            .args = if (data.rhs != 0) args[0..1] else args[0..0],
+        },
+    };
+}
+
+pub fn callFull(tree: Ast, node: Node.Index) full.Call {
+    const data = tree.nodes.items(.data)[node];
+    const extra = tree.extraData(data.rhs, Node.SubRange);
+    return .{
+        .ast = .{
+            .lparen = tree.nodes.items(.main_token)[node],
+            .fn_expr = data.lhs,
+            .args = tree.extra_data[extra.start..extra.end],
+        },
+    };
+}
+
+fn fullFnProtoComponents(self: Ast, info: full.FnProto.Components) full.FnProto {
+    const token_tags = self.tokens.items(.tag);
+    var result: full.FnProto = .{
+        .ast = info,
+        .lparen = undefined,
+    };
+
+    const after_fn_token = info.fn_token + 1;
+    if (token_tags[after_fn_token] == .identifier) {
+        result.name_token = after_fn_token;
+        result.lparen = after_fn_token + 1;
+    } else {
+        result.lparen = after_fn_token;
+    }
+    assert(token_tags[result.lparen] == .l_paren);
+
+    return result;
+}
+
+pub fn fullVarDecl(self: Ast, node: Node.Index) ?full.VarDecl {
+    return switch (self.nodes.items(.tag)[node]) {
+        .var_decl => self.varDecl(node),
+        .mut_var_decl => self.mutVarDecl(node),
+        else => null,
+    };
+}
+
+pub fn fullIf(self: Ast, node: Node.Index) ?full.If {
+    return switch (self.nodes.items(.tag)[node]) {
+        .@"if" => self.ifSimple(node),
+        .if_else => self.ifElse(node),
+        else => null,
+    };
+}
+
+pub fn fullFnProto(self: Ast, node: Node.Index) ?full.FnProto {
+    return switch (self.nodes.items(.tag)[node]) {
+        .fn_proto_one => self.fnProtoOne(node),
+        .fn_proto => self.fnProto(node),
+        .fn_decl => self.fullFnProto(self.nodes.items(.data)[node].lhs),
+        else => null,
+    };
+}
+
+pub fn fullSliceInit(self: Ast, buffer: *[2]Node.Index, node: Node.Index) ?full.SliceInit {
+    return switch (self.nodes.items(.tag)[node]) {
+        .slice_init_one => self.sliceInitOne(buffer[0..1], node),
+        .slice_init_dot_two => self.sliceInitDotTwo(buffer, node),
+        .slice_init_dot => self.sliceInitDot(node),
+        .slice_init => self.sliceInit(node),
+        else => null,
+    };
+}
+
+pub fn fullSlice(self: Ast, node: Node.Index) ?full.Slice {
+    return switch (self.nodes.items(.tag)[node]) {
+        .slice_open => self.sliceOpen(node),
+        .slice => self.slice(node),
+        else => null,
+    };
+}
+
+// pub fn fullMatch(self: Ast, node: Node.Index) ?full.Match {
+//     return switch (self.nodes.items(.tag)[node]) {
+//         .match => self.match(node),
+//         else => null,
+//     };
+// }
+
+pub fn fullMatchCase(self: Ast, node: Node.Index) ?full.MatchCase {
+    return switch (self.nodes.items(.tag)[node]) {
+        .match_case_one => self.matchCaseOne(node),
+        .match_case => self.matchCase(node),
+        else => null,
+    };
+}
+
+pub fn fullCall(self: Ast, node: Node.Index) ?full.Call {
+    return switch (self.nodes.items(.tag)[node]) {
+        .call => self.callFull(node),
+        .call_one => self.callOne(node),
+        else => null,
+    };
+}
+
+/// Fully assembled AST node information.
 pub const full = struct {
+    pub const VarDecl = struct {
+        ast: Components,
+
+        pub const Components = struct {
+            let_token: TokenIndex,
+            mut_token: ?TokenIndex,
+            type_node: Node.Index,
+            init_node: Node.Index,
+        };
+    };
+
+    pub const If = struct {
+        /// Populated only if else_expr != 0
+        else_token: TokenIndex,
+        ast: Components,
+
+        pub const Components = struct {
+            if_token: TokenIndex,
+            cond_expr: Node.Index,
+            then_expr: Node.Index,
+            else_expr: Node.Index,
+        };
+    };
+
     // TODO
+    pub const While = struct {
+        ast: Components,
+        // payload_token: ?TokenIndex,
+        // error_token: ?TokenIndex,
+        /// Populated only if else_expr != 0.
+        else_token: TokenIndex,
+
+        pub const Components = struct {
+            while_token: TokenIndex,
+            cond_expr: Node.Index,
+            cont_expr: Node.Index,
+            then_expr: Node.Index,
+            else_expr: Node.Index,
+        };
+    };
+
+    // TODO: For
+
+    pub const FnProto = struct {
+        lparen: TokenIndex,
+        ast: Components,
+
+        pub const Components = struct {
+            proto_node: Node.Index,
+            fn_token: TokenIndex,
+            return_type: ?Node.Index,
+            params: []const Node.Index,
+        };
+
+        pub const Param = struct {
+            first_doc_comment: ?TokenIndex,
+            name_token: ?TokenIndex,
+            comptime_noalias: ?TokenIndex,
+            anytype_ellipsis3: ?TokenIndex,
+            type_expr: Node.Index,
+        };
+
+        // TODO: Iterator
+    };
+
+    pub const SliceInit = struct {
+        ast: Components,
+
+        pub const Components = struct {
+            lbrace: TokenIndex,
+            elements: []const Node.Index,
+            type_expr: Node.Index,
+        };
+    };
+
+    pub const Slice = struct {
+        ast: Components,
+
+        pub const Components = struct {
+            sliced: Node.Index,
+            lbracket: TokenIndex,
+            start: Node.Index,
+            end: Node.Index,
+        };
+    };
+
+    // pub const Match = struct {
+    //     ast: Components,
+
+    //     pub const Components = struct {
+    //         match_token: TokenIndex,
+    //         expr: Node.Index,
+    //         cases: []const Node.Index,
+    //     };
+    // };
+
+    pub const MatchCase = struct {
+        ast: Components,
+
+        pub const Components = struct {
+            /// If empty, this is the `_` case.
+            values: []const Node.Index,
+            arrow_token: TokenIndex,
+            target_expr: Node.Index,
+        };
+    };
+
+    pub const Call = struct {
+        ast: Components,
+
+        pub const Components = struct {
+            lparen: TokenIndex,
+            fn_expr: Node.Index,
+            args: []const Node.Index,
+        };
+    };
 };
 
 pub const Error = struct {
@@ -1057,6 +1473,22 @@ pub const Node = struct {
         start: Index,
         end: Index,
     };
+
+    pub const While = struct {
+        cont_expr: Index,
+        then_expr: Index,
+        else_expr: Index,
+    };
+
+    // pub const WhileCont = struct {
+    //     cont_expr: Index,
+    //     then_expr: Index,
+    // };
+
+    // pub const For = packed struct(u32) {
+    //     inputs: u32,
+    //     has_else: bool,
+    // };
 };
 
 pub const Span = struct {

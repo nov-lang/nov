@@ -125,7 +125,6 @@ fn parseTopLevel(self: *Parser) Error!Members {
                     try self.scratch.append(self.allocator, top_level_decl);
                 }
             },
-            .keyword_print,
             .keyword_if,
             .keyword_loop,
             .keyword_while,
@@ -396,10 +395,8 @@ fn parseGlobalVarDecl(self: *Parser) Error!Node.Index {
 ///      / Block
 ///      / VarDeclExprStatement
 fn expectStatement(self: *Parser, allow_defer_var: bool) Error!Node.Index {
-    // eat newlines
-    while (self.token_tags[self.tok_i] == .newline) {
-        self.tok_i += 1;
-    }
+    // TODO:
+    // self.discardNewlines();
 
     return switch (self.token_tags[self.tok_i]) {
         .keyword_if => self.expectIfStatement(),
@@ -515,7 +512,6 @@ fn expectVarDeclExprStatement(self: *Parser) Error!Node.Index {
         switch (self.nodes.items(.tag)[lhs]) {
             .var_decl, .mut_var_decl => {
                 self.nodes.items(.data)[lhs].rhs = rhs;
-                // Don't need to wrap in comptime
                 return lhs;
             },
             else => {},
@@ -1244,7 +1240,7 @@ fn parseBlock(self: *Parser) Error!Node.Index {
     const scratch_top = self.scratch.items.len;
     defer self.scratch.shrinkRetainingCapacity(scratch_top);
     while (true) {
-        std.log.debug("parseBlock: {}", .{self.token_tags[self.tok_i]});
+        self.discardNewlines();
         if (self.token_tags[self.tok_i] == .r_brace) break;
         const statement = try self.expectStatementRecoverable();
         if (statement == 0) break;
@@ -2089,6 +2085,12 @@ fn expectNewline(self: *Parser, error_tag: Ast.Error.Tag, recoverable: bool) Err
 
 fn tokensOnSameLine(self: *Parser, tok1: TokenIndex, tok2: TokenIndex) bool {
     return std.mem.indexOfScalar(u8, self.source[self.token_starts[tok1]..self.token_starts[tok2]], '\n') == null;
+}
+
+fn discardNewlines(self: *Parser) void {
+    while (self.token_tags[self.tok_i] == .newline) {
+        self.tok_i += 1;
+    }
 }
 
 fn consume(self: *Parser, tag: Token.Tag) ?TokenIndex {
