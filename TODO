@@ -37,6 +37,9 @@ see [this](https://wren.io/embedding/) for embedding
 move to zig master
 -> replace `while (true) switch` with [labeled switch/continue](https://github.com/ziglang/zig/pull/21257)
 see https://github.com/ziglang/zig/pull/21367 for tokenizer
+-> for vm implem debugLoop() (original with debug infos) and releaseLoop() (with labeled switch/continue)
+-> add min_version for build.zig
+-> update ci
 
 for Value: replace pointer with raw type and use a MultiArrayList
 -> need to improve globals in VM

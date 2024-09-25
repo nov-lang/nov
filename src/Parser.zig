@@ -32,7 +32,7 @@ pub fn parse(self: *Parser) Error!void {
         .data = undefined,
     });
     // const root_members = try self.parseContainerMembers();
-    const root_members = try self.parseGlobal();
+    const root_members = try self.parseTopLevel();
     const root_decls = try root_members.toSpan(self);
     if (self.token_tags[self.tok_i] != .eof) {
         try self.warnExpected(.eof);
@@ -104,8 +104,8 @@ fn addExtra(self: *Parser, extra: anytype) Error!Node.Index {
     return result;
 }
 
-// TODO
-fn parseGlobal(self: *Parser) Error!Members {
+/// GlobalMembers <- (Decl | Statement)*
+fn parseTopLevel(self: *Parser) Error!Members {
     const scratch_top = self.scratch.items.len;
     defer self.scratch.shrinkRetainingCapacity(scratch_top);
 
@@ -117,9 +117,13 @@ fn parseGlobal(self: *Parser) Error!Members {
             .eof => {
                 break;
             },
-            .keyword_let => {
-                self.tok_i += 1;
-                // self.parseDeclaration();
+            .keyword_let,
+            .keyword_fn,
+            => {
+                const top_level_decl = try self.expectTopLevelDeclRecoverable();
+                if (top_level_decl != 0) {
+                    // try self.scratch.append(self.allocator, top_level_decl);
+                }
             },
             .keyword_print,
             .keyword_if,
@@ -128,26 +132,21 @@ fn parseGlobal(self: *Parser) Error!Members {
             .keyword_for,
             .l_brace,
             => {
-                self.tok_i += 1;
-                // self.parseStatement();
+                const top_level_stmt = try self.expectTopLevelStatementRecoverable();
+                if (top_level_stmt != 0) {
+                    // try self.scratch.append(self.allocator, top_level_stmt);
+                }
             },
             else => {
-                const expr = self.expectExpr() catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    error.ParseError => {
-                        self.synchronize();
-                        continue;
-                    },
-                };
-                try self.scratch.append(self.allocator, expr);
+                const top_level_stmt = try self.expectTopLevelStatementRecoverable();
+                if (top_level_stmt != 0) {
+                    // try self.scratch.append(self.allocator, top_level_stmt);
+                }
             },
         }
     }
 
     const items = self.scratch.items[scratch_top..];
-    for (items) |item| {
-        std.debug.print("item: {d}, tag: {s}\n", .{ item, @tagName(self.nodes.items(.tag)[item]) });
-    }
     switch (items.len) {
         0 => return .{
             .len = 0,
@@ -197,47 +196,41 @@ fn warn(self: *Parser, error_tag: Ast.Error.Tag) Error!void {
 
 fn warnMsg(self: *Parser, msg: Ast.Error) Error!void {
     @setCold(true);
-    // switch (msg.tag) {
-    //     .expected_semi_after_decl,
-    //     .expected_semi_after_stmt,
-    //     .expected_comma_after_field,
-    //     .expected_comma_after_arg,
-    //     .expected_comma_after_param,
-    //     .expected_comma_after_initializer,
-    //     .expected_comma_after_switch_prong,
-    //     .expected_comma_after_for_operand,
-    //     .expected_comma_after_capture,
-    //     .expected_semi_or_else,
-    //     .expected_semi_or_lbrace,
-    //     .expected_token,
-    //     .expected_block,
-    //     .expected_block_or_assignment,
-    //     .expected_block_or_expr,
-    //     .expected_block_or_field,
-    //     .expected_expr,
-    //     .expected_expr_or_assignment,
-    //     .expected_fn,
-    //     .expected_inlinable,
-    //     .expected_labelable,
-    //     .expected_param_list,
-    //     .expected_prefix_expr,
-    //     .expected_primary_type_expr,
-    //     .expected_pub_item,
-    //     .expected_return_type,
-    //     .expected_suffix_op,
-    //     .expected_type_expr,
-    //     .expected_var_decl,
-    //     .expected_var_decl_or_fn,
-    //     .expected_loop_payload,
-    //     .expected_container,
-    //     => if (msg.token != 0 and !self.tokensOnSameLine(msg.token - 1, msg.token)) {
-    //         var copy = msg;
-    //         copy.token_is_prev = true;
-    //         copy.token -= 1;
-    //         return self.errors.append(self.allocator, copy);
-    //     },
-    //     else => {},
-    // }
+    switch (msg.tag) {
+        .expected_newline_after_decl,
+        .expected_newline_after_stmt,
+        .expected_newline_or_else,
+        .expected_newline_or_lbrace,
+        // .expected_comma_after_field,
+        .expected_comma_after_arg,
+        // .expected_comma_after_param,
+        // .expected_comma_after_initializer,
+        .expected_comma_after_match_prong,
+        // .expected_comma_after_for_operand,
+        // .expected_comma_after_capture,
+        .expected_token,
+        .expected_block,
+        .expected_block_or_assignment,
+        // .expected_block_or_expr,
+        // .expected_block_or_field,
+        .expected_expr,
+        .expected_expr_or_assignment,
+        // .expected_labelable,
+        // .expected_param_list,
+        .expected_prefix_expr,
+        // .expected_primary_type_expr,
+        // .expected_suffix_op,
+        .expected_type_expr,
+        // .expected_loop_payload,
+        // .expected_container,
+        => if (msg.token != 0 and !self.tokensOnSameLine(msg.token - 1, msg.token)) {
+            var copy = msg;
+            copy.token_is_prev = true;
+            copy.token -= 1;
+            return self.errors.append(self.allocator, copy);
+        },
+        else => {},
+    }
     try self.errors.append(self.allocator, msg);
 }
 
@@ -263,7 +256,6 @@ fn failMsg(self: *Parser, msg: Ast.Error) Error {
 
 /// Decl <- FnProto (NEWLINE / Block) / VarDecl
 fn expectTopLevelDecl(self: *Parser) Error!Node.Index {
-    // if (self.token_tags[self.tok_i + 1] == .l_paren) // it's a func
     const fn_proto = try self.parseFnProto();
     if (fn_proto != 0) {
         switch (self.token_tags[self.tok_i]) {
@@ -297,22 +289,19 @@ fn expectTopLevelDecl(self: *Parser) Error!Node.Index {
     }
 
     const var_decl = try self.parseGlobalVarDecl();
-    if (var_decl != 0) {
-        return var_decl;
-    }
-    return self.fail(.expected_pub_item);
+    assert(var_decl != 0);
+    return var_decl;
 }
 
 fn expectTopLevelDeclRecoverable(self: *Parser) Error!Node.Index {
     return self.expectTopLevelDecl() catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.ParseError => {
-            self.synchronize(); // findNextContainerMember
+            self.findNextContainerMember();
             return null_node;
         },
     };
 }
-// TODO: we don't have fn keyword
 /// FnProto <- KEYWORD_fn IDENTIFIER? LPAREN ParamDeclList RPAREN ByteAlign? AddrSpace? LinkSection? CallConv? EXCLAMATIONMARK? TypeExpr
 /// FnProto <- IDENTIFIER LPAREN ParamDeclList RPAREN EXCLAMATIONMARK? TypeExpr?
 fn parseFnProto(self: *Parser) Error!Node.Index {
@@ -338,7 +327,7 @@ fn parseFnProto(self: *Parser) Error!Node.Index {
         }),
         .multi => |span| {
             return self.setNode(fn_proto_index, .{
-                .tag = .fn_proto_multi,
+                .tag = .fn_proto,
                 .main_token = fn_token,
                 .data = .{
                     .lhs = try self.addExtra(Node.SubRange{
@@ -408,6 +397,8 @@ fn parseGlobalVarDecl(self: *Parser) Error!Node.Index {
 ///      / Block
 ///      / VarDeclExprStatement
 fn expectStatement(self: *Parser, allow_defer_var: bool) Error!Node.Index {
+    // TODO: eat newline?
+    // while (self.token_tags[self.tok_i] == .newline) self.tok_i += 1;
     return switch (self.token_tags[self.tok_i]) {
         .keyword_if => self.expectIfStatement(),
         .keyword_loop => self.expectLoopStatement(),
@@ -416,14 +407,17 @@ fn expectStatement(self: *Parser, allow_defer_var: bool) Error!Node.Index {
         .keyword_match => self.expectMatchExpr(),
         .l_brace => self.parseBlock(),
         else => blk: {
+            std.log.debug("expectStatement: {}", .{self.token_tags[self.tok_i]});
             // TODO: ?
-            if (allow_defer_var) {
-                break :blk self.expectVarDeclExprStatement();
-            } else {
+            _ = allow_defer_var;
+            // if (allow_defer_var) {
+            //     break :blk self.expectVarDeclExprStatement();
+            // } else {
                 const assign = try self.expectAssignExpr();
+                std.log.debug("(self.token_tags[self.tok_i]: {})", .{self.token_tags[self.tok_i]});
                 try self.expectNewline(.expected_newline_after_stmt, true);
                 break :blk assign;
-            }
+            // }
         },
     };
 }
@@ -433,7 +427,7 @@ fn expectStatementRecoverable(self: *Parser) Error!Node.Index {
         return self.expectStatement(true) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.ParseError => {
-                self.synchronize(); // findNextStmt
+                self.findNextStmt(); // findNextStmt
                 switch (self.token_tags[self.tok_i]) {
                     .r_brace => return null_node,
                     .eof => return error.ParseError,
@@ -444,7 +438,17 @@ fn expectStatementRecoverable(self: *Parser) Error!Node.Index {
     }
 }
 
-// TODO: check if good
+fn expectTopLevelStatementRecoverable(self: *Parser) Error!Node.Index {
+    return self.expectStatement(true) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.ParseError => {
+            self.findNextContainerMember(); // findNextContainerMember
+            return null_node;
+        },
+    };
+}
+
+// TODO
 /// VarDeclExprStatement
 ///    <- VarDeclProto (COMMA (VarDeclProto / Expr))* EQUAL Expr NEWLINE
 ///     / Expr (AssignOp Expr / (COMMA (VarDeclProto / Expr))+ EQUAL Expr)? NEWLINE
@@ -1241,6 +1245,7 @@ fn parseBlock(self: *Parser) Error!Node.Index {
     const scratch_top = self.scratch.items.len;
     defer self.scratch.shrinkRetainingCapacity(scratch_top);
     while (true) {
+        std.log.debug("{}", .{self.token_tags[self.tok_i]});
         if (self.token_tags[self.tok_i] == .r_brace) break;
         const statement = try self.expectStatementRecoverable();
         if (statement == 0) break;
@@ -1541,7 +1546,7 @@ fn parsePrimaryTypeExpr(self: *Parser) Error!Node.Index {
                 },
             });
         },
-        // .keyword_fn => return self.parseFnProto(),
+        .keyword_fn => return self.parseFnProto(),
         .keyword_if => return self.parseIf(expectTypeExpr),
         // .keyword_struct,
         // .keyword_opaque,
@@ -1985,41 +1990,44 @@ const SmallSpan = union(enum) {
     multi: Node.SubRange,
 };
 
+// TODO
 /// ParamDeclList <- (ParamDecl COMMA)* ParamDecl?
 fn parseParamDeclList(self: *Parser) !SmallSpan {
-    _ = try self.expectToken(.l_paren);
-    const scratch_top = self.scratch.items.len;
-    defer self.scratch.shrinkRetainingCapacity(scratch_top);
-    var varargs: union(enum) { none, seen, nonfinal: TokenIndex } = .none;
-    while (true) {
-        if (self.consume(.r_paren)) |_| break;
-        if (varargs == .seen) varargs = .{ .nonfinal = self.tok_i };
-        const param = try self.expectTypeExpr();
-        if (param != 0) {
-            try self.scratch.append(self.gpa, param);
-        } else if (self.token_tags[self.tok_i - 1] == .ellipsis3) {
-            if (varargs == .none) varargs = .seen;
-        }
-        switch (self.token_tags[self.tok_i]) {
-            .comma => self.tok_i += 1,
-            .r_paren => {
-                self.tok_i += 1;
-                break;
-            },
-            .colon, .r_brace, .r_bracket => return self.failExpected(.r_paren),
-            // Likely just a missing comma; give error but continue parsing.
-            else => try self.warn(.expected_comma_after_param),
-        }
-    }
-    if (varargs == .nonfinal) {
-        try self.warnMsg(.{ .tag = .varargs_nonfinal, .token = varargs.nonfinal });
-    }
-    const params = self.scratch.items[scratch_top..];
-    return switch (params.len) {
-        0 => SmallSpan{ .zero_or_one = 0 },
-        1 => SmallSpan{ .zero_or_one = params[0] },
-        else => SmallSpan{ .multi = try self.listToSpan(params) },
-    };
+    _ = self;
+    unreachable;
+    // _ = try self.expectToken(.l_paren);
+    // const scratch_top = self.scratch.items.len;
+    // defer self.scratch.shrinkRetainingCapacity(scratch_top);
+    // var varargs: union(enum) { none, seen, nonfinal: TokenIndex } = .none;
+    // while (true) {
+    //     if (self.consume(.r_paren)) |_| break;
+    //     if (varargs == .seen) varargs = .{ .nonfinal = self.tok_i };
+    //     const param = try self.expectTypeExpr();
+    //     if (param != 0) {
+    //         try self.scratch.append(self.allocator, param);
+    //     } else if (self.token_tags[self.tok_i - 1] == .ellipsis3) {
+    //         if (varargs == .none) varargs = .seen;
+    //     }
+    //     switch (self.token_tags[self.tok_i]) {
+    //         .comma => self.tok_i += 1,
+    //         .r_paren => {
+    //             self.tok_i += 1;
+    //             break;
+    //         },
+    //         .colon, .r_brace, .r_bracket => return self.failExpected(.r_paren),
+    //         // Likely just a missing comma; give error but continue parsing.
+    //         else => try self.warn(.expected_comma_after_param),
+    //     }
+    // }
+    // if (varargs == .nonfinal) {
+    //     try self.warnMsg(.{ .tag = .varargs_nonfinal, .token = varargs.nonfinal });
+    // }
+    // const params = self.scratch.items[scratch_top..];
+    // return switch (params.len) {
+    //     0 => SmallSpan{ .zero_or_one = 0 },
+    //     1 => SmallSpan{ .zero_or_one = params[0] },
+    //     else => SmallSpan{ .multi = try self.listToSpan(params) },
+    // };
 }
 
 // TODO: parseBuiltinCall (not yet)
@@ -2082,6 +2090,10 @@ fn expectNewline(self: *Parser, error_tag: Ast.Error.Tag, recoverable: bool) Err
     }
 }
 
+fn tokensOnSameLine(self: *Parser, tok1: TokenIndex, tok2: TokenIndex) bool {
+    return std.mem.indexOfScalar(u8, self.source[self.token_starts[tok1]..self.token_starts[tok2]], '\n') == null;
+}
+
 fn consume(self: *Parser, tag: Token.Tag) ?TokenIndex {
     return if (self.token_tags[self.tok_i] == tag) self.nextToken() else null;
 }
@@ -2092,12 +2104,16 @@ fn assertToken(self: *Parser, tag: Token.Tag) TokenIndex {
     return token;
 }
 
-fn synchronize(self: *Parser) void {
+/// Attempts to find next container member by searching for certain tokens
+fn findNextContainerMember(self: *Parser) void {
     var level: u32 = 0;
     while (true) {
         const tok = self.nextToken();
         switch (self.token_tags[tok]) {
-            .keyword_let => {
+            // Any of these can start a new top level declaration.
+            .keyword_let,
+            .keyword_fn,
+            => {
                 if (level == 0) {
                     self.tok_i -= 1;
                     return;
@@ -2109,8 +2125,8 @@ fn synchronize(self: *Parser) void {
                     return;
                 }
             },
-            //.comma,
-            .newline => {
+            .comma, .newline => {
+                // this decl was likely meant to end here
                 if (level == 0) {
                     return;
                 }
@@ -2121,10 +2137,39 @@ fn synchronize(self: *Parser) void {
             },
             .r_brace => {
                 if (level == 0) {
+                    // end of container, exit
                     self.tok_i -= 1;
                     return;
                 }
                 level -= 1;
+            },
+            .eof => {
+                self.tok_i -= 1;
+                return;
+            },
+            else => {},
+        }
+    }
+}
+
+/// Attempts to find the next statement by searching for a newline
+fn findNextStmt(self: *Parser) void {
+    var level: u32 = 0;
+    while (true) {
+        const tok = self.nextToken();
+        switch (self.token_tags[tok]) {
+            .l_brace => level += 1,
+            .r_brace => {
+                if (level == 0) {
+                    self.tok_i -= 1;
+                    return;
+                }
+                level -= 1;
+            },
+            .newline => {
+                if (level == 0) {
+                    return;
+                }
             },
             .eof => {
                 self.tok_i -= 1;

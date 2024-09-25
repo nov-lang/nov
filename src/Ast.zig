@@ -191,16 +191,6 @@ pub fn renderError(self: Ast, parse_error: Error, writer: anytype) !void {
                 token_tags[parse_error.token + @intFromBool(parse_error.token_is_prev)].symbol(),
             });
         },
-        // .expected_fn => {
-        //     return writer.print("expected function, found '{s}'", .{
-        //         token_tags[parse_error.token + @intFromBool(parse_error.token_is_prev)].symbol(),
-        //     });
-        // },
-        // .expected_inlinable => {
-        //     return writer.print("expected 'while' or 'for', found '{s}'", .{
-        //         token_tags[parse_error.token + @intFromBool(parse_error.token_is_prev)].symbol(),
-        //     });
-        // },
         // .expected_labelable => {
         //     return writer.print("expected 'while', 'for', 'inline', or '{{', found '{s}'", .{
         //         token_tags[parse_error.token + @intFromBool(parse_error.token_is_prev)].symbol(),
@@ -218,14 +208,6 @@ pub fn renderError(self: Ast, parse_error: Error, writer: anytype) !void {
         },
         // .expected_primary_type_expr => {
         //     return writer.print("expected primary type expression, found '{s}'", .{
-        //         token_tags[parse_error.token + @intFromBool(parse_error.token_is_prev)].symbol(),
-        //     });
-        // },
-        // .expected_pub_item => {
-        //     return writer.writeAll("expected function or variable declaration after pub");
-        // },
-        // .expected_return_type => {
-        //     return writer.print("expected return type expression, found '{s}'", .{
         //         token_tags[parse_error.token + @intFromBool(parse_error.token_is_prev)].symbol(),
         //     });
         // },
@@ -250,16 +232,6 @@ pub fn renderError(self: Ast, parse_error: Error, writer: anytype) !void {
                 token_tags[parse_error.token + @intFromBool(parse_error.token_is_prev)].symbol(),
             });
         },
-        // .expected_var_decl => {
-        //     return writer.print("expected variable declaration, found '{s}'", .{
-        //         token_tags[parse_error.token + @intFromBool(parse_error.token_is_prev)].symbol(),
-        //     });
-        // },
-        // .expected_var_decl_or_fn => {
-        //     return writer.print("expected variable declaration or function, found '{s}'", .{
-        //         token_tags[parse_error.token + @intFromBool(parse_error.token_is_prev)].symbol(),
-        //     });
-        // },
         // .expected_loop_payload => {
         //     return writer.print("expected loop payload, found '{s}'", .{
         //         token_tags[parse_error.token + @intFromBool(parse_error.token_is_prev)].symbol(),

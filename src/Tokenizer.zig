@@ -81,6 +81,7 @@ pub const Token = struct {
         keyword_break,
         keyword_continue,
         keyword_in,
+        keyword_fn,
         identifier,
         string_literal,
         multiline_string_literal_line,
@@ -162,6 +163,7 @@ pub const Token = struct {
                 .keyword_break => "break",
                 .keyword_continue => "continue",
                 .keyword_in => "in",
+                .keyword_fn => "fn",
             };
         }
 

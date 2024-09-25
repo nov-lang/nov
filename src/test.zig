@@ -6,10 +6,18 @@ pub fn main() !void {
     // (* (- 123) (group 45.67))
     // const source = "-123 * (45.67)\n";
     const source =
-        \\-123 * (45.67)
-        \\+ -123 * (45.67)
-        \\
+        // \\let x: int = 3
+        // \\let mut y = "salut"
+        // \\ x + y x - y
+        // \\{x + y
+        \\let x = {
+        \\    let y = 3
+        \\    y
+        \\}
+        // \\
     ;
+
+    std.log.debug("Running parser with source: \n{s}\n", .{source});
 
     const allocator = std.heap.page_allocator;
     var ast = try Ast.parse(allocator, source);
@@ -25,15 +33,18 @@ pub fn main() !void {
     }
     std.debug.print("\nErrors:", .{});
     for (ast.errors) |parse_error| {
+        std.debug.print("\n", .{});
         try ast.renderError(parse_error, std.io.getStdOut().writer());
     }
     std.debug.print("\n", .{});
-    const main_tokens = ast.nodes.items(.main_token);
-    const node_tags = ast.nodes.items(.tag);
-    const datas = ast.nodes.items(.data);
-    std.debug.print("{} {} {} {} {} {} {}\n", .{ main_tokens[1], datas[2].lhs, node_tags[datas[2].lhs], datas[5].lhs, node_tags[datas[5].lhs], datas[0].lhs, node_tags[datas[0].lhs] });
-    try @import("render.zig").renderTree(ast, std.io.getStdOut().writer());
-    std.debug.print("\n", .{});
+
+    // const main_tokens = ast.nodes.items(.main_token);
+    // const node_tags = ast.nodes.items(.tag);
+    // const datas = ast.nodes.items(.data);
+    // std.debug.print("{} {} {} {} {} {} {}\n", .{ main_tokens[1], datas[2].lhs, node_tags[datas[2].lhs], datas[5].lhs, node_tags[datas[5].lhs], datas[0].lhs, node_tags[datas[0].lhs] });
+
+    // try @import("render.zig").renderTree(ast, std.io.getStdOut().writer());
+    // std.debug.print("\n", .{});
 
     // ast.rootDecls();
     // print(&ast, 0, std.io.getStdOut().writer());
