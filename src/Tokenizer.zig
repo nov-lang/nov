@@ -17,7 +17,6 @@ pub const Token = struct {
         end: usize,
     };
 
-    // must be the same order as compiler.Parser.rules
     pub const Tag = enum {
         newline,
         l_paren,
@@ -101,7 +100,7 @@ pub const Token = struct {
                 .float_literal,
                 => null,
 
-                .newline => "\n",
+                .newline => "\\n", // care, actual lexeme is "\n"
                 .l_paren => "(",
                 .r_paren => ")",
                 .l_bracket => "[",
@@ -240,8 +239,6 @@ const State = enum {
     question_mark,
 };
 
-// this could be "simplified" with functions for similar cases and optimized
-// with SIMD but it's probably not worth it
 pub fn next(self: *Tokenizer) Token {
     var state: State = .start;
     var result: Token = .{

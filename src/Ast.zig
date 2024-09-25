@@ -5,6 +5,7 @@ const std = @import("std");
 const Parser = @import("Parser.zig");
 const Tokenizer = @import("Tokenizer.zig");
 const Token = Tokenizer.Token;
+const assert = std.debug.assert;
 
 const Ast = @This();
 
@@ -126,11 +127,31 @@ pub fn tokenLocation(self: Ast, start_offset: u32, token_index: u32) Location {
     return loc;
 }
 
+pub fn tokenSlice(self: Ast, token_index: TokenIndex) []const u8 {
+    const token_starts = self.tokens.items(.start);
+    const token_tags = self.tokens.items(.tag);
+    const token_tag = token_tags[token_index];
+
+    // Many tokens can be determined entirely by their tag.
+    if (token_tag.lexeme()) |lexeme| {
+        return lexeme;
+    }
+
+    // For some tokens, re-tokenization is needed to find the end.
+    var tokenizer: std.zig.Tokenizer = .{
+        .buffer = self.source,
+        .index = token_starts[token_index],
+    };
+    const token = tokenizer.next();
+    assert(token.tag == token_tag);
+    return self.source[token.loc.start..token.loc.end];
+}
+
 pub fn extraData(tree: Ast, index: usize, comptime T: type) T {
     const fields = std.meta.fields(T);
     var result: T = undefined;
     inline for (fields, 0..) |field, i| {
-        comptime std.debug.assert(field.type == Node.Index);
+        comptime assert(field.type == Node.Index);
         @field(result, field.name) = tree.extra_data[index + i];
     }
     return result;
@@ -356,10 +377,422 @@ pub fn renderError(self: Ast, parse_error: Error, writer: anytype) !void {
     }
 }
 
-// TODO: firstToken()
-// TODO: lastToken()
-// TODO: tokensOnSameLine()
-// TODO: getNodeSource()
+pub fn firstToken(self: Ast, node: Node.Index) TokenIndex {
+    const tags = self.nodes.items(.tag);
+    const datas = self.nodes.items(.data);
+    const main_tokens = self.nodes.items(.main_token);
+    var n = node;
+    while (true) switch (tags[n]) {
+        .root => return 0,
+        .no_op => unreachable,
+
+        .bool_not,
+        .negation,
+        .bit_not,
+        .optional_type,
+        .match,
+        .@"if",
+        .if_else,
+        .@"continue",
+        .@"break",
+        .@"return",
+        .identifier,
+        .int_literal,
+        .float_literal,
+        .string_literal,
+        .multiline_string_literal,
+        .grouped_expression,
+        .slice_type,
+        .block_two,
+        .block,
+        // .container_decl,
+        // .container_decl_two,
+        // .container_decl_arg,
+        .loop,
+        // .while_simple,
+        // .while_cont,
+        // .@"while",
+        // .for_simple,
+        // .@"for",
+
+        // change if adding pub keyword
+        .fn_decl,
+        .fn_proto_one,
+        .fn_proto,
+        .var_decl,
+        .mut_var_decl,
+        => return main_tokens[n],
+
+        .slice_init_dot,
+        .slice_init_dot_two,
+        // .struct_init_dot,
+        // .struct_init_dot_two,
+        => return main_tokens[n] - 1,
+
+        .field_access,
+        .unwrap_optional,
+        .equal_equal,
+        .bang_equal,
+        .less_than,
+        .greater_than,
+        .less_or_equal,
+        .greater_or_equal,
+        .assign_mul,
+        .assign_div,
+        .assign_mod,
+        .assign_add,
+        .assign_sub,
+        .assign_shl,
+        .assign_shr,
+        .assign_bit_and,
+        .assign_bit_xor,
+        .assign_bit_or,
+        .assign,
+        .mul,
+        .div,
+        .mod,
+        .add,
+        .sub,
+        .shl,
+        .shr,
+        .bit_and,
+        .bit_xor,
+        .bit_or,
+        .optional_fallback,
+        .bool_and,
+        .bool_or,
+        .slice_open,
+        .slice,
+        .slice_access,
+        .slice_init_one,
+        .slice_init,
+        // .struct_init_one,
+        // .struct_init,
+        .call_one,
+        .call,
+        .match_range,
+        // .for_range,
+        .pipe,
+        .lambda,
+        => n = datas[n].lhs,
+
+        // .assign_destructure => {
+        //     const extra_idx = datas[n].lhs;
+        //     const lhs_len = self.extra_data[extra_idx];
+        //     assert(lhs_len > 0);
+        //     n = self.extra_data[extra_idx + 1];
+        // },
+
+        // .container_field_init,
+        // .container_field_align,
+        // .container_field,
+        // => {
+        //     const name_token = main_tokens[n];
+        //     if (name_token > 0 and token_tags[name_token - 1] == .keyword_comptime) {
+        //         end_offset += 1;
+        //     }
+        //     return name_token - end_offset;
+        // },
+
+        .match_case_one => {
+            if (datas[n].lhs == 0) {
+                return main_tokens[n] - 1; // underscore token
+            } else {
+                n = datas[n].lhs;
+            }
+        },
+        .match_case => {
+            const extra = self.extraData(datas[n].lhs, Node.SubRange);
+            assert(extra.end - extra.start > 0);
+            n = self.extra_data[extra.start];
+        },
+    };
+}
+
+// TODO: some field are probably wrong
+pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
+    const tags = self.nodes.items(.tag);
+    const datas = self.nodes.items(.data);
+    const main_tokens = self.nodes.items(.main_token);
+    var n = node;
+    var end_offset: TokenIndex = 0;
+    while (true) switch (tags[n]) {
+        .root => return @as(TokenIndex, @intCast(self.tokens.len - 1)),
+        .no_op => unreachable,
+
+        .bool_not,
+        .negation,
+        .bit_not,
+        .optional_type,
+        .loop,
+        .slice_type,
+        => n = datas[n].lhs,
+
+        .equal_equal,
+        .bang_equal,
+        .less_than,
+        .greater_than,
+        .less_or_equal,
+        .greater_or_equal,
+        .assign_mul,
+        .assign_div,
+        .assign_mod,
+        .assign_add,
+        .assign_sub,
+        .assign_shl,
+        .assign_shr,
+        .assign_bit_and,
+        .assign_bit_xor,
+        .assign_bit_or,
+        .assign,
+        // .assign_destructure,
+        .mul,
+        .div,
+        .mod,
+        .add,
+        .sub,
+        .shl,
+        .shr,
+        .bit_and,
+        .bit_xor,
+        .bit_or,
+        .optional_fallback,
+        .bool_and,
+        .bool_or,
+        .@"if",
+        // .while_simple,
+        // .for_simple,
+        .match_case_one,
+        .match_case,
+        .match_range,
+        .pipe,
+        .lambda,
+        => n = datas[n].rhs,
+
+        // .for_range => if (datas[n].rhs != 0) {
+        //     n = datas[n].rhs;
+        // } else {
+        //     return main_tokens[n] + end_offset;
+        // },
+
+        .field_access,
+        .unwrap_optional,
+        .grouped_expression,
+        .multiline_string_literal,
+        // .error_value,
+        => return datas[n].rhs + end_offset,
+
+        .int_literal,
+        .float_literal,
+        .identifier,
+        .string_literal,
+        => return main_tokens[n] + end_offset,
+
+        .@"return" => if (datas[n].lhs != 0) {
+            n = datas[n].lhs;
+        } else {
+            return main_tokens[n] + end_offset;
+        },
+
+        .call,
+        => {
+            end_offset += 1; // for the rparen
+            const params = self.extraData(datas[n].rhs, Node.SubRange);
+            if (params.end - params.start == 0) {
+                return main_tokens[n] + end_offset;
+            }
+            n = self.extra_data[params.end - 1]; // last parameter
+        },
+        .match => {
+            const cases = self.extraData(datas[n].rhs, Node.SubRange);
+            if (cases.end - cases.start == 0) {
+                end_offset += 3; // rparen, lbrace, rbrace
+                n = datas[n].lhs; // condition expression
+            } else {
+                end_offset += 1; // for the rbrace
+                n = self.extra_data[cases.end - 1]; // last case
+            }
+        },
+        // .container_decl_arg => {
+        //     const members = self.extraData(datas[n].rhs, Node.SubRange);
+        //     if (members.end - members.start == 0) {
+        //         end_offset += 3; // for the rparen + lbrace + rbrace
+        //         n = datas[n].lhs;
+        //     } else {
+        //         end_offset += 1; // for the rbrace
+        //         n = self.extra_data[members.end - 1]; // last parameter
+        //     }
+        // },
+        .slice_init,
+        // .struct_init,
+        => {
+            const elements = self.extraData(datas[n].rhs, Node.SubRange);
+            assert(elements.end - elements.start > 0);
+            end_offset += 1; // for the rbrace
+            n = self.extra_data[elements.end - 1]; // last element
+        },
+        .slice_init_dot,
+        .block,
+        // .struct_init_dot,
+        // .container_decl,
+        => {
+            assert(datas[n].rhs - datas[n].lhs > 0);
+            end_offset += 1; // for the rbrace
+            n = self.extra_data[datas[n].rhs - 1]; // last statement
+        },
+        .call_one,
+        .slice_access,
+        => {
+            end_offset += 1; // for the rparen/rbracket
+            if (datas[n].rhs == 0) {
+                return main_tokens[n] + end_offset;
+            }
+            n = datas[n].rhs;
+        },
+        .slice_init_dot_two,
+        .block_two,
+        // .struct_init_dot_two,
+        // .container_decl_two,
+        => {
+            if (datas[n].rhs != 0) {
+                end_offset += 1; // for the rparen/rbrace
+                n = datas[n].rhs;
+            } else if (datas[n].lhs != 0) {
+                end_offset += 1; // for the rparen/rbrace
+                n = datas[n].lhs;
+            } else {
+                switch (tags[n]) {
+                    .slice_init_dot_two,
+                    .block_two,
+                    // .struct_init_dot_two,
+                    => end_offset += 1, // rbrace
+                    // .container_decl_two => {
+                    //     var i: u32 = 2; // lbrace + rbrace
+                    //     while (token_tags[main_tokens[n] + i] == .container_doc_comment) i += 1;
+                    //     end_offset += i;
+                    // },
+                    else => unreachable,
+                }
+                return main_tokens[n] + end_offset;
+            }
+        },
+        .mut_var_decl, .var_decl => {
+            if (datas[n].rhs != 0) {
+                n = datas[n].rhs;
+            } else if (datas[n].lhs != 0) {
+                n = datas[n].lhs;
+            } else {
+                end_offset += 1; // from `let` token to name
+                return main_tokens[n] + end_offset;
+            }
+        },
+        // .container_field_init => {
+        //     if (datas[n].rhs != 0) {
+        //         n = datas[n].rhs;
+        //     } else if (datas[n].lhs != 0) {
+        //         n = datas[n].lhs;
+        //     } else {
+        //         return main_tokens[n] + end_offset;
+        //     }
+        // },
+        // .container_field_align => {
+        //     if (datas[n].rhs != 0) {
+        //         end_offset += 1; // for the rparen
+        //         n = datas[n].rhs;
+        //     } else if (datas[n].lhs != 0) {
+        //         n = datas[n].lhs;
+        //     } else {
+        //         return main_tokens[n] + end_offset;
+        //     }
+        // },
+        // .container_field => {
+        //     const extra = self.extraData(datas[n].rhs, Node.ContainerField);
+        //     if (extra.value_expr != 0) {
+        //         n = extra.value_expr;
+        //     } else if (extra.align_expr != 0) {
+        //         end_offset += 1; // for the rparen
+        //         n = extra.align_expr;
+        //     } else if (datas[n].lhs != 0) {
+        //         n = datas[n].lhs;
+        //     } else {
+        //         return main_tokens[n] + end_offset;
+        //     }
+        // },
+
+        .slice_init_one,
+        // .struct_init_one,
+        => {
+            end_offset += 1; // rbrace
+            if (datas[n].rhs == 0) {
+                return main_tokens[n] + end_offset;
+            } else {
+                n = datas[n].rhs;
+            }
+        },
+        .slice_open => {
+            end_offset += 2; // ellipsis2 + rbracket, or comma + rparen
+            n = datas[n].rhs;
+            assert(n != 0);
+        },
+        .slice => {
+            const extra = self.extraData(datas[n].rhs, Node.Slice);
+            assert(extra.end != 0); // should have used slice_open
+            end_offset += 1; // rbracket
+            n = extra.end;
+        },
+
+        .@"continue", .@"break" => {
+            if (datas[n].rhs != 0) {
+                n = datas[n].rhs;
+            } else if (datas[n].lhs != 0) {
+                return datas[n].lhs + end_offset;
+            } else {
+                return main_tokens[n] + end_offset;
+            }
+        },
+        .fn_decl, .fn_proto_one, .fn_proto => {
+            if (datas[n].rhs != 0) {
+                n = datas[n].rhs;
+            } else {
+                n = datas[n].lhs;
+            }
+        },
+        // .while_cont => {
+        //     const extra = self.extraData(datas[n].rhs, Node.WhileCont);
+        //     assert(extra.then_expr != 0);
+        //     n = extra.then_expr;
+        // },
+        // .@"while" => {
+        //     const extra = self.extraData(datas[n].rhs, Node.While);
+        //     assert(extra.else_expr != 0);
+        //     n = extra.else_expr;
+        // },
+        .if_else => {
+            const extra = self.extraData(datas[n].rhs, Node.If);
+            assert(extra.else_expr != 0);
+            n = extra.else_expr;
+        },
+        // .@"for" => {
+        //     const extra = @as(Node.For, @bitCast(datas[n].rhs));
+        //     n = self.extra_data[datas[n].lhs + extra.inputs + @intFromBool(extra.has_else)];
+        // },
+    };
+}
+
+pub fn tokensOnSameLine(self: Ast, token1: TokenIndex, token2: TokenIndex) bool {
+    const token_starts = self.tokens.items(.start);
+    const source = self.source[token_starts[token1]..token_starts[token2]];
+    return std.mem.indexOfScalar(u8, source, '\n') == null;
+}
+
+pub fn getNodeSource(self: Ast, node: Node.Index) []const u8 {
+    const token_starts = self.tokens.items(.start);
+    const first_token = self.firstToken(node);
+    const last_token = self.lastToken(node);
+    const start = token_starts[first_token];
+    const end = token_starts[last_token] + self.tokenSlice(last_token).len;
+    return self.source[start..end];
+}
 
 // TODO: globalVarDecl() ...
 
@@ -390,7 +823,7 @@ pub const Error = struct {
         expected_newline_or_lbrace,
         expected_newline_after_decl,
         expected_newline_after_stmt,
-        expected_comma_after_arg, // TODO: we don't care about commas
+        expected_comma_after_arg,
         expected_comma_after_match_prong,
         expected_block,
         expected_block_or_assignment,
@@ -409,17 +842,21 @@ pub const Node = struct {
     pub const Index = u32;
 
     comptime {
-        std.debug.assert(@sizeOf(Tag) == 1);
+        assert(@sizeOf(Tag) == 1);
     }
 
     // TODO: why separate xxx and xxx_one?
     pub const Tag = enum {
         /// sub_list[lhs..rhs]
         root,
-        /// `let mut a: lhs = rhs` or `let a: lhs = rhs`.
-        /// lhs and rhs may be unused. Can be local or global.
-        /// main_token is `let` or `mut`
+        /// `let a: lhs = rhs`. lhs and rhs may be unused.
+        /// Can be local or global.
+        /// main_token is `let`
         var_decl,
+        /// `let mut a: lhs = rhs`. lhs and rhs may be unused.
+        /// Can be local or global.
+        /// main_token is `let`
+        mut_var_decl,
         /// `lhs.a`. main_token is the dot. rhs is the identifier token index.
         field_access,
         /// `lhs.?`. main_token is the dot. rhs is the `?` token index.
@@ -503,25 +940,23 @@ pub const Node = struct {
         slice,
         /// `lhs[rhs]`.
         slice_access,
-        // TODO: slice_init (array_init)
+        /// `lhs{rhs}`. rhs can be omitted.
+        slice_init_one,
+        /// `.{lhs, rhs}`. lhs and rhs can be omitted.
+        slice_init_dot_two,
+        /// `.{a, b}`. `sub_list[lhs..rhs]`.
+        slice_init_dot,
+        /// `lhs{a, b}`. `sub_range_list[rhs]`.
+        slice_init,
         // TODO: if support "struct" struct_init
         /// `lhs(rhs)`. rhs can be omitted.
         /// main_token is the lparen.
         call_one,
-        /// `lhs(rhs,)`. rhs can be omitted.
-        /// main_token is the lparen.
-        call_one_comma,
         /// `lhs(a, b, c)`. `SubRange[rhs]`.
         /// main_token is the `(`.
         call,
-        /// `lhs(a, b, c,)`. `SubRange[rhs]`.
-        /// main_token is the `(`.
-        call_comma,
         /// `match(lhs) {}`. `SubRange[rhs]`.
         match,
-        /// Same as switch except there is known to be a trailing comma
-        /// before the final rbrace
-        match_comma,
         /// `lhs => rhs`. If lhs is omitted it means `_`.
         /// main_token is the `=>`
         match_case_one,
@@ -624,6 +1059,41 @@ pub const Node = struct {
     };
 };
 
-// TODO: nodeToSpan()
-// TODO: tokenToSpan()
-// TODO: tokensToSpan()
+pub const Span = struct {
+    start: u32,
+    end: u32,
+    main: u32,
+};
+
+pub fn nodeToSpan(self: Ast, node: u32) Span {
+    return tokensToSpan(
+        self,
+        self.firstToken(node),
+        self.lastToken(node),
+        self.nodes.items(.main_token)[node],
+    );
+}
+
+pub fn tokenToSpan(self: Ast, token: Ast.TokenIndex) Span {
+    return tokensToSpan(self, token, token, token);
+}
+
+pub fn tokensToSpan(self: Ast, start: Ast.TokenIndex, end: Ast.TokenIndex, main: Ast.TokenIndex) Span {
+    const token_starts = self.tokens.items(.start);
+    var start_tok = start;
+    var end_tok = end;
+
+    if (self.tokensOnSameLine(start, end)) {
+        // do nothing
+    } else if (self.tokensOnSameLine(start, main)) {
+        end_tok = main;
+    } else if (self.tokensOnSameLine(main, end)) {
+        start_tok = main;
+    } else {
+        start_tok = main;
+        end_tok = main;
+    }
+    const start_off = token_starts[start_tok];
+    const end_off = token_starts[end_tok] + @as(u32, @intCast(self.tokenSlice(end_tok).len));
+    return .{ .start = start_off, .end = end_off, .main = token_starts[main] };
+}

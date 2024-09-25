@@ -47,3 +47,9 @@ for Value: replace pointer with raw type and use a MultiArrayList
 
 builtin functions
 see https://docs.python.org/3.12/library/functions.html
+
+add a try catch system or something to deal with errors
+
+slice_type is maybe a little doomed because it's a pointer in the original parser -> fix that
+
+replace comma at the end of a match prong with newline?

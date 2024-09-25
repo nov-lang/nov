@@ -122,7 +122,7 @@ fn parseTopLevel(self: *Parser) Error!Members {
             => {
                 const top_level_decl = try self.expectTopLevelDeclRecoverable();
                 if (top_level_decl != 0) {
-                    // try self.scratch.append(self.allocator, top_level_decl);
+                    try self.scratch.append(self.allocator, top_level_decl);
                 }
             },
             .keyword_print,
@@ -134,13 +134,13 @@ fn parseTopLevel(self: *Parser) Error!Members {
             => {
                 const top_level_stmt = try self.expectTopLevelStatementRecoverable();
                 if (top_level_stmt != 0) {
-                    // try self.scratch.append(self.allocator, top_level_stmt);
+                    try self.scratch.append(self.allocator, top_level_stmt);
                 }
             },
             else => {
                 const top_level_stmt = try self.expectTopLevelStatementRecoverable();
                 if (top_level_stmt != 0) {
-                    // try self.scratch.append(self.allocator, top_level_stmt);
+                    try self.scratch.append(self.allocator, top_level_stmt);
                 }
             },
         }
@@ -344,14 +344,13 @@ fn parseFnProto(self: *Parser) Error!Node.Index {
 /// VarDeclProto <- KEYWORD_let KEYWORD_mut? IDENTIFIER (COLON TypeExpr)?
 /// Returns a `*_var_decl` node with its rhs (init expression) initialized to 0.
 fn parseVarDeclProto(self: *Parser) Error!Node.Index {
-    var main_token = self.consume(.keyword_let) orelse return null_node;
-    if (self.consume(.keyword_mut)) |tok| {
-        main_token = tok;
-    }
+    const main_token = self.consume(.keyword_let) orelse return null_node;
+    const is_mut = self.consume(.keyword_mut) != null;
+
     _ = try self.expectToken(.identifier);
     const type_node: Node.Index = if (self.consume(.colon) == null) 0 else try self.expectTypeExpr();
     return self.addNode(.{
-        .tag = .var_decl,
+        .tag = if (is_mut) .mut_var_decl else .var_decl,
         .main_token = main_token,
         .data = .{
             .lhs = type_node,
@@ -397,8 +396,11 @@ fn parseGlobalVarDecl(self: *Parser) Error!Node.Index {
 ///      / Block
 ///      / VarDeclExprStatement
 fn expectStatement(self: *Parser, allow_defer_var: bool) Error!Node.Index {
-    // TODO: eat newline?
-    // while (self.token_tags[self.tok_i] == .newline) self.tok_i += 1;
+    // eat newlines
+    while (self.token_tags[self.tok_i] == .newline) {
+        self.tok_i += 1;
+    }
+
     return switch (self.token_tags[self.tok_i]) {
         .keyword_if => self.expectIfStatement(),
         .keyword_loop => self.expectLoopStatement(),
@@ -409,15 +411,14 @@ fn expectStatement(self: *Parser, allow_defer_var: bool) Error!Node.Index {
         else => blk: {
             std.log.debug("expectStatement: {}", .{self.token_tags[self.tok_i]});
             // TODO: ?
-            _ = allow_defer_var;
-            // if (allow_defer_var) {
-            //     break :blk self.expectVarDeclExprStatement();
-            // } else {
+            if (allow_defer_var) {
+                break :blk self.expectVarDeclExprStatement();
+            } else {
                 const assign = try self.expectAssignExpr();
                 std.log.debug("(self.token_tags[self.tok_i]: {})", .{self.token_tags[self.tok_i]});
                 try self.expectNewline(.expected_newline_after_stmt, true);
                 break :blk assign;
-            // }
+            }
         },
     };
 }
@@ -453,83 +454,81 @@ fn expectTopLevelStatementRecoverable(self: *Parser) Error!Node.Index {
 ///    <- VarDeclProto (COMMA (VarDeclProto / Expr))* EQUAL Expr NEWLINE
 ///     / Expr (AssignOp Expr / (COMMA (VarDeclProto / Expr))+ EQUAL Expr)? NEWLINE
 fn expectVarDeclExprStatement(self: *Parser) Error!Node.Index {
-    _ = self;
-    unreachable;
-    // const scratch_top = self.scratch.items.len;
-    // defer self.scratch.shrinkRetainingCapacity(scratch_top);
+    const scratch_top = self.scratch.items.len;
+    defer self.scratch.shrinkRetainingCapacity(scratch_top);
 
-    // while (true) {
-    //     const var_decl_proto = try self.parseVarDeclProto();
-    //     if (var_decl_proto != 0) {
-    //         try self.scratch.append(self.allocator, var_decl_proto);
-    //     } else {
-    //         const expr = try self.parseExpr();
-    //         if (expr == 0) {
-    //             if (self.scratch.items.len == scratch_top) {
-    //                 // We parsed nothing
-    //                 return self.fail(.expected_statement);
-    //             } else {
-    //                 // We've had at least one LHS, but had a bad comma
-    //                 return self.fail(.expected_expr_or_var_decl);
-    //             }
-    //         }
-    //         try self.scratch.append(self.allocator, expr);
-    //     }
-    //     _ = self.consume(.comma) orelse break;
-    // }
+    while (true) {
+        const var_decl_proto = try self.parseVarDeclProto();
+        if (var_decl_proto != 0) {
+            try self.scratch.append(self.allocator, var_decl_proto);
+        } else {
+            const expr = try self.parseExpr();
+            if (expr == 0) {
+                if (self.scratch.items.len == scratch_top) {
+                    // We parsed nothing
+                    return self.fail(.expected_statement);
+                } else {
+                    // We've had at least one LHS, but had a bad comma
+                    return self.fail(.expected_expr_or_var_decl);
+                }
+            }
+            try self.scratch.append(self.allocator, expr);
+        }
+        _ = self.consume(.comma) orelse break;
+    }
 
-    // const lhs_count = self.scratch.items.len - scratch_top;
-    // assert(lhs_count > 0);
+    const lhs_count = self.scratch.items.len - scratch_top;
+    assert(lhs_count > 0);
 
-    // const equal_token = self.consume(.equal) orelse eql: {
-    //     if (lhs_count > 1) {
-    //         // Definitely a destructure, so allow recovering from ==
-    //         if (self.consume(.equal_equal)) |tok| {
-    //             try self.warnMsg(.{ .tag = .wrong_equal_var_decl, .token = tok });
-    //             break :eql tok;
-    //         }
-    //         return self.failExpected(.equal);
-    //     }
-    //     const lhs = self.scratch.items[scratch_top];
-    //     switch (self.nodes.items(.tag)[lhs]) {
-    //         .global_var_decl, .local_var_decl, .simple_var_decl, .aligned_var_decl => {
-    //             // Definitely a var decl, so allow recovering from ==
-    //             if (self.consume(.equal_equal)) |tok| {
-    //                 try self.warnMsg(.{ .tag = .wrong_equal_var_decl, .token = tok });
-    //                 break :eql tok;
-    //             }
-    //             return self.failExpected(.equal);
-    //         },
-    //         else => {},
-    //     }
+    const equal_token = self.consume(.equal) orelse eql: {
+        if (lhs_count > 1) {
+            // Definitely a destructure, so allow recovering from ==
+            if (self.consume(.equal_equal)) |tok| {
+                try self.warnMsg(.{ .tag = .wrong_equal_var_decl, .token = tok });
+                break :eql tok;
+            }
+            return self.failExpected(.equal);
+        }
+        const lhs = self.scratch.items[scratch_top];
+        switch (self.nodes.items(.tag)[lhs]) {
+            .var_decl, .mut_var_decl => {
+                // Definitely a var decl, so allow recovering from ==
+                if (self.consume(.equal_equal)) |tok| {
+                    try self.warnMsg(.{ .tag = .wrong_equal_var_decl, .token = tok });
+                    break :eql tok;
+                }
+                return self.failExpected(.equal);
+            },
+            else => {},
+        }
 
-    //     const expr = try self.finishAssignExpr(lhs);
-    //     try self.expectNewline(.expected_newline_after_stmt, true);
-    //     return expr;
-    // };
+        const expr = try self.finishAssignExpr(lhs);
+        try self.expectNewline(.expected_newline_after_stmt, true);
+        return expr;
+    };
 
-    // const rhs = try self.expectExpr();
-    // try self.expectNewline(.expected_newline_after_stmt, true);
+    const rhs = try self.expectExpr();
+    try self.expectNewline(.expected_newline_after_stmt, true);
 
-    // if (lhs_count == 1) {
-    //     const lhs = self.scratch.items[scratch_top];
-    //     switch (self.nodes.items(.tag)[lhs]) {
-    //         .global_var_decl, .local_var_decl, .simple_var_decl, .aligned_var_decl => {
-    //             self.nodes.items(.data)[lhs].rhs = rhs;
-    //             // Don't need to wrap in comptime
-    //             return lhs;
-    //         },
-    //         else => {},
-    //     }
-    //     const expr = try self.addNode(.{
-    //         .tag = .assign,
-    //         .main_token = equal_token,
-    //         .data = .{ .lhs = lhs, .rhs = rhs },
-    //     });
-    //     return expr;
-    // }
+    if (lhs_count == 1) {
+        const lhs = self.scratch.items[scratch_top];
+        switch (self.nodes.items(.tag)[lhs]) {
+            .var_decl, .mut_var_decl => {
+                self.nodes.items(.data)[lhs].rhs = rhs;
+                // Don't need to wrap in comptime
+                return lhs;
+            },
+            else => {},
+        }
+        const expr = try self.addNode(.{
+            .tag = .assign,
+            .main_token = equal_token,
+            .data = .{ .lhs = lhs, .rhs = rhs },
+        });
+        return expr;
+    }
 
-    // // An actual destructure! No need for any `comptime` wrapper here.
+    unreachable; // TODO: multi_assign
 
     // const extra_start = self.extra_data.items.len;
     // try self.extra_data.ensureUnusedCapacity(self.allocator, lhs_count + 1);
@@ -1245,7 +1244,7 @@ fn parseBlock(self: *Parser) Error!Node.Index {
     const scratch_top = self.scratch.items.len;
     defer self.scratch.shrinkRetainingCapacity(scratch_top);
     while (true) {
-        std.log.debug("{}", .{self.token_tags[self.tok_i]});
+        std.log.debug("parseBlock: {}", .{self.token_tags[self.tok_i]});
         if (self.token_tags[self.tok_i] == .r_brace) break;
         const statement = try self.expectStatementRecoverable();
         if (statement == 0) break;
@@ -1447,11 +1446,10 @@ fn parseSuffixExpr(self: *Parser) Error!Node.Index {
                 else => try self.warn(.expected_comma_after_arg),
             }
         }
-        const comma = (self.token_tags[self.tok_i - 2] == .comma);
         const params = self.scratch.items[scratch_top..];
         res = switch (params.len) {
             0 => try self.addNode(.{
-                .tag = if (comma) .call_one_comma else .call_one,
+                .tag = .call_one,
                 .main_token = lparen,
                 .data = .{
                     .lhs = res,
@@ -1459,7 +1457,7 @@ fn parseSuffixExpr(self: *Parser) Error!Node.Index {
                 },
             }),
             1 => try self.addNode(.{
-                .tag = if (comma) .call_one_comma else .call_one,
+                .tag = .call_one,
                 .main_token = lparen,
                 .data = .{
                     .lhs = res,
@@ -1467,7 +1465,7 @@ fn parseSuffixExpr(self: *Parser) Error!Node.Index {
                 },
             }),
             else => try self.addNode(.{
-                .tag = if (comma) .call_comma else .call,
+                .tag = .call,
                 .main_token = lparen,
                 .data = .{
                     .lhs = res,
@@ -1762,11 +1760,10 @@ fn expectMatchExpr(self: *Parser) !Node.Index {
     _ = try self.expectToken(.r_paren);
     _ = try self.expectToken(.l_brace);
     const cases = try self.parseMatchProngList();
-    const trailing_comma = self.token_tags[self.tok_i - 1] == .comma;
     _ = try self.expectToken(.r_brace);
 
     return self.addNode(.{
-        .tag = if (trailing_comma) .match_comma else .match,
+        .tag = .match,
         .main_token = match_token,
         .data = .{
             .lhs = expr_node,

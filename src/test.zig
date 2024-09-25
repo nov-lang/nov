@@ -2,6 +2,10 @@ const std = @import("std");
 const Ast = @import("Ast.zig");
 const Node = Ast.Node;
 
+// fn render(ast: *Ast, index: Ast.Node.Index, writer: anytype) !void {
+//     ast.nodes.items
+// }
+
 pub fn main() !void {
     // (* (- 123) (group 45.67))
     // const source = "-123 * (45.67)\n";
@@ -10,11 +14,15 @@ pub fn main() !void {
         // \\let mut y = "salut"
         // \\ x + y x - y
         // \\{x + y
-        \\let x = {
-        \\    let y = 3
-        \\    y
+        \\{
+        \\    let x = {
+        \\        let y = 3
+        \\        y
+        \\    }
         \\}
-        // \\
+        \\let x =
+        \\x + y
+        \\
     ;
 
     std.log.debug("Running parser with source: \n{s}\n", .{source});
@@ -37,6 +45,13 @@ pub fn main() !void {
         try ast.renderError(parse_error, std.io.getStdOut().writer());
     }
     std.debug.print("\n", .{});
+
+    _ = ast.firstToken(0);
+    _ = ast.lastToken(0);
+
+    // const rendered = try ast.render(allocator);
+    // defer allocator.free(rendered);
+    // std.debug.print("{s}", .{rendered});
 
     // const main_tokens = ast.nodes.items(.main_token);
     // const node_tags = ast.nodes.items(.tag);
