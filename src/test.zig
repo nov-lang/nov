@@ -2,10 +2,6 @@ const std = @import("std");
 const Ast = @import("Ast.zig");
 const Node = Ast.Node;
 
-// fn render(ast: *Ast, index: Ast.Node.Index, writer: anytype) !void {
-//     ast.nodes.items
-// }
-
 pub fn main() !void {
     // (* (- 123) (group 45.67))
     // const source = "-123 * (45.67)\n";
@@ -49,17 +45,15 @@ pub fn main() !void {
     _ = ast.firstToken(0);
     _ = ast.lastToken(0);
 
-    // const rendered = try ast.render(allocator);
-    // defer allocator.free(rendered);
-    // std.debug.print("{s}", .{rendered});
-
     // const main_tokens = ast.nodes.items(.main_token);
     // const node_tags = ast.nodes.items(.tag);
     // const datas = ast.nodes.items(.data);
     // std.debug.print("{} {} {} {} {} {} {}\n", .{ main_tokens[1], datas[2].lhs, node_tags[datas[2].lhs], datas[5].lhs, node_tags[datas[5].lhs], datas[0].lhs, node_tags[datas[0].lhs] });
 
-    // try @import("render.zig").renderTree(ast, std.io.getStdOut().writer());
-    // std.debug.print("\n", .{});
+    // var buffer = std.ArrayList(u8).init(allocator);
+    // defer buffer.deinit();
+    // try @import("render.zig").renderTree(&buffer, ast, .{});
+    // std.debug.print("{s}\n", .{buffer.items});
 
     // ast.rootDecls();
     // print(&ast, 0, std.io.getStdOut().writer());

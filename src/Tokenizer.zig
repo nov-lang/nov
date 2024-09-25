@@ -773,6 +773,12 @@ test "all tokens with lexeme" {
     var builder: std.MultiArrayList(struct { lexeme: []const u8, tag: Token.Tag }) = .{};
     defer builder.deinit(std.testing.allocator);
     for (std.enums.values(Token.Tag)) |tag| {
+        if (tag == .newline) {
+            // the lexeme is not the actual newline character
+            try builder.append(std.testing.allocator, .{ .lexeme = "\n", .tag = tag });
+            continue;
+        }
+
         if (tag.lexeme()) |lexeme| {
             try builder.append(std.testing.allocator, .{ .lexeme = lexeme, .tag = tag });
         }
