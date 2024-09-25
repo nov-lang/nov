@@ -1,25 +1,5 @@
-// Based on std.zig.Tokenizer
-// The MIT License (Expat)
-//
-// Copyright (c) Zig contributors
-//
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files (the "Software"), to deal
-// in the Software without restriction, including without limitation the rights
-// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-// copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions:
-//
-// The above copyright notice and this permission notice shall be included in
-// all copies or substantial portions of the Software.
-//
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-// THE SOFTWARE.
+// Based on https://github.com/ziglang/zig/blob/master/lib/std/zig/tokenizer.zig
+// See https://github.com/ziglang/zig/blob/master/LICENSE for LICENSE details
 
 const std = @import("std");
 
@@ -50,6 +30,9 @@ pub const Token = struct {
         period,
         ellipsis2,
         colon,
+        underscore,
+        question_mark,
+        question_mark_question_mark,
         bang,
         bang_equal,
         equal,
@@ -97,8 +80,7 @@ pub const Token = struct {
         keyword_for,
         keyword_break,
         keyword_continue,
-        keyword_true,
-        keyword_false,
+        keyword_in,
         identifier,
         string_literal,
         multiline_string_literal_line,
@@ -129,6 +111,9 @@ pub const Token = struct {
                 .period => ".",
                 .ellipsis2 => "..",
                 .colon => ":",
+                .underscore => "_",
+                .question_mark => "?",
+                .question_mark_question_mark => "??",
                 .bang => "!",
                 .bang_equal => "!=",
                 .equal => "=",
@@ -176,8 +161,19 @@ pub const Token = struct {
                 .keyword_for => "for",
                 .keyword_break => "break",
                 .keyword_continue => "continue",
-                .keyword_true => "true",
-                .keyword_false => "false",
+                .keyword_in => "in",
+            };
+        }
+
+        pub fn symbol(tag: Tag) []const u8 {
+            return tag.lexeme() orelse switch (tag) {
+                .eof => "EOF",
+                .invalid => "invalid bytes",
+                .identifier => "an identifier",
+                .string_literal, .multiline_string_literal_line => "a string literal",
+                .int_literal => "an integer literal",
+                .float_literal => "a float literal",
+                else => unreachable,
             };
         }
     };
@@ -238,6 +234,8 @@ const State = enum {
     int_exponent,
     float,
     float_exponent,
+    underscore,
+    question_mark,
 };
 
 // this could be "simplified" with functions for similar cases and optimized
@@ -279,9 +277,15 @@ pub fn next(self: *Tokenizer) Token {
                 '#', ';' => {
                     state = .comment_line;
                 },
-                'A'...'Z', 'a'...'z', '_' => {
+                '_' => {
+                    state = .underscore;
+                },
+                'A'...'Z', 'a'...'z' => {
                     state = .identifier;
                     result.tag = .identifier;
+                },
+                '?' => {
+                    state = .question_mark;
                 },
                 '=' => {
                     state = .equal;
@@ -384,6 +388,17 @@ pub fn next(self: *Tokenizer) Token {
                     break;
                 },
             },
+            .question_mark => switch (c) {
+                '?' => {
+                    result.tag = .question_mark_question_mark;
+                    self.index += 1;
+                    break;
+                },
+                else => {
+                    result.tag = .question_mark;
+                    break;
+                },
+            },
             .ampersand => switch (c) {
                 '=' => {
                     result.tag = .ampersand_equal;
@@ -447,6 +462,16 @@ pub fn next(self: *Tokenizer) Token {
                 },
                 else => {
                     result.tag = .tilde;
+                    break;
+                },
+            },
+            .underscore => switch (c) {
+                'A'...'Z', 'a'...'z', '_' => {
+                    state = .identifier;
+                    result.tag = .identifier;
+                },
+                else => {
+                    result.tag = .underscore;
                     break;
                 },
             },
@@ -756,6 +781,40 @@ test "all tokens with lexeme" {
     const source = try std.mem.joinZ(std.testing.allocator, " ", builder.items(.lexeme));
     defer std.testing.allocator.free(source);
     try testTokenize(source, builder.items(.tag));
+}
+
+test "_" {
+    try testTokenize(
+        \\_ => 0,
+        \\
+    , &.{
+        .underscore,
+        .equal_r_angle_bracket,
+        .int_literal,
+        .comma,
+        .newline,
+    });
+    try testTokenize(
+        \\_0 => 0,
+        \\
+    , &.{
+        .underscore,
+        .int_literal,
+        .equal_r_angle_bracket,
+        .int_literal,
+        .comma,
+        .newline,
+    });
+    try testTokenize(
+        \\_int => 0,
+        \\
+    , &.{
+        .identifier,
+        .equal_r_angle_bracket,
+        .int_literal,
+        .comma,
+        .newline,
+    });
 }
 
 test "line comment followed by statement" {

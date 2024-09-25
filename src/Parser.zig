@@ -1,492 +1,2139 @@
+// Based on https://github.com/ziglang/zig/blob/master/lib/std/zig/Parse.zig
+// See https://github.com/ziglang/zig/blob/master/LICENSE for LICENSE details
+
 const std = @import("std");
-const Tokenizer = @import("Scanner.zig");
+const Tokenizer = @import("Tokenizer.zig");
 const Token = Tokenizer.Token;
 const Ast = @import("Ast.zig");
-const debug = @import("debug.zig");
+const Node = Ast.Node;
+const TokenIndex = Ast.TokenIndex;
+const assert = std.debug.assert;
+
+const null_node: Node.Index = 0; // use null instead?
 
 const Parser = @This();
 
-ast: Ast,
-tokenizer: Tokenizer,
-current: Token,
-previous: Token,
+source: []const u8,
 allocator: std.mem.Allocator,
-had_error: bool = false,
-panic_mode: bool = false,
+token_tags: []const Token.Tag,
+token_starts: []const Ast.ByteOffset,
+tok_i: TokenIndex,
+nodes: Ast.NodeList,
+extra_data: std.ArrayListUnmanaged(Node.Index),
+errors: std.ArrayListUnmanaged(Ast.Error),
+scratch: std.ArrayListUnmanaged(Node.Index),
 
-pub fn init(allocator: std.mem.Allocator) Parser {
-    return .{
-        .ast = Ast.init(allocator),
-        .tokenizer = undefined,
-        .current = undefined,
-        .previous = undefined,
-        .allocator = allocator,
+pub const Error = error{ParseError} || std.mem.Allocator.Error;
+
+pub fn parse(self: *Parser) Error!void {
+    try self.nodes.append(self.allocator, .{
+        .tag = .root,
+        .main_token = 0,
+        .data = undefined,
+    });
+    // const root_members = try self.parseContainerMembers();
+    const root_members = try self.parseGlobal();
+    const root_decls = try root_members.toSpan(self);
+    if (self.token_tags[self.tok_i] != .eof) {
+        try self.warnExpected(.eof);
+    }
+    self.nodes.items(.data)[0] = .{
+        .lhs = root_decls.start,
+        .rhs = root_decls.end,
     };
 }
 
-pub fn deinit(self: *Parser) void {
-    _ = self;
+const Members = struct {
+    len: usize,
+    lhs: Node.Index,
+    rhs: Node.Index,
+
+    fn toSpan(self: Members, p: *Parser) Error!Node.SubRange {
+        if (self.len <= 2) {
+            const nodes = [2]Node.Index{ self.lhs, self.rhs };
+            return p.listToSpan(nodes[0..self.len]);
+        } else {
+            return Node.SubRange{ .start = self.lhs, .end = self.rhs };
+        }
+    }
+};
+
+fn listToSpan(self: *Parser, list: []const Node.Index) Error!Node.SubRange {
+    try self.extra_data.appendSlice(self.allocator, list);
+    return Node.SubRange{
+        .start = @as(Node.Index, @intCast(self.extra_data.items.len - list.len)),
+        .end = @as(Node.Index, @intCast(self.extra_data.items.len)),
+    };
 }
 
-pub fn parse(allocator: std.mem.Allocator, source: [:0]const u8) !Ast {
-    var self = Parser.init(allocator);
-    defer self.deinit();
-    errdefer self.ast.deinit();
-    self.tokenizer = Tokenizer.init(source);
+fn addNode(self: *Parser, elem: Ast.Node) Error!Node.Index {
+    const result = @as(Node.Index, @intCast(self.nodes.len));
+    try self.nodes.append(self.allocator, elem);
+    return result;
+}
 
-    // const body_node = try self.ast.appendNode(.{
-    //     .expr = .{
-    //         .block = .{
-    //             .statements = ...,
-    //         },
-    //     },
-    // });
+fn setNode(self: *Parser, i: usize, elem: Ast.Node) Node.Index {
+    self.nodes.set(i, elem);
+    return @as(Node.Index, @intCast(i));
+}
 
-    try self.advance();
-    while (!(try self.match(.eof))) {
-        if (try self.declarationOrStatement()) |node| {
-            _ = node; // TODO
-            // try self.ast.appendNode(node);
+fn reserveNode(self: *Parser, tag: Ast.Node.Tag) Error!usize {
+    try self.nodes.resize(self.allocator, self.nodes.len + 1);
+    self.nodes.items(.tag)[self.nodes.len - 1] = tag;
+    return self.nodes.len - 1;
+}
 
-        } else {
-            self.errorAtPrevious("Expected statement", .{});
+fn unreserveNode(self: *Parser, node_index: usize) void {
+    if (self.nodes.len == node_index) {
+        self.nodes.resize(self.allocator, self.nodes.len - 1) catch unreachable;
+    } else {
+        // There is zombie node left in the tree, let's make it as inoffensive as possible
+        self.nodes.items(.tag)[node_index] = .no_op;
+        self.nodes.items(.main_token)[node_index] = self.tok_i;
+    }
+}
+
+fn addExtra(self: *Parser, extra: anytype) Error!Node.Index {
+    const fields = std.meta.fields(@TypeOf(extra));
+    try self.extra_data.ensureUnusedCapacity(self.allocator, fields.len);
+    const result = @as(u32, @intCast(self.extra_data.items.len));
+    inline for (fields) |field| {
+        comptime assert(field.type == Node.Index);
+        self.extra_data.appendAssumeCapacity(@field(extra, field.name));
+    }
+    return result;
+}
+
+// TODO
+fn parseGlobal(self: *Parser) Error!Members {
+    const scratch_top = self.scratch.items.len;
+    defer self.scratch.shrinkRetainingCapacity(scratch_top);
+
+    while (true) {
+        switch (self.token_tags[self.tok_i]) {
+            .newline => {
+                self.tok_i += 1;
+            },
+            .eof => {
+                break;
+            },
+            .keyword_let => {
+                self.tok_i += 1;
+                // self.parseDeclaration();
+            },
+            .keyword_print,
+            .keyword_if,
+            .keyword_loop,
+            .keyword_while,
+            .keyword_for,
+            .l_brace,
+            => {
+                self.tok_i += 1;
+                // self.parseStatement();
+            },
+            else => {
+                const expr = self.expectExpr() catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.ParseError => {
+                        self.synchronize();
+                        continue;
+                    },
+                };
+                try self.scratch.append(self.allocator, expr);
+            },
         }
     }
 
-    return self.ast;
+    const items = self.scratch.items[scratch_top..];
+    for (items) |item| {
+        std.debug.print("item: {d}, tag: {s}\n", .{ item, @tagName(self.nodes.items(.tag)[item]) });
+    }
+    switch (items.len) {
+        0 => return .{
+            .len = 0,
+            .lhs = 0,
+            .rhs = 0,
+        },
+        1 => return .{
+            .len = 1,
+            .lhs = items[0],
+            .rhs = 0,
+        },
+        2 => return .{
+            .len = 2,
+            .lhs = items[0],
+            .rhs = items[1],
+        },
+        else => {
+            const span = try self.listToSpan(items);
+            return .{
+                .len = items.len,
+                .lhs = span.start,
+                .rhs = span.end,
+            };
+        },
+    }
 }
 
-const Precedence = enum {
-    none,
-    assignment, // = += -= *= /= %=
-    @"or", // or
-    @"and", // and
-    equality, // == !=
-    comparison, // < > <= >=
-    term, // + -
-    factor, // * / %
-    unary, // ! -
-    call, // . ()
-    primary,
+// TODO
+fn parseContainerMembers(self: *Parser) Error!Members {
+    _ = self;
+    unreachable;
+}
 
-    fn get(comptime tag: Token.Tag) Precedence {
-        return switch (tag) {
-            else => .none,
-            .equal,
-            .plus_equal,
-            .minus_equal,
-            .asterisk_equal,
-            .slash_equal,
-            .percent_equal,
-            => .assignment,
-            .keyword_or => .@"or",
-            .keyword_and => .@"and",
-            .equal_equal, .bang_equal => .equality,
-            .l_angle_bracket,
-            .r_angle_bracket,
-            .l_angle_bracket_equal,
-            .r_angle_bracket_equal,
-            => .comparison,
-            .minus, .plus => .term,
-            .asterisk, .slash, .percent => .factor,
-            // .bang => .unary,
-            // .l_paren => .call,
-            // .identifier, .string, .number, .bool => .primary,
+fn warnExpected(self: *Parser, expected_token: Token.Tag) Error!void {
+    @setCold(true);
+    try self.warnMsg(.{
+        .tag = .expected_token,
+        .token = self.tok_i,
+        .extra = .{ .expected_tag = expected_token },
+    });
+}
+
+fn warn(self: *Parser, error_tag: Ast.Error.Tag) Error!void {
+    @setCold(true);
+    try self.warnMsg(.{ .tag = error_tag, .token = self.tok_i });
+}
+
+fn warnMsg(self: *Parser, msg: Ast.Error) Error!void {
+    @setCold(true);
+    // switch (msg.tag) {
+    //     .expected_semi_after_decl,
+    //     .expected_semi_after_stmt,
+    //     .expected_comma_after_field,
+    //     .expected_comma_after_arg,
+    //     .expected_comma_after_param,
+    //     .expected_comma_after_initializer,
+    //     .expected_comma_after_switch_prong,
+    //     .expected_comma_after_for_operand,
+    //     .expected_comma_after_capture,
+    //     .expected_semi_or_else,
+    //     .expected_semi_or_lbrace,
+    //     .expected_token,
+    //     .expected_block,
+    //     .expected_block_or_assignment,
+    //     .expected_block_or_expr,
+    //     .expected_block_or_field,
+    //     .expected_expr,
+    //     .expected_expr_or_assignment,
+    //     .expected_fn,
+    //     .expected_inlinable,
+    //     .expected_labelable,
+    //     .expected_param_list,
+    //     .expected_prefix_expr,
+    //     .expected_primary_type_expr,
+    //     .expected_pub_item,
+    //     .expected_return_type,
+    //     .expected_suffix_op,
+    //     .expected_type_expr,
+    //     .expected_var_decl,
+    //     .expected_var_decl_or_fn,
+    //     .expected_loop_payload,
+    //     .expected_container,
+    //     => if (msg.token != 0 and !self.tokensOnSameLine(msg.token - 1, msg.token)) {
+    //         var copy = msg;
+    //         copy.token_is_prev = true;
+    //         copy.token -= 1;
+    //         return self.errors.append(self.allocator, copy);
+    //     },
+    //     else => {},
+    // }
+    try self.errors.append(self.allocator, msg);
+}
+
+fn failExpected(self: *Parser, expected_token: Token.Tag) Error {
+    @setCold(true);
+    return self.failMsg(.{
+        .tag = .expected_token,
+        .token = self.tok_i,
+        .extra = .{ .expected_tag = expected_token },
+    });
+}
+
+fn fail(self: *Parser, tag: Ast.Error.Tag) Error {
+    @setCold(true);
+    return self.failMsg(.{ .tag = tag, .token = self.tok_i });
+}
+
+fn failMsg(self: *Parser, msg: Ast.Error) Error {
+    @setCold(true);
+    try self.warnMsg(msg);
+    return error.ParseError;
+}
+
+/// Decl <- FnProto (NEWLINE / Block) / VarDecl
+fn expectTopLevelDecl(self: *Parser) Error!Node.Index {
+    // if (self.token_tags[self.tok_i + 1] == .l_paren) // it's a func
+    const fn_proto = try self.parseFnProto();
+    if (fn_proto != 0) {
+        switch (self.token_tags[self.tok_i]) {
+            .newline => {
+                self.tok_i += 1;
+                return fn_proto;
+            },
+            .l_brace => {
+                const fn_decl_index = try self.reserveNode(.fn_decl);
+                errdefer self.unreserveNode(fn_decl_index);
+
+                const body_block = try self.parseBlock();
+                assert(body_block != 0);
+                return self.setNode(fn_decl_index, .{
+                    .tag = .fn_decl,
+                    .main_token = self.nodes.items(.main_token)[fn_proto],
+                    .data = .{
+                        .lhs = fn_proto,
+                        .rhs = body_block,
+                    },
+                });
+            },
+            else => {
+                // Since parseBlock only return error.ParseError on
+                // a missing '}' we can assume this function was
+                // supposed to end here.
+                try self.warn(.expected_newline_or_lbrace);
+                return null_node;
+            },
+        }
+    }
+
+    const var_decl = try self.parseGlobalVarDecl();
+    if (var_decl != 0) {
+        return var_decl;
+    }
+    return self.fail(.expected_pub_item);
+}
+
+fn expectTopLevelDeclRecoverable(self: *Parser) Error!Node.Index {
+    return self.expectTopLevelDecl() catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.ParseError => {
+            self.synchronize(); // findNextContainerMember
+            return null_node;
+        },
+    };
+}
+// TODO: we don't have fn keyword
+/// FnProto <- KEYWORD_fn IDENTIFIER? LPAREN ParamDeclList RPAREN ByteAlign? AddrSpace? LinkSection? CallConv? EXCLAMATIONMARK? TypeExpr
+/// FnProto <- IDENTIFIER LPAREN ParamDeclList RPAREN EXCLAMATIONMARK? TypeExpr?
+fn parseFnProto(self: *Parser) Error!Node.Index {
+    const fn_token = self.consume(.keyword_fn) orelse return null_node;
+
+    // We want the fn proto node to be before its children in the array.
+    const fn_proto_index = try self.reserveNode(.fn_proto);
+    errdefer self.unreserveNode(fn_proto_index);
+
+    _ = self.consume(.identifier);
+    const params = try self.parseParamDeclList();
+    _ = self.consume(.bang);
+    const return_type_expr = try self.parseTypeExpr();
+
+    switch (params) {
+        .zero_or_one => |param| return self.setNode(fn_proto_index, .{
+            .tag = .fn_proto_one,
+            .main_token = fn_token,
+            .data = .{
+                .lhs = param,
+                .rhs = return_type_expr,
+            },
+        }),
+        .multi => |span| {
+            return self.setNode(fn_proto_index, .{
+                .tag = .fn_proto_multi,
+                .main_token = fn_token,
+                .data = .{
+                    .lhs = try self.addExtra(Node.SubRange{
+                        .start = span.start,
+                        .end = span.end,
+                    }),
+                    .rhs = return_type_expr,
+                },
+            });
+        },
+    }
+}
+
+/// VarDeclProto <- KEYWORD_let KEYWORD_mut? IDENTIFIER (COLON TypeExpr)?
+/// Returns a `*_var_decl` node with its rhs (init expression) initialized to 0.
+fn parseVarDeclProto(self: *Parser) Error!Node.Index {
+    var main_token = self.consume(.keyword_let) orelse return null_node;
+    if (self.consume(.keyword_mut)) |tok| {
+        main_token = tok;
+    }
+    _ = try self.expectToken(.identifier);
+    const type_node: Node.Index = if (self.consume(.colon) == null) 0 else try self.expectTypeExpr();
+    return self.addNode(.{
+        .tag = .var_decl,
+        .main_token = main_token,
+        .data = .{
+            .lhs = type_node,
+            .rhs = 0,
+        },
+    });
+}
+
+/// GlobalVarDecl <- VarDeclProto (EQUAL Expr?) NEWLINE
+fn parseGlobalVarDecl(self: *Parser) Error!Node.Index {
+    const var_decl = try self.parseVarDeclProto();
+    if (var_decl == 0) {
+        return null_node;
+    }
+
+    const init_node: Node.Index = switch (self.token_tags[self.tok_i]) {
+        .equal_equal => blk: {
+            try self.warn(.wrong_equal_var_decl);
+            self.tok_i += 1;
+            break :blk try self.expectExpr();
+        },
+        .equal => blk: {
+            self.tok_i += 1;
+            break :blk try self.expectExpr();
+        },
+        else => 0,
+    };
+
+    self.nodes.items(.data)[var_decl].rhs = init_node;
+
+    try self.expectNewline(.expected_newline_after_decl, false);
+    return var_decl;
+}
+
+// TODO: expectContainerField() (not yet)
+
+/// Statement
+///     <- IfStatement
+///      / LoopStatement
+///      / WhileStatement
+///      / ForStatement
+///      / MatchStatement
+///      / Block
+///      / VarDeclExprStatement
+fn expectStatement(self: *Parser, allow_defer_var: bool) Error!Node.Index {
+    return switch (self.token_tags[self.tok_i]) {
+        .keyword_if => self.expectIfStatement(),
+        .keyword_loop => self.expectLoopStatement(),
+        .keyword_while => self.expectWhileStatement(),
+        .keyword_for => self.expectForStatement(),
+        .keyword_match => self.expectMatchExpr(),
+        .l_brace => self.parseBlock(),
+        else => blk: {
+            // TODO: ?
+            if (allow_defer_var) {
+                break :blk self.expectVarDeclExprStatement();
+            } else {
+                const assign = try self.expectAssignExpr();
+                try self.expectNewline(.expected_newline_after_stmt, true);
+                break :blk assign;
+            }
+        },
+    };
+}
+
+fn expectStatementRecoverable(self: *Parser) Error!Node.Index {
+    while (true) {
+        return self.expectStatement(true) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ParseError => {
+                self.synchronize(); // findNextStmt
+                switch (self.token_tags[self.tok_i]) {
+                    .r_brace => return null_node,
+                    .eof => return error.ParseError,
+                    else => continue,
+                }
+            },
         };
     }
-};
-
-const Rule = struct {
-    precedence: Precedence,
-    prefix: ?*const fn (*Parser, bool) anyerror!*Ast.Node,
-    infix: ?*const fn (*Parser, bool, *Ast.Node) anyerror!*Ast.Node,
-};
-
-// must be in the same order as Scanner.Token.Tag
-const rules = [_]Rule{
-    .{ .precedence = Precedence.get(.l_paren), .prefix = grouping, .infix = null },
-    .{ .precedence = Precedence.get(.r_paren), .prefix = null, .infix = null },
-    .{ .precedence = Precedence.get(.l_brace), .prefix = null, .infix = null },
-    .{ .precedence = Precedence.get(.r_brace), .prefix = null, .infix = null },
-    .{ .precedence = Precedence.get(.comma), .prefix = null, .infix = null },
-    .{ .precedence = Precedence.get(.period), .prefix = null, .infix = null },
-    .{ .precedence = Precedence.get(.colon), .prefix = null, .infix = null },
-    .{ .precedence = Precedence.get(.minus), .prefix = unary, .infix = binary },
-    .{ .precedence = Precedence.get(.plus), .prefix = null, .infix = binary },
-    .{ .precedence = Precedence.get(.asterisk), .prefix = null, .infix = binary },
-    .{ .precedence = Precedence.get(.slash), .prefix = null, .infix = binary },
-    .{ .precedence = Precedence.get(.percent), .prefix = null, .infix = binary },
-    .{ .precedence = Precedence.get(.bang), .prefix = unary, .infix = null },
-    .{ .precedence = Precedence.get(.bang_equal), .prefix = null, .infix = binary },
-    .{ .precedence = Precedence.get(.equal), .prefix = null, .infix = null },
-    .{ .precedence = Precedence.get(.equal_equal), .prefix = null, .infix = binary },
-    .{ .precedence = Precedence.get(.l_angle_bracket), .prefix = null, .infix = binary },
-    .{ .precedence = Precedence.get(.r_angle_bracket), .prefix = null, .infix = binary },
-    .{ .precedence = Precedence.get(.l_angle_bracket_equal), .prefix = null, .infix = binary },
-    .{ .precedence = Precedence.get(.r_angle_bracket_equal), .prefix = null, .infix = binary },
-    .{ .precedence = Precedence.get(.plus_equal), .prefix = null, .infix = null },
-    .{ .precedence = Precedence.get(.minus_equal), .prefix = null, .infix = null },
-    .{ .precedence = Precedence.get(.asterisk_equal), .prefix = null, .infix = null },
-    .{ .precedence = Precedence.get(.slash_equal), .prefix = null, .infix = null },
-    .{ .precedence = Precedence.get(.percent_equal), .prefix = null, .infix = null },
-    .{ .precedence = Precedence.get(.keyword_and), .prefix = null, .infix = binary }, // TODO: binary?
-    .{ .precedence = Precedence.get(.keyword_or), .prefix = null, .infix = binary }, // TODO: binary?
-    .{ .precedence = Precedence.get(.keyword_else), .prefix = null, .infix = null },
-    .{ .precedence = Precedence.get(.keyword_if), .prefix = null, .infix = null },
-    .{ .precedence = Precedence.get(.keyword_match), .prefix = null, .infix = null },
-    .{ .precedence = Precedence.get(.keyword_print), .prefix = null, .infix = null },
-    .{ .precedence = Precedence.get(.keyword_return), .prefix = null, .infix = null },
-    .{ .precedence = Precedence.get(.keyword_let), .prefix = null, .infix = null },
-    .{ .precedence = Precedence.get(.keyword_mut), .prefix = null, .infix = null }, // TODO
-    .{ .precedence = Precedence.get(.keyword_loop), .prefix = null, .infix = null },
-    .{ .precedence = Precedence.get(.keyword_while), .prefix = null, .infix = null },
-    .{ .precedence = Precedence.get(.keyword_for), .prefix = null, .infix = null },
-    .{ .precedence = Precedence.get(.keyword_break), .prefix = null, .infix = null },
-    .{ .precedence = Precedence.get(.keyword_continue), .prefix = null, .infix = null },
-    .{ .precedence = Precedence.get(.identifier), .prefix = variable, .infix = null },
-    .{ .precedence = Precedence.get(.string), .prefix = null, .infix = null }, // TODO: prefix string
-    .{ .precedence = Precedence.get(.number), .prefix = literal, .infix = null },
-    .{ .precedence = Precedence.get(.bool), .prefix = null, .infix = null }, // TODO: prefix literal
-    .{ .precedence = Precedence.get(.eof), .prefix = null, .infix = null },
-    .{ .precedence = Precedence.get(.invalid), .prefix = null, .infix = null },
-};
-
-comptime {
-    if (std.enums.values(Token.Tag).len != rules.len) {
-        @compileError("Mismatch between Token.Tag and rules");
-    }
 }
 
-inline fn getRule(tag: Token.Tag) Rule {
-    return rules[@intFromEnum(tag)];
+// TODO: check if good
+/// VarDeclExprStatement
+///    <- VarDeclProto (COMMA (VarDeclProto / Expr))* EQUAL Expr NEWLINE
+///     / Expr (AssignOp Expr / (COMMA (VarDeclProto / Expr))+ EQUAL Expr)? NEWLINE
+fn expectVarDeclExprStatement(self: *Parser) Error!Node.Index {
+    _ = self;
+    unreachable;
+    // const scratch_top = self.scratch.items.len;
+    // defer self.scratch.shrinkRetainingCapacity(scratch_top);
+
+    // while (true) {
+    //     const var_decl_proto = try self.parseVarDeclProto();
+    //     if (var_decl_proto != 0) {
+    //         try self.scratch.append(self.allocator, var_decl_proto);
+    //     } else {
+    //         const expr = try self.parseExpr();
+    //         if (expr == 0) {
+    //             if (self.scratch.items.len == scratch_top) {
+    //                 // We parsed nothing
+    //                 return self.fail(.expected_statement);
+    //             } else {
+    //                 // We've had at least one LHS, but had a bad comma
+    //                 return self.fail(.expected_expr_or_var_decl);
+    //             }
+    //         }
+    //         try self.scratch.append(self.allocator, expr);
+    //     }
+    //     _ = self.consume(.comma) orelse break;
+    // }
+
+    // const lhs_count = self.scratch.items.len - scratch_top;
+    // assert(lhs_count > 0);
+
+    // const equal_token = self.consume(.equal) orelse eql: {
+    //     if (lhs_count > 1) {
+    //         // Definitely a destructure, so allow recovering from ==
+    //         if (self.consume(.equal_equal)) |tok| {
+    //             try self.warnMsg(.{ .tag = .wrong_equal_var_decl, .token = tok });
+    //             break :eql tok;
+    //         }
+    //         return self.failExpected(.equal);
+    //     }
+    //     const lhs = self.scratch.items[scratch_top];
+    //     switch (self.nodes.items(.tag)[lhs]) {
+    //         .global_var_decl, .local_var_decl, .simple_var_decl, .aligned_var_decl => {
+    //             // Definitely a var decl, so allow recovering from ==
+    //             if (self.consume(.equal_equal)) |tok| {
+    //                 try self.warnMsg(.{ .tag = .wrong_equal_var_decl, .token = tok });
+    //                 break :eql tok;
+    //             }
+    //             return self.failExpected(.equal);
+    //         },
+    //         else => {},
+    //     }
+
+    //     const expr = try self.finishAssignExpr(lhs);
+    //     try self.expectNewline(.expected_newline_after_stmt, true);
+    //     return expr;
+    // };
+
+    // const rhs = try self.expectExpr();
+    // try self.expectNewline(.expected_newline_after_stmt, true);
+
+    // if (lhs_count == 1) {
+    //     const lhs = self.scratch.items[scratch_top];
+    //     switch (self.nodes.items(.tag)[lhs]) {
+    //         .global_var_decl, .local_var_decl, .simple_var_decl, .aligned_var_decl => {
+    //             self.nodes.items(.data)[lhs].rhs = rhs;
+    //             // Don't need to wrap in comptime
+    //             return lhs;
+    //         },
+    //         else => {},
+    //     }
+    //     const expr = try self.addNode(.{
+    //         .tag = .assign,
+    //         .main_token = equal_token,
+    //         .data = .{ .lhs = lhs, .rhs = rhs },
+    //     });
+    //     return expr;
+    // }
+
+    // // An actual destructure! No need for any `comptime` wrapper here.
+
+    // const extra_start = self.extra_data.items.len;
+    // try self.extra_data.ensureUnusedCapacity(self.allocator, lhs_count + 1);
+    // self.extra_data.appendAssumeCapacity(@intCast(lhs_count));
+    // self.extra_data.appendSliceAssumeCapacity(self.scratch.items[scratch_top..]);
+
+    // return self.addNode(.{
+    //     .tag = .assign_destructure,
+    //     .main_token = equal_token,
+    //     .data = .{
+    //         .lhs = @intCast(extra_start),
+    //         .rhs = rhs,
+    //     },
+    // });
 }
 
-fn advance(self: *Parser) !void {
-    self.previous = self.current;
-    while (true) {
-        self.current = self.tokenizer.next();
+/// IfStatement
+///     <- IfPrefix Block ( KEYWORD_else Statement )?
+///      / IfPrefix AssignExpr ( NEWLINE / KEYWORD_else Statement )
+fn expectIfStatement(self: *Parser) Error!Node.Index {
+    const if_token = self.assertToken(.keyword_if);
+    _ = try self.expectToken(.l_paren);
+    const condition = try self.expectExpr();
+    _ = try self.expectToken(.r_paren);
+    // _ = try self.parsePtrPayload(); // if (cond) | |<-
 
-        if (self.current.tag == .invalid) {
-            if (self.current.literal) |lit| {
-                self.errorAtCurrent("{s}", .{lit.string});
-            } else {
-                self.errorAtCurrent("Unknown error", .{});
-            }
-        } else {
-            _ = try self.ast.appendToken(self.current); // TODO: append invalid too?
-            break;
+    var else_required = false;
+    const then_expr = blk: {
+        const block = try self.parseBlock();
+        if (block != 0) break :blk block;
+        const assign_expr = try self.parseAssignExpr();
+        if (assign_expr == 0) {
+            return self.fail(.expected_block_or_assignment);
         }
+        if (self.consume(.newline)) |_| {
+            return self.addNode(.{
+                .tag = .@"if",
+                .main_token = if_token,
+                .data = .{
+                    .lhs = condition,
+                    .rhs = assign_expr,
+                },
+            });
+        }
+        else_required = true;
+        break :blk assign_expr;
+    };
+    _ = self.consume(.keyword_else) orelse {
+        if (else_required) {
+            try self.warn(.expected_newline_or_else);
+        }
+        return self.addNode(.{
+            .tag = .@"if",
+            .main_token = if_token,
+            .data = .{
+                .lhs = condition,
+                .rhs = then_expr,
+            },
+        });
+    };
+    // _ = try self.parsePayload(); // else | |<-
+    const else_expr = try self.expectStatement(false);
+    return self.addNode(.{
+        .tag = .if_else,
+        .main_token = if_token,
+        .data = .{
+            .lhs = condition,
+            .rhs = try self.addExtra(Node.If{
+                .then_expr = then_expr,
+                .else_expr = else_expr,
+            }),
+        },
+    });
+}
+
+/// LoopStatement <- KEYWORD_loop Block
+fn expectLoopStatement(self: *Parser) Error!Node.Index {
+    const loop_token = self.assertToken(.keyword_loop);
+    const block = try self.parseBlock();
+    if (block == 0) {
+        return self.fail(.expected_block);
     }
+    return self.addNode(.{
+        .tag = .loop,
+        .main_token = loop_token,
+        .data = .{
+            .lhs = block,
+            .rhs = undefined,
+        },
+    });
 }
 
-fn match(self: *Parser, tag: Token.Tag) !bool {
-    if (!self.check(tag)) {
-        return false;
+// TODO
+/// WhilePrefix <- KEYWORD_while LPAREN Expr RPAREN PtrPayload? WhileContinueExpr?
+///
+/// WhileStatement
+///     <- WhilePrefix Block ( KEYWORD_else Payload? Statement )?
+///      / WhilePrefix AssignExpr ( SEMICOLON / KEYWORD_else Payload? Statement )
+fn expectWhileStatement(self: *Parser) Error!Node.Index {
+    _ = self;
+    unreachable;
+    // const while_token = self.assertToken(.keyword_while);
+    // _ = try self.expectToken(.l_paren);
+    // const condition = try self.expectExpr();
+    // _ = try self.expectToken(.r_paren);
+    // _ = try self.parsePtrPayload();
+    // const cont_expr = try self.parseWhileContinueExpr();
+
+    // // TODO propose to change the syntax so that semicolons are always required
+    // // inside while statements, even if there is an `else`.
+    // var else_required = false;
+    // const then_expr = blk: {
+    //     const block_expr = try self.parseBlock();
+    //     if (block_expr != 0) break :blk block_expr;
+    //     const assign_expr = try self.parseAssignExpr();
+    //     if (assign_expr == 0) {
+    //         return self.fail(.expected_block_or_assignment);
+    //     }
+    //     if (self.consume(.semicolon)) |_| {
+    //         if (cont_expr == 0) {
+    //             return self.addNode(.{
+    //                 .tag = .while_simple,
+    //                 .main_token = while_token,
+    //                 .data = .{
+    //                     .lhs = condition,
+    //                     .rhs = assign_expr,
+    //                 },
+    //             });
+    //         } else {
+    //             return self.addNode(.{
+    //                 .tag = .while_cont,
+    //                 .main_token = while_token,
+    //                 .data = .{
+    //                     .lhs = condition,
+    //                     .rhs = try self.addExtra(Node.WhileCont{
+    //                         .cont_expr = cont_expr,
+    //                         .then_expr = assign_expr,
+    //                     }),
+    //                 },
+    //             });
+    //         }
+    //     }
+    //     else_required = true;
+    //     break :blk assign_expr;
+    // };
+    // _ = self.consume(.keyword_else) orelse {
+    //     if (else_required) {
+    //         try self.warn(.expected_semi_or_else);
+    //     }
+    //     if (cont_expr == 0) {
+    //         return self.addNode(.{
+    //             .tag = .while_simple,
+    //             .main_token = while_token,
+    //             .data = .{
+    //                 .lhs = condition,
+    //                 .rhs = then_expr,
+    //             },
+    //         });
+    //     } else {
+    //         return self.addNode(.{
+    //             .tag = .while_cont,
+    //             .main_token = while_token,
+    //             .data = .{
+    //                 .lhs = condition,
+    //                 .rhs = try self.addExtra(Node.WhileCont{
+    //                     .cont_expr = cont_expr,
+    //                     .then_expr = then_expr,
+    //                 }),
+    //             },
+    //         });
+    //     }
+    // };
+    // _ = try self.parsePayload();
+    // const else_expr = try self.expectStatement(false);
+    // return self.addNode(.{
+    //     .tag = .@"while",
+    //     .main_token = while_token,
+    //     .data = .{
+    //         .lhs = condition,
+    //         .rhs = try self.addExtra(Node.While{
+    //             .cont_expr = cont_expr,
+    //             .then_expr = then_expr,
+    //             .else_expr = else_expr,
+    //         }),
+    //     },
+    // });
+}
+
+// TODO
+/// ForStatement
+///     <- ForPrefix Block ( KEYWORD_else Statement )?
+///      / ForPrefix AssignExpr ( SEMICOLON / KEYWORD_else Statement )
+fn expectForStatement(self: *Parser) Error!Node.Index {
+    _ = self;
+    unreachable;
+    // const for_token = self.assertToken(.keyword_for);
+
+    // const scratch_top = self.scratch.items.len;
+    // defer self.scratch.shrinkRetainingCapacity(scratch_top);
+    // const inputs = try self.forPrefix();
+
+    // var else_required = false;
+    // var seen_semicolon = false;
+    // const then_expr = blk: {
+    //     const block_expr = try self.parseBlock();
+    //     if (block_expr != 0) break :blk block_expr;
+    //     const assign_expr = try self.parseAssignExpr();
+    //     if (assign_expr == 0) {
+    //         return self.fail(.expected_block_or_assignment);
+    //     }
+    //     if (self.consume(.semicolon)) |_| {
+    //         seen_semicolon = true;
+    //         break :blk assign_expr;
+    //     }
+    //     else_required = true;
+    //     break :blk assign_expr;
+    // };
+    // var has_else = false;
+    // if (!seen_semicolon and self.consume(.keyword_else) != null) {
+    //     try self.scratch.append(self.allocator, then_expr);
+    //     const else_stmt = try self.expectStatement(false);
+    //     try self.scratch.append(self.allocator, else_stmt);
+    //     has_else = true;
+    // } else if (inputs == 1) {
+    //     if (else_required) try self.warn(.expected_semi_or_else);
+    //     return self.addNode(.{
+    //         .tag = .for_simple,
+    //         .main_token = for_token,
+    //         .data = .{
+    //             .lhs = self.scratch.items[scratch_top],
+    //             .rhs = then_expr,
+    //         },
+    //     });
+    // } else {
+    //     if (else_required) try self.warn(.expected_semi_or_else);
+    //     try self.scratch.append(self.allocator, then_expr);
+    // }
+    // return self.addNode(.{
+    //     .tag = .@"for",
+    //     .main_token = for_token,
+    //     .data = .{
+    //         .lhs = (try self.listToSpan(self.scratch.items[scratch_top..])).start,
+    //         .rhs = @as(u32, @bitCast(Node.For{
+    //             .inputs = @as(u31, @intCast(inputs)),
+    //             .has_else = has_else,
+    //         })),
+    //     },
+    // });
+}
+
+/// ForPrefix <- KEYWORD_for LPAREN ForInput (COMMA ForInput)* COMMA? RPAREN ForPayload
+///
+/// ForInput <- Expr (DOT2 Expr?)?
+///
+/// ForPayload <- PIPE ASTERISK? IDENTIFIER (COMMA ASTERISK? IDENTIFIER)* PIPE
+// fn forPrefix(self: *Parser) Error!usize {
+//     const start = self.scratch.items.len;
+//     _ = try self.expectToken(.l_paren);
+
+//     while (true) {
+//         var input = try self.expectExpr();
+//         if (self.consume(.ellipsis2)) |ellipsis| {
+//             input = try self.addNode(.{
+//                 .tag = .for_range,
+//                 .main_token = ellipsis,
+//                 .data = .{
+//                     .lhs = input,
+//                     .rhs = try self.parseExpr(),
+//                 },
+//             });
+//         }
+
+//         try self.scratch.append(self.allocator, input);
+//         switch (self.token_tags[self.tok_i]) {
+//             .comma => self.tok_i += 1,
+//             .r_paren => {
+//                 self.tok_i += 1;
+//                 break;
+//             },
+//             .colon, .r_brace, .r_bracket => return self.failExpected(.r_paren),
+//             // Likely just a missing comma; give error but continue parsing.
+//             else => try self.warn(.expected_comma_after_for_operand),
+//         }
+//         if (self.consume(.r_paren)) |_| break;
+//     }
+//     const inputs = self.scratch.items.len - start;
+
+//     _ = self.consume(.pipe) orelse {
+//         try self.warn(.expected_loop_payload);
+//         return inputs;
+//     };
+
+//     var warned_excess = false;
+//     var captures: u32 = 0;
+//     while (true) {
+//         _ = self.consume(.asterisk);
+//         const identifier = try self.expectToken(.identifier);
+//         captures += 1;
+//         if (captures > inputs and !warned_excess) {
+//             try self.warnMsg(.{ .tag = .extra_for_capture, .token = identifier });
+//             warned_excess = true;
+//         }
+//         switch (self.token_tags[self.tok_i]) {
+//             .comma => self.tok_i += 1,
+//             .pipe => {
+//                 self.tok_i += 1;
+//                 break;
+//             },
+//             // Likely just a missing comma; give error but continue parsing.
+//             else => try self.warn(.expected_comma_after_capture),
+//         }
+//         if (self.consume(.pipe)) |_| break;
+//     }
+
+//     if (captures < inputs) {
+//         const index = self.scratch.items.len - captures;
+//         const input = self.nodes.items(.main_token)[self.scratch.items[index]];
+//         try self.warnMsg(.{ .tag = .for_input_not_captured, .token = input });
+//     }
+//     return inputs;
+// }
+
+/// Blocktatement <- Block / AssignExpr NEWLINE
+fn parseBlockStatement(self: *Parser) Error!Node.Index {
+    const block = try self.parseBlock();
+    if (block != 0) {
+        return block;
     }
-    try self.advance();
-    return true;
-}
-
-inline fn check(self: *Parser, tag: Token.Tag) bool {
-    return self.current.tag == tag;
-}
-
-inline fn currentCode(self: *Parser) usize {
-    return self.chunk.code.items.len;
-}
-
-fn declarationOrStatement(self: *Parser) !?*Ast.Node {
-    return try self.declaration() orelse try self.statement();
-}
-
-fn declaration(self: *Parser) !?*Ast.Node {
-    const node = if (try self.match(.keyword_let))
-        self.letDeclaration()
-    else
-        null;
-
-    if (self.panic_mode) {
-        try self.synchronize();
+    const assign_expr = try self.parseAssignExpr();
+    if (assign_expr != 0) {
+        try self.expectNewline(.expected_newline_after_stmt, true);
+        return assign_expr;
     }
+    return null_node;
+}
 
+fn expectBlockStatement(self: *Parser) Error!Node.Index {
+    const node = try self.parseBlockStatement();
+    if (node == 0) {
+        return self.fail(.expected_block_or_expr);
+    }
     return node;
 }
 
-fn letDeclaration(self: *Parser) !*Ast.Node {
-    if (true) return error.Unimplemented;
-    const is_mut = self.match(.keyword_mut);
-    _ = is_mut; // TODO
-    const global = self.parseVariable("Expect variable name");
-    const tag = blk: {
-        if (!self.match(.colon)) {
-            break :blk null;
-        }
-        self.consume(.identifier, "Expect type after ':'");
-        const type_name = self.previous.literal.?.string;
-        // TODO: support custom types
-        if (std.mem.eql(u8, type_name, "number")) {
-            break :blk Token.Tag.number;
-        } else if (std.mem.eql(u8, type_name, "bool")) {
-            break :blk Token.Tag.bool;
-        } else if (std.mem.eql(u8, type_name, "string")) {
-            break :blk Token.Tag.string;
-        } else {
-            self.errorAtPrevious("Invalid type", .{});
-            break :blk null;
-        }
+/// AssignExpr <- Expr (AssignOp Expr / (COMMA Expr)+ EQUAL Expr)?
+///
+/// AssignOp
+///     <- ASTERISKEQUAL
+///      / SLASHEQUAL
+///      / PERCENTEQUAL
+///      / PLUSEQUAL
+///      / MINUSEQUAL
+///      / LANGLEBRACKET2EQUAL
+///      / RANGLEBRACKET2EQUAL
+///      / AMPERSANDEQUAL
+///      / CARETEQUAL
+///      / PIPEEQUAL
+///      / EQUAL
+fn parseAssignExpr(self: *Parser) Error!Node.Index {
+    const expr = try self.parseExpr();
+    if (expr == 0) return null_node;
+    return self.finishAssignExpr(expr);
+}
+
+/// SingleAssignExpr <- Expr (AssignOp Expr)?
+fn parseSingleAssignExpr(self: *Parser) Error!Node.Index {
+    const lhs = try self.parseExpr();
+    if (lhs == 0) return null_node;
+    const tag = assignOpNode(self.token_tags[self.tok_i]) orelse return lhs;
+    return self.addNode(.{
+        .tag = tag,
+        .main_token = self.nextToken(),
+        .data = .{
+            .lhs = lhs,
+            .rhs = try self.expectExpr(),
+        },
+    });
+}
+
+fn finishAssignExpr(self: *Parser, lhs: Node.Index) Error!Node.Index {
+    const tok = self.token_tags[self.tok_i];
+    // if (tok == .comma) return self.finishAssignDestructureExpr(lhs);
+    const tag = assignOpNode(tok) orelse return lhs;
+    return self.addNode(.{
+        .tag = tag,
+        .main_token = self.nextToken(),
+        .data = .{
+            .lhs = lhs,
+            .rhs = try self.expectExpr(),
+        },
+    });
+}
+
+fn assignOpNode(tok: Token.Tag) ?Node.Tag {
+    return switch (tok) {
+        .asterisk_equal => .assign_mul,
+        .slash_equal => .assign_div,
+        .percent_equal => .assign_mod,
+        .plus_equal => .assign_add,
+        .minus_equal => .assign_sub,
+        .l_angle_bracket_angle_bracket_equal => .assign_shl,
+        .r_angle_bracket_angle_bracket_equal => .assign_shr,
+        .ampersand_equal => .assign_bit_and,
+        .caret_equal => .assign_bit_xor,
+        .equal => .assign,
+        else => null,
     };
-    if (self.match(.equal)) {
-        self.expression();
-        if (tag != null and self.previous.tag != tag.?) {
-            self.errorAtPrevious("Type mismatch: expected '{s}' got '{s}'", .{
-                @tagName(tag.?),
-                @tagName(self.previous.tag),
-            });
-        }
-    } else {
-        if (tag) |t| {
-            switch (t) {
-                // TODO: very wrong
-                .number => self.emitConstant(.{ .number = undefined }),
-                .bool => self.emitConstant(.{ .bool = undefined }),
-                .string => self.emitConstant(.{ .string = undefined }),
-                else => unreachable,
-            }
-        } else {
-            self.errorAtPrevious("Expect type or '=' after variable name", .{});
-        }
-        // self.emitByte(@intFromEnum(Chunk.OpCode.void));
-    }
-    // self.consume(.semicolon, "Expect ';' after value");
-    self.defineVariable(global);
 }
 
-fn statement(self: *Parser) !?*Ast.Node {
-    // TODO: allowed in global scope?
+// fn finishAssignDestructureExpr(self: *Parser, first_lhs: Node.Index) Error!Node.Index {
+//     const scratch_top = self.scratch.items.len;
+//     defer self.scratch.shrinkRetainingCapacity(scratch_top);
 
-    // if (self.match(.keyword_print)) {
-    //     self.printStatement();
-    // } else if (self.match(.keyword_if)) {
-    //     return self.ifStatement();
-    // } else if (self.match(.keyword_loop)) {
-    //     self.loopStatement();
-    // } else if (self.match(.keyword_while)) {
-    //     self.whileStatement();
-    // } else if (self.match(.keyword_for)) {
-    //     self.forStatement();
-    // } else if (self.match(.l_brace)) {
-    //     beginScope();
-    //     self.block();
-    //     endScope();
-    // }
+//     try self.scratch.append(self.allocator, first_lhs);
 
-    return self.expressionStatement();
-}
-
-// fn ifStatement(self: *Parser) !*Ast.Node {
-//     self.consume(.l_paren, "Expected '(' after 'if'");
-//     // try self.beginScope();
-//     const condition = try self.expression();
-//     self.consume(.r_paren, "Expected ')' after 'if' condition");
-
-//     try self.consume(.l_brace, "Expected '{' after 'if' condition");
-//     const body = try self.block();
-//     // try self.endScope();
-
-//     var else_branch: ?*Ast.Node = null;
-//     if (self.match(.keyword_else)) {
-//         try self.consume(.l_brace, "Expected '{' after 'else'");
-//         // try self.beginScope();
-//         else_branch = try self.block();
-//         // try self.endScope();
+//     while (self.consume(.comma)) |_| {
+//         const expr = try self.expectExpr();
+//         try self.scratch.append(self.allocator, expr);
 //     }
 
-//     return self.ast.appendNode(.{
-//         .expr = .{
-//             .if = .{
-//             },
+//     const equal_token = try self.expectToken(.equal);
+
+//     const rhs = try self.expectExpr();
+
+//     const lhs_count = self.scratch.items.len - scratch_top;
+//     assert(lhs_count > 1); // we already had first_lhs, and must have at least one more lvalue
+
+//     const extra_start = self.extra_data.items.len;
+//     try self.extra_data.ensureUnusedCapacity(self.allocator, lhs_count + 1);
+//     self.extra_data.appendAssumeCapacity(@intCast(lhs_count));
+//     self.extra_data.appendSliceAssumeCapacity(self.scratch.items[scratch_top..]);
+
+//     return self.addNode(.{
+//         .tag = .assign_destructure,
+//         .main_token = equal_token,
+//         .data = .{
+//             .lhs = @intCast(extra_start),
+//             .rhs = rhs,
 //         },
 //     });
 // }
 
-fn parsePrecedence(self: *Parser, precedence: Precedence) !*Ast.Node {
-    try self.advance();
-    const prefixRule = getRule(self.previous.tag).prefix orelse {
-        self.errorAtPrevious("Expect expression", .{});
-        return error.what;
-    };
-    const can_assign = @intFromEnum(precedence) <= @intFromEnum(Precedence.assignment);
-    var node = try prefixRule(self, can_assign);
-    while (@intFromEnum(precedence) <= @intFromEnum(getRule(self.current.tag).precedence)) {
-        try self.advance();
-        const infixRule = getRule(self.previous.tag).infix.?;
-        node = try infixRule(self, can_assign, node);
+fn expectSingleAssignExpr(self: *Parser) Error!Node.Index {
+    const expr = try self.parseSingleAssignExpr();
+    if (expr == 0) {
+        return self.fail(.expected_expr_or_assignment);
+    }
+    return expr;
+}
+
+fn expectAssignExpr(self: *Parser) Error!Node.Index {
+    const expr = try self.parseAssignExpr();
+    if (expr == 0) {
+        return self.fail(.expected_expr_or_assignment);
+    }
+    return expr;
+}
+
+fn parseExpr(self: *Parser) Error!Node.Index {
+    return self.parseExprPrecedence(.assignment);
+}
+
+fn expectExpr(p: *Parser) Error!Node.Index {
+    const node = try p.parseExpr();
+    if (node == 0) {
+        return p.fail(.expected_expr);
+    } else {
+        return node;
+    }
+}
+
+const Precedence = enum(i8) {
+    none = -1,
+    assignment = 0,
+    bool_or = 10,
+    bool_and = 20,
+    equality = 30,
+    comparison = 40,
+    bitwise = 50,
+    shift = 60,
+    term = 70,
+    factor = 80,
+    _,
+};
+
+const Assoc = enum {
+    left,
+    none,
+};
+
+const Rule = struct {
+    prec: Precedence,
+    tag: Node.Tag,
+    assoc: Assoc = .left,
+};
+
+const rules = std.enums.directEnumArrayDefault(Token.Tag, Rule, .{ .prec = .none, .tag = .root }, 0, .{
+    .keyword_or = .{ .prec = .bool_or, .tag = .bool_or },
+
+    .keyword_and = .{ .prec = .bool_and, .tag = .bool_and },
+
+    .equal_equal = .{ .prec = .equality, .tag = .equal_equal, .assoc = .none },
+    .bang_equal = .{ .prec = .equality, .tag = .bang_equal, .assoc = .none },
+
+    .l_angle_bracket = .{ .prec = .comparison, .tag = .less_than, .assoc = .none },
+    .r_angle_bracket = .{ .prec = .comparison, .tag = .greater_than, .assoc = .none },
+    .l_angle_bracket_equal = .{ .prec = .comparison, .tag = .less_or_equal, .assoc = .none },
+    .r_angle_bracket_equal = .{ .prec = .comparison, .tag = .greater_or_equal, .assoc = .none },
+
+    .ampersand = .{ .prec = .bitwise, .tag = .bit_and },
+    .caret = .{ .prec = .bitwise, .tag = .bit_xor },
+    .pipe = .{ .prec = .bitwise, .tag = .bit_or },
+
+    .l_angle_bracket_angle_bracket = .{ .prec = .shift, .tag = .shl },
+    .r_angle_bracket_angle_bracket = .{ .prec = .shift, .tag = .shr },
+
+    .plus = .{ .prec = .term, .tag = .add },
+    .minus = .{ .prec = .term, .tag = .sub },
+
+    .asterisk = .{ .prec = .factor, .tag = .mul },
+    .slash = .{ .prec = .factor, .tag = .div },
+    .percent = .{ .prec = .factor, .tag = .mod },
+});
+
+fn parseExprPrecedence(self: *Parser, min_prec: Precedence) Error!Node.Index {
+    assert(@intFromEnum(min_prec) >= 0);
+    var node = try self.parsePrefixExpr();
+    if (node == 0) {
+        return null_node;
     }
 
-    if (can_assign and (try self.match(.equal))) {
-        self.errorAtPrevious("Invalid assignment target", .{});
+    var banned_prec: Precedence = .none;
+
+    while (true) {
+        const tok_tag = self.token_tags[self.tok_i];
+        const info = rules[@intFromEnum(tok_tag)];
+        if (@intFromEnum(info.prec) < @intFromEnum(min_prec)) {
+            break;
+        }
+        if (@intFromEnum(info.prec) == @intFromEnum(banned_prec)) {
+            return self.fail(.chained_comparison_operators);
+        }
+
+        const oper_token = self.nextToken();
+        // Special-case handling for "catch"
+        // if (tok_tag == .keyword_catch) {
+        //     _ = try self.parsePayload();
+        // }
+        const rhs = try self.parseExprPrecedence(@enumFromInt(@intFromEnum(info.prec) + 1));
+        if (rhs == 0) {
+            try self.warn(.expected_expr);
+            return node;
+        }
+
+        // {
+        //     const tok_len = tok_tag.lexeme().?.len;
+        //     const char_before = self.source[self.token_starts[oper_token] - 1];
+        //     const char_after = self.source[self.token_starts[oper_token] + tok_len];
+        //     if (tok_tag == .ampersand and char_after == '&') {
+        //         // warn about '&&' being used instead of 'and'
+        //         try self.warnMsg(.{ .tag = .invalid_ampersand_ampersand, .token = oper_token });
+        //     } else if (std.ascii.isWhitespace(char_before) != std.ascii.isWhitespace(char_after)) {
+        //         try self.warnMsg(.{ .tag = .mismatched_binary_op_whitespace, .token = oper_token });
+        //     }
+        // }
+
+        node = try self.addNode(.{
+            .tag = info.tag,
+            .main_token = oper_token,
+            .data = .{
+                .lhs = node,
+                .rhs = rhs,
+            },
+        });
+
+        if (info.assoc == .none) {
+            banned_prec = info.prec;
+        }
     }
 
     return node;
 }
 
-fn expression(self: *Parser) !*Ast.Node {
-    // TODO: don't allow assignment everywhere
-    return self.parsePrecedence(.assignment);
-}
-
-fn expressionStatement(self: *Parser) !*Ast.Node {
-    const expr = try self.expression();
-    // try self.consume(.semicolon, "Expected ';' after expression");
-    return self.ast.appendNode(.{
-        .expr = .{
-            .expression = expr,
+/// PrefixExpr <- PrefixOp* PrimaryExpr
+///
+/// PrefixOp
+///     <- EXCLAMATIONMARK
+///      / MINUS
+///      / TILDE
+fn parsePrefixExpr(self: *Parser) Error!Node.Index {
+    const tag: Node.Tag = switch (self.token_tags[self.tok_i]) {
+        .bang => .bool_not,
+        .minus => .negation,
+        .tilde => .bit_not,
+        // .keyword_try => .@"try",
+        // .keyword_await => .@"await",
+        else => return self.parsePrimaryExpr(),
+    };
+    return self.addNode(.{
+        .tag = tag,
+        .main_token = self.nextToken(),
+        .data = .{
+            .lhs = try self.expectPrefixExpr(),
+            .rhs = undefined,
         },
     });
 }
 
-fn block(self: *Parser) !*Ast.Node {
-    var statements = std.ArrayList(*Ast.Node).init(self.allocator);
-    errdefer statements.deinit();
-    while (!self.check(.r_brace) and !self.check(.eof)) {
-        if (try self.declarationOrStatement()) |node| {
-            try statements.append(node);
-        }
-        // else {
-        //     self.errorAtCurrent("Expected statement", .{});
-        // }
+fn expectPrefixExpr(self: *Parser) Error!Node.Index {
+    const node = try self.parsePrefixExpr();
+    if (node == 0) {
+        return self.fail(.expected_prefix_expr);
     }
+    return node;
+}
 
-    try self.consume(.r_brace, "Expected '}' after block");
-
-    return try self.ast.appendNode(.{
-        .expr = .{
-            .block = .{ .statements = try statements.toOwnedSlice() },
+// TODO: not sure about this
+/// TypeExpr <- PrefixTypeOp* ErrorUnionExpr
+///
+/// PrefixTypeOp <- QUESTIONMARK / SliceTypeStart
+///
+/// SliceTypeStart <- LBRACKET RBRACKET
+fn parseTypeExpr(self: *Parser) Error!Node.Index {
+    switch (self.token_tags[self.tok_i]) {
+        .question_mark => return self.addNode(.{
+            .tag = .optional_type,
+            .main_token = self.nextToken(),
+            .data = .{
+                .lhs = try self.expectTypeExpr(),
+                .rhs = undefined,
+            },
+        }),
+        .l_bracket => {
+            const lbracket = self.nextToken();
+            _ = try self.expectToken(.r_bracket);
+            const elem_type = try self.expectTypeExpr();
+            return self.addNode(.{
+                .tag = .slice_type,
+                .main_token = lbracket,
+                .data = .{
+                    .lhs = elem_type,
+                    .rhs = undefined,
+                },
+            });
         },
-    });
-}
-
-fn consume(self: *Parser, tag: Token.Tag, message: []const u8) !void {
-    if (self.check(tag)) {
-        try self.advance();
-        return;
+        else => return self.parseErrorUnionExpr(),
     }
-    self.errorAtCurrent("{s}", .{message});
 }
 
-fn errorAtCurrent(self: *Parser, comptime fmt: []const u8, args: anytype) void {
-    self.errorAt(&self.current, fmt, args);
-}
-
-fn errorAtPrevious(self: *Parser, comptime fmt: []const u8, args: anytype) void {
-    self.errorAt(&self.previous, fmt, args);
-}
-
-fn errorAt(self: *Parser, token: *const Token, comptime fmt: []const u8, args: anytype) void {
-    if (self.panic_mode) {
-        return;
+fn expectTypeExpr(self: *Parser) Error!Node.Index {
+    const node = try self.parseTypeExpr();
+    if (node == 0) {
+        return self.fail(.expected_type_expr);
     }
-    self.panic_mode = true;
-    debug.print("{d}:{d}: Error", .{ token.line, token.col });
+    return node;
+}
 
-    // if (token.tag == .eof) {
-    //     debug.print(" at end");
-    // } else if (token.tag == .invalid) {
-    //     // Nothing.
-    // } else {
-    //     debug.print(" at '{}'", .{token.tag.lexeme() orelse ""});
+/// PrimaryExpr
+///     <- IfExpr
+///      / KEYWORD_break Expr?
+///      / KEYWORD_continue
+///      / KEYWORD_return Expr?
+///      / Block
+///      / CurlySuffixExpr
+fn parsePrimaryExpr(self: *Parser) Error!Node.Index {
+    switch (self.token_tags[self.tok_i]) {
+        .keyword_if => return self.parseIfExpr(),
+        .keyword_break => {
+            return self.addNode(.{
+                .tag = .@"break",
+                .main_token = self.nextToken(),
+                .data = .{
+                    .lhs = try self.parseExpr(),
+                    .rhs = undefined,
+                },
+            });
+        },
+        .keyword_continue => {
+            return self.addNode(.{
+                .tag = .@"continue",
+                .main_token = self.nextToken(),
+                .data = .{
+                    .lhs = undefined,
+                    .rhs = undefined,
+                },
+            });
+        },
+        .keyword_return => {
+            return self.addNode(.{
+                .tag = .@"return",
+                .main_token = self.nextToken(),
+                .data = .{
+                    .lhs = try self.parseExpr(),
+                    .rhs = undefined,
+                },
+            });
+        },
+        .l_brace => return self.parseBlock(),
+        else => return self.parseCurlySuffixExpr(),
+    }
+}
+
+/// IfExpr <- IfPrefix Expr (KEYWORD_else Payload? Expr)?
+fn parseIfExpr(self: *Parser) Error!Node.Index {
+    return self.parseIf(expectExpr);
+}
+
+// TODO: last value of the block is the return value
+//       -> would this be easier/better with block labels?
+/// Block <- LBRACE Statement* RBRACE
+fn parseBlock(self: *Parser) Error!Node.Index {
+    const lbrace = self.consume(.l_brace) orelse return null_node;
+    const scratch_top = self.scratch.items.len;
+    defer self.scratch.shrinkRetainingCapacity(scratch_top);
+    while (true) {
+        if (self.token_tags[self.tok_i] == .r_brace) break;
+        const statement = try self.expectStatementRecoverable();
+        if (statement == 0) break;
+        try self.scratch.append(self.allocator, statement);
+    }
+    _ = try self.expectToken(.r_brace);
+    const statements = self.scratch.items[scratch_top..];
+    switch (statements.len) {
+        0 => return self.addNode(.{
+            .tag = .block_two,
+            .main_token = lbrace,
+            .data = .{
+                .lhs = 0,
+                .rhs = 0,
+            },
+        }),
+        1 => return self.addNode(.{
+            .tag = .block_two,
+            .main_token = lbrace,
+            .data = .{
+                .lhs = statements[0],
+                .rhs = 0,
+            },
+        }),
+        2 => return self.addNode(.{
+            .tag = .block_two,
+            .main_token = lbrace,
+            .data = .{
+                .lhs = statements[0],
+                .rhs = statements[1],
+            },
+        }),
+        else => {
+            const span = try self.listToSpan(statements);
+            return self.addNode(.{
+                .tag = .block,
+                .main_token = lbrace,
+                .data = .{
+                    .lhs = span.start,
+                    .rhs = span.end,
+                },
+            });
+        },
+    }
+}
+
+// TODO
+/// CurlySuffixExpr <- TypeExpr InitList?
+///
+/// InitList
+///     <- LBRACE FieldInit (COMMA FieldInit)* COMMA? RBRACE
+///      / LBRACE Expr (COMMA Expr)* COMMA? RBRACE
+///      / LBRACE RBRACE
+fn parseCurlySuffixExpr(self: *Parser) Error!Node.Index {
+    const lhs = try self.parseTypeExpr();
+    return lhs;
+    // if (lhs == 0) return null_node;
+    // const lbrace = self.consume(.l_brace) orelse return lhs;
+
+    // If there are 0 or 1 items, we can use ArrayInitOne/StructInitOne;
+    // otherwise we use the full ArrayInit/StructInit.
+
+    // const scratch_top = self.scratch.items.len;
+    // defer self.scratch.shrinkRetainingCapacity(scratch_top);
+    // const field_init = try self.parseFieldInit();
+    // if (field_init != 0) {
+    //     try self.scratch.append(self.allocator, field_init);
+    //     while (true) {
+    //         switch (self.token_tags[self.tok_i]) {
+    //             .comma => self.tok_i += 1,
+    //             .r_brace => {
+    //                 self.tok_i += 1;
+    //                 break;
+    //             },
+    //             .colon, .r_paren, .r_bracket => return self.failExpected(.r_brace),
+    //             // Likely just a missing comma; give error but continue parsing.
+    //             else => try self.warn(.expected_comma_after_initializer),
+    //         }
+    //         if (self.consume(.r_brace)) |_| break;
+    //         const next = try self.expectFieldInit();
+    //         try self.scratch.append(self.allocator, next);
+    //     }
+    //     const comma = (self.token_tags[self.tok_i - 2] == .comma);
+    //     const inits = self.scratch.items[scratch_top..];
+    //     switch (inits.len) {
+    //         0 => unreachable,
+    //         1 => return self.addNode(.{
+    //             .tag = if (comma) .struct_init_one_comma else .struct_init_one,
+    //             .main_token = lbrace,
+    //             .data = .{
+    //                 .lhs = lhs,
+    //                 .rhs = inits[0],
+    //             },
+    //         }),
+    //         else => return self.addNode(.{
+    //             .tag = if (comma) .struct_init_comma else .struct_init,
+    //             .main_token = lbrace,
+    //             .data = .{
+    //                 .lhs = lhs,
+    //                 .rhs = try self.addExtra(try self.listToSpan(inits)),
+    //             },
+    //         }),
+    //     }
     // }
 
-    debug.print(": " ++ fmt ++ "\n", args);
-    self.had_error = true;
+    // while (true) {
+    //     if (self.consume(.r_brace)) |_| break;
+    //     const elem_init = try self.expectExpr();
+    //     try self.scratch.append(self.allocator, elem_init);
+    //     switch (self.token_tags[self.tok_i]) {
+    //         .comma => self.tok_i += 1,
+    //         .r_brace => {
+    //             self.tok_i += 1;
+    //             break;
+    //         },
+    //         .colon, .r_paren, .r_bracket => return self.failExpected(.r_brace),
+    //         // Likely just a missing comma; give error but continue parsing.
+    //         else => try self.warn(.expected_comma_after_initializer),
+    //     }
+    // }
+    // const comma = (self.token_tags[self.tok_i - 2] == .comma);
+    // const inits = self.scratch.items[scratch_top..];
+    // switch (inits.len) {
+    //     0 => return self.addNode(.{
+    //         .tag = .struct_init_one,
+    //         .main_token = lbrace,
+    //         .data = .{
+    //             .lhs = lhs,
+    //             .rhs = 0,
+    //         },
+    //     }),
+    //     1 => return self.addNode(.{
+    //         .tag = if (comma) .array_init_one_comma else .array_init_one,
+    //         .main_token = lbrace,
+    //         .data = .{
+    //             .lhs = lhs,
+    //             .rhs = inits[0],
+    //         },
+    //     }),
+    //     else => return self.addNode(.{
+    //         .tag = if (comma) .array_init_comma else .array_init,
+    //         .main_token = lbrace,
+    //         .data = .{
+    //             .lhs = lhs,
+    //             .rhs = try self.addExtra(try self.listToSpan(inits)),
+    //         },
+    //     }),
+    // }
 }
 
-fn synchronize(self: *Parser) !void {
-    self.panic_mode = false;
+// TODO: no error union (yet)
+/// ErrorUnionExpr <- SuffixExpr (EXCLAMATIONMARK TypeExpr)?
+fn parseErrorUnionExpr(self: *Parser) Error!Node.Index {
+    const suffix_expr = try self.parseSuffixExpr();
+    return suffix_expr;
+    // if (suffix_expr == 0) return null_node;
+    // const bang = self.consume(.bang) orelse return suffix_expr;
+    // return self.addNode(.{
+    //     .tag = .error_union,
+    //     .main_token = bang,
+    //     .data = .{
+    //         .lhs = suffix_expr,
+    //         .rhs = try self.expectTypeExpr(),
+    //     },
+    // });
+}
 
-    while (self.current.tag != .eof) {
-        // if (self.previous.tag == .semicolon) {
-        //     return;
-        // }
+// TODO: we don't care about commas
+/// SuffixExpr
+///     <- PrimaryTypeExpr (SuffixOp / FnCallArguments)*
+///
+/// FnCallArguments <- LPAREN ExprList RPAREN
+///
+/// ExprList <- (Expr COMMA)* Expr?
+fn parseSuffixExpr(self: *Parser) Error!Node.Index {
+    var res = try self.parsePrimaryTypeExpr();
+    if (res == 0) return res;
+    while (true) {
+        const suffix_op = try self.parseSuffixOp(res);
+        if (suffix_op != 0) {
+            res = suffix_op;
+            continue;
+        }
+        const lparen = self.consume(.l_paren) orelse return res;
+        const scratch_top = self.scratch.items.len;
+        defer self.scratch.shrinkRetainingCapacity(scratch_top);
+        while (true) {
+            if (self.consume(.r_paren)) |_| break;
+            const param = try self.expectExpr();
+            try self.scratch.append(self.allocator, param);
+            switch (self.token_tags[self.tok_i]) {
+                .comma => self.tok_i += 1,
+                .r_paren => {
+                    self.tok_i += 1;
+                    break;
+                },
+                .colon, .r_brace, .r_bracket => return self.failExpected(.r_paren),
+                // Likely just a missing comma; give error but continue parsing.
+                else => try self.warn(.expected_comma_after_arg),
+            }
+        }
+        const comma = (self.token_tags[self.tok_i - 2] == .comma);
+        const params = self.scratch.items[scratch_top..];
+        res = switch (params.len) {
+            0 => try self.addNode(.{
+                .tag = if (comma) .call_one_comma else .call_one,
+                .main_token = lparen,
+                .data = .{
+                    .lhs = res,
+                    .rhs = 0,
+                },
+            }),
+            1 => try self.addNode(.{
+                .tag = if (comma) .call_one_comma else .call_one,
+                .main_token = lparen,
+                .data = .{
+                    .lhs = res,
+                    .rhs = params[0],
+                },
+            }),
+            else => try self.addNode(.{
+                .tag = if (comma) .call_comma else .call,
+                .main_token = lparen,
+                .data = .{
+                    .lhs = res,
+                    .rhs = try self.addExtra(try self.listToSpan(params)),
+                },
+            }),
+        };
+    }
+}
 
-        switch (self.current.tag) {
-            .keyword_let,
-            .keyword_if,
-            .keyword_match,
-            .keyword_loop,
-            .keyword_while,
-            .keyword_for,
-            .keyword_break,
-            .keyword_continue,
-            .keyword_print,
-            .keyword_return,
-            => return,
+// TODO
+/// PrimaryTypeExpr
+///     <- BUILTINIDENTIFIER FnCallArguments
+///      / ContainerDecl
+///      / DOT IDENTIFIER
+///      / DOT InitList
+///      / ErrorSetDecl
+///      / FLOAT
+///      / FnProto
+///      / GroupedExpr
+///      / IDENTIFIER
+///      / IfTypeExpr
+///      / INTEGER
+///      / KEYWORD_error DOT IDENTIFIER
+///      / STRINGLITERAL
+///
+/// ContainerDecl <- (KEYWORD_extern / KEYWORD_packed)? ContainerDeclAuto
+///
+/// ContainerDeclAuto <- ContainerDeclType LBRACE container_doc_comment? ContainerMembers RBRACE
+///
+/// InitList
+///     <- LBRACE FieldInit (COMMA FieldInit)* COMMA? RBRACE
+///      / LBRACE Expr (COMMA Expr)* COMMA? RBRACE
+///      / LBRACE RBRACE
+///
+/// ErrorSetDecl <- KEYWORD_error LBRACE IdentifierList RBRACE
+///
+/// GroupedExpr <- LPAREN Expr RPAREN
+///
+/// IfTypeExpr <- IfPrefix TypeExpr (KEYWORD_else Payload? TypeExpr)?
+fn parsePrimaryTypeExpr(self: *Parser) Error!Node.Index {
+    switch (self.token_tags[self.tok_i]) {
+        .int_literal => return self.addNode(.{
+            .tag = .int_literal,
+            .main_token = self.nextToken(),
+            .data = .{
+                .lhs = undefined,
+                .rhs = undefined,
+            },
+        }),
+        .float_literal => return self.addNode(.{
+            .tag = .float_literal,
+            .main_token = self.nextToken(),
+            .data = .{
+                .lhs = undefined,
+                .rhs = undefined,
+            },
+        }),
+        .string_literal => {
+            return self.addNode(.{
+                .tag = .string_literal,
+                .main_token = self.nextToken(),
+                .data = .{
+                    .lhs = undefined,
+                    .rhs = undefined,
+                },
+            });
+        },
+        .identifier => { // TODO check if is fn
+            return self.addNode(.{
+                .tag = .identifier,
+                .main_token = self.nextToken(),
+                .data = .{
+                    .lhs = undefined,
+                    .rhs = undefined,
+                },
+            });
+        },
+        // .keyword_fn => return self.parseFnProto(),
+        .keyword_if => return self.parseIf(expectTypeExpr),
+        // .keyword_struct,
+        // .keyword_opaque,
+        // .keyword_enum,
+        // .keyword_union,
+        // => return self.parseContainerDeclAuto(),
+        .multiline_string_literal_line => {
+            const first_line = self.nextToken();
+            while (self.token_tags[self.tok_i] == .multiline_string_literal_line) {
+                self.tok_i += 1;
+            }
+            return self.addNode(.{
+                .tag = .multiline_string_literal,
+                .main_token = first_line,
+                .data = .{
+                    .lhs = first_line,
+                    .rhs = self.tok_i - 1,
+                },
+            });
+        },
+        // .period => switch (self.token_tags[self.tok_i + 1]) {
+        //     .identifier => return self.addNode(.{
+        //         .tag = .enum_literal,
+        //         .data = .{
+        //             .lhs = self.nextToken(), // dot
+        //             .rhs = undefined,
+        //         },
+        //         .main_token = self.nextToken(), // identifier
+        //     }),
+        //     .l_brace => {
+        //         const lbrace = self.tok_i + 1;
+        //         self.tok_i = lbrace + 1;
+
+        //         // If there are 0, 1, or 2 items, we can use ArrayInitDotTwo/StructInitDotTwo;
+        //         // otherwise we use the full ArrayInitDot/StructInitDot.
+
+        //         const scratch_top = self.scratch.items.len;
+        //         defer self.scratch.shrinkRetainingCapacity(scratch_top);
+        //         const field_init = try self.parseFieldInit();
+        //         if (field_init != 0) {
+        //             try self.scratch.append(self.allocator, field_init);
+        //             while (true) {
+        //                 switch (self.token_tags[self.tok_i]) {
+        //                     .comma => self.tok_i += 1,
+        //                     .r_brace => {
+        //                         self.tok_i += 1;
+        //                         break;
+        //                     },
+        //                     .colon, .r_paren, .r_bracket => return self.failExpected(.r_brace),
+        //                     // Likely just a missing comma; give error but continue parsing.
+        //                     else => try self.warn(.expected_comma_after_initializer),
+        //                 }
+        //                 if (self.consume(.r_brace)) |_| break;
+        //                 const next = try self.expectFieldInit();
+        //                 try self.scratch.append(self.allocator, next);
+        //             }
+        //             const comma = (self.token_tags[self.tok_i - 2] == .comma);
+        //             const inits = self.scratch.items[scratch_top..];
+        //             switch (inits.len) {
+        //                 0 => unreachable,
+        //                 1 => return self.addNode(.{
+        //                     .tag = if (comma) .struct_init_dot_two_comma else .struct_init_dot_two,
+        //                     .main_token = lbrace,
+        //                     .data = .{
+        //                         .lhs = inits[0],
+        //                         .rhs = 0,
+        //                     },
+        //                 }),
+        //                 2 => return self.addNode(.{
+        //                     .tag = if (comma) .struct_init_dot_two_comma else .struct_init_dot_two,
+        //                     .main_token = lbrace,
+        //                     .data = .{
+        //                         .lhs = inits[0],
+        //                         .rhs = inits[1],
+        //                     },
+        //                 }),
+        //                 else => {
+        //                     const span = try self.listToSpan(inits);
+        //                     return self.addNode(.{
+        //                         .tag = if (comma) .struct_init_dot_comma else .struct_init_dot,
+        //                         .main_token = lbrace,
+        //                         .data = .{
+        //                             .lhs = span.start,
+        //                             .rhs = span.end,
+        //                         },
+        //                     });
+        //                 },
+        //             }
+        //         }
+
+        //         while (true) {
+        //             if (self.consume(.r_brace)) |_| break;
+        //             const elem_init = try self.expectExpr();
+        //             try self.scratch.append(self.allocator, elem_init);
+        //             switch (self.token_tags[self.tok_i]) {
+        //                 .comma => self.tok_i += 1,
+        //                 .r_brace => {
+        //                     self.tok_i += 1;
+        //                     break;
+        //                 },
+        //                 .colon, .r_paren, .r_bracket => return self.failExpected(.r_brace),
+        //                 // Likely just a missing comma; give error but continue parsing.
+        //                 else => try self.warn(.expected_comma_after_initializer),
+        //             }
+        //         }
+        //         const comma = (self.token_tags[self.tok_i - 2] == .comma);
+        //         const inits = self.scratch.items[scratch_top..];
+        //         switch (inits.len) {
+        //             0 => return self.addNode(.{
+        //                 .tag = .struct_init_dot_two,
+        //                 .main_token = lbrace,
+        //                 .data = .{
+        //                     .lhs = 0,
+        //                     .rhs = 0,
+        //                 },
+        //             }),
+        //             1 => return self.addNode(.{
+        //                 .tag = if (comma) .array_init_dot_two_comma else .array_init_dot_two,
+        //                 .main_token = lbrace,
+        //                 .data = .{
+        //                     .lhs = inits[0],
+        //                     .rhs = 0,
+        //                 },
+        //             }),
+        //             2 => return self.addNode(.{
+        //                 .tag = if (comma) .array_init_dot_two_comma else .array_init_dot_two,
+        //                 .main_token = lbrace,
+        //                 .data = .{
+        //                     .lhs = inits[0],
+        //                     .rhs = inits[1],
+        //                 },
+        //             }),
+        //             else => {
+        //                 const span = try self.listToSpan(inits);
+        //                 return self.addNode(.{
+        //                     .tag = if (comma) .array_init_dot_comma else .array_init_dot,
+        //                     .main_token = lbrace,
+        //                     .data = .{
+        //                         .lhs = span.start,
+        //                         .rhs = span.end,
+        //                     },
+        //                 });
+        //             },
+        //         }
+        //     },
+        //     else => return null_node,
+        // },
+        // .keyword_error => switch (self.token_tags[self.tok_i + 1]) {
+        //     .l_brace => {
+        //         const error_token = self.tok_i;
+        //         self.tok_i += 2;
+        //         while (true) {
+        //             if (self.consume(.r_brace)) |_| break;
+        //             _ = try self.eatDocComments();
+        //             _ = try self.expectToken(.identifier);
+        //             switch (self.token_tags[self.tok_i]) {
+        //                 .comma => self.tok_i += 1,
+        //                 .r_brace => {
+        //                     self.tok_i += 1;
+        //                     break;
+        //                 },
+        //                 .colon, .r_paren, .r_bracket => return self.failExpected(.r_brace),
+        //                 // Likely just a missing comma; give error but continue parsing.
+        //                 else => try self.warn(.expected_comma_after_field),
+        //             }
+        //         }
+        //         return self.addNode(.{
+        //             .tag = .error_set_decl,
+        //             .main_token = error_token,
+        //             .data = .{
+        //                 .lhs = undefined,
+        //                 .rhs = self.tok_i - 1, // rbrace
+        //             },
+        //         });
+        //     },
+        //     else => {
+        //         const main_token = self.nextToken();
+        //         const period = self.consume(.period);
+        //         if (period == null) try self.warnExpected(.period);
+        //         const identifier = self.consume(.identifier);
+        //         if (identifier == null) try self.warnExpected(.identifier);
+        //         return self.addNode(.{
+        //             .tag = .error_value,
+        //             .main_token = main_token,
+        //             .data = .{
+        //                 .lhs = period orelse 0,
+        //                 .rhs = identifier orelse 0,
+        //             },
+        //         });
+        //     },
+        // },
+        .l_paren => return self.addNode(.{
+            .tag = .grouped_expression,
+            .main_token = self.nextToken(),
+            .data = .{
+                .lhs = try self.expectExpr(),
+                .rhs = try self.expectToken(.r_paren),
+            },
+        }),
+        else => return null_node,
+    }
+}
+
+// TODO: parseFieldInit (not yet)
+// TODO: expectFieldInit (not yet)
+
+// TODO: we don't care about commas
+/// MatchExpr <- KEYWORD_match LPAREN Expr RPAREN LBRACE MatchProngList RBRACE
+fn expectMatchExpr(self: *Parser) !Node.Index {
+    const match_token = self.assertToken(.keyword_match);
+    _ = try self.expectToken(.l_paren);
+    const expr_node = try self.expectExpr();
+    _ = try self.expectToken(.r_paren);
+    _ = try self.expectToken(.l_brace);
+    const cases = try self.parseMatchProngList();
+    const trailing_comma = self.token_tags[self.tok_i - 1] == .comma;
+    _ = try self.expectToken(.r_brace);
+
+    return self.addNode(.{
+        .tag = if (trailing_comma) .match_comma else .match,
+        .main_token = match_token,
+        .data = .{
+            .lhs = expr_node,
+            .rhs = try self.addExtra(Node.SubRange{
+                .start = cases.start,
+                .end = cases.end,
+            }),
+        },
+    });
+}
+
+/// MatchProng <- MatchCase EQUALRARROW AssignExpr
+///
+/// MatchCase <- MatchItem (COMMA MatchItem)* COMMA? / UNDERSCORE
+fn parseMatchProng(self: *Parser) Error!Node.Index {
+    const scratch_top = self.scratch.items.len;
+    defer self.scratch.shrinkRetainingCapacity(scratch_top);
+
+    if (self.consume(.underscore) == null) {
+        while (true) {
+            const item = try self.parseMatchItem();
+            if (item == 0) break;
+            try self.scratch.append(self.allocator, item);
+            if (self.consume(.comma) == null) break;
+        }
+        if (scratch_top == self.scratch.items.len) {
+            return null_node;
+        }
+    }
+    const arrow_token = try self.expectToken(.equal_r_angle_bracket);
+
+    const items = self.scratch.items[scratch_top..];
+    switch (items.len) {
+        0 => return self.addNode(.{
+            .tag = .match_case_one,
+            .main_token = arrow_token,
+            .data = .{
+                .lhs = 0,
+                .rhs = try self.expectSingleAssignExpr(),
+            },
+        }),
+        1 => return self.addNode(.{
+            .tag = .match_case_one,
+            .main_token = arrow_token,
+            .data = .{
+                .lhs = items[0],
+                .rhs = try self.expectSingleAssignExpr(),
+            },
+        }),
+        else => return self.addNode(.{
+            .tag = .match_case,
+            .main_token = arrow_token,
+            .data = .{
+                .lhs = try self.addExtra(try self.listToSpan(items)),
+                .rhs = try self.expectSingleAssignExpr(),
+            },
+        }),
+    }
+}
+
+/// MatchProngList <- (MatchProng COMMA)* MatchProng?
+fn parseMatchProngList(self: *Parser) Error!Node.SubRange {
+    const scratch_top = self.scratch.items.len;
+    defer self.scratch.shrinkRetainingCapacity(scratch_top);
+
+    while (true) {
+        const item = try parseMatchProng(self);
+        if (item == 0) break;
+
+        try self.scratch.append(self.allocator, item);
+
+        switch (self.token_tags[self.tok_i]) {
+            .comma => self.tok_i += 1,
+            // All possible delimiters.
+            .colon, .r_paren, .r_brace, .r_bracket => break,
+            // Likely just a missing comma; give error but continue parsing.
+            else => try self.warn(.expected_comma_after_match_prong),
+        }
+    }
+    return self.listToSpan(self.scratch.items[scratch_top..]);
+}
+
+/// MatchItem <- Expr (DOT2 Expr)?
+fn parseMatchItem(self: *Parser) Error!Node.Index {
+    const expr = try self.parseExpr();
+    if (expr == 0) return null_node;
+
+    if (self.consume(.ellipsis2)) |token| {
+        return self.addNode(.{
+            .tag = .match_range,
+            .main_token = token,
+            .data = .{
+                .lhs = expr,
+                .rhs = try self.expectExpr(),
+            },
+        });
+    }
+    return expr;
+}
+
+// TODO
+/// SuffixOp
+///     <- LBRACKET Expr (DOT2 (Expr? (COLON Expr)?)?)? RBRACKET
+///      / DOT IDENTIFIER
+///      / DOTASTERISK
+///      / DOTQUESTIONMARK
+fn parseSuffixOp(self: *Parser, lhs: Node.Index) Error!Node.Index {
+    _ = self;
+    _ = lhs;
+    return null_node;
+    // switch (self.token_tags[self.tok_i]) {
+    //     .l_bracket => {
+    //         const lbracket = self.nextToken();
+    //         const index_expr = try self.expectExpr();
+
+    //         if (self.consume(.ellipsis2)) |_| {
+    //             const end_expr = try self.parseExpr();
+    //             if (self.consume(.colon)) |_| {
+    //                 const sentinel = try self.expectExpr();
+    //                 _ = try self.expectToken(.r_bracket);
+    //                 return self.addNode(.{
+    //                     .tag = .slice_sentinel,
+    //                     .main_token = lbracket,
+    //                     .data = .{
+    //                         .lhs = lhs,
+    //                         .rhs = try self.addExtra(Node.SliceSentinel{
+    //                             .start = index_expr,
+    //                             .end = end_expr,
+    //                             .sentinel = sentinel,
+    //                         }),
+    //                     },
+    //                 });
+    //             }
+    //             _ = try self.expectToken(.r_bracket);
+    //             if (end_expr == 0) {
+    //                 return self.addNode(.{
+    //                     .tag = .slice_open,
+    //                     .main_token = lbracket,
+    //                     .data = .{
+    //                         .lhs = lhs,
+    //                         .rhs = index_expr,
+    //                     },
+    //                 });
+    //             }
+    //             return self.addNode(.{
+    //                 .tag = .slice,
+    //                 .main_token = lbracket,
+    //                 .data = .{
+    //                     .lhs = lhs,
+    //                     .rhs = try self.addExtra(Node.Slice{
+    //                         .start = index_expr,
+    //                         .end = end_expr,
+    //                     }),
+    //                 },
+    //             });
+    //         }
+    //         _ = try self.expectToken(.r_bracket);
+    //         return self.addNode(.{
+    //             .tag = .array_access,
+    //             .main_token = lbracket,
+    //             .data = .{
+    //                 .lhs = lhs,
+    //                 .rhs = index_expr,
+    //             },
+    //         });
+    //     },
+    //     .period_asterisk => return self.addNode(.{
+    //         .tag = .deref,
+    //         .main_token = self.nextToken(),
+    //         .data = .{
+    //             .lhs = lhs,
+    //             .rhs = undefined,
+    //         },
+    //     }),
+    //     .invalid_periodasterisks => {
+    //         try self.warn(.asterisk_after_ptr_deref);
+    //         return self.addNode(.{
+    //             .tag = .deref,
+    //             .main_token = self.nextToken(),
+    //             .data = .{
+    //                 .lhs = lhs,
+    //                 .rhs = undefined,
+    //             },
+    //         });
+    //     },
+    //     .period => switch (self.token_tags[self.tok_i + 1]) {
+    //         .identifier => return self.addNode(.{
+    //             .tag = .field_access,
+    //             .main_token = self.nextToken(),
+    //             .data = .{
+    //                 .lhs = lhs,
+    //                 .rhs = self.nextToken(),
+    //             },
+    //         }),
+    //         .question_mark => return self.addNode(.{
+    //             .tag = .unwrap_optional,
+    //             .main_token = self.nextToken(),
+    //             .data = .{
+    //                 .lhs = lhs,
+    //                 .rhs = self.nextToken(),
+    //             },
+    //         }),
+    //         .l_brace => {
+    //             // this a misplaced `.{`, handle the error somewhere else
+    //             return null_node;
+    //         },
+    //         else => {
+    //             self.tok_i += 1;
+    //             try self.warn(.expected_suffix_op);
+    //             return null_node;
+    //         },
+    //     },
+    //     else => return null_node,
+    // }
+}
+
+// TODO: parseContainerDeclAuto (not yet)
+
+const SmallSpan = union(enum) {
+    zero_or_one: Node.Index,
+    multi: Node.SubRange,
+};
+
+/// ParamDeclList <- (ParamDecl COMMA)* ParamDecl?
+fn parseParamDeclList(self: *Parser) !SmallSpan {
+    _ = try self.expectToken(.l_paren);
+    const scratch_top = self.scratch.items.len;
+    defer self.scratch.shrinkRetainingCapacity(scratch_top);
+    var varargs: union(enum) { none, seen, nonfinal: TokenIndex } = .none;
+    while (true) {
+        if (self.consume(.r_paren)) |_| break;
+        if (varargs == .seen) varargs = .{ .nonfinal = self.tok_i };
+        const param = try self.expectTypeExpr();
+        if (param != 0) {
+            try self.scratch.append(self.gpa, param);
+        } else if (self.token_tags[self.tok_i - 1] == .ellipsis3) {
+            if (varargs == .none) varargs = .seen;
+        }
+        switch (self.token_tags[self.tok_i]) {
+            .comma => self.tok_i += 1,
+            .r_paren => {
+                self.tok_i += 1;
+                break;
+            },
+            .colon, .r_brace, .r_bracket => return self.failExpected(.r_paren),
+            // Likely just a missing comma; give error but continue parsing.
+            else => try self.warn(.expected_comma_after_param),
+        }
+    }
+    if (varargs == .nonfinal) {
+        try self.warnMsg(.{ .tag = .varargs_nonfinal, .token = varargs.nonfinal });
+    }
+    const params = self.scratch.items[scratch_top..];
+    return switch (params.len) {
+        0 => SmallSpan{ .zero_or_one = 0 },
+        1 => SmallSpan{ .zero_or_one = params[0] },
+        else => SmallSpan{ .multi = try self.listToSpan(params) },
+    };
+}
+
+// TODO: parseBuiltinCall (not yet)
+
+/// IfPrefix <- KEYWORD_if LPAREN Expr RPAREN
+fn parseIf(self: *Parser, comptime bodyParseFn: fn (*Parser) Error!Node.Index) Error!Node.Index {
+    const if_token = self.consume(.keyword_if) orelse return null_node;
+    _ = try self.expectToken(.l_paren);
+    const condition = try self.expectExpr();
+    _ = try self.expectToken(.r_paren);
+
+    const then_expr = try bodyParseFn(self);
+    assert(then_expr != 0);
+
+    _ = self.consume(.keyword_else) orelse return self.addNode(.{
+        .tag = .@"if",
+        .main_token = if_token,
+        .data = .{
+            .lhs = condition,
+            .rhs = then_expr,
+        },
+    });
+    const else_expr = try bodyParseFn(self);
+    assert(else_expr != 0);
+
+    return self.addNode(.{
+        .tag = .if_else,
+        .main_token = if_token,
+        .data = .{
+            .lhs = condition,
+            .rhs = try self.addExtra(Node.If{
+                .then_expr = then_expr,
+                .else_expr = else_expr,
+            }),
+        },
+    });
+}
+
+fn nextToken(self: *Parser) TokenIndex {
+    const result = self.tok_i;
+    self.tok_i += 1;
+    return result;
+}
+
+fn expectToken(self: *Parser, tag: Token.Tag) Error!TokenIndex {
+    if (self.token_tags[self.tok_i] != tag) {
+        return self.failExpected(tag);
+    }
+    return self.nextToken();
+}
+
+fn expectNewline(self: *Parser, error_tag: Ast.Error.Tag, recoverable: bool) Error!void {
+    if (self.token_tags[self.tok_i] == .newline) {
+        _ = self.nextToken();
+        return;
+    }
+    try self.warn(error_tag);
+    if (!recoverable) {
+        return error.ParseError;
+    }
+}
+
+fn consume(self: *Parser, tag: Token.Tag) ?TokenIndex {
+    return if (self.token_tags[self.tok_i] == tag) self.nextToken() else null;
+}
+
+fn assertToken(self: *Parser, tag: Token.Tag) TokenIndex {
+    const token = self.nextToken();
+    assert(self.token_tags[token] == tag);
+    return token;
+}
+
+fn synchronize(self: *Parser) void {
+    var level: u32 = 0;
+    while (true) {
+        const tok = self.nextToken();
+        switch (self.token_tags[tok]) {
+            .keyword_let => {
+                if (level == 0) {
+                    self.tok_i -= 1;
+                    return;
+                }
+            },
+            .identifier => {
+                if (self.token_tags[tok + 1] == .comma and level == 0) {
+                    self.tok_i -= 1;
+                    return;
+                }
+            },
+            //.comma,
+            .newline => {
+                if (level == 0) {
+                    return;
+                }
+            },
+            .l_paren, .l_bracket, .l_brace => level += 1,
+            .r_paren, .r_bracket => {
+                if (level != 0) level -= 1;
+            },
+            .r_brace => {
+                if (level == 0) {
+                    self.tok_i -= 1;
+                    return;
+                }
+                level -= 1;
+            },
+            .eof => {
+                self.tok_i -= 1;
+                return;
+            },
             else => {},
         }
-
-        try self.advance();
     }
 }
 
-fn grouping(self: *Parser, _: bool) !*Ast.Node {
-    const expr = try self.expression();
-    try self.consume(.r_paren, "Expected ')' after expression");
-    return self.ast.appendNode(.{
-        .expr = .{
-            .grouping = .{ .expression = expr },
-        },
-    });
-}
-
-fn unary(self: *Parser, _: bool) !*Ast.Node {
-    const operator = self.previous.tag;
-    const left = try self.parsePrecedence(.unary);
-
-    return self.ast.appendNode(.{
-        .expr = .{
-            .unary = .{
-                .operator = operator,
-                .right = left,
-            },
-        },
-    });
-}
-
-fn binary(self: *Parser, _: bool, left: *Ast.Node) !*Ast.Node {
-    const operator = self.previous.tag;
-    const rule = getRule(operator);
-
-    const right = try self.parsePrecedence(@enumFromInt(@intFromEnum(rule.precedence) + 1));
-    return self.ast.appendNode(.{
-        .expr = .{
-            .binary = .{
-                .left = left,
-                .operator = operator,
-                .right = right,
-            },
-        },
-    });
-}
-
-fn variable(self: *Parser, can_assign: bool) !*Ast.Node {
-    return self.namedVariable(self.previous, can_assign);
-}
-
-fn namedVariable(self: *Parser, name: Token, can_assign: bool) !*Ast.Node {
-    _ = self;
-    _ = name;
-    _ = can_assign;
-    return error.Unimplemented;
-}
-
-fn literal(self: *Parser, _: bool) !*Ast.Node {
-    var node: Ast.Node = undefined;
-    switch (self.previous.tag) {
-        .number => node.expr = .{
-            .number = .{ .value = self.previous.literal.?.number },
-        },
-        else => unreachable,
-    }
-
-    return self.ast.appendNode(node);
-}
+// TODO: add a bunch of tests
+// see https://github.com/ziglang/zig/blob/master/lib/std/zig/parser_test.zig
