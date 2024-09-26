@@ -25,6 +25,7 @@ scratch: std.ArrayListUnmanaged(Node.Index),
 
 pub const Error = error{ParseError} || std.mem.Allocator.Error;
 
+// TODO: should treat global scope as a function
 pub fn parse(self: *Parser) Error!void {
     try self.nodes.append(self.allocator, .{
         .tag = .root,

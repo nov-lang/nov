@@ -59,3 +59,5 @@ render parser error with caret under the error + full line info
 `print i` throw a expected new line after statement which is not a very good error message
 
 giving "}}" to Parser result in an infinite loop
+
+add Timer for parsing_time, codegen_time, runnning_time
