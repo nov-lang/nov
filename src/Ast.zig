@@ -31,7 +31,7 @@ pub const Location = struct {
     line_end: usize,
 };
 
-pub fn parse(allocator: std.mem.Allocator, source: [:0]const u8) !Ast {
+pub fn parse(allocator: std.mem.Allocator, source: [:0]const u8) Parser.Error!Ast {
     var tokens: TokenList = .{};
     defer tokens.deinit(allocator);
 

@@ -53,28 +53,28 @@ const Members = struct {
             const nodes = [2]Node.Index{ self.lhs, self.rhs };
             return p.listToSpan(nodes[0..self.len]);
         } else {
-            return Node.SubRange{ .start = self.lhs, .end = self.rhs };
+            return .{ .start = self.lhs, .end = self.rhs };
         }
     }
 };
 
 fn listToSpan(self: *Parser, list: []const Node.Index) Error!Node.SubRange {
     try self.extra_data.appendSlice(self.allocator, list);
-    return Node.SubRange{
-        .start = @as(Node.Index, @intCast(self.extra_data.items.len - list.len)),
-        .end = @as(Node.Index, @intCast(self.extra_data.items.len)),
+    return .{
+        .start = @intCast(self.extra_data.items.len - list.len),
+        .end = @intCast(self.extra_data.items.len),
     };
 }
 
-fn addNode(self: *Parser, elem: Ast.Node) Error!Node.Index {
-    const result = @as(Node.Index, @intCast(self.nodes.len));
-    try self.nodes.append(self.allocator, elem);
+fn addNode(self: *Parser, node: Ast.Node) Error!Node.Index {
+    const result: Node.Index = @intCast(self.nodes.len);
+    try self.nodes.append(self.allocator, node);
     return result;
 }
 
-fn setNode(self: *Parser, i: usize, elem: Ast.Node) Node.Index {
-    self.nodes.set(i, elem);
-    return @as(Node.Index, @intCast(i));
+fn setNode(self: *Parser, i: usize, node: Ast.Node) Node.Index {
+    self.nodes.set(i, node);
+    return @intCast(i);
 }
 
 fn reserveNode(self: *Parser, tag: Ast.Node.Tag) Error!usize {
@@ -96,7 +96,7 @@ fn unreserveNode(self: *Parser, node_index: usize) void {
 fn addExtra(self: *Parser, extra: anytype) Error!Node.Index {
     const fields = std.meta.fields(@TypeOf(extra));
     try self.extra_data.ensureUnusedCapacity(self.allocator, fields.len);
-    const result = @as(u32, @intCast(self.extra_data.items.len));
+    const result: Node.Index = @intCast(self.extra_data.items.len);
     inline for (fields) |field| {
         comptime assert(field.type == Node.Index);
         self.extra_data.appendAssumeCapacity(@field(extra, field.name));

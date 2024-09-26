@@ -8,16 +8,16 @@ const Codegen = @This();
 
 ast: *const Ast,
 allocator: std.mem.Allocator,
-arena: *std.heap.ArenaAllocator.State,
+arena: std.mem.Allocator,
 
 pub fn generate(allocator: std.mem.Allocator, ast: Ast) !void {
-    var arena: std.heap.ArenaAllocator.State = .{};
-    defer arena.promote(allocator).deinit();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
 
     var codegen: Codegen = .{
         .allocator = allocator,
-        .arena = arena,
-        .ast = ast,
+        .arena = arena.allocator(),
+        .ast = &ast,
     };
 
     try codegen.generateNode(0);
