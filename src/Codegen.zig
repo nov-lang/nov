@@ -56,24 +56,24 @@ fn generateNode(self: *Codegen, node: Node.Index) Error!?*Function {
     return null;
 }
 
-fn emit(self: *Codegen, code: u32) Error!void {
-    return self.chunk.write(code, self.previous.line);
+fn emit(self: *Codegen, code: u32, loc: Ast.TokenIndex) Error!void {
+    return self.current.function.chunk.write(code, loc);
 }
 
-fn emitOpCode(self: *Codegen, code: Chunk.OpCode) Error!void {
-    return self.emit(@intFromEnum(code));
+fn emitOpCode(self: *Codegen, code: Chunk.OpCode, loc: Ast.TokenIndex) Error!void {
+    return self.emit(@intFromEnum(code), loc);
 }
 
-fn emitCodeArg(self: *Codegen, code: Chunk.OpCode, arg: u24) Error!void {
-    return self.emit(@as(u32, @intFromEnum(code)) | (@as(u32, @intCast(arg)) << 8));
+fn emitCodeArg(self: *Codegen, code: Chunk.OpCode, arg: u24, loc: Ast.TokenIndex) Error!void {
+    return self.emit(@as(u32, @intFromEnum(code)) | (@as(u32, @intCast(arg)) << 8), loc);
 }
 
 fn makeConstant(self: *Codegen, value: Value) Error!u24 {
-    return self.chunk.addConstant(value);
+    return self.current.function.chunk.addConstant(value);
 }
 
-fn emitConstant(self: *Codegen, value: Value) Error!void {
-    return self.emitCodeArg(.constant, self.makeConstant(value));
+fn emitConstant(self: *Codegen, value: Value, loc: Ast.TokenIndex) Error!void {
+    return self.emitCodeArg(.constant, try self.makeConstant(value), loc);
 }
 
 // fn generateNegation(self: *Codegen, node: Node.Index) !void {
@@ -83,7 +83,9 @@ fn emitConstant(self: *Codegen, value: Value) Error!void {
 // }
 
 fn generateInt(self: *Codegen, node: Node.Index) Error!void {
-    const literal = self.ast.nodes.items(.main_token)[node];
+    const tok_i = self.ast.nodes.items(.main_token)[node];
+    const literal = self.ast.source[self.ast.tokens.items(.start)[tok_i]..self.ast.tokens.items(.end)[tok_i]];
+    std.log.debug("generateInt: '{s}'", .{literal});
     const value = Value.create(try std.fmt.parseInt(i64, literal, 0));
-    try self.emitConstant(value);
+    try self.emitConstant(value, tok_i);
 }

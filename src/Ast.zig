@@ -16,12 +16,7 @@ extra_data: []Node.Index,
 errors: []const Error,
 
 pub const TokenIndex = u32;
-pub const ByteOffset = u32;
-
-pub const TokenList = std.MultiArrayList(struct {
-    tag: Token.Tag,
-    start: ByteOffset,
-});
+pub const TokenList = std.MultiArrayList(Token);
 pub const NodeList = std.MultiArrayList(Node);
 
 pub const Location = struct {
@@ -42,10 +37,7 @@ pub fn parse(allocator: std.mem.Allocator, source: [:0]const u8) Parser.Error!As
     var tokenizer = Tokenizer.init(source);
     while (true) {
         const token = tokenizer.next();
-        try tokens.append(allocator, .{
-            .tag = token.tag,
-            .start = @intCast(token.loc.start),
-        });
+        try tokens.append(allocator, token);
         if (token.tag == .eof) {
             break;
         }

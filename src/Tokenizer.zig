@@ -6,16 +6,12 @@ const std = @import("std");
 const Tokenizer = @This();
 
 buffer: [:0]const u8,
-index: usize,
+index: u32,
 
 pub const Token = struct {
     tag: Tag,
-    loc: Loc,
-
-    pub const Loc = struct {
-        start: usize,
-        end: usize,
-    };
+    start: u32,
+    end: u32,
 
     pub const Tag = enum {
         newline,
@@ -79,7 +75,7 @@ pub const Token = struct {
         keyword_break,
         keyword_continue,
         keyword_in,
-        keyword_fn,
+        keyword_fn, // TODO: replace with let keyword (only accept lambda kind)
         identifier,
         string_literal,
         multiline_string_literal_line,
@@ -200,7 +196,7 @@ pub const Token = struct {
 
 pub fn init(buffer: [:0]const u8) Tokenizer {
     // Skip the UTF-8 BOM if present
-    const src_start: usize = if (std.mem.startsWith(u8, buffer, "\xEF\xBB\xBF")) 3 else 0;
+    const src_start: u32 = if (std.mem.startsWith(u8, buffer, "\xEF\xBB\xBF")) 3 else 0;
     return .{
         .buffer = buffer,
         .index = src_start,
@@ -245,10 +241,8 @@ pub fn next(self: *Tokenizer) Token {
     var state: State = .start;
     var result: Token = .{
         .tag = .eof,
-        .loc = .{
-            .start = self.index,
-            .end = undefined,
-        },
+        .start = self.index,
+        .end = undefined,
     };
     while (true) : (self.index += 1) {
         const c = self.buffer[self.index];
@@ -257,15 +251,15 @@ pub fn next(self: *Tokenizer) Token {
                 0 => {
                     if (self.index != self.buffer.len) {
                         result.tag = .invalid;
-                        result.loc.start = self.index;
+                        result.start = self.index;
                         self.index += 1;
-                        result.loc.end = self.index;
+                        result.end = self.index;
                         return result;
                     }
                     break;
                 },
                 ' ', '\r', '\t' => {
-                    result.loc.start = self.index + 1;
+                    result.start = self.index + 1;
                 },
                 '"' => {
                     state = .string_literal;
@@ -479,7 +473,7 @@ pub fn next(self: *Tokenizer) Token {
             .identifier => switch (c) {
                 'A'...'Z', 'a'...'z', '0'...'9', '_' => {},
                 else => {
-                    if (Token.getKeyword(self.buffer[result.loc.start..self.index])) |tag| {
+                    if (Token.getKeyword(self.buffer[result.start..self.index])) |tag| {
                         result.tag = tag;
                     }
                     break;
@@ -694,7 +688,7 @@ pub fn next(self: *Tokenizer) Token {
                 },
                 '\n' => {
                     result.tag = .newline;
-                    result.loc.start = self.index;
+                    result.start = self.index;
                     self.index += 1;
                     break;
                 },
@@ -758,10 +752,10 @@ pub fn next(self: *Tokenizer) Token {
     }
 
     if (result.tag == .eof) {
-        result.loc.start = self.index;
+        result.start = self.index;
     }
 
-    result.loc.end = self.index;
+    result.end = self.index;
     return result;
 }
 
@@ -1279,6 +1273,6 @@ fn testTokenize(source: [:0]const u8, expected_token_tags: []const Token.Tag) !v
     }
     const last_token = tokenizer.next();
     try std.testing.expectEqual(Token.Tag.eof, last_token.tag);
-    try std.testing.expectEqual(source.len, last_token.loc.start);
-    try std.testing.expectEqual(source.len, last_token.loc.end);
+    try std.testing.expectEqual(source.len, last_token.start);
+    try std.testing.expectEqual(source.len, last_token.end);
 }

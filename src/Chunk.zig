@@ -1,10 +1,11 @@
 const std = @import("std");
 const Value = @import("value.zig").Value;
+const Ast = @import("Ast.zig");
 
 const Chunk = @This();
 
 code: std.ArrayListUnmanaged(u32),
-lines: std.ArrayListUnmanaged(usize), // use RLE to save memory
+locations: std.ArrayListUnmanaged(Ast.TokenIndex), // use RLE to save memory
 constants: std.ArrayListUnmanaged(Value),
 allocator: std.mem.Allocator,
 
@@ -38,21 +39,21 @@ pub const OpCode = enum(u8) {
 pub fn init(allocator: std.mem.Allocator) Chunk {
     return .{
         .code = .{},
-        .lines = .{},
+        .locations = .{},
         .constants = .{},
         .allocator = allocator,
     };
 }
 
 pub fn deinit(self: *Chunk) void {
-    self.code.clearAndFree(self.allocator);
-    self.lines.clearAndFree(self.allocator);
-    self.constants.clearAndFree(self.allocator);
+    self.code.deinit(self.allocator);
+    self.locations.deinit(self.allocator);
+    self.constants.deinit(self.allocator);
 }
 
-pub fn write(self: *Chunk, code: u32, line: usize) !void {
+pub fn write(self: *Chunk, code: u32, loc: Ast.TokenIndex) !void {
     try self.code.append(self.allocator, code);
-    try self.lines.append(self.allocator, line);
+    try self.locations.append(self.allocator, loc);
 }
 
 pub fn addConstant(self: *Chunk, value: Value) !u24 {

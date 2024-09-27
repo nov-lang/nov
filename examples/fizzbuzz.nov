@@ -1,0 +1,23 @@
+import "std"
+
+let fizzBuzz = (n: int) -> {
+    let fizz = n % 3 == 0
+    let buzz = n % 5 == 0
+
+    match (fizz, buzz) {
+        true, true => "FizzBuzz"
+        true, _ => "Fizz"
+        _, true => "Buzz"
+        _, _ => "{n}" ; idk about that
+    }
+} -> string
+
+; TODO: show other kind of loops
+let mut i = 0
+loop {
+    i |> fizzBuzz |> println
+    i += 1
+    if i == 10 {
+        break
+    }
+}
