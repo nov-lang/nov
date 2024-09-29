@@ -1,5 +1,5 @@
-// Based on https://github.com/ziglang/zig/blob/master/lib/std/zig/tokenizer.zig
-// See https://github.com/ziglang/zig/blob/master/LICENSE for LICENSE details
+// Originally based on https://github.com/ziglang/zig/blob/master/lib/std/zig/tokenizer.zig
+// See https://github.com/ziglang/zig/blob/master/LICENSE for additional LICENSE details
 
 const std = @import("std");
 
@@ -75,7 +75,15 @@ pub const Token = struct {
         keyword_break,
         keyword_continue,
         keyword_in,
-        keyword_fn, // TODO: replace with let keyword (only accept lambda kind)
+        keyword_priv,
+        // unused reserved keywords
+        keyword_import,
+        keyword_async,
+        keyword_await,
+        keyword_yield,
+        keyword_throw,
+        keyword_try,
+        keyword_catch,
         identifier,
         string_literal,
         multiline_string_literal_line,
@@ -156,7 +164,14 @@ pub const Token = struct {
                 .keyword_break => "break",
                 .keyword_continue => "continue",
                 .keyword_in => "in",
-                .keyword_fn => "fn",
+                .keyword_priv => "priv",
+                .keyword_import => "import",
+                .keyword_async => "async",
+                .keyword_await => "await",
+                .keyword_yield => "yield",
+                .keyword_throw => "throw",
+                .keyword_try => "try",
+                .keyword_catch => "catch",
             };
         }
 

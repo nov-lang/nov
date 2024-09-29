@@ -1,22 +1,25 @@
+//! Deprecated: need to write IR first
+//! See https://github.com/Ratakor/novlang/blob/dev2/src/Codegen.zig
+//! for a "more" advanced version of this file
+
 const std = @import("std");
 const Ast = @import("Ast.zig");
 const Node = Ast.Node;
-const _value = @import("value.zig");
-const Value = _value.Value;
-const Function = _value.Function;
+const v = @import("value.zig");
+const Value = v.Value;
 const Chunk = @import("Chunk.zig");
-const isPrimitive = @import("primitives.zig").isPrimitive;
 
 const Codegen = @This();
 
 pub const Error = std.mem.Allocator.Error;
+// const Error = error{CompileError} || Parser.Error || std.mem.Allocator.Error;
 
 current: *Frame,
 ast: *const Ast,
 allocator: std.mem.Allocator,
 arena: std.mem.Allocator,
 
-pub fn generate(allocator: std.mem.Allocator, ast: Ast) Error!*Function {
+pub fn generate(allocator: std.mem.Allocator, ast: Ast) Error!*v.Function {
     std.debug.assert(ast.errors.len == 0);
 
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -35,7 +38,7 @@ pub fn generate(allocator: std.mem.Allocator, ast: Ast) Error!*Function {
 pub const Frame = struct {
     enclosing: ?*Frame = null,
     function_node: Node.Index,
-    function: *Function,
+    function: *v.Function,
     // return_counts: bool = false,
     // return_emitted: bool = false,
 };
@@ -46,7 +49,7 @@ const generators = std.enums.directEnumArray(Node.Tag, Nodegen, 0, .{
     .int_literal = generateInt,
 });
 
-fn generateNode(self: *Codegen, node: Node.Index) Error!?*Function {
+fn generateNode(self: *Codegen, node: Node.Index) Error!?*v.Function {
     // synchronize
 
     if (generators[@intFromEnum(self.ast.nodes.items(.tag)[node])]) |gen| {

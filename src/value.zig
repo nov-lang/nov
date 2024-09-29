@@ -1,15 +1,35 @@
 const std = @import("std");
 const Chunk = @import("Chunk.zig");
 
+// TODO: move true/false/nil to keywords and make this a map to the Type enum based on Value
+pub const primitives = std.StaticStringMap(void).initComptime(.{
+    .{"bool"},
+    .{"int"},
+    .{"uint"},
+    .{"float"},
+    .{"string"},
+    .{"false"},
+    .{"true"},
+    .{"nil"},
+    .{"any"},
+    // .{"undefined"},
+    // .{"void"},
+    // .{"error"},
+});
+
+pub fn isPrimitive(name: []const u8) bool {
+    return primitives.has(name);
+}
+
 pub const Value = union(enum) {
     bool: bool,
-    number: f64,
-    // int: i64,
-    // uint: u64,
-    // float: f64,
+    int: i64,
+    uint: u64,
+    float: f64,
     string: *String,
     function: *Function,
     // list: *List,
+    // tuple: *Tuple,
     // map: *Map,
 
     pub fn create(value: anytype) Value {
@@ -19,8 +39,12 @@ pub const Value = union(enum) {
             *Function => return .{ .function = value },
             []u8, []const u8 => @compileError("Use createObject() instead"),
             else => switch (@typeInfo(@TypeOf(value))) {
-                .ComptimeInt, .Int => return .{ .number = @floatFromInt(value) },
-                .Float => return .{ .number = @floatCast(value) },
+                .ComptimeInt => return .{ .int = value },
+                .Int => |info| switch (info.signedness) {
+                    .signed => return .{ .int = value },
+                    .unsigned => return .{ .uint = value },
+                },
+                .Float => return .{ .float = value },
                 else => @compileError("Unsupported type: " ++ @typeName(@TypeOf(value))),
             },
         }
@@ -46,7 +70,7 @@ pub const Value = union(enum) {
 
     pub fn destroy(self: Value, allocator: std.mem.Allocator) void {
         switch (self) {
-            .bool, .number => {},
+            .bool, .int, .uint, .float => {},
             inline else => |value| value.deinit(allocator),
         }
     }
@@ -62,7 +86,7 @@ pub const Value = union(enum) {
         }
         switch (self) {
             .bool => |value| try writer.print("{}", .{value}),
-            .number => |value| try writer.print("{d}", .{value}),
+            inline .int, .uint, .float => |value| try writer.print("{d}", .{value}),
             .string => |value| try writer.print("{s}", .{value.data}),
             .function => |value| if (value.name) |name| {
                 try writer.print("<fn {s}>", .{name});
@@ -73,15 +97,36 @@ pub const Value = union(enum) {
     }
 
     pub fn eql(self: Value, other: Value) bool {
-        if (std.meta.activeTag(self) != std.meta.activeTag(other)) {
-            return false;
+        if (std.meta.activeTag(self) == std.meta.activeTag(other)) {
+            return switch (self) {
+                .bool => self.bool == other.bool,
+                .int => self.int == other.int,
+                .uint => self.uint == other.uint,
+                .float => self.float == other.float,
+                .string => std.mem.eql(u8, self.string.data, other.string.data),
+                .function => self.function == other.function, // compare ptr
+            };
         }
-        return switch (self) {
-            .bool => self.bool == other.bool,
-            .number => self.number == other.number,
-            .string => std.mem.eql(u8, self.string.data, other.string.data),
-            .function => self.function == other.function, // compare ptr
-        };
+
+        switch (self) {
+            inline .int, .uint => |self_int| {
+                switch (other) {
+                    inline .int, .uint => |other_int| return self_int == other_int,
+                    .float => |other_float| return @as(f64, @floatFromInt(self_int)) == other_float,
+                    else => {},
+                }
+            },
+            .float => |self_float| {
+                switch (other) {
+                    inline .int, .uint => |other_int| return self_float == @as(f64, @floatFromInt(other_int)),
+                    .float => |other_float| return self_float == other_float,
+                    else => {},
+                }
+            },
+            else => {},
+        }
+
+        return false;
     }
 };
 

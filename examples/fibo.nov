@@ -2,7 +2,7 @@
 import "std"
 
 ; idk about the `rec` keyword
-let rec fibo = x: int -> {
+let rec fibo = (x: int) -> {
     match (x) {
         0, 1 => x
         _ => fibo(x - 1) + fibo(x - 2)

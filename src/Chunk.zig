@@ -21,7 +21,7 @@ pub const OpCode = enum(u8) {
     mul,
     div,
     mod,
-    not,
+    not, // TODO: rename bool_not
     negation,
     pop,
     get_local,
