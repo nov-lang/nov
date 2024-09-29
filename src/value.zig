@@ -28,8 +28,8 @@ pub const Value = union(enum) {
     float: f64,
     string: *String,
     function: *Function,
-    // list: *List,
-    // tuple: *Tuple,
+    // list: *List, // TODO: [a, b, c, d] same as OCaml, type is `InnerType list` or `List<InnerType>` or idk
+    // tuple: *Tuple, // TODO: (a, b, c, d) same as OCaml
     // map: *Map,
 
     pub fn create(value: anytype) Value {
@@ -88,6 +88,7 @@ pub const Value = union(enum) {
             .bool => |value| try writer.print("{}", .{value}),
             inline .int, .uint, .float => |value| try writer.print("{d}", .{value}),
             .string => |value| try writer.print("{s}", .{value.data}),
+            // TODO: name: args types -> return type
             .function => |value| if (value.name) |name| {
                 try writer.print("<fn {s}>", .{name});
             } else {

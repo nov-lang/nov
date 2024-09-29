@@ -1,18 +1,15 @@
 import "std"
 
 let fizzBuzz = (n: int) -> {
-    let fizz = n % 3 == 0
-    let buzz = n % 5 == 0
-
-    match (fizz, buzz) {
-        true, true => "FizzBuzz"
-        true, _ => "Fizz"
-        _, true => "Buzz"
-        _, _ => "{n}" ; idk about that
+    match (n % 3, n % 5) {
+        (0, 0) => "FizzBuzz"
+        (0, _) => "Fizz"
+        (_, 0) => "Buzz"
+        _ => "{n}" ; or n.toString()
     }
 } -> string
 
-; TODO: show other kind of loops
+; TODO: use a for loop
 let mut i = 0
 loop {
     i |> fizzBuzz |> println

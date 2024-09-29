@@ -27,10 +27,8 @@ It's fine to keep arena fucked up allocation fest until GC implementation
 - Error type for each step (~Tokenizer~, Parser, IR, Compiler, Runtime)
 - forward reference
 - string interpolation
-- rec keyword for functions?
 - separate int, uint, float and string operations. e.g. + for int/uint, +. for float, ++ for string
 - replace , with | in match prong?
-- replace , at the end of a match prong with newline? (yes every expr should end with a new line)
 - add ** for exponential?
 - handle SIG.INT
 - in repl mode output statement result by default
@@ -73,3 +71,4 @@ It's fine to keep arena fucked up allocation fest until GC implementation
 - Old errors:
   - `print i` throw a expected new line after statement which is not a very good error message
   - giving "}}" to Parser result in an infinite loop
+- No need for parenthesis everywhere (look at rust, go and caml)

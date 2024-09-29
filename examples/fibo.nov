@@ -1,9 +1,8 @@
 ; std contains the `println` function
 import "std"
 
-; idk about the `rec` keyword
-let rec fibo = (x: int) -> {
-    match (x) {
+let fibo = (x: int) -> {
+    match x {
         0, 1 => x
         _ => fibo(x - 1) + fibo(x - 2)
     }
@@ -16,4 +15,5 @@ let rec fibo = (x: int) -> {
 ; can accept any type that supports the `*` operator
 
 ; TODO: get the number from the user and use `??` for fallback
-fibo(10) |> println
+; also do it async
+10 |> fibo |> println
