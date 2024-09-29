@@ -61,6 +61,8 @@ pub const Token = struct {
         ampersand_equal,
         tilde,
         tilde_equal,
+        keyword_true,
+        keyword_false,
         keyword_and,
         keyword_or,
         keyword_if,
@@ -150,6 +152,8 @@ pub const Token = struct {
                 .ampersand_equal => "&=",
                 .tilde => "~",
                 .tilde_equal => "~=",
+                .keyword_true => "true",
+                .keyword_false => "false",
                 .keyword_and => "and",
                 .keyword_or => "or",
                 .keyword_if => "if",
@@ -476,7 +480,7 @@ pub fn next(self: *Tokenizer) Token {
                 },
             },
             .underscore => switch (c) {
-                'A'...'Z', 'a'...'z', '_' => {
+                'A'...'Z', 'a'...'z', '0'...'9', '_' => {
                     state = .identifier;
                     result.tag = .identifier;
                 },
@@ -808,8 +812,7 @@ test "_" {
         \\_0 => 0,
         \\
     , &.{
-        .underscore,
-        .int_literal,
+        .identifier,
         .equal_r_angle_bracket,
         .int_literal,
         .comma,

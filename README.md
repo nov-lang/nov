@@ -18,6 +18,7 @@ It's fine to keep arena fucked up allocation fest until GC implementation
 ## Grammar
 - https://craftinginterpreters.com/appendix-i.html
 - https://github.com/ziglang/zig-spec/blob/master/grammar/grammar.peg
+- https://doc.rust-lang.org/stable/reference/introduction.html
 - https://ocaml.org/docs/values-and-functions#the-pipe-operator
 - https://ocaml.org/docs/basic-data-types#options--results
 
@@ -53,15 +54,19 @@ It's fine to keep arena fucked up allocation fest until GC implementation
 - add import
 - add async/await/yield
   - see go coroutines and other languages way of doing it
+  - see wren's [fibers](https://wren.io/concurrency.html)
 - add throw/try/catch
   - try and catch like in zig
   - throw used to return an error (or just return a error.XXX like zig?)
 - add generics
 - add `type` keyword to define a new type or `struct`/`enum` idk
+  - also tagged union
 - add typeof keyword/builtin/idk
 - rework examples
 - remove `loop` loops?
 - add `do while` loops or `repeat until` loops?
+- monads
+- add an FFI with zig and C
 
 ## Notes
 - Check previous step of crafting interpreters and implement them with
@@ -72,3 +77,5 @@ It's fine to keep arena fucked up allocation fest until GC implementation
   - `print i` throw a expected new line after statement which is not a very good error message
   - giving "}}" to Parser result in an infinite loop
 - No need for parenthesis everywhere (look at rust, go and caml)
+- See [Option](https://doc.rust-lang.org/std/option) and [Result](https://doc.rust-lang.org/std/result) for nil and error
+- See [What are the NO's in GO design?](https://kuree.gitbooks.io/the-go-programming-language-report/content/32/text.html)

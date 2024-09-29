@@ -1,19 +1,17 @@
 const std = @import("std");
 const Chunk = @import("Chunk.zig");
 
-// TODO: move true/false/nil to keywords and make this a map to the Type enum based on Value
+// make this a map to the Type enum based on Value?
+// void type name and value is `()`
 pub const primitives = std.StaticStringMap(void).initComptime(.{
     .{"bool"},
     .{"int"},
     .{"uint"},
     .{"float"},
     .{"string"},
-    .{"false"},
-    .{"true"},
-    .{"nil"},
     .{"any"},
+    // .{"nil"},
     // .{"undefined"},
-    // .{"void"},
     // .{"error"},
 });
 
