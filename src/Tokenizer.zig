@@ -32,7 +32,7 @@ pub const Token = struct {
         bang_equal,
         equal,
         equal_equal,
-        equal_r_angle_bracket,
+        equal_arrow,
         l_angle_bracket,
         l_angle_bracket_equal,
         l_angle_bracket_angle_bracket,
@@ -45,7 +45,7 @@ pub const Token = struct {
         plus_equal,
         minus,
         minus_equal,
-        minus_r_angle_bracket,
+        arrow,
         asterisk,
         asterisk_equal,
         slash,
@@ -54,7 +54,7 @@ pub const Token = struct {
         percent_equal,
         pipe,
         pipe_equal,
-        pipe_r_angle_bracket,
+        pipe_arrow,
         caret,
         caret_equal,
         ampersand,
@@ -86,6 +86,7 @@ pub const Token = struct {
         keyword_throw,
         keyword_try,
         keyword_catch,
+        keyword_pure,
         identifier,
         string_literal,
         multiline_string_literal_line,
@@ -123,7 +124,7 @@ pub const Token = struct {
                 .bang_equal => "!=",
                 .equal => "=",
                 .equal_equal => "==",
-                .equal_r_angle_bracket => "=>",
+                .equal_arrow => "=>",
                 .l_angle_bracket => "<",
                 .l_angle_bracket_equal => "<=",
                 .l_angle_bracket_angle_bracket => "<<",
@@ -136,7 +137,7 @@ pub const Token = struct {
                 .plus_equal => "+=",
                 .minus => "-",
                 .minus_equal => "-=",
-                .minus_r_angle_bracket => "->",
+                .arrow => "->",
                 .asterisk => "*",
                 .asterisk_equal => "*=",
                 .slash => "/",
@@ -145,7 +146,7 @@ pub const Token = struct {
                 .percent_equal => "%=",
                 .pipe => "|",
                 .pipe_equal => "|=",
-                .pipe_r_angle_bracket => "|>",
+                .pipe_arrow => "|>",
                 .caret => "^",
                 .caret_equal => "^=",
                 .ampersand => "&",
@@ -176,6 +177,7 @@ pub const Token = struct {
                 .keyword_throw => "throw",
                 .keyword_try => "try",
                 .keyword_catch => "catch",
+                .keyword_pure => "pure",
             };
         }
 
@@ -584,7 +586,7 @@ pub fn next(self: *Tokenizer) Token {
                     break;
                 },
                 '>' => {
-                    result.tag = .pipe_r_angle_bracket;
+                    result.tag = .pipe_arrow;
                     self.index += 1;
                     break;
                 },
@@ -600,7 +602,7 @@ pub fn next(self: *Tokenizer) Token {
                     break;
                 },
                 '>' => {
-                    result.tag = .equal_r_angle_bracket;
+                    result.tag = .equal_arrow;
                     self.index += 1;
                     break;
                 },
@@ -616,7 +618,7 @@ pub fn next(self: *Tokenizer) Token {
                     break;
                 },
                 '>' => {
-                    result.tag = .minus_r_angle_bracket;
+                    result.tag = .arrow;
                     self.index += 1;
                     break;
                 },
@@ -681,6 +683,10 @@ pub fn next(self: *Tokenizer) Token {
                     self.index += 1;
                     break;
                 },
+                '0'...'9' => {
+                    state = .float;
+                    result.tag = .float_literal;
+                },
                 else => {
                     result.tag = .period;
                     break;
@@ -736,17 +742,14 @@ pub fn next(self: *Tokenizer) Token {
                 },
             },
             .int_period => switch (c) {
-                '_', 'a'...'d', 'f'...'o', 'q'...'z', 'A'...'D', 'F'...'O', 'Q'...'Z', '0'...'9' => {
-                    state = .float;
-                    result.tag = .float_literal;
-                },
-                'e', 'E', 'p', 'P' => {
-                    state = .float_exponent;
-                    result.tag = .float_literal;
+                '.' => {
+                    self.index -= 1;
+                    break;
                 },
                 else => {
                     self.index -= 1;
-                    break;
+                    state = .float;
+                    result.tag = .float_literal;
                 },
             },
             .float => switch (c) {
@@ -803,7 +806,7 @@ test "_" {
         \\
     , &.{
         .underscore,
-        .equal_r_angle_bracket,
+        .equal_arrow,
         .int_literal,
         .comma,
         .newline,
@@ -813,17 +816,17 @@ test "_" {
         \\
     , &.{
         .identifier,
-        .equal_r_angle_bracket,
+        .equal_arrow,
         .int_literal,
         .comma,
         .newline,
     });
     try testTokenize(
-        \\_int => 0,
+        \\_xxx => 0,
         \\
     , &.{
         .identifier,
-        .equal_r_angle_bracket,
+        .equal_arrow,
         .int_literal,
         .comma,
         .newline,
@@ -1003,13 +1006,13 @@ test "pipe into functions" {
         \\
     , &.{
         .string_literal,
-        .pipe_r_angle_bracket,
+        .pipe_arrow,
         .identifier,
-        .pipe_r_angle_bracket,
+        .pipe_arrow,
         .identifier,
-        .pipe_r_angle_bracket,
+        .pipe_arrow,
         .identifier,
-        .pipe_r_angle_bracket,
+        .pipe_arrow,
         .identifier,
         .newline,
     });
@@ -1061,9 +1064,12 @@ test "int literals decimal" {
 }
 
 test "float literals decimal" {
-    try testTokenize("1.", &.{ .int_literal, .period });
-    try testTokenize("1.+", &.{ .int_literal, .period, .plus });
+    try testTokenize("._", &.{ .period, .underscore });
+    try testTokenize("._1", &.{ .period, .identifier });
 
+    try testTokenize("1.", &.{.float_literal});
+    try testTokenize("1.+", &.{ .float_literal, .plus });
+    try testTokenize(".1234", &.{.float_literal});
     try testTokenize("0.0", &.{.float_literal});
     try testTokenize("1.0", &.{.float_literal});
     try testTokenize("0._", &.{.float_literal});
@@ -1117,7 +1123,7 @@ test "number literals binary" {
     try testTokenize("0b1111_1111", &.{.int_literal});
     try testTokenize("0b10_10_10_10", &.{.int_literal});
     try testTokenize("0b0_1_0_1_0_1_0_1", &.{.int_literal});
-    try testTokenize("0b1.", &.{ .int_literal, .period });
+    try testTokenize("0b1.", &.{.float_literal});
     try testTokenize("0b1.0", &.{.float_literal});
 
     try testTokenize("0B0", &.{.int_literal});
@@ -1156,7 +1162,7 @@ test "number literals octal" {
     try testTokenize("0o0123_4567", &.{.int_literal});
     try testTokenize("0o01_23_45_67", &.{.int_literal});
     try testTokenize("0o0_1_2_3_4_5_6_7", &.{.int_literal});
-    try testTokenize("0o7.", &.{ .int_literal, .period });
+    try testTokenize("0o7.", &.{.float_literal});
     try testTokenize("0o7.0", &.{.float_literal});
 
     try testTokenize("0O0", &.{.int_literal});
@@ -1223,10 +1229,10 @@ test "number literals hexadecimal" {
 }
 
 test "float literals hexadecimal" {
-    try testTokenize("0x1.", &.{ .int_literal, .period });
-    try testTokenize("0xF.", &.{ .int_literal, .period });
-    try testTokenize("0x1.+0xF.", &.{ .int_literal, .period, .plus, .int_literal, .period });
-    try testTokenize("0x0_.0.0", &.{ .float_literal, .period, .int_literal });
+    try testTokenize("0x1.", &.{.float_literal});
+    try testTokenize("0xF.", &.{.float_literal});
+    try testTokenize("0x1.+0xF.", &.{ .float_literal, .plus, .float_literal });
+    try testTokenize("0x0_.0.0", &.{ .float_literal, .float_literal });
 
     try testTokenize("0x1.0", &.{.float_literal});
     try testTokenize("0xF.0", &.{.float_literal});

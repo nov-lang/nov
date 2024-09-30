@@ -64,18 +64,31 @@ It's fine to keep arena fucked up allocation fest until GC implementation
 - add typeof keyword/builtin/idk
 - rework examples
 - remove `loop` loops?
+- remove `while` loops?
 - add `do while` loops or `repeat until` loops?
-- monads
+- monads, there already here but with specific `>>=` bind function
 - add an FFI with zig and C
+- add `_ =` or `() =` to discard the return of a function and make it mandatory
+  to not ignore the return value from an expression?
+- add operator overloading?
+- concat string with `++` and mult with `**` instead of same as number
+- replace float operators with `+.`, `-.`, `*.`, `/.`, `%.`
+- compilation error when trying to add/compare value of different type? (at least for non number)
+- remove uint?
+- optimize tail call recursion
 
 ## Notes
 - Check previous step of crafting interpreters and implement them with
   AST/Parser/IR/Codegen instead of just Compiler
 - Check std.zig.Ast.parse and std.zig.Ast.tokenLocation for Ast and Parser
 - Check std.zig.Zir and zig/src/Sema.zig for IR
+- Check std.zig.start.callMainWithArgs
 - Old errors:
   - `print i` throw a expected new line after statement which is not a very good error message
   - giving "}}" to Parser result in an infinite loop
 - No need for parenthesis everywhere (look at rust, go and caml)
 - See [Option](https://doc.rust-lang.org/std/option) and [Result](https://doc.rust-lang.org/std/result) for nil and error
 - See [What are the NO's in GO design?](https://kuree.gitbooks.io/the-go-programming-language-report/content/32/text.html)
+- A file is a module, import module as value like zig?
+  - `import "std"` or `let std = import "std"`
+  - When importing other files only declarations gets imported?
