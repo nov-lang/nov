@@ -79,9 +79,10 @@ It's fine to keep arena fucked up allocation fest until GC implementation
 
 ## Notes
 - Check previous step of crafting interpreters and implement them with
-  AST/Parser/IR/Codegen instead of just Compiler
+  AST/Parser/IR/Codegen instead of just compiler
 - Check std.zig.Ast.parse and std.zig.Ast.tokenLocation for Ast and Parser
-- Check std.zig.Zir and zig/src/Sema.zig for IR
+- Check std.zig.AstGen, std.zig.Zir and zig/src/Sema.zig for IR
+- Check zig/src/InternPool.zig for storing variables
 - Check std.zig.start.callMainWithArgs
 - Old errors:
   - `print i` throw a expected new line after statement which is not a very good error message

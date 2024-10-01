@@ -2,7 +2,7 @@ const std = @import("std");
 const Chunk = @import("Chunk.zig");
 
 // make this a map to the Type enum based on Value?
-// void type name and value is `()`
+// void/nil type name and value is `()`
 pub const primitives = std.StaticStringMap(void).initComptime(.{
     .{"bool"},
     .{"int"},

@@ -1,10 +1,16 @@
 const std = @import("std");
+const Parser = @import("Parser.zig");
 const Ast = @import("Ast.zig");
 const Node = Ast.Node;
 
 pub fn main() !void {
     // (* (- 123) (group 45.67))
-    const source = "-123 * (45.67)\n";
+    // const source = "-123 * (45.67)\n";
+    const source =
+        \\let x = 3
+        \\let priv mut y = 4
+        \\
+    ;
     // const source =
     //     // \\let x: int = 3
     //     // \\let mut y = "salut"
@@ -47,7 +53,7 @@ pub fn main() !void {
     // std.log.debug("Running parser with source: \n{s}\n", .{source});
 
     const allocator = std.heap.page_allocator;
-    var ast = try Ast.parse(allocator, source);
+    var ast = try Parser.parse(allocator, source);
     defer ast.deinit(allocator);
 
     // for (ast.rootDecls()) |decl| {
@@ -58,27 +64,27 @@ pub fn main() !void {
     //     std.debug.print("\n", .{});
     // }
 
-    // std.debug.print("Tokens:", .{});
-    // for (ast.tokens.items(.tag)) |tag| {
-    //     std.debug.print(" {s}", .{@tagName(tag)});
-    // }
+    std.debug.print("Tokens:", .{});
+    for (ast.tokens.items(.tag)) |tag| {
+        std.debug.print(" {s}", .{@tagName(tag)});
+    }
 
-    // std.debug.print("\nNodes:", .{});
-    // for (ast.nodes.items(.tag)) |tag| {
-    //     std.debug.print(" {s}", .{@tagName(tag)});
-    // }
-    // std.debug.print("\nErrors:", .{});
-    // for (ast.errors) |parse_error| {
-    //     std.debug.print("\n", .{});
-    //     const loc = ast.tokenLocation(0, parse_error.token);
-    //     std.debug.print("{d}:{d}: {s}: ", .{
-    //         loc.line,
-    //         loc.column,
-    //         @tagName(ast.tokens.items(.tag)[parse_error.token]),
-    //     });
-    //     try ast.renderError(parse_error, std.io.getStdOut().writer());
-    // }
-    // std.debug.print("\n", .{});
+    std.debug.print("\nNodes:", .{});
+    for (ast.nodes.items(.tag)) |tag| {
+        std.debug.print(" {s}", .{@tagName(tag)});
+    }
+    std.debug.print("\nErrors:", .{});
+    for (ast.errors) |parse_error| {
+        std.debug.print("\n", .{});
+        const loc = ast.tokenLocation(0, parse_error.token);
+        std.debug.print("{d}:{d}: {s}: ", .{
+            loc.line,
+            loc.column,
+            @tagName(ast.tokens.items(.tag)[parse_error.token]),
+        });
+        try ast.renderError(parse_error, std.io.getStdOut().writer());
+    }
+    std.debug.print("\n", .{});
 
     // _ = ast.firstToken(0);
     // _ = ast.lastToken(0);

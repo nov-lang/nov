@@ -1,0 +1,30 @@
+let std = import "std"
+let File = std.fs.File
+
+let file = match File.open("file.txt") {
+    .ok => |f| f
+    .err => |e| panic "Failed to open file: {e}"
+}
+
+; TODO: write file to stdout
+; std.io.println(...
+
+file.close()
+
+;;; another version
+let std = @import("std")
+let File = std.fs.File
+
+let file = match File.open("file.txt") {
+    ok(file) => file
+    err(error) => match error.kind() {
+        not_found => {
+            ; do something
+        },
+        _ => @panic("Failed to open file: {error}")
+    }
+}
+
+; print...
+
+file.close()

@@ -6,12 +6,14 @@ const std = @import("std");
 const Tokenizer = @This();
 
 buffer: [:0]const u8,
-index: u32,
+index: ByteOffset,
+
+pub const ByteOffset = u32;
 
 pub const Token = struct {
     tag: Tag,
-    start: u32,
-    end: u32,
+    start: ByteOffset,
+    end: ByteOffset,
 
     pub const Tag = enum {
         newline,
@@ -60,7 +62,6 @@ pub const Token = struct {
         ampersand,
         ampersand_equal,
         tilde,
-        tilde_equal,
         keyword_true,
         keyword_false,
         keyword_and,
@@ -83,6 +84,9 @@ pub const Token = struct {
         keyword_async,
         keyword_await,
         keyword_yield,
+        keyword_resume,
+        keyword_suspend,
+        keyword_nosuspend,
         keyword_throw,
         keyword_try,
         keyword_catch,
@@ -152,7 +156,6 @@ pub const Token = struct {
                 .ampersand => "&",
                 .ampersand_equal => "&=",
                 .tilde => "~",
-                .tilde_equal => "~=",
                 .keyword_true => "true",
                 .keyword_false => "false",
                 .keyword_and => "and",
@@ -174,6 +177,9 @@ pub const Token = struct {
                 .keyword_async => "async",
                 .keyword_await => "await",
                 .keyword_yield => "yield",
+                .keyword_resume => "resume",
+                .keyword_suspend => "suspend",
+                .keyword_nosuspend => "nosuspend",
                 .keyword_throw => "throw",
                 .keyword_try => "try",
                 .keyword_catch => "catch",
@@ -217,7 +223,7 @@ pub const Token = struct {
 
 pub fn init(buffer: [:0]const u8) Tokenizer {
     // Skip the UTF-8 BOM if present
-    const src_start: u32 = if (std.mem.startsWith(u8, buffer, "\xEF\xBB\xBF")) 3 else 0;
+    const src_start: ByteOffset = if (std.mem.startsWith(u8, buffer, "\xEF\xBB\xBF")) 3 else 0;
     return .{
         .buffer = buffer,
         .index = src_start,
@@ -242,7 +248,6 @@ const State = enum {
     plus,
     minus,
     slash,
-    tilde,
     l_angle_bracket,
     l_angle_bracket_angle_bracket,
     r_angle_bracket,
@@ -385,7 +390,9 @@ pub fn next(self: *Tokenizer) Token {
                     state = .caret;
                 },
                 '~' => {
-                    state = .tilde;
+                    result.tag = .tilde;
+                    self.index += 1;
+                    break;
                 },
                 '\\' => {
                     state = .backslash;
@@ -467,17 +474,6 @@ pub fn next(self: *Tokenizer) Token {
                 },
                 else => {
                     result.tag = .caret;
-                    break;
-                },
-            },
-            .tilde => switch (c) {
-                '=' => {
-                    result.tag = .tilde_equal;
-                    self.index += 1;
-                    break;
-                },
-                else => {
-                    result.tag = .tilde;
                     break;
                 },
             },
