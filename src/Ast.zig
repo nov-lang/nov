@@ -1206,8 +1206,9 @@ pub const Node = struct {
         decl,
         /// `lhs.a`. main_token is the dot. rhs is the identifier token index.
         field_access,
+        // TODO: force unwrap (use this instead of `try` too and change to `lhs!`?)
         /// `lhs.?`. main_token is the dot. rhs is the `?` token index.
-        unwrap_optional, // TODO: force unwrap (use this instead of try too?)
+        unwrap_optional,
         /// `lhs == rhs`. main_token is op.
         equal_equal,
         /// `lhs != rhs`. main_token is op.

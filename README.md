@@ -97,3 +97,80 @@ It's fine to keep arena fucked up allocation fest until GC implementation
 - A file is a module, import module as value like zig?
   - `import "std"` or `let std = import "std"`
   - When importing other files only declarations gets imported?
+
+## Concepts
+
+### Builtins
+- `@This()`: Same as zig, it's the type of the current container.
+- `@import()`: Import a nov file as module.
+- `@TypeOf(val: any)`: Returns the type of a value.
+
+### Enum
+Nov enums are just like C enums except that they can have methods and are not
+global.
+```nov
+let MyEnum = enum {
+    x ; default to 0
+    y = 5
+    z ; default to y + 1 = 6
+
+    let eql = (self: @This(), other: @This()) -> self == other -> bool
+}
+
+let x: MyEnum = .x ; TODO: is this notation allowed?
+let y = MyEnum.y
+x.eql(y) |> println ; print false
+```
+
+### Struct
+TODO: are tuples like that? Do we allow .{} notation? (no to both)
+```nov
+let MyStruct = struct {
+    name: string
+    x: float = 1.
+    y: float = 1.
+    z: float = 1.
+
+    let max = 100.
+
+    let init = (name: string) -> .{ .name = name } -> @This()
+}
+
+let x = MyStruct.init("aaa") ; same as let x = MyStruct{ .name = name }
+x |> println ; idk what this prints
+
+; tuples are anonymous structs
+let tuple = .{ 0, 1, 2 }
+@TypeOf(tuple) |> println ; idk what this prints
+```
+
+### Result and Option unions
+The Result and Option unions are created with functions since types are values.
+In nov there is no untagged union thus  we can match on any union to find the
+active field. Note that it isn't represented here but an union field can have a
+default value just like a struct field.
+```nov
+let Result = (T: type, E: type) -> union {
+    ok: T
+    err: E
+} -> type
+
+let Option = (T: type) -> union {
+    some: T
+    none
+
+    ; unions can also have methods
+    let forceUnwrap = (self: @This()) -> {
+        match self {
+            .some => |val| val ; catch the value and return it
+            .none => @panic("...")
+        }
+    } -> T
+} -> type
+
+let x = 5
+let y: Option(int) = .some{5}
+; `??` is a special operator for Result and Option to provide a fallback value
+; if the variable is .err or .none
+let sum = x + y ?? 0
+```

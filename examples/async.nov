@@ -1,0 +1,21 @@
+; yield, etc as builtins or keywords?
+
+let std = @import("std")
+
+let fibo = (n: int) -> {
+    let mut n1 = 0
+    let mut n2 = 1
+    let mut next: int ; using `next` without initializing result in a panic
+
+    ; `for` and `range` syntax is not yet decided
+    for _ in range(n) {
+        yield n1
+        next = n1 + n2
+        n1 = n2
+        n2 = next
+    }
+} -^ ?int -> () ; `-> ()` can be omitted because no return value means `()`
+
+for n in async fibo(10) {
+    n |> std.println
+}

@@ -100,6 +100,10 @@ pub const Token = struct {
         keyword_try,
         keyword_catch,
         keyword_pure,
+        keyword_extern,
+        keyword_enum,
+        keyword_struct,
+        keyword_union,
 
         pub fn lexeme(tag: Tag) ?[]const u8 {
             return switch (tag) {
@@ -188,6 +192,10 @@ pub const Token = struct {
                 .keyword_try => "try",
                 .keyword_catch => "catch",
                 .keyword_pure => "pure",
+                .keyword_extern => "extern",
+                .keyword_enum => "enum",
+                .keyword_struct => "struct",
+                .keyword_union => "union",
             };
         }
 
