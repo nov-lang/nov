@@ -3,7 +3,7 @@
 # TODO
 Rewrite Ast and Parser based on the previous versions (1 and 2)
 
-Keep it small at first with only a few expressions and very simple declaration (there is no statement in nov)
+Keep it small at first with only a few expressions and very simple declaration
 
 Implement basic IR then codegen to try it before adding more features
 
@@ -24,8 +24,8 @@ It's fine to keep arena fucked up allocation fest until GC implementation
 
 ## Proposals and stuff to add
 - opt to output bytecode and to run bytecode instead of interpreting
-- tests mainly for Parser, IR and VM
-- Error type for each step (~Tokenizer~, Parser, IR, Compiler, Runtime)
+- add tests, mainly for Parser, IR and VM
+- Error type for each step (~Tokenizer, Parser~, IR, Compiler, Runtime)
 - forward reference
 - string interpolation
 - separate int, uint, float and string operations. e.g. + for int/uint, +. for float, ++ for string
@@ -73,6 +73,7 @@ It's fine to keep arena fucked up allocation fest until GC implementation
   expression statement and it's fine to ignore their result just to trigger the
   side effects of evaluating the expression)
 - add operator overloading?
+- return an error on arithmetic overflow instead of crashing or add a builtin like zig
 - concat string with `++` and mult with `**` instead of same as number
 - replace float operators with `+.`, `-.`, `*.`, `/.`, `%.`
 - compilation error when trying to add/compare value of different type? (at least for non number)

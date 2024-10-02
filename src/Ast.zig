@@ -801,7 +801,7 @@ pub fn ifElse(self: Ast, node: Node.Index) full.If {
             .if_token = self.nodes.items(.main_token)[node],
             .cond_expr = data.lhs,
             .then_expr = extra.then_expr,
-            .else_expr = extra.then_expr,
+            .else_expr = extra.else_expr,
         },
     });
 }
@@ -1194,11 +1194,7 @@ pub const Node = struct {
 
     pub const Index = u32;
 
-    comptime {
-        assert(@sizeOf(Tag) == 1);
-    }
-
-    pub const Tag = enum {
+    pub const Tag = enum(u8) {
         /// sub_list[lhs..rhs]
         root,
         /// Both lhs and rhs unused.

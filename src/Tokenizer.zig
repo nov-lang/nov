@@ -16,6 +16,14 @@ pub const Token = struct {
     end: ByteOffset,
 
     pub const Tag = enum {
+        eof,
+        invalid,
+        identifier,
+        builtin,
+        string_literal,
+        multiline_string_literal_line,
+        int_literal,
+        float_literal,
         newline,
         l_paren,
         r_paren,
@@ -92,19 +100,13 @@ pub const Token = struct {
         keyword_try,
         keyword_catch,
         keyword_pure,
-        identifier,
-        string_literal,
-        multiline_string_literal_line,
-        int_literal,
-        float_literal,
-        eof,
-        invalid,
 
         pub fn lexeme(tag: Tag) ?[]const u8 {
             return switch (tag) {
                 .eof,
                 .invalid,
                 .identifier,
+                .builtin,
                 .string_literal,
                 .multiline_string_literal_line,
                 .int_literal,
@@ -198,6 +200,7 @@ pub const Token = struct {
                 .eof => "EOF",
                 .invalid => "invalid bytes",
                 .identifier => "an identifier",
+                .builtin => "a builtin function",
                 .string_literal, .multiline_string_literal_line => "a string literal",
                 .int_literal => "an integer literal",
                 .float_literal => "a float literal",
@@ -237,6 +240,8 @@ const State = enum {
     ampersand,
     caret,
     identifier,
+    builtin,
+    saw_at_sign,
     string_literal,
     string_literal_single_quote,
     string_literal_backslash,
@@ -306,6 +311,9 @@ pub fn next(self: *Tokenizer) Token {
                 'A'...'Z', 'a'...'z' => {
                     state = .identifier;
                     result.tag = .identifier;
+                },
+                '@' => {
+                    state = .saw_at_sign;
                 },
                 '?' => {
                     state = .question_mark;
@@ -478,6 +486,24 @@ pub fn next(self: *Tokenizer) Token {
                     result.tag = .caret;
                     break;
                 },
+            },
+            .saw_at_sign => switch (c) {
+                '"' => {
+                    result.tag = .identifier;
+                    state = .string_literal;
+                },
+                'A'...'Z', 'a'...'z', '_' => {
+                    state = .builtin;
+                    result.tag = .builtin;
+                },
+                else => {
+                    result.tag = .invalid;
+                    break;
+                },
+            },
+            .builtin => switch (c) {
+                'A'...'Z', 'a'...'z', '0'...'9', '_' => {},
+                else => break,
             },
             .underscore => switch (c) {
                 'A'...'Z', 'a'...'z', '0'...'9', '_' => {
@@ -923,6 +949,21 @@ test "fake multiline string" {
     });
 }
 
+test "string identifier and builtin fns" {
+    try testTokenize(
+        \\let @"if" = @import("std")
+        \\
+    , &.{
+        .keyword_let,
+        .identifier,
+        .equal,
+        .builtin,
+        .l_paren,
+        .string_literal,
+        .r_paren,
+        .newline,
+    });
+}
 test "UTF-8 BOM is recognized and skipped" {
     try testTokenize("\xEF\xBB\xBFa\n", &.{
         .identifier,
