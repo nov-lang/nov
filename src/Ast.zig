@@ -292,11 +292,14 @@ pub fn renderError(self: Ast, parse_error: Error, writer: anytype) !void {
         // .expected_initializer => {
         //     return writer.writeAll("expected field initializer");
         // },
-        // .mismatched_binary_op_whitespace => {
-        //     return writer.print("binary operator `{s}` has whitespace on one side, but not the other.", .{token_tags[parse_error.token].lexeme().?});
-        // },
-        // .zig_style_container => {
-        //     return writer.print("to declare a container do 'const {s} = {s}'", .{
+        .mismatched_binary_op_whitespace => {
+            return writer.print("binary operator `{s}` has whitespace on one side, but not the other.", .{token_tags[parse_error.token].lexeme().?});
+        },
+        .invalid_ampersand_ampersand => {
+            return writer.writeAll("ambiguous use of '&&'; use 'and' for logical AND, or change whitespace to ' & &' for bitwise AND");
+        },
+        // .nov_style_container => {
+        //     return writer.print("to declare a container do 'let {s} = {s}'", .{
         //         self.tokenSlice(parse_error.token), parse_error.extra.expected_tag.symbol(),
         //     });
         // },
@@ -1162,6 +1165,8 @@ pub const Error = struct {
 
     pub const Tag = enum {
         chained_comparison_operators,
+        mismatched_binary_op_whitespace,
+        invalid_ampersand_ampersand,
         expected_expr,
         expected_expr_or_assignment,
         expected_expr_or_decl,
@@ -1198,14 +1203,11 @@ pub const Node = struct {
         root,
         /// Both lhs and rhs unused.
         no_op,
-        /// `let priv? mut? a: b = rhs`. `Decl[lhs]`.
+        /// `let a b x: c = rhs`. `Decl[lhs]`.
         /// rhs may be omitted.
+        /// Can be local or global.
         /// main_token is `let`
-        global_decl,
-        /// `let mut? a: b = rhs`. `Decl[lhs]`.
-        /// rhs may be omitted.
-        /// main_token is `let`
-        local_decl,
+        decl,
         /// `lhs.a`. main_token is the dot. rhs is the identifier token index.
         field_access,
         /// `lhs.?`. main_token is the dot. rhs is the `?` token index.
@@ -1361,7 +1363,7 @@ pub const Node = struct {
         // TODO: list / slice / array
         // TODO: defer/errdefer (no)
         // TODO: try/catch/throw basically errors
-        // TODO: async/await/resume/suspend/nosuspend
+        // TODO: async/await/resume/suspend/nosuspend/yield
     };
 
     pub const Data = struct {
@@ -1377,9 +1379,8 @@ pub const Node = struct {
     };
 
     pub const Decl = packed struct(Index) {
-        mutable: bool = false,
-        public: bool = false,
-        // @"async": bool,
+        mutable: bool,
+        public: bool, // TODO: note for later, only decl in global scope or in a container can be public
         /// Can be Parser.null_node
         type_node: u30,
     };

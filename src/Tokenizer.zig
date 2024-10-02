@@ -78,8 +78,9 @@ pub const Token = struct {
         keyword_break,
         keyword_continue,
         keyword_in,
-        keyword_priv,
+        keyword_pub,
         // unused reserved keywords
+        keyword_priv,
         keyword_import,
         keyword_async,
         keyword_await,
@@ -172,6 +173,7 @@ pub const Token = struct {
                 .keyword_break => "break",
                 .keyword_continue => "continue",
                 .keyword_in => "in",
+                .keyword_pub => "pub",
                 .keyword_priv => "priv",
                 .keyword_import => "import",
                 .keyword_async => "async",

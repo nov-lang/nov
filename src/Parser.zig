@@ -7,7 +7,6 @@ const Token = Tokenizer.Token;
 const Ast = @import("Ast.zig");
 const Node = Ast.Node;
 const TokenIndex = Ast.TokenIndex;
-const assert = std.debug.assert;
 const null_node: Node.Index = 0;
 
 const Parser = @This();
@@ -81,7 +80,7 @@ pub fn parse(allocator: std.mem.Allocator, source: [:0]const u8) Error!Ast {
     };
 }
 
-/// TopLevel <- (Decl | Expr)*
+/// TopLevel <- (Decl | ExprStmt)*
 fn parseTopLevel(self: *Parser) Error!void {
     while (true) {
         switch (self.token_tags[self.tok_i]) {
@@ -92,30 +91,24 @@ fn parseTopLevel(self: *Parser) Error!void {
                 self.tok_i += 1;
             },
             .keyword_let => {
-                const decl = self.expectTopLevelDecl() catch |err| switch (err) {
+                const decl = self.expectDecl() catch |err| switch (err) {
                     error.OutOfMemory => return err,
                     error.ParseError => {
-                        // TODO
-                        // self.synchronize();
+                        self.synchronize();
                         continue;
                     },
                 };
-                if (decl != null_node) {
-                    try self.scratch.append(self.allocator, decl);
-                }
+                try self.scratch.append(self.allocator, decl);
             },
             else => {
-                const expr = self.expectExpr() catch |err| switch (err) {
+                const expr = self.expectExprStmt() catch |err| switch (err) {
                     error.OutOfMemory => return err,
                     error.ParseError => {
-                        // TODO
-                        // self.synchronize();
+                        self.synchronize();
                         continue;
                     },
                 };
-                if (expr != null_node) {
-                    try self.scratch.append(self.allocator, expr);
-                }
+                try self.scratch.append(self.allocator, expr);
             },
         }
     }
@@ -127,9 +120,11 @@ fn parseTopLevel(self: *Parser) Error!void {
     };
 }
 
-fn expectTopLevelDecl(self: *Parser) Error!Node.Index {
+/// Decl <- DeclProto (EQUAL Expr)? NEWLINE
+/// DeclProto <- KEYWORD_let KEYWORD_pub? KEYWORD_mut? IDENTIFIER (COLON TypeExpr)?
+fn expectDecl(self: *Parser) Error!Node.Index {
     const let_token = self.assertToken(.keyword_let);
-    const is_pub = self.consume(.keyword_priv) == null;
+    const is_pub = self.consume(.keyword_pub) != null; // or self.consume(.keyword_priv) == null;
     const is_mut = self.consume(.keyword_mut) != null;
 
     _ = try self.expectToken(.identifier);
@@ -144,7 +139,7 @@ fn expectTopLevelDecl(self: *Parser) Error!Node.Index {
     try self.expectNewline(.expected_newline_after_decl, true);
 
     return self.addNode(.{
-        .tag = .global_decl,
+        .tag = .decl,
         .main_token = let_token,
         .data = .{
             .lhs = @bitCast(Node.Decl{
@@ -157,40 +152,280 @@ fn expectTopLevelDecl(self: *Parser) Error!Node.Index {
     });
 }
 
-fn parseDecl(self: *Parser) Error!Node.Index {
-    const let_token = self.consume(.keyword_let) orelse return null_node;
-    if (self.consume(.keyword_priv) != null) {
-        // TODO: warn
+fn parseExpr(self: *Parser) Error!Node.Index {
+    return self.parseExprPrecedence(.assignment);
+}
+
+fn expectExpr(self: *Parser) Error!Node.Index {
+    const node = try self.parseExpr();
+    if (node == null_node) {
+        return self.fail(.expected_expr);
     }
-    const is_mut = self.consume(.keyword_mut) != null;
+    return node;
+}
 
-    _ = try self.expectToken(.identifier);
-    // TODO
-    const type_expr = null_node; //if (self.consume(.colon) != null) try self.expectTypeExpr() else null_node;
-    const initializer = if (self.consume(.equal) != null) try self.expectExpr() else null_node;
+// TODO: return should always be `()` or add a way to ignore the return value
+// and consider that everything is an expression that returns `()` by default
+/// ExprStmt <- Expr NEWLINE
+fn expectExprStmt(self: *Parser) Error!Node.Index {
+    const expr = try self.parseExpr();
+    if (expr == null_node) {
+        return self.fail(.expected_expr);
+    }
+    try self.expectNewline(.expected_newline_after_stmt, true);
+    return expr;
+}
 
-    if (type_expr == null_node and initializer == null_node) {
-        return self.failExpected(.equal);
+fn expectDeclExprStmtRecoverable(self: *Parser) Error!Node.Index {
+    while (true) {
+        switch (self.token_tags[self.tok_i]) {
+            .r_brace => return null_node,
+            .eof => return error.ParseError,
+            .keyword_let => {
+                return self.expectDecl() catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    error.ParseError => {
+                        self.synchronize();
+                        continue;
+                    },
+                };
+            },
+            else => {
+                return self.expectExprStmt() catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    error.ParseError => {
+                        self.synchronize();
+                        continue;
+                    },
+                };
+            },
+        }
+    }
+}
+
+const Precedence = enum(i8) {
+    none = -1,
+    assignment = 0,
+    // range
+    piped_call = 10,
+    bool_or = 20,
+    bool_and = 30,
+    comparison = 40,
+    bitwise = 50,
+    shift = 60,
+    term = 70,
+    factor = 80,
+    // as / cast
+    unary = 90,
+    null_coalescing = 100,
+    call = 110,
+    primary = 120,
+    _,
+};
+
+const Assoc = enum {
+    left,
+    // right,
+    none,
+};
+
+const Rule = struct {
+    prec: Precedence,
+    tag: Node.Tag,
+    assoc: Assoc = .left,
+};
+
+const rules = std.enums.directEnumArrayDefault(Token.Tag, Rule, .{ .prec = .none, .tag = .root }, 0, .{
+    .pipe_arrow = .{ .prec = .piped_call, .tag = .function_pipe },
+
+    .keyword_or = .{ .prec = .bool_or, .tag = .bool_or },
+
+    .keyword_and = .{ .prec = .bool_and, .tag = .bool_and },
+
+    .equal_equal = .{ .prec = .comparison, .tag = .equal_equal, .assoc = .none },
+    .bang_equal = .{ .prec = .comparison, .tag = .bang_equal, .assoc = .none },
+    .l_angle_bracket = .{ .prec = .comparison, .tag = .less_than, .assoc = .none },
+    .r_angle_bracket = .{ .prec = .comparison, .tag = .greater_than, .assoc = .none },
+    .l_angle_bracket_equal = .{ .prec = .comparison, .tag = .less_or_equal, .assoc = .none },
+    .r_angle_bracket_equal = .{ .prec = .comparison, .tag = .greater_or_equal, .assoc = .none },
+
+    .ampersand = .{ .prec = .bitwise, .tag = .bit_and },
+    .caret = .{ .prec = .bitwise, .tag = .bit_xor },
+    .pipe = .{ .prec = .bitwise, .tag = .bit_or },
+
+    .l_angle_bracket_angle_bracket = .{ .prec = .shift, .tag = .shl },
+    .r_angle_bracket_angle_bracket = .{ .prec = .shift, .tag = .shr },
+
+    .plus = .{ .prec = .term, .tag = .add },
+    .minus = .{ .prec = .term, .tag = .sub },
+
+    .asterisk = .{ .prec = .factor, .tag = .mul },
+    .slash = .{ .prec = .factor, .tag = .div },
+    .percent = .{ .prec = .factor, .tag = .mod },
+
+    .question_mark_question_mark = .{ .prec = .null_coalescing, .tag = .optional_fallback },
+});
+
+fn parseExprPrecedence(self: *Parser, min_prec: Precedence) Error!Node.Index {
+    std.debug.assert(@intFromEnum(min_prec) >= 0);
+    var node = try self.parsePrefixExpr();
+    if (node == null_node) {
+        return null_node;
     }
 
-    try self.expectNewline(.expected_newline_after_decl, true);
+    var banned_prec: Precedence = .none;
 
+    while (true) {
+        const tok_tag = self.token_tags[self.tok_i];
+        const rule = rules[@intFromEnum(tok_tag)];
+        if (@intFromEnum(rule.prec) < @intFromEnum(min_prec)) {
+            return node;
+        }
+        if (@intFromEnum(rule.prec) == @intFromEnum(banned_prec)) {
+            return self.fail(.chained_comparison_operators);
+        }
+
+        const op_token = self.nextToken();
+        const rhs = try self.parseExprPrecedence(@enumFromInt(@intFromEnum(rule.prec) + 1));
+        if (rhs == null_node) {
+            try self.warn(.expected_expr);
+            return node;
+        }
+
+        {
+            const tok_len = tok_tag.lexeme().?.len;
+            const char_before = self.source[self.token_starts[op_token] - 1];
+            const char_after = self.source[self.token_starts[op_token] + tok_len];
+            if (tok_tag == .ampersand and char_after == '&') {
+                // warn about '&&' being used instead of 'and'
+                try self.warnMsg(.{ .tag = .invalid_ampersand_ampersand, .token = op_token });
+            } else if (std.ascii.isWhitespace(char_before) != std.ascii.isWhitespace(char_after)) {
+                try self.warnMsg(.{ .tag = .mismatched_binary_op_whitespace, .token = op_token });
+            }
+        }
+
+        node = try self.addNode(.{
+            .tag = rule.tag,
+            .main_token = op_token,
+            .data = .{
+                .lhs = node,
+                .rhs = rhs,
+            },
+        });
+
+        if (rule.assoc == .none) {
+            banned_prec = rule.prec;
+        }
+    }
+}
+
+/// PrefixExpr <- PrefixOp* PrimaryExpr
+/// PrefixOp <- EXCLAMATIONMARK / MINUS / TILDE
+fn parsePrefixExpr(self: *Parser) Error!Node.Index {
+    const tag: Node.Tag = switch (self.token_tags[self.tok_i]) {
+        .bang => .bool_not,
+        .minus => .negation,
+        .tilde => .bit_not,
+        // .keyword_try => .@"try",
+        // .keyword_await => .@"await",
+        else => return self.parsePrimaryExpr(),
+    };
     return self.addNode(.{
-        .tag = .local_decl,
-        .main_token = let_token,
+        .tag = tag,
+        .main_token = self.nextToken(),
         .data = .{
-            .lhs = @bitCast(Node.Decl{
-                .mutable = is_mut,
-                .type_node = @intCast(type_expr),
-            }),
-            .rhs = initializer,
+            .lhs = try self.expectPrefixExpr(),
+            .rhs = undefined,
         },
     });
 }
 
-// TODO: parseExprPrec(0)
-fn parseExpr(self: *Parser) Error!Node.Index {
+fn expectPrefixExpr(self: *Parser) Error!Node.Index {
+    const node = try self.parsePrefixExpr();
+    if (node == null_node) {
+        return self.fail(.expected_prefix_expr);
+    }
+    return node;
+}
+
+// TODO
+/// PrimaryExpr
+///     <- IfExpr
+///      / KEYWORD_break BreakLabel? Expr?
+///      / KEYWORD_continue BreakLabel?
+///      / KEYWORD_return Expr?
+///      / BlockLabel? LoopExpr
+///      / Block
+///      / CurlySuffixExpr
+fn parsePrimaryExpr(self: *Parser) Error!Node.Index {
     switch (self.token_tags[self.tok_i]) {
+        .keyword_if => return self.expectIfExpr(),
+        .keyword_break => return self.addNode(.{
+            .tag = .@"break",
+            .main_token = self.nextToken(),
+            .data = .{
+                .lhs = try self.parseBreakLabel(),
+                .rhs = try self.parseExpr(),
+            },
+        }),
+        .keyword_continue => return self.addNode(.{
+            .tag = .@"continue",
+            .main_token = self.nextToken(),
+            .data = .{
+                .lhs = try self.parseBreakLabel(),
+                .rhs = undefined,
+            },
+        }),
+        .keyword_return => return self.addNode(.{
+            .tag = .@"return",
+            .main_token = self.nextToken(),
+            .data = .{
+                .lhs = try self.parseExpr(),
+                .rhs = undefined,
+            },
+        }),
+        // keyword_nosuspend
+        // keyword_resume
+        // TODO: loop + block label here or everytime before a block?
+        .identifier => {
+            if (self.token_tags[self.tok_i + 1] == .colon) {
+                switch (self.token_tags[self.tok_i + 2]) {
+                    // .keyword_for => {
+                    //     self.tok_i += 2;
+                    //     return self.parseForExpr();
+                    // },
+                    // .keyword_while => {
+                    //     self.tok_i += 2;
+                    //     return self.parseWhileExpr();
+                    // },
+                    .l_brace => {
+                        self.tok_i += 2;
+                        return self.parseBlock();
+                    },
+                    else => unreachable, //return self.parseCurlySuffixExpr(),
+                }
+            } else {
+                // TODO
+                // return self.parseCurlySuffixExpr();
+                return self.addNode(.{
+                    .tag = .identifier,
+                    .main_token = self.nextToken(),
+                    .data = .{
+                        .lhs = undefined,
+                        .rhs = undefined,
+                    },
+                });
+            }
+        },
+        // .keyword_for => return self.parseForExpr(),
+        // .keyword_while => return self.parseWhileExpr(),
+        // .keyword_match => return self.parseMatchExpr(),
+        .l_brace => return self.parseBlock(),
+        // .keyword_enum, .keyword_struct, .keyword_union => {
+        //     // TODO: warn
+        // },
+
+        // else => return self.parseCurlySuffixExpr(),
         .int_literal => return self.addNode(.{
             .tag = .int_literal,
             .main_token = self.nextToken(),
@@ -199,40 +434,135 @@ fn parseExpr(self: *Parser) Error!Node.Index {
                 .rhs = undefined,
             },
         }),
-        else => unreachable,
+        else => {
+            std.log.debug("parsePrimaryExpr: {}", .{self.token_tags[self.tok_i]});
+            unreachable;
+        },
     }
 }
 
-fn expectExpr(self: *Parser) Error!Node.Index {
-    const node = try self.parseExpr();
-    if (node == null_node) {
-        return self.fail(.expected_expr);
-    } else {
-        return node;
+/// IfExpr <- KEYWORD_if Expr Block (KEYWORD_else (IfExpr / Block))?
+fn expectIfExpr(self: *Parser) Error!Node.Index {
+    const if_token = self.assertToken(.keyword_if);
+    const condition = try self.expectExpr();
+    const then_expr = try expectBlock(self);
+
+    if (self.consume(.keyword_else) == null) {
+        return self.addNode(.{
+            .tag = .@"if",
+            .main_token = if_token,
+            .data = .{
+                .lhs = condition,
+                .rhs = then_expr,
+            },
+        });
+    }
+
+    const else_expr = if (self.token_tags[self.tok_i] == .keyword_if)
+        try self.expectIfExpr()
+    else
+        try self.expectBlock();
+
+    return self.addNode(.{
+        .tag = .if_else,
+        .main_token = if_token,
+        .data = .{
+            .lhs = condition,
+            .rhs = try self.addExtra(Node.If{
+                .then_expr = then_expr,
+                .else_expr = else_expr,
+            }),
+        },
+    });
+}
+
+/// BreakLabel <- COLON IDENTIFIER
+fn parseBreakLabel(self: *Parser) Error!TokenIndex {
+    _ = self.consume(.colon) orelse return null_node;
+    return self.expectToken(.identifier);
+}
+
+/// Block <- LBRACE (Decl | ExprStmt)* RBRACE
+fn parseBlock(self: *Parser) Error!Node.Index {
+    const lbrace = self.consume(.l_brace) orelse return null_node;
+    const scratch_top = self.scratch.items.len;
+    defer self.scratch.shrinkRetainingCapacity(scratch_top);
+    // TODO: almost same as parseTopLevel
+    while (true) {
+        switch (self.token_tags[self.tok_i]) {
+            .newline => self.tok_i += 1,
+            .r_brace => break,
+            .eof => return self.failExpected(.r_brace),
+            .keyword_let => {
+                const decl = self.expectDecl() catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    error.ParseError => {
+                        self.synchronize();
+                        continue;
+                    },
+                };
+                try self.scratch.append(self.allocator, decl);
+            },
+            else => {
+                const expr_stmt = self.expectExprStmt() catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    error.ParseError => {
+                        self.synchronize();
+                        continue;
+                    },
+                };
+                try self.scratch.append(self.allocator, expr_stmt);
+            },
+        }
+    }
+    _ = try self.expectToken(.r_brace);
+    const statements = self.scratch.items[scratch_top..];
+    switch (statements.len) {
+        0 => return self.addNode(.{
+            .tag = .block_two,
+            .main_token = lbrace,
+            .data = .{
+                .lhs = 0,
+                .rhs = 0,
+            },
+        }),
+        1 => return self.addNode(.{
+            .tag = .block_two,
+            .main_token = lbrace,
+            .data = .{
+                .lhs = statements[0],
+                .rhs = 0,
+            },
+        }),
+        2 => return self.addNode(.{
+            .tag = .block_two,
+            .main_token = lbrace,
+            .data = .{
+                .lhs = statements[0],
+                .rhs = statements[1],
+            },
+        }),
+        else => {
+            const span = try self.listToSpan(statements);
+            return self.addNode(.{
+                .tag = .block,
+                .main_token = lbrace,
+                .data = .{
+                    .lhs = span.start,
+                    .rhs = span.end,
+                },
+            });
+        },
     }
 }
 
-// TODO: Precedence, Assoc, Rule, rules
-// fn parseExprPrec(self: *Parser, min_prec: u8) Error!Node.Index {
-//     var lhs = try self.parsePrefixExpr();
-//     while (true) {
-//         const op = self.token_tags[self.tok_i];
-//         const prec = self.getOpPrecedence(op);
-//         if (prec < min_prec) {
-//             break;
-//         }
-//         self.tok_i += 1;
-//         const rhs = try self.parseExprPrec(prec + 1);
-//         lhs = self.addNode(.{
-//             .binary = .{
-//                 .lhs = lhs,
-//                 .rhs = rhs,
-//                 .op = op,
-//             },
-//         });
-//     }
-//     return lhs;
-// }
+fn expectBlock(self: *Parser) Error!Node.Index {
+    const block = try self.parseBlock();
+    if (block == null_node) {
+        return self.fail(.expected_block);
+    }
+    return block;
+}
 
 fn listToSpan(self: *Parser, list: []const Node.Index) Error!Node.SubRange {
     try self.extra_data.appendSlice(self.allocator, list);
@@ -253,7 +583,7 @@ fn addExtra(self: *Parser, extra: anytype) Error!Node.Index {
     try self.extra_data.ensureUnusedCapacity(self.allocator, fields.len);
     const result: Node.Index = @intCast(self.extra_data.items.len);
     inline for (fields) |field| {
-        comptime assert(field.type == Node.Index);
+        comptime std.debug.assert(field.type == Node.Index);
         self.extra_data.appendAssumeCapacity(@field(extra, field.name));
     }
     return result;
@@ -302,6 +632,40 @@ fn assertToken(self: *Parser, tag: Token.Tag) TokenIndex {
     const token = self.nextToken();
     std.debug.assert(self.token_tags[token] == tag);
     return token;
+}
+
+fn synchronize(self: *Parser) void {
+    var level: usize = 0;
+    while (true) {
+        const tok = self.nextToken();
+        switch (self.token_tags[tok]) {
+            .l_brace => level += 1,
+            .r_brace => {
+                if (level == 0) {
+                    self.tok_i -= 1;
+                    return;
+                }
+                level -= 1;
+            },
+            .newline => {
+                if (level == 0) {
+                    return;
+                }
+            },
+            .eof => {
+                self.tok_i -= 1;
+                return;
+            },
+            else => {},
+        }
+    }
+    while (self.token_tags[self.tok_i] != .eof) {
+        if (self.token_tags[self.tok_i] == .newline) {
+            self.tok_i += 1;
+            return;
+        }
+        self.tok_i += 1;
+    }
 }
 
 fn warnExpected(self: *Parser, expected_token: Token.Tag) Error!void {

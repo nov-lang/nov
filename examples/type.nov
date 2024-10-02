@@ -1,0 +1,19 @@
+; The syntax is still very experimental
+
+let std = @import("std")
+
+let MyInt = int
+
+let MyType = struct {
+    pub x: MyInt = 0
+    priv y: string = "hello"
+    z: bool, ; default is private
+
+    ; `self` is present in all container methods and represents the instance
+    let pub print = () -> void {
+        std.io.println("x: {self.x}, y: {self.y}. z: {self.z}")
+    }
+}
+
+let item: MyType = .{ .x = 5, .z = true }
+item.print()

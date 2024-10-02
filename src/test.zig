@@ -7,8 +7,17 @@ pub fn main() !void {
     // (* (- 123) (group 45.67))
     // const source = "-123 * (45.67)\n";
     const source =
-        \\let x = 3
-        \\let priv mut y = 4
+        \\let x = -3
+        \\let pub mut y = 4
+        \\let z = blk: {
+        \\    let a = 3
+        \\    if a == 3 {
+        \\        break :blk 3 + 4
+        \\    } else {
+        \\        3 + 4
+        \\    }
+        \\    x + y
+        \\}
         \\
     ;
     // const source =

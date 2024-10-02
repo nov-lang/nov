@@ -69,13 +69,16 @@ It's fine to keep arena fucked up allocation fest until GC implementation
 - monads, there already here but with specific `>>=` bind function
 - add an FFI with zig and C
 - add `_ =` or `() =` to discard the return of a function and make it mandatory
-  to not ignore the return value from an expression?
+  to not ignore the return value from an expression? (no, these are called
+  expression statement and it's fine to ignore their result just to trigger the
+  side effects of evaluating the expression)
 - add operator overloading?
 - concat string with `++` and mult with `**` instead of same as number
 - replace float operators with `+.`, `-.`, `*.`, `/.`, `%.`
 - compilation error when trying to add/compare value of different type? (at least for non number)
 - remove uint?
 - optimize tail call recursion
+- tree shaking
 
 ## Notes
 - Check previous step of crafting interpreters and implement them with
