@@ -1,5 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const Ast = @import("Ast.zig");
+pub const Error = std.mem.Allocator.Error;
 
 // TODO: wrong way to start I think
 
@@ -8,6 +10,15 @@ const Nir = @This();
 instructions: std.MultiArrayList(Inst).Slice,
 // string_bytes: []u8,
 // extra: []u32,
+
+pub fn generate(allocator: std.mem.Allocator, ast: Ast) Error!Nir {
+    _ = allocator;
+
+    for (ast.rootStmts()) |stmt| {
+        _ = stmt;
+    }
+    unreachable;
+}
 
 pub const Inst = struct {
     tag: Tag,

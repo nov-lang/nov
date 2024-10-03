@@ -8,6 +8,7 @@ const Ast = @import("Ast.zig");
 const Node = Ast.Node;
 const TokenIndex = Ast.TokenIndex;
 const null_node: Node.Index = 0;
+const Error = error{ParseError} || std.mem.Allocator.Error;
 
 const Parser = @This();
 
@@ -21,9 +22,7 @@ extra_data: std.ArrayListUnmanaged(Node.Index),
 errors: std.ArrayListUnmanaged(Ast.Error),
 scratch: std.ArrayListUnmanaged(Node.Index),
 
-pub const Error = error{ParseError} || std.mem.Allocator.Error;
-
-pub fn parse(allocator: std.mem.Allocator, source: [:0]const u8) Error!Ast {
+pub fn parse(allocator: std.mem.Allocator, source: [:0]const u8) std.mem.Allocator.Error!Ast {
     var tokens: Ast.TokenList = .{};
     defer tokens.deinit(allocator);
 
@@ -80,8 +79,8 @@ pub fn parse(allocator: std.mem.Allocator, source: [:0]const u8) Error!Ast {
     };
 }
 
-/// TopLevel <- (Decl | ExprStmt)*
-fn parseTopLevel(self: *Parser) Error!void {
+/// TopLevel <- Stmt*
+fn parseTopLevel(self: *Parser) std.mem.Allocator.Error!void {
     while (true) {
         switch (self.token_tags[self.tok_i]) {
             .eof => {
@@ -90,25 +89,15 @@ fn parseTopLevel(self: *Parser) Error!void {
             .newline => {
                 self.tok_i += 1;
             },
-            .keyword_let => {
-                const decl = self.expectDecl() catch |err| switch (err) {
-                    error.OutOfMemory => return err,
-                    error.ParseError => {
-                        self.synchronize();
-                        continue;
-                    },
-                };
-                try self.scratch.append(self.allocator, decl);
-            },
             else => {
-                const expr = self.expectExprStmt() catch |err| switch (err) {
-                    error.OutOfMemory => return err,
+                const stmt = self.expectStmt() catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
                     error.ParseError => {
                         self.synchronize();
                         continue;
                     },
                 };
-                try self.scratch.append(self.allocator, expr);
+                try self.scratch.append(self.allocator, stmt);
             },
         }
     }
@@ -118,6 +107,14 @@ fn parseTopLevel(self: *Parser) Error!void {
         .lhs = root_span.start,
         .rhs = root_span.end,
     };
+}
+
+/// Stmt <- Decl / ExprStmt
+fn expectStmt(self: *Parser) Error!Node.Index {
+    switch (self.token_tags[self.tok_i]) {
+        .keyword_let => return self.expectDecl(),
+        else => return self.expectExprStmt(),
+    }
 }
 
 /// Decl <- DeclProto (EQUAL Expr)? NEWLINE
@@ -174,33 +171,6 @@ fn expectExprStmt(self: *Parser) Error!Node.Index {
     }
     try self.expectNewline(.expected_newline_after_stmt, true);
     return expr;
-}
-
-fn expectDeclExprStmtRecoverable(self: *Parser) Error!Node.Index {
-    while (true) {
-        switch (self.token_tags[self.tok_i]) {
-            .r_brace => return null_node,
-            .eof => return error.ParseError,
-            .keyword_let => {
-                return self.expectDecl() catch |err| switch (err) {
-                    error.OutOfMemory => return err,
-                    error.ParseError => {
-                        self.synchronize();
-                        continue;
-                    },
-                };
-            },
-            else => {
-                return self.expectExprStmt() catch |err| switch (err) {
-                    error.OutOfMemory => return err,
-                    error.ParseError => {
-                        self.synchronize();
-                        continue;
-                    },
-                };
-            },
-        }
-    }
 }
 
 const Precedence = enum(i8) {
@@ -487,31 +457,20 @@ fn parseBlock(self: *Parser) Error!Node.Index {
     const lbrace = self.consume(.l_brace) orelse return null_node;
     const scratch_top = self.scratch.items.len;
     defer self.scratch.shrinkRetainingCapacity(scratch_top);
-    // TODO: almost same as parseTopLevel
     while (true) {
         switch (self.token_tags[self.tok_i]) {
             .newline => self.tok_i += 1,
             .r_brace => break,
             .eof => return self.failExpected(.r_brace),
-            .keyword_let => {
-                const decl = self.expectDecl() catch |err| switch (err) {
-                    error.OutOfMemory => return err,
-                    error.ParseError => {
-                        self.synchronize();
-                        continue;
-                    },
-                };
-                try self.scratch.append(self.allocator, decl);
-            },
             else => {
-                const expr_stmt = self.expectExprStmt() catch |err| switch (err) {
+                const stmt = self.expectStmt() catch |err| switch (err) {
                     error.OutOfMemory => return err,
                     error.ParseError => {
                         self.synchronize();
                         continue;
                     },
                 };
-                try self.scratch.append(self.allocator, expr_stmt);
+                try self.scratch.append(self.allocator, stmt);
             },
         }
     }
@@ -564,7 +523,7 @@ fn expectBlock(self: *Parser) Error!Node.Index {
     return block;
 }
 
-fn listToSpan(self: *Parser, list: []const Node.Index) Error!Node.SubRange {
+fn listToSpan(self: *Parser, list: []const Node.Index) std.mem.Allocator.Error!Node.SubRange {
     try self.extra_data.appendSlice(self.allocator, list);
     return .{
         .start = @intCast(self.extra_data.items.len - list.len),
@@ -658,13 +617,6 @@ fn synchronize(self: *Parser) void {
             },
             else => {},
         }
-    }
-    while (self.token_tags[self.tok_i] != .eof) {
-        if (self.token_tags[self.tok_i] == .newline) {
-            self.tok_i += 1;
-            return;
-        }
-        self.tok_i += 1;
     }
 }
 

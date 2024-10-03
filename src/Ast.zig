@@ -1,12 +1,6 @@
 // Originally based on https://github.com/ziglang/zig/blob/master/lib/std/zig/Ast.zig
 // See https://github.com/ziglang/zig/blob/master/LICENSE for additional LICENSE details
 
-// TODO:
-// firstToken()
-// lastToken()
-// full etc...
-// errors
-
 const std = @import("std");
 const v = @import("value.zig");
 const Parser = @import("Parser.zig");
@@ -98,7 +92,7 @@ pub fn tokenSlice(self: Ast, token_index: TokenIndex) []const u8 {
     };
     const token = tokenizer.next();
     assert(token.tag == token_tag);
-    return self.source[token.loc.start..token.loc.end];
+    return self.source[token.start..token.end];
 }
 
 pub fn extraData(tree: Ast, index: usize, comptime T: type) T {
@@ -111,7 +105,7 @@ pub fn extraData(tree: Ast, index: usize, comptime T: type) T {
     return result;
 }
 
-pub fn rootDecls(self: Ast) []const Node.Index {
+pub fn rootStmts(self: Ast) []const Node.Index {
     // Root is always index 0.
     const nodes_data = self.nodes.items(.data);
     return self.extra_data[nodes_data[0].lhs..nodes_data[0].rhs];
@@ -331,9 +325,8 @@ pub fn renderError(self: Ast, parse_error: Error, writer: anytype) !void {
     }
 }
 
-// TODO
 pub fn firstToken(self: Ast, node: Node.Index) TokenIndex {
-    const tags = self.nodes.items(.tag);
+    const tags: []const Node.Tag = self.nodes.items(.tag);
     const datas = self.nodes.items(.data);
     const main_tokens = self.nodes.items(.main_token);
     var n = node;
@@ -341,6 +334,7 @@ pub fn firstToken(self: Ast, node: Node.Index) TokenIndex {
         .root => return 0,
         .no_op => unreachable,
 
+        .decl,
         .bool_not,
         .negation,
         .bit_not,
@@ -352,37 +346,18 @@ pub fn firstToken(self: Ast, node: Node.Index) TokenIndex {
         .@"break",
         .@"return",
         .identifier,
+        .bool_literal,
         .int_literal,
         .float_literal,
         .string_literal,
         .multiline_string_literal,
         .grouped_expression,
-        .slice_type,
         .block_two,
         .block,
-        // .container_decl,
-        // .container_decl_two,
-        // .container_decl_arg,
         .loop,
-        // .while_simple,
-        // .while_cont,
-        // .@"while",
-        // .for_simple,
-        // .@"for",
-
-        // change if adding pub keyword
-        .fn_decl,
-        .fn_proto_one,
-        .fn_proto,
-        .var_decl,
-        .mut_var_decl,
+        .fn_args_one,
+        .fn_args,
         => return main_tokens[n],
-
-        .slice_init_dot,
-        .slice_init_dot_two,
-        // .struct_init_dot,
-        // .struct_init_dot_two,
-        => return main_tokens[n] - 1,
 
         .field_access,
         .unwrap_optional,
@@ -416,46 +391,24 @@ pub fn firstToken(self: Ast, node: Node.Index) TokenIndex {
         .optional_fallback,
         .bool_and,
         .bool_or,
-        .slice_open,
-        .slice,
-        .slice_access,
-        .slice_init_one,
-        .slice_init,
-        // .struct_init_one,
-        // .struct_init,
         .call_one,
         .call,
         .match_range,
-        // .for_range,
-        .pipe,
-        .lambda,
+        .function_pipe,
+        .fn_proto,
+        .fn_decl_noreturn,
+        .fn_decl,
         => n = datas[n].lhs,
 
-        // .assign_destructure => {
-        //     const extra_idx = datas[n].lhs;
-        //     const lhs_len = self.extra_data[extra_idx];
-        //     assert(lhs_len > 0);
-        //     n = self.extra_data[extra_idx + 1];
-        // },
-
-        // .container_field_init,
-        // .container_field_align,
-        // .container_field,
-        // => {
-        //     const name_token = main_tokens[n];
-        //     if (name_token > 0 and token_tags[name_token - 1] == .keyword_comptime) {
-        //         end_offset += 1;
-        //     }
-        //     return name_token - end_offset;
-        // },
-
         .match_case_one => {
+            // TODO
             if (datas[n].lhs == 0) {
                 return main_tokens[n] - 1; // underscore token
             } else {
                 n = datas[n].lhs;
             }
         },
+
         .match_case => {
             const extra = self.extraData(datas[n].lhs, Node.SubRange);
             assert(extra.end - extra.start > 0);
@@ -464,23 +417,26 @@ pub fn firstToken(self: Ast, node: Node.Index) TokenIndex {
     };
 }
 
-// TODO
 pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
-    const tags = self.nodes.items(.tag);
+    const tags: []const Node.Tag = self.nodes.items(.tag);
     const datas = self.nodes.items(.data);
     const main_tokens = self.nodes.items(.main_token);
     var n = node;
     var end_offset: TokenIndex = 0;
     while (true) switch (tags[n]) {
-        .root => return @as(TokenIndex, @intCast(self.tokens.len - 1)),
+        .root => return @intCast(self.tokens.len - 1),
         .no_op => unreachable,
+        else => {
+            // TODO
+            std.log.debug("Unhandled tag: {}", .{tags[n]});
+            unreachable;
+        },
 
         .bool_not,
         .negation,
         .bit_not,
         .optional_type,
         .loop,
-        .slice_type,
         => n = datas[n].lhs,
 
         .equal_equal,
@@ -500,7 +456,6 @@ pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
         .assign_bit_xor,
         .assign_bit_or,
         .assign,
-        // .assign_destructure,
         .mul,
         .div,
         .mod,
@@ -515,222 +470,44 @@ pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
         .bool_and,
         .bool_or,
         .@"if",
-        // .while_simple,
-        // .for_simple,
         .match_case_one,
         .match_case,
         .match_range,
-        .pipe,
-        .lambda,
+        .function_pipe,
+        .decl,
         => n = datas[n].rhs,
-
-        // .for_range => if (datas[n].rhs != 0) {
-        //     n = datas[n].rhs;
-        // } else {
-        //     return main_tokens[n] + end_offset;
-        // },
 
         .field_access,
         .unwrap_optional,
         .grouped_expression,
         .multiline_string_literal,
-        // .error_value,
         => return datas[n].rhs + end_offset,
 
+        .bool_literal,
         .int_literal,
         .float_literal,
         .identifier,
         .string_literal,
         => return main_tokens[n] + end_offset,
 
-        .@"return" => if (datas[n].lhs != 0) {
-            n = datas[n].lhs;
-        } else {
-            return main_tokens[n] + end_offset;
-        },
-
-        .call,
-        => {
-            end_offset += 1; // for the rparen
-            const params = self.extraData(datas[n].rhs, Node.SubRange);
-            if (params.end - params.start == 0) {
-                return main_tokens[n] + end_offset;
-            }
-            n = self.extra_data[params.end - 1]; // last parameter
-        },
-        .match => {
-            const cases = self.extraData(datas[n].rhs, Node.SubRange);
-            if (cases.end - cases.start == 0) {
-                end_offset += 3; // rparen, lbrace, rbrace
-                n = datas[n].lhs; // condition expression
-            } else {
-                end_offset += 1; // for the rbrace
-                n = self.extra_data[cases.end - 1]; // last case
-            }
-        },
-        // .container_decl_arg => {
-        //     const members = self.extraData(datas[n].rhs, Node.SubRange);
-        //     if (members.end - members.start == 0) {
-        //         end_offset += 3; // for the rparen + lbrace + rbrace
-        //         n = datas[n].lhs;
-        //     } else {
-        //         end_offset += 1; // for the rbrace
-        //         n = self.extra_data[members.end - 1]; // last parameter
-        //     }
-        // },
-        .slice_init,
-        // .struct_init,
-        => {
-            const elements = self.extraData(datas[n].rhs, Node.SubRange);
-            assert(elements.end - elements.start > 0);
-            end_offset += 1; // for the rbrace
-            n = self.extra_data[elements.end - 1]; // last element
-        },
-        .slice_init_dot,
-        .block,
-        // .struct_init_dot,
-        // .container_decl,
-        => {
+        .block => {
             assert(datas[n].rhs - datas[n].lhs > 0);
-            end_offset += 1; // for the rbrace
+            end_offset += 2; // newline rbrace
             n = self.extra_data[datas[n].rhs - 1]; // last statement
         },
-        .call_one,
-        .slice_access,
-        => {
-            end_offset += 1; // for the rparen/rbracket
-            if (datas[n].rhs == 0) {
-                return main_tokens[n] + end_offset;
-            }
-            n = datas[n].rhs;
-        },
-        .slice_init_dot_two,
-        .block_two,
-        // .struct_init_dot_two,
-        // .container_decl_two,
-        => {
-            if (datas[n].rhs != 0) {
-                end_offset += 1; // for the rparen/rbrace
-                n = datas[n].rhs;
-            } else if (datas[n].lhs != 0) {
-                end_offset += 1; // for the rparen/rbrace
-                n = datas[n].lhs;
-            } else {
-                switch (tags[n]) {
-                    .slice_init_dot_two,
-                    .block_two,
-                    // .struct_init_dot_two,
-                    => end_offset += 1, // rbrace
-                    // .container_decl_two => {
-                    //     var i: u32 = 2; // lbrace + rbrace
-                    //     while (token_tags[main_tokens[n] + i] == .container_doc_comment) i += 1;
-                    //     end_offset += i;
-                    // },
-                    else => unreachable,
-                }
-                return main_tokens[n] + end_offset;
-            }
-        },
-        .mut_var_decl, .var_decl => {
-            if (datas[n].rhs != 0) {
-                n = datas[n].rhs;
-            } else if (datas[n].lhs != 0) {
-                n = datas[n].lhs;
-            } else {
-                end_offset += 1; // from `let` token to name
-                return main_tokens[n] + end_offset;
-            }
-        },
-        // .container_field_init => {
-        //     if (datas[n].rhs != 0) {
-        //         n = datas[n].rhs;
-        //     } else if (datas[n].lhs != 0) {
-        //         n = datas[n].lhs;
-        //     } else {
-        //         return main_tokens[n] + end_offset;
-        //     }
-        // },
-        // .container_field_align => {
-        //     if (datas[n].rhs != 0) {
-        //         end_offset += 1; // for the rparen
-        //         n = datas[n].rhs;
-        //     } else if (datas[n].lhs != 0) {
-        //         n = datas[n].lhs;
-        //     } else {
-        //         return main_tokens[n] + end_offset;
-        //     }
-        // },
-        // .container_field => {
-        //     const extra = self.extraData(datas[n].rhs, Node.ContainerField);
-        //     if (extra.value_expr != 0) {
-        //         n = extra.value_expr;
-        //     } else if (extra.align_expr != 0) {
-        //         end_offset += 1; // for the rparen
-        //         n = extra.align_expr;
-        //     } else if (datas[n].lhs != 0) {
-        //         n = datas[n].lhs;
-        //     } else {
-        //         return main_tokens[n] + end_offset;
-        //     }
-        // },
 
-        .slice_init_one,
-        // .struct_init_one,
-        => {
-            end_offset += 1; // rbrace
-            if (datas[n].rhs == 0) {
-                return main_tokens[n] + end_offset;
-            } else {
-                n = datas[n].rhs;
-            }
-        },
-        .slice_open => {
-            end_offset += 2; // ellipsis2 + rbracket, or comma + rparen
-            n = datas[n].rhs;
-            assert(n != 0);
-        },
-        .slice => {
-            const extra = self.extraData(datas[n].rhs, Node.Slice);
-            assert(extra.end != 0); // should have used slice_open
-            end_offset += 1; // rbracket
-            n = extra.end;
-        },
-
-        .@"continue", .@"break" => {
+        .block_two => {
             if (datas[n].rhs != 0) {
+                end_offset += 2; // newline rbrace
                 n = datas[n].rhs;
             } else if (datas[n].lhs != 0) {
-                return datas[n].lhs + end_offset;
+                end_offset += 2; // newline rbrace
+                n = datas[n].lhs;
             } else {
+                end_offset += 1; // rbrace
                 return main_tokens[n] + end_offset;
             }
         },
-        .fn_decl, .fn_proto_one, .fn_proto => {
-            if (datas[n].rhs != 0) {
-                n = datas[n].rhs;
-            } else {
-                n = datas[n].lhs;
-            }
-        },
-        // .while_cont => {
-        //     const extra = self.extraData(datas[n].rhs, Node.WhileCont);
-        //     assert(extra.then_expr != 0);
-        //     n = extra.then_expr;
-        // },
-        // .@"while" => {
-        //     const extra = self.extraData(datas[n].rhs, Node.While);
-        //     assert(extra.else_expr != 0);
-        //     n = extra.else_expr;
-        // },
-        .if_else => {
-            const extra = self.extraData(datas[n].rhs, Node.If);
-            assert(extra.else_expr != 0);
-            n = extra.else_expr;
-        },
-        // .@"for" => {
-        //     const extra = @as(Node.For, @bitCast(datas[n].rhs));
-        //     n = self.extra_data[datas[n].lhs + extra.inputs + @intFromBool(extra.has_else)];
-        // },
     };
 }
 
@@ -1312,8 +1089,10 @@ pub const Node = struct {
         /// `return lhs`. lhs can be omitted. rhs is unused.
         @"return",
         /// `(lhs: rhs)` lhs and rhs can be omitted.
+        /// main_token is the `(`.
         fn_args_one,
         /// `(a: b, c: d)` sub_list[lhs..rhs].
+        /// main_token is the `(`.
         fn_args,
         /// `lhs -> rhs`.
         /// lhs is fn_args. rhs can be omitted.
