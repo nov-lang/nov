@@ -125,8 +125,7 @@ fn expectDecl(self: *Parser) Error!Node.Index {
     const is_mut = self.consume(.keyword_mut) != null;
 
     _ = try self.expectToken(.identifier);
-    // TODO
-    const type_expr = null_node; //if (self.consume(.colon) != null) try self.expectTypeExpr() else null_node;
+    const type_expr = if (self.consume(.colon) != null) try self.expectTypeExpr() else null_node;
     const initializer = if (self.consume(.equal) != null) try self.expectExpr() else null_node;
 
     if (type_expr == null_node and initializer == null_node) {
@@ -372,19 +371,10 @@ fn parsePrimaryExpr(self: *Parser) Error!Node.Index {
                         self.tok_i += 2;
                         return self.parseBlock();
                     },
-                    else => unreachable, //return self.parseCurlySuffixExpr(),
+                    else => return self.parseCurlySuffixExpr(),
                 }
             } else {
-                // TODO
-                // return self.parseCurlySuffixExpr();
-                return self.addNode(.{
-                    .tag = .identifier,
-                    .main_token = self.nextToken(),
-                    .data = .{
-                        .lhs = undefined,
-                        .rhs = undefined,
-                    },
-                });
+                return self.parseCurlySuffixExpr();
             }
         },
         // .keyword_for => return self.parseForExpr(),
@@ -395,19 +385,7 @@ fn parsePrimaryExpr(self: *Parser) Error!Node.Index {
         //     // TODO: warn
         // },
 
-        // else => return self.parseCurlySuffixExpr(),
-        .int_literal => return self.addNode(.{
-            .tag = .int_literal,
-            .main_token = self.nextToken(),
-            .data = .{
-                .lhs = undefined,
-                .rhs = undefined,
-            },
-        }),
-        else => {
-            std.log.debug("parsePrimaryExpr: {}", .{self.token_tags[self.tok_i]});
-            unreachable;
-        },
+        else => return self.parseCurlySuffixExpr(),
     }
 }
 
@@ -521,6 +499,212 @@ fn expectBlock(self: *Parser) Error!Node.Index {
         return self.fail(.expected_block);
     }
     return block;
+}
+
+// TODO: define InitList
+/// CurlySuffixExpr <- TypeExpr InitList?
+///
+/// InitList
+///     <- LBRACE FieldInit (COMMA FieldInit)* COMMA? RBRACE
+///      / LBRACE Expr (COMMA Expr)* COMMA? RBRACE
+///      / LBRACE RBRACE
+fn parseCurlySuffixExpr(self: *Parser) Error!Node.Index {
+    const lhs = try self.parseTypeExpr();
+    return lhs;
+    // TODO
+}
+
+/// TypeExpr <- PrefixTypeOp* SuffixExpr
+/// PrefixTypeOp <- QUESTIONMARK / ArrayTypeStart
+/// ArrayTypeStart <- LBRACKET RBRACKET
+fn parseTypeExpr(self: *Parser) Error!Node.Index {
+    switch (self.token_tags[self.tok_i]) {
+        .question_mark => return self.addNode(.{
+            .tag = .optional_type,
+            .main_token = self.nextToken(),
+            .data = .{
+                .lhs = try self.expectTypeExpr(),
+                .rhs = undefined,
+            },
+        }),
+        // TODO
+        // .l_bracket => {
+        //     const lbracket = self.nextToken();
+        //     _ = try self.expectToken(.r_bracket);
+        //     return self.addNode(.{
+        //         .tag = .slice_type,
+        //         .main_token = lbracket,
+        //         .data = .{
+        //             .lhs = try self.expectTypeExpr(),
+        //             .rhs = undefined,
+        //         },
+        //     });
+        // },
+        else => return self.parseSuffixExpr(),
+    }
+}
+
+fn expectTypeExpr(self: *Parser) Error!Node.Index {
+    const node = try self.parseTypeExpr();
+    if (node == null_node) {
+        return self.fail(.expected_type_expr);
+    }
+    return node;
+}
+
+// TODO
+/// SuffixExpr <- PrimaryTypeExpr (SuffixOp / FnCallArguments)*
+/// FnCallArguments <- LPAREN ExprList RPAREN
+/// ExprList <- (Expr COMMA)* Expr?
+fn parseSuffixExpr(self: *Parser) Error!Node.Index {
+    var res = try self.parsePrimaryTypeExpr();
+    if (res == null_node) {
+        return null_node;
+    }
+
+    while (true) {
+        const suffix_op = try self.parseSuffixOp(res);
+        if (suffix_op != null_node) {
+            res = suffix_op;
+            continue;
+        }
+        const lparen = self.consume(.l_paren) orelse return res;
+        const scratch_top = self.scratch.items.len;
+        defer self.scratch.shrinkRetainingCapacity(scratch_top);
+        while (true) {
+            if (self.consume(.r_paren)) |_| break;
+            const param = try self.expectExpr();
+            try self.scratch.append(self.allocator, param);
+            switch (self.token_tags[self.tok_i]) {
+                .comma => self.tok_i += 1,
+                .r_paren => {
+                    self.tok_i += 1;
+                    break;
+                },
+                .colon, .r_brace, .r_bracket => return self.failExpected(.r_paren),
+                // Likely just a missing comma; give error but continue parsing.
+                else => try self.warn(.expected_comma_after_arg),
+            }
+        }
+        const params = self.scratch.items[scratch_top..];
+        res = switch (params.len) {
+            0 => try self.addNode(.{
+                .tag = .call_one,
+                .main_token = lparen,
+                .data = .{
+                    .lhs = res,
+                    .rhs = null_node,
+                },
+            }),
+            1 => try self.addNode(.{
+                .tag = .call_one,
+                .main_token = lparen,
+                .data = .{
+                    .lhs = res,
+                    .rhs = params[0],
+                },
+            }),
+            else => try self.addNode(.{
+                .tag = .call,
+                .main_token = lparen,
+                .data = .{
+                    .lhs = res,
+                    .rhs = try self.addExtra(try self.listToSpan(params)),
+                },
+            }),
+        };
+    }
+}
+
+// TODO: add doc comment
+// TODO: complete all cases
+/// TupleTypeExpr <- LPAREN TypeExpr (COMMA TypeExpr)* RPAREN // TODO
+fn parsePrimaryTypeExpr(self: *Parser) Error!Node.Index {
+    switch (self.token_tags[self.tok_i]) {
+        .keyword_true, .keyword_false => return self.addNode(.{
+            .tag = .bool_literal,
+            .main_token = self.nextToken(),
+            .data = .{
+                .lhs = undefined,
+                .rhs = undefined,
+            },
+        }),
+        .int_literal => return self.addNode(.{
+            .tag = .int_literal,
+            .main_token = self.nextToken(),
+            .data = .{
+                .lhs = undefined,
+                .rhs = undefined,
+            },
+        }),
+        .float_literal => return self.addNode(.{
+            .tag = .float_literal,
+            .main_token = self.nextToken(),
+            .data = .{
+                .lhs = undefined,
+                .rhs = undefined,
+            },
+        }),
+        .string_literal => {
+            return self.addNode(.{
+                .tag = .string_literal,
+                .main_token = self.nextToken(),
+                .data = .{
+                    .lhs = undefined,
+                    .rhs = undefined,
+                },
+            });
+        },
+        .identifier => { // TODO check if is fn
+            return self.addNode(.{
+                .tag = .identifier,
+                .main_token = self.nextToken(),
+                .data = .{
+                    .lhs = undefined,
+                    .rhs = undefined,
+                },
+            });
+        },
+        // .keyword_if => return self.parseIf(expectTypeExpr), // TODO: why separate expr and type expr?
+        .multiline_string_literal_line => {
+            const first_line = self.nextToken();
+            while (self.token_tags[self.tok_i] == .multiline_string_literal_line) {
+                self.tok_i += 1;
+            }
+            return self.addNode(.{
+                .tag = .multiline_string_literal,
+                .main_token = first_line,
+                .data = .{
+                    .lhs = first_line,
+                    .rhs = self.tok_i - 1,
+                },
+            });
+        },
+        .l_paren => {
+            // TODO: handle function
+            // TODO: handle tuple
+            return self.addNode(.{
+                .tag = .grouped_expression,
+                .main_token = self.nextToken(),
+                .data = .{
+                    .lhs = try self.expectExpr(),
+                    .rhs = try self.expectToken(.r_paren),
+                },
+            });
+        },
+        else => return null_node,
+    }
+}
+
+// TODO
+/// SuffixOp
+///     <- LBRACKET Expr (DOT2 Expr?)? RBRACKET
+///      / DOT IDENTIFIER
+///      / DOTQUESTIONMARK // TODO: replace with EXCLAMATIONMARK or QUESTIONMARK
+fn parseSuffixOp(self: *Parser, lhs: Node.Index) Error!Node.Index {
+    _ = self;
+    _ = lhs;
+    return null_node;
 }
 
 fn listToSpan(self: *Parser, list: []const Node.Index) std.mem.Allocator.Error!Node.SubRange {

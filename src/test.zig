@@ -8,7 +8,7 @@ pub fn main() !void {
     // const source = "-123 * (45.67)\n";
     const source =
         \\let x = -3
-        \\let pub mut y = 4
+        \\let pub mut y: int = 4
         \\let z = blk: {
         \\    let a = 3
         \\    if a == 3 {

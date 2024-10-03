@@ -55,6 +55,7 @@ pub const Token = struct {
         plus_equal,
         minus,
         minus_equal,
+        minus_caret,
         arrow,
         asterisk,
         asterisk_equal,
@@ -148,6 +149,7 @@ pub const Token = struct {
                 .plus_equal => "+=",
                 .minus => "-",
                 .minus_equal => "-=",
+                .minus_caret => "-^",
                 .arrow => "->",
                 .asterisk => "*",
                 .asterisk_equal => "*=",
@@ -651,6 +653,11 @@ pub fn next(self: *Tokenizer) Token {
                 },
                 '>' => {
                     result.tag = .arrow;
+                    self.index += 1;
+                    break;
+                },
+                '^' => {
+                    result.tag = .minus_caret;
                     self.index += 1;
                     break;
                 },
