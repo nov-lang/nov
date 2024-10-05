@@ -1,18 +1,12 @@
 ; std contains the `println` function
-import "std"
+let std = @import("std")
 
-let fibo = (x: int) -> {
-    match x {
-        0, 1 => x
-        _ => fibo(x - 1) + fibo(x - 2)
+let fibo = (n: int) -> int {
+    match n {
+        0, 1 => n
+        _ => fibo(n - 1) + fibo(n - 2)
     }
-} -> int
-; idk if we specify the return type or not
-; for a really simple function it would be
-;     let mul = (a: int, b: int) -> a * b -> int
-; or like that for type inferance
-;     let mul = (a, b) -> a * b
-; can accept any type that supports the `*` operator
+}
 
 ; TODO: get the number from the user and use `??` for fallback
 ; also do it async

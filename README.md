@@ -80,6 +80,8 @@ It's fine to keep arena fucked up allocation fest until GC implementation
 - remove uint?
 - optimize tail call recursion
 - tree shaking
+- The polymorphism in [Functions](#Functions) can be too weird and complex
+  maybe just do like zig and accept a type as parameter instead
 
 ## Notes
 - Check previous step of crafting interpreters and implement them with
@@ -94,16 +96,57 @@ It's fine to keep arena fucked up allocation fest until GC implementation
 - No need for parenthesis everywhere (look at rust, go and caml)
 - See [Option](https://doc.rust-lang.org/std/option) and [Result](https://doc.rust-lang.org/std/result) for nil and error
 - See [What are the NO's in GO design?](https://kuree.gitbooks.io/the-go-programming-language-report/content/32/text.html)
-- A file is a module, import module as value like zig?
+- Import file as value like zig
   - `import "std"` or `let std = import "std"`
   - When importing other files only declarations gets imported?
 
 ## Concepts
 
 ### Builtins
-- `@This()`: Same as zig, it's the type of the current container.
-- `@import()`: Import a nov file as module.
+- `@This()`: Same as zig, return the type of the current container.
+- `@import()`: Import a nov file.
 - `@TypeOf(val: any)`: Returns the type of a value.
+- `@print()`: TODO
+- `@panic()`: TODO
+- `@range()`: TODO
+- `@max()`: TODO
+- `@min()`: TODO
+
+### Functions
+```nov
+let doNothing = () -> () {}
+@TypeOf(doNothing) ; returns `() -> ()`
+
+let retNothing = (x: int) -> () {
+    x += 1
+}
+@TypeOf(retNothing) ; returns `(int) -> ()`
+
+let ret2 = () -> int {
+    2
+}
+@TypeOf(ret2) ; returns `() -> int`
+
+;;; Polymorphism
+; This is still conceptual
+let eql = (x, y) -> bool {
+    x == y
+}
+@TypeOf(eql) ; returns `(:a, :a) -> bool`
+
+; `:*` is a special type that corresponds to any type
+let poly = (x, y) -> :* {
+    ; ...
+}
+@TypeOf(poly) ; returns `(:a, :b) -> :c`
+
+; here `:a` can be int, float, string or whatever type that has a definition
+; for the `+` operator
+let add = (x: :a, y: :a) -> :a {
+    x + y
+}
+@TypeOf(add) ; returns `(:a, :a) -> :a`
+```
 
 ### Enum
 Nov enums are just like C enums except that they can have methods and are not
@@ -114,16 +157,18 @@ let MyEnum = enum {
     y = 5
     z ; default to y + 1 = 6
 
-    let eql = (self: @This(), other: @This()) -> self == other -> bool
+    let eql = (self: MyEnum, other: MyEnum) -> bool {
+        self == other
+    }
 }
 
-let x: MyEnum = .x ; TODO: is this notation allowed?
-let y = MyEnum.y
+let x: MyEnum = MyEnum.x
+let y = MyEnum.y ; type is inferred
 x.eql(y) |> println ; print false
 ```
 
 ### Struct
-TODO: are tuples like that? Do we allow .{} notation? (no to both)
+TODO: are tuples like that?
 ```nov
 let MyStruct = struct {
     name: string
@@ -133,7 +178,9 @@ let MyStruct = struct {
 
     let max = 100.
 
-    let init = (name: string) -> .{ .name = name } -> @This()
+    let init = (name: string) -> MyStruct {
+        MyStruct{ .name = name }
+    }
 }
 
 let x = MyStruct.init("aaa") ; same as let x = MyStruct{ .name = name }
@@ -150,23 +197,27 @@ In nov there is no untagged union thus  we can match on any union to find the
 active field. Note that it isn't represented here but an union field can have a
 default value just like a struct field.
 ```nov
-let Result = (T: type, E: type) -> union {
-    ok: T
-    err: E
-} -> type
+let Result = (T: type, E: type) -> type {
+    union {
+        ok: T
+        err: E
+    }
+}
 
-let Option = (T: type) -> union {
-    some: T
-    none
+let Option = (T: type) -> type {
+    union {
+        some: T
+        none
 
-    ; unions can also have methods
-    let forceUnwrap = (self: @This()) -> {
-        match self {
-            .some => |val| val ; catch the value and return it
-            .none => @panic("...")
+        ; unions can also have methods
+        let forceUnwrap = (self: @This()) -> T {
+            match self {
+                .some => |val| val ; catch the value and return it
+                .none => @panic("...")
+            }
         }
-    } -> T
-} -> type
+    }
+}
 
 let x = 5
 let y: Option(int) = .some{5}

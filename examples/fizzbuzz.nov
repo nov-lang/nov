@@ -1,13 +1,13 @@
-import "std"
+let std = @import("std")
 
-let fizzBuzz = (n: int) -> {
+let fizzBuzz = (n: int) -> string {
     match (n % 3, n % 5) {
         (0, 0) => "FizzBuzz"
         (0, _) => "Fizz"
         (_, 0) => "Buzz"
         _ => "{n}" ; or n.toString()
     }
-} -> string
+}
 
 ; TODO: use a for loop
 let mut i = 0

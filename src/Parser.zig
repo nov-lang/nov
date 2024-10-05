@@ -121,12 +121,12 @@ fn expectStmt(self: *Parser) Error!Node.Index {
 /// DeclProto <- KEYWORD_let KEYWORD_pub? KEYWORD_mut? IDENTIFIER (COLON TypeExpr)?
 fn expectDecl(self: *Parser) Error!Node.Index {
     const let_token = self.assertToken(.keyword_let);
-    const is_pub = self.consume(.keyword_pub) != null; // or self.consume(.keyword_priv) == null;
-    const is_mut = self.consume(.keyword_mut) != null;
+    const is_pub = self.eatToken(.keyword_pub) != null; // or self.eatToken(.keyword_priv) == null;
+    const is_mut = self.eatToken(.keyword_mut) != null;
 
     _ = try self.expectToken(.identifier);
-    const type_expr = if (self.consume(.colon) != null) try self.expectTypeExpr() else null_node;
-    const initializer = if (self.consume(.equal) != null) try self.expectExpr() else null_node;
+    const type_expr = if (self.eatToken(.colon) != null) try self.expectTypeExpr() else null_node;
+    const initializer = if (self.eatToken(.equal) != null) try self.expectExpr() else null_node;
 
     if (type_expr == null_node and initializer == null_node) {
         return self.failExpected(.equal);
@@ -395,7 +395,7 @@ fn expectIfExpr(self: *Parser) Error!Node.Index {
     const condition = try self.expectExpr();
     const then_expr = try expectBlock(self);
 
-    if (self.consume(.keyword_else) == null) {
+    if (self.eatToken(.keyword_else) == null) {
         return self.addNode(.{
             .tag = .@"if",
             .main_token = if_token,
@@ -426,13 +426,13 @@ fn expectIfExpr(self: *Parser) Error!Node.Index {
 
 /// BreakLabel <- COLON IDENTIFIER
 fn parseBreakLabel(self: *Parser) Error!TokenIndex {
-    _ = self.consume(.colon) orelse return null_node;
+    _ = self.eatToken(.colon) orelse return null_node;
     return self.expectToken(.identifier);
 }
 
 /// Block <- LBRACE (Decl | ExprStmt)* RBRACE
 fn parseBlock(self: *Parser) Error!Node.Index {
-    const lbrace = self.consume(.l_brace) orelse return null_node;
+    const lbrace = self.eatToken(.l_brace) orelse return null_node;
     const scratch_top = self.scratch.items.len;
     defer self.scratch.shrinkRetainingCapacity(scratch_top);
     while (true) {
@@ -568,11 +568,11 @@ fn parseSuffixExpr(self: *Parser) Error!Node.Index {
             res = suffix_op;
             continue;
         }
-        const lparen = self.consume(.l_paren) orelse return res;
+        const lparen = self.eatToken(.l_paren) orelse return res;
         const scratch_top = self.scratch.items.len;
         defer self.scratch.shrinkRetainingCapacity(scratch_top);
         while (true) {
-            if (self.consume(.r_paren)) |_| break;
+            if (self.eatToken(.r_paren)) |_| break;
             const param = try self.expectExpr();
             try self.scratch.append(self.allocator, param);
             switch (self.token_tags[self.tok_i]) {
@@ -757,6 +757,7 @@ fn expectNewline(self: *Parser, error_tag: Ast.Error.Tag, recoverable: bool) Err
     }
 }
 
+// TODO: result is weird because newline is a token and used like a semicolon
 fn tokensOnSameLine(self: *Parser, tok1: TokenIndex, tok2: TokenIndex) bool {
     return std.mem.indexOfScalar(u8, self.source[self.token_starts[tok1]..self.token_starts[tok2]], '\n') == null;
 }
@@ -767,7 +768,7 @@ fn discardNewlines(self: *Parser) void {
     }
 }
 
-fn consume(self: *Parser, tag: Token.Tag) ?TokenIndex {
+fn eatToken(self: *Parser, tag: Token.Tag) ?TokenIndex {
     return if (self.token_tags[self.tok_i] == tag) self.nextToken() else null;
 }
 
@@ -822,7 +823,7 @@ fn warnMsg(self: *Parser, msg: Ast.Error) Error!void {
     @setCold(true);
     switch (msg.tag) {
         .expected_newline_after_decl,
-        .expected_newline_after_stmt,
+        .expected_newline_after_stmt, // TODO: weird
         .expected_newline_or_else,
         .expected_newline_or_lbrace,
         // .expected_comma_after_field,
@@ -837,7 +838,7 @@ fn warnMsg(self: *Parser, msg: Ast.Error) Error!void {
         .expected_block_or_assignment,
         // .expected_block_or_expr,
         // .expected_block_or_field,
-        .expected_expr,
+        // .expected_expr, // TODO: not prev?
         .expected_expr_or_assignment,
         // .expected_labelable,
         // .expected_param_list,

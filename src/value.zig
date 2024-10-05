@@ -13,6 +13,7 @@ pub const primitives = std.StaticStringMap(void).initComptime(.{
     // .{"nil"},
     // .{"undefined"},
     // .{"error"},
+    // .{"()"},
 });
 
 pub fn isPrimitive(name: []const u8) bool {

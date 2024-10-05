@@ -2,7 +2,7 @@
 
 let std = @import("std")
 
-let fibo = (n: int) -> {
+let fibo = (n: int) -^ ?int -> () {
     let mut n1 = 0
     let mut n2 = 1
     let mut next: int ; using `next` without initializing result in a panic
@@ -14,7 +14,7 @@ let fibo = (n: int) -> {
         n1 = n2
         n2 = next
     }
-} -^ ?int -> () ; `-> ()` can be omitted because no return value means `()`
+}
 
 for n in async fibo(10) {
     n |> std.println

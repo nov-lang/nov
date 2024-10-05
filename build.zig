@@ -1,10 +1,15 @@
 const std = @import("std");
 
+const nov_version: std.SemanticVersion = .{ .major = 0, .minor = 0, .patch = 0 };
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const exe = makeExe(b, target, optimize);
+    const exe_options = b.addOptions();
+    exe_options.addOption(std.SemanticVersion, "version", nov_version);
+
+    const exe = makeExe(b, target, optimize, exe_options);
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
@@ -24,7 +29,7 @@ pub fn build(b: *std.Build) void {
     };
     for (release_targets) |target_query| {
         const rel_target = b.resolveTargetQuery(target_query);
-        const rel_exe = makeExe(b, rel_target, .ReleaseSafe);
+        const rel_exe = makeExe(b, rel_target, .ReleaseSafe, exe_options);
         rel_exe.root_module.strip = true;
         const install = b.addInstallArtifact(rel_exe, .{});
         install.dest_sub_path = b.fmt("{s}-{s}", .{
@@ -57,6 +62,7 @@ fn makeExe(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
+    options: *std.Build.Step.Options,
 ) *std.Build.Step.Compile {
     const isocline = b.dependency("isocline-zig", .{}).module("isocline");
     const clap = b.dependency("clap", .{}).module("clap");
@@ -67,6 +73,7 @@ fn makeExe(
         .target = target,
         .optimize = optimize,
     });
+    exe.root_module.addOptions("build_options", options);
     exe.root_module.addImport("isocline", isocline);
     exe.root_module.addImport("clap", clap);
     exe.root_module.addImport("known-folders", known_folders);

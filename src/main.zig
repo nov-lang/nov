@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const clap = @import("clap");
 const kf = @import("known-folders");
 const ic = @import("isocline");
@@ -7,6 +8,67 @@ const Scanner = @import("Scanner.zig");
 const Chunk = @import("Chunk.zig");
 const VM = @import("vm.zig").VM;
 const debug = @import("debug.zig");
+
+pub const std_options: std.Options = .{
+    .logFn = coloredLog,
+};
+
+// TODO: move this to a separate file
+const Color = enum(u8) {
+    black = 30,
+    red,
+    green,
+    yellow,
+    blue,
+    magenta,
+    cyan,
+    white,
+    default,
+    bright_black = 90,
+    bright_red,
+    bright_green,
+    bright_yellow,
+    bright_blue,
+    bright_magenta,
+    bright_cyan,
+    bright_white,
+
+    const csi = "\x1b[";
+    const reset = csi ++ "0m";
+    const bold = csi ++ "1m";
+
+    fn toSeq(comptime fg: Color) []const u8 {
+        return comptime csi ++ std.fmt.digits2(@intFromEnum(fg)) ++ "m";
+    }
+};
+
+fn coloredLog(
+    comptime message_level: std.log.Level,
+    comptime scope: @Type(.EnumLiteral),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    const level_txt = comptime switch (message_level) {
+        .err => Color.bold ++ Color.red.toSeq() ++ "error" ++ Color.reset,
+        .warn => Color.bold ++ Color.yellow.toSeq() ++ "warning" ++ Color.reset,
+        .info => Color.bold ++ Color.blue.toSeq() ++ "info" ++ Color.reset,
+        .debug => Color.bold ++ Color.cyan.toSeq() ++ "debug" ++ Color.reset,
+    };
+    const scope_prefix = (if (scope != .default) "@" ++ @tagName(scope) else "") ++ ": ";
+    const stderr = std.io.getStdErr().writer();
+    var bw = std.io.bufferedWriter(stderr);
+    const writer = bw.writer();
+
+    std.debug.lockStdErr();
+    defer std.debug.unlockStdErr();
+    nosuspend {
+        writer.print(level_txt ++ scope_prefix ++ format ++ "\n", args) catch return;
+        bw.flush() catch return;
+    }
+}
+
+// TODO: use this variable for logging
+pub var enable_color = false;
 
 fn usage(comptime params: anytype) !void {
     const stderr = std.io.getStdErr().writer();
@@ -25,6 +87,11 @@ pub fn main() !void {
     var gpa: std.heap.GeneralPurposeAllocator(.{ .verbose_log = false }) = .{};
     defer if (builtin.mode == .Debug) std.debug.assert(gpa.deinit() == .ok);
     const allocator = if (builtin.mode == .Debug) gpa.allocator() else std.heap.c_allocator;
+
+    if (builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+        const no_color = std.posix.getenv("NO_COLOR");
+        enable_color = no_color == null or no_color.?.len == 0;
+    }
 
     const params = comptime clap.parseParamsComptime(
         \\-h, --help             Display this help and exit.
@@ -50,7 +117,7 @@ pub fn main() !void {
 
     if (res.args.version != 0) {
         const stdout = std.io.getStdOut().writer();
-        try stdout.print("nov 0.0.0", .{});
+        try stdout.print("nov {}", .{build_options.version});
         return;
     }
 
@@ -93,6 +160,8 @@ fn repl(allocator: std.mem.Allocator, vm: *VM) !void {
     } else {
         ic.setHistory(null, -1);
     }
+
+    _ = ic.enableColor(enable_color);
 
     // TODO for prompt do:
     //> while (false) {

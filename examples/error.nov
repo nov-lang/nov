@@ -1,6 +1,7 @@
 let std = import "std"
 let File = std.fs.File
 
+; `File.open("file.txt")!` is not possible because we're in global scope
 let file = match File.open("file.txt") {
     .ok => |f| f
     .err => |e| panic "Failed to open file: {e}"

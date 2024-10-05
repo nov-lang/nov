@@ -1,10 +1,7 @@
 const std = @import("std");
 const Parser = @import("Parser.zig");
-const Ast = @import("Ast.zig");
-const Node = Ast.Node;
 
 pub fn main() !void {
-    // (* (- 123) (group 45.67))
     // const source = "-123 * (45.67)\n";
     const source =
         \\let x = -3
@@ -22,21 +19,6 @@ pub fn main() !void {
         \\x + y
         \\
     ;
-    // const source =
-    //     // \\let x: int = 3
-    //     // \\let mut y = "salut"
-    //     // \\ x + y x - y
-    //     // \\{x + y
-    //     \\{
-    //     \\    let x = {
-    //     \\        let y = 3
-    //     \\        y
-    //     \\    }
-    //     \\}
-    //     \\let x =
-    //     \\x + y
-    //     \\
-    // ;
     // const source =
     //     \\let cond = true
     //     \\if (cond) {
@@ -61,14 +43,19 @@ pub fn main() !void {
     //     \\
     // ;
 
-    // std.log.debug("Running parser with source: \n{s}\n", .{source});
+    std.debug.print(
+        \\Running parser with source:
+        \\```
+        \\{s}
+        \\```
+        \\
+    , .{source});
 
     const allocator = std.heap.page_allocator;
     var ast = try Parser.parse(allocator, source);
     defer ast.deinit(allocator);
 
     for (ast.rootStmts()) |stmt| {
-        // std.debug.print("{}", .{ast.nodes.items(.tag)[stmt]});
         for (ast.firstToken(stmt)..ast.lastToken(stmt) + 1) |token| {
             std.debug.print("{s} ", .{ast.tokenSlice(@intCast(token))});
         }
@@ -84,18 +71,55 @@ pub fn main() !void {
     // for (ast.nodes.items(.tag)) |tag| {
     //     std.debug.print(" {s}", .{@tagName(tag)});
     // }
+
     if (ast.errors.len > 0) {
-        std.debug.print("\nErrors:", .{});
+        const stderr = std.io.getStdErr().writer();
+        try stderr.writeAll("\n");
         for (ast.errors) |parse_error| {
-            std.debug.print("\n", .{});
             const loc = ast.tokenLocation(0, parse_error.token);
-            std.debug.print("{d}:{d}: {s}: ", .{
+            try stderr.print(Color.bold ++ "{s}:{d}:{d}: " ++
+                Color.red.toSeq() ++ "error: " ++ Color.reset ++ Color.bold, .{
+                "source",
                 loc.line,
                 loc.column,
-                @tagName(ast.tokens.items(.tag)[parse_error.token]),
             });
-            try ast.renderError(parse_error, std.io.getStdOut().writer());
+            try ast.renderError(parse_error, stderr);
+            try stderr.print(Color.reset ++ "\n{s}\n", .{ast.source[loc.line_start..loc.line_end]});
+            try stderr.writeByteNTimes(' ', loc.column - 1);
+            try stderr.writeAll(Color.green.toSeq());
+            switch (ast.tokenSlice(parse_error.token).len) {
+                1 => try stderr.writeAll("^"),
+                else => |len| try stderr.writeByteNTimes('~', len),
+            }
+            try stderr.writeAll("\n" ++ Color.reset);
         }
-        std.debug.print("\n", .{});
     }
 }
+
+const Color = enum(u8) {
+    black = 30,
+    red,
+    green,
+    yellow,
+    blue,
+    magenta,
+    cyan,
+    white,
+    default,
+    bright_black = 90,
+    bright_red,
+    bright_green,
+    bright_yellow,
+    bright_blue,
+    bright_magenta,
+    bright_cyan,
+    bright_white,
+
+    const csi = "\x1b[";
+    const reset = csi ++ "0m";
+    const bold = csi ++ "1m";
+
+    fn toSeq(comptime fg: Color) []const u8 {
+        return comptime csi ++ std.fmt.digits2(@intFromEnum(fg)) ++ "m";
+    }
+};

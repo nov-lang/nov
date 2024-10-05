@@ -39,8 +39,8 @@ pub const Location = struct {
 
 pub fn tokenLocation(self: Ast, start_offset: u32, token_index: u32) Location {
     var loc: Location = .{
-        .line = 0,
-        .column = 0,
+        .line = 1,
+        .column = 1,
         .line_start = start_offset,
         .line_end = self.source.len,
     };
@@ -396,7 +396,6 @@ pub fn firstToken(self: Ast, node: Node.Index) TokenIndex {
         .match_range,
         .function_pipe,
         .fn_proto,
-        .fn_decl_noreturn,
         .fn_decl,
         => n = datas[n].lhs,
 
@@ -475,6 +474,8 @@ pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
         .match_range,
         .function_pipe,
         .decl,
+        .fn_proto,
+        .fn_decl,
         => n = datas[n].rhs,
 
         .field_access,
@@ -507,6 +508,38 @@ pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
                 end_offset += 1; // rbrace
                 return main_tokens[n] + end_offset;
             }
+        },
+
+        .if_else => {
+            const extra = self.extraData(datas[n].rhs, Node.If);
+            assert(extra.else_expr != 0);
+            n = extra.else_expr;
+        },
+
+        .call_one => {
+            end_offset += 1; // for the rparen
+            if (datas[n].rhs == 0) {
+                return main_tokens[n] + end_offset;
+            }
+            n = datas[n].rhs;
+        },
+
+        .fn_args_one => {
+            end_offset += 1; // for the rparen
+            if (datas[n].rhs != 0) {
+                n = datas[n].rhs;
+            } else if (datas[n].lhs != 0) {
+                n = datas[n].lhs;
+            } else {
+                return main_tokens[n] + end_offset;
+            }
+        },
+
+        // TODO: idk about that
+        .fn_args => {
+            assert(datas[n].rhs - datas[n].lhs > 0);
+            end_offset += 1; // for the rparen
+            n = self.extra_data[datas[n].rhs - 1]; // last argument
         },
     };
 }
@@ -1095,16 +1128,12 @@ pub const Node = struct {
         /// main_token is the `(`.
         fn_args,
         /// `lhs -> rhs`.
-        /// lhs is fn_args. rhs can be omitted.
+        /// lhs is fn_args.
         /// main_token is the `->`.
         fn_proto,
-        /// `lhs -> rhs`.
-        /// lhs is fn_args. rhs is the function body block.
-        /// main_token is the `->`.
-        fn_decl_noreturn,
-        /// `lhs -> a -> b. `FnDecl[rhs]`.
-        /// lhs is fn_args.
-        /// main_token is the first `->`.
+        /// `lhs rhs`.
+        /// lhs is the fn_proto.
+        /// rhs is the function body block.
         fn_decl,
         /// Both lhs and rhs unused.
         int_literal,
@@ -1165,11 +1194,6 @@ pub const Node = struct {
         then_expr: Index,
         /// can be a block or another if expression
         else_expr: Index,
-    };
-
-    pub const FnDecl = struct {
-        body_block: Index,
-        return_type: Index,
     };
 };
 
