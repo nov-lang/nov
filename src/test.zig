@@ -1,24 +1,27 @@
 const std = @import("std");
 const Parser = @import("Parser.zig");
+const Sema = @import("Sema.zig");
+const Value = @import("Value.zig");
 
 pub fn main() !void {
+    const source = "1 + 1\n";
     // const source = "-123 * (45.67)\n";
-    const source =
-        \\let x = -3
-        \\let pub mut y: int = 4
-        \\let z = blk: {
-        \\    let a = 3
-        \\    if a == 3 {
-        \\        break :blk 3 + 4
-        \\    } else {
-        \\        3 + 4
-        \\    }
-        \\    x + y
-        \\}
-        \\{}
-        \\x + y
-        \\
-    ;
+    // const source =
+    //     \\let x = -3
+    //     \\let pub mut y: int = 4
+    //     \\let z = blk: {
+    //     \\    let a = 3
+    //     \\    if a == 3 {
+    //     \\        break :blk 3 + 4
+    //     \\    } else {
+    //     \\        3 + 4
+    //     \\    }
+    //     \\    x + y
+    //     \\}
+    //     \\{}
+    //     \\x + y
+    //     \\
+    // ;
     // const source =
     //     \\let cond = true
     //     \\if (cond) {
@@ -94,6 +97,28 @@ pub fn main() !void {
             try stderr.writeAll("\n" ++ Color.reset);
         }
     }
+
+    // const nir = try Sema.generate(allocator, &ast);
+    // for (Sema.root) |ref| {
+    //     switch (ref) {
+    //         .type => unreachable,
+    //         .value => unreachable,
+    //         .index => {
+    //             std.debug.print("Index: {}: ", .{ref.index});
+    //             std.debug.print("{}\n", .{nir.instructions.items(.tag)[ref.index]});
+    //         },
+    //     }
+    // }
+
+    // const s = try Value.String.init(allocator, "Hello, world!");
+    // std.debug.print("{}\n", .{s.value()});
+    // const n = Value.create(128);
+    // std.debug.print("{}\n", .{Value.eql(.uint, n, Value.create(128))});
+    // std.debug.print("Value: {}\n", .{n});
+
+    // var x = try Value.BigInt.init(allocator);
+    // x.mutable.set(123);
+    // std.debug.print("{obj(b)}\n", .{x.value()});
 }
 
 const Color = enum(u8) {

@@ -2,10 +2,9 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Chunk = @import("Chunk.zig");
 const Scanner = @import("Scanner.zig");
-const _value = @import("value.zig");
-const Value = _value.Value;
-const String = _value.String;
-const Function = _value.Function;
+const Value = @import("Value.zig");
+const String = Value.String;
+const Function = Value.Function;
 const Token = Scanner.Token;
 const debug = @import("debug.zig");
 

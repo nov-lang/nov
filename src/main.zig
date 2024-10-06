@@ -178,4 +178,5 @@ fn repl(allocator: std.mem.Allocator, vm: *VM) !void {
 test {
     // std.testing.refAllDecls(@This());
     std.testing.refAllDecls(@import("Tokenizer.zig"));
+    std.testing.refAllDecls(@import("Value.zig"));
 }

@@ -2,7 +2,6 @@
 // See https://github.com/ziglang/zig/blob/master/LICENSE for additional LICENSE details
 
 const std = @import("std");
-const v = @import("value.zig");
 const Parser = @import("Parser.zig");
 const Tokenizer = @import("Tokenizer.zig");
 const Token = Tokenizer.Token;
@@ -396,7 +395,7 @@ pub fn firstToken(self: Ast, node: Node.Index) TokenIndex {
         .match_range,
         .function_pipe,
         .fn_proto,
-        .fn_decl,
+        .fn_expr,
         => n = datas[n].lhs,
 
         .match_case_one => {
@@ -475,7 +474,7 @@ pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
         .function_pipe,
         .decl,
         .fn_proto,
-        .fn_decl,
+        .fn_expr,
         => n = datas[n].rhs,
 
         .field_access,
@@ -958,7 +957,7 @@ pub const full = struct {
 
         pub const Components = struct {
             lparen: TokenIndex,
-            fn_expr: Node.Index,
+            fn_proto: Node.Index,
             args: []const Node.Index,
         };
     };
@@ -1134,7 +1133,7 @@ pub const Node = struct {
         /// `lhs rhs`.
         /// lhs is the fn_proto.
         /// rhs is the function body block.
-        fn_decl,
+        fn_expr,
         /// Both lhs and rhs unused.
         int_literal,
         /// Both lhs and rhs unused.
