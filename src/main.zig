@@ -4,7 +4,6 @@ const build_options = @import("build_options");
 const clap = @import("clap");
 const kf = @import("known-folders");
 const ic = @import("isocline");
-const Scanner = @import("Scanner.zig");
 const Chunk = @import("Chunk.zig");
 const VM = @import("vm.zig").VM;
 const debug = @import("debug.zig");
@@ -83,10 +82,58 @@ fn usage(comptime params: anytype) !void {
     });
 }
 
+fn runFile(allocator: std.mem.Allocator, vm: *VM, path: []const u8) !void {
+    const cwd = std.fs.cwd();
+    const file = try cwd.openFile(path, .{});
+    defer file.close();
+    var array_list = try std.ArrayList(u8).initCapacity(allocator, 4096);
+    defer array_list.deinit();
+    try file.reader().readAllArrayList(&array_list, 1024 * 1024);
+    try array_list.append(0);
+    const bytes = array_list.items[0 .. array_list.items.len - 1 :0];
+    try vm.interpret(allocator, bytes);
+}
+
+fn repl(allocator: std.mem.Allocator, vm: *VM) !void {
+    if (try kf.getPath(allocator, .state)) |state_dir| {
+        defer allocator.free(state_dir);
+        const history_path = try std.fs.path.joinZ(allocator, &.{ state_dir, "nov_history" });
+        defer allocator.free(history_path);
+        ic.setHistory(history_path, 1000);
+    } else {
+        ic.setHistory(null, -1);
+    }
+
+    _ = ic.enableColor(enable_color);
+
+    // TODO for prompt do:
+    //> while (false) {
+    //while> i += 1
+    //while> }
+    //> print(i)
+    while (ic.readline(null)) |bytes| {
+        defer ic.free(bytes);
+        const line = std.mem.span(bytes);
+        vm.interpret(allocator, line) catch {};
+    }
+}
+
 pub fn main() !void {
     var gpa: std.heap.GeneralPurposeAllocator(.{ .verbose_log = false }) = .{};
-    defer if (builtin.mode == .Debug) std.debug.assert(gpa.deinit() == .ok);
-    const allocator = if (builtin.mode == .Debug) gpa.allocator() else std.heap.c_allocator;
+    const use_gpa = builtin.mode == .Debug;
+    const allocator = if (builtin.os.tag == .wasi)
+        std.heap.wasm_allocator
+    else if (use_gpa)
+        gpa.allocator()
+        // We would prefer to use raw libc allocator here, but cannot
+        // use it if it won't support the alignment we need.
+    else if (@alignOf(std.c.max_align_t) < @max(@alignOf(i128), std.atomic.cache_line))
+        std.heap.c_allocator
+    else
+        std.heap.raw_c_allocator;
+    defer if (use_gpa) {
+        _ = gpa.deinit();
+    };
 
     if (builtin.os.tag != .windows and builtin.os.tag != .wasi) {
         const no_color = std.posix.getenv("NO_COLOR");
@@ -139,44 +186,7 @@ pub fn main() !void {
     }
 }
 
-fn runFile(allocator: std.mem.Allocator, vm: *VM, path: []const u8) !void {
-    const cwd = std.fs.cwd();
-    const file = try cwd.openFile(path, .{});
-    defer file.close();
-    var array_list = try std.ArrayList(u8).initCapacity(allocator, 4096);
-    defer array_list.deinit();
-    try file.reader().readAllArrayList(&array_list, 1024 * 1024);
-    try array_list.append(0);
-    const bytes = array_list.items[0 .. array_list.items.len - 1 :0];
-    try vm.interpret(allocator, bytes);
-}
-
-fn repl(allocator: std.mem.Allocator, vm: *VM) !void {
-    if (try kf.getPath(allocator, .state)) |state_dir| {
-        defer allocator.free(state_dir);
-        const history_path = try std.fs.path.joinZ(allocator, &.{ state_dir, "nov_history" });
-        defer allocator.free(history_path);
-        ic.setHistory(history_path, 1000);
-    } else {
-        ic.setHistory(null, -1);
-    }
-
-    _ = ic.enableColor(enable_color);
-
-    // TODO for prompt do:
-    //> while (false) {
-    //while> i += 1
-    //while> }
-    //> print(i)
-    while (ic.readline(null)) |bytes| {
-        defer ic.free(bytes);
-        const line = std.mem.span(bytes);
-        vm.interpret(allocator, line) catch {};
-    }
-}
-
 test {
-    // std.testing.refAllDecls(@This());
     std.testing.refAllDecls(@import("Tokenizer.zig"));
     std.testing.refAllDecls(@import("Value.zig"));
 }

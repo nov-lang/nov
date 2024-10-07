@@ -55,7 +55,7 @@ pub const VM = struct {
     }
 
     pub fn pop(self: *VM) Error!Value {
-        return self.stack.popOrNull() orelse return error.RuntimeError;
+        return self.stack.popOrNull() orelse error.RuntimeError;
     }
 
     fn peek(self: *VM, distance: usize) Value {

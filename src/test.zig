@@ -1,10 +1,10 @@
 const std = @import("std");
 const Parser = @import("Parser.zig");
-const Sema = @import("Sema.zig");
 const Value = @import("Value.zig");
+const Sema = @import("Sema.zig");
 
 pub fn main() !void {
-    const source = "1 + 1\n";
+    const source = "0 + 1 + 1 + 0 + 3\n";
     // const source = "-123 * (45.67)\n";
     // const source =
     //     \\let x = -3
@@ -96,6 +96,12 @@ pub fn main() !void {
             }
             try stderr.writeAll("\n" ++ Color.reset);
         }
+        std.process.exit(1);
+    }
+
+    const nir = try Sema.generate(allocator, ast);
+    for (0..nir.instructions.len) |i| {
+        std.debug.print("Instruction {}: {}\n", .{ i, nir.instructions.get(i) });
     }
 
     // const nir = try Sema.generate(allocator, &ast);

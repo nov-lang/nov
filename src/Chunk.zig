@@ -5,7 +5,7 @@ const Ast = @import("Ast.zig");
 const Chunk = @This();
 
 code: std.ArrayListUnmanaged(u32),
-locations: std.ArrayListUnmanaged(Ast.TokenIndex), // use RLE to save memory
+tokens: std.ArrayListUnmanaged(Ast.TokenIndex),
 constants: std.ArrayListUnmanaged(Value),
 allocator: std.mem.Allocator,
 
@@ -47,13 +47,13 @@ pub fn init(allocator: std.mem.Allocator) Chunk {
 
 pub fn deinit(self: *Chunk) void {
     self.code.deinit(self.allocator);
-    self.locations.deinit(self.allocator);
+    self.tokens.deinit(self.allocator);
     self.constants.deinit(self.allocator);
 }
 
-pub fn write(self: *Chunk, code: u32, loc: Ast.TokenIndex) !void {
+pub fn write(self: *Chunk, code: u32, token: Ast.TokenIndex) !void {
     try self.code.append(self.allocator, code);
-    try self.locations.append(self.allocator, loc);
+    try self.tokens.append(self.allocator, token);
 }
 
 pub fn addConstant(self: *Chunk, value: Value) !u24 {

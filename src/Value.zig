@@ -395,21 +395,23 @@ pub const BigInt = struct {
         allocator.destroy(self);
     }
 
-    /// Be sure to call fromManaged() after doing changes to the BigInt!
-    pub fn toManaged(self: *BigInt, allocator: std.mem.Allocator) big_int.Managed {
-        return self.value.toManaged(allocator);
-    }
-
-    pub fn fromManaged(self: *BigInt, managed: big_int.Managed) void {
-        self.value = managed.toMutable();
-    }
-
     pub fn obj(self: *BigInt) *Object {
         return &self.object;
     }
 
     pub fn value(self: *BigInt) Value {
         return Value.create(&self.object);
+    }
+
+    pub fn orderScalar(self: BigInt, scalar: anytype) std.math.Order {
+        return self.mutable.toConst().order(.{
+            .limbs = &.{@abs(scalar)},
+            .positive = scalar >= 0,
+        });
+    }
+
+    pub fn eqlScalar(self: BigInt, scalar: anytype) bool {
+        return self.orderScalar(scalar) == .eq;
     }
 
     pub fn format(

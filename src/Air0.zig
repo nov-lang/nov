@@ -1,5 +1,31 @@
 // TODO: zig/src/Air.zig
 
+// % cat test.zig && zig build-obj --verbose-air test.zig -OReleaseSmall
+// export fn add(a: u32, b: u32) u32 {
+//     var c: u32 = 42;
+//     c += 1;
+//     return c + a + b;
+// }
+// # Begin Function AIR: test.add:
+// # Total AIR+Liveness bytes: 263B
+// # AIR Instructions:         11 (99B)
+// # AIR Extra Data:           13 (52B)
+// # Liveness tomb_bits:       8B
+// # Liveness Extra Data:      0 (0B)
+// # Liveness special table:   0 (0B)
+//   %0 = arg(u32, 0)
+//   %1 = arg(u32, 1)
+//   %2 = alloc(*u32)
+//   %3!= store(%2, <u32, 42>)
+//   %4 = load(u32, %2)
+//   %5 = add(%4!, <u32, 1>)
+//   %6!= store(%2, %5!)
+//   %7 = load(u32, %2!)
+//   %8 = add(%7!, %0!)
+//   %9 = add(%8!, %1!)
+//   %10!= ret(%9!)
+// # End Function AIR: test.add
+
 const std = @import("std");
 
 const Air = @This();

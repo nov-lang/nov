@@ -15,7 +15,7 @@ const Parser = @This();
 source: []const u8,
 allocator: std.mem.Allocator,
 token_tags: []const Token.Tag,
-token_starts: []const u32,
+token_starts: []const Tokenizer.ByteOffset,
 tok_i: TokenIndex,
 nodes: Ast.NodeList,
 extra_data: std.ArrayListUnmanaged(Node.Index),

@@ -1,10 +1,6 @@
 # nov
 
 # TODO
-Rewrite Ast and Parser based on the previous versions (1 and 2)
-
-Keep it small at first with only a few expressions and very simple declaration
-
 Implement basic IR then codegen to try it before adding more features
 
 It's fine to keep arena fucked up allocation fest until GC implementation
@@ -23,15 +19,20 @@ It's fine to keep arena fucked up allocation fest until GC implementation
 - https://ocaml.org/docs/basic-data-types#options--results
 
 ## Proposals and stuff to add
-- opt to output bytecode and to run bytecode instead of interpreting
+- modes / arg options:
+  - build: output a file with nov bytecode
+  - run: run in a VM either a .nov file or a .novc file
+  - repl: run the repl
+  - fmt: format nov code
+- target JVM?
+- output native code?
 - add tests, mainly for Parser, IR and VM
-- Error type for each step (~Tokenizer, Parser~, IR, Compiler, Runtime)
+- Error type for each step (~Tokenizer, Parser~, IR, Codegen, Runtime)
 - forward reference
-- string interpolation
+- string interpolation like "${variable name}"
 - separate int, uint, float and string operations. e.g. + for int/uint, +. for float, ++ for string
 - replace , with | in match prong?
-- add ** for exponential?
-- handle SIG.INT
+- handle SIG.INT correctly, need to write an alternative to isocline in zig
 - in repl mode output statement result by default
 - separate codegen, VM and CLI to allow embedding nov into another project and to
   make it easier to implement JIT or native compilation
@@ -59,10 +60,6 @@ It's fine to keep arena fucked up allocation fest until GC implementation
   - try and catch like in zig
   - throw used to return an error (or just return a error.XXX like zig?)
 - add generics
-- add `type` keyword to define a new type or `struct`/`enum` idk
-  - also tagged union
-- add typeof keyword/builtin/idk
-- rework examples
 - remove `loop` loops?
 - remove `while` loops?
 - add `do while` loops or `repeat until` loops?
@@ -72,16 +69,33 @@ It's fine to keep arena fucked up allocation fest until GC implementation
   to not ignore the return value from an expression? (no, these are called
   expression statement and it's fine to ignore their result just to trigger the
   side effects of evaluating the expression)
-- add operator overloading?
-- return an error on arithmetic overflow instead of crashing or add a builtin like zig
-- concat string with `++` and mult with `**` instead of same as number
-- replace float operators with `+.`, `-.`, `*.`, `/.`, `%.`
-- compilation error when trying to add/compare value of different type? (at least for non number)
-- remove uint?
+- compilation error when trying to add/compare value of different type if there
+  is no method for the operator and underlying type. e.g. it is possible to do
+  "a" * 3 if String.mul(String, int) or Integer.mul(int, String) is implemented.
+- add operator overloading:
+  - note for bytecode, replace add, etc... bytecode with function call,
+    try to find a way to make function calls or at least these kind of function call extra lightweight
+  - implem `>=`, `==`, `<`, etc... with Object.order() wich should return a std.math.Order
+  - `+` binary op is syntaxic sugar for Object.add
+  - `!` postfix unary op is syntaxic sugar for Object.unwrap (idk about name,
+    should only be available for Result and Option)
+  - How to handle string * int?
+    - handle Object.add(a: Object, b: OtherObject), make it clear in the
+      doc/language that this is possible, look at rust traits
+    - just disallow and compile error (no)
+  - How to handle int + float? or big_int + int?
+    - have to cast variable e.g. `3.to(BigInt)`
+    - have seemless transition between numbers types, at least for int and big int
+- automatically convert int to big int on arithmetic overflow instead of crashing,
+  big int has the same type as int (in user program) but not the same representation
+- remove uint? (yes, remove uint value and use raw u64 for both, the representation
+  should be handled with the variable inner type (nan boxing is useless))
 - optimize tail call recursion
 - tree shaking
 - The polymorphism in [Functions](#Functions) can be too weird and complex
-  maybe just do like zig and accept a type as parameter instead
+  - maybe just do like zig and accept a type as parameter instead
+  - just have generics and disallow polymorphism (no)
+- write nov website with nov as backend? idk
 
 ## Notes
 - Check previous step of crafting interpreters and implement them with
@@ -99,6 +113,7 @@ It's fine to keep arena fucked up allocation fest until GC implementation
 - Import file as value like zig
   - `import "std"` or `let std = import "std"`
   - When importing other files only declarations gets imported?
+- Check [roc-lang](https://www.roc-lang.org/examples/FizzBuzz/README.html) function pipes usage (instead of monads)
 
 ## Concepts
 
