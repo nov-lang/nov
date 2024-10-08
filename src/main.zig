@@ -187,6 +187,7 @@ pub fn main() !void {
 }
 
 test {
-    std.testing.refAllDecls(@import("Tokenizer.zig"));
-    std.testing.refAllDecls(@import("Value.zig"));
+    _ = @import("Tokenizer.zig");
+    _ = @import("Value.zig");
+    _ = @import("string_literal.zig");
 }

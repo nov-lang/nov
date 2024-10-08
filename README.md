@@ -1,9 +1,21 @@
 # nov
 
+nov is a functional programming language.
+
+nov type system is strong and sound. idk about static or dynamic yet. also most types should be inferrable.
+
+nov has uncolored async! (well not yet tho)
+
+nov code is compiled to bytecode then run in the NVM (Nov Virtual Machine). (This name sucks)
+
+nov main inspirations are Zig and OCaml.
+
 # TODO
 Implement basic IR then codegen to try it before adding more features
 
 It's fine to keep arena fucked up allocation fest until GC implementation
+
+Fix this README, add links where there should be e.g. for colored async above.
 
 ## Crafting Interpreters
 - https://craftinginterpreters.com/local-variables.html#challenges
@@ -26,6 +38,7 @@ It's fine to keep arena fucked up allocation fest until GC implementation
   - fmt: format nov code
 - target JVM?
 - output native code?
+- support JIT? (JIT in another thread btw)
 - add tests, mainly for Parser, IR and VM
 - Error type for each step (~Tokenizer, Parser~, IR, Codegen, Runtime)
 - forward reference
@@ -64,11 +77,12 @@ It's fine to keep arena fucked up allocation fest until GC implementation
 - remove `while` loops?
 - add `do while` loops or `repeat until` loops?
 - monads, there already here but with specific `>>=` bind function
-- add an FFI with zig and C
-- add `_ =` or `() =` to discard the return of a function and make it mandatory
-  to not ignore the return value from an expression? (no, these are called
-  expression statement and it's fine to ignore their result just to trigger the
-  side effects of evaluating the expression)
+- add an FFI with C and bindings for zig
+- add `_ =` or `() =` or `let () =` to discard the return of a function and make
+  it mandatory to not ignore the return value from an expression? (no, these are
+  called expression statement and it's fine to ignore their result just to
+  trigger the side effects of evaluating the expression) (actually yes, we
+  shouldn't ignore a non () return)
 - compilation error when trying to add/compare value of different type if there
   is no method for the operator and underlying type. e.g. it is possible to do
   "a" * 3 if String.mul(String, int) or Integer.mul(int, String) is implemented.
@@ -96,6 +110,13 @@ It's fine to keep arena fucked up allocation fest until GC implementation
   - maybe just do like zig and accept a type as parameter instead
   - just have generics and disallow polymorphism (no)
 - write nov website with nov as backend? idk
+- add a way to have better OOP, interface, traits etc idk I hate OOP but it
+  sometimes stuff sucks without correct OOP
+- make nov embeddable, just make the compiler and VM like a library and provide bindings to them
+- add cache either in cwd or in $XDG_CACHE_HOME/nov/... (ofc finding the dir is
+  handled by known-folders) like \_\_pycache__
+- > Learn from CPython and store local variables in the frame itself instead of in a dict — this is much faster (see LOAD_FAST and STORE_FAST)
+- for repl add a print instruction right before a statement if it returns another type than ()
 
 ## Notes
 - Check previous step of crafting interpreters and implement them with
@@ -114,6 +135,7 @@ It's fine to keep arena fucked up allocation fest until GC implementation
   - `import "std"` or `let std = import "std"`
   - When importing other files only declarations gets imported?
 - Check [roc-lang](https://www.roc-lang.org/examples/FizzBuzz/README.html) function pipes usage (instead of monads)
+- Check [OCaml Loops](https://ocaml.org/docs/loops-recursion) for nov loops
 
 ## Concepts
 
@@ -183,7 +205,6 @@ x.eql(y) |> println ; print false
 ```
 
 ### Struct
-TODO: are tuples like that?
 ```nov
 let MyStruct = struct {
     name: string
@@ -201,9 +222,9 @@ let MyStruct = struct {
 let x = MyStruct.init("aaa") ; same as let x = MyStruct{ .name = name }
 x |> println ; idk what this prints
 
-; tuples are anonymous structs
-let tuple = .{ 0, 1, 2 }
-@TypeOf(tuple) |> println ; idk what this prints
+; TODO: remove this, tuples used to be anonymous structs
+; let tuple = .{ 0, 1, 2 }
+; @TypeOf(tuple) |> println
 ```
 
 ### Result and Option unions
@@ -235,8 +256,89 @@ let Option = (T: type) -> type {
 }
 
 let x = 5
-let y: Option(int) = .some{5}
+let y = Option(int){ .some = 5 }
 ; `??` is a special operator for Result and Option to provide a fallback value
 ; if the variable is .err or .none
 let sum = x + y ?? 0
+
+let MyOption = Option(float)
+let a = MyOption{ .some = 1.0 }
+let b = MyOption{ .none }
+let prod = x! * y! ; not sure about syntax (this returns an error btw)
+```
+
+### Array
+```
+let mut my_array = [ 0, 1, 2, 3, 4 ]
+@TypeOf(my_array) ; returns []int
+my_array.len == 5 ; true, should this be a function?
+my_array[1] == 1 ; true
+my_array += 3
+my_array |> println ; prints [ 0, 1, 2, 3, 4, 5 ]
+
+let my_array_of_array = [ [ "Hello", "World!" ], [ "Boujour", "Monde!" ] ]
+@TypeOf(my_array_of_array) ; returns [][]string
+let arr_arr = my_array_of_array ; alias because it's long to type
+arr_arr.len == 2 ; true
+; python like way of printing the array
+for arr in arr_arr {
+    for w in arr {
+        print(w + " ")
+    }
+    println()
+}
+; functional way, I think
+arr_arr >>= |arr| arr + " " |> println
+```
+
+### Match
+TODO: proposal for match expression.
+Allow to match strings? (also allow to match like startsWith, endsWith?)
+```
+let x = 3
+let idk = match x {
+    0 => 0
+    x when x % 2 == 0 => 1
+    x => 2 ; same as _ => 2 (no need for _ then)
+}
+```
+
+### Operator overloading
+TODO
+Binary Arithmetic
+- `+`: `add`
+- `-`: `sub`
+- `*`: `mul`
+- `/`: `div`
+- `%`: `mod`
+Postfix Unary
+- `!`: TODO
+- `[]`: TODO
+Relational
+`<`, `>`, `==`, `<=`, `>=` are all implemented with the `order()` function.
+Monad
+- `>>=`: TODO
+```
+let Complex = struct {
+    re: float
+    im: float
+
+    ; overload `+`
+    let add = (self: Complex, other: Complex) -> Complex {
+        Complex{
+            .re = self.re + other.re,
+            .im = self.im + other.im,
+        }
+    }
+
+    ; used by print
+    ; replace by format?
+    let toString = (self: MyType) -> {
+        "{self.re} + i{self.im}"
+    }
+}
+
+let x = Complex{ .re = 5, .im = 3 }
+let y = Complex{ .re = 2, .im = 7 }
+x + y ; returns Complex{ .re = 7, .im = 10 }
 ```
