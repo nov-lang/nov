@@ -130,11 +130,8 @@ fn markRoots(self: *GarbageCollector) !void {
 }
 
 fn markValue(self: *GarbageCollector, value: v.Value) !void {
-    // TODO: how to know if it's an object?
-    // mark one bit of the value to know if it's an object
-    // so we have 63 bits int...
-    if (value.is(.obj)) {
-        try self.markObject(value.as(.obj));
+    if (value.isObj()) {
+        try self.markObject(value.obj);
     }
 }
 

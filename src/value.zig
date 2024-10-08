@@ -24,22 +24,24 @@ pub fn isPrimitive(name: []const u8) bool {
 pub const Value = union {
     undefined: void, // will cause crash when using a undefined value in ReleaseSafe build
     bool: bool,
-    int: i64, // used by int and uint
+    int: i63, // used by int and uint, look at isObj to understand why it's an i63
     float: f64,
     obj: *Object,
+
+    const obj_mask: u64 = 0xfffc000000000000;
 
     pub fn create(value: anytype) Value {
         return switch (@TypeOf(value)) {
             bool => .{ .bool = value },
-            *Object => .{ .obj = value },
+            *Object => .{ .obj = @ptrFromInt(obj_mask | @intFromPtr(value)) },
             else => |T| switch (@typeInfo(T)) {
-                .ComptimeInt => if (value > std.math.maxInt(i64))
-                    .{ .int = @bitCast(@as(u64, value)) }
+                .ComptimeInt => if (value > std.math.maxInt(i63))
+                    .{ .int = @bitCast(@as(u63, value)) }
                 else
                     .{ .int = value },
                 .Int => |info| switch (info.signedness) {
                     .signed => .{ .int = value },
-                    .unsigned => .{ .int = @bitCast(@as(u64, value)) },
+                    .unsigned => .{ .int = @bitCast(@as(u63, value)) },
                 },
                 .ComptimeFloat, .Float => .{ .float = value },
                 else => @compileError("Unsupported type: " ++ @typeName(T)),
@@ -57,6 +59,13 @@ pub const Value = union {
     //         else => return create(value),
     //     }
     // }
+
+    // we could define `Value` as an extern union to do `@as(u64, @bitCast(value))`
+    // instead but that would remove the runtime safety checks for using not active field
+    // or especially the `undefined` field
+    pub fn isObj(self: Value) bool {
+        return @as(*const u64, @ptrCast(&self)).* & obj_mask == obj_mask;
+    }
 
     /// `b`: bool
     /// `i`: int decimal, `ix`: int hexadecimal, `io`: int octal, `ib`: int binary
@@ -83,10 +92,16 @@ pub const Value = union {
             std.fmt.invalidFmtError(fmt, self);
         }
     }
+
+    comptime {
+        if (std.debug.runtime_safety == false) {
+            std.debug.assert(@sizeOf(Value) == 8);
+        }
+    }
 };
 
 pub const Object = packed struct(u64) {
-    tag: Object.Tag,
+    tag: Tag,
     is_marked: bool = false,
     next: u55 = 0,
 
@@ -329,4 +344,17 @@ fn formatFloatValue(
     } else {
         std.fmt.invalidFmtError(fmt, value);
     }
+}
+
+test "Value.isObj" {
+    const expect = std.testing.expect;
+    var o: Object = undefined;
+    try expect(Value.create(10).isObj() == false);
+    try expect(Value.create(-1.0).isObj() == false);
+    try expect(Value.create(&o).isObj() == true);
+    try expect((Value{ .undefined = {} }).isObj() == false);
+    try expect(Value.create(true).isObj() == false);
+    try expect(Value.create(false).isObj() == false);
+    try expect(Value.create(std.math.nan(f64)).isObj() == false);
+    try expect(Value.create(-std.math.nan(f64)).isObj() == false);
 }

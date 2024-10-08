@@ -189,4 +189,5 @@ pub fn main() !void {
 test {
     _ = @import("Tokenizer.zig");
     _ = @import("string_literal.zig");
+    _ = @import("value.zig");
 }

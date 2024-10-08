@@ -11,6 +11,9 @@ allocator: std.mem.Allocator,
 
 // TODO: reduce the number of opcodes
 // TODO: add higher-level opcodes
+// TODO: look at
+// https://treeniks.github.io/x86-64-simplified/instructions/README.html
+// https://en.wikipedia.org/wiki/List_of_Java_bytecode_instructions
 pub const OpCode = enum(u8) {
     constant,
     equal,

@@ -254,3 +254,42 @@ pub const VM = struct {
         return error.RuntimeError;
     }
 };
+
+fn fadd(a: Value, b: Value) Value {
+    return .{ .float = a.float + b.float };
+}
+
+// fneg is fsub(0, a)
+fn fsub(a: Value, b: Value) Value {
+    return .{ .float = a.float - b.float };
+}
+
+fn fmul(a: Value, b: Value) Value {
+    return .{ .float = a.float * b.float };
+}
+
+fn fdiv(a: Value, b: Value) Value {
+    return .{ .float = a.float / b.float };
+}
+
+// TODO: for fmod and frem use std.math and handle error
+
+fn iadd(a: Value, b: Value) Value {
+    return .{ .int = a.int +% b.int };
+}
+
+fn isub(a: Value, b: Value) Value {
+    return .{ .int = a.int -% b.int };
+}
+
+fn imul(a: Value, b: Value) Value {
+    return .{ .int = a.int *% b.int };
+}
+
+fn idiv(a: Value, b: Value) Value {
+    return .{ .int = @divTrunc(a.int, b.int) };
+}
+
+fn udiv(a: Value, b: Value) Value {
+    return .{ .int = @bitCast(@as(u63, @bitCast(a.int)) / @as(u63, @bitCast(b.int))) };
+}
