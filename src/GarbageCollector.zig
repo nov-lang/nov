@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const Value = @import("Value.zig");
-const Object = Value.Object;
+const v = @import("value.zig");
+const Object = v.Object;
 const VirtualMachine = @import("vm.zig").VM;
 const log = std.log.scoped(.GC);
 
@@ -129,7 +129,10 @@ fn markRoots(self: *GarbageCollector) !void {
     }
 }
 
-fn markValue(self: *GarbageCollector, value: Value) !void {
+fn markValue(self: *GarbageCollector, value: v.Value) !void {
+    // TODO: how to know if it's an object?
+    // mark one bit of the value to know if it's an object
+    // so we have 63 bits int...
     if (value.is(.obj)) {
         try self.markObject(value.as(.obj));
     }

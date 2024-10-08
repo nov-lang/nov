@@ -1,6 +1,5 @@
 const std = @import("std");
 const Parser = @import("Parser.zig");
-const Value = @import("Value.zig");
 const Sema = @import("Sema.zig");
 
 pub fn main() !void {
@@ -115,16 +114,6 @@ pub fn main() !void {
     //         },
     //     }
     // }
-
-    // const s = try Value.String.init(allocator, "Hello, world!");
-    // std.debug.print("{}\n", .{s.value()});
-    // const n = Value.create(128);
-    // std.debug.print("{}\n", .{Value.eql(.uint, n, Value.create(128))});
-    // std.debug.print("Value: {}\n", .{n});
-
-    // var x = try Value.BigInt.init(allocator);
-    // x.mutable.set(123);
-    // std.debug.print("{obj(b)}\n", .{x.value()});
 }
 
 const Color = enum(u8) {

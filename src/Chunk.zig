@@ -1,5 +1,5 @@
 const std = @import("std");
-const Value = @import("Value.zig");
+const Value = @import("value.zig").Value;
 const Ast = @import("Ast.zig");
 
 const Chunk = @This();

@@ -1,7 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Chunk = @import("Chunk.zig");
-const Value = @import("Value.zig");
+const v = @import("value.zig");
+const Value = v.Value;
 const compiler = @import("compiler.zig");
 const debug = @import("debug.zig");
 
