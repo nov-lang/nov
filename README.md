@@ -31,22 +31,25 @@ Fix this README, add links where there should be e.g. for colored async above.
 - https://ocaml.org/docs/basic-data-types#options--results
 
 ## Proposals and stuff to add
+- make all variable constant, all functions pure and remove mut keyword (obviously)
+  - which specific case would be lost by not having mutable values?
+  - the compiler (or vm?) can perform mutation where it's guarented to have no side effect
 - modes / arg options:
   - build: output a file with nov bytecode
   - run: run in a VM either a .nov file or a .novc file
   - repl: run the repl
   - fmt: format nov code
 - target JVM?
-- output native code?
+- output native code? (make a tracing GC or see [V's autofree](https://docs.vlang.io/memory-management.html))
+- output C? (kinda weird why not just target LLVM which will probably result in faster compilation)
 - support JIT? (JIT in another thread btw)
 - add tests, mainly for Parser, IR and VM
 - Error type for each step (~Tokenizer, Parser~, IR, Codegen, Runtime)
 - forward reference
-- string interpolation like "${variable name}"
-- separate int, uint, float and string operations. e.g. + for int/uint, +. for float, ++ for string
-- replace , with | in match prong?
+- string interpolation like `"${varname:[fill][alignment][width][.precision][type]}"`
 - handle SIG.INT correctly, need to write an alternative to isocline in zig
 - in repl mode output statement result by default
+  - add a print instruction right before a statement if it returns another type than ()
 - separate codegen, VM and CLI to allow embedding nov into another project and to
   make it easier to implement JIT or native compilation
   - see [this](https://wren.io/embedding/) for embedding
@@ -69,13 +72,11 @@ Fix this README, add links where there should be e.g. for colored async above.
 - add async/await/yield
   - see go coroutines and other languages way of doing it
   - see wren's [fibers](https://wren.io/concurrency.html)
+  - see https://docs.vlang.io/concurrency.html
 - add throw/try/catch
   - try and catch like in zig
   - throw used to return an error (or just return a error.XXX like zig?)
 - add generics
-- remove `loop` loops?
-- remove `while` loops?
-- add `do while` loops or `repeat until` loops?
 - monads, there already here but with specific `>>=` bind function
 - add an FFI with C and bindings for zig
 - add `_ =` or `() =` or `let () =` to discard the return of a function and make
@@ -83,29 +84,30 @@ Fix this README, add links where there should be e.g. for colored async above.
   called expression statement and it's fine to ignore their result just to
   trigger the side effects of evaluating the expression) (actually yes, we
   shouldn't ignore a non () return)
-- compilation error when trying to add/compare value of different type if there
-  is no method for the operator and underlying type. e.g. it is possible to do
-  "a" * 3 if String.mul(String, int) or Integer.mul(int, String) is implemented.
 - add operator overloading:
-  - note for bytecode, replace add, etc... bytecode with function call,
-    try to find a way to make function calls or at least these kind of function call extra lightweight
+  - compilation error when trying to use an operator for values of different types
+  - compilation error when trying to use an operator that is not defined for the said value
+  - try to find a way to make function calls or at least these kind of function call extra lightweight
   - implem `>=`, `==`, `<`, etc... with Object.order() wich should return a std.math.Order
-  - `+` binary op is syntaxic sugar for Object.add
+  - `+` binary op is syntaxic sugar for Object.add, or iadd/fadd for int/float
   - `!` postfix unary op is syntaxic sugar for Object.unwrap (idk about name,
     should only be available for Result and Option)
   - How to handle string * int?
-    - handle Object.add(a: Object, b: OtherObject), make it clear in the
-      doc/language that this is possible, look at rust traits
+    - handle Object.mul(a: Object, b: OtherObject), make it clear in the
+      doc/language that this is possible, look at rust traits (no)
     - just disallow and compile error (no)
+    - just add a method (yes, String.repeat())
   - How to handle int + float? or big_int + int?
-    - have to cast variable e.g. `3.to(BigInt)`
-    - have seemless transition between numbers types, at least for int and big int
+    - have to cast variable e.g. `3.to(float)` or builtin
+    - have seemless transition between numbers types, at least for int and uint
+    - for big_int use addScalar
+- disallow operation between int and floats? what about between int and uint?
 - automatically convert int to big int on arithmetic overflow instead of crashing,
   big int has the same type as int (in user program) but not the same representation
-- remove uint? (yes, remove uint value and use raw u64 for both, the representation
-  should be handled with the variable inner type (nan boxing is useless))
+  (no this is cool imo but too much overhead)
 - optimize tail call recursion
 - tree shaking
+- constant folding
 - The polymorphism in [Functions](#Functions) can be too weird and complex
   - maybe just do like zig and accept a type as parameter instead
   - just have generics and disallow polymorphism (no)
@@ -115,8 +117,14 @@ Fix this README, add links where there should be e.g. for colored async above.
 - make nov embeddable, just make the compiler and VM like a library and provide bindings to them
 - add cache either in cwd or in $XDG_CACHE_HOME/nov/... (ofc finding the dir is
   handled by known-folders) like \_\_pycache__
-- > Learn from CPython and store local variables in the frame itself instead of in a dict — this is much faster (see LOAD_FAST and STORE_FAST)
-- for repl add a print instruction right before a statement if it returns another type than ()
+- add the `rune` primitive which represents a unicode code point
+  - handle char_literal in tokenizer/parser and remove ' notation for strings
+- add interfaces?
+- add generics instead of function that accept a type?
+- autodoc with doc comments `;;;`
+- package system
+- [compile time pseudo variables](https://docs.vlang.io/conditional-compilation.html#compile-time-pseudo-variables)?
+- add defer?
 
 ## Notes
 - Check previous step of crafting interpreters and implement them with
@@ -133,7 +141,9 @@ Fix this README, add links where there should be e.g. for colored async above.
 - See [What are the NO's in GO design?](https://kuree.gitbooks.io/the-go-programming-language-report/content/32/text.html)
 - Import file as value like zig
   - `import "std"` or `let std = import "std"`
-  - When importing other files only declarations gets imported?
+  - When importing other files only declarations gets imported which means that
+    if there is a print in global scope in a library it will be ignored (or
+    error?)
 - Check [roc-lang](https://www.roc-lang.org/examples/FizzBuzz/README.html) function pipes usage (instead of monads)
 - Check [OCaml Loops](https://ocaml.org/docs/loops-recursion) for nov loops
 
@@ -143,18 +153,27 @@ Fix this README, add links where there should be e.g. for colored async above.
 - `@This()`: Same as zig, return the type of the current container.
 - `@import()`: Import a nov file.
 - `@TypeOf(val: any)`: Returns the type of a value.
-- `@print()`: TODO
-- `@panic()`: TODO
+- `@print(s: string)`: Output `s` to stdout. (supports string interpolation)
+                       TODO: what about println and printf? what about print to another file?
+- `@eprint(s: string)`: Output `s` to stderr.
+- `@panic(s: string)`: Output `s` and backtrace to stderr, then terminate the program with error code 1.
 - `@range()`: TODO
 - `@max()`: TODO
 - `@min()`: TODO
+- `@dump()`: TODO: https://docs.vlang.io/builtin-functions.html#dumping-expressions-at-runtime
+- `@embedFile()`: TODO, also allow for compressing the file
+- see https://docs.vlang.io/conditional-compilation.html
 
 ### Functions
+Arguments are immutable by default unless mut is specified.
+TODO: variable number of arguments? (just use an array)
 ```nov
 let doNothing = () -> () {}
 @TypeOf(doNothing) ; returns `() -> ()`
 
-let retNothing = (x: int) -> () {
+; note that even if x is mutable, the variable given as argument will not
+; change because int are passed as value
+let retNothing = (mut x: int) -> () {
     x += 1
 }
 @TypeOf(retNothing) ; returns `(int) -> ()`
@@ -185,9 +204,39 @@ let add = (x: :a, y: :a) -> :a {
 @TypeOf(add) ; returns `(:a, :a) -> :a`
 ```
 
+This is without parenthesis for args and return but idk if there should
+actually be parenthesis. Adding parenthesis would kinda make sense with e.g.
+`f()` is call f with 0 arg which is (), or return () is return nothing which
+add sense to the () type/value but `(int)` as return type is ugly.
+- Maybe make parenthesis mandatory only for args
+- or make parenthesis mandatory only if there is multiple args (yes, ez way to
+  distinguish simple_fn_proto with fn_proto)
+```nov
+let add = a: int, b: int -> int {
+    a + b
+}
+
+; return multiple values
+let div = a: int, b: int -> int, int {
+    a / b, a % b
+}
+
+; async func, can be run normally or async
+let range = n: int -^ int -> () {
+    for i in 0..n {
+        yield i
+    }
+}
+```
+
 ### Enum
 Nov enums are just like C enums except that they can have methods and are not
 global.
+
+TODO:
+- is it possible to do `let x: MyEnum = .xxx` also for match do we specify the `.`?
+- add a way to convert a int to enum and enum to int.
+- add a way to create an enum from a string.
 ```nov
 let MyEnum = enum {
     x ; default to 0
@@ -202,9 +251,20 @@ let MyEnum = enum {
 let x: MyEnum = MyEnum.x
 let y = MyEnum.y ; type is inferred
 x.eql(y) |> println ; print false
+
+match x {
+    x => ... ; do something
+    y, z => {} ; do nothing
+}
 ```
 
 ### Struct
+TODO:
+- pub/priv keyword, also mut keyword?
+- add a way to init a struct without its type like in zig or c99?
+- support anonymous structs, useful for json, I think it's easy since struct is
+  like a function that returns a type but syntax is ugly outside of a struct
+  which is fine and intended
 ```nov
 let MyStruct = struct {
     name: string
@@ -217,14 +277,55 @@ let MyStruct = struct {
     let init = (name: string) -> MyStruct {
         MyStruct{ .name = name }
     }
+
+    ; TODO: should we omit the type on self?
+    let eql = (self: MyStruct, other: MyStruct) -> bool {
+        ; side note, parenthesis allows to bypass newline checks
+        return (
+            self.name == other.name and
+            self.x == other.x and
+            self.y == other.y and
+            self.z == other.z
+        )
+    }
 }
 
-let x = MyStruct.init("aaa") ; same as let x = MyStruct{ .name = name }
-x |> println ; idk what this prints
+let a = MyStruct{} ; error: missing struct field: name
 
-; TODO: remove this, tuples used to be anonymous structs
-; let tuple = .{ 0, 1, 2 }
-; @TypeOf(tuple) |> println
+let x = MyStruct.init("aaa")
+let y = MyStruct{ .name = "aaa" }
+x.eql(y) ; true
+x |> println ; idk what this prints
+```
+
+### Union
+See [Result and Option unions](#result-and-option-unions) for another example.
+```nov
+let MyUnion = union {
+    a: int
+    b: float
+    c: int
+    d: string
+}
+
+let x = MyUnion{ .b = 3 };
+x.a ; error
+
+let Tree = union {
+    empty
+    node: struct {
+        value: int
+        left: Tree
+        right: Tree
+    }
+
+    let sum = (self: Tree) -> int {
+        match self {
+            empty => 0
+            node => |n| n.value + n.left.sum() + n.right.sum()
+        }
+    }
+}
 ```
 
 ### Result and Option unions
@@ -232,6 +333,14 @@ The Result and Option unions are created with functions since types are values.
 In nov there is no untagged union thus  we can match on any union to find the
 active field. Note that it isn't represented here but an union field can have a
 default value just like a struct field.
+
+TODO: Add sugar for Result and Option:
+- !T is Result(T), this implies that Result.err is a string which should be fine?
+- ?T is Option(T)
+- expr! is unwrap or propagate for result
+- expr? is unwrap or propagate for option
+
+See https://docs.vlang.io/type-declarations.html#optionresult-types-and-error-handling
 ```nov
 let Result = (T: type, E: type) -> type {
     union {
@@ -268,18 +377,40 @@ let prod = x! * y! ; not sure about syntax (this returns an error btw)
 ```
 
 ### Array
-```
-let mut my_array = [ 0, 1, 2, 3, 4 ]
-@TypeOf(my_array) ; returns []int
-my_array.len == 5 ; true, should this be a function?
-my_array[1] == 1 ; true
-my_array += 3
-my_array |> println ; prints [ 0, 1, 2, 3, 4, 5 ]
+Side note about mutability. A constant array cannot be modified in any way, its
+values are constant too. A mutable array can be reassigned/extanded and its
+values can be modified.
 
-let my_array_of_array = [ [ "Hello", "World!" ], [ "Boujour", "Monde!" ] ]
+TODO:
+- add a way to initialize the capacity of an array without adding any element
+  - `let x = []int.initCapacity(50)` x is an array with len = 0 but with capacity = 50
+  - use a builtin?
+- add a way to repeat an array like a string, allow to use that as an initializer
+  - `let x = [1].repeat(50)` x is an array of 50 int with value 1
+  - `let x = [@as(uint, 1)].repeat(50)` x is an array of 50 uint with value 1
+  - `let x: []uint = [1].repeat(50)` x is an array of 50 uint with value 1
+
+See [1](https://docs.vlang.io/v-types.html#array-methods) [2](https://docs.vlang.io/v-types.html#array-method-chaining)
+```nov
+let mut my_array = [ 1, 2, 3 ]
+@TypeOf(my_array) ; returns []int
+my_array.len == 3 ; true, should `len` be a function?
+my_array[0] == 1 ; true
+my_array[-1] == 3 ; true
+my_array << 5 ; TODO: push operator for arrays
+my_array |> println ; prints [ 1, 2, 2, 5 ]
+my_array += [ 1, 1, 7 ]
+my_array |> println ; prints [ 1, 2, 3, 5, 1, 1, 7 ]
+6 in my_array ; false (TODO: this should be vectorized with std.mem.indexOf(Scalar))
+; TODO: also implem `in` for map (check for key obviously)
+my_array = []
+@TypeOf(my_array) ; still return []int
+
+let my_array_of_array = [ [ "Hello", "World!" ], [ "Bonjour", "Monde!" ] ]
 @TypeOf(my_array_of_array) ; returns [][]string
 let arr_arr = my_array_of_array ; alias because it's long to type
 arr_arr.len == 2 ; true
+
 ; python like way of printing the array
 for arr in arr_arr {
     for w in arr {
@@ -287,14 +418,28 @@ for arr in arr_arr {
     }
     println()
 }
-; functional way, I think
-arr_arr >>= |arr| arr + " " |> println
+
+; functional way, I think, add another way with .map()
+arr_arr >>= |arr| {
+    arr >>= |word| word + " " |> print
+    println()
+}
 ```
+
+### Slice
+TODO: https://docs.vlang.io/v-types.html#array-slices
+
+### Map
+TODO: https://docs.vlang.io/v-types.html#maps
+Our implem is different, check src/value.zig.
 
 ### Match
 TODO: proposal for match expression.
+
 Allow to match strings? (also allow to match like startsWith, endsWith?)
-```
+
+TODO: check https://docs.vlang.io/statements-&-expressions.html#match
+```nov
 let x = 3
 let idk = match x {
     0 => 0
@@ -303,28 +448,94 @@ let idk = match x {
 }
 ```
 
-### Operator overloading
-TODO
-Binary Arithmetic
-- `+`: `add`
-- `-`: `sub`
-- `*`: `mul`
-- `/`: `div`
-- `%`: `mod`
-Postfix Unary
-- `!`: TODO
-- `[]`: TODO
-Relational
-`<`, `>`, `==`, `<=`, `>=` are all implemented with the `order()` function.
-Monad
-- `>>=`: TODO
+### For loop
+TODO: almost all of [v implem](https://docs.vlang.io/statements-&-expressions.html#for-loop) is perfect.
+```nov
+for i in x..y {
+    ; i = x, x + 1, ..., y - 2, y - 1
+    ; how to use for loop for reverse iteration?
+}
+
+for e in ["H", "E", "Y"] {
+    ; e = "H", "E", "Y"
+}
+
+; how to handle for loop for object?
+; use .iter() or
+; .next() that returns an Option(T) where T is the child type of the array
 ```
+
+### Operator
+TODO: add precedence
+
+TODO: it's not very clear if T is a type or a variable here.
+
+Prefix
+- `!`: `logical not` !bool
+- `-`: `negation` -int/uint/float
+- `~`: `bitwise not` ~int/uint
+- `?`: `optionify` ?T, equivalent to Option(T)
+- `!`: `resultify` !T, equivalent to Result(T)
+Infix
+- `+`: `add` int, uint, float, string, []T
+- `-`: `sub` int, uint, float
+- `*`: `mul` int, uint, float
+- `/`: `div` int, uint, float
+- `%`: `rem` int, uint
+- `&`: `bitwise and` int, uint
+- `|`: `bitwise or` int, uint
+- `^`: `bitwise xor` int, uint
+- `<<`: `left shift` int/uint << uint
+- `>>`: `right shift` int/uint >> uint
+- `or`: `logical or` bool
+- `and`: `logical and` bool
+- `==`: `equal` T == T
+- `!=`: `not equal` T != T
+- `<`: `less than` int, uint, float
+- `>`: `greater than` int, uint, float
+- `<=`: `less equal` int, uint, float
+- `>=`: `greater equal` int, uint, float
+- `<<`: `push` []T << T
+- `>>=`: `bind` T >>= |T2| ...
+- `|>`: `pipe` T |> func
+Postfix
+- `!`: `unwrapOrReturn` Result(T)!
+- `?`: `unwrapOrReturn` Option(T)?
+- `[]`: `access` string, array
+Assignment
+- `=`: `assign` let x, y, ... = T1, T2, ...
+- `+=`: `assign add` let x += T
+- `-=`: `assign sub` let x += T
+- `*=`: `assign mul` let x += T
+- `/=`: `assign div` let x += T
+- `%=`: `assign rem` let x += T
+
+TODO: what about logical and shift assign?
+
+### Operator overloading
+Operator overloading is possible on the following operators:
+- `+`: (T, T) -> T
+- `-`: (T, T) -> T
+- `-`: (T) -> T    unary negation (is it possible to autogen it from the binary op?)
+- `*`: (T, T) -> T
+- `/`: (T, T) -> T
+- `%`: (T, T) -> T
+- `<`: (T, T) -> bool
+- `==`: (T, T) -> bool
+- ~`>>=`: (T, (T) -> T2) -> T2~
+- ~`[]`: (T, int) -> T2~
+
+Note:
+- `==` is automatically generated for all types by the compiler but can be overridden.
+- `!=`, `>`, `<=`, `>=` are automatically generated when `==` and `<` are defined.
+- `+=`, `-=`... are automatically generated when the corresponding operator is defined.
+```nov
 let Complex = struct {
     re: float
     im: float
 
-    ; overload `+`
-    let add = (self: Complex, other: Complex) -> Complex {
+    ; TODO: replace `@"+"` with `@overload(+)` or `@operator(+)`
+    let @"+" = (self: Complex, other: Complex) -> Complex {
         Complex{
             .re = self.re + other.re,
             .im = self.im + other.im,
@@ -332,13 +543,18 @@ let Complex = struct {
     }
 
     ; used by print
-    ; replace by format?
-    let toString = (self: MyType) -> {
-        "{self.re} + i{self.im}"
+    ; signature must be `toString: (T) -> string` where T is the container type
+    let toString = (self: Complex) -> string {
+        "${self.re} + i${self.im}"
     }
 }
 
 let x = Complex{ .re = 5, .im = 3 }
 let y = Complex{ .re = 2, .im = 7 }
 x + y ; returns Complex{ .re = 7, .im = 10 }
+```
+
+### C FFI
+```nov
+let malloc = extern malloc: (uint) -> (voidptr)
 ```

@@ -159,11 +159,11 @@ pub fn renderError(self: Ast, parse_error: Error, writer: anytype) !void {
                 token_tags[parse_error.token + @intFromBool(parse_error.token_is_prev)].symbol(),
             });
         },
-        // .expected_labelable => {
-        //     return writer.print("expected 'while', 'for', 'inline', or '{{', found '{s}'", .{
-        //         token_tags[parse_error.token + @intFromBool(parse_error.token_is_prev)].symbol(),
-        //     });
-        // },
+        .expected_labelable => {
+            return writer.print("expected 'for' or '{{', found '{s}'", .{
+                token_tags[parse_error.token + @intFromBool(parse_error.token_is_prev)].symbol(),
+            });
+        },
         // .expected_param_list => {
         //     return writer.print("expected parameter list, found '{s}'", .{
         //         token_tags[parse_error.token + @intFromBool(parse_error.token_is_prev)].symbol(),
@@ -356,6 +356,7 @@ pub fn firstToken(self: Ast, node: Node.Index) TokenIndex {
         .loop,
         .fn_args_one,
         .fn_args,
+        .@"unreachable",
         => return main_tokens[n],
 
         .field_access,
@@ -488,6 +489,7 @@ pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
         .float_literal,
         .identifier,
         .string_literal,
+        .@"unreachable",
         => return main_tokens[n] + end_offset,
 
         .block => {
@@ -750,7 +752,6 @@ pub fn matchCase(tree: Ast, node: Node.Index) full.MatchCase {
     };
 }
 
-// TODO: while
 // TODO: for
 
 pub fn callOne(tree: Ast, node: Node.Index) full.Call {
@@ -990,6 +991,7 @@ pub const Error = struct {
         expected_block,
         expected_block_or_assignment,
         expected_statement,
+        expected_labelable,
 
         /// `expected_tag` is populated.
         expected_token,
@@ -1008,6 +1010,8 @@ pub const Node = struct {
         root,
         /// Both lhs and rhs unused.
         no_op,
+        /// Both lhs and rhs unused.
+        @"unreachable", // TODO: ? need to add to tokenizer
         /// `let a b x: c = rhs`. `Decl[lhs]`.
         /// rhs may be omitted.
         /// Can be local or global.
@@ -1052,7 +1056,9 @@ pub const Node = struct {
         assign_bit_or,
         /// `lhs = rhs`. main_token is op.
         assign,
-        // TODO: assign_destructure
+        // TODO: multi_assign (assign_destructure in zig), WE DO NOT HAVE TUPLES!
+        // a, b = x, y
+        // how to return multiple values from a function if we do not have tuples?
         /// `lhs * rhs`. main_token is op.
         mul,
         /// `lhs / rhs`. main_token is op.
@@ -1107,7 +1113,6 @@ pub const Node = struct {
         match_range,
         /// `loop {}`. lhs is the block. rhs is unused.
         loop,
-        // TODO: while
         // TODO: for
         /// `if lhs {}`. rhs is the block.
         @"if",
@@ -1164,9 +1169,9 @@ pub const Node = struct {
         block,
         // TODO: struct, enum, container, class idk, generics too
         // TODO: builtins: import, typeof
-        // TODO: list / slice / array
-        // TODO: defer/errdefer (no)
-        // TODO: try/catch/throw basically errors
+        // TODO: array / slice
+        // TODO: defer?
+        // TODO: Result and Option syntax sugar
         // TODO: async/await/resume/suspend/nosuspend/yield
     };
 

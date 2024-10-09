@@ -1,9 +1,35 @@
 const std = @import("std");
+const Tokenizer = @import("Tokenizer.zig");
 const Parser = @import("Parser.zig");
+const Ast = @import("Ast.zig");
 const Sema = @import("Sema.zig");
 
-pub fn main() !void {
-    const source = "0 + 1 + 1 + 0 + 3\n";
+pub fn main() !u8 {
+    const source =
+        // \\let add_neg = (a: int, b: int) -> int {
+        // \\    let sum = a + b
+        // \\    -sum
+        // \\}
+        // \\let x = MyStruct{
+        // \\    .a = 1,
+        // \\    .b = 2,
+        // \\}
+        \\let a = 1 + 2 + 3 + 4
+        \\let a = 1 + 2 +
+        \\    3 + 4
+        \\let a = 1 + 2
+        \\    + 3 + 4
+        \\let a = (
+        \\    1 + 2 + 3
+        \\    + 4
+        \\)
+        // \\let sum = a + b
+        // \\-sum
+        \\
+    ;
+    const neighbours =
+        1 + 2 + 3 + 4;
+    _ = neighbours;
     // const source = "-123 * (45.67)\n";
     // const source =
     //     \\let x = -3
@@ -57,6 +83,10 @@ pub fn main() !void {
     var ast = try Parser.parse(allocator, source);
     defer ast.deinit(allocator);
 
+    // try dumpAst(ast);
+    // var ast = try readAst(allocator);
+    // defer ast.deinit(allocator);
+
     for (ast.rootStmts()) |stmt| {
         for (ast.firstToken(stmt)..ast.lastToken(stmt) + 1) |token| {
             std.debug.print("{s} ", .{ast.tokenSlice(@intCast(token))});
@@ -95,13 +125,13 @@ pub fn main() !void {
             }
             try stderr.writeAll("\n" ++ Color.reset);
         }
-        std.process.exit(1);
+        return 1;
     }
 
-    const nir = try Sema.generate(allocator, ast);
-    for (0..nir.instructions.len) |i| {
-        std.debug.print("Instruction {}: {}\n", .{ i, nir.instructions.get(i) });
-    }
+    // const nir = try Sema.generate(allocator, ast);
+    // for (0..nir.instructions.len) |i| {
+    //     std.debug.print("Instruction {}: {}\n", .{ i, nir.instructions.get(i) });
+    // }
 
     // const nir = try Sema.generate(allocator, &ast);
     // for (Sema.root) |ref| {
@@ -114,6 +144,80 @@ pub fn main() !void {
     //         },
     //     }
     // }
+
+    return 0;
+}
+
+fn readAst(allocator: std.mem.Allocator) !Ast {
+    var f = try std.fs.cwd().openFile("ast.json", .{});
+    defer f.close();
+    var br = std.io.bufferedReader(f.reader());
+
+    const AstJson = struct {
+        source: []u8,
+        token_tags: []Tokenizer.Token.Tag,
+        token_starts: []Tokenizer.ByteOffset,
+        node_tags: []Ast.Node.Tag,
+        node_tokens: []Ast.TokenIndex,
+        node_data: []Ast.Node.Data,
+        extra_data: []Ast.Node.Index,
+    };
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var jr = std.json.reader(arena.allocator(), br.reader());
+    const ast_json = try std.json.parseFromTokenSourceLeaky(
+        AstJson,
+        arena.allocator(),
+        &jr,
+        .{ .allocate = .alloc_if_needed },
+    );
+
+    var tokens: Ast.TokenList = .{};
+    try tokens.ensureTotalCapacity(allocator, ast_json.token_tags.len);
+    for (ast_json.token_tags, ast_json.token_starts) |tag, start| {
+        tokens.appendAssumeCapacity(.{ .tag = tag, .start = start });
+    }
+
+    var nodes: Ast.NodeList = .{};
+    try nodes.ensureTotalCapacity(allocator, ast_json.node_tags.len);
+    for (ast_json.node_tags, ast_json.node_tokens, ast_json.node_data) |tag, main_token, data| {
+        nodes.appendAssumeCapacity(.{ .tag = tag, .main_token = main_token, .data = data });
+    }
+
+    return Ast{
+        .source = try allocator.dupeZ(u8, ast_json.source),
+        .tokens = tokens.toOwnedSlice(),
+        .nodes = nodes.toOwnedSlice(),
+        .extra_data = try allocator.dupe(u32, ast_json.extra_data),
+        .errors = &[0]Ast.Error{},
+    };
+}
+
+fn dumpAst(ast: Ast) !void {
+    var f = try std.fs.cwd().createFile("ast.json", .{});
+    defer f.close();
+    var bw = std.io.bufferedWriter(f.writer());
+    defer bw.flush() catch {};
+    const writer = bw.writer();
+
+    try writer.writeAll("{");
+    try writer.writeAll("\"source\":");
+    try std.json.stringify(ast.source, .{ .emit_strings_as_arrays = true }, writer);
+    try writer.writeAll(",\"token_tags\":");
+    try std.json.stringify(ast.tokens.items(.tag), .{}, writer);
+    try writer.writeAll(",\"token_starts\":");
+    try std.json.stringify(ast.tokens.items(.start), .{}, writer);
+    try writer.writeAll(",\"node_tags\":");
+    try std.json.stringify(ast.nodes.items(.tag), .{}, writer);
+    try writer.writeAll(",\"node_tokens\":");
+    try std.json.stringify(ast.nodes.items(.main_token), .{}, writer);
+    try writer.writeAll(",\"node_data\":");
+    try std.json.stringify(ast.nodes.items(.data), .{}, writer);
+    try writer.writeAll(",\"extra_data\":");
+    try std.json.stringify(ast.extra_data, .{}, writer);
+    try writer.writeAll("}");
 }
 
 const Color = enum(u8) {

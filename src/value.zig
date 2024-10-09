@@ -15,6 +15,7 @@ pub const primitives = std.StaticStringMap(void).initComptime(.{
     // .{"undefined"}, // should be catched during compile time
     // .{"error"},
     // .{"()"},
+    // .{"type"},
 });
 
 pub fn isPrimitive(name: []const u8) bool {
@@ -100,25 +101,64 @@ pub const Value = union {
     }
 };
 
+pub const ValueType = enum {
+    bool,
+    int,
+    uint,
+    float,
+    string,
+    function,
+    array,
+    map,
+    @"struct",
+    @"enum",
+    @"union",
+
+    pub fn isObj(self: ValueType) bool {
+        return switch (self) {
+            .bool,
+            .int,
+            .uint,
+            .float,
+            => false,
+            .string,
+            .function,
+            .array,
+            .map,
+            .@"struct",
+            .@"enum",
+            .@"union",
+            => true,
+        };
+    }
+};
+
 pub const Object = packed struct(u64) {
     tag: Tag,
     is_marked: bool = false,
     next: u55 = 0,
 
     pub const Tag = enum(u8) {
-        string, // String
-        function, // Function
-        list, // List // TODO: [a, b, c, d] same as OCaml, type is `InnerType list` or `List<InnerType>` or idk
-        tuple, // Tuple // TODO: (a, b, c, d) same as OCaml
-        map, // Map
-        big_int, // BigInt
+        // see std.builtin.Type for Fn, Struct, Enum, Union
+        string,
+        function,
+        array,
+        map,
+        // TODO: each user object has a vtable?
+        @"struct", // todo: allow for struct[field name] access or @field()?
+        @"enum",
+        @"union",
 
         pub fn Type(comptime tag: Tag) type {
             return comptime switch (tag) {
                 .string => String,
                 .function => Function,
-                .big_int => BigInt,
-                else => @compileError("Unsupported tag: " ++ @tagName(tag)),
+                .array => Array,
+                .map => Map,
+                // .@"struct" => Struct,
+                // .@"enum" => Enum,
+                // .@"union" => Union,
+                else => @compileError("TODO: Implement " ++ @tagName(tag)),
             };
         }
     };
@@ -137,6 +177,14 @@ pub const Object = packed struct(u64) {
         self.next = if (next) |n| @intCast(@intFromPtr(n)) else 0;
     }
 
+    /// not implemented yet
+    /// `s`: string
+    /// `f`: function
+    /// `a`: array
+    /// `m`: map
+    /// `s`: struct // TODO: duplicate with `s` for string
+    /// `e`: enum
+    /// `u`: union
     pub fn format(
         self: *Object,
         comptime fmt: []const u8,
@@ -147,7 +195,8 @@ pub const Object = packed struct(u64) {
         return switch (self.tag) {
             .string => self.as(.string).format(fmt, options, writer),
             .function => self.as(.function).format(fmt, options, writer),
-            .big_int => self.as(.big_int).format(fmt, options, writer),
+            .array => self.as(.array).format(fmt, options, writer),
+            .map => self.as(.map).format(fmt, options, writer),
             else => unreachable, // TODO
         };
 
@@ -261,50 +310,92 @@ pub const Function = struct {
     }
 };
 
-// TODO: 3 possibilities
-// - always use big int for integers (nan boxing feels kinda useless)
-// - allow seemless conversion between int and big int (best but most complex)
-// - treat big int as a separate type (easiest but prone to overflow errors when using int)
-pub const BigInt = struct {
-    object: Object = .{ .tag = .big_int },
-    mutable: big_int.Mutable,
+/// type: []T
+/// value: [1, 2, 3, 4]
+/// access: array[n] where n is an int
+/// each values have the same type
+pub const Array = struct {
+    object: Object = .{ .tag = .array },
+    values: std.ArrayListUnmanaged(Value) = .{},
+    type: ValueType,
 
-    pub fn init(allocator: std.mem.Allocator) !BigInt {
-        const managed = try big_int.Managed.init(allocator);
-        return .{ .mutable = managed.toMutable() };
+    pub fn init(allocator: std.mem.Allocator, value_type: ValueType) !*Array {
+        const array = try allocator.create(Array);
+        array.* = .{ .type = value_type };
+        return array;
     }
 
-    pub fn deinit(self: *BigInt, allocator: std.mem.Allocator) void {
-        allocator.free(self.value.limbs);
+    pub fn deinit(self: *Array, allocator: std.mem.Allocator) void {
+        self.values.deinit(allocator);
         allocator.destroy(self);
     }
 
-    pub fn obj(self: *BigInt) *Object {
+    pub fn obj(self: *Array) *Object {
         return &self.object;
     }
 
-    pub fn value(self: *BigInt) Value {
+    pub fn value(self: *Array) Value {
         return Value.create(&self.object);
     }
 
-    pub fn orderScalar(self: BigInt, scalar: anytype) std.math.Order {
-        return self.mutable.toConst().order(.{
-            .limbs = &.{@abs(scalar)},
-            .positive = scalar >= 0,
-        });
-    }
-
-    pub fn eqlScalar(self: BigInt, scalar: anytype) bool {
-        return self.orderScalar(scalar) == .eq;
-    }
-
     pub fn format(
-        self: BigInt,
+        self: Array,
         comptime fmt: []const u8,
         options: std.fmt.FormatOptions,
         writer: anytype,
     ) @TypeOf(writer).Error!void {
-        return self.mutable.toConst().format(fmt, options, writer);
+        // TODO: use fmt to format each values
+        // can't use type because it's runtime known
+        // or have formatValue function that takes a tag instead of a fmt
+        _ = fmt;
+        try writer.print("[");
+        for (self.values.items) |val| {
+            try val.format("i", options, writer);
+            try writer.print(", ");
+        }
+        try writer.print("]");
+    }
+};
+
+/// type: [K]V
+/// value: {1: 2, 3: 4} // idk
+///        [1: 2, 3: 4]
+/// access: map[k] where k is a key of type K
+pub const Map = struct {
+    object: Object = .{ .tag = .map },
+    map: std.AutoHashMapUnmanaged(Value, Value) = .{},
+    key_type: ValueType,
+    value_type: ValueType,
+
+    pub fn init(allocator: std.mem.Allocator, key_type: ValueType, value_type: ValueType) !*Map {
+        const map = try allocator.create(Map);
+        map.* = .{ .key_type = key_type, .value_type = value_type };
+        return map;
+    }
+
+    pub fn deinit(self: *Map, allocator: std.mem.Allocator) void {
+        self.map.deinit(allocator);
+        allocator.destroy(self);
+    }
+
+    pub fn obj(self: *Map) *Object {
+        return &self.object;
+    }
+
+    pub fn value(self: *Map) Value {
+        return Value.create(&self.object);
+    }
+
+    pub fn format(
+        self: Map,
+        comptime fmt: []const u8,
+        options: std.fmt.FormatOptions,
+        writer: anytype,
+    ) @TypeOf(writer).Error!void {
+        _ = self;
+        _ = fmt;
+        _ = options;
+        // TODO
     }
 };
 

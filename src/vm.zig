@@ -272,8 +272,6 @@ fn fdiv(a: Value, b: Value) Value {
     return .{ .float = a.float / b.float };
 }
 
-// TODO: for fmod and frem use std.math and handle error
-
 fn iadd(a: Value, b: Value) Value {
     return .{ .int = a.int +% b.int };
 }
@@ -292,4 +290,12 @@ fn idiv(a: Value, b: Value) Value {
 
 fn udiv(a: Value, b: Value) Value {
     return .{ .int = @bitCast(@as(u63, @bitCast(a.int)) / @as(u63, @bitCast(b.int))) };
+}
+
+fn irem(a: Value, b: Value) Value {
+    return .{ .int = @rem(a.int, b.int) };
+}
+
+fn urem(a: Value, b: Value) Value {
+    return .{ .int = @bitCast(@as(u63, @bitCast(a.int)) % @as(u63, @bitCast(b.int))) };
 }

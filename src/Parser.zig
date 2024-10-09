@@ -1,6 +1,30 @@
 // Originally based on https://github.com/ziglang/zig/blob/master/lib/std/zig/Parse.zig
 // See https://github.com/ziglang/zig/blob/master/LICENSE for additional LICENSE details
 
+// TODO!:
+// let a = 1 + 2 ; no error, terminator is '\n'
+// let a = 1 + 2 + ; error: expected expression, found '\n'
+//     4 + 5
+// let a = 1 + 2
+//    + 4 + 5 ; error: expected expression, found '+'
+// let a = (
+//     1 + 2 + ; no error, we ignore newlines and the expr ends on ')\n'
+//     3 + 4
+// )
+// let x = [ 1, 2, ] ; no error, terminator is ']\n'
+// let x = [
+//     1,
+//     2,
+// ] ; no error, we ignore newlines and the expr ends on ']\n'
+// let x = MyStruct{ .a = 1, .b = 2, } ; no error, terminator is '}\n'
+// let x = MyStruct{
+//     .a = 1,
+//     .b = 2,
+// } ; no error, we ignore newlines and the expr ends on '}\n'
+// ; note that it's fine to have a trailing comma in a struct literal
+// ; TODO: multiline string literals
+// TODO: should currentTokenTag be used everywhere?
+
 const std = @import("std");
 const Tokenizer = @import("Tokenizer.zig");
 const Token = Tokenizer.Token;
@@ -21,6 +45,7 @@ nodes: Ast.NodeList,
 extra_data: std.ArrayListUnmanaged(Node.Index),
 errors: std.ArrayListUnmanaged(Ast.Error),
 scratch: std.ArrayListUnmanaged(Node.Index),
+ignore_newlines: bool,
 
 pub fn parse(allocator: std.mem.Allocator, source: [:0]const u8) std.mem.Allocator.Error!Ast {
     var tokens: Ast.TokenList = .{};
@@ -52,6 +77,7 @@ pub fn parse(allocator: std.mem.Allocator, source: [:0]const u8) std.mem.Allocat
         .extra_data = .{},
         .errors = .{},
         .scratch = .{},
+        .ignore_newlines = false,
     };
     defer parser.nodes.deinit(allocator);
     defer parser.extra_data.deinit(allocator);
@@ -111,7 +137,7 @@ fn parseTopLevel(self: *Parser) std.mem.Allocator.Error!void {
 
 /// Stmt <- Decl / ExprStmt
 fn expectStmt(self: *Parser) Error!Node.Index {
-    switch (self.token_tags[self.tok_i]) {
+    switch (self.currentTokenTag()) {
         .keyword_let => return self.expectDecl(),
         else => return self.expectExprStmt(),
     }
@@ -245,7 +271,7 @@ fn parseExprPrecedence(self: *Parser, min_prec: Precedence) Error!Node.Index {
     var banned_prec: Precedence = .none;
 
     while (true) {
-        const tok_tag = self.token_tags[self.tok_i];
+        const tok_tag = self.currentTokenTag();
         const rule = rules[@intFromEnum(tok_tag)];
         if (@intFromEnum(rule.prec) < @intFromEnum(min_prec)) {
             return node;
@@ -291,7 +317,7 @@ fn parseExprPrecedence(self: *Parser, min_prec: Precedence) Error!Node.Index {
 /// PrefixExpr <- PrefixOp* PrimaryExpr
 /// PrefixOp <- EXCLAMATIONMARK / MINUS / TILDE
 fn parsePrefixExpr(self: *Parser) Error!Node.Index {
-    const tag: Node.Tag = switch (self.token_tags[self.tok_i]) {
+    const tag: Node.Tag = switch (self.currentTokenTag()) {
         .bang => .bool_not,
         .minus => .negation,
         .tilde => .bit_not,
@@ -327,7 +353,7 @@ fn expectPrefixExpr(self: *Parser) Error!Node.Index {
 ///      / Block
 ///      / CurlySuffixExpr
 fn parsePrimaryExpr(self: *Parser) Error!Node.Index {
-    switch (self.token_tags[self.tok_i]) {
+    switch (self.currentTokenTag()) {
         .keyword_if => return self.expectIfExpr(),
         .keyword_break => return self.addNode(.{
             .tag = .@"break",
@@ -363,10 +389,6 @@ fn parsePrimaryExpr(self: *Parser) Error!Node.Index {
                     //     self.tok_i += 2;
                     //     return self.parseForExpr();
                     // },
-                    // .keyword_while => {
-                    //     self.tok_i += 2;
-                    //     return self.parseWhileExpr();
-                    // },
                     .l_brace => {
                         self.tok_i += 2;
                         return self.parseBlock();
@@ -378,7 +400,6 @@ fn parsePrimaryExpr(self: *Parser) Error!Node.Index {
             }
         },
         // .keyword_for => return self.parseForExpr(),
-        // .keyword_while => return self.parseWhileExpr(),
         // .keyword_match => return self.parseMatchExpr(),
         .l_brace => return self.parseBlock(),
         // .keyword_enum, .keyword_struct, .keyword_union => {
@@ -406,7 +427,7 @@ fn expectIfExpr(self: *Parser) Error!Node.Index {
         });
     }
 
-    const else_expr = if (self.token_tags[self.tok_i] == .keyword_if)
+    const else_expr = if (self.currentTokenTag() == .keyword_if)
         try self.expectIfExpr()
     else
         try self.expectBlock();
@@ -518,7 +539,7 @@ fn parseCurlySuffixExpr(self: *Parser) Error!Node.Index {
 /// PrefixTypeOp <- QUESTIONMARK / ArrayTypeStart
 /// ArrayTypeStart <- LBRACKET RBRACKET
 fn parseTypeExpr(self: *Parser) Error!Node.Index {
-    switch (self.token_tags[self.tok_i]) {
+    switch (self.currentTokenTag()) {
         .question_mark => return self.addNode(.{
             .tag = .optional_type,
             .main_token = self.nextToken(),
@@ -576,6 +597,7 @@ fn parseSuffixExpr(self: *Parser) Error!Node.Index {
             const param = try self.expectExpr();
             try self.scratch.append(self.allocator, param);
             switch (self.token_tags[self.tok_i]) {
+                .newline => {}, // TODO?
                 .comma => self.tok_i += 1,
                 .r_paren => {
                     self.tok_i += 1;
@@ -620,7 +642,7 @@ fn parseSuffixExpr(self: *Parser) Error!Node.Index {
 // TODO: complete all cases
 /// TupleTypeExpr <- LPAREN TypeExpr (COMMA TypeExpr)* RPAREN // TODO
 fn parsePrimaryTypeExpr(self: *Parser) Error!Node.Index {
-    switch (self.token_tags[self.tok_i]) {
+    switch (self.currentTokenTag()) {
         .keyword_true, .keyword_false => return self.addNode(.{
             .tag = .bool_literal,
             .main_token = self.nextToken(),
@@ -682,12 +704,16 @@ fn parsePrimaryTypeExpr(self: *Parser) Error!Node.Index {
         },
         .l_paren => {
             // TODO: handle function
-            // TODO: handle tuple
             return self.addNode(.{
                 .tag = .grouped_expression,
                 .main_token = self.nextToken(),
                 .data = .{
-                    .lhs = try self.expectExpr(),
+                    .lhs = blk: {
+                        self.ignore_newlines = true;
+                        const expr = try self.expectExpr();
+                        self.ignore_newlines = false;
+                        break :blk expr;
+                    },
                     .rhs = try self.expectToken(.r_paren),
                 },
             });
@@ -734,9 +760,23 @@ fn addExtra(self: *Parser, extra: anytype) Error!Node.Index {
 
 /// Returns current token and advances the token index
 fn nextToken(self: *Parser) TokenIndex {
+    if (self.ignore_newlines) {
+        while (self.token_tags[self.tok_i] == .newline) {
+            self.tok_i += 1;
+        }
+    }
     const result = self.tok_i;
     self.tok_i += 1;
     return result;
+}
+
+fn currentTokenTag(self: *Parser) Token.Tag {
+    if (self.ignore_newlines) {
+        while (self.token_tags[self.tok_i] == .newline) {
+            self.tok_i += 1;
+        }
+    }
+    return self.token_tags[self.tok_i];
 }
 
 fn expectToken(self: *Parser, tag: Token.Tag) Error!TokenIndex {
@@ -760,12 +800,6 @@ fn expectNewline(self: *Parser, error_tag: Ast.Error.Tag, recoverable: bool) Err
 // TODO: result is weird because newline is a token and used like a semicolon
 fn tokensOnSameLine(self: *Parser, tok1: TokenIndex, tok2: TokenIndex) bool {
     return std.mem.indexOfScalar(u8, self.source[self.token_starts[tok1]..self.token_starts[tok2]], '\n') == null;
-}
-
-fn discardNewlines(self: *Parser) void {
-    while (self.token_tags[self.tok_i] == .newline) {
-        self.tok_i += 1;
-    }
 }
 
 fn eatToken(self: *Parser, tag: Token.Tag) ?TokenIndex {
