@@ -1,34 +1,34 @@
-# nov
+# Nov
 
-nov is a functional programming language.
+Nov is a functional programming language.
 
-nov type system is strong and sound. idk about static or dynamic yet. also most types should be inferrable.
+Nov type system is strong and sound. idk about static or dynamic yet. also most types should be inferrable.
 
-nov has uncolored async! (well not yet tho)
+Nov has uncolored async! (well not yet tho)
 
-nov code is compiled to bytecode then run in the NVM (Nov Virtual Machine). (This name sucks)
+Nov code is compiled to bytecode then run in the NVM (Nov Virtual Machine). (This name sucks)
 
-nov main inspirations are Zig and OCaml.
+Nov main inspirations are Zig and OCaml.
 
 # TODO
-Implement basic IR then codegen to try it before adding more features
+Next step: add new IR that
+- forward declaration
+- resolve literals
+- replace operator overloading?
+- have more usage safety than Ast
+- start storing values in a constant pool
 
-It's fine to keep arena fucked up allocation fest until GC implementation
+Separate frontend (Tokenizer, Parser, IRs) from backend (Codegen, ...).
+Also separate CLI, REPL and VM from all the that.
+
+Figure out what (first) backend to chose
+- A language, probably C but can be Zig or something else
+- A VM, a custom one or the JVM
+  - a custom one allow support for JIT
+- Native, either unoptimized for fun or dig into LLVM
+  - make a tracing GC or see [V's autofree](https://docs.vlang.io/memory-management.html)
 
 Fix this README, add links where there should be e.g. for colored async above.
-
-## Crafting Interpreters
-- https://craftinginterpreters.com/local-variables.html#challenges
-- https://craftinginterpreters.com/global-variables.html#challenges
-- match, break, continue: https://craftinginterpreters.com/jumping-back-and-forth.html#challenges
-- next step: https://craftinginterpreters.com/calls-and-functions.html
-
-## Grammar
-- https://craftinginterpreters.com/appendix-i.html
-- https://github.com/ziglang/zig-spec/blob/master/grammar/grammar.peg
-- https://doc.rust-lang.org/stable/reference/introduction.html
-- https://ocaml.org/docs/values-and-functions#the-pipe-operator
-- https://ocaml.org/docs/basic-data-types#options--results
 
 ## Proposals and stuff to add
 - make all variable constant, all functions pure and remove mut keyword (obviously)
@@ -39,38 +39,22 @@ Fix this README, add links where there should be e.g. for colored async above.
   - run: run in a VM either a .nov file or a .novc file
   - repl: run the repl
   - fmt: format nov code
-- target JVM?
-- output native code? (make a tracing GC or see [V's autofree](https://docs.vlang.io/memory-management.html))
-- output C? (kinda weird why not just target LLVM which will probably result in faster compilation)
-  - actually it's not a bad idea
-- support JIT? (JIT in another thread btw)
-- add tests, mainly for Parser, IR and VM
-- Error type for each step (~Tokenizer, Parser~, IR, Codegen, Runtime)
-- forward reference
-- string interpolation like `"${varname:[fill][alignment][width][.precision][type]}"`
+    - works like zig fmt but for nov
+    - rename variable, functions and types to snake_case, camelCase and PascalCase?
+- add tests, mainly for Parser, IRs, Codegen and Runtime
+- Error type for each step (~Tokenizer, Parser~, IRs, Codegen, Runtime)
 - handle SIG.INT correctly, need to write an alternative to isocline in zig
 - in repl mode output statement result by default
   - add a print instruction right before a statement if it returns another type than ()
-- separate codegen, VM and CLI to allow embedding nov into another project and to
-  make it easier to implement JIT or native compilation
-  - see [this](https://wren.io/embedding/) for embedding
 - move to zig master
   - replace `while (true) switch` with [labeled switch/continue](https://github.com/ziglang/zig/pull/21257)
     see https://github.com/ziglang/zig/pull/21367 for tokenizer
   - for vm implem debugLoop() (original with debug infos) and releaseLoop() (with labeled switch/continue)
   - add min_version for build.zig
   - update ci
-- for Value: replace pointer with raw type and use a MultiArrayList
-  - need to improve globals in VM
-  - idk how to handle it in codegen yet
 - render (parser) error with caret under the error + full line info
-- add Timer for parsing_time, codegen_time, runnning_time
-- implement correct leaking allocation to have fast exit time
-- add async/await/yield
-  - see go coroutines and other languages way of doing it
-  - see wren's [fibers](https://wren.io/concurrency.html)
-  - see https://docs.vlang.io/concurrency.html
-- add an FFI with C and bindings for zig
+- add Timer for parsing_time, codegen_time, runnning_time (or use tracy)
+- implement correct leaking allocation to have fast exit time?
 - add `_ =` or `() =` or `let () =` to discard the return of a function and make
   it mandatory to not ignore the return value from an expression? (no, these are
   called expression statement and it's fine to ignore their result just to
@@ -89,14 +73,10 @@ Fix this README, add links where there should be e.g. for colored async above.
       doc/language that this is possible, look at rust traits (no)
     - just disallow and compile error (no)
     - just add a method (yes, String.repeat())
-  - How to handle int + float? or big_int + int?
-    - have to cast variable e.g. `3.to(float)` or builtin
+  - How to handle int + float? or int + uint? or big_int + int?
+    - have to cast variable e.g. `1.0 + @as(float, 3)`
     - have seemless transition between numbers types, at least for int and uint
     - for big_int use addScalar
-- disallow operation between int and floats? what about between int and uint?
-- automatically convert int to big int on arithmetic overflow instead of crashing,
-  big int has the same type as int (in user program) but not the same representation
-  (no this is cool imo but too much overhead)
 - optimize tail call recursion
 - tree shaking
 - constant folding
@@ -104,13 +84,16 @@ Fix this README, add links where there should be e.g. for colored async above.
   - maybe just do like zig and accept a type as parameter instead
   - just have generics and disallow polymorphism (no)
 - write nov website with nov as backend? idk
-- add a way to have better OOP, interface, traits etc idk I hate OOP but it
-  sometimes stuff sucks without correct OOP
-- make nov embeddable, just make the compiler and VM like a library and provide bindings to them
 - add cache either in cwd or in $XDG_CACHE_HOME/nov/... (ofc finding the dir is
   handled by known-folders) like \_\_pycache__
 - add the `rune` primitive which represents a unicode code point
   - handle char_literal in tokenizer/parser and remove ' notation for strings
+- add u8, u16, u32, u64, u128, i8, i16, i32, i64, i128, f32, f64, f80, f128 primitives
+  - int = i32 or i64 based on architecture
+  - uint = u32 or u64 based on architecture
+  - float = f32 or f64 based on architecture
+- add a way to have better OOP, interface, traits etc idk I hate OOP but it
+  sometimes stuff sucks without correct OOP
 - add interfaces? (no)
 - add generics instead of function that accepts a type?
   - probably make compilation easier
@@ -122,22 +105,26 @@ Fix this README, add links where there should be e.g. for colored async above.
 - package system
 - [compile time pseudo variables](https://docs.vlang.io/conditional-compilation.html#compile-time-pseudo-variables)?
 - add defer?
+- add attributes like `@[inline]`?
+- formal grammar definition
+  - https://craftinginterpreters.com/appendix-i.html
+  - https://github.com/ziglang/zig-spec/blob/master/grammar/grammar.peg
+  - https://doc.rust-lang.org/stable/reference/introduction.html
+- giving "}}" to Parser result in an infinite loop
 
 ## Notes
-- Check previous step of crafting interpreters and implement them with
-  AST/Parser/IR/Codegen instead of just compiler
-- Check std.zig.Ast.parse and std.zig.Ast.tokenLocation for Ast and Parser
 - Check std.zig.AstGen, std.zig.Zir and zig/src/Sema.zig for IR
 - Check zig/src/InternPool.zig for storing variables
 - Check std.zig.start.callMainWithArgs
-- Old errors:
-  - `print i` throw a expected new line after statement which is not a very good error message
-  - giving "}}" to Parser result in an infinite loop
 - No need for parenthesis everywhere (look at rust, go and caml)
 - See [Option](https://doc.rust-lang.org/std/option) and [Result](https://doc.rust-lang.org/std/result) for nil and error
 - See [What are the NO's in GO design?](https://kuree.gitbooks.io/the-go-programming-language-report/content/32/text.html)
 - Check [roc-lang](https://www.roc-lang.org/examples/FizzBuzz/README.html) function pipes usage (instead of monads)
-- Check [OCaml Loops](https://ocaml.org/docs/loops-recursion) for nov loops
+- it's a compile error to modify a string with [] or to take a mut of a string in a for loop
+- shifting warning: `x >> y` (same for `<<`)
+  - error if y is signed
+  - warn if y >= @bitSizeOf(x): `x >> ${y} is the same as x >> ${y % @bitSizeOf(x)}`
+- Check [SSA](https://en.wikipedia.org/wiki/Static_single-assignment_form) and [CPS](https://en.wikipedia.org/wiki/Continuation-passing_style)
 
 ## Concepts
 
@@ -147,6 +134,8 @@ Fix this README, add links where there should be e.g. for colored async above.
   - When importing other files only declarations gets imported which means that
     if there is a print in global scope in a library it will be ignored (or
     error?)
+  - support relative import e.g. `@import("github.com/nov-lang/idk_lib")`
+  - support circular imports
 - `@TypeOf(...)`: Returns the type of a value.
 - `@print(...)`: Output all args separated with a space to stdout. (supports string interpolation)
                  TODO: what about printf? what about print to another file?
@@ -158,6 +147,9 @@ Fix this README, add links where there should be e.g. for colored async above.
 - `@min(a: T, b: T, ...)`: Returns the minimum value between all the supplied arguments
 - `@dump()`: TODO: https://docs.vlang.io/builtin-functions.html#dumping-expressions-at-runtime
 - `@embedFile()`: TODO, also allow for compressing the file
+- `@sizeOf()`: TODO
+- `@bitSizeOf()`: TODO
+- `@as(T: type, arg: any)`: Cast arg to T if possible.
 - see https://docs.vlang.io/conditional-compilation.html
 - see https://docs.python.org/3.12/library/functions.html
 
@@ -168,8 +160,7 @@ TODO: variable number of arguments? (just use an array)
 let doNothing = () -> () {}
 @TypeOf(doNothing) ; returns `() -> ()`
 
-; note that even if x is mutable, the variable given as argument will not
-; change because int are passed as value
+; with mut is the argument passed as reference or value?
 let retNothing = (mut x: int) -> () {
     x += 1
 }
@@ -358,6 +349,11 @@ TODO: how to return an error?
 - error(...)
 - ???
 
+TODO: sugar for concatenating multiple Result
+ - proposal: replace Union with [sum types](https://docs.vlang.io/type-declarations.html#sum-types),
+   (use `T1 || T2` syntax), see also [custom-error-types](https://docs.vlang.io/type-declarations.html#custom-error-types)
+    - allow for this syntax `let a: MyUnion = .field{value}`, omit `.`? replace `{` with `(`?
+
 See https://docs.vlang.io/type-declarations.html#optionresult-types-and-error-handling
 ```nov
 let Result = (T: type, E: type) -> type {
@@ -394,7 +390,7 @@ let b = MyOption{ .none }
 let prod = x! * y! ; not sure about syntax (this returns an error btw)
 ```
 
-### Array
+### Arrays
 Side note about mutability. A constant array cannot be modified in any way, its
 values are constant too. A mutable array can be reassigned/extanded and its
 values can be modified.
@@ -558,55 +554,89 @@ let nums = [1, 2, 3]
 @println(2 !in nums) ; false
 ```
 
-### Operator
-TODO: add precedence
+### Primitive Types
+TODO
+- bool
+- string
+- rune
 
-TODO: it's not very clear if T is a type or a variable here.
+See also:
+- [Integers](#Integers)
+- [Floats](#Floats)
+- [Arrays](#Arrays)
+- Maps
 
-Prefix
-- `!`: `logical not` !bool
-- `-`: `negation` -int/uint/float
-- `~`: `bitwise not` ~int/uint
-- `?`: `optionify` ?T, equivalent to Option(T)
-- `!`: `resultify` !T, equivalent to Result(T)
-Infix
-- `+`: `add` int, uint, float, string, []T
-- `-`: `sub` int, uint, float
-- `*`: `mul` int, uint, float
-- `/`: `div` int, uint, float
-- `%`: `rem` int, uint
-- `&`: `bitwise and` int, uint
-- `|`: `bitwise or` int, uint
-- `^`: `bitwise xor` int, uint
-- `<<`: `left shift` int/uint << uint
-- `>>`: `right shift` int/uint >> uint
-- `or`: `logical or` bool
-- `and`: `logical and` bool
-- `==`: `equal` T == T
-- `!=`: `not equal` T != T
-- `<`: `less than` int, uint, float
-- `>`: `greater than` int, uint, float
-- `<=`: `less equal` int, uint, float
-- `>=`: `greater equal` int, uint, float
-- `<<`: `push` []T << T
-- `>>=`: `bind` T >>= |T2| ...
-- `|>`: `pipe` T |> func
-- `??`: `optional fallback` Option(T) ?? T
-- `in`: `in` T in []T / T in \[K]V
-- `!in`: `not in` T !in []T / T !in \[K]V
-Postfix
-- `!`: `unwrapOrReturn` Result(T)!
-- `?`: `unwrapOrReturn` Option(T)?
-- `[]`: `access` string, array
-Assignment
-- `=`: `assign` let x, y, ... = T1, T2, ...
-- `+=`: `assign add` let x += T
-- `-=`: `assign sub` let x += T
-- `*=`: `assign mul` let x += T
-- `/=`: `assign div` let x += T
-- `%=`: `assign rem` let x += T
+### Integers
+TODO
+- u8, u16, u32, u64, u128, i8, i16, i32, i64, i128, f32, f64, f80, f128
+  - int = i32 or i64 based on architecture
+  - uint = u32 or u64 based on architecture
+  - float = f32 or f64 based on architecture
 
-TODO: what about logical and shift assign?
+### Floats
+- `float` - f32 or f64 depending on architecture
+- `f16` - IEEE-754-2008 binary16
+- `f32` - IEEE-754-2008 binary32
+- `f64` - IEEE-754-2008 binary64
+- `f80` - IEEE-754-2008 80-bit extended precision
+- `f128` - IEEE-754-2008 binary128
+<!-- - `c_longdouble` - matches long double for the target C ABI -->
+
+### Operators
+| Name                  | Syntax            | Types                                        | Remarks                                                          |
+|-----------------------|-------------------|----------------------------------------------|------------------------------------------------------------------|
+| Assignment            | a = b             | All types                                    | `a` is an identifier and `b` is any type                         |
+| Addition              | a + b <br> a += b | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                             |
+| Concatenation         | a + b <br> a += b | string <br> [Arrays](#Arrays)                | TODO                                                             |
+| Substraction          | a - b <br> a -= b | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                             |
+| Negation              | -a                | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                             |
+| Multiplication        | a * b <br> a *= b | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                             |
+| Division              | a / b <br> a /= b | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                             |
+| Remainder Division    | a % b <br> a %= b | [Integers](#Integers)                        | TODO                                                             |
+| Bit Shift Left        | a << b            | [Integers](#Integers)                        | TODO                                                             |
+| Bit Shift Right       | a >> b            | [Integers](#Integers)                        | TODO                                                             |
+| Bitwise And           | a & b             | [Integers](#Integers)                        | TODO                                                             |
+| Bitwise Or            | a \| b            | [Integers](#Integers)                        | TODO                                                             |
+| Bitwise Xor           | a ^ b             | [Integers](#Integers)                        | TODO                                                             |
+| Bitwise Not           | ~a                | [Integers](#Integers)                        | TODO                                                             |
+| Optionify             | ?T                | All types                                    | Equivalent to Option(T)                                          |
+| Optional Fallback     | a ?? b            | Option                                       | TODO                                                             |
+| Optional Unwrap       | a?                | Option                                       | TODO                                                             |
+| Resultify             | E!T <br> !T       | All types                                    | Equivalent to Result(T, E) <br> Equivalent to Result(T, string)  |
+| Result Unwrap         | a!                | Result                                       | TODO                                                             |
+| Logical And           | a **and** b       | bool                                         | TODO                                                             |
+| Logical Or            | a **or** b        | bool                                         | TODO                                                             |
+| Boolean Not           | !a                | bool                                         | TODO                                                             |
+| Equality              | a == b            | All types                                    | TODO                                                             |
+| Inequality            | a != b            | All types                                    | TODO                                                             |
+| Greater Than          | a > b             | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                             |
+| Greater or Equal      | a >= b            | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                             |
+| Less Than             | a < b             | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                             |
+| Less or Equal         | a <= b            | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                             |
+| Push                  | a << b            | [Arrays](#Arrays)                            | TODO []T << T                                                    |
+| Bind                  | a >>= \|b\| ...   | Monads                                       | TODO                                                             |
+| Function Pipe         | a \|> f           | [Functions](#Functions)                      | TODO                                                             |
+| Member Search         | a **in** b        | [Arrays](#Arrays) <br> Maps                  | TODO                                                             |
+| Access                | a\[b]             | [Arrays](#Arrays) <br> Maps <br> string      | TODO: for Arrays and string b is an Integer, for Maps it's a key |
+| Field / Method Access | a.b               | All types                                    | TODO                                                             |
+
+### Precedence
+last `<<` is push
+```
+x() x[] x.y x? x! x??y
+E!T
+x{}
+!x -x ~x ?T
+* / %
++ -
+<< >>
+& ^ | in
+== != < > <= >=
+and
+or
+|> >>=
+= *= /= %= += -= <<
+```
 
 ### Operator overloading
 Operator overloading is possible on the following operators:
@@ -618,8 +648,8 @@ Operator overloading is possible on the following operators:
 - `%`: (T, T) -> T
 - `<`: (T, T) -> bool
 - `==`: (T, T) -> bool
-- ~`>>=`: (T, (T) -> T2) -> T2~
-- ~`[]`: (T, int) -> T2~
+- TODO: `>>=`: (T, (T) -> T2) -> T2
+- TODO: `[]`: (T, int) -> T2
 
 Note:
 - `==` is automatically generated for all types by the compiler but can be overridden.
@@ -651,6 +681,9 @@ x + y ; returns Complex{ .re = 7, .im = 10 }
 ```
 
 ### C FFI
+TODO...
+
+also add binding generator for zig?
 ```nov
 let malloc = extern malloc: (uint) -> (voidptr)
 ```
@@ -669,3 +702,18 @@ let s = (
     "this is on a new line\n" +
     "yes"
 )
+```
+
+### String Interpolation
+TODO: `"${varname:[fill][alignment][width][.precision][type]}"`
+
+How to escape `${`?
+
+proposal: Replace `${}` with `{}` and escape `{` and `}` with `\`
+
+### Async
+TODO: add async/await/yield
+- see go coroutines and other languages way of doing it
+- see wren's [fibers](https://wren.io/concurrency.html)
+- see https://docs.vlang.io/concurrency.html
+- see https://buzz-lang.dev/guide/fibers.html

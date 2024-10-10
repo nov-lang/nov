@@ -2,7 +2,7 @@ const std = @import("std");
 const Tokenizer = @import("Tokenizer.zig");
 const Parser = @import("Parser.zig");
 const Ast = @import("Ast.zig");
-const Sema = @import("Sema.zig");
+const AstGen = @import("AstGen.zig");
 
 pub fn main() !u8 {
     const source =
@@ -30,14 +30,14 @@ pub fn main() !u8 {
         \\
         \\    "yes"
         \\)
+        \\let s = ("this is my string\n"
+        \\+ "this is on a new line\n" + "yes")
         // \\
         // \\let sum = a + b
         // \\-sum
         \\
     ;
-    const neighbours =
-        1 + 2 + 3 + 4;
-    _ = neighbours;
+    // const source = "}}";
     // const source = "-123 * (45.67)\n";
     // const source =
     //     \\let x = -3
@@ -136,21 +136,9 @@ pub fn main() !u8 {
         return 1;
     }
 
-    // const nir = try Sema.generate(allocator, ast);
+    // const nir = try AstGen.generate(allocator, ast);
     // for (0..nir.instructions.len) |i| {
     //     std.debug.print("Instruction {}: {}\n", .{ i, nir.instructions.get(i) });
-    // }
-
-    // const nir = try Sema.generate(allocator, &ast);
-    // for (Sema.root) |ref| {
-    //     switch (ref) {
-    //         .type => unreachable,
-    //         .value => unreachable,
-    //         .index => {
-    //             std.debug.print("Index: {}: ", .{ref.index});
-    //             std.debug.print("{}\n", .{nir.instructions.items(.tag)[ref.index]});
-    //         },
-    //     }
     // }
 
     return 0;

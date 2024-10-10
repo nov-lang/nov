@@ -5,7 +5,7 @@ const Nir = @import("Nir.zig");
 pub const Error = std.mem.Allocator.Error;
 
 // TODO: rename NirGen or something?
-const Sema = @This();
+const AstGen = @This();
 
 ast: Ast,
 allocator: std.mem.Allocator,
@@ -17,7 +17,7 @@ scope: Scope,
 pub fn generate(allocator: std.mem.Allocator, ast: Ast) Error!Nir {
     std.debug.assert(ast.errors.len == 0);
 
-    var sema: Sema = .{
+    var sema: AstGen = .{
         .ast = ast,
         .allocator = allocator,
         .instructions = .{},
@@ -49,7 +49,7 @@ const Scope = enum(u8) {
     _,
 };
 
-fn expr(self: *Sema, node: Ast.Node.Index) Error!Nir.Inst.Ref {
+fn expr(self: *AstGen, node: Ast.Node.Index) Error!Nir.Inst.Ref {
     switch (self.ast.nodes.items(.tag)[node]) {
         .root => unreachable,
 
@@ -66,13 +66,13 @@ fn expr(self: *Sema, node: Ast.Node.Index) Error!Nir.Inst.Ref {
 }
 
 // TODO
-fn rvalue(self: *Sema, raw_result: Nir.Inst.Ref, src_node: Ast.Node.Index) Error!Nir.Inst.Ref {
+fn rvalue(self: *AstGen, raw_result: Nir.Inst.Ref, src_node: Ast.Node.Index) Error!Nir.Inst.Ref {
     _ = self;
     _ = src_node;
     return raw_result;
 }
 
-fn simpleBinOp(self: *Sema, node: Ast.Node.Index, op: Nir.Inst.Tag) Error!Nir.Inst.Ref {
+fn simpleBinOp(self: *AstGen, node: Ast.Node.Index, op: Nir.Inst.Tag) Error!Nir.Inst.Ref {
     const node_data = self.ast.nodes.items(.data)[node];
     const lhs = try self.expr(node_data.lhs);
     const rhs = try self.expr(node_data.rhs);
@@ -82,7 +82,7 @@ fn simpleBinOp(self: *Sema, node: Ast.Node.Index, op: Nir.Inst.Tag) Error!Nir.In
 
 const Sign = enum { negative, positive };
 
-fn numberLiteral(self: *Sema, node: Ast.Node.Index, sign: Sign) Error!Nir.Inst.Ref {
+fn numberLiteral(self: *AstGen, node: Ast.Node.Index, sign: Sign) Error!Nir.Inst.Ref {
     const token = self.ast.nodes.items(.main_token)[node];
     const bytes = self.ast.tokenSlice(token);
     const result = switch (std.zig.parseNumberLiteral(bytes)) {
@@ -150,12 +150,12 @@ fn numberLiteral(self: *Sema, node: Ast.Node.Index, sign: Sign) Error!Nir.Inst.R
 }
 
 // TODO: used in addPlNode
-// fn nodeIndexToRelative(self: *Sema, node_index: Ast.Node.Index) i32 {
+// fn nodeIndexToRelative(self: *AstGen, node_index: Ast.Node.Index) i32 {
 //     return @as(i32, @bitCast(node_index)) - @as(i32, @bitCast(self.decl_node_index));
 // }
 
 fn addPlNode(
-    self: *Sema,
+    self: *AstGen,
     tag: Nir.Inst.Tag,
     src_node: Ast.Node.Index,
     extra: anytype,
@@ -172,13 +172,13 @@ fn addPlNode(
     });
 }
 
-fn addExtra(self: *Sema, extra: anytype) Error!u32 {
+fn addExtra(self: *AstGen, extra: anytype) Error!u32 {
     const fields = std.meta.fields(@TypeOf(extra));
     try self.extra.ensureUnusedCapacity(self.allocator, fields.len);
     return self.addExtraAssumeCapacity(extra);
 }
 
-fn addExtraAssumeCapacity(self: *Sema, extra: anytype) u32 {
+fn addExtraAssumeCapacity(self: *AstGen, extra: anytype) u32 {
     const fields = std.meta.fields(@TypeOf(extra));
     const extra_index = self.extra.items.len;
     self.extra.items.len += fields.len;
@@ -186,7 +186,7 @@ fn addExtraAssumeCapacity(self: *Sema, extra: anytype) u32 {
     return @intCast(extra_index);
 }
 
-fn setExtra(self: *Sema, index: usize, extra: anytype) void {
+fn setExtra(self: *AstGen, index: usize, extra: anytype) void {
     const fields = std.meta.fields(@TypeOf(extra));
     var i = index;
     inline for (fields) |field| {
@@ -214,11 +214,11 @@ fn setExtra(self: *Sema, index: usize, extra: anytype) void {
     }
 }
 
-fn add(self: *Sema, inst: Nir.Inst) Error!Nir.Inst.Ref {
+fn add(self: *AstGen, inst: Nir.Inst) Error!Nir.Inst.Ref {
     return (try self.addAsIndex(inst)).toRef();
 }
 
-fn addAsIndex(self: *Sema, inst: Nir.Inst) Error!Nir.Inst.Index {
+fn addAsIndex(self: *AstGen, inst: Nir.Inst) Error!Nir.Inst.Index {
     const new_index: Nir.Inst.Index = @enumFromInt(self.instructions.len);
     try self.instructions.append(self.allocator, inst);
     return new_index;
