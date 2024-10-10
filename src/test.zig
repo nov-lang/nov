@@ -23,6 +23,14 @@ pub fn main() !u8 {
         \\    1 + 2 + 3
         \\    + 4
         \\)
+        \\let s = (
+        // \\     if a == 3 { "true" } else { "false" } +
+        \\    "this is my string\n" +
+        \\    "this is on a new line\n" +
+        \\
+        \\    "yes"
+        \\)
+        // \\
         // \\let sum = a + b
         // \\-sum
         \\

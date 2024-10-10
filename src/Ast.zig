@@ -1,5 +1,5 @@
-// Originally based on https://github.com/ziglang/zig/blob/master/lib/std/zig/Ast.zig
-// See https://github.com/ziglang/zig/blob/master/LICENSE for additional LICENSE details
+//! Originally based on https://github.com/ziglang/zig/blob/master/lib/std/zig/Ast.zig
+//! See https://github.com/ziglang/zig/blob/master/LICENSE for additional LICENSE details
 
 const std = @import("std");
 const Parser = @import("Parser.zig");
@@ -349,7 +349,6 @@ pub fn firstToken(self: Ast, node: Node.Index) TokenIndex {
         .int_literal,
         .float_literal,
         .string_literal,
-        .multiline_string_literal,
         .grouped_expression,
         .block_two,
         .block,
@@ -481,7 +480,6 @@ pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
         .field_access,
         .unwrap_optional,
         .grouped_expression,
-        .multiline_string_literal,
         => return datas[n].rhs + end_offset,
 
         .bool_literal,
@@ -1153,11 +1151,6 @@ pub const Node = struct {
         /// main_token is the string literal token
         /// Both lhs and rhs unused.
         string_literal,
-        /// main_token is the first token index (redundant with lhs)
-        /// lhs is the first token index; rhs is the last token index.
-        /// Could be a series of multiline_string_literal_line tokens, or a single
-        /// string_literal token.
-        multiline_string_literal,
         /// `(lhs)`. main_token is the `(`
         /// rhs is the token index of the `)`.
         grouped_expression,

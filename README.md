@@ -42,6 +42,7 @@ Fix this README, add links where there should be e.g. for colored async above.
 - target JVM?
 - output native code? (make a tracing GC or see [V's autofree](https://docs.vlang.io/memory-management.html))
 - output C? (kinda weird why not just target LLVM which will probably result in faster compilation)
+  - actually it's not a bad idea
 - support JIT? (JIT in another thread btw)
 - add tests, mainly for Parser, IR and VM
 - Error type for each step (~Tokenizer, Parser~, IR, Codegen, Runtime)
@@ -62,22 +63,13 @@ Fix this README, add links where there should be e.g. for colored async above.
 - for Value: replace pointer with raw type and use a MultiArrayList
   - need to improve globals in VM
   - idk how to handle it in codegen yet
-- builtin functions
-  - see https://docs.python.org/3.12/library/functions.html
-- add a try catch system or something to deal with errors
 - render (parser) error with caret under the error + full line info
 - add Timer for parsing_time, codegen_time, runnning_time
 - implement correct leaking allocation to have fast exit time
-- add import
 - add async/await/yield
   - see go coroutines and other languages way of doing it
   - see wren's [fibers](https://wren.io/concurrency.html)
   - see https://docs.vlang.io/concurrency.html
-- add throw/try/catch
-  - try and catch like in zig
-  - throw used to return an error (or just return a error.XXX like zig?)
-- add generics
-- monads, there already here but with specific `>>=` bind function
 - add an FFI with C and bindings for zig
 - add `_ =` or `() =` or `let () =` to discard the return of a function and make
   it mandatory to not ignore the return value from an expression? (no, these are
@@ -119,8 +111,13 @@ Fix this README, add links where there should be e.g. for colored async above.
   handled by known-folders) like \_\_pycache__
 - add the `rune` primitive which represents a unicode code point
   - handle char_literal in tokenizer/parser and remove ' notation for strings
-- add interfaces?
-- add generics instead of function that accept a type?
+- add interfaces? (no)
+- add generics instead of function that accepts a type?
+  - probably make compilation easier
+  - syntax: `add<T>(a: T, b: T) T` instead of `add(T: type, a: T, b: T) T`
+  - infer type from givern arguments -> works almost just like ML like polymorphism
+  - need @typeInfo() builtin?
+  - what about ML like polymorphism?
 - autodoc with doc comments `;;;`
 - package system
 - [compile time pseudo variables](https://docs.vlang.io/conditional-compilation.html#compile-time-pseudo-variables)?
@@ -139,30 +136,30 @@ Fix this README, add links where there should be e.g. for colored async above.
 - No need for parenthesis everywhere (look at rust, go and caml)
 - See [Option](https://doc.rust-lang.org/std/option) and [Result](https://doc.rust-lang.org/std/result) for nil and error
 - See [What are the NO's in GO design?](https://kuree.gitbooks.io/the-go-programming-language-report/content/32/text.html)
-- Import file as value like zig
-  - `import "std"` or `let std = import "std"`
-  - When importing other files only declarations gets imported which means that
-    if there is a print in global scope in a library it will be ignored (or
-    error?)
 - Check [roc-lang](https://www.roc-lang.org/examples/FizzBuzz/README.html) function pipes usage (instead of monads)
 - Check [OCaml Loops](https://ocaml.org/docs/loops-recursion) for nov loops
 
 ## Concepts
 
 ### Builtins
-- `@This()`: Same as zig, return the type of the current container.
-- `@import()`: Import a nov file.
-- `@TypeOf(val: any)`: Returns the type of a value.
-- `@print(s: string)`: Output `s` to stdout. (supports string interpolation)
-                       TODO: what about println and printf? what about print to another file?
-- `@eprint(s: string)`: Output `s` to stderr.
+- `@This()`: Same as zig, returns the type of the current container.
+- `@import(path: string)`: Import a nov file.
+  - When importing other files only declarations gets imported which means that
+    if there is a print in global scope in a library it will be ignored (or
+    error?)
+- `@TypeOf(...)`: Returns the type of a value.
+- `@print(...)`: Output all args separated with a space to stdout. (supports string interpolation)
+                 TODO: what about printf? what about print to another file?
+- `@println(...)`: Same as print with a newline at the end.
+- `@fprint(file: File, ...)`: Same as print but output to a specific file.
+<!-- - `@eprint(s: string)`: Output `s` to stderr. -->
 - `@panic(s: string)`: Output `s` and backtrace to stderr, then terminate the program with error code 1.
-- `@range()`: TODO
-- `@max()`: TODO
-- `@min()`: TODO
+- `@max(a: T, b: T, ...)`: Returns the maximum value between all the supplied arguments
+- `@min(a: T, b: T, ...)`: Returns the minimum value between all the supplied arguments
 - `@dump()`: TODO: https://docs.vlang.io/builtin-functions.html#dumping-expressions-at-runtime
 - `@embedFile()`: TODO, also allow for compressing the file
 - see https://docs.vlang.io/conditional-compilation.html
+- see https://docs.python.org/3.12/library/functions.html
 
 ### Functions
 Arguments are immutable by default unless mut is specified.
@@ -324,6 +321,16 @@ let Tree = union {
             empty => 0
             node => |n| n.value + n.left.sum() + n.right.sum()
         }
+
+        ; we could also use an if here
+        ; TODO: will this cause problem with operator overloading?
+        ;       maybe replace with `is` keyword and add a | | for union?
+        if self == empty {
+            0
+        } else {
+            n = n.node
+            n.value + n.left.sum() + n.right.sum()
+        }
     }
 }
 ```
@@ -334,11 +341,22 @@ In nov there is no untagged union thus  we can match on any union to find the
 active field. Note that it isn't represented here but an union field can have a
 default value just like a struct field.
 
-TODO: Add sugar for Result and Option:
-- !T is Result(T), this implies that Result.err is a string which should be fine?
+Sugar for Result and Option:
+- !T is Result(T, string)
+- E!T is Result(T, E)
 - ?T is Option(T)
 - expr! is unwrap or propagate for result
 - expr? is unwrap or propagate for option
+
+TODO: propagation in top level
+- not possible
+- panic if it's an error or a none
+- replace top level with main
+
+TODO: how to return an error?
+- err(...)
+- error(...)
+- ???
 
 See https://docs.vlang.io/type-declarations.html#optionresult-types-and-error-handling
 ```nov
@@ -392,21 +410,20 @@ TODO:
 
 See [1](https://docs.vlang.io/v-types.html#array-methods) [2](https://docs.vlang.io/v-types.html#array-method-chaining)
 ```nov
-let mut my_array = [ 1, 2, 3 ]
+let mut my_array = [1, 2, 3]
 @TypeOf(my_array) ; returns []int
 my_array.len == 3 ; true, should `len` be a function?
 my_array[0] == 1 ; true
 my_array[-1] == 3 ; true
 my_array << 5 ; TODO: push operator for arrays
-my_array |> println ; prints [ 1, 2, 2, 5 ]
-my_array += [ 1, 1, 7 ]
-my_array |> println ; prints [ 1, 2, 3, 5, 1, 1, 7 ]
-6 in my_array ; false (TODO: this should be vectorized with std.mem.indexOf(Scalar))
-; TODO: also implem `in` for map (check for key obviously)
+my_array |> println ; prints [1, 2, 2, 5]
+my_array += [1, 1, 7 ]
+my_array |> println ; prints [1, 2, 3, 5, 1, 1, 7]
+6 in my_array ; false
 my_array = []
 @TypeOf(my_array) ; still return []int
 
-let my_array_of_array = [ [ "Hello", "World!" ], [ "Bonjour", "Monde!" ] ]
+let my_array_of_array = [["Hello", "World!"], ["Bonjour", "Monde!"]]
 @TypeOf(my_array_of_array) ; returns [][]string
 let arr_arr = my_array_of_array ; alias because it's long to type
 arr_arr.len == 2 ; true
@@ -434,35 +451,111 @@ TODO: https://docs.vlang.io/v-types.html#maps
 Our implem is different, check src/value.zig.
 
 ### Match
-TODO: proposal for match expression.
+TODO: check https://docs.vlang.io/statements-&-expressions.html#match
 
 Allow to match strings? (also allow to match like startsWith, endsWith?)
 
-TODO: check https://docs.vlang.io/statements-&-expressions.html#match
+TODO: proposal to match over weird stuff like `x when x % 2`
 ```nov
 let x = 3
 let idk = match x {
     0 => 0
     x when x % 2 == 0 => 1
-    x => 2 ; same as _ => 2 (no need for _ then)
+    x => 2 ; same as _ => 2 (no need for _ then?)
+}
+```
+
+### If/Else
+TODO: add if unwrapping sugar for Result and Option?
+```nov
+let a = 10
+let b = 20
+; braces are mandatory, else is optional
+if a < b {
+    @println("${a} < ${n}")
+} else if a > b {
+    @println("${a} > ${n}")
+} else {
+    @println("${a} == ${n}")
+}
+
+; all If are expression which means that they all return a value
+; the previous if returns `()`
+; this one returns a bool
+let is_even = if 69 % 2 == 0 { true } else { false }
+; another example which returns an Option(int)
+let x: ?int = if is_even {
+    @println("even")
+    42
+} else {
+    @println("not even")
+    .none
 }
 ```
 
 ### For loop
-TODO: almost all of [v implem](https://docs.vlang.io/statements-&-expressions.html#for-loop) is perfect.
 ```nov
-for i in x..y {
-    ; i = x, x + 1, ..., y - 2, y - 1
-    ; how to use for loop for reverse iteration?
+; names can be an array, a slice, a string or an iterator
+; an iterator is any object with a public .next() method that returns an Option(T)
+; type is always inferred
+for name in names {
 }
 
-for e in ["H", "E", "Y"] {
-    ; e = "H", "E", "Y"
+; n takes values [0;10[
+; note than the boundary doesn't need to be literal
+; for n in x..y {} is fine as long as x and y are unsigned integers
+for n in 0..10 {
 }
 
-; how to handle for loop for object?
-; use .iter() or
-; .next() that returns an Option(T) where T is the child type of the array
+; it's possible to loop on multiple values at the same time as long as they
+; have the same length
+; TODO: what about iterators?
+for name, i in names, 0.. {
+}
+
+; loop over a map (need parenthesis or give a kv "object" (in compiler it will
+; be replaces by 2 values but in code it will look like an object) instead?)
+for k, v in m {
+}
+
+; values are const by default, add mut to make them mutable,
+; a range cannot be mutable
+for mut name in names {
+}
+
+; use underscore to ignore a value
+for _ in 0..10 {
+}
+
+; we can also loop on a condition
+for x > 10 {
+}
+
+; infinite loop
+for {
+}
+
+; proposal: add "zig while" or C like loop
+;     let mut i = 0
+;     for i < 100 : i += 2 {}
+;
+;     for i = 0; i < 100; i += 2 {}
+```
+
+### Break & Continue
+TODO: same as zig
+
+### Defer
+TODO: same as zig, still a proposal
+
+### In
+Check if an element is in an array or if it's a key in a map.
+This should be faster than using a for loop because it should be vectorized.
+(with std.mem.indexOfScalar)
+```
+let nums = [1, 2, 3]
+@println(1 in nums) ; true
+@println(2 !in nums) ; false
 ```
 
 ### Operator
@@ -498,6 +591,9 @@ Infix
 - `<<`: `push` []T << T
 - `>>=`: `bind` T >>= |T2| ...
 - `|>`: `pipe` T |> func
+- `??`: `optional fallback` Option(T) ?? T
+- `in`: `in` T in []T / T in \[K]V
+- `!in`: `not in` T !in []T / T !in \[K]V
 Postfix
 - `!`: `unwrapOrReturn` Result(T)!
 - `?`: `unwrapOrReturn` Option(T)?
@@ -558,3 +654,18 @@ x + y ; returns Complex{ .re = 7, .im = 10 }
 ```nov
 let malloc = extern malloc: (uint) -> (voidptr)
 ```
+
+### Multiline string literal
+```nov
+; Multiline string literal used to be like zig e.g.
+let s =
+    \\this my string
+    \\this is on a new line
+    \\yes
+
+; but now it was replaced with grouped expression & string `+` operator
+let s = (
+    "this is my string\n" +
+    "this is on a new line\n" +
+    "yes"
+)

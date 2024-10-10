@@ -1,7 +1,7 @@
-// Originally based on https://github.com/ziglang/zig/blob/master/lib/std/zig/Parse.zig
-// See https://github.com/ziglang/zig/blob/master/LICENSE for additional LICENSE details
+//! Originally based on https://github.com/ziglang/zig/blob/master/lib/std/zig/Parse.zig
+//! See https://github.com/ziglang/zig/blob/master/LICENSE for additional LICENSE details
 
-// TODO!:
+// TODO: (add tests)
 // let a = 1 + 2 ; no error, terminator is '\n'
 // let a = 1 + 2 + ; error: expected expression, found '\n'
 //     4 + 5
@@ -22,8 +22,6 @@
 //     .b = 2,
 // } ; no error, we ignore newlines and the expr ends on '}\n'
 // ; note that it's fine to have a trailing comma in a struct literal
-// ; TODO: multiline string literals
-// TODO: should currentTokenTag be used everywhere?
 
 const std = @import("std");
 const Tokenizer = @import("Tokenizer.zig");
@@ -137,7 +135,8 @@ fn parseTopLevel(self: *Parser) std.mem.Allocator.Error!void {
 
 /// Stmt <- Decl / ExprStmt
 fn expectStmt(self: *Parser) Error!Node.Index {
-    switch (self.currentTokenTag()) {
+    std.debug.assert(self.token_tags[self.tok_i] != .newline);
+    switch (self.token_tags[self.tok_i]) {
         .keyword_let => return self.expectDecl(),
         else => return self.expectExprStmt(),
     }
@@ -317,7 +316,8 @@ fn parseExprPrecedence(self: *Parser, min_prec: Precedence) Error!Node.Index {
 /// PrefixExpr <- PrefixOp* PrimaryExpr
 /// PrefixOp <- EXCLAMATIONMARK / MINUS / TILDE
 fn parsePrefixExpr(self: *Parser) Error!Node.Index {
-    const tag: Node.Tag = switch (self.currentTokenTag()) {
+    // an unary operator should never be on its own line so we don't use currentTokenTag()
+    const tag: Node.Tag = switch (self.token_tags[self.tok_i]) {
         .bang => .bool_not,
         .minus => .negation,
         .tilde => .bit_not,
@@ -354,7 +354,7 @@ fn expectPrefixExpr(self: *Parser) Error!Node.Index {
 ///      / CurlySuffixExpr
 fn parsePrimaryExpr(self: *Parser) Error!Node.Index {
     switch (self.currentTokenTag()) {
-        .keyword_if => return self.expectIfExpr(),
+        .keyword_if => return self.parseIfExpr(),
         .keyword_break => return self.addNode(.{
             .tag = .@"break",
             .main_token = self.nextToken(),
@@ -411,7 +411,7 @@ fn parsePrimaryExpr(self: *Parser) Error!Node.Index {
 }
 
 /// IfExpr <- KEYWORD_if Expr Block (KEYWORD_else (IfExpr / Block))?
-fn expectIfExpr(self: *Parser) Error!Node.Index {
+fn parseIfExpr(self: *Parser) Error!Node.Index {
     const if_token = self.assertToken(.keyword_if);
     const condition = try self.expectExpr();
     const then_expr = try expectBlock(self);
@@ -427,8 +427,9 @@ fn expectIfExpr(self: *Parser) Error!Node.Index {
         });
     }
 
-    const else_expr = if (self.currentTokenTag() == .keyword_if)
-        try self.expectIfExpr()
+    // an else if/block shouldn't be on a new line so we don't use currentTokenTag()
+    const else_expr = if (self.token_tags[self.tok_i] == .keyword_if)
+        try self.parseIfExpr()
     else
         try self.expectBlock();
 
@@ -462,6 +463,7 @@ fn parseBlock(self: *Parser) Error!Node.Index {
             .r_brace => break,
             .eof => return self.failExpected(.r_brace),
             else => {
+                // TODO!: do not warn if the last statement doesn't end with a newline
                 const stmt = self.expectStmt() catch |err| switch (err) {
                     error.OutOfMemory => return err,
                     error.ParseError => {
@@ -539,7 +541,8 @@ fn parseCurlySuffixExpr(self: *Parser) Error!Node.Index {
 /// PrefixTypeOp <- QUESTIONMARK / ArrayTypeStart
 /// ArrayTypeStart <- LBRACKET RBRACKET
 fn parseTypeExpr(self: *Parser) Error!Node.Index {
-    switch (self.currentTokenTag()) {
+    // an unary operator should never be on its own line so we don't use currentTokenTag()
+    switch (self.token_tags[self.tok_i]) {
         .question_mark => return self.addNode(.{
             .tag = .optional_type,
             .main_token = self.nextToken(),
@@ -593,9 +596,10 @@ fn parseSuffixExpr(self: *Parser) Error!Node.Index {
         const scratch_top = self.scratch.items.len;
         defer self.scratch.shrinkRetainingCapacity(scratch_top);
         while (true) {
-            if (self.eatToken(.r_paren)) |_| break;
+            if (self.eatToken(.r_paren) != null) break;
             const param = try self.expectExpr();
             try self.scratch.append(self.allocator, param);
+            // TODO: self.currentTokenTag()?
             switch (self.token_tags[self.tok_i]) {
                 .newline => {}, // TODO?
                 .comma => self.tok_i += 1,
@@ -688,20 +692,6 @@ fn parsePrimaryTypeExpr(self: *Parser) Error!Node.Index {
             });
         },
         // .keyword_if => return self.parseIf(expectTypeExpr), // TODO: why separate expr and type expr?
-        .multiline_string_literal_line => {
-            const first_line = self.nextToken();
-            while (self.token_tags[self.tok_i] == .multiline_string_literal_line) {
-                self.tok_i += 1;
-            }
-            return self.addNode(.{
-                .tag = .multiline_string_literal,
-                .main_token = first_line,
-                .data = .{
-                    .lhs = first_line,
-                    .rhs = self.tok_i - 1,
-                },
-            });
-        },
         .l_paren => {
             // TODO: handle function
             return self.addNode(.{
@@ -760,16 +750,22 @@ fn addExtra(self: *Parser, extra: anytype) Error!Node.Index {
 
 /// Returns current token and advances the token index
 fn nextToken(self: *Parser) TokenIndex {
-    if (self.ignore_newlines) {
-        while (self.token_tags[self.tok_i] == .newline) {
-            self.tok_i += 1;
-        }
-    }
+    // TODO
+    // if (self.ignore_newlines) {
+    //     while (self.token_tags[self.tok_i] == .newline) {
+    //         self.tok_i += 1;
+    //     }
+    // }
     const result = self.tok_i;
     self.tok_i += 1;
     return result;
 }
 
+/// Returns current token tag
+/// If ignore_newlines is true, it skips newlines until it finds a non-newline token
+/// Use self.token_tags[self.tok_i] instead to avoid the check e.g. if it's
+/// guaranteed that the current token is not a newline or there shouldn't be a
+/// need to skip newlines
 fn currentTokenTag(self: *Parser) Token.Tag {
     if (self.ignore_newlines) {
         while (self.token_tags[self.tok_i] == .newline) {

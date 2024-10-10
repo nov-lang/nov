@@ -1,5 +1,6 @@
-// Originally based on https://github.com/ziglang/zig/blob/master/lib/std/zig/tokenizer.zig
-// See https://github.com/ziglang/zig/blob/master/LICENSE for additional LICENSE details
+//! Originally based on https://github.com/ziglang/zig/blob/master/lib/std/zig/tokenizer.zig
+//! See https://github.com/ziglang/zig/blob/master/LICENSE for additional LICENSE details
+// TODO: merge int_literal and float_literal into number_literal?
 
 const std = @import("std");
 
@@ -21,9 +22,9 @@ pub const Token = struct {
         identifier,
         builtin,
         string_literal,
-        multiline_string_literal_line,
         int_literal,
         float_literal,
+        doc_comment,
         newline,
         l_paren,
         r_paren,
@@ -108,9 +109,9 @@ pub const Token = struct {
                 .identifier,
                 .builtin,
                 .string_literal,
-                .multiline_string_literal_line,
                 .int_literal,
                 .float_literal,
+                .doc_comment,
                 => null,
 
                 .newline => "\n",
@@ -201,9 +202,10 @@ pub const Token = struct {
                 .invalid => "invalid bytes",
                 .identifier => "an identifier",
                 .builtin => "a builtin function",
-                .string_literal, .multiline_string_literal_line => "a string literal",
+                .string_literal => "a string literal",
                 .int_literal => "an integer literal",
                 .float_literal => "a float literal",
+                .doc_comment => "a document comment",
                 else => unreachable,
             };
         }
@@ -227,8 +229,20 @@ pub const Token = struct {
 };
 
 pub fn init(buffer: [:0]const u8) Tokenizer {
+    var src_start: ByteOffset = 0;
     // Skip the UTF-8 BOM if present
-    const src_start: ByteOffset = if (std.mem.startsWith(u8, buffer, "\xEF\xBB\xBF")) 3 else 0;
+    if (std.mem.startsWith(u8, buffer, "\xEF\xBB\xBF")) {
+        src_start = 3;
+    }
+    // Skip the shebang line if present
+    if (std.mem.startsWith(u8, buffer[src_start..], "#!")) {
+        if (std.mem.indexOfScalarPos(u8, buffer, src_start + 2, '\n')) |nl| {
+            src_start = @intCast(nl + 1);
+        } else {
+            src_start = @intCast(buffer.len);
+        }
+    }
+
     return .{
         .buffer = buffer,
         .index = src_start,
@@ -245,8 +259,11 @@ const State = enum {
     string_literal,
     string_literal_single_quote,
     string_literal_backslash,
-    multiline_string_literal_line,
-    comment_line,
+    line_comment_1,
+    line_comment_2,
+    line_comment_3,
+    line_comment,
+    doc_comment,
     equal,
     bang,
     pipe,
@@ -259,7 +276,6 @@ const State = enum {
     l_angle_bracket_angle_bracket,
     r_angle_bracket,
     r_angle_bracket_angle_bracket,
-    backslash,
     period,
     int,
     int_period,
@@ -302,8 +318,8 @@ pub fn next(self: *Tokenizer) Token {
                     state = .string_literal_single_quote;
                     result.tag = .string_literal;
                 },
-                '#', ';' => {
-                    state = .comment_line;
+                ';' => {
+                    state = .line_comment_1;
                 },
                 '_' => {
                     state = .underscore;
@@ -403,10 +419,6 @@ pub fn next(self: *Tokenizer) Token {
                     result.tag = .tilde;
                     self.index += 1;
                     break;
-                },
-                '\\' => {
-                    state = .backslash;
-                    result.tag = .multiline_string_literal_line;
                 },
                 '.' => {
                     state = .period;
@@ -524,15 +536,6 @@ pub fn next(self: *Tokenizer) Token {
                     break;
                 },
             },
-            .backslash => switch (c) {
-                '\\' => {
-                    state = .multiline_string_literal_line;
-                },
-                else => {
-                    result.tag = .invalid;
-                    break;
-                },
-            },
             .string_literal => switch (c) {
                 '\\' => {
                     state = .string_literal_backslash;
@@ -581,16 +584,6 @@ pub fn next(self: *Tokenizer) Token {
                 else => {
                     state = .string_literal;
                 },
-            },
-            .multiline_string_literal_line => switch (c) {
-                0 => {
-                    break;
-                },
-                '\n' => {
-                    self.index += 1;
-                    break;
-                },
-                else => {},
             },
             .bang => switch (c) {
                 '=' => {
@@ -732,7 +725,38 @@ pub fn next(self: *Tokenizer) Token {
                     break;
                 },
             },
-            .comment_line => switch (c) {
+            .line_comment_1 => switch (c) {
+                ';' => {
+                    state = .line_comment_2;
+                },
+                else => {
+                    self.index -= 1;
+                    state = .line_comment;
+                },
+            },
+            .line_comment_2 => switch (c) {
+                ';' => {
+                    state = .line_comment_3;
+                },
+                else => {
+                    self.index -= 1;
+                    state = .line_comment;
+                },
+            },
+            .line_comment_3 => switch (c) {
+                ';' => {
+                    state = .line_comment;
+                },
+                0, '\n' => {
+                    result.tag = .doc_comment;
+                    break;
+                },
+                else => {
+                    state = .doc_comment;
+                    result.tag = .doc_comment;
+                },
+            },
+            .line_comment => switch (c) {
                 0 => {
                     if (self.index != self.buffer.len) {
                         result.tag = .invalid;
@@ -744,6 +768,12 @@ pub fn next(self: *Tokenizer) Token {
                     result.tag = .newline;
                     result.start = self.index;
                     self.index += 1;
+                    break;
+                },
+                else => {},
+            },
+            .doc_comment => switch (c) {
+                0, '\n' => {
                     break;
                 },
                 else => {},
@@ -864,7 +894,7 @@ test "_" {
 
 test "line comment followed by statement" {
     try testTokenize(
-        \\# comment
+        \\; comment
         \\let x: int = 32
         \\
     , &.{
@@ -886,18 +916,6 @@ test "string literal with single quotes" {
     , &.{
         .string_literal,
         .newline,
-    });
-}
-
-test "multiline string literal" {
-    try testTokenize(
-        \\\\hello
-        \\\\world
-        \\\\
-    , &.{
-        .multiline_string_literal_line,
-        .multiline_string_literal_line,
-        .multiline_string_literal_line,
     });
 }
 
@@ -925,33 +943,13 @@ test "newline in string literal" {
     });
 }
 
-test "multiple comment lines" {
-    try testTokenize(
-        \\# a
-        \\; b
-        \\# a
-        \\# c
-        \\
-    , &.{
-        .newline,
-        .newline,
-        .newline,
-        .newline,
-    });
-}
-
-test "fake multiline string" {
-    try testTokenize(
-        \\"     \
-        \\      \
-        \\"
-    , &.{
-        .invalid,
-        .newline,
-        .invalid,
-        .newline,
-        .invalid,
-    });
+test "line comment and doc comment" {
+    try testTokenize(";", &.{});
+    try testTokenize(";\n", &.{.newline});
+    try testTokenize(";;", &.{});
+    try testTokenize(";;;", &.{.doc_comment});
+    try testTokenize(";;;\n", &.{ .doc_comment, .newline });
+    try testTokenize(";;;;", &.{});
 }
 
 test "string identifier and builtin fns" {
@@ -969,8 +967,20 @@ test "string identifier and builtin fns" {
         .newline,
     });
 }
+
 test "UTF-8 BOM is recognized and skipped" {
     try testTokenize("\xEF\xBB\xBFa\n", &.{
+        .identifier,
+        .newline,
+    });
+}
+
+test "shebang line is recognized and skipped" {
+    try testTokenize(
+        \\#!/usr/bin/env nov run
+        \\a
+        \\
+    , &.{
         .identifier,
         .newline,
     });
@@ -1325,12 +1335,11 @@ test "invalid token with unfinished escape right before eof" {
 
 test "null byte before eof" {
     try testTokenize("123 \x00 456", &.{ .int_literal, .invalid, .int_literal });
-    try testTokenize("#\x00", &.{.invalid});
-    try testTokenize("\\\\\x00", &.{ .multiline_string_literal_line, .invalid });
+    try testTokenize(";\x00", &.{.invalid});
     try testTokenize("\x00", &.{.invalid});
-    try testTokenize("# NUL\x00", &.{.invalid});
-    try testTokenize("#\x00", &.{.invalid});
-    try testTokenize("# NUL\x00", &.{.invalid});
+    try testTokenize("; NUL\x00", &.{.invalid});
+    try testTokenize(";;;\x00", &.{ .doc_comment, .invalid });
+    try testTokenize(";;; NUL\x00", &.{ .doc_comment, .invalid });
 }
 
 fn testTokenize(source: [:0]const u8, expected_token_tags: []const Token.Tag) !void {
