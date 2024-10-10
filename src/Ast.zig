@@ -346,8 +346,8 @@ pub fn firstToken(self: Ast, node: Node.Index) TokenIndex {
         .@"return",
         .identifier,
         .bool_literal,
-        .int_literal,
-        .float_literal,
+        .number_literal,
+        .char_literal,
         .string_literal,
         .grouped_expression,
         .block_two,
@@ -483,8 +483,8 @@ pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
         => return datas[n].rhs + end_offset,
 
         .bool_literal,
-        .int_literal,
-        .float_literal,
+        .number_literal,
+        .char_literal,
         .identifier,
         .string_literal,
         .@"unreachable",
@@ -1138,9 +1138,9 @@ pub const Node = struct {
         /// rhs is the function body block.
         fn_expr,
         /// Both lhs and rhs unused.
-        int_literal,
+        number_literal,
         /// Both lhs and rhs unused.
-        float_literal,
+        char_literal,
         /// Both lhs and rhs unused.
         bool_literal,
         /// Both lhs and rhs unused.

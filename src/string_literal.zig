@@ -259,35 +259,33 @@ pub fn parseWrite(writer: anytype, bytes: []const u8) error{OutOfMemory}!Result 
     assert(bytes.len >= 2 and bytes[0] == '"' and bytes[bytes.len - 1] == '"');
 
     var index: usize = 1;
-    while (true) {
-        const b = bytes[index];
-
-        switch (b) {
-            '\\' => {
-                const escape_char_index = index + 1;
-                const result = parseEscapeSequence(bytes, &index);
-                switch (result) {
-                    .success => |codepoint| {
-                        if (bytes[escape_char_index] == 'u') {
-                            var buf: [4]u8 = undefined;
-                            const len = utf8Encode(codepoint, &buf) catch {
-                                return Result{ .failure = .{ .invalid_unicode_codepoint = escape_char_index + 1 } };
-                            };
-                            try writer.writeAll(buf[0..len]);
-                        } else {
-                            try writer.writeByte(@as(u8, @intCast(codepoint)));
-                        }
-                    },
-                    .failure => |err| return Result{ .failure = err },
-                }
-            },
-            '\n' => return Result{ .failure = .{ .invalid_character = index } },
-            '"' => return Result.success,
-            else => {
-                try writer.writeByte(b);
-                index += 1;
-            },
-        }
+    b: switch (bytes[index]) {
+        '\\' => {
+            const escape_char_index = index + 1;
+            const result = parseEscapeSequence(bytes, &index);
+            switch (result) {
+                .success => |codepoint| {
+                    if (bytes[escape_char_index] == 'u') {
+                        var buf: [4]u8 = undefined;
+                        const len = utf8Encode(codepoint, &buf) catch {
+                            return .{ .failure = .{ .invalid_unicode_codepoint = escape_char_index + 1 } };
+                        };
+                        try writer.writeAll(buf[0..len]);
+                    } else {
+                        try writer.writeByte(@as(u8, @intCast(codepoint)));
+                    }
+                },
+                .failure => |err| return .{ .failure = err },
+            }
+            continue :b bytes[index];
+        },
+        '\n' => return .{ .failure = .{ .invalid_character = index } },
+        '"' => return .success,
+        else => {
+            try writer.writeByte(bytes[index]);
+            index += 1;
+            continue :b bytes[index];
+        },
     }
 }
 

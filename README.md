@@ -28,6 +28,8 @@ Figure out what (first) backend to chose
 - Native, either unoptimized for fun or dig into LLVM
   - make a tracing GC or see [V's autofree](https://docs.vlang.io/memory-management.html)
 
+Cleanup the repo
+
 Fix this README, add links where there should be e.g. for colored async above.
 
 ## Proposals and stuff to add
@@ -46,12 +48,6 @@ Fix this README, add links where there should be e.g. for colored async above.
 - handle SIG.INT correctly, need to write an alternative to isocline in zig
 - in repl mode output statement result by default
   - add a print instruction right before a statement if it returns another type than ()
-- move to zig master
-  - replace `while (true) switch` with [labeled switch/continue](https://github.com/ziglang/zig/pull/21257)
-    see https://github.com/ziglang/zig/pull/21367 for tokenizer
-  - for vm implem debugLoop() (original with debug infos) and releaseLoop() (with labeled switch/continue)
-  - add min_version for build.zig
-  - update ci
 - render (parser) error with caret under the error + full line info
 - add Timer for parsing_time, codegen_time, runnning_time (or use tracy)
 - implement correct leaking allocation to have fast exit time?
@@ -110,7 +106,6 @@ Fix this README, add links where there should be e.g. for colored async above.
   - https://craftinginterpreters.com/appendix-i.html
   - https://github.com/ziglang/zig-spec/blob/master/grammar/grammar.peg
   - https://doc.rust-lang.org/stable/reference/introduction.html
-- giving "}}" to Parser result in an infinite loop
 
 ## Notes
 - Check std.zig.AstGen, std.zig.Zir and zig/src/Sema.zig for IR
@@ -531,11 +526,10 @@ for x > 10 {
 for {
 }
 
-; proposal: add "zig while" or C like loop
-;     let mut i = 0
-;     for i < 100 : i += 2 {}
-;
-;     for i = 0; i < 100; i += 2 {}
+; "zig while" for loop
+let mut i = 0
+for i < 100 : i += 2 {
+}
 ```
 
 ### Break & Continue

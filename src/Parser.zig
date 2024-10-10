@@ -107,12 +107,8 @@ pub fn parse(allocator: std.mem.Allocator, source: [:0]const u8) std.mem.Allocat
 fn parseTopLevel(self: *Parser) std.mem.Allocator.Error!void {
     while (true) {
         switch (self.token_tags[self.tok_i]) {
-            .eof => {
-                break;
-            },
-            .newline => {
-                self.tok_i += 1;
-            },
+            .eof => break,
+            .newline => self.tok_i += 1,
             else => {
                 const stmt = self.expectStmt() catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
@@ -655,16 +651,16 @@ fn parsePrimaryTypeExpr(self: *Parser) Error!Node.Index {
                 .rhs = undefined,
             },
         }),
-        .int_literal => return self.addNode(.{
-            .tag = .int_literal,
+        .number_literal => return self.addNode(.{
+            .tag = .number_literal,
             .main_token = self.nextToken(),
             .data = .{
                 .lhs = undefined,
                 .rhs = undefined,
             },
         }),
-        .float_literal => return self.addNode(.{
-            .tag = .float_literal,
+        .char_literal => return self.addNode(.{
+            .tag = .char_literal,
             .main_token = self.nextToken(),
             .data = .{
                 .lhs = undefined,
@@ -808,35 +804,37 @@ fn assertToken(self: *Parser, tag: Token.Tag) TokenIndex {
     return token;
 }
 
+// the problem with having the same synchronize for parseTopLevel and parseBlock
+// is that we have always one bug, either:
+// `}}` in top level -> infinite loop
+// `....}` in block -> expected `}` but found `EOF`
+// I opted for the second one because an infinite loop is bad
 fn synchronize(self: *Parser) void {
     var level: usize = 0;
-    while (true) {
-        const tok = self.nextToken();
-        switch (self.token_tags[tok]) {
+    while (true) : (self.tok_i += 1) {
+        switch (self.token_tags[self.tok_i]) {
             .l_brace => level += 1,
             .r_brace => {
                 if (level == 0) {
-                    self.tok_i -= 1;
+                    self.tok_i += 1; // the bug is here
                     return;
                 }
                 level -= 1;
             },
             .newline => {
                 if (level == 0) {
+                    self.tok_i += 1;
                     return;
                 }
             },
-            .eof => {
-                self.tok_i -= 1;
-                return;
-            },
+            .eof => return,
             else => {},
         }
     }
 }
 
 fn warnExpected(self: *Parser, expected_token: Token.Tag) Error!void {
-    @setCold(true);
+    @branchHint(.cold);
     try self.warnMsg(.{
         .tag = .expected_token,
         .token = self.tok_i,
@@ -845,12 +843,12 @@ fn warnExpected(self: *Parser, expected_token: Token.Tag) Error!void {
 }
 
 fn warn(self: *Parser, error_tag: Ast.Error.Tag) Error!void {
-    @setCold(true);
+    @branchHint(.cold);
     try self.warnMsg(.{ .tag = error_tag, .token = self.tok_i });
 }
 
 fn warnMsg(self: *Parser, msg: Ast.Error) Error!void {
-    @setCold(true);
+    @branchHint(.cold);
     switch (msg.tag) {
         .expected_newline_after_decl,
         .expected_newline_after_stmt, // TODO: weird
@@ -891,7 +889,7 @@ fn warnMsg(self: *Parser, msg: Ast.Error) Error!void {
 }
 
 fn failExpected(self: *Parser, expected_token: Token.Tag) Error {
-    @setCold(true);
+    @branchHint(.cold);
     return self.failMsg(.{
         .tag = .expected_token,
         .token = self.tok_i,
@@ -900,12 +898,12 @@ fn failExpected(self: *Parser, expected_token: Token.Tag) Error {
 }
 
 fn fail(self: *Parser, tag: Ast.Error.Tag) Error {
-    @setCold(true);
+    @branchHint(.cold);
     return self.failMsg(.{ .tag = tag, .token = self.tok_i });
 }
 
 fn failMsg(self: *Parser, msg: Ast.Error) Error {
-    @setCold(true);
+    @branchHint(.cold);
     try self.warnMsg(msg);
     return error.ParseError;
 }

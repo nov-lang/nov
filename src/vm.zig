@@ -67,6 +67,7 @@ pub const VM = struct {
         return self.chunk.constants.items[arg];
     }
 
+    // debugLoop
     fn run(self: *VM) Error!void {
         while (true) {
             if (builtin.mode == .Debug) {
@@ -244,6 +245,8 @@ pub const VM = struct {
             }
         }
     }
+
+    // TODO: releaseLoop with labeled switch/continue
 
     fn runtimeError(self: *VM, comptime fmt: []const u8, args: anytype) Error {
         const stderr = std.io.getStdErr().writer();

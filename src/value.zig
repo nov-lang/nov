@@ -36,15 +36,15 @@ pub const Value = union {
             bool => .{ .bool = value },
             *Object => .{ .obj = @ptrFromInt(obj_mask | @intFromPtr(value)) },
             else => |T| switch (@typeInfo(T)) {
-                .ComptimeInt => if (value > std.math.maxInt(i63))
+                .comptime_int => if (value > std.math.maxInt(i63))
                     .{ .int = @bitCast(@as(u63, value)) }
                 else
                     .{ .int = value },
-                .Int => |info| switch (info.signedness) {
+                .int => |info| switch (info.signedness) {
                     .signed => .{ .int = value },
                     .unsigned => .{ .int = @bitCast(@as(u63, value)) },
                 },
-                .ComptimeFloat, .Float => .{ .float = value },
+                .comptime_float, .float => .{ .float = value },
                 else => @compileError("Unsupported type: " ++ @typeName(T)),
             },
         };

@@ -1,8 +1,19 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 const nov_version: std.SemanticVersion = .{ .major = 0, .minor = 0, .patch = 0 };
 
 pub fn build(b: *std.Build) void {
+    comptime {
+        const current_zig = builtin.zig_version;
+        const min_zig = std.SemanticVersion.parse("0.14.0-dev.1860+2e2927735") catch unreachable;
+        if (current_zig.order(min_zig) == .lt) {
+            @compileError(std.fmt.comptimePrint(
+                \\Your zig version ({}) does not meet the minimum required version ({})
+            , .{ current_zig, min_zig }));
+        }
+    }
+
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
@@ -52,10 +63,8 @@ pub fn build(b: *std.Build) void {
     fmt_step.dependOn(&b.addFmt(.{ .paths = &.{ "build.zig", "src" } }).step);
 
     const clean_step = b.step("clean", "Remove build artifacts");
-    clean_step.dependOn(&b.addRemoveDirTree(b.install_path).step);
-    if (b.cache_root.path) |cache_path| {
-        clean_step.dependOn(&b.addRemoveDirTree(cache_path).step);
-    }
+    clean_step.dependOn(&b.addRemoveDirTree(b.path("zig-out")).step);
+    clean_step.dependOn(&b.addRemoveDirTree(b.path(".zig-cache")).step);
 }
 
 fn makeExe(

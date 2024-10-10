@@ -37,7 +37,6 @@ pub fn main() !u8 {
         // \\-sum
         \\
     ;
-    // const source = "}}";
     // const source = "-123 * (45.67)\n";
     // const source =
     //     \\let x = -3
