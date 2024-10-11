@@ -22,6 +22,7 @@
 //     .b = 2,
 // } ; no error, we ignore newlines and the expr ends on '}\n'
 // ; note that it's fine to have a trailing comma in a struct literal
+// TODO: just do what go does?
 
 const std = @import("std");
 const Tokenizer = @import("Tokenizer.zig");
@@ -29,13 +30,14 @@ const Token = Tokenizer.Token;
 const Ast = @import("Ast.zig");
 const Node = Ast.Node;
 const TokenIndex = Ast.TokenIndex;
+const Allocator = std.mem.Allocator;
 const null_node: Node.Index = 0;
-const Error = error{ParseError} || std.mem.Allocator.Error;
+const Error = error{ParseError} || Allocator.Error;
 
 const Parser = @This();
 
 source: []const u8,
-allocator: std.mem.Allocator,
+allocator: Allocator,
 token_tags: []const Token.Tag,
 token_starts: []const Tokenizer.ByteOffset,
 tok_i: TokenIndex,
@@ -45,7 +47,7 @@ errors: std.ArrayListUnmanaged(Ast.Error),
 scratch: std.ArrayListUnmanaged(Node.Index),
 ignore_newlines: bool,
 
-pub fn parse(allocator: std.mem.Allocator, source: [:0]const u8) std.mem.Allocator.Error!Ast {
+pub fn parse(allocator: Allocator, source: [:0]const u8) Allocator.Error!Ast {
     var tokens: Ast.TokenList = .{};
     defer tokens.deinit(allocator);
 
@@ -104,7 +106,7 @@ pub fn parse(allocator: std.mem.Allocator, source: [:0]const u8) std.mem.Allocat
 }
 
 /// TopLevel <- Stmt*
-fn parseTopLevel(self: *Parser) std.mem.Allocator.Error!void {
+fn parseTopLevel(self: *Parser) Allocator.Error!void {
     while (true) {
         switch (self.token_tags[self.tok_i]) {
             .eof => break,
@@ -139,10 +141,9 @@ fn expectStmt(self: *Parser) Error!Node.Index {
 }
 
 /// Decl <- DeclProto (EQUAL Expr)? NEWLINE
-/// DeclProto <- KEYWORD_let KEYWORD_pub? KEYWORD_mut? IDENTIFIER (COLON TypeExpr)?
+/// DeclProto <- KEYWORD_let KEYWORD_mut? IDENTIFIER (COLON TypeExpr)?
 fn expectDecl(self: *Parser) Error!Node.Index {
     const let_token = self.assertToken(.keyword_let);
-    const is_pub = self.eatToken(.keyword_pub) != null; // or self.eatToken(.keyword_priv) == null;
     const is_mut = self.eatToken(.keyword_mut) != null;
 
     _ = try self.expectToken(.identifier);
@@ -160,7 +161,6 @@ fn expectDecl(self: *Parser) Error!Node.Index {
         .main_token = let_token,
         .data = .{
             .lhs = @bitCast(Node.Decl{
-                .public = is_pub,
                 .mutable = is_mut,
                 .type_node = @intCast(type_expr),
             }),
@@ -719,7 +719,7 @@ fn parseSuffixOp(self: *Parser, lhs: Node.Index) Error!Node.Index {
     return null_node;
 }
 
-fn listToSpan(self: *Parser, list: []const Node.Index) std.mem.Allocator.Error!Node.SubRange {
+fn listToSpan(self: *Parser, list: []const Node.Index) Allocator.Error!Node.SubRange {
     try self.extra_data.appendSlice(self.allocator, list);
     return .{
         .start = @intCast(self.extra_data.items.len - list.len),
@@ -727,13 +727,13 @@ fn listToSpan(self: *Parser, list: []const Node.Index) std.mem.Allocator.Error!N
     };
 }
 
-fn addNode(self: *Parser, node: Ast.Node) Error!Node.Index {
+fn addNode(self: *Parser, node: Ast.Node) Allocator.Error!Node.Index {
     const result: Node.Index = @intCast(self.nodes.len);
     try self.nodes.append(self.allocator, node);
     return result;
 }
 
-fn addExtra(self: *Parser, extra: anytype) Error!Node.Index {
+fn addExtra(self: *Parser, extra: anytype) Allocator.Error!Node.Index {
     const fields = std.meta.fields(@TypeOf(extra));
     try self.extra_data.ensureUnusedCapacity(self.allocator, fields.len);
     const result: Node.Index = @intCast(self.extra_data.items.len);
@@ -833,7 +833,7 @@ fn synchronize(self: *Parser) void {
     }
 }
 
-fn warnExpected(self: *Parser, expected_token: Token.Tag) Error!void {
+fn warnExpected(self: *Parser, expected_token: Token.Tag) Allocator.Error!void {
     @branchHint(.cold);
     try self.warnMsg(.{
         .tag = .expected_token,
@@ -842,12 +842,12 @@ fn warnExpected(self: *Parser, expected_token: Token.Tag) Error!void {
     });
 }
 
-fn warn(self: *Parser, error_tag: Ast.Error.Tag) Error!void {
+fn warn(self: *Parser, error_tag: Ast.Error.Tag) Allocator.Error!void {
     @branchHint(.cold);
     try self.warnMsg(.{ .tag = error_tag, .token = self.tok_i });
 }
 
-fn warnMsg(self: *Parser, msg: Ast.Error) Error!void {
+fn warnMsg(self: *Parser, msg: Ast.Error) Allocator.Error!void {
     @branchHint(.cold);
     switch (msg.tag) {
         .expected_newline_after_decl,

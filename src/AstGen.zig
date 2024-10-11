@@ -2,52 +2,123 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Ast = @import("Ast.zig");
 const Nir = @import("Nir.zig");
-pub const Error = std.mem.Allocator.Error;
+const Allocator = std.mem.Allocator;
 
-// TODO: rename NirGen or something?
 const AstGen = @This();
+const Error = error{AnalysisFail} || Allocator.Error;
 
-ast: Ast,
-allocator: std.mem.Allocator,
+ast: *const Ast,
+allocator: Allocator,
+arena: Allocator,
 instructions: std.MultiArrayList(Nir.Inst),
 string_bytes: std.ArrayListUnmanaged(u8),
 extra: std.ArrayListUnmanaged(u32),
-scope: Scope,
+source_offset: u32,
+source_line: u32,
+source_column: u32,
+string_table: std.HashMapUnmanaged(u32, void, std.hash_map.StringIndexContext, std.hash_map.default_max_load_percentage),
+compile_errors: std.ArrayListUnmanaged(Nir.Inst.CompileErrors.Item),
+fn_block: ?*NirGen,
+fn_var_args: bool,
+within_fn: bool,
+fn_ret_ty: Nir.Inst.Ref,
+imports: std.AutoArrayHashMapUnmanaged(Nir.NullTerminatedString, Ast.TokenIndex),
+scratch: std.ArrayListUnmanaged(u32),
+ref_table: std.AutoHashMapUnmanaged(Nir.Inst.Index, Nir.Inst.Index),
 
-pub fn generate(allocator: std.mem.Allocator, ast: Ast) Error!Nir {
+pub fn generate(allocator: Allocator, ast: *const Ast) Allocator.Error!Nir {
     std.debug.assert(ast.errors.len == 0);
 
-    var sema: AstGen = .{
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var astgen: AstGen = .{
         .ast = ast,
         .allocator = allocator,
+        .arena = arena.allocator(),
         .instructions = .{},
         .string_bytes = .{},
         .extra = .{},
-        .scope = .root,
+        .source_offset = 0,
+        .source_line = 0,
+        .source_column = 0,
     };
 
     // index 0 is reserved for an empty string
-    try sema.string_bytes.append(allocator, 0);
+    try astgen.string_bytes.append(allocator, 0);
 
-    try sema.instructions.ensureTotalCapacity(allocator, ast.nodes.len);
+    try astgen.instructions.ensureTotalCapacity(allocator, ast.nodes.len);
 
-    for (ast.rootStmts()) |stmt| {
-        const ref = try sema.expr(stmt);
-        std.log.debug("{}: {}", .{ ast.nodes.items(.tag)[stmt], ref });
-    }
+    const reserved_count = @typeInfo(Nir.ExtraIndex).Enum.fields.len;
+    try astgen.extra.ensureTotalCapacity(allocator, ast.nodes.len + reserved_count);
+    astgen.extra.items.len += reserved_count;
+
+    // var top_scope: Scope.Top = .{};
+
+    var ng_instructions: std.ArrayListUnmanaged(Nir.Inst.Index) = .{};
+    // var gen_scope: NirGen = .{
+    //     .is_comptime = true,
+    //     .parent = &top_scope.base,
+    //     .anon_name_strategy = .parent,
+    //     .decl_node_index = 0,
+    //     .decl_line = 0,
+    //     .astgen = &astgen,
+    //     .instructions = &ng_instructions,
+    //     .instructions_top = 0,
+    // };
+    defer ng_instructions.deinit();
+
+    // if (topLevelDecl(&gen_scope, &gen_scope.base, 0, ast.rootStmts(), .auto, 0)) |struct_decl_ref| {
+    //     std.debug.assert(struct_decl_ref.toIndex().? == .root);
+    // } else |err| switch (err) {
+    //     error.OutOfMemory => return error.OutOfMemory,
+    //     error.AnalysisFail => {}, // Handled via compile_errors below.
+    // }
+
+    // for (ast.rootStmts()) |stmt| {
+    //     const ref = try sema.expr(stmt);
+    //     std.log.debug("{}: {}", .{ ast.nodes.items(.tag)[stmt], ref });
+    // }
 
     return .{
-        .instructions = sema.instructions.toOwnedSlice(),
-        .string_bytes = try sema.string_bytes.toOwnedSlice(allocator),
-        .extra = try sema.extra.toOwnedSlice(allocator),
+        .instructions = astgen.instructions.toOwnedSlice(),
+        .string_bytes = try astgen.string_bytes.toOwnedSlice(allocator),
+        .extra = try astgen.extra.toOwnedSlice(allocator),
     };
 }
 
-const Scope = enum(u8) {
-    root = 0,
-    container = 1,
-    _,
+fn deinit(self: *AstGen, allocator: Allocator) void {
+    self.instructions.deinit(allocator);
+    self.extra.deinit(allocator);
+    self.string_bytes.deinit(allocator);
+    self.string_table.deinit(allocator);
+    self.compile_errors.deinit(allocator);
+    self.imports.deinit(allocator);
+    self.scratch.deinit(allocator);
+    self.ref_table.deinit(allocator);
+}
+
+const Scope = struct {
+    tag: Tag,
+
+    const Tag = enum {
+        nir_gen,
+        local_val,
+        local_ptr,
+        defer_normal,
+        namespace,
+        top,
+    };
+
+    const Top = struct {
+        const base_tag: Scope.Tag = .top;
+        base: Scope = .{ .tag = base_tag },
+    };
 };
+
+/// This is a temporary structure; references to it are valid only
+/// while constructing a `Zir`.
+const NirGen = struct {};
 
 fn expr(self: *AstGen, node: Ast.Node.Index) Error!Nir.Inst.Ref {
     switch (self.ast.nodes.items(.tag)[node]) {
@@ -172,7 +243,7 @@ fn addPlNode(
     });
 }
 
-fn addExtra(self: *AstGen, extra: anytype) Error!u32 {
+fn addExtra(self: *AstGen, extra: anytype) Allocator.Error!u32 {
     const fields = std.meta.fields(@TypeOf(extra));
     try self.extra.ensureUnusedCapacity(self.allocator, fields.len);
     return self.addExtraAssumeCapacity(extra);
@@ -214,11 +285,25 @@ fn setExtra(self: *AstGen, index: usize, extra: anytype) void {
     }
 }
 
-fn add(self: *AstGen, inst: Nir.Inst) Error!Nir.Inst.Ref {
+fn reserveExtra(self: *AstGen, size: usize) Allocator.Error!u32 {
+    const extra_index: u32 = @intCast(self.extra.items.len);
+    try self.extra.resize(self.allocator, extra_index + size);
+    return extra_index;
+}
+
+fn appendRefs(self: *AstGen, refs: []const Nir.Inst.Ref) Allocator.Error!void {
+    return self.extra.appendSlice(self.allocator, refs);
+}
+
+fn appendRefsAssumeCapacity(self: *AstGen, refs: []const Nir.Inst.Ref) !void {
+    return self.extra.appendSliceAssumeCapacity(refs);
+}
+
+fn add(self: *AstGen, inst: Nir.Inst) Allocator.Error!Nir.Inst.Ref {
     return (try self.addAsIndex(inst)).toRef();
 }
 
-fn addAsIndex(self: *AstGen, inst: Nir.Inst) Error!Nir.Inst.Index {
+fn addAsIndex(self: *AstGen, inst: Nir.Inst) Allocator.Error!Nir.Inst.Index {
     const new_index: Nir.Inst.Index = @enumFromInt(self.instructions.len);
     try self.instructions.append(self.allocator, inst);
     return new_index;

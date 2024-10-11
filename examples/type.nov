@@ -4,13 +4,15 @@ let std = @import("std")
 
 let MyInt = int
 
+@[public]
 let MyType = struct {
-    pub x: MyInt = 0
-    priv y: string = "hello"
-    z: bool, ; default is private
+    x: MyInt = 0
+    y: string = "hello"
+    z: bool,
 
     ; `self` is present in all container methods and represents the instance
-    let pub print = () -> void {
+    @[public]
+    let print = () -> void {
         std.io.println("x: {self.x}, y: {self.y}. z: {self.z}")
     }
 }

@@ -27,6 +27,7 @@ pub fn deinit(self: *Ast, allocator: std.mem.Allocator) void {
     self.nodes.deinit(allocator);
     allocator.free(self.extra_data);
     allocator.free(self.errors);
+    self.* = undefined;
 }
 
 pub const Location = struct {
@@ -331,7 +332,6 @@ pub fn firstToken(self: Ast, node: Node.Index) TokenIndex {
     var n = node;
     while (true) switch (tags[n]) {
         .root => return 0,
-        .no_op => unreachable,
 
         .decl,
         .bool_not,
@@ -349,13 +349,13 @@ pub fn firstToken(self: Ast, node: Node.Index) TokenIndex {
         .number_literal,
         .char_literal,
         .string_literal,
+        .unreachable_literal,
         .grouped_expression,
         .block_two,
         .block,
         .loop,
         .fn_args_one,
         .fn_args,
-        .@"unreachable",
         => return main_tokens[n],
 
         .field_access,
@@ -423,7 +423,6 @@ pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
     var end_offset: TokenIndex = 0;
     while (true) switch (tags[n]) {
         .root => return @intCast(self.tokens.len - 1),
-        .no_op => unreachable,
         else => {
             // TODO
             std.log.debug("Unhandled tag: {}", .{tags[n]});
@@ -487,7 +486,7 @@ pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
         .char_literal,
         .identifier,
         .string_literal,
-        .@"unreachable",
+        .unreachable_literal,
         => return main_tokens[n] + end_offset,
 
         .block => {
@@ -1006,11 +1005,7 @@ pub const Node = struct {
     pub const Tag = enum(u8) {
         /// sub_list[lhs..rhs]
         root,
-        /// Both lhs and rhs unused.
-        no_op,
-        /// Both lhs and rhs unused.
-        @"unreachable", // TODO: ? need to add to tokenizer
-        /// `let a b x: c = rhs`. `Decl[lhs]`.
+        /// `let mut? x: type? = rhs`. `Decl[lhs]`.
         /// rhs may be omitted.
         /// Can be local or global.
         /// main_token is `let`
@@ -1144,6 +1139,8 @@ pub const Node = struct {
         /// Both lhs and rhs unused.
         bool_literal,
         /// Both lhs and rhs unused.
+        unreachable_literal,
+        /// Both lhs and rhs unused.
         /// Most identifiers will not have explicit AST nodes, however for expressions
         /// which could be one of many different kinds of AST nodes, there will be an
         /// identifier AST node for it.
@@ -1182,9 +1179,8 @@ pub const Node = struct {
 
     pub const Decl = packed struct(Index) {
         mutable: bool,
-        public: bool, // TODO: note for later, only decl in global scope or in a container can be public
         /// Can be Parser.null_node
-        type_node: u30,
+        type_node: u31,
     };
 
     pub const If = struct {

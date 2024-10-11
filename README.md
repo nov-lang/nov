@@ -2,13 +2,12 @@
 
 Nov is a functional programming language.
 
-Nov type system is strong and sound. idk about static or dynamic yet. also most types should be inferrable.
+Nov type system is static, strong and sound. Also most types should be inferrable.
 
 Nov has uncolored async! (well not yet tho)
 
-Nov code is compiled to bytecode then run in the NVM (Nov Virtual Machine). (This name sucks)
-
-Nov main inspirations are Zig and OCaml.
+Nov has automatic memory management via a minimal tracing GC.
+<!-- TODO: autofree https://docs.vlang.io/memory-management.html -->
 
 # TODO
 Next step: add new IR that
@@ -18,17 +17,18 @@ Next step: add new IR that
 - have more usage safety than Ast
 - start storing values in a constant pool
 
+Need to work on Parser/Ast for more complex stuff (e.g. functions, for loops,
+...) after basic IR and codegen is implemented.
+
 Separate frontend (Tokenizer, Parser, IRs) from backend (Codegen, ...).
 Also separate CLI, REPL and VM from all the that.
+And cleanup the repo
 
 Figure out what (first) backend to chose
-- A language, probably C but can be Zig or something else
+- **A language, probably C** but can be Zig or something else
 - A VM, a custom one or the JVM
   - a custom one allow support for JIT
 - Native, either unoptimized for fun or dig into LLVM
-  - make a tracing GC or see [V's autofree](https://docs.vlang.io/memory-management.html)
-
-Cleanup the repo
 
 Fix this README, add links where there should be e.g. for colored async above.
 
@@ -82,8 +82,8 @@ Fix this README, add links where there should be e.g. for colored async above.
 - write nov website with nov as backend? idk
 - add cache either in cwd or in $XDG_CACHE_HOME/nov/... (ofc finding the dir is
   handled by known-folders) like \_\_pycache__
-- add the `rune` primitive which represents a unicode code point
-  - handle char_literal in tokenizer/parser and remove ' notation for strings
+- add the `rune` primitive which represents a unicode code point, need work on AST and Parser
+- add attributes to AST and Parser
 - add u8, u16, u32, u64, u128, i8, i16, i32, i64, i128, f32, f64, f80, f128 primitives
   - int = i32 or i64 based on architecture
   - uint = u32 or u64 based on architecture
@@ -101,7 +101,6 @@ Fix this README, add links where there should be e.g. for colored async above.
 - package system
 - [compile time pseudo variables](https://docs.vlang.io/conditional-compilation.html#compile-time-pseudo-variables)?
 - add defer?
-- add attributes like `@[inline]`?
 - formal grammar definition
   - https://craftinginterpreters.com/appendix-i.html
   - https://github.com/ziglang/zig-spec/blob/master/grammar/grammar.peg
@@ -121,9 +120,9 @@ Fix this README, add links where there should be e.g. for colored async above.
   - warn if y >= @bitSizeOf(x): `x >> ${y} is the same as x >> ${y % @bitSizeOf(x)}`
 - Check [SSA](https://en.wikipedia.org/wiki/Static_single-assignment_form) and [CPS](https://en.wikipedia.org/wiki/Continuation-passing_style)
 
-## Concepts
+# Concepts
 
-### Builtins
+## Builtins
 - `@This()`: Same as zig, returns the type of the current container.
 - `@import(path: string)`: Import a nov file.
   - When importing other files only declarations gets imported which means that
@@ -148,14 +147,16 @@ Fix this README, add links where there should be e.g. for colored async above.
 - see https://docs.vlang.io/conditional-compilation.html
 - see https://docs.python.org/3.12/library/functions.html
 
-### Functions
+## Functions
 Arguments are immutable by default unless mut is specified.
+
 TODO: variable number of arguments? (just use an array)
 ```nov
 let doNothing = () -> () {}
 @TypeOf(doNothing) ; returns `() -> ()`
 
-; with mut is the argument passed as reference or value?
+; with mut is the argument passed as reference or value? (probably reference or
+; add a way to specify it's passed by reference e.g. &x or x: *int)
 let retNothing = (mut x: int) -> () {
     x += 1
 }
@@ -194,6 +195,11 @@ add sense to the () type/value but `(int)` as return type is ugly.
 - Maybe make parenthesis mandatory only for args
 - or make parenthesis mandatory only if there is multiple args (yes, ez way to
   distinguish simple_fn_proto with fn_proto)
+  - `-> {}` 0 arg 0 ret
+  - `a: int -> {}` 1 arg 0 ret
+  - `(a: int, b: int) -> {}` 2 args 0 ret
+  - `-> int {}` 0 arg 0 ret
+  - `(a: int, b: int) -> (int, int, int) {}` 2 args 3 ret
 ```nov
 let add = a: int, b: int -> int {
     a + b
@@ -212,7 +218,7 @@ let range = n: int -^ int -> () {
 }
 ```
 
-### Enum
+## Enum
 Nov enums are just like C enums except that they can have methods and are not
 global.
 
@@ -241,13 +247,14 @@ match x {
 }
 ```
 
-### Struct
+## Struct
 TODO:
-- pub/priv keyword, also mut keyword?
 - add a way to init a struct without its type like in zig or c99?
 - support anonymous structs, useful for json, I think it's easy since struct is
   like a function that returns a type but syntax is ugly outside of a struct
   which is fine and intended
+- make fields immutable by default?
+- pub/priv keyword on struct fields? do like C++/V for telling what is pub/mut?
 ```nov
 let MyStruct = struct {
     name: string
@@ -281,7 +288,7 @@ x.eql(y) ; true
 x |> println ; idk what this prints
 ```
 
-### Union
+## Union
 See [Result and Option unions](#result-and-option-unions) for another example.
 ```nov
 let MyUnion = union {
@@ -321,7 +328,7 @@ let Tree = union {
 }
 ```
 
-### Result and Option unions
+## Result and Option unions
 The Result and Option unions are created with functions since types are values.
 In nov there is no untagged union thus  we can match on any union to find the
 active field. Note that it isn't represented here but an union field can have a
@@ -337,12 +344,15 @@ Sugar for Result and Option:
 TODO: propagation in top level
 - not possible
 - panic if it's an error or a none
-- replace top level with main
+- replace top level with main and disallow statement in top level
 
 TODO: how to return an error?
 - err(...)
 - error(...)
 - ???
+
+TODO:
+  - what is the equivalent to `!void`, Result((), string)?
 
 TODO: sugar for concatenating multiple Result
  - proposal: replace Union with [sum types](https://docs.vlang.io/type-declarations.html#sum-types),
@@ -385,7 +395,7 @@ let b = MyOption{ .none }
 let prod = x! * y! ; not sure about syntax (this returns an error btw)
 ```
 
-### Arrays
+## Arrays
 Side note about mutability. A constant array cannot be modified in any way, its
 values are constant too. A mutable array can be reassigned/extanded and its
 values can be modified.
@@ -428,20 +438,21 @@ for arr in arr_arr {
 }
 
 ; functional way, I think, add another way with .map()
-arr_arr >>= |arr| {
+; type annotation is optional
+arr_arr >>= |arr: []string| {
     arr >>= |word| word + " " |> print
     println()
 }
 ```
 
-### Slice
+## Slice
 TODO: https://docs.vlang.io/v-types.html#array-slices
 
-### Map
+## Map
 TODO: https://docs.vlang.io/v-types.html#maps
 Our implem is different, check src/value.zig.
 
-### Match
+## Match
 TODO: check https://docs.vlang.io/statements-&-expressions.html#match
 
 Allow to match strings? (also allow to match like startsWith, endsWith?)
@@ -456,7 +467,7 @@ let idk = match x {
 }
 ```
 
-### If/Else
+## If/Else
 TODO: add if unwrapping sugar for Result and Option?
 ```nov
 let a = 10
@@ -484,7 +495,7 @@ let x: ?int = if is_even {
 }
 ```
 
-### For loop
+## For loop
 ```nov
 ; names can be an array, a slice, a string or an iterator
 ; an iterator is any object with a public .next() method that returns an Option(T)
@@ -532,13 +543,13 @@ for i < 100 : i += 2 {
 }
 ```
 
-### Break & Continue
+## Break & Continue
 TODO: same as zig
 
-### Defer
+## Defer
 TODO: same as zig, still a proposal
 
-### In
+## In
 Check if an element is in an array or if it's a key in a map.
 This should be faster than using a for loop because it should be vectorized.
 (with std.mem.indexOfScalar)
@@ -548,7 +559,7 @@ let nums = [1, 2, 3]
 @println(2 !in nums) ; false
 ```
 
-### Primitive Types
+## Primitive Types
 TODO
 - bool
 - string
@@ -560,14 +571,14 @@ See also:
 - [Arrays](#Arrays)
 - Maps
 
-### Integers
+## Integers
 TODO
 - u8, u16, u32, u64, u128, i8, i16, i32, i64, i128, f32, f64, f80, f128
   - int = i32 or i64 based on architecture
   - uint = u32 or u64 based on architecture
   - float = f32 or f64 based on architecture
 
-### Floats
+## Floats
 - `float` - f32 or f64 depending on architecture
 - `f16` - IEEE-754-2008 binary16
 - `f32` - IEEE-754-2008 binary32
@@ -576,7 +587,7 @@ TODO
 - `f128` - IEEE-754-2008 binary128
 <!-- - `c_longdouble` - matches long double for the target C ABI -->
 
-### Operators
+## Operators
 | Name                  | Syntax            | Types                                        | Remarks                                                          |
 |-----------------------|-------------------|----------------------------------------------|------------------------------------------------------------------|
 | Assignment            | a = b             | All types                                    | `a` is an identifier and `b` is any type                         |
@@ -614,7 +625,7 @@ TODO
 | Access                | a\[b]             | [Arrays](#Arrays) <br> Maps <br> string      | TODO: for Arrays and string b is an Integer, for Maps it's a key |
 | Field / Method Access | a.b               | All types                                    | TODO                                                             |
 
-### Precedence
+## Precedence
 last `<<` is push
 ```
 x() x[] x.y x? x! x??y
@@ -632,7 +643,7 @@ or
 = *= /= %= += -= <<
 ```
 
-### Operator overloading
+## Operator overloading
 Operator overloading is possible on the following operators:
 - `+`: (T, T) -> T
 - `-`: (T, T) -> T
@@ -674,7 +685,7 @@ let y = Complex{ .re = 2, .im = 7 }
 x + y ; returns Complex{ .re = 7, .im = 10 }
 ```
 
-### C FFI
+## C FFI
 TODO...
 
 also add binding generator for zig?
@@ -698,16 +709,46 @@ let s = (
 )
 ```
 
-### String Interpolation
+## String Interpolation
 TODO: `"${varname:[fill][alignment][width][.precision][type]}"`
 
 How to escape `${`?
 
 proposal: Replace `${}` with `{}` and escape `{` and `}` with `\`
 
-### Async
+## Async
 TODO: add async/await/yield
 - see go coroutines and other languages way of doing it
 - see wren's [fibers](https://wren.io/concurrency.html)
 - see https://docs.vlang.io/concurrency.html
 - see https://buzz-lang.dev/guide/fibers.html
+
+## Attributes
+- `@[deprecated]` - `@[deprecated("message...")]`
+- `@[warnif(cond, message)]` idk
+- `@[pure]`
+- `@[extern]`
+- `@[packed]`
+- `@[export]`
+- `@[inline]`
+- `@[noinline]`
+- `@[cold]`
+- `@[noreturn]` or have it as a return type?
+- `@[test]`
+- `@[public]`
+- `@[private]`
+
+(Attribute NEWLINE)* Decl NEWLINE
+
+Attributes can be set only on top level / container declarations
+
+Side note on visibility:
+- public: visible everywhere
+- private: visible only in current file
+- no attribute: visible when importing as a file (`@import("std.nov")`) but not
+  when importing as a module (`@import("std")`)
+
+TODO add a good way to make code usable on multiple systems through attributes.
+
+# Inspirations
+Zig, OCaml, Rust, C, V

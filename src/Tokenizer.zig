@@ -31,6 +31,7 @@ pub const Token = struct {
         r_bracket,
         l_brace,
         r_brace,
+        at_sign_l_bracket,
         comma,
         period,
         ellipsis2,
@@ -82,25 +83,19 @@ pub const Token = struct {
         keyword_break,
         keyword_continue,
         keyword_in,
-        keyword_pub,
         // unused reserved keywords
-        keyword_priv,
         keyword_async,
         keyword_await,
         keyword_yield,
         keyword_resume,
         keyword_suspend,
         keyword_nosuspend,
-        // note about pure, export and packed: there is a proposal to add attributes instead
-        keyword_pure,
-        keyword_export,
-        keyword_packed,
-        keyword_extern,
         keyword_enum,
         keyword_struct,
         keyword_union,
         keyword_defer,
         keyword_is,
+        keyword_unreachable,
 
         pub fn lexeme(tag: Tag) ?[]const u8 {
             return switch (tag) {
@@ -121,6 +116,7 @@ pub const Token = struct {
                 .r_bracket => "]",
                 .l_brace => "{",
                 .r_brace => "}",
+                .at_sign_l_bracket => "@[",
                 .comma => ",",
                 .period => ".",
                 .ellipsis2 => "..",
@@ -172,23 +168,18 @@ pub const Token = struct {
                 .keyword_break => "break",
                 .keyword_continue => "continue",
                 .keyword_in => "in",
-                .keyword_pub => "pub",
-                .keyword_priv => "priv",
                 .keyword_async => "async",
                 .keyword_await => "await",
                 .keyword_yield => "yield",
                 .keyword_resume => "resume",
                 .keyword_suspend => "suspend",
                 .keyword_nosuspend => "nosuspend",
-                .keyword_pure => "pure",
-                .keyword_export => "export",
-                .keyword_packed => "packed",
-                .keyword_extern => "extern",
                 .keyword_enum => "enum",
                 .keyword_struct => "struct",
                 .keyword_union => "union",
                 .keyword_defer => "defer",
                 .keyword_is => "is",
+                .keyword_unreachable => "unreachable",
             };
         }
 
@@ -253,7 +244,7 @@ const State = enum {
     start,
     identifier,
     builtin,
-    saw_at_sign,
+    at_sign,
     string_literal,
     string_literal_backslash,
     char_literal,
@@ -376,7 +367,7 @@ pub fn next(self: *Tokenizer) Token {
             },
             ';' => continue :state .line_comment_1,
             '_' => continue :state .underscore,
-            '@' => continue :state .saw_at_sign,
+            '@' => continue :state .at_sign,
             '?' => continue :state .question_mark,
             '=' => continue :state .equal,
             '!' => continue :state .bang,
@@ -431,10 +422,14 @@ pub fn next(self: *Tokenizer) Token {
                 else => result.tag = .plus,
             }
         },
-        .saw_at_sign => {
+        .at_sign => {
             self.index += 1;
             switch (self.buffer[self.index]) {
                 0, '\n' => result.tag = .invalid,
+                '[' => {
+                    result.tag = .at_sign_l_bracket;
+                    self.index += 1;
+                },
                 '"' => {
                     result.tag = .identifier;
                     continue :state .string_literal;
@@ -855,9 +850,14 @@ test "line comment and doc comment" {
 
 test "string identifier and builtin fns" {
     try testTokenize(
+        \\@[public]
         \\let @"if" = @import("std")
         \\
     , &.{
+        .at_sign_l_bracket,
+        .identifier,
+        .r_bracket,
+        .newline,
         .keyword_let,
         .identifier,
         .equal,
