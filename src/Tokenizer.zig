@@ -612,11 +612,6 @@ pub fn next(self: *Tokenizer) Token {
                     result.tag = .ellipsis2;
                     self.index += 1;
                 },
-                '0'...'9' => {
-                    result.tag = .number_literal;
-                    self.index += 1;
-                    continue :state .float;
-                },
                 else => result.tag = .period,
             }
         },
@@ -703,12 +698,18 @@ pub fn next(self: *Tokenizer) Token {
                 else => continue :state .int,
             }
         },
-        .int_period => switch (self.buffer[self.index + 1]) {
-            '.' => {},
-            else => {
-                self.index += 1;
-                continue :state .float;
-            },
+        .int_period => {
+            self.index += 1;
+            switch (self.buffer[self.index]) {
+                '_', 'a'...'d', 'f'...'o', 'q'...'z', 'A'...'D', 'F'...'O', 'Q'...'Z', '0'...'9' => {
+                    self.index += 1;
+                    continue :state .float;
+                },
+                'e', 'E', 'p', 'P' => {
+                    continue :state .float_exponent;
+                },
+                else => self.index -= 1,
+            }
         },
         .float => switch (self.buffer[self.index]) {
             '_', 'a'...'d', 'f'...'o', 'q'...'z', 'A'...'D', 'F'...'O', 'Q'...'Z', '0'...'9' => {
@@ -1109,10 +1110,10 @@ test "int literals decimal" {
 test "float literals decimal" {
     try testTokenize("._", &.{ .period, .underscore });
     try testTokenize("._1", &.{ .period, .identifier });
+    try testTokenize("1.", &.{ .number_literal, .period });
+    try testTokenize("1.+", &.{ .number_literal, .period, .plus });
+    try testTokenize(".1234", &.{ .period, .number_literal });
 
-    try testTokenize("1.", &.{.number_literal});
-    try testTokenize("1.+", &.{ .number_literal, .plus });
-    try testTokenize(".1234", &.{.number_literal});
     try testTokenize("0.0", &.{.number_literal});
     try testTokenize("1.0", &.{.number_literal});
     try testTokenize("0._", &.{.number_literal});
@@ -1166,7 +1167,7 @@ test "number literals binary" {
     try testTokenize("0b1111_1111", &.{.number_literal});
     try testTokenize("0b10_10_10_10", &.{.number_literal});
     try testTokenize("0b0_1_0_1_0_1_0_1", &.{.number_literal});
-    try testTokenize("0b1.", &.{.number_literal});
+    try testTokenize("0b1.", &.{ .number_literal, .period });
     try testTokenize("0b1.0", &.{.number_literal});
 
     try testTokenize("0B0", &.{.number_literal});
@@ -1205,7 +1206,7 @@ test "number literals octal" {
     try testTokenize("0o0123_4567", &.{.number_literal});
     try testTokenize("0o01_23_45_67", &.{.number_literal});
     try testTokenize("0o0_1_2_3_4_5_6_7", &.{.number_literal});
-    try testTokenize("0o7.", &.{.number_literal});
+    try testTokenize("0o7.", &.{ .number_literal, .period });
     try testTokenize("0o7.0", &.{.number_literal});
 
     try testTokenize("0O0", &.{.number_literal});
@@ -1272,10 +1273,10 @@ test "number literals hexadecimal" {
 }
 
 test "float literals hexadecimal" {
-    try testTokenize("0x1.", &.{.number_literal});
-    try testTokenize("0xF.", &.{.number_literal});
-    try testTokenize("0x1.+0xF.", &.{ .number_literal, .plus, .number_literal });
-    try testTokenize("0x0_.0.0", &.{ .number_literal, .number_literal });
+    try testTokenize("0x1.", &.{ .number_literal, .period });
+    try testTokenize("0xF.", &.{ .number_literal, .period });
+    try testTokenize("0x1.+0xF.", &.{ .number_literal, .period, .plus, .number_literal, .period });
+    try testTokenize("0x0_.0.0", &.{ .number_literal, .period, .number_literal });
 
     try testTokenize("0x1.0", &.{.number_literal});
     try testTokenize("0xF.0", &.{.number_literal});

@@ -1,6 +1,6 @@
 const std = @import("std");
 const Value = @import("value.zig").Value;
-const Ast = @import("Ast.zig");
+const Ast = @import("../Ast.zig");
 
 const Chunk = @This();
 
@@ -16,6 +16,44 @@ allocator: std.mem.Allocator,
 // https://treeniks.github.io/x86-64-simplified/instructions/README.html
 // https://en.wikipedia.org/wiki/List_of_Java_bytecode_instructions
 pub const OpCode = enum(u8) {
+    nop = 1,
+    @"unreachable" = 2,
+
+    copy = 3,
+    swap = 4,
+
+    lodab = 5,
+    loadi = 6,
+    loadu = 7,
+    loadf = 8,
+    loado = 9,
+
+    iadd,
+    isub,
+    imul,
+    idiv,
+    udiv,
+    // imod,
+    // irem,
+
+    fadd,
+    fsub,
+    fmul,
+    fdiv,
+    // fmod,
+    // frem,
+
+    not,
+
+    jmp,
+    // jmp_true,
+    jmp_false,
+    // jmp_nil,
+    // jmp_not_nil,
+
+    call,
+    ret,
+
     constant,
     equal,
     greater,
@@ -25,7 +63,7 @@ pub const OpCode = enum(u8) {
     mul,
     div,
     mod,
-    not, // TODO: rename bool_not
+    bool_not,
     negation,
     pop,
     get_local,

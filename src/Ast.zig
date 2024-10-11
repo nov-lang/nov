@@ -39,8 +39,8 @@ pub const Location = struct {
 
 pub fn tokenLocation(self: Ast, start_offset: u32, token_index: u32) Location {
     var loc: Location = .{
-        .line = 1,
-        .column = 1,
+        .line = 0,
+        .column = 0,
         .line_start = start_offset,
         .line_end = self.source.len,
     };
@@ -109,6 +109,15 @@ pub fn rootStmts(self: Ast) []const Node.Index {
     // Root is always index 0.
     const nodes_data = self.nodes.items(.data);
     return self.extra_data[nodes_data[0].lhs..nodes_data[0].rhs];
+}
+
+/// Returns an extra offset for column and byte offset of errors that
+/// should point after the token in the error message.
+pub fn errorOffset(tree: Ast, parse_error: Error) u32 {
+    return if (parse_error.token_is_prev)
+        @as(u32, @intCast(tree.tokenSlice(parse_error.token).len))
+    else
+        0;
 }
 
 pub fn renderError(self: Ast, parse_error: Error, writer: anytype) !void {
@@ -963,6 +972,7 @@ pub const full = struct {
 
 pub const Error = struct {
     tag: Tag,
+    is_note: bool = false,
     token_is_prev: bool = false,
     token: TokenIndex,
     extra: union {

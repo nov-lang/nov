@@ -25,12 +25,20 @@ Also separate CLI, REPL and VM from all the that.
 And cleanup the repo
 
 Figure out what (first) backend to chose
-- **A language, probably C** but can be Zig or something else
-- A VM, a custom one or the JVM
+- **A language, probably C** but can be Zig or something else (JS)
+- A VM, a custom one or the JVM (or WASM)
   - a custom one allow support for JIT
 - Native, either unoptimized for fun or dig into LLVM
 
 Fix this README, add links where there should be e.g. for colored async above.
+
+Keep to the main features aka:
+- functional: functions are first class citizen
+- async: good and lightweight async support is mandatory
+- GC: nov should handle everything memory related
+- interoperability with C unless it harms the features above
+Keep Nov away from:
+- Really low level stuff aka assembly, kernel or drivers. Use zig instead.
 
 ## Proposals and stuff to add
 - make all variable constant, all functions pure and remove mut keyword (obviously)
@@ -47,23 +55,16 @@ Fix this README, add links where there should be e.g. for colored async above.
 - Error type for each step (~Tokenizer, Parser~, IRs, Codegen, Runtime)
 - handle SIG.INT correctly, need to write an alternative to isocline in zig
 - in repl mode output statement result by default
-  - add a print instruction right before a statement if it returns another type than ()
+  - add a print instruction right before a statement if it returns another type than `void`
 - render (parser) error with caret under the error + full line info
 - add Timer for parsing_time, codegen_time, runnning_time (or use tracy)
 - implement correct leaking allocation to have fast exit time?
-- add `_ =` or `() =` or `let () =` to discard the return of a function and make
-  it mandatory to not ignore the return value from an expression? (no, these are
-  called expression statement and it's fine to ignore their result just to
-  trigger the side effects of evaluating the expression) (actually yes, we
-  shouldn't ignore a non () return)
+- add `_ =` to discard the return of a function and make it mandatory to not
+  ignore the return value from an expression
 - add operator overloading:
   - compilation error when trying to use an operator for values of different types
   - compilation error when trying to use an operator that is not defined for the said value
-  - try to find a way to make function calls or at least these kind of function call extra lightweight
-  - implem `>=`, `==`, `<`, etc... with Object.order() wich should return a std.math.Order
   - `+` binary op is syntaxic sugar for Object.add, or iadd/fadd for int/float
-  - `!` postfix unary op is syntaxic sugar for Object.unwrap (idk about name,
-    should only be available for Result and Option)
   - How to handle string * int?
     - handle Object.mul(a: Object, b: OtherObject), make it clear in the
       doc/language that this is possible, look at rust traits (no)
@@ -82,12 +83,7 @@ Fix this README, add links where there should be e.g. for colored async above.
 - write nov website with nov as backend? idk
 - add cache either in cwd or in $XDG_CACHE_HOME/nov/... (ofc finding the dir is
   handled by known-folders) like \_\_pycache__
-- add the `rune` primitive which represents a unicode code point, need work on AST and Parser
 - add attributes to AST and Parser
-- add u8, u16, u32, u64, u128, i8, i16, i32, i64, i128, f32, f64, f80, f128 primitives
-  - int = i32 or i64 based on architecture
-  - uint = u32 or u64 based on architecture
-  - float = f32 or f64 based on architecture
 - add a way to have better OOP, interface, traits etc idk I hate OOP but it
   sometimes stuff sucks without correct OOP
 - add interfaces? (no)
@@ -105,6 +101,9 @@ Fix this README, add links where there should be e.g. for colored async above.
   - https://craftinginterpreters.com/appendix-i.html
   - https://github.com/ziglang/zig-spec/blob/master/grammar/grammar.peg
   - https://doc.rust-lang.org/stable/reference/introduction.html
+- IO API like zig, no buffering by default? or just like C?
+- How to handle arithmetic overflow? current behaviour is to wrap, we don't want crash on arithmetic overflow
+- Replace `void` with `()`?
 
 ## Notes
 - Check std.zig.AstGen, std.zig.Zir and zig/src/Sema.zig for IR
@@ -119,6 +118,7 @@ Fix this README, add links where there should be e.g. for colored async above.
   - error if y is signed
   - warn if y >= @bitSizeOf(x): `x >> ${y} is the same as x >> ${y % @bitSizeOf(x)}`
 - Check [SSA](https://en.wikipedia.org/wiki/Static_single-assignment_form) and [CPS](https://en.wikipedia.org/wiki/Continuation-passing_style)
+- Remember to check src/vm/value.zig for cool stuff
 
 # Concepts
 
@@ -150,71 +150,69 @@ Fix this README, add links where there should be e.g. for colored async above.
 ## Functions
 Arguments are immutable by default unless mut is specified.
 
+Parenthesis are mandatory for arguments but optional for return type if there
+is only one. Return type cannot be ommited.
+
 TODO: variable number of arguments? (just use an array)
 ```nov
-let doNothing = () -> () {}
-@TypeOf(doNothing) ; returns `() -> ()`
+; signature: `() -> void`
+let doNothing = () -> void {}
 
 ; with mut is the argument passed as reference or value? (probably reference or
 ; add a way to specify it's passed by reference e.g. &x or x: *int)
-let retNothing = (mut x: int) -> () {
+; TODO: how to specify if an arg is mutable in signature
+; signature: `(int) -> void`
+let retNothing = (mut x: int) -> void {
     x += 1
 }
-@TypeOf(retNothing) ; returns `(int) -> ()`
 
+; signature: `() -> int`
 let ret2 = () -> int {
     2
 }
-@TypeOf(ret2) ; returns `() -> int`
 
-;;; Polymorphism
-; This is still conceptual
-let eql = (x, y) -> bool {
-    x == y
-}
-@TypeOf(eql) ; returns `(:a, :a) -> bool`
-
-; `:*` is a special type that corresponds to any type
-let poly = (x, y) -> :* {
-    ; ...
-}
-@TypeOf(poly) ; returns `(:a, :b) -> :c`
-
-; here `:a` can be int, float, string or whatever type that has a definition
-; for the `+` operator
-let add = (x: :a, y: :a) -> :a {
-    x + y
-}
-@TypeOf(add) ; returns `(:a, :a) -> :a`
-```
-
-This is without parenthesis for args and return but idk if there should
-actually be parenthesis. Adding parenthesis would kinda make sense with e.g.
-`f()` is call f with 0 arg which is (), or return () is return nothing which
-add sense to the () type/value but `(int)` as return type is ugly.
-- Maybe make parenthesis mandatory only for args
-- or make parenthesis mandatory only if there is multiple args (yes, ez way to
-  distinguish simple_fn_proto with fn_proto)
-  - `-> {}` 0 arg 0 ret
-  - `a: int -> {}` 1 arg 0 ret
-  - `(a: int, b: int) -> {}` 2 args 0 ret
-  - `-> int {}` 0 arg 0 ret
-  - `(a: int, b: int) -> (int, int, int) {}` 2 args 3 ret
-```nov
-let add = a: int, b: int -> int {
+; signature: `(int, int) -> int`
+let add = (a: int, b: int) -> int {
     a + b
 }
 
 ; return multiple values
-let div = a: int, b: int -> int, int {
+; signature: `(int, int) -> (int, int)
+let div = (a: int, b: int) -> (int, int) {
     a / b, a % b
 }
 
-; async func, can be run normally or async
-let range = n: int -^ int -> () {
+; TODO: write a whole section about async
+; async func, can be run normally or asynchronous
+; signature: `(int) -^ int -> void`
+let range = (n: int) -^ int -> void {
     for i in 0..n {
         yield i
     }
+}
+```
+
+Polymorphism,
+This is still very conceptual and idk if it will get implemented
+```nov
+; here the compiler knowns that x and y are of the same type because `==` can
+; only be used for values of the same type
+; signature: `(:a, :a) -> bool`
+let eql = (x, y) -> bool {
+    x == y
+}
+
+; `:*` is a special type that corresponds to any type
+; signature: `(:a, :b) -> :c`
+let poly = (x, y) -> :* {
+    ; ...
+}
+
+; here `:a` can be int, float, string or whatever type that has a definition
+; for the `+` operator
+; signature: `(:a, :a) -> :a`
+let add = (x: :a, y: :a) -> :a {
+    x + y
 }
 ```
 
@@ -351,9 +349,6 @@ TODO: how to return an error?
 - error(...)
 - ???
 
-TODO:
-  - what is the equivalent to `!void`, Result((), string)?
-
 TODO: sugar for concatenating multiple Result
  - proposal: replace Union with [sum types](https://docs.vlang.io/type-declarations.html#sum-types),
    (use `T1 || T2` syntax), see also [custom-error-types](https://docs.vlang.io/type-declarations.html#custom-error-types)
@@ -432,16 +427,16 @@ arr_arr.len == 2 ; true
 ; python like way of printing the array
 for arr in arr_arr {
     for w in arr {
-        print(w + " ")
+        @print(w + " ")
     }
-    println()
+    @println()
 }
 
 ; functional way, I think, add another way with .map()
 ; type annotation is optional
 arr_arr >>= |arr: []string| {
-    arr >>= |word| word + " " |> print
-    println()
+    arr >>= |word| word + " " |> @print
+    @println()
 }
 ```
 
@@ -482,7 +477,7 @@ if a < b {
 }
 
 ; all If are expression which means that they all return a value
-; the previous if returns `()`
+; the previous if returns `void`
 ; this one returns a bool
 let is_even = if 69 % 2 == 0 { true } else { false }
 ; another example which returns an Option(int)
@@ -573,7 +568,7 @@ See also:
 
 ## Integers
 TODO
-- u8, u16, u32, u64, u128, i8, i16, i32, i64, i128, f32, f64, f80, f128
+- u8, u16, u32, u64, u128, i8, i16, i32, i64, i128, f16, f32, f64, f80, f128
   - int = i32 or i64 based on architecture
   - uint = u32 or u64 based on architecture
   - float = f32 or f64 based on architecture
@@ -726,7 +721,7 @@ TODO: add async/await/yield
 ## Attributes
 - `@[deprecated]` - `@[deprecated("message...")]`
 - `@[warnif(cond, message)]` idk
-- `@[pure]`
+- `@[pure]` useless? a function is pure if its args are immutable and if it doesn't return an error union? (no)
 - `@[extern]`
 - `@[packed]`
 - `@[export]`

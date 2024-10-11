@@ -4,9 +4,6 @@ const build_options = @import("build_options");
 const clap = @import("clap");
 const kf = @import("known-folders");
 const ic = @import("isocline");
-const Chunk = @import("Chunk.zig");
-const VM = @import("vm.zig").VM;
-const debug = @import("debug.zig");
 
 pub const std_options: std.Options = .{
     .logFn = coloredLog,
@@ -43,7 +40,7 @@ const Color = enum(u8) {
 
 fn coloredLog(
     comptime message_level: std.log.Level,
-    comptime scope: @Type(.EnumLiteral),
+    comptime scope: @TypeOf(.enum_literal),
     comptime format: []const u8,
     args: anytype,
 ) void {
@@ -82,7 +79,7 @@ fn usage(comptime params: anytype) !void {
     });
 }
 
-fn runFile(allocator: std.mem.Allocator, vm: *VM, path: []const u8) !void {
+fn runFile(allocator: std.mem.Allocator, path: []const u8) !void {
     const cwd = std.fs.cwd();
     const file = try cwd.openFile(path, .{});
     defer file.close();
@@ -91,10 +88,12 @@ fn runFile(allocator: std.mem.Allocator, vm: *VM, path: []const u8) !void {
     try file.reader().readAllArrayList(&array_list, 1024 * 1024);
     try array_list.append(0);
     const bytes = array_list.items[0 .. array_list.items.len - 1 :0];
-    try vm.interpret(allocator, bytes);
+    // TODO
+    _ = bytes;
+    // try vm.interpret(allocator, bytes);
 }
 
-fn repl(allocator: std.mem.Allocator, vm: *VM) !void {
+fn repl(allocator: std.mem.Allocator) !void {
     if (try kf.getPath(allocator, .state)) |state_dir| {
         defer allocator.free(state_dir);
         const history_path = try std.fs.path.joinZ(allocator, &.{ state_dir, "nov_history" });
@@ -114,11 +113,16 @@ fn repl(allocator: std.mem.Allocator, vm: *VM) !void {
     while (ic.readline(null)) |bytes| {
         defer ic.free(bytes);
         const line = std.mem.span(bytes);
-        vm.interpret(allocator, line) catch {};
+        // TODO
+        _ = line;
+        // vm.interpret(allocator, line) catch {};
     }
 }
 
 pub fn main() !void {
+    const exit_status = try testMain();
+    std.process.exit(exit_status);
+
     var gpa: std.heap.GeneralPurposeAllocator(.{ .verbose_log = false }) = .{};
     const use_gpa = builtin.mode == .Debug;
     const allocator = if (builtin.os.tag == .wasi)
@@ -173,21 +177,148 @@ pub fn main() !void {
         return;
     }
 
-    var vm = VM.init(allocator);
-    defer vm.deinit();
-
     if (res.positionals.len == 0) {
-        try repl(allocator, &vm);
+        try repl(allocator);
     } else {
         for (res.positionals) |path| {
-            try runFile(allocator, &vm, path);
+            try runFile(allocator, path);
             break; // TODO: support multiple files
         }
     }
 }
 
+fn testMain() !u8 {
+    const Parser = @import("Parser.zig");
+    const AstGen = @import("AstGen.zig");
+
+    const source =
+        \\-123 * (45.67)
+
+        // // \\let a = 1 + 2 + 3 + 4
+        // // \\let a = 1 + 2 +
+        // // \\    3 + 4
+        // // \\let a = 1 + 2
+        // // \\    + 3 + 4
+        // \\let a = (
+        // \\    1 + 2 + 3
+        // \\    + 4
+        // \\)
+        // \\let s = (
+        // \\    "this is my string\n" +
+        // \\    "this is on a new line\n" +
+        // \\
+        // \\    "yes"
+        // \\)
+        // // \\
+        // // \\let sum = a + b
+        // // \\-sum
+        // \\
+
+        // \\let x = -3
+        // \\let pub mut y: int = 4
+        // \\let z = blk: {
+        // \\    let a = 3
+        // \\    if a == 3 {
+        // \\        break :blk 3 + 4
+        // \\    } else {
+        // \\        3 + 4
+        // \\    }
+        // \\    x + y
+        // \\}
+        // \\{}
+        // \\x + y
+        // \\
+
+        // \\let cond = true
+        // \\if (cond) {
+        // \\    let mut x = "outer"
+        // \\    {
+        // \\        x = (x + " ") * 3
+        // \\        x *= 2
+        // \\    }
+        // \\    print(x)
+        // \\} else {
+        // \\    print("Hello world!")
+        // \\}
+        // \\
+        // \\let mut i: int = 0
+        // \\for {
+        // \\    print(i)
+        // \\    i += 1
+        // \\    if (i == 10) {
+        // \\        break
+        // \\    }
+        // \\}
+        // \\
+        // \\if a == 3 { "true" } else { "false" } +
+        \\
+    ;
+
+    std.log.debug(
+        \\Running parser with source:
+        \\```
+        \\{s}
+        \\```
+    , .{source});
+
+    const allocator = std.heap.page_allocator;
+    var ast = try Parser.parse(allocator, source);
+    defer ast.deinit(allocator);
+
+    for (ast.rootStmts()) |stmt| {
+        for (ast.firstToken(stmt)..ast.lastToken(stmt) + 1) |token| {
+            std.debug.print("{s} ", .{ast.tokenSlice(@intCast(token))});
+        }
+        std.debug.print("\n", .{});
+    }
+
+    // std.debug.print("Tokens:", .{});
+    // for (ast.tokens.items(.tag)) |tag| {
+    //     std.debug.print(" {s}", .{@tagName(tag)});
+    // }
+
+    // std.debug.print("\nNodes:", .{});
+    // for (ast.nodes.items(.tag)) |tag| {
+    //     std.debug.print(" {s}", .{@tagName(tag)});
+    // }
+
+    if (ast.errors.len > 0) {
+        const stderr = std.io.getStdErr().writer();
+        try stderr.writeAll("\n");
+        for (ast.errors) |parse_error| {
+            var loc = ast.tokenLocation(0, parse_error.token);
+            // TODO
+            loc.line += 1;
+            loc.column += 1;
+            try stderr.print(Color.bold ++ "{s}:{d}:{d}: " ++
+                Color.red.toSeq() ++ "error: " ++ Color.reset ++ Color.bold, .{
+                "source",
+                loc.line,
+                loc.column,
+            });
+            try ast.renderError(parse_error, stderr);
+            try stderr.print(Color.reset ++ "\n{s}\n", .{ast.source[loc.line_start..loc.line_end]});
+            try stderr.writeByteNTimes(' ', loc.column - 1);
+            try stderr.writeAll(Color.green.toSeq());
+            switch (ast.tokenSlice(parse_error.token).len) {
+                1 => try stderr.writeAll("^"),
+                else => |len| try stderr.writeByteNTimes('~', len),
+            }
+            try stderr.writeAll("\n" ++ Color.reset);
+        }
+        return 1;
+    }
+
+    const nir = try AstGen.generate(allocator, &ast);
+    for (0..nir.instructions.len) |i| {
+        std.debug.print("Instruction {}: {}\n", .{ i, nir.instructions.get(i) });
+    }
+
+    return 0;
+}
+
 test {
     _ = @import("Tokenizer.zig");
     _ = @import("string_literal.zig");
-    _ = @import("value.zig");
+    _ = @import("vm/value.zig");
 }

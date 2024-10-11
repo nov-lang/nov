@@ -1,8 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Ast = @import("Ast.zig");
-const BigIntConst = std.math.big.int.Const;
-const BigIntMutable = std.math.big.int.Mutable;
 
 const Nir = @This();
 
@@ -69,7 +67,7 @@ pub fn extraData(self: Nir, comptime T: type, index: usize) ExtraData(T) {
             // Inst.Declaration.Flags,
             => @bitCast(self.extra[i]),
 
-            else => @compileError("bad field type"),
+            else => @compileError("extraData: bad field type: " ++ @typeName(field.type)),
         };
         i += 1;
     }
@@ -121,6 +119,8 @@ pub const Inst = struct {
         add,
         sub,
         mul,
+        div,
+        mod_rem, // %
         /// Integer literal that fits in a u64. Uses the `int` union field.
         int,
         /// Arbitrary sized integer literal. Uses the `str` union field.
@@ -136,6 +136,8 @@ pub const Inst = struct {
         .add = .pl_node,
         .sub = .pl_node,
         .mul = .pl_node,
+        .div = .pl_node,
+        .mod_rem = .pl_node,
 
         .int = .int,
         .int_big = .str,
@@ -216,18 +218,19 @@ pub const Inst = struct {
         // f16_type,
         f32_type,
         f64_type,
+        // f80_type,
         f128_type,
         float_type,
         anyptr_type,
         bool_type,
-        // type_type,
-        // @"()_type",
-        // void_type,
+        type_type,
+        void_type,
+        voidptr_type,
         string_type,
         zero,
         one,
         negative_one,
-        // void_value, // @"()_value",
+        void_value,
         unreachable_value,
         bool_true,
         bool_false,
@@ -454,6 +457,22 @@ pub const Inst = struct {
         body_len: u32,
     };
 
+    /// A f128 value, broken up into 4 u32 parts.
+    pub const Float128 = struct {
+        piece0: u32,
+        piece1: u32,
+        piece2: u32,
+        piece3: u32,
+
+        pub fn get(self: Float128) f128 {
+            const int_bits = @as(u128, self.piece0) |
+                (@as(u128, self.piece1) << 32) |
+                (@as(u128, self.piece2) << 64) |
+                (@as(u128, self.piece3) << 96);
+            return @as(f128, @bitCast(int_bits));
+        }
+    };
+
     /// Trailing: `CompileErrors.Item` for each `items_len`.
     pub const CompileErrors = struct {
         items_len: u32,
@@ -483,5 +502,19 @@ pub const Inst = struct {
     pub const LineColumn = struct {
         line: u32,
         column: u32,
+    };
+
+    pub const NameStrategy = enum(u2) {
+        /// Use the same name as the parent declaration name.
+        /// e.g. `const Foo = struct {...};`.
+        parent,
+        /// Use the name of the currently executing comptime function call,
+        /// with the current parameters. e.g. `ArrayList(i32)`.
+        func,
+        /// Create an anonymous name for this declaration.
+        /// Like this: "ParentDeclName_struct_69"
+        anon,
+        /// Use the name specified in the next `dbg_var_{val,ptr}` instruction.
+        dbg_var,
     };
 };

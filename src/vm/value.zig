@@ -1,5 +1,5 @@
 const std = @import("std");
-const Chunk = @import("Chunk.zig");
+const Chunk = @import("bytecode.zig");
 const big_int = std.math.big.int;
 
 // make this a map to the Type enum based on Value?
