@@ -88,13 +88,7 @@ pub fn parse(allocator: Allocator, source: [:0]const u8) Allocator.Error!Ast {
     const estimated_node_count = (tokens.len + 2) / 2;
     try parser.nodes.ensureTotalCapacity(allocator, estimated_node_count);
 
-    // root node must be index 0
-    parser.nodes.appendAssumeCapacity(.{
-        .tag = .root,
-        .main_token = 0,
-        .data = undefined,
-    });
-    try parser.parseTopLevel();
+    try parser.parseRoot();
 
     return .{
         .source = source,
@@ -105,14 +99,31 @@ pub fn parse(allocator: Allocator, source: [:0]const u8) Allocator.Error!Ast {
     };
 }
 
-/// TopLevel <- (AttrDecl / Decl)*
-fn parseTopLevel(self: *Parser) Allocator.Error!void {
+/// Root <- (doc_comment? Attr* Decl)*
+fn parseRoot(self: *Parser) Allocator.Error!void {
+    // root node must be index 0
+    self.nodes.appendAssumeCapacity(.{
+        .tag = .root,
+        .main_token = 0,
+        .data = undefined,
+    });
+
     while (true) {
+        const doc_comment = try self.eatDocComments();
+
         switch (self.token_tags[self.tok_i]) {
-            .eof => break,
+            .eof => {
+                if (doc_comment) |tok| {
+                    try self.warnMsg(.{
+                        .tag = .unattached_doc_comment,
+                        .token = tok,
+                    });
+                }
+                break;
+            },
             .newline => self.tok_i += 1,
             .at_sign_l_bracket => {
-                const attr_decl = self.parseAttrDecl() catch |err| switch (err) {
+                const attr_decl = self.expectAttrDecl() catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     error.ParseError => {
                         self.findNextTopLevelDecl();
@@ -145,13 +156,77 @@ fn parseTopLevel(self: *Parser) Allocator.Error!void {
     };
 }
 
-/// AttrDecl <- Attribute+ Decl
-/// Attribute <- AT_SIGN_LBRACKET IDENTIFIER AttrArgs RBRACKET NEWLINE
-/// AttrArgs <- LPAREN (Expr COMMA)* Expr? RPAREN
-fn parseAttrDecl(self: *Parser) Error!Node.Index {
-    // TODO
-    _ = self;
-    unreachable;
+/// AttrDecl <- Attr+ Decl
+fn expectAttrDecl(self: *Parser) Error!Node.Index {
+    const scratch_top = self.scratch.items.len;
+    defer self.scratch.shrinkRetainingCapacity(scratch_top);
+    while (true) {
+        switch (self.token_tags[self.tok_i]) {
+            .newline => self.tok_i += 1,
+            .at_sign_l_bracket => {
+                const attr = try self.expectAttr();
+                try self.scratch.append(self.allocator, attr);
+            },
+            .keyword_let => break,
+            else => return self.fail(.expected_decl),
+        }
+    }
+    const decl = try self.parseDecl();
+    const attrs = self.scratch.items[scratch_top..];
+    return switch (attrs.len) {
+        0 => unreachable,
+        1 => self.addNode(.{
+            .tag = .attr_decl_one,
+            .main_token = undefined,
+            .data = .{
+                .lhs = attrs[0],
+                .rhs = decl,
+            },
+        }),
+        else => self.addNode(.{
+            .tag = .attr_decl,
+            .main_token = undefined,
+            .data = .{
+                .lhs = try self.addExtra(try self.listToSpan(attrs)),
+                .rhs = decl,
+            },
+        }),
+    };
+}
+
+/// Attr <- AT_SIGN_LBRACKET IDENTIFIER ExprList RBRACKET NEWLINE
+fn expectAttr(self: *Parser) Error!Node.Index {
+    const main_token = try self.expectToken(.at_sign_l_bracket);
+    const name = try self.expectToken(.identifier);
+
+    var is_multi = false;
+    const args = switch (try self.parseExprList()) {
+        .null => null_node,
+        .zero_or_one => |arg| blk: {
+            if (arg == null_node) {
+                const tok = self.tok_i - 2;
+                std.debug.assert(self.token_tags[tok] == .l_paren);
+                try self.warnMsg(.{ .tag = .attr_without_args, .token = tok });
+            }
+            break :blk arg;
+        },
+        .multi => |span| blk: {
+            is_multi = true;
+            break :blk try self.addExtra(span);
+        },
+    };
+
+    _ = try self.expectToken(.r_bracket);
+    try self.expectNewLine(.expected_newline_after_attr);
+
+    return self.addNode(.{
+        .tag = if (is_multi) .attr else .attr_one,
+        .main_token = main_token,
+        .data = .{
+            .lhs = name,
+            .rhs = args,
+        },
+    });
 }
 
 /// Decl <- DeclProto (EQUAL Expr)? NEWLINE
@@ -168,7 +243,7 @@ fn parseDecl(self: *Parser) Error!Node.Index {
         return self.failExpected(.equal);
     }
 
-    try self.expectNewline(.expected_newline_after_decl, true);
+    try self.expectNewLine(.expected_newline_after_decl);
 
     return self.addNode(.{
         .tag = .decl,
@@ -478,7 +553,7 @@ fn parseBlock(self: *Parser) Error!Node.Index {
 
                 try self.scratch.append(self.allocator, expr);
                 if (self.token_tags[self.tok_i] != .r_brace) {
-                    try self.expectNewline(.expected_newline_after_stmt, true);
+                    try self.expectNewLine(.expected_newline_after_stmt);
                 }
             },
         }
@@ -731,6 +806,47 @@ fn parseSuffixOp(self: *Parser, lhs: Node.Index) Error!Node.Index {
     return null_node;
 }
 
+const SmallSpan = union(enum) {
+    /// missing l_paren
+    null: void,
+    zero_or_one: Node.Index,
+    multi: Node.SubRange,
+};
+
+/// ExprList <- LPAREN (Expr COMMA)* Expr? RPAREN
+fn parseExprList(self: *Parser) Error!SmallSpan {
+    _ = self.eatToken(.l_paren) orelse return .null;
+    if (self.eatToken(.r_paren) != null) {
+        return .{ .zero_or_one = null_node };
+    }
+
+    self.eatNewLines();
+    const scratch_top = self.scratch.items.len;
+    defer self.scratch.shrinkRetainingCapacity(scratch_top);
+    while (true) {
+        const expr = try self.expectExpr();
+        try self.scratch.append(self.allocator, expr);
+        self.eatNewLines();
+        switch (self.token_tags[self.tok_i]) {
+            .comma => self.tok_i += 1,
+            .r_paren => {
+                self.tok_i += 1;
+                break;
+            },
+            .newline => unreachable,
+            .colon, .r_brace, .r_bracket => return self.failExpected(.r_paren),
+            // Likely just a missing comma; give error but continue parsing.
+            else => try self.warn(.expected_comma_after_arg),
+        }
+    }
+    const exprs = self.scratch.items[scratch_top..];
+    return switch (exprs.len) {
+        0 => .{ .zero_or_one = null_node },
+        1 => .{ .zero_or_one = exprs[0] },
+        else => .{ .multi = try self.listToSpan(exprs) },
+    };
+}
+
 fn listToSpan(self: *Parser, list: []const Node.Index) Allocator.Error!Node.SubRange {
     try self.extra_data.appendSlice(self.allocator, list);
     return .{
@@ -758,12 +874,6 @@ fn addExtra(self: *Parser, extra: anytype) Allocator.Error!Node.Index {
 
 /// Returns current token and advances the token index
 fn nextToken(self: *Parser) TokenIndex {
-    // TODO
-    // if (self.ignore_newlines) {
-    //     while (self.token_tags[self.tok_i] == .newline) {
-    //         self.tok_i += 1;
-    //     }
-    // }
     const result = self.tok_i;
     self.tok_i += 1;
     return result;
@@ -776,9 +886,7 @@ fn nextToken(self: *Parser) TokenIndex {
 /// need to skip newlines
 fn currentTokenTag(self: *Parser) Token.Tag {
     if (self.ignore_newlines) {
-        while (self.token_tags[self.tok_i] == .newline) {
-            self.tok_i += 1;
-        }
+        self.eatNewLines();
     }
     return self.token_tags[self.tok_i];
 }
@@ -790,20 +898,44 @@ fn expectToken(self: *Parser, tag: Token.Tag) Error!TokenIndex {
     return self.nextToken();
 }
 
-fn expectNewline(self: *Parser, error_tag: Ast.Error.Tag, recoverable: bool) Error!void {
-    if (self.token_tags[self.tok_i] == .newline) {
-        _ = self.nextToken();
-        return;
-    }
-    try self.warn(error_tag);
-    if (!recoverable) {
-        return error.ParseError;
+fn expectNewLine(self: *Parser, error_tag: Ast.Error.Tag) Error!void {
+    switch (self.token_tags[self.tok_i]) {
+        .newline => self.tok_i += 1,
+        .doc_comment => {
+            try self.warnMsg(.{
+                .tag = .same_line_doc_comment,
+                .token = self.tok_i,
+            });
+            self.tok_i += 1;
+            _ = self.eatToken(.newline);
+        },
+        else => try self.warn(error_tag),
     }
 }
 
 // TODO: result is weird because newline is a token and used like a semicolon
 fn tokensOnSameLine(self: *Parser, tok1: TokenIndex, tok2: TokenIndex) bool {
     return std.mem.indexOfScalar(u8, self.source[self.token_starts[tok1]..self.token_starts[tok2]], '\n') == null;
+}
+
+inline fn eatNewLines(self: *Parser) void {
+    while (self.token_tags[self.tok_i] == .newline) {
+        self.tok_i += 1;
+    }
+}
+
+/// Skips over doc comment tokens. Returns the first one, if any.
+fn eatDocComments(self: *Parser) Allocator.Error!?TokenIndex {
+    if (self.eatToken(.doc_comment)) |first_doc_comment| {
+        while (true) {
+            switch (self.token_tags[self.tok_i]) {
+                .doc_comment, .newline => self.tok_i += 1,
+                else => break,
+            }
+        }
+        return first_doc_comment;
+    }
+    return null;
 }
 
 fn eatToken(self: *Parser, tag: Token.Tag) ?TokenIndex {
@@ -881,6 +1013,7 @@ fn warnMsg(self: *Parser, msg: Ast.Error) Allocator.Error!void {
     switch (msg.tag) {
         .expected_newline_after_decl,
         .expected_newline_after_stmt, // TODO: weird
+        .expected_newline_after_attr,
         .expected_newline_or_else,
         .expected_newline_or_lbrace,
         // .expected_comma_after_field,

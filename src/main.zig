@@ -140,7 +140,7 @@ pub fn main() !void {
     if (true) {
         const exit_status = try testMain(allocator);
         if (exit_status != 0) {
-            std.log.err("Test failed with exit status {}\n", .{exit_status});
+            std.log.err("Test failed with exit status {}", .{exit_status});
         }
         return;
     }
@@ -199,6 +199,9 @@ fn testMain(allocator: std.mem.Allocator) !u8 {
     const Nir = @import("Nir.zig");
 
     const source =
+        // \\@[attr(arg1, arg2, arg3)]
+        // \\@[attr(arg3)]
+        // \\@[attr]
         \\let x = -123 * (45.67)
 
         // // \\let a = 1 + 2 + 3 + 4

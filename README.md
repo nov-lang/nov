@@ -351,8 +351,8 @@ Sugar for Result and Option:
 - !T is Result(T, string) or Result(T, any)?
 - E!T is Result(T, E)
 - ?T is Option(T)
-- expr! is unwrap or propagate for result (TODO: replace ! and ? with .! and .?)
-- expr? is unwrap or propagate for option
+- expr.! is unwrap or propagate for result
+- expr.? is unwrap or propagate for option
 
 TODO: how to return an error?
 - err(...)
@@ -385,8 +385,8 @@ let file = match File.open("file.txt") {
         _ => return err ; return early with the error
     }
 }
-; ! unwrap and returns the err if there is any
-let file = File.open("file.txt")!
+; .! unwrap and returns the err if there is any
+let file = File.open("file.txt").!
 
 let Option = (T: type) -> type {
     union {
@@ -412,7 +412,7 @@ let sum = x + y.orelse(0)
 let MyOption = Option(float)
 let a = MyOption{ .some = 1.0 }
 let b = MyOption{ .none }
-let prod = x? * y?
+let prod = x.? * y.?
 ```
 
 ## Arrays
@@ -625,9 +625,9 @@ TODO
 | Bitwise Xor           | a ^ b             | [Integers](#Integers)                        | TODO                                                             |
 | Bitwise Not           | ~a                | [Integers](#Integers)                        | TODO                                                             |
 | Optionify             | ?T                | All types                                    | Equivalent to Option(T)                                          |
-| Optional Unwrap       | a?                | Option                                       | TODO                                                             |
+| Optional Unwrap       | a.?               | Option                                       | TODO                                                             |
 | Resultify             | E!T <br> !T       | All types                                    | Equivalent to Result(T, E) <br> Equivalent to Result(T, string)  |
-| Result Unwrap         | a!                | Result                                       | TODO                                                             |
+| Result Unwrap         | a.!               | Result                                       | TODO                                                             |
 | Logical And           | a **and** b       | bool                                         | TODO                                                             |
 | Logical Or            | a **or** b        | bool                                         | TODO                                                             |
 | Boolean Not           | !a                | bool                                         | TODO                                                             |
@@ -647,7 +647,7 @@ TODO
 ## Precedence
 last `<<` is push
 ```
-x() x[] x.y x? x!
+x() x[] x.y x.? x.!
 E!T
 x{}
 !x -x ~x ?T

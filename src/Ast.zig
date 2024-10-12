@@ -126,6 +126,9 @@ pub fn renderError(self: Ast, parse_error: Error, writer: anytype) !void {
         .chained_comparison_operators => {
             return writer.writeAll("comparison operators cannot be chained");
         },
+        .attr_without_args => {
+            return writer.writeAll("expected arguments after '('; remove the parentheses to declare an attribute without arguments");
+        },
         // .decl_between_fields => {
         //     return writer.writeAll("declarations are not allowed between container fields");
         // },
@@ -200,6 +203,15 @@ pub fn renderError(self: Ast, parse_error: Error, writer: anytype) !void {
         .expected_newline_or_lbrace => {
             return writer.writeAll("expected new line or block after function prototype");
         },
+        .expected_newline_after_decl => {
+            return writer.writeAll("expected new line after declaration");
+        },
+        .expected_newline_after_stmt => {
+            return writer.writeAll("expected new line after statement");
+        },
+        .expected_newline_after_attr => {
+            return writer.writeAll("expected new line after attribute");
+        },
         .expected_statement => {
             return writer.print("expected statement, found '{s}'", .{
                 token_tags[parse_error.token].symbol(),
@@ -236,30 +248,18 @@ pub fn renderError(self: Ast, parse_error: Error, writer: anytype) !void {
         // .invalid_bit_range => {
         //     return writer.writeAll("bit range not allowed on slices and arrays");
         // },
-        // .same_line_doc_comment => {
-        //     return writer.writeAll("same line documentation comment");
-        // },
-        // .unattached_doc_comment => {
-        //     return writer.writeAll("unattached documentation comment");
-        // },
-        // .test_doc_comment => {
-        //     return writer.writeAll("documentation comments cannot be attached to tests");
-        // },
-        // .comptime_doc_comment => {
-        //     return writer.writeAll("documentation comments cannot be attached to comptime blocks");
-        // },
+        .same_line_doc_comment => {
+            return writer.writeAll("same line documentation comment");
+        },
+        .unattached_doc_comment => {
+            return writer.writeAll("unattached documentation comment");
+        },
         // .varargs_nonfinal => {
         //     return writer.writeAll("function prototype has parameter after varargs");
         // },
         // .expected_continue_expr => {
         //     return writer.writeAll("expected ':' before while continue expression");
         // },
-        .expected_newline_after_decl => {
-            return writer.writeAll("expected new line after declaration");
-        },
-        .expected_newline_after_stmt => {
-            return writer.writeAll("expected new line after statement");
-        },
         // .expected_comma_after_field => {
         //     return writer.writeAll("expected ',' after field");
         // },
@@ -354,10 +354,13 @@ pub fn firstToken(self: Ast, node: Node.Index) TokenIndex {
         .loop,
         .fn_args_one,
         .fn_args,
+        .attr_one,
+        .attr,
         => return main_tokens[n],
 
         .field_access,
-        .unwrap_optional,
+        .unwrap_option,
+        .unwrap_result,
         .equal_equal,
         .bang_equal,
         .less_than,
@@ -393,6 +396,7 @@ pub fn firstToken(self: Ast, node: Node.Index) TokenIndex {
         .function_pipe,
         .fn_proto,
         .fn_expr,
+        .attr_decl_one,
         => n = datas[n].lhs,
 
         .match_case_one => {
@@ -404,7 +408,9 @@ pub fn firstToken(self: Ast, node: Node.Index) TokenIndex {
             }
         },
 
-        .match_case => {
+        .match_case,
+        .attr_decl,
+        => {
             const extra = self.extraData(datas[n].lhs, Node.SubRange);
             assert(extra.end - extra.start > 0);
             n = self.extra_data[extra.start];
@@ -422,6 +428,7 @@ pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
         .root => return @intCast(self.tokens.len - 1),
         else => {
             // TODO
+            // TODO: merge similar cases once all are implemented
             std.log.debug("Unhandled tag: {}", .{tags[n]});
             unreachable;
         },
@@ -470,10 +477,13 @@ pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
         .decl,
         .fn_proto,
         .fn_expr,
+        .attr_decl_one,
+        .attr_decl,
         => n = datas[n].rhs,
 
         .field_access,
-        .unwrap_optional,
+        .unwrap_option,
+        .unwrap_result,
         .grouped_expression,
         => return datas[n].rhs + end_offset,
 
@@ -518,6 +528,15 @@ pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
             n = datas[n].rhs;
         },
 
+        .attr_one => {
+            end_offset += 1; // for the rbracket
+            if (datas[n].rhs == 0) {
+                return main_tokens[n] + end_offset;
+            }
+            end_offset += 1; // for the rparen
+            n = datas[n].rhs;
+        },
+
         .fn_args_one => {
             end_offset += 1; // for the rparen
             if (datas[n].rhs != 0) {
@@ -534,6 +553,13 @@ pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
             assert(datas[n].rhs - datas[n].lhs > 0);
             end_offset += 1; // for the rparen
             n = self.extra_data[datas[n].rhs - 1]; // last argument
+        },
+
+        .attr => {
+            const extra = self.extraData(datas[n].rhs, Node.SubRange);
+            assert(extra.end - extra.start > 0);
+            end_offset += 2; // for the rparen rbracket
+            n = self.extra_data[extra.end - 1]; // last attribute
         },
     };
 }
@@ -561,10 +587,10 @@ pub fn decl(self: Ast, node: Node.Index) full.Decl {
     const data = self.nodes.items(.data)[node];
     const extra: Node.Decl = @bitCast(data.lhs);
     return .{
-        .attr = &.{},
+        .attributes = &.{},
         .ast = .{
             .let_token = let_token,
-            .mut_token = if (extra.mutable) let_token + 1 else null,
+            .is_mutable = extra.mutable,
             .type_node = extra.type_node,
             .init_node = data.rhs,
         },
@@ -847,24 +873,17 @@ pub fn fullCall(self: Ast, node: Node.Index) ?full.Call {
 
 /// Fully assembled AST node information.
 pub const full = struct {
+    // TODO: do we really need a separate struct for Decl just have a AttrDecl struct
     pub const Decl = struct {
-        attr: []const Node.Index,
+        attributes: []const Node.Index,
         ast: Components,
 
         pub const Components = struct {
             let_token: TokenIndex,
-            mut_token: ?TokenIndex,
+            is_mutable: bool,
             type_node: Node.Index,
             init_node: Node.Index,
         };
-
-        pub fn firstToken(self: Decl) TokenIndex {
-            if (self.attr.len > 0) {
-                return self.attr[0];
-            } else {
-                return self.ast.let_token;
-            }
-        }
     };
 
     pub const If = struct {
@@ -967,8 +986,11 @@ pub const Error = struct {
 
     pub const Tag = enum {
         chained_comparison_operators,
+        attr_without_args,
         mismatched_binary_op_whitespace,
         invalid_ampersand_ampersand,
+        same_line_doc_comment,
+        unattached_doc_comment,
         expected_decl,
         expected_expr,
         expected_expr_or_assignment,
@@ -979,6 +1001,7 @@ pub const Error = struct {
         expected_newline_or_lbrace,
         expected_newline_after_decl,
         expected_newline_after_stmt,
+        expected_newline_after_attr,
         expected_comma_after_arg,
         expected_comma_after_match_prong,
         expected_block,
@@ -1006,11 +1029,25 @@ pub const Node = struct {
         /// Can be local or global.
         /// main_token is `let`
         decl,
+        /// `@[lhs]`.
+        /// `@[lhs(rhs)]`.
+        /// main_token is `@[`.
+        attr_one,
+        /// `@[lhs(a, b, c)]`. `SubRange[rhs]`.
+        /// main_token is `@[
+        attr,
+        /// lhs is the attr
+        /// rhs is the decl
+        attr_decl_one,
+        /// `SubRange[lhs]` of attr
+        /// rhs is the decl
+        attr_decl,
         /// `lhs.a`. main_token is the dot. rhs is the identifier token index.
         field_access,
-        // TODO: force unwrap (use this instead of `try` too and change to `lhs!`?)
         /// `lhs.?`. main_token is the dot. rhs is the `?` token index.
-        unwrap_optional,
+        unwrap_option,
+        /// `lhs.!`. main_token is the dot. rhs is the `!` token index.
+        unwrap_result,
         /// `lhs == rhs`. main_token is op.
         equal_equal,
         /// `lhs != rhs`. main_token is op.

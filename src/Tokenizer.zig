@@ -34,6 +34,8 @@ pub const Token = struct {
         at_sign_l_bracket,
         comma,
         period,
+        period_bang,
+        period_question_mark,
         ellipsis2,
         colon,
         underscore,
@@ -117,6 +119,8 @@ pub const Token = struct {
                 .at_sign_l_bracket => "@[",
                 .comma => ",",
                 .period => ".",
+                .period_bang => ".!",
+                .period_question_mark => ".?",
                 .ellipsis2 => "..",
                 .colon => ":",
                 .underscore => "_",
@@ -592,6 +596,14 @@ pub fn next(self: *Tokenizer) Token {
         .period => {
             self.index += 1;
             switch (self.buffer[self.index]) {
+                '!' => {
+                    result.tag = .period_bang;
+                    self.index += 1;
+                },
+                '?' => {
+                    result.tag = .period_question_mark;
+                    self.index += 1;
+                },
                 '.' => {
                     result.tag = .ellipsis2;
                     self.index += 1;
@@ -955,6 +967,15 @@ test "range literals" {
     try testTokenize("0x00..0x09", &.{ .number_literal, .ellipsis2, .number_literal });
     try testTokenize("0b00..0b11", &.{ .number_literal, .ellipsis2, .number_literal });
     try testTokenize("0o00..0o11", &.{ .number_literal, .ellipsis2, .number_literal });
+}
+
+test "periods" {
+    try testTokenize("...", &.{ .ellipsis2, .period });
+    try testTokenize(". .", &.{ .period, .period });
+    try testTokenize(".!", &.{.period_bang});
+    try testTokenize(".?", &.{.period_question_mark});
+    try testTokenize(". !", &.{ .period, .bang });
+    try testTokenize(". ?", &.{ .period, .question_mark });
 }
 
 test "code point literal with hex escape" {

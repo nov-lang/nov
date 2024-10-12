@@ -570,10 +570,7 @@ fn varDecl(
     // const token_tags = ast.tokens.items(.tag);
     // const main_tokens = ast.nodes.items(.main_token);
 
-    const name_token = if (full_decl.ast.mut_token) |mut_token|
-        mut_token + 1
-    else
-        full_decl.ast.let_token + 1;
+    const name_token = full_decl.ast.let_token + 1 + @intFromBool(full_decl.ast.is_mutable);
     const ident_name_raw = ast.tokenSlice(name_token);
     // TODO: remove `_` from tokens?
     if (std.mem.eql(u8, ident_name_raw, "_")) {
@@ -586,7 +583,7 @@ fn varDecl(
         ident_name,
         name_token,
         ident_name_raw,
-        if (full_decl.ast.mut_token == null) .@"local constant" else .@"local variable",
+        if (full_decl.ast.is_mutable) .@"local variable" else .@"local constant",
     );
 
     if (full_decl.ast.init_node == 0) {
@@ -594,9 +591,8 @@ fn varDecl(
         return astgen.failNode(node, "variables must be initialized", .{});
     }
 
-    if (full_decl.ast.mut_token) |mut_token| {
+    if (full_decl.ast.is_mutable) {
         // TODO mut
-        _ = mut_token;
         unreachable;
     } else {
         // Depending on the type of AST the initialization expression is, we may need an lvalue
@@ -816,15 +812,11 @@ fn globalVarDecl(
     self.src_hasher.update(ast.getNodeSource(node));
     self.src_hasher.update(std.mem.asBytes(&self.source_column));
 
-    const is_mutable = full_decl.ast.mut_token != null;
     // We do this at the beginning so that the instruction index marks the range start
     // of the top level declaration.
     const decl_inst = try ng.makeDeclaration(node);
 
-    const name_token = if (full_decl.ast.mut_token) |mut_token|
-        mut_token + 1
-    else
-        full_decl.ast.let_token + 1;
+    const name_token = full_decl.ast.let_token + 1 + @intFromBool(full_decl.ast.is_mutable);
     self.advanceSourceCursorToNode(node);
 
     var block_scope: NirGen = .{
@@ -844,7 +836,7 @@ fn globalVarDecl(
     wip_members.nextDecl(decl_inst);
     const is_threadlocal = false;
     const lib_name = .empty;
-    const doc_comment_index = try self.docCommentAsString(full_decl.firstToken());
+    const doc_comment_index = try self.docCommentAsString(ast.firstToken(node));
 
     const var_inst: Nir.Inst.Ref = if (full_decl.ast.init_node != 0) vi: {
         if (is_extern) {
@@ -874,14 +866,14 @@ fn globalVarDecl(
             full_decl.ast.init_node,
         );
 
-        if (is_mutable) {
+        if (full_decl.ast.is_mutable) {
             const var_inst = try block_scope.addVar(.{
                 .var_type = type_inst,
                 .lib_name = .empty,
                 .align_inst = .none, // passed via the decls data
                 .init = init_inst,
                 .is_extern = false,
-                .is_const = !is_mutable,
+                .is_const = !full_decl.ast.is_mutable,
                 .is_threadlocal = is_threadlocal,
             });
             break :vi var_inst;
@@ -902,7 +894,7 @@ fn globalVarDecl(
             .align_inst = .none, // passed via the decls data
             .init = .none,
             .is_extern = true,
-            .is_const = !is_mutable,
+            .is_const = !full_decl.ast.is_mutable,
             .is_threadlocal = is_threadlocal,
         });
         break :vi var_inst;
@@ -1363,8 +1355,8 @@ fn rvalueInner(
             // instruction here because we need subsequent address-of operator on
             // const locals to return the same address.
             const astgen = ng.astgen;
-            const tree = astgen.tree;
-            const src_token = tree.firstToken(src_node);
+            const ast = astgen.ast;
+            const src_token = ast.firstToken(src_node);
             const result_index = coerced_result.toIndex() orelse
                 return ng.addUnTok(.ref, coerced_result, src_token);
             const nir_tags = ng.astgen.instructions.items(.tag);
