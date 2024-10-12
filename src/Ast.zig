@@ -1,5 +1,5 @@
-//! Originally based on https://github.com/ziglang/zig/blob/master/lib/std/zig/Ast.zig
-//! See https://github.com/ziglang/zig/blob/master/LICENSE for additional LICENSE details
+// Originally based on https://github.com/ziglang/zig/blob/master/lib/std/zig/Ast.zig
+// See https://github.com/ziglang/zig/blob/master/LICENSE for additional LICENSE details
 
 const std = @import("std");
 const Parser = @import("Parser.zig");
@@ -105,7 +105,7 @@ pub fn extraData(tree: Ast, index: usize, comptime T: type) T {
     return result;
 }
 
-pub fn rootStmts(self: Ast) []const Node.Index {
+pub fn rootDecls(self: Ast) []const Node.Index {
     // Root is always index 0.
     const nodes_data = self.nodes.items(.data);
     return self.extra_data[nodes_data[0].lhs..nodes_data[0].rhs];
@@ -154,6 +154,11 @@ pub fn renderError(self: Ast, parse_error: Error, writer: anytype) !void {
         //         token_tags[parse_error.token].symbol(),
         //     });
         // },
+        .expected_decl => {
+            return writer.print("expected declaration, found '{s}'", .{
+                token_tags[parse_error.token + @intFromBool(parse_error.token_is_prev)].symbol(),
+            });
+        },
         .expected_expr => {
             return writer.print("expected expression, found '{s}'", .{
                 token_tags[parse_error.token + @intFromBool(parse_error.token_is_prev)].symbol(),
@@ -223,21 +228,6 @@ pub fn renderError(self: Ast, parse_error: Error, writer: anytype) !void {
         // .extern_fn_body => {
         //     return writer.writeAll("extern functions have no body");
         // },
-        // .extra_addrspace_qualifier => {
-        //     return writer.writeAll("extra addrspace qualifier");
-        // },
-        // .extra_align_qualifier => {
-        //     return writer.writeAll("extra align qualifier");
-        // },
-        // .extra_allowzero_qualifier => {
-        //     return writer.writeAll("extra allowzero qualifier");
-        // },
-        // .extra_const_qualifier => {
-        //     return writer.writeAll("extra const qualifier");
-        // },
-        // .extra_volatile_qualifier => {
-        //     return writer.writeAll("extra volatile qualifier");
-        // },
         // .ptr_mod_on_array_child_type => {
         //     return writer.print("pointer modifier '{s}' not allowed on array child type", .{
         //         token_tags[parse_error.token].symbol(),
@@ -264,7 +254,6 @@ pub fn renderError(self: Ast, parse_error: Error, writer: anytype) !void {
         // .expected_continue_expr => {
         //     return writer.writeAll("expected ':' before while continue expression");
         // },
-
         .expected_newline_after_decl => {
             return writer.writeAll("expected new line after declaration");
         },
@@ -396,7 +385,6 @@ pub fn firstToken(self: Ast, node: Node.Index) TokenIndex {
         .bit_and,
         .bit_xor,
         .bit_or,
-        .optional_fallback,
         .bool_and,
         .bool_or,
         .call_one,
@@ -472,7 +460,6 @@ pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
         .bit_and,
         .bit_xor,
         .bit_or,
-        .optional_fallback,
         .bool_and,
         .bool_or,
         .@"if",
@@ -568,30 +555,20 @@ pub fn getNodeSource(self: Ast, node: Node.Index) []const u8 {
 
 // TODO: all of this
 
-pub fn varDecl(self: Ast, node: Node.Index) full.VarDecl {
-    assert(self.nodes.items(.tag)[node] == .var_decl);
+pub fn decl(self: Ast, node: Node.Index) full.Decl {
+    assert(self.nodes.items(.tag)[node] == .decl);
+    const let_token = self.nodes.items(.main_token)[node];
     const data = self.nodes.items(.data)[node];
-    return (.{
+    const extra: Node.Decl = @bitCast(data.lhs);
+    return .{
+        .attr = &.{},
         .ast = .{
-            .let_token = self.nodes.items(.main_token)[node],
-            .mut_token = null,
-            .type_node = data.lhs,
+            .let_token = let_token,
+            .mut_token = if (extra.mutable) let_token + 1 else null,
+            .type_node = extra.type_node,
             .init_node = data.rhs,
         },
-    });
-}
-
-pub fn mutVarDecl(self: Ast, node: Node.Index) full.VarDecl {
-    assert(self.nodes.items(.tag)[node] == .mut_var_decl);
-    const data = self.nodes.items(.data)[node];
-    return (.{
-        .ast = .{
-            .let_token = self.nodes.items(.main_token)[node],
-            .mut_token = self.nodes.items(.main_token)[node] + 1,
-            .type_node = data.lhs,
-            .init_node = data.rhs,
-        },
-    });
+    };
 }
 
 pub fn ifSimple(self: Ast, node: Node.Index) full.If {
@@ -803,10 +780,9 @@ fn fullFnProtoComponents(self: Ast, info: full.FnProto.Components) full.FnProto 
     return result;
 }
 
-pub fn fullVarDecl(self: Ast, node: Node.Index) ?full.VarDecl {
+pub fn fullDecl(self: Ast, node: Node.Index) ?full.Decl {
     return switch (self.nodes.items(.tag)[node]) {
-        .var_decl => self.varDecl(node),
-        .mut_var_decl => self.mutVarDecl(node),
+        .decl => self.decl(node),
         else => null,
     };
 }
@@ -872,6 +848,7 @@ pub fn fullCall(self: Ast, node: Node.Index) ?full.Call {
 /// Fully assembled AST node information.
 pub const full = struct {
     pub const Decl = struct {
+        attr: []const Node.Index,
         ast: Components,
 
         pub const Components = struct {
@@ -880,6 +857,14 @@ pub const full = struct {
             type_node: Node.Index,
             init_node: Node.Index,
         };
+
+        pub fn firstToken(self: Decl) TokenIndex {
+            if (self.attr.len > 0) {
+                return self.attr[0];
+            } else {
+                return self.ast.let_token;
+            }
+        }
     };
 
     pub const If = struct {
@@ -984,6 +969,7 @@ pub const Error = struct {
         chained_comparison_operators,
         mismatched_binary_op_whitespace,
         invalid_ampersand_ampersand,
+        expected_decl,
         expected_expr,
         expected_expr_or_assignment,
         expected_expr_or_decl,
@@ -1082,8 +1068,6 @@ pub const Node = struct {
         bit_xor,
         /// `lhs | rhs`. main_token is op.
         bit_or,
-        /// `lhs ?? rhs`. main_token is op.
-        optional_fallback,
         /// `lhs |> rhs`. main_token is op.
         function_pipe,
         /// `lhs and rhs`. main_token is op.

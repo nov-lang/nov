@@ -120,9 +120,6 @@ fn repl(allocator: std.mem.Allocator) !void {
 }
 
 pub fn main() !void {
-    const exit_status = try testMain();
-    std.process.exit(exit_status);
-
     var gpa: std.heap.GeneralPurposeAllocator(.{ .verbose_log = false }) = .{};
     const use_gpa = builtin.mode == .Debug;
     const allocator = if (builtin.os.tag == .wasi)
@@ -138,6 +135,15 @@ pub fn main() !void {
     defer if (use_gpa) {
         _ = gpa.deinit();
     };
+
+    // TODO
+    if (true) {
+        const exit_status = try testMain(allocator);
+        if (exit_status != 0) {
+            std.log.err("Test failed with exit status {}\n", .{exit_status});
+        }
+        return;
+    }
 
     if (builtin.os.tag != .windows and builtin.os.tag != .wasi) {
         const no_color = std.posix.getenv("NO_COLOR");
@@ -187,12 +193,13 @@ pub fn main() !void {
     }
 }
 
-fn testMain() !u8 {
+fn testMain(allocator: std.mem.Allocator) !u8 {
     const Parser = @import("Parser.zig");
     const AstGen = @import("AstGen.zig");
+    const Nir = @import("Nir.zig");
 
     const source =
-        \\-123 * (45.67)
+        \\let x = -123 * (45.67)
 
         // // \\let a = 1 + 2 + 3 + 4
         // // \\let a = 1 + 2 +
@@ -250,7 +257,6 @@ fn testMain() !u8 {
         // \\    }
         // \\}
         // \\
-        // \\if a == 3 { "true" } else { "false" } +
         \\
     ;
 
@@ -261,11 +267,10 @@ fn testMain() !u8 {
         \\```
     , .{source});
 
-    const allocator = std.heap.page_allocator;
     var ast = try Parser.parse(allocator, source);
     defer ast.deinit(allocator);
 
-    for (ast.rootStmts()) |stmt| {
+    for (ast.rootDecls()) |stmt| {
         for (ast.firstToken(stmt)..ast.lastToken(stmt) + 1) |token| {
             std.debug.print("{s} ", .{ast.tokenSlice(@intCast(token))});
         }
@@ -309,9 +314,18 @@ fn testMain() !u8 {
         return 1;
     }
 
-    const nir = try AstGen.generate(allocator, &ast);
+    var nir = try AstGen.generate(allocator, &ast);
+    defer nir.deinit(allocator);
     for (0..nir.instructions.len) |i| {
-        std.debug.print("Instruction {}: {}\n", .{ i, nir.instructions.get(i) });
+        const inst = nir.instructions.get(i);
+        const data_tag = Nir.Inst.data_tags[@intFromEnum(inst.tag)];
+        switch (data_tag) {
+            inline else => |tag| {
+                const data = @field(inst.data, @tagName(tag));
+                std.debug.print("Instruction {}: " ++ @tagName(tag) ++ ": {}\n", .{ i, data });
+            },
+        }
+        // std.debug.print("Instruction {}: {}\n", .{ i, nir.instructions.get(i) });
     }
 
     return 0;

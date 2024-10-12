@@ -1,5 +1,9 @@
+// Originally based on https://github.com/ziglang/zig/blob/master/lib/std/zig/AstGen.zig
+// See https://github.com/ziglang/zig/blob/master/LICENSE for additional LICENSE details
+
 const std = @import("std");
 const builtin = @import("builtin");
+const string_literal = @import("string_literal.zig");
 const Ast = @import("Ast.zig");
 const Nir = @import("Nir.zig");
 const isPrimitive = @import("primitives.zig").isPrimitive;
@@ -21,7 +25,7 @@ instructions: std.MultiArrayList(Nir.Inst),
 string_bytes: std.ArrayListUnmanaged(u8),
 extra: std.ArrayListUnmanaged(u32),
 /// Tracks the current byte offset within the source file.
-/// Used to populate line deltas in the ZIR. AstGen maintains
+/// Used to populate line deltas in the NIR. AstGen maintains
 /// this "cursor" throughout the entire AST lowering process in order
 /// to avoid starting over the line/column scan for every declaration, which
 /// would be O(N^2).
@@ -43,7 +47,7 @@ within_fn: bool,
 /// The return type of the current function. This may be a trivial `Ref`, or
 /// otherwise it refers to a `ret_type` instruction.
 fn_ret_ty: Nir.Inst.Ref,
-/// Maps string table indexes to the first `@import` ZIR instruction
+/// Maps string table indexes to the first `@import` NIR instruction
 /// that uses this string as the operand.
 imports: std.AutoArrayHashMapUnmanaged(Nir.NullTerminatedString, Ast.TokenIndex),
 /// Used for temporary storage when building payloads.
@@ -56,7 +60,7 @@ scratch: std.ArrayListUnmanaged(u32),
 /// 1. All pointers to the same locals return the same address. This is required
 ///    to be compliant with the language specification.
 /// 2. `ref` instructions will dominate their uses. This is a required property
-///    of ZIR.
+///    of NIR.
 /// The key is the ref operand; the value is the ref instruction.
 ref_table: std.AutoHashMapUnmanaged(Nir.Inst.Index, Nir.Inst.Index),
 /// Any information which should trigger invalidation of incremental compilation
@@ -116,25 +120,16 @@ pub fn generate(allocator: Allocator, ast: *const Ast) Allocator.Error!Nir {
         .instructions = &ng_instructions,
         .instructions_top = 0,
     };
-    gen_scope.is_comptime = true; // TODO: remove
 
     // The AST -> NIR lowering process assumes an AST that does not have any parse errors.
     if (ast.errors.len != 0) {
         try lowerAstErrors(&astgen);
+    } else if (topLevel(&gen_scope)) |struct_decl_ref| {
+        assert(struct_decl_ref.toIndex().? == .root);
+    } else |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.AnalysisFail => {}, // Handled via compile_errors below.
     }
-    // } else if (structDeclInner(
-    //     &gen_scope,
-    //     &gen_scope.base,
-    //     0,
-    //     ast.containerDeclRoot(),
-    //     .auto,
-    //     0,
-    // )) |struct_decl_ref| {
-    //     assert(struct_decl_ref.toIndex().? == .main_struct_inst);
-    // } else |err| switch (err) {
-    //     error.OutOfMemory => return error.OutOfMemory,
-    //     error.AnalysisFail => {}, // Handled via compile_errors below.
-    // }
 
     const err_index = @intFromEnum(Nir.ExtraIndex.compile_errors);
     if (astgen.compile_errors.items.len == 0) {
@@ -152,25 +147,25 @@ pub fn generate(allocator: Allocator, ast: *const Ast) Allocator.Error!Nir {
         }
     }
 
-    // const imports_index = @intFromEnum(Nir.ExtraIndex.imports);
-    // if (astgen.imports.count() == 0) {
-    //     astgen.extra.items[imports_index] = 0;
-    // } else {
-    //     try astgen.extra.ensureUnusedCapacity(allocator, @typeInfo(Nir.Inst.Imports).@"struct".fields.len +
-    //         astgen.imports.count() * @typeInfo(Nir.Inst.Imports.Item).@"struct".fields.len);
+    const imports_index = @intFromEnum(Nir.ExtraIndex.imports);
+    if (astgen.imports.count() == 0) {
+        astgen.extra.items[imports_index] = 0;
+    } else {
+        try astgen.extra.ensureUnusedCapacity(allocator, @typeInfo(Nir.Inst.Imports).@"struct".fields.len +
+            astgen.imports.count() * @typeInfo(Nir.Inst.Imports.Item).@"struct".fields.len);
 
-    //     astgen.extra.items[imports_index] = astgen.addExtraAssumeCapacity(Nir.Inst.Imports{
-    //         .imports_len = @intCast(astgen.imports.count()),
-    //     });
+        astgen.extra.items[imports_index] = astgen.addExtraAssumeCapacity(Nir.Inst.Imports{
+            .imports_len = @intCast(astgen.imports.count()),
+        });
 
-    //     var it = astgen.imports.iterator();
-    //     while (it.next()) |entry| {
-    //         _ = astgen.addExtraAssumeCapacity(Nir.Inst.Imports.Item{
-    //             .name = entry.key_ptr.*,
-    //             .token = entry.value_ptr.*,
-    //         });
-    //     }
-    // }
+        var it = astgen.imports.iterator();
+        while (it.next()) |entry| {
+            _ = astgen.addExtraAssumeCapacity(Nir.Inst.Imports.Item{
+                .name = entry.key_ptr.*,
+                .token = entry.value_ptr.*,
+            });
+        }
+    }
 
     return .{
         .instructions = astgen.instructions.toOwnedSlice(),
@@ -188,6 +183,132 @@ fn deinit(self: *AstGen) void {
     self.imports.deinit(self.allocator);
     self.scratch.deinit(self.allocator);
     self.ref_table.deinit(self.allocator);
+}
+
+// TODOa: replace setStruct with setRoot
+fn topLevel(ng: *NirGen) Error!Nir.Inst.Ref {
+    const decls = ng.astgen.ast.rootDecls();
+    const decl_inst = try ng.reserveInstructionIndex();
+
+    const scope = &ng.base;
+    const node = 0;
+    const layout = .auto;
+    const backing_int_node = 0;
+
+    if (decls.len == 0) {
+        try ng.setStruct(decl_inst, .{
+            .src_node = node,
+            .layout = layout,
+            .captures_len = 0,
+            .fields_len = 0,
+            .decls_len = 0,
+            .has_backing_int = false,
+            .known_non_opv = false,
+            .known_comptime_only = false,
+            .is_tuple = false,
+            .any_comptime_fields = false,
+            .any_default_inits = false,
+            .any_aligned_fields = false,
+            .fields_hash = std.zig.hashSrc(@tagName(layout)),
+        });
+        return decl_inst.toRef();
+    }
+
+    const astgen = ng.astgen;
+    const allocator = astgen.allocator;
+    const ast = astgen.ast;
+
+    var namespace: Scope.Namespace = .{
+        .parent = scope,
+        .node = node,
+        .inst = decl_inst,
+        .declaring_ng = ng,
+        .maybe_generic = astgen.within_fn,
+    };
+    defer namespace.deinit(allocator);
+
+    // The struct_decl instruction introduces a scope in which the decls of the struct
+    // are in scope, so that field types, alignments, and default value expressions
+    // can refer to decls within the struct itself.
+    astgen.advanceSourceCursorToNode(node);
+    var block_scope: NirGen = .{
+        .parent = &namespace.base,
+        .decl_node_index = node,
+        .decl_line = ng.decl_line,
+        .astgen = astgen,
+        .is_comptime = true,
+        .instructions = ng.instructions,
+        .instructions_top = ng.instructions.items.len,
+    };
+    defer block_scope.unstack();
+
+    const scratch_top = astgen.scratch.items.len;
+    defer astgen.scratch.items.len = scratch_top;
+
+    const decl_count = try astgen.scanContainer(&namespace, decls, .@"struct");
+
+    const bits_per_field = 4;
+    const max_field_size = 5;
+    var wip_members = try WipMembers.init(allocator, &astgen.scratch, decl_count, 0, bits_per_field, max_field_size);
+    defer wip_members.deinit();
+
+    // We will use the scratch buffer, starting here, for the bodies:
+    //    bodies: { // for every fields_len
+    //        field_type_body_inst: Inst, // for each field_type_body_len
+    //        align_body_inst: Inst, // for each align_body_len
+    //        init_body_inst: Inst, // for each init_body_len
+    //    }
+    // Note that the scratch buffer is simultaneously being used by WipMembers, however
+    // it will not access any elements beyond this point in the ArrayList. It also
+    // accesses via the ArrayList items field so it can handle the scratch buffer being
+    // reallocated.
+    // No defer needed here because it is handled by `wip_members.deinit()` above.
+    const bodies_start = astgen.scratch.items.len;
+
+    const old_hasher = astgen.src_hasher;
+    defer astgen.src_hasher = old_hasher;
+    astgen.src_hasher = std.zig.SrcHasher.init(.{});
+    astgen.src_hasher.update(@tagName(layout));
+    if (backing_int_node != 0) {
+        astgen.src_hasher.update(ast.getNodeSource(backing_int_node));
+    }
+
+    for (decls) |top_level_decl| {
+        assert(try containerMember(&block_scope, &namespace.base, &wip_members, top_level_decl) == .decl);
+    }
+
+    var fields_hash: std.zig.SrcHash = undefined;
+    astgen.src_hasher.final(&fields_hash);
+
+    try ng.setStruct(decl_inst, .{
+        .src_node = node,
+        .layout = layout,
+        .captures_len = @intCast(namespace.captures.count()),
+        .fields_len = 0,
+        .decls_len = decl_count,
+        .has_backing_int = false,
+        .known_non_opv = false,
+        .known_comptime_only = false,
+        .is_tuple = false,
+        .any_comptime_fields = false,
+        .any_default_inits = false,
+        .any_aligned_fields = false,
+        .fields_hash = fields_hash,
+    });
+
+    wip_members.finishBits(bits_per_field);
+    const decls_slice = wip_members.declsSlice();
+    const fields_slice = wip_members.fieldsSlice();
+    const bodies_slice = astgen.scratch.items[bodies_start..];
+    try astgen.extra.ensureUnusedCapacity(allocator, 0 + 2 +
+        decls_slice.len + namespace.captures.count() + fields_slice.len + bodies_slice.len);
+    astgen.extra.appendSliceAssumeCapacity(@ptrCast(namespace.captures.keys()));
+    astgen.extra.appendSliceAssumeCapacity(decls_slice);
+    astgen.extra.appendSliceAssumeCapacity(fields_slice);
+    astgen.extra.appendSliceAssumeCapacity(bodies_slice);
+
+    block_scope.unstack();
+    return decl_inst.toRef();
 }
 
 const ResultInfo = struct {
@@ -373,8 +494,8 @@ fn expr(ng: *NirGen, scope: *Scope, ri: ResultInfo, node: Ast.Node.Index) Error!
     const ast = astgen.ast;
     // const main_tokens = ast.nodes.items(.main_token);
     // const token_tags = ast.tokens.items(.tag);
-    // const node_datas = ast.nodes.items(.data);
-    const node_tags = ast.nodes.items(.tag);
+    const node_datas = ast.nodes.items(.data);
+    const node_tags: []const Ast.Node.Tag = ast.nodes.items(.tag);
 
     const prev_anon_name_strategy = ng.anon_name_strategy;
     defer ng.anon_name_strategy = prev_anon_name_strategy;
@@ -393,6 +514,11 @@ fn expr(ng: *NirGen, scope: *Scope, ri: ResultInfo, node: Ast.Node.Index) Error!
         .sub => return simpleBinOp(ng, scope, ri, node, .sub),
         .mul => return simpleBinOp(ng, scope, ri, node, .mul),
 
+        .negation => return negation(ng, scope, ri, node),
+
+        .grouped_expression => return expr(ng, scope, ri, node_datas[node].lhs),
+
+        .char_literal => return charLiteral(ng, ri, node),
         .number_literal => return numberLiteral(ng, ri, node, node, .positive),
     }
 }
@@ -429,8 +555,154 @@ fn comptimeExpr(ng: *NirGen, scope: *Scope, ri: ResultInfo, node: Ast.Node.Index
 // TODO: genDefers
 // TODO: checkUsed
 // TODO: deferStmt
-// TODO: varDecl
-// TODO: emitDbgNode
+
+// TODO
+fn varDecl(
+    ng: *NirGen,
+    scope: *Scope,
+    node: Ast.Node.Index,
+    block_arena: Allocator,
+    full_decl: Ast.full.Decl,
+) Error!*Scope {
+    try emitDbgNode(ng, node);
+    const astgen = ng.astgen;
+    const ast = astgen.ast;
+    // const token_tags = ast.tokens.items(.tag);
+    // const main_tokens = ast.nodes.items(.main_token);
+
+    const name_token = if (full_decl.ast.mut_token) |mut_token|
+        mut_token + 1
+    else
+        full_decl.ast.let_token + 1;
+    const ident_name_raw = ast.tokenSlice(name_token);
+    // TODO: remove `_` from tokens?
+    if (std.mem.eql(u8, ident_name_raw, "_")) {
+        return astgen.failTok(name_token, "'_' used as an identifer without @\"_\" syntax", .{});
+    }
+    const ident_name = try astgen.identAsString(name_token);
+
+    try astgen.detectLocalShadowing(
+        scope,
+        ident_name,
+        name_token,
+        ident_name_raw,
+        if (full_decl.ast.mut_token == null) .@"local constant" else .@"local variable",
+    );
+
+    if (full_decl.ast.init_node == 0) {
+        // TODO: no
+        return astgen.failNode(node, "variables must be initialized", .{});
+    }
+
+    if (full_decl.ast.mut_token) |mut_token| {
+        // TODO mut
+        _ = mut_token;
+        unreachable;
+    } else {
+        // Depending on the type of AST the initialization expression is, we may need an lvalue
+        // or an rvalue as a result location. If it is an rvalue, we can use the instruction as
+        // the variable, no memory location needed.
+        const type_node = full_decl.ast.type_node;
+        // if (!astgen.nodes_need_rl.contains(node)) {
+        //     const result_info: ResultInfo = if (type_node != 0) .{
+        //         .rl = .{ .ty = try typeExpr(gz, scope, type_node) },
+        //         .ctx = .const_init,
+        //     } else .{ .rl = .none, .ctx = .const_init };
+        //     const prev_anon_name_strategy = gz.anon_name_strategy;
+        //     gz.anon_name_strategy = .dbg_var;
+        //     const init_inst = try reachableExpr(gz, scope, result_info, var_decl.ast.init_node, node);
+        //     gz.anon_name_strategy = prev_anon_name_strategy;
+
+        //     try gz.addDbgVar(.dbg_var_val, ident_name, init_inst);
+
+        //     // The const init expression may have modified the error return trace, so signal
+        //     // to Sema that it should save the new index for restoring later.
+        //     if (nodeMayAppendToErrorTrace(tree, var_decl.ast.init_node))
+        //         _ = try gz.addSaveErrRetIndex(.{ .if_of_error_type = init_inst });
+
+        //     const sub_scope = try block_arena.create(Scope.LocalVal);
+        //     sub_scope.* = .{
+        //         .parent = scope,
+        //         .gen_zir = gz,
+        //         .name = ident_name,
+        //         .inst = init_inst,
+        //         .token_src = name_token,
+        //         .id_cat = .@"local constant",
+        //     };
+        //     return &sub_scope.base;
+        // }
+
+        const is_comptime = ng.is_comptime;
+
+        var resolve_inferred_alloc: Nir.Inst.Ref = .none;
+        var opt_type_inst: Nir.Inst.Ref = .none;
+        const init_rl: ResultInfo.Loc = if (type_node != 0) init_rl: {
+            const type_inst = try typeExpr(ng, scope, type_node);
+            opt_type_inst = type_inst;
+            break :init_rl .{ .ptr = .{ .inst = try ng.addUnNode(.alloc, type_inst, node) } };
+        } else init_rl: {
+            const alloc_inst = ptr: {
+                const tag: Nir.Inst.Tag = if (is_comptime)
+                    .alloc_inferred_comptime
+                else
+                    .alloc_inferred;
+                break :ptr try ng.addNode(tag, node);
+            };
+            resolve_inferred_alloc = alloc_inst;
+            break :init_rl .{ .inferred_ptr = alloc_inst };
+        };
+        const var_ptr = switch (init_rl) {
+            .ptr => |ptr| ptr.inst,
+            .inferred_ptr => |inst| inst,
+            else => unreachable,
+        };
+        const init_result_info: ResultInfo = .{ .rl = init_rl, .ctx = .const_init };
+
+        const prev_anon_name_strategy = ng.anon_name_strategy;
+        ng.anon_name_strategy = .dbg_var;
+        defer ng.anon_name_strategy = prev_anon_name_strategy;
+        const init_inst = try reachableExpr(ng, scope, init_result_info, full_decl.ast.init_node, node);
+
+        // The const init expression may have modified the error return trace, so signal
+        // to Sema that it should save the new index for restoring later.
+        _ = init_inst;
+        // if (nodeMayAppendToErrorTrace(tree, full_decl.ast.init_node)) {
+        //     _ = try ng.addSaveErrRetIndex(.{ .if_of_error_type = init_inst });
+        // }
+
+        const const_ptr = if (resolve_inferred_alloc != .none) p: {
+            _ = try ng.addUnNode(.resolve_inferred_alloc, resolve_inferred_alloc, node);
+            break :p var_ptr;
+        } else try ng.addUnNode(.make_ptr_const, var_ptr, node);
+
+        try ng.addDbgVar(.dbg_var_ptr, ident_name, const_ptr);
+
+        const sub_scope = try block_arena.create(Scope.LocalPtr);
+        sub_scope.* = .{
+            .parent = scope,
+            .gen_zir = ng,
+            .name = ident_name,
+            .ptr = const_ptr,
+            .token_src = name_token,
+            .maybe_comptime = true,
+            .id_cat = .@"local constant",
+        };
+        return &sub_scope.base;
+    }
+}
+
+fn emitDbgNode(ng: *NirGen, node: Ast.Node.Index) !void {
+    // The instruction emitted here is for debugging runtime code.
+    // If the current block will be evaluated only during semantic analysis
+    // then no dbg_stmt NIR instruction is needed.
+    if (ng.is_comptime) return;
+    const astgen = ng.astgen;
+    astgen.advanceSourceCursorToNode(node);
+    const line = astgen.source_line - ng.decl_line;
+    const column = astgen.source_column;
+    try emitDbgStmt(ng, .{ line, column });
+}
+
 // TODO: assign
 // TODO: assignDestructure
 // TODO: assignDestructureMaybeDecls
@@ -440,17 +712,289 @@ fn comptimeExpr(ng: *NirGen, scope: *Scope, ri: ResultInfo, node: Ast.Node.Index
 // TODO: arrayType
 // TODO: arrayTypeSentinel
 
-// TODO: WipMembers
+// TODO
+const WipMembers = struct {
+    payload: *std.ArrayListUnmanaged(u32),
+    payload_top: usize,
+    field_bits_start: u32,
+    fields_start: u32,
+    fields_end: u32,
+    decl_index: u32 = 0,
+    field_index: u32 = 0,
+
+    fn init(
+        allocator: Allocator,
+        payload: *std.ArrayListUnmanaged(u32),
+        decl_count: u32,
+        field_count: u32,
+        comptime bits_per_field: u32,
+        comptime max_field_size: u32,
+    ) Allocator.Error!WipMembers {
+        const payload_top: u32 = @intCast(payload.items.len);
+        const field_bits_start = payload_top + decl_count;
+        const fields_start = field_bits_start + if (bits_per_field > 0) blk: {
+            const fields_per_u32 = 32 / bits_per_field;
+            break :blk (field_count + fields_per_u32 - 1) / fields_per_u32;
+        } else 0;
+        const payload_end = fields_start + field_count * max_field_size;
+        try payload.resize(allocator, payload_end);
+        return .{
+            .payload = payload,
+            .payload_top = payload_top,
+            .field_bits_start = field_bits_start,
+            .fields_start = fields_start,
+            .fields_end = fields_start,
+        };
+    }
+
+    fn nextDecl(self: *WipMembers, decl_inst: Nir.Inst.Index) void {
+        self.payload.items[self.payload_top + self.decl_index] = @intFromEnum(decl_inst);
+        self.decl_index += 1;
+    }
+
+    fn nextField(self: *WipMembers, comptime bits_per_field: u32, bits: [bits_per_field]bool) void {
+        const fields_per_u32 = 32 / bits_per_field;
+        const index = self.field_bits_start + self.field_index / fields_per_u32;
+        assert(index < self.fields_start);
+        var bit_bag: u32 = if (self.field_index % fields_per_u32 == 0) 0 else self.payload.items[index];
+        bit_bag >>= bits_per_field;
+        comptime var i = 0;
+        inline while (i < bits_per_field) : (i += 1) {
+            bit_bag |= @as(u32, @intFromBool(bits[i])) << (32 - bits_per_field + i);
+        }
+        self.payload.items[index] = bit_bag;
+        self.field_index += 1;
+    }
+
+    fn appendToField(self: *WipMembers, data: u32) void {
+        assert(self.fields_end < self.payload.items.len);
+        self.payload.items[self.fields_end] = data;
+        self.fields_end += 1;
+    }
+
+    fn finishBits(self: *WipMembers, comptime bits_per_field: u32) void {
+        if (bits_per_field > 0) {
+            const fields_per_u32 = 32 / bits_per_field;
+            const empty_field_slots = fields_per_u32 - (self.field_index % fields_per_u32);
+            if (self.field_index > 0 and empty_field_slots < fields_per_u32) {
+                const index = self.field_bits_start + self.field_index / fields_per_u32;
+                self.payload.items[index] >>= @intCast(empty_field_slots * bits_per_field);
+            }
+        }
+    }
+
+    fn declsSlice(self: *WipMembers) []u32 {
+        return self.payload.items[self.payload_top..][0..self.decl_index];
+    }
+
+    fn fieldsSlice(self: *WipMembers) []u32 {
+        return self.payload.items[self.field_bits_start..self.fields_end];
+    }
+
+    fn deinit(self: *WipMembers) void {
+        self.payload.items.len = self.payload_top;
+    }
+};
 
 // TODO: fnDecl
-// TODO: globalVarDecl
+
+// TODO
+fn globalVarDecl(
+    self: *AstGen,
+    ng: *NirGen,
+    scope: *Scope,
+    wip_members: *WipMembers,
+    node: Ast.Node.Index,
+    full_decl: Ast.full.Decl,
+) Error!void {
+    const ast = self.ast;
+    // const token_tags = ast.tokens.items(.tag);
+
+    const old_hasher = self.src_hasher;
+    defer self.src_hasher = old_hasher;
+    self.src_hasher = std.zig.SrcHasher.init(.{});
+    self.src_hasher.update(ast.getNodeSource(node));
+    self.src_hasher.update(std.mem.asBytes(&self.source_column));
+
+    const is_mutable = full_decl.ast.mut_token != null;
+    // We do this at the beginning so that the instruction index marks the range start
+    // of the top level declaration.
+    const decl_inst = try ng.makeDeclaration(node);
+
+    const name_token = if (full_decl.ast.mut_token) |mut_token|
+        mut_token + 1
+    else
+        full_decl.ast.let_token + 1;
+    self.advanceSourceCursorToNode(node);
+
+    var block_scope: NirGen = .{
+        .parent = scope,
+        .decl_node_index = node,
+        .decl_line = self.source_line,
+        .astgen = self,
+        .is_comptime = true,
+        .instructions = ng.instructions,
+        .instructions_top = ng.instructions.items.len,
+    };
+    defer block_scope.unstack();
+
+    const is_pub = false;
+    const is_export = false;
+    const is_extern = false;
+    wip_members.nextDecl(decl_inst);
+    const is_threadlocal = false;
+    const lib_name = .empty;
+    const doc_comment_index = try self.docCommentAsString(full_decl.firstToken());
+
+    const var_inst: Nir.Inst.Ref = if (full_decl.ast.init_node != 0) vi: {
+        if (is_extern) {
+            return self.failNode(
+                full_decl.ast.init_node,
+                "extern variables have no initializers",
+                .{},
+            );
+        }
+
+        const type_inst: Nir.Inst.Ref = if (full_decl.ast.type_node != 0)
+            try expr(
+                &block_scope,
+                &block_scope.base,
+                coerced_type_ri,
+                full_decl.ast.type_node,
+            )
+        else
+            .none;
+
+        block_scope.anon_name_strategy = .parent;
+
+        const init_inst = try expr(
+            &block_scope,
+            &block_scope.base,
+            if (type_inst != .none) .{ .rl = .{ .ty = type_inst } } else .{ .rl = .none },
+            full_decl.ast.init_node,
+        );
+
+        if (is_mutable) {
+            const var_inst = try block_scope.addVar(.{
+                .var_type = type_inst,
+                .lib_name = .empty,
+                .align_inst = .none, // passed via the decls data
+                .init = init_inst,
+                .is_extern = false,
+                .is_const = !is_mutable,
+                .is_threadlocal = is_threadlocal,
+            });
+            break :vi var_inst;
+        } else {
+            break :vi init_inst;
+        }
+    } else if (!is_extern) {
+        return self.failNode(node, "variables must be initialized", .{});
+    } else if (full_decl.ast.type_node != 0) vi: {
+        // Extern variable which has an explicit type.
+        const type_inst = try typeExpr(&block_scope, &block_scope.base, full_decl.ast.type_node);
+
+        block_scope.anon_name_strategy = .parent;
+
+        const var_inst = try block_scope.addVar(.{
+            .var_type = type_inst,
+            .lib_name = lib_name,
+            .align_inst = .none, // passed via the decls data
+            .init = .none,
+            .is_extern = true,
+            .is_const = !is_mutable,
+            .is_threadlocal = is_threadlocal,
+        });
+        break :vi var_inst;
+    } else {
+        return self.failNode(node, "unable to infer variable type", .{});
+    };
+
+    // We do this at the end so that the instruction index marks the end
+    // range of a top level declaration.
+    _ = try block_scope.addBreakWithSrcNode(.break_inline, decl_inst, var_inst, node);
+    // TODO: align linksection addrspace
+
+    var hash: std.zig.SrcHash = undefined;
+    self.src_hasher.final(&hash);
+    try setDeclaration(
+        decl_inst,
+        hash,
+        .{ .named = name_token },
+        block_scope.decl_line,
+        is_pub,
+        is_export,
+        doc_comment_index,
+        &block_scope,
+    );
+}
+
 // TODO: comptimeDecl
 // TODO: usignnamespaceDecl
 // TODO: testDecl
 // TODO: structDeclInner
 // TODO: unionDeclInner
 // TODO: containerDecl
-// TODO: containerMember
+
+// const ContainerMemberResult = union(enum) { decl, field: Ast.full.ContainerField };
+const ContainerMemberResult = union(enum) { decl };
+
+// TODO
+fn containerMember(
+    ng: *NirGen,
+    scope: *Scope,
+    wip_members: *WipMembers,
+    member_node: Ast.Node.Index,
+) Error!ContainerMemberResult {
+    const astgen = ng.astgen;
+    const ast = astgen.ast;
+    const node_tags = ast.nodes.items(.tag);
+    // const node_datas = ast.nodes.items(.data);
+    switch (node_tags[member_node]) {
+        // .container_field_init,
+        // .container_field_align,
+        // .container_field,
+        // => return ContainerMemberResult{ .field = tree.fullContainerField(member_node).? },
+
+        // .fn_proto,
+        // .fn_proto_multi,
+        // .fn_proto_one,
+        // .fn_proto_simple,
+        // .fn_decl,
+        // => {
+        //     var buf: [1]Ast.Node.Index = undefined;
+        //     const full = tree.fullFnProto(&buf, member_node).?;
+        //     const body = if (node_tags[member_node] == .fn_decl) node_datas[member_node].rhs else 0;
+
+        //     astgen.fnDecl(ng, scope, wip_members, member_node, body, full) catch |err| switch (err) {
+        //         error.OutOfMemory => return error.OutOfMemory,
+        //         error.AnalysisFail => {},
+        //     };
+        // },
+
+        // .global_var_decl,
+        // .local_var_decl,
+        // .simple_var_decl,
+        // .aligned_var_decl,
+        .decl,
+        => {
+            astgen.globalVarDecl(ng, scope, wip_members, member_node, ast.fullDecl(member_node).?) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.AnalysisFail => {},
+            };
+        },
+
+        // .test_decl => {
+        //     astgen.testDecl(ng, scope, wip_members, member_node) catch |err| switch (err) {
+        //         error.OutOfMemory => return error.OutOfMemory,
+        //         error.AnalysisFail => {},
+        //     };
+        // },
+        else => unreachable,
+    }
+    return .decl;
+}
+
 // TODO: errorSetDecl
 // TODO: tryExpr
 // TODO: orelseCatchExpr
@@ -467,14 +1011,14 @@ fn simpleBinOp(
 ) Error!Nir.Inst.Ref {
     const astgen = ng.astgen;
     const ast = astgen.ast;
-    const node_datas = ast.nodes.items(.data)[node];
+    const node_data = ast.nodes.items(.data)[node];
 
-    const lhs = try reachableExpr(ng, scope, .{ .rl = .none }, node_datas[node].lhs, node);
+    const lhs = try reachableExpr(ng, scope, .{ .rl = .none }, node_data.lhs, node);
     const cursor = switch (op_inst_tag) {
         .add, .sub, .mul, .div, .mod_rem => maybeAdvanceSourceCursorToMainToken(ng, node),
         else => undefined,
     };
-    const rhs = try reachableExpr(ng, scope, .{ .rl = .none }, node_datas[node].rhs, node);
+    const rhs = try reachableExpr(ng, scope, .{ .rl = .none }, node_data.rhs, node);
 
     switch (op_inst_tag) {
         .add, .sub, .mul, .div, .mod_rem => try emitDbgStmt(ng, cursor),
@@ -507,7 +1051,7 @@ fn charLiteral(gz: *NirGen, ri: ResultInfo, node: Ast.Node.Index) Error!Nir.Inst
     const main_token = main_tokens[node];
     const slice = tree.tokenSlice(main_token);
 
-    switch (std.zig.parseCharLiteral(slice)) {
+    switch (string_literal.parseCharLiteral(slice)) {
         .success => |codepoint| {
             const result = try gz.addInt(codepoint);
             return rvalue(gz, ri, result, node);
@@ -633,6 +1177,7 @@ fn failWithNumberError(astgen: *AstGen, err: std.zig.number_literal.Error, token
             assert(bytes.len >= 2 and bytes[0] == '0' and bytes[1] == 'x'); // Validated by tokenizer
             return astgen.failOff(token, @intCast(i), "sign '{c}' cannot follow digit '{c}' in hex base", .{ bytes[i], bytes[i - 1] });
         },
+        .period_after_exponent => |i| return astgen.failOff(token, @intCast(i), "unexpected period after exponent", .{}),
     }
 }
 
@@ -645,9 +1190,66 @@ fn failWithNumberError(astgen: *AstGen, err: std.zig.number_literal.Error, token
 // TODO: builtinCall
 // TODO: hasDeclOrField
 // TODO: typeCast
-// TODO: simpleUnOpType
-// TODO: simpleUnOp
-// TODO: negation
+
+fn simpleUnOpType(
+    ng: *NirGen,
+    scope: *Scope,
+    ri: ResultInfo,
+    node: Ast.Node.Index,
+    operand_node: Ast.Node.Index,
+    tag: Nir.Inst.Tag,
+) Error!Nir.Inst.Ref {
+    const operand = try typeExpr(ng, scope, operand_node);
+    const result = try ng.addUnNode(tag, operand, node);
+    return rvalue(ng, ri, result, node);
+}
+
+// TODO
+fn simpleUnOp(
+    ng: *NirGen,
+    scope: *Scope,
+    ri: ResultInfo,
+    node: Ast.Node.Index,
+    operand_ri: ResultInfo,
+    operand_node: Ast.Node.Index,
+    tag: Nir.Inst.Tag,
+) Error!Nir.Inst.Ref {
+    const cursor = maybeAdvanceSourceCursorToMainToken(ng, node);
+    const operand = if (tag == .compile_error)
+        try comptimeExpr(ng, scope, operand_ri, operand_node)
+    else
+        try expr(ng, scope, operand_ri, operand_node);
+    switch (tag) {
+        .tag_name, .error_name, .int_from_ptr => try emitDbgStmt(ng, cursor),
+        else => {},
+    }
+    const result = try ng.addUnNode(tag, operand, node);
+    return rvalue(ng, ri, result, node);
+}
+
+fn negation(
+    ng: *NirGen,
+    scope: *Scope,
+    ri: ResultInfo,
+    node: Ast.Node.Index,
+) Error!Nir.Inst.Ref {
+    const astgen = ng.astgen;
+    const ast = astgen.ast;
+    const node_tags = ast.nodes.items(.tag);
+    const node_datas = ast.nodes.items(.data);
+
+    // Check for float literal as the sub-expression because we want to preserve
+    // its negativity rather than having it go through comptime subtraction.
+    const operand_node = node_datas[node].lhs;
+    if (node_tags[operand_node] == .number_literal) {
+        return numberLiteral(ng, ri, operand_node, node, .negative);
+    }
+
+    const operand = try expr(ng, scope, .{ .rl = .none }, operand_node);
+    const result = try ng.addUnNode(.negate, operand, node);
+    return rvalue(ng, ri, result, node);
+}
+
 // TODO: cmpxchg
 // TODO: bitBuiltin
 // TODO: divBuiltin
@@ -915,16 +1517,86 @@ fn rvalueInner(
     }
 }
 
-// TODO: identifierTokenString
-// TODO: appendIdentStr
-// TODO: parseStrLit // handle string interpolation here?
+/// Given an identifier token, obtain the string for it.
+/// If the token uses @"" syntax, parses as a string, reports errors if applicable,
+/// and allocates the result within `astgen.arena`.
+/// Otherwise, returns a reference to the source code bytes directly.
+/// See also `appendIdentStr` and `parseStrLit`.
+fn identifierTokenString(self: *AstGen, token: Ast.TokenIndex) Error![]const u8 {
+    const ast = self.ast;
+    const token_tags = ast.tokens.items(.tag);
+    assert(token_tags[token] == .identifier);
+    const ident_name = ast.tokenSlice(token);
+    if (!std.mem.startsWith(u8, ident_name, "@")) {
+        return ident_name;
+    }
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(self.allocator);
+    try self.parseStrLit(token, &buf, ident_name, 1);
+    if (std.mem.indexOfScalar(u8, buf.items, 0) != null) {
+        return self.failTok(token, "identifier cannot contain null bytes", .{});
+    } else if (buf.items.len == 0) {
+        return self.failTok(token, "identifier cannot be empty", .{});
+    }
+    const duped = try self.arena.dupe(u8, buf.items);
+    return duped;
+}
+
+/// Given an identifier token, obtain the string for it (possibly parsing as a string
+/// literal if it is @"" syntax), and append the string to `buf`.
+/// See also `identifierTokenString` and `parseStrLit`.
+fn appendIdentStr(self: *AstGen, token: Ast.TokenIndex, buf: *std.ArrayListUnmanaged(u8)) Error!void {
+    const ast = self.ast;
+    const token_tags = ast.tokens.items(.tag);
+    assert(token_tags[token] == .identifier);
+    const ident_name = ast.tokenSlice(token);
+    if (!std.mem.startsWith(u8, ident_name, "@")) {
+        return buf.appendSlice(self.allocator, ident_name);
+    } else {
+        const start = buf.items.len;
+        try self.parseStrLit(token, buf, ident_name, 1);
+        const slice = buf.items[start..];
+        if (std.mem.indexOfScalar(u8, slice, 0) != null) {
+            return self.failTok(token, "identifier cannot contain null bytes", .{});
+        } else if (slice.len == 0) {
+            return self.failTok(token, "identifier cannot be empty", .{});
+        }
+    }
+}
+
+// TODO: handle string interpolation here?
+// in string_literal.parseWrite
+
+/// Appends the result to `buf`.
+fn parseStrLit(
+    self: *AstGen,
+    token: Ast.TokenIndex,
+    buf: *std.ArrayListUnmanaged(u8),
+    bytes: []const u8,
+    offset: u32,
+) Error!void {
+    const raw_string = bytes[offset..];
+    var buf_managed = buf.toManaged(self.allocator);
+    const result = string_literal.parseWrite(buf_managed.writer(), raw_string);
+    buf.* = buf_managed.moveToUnmanaged();
+    switch (try result) {
+        .success => return,
+        .failure => |err| return self.failWithStrLitError(err, token, bytes, offset),
+    }
+}
 
 // TODO
-fn failWithStrLitError(astgen: *AstGen, err: std.zig.string_literal.Error, token: Ast.TokenIndex, bytes: []const u8, offset: u32) Error {
+fn failWithStrLitError(
+    self: *AstGen,
+    err: string_literal.Error,
+    token: Ast.TokenIndex,
+    bytes: []const u8,
+    offset: u32,
+) Error {
     const raw_string = bytes[offset..];
     switch (err) {
         .invalid_escape_character => |bad_index| {
-            return astgen.failOff(
+            return self.failOff(
                 token,
                 offset + @as(u32, @intCast(bad_index)),
                 "invalid escape character: '{c}'",
@@ -932,7 +1604,7 @@ fn failWithStrLitError(astgen: *AstGen, err: std.zig.string_literal.Error, token
             );
         },
         .expected_hex_digit => |bad_index| {
-            return astgen.failOff(
+            return self.failOff(
                 token,
                 offset + @as(u32, @intCast(bad_index)),
                 "expected hex digit, found '{c}'",
@@ -940,7 +1612,7 @@ fn failWithStrLitError(astgen: *AstGen, err: std.zig.string_literal.Error, token
             );
         },
         .empty_unicode_escape_sequence => |bad_index| {
-            return astgen.failOff(
+            return self.failOff(
                 token,
                 offset + @as(u32, @intCast(bad_index)),
                 "empty unicode escape sequence",
@@ -948,7 +1620,7 @@ fn failWithStrLitError(astgen: *AstGen, err: std.zig.string_literal.Error, token
             );
         },
         .expected_hex_digit_or_rbrace => |bad_index| {
-            return astgen.failOff(
+            return self.failOff(
                 token,
                 offset + @as(u32, @intCast(bad_index)),
                 "expected hex digit or '}}', found '{c}'",
@@ -956,7 +1628,7 @@ fn failWithStrLitError(astgen: *AstGen, err: std.zig.string_literal.Error, token
             );
         },
         .invalid_unicode_codepoint => |bad_index| {
-            return astgen.failOff(
+            return self.failOff(
                 token,
                 offset + @as(u32, @intCast(bad_index)),
                 "unicode escape does not correspond to a valid codepoint",
@@ -964,7 +1636,7 @@ fn failWithStrLitError(astgen: *AstGen, err: std.zig.string_literal.Error, token
             );
         },
         .expected_lbrace => |bad_index| {
-            return astgen.failOff(
+            return self.failOff(
                 token,
                 offset + @as(u32, @intCast(bad_index)),
                 "expected '{{', found '{c}",
@@ -972,7 +1644,7 @@ fn failWithStrLitError(astgen: *AstGen, err: std.zig.string_literal.Error, token
             );
         },
         .expected_rbrace => |bad_index| {
-            return astgen.failOff(
+            return self.failOff(
                 token,
                 offset + @as(u32, @intCast(bad_index)),
                 "expected '}}', found '{c}",
@@ -980,7 +1652,7 @@ fn failWithStrLitError(astgen: *AstGen, err: std.zig.string_literal.Error, token
             );
         },
         .expected_single_quote => |bad_index| {
-            return astgen.failOff(
+            return self.failOff(
                 token,
                 offset + @as(u32, @intCast(bad_index)),
                 "expected single quote ('), found '{c}",
@@ -988,12 +1660,15 @@ fn failWithStrLitError(astgen: *AstGen, err: std.zig.string_literal.Error, token
             );
         },
         .invalid_character => |bad_index| {
-            return astgen.failOff(
+            return self.failOff(
                 token,
                 offset + @as(u32, @intCast(bad_index)),
                 "invalid byte in string or character literal: '{c}'",
                 .{raw_string[bad_index]},
             );
+        },
+        .empty_char_literal => {
+            return self.failOff(token, offset, "empty character literal", .{});
         },
     }
 }
@@ -1183,19 +1858,18 @@ fn errNoteNode(
     });
 }
 
-// TODO: idk about all below
-
-fn identAsString(astgen: *AstGen, ident_token: Ast.TokenIndex) !Nir.NullTerminatedString {
+fn identAsString(astgen: *AstGen, ident_token: Ast.TokenIndex) Error!Nir.NullTerminatedString {
     const allocator = astgen.allocator;
     const string_bytes = &astgen.string_bytes;
     const str_index: u32 = @intCast(string_bytes.items.len);
     try astgen.appendIdentStr(ident_token, string_bytes);
     const key: []const u8 = string_bytes.items[str_index..];
-    const gop = try astgen.string_table.getOrPutContextAdapted(allocator, key, StringIndexAdapter{
-        .bytes = string_bytes,
-    }, StringIndexContext{
-        .bytes = string_bytes,
-    });
+    const gop = try astgen.string_table.getOrPutContextAdapted(
+        allocator,
+        key,
+        StringIndexAdapter{ .bytes = string_bytes },
+        StringIndexContext{ .bytes = string_bytes },
+    );
     if (gop.found_existing) {
         string_bytes.shrinkRetainingCapacity(str_index);
         return @enumFromInt(gop.key_ptr.*);
@@ -1205,6 +1879,8 @@ fn identAsString(astgen: *AstGen, ident_token: Ast.TokenIndex) !Nir.NullTerminat
         return @enumFromInt(str_index);
     }
 }
+
+// TODO: idk about all below
 
 /// Adds a doc comment block to `string_bytes` by walking backwards from `end_token`.
 /// `end_token` must point at the first token after the last doc coment line.
@@ -2023,7 +2699,7 @@ const NirGen = struct {
 
         try astgen.extra.ensureUnusedCapacity(
             allocator,
-            @typeInfo(Nir.Inst.ExtendedVar).Struct.fields.len +
+            @typeInfo(Nir.Inst.ExtendedVar).@"struct".fields.len +
                 @intFromBool(args.lib_name != .empty) +
                 @intFromBool(args.align_inst != .none) +
                 @intFromBool(args.init != .none),
@@ -2495,7 +3171,7 @@ const NirGen = struct {
     ) !Nir.Inst.Index {
         const allocator = ng.astgen.allocator;
         try ng.astgen.instructions.ensureUnusedCapacity(allocator, 1);
-        try ng.astgen.extra.ensureUnusedCapacity(allocator, @typeInfo(Nir.Inst.Break).Struct.fields.len);
+        try ng.astgen.extra.ensureUnusedCapacity(allocator, @typeInfo(Nir.Inst.Break).@"struct".fields.len);
 
         const new_index: Nir.Inst.Index = @enumFromInt(ng.astgen.instructions.len);
         ng.astgen.instructions.appendAssumeCapacity(.{
@@ -2726,6 +3402,21 @@ const NirGen = struct {
         return new_index;
     }
 
+    /// Note that this returns a `Zir.Inst.Index` not a ref.
+    /// Does *not* append the block instruction to the scope.
+    /// Leaves the `payload_index` field undefined. Use `setDeclaration` to finalize.
+    fn makeDeclaration(ng: *NirGen, node: Ast.Node.Index) !Nir.Inst.Index {
+        const new_index: Nir.Inst.Index = @enumFromInt(ng.astgen.instructions.len);
+        try ng.astgen.instructions.append(ng.astgen.allocator, .{
+            .tag = .declaration,
+            .data = .{ .declaration = .{
+                .src_node = node,
+                .payload_index = undefined,
+            } },
+        });
+        return new_index;
+    }
+
     /// Note that this returns a `Nir.Inst.Index` not a ref.
     /// Leaves the `payload_index` field undefined.
     fn addCondBr(ng: *NirGen, tag: Nir.Inst.Tag, node: Ast.Node.Index) !Nir.Inst.Index {
@@ -2766,13 +3457,14 @@ const NirGen = struct {
 
         const fields_hash_arr: [4]u32 = @bitCast(args.fields_hash);
 
-        try astgen.extra.ensureUnusedCapacity(allocator, @typeInfo(Nir.Inst.StructDecl).Struct.fields.len + 3);
+        try astgen.extra.ensureUnusedCapacity(allocator, @typeInfo(Nir.Inst.StructDecl).@"struct".fields.len + 3);
         const payload_index = astgen.addExtraAssumeCapacity(Nir.Inst.StructDecl{
             .fields_hash_0 = fields_hash_arr[0],
             .fields_hash_1 = fields_hash_arr[1],
             .fields_hash_2 = fields_hash_arr[2],
             .fields_hash_3 = fields_hash_arr[3],
-            .src_node = ng.nodeIndexToRelative(args.src_node),
+            .src_line = astgen.source_line,
+            .src_node = args.src_node,
         });
 
         if (args.captures_len != 0) {
@@ -3166,124 +3858,168 @@ fn advanceSourceCursor(astgen: *AstGen, end: usize) void {
     astgen.source_column = column;
 }
 
-fn scanDecls(astgen: *AstGen, namespace: *Scope.Namespace, members: []const Ast.Node.Index) !u32 {
-    const allocator = astgen.allocator;
-    const ast = astgen.ast;
+// TODO
+/// Detects name conflicts for decls and fields, and populates `namespace.decls` with all named declarations.
+/// Returns the number of declarations in the namespace, including unnamed declarations (e.g. `comptime` decls).
+fn scanContainer(
+    self: *AstGen,
+    namespace: *Scope.Namespace,
+    members: []const Ast.Node.Index,
+    container_kind: enum { @"struct", @"union", @"enum", @"opaque" },
+) !u32 {
+    const allocator = self.allocator;
+    const ast = self.ast;
     const node_tags = ast.nodes.items(.tag);
     const main_tokens = ast.nodes.items(.main_token);
-    const token_tags = ast.tokens.items(.tag);
+    // const token_tags = ast.tokens.items(.tag);
 
-    // We don't have shadowing for test names, so we just track those for duplicate reporting locally.
-    var named_tests: std.AutoHashMapUnmanaged(Nir.NullTerminatedString, Ast.Node.Index) = .{};
-    var decltests: std.AutoHashMapUnmanaged(Nir.NullTerminatedString, Ast.Node.Index) = .{};
+    // This type forms a linked list of source tokens declaring the same name.
+    const NameEntry = struct {
+        tok: Ast.TokenIndex,
+        /// Using a linked list here simplifies memory management, and is acceptable since
+        ///ewntries are only allocated in error situations. The entries are allocated into the
+        /// AstGen arena.
+        next: ?*@This(),
+    };
+
+    // The maps below are allocated into this SFBA to avoid using the GPA for small namespaces.
+    var sfba_state = std.heap.stackFallback(512, allocator);
+    const sfba = sfba_state.get();
+
+    var names: std.AutoArrayHashMapUnmanaged(Nir.NullTerminatedString, NameEntry) = .empty;
+    // var test_names: std.AutoArrayHashMapUnmanaged(Nir.NullTerminatedString, NameEntry) = .empty;
+    // var decltest_names: std.AutoArrayHashMapUnmanaged(Nir.NullTerminatedString, NameEntry) = .empty;
     defer {
-        named_tests.deinit(allocator);
-        decltests.deinit(allocator);
+        names.deinit(sfba);
+        // test_names.deinit(sfba);
+        // decltest_names.deinit(sfba);
     }
 
+    var any_duplicates = false;
     var decl_count: u32 = 0;
     for (members) |member_node| {
-        const name_token = switch (node_tags[member_node]) {
-            .global_var_decl,
-            .local_var_decl,
-            .simple_var_decl,
-            .aligned_var_decl,
+        const Kind = enum { decl, field };
+        const kind: Kind, const name_token = switch (node_tags[member_node]) {
+            // .container_field_init,
+            // .container_field_align,
+            // .container_field,
+            // => blk: {
+            //     var full = ast.fullContainerField(member_node).?;
+            //     switch (container_kind) {
+            //         .@"struct", .@"opaque" => {},
+            //         .@"union", .@"enum" => full.convertToNonTupleLike(self.tree.nodes),
+            //     }
+            //     if (full.ast.tuple_like) continue;
+            //     break :blk .{ .field, full.ast.main_token };
+            // },
+
+            .decl,
             => blk: {
                 decl_count += 1;
-                break :blk main_tokens[member_node] + 1;
+                break :blk .{ .decl, main_tokens[member_node] + 1 };
             },
 
-            .fn_proto_simple,
-            .fn_proto_multi,
-            .fn_proto_one,
-            .fn_proto,
-            .fn_decl,
-            => blk: {
-                decl_count += 1;
-                const ident = main_tokens[member_node] + 1;
-                if (token_tags[ident] != .identifier) {
-                    switch (astgen.failNode(member_node, "missing function name", .{})) {
-                        error.AnalysisFail => continue,
-                        error.OutOfMemory => return error.OutOfMemory,
-                    }
-                }
-                break :blk ident;
-            },
+            // .fn_proto_simple,
+            // .fn_proto_multi,
+            // .fn_proto_one,
+            // .fn_proto,
+            // .fn_decl,
+            // => blk: {
+            //     decl_count += 1;
+            //     const ident = main_tokens[member_node] + 1;
+            //     if (token_tags[ident] != .identifier) {
+            //         try self.appendErrorNode(member_node, "missing function name", .{});
+            //         continue;
+            //     }
+            //     break :blk .{ .decl, ident };
+            // },
 
-            .@"comptime", .@"usingnamespace" => {
-                decl_count += 1;
-                continue;
-            },
+            // .test_decl => {
+            //     decl_count += 1;
+            //     // We don't want shadowing detection here, and test names work a bit differently, so
+            //     // we must do the redeclaration detection ourselves.
+            //     const test_name_token = main_tokens[member_node] + 1;
+            //     const new_ent: NameEntry = .{
+            //         .tok = test_name_token,
+            //         .next = null,
+            //     };
+            //     switch (token_tags[test_name_token]) {
+            //         else => {}, // unnamed test
+            //         .string_literal => {
+            //             const name = try self.strLitAsString(test_name_token);
+            //             const gop = try test_names.getOrPut(sfba, name.index);
+            //             if (gop.found_existing) {
+            //                 var e = gop.value_ptr;
+            //                 while (e.next) |n| e = n;
+            //                 e.next = try self.arena.create(NameEntry);
+            //                 e.next.?.* = new_ent;
+            //                 any_duplicates = true;
+            //             } else {
+            //                 gop.value_ptr.* = new_ent;
+            //             }
+            //         },
+            //         .identifier => {
+            //             const name = try self.identAsString(test_name_token);
+            //             const gop = try decltest_names.getOrPut(sfba, name);
+            //             if (gop.found_existing) {
+            //                 var e = gop.value_ptr;
+            //                 while (e.next) |n| e = n;
+            //                 e.next = try self.arena.create(NameEntry);
+            //                 e.next.?.* = new_ent;
+            //                 any_duplicates = true;
+            //             } else {
+            //                 gop.value_ptr.* = new_ent;
+            //             }
+            //         },
+            //     }
+            //     continue;
+            // },
 
-            .test_decl => {
-                decl_count += 1;
-                // We don't want shadowing detection here, and test names work a bit differently, so
-                // we must do the redeclaration detection ourselves.
-                const test_name_token = main_tokens[member_node] + 1;
-                switch (token_tags[test_name_token]) {
-                    else => {}, // unnamed test
-                    .string_literal => {
-                        const name = try astgen.strLitAsString(test_name_token);
-                        const gop = try named_tests.getOrPut(allocator, name.index);
-                        if (gop.found_existing) {
-                            const name_slice = astgen.string_bytes.items[@intFromEnum(name.index)..][0..name.len];
-                            const name_duped = try allocator.dupe(u8, name_slice);
-                            defer allocator.free(name_duped);
-                            try astgen.appendErrorNodeNotes(member_node, "duplicate test name '{s}'", .{name_duped}, &.{
-                                try astgen.errNoteNode(gop.value_ptr.*, "other test here", .{}),
-                            });
-                        } else {
-                            gop.value_ptr.* = member_node;
-                        }
-                    },
-                    .identifier => {
-                        const name = try astgen.identAsString(test_name_token);
-                        const gop = try decltests.getOrPut(allocator, name);
-                        if (gop.found_existing) {
-                            const name_slice = std.mem.span(astgen.nullTerminatedString(name));
-                            const name_duped = try allocator.dupe(u8, name_slice);
-                            defer allocator.free(name_duped);
-                            try astgen.appendErrorNodeNotes(member_node, "duplicate decltest '{s}'", .{name_duped}, &.{
-                                try astgen.errNoteNode(gop.value_ptr.*, "other decltest here", .{}),
-                            });
-                        } else {
-                            gop.value_ptr.* = member_node;
-                        }
-                    },
-                }
-                continue;
-            },
-
-            else => continue,
+            else => unreachable,
         };
 
-        const token_bytes = astgen.ast.tokenSlice(name_token);
-        if (token_bytes[0] != '@' and isPrimitive(token_bytes)) {
-            switch (astgen.failTokNotes(name_token, "name shadows primitive '{s}'", .{
-                token_bytes,
-            }, &[_]u32{
-                try astgen.errNoteTok(name_token, "consider using @\"{s}\" to disambiguate", .{
-                    token_bytes,
-                }),
-            })) {
-                error.AnalysisFail => continue,
-                error.OutOfMemory => return error.OutOfMemory,
+        const name_str_index = try self.identAsString(name_token);
+
+        if (kind == .decl) {
+            // Put the name straight into `decls`, even if there are compile errors.
+            // This avoids incorrect "undeclared identifier" errors later on.
+            try namespace.decls.put(allocator, name_str_index, member_node);
+        }
+
+        {
+            const gop = try names.getOrPut(sfba, name_str_index);
+            const new_ent: NameEntry = .{
+                .tok = name_token,
+                .next = null,
+            };
+            if (gop.found_existing) {
+                var e = gop.value_ptr;
+                while (e.next) |n| e = n;
+                e.next = try self.arena.create(NameEntry);
+                e.next.?.* = new_ent;
+                any_duplicates = true;
+                continue;
+            } else {
+                gop.value_ptr.* = new_ent;
             }
         }
 
-        const name_str_index = try astgen.identAsString(name_token);
-        const gop = try namespace.decls.getOrPut(allocator, name_str_index);
-        if (gop.found_existing) {
-            const name = try allocator.dupe(u8, std.mem.span(astgen.nullTerminatedString(name_str_index)));
-            defer allocator.free(name);
-            switch (astgen.failNodeNotes(member_node, "redeclaration of '{s}'", .{
-                name,
-            }, &[_]u32{
-                try astgen.errNoteNode(gop.value_ptr.*, "other declaration here", .{}),
-            })) {
-                error.AnalysisFail => continue,
-                error.OutOfMemory => return error.OutOfMemory,
-            }
+        // For fields, we only needed the duplicate check! Decls have some more checks to do, though.
+        switch (kind) {
+            .decl => {},
+            .field => continue,
+        }
+
+        const token_bytes = self.ast.tokenSlice(name_token);
+        if (token_bytes[0] != '@' and isPrimitive(token_bytes)) {
+            try self.appendErrorTokNotes(name_token, "name shadows primitive '{s}'", .{
+                token_bytes,
+            }, &.{
+                try self.errNoteTok(name_token, "consider using @\"{s}\" to disambiguate", .{
+                    token_bytes,
+                }),
+            });
+            continue;
         }
 
         var s = namespace.parent;
@@ -3291,30 +4027,32 @@ fn scanDecls(astgen: *AstGen, namespace: *Scope.Namespace, members: []const Ast.
             .local_val => {
                 const local_val = s.cast(Scope.LocalVal).?;
                 if (local_val.name == name_str_index) {
-                    return astgen.failTokNotes(name_token, "declaration '{s}' shadows {s} from outer scope", .{
+                    try self.appendErrorTokNotes(name_token, "declaration '{s}' shadows {s} from outer scope", .{
                         token_bytes, @tagName(local_val.id_cat),
-                    }, &[_]u32{
-                        try astgen.errNoteTok(
+                    }, &.{
+                        try self.errNoteTok(
                             local_val.token_src,
                             "previous declaration here",
                             .{},
                         ),
                     });
+                    break;
                 }
                 s = local_val.parent;
             },
             .local_ptr => {
                 const local_ptr = s.cast(Scope.LocalPtr).?;
                 if (local_ptr.name == name_str_index) {
-                    return astgen.failTokNotes(name_token, "declaration '{s}' shadows {s} from outer scope", .{
+                    try self.appendErrorTokNotes(name_token, "declaration '{s}' shadows {s} from outer scope", .{
                         token_bytes, @tagName(local_ptr.id_cat),
-                    }, &[_]u32{
-                        try astgen.errNoteTok(
+                    }, &.{
+                        try self.errNoteTok(
                             local_ptr.token_src,
                             "previous declaration here",
                             .{},
                         ),
                     });
+                    break;
                 }
                 s = local_ptr.parent;
             },
@@ -3323,8 +4061,46 @@ fn scanDecls(astgen: *AstGen, namespace: *Scope.Namespace, members: []const Ast.
             .defer_normal, .defer_error => s = s.cast(Scope.Defer).?.parent,
             .top => break,
         };
-        gop.value_ptr.* = member_node;
     }
+
+    if (!any_duplicates) return decl_count;
+
+    for (names.keys(), names.values()) |name, first| {
+        if (first.next == null) continue;
+        var notes: std.ArrayListUnmanaged(u32) = .empty;
+        var prev: NameEntry = first;
+        while (prev.next) |cur| : (prev = cur.*) {
+            try notes.append(self.arena, try self.errNoteTok(cur.tok, "duplicate name here", .{}));
+        }
+        try notes.append(self.arena, try self.errNoteNode(namespace.node, "{s} declared here", .{@tagName(container_kind)}));
+        const name_duped = try self.arena.dupe(u8, std.mem.span(self.nullTerminatedString(name)));
+        try self.appendErrorTokNotes(first.tok, "duplicate {s} member name '{s}'", .{ @tagName(container_kind), name_duped }, notes.items);
+    }
+
+    // for (test_names.keys(), test_names.values()) |name, first| {
+    //     if (first.next == null) continue;
+    //     var notes: std.ArrayListUnmanaged(u32) = .empty;
+    //     var prev: NameEntry = first;
+    //     while (prev.next) |cur| : (prev = cur.*) {
+    //         try notes.append(self.arena, try self.errNoteTok(cur.tok, "duplicate test here", .{}));
+    //     }
+    //     try notes.append(self.arena, try self.errNoteNode(namespace.node, "{s} declared here", .{@tagName(container_kind)}));
+    //     const name_duped = try self.arena.dupe(u8, mem.span(self.nullTerminatedString(name)));
+    //     try self.appendErrorTokNotes(first.tok, "duplicate test name '{s}'", .{name_duped}, notes.items);
+    // }
+
+    // for (decltest_names.keys(), decltest_names.values()) |name, first| {
+    //     if (first.next == null) continue;
+    //     var notes: std.ArrayListUnmanaged(u32) = .empty;
+    //     var prev: NameEntry = first;
+    //     while (prev.next) |cur| : (prev = cur.*) {
+    //         try notes.append(self.arena, try self.errNoteTok(cur.tok, "duplicate decltest here", .{}));
+    //     }
+    //     try notes.append(self.arena, try self.errNoteNode(namespace.node, "{s} declared here", .{@tagName(container_kind)}));
+    //     const name_duped = try self.arena.dupe(u8, mem.span(self.nullTerminatedString(name)));
+    //     try self.appendErrorTokNotes(first.tok, "duplicate decltest '{s}'", .{name_duped}, notes.items);
+    // }
+
     return decl_count;
 }
 
@@ -3485,43 +4261,24 @@ const DeclarationName = union(enum) {
     @"usingnamespace",
 };
 
+// TODO
 /// Sets all extra data for a `declaration` instruction.
 /// Unstacks `value_ng`, `align_ng`, `linksection_ng`, and `addrspace_ng`.
 fn setDeclaration(
     decl_inst: Nir.Inst.Index,
     src_hash: std.zig.SrcHash,
     name: DeclarationName,
-    line_offset: u32,
+    src_line: u32,
     is_pub: bool,
     is_export: bool,
     doc_comment: Nir.NullTerminatedString,
     value_ng: *NirGen,
-    /// May be `null` if all these blocks would be empty.
-    /// If `null`, then `value_ng` must have nothing stacked on it.
-    extra_ngs: ?struct {
-        /// Must be stacked on `value_ng`.
-        align_ng: *NirGen,
-        /// Must be stacked on `align_ng`.
-        linksection_ng: *NirGen,
-        /// Must be stacked on `linksection_ng`, and have nothing stacked on it.
-        addrspace_ng: *NirGen,
-    },
 ) !void {
     const astgen = value_ng.astgen;
     const allocator = astgen.allocator;
 
-    const empty_body: []Nir.Inst.Index = &.{};
-    const value_body, const align_body, const linksection_body, const addrspace_body = if (extra_ngs) |e| .{
-        value_ng.instructionsSliceUpto(e.align_ng),
-        e.align_ng.instructionsSliceUpto(e.linksection_ng),
-        e.linksection_ng.instructionsSliceUpto(e.addrspace_ng),
-        e.addrspace_ng.instructionsSlice(),
-    } else .{ value_ng.instructionsSlice(), empty_body, empty_body, empty_body };
-
+    const value_body = value_ng.instructionsSlice();
     const value_len = astgen.countBodyLenAfterFixups(value_body);
-    const align_len = astgen.countBodyLenAfterFixups(align_body);
-    const linksection_len = astgen.countBodyLenAfterFixups(linksection_body);
-    const addrspace_len = astgen.countBodyLenAfterFixups(addrspace_body);
 
     const true_doc_comment: Nir.NullTerminatedString = switch (name) {
         .decltest => |test_name| test_name,
@@ -3543,39 +4300,21 @@ fn setDeclaration(
             .@"comptime" => .@"comptime",
             .@"usingnamespace" => .@"usingnamespace",
         },
-        .line_offset = line_offset,
+        .src_line = src_line,
         .flags = .{
             .value_body_len = @intCast(value_len),
             .is_pub = is_pub,
             .is_export = is_export,
             .has_doc_comment = true_doc_comment != .empty,
-            .has_align_linksection_addrspace = align_len != 0 or linksection_len != 0 or addrspace_len != 0,
+            .has_align_linksection_addrspace = false,
         },
     };
-    astgen.instructions.items(.data)[@intFromEnum(decl_inst)].pl_node.payload_index = try astgen.addExtra(extra);
+    astgen.instructions.items(.data)[@intFromEnum(decl_inst)].declaration.payload_index = try astgen.addExtra(extra);
     if (extra.flags.has_doc_comment) {
         try astgen.extra.append(allocator, @intFromEnum(true_doc_comment));
     }
-    if (extra.flags.has_align_linksection_addrspace) {
-        try astgen.extra.appendSlice(allocator, &.{
-            align_len,
-            linksection_len,
-            addrspace_len,
-        });
-    }
-    try astgen.extra.ensureUnusedCapacity(allocator, value_len + align_len + linksection_len + addrspace_len);
+    try astgen.extra.ensureUnusedCapacity(allocator, value_len);
     astgen.appendBodyWithFixups(value_body);
-    if (extra.flags.has_align_linksection_addrspace) {
-        astgen.appendBodyWithFixups(align_body);
-        astgen.appendBodyWithFixups(linksection_body);
-        astgen.appendBodyWithFixups(addrspace_body);
-    }
-
-    if (extra_ngs) |e| {
-        e.addrspace_ng.unstack();
-        e.linksection_ng.unstack();
-        e.align_ng.unstack();
-    }
     value_ng.unstack();
 }
 
@@ -3602,7 +4341,7 @@ fn setExtra(self: *AstGen, index: usize, extra: anytype) void {
 
             Nir.Inst.Ref,
             Nir.Inst.Index,
-            // Nir.Inst.Declaration.Name,
+            Nir.Inst.Declaration.Name,
             Nir.NullTerminatedString,
             => @intFromEnum(@field(extra, field.name)),
 
@@ -3612,7 +4351,7 @@ fn setExtra(self: *AstGen, index: usize, extra: anytype) void {
             // Nir.Inst.SwitchBlock.Bits,
             // Nir.Inst.SwitchBlockErrUnion.Bits,
             // Nir.Inst.FuncFancy.Bits,
-            // Nir.Inst.Declaration.Flags,
+            Nir.Inst.Declaration.Flags,
             => @bitCast(@field(extra, field.name)),
 
             else => @compileError("setExtra: bad field type: " ++ @typeName(field.type)),

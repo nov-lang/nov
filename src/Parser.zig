@@ -1,5 +1,5 @@
-//! Originally based on https://github.com/ziglang/zig/blob/master/lib/std/zig/Parse.zig
-//! See https://github.com/ziglang/zig/blob/master/LICENSE for additional LICENSE details
+// Originally based on https://github.com/ziglang/zig/blob/master/lib/std/zig/Parse.zig
+// See https://github.com/ziglang/zig/blob/master/LICENSE for additional LICENSE details
 
 // TODO: (add tests)
 // let a = 1 + 2 ; no error, terminator is '\n'
@@ -105,21 +105,35 @@ pub fn parse(allocator: Allocator, source: [:0]const u8) Allocator.Error!Ast {
     };
 }
 
-/// TopLevel <- Stmt*
+/// TopLevel <- (AttrDecl / Decl)*
 fn parseTopLevel(self: *Parser) Allocator.Error!void {
     while (true) {
         switch (self.token_tags[self.tok_i]) {
             .eof => break,
             .newline => self.tok_i += 1,
-            else => {
-                const stmt = self.expectStmt() catch |err| switch (err) {
+            .at_sign_l_bracket => {
+                const attr_decl = self.parseAttrDecl() catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     error.ParseError => {
-                        self.synchronize();
+                        self.findNextTopLevelDecl();
                         continue;
                     },
                 };
-                try self.scratch.append(self.allocator, stmt);
+                try self.scratch.append(self.allocator, attr_decl);
+            },
+            .keyword_let => {
+                const decl = self.parseDecl() catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.ParseError => {
+                        self.findNextTopLevelDecl();
+                        continue;
+                    },
+                };
+                try self.scratch.append(self.allocator, decl);
+            },
+            else => {
+                try self.warn(.expected_decl);
+                self.findNextTopLevelDecl();
             },
         }
     }
@@ -131,18 +145,18 @@ fn parseTopLevel(self: *Parser) Allocator.Error!void {
     };
 }
 
-/// Stmt <- Decl / ExprStmt
-fn expectStmt(self: *Parser) Error!Node.Index {
-    std.debug.assert(self.token_tags[self.tok_i] != .newline);
-    switch (self.token_tags[self.tok_i]) {
-        .keyword_let => return self.expectDecl(),
-        else => return self.expectExprStmt(),
-    }
+/// AttrDecl <- Attribute+ Decl
+/// Attribute <- AT_SIGN_LBRACKET IDENTIFIER AttrArgs RBRACKET NEWLINE
+/// AttrArgs <- LPAREN (Expr COMMA)* Expr? RPAREN
+fn parseAttrDecl(self: *Parser) Error!Node.Index {
+    // TODO
+    _ = self;
+    unreachable;
 }
 
 /// Decl <- DeclProto (EQUAL Expr)? NEWLINE
 /// DeclProto <- KEYWORD_let KEYWORD_mut? IDENTIFIER (COLON TypeExpr)?
-fn expectDecl(self: *Parser) Error!Node.Index {
+fn parseDecl(self: *Parser) Error!Node.Index {
     const let_token = self.assertToken(.keyword_let);
     const is_mut = self.eatToken(.keyword_mut) != null;
 
@@ -181,18 +195,6 @@ fn expectExpr(self: *Parser) Error!Node.Index {
     return node;
 }
 
-// TODO: return should always be `()` or add a way to ignore the return value
-// and consider that everything is an expression that returns `()` by default
-/// ExprStmt <- Expr NEWLINE
-fn expectExprStmt(self: *Parser) Error!Node.Index {
-    const expr = try self.parseExpr();
-    if (expr == null_node) {
-        return self.fail(.expected_expr);
-    }
-    try self.expectNewline(.expected_newline_after_stmt, true);
-    return expr;
-}
-
 const Precedence = enum(i8) {
     none = -1,
     assignment = 0,
@@ -207,9 +209,8 @@ const Precedence = enum(i8) {
     factor = 80,
     // as / cast
     unary = 90,
-    null_coalescing = 100,
-    call = 110,
-    primary = 120,
+    call = 100,
+    primary = 110,
     _,
 };
 
@@ -252,8 +253,6 @@ const rules = std.enums.directEnumArrayDefault(Token.Tag, Rule, .{ .prec = .none
     .asterisk = .{ .prec = .factor, .tag = .mul },
     .slash = .{ .prec = .factor, .tag = .div },
     .percent = .{ .prec = .factor, .tag = .mod },
-
-    .question_mark_question_mark = .{ .prec = .null_coalescing, .tag = .optional_fallback },
 });
 
 fn parseExprPrecedence(self: *Parser, min_prec: Precedence) Error!Node.Index {
@@ -448,7 +447,8 @@ fn parseBreakLabel(self: *Parser) Error!TokenIndex {
     return self.expectToken(.identifier);
 }
 
-/// Block <- LBRACE (Decl | ExprStmt)* RBRACE
+/// Block <- LBRACE (Decl / ExprStmt)* Expr? RBRACE
+/// ExprStmt <- Expr NEWLINE
 fn parseBlock(self: *Parser) Error!Node.Index {
     const lbrace = self.eatToken(.l_brace) orelse return null_node;
     const scratch_top = self.scratch.items.len;
@@ -458,16 +458,28 @@ fn parseBlock(self: *Parser) Error!Node.Index {
             .newline => self.tok_i += 1,
             .r_brace => break,
             .eof => return self.failExpected(.r_brace),
-            else => {
-                // TODO!: do not warn if the last statement doesn't end with a newline
-                const stmt = self.expectStmt() catch |err| switch (err) {
+            .keyword_let => {
+                const decl = self.parseDecl() catch |err| switch (err) {
                     error.OutOfMemory => return err,
                     error.ParseError => {
-                        self.synchronize();
+                        self.findNextStmt();
                         continue;
                     },
                 };
-                try self.scratch.append(self.allocator, stmt);
+                try self.scratch.append(self.allocator, decl);
+            },
+            else => {
+                const expr = try self.parseExpr();
+                if (expr == null_node) {
+                    try self.warn(.expected_expr);
+                    self.findNextStmt();
+                    continue;
+                }
+
+                try self.scratch.append(self.allocator, expr);
+                if (self.token_tags[self.tok_i] != .r_brace) {
+                    try self.expectNewline(.expected_newline_after_stmt, true);
+                }
             },
         }
     }
@@ -804,19 +816,36 @@ fn assertToken(self: *Parser, tag: Token.Tag) TokenIndex {
     return token;
 }
 
-// the problem with having the same synchronize for parseTopLevel and parseBlock
-// is that we have always one bug, either:
-// `}}` in top level -> infinite loop
-// `....}` in block -> expected `}` but found `EOF`
-// I opted for the second one because an infinite loop is bad
-fn synchronize(self: *Parser) void {
+fn findNextTopLevelDecl(self: *Parser) void {
+    var level: usize = 0;
+    while (true) : (self.tok_i += 1) {
+        switch (self.token_tags[self.tok_i]) {
+            .l_paren, .l_bracket, .l_brace => level += 1,
+            .r_paren, .r_bracket, .r_brace => level -|= 1,
+            .at_sign_l_bracket, .keyword_let => {
+                if (level == 0) {
+                    return;
+                }
+            },
+            .newline => {
+                if (level == 0) {
+                    self.tok_i += 1;
+                    return;
+                }
+            },
+            .eof => return,
+            else => {},
+        }
+    }
+}
+
+fn findNextStmt(self: *Parser) void {
     var level: usize = 0;
     while (true) : (self.tok_i += 1) {
         switch (self.token_tags[self.tok_i]) {
             .l_brace => level += 1,
             .r_brace => {
                 if (level == 0) {
-                    self.tok_i += 1; // the bug is here
                     return;
                 }
                 level -= 1;
@@ -861,7 +890,7 @@ fn warnMsg(self: *Parser, msg: Ast.Error) Allocator.Error!void {
         .expected_comma_after_match_prong,
         // .expected_comma_after_for_operand,
         // .expected_comma_after_capture,
-        .expected_token,
+        // .expected_token,
         .expected_block,
         .expected_block_or_assignment,
         // .expected_block_or_expr,

@@ -1,7 +1,3 @@
-; The syntax is still very experimental
-
-let std = @import("std")
-
 let MyInt = int
 
 @[public]
@@ -10,12 +6,14 @@ let MyType = struct {
     y: string = "hello"
     z: bool,
 
-    ; `self` is present in all container methods and represents the instance
+    ; `self` is present in all container methods and represents the instance?
     @[public]
-    let print = () -> void {
-        std.io.println("x: {self.x}, y: {self.y}. z: {self.z}")
+    let toString = () -> string {
+        "x: {self.x}, y: {self.y}. z: {self.z}"
     }
 }
 
-let item: MyType = .{ .x = 5, .z = true }
-item.print()
+let main = () -> void {
+    let item = MyType{ .x = 5, .z = true }
+    @println(item) ; @println will call the `toString` method
+}

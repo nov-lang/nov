@@ -17,6 +17,9 @@ Next step: add new IR that
 - have more usage safety than Ast
 - start storing values in a constant pool
 
+AstGen/Sema from zig looks to complex if we just want to generate some C code.
+Move to a custom IR?
+
 Need to work on Parser/Ast for more complex stuff (e.g. functions, for loops,
 ...) after basic IR and codegen is implemented.
 
@@ -45,9 +48,11 @@ Keep Nov away from:
   - which specific case would be lost by not having mutable values?
   - the compiler (or vm?) can perform mutation where it's guarented to have no side effect
 - modes / arg options:
-  - build: output a file with nov bytecode
-  - run: run in a VM either a .nov file or a .novc file
+  - no arg: same as build
+  - build: output a compiled file
+  - run: execute a nov file
   - repl: run the repl
+  - test: run unit tests
   - fmt: format nov code
     - works like zig fmt but for nov
     - rename variable, functions and types to snake_case, camelCase and PascalCase?
@@ -88,9 +93,9 @@ Keep Nov away from:
   sometimes stuff sucks without correct OOP
 - add interfaces? (no)
 - add generics instead of function that accepts a type?
-  - probably make compilation easier
+  - probably make compilation easier?
   - syntax: `add<T>(a: T, b: T) T` instead of `add(T: type, a: T, b: T) T`
-  - infer type from givern arguments -> works almost just like ML like polymorphism
+  - infer type from given arguments? -> works almost just like ML like polymorphism
   - need @typeInfo() builtin?
   - what about ML like polymorphism?
 - autodoc with doc comments `;;;`
@@ -104,6 +109,13 @@ Keep Nov away from:
 - IO API like zig, no buffering by default? or just like C?
 - How to handle arithmetic overflow? current behaviour is to wrap, we don't want crash on arithmetic overflow
 - Replace `void` with `()`?
+- allow for default argument in function? (probably not)
+- fix multiline expression:
+  - current state is to bypass it in specific case or with a grouping expression
+  - add automatic `;` insertion to tokenizer or parser?
+- add regex pattern as builtin type?
+- [Switch Prongs Defined as Comptime-Known Arrays](https://github.com/ziglang/zig/issues/21507)
+- rename `for` to `loop`?
 
 ## Notes
 - Check std.zig.AstGen, std.zig.Zir and zig/src/Sema.zig for IR
@@ -131,11 +143,12 @@ Keep Nov away from:
   - support relative import e.g. `@import("github.com/nov-lang/idk_lib")`
   - support circular imports
 - `@TypeOf(...)`: Returns the type of a value.
+<!-- - `@format(...)`: Format all args to a string. (support string interpolation) -->
 - `@print(...)`: Output all args separated with a space to stdout. (supports string interpolation)
                  TODO: what about printf? what about print to another file?
 - `@println(...)`: Same as print with a newline at the end.
 - `@fprint(file: File, ...)`: Same as print but output to a specific file.
-<!-- - `@eprint(s: string)`: Output `s` to stderr. -->
+<!-- - `@eprint(...)`: Same as print but output to stderr. -->
 - `@panic(s: string)`: Output `s` and backtrace to stderr, then terminate the program with error code 1.
 - `@max(a: T, b: T, ...)`: Returns the maximum value between all the supplied arguments
 - `@min(a: T, b: T, ...)`: Returns the minimum value between all the supplied arguments
@@ -237,7 +250,7 @@ let MyEnum = enum {
 
 let x: MyEnum = MyEnum.x
 let y = MyEnum.y ; type is inferred
-x.eql(y) |> println ; print false
+x.eql(y) |> @println ; print false
 
 match x {
     x => ... ; do something
@@ -251,8 +264,9 @@ TODO:
 - support anonymous structs, useful for json, I think it's easy since struct is
   like a function that returns a type but syntax is ugly outside of a struct
   which is fine and intended
-- make fields immutable by default?
-- pub/priv keyword on struct fields? do like C++/V for telling what is pub/mut?
+- make fields immutable by default? -> add mut keyword to fields
+- pub/priv keyword on struct fields?
+- do like C++/V for telling what is pub/mut?
 ```nov
 let MyStruct = struct {
     name: string
@@ -283,7 +297,7 @@ let a = MyStruct{} ; error: missing struct field: name
 let x = MyStruct.init("aaa")
 let y = MyStruct{ .name = "aaa" }
 x.eql(y) ; true
-x |> println ; idk what this prints
+x |> @println ; idk what this prints
 ```
 
 ## Union
@@ -308,6 +322,7 @@ let Tree = union {
     }
 
     let sum = (self: Tree) -> int {
+        ; TODO: match with .empty?
         match self {
             empty => 0
             node => |n| n.value + n.left.sum() + n.right.sum()
@@ -333,28 +348,25 @@ active field. Note that it isn't represented here but an union field can have a
 default value just like a struct field.
 
 Sugar for Result and Option:
-- !T is Result(T, string)
+- !T is Result(T, string) or Result(T, any)?
 - E!T is Result(T, E)
 - ?T is Option(T)
-- expr! is unwrap or propagate for result
+- expr! is unwrap or propagate for result (TODO: replace ! and ? with .! and .?)
 - expr? is unwrap or propagate for option
-
-TODO: propagation in top level
-- not possible
-- panic if it's an error or a none
-- replace top level with main and disallow statement in top level
 
 TODO: how to return an error?
 - err(...)
 - error(...)
-- ???
+- .err{ ... }
 
-TODO: sugar for concatenating multiple Result
- - proposal: replace Union with [sum types](https://docs.vlang.io/type-declarations.html#sum-types),
-   (use `T1 || T2` syntax), see also [custom-error-types](https://docs.vlang.io/type-declarations.html#custom-error-types)
-    - allow for this syntax `let a: MyUnion = .field{value}`, omit `.`? replace `{` with `(`?
+TODO:
+- allow for this syntax `let a: MyUnion = .field{value}`, omit `.`? replace `{` with `(`?
+- add a way to merge multiple error type into one?
+- remove type sugar and only keep `.!` and `.?`?
+- Check https://docs.vlang.io/type-declarations.html#custom-error-types
+- Check https://docs.vlang.io/type-declarations.html#optionresult-types-and-error-handling
+- Check https://doc.rust-lang.org/std/result/index.html
 
-See https://docs.vlang.io/type-declarations.html#optionresult-types-and-error-handling
 ```nov
 let Result = (T: type, E: type) -> type {
     union {
@@ -363,16 +375,31 @@ let Result = (T: type, E: type) -> type {
     }
 }
 
+; error handling
+let file = match File.open("file.txt") {
+    .ok => |f| f
+    .err => |err| match err.kind {
+        not_found => {
+            ; do something
+        }
+        _ => return err ; return early with the error
+    }
+}
+; ! unwrap and returns the err if there is any
+let file = File.open("file.txt")!
+
 let Option = (T: type) -> type {
     union {
         some: T
         none
 
         ; unions can also have methods
-        let forceUnwrap = (self: @This()) -> T {
+        @[public]
+        @[inline]
+        let orelse = (self: @This(), fallback_value: T) -> T {
             match self {
                 .some => |val| val ; catch the value and return it
-                .none => @panic("...")
+                .none => fallback_Value
             }
         }
     }
@@ -380,14 +407,12 @@ let Option = (T: type) -> type {
 
 let x = 5
 let y = Option(int){ .some = 5 }
-; `??` is a special operator for Result and Option to provide a fallback value
-; if the variable is .err or .none
-let sum = x + y ?? 0
+let sum = x + y.orelse(0)
 
 let MyOption = Option(float)
 let a = MyOption{ .some = 1.0 }
 let b = MyOption{ .none }
-let prod = x! * y! ; not sure about syntax (this returns an error btw)
+let prod = x? * y?
 ```
 
 ## Arrays
@@ -411,10 +436,10 @@ let mut my_array = [1, 2, 3]
 my_array.len == 3 ; true, should `len` be a function?
 my_array[0] == 1 ; true
 my_array[-1] == 3 ; true
-my_array << 5 ; TODO: push operator for arrays
-my_array |> println ; prints [1, 2, 2, 5]
+my_array << 5 ; push operator for arrays
+my_array |> @println ; prints [1, 2, 3, 5]
 my_array += [1, 1, 7 ]
-my_array |> println ; prints [1, 2, 3, 5, 1, 1, 7]
+my_array |> @println ; prints [1, 2, 3, 5, 1, 1, 7]
 6 in my_array ; false
 my_array = []
 @TypeOf(my_array) ; still return []int
@@ -469,11 +494,11 @@ let a = 10
 let b = 20
 ; braces are mandatory, else is optional
 if a < b {
-    @println("${a} < ${n}")
+    @println("${a} < ${b}")
 } else if a > b {
-    @println("${a} > ${n}")
+    @println("${a} > ${b}")
 } else {
-    @println("${a} == ${n}")
+    @println("${a} == ${b}")
 }
 
 ; all If are expression which means that they all return a value
@@ -551,7 +576,7 @@ This should be faster than using a for loop because it should be vectorized.
 ```
 let nums = [1, 2, 3]
 @println(1 in nums) ; true
-@println(2 !in nums) ; false
+@println(5 in nums) ; false
 ```
 
 ## Primitive Types
@@ -600,7 +625,6 @@ TODO
 | Bitwise Xor           | a ^ b             | [Integers](#Integers)                        | TODO                                                             |
 | Bitwise Not           | ~a                | [Integers](#Integers)                        | TODO                                                             |
 | Optionify             | ?T                | All types                                    | Equivalent to Option(T)                                          |
-| Optional Fallback     | a ?? b            | Option                                       | TODO                                                             |
 | Optional Unwrap       | a?                | Option                                       | TODO                                                             |
 | Resultify             | E!T <br> !T       | All types                                    | Equivalent to Result(T, E) <br> Equivalent to Result(T, string)  |
 | Result Unwrap         | a!                | Result                                       | TODO                                                             |
@@ -623,7 +647,7 @@ TODO
 ## Precedence
 last `<<` is push
 ```
-x() x[] x.y x? x! x??y
+x() x[] x.y x? x!
 E!T
 x{}
 !x -x ~x ?T
@@ -638,7 +662,7 @@ or
 = *= /= %= += -= <<
 ```
 
-## Operator overloading
+## Operator Overloading
 Operator overloading is possible on the following operators:
 - `+`: (T, T) -> T
 - `-`: (T, T) -> T
@@ -660,8 +684,10 @@ let Complex = struct {
     re: float
     im: float
 
-    ; TODO: replace `@"+"` with `@overload(+)` or `@operator(+)`
-    let @"+" = (self: Complex, other: Complex) -> Complex {
+    ; TODO: make the arg an enum so parsing is handled like an expr and it
+    ; solve the binary/unary issue with `-`
+    @[operator(+)]
+    let add = (self: Complex, other: Complex) -> Complex {
         Complex{
             .re = self.re + other.re,
             .im = self.im + other.im,
@@ -721,6 +747,7 @@ TODO: add async/await/yield
 ## Attributes
 - `@[deprecated]` - `@[deprecated("message...")]`
 - `@[warnif(cond, message)]` idk
+- `@[operator(op)]`
 - `@[pure]` useless? a function is pure if its args are immutable and if it doesn't return an error union? (no)
 - `@[extern]`
 - `@[packed]`
@@ -729,11 +756,11 @@ TODO: add async/await/yield
 - `@[noinline]`
 - `@[cold]`
 - `@[noreturn]` or have it as a return type?
-- `@[test]`
+- `@[test]` decl with it are ignored unless run with `nov test` where it behave like `zig test`
+- `@[comptime]` run the decl function at comptime, TODO: or `@[assert]` idk it's for comptime assertion
 - `@[public]`
 - `@[private]`
-
-(Attribute NEWLINE)* Decl NEWLINE
+- `@[entry]` idk, use it for main or just default to public main method?
 
 Attributes can be set only on top level / container declarations
 

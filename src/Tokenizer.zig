@@ -1,5 +1,5 @@
-//! Originally based on https://github.com/ziglang/zig/blob/master/lib/std/zig/tokenizer.zig
-//! See https://github.com/ziglang/zig/blob/master/LICENSE for additional LICENSE details
+// Originally based on https://github.com/ziglang/zig/blob/master/lib/std/zig/tokenizer.zig
+// See https://github.com/ziglang/zig/blob/master/LICENSE for additional LICENSE details
 
 const std = @import("std");
 
@@ -38,7 +38,6 @@ pub const Token = struct {
         colon,
         underscore,
         question_mark,
-        question_mark_question_mark,
         bang,
         bang_equal,
         equal,
@@ -65,7 +64,6 @@ pub const Token = struct {
         percent_equal,
         pipe,
         pipe_arrow,
-        pipe_pipe,
         caret,
         ampersand,
         tilde,
@@ -123,7 +121,6 @@ pub const Token = struct {
                 .colon => ":",
                 .underscore => "_",
                 .question_mark => "?",
-                .question_mark_question_mark => "??",
                 .bang => "!",
                 .bang_equal => "!=",
                 .equal => "=",
@@ -150,7 +147,6 @@ pub const Token = struct {
                 .percent_equal => "%=",
                 .pipe => "|",
                 .pipe_arrow => "|>",
-                .pipe_pipe => "||",
                 .caret => "^",
                 .ampersand => "&",
                 .tilde => "~",
@@ -272,7 +268,6 @@ const State = enum {
     float,
     float_exponent,
     underscore,
-    question_mark,
     invalid,
 };
 
@@ -343,6 +338,10 @@ pub fn next(self: *Tokenizer) Token {
                 result.tag = .caret;
                 self.index += 1;
             },
+            '?' => {
+                result.tag = .question_mark;
+                self.index += 1;
+            },
             ' ', '\r', '\t' => {
                 self.index += 1;
                 result.start = self.index;
@@ -368,7 +367,6 @@ pub fn next(self: *Tokenizer) Token {
             ';' => continue :state .line_comment_1,
             '_' => continue :state .underscore,
             '@' => continue :state .at_sign,
-            '?' => continue :state .question_mark,
             '=' => continue :state .equal,
             '!' => continue :state .bang,
             '|' => continue :state .pipe,
@@ -381,16 +379,6 @@ pub fn next(self: *Tokenizer) Token {
             '>' => continue :state .r_angle_bracket,
             '.' => continue :state .period,
             else => continue :state .invalid,
-        },
-        .question_mark => {
-            self.index += 1;
-            switch (self.buffer[self.index]) {
-                '?' => {
-                    result.tag = .question_mark_question_mark;
-                    self.index += 1;
-                },
-                else => result.tag = .question_mark,
-            }
         },
         .asterisk => {
             self.index += 1;
@@ -529,10 +517,6 @@ pub fn next(self: *Tokenizer) Token {
             switch (self.buffer[self.index]) {
                 '>' => {
                     result.tag = .pipe_arrow;
-                    self.index += 1;
-                },
-                '|' => {
-                    result.tag = .pipe_pipe;
                     self.index += 1;
                 },
                 else => result.tag = .pipe,

@@ -1,31 +1,28 @@
-let std = import "std"
-let File = std.fs.File
-
-; `File.open("file.txt")!` is not possible because we're in global scope
-let file = match File.open("file.txt") {
-    .ok => |f| f
-    .err => |e| panic "Failed to open file: {e}"
-}
-
-; TODO: write file to stdout
-; std.io.println(...
-
-file.close()
-
-;;; another version
 let std = @import("std")
 let File = std.fs.File
 
-let file = match File.open("file.txt") {
-    ok(file) => file
-    err(error) => match error.kind() {
-        not_found => {
-            ; do something
-        },
-        _ => @panic("Failed to open file: {error}")
+; TODO: replace !void with correct return type
+let main = () -> !void {
+    let file = File.open("file.txt")!
+    ; same as
+    let file = match File.open("file.txt") {
+        .ok => |f| f
+        .err => |err| return err
     }
+    ; we can also handle specific errors differently
+    let file = match File.open("file.txt") {
+        .ok => |f| f
+        .err => |err| match err.kind() {
+            .not_found => {
+                ; do something
+            },
+            _ => return err
+        }
+    }
+
+    ; TODO: write file to stdout
+    ; std.io.println(...
+
+    ; we could use defer instead
+    file.close()
 }
-
-; print...
-
-file.close()
