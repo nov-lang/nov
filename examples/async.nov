@@ -1,6 +1,6 @@
 ; TODO: yield, etc as builtins or keywords?
 
-let fibo = (n: int) -^ ?int -> () {
+let fibo: `(n: int) -^ ?int = {
     let mut a = 0
     let mut b = 1
     ; let mut next: int ; using `next` without initializing result in a panic
@@ -15,7 +15,7 @@ let fibo = (n: int) -^ ?int -> () {
     }
 }
 
-let main = () -> void {
+let main: `() = {
     for n in async fibo(10) {
         n |> @println
     }

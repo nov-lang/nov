@@ -19,7 +19,7 @@ pub const names = std.StaticStringMap(void).initComptime(.{
     .{"f80"},
     .{"f128"},
     .{"float"},
-    // .{"false"},
+    .{"false"},
     .{"i8"},
     .{"i16"},
     .{"i32"},
@@ -28,7 +28,7 @@ pub const names = std.StaticStringMap(void).initComptime(.{
     .{"int"},
     .{"rune"}, // unicode code point, u21
     .{"string"},
-    // .{"true"},
+    .{"true"},
     .{"type"},
     .{"u8"},
     .{"u16"},

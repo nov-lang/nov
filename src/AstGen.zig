@@ -1232,7 +1232,7 @@ fn negation(
 
     // Check for float literal as the sub-expression because we want to preserve
     // its negativity rather than having it go through comptime subtraction.
-    const operand_node = node_datas[node].lhs;
+    const operand_node = node_datas[node].rhs;
     if (node_tags[operand_node] == .number_literal) {
         return numberLiteral(ng, ri, operand_node, node, .negative);
     }

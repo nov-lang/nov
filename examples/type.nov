@@ -6,14 +6,11 @@ let MyType = struct {
     y: string = "hello"
     z: bool,
 
-    ; `self` is present in all container methods and represents the instance?
     @[public]
-    let toString = () -> string {
-        "x: {self.x}, y: {self.y}. z: {self.z}"
-    }
+    let toString: `(self: MyType) -> string = "x: {self.x}, y: {self.y}. z: {self.z}"
 }
 
-let main = () -> void {
+let main: `() = {
     let item = MyType{ .x = 5, .z = true }
     @println(item) ; @println will call the `toString` method
 }

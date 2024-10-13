@@ -203,6 +203,19 @@ fn testMain(allocator: std.mem.Allocator) !u8 {
         // \\@[attr(arg3)]
         // \\@[attr]
         \\let x = -123 * (45.67)
+        // \\let myFun: `(int) -> int = {}
+        \\
+        \\let x = @builtin(
+        \\    1 + 2,
+        \\    void
+        \\) * 3
+
+        // TODO: is this a problem?
+        // \\let init: `(name: string) -> MyStruct =
+        // \\    MyStruct{ .name = name }
+
+        //TODO: change parseArrayLiteral to allow that
+        // \\let z = [ 1, 2, 3, 4 ].len
 
         // // \\let a = 1 + 2 + 3 + 4
         // // \\let a = 1 + 2 +
@@ -273,22 +286,18 @@ fn testMain(allocator: std.mem.Allocator) !u8 {
     var ast = try Parser.parse(allocator, source);
     defer ast.deinit(allocator);
 
+    std.debug.print("\nNodes:", .{});
+    for (ast.nodes.items(.tag)) |tag| {
+        std.debug.print(" {s}", .{@tagName(tag)});
+    }
+    std.debug.print("\n", .{});
+
     for (ast.rootDecls()) |stmt| {
         for (ast.firstToken(stmt)..ast.lastToken(stmt) + 1) |token| {
             std.debug.print("{s} ", .{ast.tokenSlice(@intCast(token))});
         }
         std.debug.print("\n", .{});
     }
-
-    // std.debug.print("Tokens:", .{});
-    // for (ast.tokens.items(.tag)) |tag| {
-    //     std.debug.print(" {s}", .{@tagName(tag)});
-    // }
-
-    // std.debug.print("\nNodes:", .{});
-    // for (ast.nodes.items(.tag)) |tag| {
-    //     std.debug.print(" {s}", .{@tagName(tag)});
-    // }
 
     if (ast.errors.len > 0) {
         const stderr = std.io.getStdErr().writer();

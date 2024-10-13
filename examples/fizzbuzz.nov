@@ -1,13 +1,13 @@
-let fizzBuzz = (n: int) -> string {
+let fizzBuzz: `(n: int) -> string = {
     match (n % 3, n % 5) {
         (0, 0) => "FizzBuzz"
         (0, _) => "Fizz"
         (_, 0) => "Buzz"
-        _ => "${n}"
+        _ => "{n}"
     }
 }
 
-let main = () -> void {
+let main: `() = {
     for i in 0..10 {
         i |> fizzBuzz |> @println
     }

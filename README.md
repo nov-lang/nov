@@ -82,32 +82,23 @@ Keep Nov away from:
 - optimize tail call recursion
 - tree shaking
 - constant folding
-- The polymorphism in [Functions](#Functions) can be too weird and complex
-  - maybe just do like zig and accept a type as parameter instead
-  - just have generics and disallow polymorphism (no)
 - write nov website with nov as backend? idk
 - add cache either in cwd or in $XDG_CACHE_HOME/nov/... (ofc finding the dir is
   handled by known-folders) like \_\_pycache__
-- add attributes to AST and Parser
 - add a way to have better OOP, interface, traits etc idk I hate OOP but it
   sometimes stuff sucks without correct OOP
 - add interfaces? (no)
-- add generics instead of function that accepts a type?
-  - probably make compilation easier?
-  - syntax: `add<T>(a: T, b: T) T` instead of `add(T: type, a: T, b: T) T`
-  - infer type from given arguments? -> works almost just like ML like polymorphism
-  - need @typeInfo() builtin?
-  - what about ML like polymorphism?
 - autodoc with doc comments `;;;`
 - package system
 - [compile time pseudo variables](https://docs.vlang.io/conditional-compilation.html#compile-time-pseudo-variables)?
-- add defer?
+  - like builtin module in zig
 - formal grammar definition
   - https://craftinginterpreters.com/appendix-i.html
   - https://github.com/ziglang/zig-spec/blob/master/grammar/grammar.peg
   - https://doc.rust-lang.org/stable/reference/introduction.html
 - IO API like zig, no buffering by default? or just like C?
-- How to handle arithmetic overflow? current behaviour is to wrap, we don't want crash on arithmetic overflow
+- How to handle arithmetic overflow? current behaviour is to wrap,
+  we don't want crash on arithmetic overflow
 - Replace `void` with `()`?
 - allow for default argument in function? (probably not)
 - fix multiline expression:
@@ -116,6 +107,8 @@ Keep Nov away from:
 - add regex pattern as builtin type?
 - [Switch Prongs Defined as Comptime-Known Arrays](https://github.com/ziglang/zig/issues/21507)
 - rename `for` to `loop`?
+- make all arrays/string 0 terminated
+- dependant types?
 
 ## Notes
 - Check std.zig.AstGen, std.zig.Zir and zig/src/Sema.zig for IR
@@ -143,6 +136,7 @@ Keep Nov away from:
   - support relative import e.g. `@import("github.com/nov-lang/idk_lib")`
   - support circular imports
 - `@TypeOf(...)`: Returns the type of a value.
+- `@typeInfo(...)`: Returns type information about a value.
 <!-- - `@format(...)`: Format all args to a string. (support string interpolation) -->
 - `@print(...)`: Output all args separated with a space to stdout. (supports string interpolation)
                  TODO: what about printf? what about print to another file?
@@ -161,72 +155,53 @@ Keep Nov away from:
 - see https://docs.python.org/3.12/library/functions.html
 
 ## Functions
-Arguments are immutable by default unless mut is specified.
+Parameters are immutable by default.
 
-Parenthesis are mandatory for arguments but optional for return type if there
-is only one. Return type cannot be ommited.
-
-TODO: variable number of arguments? (just use an array)
+TODO: variable number of parameters? (just use an array)
 ```nov
-; signature: `() -> void`
-let doNothing = () -> void {}
+; signature: `() -> void
+let doNothing: `() = {}
 
-; with mut is the argument passed as reference or value? (probably reference or
-; add a way to specify it's passed by reference e.g. &x or x: *int)
-; TODO: how to specify if an arg is mutable in signature
-; signature: `(int) -> void`
-let retNothing = (mut x: int) -> void {
+; here x is passed by reference
+; signature: `(&int) -> void
+let retNothing: `(x: &int) = {
     x += 1
 }
 
-; signature: `() -> int`
-let ret2 = () -> int {
-    2
-}
+; functions body doesn't need to be a block
+; signature: `() -> int
+let ret2: `() -> int = 2
 
-; signature: `(int, int) -> int`
-let add = (a: int, b: int) -> int {
-    a + b
-}
+; signature: `(int, int) -> int
+let add: `(a: int, b: int) -> int = a + b
 
-; return multiple values
+; TODO: return multiple values or return a tuple?
 ; signature: `(int, int) -> (int, int)
-let div = (a: int, b: int) -> (int, int) {
+let div: `(a: int, b: int) -> (int, int) = {
     a / b, a % b
 }
 
 ; TODO: write a whole section about async
 ; async func, can be run normally or asynchronous
-; signature: `(int) -^ int -> void`
-let range = (n: int) -^ int -> void {
+; signature: `(int) -^ int -> void
+let range: `(n: int) -^ int = {
     for i in 0..n {
         yield i
     }
 }
-```
 
-Polymorphism,
-This is still very conceptual and idk if it will get implemented
-```nov
-; here the compiler knowns that x and y are of the same type because `==` can
-; only be used for values of the same type
-; signature: `(:a, :a) -> bool`
-let eql = (x, y) -> bool {
-    x == y
-}
+;;; Polymorphism
+; signature?
 
-; `:*` is a special type that corresponds to any type
-; signature: `(:a, :b) -> :c`
-let poly = (x, y) -> :* {
-    ; ...
-}
+; int signature: `<int>(int, int) -> bool
+let eql: `<T>(x: T, y: T) -> bool = x == y
+eql(1, 2) ; returns false
+eql(true, 0) ; compile error
 
-; here `:a` can be int, float, string or whatever type that has a definition
-; for the `+` operator
-; signature: `(:a, :a) -> :a`
-let add = (x: :a, y: :a) -> :a {
-    x + y
-}
+let add: `<T>(x: T, y: T) -> T = x + y
+add(1, 2) ; returns 3
+add("he", "llo") ; returns "hello"
+add(true, false) ; compile error
 ```
 
 ## Enum
@@ -243,7 +218,7 @@ let MyEnum = enum {
     y = 5
     z ; default to y + 1 = 6
 
-    let eql = (self: MyEnum, other: MyEnum) -> bool {
+    let eql: `(self: MyEnum, other: MyEnum) -> bool = {
         self == other
     }
 }
@@ -276,12 +251,10 @@ let MyStruct = struct {
 
     let max = 100.
 
-    let init = (name: string) -> MyStruct {
-        MyStruct{ .name = name }
-    }
+    let init: `(name: string) -> MyStruct = MyStruct{ .name = name }
 
     ; TODO: should we omit the type on self?
-    let eql = (self: MyStruct, other: MyStruct) -> bool {
+    let eql: `(self: MyStruct, other: MyStruct) -> bool = {
         ; side note, parenthesis allows to bypass newline checks
         return (
             self.name == other.name and
@@ -321,7 +294,7 @@ let Tree = union {
         right: Tree
     }
 
-    let sum = (self: Tree) -> int {
+    let sum: `(self: Tree) -> int = {
         ; TODO: match with .empty?
         match self {
             empty => 0
@@ -341,6 +314,11 @@ let Tree = union {
 }
 ```
 
+## Generics
+TODO
+
+See [Result and Option unions](#result-and-option-unions) for example.
+
 ## Result and Option unions
 The Result and Option unions are created with functions since types are values.
 In nov there is no untagged union thus  we can match on any union to find the
@@ -354,26 +332,32 @@ Sugar for Result and Option:
 - expr.! is unwrap or propagate for result
 - expr.? is unwrap or propagate for option
 
-TODO: how to return an error?
-- err(...)
-- error(...)
-- .err{ ... }
-
 TODO:
-- allow for this syntax `let a: MyUnion = .field{value}`, omit `.`? replace `{` with `(`?
+- allow for this syntax? `let a: MyUnion = .field{value}`, replace `{` with `(`?
+  - current syntax is `MyUnion{ .field = value }` or `.{ .field = value }` with inference
 - add a way to merge multiple error type into one?
+- find a way to reduce nested Result
+```
+`(Result<T>, `(T) -> U) -> Result<U> ; replace the value type but keep the same error
+`(Result<T>, `(T) -> Result<U>) -> Result<U> ; bind, see https://doc.rust-lang.org/std/result/enum.Result.html#method.and_then
+```
 - remove type sugar and only keep `.!` and `.?`?
 - Check https://docs.vlang.io/type-declarations.html#custom-error-types
 - Check https://docs.vlang.io/type-declarations.html#optionresult-types-and-error-handling
 - Check https://doc.rust-lang.org/std/result/index.html
 
 ```nov
-let Result = (T: type, E: type) -> type {
-    union {
-        ok: T
-        err: E
-    }
+let Result = union<T, E> {
+    ok: T
+    err: E
+
+    let newError: `(err: E) -> @This() = .{ .err = err }
+    ; same as
+    let newError: `(err: E) -> Result<T, E> = Result<T, E>{ .err = err }
 }
+
+let MyResult = Result<int, string>
+let my_err = MyResult.newError("my error string")
 
 ; error handling
 let file = match File.open("file.txt") {
@@ -388,28 +372,26 @@ let file = match File.open("file.txt") {
 ; .! unwrap and returns the err if there is any
 let file = File.open("file.txt").!
 
-let Option = (T: type) -> type {
-    union {
-        some: T
-        none
+let Option = union<T> {
+    some: T
+    none
 
-        ; unions can also have methods
-        @[public]
-        @[inline]
-        let orelse = (self: @This(), fallback_value: T) -> T {
-            match self {
-                .some => |val| val ; catch the value and return it
-                .none => fallback_Value
-            }
+    ; unions can also have methods
+    @[public]
+    @[inline]
+    let orelse: `(self: @This(), fallback_value: T) -> T = {
+        match self {
+            .some => |val| val ; catch the value and return it
+            .none => fallback_Value
         }
     }
 }
 
 let x = 5
-let y = Option(int){ .some = 5 }
+let y = Option<int>{ .some = 5 }
 let sum = x + y.orelse(0)
 
-let MyOption = Option(float)
+let MyOption = Option<float>
 let a = MyOption{ .some = 1.0 }
 let b = MyOption{ .none }
 let prod = x.? * y.?
@@ -421,9 +403,12 @@ values are constant too. A mutable array can be reassigned/extanded and its
 values can be modified.
 
 TODO:
+- keep arrays like that aka growable size list etc... or move to static array like zig?
+  - probably continue like that because it's garbage collected and easier for programmer ig
 - add a way to initialize the capacity of an array without adding any element
   - `let x = []int.initCapacity(50)` x is an array with len = 0 but with capacity = 50
   - use a builtin?
+  - `let x: [50]int`
 - add a way to repeat an array like a string, allow to use that as an initializer
   - `let x = [1].repeat(50)` x is an array of 50 int with value 1
   - `let x = [@as(uint, 1)].repeat(50)` x is an array of 50 uint with value 1
@@ -516,6 +501,7 @@ let x: ?int = if is_even {
 ```
 
 ## For loop
+TODO: add else statement?
 ```nov
 ; names can be an array, a slice, a string or an iterator
 ; an iterator is any object with a public .next() method that returns an Option(T)
@@ -567,7 +553,7 @@ for i < 100 : i += 2 {
 TODO: same as zig
 
 ## Defer
-TODO: same as zig, still a proposal
+TODO: same as zig
 
 ## In
 Check if an element is in an array or if it's a key in a map.
@@ -672,8 +658,8 @@ Operator overloading is possible on the following operators:
 - `%`: (T, T) -> T
 - `<`: (T, T) -> bool
 - `==`: (T, T) -> bool
-- TODO: `>>=`: (T, (T) -> T2) -> T2
-- TODO: `[]`: (T, int) -> T2
+- TODO: `>>=`: (T, (T) -> U) -> U
+- TODO: `[]`: (T, int) -> U
 
 Note:
 - `==` is automatically generated for all types by the compiler but can be overridden.
@@ -687,7 +673,7 @@ let Complex = struct {
     ; TODO: make the arg an enum so parsing is handled like an expr and it
     ; solve the binary/unary issue with `-`
     @[operator(+)]
-    let add = (self: Complex, other: Complex) -> Complex {
+    let add: `(self: Complex, other: Complex) -> Complex = {
         Complex{
             .re = self.re + other.re,
             .im = self.im + other.im,
@@ -696,7 +682,7 @@ let Complex = struct {
 
     ; used by print
     ; signature must be `toString: (T) -> string` where T is the container type
-    let toString = (self: Complex) -> string {
+    let toString: `(self: Complex) -> string = {
         "${self.re} + i${self.im}"
     }
 }
@@ -711,7 +697,11 @@ TODO...
 
 also add binding generator for zig?
 ```nov
-let malloc = extern malloc: (uint) -> (voidptr)
+@[extern("malloc")]
+let c_malloc(uint) -> voidptr
+
+@[extern("malloc")]
+let c_malloc(uint) -> voidptr = {} ; error extern fn can't have body
 ```
 
 ### Multiline string literal
@@ -731,11 +721,9 @@ let s = (
 ```
 
 ## String Interpolation
-TODO: `"${varname:[fill][alignment][width][.precision][type]}"`
+`"{varname:[fill][alignment][width][.precision][type]}"`
 
-How to escape `${`?
-
-proposal: Replace `${}` with `{}` and escape `{` and `}` with `\`
+Escape `{` and `}` with `\`.
 
 ## Async
 TODO: add async/await/yield

@@ -100,6 +100,8 @@ pub fn parseEscapeSequence(slice: []const u8, offset: *usize) ParsedCharLiteral 
         '\'' => return .{ .success = '\'' },
         '"' => return .{ .success = '"' },
         '0' => return .{ .success = '\x00' },
+        '{' => return .{ .success = '{' },
+        '}' => return .{ .success = '}' },
         'x' => {
             var value: u8 = 0;
             var i: usize = offset.*;

@@ -182,11 +182,11 @@ pub fn renderError(self: Ast, parse_error: Error, writer: anytype) !void {
                 token_tags[parse_error.token + @intFromBool(parse_error.token_is_prev)].symbol(),
             });
         },
-        // .expected_param_list => {
-        //     return writer.print("expected parameter list, found '{s}'", .{
-        //         token_tags[parse_error.token + @intFromBool(parse_error.token_is_prev)].symbol(),
-        //     });
-        // },
+        .expected_param_list => {
+            return writer.print("expected parameter list, found '{s}'", .{
+                token_tags[parse_error.token + @intFromBool(parse_error.token_is_prev)].symbol(),
+            });
+        },
         .expected_prefix_expr => {
             return writer.print("expected prefix expression, found '{s}'", .{
                 token_tags[parse_error.token + @intFromBool(parse_error.token_is_prev)].symbol(),
@@ -212,16 +212,19 @@ pub fn renderError(self: Ast, parse_error: Error, writer: anytype) !void {
         .expected_newline_after_attr => {
             return writer.writeAll("expected new line after attribute");
         },
+        .expected_newline_after_match_prong => {
+            return writer.writeAll("expected new line after match prong");
+        },
         .expected_statement => {
             return writer.print("expected statement, found '{s}'", .{
                 token_tags[parse_error.token].symbol(),
             });
         },
-        // .expected_suffix_op => {
-        //     return writer.print("expected pointer dereference, optional unwrap, or field access, found '{s}'", .{
-        //         token_tags[parse_error.token + @intFromBool(parse_error.token_is_prev)].symbol(),
-        //     });
-        // },
+        .expected_suffix_op => {
+            return writer.print("expected result unwrap, option unwrap, or field access, found '{s}'", .{
+                token_tags[parse_error.token + @intFromBool(parse_error.token_is_prev)].symbol(),
+            });
+        },
         .expected_type_expr => {
             return writer.print("expected type expression, found '{s}'", .{
                 token_tags[parse_error.token + @intFromBool(parse_error.token_is_prev)].symbol(),
@@ -266,15 +269,12 @@ pub fn renderError(self: Ast, parse_error: Error, writer: anytype) !void {
         .expected_comma_after_arg => {
             return writer.writeAll("expected ',' after argument");
         },
-        // .expected_comma_after_param => {
-        //     return writer.writeAll("expected ',' after parameter");
-        // },
+        .expected_comma_after_param => {
+            return writer.writeAll("expected ',' after parameter");
+        },
         // .expected_comma_after_initializer => {
         //     return writer.writeAll("expected ',' after initializer");
         // },
-        .expected_comma_after_match_prong => {
-            return writer.writeAll("expected ',' after match prong");
-        },
         // .expected_comma_after_for_operand => {
         //     return writer.writeAll("expected ',' after for operand");
         // },
@@ -290,11 +290,11 @@ pub fn renderError(self: Ast, parse_error: Error, writer: anytype) !void {
         .invalid_ampersand_ampersand => {
             return writer.writeAll("ambiguous use of '&&'; use 'and' for logical AND, or change whitespace to ' & &' for bitwise AND");
         },
-        // .nov_style_container => {
-        //     return writer.print("to declare a container do 'let {s} = {s}'", .{
-        //         self.tokenSlice(parse_error.token), parse_error.extra.expected_tag.symbol(),
-        //     });
-        // },
+        .nov_style_container => {
+            return writer.print("to declare a container do 'let {s} = {s}'", .{
+                self.tokenSlice(parse_error.token), parse_error.extra.expected_tag.symbol(),
+            });
+        },
         // .previous_field => {
         //     return writer.writeAll("field before declarations here");
         // },
@@ -335,6 +335,8 @@ pub fn firstToken(self: Ast, node: Node.Index) TokenIndex {
         .bool_not,
         .negation,
         .bit_not,
+        .ref_of,
+        .ref_type,
         .optional_type,
         .match,
         .@"if",
@@ -343,24 +345,32 @@ pub fn firstToken(self: Ast, node: Node.Index) TokenIndex {
         .@"break",
         .@"return",
         .identifier,
-        .bool_literal,
         .number_literal,
         .char_literal,
         .string_literal,
         .unreachable_literal,
+        .builtin_literal,
         .grouped_expression,
         .block_two,
         .block,
-        .loop,
-        .fn_args_one,
-        .fn_args,
+        .fn_proto_simple,
+        .fn_proto_multi,
+        .fn_proto,
         .attr_one,
         .attr,
+        .array_type,
+        .array_init_two,
+        .array_init,
+        .@"defer",
         => return main_tokens[n],
+
+        .enum_literal,
+        => return main_tokens[n] - 1,
 
         .field_access,
         .unwrap_option,
         .unwrap_result,
+        .deref,
         .equal_equal,
         .bang_equal,
         .less_than,
@@ -394,9 +404,11 @@ pub fn firstToken(self: Ast, node: Node.Index) TokenIndex {
         .call,
         .match_range,
         .function_pipe,
-        .fn_proto,
-        .fn_expr,
         .attr_decl_one,
+        .slice_open,
+        .slice,
+        .array_access,
+        .result_union,
         => n = datas[n].lhs,
 
         .match_case_one => {
@@ -436,10 +448,9 @@ pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
         .bool_not,
         .negation,
         .bit_not,
+        .ref_of,
+        .ref_type,
         .optional_type,
-        .loop,
-        => n = datas[n].lhs,
-
         .equal_equal,
         .bang_equal,
         .less_than,
@@ -475,42 +486,68 @@ pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
         .match_range,
         .function_pipe,
         .decl,
-        .fn_proto,
-        .fn_expr,
         .attr_decl_one,
         .attr_decl,
+        .array_type,
+        .@"defer",
+        .result_union,
         => n = datas[n].rhs,
 
         .field_access,
         .unwrap_option,
         .unwrap_result,
+        .deref,
         .grouped_expression,
         => return datas[n].rhs + end_offset,
 
-        .bool_literal,
         .number_literal,
         .char_literal,
         .identifier,
         .string_literal,
         .unreachable_literal,
+        .enum_literal,
+        .builtin_literal,
         => return main_tokens[n] + end_offset,
 
         .block => {
             assert(datas[n].rhs - datas[n].lhs > 0);
-            end_offset += 2; // newline rbrace
+            end_offset += 2; // rbrace TODO: newline
             n = self.extra_data[datas[n].rhs - 1]; // last statement
         },
 
         .block_two => {
             if (datas[n].rhs != 0) {
-                end_offset += 2; // newline rbrace
+                end_offset += 2; // rbrace newline
                 n = datas[n].rhs;
             } else if (datas[n].lhs != 0) {
-                end_offset += 2; // newline rbrace
+                end_offset += 2; // rbrace newline
                 n = datas[n].lhs;
             } else {
                 end_offset += 1; // rbrace
                 return main_tokens[n] + end_offset;
+            }
+        },
+
+        .fn_proto_simple => {
+            if (datas[n].rhs != 0) {
+                n = datas[n].rhs;
+            } else if (datas[n].lhs != 0) {
+                end_offset += 1; // rparen
+                n = datas[n].lhs;
+            } else {
+                end_offset += 2; // lparen rparen
+                return main_tokens[n] + end_offset;
+            }
+        },
+
+        .fn_proto_multi => {
+            if (datas[n].rhs != 0) {
+                n = datas[n].rhs;
+            } else {
+                const extra = self.extraData(datas[n].lhs, Node.SubRange);
+                assert(extra.end - extra.start > 0);
+                end_offset += 1; // rparen
+                n = self.extra_data[extra.end - 1]; // last parameter
             }
         },
 
@@ -520,8 +557,10 @@ pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
             n = extra.else_expr;
         },
 
-        .call_one => {
-            end_offset += 1; // for the rparen
+        .call_one,
+        .array_access,
+        => {
+            end_offset += 1; // for the rparen/rbracket
             if (datas[n].rhs == 0) {
                 return main_tokens[n] + end_offset;
             }
@@ -537,29 +576,24 @@ pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
             n = datas[n].rhs;
         },
 
-        .fn_args_one => {
-            end_offset += 1; // for the rparen
-            if (datas[n].rhs != 0) {
-                n = datas[n].rhs;
-            } else if (datas[n].lhs != 0) {
-                n = datas[n].lhs;
-            } else {
-                return main_tokens[n] + end_offset;
-            }
-        },
-
-        // TODO: idk about that
-        .fn_args => {
-            assert(datas[n].rhs - datas[n].lhs > 0);
-            end_offset += 1; // for the rparen
-            n = self.extra_data[datas[n].rhs - 1]; // last argument
-        },
-
         .attr => {
             const extra = self.extraData(datas[n].rhs, Node.SubRange);
             assert(extra.end - extra.start > 0);
-            end_offset += 2; // for the rparen rbracket
+            end_offset += 2; // rparen rbracket
             n = self.extra_data[extra.end - 1]; // last attribute
+        },
+
+        .slice_open => {
+            end_offset += 2; // ellipsis2 rbracket
+            n = datas[n].rhs;
+            assert(n != 0);
+        },
+
+        .slice => {
+            const extra = self.extraData(datas[n].rhs, Node.Slice);
+            assert(extra.end != 0); // should have used slice_open
+            end_offset += 1; // for the rbracket
+            n = extra.end;
         },
     };
 }
@@ -991,10 +1025,12 @@ pub const Error = struct {
         invalid_ampersand_ampersand,
         same_line_doc_comment,
         unattached_doc_comment,
+        nov_style_container,
         expected_decl,
         expected_expr,
         expected_expr_or_assignment,
         expected_expr_or_decl,
+        expected_suffix_op,
         expected_type_expr,
         expected_prefix_expr,
         expected_newline_or_else,
@@ -1002,12 +1038,14 @@ pub const Error = struct {
         expected_newline_after_decl,
         expected_newline_after_stmt,
         expected_newline_after_attr,
+        expected_newline_after_match_prong,
         expected_comma_after_arg,
-        expected_comma_after_match_prong,
+        expected_comma_after_param,
         expected_block,
         expected_block_or_assignment,
         expected_statement,
         expected_labelable,
+        expected_param_list,
 
         /// `expected_tag` is populated.
         expected_token,
@@ -1021,6 +1059,7 @@ pub const Node = struct {
 
     pub const Index = u32;
 
+    // TODO: add _comma and _newline variants for lastToken()
     pub const Tag = enum(u8) {
         /// sub_list[lhs..rhs]
         root,
@@ -1048,6 +1087,8 @@ pub const Node = struct {
         unwrap_option,
         /// `lhs.!`. main_token is the dot. rhs is the `!` token index.
         unwrap_result,
+        /// `lhs.*`. rhs is unused.
+        deref,
         /// `lhs == rhs`. main_token is op.
         equal_equal,
         /// `lhs != rhs`. main_token is op.
@@ -1111,14 +1152,35 @@ pub const Node = struct {
         bool_and,
         /// `lhs or rhs`. main_token is op.
         bool_or,
-        /// `!lhs`. rhs unused. main_token is op.
+        /// `!rhs`. lhs unused. main_token is op.
         bool_not,
-        /// `-lhs`. rhs unused. main_token is op.
+        /// `-rhs`. lhs unused. main_token is op.
         negation,
-        /// `~lhs`. rhs unused. main_token is op.
+        /// `~rhs`. lhs unused. main_token is op.
         bit_not,
-        /// `?lhs`. rhs unused. main_token is the `?`.
+        /// `&rhs`. lhs unused. main_token is op.
+        ref_of,
+        /// `&rhs`. lhs unused. main_token is the `&`.
+        ref_type,
+        /// `?rhs`. lhs unused. main_token is the `?`.
         optional_type,
+        // TODO: keep lhs for size?
+        /// `[]rhs`. lhs is unused.
+        array_type,
+        /// `lhs[rhs..]`
+        /// main_token is the lbracket.
+        slice_open,
+        /// `lhs[a..b]`. `Slice[rhs]`.
+        /// main_token is the lbracket.
+        slice,
+        /// `lhs[rhs]`.
+        array_access,
+        /// `[lhs, rhs]`. lhs and rhs can be omitted.
+        /// main_token points at the lbracket.
+        array_init_two,
+        /// `[a, b, c]`. `sub_list[lhs..rhs]`.
+        /// main_token points at the lbracket.
+        array_init,
         /// `lhs(rhs)`. rhs can be omitted.
         /// main_token is the `(`.
         call_one,
@@ -1135,8 +1197,6 @@ pub const Node = struct {
         match_case,
         /// `lhs..rhs`.
         match_range,
-        /// `loop {}`. lhs is the block. rhs is unused.
-        loop,
         // TODO: for
         /// `if lhs {}`. rhs is the block.
         @"if",
@@ -1145,37 +1205,40 @@ pub const Node = struct {
         /// `continue`. lhs is token index of label if any. rhs is unused.
         @"continue",
         /// `break :lhs rhs`
-        /// both lhs and rhs may be omitted.
+        /// lhs and rhs may be omitted.
         @"break",
         /// `return lhs`. lhs can be omitted. rhs is unused.
         @"return",
-        /// `(lhs: rhs)` lhs and rhs can be omitted.
-        /// main_token is the `(`.
-        fn_args_one,
-        /// `(a: b, c: d)` sub_list[lhs..rhs].
-        /// main_token is the `(`.
-        fn_args,
-        /// `lhs -> rhs`.
-        /// lhs is fn_args.
-        /// main_token is the `->`.
+        /// `BACKTICK(a: lhs) -> rhs`.
+        /// lhs and rhs can be omitted.
+        /// main_token is the BACKTICK (`).
+        fn_proto_simple,
+        /// `BACKTICK(d: e, f: g) -> rhs`. `SubRange[lhs]`.
+        /// rhs can be omitted.
+        /// main_token is the BACKTICK (`).
+        fn_proto_multi,
+        // TODO: more fn_proto variants, currently only fn_proto_simple and fn_proto_multi are used
+        // TODO: add return multiple values when assign destructure is added
+        /// `BACKTICK<a, b, c>(d: e, f: g) -^ h -> rhs`. `FnProto[lhs]`.
+        /// rhs can be omitted.
+        /// main_token is the BACKTICK (`).
         fn_proto,
-        /// `lhs rhs`.
-        /// lhs is the fn_proto.
-        /// rhs is the function body block.
-        fn_expr,
         /// Both lhs and rhs unused.
         number_literal,
         /// Both lhs and rhs unused.
         char_literal,
         /// Both lhs and rhs unused.
-        bool_literal,
-        /// Both lhs and rhs unused.
         unreachable_literal,
+        /// Both lhs and rhs unused.
+        builtin_literal,
         /// Both lhs and rhs unused.
         /// Most identifiers will not have explicit AST nodes, however for expressions
         /// which could be one of many different kinds of AST nodes, there will be an
         /// identifier AST node for it.
         identifier,
+        /// lhs is the dot token index, rhs unused.
+        /// main_token is the identifier.
+        enum_literal,
         /// main_token is the string literal token
         /// Both lhs and rhs unused.
         string_literal,
@@ -1188,11 +1251,12 @@ pub const Node = struct {
         /// `{}`. `sub_list[lhs..rhs]`.
         /// main_token points at the lbrace.
         block,
+        /// lhs is unused.
+        /// rhs is the deferred expression.
+        @"defer",
+        /// `lhs!rhs`. main_token is the `!`.
+        result_union,
         // TODO: struct, enum, container, class idk, generics too
-        // TODO: builtins: import, typeof
-        // TODO: array / slice
-        // TODO: defer?
-        // TODO: Result and Option syntax sugar
         // TODO: async/await/resume/suspend/nosuspend/yield
     };
 
@@ -1218,6 +1282,20 @@ pub const Node = struct {
         then_expr: Index,
         /// can be a block or another if expression
         else_expr: Index,
+    };
+
+    pub const Slice = struct {
+        start: Index,
+        end: Index,
+    };
+
+    pub const FnProto = struct {
+        generic_types_start: Index,
+        generic_types_end: Index,
+        params_start: Index,
+        params_end: Index,
+        /// Populated if `-^` is present.
+        async_return_type: Index,
     };
 };
 

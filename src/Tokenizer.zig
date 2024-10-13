@@ -32,13 +32,11 @@ pub const Token = struct {
         l_brace,
         r_brace,
         at_sign_l_bracket,
+        grave_accent,
         comma,
         period,
-        period_bang,
-        period_question_mark,
         ellipsis2,
         colon,
-        underscore,
         question_mark,
         bang,
         bang_equal,
@@ -76,8 +74,6 @@ pub const Token = struct {
         keyword_else,
         keyword_and,
         keyword_or,
-        keyword_true,
-        keyword_false,
         keyword_mut,
         keyword_return,
         keyword_break,
@@ -117,13 +113,11 @@ pub const Token = struct {
                 .l_brace => "{",
                 .r_brace => "}",
                 .at_sign_l_bracket => "@[",
+                .grave_accent => "`",
                 .comma => ",",
                 .period => ".",
-                .period_bang => ".!",
-                .period_question_mark => ".?",
                 .ellipsis2 => "..",
                 .colon => ":",
-                .underscore => "_",
                 .question_mark => "?",
                 .bang => "!",
                 .bang_equal => "!=",
@@ -154,8 +148,6 @@ pub const Token = struct {
                 .caret => "^",
                 .ampersand => "&",
                 .tilde => "~",
-                .keyword_true => "true",
-                .keyword_false => "false",
                 .keyword_and => "and",
                 .keyword_or => "or",
                 .keyword_if => "if",
@@ -271,7 +263,6 @@ const State = enum {
     int_exponent,
     float,
     float_exponent,
-    underscore,
     invalid,
 };
 
@@ -322,6 +313,10 @@ pub fn next(self: *Tokenizer) Token {
                 result.tag = .r_brace;
                 self.index += 1;
             },
+            '`' => {
+                result.tag = .grave_accent;
+                self.index += 1;
+            },
             ',' => {
                 result.tag = .comma;
                 self.index += 1;
@@ -359,7 +354,7 @@ pub fn next(self: *Tokenizer) Token {
                 result.tag = .char_literal;
                 continue :state .char_literal;
             },
-            'A'...'Z', 'a'...'z' => {
+            'A'...'Z', 'a'...'z', '_' => {
                 result.tag = .identifier;
                 continue :state .identifier;
             },
@@ -369,7 +364,6 @@ pub fn next(self: *Tokenizer) Token {
                 continue :state .int;
             },
             ';' => continue :state .line_comment_1,
-            '_' => continue :state .underscore,
             '@' => continue :state .at_sign,
             '=' => continue :state .equal,
             '!' => continue :state .bang,
@@ -438,16 +432,6 @@ pub fn next(self: *Tokenizer) Token {
             switch (self.buffer[self.index]) {
                 'A'...'Z', 'a'...'z', '0'...'9', '_' => continue :state .builtin,
                 else => {},
-            }
-        },
-        .underscore => {
-            self.index += 1;
-            switch (self.buffer[self.index]) {
-                'A'...'Z', 'a'...'z', '0'...'9', '_' => {
-                    result.tag = .identifier;
-                    continue :state .identifier;
-                },
-                else => result.tag = .underscore,
             }
         },
         .identifier => {
@@ -596,14 +580,6 @@ pub fn next(self: *Tokenizer) Token {
         .period => {
             self.index += 1;
             switch (self.buffer[self.index]) {
-                '!' => {
-                    result.tag = .period_bang;
-                    self.index += 1;
-                },
-                '?' => {
-                    result.tag = .period_question_mark;
-                    self.index += 1;
-                },
                 '.' => {
                     result.tag = .ellipsis2;
                     self.index += 1;
@@ -762,39 +738,6 @@ test "all tokens with lexeme" {
     try testTokenize(source, builder.items(.tag));
 }
 
-test "_" {
-    try testTokenize(
-        \\_ => 0,
-        \\
-    , &.{
-        .underscore,
-        .equal_arrow,
-        .number_literal,
-        .comma,
-        .newline,
-    });
-    try testTokenize(
-        \\_0 => 0,
-        \\
-    , &.{
-        .identifier,
-        .equal_arrow,
-        .number_literal,
-        .comma,
-        .newline,
-    });
-    try testTokenize(
-        \\_xxx => 0,
-        \\
-    , &.{
-        .identifier,
-        .equal_arrow,
-        .number_literal,
-        .comma,
-        .newline,
-    });
-}
-
 test "line comment followed by statement" {
     try testTokenize(
         \\; comment
@@ -884,45 +827,6 @@ test "shebang line is recognized and skipped" {
     });
 }
 
-test "small program" {
-    try testTokenize(
-        \\doNothing(arg: str) str {
-        \\    return arg
-        \\}
-        \\main() {
-        \\    doNothing("hello")
-        \\}
-        \\
-    , &.{
-        .identifier,
-        .l_paren,
-        .identifier,
-        .colon,
-        .identifier,
-        .r_paren,
-        .identifier,
-        .l_brace,
-        .newline,
-        .keyword_return,
-        .identifier,
-        .newline,
-        .r_brace,
-        .newline,
-        .identifier,
-        .l_paren,
-        .r_paren,
-        .l_brace,
-        .newline,
-        .identifier,
-        .l_paren,
-        .string_literal,
-        .r_paren,
-        .newline,
-        .r_brace,
-        .newline,
-    });
-}
-
 test "assignment operators" {
     try testTokenize(
         \\x = 1
@@ -967,15 +871,6 @@ test "range literals" {
     try testTokenize("0x00..0x09", &.{ .number_literal, .ellipsis2, .number_literal });
     try testTokenize("0b00..0b11", &.{ .number_literal, .ellipsis2, .number_literal });
     try testTokenize("0o00..0o11", &.{ .number_literal, .ellipsis2, .number_literal });
-}
-
-test "periods" {
-    try testTokenize("...", &.{ .ellipsis2, .period });
-    try testTokenize(". .", &.{ .period, .period });
-    try testTokenize(".!", &.{.period_bang});
-    try testTokenize(".?", &.{.period_question_mark});
-    try testTokenize(". !", &.{ .period, .bang });
-    try testTokenize(". ?", &.{ .period, .question_mark });
 }
 
 test "code point literal with hex escape" {
@@ -1067,7 +962,7 @@ test "chars" {
 
 test "invalid token characters" {
     try testTokenize("#", &.{.invalid});
-    try testTokenize("`", &.{.invalid});
+    try testTokenize("$", &.{.invalid});
     try testTokenize("'c", &.{.invalid});
     try testTokenize("'", &.{.invalid});
     try testTokenize("''", &.{.char_literal});
@@ -1113,7 +1008,7 @@ test "int literals decimal" {
 }
 
 test "float literals decimal" {
-    try testTokenize("._", &.{ .period, .underscore });
+    try testTokenize("._", &.{ .period, .identifier });
     try testTokenize("._1", &.{ .period, .identifier });
     try testTokenize("1.", &.{ .number_literal, .period });
     try testTokenize("1.+", &.{ .number_literal, .period, .plus });

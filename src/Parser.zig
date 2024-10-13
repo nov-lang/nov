@@ -143,8 +143,15 @@ fn parseRoot(self: *Parser) Allocator.Error!void {
                 try self.scratch.append(self.allocator, decl);
             },
             else => {
-                try self.warn(.expected_decl);
-                self.findNextTopLevelDecl();
+                const is_c_container = self.parseCStyleContainer() catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.ParseError => false,
+                };
+
+                if (!is_c_container) {
+                    try self.warn(.expected_decl);
+                    self.findNextTopLevelDecl();
+                }
             },
         }
     }
@@ -200,8 +207,9 @@ fn expectAttr(self: *Parser) Error!Node.Index {
     const name = try self.expectToken(.identifier);
 
     var is_multi = false;
-    const args = switch (try self.parseExprList()) {
-        .null => null_node,
+    const args = if (self.eatToken(.l_paren) == null)
+        null_node
+    else switch (try self.parseExprList(.r_paren, .expected_comma_after_arg)) {
         .zero_or_one => |arg| blk: {
             if (arg == null_node) {
                 const tok = self.tok_i - 2;
@@ -361,7 +369,8 @@ fn parseExprPrecedence(self: *Parser, min_prec: Precedence) Error!Node.Index {
             const char_before = self.source[self.token_starts[op_token] - 1];
             const char_after = self.source[self.token_starts[op_token] + tok_len];
             if (tok_tag == .ampersand and char_after == '&') {
-                // warn about '&&' being used instead of 'and'
+                // without types we don't know if '&&' was intended as 'bitwise_and ref_of', or a c-style logical_and
+                // The best the parser can do is recommend changing it to 'and' or ' & &'
                 try self.warnMsg(.{ .tag = .invalid_ampersand_ampersand, .token = op_token });
             } else if (std.ascii.isWhitespace(char_before) != std.ascii.isWhitespace(char_after)) {
                 try self.warnMsg(.{ .tag = .mismatched_binary_op_whitespace, .token = op_token });
@@ -384,14 +393,14 @@ fn parseExprPrecedence(self: *Parser, min_prec: Precedence) Error!Node.Index {
 }
 
 /// PrefixExpr <- PrefixOp* PrimaryExpr
-/// PrefixOp <- EXCLAMATIONMARK / MINUS / TILDE
+/// PrefixOp <- EXCLAMATIONMARK / MINUS / TILDE / AMPERSAND
 fn parsePrefixExpr(self: *Parser) Error!Node.Index {
     // an unary operator should never be on its own line so we don't use currentTokenTag()
     const tag: Node.Tag = switch (self.token_tags[self.tok_i]) {
         .bang => .bool_not,
         .minus => .negation,
         .tilde => .bit_not,
-        // .keyword_try => .@"try",
+        .ampersand => .ref_of,
         // .keyword_await => .@"await",
         else => return self.parsePrimaryExpr(),
     };
@@ -399,8 +408,8 @@ fn parsePrefixExpr(self: *Parser) Error!Node.Index {
         .tag = tag,
         .main_token = self.nextToken(),
         .data = .{
-            .lhs = try self.expectPrefixExpr(),
-            .rhs = undefined,
+            .lhs = undefined,
+            .rhs = try self.expectPrefixExpr(),
         },
     });
 }
@@ -413,7 +422,6 @@ fn expectPrefixExpr(self: *Parser) Error!Node.Index {
     return node;
 }
 
-// TODO
 /// PrimaryExpr
 ///     <- IfExpr
 ///      / KEYWORD_break BreakLabel? Expr?
@@ -422,6 +430,9 @@ fn expectPrefixExpr(self: *Parser) Error!Node.Index {
 ///      / BlockLabel? LoopExpr
 ///      / Block
 ///      / CurlySuffixExpr
+// TODO:
+// KEYWORD_nosuspend Expr
+// KEYWORD_resume Expr
 fn parsePrimaryExpr(self: *Parser) Error!Node.Index {
     switch (self.currentTokenTag()) {
         .keyword_if => return self.parseIfExpr(),
@@ -449,16 +460,13 @@ fn parsePrimaryExpr(self: *Parser) Error!Node.Index {
                 .rhs = undefined,
             },
         }),
-        // keyword_nosuspend
-        // keyword_resume
-        // TODO: loop + block label here or everytime before a block?
         .identifier => {
             if (self.token_tags[self.tok_i + 1] == .colon) {
                 switch (self.token_tags[self.tok_i + 2]) {
-                    // .keyword_for => {
-                    //     self.tok_i += 2;
-                    //     return self.parseForExpr();
-                    // },
+                    .keyword_for => {
+                        self.tok_i += 2;
+                        return self.parseForExpr();
+                    },
                     .l_brace => {
                         self.tok_i += 2;
                         return self.parseBlock();
@@ -469,15 +477,19 @@ fn parsePrimaryExpr(self: *Parser) Error!Node.Index {
                 return self.parseCurlySuffixExpr();
             }
         },
-        // .keyword_for => return self.parseForExpr(),
-        // .keyword_match => return self.parseMatchExpr(),
+        .keyword_for => return self.parseForExpr(),
         .l_brace => return self.parseBlock(),
-        // .keyword_enum, .keyword_struct, .keyword_union => {
-        //     // TODO: warn
-        // },
-
+        .l_bracket => return self.parseArrayLiteral(), // TODO: move to parsePrimaryTypeExpr, make it like zig?
+        // TODO: here?
+        // .keyword_match => return self.parseMatchExpr(),
         else => return self.parseCurlySuffixExpr(),
     }
+}
+
+/// BreakLabel <- COLON IDENTIFIER
+fn parseBreakLabel(self: *Parser) Error!TokenIndex {
+    _ = self.eatToken(.colon) orelse return null_node;
+    return self.expectToken(.identifier);
 }
 
 /// IfExpr <- KEYWORD_if Expr Block (KEYWORD_else (IfExpr / Block))?
@@ -516,10 +528,25 @@ fn parseIfExpr(self: *Parser) Error!Node.Index {
     });
 }
 
-/// BreakLabel <- COLON IDENTIFIER
-fn parseBreakLabel(self: *Parser) Error!TokenIndex {
-    _ = self.eatToken(.colon) orelse return null_node;
-    return self.expectToken(.identifier);
+// TODO
+// for x in y
+// for x, y, z in a, b, c
+// for x in y..z
+// for mut x, mut y in a, b, c
+// for _ in 0..10
+// for x > 10
+// for {}
+// for i < 100 : i += 1
+/// IfExpr <- KEYWORD_if Expr Block (KEYWORD_else (IfExpr / Block))?
+/// ForExpr <- KEYWORD_for ... Block
+/// ForEachInput <- IDENTIFIER+ KEYWORD_in (Expr (DOT2 Expr?)?)+
+///
+fn parseForExpr(self: *Parser) Error!Node.Index {
+    const for_token = self.assertToken(.keyword_for);
+    _ = for_token;
+    unreachable;
+
+    // const inputs = try self.parseForEachInput();
 }
 
 /// Block <- LBRACE (Decl / ExprStmt)* Expr? RBRACE
@@ -531,7 +558,10 @@ fn parseBlock(self: *Parser) Error!Node.Index {
     while (true) {
         switch (self.token_tags[self.tok_i]) {
             .newline => self.tok_i += 1,
-            .r_brace => break,
+            .r_brace => {
+                self.tok_i += 1;
+                break;
+            },
             .eof => return self.failExpected(.r_brace),
             .keyword_let => {
                 const decl = self.parseDecl() catch |err| switch (err) {
@@ -558,7 +588,6 @@ fn parseBlock(self: *Parser) Error!Node.Index {
             },
         }
     }
-    _ = try self.expectToken(.r_brace);
     const statements = self.scratch.items[scratch_top..];
     switch (statements.len) {
         0 => return self.addNode(.{
@@ -607,7 +636,81 @@ fn expectBlock(self: *Parser) Error!Node.Index {
     return block;
 }
 
-// TODO: define InitList
+// TODO: use parseList or make it more like parseBlock, this is too long
+/// ArrayLiteral <- LBRACKET (Expr COMMA)* Expr? RBRACKET
+fn parseArrayLiteral(self: *Parser) Error!Node.Index {
+    const lbracket = self.assertToken(.l_bracket);
+    if (self.eatToken(.r_bracket) != null) {
+        return self.addNode(.{
+            .tag = .array_init_two,
+            .main_token = lbracket,
+            .data = .{
+                .lhs = null_node,
+                .rhs = null_node,
+            },
+        });
+    }
+
+    self.eatNewLines();
+    const scratch_top = self.scratch.items.len;
+    defer self.scratch.shrinkRetainingCapacity(scratch_top);
+    while (true) {
+        const expr = try self.expectExpr();
+        try self.scratch.append(self.allocator, expr);
+        self.eatNewLines();
+        switch (self.token_tags[self.tok_i]) {
+            .comma => self.tok_i += 1,
+            .r_bracket => {
+                self.tok_i += 1;
+                break;
+            },
+            .newline => unreachable,
+            .colon, .r_brace, .r_paren => return self.failExpected(.r_bracket),
+            // Likely just a missing comma; give error but continue parsing.
+            else => try self.warn(.expected_comma_after_arg),
+        }
+    }
+    const exprs = self.scratch.items[scratch_top..];
+    switch (exprs.len) {
+        0 => return self.addNode(.{
+            .tag = .array_init_two,
+            .main_token = lbracket,
+            .data = .{
+                .lhs = null_node,
+                .rhs = null_node,
+            },
+        }),
+        1 => return self.addNode(.{
+            .tag = .array_init_two,
+            .main_token = lbracket,
+            .data = .{
+                .lhs = exprs[0],
+                .rhs = null_node,
+            },
+        }),
+        2 => return self.addNode(.{
+            .tag = .array_init_two,
+            .main_token = lbracket,
+            .data = .{
+                .lhs = exprs[0],
+                .rhs = exprs[1],
+            },
+        }),
+        else => {
+            const span = try self.listToSpan(exprs);
+            return self.addNode(.{
+                .tag = .array_init,
+                .main_token = lbracket,
+                .data = .{
+                    .lhs = span.start,
+                    .rhs = span.end,
+                },
+            });
+        },
+    }
+}
+
+// TODO: define InitList, for container only (and map?)
 /// CurlySuffixExpr <- TypeExpr InitList?
 ///
 /// InitList
@@ -620,8 +723,8 @@ fn parseCurlySuffixExpr(self: *Parser) Error!Node.Index {
     // TODO
 }
 
-/// TypeExpr <- PrefixTypeOp* SuffixExpr
-/// PrefixTypeOp <- QUESTIONMARK / ArrayTypeStart
+/// TypeExpr <- PrefixTypeOp* ResultUnionExpr
+/// PrefixTypeOp <- QUESTIONMARK / AMPERSAND / ArrayTypeStart
 /// ArrayTypeStart <- LBRACKET RBRACKET
 fn parseTypeExpr(self: *Parser) Error!Node.Index {
     // an unary operator should never be on its own line so we don't use currentTokenTag()
@@ -630,24 +733,31 @@ fn parseTypeExpr(self: *Parser) Error!Node.Index {
             .tag = .optional_type,
             .main_token = self.nextToken(),
             .data = .{
-                .lhs = try self.expectTypeExpr(),
-                .rhs = undefined,
+                .lhs = undefined,
+                .rhs = try self.expectTypeExpr(),
             },
         }),
-        // TODO
-        // .l_bracket => {
-        //     const lbracket = self.nextToken();
-        //     _ = try self.expectToken(.r_bracket);
-        //     return self.addNode(.{
-        //         .tag = .slice_type,
-        //         .main_token = lbracket,
-        //         .data = .{
-        //             .lhs = try self.expectTypeExpr(),
-        //             .rhs = undefined,
-        //         },
-        //     });
-        // },
-        else => return self.parseSuffixExpr(),
+        .ampersand => return self.addNode(.{
+            .tag = .ref_type,
+            .main_token = self.nextToken(),
+            .data = .{
+                .lhs = undefined,
+                .rhs = try self.expectTypeExpr(),
+            },
+        }),
+        .l_bracket => {
+            const lbracket = self.nextToken();
+            _ = try self.expectToken(.r_bracket);
+            return self.addNode(.{
+                .tag = .array_type,
+                .main_token = lbracket,
+                .data = .{
+                    .lhs = undefined,
+                    .rhs = try self.expectTypeExpr(),
+                },
+            });
+        },
+        else => return self.parseResultUnionExpr(),
     }
 }
 
@@ -659,10 +769,23 @@ fn expectTypeExpr(self: *Parser) Error!Node.Index {
     return node;
 }
 
-// TODO
+/// ResultUnionExpr <- SuffixExpr (EXCLAMATIONMARK TypeExpr)?
+fn parseResultUnionExpr(self: *Parser) Error!Node.Index {
+    const suffix_expr = try self.parseSuffixExpr();
+    if (suffix_expr == null_node) return null_node;
+    const bang = self.eatToken(.bang) orelse return suffix_expr;
+    return self.addNode(.{
+        .tag = .result_union,
+        .main_token = bang,
+        .data = .{
+            .lhs = suffix_expr,
+            .rhs = try self.expectTypeExpr(),
+        },
+    });
+}
+
 /// SuffixExpr <- PrimaryTypeExpr (SuffixOp / FnCallArguments)*
 /// FnCallArguments <- LPAREN ExprList RPAREN
-/// ExprList <- (Expr COMMA)* Expr?
 fn parseSuffixExpr(self: *Parser) Error!Node.Index {
     var res = try self.parsePrimaryTypeExpr();
     if (res == null_node) {
@@ -676,49 +799,22 @@ fn parseSuffixExpr(self: *Parser) Error!Node.Index {
             continue;
         }
         const lparen = self.eatToken(.l_paren) orelse return res;
-        const scratch_top = self.scratch.items.len;
-        defer self.scratch.shrinkRetainingCapacity(scratch_top);
-        while (true) {
-            if (self.eatToken(.r_paren) != null) break;
-            const param = try self.expectExpr();
-            try self.scratch.append(self.allocator, param);
-            // TODO: self.currentTokenTag()?
-            switch (self.token_tags[self.tok_i]) {
-                .newline => {}, // TODO?
-                .comma => self.tok_i += 1,
-                .r_paren => {
-                    self.tok_i += 1;
-                    break;
-                },
-                .colon, .r_brace, .r_bracket => return self.failExpected(.r_paren),
-                // Likely just a missing comma; give error but continue parsing.
-                else => try self.warn(.expected_comma_after_arg),
-            }
-        }
-        const params = self.scratch.items[scratch_top..];
-        res = switch (params.len) {
-            0 => try self.addNode(.{
+        const params = try self.parseExprList(.r_paren, .expected_comma_after_arg);
+        res = try switch (params) {
+            .zero_or_one => |param| self.addNode(.{
                 .tag = .call_one,
                 .main_token = lparen,
                 .data = .{
                     .lhs = res,
-                    .rhs = null_node,
+                    .rhs = param,
                 },
             }),
-            1 => try self.addNode(.{
-                .tag = .call_one,
-                .main_token = lparen,
-                .data = .{
-                    .lhs = res,
-                    .rhs = params[0],
-                },
-            }),
-            else => try self.addNode(.{
+            .multi => |span| self.addNode(.{
                 .tag = .call,
                 .main_token = lparen,
                 .data = .{
                     .lhs = res,
-                    .rhs = try self.addExtra(try self.listToSpan(params)),
+                    .rhs = try self.addExtra(span),
                 },
             }),
         };
@@ -730,8 +826,8 @@ fn parseSuffixExpr(self: *Parser) Error!Node.Index {
 /// TupleTypeExpr <- LPAREN TypeExpr (COMMA TypeExpr)* RPAREN // TODO
 fn parsePrimaryTypeExpr(self: *Parser) Error!Node.Index {
     switch (self.currentTokenTag()) {
-        .keyword_true, .keyword_false => return self.addNode(.{
-            .tag = .bool_literal,
+        .keyword_unreachable => return self.addNode(.{
+            .tag = .unreachable_literal,
             .main_token = self.nextToken(),
             .data = .{
                 .lhs = undefined,
@@ -754,96 +850,336 @@ fn parsePrimaryTypeExpr(self: *Parser) Error!Node.Index {
                 .rhs = undefined,
             },
         }),
-        .string_literal => {
-            return self.addNode(.{
-                .tag = .string_literal,
-                .main_token = self.nextToken(),
-                .data = .{
-                    .lhs = undefined,
-                    .rhs = undefined,
+        .string_literal => return self.addNode(.{
+            .tag = .string_literal,
+            .main_token = self.nextToken(),
+            .data = .{
+                .lhs = undefined,
+                .rhs = undefined,
+            },
+        }),
+        .builtin => return self.addNode(.{
+            .tag = .builtin_literal,
+            .main_token = self.nextToken(),
+            .data = .{
+                .lhs = undefined,
+                .rhs = undefined,
+            },
+        }),
+        .grave_accent => return self.parseFnProto(),
+        // .keyword_if => return self.parseIf(expectTypeExpr), // TODO: why separate expr and type expr?
+        // .keyword_match => return self.expectMatchExpr(false), // TODO
+        // .keyword_for => return self.parseFor(expectTypeExpr), // TODO
+        // TODO
+        // .keyword_struct,
+        // .keyword_opaque,
+        // .keyword_enum,
+        // .keyword_union,
+        // => return self.parseContainerDeclAuto(),
+        .identifier => switch (self.token_tags[self.tok_i + 1]) {
+            .colon => switch (self.token_tags[self.tok_i + 2]) {
+                // TODO
+                // .keyword_for => {
+                //     self.tok_i += 2;
+                //     return self.parseFor(expectTypeExpr);
+                // },
+                // .keyword_match => {
+                //     self.tok_i += 2;
+                //     return self.expectMatchExpr(true);
+                // },
+                .l_brace => {
+                    self.tok_i += 2;
+                    return self.parseBlock();
                 },
-            });
-        },
-        .identifier => { // TODO check if is fn
-            return self.addNode(.{
+                else => return self.addNode(.{
+                    .tag = .identifier,
+                    .main_token = self.nextToken(),
+                    .data = .{
+                        .lhs = undefined,
+                        .rhs = undefined,
+                    },
+                }),
+            },
+            else => return self.addNode(.{
                 .tag = .identifier,
                 .main_token = self.nextToken(),
                 .data = .{
                     .lhs = undefined,
                     .rhs = undefined,
                 },
-            });
+            }),
         },
-        // .keyword_if => return self.parseIf(expectTypeExpr), // TODO: why separate expr and type expr?
-        .l_paren => {
-            // TODO: handle function
-            return self.addNode(.{
-                .tag = .grouped_expression,
-                .main_token = self.nextToken(),
+        // TODO: see README proposal
+        .period => switch (self.token_tags[self.tok_i + 1]) {
+            .identifier => return self.addNode(.{
+                .tag = .enum_literal,
                 .data = .{
-                    .lhs = blk: {
-                        self.ignore_newlines = true;
-                        const expr = try self.expectExpr();
-                        self.ignore_newlines = false;
-                        break :blk expr;
+                    .lhs = self.nextToken(), // period
+                    .rhs = undefined,
+                },
+                .main_token = self.nextToken(), // identifier
+            }),
+            else => return null_node,
+        },
+        .l_paren => return self.addNode(.{
+            .tag = .grouped_expression,
+            .main_token = self.nextToken(),
+            .data = .{
+                .lhs = blk: {
+                    self.ignore_newlines = true;
+                    const expr = try self.expectExpr();
+                    self.ignore_newlines = false;
+                    break :blk expr;
+                },
+                .rhs = try self.expectToken(.r_paren),
+            },
+        }),
+        else => return null_node,
+    }
+}
+
+/// SuffixOp
+///     <- LBRACKET Expr (DOT2 Expr?)? RBRACKET
+///      / DOT IDENTIFIER
+///      / DOTQUESTIONMARK
+///      / DOTEXCLAMATIONMARK
+///      / DOTASTERISK
+fn parseSuffixOp(self: *Parser, lhs: Node.Index) Error!Node.Index {
+    switch (self.token_tags[self.tok_i]) {
+        .l_bracket => {
+            const lbracket = self.nextToken();
+            const index_expr = try self.expectExpr();
+
+            if (self.eatToken(.ellipsis2) != null) {
+                const end_expr = try self.parseExpr();
+                _ = try self.expectToken(.r_bracket);
+                if (end_expr == null_node) {
+                    return self.addNode(.{
+                        .tag = .slice_open,
+                        .main_token = lbracket,
+                        .data = .{
+                            .lhs = lhs,
+                            .rhs = index_expr,
+                        },
+                    });
+                }
+                return self.addNode(.{
+                    .tag = .slice,
+                    .main_token = lbracket,
+                    .data = .{
+                        .lhs = lhs,
+                        .rhs = try self.addExtra(Node.Slice{
+                            .start = index_expr,
+                            .end = end_expr,
+                        }),
                     },
-                    .rhs = try self.expectToken(.r_paren),
+                });
+            }
+            _ = try self.expectToken(.r_bracket);
+            return self.addNode(.{
+                .tag = .array_access,
+                .main_token = lbracket,
+                .data = .{
+                    .lhs = lhs,
+                    .rhs = index_expr,
                 },
             });
+        },
+        .period => switch (self.token_tags[self.tok_i + 1]) {
+            .identifier => return self.addNode(.{
+                .tag = .field_access,
+                .main_token = self.nextToken(),
+                .data = .{
+                    .lhs = lhs,
+                    .rhs = self.nextToken(),
+                },
+            }),
+            .question_mark => return self.addNode(.{
+                .tag = .unwrap_option,
+                .main_token = self.nextToken(),
+                .data = .{
+                    .lhs = lhs,
+                    .rhs = self.nextToken(),
+                },
+            }),
+            .bang => return self.addNode(.{
+                .tag = .unwrap_result,
+                .main_token = self.nextToken(),
+                .data = .{
+                    .lhs = lhs,
+                    .rhs = self.nextToken(),
+                },
+            }),
+            .asterisk => return self.addNode(.{
+                .tag = .deref,
+                .main_token = self.nextToken(),
+                .data = .{
+                    .lhs = lhs,
+                    .rhs = self.nextToken(),
+                },
+            }),
+            // .l_brace => {
+            //     // this a misplaced `.{`, handle the error somewhere else
+            //     return null_node;
+            // },
+            else => {
+                self.tok_i += 1;
+                try self.warn(.expected_suffix_op);
+                return null_node;
+            },
         },
         else => return null_node,
     }
 }
 
-// TODO
-/// SuffixOp
-///     <- LBRACKET Expr (DOT2 Expr?)? RBRACKET
-///      / DOT IDENTIFIER
-///      / DOTQUESTIONMARK // TODO: replace with EXCLAMATIONMARK or QUESTIONMARK
-fn parseSuffixOp(self: *Parser, lhs: Node.Index) Error!Node.Index {
+// TODO: handle generic list and async ret type
+// TODO: for ResultUnion: FnRetType <- ARROW EXCLAMATIONMARK? TypeExpr
+/// FnProto <- GRAVEACCENT GenericList? ParamDeclList AsyncRetType? FnRetType?
+/// AsyncRetType <- MINUSCARET TypeExpr
+/// FnRetType <- ARROW TypeExpr
+fn parseFnProto(self: *Parser) Error!Node.Index {
+    const fn_token = self.assertToken(.grave_accent);
+
+    // We want the fn proto node to be before its children in the array. TODO: why?
+    const fn_proto_index = try self.reserveNode(.fn_proto);
+    errdefer self.unreserveNode(fn_proto_index);
+
+    // const generics = try self.parseGenericList();
+    const params = try self.parseParamDeclList();
+
+    // const async_ret_type = if (self.eatToken(.minus_caret) != null) try self.expectTypeExpr() else null_node;
+    const ret_type = if (self.eatToken(.arrow) != null) try self.expectTypeExpr() else null_node;
+
+    return switch (params) {
+        .zero_or_one => |param| self.setNode(fn_proto_index, .{
+            .tag = .fn_proto_simple,
+            .main_token = fn_token,
+            .data = .{
+                .lhs = param,
+                .rhs = ret_type,
+            },
+        }),
+        .multi => |span| self.setNode(fn_proto_index, .{
+            .tag = .fn_proto_multi,
+            .main_token = fn_token,
+            .data = .{
+                .lhs = try self.addExtra(span),
+                .rhs = ret_type,
+            },
+        }),
+    };
+}
+
+/// Give a helpful error message for those transitioning from
+/// C's 'struct Foo {};' to Nov's 'const Foo = struct {};'.
+fn parseCStyleContainer(self: *Parser) Error!bool {
+    const main_token = self.tok_i;
+    switch (self.token_tags[self.tok_i]) {
+        .keyword_enum, .keyword_union, .keyword_struct => {},
+        else => return false,
+    }
+    const identifier = self.tok_i + 1;
+    if (self.token_tags[identifier] != .identifier) return false;
+    self.tok_i += 2;
+
+    try self.warnMsg(.{
+        .tag = .nov_style_container,
+        .is_note = true,
+        .token = identifier,
+        .extra = .{ .expected_tag = self.token_tags[main_token] },
+    });
+
+    _ = try self.expectToken(.l_brace);
+    // _ = try self.parseContainerMembers(); // TODO
+    _ = try self.expectToken(.r_brace);
+    try self.expectNewLine(.expected_newline_after_decl);
+    return true;
+}
+
+/// GenericList <- LANGLEBRACKET (IDENTIFIER COMMA)* IDENTIFIER COMMA? RANGLEBRACKET
+fn parseGenericList(self: *Parser) Error!SmallSpan {
     _ = self;
-    _ = lhs;
-    return null_node;
+    unreachable;
+}
+
+/// ParamDeclList <- LPAREN (ParamDecl COMMA)* ParamDecl? RPAREN
+fn parseParamDeclList(self: *Parser) Error!SmallSpan {
+    _ = try self.expectToken(.l_paren);
+    return self.parseList(
+        .r_paren,
+        .expected_comma_after_param,
+        expectParamDecl,
+    );
+}
+
+/// ParamDecl <- (IDENTIFIER COLON)? TypeExpr
+fn expectParamDecl(self: *Parser) Error!Node.Index {
+    if (self.token_tags[self.tok_i] == .identifier and
+        self.token_tags[self.tok_i + 1] == .colon)
+    {
+        self.tok_i += 2;
+    }
+    return self.expectTypeExpr();
+}
+
+/// ExprList <- (Expr COMMA)* Expr?
+fn parseExprList(
+    self: *Parser,
+    comptime ending_token_tag: Token.Tag,
+    comptime error_tag: Ast.Error.Tag,
+) Error!SmallSpan {
+    return self.parseList(ending_token_tag, error_tag, expectExpr);
 }
 
 const SmallSpan = union(enum) {
-    /// missing l_paren
-    null: void,
     zero_or_one: Node.Index,
     multi: Node.SubRange,
 };
 
-/// ExprList <- LPAREN (Expr COMMA)* Expr? RPAREN
-fn parseExprList(self: *Parser) Error!SmallSpan {
-    _ = self.eatToken(.l_paren) orelse return .null;
-    if (self.eatToken(.r_paren) != null) {
+// this should handle new lines and commas correctly
+fn parseList(
+    self: *Parser,
+    comptime ending_token_tag: Token.Tag,
+    comptime error_tag: Ast.Error.Tag,
+    comptime parseFn: fn (*Parser) Error!Node.Index,
+) Error!SmallSpan {
+    if (self.eatToken(ending_token_tag) != null) {
         return .{ .zero_or_one = null_node };
     }
 
-    self.eatNewLines();
     const scratch_top = self.scratch.items.len;
     defer self.scratch.shrinkRetainingCapacity(scratch_top);
-    while (true) {
-        const expr = try self.expectExpr();
-        try self.scratch.append(self.allocator, expr);
-        self.eatNewLines();
-        switch (self.token_tags[self.tok_i]) {
-            .comma => self.tok_i += 1,
-            .r_paren => {
-                self.tok_i += 1;
-                break;
-            },
-            .newline => unreachable,
-            .colon, .r_brace, .r_bracket => return self.failExpected(.r_paren),
-            // Likely just a missing comma; give error but continue parsing.
-            else => try self.warn(.expected_comma_after_arg),
-        }
+    var comma = true;
+    sw: switch (self.token_tags[self.tok_i]) {
+        ending_token_tag => self.tok_i += 1, // break
+        .newline => {
+            self.tok_i += 1;
+            continue :sw self.token_tags[self.tok_i];
+        },
+        .comma => {
+            if (comma) {
+                _ = try parseFn(self); // should return the correct warning
+                unreachable;
+            }
+            comma = true;
+            self.tok_i += 1;
+            continue :sw self.token_tags[self.tok_i];
+        },
+        else => {
+            if (!comma) {
+                try self.warn(error_tag);
+            }
+            const item = try parseFn(self);
+            try self.scratch.append(self.allocator, item);
+            comma = false;
+            continue :sw self.token_tags[self.tok_i];
+        },
     }
-    const exprs = self.scratch.items[scratch_top..];
-    return switch (exprs.len) {
+    const items = self.scratch.items[scratch_top..];
+    return switch (items.len) {
         0 => .{ .zero_or_one = null_node },
-        1 => .{ .zero_or_one = exprs[0] },
-        else => .{ .multi = try self.listToSpan(exprs) },
+        1 => .{ .zero_or_one = items[0] },
+        else => .{ .multi = try self.listToSpan(items) },
     };
 }
 
@@ -859,6 +1195,28 @@ fn addNode(self: *Parser, node: Ast.Node) Allocator.Error!Node.Index {
     const result: Node.Index = @intCast(self.nodes.len);
     try self.nodes.append(self.allocator, node);
     return result;
+}
+
+fn setNode(self: *Parser, index: usize, node: Ast.Node) Node.Index {
+    self.nodes.set(index, node);
+    return @intCast(index);
+}
+
+fn reserveNode(self: *Parser, tag: Ast.Node.Tag) Allocator.Error!usize {
+    try self.nodes.resize(self.allocator, self.nodes.len + 1);
+    self.nodes.items(.tag)[self.nodes.len - 1] = tag;
+    return self.nodes.len - 1;
+}
+
+fn unreserveNode(self: *Parser, node_index: usize) void {
+    if (self.nodes.len == node_index) {
+        self.nodes.resize(self.allocator, self.nodes.len - 1) catch unreachable;
+    } else {
+        // There is zombie node left in the tree, let's make it as inoffensive as possible
+        // (sadly there's no no-op node)
+        self.nodes.items(.tag)[node_index] = .unreachable_literal;
+        self.nodes.items(.main_token)[node_index] = self.tok_i;
+    }
 }
 
 fn addExtra(self: *Parser, extra: anytype) Allocator.Error!Node.Index {
@@ -1018,9 +1376,9 @@ fn warnMsg(self: *Parser, msg: Ast.Error) Allocator.Error!void {
         .expected_newline_or_lbrace,
         // .expected_comma_after_field,
         .expected_comma_after_arg,
-        // .expected_comma_after_param,
+        .expected_comma_after_param,
         // .expected_comma_after_initializer,
-        .expected_comma_after_match_prong,
+        // .expected_comma_after_match_prong,
         // .expected_comma_after_for_operand,
         // .expected_comma_after_capture,
         // .expected_token,
@@ -1031,10 +1389,10 @@ fn warnMsg(self: *Parser, msg: Ast.Error) Allocator.Error!void {
         // .expected_expr, // TODO: not prev?
         .expected_expr_or_assignment,
         // .expected_labelable,
-        // .expected_param_list,
+        .expected_param_list,
         .expected_prefix_expr,
         // .expected_primary_type_expr,
-        // .expected_suffix_op,
+        .expected_suffix_op,
         .expected_type_expr,
         // .expected_loop_payload,
         // .expected_container,
