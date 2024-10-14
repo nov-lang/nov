@@ -199,77 +199,34 @@ fn testMain(allocator: std.mem.Allocator) !u8 {
     const Nir = @import("Nir.zig");
 
     const source =
-        // \\@[attr(arg1, arg2, arg3)]
-        // \\@[attr(arg3)]
-        // \\@[attr]
-        \\let x = -123 * (45.67)
-        // \\let myFun: `(int) -> int = {}
-        \\
-        \\let x = @builtin(
-        \\    1 + 2,
-        \\    void
-        \\) * 3
-
-        // TODO: is this a problem?
-        // \\let init: `(name: string) -> MyStruct =
-        // \\    MyStruct{ .name = name }
+        \\let x = 1 + 1
+        \\let main: `() = {
+        \\    @println(x)
+        \\}
 
         //TODO: change parseArrayLiteral to allow that
         // \\let z = [ 1, 2, 3, 4 ].len
 
-        // // \\let a = 1 + 2 + 3 + 4
-        // // \\let a = 1 + 2 +
-        // // \\    3 + 4
-        // // \\let a = 1 + 2
-        // // \\    + 3 + 4
-        // \\let a = (
-        // \\    1 + 2 + 3
-        // \\    + 4
-        // \\)
-        // \\let s = (
-        // \\    "this is my string\n" +
-        // \\    "this is on a new line\n" +
-        // \\
-        // \\    "yes"
-        // \\)
-        // // \\
-        // // \\let sum = a + b
-        // // \\-sum
-        // \\
-
-        // \\let x = -3
-        // \\let pub mut y: int = 4
-        // \\let z = blk: {
-        // \\    let a = 3
-        // \\    if a == 3 {
-        // \\        break :blk 3 + 4
-        // \\    } else {
-        // \\        3 + 4
-        // \\    }
-        // \\    x + y
-        // \\}
-        // \\{}
-        // \\x + y
-        // \\
-
         // \\let cond = true
-        // \\if (cond) {
-        // \\    let mut x = "outer"
-        // \\    {
-        // \\        x = (x + " ") * 3
-        // \\        x *= 2
+        // \\let main = {
+        // \\    if (cond) {
+        // \\        let mut x = "outer"
+        // \\        {
+        // \\            x = (x + " ") * 3
+        // \\            x *= 2
+        // \\        }
+        // \\        print(x)
+        // \\    } else {
+        // \\        print("Hello world!")
         // \\    }
-        // \\    print(x)
-        // \\} else {
-        // \\    print("Hello world!")
-        // \\}
         // \\
-        // \\let mut i: int = 0
-        // \\for {
-        // \\    print(i)
-        // \\    i += 1
-        // \\    if (i == 10) {
-        // \\        break
+        // \\    let mut i: int = 0
+        // \\    for {
+        // \\        print(i)
+        // \\        i += 1
+        // \\        if (i == 10) {
+        // \\            break
+        // \\        }
         // \\    }
         // \\}
         // \\

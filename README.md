@@ -7,6 +7,7 @@ Nov type system is static, strong and sound. Also most types should be inferrabl
 Nov has uncolored async! (well not yet tho)
 
 Nov has automatic memory management via a minimal tracing GC.
+<!-- TODO: https://github.com/ivmai/bdwgc -->
 <!-- TODO: autofree https://docs.vlang.io/memory-management.html -->
 
 # TODO
@@ -101,14 +102,15 @@ Keep Nov away from:
   we don't want crash on arithmetic overflow
 - Replace `void` with `()`?
 - allow for default argument in function? (probably not)
-- fix multiline expression:
-  - current state is to bypass it in specific case or with a grouping expression
-  - add automatic `;` insertion to tokenizer or parser?
 - add regex pattern as builtin type?
 - [Switch Prongs Defined as Comptime-Known Arrays](https://github.com/ziglang/zig/issues/21507)
 - rename `for` to `loop`?
 - make all arrays/string 0 terminated
 - dependant types?
+- Replace ` for functions with \ or #?
+- Add `<=>` operator?
+- Remove `<<=` operator?
+- add `pop` keyword which works like return but for the current scope, same as a `break :blk`?
 
 ## Notes
 - Check std.zig.AstGen, std.zig.Zir and zig/src/Sema.zig for IR
@@ -413,6 +415,7 @@ TODO:
   - `let x = [1].repeat(50)` x is an array of 50 int with value 1
   - `let x = [@as(uint, 1)].repeat(50)` x is an array of 50 uint with value 1
   - `let x: []uint = [1].repeat(50)` x is an array of 50 uint with value 1
+- use zig/go synthax?
 
 See [1](https://docs.vlang.io/v-types.html#array-methods) [2](https://docs.vlang.io/v-types.html#array-method-chaining)
 ```nov
@@ -421,7 +424,7 @@ let mut my_array = [1, 2, 3]
 my_array.len == 3 ; true, should `len` be a function?
 my_array[0] == 1 ; true
 my_array[-1] == 3 ; true
-my_array << 5 ; push operator for arrays
+my_array <<= 5 ; push operator for arrays
 my_array |> @println ; prints [1, 2, 3, 5]
 my_array += [1, 1, 7 ]
 my_array |> @println ; prints [1, 2, 3, 5, 1, 1, 7]
@@ -547,13 +550,26 @@ for {
 let mut i = 0
 for i < 100 : i += 2 {
 }
+
+; else branch
+; the else branch is evaluated when the loop is not exited with a break
+let rangeHasNumber: `(begin: uint, end: uint, number: uint) -> bool = {
+    var i = begin;
+    return for i < end : i += 1 {
+        if i == number {
+            break true;
+        }
+    } else {
+        false;
+    }
+}
 ```
 
 ## Break & Continue
 TODO: same as zig
 
 ## Defer
-TODO: same as zig
+TODO: same as ~zig~ go
 
 ## In
 Check if an element is in an array or if it's a key in a map.
@@ -579,6 +595,7 @@ See also:
 
 ## Integers
 TODO
+- c_int, ...
 - u8, u16, u32, u64, u128, i8, i16, i32, i64, i128, f16, f32, f64, f80, f128
   - int = i32 or i64 based on architecture
   - uint = u32 or u64 based on architecture
@@ -591,52 +608,54 @@ TODO
 - `f64` - IEEE-754-2008 binary64
 - `f80` - IEEE-754-2008 80-bit extended precision
 - `f128` - IEEE-754-2008 binary128
-<!-- - `c_longdouble` - matches long double for the target C ABI -->
+- `c_longdouble` - matches long double for the target C ABI
 
 ## Operators
-| Name                  | Syntax            | Types                                        | Remarks                                                          |
-|-----------------------|-------------------|----------------------------------------------|------------------------------------------------------------------|
-| Assignment            | a = b             | All types                                    | `a` is an identifier and `b` is any type                         |
-| Addition              | a + b <br> a += b | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                             |
-| Concatenation         | a + b <br> a += b | string <br> [Arrays](#Arrays)                | TODO                                                             |
-| Substraction          | a - b <br> a -= b | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                             |
-| Negation              | -a                | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                             |
-| Multiplication        | a * b <br> a *= b | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                             |
-| Division              | a / b <br> a /= b | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                             |
-| Remainder Division    | a % b <br> a %= b | [Integers](#Integers)                        | TODO                                                             |
-| Bit Shift Left        | a << b            | [Integers](#Integers)                        | TODO                                                             |
-| Bit Shift Right       | a >> b            | [Integers](#Integers)                        | TODO                                                             |
-| Bitwise And           | a & b             | [Integers](#Integers)                        | TODO                                                             |
-| Bitwise Or            | a \| b            | [Integers](#Integers)                        | TODO                                                             |
-| Bitwise Xor           | a ^ b             | [Integers](#Integers)                        | TODO                                                             |
-| Bitwise Not           | ~a                | [Integers](#Integers)                        | TODO                                                             |
-| Optionify             | ?T                | All types                                    | Equivalent to Option(T)                                          |
-| Optional Unwrap       | a.?               | Option                                       | TODO                                                             |
-| Resultify             | E!T <br> !T       | All types                                    | Equivalent to Result(T, E) <br> Equivalent to Result(T, string)  |
-| Result Unwrap         | a.!               | Result                                       | TODO                                                             |
-| Logical And           | a **and** b       | bool                                         | TODO                                                             |
-| Logical Or            | a **or** b        | bool                                         | TODO                                                             |
-| Boolean Not           | !a                | bool                                         | TODO                                                             |
-| Equality              | a == b            | All types                                    | TODO                                                             |
-| Inequality            | a != b            | All types                                    | TODO                                                             |
-| Greater Than          | a > b             | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                             |
-| Greater or Equal      | a >= b            | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                             |
-| Less Than             | a < b             | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                             |
-| Less or Equal         | a <= b            | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                             |
-| Push                  | a << b            | [Arrays](#Arrays)                            | TODO []T << T                                                    |
-| Bind                  | a >>= \|b\| ...   | Monads                                       | TODO                                                             |
-| Function Pipe         | a \|> f           | [Functions](#Functions)                      | TODO                                                             |
-| Member Search         | a **in** b        | [Arrays](#Arrays) <br> Maps                  | TODO                                                             |
-| Access                | a\[b]             | [Arrays](#Arrays) <br> Maps <br> string      | TODO: for Arrays and string b is an Integer, for Maps it's a key |
-| Field / Method Access | a.b               | All types                                    | TODO                                                             |
+| Name                  | Syntax            | Types                                        | Remarks                                                             |
+|-----------------------|-------------------|----------------------------------------------|---------------------------------------------------------------------|
+| Assignment            | a = b             | All types                                    | `a` is an identifier and `b` is any type.                           |
+| Addition              | a + b <br> a += b | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                                |
+| Concatenation         | a + b <br> a += b | string <br> [Arrays](#Arrays)                | TODO                                                                |
+| Substraction          | a - b <br> a -= b | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                                |
+| Negation              | -a                | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                                |
+| Multiplication        | a * b <br> a *= b | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                                |
+| Division              | a / b <br> a /= b | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                                |
+| Remainder Division    | a % b <br> a %= b | [Integers](#Integers)                        | TODO                                                                |
+| Bit Shift Left        | a << b            | [Integers](#Integers)                        | TODO                                                                |
+| Bit Shift Right       | a >> b            | [Integers](#Integers)                        | TODO                                                                |
+| Bitwise And           | a & b             | [Integers](#Integers)                        | TODO                                                                |
+| Bitwise Or            | a \| b            | [Integers](#Integers)                        | TODO                                                                |
+| Bitwise Xor           | a ^ b             | [Integers](#Integers)                        | TODO                                                                |
+| Bitwise Not           | ~a                | [Integers](#Integers)                        | TODO                                                                |
+| Optionify             | ?T                | All types                                    | Equivalent to Option(T)                                             |
+| Optional Unwrap       | a.?               | Option                                       | Unwrap an Option type or return it's error.                         |
+| Resultify             | E!T <br> !T       | All types                                    | Equivalent to Result(T, E) <br> Equivalent to Result(T, string).    |
+| Result Unwrap         | a.!               | Result                                       | Unwrap a Result type or return it's error. (same as `try` in zig)   |
+| Logical And           | a **and** b       | bool                                         | TODO                                                                |
+| Logical Or            | a **or** b        | bool                                         | TODO                                                                |
+| Boolean Not           | !a                | bool                                         | TODO                                                                |
+| Equality              | a == b            | All types                                    | TODO                                                                |
+| Inequality            | a != b            | All types                                    | TODO                                                                |
+| Greater Than          | a > b             | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                                |
+| Greater or Equal      | a >= b            | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                                |
+| Less Than             | a < b             | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                                |
+| Less or Equal         | a <= b            | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                                |
+| Push                  | a <<= b           | [Arrays](#Arrays)                            | TODO []T <<= T                                                      |
+| Bind                  | a >>= \|b\| ...   | Monads                                       | TODO                                                                |
+| Function Pipe         | a \|> f           | [Functions](#Functions)                      | TODO                                                                |
+| Member Search         | a **in** b        | [Arrays](#Arrays) <br> Maps                  | TODO                                                                |
+| Access                | a\[b]             | [Arrays](#Arrays) <br> Maps <br> string      | TODO: for Arrays and string b is an Integer, for Maps it's a key    |
+| Field / Method Access | a.b               | All types                                    | TODO                                                                |
+| Reference Type        | *T                | All types                                    | Create a reference type from `T`.                                   |
+| Reference Of          | &a                | All types                                    | Returns a reference to `a`.                                         |
+| Dereference           | a.*               | Reference                                    | Unwrap a reference type, this is done automatically when using `.`. |
 
 ## Precedence
-last `<<` is push
 ```
-x() x[] x.y x.? x.!
+x() x[] x.y x.? x.! x.*
 E!T
 x{}
-!x -x ~x ?T
+!x -x ~x &x *T ?T
 * / %
 + -
 << >>
@@ -645,26 +664,26 @@ x{}
 and
 or
 |> >>=
-= *= /= %= += -= <<
+= *= /= %= += -= <<=
 ```
 
 ## Operator Overloading
 Operator overloading is possible on the following operators:
-- `+`: (T, T) -> T
-- `-`: (T, T) -> T
-- `-`: (T) -> T    unary negation (is it possible to autogen it from the binary op?)
-- `*`: (T, T) -> T
-- `/`: (T, T) -> T
-- `%`: (T, T) -> T
-- `<`: (T, T) -> bool
-- `==`: (T, T) -> bool
-- TODO: `>>=`: (T, (T) -> U) -> U
-- TODO: `[]`: (T, int) -> U
+- `+`: `(T, T) -> T
+- `-`: `(T, T) -> T
+- `-`: `(T) -> T    unary negation (is it possible to autogen it from the binary op?)
+- `*`: `(T, T) -> T
+- `/`: `(T, T) -> T
+- `%`: `(T, T) -> T
+- `<`: `(T, T) -> bool
+- `==`: `(T, T) -> bool
+- TODO: `>>=`: \`(T, `(T) -> U) -> U
+- TODO: `[]`: `(T\<U>, int) -> U
 
 Note:
 - `==` is automatically generated for all types by the compiler but can be overridden.
 - `!=`, `>`, `<=`, `>=` are automatically generated when `==` and `<` are defined.
-- `+=`, `-=`... are automatically generated when the corresponding operator is defined.
+- `+=`, `-=`, `*=`, `/=`, `%=` are automatically generated when the corresponding operator is defined.
 ```nov
 let Complex = struct {
     re: float
@@ -698,26 +717,13 @@ TODO...
 also add binding generator for zig?
 ```nov
 @[extern("malloc")]
-let c_malloc(uint) -> voidptr
+let c_malloc: `(uint) -> voidptr
 
 @[extern("malloc")]
-let c_malloc(uint) -> voidptr = {} ; error extern fn can't have body
-```
+let c_malloc: `(uint) -> voidptr = {} ; error extern fn can't have body
 
-### Multiline string literal
-```nov
-; Multiline string literal used to be like zig e.g.
-let s =
-    \\this my string
-    \\this is on a new line
-    \\yes
-
-; but now it was replaced with grouped expression & string `+` operator
-let s = (
-    "this is my string\n" +
-    "this is on a new line\n" +
-    "yes"
-)
+@[export("nov_add")]
+let add: `(a: c_int, b: c_int) -> c_int = a + b
 ```
 
 ## String Interpolation

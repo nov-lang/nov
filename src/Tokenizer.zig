@@ -46,6 +46,7 @@ pub const Token = struct {
         l_angle_bracket,
         l_angle_bracket_equal,
         l_angle_bracket_angle_bracket,
+        l_angle_bracket_angle_bracket_equal,
         r_angle_bracket,
         r_angle_bracket_equal,
         r_angle_bracket_angle_bracket,
@@ -79,6 +80,8 @@ pub const Token = struct {
         keyword_break,
         keyword_continue,
         keyword_in,
+        keyword_defer,
+        keyword_unreachable,
         // unused reserved keywords
         keyword_async,
         keyword_await,
@@ -89,9 +92,7 @@ pub const Token = struct {
         keyword_enum,
         keyword_struct,
         keyword_union,
-        keyword_defer,
         keyword_is,
-        keyword_unreachable,
 
         pub fn lexeme(tag: Tag) ?[]const u8 {
             return switch (tag) {
@@ -127,6 +128,7 @@ pub const Token = struct {
                 .l_angle_bracket => "<",
                 .l_angle_bracket_equal => "<=",
                 .l_angle_bracket_angle_bracket => "<<",
+                .l_angle_bracket_angle_bracket_equal => "<<=",
                 .r_angle_bracket => ">",
                 .r_angle_bracket_equal => ">=",
                 .r_angle_bracket_angle_bracket => ">>",
@@ -177,7 +179,7 @@ pub const Token = struct {
 
         pub fn symbol(tag: Tag) []const u8 {
             if (tag == .newline) {
-                return "\\n";
+                return "a new line";
             }
 
             return tag.lexeme() orelse switch (tag) {
@@ -255,6 +257,7 @@ const State = enum {
     minus,
     slash,
     l_angle_bracket,
+    l_angle_bracket_angle_bracket,
     r_angle_bracket,
     r_angle_bracket_angle_bracket,
     period,
@@ -545,15 +548,22 @@ pub fn next(self: *Tokenizer) Token {
         .l_angle_bracket => {
             self.index += 1;
             switch (self.buffer[self.index]) {
-                '<' => {
-                    result.tag = .l_angle_bracket_angle_bracket;
-                    self.index += 1;
-                },
+                '<' => continue :state .l_angle_bracket_angle_bracket,
                 '=' => {
                     result.tag = .l_angle_bracket_equal;
                     self.index += 1;
                 },
                 else => result.tag = .l_angle_bracket,
+            }
+        },
+        .l_angle_bracket_angle_bracket => {
+            self.index += 1;
+            switch (self.buffer[self.index]) {
+                '=' => {
+                    result.tag = .l_angle_bracket_angle_bracket_equal;
+                    self.index += 1;
+                },
+                else => result.tag = .l_angle_bracket_angle_bracket,
             }
         },
         .r_angle_bracket => {

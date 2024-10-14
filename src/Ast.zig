@@ -290,6 +290,9 @@ pub fn renderError(self: Ast, parse_error: Error, writer: anytype) !void {
         .invalid_ampersand_ampersand => {
             return writer.writeAll("ambiguous use of '&&'; use 'and' for logical AND, or change whitespace to ' & &' for bitwise AND");
         },
+        .ambiguous_unary_operator => {
+            return writer.print("unary operator `{s}` is ambiguous; remove a new line to make it binary or add a new line.", .{token_tags[parse_error.token].lexeme().?});
+        },
         .nov_style_container => {
             return writer.print("to declare a container do 'let {s} = {s}'", .{
                 self.tokenSlice(parse_error.token), parse_error.extra.expected_tag.symbol(),
@@ -382,11 +385,6 @@ pub fn firstToken(self: Ast, node: Node.Index) TokenIndex {
         .assign_mod,
         .assign_add,
         .assign_sub,
-        .assign_shl,
-        .assign_shr,
-        .assign_bit_and,
-        .assign_bit_xor,
-        .assign_bit_or,
         .assign,
         .mul,
         .div,
@@ -404,6 +402,9 @@ pub fn firstToken(self: Ast, node: Node.Index) TokenIndex {
         .call,
         .match_range,
         .function_pipe,
+        .push,
+        .bind,
+        .in,
         .attr_decl_one,
         .slice_open,
         .slice,
@@ -462,11 +463,6 @@ pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
         .assign_mod,
         .assign_add,
         .assign_sub,
-        .assign_shl,
-        .assign_shr,
-        .assign_bit_and,
-        .assign_bit_xor,
-        .assign_bit_or,
         .assign,
         .mul,
         .div,
@@ -485,6 +481,9 @@ pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
         .match_case,
         .match_range,
         .function_pipe,
+        .push,
+        .bind,
+        .in,
         .decl,
         .attr_decl_one,
         .attr_decl,
@@ -1023,6 +1022,7 @@ pub const Error = struct {
         attr_without_args,
         mismatched_binary_op_whitespace,
         invalid_ampersand_ampersand,
+        ambiguous_unary_operator,
         same_line_doc_comment,
         unattached_doc_comment,
         nov_style_container,
@@ -1111,19 +1111,9 @@ pub const Node = struct {
         assign_add,
         /// `lhs -= rhs`. main_token is op.
         assign_sub,
-        /// `lhs <<= rhs`. main_token is op.
-        assign_shl,
-        /// `lhs >>= rhs`. main_token is op.
-        assign_shr,
-        /// `lhs &= rhs`. main_token is op.
-        assign_bit_and,
-        /// `lhs ^= rhs`. main_token is op.
-        assign_bit_xor,
-        /// `lhs |= rhs`. main_token is op.
-        assign_bit_or,
         /// `lhs = rhs`. main_token is op.
         assign,
-        // TODO: multi_assign (assign_destructure in zig), WE DO NOT HAVE TUPLES!
+        // TODO: multi_assign (assign_destructure in zig), WE DO NOT HAVE TUPLES!?
         // a, b = x, y
         // how to return multiple values from a function if we do not have tuples?
         /// `lhs * rhs`. main_token is op.
@@ -1148,6 +1138,13 @@ pub const Node = struct {
         bit_or,
         /// `lhs |> rhs`. main_token is op.
         function_pipe,
+        /// `lhs <<= rhs`. main_token is op.
+        push,
+        // TODO: lhs >>= |args| expr
+        /// `lhs >>= rhs`. main_token is op.
+        bind,
+        // `lhs in rhs`. main_token is op.
+        in,
         /// `lhs and rhs`. main_token is op.
         bool_and,
         /// `lhs or rhs`. main_token is op.
@@ -1207,8 +1204,10 @@ pub const Node = struct {
         /// `break :lhs rhs`
         /// lhs and rhs may be omitted.
         @"break",
-        /// `return lhs`. lhs can be omitted. rhs is unused.
+        /// `return rhs`. rhs can be omitted. lhs is unused.
         @"return",
+        // `defer rhs`. rhs is the deferred expression. lhs is unused.
+        @"defer",
         /// `BACKTICK(a: lhs) -> rhs`.
         /// lhs and rhs can be omitted.
         /// main_token is the BACKTICK (`).
@@ -1251,9 +1250,6 @@ pub const Node = struct {
         /// `{}`. `sub_list[lhs..rhs]`.
         /// main_token points at the lbrace.
         block,
-        /// lhs is unused.
-        /// rhs is the deferred expression.
-        @"defer",
         /// `lhs!rhs`. main_token is the `!`.
         result_union,
         // TODO: struct, enum, container, class idk, generics too

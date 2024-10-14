@@ -1,16 +1,7 @@
 // Originally based on https://github.com/ziglang/zig/blob/master/lib/std/zig/Parse.zig
 // See https://github.com/ziglang/zig/blob/master/LICENSE for additional LICENSE details
 
-// TODO: (add tests)
-// let a = 1 + 2 ; no error, terminator is '\n'
-// let a = 1 + 2 + ; error: expected expression, found '\n'
-//     4 + 5
-// let a = 1 + 2
-//    + 4 + 5 ; error: expected expression, found '+'
-// let a = (
-//     1 + 2 + ; no error, we ignore newlines and the expr ends on ')\n'
-//     3 + 4
-// )
+// TODO
 // let x = [ 1, 2, ] ; no error, terminator is ']\n'
 // let x = [
 //     1,
@@ -22,7 +13,6 @@
 //     .b = 2,
 // } ; no error, we ignore newlines and the expr ends on '}\n'
 // ; note that it's fine to have a trailing comma in a struct literal
-// TODO: just do what go does?
 
 const std = @import("std");
 const Tokenizer = @import("Tokenizer.zig");
@@ -45,7 +35,6 @@ nodes: Ast.NodeList,
 extra_data: std.ArrayListUnmanaged(Node.Index),
 errors: std.ArrayListUnmanaged(Ast.Error),
 scratch: std.ArrayListUnmanaged(Node.Index),
-ignore_newlines: bool,
 
 pub fn parse(allocator: Allocator, source: [:0]const u8) Allocator.Error!Ast {
     var tokens: Ast.TokenList = .{};
@@ -77,7 +66,6 @@ pub fn parse(allocator: Allocator, source: [:0]const u8) Allocator.Error!Ast {
         .extra_data = .{},
         .errors = .{},
         .scratch = .{},
-        .ignore_newlines = false,
     };
     defer parser.nodes.deinit(allocator);
     defer parser.extra_data.deinit(allocator);
@@ -280,20 +268,22 @@ fn expectExpr(self: *Parser) Error!Node.Index {
 
 const Precedence = enum(i8) {
     none = -1,
-    assignment = 0,
-    // range
-    piped_call = 10,
-    bool_or = 20,
-    bool_and = 30,
-    comparison = 40,
-    bitwise = 50,
-    shift = 60,
-    term = 70,
-    factor = 80,
-    // as / cast
-    unary = 90,
-    call = 100,
-    primary = 110,
+    assignment = 0, // = *= /= %= += -= <<=
+    piped_call = 10, // |> >>=
+    bool_or = 20, // or
+    bool_and = 30, // and
+    comparison = 40, // == != < > <= >=
+    bitwise = 50, // & ^ | in
+    shift = 60, // << >>
+    term = 70, // + -
+    factor = 80, // * / %
+
+    unary, // !x -x ~x &x *T ?T
+    curly_suffix, // x{}
+    result_union, // E!T
+    call, // x() x[] x.y x.? x.! x.*
+    primary, // literals, identifiers, (expr)
+
     _,
 };
 
@@ -311,6 +301,7 @@ const Rule = struct {
 
 const rules = std.enums.directEnumArrayDefault(Token.Tag, Rule, .{ .prec = .none, .tag = .root }, 0, .{
     .pipe_arrow = .{ .prec = .piped_call, .tag = .function_pipe },
+    .r_angle_bracket_angle_bracket_equal = .{ .prec = .piped_call, .tag = .bind },
 
     .keyword_or = .{ .prec = .bool_or, .tag = .bool_or },
 
@@ -326,6 +317,7 @@ const rules = std.enums.directEnumArrayDefault(Token.Tag, Rule, .{ .prec = .none
     .ampersand = .{ .prec = .bitwise, .tag = .bit_and },
     .caret = .{ .prec = .bitwise, .tag = .bit_xor },
     .pipe = .{ .prec = .bitwise, .tag = .bit_or },
+    .keyword_in = .{ .prec = .bitwise, .tag = .in },
 
     .l_angle_bracket_angle_bracket = .{ .prec = .shift, .tag = .shl },
     .r_angle_bracket_angle_bracket = .{ .prec = .shift, .tag = .shr },
@@ -338,8 +330,15 @@ const rules = std.enums.directEnumArrayDefault(Token.Tag, Rule, .{ .prec = .none
     .percent = .{ .prec = .factor, .tag = .mod },
 });
 
+// TODO: handle chained method call e.g.
+// let x = list
+//     .map()
+//     .filter()
+//     .reuduce()
 fn parseExprPrecedence(self: *Parser, min_prec: Precedence) Error!Node.Index {
     std.debug.assert(@intFromEnum(min_prec) >= 0);
+    // allow for `let x =\n1 +\n 2` but not `let x =\n\n1 + 2`
+    _ = self.eatToken(.newline);
     var node = try self.parsePrefixExpr();
     if (node == null_node) {
         return null_node;
@@ -348,9 +347,14 @@ fn parseExprPrecedence(self: *Parser, min_prec: Precedence) Error!Node.Index {
     var banned_prec: Precedence = .none;
 
     while (true) {
-        const tok_tag = self.currentTokenTag();
+        // allow for `let x = 1\n+ 2` but not `let x = 1\n\n+ 2`
+        const ate_newline = self.eatToken(.newline) != null;
+        const tok_tag = self.token_tags[self.tok_i];
         const rule = rules[@intFromEnum(tok_tag)];
         if (@intFromEnum(rule.prec) < @intFromEnum(min_prec)) {
+            if (ate_newline) {
+                self.tok_i -= 1;
+            }
             return node;
         }
         if (@intFromEnum(rule.prec) == @intFromEnum(banned_prec)) {
@@ -358,8 +362,26 @@ fn parseExprPrecedence(self: *Parser, min_prec: Precedence) Error!Node.Index {
         }
 
         const op_token = self.nextToken();
+        // since everything is an expression it's not possible to distinguish
+        // let add_neg: `(a: int, b: int) -> int = {
+        //     let sum = a + b
+        //     -sum
+        // }
+        // from
+        // let add_neg: `(a: int, b: int) -> int = {
+        //     let sum = a + b - sum
+        // }
+        // so we ask the user to add or remove a newline
+        if (ate_newline) switch (self.token_tags[op_token]) {
+            .minus, // a - b or -a
+            .ampersand, // a & b or &a
+            .asterisk, // a * b or *T
+            => try self.warnMsg(.{ .tag = .ambiguous_unary_operator, .token = op_token }),
+            else => {},
+        };
         const rhs = try self.parseExprPrecedence(@enumFromInt(@intFromEnum(rule.prec) + 1));
         if (rhs == null_node) {
+            // return self.fail(.expected_expr);
             try self.warn(.expected_expr);
             return node;
         }
@@ -395,7 +417,6 @@ fn parseExprPrecedence(self: *Parser, min_prec: Precedence) Error!Node.Index {
 /// PrefixExpr <- PrefixOp* PrimaryExpr
 /// PrefixOp <- EXCLAMATIONMARK / MINUS / TILDE / AMPERSAND
 fn parsePrefixExpr(self: *Parser) Error!Node.Index {
-    // an unary operator should never be on its own line so we don't use currentTokenTag()
     const tag: Node.Tag = switch (self.token_tags[self.tok_i]) {
         .bang => .bool_not,
         .minus => .negation,
@@ -434,7 +455,7 @@ fn expectPrefixExpr(self: *Parser) Error!Node.Index {
 // KEYWORD_nosuspend Expr
 // KEYWORD_resume Expr
 fn parsePrimaryExpr(self: *Parser) Error!Node.Index {
-    switch (self.currentTokenTag()) {
+    switch (self.token_tags[self.tok_i]) {
         .keyword_if => return self.parseIfExpr(),
         .keyword_break => return self.addNode(.{
             .tag = .@"break",
@@ -456,8 +477,16 @@ fn parsePrimaryExpr(self: *Parser) Error!Node.Index {
             .tag = .@"return",
             .main_token = self.nextToken(),
             .data = .{
-                .lhs = try self.parseExpr(),
-                .rhs = undefined,
+                .lhs = undefined,
+                .rhs = try self.parseExpr(),
+            },
+        }),
+        .keyword_defer => return self.addNode(.{
+            .tag = .@"defer",
+            .main_token = self.nextToken(),
+            .data = .{
+                .lhs = undefined,
+                .rhs = try self.expectExpr(),
             },
         }),
         .identifier => {
@@ -498,7 +527,8 @@ fn parseIfExpr(self: *Parser) Error!Node.Index {
     const condition = try self.expectExpr();
     const then_expr = try expectBlock(self);
 
-    if (self.eatToken(.keyword_else) == null) {
+    const else_expr = try self.parseElseExpr();
+    if (else_expr == null_node) {
         return self.addNode(.{
             .tag = .@"if",
             .main_token = if_token,
@@ -508,13 +538,6 @@ fn parseIfExpr(self: *Parser) Error!Node.Index {
             },
         });
     }
-
-    // an else if/block shouldn't be on a new line so we don't use currentTokenTag()
-    const else_expr = if (self.token_tags[self.tok_i] == .keyword_if)
-        try self.parseIfExpr()
-    else
-        try self.expectBlock();
-
     return self.addNode(.{
         .tag = .if_else,
         .main_token = if_token,
@@ -528,6 +551,15 @@ fn parseIfExpr(self: *Parser) Error!Node.Index {
     });
 }
 
+fn parseElseExpr(self: *Parser) Error!Node.Index {
+    return if (self.eatToken(.keyword_else) == null)
+        null_node
+    else if (self.token_tags[self.tok_i] == .keyword_if)
+        self.parseIfExpr()
+    else
+        self.expectBlock();
+}
+
 // TODO
 // for x in y
 // for x, y, z in a, b, c
@@ -537,6 +569,7 @@ fn parseIfExpr(self: *Parser) Error!Node.Index {
 // for x > 10
 // for {}
 // for i < 100 : i += 1
+// for ... {} else
 /// IfExpr <- KEYWORD_if Expr Block (KEYWORD_else (IfExpr / Block))?
 /// ForExpr <- KEYWORD_for ... Block
 /// ForEachInput <- IDENTIFIER+ KEYWORD_in (Expr (DOT2 Expr?)?)+
@@ -547,6 +580,48 @@ fn parseForExpr(self: *Parser) Error!Node.Index {
     unreachable;
 
     // const inputs = try self.parseForEachInput();
+}
+
+/// AssignExpr <- Expr (AssignOp Expr)?
+/// AssignOp
+///     <- ASTERISKEQUAL
+///      / SLASHEQUAL
+///      / PERCENTEQUAL
+///      / PLUSEQUAL
+///      / MINUSEQUAL
+///      / LARROW2EQUAL
+///      / EQUAL
+fn parseAssignExpr(self: *Parser) Error!Node.Index {
+    const lhs = try self.parseExpr();
+    if (lhs == null_node) {
+        return null_node;
+    }
+    // const tok = self.token_tags[self.tok_i];
+    // if (tok == .comma) {
+    //     // TODO: handle multi-assign
+    // }
+    const tag = assignOpNode(self.token_tags[self.tok_i]) orelse return lhs;
+    return self.addNode(.{
+        .tag = tag,
+        .main_token = self.nextToken(),
+        .data = .{
+            .lhs = lhs,
+            .rhs = try self.expectExpr(),
+        },
+    });
+}
+
+fn assignOpNode(tok: Token.Tag) ?Node.Tag {
+    return switch (tok) {
+        .asterisk_equal => .assign_mul,
+        .slash_equal => .assign_div,
+        .percent_equal => .assign_mod,
+        .plus_equal => .assign_add,
+        .minus_equal => .assign_sub,
+        .l_angle_bracket_angle_bracket_equal => .push,
+        .equal => .assign,
+        else => null,
+    };
 }
 
 /// Block <- LBRACE (Decl / ExprStmt)* Expr? RBRACE
@@ -574,7 +649,7 @@ fn parseBlock(self: *Parser) Error!Node.Index {
                 try self.scratch.append(self.allocator, decl);
             },
             else => {
-                const expr = try self.parseExpr();
+                const expr = try self.parseAssignExpr();
                 if (expr == null_node) {
                     try self.warn(.expected_expr);
                     self.findNextStmt();
@@ -727,7 +802,6 @@ fn parseCurlySuffixExpr(self: *Parser) Error!Node.Index {
 /// PrefixTypeOp <- QUESTIONMARK / AMPERSAND / ArrayTypeStart
 /// ArrayTypeStart <- LBRACKET RBRACKET
 fn parseTypeExpr(self: *Parser) Error!Node.Index {
-    // an unary operator should never be on its own line so we don't use currentTokenTag()
     switch (self.token_tags[self.tok_i]) {
         .question_mark => return self.addNode(.{
             .tag = .optional_type,
@@ -737,7 +811,7 @@ fn parseTypeExpr(self: *Parser) Error!Node.Index {
                 .rhs = try self.expectTypeExpr(),
             },
         }),
-        .ampersand => return self.addNode(.{
+        .asterisk => return self.addNode(.{
             .tag = .ref_type,
             .main_token = self.nextToken(),
             .data = .{
@@ -823,9 +897,8 @@ fn parseSuffixExpr(self: *Parser) Error!Node.Index {
 
 // TODO: add doc comment
 // TODO: complete all cases
-/// TupleTypeExpr <- LPAREN TypeExpr (COMMA TypeExpr)* RPAREN // TODO
 fn parsePrimaryTypeExpr(self: *Parser) Error!Node.Index {
-    switch (self.currentTokenTag()) {
+    switch (self.token_tags[self.tok_i]) {
         .keyword_unreachable => return self.addNode(.{
             .tag = .unreachable_literal,
             .main_token = self.nextToken(),
@@ -867,9 +940,9 @@ fn parsePrimaryTypeExpr(self: *Parser) Error!Node.Index {
             },
         }),
         .grave_accent => return self.parseFnProto(),
-        // .keyword_if => return self.parseIf(expectTypeExpr), // TODO: why separate expr and type expr?
+        // .keyword_if => return self.parseIf(expectTypeExpr), // do not add yet
+        // .keyword_for => return self.parseFor(expectTypeExpr) // do not add yet
         // .keyword_match => return self.expectMatchExpr(false), // TODO
-        // .keyword_for => return self.parseFor(expectTypeExpr), // TODO
         // TODO
         // .keyword_struct,
         // .keyword_opaque,
@@ -925,13 +998,11 @@ fn parsePrimaryTypeExpr(self: *Parser) Error!Node.Index {
             .tag = .grouped_expression,
             .main_token = self.nextToken(),
             .data = .{
-                .lhs = blk: {
-                    self.ignore_newlines = true;
-                    const expr = try self.expectExpr();
-                    self.ignore_newlines = false;
-                    break :blk expr;
+                .lhs = try self.expectExpr(),
+                .rhs = blk: {
+                    self.eatNewLines();
+                    break :blk try self.expectToken(.r_paren);
                 },
-                .rhs = try self.expectToken(.r_paren),
             },
         }),
         else => return null_node,
@@ -1136,7 +1207,8 @@ const SmallSpan = union(enum) {
     multi: Node.SubRange,
 };
 
-// this should handle new lines and commas correctly
+// this should ignore new lines and handle commas correctly
+// it's fine to ignore new lines since everything is comma separated
 fn parseList(
     self: *Parser,
     comptime ending_token_tag: Token.Tag,
@@ -1237,18 +1309,6 @@ fn nextToken(self: *Parser) TokenIndex {
     return result;
 }
 
-/// Returns current token tag
-/// If ignore_newlines is true, it skips newlines until it finds a non-newline token
-/// Use self.token_tags[self.tok_i] instead to avoid the check e.g. if it's
-/// guaranteed that the current token is not a newline or there shouldn't be a
-/// need to skip newlines
-fn currentTokenTag(self: *Parser) Token.Tag {
-    if (self.ignore_newlines) {
-        self.eatNewLines();
-    }
-    return self.token_tags[self.tok_i];
-}
-
 fn expectToken(self: *Parser, tag: Token.Tag) Error!TokenIndex {
     if (self.token_tags[self.tok_i] != tag) {
         return self.failExpected(tag);
@@ -1276,7 +1336,7 @@ fn tokensOnSameLine(self: *Parser, tok1: TokenIndex, tok2: TokenIndex) bool {
     return std.mem.indexOfScalar(u8, self.source[self.token_starts[tok1]..self.token_starts[tok2]], '\n') == null;
 }
 
-inline fn eatNewLines(self: *Parser) void {
+fn eatNewLines(self: *Parser) void {
     while (self.token_tags[self.tok_i] == .newline) {
         self.tok_i += 1;
     }
