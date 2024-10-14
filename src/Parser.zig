@@ -1,6 +1,7 @@
 // Originally based on https://github.com/ziglang/zig/blob/master/lib/std/zig/Parse.zig
 // See https://github.com/ziglang/zig/blob/master/LICENSE for additional LICENSE details
 
+// TODO: add eaten newlines to grammar
 // TODO
 // let x = [ 1, 2, ] ; no error, terminator is ']\n'
 // let x = [
@@ -255,11 +256,23 @@ fn parseDecl(self: *Parser) Error!Node.Index {
 }
 
 fn parseExpr(self: *Parser) Error!Node.Index {
-    return self.parseExprPrecedence(.assignment);
+    return self.parseExprPrecedence(.assignment, false);
 }
 
 fn expectExpr(self: *Parser) Error!Node.Index {
     const node = try self.parseExpr();
+    if (node == null_node) {
+        return self.fail(.expected_expr);
+    }
+    return node;
+}
+
+fn parseExprStrict(self: *Parser) Error!Node.Index {
+    return self.parseExprPrecedence(.assignment, true);
+}
+
+fn expectExprStrict(self: *Parser) Error!Node.Index {
+    const node = try self.parseExprStrict();
     if (node == null_node) {
         return self.fail(.expected_expr);
     }
@@ -335,10 +348,12 @@ const rules = std.enums.directEnumArrayDefault(Token.Tag, Rule, .{ .prec = .none
 //     .map()
 //     .filter()
 //     .reuduce()
-fn parseExprPrecedence(self: *Parser, min_prec: Precedence) Error!Node.Index {
+fn parseExprPrecedence(self: *Parser, min_prec: Precedence, strict: bool) Error!Node.Index {
     std.debug.assert(@intFromEnum(min_prec) >= 0);
-    // allow for `let x =\n1 +\n 2` but not `let x =\n\n1 + 2`
-    _ = self.eatToken(.newline);
+    if (!strict) {
+        // allow for `let x =\n1 +\n 2` but not `let x =\n\n1 + 2`
+        _ = self.eatToken(.newline);
+    }
     var node = try self.parsePrefixExpr();
     if (node == null_node) {
         return null_node;
@@ -348,7 +363,7 @@ fn parseExprPrecedence(self: *Parser, min_prec: Precedence) Error!Node.Index {
 
     while (true) {
         // allow for `let x = 1\n+ 2` but not `let x = 1\n\n+ 2`
-        const ate_newline = self.eatToken(.newline) != null;
+        const ate_newline = !strict and self.eatToken(.newline) != null;
         const tok_tag = self.token_tags[self.tok_i];
         const rule = rules[@intFromEnum(tok_tag)];
         if (@intFromEnum(rule.prec) < @intFromEnum(min_prec)) {
@@ -379,7 +394,7 @@ fn parseExprPrecedence(self: *Parser, min_prec: Precedence) Error!Node.Index {
             => try self.warnMsg(.{ .tag = .ambiguous_unary_operator, .token = op_token }),
             else => {},
         };
-        const rhs = try self.parseExprPrecedence(@enumFromInt(@intFromEnum(rule.prec) + 1));
+        const rhs = try self.parseExprPrecedence(@enumFromInt(@intFromEnum(rule.prec) + 1), strict);
         if (rhs == null_node) {
             // return self.fail(.expected_expr);
             try self.warn(.expected_expr);
@@ -486,7 +501,7 @@ fn parsePrimaryExpr(self: *Parser) Error!Node.Index {
             .main_token = self.nextToken(),
             .data = .{
                 .lhs = undefined,
-                .rhs = try self.expectExpr(),
+                .rhs = try self.expectSingleAssignExprStrict(),
             },
         }),
         .identifier => {
@@ -510,7 +525,7 @@ fn parsePrimaryExpr(self: *Parser) Error!Node.Index {
         .l_brace => return self.parseBlock(),
         .l_bracket => return self.parseArrayLiteral(), // TODO: move to parsePrimaryTypeExpr, make it like zig?
         // TODO: here?
-        // .keyword_match => return self.parseMatchExpr(),
+        .keyword_match => return self.parseMatchExpr(),
         else => return self.parseCurlySuffixExpr(),
     }
 }
@@ -611,6 +626,22 @@ fn parseAssignExpr(self: *Parser) Error!Node.Index {
     });
 }
 
+fn expectSingleAssignExprStrict(self: *Parser) Error!Node.Index {
+    const lhs = try self.parseExprStrict();
+    if (lhs == null_node) {
+        return self.fail(.expected_expr_or_assignment);
+    }
+    const tag = assignOpNode(self.token_tags[self.tok_i]) orelse return lhs;
+    return self.addNode(.{
+        .tag = tag,
+        .main_token = self.nextToken(),
+        .data = .{
+            .lhs = lhs,
+            .rhs = try self.expectExpr(),
+        },
+    });
+}
+
 fn assignOpNode(tok: Token.Tag) ?Node.Tag {
     return switch (tok) {
         .asterisk_equal => .assign_mul,
@@ -651,7 +682,7 @@ fn parseBlock(self: *Parser) Error!Node.Index {
             else => {
                 const expr = try self.parseAssignExpr();
                 if (expr == null_node) {
-                    try self.warn(.expected_expr);
+                    try self.warn(.expected_expr_or_assignment);
                     self.findNextStmt();
                     continue;
                 }
@@ -709,6 +740,154 @@ fn expectBlock(self: *Parser) Error!Node.Index {
         return self.fail(.expected_block);
     }
     return block;
+}
+
+// TODO: handle match on multiple values (tuple?)
+// TODO: improve error messages
+/// MatchExpr <- KEYWORD_match Expr LBRACE MatchProngList RBRACE
+/// MatchProngList <- (MatchProng NEWLINE)*
+// MatchProngList <- (NEWLINE* MatchProng NEWLINE+)*
+fn parseMatchExpr(self: *Parser) Error!Node.Index {
+    const match_token = self.assertToken(.keyword_match);
+    const expr = try self.expectExpr();
+    _ = try self.expectToken(.l_brace);
+
+    const scratch_top = self.scratch.items.len;
+    defer self.scratch.shrinkRetainingCapacity(scratch_top);
+    // eat newlines to allow for
+    // match x {
+    //     1 => 1
+    //
+    //     2 => 2
+    // }
+    var newline = true;
+    sw: switch (self.token_tags[self.tok_i]) {
+        .r_brace => self.tok_i += 1, // break
+        .newline => {
+            self.tok_i += 1;
+            newline = true;
+            continue :sw self.token_tags[self.tok_i];
+        },
+        else => {
+            if (!newline) {
+                try self.warn(.expected_newline_after_match_prong);
+            }
+            const item = try self.parseMatchProng();
+            if (item != null_node) {
+                try self.scratch.append(self.allocator, item);
+                newline = false;
+                continue :sw self.token_tags[self.tok_i];
+            }
+        },
+    }
+    const cases = try self.listToSpan(self.scratch.items[scratch_top..]);
+
+    return self.addNode(.{
+        .tag = .match,
+        .main_token = match_token,
+        .data = .{
+            .lhs = expr,
+            .rhs = try self.addExtra(cases),
+        },
+    });
+}
+
+/// MatchProng <- MatchCase EQUALARROW MatchCasePayload? AssignExpr
+/// MatchCasePayload <- PIPE AMPERSAND? IDENTIFIER PIPE
+/// MatchCase <- MatchItem (COMMA MatchItem)* COMMA?
+fn parseMatchProng(self: *Parser) Error!Node.Index {
+    const scratch_top = self.scratch.items.len;
+    defer self.scratch.shrinkRetainingCapacity(scratch_top);
+
+    // eat newlines to allow for
+    // match x {
+    //     1,
+    //     2,
+    //     => idk
+    // }
+    var comma = true;
+    sw: switch (self.token_tags[self.tok_i]) {
+        .newline => {
+            self.tok_i += 1;
+            continue :sw self.token_tags[self.tok_i];
+        },
+        .comma => {
+            self.tok_i += 1;
+            comma = true;
+            continue :sw self.token_tags[self.tok_i];
+        },
+        else => {
+            if (comma) {
+                const item = try self.parseMatchItem();
+                if (item != null_node) {
+                    comma = false;
+                    try self.scratch.append(self.allocator, item);
+                    continue :sw self.token_tags[self.tok_i];
+                }
+            }
+        },
+    }
+    // old behavior that doesn't eat newlines
+    // while (true) {
+    //     const item = try self.parseMatchItem();
+    //     if (item == null_node) {
+    //         break;
+    //     }
+    //     try self.scratch.append(self.allocator, item);
+    //     if (self.eatToken(.comma) == null) break;
+    // }
+    if (scratch_top == self.scratch.items.len) {
+        return null_node;
+    }
+    const arrow_token = try self.expectToken(.equal_arrow);
+
+    if (self.eatToken(.pipe) != null) {
+        _ = self.eatToken(.ampersand);
+        _ = try self.expectToken(.identifier);
+        _ = try self.expectToken(.pipe);
+    }
+
+    const items = self.scratch.items[scratch_top..];
+    switch (items.len) {
+        0 => unreachable,
+        1 => return self.addNode(.{
+            .tag = .match_case_one,
+            .main_token = arrow_token,
+            .data = .{
+                .lhs = items[0],
+                .rhs = try self.expectSingleAssignExprStrict(),
+            },
+        }),
+        else => return self.addNode(.{
+            .tag = .match_case,
+            .main_token = arrow_token,
+            .data = .{
+                .lhs = try self.addExtra(try self.listToSpan(items)),
+                .rhs = try self.expectSingleAssignExprStrict(),
+            },
+        }),
+    }
+}
+
+// TODO: change to DOT3
+/// MatchItem <- Expr (DOT2 Expr)?
+fn parseMatchItem(self: *Parser) Error!Node.Index {
+    const expr = try self.parseExprStrict();
+    if (expr == null_node) {
+        return null_node;
+    }
+
+    if (self.eatToken(.ellipsis2)) |token| {
+        return self.addNode(.{
+            .tag = .match_range,
+            .main_token = token,
+            .data = .{
+                .lhs = expr,
+                .rhs = try self.expectExprStrict(),
+            },
+        });
+    }
+    return expr;
 }
 
 // TODO: use parseList or make it more like parseBlock, this is too long
@@ -815,7 +994,7 @@ fn parseTypeExpr(self: *Parser) Error!Node.Index {
             .tag = .ref_type,
             .main_token = self.nextToken(),
             .data = .{
-                .lhs = undefined,
+                .lhs = self.eatToken(.keyword_mut) orelse 0,
                 .rhs = try self.expectTypeExpr(),
             },
         }),
@@ -942,7 +1121,7 @@ fn parsePrimaryTypeExpr(self: *Parser) Error!Node.Index {
         .grave_accent => return self.parseFnProto(),
         // .keyword_if => return self.parseIf(expectTypeExpr), // do not add yet
         // .keyword_for => return self.parseFor(expectTypeExpr) // do not add yet
-        // .keyword_match => return self.expectMatchExpr(false), // TODO
+        // .keyword_match => return self.parseMatchExpr(), // do not add yet
         // TODO
         // .keyword_struct,
         // .keyword_opaque,
@@ -955,10 +1134,6 @@ fn parsePrimaryTypeExpr(self: *Parser) Error!Node.Index {
                 // .keyword_for => {
                 //     self.tok_i += 2;
                 //     return self.parseFor(expectTypeExpr);
-                // },
-                // .keyword_match => {
-                //     self.tok_i += 2;
-                //     return self.expectMatchExpr(true);
                 // },
                 .l_brace => {
                     self.tok_i += 2;

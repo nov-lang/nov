@@ -1,8 +1,6 @@
-let fibo: `(n: int) -> int = {
-    match n {
-        0, 1 => n
-        _ => fibo(n - 1) + fibo(n - 2)
-    }
+let fibo: `(n: int) -> int = match n {
+    0, 1 => n
+    _ => fibo(n - 1) + fibo(n - 2)
 }
 
 let main: `() = 10 |> fibo |> @println

@@ -410,16 +410,8 @@ pub fn firstToken(self: Ast, node: Node.Index) TokenIndex {
         .slice,
         .array_access,
         .result_union,
+        .match_case_one,
         => n = datas[n].lhs,
-
-        .match_case_one => {
-            // TODO
-            if (datas[n].lhs == 0) {
-                return main_tokens[n] - 1; // underscore token
-            } else {
-                n = datas[n].lhs;
-            }
-        },
 
         .match_case,
         .attr_decl,
@@ -593,6 +585,16 @@ pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
             assert(extra.end != 0); // should have used slice_open
             end_offset += 1; // for the rbracket
             n = extra.end;
+        },
+
+        .match => {
+            const cases = self.extraData(datas[n].rhs, Node.SubRange);
+            end_offset += 1; // rbrace
+            if (cases.end - cases.start == 0) {
+                n = datas[n].lhs; // cond expr
+            } else {
+                n = self.extra_data[cases.end - 1]; // last case
+            }
         },
     };
 }
@@ -1157,7 +1159,9 @@ pub const Node = struct {
         bit_not,
         /// `&rhs`. lhs unused. main_token is op.
         ref_of,
-        /// `&rhs`. lhs unused. main_token is the `&`.
+        /// `*mut rhs`.
+        /// main_token is the `*`.
+        /// lhs is the `mut` token index if any.
         ref_type,
         /// `?rhs`. lhs unused. main_token is the `?`.
         optional_type,
@@ -1186,7 +1190,7 @@ pub const Node = struct {
         call,
         /// `match lhs {}`. `SubRange[rhs]`.
         match,
-        /// `lhs => rhs`. If lhs is omitted it means `_`.
+        /// `lhs => rhs`.
         /// main_token is the `=>`
         match_case_one,
         /// `a, b, c => rhs`. `SubRange[lhs]`.

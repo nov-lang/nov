@@ -45,9 +45,6 @@ Keep Nov away from:
 - Really low level stuff aka assembly, kernel or drivers. Use zig instead.
 
 ## Proposals and stuff to add
-- make all variable constant, all functions pure and remove mut keyword (obviously)
-  - which specific case would be lost by not having mutable values?
-  - the compiler (or vm?) can perform mutation where it's guarented to have no side effect
 - modes / arg options:
   - no arg: same as build
   - build: output a compiled file
@@ -111,6 +108,7 @@ Keep Nov away from:
 - Add `<=>` operator?
 - Remove `<<=` operator?
 - add `pop` keyword which works like return but for the current scope, same as a `break :blk`?
+- just do like zig for assign destructure and tuples?
 
 ## Notes
 - Check std.zig.AstGen, std.zig.Zir and zig/src/Sema.zig for IR
@@ -164,9 +162,9 @@ TODO: variable number of parameters? (just use an array)
 ; signature: `() -> void
 let doNothing: `() = {}
 
-; here x is passed by reference
-; signature: `(&int) -> void
-let retNothing: `(x: &int) = {
+; here x is passed as reference and its value is mutable
+; signature: `(*mut int) -> void
+let retNothing: `(x: *mut int) = {
     x += 1
 }
 
@@ -611,6 +609,7 @@ TODO
 - `c_longdouble` - matches long double for the target C ABI
 
 ## Operators
+<!-- Yes this is not really lisible as raw text -->
 | Name                  | Syntax            | Types                                        | Remarks                                                             |
 |-----------------------|-------------------|----------------------------------------------|---------------------------------------------------------------------|
 | Assignment            | a = b             | All types                                    | `a` is an identifier and `b` is any type.                           |
@@ -646,7 +645,7 @@ TODO
 | Member Search         | a **in** b        | [Arrays](#Arrays) <br> Maps                  | TODO                                                                |
 | Access                | a\[b]             | [Arrays](#Arrays) <br> Maps <br> string      | TODO: for Arrays and string b is an Integer, for Maps it's a key    |
 | Field / Method Access | a.b               | All types                                    | TODO                                                                |
-| Reference Type        | *T                | All types                                    | Create a reference type from `T`.                                   |
+| Reference Type        | *T <br> *mut T    | All types                                    | Create a reference type from `T`. Unless `mut` is specified the wrapped value is constant |
 | Reference Of          | &a                | All types                                    | Returns a reference to `a`.                                         |
 | Dereference           | a.*               | Reference                                    | Unwrap a reference type, this is done automatically when using `.`. |
 

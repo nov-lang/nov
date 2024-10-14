@@ -199,7 +199,7 @@ fn testMain(allocator: std.mem.Allocator) !u8 {
     const Nir = @import("Nir.zig");
 
     const source =
-        \\let x = 1 + 1
+        \\let x: *mut int = 1 + 1
         \\let main: `() = {
         \\    @println(x)
         \\}
