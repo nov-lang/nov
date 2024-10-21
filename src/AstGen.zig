@@ -2288,7 +2288,6 @@ const NirGen = struct {
 
     /// TODO all uses of this should be replaced with uses of `endsWithNoReturn`.
     fn refIsNoReturn(self: NirGen, inst_ref: Nir.Inst.Ref) bool {
-        if (inst_ref == .unreachable_value) return true;
         if (inst_ref.toIndex()) |inst_index| {
             return self.astgen.instructions.items(.tag)[@intFromEnum(inst_index)].isNoReturn();
         }

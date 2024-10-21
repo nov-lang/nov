@@ -154,7 +154,6 @@ pub const Inst = struct {
                 // .ret_load,
                 // .ret_implicit,
                 // .ret_err_value,
-                // .@"unreachable",
                 // .repeat,
                 // .repeat_inline,
                 // .panic,
@@ -282,7 +281,6 @@ pub const Inst = struct {
         one,
         negative_one,
         void_value,
-        unreachable_value,
         bool_true,
         bool_false,
 
@@ -397,11 +395,6 @@ pub const Inst = struct {
             signedness: std.builtin.Signedness,
             bit_count: u16,
         },
-        @"unreachable": struct {
-            /// Offset from Decl AST node index.
-            /// `Tag` determines which kind of AST node this points to.
-            src_node: i32,
-        },
         @"break": struct {
             operand: Ref,
             /// Index of a `Break` payload.
@@ -477,7 +470,6 @@ pub const Inst = struct {
             float,
             ptr_type,
             int_type,
-            @"unreachable",
             @"break",
             dbg_stmt,
             inst_node,

@@ -281,7 +281,7 @@ fn expectExprStrict(self: *Parser) Error!Node.Index {
 
 const Precedence = enum(i8) {
     none = -1,
-    assignment = 0, // = *= /= %= += -= <<=
+    assignment = 0, // = *= /= %= += -=
     piped_call = 10, // |> >>=
     bool_or = 20, // or
     bool_and = 30, // and
@@ -649,7 +649,6 @@ fn assignOpNode(tok: Token.Tag) ?Node.Tag {
         .percent_equal => .assign_mod,
         .plus_equal => .assign_add,
         .minus_equal => .assign_sub,
-        .l_angle_bracket_angle_bracket_equal => .push,
         .equal => .assign,
         else => null,
     };
@@ -1078,14 +1077,6 @@ fn parseSuffixExpr(self: *Parser) Error!Node.Index {
 // TODO: complete all cases
 fn parsePrimaryTypeExpr(self: *Parser) Error!Node.Index {
     switch (self.token_tags[self.tok_i]) {
-        .keyword_unreachable => return self.addNode(.{
-            .tag = .unreachable_literal,
-            .main_token = self.nextToken(),
-            .data = .{
-                .lhs = undefined,
-                .rhs = undefined,
-            },
-        }),
         .number_literal => return self.addNode(.{
             .tag = .number_literal,
             .main_token = self.nextToken(),
@@ -1459,10 +1450,9 @@ fn unreserveNode(self: *Parser, node_index: usize) void {
     if (self.nodes.len == node_index) {
         self.nodes.resize(self.allocator, self.nodes.len - 1) catch unreachable;
     } else {
-        // There is zombie node left in the tree, let's make it as inoffensive as possible
-        // (sadly there's no no-op node)
-        self.nodes.items(.tag)[node_index] = .unreachable_literal;
-        self.nodes.items(.main_token)[node_index] = self.tok_i;
+        // There is a zombie node left in the tree
+        // self.nodes.items(.tag)[node_index] = .no_op;
+        // self.nodes.items(.main_token)[node_index] = self.tok_i;
     }
 }
 

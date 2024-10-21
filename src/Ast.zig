@@ -351,7 +351,6 @@ pub fn firstToken(self: Ast, node: Node.Index) TokenIndex {
         .number_literal,
         .char_literal,
         .string_literal,
-        .unreachable_literal,
         .builtin_literal,
         .grouped_expression,
         .block_two,
@@ -402,7 +401,6 @@ pub fn firstToken(self: Ast, node: Node.Index) TokenIndex {
         .call,
         .match_range,
         .function_pipe,
-        .push,
         .bind,
         .in,
         .attr_decl_one,
@@ -473,7 +471,6 @@ pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
         .match_case,
         .match_range,
         .function_pipe,
-        .push,
         .bind,
         .in,
         .decl,
@@ -495,7 +492,6 @@ pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
         .char_literal,
         .identifier,
         .string_literal,
-        .unreachable_literal,
         .enum_literal,
         .builtin_literal,
         => return main_tokens[n] + end_offset,
@@ -1140,8 +1136,6 @@ pub const Node = struct {
         bit_or,
         /// `lhs |> rhs`. main_token is op.
         function_pipe,
-        /// `lhs <<= rhs`. main_token is op.
-        push,
         // TODO: lhs >>= |args| expr
         /// `lhs >>= rhs`. main_token is op.
         bind,
@@ -1230,8 +1224,6 @@ pub const Node = struct {
         number_literal,
         /// Both lhs and rhs unused.
         char_literal,
-        /// Both lhs and rhs unused.
-        unreachable_literal,
         /// Both lhs and rhs unused.
         builtin_literal,
         /// Both lhs and rhs unused.
