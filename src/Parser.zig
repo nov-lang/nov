@@ -14,6 +14,7 @@
 //     .b = 2,
 // } ; no error, we ignore newlines and the expr ends on '}\n'
 // ; note that it's fine to have a trailing comma in a struct literal
+// TODO: add support for _newline, _trainling and _comma kind
 
 const std = @import("std");
 const Tokenizer = @import("Tokenizer.zig");
@@ -507,9 +508,9 @@ fn parsePrimaryExpr(self: *Parser) Error!Node.Index {
         .identifier => {
             if (self.token_tags[self.tok_i + 1] == .colon) {
                 switch (self.token_tags[self.tok_i + 2]) {
-                    .keyword_for => {
+                    .keyword_loop => {
                         self.tok_i += 2;
-                        return self.parseForExpr();
+                        return self.parseLoopExpr();
                     },
                     .l_brace => {
                         self.tok_i += 2;
@@ -521,7 +522,7 @@ fn parsePrimaryExpr(self: *Parser) Error!Node.Index {
                 return self.parseCurlySuffixExpr();
             }
         },
-        .keyword_for => return self.parseForExpr(),
+        .keyword_loop => return self.parseLoopExpr(),
         .l_brace => return self.parseBlock(),
         .l_bracket => return self.parseArrayLiteral(), // TODO: move to parsePrimaryTypeExpr, make it like zig?
         // TODO: here?
@@ -536,7 +537,7 @@ fn parseBreakLabel(self: *Parser) Error!TokenIndex {
     return self.expectToken(.identifier);
 }
 
-/// IfExpr <- KEYWORD_if Expr Block (KEYWORD_else (IfExpr / Block))?
+/// IfExpr <- KEYWORD_if Expr Block ElseExpr?
 fn parseIfExpr(self: *Parser) Error!Node.Index {
     const if_token = self.assertToken(.keyword_if);
     const condition = try self.expectExpr();
@@ -566,6 +567,7 @@ fn parseIfExpr(self: *Parser) Error!Node.Index {
     });
 }
 
+/// ElseExpr <- KEYWORD_else (IfExpr / Block)
 fn parseElseExpr(self: *Parser) Error!Node.Index {
     return if (self.eatToken(.keyword_else) == null)
         null_node
@@ -576,21 +578,22 @@ fn parseElseExpr(self: *Parser) Error!Node.Index {
 }
 
 // TODO
-// for x in y
-// for x, y, z in a, b, c
-// for x in y..z
-// for mut x, mut y in a, b, c
-// for _ in 0..10
-// for x > 10
-// for {}
-// for i < 100 : i += 1
-// for ... {} else
-/// IfExpr <- KEYWORD_if Expr Block (KEYWORD_else (IfExpr / Block))?
-/// ForExpr <- KEYWORD_for ... Block
-/// ForEachInput <- IDENTIFIER+ KEYWORD_in (Expr (DOT2 Expr?)?)+
-///
-fn parseForExpr(self: *Parser) Error!Node.Index {
-    const for_token = self.assertToken(.keyword_for);
+// loop &x, y in a, b {}
+// loop *x, *mut y in a, b {}
+
+// loop x in y {}
+// loop _ in y..z {}
+// loop x, y, z in a, b, c {}
+// loop x > 10 {}
+// loop i < 100 : i += 1 {}
+// loop {}
+// loop ... {} else
+/// LoopExpr <- KEYWORD_loop LoopInput? Block ElseExpr?
+/// LoopInput
+///     <- (AMPERSAND? IDENTIFIER)+ KEYWORD_in (Expr (DOT2 Expr?)?)+
+///      / Expr (COLON AssignExpr)?
+fn parseLoopExpr(self: *Parser) Error!Node.Index {
+    const for_token = self.assertToken(.keyword_loop);
     _ = for_token;
     unreachable;
 
@@ -791,6 +794,7 @@ fn parseMatchExpr(self: *Parser) Error!Node.Index {
     });
 }
 
+// TODO: rework to support new syntax
 /// MatchProng <- MatchCase EQUALARROW MatchCasePayload? AssignExpr
 /// MatchCasePayload <- PIPE AMPERSAND? IDENTIFIER PIPE
 /// MatchCase <- MatchItem (COMMA MatchItem)* COMMA?
@@ -868,15 +872,14 @@ fn parseMatchProng(self: *Parser) Error!Node.Index {
     }
 }
 
-// TODO: change to DOT3
-/// MatchItem <- Expr (DOT2 Expr)?
+/// MatchItem <- Expr (DOT3 Expr)?
 fn parseMatchItem(self: *Parser) Error!Node.Index {
     const expr = try self.parseExprStrict();
     if (expr == null_node) {
         return null_node;
     }
 
-    if (self.eatToken(.ellipsis2)) |token| {
+    if (self.eatToken(.ellipsis3)) |token| {
         return self.addNode(.{
             .tag = .match_range,
             .main_token = token,
@@ -1109,9 +1112,9 @@ fn parsePrimaryTypeExpr(self: *Parser) Error!Node.Index {
                 .rhs = undefined,
             },
         }),
-        .grave_accent => return self.parseFnProto(),
+        .l_paren => return self.parseFnProto(),
         // .keyword_if => return self.parseIf(expectTypeExpr), // do not add yet
-        // .keyword_for => return self.parseFor(expectTypeExpr) // do not add yet
+        // .keyword_loop => return self.parseLoop(expectTypeExpr) // do not add yet
         // .keyword_match => return self.parseMatchExpr(), // do not add yet
         // TODO
         // .keyword_struct,
@@ -1122,9 +1125,9 @@ fn parsePrimaryTypeExpr(self: *Parser) Error!Node.Index {
         .identifier => switch (self.token_tags[self.tok_i + 1]) {
             .colon => switch (self.token_tags[self.tok_i + 2]) {
                 // TODO
-                // .keyword_for => {
+                // .keyword_loop => {
                 //     self.tok_i += 2;
-                //     return self.parseFor(expectTypeExpr);
+                //     return self.parseLoop(expectTypeExpr);
                 // },
                 .l_brace => {
                     self.tok_i += 2;
@@ -1160,17 +1163,6 @@ fn parsePrimaryTypeExpr(self: *Parser) Error!Node.Index {
             }),
             else => return null_node,
         },
-        .l_paren => return self.addNode(.{
-            .tag = .grouped_expression,
-            .main_token = self.nextToken(),
-            .data = .{
-                .lhs = try self.expectExpr(),
-                .rhs = blk: {
-                    self.eatNewLines();
-                    break :blk try self.expectToken(.r_paren);
-                },
-            },
-        }),
         else => return null_node,
     }
 }
@@ -1269,27 +1261,21 @@ fn parseSuffixOp(self: *Parser, lhs: Node.Index) Error!Node.Index {
     }
 }
 
-// TODO: handle generic list and async ret type
 // TODO: for ResultUnion: FnRetType <- ARROW EXCLAMATIONMARK? TypeExpr
-/// FnProto <- GRAVEACCENT GenericList? ParamDeclList AsyncRetType? FnRetType?
-/// AsyncRetType <- MINUSCARET TypeExpr
-/// FnRetType <- ARROW TypeExpr
+/// FnProto <- ParamDeclList (ARROW TypeExpr)?
+/// ParamDeclList <- LPAREN (ParamDecl COMMA)* ParamDecl? RPAREN
 fn parseFnProto(self: *Parser) Error!Node.Index {
-    const fn_token = self.assertToken(.grave_accent);
+    const fn_token = self.assertToken(.l_paren);
 
     // We want the fn proto node to be before its children in the array. TODO: why?
     const fn_proto_index = try self.reserveNode(.fn_proto);
     errdefer self.unreserveNode(fn_proto_index);
-
-    // const generics = try self.parseGenericList();
-    const params = try self.parseParamDeclList();
-
-    // const async_ret_type = if (self.eatToken(.minus_caret) != null) try self.expectTypeExpr() else null_node;
+    const params = try self.parseList(.r_paren, .expected_comma_after_param, expectParamDecl);
     const ret_type = if (self.eatToken(.arrow) != null) try self.expectTypeExpr() else null_node;
 
     return switch (params) {
         .zero_or_one => |param| self.setNode(fn_proto_index, .{
-            .tag = .fn_proto_simple,
+            .tag = .fn_proto_one,
             .main_token = fn_token,
             .data = .{
                 .lhs = param,
@@ -1297,7 +1283,7 @@ fn parseFnProto(self: *Parser) Error!Node.Index {
             },
         }),
         .multi => |span| self.setNode(fn_proto_index, .{
-            .tag = .fn_proto_multi,
+            .tag = .fn_proto,
             .main_token = fn_token,
             .data = .{
                 .lhs = try self.addExtra(span),
@@ -1305,6 +1291,16 @@ fn parseFnProto(self: *Parser) Error!Node.Index {
             },
         }),
     };
+}
+
+/// ParamDecl <- (IDENTIFIER COLON)? TypeExpr
+fn expectParamDecl(self: *Parser) Error!Node.Index {
+    if (self.token_tags[self.tok_i] == .identifier and
+        self.token_tags[self.tok_i + 1] == .colon)
+    {
+        self.tok_i += 2;
+    }
+    return self.expectTypeExpr();
 }
 
 /// Give a helpful error message for those transitioning from
@@ -1331,32 +1327,6 @@ fn parseCStyleContainer(self: *Parser) Error!bool {
     _ = try self.expectToken(.r_brace);
     try self.expectNewLine(.expected_newline_after_decl);
     return true;
-}
-
-/// GenericList <- LANGLEBRACKET (IDENTIFIER COMMA)* IDENTIFIER COMMA? RANGLEBRACKET
-fn parseGenericList(self: *Parser) Error!SmallSpan {
-    _ = self;
-    unreachable;
-}
-
-/// ParamDeclList <- LPAREN (ParamDecl COMMA)* ParamDecl? RPAREN
-fn parseParamDeclList(self: *Parser) Error!SmallSpan {
-    _ = try self.expectToken(.l_paren);
-    return self.parseList(
-        .r_paren,
-        .expected_comma_after_param,
-        expectParamDecl,
-    );
-}
-
-/// ParamDecl <- (IDENTIFIER COLON)? TypeExpr
-fn expectParamDecl(self: *Parser) Error!Node.Index {
-    if (self.token_tags[self.tok_i] == .identifier and
-        self.token_tags[self.tok_i + 1] == .colon)
-    {
-        self.tok_i += 2;
-    }
-    return self.expectTypeExpr();
 }
 
 /// ExprList <- (Expr COMMA)* Expr?

@@ -9,10 +9,6 @@ Next step: add new IR that
 AstGen/Sema from zig looks to complex if we just want to generate some C code.
 Move to a custom IR?
 
-Separate frontend (Tokenizer, Parser, IRs) from backend (Codegen, ...).
-Also separate CLI, REPL and VM from all the that.
-And cleanup the repo.
-
 Figure out what (first) backend to chose
 - **A language, probably C** ~but can be Zig or something else (JS)~
 - A VM, a custom one (support JIT) or the JVM (or WASM)
@@ -117,6 +113,7 @@ let myStruct = struct {}
 - support C variadic functions?
 - add a way to convert a int to enum and enum to int.
 - add a way to create an enum from a string.
+- `opaque` container
 
 # proposal: Annotations for container fields aka Tags
 add [tags](https://github.com/Hejsil/zig-clap/issues/8#issuecomment-381637825)
@@ -348,6 +345,8 @@ _ = match x % 3, x % 5 {
 ```
 
 proposal: match over array
+proposal2: revert to using `,` to separate values and allow match over
+arrays/tuples instead of match over multiple values
 ```nov
 _ = match [1, 2, 3] {
     [] => "Empty array"
@@ -455,12 +454,47 @@ let ArrayList: (#T: type) -> type = { ... }
 let ArrayList: (T: #type) -> type = { ... }
 ```
 
+# Use after realloc / iterator invalidation
+Make all of these work fine in Nov.
+Make sure that all kind of Nov loop work fine.
+```zig
+const std = @import("std");
+
+pub fn main() !void {
+    const init_queue = [5]usize{ 0, 1, 2, 3, 4 };
+    var queue = try std.ArrayList(usize).initCapacity(std.heap.page_allocator, init_queue.len);
+    defer queue.deinit();
+    try queue.appendSlice(&init_queue);
+    // var i: usize = 0;
+
+    // works fine
+    // const len = queue.items.len;
+    // while (i < len) : (i += 1) {
+    //     const item = queue.items[i];
+    //     try queue.append(item);
+    // }
+
+    // infinite loop
+    // while (i < queue.items.len) : (i += 1) {
+    //     const item = queue.items[i];
+    //     try queue.append(item);
+    // }
+
+    // segmentation fault
+    // for (queue.items) |*item| {
+    //     item.* += 1;
+    //     try queue.append(item.*);
+    // }
+    std.debug.print("{any}\n", .{queue.items});
+}
+```
+
 # Notes
 - it's a compile error to modify a string with [] or to take a mut of a string in a loop?
 - shifting warning: `x >> y` (same for `<<`)
   - error if y is signed
   - warn if y >= @bitSizeOf(x): `x >> ${y} is the same as x >> ${y % @bitSizeOf(x)}`
-- Remember to check src/vm/value.zig for cool stuff
+- Remember to check [value.zig](https://github.com/nov-lang/nov/blob/d8cc0edc95c43461e37b48a72d1e02b2307d278c/src/vm/value.zig) for cool stuff
 - Declarations in top level can't be `mut`
 - All arrays and strings should be 0 terminated (what about array of structs?)
 - strings:

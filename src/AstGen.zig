@@ -494,7 +494,7 @@ fn expr(ng: *NirGen, scope: *Scope, ri: ResultInfo, node: Ast.Node.Index) Error!
     const ast = astgen.ast;
     // const main_tokens = ast.nodes.items(.main_token);
     // const token_tags = ast.tokens.items(.tag);
-    const node_datas = ast.nodes.items(.data);
+    // const node_datas = ast.nodes.items(.data);
     const node_tags: []const Ast.Node.Tag = ast.nodes.items(.tag);
 
     const prev_anon_name_strategy = ng.anon_name_strategy;
@@ -515,8 +515,6 @@ fn expr(ng: *NirGen, scope: *Scope, ri: ResultInfo, node: Ast.Node.Index) Error!
         .mul => return simpleBinOp(ng, scope, ri, node, .mul),
 
         .negation => return negation(ng, scope, ri, node),
-
-        .grouped_expression => return expr(ng, scope, ri, node_datas[node].lhs),
 
         .char_literal => return charLiteral(ng, ri, node),
         .number_literal => return numberLiteral(ng, ri, node, node, .positive),

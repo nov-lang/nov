@@ -32,10 +32,11 @@ pub const Token = struct {
         l_brace,
         r_brace,
         at_sign_l_bracket,
-        grave_accent,
+        octothorpe,
         comma,
         period,
         ellipsis2,
+        ellipsis3,
         colon,
         question_mark,
         bang,
@@ -69,7 +70,7 @@ pub const Token = struct {
         tilde,
         keyword_let,
         keyword_match,
-        keyword_for,
+        keyword_loop,
         keyword_if,
         keyword_else,
         keyword_and,
@@ -113,10 +114,11 @@ pub const Token = struct {
                 .l_brace => "{",
                 .r_brace => "}",
                 .at_sign_l_bracket => "@[",
-                .grave_accent => "`",
+                .octothorpe => "#",
                 .comma => ",",
                 .period => ".",
                 .ellipsis2 => "..",
+                .ellipsis3 => "...",
                 .colon => ":",
                 .question_mark => "?",
                 .bang => "!",
@@ -156,7 +158,7 @@ pub const Token = struct {
                 .keyword_return => "return",
                 .keyword_let => "let",
                 .keyword_mut => "mut",
-                .keyword_for => "for",
+                .keyword_loop => "loop",
                 .keyword_break => "break",
                 .keyword_continue => "continue",
                 .keyword_in => "in",
@@ -258,6 +260,7 @@ const State = enum {
     r_angle_bracket,
     r_angle_bracket_angle_bracket,
     period,
+    period_2,
     int,
     int_period,
     int_exponent,
@@ -313,8 +316,8 @@ pub fn next(self: *Tokenizer) Token {
                 result.tag = .r_brace;
                 self.index += 1;
             },
-            '`' => {
-                result.tag = .grave_accent;
+            '#' => {
+                result.tag = .octothorpe;
                 self.index += 1;
             },
             ',' => {
@@ -580,11 +583,18 @@ pub fn next(self: *Tokenizer) Token {
         .period => {
             self.index += 1;
             switch (self.buffer[self.index]) {
+                '.' => continue :state .period_2,
+                else => result.tag = .period,
+            }
+        },
+        .period_2 => {
+            self.index += 1;
+            switch (self.buffer[self.index]) {
                 '.' => {
-                    result.tag = .ellipsis2;
+                    result.tag = .ellipsis3;
                     self.index += 1;
                 },
-                else => result.tag = .period,
+                else => result.tag = .ellipsis2,
             }
         },
         .slash => {
@@ -871,6 +881,12 @@ test "range literals" {
     try testTokenize("0x00..0x09", &.{ .number_literal, .ellipsis2, .number_literal });
     try testTokenize("0b00..0b11", &.{ .number_literal, .ellipsis2, .number_literal });
     try testTokenize("0o00..0o11", &.{ .number_literal, .ellipsis2, .number_literal });
+
+    try testTokenize("0...9", &.{ .number_literal, .ellipsis3, .number_literal });
+    try testTokenize("'0'...'9'", &.{ .char_literal, .ellipsis3, .char_literal });
+    try testTokenize("0x00...0x09", &.{ .number_literal, .ellipsis3, .number_literal });
+    try testTokenize("0b00...0b11", &.{ .number_literal, .ellipsis3, .number_literal });
+    try testTokenize("0o00...0o11", &.{ .number_literal, .ellipsis3, .number_literal });
 }
 
 test "code point literal with hex escape" {
@@ -961,10 +977,11 @@ test "chars" {
 }
 
 test "invalid token characters" {
-    try testTokenize("#", &.{.invalid});
+    try testTokenize("`", &.{.invalid});
     try testTokenize("$", &.{.invalid});
     try testTokenize("'c", &.{.invalid});
     try testTokenize("'", &.{.invalid});
+    try testTokenize("@", &.{.invalid});
     try testTokenize("''", &.{.char_literal});
     try testTokenize("'\n'", &.{ .invalid, .newline, .invalid });
 }

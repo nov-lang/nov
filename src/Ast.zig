@@ -330,6 +330,8 @@ pub fn firstToken(self: Ast, node: Node.Index) TokenIndex {
     const tags: []const Node.Tag = self.nodes.items(.tag);
     const datas = self.nodes.items(.data);
     const main_tokens = self.nodes.items(.main_token);
+    const token_tags = self.tokens.items(.tag);
+    var end_offset: TokenIndex = 0;
     var n = node;
     while (true) switch (tags[n]) {
         .root => return 0,
@@ -352,22 +354,28 @@ pub fn firstToken(self: Ast, node: Node.Index) TokenIndex {
         .char_literal,
         .string_literal,
         .builtin_literal,
-        .grouped_expression,
-        .block_two,
-        .block,
-        .fn_proto_simple,
-        .fn_proto_multi,
+        .fn_proto_one,
         .fn_proto,
         .attr_one,
         .attr,
         .array_type,
         .array_init_two,
+        .array_init_two_comma,
         .array_init,
+        .array_init_comma,
         .@"defer",
-        => return main_tokens[n],
+        .@"comptime",
+        .container_decl,
+        .container_decl_trailing,
+        .container_decl_two,
+        .container_decl_two_trailing,
+        .container_decl_arg,
+        .container_decl_arg_trailing,
+        .container_field,
+        => return main_tokens[n] - end_offset,
 
         .enum_literal,
-        => return main_tokens[n] - 1,
+        => return main_tokens[n] - 1 - end_offset,
 
         .field_access,
         .unwrap_option,
@@ -398,7 +406,9 @@ pub fn firstToken(self: Ast, node: Node.Index) TokenIndex {
         .bool_and,
         .bool_or,
         .call_one,
+        .call_one_comma,
         .call,
+        .call_comma,
         .match_range,
         .function_pipe,
         .bind,
@@ -417,6 +427,21 @@ pub fn firstToken(self: Ast, node: Node.Index) TokenIndex {
             const extra = self.extraData(datas[n].lhs, Node.SubRange);
             assert(extra.end - extra.start > 0);
             n = self.extra_data[extra.start];
+        },
+
+        .block,
+        .block_newline,
+        .block_two,
+        .block_two_newline,
+        => {
+            // Look for a label.
+            const lbrace = main_tokens[n];
+            if (token_tags[lbrace - 1] == .colon and
+                token_tags[lbrace - 2] == .identifier)
+            {
+                end_offset += 2;
+            }
+            return lbrace - end_offset;
         },
     };
 }
@@ -485,7 +510,6 @@ pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
         .unwrap_option,
         .unwrap_result,
         .deref,
-        .grouped_expression,
         => return datas[n].rhs + end_offset,
 
         .number_literal,
@@ -515,19 +539,19 @@ pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
             }
         },
 
-        .fn_proto_simple => {
+        .fn_proto_one => {
             if (datas[n].rhs != 0) {
                 n = datas[n].rhs;
             } else if (datas[n].lhs != 0) {
                 end_offset += 1; // rparen
                 n = datas[n].lhs;
             } else {
-                end_offset += 2; // lparen rparen
+                end_offset += 1; // rparen
                 return main_tokens[n] + end_offset;
             }
         },
 
-        .fn_proto_multi => {
+        .fn_proto => {
             if (datas[n].rhs != 0) {
                 n = datas[n].rhs;
             } else {
@@ -1057,7 +1081,6 @@ pub const Node = struct {
 
     pub const Index = u32;
 
-    // TODO: add _comma and _newline variants for lastToken()
     pub const Tag = enum(u8) {
         /// sub_list[lhs..rhs]
         root,
@@ -1111,7 +1134,7 @@ pub const Node = struct {
         assign_sub,
         /// `lhs = rhs`. main_token is op.
         assign,
-        // TODO: multi_assign (assign_destructure in zig), WE DO NOT HAVE TUPLES!?
+        // TODO: assign_destructure
         // a, b = x, y
         // how to return multiple values from a function if we do not have tuples?
         /// `lhs * rhs`. main_token is op.
@@ -1159,9 +1182,11 @@ pub const Node = struct {
         ref_type,
         /// `?rhs`. lhs unused. main_token is the `?`.
         optional_type,
-        // TODO: keep lhs for size?
         /// `[]rhs`. lhs is unused.
         array_type,
+        /// `#lhs`. rhs unused.
+        /// main_token is the `#`.
+        @"comptime",
         /// `lhs[rhs..]`
         /// main_token is the lbracket.
         slice_open,
@@ -1173,26 +1198,39 @@ pub const Node = struct {
         /// `[lhs, rhs]`. lhs and rhs can be omitted.
         /// main_token points at the lbracket.
         array_init_two,
+        /// `[lhs, rhs,]`. lhs and rhs can be omitted.
+        /// main_token points at the lbracket.
+        array_init_two_comma,
         /// `[a, b, c]`. `sub_list[lhs..rhs]`.
         /// main_token points at the lbracket.
         array_init,
+        /// `[a, b, c,]`. `sub_list[lhs..rhs]`.
+        /// main_token points at the lbracket.
+        array_init_comma,
+        // TODO: struct init
         /// `lhs(rhs)`. rhs can be omitted.
         /// main_token is the `(`.
         call_one,
+        /// `lhs(rhs,)`. rhs can be omitted.
+        /// main_token is the lparen.
+        call_one_comma,
         /// `lhs(a, b, c)`. `SubRange[rhs]`.
         /// main_token is the `(`.
         call,
+        /// `lhs(a, b, c,)`. `SubRange[rhs]`.
+        /// main_token is the `(`.
+        call_comma,
         /// `match lhs {}`. `SubRange[rhs]`.
         match,
         /// `lhs => rhs`.
         /// main_token is the `=>`
         match_case_one,
-        /// `a, b, c => rhs`. `SubRange[lhs]`.
+        /// `a | b | c => rhs`. `SubRange[lhs]`.
         /// main_token is the `=>`.
         match_case,
         /// `lhs..rhs`.
         match_range,
-        // TODO: for
+        // TODO: loop
         /// `if lhs {}`. rhs is the block.
         @"if",
         /// `if lhs {} else {}`. `If[rhs]`.
@@ -1206,19 +1244,13 @@ pub const Node = struct {
         @"return",
         // `defer rhs`. rhs is the deferred expression. lhs is unused.
         @"defer",
-        /// `BACKTICK(a: lhs) -> rhs`.
+        /// `(a: lhs) -> rhs`.
         /// lhs and rhs can be omitted.
-        /// main_token is the BACKTICK (`).
-        fn_proto_simple,
-        /// `BACKTICK(d: e, f: g) -> rhs`. `SubRange[lhs]`.
+        /// main_token is the `(`.
+        fn_proto_one,
+        /// `(a: b, c: d) -> rhs`. `SubRange[lhs]`.
         /// rhs can be omitted.
-        /// main_token is the BACKTICK (`).
-        fn_proto_multi,
-        // TODO: more fn_proto variants, currently only fn_proto_simple and fn_proto_multi are used
-        // TODO: add return multiple values when assign destructure is added
-        /// `BACKTICK<a, b, c>(d: e, f: g) -^ h -> rhs`. `FnProto[lhs]`.
-        /// rhs can be omitted.
-        /// main_token is the BACKTICK (`).
+        /// main_token is the `(`
         fn_proto,
         /// Both lhs and rhs unused.
         number_literal,
@@ -1237,19 +1269,40 @@ pub const Node = struct {
         /// main_token is the string literal token
         /// Both lhs and rhs unused.
         string_literal,
-        /// `(lhs)`. main_token is the `(`
-        /// rhs is the token index of the `)`.
-        grouped_expression,
         /// `{lhs rhs}`. lhs and rhs can be omitted.
         /// main_token points at the lbrace.
         block_two,
+        /// Same as block_two but there is known to be a newline before the rbrace.
+        block_two_newline,
         /// `{}`. `sub_list[lhs..rhs]`.
         /// main_token points at the lbrace.
         block,
+        /// Same as block but there is known to be a newline before the rbrace.
+        block_newline,
+        /// `struct []`, `union []`, `opaque []`, `enum []`. `extra_data[lhs..rhs]`.
+        /// main_token is `struct`, `union`, `opaque`, `enum` keyword.
+        container_decl,
+        /// Same as container_decl but there is known to be a trailing comma
+        /// or newline before the rbrace.
+        container_decl_trailing,
+        /// `struct [lhs, rhs]`, `union [lhs, rhs]`, `opaque [lhs, rhs]`, `enum [lhs, rhs]`.
+        /// lhs or rhs can be omitted.
+        /// main_token is `struct`, `union`, `opaque`, `enum` keyword.
+        container_decl_two,
+        /// Same as container_decl_two except there is known to be a trailing comma
+        /// or newline before the rbrace.
+        container_decl_two_trailing,
+        /// `struct(lhs)` / `union(lhs)` / `enum(lhs)`. `SubRange[rhs]`.
+        container_decl_arg,
+        /// Same as container_decl_arg but there is known to be a trailing
+        /// comma or newline before the rbrace.
+        container_decl_arg_trailing,
+        /// `a: lhs = rhs,`. lhs and rhs can be omitted.
+        /// main_token is the field name identifier.
+        /// lastToken() does not include the possible trailing comma.
+        container_field,
         /// `lhs!rhs`. main_token is the `!`.
         result_union,
-        // TODO: struct, enum, container, class idk, generics too
-        // TODO: async/await/resume/suspend/nosuspend/yield
     };
 
     pub const Data = struct {
@@ -1281,14 +1334,21 @@ pub const Node = struct {
         end: Index,
     };
 
-    pub const FnProto = struct {
-        generic_types_start: Index,
-        generic_types_end: Index,
-        params_start: Index,
-        params_end: Index,
-        /// Populated if `-^` is present.
-        async_return_type: Index,
-    };
+    // pub const Loop = struct {
+    //     cont_expr: Index,
+    //     then_expr: Index,
+    //     else_expr: Index,
+    // };
+
+    // pub const LoopCont = struct {
+    //     cont_expr: Index,
+    //     then_expr: Index,
+    // };
+
+    // pub const Loop = packed struct(u32) {
+    //     inputs: u31,
+    //     has_else: bool,
+    // };
 };
 
 pub const Span = struct {

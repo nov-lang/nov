@@ -2,7 +2,7 @@ let std = @import("std")
 let File = std.fs.File
 
 ; TODO: replace !void with correct return type
-let main: `() -> !void = {
+let main: () -> !void = {
     let file = File.open("file.txt").!
     ; the .! operator does the same as
     let file = match File.open("file.txt") {
@@ -12,7 +12,7 @@ let main: `() -> !void = {
     ; we can also handle specific errors differently
     let file = match File.open("file.txt") {
         .ok => |f| f
-        .err => |err| match err.kind() {
+        .err => |err| match err.kind {
             .not_found => {
                 ; do something
             },

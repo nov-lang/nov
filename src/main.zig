@@ -200,36 +200,11 @@ fn testMain(allocator: std.mem.Allocator) !u8 {
 
     const source =
         \\let x: *mut int = 1 + 1
-        \\let main: `() = {
+        \\let main: () = {
         \\    @println(x)
         \\}
-
         //TODO: change parseArrayLiteral to allow that
         // \\let z = [ 1, 2, 3, 4 ].len
-
-        // \\let cond = true
-        // \\let main = {
-        // \\    if (cond) {
-        // \\        let mut x = "outer"
-        // \\        {
-        // \\            x = (x + " ") * 3
-        // \\            x *= 2
-        // \\        }
-        // \\        print(x)
-        // \\    } else {
-        // \\        print("Hello world!")
-        // \\    }
-        // \\
-        // \\    let mut i: int = 0
-        // \\    for {
-        // \\        print(i)
-        // \\        i += 1
-        // \\        if (i == 10) {
-        // \\            break
-        // \\        }
-        // \\    }
-        // \\}
-        // \\
         \\
     ;
 
@@ -303,5 +278,4 @@ fn testMain(allocator: std.mem.Allocator) !u8 {
 test {
     _ = @import("Tokenizer.zig");
     _ = @import("string_literal.zig");
-    _ = @import("vm/value.zig");
 }

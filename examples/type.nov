@@ -1,16 +1,18 @@
 let MyInt = int
 
 @[public]
-let MyType = struct {
-    x: MyInt = 0
-    y: string = "hello"
+let MyType = struct [
+    x: MyInt = 0,
+    y: string = "hello",
     z: bool,
 
     @[public]
-    let toString: `(self: MyType) -> string = "x: {self.x}, y: {self.y}. z: {self.z}"
-}
+    let toString: (self: MyType) -> string = {
+        "x: {self.x}, y: {self.y}. z: {self.z}"
+    }
+]
 
-let main: `() = {
-    let item = MyType{ .x = 5, .z = true }
+let main: () = {
+    let item = MyType[ .x = 5, .z = true ]
     @println(item) ; @println will call the `toString` method
 }
