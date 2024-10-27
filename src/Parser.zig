@@ -287,7 +287,7 @@ const Precedence = enum(i8) {
     bool_or = 20, // or
     bool_and = 30, // and
     comparison = 40, // == != < > <= >=
-    bitwise = 50, // & ^ | in
+    bitwise = 50, // & ^ | in is
     shift = 60, // << >>
     term = 70, // + -
     factor = 80, // * / %
@@ -332,6 +332,7 @@ const rules = std.enums.directEnumArrayDefault(Token.Tag, Rule, .{ .prec = .none
     .caret = .{ .prec = .bitwise, .tag = .bit_xor },
     .pipe = .{ .prec = .bitwise, .tag = .bit_or },
     .keyword_in = .{ .prec = .bitwise, .tag = .in },
+    .keyword_is = .{ .prec = .bitwise, .tag = .is },
 
     .l_angle_bracket_angle_bracket = .{ .prec = .shift, .tag = .shl },
     .r_angle_bracket_angle_bracket = .{ .prec = .shift, .tag = .shr },

@@ -413,6 +413,7 @@ pub fn firstToken(self: Ast, node: Node.Index) TokenIndex {
         .function_pipe,
         .bind,
         .in,
+        .is,
         .attr_decl_one,
         .slice_open,
         .slice,
@@ -498,6 +499,7 @@ pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
         .function_pipe,
         .bind,
         .in,
+        .is,
         .decl,
         .attr_decl_one,
         .attr_decl,
@@ -1164,6 +1166,8 @@ pub const Node = struct {
         bind,
         // `lhs in rhs`. main_token is op.
         in,
+        // `lhs is rhs`. main_token is op.
+        is,
         /// `lhs and rhs`. main_token is op.
         bool_and,
         /// `lhs or rhs`. main_token is op.

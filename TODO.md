@@ -113,7 +113,7 @@ let myStruct = struct {}
 - support C variadic functions?
 - add a way to convert a int to enum and enum to int.
 - add a way to create an enum from a string.
-- `opaque` container
+- `opaque` container...
 
 # proposal: Annotations for container fields aka Tags
 add [tags](https://github.com/Hejsil/zig-clap/issues/8#issuecomment-381637825)
@@ -121,7 +121,7 @@ to container fields, this is a must have (e.g. for arg parsing or json parsing)
 
 this can allow to specify if a field is public/private or if it's constant/mutable
 ```nov
-let User = struct [
+let User = struct {
     @[key]
     @[auto]
     id: Id,
@@ -134,9 +134,9 @@ let User = struct [
     todos: []Todo,
 
     moto: Option(string),
-]
+}
 
-let Todo = struct [
+let Todo = struct {
     @[key]
     @[auto]
     id: Id,
@@ -148,7 +148,7 @@ let Todo = struct [
     user: User,
 
     title: string,
-]
+}
 ```
 
 # Closures, anonymous functions & bind
@@ -189,40 +189,14 @@ let x = Option.none[]
 ```
 
 # Union
-Problem 1: if on union
-```nov
-let Tree = union [
-    empty,
-    node: struct [
-        value: int,
-        left: *mut Tree,
-        right: *mut Tree,
-    ],
-
-    let sum: (self: *mut Tree) -> int = {
-        ; TODO: replace `==` with `is` or something else to compare union
-        ; correctly to not shadow with operator overloading?
-        ; also do something like that? `if self is .node |n| {}`
-        ; TODO: will this cause problem with operator overloading?
-        ;       maybe replace with `is` keyword and add a | | for union?
-        if self == .empty {
-            return 0
-        } else {
-            let n = self.node
-            return n.value + n.left.sum() + n.right.sum()
-        }
-    }
-]
-```
-
-Problem 2: invalidating an interior pointer
+Problem: invalidating an interior pointer
 ```nov
 @[public]
 let main: () -> !void = {
-    let Value = union [
+    let Value = union {
         s: string,
         n: uint,
-    ]
+    }
     let mut value = Value[ .n = 42 ]
     let number = &value.n
     value = Value[ .s = "hello world" ]
@@ -332,6 +306,11 @@ This will probably be implemented in stdlib instead.
 # Match
 TODO: check https://docs.vlang.io/statements-&-expressions.html#match
 
+TODO: check https://tour.gleam.run/everything/#flow-control-case-expressions
+- rework how match work and remove catch syntax
+  - add [Flow-sensitive typing](https://en.wikipedia.org/wiki/Flow-sensitive_typing)?
+    that could solve the issue with `if`
+
 TODO: add inline like zig (need a different keyword) or make it implicit?
 
 proposal: match over multiple values
@@ -346,7 +325,7 @@ _ = match x % 3, x % 5 {
 
 proposal: match over array
 proposal2: revert to using `,` to separate values and allow match over
-arrays/tuples instead of match over multiple values
+arrays/tuples instead of match over multiple values (no, allow both)
 ```nov
 _ = match [1, 2, 3] {
     [] => "Empty array"
@@ -379,6 +358,45 @@ let getName: (s: string) -> string = {
 - use [] and .len operator overloading instead?
   - what about getting reference or making assignement to object[i]
 - use async with yield for iterators
+
+## Use after realloc / iterator invalidation
+Make all of these work fine in Nov.
+Make sure that all kind of Nov loop work fine.
+
+Proposal:
+- make it work by definition for all primitives (i.e. everything but iterators)
+- for iterator do it like rust aka force immutability and stuff to prevent this from happening
+```zig
+const std = @import("std");
+
+pub fn main() !void {
+    const init_queue = [5]usize{ 0, 1, 2, 3, 4 };
+    var queue = try std.ArrayList(usize).initCapacity(std.heap.page_allocator, init_queue.len);
+    defer queue.deinit();
+    try queue.appendSlice(&init_queue);
+    // var i: usize = 0;
+
+    // works fine
+    // const len = queue.items.len;
+    // while (i < len) : (i += 1) {
+    //     const item = queue.items[i];
+    //     try queue.append(item);
+    // }
+
+    // infinite loop
+    // while (i < queue.items.len) : (i += 1) {
+    //     const item = queue.items[i];
+    //     try queue.append(item);
+    // }
+
+    // segmentation fault
+    // for (queue.items) |*item| {
+    //     item.* += 1;
+    //     try queue.append(item.*);
+    // }
+    std.debug.print("{any}\n", .{queue.items});
+}
+```
 
 # Operator Overloading
 TODO:
@@ -454,43 +472,7 @@ let ArrayList: (#T: type) -> type = { ... }
 let ArrayList: (T: #type) -> type = { ... }
 ```
 
-# Use after realloc / iterator invalidation
-Make all of these work fine in Nov.
-Make sure that all kind of Nov loop work fine.
-```zig
-const std = @import("std");
-
-pub fn main() !void {
-    const init_queue = [5]usize{ 0, 1, 2, 3, 4 };
-    var queue = try std.ArrayList(usize).initCapacity(std.heap.page_allocator, init_queue.len);
-    defer queue.deinit();
-    try queue.appendSlice(&init_queue);
-    // var i: usize = 0;
-
-    // works fine
-    // const len = queue.items.len;
-    // while (i < len) : (i += 1) {
-    //     const item = queue.items[i];
-    //     try queue.append(item);
-    // }
-
-    // infinite loop
-    // while (i < queue.items.len) : (i += 1) {
-    //     const item = queue.items[i];
-    //     try queue.append(item);
-    // }
-
-    // segmentation fault
-    // for (queue.items) |*item| {
-    //     item.* += 1;
-    //     try queue.append(item.*);
-    // }
-    std.debug.print("{any}\n", .{queue.items});
-}
-```
-
 # Notes
-- it's a compile error to modify a string with [] or to take a mut of a string in a loop?
 - shifting warning: `x >> y` (same for `<<`)
   - error if y is signed
   - warn if y >= @bitSizeOf(x): `x >> ${y} is the same as x >> ${y % @bitSizeOf(x)}`
@@ -504,6 +486,11 @@ pub fn main() !void {
   - const strings are fixed length, stored in .rodata like a C string
     - note that the "a" + "b" is done at compile time
   - mut string are variable length, allocated "slices" (storing ptr and len), just like a []u8
+  - it's a compile error to modify a string with []?
+  - PROPOSAL: make all string immutable they are all pointer to rodata, that pointer can be mut
+    - allow for more optimization
+    - probably better semantic
+    - string manipulation is done with []u8 instead
 - `void` is Nov's unit type (`()` in Rust and OCaml, `Nil` in Gleam)
 - about variable initialization:
   - initialize to zero by default if there is no initializer
@@ -515,7 +502,7 @@ pub fn main() !void {
   - put it on the stack/heap? need executable memory which is bad, also idk how gc will handle that
   - look at how ocaml or rust does it
 - comptime assertion like `let _ = #{}`?
-
+- move generic to annotations? `@[generic(T)]`
 
 # Stuff to check & links
 - check https://docs.vlang.io/functions-2.html#anonymous-&-higher-order-functions + closures
@@ -544,3 +531,6 @@ pub fn main() !void {
 - https://doc.rust-lang.org/book/ch09-02-recoverable-errors-with-result.html
 - Change Parser.parseExprPrecedence? https://www.scattered-thoughts.net/writing/better-operator-precedence/
 - https://www.scattered-thoughts.net/writing/notes-on-compiler-irs/
+- Builtins
+  - https://docs.vlang.io/conditional-compilation.html
+  - https://docs.python.org/3.12/library/functions.html

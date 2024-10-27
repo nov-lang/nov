@@ -1,7 +1,7 @@
 let MyInt = int
 
 @[public]
-let MyType = struct [
+let MyType = struct {
     x: MyInt = 0,
     y: string = "hello",
     z: bool,
@@ -10,7 +10,7 @@ let MyType = struct [
     let toString: (self: MyType) -> string = {
         "x: {self.x}, y: {self.y}. z: {self.z}"
     }
-]
+}
 
 let main: () = {
     let item = MyType[ .x = 5, .z = true ]

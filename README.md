@@ -1,10 +1,15 @@
 # Nov
 
-Nov is a functional programming language.
+Nov is a multi-paradigm ~functional~ programming language.
 
-Nov type system is static, strong and sound. Also most types should be inferrable.
+Nov [typing discipline](https://en.wikipedia.org/wiki/Type_system) is
+[static](https://en.wikipedia.org/wiki/Static_typing),
+[strong](https://en.wikipedia.org/wiki/Strong_and_weak_typing),
+sound and
+[manifest](https://en.wikipedia.org/wiki/Manifest_typing) with bidirectional inference.
 
-Nov has [uncolored](https://journal.stuffwithstuff.com/2015/02/01/what-color-is-your-function/) async! (well not yet tho)
+Nov has [uncolored](https://journal.stuffwithstuff.com/2015/02/01/what-color-is-your-function/) async!
+(well not yet tho)
 
 Nov has automatic memory management via a minimal tracing GC.
 <!-- https://github.com/ivmai/bdwgc -->
@@ -41,8 +46,8 @@ let add: (a: int, b: int) -> int = a + b
 
 ; return a tuple
 ; see #Struct for more information about tuples and structs
-; signature: (int, int) -> struct[int, int]
-let div: (a: int, b: int) -> struct[int, int] = {
+; signature: (int, int) -> struct{ int, int }
+let div: (a: int, b: int) -> struct{ int, int } = {
     [a / b, a % b]
 }
 
@@ -90,8 +95,10 @@ Similarly to functions, brackets are specific to containers.
 
 ### Enum
 Nov enums are just like C enums except that they can have methods and their fields are not global.
+
+Overall enums are a nice way to represent tags or constant numbers.
 ```nov
-let Season = enum [
+let Season = enum {
     spring,     ; 0
     summer = 5, ; 5
     autumn,     ; 6
@@ -100,7 +107,7 @@ let Season = enum [
     let eql: (self: Season, other: Season) -> bool = {
         self == other
     }
-]
+}
 
 let s1 = Season.spring ; type of s1 is inferred from the initializer
 let s2: Season = .spring ; type of the initializer is inferred from the type of s2
@@ -113,8 +120,9 @@ match s1 {
 ```
 
 ### Struct
+Struct is Nov's equivalent of [Product type](https://en.wikipedia.org/wiki/Product_type).
 ```nov
-let MyStruct = struct [
+let MyStruct = struct {
     name: string,
     x: float = 1.0,
     y: float = 1.0,
@@ -142,7 +150,7 @@ let c: MyStruct = [ .name = "", .x = 0, .y = 0 ]
 ;;; Tuples
 ; tuples are simply anonymous structs
 
-; is a tuple of type struct[int, string]
+; is a tuple of type struct{ int, string }
 let x = [ 0, "test" ]
 
 ; this is also a tuple
@@ -153,46 +161,55 @@ let z = [ 10, 20, 30 ]
 ```
 
 ### Union
-Note that it isn't represented here but a union field can have a default value just like a struct field.
+Union is Nov's equivalent of [Sum type](https://en.wikipedia.org/wiki/Tagged_union)
+since a Nov's union always stores its tag unless annotated with `@[extern]`.
+Thus we can match on any union to find its active field.
 
-In Nov there is no untagged union thus we can match on any union to find the active field.
+Note that it isn't represented here but a union field can have a default value just like a struct field.
 
 See [Result and Option unions](#result-and-option-unions) for an example of generic unions.
 ```nov
-let Tree = union [
+let Tree = union {
     empty,
-    node: struct [
+    node: struct {
         value: int,
         left: *mut Tree,
         right: *mut Tree,
-    ],
+    },
 
     let sum: (self: *mut Tree) -> int = match self {
         .empty => 0
         .node => |n| n.value + n.left.sum() + n.right.sum()
     }
-]
+}
 let mut leaf = Tree.empty[]
 let a = Tree.node[ .value = 0, .left = &leaf, .right = &leaf ]
 let b: Tree = .node[ .value = 0, .left = &leaf, .right = &leaf ]
 
 ; we can also create an union from an enum
-let MyEnum = enum [ a, b, c, d ]
-let MyUnion = union(MyEnum) [
+let MyEnum = enum { a, b, c, d }
+let MyUnion = union(MyEnum) {
     a: int,
     b: float,
     c: int,
     d: string,
-]
+}
 
-let x = MyUnion{ .b = 3 };
+let x = MyUnion[ .b = 3 ]
 x.a ; runtime error
+
+; Use the `is` keyword to check the tag of an union
+@println(x is .b) ; prints true
+
+; `==` between unions is illegal unless it is overloaded
+x == MyUnion[ .b = 3 ] ; compile error
+
 ```
 
 ### Generics
 We can generate a type with a function thus creating a generic type.
 ```nov
-let Stack: (T: #type) -> type = struct [
+let Stack: (T: #type) -> type = struct {
     list: []T = [],
 
     let Self = @This()
@@ -211,7 +228,7 @@ let Stack: (T: #type) -> type = struct [
 
     @[public]
     let isEmpty: (self: Self) -> bool = self.list.len == 0
-]
+}
 ```
 
 ### Result and Option unions
@@ -224,7 +241,7 @@ Sugar for Result and Option:
 
 ```nov
 @[public]
-let Result: (T: type, E: type) -> type = union [
+let Result: (T: type, E: type) -> type = union {
     ok: T,
     err: E,
 
@@ -243,7 +260,7 @@ let Result: (T: type, E: type) -> type = union [
         .ok => |value| value
         .err => |err| fallback(err)
     }
-]
+}
 
 let MyResult = Result(int, string)
 let my_value = MyResult.ok[0]
@@ -264,7 +281,7 @@ let file = File.open("file.txt").!
 ```
 
 ```nov
-let Option: (T: type) -> type = union [
+let Option: (T: type) -> type = union {
     some: T,
     none,
 
@@ -528,6 +545,7 @@ TODO
 | Function Pipe         | a \|> f           | [Functions](#Functions)                      | TODO                                                                |
 | Member Search         | a **in** b        | [Arrays](#Arrays)                            | TODO                                                                |
 | Access                | a\[b]             | [Arrays](#Arrays) <br> string                | TODO: b is an Integer                                               |
+| Active Field          | a **is** b        | [Union](#Union)                              | TODO                                                                |
 | Field / Method Access | a.b               | All types                                    | TODO                                                                |
 | Reference Type        | *T <br> *mut T    | All types                                    | Create a reference type from `T`. Unless `mut` is specified the wrapped value is constant |
 | Reference Of          | &a                | All types                                    | Returns a reference to `a`.                                         |
@@ -542,7 +560,7 @@ x{}
 * / %
 + -
 << >>
-& ^ | in
+& ^ | in is
 == != < > <= >=
 and
 or
@@ -566,7 +584,7 @@ Note:
 - `+=`, `-=`, `*=`, `/=`, `%=` are automatically generated when the corresponding operator is defined.
 
 ```nov
-let Complex = struct [
+let Complex = struct {
     re: float
     im: float
 
@@ -579,7 +597,7 @@ let Complex = struct [
     ; used by print
     ; signature must be `toString: (T) -> string` where T is the container type
     let toString: (self: Complex) -> string = "{self.re} + i{self.im}"
-]
+}
 
 let x: Complex = [ .re = 5, .im = 3 ]
 let y: Complex = [ .re = 2, .im = 7 ]
@@ -615,8 +633,6 @@ TODO
 - `@bitSizeOf()`: TODO
 <!-- - `@as(T: type, arg: any)`: Cast arg to T if possible. -->
 <!-- - `@bitCast()`: Same as zig -->
-- see https://docs.vlang.io/conditional-compilation.html
-- see https://docs.python.org/3.12/library/functions.html
 - `@swap(a: any, b: @Typeof(a))`
 - `@unreachable()`: TODO
 - atomic stuff

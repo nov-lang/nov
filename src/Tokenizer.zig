@@ -80,7 +80,11 @@ pub const Token = struct {
         keyword_break,
         keyword_continue,
         keyword_in,
+        keyword_is,
         keyword_defer,
+        keyword_enum,
+        keyword_struct,
+        keyword_union,
         // unused reserved keywords
         keyword_async,
         keyword_await,
@@ -88,11 +92,7 @@ pub const Token = struct {
         keyword_resume,
         keyword_suspend,
         keyword_nosuspend,
-        keyword_enum,
-        keyword_struct,
-        keyword_union,
         keyword_opaque,
-        keyword_is,
 
         pub fn lexeme(tag: Tag) ?[]const u8 {
             return switch (tag) {
