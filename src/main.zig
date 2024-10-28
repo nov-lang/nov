@@ -195,14 +195,17 @@ pub fn main() !void {
 
 fn testMain(allocator: std.mem.Allocator) !u8 {
     const Parser = @import("Parser.zig");
-    const AstGen = @import("AstGen.zig");
-    const Nir = @import("Nir.zig");
+    // const AstGen = @import("AstGen.zig");
+    // const Nir = @import("Nir.zig");
 
     const source =
+        \\let x =
+        \\    #3 + 1
+        \\    + 1
         \\let x: *mut int = 1 + 1
-        \\let main: () = {
-        \\    @println(x)
-        \\}
+        // \\let main: () = {
+        // \\    @println(x)
+        // \\}
         //TODO: change parseArrayLiteral to allow that
         // \\let z = [ 1, 2, 3, 4 ].len
         \\
@@ -218,18 +221,18 @@ fn testMain(allocator: std.mem.Allocator) !u8 {
     var ast = try Parser.parse(allocator, source);
     defer ast.deinit(allocator);
 
-    std.debug.print("\nNodes:", .{});
-    for (ast.nodes.items(.tag)) |tag| {
-        std.debug.print(" {s}", .{@tagName(tag)});
-    }
-    std.debug.print("\n", .{});
+    // std.debug.print("\nNodes:", .{});
+    // for (ast.nodes.items(.tag)) |tag| {
+    //     std.debug.print(" {s}", .{@tagName(tag)});
+    // }
+    // std.debug.print("\n", .{});
 
-    for (ast.rootDecls()) |stmt| {
-        for (ast.firstToken(stmt)..ast.lastToken(stmt) + 1) |token| {
-            std.debug.print("{s} ", .{ast.tokenSlice(@intCast(token))});
-        }
-        std.debug.print("\n", .{});
-    }
+    // for (ast.rootDecls()) |stmt| {
+    //     for (ast.firstToken(stmt)..ast.lastToken(stmt) + 1) |token| {
+    //         std.debug.print("{s} ", .{ast.tokenSlice(@intCast(token))});
+    //     }
+    //     std.debug.print("\n", .{});
+    // }
 
     if (ast.errors.len > 0) {
         const stderr = std.io.getStdErr().writer();
@@ -258,19 +261,28 @@ fn testMain(allocator: std.mem.Allocator) !u8 {
         return 1;
     }
 
-    var nir = try AstGen.generate(allocator, &ast);
-    defer nir.deinit(allocator);
-    for (0..nir.instructions.len) |i| {
-        const inst = nir.instructions.get(i);
-        const data_tag = Nir.Inst.data_tags[@intFromEnum(inst.tag)];
-        switch (data_tag) {
-            inline else => |tag| {
-                const data = @field(inst.data, @tagName(tag));
-                std.debug.print("Instruction {}: " ++ @tagName(tag) ++ ": {}\n", .{ i, data });
-            },
-        }
-        // std.debug.print("Instruction {}: {}\n", .{ i, nir.instructions.get(i) });
-    }
+    const fmt_source = try ast.render(allocator);
+    defer allocator.free(fmt_source);
+    std.log.debug(
+        \\Formatted source:
+        \\```
+        \\{s}
+        \\```
+    , .{fmt_source});
+
+    // var nir = try AstGen.generate(allocator, &ast);
+    // defer nir.deinit(allocator);
+    // for (0..nir.instructions.len) |i| {
+    //     const inst = nir.instructions.get(i);
+    //     const data_tag = Nir.Inst.data_tags[@intFromEnum(inst.tag)];
+    //     switch (data_tag) {
+    //         inline else => |tag| {
+    //             const data = @field(inst.data, @tagName(tag));
+    //             std.debug.print("Instruction {}: " ++ @tagName(tag) ++ ": {}\n", .{ i, data });
+    //         },
+    //     }
+    //     // std.debug.print("Instruction {}: {}\n", .{ i, nir.instructions.get(i) });
+    // }
 
     return 0;
 }

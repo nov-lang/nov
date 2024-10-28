@@ -1,7 +1,8 @@
 // Originally based on https://github.com/ziglang/zig/blob/master/lib/std/zig/Parse.zig
 // See https://github.com/ziglang/zig/blob/master/LICENSE for additional LICENSE details
 
-// TODO: add eaten newlines to grammar
+// TODO: add eaten newlines to grammar?
+
 // TODO
 // let x = [ 1, 2, ] ; no error, terminator is ']\n'
 // let x = [
@@ -14,7 +15,15 @@
 //     .b = 2,
 // } ; no error, we ignore newlines and the expr ends on '}\n'
 // ; note that it's fine to have a trailing comma in a struct literal
+
 // TODO: add support for _newline, _trainling and _comma kind
+
+// TODO: these parsing are incorrect:
+// - array
+// - array type
+// - match
+// - comptime
+// - ...
 
 const std = @import("std");
 const Tokenizer = @import("Tokenizer.zig");
@@ -462,6 +471,7 @@ fn expectPrefixExpr(self: *Parser) Error!Node.Index {
 
 /// PrimaryExpr
 ///     <- IfExpr
+///      / OCTOTHORPE Expr
 ///      / KEYWORD_break BreakLabel? Expr?
 ///      / KEYWORD_continue BreakLabel?
 ///      / KEYWORD_return Expr?
@@ -474,6 +484,14 @@ fn expectPrefixExpr(self: *Parser) Error!Node.Index {
 fn parsePrimaryExpr(self: *Parser) Error!Node.Index {
     switch (self.token_tags[self.tok_i]) {
         .keyword_if => return self.parseIfExpr(),
+        .octothorpe => return self.addNode(.{
+            .tag = .@"comptime",
+            .main_token = self.nextToken(),
+            .data = .{
+                .lhs = undefined,
+                .rhs = try self.expectExpr(),
+            },
+        }),
         .keyword_break => return self.addNode(.{
             .tag = .@"break",
             .main_token = self.nextToken(),

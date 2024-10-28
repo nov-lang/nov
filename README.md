@@ -513,7 +513,7 @@ TODO
 <!-- Yes this is not really lisible as raw text -->
 | Name                  | Syntax            | Types                                        | Remarks                                                             |
 |-----------------------|-------------------|----------------------------------------------|---------------------------------------------------------------------|
-| Assignment            | a = b             | All types                                    | `a` is an identifier and `b` is any type.                           |
+| Assignment            | a = b             | All types                                    | `a` is an identifier and `b` is an expression.                           |
 | Addition              | a + b <br> a += b | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                                |
 | Concatenation         | a + b <br> a += b | string <br> [Arrays](#Arrays)                | TODO                                                                |
 | Substraction          | a - b <br> a -= b | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                                |
@@ -554,7 +554,6 @@ TODO
 ```
 x() x[] x.y x.? x.! x.*
 E!T
-x{}
 !x -x ~x &x *T ?T
 * / %
 + -
@@ -689,7 +688,8 @@ let x = #fibonacci(10)
 ; comptime block
 let x = #{}
 
-; comptime variable semantic aren't yet defined
+; comptime variable
+let mut x: #int = 0
 
 ; comptime parameter
 let ArrayList: (T: #type) -> type = ...

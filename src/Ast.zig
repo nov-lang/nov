@@ -2,6 +2,7 @@
 // See https://github.com/ziglang/zig/blob/master/LICENSE for additional LICENSE details
 
 const std = @import("std");
+const Render = @import("Render.zig");
 const Parser = @import("Parser.zig");
 const Tokenizer = @import("Tokenizer.zig");
 const Token = Tokenizer.Token;
@@ -28,6 +29,21 @@ pub fn deinit(self: *Ast, allocator: std.mem.Allocator) void {
     allocator.free(self.extra_data);
     allocator.free(self.errors);
     self.* = undefined;
+}
+
+pub fn render(self: Ast, allocator: std.mem.Allocator) Render.Error![]u8 {
+    var buffer = std.ArrayList(u8).init(allocator);
+    defer buffer.deinit();
+    try self.renderToArrayList(&buffer, .{});
+    return buffer.toOwnedSlice();
+}
+
+pub fn renderToArrayList(
+    self: Ast,
+    buffer: *std.ArrayList(u8),
+    fixups: Render.Fixups,
+) Render.Error!void {
+    return Render.renderTree(buffer, self, fixups);
 }
 
 pub const Location = struct {
@@ -1099,7 +1115,9 @@ pub const Node = struct {
         /// main_token is the dot.
         /// rhs is the `!` token index.
         unwrap_result,
-        /// `lhs.*`. rhs is unused.
+        /// `lhs.*`.
+        /// main_token is the dot.
+        /// rhs is the `*` token index.
         deref,
         /// `lhs == rhs`. main_token is op.
         equal_equal,
@@ -1153,7 +1171,7 @@ pub const Node = struct {
         // TODO: lhs >>= |args| expr
         /// `lhs >>= rhs`. main_token is op.
         bind,
-        // `lhs in rhs`. main_token is op.
+        /// `lhs in rhs`. main_token is op.
         in,
         /// `lhs and rhs`. main_token is op.
         bool_and,
@@ -1175,14 +1193,12 @@ pub const Node = struct {
         optional_type,
         /// `[]rhs`. lhs is unused.
         array_type,
-        /// `#lhs`. rhs unused.
-        /// main_token is the `#`.
-        @"comptime",
         /// `lhs[rhs]`.
         /// rhs is the `range` node index.
         /// main_token is the lbracket.
         slice,
         /// `lhs[rhs]`.
+        /// main_token is the lbracket.
         array_access,
         /// `[lhs, rhs]`. lhs and rhs can be omitted.
         /// main_token points at the lbracket.
@@ -1227,7 +1243,8 @@ pub const Node = struct {
         @"if",
         /// `if lhs {} else {}`. `If[rhs]`.
         if_else,
-        /// `continue`. lhs is token index of label if any. rhs is unused.
+        /// `continue :lhs`.
+        /// lhs is token index of label if any. rhs is unused.
         @"continue",
         /// `break :lhs rhs`
         /// lhs and rhs may be omitted.
@@ -1236,6 +1253,9 @@ pub const Node = struct {
         @"return",
         // `defer rhs`. rhs is the deferred expression. lhs is unused.
         @"defer",
+        /// `#rhs`. lhs unused.
+        /// main_token is the `#`.
+        @"comptime",
         /// `(a: lhs) -> rhs`.
         /// lhs and rhs can be omitted.
         /// main_token is the `(`.

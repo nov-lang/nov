@@ -32,7 +32,6 @@ Keep Nov away from:
   - test: run unit tests
   - fmt: format nov code
     - works like zig fmt but for nov
-    - rename variable, functions and types to snake_case, camelCase and PascalCase?
 - add tests, mainly for Parser, IRs, Codegen and Runtime
 - add render.zig which render an Ast, core of fmt and used for testing parser
   - based on std.zig.render from https://github.com/ziglang/zig/pull/21727
@@ -486,9 +485,12 @@ via SA_SIGINFO (see std.debug.attachSegfaultHandler) `@[signal_handler(signal, a
 # Comptime
 ```nov
 ; comptime variable?
+let mut x = #0 ; no
+let mut x: #int = 0 ; probably the best, #int and #uint can be bigger than their runtime equivalent
 let mut #x = 0
+let #mut x = 0
 
-; change comptime param to this to match with comptime var?
+; change the last two change param to this to match with comptime var
 let ArrayList: (#T: type) -> type = { ... }
 ; instead of
 let ArrayList: (T: #type) -> type = { ... }
