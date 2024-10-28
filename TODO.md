@@ -103,7 +103,7 @@ let myStruct = struct {}
 - add `any` similar to zig's `anytype`
 - assign destructure like zig
 - make slice immutable or find a way to differentiate ref from copy...
-- embed tcc into the compilator?
+- embed tcc into the compilator? (revive the repl proposal)
 
 - arbitrary sized integers?
 - support relative import e.g. `@import("github.com/nov-lang/idk_lib")`
@@ -114,6 +114,23 @@ let myStruct = struct {}
 - add a way to convert a int to enum and enum to int.
 - add a way to create an enum from a string.
 - `opaque` container...
+- add a [cons](https://en.wikipedia.org/wiki/Cons) operator instead of doing
+  `+ [x]` to append a single element to an array?
+- I think that we can actually allow parenthesis for grouping since function is
+  now a type so it shouldn't make any issue in the parser
+  - test this after implementing basic IR/CodeGen
+  - note that this conflicts with one of the closure proposal
+- Remove `.!`, rename `.?` to unwrap/try and make it overridable?
+- Move `@print` etc... to stdlib? (either need to wrap args in an anonymous
+  struct or allow to pass a variadic amount of parameters to a function).
+
+# proposal: add Traits or something similar
+Currently many proposals are about using arbitrary declaration for overloading
+behavior like `.toString()` overwrite the default format, `.len` override idk
+what, `.next()` implem an iterator, etc...
+
+I think it's a better idea to uniformize all of that with specific description
+like traits which should make the language easier to understand and read.
 
 # proposal: Annotations for container fields aka Tags
 add [tags](https://github.com/Hejsil/zig-clap/issues/8#issuecomment-381637825)
@@ -296,7 +313,7 @@ let result = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 # Slice
 TODO: https://docs.vlang.io/v-types.html#array-slices
 
-slicing creates a ref by default unless type annotation state otherwise?
+slicing creates a ref by default unless type attribute state otherwise?
 
 # Map
 TODO: https://docs.vlang.io/v-types.html#maps
@@ -354,9 +371,14 @@ let getName: (s: string) -> string = {
 
 ## Iterators
 - an iterator is any object with a public .next() method that returns an
-  Option(T) e.g. `next: (T) -> ?U`
-- use [] and .len operator overloading instead?
-  - what about getting reference or making assignement to object[i]
+  Option(T) e.g. `next: (*T) -> ?U`
+  - need a `(*T) -> ?*mut U`
+- use &[], [] and .len operator overloading instead?
+  - []: `(*T, int) -> U`
+  - &[]: `(*T, int) -> *mut U`
+  - this is better than .next() because we know the len and [] op overloading
+    is a cool side effect but it's a pain to have separate [] and .len
+    overloading doesn't make much sense
 - use async with yield for iterators
 
 ## Use after realloc / iterator invalidation
@@ -400,8 +422,8 @@ pub fn main() !void {
 
 # Operator Overloading
 TODO:
-- `>>=`: (T, (T) -> U) -> U
-- `[]`: (T, int) -> U
+- `>>=`: (*T, (*T) -> U) -> U
+- `[]`: (*T, int) -> U
 - for unary negation `-`, autogen it from `-` operator and `zero` decl?
 
 # C FFI
@@ -492,6 +514,7 @@ let ArrayList: (T: #type) -> type = { ... }
     - probably better semantic
     - string manipulation is done with []u8 instead
 - `void` is Nov's unit type (`()` in Rust and OCaml, `Nil` in Gleam)
+  - `void` only value is `[]` (`{}` in zig)
 - about variable initialization:
   - initialize to zero by default if there is no initializer
   - no initialization if there is no initializer
@@ -502,7 +525,7 @@ let ArrayList: (T: #type) -> type = { ... }
   - put it on the stack/heap? need executable memory which is bad, also idk how gc will handle that
   - look at how ocaml or rust does it
 - comptime assertion like `let _ = #{}`?
-- move generic to annotations? `@[generic(T)]`
+- move generic to attributes? `@[generic(T)]`
 
 # Stuff to check & links
 - check https://docs.vlang.io/functions-2.html#anonymous-&-higher-order-functions + closures
@@ -534,3 +557,4 @@ let ArrayList: (T: #type) -> type = { ... }
 - Builtins
   - https://docs.vlang.io/conditional-compilation.html
   - https://docs.python.org/3.12/library/functions.html
+- https://en.wikipedia.org/wiki/Clean_(programming_language)#Examples

@@ -409,13 +409,11 @@ pub fn firstToken(self: Ast, node: Node.Index) TokenIndex {
         .call_one_comma,
         .call,
         .call_comma,
-        .match_range,
+        .range,
         .function_pipe,
         .bind,
         .in,
-        .is,
         .attr_decl_one,
-        .slice_open,
         .slice,
         .array_access,
         .result_union,
@@ -495,11 +493,9 @@ pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
         .@"if",
         .match_case_one,
         .match_case,
-        .match_range,
         .function_pipe,
         .bind,
         .in,
-        .is,
         .decl,
         .attr_decl_one,
         .attr_decl,
@@ -594,19 +590,6 @@ pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
             assert(extra.end - extra.start > 0);
             end_offset += 2; // rparen rbracket
             n = self.extra_data[extra.end - 1]; // last attribute
-        },
-
-        .slice_open => {
-            end_offset += 2; // ellipsis2 rbracket
-            n = datas[n].rhs;
-            assert(n != 0);
-        },
-
-        .slice => {
-            const extra = self.extraData(datas[n].rhs, Node.Slice);
-            assert(extra.end != 0); // should have used slice_open
-            end_offset += 1; // for the rbracket
-            n = extra.end;
         },
 
         .match => {
@@ -1104,11 +1087,17 @@ pub const Node = struct {
         /// `SubRange[lhs]` of attr
         /// rhs is the decl
         attr_decl,
-        /// `lhs.a`. main_token is the dot. rhs is the identifier token index.
+        /// `lhs.a`.
+        /// main_token is the dot.
+        /// rhs is the identifier token index.
         field_access,
-        /// `lhs.?`. main_token is the dot. rhs is the `?` token index.
+        /// `lhs.?`.
+        /// main_token is the dot.
+        /// rhs is the `?` token index.
         unwrap_option,
-        /// `lhs.!`. main_token is the dot. rhs is the `!` token index.
+        /// `lhs.!`.
+        /// main_token is the dot.
+        /// rhs is the `!` token index.
         unwrap_result,
         /// `lhs.*`. rhs is unused.
         deref,
@@ -1166,8 +1155,6 @@ pub const Node = struct {
         bind,
         // `lhs in rhs`. main_token is op.
         in,
-        // `lhs is rhs`. main_token is op.
-        is,
         /// `lhs and rhs`. main_token is op.
         bool_and,
         /// `lhs or rhs`. main_token is op.
@@ -1191,10 +1178,8 @@ pub const Node = struct {
         /// `#lhs`. rhs unused.
         /// main_token is the `#`.
         @"comptime",
-        /// `lhs[rhs..]`
-        /// main_token is the lbracket.
-        slice_open,
-        /// `lhs[a..b]`. `Slice[rhs]`.
+        /// `lhs[rhs]`.
+        /// rhs is the `range` node index.
         /// main_token is the lbracket.
         slice,
         /// `lhs[rhs]`.
@@ -1233,7 +1218,10 @@ pub const Node = struct {
         /// main_token is the `=>`.
         match_case,
         /// `lhs..rhs`.
-        match_range,
+        /// `lhs..=rhs`.
+        /// rhs can be omitted.
+        /// main_token is the `..` or `..=`.
+        range,
         // TODO: loop
         /// `if lhs {}`. rhs is the block.
         @"if",
@@ -1331,11 +1319,6 @@ pub const Node = struct {
         then_expr: Index,
         /// can be a block or another if expression
         else_expr: Index,
-    };
-
-    pub const Slice = struct {
-        start: Index,
-        end: Index,
     };
 
     // pub const Loop = struct {

@@ -287,7 +287,7 @@ const Precedence = enum(i8) {
     bool_or = 20, // or
     bool_and = 30, // and
     comparison = 40, // == != < > <= >=
-    bitwise = 50, // & ^ | in is
+    bitwise = 50, // & ^ | in
     shift = 60, // << >>
     term = 70, // + -
     factor = 80, // * / %
@@ -332,7 +332,6 @@ const rules = std.enums.directEnumArrayDefault(Token.Tag, Rule, .{ .prec = .none
     .caret = .{ .prec = .bitwise, .tag = .bit_xor },
     .pipe = .{ .prec = .bitwise, .tag = .bit_or },
     .keyword_in = .{ .prec = .bitwise, .tag = .in },
-    .keyword_is = .{ .prec = .bitwise, .tag = .is },
 
     .l_angle_bracket_angle_bracket = .{ .prec = .shift, .tag = .shl },
     .r_angle_bracket_angle_bracket = .{ .prec = .shift, .tag = .shr },
@@ -349,7 +348,8 @@ const rules = std.enums.directEnumArrayDefault(Token.Tag, Rule, .{ .prec = .none
 // let x = list
 //     .map()
 //     .filter()
-//     .reuduce()
+//     .reduce()
+// or do like Roc aka remove variables don't have methods only containers do so we use |> instead
 fn parseExprPrecedence(self: *Parser, min_prec: Precedence, strict: bool) Error!Node.Index {
     std.debug.assert(@intFromEnum(min_prec) >= 0);
     if (!strict) {
@@ -873,24 +873,24 @@ fn parseMatchProng(self: *Parser) Error!Node.Index {
     }
 }
 
-/// MatchItem <- Expr (DOT3 Expr)?
+/// MatchItem <- Expr ((DOTDOT / DOTDOTEQUAL) Expr)?
 fn parseMatchItem(self: *Parser) Error!Node.Index {
     const expr = try self.parseExprStrict();
     if (expr == null_node) {
         return null_node;
     }
 
-    if (self.eatToken(.ellipsis3)) |token| {
-        return self.addNode(.{
-            .tag = .match_range,
-            .main_token = token,
+    return switch (self.token_tags[self.tok_i]) {
+        .period_period, .period_period_equal => return self.addNode(.{
+            .tag = .range, // TODO rhs can't be null for match
+            .main_token = self.nextToken(),
             .data = .{
                 .lhs = expr,
                 .rhs = try self.expectExprStrict(),
             },
-        });
-    }
-    return expr;
+        }),
+        else => return expr,
+    };
 }
 
 // TODO: use parseList or make it more like parseBlock, this is too long
@@ -1002,6 +1002,7 @@ fn parseTypeExpr(self: *Parser) Error!Node.Index {
             },
         }),
         .l_bracket => {
+            // TODO: probably try to have []T and if it's fail fallback to parseResultUnionExpr
             const lbracket = self.nextToken();
             _ = try self.expectToken(.r_bracket);
             return self.addNode(.{
@@ -1169,7 +1170,7 @@ fn parsePrimaryTypeExpr(self: *Parser) Error!Node.Index {
 }
 
 /// SuffixOp
-///     <- LBRACKET Expr (DOT2 Expr?)? RBRACKET
+///     <- LBRACKET Expr ((DOTDOT / DOTDOTEQUAL) Expr?)? RBRACKET
 ///      / DOT IDENTIFIER
 ///      / DOTQUESTIONMARK
 ///      / DOTEXCLAMATIONMARK
@@ -1180,40 +1181,39 @@ fn parseSuffixOp(self: *Parser, lhs: Node.Index) Error!Node.Index {
             const lbracket = self.nextToken();
             const index_expr = try self.expectExpr();
 
-            if (self.eatToken(.ellipsis2) != null) {
-                const end_expr = try self.parseExpr();
-                _ = try self.expectToken(.r_bracket);
-                if (end_expr == null_node) {
+            switch (self.token_tags[self.tok_i]) {
+                .period_period, .period_period_equal => {
+                    const range_token = self.nextToken();
+                    const end_expr = try self.parseExpr();
+                    _ = try self.expectToken(.r_bracket);
                     return self.addNode(.{
-                        .tag = .slice_open,
+                        .tag = .slice,
+                        .main_token = lbracket,
+                        .data = .{
+                            .lhs = lhs,
+                            .rhs = try self.addNode(.{
+                                .tag = .range,
+                                .main_token = range_token,
+                                .data = .{
+                                    .lhs = index_expr,
+                                    .rhs = end_expr,
+                                },
+                            }),
+                        },
+                    });
+                },
+                else => {
+                    _ = try self.expectToken(.r_bracket);
+                    return self.addNode(.{
+                        .tag = .array_access,
                         .main_token = lbracket,
                         .data = .{
                             .lhs = lhs,
                             .rhs = index_expr,
                         },
                     });
-                }
-                return self.addNode(.{
-                    .tag = .slice,
-                    .main_token = lbracket,
-                    .data = .{
-                        .lhs = lhs,
-                        .rhs = try self.addExtra(Node.Slice{
-                            .start = index_expr,
-                            .end = end_expr,
-                        }),
-                    },
-                });
-            }
-            _ = try self.expectToken(.r_bracket);
-            return self.addNode(.{
-                .tag = .array_access,
-                .main_token = lbracket,
-                .data = .{
-                    .lhs = lhs,
-                    .rhs = index_expr,
                 },
-            });
+            }
         },
         .period => switch (self.token_tags[self.tok_i + 1]) {
             .identifier => return self.addNode(.{
@@ -1248,10 +1248,6 @@ fn parseSuffixOp(self: *Parser, lhs: Node.Index) Error!Node.Index {
                     .rhs = self.nextToken(),
                 },
             }),
-            // .l_brace => {
-            //     // this a misplaced `.{`, handle the error somewhere else
-            //     return null_node;
-            // },
             else => {
                 self.tok_i += 1;
                 try self.warn(.expected_suffix_op);

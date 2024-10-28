@@ -1,6 +1,5 @@
 const std = @import("std");
 
-/// Does not include arrays and maps
 pub const names = std.StaticStringMap(void).initComptime(.{
     .{"bool"},
     // .{"c_int"},
@@ -38,7 +37,7 @@ pub const names = std.StaticStringMap(void).initComptime(.{
     .{"uint"},
     // .{"undefined"},
     .{"void"},
-    .{"voidptr"},
+    // .{"voidptr"},
 });
 
 pub fn isPrimitive(name: []const u8) bool {

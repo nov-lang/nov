@@ -8,12 +8,9 @@ Nov [typing discipline](https://en.wikipedia.org/wiki/Type_system) is
 sound and
 [manifest](https://en.wikipedia.org/wiki/Manifest_typing) with bidirectional inference.
 
-Nov has [uncolored](https://journal.stuffwithstuff.com/2015/02/01/what-color-is-your-function/) async!
-(well not yet tho)
-
 Nov has automatic memory management via a minimal tracing GC.
 <!-- https://github.com/ivmai/bdwgc -->
-<!-- autofree https://docs.vlang.io/memory-management.html -->
+<!-- autofree? https://docs.vlang.io/memory-management.html -->
 
 # Concepts
 
@@ -198,12 +195,10 @@ let MyUnion = union(MyEnum) {
 let x = MyUnion[ .b = 3 ]
 x.a ; runtime error
 
-; Use the `is` keyword to check the tag of an union
-@println(x is .b) ; prints true
-
-; `==` between unions is illegal unless it is overloaded
-x == MyUnion[ .b = 3 ] ; compile error
-
+; use `==` to check the tag of an union
+; if `==` is overloaded in the union it will be used instead
+; note that using `==` in the function overloading `==` will fallback to the default behavior
+@println(x == .b) ; prints true
 ```
 
 ### Generics
@@ -377,8 +372,9 @@ TODO
 match 5 {
     0 | 1 | 2 => ... ; use `|` to specify multiple cases
     {0b100 | 0b001} => ... ; wrap your expr in a {} to use `|` bitwise operator
-    10...20 => ... ; use `x...y` to match over x to y included, [x;y]
-    21 => {} ; {} does nothing, it's a empty block
+    10..20 => ... ; use `x..y` to match over x to y excluded, [x;y[
+    20..=30 => ... ; use `x..=` to match over x to y included, [x;y]
+    31 => {} ; {} does nothing, it's a empty block
     _ => {} ; _ correspond to every other possible values
 }
 ```
@@ -419,8 +415,11 @@ loop item in items {}
 
 ; n takes values [0;10[
 ; note than the boundary doesn't need to be literal
-; loop n in x..y {} is fine as long as x and y are unsigned integers
+; loop n in x..y {} is fine as long as x and y are unsigned? integers
 loop n in 0..10 {}
+
+; n takes values [0;10]
+loop n in 0..=10 {}
 
 ; it's possible to loop on multiple values at the same time as long as they
 ; have the same length
@@ -653,26 +652,28 @@ TODO
 
 ## Attributes
 - `@[deprecated]` - `@[deprecated("message...")]`
-- `@[warnif(cond, message)]` idk
-- `@[operator(op)]`
-- `@[pure]` (mainly for extern functions) ([Pure functions](https://en.wikipedia.org/wiki/Functional_programming#Pure_functions))
+- `@[operator(op)]`: Note that op is an enum for easier parsing.
+- `@[pure]`: Mainly for extern functions, a [pure function](https://en.wikipedia.org/wiki/Functional_programming#Pure_functions))
+             can only call pure functions but impure functions can call a pure function without issue.
 - `@[extern]`
 - `@[packed]`
 - `@[export]`
 - `@[inline]`
 - `@[noinline]`
 - `@[cold]`
-- `@[noreturn]` or have it as a return type?
-- `@[test]` decl with it are ignored unless run with `nov test` where it behave like `zig test`
+- `@[noreturn]`: Specify that a function can't return.
+- `@[test]`: Decl with it are ignored unless run with `nov test` where it behave like `zig test`.
 <!-- - `@[callconv]` -->
 - `@[public]`
 - `@[private]`
-- `@[memoize]` (?)
+- `@[memoize]`: (?, related to pure...)
+- `@[require(condition..., "optional error message")`: Ensure that the specified conditions are verified for the arguments given to a function or to a container initializer.
+<!-- - `@[ensure(condition..., "optional error message")`: Ensure that the specified conditions are verified for the values returned by a function. -->
 
 Attributes can be set only on top level / container declarations
 
 ## Visibility
-Visibility is modified via (attributes)[# Attributes].
+Visibility is modified via [attributes](#Attributes).
 
 - public: visible everywhere
 - private: visible only in current file

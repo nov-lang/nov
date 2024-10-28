@@ -35,8 +35,8 @@ pub const Token = struct {
         octothorpe,
         comma,
         period,
-        ellipsis2,
-        ellipsis3,
+        period_period,
+        period_period_equal,
         colon,
         question_mark,
         bang,
@@ -80,7 +80,6 @@ pub const Token = struct {
         keyword_break,
         keyword_continue,
         keyword_in,
-        keyword_is,
         keyword_defer,
         keyword_enum,
         keyword_struct,
@@ -93,6 +92,7 @@ pub const Token = struct {
         keyword_suspend,
         keyword_nosuspend,
         keyword_opaque,
+        keyword_volatile,
 
         pub fn lexeme(tag: Tag) ?[]const u8 {
             return switch (tag) {
@@ -117,8 +117,8 @@ pub const Token = struct {
                 .octothorpe => "#",
                 .comma => ",",
                 .period => ".",
-                .ellipsis2 => "..",
-                .ellipsis3 => "...",
+                .period_period => "..",
+                .period_period_equal => "..=",
                 .colon => ":",
                 .question_mark => "?",
                 .bang => "!",
@@ -172,8 +172,8 @@ pub const Token = struct {
                 .keyword_struct => "struct",
                 .keyword_union => "union",
                 .keyword_defer => "defer",
-                .keyword_is => "is",
                 .keyword_opaque => "opaque",
+                .keyword_volatile => "volatile",
             };
         }
 
@@ -186,7 +186,7 @@ pub const Token = struct {
                 .eof => "EOF",
                 .invalid => "invalid bytes",
                 .identifier => "an identifier",
-                .builtin => "a builtin function",
+                .builtin => "a builtin literal",
                 .string_literal => "a string literal",
                 .char_literal => "a character literal",
                 .number_literal => "a number literal",
@@ -590,11 +590,11 @@ pub fn next(self: *Tokenizer) Token {
         .period_2 => {
             self.index += 1;
             switch (self.buffer[self.index]) {
-                '.' => {
-                    result.tag = .ellipsis3;
+                '=' => {
+                    result.tag = .period_period_equal;
                     self.index += 1;
                 },
-                else => result.tag = .ellipsis2,
+                else => result.tag = .period_period,
             }
         },
         .slash => {
@@ -877,16 +877,16 @@ test "pipe, monad and builtin" {
 }
 
 test "range literals" {
-    try testTokenize("0..9", &.{ .number_literal, .ellipsis2, .number_literal });
-    try testTokenize("0x00..0x09", &.{ .number_literal, .ellipsis2, .number_literal });
-    try testTokenize("0b00..0b11", &.{ .number_literal, .ellipsis2, .number_literal });
-    try testTokenize("0o00..0o11", &.{ .number_literal, .ellipsis2, .number_literal });
+    try testTokenize("0..9", &.{ .number_literal, .period_period, .number_literal });
+    try testTokenize("0x00..0x09", &.{ .number_literal, .period_period, .number_literal });
+    try testTokenize("0b00..0b11", &.{ .number_literal, .period_period, .number_literal });
+    try testTokenize("0o00..0o11", &.{ .number_literal, .period_period, .number_literal });
 
-    try testTokenize("0...9", &.{ .number_literal, .ellipsis3, .number_literal });
-    try testTokenize("'0'...'9'", &.{ .char_literal, .ellipsis3, .char_literal });
-    try testTokenize("0x00...0x09", &.{ .number_literal, .ellipsis3, .number_literal });
-    try testTokenize("0b00...0b11", &.{ .number_literal, .ellipsis3, .number_literal });
-    try testTokenize("0o00...0o11", &.{ .number_literal, .ellipsis3, .number_literal });
+    try testTokenize("0..=9", &.{ .number_literal, .period_period_equal, .number_literal });
+    try testTokenize("'0'..='9'", &.{ .char_literal, .period_period_equal, .char_literal });
+    try testTokenize("0x00..=0x09", &.{ .number_literal, .period_period_equal, .number_literal });
+    try testTokenize("0b00..=0b11", &.{ .number_literal, .period_period_equal, .number_literal });
+    try testTokenize("0o00..=0o11", &.{ .number_literal, .period_period_equal, .number_literal });
 }
 
 test "code point literal with hex escape" {
@@ -997,7 +997,7 @@ test "int literals decimal" {
     try testTokenize("7", &.{.number_literal});
     try testTokenize("8", &.{.number_literal});
     try testTokenize("9", &.{.number_literal});
-    try testTokenize("1..", &.{ .number_literal, .ellipsis2 });
+    try testTokenize("1..", &.{ .number_literal, .period_period });
     try testTokenize("0a", &.{.number_literal});
     try testTokenize("9b", &.{.number_literal});
     try testTokenize("1z", &.{.number_literal});
