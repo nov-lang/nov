@@ -21,6 +21,8 @@ Doc comments start with exactly three semicolon (i.e. `;;;` but not `;;;;`).
 Doc comments are used to automatically generate documentation.
 
 ## Functions
+Nov functions can be understood as lazy or postponed expressions that takes parameters.
+
 Parameters are immutable by default.
 
 Parenthesis are specific to functions, whenever there is a parenthesis there is a function involved.
@@ -159,14 +161,14 @@ let z = [ 10, 20, 30 ]
 
 ### Union
 Union is Nov's equivalent of [Sum type](https://en.wikipedia.org/wiki/Tagged_union)
-since a Nov's union always stores its tag unless annotated with `@[extern]`.
-Thus we can match on any union to find its active field.
-
-Note that it isn't represented here but a union field can have a default value just like a struct field.
+since Nov's unions are always tagged unless annotated with `@[extern]`.
+Thus we can match on an union to find its active field.
 
 See [Result and Option unions](#result-and-option-unions) for an example of generic unions.
+
 ```nov
-let Tree = union {
+let NodeKind = enum { empty, node }
+let Tree = union(NodeKind) {
     empty,
     node: struct {
         value: int,
@@ -183,22 +185,37 @@ let mut leaf = Tree.empty[]
 let a = Tree.node[ .value = 0, .left = &leaf, .right = &leaf ]
 let b: Tree = .node[ .value = 0, .left = &leaf, .right = &leaf ]
 
-; we can also create an union from an enum
-let MyEnum = enum { a, b, c, d }
-let MyUnion = union(MyEnum) {
-    a: int,
-    b: float,
-    c: int,
-    d: string,
+; we can also create an union without explicit enum
+let Number = union {
+    raw: int = 0, ; provide a default value for Number.raw
+    text: string,
+
+    ;;; Converts a Number to an int
+    let toRaw: (self: Number) -> int = {
+        match self {
+            .raw => |raw| return raw
+            .text => ... ; TODO: parseInt
+        }
+    }
+
+    @[public]
+    @[operator(.@"==")]
+    let eql: (a: Number, b: Number) -> bool = {
+        a.toRaw() == b.toRaw()
+    }
 }
 
-let x = MyUnion[ .b = 3 ]
-x.a ; runtime error
+let x = Number.raw[3]
+x.text ; runtime error
 
-; use `==` to check the tag of an union
-; if `==` is overloaded in the union it will be used instead
-; note that using `==` in the function overloading `==` will fallback to the default behavior
-@println(x == .b) ; prints true
+; `==` can be used to check the tag of an union and to compare two unions
+; overloading `==` in an union only overload the comparison between two unions,
+; not between the tag
+@println(x == .raw) ; prints true
+@println(x == .text) ; prints false
+
+@println(x == .raw[4]) ; prints false
+@println(x == .text["3"]) ; prints true, would have been false if we hadn't overloaded the `==` operator
 ```
 
 ### Generics
@@ -324,9 +341,11 @@ my_array = []
 let my_array_of_array = [["Hello", "World!"], ["Bonjour", "Monde!"]]
 @TypeOf(my_array_of_array) ; returns [][]string
 
-; proposals about copy/ref of variables
-; side note, it kinda sucks to hide through type is something is copied or not
+; TODO:
+; proposal about copy/ref of variables
+; side note, it kinda sucks to hide through type if something is copied or not
 ; we're trying to solve that btw https://jvns.ca/blog/2024/08/06/go-structs-copied-on-assignment/
+; ---
 ; alias because it's long to type. we specify the type so it's passed by
 ; reference and create an actual alias instead of copying the data
 let arr_arr: *[][]string = my_array_of_array
@@ -375,7 +394,7 @@ match 5 {
     10..20 => ... ; use `x..y` to match over x to y excluded, [x;y[
     20..=30 => ... ; use `x..=` to match over x to y included, [x;y]
     31 => {} ; {} does nothing, it's a empty block
-    _ => {} ; _ correspond to every other possible values
+    _ => {} ; _ corresponds to every other possible values
 }
 ```
 
@@ -392,10 +411,10 @@ if a < b {
     @println("{a} == {b}")
 }
 
-; all If are expressions which means that they all return a value
+; all ifs are expressions which means that they all return a value
 ; the previous if returns `void`
 ; this one returns a bool
-let is_even = if 69 % 2 == 0 { true } else { false }
+let is_even = if 69 % 2 == 0 {true} else {false}
 ; another example which returns an Option(int)
 let x: ?int = if is_even {
     @println("even")
@@ -478,7 +497,7 @@ let b = 4 ; @TypeOf(b) == int
 let x = y = 3 ; parse error
 let x = a += b ; parse error
 let x = {y = 3} ; should be fine, @TypeOf(x) == void
-let z += 3 ; compile error, z is not defined
+let z += 3 ; compile error, expected `=`
 ```
 
 ## Primitive Types
@@ -544,11 +563,10 @@ TODO
 | Function Pipe         | a \|> f           | [Functions](#Functions)                      | TODO                                                                |
 | Member Search         | a **in** b        | [Arrays](#Arrays)                            | TODO                                                                |
 | Access                | a\[b]             | [Arrays](#Arrays) <br> string                | TODO: b is an Integer                                               |
-| Active Field          | a **is** b        | [Union](#Union)                              | TODO                                                                |
 | Field / Method Access | a.b               | All types                                    | TODO                                                                |
 | Reference Type        | *T <br> *mut T    | All types                                    | Create a reference type from `T`. Unless `mut` is specified the wrapped value is constant |
 | Reference Of          | &a                | All types                                    | Returns a reference to `a`.                                         |
-| Dereference           | a.*               | Reference                                    | Unwrap a reference type, this is done automatically when using `.`. |
+| Dereference           | a.*               | Reference                                    | Unwrap a reference type, this is done automatically when using `.` or `[]`. |
 
 ## Precedence
 ```
@@ -558,7 +576,7 @@ E!T
 * / %
 + -
 << >>
-& ^ | in is
+& ^ | in
 == != < > <= >=
 and
 or
@@ -603,7 +621,7 @@ x + y ; returns Complex[ .re = 7, .im = 10 ]
 ```
 
 ## String Interpolation
-`"{varname:[fill][alignment][width][.precision][type]}"`
+`"{varname:[fill][alignment][width][.precision]}"`
 
 Escape `{` and `}` with `\`.
 
@@ -612,7 +630,7 @@ TODO
 
 ## Builtins
 ### Functions
-- `@import(path: string)`: Import a nov file. See (Visibility)[#Visibility] for which declarations gets imported.
+- `@import(path: string)`: Import a nov file. See [Visibility](#Visibility) for which declarations gets imported.
 - `@TypeOf(...)`: Returns the type of a value.
 - `@typeInfo(...)`: Returns type information about a value.
 - `@This()`: Returns the type of the current container
@@ -652,7 +670,7 @@ TODO
 ## Attributes
 - `@[deprecated]` - `@[deprecated("message...")]`
 - `@[operator(op)]`: Note that op is an enum for easier parsing.
-- `@[pure]`: Mainly for extern functions, a [pure function](https://en.wikipedia.org/wiki/Functional_programming#Pure_functions))
+- `@[pure]`: Mainly for extern functions, a [pure function](https://en.wikipedia.org/wiki/Functional_programming#Pure_functions)
              can only call pure functions but impure functions can call a pure function without issue.
 - `@[extern]`
 - `@[packed]`
@@ -680,7 +698,7 @@ Visibility is modified via [attributes](#Attributes).
                when importing as a module (`@import("std")`)
 
 ## Comptime
-Works like zig except that we use `#` instead of `comptime`
+Works almost like zig except that we use `#` instead of `comptime`
 ```nov
 ; comptime expr
 let x = #fibonacci(10)
@@ -692,7 +710,7 @@ let x = #{}
 let mut x: #int = 0
 
 ; comptime parameter
-let ArrayList: (T: #type) -> type = ...
+let intList: (len: #uint) -> []int = ...
 ```
 
 # Inspirations

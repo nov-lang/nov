@@ -96,14 +96,13 @@ let myStruct = struct {}
 let myStruct = struct {}
 ```
 - Use [chameleon](https://github.com/tr1ckydev/chameleon/) for colors
-- Support [APE](https://justine.lol/ape.html)? / Use it by default?
+- Support [APE](https://justine.lol/ape.html) & [Cosmopolitan](https://github.com/jart/cosmopolitan)? / Use it by default?
 - Support casting? (check [this](https://c3-lang.org/language-rules/conversion/))
 - type as values
 - add `any` similar to zig's `anytype`
 - assign destructure like zig
 - make slice immutable or find a way to differentiate ref from copy...
 - embed tcc into the compilator? (revive the repl proposal)
-
 - arbitrary sized integers?
 - support relative import e.g. `@import("github.com/nov-lang/idk_lib")`
 - support circular imports
@@ -122,6 +121,10 @@ let myStruct = struct {}
 - Remove `.!`, rename `.?` to unwrap/try and make it overridable?
 - Move `@print` etc... to stdlib? (either need to wrap args in an anonymous
   struct or allow to pass a variadic amount of parameters to a function).
+- Make `*` always `*mut`? What are the positives and negatives of this change?
+- Change string interpolation to
+  `"{varname:[fill][alignment][width][.precision]:[custom options]}"`
+  and use format like zig instead of toString?
 
 # proposal: add Traits or something similar
 Currently many proposals are about using arbitrary declaration for overloading
@@ -130,6 +133,9 @@ what, `.next()` implem an iterator, etc...
 
 I think it's a better idea to uniformize all of that with specific description
 like traits which should make the language easier to understand and read.
+
+Add a way to tell that a container implement a certain behavior, maybe
+`@[impl(Iterator)]`, need a way to describe behavior.
 
 # proposal: Annotations for container fields aka Tags
 add [tags](https://github.com/Hejsil/zig-clap/issues/8#issuecomment-381637825)
@@ -168,9 +174,44 @@ let Todo = struct {
 ```
 
 # Closures, anonymous functions & bind
+Missing README examples:
+- return a function
+- return a closure
+- create a closure
+- pass a closure as argument
+- ...?
+
 ```nov
+let forEach: (a: *mut []int, f: (int) -> int) = {
+    for i in 0..a.len {
+        a[i] = f(a[i])
+    }
+}
+let a = [1, 2, 3]
+; we need to specify the name of the argument but that's it (?)
+; no need to specify the return type since it's inferred, no need for ->
+; no need to specify the type of params sicne it's inferred
+; body can be an expr since || delimit it
+;
+; so we have 2 types of functions, classic functions and instant function that
+; needs to name its parameter but everything else is inferred from type,
+forEach(a, |x| x + 1)
+
+; similar to rust
+let add = |a: int, b: int| -> int { a + b }
+let add = |a, b| a + b
+
+let x = [1, 2, 3].map(|x| x + 1).filter(|x| x % 2).sum()
+
+; similar to c++
+; []: capture list
+; (): arguments
+; {}: body
+let add = [](a: int, b: int) { a + b }
+
 ; proposal: allow for below syntax so there is no difference between a function and a closure
 ; body block is necessary if we specify type
+; pretty hard to parse if we accept grouped expr!
 let add = (a: int, b: int) -> int { a + b }
 
 ; closure / anon/instant function
@@ -367,12 +408,30 @@ let getName: (s: string) -> string = {
 # Loop
 - `let *mut item in items {}` or `let &item in items {}`
 - loop over multiple values with iterators, how? they need to have the same length
+- allow backward iteration, this means that indexes are int instead of uint?
+  - what about backward iteration on arrays, etc...?
+```nov
+let arr = [0, 4, 5, 1]
+for i in 3..=0 {
+    @println(arr[i])
+}
+```
+- allow type annotation? (use that instead of taking *mut/& of item?)
+```nov
+let arr = [1, 2, 3, 4]
+for x: int in arr {
+    @println(x)
+}
+```
 
 ## Iterators
 - an iterator is any object with a public .next() method that returns an
-  Option(T) e.g. `next: (*T) -> ?U`
-  - need a `(*T) -> ?*mut U`
-- use &[], [] and .len operator overloading instead?
+  Option(T) e.g. `next: (*T) -> ?U` (yes)
+  - need a `(*T) -> ?*mut U` (no, *mut is included in U if needed)
+  - It's fine to iterate on an array and an iterator at the same time. It will
+    panic if the iterator is null when array still has elelemnts and when
+    iterator is not null when array as no more elements.
+- use &[], [] and .len operator overloading instead? (no, too complicated and doesn't work for e.g. tokenizer)
   - []: `(*T, int) -> U`
   - &[]: `(*T, int) -> *mut U`
   - this is better than .next() because we know the len and [] op overloading
@@ -397,14 +456,14 @@ pub fn main() !void {
     try queue.appendSlice(&init_queue);
     // var i: usize = 0;
 
-    // works fine
+    // works fine...
     // const len = queue.items.len;
     // while (i < len) : (i += 1) {
     //     const item = queue.items[i];
     //     try queue.append(item);
     // }
 
-    // infinite loop
+    // infinite loop (expected behavior)
     // while (i < queue.items.len) : (i += 1) {
     //     const item = queue.items[i];
     //     try queue.append(item);
@@ -423,6 +482,7 @@ pub fn main() !void {
 TODO:
 - `>>=`: (*T, (*T) -> U) -> U
 - `[]`: (*T, int) -> U
+  - probably too complex since we should be able to overload it twice with `U` and `*mut U`
 - for unary negation `-`, autogen it from `-` operator and `zero` decl?
 
 # C FFI
@@ -505,6 +565,12 @@ let ArrayList: (T: #type) -> type = { ... }
 - All arrays and strings should be 0 terminated (what about array of structs?)
 - strings:
   - string is an array of u8. (u16 on windows)
+    - array of rune for unicode aware strings
+```nov
+let s: []rune = "hey! 😀"
+s.len == 6 ; true, actual size is 9
+s[-1] == 😀
+```
   - all strings are 0 terminated by default? or add a `toCString()` method
   - strings can't be directly modified like an array, `str[i] = ...` is a compile error
   - const strings are fixed length, stored in .rodata like a C string
