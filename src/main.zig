@@ -4,67 +4,17 @@ const build_options = @import("build_options");
 const clap = @import("clap");
 const kf = @import("known-folders");
 const ic = @import("isocline");
+const Axe = @import("axe").Axe(.{
+    .scope_format = "@%",
+    .mutex = .{ .function = .{
+        .lock = std.debug.lockStdErr,
+        .unlock = std.debug.unlockStdErr,
+    } },
+});
 
 pub const std_options: std.Options = .{
-    .logFn = coloredLog,
+    .logFn = Axe.log,
 };
-
-// TODO: move this to a separate file
-const Color = enum(u8) {
-    black = 30,
-    red,
-    green,
-    yellow,
-    blue,
-    magenta,
-    cyan,
-    white,
-    default,
-    bright_black = 90,
-    bright_red,
-    bright_green,
-    bright_yellow,
-    bright_blue,
-    bright_magenta,
-    bright_cyan,
-    bright_white,
-
-    const csi = "\x1b[";
-    const reset = csi ++ "0m";
-    const bold = csi ++ "1m";
-
-    fn toSeq(comptime fg: Color) []const u8 {
-        return comptime csi ++ std.fmt.digits2(@intFromEnum(fg)) ++ "m";
-    }
-};
-
-fn coloredLog(
-    comptime message_level: std.log.Level,
-    comptime scope: @TypeOf(.enum_literal),
-    comptime format: []const u8,
-    args: anytype,
-) void {
-    const level_txt = comptime switch (message_level) {
-        .err => Color.bold ++ Color.red.toSeq() ++ "error" ++ Color.reset,
-        .warn => Color.bold ++ Color.yellow.toSeq() ++ "warning" ++ Color.reset,
-        .info => Color.bold ++ Color.blue.toSeq() ++ "info" ++ Color.reset,
-        .debug => Color.bold ++ Color.cyan.toSeq() ++ "debug" ++ Color.reset,
-    };
-    const scope_prefix = (if (scope != .default) "@" ++ @tagName(scope) else "") ++ ": ";
-    const stderr = std.io.getStdErr().writer();
-    var bw = std.io.bufferedWriter(stderr);
-    const writer = bw.writer();
-
-    std.debug.lockStdErr();
-    defer std.debug.unlockStdErr();
-    nosuspend {
-        writer.print(level_txt ++ scope_prefix ++ format ++ "\n", args) catch return;
-        bw.flush() catch return;
-    }
-}
-
-// TODO: use this variable for logging
-pub var enable_color = false;
 
 fn usage(comptime params: anytype) !void {
     const stderr = std.io.getStdErr().writer();
@@ -102,8 +52,7 @@ fn repl(allocator: std.mem.Allocator) !void {
     } else {
         ic.setHistory(null, -1);
     }
-
-    _ = ic.enableColor(enable_color);
+    _ = ic.enableColor(true);
 
     // TODO for prompt do:
     //> while (false) {
@@ -136,6 +85,9 @@ pub fn main() !void {
         _ = gpa.deinit();
     };
 
+    try Axe.init(allocator, &.{}, null);
+    defer Axe.deinit(allocator);
+
     // TODO
     if (true) {
         const exit_status = try testMain(allocator);
@@ -143,11 +95,6 @@ pub fn main() !void {
             std.log.err("Test failed with exit status {}", .{exit_status});
         }
         return;
-    }
-
-    if (builtin.os.tag != .windows and builtin.os.tag != .wasi) {
-        const no_color = std.posix.getenv("NO_COLOR");
-        enable_color = no_color == null or no_color.?.len == 0;
     }
 
     const params = comptime clap.parseParamsComptime(
@@ -242,21 +189,25 @@ fn testMain(allocator: std.mem.Allocator) !u8 {
             // TODO
             loc.line += 1;
             loc.column += 1;
-            try stderr.print(Color.bold ++ "{s}:{d}:{d}: " ++
-                Color.red.toSeq() ++ "error: " ++ Color.reset ++ Color.bold, .{
+            // TODO: use chameleon?
+            const bold = "\x1b[1m";
+            const red = "\x1b[31m";
+            const green = "\x1b[32m";
+            const reset = "\x1b[m";
+            try stderr.print(bold ++ "{s}:{d}:{d}: " ++ red ++ "error: " ++ reset ++ bold, .{
                 "source",
                 loc.line,
                 loc.column,
             });
             try ast.renderError(parse_error, stderr);
-            try stderr.print(Color.reset ++ "\n{s}\n", .{ast.source[loc.line_start..loc.line_end]});
+            try stderr.print(reset ++ "\n{s}\n", .{ast.source[loc.line_start..loc.line_end]});
             try stderr.writeByteNTimes(' ', loc.column - 1);
-            try stderr.writeAll(Color.green.toSeq());
+            try stderr.writeAll(green);
             switch (ast.tokenSlice(parse_error.token).len) {
                 1 => try stderr.writeAll("^"),
                 else => |len| try stderr.writeByteNTimes('~', len),
             }
-            try stderr.writeAll("\n" ++ Color.reset);
+            try stderr.writeAll("\n" ++ reset);
         }
         return 1;
     }

@@ -76,6 +76,7 @@ fn makeExe(
     const isocline = b.dependency("isocline-zig", .{}).module("isocline");
     const clap = b.dependency("clap", .{}).module("clap");
     const known_folders = b.dependency("known-folders", .{}).module("known-folders");
+    const axe = b.dependency("axe", .{}).module("axe");
     const exe = b.addExecutable(.{
         .name = "nov",
         .root_source_file = b.path("src/main.zig"),
@@ -85,6 +86,7 @@ fn makeExe(
     exe.root_module.addOptions("build_options", options);
     exe.root_module.addImport("isocline", isocline);
     exe.root_module.addImport("clap", clap);
+    exe.root_module.addImport("axe", axe);
     exe.root_module.addImport("known-folders", known_folders);
     exe.linkLibC();
     return exe;

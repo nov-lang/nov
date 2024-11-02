@@ -16,6 +16,10 @@
             .url = "git+https://github.com/ratakor/known-folders.git#fb176575f1ba9c0042d5a866a900f44ec6deb8f2",
             .hash = "122019466baf1594cc2a939864890b7f9743db30f92da2e514ccc3cc03a859abc5fd",
         },
+        .axe = .{
+            .url = "git+https://github.com/Ratakor/axe#43b3e38b85e25f236187124a87a1544869637edd",
+            .hash = "1220bb34f9bf3d0f0edef8e5b77799d22e2b7244166fdef1c0773da34adbf85ac24f",
+        },
     },
     .paths = .{
         "build.zig",

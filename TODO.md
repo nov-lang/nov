@@ -37,6 +37,7 @@ Keep Nov away from:
   - based on std.zig.render from https://github.com/ziglang/zig/pull/21727
 - Error type for each step (~Tokenizer, Parser~, IRs, Codegen, Runtime)
 - handle SIG.INT correctly, need to write an alternative to isocline in zig
+  - [zigline](https://github.com/alimpfard/zigline)?
 - render (parser) error with caret under the error + full line info
 - add Timer for parsing_time, cod, 2 modes debug & release (ReleaseSafe)egen_time, runnning_time (or use tracy)
 - implement correct leaking allocation to have fast exit time?
@@ -95,7 +96,6 @@ let myStruct = struct {}
 @[ .visibility = .public, .layout = .packed ]
 let myStruct = struct {}
 ```
-- Use [chameleon](https://github.com/tr1ckydev/chameleon/) for colors
 - Support [APE](https://justine.lol/ape.html) & [Cosmopolitan](https://github.com/jart/cosmopolitan)? / Use it by default?
 - Support casting? (check [this](https://c3-lang.org/language-rules/conversion/))
 - type as values
@@ -125,6 +125,10 @@ let myStruct = struct {}
 - Change string interpolation to
   `"{varname:[fill][alignment][width][.precision]:[custom options]}"`
   and use format like zig instead of toString?
+- **Rework Parser to remove newline if they are unnecessary**
+  - idk about render but this will simplify other steps a lot
+- provide a way to duplicate a function based on parameters?
+  - useful when an argument can be comptime or runtime
 
 # proposal: add Traits or something similar
 Currently many proposals are about using arbitrary declaration for overloading
@@ -489,13 +493,13 @@ TODO:
 TODO
 ```nov
 @[extern("malloc")]
-let c_malloc: `(uint) -> voidptr
+let c_malloc: (uint) -> voidptr
 
 @[extern("malloc")]
-let c_malloc: `(uint) -> voidptr = {} ; error extern fn can't have body
+let c_malloc: (uint) -> voidptr = {} ; error extern fn can't have a body
 
 @[export("nov_add")]
-let add: `(a: c_int, b: c_int) -> c_int = a + b
+let add: (a: c_int, b: c_int) -> c_int = a + b
 ```
 
 # Concurrency
