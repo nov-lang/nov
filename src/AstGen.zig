@@ -15,9 +15,11 @@ const StringIndexContext = std.hash_map.StringIndexContext;
 const AstGen = @This();
 const Error = error{AnalysisFail} || Allocator.Error;
 
-ast: *const Ast,
-// TODO nodes_need_rl
 allocator: Allocator,
+ast: *const Ast,
+/// The set of nodes which, given the choice, must expose a result pointer to
+/// sub-expressions. See `AstRlAnnotate` for details.
+nodes_need_rl: *const AstRlAnnotate.RlNeededSet,
 /// Used for temporary allocations; freed after AstGen is complete.
 /// The resulting NIR code has no references to anything in this arena.
 arena: Allocator,
