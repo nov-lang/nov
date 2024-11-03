@@ -10,7 +10,7 @@ const string_literal = @import("string_literal.zig");
 const assert = std.debug.assert;
 pub const Error = std.mem.Allocator.Error;
 const Ais = AutoIndentingStream(std.ArrayList(u8).Writer);
-const indent_delta = 4;
+const indent_delta = 4; // TODO: replace with tab?
 
 const Render = @This();
 
