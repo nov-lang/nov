@@ -313,7 +313,6 @@ fn renderExpression(self: *Render, node: Ast.Node.Index, space: Space) Error!voi
         .bit_not,
         .bool_not,
         .negation,
-        .optional_type,
         .ref_of,
         => {
             try self.renderToken(main_tokens[node], .none);
@@ -367,8 +366,7 @@ fn renderExpression(self: *Render, node: Ast.Node.Index, space: Space) Error!voi
         },
 
         .deref,
-        .unwrap_option,
-        .unwrap_result,
+        .unwrap,
         => {
             try self.renderExpression(datas[node].lhs, .none);
             try self.renderToken(main_tokens[node], .none);
@@ -453,9 +451,7 @@ fn renderExpression(self: *Render, node: Ast.Node.Index, space: Space) Error!voi
             @panic("TODO");
         },
 
-        .bind,
-        .result_union,
-        => {
+        .bind => {
             @panic("TODO: idk");
         },
 

@@ -17,8 +17,8 @@
             .hash = "122019466baf1594cc2a939864890b7f9743db30f92da2e514ccc3cc03a859abc5fd",
         },
         .axe = .{
-            .url = "git+https://github.com/Ratakor/axe#1e52c92bac594d10e799461b5727f07f171b27b1",
-            .hash = "122014d874ad8d0de4459d2ed1a7b86966503f8497e837c65bc10b7e1120e382be28",
+            .url = "git+https://github.com/Ratakor/axe#47988c46e747ed305e2cbb6fda67aedc74608b6d",
+            .hash = "122079591ca8217cd2ead5ad42f804b25b950c80de2f6ae073e527b9c16de6b43cc9",
         },
     },
     .paths = .{

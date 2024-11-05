@@ -41,7 +41,7 @@ Keep Nov away from:
 - render (parser) error with caret under the error + full line info
 - add Timer for parsing_time, cod, 2 modes debug & release (ReleaseSafe)egen_time, runnning_time (or use tracy)
 - implement correct leaking allocation to have fast exit time?
-- add `_ =` to discard the return value of an expression, it's mandatory to not ignore the returned value if it's != void
+- add `let _ =` or `_ =` to discard the return value of an expression, it's mandatory to not ignore the returned value if it's != void
 - add operator overloading:
   - compilation error when trying to use an operator for values of different types
   - compilation error when trying to use an operator that is not defined for the said value
@@ -118,7 +118,6 @@ let myStruct = struct {}
   now a type so it shouldn't make any issue in the parser
   - test this after implementing basic IR/CodeGen
   - note that this conflicts with one of the closure proposal
-- Remove `.!`, rename `.?` to unwrap/try and make it overridable?
 - Move `@print` etc... to stdlib? (either need to wrap args in an anonymous
   struct or allow to pass a variadic amount of parameters to a function).
 - Make `*` always `*mut`? What are the positives and negatives of this change?
@@ -129,6 +128,11 @@ let myStruct = struct {}
   - idk about render but this will simplify other steps a lot
 - provide a way to duplicate a function based on parameters?
   - useful when an argument can be comptime or runtime
+- Add `unroll` keyword to `match` and `for`, works like `inline` in zig
+- Eliminate hidden pass-by-reference from the codebase, i.e. use \*const more ofth for params
+- Make type optional (default to `any`) for function param?
+- Replace `.?` with `.!`? (removes `?` from tokens)
+- Remove c_int, c_long, ...  from language and add them to std.c smh instead.
 
 # proposal: add Traits or something similar
 Currently many proposals are about using arbitrary declaration for overloading
@@ -140,6 +144,8 @@ like traits which should make the language easier to understand and read.
 
 Add a way to tell that a container implement a certain behavior, maybe
 `@[impl(Iterator)]`, need a way to describe behavior.
+
+https://github.com/ziglang/zig/issues/1268
 
 # proposal: Annotations for container fields aka Tags
 add [tags](https://github.com/Hejsil/zig-clap/issues/8#issuecomment-381637825)
@@ -273,20 +279,15 @@ Solutions?:
   - This means that we only need to alloc for the tag + size of the field we
     use instead of tag + max size of fields thus saving memory
 
-# Result/Option
-- add a way to merge multiple error type into one?
-- find a way to reduce nested Result
+# If
+Add catch syntax for unions?
 ```nov
-(Result<T>, (T) -> U) -> Result<U> ; replace the value type but keep the same error
-(Result<T>, (T) -> Result<U>) -> Result<U> ; bind, see https://doc.rust-lang.org/std/result/enum.Result.html#method.and_then
+if expr |val| {
+    ...
+} else |err| {
+    ...
+}
 ```
-- remove sugar and only keep `.!` and `.?`?
-  - keep `?T` because it's simple and allow for good C interop with ptr/ref because it can be NULL
-- Check https://docs.vlang.io/type-declarations.html#custom-error-types
-- Check https://docs.vlang.io/type-declarations.html#optionresult-types-and-error-handling
-- Check https://doc.rust-lang.org/std/result/index.html
-- add `else {}` sugar which works like `orelse` or `catch` in zig (`else |val| {}`)?
-- add if/else unwrapping sugar like zig?
 
 # Arrays
 Side note about mutability. A constant array cannot be modified in any way, its
@@ -372,8 +373,6 @@ TODO: check https://tour.gleam.run/everything/#flow-control-case-expressions
   - add [Flow-sensitive typing](https://en.wikipedia.org/wiki/Flow-sensitive_typing)?
     that could solve the issue with `if`
 
-TODO: add inline like zig (need a different keyword) or make it implicit?
-
 proposal: match over multiple values
 ```nov
 _ = match x % 3, x % 5 {
@@ -410,7 +409,6 @@ let getName: (s: string) -> string = {
 ```
 
 # Loop
-- `let *mut item in items {}` or `let &item in items {}`
 - loop over multiple values with iterators, how? they need to have the same length
 - allow backward iteration, this means that indexes are int instead of uint?
   - what about backward iteration on arrays, etc...?
@@ -431,7 +429,7 @@ for x: int in arr {
 ## Iterators
 - an iterator is any object with a public .next() method that returns an
   Option(T) e.g. `next: (*T) -> ?U` (yes)
-  - need a `(*T) -> ?*mut U` (no, *mut is included in U if needed)
+  - need a `(*T) -> ?*mut U` (no, \*mut is included in U if needed)
   - It's fine to iterate on an array and an iterator at the same time. It will
     panic if the iterator is null when array still has elelemnts and when
     iterator is not null when array as no more elements.
@@ -484,9 +482,10 @@ pub fn main() !void {
 
 # Operator Overloading
 TODO:
-- `>>=`: (*T, (*T) -> U) -> U
-- `[]`: (*T, int) -> U
+- `>>=`: `(*T, (*T) -> U) -> U`
+- `[]`: `(*T, int) -> U`
   - probably too complex since we should be able to overload it twice with `U` and `*mut U`
+- `.?`: unwrap...
 - for unary negation `-`, autogen it from `-` operator and `zero` decl?
 
 # C FFI
@@ -544,7 +543,7 @@ let range: `(n: int) -^ int = {
 TODO add a good way to make code usable on multiple systems through attributes.
 
 TODO: add an attribute for signal handler and add a way to pass parameters to it
-via SA_SIGINFO (see std.debug.attachSegfaultHandler) `@[signal_handler(signal, args)]`
+via SA\_SIGINFO (see std.debug.attachSegfaultHandler) `@[signal_handler(signal, args)]`
 
 # Comptime
 ```nov
@@ -623,7 +622,11 @@ s[-1] == 😀
 - https://en.wikipedia.org/wiki/Algebraic_data_type
 - https://en.wikipedia.org/wiki/Coroutine
 - https://doc.rust-lang.org/book/ch13-01-closures.html
-- https://doc.rust-lang.org/book/ch09-02-recoverable-errors-with-result.html
+- Result
+  - https://docs.vlang.io/type-declarations.html#custom-error-types
+  - https://docs.vlang.io/type-declarations.html#optionresult-types-and-error-handling
+  - https://doc.rust-lang.org/std/result/index.html
+  - https://doc.rust-lang.org/book/ch09-02-recoverable-errors-with-result.html
 - Change Parser.parseExprPrecedence? https://www.scattered-thoughts.net/writing/better-operator-precedence/
 - https://www.scattered-thoughts.net/writing/notes-on-compiler-irs/
 - Builtins

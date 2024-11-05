@@ -93,6 +93,7 @@ pub const Token = struct {
         keyword_nosuspend,
         keyword_opaque,
         keyword_volatile,
+        keyword_unroll,
 
         pub fn lexeme(tag: Tag) ?[]const u8 {
             return switch (tag) {
@@ -174,6 +175,7 @@ pub const Token = struct {
                 .keyword_defer => "defer",
                 .keyword_opaque => "opaque",
                 .keyword_volatile => "volatile",
+                .keyword_unroll => "unroll",
             };
         }
 

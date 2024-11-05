@@ -237,7 +237,7 @@ pub fn renderError(self: Ast, parse_error: Error, writer: anytype) !void {
             });
         },
         .expected_suffix_op => {
-            return writer.print("expected result unwrap, option unwrap, or field access, found '{s}'", .{
+            return writer.print("expected dereference, unwrap, or field access, found '{s}'", .{
                 token_tags[parse_error.token + @intFromBool(parse_error.token_is_prev)].symbol(),
             });
         },
@@ -358,7 +358,6 @@ pub fn firstToken(self: Ast, node: Node.Index) TokenIndex {
         .bit_not,
         .ref_of,
         .ref_type,
-        .optional_type,
         .match,
         .@"if",
         .if_else,
@@ -394,8 +393,7 @@ pub fn firstToken(self: Ast, node: Node.Index) TokenIndex {
         => return main_tokens[n] - 1 - end_offset,
 
         .field_access,
-        .unwrap_option,
-        .unwrap_result,
+        .unwrap,
         .deref,
         .equal_equal,
         .bang_equal,
@@ -432,7 +430,6 @@ pub fn firstToken(self: Ast, node: Node.Index) TokenIndex {
         .attr_decl_one,
         .slice,
         .array_access,
-        .result_union,
         .match_case_one,
         => n = datas[n].lhs,
 
@@ -481,7 +478,6 @@ pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
         .bit_not,
         .ref_of,
         .ref_type,
-        .optional_type,
         .equal_equal,
         .bang_equal,
         .less_than,
@@ -517,12 +513,10 @@ pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
         .attr_decl,
         .array_type,
         .@"defer",
-        .result_union,
         => n = datas[n].rhs,
 
         .field_access,
-        .unwrap_option,
-        .unwrap_result,
+        .unwrap,
         .deref,
         => return datas[n].rhs + end_offset,
 
@@ -1110,11 +1104,7 @@ pub const Node = struct {
         /// `lhs.?`.
         /// main_token is the dot.
         /// rhs is the `?` token index.
-        unwrap_option,
-        /// `lhs.!`.
-        /// main_token is the dot.
-        /// rhs is the `!` token index.
-        unwrap_result,
+        unwrap,
         /// `lhs.*`.
         /// main_token is the dot.
         /// rhs is the `*` token index.
@@ -1189,8 +1179,6 @@ pub const Node = struct {
         /// main_token is the `*`.
         /// lhs is the `mut` token index if any.
         ref_type,
-        /// `?rhs`. lhs unused. main_token is the `?`.
-        optional_type,
         /// `[]rhs`. lhs is unused.
         array_type,
         /// `lhs[rhs]`.
@@ -1313,8 +1301,6 @@ pub const Node = struct {
         /// main_token is the field name identifier.
         /// lastToken() does not include the possible trailing comma.
         container_field,
-        /// `lhs!rhs`. main_token is the `!`.
-        result_union,
     };
 
     pub const Data = struct {

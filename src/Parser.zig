@@ -301,10 +301,9 @@ const Precedence = enum(i8) {
     term = 70, // + -
     factor = 80, // * / %
 
-    unary, // !x -x ~x &x *T ?T
+    unary, // !x -x ~x &x *T
     curly_suffix, // x{}
-    result_union, // E!T
-    call, // x() x[] x.y x.? x.! x.*
+    call, // x() x[] x.y x.? x.*
     primary, // literals, identifiers, (expr)
 
     _,
@@ -448,7 +447,6 @@ fn parsePrefixExpr(self: *Parser) Error!Node.Index {
         .minus => .negation,
         .tilde => .bit_not,
         .ampersand => .ref_of,
-        // .keyword_await => .@"await",
         else => return self.parsePrimaryExpr(),
     };
     return self.addNode(.{
@@ -998,19 +996,11 @@ fn parseCurlySuffixExpr(self: *Parser) Error!Node.Index {
     // TODO
 }
 
-/// TypeExpr <- PrefixTypeOp* ResultUnionExpr
-/// PrefixTypeOp <- QUESTIONMARK / AMPERSAND / ArrayTypeStart
+/// TypeExpr <- PrefixTypeOp* SuffixExpr
+/// PrefixTypeOp <- AMPERSAND / ArrayTypeStart
 /// ArrayTypeStart <- LBRACKET RBRACKET
 fn parseTypeExpr(self: *Parser) Error!Node.Index {
     switch (self.token_tags[self.tok_i]) {
-        .question_mark => return self.addNode(.{
-            .tag = .optional_type,
-            .main_token = self.nextToken(),
-            .data = .{
-                .lhs = undefined,
-                .rhs = try self.expectTypeExpr(),
-            },
-        }),
         .asterisk => return self.addNode(.{
             .tag = .ref_type,
             .main_token = self.nextToken(),
@@ -1020,7 +1010,7 @@ fn parseTypeExpr(self: *Parser) Error!Node.Index {
             },
         }),
         .l_bracket => {
-            // TODO: probably try to have []T and if it's fail fallback to parseResultUnionExpr
+            // TODO: probably try to have []T and if it's fail fallback to parseSuffixExpr
             const lbracket = self.nextToken();
             _ = try self.expectToken(.r_bracket);
             return self.addNode(.{
@@ -1032,7 +1022,7 @@ fn parseTypeExpr(self: *Parser) Error!Node.Index {
                 },
             });
         },
-        else => return self.parseResultUnionExpr(),
+        else => return self.parseSuffixExpr(),
     }
 }
 
@@ -1042,21 +1032,6 @@ fn expectTypeExpr(self: *Parser) Error!Node.Index {
         return self.fail(.expected_type_expr);
     }
     return node;
-}
-
-/// ResultUnionExpr <- SuffixExpr (EXCLAMATIONMARK TypeExpr)?
-fn parseResultUnionExpr(self: *Parser) Error!Node.Index {
-    const suffix_expr = try self.parseSuffixExpr();
-    if (suffix_expr == null_node) return null_node;
-    const bang = self.eatToken(.bang) orelse return suffix_expr;
-    return self.addNode(.{
-        .tag = .result_union,
-        .main_token = bang,
-        .data = .{
-            .lhs = suffix_expr,
-            .rhs = try self.expectTypeExpr(),
-        },
-    });
 }
 
 /// SuffixExpr <- PrimaryTypeExpr (SuffixOp / FnCallArguments)*
@@ -1191,7 +1166,6 @@ fn parsePrimaryTypeExpr(self: *Parser) Error!Node.Index {
 ///     <- LBRACKET Expr ((DOTDOT / DOTDOTEQUAL) Expr?)? RBRACKET
 ///      / DOT IDENTIFIER
 ///      / DOTQUESTIONMARK
-///      / DOTEXCLAMATIONMARK
 ///      / DOTASTERISK
 fn parseSuffixOp(self: *Parser, lhs: Node.Index) Error!Node.Index {
     switch (self.token_tags[self.tok_i]) {
@@ -1243,15 +1217,7 @@ fn parseSuffixOp(self: *Parser, lhs: Node.Index) Error!Node.Index {
                 },
             }),
             .question_mark => return self.addNode(.{
-                .tag = .unwrap_option,
-                .main_token = self.nextToken(),
-                .data = .{
-                    .lhs = lhs,
-                    .rhs = self.nextToken(),
-                },
-            }),
-            .bang => return self.addNode(.{
-                .tag = .unwrap_result,
+                .tag = .unwrap,
                 .main_token = self.nextToken(),
                 .data = .{
                     .lhs = lhs,
@@ -1276,7 +1242,6 @@ fn parseSuffixOp(self: *Parser, lhs: Node.Index) Error!Node.Index {
     }
 }
 
-// TODO: for ResultUnion: FnRetType <- ARROW EXCLAMATIONMARK? TypeExpr
 /// FnProto <- ParamDeclList (ARROW TypeExpr)?
 /// ParamDeclList <- LPAREN (ParamDecl COMMA)* ParamDecl? RPAREN
 fn parseFnProto(self: *Parser) Error!Node.Index {

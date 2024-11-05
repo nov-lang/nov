@@ -232,10 +232,13 @@ let Stack: (T: #type) -> type = struct {
     }
 
     @[public]
-    let pop: (self: *mut Self) -> ?T = {
+    let pop: (self: *mut Self) -> Option(T) = {
+        if self.list.len == 0 {
+            return .none
+        }
         let value = self.list[self.list.len - 1]
         self.list.len -= 1
-        return value
+        return .some[value]
     }
 
     @[public]
@@ -244,12 +247,8 @@ let Stack: (T: #type) -> type = struct {
 ```
 
 ### Result and Option unions
-Sugar for Result and Option:
-- !T is Result(T, string) or Result(T, any)?
-- E!T is Result(T, E)
-- ?T is Option(T)
-- expr.! is unwrap or propagate for result
-- expr.? is unwrap or propagate for option
+`.?` is syntax sugar for Result/Option which is equivalent to unwrapping the
+value or returning it if it's `.err`/`.none`.
 
 ```nov
 @[public]
@@ -288,8 +287,8 @@ let file = match File.open("file.txt") {
         _ => return err ; return early with the error
     }
 }
-; .! unwrap and returns the err if there is any
-let file = File.open("file.txt").!
+; .? unwrap and returns the err if there is any
+let file = File.open("file.txt").?
 ```
 
 ```nov
@@ -313,7 +312,7 @@ let sum = x + y.unwrapOrElse(0)
 let MyOption = Option(float)
 let a = MyOption.some[1.0]
 let b = MyOption.none[]
-let prod = a.? * b.? ; will return none to the calling function since b is none
+let prod = a.? * b.? ; will return .none to the calling function since b is .none
 ```
 
 ## Arrays
@@ -386,6 +385,27 @@ arr_arr >>= |arr: []string| {
 ## Slice
 TODO
 
+## Range
+Ranges are values too!
+```nov
+5 in 0..10 ; true
+```
+<!--
+note for myself: implem
+```
+struct {
+    start: int,
+    end: int,
+    step: int, ; always 1?
+    ; `.next()` for iter and `in` op are ez to implem
+}
+```
+for step maybe ++/-- or +=/-=
+
+loop _ in 10..=0-=1 {
+}
+-->
+
 ## Match
 ```nov
 match 5 {
@@ -416,7 +436,7 @@ if a < b {
 ; this one returns a bool
 let is_even = if 69 % 2 == 0 {true} else {false}
 ; another example which returns an Option(int)
-let x: ?int = if is_even {
+let x: Option(int) = if is_even {
     @println("even")
     .some[42]
 } else {
@@ -444,8 +464,7 @@ loop n in 0..=10 {}
 ; have the same length
 loop item, i in items, 0.. {}
 
-; values are const by default, add & to take a ref to a mutable value
-; a range cannot be mutable
+; item is a copy by default, add & to get a ref instead
 loop &item in items {}
 
 ; use underscore to ignore a value
@@ -513,7 +532,7 @@ See also:
 
 ## Integers
 TODO
-- c_int, ...
+- c\_int, ...
 - u8, u16, u32, u64, u128, i8, i16, i32, i64, i128, f16, f32, f64, f80, f128
   - int = i32 or i64 based on architecture
   - uint = u32 or u64 based on architecture
@@ -530,49 +549,45 @@ TODO
 
 ## Operators
 <!-- Yes this is not really lisible as raw text -->
-| Name                  | Syntax            | Types                                        | Remarks                                                             |
-|-----------------------|-------------------|----------------------------------------------|---------------------------------------------------------------------|
-| Assignment            | a = b             | All types                                    | `a` is an identifier and `b` is an expression.                           |
-| Addition              | a + b <br> a += b | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                                |
-| Concatenation         | a + b <br> a += b | string <br> [Arrays](#Arrays)                | TODO                                                                |
-| Substraction          | a - b <br> a -= b | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                                |
-| Negation              | -a                | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                                |
-| Multiplication        | a * b <br> a *= b | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                                |
-| Division              | a / b <br> a /= b | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                                |
-| Remainder Division    | a % b <br> a %= b | [Integers](#Integers)                        | TODO                                                                |
-| Bit Shift Left        | a << b            | [Integers](#Integers)                        | TODO                                                                |
-| Bit Shift Right       | a >> b            | [Integers](#Integers)                        | TODO                                                                |
-| Bitwise And           | a & b             | [Integers](#Integers)                        | TODO                                                                |
-| Bitwise Or            | a \| b            | [Integers](#Integers)                        | TODO                                                                |
-| Bitwise Xor           | a ^ b             | [Integers](#Integers)                        | TODO                                                                |
-| Bitwise Not           | ~a                | [Integers](#Integers)                        | TODO                                                                |
-| Optionify             | ?T                | All types                                    | Equivalent to Option(T)                                             |
-| Optional Unwrap       | a.?               | Option                                       | Unwrap an Option type or return it's error.                         |
-| Resultify             | E!T <br> !T       | All types                                    | Equivalent to Result(T, E) <br> Equivalent to Result(T, string).    |
-| Result Unwrap         | a.!               | Result                                       | Unwrap a Result type or return it's error. (same as `try` in zig)   |
-| Logical And           | a **and** b       | bool                                         | TODO                                                                |
-| Logical Or            | a **or** b        | bool                                         | TODO                                                                |
-| Boolean Not           | !a                | bool                                         | TODO                                                                |
-| Equality              | a == b            | All types                                    | TODO                                                                |
-| Inequality            | a != b            | All types                                    | TODO                                                                |
-| Greater Than          | a > b             | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                                |
-| Greater or Equal      | a >= b            | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                                |
-| Less Than             | a < b             | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                                |
-| Less or Equal         | a <= b            | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                                |
-| Bind                  | a >>= \|b\| ...   | Monads                                       | TODO                                                                |
-| Function Pipe         | a \|> f           | [Functions](#Functions)                      | TODO                                                                |
-| Member Search         | a **in** b        | [Arrays](#Arrays)                            | TODO                                                                |
-| Access                | a\[b]             | [Arrays](#Arrays) <br> string                | TODO: b is an Integer                                               |
-| Field / Method Access | a.b               | All types                                    | TODO                                                                |
-| Reference Type        | *T <br> *mut T    | All types                                    | Create a reference type from `T`. Unless `mut` is specified the wrapped value is constant |
-| Reference Of          | &a                | All types                                    | Returns a reference to `a`.                                         |
-| Dereference           | a.*               | Reference                                    | Unwrap a reference type, this is done automatically when using `.` or `[]`. |
+| Name                  | Syntax             | Types                                        | Remarks                                                             |
+|-----------------------|--------------------|----------------------------------------------|---------------------------------------------------------------------|
+| Assignment            | a = b              | All types                                    | `a` is an identifier and `b` is an expression.                      |
+| Addition              | a + b <br> a += b  | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                                |
+| Concatenation         | a + b <br> a += b  | string <br> [Arrays](#Arrays)                | TODO                                                                |
+| Substraction          | a - b <br> a -= b  | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                                |
+| Negation              | -a                 | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                                |
+| Multiplication        | a * b <br> a \*= b | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                                |
+| Division              | a / b <br> a /= b  | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                                |
+| Remainder Division    | a % b <br> a %= b  | [Integers](#Integers)                        | TODO                                                                |
+| Bit Shift Left        | a << b             | [Integers](#Integers)                        | TODO                                                                |
+| Bit Shift Right       | a >> b             | [Integers](#Integers)                        | TODO                                                                |
+| Bitwise And           | a & b              | [Integers](#Integers)                        | TODO                                                                |
+| Bitwise Or            | a \| b             | [Integers](#Integers)                        | TODO                                                                |
+| Bitwise Xor           | a ^ b              | [Integers](#Integers)                        | TODO                                                                |
+| Bitwise Not           | ~a                 | [Integers](#Integers)                        | TODO                                                                |
+| Logical And           | a **and** b        | bool                                         | TODO                                                                |
+| Logical Or            | a **or** b         | bool                                         | TODO                                                                |
+| Boolean Not           | !a                 | bool                                         | TODO                                                                |
+| Equality              | a == b             | All types                                    | TODO                                                                |
+| Inequality            | a != b             | All types                                    | TODO                                                                |
+| Greater Than          | a > b              | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                                |
+| Greater or Equal      | a >= b             | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                                |
+| Less Than             | a < b              | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                                |
+| Less or Equal         | a <= b             | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                                |
+| Bind                  | a >>= \|b\| ...    | Monads                                       | TODO                                                                |
+| Function Pipe         | a \|> f            | [Functions](#Functions)                      | TODO                                                                |
+| Member Search         | a **in** b         | [Arrays](#Arrays)                            | TODO                                                                |
+| Access                | a\[b]              | [Arrays](#Arrays) <br> string                | TODO: b is an Integer                                               |
+| Field / Method Access | a.b                | All types                                    | TODO                                                                |
+| Reference Type        | \*T <br> \*mut T   | All types                                    | Create a reference type from `T`. Unless `mut` is specified the wrapped value is constant |
+| Reference Of          | &a                 | All types                                    | Returns a reference to `a`.                                         |
+| Dereference           | a.*                | Reference                                    | Unwrap a reference type, this is done automatically when using `.` or `[]`. |
+| Unwrap                | a.?                | Result <br> Option                           | Unwrap a value or return if it's wrong (`.err`, `.none`).           |
 
 ## Precedence
 ```
-x() x[] x.y x.? x.! x.*
-E!T
-!x -x ~x &x *T ?T
+x() x[] x.y x.? x.*
+!x -x ~x &x *T
 * / %
 + -
 << >>
@@ -711,6 +726,14 @@ let mut x: #int = 0
 
 ; comptime parameter
 let intList: (len: #uint) -> []int = ...
+
+; comptime assertion
+let assert_name = #{
+    let cond = 1 == 1
+    if !cond {
+        @unreachable()
+    }
+}
 ```
 
 # Inspirations
