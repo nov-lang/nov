@@ -303,7 +303,7 @@ const Precedence = enum(i8) {
 
     unary, // !x -x ~x &x *T
     curly_suffix, // x{}
-    call, // x() x[] x.y x.? x.*
+    call, // x() x[] x.y x.! x.*
     primary, // literals, identifiers, (expr)
 
     _,
@@ -1165,8 +1165,8 @@ fn parsePrimaryTypeExpr(self: *Parser) Error!Node.Index {
 /// SuffixOp
 ///     <- LBRACKET Expr ((DOTDOT / DOTDOTEQUAL) Expr?)? RBRACKET
 ///      / DOT IDENTIFIER
-///      / DOTQUESTIONMARK
-///      / DOTASTERISK
+///      / DOT EXCLAMATIONMARK
+///      / DOT ASTERISK
 fn parseSuffixOp(self: *Parser, lhs: Node.Index) Error!Node.Index {
     switch (self.token_tags[self.tok_i]) {
         .l_bracket => {
@@ -1216,7 +1216,7 @@ fn parseSuffixOp(self: *Parser, lhs: Node.Index) Error!Node.Index {
                     .rhs = self.nextToken(),
                 },
             }),
-            .question_mark => return self.addNode(.{
+            .bang => return self.addNode(.{
                 .tag = .unwrap,
                 .main_token = self.nextToken(),
                 .data = .{

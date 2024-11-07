@@ -131,7 +131,6 @@ let myStruct = struct {}
 - Add `unroll` keyword to `match` and `for`, works like `inline` in zig
 - Eliminate hidden pass-by-reference from the codebase, i.e. use \*const more ofth for params
 - Make type optional (default to `any`) for function param?
-- Replace `.?` with `.!`? (removes `?` from tokens)
 - Remove c_int, c_long, ...  from language and add them to std.c smh instead.
 
 # proposal: add Traits or something similar

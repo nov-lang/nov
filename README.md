@@ -247,7 +247,7 @@ let Stack: (T: #type) -> type = struct {
 ```
 
 ### Result and Option unions
-`.?` is syntax sugar for Result/Option which is equivalent to unwrapping the
+`.!` is syntax sugar for Result/Option which is equivalent to unwrapping the
 value or returning it if it's `.err`/`.none`.
 
 ```nov
@@ -287,8 +287,8 @@ let file = match File.open("file.txt") {
         _ => return err ; return early with the error
     }
 }
-; .? unwrap and returns the err if there is any
-let file = File.open("file.txt").?
+; .! unwrap and returns the err if there is any
+let file = File.open("file.txt").!
 ```
 
 ```nov
@@ -312,7 +312,7 @@ let sum = x + y.unwrapOrElse(0)
 let MyOption = Option(float)
 let a = MyOption.some[1.0]
 let b = MyOption.none[]
-let prod = a.? * b.? ; will return .none to the calling function since b is .none
+let prod = a.! * b.! ; will return .none to the calling function since b is .none
 ```
 
 ## Arrays
@@ -582,11 +582,11 @@ TODO
 | Reference Type        | \*T <br> \*mut T   | All types                                    | Create a reference type from `T`. Unless `mut` is specified the wrapped value is constant |
 | Reference Of          | &a                 | All types                                    | Returns a reference to `a`.                                         |
 | Dereference           | a.*                | Reference                                    | Unwrap a reference type, this is done automatically when using `.` or `[]`. |
-| Unwrap                | a.?                | Result <br> Option                           | Unwrap a value or return if it's wrong (`.err`, `.none`).           |
+| Unwrap or Rethrow     | a.!                | Result <br> Option                           | Unwrap a value or return if it's wrong (`.err`, `.none`).           |
 
 ## Precedence
 ```
-x() x[] x.y x.? x.*
+x() x[] x.y x.! x.*
 !x -x ~x &x *T
 * / %
 + -
@@ -671,6 +671,8 @@ TODO
 - math func? prob no, put them in std.math
 <!-- - `@fieldParentRef()` similar to `@fieldParentPtr()` from zig, useful for C-style OOP -->
 - `@call()`: TODO
+- `@volatile_load()`: TODO
+- `@volatile_store()`: TODO
 
 ### Variables
 - os type

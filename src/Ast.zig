@@ -1101,7 +1101,7 @@ pub const Node = struct {
         /// main_token is the dot.
         /// rhs is the identifier token index.
         field_access,
-        /// `lhs.?`.
+        /// `lhs.!`.
         /// main_token is the dot.
         /// rhs is the `?` token index.
         unwrap,

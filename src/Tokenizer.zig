@@ -38,7 +38,6 @@ pub const Token = struct {
         period_period,
         period_period_equal,
         colon,
-        question_mark,
         bang,
         bang_equal,
         equal,
@@ -92,7 +91,6 @@ pub const Token = struct {
         keyword_suspend,
         keyword_nosuspend,
         keyword_opaque,
-        keyword_volatile,
         keyword_unroll,
 
         pub fn lexeme(tag: Tag) ?[]const u8 {
@@ -121,7 +119,6 @@ pub const Token = struct {
                 .period_period => "..",
                 .period_period_equal => "..=",
                 .colon => ":",
-                .question_mark => "?",
                 .bang => "!",
                 .bang_equal => "!=",
                 .equal => "=",
@@ -174,7 +171,6 @@ pub const Token = struct {
                 .keyword_union => "union",
                 .keyword_defer => "defer",
                 .keyword_opaque => "opaque",
-                .keyword_volatile => "volatile",
                 .keyword_unroll => "unroll",
             };
         }
@@ -340,10 +336,6 @@ pub fn next(self: *Tokenizer) Token {
             },
             '^' => {
                 result.tag = .caret;
-                self.index += 1;
-            },
-            '?' => {
-                result.tag = .question_mark;
                 self.index += 1;
             },
             ' ', '\r', '\t' => {
