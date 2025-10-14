@@ -566,11 +566,10 @@ pub const Inst = struct {
 
         pub const Name = enum(u32) {
             @"comptime" = std.math.maxInt(u32),
-            @"usingnamespace" = std.math.maxInt(u32) - 1,
-            unnamed_test = std.math.maxInt(u32) - 2,
+            unnamed_test = std.math.maxInt(u32) - 1,
             /// In this case, `has_doc_comment` will be true, and the doc
             /// comment body is the identifier name.
-            decltest = std.math.maxInt(u32) - 3,
+            decltest = std.math.maxInt(u32) - 2,
             /// Other values are `NullTerminatedString` values, i.e. index into
             /// `string_bytes`. If the byte referenced is 0, the decl is a named
             /// test, and the actual name begins at the following byte.
@@ -578,13 +577,13 @@ pub const Inst = struct {
 
             pub fn isNamedTest(name: Name, nir: Nir) bool {
                 return switch (name) {
-                    .@"comptime", .@"usingnamespace", .unnamed_test, .decltest => false,
+                    .@"comptime", .unnamed_test, .decltest => false,
                     _ => nir.string_bytes[@intFromEnum(name)] == 0,
                 };
             }
             pub fn toString(name: Name, nir: Nir) ?NullTerminatedString {
                 switch (name) {
-                    .@"comptime", .@"usingnamespace", .unnamed_test, .decltest => return null,
+                    .@"comptime", .unnamed_test, .decltest => return null,
                     _ => {},
                 }
                 const idx: u32 = @intFromEnum(name);

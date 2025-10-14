@@ -4247,7 +4247,6 @@ const DeclarationName = union(enum) {
     unnamed_test,
     decltest: Nir.NullTerminatedString,
     @"comptime",
-    @"usingnamespace",
 };
 
 // TODO
@@ -4287,7 +4286,6 @@ fn setDeclaration(
             .unnamed_test => .unnamed_test,
             .decltest => .decltest,
             .@"comptime" => .@"comptime",
-            .@"usingnamespace" => .@"usingnamespace",
         },
         .src_line = src_line,
         .flags = .{
