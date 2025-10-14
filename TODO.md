@@ -132,6 +132,8 @@ let myStruct = struct {}
 - Eliminate hidden pass-by-reference from the codebase, i.e. use \*const more ofth for params
 - Make type optional (default to `any`) for function param?
 - Remove c_int, c_long, ...  from language and add them to std.c smh instead.
+- Cast with int(), u8(), etc...?
+  - overloadable functions: `str()` and `len()`, also `next()`...
 
 # proposal: add Traits or something similar
 Currently many proposals are about using arbitrary declaration for overloading

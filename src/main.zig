@@ -135,6 +135,13 @@ pub fn main() !void {
             break; // TODO: support multiple files
         }
     }
+
+    if (builtin.mode == .Debug) {
+        std.log.debug("clean exit", .{});
+    } else {
+        // let the kernel free memory
+        std.process.exit(0);
+    }
 }
 
 fn testMain(allocator: std.mem.Allocator) !u8 {
