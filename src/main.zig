@@ -41,7 +41,7 @@ fn runFile(allocator: std.mem.Allocator, path: []const u8) !void {
 }
 
 fn repl(allocator: std.mem.Allocator) !void {
-    if (try kf.getPath(allocator, .state)) |state_dir| {
+    if (try kf.getPath(allocator, .logs)) |state_dir| {
         defer allocator.free(state_dir);
         const history_path = try std.fs.path.joinZ(allocator, &.{ state_dir, "nov_history" });
         defer allocator.free(history_path);
@@ -117,8 +117,8 @@ pub fn main() !void {
     defer res.deinit();
 
     if (res.args.version != 0) {
-        const stdout = std.io.getStdOut().writer();
-        try stdout.print("nov {}", .{build_options.version});
+        var stdout = std.fs.File.stdout().writer(.{});
+        try stdout.interface.print("nov {}", .{build_options.version});
         return;
     }
 
@@ -179,7 +179,9 @@ fn testMain(allocator: std.mem.Allocator) !u8 {
     // }
 
     if (ast.errors.len > 0) {
-        const stderr = std.io.getStdErr().writer();
+        var stderr_buffer: [4096]u8 = undefined;
+        var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
+        const stderr = &stderr_writer.interface;
         try stderr.writeAll("\n");
         for (ast.errors) |parse_error| {
             var loc = ast.tokenLocation(0, parse_error.token);
@@ -198,25 +200,26 @@ fn testMain(allocator: std.mem.Allocator) !u8 {
             });
             try ast.renderError(parse_error, stderr);
             try stderr.print(reset ++ "\n{s}\n", .{ast.source[loc.line_start..loc.line_end]});
-            try stderr.writeByteNTimes(' ', loc.column - 1);
+            try stderr.splatByteAll(' ', loc.column - 1);
             try stderr.writeAll(green);
             switch (ast.tokenSlice(parse_error.token).len) {
                 1 => try stderr.writeAll("^"),
-                else => |len| try stderr.writeByteNTimes('~', len),
+                else => |len| try stderr.splatByteAll('~', len),
             }
             try stderr.writeAll("\n" ++ reset);
         }
+        try stderr.flush();
         return 1;
     }
 
-    const fmt_source = try ast.render(allocator);
-    defer allocator.free(fmt_source);
-    std.log.debug(
-        \\Formatted source:
-        \\```
-        \\{s}
-        \\```
-    , .{fmt_source});
+    // const fmt_source = try ast.render(allocator);
+    // defer allocator.free(fmt_source);
+    // std.log.debug(
+    //     \\Formatted source:
+    //     \\```
+    //     \\{s}
+    //     \\```
+    // , .{fmt_source});
 
     // var nir = try AstGen.generate(allocator, &ast);
     // defer nir.deinit(allocator);

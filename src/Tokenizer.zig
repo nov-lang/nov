@@ -196,14 +196,16 @@ pub const Token = struct {
 
     pub const keywords = blk: {
         const values = std.enums.values(Tag);
-        var kvs: std.BoundedArray(struct { []const u8, Tag }, values.len) = .{};
+        const KV = struct { []const u8, Tag };
+        var kvs_buffer: [values.len]KV = undefined;
+        var kvs: std.ArrayList(KV) = .initBuffer(&kvs_buffer);
         @setEvalBranchQuota(10_000);
         for (values) |tag| {
             if (std.mem.startsWith(u8, @tagName(tag), "keyword_")) {
-                kvs.append(.{ tag.lexeme().?, tag }) catch unreachable;
+                kvs.appendAssumeCapacity(.{ tag.lexeme().?, tag });
             }
         }
-        break :blk std.StaticStringMap(Tag).initComptime(kvs.constSlice());
+        break :blk std.StaticStringMap(Tag).initComptime(kvs.items);
     };
 
     pub fn getKeyword(bytes: []const u8) ?Tag {

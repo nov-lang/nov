@@ -16,11 +16,16 @@ pub fn build(b: *std.Build) void {
 
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const strip = b.option(bool, "strip", "Omit debug information");
+    const build_options = b.addOptions();
+    build_options.addOption(std.SemanticVersion, "version", nov_version);
 
-    const exe_options = b.addOptions();
-    exe_options.addOption(std.SemanticVersion, "version", nov_version);
-
-    const exe = makeExe(b, target, optimize, exe_options);
+    const exe = makeExe(b, .{
+        .target = target,
+        .optimize = optimize,
+        .build_options = build_options,
+        .strip = strip,
+    });
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
@@ -40,7 +45,14 @@ pub fn build(b: *std.Build) void {
     };
     for (release_targets) |target_query| {
         const rel_target = b.resolveTargetQuery(target_query);
-        const rel_exe = makeExe(b, rel_target, .ReleaseSafe, exe_options);
+        const rel_exe = makeExe(b, .{
+            .target = rel_target,
+            .optimize = .ReleaseSafe,
+            .build_options = build_options,
+            .strip = true,
+            // .lto = !rel_target.result.isDarwin() and // https://github.com/ziglang/zig/issues/8680
+            //     !(rel_target.result.os.tag == .windows and target.result.abi == .gnu), // LTO is broken on mingw
+        });
         rel_exe.root_module.strip = true;
         const install = b.addInstallArtifact(rel_exe, .{});
         install.dest_sub_path = b.fmt("{s}-{s}", .{
@@ -50,11 +62,7 @@ pub fn build(b: *std.Build) void {
         release.dependOn(&install.step);
     }
 
-    const tests = b.addTest(.{
-        .root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
+    const tests = b.addTest(.{ .root_module = exe.root_module });
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_tests.step);
@@ -67,23 +75,34 @@ pub fn build(b: *std.Build) void {
     clean_step.dependOn(&b.addRemoveDirTree(b.path(".zig-cache")).step);
 }
 
-fn makeExe(
-    b: *std.Build,
+const ExecutableOptions = struct {
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
-    options: *std.Build.Step.Options,
-) *std.Build.Step.Compile {
-    const isocline = b.dependency("isocline-zig", .{}).module("isocline");
+    build_options: *std.Build.Step.Options,
+    strip: ?bool = null,
+    lto: ?bool = null,
+};
+
+fn makeExe(b: *std.Build, options: ExecutableOptions) *std.Build.Step.Compile {
+    const isocline = b.dependency("isocline", .{}).module("isocline");
     const clap = b.dependency("clap", .{}).module("clap");
-    const known_folders = b.dependency("known-folders", .{}).module("known-folders");
+    const known_folders = b.dependency("known_folders", .{}).module("known-folders");
     const axe = b.dependency("axe", .{}).module("axe");
+
+    const exe_module = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = options.target,
+        .optimize = options.optimize,
+        .strip = options.strip,
+    });
+
     const exe = b.addExecutable(.{
         .name = "nov",
-        .root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
+        .root_module = exe_module,
     });
-    exe.root_module.addOptions("build_options", options);
+
+    exe.want_lto = options.lto;
+    exe.root_module.addOptions("build_options", options.build_options);
     exe.root_module.addImport("isocline", isocline);
     exe.root_module.addImport("clap", clap);
     exe.root_module.addImport("axe", axe);

@@ -1,24 +1,24 @@
 .{
-    .name = "nov",
+    .name = .nov,
     .version = "0.0.0",
-    .minimum_zig_version = "0.13.0",
+    .minimum_zig_version = "0.15.0",
+    .fingerprint = 0xe60b9c59a00e14ef,
     .dependencies = .{
         .clap = .{
-            .url = "git+https://github.com/Hejsil/zig-clap#e9207ad2b86131fa9f0dfbd5c68cafd67f00fe64",
-            .hash = "1220cb2f28680ef73c1020bfd8c7b08de38821b0bc19b5469f60dcf813f1d8455dbd",
+            .url = "git+https://github.com/Hejsil/zig-clap#b7e3348ed60f99ba32c75aa707ff7c87adc31b36",
+            .hash = "clap-0.11.0-oBajB-TnAQC7yPLnZRT5WzHZ_4Ly4dX2OILskli74b9H",
         },
-        .@"isocline-zig" = .{
-            .url = "git+https://github.com/ratakor/isocline-zig#949b42087c64a58307424a1d30765183171b851f",
-            .hash = "1220a6931c89c1a5d891015857e265544cdee0520b7af905103fabeaf35aa7546e18",
+        .isocline = .{
+            .url = "git+https://github.com/ratakor/isocline-zig#4441805bc1ca663b2b6fa7b62e2552e96449538b",
+            .hash = "isocline-1.0.9-5daVr0kMBgCh-hYzMeXDNsF_imdzgPk5qua7OMBdiXHl",
         },
-        .@"known-folders" = .{
-            // TODO: replace with ziglibs once https://github.com/ziglibs/known-folders/pull/55 gets merged
-            .url = "git+https://github.com/ratakor/known-folders.git#fb176575f1ba9c0042d5a866a900f44ec6deb8f2",
-            .hash = "122019466baf1594cc2a939864890b7f9743db30f92da2e514ccc3cc03a859abc5fd",
+        .known_folders = .{
+            .url = "git+https://github.com/ziglibs/known-folders#ab5cf5feb936fa3b72c95d3ad0c0c67791937ba1",
+            .hash = "known_folders-0.0.0-Fy-PJtTTAADUOhGKM0sxzG4eMkNQxRvx9e5dfHVyaeA3",
         },
         .axe = .{
-            .url = "git+https://github.com/Ratakor/axe#47988c46e747ed305e2cbb6fda67aedc74608b6d",
-            .hash = "122079591ca8217cd2ead5ad42f804b25b950c80de2f6ae073e527b9c16de6b43cc9",
+            .url = "git+https://github.com/ratakor/axe#4df48b5fd1bd8496dc3a9ed49790649b7c4e8fee",
+            .hash = "axe-0.7.0-M2JU5cyPAADJQcWDZE7xNmnuQtAgwmPLyCMjiLhOptrC",
         },
     },
     .paths = .{
