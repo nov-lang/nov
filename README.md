@@ -22,8 +22,10 @@ zig build test
 zig fmt --check src build.zig
 ```
 
-The executable currently runs a parser demo; compilation and execution of Nov
-programs are not implemented yet.
+Check syntax in one or more files with `zig build run -- check file.nov`.
+Diagnostics include the filename, line, column, source line, and a caret. Invalid
+input or unreadable files produce a nonzero exit status. Compilation and execution
+of Nov programs are not implemented yet.
 
 # Concepts
 

@@ -38,7 +38,7 @@ Keep Nov away from:
 - Error type for each step (~Tokenizer, Parser~, IRs, Codegen, Runtime)
 - handle SIG.INT correctly, need to write an alternative to isocline in zig
   - [zigline](https://github.com/alimpfard/zigline)?
-- render (parser) error with caret under the error + full line info
+- [x] render (parser) error with caret under the error + full line info
 - add Timer for parsing_time, cod, 2 modes debug & release (ReleaseSafe)egen_time, runnning_time (or use tracy)
 - implement correct leaking allocation to have fast exit time?
 - add `let _ =` or `_ =` to discard the return value of an expression, it's mandatory to not ignore the returned value if it's != void
