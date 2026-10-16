@@ -27,6 +27,14 @@ Diagnostics include the filename, line, column, source line, and a caret. Invali
 input or unreadable files produce a nonzero exit status. Compilation and execution
 of Nov programs are not implemented yet.
 
+Format files in place with `zig build run -- fmt file.nov`, or use
+`zig build run -- fmt --check file.nov` to check formatting without writing.
+Both commands accept multiple file paths. Formatting currently supports simple
+`let` declarations, literals, operators, and comments; unsupported syntax is
+reported without modifying the file. Formatted output is reparsed and checked
+for structural, token, and comment preservation before atomic replacement.
+Declarations currently need a terminating newline.
+
 # Concepts
 
 ## Comments

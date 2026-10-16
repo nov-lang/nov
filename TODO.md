@@ -31,9 +31,13 @@ Keep Nov away from:
   - ~repl: run the repl~
   - test: run unit tests
   - fmt: format nov code
-    - works like zig fmt but for nov
+    - [x] in-place formatting and read-only --check for multiple files
+    - [x] reject unsupported syntax without changing files; validate output preservation
+    - expand beyond simple declarations, literals, operators, and comments
+    - recursive directory traversal and stdin support
 - add tests, mainly for Parser, IRs, Codegen and Runtime
-- add render.zig which render an Ast, core of fmt and used for testing parser
+  - [x] initial parser, formatter, file-safety, and CLI regression coverage
+- expand Render.zig to cover the full AST (simple declarations and expressions work)
   - based on std.zig.render from https://github.com/ziglang/zig/pull/21727
 - Error type for each step (~Tokenizer, Parser~, IRs, Codegen, Runtime)
 - handle SIG.INT correctly, need to write an alternative to isocline in zig

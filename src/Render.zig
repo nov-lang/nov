@@ -97,7 +97,9 @@ fn renderTreeInner(buffer: *std.Io.Writer.Allocating, ast: Ast, fixups: Fixups) 
     };
 
     // Render all the line comments at the beginning of the file.
-    const comment_end_loc = ast.tokens.items(.start)[0];
+    var first_token: Ast.TokenIndex = 0;
+    while (ast.tokens.items(.tag)[first_token] == .newline) : (first_token += 1) {}
+    const comment_end_loc = ast.tokens.items(.start)[first_token];
     _ = try r.renderComments(0, comment_end_loc);
 
     try r.renderMembers(ast.rootDecls());
@@ -324,7 +326,7 @@ fn renderExpression(self: *Render, node: Ast.Node.Index, space: Space) RenderErr
         .ref_of,
         => {
             try self.renderToken(main_tokens[node], .none);
-            return self.renderExpression(datas[node].lhs, space);
+            return self.renderExpression(datas[node].rhs, space);
         },
 
         .array_type => {
@@ -514,15 +516,16 @@ fn renderDeclWithoutFixups(
         break :name decl.ast.let_token + 2;
     } else decl.ast.let_token + 1;
 
-    try self.renderIdentifier(name_token, .space, .preserve_when_shadowing); // name
+    try self.renderIdentifier(name_token, if (decl.ast.type_node != 0) .none else .space, .preserve_when_shadowing); // name
 
     if (decl.ast.type_node != 0) {
         // TODO: type_node - 1 for the colon?
         try self.renderToken(name_token + 1, .space); // :
-        try self.renderExpression(decl.ast.type_node, .space); // type
+        try self.renderExpression(decl.ast.type_node, if (decl.ast.init_node != 0) .space else space); // type
     }
 
     if (decl.ast.init_node != 0) {
+        try ais.pushIndent(.after_equals);
         const token_tags = ast.tokens.items(.tag);
         const prev_token = ast.firstToken(decl.ast.init_node) - 1;
         if (token_tags[prev_token] == .equal) {
@@ -532,8 +535,6 @@ fn renderDeclWithoutFixups(
             assert(token_tags[prev_token] == .newline);
             try self.renderToken(prev_token - 1, .newline); // =
         }
-        try ais.pushIndent(.after_equals);
-        // TODO: doesn't render indent correctly
         try self.renderExpression(decl.ast.init_node, space);
         ais.popIndent();
     }
@@ -618,7 +619,11 @@ fn renderSpace(
     }
     if (space == .endline or space == .comma) ais.enableSpaceMode(space);
     defer ais.disableSpaceMode();
-    const comment = try renderComments(self, token_start + lexeme_len, token_starts[token_index + 1]);
+    // Newlines are parser tokens, but comments in their gaps still belong
+    // to the preceding rendered token.
+    var next_token = token_index + 1;
+    while (token_tags[next_token] == .newline) : (next_token += 1) {}
+    const comment = try renderComments(self, token_start + lexeme_len, token_starts[next_token]);
     switch (space) {
         .none => {},
         .space => if (!comment) try ais.writer().writeByte(' '),
@@ -928,10 +933,12 @@ fn renderExtraNewlineToken(self: *Render, token_index: Ast.TokenIndex) RenderErr
     const token_starts = ast.tokens.items(.start);
     const token_start = token_starts[token_index];
     if (token_start == 0) return;
-    const prev_token_end = if (token_index == 0)
+    var previous = token_index;
+    while (previous > 0 and ast.tokens.items(.tag)[previous - 1] == .newline) : (previous -= 1) {}
+    const prev_token_end = if (previous == 0)
         0
     else
-        token_starts[token_index - 1] + tokenSliceForRender(ast, token_index - 1).len;
+        token_starts[previous - 1] + tokenSliceForRender(ast, previous - 1).len;
 
     // If there is a immediately preceding comment or doc_comment,
     // skip it because required extra newline has already been rendered.
@@ -940,12 +947,13 @@ fn renderExtraNewlineToken(self: *Render, token_index: Ast.TokenIndex) RenderErr
 
     // Iterate backwards to the end of the previous token, stopping if a
     // non-whitespace character is encountered or two newlines have been found.
-    var i = token_start - 1;
+    var i = token_start;
     var newlines: u2 = 0;
-    while (std.ascii.isWhitespace(ast.source[i])) : (i -= 1) {
+    while (i > prev_token_end) {
+        i -= 1;
+        if (!std.ascii.isWhitespace(ast.source[i])) break;
         if (ast.source[i] == '\n') newlines += 1;
         if (newlines == 2) return ais.insertNewline();
-        if (i == prev_token_end) break;
     }
 }
 
@@ -956,13 +964,11 @@ fn renderDocComments(self: *Render, end_token: Ast.TokenIndex) RenderError!void 
     // Search backwards for the first doc comment.
     const token_tags = ast.tokens.items(.tag);
     if (end_token == 0) return;
-    var tok = end_token - 1;
-    while (token_tags[tok] == .doc_comment) {
-        if (tok == 0) break;
+    var tok = end_token;
+    while (tok > 0 and (token_tags[tok - 1] == .doc_comment or token_tags[tok - 1] == .newline)) {
         tok -= 1;
-    } else {
-        tok += 1;
     }
+    while (tok < end_token and token_tags[tok] == .newline) : (tok += 1) {}
     const first_tok = tok;
     if (first_tok == end_token) return;
 
@@ -977,8 +983,8 @@ fn renderDocComments(self: *Render, end_token: Ast.TokenIndex) RenderError!void 
         }
     }
 
-    while (token_tags[tok] == .doc_comment) : (tok += 1) {
-        try renderToken(self, tok, .newline);
+    while (tok < end_token) : (tok += 1) {
+        if (token_tags[tok] == .doc_comment) try renderToken(self, tok, .newline);
     }
 }
 
