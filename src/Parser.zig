@@ -1602,3 +1602,55 @@ fn failMsg(self: *Parser, msg: Ast.Error) Error {
     try self.warnMsg(msg);
     return error.ParseError;
 }
+
+test "parse empty source" {
+    var ast = try parse(std.testing.allocator, "");
+    defer ast.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    try std.testing.expectEqual(@as(usize, 0), ast.rootDecls().len);
+    try std.testing.expectEqual(Node.Tag.root, ast.nodes.items(.tag)[0]);
+    try std.testing.expectEqual(Token.Tag.eof, ast.tokens.items(.tag)[0]);
+}
+
+test "multiplication binds tighter than addition" {
+    var ast = try parse(std.testing.allocator, "let answer = 1 + 2 * 3\n");
+    defer ast.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    try std.testing.expectEqual(@as(usize, 1), ast.rootDecls().len);
+    const initializer = ast.decl(ast.rootDecls()[0]).ast.init_node;
+    try std.testing.expectEqual(Node.Tag.add, ast.nodes.items(.tag)[initializer]);
+    const rhs = ast.nodes.items(.data)[initializer].rhs;
+    try std.testing.expectEqual(Node.Tag.mul, ast.nodes.items(.tag)[rhs]);
+}
+
+test "parse multiline and typed declarations" {
+    const source =
+        \\let x =
+        \\    #3 + 1
+        \\    + 1
+        \\let y: *mut int = 1 + 1
+        \\
+    ;
+    var ast = try parse(std.testing.allocator, source);
+    defer ast.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    try std.testing.expectEqual(@as(usize, 2), ast.rootDecls().len);
+    const typed_decl = ast.decl(ast.rootDecls()[1]);
+    try std.testing.expect(typed_decl.ast.type_node != 0);
+    try std.testing.expect(typed_decl.ast.init_node != 0);
+}
+
+test "recover after a declaration without an initializer" {
+    var ast = try parse(std.testing.allocator, "let broken =\nlet valid = 42\n");
+    defer ast.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), ast.errors.len);
+    try std.testing.expectEqual(Ast.Error.Tag.expected_expr, ast.errors[0].tag);
+    try std.testing.expectEqual(@as(usize, 1), ast.rootDecls().len);
+    const declaration = ast.rootDecls()[0];
+    const let_token = ast.nodes.items(.main_token)[declaration];
+    try std.testing.expectEqualStrings("valid", ast.tokenSlice(let_token + 1));
+}
