@@ -6,15 +6,17 @@ const kf = @import("known-folders");
 const ic = @import("isocline");
 const Axe = @import("axe").Axe(.{
     .scope_format = "@%",
-    .mutex = .{ .function = .progress_stderr },
+    .mutex = .default,
 });
 
 pub const std_options: std.Options = .{
     .logFn = Axe.log,
 };
 
-fn usage(comptime params: anytype) !void {
-    const stderr = std.io.getStdErr().writer();
+fn usage(io: std.Io, comptime params: anytype) !void {
+    var buffer: [4096]u8 = undefined;
+    var writer = std.Io.File.stderr().writer(io, &buffer);
+    const stderr = &writer.interface;
     try stderr.writeAll("Usage: nov ");
     try clap.usage(stderr, clap.Help, params);
     try stderr.writeAll("\n\nOptions:\n");
@@ -24,24 +26,18 @@ fn usage(comptime params: anytype) !void {
         .spacing_between_parameters = 0,
         .indent = 2,
     });
+    try stderr.flush();
 }
 
-fn runFile(allocator: std.mem.Allocator, path: []const u8) !void {
-    const cwd = std.fs.cwd();
-    const file = try cwd.openFile(path, .{});
-    defer file.close();
-    var array_list = try std.ArrayList(u8).initCapacity(allocator, 4096);
-    defer array_list.deinit();
-    try file.reader().readAllArrayList(&array_list, 1024 * 1024);
-    try array_list.append(0);
-    const bytes = array_list.items[0 .. array_list.items.len - 1 :0];
+fn runFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !void {
+    const bytes = try std.Io.Dir.cwd().readFileAllocOptions(io, path, allocator, .limited(1024 * 1024), .of(u8), 0);
+    defer allocator.free(bytes);
     // TODO
-    _ = bytes;
     // try vm.interpret(allocator, bytes);
 }
 
-fn repl(allocator: std.mem.Allocator) !void {
-    if (try kf.getPath(allocator, .logs)) |state_dir| {
+fn repl(io: std.Io, allocator: std.mem.Allocator, environ: *const std.process.Environ.Map) !void {
+    if (try kf.getPath(io, allocator, environ, .logs)) |state_dir| {
         defer allocator.free(state_dir);
         const history_path = try std.fs.path.joinZ(allocator, &.{ state_dir, "nov_history" });
         defer allocator.free(history_path);
@@ -65,29 +61,16 @@ fn repl(allocator: std.mem.Allocator) !void {
     }
 }
 
-pub fn main() !void {
-    var gpa: std.heap.GeneralPurposeAllocator(.{ .verbose_log = false }) = .{};
-    const use_gpa = builtin.mode == .Debug;
-    const allocator = if (builtin.os.tag == .wasi)
-        std.heap.wasm_allocator
-    else if (use_gpa)
-        gpa.allocator()
-        // We would prefer to use raw libc allocator here, but cannot
-        // use it if it won't support the alignment we need.
-    else if (@alignOf(std.c.max_align_t) < @max(@alignOf(i128), std.atomic.cache_line))
-        std.heap.c_allocator
-    else
-        std.heap.raw_c_allocator;
-    defer if (use_gpa) {
-        _ = gpa.deinit();
-    };
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
 
-    try Axe.init(allocator, &.{}, null);
-    defer Axe.deinit(allocator);
+    try Axe.init(io, &.{}, init.environ_map);
+    defer Axe.deinit();
 
     // TODO
     if (true) {
-        const exit_status = try testMain(allocator);
+        const exit_status = try testMain(io, allocator);
         if (exit_status != 0) {
             std.log.err("Test failed with exit status {}", .{exit_status});
         }
@@ -106,32 +89,34 @@ pub fn main() !void {
     };
 
     var diag: clap.Diagnostic = .{};
-    var res = clap.parse(clap.Help, &params, parsers, .{
+    var res = clap.parse(clap.Help, &params, parsers, init.minimal.args, .{
         .allocator = allocator,
         .diagnostic = &diag,
     }) catch |err| {
-        diag.report(std.io.getStdErr().writer(), err) catch {};
-        usage(&params) catch {};
+        diag.reportToFile(io, .stderr(), err) catch {};
+        usage(io, &params) catch {};
         std.process.exit(1);
     };
     defer res.deinit();
 
     if (res.args.version != 0) {
-        var stdout = std.fs.File.stdout().writer(.{});
-        try stdout.interface.print("nov {}", .{build_options.version});
+        var buffer: [128]u8 = undefined;
+        var stdout = std.Io.File.stdout().writer(io, &buffer);
+        try stdout.interface.print("nov {f}", .{build_options.version});
+        try stdout.interface.flush();
         return;
     }
 
     if (res.args.help != 0) {
-        try usage(&params);
+        try usage(io, &params);
         return;
     }
 
-    if (res.positionals.len == 0) {
-        try repl(allocator);
+    if (res.positionals[0].len == 0) {
+        try repl(io, allocator, init.environ_map);
     } else {
-        for (res.positionals) |path| {
-            try runFile(allocator, path);
+        for (res.positionals[0]) |path| {
+            try runFile(io, allocator, path);
             break; // TODO: support multiple files
         }
     }
@@ -144,7 +129,7 @@ pub fn main() !void {
     }
 }
 
-fn testMain(allocator: std.mem.Allocator) !u8 {
+fn testMain(io: std.Io, allocator: std.mem.Allocator) !u8 {
     const Parser = @import("Parser.zig");
     // const AstGen = @import("AstGen.zig");
     // const Nir = @import("Nir.zig");
@@ -187,7 +172,7 @@ fn testMain(allocator: std.mem.Allocator) !u8 {
 
     if (ast.errors.len > 0) {
         var stderr_buffer: [4096]u8 = undefined;
-        var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
+        var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buffer);
         const stderr = &stderr_writer.interface;
         try stderr.writeAll("\n");
         for (ast.errors) |parse_error| {
@@ -246,6 +231,7 @@ fn testMain(allocator: std.mem.Allocator) !u8 {
 }
 
 test {
+    _ = @import("Ast.zig");
     _ = @import("Tokenizer.zig");
     _ = @import("string_literal.zig");
 }

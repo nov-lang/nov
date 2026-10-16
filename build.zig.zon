@@ -1,24 +1,24 @@
 .{
     .name = .nov,
     .version = "0.0.0",
-    .minimum_zig_version = "0.15.0",
+    .minimum_zig_version = "0.16.0",
     .fingerprint = 0xe60b9c59a00e14ef,
     .dependencies = .{
         .clap = .{
-            .url = "git+https://github.com/Hejsil/zig-clap#b7e3348ed60f99ba32c75aa707ff7c87adc31b36",
-            .hash = "clap-0.11.0-oBajB-TnAQC7yPLnZRT5WzHZ_4Ly4dX2OILskli74b9H",
+            .url = "git+https://github.com/Hejsil/zig-clap#8d97efa1ee1e575443c7888d5c38e1c3fc145cf5",
+            .hash = "clap-0.12.0-oBajB7foAQDqlSwaSG5g0yq7xGbQARUsBk5T64gAOqP5",
         },
         .isocline = .{
             .url = "git+https://github.com/ratakor/isocline-zig#4441805bc1ca663b2b6fa7b62e2552e96449538b",
             .hash = "isocline-1.0.9-5daVr0kMBgCh-hYzMeXDNsF_imdzgPk5qua7OMBdiXHl",
         },
         .known_folders = .{
-            .url = "git+https://github.com/ziglibs/known-folders#ab5cf5feb936fa3b72c95d3ad0c0c67791937ba1",
-            .hash = "known_folders-0.0.0-Fy-PJtTTAADUOhGKM0sxzG4eMkNQxRvx9e5dfHVyaeA3",
+            .url = "git+https://github.com/ziglibs/known-folders#6da0d0c41b78b9ed2d34fa364fcb81b5ebece6c4",
+            .hash = "known_folders-0.0.0-Fy-PJiDLAAB98m3uYUzatrTb2mO2fpvwx2zpSroEtfbO",
         },
         .axe = .{
-            .url = "git+https://github.com/ratakor/axe#4df48b5fd1bd8496dc3a9ed49790649b7c4e8fee",
-            .hash = "axe-0.7.0-M2JU5cyPAADJQcWDZE7xNmnuQtAgwmPLyCMjiLhOptrC",
+            .url = "git+https://github.com/ratakor/axe#186078c497e4e4dab20926c1b135fa9ab8a6a3b1",
+            .hash = "axe-0.8.0-M2JU5SuRAABRUbICFInh_GltUm46JBd986HQCE7j6BJz",
         },
     },
     .paths = .{

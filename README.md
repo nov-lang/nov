@@ -12,6 +12,19 @@ Nov has automatic memory management via a minimal tracing GC.
 <!-- https://github.com/ivmai/bdwgc -->
 <!-- autofree? https://docs.vlang.io/memory-management.html -->
 
+## Building
+
+Requires Zig 0.16.0.
+
+```sh
+zig build
+zig build test
+zig fmt --check src build.zig
+```
+
+The executable currently runs a parser demo; compilation and execution of Nov
+programs are not implemented yet.
+
 # Concepts
 
 ## Comments

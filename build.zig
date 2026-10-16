@@ -6,7 +6,7 @@ const nov_version: std.SemanticVersion = .{ .major = 0, .minor = 0, .patch = 0 }
 pub fn build(b: *std.Build) void {
     comptime {
         const current_zig = builtin.zig_version;
-        const min_zig = std.SemanticVersion.parse("0.14.0-dev.1860+2e2927735") catch unreachable;
+        const min_zig = std.SemanticVersion.parse("0.16.0") catch unreachable;
         if (current_zig.order(min_zig) == .lt) {
             @compileError(std.fmt.comptimePrint(
                 \\Your zig version ({}) does not meet the minimum required version ({})
@@ -50,8 +50,6 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseSafe,
             .build_options = build_options,
             .strip = true,
-            // .lto = !rel_target.result.isDarwin() and // https://github.com/ziglang/zig/issues/8680
-            //     !(rel_target.result.os.tag == .windows and target.result.abi == .gnu), // LTO is broken on mingw
         });
         rel_exe.root_module.strip = true;
         const install = b.addInstallArtifact(rel_exe, .{});
@@ -71,8 +69,16 @@ pub fn build(b: *std.Build) void {
     fmt_step.dependOn(&b.addFmt(.{ .paths = &.{ "build.zig", "src" } }).step);
 
     const clean_step = b.step("clean", "Remove build artifacts");
-    clean_step.dependOn(&b.addRemoveDirTree(b.path("zig-out")).step);
-    clean_step.dependOn(&b.addRemoveDirTree(b.path(".zig-cache")).step);
+    clean_step.makeFn = clean;
+}
+
+fn clean(step: *std.Build.Step, _: std.Build.Step.MakeOptions) !void {
+    const b = step.owner;
+    for ([_][]const u8{ "zig-out", ".zig-cache" }) |path| {
+        std.Io.Dir.cwd().deleteTree(b.graph.io, b.pathFromRoot(path)) catch |err| {
+            return step.fail("unable to remove {s}: {s}", .{ path, @errorName(err) });
+        };
+    }
 }
 
 const ExecutableOptions = struct {
@@ -80,7 +86,7 @@ const ExecutableOptions = struct {
     optimize: std.builtin.OptimizeMode,
     build_options: *std.Build.Step.Options,
     strip: ?bool = null,
-    lto: ?bool = null,
+    lto: ?std.zig.LtoMode = null,
 };
 
 fn makeExe(b: *std.Build, options: ExecutableOptions) *std.Build.Step.Compile {
@@ -94,6 +100,7 @@ fn makeExe(b: *std.Build, options: ExecutableOptions) *std.Build.Step.Compile {
         .target = options.target,
         .optimize = options.optimize,
         .strip = options.strip,
+        .link_libc = true,
     });
 
     const exe = b.addExecutable(.{
@@ -101,12 +108,12 @@ fn makeExe(b: *std.Build, options: ExecutableOptions) *std.Build.Step.Compile {
         .root_module = exe_module,
     });
 
-    exe.want_lto = options.lto;
+    exe.lto = options.lto;
     exe.root_module.addOptions("build_options", options.build_options);
     exe.root_module.addImport("isocline", isocline);
     exe.root_module.addImport("clap", clap);
     exe.root_module.addImport("axe", axe);
     exe.root_module.addImport("known-folders", known_folders);
-    exe.linkLibC();
+
     return exe;
 }

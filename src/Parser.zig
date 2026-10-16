@@ -74,9 +74,9 @@ pub fn parse(allocator: Allocator, source: [:0]const u8) Allocator.Error!Ast {
         .token_starts = tokens.items(.start),
         .tok_i = 0,
         .nodes = .{},
-        .extra_data = .{},
-        .errors = .{},
-        .scratch = .{},
+        .extra_data = .empty,
+        .errors = .empty,
+        .scratch = .empty,
     };
     defer parser.nodes.deinit(allocator);
     defer parser.extra_data.deinit(allocator);

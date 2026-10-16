@@ -32,18 +32,55 @@ pub fn deinit(self: *Ast, allocator: std.mem.Allocator) void {
 }
 
 pub fn render(self: Ast, allocator: std.mem.Allocator) Render.Error![]u8 {
-    var buffer = std.ArrayList(u8).init(allocator);
+    var buffer = std.Io.Writer.Allocating.init(allocator);
     defer buffer.deinit();
-    try self.renderToArrayList(&buffer, .{});
+    try Render.renderTree(&buffer, self, .{});
     return buffer.toOwnedSlice();
 }
 
 pub fn renderToArrayList(
     self: Ast,
+    allocator: std.mem.Allocator,
     buffer: *std.ArrayList(u8),
     fixups: Render.Fixups,
 ) Render.Error!void {
-    return Render.renderTree(buffer, self, fixups);
+    var writer = std.Io.Writer.Allocating.fromArrayList(allocator, buffer);
+    defer buffer.* = writer.toArrayList();
+    return Render.renderTree(&writer, self, fixups);
+}
+
+test "render empty AST" {
+    const allocator = std.testing.allocator;
+    var ast = try Parser.parse(allocator, "");
+    defer ast.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+
+    const rendered = try ast.render(allocator);
+    defer allocator.free(rendered);
+    try std.testing.expectEqualStrings("", rendered);
+
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(allocator);
+    try buffer.appendSlice(allocator, "prefix");
+    try ast.renderToArrayList(allocator, &buffer, .{});
+    try std.testing.expectEqualStrings("prefix", buffer.items);
+}
+
+test "render simple declaration" {
+    const allocator = std.testing.allocator;
+    var ast = try Parser.parse(allocator, "let answer=42\n");
+    defer ast.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+
+    const rendered = try ast.render(allocator);
+    defer allocator.free(rendered);
+    try std.testing.expectEqualStrings("let answer = 42\n", rendered);
+
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(allocator);
+    try buffer.appendSlice(allocator, "prefix\n");
+    try ast.renderToArrayList(allocator, &buffer, .{});
+    try std.testing.expectEqualStrings("prefix\nlet answer = 42\n", buffer.items);
 }
 
 pub const Location = struct {
