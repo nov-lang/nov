@@ -701,7 +701,13 @@ fn parseBlock(self: *Parser) Error!Node.Index {
                 try self.scratch.append(self.allocator, decl);
             },
             else => {
-                const expr = try self.parseAssignExpr();
+                const expr = self.parseAssignExpr() catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    error.ParseError => {
+                        self.findNextStmt();
+                        continue;
+                    },
+                };
                 if (expr == null_node) {
                     try self.warn(.expected_expr_or_assignment);
                     self.findNextStmt();
@@ -1510,6 +1516,7 @@ fn findNextStmt(self: *Parser) void {
     var level: usize = 0;
     while (true) : (self.tok_i += 1) {
         switch (self.token_tags[self.tok_i]) {
+            .keyword_let => if (level == 0) return,
             .l_brace => level += 1,
             .r_brace => {
                 if (level == 0) {
@@ -1738,6 +1745,63 @@ test "blank line stops continuation and recovery preserves next declaration" {
         const let_token = ast.nodes.items(.main_token)[declaration];
         try std.testing.expectEqualStrings("valid", ast.tokenSlice(let_token + 1));
     }
+}
+
+test "block recovery preserves the next declaration and block boundary" {
+    const malformed = [_][]const u8{
+        "let broken =\n",
+        "let broken:\n",
+        "let broken = -\n",
+        "let broken = ; comment\r\n",
+        "-\n",
+        "- ) {\nlet hidden = 0\n}\n",
+    };
+    for (malformed) |prefix| {
+        const source = try std.fmt.allocPrintSentinel(std.testing.allocator, "let value = {{\n{s}let valid = 42\nvalid\n}}\nlet after = 0", .{prefix}, 0);
+        defer std.testing.allocator.free(source);
+        var ast = try parse(std.testing.allocator, source);
+        defer ast.deinit(std.testing.allocator);
+
+        try std.testing.expectEqual(@as(usize, 1), ast.errors.len);
+        try std.testing.expectEqual(@as(usize, 2), ast.rootDecls().len);
+        const block_node = ast.decl(ast.rootDecls()[0]).ast.init_node;
+        var buffer: [2]Node.Index = undefined;
+        const block = ast.fullBlock(&buffer, block_node).?;
+        try std.testing.expectEqual(@as(usize, 2), block.ast.statements.len);
+        const declaration = ast.decl(block.ast.statements[0]);
+        try std.testing.expectEqualStrings("valid", ast.tokenSlice(declaration.ast.let_token + 1));
+        if (std.mem.eql(u8, prefix, "let broken =\n")) {
+            try std.testing.expectEqual(Ast.Error.Tag.expected_expr, ast.errors[0].tag);
+            try std.testing.expectEqual(declaration.ast.let_token, ast.errors[0].token);
+            try std.testing.expectEqual(std.mem.indexOf(u8, source, "let valid").?, ast.tokens.items(.start)[ast.errors[0].token]);
+        }
+        try std.testing.expectEqualStrings("valid", ast.tokenSlice(ast.firstToken(block.ast.statements[1])));
+        try std.testing.expectEqualStrings("}", ast.tokenSlice(block.ast.rbrace));
+        const after = ast.decl(ast.rootDecls()[1]);
+        try std.testing.expectEqualStrings("after", ast.tokenSlice(after.ast.let_token + 1));
+    }
+}
+
+test "block recovery preserves closing brace and diagnoses incomplete EOF" {
+    const sources = [_][:0]const u8{
+        "let value = {\nlet broken =\n}\nlet after = 0",
+        "let value = {\n-\n}\nlet after = 0",
+    };
+    for (sources) |source| {
+        var ast = try parse(std.testing.allocator, source);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 1), ast.errors.len);
+        try std.testing.expectEqual(@as(usize, 2), ast.rootDecls().len);
+        var buffer: [2]Node.Index = undefined;
+        const block = ast.fullBlock(&buffer, ast.decl(ast.rootDecls()[0]).ast.init_node).?;
+        try std.testing.expectEqual(@as(usize, 0), block.ast.statements.len);
+    }
+    var ast = try parse(std.testing.allocator, "let value = {\nlet broken =");
+    defer ast.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), ast.errors.len);
+    try std.testing.expectEqual(Ast.Error.Tag.expected_expr, ast.errors[0].tag);
+    try std.testing.expectEqual(Ast.Error.Tag.expected_token, ast.errors[1].tag);
+    try std.testing.expectEqual(Token.Tag.r_brace, ast.errors[1].extra.expected_tag);
 }
 
 test "recover after a declaration without an initializer" {
