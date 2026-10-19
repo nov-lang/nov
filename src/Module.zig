@@ -56,6 +56,7 @@ pub const Diagnostic = struct {
         argument_count_mismatch,
         unresolved_value_type,
         body_nesting_limit,
+        unsupported_lowering,
     };
 };
 

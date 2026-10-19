@@ -1,20 +1,44 @@
 const std = @import("std");
 const Ir = @This();
 
-// This is the owned type/constant foundation, not yet an executable IR. Integer
-// widths describe resolved values; no literal defaults or overflow policy live here.
+// Integer widths describe resolved values; no literal defaults or overflow policy
+// live here. Spans borrow offsets into a single externally owned source.
 allocator: std.mem.Allocator,
 types: std.ArrayList(Type) = .empty,
 constants: std.ArrayList(Constant) = .empty,
+source_len: u32 = 0,
+functions: std.ArrayList(Function) = .empty,
 
 pub const TypeId = enum(u32) { _ };
 pub const ConstId = enum(u32) { _ };
+pub const FunctionId = enum(u32) { _ };
+/// Zero-based instruction index, local to a single body.
+pub const ValueId = enum(u32) { _ };
+pub const Span = struct { start: u32, end: u32 };
+pub const Function = struct {
+    name: []const u8,
+    ty: TypeId,
+    span: Span,
+    body: ?Body = null,
+};
+pub const Body = struct { instructions: []const Instruction, result: ValueId };
+pub const Instruction = struct { ty: TypeId, span: Span, op: Operation };
+pub const UnaryOp = enum { negate, bit_not, bool_not };
+pub const BinaryOp = enum { add, sub, mul, div, mod, eq, ne, lt, le, gt, ge };
+pub const Operation = union(enum) {
+    constant: ConstId,
+    parameter: u32,
+    function_ref: FunctionId,
+    unary: struct { op: UnaryOp, operand: ValueId },
+    binary: struct { op: BinaryOp, lhs: ValueId, rhs: ValueId },
+    call: struct { callee: ValueId, args: []const ValueId },
+};
 
 pub const Type = union(enum) {
     void,
     boolean,
     integer: Integer,
-    function: Function,
+    function: Type.Function,
 
     pub const Integer = struct {
         signedness: std.builtin.Signedness,
@@ -49,13 +73,32 @@ pub const ValidationError = error{
     IntegerOutOfRange,
 };
 pub const InternError = ValidationError || std.mem.Allocator.Error || error{TooManyEntries};
-pub const VerifyError = ValidationError || error{ NonCanonicalType, NonCanonicalConstant };
+pub const VerifyError = ValidationError || error{
+    NonCanonicalType,
+    NonCanonicalConstant,
+    InvalidFunctionId,
+    InvalidFunctionType,
+    InvalidFunctionName,
+    DuplicateFunctionName,
+    InvalidSourceSpan,
+    MissingFunctionBody,
+    InvalidValueId,
+    InvalidParameter,
+    OperandTypeMismatch,
+    InvalidOperation,
+    InvalidCall,
+    InvalidReturn,
+    InvalidConstId,
+};
+pub const BuildError = VerifyError || std.mem.Allocator.Error || error{ TooManyEntries, BodyAlreadySet };
 
 pub fn init(allocator: std.mem.Allocator) Ir {
     return .{ .allocator = allocator };
 }
 
 pub fn deinit(self: *Ir) void {
+    self.clearFunctions();
+    self.functions.deinit(self.allocator);
     for (self.types.items) |ty| {
         switch (ty) {
             .function => |function| self.allocator.free(function.params),
@@ -78,6 +121,65 @@ pub fn getConstant(self: *const Ir, id: ConstId) ?Constant {
     const index = @intFromEnum(id);
     if (index >= self.constants.items.len) return null;
     return self.constants.items[index];
+}
+
+/// Names and nested body slices in the returned view borrow this IR.
+pub fn getFunction(self: *const Ir, id: FunctionId) ?Function {
+    const index = @intFromEnum(id);
+    if (index >= self.functions.items.len) return null;
+    return self.functions.items[index];
+}
+
+pub fn addFunction(self: *Ir, name: []const u8, ty: TypeId, span: Span) BuildError!FunctionId {
+    try self.validateFunction(.{ .name = name, .ty = ty, .span = span });
+    for (self.functions.items) |existing| {
+        if (std.mem.eql(u8, name, existing.name)) return error.DuplicateFunctionName;
+    }
+    if (self.functions.items.len == std.math.maxInt(u32)) return error.TooManyEntries;
+    const owned_name = try self.allocator.dupe(u8, name);
+    errdefer self.allocator.free(owned_name);
+    const id: FunctionId = @enumFromInt(self.functions.items.len);
+    try self.functions.append(self.allocator, .{ .name = owned_name, .ty = ty, .span = span });
+    return id;
+}
+
+/// Validation and allocation complete before publishing any part of the body.
+/// Referenced function declarations may still be awaiting their own bodies.
+pub fn setFunctionBody(self: *Ir, id: FunctionId, instructions: []const Instruction, result: ValueId) BuildError!void {
+    const function = self.getFunction(id) orelse return error.InvalidFunctionId;
+    if (function.body != null) return error.BodyAlreadySet;
+    if (instructions.len > std.math.maxInt(u32)) return error.TooManyEntries;
+    try self.validateFunction(function);
+    try self.validateBody(function, .{ .instructions = instructions, .result = result });
+    const owned = try self.allocator.dupe(Instruction, instructions);
+    var copied: usize = 0;
+    errdefer {
+        for (owned[0..copied]) |instruction| {
+            if (instruction.op == .call) self.allocator.free(instruction.op.call.args);
+        }
+        self.allocator.free(owned);
+    }
+    for (owned) |*instruction| {
+        if (instruction.op == .call) {
+            instruction.op.call.args = try self.allocator.dupe(ValueId, instruction.op.call.args);
+        }
+        copied += 1;
+    }
+    self.functions.items[@intFromEnum(id)].body = .{ .instructions = owned, .result = result };
+}
+
+/// Invalidates all function handles and borrowed function/body views, not pools.
+pub fn clearFunctions(self: *Ir) void {
+    for (self.functions.items) |function| {
+        self.allocator.free(function.name);
+        if (function.body) |body| {
+            for (body.instructions) |instruction| {
+                if (instruction.op == .call) self.allocator.free(instruction.op.call.args);
+            }
+            self.allocator.free(body.instructions);
+        }
+    }
+    self.functions.clearRetainingCapacity();
 }
 
 pub fn internType(self: *Ir, ty: Type) InternError!TypeId {
@@ -125,6 +227,96 @@ pub fn verify(self: *const Ir) VerifyError!void {
             if (std.meta.eql(previous, constant)) return error.NonCanonicalConstant;
         }
     }
+    // Check every declaration before bodies, allowing forward and recursive refs.
+    for (self.functions.items, 0..) |function, i| {
+        try self.validateFunction(function);
+        for (self.functions.items[0..i]) |previous| {
+            if (std.mem.eql(u8, previous.name, function.name)) return error.DuplicateFunctionName;
+        }
+    }
+    for (self.functions.items) |function| {
+        if (function.body == null) return error.MissingFunctionBody;
+    }
+    for (self.functions.items) |function| try self.validateBody(function, function.body.?);
+}
+
+fn validateSpan(self: *const Ir, span: Span) VerifyError!void {
+    if (span.start > span.end or span.end > self.source_len) return error.InvalidSourceSpan;
+}
+
+fn validateFunction(self: *const Ir, function: Function) VerifyError!void {
+    if (function.name.len == 0) return error.InvalidFunctionName;
+    const ty = self.getType(function.ty) orelse return error.InvalidTypeId;
+    if (ty != .function) return error.InvalidFunctionType;
+    try self.validateType(ty, self.types.items.len);
+    try self.validateSpan(function.span);
+}
+
+fn operandType(body: Body, id: ValueId, before: usize) VerifyError!TypeId {
+    const index = @intFromEnum(id);
+    if (index >= before) return error.InvalidValueId;
+    return body.instructions[index].ty;
+}
+
+fn validateBody(self: *const Ir, function: Function, body: Body) VerifyError!void {
+    const signature = (self.getType(function.ty) orelse return error.InvalidTypeId).function;
+    for (body.instructions, 0..) |instruction, i| {
+        const ty = self.getType(instruction.ty) orelse return error.InvalidTypeId;
+        try self.validateSpan(instruction.span);
+        switch (instruction.op) {
+            .constant => |id| {
+                const constant = self.getConstant(id) orelse return error.InvalidConstId;
+                try self.validateConstant(constant);
+                if (constant.ty != instruction.ty) return error.OperandTypeMismatch;
+            },
+            .parameter => |index| {
+                if (index >= signature.params.len) return error.InvalidParameter;
+                if (signature.params[index] != instruction.ty) return error.OperandTypeMismatch;
+            },
+            .function_ref => |id| {
+                const referenced = self.getFunction(id) orelse return error.InvalidFunctionId;
+                try self.validateFunction(referenced);
+                if (referenced.ty != instruction.ty) return error.OperandTypeMismatch;
+            },
+            .unary => |unary| {
+                const operand = try operandType(body, unary.operand, i);
+                if (operand != instruction.ty) return error.OperandTypeMismatch;
+                switch (unary.op) {
+                    .negate => if (ty != .integer or ty.integer.signedness != .signed) return error.InvalidOperation,
+                    .bit_not => if (ty != .integer) return error.InvalidOperation,
+                    .bool_not => if (ty != .boolean) return error.InvalidOperation,
+                }
+            },
+            .binary => |binary| {
+                const lhs = try operandType(body, binary.lhs, i);
+                const rhs = try operandType(body, binary.rhs, i);
+                if (lhs != rhs) return error.OperandTypeMismatch;
+                const operand = self.getType(lhs) orelse return error.InvalidTypeId;
+                switch (binary.op) {
+                    .add, .sub, .mul, .div, .mod => {
+                        if (operand != .integer) return error.InvalidOperation;
+                        if (instruction.ty != lhs) return error.OperandTypeMismatch;
+                    },
+                    .eq, .ne, .lt, .le, .gt, .ge => {
+                        if (operand != .integer and !((binary.op == .eq or binary.op == .ne) and operand == .boolean)) return error.InvalidOperation;
+                        if (ty != .boolean) return error.OperandTypeMismatch;
+                    },
+                }
+            },
+            .call => |call| {
+                const callee_id = try operandType(body, call.callee, i);
+                const callee = self.getType(callee_id) orelse return error.InvalidTypeId;
+                if (callee != .function) return error.InvalidCall;
+                try self.validateType(callee, self.types.items.len);
+                if (call.args.len != callee.function.params.len) return error.InvalidCall;
+                for (call.args, callee.function.params) |arg, param| {
+                    if (try operandType(body, arg, i) != param) return error.OperandTypeMismatch;
+                }
+                if (instruction.ty != callee.function.result) return error.InvalidCall;
+            },
+        }
+    }
+    if (try operandType(body, body.result, body.instructions.len) != signature.result) return error.InvalidReturn;
 }
 
 fn validateType(self: *const Ir, ty: Type, before: usize) ValidationError!void {
@@ -363,4 +555,339 @@ fn testAllocationFailures(allocator: std.mem.Allocator) !void {
 
 test "type and constant ownership survives every allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{});
+}
+
+const test_span: Span = .{ .start = 0, .end = 1 };
+const TestFunctions = struct {
+    ir: Ir,
+    boolean: TypeId,
+    integer: TypeId,
+    unsigned: TypeId,
+    signature: TypeId,
+    function: FunctionId,
+    number: ConstId,
+
+    fn init(allocator: std.mem.Allocator) !TestFunctions {
+        var ir = Ir.init(allocator);
+        errdefer ir.deinit();
+        ir.source_len = 10;
+        const boolean = try ir.internType(.boolean);
+        const integer = try ir.internType(.{ .integer = .{ .signedness = .signed, .bits = 32 } });
+        const unsigned = try ir.internType(.{ .integer = .{ .signedness = .unsigned, .bits = 32 } });
+        const signature = try ir.internType(.{ .function = .{ .params = &.{integer}, .result = integer } });
+        const number = try ir.internConstant(.{ .ty = integer, .value = .{ .signed_integer = 1 } });
+        const function = try ir.addFunction("identity", signature, test_span);
+        return .{ .ir = ir, .boolean = boolean, .integer = integer, .unsigned = unsigned, .signature = signature, .function = function, .number = number };
+    }
+
+    fn instruction(ty: TypeId, op: Operation) Instruction {
+        return .{ .ty = ty, .span = test_span, .op = op };
+    }
+
+    fn reject(self: *TestFunctions, expected: VerifyError, instructions: []const Instruction, result: ValueId) !void {
+        try std.testing.expectError(expected, self.ir.setFunctionBody(self.function, instructions, result));
+        try std.testing.expect(self.ir.getFunction(self.function).?.body == null);
+    }
+};
+
+test "functions own names instructions and call arguments with forward and recursive references" {
+    var fixture = try TestFunctions.init(std.testing.allocator);
+    defer fixture.ir.deinit();
+    const ir = &fixture.ir;
+    var name = [_]u8{ 'l', 'a', 't', 'e', 'r' };
+    const later = try ir.addFunction(&name, fixture.signature, .{ .start = 1, .end = 10 });
+    name[0] = 'x';
+    try std.testing.expectEqualStrings("later", ir.getFunction(later).?.name);
+    var args = [_]ValueId{@enumFromInt(0)};
+    var instructions = [_]Instruction{
+        TestFunctions.instruction(fixture.integer, .{ .parameter = 0 }),
+        TestFunctions.instruction(fixture.signature, .{ .function_ref = later }),
+        TestFunctions.instruction(fixture.integer, .{ .call = .{ .callee = @enumFromInt(1), .args = &args } }),
+    };
+    try ir.setFunctionBody(fixture.function, &instructions, @enumFromInt(2));
+    try std.testing.expectError(error.MissingFunctionBody, ir.verify());
+    args[0] = @enumFromInt(999);
+    instructions[0].ty = fixture.boolean;
+    const stored = ir.getFunction(fixture.function).?.body.?;
+    try std.testing.expectEqual(fixture.integer, stored.instructions[0].ty);
+    try std.testing.expectEqual(@as(ValueId, @enumFromInt(0)), stored.instructions[2].op.call.args[0]);
+    // The second function refers to itself, but no body is required at insertion.
+    instructions[0].ty = fixture.integer;
+    args[0] = @enumFromInt(0);
+    try ir.setFunctionBody(later, &instructions, @enumFromInt(2));
+    try ir.verify();
+    try std.testing.expectError(error.BodyAlreadySet, ir.setFunctionBody(later, &.{}, @enumFromInt(0)));
+    try std.testing.expect(ir.getFunction(@enumFromInt(999)) == null);
+    const capacity = ir.functions.capacity;
+    ir.clearFunctions();
+    try std.testing.expectEqual(capacity, ir.functions.capacity);
+    try std.testing.expectEqual(@as(usize, 0), ir.functions.items.len);
+    try ir.verify();
+    _ = try ir.addFunction("identity", fixture.signature, test_span);
+    ir.clearFunctions();
+}
+
+test "all integer unary binary and comparison operations have exact types" {
+    var fixture = try TestFunctions.init(std.testing.allocator);
+    defer fixture.ir.deinit();
+    const ir = &fixture.ir;
+    for ([_]TypeId{ fixture.integer, fixture.unsigned }) |integer| {
+        const signature = try ir.internType(.{ .function = .{ .params = &.{integer}, .result = integer } });
+        for (std.enums.values(BinaryOp)) |op| {
+            const comparison = switch (op) {
+                .add, .sub, .mul, .div, .mod => false,
+                else => true,
+            };
+            const result_type = if (comparison) fixture.boolean else integer;
+            const ty = try ir.internType(.{ .function = .{ .params = &.{integer}, .result = result_type } });
+            ir.clearFunctions();
+            const function = try ir.addFunction("binary", ty, test_span);
+            try ir.setFunctionBody(function, &.{
+                TestFunctions.instruction(integer, .{ .parameter = 0 }),
+                TestFunctions.instruction(result_type, .{ .binary = .{ .op = op, .lhs = @enumFromInt(0), .rhs = @enumFromInt(0) } }),
+            }, @enumFromInt(1));
+            try ir.verify();
+        }
+        for ([_]UnaryOp{ .negate, .bit_not }) |op| {
+            if (integer == fixture.unsigned and op == .negate) continue;
+            ir.clearFunctions();
+            const function = try ir.addFunction("unary", signature, test_span);
+            try ir.setFunctionBody(function, &.{
+                TestFunctions.instruction(integer, .{ .parameter = 0 }),
+                TestFunctions.instruction(integer, .{ .unary = .{ .op = op, .operand = @enumFromInt(0) } }),
+            }, @enumFromInt(1));
+            try ir.verify();
+        }
+    }
+    ir.clearFunctions();
+    const boolean_signature = try ir.internType(.{ .function = .{ .params = &.{fixture.boolean}, .result = fixture.boolean } });
+    const function = try ir.addFunction("boolean", boolean_signature, test_span);
+    try ir.setFunctionBody(function, &.{
+        TestFunctions.instruction(fixture.boolean, .{ .parameter = 0 }),
+        TestFunctions.instruction(fixture.boolean, .{ .unary = .{ .op = .bool_not, .operand = @enumFromInt(0) } }),
+        TestFunctions.instruction(fixture.boolean, .{ .binary = .{ .op = .eq, .lhs = @enumFromInt(0), .rhs = @enumFromInt(1) } }),
+        TestFunctions.instruction(fixture.boolean, .{ .binary = .{ .op = .ne, .lhs = @enumFromInt(1), .rhs = @enumFromInt(2) } }),
+    }, @enumFromInt(3));
+    try ir.verify();
+}
+
+test "function metadata validation rejects corruption and preserves declarations" {
+    var fixture = try TestFunctions.init(std.testing.allocator);
+    defer fixture.ir.deinit();
+    const ir = &fixture.ir;
+    try std.testing.expectError(error.InvalidFunctionName, ir.addFunction("", fixture.signature, test_span));
+    try std.testing.expectError(error.DuplicateFunctionName, ir.addFunction("identity", fixture.signature, test_span));
+    try std.testing.expectError(error.InvalidFunctionType, ir.addFunction("bad", fixture.integer, test_span));
+    try std.testing.expectError(error.InvalidTypeId, ir.addFunction("bad", @enumFromInt(999), test_span));
+    for ([_]Span{ .{ .start = 2, .end = 1 }, .{ .start = 0, .end = 11 } }) |span| {
+        try std.testing.expectError(error.InvalidSourceSpan, ir.addFunction("bad", fixture.signature, span));
+    }
+    try std.testing.expectEqual(@as(usize, 1), ir.functions.items.len);
+    try std.testing.expectError(error.InvalidFunctionId, ir.setFunctionBody(@enumFromInt(999), &.{}, @enumFromInt(0)));
+    try std.testing.expectError(error.MissingFunctionBody, ir.verify());
+    try ir.setFunctionBody(fixture.function, &.{TestFunctions.instruction(fixture.integer, .{ .parameter = 0 })}, @enumFromInt(0));
+    const original = ir.functions.items[0];
+    ir.functions.items[0].name = "";
+    try std.testing.expectError(error.InvalidFunctionName, ir.verify());
+    ir.functions.items[0] = original;
+    ir.functions.items[0].ty = fixture.integer;
+    try std.testing.expectError(error.InvalidFunctionType, ir.verify());
+    ir.functions.items[0].ty = @enumFromInt(999);
+    try std.testing.expectError(error.InvalidTypeId, ir.verify());
+    ir.functions.items[0] = original;
+    ir.functions.items[0].span.end = 11;
+    try std.testing.expectError(error.InvalidSourceSpan, ir.verify());
+    ir.functions.items[0] = original;
+    const other = try ir.addFunction("other", fixture.signature, test_span);
+    const other_name = ir.functions.items[@intFromEnum(other)].name;
+    ir.functions.items[@intFromEnum(other)].name = original.name;
+    try std.testing.expectError(error.DuplicateFunctionName, ir.verify());
+    ir.functions.items[@intFromEnum(other)].name = other_name;
+    try ir.setFunctionBody(other, &.{TestFunctions.instruction(fixture.integer, .{ .parameter = 0 })}, @enumFromInt(0));
+    ir.source_len = 0;
+    try std.testing.expectError(error.InvalidSourceSpan, ir.verify());
+    ir.source_len = 10;
+    try ir.verify();
+}
+
+test "body validation rejects invalid ids parameter types spans and returns" {
+    var fixture = try TestFunctions.init(std.testing.allocator);
+    defer fixture.ir.deinit();
+    const integer = fixture.integer;
+    try fixture.reject(error.InvalidValueId, &.{}, @enumFromInt(0));
+    try fixture.reject(error.InvalidTypeId, &.{TestFunctions.instruction(@enumFromInt(999), .{ .parameter = 0 })}, @enumFromInt(0));
+    try fixture.reject(error.InvalidParameter, &.{TestFunctions.instruction(integer, .{ .parameter = 1 })}, @enumFromInt(0));
+    try fixture.reject(error.OperandTypeMismatch, &.{TestFunctions.instruction(fixture.boolean, .{ .parameter = 0 })}, @enumFromInt(0));
+    try fixture.reject(error.InvalidConstId, &.{TestFunctions.instruction(integer, .{ .constant = @enumFromInt(999) })}, @enumFromInt(0));
+    try fixture.reject(error.OperandTypeMismatch, &.{TestFunctions.instruction(fixture.boolean, .{ .constant = fixture.number })}, @enumFromInt(0));
+    try fixture.reject(error.InvalidFunctionId, &.{TestFunctions.instruction(fixture.signature, .{ .function_ref = @enumFromInt(999) })}, @enumFromInt(0));
+    try fixture.reject(error.OperandTypeMismatch, &.{TestFunctions.instruction(integer, .{ .function_ref = fixture.function })}, @enumFromInt(0));
+    const truth = try fixture.ir.internConstant(.{ .ty = fixture.boolean, .value = .{ .boolean = true } });
+    try fixture.reject(error.InvalidReturn, &.{TestFunctions.instruction(fixture.boolean, .{ .constant = truth })}, @enumFromInt(0));
+    try fixture.reject(error.InvalidValueId, &.{TestFunctions.instruction(integer, .{ .constant = fixture.number })}, @enumFromInt(1));
+    for ([_]Span{ .{ .start = 3, .end = 2 }, .{ .start = 10, .end = 11 } }) |span| {
+        try fixture.reject(error.InvalidSourceSpan, &.{.{ .ty = integer, .span = span, .op = .{ .parameter = 0 } }}, @enumFromInt(0));
+    }
+    try fixture.ir.setFunctionBody(fixture.function, &.{TestFunctions.instruction(integer, .{ .constant = fixture.number })}, @enumFromInt(0));
+    const body = &fixture.ir.functions.items[0].body.?;
+    const instructions = @constCast(body.instructions);
+    instructions[0].op = .{ .constant = @enumFromInt(999) };
+    try std.testing.expectError(error.InvalidConstId, fixture.ir.verify());
+    instructions[0].op = .{ .constant = fixture.number };
+    instructions[0].span.end = 11;
+    try std.testing.expectError(error.InvalidSourceSpan, fixture.ir.verify());
+    instructions[0].span = test_span;
+    body.result = @enumFromInt(1);
+    try std.testing.expectError(error.InvalidValueId, fixture.ir.verify());
+    body.result = @enumFromInt(0);
+    try fixture.ir.verify();
+}
+
+test "SSA operands must precede their use and operation types must agree" {
+    var fixture = try TestFunctions.init(std.testing.allocator);
+    defer fixture.ir.deinit();
+    const integer = fixture.integer;
+    const first = TestFunctions.instruction(integer, .{ .parameter = 0 });
+    for ([_]u32{ 1, 2, 999 }) |invalid| {
+        try fixture.reject(error.InvalidValueId, &.{ first, TestFunctions.instruction(integer, .{ .unary = .{ .op = .negate, .operand = @enumFromInt(invalid) } }) }, @enumFromInt(1));
+        try fixture.reject(error.InvalidValueId, &.{ first, TestFunctions.instruction(integer, .{ .binary = .{ .op = .add, .lhs = @enumFromInt(0), .rhs = @enumFromInt(invalid) } }) }, @enumFromInt(1));
+        try fixture.reject(error.InvalidValueId, &.{ first, TestFunctions.instruction(integer, .{ .binary = .{ .op = .add, .lhs = @enumFromInt(invalid), .rhs = @enumFromInt(0) } }) }, @enumFromInt(1));
+    }
+    try fixture.reject(error.OperandTypeMismatch, &.{ first, TestFunctions.instruction(fixture.unsigned, .{ .unary = .{ .op = .bit_not, .operand = @enumFromInt(0) } }) }, @enumFromInt(1));
+    try fixture.reject(error.InvalidOperation, &.{ first, TestFunctions.instruction(integer, .{ .unary = .{ .op = .bool_not, .operand = @enumFromInt(0) } }) }, @enumFromInt(1));
+    const unsigned_constant = try fixture.ir.internConstant(.{ .ty = fixture.unsigned, .value = .{ .unsigned_integer = 1 } });
+    const unsigned_first = TestFunctions.instruction(fixture.unsigned, .{ .constant = unsigned_constant });
+    try fixture.reject(error.InvalidOperation, &.{ unsigned_first, TestFunctions.instruction(fixture.unsigned, .{ .unary = .{ .op = .negate, .operand = @enumFromInt(0) } }) }, @enumFromInt(1));
+    try fixture.reject(error.OperandTypeMismatch, &.{ first, unsigned_first, TestFunctions.instruction(integer, .{ .binary = .{ .op = .add, .lhs = @enumFromInt(0), .rhs = @enumFromInt(1) } }) }, @enumFromInt(2));
+    try fixture.reject(error.OperandTypeMismatch, &.{ first, TestFunctions.instruction(fixture.unsigned, .{ .binary = .{ .op = .add, .lhs = @enumFromInt(0), .rhs = @enumFromInt(0) } }) }, @enumFromInt(1));
+    try fixture.reject(error.OperandTypeMismatch, &.{ first, TestFunctions.instruction(integer, .{ .binary = .{ .op = .lt, .lhs = @enumFromInt(0), .rhs = @enumFromInt(0) } }) }, @enumFromInt(1));
+    const truth = try fixture.ir.internConstant(.{ .ty = fixture.boolean, .value = .{ .boolean = true } });
+    const boolean_first = TestFunctions.instruction(fixture.boolean, .{ .constant = truth });
+    for ([_]UnaryOp{ .negate, .bit_not }) |op| {
+        try fixture.reject(error.InvalidOperation, &.{ boolean_first, TestFunctions.instruction(fixture.boolean, .{ .unary = .{ .op = op, .operand = @enumFromInt(0) } }) }, @enumFromInt(1));
+    }
+    for ([_]BinaryOp{ .add, .sub, .mul, .div, .mod, .lt, .le, .gt, .ge }) |op| {
+        try fixture.reject(error.InvalidOperation, &.{ boolean_first, TestFunctions.instruction(fixture.boolean, .{ .binary = .{ .op = op, .lhs = @enumFromInt(0), .rhs = @enumFromInt(0) } }) }, @enumFromInt(1));
+    }
+    // A value in another function cannot satisfy an operand in this body.
+    const other = try fixture.ir.addFunction("other", fixture.signature, test_span);
+    try fixture.ir.setFunctionBody(other, &.{first}, @enumFromInt(0));
+    try fixture.reject(error.InvalidValueId, &.{TestFunctions.instruction(integer, .{ .unary = .{ .op = .negate, .operand = @enumFromInt(0) } })}, @enumFromInt(0));
+}
+
+test "calls validate callee order signatures arity arguments and results" {
+    var fixture = try TestFunctions.init(std.testing.allocator);
+    defer fixture.ir.deinit();
+    const integer = fixture.integer;
+    const first = TestFunctions.instruction(integer, .{ .parameter = 0 });
+    const reference = TestFunctions.instruction(fixture.signature, .{ .function_ref = fixture.function });
+    try fixture.reject(error.InvalidCall, &.{ first, TestFunctions.instruction(integer, .{ .call = .{ .callee = @enumFromInt(0), .args = &.{} } }) }, @enumFromInt(1));
+    for ([_]u32{ 2, 999 }) |invalid| {
+        try fixture.reject(error.InvalidValueId, &.{ first, reference, TestFunctions.instruction(integer, .{ .call = .{ .callee = @enumFromInt(invalid), .args = &.{@enumFromInt(0)} } }) }, @enumFromInt(2));
+        try fixture.reject(error.InvalidValueId, &.{ first, reference, TestFunctions.instruction(integer, .{ .call = .{ .callee = @enumFromInt(1), .args = &.{@enumFromInt(invalid)} } }) }, @enumFromInt(2));
+    }
+    for ([_][]const ValueId{ &.{}, &.{ @enumFromInt(0), @enumFromInt(0) } }) |args| {
+        try fixture.reject(error.InvalidCall, &.{ first, reference, TestFunctions.instruction(integer, .{ .call = .{ .callee = @enumFromInt(1), .args = args } }) }, @enumFromInt(2));
+    }
+    try fixture.reject(error.OperandTypeMismatch, &.{ first, reference, TestFunctions.instruction(integer, .{ .call = .{ .callee = @enumFromInt(1), .args = &.{@enumFromInt(1)} } }) }, @enumFromInt(2));
+    try fixture.reject(error.InvalidCall, &.{ first, reference, TestFunctions.instruction(fixture.boolean, .{ .call = .{ .callee = @enumFromInt(1), .args = &.{@enumFromInt(0)} } }) }, @enumFromInt(2));
+    try fixture.ir.setFunctionBody(fixture.function, &.{ first, reference, TestFunctions.instruction(integer, .{ .call = .{ .callee = @enumFromInt(1), .args = &.{@enumFromInt(0)} } }) }, @enumFromInt(2));
+    const instructions = @constCast(fixture.ir.getFunction(fixture.function).?.body.?.instructions);
+    const original = instructions[2];
+    instructions[2].op.call.callee = @enumFromInt(2);
+    try std.testing.expectError(error.InvalidValueId, fixture.ir.verify());
+    instructions[2] = original;
+    @constCast(instructions[2].op.call.args)[0] = @enumFromInt(2);
+    try std.testing.expectError(error.InvalidValueId, fixture.ir.verify());
+    @constCast(instructions[2].op.call.args)[0] = @enumFromInt(0);
+    try fixture.ir.verify();
+}
+
+fn testFunctionAllocationFailures(allocator: std.mem.Allocator) !void {
+    var fixture = try TestFunctions.init(allocator);
+    defer fixture.ir.deinit();
+    const ir = &fixture.ir;
+    const first = TestFunctions.instruction(fixture.integer, .{ .parameter = 0 });
+    ir.setFunctionBody(fixture.function, &.{first}, @enumFromInt(0)) catch |err| {
+        try std.testing.expect(ir.getFunction(fixture.function).?.body == null);
+        return err;
+    };
+    const original_body = ir.getFunction(fixture.function).?.body.?.instructions;
+    // Force both name allocation and eventual array growth while preserving bodies.
+    for (0..20) |i| {
+        var name_buffer: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buffer, "function{d}", .{i});
+        const old_len = ir.functions.items.len;
+        const function = ir.addFunction(name, fixture.signature, test_span) catch |err| {
+            try std.testing.expectEqual(old_len, ir.functions.items.len);
+            try ir.verify();
+            return err;
+        };
+        const instructions = [_]Instruction{
+            first,
+            TestFunctions.instruction(fixture.signature, .{ .function_ref = fixture.function }),
+            TestFunctions.instruction(fixture.integer, .{ .call = .{ .callee = @enumFromInt(1), .args = &.{@enumFromInt(0)} } }),
+            TestFunctions.instruction(fixture.integer, .{ .call = .{ .callee = @enumFromInt(1), .args = &.{@enumFromInt(2)} } }),
+        };
+        ir.setFunctionBody(function, &instructions, @enumFromInt(3)) catch |err| {
+            try std.testing.expect(ir.getFunction(function).?.body == null);
+            try std.testing.expectEqualStrings(name, ir.getFunction(function).?.name);
+            try std.testing.expectEqual(original_body.ptr, ir.getFunction(fixture.function).?.body.?.instructions.ptr);
+            try std.testing.expectError(error.MissingFunctionBody, ir.verify());
+            return err;
+        };
+        try ir.verify();
+    }
+    ir.clearFunctions();
+    try ir.verify();
+    const reused = try ir.addFunction("reused", fixture.signature, test_span);
+    try ir.setFunctionBody(reused, &.{first}, @enumFromInt(0));
+    try ir.verify();
+}
+
+test "void and higher order functions accept zero width source spans" {
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    const span: Span = .{ .start = 0, .end = 0 };
+    const void_type = try ir.internType(.void);
+    const void_value = try ir.internConstant(.{ .ty = void_type, .value = .void });
+    const signature = try ir.internType(.{ .function = .{ .params = &.{}, .result = void_type } });
+    const identity_type = try ir.internType(.{ .function = .{ .params = &.{signature}, .result = signature } });
+    const call_type = try ir.internType(.{ .function = .{ .params = &.{signature}, .result = void_type } });
+    const leaf = try ir.addFunction("leaf", signature, span);
+    const identity = try ir.addFunction("identity", identity_type, span);
+    const call = try ir.addFunction("call", call_type, span);
+    try ir.setFunctionBody(leaf, &.{.{ .ty = void_type, .span = span, .op = .{ .constant = void_value } }}, @enumFromInt(0));
+    try ir.setFunctionBody(identity, &.{.{ .ty = signature, .span = span, .op = .{ .parameter = 0 } }}, @enumFromInt(0));
+    try ir.setFunctionBody(call, &.{
+        .{ .ty = signature, .span = span, .op = .{ .parameter = 0 } },
+        .{ .ty = void_type, .span = span, .op = .{ .call = .{ .callee = @enumFromInt(0), .args = &.{} } } },
+    }, @enumFromInt(1));
+    try ir.verify();
+}
+
+test "body insertion checks referenced signatures and verification checks pools first" {
+    var fixture = try TestFunctions.init(std.testing.allocator);
+    defer fixture.ir.deinit();
+    const ir = &fixture.ir;
+    const other = try ir.addFunction("other", fixture.signature, test_span);
+    const reference = TestFunctions.instruction(fixture.signature, .{ .function_ref = other });
+    ir.functions.items[@intFromEnum(other)].ty = fixture.integer;
+    try fixture.reject(error.InvalidFunctionType, &.{reference}, @enumFromInt(0));
+    ir.functions.items[@intFromEnum(other)].ty = @enumFromInt(999);
+    try fixture.reject(error.InvalidTypeId, &.{reference}, @enumFromInt(0));
+    ir.functions.items[@intFromEnum(other)].ty = fixture.signature;
+    const signature = &ir.types.items[@intFromEnum(fixture.signature)].function;
+    signature.result = @enumFromInt(999);
+    try fixture.reject(error.InvalidTypeId, &.{reference}, @enumFromInt(0));
+    try std.testing.expectError(error.InvalidTypeId, ir.verify());
+    signature.result = fixture.integer;
+    ir.constants.items[@intFromEnum(fixture.number)].ty = @enumFromInt(999);
+    try std.testing.expectError(error.InvalidTypeId, ir.verify());
+    ir.constants.items[@intFromEnum(fixture.number)].ty = fixture.integer;
+    try std.testing.expectError(error.MissingFunctionBody, ir.verify());
+}
+
+test "function ownership and body publication survive every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testFunctionAllocationFailures, .{});
 }

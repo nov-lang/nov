@@ -5,9 +5,9 @@ const Ir = @import("Ir.zig");
 const Literal = @import("Literal.zig");
 const isPrimitive = @import("primitives.zig").isPrimitive;
 
-pub const Error = Ir.InternError;
+pub const Error = Ir.BuildError;
 const Known = struct { ty: Ir.TypeId, annotation: ?Module.Span = null };
-const Binding = struct { known: Known };
+const Binding = struct { known: Known, index: u32 };
 // Bounds recursive checking/probing, not the iterative literal-grouping walk.
 const max_recursive_depth = 128;
 
@@ -16,6 +16,45 @@ const max_recursive_depth = 128;
 /// Requires the complete, valid annotation table produced by Sema/TypeResolver.
 /// The caller owns rollback of diagnostics and IR allocations on failure.
 pub fn check(module: *Module, ir: *Ir, types: []const ?Ir.TypeId, id: Module.DeclId) Error!bool {
+    return checkInner(module, ir, types, id, null);
+}
+
+/// Reuses the checked walk to emit values in callee/argument and operand order.
+/// Source length and all function identities must already be registered in IR.
+pub fn lower(module: *Module, ir: *Ir, types: []const ?Ir.TypeId, constants: []const ?Ir.ConstId, functions: []const ?Ir.FunctionId, id: Module.DeclId) Error!bool {
+    if (constants.len != types.len or functions.len != types.len) return error.InvalidFunctionId;
+    var arena = std.heap.ArenaAllocator.init(module.allocator);
+    defer arena.deinit();
+    var emitter: Emitter = .{ .allocator = arena.allocator(), .constants = constants, .functions = functions };
+    if (!try checkInner(module, ir, types, id, &emitter)) return false;
+    const body_node = module.ast.decl(module.getDeclaration(id).?.node).ast.init_node;
+    const result = emitter.values.get(body_node) orelse return error.InvalidValueId;
+    const function = functions[@intFromEnum(id)] orelse return error.InvalidFunctionId;
+    try ir.setFunctionBody(function, emitter.instructions.items, result);
+    return true;
+}
+
+const Emitter = struct {
+    allocator: std.mem.Allocator,
+    constants: []const ?Ir.ConstId,
+    functions: []const ?Ir.FunctionId,
+    instructions: std.ArrayList(Ir.Instruction) = .empty,
+    values: std.AutoHashMapUnmanaged(Ast.Node.Index, Ir.ValueId) = .empty,
+
+    fn record(self: *Emitter, node: Ast.Node.Index, ty: Ir.TypeId, span: Ir.Span, op: Ir.Operation) Error!void {
+        if (self.values.contains(node)) return;
+        if (self.instructions.items.len == std.math.maxInt(u32)) return error.TooManyEntries;
+        const id: Ir.ValueId = @enumFromInt(self.instructions.items.len);
+        try self.instructions.append(self.allocator, .{ .ty = ty, .span = span, .op = op });
+        try self.values.put(self.allocator, node, id);
+    }
+
+    fn value(self: *Emitter, node: Ast.Node.Index) Error!Ir.ValueId {
+        return self.values.get(node) orelse error.InvalidValueId;
+    }
+};
+
+fn checkInner(module: *Module, ir: *Ir, types: []const ?Ir.TypeId, id: Module.DeclId, emitter: ?*Emitter) Error!bool {
     if (types.len != module.declarations.items.len) return error.InvalidTypeId;
     const declaration = module.getDeclaration(id) orelse return error.InvalidTypeId;
     const type_id = types[@intFromEnum(id)] orelse return false;
@@ -24,7 +63,7 @@ pub fn check(module: *Module, ir: *Ir, types: []const ?Ir.TypeId, id: Module.Dec
     const full = module.ast.decl(declaration.node);
     const proto = module.ast.fullFnProto(full.ast.type_node) orelse return error.InvalidTypeId;
     if (proto.ast.params.len != ty.function.params.len) return error.InvalidTypeId;
-    var context: Context = .{ .module = module, .ir = ir, .types = types };
+    var context: Context = .{ .module = module, .ir = ir, .types = types, .emitter = emitter };
     defer context.bindings.deinit(module.allocator);
     var iterator = proto.iterate(&module.ast);
     var i: usize = 0;
@@ -39,7 +78,7 @@ pub fn check(module: *Module, ir: *Ir, types: []const ?Ir.TypeId, id: Module.Dec
                 valid = false;
                 continue;
             }
-            try context.bindings.put(module.allocator, name, .{ .known = .{
+            try context.bindings.put(module.allocator, name, .{ .index = @intCast(i), .known = .{
                 .ty = ty.function.params[i],
                 .annotation = module.tokenSpan(module.ast.firstToken(param.type_expr)),
             } });
@@ -58,6 +97,7 @@ const Context = struct {
     module: *Module,
     ir: *Ir,
     types: []const ?Ir.TypeId,
+    emitter: ?*Emitter = null,
     bindings: std.StringHashMapUnmanaged(Binding) = .empty,
 
     fn span(self: *Context, node: Ast.Node.Index) Module.Span {
@@ -168,12 +208,100 @@ const Context = struct {
         return self.fail(.literal_needs_type, lhs, null);
     }
 
+    fn irSpan(self: *Context, node: Ast.Node.Index) Ir.Span {
+        const ast = &self.module.ast;
+        return .{
+            .start = self.module.tokenSpan(ast.firstToken(node)).start,
+            .end = self.module.tokenSpan(ast.lastToken(node)).end,
+        };
+    }
+
+    fn emitNode(self: *Context, node: Ast.Node.Index, ty: Ir.TypeId) Error!bool {
+        const emitter = self.emitter.?;
+        if (emitter.values.contains(node)) return true;
+        const ast = &self.module.ast;
+        const data = ast.nodes.items(.data)[node];
+        const tag = ast.nodes.items(.tag)[node];
+        const op: Ir.Operation = switch (tag) {
+            .identifier => blk: {
+                const name = self.module.sourceSlice(self.span(node)).?;
+                if (self.bindings.get(name)) |binding| break :blk .{ .parameter = binding.index };
+                const id = self.module.lookup(name) orelse return error.InvalidFunctionId;
+                if (emitter.functions[@intFromEnum(id)]) |function| break :blk .{ .function_ref = function };
+                if (emitter.constants[@intFromEnum(id)]) |constant| break :blk .{ .constant = constant };
+                _ = try self.fail(.unsupported_lowering, node, null);
+                return false;
+            },
+            .block, .block_two, .block_newline, .block_two_newline => blk: {
+                var buffer: [2]Ast.Node.Index = undefined;
+                const block = ast.fullBlock(&buffer, node).?;
+                if (block.ast.statements.len == 0) break :blk .{ .constant = try self.ir.internConstant(.{ .ty = ty, .value = .void }) };
+                // Grouping adds no operation; keep the child's operation-origin span.
+                try emitter.values.put(emitter.allocator, node, try emitter.value(block.ast.statements[0]));
+                return true;
+            },
+            .negation, .bit_not, .bool_not => .{ .unary = .{
+                .op = switch (tag) {
+                    .negation => .negate,
+                    .bit_not => .bit_not,
+                    .bool_not => .bool_not,
+                    else => unreachable,
+                },
+                .operand = try emitter.value(data.rhs),
+            } },
+            .add, .sub, .mul, .div, .mod, .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal => .{ .binary = .{
+                .op = switch (tag) {
+                    .add => .add,
+                    .sub => .sub,
+                    .mul => .mul,
+                    .div => .div,
+                    .mod => .mod,
+                    .equal_equal => .eq,
+                    .bang_equal => .ne,
+                    .less_than => .lt,
+                    .less_or_equal => .le,
+                    .greater_than => .gt,
+                    .greater_or_equal => .ge,
+                    else => unreachable,
+                },
+                .lhs = try emitter.value(data.lhs),
+                .rhs = try emitter.value(data.rhs),
+            } },
+            .call, .call_one => blk: {
+                const call = ast.fullCall(node).?;
+                const args = try emitter.allocator.alloc(Ir.ValueId, call.ast.args.len);
+                for (call.ast.args, args) |arg, *value| value.* = try emitter.value(arg);
+                break :blk .{ .call = .{ .callee = try emitter.value(call.ast.fn_expr), .args = args } };
+            },
+            else => {
+                _ = try self.fail(.unsupported_lowering, node, null);
+                return false;
+            },
+        };
+        try emitter.record(node, ty, self.irSpan(node), op);
+        return true;
+    }
+
     fn expression(self: *Context, node: Ast.Node.Index, expected: ?Known, depth: usize) Error!?Ir.TypeId {
+        if (self.emitter != null) {
+            const tag = self.module.ast.nodes.items(.tag)[node];
+            // A flat binary operation would silently make RHS evaluation eager.
+            if (tag == .bool_and or tag == .bool_or) return self.fail(.unsupported_lowering, node, null);
+        }
+        const ty = (try self.expressionInner(node, expected, depth)) orelse return null;
+        if (self.emitter != null and !try self.emitNode(node, ty)) return null;
+        return ty;
+    }
+
+    fn expressionInner(self: *Context, node: Ast.Node.Index, expected: ?Known, depth: usize) Error!?Ir.TypeId {
         if (depth >= max_recursive_depth) return self.fail(.body_nesting_limit, node, null);
         const hint = expected orelse try self.probe(node, depth);
         if (hint) |known| {
             switch (try Literal.check(self.module, self.ir, node, known.ty, known.annotation)) {
-                .constant => return known.ty,
+                .constant => |constant| {
+                    if (self.emitter) |emitter| try emitter.record(node, known.ty, self.irSpan(node), .{ .constant = constant });
+                    return known.ty;
+                },
                 .failed => return null,
                 .not_literal => {},
             }

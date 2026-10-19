@@ -70,6 +70,7 @@ pub fn renderModule(module: *const Module, writer: *std.Io.Writer) !void {
             .argument_count_mismatch => try writer.writeAll("argument count does not match the function signature"),
             .unresolved_value_type => try writer.writeAll("declaration needs a resolved type before use here"),
             .body_nesting_limit => try writer.writeAll("recursive body checking exceeds the current analysis limit of 128"),
+            .unsupported_lowering => try writer.writeAll("lowering this source form is not implemented yet"),
         }
         try location.renderExcerpt(module.ast.source, diagnostic.span.end - diagnostic.span.start, writer);
         const note: ?[]const u8 = switch (diagnostic.tag) {
@@ -240,6 +241,7 @@ test "module body diagnostics render messages and optional related notes" {
         .{ .tag = .not_callable, .message = "expression is not callable", .note = "type specified here" },
         .{ .tag = .unresolved_value_type, .message = "declaration needs a resolved type before use here", .note = "declaration here" },
         .{ .tag = .body_nesting_limit, .message = "recursive body checking exceeds the current analysis limit of 128" },
+        .{ .tag = .unsupported_lowering, .message = "lowering this source form is not implemented yet" },
     }) |case| {
         for ([_]bool{ true, false }) |with_related| {
             var module = try Module.init(std.testing.allocator, "body.nov", "let value: i32 = 123");

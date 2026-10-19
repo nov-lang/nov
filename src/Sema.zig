@@ -10,14 +10,18 @@ const Sema = @This();
 allocator: std.mem.Allocator,
 ir: Ir,
 entries: []Entry,
+/// True only after whole-module lowering and structural verification succeed.
+/// Entry-point/backend/runtime configuration is still a separate obligation.
+lowering_complete: bool = false,
 
-pub const Status = enum { deferred, signature_only, constant_checked, body_checked, failed };
+pub const Status = enum { deferred, signature_only, constant_checked, body_checked, lowered, failed };
 pub const Entry = struct {
     type_id: ?Ir.TypeId = null,
     constant: ?Ir.ConstId = null,
+    function: ?Ir.FunctionId = null,
     status: Status = .deferred,
 };
-pub const Error = Ir.InternError || error{InvalidModule};
+pub const Error = Ir.BuildError || error{InvalidModule};
 
 /// A partial semantic pass: resolves explicit annotations and literal constants.
 /// Deferred entries and signatures are not checked bodies or executable IR.

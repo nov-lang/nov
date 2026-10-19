@@ -34,8 +34,11 @@ and boolean literals against annotations. Bounded function-body checking binds
 parameters and checks integer arithmetic, boolean expressions, comparisons and
 calls against collected signatures, including recursive calls. Defaults, aliases,
 local declarations, shadowing, control flow and general block results remain
-deferred or unsupported. No executable operations or C are emitted; `check`
-remains syntax-only.
+deferred or unsupported. Straight-line lowering now produces typed operations
+with source spans and ordered operands/call arguments. It requires immutable
+literal globals; unit/global block initializers and short-circuit `and`/`or` are
+not lowered yet. Numeric execution rules and C emission remain unimplemented;
+`check` remains syntax-only.
 
 Format files in place with `zig build run -- fmt file.nov`, or use
 `zig build run -- fmt --check file.nov` to check formatting without writing.
