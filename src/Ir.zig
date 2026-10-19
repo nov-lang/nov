@@ -42,6 +42,10 @@ pub const Operation = union(enum) {
     /// Regions nest or are disjoint; only this merged boolean escapes. Empty
     /// regions and results captured from enclosing regions are valid.
     short_circuit: struct { kind: enum { @"and", @"or" }, lhs: ValueId, rhs_start: u32, rhs: ValueId },
+    /// Then instructions occupy [then_start, else_start), else instructions
+    /// [else_start, merge). Only the selected result escapes these sibling scopes.
+    /// An absent else is an empty region and is valid only for a void result.
+    branch: struct { condition: ValueId, then_start: u32, else_start: u32, then_value: ValueId, else_value: ?ValueId },
 };
 
 pub const Type = union(enum) {
@@ -278,13 +282,31 @@ fn operandType(body: Body, id: ValueId, before: usize) VerifyError!TypeId {
 fn regionOperandType(body: Body, id: ValueId, before: usize, yielding: ?usize) VerifyError!TypeId {
     const index = @intFromEnum(id);
     if (index >= before) return error.InvalidValueId;
-    for (body.instructions, 0..) |instruction, end| {
-        if (instruction.op != .short_circuit) continue;
-        const start = instruction.op.short_circuit.rhs_start;
-        if (index >= start and index < end and
-            !(before >= start and (before < end or yielding == end))) return error.InvalidValueId;
+    for (body.instructions, 0..) |instruction, owner| {
+        var buffer: [2]Region = undefined;
+        for (regions(instruction.op, owner, &buffer)) |region| {
+            if (index >= region.start and index < region.end and
+                !(before >= region.start and before < region.end) and
+                !(before == region.end and yielding == owner)) return error.InvalidValueId;
+        }
     }
     return body.instructions[index].ty;
+}
+
+const Region = struct { start: usize, end: usize };
+
+fn regions(op: Operation, end: usize, buffer: *[2]Region) []const Region {
+    switch (op) {
+        .short_circuit => |r| {
+            buffer[0] = .{ .start = r.rhs_start, .end = end };
+            return buffer[0..1];
+        },
+        .branch => |r| {
+            buffer.* = .{ .{ .start = r.then_start, .end = r.else_start }, .{ .start = r.else_start, .end = end } };
+            return buffer;
+        },
+        else => return &.{},
+    }
 }
 
 fn validateBody(self: *const Ir, function: Function, body: Body) VerifyError!void {
@@ -293,13 +315,26 @@ fn validateBody(self: *const Ir, function: Function, body: Body) VerifyError!voi
     // Validate structure before resolving operands. A region includes its merge
     // in its parent's scope, never in a sibling's scope.
     for (body.instructions, 0..) |instruction, end| {
-        if (instruction.op != .short_circuit) continue;
-        const region = instruction.op.short_circuit;
-        if (region.rhs_start > end or @intFromEnum(region.lhs) >= region.rhs_start) return error.InvalidRegion;
-        for (body.instructions[0..end], 0..) |previous, previous_end| {
-            if (previous.op != .short_circuit) continue;
-            const previous_start = previous.op.short_circuit.rhs_start;
-            if (previous_end >= region.rhs_start and previous_start < region.rhs_start) return error.InvalidRegion;
+        switch (instruction.op) {
+            .short_circuit => |r| {
+                if (r.rhs_start > end or @intFromEnum(r.lhs) >= r.rhs_start) return error.InvalidRegion;
+            },
+            .branch => |r| {
+                if (r.then_start > r.else_start or r.else_start > end or
+                    @intFromEnum(r.condition) >= r.then_start or
+                    (r.else_value == null and r.else_start != end)) return error.InvalidRegion;
+            },
+            else => {},
+        }
+        var buffer: [2]Region = undefined;
+        for (regions(instruction.op, end, &buffer)) |region| {
+            for (body.instructions[0..end], 0..) |previous, previous_end| {
+                var previous_buffer: [2]Region = undefined;
+                for (regions(previous.op, previous_end, &previous_buffer)) |previous_region| {
+                    // The nested merge belongs to the surrounding scope too.
+                    if (previous_end >= region.start and previous_region.start < region.start) return error.InvalidRegion;
+                }
+            }
         }
     }
     for (body.instructions, 0..) |instruction, i| {
@@ -349,6 +384,14 @@ fn validateBody(self: *const Ir, function: Function, body: Body) VerifyError!voi
                 if (ty != .boolean) return error.OperandTypeMismatch;
                 if (try operandType(body, region.lhs, region.rhs_start) != instruction.ty) return error.OperandTypeMismatch;
                 if (try regionOperandType(body, region.rhs, i, i) != instruction.ty) return error.OperandTypeMismatch;
+            },
+            .branch => |r| {
+                const condition = self.getType(try operandType(body, r.condition, r.then_start)) orelse return error.InvalidTypeId;
+                if (condition != .boolean) return error.OperandTypeMismatch;
+                if (try regionOperandType(body, r.then_value, r.else_start, i) != instruction.ty) return error.OperandTypeMismatch;
+                if (r.else_value) |value| {
+                    if (try regionOperandType(body, value, i, i) != instruction.ty) return error.OperandTypeMismatch;
+                } else if (ty != .void) return error.OperandTypeMismatch;
             },
             .print => |print| {
                 if (ty != .void) return error.InvalidOperation;
@@ -719,7 +762,7 @@ fn testConditionalAllocationFailures(allocator: std.mem.Allocator) !void {
         .{ .ty = boolean, .span = .{ .start = 0, .end = 0 }, .op = .{ .call = .{ .callee = @enumFromInt(1), .args = &call_args } } },
         .{ .ty = void_ty, .span = .{ .start = 0, .end = 0 }, .op = .{ .print = .{ .args = &print_args, .newline = true } } },
         .{ .ty = boolean, .span = .{ .start = 0, .end = 0 }, .op = .{ .short_circuit = .{ .kind = .@"or", .lhs = @enumFromInt(0), .rhs_start = 2, .rhs = @enumFromInt(2) } } },
-        .{ .ty = boolean, .span = .{ .start = 0, .end = 0 }, .op = .{ .short_circuit = .{ .kind = .@"and", .lhs = @enumFromInt(0), .rhs_start = 1, .rhs = @enumFromInt(4) } } },
+        .{ .ty = boolean, .span = .{ .start = 0, .end = 0 }, .op = .{ .branch = .{ .condition = @enumFromInt(0), .then_start = 1, .else_start = 5, .then_value = @enumFromInt(4), .else_value = @enumFromInt(0) } } },
     };
     ir.setFunctionBody(function, &instructions, @enumFromInt(5)) catch |err| {
         try std.testing.expect(ir.getFunction(function).?.body == null);
@@ -727,7 +770,7 @@ fn testConditionalAllocationFailures(allocator: std.mem.Allocator) !void {
     };
     call_args[0] = @enumFromInt(99);
     print_args[0] = @enumFromInt(99);
-    instructions[5].op.short_circuit.rhs_start = 99;
+    instructions[5].op.branch.then_start = 99;
     try ir.verify();
     // Removing a nested body frees the same owned slices as final destruction.
     ir.clearFunctions();
@@ -736,6 +779,80 @@ fn testConditionalAllocationFailures(allocator: std.mem.Allocator) !void {
 
 test "conditional body operands are owned and publication is atomic under OOM" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, testConditionalAllocationFailures, .{});
+}
+
+test "if regions validate sibling isolation captures yields types and boundaries" {
+    var fixture = try TestFunctions.init(std.testing.allocator);
+    defer fixture.ir.deinit();
+    const ir = &fixture.ir;
+    const boolean = fixture.boolean;
+    const signature = try ir.internType(.{ .function = .{ .params = &.{}, .result = boolean } });
+    const function = try ir.addFunction("branch", signature, test_span);
+    const constant = try ir.internConstant(.{ .ty = boolean, .value = .{ .boolean = true } });
+    const ins = TestFunctions.instruction;
+    const valid = [_]Instruction{
+        ins(boolean, .{ .constant = constant }),
+        ins(boolean, .{ .constant = constant }),
+        ins(boolean, .{ .short_circuit = .{ .kind = .@"and", .lhs = @enumFromInt(0), .rhs_start = 1, .rhs = @enumFromInt(1) } }),
+        ins(boolean, .{ .constant = constant }),
+        ins(boolean, .{ .branch = .{ .condition = @enumFromInt(0), .then_start = 1, .else_start = 3, .then_value = @enumFromInt(2), .else_value = @enumFromInt(3) } }),
+        ins(boolean, .{ .unary = .{ .op = .bool_not, .operand = @enumFromInt(4) } }),
+    };
+    var cases: std.ArrayList(struct { index: usize, instruction: Instruction, err: VerifyError }) = .empty;
+    defer cases.deinit(std.testing.allocator);
+    const original = valid[4].op.branch;
+    var r = original;
+    r.then_start = 5;
+    try cases.append(std.testing.allocator, .{ .index = 4, .instruction = ins(boolean, .{ .branch = r }), .err = error.InvalidRegion });
+    r = original;
+    r.else_start = 99;
+    try cases.append(std.testing.allocator, .{ .index = 4, .instruction = ins(boolean, .{ .branch = r }), .err = error.InvalidRegion });
+    r = original;
+    r.condition = @enumFromInt(1);
+    try cases.append(std.testing.allocator, .{ .index = 4, .instruction = ins(boolean, .{ .branch = r }), .err = error.InvalidRegion });
+    r = original;
+    r.else_start = 2; // Splits a nested region from its merge.
+    try cases.append(std.testing.allocator, .{ .index = 4, .instruction = ins(boolean, .{ .branch = r }), .err = error.InvalidRegion });
+    r = original;
+    r.then_value = @enumFromInt(1); // A nested RHS cannot escape via the outer yield.
+    try cases.append(std.testing.allocator, .{ .index = 4, .instruction = ins(boolean, .{ .branch = r }), .err = error.InvalidValueId });
+    r = original;
+    r.else_value = @enumFromInt(2);
+    try cases.append(std.testing.allocator, .{ .index = 4, .instruction = ins(boolean, .{ .branch = r }), .err = error.InvalidValueId });
+    r = original;
+    r.then_value = @enumFromInt(3);
+    try cases.append(std.testing.allocator, .{ .index = 4, .instruction = ins(boolean, .{ .branch = r }), .err = error.InvalidValueId });
+    r = original;
+    r.else_value = @enumFromInt(4);
+    try cases.append(std.testing.allocator, .{ .index = 4, .instruction = ins(boolean, .{ .branch = r }), .err = error.InvalidValueId });
+    r = original;
+    r.else_start = 4;
+    r.else_value = null;
+    try cases.append(std.testing.allocator, .{ .index = 4, .instruction = ins(boolean, .{ .branch = r }), .err = error.OperandTypeMismatch });
+    try cases.append(std.testing.allocator, .{ .index = 3, .instruction = ins(boolean, .{ .unary = .{ .op = .bool_not, .operand = @enumFromInt(2) } }), .err = error.InvalidValueId });
+    try cases.append(std.testing.allocator, .{ .index = 5, .instruction = ins(boolean, .{ .unary = .{ .op = .bool_not, .operand = @enumFromInt(3) } }), .err = error.InvalidValueId });
+    try cases.append(std.testing.allocator, .{ .index = 0, .instruction = ins(fixture.integer, .{ .constant = fixture.number }), .err = error.OperandTypeMismatch });
+    for (cases.items) |case| {
+        var invalid = valid;
+        invalid[case.index] = case.instruction;
+        try std.testing.expectError(case.err, ir.setFunctionBody(function, &invalid, @enumFromInt(5)));
+        try std.testing.expect(ir.getFunction(function).?.body == null);
+    }
+    try std.testing.expectError(error.InvalidValueId, ir.setFunctionBody(function, &valid, @enumFromInt(3)));
+    try ir.setFunctionBody(function, &valid, @enumFromInt(5));
+    try ir.setFunctionBody(fixture.function, &.{ins(fixture.integer, .{ .parameter = 0 })}, @enumFromInt(0));
+    const owned = @constCast(ir.getFunction(function).?.body.?.instructions);
+    for (cases.items) |case| {
+        owned[case.index] = case.instruction;
+        try std.testing.expectError(case.err, ir.verify());
+        owned[case.index] = valid[case.index];
+    }
+    owned[4].op.branch.then_value = @enumFromInt(0);
+    owned[4].op.branch.else_value = @enumFromInt(0);
+    try ir.verify();
+    owned[4].op.branch.then_start = 4;
+    owned[4].op.branch.else_start = 4;
+    try ir.verify(); // Empty branches can yield captured values.
 }
 
 test "conditional regions reject crossing ranges and private value escapes" {

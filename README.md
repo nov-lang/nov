@@ -35,9 +35,9 @@ parameters and checks integer arithmetic, boolean expressions, comparisons and
 calls against collected signatures, including recursive calls. Immutable,
 explicitly typed locals and straight-line blocks with final-expression results
 are supported in function bodies. Literal defaults, user-defined type aliases,
-shadowing and general control flow remain deferred or unsupported.
+shadowing and control flow beyond conditional expressions remain deferred or unsupported.
 Lowering produces typed operations with source spans, ordered operands/call
-arguments, and structured conditional RHS regions for boolean `and`/`or`.
+arguments, and structured conditional regions for boolean `and`/`or` and `if`/`else`.
 It requires immutable literal globals; unit/global block initializers are
 not lowered yet. An internal C11 backend emits verified IR, including fixed-width
 integer arithmetic and program entrypoint emission through `emit-c`.
@@ -52,7 +52,7 @@ diagnostics (including related notes where available); recovered syntax errors
 stop semantic analysis. Globals must be immutable, explicitly typed integer or
 boolean literals. Functions need explicit supported signatures and bounded
 expression bodies (including forward/recursive calls, local declarations, nested
-blocks, boolean short-circuiting and empty void bodies).
+blocks, boolean short-circuiting, `if`/`else` expressions and empty void bodies).
 Inferred globals, mutable globals, nonliteral global initializers, global unit
 values are currently rejected, along with the other
 unsupported forms listed above. This is not a backend compatibility check: it
@@ -198,7 +198,7 @@ This prints `42` on two lines. Locals require an explicit supported type and an
 initializer. Immutable scalar/unit values and existing function values (with
 unnamed parameter types, e.g. `let callback: (int) -> int = twice`) work; named
 local function definitions/closures, inferred locals, mutation, assignments,
-labels, explicit `return`, general control flow and memory-bearing values are rejected.
+labels, explicit `return`, loops and memory-bearing values are rejected.
 Global block initializers remain unsupported by lowering.
 
 Boolean `and`/`or` evaluate the left operand exactly once, then evaluate the right
@@ -210,7 +210,27 @@ Nested operators merge only their boolean result, not RHS-local values. The IR
 stores nestable RHS instruction ranges in the owned function body; verification
 rejects crossing ranges, forward references and references escaping a region.
 The C backend emits conditional blocks, never eager RHS temporaries. This does
-not add general `if`/`else`, mutation or new global initializer forms.
+not add mutation or new global initializer forms.
+
+`if` conditions must be `bool` and execute exactly once. Only the selected branch
+executes, including its local initializers, calls, printing and arithmetic panics;
+both branches are typechecked. Braces are mandatory, with `else if` chains allowed.
+An explicit `else` requires matching branch result types (including `void` and
+function values). A surrounding result/argument/annotation type or either branch
+can supply the type context; two bare integer branches still need an explicit
+context. There are no implicit numeric conversions. Without `else`, the expression
+and its then-branch must return `void`. Each branch has its own lexical scope;
+branch locals cannot escape or become visible in the other branch. Conditional
+regions nest with `and`/`or`, and IR verification rejects cross-branch references
+and escaping private values.
+
+```nov
+let magnitude: (n: int) -> int = if n < 0 {-n} else {n}
+let main: () -> void = {
+    let answer: int = magnitude(-42)
+    if answer == 42 {@println(answer)}
+}
+```
 
 Format files in place with `zig build run -- fmt file.nov`, or use
 `zig build run -- fmt --check file.nov` to check formatting without writing.

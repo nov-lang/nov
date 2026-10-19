@@ -2,7 +2,7 @@
 //!
 //! Emits one translation unit with externally visible `nov_`-prefixed functions
 //! and function-pointer typedefs. IR values become ordered locals (only a
-//! short-circuit merge needs a mutable temporary), so
+//! conditional merge needs a mutable temporary), so
 //! the IR's callee-first, left-to-right order is preserved without relying on C
 //! argument evaluation order.
 //!
@@ -325,6 +325,11 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
             value_used[@intFromEnum(region.lhs)] = true;
             value_used[@intFromEnum(region.rhs)] = true;
         },
+        .branch => |region| {
+            value_used[@intFromEnum(region.condition)] = true;
+            value_used[@intFromEnum(region.then_value)] = true;
+            if (region.else_value) |value| value_used[@intFromEnum(value)] = true;
+        },
         .constant, .function_ref => {},
     };
 
@@ -338,9 +343,33 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
         while (end > i) {
             end -= 1;
             const candidate = body.instructions[end];
-            if (candidate.op != .short_circuit or candidate.op.short_circuit.rhs_start != i) continue;
-            const region = candidate.op.short_circuit;
-            try w.print("    bool v{d} = v{d};\n    if ({s}v{d}) {{\n", .{ end, @intFromEnum(region.lhs), if (region.kind == .@"or") "!" else "", @intFromEnum(region.lhs) });
+            if (candidate.op == .branch) {
+                const region = candidate.op.branch;
+                const has_value = ir.types.items[@intFromEnum(candidate.ty)] != .void;
+                if (region.then_start == i) {
+                    if (has_value) {
+                        try w.writeAll("    ");
+                        try writeType(ir, w, candidate.ty);
+                        try w.print(" v{d};\n", .{end});
+                    }
+                    try w.print("    if (v{d}) {{\n", .{@intFromEnum(region.condition)});
+                }
+                if (region.else_start == i) {
+                    if (has_value) try w.print("    v{d} = v{d};\n", .{ end, @intFromEnum(region.then_value) });
+                    try w.writeAll("    } else {\n");
+                }
+            } else if (candidate.op == .short_circuit and candidate.op.short_circuit.rhs_start == i) {
+                const region = candidate.op.short_circuit;
+                try w.print("    bool v{d} = v{d};\n    if ({s}v{d}) {{\n", .{ end, @intFromEnum(region.lhs), if (region.kind == .@"or") "!" else "", @intFromEnum(region.lhs) });
+            }
+        }
+        if (instruction.op == .branch) {
+            if (ir.types.items[@intFromEnum(instruction.ty)] != .void) {
+                try w.print("    v{d} = v{d};\n", .{ i, @intFromEnum(instruction.op.branch.else_value.?) });
+            }
+            try w.writeAll("    }\n");
+            if (ir.types.items[@intFromEnum(instruction.ty)] != .void and !value_used[i]) try w.print("    (void)v{d};\n", .{i});
+            continue;
         }
         if (instruction.op == .short_circuit) {
             try w.print("    v{d} = v{d};\n    }}\n", .{ i, @intFromEnum(instruction.op.short_circuit.rhs) });
@@ -413,7 +442,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
                 try w.print("v{d} {s} v{d}", .{ @intFromEnum(binary.lhs), operator, @intFromEnum(binary.rhs) });
             },
             .call => |call| try writeCall(w, call),
-            .print, .short_circuit => unreachable,
+            .print, .short_circuit, .branch => unreachable,
         }
         try w.writeAll(";\n");
         if (!value_used[i]) try w.print("    (void)v{d};\n", .{i});
@@ -463,6 +492,59 @@ fn emitSource(source: []const u8, diagnostic: ?*Diagnostic) ![]u8 {
     try std.testing.expect(!module.hasErrors());
     try std.testing.expect(sema.lowering_complete);
     return emit(test_gpa, &sema.ir, diagnostic);
+}
+
+test "if branches execute selected effects once with nesting and function results" {
+    const c = try emitSource(
+        \\let mark: (n: int, value: bool) -> bool = {@print(n)
+        \\    value}
+        \\let id: (n: int) -> int = n
+        \\let other: (n: int) -> int = n + 1
+        \\let out: () -> void = {
+        \\    let outer: int = 10
+        \\    @println(if mark(1, true) {let local: int = outer + 1
+        \\        @print(local)
+        \\        local} else {let local: int = outer + 2
+        \\        @print(local)
+        \\        local}, if mark(2, false) {@print(false)
+        \\        outer} else {@print(true)
+        \\        outer + 2})
+        \\    @println(if mark(3, false) {false} else if mark(4, true) {true} else {false})
+        \\    @println(if mark(5, true) {if mark(6, false) {false} else {true}} else {false})
+        \\    @println(false and {if mark(7, true) {true} else {false}}, if true {false or mark(8, true)} else {false})
+        \\    let callback: (int) -> int = if false {id} else {other}
+        \\    @println(callback(20))
+        \\    if false {@print(false)}
+        \\    if true {@print(true)}
+        \\    if true {} else {}
+        \\    let unused: int = if false {outer} else {outer}
+        \\    @println(if true {outer} else {outer})
+        \\}
+    , null);
+    defer test_gpa.free(c);
+    try compileAndRunExpected(c, "void nov_out(void); int main(void) { nov_out(); return 0; }", 0, "1112true11 12\n34true\n56true\n8false true\n21\ntrue10\n", "");
+}
+
+test "if skips unselected panics and propagates taken branch panics" {
+    const c = try emitSource(
+        \\let divide: (x: int) -> int = 1 / x
+        \\let remainder: (x: int) -> int = 1 % x
+        \\let skip: () -> void = {
+        \\    @println(if true {1} else {divide(0)}, if false {remainder(0)} else {2})
+        \\    if false {let unused: int = divide(0)
+        \\    }
+        \\}
+        \\let takethen: () -> void = if true {@print(true)
+        \\    let unused: int = divide(0)
+        \\} else {}
+        \\let takeelse: () -> void = if false {} else if false {} else {@print(false)
+        \\    let unused: int = remainder(0)
+        \\}
+    , null);
+    defer test_gpa.free(c);
+    try compileAndRunExpected(c, "void nov_skip(void); int main(void) { nov_skip(); return 0; }", 0, "1 2\n", "");
+    try compileAndRunExpected(c, "void nov_takethen(void); int main(void) { nov_takethen(); return 0; }", 1, "true", "panic: division by zero\n");
+    try compileAndRunExpected(c, "void nov_takeelse(void); int main(void) { nov_takeelse(); return 0; }", 1, "false", "panic: remainder by zero\n");
 }
 
 test "short circuit truth tables nested effects captures and argument order" {
@@ -524,7 +606,9 @@ fn testShortCircuitAllocationFailures(allocator: std.mem.Allocator) !void {
         \\    @println(outer and {let callback: (bool) -> bool = id
         \\        let inner: bool = callback(false) or outer
         \\        @println(inner)
-        \\        inner and outer}, false or id(true))
+        \\        if inner {outer} else if outer {id(false)} else {inner and outer}}, false or id(true))
+        \\    if outer {let unit: void = @println(true)
+        \\    }
         \\}
     );
     var result = Lowering.lower(&module) catch |err| {

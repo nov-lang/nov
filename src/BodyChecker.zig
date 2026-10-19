@@ -262,6 +262,11 @@ const Context = struct {
                 break :blk null;
             },
             .block, .block_two, .block_newline, .block_two_newline => try self.probeBlock(node, depth),
+            .@"if" => .{ .ty = try self.ir.internType(.void) },
+            .if_else => blk: {
+                const branch = ast.fullIf(node).?.ast;
+                break :blk (try self.probe(branch.then_expr, depth + 1)) orelse try self.probe(branch.else_expr, depth + 1);
+            },
             .negation, .bit_not => try self.probe(data.rhs, depth + 1),
             .add, .sub, .mul, .div, .mod => (try self.probe(data.lhs, depth + 1)) orelse try self.probe(data.rhs, depth + 1),
             .bool_not, .bool_and, .bool_or, .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal => .{ .ty = try self.ir.internType(.boolean) },
@@ -305,7 +310,7 @@ const Context = struct {
                 const rhs = try self.validateUnconstrained(data.rhs, depth + 1);
                 return lhs and rhs;
             },
-            .block, .block_two, .block_newline, .block_two_newline => return (try self.expression(node, null, depth + 1)) != null,
+            .@"if", .if_else, .block, .block_two, .block_newline, .block_two_newline => return (try self.expression(node, null, depth + 1)) != null,
             else => {},
         }
         _ = try self.fail(.unsupported_body_expression, node, null);
@@ -437,6 +442,33 @@ const Context = struct {
             .number_literal => return self.fail(.literal_needs_type, node, null),
             .char_literal, .string_literal => return self.fail(.unsupported_literal, node, null),
             .block, .block_two, .block_newline, .block_two_newline => return self.blockExpression(node, expected, depth),
+            .@"if", .if_else => {
+                const branch = ast.fullIf(node).?.ast;
+                const boolean = try self.ir.internType(.boolean);
+                const condition = try self.expression(branch.cond_expr, .{ .ty = boolean }, depth + 1);
+                const result: ?Known = if (branch.else_expr == 0)
+                    .{ .ty = try self.ir.internType(.void), .annotation = self.span(node) }
+                else
+                    hint;
+                const then_start: u32 = if (self.emitter) |emitter| @intCast(emitter.instructions.items.len) else 0;
+                const then_ty = try self.expression(branch.then_expr, result, depth + 1);
+                const else_start: u32 = if (self.emitter) |emitter| @intCast(emitter.instructions.items.len) else 0;
+                const else_ty = if (branch.else_expr != 0)
+                    try self.expression(branch.else_expr, result, depth + 1)
+                else
+                    try self.ir.internType(.void);
+                if (condition == null or then_ty == null or else_ty == null) return null;
+                if (then_ty.? != else_ty.?) return self.fail(.expression_type_mismatch, branch.else_expr, self.span(branch.then_expr));
+                if (try self.fit(then_ty.?, expected, node) == null) return null;
+                if (self.emitter) |emitter| try emitter.record(node, then_ty.?, self.irSpan(node), .{ .branch = .{
+                    .condition = try emitter.value(branch.cond_expr),
+                    .then_start = then_start,
+                    .else_start = else_start,
+                    .then_value = try emitter.value(branch.then_expr),
+                    .else_value = if (branch.else_expr != 0) try emitter.value(branch.else_expr) else null,
+                } });
+                return then_ty;
+            },
             .add, .sub, .mul, .div, .mod => {
                 const integer_context = if (expected) |want| (if (self.ir.getType(want.ty).? == .integer) expected else null) else null;
                 const operand = (try self.probe(data.lhs, depth + 1)) orelse (try self.probe(data.rhs, depth + 1)) orelse integer_context orelse return self.missingOperandType(node, data.lhs, data.rhs, expected, depth);
@@ -519,6 +551,53 @@ const Context = struct {
         }
     }
 };
+
+test "if branches infer bidirectionally and keep separate lexical scopes" {
+    var module = try Module.init(std.testing.allocator, "if.nov",
+        \\let id: (x: int) -> int = x
+        \\let f: (c: bool, n: int) -> int = if c {1} else if !c {n} else {2}
+        \\let out: (c: bool, n: int) -> void = {
+        \\    @println(if c {1} else {n}, if c {n} else {2})
+        \\    @println({if c {1} else {2}} == n)
+        \\    let callback: (int) -> int = if c {id} else {id}
+        \\    if c {let reused: int = callback(1)
+        \\        @println(reused)} else {let reused: int = n
+        \\        @println(reused)}
+        \\    if c {@println(true)}
+        \\}
+    );
+    defer module.deinit();
+    var sema = try @import("Sema.zig").analyzeFunctions(&module);
+    defer sema.deinit();
+    try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+    try std.testing.expect(!module.hasErrors());
+}
+
+test "if diagnostics check conditions both branches results and lexical visibility" {
+    const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag, token: []const u8 };
+    for ([_]Case{
+        .{ .source = "let f: (n: int) -> int = if n {1} else {2}", .tag = .expression_type_mismatch, .token = "n" },
+        .{ .source = "let f: () -> int = if true {1} else {false}", .tag = .literal_type_mismatch, .token = "false" },
+        .{ .source = "let f: () -> void = if false {missing} else {}", .tag = .unknown_name, .token = "missing" },
+        .{ .source = "let f: () -> void = if true {} else {missing}", .tag = .unknown_name, .token = "missing" },
+        .{ .source = "let f: (n: int) -> void = if true {n}", .tag = .expression_type_mismatch, .token = "n" },
+        .{ .source = "let f: () -> int = if true {}", .tag = .expression_type_mismatch, .token = "if" },
+        .{ .source = "let f: () -> void = @println(if true {1} else {2})", .tag = .literal_needs_type, .token = "1" },
+        .{ .source = "let f: () -> void = if true {let hidden: bool = true\n} else {@println(hidden)}", .tag = .unknown_name, .token = "hidden" },
+        .{ .source = "let f: () -> bool = {if true {let hidden: bool = true\n}\nhidden}", .tag = .unknown_name, .token = "hidden" },
+        .{ .source = "let f: (n: int, u: uint) -> void = @println(if true {n} else {u})", .tag = .expression_type_mismatch, .token = "u" },
+    }) |case| {
+        var module = try Module.init(std.testing.allocator, "if.nov", case.source);
+        defer module.deinit();
+        var sema = try @import("Sema.zig").analyzeFunctions(&module);
+        defer sema.deinit();
+        try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+        try std.testing.expect(module.hasErrors());
+        const diagnostic = module.diagnostics.items[0];
+        try std.testing.expectEqual(case.tag, diagnostic.tag);
+        try std.testing.expectEqualStrings(case.token, module.sourceSlice(diagnostic.span).?);
+    }
+}
 
 test "typed locals and final expressions work across lexical blocks" {
     var module = try Module.init(std.testing.allocator, "locals.nov",

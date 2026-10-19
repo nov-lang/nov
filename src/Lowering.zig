@@ -191,6 +191,35 @@ test "unit comparisons and unary operations lower without arithmetic evaluation"
     try sema.ir.verify();
 }
 
+test "if lowering owns branch ranges results and spans after source destruction" {
+    var module = try Module.init(std.testing.allocator, "if.nov",
+        \\let f: (c: bool, n: int) -> int = if c {n} else if c {1} else {2}
+        \\let main: () -> void = if true {@println(f(false, 3))}
+    );
+    var sema = lower(&module) catch |err| {
+        module.deinit();
+        return err;
+    };
+    defer sema.deinit();
+    const failed = module.hasErrors();
+    const body = sema.ir.functions.items[0].body.?;
+    const merge = body.instructions[body.instructions.len - 1];
+    const r = merge.op.branch;
+    try std.testing.expectEqualStrings("if c {n} else if c {1} else {2}", module.ast.source[merge.span.start..merge.span.end]);
+    module.deinit();
+    try std.testing.expect(!failed);
+    try std.testing.expect(sema.lowering_complete);
+    try std.testing.expectEqual(@as(u32, 1), r.then_start);
+    try std.testing.expectEqual(@as(u32, 2), r.else_start);
+    try std.testing.expectEqual(@as(u32, 1), @intFromEnum(r.then_value));
+    try std.testing.expect(body.instructions[@intFromEnum(r.else_value.?)].op == .branch);
+    const main_body = sema.ir.functions.items[1].body.?;
+    const no_else = main_body.instructions[main_body.instructions.len - 1].op.branch;
+    try std.testing.expect(no_else.else_value == null);
+    try std.testing.expectEqual(main_body.instructions.len - 1, no_else.else_start);
+    try sema.ir.verify();
+}
+
 test "short-circuit expressions lower explicit conditional RHS regions" {
     for ([_][]const u8{ "and", "or" }) |operator| {
         const source = try std.fmt.allocPrint(std.testing.allocator, "let side: () -> bool = true\nlet main: () -> bool = false {s} side()", .{operator});
@@ -306,6 +335,8 @@ test "lowering ownership and source diagnostic rollback survive allocation failu
         "let f: (a: i32, b: i32) -> i32 = a + b\nlet main: () -> i32 = f(1, f(2, 3))",
         "let first: () = {}\nlet last: () -> bool = true and false",
         "let f: (x: bool) -> bool = x and {let y: bool = x or false\n@println(y)\ny and x}\nlet main: () -> void = @println(f(true), false or f(false))",
+        "let f: (x: bool) -> bool = if x {let y: bool = x or false\n@println(y)\ny} else if !x {true and x} else {false}\nlet main: () -> void = {if f(true) {@println(true)}\n}",
+        "let f: () -> void = if false {missing} else {}",
         "let f: () -> bool = false and missing",
         "let id: (x: i32) -> i32 = x\nlet main: () -> void = @println(true, id(1), id(2))",
         "let main: () -> void = @println(true, missing, 1)",
