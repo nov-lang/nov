@@ -24,8 +24,8 @@ zig fmt --check src build.zig
 
 Check syntax in one or more files with `zig build run -- check file.nov`.
 Diagnostics include the filename, line, column, source line, and a caret. Invalid
-input or unreadable files produce a nonzero exit status. Compilation and execution
-of Nov programs are not implemented yet. The new typed IR currently provides
+input or unreadable files produce a nonzero exit status. Single-file programs can
+be compiled and executed through the C11 backend. The new typed IR provides
 owned, canonical type/constant storage and verification. Internal module passes
 collect names and diagnose duplicate/unknown names and initializer dependency
 cycles for a bounded expression subset. Internal annotation analysis resolves
@@ -40,7 +40,7 @@ literal globals; unit/global block initializers and short-circuit `and`/`or` are
 not lowered yet. An internal C11 backend emits verified IR, including fixed-width
 integer arithmetic and program entrypoint emission through `emit-c`.
 `@print`/`@println` support booleans and explicitly typed fixed-width integers.
-CLI compilation/execution remains unimplemented. Plain `check` remains syntax-only.
+Plain `check` remains syntax-only.
 
 Use `zig build run -- check --semantic file.nov` for the current bounded
 semantic/lowering subset. It runs declaration collection, initializer dependency
@@ -64,6 +64,44 @@ emission failure. Exactly one input file is required; `--semantic` and `--check`
 are not accepted. This command does not modify files, invoke a C compiler, or run
 the program. Redirect stdout to a `.c` file if desired.
 
+Build or run a single-file program (after `zig build`, use `zig-out/bin/nov`):
+
+```sh
+nov build file.nov                    # ./file (file.exe on Windows)
+nov build file.nov -o path/to/program # --output is equivalent
+nov run file.nov
+nov build file.nov --cc /path/to/cc
+```
+
+`build` defaults to the input basename without its extension in the current
+working directory. It atomically replaces the output only after successful
+compilation and refuses an output path resolving to the input source. `run`
+compiles a temporary executable, inherits stdin/stdout/stderr and the current
+working directory, then returns the program's exit code. On POSIX, signal
+termination is diagnosed and mapped to `128 + signal` (capped at 255). Program
+arguments are not supported yet; extra positional arguments are rejected.
+`--output` is build-only; `--cc` is build/run-only. Neither command accepts
+`--semantic` or `--check`.
+
+Compiler discovery tries `--cc`, nonempty `NOV_CC`, nonempty `CC`, `cc`, then
+`zig cc` if `zig` is on PATH. Each configured value is **one executable name or
+path**, including paths containing spaces, not shell fragments or flag lists:
+`CC='cc -g'` and `--cc 'zig cc'` do not mean multiple arguments. Use an executable
+wrapper for extra compiler options, or put `zig` on PATH for the `zig cc` fallback.
+Missing executables advance to the next candidate, including missing explicit or
+environment selections. An executable that cannot start for another reason, or
+starts and fails, stops discovery and fails the command. Empty environment values
+are ignored; an empty `--cc` is an error. Every invocation uses `-std=c11 -O2`.
+No shell is involved. Compiler diagnostics (including compiler stdout) go to
+stderr; compiler failure exits nonzero without running the program. If nothing
+is found, the diagnostic lists candidates tried and suggests `nov emit-c`.
+
+Generated C and executables are kept in a private temporary directory under
+`TMPDIR`, then `TEMP`, then `/tmp` (current directory on Windows without either
+variable), and removed after success, compiler failure, or normal child exit.
+As with most temporary files, force-killing Nov or losing power may leave them
+behind. `run` does not leave a build output in the current directory.
+
 Programs require a root function named `main` with exactly type `() -> void`:
 
 ```nov
@@ -77,8 +115,7 @@ flush stdout, then writes `panic: <message>\n` to stderr (no backtrace yet).
 Library `CEmitter.emit` still emits no C `main`; only
 `CEmitter.emitProgram` adds the wrapper. Backend integer widths are restricted to
 8, 16, 32 and 64 bits, including nested function signatures, with source diagnostics
-for unsupported widths. Build/run commands and compiler discovery remain
-unimplemented.
+for unsupported widths.
 
 `@print` and `@println` return `void` and write arguments to buffered stdout,
 separated by one space. Booleans use `true`/`false`; integers use decimal notation.

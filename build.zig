@@ -86,6 +86,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     _ = fixtures.add("arrays.nov", "let values = [[\n], [1,], [1, 2, 3,\n],]");
     _ = fixtures.add("unclosed-array.nov", "let values = [1");
     _ = fixtures.add("needs-format.nov", "let answer=1+2*3\n");
+    _ = fixtures.add("let-only.nov", "let number: i32 = 42\n");
+    _ = fixtures.add("print-program.nov", "let number: i32 = -42\nlet main: () -> void = @println(true, number)\n");
+    _ = fixtures.add("panic-program.nov", "let zero: i32 = 0\nlet divide: () -> i32 = 1 / zero\nlet main: () -> void = @println(divide())\n");
 
     const Case = struct {
         name: []const u8,
@@ -101,6 +104,19 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         .{ .name = "unknown command", .args = &.{"unknown-command"}, .exit_code = 1, .stderr_match = "error:" },
         .{ .name = "check without files", .args = &.{"check"}, .exit_code = 1, .stderr_match = "error:" },
         .{ .name = "fmt without files", .args = &.{"fmt"}, .exit_code = 1, .stderr_match = "error:" },
+        .{ .name = "build without files", .args = &.{"build"}, .exit_code = 1, .stderr_match = "exactly one file" },
+        .{ .name = "run without files", .args = &.{"run"}, .exit_code = 1, .stderr_match = "exactly one file" },
+        .{ .name = "build multiple files", .args = &.{ "build", "valid.nov", "another-valid.nov" }, .exit_code = 1, .stderr_match = "exactly one file" },
+        .{ .name = "run arguments deferred", .args = &.{ "run", "valid.nov", "argument" }, .exit_code = 1, .stderr_match = "program arguments are not supported" },
+        .{ .name = "run rejects output", .args = &.{ "run", "valid.nov", "-o", "out" }, .exit_code = 1, .stderr_match = "--output requires the build command" },
+        .{ .name = "emit-c rejects cc", .args = &.{ "emit-c", "valid.nov", "--cc", "cc" }, .exit_code = 1, .stderr_match = "--cc requires" },
+        .{ .name = "build rejects semantic", .args = &.{ "build", "valid.nov", "--semantic" }, .exit_code = 1, .stderr_match = "--semantic requires" },
+        .{ .name = "build rejects check", .args = &.{ "build", "valid.nov", "--check" }, .exit_code = 1, .stderr_match = "--check requires" },
+        .{ .name = "build empty cc", .args = &.{ "build", "valid.nov", "--cc", "" }, .exit_code = 1, .stderr_match = "nonempty executable" },
+        .{ .name = "build empty output", .args = &.{ "build", "valid.nov", "-o", "" }, .exit_code = 1, .stderr_match = "nonempty path" },
+        .{ .name = "build invalid source", .args = &.{ "build", "invalid.nov" }, .exit_code = 1, .stderr_match = "invalid.nov:1:13: error:" },
+        .{ .name = "run invalid source", .args = &.{ "run", "invalid.nov" }, .exit_code = 1, .stderr_match = "invalid.nov:1:13: error:" },
+        .{ .name = "build missing main", .args = &.{ "build", "let-only.nov" }, .exit_code = 1, .stderr_match = "error:" },
         .{ .name = "unknown option", .args = &.{"--unknown-option"}, .exit_code = 1, .stderr_match = "--unknown-option" },
         .{ .name = "check rejects --check", .args = &.{ "check", "--check", "valid.nov" }, .exit_code = 1, .stderr_match = "--check" },
         .{ .name = "--check requires fmt", .args = &.{"--check"}, .exit_code = 1, .stderr_match = "--check" },
@@ -132,6 +148,40 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
             run.expectStdErrEqual("");
         }
         test_step.dependOn(&run.step);
+    }
+
+    // An isolated PATH exercises real `zig cc` discovery, independent of host CC.
+    for ([_]bool{ false, true }) |panic| {
+        const run = b.addRunArtifact(exe);
+        run.step.name = if (panic) "CLI: run panic" else "CLI: run printed program";
+        run.setCwd(fixtures.getDirectory());
+        run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+        run.setEnvironmentVariable("NOV_CC", "");
+        run.setEnvironmentVariable("CC", "");
+        run.addArgs(&.{ "run", if (panic) "panic-program.nov" else "print-program.nov" });
+        run.expectExitCode(if (panic) 1 else 0);
+        run.expectStdOutEqual(if (panic) "" else "true -42\n");
+        run.expectStdErrEqual(if (panic) "panic: division by zero\n" else "");
+        test_step.dependOn(&run.step);
+    }
+    for ([_][]const u8{ "-o", "--output" }) |option| {
+        const compile = b.addRunArtifact(exe);
+        compile.step.name = b.fmt("CLI: build with {s}", .{option});
+        compile.setCwd(fixtures.getDirectory());
+        compile.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+        compile.setEnvironmentVariable("NOV_CC", "");
+        compile.setEnvironmentVariable("CC", "");
+        compile.addArgs(&.{ "build", "print-program.nov", option });
+        const program = compile.addOutputFileArg(if (exe.root_module.resolved_target.?.result.os.tag == .windows) "printed program.exe" else "printed program");
+        compile.expectExitCode(0);
+        compile.expectStdOutEqual("");
+        compile.expectStdErrEqual("");
+        const execute = std.Build.Step.Run.create(b, b.fmt("CLI: execute build output ({s})", .{option}));
+        execute.addFileArg(program);
+        execute.expectExitCode(0);
+        execute.expectStdOutEqual("true -42\n");
+        execute.expectStdErrEqual("");
+        test_step.dependOn(&execute.step);
     }
 }
 

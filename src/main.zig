@@ -8,12 +8,15 @@ const Module = @import("Module.zig");
 const Dependencies = @import("Dependencies.zig");
 const Lowering = @import("Lowering.zig");
 const CEmitter = @import("CEmitter.zig");
+const Driver = @import("Driver.zig");
 
 const params = clap.parseParamsComptime(
     \\-h, --help             Display this help and exit.
     \\-v, --version          Display the version and exit.
     \\--check                Check formatting without changing files (fmt only).
     \\--semantic             Check the bounded semantic/lowering subset (check only).
+    \\--cc <str>             C compiler executable (build/run only).
+    \\-o, --output <str>      Output executable path (build only).
     \\<arg>...
     \\
 );
@@ -23,9 +26,11 @@ fn usage(writer: *std.Io.Writer) !void {
         \\Usage: nov check [--semantic] <file>...
         \\       nov fmt [--check] <file>...
         \\       nov emit-c <file>
+        \\       nov build <file> [-o|--output <path>] [--cc <executable>]
+        \\       nov run <file> [--cc <executable>]
         \\
         \\Check syntax, or the bounded semantic subset with --semantic.
-        \\Emit program C11 source to stdout with emit-c; no build or execution.
+        \\Emit program C11 with emit-c, compile with build, or compile and run with run.
         \\
         \\Options:
         \\
@@ -45,7 +50,7 @@ pub fn main(init: std.process.Init) !u8 {
     defer stderr.flush() catch {};
 
     var diag: clap.Diagnostic = .{};
-    var res = clap.parse(clap.Help, &params, .{ .arg = clap.parsers.string }, init.minimal.args, .{
+    var res = clap.parse(clap.Help, &params, .{ .arg = clap.parsers.string, .str = clap.parsers.string }, init.minimal.args, .{
         .allocator = init.gpa,
         .diagnostic = &diag,
     }) catch |err| {
@@ -70,6 +75,28 @@ pub fn main(init: std.process.Init) !u8 {
     const args = res.positionals[0];
     const is_emit = args.len != 0 and std.mem.eql(u8, args[0], "emit-c");
     const is_fmt = args.len != 0 and std.mem.eql(u8, args[0], "fmt");
+    const is_build = args.len != 0 and std.mem.eql(u8, args[0], "build");
+    const is_run = args.len != 0 and std.mem.eql(u8, args[0], "run");
+    if (res.args.cc != null and !is_build and !is_run) {
+        try stderr.writeAll("error: --cc requires the build or run command\n");
+        return 1;
+    }
+    if (res.args.output != null and !is_build) {
+        try stderr.writeAll("error: --output requires the build command\n");
+        return 1;
+    }
+    if (res.args.cc) |cc| {
+        if (cc.len == 0) {
+            try stderr.writeAll("error: --cc requires a nonempty executable name or path\n");
+            return 1;
+        }
+    }
+    if (res.args.output) |output| {
+        if (output.len == 0) {
+            try stderr.writeAll("error: --output requires a nonempty path\n");
+            return 1;
+        }
+    }
     if (res.args.semantic != 0 and (args.len == 0 or !std.mem.eql(u8, args[0], "check"))) {
         try stderr.writeAll("error: --semantic requires the check command\n");
         return 1;
@@ -77,6 +104,16 @@ pub fn main(init: std.process.Init) !u8 {
     if (res.args.check != 0 and !is_fmt) {
         try stderr.writeAll("error: --check requires the fmt command\n");
         return 1;
+    }
+    if (is_build or is_run) {
+        if (args.len != 2) {
+            try stderr.print("error: {s} requires exactly one file; program arguments are not supported yet\n", .{args[0]});
+            return 1;
+        }
+        return buildFile(init.io, init.gpa, init.environ_map, args[1], res.args.output, res.args.cc, is_run, stderr) catch |err| {
+            try stderr.print("{s}: error: {s}\n", .{ args[1], @errorName(err) });
+            return 1;
+        };
     }
     if (is_emit) {
         if (args.len != 2) {
@@ -93,7 +130,7 @@ pub fn main(init: std.process.Init) !u8 {
         return if (valid) 0 else 1;
     }
     if (args.len < 2 or (!is_fmt and !std.mem.eql(u8, args[0], "check"))) {
-        if (args.len != 0) try stderr.writeAll("error: expected 'check', 'fmt', or 'emit-c' followed by files\n");
+        if (args.len != 0) try stderr.writeAll("error: expected 'check', 'fmt', 'emit-c', 'build', or 'run' followed by files\n");
         try usage(stderr);
         return 1;
     }
@@ -141,6 +178,45 @@ fn processFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, stder
 
     try replaceFormattedFile(io, allocator, resolved, source, formatted);
     return true;
+}
+
+fn buildFile(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Environ.Map, path: []const u8, output_option: ?[]const u8, cc: ?[]const u8, execute: bool, stderr: *std.Io.Writer) !u8 {
+    var source = std.Io.Writer.Allocating.init(allocator);
+    defer source.deinit();
+    if (!try emitFile(io, allocator, path, stderr, &source.writer)) return 1;
+
+    const temp_root = env.get("TMPDIR") orelse env.get("TEMP") orelse
+        (if (@import("builtin").os.tag == .windows) "." else "/tmp");
+    const workspace = try Driver.Workspace.init(io, allocator, temp_root);
+    defer workspace.deinit(io);
+    const c_path = try workspace.file("program.c");
+    defer allocator.free(c_path);
+    const exe_path = try workspace.file(if (@import("builtin").os.tag == .windows) "program.exe" else "program");
+    defer allocator.free(exe_path);
+    const cwd = std.Io.Dir.cwd();
+    try cwd.writeFile(io, .{ .sub_path = c_path, .data = source.written() });
+    if (!try Driver.compile(io, .{ .cc = cc, .nov_cc = env.get("NOV_CC"), .env_cc = env.get("CC") }, c_path, exe_path, stderr)) return 1;
+    if (execute) return Driver.run(io, exe_path, stderr);
+
+    const default_output = if (output_option == null) try Driver.defaultOutput(allocator, path) else null;
+    defer if (default_output) |output| allocator.free(output);
+    const output = output_option orelse default_output.?;
+    const source_path = try cwd.realPathFileAlloc(io, path, allocator);
+    defer allocator.free(source_path);
+    const existing_output = cwd.realPathFileAlloc(io, output, allocator) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    defer if (existing_output) |resolved| allocator.free(resolved);
+    if (existing_output) |resolved| {
+        if (std.mem.eql(u8, source_path, resolved)) {
+            try stderr.writeAll("error: output path refers to the input source file\n");
+            return 1;
+        }
+    }
+    // Publish only a successful build, retaining executable permissions.
+    try cwd.copyFile(exe_path, cwd, output, io, .{});
+    return 0;
 }
 
 fn emitFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, stderr: *std.Io.Writer, stdout: *std.Io.Writer) !bool {
@@ -336,6 +412,65 @@ test "semantic file checks reject errors and deferred forms without writing" {
     }
 }
 
+test "build and run integrate discovery, preserve outputs, and clean temporary files" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    try tmp.dir.writeFile(io, .{ .sub_path = "input.nov", .data = "let main: () -> void = {}\n" });
+    const input = try tmp.dir.realPathFileAlloc(io, "input.nov", allocator);
+    defer allocator.free(input);
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put("TMPDIR", root);
+    var compilers: [3][:0]const u8 = undefined;
+    var count: usize = 0;
+    defer for (compilers[0..count]) |path| allocator.free(path);
+    for (0..3) |index| {
+        const name = try std.fmt.allocPrint(allocator, "compiler {d};literal", .{index});
+        defer allocator.free(name);
+        const script = try std.fmt.allocPrint(
+            allocator,
+            "#!/bin/sh\n[ \"$1\" = -std=c11 ] && [ \"$2\" = -O2 ] && [ -f \"$3\" ] && [ \"$4\" = -o ] || exit 90\nprintf '#!/bin/sh\\nexit {d}\\n' > \"$5\"\n/bin/chmod 700 \"$5\"\n",
+            .{37 + index},
+        );
+        defer allocator.free(script);
+        try tmp.dir.writeFile(io, .{ .sub_path = name, .data = script });
+        try tmp.dir.setFilePermissions(io, name, .fromMode(0o700), .{});
+        compilers[index] = try tmp.dir.realPathFileAlloc(io, name, allocator);
+        count += 1;
+    }
+    try env.put("NOV_CC", compilers[1]);
+    try env.put("CC", compilers[2]);
+    var diagnostics = std.Io.Writer.Allocating.init(allocator);
+    defer diagnostics.deinit();
+    try std.testing.expectEqual(@as(u8, 37), try buildFile(io, allocator, &env, input, null, compilers[0], true, &diagnostics.writer));
+    try std.testing.expectEqual(@as(u8, 38), try buildFile(io, allocator, &env, input, null, "/nov-missing/explicit", true, &diagnostics.writer));
+    try env.put("NOV_CC", "");
+    try std.testing.expectEqual(@as(u8, 39), try buildFile(io, allocator, &env, input, null, null, true, &diagnostics.writer));
+    const output = try std.fs.path.join(allocator, &.{ root, "output with spaces;literal" });
+    defer allocator.free(output);
+    try std.testing.expectEqual(@as(u8, 0), try buildFile(io, allocator, &env, input, output, compilers[0], false, &diagnostics.writer));
+    try std.testing.expectEqual(@as(u8, 37), try Driver.run(io, output, &diagnostics.writer));
+    try tmp.dir.writeFile(io, .{ .sub_path = "failure", .data = "#!/bin/sh\nexit 51\n" });
+    try tmp.dir.setFilePermissions(io, "failure", .fromMode(0o700), .{});
+    const failure = try tmp.dir.realPathFileAlloc(io, "failure", allocator);
+    defer allocator.free(failure);
+    try std.testing.expectEqual(@as(u8, 1), try buildFile(io, allocator, &env, input, output, failure, false, &diagnostics.writer));
+    try std.testing.expectEqual(@as(u8, 37), try Driver.run(io, output, &diagnostics.writer));
+    try std.testing.expectEqual(@as(u8, 1), try buildFile(io, allocator, &env, input, input, compilers[0], false, &diagnostics.writer));
+    const source = try tmp.dir.readFileAlloc(io, "input.nov", allocator, .limited(1024));
+    defer allocator.free(source);
+    try std.testing.expectEqualStrings("let main: () -> void = {}\n", source);
+    var iterator = tmp.dir.iterate();
+    while (try iterator.next(io)) |entry| {
+        try std.testing.expect(!std.mem.startsWith(u8, entry.name, "nov-"));
+    }
+}
+
 test {
     _ = @import("Ast.zig");
     _ = @import("Ir.zig");
@@ -349,6 +484,7 @@ test {
     _ = @import("CEmitter.zig");
     _ = @import("Tokenizer.zig");
     _ = @import("string_literal.zig");
+    _ = Driver;
     _ = Diagnostics;
     _ = Formatter;
 }
