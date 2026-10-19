@@ -89,12 +89,17 @@ pub fn parse(allocator: Allocator, source: [:0]const u8) Allocator.Error!Ast {
 
     try parser.parseRoot();
 
+    // Finish fallible transfers before releasing the token and node owners.
+    const extra_data = try parser.extra_data.toOwnedSlice(allocator);
+    errdefer allocator.free(extra_data);
+    const errors = try parser.errors.toOwnedSlice(allocator);
+
     return .{
         .source = source,
         .tokens = tokens.toOwnedSlice(),
         .nodes = parser.nodes.toOwnedSlice(),
-        .extra_data = try parser.extra_data.toOwnedSlice(allocator),
-        .errors = try parser.errors.toOwnedSlice(allocator),
+        .extra_data = extra_data,
+        .errors = errors,
     };
 }
 
@@ -1610,6 +1615,25 @@ fn failMsg(self: *Parser, msg: Ast.Error) Error {
     @branchHint(.cold);
     try self.warnMsg(msg);
     return error.ParseError;
+}
+
+fn testParseAllocationFailures(allocator: Allocator, source: [:0]const u8) !void {
+    var ast = try parse(allocator, source);
+    defer ast.deinit(allocator);
+    try std.testing.expectEqual(Token.Tag.eof, ast.tokens.items(.tag)[ast.tokens.len - 1]);
+}
+
+test "parser ownership survives allocation failures" {
+    const sources = [_][:0]const u8{
+        "",
+        "let answer: int = 1 + 2",
+        "let add: (a: int, b: int, c: int) -> int = {\nlet sum = a + b\nlet result = sum + c\nresult\n}\nlet answer = add(1, 2, 3)",
+        "let value = {\nlet broken =\nlet valid = 42\nvalid\n}\nlet missing =",
+        "let a =\nlet b =\nlet c =\nlet d =\nlet e =\nlet f =\nlet g =\nlet h =",
+    };
+    for (sources) |source| {
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
+    }
 }
 
 test "parse empty source" {
