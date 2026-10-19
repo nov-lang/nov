@@ -692,6 +692,10 @@ pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
     var end_offset: TokenIndex = 0;
     while (true) switch (tags[n]) {
         .root => return @intCast(self.tokens.len - 1),
+        .@"return" => {
+            if (datas[n].rhs == 0) return main_tokens[n] + end_offset;
+            n = datas[n].rhs;
+        },
         else => {
             // TODO
             // TODO: merge similar cases once all are implemented

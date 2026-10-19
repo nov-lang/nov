@@ -50,6 +50,7 @@ pub const Diagnostic = struct {
         unsupported_body_expression,
         unsupported_local_declaration,
         unused_block_value,
+        unreachable_code,
         unsupported_shadowing,
         expression_type_mismatch,
         operator_not_supported,

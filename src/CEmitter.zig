@@ -330,6 +330,9 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
             value_used[@intFromEnum(region.then_value)] = true;
             if (region.else_value) |value| value_used[@intFromEnum(value)] = true;
         },
+        .return_value => |value| {
+            if (value) |v| value_used[@intFromEnum(v)] = true;
+        },
         .constant, .function_ref => {},
     };
 
@@ -355,7 +358,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
                     try w.print("    if (v{d}) {{\n", .{@intFromEnum(region.condition)});
                 }
                 if (region.else_start == i) {
-                    if (has_value) try w.print("    v{d} = v{d};\n", .{ end, @intFromEnum(region.then_value) });
+                    if (has_value and !Ir.terminates(body, region.then_value)) try w.print("    v{d} = v{d};\n", .{ end, @intFromEnum(region.then_value) });
                     try w.writeAll("    } else {\n");
                 }
             } else if (candidate.op == .short_circuit and candidate.op.short_circuit.rhs_start == i) {
@@ -364,7 +367,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
             }
         }
         if (instruction.op == .branch) {
-            if (ir.types.items[@intFromEnum(instruction.ty)] != .void) {
+            if (ir.types.items[@intFromEnum(instruction.ty)] != .void and !Ir.terminates(body, instruction.op.branch.else_value.?)) {
                 try w.print("    v{d} = v{d};\n", .{ i, @intFromEnum(instruction.op.branch.else_value.?) });
             }
             try w.writeAll("    }\n");
@@ -372,11 +375,20 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
             continue;
         }
         if (instruction.op == .short_circuit) {
-            try w.print("    v{d} = v{d};\n    }}\n", .{ i, @intFromEnum(instruction.op.short_circuit.rhs) });
+            if (!Ir.terminates(body, instruction.op.short_circuit.rhs)) try w.print("    v{d} = v{d};\n", .{ i, @intFromEnum(instruction.op.short_circuit.rhs) });
+            try w.writeAll("    }\n");
             if (!value_used[i]) try w.print("    (void)v{d};\n", .{i});
             continue;
         }
         const ty = ir.types.items[@intFromEnum(instruction.ty)];
+        if (instruction.op == .return_value) {
+            if (instruction.op.return_value) |value| {
+                if (ir.types.items[@intFromEnum(body.instructions[@intFromEnum(value)].ty)] != .void) {
+                    try w.print("    return v{d};\n", .{@intFromEnum(value)});
+                } else try w.writeAll("    return;\n");
+            } else try w.writeAll("    return;\n");
+            continue;
+        }
         if (ty == .void) {
             // Void values have no C object; emit their effects as statements.
             if (instruction.op == .print) try writePrint(ir, w, body, instruction.op.print);
@@ -442,13 +454,13 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
                 try w.print("v{d} {s} v{d}", .{ @intFromEnum(binary.lhs), operator, @intFromEnum(binary.rhs) });
             },
             .call => |call| try writeCall(w, call),
-            .print, .short_circuit, .branch => unreachable,
+            .return_value, .print, .short_circuit, .branch => unreachable,
         }
         try w.writeAll(";\n");
         if (!value_used[i]) try w.print("    (void)v{d};\n", .{i});
     }
     const result_type = ir.types.items[@intFromEnum(signature.result)];
-    if (result_type != .void) try w.print("    return v{d};\n", .{@intFromEnum(body.result)});
+    if (result_type != .void and !Ir.terminates(body, body.result)) try w.print("    return v{d};\n", .{@intFromEnum(body.result)});
 }
 
 fn writePrint(ir: *const Ir, w: *std.Io.Writer, body: Ir.Body, print: anytype) WriteError!void {
@@ -492,6 +504,104 @@ fn emitSource(source: []const u8, diagnostic: ?*Diagnostic) ![]u8 {
     try std.testing.expect(!module.hasErrors());
     try std.testing.expect(sema.lowering_complete);
     return emit(test_gpa, &sema.ir, diagnostic);
+}
+
+test "early returns preserve effects fallbacks nested merges and function values" {
+    const c = try emitSource(
+        \\let mark: (n: int) -> int = {@print(n)
+        \\    n}
+        \\let add: (a: int, b: int) -> int = a + b
+        \\let fallback: (c: bool) -> int = {
+        \\    @print(mark(1))
+        \\    if c {{return mark(2)}}
+        \\    mark(3)
+        \\}
+        \\let mixed: (c: bool) -> int = if c {return mark(4)} else {mark(5)}
+        \\let reverse: (c: bool) -> int = if c {mark(6)} else {return mark(7)}
+        \\let all: (c: bool) -> int = if c {if c {return mark(8)} else {return mark(9)}} else {return mark(10)}
+        \\let abortargs: () -> int = add(mark(11), {return mark(12)})
+        \\let abortprint: () -> int = @println(mark(13), {return mark(14)}, mark(15))
+        \\let abortinit: () -> int = {let unused: bool = {return mark(16)}
+        \\}
+        \\let choose: () -> (int) -> int = return mark
+        \\let unit: (c: bool) -> void = {if c {return @print(true)}
+        \\    @print(false)}
+        \\let out: () -> void = {
+        \\    @println(fallback(true), fallback(false))
+        \\    @println(mixed(true), mixed(false), reverse(true), reverse(false))
+        \\    @println(all(true), all(false), abortargs(), abortprint(), abortinit())
+        \\    @println(choose()(17))
+        \\    unit(true)
+        \\    unit(false)
+        \\    return @println()
+        \\}
+    , null);
+    defer test_gpa.free(c);
+    try compileAndRunExpected(c, "void nov_out(void); int main(void) { nov_out(); return 0; }", 0, "1121132 3\n45674 5 6 7\n81011121314168 10 12 14 16\n1717\ntruefalse\n", "");
+}
+
+test "returning short circuit regions skip effects and merge continuing booleans" {
+    const c = try emitSource(
+        \\let mark: (n: int) -> int = {@print(n)
+        \\    n}
+        \\let a: (c: bool) -> int = {let b: bool = c and {return mark(1)}
+        \\    if b {return 2}
+        \\    mark(3)}
+        \\let o: (c: bool) -> int = {let b: bool = c or {return mark(4)}
+        \\    if b {return mark(5)}
+        \\    6}
+        \\let nested: (c: bool) -> bool = c and {if c {return false} else {true or {return false}}}
+        \\let out: () -> void = {
+        \\    @println(a(true), a(false), o(true), o(false))
+        \\    @println(nested(true), nested(false))
+        \\    return
+        \\}
+    , null);
+    defer test_gpa.free(c);
+    try compileAndRunExpected(c, "void nov_out(void); int main(void) { nov_out(); return 0; }", 0, "13541 3 5 4\nfalse false\n", "");
+}
+
+test "returns skip fallback panics but evaluate returned expressions" {
+    const c = try emitSource(
+        \\let divide: (n: int) -> int = 1 / n
+        \\let early: (c: bool) -> int = {if c {return 42}
+        \\    divide(0)}
+        \\let panic: () -> int = return {@print(true)
+        \\    divide(0)}
+        \\let skip: () -> void = @println(early(true), false and {return}, true or {return})
+    , null);
+    defer test_gpa.free(c);
+    try compileAndRunExpected(c, "void nov_skip(void); int main(void) { nov_skip(); return 0; }", 0, "42 false true\n", "");
+    try compileAndRunExpected(c, "#include <stdint.h>\n#include <stdbool.h>\nint64_t nov_early(bool); int main(void) { (void)nov_early(false); return 0; }", 1, "", "panic: division by zero\n");
+    try compileAndRunExpected(c, "#include <stdint.h>\nint64_t nov_panic(void); int main(void) { (void)nov_panic(); return 0; }", 1, "true", "panic: division by zero\n");
+}
+
+fn testReturnAllocationFailures(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "return.nov",
+        \\let f: (c: bool) -> int = {
+        \\    let b: bool = c and {if c {return 1} else {return 2}}
+        \\    if b {return 3}
+        \\    return 4
+        \\}
+        \\let main: () -> void = {if true {return @println(f(true))}
+        \\    @println(f(false))}
+    );
+    var result = Lowering.lower(&module) catch |err| {
+        module.deinit();
+        return err;
+    };
+    defer result.deinit();
+    const failed = module.hasErrors();
+    module.deinit();
+    try std.testing.expect(!failed);
+    try std.testing.expect(result.lowering_complete);
+    try result.ir.verify();
+    const c = try emitProgram(allocator, &result.ir, null);
+    defer allocator.free(c);
+}
+
+test "return ownership and C emission survive every allocation failure" {
+    try std.testing.checkAllAllocationFailures(test_gpa, testReturnAllocationFailures, .{});
 }
 
 test "if branches execute selected effects once with nesting and function results" {

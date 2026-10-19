@@ -191,6 +191,30 @@ test "unit comparisons and unary operations lower without arithmetic evaluation"
     try sema.ir.verify();
 }
 
+test "return spans and owned terminal regions survive source destruction" {
+    var module = try Module.init(std.testing.allocator, "return.nov",
+        \\let f: (c: bool) -> int = if c {{return 42}} else {return 43}
+        \\let unit: () -> void = return
+    );
+    var sema = lower(&module) catch |err| {
+        module.deinit();
+        return err;
+    };
+    defer sema.deinit();
+    const failed = module.hasErrors();
+    for (sema.ir.functions.items[0].body.?.instructions) |instruction| {
+        if (instruction.op == .return_value) try std.testing.expect(std.mem.startsWith(u8, module.ast.source[instruction.span.start..instruction.span.end], "return 4"));
+    }
+    module.deinit();
+    try std.testing.expect(!failed);
+    try std.testing.expect(sema.lowering_complete);
+    const body = sema.ir.functions.items[0].body.?;
+    try std.testing.expect(Ir.terminates(body, body.result));
+    try std.testing.expect(body.instructions[@intFromEnum(body.result)].op.branch.returns);
+    try std.testing.expect(sema.ir.functions.items[1].body.?.instructions[0].op.return_value == null);
+    try sema.ir.verify();
+}
+
 test "if lowering owns branch ranges results and spans after source destruction" {
     var module = try Module.init(std.testing.allocator, "if.nov",
         \\let f: (c: bool, n: int) -> int = if c {n} else if c {1} else {2}
@@ -337,6 +361,10 @@ test "lowering ownership and source diagnostic rollback survive allocation failu
         "let f: (x: bool) -> bool = x and {let y: bool = x or false\n@println(y)\ny and x}\nlet main: () -> void = @println(f(true), false or f(false))",
         "let f: (x: bool) -> bool = if x {let y: bool = x or false\n@println(y)\ny} else if !x {true and x} else {false}\nlet main: () -> void = {if f(true) {@println(true)}\n}",
         "let f: () -> void = if false {missing} else {}",
+        "let f: (c: bool) -> int = {if c {{return 1}}\nreturn 2}",
+        "let f: () -> int = return false",
+        "let f: () -> int = {return 1\n@println(true)}",
+        "let f: () -> int = return",
         "let f: () -> bool = false and missing",
         "let id: (x: i32) -> i32 = x\nlet main: () -> void = @println(true, id(1), id(2))",
         "let main: () -> void = @println(true, missing, 1)",

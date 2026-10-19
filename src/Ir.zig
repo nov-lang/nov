@@ -26,11 +26,14 @@ pub const Function = struct {
     span: Span,
     body: ?Body = null,
 };
+/// `result` is either a continuing value or the final terminal instruction.
 pub const Body = struct { instructions: []const Instruction, result: ValueId };
 pub const Instruction = struct { ty: TypeId, span: Span, op: Operation };
 pub const UnaryOp = enum { negate, bit_not, bool_not };
 pub const BinaryOp = enum { add, sub, mul, div, mod, eq, ne, lt, le, gt, ge };
 pub const Operation = union(enum) {
+    /// Terminal control flow, never a value. Its optional operand is body-local.
+    return_value: ?ValueId,
     constant: ConstId,
     parameter: u32,
     function_ref: FunctionId,
@@ -45,7 +48,9 @@ pub const Operation = union(enum) {
     /// Then instructions occupy [then_start, else_start), else instructions
     /// [else_start, merge). Only the selected result escapes these sibling scopes.
     /// An absent else is an empty region and is valid only for a void result.
-    branch: struct { condition: ValueId, then_start: u32, else_start: u32, then_value: ValueId, else_value: ?ValueId },
+    /// Yields may instead name terminal instructions. `returns` is verified to
+    /// mean both paths terminate; such a merge has void type and no value.
+    branch: struct { condition: ValueId, then_start: u32, else_start: u32, then_value: ValueId, else_value: ?ValueId, returns: bool = false },
 };
 
 pub const Type = union(enum) {
@@ -104,6 +109,7 @@ pub const VerifyError = ValidationError || error{
     InvalidReturn,
     InvalidConstId,
     InvalidRegion,
+    UnreachableInstruction,
 };
 pub const BuildError = VerifyError || std.mem.Allocator.Error || error{ TooManyEntries, BodyAlreadySet };
 
@@ -290,7 +296,16 @@ fn regionOperandType(body: Body, id: ValueId, before: usize, yielding: ?usize) V
                 !(before == region.end and yielding == owner)) return error.InvalidValueId;
         }
     }
+    if (terminates(body, id) and yielding == null) return error.InvalidValueId;
     return body.instructions[index].ty;
+}
+
+pub fn terminates(body: Body, id: ValueId) bool {
+    return switch (body.instructions[@intFromEnum(id)].op) {
+        .return_value => true,
+        .branch => |r| r.returns,
+        else => false,
+    };
 }
 
 const Region = struct { start: usize, end: usize };
@@ -340,7 +355,31 @@ fn validateBody(self: *const Ir, function: Function, body: Body) VerifyError!voi
     for (body.instructions, 0..) |instruction, i| {
         const ty = self.getType(instruction.ty) orelse return error.InvalidTypeId;
         try self.validateSpan(instruction.span);
+        if (terminates(body, @enumFromInt(i))) {
+            var region_end = body.instructions.len;
+            var result = body.result;
+            for (body.instructions, 0..) |owner, end| {
+                var buffer: [2]Region = undefined;
+                for (regions(owner.op, end, &buffer), 0..) |region, r| {
+                    if (i >= region.start and i < region.end and region.end <= region_end) {
+                        region_end = region.end;
+                        result = switch (owner.op) {
+                            .branch => |b| if (r == 0) b.then_value else b.else_value.?,
+                            .short_circuit => |s| s.rhs,
+                            else => unreachable,
+                        };
+                    }
+                }
+            }
+            if (i + 1 != region_end or @intFromEnum(result) != i) return error.UnreachableInstruction;
+        }
         switch (instruction.op) {
+            .return_value => |value| {
+                if (ty != .void) return error.InvalidReturn;
+                if (value) |v| {
+                    if (try operandType(body, v, i) != signature.result) return error.InvalidReturn;
+                } else if (self.getType(signature.result).? != .void) return error.InvalidReturn;
+            },
             .constant => |id| {
                 const constant = self.getConstant(id) orelse return error.InvalidConstId;
                 try self.validateConstant(constant);
@@ -383,15 +422,22 @@ fn validateBody(self: *const Ir, function: Function, body: Body) VerifyError!voi
             .short_circuit => |region| {
                 if (ty != .boolean) return error.OperandTypeMismatch;
                 if (try operandType(body, region.lhs, region.rhs_start) != instruction.ty) return error.OperandTypeMismatch;
-                if (try regionOperandType(body, region.rhs, i, i) != instruction.ty) return error.OperandTypeMismatch;
+                const rhs_ty = try regionOperandType(body, region.rhs, i, i);
+                if (!terminates(body, region.rhs) and rhs_ty != instruction.ty) return error.OperandTypeMismatch;
             },
             .branch => |r| {
                 const condition = self.getType(try operandType(body, r.condition, r.then_start)) orelse return error.InvalidTypeId;
                 if (condition != .boolean) return error.OperandTypeMismatch;
-                if (try regionOperandType(body, r.then_value, r.else_start, i) != instruction.ty) return error.OperandTypeMismatch;
+                const then_ty = try regionOperandType(body, r.then_value, r.else_start, i);
+                const then_returns = terminates(body, r.then_value);
+                if (!then_returns and then_ty != instruction.ty) return error.OperandTypeMismatch;
+                var else_returns = false;
                 if (r.else_value) |value| {
-                    if (try regionOperandType(body, value, i, i) != instruction.ty) return error.OperandTypeMismatch;
+                    const else_ty = try regionOperandType(body, value, i, i);
+                    else_returns = terminates(body, value);
+                    if (!else_returns and else_ty != instruction.ty) return error.OperandTypeMismatch;
                 } else if (ty != .void) return error.OperandTypeMismatch;
+                if (r.returns != (then_returns and else_returns) or (r.returns and ty != .void)) return error.InvalidReturn;
             },
             .print => |print| {
                 if (ty != .void) return error.InvalidOperation;
@@ -413,7 +459,8 @@ fn validateBody(self: *const Ir, function: Function, body: Body) VerifyError!voi
             },
         }
     }
-    if (try operandType(body, body.result, body.instructions.len) != signature.result) return error.InvalidReturn;
+    const result_ty = try regionOperandType(body, body.result, body.instructions.len, body.instructions.len);
+    if (!terminates(body, body.result) and result_ty != signature.result) return error.InvalidReturn;
 }
 
 fn validateType(self: *const Ir, ty: Type, before: usize) ValidationError!void {
@@ -779,6 +826,122 @@ fn testConditionalAllocationFailures(allocator: std.mem.Allocator) !void {
 
 test "conditional body operands are owned and publication is atomic under OOM" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, testConditionalAllocationFailures, .{});
+}
+
+test "explicit returns validate signatures prior values spans and terminal tails" {
+    var fixture = try TestFunctions.init(std.testing.allocator);
+    defer fixture.ir.deinit();
+    const unit = try fixture.ir.internType(.void);
+    const ins = TestFunctions.instruction;
+    const good = [_]Instruction{
+        ins(fixture.integer, .{ .parameter = 0 }),
+        ins(unit, .{ .return_value = @enumFromInt(0) }),
+    };
+    var bad = good;
+    bad[1].op.return_value = null;
+    try fixture.reject(error.InvalidReturn, &bad, @enumFromInt(1));
+    bad = good;
+    bad[1].op.return_value = @enumFromInt(1);
+    try fixture.reject(error.InvalidValueId, &bad, @enumFromInt(1));
+    bad = good;
+    bad[1].ty = fixture.integer;
+    try fixture.reject(error.InvalidReturn, &bad, @enumFromInt(1));
+    bad = good;
+    bad[1].span.end = 11;
+    try fixture.reject(error.InvalidSourceSpan, &bad, @enumFromInt(1));
+    try fixture.reject(error.UnreachableInstruction, &good, @enumFromInt(0));
+    const after = good ++ [_]Instruction{ins(fixture.integer, .{ .parameter = 0 })};
+    try fixture.reject(error.UnreachableInstruction, &after, @enumFromInt(2));
+    const wrong = [_]Instruction{
+        ins(unit, .{ .constant = try fixture.ir.internConstant(.{ .ty = unit, .value = .void }) }),
+        ins(unit, .{ .return_value = @enumFromInt(0) }),
+    };
+    try fixture.reject(error.InvalidReturn, &wrong, @enumFromInt(1));
+    try fixture.ir.setFunctionBody(fixture.function, &good, @enumFromInt(1));
+    try fixture.ir.verify();
+}
+
+test "void returns accept unit operands and reject nonvoid values" {
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    ir.source_len = 1;
+    const unit = try ir.internType(.void);
+    const boolean = try ir.internType(.boolean);
+    const sig = try ir.internType(.{ .function = .{ .params = &.{}, .result = unit } });
+    const f = try ir.addFunction("unit", sig, test_span);
+    const ins = TestFunctions.instruction;
+    var instructions = [_]Instruction{
+        ins(unit, .{ .constant = try ir.internConstant(.{ .ty = unit, .value = .void }) }),
+        ins(unit, .{ .return_value = @enumFromInt(0) }),
+    };
+    try ir.setFunctionBody(f, &instructions, @enumFromInt(1));
+    try ir.verify();
+    instructions[0] = ins(boolean, .{ .constant = try ir.internConstant(.{ .ty = boolean, .value = .{ .boolean = true } }) });
+    const bad = try ir.addFunction("bad", sig, test_span);
+    try std.testing.expectError(error.InvalidReturn, ir.setFunctionBody(bad, &instructions, @enumFromInt(1)));
+    const bare = [_]Instruction{ins(unit, .{ .return_value = null })};
+    try ir.setFunctionBody(bad, &bare, @enumFromInt(0));
+    try ir.verify();
+}
+
+test "short circuit terminal RHS cannot escape or provide a fabricated live value" {
+    var fixture = try TestFunctions.init(std.testing.allocator);
+    defer fixture.ir.deinit();
+    const unit = try fixture.ir.internType(.void);
+    const boolean_constant = try fixture.ir.internConstant(.{ .ty = fixture.boolean, .value = .{ .boolean = true } });
+    const ins = TestFunctions.instruction;
+    const good = [_]Instruction{
+        ins(fixture.boolean, .{ .constant = boolean_constant }),
+        ins(fixture.integer, .{ .parameter = 0 }),
+        ins(unit, .{ .return_value = @enumFromInt(1) }),
+        ins(fixture.boolean, .{ .short_circuit = .{ .kind = .@"and", .lhs = @enumFromInt(0), .rhs_start = 1, .rhs = @enumFromInt(2) } }),
+        ins(fixture.integer, .{ .parameter = 0 }),
+    };
+    var bad = good;
+    bad[4] = ins(unit, .{ .return_value = @enumFromInt(1) });
+    try fixture.reject(error.InvalidValueId, &bad, @enumFromInt(4));
+    bad = good;
+    bad[2] = ins(unit, .{ .constant = try fixture.ir.internConstant(.{ .ty = unit, .value = .void }) });
+    try fixture.reject(error.OperandTypeMismatch, &bad, @enumFromInt(4));
+    bad = good;
+    bad[3].op.short_circuit.rhs = @enumFromInt(0);
+    try fixture.reject(error.UnreachableInstruction, &bad, @enumFromInt(4));
+    try fixture.ir.setFunctionBody(fixture.function, &good, @enumFromInt(4));
+    try fixture.ir.verify();
+}
+
+test "returning branches verify merge flags reachability and private return operands" {
+    var fixture = try TestFunctions.init(std.testing.allocator);
+    defer fixture.ir.deinit();
+    const unit = try fixture.ir.internType(.void);
+    const boolean_constant = try fixture.ir.internConstant(.{ .ty = fixture.boolean, .value = .{ .boolean = true } });
+    const ins = TestFunctions.instruction;
+    const good = [_]Instruction{
+        ins(fixture.boolean, .{ .constant = boolean_constant }),
+        ins(fixture.integer, .{ .parameter = 0 }),
+        ins(unit, .{ .return_value = @enumFromInt(1) }),
+        ins(fixture.integer, .{ .parameter = 0 }),
+        ins(unit, .{ .return_value = @enumFromInt(3) }),
+        ins(unit, .{ .branch = .{ .condition = @enumFromInt(0), .then_start = 1, .else_start = 3, .then_value = @enumFromInt(2), .else_value = @enumFromInt(4), .returns = true } }),
+    };
+    var bad = good;
+    bad[5].op.branch.returns = false;
+    try fixture.reject(error.InvalidReturn, &bad, @enumFromInt(5));
+    bad = good;
+    bad[4].op.return_value = @enumFromInt(1);
+    try fixture.reject(error.InvalidValueId, &bad, @enumFromInt(5));
+    bad = good;
+    bad[5].ty = fixture.integer;
+    try fixture.reject(error.InvalidReturn, &bad, @enumFromInt(5));
+    const after = good ++ [_]Instruction{ins(fixture.integer, .{ .parameter = 0 })};
+    try fixture.reject(error.UnreachableInstruction, &after, @enumFromInt(6));
+    // A non-returning branch cannot claim its successor is unreachable.
+    bad = good;
+    bad[4] = ins(fixture.integer, .{ .parameter = 0 });
+    bad[5].ty = fixture.integer;
+    try fixture.reject(error.InvalidReturn, &bad, @enumFromInt(5));
+    try fixture.ir.setFunctionBody(fixture.function, &good, @enumFromInt(5));
+    try fixture.ir.verify();
 }
 
 test "if regions validate sibling isolation captures yields types and boundaries" {

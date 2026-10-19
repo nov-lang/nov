@@ -63,6 +63,7 @@ pub fn renderModule(module: *const Module, writer: *std.Io.Writer) !void {
             .literal_out_of_range => try writer.writeAll("integer literal does not fit the annotated type"),
             .unsupported_body_expression => try writer.writeAll("body checking for this expression is not implemented yet"),
             .unsupported_local_declaration => try writer.writeAll("local declarations require an immutable, explicitly typed value (local function definitions and discards are not supported yet)"),
+            .unreachable_code => try writer.writeAll("unreachable statement after return"),
             .unused_block_value => try writer.writeAll("non-final block expression must return void; discarding values is not supported yet"),
             .unsupported_shadowing => try writer.writeAll("shadowing is not supported in body analysis yet"),
             .expression_type_mismatch => try writer.writeAll("expression does not match the expected type"),

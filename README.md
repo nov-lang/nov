@@ -35,9 +35,9 @@ parameters and checks integer arithmetic, boolean expressions, comparisons and
 calls against collected signatures, including recursive calls. Immutable,
 explicitly typed locals and straight-line blocks with final-expression results
 are supported in function bodies. Literal defaults, user-defined type aliases,
-shadowing and control flow beyond conditional expressions remain deferred or unsupported.
+shadowing, mutation and loops remain deferred or unsupported.
 Lowering produces typed operations with source spans, ordered operands/call
-arguments, and structured conditional regions for boolean `and`/`or` and `if`/`else`.
+arguments, explicit returns, and structured conditional regions for boolean `and`/`or` and `if`/`else`.
 It requires immutable literal globals; unit/global block initializers are
 not lowered yet. An internal C11 backend emits verified IR, including fixed-width
 integer arithmetic and program entrypoint emission through `emit-c`.
@@ -52,7 +52,7 @@ diagnostics (including related notes where available); recovered syntax errors
 stop semantic analysis. Globals must be immutable, explicitly typed integer or
 boolean literals. Functions need explicit supported signatures and bounded
 expression bodies (including forward/recursive calls, local declarations, nested
-blocks, boolean short-circuiting, `if`/`else` expressions and empty void bodies).
+blocks, boolean short-circuiting, `if`/`else`, explicit returns and empty void bodies).
 Inferred globals, mutable globals, nonliteral global initializers, global unit
 values are currently rejected, along with the other
 unsupported forms listed above. This is not a backend compatibility check: it
@@ -198,7 +198,7 @@ This prints `42` on two lines. Locals require an explicit supported type and an
 initializer. Immutable scalar/unit values and existing function values (with
 unnamed parameter types, e.g. `let callback: (int) -> int = twice`) work; named
 local function definitions/closures, inferred locals, mutation, assignments,
-labels, explicit `return`, loops and memory-bearing values are rejected.
+labels, loops and memory-bearing values are rejected.
 Global block initializers remain unsupported by lowering.
 
 Boolean `and`/`or` evaluate the left operand exactly once, then evaluate the right
@@ -215,11 +215,11 @@ not add mutation or new global initializer forms.
 `if` conditions must be `bool` and execute exactly once. Only the selected branch
 executes, including its local initializers, calls, printing and arithmetic panics;
 both branches are typechecked. Braces are mandatory, with `else if` chains allowed.
-An explicit `else` requires matching branch result types (including `void` and
-function values). A surrounding result/argument/annotation type or either branch
+An explicit `else` requires matching result types on paths that continue (including
+`void` and function values); returning paths do not contribute a merge value. A surrounding result/argument/annotation type or either branch
 can supply the type context; two bare integer branches still need an explicit
 context. There are no implicit numeric conversions. Without `else`, the expression
-and its then-branch must return `void`. Each branch has its own lexical scope;
+is `void`, and its then-branch must either produce `void` or return from the function. Each branch has its own lexical scope;
 branch locals cannot escape or become visible in the other branch. Conditional
 regions nest with `and`/`or`, and IR verification rejects cross-branch references
 and escaping private values.
@@ -231,6 +231,34 @@ let main: () -> void = {
     if answer == 42 {@println(answer)}
 }
 ```
+
+Explicit `return expression` exits the enclosing function, even inside nested
+blocks, local initializers, call arguments, conditional branches or short-circuit
+RHS blocks. The expression is checked against the **function's result type**, not
+the surrounding block/argument type. It is evaluated once before returning;
+later effects in that execution path do not run. A bare `return` requires a
+`void` function; `return` with a void expression is also valid. Existing parser
+rules apply, including one-newline expression continuation; use `{return}` for a
+bare-return expression body before another declaration.
+
+```nov
+let magnitude: (n: int) -> int = {
+    if n < 0 {return -n}
+    n
+}
+```
+
+A branch that returns does not need to supply the conditional's value. An `if`
+without `else` can return early and still leave a reachable fallback, as above.
+If both branches return, the conditional does not continue. An `and`/`or` RHS may
+return, but the skipped-RHS path still continues with the boolean result. These
+rules do not fold constant conditions: both conditional paths are checked even
+when a condition is a literal. Statements after an unconditional return (including
+a nested block or `if` whose branches both return) are diagnosed as unreachable.
+Non-void functions still require a correctly typed final value on every path
+that reaches the end. IR verification checks return operands, signatures,
+region-private references and terminal tails; C emission merges only continuing
+paths and never reads a value from a returning path.
 
 Format files in place with `zig build run -- fmt file.nov`, or use
 `zig build run -- fmt --check file.nov` to check formatting without writing.

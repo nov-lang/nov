@@ -90,6 +90,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     _ = fixtures.add("print-program.nov", "let number: i32 = -42\nlet answer: () -> i32 = number\nlet main: () -> void = @println(true, answer())\n");
     _ = fixtures.add("checkout.nov", @embedFile("examples/checkout.nov"));
     _ = fixtures.add("if-program.nov", "let divide: (n: int) -> int = 1 / n\nlet main: () -> void = {\nlet n: int = if false {divide(0)} else if true {42} else {divide(0)}\nif n == 42 {@println(n)}\n}\n");
+    _ = fixtures.add("return-program.nov", "let f: (c: bool) -> int = {if c {{return 42}}\n1 / 0}\nlet main: () -> void = {let b: bool = false and {return}\n@println(f(true), b)\nreturn}\n");
+    _ = fixtures.add("return-invalid.nov", "let main: () -> void = return true\n");
+    _ = fixtures.add("return-unreachable.nov", "let main: () -> void = {return @println(true)\n@println(false)}\n");
     _ = fixtures.add("if-invalid.nov", "let main: () -> void = if true {} else {@println(missing)}\n");
     _ = fixtures.add("panic-program.nov", "let zero: i32 = 0\nlet divide: () -> i32 = 1 / zero\nlet main: () -> void = @println(divide())\n");
 
@@ -132,6 +135,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         .{ .name = "check rejects --check", .args = &.{ "check", "--check", "valid.nov" }, .exit_code = 1, .stderr_match = "--check" },
         .{ .name = "--check requires fmt", .args = &.{"--check"}, .exit_code = 1, .stderr_match = "--check" },
         .{ .name = "check valid syntax", .args = &.{ "check", "valid.nov" }, .exit_code = 0 },
+        .{ .name = "check semantic returns", .args = &.{ "check", "--semantic", "return-program.nov" }, .exit_code = 0 },
+        .{ .name = "check return signature diagnostic", .args = &.{ "check", "--semantic", "return-invalid.nov" }, .exit_code = 1, .stderr_match = "return-invalid.nov:1:31: error: literal does not match the annotated type" },
+        .{ .name = "emit rejects unreachable statement", .args = &.{ "emit-c", "return-unreachable.nov" }, .exit_code = 1, .stderr_match = "return-unreachable.nov:2:1: error: unreachable statement after return" },
         .{ .name = "check semantic if expressions", .args = &.{ "check", "--semantic", "if-program.nov" }, .exit_code = 0 },
         .{ .name = "check semantic unselected if branch", .args = &.{ "check", "--semantic", "if-invalid.nov" }, .exit_code = 1, .stderr_match = "unknown name" },
         .{ .name = "check remains syntax only", .args = &.{ "check", "syntax-only.nov" }, .exit_code = 0 },
@@ -177,6 +183,18 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
 
     // An isolated PATH exercises real `zig cc` discovery, independent of host CC.
     for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+        const returns = b.addRunArtifact(exe);
+        returns.step.name = b.fmt("CLI: early returns ({s})", .{mode});
+        returns.setCwd(fixtures.getDirectory());
+        returns.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+        returns.setEnvironmentVariable("NOV_CC", "");
+        returns.setEnvironmentVariable("CC", "");
+        returns.addArgs(&.{ "run", "return-program.nov" });
+        if (mode.len != 0) returns.addArg(mode);
+        returns.expectExitCode(0);
+        returns.expectStdOutEqual("42 false\n");
+        returns.expectStdErrEqual("");
+        test_step.dependOn(&returns.step);
         const conditional = b.addRunArtifact(exe);
         conditional.step.name = b.fmt("CLI: if expressions ({s})", .{mode});
         conditional.setCwd(fixtures.getDirectory());

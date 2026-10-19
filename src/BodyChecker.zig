@@ -97,6 +97,7 @@ fn checkInner(module: *Module, ir: *Ir, types: []const ?Ir.TypeId, id: Module.De
         return false;
     }
     const annotation = module.tokenSpan(if (proto.ast.return_type) |node| module.ast.firstToken(node) else proto.lparen);
+    context.return_type = .{ .ty = ty.function.result, .annotation = annotation };
     return (try context.expression(full.ast.init_node, .{ .ty = ty.function.result, .annotation = annotation }, 0)) != null;
 }
 
@@ -105,6 +106,11 @@ const Context = struct {
     ir: *Ir,
     types: []const ?Ir.TypeId,
     emitter: ?*Emitter = null,
+    return_type: Known = undefined,
+    // Termination is independent of the contextual value type. A returning
+    // expression has no merge value, and enclosing expressions alias its exit.
+    terminated: bool = false,
+    terminal: ?Ir.ValueId = null,
     bindings: std.StringHashMapUnmanaged(Binding) = .empty,
     locals: std.ArrayList([]const u8) = .empty,
 
@@ -163,6 +169,7 @@ const Context = struct {
         // Publish only after checking/evaluating the initializer: no self or
         // forward local references, and initialization happens exactly once.
         if (try self.expression(decl.init_node, known, depth + 1) == null) return false;
+        if (self.terminated) return true;
         try self.bindLocal(name, .{ .known = known, .initializer = decl.init_node, .name_span = name_span });
         return true;
     }
@@ -175,6 +182,7 @@ const Context = struct {
         const start = self.locals.items.len;
         defer self.restoreScope(start);
         for (block.ast.statements, 0..) |statement, i| {
+            if (self.terminated) return self.fail(.unreachable_code, statement, null);
             if (ast.nodes.items(.tag)[statement] == .decl) {
                 if (!try self.local(statement, depth)) return null;
             } else if (i + 1 == block.ast.statements.len) {
@@ -183,9 +191,10 @@ const Context = struct {
                 return ty;
             } else {
                 const ty = (try self.expression(statement, null, depth + 1)) orelse return null;
-                if (self.ir.getType(ty).? != .void) return self.fail(.unused_block_value, statement, null);
+                if (!self.terminated and self.ir.getType(ty).? != .void) return self.fail(.unused_block_value, statement, null);
             }
         }
+        if (self.terminated) return if (expected) |want| want.ty else try self.ir.internType(.void);
         return self.fit(try self.ir.internType(.void), expected, node);
     }
 
@@ -221,11 +230,13 @@ const Context = struct {
     }
 
     fn fail(self: *Context, tag: Module.Diagnostic.Tag, node: Ast.Node.Index, related: ?Module.Span) Error!?Ir.TypeId {
-        try self.module.diagnostics.append(self.module.allocator, .{ .tag = tag, .span = self.span(node), .related = related });
+        const location = if (tag == .unreachable_code) self.module.tokenSpan(self.module.ast.firstToken(node)) else self.span(node);
+        try self.module.diagnostics.append(self.module.allocator, .{ .tag = tag, .span = location, .related = related });
         return null;
     }
 
     fn fit(self: *Context, ty: Ir.TypeId, expected: ?Known, node: Ast.Node.Index) Error!?Ir.TypeId {
+        if (self.terminated) return if (expected) |want| want.ty else ty;
         if (expected) |want| {
             if (ty != want.ty) return self.fail(.expression_type_mismatch, node, want.annotation);
         }
@@ -406,8 +417,15 @@ const Context = struct {
     }
 
     fn expression(self: *Context, node: Ast.Node.Index, expected: ?Known, depth: usize) Error!?Ir.TypeId {
-        const ty = (try self.expressionInner(node, expected, depth)) orelse return null;
-        if (self.emitter != null and !try self.emitNode(node, ty)) return null;
+        const ty = if (self.terminated)
+            (if (expected) |want| want.ty else try self.ir.internType(.void))
+        else
+            (try self.expressionInner(node, expected, depth)) orelse return null;
+        if (self.emitter) |emitter| {
+            if (self.terminated) {
+                try emitter.values.put(emitter.allocator, node, self.terminal.?);
+            } else if (!try self.emitNode(node, ty)) return null;
+        }
         return ty;
     }
 
@@ -439,6 +457,21 @@ const Context = struct {
                 if (std.mem.startsWith(u8, name, "@\"")) return self.fail(.unsupported_name, node, null);
                 return self.fail(if (isPrimitive(name)) .unsupported_body_expression else .unknown_name, node, null);
             },
+            .@"return" => {
+                if (data.rhs != 0) {
+                    if (try self.expression(data.rhs, self.return_type, depth + 1) == null) return null;
+                    if (self.terminated) return self.return_type.ty;
+                } else if (self.ir.getType(self.return_type.ty).? != .void) {
+                    return self.fail(.expression_type_mismatch, node, self.return_type.annotation);
+                }
+                const unit = try self.ir.internType(.void);
+                if (self.emitter) |emitter| {
+                    try emitter.record(node, unit, self.irSpan(node), .{ .return_value = if (data.rhs != 0) try emitter.value(data.rhs) else null });
+                    self.terminal = try emitter.value(node);
+                }
+                self.terminated = true;
+                return if (expected) |want| want.ty else unit;
+            },
             .number_literal => return self.fail(.literal_needs_type, node, null),
             .char_literal, .string_literal => return self.fail(.unsupported_literal, node, null),
             .block, .block_two, .block_newline, .block_two_newline => return self.blockExpression(node, expected, depth),
@@ -446,28 +479,38 @@ const Context = struct {
                 const branch = ast.fullIf(node).?.ast;
                 const boolean = try self.ir.internType(.boolean);
                 const condition = try self.expression(branch.cond_expr, .{ .ty = boolean }, depth + 1);
+                if (self.terminated) return if (expected) |want| want.ty else boolean;
                 const result: ?Known = if (branch.else_expr == 0)
                     .{ .ty = try self.ir.internType(.void), .annotation = self.span(node) }
                 else
                     hint;
                 const then_start: u32 = if (self.emitter) |emitter| @intCast(emitter.instructions.items.len) else 0;
                 const then_ty = try self.expression(branch.then_expr, result, depth + 1);
+                const then_returns = self.terminated;
+                self.terminated = false;
                 const else_start: u32 = if (self.emitter) |emitter| @intCast(emitter.instructions.items.len) else 0;
                 const else_ty = if (branch.else_expr != 0)
                     try self.expression(branch.else_expr, result, depth + 1)
                 else
                     try self.ir.internType(.void);
                 if (condition == null or then_ty == null or else_ty == null) return null;
-                if (then_ty.? != else_ty.?) return self.fail(.expression_type_mismatch, branch.else_expr, self.span(branch.then_expr));
-                if (try self.fit(then_ty.?, expected, node) == null) return null;
-                if (self.emitter) |emitter| try emitter.record(node, then_ty.?, self.irSpan(node), .{ .branch = .{
-                    .condition = try emitter.value(branch.cond_expr),
-                    .then_start = then_start,
-                    .else_start = else_start,
-                    .then_value = try emitter.value(branch.then_expr),
-                    .else_value = if (branch.else_expr != 0) try emitter.value(branch.else_expr) else null,
-                } });
-                return then_ty;
+                const else_returns = self.terminated;
+                self.terminated = then_returns and else_returns;
+                const merged = if (self.terminated) try self.ir.internType(.void) else if (then_returns) else_ty.? else then_ty.?;
+                if (!then_returns and !else_returns and then_ty.? != else_ty.?) return self.fail(.expression_type_mismatch, branch.else_expr, self.span(branch.then_expr));
+                if (try self.fit(merged, expected, node) == null) return null;
+                if (self.emitter) |emitter| {
+                    try emitter.record(node, merged, self.irSpan(node), .{ .branch = .{
+                        .returns = self.terminated,
+                        .condition = try emitter.value(branch.cond_expr),
+                        .then_start = then_start,
+                        .else_start = else_start,
+                        .then_value = try emitter.value(branch.then_expr),
+                        .else_value = if (branch.else_expr != 0) try emitter.value(branch.else_expr) else null,
+                    } });
+                    if (self.terminated) self.terminal = try emitter.value(node);
+                }
+                return if (self.terminated) (if (expected) |want| want.ty else merged) else merged;
             },
             .add, .sub, .mul, .div, .mod => {
                 const integer_context = if (expected) |want| (if (self.ir.getType(want.ty).? == .integer) expected else null) else null;
@@ -490,9 +533,9 @@ const Context = struct {
             },
             .bool_and, .bool_or, .bool_not => {
                 const boolean = try self.ir.internType(.boolean);
-                if (try self.fit(boolean, expected, node) == null) return null;
                 const operand: Known = .{ .ty = boolean, .annotation = if (expected) |want| want.annotation else null };
                 const lhs = if (ast.nodes.items(.tag)[node] != .bool_not) try self.expression(data.lhs, operand, depth + 1) else boolean;
+                if (self.terminated) return boolean;
                 const rhs_start: u32 = if (self.emitter) |emitter| @intCast(emitter.instructions.items.len) else 0;
                 const rhs = try self.expression(data.rhs, operand, depth + 1);
                 if (lhs == null or rhs == null) return null;
@@ -505,7 +548,8 @@ const Context = struct {
                         .rhs = try emitter.value(data.rhs),
                     } });
                 }
-                return boolean;
+                if (ast.nodes.items(.tag)[node] != .bool_not) self.terminated = false;
+                return self.fit(boolean, expected, node);
             },
             .negation, .bit_not => {
                 const integer_context = if (expected) |want| (if (self.ir.getType(want.ty).? == .integer) expected else null) else null;
@@ -526,7 +570,7 @@ const Context = struct {
                             continue;
                         };
                         const arg_ty = self.ir.getType(arg_type).?;
-                        if (arg_ty != .boolean and arg_ty != .integer) {
+                        if (!self.terminated and arg_ty != .boolean and arg_ty != .integer) {
                             _ = try self.fail(.unsupported_body_expression, arg, null);
                             valid = false;
                         }
@@ -535,6 +579,7 @@ const Context = struct {
                     return self.fit(try self.ir.internType(.void), expected, node);
                 }
                 const callee = (try self.expression(call.ast.fn_expr, null, depth + 1)) orelse return null;
+                if (self.terminated) return if (expected) |want| want.ty else try self.ir.internType(.void);
                 const origin = try self.probe(call.ast.fn_expr, depth + 1);
                 const annotation = if (origin) |known| known.annotation else null;
                 const ty = self.ir.getType(callee).?;
@@ -551,6 +596,65 @@ const Context = struct {
         }
     }
 };
+
+test "returns use enclosing signatures and merge only continuing paths" {
+    var module = try Module.init(std.testing.allocator, "return.nov",
+        \\let direct: () -> int = return 42
+        \\let unit: () -> void = {return}
+        \\let effect: () -> void = return @println(true)
+        \\let fallback: (c: bool) -> int = {if c {return 1}
+        \\    2}
+        \\let nested: (c: bool) -> int = {if c {{return 3}} else {return 4}}
+        \\let mixed: (c: bool) -> int = if c {return 5} else {6}
+        \\let reverse: (c: bool) -> int = if c {7} else {return 8}
+        \\let typed: (c: bool, n: int) -> void = {
+        \\    let x: bool = if c {return} else {true}
+        \\    @println(if x {n} else {return})
+        \\}
+        \\let short: (c: bool) -> int = {let b: bool = c and {return 9}
+        \\    if b {return 10}
+        \\    11}
+        \\let init: () -> int = {let x: bool = {return 12}
+        \\}
+        \\let nestedreturn: () -> int = return {return 13}
+        \\let condition: () -> int = if {return 14} {} else {}
+        \\let negate: () -> int = !{return 15}
+    );
+    defer module.deinit();
+    var sema = try @import("Sema.zig").analyzeFunctions(&module);
+    defer sema.deinit();
+    try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+    try std.testing.expect(!module.hasErrors());
+}
+
+test "return diagnostics retain value locations signature notes and reachability" {
+    const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag, token: []const u8 };
+    for ([_]Case{
+        .{ .source = "let f: () -> int = return", .tag = .expression_type_mismatch, .token = "return" },
+        .{ .source = "let f: () -> int = return false", .tag = .literal_type_mismatch, .token = "false" },
+        .{ .source = "let f: () -> void = return 1", .tag = .literal_type_mismatch, .token = "1" },
+        .{ .source = "let f: () -> int = return missing", .tag = .unknown_name, .token = "missing" },
+        .{ .source = "let f: () -> int = {let b: bool = {return false}\n1}", .tag = .literal_type_mismatch, .token = "false" },
+        .{ .source = "let f: () -> int = {return 1\n2}", .tag = .unreachable_code, .token = "2" },
+        .{ .source = "let f: () -> int = {{return 1}\nlet n: int = 2\n}", .tag = .unreachable_code, .token = "let" },
+        .{ .source = "let f: (c: bool) -> int = {if c {return 1} else {return 2}\n3}", .tag = .unreachable_code, .token = "3" },
+        .{ .source = "let f: (c: bool) -> int = {if c {return 1}}", .tag = .expression_type_mismatch, .token = "if" },
+        .{ .source = "let f: () -> int = if true {return 1} else {return false}", .tag = .literal_type_mismatch, .token = "false" },
+    }) |case| {
+        var module = try Module.init(std.testing.allocator, "return.nov", case.source);
+        defer module.deinit();
+
+        try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+        var sema = try @import("Sema.zig").analyzeFunctions(&module);
+        defer sema.deinit();
+        try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+        try std.testing.expect(module.hasErrors());
+        const diagnostic = module.diagnostics.items[0];
+        try std.testing.expectEqual(case.tag, diagnostic.tag);
+        try std.testing.expectEqualStrings(case.token, module.sourceSlice(diagnostic.span).?);
+        if (case.tag == .literal_type_mismatch or case.tag == .expression_type_mismatch) try std.testing.expect(diagnostic.related != null);
+    }
+}
 
 test "if branches infer bidirectionally and keep separate lexical scopes" {
     var module = try Module.init(std.testing.allocator, "if.nov",
@@ -775,7 +879,6 @@ test "body errors identify mismatched returns operands names and calls" {
 test "control flow and parameter shadowing stay explicitly unsupported" {
     for ([_][]const u8{
         "let f: () -> i32 = label: {42}",
-        "let f: (value: i32) -> i32 = {return value}",
         "let f: (value: i32) = {value += 1}",
     }) |source| {
         var module = try Module.init(std.testing.allocator, "unsupported.nov", source);
