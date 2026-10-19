@@ -7,6 +7,7 @@ const Formatter = @import("Formatter.zig");
 const Module = @import("Module.zig");
 const Dependencies = @import("Dependencies.zig");
 const Lowering = @import("Lowering.zig");
+const CEmitter = @import("CEmitter.zig");
 
 const params = clap.parseParamsComptime(
     \\-h, --help             Display this help and exit.
@@ -21,9 +22,10 @@ fn usage(writer: *std.Io.Writer) !void {
     try writer.writeAll(
         \\Usage: nov check [--semantic] <file>...
         \\       nov fmt [--check] <file>...
+        \\       nov emit-c <file>
         \\
         \\Check syntax, or the bounded semantic subset with --semantic.
-        \\Compilation is not implemented yet.
+        \\Emit program C11 source to stdout with emit-c; no build or execution.
         \\
         \\Options:
         \\
@@ -66,6 +68,7 @@ pub fn main(init: std.process.Init) !u8 {
     }
 
     const args = res.positionals[0];
+    const is_emit = args.len != 0 and std.mem.eql(u8, args[0], "emit-c");
     const is_fmt = args.len != 0 and std.mem.eql(u8, args[0], "fmt");
     if (res.args.semantic != 0 and (args.len == 0 or !std.mem.eql(u8, args[0], "check"))) {
         try stderr.writeAll("error: --semantic requires the check command\n");
@@ -75,8 +78,22 @@ pub fn main(init: std.process.Init) !u8 {
         try stderr.writeAll("error: --check requires the fmt command\n");
         return 1;
     }
+    if (is_emit) {
+        if (args.len != 2) {
+            try stderr.writeAll("error: emit-c requires exactly one file\n");
+            return 1;
+        }
+        var buffer: [4096]u8 = undefined;
+        var stdout = std.Io.File.stdout().writer(init.io, &buffer);
+        const valid = emitFile(init.io, init.gpa, args[1], stderr, &stdout.interface) catch |err| {
+            try stderr.print("{s}: error: {s}\n", .{ args[1], @errorName(err) });
+            return 1;
+        };
+        try stdout.interface.flush();
+        return if (valid) 0 else 1;
+    }
     if (args.len < 2 or (!is_fmt and !std.mem.eql(u8, args[0], "check"))) {
-        if (args.len != 0) try stderr.writeAll("error: expected 'check' or 'fmt' followed by one or more files\n");
+        if (args.len != 0) try stderr.writeAll("error: expected 'check', 'fmt', or 'emit-c' followed by files\n");
         try usage(stderr);
         return 1;
     }
@@ -126,6 +143,48 @@ fn processFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, stder
     return true;
 }
 
+fn emitFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, stderr: *std.Io.Writer, stdout: *std.Io.Writer) !bool {
+    const source = try std.Io.Dir.cwd().readFileAllocOptions(io, path, allocator, .limited(1024 * 1024), .of(u8), 0);
+    defer allocator.free(source);
+    if (std.mem.indexOfScalar(u8, source, 0) != null) return error.InvalidSource;
+    return emitSource(allocator, path, source, stderr, stdout);
+}
+
+fn emitSource(allocator: std.mem.Allocator, path: []const u8, source: [:0]const u8, stderr: *std.Io.Writer, stdout: *std.Io.Writer) !bool {
+    var module = try Module.init(allocator, path, source);
+    defer module.deinit();
+    if (!module.hasErrors()) {
+        var dependencies = try Dependencies.analyze(&module);
+        defer dependencies.deinit();
+        if (!module.hasErrors()) {
+            var result = try Lowering.lower(&module);
+            defer result.deinit();
+            if (!module.hasErrors()) {
+                var diagnostic: CEmitter.Diagnostic = undefined;
+                const c_source = CEmitter.emitProgram(allocator, &result.ir, &diagnostic) catch |err| switch (err) {
+                    error.UnsupportedIntegerWidth, error.MissingEntrypoint, error.InvalidEntrypoint => {
+                        if (err == error.MissingEntrypoint) {
+                            if (module.lookup("main")) |id| {
+                                const declaration = module.getDeclaration(id).?;
+                                diagnostic.reason = .entrypoint_signature;
+                                diagnostic.span = .{ .start = declaration.name_span.start, .end = declaration.name_span.end };
+                            }
+                        }
+                        try Diagnostics.renderBackend(&module, diagnostic, stderr);
+                        return false;
+                    },
+                    else => return err,
+                };
+                defer allocator.free(c_source);
+                try stdout.writeAll(c_source);
+                return true;
+            }
+        }
+    }
+    try Diagnostics.renderModule(&module, stderr);
+    return false;
+}
+
 fn checkSemantic(allocator: std.mem.Allocator, path: []const u8, source: []const u8, stderr: *std.Io.Writer) !bool {
     var module = try Module.init(allocator, path, source);
     defer module.deinit();
@@ -164,6 +223,41 @@ fn replaceFormattedFile(io: std.Io, allocator: std.mem.Allocator, path: []const 
     defer allocator.free(current);
     if (!std.mem.eql(u8, original, current)) return error.SourceChanged;
     try atomic.replace(io);
+}
+
+test "emit-c buffers source and renders frontend entrypoint and backend failures" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { source: [:0]const u8, message: ?[]const u8 = null }{
+        .{ .source = "let main: () -> void = {}" },
+        .{ .source = "", .message = "requires a root function 'main'" },
+        .{ .source = "let main: i32 = 1", .message = "must have type () -> void" },
+        .{ .source = "let main: () -> bool = true", .message = "must have type () -> void" },
+        .{ .source = "let main: (x: bool) -> void = {}", .message = "must have type () -> void" },
+        .{ .source = "let broken =", .message = "expected" },
+        .{ .source = "let main: () -> void = absent()", .message = "unknown name" },
+        .{ .source = "let main: () -> void = {}\r\n\tlet wide: (x: i128) -> i128 = x", .message = "C backend only supports" },
+        .{ .source = "let wide: () -> u128 = 1\nlet main: () -> void = {}", .message = "C backend only supports" },
+    };
+    for (cases) |case| {
+        var diagnostics = std.Io.Writer.Allocating.init(allocator);
+        defer diagnostics.deinit();
+        var output = std.Io.Writer.Allocating.init(allocator);
+        defer output.deinit();
+        try std.testing.expectEqual(case.message == null, try emitSource(allocator, "input.nov", case.source, &diagnostics.writer, &output.writer));
+        if (case.message) |message| {
+            try std.testing.expectEqualStrings("", output.written());
+            try std.testing.expect(std.mem.indexOf(u8, diagnostics.written(), message) != null);
+            try std.testing.expect(std.mem.indexOf(u8, diagnostics.written(), "input.nov:") != null);
+            try std.testing.expect(std.mem.indexOf(u8, diagnostics.written(), "^") != null);
+            if (std.mem.indexOf(u8, case.source, "\r\n") != null) {
+                try std.testing.expect(std.mem.indexOf(u8, diagnostics.written(), "input.nov:2:32: error:") != null);
+                try std.testing.expect(std.mem.indexOf(u8, diagnostics.written(), "\n\t" ++ " " ** 30 ++ "^\n") != null);
+            }
+        } else {
+            try std.testing.expectEqualStrings("", diagnostics.written());
+            try std.testing.expect(std.mem.indexOf(u8, output.written(), "int main(void)") != null);
+        }
+    }
 }
 
 test "formatting refuses to overwrite a changed source" {

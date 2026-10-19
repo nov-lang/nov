@@ -96,6 +96,13 @@ pub fn renderModule(module: *const Module, writer: *std.Io.Writer) !void {
     }
 }
 
+pub fn renderBackend(module: *const Module, diagnostic: @import("CEmitter.zig").Diagnostic, writer: *std.Io.Writer) !void {
+    const location = Location.init(module.ast.source, diagnostic.span.start);
+    try location.renderPrefix(module.path, "error", writer);
+    try writer.writeAll(diagnostic.reason.message());
+    try location.renderExcerpt(module.ast.source, diagnostic.span.end - diagnostic.span.start, writer);
+}
+
 pub fn render(ast: Ast, path: []const u8, writer: *std.Io.Writer) !void {
     for (ast.errors) |parse_error| {
         const offset = ast.errorOffset(parse_error);

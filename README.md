@@ -38,8 +38,8 @@ deferred or unsupported. Straight-line lowering now produces typed operations
 with source spans and ordered operands/call arguments. It requires immutable
 literal globals; unit/global block initializers and short-circuit `and`/`or` are
 not lowered yet. An internal C11 backend emits verified IR, including fixed-width
-integer arithmetic; CLI compilation/execution, printing and entrypoint emission
-remain unimplemented. Plain `check` remains syntax-only.
+integer arithmetic and program entrypoint emission through `emit-c`.
+CLI compilation/execution and printing remain unimplemented. Plain `check` remains syntax-only.
 
 Use `zig build run -- check --semantic file.nov` for the current bounded
 semantic/lowering subset. It runs declaration collection, initializer dependency
@@ -55,6 +55,27 @@ unsupported forms listed above. This is not a backend compatibility check: it
 does not emit C, validate C integer widths, require `main`, build, or execute a
 program. Each input file is checked independently; any failed/unreadable input
 makes the command fail, without modifying files.
+
+Emit a single-file program as C11 with `zig build run -- emit-c file.nov`
+(or `nov emit-c file.nov` after installation). C source goes to stdout; diagnostics
+go to stderr with a nonzero exit status and no partial source on analysis or
+emission failure. Exactly one input file is required; `--semantic` and `--check`
+are not accepted. This command does not modify files, invoke a C compiler, or run
+the program. Redirect stdout to a `.c` file if desired.
+
+Programs require a root function named `main` with exactly type `() -> void`:
+
+```nov
+let helper: () -> void = {}
+let main: () -> void = helper()
+```
+
+The C wrapper exits 0 when Nov `main` returns; arithmetic panics exit 1 and report
+to stderr. Library `CEmitter.emit` still emits no C `main`; only
+`CEmitter.emitProgram` adds the wrapper. Backend integer widths are restricted to
+8, 16, 32 and 64 bits, including nested function signatures, with source diagnostics
+for unsupported widths. Printing, build/run commands and compiler discovery remain
+outside this slice.
 
 Format files in place with `zig build run -- fmt file.nov`, or use
 `zig build run -- fmt --check file.nov` to check formatting without writing.

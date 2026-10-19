@@ -8,27 +8,33 @@
 //! Arithmetic uses unsigned 32/64-bit working types, avoiding signed overflow
 //! and narrow integer promotions. Conversion back to signed relies on the
 //! modular unsigned-to-signed conversion provided by GCC, Clang and MSVC.
-//! Widths other than 8/16/32/64, entrypoints and printing remain unsupported.
+//! Widths other than 8/16/32/64 and printing remain unsupported.
 const std = @import("std");
 const Ir = @import("Ir.zig");
 
 pub const Error = Ir.VerifyError || std.mem.Allocator.Error || error{
     UnsupportedIntegerWidth,
+    MissingEntrypoint,
+    InvalidEntrypoint,
 };
 
 /// Describes the first construct the backend rejected. `span` indexes the source
 /// the IR was lowered from, which this backend never needs to read.
 pub const Diagnostic = struct {
     reason: Reason,
-    function: Ir.FunctionId,
+    function: ?Ir.FunctionId,
     span: Ir.Span,
 
     pub const Reason = enum {
         integer_width_unsupported,
+        entrypoint_missing,
+        entrypoint_signature,
 
         pub fn message(reason: Reason) []const u8 {
             return switch (reason) {
                 .integer_width_unsupported => "C backend only supports 8, 16, 32 and 64-bit integers",
+                .entrypoint_missing => "program requires a root function 'main' with type () -> void",
+                .entrypoint_signature => "program entrypoint 'main' must have type () -> void",
             };
         }
     };
@@ -54,10 +60,29 @@ pub fn emit(allocator: std.mem.Allocator, ir: *const Ir, diagnostic: ?*Diagnosti
     return out.toOwnedSlice();
 }
 
+/// Emits a program, leaving library emission through `emit` unchanged.
+pub fn emitProgram(allocator: std.mem.Allocator, ir: *const Ir, diagnostic: ?*Diagnostic) Error![]u8 {
+    try ir.verify();
+    for (ir.functions.items, 0..) |function, i| {
+        if (!std.mem.eql(u8, function.name, "main")) continue;
+        const signature = ir.types.items[@intFromEnum(function.ty)].function;
+        if (signature.params.len != 0 or ir.types.items[@intFromEnum(signature.result)] != .void) {
+            return fail(diagnostic, .entrypoint_signature, .{ .function = @enumFromInt(i), .span = function.span });
+        }
+        const library = try emit(allocator, ir, diagnostic);
+        defer allocator.free(library);
+        return std.fmt.allocPrint(allocator, "{s}\nint main(void) {{\n    nov_main();\n    return 0;\n}}\n", .{library});
+    }
+    if (diagnostic) |d| d.* = .{ .reason = .entrypoint_missing, .function = null, .span = .{ .start = ir.source_len, .end = ir.source_len } };
+    return error.MissingEntrypoint;
+}
+
 fn fail(diagnostic: ?*Diagnostic, reason: Diagnostic.Reason, origin: Origin) Error {
     if (diagnostic) |d| d.* = .{ .reason = reason, .function = origin.function, .span = origin.span };
     return switch (reason) {
         .integer_width_unsupported => error.UnsupportedIntegerWidth,
+        .entrypoint_missing => error.MissingEntrypoint,
+        .entrypoint_signature => error.InvalidEntrypoint,
     };
 }
 
@@ -371,6 +396,46 @@ fn emitSource(source: []const u8, diagnostic: ?*Diagnostic) ![]u8 {
     return emit(test_gpa, &sema.ir, diagnostic);
 }
 
+test "program entrypoint is separate from library emission and propagates panic" {
+    for ([_]bool{ false, true }) |panic| {
+        const source = if (panic)
+            "let divide: () -> i32 = 1 / 0\nlet sink: (x: i32) -> void = {}\nlet main: () -> void = sink(divide())"
+        else
+            "let helper: () -> void = {}\nlet main: () -> void = helper()";
+        var module = try Module.init(test_gpa, "program.nov", source);
+        defer module.deinit();
+        var result = try Lowering.lower(&module);
+        defer result.deinit();
+        try std.testing.expect(!module.hasErrors());
+        const library = try emit(test_gpa, &result.ir, null);
+        defer test_gpa.free(library);
+        try std.testing.expect(std.mem.indexOf(u8, library, "int main(void)") == null);
+        const program = try emitProgram(test_gpa, &result.ir, null);
+        defer test_gpa.free(program);
+        try std.testing.expect(std.mem.startsWith(u8, program, library));
+        try compileAndRunExpected(program, "typedef int nonempty_translation_unit;\n", if (panic) 1 else 0, "", if (panic) "panic: division by zero\n" else "");
+    }
+}
+
+test "program entrypoint validation reports missing and wrong signatures" {
+    const cases = [_]struct { source: []const u8, expected: Error }{
+        .{ .source = "", .expected = error.MissingEntrypoint },
+        .{ .source = "let other: () -> void = {}", .expected = error.MissingEntrypoint },
+        .{ .source = "let main: () -> bool = true", .expected = error.InvalidEntrypoint },
+        .{ .source = "let main: (x: bool) -> void = {}", .expected = error.InvalidEntrypoint },
+    };
+    for (cases) |case| {
+        var module = try Module.init(test_gpa, "program.nov", case.source);
+        defer module.deinit();
+        var result = try Lowering.lower(&module);
+        defer result.deinit();
+        try std.testing.expect(!module.hasErrors());
+        var diagnostic: Diagnostic = undefined;
+        try std.testing.expectError(case.expected, emitProgram(test_gpa, &result.ir, &diagnostic));
+        try std.testing.expect(diagnostic.span.end <= case.source.len);
+    }
+}
+
 test "empty module emits only the prelude" {
     const c = try emitSource("", null);
     defer test_gpa.free(c);
@@ -496,7 +561,7 @@ test "unsupported integer widths are rejected wherever they are reachable" {
     var diagnostic: Diagnostic = undefined;
     try std.testing.expectError(error.UnsupportedIntegerWidth, emitSource("let wide: (x: i128) -> i128 = x", &diagnostic));
     try std.testing.expectEqual(Diagnostic.Reason.integer_width_unsupported, diagnostic.reason);
-    try std.testing.expectEqual(@as(u32, 0), @intFromEnum(diagnostic.function));
+    try std.testing.expectEqual(@as(u32, 0), @intFromEnum(diagnostic.function.?));
     // Nested inside a function type that only appears as a parameter.
     try std.testing.expectError(error.UnsupportedIntegerWidth, emitSource("let f: (g: (u128) -> bool) -> bool = true", null));
 }
@@ -519,7 +584,7 @@ test "non-byte-sized integer pool entries do not matter unless reachable" {
     try ir.setFunctionBody(odd_function, &.{.{ .ty = void_type, .span = .{ .start = 0, .end = 0 }, .op = .{ .constant = unit } }}, @enumFromInt(0));
     var diagnostic: Diagnostic = undefined;
     try std.testing.expectError(error.UnsupportedIntegerWidth, emit(test_gpa, &ir, &diagnostic));
-    try std.testing.expectEqual(@as(u32, 1), @intFromEnum(diagnostic.function));
+    try std.testing.expectEqual(@as(u32, 1), @intFromEnum(diagnostic.function.?));
 }
 
 test "unverified IR is rejected before emission" {
