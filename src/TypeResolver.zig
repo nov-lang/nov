@@ -82,6 +82,12 @@ fn resolveDepth(module: *Module, ir: *Ir, node: Ast.Node.Index, depth: usize) Er
     if (std.mem.eql(u8, name, "true") or std.mem.eql(u8, name, "false")) return diagnose(module, node, .not_a_type);
     if (std.mem.eql(u8, name, "bool")) return try ir.internType(.boolean);
     if (std.mem.eql(u8, name, "void")) return try ir.internType(.void);
+    if (std.mem.eql(u8, name, "int") or std.mem.eql(u8, name, "uint")) {
+        return try ir.internType(.{ .integer = .{
+            .signedness = if (name[0] == 'i') .signed else .unsigned,
+            .bits = Ir.native_pointer_bits,
+        } });
+    }
     inline for (.{ "i8", "i16", "i32", "i64", "i128", "u8", "u16", "u32", "u64", "u128" }) |integer| {
         if (std.mem.eql(u8, name, integer)) return try ir.internType(.{ .integer = .{
             .signedness = if (integer[0] == 'i') .signed else .unsigned,
@@ -141,6 +147,24 @@ test "explicit primitive types have canonical identities and widths" {
         try std.testing.expectEqual(try ir.internType(ty), id);
         try std.testing.expectEqual(id, (try resolve(&module, &ir, node)).?);
     }
+    try std.testing.expect(!module.hasErrors());
+    try ir.verify();
+}
+
+test "native integer aliases canonicalize with fixed width types and signatures" {
+    const source = try std.fmt.allocPrint(std.testing.allocator, "let a: int\nlet b: i{d}\nlet c: uint\nlet d: u{d}\nlet e: (int, (uint) -> int) -> uint\nlet f: (i{d}, (u{d}) -> i{d}) -> u{d}", .{ @bitSizeOf(usize), @bitSizeOf(usize), @bitSizeOf(usize), @bitSizeOf(usize), @bitSizeOf(usize), @bitSizeOf(usize) });
+    defer std.testing.allocator.free(source);
+    var module = try Module.init(std.testing.allocator, "native.nov", source);
+    defer module.deinit();
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    var ids: [6]Ir.TypeId = undefined;
+    for (module.declarations.items, &ids) |declaration, *id| {
+        id.* = (try resolve(&module, &ir, module.ast.decl(declaration.node).ast.type_node)).?;
+    }
+    try std.testing.expectEqual(ids[0], ids[1]);
+    try std.testing.expectEqual(ids[2], ids[3]);
+    try std.testing.expectEqual(ids[4], ids[5]);
     try std.testing.expect(!module.hasErrors());
     try ir.verify();
 }
@@ -215,7 +239,7 @@ test "unsupported unknown and non-type forms have source diagnostics" {
         try std.testing.expectEqualStrings(case.span, module.sourceSlice(diagnostic.span).?);
         try std.testing.expect(diagnostic.related == null);
     }
-    for ([_][]const u8{ "int", "uint", "float", "f16", "f32", "f64", "f80", "f128", "string", "rune", "type" }) |name| {
+    for ([_][]const u8{ "float", "f16", "f32", "f64", "f80", "f128", "string", "rune", "type" }) |name| {
         const source = try std.fmt.allocPrint(std.testing.allocator, "let value: {s}", .{name});
         defer std.testing.allocator.free(source);
         var module = try Module.init(std.testing.allocator, "unsupported.nov", source);
@@ -267,7 +291,7 @@ test "individual parameter and result failures never intern a successful signatu
         .{ .source = "let value: (x: void)", .tag = .invalid_parameter_type },
         .{ .source = "let value: (Missing)", .tag = .unknown_type },
         .{ .source = "let value: (i32) -> Missing", .tag = .unknown_type },
-        .{ .source = "let value: (i32) -> int", .tag = .unsupported_type },
+        .{ .source = "let value: (i32) -> float", .tag = .unsupported_type },
         .{ .source = "let value: (true)", .tag = .not_a_type },
         .{ .source = "let value: ((void))", .tag = .invalid_parameter_type },
     }) |case| {

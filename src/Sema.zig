@@ -96,6 +96,48 @@ fn checkLiteral(self: *Sema, module: *Module, index: usize, initializer: Ast.Nod
     }
 }
 
+test "native aliases check literal boundaries without defaulting untyped globals" {
+    const signed_min: i128 = std.math.minInt(isize);
+    const signed_max: i128 = std.math.maxInt(isize);
+    const unsigned_max: u128 = std.math.maxInt(usize);
+    const Case = struct { name: []const u8, value: i128, valid: bool };
+    for ([_]Case{
+        .{ .name = "int", .value = signed_min, .valid = true },
+        .{ .name = "int", .value = signed_max, .valid = true },
+        .{ .name = "int", .value = signed_min - 1, .valid = false },
+        .{ .name = "int", .value = signed_max + 1, .valid = false },
+        .{ .name = "uint", .value = @intCast(unsigned_max), .valid = true },
+        .{ .name = "uint", .value = @intCast(unsigned_max + 1), .valid = false },
+        .{ .name = "uint", .value = -1, .valid = false },
+        .{ .name = "uint", .value = 0, .valid = true },
+    }) |case| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let value: {s} = {d}\nlet pending = 42", .{ case.name, case.value });
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "native.nov", source);
+        defer module.deinit();
+        var sema = try analyzeAnnotations(&module);
+        defer sema.deinit();
+        try std.testing.expectEqual(if (case.valid) Status.constant_checked else Status.failed, sema.entries[0].status);
+        try std.testing.expectEqual(Status.deferred, sema.entries[1].status);
+        try std.testing.expect(sema.entries[1].type_id == null);
+        if (case.valid) {
+            const constant = sema.ir.getConstant(sema.entries[0].constant.?).?;
+            try std.testing.expectEqual(Ir.native_pointer_bits, sema.ir.getType(constant.ty).?.integer.bits);
+            if (case.name[0] == 'i') {
+                try std.testing.expectEqual(case.value, constant.value.signed_integer);
+            } else {
+                try std.testing.expectEqual(@as(u128, @intCast(case.value)), constant.value.unsigned_integer);
+            }
+            try std.testing.expect(!module.hasErrors());
+        } else {
+            try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+            try std.testing.expectEqual(Module.Diagnostic.Tag.literal_out_of_range, module.diagnostics.items[0].tag);
+            try std.testing.expectEqualStrings(case.name, module.sourceSlice(module.diagnostics.items[0].related.?).?);
+        }
+        try sema.ir.verify();
+    }
+}
+
 test "explicit annotations check literals and preserve integer boundaries" {
     var module = try Module.init(std.testing.allocator, "literals.nov", "let small: i8 = -128\nlet byte: u8 = 0xff\nlet binary: i32 = 0b10\nlet octal: i32 = 0o10\nlet separated: i32 = 1_000\n" ++
         "let minimum: i128 = -170141183460469231731687303715884105728\nlet maximum: u128 = 340282366920938463463374607431768211455\n" ++
@@ -191,7 +233,7 @@ test "signatures are resolved but bodies and unannotated expressions stay deferr
 test "invalid annotations and unsupported literals never become checked constants" {
     for ([_][]const u8{
         "let x: Unknown = 1",
-        "let x: int = 1",
+        "let x: float = 1",
         "let f: (x: i32, x: i32) -> i32 = 1",
         "let x: i32 = 1e",
         "let x: i32 = 1.0",

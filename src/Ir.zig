@@ -9,6 +9,10 @@ constants: std.ArrayList(Constant) = .empty,
 source_len: u32 = 0,
 functions: std.ArrayList(Function) = .empty,
 
+/// The current pipeline targets the machine running Nov, not a separate target.
+/// Native aliases are canonical fixed-width integers once resolved.
+pub const native_pointer_bits = @bitSizeOf(usize);
+
 pub const TypeId = enum(u32) { _ };
 pub const ConstId = enum(u32) { _ };
 pub const FunctionId = enum(u32) { _ };

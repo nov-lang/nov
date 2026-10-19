@@ -29,18 +29,19 @@ be compiled and executed through the C11 backend. The new typed IR provides
 owned, canonical type/constant storage and verification. Internal module passes
 collect names and diagnose duplicate/unknown names and initializer dependency
 cycles for a bounded expression subset. Internal annotation analysis resolves
-explicit `bool`, `void`, fixed-width integer and function types, and checks integer
-and boolean literals against annotations. Bounded function-body checking binds
+explicit `bool`, `void`, fixed-width integer, native `int`/`uint` and function
+types, and checks integer and boolean literals against annotations. Bounded function-body checking binds
 parameters and checks integer arithmetic, boolean expressions, comparisons and
-calls against collected signatures, including recursive calls. Defaults, aliases,
-local declarations, shadowing, control flow and general block results remain
+calls against collected signatures, including recursive calls. Literal defaults,
+user-defined type aliases, local declarations, shadowing, control flow and general
+block results remain
 deferred or unsupported. Straight-line lowering now produces typed operations
 with source spans and ordered operands/call arguments. It requires immutable
 literal globals; unit/global block initializers and short-circuit `and`/`or` are
 not lowered yet. An internal C11 backend emits verified IR, including fixed-width
 integer arithmetic and program entrypoint emission through `emit-c`.
-`@print`/`@println` support booleans and explicitly typed fixed-width integers.
-Plain `check` remains syntax-only.
+`@print`/`@println` support booleans and explicitly typed integers, including
+`int`/`uint`. Plain `check` remains syntax-only.
 
 Use `zig build run -- check --semantic file.nov` for the current bounded
 semantic/lowering subset. It runs declaration collection, initializer dependency
@@ -63,6 +64,15 @@ go to stderr with a nonzero exit status and no partial source on analysis or
 emission failure. Exactly one input file is required; `--semantic` and `--check`
 are not accepted. This command does not modify files, invoke a C compiler, or run
 the program. Redirect stdout to a `.c` file if desired.
+
+The current target is native: `int`/`uint` resolve using the pointer width of the
+running Nov compiler (64 bits on a 64-bit target, 32 on a 32-bit target).
+There is no Nov cross-compilation option. All emitted C, including library output,
+contains a C11 `_Static_assert` that `sizeof(void *) * CHAR_BIT` matches that width.
+Compile emitted C for the same pointer width; a mismatched C compiler target is
+rejected rather than silently changing alias semantics. This guard applies even
+to programs without aliases, keeping one native-target contract without carrying
+source spelling through canonical IR.
 
 Build or run a single-file program (after `zig build`, use `zig-out/bin/nov`):
 
@@ -143,9 +153,22 @@ let main: () -> void = @println(true, answer())
 
 This outputs `true -42` followed by a newline. Bare integer literals such as
 `@println(42)` still require a type context: use a typed global, parameter, or
-function result. There is no default `int`/`uint` width. Strings/interpolation,
-function values and void arguments remain unsupported for printing; the C backend
+function result. Native aliases do not introduce bare-literal inference defaults.
+Strings/interpolation, function values and void arguments remain unsupported for
+printing; the C backend
 continues to reject widths other than 8/16/32/64.
+
+A runnable arithmetic example is [`examples/checkout.nov`](examples/checkout.nov):
+
+```sh
+nov run examples/checkout.nov
+# 3 6750
+```
+
+It computes the discounted total in cents for three items priced at 2500 each,
+using typed globals, parameters, function calls and printing. Quantity is printed
+as `uint`; arithmetic uses `int` consistently. No implicit signed/unsigned
+conversion is introduced; the count argument has its own `int` context.
 
 Format files in place with `zig build run -- fmt file.nov`, or use
 `zig build run -- fmt --check file.nov` to check formatting without writing.
@@ -692,14 +715,18 @@ zero flushes stdout, writes `panic: division by zero` or `panic: remainder by ze
 C arithmetic uses `uint32_t`/`uint64_t` working values to avoid signed overflow
 and narrow integer promotions. Conversion back to signed integers relies on the
 modular unsigned-to-signed conversion provided by GCC, Clang and MSVC. Shifts,
-128-bit and odd-width backend integers remain unsupported; `int`/`uint` widths
-are not yet decided. The wider type list below is a proposal.
+128-bit and odd-width backend integers remain unsupported. `int` and `uint` are
+signed and unsigned aliases of the native target's pointer-sized fixed-width
+integers: `i64`/`u64` on 64-bit targets and `i32`/`u32` on 32-bit targets. They have
+identical type identity, literal bounds, wrapping arithmetic and printing behavior
+to those fixed-width types, including in nested function signatures. They are not
+C `int`/`unsigned int`. Bare literals still require type context; native aliases do
+not select an inference default or add implicit integer conversions. The wider
+type list below is a proposal.
 
 TODO
 - c\_int, ...
 - u8, u16, u32, u64, u128, i8, i16, i32, i64, i128, f16, f32, f64, f80, f128
-  - int = i32 or i64 based on architecture
-  - uint = u32 or u64 based on architecture
   - float = f32 or f64 based on architecture
 
 ## Floats

@@ -88,6 +88,7 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     _ = fixtures.add("needs-format.nov", "let answer=1+2*3\n");
     _ = fixtures.add("let-only.nov", "let number: i32 = 42\n");
     _ = fixtures.add("print-program.nov", "let number: i32 = -42\nlet answer: () -> i32 = number\nlet main: () -> void = @println(true, answer())\n");
+    _ = fixtures.add("checkout.nov", @embedFile("examples/checkout.nov"));
     _ = fixtures.add("panic-program.nov", "let zero: i32 = 0\nlet divide: () -> i32 = 1 / zero\nlet main: () -> void = @println(divide())\n");
 
     const Case = struct {
@@ -172,6 +173,18 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
 
     // An isolated PATH exercises real `zig cc` discovery, independent of host CC.
     for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+        const checkout = b.addRunArtifact(exe);
+        checkout.step.name = b.fmt("CLI: native integer checkout ({s})", .{mode});
+        checkout.setCwd(fixtures.getDirectory());
+        checkout.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+        checkout.setEnvironmentVariable("NOV_CC", "");
+        checkout.setEnvironmentVariable("CC", "");
+        checkout.addArgs(&.{ "run", "checkout.nov" });
+        if (mode.len != 0) checkout.addArg(mode);
+        checkout.expectExitCode(0);
+        checkout.expectStdOutEqual("3 6750\n");
+        checkout.expectStdErrEqual("");
+        test_step.dependOn(&checkout.step);
         for ([_]bool{ false, true }) |panic| {
             const run = b.addRunArtifact(exe);
             run.step.name = b.fmt("CLI: run {s} ({s})", .{ if (panic) "panic" else "printed program", mode });

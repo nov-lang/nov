@@ -428,6 +428,8 @@ test "printing rejects unresolved literals non-scalars unsupported builtins and 
     const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag };
     for ([_]Case{
         .{ .source = "let f: () -> void = @println(1)", .tag = .literal_needs_type },
+        .{ .source = "let n: int = 1\nlet f: () -> void = @println(2)", .tag = .literal_needs_type },
+        .{ .source = "let n: uint = 1\nlet f: () -> int = n", .tag = .expression_type_mismatch },
         .{ .source = "let f: () -> void = @println(-1)", .tag = .literal_needs_type },
         .{ .source = "let f: () -> void = @println(\"text\")", .tag = .unsupported_literal },
         .{ .source = "let f: () -> void = @println({})", .tag = .unsupported_body_expression },
