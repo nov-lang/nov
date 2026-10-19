@@ -49,6 +49,103 @@ pub fn renderToArrayList(
     return Render.renderTree(&writer, self, fixups);
 }
 
+test "function prototype accessors expose parameters and return types" {
+    const Case = struct {
+        source: [:0]const u8,
+        names: []const ?[]const u8,
+        types: []const []const u8,
+        return_type: ?[]const u8,
+    };
+    const cases = [_]Case{
+        .{ .source = "let f: () = {}", .names = &.{}, .types = &.{}, .return_type = null },
+        .{ .source = "let f: (x: int) -> int = x", .names = &.{"x"}, .types = &.{"int"}, .return_type = "int" },
+        .{ .source = "let f: (int) = {}", .names = &.{null}, .types = &.{"int"}, .return_type = null },
+        .{ .source = "let f: (a: int, bool, b: *mut int) -> bool = true", .names = &.{ "a", null, "b" }, .types = &.{ "int", "bool", "*" }, .return_type = "bool" },
+        .{ .source = "let f: (\n a: int,\n b: bool,\n) = {}", .names = &.{ "a", "b" }, .types = &.{ "int", "bool" }, .return_type = null },
+        .{ .source = "let f: (callback: (x: int) -> int) = {}", .names = &.{"callback"}, .types = &.{"("}, .return_type = null },
+    };
+    for (cases) |case| {
+        var tree = try Parser.parse(std.testing.allocator, case.source);
+        defer tree.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+        const decl_node = tree.rootDecls()[0];
+        const declaration = tree.decl(decl_node);
+        const proto_node = declaration.ast.type_node;
+        const proto = tree.fullFnProto(proto_node).?;
+        try std.testing.expectEqual(proto_node, proto.ast.proto_node);
+        try std.testing.expectEqual(tree.nodes.items(.main_token)[proto_node], proto.lparen);
+        try std.testing.expectEqualStrings("(", tree.tokenSlice(proto.lparen));
+        try std.testing.expectEqual(case.types.len, proto.ast.params.len);
+        if (case.types.len == 1) {
+            try std.testing.expectEqual(@intFromPtr(&tree.nodes.items(.data)[proto_node].lhs), @intFromPtr(proto.ast.params.ptr));
+        }
+        if (case.return_type) |expected| {
+            try std.testing.expectEqualStrings(expected, tree.tokenSlice(tree.firstToken(proto.ast.return_type.?)));
+        } else {
+            try std.testing.expectEqual(@as(?Node.Index, null), proto.ast.return_type);
+        }
+        var iterator = proto.iterate(&tree);
+        for (case.types, case.names, 0..) |expected_type, expected_name, i| {
+            const param = iterator.next().?;
+            try std.testing.expectEqual(proto.ast.params[i], param.type_expr);
+            try std.testing.expectEqualStrings(expected_type, tree.tokenSlice(tree.firstToken(param.type_expr)));
+            if (expected_name) |name| {
+                try std.testing.expectEqualStrings(name, tree.tokenSlice(param.name_token.?));
+            } else {
+                try std.testing.expectEqual(@as(?TokenIndex, null), param.name_token);
+            }
+        }
+        try std.testing.expect(iterator.next() == null);
+        try std.testing.expect(iterator.next() == null);
+        try std.testing.expect(tree.fullFnProto(decl_node) == null);
+        try std.testing.expect(tree.fullFnProto(declaration.ast.init_node) == null);
+    }
+}
+
+test "call accessors expose targets and AST-owned arguments" {
+    const sources = [_][:0]const u8{
+        "let value = f()",
+        "let value = f(1)",
+        "let value = f(1, 2)",
+        "let value = f(\n1,\n2,\n3,\n)",
+    };
+    for (sources, 0..) |source, count| {
+        var tree = try Parser.parse(std.testing.allocator, source);
+        defer tree.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+        const decl_node = tree.rootDecls()[0];
+        const call_node = tree.decl(decl_node).ast.init_node;
+        const call = tree.fullCall(call_node).?;
+        try std.testing.expectEqual(count, call.ast.args.len);
+        try std.testing.expectEqualStrings("(", tree.tokenSlice(call.ast.lparen));
+        try std.testing.expectEqualStrings("f", tree.tokenSlice(tree.firstToken(call.ast.fn_expr)));
+        for (call.ast.args, 0..) |arg, i| {
+            try std.testing.expectEqualStrings((&[_][]const u8{ "1", "2", "3" })[i], tree.tokenSlice(tree.firstToken(arg)));
+        }
+        if (count == 1) {
+            try std.testing.expectEqual(@intFromPtr(&tree.nodes.items(.data)[call_node].rhs), @intFromPtr(call.ast.args.ptr));
+        }
+        try std.testing.expect(tree.fullCall(decl_node) == null);
+        try std.testing.expect(tree.fullCall(call.ast.fn_expr) == null);
+    }
+}
+
+test "nested call views retain independent argument slices" {
+    var tree = try Parser.parse(std.testing.allocator, "let value = outer(inner(1), empty())");
+    defer tree.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+    const outer = tree.fullCall(tree.decl(tree.rootDecls()[0]).ast.init_node).?;
+    const inner = tree.fullCall(outer.ast.args[0]).?;
+    const empty = tree.fullCall(outer.ast.args[1]).?;
+    try std.testing.expectEqual(@as(usize, 2), outer.ast.args.len);
+    try std.testing.expectEqual(@as(usize, 1), inner.ast.args.len);
+    try std.testing.expectEqual(@as(usize, 0), empty.ast.args.len);
+    try std.testing.expectEqualStrings("outer", tree.tokenSlice(tree.firstToken(outer.ast.fn_expr)));
+    try std.testing.expectEqualStrings("inner", tree.tokenSlice(tree.firstToken(inner.ast.fn_expr)));
+    try std.testing.expectEqualStrings("empty", tree.tokenSlice(tree.firstToken(empty.ast.fn_expr)));
+    try std.testing.expectEqualStrings("1", tree.tokenSlice(tree.firstToken(inner.ast.args[0])));
+}
+
 test "render empty AST" {
     const allocator = std.testing.allocator;
     var ast = try Parser.parse(allocator, "");
@@ -715,12 +812,12 @@ pub fn ifElse(self: Ast, node: Node.Index) full.If {
 
 pub fn fnProtoOne(self: Ast, node: Node.Index) full.FnProto {
     assert(self.nodes.items(.tag)[node] == .fn_proto_one);
-    const data = self.nodes.items(.data)[node];
+    const data = &self.nodes.items(.data)[node];
     const params: *const [1]Node.Index = @ptrCast(&data.lhs);
     return self.fullFnProtoComponents(.{
         .proto_node = node,
         .fn_token = self.nodes.items(.main_token)[node],
-        .return_type = data.rhs,
+        .return_type = if (data.rhs == 0) null else data.rhs,
         .params = if (data.lhs == 0) params[0..0] else params[0..1],
     });
 }
@@ -733,7 +830,7 @@ pub fn fnProto(self: Ast, node: Node.Index) full.FnProto {
     return self.fullFnProtoComponents(.{
         .proto_node = node,
         .fn_token = self.nodes.items(.main_token)[node],
-        .return_type = data.rhs,
+        .return_type = if (data.rhs == 0) null else data.rhs,
         .params = params,
     });
 }
@@ -851,7 +948,8 @@ pub fn matchCase(tree: Ast, node: Node.Index) full.MatchCase {
 // TODO: for
 
 pub fn callOne(tree: Ast, node: Node.Index) full.Call {
-    const data = tree.nodes.items(.data)[node];
+    assert(tree.nodes.items(.tag)[node] == .call_one);
+    const data = &tree.nodes.items(.data)[node];
     const args: *const [1]Node.Index = @ptrCast(&data.rhs);
     return .{
         .ast = .{
@@ -863,6 +961,7 @@ pub fn callOne(tree: Ast, node: Node.Index) full.Call {
 }
 
 pub fn callFull(tree: Ast, node: Node.Index) full.Call {
+    assert(tree.nodes.items(.tag)[node] == .call);
     const data = tree.nodes.items(.data)[node];
     const extra = tree.extraData(data.rhs, Node.SubRange);
     return .{
@@ -876,21 +975,11 @@ pub fn callFull(tree: Ast, node: Node.Index) full.Call {
 
 fn fullFnProtoComponents(self: Ast, info: full.FnProto.Components) full.FnProto {
     const token_tags = self.tokens.items(.tag);
-    var result: full.FnProto = .{
+    assert(token_tags[info.fn_token] == .l_paren);
+    return .{
         .ast = info,
-        .lparen = undefined,
+        .lparen = info.fn_token,
     };
-
-    const after_fn_token = info.fn_token + 1;
-    if (token_tags[after_fn_token] == .identifier) {
-        result.name_token = after_fn_token;
-        result.lparen = after_fn_token + 1;
-    } else {
-        result.lparen = after_fn_token;
-    }
-    assert(token_tags[result.lparen] == .l_paren);
-
-    return result;
 }
 
 pub fn fullDecl(self: Ast, node: Node.Index) ?full.Decl {
@@ -912,7 +1001,6 @@ pub fn fullFnProto(self: Ast, node: Node.Index) ?full.FnProto {
     return switch (self.nodes.items(.tag)[node]) {
         .fn_proto_one => self.fnProtoOne(node),
         .fn_proto => self.fnProto(node),
-        .fn_decl => self.fullFnProto(self.nodes.items(.data)[node].lhs),
         else => null,
     };
 }
@@ -994,6 +1082,7 @@ pub const full = struct {
             proto_node: Node.Index,
             fn_token: TokenIndex,
             return_type: ?Node.Index,
+            /// Borrows AST storage; valid until the AST is mutated or deinitialized.
             params: []const Node.Index,
         };
 
@@ -1005,7 +1094,36 @@ pub const full = struct {
             type_expr: Node.Index,
         };
 
-        // TODO: Iterator
+        pub fn iterate(proto: FnProto, tree: *const Ast) Iterator {
+            return .{ .tree = tree, .params = proto.ast.params };
+        }
+
+        pub const Iterator = struct {
+            tree: *const Ast,
+            params: []const Node.Index,
+            index: usize = 0,
+
+            pub fn next(it: *Iterator) ?Param {
+                if (it.index == it.params.len) return null;
+                const type_expr = it.params[it.index];
+                it.index += 1;
+                const first_token = it.tree.firstToken(type_expr);
+                const token_tags = it.tree.tokens.items(.tag);
+                const name_token = if (first_token >= 2 and
+                    token_tags[first_token - 1] == .colon and
+                    token_tags[first_token - 2] == .identifier)
+                    first_token - 2
+                else
+                    null;
+                return .{
+                    .first_doc_comment = null,
+                    .name_token = name_token,
+                    .comptime_noalias = null,
+                    .anytype_ellipsis3 = null,
+                    .type_expr = type_expr,
+                };
+            }
+        };
     };
 
     pub const SliceInit = struct {
@@ -1055,7 +1173,8 @@ pub const full = struct {
 
         pub const Components = struct {
             lparen: TokenIndex,
-            fn_proto: Node.Index,
+            fn_expr: Node.Index,
+            /// Borrows AST storage; valid until the AST is mutated or deinitialized.
             args: []const Node.Index,
         };
     };
