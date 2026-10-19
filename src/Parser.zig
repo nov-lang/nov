@@ -923,21 +923,11 @@ fn parseMatchItem(self: *Parser) Error!Node.Index {
 /// ArrayLiteral <- LBRACKET (Expr COMMA)* Expr? RBRACKET
 fn parseArrayLiteral(self: *Parser) Error!Node.Index {
     const lbracket = self.assertToken(.l_bracket);
-    if (self.eatToken(.r_bracket) != null) {
-        return self.addNode(.{
-            .tag = .array_init_two,
-            .main_token = lbracket,
-            .data = .{
-                .lhs = null_node,
-                .rhs = null_node,
-            },
-        });
-    }
-
-    self.eatNewLines();
     const scratch_top = self.scratch.items.len;
     defer self.scratch.shrinkRetainingCapacity(scratch_top);
     while (true) {
+        self.eatNewLines();
+        if (self.eatToken(.r_bracket) != null) break;
         const expr = try self.expectExpr();
         try self.scratch.append(self.allocator, expr);
         self.eatNewLines();
@@ -948,7 +938,7 @@ fn parseArrayLiteral(self: *Parser) Error!Node.Index {
                 break;
             },
             .newline => unreachable,
-            .colon, .r_brace, .r_paren => return self.failExpected(.r_bracket),
+            .colon, .r_brace, .r_paren, .eof => return self.failExpected(.r_bracket),
             // Likely just a missing comma; give error but continue parsing.
             else => try self.warn(.expected_comma_after_arg),
         }
@@ -1624,6 +1614,8 @@ test "parser ownership survives allocation failures" {
     const sources = [_][:0]const u8{
         "",
         "let answer: int = 1 + 2",
+        "let arrays = [[\n], [1,], [1, 2, 3,\n],]\nlet broken = [1",
+        "let broken = f(1,,2)\nlet invalid: (x: int,,y: int) = 0\nlet valid = 42",
         "let value = loop {}\nlet f: () = {\nloop {}\nlet valid = 42\nvalid\n}",
         "let add: (a: int, b: int, c: int) -> int = {\nlet sum = a + b\nlet result = sum + c\nresult\n}\nlet answer = add(1, 2, 3)",
         "let value = {\nlet broken =\nlet valid = 42\nvalid\n}\nlet missing =",
@@ -1672,6 +1664,70 @@ test "unsupported loops recover within blocks and at EOF" {
     defer truncated.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), truncated.errors.len);
     try std.testing.expectEqual(Token.Tag.keyword_loop, truncated.tokens.items(.tag)[truncated.errors[0].token]);
+}
+
+test "array literals accept empty multiline forms and trailing separators" {
+    const literals = [_][]const u8{
+        "[]",      "[\n\n]",       "[; comment\n]", "[1]",                    "[1,]", "[1,\n\n]",
+        "[1, 2,]", "[1, 2, 3,\n]", "[[1,], [\n],]", "[\r\n\t1,\r\n\t2,\r\n]",
+    };
+    const counts = [_]usize{ 0, 0, 0, 1, 1, 1, 2, 3, 2, 2 };
+    for (literals, counts) |literal, count| {
+        const source = try std.fmt.allocPrintSentinel(std.testing.allocator, "let value = {s}\nlet next = 0", .{literal}, 0);
+        defer std.testing.allocator.free(source);
+        var ast = try parse(std.testing.allocator, source);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+        try std.testing.expectEqual(@as(usize, 2), ast.rootDecls().len);
+        const node = ast.decl(ast.rootDecls()[0]).ast.init_node;
+        const data = ast.nodes.items(.data)[node];
+        const compact = [_]Node.Index{ data.lhs, data.rhs };
+        const elements = switch (ast.nodes.items(.tag)[node]) {
+            .array_init_two => compact[0..count],
+            .array_init => ast.extra_data[data.lhs..data.rhs],
+            else => return error.TestUnexpectedResult,
+        };
+        try std.testing.expectEqual(count, elements.len);
+        if (count < 2) try std.testing.expectEqual(@as(Node.Index, 0), data.rhs);
+        if (count == 0) try std.testing.expectEqual(@as(Node.Index, 0), data.lhs);
+        for (elements, 0..) |element, i| {
+            try std.testing.expect(element != 0);
+            if (ast.nodes.items(.tag)[element] == .number_literal) {
+                var buffer: [16]u8 = undefined;
+                const expected = try std.fmt.bufPrint(&buffer, "{d}", .{i + 1});
+                try std.testing.expectEqualStrings(expected, ast.tokenSlice(ast.firstToken(element)));
+            }
+        }
+    }
+}
+
+test "malformed array and call lists diagnose and preserve following declarations" {
+    const expressions = [_][]const u8{
+        "[,]",              "[1,,2]",     "[1,\n,2]",  "[1)",  "[1}",    "[1 2]",
+        "f(,)",             "f(1,,2)",    "f(1,\n,2)", "f(1]", "f(1 2)", "(,)",
+        "(x: int,,y: int)", "(int bool)",
+    };
+    for (expressions) |expression| {
+        const source = try std.fmt.allocPrintSentinel(std.testing.allocator, "let broken = {s}\nlet valid = 42", .{expression}, 0);
+        defer std.testing.allocator.free(source);
+        var ast = try parse(std.testing.allocator, source);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expect(ast.errors.len != 0);
+        const last = ast.decl(ast.rootDecls()[ast.rootDecls().len - 1]);
+        try std.testing.expectEqualStrings("valid", ast.tokenSlice(last.ast.let_token + 1));
+    }
+}
+
+test "unterminated array after an element expects a closing bracket at EOF" {
+    const sources = [_][:0]const u8{ "let broken = [1", "let broken = [1\n" };
+    for (sources) |source| {
+        var ast = try parse(std.testing.allocator, source);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 1), ast.errors.len);
+        try std.testing.expectEqual(Ast.Error.Tag.expected_token, ast.errors[0].tag);
+        try std.testing.expectEqual(Token.Tag.r_bracket, ast.errors[0].extra.expected_tag);
+        try std.testing.expectEqual(Token.Tag.eof, ast.tokens.items(.tag)[ast.errors[0].token]);
+    }
 }
 
 test "parse empty source" {

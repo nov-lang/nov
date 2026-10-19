@@ -340,6 +340,9 @@ let prod = a.! * b.! ; will return .none to the calling function since b is .non
 ```
 
 ## Arrays
+Array literals are comma-separated, may span multiple lines, and may have a
+trailing comma.
+
 ```nov
 let mut my_array = [1, 2, 3]
 @TypeOf(my_array) ; returns []int
