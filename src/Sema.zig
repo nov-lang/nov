@@ -3,13 +3,15 @@ const Ast = @import("Ast.zig");
 const Module = @import("Module.zig");
 const Ir = @import("Ir.zig");
 const TypeResolver = @import("TypeResolver.zig");
+const Literal = @import("Literal.zig");
+const BodyChecker = @import("BodyChecker.zig");
 const Sema = @This();
 
 allocator: std.mem.Allocator,
 ir: Ir,
 entries: []Entry,
 
-pub const Status = enum { deferred, signature_only, constant_checked, failed };
+pub const Status = enum { deferred, signature_only, constant_checked, body_checked, failed };
 pub const Entry = struct {
     type_id: ?Ir.TypeId = null,
     constant: ?Ir.ConstId = null,
@@ -48,6 +50,24 @@ pub fn analyzeAnnotations(module: *Module) Error!Sema {
     return result;
 }
 
+/// Checks the bounded expression-body subset after collecting all annotations.
+/// This does not resolve global initializers or produce executable operations.
+pub fn analyzeFunctions(module: *Module) Error!Sema {
+    const diagnostics_start = module.diagnostics.items.len;
+    errdefer module.diagnostics.shrinkRetainingCapacity(diagnostics_start);
+    var result = try analyzeAnnotations(module);
+    errdefer result.deinit();
+    if (module.hasErrors()) return result;
+    const types = try result.allocator.alloc(?Ir.TypeId, result.entries.len);
+    defer result.allocator.free(types);
+    for (result.entries, types) |entry, *ty| ty.* = entry.type_id;
+    for (result.entries, 0..) |*entry, i| {
+        if (entry.status != .signature_only) continue;
+        entry.status = if (try BodyChecker.check(module, &result.ir, types, @enumFromInt(i))) .body_checked else .failed;
+    }
+    return result;
+}
+
 pub fn deinit(self: *Sema) void {
     self.ir.deinit();
     self.allocator.free(self.entries);
@@ -61,92 +81,13 @@ pub fn getEntry(self: *const Sema, id: Module.DeclId) ?Entry {
     return self.entries[index];
 }
 
-fn failLiteral(self: *Sema, module: *Module, index: usize, tag: Module.Diagnostic.Tag, span: Module.Span, annotation: Module.Span) std.mem.Allocator.Error!void {
-    try module.diagnostics.append(self.allocator, .{
-        .tag = tag,
-        .span = span,
-        .related = if (tag == .literal_out_of_range or tag == .literal_type_mismatch) annotation else null,
-    });
-    self.entries[index].status = .failed;
-}
-
-fn internLiteral(self: *Sema, module: *Module, index: usize, value: Ir.Constant.Value, span: Module.Span, annotation: Module.Span) Error!void {
-    const constant = self.ir.internConstant(.{ .ty = self.entries[index].type_id.?, .value = value }) catch |err| switch (err) {
-        error.IntegerOutOfRange => return self.failLiteral(module, index, .literal_out_of_range, span, annotation),
-        error.ConstantTypeMismatch => return self.failLiteral(module, index, .literal_type_mismatch, span, annotation),
-        else => return err,
-    };
-    self.entries[index].constant = constant;
-    self.entries[index].status = .constant_checked;
-}
-
 fn checkLiteral(self: *Sema, module: *Module, index: usize, initializer: Ast.Node.Index, annotation: Module.Span) Error!void {
-    const ast = &module.ast;
-    var node = initializer;
-    while (true) {
-        const tag = ast.nodes.items(.tag)[node];
-        const span = module.tokenSpan(ast.nodes.items(.main_token)[node]);
-        switch (tag) {
-            .block, .block_two, .block_newline, .block_two_newline => {
-                var buffer: [2]Ast.Node.Index = undefined;
-                const block = ast.fullBlock(&buffer, node).?;
-                // README explicitly defines single-expression braces as grouping.
-                // Empty, labeled and multistatement block results remain deferred.
-                if (ast.firstToken(node) != block.ast.lbrace or block.ast.statements.len != 1) return;
-                if (ast.nodes.items(.tag)[block.ast.statements[0]] == .decl) return;
-                node = block.ast.statements[0];
-            },
-            .number_literal => return self.checkNumber(module, index, node, false, span, annotation),
-            .negation => {
-                const operand = ast.nodes.items(.data)[node].rhs;
-                if (ast.nodes.items(.tag)[operand] != .number_literal) return;
-                const number_span = module.tokenSpan(ast.nodes.items(.main_token)[operand]);
-                return self.checkNumber(module, index, operand, true, .{ .start = span.start, .end = number_span.end }, annotation);
-            },
-            .identifier => {
-                const name = module.sourceSlice(span).?;
-                // Module bindings are left for name/type checking, not silently
-                // interpreted as builtin booleans under an assumed shadowing rule.
-                if (module.lookup(name) != null) return;
-                if (std.mem.eql(u8, name, "true") or std.mem.eql(u8, name, "false")) {
-                    return self.internLiteral(module, index, .{ .boolean = std.mem.eql(u8, name, "true") }, span, annotation);
-                }
-                return;
-            },
-            .char_literal, .string_literal => return self.failLiteral(module, index, .unsupported_literal, span, annotation),
-            else => return,
-        }
-    }
-}
-
-fn checkNumber(self: *Sema, module: *Module, index: usize, node: Ast.Node.Index, negative: bool, span: Module.Span, annotation: Module.Span) Error!void {
-    const bytes = module.ast.tokenSlice(module.ast.nodes.items(.main_token)[node]);
-    switch (std.zig.parseNumberLiteral(bytes)) {
-        .float => return self.failLiteral(module, index, .unsupported_literal, span, annotation),
-        .failure => return self.failLiteral(module, index, .invalid_literal, span, annotation),
-        else => {},
-    }
-    const ty = self.ir.getType(self.entries[index].type_id.?).?;
-    if (ty != .integer) return self.failLiteral(module, index, .literal_type_mismatch, span, annotation);
-    const magnitude = std.fmt.parseInt(u128, bytes, 0) catch |err| switch (err) {
-        error.Overflow => return self.failLiteral(module, index, .literal_out_of_range, span, annotation),
-        error.InvalidCharacter => return self.failLiteral(module, index, .invalid_literal, span, annotation),
-    };
-    switch (ty.integer.signedness) {
-        .signed => {
-            const minimum_magnitude = @as(u128, 1) << 127;
-            if (magnitude > (if (negative) minimum_magnitude else minimum_magnitude - 1)) {
-                return self.failLiteral(module, index, .literal_out_of_range, span, annotation);
-            }
-            const value: i128 = if (negative)
-                (if (magnitude == minimum_magnitude) std.math.minInt(i128) else -@as(i128, @intCast(magnitude)))
-            else
-                @intCast(magnitude);
-            return self.internLiteral(module, index, .{ .signed_integer = value }, span, annotation);
-        },
-        .unsigned => {
-            if (negative and magnitude != 0) return self.failLiteral(module, index, .literal_out_of_range, span, annotation);
-            return self.internLiteral(module, index, .{ .unsigned_integer = magnitude }, span, annotation);
+    switch (try Literal.check(module, &self.ir, initializer, self.entries[index].type_id.?, annotation)) {
+        .not_literal => {},
+        .failed => self.entries[index].status = .failed,
+        .constant => |constant| {
+            self.entries[index].constant = constant;
+            self.entries[index].status = .constant_checked;
         },
     }
 }

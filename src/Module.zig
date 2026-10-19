@@ -47,6 +47,15 @@ pub const Diagnostic = struct {
         unsupported_literal,
         literal_type_mismatch,
         literal_out_of_range,
+        unsupported_body_expression,
+        unsupported_shadowing,
+        expression_type_mismatch,
+        operator_not_supported,
+        literal_needs_type,
+        not_callable,
+        argument_count_mismatch,
+        unresolved_value_type,
+        body_nesting_limit,
     };
 };
 

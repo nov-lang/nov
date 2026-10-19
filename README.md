@@ -30,9 +30,12 @@ owned, canonical type/constant storage and verification. Internal module passes
 collect names and diagnose duplicate/unknown names and initializer dependency
 cycles for a bounded expression subset. Internal annotation analysis resolves
 explicit `bool`, `void`, fixed-width integer and function types, and checks integer
-and boolean literals against annotations. Defaults, aliases, general expressions,
-function bodies and local scopes remain deferred or unsupported. These passes
-and C generation are not connected to the CLI; `check` remains syntax-only.
+and boolean literals against annotations. Bounded function-body checking binds
+parameters and checks integer arithmetic, boolean expressions, comparisons and
+calls against collected signatures, including recursive calls. Defaults, aliases,
+local declarations, shadowing, control flow and general block results remain
+deferred or unsupported. No executable operations or C are emitted; `check`
+remains syntax-only.
 
 Format files in place with `zig build run -- fmt file.nov`, or use
 `zig build run -- fmt --check file.nov` to check formatting without writing.

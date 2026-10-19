@@ -61,6 +61,15 @@ pub fn renderModule(module: *const Module, writer: *std.Io.Writer) !void {
             .unsupported_literal => try writer.writeAll("this literal is not supported in semantic analysis yet"),
             .literal_type_mismatch => try writer.writeAll("literal does not match the annotated type"),
             .literal_out_of_range => try writer.writeAll("integer literal does not fit the annotated type"),
+            .unsupported_body_expression => try writer.writeAll("body checking for this expression is not implemented yet"),
+            .unsupported_shadowing => try writer.writeAll("shadowing is not supported in body analysis yet"),
+            .expression_type_mismatch => try writer.writeAll("expression does not match the expected type"),
+            .operator_not_supported => try writer.writeAll("operator is not supported for this operand type"),
+            .literal_needs_type => try writer.writeAll("integer literal needs an expected type (no default chosen)"),
+            .not_callable => try writer.writeAll("expression is not callable"),
+            .argument_count_mismatch => try writer.writeAll("argument count does not match the function signature"),
+            .unresolved_value_type => try writer.writeAll("declaration needs a resolved type before use here"),
+            .body_nesting_limit => try writer.writeAll("recursive body checking exceeds the current analysis limit of 128"),
         }
         try location.renderExcerpt(module.ast.source, diagnostic.span.end - diagnostic.span.start, writer);
         const note: ?[]const u8 = switch (diagnostic.tag) {
@@ -68,6 +77,11 @@ pub fn renderModule(module: *const Module, writer: *std.Io.Writer) !void {
             .value_cycle => "declaration in this cycle",
             .duplicate_parameter => "first parameter here",
             .literal_type_mismatch, .literal_out_of_range => "type annotation here",
+            .expression_type_mismatch, .literal_needs_type => "expected type required here",
+            .unsupported_shadowing => "conflicting declaration here",
+            .operator_not_supported => "operand type specified here",
+            .argument_count_mismatch, .not_callable => "type specified here",
+            .unresolved_value_type => "declaration here",
             else => null,
         };
         if (note) |message| {
@@ -207,6 +221,54 @@ test "module type and literal diagnostics render messages and source excerpts" {
         );
         defer std.testing.allocator.free(expected);
         try std.testing.expectEqualStrings(expected, output.written());
+    }
+}
+
+test "module body diagnostics render messages and optional related notes" {
+    const Case = struct {
+        tag: Module.Diagnostic.Tag,
+        message: []const u8,
+        note: ?[]const u8 = null,
+    };
+    for ([_]Case{
+        .{ .tag = .expression_type_mismatch, .message = "expression does not match the expected type", .note = "expected type required here" },
+        .{ .tag = .argument_count_mismatch, .message = "argument count does not match the function signature", .note = "type specified here" },
+        .{ .tag = .unsupported_body_expression, .message = "body checking for this expression is not implemented yet" },
+        .{ .tag = .unsupported_shadowing, .message = "shadowing is not supported in body analysis yet", .note = "conflicting declaration here" },
+        .{ .tag = .operator_not_supported, .message = "operator is not supported for this operand type", .note = "operand type specified here" },
+        .{ .tag = .literal_needs_type, .message = "integer literal needs an expected type (no default chosen)", .note = "expected type required here" },
+        .{ .tag = .not_callable, .message = "expression is not callable", .note = "type specified here" },
+        .{ .tag = .unresolved_value_type, .message = "declaration needs a resolved type before use here", .note = "declaration here" },
+        .{ .tag = .body_nesting_limit, .message = "recursive body checking exceeds the current analysis limit of 128" },
+    }) |case| {
+        for ([_]bool{ true, false }) |with_related| {
+            var module = try Module.init(std.testing.allocator, "body.nov", "let value: i32 = 123");
+            defer module.deinit();
+            try std.testing.expect(!module.hasErrors());
+            try module.diagnostics.append(module.allocator, .{
+                .tag = case.tag,
+                .span = .{ .start = 17, .end = 20 },
+                .related = if (with_related) .{ .start = 11, .end = 14 } else null,
+            });
+            var output = std.Io.Writer.Allocating.init(std.testing.allocator);
+            defer output.deinit();
+            try renderModule(&module, &output.writer);
+            var expected = std.Io.Writer.Allocating.init(std.testing.allocator);
+            defer expected.deinit();
+            try expected.writer.print(
+                "body.nov:1:18: error: {s}\nlet value: i32 = 123\n                 ^~~\n",
+                .{case.message},
+            );
+            if (with_related) {
+                if (case.note) |note| {
+                    try expected.writer.print(
+                        "body.nov:1:12: note: {s}\nlet value: i32 = 123\n           ^~~\n",
+                        .{note},
+                    );
+                }
+            }
+            try std.testing.expectEqualStrings(expected.written(), output.written());
+        }
     }
 }
 

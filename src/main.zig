@@ -185,6 +185,8 @@ test {
     _ = @import("Dependencies.zig");
     _ = @import("TypeResolver.zig");
     _ = @import("Sema.zig");
+    _ = @import("Literal.zig");
+    _ = @import("BodyChecker.zig");
     _ = @import("Tokenizer.zig");
     _ = @import("string_literal.zig");
     _ = Diagnostics;
