@@ -146,6 +146,97 @@ test "nested call views retain independent argument slices" {
     try std.testing.expectEqualStrings("1", tree.tokenSlice(tree.firstToken(inner.ast.args[0])));
 }
 
+test "expression token boundaries follow delimiters rather than newline counts" {
+    const expressions = [_][:0]const u8{
+        "{}",                      "{\n\n}",        "{1}",                               "{1\n}",                          "{\n1\n\n; tail\n}",
+        "{1\n2}",                  "{1\n2\n3\n\n}", "{{1}\n{2}\n3}",                     "named: {1}",                     "{\r\n\t1\r\n\r\n}",
+        "f()",                     "f(\n\n)",       "f(1)",                              "f(1,)",                          "f(\n1\n)",
+        "f(1, 2)",                 "f(1, 2,\n\n)",  "f(g(1), h(2, 3))",                  "()",                             "(\n\n)",
+        "(x: int)",                "(x: int,\n\n)", "(x: int, y: bool,\n)",              "(callback: (x: int) -> int,\n)", "() -> int",
+        "(x: int, y: int) -> int", "1 + f(2, 3)",   "{1} * 3",                           "-f(1)",                          "#f(1)",
+        "f(\"(\", \")\")",         "{\"}\"}",       "f(1, ; ) ignored in comment\n2\n)", "{; } ignored in comment\n1\n}",
+    };
+    for (expressions) |expression| {
+        const source = try std.fmt.allocPrintSentinel(std.testing.allocator, "let value = {s}\nlet next = 0\n", .{expression}, 0);
+        defer std.testing.allocator.free(source);
+        var tree = try Parser.parse(std.testing.allocator, source);
+        defer tree.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+        const node = tree.decl(tree.rootDecls()[0]).ast.init_node;
+        const first = tree.firstToken(node);
+        const last = tree.lastToken(node);
+        const starts = tree.tokens.items(.start);
+        const end = starts[last] + tree.tokenSlice(last).len;
+        try std.testing.expectEqualStrings(expression, tree.source[starts[first]..end]);
+        const span = tree.nodeToSpan(node);
+        try std.testing.expect(span.start <= span.main);
+        try std.testing.expect(span.main < span.end);
+        try std.testing.expect(std.mem.indexOfScalar(u8, tree.source[span.start..span.end], '\n') == null);
+        if (std.mem.indexOfScalar(u8, expression, '\n') == null) {
+            try std.testing.expectEqualStrings(expression, tree.source[span.start..span.end]);
+        }
+    }
+}
+
+test "block accessors expose ordered statements without assigning result semantics" {
+    const Case = struct { source: [:0]const u8, count: usize };
+    const cases = [_]Case{
+        .{ .source = "let value = {}", .count = 0 },
+        .{ .source = "let value = {\n\n}", .count = 0 },
+        .{ .source = "let value = {1}", .count = 1 },
+        .{ .source = "let value = {1\n2}", .count = 2 },
+        .{ .source = "let value = {1\n2\n3}", .count = 3 },
+        .{ .source = "let f: () = {\nlet x = 1\nlet y = 2\nx + y\n}", .count = 3 },
+    };
+    for (cases) |case| {
+        var tree = try Parser.parse(std.testing.allocator, case.source);
+        defer tree.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+        const decl_node = tree.rootDecls()[0];
+        const node = tree.decl(decl_node).ast.init_node;
+        var buffer: [2]Node.Index = undefined;
+        const block = tree.fullBlock(&buffer, node).?;
+        try std.testing.expectEqual(case.count, block.ast.statements.len);
+        try std.testing.expectEqualStrings("{", tree.tokenSlice(block.ast.lbrace));
+        try std.testing.expectEqualStrings("}", tree.tokenSlice(block.ast.rbrace));
+        var previous = block.ast.lbrace;
+        for (block.ast.statements) |statement| {
+            const first = tree.firstToken(statement);
+            const last = tree.lastToken(statement);
+            try std.testing.expect(previous < first);
+            try std.testing.expect(first <= last);
+            try std.testing.expect(last < block.ast.rbrace);
+            previous = last;
+        }
+        try std.testing.expect(tree.fullBlock(&buffer, decl_node) == null);
+    }
+}
+
+test "recovered blocks retain statement access and closing token spans" {
+    var tree = try Parser.parse(std.testing.allocator, "let value = {\nlet = 0\nlet valid = 1\nvalid\n\n}\nlet next = 0");
+    defer tree.deinit(std.testing.allocator);
+    try std.testing.expect(tree.errors.len != 0);
+    try std.testing.expectEqual(@as(usize, 2), tree.rootDecls().len);
+    var buffer: [2]Node.Index = undefined;
+    const node = tree.decl(tree.rootDecls()[0]).ast.init_node;
+    const block = tree.fullBlock(&buffer, node).?;
+    try std.testing.expectEqual(@as(usize, 2), block.ast.statements.len);
+    try std.testing.expectEqualStrings("}", tree.tokenSlice(tree.lastToken(node)));
+    try std.testing.expectEqualStrings("valid", tree.tokenSlice(tree.firstToken(block.ast.statements[1])));
+    const span = tree.nodeToSpan(node);
+    try std.testing.expectEqualStrings("{", tree.source[span.start..span.end]);
+}
+
+test "type-only declarations end at their annotated type" {
+    var tree = try Parser.parse(std.testing.allocator, "let value: *mut int\nlet next = 0");
+    defer tree.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+    const node = tree.rootDecls()[0];
+    try std.testing.expectEqualStrings("int", tree.tokenSlice(tree.lastToken(node)));
+    const span = tree.nodeToSpan(node);
+    try std.testing.expectEqualStrings("let value: *mut int", tree.source[span.start..span.end]);
+}
+
 test "render empty AST" {
     const allocator = std.testing.allocator;
     var ast = try Parser.parse(allocator, "");
@@ -582,7 +673,7 @@ pub fn firstToken(self: Ast, node: Node.Index) TokenIndex {
         => {
             // Look for a label.
             const lbrace = main_tokens[n];
-            if (token_tags[lbrace - 1] == .colon and
+            if (lbrace >= 2 and token_tags[lbrace - 1] == .colon and
                 token_tags[lbrace - 2] == .identifier)
             {
                 end_offset += 2;
@@ -642,7 +733,7 @@ pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
         .function_pipe,
         .bind,
         .in,
-        .decl,
+        .@"comptime",
         .attr_decl_one,
         .attr_decl,
         .array_type,
@@ -662,45 +753,28 @@ pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
         .builtin_literal,
         => return main_tokens[n] + end_offset,
 
-        .block => {
-            assert(datas[n].rhs - datas[n].lhs > 0);
-            end_offset += 2; // rbrace TODO: newline
-            n = self.extra_data[datas[n].rhs - 1]; // last statement
-        },
-
-        .block_two => {
+        .decl => {
             if (datas[n].rhs != 0) {
-                end_offset += 2; // rbrace newline
                 n = datas[n].rhs;
-            } else if (datas[n].lhs != 0) {
-                end_offset += 2; // rbrace newline
-                n = datas[n].lhs;
             } else {
-                end_offset += 1; // rbrace
-                return main_tokens[n] + end_offset;
+                const declaration: Node.Decl = @bitCast(datas[n].lhs);
+                n = declaration.type_node;
             }
         },
 
-        .fn_proto_one => {
-            if (datas[n].rhs != 0) {
-                n = datas[n].rhs;
-            } else if (datas[n].lhs != 0) {
-                end_offset += 1; // rparen
-                n = datas[n].lhs;
-            } else {
-                end_offset += 1; // rparen
-                return main_tokens[n] + end_offset;
-            }
-        },
+        .block,
+        .block_newline,
+        .block_two,
+        .block_two_newline,
+        => return self.matchingDelimiter(main_tokens[n]) + end_offset,
 
-        .fn_proto => {
+        .fn_proto_one,
+        .fn_proto,
+        => {
             if (datas[n].rhs != 0) {
                 n = datas[n].rhs;
             } else {
-                const extra = self.extraData(datas[n].lhs, Node.SubRange);
-                assert(extra.end - extra.start > 0);
-                end_offset += 1; // rparen
-                n = self.extra_data[extra.end - 1]; // last parameter
+                return self.matchingDelimiter(main_tokens[n]) + end_offset;
             }
         },
 
@@ -711,8 +785,12 @@ pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
         },
 
         .call_one,
-        .array_access,
-        => {
+        .call_one_comma,
+        .call,
+        .call_comma,
+        => return self.matchingDelimiter(main_tokens[n]) + end_offset,
+
+        .array_access => {
             end_offset += 1; // for the rparen/rbracket
             if (datas[n].rhs == 0) {
                 return main_tokens[n] + end_offset;
@@ -746,6 +824,29 @@ pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
             }
         },
     };
+}
+
+// Child-node offsets cannot locate closers across optional newlines, comments,
+// and trailing commas. Token tags also keep delimiters inside literals opaque.
+fn matchingDelimiter(self: Ast, opening: TokenIndex) TokenIndex {
+    const token_tags = self.tokens.items(.tag);
+    const open_tag = token_tags[opening];
+    const close_tag: Token.Tag = switch (open_tag) {
+        .l_brace => .r_brace,
+        .l_paren => .r_paren,
+        else => unreachable,
+    };
+    var depth: usize = 1;
+    var token = opening + 1;
+    while (token < token_tags.len) : (token += 1) {
+        if (token_tags[token] == open_tag) {
+            depth += 1;
+        } else if (token_tags[token] == close_tag) {
+            depth -= 1;
+            if (depth == 0) return token;
+        }
+    }
+    unreachable; // Parsed block/prototype/call nodes have a closing delimiter.
 }
 
 pub fn tokensOnSameLine(self: Ast, token1: TokenIndex, token2: TokenIndex) bool {
@@ -1046,6 +1147,26 @@ pub fn fullCall(self: Ast, node: Node.Index) ?full.Call {
     };
 }
 
+/// Compact block statements borrow `buffer`; keep it alive and unchanged while
+/// using the returned view. Larger blocks borrow AST storage instead.
+pub fn fullBlock(self: Ast, buffer: *[2]Node.Index, node: Node.Index) ?full.Block {
+    const data = self.nodes.items(.data)[node];
+    const statements: []const Node.Index = switch (self.nodes.items(.tag)[node]) {
+        .block_two, .block_two_newline => blk: {
+            buffer.* = .{ data.lhs, data.rhs };
+            const count: usize = if (data.lhs == 0) 0 else if (data.rhs == 0) 1 else 2;
+            break :blk buffer[0..count];
+        },
+        .block, .block_newline => self.extra_data[data.lhs..data.rhs],
+        else => return null,
+    };
+    return .{ .ast = .{
+        .lbrace = self.nodes.items(.main_token)[node],
+        .rbrace = self.lastToken(node),
+        .statements = statements,
+    } };
+}
+
 /// Fully assembled AST node information.
 pub const full = struct {
     // TODO: do we really need a separate struct for Decl just have a AttrDecl struct
@@ -1058,6 +1179,18 @@ pub const full = struct {
             is_mutable: bool,
             type_node: Node.Index,
             init_node: Node.Index,
+        };
+    };
+
+    pub const Block = struct {
+        ast: Components,
+
+        pub const Components = struct {
+            lbrace: TokenIndex,
+            rbrace: TokenIndex,
+            /// Ordered statements, without inferring whether the last produces a value.
+            /// Borrows the caller's buffer for compact blocks, otherwise AST storage.
+            statements: []const Node.Index,
         };
     };
 
@@ -1506,6 +1639,8 @@ pub const Span = struct {
     main: u32,
 };
 
+/// A single-line diagnostic highlight, not necessarily the node's full extent.
+/// Use firstToken/lastToken for the complete token range of multiline nodes.
 pub fn nodeToSpan(self: Ast, node: u32) Span {
     return tokensToSpan(
         self,
