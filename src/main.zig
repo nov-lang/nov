@@ -188,6 +188,7 @@ test {
     _ = @import("Literal.zig");
     _ = @import("BodyChecker.zig");
     _ = @import("Lowering.zig");
+    _ = @import("CEmitter.zig");
     _ = @import("Tokenizer.zig");
     _ = @import("string_literal.zig");
     _ = Diagnostics;

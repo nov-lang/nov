@@ -62,6 +62,8 @@ pub fn build(b: *std.Build) void {
 
     const tests = b.addTest(.{ .root_module = exe.root_module });
     const run_tests = b.addRunArtifact(tests);
+    // Generated-C tests compile with the pinned toolchain's `zig cc`.
+    run_tests.setEnvironmentVariable("NOV_TEST_ZIG", b.graph.zig_exe);
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_tests.step);
     addCliTests(b, exe, test_step);
