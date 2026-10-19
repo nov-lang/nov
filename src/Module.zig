@@ -49,6 +49,8 @@ pub const Diagnostic = struct {
         literal_out_of_range,
         unsupported_body_expression,
         unsupported_local_declaration,
+        immutable_assignment,
+        unsupported_assignment_target,
         unused_block_value,
         unreachable_code,
         unsupported_shadowing,

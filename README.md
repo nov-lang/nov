@@ -32,10 +32,10 @@ cycles for a bounded expression subset. Internal annotation analysis resolves
 explicit `bool`, `void`, fixed-width integer, native `int`/`uint` and function
 types, and checks integer and boolean literals against annotations. Bounded function-body checking binds
 parameters and checks integer arithmetic, boolean expressions, comparisons and
-calls against collected signatures, including recursive calls. Immutable,
-explicitly typed locals and straight-line blocks with final-expression results
+calls against collected signatures, including recursive calls. Explicitly typed
+immutable and mutable scalar locals and blocks with final-expression results
 are supported in function bodies. Literal defaults, user-defined type aliases,
-shadowing, mutation and loops remain deferred or unsupported.
+shadowing, global mutation and loops remain deferred or unsupported.
 Lowering produces typed operations with source spans, ordered operands/call
 arguments, explicit returns, and structured conditional regions for boolean `and`/`or` and `if`/`else`.
 It requires immutable literal globals; unit/global block initializers are
@@ -51,8 +51,9 @@ IR verification. Source errors and unsupported/deferred forms fail with source
 diagnostics (including related notes where available); recovered syntax errors
 stop semantic analysis. Globals must be immutable, explicitly typed integer or
 boolean literals. Functions need explicit supported signatures and bounded
-expression bodies (including forward/recursive calls, local declarations, nested
-blocks, boolean short-circuiting, `if`/`else`, explicit returns and empty void bodies).
+expression bodies (including forward/recursive calls, local declarations and
+assignments, nested blocks, boolean short-circuiting, `if`/`else`, explicit returns
+and empty void bodies).
 Inferred globals, mutable globals, nonliteral global initializers, global unit
 values are currently rejected, along with the other
 unsupported forms listed above. This is not a backend compatibility check: it
@@ -197,8 +198,21 @@ let main: () -> void = {
 This prints `42` on two lines. Locals require an explicit supported type and an
 initializer. Immutable scalar/unit values and existing function values (with
 unnamed parameter types, e.g. `let callback: (int) -> int = twice`) work; named
-local function definitions/closures, inferred locals, mutation, assignments,
-labels, loops and memory-bearing values are rejected.
+local function definitions/closures, inferred locals, labels, loops and
+memory-bearing values are rejected. Mutable locals use `let mut`
+and support `bool`, integer and existing function values (not `void`). Direct
+identifier assignment (`n = value`) and integer-only `+=`, `-=`, `*=`, `/=`, `%=`
+return `void`; a block ending in assignment therefore also returns `void`.
+Assignments require a mutable local, not a parameter or global. RHS types must
+match exactly, without implicit numeric conversions. Compound assignments read
+the old local value before evaluating the RHS, then apply the existing wrapping
+arithmetic/division rules and store once. RHS effects can update the same local;
+the compound calculation still uses the captured old value. A returning RHS exits
+without performing the pending store. Mutable initializers execute exactly once,
+before the local is visible; each later read captures its current value. Updates
+to outer locals persist across selected conditional branches and short-circuit
+RHS regions; skipped regions do not read or write their locals. Slots remain
+lexically scoped and separate sibling blocks may reuse names.
 Global block initializers remain unsupported by lowering.
 
 Boolean `and`/`or` evaluate the left operand exactly once, then evaluate the right
@@ -210,7 +224,7 @@ Nested operators merge only their boolean result, not RHS-local values. The IR
 stores nestable RHS instruction ranges in the owned function body; verification
 rejects crossing ranges, forward references and references escaping a region.
 The C backend emits conditional blocks, never eager RHS temporaries. This does
-not add mutation or new global initializer forms.
+not add new global initializer forms.
 
 `if` conditions must be `bool` and execute exactly once. Only the selected branch
 executes, including its local initializers, calls, printing and arithmetic panics;

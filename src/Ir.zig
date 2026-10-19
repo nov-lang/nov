@@ -34,6 +34,10 @@ pub const BinaryOp = enum { add, sub, mul, div, mod, eq, ne, lt, le, gt, ge };
 pub const Operation = union(enum) {
     /// Terminal control flow, never a value. Its optional operand is body-local.
     return_value: ?ValueId,
+    // Slot identities are instruction IDs, but are not expression values.
+    local_slot: ValueId,
+    local_load: ValueId,
+    local_store: struct { slot: ValueId, value: ValueId },
     constant: ConstId,
     parameter: u32,
     function_ref: FunctionId,
@@ -282,12 +286,15 @@ fn validateFunction(self: *const Ir, function: Function) VerifyError!void {
 }
 
 fn operandType(body: Body, id: ValueId, before: usize) VerifyError!TypeId {
-    return regionOperandType(body, id, before, null);
+    const ty = try regionOperandType(body, id, before, null);
+    if (body.instructions[@intFromEnum(id)].op == .local_slot) return error.InvalidValueId;
+    return ty;
 }
 
 fn regionOperandType(body: Body, id: ValueId, before: usize, yielding: ?usize) VerifyError!TypeId {
     const index = @intFromEnum(id);
-    if (index >= before) return error.InvalidValueId;
+    if (index >= before or index >= body.instructions.len) return error.InvalidValueId;
+    if (yielding != null and body.instructions[index].op == .local_slot) return error.InvalidValueId;
     for (body.instructions, 0..) |instruction, owner| {
         var buffer: [2]Region = undefined;
         for (regions(instruction.op, owner, &buffer)) |region| {
@@ -322,6 +329,12 @@ fn regions(op: Operation, end: usize, buffer: *[2]Region) []const Region {
         },
         else => return &.{},
     }
+}
+
+fn slotType(body: Body, id: ValueId, before: usize) VerifyError!TypeId {
+    const ty = try regionOperandType(body, id, before, null);
+    if (body.instructions[@intFromEnum(id)].op != .local_slot) return error.InvalidOperation;
+    return ty;
 }
 
 fn validateBody(self: *const Ir, function: Function, body: Body) VerifyError!void {
@@ -374,6 +387,17 @@ fn validateBody(self: *const Ir, function: Function, body: Body) VerifyError!voi
             if (i + 1 != region_end or @intFromEnum(result) != i) return error.UnreachableInstruction;
         }
         switch (instruction.op) {
+            .local_slot => |value| {
+                if (ty != .boolean and ty != .integer and ty != .function) return error.InvalidOperation;
+                if (try operandType(body, value, i) != instruction.ty) return error.OperandTypeMismatch;
+            },
+            .local_load => |slot| {
+                if (try slotType(body, slot, i) != instruction.ty) return error.OperandTypeMismatch;
+            },
+            .local_store => |store| {
+                if (ty != .void) return error.InvalidOperation;
+                if (try slotType(body, store.slot, i) != try operandType(body, store.value, i)) return error.OperandTypeMismatch;
+            },
             .return_value => |value| {
                 if (ty != .void) return error.InvalidReturn;
                 if (value) |v| {
@@ -460,6 +484,7 @@ fn validateBody(self: *const Ir, function: Function, body: Body) VerifyError!voi
         }
     }
     const result_ty = try regionOperandType(body, body.result, body.instructions.len, body.instructions.len);
+    if (body.instructions[@intFromEnum(body.result)].op == .local_slot) return error.InvalidValueId;
     if (!terminates(body, body.result) and result_ty != signature.result) return error.InvalidReturn;
 }
 
@@ -544,6 +569,67 @@ fn testPrintAllocationFailures(allocator: std.mem.Allocator) !void {
     const body = ir.functions.items[0].body.?;
     try std.testing.expectEqual(@as(u32, 0), @intFromEnum(body.instructions[1].op.print.args[0]));
     try std.testing.expectEqual(@as(u32, 0), @intFromEnum(body.instructions[2].op.print.args[0]));
+}
+
+test "local slots require prior visible identities exact types and explicit loads" {
+    var t = try TestFunctions.init(std.testing.allocator);
+    defer t.ir.deinit();
+    const unit = try t.ir.internType(.void);
+    const make = TestFunctions.instruction;
+    const base = [_]Instruction{
+        make(t.integer, .{ .constant = t.number }),
+        make(t.integer, .{ .local_slot = @enumFromInt(0) }),
+        make(t.integer, .{ .local_load = @enumFromInt(1) }),
+        make(unit, .{ .local_store = .{ .slot = @enumFromInt(1), .value = @enumFromInt(2) } }),
+        make(t.integer, .{ .local_load = @enumFromInt(1) }),
+    };
+    const Case = struct { index: usize, instruction: Instruction, err: VerifyError };
+    for ([_]Case{
+        .{ .index = 1, .instruction = make(t.integer, .{ .local_slot = @enumFromInt(1) }), .err = error.InvalidValueId },
+        .{ .index = 1, .instruction = make(t.boolean, .{ .local_slot = @enumFromInt(0) }), .err = error.OperandTypeMismatch },
+        .{ .index = 1, .instruction = make(unit, .{ .local_slot = @enumFromInt(0) }), .err = error.InvalidOperation },
+        .{ .index = 2, .instruction = make(t.integer, .{ .local_load = @enumFromInt(0) }), .err = error.InvalidOperation },
+        .{ .index = 2, .instruction = make(t.integer, .{ .local_load = @enumFromInt(99) }), .err = error.InvalidValueId },
+        .{ .index = 2, .instruction = make(t.boolean, .{ .local_load = @enumFromInt(1) }), .err = error.OperandTypeMismatch },
+        .{ .index = 2, .instruction = make(t.integer, .{ .unary = .{ .op = .negate, .operand = @enumFromInt(1) } }), .err = error.InvalidValueId },
+        .{ .index = 3, .instruction = make(unit, .{ .local_store = .{ .slot = @enumFromInt(2), .value = @enumFromInt(0) } }), .err = error.InvalidOperation },
+        .{ .index = 3, .instruction = make(unit, .{ .local_store = .{ .slot = @enumFromInt(1), .value = @enumFromInt(1) } }), .err = error.InvalidValueId },
+        .{ .index = 3, .instruction = make(t.integer, .{ .local_store = .{ .slot = @enumFromInt(1), .value = @enumFromInt(2) } }), .err = error.InvalidOperation },
+    }) |case| {
+        var bad = base;
+        bad[case.index] = case.instruction;
+        try t.reject(case.err, &bad, @enumFromInt(4));
+    }
+    try t.reject(error.InvalidValueId, base[0..2], @enumFromInt(1));
+    try t.ir.setFunctionBody(t.function, &base, @enumFromInt(4));
+    try t.ir.verify();
+}
+
+test "region private slots cannot escape into siblings or surrounding loads and stores" {
+    var t = try TestFunctions.init(std.testing.allocator);
+    defer t.ir.deinit();
+    const unit = try t.ir.internType(.void);
+    const truth = try t.ir.internConstant(.{ .ty = t.boolean, .value = .{ .boolean = true } });
+    const make = TestFunctions.instruction;
+    const base = [_]Instruction{
+        make(t.boolean, .{ .constant = truth }),
+        make(t.integer, .{ .constant = t.number }),
+        make(t.integer, .{ .local_slot = @enumFromInt(1) }),
+        make(t.integer, .{ .local_load = @enumFromInt(2) }),
+        make(t.integer, .{ .constant = t.number }),
+        make(t.integer, .{ .branch = .{ .condition = @enumFromInt(0), .then_start = 1, .else_start = 4, .then_value = @enumFromInt(3), .else_value = @enumFromInt(4) } }),
+        make(t.integer, .{ .local_load = @enumFromInt(2) }),
+    };
+    try t.reject(error.InvalidValueId, &base, @enumFromInt(6));
+    var bad = base;
+    bad[4] = make(t.integer, .{ .local_load = @enumFromInt(2) });
+    try t.reject(error.InvalidValueId, &bad, @enumFromInt(5));
+    bad = base;
+    bad[6] = make(unit, .{ .local_store = .{ .slot = @enumFromInt(2), .value = @enumFromInt(5) } });
+    try t.reject(error.InvalidValueId, &bad, @enumFromInt(5));
+    bad = base;
+    bad[5].op.branch.then_value = @enumFromInt(2);
+    try t.reject(error.InvalidValueId, bad[0..6], @enumFromInt(5));
 }
 
 test "print operands are owned and body publication is atomic under OOM" {

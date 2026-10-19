@@ -372,6 +372,10 @@ test "lowering ownership and source diagnostic rollback survive allocation failu
         "let id: (x: i32) -> i32 = x\nlet main: () -> void = {let x: i32 = id(1)\n@println({let y: i32 = x + x\ny})\n}",
         "let main: () -> void = {let value: i32 = 1\n{let value: i32 = 2\n}\n}",
         "let main: () -> void = {let x: i32 = 1\n@println(x)\nfalse and true\n}",
+        "let main: () -> void = {let mut x: int = 1\nx += if true {2} else {3}\n@println(x)\n}",
+        "let main: () -> void = {let x: int = 1\nx = 2}",
+        "let main: () -> void = {let mut x: int = 1\nx = false}",
+        "let main: () -> void = {let mut x: int = 1\nx.field = 2}",
     }) |source| {
         try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
     }

@@ -12,6 +12,8 @@ const Binding = struct {
     known: Known,
     index: u32 = 0,
     initializer: ?Ast.Node.Index = null,
+    mutable: bool = false,
+    slot: ?Ir.ValueId = null,
     name_span: Module.Span,
 };
 // Bounds recursive checking/probing, not the iterative literal-grouping walk.
@@ -47,11 +49,16 @@ const Emitter = struct {
     instructions: std.ArrayList(Ir.Instruction) = .empty,
     values: std.AutoHashMapUnmanaged(Ast.Node.Index, Ir.ValueId) = .empty,
 
-    fn record(self: *Emitter, node: Ast.Node.Index, ty: Ir.TypeId, span: Ir.Span, op: Ir.Operation) Error!void {
-        if (self.values.contains(node)) return;
+    fn append(self: *Emitter, ty: Ir.TypeId, span: Ir.Span, op: Ir.Operation) Error!Ir.ValueId {
         if (self.instructions.items.len == std.math.maxInt(u32)) return error.TooManyEntries;
         const id: Ir.ValueId = @enumFromInt(self.instructions.items.len);
         try self.instructions.append(self.allocator, .{ .ty = ty, .span = span, .op = op });
+        return id;
+    }
+
+    fn record(self: *Emitter, node: Ast.Node.Index, ty: Ir.TypeId, span: Ir.Span, op: Ir.Operation) Error!void {
+        if (self.values.contains(node)) return;
+        const id = try self.append(ty, span, op);
         try self.values.put(self.allocator, node, id);
     }
 
@@ -145,7 +152,7 @@ const Context = struct {
             try self.module.diagnostics.append(self.module.allocator, .{ .tag = .unsupported_shadowing, .span = name_span, .related = related });
             return false;
         }
-        if (decl.is_mutable or decl.type_node == 0 or std.mem.eql(u8, name, "_")) {
+        if (decl.type_node == 0 or std.mem.eql(u8, name, "_")) {
             _ = try self.fail(.unsupported_local_declaration, node, null);
             return false;
         }
@@ -165,12 +172,20 @@ const Context = struct {
             return false;
         }
         const ty = (try TypeResolver.resolve(self.module, self.ir, decl.type_node)) orelse return false;
+        if (decl.is_mutable and self.ir.getType(ty).? == .void) {
+            _ = try self.fail(.unsupported_local_declaration, node, null);
+            return false;
+        }
         const known: Known = .{ .ty = ty, .annotation = self.module.tokenSpan(ast.firstToken(decl.type_node)) };
         // Publish only after checking/evaluating the initializer: no self or
         // forward local references, and initialization happens exactly once.
         if (try self.expression(decl.init_node, known, depth + 1) == null) return false;
         if (self.terminated) return true;
-        try self.bindLocal(name, .{ .known = known, .initializer = decl.init_node, .name_span = name_span });
+        const slot = if (decl.is_mutable and self.emitter != null)
+            try self.emitter.?.append(ty, self.irSpan(node), .{ .local_slot = try self.emitter.?.value(decl.init_node) })
+        else
+            null;
+        try self.bindLocal(name, .{ .known = known, .initializer = decl.init_node, .name_span = name_span, .mutable = decl.is_mutable, .slot = slot });
         return true;
     }
 
@@ -212,8 +227,8 @@ const Context = struct {
         for (block.ast.statements, 0..) |statement, i| {
             if (ast.nodes.items(.tag)[statement] == .decl) {
                 const decl = ast.decl(statement).ast;
-                if (decl.is_mutable or decl.type_node == 0) return null;
-                const token = decl.let_token + 1;
+                if (decl.type_node == 0) return null;
+                const token = decl.let_token + 1 + @as(u32, @intFromBool(decl.is_mutable));
                 const name = ast.tokenSlice(token);
                 if (self.conflict(name) != null or isPrimitive(name)) return null;
                 const ty = (try TypeResolver.resolve(self.module, self.ir, decl.type_node)) orelse return null;
@@ -273,7 +288,7 @@ const Context = struct {
                 break :blk null;
             },
             .block, .block_two, .block_newline, .block_two_newline => try self.probeBlock(node, depth),
-            .@"if" => .{ .ty = try self.ir.internType(.void) },
+            .@"if", .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod => .{ .ty = try self.ir.internType(.void) },
             .if_else => blk: {
                 const branch = ast.fullIf(node).?.ast;
                 break :blk (try self.probe(branch.then_expr, depth + 1)) orelse try self.probe(branch.else_expr, depth + 1);
@@ -356,6 +371,7 @@ const Context = struct {
             .identifier => blk: {
                 const name = self.module.sourceSlice(self.span(node)).?;
                 if (self.bindings.get(name)) |binding| {
+                    if (binding.slot) |slot| break :blk .{ .local_load = slot };
                     if (binding.initializer) |initializer| {
                         try emitter.values.put(emitter.allocator, node, try emitter.value(initializer));
                         return true;
@@ -471,6 +487,42 @@ const Context = struct {
                 }
                 self.terminated = true;
                 return if (expected) |want| want.ty else unit;
+            },
+            .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod => {
+                if (ast.nodes.items(.tag)[data.lhs] != .identifier) return self.fail(.unsupported_assignment_target, data.lhs, null);
+                const name = self.module.sourceSlice(self.span(data.lhs)).?;
+                const binding = self.bindings.get(name) orelse {
+                    if (self.module.lookup(name)) |id| return self.fail(.immutable_assignment, data.lhs, self.module.getDeclaration(id).?.name_span);
+                    return self.fail(.unknown_name, data.lhs, null);
+                };
+                if (!binding.mutable) return self.fail(.immutable_assignment, data.lhs, binding.name_span);
+                const tag = ast.nodes.items(.tag)[node];
+                const compound = tag != .assign;
+                if (compound and self.ir.getType(binding.known.ty).? != .integer) return self.fail(.operator_not_supported, node, binding.known.annotation);
+                // Capture the old value before RHS effects, just as for binary
+                // arithmetic. A returning RHS never performs the final store.
+                if (compound and try self.expression(data.lhs, binding.known, depth + 1) == null) return null;
+                if (try self.expression(data.rhs, binding.known, depth + 1) == null) return null;
+                const unit = try self.ir.internType(.void);
+                if (!self.terminated) {
+                    if (self.emitter) |emitter| {
+                        var value = try emitter.value(data.rhs);
+                        if (compound) value = try emitter.append(binding.known.ty, self.irSpan(node), .{ .binary = .{
+                            .op = switch (tag) {
+                                .assign_add => .add,
+                                .assign_sub => .sub,
+                                .assign_mul => .mul,
+                                .assign_div => .div,
+                                .assign_mod => .mod,
+                                else => unreachable,
+                            },
+                            .lhs = try emitter.value(data.lhs),
+                            .rhs = value,
+                        } });
+                        try emitter.record(node, unit, self.irSpan(node), .{ .local_store = .{ .slot = binding.slot.?, .value = value } });
+                    }
+                }
+                return self.fit(unit, expected, node);
             },
             .number_literal => return self.fail(.literal_needs_type, node, null),
             .char_literal, .string_literal => return self.fail(.unsupported_literal, node, null),
@@ -596,6 +648,40 @@ const Context = struct {
         }
     }
 };
+
+test "assignment diagnostics identify targets mutability types and lexical scope" {
+    const Case = struct { body: []const u8, tag: Module.Diagnostic.Tag, token: []const u8 };
+    for ([_]Case{
+        .{ .body = "{let n: int = 1\nn = 2}", .tag = .immutable_assignment, .token = "n" },
+        .{ .body = "{p += 1}", .tag = .immutable_assignment, .token = "p" },
+        .{ .body = "{g = 2}", .tag = .immutable_assignment, .token = "g" },
+        .{ .body = "{missing = 1}", .tag = .unknown_name, .token = "missing" },
+        .{ .body = "{let mut n: int = 1\nn = true}", .tag = .literal_type_mismatch, .token = "true" },
+        .{ .body = "{let mut n: int = 1\nn = p}", .tag = .expression_type_mismatch, .token = "p" },
+        .{ .body = "{let mut b: bool = true\nb += false}", .tag = .operator_not_supported, .token = "+=" },
+        .{ .body = "{let mut n: int = 1\nn + n = 2}", .tag = .unsupported_assignment_target, .token = "+" },
+        .{ .body = "{let mut n: int = 1\nn.x = 2}", .tag = .unsupported_assignment_target, .token = "." },
+        .{ .body = "{let mut n: int = 1\nn[0] = 2}", .tag = .unsupported_assignment_target, .token = "[" },
+        .{ .body = "{let mut n: int = n\n}", .tag = .unknown_name, .token = "n" },
+        .{ .body = "{if true {let mut n: int = 1\n}\nn = 2}", .tag = .unknown_name, .token = "n" },
+        .{ .body = "{let mut n: int = 1\n{let mut n: int = 2\n}}", .tag = .unsupported_shadowing, .token = "n" },
+        .{ .body = "{let mut n: int = 1\nlet x: int = {n = 2}\n}", .tag = .expression_type_mismatch, .token = "=" },
+    }) |case| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let g: int = 0\nlet f: (p: bool) -> void = {s}", .{case.body});
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "assign.nov", source);
+        defer module.deinit();
+        errdefer std.debug.print("assignment case: {s}\n", .{case.body});
+        try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+        var sema = try @import("Lowering.zig").lower(&module);
+        defer sema.deinit();
+        try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+        try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
+        try std.testing.expectEqualStrings(case.token, module.sourceSlice(module.diagnostics.items[0].span).?);
+        try std.testing.expect(!sema.lowering_complete);
+    }
+}
 
 test "returns use enclosing signatures and merge only continuing paths" {
     var module = try Module.init(std.testing.allocator, "return.nov",
@@ -739,7 +825,7 @@ test "local scope declaration and block result diagnostics" {
         .{ .body = "{let n: i32 = 1\nlet n: i32 = 2\nn}", .tag = .unsupported_shadowing },
         .{ .body = "{let p: i32 = 1\np}", .tag = .unsupported_shadowing },
         .{ .body = "{let i32: i32 = 1\ni32}", .tag = .unsupported_shadowing },
-        .{ .body = "{let mut n: i32 = 1\nn}", .tag = .unsupported_local_declaration },
+        .{ .body = "{let mut n: void = {}\nn}", .tag = .unsupported_local_declaration },
         .{ .body = "{let n = 1\nn}", .tag = .unsupported_local_declaration },
         .{ .body = "{let n: i32\nn}", .tag = .missing_initializer },
         .{ .body = "{let n: i8 = 128\nn}", .tag = .literal_out_of_range },
@@ -747,7 +833,7 @@ test "local scope declaration and block result diagnostics" {
         .{ .body = "{let f: i32 = 1\nf}", .tag = .unsupported_shadowing },
         .{ .body = "{let n: i32 = true\nn}", .tag = .literal_type_mismatch },
         .{ .body = "{let n: int = 1\nlet u: uint = n\np}", .tag = .expression_type_mismatch },
-        .{ .body = "{let n: i32 = 1\nn = 2\nn}", .tag = .unsupported_body_expression },
+        .{ .body = "{let n: i32 = 1\nn = 2\nn}", .tag = .immutable_assignment },
         .{ .body = "{let n: i32 = 1\n{let hidden: i32 = n\n}\nhidden} + 1", .tag = .unknown_name },
         .{ .body = "{let n: i32 = 1\n}", .tag = .expression_type_mismatch },
         .{ .body = "{p\np}", .tag = .unused_block_value },
@@ -879,7 +965,6 @@ test "body errors identify mismatched returns operands names and calls" {
 test "control flow and parameter shadowing stay explicitly unsupported" {
     for ([_][]const u8{
         "let f: () -> i32 = label: {42}",
-        "let f: (value: i32) = {value += 1}",
     }) |source| {
         var module = try Module.init(std.testing.allocator, "unsupported.nov", source);
         defer module.deinit();

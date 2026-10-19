@@ -1,8 +1,8 @@
 //! C11 backend foundation for verified typed IR.
 //!
 //! Emits one translation unit with externally visible `nov_`-prefixed functions
-//! and function-pointer typedefs. IR values become ordered locals (only a
-//! conditional merge needs a mutable temporary), so
+//! and function-pointer typedefs. IR values become ordered const locals;
+//! local slots and conditional merges use mutable temporaries, so
 //! the IR's callee-first, left-to-right order is preserved without relying on C
 //! argument evaluation order.
 //!
@@ -309,6 +309,12 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
     value_used[@intFromEnum(body.result)] = true;
     for (body.instructions) |instruction| switch (instruction.op) {
         .parameter => |index| param_used[index] = true,
+        .local_slot => |value| value_used[@intFromEnum(value)] = true,
+        .local_load => |slot| value_used[@intFromEnum(slot)] = true,
+        .local_store => |store| {
+            value_used[@intFromEnum(store.slot)] = true;
+            value_used[@intFromEnum(store.value)] = true;
+        },
         .unary => |unary| value_used[@intFromEnum(unary.operand)] = true,
         .binary => |binary| {
             value_used[@intFromEnum(binary.lhs)] = true;
@@ -389,6 +395,11 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
             } else try w.writeAll("    return;\n");
             continue;
         }
+        if (instruction.op == .local_store) {
+            const store = instruction.op.local_store;
+            try w.print("    v{d} = v{d};\n", .{ @intFromEnum(store.slot), @intFromEnum(store.value) });
+            continue;
+        }
         if (ty == .void) {
             // Void values have no C object; emit their effects as statements.
             if (instruction.op == .print) try writePrint(ir, w, body, instruction.op.print);
@@ -399,12 +410,13 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
             }
             continue;
         }
-        try w.writeAll("    const ");
+        try w.writeAll(if (instruction.op == .local_slot) "    " else "    const ");
         try writeType(ir, w, instruction.ty);
         try w.print(" v{d} = ", .{i});
         switch (instruction.op) {
             .constant => |id| try writeConstant(w, ir.constants.items[@intFromEnum(id)], ty),
             .parameter => |index| try w.print("p{d}", .{index}),
+            .local_slot, .local_load => |value| try w.print("v{d}", .{@intFromEnum(value)}),
             .function_ref => |id| try writeFunctionName(w, ir.functions.items[@intFromEnum(id)].name),
             .unary => |unary| switch (unary.op) {
                 .bool_not => try w.print("!v{d}", .{@intFromEnum(unary.operand)}),
@@ -454,10 +466,10 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
                 try w.print("v{d} {s} v{d}", .{ @intFromEnum(binary.lhs), operator, @intFromEnum(binary.rhs) });
             },
             .call => |call| try writeCall(w, call),
-            .return_value, .print, .short_circuit, .branch => unreachable,
+            .return_value, .print, .short_circuit, .branch, .local_store => unreachable,
         }
         try w.writeAll(";\n");
-        if (!value_used[i]) try w.print("    (void)v{d};\n", .{i});
+        if (!value_used[i] or instruction.op == .local_slot) try w.print("    (void)v{d};\n", .{i});
     }
     const result_type = ir.types.items[@intFromEnum(signature.result)];
     if (result_type != .void and !Ir.terminates(body, body.result)) try w.print("    return v{d};\n", .{@intFromEnum(body.result)});
@@ -504,6 +516,134 @@ fn emitSource(source: []const u8, diagnostic: ?*Diagnostic) ![]u8 {
     try std.testing.expect(!module.hasErrors());
     try std.testing.expect(sema.lowering_complete);
     return emit(test_gpa, &sema.ir, diagnostic);
+}
+
+test "mutable locals snapshot reads and preserve conditional sequential effects" {
+    const c = try emitSource(
+        \\let mark: (n: int) -> int = {@print(n)
+        \\    n}
+        \\let id: (n: int) -> int = n
+        \\let next: (n: int) -> int = n + 1
+        \\let out: () -> void = {
+        \\    let mut n: int = mark(1)
+        \\    let saved: int = n
+        \\    @println(n, {n = mark(2)
+        \\        n}, n, saved)
+        \\    n += {n = mark(10)
+        \\        mark(3)}
+        \\    @println(n)
+        \\    if true {n *= 2} else {n = 99}
+        \\    if false {n = 99} else if true {n -= 1}
+        \\    @println(n)
+        \\    let mut b: bool = false
+        \\    @println(false and {n = 99
+        \\        true}, true or {n = 99
+        \\        false}, true and {n += 1
+        \\        b = true
+        \\        b}, b, n)
+        \\    let mut callback: (int) -> int = id
+        \\    @println(callback({callback = next
+        \\        20}), callback(20))
+        \\    {let mut local: int = 30
+        \\        local += 1
+        \\        n = local}
+        \\    {let mut local: int = 40
+        \\        n += local}
+        \\    @println(n)
+        \\    let unit: void = {n = 8}
+        \\    let mut unused: int = 0
+        \\    unused = 1
+        \\    @println(n)
+        \\}
+    , null);
+    defer test_gpa.free(c);
+    try compileAndRunExpected(c, "void nov_out(void); int main(void) { nov_out(); return 0; }", 0, "121 2 2 1\n1035\n9\nfalse true true true 10\n20 21\n71\n8\n", "");
+}
+
+test "compound assignments reuse wrapping division and remainder semantics" {
+    const c = try emitSource(
+        \\let out: () -> void = {
+        \\    let mut s: i8 = 127
+        \\    s += 1
+        \\    @println(s)
+        \\    s /= -1
+        \\    @println(s)
+        \\    s %= -1
+        \\    s -= 1
+        \\    s *= 3
+        \\    @println(s)
+        \\    let mut u: u8 = 255
+        \\    u += 1
+        \\    u -= 1
+        \\    u *= 2
+        \\    u /= 2
+        \\    u %= 10
+        \\    @println(u)
+        \\}
+        \\let divide: () -> void = {let mut n: int = 1
+        \\    n /= {@print(true)
+        \\        0}}
+        \\let remainder: () -> void = {let mut n: int = 1
+        \\    n %= 0}
+    , null);
+    defer test_gpa.free(c);
+    try compileAndRunExpected(c, "void nov_out(void); int main(void) { nov_out(); return 0; }", 0, "-128\n-128\n-3\n7\n", "");
+    try compileAndRunExpected(c, "void nov_divide(void); int main(void) { nov_divide(); return 0; }", 1, "true", "panic: division by zero\n");
+    try compileAndRunExpected(c, "void nov_remainder(void); int main(void) { nov_remainder(); return 0; }", 1, "", "panic: remainder by zero\n");
+}
+
+test "assignment and initializer returns skip stores and subsequent effects" {
+    const c = try emitSource(
+        \\let early: (c: bool) -> int = {
+        \\    let mut n: int = 1
+        \\    n += if c {n = 4
+        \\        return n} else {n = 8
+        \\        2}
+        \\    return n
+        \\}
+        \\let abort: () -> int = {let mut n: int = 1
+        \\    n = {return n}}
+        \\let init: () -> int = {let mut n: int = {return 7}
+        \\}
+        \\let short: (c: bool) -> int = {let mut n: int = 1
+        \\    let b: bool = c and {n += 1
+        \\        return n}
+        \\    if b {n = 99}
+        \\    n}
+        \\let out: () -> void = @println(early(true), early(false), abort(), init(), short(true), short(false))
+    , null);
+    defer test_gpa.free(c);
+    try compileAndRunExpected(c, "void nov_out(void); int main(void) { nov_out(); return 0; }", 0, "4 3 1 7 2 1\n", "");
+}
+
+fn testMutableAllocationFailures(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "mutable.nov",
+        \\let id: (n: int) -> int = n
+        \\let f: (c: bool) -> int = {let mut n: int = id(1)
+        \\    let mut callback: (int) -> int = id
+        \\    let b: bool = c and {n += callback(n)
+        \\        true}
+        \\    n += if b {return n} else {callback = id
+        \\        callback(n)}
+        \\    n}
+        \\let main: () -> void = @println(f(true), f(false))
+    );
+    var result = Lowering.lower(&module) catch |err| {
+        module.deinit();
+        return err;
+    };
+    defer result.deinit();
+    const failed = module.hasErrors();
+    module.deinit();
+    try std.testing.expect(!failed);
+    try std.testing.expect(result.lowering_complete);
+    try result.ir.verify();
+    const c = try emitProgram(allocator, &result.ir, null);
+    defer allocator.free(c);
+}
+
+test "mutable slot ownership lowering and emission survive every allocation failure" {
+    try std.testing.checkAllAllocationFailures(test_gpa, testMutableAllocationFailures, .{});
 }
 
 test "early returns preserve effects fallbacks nested merges and function values" {
