@@ -122,6 +122,15 @@ const Context = struct {
         return .{ .ty = ty, .annotation = if (full.ast.type_node != 0) self.module.tokenSpan(self.module.ast.firstToken(full.ast.type_node)) else null };
     }
 
+    fn printing(self: *Context, node: Ast.Node.Index) ?bool {
+        const ast = &self.module.ast;
+        if (ast.nodes.items(.tag)[node] != .builtin_literal) return null;
+        const name = self.module.sourceSlice(self.span(node)).?;
+        if (std.mem.eql(u8, name, "@print")) return false;
+        if (std.mem.eql(u8, name, "@println")) return true;
+        return null;
+    }
+
     // Finds an already determined operand type without defaulting integer literals
     // or diagnosing unbound names. The actual walk still checks both operands.
     fn probe(self: *Context, node: Ast.Node.Index, depth: usize) Error!?Known {
@@ -148,6 +157,7 @@ const Context = struct {
             .bool_not, .bool_and, .bool_or, .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal => .{ .ty = try self.ir.internType(.boolean) },
             .call, .call_one => blk: {
                 const call = ast.fullCall(node).?;
+                if (self.printing(call.ast.fn_expr) != null) break :blk .{ .ty = try self.ir.internType(.void) };
                 const callee = (try self.probe(call.ast.fn_expr, depth + 1)) orelse break :blk null;
                 const ty = self.ir.getType(callee.ty).?;
                 if (ty != .function) break :blk null;
@@ -271,6 +281,7 @@ const Context = struct {
                 const call = ast.fullCall(node).?;
                 const args = try emitter.allocator.alloc(Ir.ValueId, call.ast.args.len);
                 for (call.ast.args, args) |arg, *value| value.* = try emitter.value(arg);
+                if (self.printing(call.ast.fn_expr)) |newline| break :blk .{ .print = .{ .args = args, .newline = newline } };
                 break :blk .{ .call = .{ .callee = try emitter.value(call.ast.fn_expr), .args = args } };
             },
             else => {
@@ -370,6 +381,22 @@ const Context = struct {
             },
             .call, .call_one => {
                 const call = ast.fullCall(node).?;
+                if (self.printing(call.ast.fn_expr) != null) {
+                    var valid = true;
+                    for (call.ast.args) |arg| {
+                        const arg_type = (try self.expression(arg, null, depth + 1)) orelse {
+                            valid = false;
+                            continue;
+                        };
+                        const arg_ty = self.ir.getType(arg_type).?;
+                        if (arg_ty != .boolean and arg_ty != .integer) {
+                            _ = try self.fail(.unsupported_body_expression, arg, null);
+                            valid = false;
+                        }
+                    }
+                    if (!valid) return null;
+                    return self.fit(try self.ir.internType(.void), expected, node);
+                }
                 const callee = (try self.expression(call.ast.fn_expr, null, depth + 1)) orelse return null;
                 const origin = try self.probe(call.ast.fn_expr, depth + 1);
                 const annotation = if (origin) |known| known.annotation else null;
@@ -387,6 +414,38 @@ const Context = struct {
         }
     }
 };
+
+test "printing accepts typed scalar arguments and returns void" {
+    var module = try Module.init(std.testing.allocator, "print.nov", "let empty: () -> void = @print()\nlet line: () -> void = @println()\nlet out: (a: i8, b: u64, c: bool) -> void = @println(a, b, c, true, false, a + 1)");
+    defer module.deinit();
+    var sema = try @import("Sema.zig").analyzeFunctions(&module);
+    defer sema.deinit();
+    try std.testing.expect(!module.hasErrors());
+    for (sema.entries) |entry| try std.testing.expectEqual(@import("Sema.zig").Status.body_checked, entry.status);
+}
+
+test "printing rejects unresolved literals non-scalars unsupported builtins and nonvoid results" {
+    const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag };
+    for ([_]Case{
+        .{ .source = "let f: () -> void = @println(1)", .tag = .literal_needs_type },
+        .{ .source = "let f: () -> void = @println(-1)", .tag = .literal_needs_type },
+        .{ .source = "let f: () -> void = @println(\"text\")", .tag = .unsupported_literal },
+        .{ .source = "let f: () -> void = @println({})", .tag = .unsupported_body_expression },
+        .{ .source = "let f: () -> void = @println(f)", .tag = .unsupported_body_expression },
+        .{ .source = "let f: () -> void = @println(@print())", .tag = .unsupported_body_expression },
+        .{ .source = "let f: () -> bool = @println(true)", .tag = .expression_type_mismatch },
+        .{ .source = "let f: () -> void = @println(missing)", .tag = .unknown_name },
+        .{ .source = "let f: () -> void = @max(true)", .tag = .unsupported_body_expression },
+        .{ .source = "let f: () -> void = @print", .tag = .unsupported_body_expression },
+    }) |case| {
+        var module = try Module.init(std.testing.allocator, "print.nov", case.source);
+        defer module.deinit();
+        var sema = try @import("Sema.zig").analyzeFunctions(&module);
+        defer sema.deinit();
+        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+        try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
+    }
+}
 
 test "function parameters literals arithmetic and forward calls type-check" {
     var module = try Module.init(std.testing.allocator, "functions.nov", "let caller: () -> i32 = add(1, 2)\nlet add: (a: i32, b: i32) -> i32 = {a + b}\nlet minimum: () -> i8 = -{128}\nlet empty: () = {}\nlet overflow_pending: () -> i8 = 127 + 1");

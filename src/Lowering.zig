@@ -57,6 +57,29 @@ pub fn lower(module: *Module) Error!Sema {
     return result;
 }
 
+test "printing lowers owned ordered arguments and operation spans" {
+    var module = try Module.init(std.testing.allocator, "print.nov", "let id: (x: i32) -> i32 = x\nlet main: () -> void = @println(id(1), id(2), true)");
+    var sema = lower(&module) catch |err| {
+        module.deinit();
+        return err;
+    };
+    defer sema.deinit();
+    defer module.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    const body = sema.ir.functions.items[1].body.?;
+    const instruction = body.instructions[body.instructions.len - 1];
+    try std.testing.expect(instruction.op.print.newline);
+    try std.testing.expectEqualStrings("@println(id(1), id(2), true)", module.ast.source[instruction.span.start..instruction.span.end]);
+    const args = instruction.op.print.args;
+    try std.testing.expectEqual(@as(usize, 3), args.len);
+    try std.testing.expect(@intFromEnum(args[0]) < @intFromEnum(args[1]));
+    try std.testing.expect(@intFromEnum(args[1]) < @intFromEnum(args[2]));
+    try std.testing.expect(body.instructions[@intFromEnum(args[0])].op == .call);
+    try std.testing.expect(body.instructions[@intFromEnum(args[1])].op == .call);
+    try sema.ir.verify();
+}
+
 test "checked parameter arithmetic lowers into typed ordered values" {
     var module = try Module.init(std.testing.allocator, "add.nov", "let add: (a: i32, b: i32) -> i32 = a + b");
     defer module.deinit();
@@ -169,7 +192,7 @@ test "deferred and mutable globals cannot silently become executable constants" 
 }
 
 test "lowered functions names and call arguments outlive source and scratch arenas" {
-    var module = try Module.init(std.testing.allocator, "owned.nov", "let id: (x: i32) -> i32 = x\nlet main: () -> i32 = id(42)");
+    var module = try Module.init(std.testing.allocator, "owned.nov", "let id: (x: i32) -> i32 = x\nlet main: () -> i32 = id(42)\nlet out: () -> void = @println(id(1), true)");
     var sema = lower(&module) catch |err| {
         module.deinit();
         return err;
@@ -241,6 +264,8 @@ test "lowering ownership and source diagnostic rollback survive allocation failu
         "",
         "let f: (a: i32, b: i32) -> i32 = a + b\nlet main: () -> i32 = f(1, f(2, 3))",
         "let first: () = {}\nlet last: () -> bool = true and false",
+        "let id: (x: i32) -> i32 = x\nlet main: () -> void = @println(true, id(1), id(2))",
+        "let main: () -> void = @println(true, missing, 1)",
         "let mut value: i32 = 1\nlet main: () -> i32 = value",
     }) |source| {
         try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});

@@ -32,6 +32,7 @@ pub const Operation = union(enum) {
     unary: struct { op: UnaryOp, operand: ValueId },
     binary: struct { op: BinaryOp, lhs: ValueId, rhs: ValueId },
     call: struct { callee: ValueId, args: []const ValueId },
+    print: struct { args: []const ValueId, newline: bool },
 };
 
 pub const Type = union(enum) {
@@ -154,18 +155,26 @@ pub fn setFunctionBody(self: *Ir, id: FunctionId, instructions: []const Instruct
     const owned = try self.allocator.dupe(Instruction, instructions);
     var copied: usize = 0;
     errdefer {
-        for (owned[0..copied]) |instruction| {
-            if (instruction.op == .call) self.allocator.free(instruction.op.call.args);
-        }
+        for (owned[0..copied]) |instruction| self.freeOperands(instruction.op);
         self.allocator.free(owned);
     }
     for (owned) |*instruction| {
-        if (instruction.op == .call) {
-            instruction.op.call.args = try self.allocator.dupe(ValueId, instruction.op.call.args);
+        switch (instruction.op) {
+            .call => |*call| call.args = try self.allocator.dupe(ValueId, call.args),
+            .print => |*print| print.args = try self.allocator.dupe(ValueId, print.args),
+            else => {},
         }
         copied += 1;
     }
     self.functions.items[@intFromEnum(id)].body = .{ .instructions = owned, .result = result };
+}
+
+fn freeOperands(self: *Ir, op: Operation) void {
+    switch (op) {
+        .call => |call| self.allocator.free(call.args),
+        .print => |print| self.allocator.free(print.args),
+        else => {},
+    }
 }
 
 /// Invalidates all function handles and borrowed function/body views, not pools.
@@ -174,7 +183,7 @@ pub fn clearFunctions(self: *Ir) void {
         self.allocator.free(function.name);
         if (function.body) |body| {
             for (body.instructions) |instruction| {
-                if (instruction.op == .call) self.allocator.free(instruction.op.call.args);
+                self.freeOperands(instruction.op);
             }
             self.allocator.free(body.instructions);
         }
@@ -303,6 +312,13 @@ fn validateBody(self: *const Ir, function: Function, body: Body) VerifyError!voi
                     },
                 }
             },
+            .print => |print| {
+                if (ty != .void) return error.InvalidOperation;
+                for (print.args) |arg| {
+                    const operand = self.getType(try operandType(body, arg, i)) orelse return error.InvalidTypeId;
+                    if (operand != .boolean and operand != .integer) return error.InvalidOperation;
+                }
+            },
             .call => |call| {
                 const callee_id = try operandType(body, call.callee, i);
                 const callee = self.getType(callee_id) orelse return error.InvalidTypeId;
@@ -376,6 +392,66 @@ fn typeEql(a: Type, b: Type) bool {
         .function => |function| function.result == b.function.result and
             std.mem.eql(TypeId, function.params, b.function.params),
     };
+}
+
+fn testPrintAllocationFailures(allocator: std.mem.Allocator) !void {
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    const void_ty = try ir.internType(.void);
+    const boolean = try ir.internType(.boolean);
+    const signature = try ir.internType(.{ .function = .{ .params = &.{boolean}, .result = void_ty } });
+    const function = try ir.addFunction("print", signature, .{ .start = 0, .end = 0 });
+    var args = [_]ValueId{@enumFromInt(0)};
+    const instructions = [_]Instruction{
+        .{ .ty = boolean, .span = .{ .start = 0, .end = 0 }, .op = .{ .parameter = 0 } },
+        .{ .ty = void_ty, .span = .{ .start = 0, .end = 0 }, .op = .{ .print = .{ .args = &args, .newline = false } } },
+        .{ .ty = void_ty, .span = .{ .start = 0, .end = 0 }, .op = .{ .print = .{ .args = &args, .newline = true } } },
+    };
+    ir.setFunctionBody(function, &instructions, @enumFromInt(2)) catch |err| {
+        try std.testing.expect(ir.functions.items[0].body == null);
+        return err;
+    };
+    args[0] = @enumFromInt(999);
+    try ir.verify();
+    const body = ir.functions.items[0].body.?;
+    try std.testing.expectEqual(@as(u32, 0), @intFromEnum(body.instructions[1].op.print.args[0]));
+    try std.testing.expectEqual(@as(u32, 0), @intFromEnum(body.instructions[2].op.print.args[0]));
+}
+
+test "print operands are owned and body publication is atomic under OOM" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testPrintAllocationFailures, .{});
+}
+
+test "print verification checks result types scalar arguments and prior operands" {
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    const void_ty = try ir.internType(.void);
+    const boolean = try ir.internType(.boolean);
+    const unit = try ir.internConstant(.{ .ty = void_ty, .value = .void });
+    const signature = try ir.internType(.{ .function = .{ .params = &.{boolean}, .result = void_ty } });
+    const function = try ir.addFunction("print", signature, .{ .start = 0, .end = 0 });
+    var instructions = [_]Instruction{
+        .{ .ty = boolean, .span = .{ .start = 0, .end = 0 }, .op = .{ .parameter = 0 } },
+        .{ .ty = void_ty, .span = .{ .start = 0, .end = 0 }, .op = .{ .print = .{ .args = &.{@enumFromInt(0)}, .newline = true } } },
+    };
+    instructions[1].ty = boolean;
+    try std.testing.expectError(error.InvalidOperation, ir.setFunctionBody(function, &instructions, @enumFromInt(1)));
+    instructions[1].ty = void_ty;
+    for ([_]u32{ 1, 99 }) |index| {
+        instructions[1].op.print.args = &.{@enumFromInt(index)};
+        try std.testing.expectError(error.InvalidValueId, ir.setFunctionBody(function, &instructions, @enumFromInt(1)));
+    }
+    instructions[1].op.print.args = &.{@enumFromInt(0)};
+    instructions[0] = .{ .ty = void_ty, .span = .{ .start = 0, .end = 0 }, .op = .{ .constant = unit } };
+    try std.testing.expectError(error.InvalidOperation, ir.setFunctionBody(function, &instructions, @enumFromInt(1)));
+    instructions[0] = .{ .ty = signature, .span = .{ .start = 0, .end = 0 }, .op = .{ .function_ref = function } };
+    try std.testing.expectError(error.InvalidOperation, ir.setFunctionBody(function, &instructions, @enumFromInt(1)));
+    instructions[1].op.print.args = &.{};
+    try ir.setFunctionBody(function, &instructions, @enumFromInt(1));
+    try ir.verify();
+    const owned = @constCast(ir.functions.items[0].body.?.instructions);
+    owned[1].ty = boolean;
+    try std.testing.expectError(error.InvalidOperation, ir.verify());
 }
 
 test "types and constants have canonical typed identities" {

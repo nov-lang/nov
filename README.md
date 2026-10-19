@@ -39,7 +39,8 @@ with source spans and ordered operands/call arguments. It requires immutable
 literal globals; unit/global block initializers and short-circuit `and`/`or` are
 not lowered yet. An internal C11 backend emits verified IR, including fixed-width
 integer arithmetic and program entrypoint emission through `emit-c`.
-CLI compilation/execution and printing remain unimplemented. Plain `check` remains syntax-only.
+`@print`/`@println` support booleans and explicitly typed fixed-width integers.
+CLI compilation/execution remains unimplemented. Plain `check` remains syntax-only.
 
 Use `zig build run -- check --semantic file.nov` for the current bounded
 semantic/lowering subset. It runs declaration collection, initializer dependency
@@ -70,12 +71,34 @@ let helper: () -> void = {}
 let main: () -> void = helper()
 ```
 
-The C wrapper exits 0 when Nov `main` returns; arithmetic panics exit 1 and report
-to stderr. Library `CEmitter.emit` still emits no C `main`; only
+The C wrapper exits 0 when Nov `main` returns and the final stdout flush succeeds;
+arithmetic and stdout failures panic with exit status 1. A panic first attempts to
+flush stdout, then writes `panic: <message>\n` to stderr (no backtrace yet).
+Library `CEmitter.emit` still emits no C `main`; only
 `CEmitter.emitProgram` adds the wrapper. Backend integer widths are restricted to
 8, 16, 32 and 64 bits, including nested function signatures, with source diagnostics
-for unsupported widths. Printing, build/run commands and compiler discovery remain
-outside this slice.
+for unsupported widths. Build/run commands and compiler discovery remain
+unimplemented.
+
+`@print` and `@println` return `void` and write arguments to buffered stdout,
+separated by one space. Booleans use `true`/`false`; integers use decimal notation.
+`@println` appends a newline, including when called without arguments; `@print()`
+outputs nothing. Arguments are evaluated left to right before the builtin writes
+any output. Each stdout write and the program's final flush are checked; failure
+panics with `panic: stdout write failed`. Runtime helpers are libc-only, `static`,
+and emitted only when used. Library emission has no exit wrapper: the embedding
+caller is responsible for its final stdout flush.
+
+```nov
+let number: i64 = -42
+let main: () -> void = @println(true, number)
+```
+
+This outputs `true -42` followed by a newline. Bare integer literals such as
+`@println(42)` still require a type context: use a typed global, parameter, or
+function result. There is no default `int`/`uint` width. Strings/interpolation,
+function values and void arguments remain unsupported for printing; the C backend
+continues to reject widths other than 8/16/32/64.
 
 Format files in place with `zig build run -- fmt file.nov`, or use
 `zig build run -- fmt --check file.nov` to check formatting without writing.
@@ -743,9 +766,8 @@ TODO
 - `@TypeOf(...)`: Returns the type of a value.
 - `@typeInfo(...)`: Returns type information about a value.
 - `@This()`: Returns the type of the current container
-- `@print(...)`: Output all args separated with a space to stdout. (supports string interpolation)
-                 TODO: what about printf? what about print to another file?
-- `@println(...)`: Same as print with a newline at the end.
+- `@print(...)`: Output bool/fixed-width integer args separated with a space to stdout; returns void. Strings/interpolation are not implemented yet.
+- `@println(...)`: Same as print with a newline at the end, including with no args.
 - `@fprint(file: File, ...)`: Same as print but output to a specific file. Returns a Result<>.
 <!-- - `@eprint(...)`: Same as print but output to stderr. -->
 <!-- - `@printf(fmt: #string, args: ...)` works like std.fmt.format and print to stdout -->
