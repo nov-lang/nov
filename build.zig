@@ -78,6 +78,7 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     _ = fixtures.add("valid.nov", "let answer = 1 + 2 * 3\n");
     _ = fixtures.add("another-valid.nov", "let text = \"hello\"\n");
     _ = fixtures.add("no-final-newline.nov", "let answer = 42");
+    _ = fixtures.add("syntax-only.nov", "let name = absent\nlet name = 42\n");
     _ = fixtures.add("invalid.nov", "let broken =");
     _ = fixtures.add("unsupported-loop.nov", "let value = loop {}\n");
     _ = fixtures.add("arrays.nov", "let values = [[\n], [1,], [1, 2, 3,\n],]");
@@ -102,6 +103,7 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         .{ .name = "check rejects --check", .args = &.{ "check", "--check", "valid.nov" }, .exit_code = 1, .stderr_match = "--check" },
         .{ .name = "--check requires fmt", .args = &.{"--check"}, .exit_code = 1, .stderr_match = "--check" },
         .{ .name = "check valid syntax", .args = &.{ "check", "valid.nov" }, .exit_code = 0 },
+        .{ .name = "check remains syntax only", .args = &.{ "check", "syntax-only.nov" }, .exit_code = 0 },
         .{ .name = "check array separators", .args = &.{ "check", "arrays.nov" }, .exit_code = 0 },
         .{ .name = "check unclosed array", .args = &.{ "check", "unclosed-array.nov" }, .exit_code = 1, .stderr_match = "unclosed-array.nov:1:16: error: expected ']', found 'EOF'" },
         .{ .name = "check without final newline", .args = &.{ "check", "no-final-newline.nov" }, .exit_code = 0 },

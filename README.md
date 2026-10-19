@@ -26,8 +26,9 @@ Check syntax in one or more files with `zig build run -- check file.nov`.
 Diagnostics include the filename, line, column, source line, and a caret. Invalid
 input or unreadable files produce a nonzero exit status. Compilation and execution
 of Nov programs are not implemented yet. The new typed IR currently provides
-owned, canonical type/constant storage and verification; semantic analysis and
-C generation are not connected to the CLI yet.
+owned, canonical type/constant storage and verification. Internal module
+collection supports declaration lookup and duplicate/unknown-name diagnostics;
+body/type checking and C generation are not connected to the CLI yet.
 
 Format files in place with `zig build run -- fmt file.nov`, or use
 `zig build run -- fmt --check file.nov` to check formatting without writing.
