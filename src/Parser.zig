@@ -617,11 +617,8 @@ fn parseElseExpr(self: *Parser) Error!Node.Index {
 ///     <- (AMPERSAND? IDENTIFIER)+ KEYWORD_in (Expr (DOT2 Expr?)?)+
 ///      / Expr (COLON AssignExpr)?
 fn parseLoopExpr(self: *Parser) Error!Node.Index {
-    const for_token = self.assertToken(.keyword_loop);
-    _ = for_token;
-    unreachable;
-
-    // const inputs = try self.parseForEachInput();
+    const loop_token = self.assertToken(.keyword_loop);
+    return self.failMsg(.{ .tag = .unsupported_loop, .token = loop_token });
 }
 
 /// AssignExpr <- Expr (AssignOp Expr)?
@@ -1627,6 +1624,7 @@ test "parser ownership survives allocation failures" {
     const sources = [_][:0]const u8{
         "",
         "let answer: int = 1 + 2",
+        "let value = loop {}\nlet f: () = {\nloop {}\nlet valid = 42\nvalid\n}",
         "let add: (a: int, b: int, c: int) -> int = {\nlet sum = a + b\nlet result = sum + c\nresult\n}\nlet answer = add(1, 2, 3)",
         "let value = {\nlet broken =\nlet valid = 42\nvalid\n}\nlet missing =",
         "let a =\nlet b =\nlet c =\nlet d =\nlet e =\nlet f =\nlet g =\nlet h =",
@@ -1634,6 +1632,46 @@ test "parser ownership survives allocation failures" {
     for (sources) |source| {
         try std.testing.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
     }
+}
+
+test "unsupported loops diagnose their keyword and preserve following declarations" {
+    const expressions = [_][]const u8{
+        "loop {}",
+        "loop item in items {\nlet hidden = 0\n}",
+        "loop i < 10 : i += 1 {}",
+        "loop {} else {}",
+        "outer: loop {}",
+    };
+    for (expressions) |expression| {
+        const source = try std.fmt.allocPrintSentinel(std.testing.allocator, "let value = {s}\nlet valid = 42", .{expression}, 0);
+        defer std.testing.allocator.free(source);
+        var ast = try parse(std.testing.allocator, source);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 1), ast.errors.len);
+        try std.testing.expectEqual(Ast.Error.Tag.unsupported_loop, ast.errors[0].tag);
+        try std.testing.expectEqual(Token.Tag.keyword_loop, ast.tokens.items(.tag)[ast.errors[0].token]);
+        try std.testing.expectEqual(std.mem.indexOf(u8, source, "loop").?, ast.tokens.items(.start)[ast.errors[0].token]);
+        try std.testing.expectEqual(@as(usize, 1), ast.rootDecls().len);
+        const declaration = ast.decl(ast.rootDecls()[0]);
+        try std.testing.expectEqualStrings("valid", ast.tokenSlice(declaration.ast.let_token + 1));
+    }
+}
+
+test "unsupported loops recover within blocks and at EOF" {
+    var ast = try parse(std.testing.allocator, "let f: () = {\nouter: loop {\nlet hidden = 0\n}\nlet valid = 42\nvalid\n}\nlet after = 0");
+    defer ast.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), ast.errors.len);
+    try std.testing.expectEqual(@as(usize, 2), ast.rootDecls().len);
+    var buffer: [2]Node.Index = undefined;
+    const block = ast.fullBlock(&buffer, ast.decl(ast.rootDecls()[0]).ast.init_node).?;
+    try std.testing.expectEqual(@as(usize, 2), block.ast.statements.len);
+    const declaration = ast.decl(block.ast.statements[0]);
+    try std.testing.expectEqualStrings("valid", ast.tokenSlice(declaration.ast.let_token + 1));
+
+    var truncated = try parse(std.testing.allocator, "let value = loop");
+    defer truncated.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), truncated.errors.len);
+    try std.testing.expectEqual(Token.Tag.keyword_loop, truncated.tokens.items(.tag)[truncated.errors[0].token]);
 }
 
 test "parse empty source" {

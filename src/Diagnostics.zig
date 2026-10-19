@@ -28,6 +28,19 @@ pub fn render(ast: Ast, path: []const u8, writer: *std.Io.Writer) !void {
     }
 }
 
+test "unsupported loop diagnostics identify the keyword with tabs and CRLF" {
+    var ast = try @import("Parser.zig").parse(std.testing.allocator, "let f: () = {\r\n\touter: loop {}\r\n}\r\n");
+    defer ast.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), ast.errors.len);
+    var output = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer output.deinit();
+    try render(ast, "loop.nov", &output.writer);
+    try std.testing.expectEqualStrings(
+        "loop.nov:2:9: error: loop expressions are not implemented yet\n\touter: loop {}\n\t       ^~~~\n",
+        output.written(),
+    );
+}
+
 test "diagnostics include filename source and caret at EOF" {
     var ast = try @import("Parser.zig").parse(std.testing.allocator, "let broken =");
     defer ast.deinit(std.testing.allocator);

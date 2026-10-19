@@ -398,6 +398,7 @@ pub fn renderError(self: Ast, parse_error: Error, writer: anytype) !void {
         //         token_tags[parse_error.token].symbol(),
         //     });
         // },
+        .unsupported_loop => return writer.writeAll("loop expressions are not implemented yet"),
         .expected_decl => {
             return writer.print("expected declaration, found '{s}'", .{
                 token_tags[parse_error.token + @intFromBool(parse_error.token_is_prev)].symbol(),
@@ -1332,6 +1333,7 @@ pub const Error = struct {
         same_line_doc_comment,
         unattached_doc_comment,
         nov_style_container,
+        unsupported_loop,
         expected_decl,
         expected_expr,
         expected_expr_or_assignment,

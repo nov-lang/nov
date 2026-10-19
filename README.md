@@ -470,6 +470,9 @@ let x: Option(int) = if is_even {
 ```
 
 ## Loop
+Loop expressions are not implemented yet; `check` and `fmt` report a diagnostic.
+The examples below describe intended syntax, not currently supported behavior.
+
 ```nov
 ; items can be an array, a slice, a string or an iterator
 ; iterator semantic are not defined yet...
