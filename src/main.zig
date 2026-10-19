@@ -15,6 +15,8 @@ const params = clap.parseParamsComptime(
     \\-v, --version          Display the version and exit.
     \\--check                Check formatting without changing files (fmt only).
     \\--semantic             Check the bounded semantic/lowering subset (check only).
+    \\--debug                Compile with -O0 -g (build/run only).
+    \\--release              Compile with -O2 (default; build/run only).
     \\--cc <str>             C compiler executable (build/run only).
     \\-o, --output <str>      Output executable path (build only).
     \\<arg>...
@@ -26,8 +28,8 @@ fn usage(writer: *std.Io.Writer) !void {
         \\Usage: nov check [--semantic] <file>...
         \\       nov fmt [--check] <file>...
         \\       nov emit-c <file>
-        \\       nov build <file> [-o|--output <path>] [--cc <executable>]
-        \\       nov run <file> [--cc <executable>]
+        \\       nov [build] <file> [-o|--output <path>] [--cc <executable>] [--debug|--release]
+        \\       nov run <file> [--cc <executable>] [--debug|--release]
         \\
         \\Check syntax, or the bounded semantic subset with --semantic.
         \\Emit program C11 with emit-c, compile with build, or compile and run with run.
@@ -75,8 +77,19 @@ pub fn main(init: std.process.Init) !u8 {
     const args = res.positionals[0];
     const is_emit = args.len != 0 and std.mem.eql(u8, args[0], "emit-c");
     const is_fmt = args.len != 0 and std.mem.eql(u8, args[0], "fmt");
-    const is_build = args.len != 0 and std.mem.eql(u8, args[0], "build");
+    const implicit_build = args.len != 0 and (std.mem.endsWith(u8, args[0], ".nov") or
+        std.mem.indexOfAny(u8, args[0], "/\\") != null);
+    const is_build = implicit_build or (args.len != 0 and std.mem.eql(u8, args[0], "build"));
     const is_run = args.len != 0 and std.mem.eql(u8, args[0], "run");
+    if (res.args.debug != 0 and res.args.release != 0) {
+        try stderr.writeAll("error: --debug and --release are mutually exclusive\n");
+        return 1;
+    }
+    if ((res.args.debug != 0 or res.args.release != 0) and !is_build and !is_run) {
+        try stderr.writeAll("error: --debug and --release require the build or run command\n");
+        return 1;
+    }
+    const mode: Driver.Mode = if (res.args.debug != 0) .debug else .release;
     if (res.args.cc != null and !is_build and !is_run) {
         try stderr.writeAll("error: --cc requires the build or run command\n");
         return 1;
@@ -106,12 +119,13 @@ pub fn main(init: std.process.Init) !u8 {
         return 1;
     }
     if (is_build or is_run) {
-        if (args.len != 2) {
-            try stderr.print("error: {s} requires exactly one file; program arguments are not supported yet\n", .{args[0]});
+        const files = if (implicit_build) args else args[1..];
+        if (files.len != 1) {
+            try stderr.print("error: {s} requires exactly one file; program arguments are not supported yet\n", .{if (is_run) "run" else "build"});
             return 1;
         }
-        return buildFile(init.io, init.gpa, init.environ_map, args[1], res.args.output, res.args.cc, is_run, stderr) catch |err| {
-            try stderr.print("{s}: error: {s}\n", .{ args[1], @errorName(err) });
+        return buildFile(init.io, init.gpa, init.environ_map, files[0], res.args.output, res.args.cc, mode, is_run, stderr) catch |err| {
+            try stderr.print("{s}: error: {s}\n", .{ files[0], @errorName(err) });
             return 1;
         };
     }
@@ -130,7 +144,7 @@ pub fn main(init: std.process.Init) !u8 {
         return if (valid) 0 else 1;
     }
     if (args.len < 2 or (!is_fmt and !std.mem.eql(u8, args[0], "check"))) {
-        if (args.len != 0) try stderr.writeAll("error: expected 'check', 'fmt', 'emit-c', 'build', or 'run' followed by files\n");
+        if (args.len != 0) try stderr.print("error: unknown command or missing file for '{s}'; expected 'check', 'fmt', 'emit-c', 'build', 'run', or a .nov file/path\n", .{args[0]});
         try usage(stderr);
         return 1;
     }
@@ -180,7 +194,7 @@ fn processFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, stder
     return true;
 }
 
-fn buildFile(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Environ.Map, path: []const u8, output_option: ?[]const u8, cc: ?[]const u8, execute: bool, stderr: *std.Io.Writer) !u8 {
+fn buildFile(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Environ.Map, path: []const u8, output_option: ?[]const u8, cc: ?[]const u8, mode: Driver.Mode, execute: bool, stderr: *std.Io.Writer) !u8 {
     var source = std.Io.Writer.Allocating.init(allocator);
     defer source.deinit();
     if (!try emitFile(io, allocator, path, stderr, &source.writer)) return 1;
@@ -195,7 +209,7 @@ fn buildFile(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.E
     defer allocator.free(exe_path);
     const cwd = std.Io.Dir.cwd();
     try cwd.writeFile(io, .{ .sub_path = c_path, .data = source.written() });
-    if (!try Driver.compile(io, .{ .cc = cc, .nov_cc = env.get("NOV_CC"), .env_cc = env.get("CC") }, c_path, exe_path, stderr)) return 1;
+    if (!try Driver.compile(io, .{ .cc = cc, .nov_cc = env.get("NOV_CC"), .env_cc = env.get("CC"), .mode = mode }, c_path, exe_path, stderr)) return 1;
     if (execute) return Driver.run(io, exe_path, stderr);
 
     const default_output = if (output_option == null) try Driver.defaultOutput(allocator, path) else null;
@@ -447,21 +461,21 @@ test "build and run integrate discovery, preserve outputs, and clean temporary f
     try env.put("CC", compilers[2]);
     var diagnostics = std.Io.Writer.Allocating.init(allocator);
     defer diagnostics.deinit();
-    try std.testing.expectEqual(@as(u8, 37), try buildFile(io, allocator, &env, input, null, compilers[0], true, &diagnostics.writer));
-    try std.testing.expectEqual(@as(u8, 38), try buildFile(io, allocator, &env, input, null, "/nov-missing/explicit", true, &diagnostics.writer));
+    try std.testing.expectEqual(@as(u8, 37), try buildFile(io, allocator, &env, input, null, compilers[0], .release, true, &diagnostics.writer));
+    try std.testing.expectEqual(@as(u8, 38), try buildFile(io, allocator, &env, input, null, "/nov-missing/explicit", .release, true, &diagnostics.writer));
     try env.put("NOV_CC", "");
-    try std.testing.expectEqual(@as(u8, 39), try buildFile(io, allocator, &env, input, null, null, true, &diagnostics.writer));
+    try std.testing.expectEqual(@as(u8, 39), try buildFile(io, allocator, &env, input, null, null, .release, true, &diagnostics.writer));
     const output = try std.fs.path.join(allocator, &.{ root, "output with spaces;literal" });
     defer allocator.free(output);
-    try std.testing.expectEqual(@as(u8, 0), try buildFile(io, allocator, &env, input, output, compilers[0], false, &diagnostics.writer));
+    try std.testing.expectEqual(@as(u8, 0), try buildFile(io, allocator, &env, input, output, compilers[0], .release, false, &diagnostics.writer));
     try std.testing.expectEqual(@as(u8, 37), try Driver.run(io, output, &diagnostics.writer));
     try tmp.dir.writeFile(io, .{ .sub_path = "failure", .data = "#!/bin/sh\nexit 51\n" });
     try tmp.dir.setFilePermissions(io, "failure", .fromMode(0o700), .{});
     const failure = try tmp.dir.realPathFileAlloc(io, "failure", allocator);
     defer allocator.free(failure);
-    try std.testing.expectEqual(@as(u8, 1), try buildFile(io, allocator, &env, input, output, failure, false, &diagnostics.writer));
+    try std.testing.expectEqual(@as(u8, 1), try buildFile(io, allocator, &env, input, output, failure, .release, false, &diagnostics.writer));
     try std.testing.expectEqual(@as(u8, 37), try Driver.run(io, output, &diagnostics.writer));
-    try std.testing.expectEqual(@as(u8, 1), try buildFile(io, allocator, &env, input, input, compilers[0], false, &diagnostics.writer));
+    try std.testing.expectEqual(@as(u8, 1), try buildFile(io, allocator, &env, input, input, compilers[0], .release, false, &diagnostics.writer));
     const source = try tmp.dir.readFileAlloc(io, "input.nov", allocator, .limited(1024));
     defer allocator.free(source);
     try std.testing.expectEqualStrings("let main: () -> void = {}\n", source);

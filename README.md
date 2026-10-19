@@ -67,10 +67,12 @@ the program. Redirect stdout to a `.c` file if desired.
 Build or run a single-file program (after `zig build`, use `zig-out/bin/nov`):
 
 ```sh
+nov file.nov                         # same as nov build file.nov
 nov build file.nov                    # ./file (file.exe on Windows)
-nov build file.nov -o path/to/program # --output is equivalent
-nov run file.nov
-nov build file.nov --cc /path/to/cc
+nov file.nov -o path/to/program       # --output is equivalent
+nov run file.nov --debug              # -O0 -g
+nov build file.nov --release          # -O2 (also the default)
+nov file.nov --cc /path/to/cc
 ```
 
 `build` defaults to the input basename without its extension in the current
@@ -80,8 +82,12 @@ compiles a temporary executable, inherits stdin/stdout/stderr and the current
 working directory, then returns the program's exit code. On POSIX, signal
 termination is diagnosed and mapped to `128 + signal` (capped at 255). Program
 arguments are not supported yet; extra positional arguments are rejected.
-`--output` is build-only; `--cc` is build/run-only. Neither command accepts
-`--semantic` or `--check`.
+`--output` is build-only; `--cc`, `--debug`, and `--release` are build/run-only.
+The two mode flags are mutually exclusive. Neither command accepts `--semantic`
+or `--check`. Omitting the command accepts all build options: the first positional
+argument must end in `.nov` or contain a path separator (`/` or `\`); bare unknown
+words remain command errors. Use an explicit path (such as `./source`) or `build`
+for a source filename without the `.nov` extension.
 
 Compiler discovery tries `--cc`, nonempty `NOV_CC`, nonempty `CC`, `cc`, then
 `zig cc` if `zig` is on PATH. Each configured value is **one executable name or
@@ -91,7 +97,10 @@ wrapper for extra compiler options, or put `zig` on PATH for the `zig cc` fallba
 Missing executables advance to the next candidate, including missing explicit or
 environment selections. An executable that cannot start for another reason, or
 starts and fails, stops discovery and fails the command. Empty environment values
-are ignored; an empty `--cc` is an error. Every invocation uses `-std=c11 -O2`.
+are ignored; an empty `--cc` is an error. Every invocation uses `-std=c11`;
+default/release builds add `-O2`, while debug builds add `-O0 -g`. These select C
+optimization/debug information only, not different Nov semantics: wrapping
+arithmetic, panic checks, output, and exit behavior stay identical in both modes.
 No shell is involved. Compiler diagnostics (including compiler stdout) go to
 stderr; compiler failure exits nonzero without running the program. If nothing
 is found, the diagnostic lists candidates tried and suggests `nov emit-c`.
@@ -128,7 +137,8 @@ caller is responsible for its final stdout flush.
 
 ```nov
 let number: i64 = -42
-let main: () -> void = @println(true, number)
+let answer: () -> i64 = number
+let main: () -> void = @println(true, answer())
 ```
 
 This outputs `true -42` followed by a newline. Bare integer literals such as

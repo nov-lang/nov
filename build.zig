@@ -87,7 +87,7 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     _ = fixtures.add("unclosed-array.nov", "let values = [1");
     _ = fixtures.add("needs-format.nov", "let answer=1+2*3\n");
     _ = fixtures.add("let-only.nov", "let number: i32 = 42\n");
-    _ = fixtures.add("print-program.nov", "let number: i32 = -42\nlet main: () -> void = @println(true, number)\n");
+    _ = fixtures.add("print-program.nov", "let number: i32 = -42\nlet answer: () -> i32 = number\nlet main: () -> void = @println(true, answer())\n");
     _ = fixtures.add("panic-program.nov", "let zero: i32 = 0\nlet divide: () -> i32 = 1 / zero\nlet main: () -> void = @println(divide())\n");
 
     const Case = struct {
@@ -101,7 +101,15 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         .{ .name = "help", .args = &.{"--help"}, .exit_code = 0, .stderr_match = "Usage: nov" },
         .{ .name = "version", .args = &.{"--version"}, .exit_code = 0, .stdout = b.fmt("nov {f}\n", .{nov_version}) },
         .{ .name = "no arguments", .args = &.{}, .exit_code = 1, .stderr_match = "Usage: nov" },
-        .{ .name = "unknown command", .args = &.{"unknown-command"}, .exit_code = 1, .stderr_match = "error:" },
+        .{ .name = "unknown command", .args = &.{"unknown-command"}, .exit_code = 1, .stderr_match = "unknown command" },
+        .{ .name = "implicit build missing source", .args = &.{"missing.nov"}, .exit_code = 1, .stderr_match = "missing.nov: error: FileNotFound" },
+        .{ .name = "implicit build invalid source", .args = &.{"invalid.nov"}, .exit_code = 1, .stderr_match = "invalid.nov:1:13: error:" },
+        .{ .name = "implicit build multiple files", .args = &.{ "valid.nov", "another-valid.nov" }, .exit_code = 1, .stderr_match = "exactly one file" },
+        .{ .name = "implicit build rejects semantic", .args = &.{ "valid.nov", "--semantic" }, .exit_code = 1, .stderr_match = "--semantic requires" },
+        .{ .name = "implicit build rejects check", .args = &.{ "valid.nov", "--check" }, .exit_code = 1, .stderr_match = "--check requires" },
+        .{ .name = "build conflicting modes", .args = &.{ "build", "valid.nov", "--debug", "--release" }, .exit_code = 1, .stderr_match = "mutually exclusive" },
+        .{ .name = "run conflicting modes", .args = &.{ "run", "valid.nov", "--release", "--debug" }, .exit_code = 1, .stderr_match = "mutually exclusive" },
+        .{ .name = "implicit build conflicting modes", .args = &.{ "valid.nov", "--debug", "--release" }, .exit_code = 1, .stderr_match = "mutually exclusive" },
         .{ .name = "check without files", .args = &.{"check"}, .exit_code = 1, .stderr_match = "error:" },
         .{ .name = "fmt without files", .args = &.{"fmt"}, .exit_code = 1, .stderr_match = "error:" },
         .{ .name = "build without files", .args = &.{"build"}, .exit_code = 1, .stderr_match = "exactly one file" },
@@ -150,38 +158,61 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         test_step.dependOn(&run.step);
     }
 
-    // An isolated PATH exercises real `zig cc` discovery, independent of host CC.
-    for ([_]bool{ false, true }) |panic| {
-        const run = b.addRunArtifact(exe);
-        run.step.name = if (panic) "CLI: run panic" else "CLI: run printed program";
-        run.setCwd(fixtures.getDirectory());
-        run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
-        run.setEnvironmentVariable("NOV_CC", "");
-        run.setEnvironmentVariable("CC", "");
-        run.addArgs(&.{ "run", if (panic) "panic-program.nov" else "print-program.nov" });
-        run.expectExitCode(if (panic) 1 else 0);
-        run.expectStdOutEqual(if (panic) "" else "true -42\n");
-        run.expectStdErrEqual(if (panic) "panic: division by zero\n" else "");
-        test_step.dependOn(&run.step);
+    for ([_][]const u8{ "--debug", "--release" }) |mode| {
+        for ([_][]const u8{ "check", "fmt", "emit-c" }) |command| {
+            const run = b.addRunArtifact(exe);
+            run.step.name = b.fmt("CLI: {s} rejects {s}", .{ command, mode });
+            run.addArgs(&.{ command, "valid.nov", mode });
+            run.expectExitCode(1);
+            run.expectStdOutEqual("");
+            run.expectStdErrMatch("require the build or run command");
+            test_step.dependOn(&run.step);
+        }
     }
-    for ([_][]const u8{ "-o", "--output" }) |option| {
-        const compile = b.addRunArtifact(exe);
-        compile.step.name = b.fmt("CLI: build with {s}", .{option});
-        compile.setCwd(fixtures.getDirectory());
-        compile.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
-        compile.setEnvironmentVariable("NOV_CC", "");
-        compile.setEnvironmentVariable("CC", "");
-        compile.addArgs(&.{ "build", "print-program.nov", option });
-        const program = compile.addOutputFileArg(if (exe.root_module.resolved_target.?.result.os.tag == .windows) "printed program.exe" else "printed program");
-        compile.expectExitCode(0);
-        compile.expectStdOutEqual("");
-        compile.expectStdErrEqual("");
-        const execute = std.Build.Step.Run.create(b, b.fmt("CLI: execute build output ({s})", .{option}));
-        execute.addFileArg(program);
-        execute.expectExitCode(0);
-        execute.expectStdOutEqual("true -42\n");
-        execute.expectStdErrEqual("");
-        test_step.dependOn(&execute.step);
+
+    // An isolated PATH exercises real `zig cc` discovery, independent of host CC.
+    for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+        for ([_]bool{ false, true }) |panic| {
+            const run = b.addRunArtifact(exe);
+            run.step.name = b.fmt("CLI: run {s} ({s})", .{ if (panic) "panic" else "printed program", mode });
+            run.setCwd(fixtures.getDirectory());
+            run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+            run.setEnvironmentVariable("NOV_CC", "");
+            run.setEnvironmentVariable("CC", "");
+            run.addArgs(&.{ "run", if (panic) "panic-program.nov" else "print-program.nov" });
+            if (mode.len != 0) run.addArg(mode);
+            run.expectExitCode(if (panic) 1 else 0);
+            run.expectStdOutEqual(if (panic) "" else "true -42\n");
+            run.expectStdErrEqual(if (panic) "panic: division by zero\n" else "");
+            test_step.dependOn(&run.step);
+        }
+        for ([_]bool{ false, true }) |implicit| {
+            for ([_]bool{ false, true }) |panic| {
+                for ([_][]const u8{ "-o", "--output" }) |option| {
+                    const compile = b.addRunArtifact(exe);
+                    compile.step.name = b.fmt("CLI: {s} {s} with {s} ({s})", .{ if (implicit) "implicit build" else "build", if (panic) "panic" else "printed program", option, mode });
+                    compile.setCwd(fixtures.getDirectory());
+                    compile.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+                    compile.setEnvironmentVariable("NOV_CC", "");
+                    compile.setEnvironmentVariable("CC", "");
+                    if (!implicit) compile.addArg("build");
+                    if (mode.len != 0) compile.addArg(mode);
+                    // Exercise literal --cc paths as well as fallback discovery.
+                    if (implicit) compile.addArgs(&.{ "--cc", "/nov-missing/explicit" });
+                    compile.addArgs(&.{ if (panic) "panic-program.nov" else "./print-program.nov", option });
+                    const program = compile.addOutputFileArg(if (exe.root_module.resolved_target.?.result.os.tag == .windows) "printed program.exe" else "printed program");
+                    compile.expectExitCode(0);
+                    compile.expectStdOutEqual("");
+                    compile.expectStdErrEqual("");
+                    const execute = std.Build.Step.Run.create(b, b.fmt("CLI: execute {s}", .{compile.step.name}));
+                    execute.addFileArg(program);
+                    execute.expectExitCode(if (panic) 1 else 0);
+                    execute.expectStdOutEqual(if (panic) "" else "true -42\n");
+                    execute.expectStdErrEqual(if (panic) "panic: division by zero\n" else "");
+                    test_step.dependOn(&execute.step);
+                }
+            }
+        }
     }
 }
 

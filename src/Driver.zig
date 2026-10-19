@@ -1,7 +1,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+pub const Mode = enum { debug, release };
+
 pub const Discovery = struct {
+    mode: Mode = .release,
     cc: ?[]const u8 = null,
     nov_cc: ?[]const u8 = null,
     env_cc: ?[]const u8 = null,
@@ -21,11 +24,30 @@ pub fn compile(io: std.Io, discovery: Discovery, source: []const u8, output: []c
         const zig = index == candidates.len - 1;
         if (tried.written().len != 0) try tried.writer.writeAll(", ");
         try tried.writer.print("'{s}{s}'", .{ executable, if (zig) " cc" else "" });
-        const argv = [_][]const u8{ executable, "cc", "-std=c11", "-O2", source, "-o", output };
-        const plain_argv = [_][]const u8{ executable, "-std=c11", "-O2", source, "-o", output };
+
+        // Keep argv storage bounded and pass each flag/path literally.
+        var arguments: [8][]const u8 = undefined;
+        var count: usize = 0;
+        arguments[count] = executable;
+        count += 1;
+        if (zig) {
+            arguments[count] = "cc";
+            count += 1;
+        }
+        arguments[count] = "-std=c11";
+        arguments[count + 1] = if (discovery.mode == .debug) "-O0" else "-O2";
+        count += 2;
+        if (discovery.mode == .debug) {
+            arguments[count] = "-g";
+            count += 1;
+        }
+        arguments[count] = source;
+        arguments[count + 1] = "-o";
+        arguments[count + 2] = output;
+        count += 3;
         try stderr.flush();
         var child = std.process.spawn(io, .{
-            .argv = if (zig) &argv else &plain_argv,
+            .argv = arguments[0..count],
             .stdin = .ignore,
             // Keep compiler chatter off the program's stdout.
             .stdout = .{ .file = std.Io.File.stderr() },
@@ -123,24 +145,32 @@ test "compiler discovery uses literal executables in approved order and exact fl
     defer allocator.free(good);
     const missing = try std.fs.path.join(allocator, &.{ root, "absent" });
     defer allocator.free(missing);
-    try fakeCompiler(tmp.dir, "compiler with spaces;literal", "#!/bin/sh\n[ \"$#\" = 5 ] && [ \"$1\" = -std=c11 ] && [ \"$2\" = -O2 ] && [ \"$3\" = 'source with spaces.c' ] && [ \"$4\" = -o ] && [ \"$5\" = 'output;literal' ]\n");
-    for (0..4) |selected| {
-        const candidates: [4][]const u8 = blk: {
-            var values = [_][]const u8{missing} ** 4;
-            values[selected] = good;
-            break :blk values;
-        };
+    for ([_]Mode{ .release, .debug }) |mode| {
+        try fakeCompiler(tmp.dir, "compiler with spaces;literal", if (mode == .release)
+            "#!/bin/sh\n[ \"$#\" = 5 ] && [ \"$1\" = -std=c11 ] && [ \"$2\" = -O2 ] && [ \"$3\" = 'source with spaces.c' ] && [ \"$4\" = -o ] && [ \"$5\" = 'output;literal' ]\n"
+        else
+            "#!/bin/sh\n[ \"$#\" = 6 ] && [ \"$1\" = -std=c11 ] && [ \"$2\" = -O0 ] && [ \"$3\" = -g ] && [ \"$4\" = 'source with spaces.c' ] && [ \"$5\" = -o ] && [ \"$6\" = 'output;literal' ]\n");
+        for (0..4) |selected| {
+            const candidates: [4][]const u8 = blk: {
+                var values = [_][]const u8{missing} ** 4;
+                values[selected] = good;
+                break :blk values;
+            };
+            var diagnostics = std.Io.Writer.Allocating.init(allocator);
+            defer diagnostics.deinit();
+            try std.testing.expect(try compile(io, .{ .mode = mode, .cc = candidates[0], .nov_cc = candidates[1], .env_cc = candidates[2], .fallback_cc = candidates[3], .fallback_zig = missing }, "source with spaces.c", "output;literal", &diagnostics.writer));
+            try std.testing.expectEqualStrings("", diagnostics.written());
+        }
+        try fakeCompiler(tmp.dir, "zig", if (mode == .release)
+            "#!/bin/sh\n[ \"$#\" = 6 ] && [ \"$1\" = cc ] && [ \"$2\" = -std=c11 ] && [ \"$3\" = -O2 ] && [ \"$4\" = source ] && [ \"$5\" = -o ] && [ \"$6\" = output ]\n"
+        else
+            "#!/bin/sh\n[ \"$#\" = 7 ] && [ \"$1\" = cc ] && [ \"$2\" = -std=c11 ] && [ \"$3\" = -O0 ] && [ \"$4\" = -g ] && [ \"$5\" = source ] && [ \"$6\" = -o ] && [ \"$7\" = output ]\n");
+        const zig = try std.fs.path.join(allocator, &.{ root, "zig" });
+        defer allocator.free(zig);
         var diagnostics = std.Io.Writer.Allocating.init(allocator);
         defer diagnostics.deinit();
-        try std.testing.expect(try compile(io, .{ .cc = candidates[0], .nov_cc = candidates[1], .env_cc = candidates[2], .fallback_cc = candidates[3], .fallback_zig = missing }, "source with spaces.c", "output;literal", &diagnostics.writer));
-        try std.testing.expectEqualStrings("", diagnostics.written());
+        try std.testing.expect(try compile(io, .{ .mode = mode, .cc = "", .nov_cc = "", .fallback_cc = missing, .fallback_zig = zig }, "source", "output", &diagnostics.writer));
     }
-    try fakeCompiler(tmp.dir, "zig", "#!/bin/sh\n[ \"$#\" = 6 ] && [ \"$1\" = cc ] && [ \"$2\" = -std=c11 ] && [ \"$3\" = -O2 ]\n");
-    const zig = try std.fs.path.join(allocator, &.{ root, "zig" });
-    defer allocator.free(zig);
-    var diagnostics = std.Io.Writer.Allocating.init(allocator);
-    defer diagnostics.deinit();
-    try std.testing.expect(try compile(io, .{ .cc = "", .nov_cc = "", .fallback_cc = missing, .fallback_zig = zig }, "source", "output", &diagnostics.writer));
 }
 
 test "missing compiler lists all attempts and suggests emit-c" {
