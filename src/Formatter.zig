@@ -216,6 +216,18 @@ test "unsupported syntax fails closed including nested expressions" {
     }
 }
 
+test "executable local blocks remain unsupported by the formatter" {
+    for ([_][:0]const u8{
+        "let f: () -> i32 = {\nlet n: i32 = 1\nn\n}\n",
+        "let x: i32 = {\nlet n: i32 = 1\nn\n}\n",
+    }) |source| {
+        var ast = try Parser.parse(std.testing.allocator, source);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+        try std.testing.expectError(error.UnsupportedSyntax, format(std.testing.allocator, source));
+    }
+}
+
 test "every unsupported AST tag is rejected before rendering" {
     const supported = [_]Ast.Node.Tag{
         .root,      .decl,          .identifier,   .number_literal,   .char_literal, .string_literal,

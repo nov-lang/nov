@@ -48,6 +48,8 @@ pub const Diagnostic = struct {
         literal_type_mismatch,
         literal_out_of_range,
         unsupported_body_expression,
+        unsupported_local_declaration,
+        unused_block_value,
         unsupported_shadowing,
         expression_type_mismatch,
         operator_not_supported,

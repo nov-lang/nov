@@ -5,5 +5,11 @@ let discount_percent: int = 10
 
 let subtotal: (price: int, count: int) -> int = price * count
 let discounted: (total: int, percent: int) -> int = total - total * percent / 100
-let checkout: (count: int) -> int = discounted(subtotal(unit_price, count), discount_percent)
-let main: () -> void = @println(quantity, checkout(3))
+let checkout: (count: int) -> int = {
+    let total: int = subtotal(unit_price, count)
+    discounted(total, discount_percent)
+}
+let main: () -> void = {
+    let total: int = checkout(3)
+    @println(quantity, total)
+}

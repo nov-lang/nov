@@ -32,10 +32,11 @@ cycles for a bounded expression subset. Internal annotation analysis resolves
 explicit `bool`, `void`, fixed-width integer, native `int`/`uint` and function
 types, and checks integer and boolean literals against annotations. Bounded function-body checking binds
 parameters and checks integer arithmetic, boolean expressions, comparisons and
-calls against collected signatures, including recursive calls. Literal defaults,
-user-defined type aliases, local declarations, shadowing, control flow and general
-block results remain
-deferred or unsupported. Straight-line lowering now produces typed operations
+calls against collected signatures, including recursive calls. Immutable,
+explicitly typed locals and straight-line blocks with final-expression results
+are supported in function bodies. Literal defaults, user-defined type aliases,
+shadowing and control flow remain deferred or unsupported.
+Straight-line lowering now produces typed operations
 with source spans and ordered operands/call arguments. It requires immutable
 literal globals; unit/global block initializers and short-circuit `and`/`or` are
 not lowered yet. An internal C11 backend emits verified IR, including fixed-width
@@ -50,7 +51,8 @@ IR verification. Source errors and unsupported/deferred forms fail with source
 diagnostics (including related notes where available); recovered syntax errors
 stop semantic analysis. Globals must be immutable, explicitly typed integer or
 boolean literals. Functions need explicit supported signatures and straight-line
-expression bodies (including forward/recursive calls and empty void bodies).
+expression bodies (including forward/recursive calls, local declarations, nested
+blocks and empty void bodies).
 Inferred globals, mutable globals, nonliteral global initializers, global unit
 values, and short-circuit `and`/`or` are currently rejected, along with the other
 unsupported forms listed above. This is not a backend compatibility check: it
@@ -152,7 +154,7 @@ let main: () -> void = @println(true, answer())
 ```
 
 This outputs `true -42` followed by a newline. Bare integer literals such as
-`@println(42)` still require a type context: use a typed global, parameter, or
+`@println(42)` still require a type context: use a typed global, local, parameter, or
 function result. Native aliases do not introduce bare-literal inference defaults.
 Strings/interpolation, function values and void arguments remain unsupported for
 printing; the C backend
@@ -166,14 +168,44 @@ nov run examples/checkout.nov
 ```
 
 It computes the discounted total in cents for three items priced at 2500 each,
-using typed globals, parameters, function calls and printing. Quantity is printed
+using typed globals, locals, parameters, block results, function calls and printing.
+Quantity is printed
 as `uint`; arithmetic uses `int` consistently. No implicit signed/unsigned
 conversion is introduced; the count argument has its own `int` context.
+
+Function blocks use their final expression as the result, including with a newline
+before `}`. Empty blocks and blocks ending in a declaration produce `void`.
+Statements and initializers execute left to right; a local becomes visible only
+**after** its initializer, so self/forward local references are errors. Nested
+blocks have lexical scopes; names do not escape them, and separate sibling blocks
+may reuse a name. Shadowing any visible local, parameter, global or primitive
+name remains unsupported. Non-final expressions must return `void`; explicit
+value-discard syntax is not implemented yet.
+
+```nov
+let twice: (value: int) -> int = {
+    let result: int = value + value
+    @println(result)
+    result
+}
+let main: () -> void = {
+    let answer: int = twice(21)
+    @println(answer)
+}
+```
+
+This prints `42` on two lines. Locals require an explicit supported type and an
+initializer. Immutable scalar/unit values and existing function values (with
+unnamed parameter types, e.g. `let callback: (int) -> int = twice`) work; named
+local function definitions/closures, inferred locals, mutation, assignments,
+labels, explicit `return`, control flow and memory-bearing values are rejected.
+Global block initializers remain unsupported by lowering.
 
 Format files in place with `zig build run -- fmt file.nov`, or use
 `zig build run -- fmt --check file.nov` to check formatting without writing.
 Both commands accept multiple file paths. Formatting currently supports simple
-`let` declarations, literals, operators, and comments; unsupported syntax is
+`let` declarations, literals, operators, and comments, but not function signatures,
+calls or blocks (including the executable examples above); unsupported syntax is
 reported without modifying the file. Formatted output is reparsed and checked
 for structural, token, and comment preservation before atomic replacement.
 Declarations are separated by newlines; EOF also terminates a complete declaration,

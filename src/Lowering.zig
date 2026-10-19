@@ -57,6 +57,43 @@ pub fn lower(module: *Module) Error!Sema {
     return result;
 }
 
+test "locals alias evaluated values and nested results survive scope exit" {
+    var module = try Module.init(std.testing.allocator, "locals.nov",
+        \\let id: (x: i32) -> i32 = x
+        \\let f: () -> i32 = {
+        \\    let callback: (i32) -> i32 = id
+        \\    let x: i32 = callback(7)
+        \\    let y: i32 = {let inner: i32 = x + x
+        \\        inner}
+        \\    @println(y)
+        \\    y + x
+        \\}
+        \\let empty: () -> void = {let unused: i32 = id(9)
+        \\}
+    );
+    var sema = lower(&module) catch |err| {
+        module.deinit();
+        return err;
+    };
+    defer sema.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    const body = sema.ir.functions.items[1].body.?;
+    try std.testing.expectEqual(@as(usize, 6), body.instructions.len);
+    try std.testing.expect(body.instructions[2].op == .call);
+    const twice = body.instructions[3].op.binary;
+    try std.testing.expectEqual(@as(u32, 2), @intFromEnum(twice.lhs));
+    try std.testing.expectEqual(twice.lhs, twice.rhs);
+    const sum = body.instructions[5].op.binary;
+    try std.testing.expectEqual(@as(u32, 3), @intFromEnum(sum.lhs));
+    try std.testing.expectEqual(@as(u32, 2), @intFromEnum(sum.rhs));
+    const empty = sema.ir.functions.items[2].body.?;
+    try std.testing.expect(empty.instructions[2].op == .call);
+    try std.testing.expect(sema.ir.getConstant(empty.instructions[3].op.constant).?.value == .void);
+    module.deinit();
+    try sema.ir.verify();
+}
+
 test "printing lowers owned ordered arguments and operation spans" {
     var module = try Module.init(std.testing.allocator, "print.nov", "let id: (x: i32) -> i32 = x\nlet main: () -> void = @println(id(1), id(2), true)");
     var sema = lower(&module) catch |err| {
@@ -267,6 +304,9 @@ test "lowering ownership and source diagnostic rollback survive allocation failu
         "let id: (x: i32) -> i32 = x\nlet main: () -> void = @println(true, id(1), id(2))",
         "let main: () -> void = @println(true, missing, 1)",
         "let mut value: i32 = 1\nlet main: () -> i32 = value",
+        "let id: (x: i32) -> i32 = x\nlet main: () -> void = {let x: i32 = id(1)\n@println({let y: i32 = x + x\ny})\n}",
+        "let main: () -> void = {let value: i32 = 1\n{let value: i32 = 2\n}\n}",
+        "let main: () -> void = {let x: i32 = 1\n@println(x)\nfalse and true\n}",
     }) |source| {
         try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
     }

@@ -3,11 +3,17 @@ const Ast = @import("Ast.zig");
 const Module = @import("Module.zig");
 const Ir = @import("Ir.zig");
 const Literal = @import("Literal.zig");
+const TypeResolver = @import("TypeResolver.zig");
 const isPrimitive = @import("primitives.zig").isPrimitive;
 
 pub const Error = Ir.BuildError;
 const Known = struct { ty: Ir.TypeId, annotation: ?Module.Span = null };
-const Binding = struct { known: Known, index: u32 };
+const Binding = struct {
+    known: Known,
+    index: u32 = 0,
+    initializer: ?Ast.Node.Index = null,
+    name_span: Module.Span,
+};
 // Bounds recursive checking/probing, not the iterative literal-grouping walk.
 const max_recursive_depth = 128;
 
@@ -65,6 +71,7 @@ fn checkInner(module: *Module, ir: *Ir, types: []const ?Ir.TypeId, id: Module.De
     if (proto.ast.params.len != ty.function.params.len) return error.InvalidTypeId;
     var context: Context = .{ .module = module, .ir = ir, .types = types, .emitter = emitter };
     defer context.bindings.deinit(module.allocator);
+    defer context.locals.deinit(module.allocator);
     var iterator = proto.iterate(&module.ast);
     var i: usize = 0;
     var valid = true;
@@ -78,7 +85,7 @@ fn checkInner(module: *Module, ir: *Ir, types: []const ?Ir.TypeId, id: Module.De
                 valid = false;
                 continue;
             }
-            try context.bindings.put(module.allocator, name, .{ .index = @intCast(i), .known = .{
+            try context.bindings.put(module.allocator, name, .{ .index = @intCast(i), .name_span = span, .known = .{
                 .ty = ty.function.params[i],
                 .annotation = module.tokenSpan(module.ast.firstToken(param.type_expr)),
             } });
@@ -99,6 +106,115 @@ const Context = struct {
     types: []const ?Ir.TypeId,
     emitter: ?*Emitter = null,
     bindings: std.StringHashMapUnmanaged(Binding) = .empty,
+    locals: std.ArrayList([]const u8) = .empty,
+
+    fn restoreScope(self: *Context, start: usize) void {
+        for (self.locals.items[start..]) |name| _ = self.bindings.remove(name);
+        self.locals.shrinkRetainingCapacity(start);
+    }
+
+    fn bindLocal(self: *Context, name: []const u8, binding: Binding) Error!void {
+        try self.locals.append(self.module.allocator, name);
+        try self.bindings.put(self.module.allocator, name, binding);
+    }
+
+    fn conflict(self: *Context, name: []const u8) ?Module.Span {
+        if (self.bindings.get(name)) |binding| return binding.name_span;
+        if (self.module.lookup(name)) |id| return self.module.getDeclaration(id).?.name_span;
+        return null;
+    }
+
+    fn local(self: *Context, node: Ast.Node.Index, depth: usize) Error!bool {
+        const ast = &self.module.ast;
+        const decl = ast.decl(node).ast;
+        const token = decl.let_token + 1 + @as(u32, @intFromBool(decl.is_mutable));
+        const name = ast.tokenSlice(token);
+        const name_span = self.module.tokenSpan(token);
+        if (std.mem.startsWith(u8, name, "@\"")) {
+            _ = try self.fail(.unsupported_name, node, null);
+            return false;
+        }
+        const related = self.conflict(name);
+        if (related != null or isPrimitive(name)) {
+            try self.module.diagnostics.append(self.module.allocator, .{ .tag = .unsupported_shadowing, .span = name_span, .related = related });
+            return false;
+        }
+        if (decl.is_mutable or decl.type_node == 0 or std.mem.eql(u8, name, "_")) {
+            _ = try self.fail(.unsupported_local_declaration, node, null);
+            return false;
+        }
+        // Named parameters introduce a local function definition, not a value
+        // annotation. Closures/local function bodies are outside this slice.
+        if (ast.fullFnProto(decl.type_node)) |proto| {
+            var iterator = proto.iterate(ast);
+            while (iterator.next()) |param| {
+                if (param.name_token != null) {
+                    _ = try self.fail(.unsupported_local_declaration, node, null);
+                    return false;
+                }
+            }
+        }
+        if (decl.init_node == 0) {
+            _ = try self.fail(.missing_initializer, node, null);
+            return false;
+        }
+        const ty = (try TypeResolver.resolve(self.module, self.ir, decl.type_node)) orelse return false;
+        const known: Known = .{ .ty = ty, .annotation = self.module.tokenSpan(ast.firstToken(decl.type_node)) };
+        // Publish only after checking/evaluating the initializer: no self or
+        // forward local references, and initialization happens exactly once.
+        if (try self.expression(decl.init_node, known, depth + 1) == null) return false;
+        try self.bindLocal(name, .{ .known = known, .initializer = decl.init_node, .name_span = name_span });
+        return true;
+    }
+
+    fn blockExpression(self: *Context, node: Ast.Node.Index, expected: ?Known, depth: usize) Error!?Ir.TypeId {
+        const ast = &self.module.ast;
+        var buffer: [2]Ast.Node.Index = undefined;
+        const block = ast.fullBlock(&buffer, node).?;
+        if (ast.firstToken(node) != block.ast.lbrace) return self.fail(.unsupported_body_expression, node, null);
+        const start = self.locals.items.len;
+        defer self.restoreScope(start);
+        for (block.ast.statements, 0..) |statement, i| {
+            if (ast.nodes.items(.tag)[statement] == .decl) {
+                if (!try self.local(statement, depth)) return null;
+            } else if (i + 1 == block.ast.statements.len) {
+                const ty = (try self.expression(statement, expected, depth + 1)) orelse return null;
+                if (self.emitter) |emitter| try emitter.values.put(emitter.allocator, node, try emitter.value(statement));
+                return ty;
+            } else {
+                const ty = (try self.expression(statement, null, depth + 1)) orelse return null;
+                if (self.ir.getType(ty).? != .void) return self.fail(.unused_block_value, statement, null);
+            }
+        }
+        return self.fit(try self.ir.internType(.void), expected, node);
+    }
+
+    fn probeBlock(self: *Context, node: Ast.Node.Index, depth: usize) Error!?Known {
+        const ast = &self.module.ast;
+        var buffer: [2]Ast.Node.Index = undefined;
+        const block = ast.fullBlock(&buffer, node).?;
+        if (ast.firstToken(node) != block.ast.lbrace) return null;
+        const start = self.locals.items.len;
+        defer self.restoreScope(start);
+        // Probing only supplies context, never emits/evaluates initializers or
+        // keeps diagnostics. The actual left-to-right walk validates everything.
+        const diagnostics_start = self.module.diagnostics.items.len;
+        defer self.module.diagnostics.shrinkRetainingCapacity(diagnostics_start);
+        for (block.ast.statements, 0..) |statement, i| {
+            if (ast.nodes.items(.tag)[statement] == .decl) {
+                const decl = ast.decl(statement).ast;
+                if (decl.is_mutable or decl.type_node == 0) return null;
+                const token = decl.let_token + 1;
+                const name = ast.tokenSlice(token);
+                if (self.conflict(name) != null or isPrimitive(name)) return null;
+                const ty = (try TypeResolver.resolve(self.module, self.ir, decl.type_node)) orelse return null;
+                try self.bindLocal(name, .{ .known = .{ .ty = ty }, .initializer = decl.init_node, .name_span = self.module.tokenSpan(token) });
+            } else if (i + 1 == block.ast.statements.len) {
+                return self.probe(statement, depth + 1);
+            }
+        }
+        return .{ .ty = try self.ir.internType(.void) };
+    }
 
     fn span(self: *Context, node: Ast.Node.Index) Module.Span {
         return self.module.tokenSpan(self.module.ast.nodes.items(.main_token)[node]);
@@ -145,13 +261,7 @@ const Context = struct {
                 if (std.mem.eql(u8, name, "true") or std.mem.eql(u8, name, "false")) break :blk .{ .ty = try self.ir.internType(.boolean) };
                 break :blk null;
             },
-            .block, .block_two, .block_newline, .block_two_newline => blk: {
-                var buffer: [2]Ast.Node.Index = undefined;
-                const block = ast.fullBlock(&buffer, node).?;
-                if (ast.firstToken(node) != block.ast.lbrace or block.ast.statements.len > 1) break :blk null;
-                if (block.ast.statements.len == 0) break :blk .{ .ty = try self.ir.internType(.void) };
-                break :blk try self.probe(block.ast.statements[0], depth + 1);
-            },
+            .block, .block_two, .block_newline, .block_two_newline => try self.probeBlock(node, depth),
             .negation, .bit_not => try self.probe(data.rhs, depth + 1),
             .add, .sub, .mul, .div, .mod => (try self.probe(data.lhs, depth + 1)) orelse try self.probe(data.rhs, depth + 1),
             .bool_not, .bool_and, .bool_or, .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal => .{ .ty = try self.ir.internType(.boolean) },
@@ -195,13 +305,7 @@ const Context = struct {
                 const rhs = try self.validateUnconstrained(data.rhs, depth + 1);
                 return lhs and rhs;
             },
-            .block, .block_two, .block_newline, .block_two_newline => {
-                var buffer: [2]Ast.Node.Index = undefined;
-                const block = ast.fullBlock(&buffer, node).?;
-                if (ast.firstToken(node) == block.ast.lbrace and block.ast.statements.len == 1 and ast.nodes.items(.tag)[block.ast.statements[0]] != .decl) {
-                    return self.validateUnconstrained(block.ast.statements[0], depth + 1);
-                }
-            },
+            .block, .block_two, .block_newline, .block_two_newline => return (try self.expression(node, null, depth + 1)) != null,
             else => {},
         }
         _ = try self.fail(.unsupported_body_expression, node, null);
@@ -235,7 +339,13 @@ const Context = struct {
         const op: Ir.Operation = switch (tag) {
             .identifier => blk: {
                 const name = self.module.sourceSlice(self.span(node)).?;
-                if (self.bindings.get(name)) |binding| break :blk .{ .parameter = binding.index };
+                if (self.bindings.get(name)) |binding| {
+                    if (binding.initializer) |initializer| {
+                        try emitter.values.put(emitter.allocator, node, try emitter.value(initializer));
+                        return true;
+                    }
+                    break :blk .{ .parameter = binding.index };
+                }
                 const id = self.module.lookup(name) orelse return error.InvalidFunctionId;
                 if (emitter.functions[@intFromEnum(id)]) |function| break :blk .{ .function_ref = function };
                 if (emitter.constants[@intFromEnum(id)]) |constant| break :blk .{ .constant = constant };
@@ -243,12 +353,9 @@ const Context = struct {
                 return false;
             },
             .block, .block_two, .block_newline, .block_two_newline => blk: {
-                var buffer: [2]Ast.Node.Index = undefined;
-                const block = ast.fullBlock(&buffer, node).?;
-                if (block.ast.statements.len == 0) break :blk .{ .constant = try self.ir.internConstant(.{ .ty = ty, .value = .void }) };
-                // Grouping adds no operation; keep the child's operation-origin span.
-                try emitter.values.put(emitter.allocator, node, try emitter.value(block.ast.statements[0]));
-                return true;
+                // Value-result blocks were already aliased before leaving scope.
+                // Empty/declaration-ended blocks produce unit after their effects.
+                break :blk .{ .constant = try self.ir.internConstant(.{ .ty = ty, .value = .void }) };
             },
             .negation, .bit_not, .bool_not => .{ .unary = .{
                 .op = switch (tag) {
@@ -334,14 +441,7 @@ const Context = struct {
             },
             .number_literal => return self.fail(.literal_needs_type, node, null),
             .char_literal, .string_literal => return self.fail(.unsupported_literal, node, null),
-            .block, .block_two, .block_newline, .block_two_newline => {
-                var buffer: [2]Ast.Node.Index = undefined;
-                const block = ast.fullBlock(&buffer, node).?;
-                if (ast.firstToken(node) != block.ast.lbrace or block.ast.statements.len > 1) return self.fail(.unsupported_body_expression, node, null);
-                if (block.ast.statements.len == 0) return self.fit(try self.ir.internType(.void), expected, node);
-                if (ast.nodes.items(.tag)[block.ast.statements[0]] == .decl) return self.fail(.unsupported_body_expression, node, null);
-                return self.expression(block.ast.statements[0], expected, depth + 1);
-            },
+            .block, .block_two, .block_newline, .block_two_newline => return self.blockExpression(node, expected, depth),
             .add, .sub, .mul, .div, .mod => {
                 const integer_context = if (expected) |want| (if (self.ir.getType(want.ty).? == .integer) expected else null) else null;
                 const operand = (try self.probe(data.lhs, depth + 1)) orelse (try self.probe(data.rhs, depth + 1)) orelse integer_context orelse return self.missingOperandType(node, data.lhs, data.rhs, expected, depth);
@@ -414,6 +514,83 @@ const Context = struct {
         }
     }
 };
+
+test "typed locals and final expressions work across lexical blocks" {
+    var module = try Module.init(std.testing.allocator, "locals.nov",
+        \\let id: (x: i32) -> i32 = x
+        \\let f: (p: i32) -> i32 = {
+        \\    let x: i32 = p + 1
+        \\    @println(x)
+        \\    let y: i32 = {
+        \\        let inner: i32 = id(x)
+        \\        inner + 1
+        \\    }
+        \\    y
+        \\}
+        \\let out: () -> void = {
+        \\    {let reused: bool = true
+        \\    }
+        \\    {let reused: bool = false
+        \\    }
+        \\    @println({let n: i32 = 2
+        \\        n} == 2)
+        \\}
+    );
+    defer module.deinit();
+    var sema = try @import("Sema.zig").analyzeFunctions(&module);
+    defer sema.deinit();
+    try std.testing.expect(!module.hasErrors());
+}
+
+test "local scope declaration and block result diagnostics" {
+    const Case = struct { body: []const u8, tag: Module.Diagnostic.Tag };
+    for ([_]Case{
+        .{ .body = "{let n: i32 = n\nn}", .tag = .unknown_name },
+        .{ .body = "{let n: i32 = later\nlet later: i32 = 1\nn}", .tag = .unknown_name },
+        .{ .body = "{{let inner: i32 = 1\n}\ninner}", .tag = .unknown_name },
+        .{ .body = "{let n: i32 = 1\nlet n: i32 = 2\nn}", .tag = .unsupported_shadowing },
+        .{ .body = "{let p: i32 = 1\np}", .tag = .unsupported_shadowing },
+        .{ .body = "{let i32: i32 = 1\ni32}", .tag = .unsupported_shadowing },
+        .{ .body = "{let mut n: i32 = 1\nn}", .tag = .unsupported_local_declaration },
+        .{ .body = "{let n = 1\nn}", .tag = .unsupported_local_declaration },
+        .{ .body = "{let n: i32\nn}", .tag = .missing_initializer },
+        .{ .body = "{let n: i8 = 128\nn}", .tag = .literal_out_of_range },
+        .{ .body = "{let n: missing = 1\nn}", .tag = .unknown_type },
+        .{ .body = "{let f: i32 = 1\nf}", .tag = .unsupported_shadowing },
+        .{ .body = "{let n: i32 = true\nn}", .tag = .literal_type_mismatch },
+        .{ .body = "{let n: int = 1\nlet u: uint = n\np}", .tag = .expression_type_mismatch },
+        .{ .body = "{let n: i32 = 1\nn = 2\nn}", .tag = .unsupported_body_expression },
+        .{ .body = "{let n: i32 = 1\n{let hidden: i32 = n\n}\nhidden} + 1", .tag = .unknown_name },
+        .{ .body = "{let n: i32 = 1\n}", .tag = .expression_type_mismatch },
+        .{ .body = "{p\np}", .tag = .unused_block_value },
+        .{ .body = "{let n: i32 = 1\n{let n: i32 = 2\nn}}", .tag = .unsupported_shadowing },
+        .{ .body = "{let callback: (x: i32) -> i32 = x\n1}", .tag = .unsupported_local_declaration },
+    }) |case| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let f: (p: i32) -> i32 = {s}", .{case.body});
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "locals.nov", source);
+        defer module.deinit();
+        var sema = try @import("Sema.zig").analyzeFunctions(&module);
+        defer sema.deinit();
+        try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+        try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
+    }
+}
+
+test "local shadowing reports both declarations and locals do not leak to other functions" {
+    var module = try Module.init(std.testing.allocator, "scope.nov", "let first: () -> void = {let secret: i32 = 1\n{let secret: i32 = 2\n}\n}\nlet second: () -> i32 = secret");
+    defer module.deinit();
+    var sema = try @import("Sema.zig").analyzeFunctions(&module);
+    defer sema.deinit();
+    try std.testing.expectEqual(@as(usize, 2), module.diagnostics.items.len);
+    const diagnostic = module.diagnostics.items[0];
+    try std.testing.expectEqual(Module.Diagnostic.Tag.unsupported_shadowing, diagnostic.tag);
+    try std.testing.expectEqualStrings("secret", module.sourceSlice(diagnostic.span).?);
+    try std.testing.expectEqualStrings("secret", module.sourceSlice(diagnostic.related.?).?);
+    try std.testing.expect(diagnostic.related.?.start < diagnostic.span.start);
+    try std.testing.expectEqual(Module.Diagnostic.Tag.unknown_name, module.diagnostics.items[1].tag);
+}
 
 test "printing accepts typed scalar arguments and returns void" {
     var module = try Module.init(std.testing.allocator, "print.nov", "let empty: () -> void = @print()\nlet line: () -> void = @println()\nlet out: (a: i8, b: u64, c: bool) -> void = @println(a, b, c, true, false, a + 1)");
@@ -511,13 +688,11 @@ test "body errors identify mismatched returns operands names and calls" {
     }
 }
 
-test "local declarations control flow and shadowing stay explicitly unsupported" {
+test "control flow and parameter shadowing stay explicitly unsupported" {
     for ([_][]const u8{
-        "let f: () -> i32 = {\nlet local = 1\nlocal\n}",
         "let f: () -> i32 = label: {42}",
         "let f: (value: i32) -> i32 = {return value}",
         "let f: (value: i32) = {value += 1}",
-        "let f: () -> i32 = {1\n2}",
     }) |source| {
         var module = try Module.init(std.testing.allocator, "unsupported.nov", source);
         defer module.deinit();
@@ -551,7 +726,7 @@ test "unconstrained operands still diagnose unknown names and unsupported shapes
     var unsupported_sema = try @import("Sema.zig").analyzeFunctions(&unsupported);
     defer unsupported_sema.deinit();
     try std.testing.expectEqual(@as(usize, 1), unsupported.diagnostics.items.len);
-    try std.testing.expectEqual(Module.Diagnostic.Tag.unsupported_body_expression, unsupported.diagnostics.items[0].tag);
+    try std.testing.expectEqual(Module.Diagnostic.Tag.unsupported_local_declaration, unsupported.diagnostics.items[0].tag);
 }
 
 test "parameter bindings do not leak between functions and annotated globals remain readable" {
@@ -606,6 +781,9 @@ test "body checking rolls back diagnostics and owned storage on allocation failu
         "let bad: (x: i32) -> bool = x\nlet good: (p: i32, q: i32) -> i32 = p + q",
         "let f: (x: i32) -> i32 = missing(x)",
         "let f: (true: bool) -> bool = true",
+        "let f: () -> i32 = {let a: i32 = 1\nlet b: i32 = {let c: i32 = a + 2\nc}\nb}",
+        "let f: () -> i32 = {let x: i32 = 1\n{let x: i32 = 2\nx}}",
+        "let f: () -> i32 = {let x: (missing) -> i32 = f\n1}",
     }) |source| {
         try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
     }

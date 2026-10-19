@@ -446,6 +446,42 @@ fn emitSource(source: []const u8, diagnostic: ?*Diagnostic) ![]u8 {
     return emit(test_gpa, &sema.ir, diagnostic);
 }
 
+test "local initializers statements and nested results execute in source order" {
+    const c = try emitSource(
+        \\let mark: (value: int) -> int = {
+        \\    @print(value)
+        \\    value
+        \\}
+        \\let add: (a: int, b: int) -> int = a + b
+        \\let choose: () -> (int, int) -> int = {
+        \\    @print(mark(8))
+        \\    add
+        \\}
+        \\let out: () -> void = {
+        \\    let unused: int = mark(1)
+        \\    let first: int = mark(2)
+        \\    let next: int = {
+        \\        let scoped: int = mark(3)
+        \\        @print(scoped)
+        \\        scoped + first
+        \\    }
+        \\    {let scoped: int = mark(4)
+        \\    }
+        \\    let callback: (int, int) -> int = add
+        \\    @println(first, first, next, callback(mark(5), mark(6)))
+        \\    @println({@print(mark(7))
+        \\        let last: bool = true
+        \\        last})
+        \\    let unit: void = @println()
+        \\    @println(choose()(mark(9), mark(10)))
+        \\    @println({let left: int = mark(11)
+        \\        left} + mark(12))
+        \\}
+    , null);
+    defer test_gpa.free(c);
+    try compileAndRunExpected(c, "void nov_out(void); int main(void) { nov_out(); return 0; }", 0, "12334562 2 5 11\n77true\n\n8891019\n111223\n", "");
+}
+
 test "native aliases lower arithmetic indirect calls comparisons and printing" {
     const c = try emitSource(
         "let negative: int = -42\nlet count: uint = 3\n" ++
