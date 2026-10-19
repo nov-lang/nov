@@ -37,8 +37,9 @@ local declarations, shadowing, control flow and general block results remain
 deferred or unsupported. Straight-line lowering now produces typed operations
 with source spans and ordered operands/call arguments. It requires immutable
 literal globals; unit/global block initializers and short-circuit `and`/`or` are
-not lowered yet. Numeric execution rules and C emission remain unimplemented;
-`check` remains syntax-only.
+not lowered yet. An internal C11 backend emits verified IR, including fixed-width
+integer arithmetic; CLI compilation/execution, printing and entrypoint emission
+remain unimplemented. `check` remains syntax-only.
 
 Format files in place with `zig build run -- fmt file.nov`, or use
 `zig build run -- fmt --check file.nov` to check formatting without writing.
@@ -574,6 +575,20 @@ See also:
 - [Arrays](#Arrays)
 
 ## Integers
+
+The C backend supports signed and unsigned 8/16/32/64-bit integers. Addition,
+subtraction, multiplication and signed negation wrap in two's complement, equally
+in debug and release. Division truncates toward zero; remainder has the dividend's
+sign. `MIN / -1` wraps to `MIN`, and `MIN % -1` is zero. Division or remainder by
+zero flushes stdout, writes `panic: division by zero` or `panic: remainder by zero`
+(with a newline) to stderr, and exits with status 1.
+
+C arithmetic uses `uint32_t`/`uint64_t` working values to avoid signed overflow
+and narrow integer promotions. Conversion back to signed integers relies on the
+modular unsigned-to-signed conversion provided by GCC, Clang and MSVC. Shifts,
+128-bit and odd-width backend integers remain unsupported; `int`/`uint` widths
+are not yet decided. The wider type list below is a proposal.
+
 TODO
 - c\_int, ...
 - u8, u16, u32, u64, u128, i8, i16, i32, i64, i128, f16, f32, f64, f80, f128
