@@ -35,10 +35,10 @@ parameters and checks integer arithmetic, boolean expressions, comparisons and
 calls against collected signatures, including recursive calls. Immutable,
 explicitly typed locals and straight-line blocks with final-expression results
 are supported in function bodies. Literal defaults, user-defined type aliases,
-shadowing and control flow remain deferred or unsupported.
-Straight-line lowering now produces typed operations
-with source spans and ordered operands/call arguments. It requires immutable
-literal globals; unit/global block initializers and short-circuit `and`/`or` are
+shadowing and general control flow remain deferred or unsupported.
+Lowering produces typed operations with source spans, ordered operands/call
+arguments, and structured conditional RHS regions for boolean `and`/`or`.
+It requires immutable literal globals; unit/global block initializers are
 not lowered yet. An internal C11 backend emits verified IR, including fixed-width
 integer arithmetic and program entrypoint emission through `emit-c`.
 `@print`/`@println` support booleans and explicitly typed integers, including
@@ -50,11 +50,11 @@ analysis, annotation/literal and function-body checking, then typed lowering and
 IR verification. Source errors and unsupported/deferred forms fail with source
 diagnostics (including related notes where available); recovered syntax errors
 stop semantic analysis. Globals must be immutable, explicitly typed integer or
-boolean literals. Functions need explicit supported signatures and straight-line
+boolean literals. Functions need explicit supported signatures and bounded
 expression bodies (including forward/recursive calls, local declarations, nested
-blocks and empty void bodies).
+blocks, boolean short-circuiting and empty void bodies).
 Inferred globals, mutable globals, nonliteral global initializers, global unit
-values, and short-circuit `and`/`or` are currently rejected, along with the other
+values are currently rejected, along with the other
 unsupported forms listed above. This is not a backend compatibility check: it
 does not emit C, validate C integer widths, require `main`, build, or execute a
 program. Each input file is checked independently; any failed/unreadable input
@@ -198,8 +198,19 @@ This prints `42` on two lines. Locals require an explicit supported type and an
 initializer. Immutable scalar/unit values and existing function values (with
 unnamed parameter types, e.g. `let callback: (int) -> int = twice`) work; named
 local function definitions/closures, inferred locals, mutation, assignments,
-labels, explicit `return`, control flow and memory-bearing values are rejected.
+labels, explicit `return`, general control flow and memory-bearing values are rejected.
 Global block initializers remain unsupported by lowering.
+
+Boolean `and`/`or` evaluate the left operand exactly once, then evaluate the right
+operand only when needed (`and`: left is true; `or`: left is false). Both operands
+must typecheck as `bool`, even when the RHS will be skipped at runtime. RHS blocks,
+local initializers, calls, printing and arithmetic panics are all conditional;
+other expressions and call/print arguments retain left-to-right evaluation.
+Nested operators merge only their boolean result, not RHS-local values. The IR
+stores nestable RHS instruction ranges in the owned function body; verification
+rejects crossing ranges, forward references and references escaping a region.
+The C backend emits conditional blocks, never eager RHS temporaries. This does
+not add general `if`/`else`, mutation or new global initializer forms.
 
 Format files in place with `zig build run -- fmt file.nov`, or use
 `zig build run -- fmt --check file.nov` to check formatting without writing.

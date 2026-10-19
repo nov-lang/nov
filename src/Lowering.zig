@@ -191,7 +191,7 @@ test "unit comparisons and unary operations lower without arithmetic evaluation"
     try sema.ir.verify();
 }
 
-test "short-circuit expressions reject lowering and discard partial functions" {
+test "short-circuit expressions lower explicit conditional RHS regions" {
     for ([_][]const u8{ "and", "or" }) |operator| {
         const source = try std.fmt.allocPrint(std.testing.allocator, "let side: () -> bool = true\nlet main: () -> bool = false {s} side()", .{operator});
         defer std.testing.allocator.free(source);
@@ -199,12 +199,16 @@ test "short-circuit expressions reject lowering and discard partial functions" {
         defer module.deinit();
         var sema = try lower(&module);
         defer sema.deinit();
-        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
-        try std.testing.expectEqual(Module.Diagnostic.Tag.unsupported_lowering, module.diagnostics.items[0].tag);
-        try std.testing.expectEqualStrings(operator, module.sourceSlice(module.diagnostics.items[0].span).?);
-        try std.testing.expect(!sema.lowering_complete);
-        try std.testing.expectEqual(@as(usize, 0), sema.ir.functions.items.len);
-        for (sema.entries) |entry| try std.testing.expect(entry.function == null);
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expect(sema.lowering_complete);
+        const body = sema.ir.functions.items[1].body.?;
+        const merge = body.instructions[body.instructions.len - 1];
+        const region = merge.op.short_circuit;
+        try std.testing.expectEqualStrings(operator, @tagName(region.kind));
+        try std.testing.expectEqual(@as(u32, 1), region.rhs_start);
+        try std.testing.expectEqual(@as(u32, 0), @intFromEnum(region.lhs));
+        try std.testing.expect(body.instructions[@intFromEnum(region.rhs)].op == .call);
+        try std.testing.expectEqualStrings(source[std.mem.indexOf(u8, source, "false").?..], module.ast.source[merge.span.start..merge.span.end]);
         try sema.ir.verify();
     }
 }
@@ -301,6 +305,8 @@ test "lowering ownership and source diagnostic rollback survive allocation failu
         "",
         "let f: (a: i32, b: i32) -> i32 = a + b\nlet main: () -> i32 = f(1, f(2, 3))",
         "let first: () = {}\nlet last: () -> bool = true and false",
+        "let f: (x: bool) -> bool = x and {let y: bool = x or false\n@println(y)\ny and x}\nlet main: () -> void = @println(f(true), false or f(false))",
+        "let f: () -> bool = false and missing",
         "let id: (x: i32) -> i32 = x\nlet main: () -> void = @println(true, id(1), id(2))",
         "let main: () -> void = @println(true, missing, 1)",
         "let mut value: i32 = 1\nlet main: () -> i32 = value",

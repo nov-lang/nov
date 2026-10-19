@@ -406,7 +406,9 @@ test "semantic file checks reject errors and deferred forms without writing" {
         .{ .source = "let f: (x: i32) -> i32 = x\nlet g: () -> i32 = f()", .message = "argument count" },
         .{ .source = "let x = 1", .message = "lowering this source form" },
         .{ .source = "let mut x: i32 = 1", .message = "lowering this source form" },
-        .{ .source = "let f: (x: bool) -> bool = x and true", .message = "lowering this source form" },
+        .{ .source = "let f: (x: bool) -> bool = x and {false or x}" },
+        .{ .source = "let f: () -> bool = false and absent", .message = "unknown name" },
+        .{ .source = "let f: (x: i32) -> bool = true or x", .message = "does not match" },
     };
     for (cases) |case| {
         try tmp.dir.writeFile(io, .{ .sub_path = "input.nov", .data = case.source });

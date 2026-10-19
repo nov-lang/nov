@@ -1,7 +1,8 @@
 //! C11 backend foundation for verified typed IR.
 //!
 //! Emits one translation unit with externally visible `nov_`-prefixed functions
-//! and function-pointer typedefs. Every IR value becomes one `const` local, so
+//! and function-pointer typedefs. IR values become ordered locals (only a
+//! short-circuit merge needs a mutable temporary), so
 //! the IR's callee-first, left-to-right order is preserved without relying on C
 //! argument evaluation order.
 //!
@@ -320,6 +321,10 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
         .print => |print| for (print.args) |arg| {
             value_used[@intFromEnum(arg)] = true;
         },
+        .short_circuit => |region| {
+            value_used[@intFromEnum(region.lhs)] = true;
+            value_used[@intFromEnum(region.rhs)] = true;
+        },
         .constant, .function_ref => {},
     };
 
@@ -328,6 +333,20 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
         if (!used) try w.print("    (void)p{d};\n", .{i});
     }
     for (body.instructions, 0..) |instruction, i| {
+        // Open outer regions first when nested RHS regions share a start.
+        var end = body.instructions.len;
+        while (end > i) {
+            end -= 1;
+            const candidate = body.instructions[end];
+            if (candidate.op != .short_circuit or candidate.op.short_circuit.rhs_start != i) continue;
+            const region = candidate.op.short_circuit;
+            try w.print("    bool v{d} = v{d};\n    if ({s}v{d}) {{\n", .{ end, @intFromEnum(region.lhs), if (region.kind == .@"or") "!" else "", @intFromEnum(region.lhs) });
+        }
+        if (instruction.op == .short_circuit) {
+            try w.print("    v{d} = v{d};\n    }}\n", .{ i, @intFromEnum(instruction.op.short_circuit.rhs) });
+            if (!value_used[i]) try w.print("    (void)v{d};\n", .{i});
+            continue;
+        }
         const ty = ir.types.items[@intFromEnum(instruction.ty)];
         if (ty == .void) {
             // Void values have no C object; emit their effects as statements.
@@ -394,7 +413,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
                 try w.print("v{d} {s} v{d}", .{ @intFromEnum(binary.lhs), operator, @intFromEnum(binary.rhs) });
             },
             .call => |call| try writeCall(w, call),
-            .print => unreachable,
+            .print, .short_circuit => unreachable,
         }
         try w.writeAll(";\n");
         if (!value_used[i]) try w.print("    (void)v{d};\n", .{i});
@@ -444,6 +463,85 @@ fn emitSource(source: []const u8, diagnostic: ?*Diagnostic) ![]u8 {
     try std.testing.expect(!module.hasErrors());
     try std.testing.expect(sema.lowering_complete);
     return emit(test_gpa, &sema.ir, diagnostic);
+}
+
+test "short circuit truth tables nested effects captures and argument order" {
+    const c = try emitSource(
+        \\let mark: (n: int, value: bool) -> bool = {
+        \\    @print(n)
+        \\    value
+        \\}
+        \\let choose: () -> (int, bool) -> bool = {
+        \\    @print(true)
+        \\    mark
+        \\}
+        \\let captures: (x: bool) -> bool = {
+        \\    let outer: bool = x
+        \\    outer and {outer or outer}
+        \\}
+        \\let out: () -> void = {
+        \\    @println(true and true, true and false, false and true, false and false, true or true, true or false, false or true, false or false)
+        \\    @println(mark(1, false) and mark(2, true), mark(3, true) and mark(4, false), mark(5, true) or mark(6, false), mark(7, false) or mark(8, true))
+        \\    @println(mark(9, true) and {mark(10, false) or mark(11, true)})
+        \\    @println({mark(12, false) and mark(13, true)} or mark(14, false))
+        \\    @println(captures(false), captures(true))
+        \\    @println(false and {let skipped: bool = choose()(15, true)
+        \\        @print(skipped)
+        \\        skipped})
+        \\    @println(true and {let taken: bool = choose()(16, true)
+        \\        @print(taken)
+        \\        taken and true})
+        \\    let unused: bool = false or mark(17, true)
+        \\    @println(true or false and mark(18, true))
+        \\    @println({true or false} == {false or true}, !{true and false})
+        \\}
+    , null);
+    defer test_gpa.free(c);
+    try compileAndRunExpected(c, "void nov_out(void); int main(void) { nov_out(); return 0; }", 0, "true false false false true true true false\n134578false false true true\n91011true\n1214false\nfalse true\nfalse\ntrue16truetrue\n17true\ntrue true\n", "");
+}
+
+test "short circuit skips RHS panics and propagates taken RHS panics" {
+    const c = try emitSource(
+        \\let divide: (x: int) -> bool = 1 / x == 0
+        \\let remainder: (x: int) -> bool = 1 % x == 0
+        \\let skip: () -> void = @println(false and divide(0), true or remainder(0))
+        \\let takeand: () -> bool = true and {@print(true)
+        \\    divide(0)}
+        \\let takeor: () -> bool = false or {@print(false)
+        \\    remainder(0)}
+    , null);
+    defer test_gpa.free(c);
+    try compileAndRunExpected(c, "void nov_skip(void); int main(void) { nov_skip(); return 0; }", 0, "false true\n", "");
+    try compileAndRunExpected(c, "#include <stdbool.h>\nbool nov_takeand(void); int main(void) { (void)nov_takeand(); return 0; }", 1, "true", "panic: division by zero\n");
+    try compileAndRunExpected(c, "#include <stdbool.h>\nbool nov_takeor(void); int main(void) { (void)nov_takeor(); return 0; }", 1, "false", "panic: remainder by zero\n");
+}
+
+fn testShortCircuitAllocationFailures(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "short.nov",
+        \\let id: (x: bool) -> bool = x
+        \\let main: () -> void = {
+        \\    let outer: bool = true
+        \\    @println(outer and {let callback: (bool) -> bool = id
+        \\        let inner: bool = callback(false) or outer
+        \\        @println(inner)
+        \\        inner and outer}, false or id(true))
+        \\}
+    );
+    var result = Lowering.lower(&module) catch |err| {
+        module.deinit();
+        return err;
+    };
+    defer result.deinit();
+    const failed = module.hasErrors();
+    module.deinit();
+    try std.testing.expect(!failed);
+    try result.ir.verify();
+    const c = try emitProgram(allocator, &result.ir, null);
+    defer allocator.free(c);
+}
+
+test "nested conditional ownership and emission survive every allocation failure" {
+    try std.testing.checkAllAllocationFailures(test_gpa, testShortCircuitAllocationFailures, .{});
 }
 
 test "local initializers statements and nested results execute in source order" {

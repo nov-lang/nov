@@ -16,7 +16,8 @@ pub const native_pointer_bits = @bitSizeOf(usize);
 pub const TypeId = enum(u32) { _ };
 pub const ConstId = enum(u32) { _ };
 pub const FunctionId = enum(u32) { _ };
-/// Zero-based instruction index, local to a single body.
+/// Zero-based instruction index, local to a single body. Region-private values
+/// are visible only within that region (or as its explicit result).
 pub const ValueId = enum(u32) { _ };
 pub const Span = struct { start: u32, end: u32 };
 pub const Function = struct {
@@ -37,6 +38,10 @@ pub const Operation = union(enum) {
     binary: struct { op: BinaryOp, lhs: ValueId, rhs: ValueId },
     call: struct { callee: ValueId, args: []const ValueId },
     print: struct { args: []const ValueId, newline: bool },
+    /// Instructions [rhs_start, this instruction) form a conditional RHS region.
+    /// Regions nest or are disjoint; only this merged boolean escapes. Empty
+    /// regions and results captured from enclosing regions are valid.
+    short_circuit: struct { kind: enum { @"and", @"or" }, lhs: ValueId, rhs_start: u32, rhs: ValueId },
 };
 
 pub const Type = union(enum) {
@@ -94,6 +99,7 @@ pub const VerifyError = ValidationError || error{
     InvalidCall,
     InvalidReturn,
     InvalidConstId,
+    InvalidRegion,
 };
 pub const BuildError = VerifyError || std.mem.Allocator.Error || error{ TooManyEntries, BodyAlreadySet };
 
@@ -266,13 +272,36 @@ fn validateFunction(self: *const Ir, function: Function) VerifyError!void {
 }
 
 fn operandType(body: Body, id: ValueId, before: usize) VerifyError!TypeId {
+    return regionOperandType(body, id, before, null);
+}
+
+fn regionOperandType(body: Body, id: ValueId, before: usize, yielding: ?usize) VerifyError!TypeId {
     const index = @intFromEnum(id);
     if (index >= before) return error.InvalidValueId;
+    for (body.instructions, 0..) |instruction, end| {
+        if (instruction.op != .short_circuit) continue;
+        const start = instruction.op.short_circuit.rhs_start;
+        if (index >= start and index < end and
+            !(before >= start and (before < end or yielding == end))) return error.InvalidValueId;
+    }
     return body.instructions[index].ty;
 }
 
 fn validateBody(self: *const Ir, function: Function, body: Body) VerifyError!void {
     const signature = (self.getType(function.ty) orelse return error.InvalidTypeId).function;
+    if (body.instructions.len > std.math.maxInt(u32)) return error.InvalidRegion;
+    // Validate structure before resolving operands. A region includes its merge
+    // in its parent's scope, never in a sibling's scope.
+    for (body.instructions, 0..) |instruction, end| {
+        if (instruction.op != .short_circuit) continue;
+        const region = instruction.op.short_circuit;
+        if (region.rhs_start > end or @intFromEnum(region.lhs) >= region.rhs_start) return error.InvalidRegion;
+        for (body.instructions[0..end], 0..) |previous, previous_end| {
+            if (previous.op != .short_circuit) continue;
+            const previous_start = previous.op.short_circuit.rhs_start;
+            if (previous_end >= region.rhs_start and previous_start < region.rhs_start) return error.InvalidRegion;
+        }
+    }
     for (body.instructions, 0..) |instruction, i| {
         const ty = self.getType(instruction.ty) orelse return error.InvalidTypeId;
         try self.validateSpan(instruction.span);
@@ -315,6 +344,11 @@ fn validateBody(self: *const Ir, function: Function, body: Body) VerifyError!voi
                         if (ty != .boolean) return error.OperandTypeMismatch;
                     },
                 }
+            },
+            .short_circuit => |region| {
+                if (ty != .boolean) return error.OperandTypeMismatch;
+                if (try operandType(body, region.lhs, region.rhs_start) != instruction.ty) return error.OperandTypeMismatch;
+                if (try regionOperandType(body, region.rhs, i, i) != instruction.ty) return error.OperandTypeMismatch;
             },
             .print => |print| {
                 if (ty != .void) return error.InvalidOperation;
@@ -669,6 +703,105 @@ const TestFunctions = struct {
         try std.testing.expect(self.ir.getFunction(self.function).?.body == null);
     }
 };
+
+fn testConditionalAllocationFailures(allocator: std.mem.Allocator) !void {
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    const boolean = try ir.internType(.boolean);
+    const void_ty = try ir.internType(.void);
+    const signature = try ir.internType(.{ .function = .{ .params = &.{boolean}, .result = boolean } });
+    const function = try ir.addFunction("conditional", signature, .{ .start = 0, .end = 0 });
+    var call_args = [_]ValueId{@enumFromInt(0)};
+    var print_args = [_]ValueId{@enumFromInt(2)};
+    var instructions = [_]Instruction{
+        .{ .ty = boolean, .span = .{ .start = 0, .end = 0 }, .op = .{ .parameter = 0 } },
+        .{ .ty = signature, .span = .{ .start = 0, .end = 0 }, .op = .{ .function_ref = function } },
+        .{ .ty = boolean, .span = .{ .start = 0, .end = 0 }, .op = .{ .call = .{ .callee = @enumFromInt(1), .args = &call_args } } },
+        .{ .ty = void_ty, .span = .{ .start = 0, .end = 0 }, .op = .{ .print = .{ .args = &print_args, .newline = true } } },
+        .{ .ty = boolean, .span = .{ .start = 0, .end = 0 }, .op = .{ .short_circuit = .{ .kind = .@"or", .lhs = @enumFromInt(0), .rhs_start = 2, .rhs = @enumFromInt(2) } } },
+        .{ .ty = boolean, .span = .{ .start = 0, .end = 0 }, .op = .{ .short_circuit = .{ .kind = .@"and", .lhs = @enumFromInt(0), .rhs_start = 1, .rhs = @enumFromInt(4) } } },
+    };
+    ir.setFunctionBody(function, &instructions, @enumFromInt(5)) catch |err| {
+        try std.testing.expect(ir.getFunction(function).?.body == null);
+        return err;
+    };
+    call_args[0] = @enumFromInt(99);
+    print_args[0] = @enumFromInt(99);
+    instructions[5].op.short_circuit.rhs_start = 99;
+    try ir.verify();
+    // Removing a nested body frees the same owned slices as final destruction.
+    ir.clearFunctions();
+    try ir.verify();
+}
+
+test "conditional body operands are owned and publication is atomic under OOM" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testConditionalAllocationFailures, .{});
+}
+
+test "conditional regions reject crossing ranges and private value escapes" {
+    var fixture = try TestFunctions.init(std.testing.allocator);
+    defer fixture.ir.deinit();
+    const ir = &fixture.ir;
+    const boolean = fixture.boolean;
+    const signature = try ir.internType(.{ .function = .{ .params = &.{}, .result = boolean } });
+    const function = try ir.addFunction("conditional", signature, test_span);
+    const constant = try ir.internConstant(.{ .ty = boolean, .value = .{ .boolean = true } });
+    const ins = TestFunctions.instruction;
+    const void_ty = try ir.internType(.void);
+    const valid = [_]Instruction{
+        ins(boolean, .{ .constant = constant }),
+        ins(boolean, .{ .constant = constant }),
+        ins(boolean, .{ .short_circuit = .{ .kind = .@"and", .lhs = @enumFromInt(0), .rhs_start = 1, .rhs = @enumFromInt(1) } }),
+        ins(boolean, .{ .constant = constant }),
+        ins(boolean, .{ .short_circuit = .{ .kind = .@"or", .lhs = @enumFromInt(0), .rhs_start = 3, .rhs = @enumFromInt(3) } }),
+        ins(boolean, .{ .unary = .{ .op = .bool_not, .operand = @enumFromInt(2) } }),
+    };
+    // Test insertion as well as verification after post-publication corruption.
+    const cases = [_]struct { index: usize, instruction: Instruction, err: VerifyError }{
+        .{ .index = 4, .instruction = ins(boolean, .{ .short_circuit = .{ .kind = .@"or", .lhs = @enumFromInt(0), .rhs_start = 2, .rhs = @enumFromInt(3) } }), .err = error.InvalidRegion },
+        .{ .index = 2, .instruction = ins(boolean, .{ .short_circuit = .{ .kind = .@"and", .lhs = @enumFromInt(1), .rhs_start = 1, .rhs = @enumFromInt(1) } }), .err = error.InvalidRegion },
+        .{ .index = 2, .instruction = ins(boolean, .{ .short_circuit = .{ .kind = .@"and", .lhs = @enumFromInt(0), .rhs_start = 99, .rhs = @enumFromInt(1) } }), .err = error.InvalidRegion },
+        .{ .index = 2, .instruction = ins(boolean, .{ .short_circuit = .{ .kind = .@"and", .lhs = @enumFromInt(0), .rhs_start = 1, .rhs = @enumFromInt(2) } }), .err = error.InvalidValueId },
+        .{ .index = 4, .instruction = ins(boolean, .{ .short_circuit = .{ .kind = .@"or", .lhs = @enumFromInt(0), .rhs_start = 3, .rhs = @enumFromInt(1) } }), .err = error.InvalidValueId },
+        .{ .index = 5, .instruction = ins(boolean, .{ .unary = .{ .op = .bool_not, .operand = @enumFromInt(1) } }), .err = error.InvalidValueId },
+        .{ .index = 0, .instruction = ins(fixture.integer, .{ .constant = fixture.number }), .err = error.OperandTypeMismatch },
+        .{ .index = 1, .instruction = ins(fixture.integer, .{ .constant = fixture.number }), .err = error.OperandTypeMismatch },
+        .{ .index = 2, .instruction = ins(fixture.integer, valid[2].op), .err = error.OperandTypeMismatch },
+        .{ .index = 5, .instruction = ins(void_ty, .{ .print = .{ .args = &.{@enumFromInt(1)}, .newline = true } }), .err = error.InvalidValueId },
+        .{ .index = 5, .instruction = ins(boolean, .{ .binary = .{ .op = .eq, .lhs = @enumFromInt(1), .rhs = @enumFromInt(0) } }), .err = error.InvalidValueId },
+        .{ .index = 5, .instruction = ins(boolean, .{ .call = .{ .callee = @enumFromInt(1), .args = &.{} } }), .err = error.InvalidValueId },
+        .{ .index = 2, .instruction = .{ .ty = boolean, .span = .{ .start = 0, .end = 99 }, .op = valid[2].op }, .err = error.InvalidSourceSpan },
+    };
+    for (cases) |case| {
+        var invalid = valid;
+        invalid[case.index] = case.instruction;
+        try std.testing.expectError(case.err, ir.setFunctionBody(function, &invalid, @enumFromInt(5)));
+        try std.testing.expect(ir.getFunction(function).?.body == null);
+    }
+    try std.testing.expectError(error.InvalidValueId, ir.setFunctionBody(function, &valid, @enumFromInt(1)));
+    try ir.setFunctionBody(function, &valid, @enumFromInt(5));
+    // Complete the unrelated fixture declaration before verifying.
+    try ir.setFunctionBody(fixture.function, &.{ins(fixture.integer, .{ .parameter = 0 })}, @enumFromInt(0));
+    try ir.verify();
+    const owned = @constCast(ir.getFunction(function).?.body.?.instructions);
+    for (cases) |case| {
+        owned[case.index] = case.instruction;
+        try std.testing.expectError(case.err, ir.verify());
+        owned[case.index] = valid[case.index];
+    }
+    // Nesting and enclosing captures, including an empty region, are legal.
+    owned[5].op.unary.operand = @enumFromInt(4);
+    owned[4].op.short_circuit.rhs_start = 1;
+    owned[4].op.short_circuit.rhs = @enumFromInt(2);
+    try ir.verify();
+    owned[2].op.short_circuit.rhs_start = 2;
+    owned[2].op.short_circuit.rhs = @enumFromInt(0);
+    try ir.verify();
+    owned[4].op.short_circuit.rhs = @enumFromInt(1);
+    try ir.verify();
+    owned[5].op.unary.operand = @enumFromInt(2);
+    try std.testing.expectError(error.InvalidValueId, ir.verify());
+}
 
 test "functions own names instructions and call arguments with forward and recursive references" {
     var fixture = try TestFunctions.init(std.testing.allocator);

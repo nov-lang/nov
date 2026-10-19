@@ -401,11 +401,6 @@ const Context = struct {
     }
 
     fn expression(self: *Context, node: Ast.Node.Index, expected: ?Known, depth: usize) Error!?Ir.TypeId {
-        if (self.emitter != null) {
-            const tag = self.module.ast.nodes.items(.tag)[node];
-            // A flat binary operation would silently make RHS evaluation eager.
-            if (tag == .bool_and or tag == .bool_or) return self.fail(.unsupported_lowering, node, null);
-        }
         const ty = (try self.expressionInner(node, expected, depth)) orelse return null;
         if (self.emitter != null and !try self.emitNode(node, ty)) return null;
         return ty;
@@ -466,8 +461,18 @@ const Context = struct {
                 if (try self.fit(boolean, expected, node) == null) return null;
                 const operand: Known = .{ .ty = boolean, .annotation = if (expected) |want| want.annotation else null };
                 const lhs = if (ast.nodes.items(.tag)[node] != .bool_not) try self.expression(data.lhs, operand, depth + 1) else boolean;
+                const rhs_start: u32 = if (self.emitter) |emitter| @intCast(emitter.instructions.items.len) else 0;
                 const rhs = try self.expression(data.rhs, operand, depth + 1);
                 if (lhs == null or rhs == null) return null;
+                if (self.emitter) |emitter| {
+                    const tag = ast.nodes.items(.tag)[node];
+                    if (tag != .bool_not) try emitter.record(node, boolean, self.irSpan(node), .{ .short_circuit = .{
+                        .kind = if (tag == .bool_and) .@"and" else .@"or",
+                        .lhs = try emitter.value(data.lhs),
+                        .rhs_start = rhs_start,
+                        .rhs = try emitter.value(data.rhs),
+                    } });
+                }
                 return boolean;
             },
             .negation, .bit_not => {
