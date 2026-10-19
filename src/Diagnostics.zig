@@ -48,13 +48,16 @@ pub fn renderModule(module: *const Module, writer: *std.Io.Writer) !void {
             .unknown_name => try writer.print("unknown name '{s}'", .{module.sourceSlice(diagnostic.span).?}),
             .unsupported_declaration => try writer.writeAll("declaration attributes are not supported in semantic analysis yet"),
             .unsupported_name => try writer.writeAll("quoted identifiers are not supported in semantic analysis yet"),
+            .value_cycle => try writer.print("cyclic value dependency on '{s}'", .{module.sourceSlice(diagnostic.span).?}),
+            .unsupported_dependency_expression => try writer.writeAll("dependency analysis for this expression is not implemented yet"),
+            .missing_initializer => try writer.writeAll("dependency analysis requires an initializer"),
         }
         try location.renderExcerpt(module.ast.source, diagnostic.span.end - diagnostic.span.start, writer);
-        if (diagnostic.tag == .duplicate_name) {
+        if (diagnostic.tag == .duplicate_name or diagnostic.tag == .value_cycle) {
             if (diagnostic.related) |related| {
                 const original = Location.init(module.ast.source, related.start);
                 try original.renderPrefix(module.path, "note", writer);
-                try writer.writeAll("first declaration here");
+                try writer.writeAll(if (diagnostic.tag == .duplicate_name) "first declaration here" else "declaration in this cycle");
                 try original.renderExcerpt(module.ast.source, related.end - related.start, writer);
             }
         }
@@ -81,6 +84,59 @@ test "module duplicate diagnostics include the first binding with tabs and CRLF"
     try std.testing.expectEqualStrings(
         "duplicate.nov:3:6: error: duplicate declaration 'name'\n\tlet name = 2\n\t    ^~~~\n" ++
             "duplicate.nov:2:6: note: first declaration here\n\tlet name = 1\n\t    ^~~~\n",
+        output.written(),
+    );
+}
+
+test "module value cycle diagnostics include the target declaration" {
+    var module = try Module.init(std.testing.allocator, "cycle.nov", "let first = second\nlet second = first");
+    defer module.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try module.diagnostics.append(module.allocator, .{
+        .tag = .value_cycle,
+        .span = .{ .start = 12, .end = 18 },
+        .related = module.getDeclaration(module.lookup("second").?).?.name_span,
+    });
+    var output = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer output.deinit();
+    try renderModule(&module, &output.writer);
+    try std.testing.expectEqualStrings(
+        "cycle.nov:1:13: error: cyclic value dependency on 'second'\nlet first = second\n            ^~~~~~\n" ++
+            "cycle.nov:2:5: note: declaration in this cycle\nlet second = first\n    ^~~~~~\n",
+        output.written(),
+    );
+}
+
+test "module unsupported dependency expressions render diagnostics" {
+    var module = try Module.init(std.testing.allocator, "expression.nov", "let value = value()");
+    defer module.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try module.diagnostics.append(module.allocator, .{
+        .tag = .unsupported_dependency_expression,
+        .span = .{ .start = 12, .end = 19 },
+    });
+    var output = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer output.deinit();
+    try renderModule(&module, &output.writer);
+    try std.testing.expectEqualStrings(
+        "expression.nov:1:13: error: dependency analysis for this expression is not implemented yet\nlet value = value()\n            ^~~~~~~\n",
+        output.written(),
+    );
+}
+
+test "module missing initializers render diagnostics" {
+    var module = try Module.init(std.testing.allocator, "initializer.nov", "let value: i32");
+    defer module.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try module.diagnostics.append(module.allocator, .{
+        .tag = .missing_initializer,
+        .span = module.getDeclaration(module.lookup("value").?).?.name_span,
+    });
+    var output = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer output.deinit();
+    try renderModule(&module, &output.writer);
+    try std.testing.expectEqualStrings(
+        "initializer.nov:1:5: error: dependency analysis requires an initializer\nlet value: i32\n    ^~~~~\n",
         output.written(),
     );
 }

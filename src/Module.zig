@@ -34,6 +34,9 @@ pub const Diagnostic = struct {
         unknown_name,
         unsupported_declaration,
         unsupported_name,
+        value_cycle,
+        unsupported_dependency_expression,
+        missing_initializer,
     };
 };
 

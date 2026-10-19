@@ -182,6 +182,7 @@ test {
     _ = @import("Ast.zig");
     _ = @import("Ir.zig");
     _ = @import("Module.zig");
+    _ = @import("Dependencies.zig");
     _ = @import("Tokenizer.zig");
     _ = @import("string_literal.zig");
     _ = Diagnostics;
