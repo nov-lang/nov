@@ -180,6 +180,7 @@ test "format files atomically and leave rejected input unchanged" {
 
 test {
     _ = @import("Ast.zig");
+    _ = @import("Ir.zig");
     _ = @import("Tokenizer.zig");
     _ = @import("string_literal.zig");
     _ = Diagnostics;
