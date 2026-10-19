@@ -4,21 +4,26 @@ const clap = @import("clap");
 const Parser = @import("Parser.zig");
 const Diagnostics = @import("Diagnostics.zig");
 const Formatter = @import("Formatter.zig");
+const Module = @import("Module.zig");
+const Dependencies = @import("Dependencies.zig");
+const Lowering = @import("Lowering.zig");
 
 const params = clap.parseParamsComptime(
     \\-h, --help             Display this help and exit.
     \\-v, --version          Display the version and exit.
     \\--check                Check formatting without changing files (fmt only).
+    \\--semantic             Check the bounded semantic/lowering subset (check only).
     \\<arg>...
     \\
 );
 
 fn usage(writer: *std.Io.Writer) !void {
     try writer.writeAll(
-        \\Usage: nov check <file>...
+        \\Usage: nov check [--semantic] <file>...
         \\       nov fmt [--check] <file>...
         \\
-        \\Parse Nov files and report syntax errors. Compilation is not implemented yet.
+        \\Check syntax, or the bounded semantic subset with --semantic.
+        \\Compilation is not implemented yet.
         \\
         \\Options:
         \\
@@ -62,6 +67,10 @@ pub fn main(init: std.process.Init) !u8 {
 
     const args = res.positionals[0];
     const is_fmt = args.len != 0 and std.mem.eql(u8, args[0], "fmt");
+    if (res.args.semantic != 0 and (args.len == 0 or !std.mem.eql(u8, args[0], "check"))) {
+        try stderr.writeAll("error: --semantic requires the check command\n");
+        return 1;
+    }
     if (res.args.check != 0 and !is_fmt) {
         try stderr.writeAll("error: --check requires the fmt command\n");
         return 1;
@@ -74,7 +83,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     var failed = false;
     for (args[1..]) |path| {
-        const valid = processFile(init.io, init.gpa, path, stderr, is_fmt, res.args.check != 0) catch |err| {
+        const valid = processFile(init.io, init.gpa, path, stderr, is_fmt, res.args.check != 0, res.args.semantic != 0) catch |err| {
             try stderr.print("{s}: error: {s}\n", .{ path, @errorName(err) });
             failed = true;
             continue;
@@ -84,7 +93,7 @@ pub fn main(init: std.process.Init) !u8 {
     return if (failed) 1 else 0;
 }
 
-fn processFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, stderr: *std.Io.Writer, is_fmt: bool, check_only: bool) !bool {
+fn processFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, stderr: *std.Io.Writer, is_fmt: bool, check_only: bool, semantic: bool) !bool {
     const cwd = std.Io.Dir.cwd();
     // Resolve symlinks so atomic replacement updates the target, not the link.
     const resolved = try cwd.realPathFileAlloc(io, path, allocator);
@@ -92,6 +101,7 @@ fn processFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, stder
     const source = try cwd.readFileAllocOptions(io, resolved, allocator, .limited(1024 * 1024), .of(u8), 0);
     defer allocator.free(source);
     if (std.mem.indexOfScalar(u8, source, 0) != null) return error.InvalidSource;
+    if (semantic) return checkSemantic(allocator, path, source, stderr);
     var ast = try Parser.parse(allocator, source);
     defer ast.deinit(allocator);
     try Diagnostics.render(ast, path, stderr);
@@ -114,6 +124,23 @@ fn processFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, stder
 
     try replaceFormattedFile(io, allocator, resolved, source, formatted);
     return true;
+}
+
+fn checkSemantic(allocator: std.mem.Allocator, path: []const u8, source: []const u8, stderr: *std.Io.Writer) !bool {
+    var module = try Module.init(allocator, path, source);
+    defer module.deinit();
+    if (!module.hasErrors()) {
+        var dependencies = try Dependencies.analyze(&module);
+        defer dependencies.deinit();
+        if (!module.hasErrors()) {
+            // Partial semantic passes leave deferred entries; lowering rejects
+            // those rather than reporting unchecked source as valid.
+            var result = try Lowering.lower(&module);
+            defer result.deinit();
+        }
+    }
+    try Diagnostics.renderModule(&module, stderr);
+    return !module.hasErrors();
 }
 
 fn replaceFormattedFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, original: []const u8, formatted: []const u8) !void {
@@ -171,10 +198,47 @@ test "format files atomically and leave rejected input unchanged" {
         defer allocator.free(path);
         var diagnostics = std.Io.Writer.Allocating.init(allocator);
         defer diagnostics.deinit();
-        try std.testing.expectEqual(case.valid, try processFile(io, allocator, path, &diagnostics.writer, true, case.check_only));
+        try std.testing.expectEqual(case.valid, try processFile(io, allocator, path, &diagnostics.writer, true, case.check_only, false));
         const actual = try tmp.dir.readFileAlloc(io, "input.nov", allocator, .limited(4096));
         defer allocator.free(actual);
         try std.testing.expectEqualStrings(case.expected, actual);
+    }
+}
+
+test "semantic file checks reject errors and deferred forms without writing" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cases = [_]struct { source: []const u8, message: ?[]const u8 = null }{
+        .{ .source = "let base: i32 = 42\nlet first: (x: i32) -> i32 = second(x)\nlet second: (x: i32) -> i32 = first(x)\nlet empty: () -> void = {}" },
+        .{ .source = "let x: i128 = 1" }, // No C backend width restriction.
+        .{ .source = "let broken =", .message = "expected" },
+        .{ .source = "let x = 1\nlet x = 2", .message = "first declaration here" },
+        .{ .source = "let x = absent", .message = "unknown name 'absent'" },
+        .{ .source = "let x = y\nlet y = x", .message = "cyclic value dependency" },
+        .{ .source = "let x: i8 = 128", .message = "type annotation here" },
+        .{ .source = "let f: () -> i32 = true", .message = "does not match" },
+        .{ .source = "let f: (x: i32) -> i32 = x\nlet g: () -> i32 = f()", .message = "argument count" },
+        .{ .source = "let x = 1", .message = "lowering this source form" },
+        .{ .source = "let mut x: i32 = 1", .message = "lowering this source form" },
+        .{ .source = "let f: (x: bool) -> bool = x and true", .message = "lowering this source form" },
+    };
+    for (cases) |case| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "input.nov", .data = case.source });
+        const path = try tmp.dir.realPathFileAlloc(io, "input.nov", allocator);
+        defer allocator.free(path);
+        var diagnostics = std.Io.Writer.Allocating.init(allocator);
+        defer diagnostics.deinit();
+        try std.testing.expectEqual(case.message == null, try processFile(io, allocator, path, &diagnostics.writer, false, false, true));
+        if (case.message) |message| {
+            try std.testing.expect(std.mem.indexOf(u8, diagnostics.written(), message) != null);
+            try std.testing.expect(std.mem.indexOf(u8, diagnostics.written(), "input.nov:") != null);
+            try std.testing.expect(std.mem.indexOf(u8, diagnostics.written(), "^") != null);
+        } else try std.testing.expectEqualStrings("", diagnostics.written());
+        const actual = try tmp.dir.readFileAlloc(io, "input.nov", allocator, .limited(4096));
+        defer allocator.free(actual);
+        try std.testing.expectEqualStrings(case.source, actual);
     }
 }
 

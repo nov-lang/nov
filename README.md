@@ -39,7 +39,22 @@ with source spans and ordered operands/call arguments. It requires immutable
 literal globals; unit/global block initializers and short-circuit `and`/`or` are
 not lowered yet. An internal C11 backend emits verified IR, including fixed-width
 integer arithmetic; CLI compilation/execution, printing and entrypoint emission
-remain unimplemented. `check` remains syntax-only.
+remain unimplemented. Plain `check` remains syntax-only.
+
+Use `zig build run -- check --semantic file.nov` for the current bounded
+semantic/lowering subset. It runs declaration collection, initializer dependency
+analysis, annotation/literal and function-body checking, then typed lowering and
+IR verification. Source errors and unsupported/deferred forms fail with source
+diagnostics (including related notes where available); recovered syntax errors
+stop semantic analysis. Globals must be immutable, explicitly typed integer or
+boolean literals. Functions need explicit supported signatures and straight-line
+expression bodies (including forward/recursive calls and empty void bodies).
+Inferred globals, mutable globals, nonliteral global initializers, global unit
+values, and short-circuit `and`/`or` are currently rejected, along with the other
+unsupported forms listed above. This is not a backend compatibility check: it
+does not emit C, validate C integer widths, require `main`, build, or execute a
+program. Each input file is checked independently; any failed/unreadable input
+makes the command fail, without modifying files.
 
 Format files in place with `zig build run -- fmt file.nov`, or use
 `zig build run -- fmt --check file.nov` to check formatting without writing.
