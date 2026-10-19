@@ -51,13 +51,30 @@ pub fn renderModule(module: *const Module, writer: *std.Io.Writer) !void {
             .value_cycle => try writer.print("cyclic value dependency on '{s}'", .{module.sourceSlice(diagnostic.span).?}),
             .unsupported_dependency_expression => try writer.writeAll("dependency analysis for this expression is not implemented yet"),
             .missing_initializer => try writer.writeAll("dependency analysis requires an initializer"),
+            .unknown_type => try writer.print("unknown type '{s}'", .{module.sourceSlice(diagnostic.span).?}),
+            .unsupported_type => try writer.writeAll("this type is not supported in semantic analysis yet"),
+            .not_a_type => try writer.writeAll("expected a type, found a value"),
+            .duplicate_parameter => try writer.print("duplicate parameter '{s}'", .{module.sourceSlice(diagnostic.span).?}),
+            .invalid_parameter_type => try writer.writeAll("void is not a parameter type"),
+            .type_nesting_limit => try writer.writeAll("type annotation nesting exceeds the current analysis limit of 128"),
+            .invalid_literal => try writer.writeAll("invalid numeric literal"),
+            .unsupported_literal => try writer.writeAll("this literal is not supported in semantic analysis yet"),
+            .literal_type_mismatch => try writer.writeAll("literal does not match the annotated type"),
+            .literal_out_of_range => try writer.writeAll("integer literal does not fit the annotated type"),
         }
         try location.renderExcerpt(module.ast.source, diagnostic.span.end - diagnostic.span.start, writer);
-        if (diagnostic.tag == .duplicate_name or diagnostic.tag == .value_cycle) {
+        const note: ?[]const u8 = switch (diagnostic.tag) {
+            .duplicate_name => "first declaration here",
+            .value_cycle => "declaration in this cycle",
+            .duplicate_parameter => "first parameter here",
+            .literal_type_mismatch, .literal_out_of_range => "type annotation here",
+            else => null,
+        };
+        if (note) |message| {
             if (diagnostic.related) |related| {
                 const original = Location.init(module.ast.source, related.start);
                 try original.renderPrefix(module.path, "note", writer);
-                try writer.writeAll(if (diagnostic.tag == .duplicate_name) "first declaration here" else "declaration in this cycle");
+                try writer.writeAll(message);
                 try original.renderExcerpt(module.ast.source, related.end - related.start, writer);
             }
         }
@@ -105,6 +122,92 @@ test "module value cycle diagnostics include the target declaration" {
             "cycle.nov:2:5: note: declaration in this cycle\nlet second = first\n    ^~~~~~\n",
         output.written(),
     );
+}
+
+test "module duplicate parameter diagnostics include the first parameter" {
+    var module = try Module.init(std.testing.allocator, "parameters.nov", "let value: (x: i32, x: bool)");
+    defer module.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try module.diagnostics.append(module.allocator, .{
+        .tag = .duplicate_parameter,
+        .span = .{ .start = 20, .end = 21 },
+        .related = .{ .start = 12, .end = 13 },
+    });
+    var output = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer output.deinit();
+    try renderModule(&module, &output.writer);
+    try std.testing.expectEqualStrings(
+        "parameters.nov:1:21: error: duplicate parameter 'x'\nlet value: (x: i32, x: bool)\n                    ^\n" ++
+            "parameters.nov:1:13: note: first parameter here\nlet value: (x: i32, x: bool)\n            ^\n",
+        output.written(),
+    );
+}
+
+test "module literal diagnostics include the type annotation when present" {
+    const Case = struct { tag: Module.Diagnostic.Tag, message: []const u8 };
+    for ([_]Case{
+        .{ .tag = .literal_out_of_range, .message = "integer literal does not fit the annotated type" },
+        .{ .tag = .literal_type_mismatch, .message = "literal does not match the annotated type" },
+    }) |case| {
+        for ([_]bool{ true, false }) |with_related| {
+            var module = try Module.init(std.testing.allocator, "literal.nov", "let value: u8 = 256");
+            defer module.deinit();
+            try std.testing.expect(!module.hasErrors());
+            try module.diagnostics.append(module.allocator, .{
+                .tag = case.tag,
+                .span = .{ .start = 16, .end = 19 },
+                .related = if (with_related) .{ .start = 11, .end = 13 } else null,
+            });
+            var output = std.Io.Writer.Allocating.init(std.testing.allocator);
+            defer output.deinit();
+            try renderModule(&module, &output.writer);
+            const expected = try std.fmt.allocPrint(
+                std.testing.allocator,
+                "literal.nov:1:17: error: {s}\nlet value: u8 = 256\n                ^~~\n{s}",
+                .{ case.message, if (with_related) "literal.nov:1:12: note: type annotation here\nlet value: u8 = 256\n           ^~\n" else "" },
+            );
+            defer std.testing.allocator.free(expected);
+            try std.testing.expectEqualStrings(expected, output.written());
+        }
+    }
+}
+
+test "module type and literal diagnostics render messages and source excerpts" {
+    const Case = struct {
+        tag: Module.Diagnostic.Tag,
+        token: []const u8,
+        underline: []const u8,
+        message: []const u8,
+    };
+    for ([_]Case{
+        .{ .tag = .unknown_type, .token = "Missing", .underline = "^~~~~~~", .message = "unknown type 'Missing'" },
+        .{ .tag = .unsupported_type, .token = "i32", .underline = "^~~", .message = "this type is not supported in semantic analysis yet" },
+        .{ .tag = .not_a_type, .token = "value", .underline = "^~~~~", .message = "expected a type, found a value" },
+        .{ .tag = .invalid_parameter_type, .token = "void", .underline = "^~~~", .message = "void is not a parameter type" },
+        .{ .tag = .type_nesting_limit, .token = "i32", .underline = "^~~", .message = "type annotation nesting exceeds the current analysis limit of 128" },
+        .{ .tag = .invalid_literal, .token = "123", .underline = "^~~", .message = "invalid numeric literal" },
+        .{ .tag = .unsupported_literal, .token = "1.5", .underline = "^~~", .message = "this literal is not supported in semantic analysis yet" },
+    }) |case| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let value = {s}", .{case.token});
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "semantic.nov", source);
+        defer module.deinit();
+        try std.testing.expect(!module.hasErrors());
+        try module.diagnostics.append(module.allocator, .{
+            .tag = case.tag,
+            .span = .{ .start = 12, .end = @intCast(source.len) },
+        });
+        var output = std.Io.Writer.Allocating.init(std.testing.allocator);
+        defer output.deinit();
+        try renderModule(&module, &output.writer);
+        const expected = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "semantic.nov:1:13: error: {s}\n{s}\n            {s}\n",
+            .{ case.message, source, case.underline },
+        );
+        defer std.testing.allocator.free(expected);
+        try std.testing.expectEqualStrings(expected, output.written());
+    }
 }
 
 test "module unsupported dependency expressions render diagnostics" {

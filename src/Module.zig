@@ -37,6 +37,16 @@ pub const Diagnostic = struct {
         value_cycle,
         unsupported_dependency_expression,
         missing_initializer,
+        unknown_type,
+        unsupported_type,
+        not_a_type,
+        duplicate_parameter,
+        invalid_parameter_type,
+        type_nesting_limit,
+        invalid_literal,
+        unsupported_literal,
+        literal_type_mismatch,
+        literal_out_of_range,
     };
 };
 
