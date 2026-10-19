@@ -77,6 +77,7 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const fixtures = b.addWriteFiles();
     _ = fixtures.add("valid.nov", "let answer = 1 + 2 * 3\n");
     _ = fixtures.add("another-valid.nov", "let text = \"hello\"\n");
+    _ = fixtures.add("no-final-newline.nov", "let answer = 42");
     _ = fixtures.add("invalid.nov", "let broken =");
     _ = fixtures.add("needs-format.nov", "let answer=1+2*3\n");
 
@@ -98,6 +99,8 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         .{ .name = "check rejects --check", .args = &.{ "check", "--check", "valid.nov" }, .exit_code = 1, .stderr_match = "--check" },
         .{ .name = "--check requires fmt", .args = &.{"--check"}, .exit_code = 1, .stderr_match = "--check" },
         .{ .name = "check valid syntax", .args = &.{ "check", "valid.nov" }, .exit_code = 0 },
+        .{ .name = "check without final newline", .args = &.{ "check", "no-final-newline.nov" }, .exit_code = 0 },
+        .{ .name = "fmt check without final newline", .args = &.{ "fmt", "--check", "no-final-newline.nov" }, .exit_code = 1, .stderr_match = "no-final-newline.nov" },
         .{ .name = "check invalid syntax", .args = &.{ "check", "invalid.nov" }, .exit_code = 1, .stderr_match = "invalid.nov:1:13: error:" },
         .{ .name = "check missing source", .args = &.{ "check", "missing.nov" }, .exit_code = 1, .stderr_match = "missing.nov: error: FileNotFound" },
         .{ .name = "check multiple valid files", .args = &.{ "check", "valid.nov", "another-valid.nov" }, .exit_code = 0 },

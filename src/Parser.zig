@@ -250,7 +250,9 @@ fn parseDecl(self: *Parser) Error!Node.Index {
         return self.failExpected(.equal);
     }
 
-    try self.expectNewLine(.expected_newline_after_decl);
+    if (self.token_tags[self.tok_i] != .eof) {
+        try self.expectNewLine(.expected_newline_after_decl);
+    }
 
     return self.addNode(.{
         .tag = .decl,
@@ -1641,6 +1643,101 @@ test "parse multiline and typed declarations" {
     const typed_decl = ast.decl(ast.rootDecls()[1]);
     try std.testing.expect(typed_decl.ast.type_node != 0);
     try std.testing.expect(typed_decl.ast.init_node != 0);
+}
+
+test "declaration separators preserve single newline continuations" {
+    const sources = [_][:0]const u8{
+        "let answer =\n    1 + 2\nlet next = 3\n",
+        "let answer = 1 +\n    2\nlet next = 3\n",
+        "let answer = 1\n    + 2\nlet next = 3\n",
+        "\n\nlet answer = 1 + 2\n\nlet next = 3\n\n",
+        "let answer = 1 + 2 ; comment\nlet next = 3\n",
+        "let answer =\r\n\t1 +\r\n\t2\r\nlet next = 3\r\n",
+    };
+    for (sources) |source| {
+        var ast = try parse(std.testing.allocator, source);
+        defer ast.deinit(std.testing.allocator);
+
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+        try std.testing.expectEqual(@as(usize, 2), ast.rootDecls().len);
+        const initializer = ast.decl(ast.rootDecls()[0]).ast.init_node;
+        try std.testing.expectEqual(Node.Tag.add, ast.nodes.items(.tag)[initializer]);
+        const next_token = ast.nodes.items(.main_token)[ast.rootDecls()[1]];
+        try std.testing.expectEqualStrings("next", ast.tokenSlice(next_token + 1));
+    }
+}
+
+test "EOF terminates complete declarations without consuming the EOF token" {
+    const sources = [_][:0]const u8{
+        "let answer = 42",
+        "let answer: int = 42",
+        "let answer: int",
+        "let answer = 42 ; trailing comment",
+        "let answer =\n    40 +\n    2",
+        "let answer = {42}",
+        "let answer = add(40, 2)",
+        "let answer: () -> int = 42",
+    };
+    for (sources) |source| {
+        var ast = try parse(std.testing.allocator, source);
+        defer ast.deinit(std.testing.allocator);
+
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+        try std.testing.expectEqual(@as(usize, 1), ast.rootDecls().len);
+        const last_token = ast.tokens.len - 1;
+        try std.testing.expectEqual(Token.Tag.eof, ast.tokens.items(.tag)[last_token]);
+        try std.testing.expectEqual(source.len, ast.tokens.items(.start)[last_token]);
+    }
+}
+
+test "EOF does not replace missing delimiters or declaration separators" {
+    const sources = [_][:0]const u8{
+        "let answer = {42",
+        "let answer = add(40, 2",
+        "let answer: (value: int",
+        "let first = 1 let second = 2",
+    };
+    for (sources) |source| {
+        var ast = try parse(std.testing.allocator, source);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expect(ast.errors.len != 0);
+    }
+}
+
+test "incomplete initializers diagnose EOF with and without final newline" {
+    const sources = [_][:0]const u8{
+        "let broken =",
+        "let broken =\n",
+        "let broken = 1 +",
+        "let broken = 1 +\n",
+    };
+    for (sources) |source| {
+        var ast = try parse(std.testing.allocator, source);
+        defer ast.deinit(std.testing.allocator);
+
+        try std.testing.expect(ast.errors.len != 0);
+        try std.testing.expectEqual(Ast.Error.Tag.expected_expr, ast.errors[0].tag);
+        const error_token = ast.errors[0].token;
+        try std.testing.expectEqual(Token.Tag.eof, ast.tokens.items(.tag)[error_token]);
+        try std.testing.expectEqual(source.len, ast.tokens.items(.start)[error_token]);
+    }
+}
+
+test "blank line stops continuation and recovery preserves next declaration" {
+    const sources = [_][:0]const u8{
+        "let broken =\n\n1\nlet valid = 42\n",
+        "let broken = 1 +\n\n2\nlet valid = 42\n",
+    };
+    for (sources) |source| {
+        var ast = try parse(std.testing.allocator, source);
+        defer ast.deinit(std.testing.allocator);
+
+        try std.testing.expect(ast.errors.len != 0);
+        try std.testing.expectEqual(Ast.Error.Tag.expected_expr, ast.errors[0].tag);
+        const declaration = ast.rootDecls()[ast.rootDecls().len - 1];
+        const let_token = ast.nodes.items(.main_token)[declaration];
+        try std.testing.expectEqualStrings("valid", ast.tokenSlice(let_token + 1));
+    }
 }
 
 test "recover after a declaration without an initializer" {

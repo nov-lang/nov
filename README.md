@@ -33,7 +33,8 @@ Both commands accept multiple file paths. Formatting currently supports simple
 `let` declarations, literals, operators, and comments; unsupported syntax is
 reported without modifying the file. Formatted output is reparsed and checked
 for structural, token, and comment preservation before atomic replacement.
-Declarations currently need a terminating newline.
+Declarations are separated by newlines; EOF also terminates a complete declaration,
+so the final newline is optional. Formatting adds a final newline.
 
 # Concepts
 

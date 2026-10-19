@@ -187,8 +187,14 @@ test "documentation comments" {
     try expectFormatted("let x=1\n\n;;; Next\nlet y=2\n", "let x = 1\n\n;;; Next\nlet y = 2\n");
 }
 
+test "format declarations without a final newline" {
+    try expectFormatted("let x=42", "let x = 42\n");
+    try expectFormatted("let x:int", "let x: int\n");
+    try expectFormatted("let x=42 ; trailing comment", "let x = 42 ; trailing comment\n");
+}
+
 test "invalid sources are rejected" {
-    for ([_][:0]const u8{ "let =\n", "let x=\n", "let x=42", "let x=1\x00let y=2\n" }) |source| {
+    for ([_][:0]const u8{ "let =\n", "let x=\n", "let x=", "let x=1\x00let y=2\n" }) |source| {
         try std.testing.expectError(error.InvalidSource, format(std.testing.allocator, source));
     }
 }
