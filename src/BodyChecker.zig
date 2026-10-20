@@ -312,7 +312,7 @@ const Context = struct {
             },
             .negation, .bit_not, .bool_not, .@"return" => return self.probeBreaks(data.rhs, depth + 1),
             .field_access => return self.probeBreaks(data.lhs, depth + 1),
-            .add, .sub, .mul, .div, .mod, .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal, .bool_and, .bool_or, .array_access, .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod => return (try self.probeBreaks(data.lhs, depth + 1)) orelse (try self.probeBreaks(data.rhs, depth + 1)),
+            .add, .sub, .mul, .div, .mod, .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal, .bool_and, .bool_or, .in, .array_access, .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod => return (try self.probeBreaks(data.lhs, depth + 1)) orelse (try self.probeBreaks(data.rhs, depth + 1)),
             else => {},
         }
         return null;
@@ -389,7 +389,7 @@ const Context = struct {
             },
             .negation, .bit_not => try self.probe(data.rhs, depth + 1),
             .add, .sub, .mul, .div, .mod => (try self.probe(data.lhs, depth + 1)) orelse try self.probe(data.rhs, depth + 1),
-            .bool_not, .bool_and, .bool_or, .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal => .{ .ty = try self.ir.internType(.boolean) },
+            .in, .bool_not, .bool_and, .bool_or, .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal => .{ .ty = try self.ir.internType(.boolean) },
             .call, .call_one => blk: {
                 const call = ast.fullCall(node).?;
                 if (self.printing(call.ast.fn_expr) != null) break :blk .{ .ty = try self.ir.internType(.void) };
@@ -504,6 +504,7 @@ const Context = struct {
             },
             .array_access => .{ .array_index = .{ .array = try emitter.value(data.lhs), .index = try emitter.value(data.rhs) } },
             .field_access => .{ .array_len = try emitter.value(data.lhs) },
+            .in => .{ .array_contains = .{ .value = try emitter.value(data.lhs), .array = try emitter.value(data.rhs) } },
             .identifier => blk: {
                 const name = self.module.sourceSlice(self.span(node)).?;
                 if (self.bindings.get(name)) |binding| {
@@ -884,6 +885,28 @@ const Context = struct {
                 if (lhs == null or rhs == null) return null;
                 return self.fit(operand.ty, expected, node);
             },
+            .in => {
+                const right = try self.probe(data.rhs, depth + 1);
+                const left = try self.probe(data.lhs, depth + 1);
+                const element: Known = if (right) |known| blk: {
+                    const array = self.ir.getType(known.ty).?;
+                    if (array != .array) return self.fail(.operator_not_supported, node, known.annotation);
+                    break :blk .{ .ty = array.array, .annotation = known.annotation };
+                } else if (left) |known| blk: {
+                    if (!Ir.isArrayElement(self.ir.getType(known.ty).?)) return self.fail(.operator_not_supported, node, known.annotation);
+                    break :blk known;
+                } else {
+                    // Diagnose the operands without letting the boolean result
+                    // supply an integer default or an array element type.
+                    if (try self.expression(data.lhs, null, depth + 1) == null) return null;
+                    if (try self.expression(data.rhs, null, depth + 1) == null) return null;
+                    return self.fail(.operator_not_supported, node, null);
+                };
+                if (try self.expression(data.lhs, element, depth + 1) == null) return null;
+                const array: Known = .{ .ty = try self.ir.internType(.{ .array = element.ty }), .annotation = element.annotation };
+                if (try self.expression(data.rhs, array, depth + 1) == null) return null;
+                return self.fit(try self.ir.internType(.boolean), expected, node);
+            },
             .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal => {
                 const operand = (try self.probe(data.lhs, depth + 1)) orelse (try self.probe(data.rhs, depth + 1)) orelse return self.missingOperandType(node, data.lhs, data.rhs, null, depth);
                 const ty = self.ir.getType(operand.ty).?;
@@ -961,6 +984,62 @@ const Context = struct {
         }
     }
 };
+
+test "membership infers exact scalar operands without numeric defaults" {
+    for ([_][]const u8{
+        "let f: (a: []i8) -> bool = -128 in a",
+        "let f: (n: u16) -> bool = n in [1, 2, n]",
+        "let f: (n: int) -> bool = n in []",
+        "let f: () -> bool = true in [true, false]",
+        "let f: () -> bool = false in []",
+        "let f: (a: []uint) -> void = {let found = 1 in a\n@println(found)}",
+        "let f: (a: []i32, b: bool) -> bool = 1 in if b {a} else {[]}",
+        "let f: (n: i64, b: bool) -> bool = if b {1} else {n} in [n]",
+        "let f: () -> int = loop {let found = {break 7} in [true]\n}",
+        "let f: () -> int = loop {let found = true in {break 7}\n}",
+    }) |source| {
+        var module = try Module.init(std.testing.allocator, "membership.nov", source);
+        defer module.deinit();
+        var sema = try @import("Lowering.zig").lower(&module);
+        defer sema.deinit();
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expect(sema.lowering_complete);
+        try sema.ir.verify();
+    }
+}
+
+test "membership rejects defaults widening nonscalar elements and nonboolean results" {
+    const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag };
+    for ([_]Case{
+        .{ .source = "let f: () -> bool = 1 in [1, 2]", .tag = .literal_needs_type },
+        .{ .source = "let f: () -> bool = 1 in []", .tag = .literal_needs_type },
+        .{ .source = "let f: (a: []i8, n: i16) -> bool = n in a", .tag = .expression_type_mismatch },
+        .{ .source = "let f: (a: []u8, n: i8) -> bool = n in a", .tag = .expression_type_mismatch },
+        .{ .source = "let f: (a: []i8) -> bool = 128 in a", .tag = .literal_out_of_range },
+        .{ .source = "let f: (a: []u8) -> bool = -1 in a", .tag = .literal_out_of_range },
+        .{ .source = "let f: (a: []bool) -> bool = 1 in a", .tag = .literal_type_mismatch },
+        .{ .source = "let f: (n: int) -> bool = n in [true]", .tag = .expression_type_mismatch },
+        .{ .source = "let f: (a: []int) -> bool = true in a", .tag = .literal_type_mismatch },
+        .{ .source = "let f: (a: []int) -> int = 1 in a", .tag = .expression_type_mismatch },
+        .{ .source = "let f: () -> bool = true in false", .tag = .operator_not_supported },
+        .{ .source = "let f: () -> bool = \"a\" in \"abc\"", .tag = .operator_not_supported },
+        .{ .source = "let f: () -> bool = \"a\" in []", .tag = .operator_not_supported },
+        .{ .source = "let f: (a: []int) -> bool = a in []", .tag = .operator_not_supported },
+        .{ .source = "let f: () -> bool = {} in []", .tag = .operator_not_supported },
+        .{ .source = "let f: (a: []int) -> bool = missing in a", .tag = .unknown_name },
+        .{ .source = "let f: (n: int) -> bool = n in missing", .tag = .unknown_name },
+    }) |case| {
+        var module = try Module.init(std.testing.allocator, "membership-error.nov", case.source);
+        defer module.deinit();
+        var sema = try @import("Lowering.zig").lower(&module);
+        defer sema.deinit();
+        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+        try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
+        try std.testing.expect(module.sourceSlice(module.diagnostics.items[0].span).?.len != 0);
+        try std.testing.expect(!sema.lowering_complete);
+        try std.testing.expectEqual(@as(usize, 0), sema.ir.functions.items.len);
+    }
+}
 
 test "string inference accepts late literals calls lengths and branch context" {
     var module = try Module.init(std.testing.allocator, "strings.nov",

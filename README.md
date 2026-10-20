@@ -1079,12 +1079,28 @@ or continuation-side `continue` reevaluates the condition directly. `break` and
 TODO: same as zig
 
 ## In
-Check if an element is in an array
+`value in array` returns `bool`: true if any element equals the value, false
+otherwise (including an empty array).
 ```nov
-let nums = [1, 2, 3]
+let nums: []int = [1, 2, 3]
 @println(1 in nums) ; true
 @println(5 in nums) ; false
 ```
+
+The executable subset supports the existing scalar `[]T` arrays only: `bool`,
+fixed 8/16/32/64-bit signed/unsigned integers, and native `int`/`uint`. Value and
+element types must match exactly; there is no widening or signedness conversion.
+A known array element type constrains the left literal; a known typed left value
+constrains an array literal, including `[]`. Boolean literals provide a known
+`bool` type (`true in [false, true]` works). Integer literals have no default:
+`1 in [1, 2]` is rejected even with an expected `bool` result. The result type
+does not choose an element type.
+
+Operands evaluate once, left then right, following the existing array read/copy
+rules. Membership itself is an allocation-free linear scan of the array's
+length, using scalar value equality and stopping at the first match. It neither
+mutates nor appends. Strings, nested arrays, pointers, ranges and iterators are
+not supported membership containers or element types.
 
 ## Assignment
 ```nov

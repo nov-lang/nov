@@ -123,6 +123,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     _ = fixtures.add("inferred-integer.nov", "let main: () -> void = {let n = 1\n@println(n)}\n");
     _ = fixtures.add("inferred-empty-array.nov", "let main: () -> void = {let a = []\n}\n");
     _ = fixtures.add("scalar-arrays.nov", @embedFile("examples/arrays.nov"));
+    _ = fixtures.add("membership-default.nov", "let main: () -> void = @println(1 in [1, 2])\n");
+    _ = fixtures.add("membership-width.nov", "let f: (n: i16, a: []i8) -> bool = n in a\n");
+    _ = fixtures.add("membership-string.nov", "let main: () -> void = @println(\"a\" in \"abc\")\n");
     _ = fixtures.add("array-bounds.nov", "let main: () -> void = {let a: []bool = [true]\n@println(a[-2])}\n");
     _ = fixtures.add("array-compound.nov", "let main: () -> void = {\n    let mut a: []i8 = [127, 10]\n    a[0] += 1\n    a[0] -= 1\n    a[0] *= 2\n    a[0] /= -1\n    a[0] %= 3\n    a[-1] += {\n        a = []\n        5\n    }\n    @println(a[0], a[-1], a.len)\n}\n");
     _ = fixtures.add("array-bool-compound.nov", "let main: () -> void = {let mut a: []bool = [true]\na[0] += false}\n");
@@ -190,6 +193,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         .{ .name = "fmt array compounds", .args = &.{ "fmt", "--check", "array-compound.nov" }, .exit_code = 0 },
         .{ .name = "reject bool array compounds", .args = &.{ "emit-c", "array-bool-compound.nov" }, .exit_code = 1, .stderr_match = "operator is not supported" },
         .{ .name = "check scalar arrays", .args = &.{ "check", "--semantic", "scalar-arrays.nov" }, .exit_code = 0 },
+        .{ .name = "reject membership integer defaults", .args = &.{ "check", "--semantic", "membership-default.nov" }, .exit_code = 1, .stderr_match = "integer literal needs an expected type (no default chosen)" },
+        .{ .name = "reject membership widening", .args = &.{ "emit-c", "membership-width.nov" }, .exit_code = 1, .stderr_match = "expression does not match the expected type" },
+        .{ .name = "reject string membership", .args = &.{ "emit-c", "membership-string.nov" }, .exit_code = 1, .stderr_match = "operator is not supported for this operand type" },
         .{ .name = "reject array length writes", .args = &.{ "emit-c", "array-length-write.nov" }, .exit_code = 1, .stderr_match = "array .len is read-only" },
         .{ .name = "check semantic loops", .args = &.{ "check", "--semantic", "loop-program.nov" }, .exit_code = 0 },
         .{ .name = "check break outside loop", .args = &.{ "check", "--semantic", "break-outside.nov" }, .exit_code = 1, .stderr_match = "break and continue require an enclosing loop" },
@@ -334,7 +340,7 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
             arrays.addArgs(&.{ "run", if (bounds) "array-bounds.nov" else "scalar-arrays.nov" });
             if (mode.len != 0) arrays.addArg(mode);
             arrays.expectExitCode(if (bounds) 1 else 0);
-            arrays.expectStdOutEqual(if (bounds) "" else "3 30 30 6\n454 15\n99 15 4\nfalse true 2\n0\n");
+            arrays.expectStdOutEqual(if (bounds) "" else "3 30 30 6\n454 15\n99 15 4\nfalse true 2\n0\ntrue false true true\ntrue false false false\n");
             arrays.expectStdErrEqual(if (bounds) "panic: array index out of bounds\n" else "");
             test_step.dependOn(&arrays.step);
         }

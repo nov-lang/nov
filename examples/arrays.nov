@@ -24,4 +24,6 @@ let main: () -> void = {
     @println(flags[-1], flags[0], flags.len)
     numbers = []
     @println(numbers.len)
+    @println(2 in original, 30 in original, 99 in joined, 5 in joined)
+    @println(true in flags, false in [true], true in [], 1 in numbers)
 }

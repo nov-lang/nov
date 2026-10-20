@@ -7,7 +7,8 @@ const Tokenizer = @import("Tokenizer.zig");
 /// local blocks, if/else, loops with optional conditions/continuations, returns,
 /// unlabeled loop controls (including value-bearing breaks),
 /// direct identifier assignments, scalar array types/literals/indexing/.len,
-/// and indexed assignments to direct identifiers. Formatting is syntactic,
+/// membership (`in`, not ranges), and indexed assignments to direct identifiers.
+/// Formatting is syntactic,
 /// not a scope, mutability, or type check. Preserves line/doc comments and tokens.
 /// All other AST tags and quoted identifiers/BOMs/shebangs are unsupported.
 /// Parse errors return InvalidSource; unsupported or unpreservable output
@@ -93,6 +94,7 @@ fn checkSupported(ast: Ast) !void {
         .bit_and,
         .bit_or,
         .bit_xor,
+        .in,
         .equal_equal,
         .bang_equal,
         .less_than,
@@ -352,7 +354,7 @@ test "every unsupported AST tag is rejected before rendering" {
         .block_newline,        .@"if",         .if_else,          .loop_condition,   .loop_cont,         .loop_else,
         .@"return",            .@"break",      .@"continue",      .assign,           .assign_add,        .assign_sub,
         .assign_mul,           .assign_div,    .assign_mod,       .builtin_literal,  .array_type,        .array_init_two,
-        .array_init_two_comma, .array_init,    .array_init_comma, .array_access,     .field_access,
+        .array_init_two_comma, .array_init,    .array_init_comma, .array_access,     .field_access,      .in,
     };
     var ast = try Parser.parse(std.testing.allocator, "let x=1\n");
     defer ast.deinit(std.testing.allocator);
@@ -372,6 +374,14 @@ test "every unsupported AST tag is rejected before rendering" {
             try std.testing.expectError(error.UnsupportedSyntax, checkSupported(ast));
         }
     }
+}
+
+test "membership formatting preserves syntactic operands but rejects ranges" {
+    try expectFormatted("let f:(a:[]i8)->bool=-1 in a\n", "let f: (a: []i8) -> bool = -1 in a\n");
+    try expectFormatted("let f:()->bool=true in [false,true,]\n", "let f: () -> bool = true in [false, true,]\n");
+    try expectFormatted("let f:(n:int)->bool=n in [\n; values\n1,2,]\n", "let f: (n: int) -> bool = n in [\n    ; values\n    1,\n    2,\n]\n");
+    try std.testing.expectError(error.InvalidSource, format(std.testing.allocator, "let f: (n: int) -> bool = n in 1..3\n"));
+    try std.testing.expectError(error.UnsupportedSyntax, format(std.testing.allocator, "let f: (n: int, a: []int) -> bool = n in a[1..3]\n"));
 }
 
 test "whitespace and additional supported operators are idempotent" {
@@ -471,7 +481,7 @@ test "array comments continuations and expanding lists stabilize on the first pa
 }
 
 fn testArrayAllocationFailures(allocator: std.mem.Allocator) !void {
-    const output = try format(allocator, "let f:(a:[]int)->[]int={let mut b:[]int=[\n1, ; element\n{a[-1]},3,]\nb[0]=a.len\nb[-1] += {a[0]}\nb[0] -= 1\nb[0] *= 2\nb[0] /= 2\nb[0] %= 3\nb += []\nreturn b}\n");
+    const output = try format(allocator, "let f:(a:[]int)->[]int={let mut b:[]int=[\n1, ; element\n{a[-1]},3,]\nb[0]=a.len\nb[-1] += {a[0]}\nb[0] -= 1\nb[0] *= 2\nb[0] /= 2\nb[0] %= 3\nb += []\nlet found = 1 in b\nlet absent = false in []\nreturn b}\n");
     defer allocator.free(output);
 }
 

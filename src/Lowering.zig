@@ -618,6 +618,11 @@ test "lowering ownership and source diagnostic rollback survive allocation failu
         "let f: () -> void = {let a: []int = [true]\n}",
         "let f: (c: bool) -> void = {let mut a: []int = [1]\na[{a = []\n0}] += if c {return} else {a = [9]\n2}\na[0] -= 1\na[0] *= 3\na[0] /= 2\na[0] %= 5}",
         "let f: () -> void = {let mut a: []bool = [true]\na[0] %= false}",
+        "let f: (a: []i16) -> bool = -3 in a",
+        "let f: (n: u8) -> bool = n in [1, 2]",
+        "let f: () -> bool = true in []",
+        "let f: () -> bool = 1 in [1, 2]",
+        "let f: (n: i16, a: []i8) -> bool = n in a",
     }) |source| {
         try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
     }

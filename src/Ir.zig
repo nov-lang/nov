@@ -38,6 +38,8 @@ pub const Operation = union(enum) {
     /// Byte length for strings; element count for arrays.
     array_len: ValueId,
     array_index: struct { array: ValueId, index: ValueId },
+    /// Allocation-free scalar equality scan; operands retain their read/copy rules.
+    array_contains: struct { value: ValueId, array: ValueId },
     array_set: struct { array: ValueId, index: ValueId, value: ValueId },
     array_append: struct { lhs: ValueId, rhs: ValueId },
     /// Terminal control flow, never a value. Its optional operand is body-local.
@@ -498,6 +500,13 @@ fn validateBody(self: *const Ir, function: Function, body: Body) VerifyError!voi
                 if (array != .array) return error.InvalidOperation;
                 if (array.array != instruction.ty or !isNativeInteger(self.getType(try operandType(body, r.index, i)).?, .signed)) return error.OperandTypeMismatch;
             },
+            .array_contains => |r| {
+                if (ty != .boolean) return error.InvalidOperation;
+                const value = try operandType(body, r.value, i);
+                const array = self.getType(try operandType(body, r.array, i)).?;
+                if (array != .array) return error.InvalidOperation;
+                if (value != array.array) return error.OperandTypeMismatch;
+            },
             .array_set => |r| {
                 if (ty != .array) return error.InvalidOperation;
                 if (try operandType(body, r.array, i) != instruction.ty or
@@ -860,6 +869,44 @@ test "scalar array types operations and owned operands are verified" {
     }
 }
 
+test "membership verifies exact prior values result spans and slot isolation" {
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    ir.source_len = 1;
+    const boolean = try ir.internType(.boolean);
+    const integer = try ir.internType(.{ .integer = .{ .signedness = .signed, .bits = 16 } });
+    const other = try ir.internType(.{ .integer = .{ .signedness = .unsigned, .bits = 16 } });
+    const array = try ir.internType(.{ .array = integer });
+    const signature = try ir.internType(.{ .function = .{ .params = &.{ integer, array, other }, .result = boolean } });
+    const function = try ir.addFunction("contains", signature, .{ .start = 0, .end = 0 });
+    const make = TestFunctions.instruction;
+    const instructions = [_]Instruction{
+        make(integer, .{ .parameter = 0 }),
+        make(array, .{ .parameter = 1 }),
+        make(other, .{ .parameter = 2 }),
+        make(integer, .{ .local_slot = @enumFromInt(0) }),
+        make(boolean, .{ .array_contains = .{ .value = @enumFromInt(0), .array = @enumFromInt(1) } }),
+    };
+    try ir.setFunctionBody(function, &instructions, @enumFromInt(4));
+    const owned = @constCast(ir.functions.items[0].body.?.instructions);
+    const Case = struct { instruction: Instruction, err: VerifyError };
+    for ([_]Case{
+        .{ .instruction = make(integer, instructions[4].op), .err = error.InvalidOperation },
+        .{ .instruction = make(boolean, .{ .array_contains = .{ .value = @enumFromInt(2), .array = @enumFromInt(1) } }), .err = error.OperandTypeMismatch },
+        .{ .instruction = make(boolean, .{ .array_contains = .{ .value = @enumFromInt(1), .array = @enumFromInt(1) } }), .err = error.OperandTypeMismatch },
+        .{ .instruction = make(boolean, .{ .array_contains = .{ .value = @enumFromInt(0), .array = @enumFromInt(0) } }), .err = error.InvalidOperation },
+        .{ .instruction = make(boolean, .{ .array_contains = .{ .value = @enumFromInt(4), .array = @enumFromInt(1) } }), .err = error.InvalidValueId },
+        .{ .instruction = make(boolean, .{ .array_contains = .{ .value = @enumFromInt(0), .array = @enumFromInt(99) } }), .err = error.InvalidValueId },
+        .{ .instruction = make(boolean, .{ .array_contains = .{ .value = @enumFromInt(3), .array = @enumFromInt(1) } }), .err = error.InvalidValueId },
+        .{ .instruction = .{ .ty = boolean, .span = .{ .start = 0, .end = 2 }, .op = instructions[4].op }, .err = error.InvalidSourceSpan },
+    }) |case| {
+        owned[4] = case.instruction;
+        try std.testing.expectError(case.err, ir.verify());
+    }
+    owned[4] = instructions[4];
+    try ir.verify();
+}
+
 test "array operands cannot leak from a private region" {
     var ir = Ir.init(std.testing.allocator);
     defer ir.deinit();
@@ -882,6 +929,14 @@ test "array operands cannot leak from a private region" {
     var valid = body;
     valid[4].op.array_len = @enumFromInt(3);
     try ir.setFunctionBody(function, &valid, @enumFromInt(4));
+    try ir.verify();
+    // Membership must not bypass the same prior-reference/private-region checks.
+    valid[4] = make(boolean, .{ .array_contains = .{ .value = @enumFromInt(0), .array = @enumFromInt(1) } });
+    const bool_signature = try ir.internType(.{ .function = .{ .params = &.{}, .result = boolean } });
+    const bool_function = try ir.addFunction("private_contains", bool_signature, .{ .start = 0, .end = 0 });
+    try std.testing.expectError(error.InvalidValueId, ir.setFunctionBody(bool_function, &valid, @enumFromInt(4)));
+    valid[4].op.array_contains.array = @enumFromInt(3);
+    try ir.setFunctionBody(bool_function, &valid, @enumFromInt(4));
     try ir.verify();
 }
 

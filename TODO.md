@@ -315,6 +315,13 @@ executable subset for precise limits and evaluation order. The proposals below
 remain proposals; writable length, slices, nested/pointer elements, aliases,
 capacity APIs and efficient copy/append optimizations are still deferred.
 
+Scalar `value in array` membership is delivered for bool and supported fixed/native
+integers with exact element types, bidirectional literal context and no numeric
+defaults. It returns bool, evaluates left then right once, preserves array copy
+rules, and scans length with typed equality and early exit without allocating.
+Formatter support is syntactic only; ranges remain rejected. String/nested/pointer
+membership, conversions and iterators remain outside this slice.
+
 Side note about mutability. A constant array cannot be modified in any way, its
 values are constant too. A mutable array can be reassigned/extanded and its
 values can be modified. TODO: talk about * and *mut array.

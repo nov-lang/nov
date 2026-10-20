@@ -161,6 +161,15 @@ fn write(allocator: std.mem.Allocator, ir: *const Ir, origins: []const ?Origin, 
             "    return a.len == b.len && (!a.len || memcmp(a.data, b.data, (size_t)a.len) == 0);\n" ++
             "}\n",
     );
+    for (ir.types.items, 0..) |_, t| {
+        const element: Ir.TypeId = @enumFromInt(t);
+        if (!usesArrayContains(ir, element)) continue;
+        try w.print("static bool nov_array_contains_{d}(", .{t});
+        try writeType(ir, w, element);
+        try w.writeAll(" value, nov_array array) {\n    const ");
+        try writeType(ir, w, element);
+        try w.writeAll(" *data = array.data;\n    for (uintptr_t i = 0; i < array.len; ++i) {\n        if (value == data[i]) return true;\n    }\n    return false;\n}\n");
+    }
     try writeArithmeticRuntime(ir, w);
     var first_typedef = true;
     for (origins, ir.types.items, 0..) |origin, ty, i| {
@@ -368,6 +377,16 @@ fn writeConstant(w: *std.Io.Writer, constant: Ir.Constant, ty: Ir.Type) WriteErr
     }
 }
 
+fn usesArrayContains(ir: *const Ir, element: Ir.TypeId) bool {
+    for (ir.functions.items) |function| {
+        const body = function.body.?;
+        for (body.instructions) |instruction| {
+            if (instruction.op == .array_contains and body.instructions[@intFromEnum(instruction.op.array_contains.value)].ty == element) return true;
+        }
+    }
+    return false;
+}
+
 fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, function: Ir.Function) (WriteError || std.mem.Allocator.Error)!void {
     const signature = ir.types.items[@intFromEnum(function.ty)].function;
     const body = function.body.?;
@@ -386,6 +405,10 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
         .array_index => |r| {
             value_used[@intFromEnum(r.array)] = true;
             value_used[@intFromEnum(r.index)] = true;
+        },
+        .array_contains => |r| {
+            value_used[@intFromEnum(r.value)] = true;
+            value_used[@intFromEnum(r.array)] = true;
         },
         .array_set => |r| {
             value_used[@intFromEnum(r.array)] = true;
@@ -605,6 +628,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
                 try writeType(ir, w, instruction.ty);
                 try w.print(" *)v{d}.data)[nov_array_index(v{d}, v{d})]", .{ @intFromEnum(r.array), @intFromEnum(r.array), @intFromEnum(r.index) });
             },
+            .array_contains => |r| try w.print("nov_array_contains_{d}(v{d}, v{d})", .{ @intFromEnum(body.instructions[@intFromEnum(r.value)].ty), @intFromEnum(r.value), @intFromEnum(r.array) }),
             .array_literal, .array_clone, .array_set, .array_append => unreachable,
             .constant => |id| try writeConstant(w, ir.constants.items[@intFromEnum(id)], ty),
             .parameter => |index| try w.print("p{d}", .{index}),
@@ -903,6 +927,142 @@ test "immutable strings share UTF8 bytes across calls replacements control flow 
     defer test_gpa.free(c);
     try compileAndRunExpected(c, "typedef int nonempty_translation_unit;", 0, string_output, "");
     try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, string_output, "", "-O0");
+}
+
+const array_membership =
+    \\let left: () -> i16 = {@print("L")
+    \\    2}
+    \\let right: () -> []i16 = {@print("R")
+    \\    [1, 2, -3]}
+    \\let early_left: () -> bool = {return true} in right()
+    \\let early_right: () -> bool = left() in {return false}
+    \\let main: () -> void = {
+    \\    let mut a: []i16 = [-3, 2, 7]
+    \\    let original = a
+    \\    @println(-3 in a, 2 in a, 7 in a, 4 in a)
+    \\    @println(true in [false, true], false in [true], true in [], false in [])
+    \\    @println(left() in right())
+    \\    @println(early_left(), early_right())
+    \\    let mut n: i16 = 1
+    \\    @println({n += 1
+    \\        n} in {n = 9
+    \\        [2, n]}, n)
+    \\    @println({a = [9]
+    \\        9} in a, 9 in original, -3 in original)
+    \\    @println(false and left() in right(), true or left() in right())
+    \\    let found = loop {let skipped = {break true} in right()
+    \\    }
+    \\    let other = loop {let skipped = left() in {break false}
+    \\    }
+    \\    @println(found, other)
+    \\    let mut steps: int = 0
+    \\    loop steps < 3 : steps += 1 {
+    \\        let skipped = {if steps == 0 {continue}
+    \\            2} in [2, steps]
+    \\        loop {let stop = true in {break}
+    \\        }
+    \\        @println(skipped)
+    \\        if steps == 1 {break}
+    \\    }
+    \\    @println(steps)
+    \\    let mut checks: int = 0
+    \\    loop {checks += 1
+    \\        true in {if checks == 1 {continue}
+    \\            if checks == 3 {break}
+    \\            [true]}} : {let skipped = {continue} in [true]
+    \\    } {@print("C")}
+    \\    @println(checks)
+    \\}
+;
+const array_membership_output = "true true true false\ntrue false false false\nLRtrue\nLtrue false\ntrue 9\ntrue false true\nfalse true\nLtrue false\ntrue\n1\nC3\n";
+
+test "array membership preserves exact equality effects controls formatting and forced GC" {
+    const c = try arrayTestProgram(array_membership);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, array_membership_output, "", mode);
+}
+
+test "array membership supports every fixed and native scalar element type" {
+    var source = std.Io.Writer.Allocating.init(test_gpa);
+    defer source.deinit();
+    try source.writer.writeAll("let main: () -> void = {\n");
+    for ([_][]const u8{ "i8", "i16", "i32", "i64", "int", "u8", "u16", "u32", "u64", "uint", "bool" }, 0..) |name, i| {
+        const boolean = std.mem.eql(u8, name, "bool");
+        const negative = name[0] == 'i';
+        const value: []const u8 = if (boolean) "true" else if (negative) "-1" else "255";
+        try source.writer.print("let n{d}: {s} = {s}\nlet a{d}: []{s} = [{s}]\n@println(n{d} in a{d}, n{d} in [], {s} in a{d})\n", .{ i, name, value, i, name, value, i, i, i, if (boolean) "false" else "0", i });
+    }
+    try source.writer.writeAll("}\n");
+    const c = try arrayTestProgram(source.written());
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "true false false\n" ** 11, "", mode);
+}
+
+test "array membership scan allocates nothing ignores capacity and stops at first match" {
+    const library = try emitSource("let contains: (n: i16, a: []i16) -> bool = n in a\nlet flag: (n: bool, a: []bool) -> bool = n in a", null);
+    defer test_gpa.free(library);
+    try std.testing.expect(std.mem.indexOf(u8, library, "memcmp") == null);
+    const prefix = "static bool ";
+    const first = std.mem.indexOf(u8, library, prefix ++ "nov_array_contains_").? + prefix.len;
+    const integer_helper = library[first .. first + std.mem.indexOfScalar(u8, library[first..], '(').?];
+    const second = std.mem.indexOfPos(u8, library, first, prefix ++ "nov_array_contains_").? + prefix.len;
+    const boolean_helper = library[second .. second + std.mem.indexOfScalar(u8, library[second..], '(').?];
+    const main = try std.fmt.allocPrint(
+        test_gpa,
+        "\nint main(void) {{\n" ++
+            "int16_t data[] = {{-7, 2, 99}}; bool flags[] = {{false, true}};\n" ++
+            "nov_array empty = {{NULL, 0, 10}};\n" ++
+            "if ({s}(1, empty)) return 1;\n" ++
+            "if ({s}(99, (nov_array){{data, 2, 3}})) return 2;\n" ++
+            "if (!{s}(-7, (nov_array){{data, UINTPTR_MAX, UINTPTR_MAX}})) return 3;\n" ++
+            "if (!{s}(2, (nov_array){{data, 2, 2}})) return 4;\n" ++
+            "if (!{s}(true, (nov_array){{flags, 2, 2}})) return 5;\n" ++
+            "if (nov_rt_heap.frames || nov_rt_heap.live_objects) return 6;\n" ++
+            "nov_gc_shutdown(&nov_rt_heap); return 0; }}\n",
+        .{ integer_helper, integer_helper, integer_helper, integer_helper, boolean_helper },
+    );
+    defer test_gpa.free(main);
+    const c = try std.mem.concat(test_gpa, u8, &.{
+        "#include <stdlib.h>\nstatic void *no_alloc(size_t n) { (void)n; abort(); }\n#define NOV_GC_MALLOC no_alloc\n#define NOV_GC_FREE free\n",
+        library,
+        main,
+    });
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "", "", mode);
+}
+
+test "array membership helpers are demand only including nested callback signatures" {
+    for ([_][]const u8{
+        "let f: (callback: ([]bool) -> bool) -> void = {}",
+        "let f: (n: int) -> bool = n == 1",
+        "let f: (a: []i8) -> []i8 = a",
+        "let f: () -> bool = {return true} in [true]",
+    }) |source| {
+        const c = try emitSource(source, null);
+        defer test_gpa.free(c);
+        try std.testing.expect(std.mem.indexOf(u8, c, "nov_array_contains_") == null);
+        try compileAndRun(c, "int main(void) { return 0; }");
+    }
+}
+
+test "array membership owned lowering emits after freeing source" {
+    var sema = blk: {
+        var module = try Module.init(test_gpa, "source-free.nov", array_membership);
+        defer module.deinit();
+        var result = try Lowering.lower(&module);
+        errdefer result.deinit();
+        try std.testing.expect(!module.hasErrors());
+        break :blk result;
+    };
+    defer sema.deinit();
+    try sema.ir.verify();
+    const c = try emitProgram(test_gpa, &sema.ir, null);
+    defer test_gpa.free(c);
+    try compileAndRunExpected(c, "typedef int nonempty_translation_unit;", 0, array_membership_output, "");
+}
+
+test "array membership compiler ownership survives every allocation failure" {
+    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{array_membership});
 }
 
 const string_equality =
@@ -1415,7 +1575,7 @@ test "array capacity and append length overflow panic before accessing backing" 
 }
 
 test "array allocation failure retries preserve roots and shutdown frees backing" {
-    for ([_][]const u8{ array_example, array_compound_effects, inferred_example, inferred_arrays, string_example, string_compound, string_equality, unconditional_loops, else_loops }, [_][]const u8{ "3 30 30 6\n454 15\n99 15 4\nfalse true 2\n0\n", array_compound_output, inferred_output, inferred_arrays_output, string_output, string_compound_output, string_equality_output, unconditional_output, else_loop_output }) |source, output| {
+    for ([_][]const u8{ array_example, array_compound_effects, inferred_example, inferred_arrays, string_example, string_compound, string_equality, unconditional_loops, else_loops, array_membership }, [_][]const u8{ "3 30 30 6\n454 15\n99 15 4\nfalse true 2\n0\n", array_compound_output, inferred_output, inferred_arrays_output, string_output, string_compound_output, string_equality_output, unconditional_output, else_loop_output, array_membership_output }) |source, output| {
         const c = try arrayTestProgram(source);
         defer test_gpa.free(c);
         const injected = try std.mem.concat(test_gpa, u8, &.{
