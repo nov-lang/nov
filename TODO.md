@@ -38,7 +38,10 @@ Keep Nov away from:
 - strings:
   - [x] immutable UTF-8 literals, sharing, concatenation, `+=`, byte length and output
   - [x] allocation-free, byte-exact `==`/`!=` (including NUL; no normalization)
-  - ordering, indexing, slicing, interpolation and Unicode operations remain deferred
+  - [x] identifier-only `{name}` interpolation for bool/fixed/native integers/strings;
+    decimal boundaries, UTF-8/NUL, rooted temporaries and formatter preservation
+  - expressions/calls/formats/captures and global interpolation remain unsupported
+  - ordering, indexing, slicing and Unicode operations remain deferred
 - add tests, mainly for Parser, IRs, Codegen and Runtime
   - [x] initial parser, formatter, file-safety, and CLI regression coverage
 - expand Render.zig to cover the full AST (simple declarations and expressions work)
@@ -129,7 +132,7 @@ let myStruct = struct {}
 - Move `@print` etc... to stdlib? (either need to wrap args in an anonymous
   struct or allow to pass a variadic amount of parameters to a function).
 - Make `*` always `*mut`? What are the positives and negatives of this change?
-- Change string interpolation to
+- Future format-option proposal (identifier-only interpolation is implemented):
   `"{varname:[fill][alignment][width][.precision]:[custom options]}"`
   and use format like zig instead of toString?
 - **Rework Parser to remove newline if they are unnecessary**
@@ -400,8 +403,8 @@ required final catchall. Unary function/print pipes are also executable; fibo.no
 runs unchanged. Match subjects evaluate once left-to-right; pipes evaluate as
 callee-first unary calls. Exact branch types, private scopes and terminal paths
 reuse typed branch IR. Captures/enums/complex patterns/full exhaustiveness,
-ranges/iteration and interpolation remain deferred. Proposals below are not a
-claim of executable support.
+ranges/iteration remain deferred. Identifier interpolation works in branch results.
+Proposals below are not a claim of executable support.
 
 TODO: check https://docs.vlang.io/statements-&-expressions.html#match
 
@@ -410,8 +413,8 @@ TODO: check https://tour.gleam.run/everything/#flow-control-case-expressions
   - add [Flow-sensitive typing](https://en.wikipedia.org/wiki/Flow-sensitive_typing)?
     that could solve the issue with `if`
 
-Delivered syntax: match over multiple scalar values (interpolation and discard
-assignment in this historical example remain unsupported)
+Delivered syntax: match over multiple scalar values with identifier interpolation
+(discard assignment in this historical example remains unsupported)
 ```nov
 _ = match x % 3, x % 5 {
     0, 0 => "FizzBuzz"
@@ -623,8 +626,12 @@ let ArrayList: (T: #type) -> type = { ... }
   - Literals, `+`, printing, locals, parameters/returns, conditionals and explicitly
     typed immutable literal globals are supported. Concatenation uses rooted GC
     backing; literals use static read-only bytes with a null traced owner.
-  - Indexing, slicing, interpolation, Unicode operations, string arrays and C-string
-    conversion are deferred. No terminator or compile-time concatenation promise.
+  - Identifier interpolation supports bool, fixed/native decimal integers and
+    shared strings, preserving UTF-8/NUL with no normalization. Placeholders are
+    evaluated left-to-right once; calls/expressions/formats/captures are unsupported.
+    Global interpolation is nonliteral and rejected, not eagerly evaluated.
+  - Indexing, slicing, Unicode operations, string arrays and C-string conversion
+    are deferred. No terminator or compile-time concatenation promise.
 - `void` is Nov's unit type (`()` in Rust and OCaml, `Nil` in Gleam)
   - `void` only value is `[]` (`{}` in zig)
 - about variable initialization:

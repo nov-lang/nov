@@ -803,6 +803,101 @@ const Context = struct {
         return self.fit(result.ty, expected, node);
     }
 
+    fn interpolationError(self: *Context, tag: Module.Diagnostic.Tag, location: Module.Span) Error!?Ir.TypeId {
+        try self.module.diagnostics.append(self.module.allocator, .{ .tag = tag, .span = location });
+        return null;
+    }
+
+    fn stringChunk(self: *Context, raw: []const u8, location: Module.Span, ty: Ir.TypeId) Error!?Ir.ConstId {
+        const bytes = try std.mem.concat(self.module.allocator, u8, &.{ "\"", raw, "\"" });
+        defer self.module.allocator.free(bytes);
+        var decoded = std.Io.Writer.Allocating.init(self.module.allocator);
+        defer decoded.deinit();
+        const result = @import("string_literal.zig").parseWrite(&decoded.writer, bytes) catch return error.OutOfMemory;
+        const issue: ?Literal.StringIssue = switch (result) {
+            .success => Literal.stringIssue(bytes, decoded.written()),
+            .failure => |failure| .{ .offset = switch (failure) {
+                .empty_char_literal => unreachable,
+                inline else => |offset| offset,
+            }, .tag = Module.Diagnostic.Tag.invalid_literal },
+        };
+        if (issue) |bad| {
+            const start = location.start + @as(u32, @intCast(bad.offset - 1));
+            _ = try self.interpolationError(bad.tag, .{ .start = start, .end = @min(location.end, start + 1) });
+            return null;
+        }
+        return try self.ir.internConstant(.{ .ty = ty, .value = .{ .string = decoded.written() } });
+    }
+
+    fn stringInterpolation(self: *Context, node: Ast.Node.Index, expected: ?Known) Error!?Ir.TypeId {
+        const location = self.span(node);
+        const bytes = self.module.sourceSlice(location).?;
+        const string = try self.ir.internType(.string);
+        var result: ?Ir.ValueId = null;
+        var offset: usize = 1;
+        var chunk: usize = 1;
+        while (offset < bytes.len) {
+            if (offset < bytes.len - 1 and bytes[offset] == '\\') {
+                switch (@import("string_literal.zig").parseEscapeSequence(bytes, &offset)) {
+                    .success => continue,
+                    .failure => return self.interpolationError(.invalid_literal, location),
+                }
+            }
+            if (offset == bytes.len - 1 or bytes[offset] == '{' or bytes[offset] == '}') {
+                if (offset > chunk) {
+                    const constant = (try self.stringChunk(bytes[chunk..offset], .{
+                        .start = location.start + @as(u32, @intCast(chunk)),
+                        .end = location.start + @as(u32, @intCast(offset)),
+                    }, string)) orelse return null;
+                    if (self.emitter) |emitter| {
+                        const value = try emitter.append(string, self.irSpan(node), .{ .constant = constant });
+                        result = if (result) |left| try emitter.append(string, self.irSpan(node), .{ .binary = .{ .op = .add, .lhs = left, .rhs = value } }) else value;
+                    }
+                }
+                if (offset == bytes.len - 1) break;
+                const brace = offset;
+                offset += 1;
+                const start = offset;
+                while (offset < bytes.len - 1 and (std.ascii.isAlphanumeric(bytes[offset]) or bytes[offset] == '_')) : (offset += 1) {}
+                const name = bytes[start..offset];
+                const name_span: Module.Span = .{ .start = location.start + @as(u32, @intCast(start)), .end = location.start + @as(u32, @intCast(offset)) };
+                if (bytes[brace] != '{' or name.len == 0 or std.ascii.isDigit(name[0]) or offset == bytes.len - 1 or bytes[offset] != '}' or @import("Tokenizer.zig").Token.keywords.get(name) != null)
+                    return self.interpolationError(.invalid_interpolation, .{ .start = location.start + @as(u32, @intCast(brace)), .end = location.start + @as(u32, @intCast(@min(offset + 1, bytes.len - 1))) });
+                var value: ?Ir.ValueId = null;
+                const ty = if (self.bindings.get(name)) |binding| blk: {
+                    if (self.emitter) |emitter| value = if (binding.slot) |slot|
+                        try emitter.append(binding.known.ty, self.irSpan(node), .{ .local_load = slot })
+                    else if (binding.initializer) |initializer|
+                        try emitter.value(initializer)
+                    else
+                        try emitter.append(binding.known.ty, self.irSpan(node), .{ .parameter = binding.index });
+                    break :blk binding.known.ty;
+                } else if (self.module.lookup(name)) |id| blk: {
+                    if (isPrimitive(name)) return self.interpolationError(.unsupported_shadowing, name_span);
+                    const known = self.globalType(id) orelse return self.interpolationError(.unresolved_value_type, name_span);
+                    if (self.emitter) |emitter| {
+                        if (emitter.constants[@intFromEnum(id)]) |constant| value = try emitter.append(known.ty, self.irSpan(node), .{ .constant = constant });
+                    }
+                    break :blk known.ty;
+                } else if (std.mem.eql(u8, name, "true") or std.mem.eql(u8, name, "false")) blk: {
+                    const boolean = try self.ir.internType(.boolean);
+                    if (self.emitter) |emitter| value = try emitter.append(boolean, self.irSpan(node), .{ .constant = try self.ir.internConstant(.{ .ty = boolean, .value = .{ .boolean = std.mem.eql(u8, name, "true") } }) });
+                    break :blk boolean;
+                } else return self.interpolationError(.unknown_name, name_span);
+                const scalar = self.ir.getType(ty).?;
+                if (scalar != .boolean and scalar != .integer and scalar != .string) return self.interpolationError(.unsupported_interpolation_type, name_span);
+                if (self.emitter) |emitter| {
+                    const converted = try emitter.append(string, self.irSpan(node), .{ .to_string = value orelse return error.InvalidValueId });
+                    result = if (result) |left| try emitter.append(string, self.irSpan(node), .{ .binary = .{ .op = .add, .lhs = left, .rhs = converted } }) else converted;
+                }
+                offset += 1;
+                chunk = offset;
+            } else offset += 1;
+        }
+        if (self.emitter) |emitter| try emitter.values.put(emitter.allocator, node, result orelse return error.InvalidValueId);
+        return self.fit(string, expected, node);
+    }
+
     fn expression(self: *Context, node: Ast.Node.Index, expected: ?Known, depth: usize) Error!?Ir.TypeId {
         const ty = if (self.terminated)
             (if (expected) |want| want.ty else try self.ir.internType(.void))
@@ -1036,7 +1131,8 @@ const Context = struct {
                 return self.fit(unit, expected, node);
             },
             .number_literal => return self.fail(.literal_needs_type, node, null),
-            .char_literal, .string_literal => return self.fail(.unsupported_literal, node, null),
+            .string_literal => return self.stringInterpolation(node, expected),
+            .char_literal => return self.fail(.unsupported_literal, node, null),
             .block, .block_two, .block_newline, .block_two_newline => return self.blockExpression(node, expected, depth),
             .@"if", .if_else => {
                 const branch = ast.fullIf(node).?.ast;
@@ -1183,6 +1279,44 @@ const Context = struct {
         }
     }
 };
+
+test "interpolation diagnoses names grammar types scopes and exact source bytes" {
+    const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag, token: []const u8 };
+    for ([_]Case{
+        .{ .source = "let f: (n: int) -> string = \"{missing}\"", .tag = .unknown_name, .token = "missing" },
+        .{ .source = "let f: () -> string = {let text = \"{text}\"\ntext}", .tag = .unknown_name, .token = "text" },
+        .{ .source = "let f: () -> string = {let text = \"{later}\"\nlet later = true\ntext}", .tag = .unknown_name, .token = "later" },
+        .{ .source = "let f: () -> string = {if true {let hidden = true\n}\n\"{hidden}\"}", .tag = .unknown_name, .token = "hidden" },
+        .{ .source = "let f: (n: int) -> string = \"{}\"", .tag = .invalid_interpolation, .token = "{}" },
+        .{ .source = "let f: (n: int) -> string = \"{n\"", .tag = .invalid_interpolation, .token = "{n" },
+        .{ .source = "let f: (n: int) -> string = \"}\"", .tag = .invalid_interpolation, .token = "}" },
+        .{ .source = "let f: (n: int) -> string = \"{n + 1}\"", .tag = .invalid_interpolation, .token = "{n " },
+        .{ .source = "let f: (n: int) -> string = \"{n:02}\"", .tag = .invalid_interpolation, .token = "{n:" },
+        .{ .source = "let f: (n: int) -> string = \"{n()}\"", .tag = .invalid_interpolation, .token = "{n(" },
+        .{ .source = "let f: (n: int) -> string = \"{{n}}\"", .tag = .invalid_interpolation, .token = "{{" },
+        .{ .source = "let f: (n: int) -> string = \"{ n}\"", .tag = .invalid_interpolation, .token = "{ " },
+        .{ .source = "let f: (n: int) -> string = \"{1}\"", .tag = .invalid_interpolation, .token = "{1}" },
+        .{ .source = "let f: (n: int) -> string = \"{if}\"", .tag = .invalid_interpolation, .token = "{if}" },
+        .{ .source = "let f: (n: []int) -> string = \"{n}\"", .tag = .unsupported_interpolation_type, .token = "n" },
+        .{ .source = "let f: () -> string = \"{f}\"", .tag = .unsupported_interpolation_type, .token = "f" },
+        .{ .source = "let f: (n: () -> int) -> string = \"{n}\"", .tag = .unsupported_interpolation_type, .token = "n" },
+        .{ .source = "let f: (n: int) -> int = \"{n}\"", .tag = .expression_type_mismatch, .token = "\"{n}\"" },
+        .{ .source = "let f: (n: int) -> string = \"{n}a\\xFF\"", .tag = .invalid_literal, .token = "\\" },
+        .{ .source = "let f: (n: int) -> string = \"a\\xFF{n}\"", .tag = .invalid_literal, .token = "\\" },
+        .{ .source = "let f: (n: int) -> string = \"{n}\xff\"", .tag = .invalid_literal, .token = "\xff" },
+        .{ .source = "let f: (n: int) -> string = {let n = true\n\"{n}\"}", .tag = .unsupported_shadowing, .token = "n" },
+    }) |case| {
+        var module = try Module.init(std.testing.allocator, "interpolation-error.nov", case.source);
+        defer module.deinit();
+        var sema = try @import("Lowering.zig").lower(&module);
+        defer sema.deinit();
+        try std.testing.expect(!sema.lowering_complete);
+        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+        const diagnostic = module.diagnostics.items[0];
+        try std.testing.expectEqual(case.tag, diagnostic.tag);
+        try std.testing.expectEqualStrings(case.token, module.sourceSlice(diagnostic.span).?);
+    }
+}
 
 test "match and pipes reject unsupported patterns arity defaults and inexact types" {
     const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag };

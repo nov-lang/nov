@@ -744,6 +744,10 @@ test "all tokens with lexeme" {
     try testTokenize(source, builder.items(.tag));
 }
 
+test "interpolation stays one literal token including escaped braces and UTF8" {
+    try testTokenize("\"é\\{literal\\}\\0{n}{text}😀\"", &.{.string_literal});
+}
+
 test "line comment followed by statement" {
     try testTokenize(
         \\; comment

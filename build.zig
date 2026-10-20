@@ -120,6 +120,10 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     _ = fixtures.add("checkout.nov", @embedFile("examples/checkout.nov"));
     _ = fixtures.add("fibo.nov", @embedFile("examples/fibo.nov"));
     _ = fixtures.add("strings.nov", @embedFile("examples/strings.nov"));
+    _ = fixtures.add("interpolation.nov", @embedFile("examples/interpolation.nov"));
+    _ = fixtures.add("interpolation-format.nov", "let main: () -> void = {let n: int = 1\n@println(\"{n:02}\")}\n");
+    _ = fixtures.add("interpolation-name.nov", "let main: () -> void = @println(\"{missing}\")\n");
+    _ = fixtures.add("interpolation-global.nov", "let n: int = 1\nlet text: string = \"{n}\"\n");
     _ = fixtures.add("inferred-locals.nov", @embedFile("examples/inferred-locals.nov"));
     _ = fixtures.add("inferred-integer.nov", "let main: () -> void = {let n = 1\n@println(n)}\n");
     _ = fixtures.add("inferred-empty-array.nov", "let main: () -> void = {let a = []\n}\n");
@@ -186,6 +190,11 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         .{ .name = "check rejects --check", .args = &.{ "check", "--check", "valid.nov" }, .exit_code = 1, .stderr_match = "--check" },
         .{ .name = "--check requires fmt", .args = &.{"--check"}, .exit_code = 1, .stderr_match = "--check" },
         .{ .name = "check valid syntax", .args = &.{ "check", "valid.nov" }, .exit_code = 0 },
+        .{ .name = "check interpolation", .args = &.{ "check", "--semantic", "interpolation.nov" }, .exit_code = 0 },
+        .{ .name = "fmt interpolation", .args = &.{ "fmt", "--check", "interpolation.nov" }, .exit_code = 0 },
+        .{ .name = "reject interpolation formats", .args = &.{ "emit-c", "interpolation-format.nov" }, .exit_code = 1, .stderr_match = "expected {identifier}; expressions, calls and format options are unsupported" },
+        .{ .name = "reject interpolation unknown names", .args = &.{ "emit-c", "interpolation-name.nov" }, .exit_code = 1, .stderr_match = "unknown name 'missing'" },
+        .{ .name = "reject global interpolation", .args = &.{ "check", "--semantic", "interpolation-global.nov" }, .exit_code = 1, .stderr_match = "global strings require literal initializers; move interpolation into a function" },
         .{ .name = "check unchanged fibo", .args = &.{ "check", "--semantic", "fibo.nov" }, .exit_code = 0 },
         .{ .name = "fmt unchanged fibo", .args = &.{ "fmt", "--check", "fibo.nov" }, .exit_code = 0 },
         .{ .name = "check inferred locals", .args = &.{ "check", "--semantic", "inferred-locals.nov" }, .exit_code = 0 },
@@ -319,6 +328,39 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         value_loops.expectStdOutEqual("First multiple: found 28 42\nBounded search: true false false 28 -1\n");
         value_loops.expectStdErrEqual("");
         test_step.dependOn(&value_loops.step);
+
+        const interpolation_output = "1: 1\n2: 2\n3: Fizz\n4: 4\n5: Buzz\n6: Fizz\n7: 7\n8: 8\n9: Fizz\n10: Buzz\n11: 11\n12: Fizz\n13: 13\n14: 14\n15: FizzBuzz\n{literal}: true: é\x00😀 7\n";
+        const interpolation = b.addRunArtifact(exe);
+        interpolation.step.name = b.fmt("CLI: interpolation ({s})", .{mode});
+        interpolation.setCwd(fixtures.getDirectory());
+        interpolation.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+        interpolation.setEnvironmentVariable("NOV_CC", "");
+        interpolation.setEnvironmentVariable("CC", "");
+        interpolation.addArgs(&.{ "run", "interpolation.nov" });
+        if (mode.len != 0) interpolation.addArg(mode);
+        interpolation.expectExitCode(0);
+        interpolation.expectStdOutEqual(interpolation_output);
+        interpolation.expectStdErrEqual("");
+        test_step.dependOn(&interpolation.step);
+        const interpolation_build = b.addRunArtifact(exe);
+        interpolation_build.step.name = b.fmt("CLI: build interpolation ({s})", .{mode});
+        interpolation_build.setCwd(fixtures.getDirectory());
+        interpolation_build.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+        interpolation_build.setEnvironmentVariable("NOV_CC", "");
+        interpolation_build.setEnvironmentVariable("CC", "");
+        interpolation_build.addArgs(&.{ "build", "interpolation.nov" });
+        if (mode.len != 0) interpolation_build.addArg(mode);
+        interpolation_build.addArg("-o");
+        const interpolation_program = interpolation_build.addOutputFileArg(if (exe.root_module.resolved_target.?.result.os.tag == .windows) "interpolation.exe" else "interpolation");
+        interpolation_build.expectExitCode(0);
+        interpolation_build.expectStdOutEqual("");
+        interpolation_build.expectStdErrEqual("");
+        const interpolation_run = std.Build.Step.Run.create(b, b.fmt("CLI: execute interpolation ({s})", .{mode}));
+        interpolation_run.addFileArg(interpolation_program);
+        interpolation_run.expectExitCode(0);
+        interpolation_run.expectStdOutEqual(interpolation_output);
+        interpolation_run.expectStdErrEqual("");
+        test_step.dependOn(&interpolation_run.step);
 
         const strings = b.addRunArtifact(exe);
         strings.step.name = b.fmt("CLI: UTF8 strings and NUL ({s})", .{mode});

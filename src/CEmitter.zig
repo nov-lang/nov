@@ -154,6 +154,7 @@ fn write(allocator: std.mem.Allocator, ir: *const Ir, origins: []const ?Origin, 
         try w.writeByte('\n');
         try w.writeAll(@embedFile("runtime/array.h"));
         if (usesStringConcat(ir)) try w.writeAll(@embedFile("runtime/string.h"));
+        try writeStringConversions(ir, w);
     }
     if (usesStringEquality(ir)) try w.writeAll(
         "#include <string.h>\n" ++
@@ -221,10 +222,30 @@ fn usesStringEquality(ir: *const Ir) bool {
     return false;
 }
 
+fn writeStringConversions(ir: *const Ir, w: *std.Io.Writer) WriteError!void {
+    for (ir.types.items, 0..) |ty, t| {
+        if (ty != .integer) continue;
+        var used = false;
+        for (ir.functions.items) |function| {
+            const body = function.body.?;
+            for (body.instructions) |instruction| {
+                if (instruction.op == .to_string and @intFromEnum(body.instructions[@intFromEnum(instruction.op.to_string)].ty) == t) used = true;
+            }
+        }
+        if (!used) continue;
+        try w.writeAll("#include <inttypes.h>\nstatic nov_string nov_to_string_");
+        try w.print("{d}(", .{t});
+        try writeType(ir, w, @enumFromInt(t));
+        try w.print(" value) {{\n    char bytes[32];\n    int len = snprintf(bytes, sizeof bytes, \"%\" PRI{s}64, ({s}int64_t)value);\n", .{ if (ty.integer.signedness == .signed) "d" else "u", if (ty.integer.signedness == .signed) "" else "u" });
+        try w.writeAll("    if (len < 0 || (size_t)len >= sizeof bytes) nov_rt_panic(\"integer formatting failed\");\n    return nov_string_concat((nov_string){0}, (nov_string){NULL, (const unsigned char *)bytes, (uintptr_t)len});\n}\n");
+    }
+}
+
 fn usesStringConcat(ir: *const Ir) bool {
     for (ir.functions.items) |function| {
         for (function.body.?.instructions) |instruction| {
             if (instruction.op == .binary and ir.getType(instruction.ty).? == .string) return true;
+            if (instruction.op == .to_string and ir.getType(function.body.?.instructions[@intFromEnum(instruction.op.to_string)].ty).? == .integer) return true;
         }
     }
     return false;
@@ -401,7 +422,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
         .array_literal => |elements| for (elements) |value| {
             value_used[@intFromEnum(value)] = true;
         },
-        .array_clone, .array_len => |value| value_used[@intFromEnum(value)] = true,
+        .array_clone, .array_len, .to_string => |value| value_used[@intFromEnum(value)] = true,
         .array_index => |r| {
             value_used[@intFromEnum(r.array)] = true;
             value_used[@intFromEnum(r.index)] = true;
@@ -605,6 +626,15 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
                 .constant => |id| try writeConstant(w, ir.getConstant(id).?, ty),
                 .parameter => |index| try w.print("p{d}", .{index}),
                 .local_slot, .local_load => |value| try w.print("v{d}", .{@intFromEnum(value)}),
+                .to_string => |value| {
+                    const source_ty = body.instructions[@intFromEnum(value)].ty;
+                    switch (ir.getType(source_ty).?) {
+                        .string => try w.print("v{d}", .{@intFromEnum(value)}),
+                        .boolean => try w.print("(v{d} ? (nov_string){{NULL, (const unsigned char *)\"true\", 4}} : (nov_string){{NULL, (const unsigned char *)\"false\", 5}})", .{@intFromEnum(value)}),
+                        .integer => try w.print("nov_to_string_{d}(v{d})", .{ @intFromEnum(source_ty), @intFromEnum(value) }),
+                        else => unreachable,
+                    }
+                },
                 .binary => |b| try w.print("nov_string_concat(v{d}, v{d})", .{ @intFromEnum(b.lhs), @intFromEnum(b.rhs) }),
                 .call => |call| try writeCall(w, call),
                 else => unreachable,
@@ -629,7 +659,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
                 try w.print(" *)v{d}.data)[nov_array_index(v{d}, v{d})]", .{ @intFromEnum(r.array), @intFromEnum(r.array), @intFromEnum(r.index) });
             },
             .array_contains => |r| try w.print("nov_array_contains_{d}(v{d}, v{d})", .{ @intFromEnum(body.instructions[@intFromEnum(r.value)].ty), @intFromEnum(r.value), @intFromEnum(r.array) }),
-            .array_literal, .array_clone, .array_set, .array_append => unreachable,
+            .array_literal, .array_clone, .array_set, .array_append, .to_string => unreachable,
             .constant => |id| try writeConstant(w, ir.constants.items[@intFromEnum(id)], ty),
             .parameter => |index| try w.print("p{d}", .{index}),
             .local_slot, .local_load => |value| try w.print("v{d}", .{@intFromEnum(value)}),
@@ -1190,6 +1220,123 @@ test "array membership compiler ownership survives every allocation failure" {
     try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{array_membership});
 }
 
+const string_interpolation =
+    \\let prefix: string = "é\0"
+    \\let fizz: (n: int) -> string = match n % 3, n % 5 {
+    \\    0, 0 => "FizzBuzz"
+    \\    0, _ => "Fizz"
+    \\    _, 0 => "Buzz"
+    \\    _ => "{n}"
+    \\}
+    \\let identity: (s: string) -> string = "{s}"
+    \\let early: (n: int) -> string = {if n == 0 {return "{n}"}
+    \\    "number={n}"}
+    \\let main: () -> void = {
+    \\    let mut n: int = 0
+    \\    let yes = true
+    \\    let no = false
+    \\    let mut s = prefix + "😀"
+    \\    let shared = identity(s)
+    \\    @println("A{yes}:{no}:{n}:\{{s}\}:Z", shared.len, "{true}/{false}")
+    \\    s = "other"
+    \\    @println(shared == prefix + "😀", "{shared}" == shared, "{shared}".len)
+    \\    let empty = ""
+    \\    @println("{empty}{empty}" == "", "{prefix}{shared}\0".len)
+    \\    loop n < 16 : n += 1 {
+    \\        if n == 0 {continue}
+    \\        let text = fizz(n)
+    \\        @println("[{n}]={text}")
+    \\    }
+    \\    let found = loop : {} {break "{n}"}
+    \\    @println(found, early(0), early(9), shared)
+    \\}
+;
+const string_interpolation_output = "Atrue:false:0:{é\x00😀}:Z 7 true/false\ntrue true 7\ntrue 11\n[1]=1\n[2]=2\n[3]=Fizz\n[4]=4\n[5]=Buzz\n[6]=Fizz\n[7]=7\n[8]=8\n[9]=Fizz\n[10]=Buzz\n[11]=11\n[12]=Fizz\n[13]=13\n[14]=14\n[15]=FizzBuzz\n16 0 number=9 é\x00😀\n";
+
+test "identifier interpolation preserves chunks formatting roots loops matches and returns" {
+    const c = try arrayTestProgram(string_interpolation);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, string_interpolation_output, "", mode);
+}
+
+test "interpolation decimal formatting is exact at every supported integer boundary" {
+    var source = std.Io.Writer.Allocating.init(test_gpa);
+    defer source.deinit();
+    var output = std.Io.Writer.Allocating.init(test_gpa);
+    defer output.deinit();
+    try source.writer.writeAll("let main: () -> void = {\n");
+    for ([_][]const u8{ "i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "int", "uint" }, 0..) |name, i| {
+        const bits: u7 = if (name[0] == 'i' and name[1] == 'n' or name[0] == 'u' and name[1] == 'i') @intCast(Ir.native_pointer_bits) else try std.fmt.parseInt(u7, name[1..], 10);
+        const signed = name[0] == 'i';
+        const min: i128 = if (signed) -(@as(i128, 1) << @intCast(bits - 1)) else 0;
+        const max: i128 = (@as(i128, 1) << @intCast(bits - @as(u7, @intFromBool(signed)))) - 1;
+        try source.writer.print("let a{d}: {s} = {d}\nlet b{d}: {s} = {d}\n@println(\"{{a{d}}}:{{b{d}}}\")\n", .{ i, name, min, i, name, max, i, i });
+        try output.writer.print("{d}:{d}\n", .{ min, max });
+    }
+    try source.writer.writeAll("}\n");
+    const c = try arrayTestProgram(source.written());
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, output.written(), "", mode);
+}
+
+test "interpolation escapes and inserted strings never become syntax or normalize" {
+    const c = try arrayTestProgram(
+        \\let main: () -> void = {
+        \\    let n: int = -7
+        \\    let raw = "\{n\}"
+        \\    let composed = "é"
+        \\    let decomposed = "e\u{301}"
+        \\    @println("\x7braw\u{7d}\{{n}\}\\{n}:{raw}", "{composed}" == "{decomposed}")
+        \\}
+    );
+    defer test_gpa.free(c);
+    try compileAndRunExpected(c, "typedef int nonempty_translation_unit;", 0, "{raw}{-7}\\-7:{n} false\n", "");
+}
+
+test "interpolation allocations panic on exhaustion while bool and string sharing allocate nothing" {
+    for ([_]struct { source: []const u8, output: []const u8 = "", allocates: bool = true }{
+        .{ .source = "let main: () -> void = {let n: int = 1\n@println(\"{n}\")}" },
+        .{ .source = "let main: () -> void = {let b = true\n@println(\"value={b}\")}" },
+        .{ .source = "let main: () -> void = {let s = \"é\\0\"\n@println(\"{s}\", \"{false}\")}", .output = "é\x00 false\n", .allocates = false },
+    }) |case| {
+        const c = try arrayTestProgram(case.source);
+        defer test_gpa.free(c);
+        const exhausted = try std.mem.concat(test_gpa, u8, &.{
+            "#include <stdlib.h>\nstatic void *test_malloc(size_t n) { (void)n; return NULL; }\n#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n",
+            c,
+        });
+        defer test_gpa.free(exhausted);
+        for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(exhausted, "typedef int nonempty_translation_unit;", if (case.allocates) 1 else 0, case.output, if (case.allocates) "panic: GC allocation failed\n" else "", mode);
+    }
+}
+
+test "interpolation without printing needs only demanded conversion helpers" {
+    const library = try emitSource("let b: (n: bool) -> string = \"{n}\"\nlet s: (text: string) -> string = \"{text}\"\nlet i: (n: int) -> bool = \"{n}\" == \"-42\"", null);
+    defer test_gpa.free(library);
+    try std.testing.expect(std.mem.indexOf(u8, library, "nov_rt_init_stdout") == null);
+    const combined = try std.mem.concat(test_gpa, u8, &.{
+        library,
+        "\nint main(void) {\n" ++
+            "nov_string a = nov_b(true), b = nov_b(false);\n" ++
+            "nov_string input = {NULL, (const unsigned char *)\"a\\0b\", 3};\n" ++
+            "nov_string shared = nov_s(input);\n" ++
+            "nov_string allocated = nov_string_concat(input, input);\n" ++
+            "nov_string alias = nov_s(allocated);\n" ++
+            "if (alias.owner != allocated.owner || alias.data != allocated.data || alias.len != allocated.len) return 2;\n" ++
+            "if (a.len != 4 || b.len != 5 || shared.data != input.data || shared.owner != input.owner || !nov_i(-42) || nov_i(42)) return 1;\n" ++
+            "nov_gc_shutdown(&nov_rt_heap); return 0; }",
+    });
+    defer test_gpa.free(combined);
+    try compileAndRun(combined, "typedef int nonempty_translation_unit;");
+    for ([_][]const u8{ "let f: (n: bool) -> string = \"{n}\"", "let f: (s: string) -> string = \"{s}\"" }) |source| {
+        const c = try emitSource(source, null);
+        defer test_gpa.free(c);
+        try std.testing.expect(std.mem.indexOf(u8, c, "nov_to_string_") == null);
+        try std.testing.expect(std.mem.indexOf(u8, c, "nov_string_concat") == null);
+        try compileAndRun(c, "int main(void) {return 0;}");
+    }
+}
+
 const string_equality =
     \\let literal: string = "hé\0😀"
     \\let make: () -> string = "hé\0" + "😀"
@@ -1360,28 +1507,30 @@ test "string callback signatures need declarations but not a managed runtime" {
 test "generated string programs compile for Windows with binary UTF8 output" {
     const zig_exe = std.testing.environ.getAlloc(test_gpa, "NOV_TEST_ZIG") catch try test_gpa.dupe(u8, "zig");
     defer test_gpa.free(zig_exe);
-    var module = try Module.init(test_gpa, "windows.nov", string_example);
-    defer module.deinit();
-    var sema = try Lowering.lower(&module);
-    defer sema.deinit();
-    const program = try emitProgram(test_gpa, &sema.ir, null);
-    defer test_gpa.free(program);
-    try std.testing.expect(std.mem.indexOf(u8, program, "_setmode(_fileno(stdout), _O_BINARY)") != null);
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "strings.c", .data = program });
-    const compiled = try std.process.run(test_gpa, std.testing.io, .{
-        .argv = &.{ zig_exe, "cc", "-target", "x86_64-windows-gnu", "-std=c11", "-Wall", "-Wextra", "-Wpedantic", "-Werror", "-c", "strings.c", "-o", "strings.o" },
-        .cwd = .{ .dir = tmp.dir },
-    });
-    defer test_gpa.free(compiled.stdout);
-    defer test_gpa.free(compiled.stderr);
-    try expectSuccess(compiled, "Windows string C compilation");
+    for ([_][]const u8{ string_example, string_interpolation }) |source| {
+        var module = try Module.init(test_gpa, "windows.nov", source);
+        defer module.deinit();
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        const program = try emitProgram(test_gpa, &sema.ir, null);
+        defer test_gpa.free(program);
+        try std.testing.expect(std.mem.indexOf(u8, program, "_setmode(_fileno(stdout), _O_BINARY)") != null);
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "strings.c", .data = program });
+        const compiled = try std.process.run(test_gpa, std.testing.io, .{
+            .argv = &.{ zig_exe, "cc", "-target", "x86_64-windows-gnu", "-std=c11", "-Wall", "-Wextra", "-Wpedantic", "-Werror", "-c", "strings.c", "-o", "strings.o" },
+            .cwd = .{ .dir = tmp.dir },
+        });
+        defer test_gpa.free(compiled.stdout);
+        defer test_gpa.free(compiled.stderr);
+        try expectSuccess(compiled, "Windows string C compilation");
+    }
 }
 
 test "lowered strings emit after module and source storage are freed" {
     var sema = blk: {
-        var module = try Module.init(test_gpa, "source-free.nov", "let text: string = \"a\\0é\"\nlet main: () -> void = @println(text + \"!\", text == \"a\\0\" + \"é\")");
+        var module = try Module.init(test_gpa, "source-free.nov", "let text: string = \"a\\0é\"\nlet main: () -> void = {let n: int = -42\n@println(\"{text}!\", text == \"a\\0\" + \"é\", \"{n}\")}");
         defer module.deinit();
         break :blk try Lowering.lower(&module);
     };
@@ -1390,16 +1539,17 @@ test "lowered strings emit after module and source storage are freed" {
     try sema.ir.verify();
     const program = try emitProgram(test_gpa, &sema.ir, null);
     defer test_gpa.free(program);
-    try compileAndRunExpected(program, "typedef int nonempty_translation_unit;", 0, "a\x00é! true\n", "");
+    try compileAndRunExpected(program, "typedef int nonempty_translation_unit;", 0, "a\x00é! true -42\n", "");
 }
 
 test "string compiler ownership survives every allocation failure" {
-    for ([_][]const u8{ string_example, string_compound, string_equality }) |source| try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{source});
+    for ([_][]const u8{ string_example, string_compound, string_equality, string_interpolation }) |source| try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{source});
 }
 
 test "string length overflow panics before touching invalid backing in both modes" {
     for ([_][]const u8{
         "let f: (a: string, b: string) -> string = a + b",
+        "let f: (a: string, b: string) -> string = \"{a}{b}\"",
         "let f: (a: string, b: string) -> string = {let mut s = a\ns += b\ns}",
     }) |source| {
         const library = try emitSource(source, null);
@@ -1700,7 +1850,7 @@ test "array capacity and append length overflow panic before accessing backing" 
 }
 
 test "array allocation failure retries preserve roots and shutdown frees backing" {
-    for ([_][]const u8{ array_example, array_compound_effects, inferred_example, inferred_arrays, string_example, string_compound, string_equality, unconditional_loops, else_loops, array_membership }, [_][]const u8{ "3 30 30 6\n454 15\n99 15 4\nfalse true 2\n0\n", array_compound_output, inferred_output, inferred_arrays_output, string_output, string_compound_output, string_equality_output, unconditional_output, else_loop_output, array_membership_output }) |source, output| {
+    for ([_][]const u8{ array_example, array_compound_effects, inferred_example, inferred_arrays, string_example, string_compound, string_equality, unconditional_loops, else_loops, array_membership, string_interpolation }, [_][]const u8{ "3 30 30 6\n454 15\n99 15 4\nfalse true 2\n0\n", array_compound_output, inferred_output, inferred_arrays_output, string_output, string_compound_output, string_equality_output, unconditional_output, else_loop_output, array_membership_output, string_interpolation_output }) |source, output| {
         const c = try arrayTestProgram(source);
         defer test_gpa.free(c);
         const injected = try std.mem.concat(test_gpa, u8, &.{

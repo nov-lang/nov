@@ -1,6 +1,6 @@
 // Originally based on https://github.com/ziglang/zig/blob/master/lib/std/zig/string_literal.zig
 // See https://github.com/ziglang/zig/blob/master/LICENSE for additional LICENSE details
-// TODO: add string interpolation support with ${} syntax
+// Identifier interpolation is checked/lowered from the original token by BodyChecker.
 // TODO: treat characters as a whole new type instead of string?
 
 const std = @import("std");

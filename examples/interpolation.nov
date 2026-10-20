@@ -1,0 +1,19 @@
+; Identifier-only interpolation; no expressions, calls or format options.
+let fizz: (n: int) -> string = match n % 3, n % 5 {
+    0, 0 => "FizzBuzz"
+    0, _ => "Fizz"
+    _, 0 => "Buzz"
+    _ => "{n}"
+}
+
+let main: () -> void = {
+    let mut n: int = 1
+    loop n <= 15 : n += 1 {
+        let text = fizz(n)
+        @println("{n}: {text}")
+    }
+    let yes = true
+    let text = "é\0😀"
+    let shared = "{text}"
+    @println("\{literal\}: {yes}: {shared}", shared.len)
+}

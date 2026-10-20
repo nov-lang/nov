@@ -167,8 +167,8 @@ let main: () -> void = @println(true, answer())
 This outputs `true -42` followed by a newline. Bare integer literals such as
 `@println(42)` still require a type context: use a typed global, local, parameter, or
 function result. Native aliases do not introduce bare-literal inference defaults.
-Interpolation, function values and void arguments remain unsupported for
-printing; the C backend
+Interpolated strings can be printed like any string; function values and void
+arguments remain unsupported for printing. The C backend
 continues to reject widths other than 8/16/32/64.
 
 A runnable arithmetic example is [`examples/checkout.nov`](examples/checkout.nov):
@@ -973,7 +973,8 @@ String patterns compare exact UTF-8 bytes, including NUL. Each prong has private
 local scope; continuing results have one exact, bidirectionally inferred or
 contextual type. Return/break/continue paths do not contribute merge values.
 Array/function subjects, enums, captures, range/destructuring/computed patterns,
-and general exhaustiveness remain unsupported. Interpolation is still deferred.
+and general exhaustiveness remain unsupported. Identifier interpolation works in
+branch results, including the FizzBuzz fallback `"{n}"`.
 The following broader syntax remains a design example, **not executable in full**:
 
 ```nov
@@ -1312,15 +1313,15 @@ is false, while `"é" == "\u{e9}"` is true. A return, break or continue in an
 operand skips the remaining comparison without undoing earlier effects.
 
 Ordering (`<`, `<=`, `>`, `>=`), other operators (including `-=`, `*=`, `/=` and
-`%=`), indexing, slicing, interpolation and Unicode operations remain deferred.
+`%=`), indexing, slicing and Unicode operations remain deferred.
 Arrays remain bool/integer-only: `[]string` and nested arrays are rejected.
 
 `.len` is the byte length as native `uint`, not a character or grapheme count.
 `"é".len` is 2 and `"😀".len` is 4. Literals use the existing escapes (`\n`, `\r`,
 `\t`, `\\`, `\"`, `\'`, `\0`, `\xNN`, `\u{...}`, `\{`, `\}`). Decoded bytes
 must be valid UTF-8; NUL is valid, including through `\x00` or `\u{0}`. Invalid
-escapes/UTF-8 report source locations. Unescaped braces are reserved for deferred
-interpolation and rejected; use `\{` and `\}` for literal braces.
+escapes/UTF-8 report source locations. Unescaped `{identifier}` interpolates a
+value; use `\{` and `\}` for literal braces. Other brace forms are rejected.
 
 `@print`/`@println` write exact UTF-8 bytes with explicit lengths, including embedded
 NUL, with the same spaces, buffering, checked writes/final flush and panic behavior
@@ -1328,7 +1329,8 @@ as scalars. Windows stdout is switched to binary mode on the first print to avoi
 newline translation; this is UTF-8 byte output, not UTF-16 console conversion.
 Literal-only immutable globals with explicit `string` annotations are supported
 without eager initialization calls; inferred/mutable globals and global concatenation
-or calls remain unsupported.
+or calls remain unsupported. Global interpolation is also rejected as nonliteral;
+move it into a function.
 
 ```nov
 let prefix: string = "Hello"
@@ -1350,7 +1352,37 @@ never static byte pointers. Temporaries use the same precise root frames as arra
 
 ## String Interpolation
 
-Deferred. No interpolation syntax or formatting-option semantics are implemented.
+`"{identifier}"` evaluates an identifier in the current lexical scope and produces
+an immutable `string`. Placeholders support `bool` (`true`/`false`), signed and
+unsigned fixed-width integers (`i8`/`u8` through `i64`/`u64`), native `int`/`uint`
+(exact decimal, including minimum/maximum values), and strings (unchanged bytes).
+No numeric defaults, widening or implicit fallback formatting are introduced.
+
+```nov
+let describe: (n: int, ready: bool) -> string = "n={n}, ready={ready}"
+```
+
+Placeholders are ordinary unquoted identifiers only (`[A-Za-z_][A-Za-z0-9_]*`).
+They resolve existing locals, parameters and supported literal globals; builtin
+`true`/`false` also work. Existing no-shadowing and declaration-before-use rules
+apply. Expressions, calls, fields, quoted identifiers, captures and format options
+such as `"{n:02}"` are not supported. Malformed/unescaped braces diagnose rather
+than silently printing text. Escaped braces and braces produced by `\xNN` or
+`\u{...}` remain literal, and inserted strings are never reinterpreted.
+
+Chunks and placeholders evaluate once, left to right. UTF-8 bytes and embedded NUL
+are preserved, with no Unicode normalization. String placeholders share storage;
+integer conversions and concatenations allocate rooted GC backing. Concatenation
+checks length overflow; allocation failure panics. This minimal implementation uses
+successive concatenations (potentially quadratic copied bytes for many chunks),
+not an optimized string builder. Interpolation works independently of printing,
+including equality, `.len`, branch results and returns; globals still require
+literal initializers, not interpolation or eager evaluation.
+
+The formatter preserves the single literal token, including its chunks, escapes
+and placeholders. See [`examples/interpolation.nov`](examples/interpolation.nov)
+for a runnable FizzBuzz match with a conditional loop; range/iterator syntax in
+`examples/fizzbuzz.nov` remains deferred.
 
 ## Concurrency
 TODO
@@ -1361,7 +1393,7 @@ TODO
 - `@TypeOf(...)`: Returns the type of a value.
 - `@typeInfo(...)`: Returns type information about a value.
 - `@This()`: Returns the type of the current container
-- `@print(...)`: Output bool/fixed-width integer args separated with a space to stdout; returns void. Strings/interpolation are not implemented yet.
+- `@print(...)`: Output bool, fixed/native integer and string args separated with a space to stdout; returns void. Interpolated strings work like other strings.
 - `@println(...)`: Same as print with a newline at the end, including with no args.
 - `@fprint(file: File, ...)`: Same as print but output to a specific file. Returns a Result<>.
 <!-- - `@eprint(...)`: Same as print but output to stderr. -->

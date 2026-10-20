@@ -515,6 +515,10 @@ test "array formatting survives every allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, testArrayAllocationFailures, .{});
 }
 
+test "interpolation formatting preserves literal chunks escapes and placeholders" {
+    try expectFormatted("let f:(n:int,s:string)->string=\"é\\{\\}\\0{n}:{s}😀\"", "let f: (n: int, s: string) -> string = \"é\\{\\}\\0{n}:{s}😀\"\n");
+}
+
 test "conditional loop exhaustion formatting preserves tokens comments and structure" {
     try expectFormatted("let x=loop false{}else{true}", "let x = loop false {} else {\n    true\n}\n");
     for ([_][:0]const u8{

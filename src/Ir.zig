@@ -32,6 +32,8 @@ pub const Instruction = struct { ty: TypeId, span: Span, op: Operation };
 pub const UnaryOp = enum { negate, bit_not, bool_not };
 pub const BinaryOp = enum { add, sub, mul, div, mod, eq, ne, lt, le, gt, ge };
 pub const Operation = union(enum) {
+    /// Decimal integers, true/false booleans, or a shared immutable string.
+    to_string: ValueId,
     array_literal: []const ValueId,
     /// Independent scalar element storage; every value boundary is explicit.
     array_clone: ValueId,
@@ -481,6 +483,11 @@ fn validateBody(self: *const Ir, function: Function, body: Body) VerifyError!voi
             if (i + 1 != region_end or @intFromEnum(result) != i) return error.UnreachableInstruction;
         }
         switch (instruction.op) {
+            .to_string => |value| {
+                if (ty != .string) return error.InvalidOperation;
+                const operand = self.getType(try operandType(body, value, i)).?;
+                if (operand != .boolean and operand != .integer and operand != .string) return error.InvalidOperation;
+            },
             .array_literal => |elements| {
                 if (ty != .array) return error.InvalidOperation;
                 for (elements) |element| {
@@ -867,6 +874,54 @@ test "scalar array types operations and owned operands are verified" {
         defer owned[case.index] = saved;
         try std.testing.expectError(case.err, ir.verify());
     }
+}
+
+test "to_string verifies scalar prior operands result types spans and slot isolation" {
+    const make = TestFunctions.instruction;
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    ir.source_len = 1;
+    const boolean = try ir.internType(.boolean);
+    const integer = try ir.internType(.{ .integer = .{ .signedness = .signed, .bits = 64 } });
+    const string = try ir.internType(.string);
+    const array = try ir.internType(.{ .array = integer });
+    const unit = try ir.internType(.void);
+    const signature = try ir.internType(.{ .function = .{ .params = &.{ integer, boolean, string, array }, .result = string } });
+    const function = try ir.addFunction("format", signature, .{ .start = 0, .end = 1 });
+    const body = [_]Instruction{
+        make(integer, .{ .parameter = 0 }),
+        make(boolean, .{ .parameter = 1 }),
+        make(string, .{ .parameter = 2 }),
+        make(array, .{ .parameter = 3 }),
+        make(signature, .{ .function_ref = function }),
+        make(unit, .{ .constant = try ir.internConstant(.{ .ty = unit, .value = .void }) }),
+        make(integer, .{ .local_slot = @enumFromInt(0) }),
+        make(string, .{ .to_string = @enumFromInt(0) }),
+        make(string, .{ .to_string = @enumFromInt(1) }),
+        make(string, .{ .to_string = @enumFromInt(2) }),
+    };
+    try ir.setFunctionBody(function, &body, @enumFromInt(9));
+    try ir.verify();
+    const owned = @constCast(ir.functions.items[0].body.?.instructions);
+    for ([_]struct { value: u32, err: VerifyError }{
+        .{ .value = 3, .err = error.InvalidOperation },
+        .{ .value = 4, .err = error.InvalidOperation },
+        .{ .value = 5, .err = error.InvalidOperation },
+        .{ .value = 6, .err = error.InvalidValueId },
+        .{ .value = 9, .err = error.InvalidValueId },
+        .{ .value = 99, .err = error.InvalidValueId },
+    }) |case| {
+        owned[9].op.to_string = @enumFromInt(case.value);
+        try std.testing.expectError(case.err, ir.verify());
+    }
+    owned[9] = body[9];
+    owned[9].ty = integer;
+    try std.testing.expectError(error.InvalidOperation, ir.verify());
+    owned[9] = body[9];
+    owned[9].span.end = 2;
+    try std.testing.expectError(error.InvalidSourceSpan, ir.verify());
+    owned[9] = body[9];
+    try ir.verify();
 }
 
 test "membership verifies exact prior values result spans and slot isolation" {

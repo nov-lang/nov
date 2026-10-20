@@ -72,11 +72,77 @@ fn testRejectedMatchAllocations(allocator: std.mem.Allocator, source: []const u8
 
 test "rejected matches and pipes roll back diagnostics on allocation failure" {
     for ([_][]const u8{
+        "let f: (n: int) -> string = \"{missing}\"",
+        "let f: (n: int) -> string = \"{n:02}\"",
+        "let f: (n: int) -> string = \"{n}\\xFF\"",
+        "let f: (n: []int) -> string = \"{n}\"",
         "let f: (n: int) -> int = match n {capture => 1\n_ => 2}",
         "let f: (n: int) -> int = match n {0 => 1}",
         "let f: (n: int) -> int = match n {0 => {let private: int = 1\nprivate}\n_ => true}",
         "let f: (n: int) -> int = n\nlet main: () = true |> f |> @println",
     }) |source| try std.testing.checkAllAllocationFailures(std.testing.allocator, testRejectedMatchAllocations, .{source});
+}
+
+test "interpolation chunks and ordered conversions own storage after source release" {
+    var module = try Module.init(std.testing.allocator, "interpolation.nov", "let f: (n: int, s: string) -> string = \"é\\0{n}:{s}/{n}😀\"");
+    var sema = lower(&module) catch |err| {
+        module.deinit();
+        return err;
+    };
+    defer sema.deinit();
+    const failed = module.hasErrors();
+    module.deinit();
+    try std.testing.expect(!failed);
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+    var conversions: usize = 0;
+    var chunks: usize = 0;
+    for (sema.ir.functions.items[0].body.?.instructions, 0..) |instruction, i| {
+        if (instruction.op == .to_string) {
+            try std.testing.expect(@intFromEnum(instruction.op.to_string) < i);
+            conversions += 1;
+        }
+        if (instruction.op == .constant) {
+            const bytes = sema.ir.getConstant(instruction.op.constant).?.value.string;
+            try std.testing.expect(std.mem.eql(u8, bytes, "é\x00") or std.mem.eql(u8, bytes, ":") or std.mem.eql(u8, bytes, "/") or std.mem.eql(u8, bytes, "😀"));
+            chunks += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 3), conversions);
+    try std.testing.expectEqual(@as(usize, 4), chunks);
+}
+
+test "interpolation conversions cannot reference sibling private match values" {
+    var module = try Module.init(std.testing.allocator, "private-interpolation.nov", "let f: (n: int) -> string = match n {0 => \"{n}\"\n_ => \"{n}\"}");
+    defer module.deinit();
+    var sema = try lower(&module);
+    defer sema.deinit();
+    try std.testing.expect(sema.lowering_complete);
+    const body = sema.ir.functions.items[0].body.?;
+    var first: ?Ir.ValueId = null;
+    for (@constCast(body.instructions), 0..) |*instruction, i| {
+        if (instruction.op != .to_string) continue;
+        if (first) |sibling| {
+            const saved = instruction.op.to_string;
+            instruction.op.to_string = sibling;
+            try std.testing.expectError(error.InvalidValueId, sema.ir.verify());
+            instruction.op.to_string = saved;
+        } else first = @enumFromInt(i);
+    }
+    try std.testing.expect(first != null);
+    try sema.ir.verify();
+}
+
+test "interpolation globals remain unsupported nonliteral initializers" {
+    for ([_][]const u8{ "let n: int = 1\nlet text: string = \"{n}\"", "let text: string = {\"{true}\"}" }) |source| {
+        var module = try Module.init(std.testing.allocator, "global.nov", source);
+        defer module.deinit();
+        var sema = try lower(&module);
+        defer sema.deinit();
+        try std.testing.expect(!sema.lowering_complete);
+        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+        try std.testing.expectEqual(Module.Diagnostic.Tag.unsupported_global_interpolation, module.diagnostics.items[0].tag);
+    }
 }
 
 test "match reuses branch verification for sibling privacy and terminal metadata" {

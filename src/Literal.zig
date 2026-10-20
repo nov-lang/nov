@@ -64,6 +64,7 @@ pub fn check(module: *Module, ir: *Ir, node: Ast.Node.Index, expected: Ir.TypeId
                     },
                     .success => {},
                 }
+                if (hasInterpolation(bytes)) return .not_literal;
                 if (stringIssue(bytes, decoded.written())) |issue| {
                     const start = span.start + @as(u32, @intCast(issue.offset));
                     return failLiteral(module, issue.tag, .{ .start = start, .end = start + 1 }, null);
@@ -76,9 +77,24 @@ pub fn check(module: *Module, ir: *Ir, node: Ast.Node.Index, expected: Ir.TypeId
     }
 }
 
+pub fn hasInterpolation(bytes: []const u8) bool {
+    var offset: usize = 1;
+    while (offset < bytes.len - 1) {
+        if (bytes[offset] == '{') return true;
+        if (bytes[offset] == '\\') {
+            switch (@import("string_literal.zig").parseEscapeSequence(bytes, &offset)) {
+                .success => {},
+                .failure => return false,
+            }
+        } else offset += 1;
+    }
+    return false;
+}
+
 // Map decoded-byte failures back to the escape/raw source byte that produced
 // them. Decoding itself stays in the shared parser, including hex byte escapes.
-fn stringIssue(source: []const u8, decoded: []const u8) ?struct { offset: usize, tag: Module.Diagnostic.Tag } {
+pub const StringIssue = struct { offset: usize, tag: Module.Diagnostic.Tag };
+pub fn stringIssue(source: []const u8, decoded: []const u8) ?StringIssue {
     var invalid: usize = decoded.len;
     var i: usize = 0;
     while (i < decoded.len) {
@@ -100,7 +116,7 @@ fn stringIssue(source: []const u8, decoded: []const u8) ?struct { offset: usize,
     var output: usize = 0;
     while (offset < source.len - 1) {
         const start = offset;
-        if (source[offset] == '{' or source[offset] == '}') return .{ .offset = offset, .tag = .unsupported_literal };
+        if (source[offset] == '{' or source[offset] == '}') return .{ .offset = offset, .tag = .invalid_interpolation };
         if (source[offset] == '\\') {
             const unicode = source[offset + 1] == 'u';
             const point = @import("string_literal.zig").parseEscapeSequence(source, &offset).success;
@@ -190,7 +206,7 @@ test "string decoding owns canonical UTF8 bytes independently of source" {
     try ir.verify();
 }
 
-test "strings diagnose invalid escapes UTF8 and deferred interpolation at source bytes" {
+test "strings diagnose invalid escapes and UTF8 at source bytes" {
     const Case = struct { source: []const u8, offset: usize, tag: Module.Diagnostic.Tag = .invalid_literal };
     for ([_]Case{
         .{ .source = "\"a\\q\"", .offset = 3 },
@@ -199,8 +215,6 @@ test "strings diagnose invalid escapes UTF8 and deferred interpolation at source
         .{ .source = "\"a\\xC0\\x80\"", .offset = 2 },
         .{ .source = "\"a\xff\"", .offset = 2 },
         .{ .source = "\"a\\u{D800}\"", .offset = 4 },
-        .{ .source = "\"a{value}\"", .offset = 2, .tag = .unsupported_literal },
-        .{ .source = "\"a${value}\"", .offset = 3, .tag = .unsupported_literal },
     }) |case| {
         const source = try std.mem.concat(std.testing.allocator, u8, &.{ "let x = ", case.source });
         defer std.testing.allocator.free(source);
@@ -373,7 +387,7 @@ fn testStringAllocationFailures(allocator: std.mem.Allocator) !void {
     const string = try ir.internType(.string);
     for (0..module.declarations.items.len) |i| _ = try check(&module, &ir, testNode(&module, i), string, null);
     try std.testing.expectEqual(@as(usize, 1), ir.constants.items.len);
-    try std.testing.expectEqual(@as(usize, 3), module.diagnostics.items.len);
+    try std.testing.expectEqual(@as(usize, 2), module.diagnostics.items.len);
     try ir.verify();
 }
 

@@ -87,7 +87,18 @@ pub fn getEntry(self: *const Sema, id: Module.DeclId) ?Entry {
 
 fn checkLiteral(self: *Sema, module: *Module, index: usize, initializer: Ast.Node.Index, annotation: Module.Span) Error!void {
     switch (try Literal.check(module, &self.ir, initializer, self.entries[index].type_id.?, annotation)) {
-        .not_literal => {},
+        .not_literal => {
+            var node = initializer;
+            var buffer: [2]Ast.Node.Index = undefined;
+            while (module.ast.fullBlock(&buffer, node)) |block| {
+                if (module.ast.firstToken(node) != block.ast.lbrace or block.ast.statements.len != 1) break;
+                node = block.ast.statements[0];
+            }
+            if (module.ast.nodes.items(.tag)[node] == .string_literal and Literal.hasInterpolation(module.ast.tokenSlice(module.ast.nodes.items(.main_token)[node]))) {
+                try module.diagnostics.append(module.allocator, .{ .tag = .unsupported_global_interpolation, .span = module.tokenSpan(module.ast.nodes.items(.main_token)[node]) });
+                self.entries[index].status = .failed;
+            }
+        },
         .failed => self.entries[index].status = .failed,
         .constant => |constant| {
             self.entries[index].constant = constant;
