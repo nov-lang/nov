@@ -5,7 +5,9 @@ const Tokenizer = @import("Tokenizer.zig");
 
 /// Supports scalar declarations/operators plus function signatures, calls,
 /// local blocks, if/else, condition loops, returns, unlabeled loop controls,
-/// and direct identifier assignments. Preserves line/doc comments and tokens.
+/// direct identifier assignments, scalar array types/literals/indexing/.len,
+/// and plain indexed assignments to direct identifiers. Formatting is syntactic,
+/// not a scope, mutability, or type check. Preserves line/doc comments and tokens.
 /// All other AST tags and quoted identifiers/BOMs/shebangs are unsupported.
 /// Parse errors return InvalidSource; unsupported or unpreservable output
 /// returns UnsupportedSyntax. Allocation failures propagate as OutOfMemory.
@@ -66,6 +68,13 @@ fn checkSupported(ast: Ast) !void {
         .assign_mul,
         .assign_div,
         .assign_mod,
+        .array_type,
+        .array_init_two,
+        .array_init_two_comma,
+        .array_init,
+        .array_init_comma,
+        .array_access,
+        .field_access,
         .identifier,
         .number_literal,
         .char_literal,
@@ -97,6 +106,27 @@ fn checkSupported(ast: Ast) !void {
     };
     for (ast.nodes.items(.tag), ast.nodes.items(.data), ast.nodes.items(.main_token)) |tag, data, main| {
         switch (tag) {
+            .array_type => {
+                if (ast.nodes.items(.tag)[data.rhs] != .identifier) return error.UnsupportedSyntax;
+                const name = ast.tokenSlice(ast.nodes.items(.main_token)[data.rhs]);
+                const scalar_types = [_][]const u8{ "bool", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "int", "uint" };
+                for (scalar_types) |scalar| {
+                    if (std.mem.eql(u8, name, scalar)) break;
+                } else return error.UnsupportedSyntax;
+            },
+            .array_init_two, .array_init_two_comma, .array_init, .array_init_comma => {
+                const buffer = [_]Ast.Node.Index{ data.lhs, data.rhs };
+                const items = switch (tag) {
+                    .array_init_two, .array_init_two_comma => buffer[0..@as(usize, if (data.rhs != 0) 2 else if (data.lhs != 0) 1 else 0)],
+                    else => ast.extra_data[data.lhs..data.rhs],
+                };
+                for (items) |item| switch (ast.nodes.items(.tag)[item]) {
+                    .array_init_two, .array_init_two_comma, .array_init, .array_init_comma => return error.UnsupportedSyntax,
+                    else => {},
+                };
+            },
+            .array_access => if (ast.nodes.items(.tag)[data.lhs] == .array_access) return error.UnsupportedSyntax,
+            .field_access => if (!std.mem.eql(u8, ast.tokenSlice(data.rhs), "len")) return error.UnsupportedSyntax,
             .builtin_literal => {
                 const name = ast.tokenSlice(main);
                 if (!std.mem.eql(u8, name, "@print") and !std.mem.eql(u8, name, "@println"))
@@ -109,7 +139,11 @@ fn checkSupported(ast: Ast) !void {
                     return error.UnsupportedSyntax;
             },
             .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod => {
-                if (ast.nodes.items(.tag)[data.lhs] != .identifier) return error.UnsupportedSyntax;
+                const lhs_tag = ast.nodes.items(.tag)[data.lhs];
+                if (lhs_tag == .identifier) continue;
+                if (tag != .assign or lhs_tag != .array_access or
+                    ast.nodes.items(.tag)[ast.nodes.items(.data)[data.lhs].lhs] != .identifier)
+                    return error.UnsupportedSyntax;
             },
             else => {},
         }
@@ -131,7 +165,8 @@ fn sameStructure(a: Ast, b: Ast) bool {
         switch (tag) {
             .identifier, .number_literal, .char_literal, .string_literal, .builtin_literal => {},
             // The parser leaves unused node data undefined; never read it.
-            .negation, .bool_not, .bit_not, .@"return" => if (x.rhs != y.rhs) return false,
+            .negation, .bool_not, .bit_not, .@"return", .array_type => if (x.rhs != y.rhs) return false,
+            .field_access => if (x.lhs != y.lhs or !std.mem.eql(u8, a.tokenSlice(x.rhs), b.tokenSlice(y.rhs))) return false,
             .@"continue" => if ((x.lhs == 0) != (y.lhs == 0)) return false,
             else => if (x.lhs != y.lhs or x.rhs != y.rhs) return false,
         }
@@ -247,15 +282,23 @@ test "unsupported syntax fails closed including nested expressions" {
         "let x=@import(\"memory\")\n",
         "let x=call({&value})\n",
         "let x=a.b\n",
-        "let x=[1, 2]\n",
+        "let x=[[1], [2]]\n",
+        "let x:[][]int\n",
+        "let x:[]string\n",
+        "let x:[]*int\n",
+        "let x:[]() -> int\n",
+        "let x=a[0][1]\n",
+        "let x=a[0..1]\n",
+        "let f:()->void={a.len=1}\n",
+        "let f:()->void={a[0]+=1}\n",
+        "let f:()->void={make()[0]=1}\n",
         "let x=#true\n",
         "@[test]\nlet x=1\n",
         "let f: () -> void = loop true {break 1}\n",
         "let f: () -> void = loop true {continue :outer}\n",
         "let f: () -> void = outer: {}\n",
         "let x=&value\n",
-        "let x:[]i32\n",
-        "let x=a[0]\n",
+
         "let x=.value\n",
         "let x=a |> b\n",
         "let @\"x\"=1\n",
@@ -286,15 +329,16 @@ test "executable local blocks round trip" {
 
 test "every unsupported AST tag is rejected before rendering" {
     const supported = [_]Ast.Node.Tag{
-        .root,           .decl,            .identifier,   .number_literal,   .char_literal,      .string_literal,
-        .add,            .sub,             .mul,          .div,              .mod,               .shl,
-        .shr,            .bit_and,         .bit_or,       .bit_xor,          .equal_equal,       .bang_equal,
-        .less_than,      .less_or_equal,   .greater_than, .greater_or_equal, .bool_and,          .bool_or,
-        .negation,       .bool_not,        .bit_not,      .fn_proto_one,     .fn_proto,          .call_one,
-        .call_one_comma, .call,            .call_comma,   .block_two,        .block_two_newline, .block,
-        .block_newline,  .@"if",           .if_else,      .loop_condition,   .@"return",         .@"break",
-        .@"continue",    .assign,          .assign_add,   .assign_sub,       .assign_mul,        .assign_div,
-        .assign_mod,     .builtin_literal,
+        .root,             .decl,            .identifier,   .number_literal,   .char_literal,         .string_literal,
+        .add,              .sub,             .mul,          .div,              .mod,                  .shl,
+        .shr,              .bit_and,         .bit_or,       .bit_xor,          .equal_equal,          .bang_equal,
+        .less_than,        .less_or_equal,   .greater_than, .greater_or_equal, .bool_and,             .bool_or,
+        .negation,         .bool_not,        .bit_not,      .fn_proto_one,     .fn_proto,             .call_one,
+        .call_one_comma,   .call,            .call_comma,   .block_two,        .block_two_newline,    .block,
+        .block_newline,    .@"if",           .if_else,      .loop_condition,   .@"return",            .@"break",
+        .@"continue",      .assign,          .assign_add,   .assign_sub,       .assign_mul,           .assign_div,
+        .assign_mod,       .builtin_literal, .array_type,   .array_init_two,   .array_init_two_comma, .array_init,
+        .array_init_comma, .array_access,    .field_access,
     };
     var ast = try Parser.parse(std.testing.allocator, "let x=1\n");
     defer ast.deinit(std.testing.allocator);
@@ -306,7 +350,9 @@ test "every unsupported AST tag is rejected before rendering" {
             // This synthetic leaf has no valid child/label data for these tags.
             if (tag == .builtin_literal or tag == .@"break" or tag == .@"continue" or tag == .assign or
                 tag == .assign_add or tag == .assign_sub or tag == .assign_mul or
-                tag == .assign_div or tag == .assign_mod) continue;
+                tag == .assign_div or tag == .assign_mod or tag == .array_type or
+                tag == .array_init_two or tag == .array_init_two_comma or tag == .array_init or
+                tag == .array_init_comma or tag == .array_access or tag == .field_access) continue;
             try checkSupported(ast);
         } else {
             try std.testing.expectError(error.UnsupportedSyntax, checkSupported(ast));
@@ -368,6 +414,49 @@ fn testExecutableAllocationFailures(allocator: std.mem.Allocator) !void {
 
 test "executable formatting survives allocation failures" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, testExecutableAllocationFailures, .{});
+}
+
+test "scalar arrays render types literals indexing length and direct stores" {
+    try expectFormatted("let f:(a:[]int)->[]bool={let mut b:[]bool=[true,false,]\nb[-1]=!a[0] == 0\nb += []\nreturn b}\n", "let f: (a: []int) -> []bool = {\n    let mut b: []bool = [true, false,]\n    b[-1] = !a[0] == 0\n    b += []\n    return b\n}\n");
+    try expectFormatted("let x:[]int=[]\nlet y=[1,2,3,]\nlet n=make()[0] + -a[-1] * a.len\n", "let x: []int = []\nlet y = [1, 2, 3,]\nlet n = make()[0] + -a[-1] * a.len\n");
+    for ([_][]const u8{ "bool", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "int", "uint" }) |name| {
+        const source = try std.fmt.allocPrintSentinel(std.testing.allocator, "let f:(a:[]{s})->[]{s}=a\n", .{ name, name }, 0);
+        defer std.testing.allocator.free(source);
+        const formatted = try format(std.testing.allocator, source);
+        defer std.testing.allocator.free(formatted);
+        try expectFormatted(source, formatted);
+    }
+}
+
+test "array comments continuations and expanding lists stabilize on the first pass" {
+    try expectFormatted("let x:[]int=[\n; empty\n]\n", "let x: []int = [\n    ; empty\n]\n");
+    try expectFormatted("let x=[{1}]\n", "let x = [\n    {\n        1\n    }\n]\n");
+    for ([_][:0]const u8{
+        "let f:(a:[]int)->int=a[\n -1]\n",
+        "let f:(a:[]int)->int=a[; index\n -1].len\n",
+        "let f:()->[]int=[\n1, ; first\n2 ; before comma\n,3, ; tail\n]\n",
+        "let f:()->[]int=[1 + ; operator\n 2,3]\n",
+        "let f:(a:[]int)->int=a[0 +\n 1]\n",
+        "let f:(a:[]int)->int=a[1 + {2}]\n",
+        "let f:(a:[]int)->int=a[{1}]\n",
+        "let f:(a:[]int)->int=a[0].len + -a[-1]\n",
+        "let f:()->void={let mut a:[]int= ; literal\n [1,2]\na[-1]= ; store\n 3\na += ; append\n []}\n",
+        "let f:()->void=call([1,{2}],[])\n",
+        "let f:()->[]int=[1,{let x:int=2\nx},3,]\n",
+    }) |source| {
+        const formatted = try format(std.testing.allocator, source);
+        defer std.testing.allocator.free(formatted);
+        try expectFormatted(source, formatted);
+    }
+}
+
+fn testArrayAllocationFailures(allocator: std.mem.Allocator) !void {
+    const output = try format(allocator, "let f:(a:[]int)->[]int={let mut b:[]int=[\n1, ; element\n{a[-1]},3,]\nb[0]=a.len\nb += []\nreturn b}\n");
+    defer allocator.free(output);
+}
+
+test "array formatting survives every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testArrayAllocationFailures, .{});
 }
 
 test "preservation checks detect code comment and structural loss" {

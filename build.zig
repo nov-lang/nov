@@ -179,6 +179,8 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         .{ .name = "emit rejects value break", .args = &.{ "emit-c", "value-break.nov" }, .exit_code = 1, .stderr_match = "labeled and value-carrying loop control are not supported" },
         .{ .name = "fmt condition loops detects changes", .args = &.{ "fmt", "--check", "loop-program.nov" }, .exit_code = 1, .stderr_match = "file is not formatted" },
         .{ .name = "fmt value break remains unsupported", .args = &.{ "fmt", "--check", "value-break.nov" }, .exit_code = 1, .stderr_match = "formatting this syntax is not supported yet; file unchanged" },
+        .{ .name = "fmt scalar arrays example", .args = &.{ "fmt", "--check", "scalar-arrays.nov" }, .exit_code = 0 },
+        .{ .name = "fmt rejects array length writes", .args = &.{ "fmt", "--check", "array-length-write.nov" }, .exit_code = 1, .stderr_match = "formatting this syntax is not supported yet; file unchanged" },
         .{ .name = "fmt executable example", .args = &.{ "fmt", "--check", "checkout.nov" }, .exit_code = 0 },
         .{ .name = "check semantic mutable locals", .args = &.{ "check", "--semantic", "mutable-program.nov" }, .exit_code = 0 },
         .{ .name = "emit rejects immutable assignment", .args = &.{ "emit-c", "immutable-assignment.nov" }, .exit_code = 1, .stderr_match = "immutable-assignment.nov:2:1: error: assignment requires a mutable local" },
@@ -241,7 +243,10 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         .{ .source = "let x=1", .check = true, .diagnostic = "<stdin>: error: input is not formatted", .code = 1 },
         .{ .source = "let x = 1\n", .check = true },
         .{ .source = "let x=", .diagnostic = "<stdin>:1:7: error:", .code = 1 },
-        .{ .source = "let x=[1]", .diagnostic = "<stdin>: error: formatting this syntax is not supported yet", .code = 1 },
+        .{ .source = "let x:[]int=[1]", .output = "let x: []int = [1]\n" },
+        .{ .source = "let x = [1]\n", .check = true },
+        .{ .source = "let x=[1]", .check = true, .diagnostic = "<stdin>: error: input is not formatted", .code = 1 },
+        .{ .source = "let x:[][]int=[[1]]", .diagnostic = "<stdin>: error: formatting this syntax is not supported yet", .code = 1 },
     };
     for (stdin_cases, 0..) |case, index| {
         const run = b.addRunArtifact(exe);

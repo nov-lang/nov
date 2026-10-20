@@ -742,8 +742,20 @@ const array_example =
 ;
 
 fn arrayTestProgram(source: []const u8) ![]u8 {
-    const library = try emitSource(source, null);
+    const terminated = try test_gpa.dupeZ(u8, source);
+    defer test_gpa.free(terminated);
+    const formatted = try @import("Formatter.zig").format(test_gpa, terminated);
+    defer test_gpa.free(formatted);
+    const formatted_z = try test_gpa.dupeZ(u8, formatted);
+    defer test_gpa.free(formatted_z);
+    const again = try @import("Formatter.zig").format(test_gpa, formatted_z);
+    defer test_gpa.free(again);
+    try std.testing.expectEqualStrings(formatted, again);
+    const original = try emitSource(source, null);
+    defer test_gpa.free(original);
+    const library = try emitSource(formatted, null);
     defer test_gpa.free(library);
+    try std.testing.expectEqualStrings(original, library);
     return std.mem.concat(test_gpa, u8, &.{
         library,
         "\nint main(void) { nov_rt_heap.collect_every_allocation = 1; nov_main(); " ++

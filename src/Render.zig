@@ -252,7 +252,9 @@ fn renderExpression(self: *Render, node: Ast.Node.Index, space: Space) RenderErr
         },
 
         .field_access => {
-            @panic("TODO");
+            try self.renderExpression(datas[node].lhs, .none);
+            try self.renderToken(main_tokens[node], .none);
+            return self.renderIdentifier(datas[node].rhs, space, .preserve_when_shadowing);
         },
 
         .range => {
@@ -334,7 +336,7 @@ fn renderExpression(self: *Render, node: Ast.Node.Index, space: Space) RenderErr
         .array_type => {
             try self.renderToken(main_tokens[node], .none); // [
             try self.renderToken(main_tokens[node] + 1, .none); // ]
-            return self.renderExpression(datas[node].lhs, space);
+            return self.renderExpression(datas[node].rhs, space);
         },
 
         .ref_type => {
@@ -350,7 +352,13 @@ fn renderExpression(self: *Render, node: Ast.Node.Index, space: Space) RenderErr
         .array_init,
         .array_init_comma,
         => {
-            @panic("TODO");
+            var buffer: [2]Ast.Node.Index = .{ datas[node].lhs, datas[node].rhs };
+            const items = switch (node_tags[node]) {
+                .array_init_two, .array_init_two_comma => buffer[0..@as(usize, if (buffer[1] != 0) 2 else if (buffer[0] != 0) 1 else 0)],
+                else => ast.extra_data[datas[node].lhs..datas[node].rhs],
+            };
+            try self.renderList(main_tokens[node], ast.lastToken(node), items, false);
+            return self.renderToken(ast.lastToken(node), space);
         },
 
         // TODO: struct_init
@@ -367,13 +375,15 @@ fn renderExpression(self: *Render, node: Ast.Node.Index, space: Space) RenderErr
         => {
             const suffix = datas[node];
             const lbracket = main_tokens[node];
-            const rbracket = ast.lastToken(suffix.rhs) + 1;
             try self.renderExpression(suffix.lhs, .none);
-            // try ais.pushIndent(.normal);
-            try self.renderToken(lbracket, .none); // [
+            // Unlike literal/call lists, the parser requires the closing index
+            // bracket immediately after the expression (no newline token).
+            const multiline = self.listIsMultiline(lbracket, ast.lastToken(node));
+            if (multiline) try ais.pushIndent(.normal);
+            defer if (multiline) ais.popIndent();
+            try self.renderToken(lbracket, if (multiline) .newline else .none);
             try self.renderExpression(suffix.rhs, .none);
-            // ais.popIndent();
-            return self.renderToken(rbracket, space); // ]
+            return self.renderToken(ast.lastToken(node), space); // ]
         },
 
         .deref,
@@ -504,15 +514,7 @@ fn renderList(self: *Render, open: Ast.TokenIndex, close: Ast.TokenIndex, items:
     const tags = ast.tokens.items(.tag);
     // Blocks expand even when originally compact. Expand their enclosing list
     // on the first pass as well, rather than changing layout on a second fmt.
-    const multiline = multiline: {
-        if (!ast.tokensOnSameLine(open, close)) break :multiline true;
-        var token = open + 1;
-        while (token < close) : (token += 1) {
-            if (tags[token] == .l_brace and tags[token + 1] != .r_brace)
-                break :multiline true;
-        }
-        break :multiline false;
-    };
+    const multiline = self.listIsMultiline(open, close);
     if (multiline) try self.ais.pushIndent(.normal);
     defer if (multiline) self.ais.popIndent();
     try self.renderToken(open, if (multiline) .newline else .none);
@@ -532,6 +534,16 @@ fn renderList(self: *Render, open: Ast.TokenIndex, close: Ast.TokenIndex, items:
             try self.renderToken(next, if (multiline) .newline else if (after == close) .none else .space);
         }
     }
+}
+
+fn listIsMultiline(self: *Render, open: Ast.TokenIndex, close: Ast.TokenIndex) bool {
+    if (!self.ast.tokensOnSameLine(open, close)) return true;
+    const tags = self.ast.tokens.items(.tag);
+    var token = open + 1;
+    while (token < close) : (token += 1) {
+        if (tags[token] == .l_brace and tags[token + 1] != .r_brace) return true;
+    }
+    return false;
 }
 
 // TODO: renderExpressionFixup

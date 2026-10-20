@@ -299,7 +299,10 @@ if expr |val| {
 Approved and delivered first slice: growable scalar `[]T` value arrays with
 pointer-sized uint len/cap, native int negative indexing, independent copies at
 value boundaries, literals (including context-typed empty arrays), read-only
-`.len`, mutable element replacement and self-safe `+=` append. See README's
+`.len`, mutable element replacement and self-safe `+=` append. Formatting now
+covers scalar array annotations, literals, indexing, `.len` reads and direct
+indexed replacement, with token/comment/AST preservation and first-pass idempotence.
+This is syntax-only; it adds no array semantics or memory forms. See README's
 executable subset for precise limits and evaluation order. The proposals below
 remain proposals; writable length, slices, nested/pointer elements, aliases,
 capacity APIs and efficient copy/append optimizations are still deferred.

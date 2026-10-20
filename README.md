@@ -376,11 +376,19 @@ Formatting supports scalar `let`/`let mut`
 declarations, literals and operators, function signatures and bodies, calls (including
 `@print`/`@println`), local blocks, `if`/`else if`/`else`, condition loops, returns,
 unlabeled `break`/`continue`, and direct identifier assignments (`=`, `+=`, `-=`,
-`*=`, `/=`, `%=`). Nonempty blocks use four-space indentation. Function parentheses,
+`*=`, `/=`, `%=`). Scalar array annotations (`[]bool`, fixed-width integer types,
+`[]int`/`[]uint`), literals (including empty `[]`), indexing (including negative
+indices), `.len` reads, and plain `name[index] = value` stores are also supported.
+Nonempty blocks use four-space indentation. Function parentheses,
 list commas (including trailing commas), precedence, comments, and multiline
 continuations are preserved; no grouping parentheses are invented.
 This is syntax formatting, not semantic validation: existing literal/bitwise/shift
-formatting does not make those forms executable. Memory/container forms, labels,
+formatting does not make those forms executable. Array formatting does not check
+expected literal types, scope, mutability, or whether a base is an array; it does
+not enable array globals or new language semantics. Other members, `.len` writes,
+indexed compound stores and stores through computed bases remain unsupported.
+Nested array annotations, directly nested literals/indexing, slices, pointers,
+other memory/container forms, labels,
 value-carrying breaks, iterator/other loop forms, attributes, quoted identifiers,
 BOMs and shebangs remain unsupported or invalid. Unsupported syntax is reported
 without modifying the file. Formatted output is reparsed and checked for structural,
@@ -737,7 +745,8 @@ let main: () -> void = {
 - `.len` writes are explicitly rejected: shrinking and especially initialization
   on length growth remain undesigned. No array printing, equality, concatenation
   with `+`, slices, nested arrays, pointer/function elements, explicit aliases,
-  array globals, capacity API, iteration, or array formatting is delivered.
+  array globals, capacity API, or iteration is delivered. The formatter supports
+    the scalar array syntax described above without extending these semantics.
   `@print`/`@println` still accept only bool/integer values; indexing and `.len`
   can be printed.
 
