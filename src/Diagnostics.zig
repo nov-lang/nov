@@ -70,7 +70,7 @@ pub fn renderModule(module: *const Module, writer: *std.Io.Writer) !void {
             .unreachable_code => try writer.writeAll("unreachable statement after return, break or continue"),
             .loop_control_outside_loop => try writer.writeAll("break and continue require an enclosing loop"),
             .unsupported_loop_control => try writer.writeAll("labeled loop control is not supported"),
-            .conditional_value_break => try writer.writeAll("conditional loops cannot break with a value; only unconditional loops produce values"),
+            .conditional_value_break => try writer.writeAll("conditional loops cannot break with a value without an else branch"),
             .loop_missing_value_break => try writer.writeAll("nonvoid loop result requires a reachable value-carrying break"),
             .unused_block_value => try writer.writeAll("non-final block expression must return void; discarding values is not supported yet"),
             .unsupported_shadowing => try writer.writeAll("shadowing is not supported in body analysis yet"),

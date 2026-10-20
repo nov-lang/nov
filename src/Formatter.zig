@@ -61,6 +61,7 @@ fn checkSupported(ast: Ast) !void {
         .if_else,
         .loop_condition,
         .loop_cont,
+        .loop_else,
         .@"return",
         .@"break",
         .@"continue",
@@ -342,16 +343,16 @@ test "executable local blocks round trip" {
 
 test "every unsupported AST tag is rejected before rendering" {
     const supported = [_]Ast.Node.Tag{
-        .root,           .decl,             .identifier,      .number_literal,   .char_literal,      .string_literal,
-        .add,            .sub,              .mul,             .div,              .mod,               .shl,
-        .shr,            .bit_and,          .bit_or,          .bit_xor,          .equal_equal,       .bang_equal,
-        .less_than,      .less_or_equal,    .greater_than,    .greater_or_equal, .bool_and,          .bool_or,
-        .negation,       .bool_not,         .bit_not,         .fn_proto_one,     .fn_proto,          .call_one,
-        .call_one_comma, .call,             .call_comma,      .block_two,        .block_two_newline, .block,
-        .block_newline,  .@"if",            .if_else,         .loop_condition,   .loop_cont,         .@"return",
-        .@"break",       .@"continue",      .assign,          .assign_add,       .assign_sub,        .assign_mul,
-        .assign_div,     .assign_mod,       .builtin_literal, .array_type,       .array_init_two,    .array_init_two_comma,
-        .array_init,     .array_init_comma, .array_access,    .field_access,
+        .root,                 .decl,          .identifier,       .number_literal,   .char_literal,      .string_literal,
+        .add,                  .sub,           .mul,              .div,              .mod,               .shl,
+        .shr,                  .bit_and,       .bit_or,           .bit_xor,          .equal_equal,       .bang_equal,
+        .less_than,            .less_or_equal, .greater_than,     .greater_or_equal, .bool_and,          .bool_or,
+        .negation,             .bool_not,      .bit_not,          .fn_proto_one,     .fn_proto,          .call_one,
+        .call_one_comma,       .call,          .call_comma,       .block_two,        .block_two_newline, .block,
+        .block_newline,        .@"if",         .if_else,          .loop_condition,   .loop_cont,         .loop_else,
+        .@"return",            .@"break",      .@"continue",      .assign,           .assign_add,        .assign_sub,
+        .assign_mul,           .assign_div,    .assign_mod,       .builtin_literal,  .array_type,        .array_init_two,
+        .array_init_two_comma, .array_init,    .array_init_comma, .array_access,     .field_access,
     };
     var ast = try Parser.parse(std.testing.allocator, "let x=1\n");
     defer ast.deinit(std.testing.allocator);
@@ -478,6 +479,24 @@ test "array formatting survives every allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, testArrayAllocationFailures, .{});
 }
 
+test "conditional loop exhaustion formatting preserves tokens comments and structure" {
+    try expectFormatted("let x=loop false{}else{true}", "let x = loop false {} else {\n    true\n}\n");
+    for ([_][:0]const u8{
+        "let x=loop c : step() {break 1} else {2}",
+        "let x=loop {true} : {tick()} {break [1,2,]} else {[]}",
+        "let x=loop c {; body\nbreak true ; break\n} else {; fallback\nfalse}",
+        "let x=loop c {} else if b {return} else {loop d {} else {continue}}",
+    }) |source| {
+        const formatted = try format(std.testing.allocator, source);
+        defer std.testing.allocator.free(formatted);
+        const terminated = try std.testing.allocator.dupeZ(u8, formatted);
+        defer std.testing.allocator.free(terminated);
+        const twice = try format(std.testing.allocator, terminated);
+        defer std.testing.allocator.free(twice);
+        try std.testing.expectEqualStrings(formatted, twice);
+    }
+}
+
 test "loop continuations and value breaks are idempotent" {
     try expectFormatted("let value=loop i<10:i+=1{break 1+2*3}", "let value = loop i < 10 : i += 1 {\n    break 1 + 2 * 3\n}\n");
     try expectFormatted("let value=loop:tick(){break 42}", "let value = loop : tick() {\n    break 42\n}\n");
@@ -574,6 +593,8 @@ test "loop structure checks inspect extras without reading unused fields" {
 fn testLoopAllocationFailures(allocator: std.mem.Allocator) !void {
     const output = try format(allocator, "let value=loop : tick(1,2,) {break loop i < 10 : i += ; step\n1 {if true {continue}\nbreak [1,2,3,]}} ; end");
     defer allocator.free(output);
+    const exhaustion = try format(allocator, "let x=loop {true} : {} {break [1,2,]} else {; fallback\n[3,4,]}");
+    defer allocator.free(exhaustion);
 }
 
 test "continuation and value loop formatting survives every allocation failure" {

@@ -57,6 +57,57 @@ pub fn lower(module: *Module) Error!Sema {
     return result;
 }
 
+test "exhaustion controls belong to parent loops and IR outlives the source" {
+    var module = try Module.init(std.testing.allocator, "else.nov",
+        \\let f: () -> []int = loop : {} {
+        \\    loop false {} else {break [7, 8]}
+        \\}
+        \\let g: () -> void = loop true : {} {
+        \\    loop false {} else {continue}
+        \\}
+        \\let h: () -> string = loop false {} else {return "a" + "b"}
+    );
+    var sema = lower(&module) catch |err| {
+        module.deinit();
+        return err;
+    };
+    defer sema.deinit();
+    const failed = module.hasErrors();
+    module.deinit();
+    try std.testing.expect(!failed);
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+    for (sema.ir.functions.items[0..2], 0..) |function, f| {
+        const body = function.body.?;
+        var outer: usize = 0;
+        for (body.instructions, 0..) |instruction, i| {
+            if (instruction.op == .loop) outer = i;
+        }
+        try std.testing.expect(body.instructions[outer].op == .loop);
+        var controls: usize = 0;
+        for (body.instructions, 0..) |instruction, i| {
+            if (instruction.op != .loop_break and instruction.op != .loop_continue) continue;
+            controls += 1;
+            try std.testing.expectEqual(outer, Ir.enclosingLoop(body, i).?);
+            try std.testing.expectEqual(f == 0, instruction.op == .loop_break);
+        }
+        try std.testing.expectEqual(@as(usize, 1), controls);
+        // The completed inner loop is terminal in its parent's body, not the
+        // owner of the control in its exhaustion region.
+        const inner_id = body.instructions[outer].op.loop.body;
+        const inner = body.instructions[@intFromEnum(inner_id)];
+        try std.testing.expect(inner.op.loop.returns);
+        try std.testing.expect(Ir.terminates(body, inner_id));
+    }
+    const body = sema.ir.functions.items[2].body.?;
+    const index = @intFromEnum(body.result);
+    try std.testing.expect(body.instructions[index].op.loop.returns);
+    @constCast(body.instructions)[index].op.loop.returns = false;
+    try std.testing.expectError(error.InvalidReturn, sema.ir.verify());
+    @constCast(body.instructions)[index].op.loop.returns = true;
+    try sema.ir.verify();
+}
+
 test "loop continuation regions and value breaks outlive source storage" {
     var module = try Module.init(std.testing.allocator, "loop-values.nov",
         \\let f: (n: int) -> []int = {

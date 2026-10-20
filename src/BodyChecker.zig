@@ -111,7 +111,7 @@ fn checkInner(module: *Module, ir: *Ir, types: []const ?Ir.TypeId, id: Module.De
 }
 
 const Context = struct {
-    const LoopContext = struct { unconditional: bool, result: ?Known, valued_break: bool = false };
+    const LoopContext = struct { allows_value: bool, result: ?Known, valued_break: bool = false, has_break: bool = false };
 
     module: *Module,
     ir: *Ir,
@@ -264,8 +264,13 @@ const Context = struct {
         const ast = &self.module.ast;
         const data = ast.nodes.items(.data)[node];
         switch (ast.nodes.items(.tag)[node]) {
-            .loop_condition, .loop_cont => return null,
-            .@"break" => return if (data.rhs != 0) self.probe(data.rhs, depth + 1) else null,
+            .loop_condition, .loop_cont, .loop_else => return self.probeBreaks(ast.fullLoop(node).?.else_expr, depth + 1),
+            // The operand runs before this break. Its own controls may exit
+            // this loop before the operand ever produces a value.
+            .@"break" => return if (data.rhs != 0)
+                (try self.probeBreaks(data.rhs, depth + 1)) orelse try self.probe(data.rhs, depth + 1)
+            else
+                null,
             .block, .block_two, .block_newline, .block_two_newline => {
                 const start = self.locals.items.len;
                 defer self.restoreScope(start);
@@ -369,11 +374,13 @@ const Context = struct {
             },
             .field_access => if (std.mem.eql(u8, ast.tokenSlice(data.rhs), "len")) .{ .ty = try self.ir.internType(.{ .integer = .{ .signedness = .unsigned, .bits = Ir.native_pointer_bits } }) } else null,
             .block, .block_two, .block_newline, .block_two_newline => try self.probeBlock(node, depth),
-            .loop_condition, .loop_cont => blk: {
+            .loop_condition, .loop_cont, .loop_else => blk: {
                 const loop = ast.fullLoop(node).?;
-                if (loop.condition != 0) break :blk .{ .ty = try self.ir.internType(.void) };
-                break :blk (try self.probeBreaks(loop.body, depth + 1)) orelse
-                    (if (loop.continuation != 0) try self.probeBreaks(loop.continuation, depth + 1) else null);
+                if (loop.condition != 0 and loop.else_expr == 0) break :blk .{ .ty = try self.ir.internType(.void) };
+                break :blk (try self.probeBreaks(loop.condition, depth + 1)) orelse
+                    (try self.probeBreaks(loop.body, depth + 1)) orelse
+                    (try self.probeBreaks(loop.continuation, depth + 1)) orelse
+                    (if (loop.else_expr != 0) try self.probe(loop.else_expr, depth + 1) else null);
             },
             .@"if", .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod => .{ .ty = try self.ir.internType(.void) },
             .if_else => blk: {
@@ -686,7 +693,7 @@ const Context = struct {
                 const unit = try self.ir.internType(.void);
                 if (is_break) {
                     if (data.rhs != 0) {
-                        if (!loop.unconditional) return self.fail(.conditional_value_break, node, null);
+                        if (!loop.allows_value) return self.fail(.conditional_value_break, node, null);
                         const ty = (try self.expression(data.rhs, loop.result, depth + 1)) orelse return null;
                         if (self.terminated) return if (expected) |want| want.ty else unit;
                         if (loop.result == null) loop.result = .{ .ty = ty };
@@ -697,6 +704,7 @@ const Context = struct {
                             if (want.ty != unit) return self.fail(.expression_type_mismatch, node, want.annotation);
                         } else loop.result = .{ .ty = unit };
                     }
+                    loop.has_break = true;
                 }
                 if (self.emitter) |emitter| {
                     try emitter.record(node, unit, self.irSpan(node), if (is_break) .{ .loop_break = if (data.rhs != 0) try emitter.value(data.rhs) else null } else .loop_continue);
@@ -705,11 +713,11 @@ const Context = struct {
                 self.terminated = true;
                 return if (expected) |want| want.ty else unit;
             },
-            .loop_condition, .loop_cont => {
+            .loop_condition, .loop_cont, .loop_else => {
                 const loop = ast.fullLoop(node).?;
                 const unit = try self.ir.internType(.void);
                 const boolean = try self.ir.internType(.boolean);
-                var context: LoopContext = .{ .unconditional = loop.condition == 0, .result = if (loop.condition == 0) hint else .{ .ty = unit } };
+                var context: LoopContext = .{ .allows_value = loop.condition == 0 or loop.else_expr != 0, .result = if (loop.condition == 0 or loop.else_expr != 0) hint else .{ .ty = unit } };
                 const parent = self.loop_context;
                 self.loop_context = &context;
                 defer self.loop_context = parent;
@@ -729,17 +737,35 @@ const Context = struct {
                 const continuation = if (loop.continuation != 0) try self.expression(loop.continuation, .{ .ty = unit }, depth + 1) else unit;
                 self.terminated = false;
                 if (condition == null or body == null or continuation == null) return null;
-                const result = if (context.result) |known| known.ty else unit;
-                if (result != unit and !context.valued_break) return self.fail(.loop_missing_value_break, node, null);
+                // Exhaustion is a sibling value region, but not part of this
+                // loop's break/continue scope. Its controls belong to the parent.
+                self.loop_context = parent;
+                const else_start: ?u32 = if (loop.else_expr != 0 and self.emitter != null) @intCast(self.emitter.?.instructions.items.len) else null;
+                const exhaustion = if (loop.else_expr != 0) try self.expression(loop.else_expr, context.result, depth + 1) else unit;
+                if (exhaustion == null) return null;
+                const else_terminal = self.terminated;
+                if (loop.else_expr != 0 and !else_terminal) {
+                    if (context.result == null) context.result = .{ .ty = exhaustion.? };
+                    try self.copyNode(loop.else_expr, exhaustion.?);
+                }
+                self.terminated = loop.else_expr != 0 and else_terminal and !context.has_break;
+                const result = if (self.terminated) unit else if (context.result) |known| known.ty else unit;
+                if (loop.else_expr == 0 and result != unit and !context.valued_break) return self.fail(.loop_missing_value_break, node, null);
                 if (self.emitter) |emitter| try emitter.record(node, result, self.irSpan(node), .{ .loop = .{
                     .unconditional = loop.condition == 0,
                     .condition_start = condition_start,
                     .body_start = body_start,
                     .continuation_start = continuation_start,
+                    .else_start = else_start,
+                    .else_value = if (loop.else_expr != 0) try emitter.value(loop.else_expr) else null,
+                    .returns = self.terminated,
                     .condition = condition_value.?,
                     .body = try emitter.value(loop.body),
                     .continuation = if (loop.continuation != 0) try emitter.value(loop.continuation) else null,
                 } });
+                if (self.terminated) if (self.emitter) |emitter| {
+                    self.terminal = try emitter.value(node);
+                };
                 return self.fit(result, expected, node);
             },
             .@"return" => {
@@ -1156,8 +1182,77 @@ test "loop values infer from typed breaks with exact branch types and scopes" {
     try sema.ir.verify();
 }
 
+test "break operand probes do not borrow discarded nested loop result types" {
+    for ([_][]const u8{
+        "loop true {break n}",
+        "loop {if false {break n}\nfalse} {} else {2}",
+        "loop false : {break n} {} else {2}",
+    }) |inner| {
+        const source = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "let f: () -> void = {{let n: i8 = 7\nlet x = loop true {{if false {{break 1}}\nbreak {{let unused = {s}\n2}}}} else {{3}}\n}}",
+            .{inner},
+        );
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "operand-scope.nov", source);
+        defer module.deinit();
+        var sema = try @import("Lowering.zig").lower(&module);
+        defer sema.deinit();
+        try std.testing.expect(!sema.lowering_complete);
+        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+        try std.testing.expectEqual(Module.Diagnostic.Tag.literal_needs_type, module.diagnostics.items[0].tag);
+    }
+}
+
+test "conditional loop else results use exact bidirectional types and ignore terminal paths" {
+    const source =
+        \\let identity: (n: int) -> int = n
+        \\let pick: (n: int) -> int = loop false {break 1} else {n}
+        \\let out: () -> int = loop false {} else {return 7}
+        \\let terminal: () -> int = loop true {break 4} else {return 8}
+        \\let main: () -> void = {
+        \\    let n: i16 = 3
+        \\    let a = loop true {break 1} else {n}
+        \\    let b = loop false {break n} else {2}
+        \\    let c = loop {if false {break n}
+        \\        true} {} else {1}
+        \\    let d = loop false : if true {break n} {} else {2}
+        \\    let e = loop true {break [1]} else {let seed: i8 = 2
+        \\        [seed]}
+        \\    let f = loop false {break identity} else {identity}
+        \\    let g = loop false {break []} else {[true]}
+        \\    let h = loop false {} else {loop true {break "x"} else {"y"}}
+        \\    let i = loop {loop false {break} else {break 3}
+        \\        break n}
+        \\    @println(a, b, c, d, e[0], f(1), g.len, h, i)
+        \\}
+    ;
+    var module = try Module.init(std.testing.allocator, "else.nov", source);
+    defer module.deinit();
+    var sema = try @import("Lowering.zig").lower(&module);
+    defer sema.deinit();
+    for (module.diagnostics.items) |diagnostic| std.debug.print("else diagnostic {s}\n", .{@tagName(diagnostic.tag)});
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+}
+
 test "loop value and continuation diagnostics preserve exact types and lexical scopes" {
     for ([_]struct { source: []const u8, tag: Module.Diagnostic.Tag }{
+        .{ .source = "let f: () -> void = loop false {} else {break}", .tag = .loop_control_outside_loop },
+        .{ .source = "let f: () -> void = loop false {} else {continue}", .tag = .loop_control_outside_loop },
+        .{ .source = "let f: () -> bool = loop true {break} else {false}", .tag = .expression_type_mismatch },
+        .{ .source = "let f: () -> bool = loop true {break true} else {1}", .tag = .literal_type_mismatch },
+        .{ .source = "let f: (a: i8, b: i16) -> i8 = loop true {break a} else {b}", .tag = .expression_type_mismatch },
+        .{ .source = "let f: () -> void = {let x = loop false {break 1} else {2}\n}", .tag = .literal_needs_type },
+        .{ .source = "let f: () -> void = {let x = loop false {break []} else {[]}\n}", .tag = .array_literal_needs_type },
+        .{ .source = "let f: () -> void = loop false {let hidden = true\n} else {@println(hidden)}", .tag = .unknown_name },
+        .{ .source = "let f: () -> void = loop {let hidden = true\nhidden} {} else {@println(hidden)}", .tag = .unknown_name },
+        .{ .source = "let f: () -> void = loop false : {let hidden = true\n} {} else {@println(hidden)}", .tag = .unknown_name },
+        .{ .source = "let f: () -> void = {loop false {} else {let hidden = true\n}\n@println(hidden)}", .tag = .unknown_name },
+        .{ .source = "let f: () -> void = {loop false {} else {return}\n@println(true)}", .tag = .unreachable_code },
+        .{ .source = "let f: () -> void = loop true {break} else {return {}\n@println(true)}", .tag = .unreachable_code },
+        .{ .source = "let f: () -> void = loop true {loop false {} else {break true}}", .tag = .conditional_value_break },
         .{ .source = "let f: () -> void = {let x = loop {break 1}\n}", .tag = .literal_needs_type },
         .{ .source = "let f: () -> int = loop {if true {break} else {break 1}}", .tag = .expression_type_mismatch },
         .{ .source = "let f: () -> int = loop {if true {break 1} else {break false}}", .tag = .literal_type_mismatch },

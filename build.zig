@@ -133,6 +133,8 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     _ = fixtures.add("mutable-program.nov", "let f: (c: bool) -> int = {let mut n: int = 1\nn += if c {return 42} else {2}\nn}\nlet main: () -> void = {let mut n: int = 1\nif true {n += 2}\nlet b: bool = false and {n = 99\ntrue}\n@println(n, b, f(true), f(false))}\n");
     _ = fixtures.add("loop-values.nov", @embedFile("examples/loop-values.nov"));
     _ = fixtures.add("loop-program.nov", "let f: () -> int = {let mut n: int = 0\nloop {if n == 5 {break}\nn += 1\nloop false {continue}\nif n == 2 {continue}\nif n == 4 {break}\n@println(n)}\nn}\nlet main: () -> void = @println(f())\n");
+    _ = fixtures.add("else-break-outside.nov", "let main: () -> void = loop false {} else {break}\n");
+    _ = fixtures.add("else-mismatch.nov", "let main: () -> void = {let x: bool = loop true {break true} else {1}\n}\n");
     _ = fixtures.add("break-outside.nov", "let main: () -> void = {break}\n");
     _ = fixtures.add("value-break.nov", "let main: () -> void = loop true {break 1}\n");
     _ = fixtures.add("immutable-assignment.nov", "let main: () -> void = {let n: int = 1\nn = 2}\n");
@@ -192,6 +194,8 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         .{ .name = "check semantic loops", .args = &.{ "check", "--semantic", "loop-program.nov" }, .exit_code = 0 },
         .{ .name = "check break outside loop", .args = &.{ "check", "--semantic", "break-outside.nov" }, .exit_code = 1, .stderr_match = "break and continue require an enclosing loop" },
         .{ .name = "emit rejects conditional value break", .args = &.{ "emit-c", "value-break.nov" }, .exit_code = 1, .stderr_match = "conditional loops cannot break with a value" },
+        .{ .name = "reject else break outside loop", .args = &.{ "check", "--semantic", "else-break-outside.nov" }, .exit_code = 1, .stderr_match = "break and continue require an enclosing loop" },
+        .{ .name = "reject mismatched else result", .args = &.{ "emit-c", "else-mismatch.nov" }, .exit_code = 1, .stderr_match = "literal does not match the annotated type" },
         .{ .name = "check loop values and continuations", .args = &.{ "check", "--semantic", "loop-values.nov" }, .exit_code = 0 },
         .{ .name = "fmt loop values and continuations", .args = &.{ "fmt", "--check", "loop-values.nov" }, .exit_code = 0 },
         .{ .name = "fmt condition loops detects changes", .args = &.{ "fmt", "--check", "loop-program.nov" }, .exit_code = 1, .stderr_match = "file is not formatted" },
@@ -290,7 +294,7 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         value_loops.addArgs(&.{ "run", "loop-values.nov" });
         if (mode.len != 0) value_loops.addArg(mode);
         value_loops.expectExitCode(0);
-        value_loops.expectStdOutEqual("First multiple: found 28 42\n");
+        value_loops.expectStdOutEqual("First multiple: found 28 42\nBounded search: true false false 28 -1\n");
         value_loops.expectStdErrEqual("");
         test_step.dependOn(&value_loops.step);
 

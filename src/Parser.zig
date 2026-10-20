@@ -621,7 +621,7 @@ fn parseElseExpr(self: *Parser) Error!Node.Index {
 ///     <- (AMPERSAND? IDENTIFIER)+ KEYWORD_in (Expr (DOT2 Expr?)?)+
 ///      / Expr (COLON AssignExpr)?
 /// Condition-and-block and unconditional block forms, with optional continuations,
-/// are enabled. Iteration, labels, and else forms use balanced error recovery.
+/// and conditional exhaustion branches are enabled. Iteration and labels remain unsupported.
 fn parseLoopExpr(self: *Parser) Error!Node.Index {
     const loop_token = self.assertToken(.keyword_loop);
     if (loop_token >= 2 and self.token_tags[loop_token - 1] == .colon or self.token_tags[self.tok_i] == .eof)
@@ -647,8 +647,15 @@ fn parseLoopExpr(self: *Parser) Error!Node.Index {
         condition = null_node;
         break :body block;
     };
-    if (self.token_tags[self.tok_i] == .keyword_else)
-        return self.failMsg(.{ .tag = .unsupported_loop, .token = loop_token });
+    if (self.token_tags[self.tok_i] == .keyword_else) {
+        if (condition == 0) return self.failMsg(.{ .tag = .unsupported_loop, .token = loop_token });
+        const else_expr = try self.parseElseExpr();
+        return self.addNode(.{
+            .tag = .loop_else,
+            .main_token = loop_token,
+            .data = .{ .lhs = condition, .rhs = try self.addExtra(Node.LoopElse{ .continuation = continuation, .body = body, .else_expr = else_expr }) },
+        });
+    }
     return self.addNode(.{
         .tag = if (continuation != 0) .loop_cont else .loop_condition,
         .main_token = loop_token,
@@ -1695,12 +1702,38 @@ test "unconditional loops preserve blocks ambiguity comments and EOF spans" {
     var separate = try parse(std.testing.allocator, "let f: () -> void = {loop {break} ; end\n{}\n}");
     defer separate.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), separate.errors.len);
-    for ([_][:0]const u8{ "let f = loop {", "let f = loop {break", "let f = loop {} {} else {}\nlet after = 0" }) |source| {
+    for ([_][:0]const u8{ "let f = loop {", "let f = loop {break", "let f = loop {} else {}\nlet after = 0" }) |source| {
         var broken = try parse(std.testing.allocator, source);
         defer broken.deinit(std.testing.allocator);
         try std.testing.expect(broken.errors.len != 0);
         for (broken.errors) |err| try std.testing.expect(broken.tokens.items(.start)[err.token] <= source.len);
     }
+}
+
+test "conditional loop else extras preserve spans and existing newline grammar" {
+    for ([_][:0]const u8{
+        "let x = loop false {} else {false}",
+        "let x = loop true : tick() {break true} else {false}",
+        "let x = loop {true} : {} {} else if true {false} else {true}",
+        "let x = loop false {} else {; fallback\nfalse}",
+    }) |source| {
+        var ast = try parse(std.testing.allocator, source);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+        const node = ast.decl(ast.rootDecls()[0]).ast.init_node;
+        try std.testing.expectEqual(Node.Tag.loop_else, ast.nodes.items(.tag)[node]);
+        const loop = ast.fullLoop(node).?;
+        try std.testing.expect(loop.condition != 0 and loop.else_expr != 0);
+        try std.testing.expectEqualStrings("loop", ast.tokenSlice(ast.firstToken(node)));
+        try std.testing.expectEqual(source.len - 1, ast.tokens.items(.start)[ast.lastToken(node)]);
+    }
+    // Like if/else, a newline before else ends the expression.
+    var broken = try parse(std.testing.allocator, "let x = loop false {}\nelse {}\nlet after = 0");
+    defer broken.deinit(std.testing.allocator);
+    try std.testing.expect(broken.errors.len != 0);
+    var incomplete = try parse(std.testing.allocator, "let x = loop false {} else {");
+    defer incomplete.deinit(std.testing.allocator);
+    try std.testing.expect(incomplete.errors.len != 0);
 }
 
 test "continuation loop extras and EOF source spans" {
@@ -1864,11 +1897,9 @@ test "unsupported loops diagnose their keyword and preserve following declaratio
         "loop item in items {\nlet hidden = 0\n}",
         "loop i < 10 : i += 1, j += 1 {}",
         "loop {} else {}",
-        "loop {} {} else {}",
-        "loop true : next {} else {}",
+        "loop : next {} else {}",
         "outer: loop {}",
         "outer: loop true {}",
-        "loop true {} else {}",
         "loop i in 0..10 {}",
     };
     for (expressions) |expression| {

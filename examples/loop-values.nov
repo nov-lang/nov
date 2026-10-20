@@ -8,6 +8,29 @@ let first_multiple: (minimum: int, divisor: int) -> int = {
     }
 }
 
+; Exhaustion, including an empty interval, supplies the fallback result.
+let range_has_number: (begin: int, end: int, number: int) -> bool = {
+    let mut candidate = begin
+    loop candidate < end : candidate += 1 {
+        if candidate == number {
+            break true
+        }
+    } else {
+        false
+    }
+}
+
+let bounded_multiple: (begin: int, end: int, divisor: int) -> int = {
+    let mut candidate = begin
+    loop candidate < end : candidate += 1 {
+        if candidate % divisor == 0 {
+            break candidate
+        }
+    } else {
+        -1
+    }
+}
+
 let main: () -> void = {
     let found = first_multiple(23, 7)
     let mut total: int = 0
@@ -22,4 +45,5 @@ let main: () -> void = {
         break "First multiple: " + "found"
     }
     @println(message, found, total)
+    @println("Bounded search:", range_has_number(23, 29, 28), range_has_number(23, 28, 28), range_has_number(28, 28, 28), bounded_multiple(23, 29, 7), bounded_multiple(23, 28, 7))
 }

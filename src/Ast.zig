@@ -588,6 +588,7 @@ pub fn firstToken(self: Ast, node: Node.Index) TokenIndex {
         .if_else,
         .loop_condition,
         .loop_cont,
+        .loop_else,
         .@"continue",
         .@"break",
         .@"return",
@@ -681,7 +682,7 @@ pub fn firstToken(self: Ast, node: Node.Index) TokenIndex {
                 // A bare block continuation also follows `identifier :`, but
                 // that colon belongs to the loop header, not a block label.
                 const separator = for (tags, 0..) |tag, i| {
-                    if (tag != .loop_cont) continue;
+                    if (tag != .loop_cont and tag != .loop_else) continue;
                     const loop = self.fullLoop(@intCast(i)).?;
 
                     const header_end = if (loop.condition == 0) main_tokens[i] else self.lastToken(loop.condition);
@@ -762,6 +763,7 @@ pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
         => n = datas[n].rhs,
 
         .loop_cont => n = self.extraData(datas[n].rhs, Node.LoopCont).body,
+        .loop_else => n = self.extraData(datas[n].rhs, Node.LoopElse).else_expr,
 
         .field_access,
         .unwrap,
@@ -1112,11 +1114,16 @@ pub fn fullDecl(self: Ast, node: Node.Index) ?full.Decl {
     };
 }
 
-pub fn fullLoop(self: Ast, node: Node.Index) ?struct { condition: Node.Index, continuation: Node.Index, body: Node.Index } {
+pub fn fullLoop(self: Ast, node: Node.Index) ?struct { condition: Node.Index, continuation: Node.Index, body: Node.Index, else_expr: Node.Index = 0 } {
     return switch (self.nodes.items(.tag)[node]) {
         .loop_condition => blk: {
             const data = self.nodes.items(.data)[node];
             break :blk .{ .condition = data.lhs, .continuation = 0, .body = data.rhs };
+        },
+        .loop_else => blk: {
+            const data = self.nodes.items(.data)[node];
+            const extra = self.extraData(data.rhs, Node.LoopElse);
+            break :blk .{ .condition = data.lhs, .continuation = extra.continuation, .body = extra.body, .else_expr = extra.else_expr };
         },
         .loop_cont => blk: {
             const data = self.nodes.items(.data)[node];
@@ -1557,6 +1564,8 @@ pub const Node = struct {
         loop_condition,
         /// Optional condition in lhs (0 for unconditional), LoopCont extra in rhs.
         loop_cont,
+        /// Condition in lhs, LoopElse extra in rhs; exhaustion is outside loop control scope.
+        loop_else,
         /// `if lhs {}`. rhs is the block.
         @"if",
         /// `if lhs {} else {}`. `If[rhs]`.
@@ -1649,6 +1658,12 @@ pub const Node = struct {
         mutable: bool,
         /// Can be Parser.null_node
         type_node: u31,
+    };
+
+    pub const LoopElse = struct {
+        continuation: Index,
+        body: Index,
+        else_expr: Index,
     };
 
     pub const LoopCont = struct {

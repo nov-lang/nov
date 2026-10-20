@@ -45,11 +45,14 @@ pub const Operation = union(enum) {
     /// Terminal exits target the innermost containing loop, including its condition.
     loop_break: ?ValueId,
     loop_continue,
-    /// Condition [condition_start, body_start) is reexecuted before every body
-    /// [body_start, continuation_start orelse this instruction). The optional
-    /// continuation occupies the remaining region. Body continue enters it;
+    /// Condition [condition_start, body_start) is reexecuted before every body.
+    /// Body ends at continuation_start, else_start, or the merge; continuation
+    /// ends at else_start or the merge. Body continue enters the continuation;
     /// condition/continuation continue reenters the condition. Break/return skip
-    /// it. Only outer slots carry state between these private sibling regions.
+    /// continuation and exhaustion. Exhaustion [else_start, merge) runs only on
+    /// condition false and belongs to the enclosing control scope. All regions
+    /// are private siblings; only outer slots carry state across backedges.
+    /// `returns` means terminal exhaustion with no breaks owned by this loop.
     loop: struct {
         unconditional: bool = false,
         condition_start: u32,
@@ -58,6 +61,10 @@ pub const Operation = union(enum) {
         condition: ValueId,
         body: ValueId,
         continuation: ?ValueId = null,
+        /// Exhaustion is private but outside this loop's control scope.
+        else_start: ?u32 = null,
+        else_value: ?ValueId = null,
+        returns: bool = false,
     },
     // Slot identities are instruction IDs, but are not expression values.
     local_slot: ValueId,
@@ -328,16 +335,20 @@ fn operandType(body: Body, id: ValueId, before: usize) VerifyError!TypeId {
     return ty;
 }
 
-fn regionOperandType(body: Body, id: ValueId, before: usize, yielding: ?usize) VerifyError!TypeId {
+// Empty siblings can share an end offset. Only the precise yielding region
+// may expose its private result, not another region ending at the same merge.
+const Yield = struct { owner: usize, start: usize };
+
+fn regionOperandType(body: Body, id: ValueId, before: usize, yielding: ?Yield) VerifyError!TypeId {
     const index = @intFromEnum(id);
     if (index >= before or index >= body.instructions.len) return error.InvalidValueId;
     if (yielding != null and body.instructions[index].op == .local_slot) return error.InvalidValueId;
     for (body.instructions, 0..) |instruction, owner| {
-        var buffer: [3]Region = undefined;
+        var buffer: [4]Region = undefined;
         for (regions(instruction.op, owner, &buffer)) |region| {
             if (index >= region.start and index < region.end and
                 !(before >= region.start and before < region.end) and
-                !(before == region.end and yielding == owner)) return error.InvalidValueId;
+                !(before == region.end and yielding != null and yielding.?.owner == owner and yielding.?.start == region.start)) return error.InvalidValueId;
         }
     }
     if (terminates(body, id) and yielding == null) return error.InvalidValueId;
@@ -348,34 +359,41 @@ pub fn terminates(body: Body, id: ValueId) bool {
     return switch (body.instructions[@intFromEnum(id)].op) {
         .return_value, .loop_break, .loop_continue => true,
         .branch => |r| r.returns,
+        .loop => |r| r.returns,
         else => false,
     };
 }
 
 pub fn enclosingLoop(body: Body, index: usize) ?usize {
     for (body.instructions[index + 1 ..], index + 1..) |instruction, end| {
-        if (instruction.op == .loop and index >= instruction.op.loop.condition_start) return end;
+        if (instruction.op == .loop and index >= instruction.op.loop.condition_start and index < (instruction.op.loop.else_start orelse end)) return end;
     }
     return null;
 }
 
 const Region = struct { start: usize, end: usize };
 
-fn regions(op: Operation, end: usize, buffer: *[3]Region) []const Region {
+fn regions(op: Operation, end: usize, buffer: *[4]Region) []const Region {
     switch (op) {
         .short_circuit => |r| {
             buffer[0] = .{ .start = r.rhs_start, .end = end };
             return buffer[0..1];
         },
         .loop => |r| {
-            const continuation_start = r.continuation_start orelse end;
+            const control_end = r.else_start orelse end;
+            const continuation_start = r.continuation_start orelse control_end;
             buffer[0] = .{ .start = r.condition_start, .end = r.body_start };
             buffer[1] = .{ .start = r.body_start, .end = continuation_start };
+            var count: usize = 2;
             if (r.continuation_start != null) {
-                buffer[2] = .{ .start = continuation_start, .end = end };
-                return buffer;
+                buffer[count] = .{ .start = continuation_start, .end = control_end };
+                count += 1;
             }
-            return buffer[0..2];
+            if (r.else_start) |start| {
+                buffer[count] = .{ .start = start, .end = end };
+                count += 1;
+            }
+            return buffer[0..count];
         },
         .branch => |r| {
             buffer[0] = .{ .start = r.then_start, .end = r.else_start };
@@ -400,12 +418,17 @@ fn validateBody(self: *const Ir, function: Function, body: Body) VerifyError!voi
     for (body.instructions, 0..) |instruction, end| {
         switch (instruction.op) {
             .loop => |r| {
+                const control_end = r.else_start orelse end;
+                if ((r.else_start == null) != (r.else_value == null)) return error.InvalidRegion;
+                if (r.else_start) |start| {
+                    if (r.unconditional or start <= r.body_start or start > end or @intFromEnum(r.else_value.?) >= end) return error.InvalidRegion;
+                }
                 if (r.condition_start >= r.body_start or r.body_start >= end or
                     @intFromEnum(r.condition) < r.condition_start or @intFromEnum(r.condition) >= r.body_start or
-                    @intFromEnum(r.body) < r.body_start or @intFromEnum(r.body) >= (r.continuation_start orelse end)) return error.InvalidRegion;
+                    @intFromEnum(r.body) < r.body_start or @intFromEnum(r.body) >= (r.continuation_start orelse control_end)) return error.InvalidRegion;
                 if ((r.continuation_start == null) != (r.continuation == null)) return error.InvalidRegion;
                 if (r.continuation_start) |start| {
-                    if (start <= r.body_start or start >= end or @intFromEnum(r.continuation.?) < start or @intFromEnum(r.continuation.?) >= end) return error.InvalidRegion;
+                    if (start <= r.body_start or start >= control_end or @intFromEnum(r.continuation.?) < start or @intFromEnum(r.continuation.?) >= control_end) return error.InvalidRegion;
                 }
             },
             .short_circuit => |r| {
@@ -418,10 +441,10 @@ fn validateBody(self: *const Ir, function: Function, body: Body) VerifyError!voi
             },
             else => {},
         }
-        var buffer: [3]Region = undefined;
+        var buffer: [4]Region = undefined;
         for (regions(instruction.op, end, &buffer)) |region| {
             for (body.instructions[0..end], 0..) |previous, previous_end| {
-                var previous_buffer: [3]Region = undefined;
+                var previous_buffer: [4]Region = undefined;
                 for (regions(previous.op, previous_end, &previous_buffer)) |previous_region| {
                     // The nested merge belongs to the surrounding scope too.
                     if (previous_end >= region.start and previous_region.start < region.start) return error.InvalidRegion;
@@ -436,7 +459,7 @@ fn validateBody(self: *const Ir, function: Function, body: Body) VerifyError!voi
             var region_end = body.instructions.len;
             var result = body.result;
             for (body.instructions, 0..) |owner, end| {
-                var buffer: [3]Region = undefined;
+                var buffer: [4]Region = undefined;
                 for (regions(owner.op, end, &buffer), 0..) |region, r| {
                     if (i >= region.start and i < region.end and region.end <= region_end) {
                         region_end = region.end;
@@ -446,7 +469,7 @@ fn validateBody(self: *const Ir, function: Function, body: Body) VerifyError!voi
                             .loop => |l| switch (r) {
                                 0 => l.condition,
                                 1 => l.body,
-                                else => l.continuation.?,
+                                else => if (l.continuation != null and r == 2) l.continuation.? else l.else_value.?,
                             },
                             else => unreachable,
                         };
@@ -504,32 +527,40 @@ fn validateBody(self: *const Ir, function: Function, body: Body) VerifyError!voi
                     // has not yet passed the per-instruction validation below.
                     const loop_ty = self.getType(body.instructions[owner].ty) orelse return error.InvalidTypeId;
                     if (instruction.op.loop_break) |value| {
-                        if (!body.instructions[owner].op.loop.unconditional) return error.InvalidOperation;
+                        if (!body.instructions[owner].op.loop.unconditional and body.instructions[owner].op.loop.else_value == null) return error.InvalidOperation;
                         if (try operandType(body, value, i) != body.instructions[owner].ty) return error.OperandTypeMismatch;
                     } else if (loop_ty != .void) return error.OperandTypeMismatch;
                 }
             },
             .loop => |r| {
-                if (!r.unconditional and ty != .void) return error.InvalidOperation;
+                if (!r.unconditional and r.else_value == null and ty != .void) return error.InvalidOperation;
                 if (r.unconditional) {
                     const condition = body.instructions[@intFromEnum(r.condition)];
                     if (condition.op != .constant) return error.InvalidOperation;
                     const constant = self.getConstant(condition.op.constant) orelse return error.InvalidConstId;
                     if (constant.value != .boolean or !constant.value.boolean) return error.InvalidOperation;
                 }
-                if (ty != .void) {
-                    var valued_break = false;
-                    for (body.instructions, 0..) |control, index| {
-                        if (control.op == .loop_break and control.op.loop_break != null and enclosingLoop(body, index) == i) valued_break = true;
+                var has_break = false;
+                var valued_break = false;
+                for (body.instructions, 0..) |control, index| {
+                    if (control.op == .loop_break and enclosingLoop(body, index) == i) {
+                        has_break = true;
+                        if (control.op.loop_break != null) valued_break = true;
                     }
-                    if (!valued_break) return error.InvalidOperation;
                 }
-                const condition_ty = try regionOperandType(body, r.condition, r.body_start, i);
+                if (ty != .void and r.else_value == null and !valued_break) return error.InvalidOperation;
+                const returns = if (r.else_value) |value| terminates(body, value) and !has_break else false;
+                if (r.returns != returns or (returns and ty != .void)) return error.InvalidReturn;
+                if (r.else_value) |value| {
+                    const else_ty = try regionOperandType(body, value, i, .{ .owner = i, .start = r.else_start.? });
+                    if (!terminates(body, value) and else_ty != instruction.ty) return error.OperandTypeMismatch;
+                }
+                const condition_ty = try regionOperandType(body, r.condition, r.body_start, .{ .owner = i, .start = r.condition_start });
                 if (!terminates(body, r.condition) and self.getType(condition_ty).? != .boolean) return error.OperandTypeMismatch;
-                const body_ty = try regionOperandType(body, r.body, r.continuation_start orelse i, i);
+                const body_ty = try regionOperandType(body, r.body, r.continuation_start orelse r.else_start orelse i, .{ .owner = i, .start = r.body_start });
                 if (!terminates(body, r.body) and self.getType(body_ty).? != .void) return error.OperandTypeMismatch;
                 if (r.continuation) |value| {
-                    const continuation_ty = try regionOperandType(body, value, i, i);
+                    const continuation_ty = try regionOperandType(body, value, r.else_start orelse i, .{ .owner = i, .start = r.continuation_start.? });
                     if (!terminates(body, value) and self.getType(continuation_ty).? != .void) return error.OperandTypeMismatch;
                 }
             },
@@ -581,18 +612,18 @@ fn validateBody(self: *const Ir, function: Function, body: Body) VerifyError!voi
             .short_circuit => |region| {
                 if (ty != .boolean) return error.OperandTypeMismatch;
                 if (try operandType(body, region.lhs, region.rhs_start) != instruction.ty) return error.OperandTypeMismatch;
-                const rhs_ty = try regionOperandType(body, region.rhs, i, i);
+                const rhs_ty = try regionOperandType(body, region.rhs, i, .{ .owner = i, .start = region.rhs_start });
                 if (!terminates(body, region.rhs) and rhs_ty != instruction.ty) return error.OperandTypeMismatch;
             },
             .branch => |r| {
                 const condition = self.getType(try operandType(body, r.condition, r.then_start)) orelse return error.InvalidTypeId;
                 if (condition != .boolean) return error.OperandTypeMismatch;
-                const then_ty = try regionOperandType(body, r.then_value, r.else_start, i);
+                const then_ty = try regionOperandType(body, r.then_value, r.else_start, .{ .owner = i, .start = r.then_start });
                 const then_returns = terminates(body, r.then_value);
                 if (!then_returns and then_ty != instruction.ty) return error.OperandTypeMismatch;
                 var else_returns = false;
                 if (r.else_value) |value| {
-                    const else_ty = try regionOperandType(body, value, i, i);
+                    const else_ty = try regionOperandType(body, value, i, .{ .owner = i, .start = r.else_start });
                     else_returns = terminates(body, value);
                     if (!else_returns and else_ty != instruction.ty) return error.OperandTypeMismatch;
                 } else if (ty != .void) return error.OperandTypeMismatch;
@@ -618,7 +649,7 @@ fn validateBody(self: *const Ir, function: Function, body: Body) VerifyError!voi
             },
         }
     }
-    const result_ty = try regionOperandType(body, body.result, body.instructions.len, body.instructions.len);
+    const result_ty = try regionOperandType(body, body.result, body.instructions.len, .{ .owner = body.instructions.len, .start = 0 });
     if (body.instructions[@intFromEnum(body.result)].op == .local_slot) return error.InvalidValueId;
     if (!terminates(body, body.result) and result_ty != signature.result) return error.InvalidReturn;
 }
@@ -1289,6 +1320,219 @@ const LoopTests = struct {
         try std.testing.expectError(expected, fixture.ir.verify());
     }
 };
+
+test "empty exhaustion yields cannot expose sibling or nested private values" {
+    for (0..6) |case| {
+        var t = try TestFunctions.init(std.testing.allocator);
+        defer t.ir.deinit();
+        const unit = try t.ir.internType(.void);
+        const nothing = try t.ir.internConstant(.{ .ty = unit, .value = .void });
+        const falsity = try t.ir.internConstant(.{ .ty = t.boolean, .value = .{ .boolean = false } });
+        const seven = try t.ir.internConstant(.{ .ty = t.integer, .value = .{ .signed_integer = 7 } });
+        const ins = TestFunctions.instruction;
+        const minimal = [_]Instruction{
+            ins(t.boolean, .{ .constant = falsity }),
+            ins(t.integer, .{ .constant = seven }),
+            ins(unit, .{ .constant = nothing }),
+            ins(t.integer, .{ .loop = .{ .condition_start = 0, .condition = @enumFromInt(0), .body_start = 1, .body = @enumFromInt(2), .else_start = 3, .else_value = @enumFromInt(1) } }),
+        };
+        if (case == 0) {
+            try LoopTests.reject(&t, error.InvalidValueId, &minimal, @enumFromInt(3));
+            continue;
+        }
+        const body_private = [_]Instruction{
+            ins(t.integer, .{ .constant = seven }),
+            ins(t.boolean, .{ .constant = falsity }),
+            ins(t.integer, .{ .constant = seven }),
+            ins(unit, .{ .constant = nothing }),
+            ins(t.integer, .{ .loop = .{ .condition_start = 1, .condition = @enumFromInt(1), .body_start = 2, .body = @enumFromInt(3), .else_start = 4, .else_value = @enumFromInt(0) } }),
+        };
+        const continuation_private = [_]Instruction{
+            ins(t.integer, .{ .constant = seven }),
+            ins(t.boolean, .{ .constant = falsity }),
+            ins(unit, .{ .constant = nothing }),
+            ins(t.integer, .{ .constant = seven }),
+            ins(unit, .{ .constant = nothing }),
+            ins(t.integer, .{ .loop = .{ .condition_start = 1, .condition = @enumFromInt(1), .body_start = 2, .body = @enumFromInt(2), .continuation_start = 3, .continuation = @enumFromInt(4), .else_start = 5, .else_value = @enumFromInt(0) } }),
+        };
+        const nested_body = [_]Instruction{
+            ins(t.integer, .{ .constant = seven }),
+            ins(t.boolean, .{ .constant = falsity }),
+            ins(t.boolean, .{ .constant = falsity }),
+            ins(t.integer, .{ .constant = seven }),
+            ins(t.integer, .{ .constant = seven }),
+            ins(t.integer, .{ .branch = .{ .condition = @enumFromInt(2), .then_start = 3, .else_start = 4, .then_value = @enumFromInt(3), .else_value = @enumFromInt(4) } }),
+            ins(unit, .{ .constant = nothing }),
+            ins(t.integer, .{ .loop = .{ .condition_start = 1, .condition = @enumFromInt(1), .body_start = 2, .body = @enumFromInt(6), .else_start = 7, .else_value = @enumFromInt(0) } }),
+        };
+        const nested_exhaustion = [_]Instruction{
+            ins(t.integer, .{ .constant = seven }),
+            ins(t.boolean, .{ .constant = falsity }),
+            ins(unit, .{ .constant = nothing }),
+            ins(t.boolean, .{ .constant = falsity }),
+            ins(t.integer, .{ .constant = seven }),
+            ins(t.integer, .{ .constant = seven }),
+            ins(t.integer, .{ .branch = .{ .condition = @enumFromInt(3), .then_start = 4, .else_start = 5, .then_value = @enumFromInt(4), .else_value = @enumFromInt(5) } }),
+            ins(t.integer, .{ .loop = .{ .condition_start = 1, .condition = @enumFromInt(1), .body_start = 2, .body = @enumFromInt(2), .else_start = 3, .else_value = @enumFromInt(6) } }),
+        };
+        const enclosing_branch = [_]Instruction{
+            ins(t.boolean, .{ .constant = falsity }),
+            ins(t.integer, .{ .constant = seven }), // visible in the enclosing then region
+            ins(t.boolean, .{ .constant = falsity }),
+            ins(t.integer, .{ .constant = seven }), // private to the inner loop body
+            ins(unit, .{ .constant = nothing }),
+            ins(t.integer, .{ .loop = .{ .condition_start = 2, .condition = @enumFromInt(2), .body_start = 3, .body = @enumFromInt(4), .else_start = 5, .else_value = @enumFromInt(1) } }),
+            ins(t.integer, .{ .constant = seven }),
+            ins(t.integer, .{ .branch = .{ .condition = @enumFromInt(0), .then_start = 1, .else_start = 6, .then_value = @enumFromInt(5), .else_value = @enumFromInt(6) } }),
+        };
+        const good: []const Instruction = switch (case) {
+            1 => &body_private,
+            2 => &continuation_private,
+            3 => &nested_body,
+            4 => &nested_exhaustion,
+            5 => &enclosing_branch,
+            else => unreachable,
+        };
+        const private: []const ValueId = switch (case) {
+            1 => &.{@enumFromInt(2)},
+            2 => &.{@enumFromInt(3)},
+            3 => &.{ @enumFromInt(3), @enumFromInt(4), @enumFromInt(5) },
+            4 => &.{ @enumFromInt(4), @enumFromInt(5) },
+            5 => &.{@enumFromInt(3)},
+            else => unreachable,
+        };
+        const result: ValueId = @enumFromInt(good.len - 1);
+        for (private) |value| {
+            const bad = try std.testing.allocator.dupe(Instruction, good);
+            defer std.testing.allocator.free(bad);
+            const loop_index = if (case == 5) 5 else good.len - 1;
+            bad[loop_index].op.loop.else_value = value;
+            errdefer std.debug.print("exhaustion visibility case {d}, private value {d}\n", .{ case, @intFromEnum(value) });
+            try LoopTests.reject(&t, error.InvalidValueId, bad, result);
+        }
+        try t.ir.setFunctionBody(t.function, good, result);
+        try t.ir.verify();
+    }
+}
+
+test "loop exhaustion regions verify boundaries privacy types and control ownership" {
+    var t = try TestFunctions.init(std.testing.allocator);
+    defer t.ir.deinit();
+    const unit = try t.ir.internType(.void);
+    const nothing = try t.ir.internConstant(.{ .ty = unit, .value = .void });
+    const truth = try t.ir.internConstant(.{ .ty = t.boolean, .value = .{ .boolean = true } });
+    const ins = TestFunctions.instruction;
+    const good = [_]Instruction{
+        ins(t.integer, .{ .parameter = 0 }), // 0 outer value
+        ins(t.boolean, .{ .constant = truth }), // 1 condition
+        ins(t.integer, .{ .parameter = 0 }), // 2 body
+        ins(t.integer, .{ .local_slot = @enumFromInt(2) }),
+        ins(unit, .{ .constant = nothing }),
+        ins(t.integer, .{ .parameter = 0 }), // 5 continuation
+        ins(unit, .{ .constant = nothing }),
+        ins(t.integer, .{ .parameter = 0 }), // 7 exhaustion
+        ins(t.integer, .{ .local_slot = @enumFromInt(7) }),
+        ins(t.integer, .{ .local_load = @enumFromInt(8) }),
+        ins(t.integer, .{ .loop = .{ .condition_start = 1, .body_start = 2, .continuation_start = 5, .else_start = 7, .condition = @enumFromInt(1), .body = @enumFromInt(4), .continuation = @enumFromInt(6), .else_value = @enumFromInt(9) } }),
+    };
+    for (0..19) |case| {
+        var bad = good;
+        const r = &bad[10].op.loop;
+        const expected: VerifyError = switch (case) {
+            0 => b: {
+                r.else_start = null;
+                break :b error.InvalidRegion;
+            },
+            1 => b: {
+                r.else_value = null;
+                break :b error.InvalidRegion;
+            },
+            2 => b: {
+                r.else_start = 2;
+                break :b error.InvalidRegion;
+            },
+            3 => b: {
+                r.else_start = 11;
+                break :b error.InvalidRegion;
+            },
+            4 => b: {
+                r.else_start = std.math.maxInt(u32);
+                break :b error.InvalidRegion;
+            },
+            5 => b: {
+                r.else_value = @enumFromInt(10);
+                break :b error.InvalidRegion;
+            },
+            6 => b: {
+                r.else_value = @enumFromInt(8);
+                break :b error.InvalidValueId;
+            },
+            7 => b: {
+                r.else_value = @enumFromInt(2);
+                break :b error.InvalidValueId;
+            },
+            8 => b: {
+                r.else_value = @enumFromInt(5);
+                break :b error.InvalidValueId;
+            },
+            9 => b: {
+                bad[9].op.local_load = @enumFromInt(3);
+                break :b error.InvalidValueId;
+            },
+            10 => b: {
+                bad[9] = ins(unit, .{ .constant = nothing });
+                break :b error.OperandTypeMismatch;
+            },
+            11 => b: {
+                bad[9] = ins(unit, .loop_continue);
+                break :b error.InvalidRegion;
+            },
+            12 => b: {
+                bad[9] = ins(unit, .{ .loop_break = null });
+                break :b error.InvalidRegion;
+            },
+            13 => b: {
+                r.returns = true;
+                break :b error.InvalidReturn;
+            },
+            14 => b: {
+                r.unconditional = true;
+                break :b error.InvalidRegion;
+            },
+            15 => b: {
+                r.continuation_start = 7;
+                break :b error.InvalidRegion;
+            },
+            16 => b: {
+                r.body = @enumFromInt(7);
+                break :b error.InvalidRegion;
+            },
+            17 => b: {
+                bad[9].span.end = t.ir.source_len + 1;
+                break :b error.InvalidSourceSpan;
+            },
+            18 => b: {
+                bad[7] = ins(unit, .{ .return_value = @enumFromInt(0) });
+                break :b error.UnreachableInstruction;
+            },
+            else => unreachable,
+        };
+        errdefer std.debug.print("exhaustion verifier case {d}\n", .{case});
+        try LoopTests.reject(&t, expected, &bad, @enumFromInt(10));
+    }
+    try LoopTests.reject(&t, error.InvalidValueId, &good, @enumFromInt(9));
+    var terminal = good;
+    terminal[9] = ins(unit, .{ .return_value = @enumFromInt(0) });
+    terminal[10].ty = unit;
+    try LoopTests.reject(&t, error.InvalidReturn, &terminal, @enumFromInt(10));
+    terminal[10].op.loop.returns = true;
+    try t.ir.validateBody(t.ir.functions.items[0], .{ .instructions = &terminal, .result = @enumFromInt(10) });
+    terminal[10].ty = t.integer;
+    try LoopTests.reject(&t, error.InvalidReturn, &terminal, @enumFromInt(10));
+    try t.ir.setFunctionBody(t.function, &good, @enumFromInt(10));
+    try t.ir.verify();
+    try std.testing.expectEqual(@as(?usize, null), enclosingLoop(t.ir.functions.items[0].body.?, 9));
+}
 
 test "loop continuation boundaries types and private sibling operands are verified" {
     var t = try TestFunctions.init(std.testing.allocator);

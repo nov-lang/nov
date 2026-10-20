@@ -413,6 +413,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
             value_used[@intFromEnum(region.condition)] = true;
             value_used[@intFromEnum(region.body)] = true;
             if (region.continuation) |value| value_used[@intFromEnum(value)] = true;
+            if (region.else_value) |value| value_used[@intFromEnum(value)] = true;
         },
         .loop_continue, .constant, .function_ref => {},
     };
@@ -469,9 +470,11 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
                     try w.print("    while (true) {{\n    goto nov_cond{d};\n    nov_cond{d}:;\n", .{ end, end });
                 }
                 if (region.body_start == i and !Ir.terminates(body, region.condition))
-                    try w.print("    if (!v{d}) goto nov_exit{d};\n", .{ @intFromEnum(region.condition), end });
+                    try w.print("    if (!v{d}) goto nov_{s}{d};\n", .{ @intFromEnum(region.condition), if (region.else_start != null) "else" else "exit", end });
                 if (region.continuation_start != null and region.continuation_start.? == i)
                     try w.print("    goto nov_cont{d};\n    nov_cont{d}:;\n", .{ end, end });
+                if (region.else_start != null and region.else_start.? == i)
+                    try w.print("    }}\n    goto nov_else{d};\n    nov_else{d}:;\n    {{\n", .{ end, end });
             } else if (candidate.op == .branch) {
                 const region = candidate.op.branch;
                 const has_value = ir.types.items[@intFromEnum(candidate.ty)] != .void;
@@ -493,6 +496,10 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
             }
         }
         if (instruction.op == .loop) {
+            if (instruction.op.loop.else_value) |value| {
+                if (ir.getType(instruction.ty).? != .void and !Ir.terminates(body, value))
+                    try w.print("    v{d} = v{d};\n", .{ i, @intFromEnum(value) });
+            }
             try w.print("    }}\n    goto nov_exit{d};\n    nov_exit{d}:;\n", .{ i, i });
             if (ir.getType(instruction.ty).? != .void and !value_used[i]) try w.print("    (void)v{d};\n", .{i});
             continue;
@@ -507,7 +514,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
                 }
                 try w.print("    goto nov_exit{d};\n", .{owner});
             } else {
-                const from_body = i >= loop.body_start and i < (loop.continuation_start orelse owner);
+                const from_body = i >= loop.body_start and i < (loop.continuation_start orelse loop.else_start orelse owner);
                 try w.print("    goto nov_{s}{d};\n", .{ if (from_body and loop.continuation != null) "cont" else "cond", owner });
             }
             continue;
@@ -1311,7 +1318,7 @@ test "array capacity and append length overflow panic before accessing backing" 
 }
 
 test "array allocation failure retries preserve roots and shutdown frees backing" {
-    for ([_][]const u8{ array_example, array_compound_effects, inferred_example, inferred_arrays, string_example, string_compound, unconditional_loops }, [_][]const u8{ "3 30 30 6\n454 15\n99 15 4\nfalse true 2\n0\n", array_compound_output, inferred_output, inferred_arrays_output, string_output, string_compound_output, unconditional_output }) |source, output| {
+    for ([_][]const u8{ array_example, array_compound_effects, inferred_example, inferred_arrays, string_example, string_compound, unconditional_loops, else_loops }, [_][]const u8{ "3 30 30 6\n454 15\n99 15 4\nfalse true 2\n0\n", array_compound_output, inferred_output, inferred_arrays_output, string_output, string_compound_output, unconditional_output, else_loop_output }) |source, output| {
         const c = try arrayTestProgram(source);
         defer test_gpa.free(c);
         const injected = try std.mem.concat(test_gpa, u8, &.{
@@ -1330,7 +1337,7 @@ test "array allocation failure retries preserve roots and shutdown frees backing
             c,
         });
         defer test_gpa.free(exhausted);
-        for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(exhausted, "typedef int nonempty_translation_unit;", 1, if (std.mem.eql(u8, source, inferred_example)) "7\n8\n" else if (std.mem.eql(u8, source, inferred_arrays)) "7\n" else "", "panic: GC allocation failed\n", mode);
+        for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(exhausted, "typedef int nonempty_translation_unit;", 1, if (std.mem.eql(u8, source, inferred_example)) "7\n8\n" else if (std.mem.eql(u8, source, inferred_arrays)) "7\n" else if (std.mem.eql(u8, source, else_loops)) "false true false\n42 42 5\nexhausted 5 3 3\ncondition continuation body\n10 11 12 14\n3 7\n31 32 3\ntrue\n" else "", "panic: GC allocation failed\n", mode);
     }
 }
 
@@ -1405,6 +1412,115 @@ test "continuation loops route nested branch short circuit and RHS controls in s
     defer test_gpa.free(c);
     for ([_][]const u8{ "-O0", "-O2" }) |mode|
         try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, continuation_output, "", mode);
+}
+
+const else_loops =
+    \\let plus: (n: int) -> int = n + 1
+    \\let search: (end: int, needle: int) -> bool = {
+    \\    let mut n: int = 0
+    \\    loop n < end : n += 1 {if n == needle {break true}} else {false}
+    \\}
+    \\let early: (where: int) -> int = {
+    \\    loop {if where == 0 {return 10}
+    \\        true} : {if where == 2 {return 12}} {
+    \\        if where == 1 {return 11}
+    \\        if where == 2 {continue}
+    \\        break
+    \\    } else {return 99}
+    \\    13
+    \\}
+    \\let fallback_return: () -> int = loop false {} else {return 14}
+    \\let choose: (take: bool) -> []int = {
+    \\    let mut a: []int = [3, 4]
+    \\    let mut result = loop take {break a} else {a}
+    \\    a[0] = 9
+    \\    a += [5]
+    \\    result[-1] = 8
+    \\    @println(a[0], a[-1], a.len, result[0], result[-1])
+    \\    return loop false {} else {result}
+    \\}
+    \\let join: (a: string, b: string, c: string) -> string = a + b + c
+    \\let main: () -> void = {
+    \\    @println(search(0, 0), search(3, 2), search(2, 2))
+    \\    let n: i8 = 42
+    \\    let from_else = loop false {break 1} else {n}
+    \\    let from_break = loop true {break n} else {2}
+    \\    let callable = loop false {break plus} else {plus}
+    \\    @println(from_else, from_break, callable(4))
+    \\    let mut checks: int = 0
+    \\    let mut steps: int = 0
+    \\    let mut bodies: int = 0
+    \\    let exhaustion = loop {checks += 1
+    \\        if checks == 1 {continue}
+    \\        checks < 5} : {steps += 1
+    \\        if steps == 1 {continue}} {
+    \\        bodies += 1
+    \\        continue
+    \\    } else {"exhausted"}
+    \\    @println(exhaustion, checks, steps, bodies)
+    \\    let a = loop {break "condition"
+    \\        } : {@println("bad continuation")} {} else {"bad else"}
+    \\    let b = loop true : {break "continuation"} {continue} else {"bad else"}
+    \\    let c = loop true {break "body"} else {"bad else"}
+    \\    @println(a, b, c)
+    \\    @println(early(0), early(1), early(2), fallback_return())
+    \\    let mut outer: int = 0
+    \\    loop outer < 3 : outer += 1 {
+    \\        loop false {} else {continue}
+    \\    }
+    \\    let result: int = loop : {@println("bad outer continuation")} {
+    \\        loop false {} else {break 7}
+    \\    }
+    \\    @println(outer, result)
+    \\    let mut phase: int = 0
+    \\    let condition_parent: int = loop {phase += 1
+    \\        if phase == 1 {loop false {} else {continue}}
+    \\        if phase == 3 {loop false {} else {break 31}}
+    \\        true} : {if phase == 2 {loop false {} else {continue}}} {} else {0}
+    \\    let continuation_parent: int = loop phase < 4 : {
+    \\        loop false {} else {break 32}
+    \\    } {} else {0}
+    \\    @println(condition_parent, continuation_parent, phase)
+    \\    let nested = loop false {} else {loop true {break true} else {false}}
+    \\    @println(nested)
+    \\    let x = choose(true)
+    \\    let y = choose(false)
+    \\    let pressure: []int = [99]
+    \\    @println(x[0], x[-1], y[0], y[-1], pressure.len)
+    \\    let mut text = "a" + "b"
+    \\    let shared = loop false {} else {text}
+    \\    text += "c"
+    \\    @println(join("L" + "!", loop false {} else {shared + "!"}, "R" + "!"), text, shared)
+    \\}
+;
+const else_loop_output = "false true false\n42 42 5\nexhausted 5 3 3\ncondition continuation body\n10 11 12 14\n3 7\n31 32 3\ntrue\n9 5 3 3 8\n9 5 3 3 8\n3 8 3 8 1\nL!ab!R! abc ab\n";
+
+test "break operands infer owner target controls before their eventual values" {
+    for ([_][]const u8{
+        "loop false {} else {break n}",
+        "{break n}",
+        "1 + {break n}",
+        "identity({break n})",
+        "{let inner = loop false {break wide} else {wide}\nbreak n}",
+    }) |operand| {
+        const source = try std.fmt.allocPrint(
+            test_gpa,
+            "let identity: (n: i8) -> i8 = n\nlet main: () -> void = {{let n: i8 = 7\nlet wide: i16 = 8\nlet x = loop true {{if false {{break 1}}\nbreak {s}}} else {{2}}\n@println(x)}}",
+            .{operand},
+        );
+        defer test_gpa.free(source);
+        const c = try emitSource(source, null);
+        defer test_gpa.free(c);
+        for ([_][]const u8{ "-O0", "-O2" }) |mode|
+            try compileAndRunMode(c, "void nov_main(void);\nint main(void) { nov_main(); return 0; }", 0, "7\n", "", mode);
+    }
+}
+
+test "conditional loop else results exhaust break return and target parent controls" {
+    const c = try arrayTestProgram(else_loops);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O2" }) |mode|
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, else_loop_output, "", mode);
 }
 
 const value_loops =
@@ -1491,6 +1607,24 @@ test "value loops merge scalar function and managed results with every allocatio
         try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, value_loop_output, "", mode);
 }
 
+test "loop exhaustion strings share backing without allocation and terminal fallbacks pop roots" {
+    const library = try emitSource(
+        \\let make: () -> string = "a" + "b"
+        \\let share: (s: string) -> string = loop false {} else {s}
+        \\let early: (s: string) -> string = loop false {} else {return s}
+    , null);
+    defer test_gpa.free(library);
+    const c = try std.mem.concat(test_gpa, u8, &.{
+        library,
+        "\nint main(void) { nov_rt_heap.collect_every_allocation = 1; nov_string s = nov_make(); nov_string t = nov_share(s); " ++
+            "nov_string u = nov_early(t); if (!s.owner || s.owner != t.owner || s.owner != u.owner || s.data != u.data) return 1; " ++
+            "if (nov_rt_heap.live_objects != 1 || nov_rt_heap.frames) return 2; nov_gc_shutdown(&nov_rt_heap); return 0; }\n",
+    });
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O2" }) |mode|
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "", "", mode);
+}
+
 test "value loop string breaks share backing without allocating" {
     const library = try emitSource(
         \\let make: () -> string = loop {break "a" + "b"}
@@ -1510,7 +1644,7 @@ test "value loop string breaks share backing without allocating" {
 }
 
 test "loop continuations and value results execute before formatting" {
-    for ([_][]const u8{ continuation_loops, value_loops }, [_][]const u8{ continuation_output, value_loop_output }) |source, output| {
+    for ([_][]const u8{ continuation_loops, value_loops, else_loops }, [_][]const u8{ continuation_output, value_loop_output, else_loop_output }) |source, output| {
         const library = try emitSource(source, null);
         defer test_gpa.free(library);
         const c = try collectingTestProgram(library);
@@ -1521,7 +1655,7 @@ test "loop continuations and value results execute before formatting" {
 }
 
 test "continuation and value loop lowering and emission survive every allocation failure" {
-    for ([_][]const u8{ continuation_loops, value_loops }) |source|
+    for ([_][]const u8{ continuation_loops, value_loops, else_loops }) |source|
         try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{source});
 }
 

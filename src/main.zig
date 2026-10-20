@@ -477,6 +477,7 @@ test "format executable programs without changing generated C or runtime behavio
             ,
             .output = "1\n3\n7\n8\n0 false true 42 3 7 8\n9\n",
         },
+        .{ .source = "let search:(end:int,needle:int)->bool={let mut n:int=0\nloop n<end:n+=1{if n==needle{break true}}else{false}}\nlet main:()->void=@println(search(0,0),search(3,2),search(2,2))", .output = "false true false\n" },
         .{ .source = "let main:()->void={let n:int=1 / 0\n@println(n)}", .output = "", .code = 1, .stderr = "panic: division by zero\n" },
     };
     const zig_exe = std.testing.environ.getAlloc(allocator, "NOV_TEST_ZIG") catch null;

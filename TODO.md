@@ -430,9 +430,14 @@ Approved and implemented: condition/unconditional loops support optional
 `: continuation` clauses. Body-side `continue` runs the continuation; `continue`
 in the condition or continuation reevaluates the condition directly. `break` and
 `return` skip the continuation. Unconditional loops can yield `break value` with
-an exact inferred/contextual result type. Conditional loops remain void until
-zero-iteration/loop-else result rules are settled. Labels and iterator/range forms
-remain deferred; see README for executable syntax and restrictions.
+an exact inferred/contextual result type. Conditional loops with `else` now yield
+an exactly compatible break or exhaustion result with bidirectional inference.
+`else` runs on condition false, including zero iterations, and is skipped by break
+or return. It is outside the completed loop's control scope: its break/continue
+target an outer loop or diagnose. Terminal exhaustion paths do not contribute a
+merge value. Arrays copy at value boundaries; strings share. Conditional loops
+without `else` remain void and reject value breaks; unconditional `else` remains
+rejected. Labels and iterator/range forms remain deferred; see README for syntax.
 
 - loop over multiple values with iterators, how? they need to have the same length
 - allow backward iteration, this means that indexes are int instead of uint?
