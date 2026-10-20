@@ -9,11 +9,13 @@ const Dependencies = @import("Dependencies.zig");
 const Lowering = @import("Lowering.zig");
 const CEmitter = @import("CEmitter.zig");
 const Driver = @import("Driver.zig");
+const FmtPaths = @import("FmtPaths.zig");
 
 const params = clap.parseParamsComptime(
     \\-h, --help             Display this help and exit.
     \\-v, --version          Display the version and exit.
     \\--check                Check formatting without changing files (fmt only).
+    \\--exclude <str>...      Exclude a literal file/directory path (fmt only).
     \\--semantic             Check the bounded semantic/lowering subset (check only).
     \\--debug                Compile with -O0 -g (build/run only).
     \\--release              Compile with -O2 (default; build/run only).
@@ -26,7 +28,8 @@ const params = clap.parseParamsComptime(
 fn usage(writer: *std.Io.Writer) !void {
     try writer.writeAll(
         \\Usage: nov check [--semantic] <file>...
-        \\       nov fmt [--check] <file>...
+        \\       nov fmt [--check] [--exclude <path>] <file|directory>...
+        \\       nov fmt [--check] -
         \\       nov emit-c <file>
         \\       nov [build] <file> [-o|--output <path>] [--cc <executable>] [--debug|--release]
         \\       nov run <file> [--cc <executable>] [--debug|--release]
@@ -118,6 +121,17 @@ pub fn main(init: std.process.Init) !u8 {
         try stderr.writeAll("error: --check requires the fmt command\n");
         return 1;
     }
+    if (res.args.exclude.len != 0 and !is_fmt) {
+        try stderr.writeAll("error: --exclude requires the fmt command\n");
+        return 1;
+    }
+    for (res.args.exclude) |path| {
+        if (path.len == 0) {
+            try stderr.writeAll("error: --exclude requires a nonempty path\n");
+            return 1;
+        }
+    }
+
     if (is_build or is_run) {
         const files = if (implicit_build) args else args[1..];
         if (files.len != 1) {
@@ -149,6 +163,26 @@ pub fn main(init: std.process.Init) !u8 {
         return 1;
     }
 
+    if (is_fmt) {
+        for (args[1..]) |path| {
+            if (!std.mem.eql(u8, path, "-")) continue;
+            if (args.len != 2 or res.args.exclude.len != 0) {
+                try stderr.writeAll("error: fmt stdin '-' requires sole input and cannot use --exclude\n");
+                return 1;
+            }
+            var input_buffer: [4096]u8 = undefined;
+            var input = std.Io.File.stdin().readerStreaming(init.io, &input_buffer);
+            var output_buffer: [4096]u8 = undefined;
+            var output = std.Io.File.stdout().writer(init.io, &output_buffer);
+            const valid = formatStdin(init.gpa, &input.interface, &output.interface, stderr, res.args.check != 0) catch |err| {
+                try stderr.print("<stdin>: error: {s}\n", .{@errorName(err)});
+                return 1;
+            };
+            try output.interface.flush();
+            return if (valid) 0 else 1;
+        }
+        return if (try formatPaths(init.io, init.gpa, args[1..], res.args.exclude, stderr, res.args.check != 0)) 0 else 1;
+    }
     var failed = false;
     for (args[1..]) |path| {
         const valid = processFile(init.io, init.gpa, path, stderr, is_fmt, res.args.check != 0, res.args.semantic != 0) catch |err| {
@@ -159,6 +193,66 @@ pub fn main(init: std.process.Init) !u8 {
         failed = failed or !valid;
     }
     return if (failed) 1 else 0;
+}
+
+fn formatPaths(io: std.Io, allocator: std.mem.Allocator, inputs: []const []const u8, exclusions: []const []const u8, stderr: *std.Io.Writer, check_only: bool) !bool {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const cwd = std.Io.Dir.cwd();
+    const base = try cwd.realPathFileAlloc(io, ".", scratch);
+    var excluded: std.ArrayList([]const u8) = .empty;
+    for (exclusions) |path| {
+        try excluded.append(scratch, try std.fs.path.resolve(scratch, &.{ base, path }));
+        // Also exclude aliases to an existing target. Nonexistent exclusions are valid.
+        if (cwd.realPathFileAlloc(io, path, scratch)) |resolved| {
+            try excluded.append(scratch, resolved);
+        } else |_| {}
+    }
+    var paths: FmtPaths = .{ .io = io, .allocator = scratch, .stderr = stderr, .exclusions = excluded.items, .base = base };
+    try paths.collect(inputs);
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    for (paths.files.items) |path| {
+        const resolved = cwd.realPathFileAlloc(io, path, scratch) catch |err| {
+            try stderr.print("{s}: error: {s}\n", .{ path, @errorName(err) });
+            paths.failed = true;
+            continue;
+        };
+        const entry = try seen.getOrPut(scratch, resolved);
+        if (entry.found_existing) continue;
+        const valid = processFile(io, allocator, path, stderr, true, check_only, false) catch |err| {
+            try stderr.print("{s}: error: {s}\n", .{ path, @errorName(err) });
+            paths.failed = true;
+            continue;
+        };
+        paths.failed = paths.failed or !valid;
+    }
+    return !paths.failed;
+}
+
+fn formatStdin(allocator: std.mem.Allocator, input: *std.Io.Reader, output: *std.Io.Writer, stderr: *std.Io.Writer, check_only: bool) !bool {
+    const source = try input.allocRemainingAlignedSentinel(allocator, .limited(1024 * 1024), .of(u8), 0);
+    defer allocator.free(source);
+    if (std.mem.indexOfScalar(u8, source, 0) != null) return error.InvalidSource;
+    var ast = try Parser.parse(allocator, source);
+    defer ast.deinit(allocator);
+    try Diagnostics.render(ast, "<stdin>", stderr);
+    if (ast.errors.len != 0) return false;
+    const formatted = Formatter.format(allocator, source) catch |err| switch (err) {
+        error.UnsupportedSyntax => {
+            try stderr.writeAll("<stdin>: error: formatting this syntax is not supported yet\n");
+            return false;
+        },
+        else => return err,
+    };
+    defer allocator.free(formatted);
+    if (check_only) {
+        if (std.mem.eql(u8, source, formatted)) return true;
+        try stderr.writeAll("<stdin>: error: input is not formatted\n");
+        return false;
+    }
+    try output.writeAll(formatted);
+    return true;
 }
 
 fn processFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, stderr: *std.Io.Writer, is_fmt: bool, check_only: bool, semantic: bool) !bool {
@@ -191,6 +285,7 @@ fn processFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, stder
     }
 
     try replaceFormattedFile(io, allocator, resolved, source, formatted);
+    try stderr.print("{s}\n", .{path});
     return true;
 }
 
@@ -432,6 +527,207 @@ test "format executable programs without changing generated C or runtime behavio
             try std.testing.expectEqualStrings(program.stderr, ran.stderr);
         }
     }
+}
+
+test "recursive formatting sorts reports deduplicates inputs and prunes literal exclusions" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "nested/skip");
+    try tmp.dir.createDirPath(io, "nested/skip-more");
+    for ([_][]const u8{ "z.nov", "a.nov", "nested/b.nov", "nested/skip/no.nov", "nested/skip-more/yes.nov", "ignored.txt", "UPPER.NOV" }) |name| {
+        try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "let x=1\n" });
+    }
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const a = try std.fs.path.join(allocator, &.{ root, "a.nov" });
+    defer allocator.free(a);
+    const skip = try std.fs.path.join(allocator, &.{ root, "nested/skip/../skip" });
+    defer allocator.free(skip);
+    const skip_z = try std.fs.path.join(allocator, &.{ root, "z.nov" });
+    defer allocator.free(skip_z);
+    var diagnostics = std.Io.Writer.Allocating.init(allocator);
+    defer diagnostics.deinit();
+    try std.testing.expect(try formatPaths(io, allocator, &.{ root, a, root }, &.{ skip, skip_z }, &diagnostics.writer, false));
+    const expected = try std.fmt.allocPrint(allocator, "{s}/a.nov\n{s}/nested/b.nov\n{s}/nested/skip-more/yes.nov\n", .{ root, root, root });
+    defer allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, diagnostics.written());
+    for ([_][]const u8{ "z.nov", "nested/skip/no.nov", "ignored.txt", "UPPER.NOV" }) |name| {
+        const actual = try tmp.dir.readFileAlloc(io, name, allocator, .limited(4096));
+        defer allocator.free(actual);
+        try std.testing.expectEqualStrings("let x=1\n", actual);
+    }
+    diagnostics.clearRetainingCapacity();
+    try std.testing.expect(try formatPaths(io, allocator, &.{root}, &.{ skip, skip_z }, &diagnostics.writer, true));
+    try std.testing.expectEqualStrings("", diagnostics.written());
+}
+
+test "formatter empty selections succeed and explicit extensionless files remain supported" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    var diagnostics = std.Io.Writer.Allocating.init(allocator);
+    defer diagnostics.deinit();
+    try std.testing.expect(try formatPaths(io, allocator, &.{root}, &.{}, &diagnostics.writer, false));
+    try tmp.dir.writeFile(io, .{ .sub_path = "source", .data = "let x=1\n" });
+    const file = try std.fs.path.join(allocator, &.{ root, "source" });
+    defer allocator.free(file);
+    try std.testing.expect(try formatPaths(io, allocator, &.{root}, &.{root}, &diagnostics.writer, false));
+    try std.testing.expectEqualStrings("", diagnostics.written());
+    try std.testing.expect(try formatPaths(io, allocator, &.{ root, file, file }, &.{}, &diagnostics.writer, false));
+    const expected = try std.fmt.allocPrint(allocator, "{s}\n", .{file});
+    defer allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, diagnostics.written());
+}
+
+test "recursive check and errors never stop other supported files" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.nov", .data = "let x=1\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b.nov", .data = "let x = [1]\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "c.nov", .data = "let x=\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "z.nov", .data = "let z=2\n" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const missing = try std.fs.path.join(allocator, &.{ root, "missing" });
+    defer allocator.free(missing);
+    var diagnostics = std.Io.Writer.Allocating.init(allocator);
+    defer diagnostics.deinit();
+    try std.testing.expect(!try formatPaths(io, allocator, &.{ missing, root }, &.{}, &diagnostics.writer, true));
+    const before = try tmp.dir.readFileAlloc(io, "z.nov", allocator, .limited(4096));
+    defer allocator.free(before);
+    try std.testing.expectEqualStrings("let z=2\n", before);
+    try std.testing.expect(!try formatPaths(io, allocator, &.{ root, missing }, &.{}, &diagnostics.writer, false));
+    const after = try tmp.dir.readFileAlloc(io, "z.nov", allocator, .limited(4096));
+    defer allocator.free(after);
+    try std.testing.expectEqualStrings("let z = 2\n", after);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.written(), "FileNotFound") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.written(), "not supported yet") != null);
+}
+
+test "formatter preserves file symlinks permissions and avoids directory cycles" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "dir");
+    try tmp.dir.writeFile(io, .{ .sub_path = "target.nov", .data = "let x=1\n" });
+    try tmp.dir.setFilePermissions(io, "target.nov", .fromMode(0o640), .{});
+    try tmp.dir.symLink(io, "target.nov", "a.nov", .{});
+    try tmp.dir.symLink(io, "..", "dir/cycle.nov", .{ .is_directory = true });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    var diagnostics = std.Io.Writer.Allocating.init(allocator);
+    defer diagnostics.deinit();
+    try std.testing.expect(try formatPaths(io, allocator, &.{root}, &.{}, &diagnostics.writer, false));
+    const expected = try std.fmt.allocPrint(allocator, "{s}/a.nov\n", .{root});
+    defer allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, diagnostics.written());
+    const link = try tmp.dir.statFile(io, "a.nov", .{ .follow_symlinks = false });
+    try std.testing.expectEqual(.sym_link, link.kind);
+    const target = try tmp.dir.statFile(io, "target.nov", .{});
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o640), target.permissions.toMode() & 0o7777);
+    const actual = try tmp.dir.readFileAlloc(io, "target.nov", allocator, .limited(4096));
+    defer allocator.free(actual);
+    try std.testing.expectEqualStrings("let x = 1\n", actual);
+}
+
+test "formatter excludes symlink targets and diagnoses broken links while continuing" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "target.nov", .data = "let x=1\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "z.nov", .data = "let z=2\n" });
+    try tmp.dir.symLink(io, "target.nov", "alias.nov", .{});
+    try tmp.dir.symLink(io, "absent", "broken.nov", .{});
+    try tmp.dir.symLink(io, "loop.nov", "loop.nov", .{});
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const target = try std.fs.path.join(allocator, &.{ root, "target.nov" });
+    defer allocator.free(target);
+    var diagnostics = std.Io.Writer.Allocating.init(allocator);
+    defer diagnostics.deinit();
+    try std.testing.expect(!try formatPaths(io, allocator, &.{root}, &.{target}, &diagnostics.writer, false));
+    const actual = try tmp.dir.readFileAlloc(io, "target.nov", allocator, .limited(4096));
+    defer allocator.free(actual);
+    try std.testing.expectEqualStrings("let x=1\n", actual);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.written(), "broken.nov: error:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.written(), "loop.nov: error:") != null);
+    try std.testing.expect(std.mem.endsWith(u8, diagnostics.written(), "/z.nov\n"));
+}
+
+test "unreadable formatter input reports failure and continues" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.nov", .data = "let x=1\n" });
+    try tmp.dir.setFilePermissions(io, "a.nov", .fromMode(0), .{});
+    defer tmp.dir.setFilePermissions(io, "a.nov", .fromMode(0o600), .{}) catch {};
+    if (tmp.dir.openFile(io, "a.nov", .{})) |file| {
+        file.close(io);
+        return error.SkipZigTest; // Privileged test processes bypass permission denial.
+    } else |_| {}
+    try tmp.dir.createDirPath(io, "locked");
+    try tmp.dir.setFilePermissions(io, "locked", .fromMode(0), .{});
+    defer tmp.dir.setFilePermissions(io, "locked", .fromMode(0o700), .{}) catch {};
+    try tmp.dir.writeFile(io, .{ .sub_path = "z.nov", .data = "let z=2\n" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    var diagnostics = std.Io.Writer.Allocating.init(allocator);
+    defer diagnostics.deinit();
+    try std.testing.expect(!try formatPaths(io, allocator, &.{root}, &.{}, &diagnostics.writer, false));
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.written(), "a.nov: error:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.written(), "locked: error:") != null);
+    const actual = try tmp.dir.readFileAlloc(io, "z.nov", allocator, .limited(4096));
+    defer allocator.free(actual);
+    try std.testing.expectEqualStrings("let z = 2\n", actual);
+}
+
+test "stdin formatting buffers validation and check never emits source" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { source: []const u8, check: bool = false, valid: bool, output: []const u8 = "" }{
+        .{ .source = "let x=1", .valid = true, .output = "let x = 1\n" },
+        .{ .source = "", .valid = true },
+        .{ .source = "let x = 1\n", .valid = true, .output = "let x = 1\n" },
+        .{ .source = "let x=1", .check = true, .valid = false },
+        .{ .source = "let x = 1\n", .check = true, .valid = true },
+        .{ .source = "let x=", .valid = false },
+        .{ .source = "let x=[1]", .valid = false },
+    };
+    for (cases) |case| {
+        var input = std.Io.Reader.fixed(case.source);
+        var output = std.Io.Writer.Allocating.init(allocator);
+        defer output.deinit();
+        var diagnostics = std.Io.Writer.Allocating.init(allocator);
+        defer diagnostics.deinit();
+        try std.testing.expectEqual(case.valid, try formatStdin(allocator, &input, &output.writer, &diagnostics.writer, case.check));
+        try std.testing.expectEqualStrings(case.output, output.written());
+        if (!case.valid) try std.testing.expect(std.mem.startsWith(u8, diagnostics.written(), "<stdin>:"));
+    }
+    const oversized = try allocator.alloc(u8, 1024 * 1024 + 1);
+    defer allocator.free(oversized);
+    @memset(oversized, ' ');
+    var too_long = std.Io.Reader.fixed(oversized);
+    var discard: std.Io.Writer.Discarding = .init(&.{});
+    try std.testing.expectError(error.StreamTooLong, formatStdin(allocator, &too_long, &discard.writer, &discard.writer, false));
+    var nul = std.Io.Reader.fixed("let x=1\x00");
+    var output = std.Io.Writer.Allocating.init(allocator);
+    defer output.deinit();
+    var diagnostics = std.Io.Writer.Allocating.init(allocator);
+    defer diagnostics.deinit();
+    try std.testing.expectError(error.InvalidSource, formatStdin(allocator, &nul, &output.writer, &diagnostics.writer, false));
+    try std.testing.expectEqualStrings("", output.written());
 }
 
 test "formatting refuses to overwrite a changed source" {

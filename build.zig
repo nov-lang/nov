@@ -164,6 +164,12 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         .{ .name = "check missing source", .args = &.{ "check", "missing.nov" }, .exit_code = 1, .stderr_match = "missing.nov: error: FileNotFound" },
         .{ .name = "check multiple valid files", .args = &.{ "check", "valid.nov", "another-valid.nov" }, .exit_code = 0 },
         .{ .name = "check mixed files", .args = &.{ "check", "valid.nov", "invalid.nov", "another-valid.nov" }, .exit_code = 1, .stderr_match = "invalid.nov:1:13: error:" },
+        .{ .name = "fmt rejects mixed stdin", .args = &.{ "fmt", "-", "valid.nov" }, .exit_code = 1, .stderr_match = "requires sole input" },
+        .{ .name = "fmt rejects duplicate stdin", .args = &.{ "fmt", "-", "-" }, .exit_code = 1, .stderr_match = "requires sole input" },
+        .{ .name = "fmt rejects stdin exclusions", .args = &.{ "fmt", "-", "--exclude", "valid.nov" }, .exit_code = 1, .stderr_match = "cannot use --exclude" },
+        .{ .name = "fmt rejects empty exclusion", .args = &.{ "fmt", "valid.nov", "--exclude", "" }, .exit_code = 1, .stderr_match = "nonempty path" },
+        .{ .name = "check rejects exclusion", .args = &.{ "check", "valid.nov", "--exclude", "valid.nov" }, .exit_code = 1, .stderr_match = "--exclude requires" },
+        .{ .name = "fmt literal exclusions repeat", .args = &.{ "fmt", "--check", "needs-format.nov", "invalid.nov", "valid.nov", "--exclude", "needs-format.nov", "--exclude", "invalid.nov" }, .exit_code = 0 },
         .{ .name = "fmt check formatted", .args = &.{ "fmt", "--check", "valid.nov" }, .exit_code = 0 },
         .{ .name = "fmt check needs formatting", .args = &.{ "fmt", "--check", "needs-format.nov" }, .exit_code = 1, .stderr_match = "needs-format.nov" },
     };
@@ -192,6 +198,27 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
             run.expectStdErrMatch("require the build or run command");
             test_step.dependOn(&run.step);
         }
+    }
+
+    const stdin_cases = [_]struct { source: []const u8, check: bool = false, output: []const u8 = "", diagnostic: ?[]const u8 = null, code: u8 = 0 }{
+        .{ .source = "let x=1", .output = "let x = 1\n" },
+        .{ .source = "let x = 1\n", .output = "let x = 1\n" },
+        .{ .source = "" },
+        .{ .source = "let x=1", .check = true, .diagnostic = "<stdin>: error: input is not formatted", .code = 1 },
+        .{ .source = "let x = 1\n", .check = true },
+        .{ .source = "let x=", .diagnostic = "<stdin>:1:7: error:", .code = 1 },
+        .{ .source = "let x=[1]", .diagnostic = "<stdin>: error: formatting this syntax is not supported yet", .code = 1 },
+    };
+    for (stdin_cases, 0..) |case, index| {
+        const run = b.addRunArtifact(exe);
+        run.step.name = b.fmt("CLI: fmt stdin {d}", .{index});
+        run.addArgs(&.{ "fmt", "-" });
+        if (case.check) run.addArg("--check");
+        run.setStdIn(.{ .bytes = case.source });
+        run.expectExitCode(case.code);
+        run.expectStdOutEqual(case.output);
+        if (case.diagnostic) |message| run.expectStdErrMatch(message) else run.expectStdErrEqual("");
+        test_step.dependOn(&run.step);
     }
 
     // An isolated PATH exercises real `zig cc` discovery, independent of host CC.

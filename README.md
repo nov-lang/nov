@@ -318,7 +318,55 @@ unsupported and diagnosed; no loop-result/value-break semantics are introduced.
 
 Format files in place with `zig build run -- fmt file.nov`, or use
 `zig build run -- fmt --check file.nov` to check formatting without writing.
-Both commands accept multiple file paths. Formatting supports scalar `let`/`let mut`
+Both commands accept multiple files and directories:
+
+```sh
+nov fmt src examples --exclude src/generated --exclude examples/broken.nov
+nov fmt --check . --exclude vendor
+nov fmt - < input.nov > formatted.nov
+nov fmt --check - < input.nov
+```
+
+Directories are scanned recursively for case-sensitive `.nov` filenames only;
+explicit files retain the previous behavior and need not have that extension.
+Hidden directories are included: there are no implicit ignore rules. Repeatable
+`--exclude <path>` options exclude literal files or whole directory subtrees,
+including explicit inputs, with path-component boundaries (`vendor` does not
+exclude `vendor-old`). Paths are resolved lexically against the working directory;
+`..` and trailing separators are normalized. Exclusions are not globs, basename
+patterns, or gitignore rules. Existing exclusion targets are also resolved so file
+symlink aliases cannot reinclude an excluded target. Missing exclusions are valid.
+
+Directory symlink entries are skipped, even as explicit inputs; scans never recurse
+through them. Explicit paths may still contain symlink ancestors resolved by the OS.
+File symlinks are supported: replacement updates the resolved target and preserves
+the link. Broken/cyclic selected file links are errors. Inputs are sorted by normalized
+absolute path (bytewise, case-sensitive), and repeated/overlapping inputs and file
+symlink aliases are processed once per resolved path; the first sorted alias is used
+for reporting. Hard-link identity is not deduplicated. Successful writes report one
+absolute path per changed file to stderr in sorted order; unchanged files are silent.
+Traversal errors are reported in sorted traversal order before file processing.
+Unreadable inputs, traversal errors, invalid or unsupported sources fail the command
+but do not stop other selected files. An empty or fully excluded selection succeeds.
+`--check` never writes or reports successful changes: unformatted inputs receive
+stderr diagnostics and cause exit status 1 (as do other input errors).
+
+`-` must be the sole input and cannot be combined with `--exclude`; build/run flags
+and `--semantic` remain invalid for `fmt`. Stdin formatting writes only validated
+formatted source to stdout, with diagnostics labeled `<stdin>` on stderr and no
+changed-file report. `--check -` emits no source, succeeds for already formatted
+input, and otherwise diagnoses the input and exits 1. Empty stdin succeeds. Both
+file and stdin sources have a 1 MiB limit; NUL bytes are rejected. Input validation
+failure emits no partial formatted source (an output I/O failure can still leave a
+partial stream).
+
+File replacement is atomic and retains permissions. A source-content recheck refuses
+to overwrite concurrent edits detected before rename. There is still a final rename
+race, and traversal/path resolution is not a security boundary against concurrent
+symlink changes. Ownership, hard-link relationships and other metadata are not
+promised to survive replacement.
+
+Formatting supports scalar `let`/`let mut`
 declarations, literals and operators, function signatures and bodies, calls (including
 `@print`/`@println`), local blocks, `if`/`else if`/`else`, condition loops, returns,
 unlabeled `break`/`continue`, and direct identifier assignments (`=`, `+=`, `-=`,
