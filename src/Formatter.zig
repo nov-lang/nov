@@ -7,7 +7,8 @@ const Tokenizer = @import("Tokenizer.zig");
 /// local blocks, if/else, loops with optional conditions/continuations, returns,
 /// unlabeled loop controls (including value-bearing breaks),
 /// direct identifier assignments, scalar array types/literals/indexing/.len,
-/// membership (`in`, not ranges), and indexed assignments to direct identifiers.
+/// membership (`in`, not ranges), scalar match/prongs, unary pipes,
+/// and indexed assignments to direct identifiers.
 /// Formatting is syntactic,
 /// not a scope, mutability, or type check. Preserves line/doc comments and tokens.
 /// All other AST tags and quoted identifiers/BOMs/shebangs are unsupported.
@@ -60,6 +61,10 @@ fn checkSupported(ast: Ast) !void {
         .block_newline,
         .@"if",
         .if_else,
+        .match,
+        .match_case_one,
+        .match_case,
+        .function_pipe,
         .loop_condition,
         .loop_cont,
         .loop_else,
@@ -312,7 +317,7 @@ test "unsupported syntax fails closed including nested expressions" {
         "let x=&value\n",
 
         "let x=.value\n",
-        "let x=a |> b\n",
+
         "let @\"x\"=1\n",
         "#!nov\nlet x=1\n",
         "\xEF\xBB\xBFlet x=1\n",
@@ -322,6 +327,26 @@ test "unsupported syntax fails closed including nested expressions" {
         if (ast.errors.len != 0) std.debug.print("invalid unsupported test fixture: {s}\n", .{source});
         try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
         try std.testing.expectError(error.UnsupportedSyntax, format(std.testing.allocator, source));
+    }
+}
+
+fn testMatchFormatAllocationFailures(allocator: std.mem.Allocator, source: [:0]const u8) !void {
+    const result = try format(allocator, source);
+    defer allocator.free(result);
+}
+
+test "match and pipes preserve comments tokens private blocks and multiline prongs" {
+    for ([_][:0]const u8{
+        "let f:(n:int)->int=match n {0 | 1=>n\n_=>n}\nlet main:()=10 |> f |> @println\n",
+        "let f:(n:int)->int=match n, ; subject\nn {; prongs\n0 | 1, ; alternatives and position\n_, => {; block\nlet x:int=n\nx} ; selected\n; fallback\n_ => n ; tail\n}\n",
+        "let f:(n:int)->int=match n {0=>match n {0=>1\n_=>2}\n_=>3}\n",
+        "let x=match true {} ; empty\n",
+        "let x=match true {; empty\n}\n",
+    }) |source| {
+        const result = try format(std.testing.allocator, source);
+        defer std.testing.allocator.free(result);
+        try expectFormatted(source, result);
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{source});
     }
 }
 
@@ -345,16 +370,17 @@ test "executable local blocks round trip" {
 
 test "every unsupported AST tag is rejected before rendering" {
     const supported = [_]Ast.Node.Tag{
-        .root,                 .decl,          .identifier,       .number_literal,   .char_literal,      .string_literal,
-        .add,                  .sub,           .mul,              .div,              .mod,               .shl,
-        .shr,                  .bit_and,       .bit_or,           .bit_xor,          .equal_equal,       .bang_equal,
-        .less_than,            .less_or_equal, .greater_than,     .greater_or_equal, .bool_and,          .bool_or,
-        .negation,             .bool_not,      .bit_not,          .fn_proto_one,     .fn_proto,          .call_one,
-        .call_one_comma,       .call,          .call_comma,       .block_two,        .block_two_newline, .block,
-        .block_newline,        .@"if",         .if_else,          .loop_condition,   .loop_cont,         .loop_else,
-        .@"return",            .@"break",      .@"continue",      .assign,           .assign_add,        .assign_sub,
-        .assign_mul,           .assign_div,    .assign_mod,       .builtin_literal,  .array_type,        .array_init_two,
-        .array_init_two_comma, .array_init,    .array_init_comma, .array_access,     .field_access,      .in,
+        .root,                 .decl,           .identifier,       .number_literal,   .char_literal,      .string_literal,
+        .add,                  .sub,            .mul,              .div,              .mod,               .shl,
+        .shr,                  .bit_and,        .bit_or,           .bit_xor,          .equal_equal,       .bang_equal,
+        .less_than,            .less_or_equal,  .greater_than,     .greater_or_equal, .bool_and,          .bool_or,
+        .negation,             .bool_not,       .bit_not,          .fn_proto_one,     .fn_proto,          .call_one,
+        .call_one_comma,       .call,           .call_comma,       .block_two,        .block_two_newline, .block,
+        .block_newline,        .@"if",          .if_else,          .loop_condition,   .loop_cont,         .loop_else,
+        .@"return",            .@"break",       .@"continue",      .assign,           .assign_add,        .assign_sub,
+        .assign_mul,           .assign_div,     .assign_mod,       .builtin_literal,  .array_type,        .array_init_two,
+        .array_init_two_comma, .array_init,     .array_init_comma, .array_access,     .field_access,      .in,
+        .match,                .match_case_one, .match_case,       .function_pipe,
     };
     var ast = try Parser.parse(std.testing.allocator, "let x=1\n");
     defer ast.deinit(std.testing.allocator);

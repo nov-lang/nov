@@ -301,6 +301,12 @@ const Context = struct {
                     (try self.probeBreaks(branch.then_expr, depth + 1)) orelse
                     (try self.probeBreaks(branch.else_expr, depth + 1));
             },
+            .match => {
+                const match = ast.fullMatch(node).?.ast;
+                for (match.subjects) |subject| if (try self.probeBreaks(subject, depth + 1)) |known| return known;
+                for (match.cases) |case| if (try self.probeBreaks(ast.fullMatchCase(case).?.ast.target_expr, depth + 1)) |known| return known;
+            },
+            .function_pipe => return (try self.probeBreaks(data.rhs, depth + 1)) orelse try self.probeBreaks(data.lhs, depth + 1),
             .call, .call_one => {
                 const call = ast.fullCall(node).?;
                 if (try self.probeBreaks(call.ast.fn_expr, depth + 1)) |known| return known;
@@ -390,6 +396,18 @@ const Context = struct {
             .negation, .bit_not => try self.probe(data.rhs, depth + 1),
             .add, .sub, .mul, .div, .mod => (try self.probe(data.lhs, depth + 1)) orelse try self.probe(data.rhs, depth + 1),
             .in, .bool_not, .bool_and, .bool_or, .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal => .{ .ty = try self.ir.internType(.boolean) },
+            .match => blk: {
+                for (ast.fullMatch(node).?.ast.cases) |case| {
+                    if (try self.probe(ast.fullMatchCase(case).?.ast.target_expr, depth + 1)) |known| break :blk known;
+                }
+                break :blk null;
+            },
+            .function_pipe => blk: {
+                if (self.printing(data.rhs) != null) break :blk .{ .ty = try self.ir.internType(.void) };
+                const callee = (try self.probe(data.rhs, depth + 1)) orelse break :blk null;
+                const ty = self.ir.getType(callee.ty).?;
+                break :blk if (ty == .function) .{ .ty = ty.function.result } else null;
+            },
             .call, .call_one => blk: {
                 const call = ast.fullCall(node).?;
                 if (self.printing(call.ast.fn_expr) != null) break :blk .{ .ty = try self.ir.internType(.void) };
@@ -554,6 +572,12 @@ const Context = struct {
                 .lhs = try emitter.value(data.lhs),
                 .rhs = try emitter.value(data.rhs),
             } },
+            .function_pipe => blk: {
+                const args = try emitter.allocator.alloc(Ir.ValueId, 1);
+                args[0] = try emitter.value(data.lhs);
+                if (self.printing(data.rhs)) |newline| break :blk .{ .print = .{ .args = args, .newline = newline } };
+                break :blk .{ .call = .{ .callee = try emitter.value(data.rhs), .args = args } };
+            },
             .call, .call_one => blk: {
                 const call = ast.fullCall(node).?;
                 const args = try emitter.allocator.alloc(Ir.ValueId, call.ast.args.len);
@@ -623,6 +647,162 @@ const Context = struct {
         return self.fit(unit, expected, node);
     }
 
+    const MatchSubject = struct { ty: Ir.TypeId, value: ?Ir.ValueId };
+    const MatchResult = struct { ty: Ir.TypeId, value: ?Ir.ValueId };
+
+    fn wildcard(self: *Context, node: Ast.Node.Index) bool {
+        const ast = &self.module.ast;
+        return ast.nodes.items(.tag)[node] == .identifier and std.mem.eql(u8, ast.tokenSlice(ast.nodes.items(.main_token)[node]), "_");
+    }
+
+    fn catchall(self: *Context, patterns: []const Ast.Node.Index) bool {
+        for (patterns) |pattern| if (!self.wildcard(pattern)) return false;
+        return true;
+    }
+
+    fn patternShape(self: *Context, node: Ast.Node.Index, depth: usize) Error!bool {
+        if (depth >= max_recursive_depth) {
+            _ = try self.fail(.body_nesting_limit, node, null);
+            return false;
+        }
+        const ast = &self.module.ast;
+        const data = ast.nodes.items(.data)[node];
+        switch (ast.nodes.items(.tag)[node]) {
+            .bit_or => return try self.patternShape(data.lhs, depth + 1) and try self.patternShape(data.rhs, depth + 1),
+            .number_literal, .string_literal => return true,
+            .negation => if (ast.nodes.items(.tag)[data.rhs] == .number_literal) return true,
+            .identifier => {
+                const name = ast.tokenSlice(ast.nodes.items(.main_token)[node]);
+                if (std.mem.eql(u8, name, "true") or std.mem.eql(u8, name, "false") or self.wildcard(node)) return true;
+            },
+            else => {},
+        }
+        _ = try self.fail(.unsupported_match_pattern, node, null);
+        return false;
+    }
+
+    // Patterns contain no effects. Comparisons use the subject snapshots, never
+    // revisit subject ASTs, and reuse verified short-circuit boolean regions.
+    fn matchPattern(self: *Context, node: Ast.Node.Index, subject: MatchSubject, depth: usize) Error!?MatchResult {
+        if (depth >= max_recursive_depth) {
+            _ = try self.fail(.body_nesting_limit, node, null);
+            return null;
+        }
+        const boolean = try self.ir.internType(.boolean);
+        const ast = &self.module.ast;
+        const data = ast.nodes.items(.data)[node];
+        if (ast.nodes.items(.tag)[node] == .bit_or) {
+            const left = (try self.matchPattern(data.lhs, subject, depth + 1)) orelse return null;
+            const start: u32 = if (self.emitter) |emitter| @intCast(emitter.instructions.items.len) else 0;
+            const right = (try self.matchPattern(data.rhs, subject, depth + 1)) orelse return null;
+            return .{ .ty = boolean, .value = if (self.emitter) |emitter| try emitter.append(boolean, self.irSpan(node), .{ .short_circuit = .{
+                .kind = .@"or",
+                .lhs = left.value.?,
+                .rhs_start = start,
+                .rhs = right.value.?,
+            } }) else null };
+        }
+        const constant = if (self.wildcard(node))
+            try self.ir.internConstant(.{ .ty = boolean, .value = .{ .boolean = true } })
+        else switch (try Literal.check(self.module, self.ir, node, subject.ty, null)) {
+            .constant => |constant| constant,
+            .failed => return null,
+            .not_literal => {
+                _ = try self.fail(.unsupported_match_pattern, node, null);
+                return null;
+            },
+        };
+        var value: ?Ir.ValueId = null;
+        if (self.emitter) |emitter| {
+            value = try emitter.append(if (self.wildcard(node)) boolean else subject.ty, self.irSpan(node), .{ .constant = constant });
+            if (!self.wildcard(node)) value = try emitter.append(boolean, self.irSpan(node), .{ .binary = .{ .op = .eq, .lhs = subject.value.?, .rhs = value.? } });
+        }
+        return .{ .ty = boolean, .value = value };
+    }
+
+    fn matchProngs(self: *Context, owner: Ast.Node.Index, cases: []const Ast.Node.Index, subjects: []const MatchSubject, hint: ?Known, depth: usize) Error!?MatchResult {
+        if (depth >= max_recursive_depth) {
+            _ = try self.fail(.body_nesting_limit, owner, null);
+            return null;
+        }
+        const ast = &self.module.ast;
+        const prong = ast.fullMatchCase(cases[0]).?.ast;
+        if (cases.len == 1) {
+            const start = self.locals.items.len;
+            defer self.restoreScope(start);
+            const ty = (try self.expression(prong.target_expr, hint, depth + 1)) orelse return null;
+            if (!self.terminated) try self.copyNode(prong.target_expr, ty);
+            return .{ .ty = ty, .value = if (self.emitter) |emitter| try emitter.value(prong.target_expr) else null };
+        }
+        var condition: ?Ir.ValueId = null;
+        const boolean = try self.ir.internType(.boolean);
+        for (prong.values, subjects, 0..) |pattern, subject, i| {
+            const start: u32 = if (self.emitter) |emitter| @intCast(emitter.instructions.items.len) else 0;
+            const part = (try self.matchPattern(pattern, subject, depth + 1)) orelse return null;
+            if (self.emitter) |emitter| condition = if (i == 0) part.value.? else try emitter.append(boolean, self.irSpan(pattern), .{ .short_circuit = .{
+                .kind = .@"and",
+                .lhs = condition.?,
+                .rhs_start = start,
+                .rhs = part.value.?,
+            } });
+        }
+        const then_start: u32 = if (self.emitter) |emitter| @intCast(emitter.instructions.items.len) else 0;
+        const scope = self.locals.items.len;
+        const then_ty = try self.expression(prong.target_expr, hint, depth + 1);
+        self.restoreScope(scope);
+        if (then_ty == null) return null;
+        const then_terminal = self.terminated;
+        if (!then_terminal) try self.copyNode(prong.target_expr, then_ty.?);
+        const then_value = if (self.emitter) |emitter| try emitter.value(prong.target_expr) else null;
+        self.terminated = false;
+        const else_start: u32 = if (self.emitter) |emitter| @intCast(emitter.instructions.items.len) else 0;
+        const rest = (try self.matchProngs(owner, cases[1..], subjects, hint orelse if (!then_terminal) Known{ .ty = then_ty.? } else null, depth + 1)) orelse return null;
+        const else_terminal = self.terminated;
+        self.terminated = then_terminal and else_terminal;
+        const merged = if (self.terminated) try self.ir.internType(.void) else if (then_terminal) rest.ty else then_ty.?;
+        if (!then_terminal and !else_terminal and then_ty.? != rest.ty) {
+            _ = try self.fail(.expression_type_mismatch, cases[1], self.span(prong.target_expr));
+            return null;
+        }
+        const value = if (self.emitter) |emitter| try emitter.append(merged, self.irSpan(cases[0]), .{ .branch = .{
+            .condition = condition.?,
+            .then_start = then_start,
+            .else_start = else_start,
+            .then_value = then_value.?,
+            .else_value = rest.value.?,
+            .returns = self.terminated,
+        } }) else null;
+        if (self.terminated) self.terminal = value;
+        return .{ .ty = merged, .value = value };
+    }
+
+    fn matchExpression(self: *Context, node: Ast.Node.Index, expected: ?Known, hint: ?Known, depth: usize) Error!?Ir.TypeId {
+        const ast = &self.module.ast;
+        const match = ast.fullMatch(node).?.ast;
+        if (match.cases.len == 0) return self.fail(.match_missing_catchall, node, null);
+        for (match.cases, 0..) |case, i| {
+            const patterns = ast.fullMatchCase(case).?.ast.values;
+            const fallback = patterns.len == 1 and self.wildcard(patterns[0]);
+            if (!fallback and patterns.len != match.subjects.len) return self.fail(.match_pattern_count, case, null);
+            for (patterns) |pattern| if (!try self.patternShape(pattern, depth + 1)) return null;
+            const all = fallback or self.catchall(patterns);
+            if (all and i + 1 != match.cases.len) return self.fail(.match_catchall_not_last, case, null);
+            if (!all and i + 1 == match.cases.len) return self.fail(.match_missing_catchall, case, null);
+        }
+        const subjects = try self.module.allocator.alloc(MatchSubject, match.subjects.len);
+        defer self.module.allocator.free(subjects);
+        for (match.subjects, subjects) |subject, *snapshot| {
+            const ty = (try self.expression(subject, null, depth + 1)) orelse return null;
+            if (self.terminated) return if (expected) |want| want.ty else ty;
+            const scalar = self.ir.getType(ty).?;
+            if (scalar != .boolean and scalar != .integer and scalar != .string) return self.fail(.unsupported_match_subject, subject, null);
+            snapshot.* = .{ .ty = ty, .value = if (self.emitter) |emitter| try emitter.value(subject) else null };
+        }
+        const result = (try self.matchProngs(node, match.cases, subjects, hint, depth + 1)) orelse return null;
+        if (self.emitter) |emitter| try emitter.values.put(emitter.allocator, node, result.value.?);
+        return self.fit(result.ty, expected, node);
+    }
+
     fn expression(self: *Context, node: Ast.Node.Index, expected: ?Known, depth: usize) Error!?Ir.TypeId {
         const ty = if (self.terminated)
             (if (expected) |want| want.ty else try self.ir.internType(.void))
@@ -652,6 +832,25 @@ const Context = struct {
         const ast = &self.module.ast;
         const data = ast.nodes.items(.data)[node];
         switch (ast.nodes.items(.tag)[node]) {
+            .match => return self.matchExpression(node, expected, hint, depth),
+            .function_pipe => {
+                const unit = try self.ir.internType(.void);
+                if (self.printing(data.rhs) != null) {
+                    const arg = (try self.expression(data.lhs, null, depth + 1)) orelse return null;
+                    const ty = self.ir.getType(arg).?;
+                    if (!self.terminated and ty != .boolean and ty != .integer and ty != .string) return self.fail(.unsupported_body_expression, data.lhs, null);
+                    return self.fit(unit, expected, node);
+                }
+                // Exactly rhs(lhs): evaluate the callee before the sole argument.
+                const callee = (try self.expression(data.rhs, null, depth + 1)) orelse return null;
+                if (self.terminated) return if (expected) |want| want.ty else unit;
+                const ty = self.ir.getType(callee).?;
+                if (ty != .function) return self.fail(.not_callable, data.rhs, null);
+                if (ty.function.params.len != 1) return self.fail(.argument_count_mismatch, node, null);
+                if (try self.expression(data.lhs, .{ .ty = ty.function.params[0] }, depth + 1) == null) return null;
+                if (!self.terminated) try self.copyNode(data.lhs, ty.function.params[0]);
+                return self.fit(ty.function.result, expected, node);
+            },
             .array_init, .array_init_comma, .array_init_two, .array_init_two_comma => {
                 const want = hint orelse return self.fail(.array_literal_needs_type, node, null);
                 const array = self.ir.getType(want.ty).?;
@@ -984,6 +1183,48 @@ const Context = struct {
         }
     }
 };
+
+test "match and pipes reject unsupported patterns arity defaults and inexact types" {
+    const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag };
+    for ([_]Case{
+        .{ .source = "let f: (n: int) -> int = match n {}", .tag = .match_missing_catchall },
+        .{ .source = "let f: (n: int) -> int = match n {0 => 1}", .tag = .match_missing_catchall },
+        .{ .source = "let f: (n: int) -> int = match n {_ => 1\n0 => 2}", .tag = .match_catchall_not_last },
+        .{ .source = "let f: (n: int) -> int = match n, n {0 => 1\n_ => 2}", .tag = .match_pattern_count },
+        .{ .source = "let f: (n: int) -> int = match n {0, 1 => 1\n_ => 2}", .tag = .match_pattern_count },
+        .{ .source = "let f: (n: int) -> int = match n {capture => 1\n_ => 2}", .tag = .unsupported_match_pattern },
+        .{ .source = "let f: (n: int) -> int = match n {.value => 1\n_ => 2}", .tag = .unsupported_match_pattern },
+        .{ .source = "let f: (n: int) -> int = match n {0..3 => 1\n_ => 2}", .tag = .unsupported_match_pattern },
+        .{ .source = "let f: (n: int) -> int = match n {{0 | 1} => 1\n_ => 2}", .tag = .unsupported_match_pattern },
+        .{ .source = "let f: (n: int) -> int = match n {n + 1 => 1\n_ => 2}", .tag = .unsupported_match_pattern },
+        .{ .source = "let f: (n: []int) -> int = match n {_ => 2}", .tag = .unsupported_match_subject },
+        .{ .source = "let f: () -> int = match 1 {_ => 2}", .tag = .literal_needs_type },
+        .{ .source = "let f: (n: u8) -> int = match n {-1 => 1\n_ => 2}", .tag = .literal_out_of_range },
+        .{ .source = "let f: (n: i8) -> int = match n {128 => 1\n_ => 2}", .tag = .literal_out_of_range },
+        .{ .source = "let f: (n: bool) -> int = match n {1 => 1\n_ => 2}", .tag = .literal_type_mismatch },
+        .{ .source = "let f: (n: int) -> int = match n {0 => true\n_ => 2}", .tag = .literal_type_mismatch },
+        .{ .source = "let f: (n: int) -> int = match n {0 => {let private: int = 2\nprivate}\n_ => private}", .tag = .unknown_name },
+        .{ .source = "let f: (n: int) -> int = n\nlet g: () -> int = true |> f", .tag = .literal_type_mismatch },
+        .{ .source = "let f: () -> int = 1\nlet g: () -> int = 1 |> f", .tag = .argument_count_mismatch },
+        .{ .source = "let f: (a: int, b: int) -> int = a\nlet g: () -> int = 1 |> f", .tag = .argument_count_mismatch },
+        .{ .source = "let g: () -> int = true |> false", .tag = .not_callable },
+        .{ .source = "let g: () -> void = 1 |> @println", .tag = .literal_needs_type },
+        .{ .source = "let g: () -> void = [true] |> @println", .tag = .unsupported_body_expression },
+        .{ .source = "let f: (n: i8) -> i8 = n\nlet g: (n: i16) -> i8 = n |> f", .tag = .expression_type_mismatch },
+    }) |case| {
+        var module = try Module.init(std.testing.allocator, "match-error.nov", case.source);
+        defer module.deinit();
+        var sema = try @import("Lowering.zig").lower(&module);
+        defer sema.deinit();
+        if (module.diagnostics.items.len != 1 or module.diagnostics.items[0].tag != case.tag) {
+            std.debug.print("unexpected diagnostics for {s}: {any}\n", .{ case.source, module.diagnostics.items });
+        }
+        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+        try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
+        try std.testing.expect(!sema.lowering_complete);
+        try std.testing.expectEqual(@as(usize, 0), sema.ir.functions.items.len);
+    }
+}
 
 test "membership infers exact scalar operands without numeric defaults" {
     for ([_][]const u8{

@@ -837,15 +837,7 @@ pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
             n = self.extra_data[extra.end - 1]; // last attribute
         },
 
-        .match => {
-            const cases = self.extraData(datas[n].rhs, Node.SubRange);
-            end_offset += 1; // rbrace
-            if (cases.end - cases.start == 0) {
-                n = datas[n].lhs; // cond expr
-            } else {
-                n = self.extra_data[cases.end - 1]; // last case
-            }
-        },
+        .match => return self.matchingDelimiter(self.fullMatch(n).?.ast.lbrace) + end_offset,
     };
 }
 
@@ -1168,12 +1160,21 @@ pub fn fullSlice(self: Ast, node: Node.Index) ?full.Slice {
     };
 }
 
-// pub fn fullMatch(self: Ast, node: Node.Index) ?full.Match {
-//     return switch (self.nodes.items(.tag)[node]) {
-//         .match => self.match(node),
-//         else => null,
-//     };
-// }
+pub fn fullMatch(self: Ast, node: Node.Index) ?full.Match {
+    if (self.nodes.items(.tag)[node] != .match) return null;
+    const data = self.nodes.items(.data)[node];
+    const subjects = self.extraData(data.lhs, Node.SubRange);
+    const cases = self.extraData(data.rhs, Node.SubRange);
+    const values = self.extra_data[subjects.start..subjects.end];
+    var lbrace = self.lastToken(values[values.len - 1]) + 1;
+    while (self.tokens.items(.tag)[lbrace] == .newline) : (lbrace += 1) {}
+    return .{ .ast = .{
+        .match_token = self.nodes.items(.main_token)[node],
+        .lbrace = lbrace,
+        .subjects = values,
+        .cases = self.extra_data[cases.start..cases.end],
+    } };
+}
 
 pub fn fullMatchCase(self: Ast, node: Node.Index) ?full.MatchCase {
     return switch (self.nodes.items(.tag)[node]) {
@@ -1324,21 +1325,21 @@ pub const full = struct {
         };
     };
 
-    // pub const Match = struct {
-    //     ast: Components,
-
-    //     pub const Components = struct {
-    //         match_token: TokenIndex,
-    //         expr: Node.Index,
-    //         cases: []const Node.Index,
-    //     };
-    // };
+    pub const Match = struct {
+        ast: struct {
+            match_token: TokenIndex,
+            lbrace: TokenIndex,
+            subjects: []const Node.Index,
+            cases: []const Node.Index,
+        },
+    };
 
     pub const MatchCase = struct {
         ast: Components,
 
         pub const Components = struct {
-            /// If empty, this is the `_` case.
+            /// Positional patterns; bit_or nodes represent literal alternatives.
+            /// Wildcards are identifier nodes spelling `_`.
             values: []const Node.Index,
             arrow_token: TokenIndex,
             target_expr: Node.Index,
@@ -1547,12 +1548,12 @@ pub const Node = struct {
         /// `lhs(a, b, c,)`. `SubRange[rhs]`.
         /// main_token is the `(`.
         call_comma,
-        /// `match lhs {}`. `SubRange[rhs]`.
+        /// `match a, b { ... }`. Subjects `SubRange[lhs]`, cases `SubRange[rhs]`.
         match,
         /// `lhs => rhs`.
         /// main_token is the `=>`
         match_case_one,
-        /// `a | b | c => rhs`. `SubRange[lhs]`.
+        /// `a, b, c => rhs`. Positional patterns `SubRange[lhs]`.
         /// main_token is the `=>`.
         match_case,
         /// `lhs..rhs`.

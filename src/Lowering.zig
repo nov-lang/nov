@@ -57,6 +57,68 @@ pub fn lower(module: *Module) Error!Sema {
     return result;
 }
 
+fn testRejectedMatchAllocations(allocator: std.mem.Allocator, source: []const u8) !void {
+    var module = try Module.init(allocator, "invalid-match.nov", source);
+    defer module.deinit();
+    var sema = lower(&module) catch |err| {
+        if (err == error.OutOfMemory) try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+        return err;
+    };
+    defer sema.deinit();
+    try std.testing.expect(module.hasErrors());
+    try std.testing.expect(!sema.lowering_complete);
+    try std.testing.expectEqual(@as(usize, 0), sema.ir.functions.items.len);
+}
+
+test "rejected matches and pipes roll back diagnostics on allocation failure" {
+    for ([_][]const u8{
+        "let f: (n: int) -> int = match n {capture => 1\n_ => 2}",
+        "let f: (n: int) -> int = match n {0 => 1}",
+        "let f: (n: int) -> int = match n {0 => {let private: int = 1\nprivate}\n_ => true}",
+        "let f: (n: int) -> int = n\nlet main: () = true |> f |> @println",
+    }) |source| try std.testing.checkAllAllocationFailures(std.testing.allocator, testRejectedMatchAllocations, .{source});
+}
+
+test "match reuses branch verification for sibling privacy and terminal metadata" {
+    var module = try Module.init(std.testing.allocator, "match.nov",
+        \\let f: (n: int) -> int = match n {
+        \\    0 => {let private: int = n + 1
+        \\        private}
+        \\    1 => n + 2
+        \\    _ => n + 3
+        \\}
+        \\let g: (n: int) -> int = match n {
+        \\    0 => {return 1}
+        \\    _ => {return 2}
+        \\}
+    );
+    defer module.deinit();
+    var sema = try lower(&module);
+    defer sema.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    const body = sema.ir.functions.items[0].body.?;
+    const merge = &@constCast(body.instructions)[@intFromEnum(body.result)];
+    try std.testing.expect(merge.op == .branch);
+    const saved = merge.op.branch;
+    merge.op.branch.then_value = saved.else_value.?;
+    try std.testing.expectError(error.InvalidValueId, sema.ir.verify());
+    merge.op.branch = saved;
+    merge.op.branch.else_value = saved.then_value;
+    try std.testing.expectError(error.InvalidValueId, sema.ir.verify());
+    merge.op.branch = saved;
+    merge.op.branch.condition = saved.then_value;
+    try std.testing.expectError(error.InvalidRegion, sema.ir.verify());
+    merge.op.branch = saved;
+    const terminal_body = sema.ir.functions.items[1].body.?;
+    const terminal = &@constCast(terminal_body.instructions)[@intFromEnum(terminal_body.result)];
+    try std.testing.expect(terminal.op.branch.returns);
+    terminal.op.branch.returns = false;
+    try std.testing.expectError(error.InvalidReturn, sema.ir.verify());
+    terminal.op.branch.returns = true;
+    try sema.ir.verify();
+}
+
 test "exhaustion controls belong to parent loops and IR outlives the source" {
     var module = try Module.init(std.testing.allocator, "else.nov",
         \\let f: () -> []int = loop : {} {

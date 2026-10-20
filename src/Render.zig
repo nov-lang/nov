@@ -317,7 +317,7 @@ fn renderExpression(self: *Render, node: Ast.Node.Index, space: Space) RenderErr
         .mul,
         .sub,
         .in,
-        .function_pipe, // TODO
+        .function_pipe,
         => {
             const infix = datas[node];
             try self.renderExpression(infix.lhs, .space);
@@ -482,13 +482,34 @@ fn renderExpression(self: *Render, node: Ast.Node.Index, space: Space) RenderErr
         },
 
         .match => {
-            @panic("TODO");
+            const match = ast.fullMatch(node).?.ast;
+            try self.renderToken(match.match_token, .space);
+            for (match.subjects, 0..) |subject, i| {
+                try self.renderExpression(subject, if (i + 1 == match.subjects.len) .space else .none);
+                if (i + 1 != match.subjects.len) {
+                    var comma = ast.lastToken(subject) + 1;
+                    while (token_tags[comma] == .newline) : (comma += 1) {}
+                    try self.renderToken(comma, .space);
+                }
+            }
+            try self.ais.pushIndent(.normal);
+            try self.renderToken(match.lbrace, .newline);
+            for (match.cases) |case| try self.renderExpression(case, .newline);
+            self.ais.popIndent();
+            return self.renderToken(ast.lastToken(node), space);
         },
 
-        .match_case_one,
-        .match_case,
-        => {
-            @panic("TODO");
+        .match_case_one, .match_case => {
+            const prong = ast.fullMatchCase(node).?.ast;
+            for (prong.values) |pattern| {
+                const last = ast.lastToken(pattern);
+                var next = last + 1;
+                while (token_tags[next] == .newline) : (next += 1) {}
+                try self.renderExpression(pattern, if (token_tags[next] == .comma) .none else .space);
+                if (token_tags[next] == .comma) try self.renderToken(next, .space);
+            }
+            try self.renderToken(prong.arrow_token, .space);
+            return self.renderExpression(prong.target_expr, space);
         },
 
         .@"if", .if_else => {

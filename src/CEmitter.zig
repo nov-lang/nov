@@ -929,6 +929,131 @@ test "immutable strings share UTF8 bytes across calls replacements control flow 
     try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, string_output, "", "-O0");
 }
 
+const match_pipes =
+    \\let fibo: (n: int) -> int = match n {
+    \\    0 | 1 => n
+    \\    _ => fibo(n - 1) + fibo(n - 2)
+    \\}
+    \\let fizz: (n: uint) -> string = match n % 3, n % 5 {
+    \\    0, 0 => "FizzBuzz"
+    \\    0, _ => "Fizz"
+    \\    _, 0 => "Buzz"
+    \\    _ => "number"
+    \\}
+    \\let identity: (n: int) -> int = n
+    \\let callee: () -> (int) -> int = {@print("C")
+    \\    identity}
+    \\let argument: () -> int = {@print("A")
+    \\    7}
+    \\let early: (n: int) -> string = match n {
+    \\    -1 | 0 => {return "early" + "!"}
+    \\    _ => "late" + "!"
+    \\}
+    \\let terminal: (b: bool) -> int = match b {
+    \\    true => {return 1}
+    \\    _ => {return 2}
+    \\}
+    \\let pipeExit: () -> int = {return 12} |> callee()
+    \\let calleeExit: () -> int = argument() |> {return 13}
+    \\let subjectExit: () -> int = match {return 14}, argument() {_ => 99}
+    \\let otherExit: () -> int = match argument(), {return 15} {_ => 99}
+    \\let main: () = {
+    \\    10 |> fibo |> @println
+    \\    @println(fizz(15), fizz(3), fizz(5), fizz(1))
+    \\    argument() |> callee() |> @println
+    \\    let callback = identity
+    \\    8 |> callback |> @println
+    \\    @println(pipeExit(), calleeExit(), subjectExit(), otherExit())
+    \\    true |> @print
+    \\    "!" |> @println
+    \\    let mut n: int = 0
+    \\    let selected = match {n += 1
+    \\        @print("L")
+    \\        n}, {n *= 2
+    \\        @print("R")
+    \\        n} {
+    \\        1 | 2, 2 => {@print("Y")
+    \\            "chosen" + "!"}
+    \\        1, _ => {@print("BAD")
+    \\            "bad"}
+    \\        _ => "bad"
+    \\    }
+    \\    @println(selected, n)
+    \\    let text = "a" + "\x00b"
+    \\    @println(match text {"a\x00b" | "other" => true
+    \\        _ => false})
+    \\    @println(match "a" + "b", "c" + "d" {"ab", "cd" => "rooted" + "!"
+    \\        _ => "bad"})
+    \\    @println(match false {true => "wrong"
+    \\        _ => "right"})
+    \\    @println(early(-1), early(2), terminal(true), terminal(false))
+    \\    let a: []int = match true {
+    \\        true => [1, 2]
+    \\        _ => [3]
+    \\    }
+    \\    let mut copy = a
+    \\    copy[0] = 9
+    \\    @println(a[0], copy[0], a.len)
+    \\    let picked = match true {true => identity
+    \\        _ => identity}
+    \\    6 |> picked |> @println
+    \\    let inferred = match false {true => 1
+    \\        _ => n}
+    \\    @println(inferred)
+    \\    let result = loop {
+    \\        match n {2 => {n += 1
+    \\            continue}
+    \\            _ => {break n}}
+    \\    }
+    \\    @println(result)
+    \\    @println(match true, false {true, false => "tuple"
+    \\        _, _ => "bad"})
+    \\}
+;
+const match_pipes_output = "55\nFizzBuzz Fizz Buzz number\nCA7\n8\nCA12 13 14 15\ntrue!\nLRYchosen! 2\ntrue\nrooted!\nright\nearly! late! 1 2\n1 9 2\n6\n2\n3\ntuple\n";
+
+test "match and pipes preserve recursion effects exits exact results formatting and forced GC" {
+    const c = try arrayTestProgram(match_pipes);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, match_pipes_output, "", mode);
+}
+
+test "match allocates only in the selected prong and reports runtime OOM" {
+    for ([_]bool{ false, true }) |allocate| {
+        const c = try arrayTestProgram(if (allocate)
+            "let main: () = match true {true => @println(\"a\" + \"b\")\n_ => @println(\"ok\")}"
+        else
+            "let main: () = match true {true => @println(\"ok\")\n_ => @println(\"a\" + \"b\")}");
+        defer test_gpa.free(c);
+        const exhausted = try std.mem.concat(test_gpa, u8, &.{
+            "#include <stdlib.h>\nstatic void *test_malloc(size_t n) { (void)n; return NULL; }\n" ++
+                "#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n",
+            c,
+        });
+        defer test_gpa.free(exhausted);
+        for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(exhausted, "typedef int nonempty_translation_unit;", if (allocate) 1 else 0, if (allocate) "" else "ok\n", if (allocate) "panic: GC allocation failed\n" else "", mode);
+    }
+}
+
+test "match and pipes own metadata after source release" {
+    var sema = blk: {
+        var module = try Module.init(test_gpa, "match.nov", match_pipes);
+        defer module.deinit();
+        var result = try Lowering.lower(&module);
+        errdefer result.deinit();
+        try std.testing.expect(!module.hasErrors());
+        break :blk result;
+    };
+    defer sema.deinit();
+    const c = try emitProgram(test_gpa, &sema.ir, null);
+    defer test_gpa.free(c);
+    try compileAndRunExpected(c, "typedef int nonempty_translation_unit;", 0, match_pipes_output, "");
+}
+
+test "match and pipes clean up every compiler allocation failure" {
+    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{match_pipes});
+}
+
 const array_membership =
     \\let left: () -> i16 = {@print("L")
     \\    2}

@@ -44,7 +44,7 @@ with final-expression results are supported in function bodies. Literal defaults
 shadowing and global mutation remain deferred or unsupported.
 Lowering produces typed operations with source spans, ordered operands/call
 arguments, explicit returns, and structured regions for boolean `and`/`or`,
-`if`/`else`, and condition-based or unconditional loops with optional continuation
+`if`/`else`, scalar `match`, and condition-based or unconditional loops with optional continuation
 clauses, value-carrying breaks, and conditional-loop exhaustion (`else`) results.
 It requires immutable literal globals; unit/global block initializers are
 not lowered yet. An internal C11 backend emits verified IR, including fixed-width
@@ -950,6 +950,32 @@ loop _ in 10..=0-=1 {
 -->
 
 ## Match
+
+The executable subset supports one or more `bool`, integer, or string subjects,
+scalar literal patterns, `|` alternatives within a positional pattern, and `_`
+wildcards. Subjects are evaluated **once, left to right, before selection**.
+Prongs are tested in source order and only the first matching body executes.
+With multiple subjects, commas separate positional patterns; a single `_`
+matches all subjects. A final catchall (`_` or all positional `_`s) is required,
+even for booleans: this is bounded exhaustiveness, not full pattern analysis.
+
+```nov
+let classify: (n: uint) -> string = match n % 3, n % 5 {
+    0, 0 => "FizzBuzz"
+    0, _ => "Fizz"
+    _, 0 => "Buzz"
+    _ => "number"
+}
+```
+
+Literal patterns use the exact subject type (no integer defaults or conversions).
+String patterns compare exact UTF-8 bytes, including NUL. Each prong has private
+local scope; continuing results have one exact, bidirectionally inferred or
+contextual type. Return/break/continue paths do not contribute merge values.
+Array/function subjects, enums, captures, range/destructuring/computed patterns,
+and general exhaustiveness remain unsupported. Interpolation is still deferred.
+The following broader syntax remains a design example, **not executable in full**:
+
 ```nov
 match 5 {
     0 | 1 | 2 => ... ; use `|` to specify multiple cases
@@ -1158,6 +1184,24 @@ TODO
 - `f80` - IEEE-754-2008 80-bit extended precision
 - `f128` - IEEE-754-2008 binary128
 - `c_longdouble` - matches long double for the target C ABI
+
+## Function Pipes
+
+`value |> function` is exactly unary application `function(value)`, including
+**callee-first** evaluation: evaluate the RHS callee before the LHS argument,
+not a new left-to-right pipeline effect order. Chaining is left-associative.
+Named functions and function values require exactly one parameter; its exact type
+constrains literals (`10 |> fibo`). `value |> @print` and `value |> @println`
+accept an already typed bool/integer/string result and return void. They do not
+supply an integer default. No partial application or implicit conversions occur.
+
+The unchanged [`examples/fibo.nov`](examples/fibo.nov) now runs:
+
+```sh
+nov run examples/fibo.nov          # 55
+nov run examples/fibo.nov --debug  # 55
+nov run examples/fibo.nov --release # 55
+```
 
 ## Operators
 <!-- Yes this is not really lisible as raw text -->

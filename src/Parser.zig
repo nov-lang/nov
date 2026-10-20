@@ -813,18 +813,21 @@ fn expectBlock(self: *Parser) Error!Node.Index {
     return block;
 }
 
-// TODO: handle match on multiple values (tuple?)
 // TODO: improve error messages
 /// MatchExpr <- KEYWORD_match Expr LBRACE MatchProngList RBRACE
 /// MatchProngList <- (MatchProng NEWLINE)*
 // MatchProngList <- (NEWLINE* MatchProng NEWLINE+)*
 fn parseMatchExpr(self: *Parser) Error!Node.Index {
     const match_token = self.assertToken(.keyword_match);
-    const expr = try self.expectExpr();
-    _ = try self.expectToken(.l_brace);
-
     const scratch_top = self.scratch.items.len;
     defer self.scratch.shrinkRetainingCapacity(scratch_top);
+    try self.scratch.append(self.allocator, try self.expectExpr());
+    while (self.eatToken(.comma) != null) {
+        try self.scratch.append(self.allocator, try self.expectExpr());
+    }
+    const subjects = try self.addExtra(try self.listToSpan(self.scratch.items[scratch_top..]));
+    self.scratch.shrinkRetainingCapacity(scratch_top);
+    _ = try self.expectToken(.l_brace);
     // eat newlines to allow for
     // match x {
     //     1 => 1
@@ -833,7 +836,7 @@ fn parseMatchExpr(self: *Parser) Error!Node.Index {
     // }
     var newline = true;
     sw: switch (self.token_tags[self.tok_i]) {
-        .r_brace => self.tok_i += 1, // break
+        .r_brace => {},
         .newline => {
             self.tok_i += 1;
             newline = true;
@@ -851,13 +854,14 @@ fn parseMatchExpr(self: *Parser) Error!Node.Index {
             }
         },
     }
+    _ = try self.expectToken(.r_brace);
     const cases = try self.listToSpan(self.scratch.items[scratch_top..]);
 
     return self.addNode(.{
         .tag = .match,
         .main_token = match_token,
         .data = .{
-            .lhs = expr,
+            .lhs = subjects,
             .rhs = try self.addExtra(cases),
         },
     });
@@ -871,53 +875,18 @@ fn parseMatchProng(self: *Parser) Error!Node.Index {
     const scratch_top = self.scratch.items.len;
     defer self.scratch.shrinkRetainingCapacity(scratch_top);
 
-    // eat newlines to allow for
-    // match x {
-    //     1,
-    //     2,
-    //     => idk
-    // }
-    var comma = true;
-    sw: switch (self.token_tags[self.tok_i]) {
-        .newline => {
-            self.tok_i += 1;
-            continue :sw self.token_tags[self.tok_i];
-        },
-        .comma => {
-            self.tok_i += 1;
-            comma = true;
-            continue :sw self.token_tags[self.tok_i];
-        },
-        else => {
-            if (comma) {
-                const item = try self.parseMatchItem();
-                if (item != null_node) {
-                    comma = false;
-                    try self.scratch.append(self.allocator, item);
-                    continue :sw self.token_tags[self.tok_i];
-                }
-            }
-        },
+    while (true) {
+        const item = try self.parseMatchItem();
+        if (item == null_node) break;
+        try self.scratch.append(self.allocator, item);
+        while (self.eatToken(.newline) != null) {}
+        if (self.eatToken(.comma) == null) break;
+        while (self.eatToken(.newline) != null) {}
     }
-    // old behavior that doesn't eat newlines
-    // while (true) {
-    //     const item = try self.parseMatchItem();
-    //     if (item == null_node) {
-    //         break;
-    //     }
-    //     try self.scratch.append(self.allocator, item);
-    //     if (self.eatToken(.comma) == null) break;
-    // }
     if (scratch_top == self.scratch.items.len) {
         return null_node;
     }
     const arrow_token = try self.expectToken(.equal_arrow);
-
-    if (self.eatToken(.pipe) != null) {
-        _ = self.eatToken(.ampersand);
-        _ = try self.expectToken(.identifier);
-        _ = try self.expectToken(.pipe);
-    }
 
     const items = self.scratch.items[scratch_top..];
     switch (items.len) {
@@ -1673,6 +1642,33 @@ test "parser ownership survives allocation failures" {
     };
     for (sources) |source| {
         try std.testing.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
+    }
+}
+
+test "match subjects alternatives helpers delimiters recovery and OOM" {
+    const source = "let f: (n: int) -> int = match n, n {\n0 | 1, _ => {let x: int = n\nx}\n_ => n\n}";
+    var ast = try parse(std.testing.allocator, source);
+    defer ast.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    const node = ast.decl(ast.rootDecls()[0]).ast.init_node;
+    const match = ast.fullMatch(node).?.ast;
+    try std.testing.expectEqual(@as(usize, 2), match.subjects.len);
+    try std.testing.expectEqual(@as(usize, 2), match.cases.len);
+    try std.testing.expectEqualStrings("match", ast.tokenSlice(ast.firstToken(node)));
+    try std.testing.expectEqual(source.len - 1, ast.tokens.items(.start)[ast.lastToken(node)]);
+    const prong = ast.fullMatchCase(match.cases[0]).?.ast;
+    try std.testing.expectEqual(@as(usize, 2), prong.values.len);
+    try std.testing.expectEqual(Node.Tag.bit_or, ast.nodes.items(.tag)[prong.values[0]]);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
+    for ([_][:0]const u8{
+        "let f = match n {",                  "let f = match n {0 => 1",             "let f = match n {0 => 1\n",
+        "let f = match n, {}",                "let f = match n {0,,1 => 1\n_ => 2}", "let f = match n {0 => |capture| capture\n_ => 2}",
+        "let f = match n {0 | => 1\n_ => 2}", "let f = 1 |>\n",
+    }) |broken| {
+        var result = try parse(std.testing.allocator, broken);
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expect(result.errors.len != 0);
+        for (result.errors) |err| try std.testing.expect(result.tokens.items(.start)[err.token] <= broken.len);
     }
 }
 

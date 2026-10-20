@@ -118,6 +118,7 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     _ = fixtures.add("let-only.nov", "let number: i32 = 42\n");
     _ = fixtures.add("print-program.nov", "let number: i32 = -42\nlet answer: () -> i32 = number\nlet main: () -> void = @println(true, answer())\n");
     _ = fixtures.add("checkout.nov", @embedFile("examples/checkout.nov"));
+    _ = fixtures.add("fibo.nov", @embedFile("examples/fibo.nov"));
     _ = fixtures.add("strings.nov", @embedFile("examples/strings.nov"));
     _ = fixtures.add("inferred-locals.nov", @embedFile("examples/inferred-locals.nov"));
     _ = fixtures.add("inferred-integer.nov", "let main: () -> void = {let n = 1\n@println(n)}\n");
@@ -185,6 +186,8 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         .{ .name = "check rejects --check", .args = &.{ "check", "--check", "valid.nov" }, .exit_code = 1, .stderr_match = "--check" },
         .{ .name = "--check requires fmt", .args = &.{"--check"}, .exit_code = 1, .stderr_match = "--check" },
         .{ .name = "check valid syntax", .args = &.{ "check", "valid.nov" }, .exit_code = 0 },
+        .{ .name = "check unchanged fibo", .args = &.{ "check", "--semantic", "fibo.nov" }, .exit_code = 0 },
+        .{ .name = "fmt unchanged fibo", .args = &.{ "fmt", "--check", "fibo.nov" }, .exit_code = 0 },
         .{ .name = "check inferred locals", .args = &.{ "check", "--semantic", "inferred-locals.nov" }, .exit_code = 0 },
         .{ .name = "fmt inferred locals", .args = &.{ "fmt", "--check", "inferred-locals.nov" }, .exit_code = 0 },
         .{ .name = "reject inferred integer default", .args = &.{ "emit-c", "inferred-integer.nov" }, .exit_code = 1, .stderr_match = "integer literal needs an expected type (no default chosen)" },
@@ -291,6 +294,19 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
 
     // An isolated PATH exercises real `zig cc` discovery, independent of host CC.
     for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+        const fibo = b.addRunArtifact(exe);
+        fibo.step.name = b.fmt("CLI: unchanged fibo ({s})", .{mode});
+        fibo.setCwd(fixtures.getDirectory());
+        fibo.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+        fibo.setEnvironmentVariable("NOV_CC", "");
+        fibo.setEnvironmentVariable("CC", "");
+        fibo.addArgs(&.{ "run", "fibo.nov" });
+        if (mode.len != 0) fibo.addArg(mode);
+        fibo.expectExitCode(0);
+        fibo.expectStdOutEqual("55\n");
+        fibo.expectStdErrEqual("");
+        test_step.dependOn(&fibo.step);
+
         const value_loops = b.addRunArtifact(exe);
         value_loops.step.name = b.fmt("CLI: loop values and continuations ({s})", .{mode});
         value_loops.setCwd(fixtures.getDirectory());
