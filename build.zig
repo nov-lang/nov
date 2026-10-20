@@ -258,6 +258,7 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         .{ .source = "let x = 1\n", .check = true },
         .{ .source = "let x=", .diagnostic = "<stdin>:1:7: error:", .code = 1 },
         .{ .source = "let f:()->void={a[-1]+=1\na[0]-=2\na[0]*=3\na[0]/=4\na[0]%=5}", .output = "let f: () -> void = {\n    a[-1] += 1\n    a[0] -= 2\n    a[0] *= 3\n    a[0] /= 4\n    a[0] %= 5\n}\n" },
+        .{ .source = "let f:()->void={let mut s=\"é\"\ns+=\"\\0\"}", .output = "let f: () -> void = {\n    let mut s = \"é\"\n    s += \"\\0\"\n}\n" },
         .{ .source = "let x:[]int=[1]", .output = "let x: []int = [1]\n" },
         .{ .source = "let x = [1]\n", .check = true },
         .{ .source = "let x=[1]", .check = true, .diagnostic = "<stdin>: error: input is not formatted", .code = 1 },
@@ -286,7 +287,7 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         strings.addArgs(&.{ "run", "strings.nov" });
         if (mode.len != 0) strings.addArg(mode);
         strings.expectExitCode(0);
-        strings.expectStdOutEqual("Hello, 世界! 14\n[new binding]\n[Hello, 世界!]\n{UTF-8} 4\na\x00b 3\n");
+        strings.expectStdOutEqual("Hello, 世界! 14\n[new binding]!\n[Hello, 世界!]\n{UTF-8} 4\na\x00b 3\n");
         strings.expectStdErrEqual("");
         test_step.dependOn(&strings.step);
 

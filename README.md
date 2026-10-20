@@ -1145,10 +1145,13 @@ x + y ; returns Complex[ .re = 7, .im = 10 ]
 `string` is immutable, valid UTF-8 on every platform, including Windows. Assignment,
 initialization, parameters and returns share immutable storage; `let mut` allows
 replacing the binding, never changing bytes. `+` concatenates strings, evaluating
-operands once, left to right. Concatenation checks length overflow and allocates
-GC-managed backing; allocation failure panics. String equality, other operators
-(including `+=`), indexing, slicing, interpolation and Unicode operations remain
-deferred. Arrays remain bool/integer-only: `[]string` and nested arrays are rejected.
+operands once, left to right. For a mutable local, `s += rhs` captures the old string
+before evaluating `rhs`, concatenates, then replaces `s`. RHS effects may replace
+`s`; a return, break or continue skips the final concatenation and store without
+undoing those effects. Shared originals remain unchanged, including for `s += s`.
+Concatenation checks length overflow and allocates GC-managed backing; allocation
+failure panics. String equality, other operators (including `-=`, `*=`, `/=` and
+`%=`), indexing, slicing, interpolation and Unicode operations remain deferred. Arrays remain bool/integer-only: `[]string` and nested arrays are rejected.
 
 `.len` is the byte length as native `uint`, not a character or grapheme count.
 `"é".len` is 2 and `"😀".len` is 4. Literals use the existing escapes (`\n`, `\r`,
@@ -1171,7 +1174,7 @@ let identity: (text: string) -> string = text
 let main: () -> void = {
     let mut text = prefix + ", 世界!"
     let shared = identity(text)
-    text = "replacement"
+    text += " Again!"
     @println(shared, shared.len, text)
 }
 ```

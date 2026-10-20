@@ -826,7 +826,7 @@ const string_example =
     \\    @println(chosen, choose(true), choose(false))
     \\    let mut count: int = 0
     \\    loop count < 3 {
-    \\        value = value + "x"
+    \\        value += "x"
     \\        count += 1
     \\        if count == 1 {continue}
     \\        if count == 3 {break}
@@ -843,6 +843,50 @@ test "immutable strings share UTF8 bytes across calls replacements control flow 
     defer test_gpa.free(c);
     try compileAndRunExpected(c, "typedef int nonempty_translation_unit;", 0, string_output, "");
     try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, string_output, "", "-O0");
+}
+
+const string_compound =
+    \\let id: (s: string) -> string = s
+    \\let early: (b: bool) -> string = {
+    \\    let mut s: string = "old" + "!"
+    \\    s += if b {s = "returned"
+    \\        return s} else {"tail"}
+    \\    s
+    \\}
+    \\let main: () -> void = {
+    \\    let mut s = "hé" + "\0"
+    \\    let original = id(s)
+    \\    s += s
+    \\    @println(s, s.len, original, original.len)
+    \\    s += {s = "replacement" + "!"
+    \\        id("😀" + "\0")}
+    \\    @println(s, original)
+    \\    let mut n: int = 0
+    \\    loop n < 4 {
+    \\        n += 1
+    \\        s += {
+    \\            if n == 1 {s = "continue" + "!"
+    \\                continue}
+    \\            if n == 3 {s = "break" + "!"
+    \\                break}
+    \\            "tail" + "!"
+    \\        }
+    \\        @println(s)
+    \\    }
+    \\    @println(s, n, early(true), early(false), original)
+    \\    let mut empty = ""
+    \\    empty += ""
+    \\    empty += "é"
+    \\    empty += ""
+    \\    @println(empty, empty.len)
+    \\}
+;
+const string_compound_output = "hé\x00hé\x00 8 hé\x00 4\nhé\x00hé\x00😀\x00 hé\x00\ncontinue!tail!\nbreak! 3 returned old!tail hé\x00\né 2\n";
+
+test "string compounds capture before RHS and preserve aliases terminal effects and GC roots" {
+    const c = try arrayTestProgram(string_compound);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, string_compound_output, "", mode);
 }
 
 test "string parameters returns and assignments share backing without allocation" {
@@ -931,18 +975,23 @@ test "lowered strings emit after module and source storage are freed" {
 }
 
 test "string compiler ownership survives every allocation failure" {
-    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{string_example});
+    for ([_][]const u8{ string_example, string_compound }) |source| try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{source});
 }
 
 test "string length overflow panics before touching invalid backing in both modes" {
-    const library = try emitSource("let f: (a: string, b: string) -> string = a + b", null);
-    defer test_gpa.free(library);
-    const c = try std.mem.concat(test_gpa, u8, &.{
-        library,
-        "\nint main(void) { (void)nov_f((nov_string){NULL, NULL, UINTPTR_MAX}, (nov_string){NULL, NULL, 1}); return 99; }\n",
-    });
-    defer test_gpa.free(c);
-    for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 1, "", "panic: string size overflow\n", mode);
+    for ([_][]const u8{
+        "let f: (a: string, b: string) -> string = a + b",
+        "let f: (a: string, b: string) -> string = {let mut s = a\ns += b\ns}",
+    }) |source| {
+        const library = try emitSource(source, null);
+        defer test_gpa.free(library);
+        const c = try std.mem.concat(test_gpa, u8, &.{
+            library,
+            "\nint main(void) { (void)nov_f((nov_string){NULL, NULL, UINTPTR_MAX}, (nov_string){NULL, NULL, 1}); return 99; }\n",
+        });
+        defer test_gpa.free(c);
+        for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 1, "", "panic: string size overflow\n", mode);
+    }
 }
 
 const inferred_example =
@@ -1232,7 +1281,7 @@ test "array capacity and append length overflow panic before accessing backing" 
 }
 
 test "array allocation failure retries preserve roots and shutdown frees backing" {
-    for ([_][]const u8{ array_example, array_compound_effects, inferred_example, inferred_arrays, string_example }, [_][]const u8{ "3 30 30 6\n454 15\n99 15 4\nfalse true 2\n0\n", array_compound_output, inferred_output, inferred_arrays_output, string_output }) |source, output| {
+    for ([_][]const u8{ array_example, array_compound_effects, inferred_example, inferred_arrays, string_example, string_compound }, [_][]const u8{ "3 30 30 6\n454 15\n99 15 4\nfalse true 2\n0\n", array_compound_output, inferred_output, inferred_arrays_output, string_output, string_compound_output }) |source, output| {
         const c = try arrayTestProgram(source);
         defer test_gpa.free(c);
         const injected = try std.mem.concat(test_gpa, u8, &.{
@@ -1244,14 +1293,14 @@ test "array allocation failure retries preserve roots and shutdown frees backing
             "\n#undef main\nint main(void) { int result = test_main(); assert(!outstanding); return result; }\n",
         });
         defer test_gpa.free(injected);
-        try compileAndRunExpected(injected, "typedef int nonempty_translation_unit;", 0, output, "");
+        for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(injected, "typedef int nonempty_translation_unit;", 0, output, "", mode);
         const exhausted = try std.mem.concat(test_gpa, u8, &.{
             "#include <stdlib.h>\nstatic void *test_malloc(size_t n) { (void)n; return NULL; }\n" ++
                 "#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n",
             c,
         });
         defer test_gpa.free(exhausted);
-        try compileAndRunExpected(exhausted, "typedef int nonempty_translation_unit;", 1, if (std.mem.eql(u8, source, inferred_example)) "7\n8\n" else if (std.mem.eql(u8, source, inferred_arrays)) "7\n" else "", "panic: GC allocation failed\n");
+        for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(exhausted, "typedef int nonempty_translation_unit;", 1, if (std.mem.eql(u8, source, inferred_example)) "7\n8\n" else if (std.mem.eql(u8, source, inferred_arrays)) "7\n" else "", "panic: GC allocation failed\n", mode);
     }
 }
 

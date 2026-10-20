@@ -246,6 +246,11 @@ test "declarations arithmetic strings and idempotence" {
     try expectFormatted("let flag=!ready\nlet bits=~mask\n", "let flag = !ready\nlet bits = ~mask\n");
 }
 
+test "string compounds format syntactically without semantic restrictions" {
+    try expectFormatted("let f:()->void={let mut s=\"é\\0\"\ns+=s\ns+={s=\"new\"\n\"😀\"}}", "let f: () -> void = {\n    let mut s = \"é\\0\"\n    s += s\n    s += {\n        s = \"new\"\n        \"😀\"\n    }\n}\n");
+    try expectFormatted("let f:(s:string)->void={s+=true\ns-=\"a\"}", "let f: (s: string) -> void = {\n    s += true\n    s -= \"a\"\n}\n");
+}
+
 test "comments before between and after declarations" {
     try expectFormatted("; header\n\nlet x=1 ; inline\n; between\nlet y=\"; not a comment\"\n; tail", "; header\n\nlet x = 1 ; inline\n; between\nlet y = \"; not a comment\"\n; tail\n");
     try expectFormatted("; comment only", "; comment only\n");

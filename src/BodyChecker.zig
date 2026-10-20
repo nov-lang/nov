@@ -682,8 +682,10 @@ const Context = struct {
                 if (!binding.mutable) return self.fail(.immutable_assignment, data.lhs, binding.name_span);
                 const tag = ast.nodes.items(.tag)[node];
                 const compound = tag != .assign;
-                const array_append = tag == .assign_add and self.ir.getType(binding.known.ty).? == .array;
-                if (compound and !array_append and self.ir.getType(binding.known.ty).? != .integer) return self.fail(.operator_not_supported, node, binding.known.annotation);
+                const ty = self.ir.getType(binding.known.ty).?;
+                const array_append = tag == .assign_add and ty == .array;
+                const string_concat = tag == .assign_add and ty == .string;
+                if (compound and !array_append and !string_concat and ty != .integer) return self.fail(.operator_not_supported, node, binding.known.annotation);
                 // Capture the old value before RHS effects, just as for binary
                 // arithmetic. A returning RHS never performs the final store.
                 if (compound and try self.expression(data.lhs, binding.known, depth + 1) == null) return null;
@@ -858,6 +860,39 @@ test "string inference accepts late literals calls lengths and branch context" {
     try std.testing.expect(sema.lowering_complete);
 }
 
+test "string compounds retain mutability operator and operand diagnostics" {
+    const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag };
+    for ([_]Case{
+        .{ .source = "let f: () -> void = {let s = \"a\"\ns += \"b\"}", .tag = .immutable_assignment },
+        .{ .source = "let f: (s: string) -> void = {s += \"b\"}", .tag = .immutable_assignment },
+        .{ .source = "let s: string = \"a\"\nlet f: () -> void = {s += \"b\"}", .tag = .immutable_assignment },
+        .{ .source = "let f: () -> void = {let mut s = \"a\"\ns += true}", .tag = .literal_type_mismatch },
+        .{ .source = "let f: (n: int) -> void = {let mut s = \"a\"\ns += n}", .tag = .expression_type_mismatch },
+        .{ .source = "let f: () -> void = {let mut s = true\ns += \"a\"}", .tag = .operator_not_supported },
+        .{ .source = "let f: () -> void = {let mut s: int = 1\ns += \"a\"}", .tag = .literal_type_mismatch },
+    }) |case| {
+        var module = try Module.init(std.testing.allocator, "compound.nov", case.source);
+        defer module.deinit();
+        var sema = try @import("Lowering.zig").lower(&module);
+        defer sema.deinit();
+        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+        try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
+        if (case.tag == .immutable_assignment) try std.testing.expect(module.diagnostics.items[0].related != null);
+        try std.testing.expect(!sema.lowering_complete);
+    }
+    for ([_][]const u8{ "-=", "*=", "/=", "%=" }) |op| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let f: () -> void = {{let mut s: string = \"a\"\ns {s} \"b\"}}", .{op});
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "compound.nov", source);
+        defer module.deinit();
+        var sema = try @import("Lowering.zig").lower(&module);
+        defer sema.deinit();
+        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+        try std.testing.expectEqual(Module.Diagnostic.Tag.operator_not_supported, module.diagnostics.items[0].tag);
+        try std.testing.expect(!sema.lowering_complete);
+    }
+}
+
 test "strings reject byte mutation indexing slicing arrays comparisons and eager globals" {
     for ([_][]const u8{
         "let f: () -> void = {let x: []string = []\n}",
@@ -866,7 +901,7 @@ test "strings reject byte mutation indexing slicing arrays comparisons and eager
         "let f: () -> void = @println(\"a\"[0])",
         "let f: () -> void = @println(\"a\"[0..1])",
         "let f: () -> void = {let mut x = \"a\"\nx.len = 1}",
-        "let f: () -> void = {let mut x = \"a\"\nx += \"b\"}",
+        "let f: () -> void = {let mut x = \"a\"\nx -= \"b\"}",
         "let f: () -> bool = \"a\" == \"b\"",
         "let f: () -> string = \"a\" - \"b\"",
         "let f: () -> string = 1 + \"b\"",

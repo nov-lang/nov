@@ -57,6 +57,49 @@ pub fn lower(module: *Module) Error!Sema {
     return result;
 }
 
+test "string compound reuses binary add with old load before RHS replacement" {
+    var module = try Module.init(std.testing.allocator, "compound.nov",
+        \\let rhs: () -> string = "right" + "!"
+        \\let f: (s: string) -> string = {
+        \\    let mut x = s
+        \\    x += {x = "replacement"
+        \\        rhs()}
+        \\    x
+        \\}
+    );
+    defer module.deinit();
+    var sema = try lower(&module);
+    defer sema.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    const body = sema.ir.functions.items[1].body.?;
+    var adds: usize = 0;
+    var stores: usize = 0;
+    for (body.instructions, 0..) |instruction, i| switch (instruction.op) {
+        .local_store => stores += 1,
+        .binary => |binary| {
+            adds += 1;
+            try std.testing.expectEqual(@as(usize, 1), stores);
+            try std.testing.expectEqual(Ir.BinaryOp.add, binary.op);
+            try std.testing.expect(sema.ir.getType(instruction.ty).? == .string);
+            try std.testing.expect(body.instructions[@intFromEnum(binary.lhs)].op == .local_load);
+            try std.testing.expect(body.instructions[@intFromEnum(binary.rhs)].op == .call);
+            try std.testing.expect(@intFromEnum(binary.lhs) < @intFromEnum(binary.rhs));
+            var replacement: ?usize = null;
+            for (body.instructions[0..i], 0..) |prior, j| {
+                if (prior.op == .local_store) replacement = j;
+            }
+            try std.testing.expect(@intFromEnum(binary.lhs) < replacement.?);
+            try std.testing.expect(replacement.? < @intFromEnum(binary.rhs));
+            try std.testing.expectEqual(@as(Ir.ValueId, @enumFromInt(i)), body.instructions[i + 1].op.local_store.value);
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 1), adds);
+    try std.testing.expectEqual(@as(usize, 2), stores);
+    try sema.ir.verify();
+}
+
 test "indexed compounds reuse one snapshot and index with old read before RHS" {
     var module = try Module.init(std.testing.allocator, "compound.nov",
         \\let index: () -> int = -1
