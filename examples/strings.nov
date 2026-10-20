@@ -20,4 +20,10 @@ let main: () -> void = {
     @println("\{UTF-8\}", "😀".len)
 ; NUL is a valid byte, not an output terminator (length is 3).
     @println("a\0b", "a\0b".len)
+; Equality compares bytes, not storage identity, including past NUL.
+    let rebuilt = greeting + ", 世界!"
+    @println("Same greeting:", shared == rebuilt, shared != text)
+    @println("NUL bytes:", "a\0b" == "a" + "\0b", "a\0b" != "a\0c")
+; No normalization: composed and decomposed accents are distinct.
+    @println("UTF-8 equality:", "é" == "\u{e9}", "é" == "e\u{301}")
 }

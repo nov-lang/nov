@@ -35,6 +35,10 @@ Keep Nov away from:
     - [x] reject unsupported syntax without changing files; validate output preservation
     - expand beyond simple declarations, literals, operators, and comments
     - recursive directory traversal and stdin support
+- strings:
+  - [x] immutable UTF-8 literals, sharing, concatenation, `+=`, byte length and output
+  - [x] allocation-free, byte-exact `==`/`!=` (including NUL; no normalization)
+  - ordering, indexing, slicing, interpolation and Unicode operations remain deferred
 - add tests, mainly for Parser, IRs, Codegen and Runtime
   - [x] initial parser, formatter, file-safety, and CLI regression coverage
 - expand Render.zig to cover the full AST (simple declarations and expressions work)

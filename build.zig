@@ -307,7 +307,7 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         strings.addArgs(&.{ "run", "strings.nov" });
         if (mode.len != 0) strings.addArg(mode);
         strings.expectExitCode(0);
-        strings.expectStdOutEqual("Hello, 世界! 14\n[new binding]!\n[Hello, 世界!]\n{UTF-8} 4\na\x00b 3\n");
+        strings.expectStdOutEqual("Hello, 世界! 14\n[new binding]!\n[Hello, 世界!]\n{UTF-8} 4\na\x00b 3\nSame greeting: true true\nNUL bytes: true true\nUTF-8 equality: true false\n");
         strings.expectStdErrEqual("");
         test_step.dependOn(&strings.step);
 

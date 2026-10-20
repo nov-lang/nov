@@ -604,7 +604,7 @@ fn validateBody(self: *const Ir, function: Function, body: Body) VerifyError!voi
                         if (instruction.ty != lhs) return error.OperandTypeMismatch;
                     },
                     .eq, .ne, .lt, .le, .gt, .ge => {
-                        if (operand != .integer and !((binary.op == .eq or binary.op == .ne) and operand == .boolean)) return error.InvalidOperation;
+                        if (operand != .integer and !((binary.op == .eq or binary.op == .ne) and (operand == .boolean or operand == .string))) return error.InvalidOperation;
                         if (ty != .boolean) return error.OperandTypeMismatch;
                     },
                 }
@@ -765,7 +765,7 @@ test "string constants are canonical owned UTF8 and operations verify exact type
     };
     instructions[1].op.binary.op = .sub;
     try std.testing.expectError(error.InvalidOperation, ir.setFunctionBody(f, &instructions, @enumFromInt(1)));
-    instructions[1].op.binary.op = .eq;
+    instructions[1].op.binary.op = .lt;
     instructions[1].ty = boolean;
     try std.testing.expectError(error.InvalidOperation, ir.setFunctionBody(f, &instructions, @enumFromInt(0)));
     instructions[1].op.binary.op = .add;
@@ -774,6 +774,37 @@ test "string constants are canonical owned UTF8 and operations verify exact type
     try std.testing.expectError(error.OperandTypeMismatch, ir.setFunctionBody(f, &instructions, @enumFromInt(1)));
     instructions[2].ty = integer;
     try ir.setFunctionBody(f, &instructions, @enumFromInt(1));
+    try ir.verify();
+}
+
+test "string equality verifier requires exact string operands and boolean results" {
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    const string = try ir.internType(.string);
+    const boolean = try ir.internType(.boolean);
+    const signature = try ir.internType(.{ .function = .{ .params = &.{ string, boolean }, .result = boolean } });
+    const f = try ir.addFunction("equal", signature, .{ .start = 0, .end = 0 });
+    var instructions = [_]Instruction{
+        .{ .ty = string, .span = .{ .start = 0, .end = 0 }, .op = .{ .parameter = 0 } },
+        .{ .ty = boolean, .span = .{ .start = 0, .end = 0 }, .op = .{ .parameter = 1 } },
+        .{ .ty = boolean, .span = .{ .start = 0, .end = 0 }, .op = .{ .binary = .{ .op = .eq, .lhs = @enumFromInt(0), .rhs = @enumFromInt(0) } } },
+    };
+    for ([_]BinaryOp{ .eq, .ne }) |op| {
+        instructions[2].op.binary.op = op;
+        try ir.validateBody(ir.getFunction(f).?, .{ .instructions = &instructions, .result = @enumFromInt(2) });
+        instructions[2].ty = string;
+        try std.testing.expectError(error.OperandTypeMismatch, ir.setFunctionBody(f, &instructions, @enumFromInt(2)));
+        instructions[2].ty = boolean;
+        instructions[2].op.binary.rhs = @enumFromInt(1);
+        try std.testing.expectError(error.OperandTypeMismatch, ir.setFunctionBody(f, &instructions, @enumFromInt(2)));
+        instructions[2].op.binary.rhs = @enumFromInt(0);
+    }
+    for ([_]BinaryOp{ .lt, .le, .gt, .ge }) |op| {
+        instructions[2].op.binary.op = op;
+        try std.testing.expectError(error.InvalidOperation, ir.setFunctionBody(f, &instructions, @enumFromInt(2)));
+    }
+    instructions[2].op.binary.op = .ne;
+    try ir.setFunctionBody(f, &instructions, @enumFromInt(2));
     try ir.verify();
 }
 

@@ -1241,8 +1241,19 @@ before evaluating `rhs`, concatenates, then replaces `s`. RHS effects may replac
 `s`; a return, break or continue skips the final concatenation and store without
 undoing those effects. Shared originals remain unchanged, including for `s += s`.
 Concatenation checks length overflow and allocates GC-managed backing; allocation
-failure panics. String equality, other operators (including `-=`, `*=`, `/=` and
-`%=`), indexing, slicing, interpolation and Unicode operations remain deferred. Arrays remain bool/integer-only: `[]string` and nested arrays are rejected.
+failure panics.
+
+`==` and `!=` compare exact UTF-8 bytes and byte length, including embedded NUL,
+not storage addresses. Both operands must be strings; the result is `bool`.
+Operands evaluate once, left to right, retaining the left value even if the RHS
+replaces its binding or allocates. Comparison itself does not allocate. Equality
+is case-sensitive and performs no Unicode normalization: `"é" == "e\u{301}"`
+is false, while `"é" == "\u{e9}"` is true. A return, break or continue in an
+operand skips the remaining comparison without undoing earlier effects.
+
+Ordering (`<`, `<=`, `>`, `>=`), other operators (including `-=`, `*=`, `/=` and
+`%=`), indexing, slicing, interpolation and Unicode operations remain deferred.
+Arrays remain bool/integer-only: `[]string` and nested arrays are rejected.
 
 `.len` is the byte length as native `uint`, not a character or grapheme count.
 `"é".len` is 2 and `"😀".len` is 4. Literals use the existing escapes (`\n`, `\r`,
@@ -1271,7 +1282,8 @@ let main: () -> void = {
 ```
 
 See [`examples/strings.nov`](examples/strings.nov), which also demonstrates escaped
-braces and embedded-NUL output. String formatting preserves literal tokens and escapes.
+braces, embedded-NUL output and byte-exact equality across independent allocations.
+String formatting preserves literal tokens and escapes.
 Literals use static read-only bytes with a null GC owner; concatenation results
 have an exact scalar GC backing descriptor. Only managed owner fields are traced,
 never static byte pointers. Temporaries use the same precise root frames as arrays.

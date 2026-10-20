@@ -155,6 +155,12 @@ fn write(allocator: std.mem.Allocator, ir: *const Ir, origins: []const ?Origin, 
         try w.writeAll(@embedFile("runtime/array.h"));
         if (usesStringConcat(ir)) try w.writeAll(@embedFile("runtime/string.h"));
     }
+    if (usesStringEquality(ir)) try w.writeAll(
+        "#include <string.h>\n" ++
+            "static bool nov_string_equal(nov_string a, nov_string b) {\n" ++
+            "    return a.len == b.len && (!a.len || memcmp(a.data, b.data, (size_t)a.len) == 0);\n" ++
+            "}\n",
+    );
     try writeArithmeticRuntime(ir, w);
     var first_typedef = true;
     for (origins, ir.types.items, 0..) |origin, ty, i| {
@@ -191,6 +197,18 @@ fn needsRootFrame(ir: *const Ir, function: Ir.Function) bool {
 
 fn usesManagedRuntime(ir: *const Ir) bool {
     for (ir.functions.items) |function| if (needsRootFrame(ir, function)) return true;
+    return false;
+}
+
+fn usesStringEquality(ir: *const Ir) bool {
+    for (ir.functions.items) |function| {
+        const body = function.body.?;
+        for (body.instructions) |instruction| {
+            if (instruction.op != .binary) continue;
+            const binary = instruction.op.binary;
+            if ((binary.op == .eq or binary.op == .ne) and ir.getType(body.instructions[@intFromEnum(binary.lhs)].ty).? == .string) return true;
+        }
+    }
     return false;
 }
 
@@ -609,6 +627,11 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
             .binary => |binary| arithmetic: {
                 const lhs = @intFromEnum(binary.lhs);
                 const rhs = @intFromEnum(binary.rhs);
+                if (ir.getType(body.instructions[lhs].ty).? == .string) {
+                    if (binary.op == .ne) try w.writeByte('!');
+                    try w.print("nov_string_equal(v{d}, v{d})", .{ lhs, rhs });
+                    break :arithmetic;
+                }
                 switch (binary.op) {
                     .add, .sub, .mul => {
                         try w.writeByte('(');
@@ -882,6 +905,80 @@ test "immutable strings share UTF8 bytes across calls replacements control flow 
     try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, string_output, "", "-O0");
 }
 
+const string_equality =
+    \\let literal: string = "hé\0😀"
+    \\let make: () -> string = "hé\0" + "😀"
+    \\let mark: (s: string) -> string = {@print(s)
+    \\    s + "!"}
+    \\let early: () -> bool = make() == {return true
+    \\}
+    \\let main: () -> void = {
+    \\    let a = make()
+    \\    let b = make()
+    \\    @println(a == b, a == literal, a != b, literal != "hé\0😁")
+    \\    @println("" == "" + "", "" != "x", "a\0b" == "a\x00b", "a\0b" != "a\0c")
+    \\    @println("a\0" != "a", "ab" != "abc", "ab" != "cb", "a" != "A")
+    \\    @println("é" == "\u{e9}", "é" != "e\u{301}", "😀" == "\u{1f600}")
+    \\    let mut s = "old" + "!"
+    \\    let snapshot = s == {s = "new" + "!"
+    \\        "old" + "!"}
+    \\    @println(snapshot, s == "new!")
+    \\    @println(mark("L") != mark("R"), early())
+    \\    let skipped = false and mark("BAD") == "BAD!"
+    \\    @println(skipped)
+    \\    let mut i: int = 0
+    \\    loop i < 3 {
+    \\        i += 1
+    \\        let result = make() == {if i == 1 {continue}
+    \\            if i == 2 {break}
+    \\            mark("BAD")}
+    \\        @println(result)
+    \\    }
+    \\    @println(i)
+    \\}
+;
+const string_equality_output = "true true false true\ntrue true true true\ntrue true true true\ntrue true true\ntrue true\nLRtrue true\nfalse\n2\n";
+
+test "string equality compares bytes and preserves effects terminal paths formatting and GC roots" {
+    const c = try arrayTestProgram(string_equality);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, string_equality_output, "", mode);
+}
+
+test "string equality library is allocation free and handles null empty views" {
+    const library = try emitSource("let equal: (a: string, b: string) -> bool = a == b\nlet different: (a: string, b: string) -> bool = a != b", null);
+    defer test_gpa.free(library);
+    try std.testing.expect(std.mem.indexOf(u8, library, "nov_string_concat") == null);
+    const c = try std.mem.concat(test_gpa, u8, &.{
+        "#include <stdlib.h>\nstatic void *no_alloc(size_t n) { (void)n; abort(); }\n#define NOV_GC_MALLOC no_alloc\n#define NOV_GC_FREE free\n",
+        library,
+        "\nint main(void) {\n" ++
+            "nov_string a = {NULL, (const unsigned char *)\"a\\0b\", 3};\n" ++
+            "nov_string b = {NULL, (const unsigned char *)\"a\\0c\", 3};\n" ++
+            "nov_string empty = {NULL, NULL, 0};\n" ++
+            "if (!nov_equal(empty, empty) || nov_different(empty, empty)) return 1;\n" ++
+            "if (nov_equal(empty, a) || !nov_different(a, empty)) return 2;\n" ++
+            "if (nov_equal(a, b) || !nov_different(a, b) || !nov_equal(a, a)) return 3;\n" ++
+            "if (nov_rt_heap.frames || nov_rt_heap.live_objects) return 4;\n" ++
+            "nov_gc_shutdown(&nov_rt_heap); return 0; }\n",
+    });
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "", "", mode);
+}
+
+test "string equality helper is emitted only on demand" {
+    for ([_][]const u8{
+        "let f: (callback: (string) -> bool) -> void = {}",
+        "let f: (s: string) -> string = s",
+        "let main: () -> void = @println(\"a\" + \"b\")",
+    }) |source| {
+        const library = try emitSource(source, null);
+        defer test_gpa.free(library);
+        try std.testing.expect(std.mem.indexOf(u8, library, "nov_string_equal") == null);
+        try compileAndRun(library, "int main(void) { return 0; }");
+    }
+}
+
 const string_compound =
     \\let id: (s: string) -> string = s
     \\let early: (b: bool) -> string = {
@@ -999,7 +1096,7 @@ test "generated string programs compile for Windows with binary UTF8 output" {
 
 test "lowered strings emit after module and source storage are freed" {
     var sema = blk: {
-        var module = try Module.init(test_gpa, "source-free.nov", "let text: string = \"a\\0é\"\nlet main: () -> void = @println(text + \"!\")");
+        var module = try Module.init(test_gpa, "source-free.nov", "let text: string = \"a\\0é\"\nlet main: () -> void = @println(text + \"!\", text == \"a\\0\" + \"é\")");
         defer module.deinit();
         break :blk try Lowering.lower(&module);
     };
@@ -1008,11 +1105,11 @@ test "lowered strings emit after module and source storage are freed" {
     try sema.ir.verify();
     const program = try emitProgram(test_gpa, &sema.ir, null);
     defer test_gpa.free(program);
-    try compileAndRunExpected(program, "typedef int nonempty_translation_unit;", 0, "a\x00é!\n", "");
+    try compileAndRunExpected(program, "typedef int nonempty_translation_unit;", 0, "a\x00é! true\n", "");
 }
 
 test "string compiler ownership survives every allocation failure" {
-    for ([_][]const u8{ string_example, string_compound }) |source| try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{source});
+    for ([_][]const u8{ string_example, string_compound, string_equality }) |source| try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{source});
 }
 
 test "string length overflow panics before touching invalid backing in both modes" {
@@ -1318,7 +1415,7 @@ test "array capacity and append length overflow panic before accessing backing" 
 }
 
 test "array allocation failure retries preserve roots and shutdown frees backing" {
-    for ([_][]const u8{ array_example, array_compound_effects, inferred_example, inferred_arrays, string_example, string_compound, unconditional_loops, else_loops }, [_][]const u8{ "3 30 30 6\n454 15\n99 15 4\nfalse true 2\n0\n", array_compound_output, inferred_output, inferred_arrays_output, string_output, string_compound_output, unconditional_output, else_loop_output }) |source, output| {
+    for ([_][]const u8{ array_example, array_compound_effects, inferred_example, inferred_arrays, string_example, string_compound, string_equality, unconditional_loops, else_loops }, [_][]const u8{ "3 30 30 6\n454 15\n99 15 4\nfalse true 2\n0\n", array_compound_output, inferred_output, inferred_arrays_output, string_output, string_compound_output, string_equality_output, unconditional_output, else_loop_output }) |source, output| {
         const c = try arrayTestProgram(source);
         defer test_gpa.free(c);
         const injected = try std.mem.concat(test_gpa, u8, &.{

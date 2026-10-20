@@ -888,7 +888,7 @@ const Context = struct {
                 const operand = (try self.probe(data.lhs, depth + 1)) orelse (try self.probe(data.rhs, depth + 1)) orelse return self.missingOperandType(node, data.lhs, data.rhs, null, depth);
                 const ty = self.ir.getType(operand.ty).?;
                 const equality = ast.nodes.items(.tag)[node] == .equal_equal or ast.nodes.items(.tag)[node] == .bang_equal;
-                if (ty != .integer and !(ty == .boolean and equality)) return self.fail(.operator_not_supported, node, operand.annotation);
+                if (ty != .integer and !((ty == .boolean or ty == .string) and equality)) return self.fail(.operator_not_supported, node, operand.annotation);
                 const lhs = try self.expression(data.lhs, operand, depth + 1);
                 const rhs = try self.expression(data.rhs, operand, depth + 1);
                 if (lhs == null or rhs == null) return null;
@@ -981,6 +981,50 @@ test "string inference accepts late literals calls lengths and branch context" {
     try std.testing.expect(sema.lowering_complete);
 }
 
+test "string equality infers exact operands and a boolean result" {
+    var module = try Module.init(std.testing.allocator, "equality.nov",
+        \\let constant: string = "a"
+        \\let id: (s: string) -> string = s
+        \\let f: (s: string, b: bool) -> bool = {
+        \\    let same = "a" == "a"
+        \\    let different = constant != id(s)
+        \\    let branch = if b {s} else {"b"} == "a"
+        \\    same and different or branch
+        \\}
+    );
+    defer module.deinit();
+    var sema = try @import("Lowering.zig").lower(&module);
+    defer sema.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+}
+
+test "string comparisons reject ordered mixed and nonboolean result types" {
+    const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag };
+    for ([_]Case{
+        .{ .source = "let f: () -> bool = \"a\" == true", .tag = .literal_type_mismatch },
+        .{ .source = "let f: () -> bool = true != \"a\"", .tag = .literal_type_mismatch },
+        .{ .source = "let f: () -> bool = \"a\" == 1", .tag = .literal_type_mismatch },
+        .{ .source = "let f: () -> bool = 1 != \"a\"", .tag = .literal_type_mismatch },
+        .{ .source = "let f: (s: string, n: int) -> bool = s == n", .tag = .expression_type_mismatch },
+        .{ .source = "let f: (s: string, n: int) -> bool = n != s", .tag = .expression_type_mismatch },
+        .{ .source = "let f: () -> string = \"a\" == \"b\"", .tag = .expression_type_mismatch },
+        .{ .source = "let f: () -> bool = \"a\" < \"b\"", .tag = .operator_not_supported },
+        .{ .source = "let f: () -> bool = \"a\" <= \"b\"", .tag = .operator_not_supported },
+        .{ .source = "let f: () -> bool = \"a\" > \"b\"", .tag = .operator_not_supported },
+        .{ .source = "let f: () -> bool = \"a\" >= \"b\"", .tag = .operator_not_supported },
+    }) |case| {
+        var module = try Module.init(std.testing.allocator, "comparison.nov", case.source);
+        defer module.deinit();
+        var sema = try @import("Lowering.zig").lower(&module);
+        defer sema.deinit();
+        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+        try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
+        try std.testing.expect(!sema.lowering_complete);
+    }
+}
+
 test "string compounds retain mutability operator and operand diagnostics" {
     const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag };
     for ([_]Case{
@@ -1014,7 +1058,7 @@ test "string compounds retain mutability operator and operand diagnostics" {
     }
 }
 
-test "strings reject byte mutation indexing slicing arrays comparisons and eager globals" {
+test "strings reject byte mutation indexing slicing arrays ordering and eager globals" {
     for ([_][]const u8{
         "let f: () -> void = {let x: []string = []\n}",
         "let f: () -> void = {let x = [\"a\"]\n}",
@@ -1023,7 +1067,7 @@ test "strings reject byte mutation indexing slicing arrays comparisons and eager
         "let f: () -> void = @println(\"a\"[0..1])",
         "let f: () -> void = {let mut x = \"a\"\nx.len = 1}",
         "let f: () -> void = {let mut x = \"a\"\nx -= \"b\"}",
-        "let f: () -> bool = \"a\" == \"b\"",
+        "let f: () -> bool = \"a\" < \"b\"",
         "let f: () -> string = \"a\" - \"b\"",
         "let f: () -> string = 1 + \"b\"",
         "let f: () -> string = \"a\" + 1",
