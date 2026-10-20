@@ -1,11 +1,10 @@
 # Internal GC foundation
 
 `gc.h` is a standalone libc-only C11, nonmoving, single-threaded mark/sweep
-collector for **fixed-layout internal objects**, not a Nov language feature.
-`GcRuntime.zig.source` embeds it for future conditional C emission. No current
-IR operation requests it and the emitter is deliberately unchanged. Future
-emission must include it only when managed operations are present and define
-`NOV_GC_PANIC` as `nov_rt_panic` to share the emitted panic helper. The standalone
+collector for **fixed-layout internal objects**. `GcRuntime.zig.source` embeds
+it conditionally for scalar-array code generation alongside `array.h`.
+Scalar-only emission is unchanged. Managed emission defines `NOV_GC_PANIC` as
+`nov_rt_panic` to share the emitted panic helper. The standalone
 fallback follows the existing contract: flush stdout, `panic: <message>\n` on
 stderr, exit 1. No external collector, finalizers, weak references, moving,
 concurrency, or conservative stack scanning is involved.
@@ -15,7 +14,10 @@ concurrency, or conservative stack scanning is involved.
 Initialize one `nov_gc_heap` with `nov_gc_init`; do not copy it or reinitialize a
 live heap. Allocate using `nov_gc_alloc` (panic on failure) or
 `nov_gc_try_alloc` (NULL on size overflow or exhausted allocation retry).
-Descriptors and their offset tables are immutable and must outlive their objects.
+The descriptor value is copied into the allocation header, so a stack-local
+descriptor is safe. Pointer-offset tables remain borrowed, immutable, and must
+outlive their objects. This permits exact, variable-size scalar backing blocks
+without allocating or retaining separate descriptor objects.
 Use `sizeof(T)`, `_Alignof(T)` and sorted `offsetof(T, field)` entries. Every strong
 managed field must be an actual C `void *` object and appear exactly once. Nested
 inline records can be flattened into offsets. Do not describe arbitrary typed
@@ -106,9 +108,45 @@ compatible, fundamentally aligned and nonreentrant. No hook may reenter the heap
 checks. GCC can run the same harness with the identical flags. The harness counts
 outstanding host allocations to check deterministic cleanup.
 
-## Still blocked on language decisions
+## Generated scalar arrays
 
-This API does not decide array storage/growth/copying/aliasing, slice ownership and
-invalidation, string encoding/mutability/layout/interpolation, container mutation,
-or any source-level allocation/FFI syntax. Those contracts and compiler root
-lowering must be approved/implemented before adding memory-bearing IR or syntax.
+The approved first array slice uses `nov_array { void *data; uintptr_t len, cap; }`.
+The emitter declares this type for any transitively reachable array type, including
+arrays nested in callback parameter/result signatures. Signature-only callback
+uses need neither the GC helpers nor root frames; unreferenced pooled types emit
+nothing. Runtime emission and function rooting instead depend on direct managed
+parameters, results, or instruction values.
+Only backing storage is managed. Each nonempty allocation has an exact descriptor
+of `cap * sizeof(element)` bytes, element alignment, and zero pointer fields.
+Empty backing is NULL and requires no allocation. Size addition/multiplication
+are checked before allocation; self-append copies from rooted inputs into fresh
+backing. Copies and updates are eager, not a copy-on-write or amortized-growth
+optimization. Bool elements are ordinary C bool objects, not bit-packed.
+
+Typed IR owns literal operand lists and represents clone, len, index, replacement
+and append explicitly, with exact element/index/result types and region privacy.
+Array value boundaries clone; returns transfer freshly copied backing without an
+intervening safepoint after popping the callee frame. C helpers allocate at most
+one backing per call and rely on compiler-rooted input values.
+
+The emitter predeclares every managed instruction result at **function scope**,
+initializes all data fields to NULL, and pushes one frame containing their actual
+`void *data` addresses plus every managed parameter's data field before executing
+any body instruction. No typed-pointer-to-void-pointer slot casts are used.
+Locals, prior arguments, branch merges, snapshots and return values thus remain
+rooted across all allocations, including retry collection. Slots outlive nested
+blocks and loops: break/continue leave the function frame registered (no nested
+root record exists to dangle), and every explicit/fallthrough return pops it.
+Retention is conservative: an instruction slot retains its previous iteration's
+backing until overwritten, and unused temporary slots survive until return.
+
+Program main shuts down the heap on normal completion; panic still exits without
+heap cleanup as above. Library emission's host owns lifetime/shutdown; the managed
+C ABI is internal, not an approved FFI. Single-threading and no foreign unwinding
+across frames remain requirements. Tests run generated programs with collection
+on **every** allocation, injected allocation failures/retries, strict C11/UBSan,
+-O0 and -O2 bounds checks, argument-order effects, nested loops and early returns.
+
+Writable length (especially growth initialization), slices/invalidation, nested
+or pointer elements, explicit aliases, strings and managed FFI remain deferred.
+See the main README for delivered source syntax and copy/evaluation contracts.

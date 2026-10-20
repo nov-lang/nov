@@ -34,6 +34,14 @@ static void *cons(nov_gc_heap *heap, void *child) {
     return p;
 }
 
+/* Scalar backing descriptors need not outlive this call. */
+static void *scalar_backing(nov_gc_heap *heap, size_t bytes) {
+    nov_gc_descriptor d = {bytes, 1, 0, NULL};
+    void *p = nov_gc_alloc(heap, &d);
+    d.size = 0;
+    return p;
+}
+
 int main(int argc, char **argv) {
     nov_gc_heap heap;
     nov_gc_roots frame = {0}, global = {0}, inner = {0};
@@ -74,6 +82,14 @@ int main(int argc, char **argv) {
         return 99;
     }
     heap.collect_every_allocation = 1;
+    root = scalar_backing(&heap, 7);
+    saved = scalar_backing(&heap, 19);
+    nov_gc_collect(&heap);
+    assert(heap.live_objects == 2);
+    assert(((unsigned char *)root)[6] == 0 && ((unsigned char *)saved)[18] == 0);
+    root = saved = NULL;
+    nov_gc_collect(&heap);
+    assert(!heap.live_objects && !heap.live_bytes && !outstanding);
     root = nov_gc_alloc(&heap, &descriptor);
     assert((uintptr_t)root % _Alignof(node) == 0);
     assert(!((node *)root)->left && !((node *)root)->right && !((node *)root)->value);

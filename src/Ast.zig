@@ -148,15 +148,14 @@ test "nested call views retain independent argument slices" {
 
 test "expression token boundaries follow delimiters rather than newline counts" {
     const expressions = [_][:0]const u8{
-        "{}",                      "{\n\n}",        "{1}",                               "{1\n}",                          "{\n1\n\n; tail\n}",
-        "{1\n2}",                  "{1\n2\n3\n\n}", "{{1}\n{2}\n3}",                     "named: {1}",                     "{\r\n\t1\r\n\r\n}",
-        "f()",                     "f(\n\n)",       "f(1)",                              "f(1,)",                          "f(\n1\n)",
-        "f(1, 2)",                 "f(1, 2,\n\n)",  "f(g(1), h(2, 3))",                  "()",                             "(\n\n)",
-        "(x: int)",                "(x: int,\n\n)", "(x: int, y: bool,\n)",              "(callback: (x: int) -> int,\n)", "() -> int",
-        "(x: int, y: int) -> int", "1 + f(2, 3)",   "{1} * 3",                           "-f(1)",                          "#f(1)",
-        "f(\"(\", \")\")",         "{\"}\"}",       "f(1, ; ) ignored in comment\n2\n)", "{; } ignored in comment\n1\n}",
+        "[]",                "[1]",    "[1, 2,]",  "[1, 2, 3,\n]",    "[[1], [2, 3],]",       "a[0]",                              "a[-1]",                         "make()[0]",               "a[call(0)]",
+        "{}",                "{\n\n}", "{1}",      "{1\n}",           "{\n1\n\n; tail\n}",    "{1\n2}",                            "{1\n2\n3\n\n}",                 "{{1}\n{2}\n3}",           "named: {1}",
+        "{\r\n\t1\r\n\r\n}", "f()",    "f(\n\n)",  "f(1)",            "f(1,)",                "f(\n1\n)",                          "f(1, 2)",                       "f(1, 2,\n\n)",            "f(g(1), h(2, 3))",
+        "()",                "(\n\n)", "(x: int)", "(x: int,\n\n)",   "(x: int, y: bool,\n)", "(callback: (x: int) -> int,\n)",    "() -> int",                     "(x: int, y: int) -> int", "1 + f(2, 3)",
+        "{1} * 3",           "-f(1)",  "#f(1)",    "f(\"(\", \")\")", "{\"}\"}",              "f(1, ; ) ignored in comment\n2\n)", "{; } ignored in comment\n1\n}",
     };
     for (expressions) |expression| {
+        errdefer std.debug.print("expression span case: {s}\n", .{expression});
         const source = try std.fmt.allocPrintSentinel(std.testing.allocator, "let value = {s}\nlet next = 0\n", .{expression}, 0);
         defer std.testing.allocator.free(source);
         var tree = try Parser.parse(std.testing.allocator, source);
@@ -778,6 +777,10 @@ pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
         .block_newline,
         .block_two,
         .block_two_newline,
+        .array_init,
+        .array_init_comma,
+        .array_init_two,
+        .array_init_two_comma,
         => return self.matchingDelimiter(main_tokens[n]) + end_offset,
 
         .fn_proto_one,
@@ -802,13 +805,7 @@ pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
         .call_comma,
         => return self.matchingDelimiter(main_tokens[n]) + end_offset,
 
-        .array_access => {
-            end_offset += 1; // for the rparen/rbracket
-            if (datas[n].rhs == 0) {
-                return main_tokens[n] + end_offset;
-            }
-            n = datas[n].rhs;
-        },
+        .array_access => return self.matchingDelimiter(main_tokens[n]) + end_offset,
 
         .attr_one => {
             end_offset += 1; // for the rbracket
@@ -846,6 +843,7 @@ fn matchingDelimiter(self: Ast, opening: TokenIndex) TokenIndex {
     const close_tag: Token.Tag = switch (open_tag) {
         .l_brace => .r_brace,
         .l_paren => .r_paren,
+        .l_bracket => .r_bracket,
         else => unreachable,
     };
     var depth: usize = 1;

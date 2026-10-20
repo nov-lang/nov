@@ -16,11 +16,11 @@ Nov has automatic memory management via a minimal tracing GC.
 
 Requires Zig 0.16.0.
 
-An opt-in, internal libc-only nonmoving mark/sweep GC foundation is available for
-future managed-value code generation. It is not emitted into current scalar
-programs and adds no language features. See the [runtime API and root discipline](src/runtime/README.md)
-for layout, C boundary, OOM, testing, and unsupported-reference contracts. Array,
-slice, and string semantics remain undecided.
+Scalar growable arrays use an internal libc-only nonmoving mark/sweep GC. The
+runtime is emitted only for managed values; scalar-only programs stay unchanged.
+See the [runtime API and root discipline](src/runtime/README.md) for layout, C
+boundary, OOM, testing, and unsupported-reference contracts. Slices, nested arrays,
+explicit aliases and strings remain deferred.
 
 ```sh
 zig build
@@ -693,6 +693,58 @@ let prod = a.! * b.! ; will return .none to the calling function since b is .non
 ```
 
 ## Arrays
+
+### Executable scalar subset
+
+Growable `[]T` arrays are supported in function bodies and signatures for `bool`,
+`i8/i16/i32/i64`, `u8/u16/u32/u64`, and native `int/uint`. Literals require an
+expected array type, including empty `[]`; numeric literal defaults and inferred
+locals are still deferred. See [examples/arrays.nov](examples/arrays.nov):
+
+```nov
+let main: () -> void = {
+    let mut values: []int = [1, 2, 3]
+    let original: []int = values
+    values[-1] = 30
+    values += values
+    @println(original[-1], values[-1], values.len) ; 3 30 6
+    values = []
+}
+```
+
+- Array assignment, local initialization, by-value arguments and returns have
+  **copy semantics**: independent element storage, not aliases. Immutable arrays
+  cannot have their elements changed. Parameters are immutable; copy into a
+  mutable local to edit them.
+- `.len` has pointer-sized `uint` type. Internal capacity is also pointer-sized
+  `uint`, but is not a source-level field. Indices have native `int` type, with
+  `-1` denoting the last element and `-len` the first. Every out-of-bounds access
+  (including empty arrays and minimum native `int`) panics with
+  `panic: array index out of bounds`, exit 1, identically in debug and release.
+- Plain `values[index] = element` and `values += other_array` require a mutable
+  direct local. Append accepts the same array type and self-append is safe.
+  Element compound assignments are not yet supported.
+- Evaluation is once, left-to-right: callee before arguments, literal elements in
+  order, indexing base before index. Array reads capture values; read-modify-write
+  updates (`+=` and element replacement) capture the left array before index/RHS
+  effects, then store the updated value after the RHS. Bounds on replacement are
+  checked at that final update; a returning RHS does not perform it.
+- This first implementation deliberately copies eagerly, including temporary
+  snapshots. Reads and updates may allocate/copy O(n) elements; append does not yet
+  promise amortized constant time or preserve spare capacity across value copies.
+  Compiler roots conservatively retain temporary backing until its instruction is
+  reused or the function returns, rather than doing last-use liveness analysis.
+- `.len` writes are explicitly rejected: shrinking and especially initialization
+  on length growth remain undesigned. No array printing, equality, concatenation
+  with `+`, slices, nested arrays, pointer/function elements, explicit aliases,
+  array globals, capacity API, iteration, or array formatting is delivered.
+  `@print`/`@println` still accept only bool/integer values; indexing and `.len`
+  can be printed.
+
+The broader examples below describe future syntax as well as implemented syntax;
+printing arrays, inferred types and writable `.len` in them are **not** executable
+features of this subset.
+
 Array literals are comma-separated, may span multiple lines, and may have a
 trailing comma.
 

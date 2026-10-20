@@ -51,6 +51,8 @@ pub const Diagnostic = struct {
         unsupported_local_declaration,
         immutable_assignment,
         unsupported_assignment_target,
+        unsupported_array_length_write,
+        array_literal_needs_type,
         unused_block_value,
         unreachable_code,
         loop_control_outside_loop,

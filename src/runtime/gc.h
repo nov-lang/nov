@@ -31,6 +31,7 @@ union nov_gc_object {
     struct {
         nov_gc_object *next, *gray;
         const nov_gc_descriptor *descriptor;
+        nov_gc_descriptor owned_descriptor;
         unsigned marked;
     } h;
 };
@@ -189,7 +190,8 @@ static inline void *nov_gc_try_alloc(nov_gc_heap *heap, const nov_gc_descriptor 
     }
     p->h.next = heap->objects;
     p->h.gray = NULL;
-    p->h.descriptor = d;
+    p->h.owned_descriptor = *d;
+    p->h.descriptor = &p->h.owned_descriptor;
     p->h.marked = 0;
     heap->objects = p;
     ++heap->live_objects;

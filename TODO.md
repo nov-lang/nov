@@ -295,6 +295,15 @@ if expr |val| {
 ```
 
 # Arrays
+
+Approved and delivered first slice: growable scalar `[]T` value arrays with
+pointer-sized uint len/cap, native int negative indexing, independent copies at
+value boundaries, literals (including context-typed empty arrays), read-only
+`.len`, mutable element replacement and self-safe `+=` append. See README's
+executable subset for precise limits and evaluation order. The proposals below
+remain proposals; writable length, slices, nested/pointer elements, aliases,
+capacity APIs and efficient copy/append optimizations are still deferred.
+
 Side note about mutability. A constant array cannot be modified in any way, its
 values are constant too. A mutable array can be reassigned/extanded and its
 values can be modified. TODO: talk about * and *mut array.

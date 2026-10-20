@@ -1,0 +1,27 @@
+; Scalar growable arrays have independent storage at value boundaries.
+let make: (n: int) -> []int = {
+    @print(n)
+    [n, n + 10]
+}
+
+let combine: (first: []int, second: []int) -> []int = {
+    let mut result: []int = first
+    result[0] = 99
+    @println(first[0], second[-1])
+    result += second
+    return result
+}
+
+let main: () -> void = {
+    let mut numbers: []int = [1, 2, 3]
+    let original: []int = numbers
+    numbers[-1] = 30
+    numbers += numbers
+    @println(original[-1], numbers[2], numbers[-1], numbers.len)
+    let joined: []int = combine(make(4), make(5))
+    @println(joined[0], joined[-1], joined.len)
+    let flags: []bool = [true, false]
+    @println(flags[-1], flags[0], flags.len)
+    numbers = []
+    @println(numbers.len)
+}

@@ -105,7 +105,9 @@ fn checkInner(module: *Module, ir: *Ir, types: []const ?Ir.TypeId, id: Module.De
     }
     const annotation = module.tokenSpan(if (proto.ast.return_type) |node| module.ast.firstToken(node) else proto.lparen);
     context.return_type = .{ .ty = ty.function.result, .annotation = annotation };
-    return (try context.expression(full.ast.init_node, .{ .ty = ty.function.result, .annotation = annotation }, 0)) != null;
+    const checked = (try context.expression(full.ast.init_node, .{ .ty = ty.function.result, .annotation = annotation }, 0)) != null;
+    if (checked and !context.terminated) try context.copyNode(full.ast.init_node, ty.function.result);
+    return checked;
 }
 
 const Context = struct {
@@ -182,6 +184,7 @@ const Context = struct {
         // forward local references, and initialization happens exactly once.
         if (try self.expression(decl.init_node, known, depth + 1) == null) return false;
         if (self.terminated) return true;
+        try self.copyNode(decl.init_node, ty);
         const slot = if (decl.is_mutable and self.emitter != null)
             try self.emitter.?.append(ty, self.irSpan(node), .{ .local_slot = try self.emitter.?.value(decl.init_node) })
         else
@@ -288,6 +291,12 @@ const Context = struct {
                 if (std.mem.eql(u8, name, "true") or std.mem.eql(u8, name, "false")) break :blk .{ .ty = try self.ir.internType(.boolean) };
                 break :blk null;
             },
+            .array_access => blk: {
+                const array = (try self.probe(data.lhs, depth + 1)) orelse break :blk null;
+                const ty = self.ir.getType(array.ty).?;
+                break :blk if (ty == .array) .{ .ty = ty.array } else null;
+            },
+            .field_access => if (std.mem.eql(u8, ast.tokenSlice(data.rhs), "len")) .{ .ty = try self.ir.internType(.{ .integer = .{ .signedness = .unsigned, .bits = Ir.native_pointer_bits } }) } else null,
             .block, .block_two, .block_newline, .block_two_newline => try self.probeBlock(node, depth),
             .loop_condition, .@"if", .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod => .{ .ty = try self.ir.internType(.void) },
             .if_else => blk: {
@@ -354,6 +363,26 @@ const Context = struct {
         return self.fail(.literal_needs_type, lhs, null);
     }
 
+    fn copyNode(self: *Context, node: Ast.Node.Index, ty: Ir.TypeId) Error!void {
+        if (self.ir.getType(ty).? != .array) return;
+        if (self.emitter) |emitter| {
+            const copy = try emitter.append(ty, self.irSpan(node), .{ .array_clone = try emitter.value(node) });
+            try emitter.values.put(emitter.allocator, node, copy);
+        }
+    }
+
+    fn arrayElements(self: *Context, node: Ast.Node.Index, buffer: *[2]Ast.Node.Index) []const Ast.Node.Index {
+        const ast = &self.module.ast;
+        const data = ast.nodes.items(.data)[node];
+        return switch (ast.nodes.items(.tag)[node]) {
+            .array_init, .array_init_comma => ast.extra_data[data.lhs..data.rhs],
+            else => blk: {
+                buffer.* = .{ data.lhs, data.rhs };
+                break :blk buffer[0 .. @as(usize, @intFromBool(data.lhs != 0)) + @as(usize, @intFromBool(data.rhs != 0))];
+            },
+        };
+    }
+
     fn irSpan(self: *Context, node: Ast.Node.Index) Ir.Span {
         const ast = &self.module.ast;
         return .{
@@ -369,12 +398,22 @@ const Context = struct {
         const data = ast.nodes.items(.data)[node];
         const tag = ast.nodes.items(.tag)[node];
         const op: Ir.Operation = switch (tag) {
+            .array_init, .array_init_comma, .array_init_two, .array_init_two_comma => blk: {
+                var buffer: [2]Ast.Node.Index = undefined;
+                const elements = self.arrayElements(node, &buffer);
+                const values = try emitter.allocator.alloc(Ir.ValueId, elements.len);
+                for (elements, values) |element, *value| value.* = try emitter.value(element);
+                break :blk .{ .array_literal = values };
+            },
+            .array_access => .{ .array_index = .{ .array = try emitter.value(data.lhs), .index = try emitter.value(data.rhs) } },
+            .field_access => .{ .array_len = try emitter.value(data.lhs) },
             .identifier => blk: {
                 const name = self.module.sourceSlice(self.span(node)).?;
                 if (self.bindings.get(name)) |binding| {
                     if (binding.slot) |slot| break :blk .{ .local_load = slot };
                     if (binding.initializer) |initializer| {
                         try emitter.values.put(emitter.allocator, node, try emitter.value(initializer));
+                        if (self.ir.getType(ty).? == .array) try self.copyNode(node, ty);
                         return true;
                     }
                     break :blk .{ .parameter = binding.index };
@@ -430,7 +469,32 @@ const Context = struct {
             },
         };
         try emitter.record(node, ty, self.irSpan(node), op);
+        if (tag == .identifier and self.ir.getType(ty).? == .array) try self.copyNode(node, ty);
         return true;
+    }
+
+    fn elementAssignment(self: *Context, node: Ast.Node.Index, expected: ?Known, depth: usize) Error!?Ir.TypeId {
+        const ast = &self.module.ast;
+        const data = ast.nodes.items(.data)[node];
+        const target = ast.nodes.items(.data)[data.lhs];
+        if (ast.nodes.items(.tag)[node] != .assign or ast.nodes.items(.tag)[target.lhs] != .identifier) return self.fail(.unsupported_assignment_target, data.lhs, null);
+        const name = self.module.sourceSlice(self.span(target.lhs)).?;
+        const binding = self.bindings.get(name) orelse return self.fail(.unsupported_assignment_target, data.lhs, null);
+        const array = self.ir.getType(binding.known.ty).?;
+        if (array != .array) return self.fail(.unsupported_assignment_target, data.lhs, null);
+        if (!binding.mutable) return self.fail(.immutable_assignment, target.lhs, binding.name_span);
+        if (try self.expression(target.lhs, binding.known, depth + 1) == null) return null;
+        const index = try self.ir.internType(.{ .integer = .{ .signedness = .signed, .bits = Ir.native_pointer_bits } });
+        if (try self.expression(target.rhs, .{ .ty = index }, depth + 1) == null) return null;
+        if (try self.expression(data.rhs, .{ .ty = array.array }, depth + 1) == null) return null;
+        const unit = try self.ir.internType(.void);
+        if (!self.terminated) {
+            if (self.emitter) |emitter| {
+                const updated = try emitter.append(binding.known.ty, self.irSpan(node), .{ .array_set = .{ .array = try emitter.value(target.lhs), .index = try emitter.value(target.rhs), .value = try emitter.value(data.rhs) } });
+                try emitter.record(node, unit, self.irSpan(node), .{ .local_store = .{ .slot = binding.slot.?, .value = updated } });
+            }
+        }
+        return self.fit(unit, expected, node);
     }
 
     fn expression(self: *Context, node: Ast.Node.Index, expected: ?Known, depth: usize) Error!?Ir.TypeId {
@@ -462,6 +526,29 @@ const Context = struct {
         const ast = &self.module.ast;
         const data = ast.nodes.items(.data)[node];
         switch (ast.nodes.items(.tag)[node]) {
+            .array_init, .array_init_comma, .array_init_two, .array_init_two_comma => {
+                const want = expected orelse return self.fail(.array_literal_needs_type, node, null);
+                const array = self.ir.getType(want.ty).?;
+                if (array != .array) return self.fail(.expression_type_mismatch, node, want.annotation);
+                var buffer: [2]Ast.Node.Index = undefined;
+                for (self.arrayElements(node, &buffer)) |element| {
+                    if (try self.expression(element, .{ .ty = array.array }, depth + 1) == null) return null;
+                }
+                return want.ty;
+            },
+            .array_access, .field_access => {
+                const base = (try self.expression(data.lhs, null, depth + 1)) orelse return null;
+                if (self.terminated) return if (expected) |want| want.ty else base;
+                const array = self.ir.getType(base).?;
+                if (array != .array) return self.fail(.unsupported_body_expression, node, null);
+                if (ast.nodes.items(.tag)[node] == .field_access) {
+                    if (!std.mem.eql(u8, ast.tokenSlice(data.rhs), "len")) return self.fail(.unsupported_body_expression, node, null);
+                    return self.fit(try self.ir.internType(.{ .integer = .{ .signedness = .unsigned, .bits = Ir.native_pointer_bits } }), expected, node);
+                }
+                const index = try self.ir.internType(.{ .integer = .{ .signedness = .signed, .bits = Ir.native_pointer_bits } });
+                if (try self.expression(data.rhs, .{ .ty = index }, depth + 1) == null) return null;
+                return self.fit(array.array, expected, node);
+            },
             .identifier => {
                 const name = self.module.sourceSlice(self.span(node)).?;
                 if (self.bindings.get(name)) |binding| return self.fit(binding.known.ty, expected, node);
@@ -510,6 +597,7 @@ const Context = struct {
                 if (data.rhs != 0) {
                     if (try self.expression(data.rhs, self.return_type, depth + 1) == null) return null;
                     if (self.terminated) return self.return_type.ty;
+                    try self.copyNode(data.rhs, self.return_type.ty);
                 } else if (self.ir.getType(self.return_type.ty).? != .void) {
                     return self.fail(.expression_type_mismatch, node, self.return_type.annotation);
                 }
@@ -522,6 +610,15 @@ const Context = struct {
                 return if (expected) |want| want.ty else unit;
             },
             .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod => {
+                if (ast.nodes.items(.tag)[data.lhs] == .field_access) {
+                    const target = ast.nodes.items(.data)[data.lhs];
+                    if (std.mem.eql(u8, ast.tokenSlice(target.rhs), "len")) {
+                        if (try self.probe(target.lhs, depth + 1)) |base| {
+                            if (self.ir.getType(base.ty).? == .array) return self.fail(.unsupported_array_length_write, data.lhs, null);
+                        }
+                    }
+                }
+                if (ast.nodes.items(.tag)[data.lhs] == .array_access) return self.elementAssignment(node, expected, depth);
                 if (ast.nodes.items(.tag)[data.lhs] != .identifier) return self.fail(.unsupported_assignment_target, data.lhs, null);
                 const name = self.module.sourceSlice(self.span(data.lhs)).?;
                 const binding = self.bindings.get(name) orelse {
@@ -531,7 +628,8 @@ const Context = struct {
                 if (!binding.mutable) return self.fail(.immutable_assignment, data.lhs, binding.name_span);
                 const tag = ast.nodes.items(.tag)[node];
                 const compound = tag != .assign;
-                if (compound and self.ir.getType(binding.known.ty).? != .integer) return self.fail(.operator_not_supported, node, binding.known.annotation);
+                const array_append = tag == .assign_add and self.ir.getType(binding.known.ty).? == .array;
+                if (compound and !array_append and self.ir.getType(binding.known.ty).? != .integer) return self.fail(.operator_not_supported, node, binding.known.annotation);
                 // Capture the old value before RHS effects, just as for binary
                 // arithmetic. A returning RHS never performs the final store.
                 if (compound and try self.expression(data.lhs, binding.known, depth + 1) == null) return null;
@@ -540,7 +638,9 @@ const Context = struct {
                 if (!self.terminated) {
                     if (self.emitter) |emitter| {
                         var value = try emitter.value(data.rhs);
-                        if (compound) value = try emitter.append(binding.known.ty, self.irSpan(node), .{ .binary = .{
+                        if (array_append) {
+                            value = try emitter.append(binding.known.ty, self.irSpan(node), .{ .array_append = .{ .lhs = try emitter.value(data.lhs), .rhs = value } });
+                        } else if (compound) value = try emitter.append(binding.known.ty, self.irSpan(node), .{ .binary = .{
                             .op = switch (tag) {
                                 .assign_add => .add,
                                 .assign_sub => .sub,
@@ -552,6 +652,7 @@ const Context = struct {
                             .lhs = try emitter.value(data.lhs),
                             .rhs = value,
                         } });
+                        if (self.ir.getType(binding.known.ty).? == .array) value = try emitter.append(binding.known.ty, self.irSpan(node), .{ .array_clone = value });
                         try emitter.record(node, unit, self.irSpan(node), .{ .local_store = .{ .slot = binding.slot.?, .value = value } });
                     }
                 }
@@ -672,7 +773,9 @@ const Context = struct {
                 if (call.ast.args.len != ty.function.params.len) return self.fail(.argument_count_mismatch, node, annotation);
                 var valid = true;
                 for (call.ast.args, ty.function.params) |arg, param| {
-                    if (try self.expression(arg, .{ .ty = param, .annotation = annotation }, depth + 1) == null) valid = false;
+                    if (try self.expression(arg, .{ .ty = param, .annotation = annotation }, depth + 1) == null) {
+                        valid = false;
+                    } else if (!self.terminated) try self.copyNode(arg, param);
                 }
                 if (!valid) return null;
                 return self.fit(ty.function.result, expected, node);
@@ -681,6 +784,36 @@ const Context = struct {
         }
     }
 };
+
+test "scalar array deferred and ill typed forms fail closed" {
+    for ([_][]const u8{
+        "let main: () -> void = @println([])",
+        "let main: () -> void = {let a: []int = []\n@println(a)}",
+        "let main: () -> void = {let a: []int = [1]\na[0] = 2}",
+        "let main: () -> void = {let mut a: []int = [1]\na.len = 2}",
+        "let main: () -> void = {let mut a: []int = [1]\na.len += 2}",
+        "let main: () -> void = {let a: []int = [1]\nlet index: uint = 0\n@println(a[index])}",
+        "let main: () -> void = {let a: []int = [true]\n}",
+        "let main: () -> void = {let a: [][]int = [[1]]\n}",
+        "let main: () -> void = {let a: []i128 = []\n}",
+        "let main: () -> void = {let a: []void = []\n}",
+        "let main: () -> void = {let a: []int = [1]\n@println(a.cap)}",
+        "let main: () -> void = {let a: []int = [1]\n@println(a == a)}",
+        "let main: () -> void = {let a: []int = [1]\n@println(a[0..1])}",
+        "let main: () -> void = {let mut a: []int = [1]\na += 2}",
+        "let main: () -> void = {let mut a: []int = [1]\na -= [2]}",
+        "let main: () -> void = {let mut a: []int = [1]\na[0] += 2}",
+    }) |source| {
+        var module = try Module.init(std.testing.allocator, "arrays.nov", source);
+        defer module.deinit();
+        try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+        var sema = try @import("Lowering.zig").lower(&module);
+        defer sema.deinit();
+        try std.testing.expect(module.hasErrors());
+        try std.testing.expect(!sema.lowering_complete);
+        try std.testing.expectEqual(@as(usize, 0), sema.ir.functions.items.len);
+    }
+}
 
 test "condition loops diagnose controls types scope and unreachable tails" {
     for ([_]struct { body: []const u8, tag: Module.Diagnostic.Tag }{

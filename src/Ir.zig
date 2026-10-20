@@ -32,6 +32,13 @@ pub const Instruction = struct { ty: TypeId, span: Span, op: Operation };
 pub const UnaryOp = enum { negate, bit_not, bool_not };
 pub const BinaryOp = enum { add, sub, mul, div, mod, eq, ne, lt, le, gt, ge };
 pub const Operation = union(enum) {
+    array_literal: []const ValueId,
+    /// Independent scalar element storage; every value boundary is explicit.
+    array_clone: ValueId,
+    array_len: ValueId,
+    array_index: struct { array: ValueId, index: ValueId },
+    array_set: struct { array: ValueId, index: ValueId, value: ValueId },
+    array_append: struct { lhs: ValueId, rhs: ValueId },
     /// Terminal control flow, never a value. Its optional operand is body-local.
     return_value: ?ValueId,
     /// Terminal exits target the innermost containing loop, including its condition.
@@ -68,6 +75,7 @@ pub const Type = union(enum) {
     boolean,
     integer: Integer,
     function: Type.Function,
+    array: TypeId,
 
     pub const Integer = struct {
         signedness: std.builtin.Signedness,
@@ -98,6 +106,7 @@ pub const ValidationError = error{
     InvalidIntegerWidth,
     VoidParameter,
     NonConstantType,
+    InvalidArrayElement,
     ConstantTypeMismatch,
     IntegerOutOfRange,
 };
@@ -192,6 +201,7 @@ pub fn setFunctionBody(self: *Ir, id: FunctionId, instructions: []const Instruct
         switch (instruction.op) {
             .call => |*call| call.args = try self.allocator.dupe(ValueId, call.args),
             .print => |*print| print.args = try self.allocator.dupe(ValueId, print.args),
+            .array_literal => |*elements| elements.* = try self.allocator.dupe(ValueId, elements.*),
             else => {},
         }
         copied += 1;
@@ -203,6 +213,7 @@ fn freeOperands(self: *Ir, op: Operation) void {
     switch (op) {
         .call => |call| self.allocator.free(call.args),
         .print => |print| self.allocator.free(print.args),
+        .array_literal => |elements| self.allocator.free(elements),
         else => {},
     }
 }
@@ -403,8 +414,37 @@ fn validateBody(self: *const Ir, function: Function, body: Body) VerifyError!voi
             if (i + 1 != region_end or @intFromEnum(result) != i) return error.UnreachableInstruction;
         }
         switch (instruction.op) {
+            .array_literal => |elements| {
+                if (ty != .array) return error.InvalidOperation;
+                for (elements) |element| {
+                    if (try operandType(body, element, i) != ty.array) return error.OperandTypeMismatch;
+                }
+            },
+            .array_clone => |value| {
+                if (ty != .array) return error.InvalidOperation;
+                if (try operandType(body, value, i) != instruction.ty) return error.OperandTypeMismatch;
+            },
+            .array_len => |value| {
+                if (!isNativeInteger(ty, .unsigned)) return error.OperandTypeMismatch;
+                if (self.getType(try operandType(body, value, i)).? != .array) return error.InvalidOperation;
+            },
+            .array_index => |r| {
+                const array = self.getType(try operandType(body, r.array, i)).?;
+                if (array != .array) return error.InvalidOperation;
+                if (array.array != instruction.ty or !isNativeInteger(self.getType(try operandType(body, r.index, i)).?, .signed)) return error.OperandTypeMismatch;
+            },
+            .array_set => |r| {
+                if (ty != .array) return error.InvalidOperation;
+                if (try operandType(body, r.array, i) != instruction.ty or
+                    try operandType(body, r.value, i) != ty.array or
+                    !isNativeInteger(self.getType(try operandType(body, r.index, i)).?, .signed)) return error.OperandTypeMismatch;
+            },
+            .array_append => |r| {
+                if (ty != .array) return error.InvalidOperation;
+                if (try operandType(body, r.lhs, i) != instruction.ty or try operandType(body, r.rhs, i) != instruction.ty) return error.OperandTypeMismatch;
+            },
             .local_slot => |value| {
-                if (ty != .boolean and ty != .integer and ty != .function) return error.InvalidOperation;
+                if (ty != .boolean and ty != .integer and ty != .function and ty != .array) return error.InvalidOperation;
                 if (try operandType(body, value, i) != instruction.ty) return error.OperandTypeMismatch;
             },
             .local_load => |slot| {
@@ -525,6 +565,10 @@ fn validateType(self: *const Ir, ty: Type, before: usize) ValidationError!void {
         .integer => |integer| {
             if (integer.bits == 0 or integer.bits > 128) return error.InvalidIntegerWidth;
         },
+        .array => |element| {
+            if (@intFromEnum(element) >= before) return error.InvalidTypeId;
+            if (!isArrayElement(self.getType(element).?)) return error.InvalidArrayElement;
+        },
         .function => |function| {
             // Types form a DAG; recursive function values do not require cycles
             // in their signature types. Only refer to previously interned types.
@@ -543,7 +587,7 @@ fn validateConstant(self: *const Ir, constant: Constant) ValidationError!void {
     switch (ty) {
         .void => if (constant.value != .void) return error.ConstantTypeMismatch,
         .boolean => if (constant.value != .boolean) return error.ConstantTypeMismatch,
-        .function => return error.NonConstantType,
+        .function, .array => return error.NonConstantType,
         .integer => |integer| switch (integer.signedness) {
             .signed => {
                 const value = switch (constant.value) {
@@ -568,14 +612,103 @@ fn validateConstant(self: *const Ir, constant: Constant) ValidationError!void {
     }
 }
 
+pub fn isNativeInteger(ty: Type, signedness: std.builtin.Signedness) bool {
+    return ty == .integer and ty.integer.bits == native_pointer_bits and ty.integer.signedness == signedness;
+}
+
+pub fn isArrayElement(ty: Type) bool {
+    return ty == .boolean or (ty == .integer and switch (ty.integer.bits) {
+        8, 16, 32, 64 => true,
+        else => false,
+    });
+}
+
 fn typeEql(a: Type, b: Type) bool {
     if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
     return switch (a) {
         .void, .boolean => true,
         .integer => |integer| std.meta.eql(integer, b.integer),
+        .array => |element| element == b.array,
         .function => |function| function.result == b.function.result and
             std.mem.eql(TypeId, function.params, b.function.params),
     };
+}
+
+test "scalar array types operations and owned operands are verified" {
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    ir.source_len = 1;
+    const integer = try ir.internType(.{ .integer = .{ .signedness = .signed, .bits = native_pointer_bits } });
+    const uint = try ir.internType(.{ .integer = .{ .signedness = .unsigned, .bits = native_pointer_bits } });
+    const boolean = try ir.internType(.boolean);
+    const array = try ir.internType(.{ .array = integer });
+    try std.testing.expectEqual(array, try ir.internType(.{ .array = integer }));
+    try std.testing.expectError(error.InvalidArrayElement, ir.internType(.{ .array = array }));
+    const unit = try ir.internType(.void);
+    try std.testing.expectError(error.InvalidArrayElement, ir.internType(.{ .array = unit }));
+    try std.testing.expectError(error.InvalidTypeId, ir.internType(.{ .array = @enumFromInt(999) }));
+    const wide = try ir.internType(.{ .integer = .{ .signedness = .signed, .bits = 128 } });
+    try std.testing.expectError(error.InvalidArrayElement, ir.internType(.{ .array = wide }));
+    const signature = try ir.internType(.{ .function = .{ .params = &.{}, .result = array } });
+    try std.testing.expectError(error.InvalidArrayElement, ir.internType(.{ .array = signature }));
+    const number = try ir.internConstant(.{ .ty = integer, .value = .{ .signed_integer = 0 } });
+    const function = try ir.addFunction("arrays", signature, .{ .start = 0, .end = 0 });
+    const make = TestFunctions.instruction;
+    var elements = [_]ValueId{@enumFromInt(0)};
+    const instructions = [_]Instruction{
+        make(integer, .{ .constant = number }),
+        make(array, .{ .array_literal = &elements }),
+        make(array, .{ .array_clone = @enumFromInt(1) }),
+        make(integer, .{ .array_index = .{ .array = @enumFromInt(2), .index = @enumFromInt(0) } }),
+        make(array, .{ .array_set = .{ .array = @enumFromInt(2), .index = @enumFromInt(0), .value = @enumFromInt(3) } }),
+        make(array, .{ .array_append = .{ .lhs = @enumFromInt(2), .rhs = @enumFromInt(4) } }),
+        make(uint, .{ .array_len = @enumFromInt(5) }),
+    };
+    try ir.setFunctionBody(function, &instructions, @enumFromInt(5));
+    elements[0] = @enumFromInt(999);
+    try ir.verify();
+    const owned = @constCast(ir.functions.items[0].body.?.instructions);
+    const Case = struct { index: usize, replacement: Instruction, err: VerifyError };
+    for ([_]Case{
+        .{ .index = 0, .replacement = make(boolean, .{ .constant = number }), .err = error.OperandTypeMismatch },
+        .{ .index = 2, .replacement = make(array, .{ .array_clone = @enumFromInt(0) }), .err = error.OperandTypeMismatch },
+        .{ .index = 2, .replacement = make(array, .{ .array_clone = @enumFromInt(99) }), .err = error.InvalidValueId },
+        .{ .index = 3, .replacement = make(integer, .{ .array_index = .{ .array = @enumFromInt(0), .index = @enumFromInt(0) } }), .err = error.InvalidOperation },
+        .{ .index = 3, .replacement = make(boolean, instructions[3].op), .err = error.OperandTypeMismatch },
+        .{ .index = 4, .replacement = make(array, .{ .array_set = .{ .array = @enumFromInt(2), .index = @enumFromInt(2), .value = @enumFromInt(3) } }), .err = error.OperandTypeMismatch },
+        .{ .index = 5, .replacement = make(array, .{ .array_append = .{ .lhs = @enumFromInt(2), .rhs = @enumFromInt(0) } }), .err = error.OperandTypeMismatch },
+        .{ .index = 6, .replacement = make(integer, instructions[6].op), .err = error.OperandTypeMismatch },
+    }) |case| {
+        const saved = owned[case.index];
+        owned[case.index] = case.replacement;
+        defer owned[case.index] = saved;
+        try std.testing.expectError(case.err, ir.verify());
+    }
+}
+
+test "array operands cannot leak from a private region" {
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    ir.source_len = 1;
+    const boolean = try ir.internType(.boolean);
+    const uint = try ir.internType(.{ .integer = .{ .signedness = .unsigned, .bits = native_pointer_bits } });
+    const array = try ir.internType(.{ .array = boolean });
+    const truth = try ir.internConstant(.{ .ty = boolean, .value = .{ .boolean = true } });
+    const signature = try ir.internType(.{ .function = .{ .params = &.{}, .result = uint } });
+    const function = try ir.addFunction("private", signature, .{ .start = 0, .end = 0 });
+    const make = TestFunctions.instruction;
+    const body = [_]Instruction{
+        make(boolean, .{ .constant = truth }),
+        make(array, .{ .array_literal = &.{} }),
+        make(array, .{ .array_literal = &.{} }),
+        make(array, .{ .branch = .{ .condition = @enumFromInt(0), .then_start = 1, .else_start = 2, .then_value = @enumFromInt(1), .else_value = @enumFromInt(2) } }),
+        make(uint, .{ .array_len = @enumFromInt(1) }),
+    };
+    try std.testing.expectError(error.InvalidValueId, ir.setFunctionBody(function, &body, @enumFromInt(4)));
+    var valid = body;
+    valid[4].op.array_len = @enumFromInt(3);
+    try ir.setFunctionBody(function, &valid, @enumFromInt(4));
+    try ir.verify();
 }
 
 fn testPrintAllocationFailures(allocator: std.mem.Allocator) !void {

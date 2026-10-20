@@ -75,6 +75,11 @@ fn resolveDepth(module: *Module, ir: *Ir, node: Ast.Node.Index, depth: usize) Er
         if (!valid or result == null) return null;
         return try ir.internType(.{ .function = .{ .params = params.items, .result = result.? } });
     }
+    if (ast.nodes.items(.tag)[node] == .array_type) {
+        const element = (try resolveDepth(module, ir, ast.nodes.items(.data)[node].rhs, depth + 1)) orelse return null;
+        if (!Ir.isArrayElement(ir.getType(element).?)) return diagnose(module, node, .unsupported_type);
+        return try ir.internType(.{ .array = element });
+    }
     if (ast.nodes.items(.tag)[node] != .identifier) return diagnose(module, node, .unsupported_type);
     const name = ast.tokenSlice(ast.firstToken(node));
     // Until aliasing/shadowing rules exist, a module binding is never a type.

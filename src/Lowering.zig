@@ -405,6 +405,9 @@ test "lowering ownership and source diagnostic rollback survive allocation failu
         "let f: () -> void = loop true {break 1}",
         "let f: () -> void = loop false {missing}",
         "let f: () -> void = loop true {{break}\n@println(true)}",
+        "let f: (a: []int) -> []int = {let mut b: []int = a\nb += b\nb[-1] = 7\nb}",
+        "let f: () -> void = {let mut a: []bool = [true]\na.len = 2}",
+        "let f: () -> void = {let a: []int = [true]\n}",
     }) |source| {
         try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
     }

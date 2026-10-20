@@ -1,5 +1,5 @@
-//! Opt-in C11 runtime text for future managed-value emission.
-//! No current IR operation uses this runtime; scalar C emission stays unchanged.
+//! Opt-in C11 runtime text for managed scalar-array backing.
+//! Scalar-only C emission stays unchanged.
 pub const source = @embedFile("runtime/gc.h");
 
 test "GC template is embedded without changing scalar emission" {
