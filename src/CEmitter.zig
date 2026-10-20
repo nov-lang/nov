@@ -764,6 +764,35 @@ fn arrayTestProgram(source: []const u8) ![]u8 {
     });
 }
 
+const inferred_example =
+    \\let seed: int = 7
+    \\let mark: (n: int) -> int = {@println(n)
+    \\    n}
+    \\let make: (n: int) -> []int = [n, n + 1]
+    \\let main: () -> void = {
+    \\    let mut value = mark(seed)
+    \\    let saved = value
+    \\    value += 1
+    \\    let callback = mark
+    \\    let result = callback(value)
+    \\    let ready = true
+    \\    let mut values = make(result)
+    \\    let original = values
+    \\    values[0] += 1
+    \\    values += [result]
+    \\    @println(1 + {let inner = result
+    \\        inner})
+    \\    @println(saved, value, original[0], values[0], values.len, ready)
+    \\}
+;
+const inferred_output = "7\n8\n9\n7 8 8 9 3 true\n";
+
+test "inferred locals preserve evaluation order snapshots copies and GC roots" {
+    const c = try arrayTestProgram(inferred_example);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, inferred_output, "", mode);
+}
+
 test "scalar arrays copy grow and return with every allocation collecting" {
     const c = try arrayTestProgram(array_example);
     defer test_gpa.free(c);
@@ -982,7 +1011,7 @@ test "array capacity and append length overflow panic before accessing backing" 
 }
 
 test "array allocation failure retries preserve roots and shutdown frees backing" {
-    for ([_][]const u8{ array_example, array_compound_effects }, [_][]const u8{ "3 30 30 6\n454 15\n99 15 4\nfalse true 2\n0\n", array_compound_output }) |source, output| {
+    for ([_][]const u8{ array_example, array_compound_effects, inferred_example }, [_][]const u8{ "3 30 30 6\n454 15\n99 15 4\nfalse true 2\n0\n", array_compound_output, inferred_output }) |source, output| {
         const c = try arrayTestProgram(source);
         defer test_gpa.free(c);
         const injected = try std.mem.concat(test_gpa, u8, &.{
@@ -1001,7 +1030,7 @@ test "array allocation failure retries preserve roots and shutdown frees backing
             c,
         });
         defer test_gpa.free(exhausted);
-        try compileAndRunExpected(exhausted, "typedef int nonempty_translation_unit;", 1, "", "panic: GC allocation failed\n");
+        try compileAndRunExpected(exhausted, "typedef int nonempty_translation_unit;", 1, if (std.mem.eql(u8, source, inferred_example)) "7\n8\n" else "", "panic: GC allocation failed\n");
     }
 }
 
@@ -1016,7 +1045,7 @@ fn testArrayEmissionAllocationFailures(allocator: std.mem.Allocator, source: []c
 }
 
 test "array compiler ownership survives every allocation failure" {
-    for ([_][]const u8{ array_example, array_compound_effects }) |source| try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{source});
+    for ([_][]const u8{ array_example, array_compound_effects, inferred_example }) |source| try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{source});
 }
 
 test "condition loops repeat current reads and scope initialization with innermost controls" {

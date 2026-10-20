@@ -118,6 +118,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     _ = fixtures.add("let-only.nov", "let number: i32 = 42\n");
     _ = fixtures.add("print-program.nov", "let number: i32 = -42\nlet answer: () -> i32 = number\nlet main: () -> void = @println(true, answer())\n");
     _ = fixtures.add("checkout.nov", @embedFile("examples/checkout.nov"));
+    _ = fixtures.add("inferred-locals.nov", @embedFile("examples/inferred-locals.nov"));
+    _ = fixtures.add("inferred-integer.nov", "let main: () -> void = {let n = 1\n@println(n)}\n");
+    _ = fixtures.add("inferred-empty-array.nov", "let main: () -> void = {let a = []\n}\n");
     _ = fixtures.add("scalar-arrays.nov", @embedFile("examples/arrays.nov"));
     _ = fixtures.add("array-bounds.nov", "let main: () -> void = {let a: []bool = [true]\n@println(a[-2])}\n");
     _ = fixtures.add("array-compound.nov", "let main: () -> void = {\n    let mut a: []i8 = [127, 10]\n    a[0] += 1\n    a[0] -= 1\n    a[0] *= 2\n    a[0] /= -1\n    a[0] %= 3\n    a[-1] += {\n        a = []\n        5\n    }\n    @println(a[0], a[-1], a.len)\n}\n");
@@ -175,6 +178,10 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         .{ .name = "check rejects --check", .args = &.{ "check", "--check", "valid.nov" }, .exit_code = 1, .stderr_match = "--check" },
         .{ .name = "--check requires fmt", .args = &.{"--check"}, .exit_code = 1, .stderr_match = "--check" },
         .{ .name = "check valid syntax", .args = &.{ "check", "valid.nov" }, .exit_code = 0 },
+        .{ .name = "check inferred locals", .args = &.{ "check", "--semantic", "inferred-locals.nov" }, .exit_code = 0 },
+        .{ .name = "fmt inferred locals", .args = &.{ "fmt", "--check", "inferred-locals.nov" }, .exit_code = 0 },
+        .{ .name = "reject inferred integer default", .args = &.{ "emit-c", "inferred-integer.nov" }, .exit_code = 1, .stderr_match = "integer literal needs an expected type (no default chosen)" },
+        .{ .name = "reject inferred empty array", .args = &.{ "check", "--semantic", "inferred-empty-array.nov" }, .exit_code = 1, .stderr_match = "array literal needs an expected []T type" },
         .{ .name = "check array compounds", .args = &.{ "check", "--semantic", "array-compound.nov" }, .exit_code = 0 },
         .{ .name = "fmt array compounds", .args = &.{ "fmt", "--check", "array-compound.nov" }, .exit_code = 0 },
         .{ .name = "reject bool array compounds", .args = &.{ "emit-c", "array-bool-compound.nov" }, .exit_code = 1, .stderr_match = "operator is not supported" },
@@ -269,6 +276,19 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
 
     // An isolated PATH exercises real `zig cc` discovery, independent of host CC.
     for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+        const inferred = b.addRunArtifact(exe);
+        inferred.step.name = b.fmt("CLI: inferred locals ({s})", .{mode});
+        inferred.setCwd(fixtures.getDirectory());
+        inferred.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+        inferred.setEnvironmentVariable("NOV_CC", "");
+        inferred.setEnvironmentVariable("CC", "");
+        inferred.addArgs(&.{ "run", "inferred-locals.nov" });
+        if (mode.len != 0) inferred.addArg(mode);
+        inferred.expectExitCode(0);
+        inferred.expectStdOutEqual("7\n8\n9\n7 8 8 9 3 true\n");
+        inferred.expectStdErrEqual("");
+        test_step.dependOn(&inferred.step);
+
         for ([_]bool{ false, true }) |bounds| {
             const arrays = b.addRunArtifact(exe);
             arrays.step.name = b.fmt("CLI: scalar arrays bounds={any} ({s})", .{ bounds, mode });

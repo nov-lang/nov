@@ -38,9 +38,9 @@ cycles for a bounded expression subset. Internal annotation analysis resolves
 explicit `bool`, `void`, fixed-width integer, native `int`/`uint` and function
 types, and checks integer and boolean literals against annotations. Bounded function-body checking binds
 parameters and checks integer arithmetic, boolean expressions, comparisons and
-calls against collected signatures, including recursive calls. Explicitly typed
-immutable and mutable scalar locals and blocks with final-expression results
-are supported in function bodies. Literal defaults, user-defined type aliases,
+calls against collected signatures, including recursive calls. Immutable and mutable
+locals (explicitly typed or inferred from an already typed initializer) and blocks
+with final-expression results are supported in function bodies. Literal defaults, user-defined type aliases,
 shadowing and global mutation remain deferred or unsupported.
 Lowering produces typed operations with source spans, ordered operands/call
 arguments, explicit returns, and structured regions for boolean `and`/`or`,
@@ -202,12 +202,25 @@ let main: () -> void = {
 }
 ```
 
-This prints `42` on two lines. Locals require an explicit supported type and an
-initializer. Immutable scalar/unit values and existing function values (with
-unnamed parameter types, e.g. `let callback: (int) -> int = twice`) work; named
-local function definitions/closures, inferred locals, labels and
-memory-bearing values are rejected. Mutable locals use `let mut`
-and support `bool`, integer and existing function values (not `void`). Direct
+This prints `42` on two lines. Locals require an initializer. The annotation may
+be omitted in `let name = expression` and `let mut name = expression` when the
+initializer already determines a supported `bool`, integer (fixed-width or native
+`int`/`uint`), existing function-value or scalar-array type. Examples include
+`let ready = true`, `let result = value + 1`, `let callback = twice`, and
+`let mut copy = values` for an already typed array. Calls, indexing, `.len`, and
+block/conditional results use the same bidirectional rules as other expressions.
+No type is inferred from later uses or from the enclosing function result for a
+local initializer. `let n = 1` and `let n = 1 + 2` still need annotations; there
+are no integer defaults or widening conversions. Array literals still need an
+expected `[]T` type, even `[true]` or `[typed_value]`; `let values = []` cannot
+infer an element type. Inferred arrays keep the same copy and GC-root semantics
+as annotated arrays. See [examples/inferred-locals.nov](examples/inferred-locals.nov).
+
+Explicit annotations remain supported, including immutable `void` values and
+function values with unnamed parameter types (e.g. `let callback: (int) -> int = twice`).
+Inferred `void` locals, named local function definitions/closures, labels and
+other managed types remain unsupported. Mutable locals use `let mut` and support
+`bool`, integer, existing function and scalar-array values (not `void`). Direct
 identifier assignment (`n = value`) and integer-only `+=`, `-=`, `*=`, `/=`, `%=`
 return `void`; a block ending in assignment therefore also returns `void`.
 Assignments require a mutable local, not a parameter or global. RHS types must
@@ -706,8 +719,9 @@ let prod = a.! * b.! ; will return .none to the calling function since b is .non
 
 Growable `[]T` arrays are supported in function bodies and signatures for `bool`,
 `i8/i16/i32/i64`, `u8/u16/u32/u64`, and native `int/uint`. Literals require an
-expected array type, including empty `[]`; numeric literal defaults and inferred
-locals are still deferred. See [examples/arrays.nov](examples/arrays.nov):
+expected array type, including empty `[]`; numeric and array-element defaults
+remain deferred. Array-valued parameters, locals, calls and other already typed
+expressions can initialize inferred locals without changing copy semantics. See [examples/arrays.nov](examples/arrays.nov):
 
 ```nov
 let main: () -> void = {

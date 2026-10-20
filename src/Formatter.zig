@@ -315,6 +315,10 @@ test "unsupported syntax fails closed including nested expressions" {
     }
 }
 
+test "inferred local declarations retain omitted annotations" {
+    try expectFormatted("let f:(n:int)->void={let yes=true\nlet mut value=1+n\nlet callback=f\nlet a:[]int=[n]\nlet mut copy=a\nvalue+=copy[0]\n@println(value,yes)}\n", "let f: (n: int) -> void = {\n    let yes = true\n    let mut value = 1 + n\n    let callback = f\n    let a: []int = [n]\n    let mut copy = a\n    value += copy[0]\n    @println(value, yes)\n}\n");
+}
+
 test "executable local blocks round trip" {
     for ([_][:0]const u8{
         "let f: () -> i32 = {\nlet n: i32 = 1\nn\n}\n",

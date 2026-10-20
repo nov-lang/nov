@@ -155,13 +155,13 @@ const Context = struct {
             try self.module.diagnostics.append(self.module.allocator, .{ .tag = .unsupported_shadowing, .span = name_span, .related = related });
             return false;
         }
-        if (decl.type_node == 0 or std.mem.eql(u8, name, "_")) {
+        if (std.mem.eql(u8, name, "_")) {
             _ = try self.fail(.unsupported_local_declaration, node, null);
             return false;
         }
         // Named parameters introduce a local function definition, not a value
         // annotation. Closures/local function bodies are outside this slice.
-        if (ast.fullFnProto(decl.type_node)) |proto| {
+        if (if (decl.type_node != 0) ast.fullFnProto(decl.type_node) else null) |proto| {
             var iterator = proto.iterate(ast);
             while (iterator.next()) |param| {
                 if (param.name_token != null) {
@@ -174,16 +174,23 @@ const Context = struct {
             _ = try self.fail(.missing_initializer, node, null);
             return false;
         }
-        const ty = (try TypeResolver.resolve(self.module, self.ir, decl.type_node)) orelse return false;
-        if (decl.is_mutable and self.ir.getType(ty).? == .void) {
+        const annotation: ?Known = if (decl.type_node != 0) .{
+            .ty = (try TypeResolver.resolve(self.module, self.ir, decl.type_node)) orelse return false,
+            .annotation = self.module.tokenSpan(ast.firstToken(decl.type_node)),
+        } else null;
+        if (decl.is_mutable and annotation != null and self.ir.getType(annotation.?.ty).? == .void) {
             _ = try self.fail(.unsupported_local_declaration, node, null);
             return false;
         }
-        const known: Known = .{ .ty = ty, .annotation = self.module.tokenSpan(ast.firstToken(decl.type_node)) };
         // Publish only after checking/evaluating the initializer: no self or
         // forward local references, and initialization happens exactly once.
-        if (try self.expression(decl.init_node, known, depth + 1) == null) return false;
+        const ty = (try self.expression(decl.init_node, annotation, depth + 1)) orelse return false;
         if (self.terminated) return true;
+        if (annotation == null and self.ir.getType(ty).? == .void) {
+            _ = try self.fail(.unsupported_local_declaration, node, null);
+            return false;
+        }
+        const known = annotation orelse Known{ .ty = ty };
         try self.copyNode(decl.init_node, ty);
         const slot = if (decl.is_mutable and self.emitter != null)
             try self.emitter.?.append(ty, self.irSpan(node), .{ .local_slot = try self.emitter.?.value(decl.init_node) })
@@ -231,12 +238,16 @@ const Context = struct {
         for (block.ast.statements, 0..) |statement, i| {
             if (ast.nodes.items(.tag)[statement] == .decl) {
                 const decl = ast.decl(statement).ast;
-                if (decl.type_node == 0) return null;
                 const token = decl.let_token + 1 + @as(u32, @intFromBool(decl.is_mutable));
                 const name = ast.tokenSlice(token);
                 if (self.conflict(name) != null or isPrimitive(name)) return null;
-                const ty = (try TypeResolver.resolve(self.module, self.ir, decl.type_node)) orelse return null;
-                try self.bindLocal(name, .{ .known = .{ .ty = ty }, .initializer = decl.init_node, .name_span = self.module.tokenSpan(token) });
+                const known: Known = if (decl.type_node != 0)
+                    .{ .ty = (try TypeResolver.resolve(self.module, self.ir, decl.type_node)) orelse return null }
+                else if (decl.init_node != 0)
+                    (try self.probe(decl.init_node, depth + 1)) orelse return null
+                else
+                    return null;
+                try self.bindLocal(name, .{ .known = known, .initializer = decl.init_node, .name_span = self.module.tokenSpan(token) });
             } else if (i + 1 == block.ast.statements.len) {
                 return self.probe(statement, depth + 1);
             }
@@ -1071,6 +1082,65 @@ test "typed locals and final expressions work across lexical blocks" {
     try std.testing.expect(!module.hasErrors());
 }
 
+test "inferred locals reuse known expression types and nested probe scopes" {
+    for ([_][]const u8{ "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "int", "uint" }) |name| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let global: {s} = 7\nlet id: (p: {s}) -> {s} = {{\n" ++
+            "let yes = true\nlet mut no = !yes\nno = false\n" ++
+            "let callback = id\nlet mut other = callback\nother = id\n" ++
+            "let from_global = global\nlet from_param = p\nlet called = other(from_param)\n" ++
+            "let sum = 1 + called\nlet mut result = if yes {{1}} else {{sum}}\nresult += 1\n" ++
+            "let array: []{s} = [p]\nlet mut copy = array\ncopy[0] = result\n" ++
+            "let size = copy.len\nlet element = copy[0]\n@println(size, element, no, from_global)\n" ++
+            "let nested = 1 + {{let first = p\nlet second = {{let inner = first\ninner}}\nsecond}}\n" ++
+            "@println({{let reused = p\nreused}} == {{let reused = p\nreused}})\n" ++
+            "nested\n}}", .{ name, name, name, name });
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "inferred.nov", source);
+        defer module.deinit();
+        var sema = try @import("Sema.zig").analyzeFunctions(&module);
+        defer sema.deinit();
+        try std.testing.expect(!module.hasErrors());
+    }
+}
+
+test "inferred local failures preserve typing and initializer scope" {
+    const Case = struct { body: []const u8, tag: Module.Diagnostic.Tag, token: []const u8 };
+    for ([_]Case{
+        .{ .body = "let n = 1", .tag = .literal_needs_type, .token = "1" },
+        .{ .body = "let mut n = 1 + 2", .tag = .literal_needs_type, .token = "1" },
+        .{ .body = "let n = []", .tag = .array_literal_needs_type, .token = "[" },
+        .{ .body = "let n = [true]", .tag = .array_literal_needs_type, .token = "[" },
+        .{ .body = "let n = [p]", .tag = .array_literal_needs_type, .token = "[" },
+        .{ .body = "let n = n", .tag = .unknown_name, .token = "n" },
+        .{ .body = "let n = later\nlet later = p", .tag = .unknown_name, .token = "later" },
+        .{ .body = "let n = missing + p", .tag = .unknown_name, .token = "missing" },
+        .{ .body = "let n = p\n{let n = true\n}", .tag = .unsupported_shadowing, .token = "n" },
+        .{ .body = "let p = true", .tag = .unsupported_shadowing, .token = "p" },
+        .{ .body = "let int = true", .tag = .unsupported_shadowing, .token = "int" },
+        .{ .body = "{let hidden = p\n}\nlet n = hidden", .tag = .unknown_name, .token = "hidden" },
+        .{ .body = "let n = p\nn = 2", .tag = .immutable_assignment, .token = "n" },
+        .{ .body = "let mut n = p\nlet wide: i64 = 1\nn = wide", .tag = .expression_type_mismatch, .token = "wide" },
+        .{ .body = "let n = 128 + p", .tag = .literal_out_of_range, .token = "128" },
+        .{ .body = "let n = {}", .tag = .unsupported_local_declaration, .token = "let" },
+        .{ .body = "let mut n = {}", .tag = .unsupported_local_declaration, .token = "let" },
+        .{ .body = "let _ = true", .tag = .unsupported_local_declaration, .token = "let" },
+        .{ .body = "@println(1 + {let n = missing\nn})", .tag = .unknown_name, .token = "missing" },
+        .{ .body = "@println(1 + {let n = p\nn})\nlet out = n", .tag = .unknown_name, .token = "n" },
+    }) |case| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let f: (p: i8) -> void = {{{s}\n}}", .{case.body});
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "inferred-errors.nov", source);
+        defer module.deinit();
+
+        try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+        var sema = try @import("Sema.zig").analyzeFunctions(&module);
+        defer sema.deinit();
+        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+        try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
+        try std.testing.expectEqualStrings(case.token, module.sourceSlice(module.diagnostics.items[0].span).?);
+    }
+}
+
 test "local scope declaration and block result diagnostics" {
     const Case = struct { body: []const u8, tag: Module.Diagnostic.Tag };
     for ([_]Case{
@@ -1081,7 +1151,7 @@ test "local scope declaration and block result diagnostics" {
         .{ .body = "{let p: i32 = 1\np}", .tag = .unsupported_shadowing },
         .{ .body = "{let i32: i32 = 1\ni32}", .tag = .unsupported_shadowing },
         .{ .body = "{let mut n: void = {}\nn}", .tag = .unsupported_local_declaration },
-        .{ .body = "{let n = 1\nn}", .tag = .unsupported_local_declaration },
+        .{ .body = "{let n = 1\nn}", .tag = .literal_needs_type },
         .{ .body = "{let n: i32\nn}", .tag = .missing_initializer },
         .{ .body = "{let n: i8 = 128\nn}", .tag = .literal_out_of_range },
         .{ .body = "{let n: missing = 1\nn}", .tag = .unknown_type },
@@ -1253,7 +1323,7 @@ test "unconstrained operands still diagnose unknown names and unsupported shapes
     var unsupported_sema = try @import("Sema.zig").analyzeFunctions(&unsupported);
     defer unsupported_sema.deinit();
     try std.testing.expectEqual(@as(usize, 1), unsupported.diagnostics.items.len);
-    try std.testing.expectEqual(Module.Diagnostic.Tag.unsupported_local_declaration, unsupported.diagnostics.items[0].tag);
+    try std.testing.expectEqual(Module.Diagnostic.Tag.literal_needs_type, unsupported.diagnostics.items[0].tag);
 }
 
 test "parameter bindings do not leak between functions and annotated globals remain readable" {
@@ -1311,6 +1381,10 @@ test "body checking rolls back diagnostics and owned storage on allocation failu
         "let f: () -> i32 = {let a: i32 = 1\nlet b: i32 = {let c: i32 = a + 2\nc}\nb}",
         "let f: () -> i32 = {let x: i32 = 1\n{let x: i32 = 2\nx}}",
         "let f: () -> i32 = {let x: (missing) -> i32 = f\n1}",
+        "let f: (p: i32) -> i32 = {let n = 1 + {let first = p\nlet second = {let inner = first\ninner}\nsecond}\nn}",
+        "let f: () -> bool = {let n = missing\nn}",
+        "let f: () -> void = {let n = []\n}",
+        "let f: () -> void = {let n = {}\n}",
     }) |source| {
         try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
     }

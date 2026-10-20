@@ -1,0 +1,25 @@
+let seed: int = 7
+let mark: (n: int) -> int = {
+    @println(n)
+    n
+}
+let make: (n: int) -> []int = [n, n + 1]
+let main: () -> void = {
+    let mut value = mark(seed)
+    let saved = value
+    value += 1
+    let callback = mark
+    let result = callback(value)
+    let ready = true
+    let mut values = make(result)
+    let original = values
+    values[0] += 1
+    values += [result]
+    @println(
+        1 + {
+            let inner = result
+            inner
+        }
+    )
+    @println(saved, value, original[0], values[0], values.len, ready)
+}
