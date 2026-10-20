@@ -3,9 +3,9 @@ const Ast = @import("Ast.zig");
 const Parser = @import("Parser.zig");
 const Tokenizer = @import("Tokenizer.zig");
 
-/// Supports top-level let/mut declarations with simple types, identifiers,
-/// number/character/string literals, arithmetic, bitwise/comparison/boolean
-/// operators, unary -/!/~, line/doc comments, and multiline continuations.
+/// Supports scalar declarations/operators plus function signatures, calls,
+/// local blocks, if/else, condition loops, returns, unlabeled loop controls,
+/// and direct identifier assignments. Preserves line/doc comments and tokens.
 /// All other AST tags and quoted identifiers/BOMs/shebangs are unsupported.
 /// Parse errors return InvalidSource; unsupported or unpreservable output
 /// returns UnsupportedSyntax. Allocation failures propagate as OutOfMemory.
@@ -44,10 +44,33 @@ fn checkSupported(ast: Ast) !void {
     for (ast.nodes.items(.tag)) |tag| switch (tag) {
         .root,
         .decl,
+        .fn_proto_one,
+        .fn_proto,
+        .call_one,
+        .call_one_comma,
+        .call,
+        .call_comma,
+        .block_two,
+        .block_two_newline,
+        .block,
+        .block_newline,
+        .@"if",
+        .if_else,
+        .loop_condition,
+        .@"return",
+        .@"break",
+        .@"continue",
+        .assign,
+        .assign_add,
+        .assign_sub,
+        .assign_mul,
+        .assign_div,
+        .assign_mod,
         .identifier,
         .number_literal,
         .char_literal,
         .string_literal,
+        .builtin_literal,
         .add,
         .sub,
         .mul,
@@ -72,6 +95,25 @@ fn checkSupported(ast: Ast) !void {
         => {},
         else => return error.UnsupportedSyntax,
     };
+    for (ast.nodes.items(.tag), ast.nodes.items(.data), ast.nodes.items(.main_token)) |tag, data, main| {
+        switch (tag) {
+            .builtin_literal => {
+                const name = ast.tokenSlice(main);
+                if (!std.mem.eql(u8, name, "@print") and !std.mem.eql(u8, name, "@println"))
+                    return error.UnsupportedSyntax;
+            },
+            .@"break" => if (data.lhs != 0 or data.rhs != 0) return error.UnsupportedSyntax,
+            .@"continue" => if (data.lhs != 0) return error.UnsupportedSyntax,
+            .block_two, .block_two_newline, .block, .block_newline => {
+                if (main >= 2 and ast.tokens.items(.tag)[main - 1] == .colon)
+                    return error.UnsupportedSyntax;
+            },
+            .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod => {
+                if (ast.nodes.items(.tag)[data.lhs] != .identifier) return error.UnsupportedSyntax;
+            },
+            else => {},
+        }
+    }
     for (ast.tokens.items(.tag), 0..) |tag, i| {
         if (tag == .identifier and std.mem.startsWith(u8, ast.tokenSlice(@intCast(i)), "@")) {
             // Quoted identifiers use additional normalization paths that are not
@@ -87,9 +129,10 @@ fn sameStructure(a: Ast, b: Ast) bool {
         !std.mem.eql(Ast.Node.Index, a.extra_data, b.extra_data)) return false;
     for (tags, a.nodes.items(.data), b.nodes.items(.data)) |tag, x, y| {
         switch (tag) {
-            .identifier, .number_literal, .char_literal, .string_literal => {},
+            .identifier, .number_literal, .char_literal, .string_literal, .builtin_literal => {},
             // The parser leaves unused node data undefined; never read it.
-            .negation, .bool_not, .bit_not => if (x.rhs != y.rhs) return false,
+            .negation, .bool_not, .bit_not, .@"return" => if (x.rhs != y.rhs) return false,
+            .@"continue" => if ((x.lhs == 0) != (y.lhs == 0)) return false,
             else => if (x.lhs != y.lhs or x.rhs != y.rhs) return false,
         }
     }
@@ -201,12 +244,23 @@ test "invalid sources are rejected" {
 
 test "unsupported syntax fails closed including nested expressions" {
     for ([_][:0]const u8{
-        "let x=f()\n",                       "let x=1 + f(2)\n",      "let x=a.b\n",
-        "let x=[1, 2]\n",                    "let x={ 1 }\n",         "let x=#true\n",
-        "let x=if ready { 1 } else { 2 }\n", "@[test]\nlet x=1\n",    "let f=(x:i32) -> i32\n",
-        "let x=&value\n",                    "let x:[]i32\n",         "let x=a[0]\n",
-        "let x=.value\n",                    "let x=a |> b\n",        "let @\"x\"=1\n",
-        "#!nov\nlet x=1\n",                  "\xEF\xBB\xBFlet x=1\n",
+        "let x=@import(\"memory\")\n",
+        "let x=call({&value})\n",
+        "let x=a.b\n",
+        "let x=[1, 2]\n",
+        "let x=#true\n",
+        "@[test]\nlet x=1\n",
+        "let f: () -> void = loop true {break 1}\n",
+        "let f: () -> void = loop true {continue :outer}\n",
+        "let f: () -> void = outer: {}\n",
+        "let x=&value\n",
+        "let x:[]i32\n",
+        "let x=a[0]\n",
+        "let x=.value\n",
+        "let x=a |> b\n",
+        "let @\"x\"=1\n",
+        "#!nov\nlet x=1\n",
+        "\xEF\xBB\xBFlet x=1\n",
     }) |source| {
         var ast = try Parser.parse(std.testing.allocator, source);
         defer ast.deinit(std.testing.allocator);
@@ -216,7 +270,7 @@ test "unsupported syntax fails closed including nested expressions" {
     }
 }
 
-test "executable local blocks remain unsupported by the formatter" {
+test "executable local blocks round trip" {
     for ([_][:0]const u8{
         "let f: () -> i32 = {\nlet n: i32 = 1\nn\n}\n",
         "let x: i32 = {\nlet n: i32 = 1\nn\n}\n",
@@ -224,17 +278,23 @@ test "executable local blocks remain unsupported by the formatter" {
         var ast = try Parser.parse(std.testing.allocator, source);
         defer ast.deinit(std.testing.allocator);
         try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
-        try std.testing.expectError(error.UnsupportedSyntax, format(std.testing.allocator, source));
+        const formatted = try format(std.testing.allocator, source);
+        defer std.testing.allocator.free(formatted);
+        try expectFormatted(source, formatted);
     }
 }
 
 test "every unsupported AST tag is rejected before rendering" {
     const supported = [_]Ast.Node.Tag{
-        .root,      .decl,          .identifier,   .number_literal,   .char_literal, .string_literal,
-        .add,       .sub,           .mul,          .div,              .mod,          .shl,
-        .shr,       .bit_and,       .bit_or,       .bit_xor,          .equal_equal,  .bang_equal,
-        .less_than, .less_or_equal, .greater_than, .greater_or_equal, .bool_and,     .bool_or,
-        .negation,  .bool_not,      .bit_not,
+        .root,           .decl,            .identifier,   .number_literal,   .char_literal,      .string_literal,
+        .add,            .sub,             .mul,          .div,              .mod,               .shl,
+        .shr,            .bit_and,         .bit_or,       .bit_xor,          .equal_equal,       .bang_equal,
+        .less_than,      .less_or_equal,   .greater_than, .greater_or_equal, .bool_and,          .bool_or,
+        .negation,       .bool_not,        .bit_not,      .fn_proto_one,     .fn_proto,          .call_one,
+        .call_one_comma, .call,            .call_comma,   .block_two,        .block_two_newline, .block,
+        .block_newline,  .@"if",           .if_else,      .loop_condition,   .@"return",         .@"break",
+        .@"continue",    .assign,          .assign_add,   .assign_sub,       .assign_mul,        .assign_div,
+        .assign_mod,     .builtin_literal,
     };
     var ast = try Parser.parse(std.testing.allocator, "let x=1\n");
     defer ast.deinit(std.testing.allocator);
@@ -243,6 +303,10 @@ test "every unsupported AST tag is rejected before rendering" {
     for (std.enums.values(Ast.Node.Tag)) |tag| {
         ast.nodes.items(.tag)[1] = tag;
         if (std.mem.indexOfScalar(Ast.Node.Tag, &supported, tag) != null) {
+            // This synthetic leaf has no valid child/label data for these tags.
+            if (tag == .builtin_literal or tag == .@"break" or tag == .@"continue" or tag == .assign or
+                tag == .assign_add or tag == .assign_sub or tag == .assign_mul or
+                tag == .assign_div or tag == .assign_mod) continue;
             try checkSupported(ast);
         } else {
             try std.testing.expectError(error.UnsupportedSyntax, checkSupported(ast));
@@ -255,6 +319,55 @@ test "whitespace and additional supported operators are idempotent" {
     try expectFormatted("let x=1\r\nlet y=2\r\n", "let x = 1\nlet y = 2\n");
     try expectFormatted("let x=1 +\n 2\n", "let x = 1 +\n    2\n");
     try expectFormatted("let x=a and b or !c\nlet y=a << 2 | b & ~c\nlet z=a <= b\n", "let x = a and b or !c\nlet y = a << 2 | b & ~c\nlet z = a <= b\n");
+}
+
+test "function signatures calls and delimiters are idempotent" {
+    try expectFormatted("let f:(x:int,y:int)->int=x + y\nlet main:()->void=@println(f(1,2,),)\n", "let f: (x: int, y: int) -> int = x + y\nlet main: () -> void = @println(f(1, 2,),)\n");
+    try expectFormatted("let f:(cb:(int)->int,x:int)->int=cb(x)\n", "let f: (cb: (int) -> int, x: int) -> int = cb(x)\n");
+    try expectFormatted("let f:(\n x:int, ; param\n y:int,\n)->int=add(\n x, ; arg\n y,\n)\n", "let f: (\n    x: int, ; param\n    y: int,\n) -> int = add(\n    x, ; arg\n    y,\n)\n");
+    try expectFormatted("let f:()->void=@println(\n; empty\n)\n", "let f: () -> void = @println(\n    ; empty\n)\n");
+}
+
+test "blocks controls assignments and precedence are idempotent" {
+    try expectFormatted("let f:(n:int)->int={let mut x:int=1\nx += n * 2\nif x > 0 {return x} else if x == 0 {return -1} else {return 0}}\n", "let f: (n: int) -> int = {\n    let mut x: int = 1\n    x += n * 2\n    if x > 0 {\n        return x\n    } else if x == 0 {\n        return -1\n    } else {\n        return 0\n    }\n}\n");
+    try expectFormatted("let main:()->void={loop {true} {if false {break} else {continue}}\nreturn}\n", "let main: () -> void = {\n    loop {\n        true\n    } {\n        if false {\n            break\n        } else {\n            continue\n        }\n    }\n    return\n}\n");
+    try expectFormatted("let x={1 + 2} * 3 - 4 / {5 - 6}\n", "let x = {\n    1 + 2\n} * 3 - 4 / {\n    5 - 6\n}\n");
+    try expectFormatted("let f:()->bool=false and {return true} or !false\n", "let f: () -> bool = false and {\n    return true\n} or !false\n");
+}
+
+test "nested list expansion and empty block comments stabilize on the first pass" {
+    try expectFormatted("let f:()->void=@println({let x:int=1\nx})\n", "let f: () -> void = @println(\n    {\n        let x: int = 1\n        x\n    }\n)\n");
+    try expectFormatted("let f:()->void={\n; empty body\n}\n", "let f: () -> void = {\n    ; empty body\n}\n");
+    try expectFormatted("let f:()->void={}\nlet g:(int,int)->int=call(1,2)\n", "let f: () -> void = {}\nlet g: (int, int) -> int = call(1, 2)\n");
+    for ([_][:0]const u8{
+        "let f:()->void={loop true {let x:int={break}\n@println(x)}}",
+        "let f:()->void={loop true {loop false {continue}\nbreak}}",
+        "let f:()->void={return\n}\nlet g:()->void={}",
+        "let f:(\n)->void=call(\n)",
+        "let f:(\n x:int\n)->int=call(\n x\n)",
+        "let f:()->void=call(1 ; before comma\n,2 ; before close\n)",
+        "let f:(x:int)->int={let n:int=x\n + 1\nn}",
+    }) |source| {
+        const formatted = try format(std.testing.allocator, source);
+        defer std.testing.allocator.free(formatted);
+        try expectFormatted(source, formatted);
+    }
+}
+
+test "comments and continuations inside executable forms survive" {
+    const source = ";;; function\nlet f:(x:int)->int={ ; open\n; local\nlet mut n:int= ; init\n x + ; add\n 1\n\nn *= ; store\n 2\nif n > 0 {; then\nreturn ; result\n n ; value\n} else {return 0} ; branch\n} ; end\n";
+    const formatted = try format(std.testing.allocator, source);
+    defer std.testing.allocator.free(formatted);
+    try expectFormatted(source, formatted);
+}
+
+fn testExecutableAllocationFailures(allocator: std.mem.Allocator) !void {
+    const output = try format(allocator, "let f:(n:int)->int={let mut x:int=n\nloop x > 0 {x -= 1\nif x == 2 {break}\ncontinue}\nreturn x}\n");
+    defer allocator.free(output);
+}
+
+test "executable formatting survives allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testExecutableAllocationFailures, .{});
 }
 
 test "preservation checks detect code comment and structural loss" {

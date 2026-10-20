@@ -350,6 +350,90 @@ test "emit-c buffers source and renders frontend entrypoint and backend failures
     }
 }
 
+test "format executable programs without changing generated C or runtime behavior" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const programs = [_]struct { source: [:0]const u8, output: []const u8, code: u8 = 0, stderr: []const u8 = "" }{
+        .{
+            .source =
+            \\let effect:(n:int)->int={@println(n)
+            \\return n}
+            \\let choose:(c:bool)->int={let mut n:int=1
+            \\n += if c {return 42} else {2}
+            \\n}
+            \\let main:()->void={let mut n:int=0
+            \\loop {n += 1
+            \\n < 6} {if n == 2 {continue}
+            \\if n == 4 {break}
+            \\@println(n)}
+            \\let skipped:bool=false and {n = 99
+            \\return}
+            \\let taken:bool=true or {let bad:int=1 / 0
+            \\bad == 0}
+            \\n += {n = 10
+            \\2}
+            \\n *= 2
+            \\n /= 3
+            \\n %= 3
+            \\n -= 1
+            \\@println(n,skipped,taken,choose(true),choose(false),effect(7),effect(8))
+            \\return @println({let result:int={1 + 2} * 3
+            \\result})}
+            ,
+            .output = "1\n3\n7\n8\n0 false true 42 3 7 8\n9\n",
+        },
+        .{ .source = "let main:()->void={let n:int=1 / 0\n@println(n)}", .output = "", .code = 1, .stderr = "panic: division by zero\n" },
+    };
+    const zig_exe = std.testing.environ.getAlloc(allocator, "NOV_TEST_ZIG") catch null;
+    defer if (zig_exe) |path| allocator.free(path);
+    for (programs) |program| {
+        const formatted = try Formatter.format(allocator, program.source);
+        defer allocator.free(formatted);
+        const terminated = try allocator.dupeZ(u8, formatted);
+        defer allocator.free(terminated);
+        const again = try Formatter.format(allocator, terminated);
+        defer allocator.free(again);
+        try std.testing.expectEqualStrings(formatted, again);
+        var original_c = std.Io.Writer.Allocating.init(allocator);
+        defer original_c.deinit();
+        var formatted_c = std.Io.Writer.Allocating.init(allocator);
+        defer formatted_c.deinit();
+        var diagnostics = std.Io.Writer.Allocating.init(allocator);
+        defer diagnostics.deinit();
+        const original_ok = try emitSource(allocator, "format.nov", program.source, &diagnostics.writer, &original_c.writer);
+        if (!original_ok) std.debug.print("{s}", .{diagnostics.written()});
+        try std.testing.expect(original_ok);
+        try std.testing.expect(try emitSource(allocator, "format.nov", terminated, &diagnostics.writer, &formatted_c.writer));
+        try std.testing.expectEqualStrings("", diagnostics.written());
+        try std.testing.expectEqualStrings(original_c.written(), formatted_c.written());
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.writeFile(io, .{ .sub_path = "formatted.c", .data = formatted_c.written() });
+        const executable = "formatted" ++ (if (@import("builtin").os.tag == .windows) ".exe" else "");
+        const directory = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+        defer allocator.free(directory);
+        const path = try std.fs.path.join(allocator, &.{ directory, executable });
+        defer allocator.free(path);
+        for ([_][]const u8{ "-O0", "-O2" }) |mode| {
+            var argv: std.ArrayList([]const u8) = .empty;
+            defer argv.deinit(allocator);
+            if (zig_exe) |zig| try argv.appendSlice(allocator, &.{ zig, "cc" }) else try argv.append(allocator, "cc");
+            try argv.appendSlice(allocator, &.{ "-std=c11", mode, "-Wall", "-Wextra", "-Wpedantic", "-Werror", "-fsanitize=undefined", "-fno-sanitize-recover=all", "formatted.c", "-o", executable });
+            const compiled = try std.process.run(allocator, io, .{ .argv = argv.items, .cwd = .{ .dir = tmp.dir } });
+            defer allocator.free(compiled.stdout);
+            defer allocator.free(compiled.stderr);
+            if (compiled.term != .exited or compiled.term.exited != 0) std.debug.print("{s}\n", .{compiled.stderr});
+            try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, compiled.term);
+            const ran = try std.process.run(allocator, io, .{ .argv = &.{path}, .cwd = .{ .dir = tmp.dir } });
+            defer allocator.free(ran.stdout);
+            defer allocator.free(ran.stderr);
+            try std.testing.expectEqual(std.process.Child.Term{ .exited = program.code }, ran.term);
+            try std.testing.expectEqualStrings(program.output, ran.stdout);
+            try std.testing.expectEqualStrings(program.stderr, ran.stderr);
+        }
+    }
+}
+
 test "formatting refuses to overwrite a changed source" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -374,7 +458,10 @@ test "format files atomically and leave rejected input unchanged" {
         .{ .source = "let x=1+2\n", .valid = true, .expected = "let x = 1 + 2\n" },
         .{ .source = "let x=1+2\n", .check_only = true, .valid = false, .expected = "let x=1+2\n" },
         .{ .source = "let x =\n", .valid = false, .expected = "let x =\n" },
-        .{ .source = "let x = foo(1)\n", .valid = false, .expected = "let x = foo(1)\n" },
+        .{ .source = "let x=foo(1)\n", .valid = true, .expected = "let x = foo(1)\n" },
+        .{ .source = "let f:()->void={return}\n", .valid = true, .expected = "let f: () -> void = {\n    return\n}\n" },
+        .{ .source = "let x = foo([1])\n", .valid = false, .expected = "let x = foo([1])\n" },
+        .{ .source = "let f = loop true {break 1}\n", .valid = false, .expected = "let f = loop true {break 1}\n" },
     };
     for (cases) |case| {
         try tmp.dir.writeFile(io, .{ .sub_path = "input.nov", .data = case.source });

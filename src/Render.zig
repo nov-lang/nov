@@ -206,37 +206,38 @@ fn renderExpression(self: *Render, node: Ast.Node.Index, space: Space) RenderErr
         .number_literal,
         .char_literal,
         .string_literal,
+        .builtin_literal,
         => return self.renderToken(main_tokens[node], space),
-
-        .builtin_literal => {
-            @panic("TODO");
-        },
 
         .enum_literal => {
             try self.renderToken(datas[node].lhs, .none); // .
             return self.renderIdentifier(main_tokens[node], space, .eagerly_unquote); // name
         },
 
-        .block_two,
-        .block_two_newline,
-        => {
-            @panic("TODO");
-            // const statements = [2]Ast.Node.Index{ datas[node].lhs, datas[node].rhs };
-            // if (datas[node].lhs == 0) {
-            //     return renderBlock(r, node, statements[0..0], space);
-            // } else if (datas[node].rhs == 0) {
-            //     return renderBlock(r, node, statements[0..1], space);
-            // } else {
-            //     return renderBlock(r, node, statements[0..2], space);
-            // }
+        .block_two, .block_two_newline, .block, .block_newline => {
+            var buffer: [2]Ast.Node.Index = undefined;
+            const block = ast.fullBlock(&buffer, node).?;
+            if (block.ast.statements.len == 0 and !hasComment(ast, block.ast.lbrace, block.ast.rbrace)) {
+                try self.renderToken(block.ast.lbrace, .none);
+            } else {
+                try ais.pushIndent(.normal);
+                try self.renderToken(block.ast.lbrace, .newline);
+                for (block.ast.statements, 0..) |statement, i| {
+                    if (i != 0) try self.renderExtraNewline(statement);
+                    if (node_tags[statement] == .decl) {
+                        try self.renderDecl(ast.fullDecl(statement).?, .endline);
+                    } else {
+                        try self.renderExpression(statement, .endline);
+                    }
+                }
+                ais.popIndent();
+            }
+            return self.renderToken(block.ast.rbrace, space);
         },
-        .loop_condition,
-        .block,
-        .block_newline,
-        => {
-            @panic("TODO");
-            // const statements = ast.extra_data[datas[node].lhs..datas[node].rhs];
-            // return renderBlock(r, node, statements, space);
+        .loop_condition => {
+            try self.renderToken(main_tokens[node], .space);
+            try self.renderExpression(datas[node].lhs, .space);
+            return self.renderExpression(datas[node].rhs, space);
         },
 
         .@"defer" => {
@@ -354,12 +355,11 @@ fn renderExpression(self: *Render, node: Ast.Node.Index, space: Space) RenderErr
 
         // TODO: struct_init
 
-        .call_one,
-        .call_one_comma,
-        .call,
-        .call_comma,
-        => {
-            @panic("TODO");
+        .call_one, .call_one_comma, .call, .call_comma => {
+            const call = ast.fullCall(node).?;
+            try self.renderExpression(call.ast.fn_expr, .none);
+            try self.renderList(call.ast.lparen, ast.lastToken(node), call.ast.args, false);
+            return self.renderToken(ast.lastToken(node), space);
         },
 
         .array_access,
@@ -420,7 +420,7 @@ fn renderExpression(self: *Render, node: Ast.Node.Index, space: Space) RenderErr
         .@"return" => {
             if (datas[node].rhs != 0) {
                 try self.renderToken(main_tokens[node], .space);
-                try self.renderExpression(datas[node].lhs, space);
+                try self.renderExpression(datas[node].rhs, space);
             } else {
                 try self.renderToken(main_tokens[node], space);
             }
@@ -438,10 +438,27 @@ fn renderExpression(self: *Render, node: Ast.Node.Index, space: Space) RenderErr
             @panic("TODO");
         },
 
-        .fn_proto_one,
-        .fn_proto,
-        => {
-            @panic("TODO");
+        .fn_proto_one, .fn_proto => {
+            const proto = ast.fullFnProto(node).?;
+            // The return type can itself contain delimiters, so find this
+            // parameter list's closing token independently of lastToken(node).
+            var close = proto.lparen + 1;
+            var depth: usize = 1;
+            while (depth != 0) : (close += 1) {
+                switch (token_tags[close]) {
+                    .l_paren => depth += 1,
+                    .r_paren => depth -= 1,
+                    else => {},
+                }
+            }
+            close -= 1;
+            try self.renderList(proto.lparen, close, proto.ast.params, true);
+            if (proto.ast.return_type) |result| {
+                try self.renderToken(close, .space);
+                try self.renderToken(close + 1, .space);
+                return self.renderExpression(result, space);
+            }
+            return self.renderToken(close, space);
         },
 
         .match => {
@@ -454,12 +471,15 @@ fn renderExpression(self: *Render, node: Ast.Node.Index, space: Space) RenderErr
             @panic("TODO");
         },
 
-        // TODO: loop
-
-        .@"if",
-        .if_else,
-        => {
-            @panic("TODO");
+        .@"if", .if_else => {
+            const conditional = ast.fullIf(node).?;
+            try self.renderToken(conditional.ast.if_token, .space);
+            try self.renderExpression(conditional.ast.cond_expr, .space);
+            try self.renderExpression(conditional.ast.then_expr, if (conditional.ast.else_expr == 0) space else .space);
+            if (conditional.ast.else_expr != 0) {
+                try self.renderToken(conditional.else_token, .space);
+                try self.renderExpression(conditional.ast.else_expr, space);
+            }
         },
 
         .bind => {
@@ -474,6 +494,43 @@ fn renderExpression(self: *Render, node: Ast.Node.Index, space: Space) RenderErr
         .container_field,
         .root,
         => unreachable,
+    }
+}
+
+/// Preserve separators exactly, including trailing commas. Flattening all
+/// newlines can change expression continuation semantics.
+fn renderList(self: *Render, open: Ast.TokenIndex, close: Ast.TokenIndex, items: []const Ast.Node.Index, named: bool) RenderError!void {
+    const ast = self.ast;
+    const tags = ast.tokens.items(.tag);
+    // Blocks expand even when originally compact. Expand their enclosing list
+    // on the first pass as well, rather than changing layout on a second fmt.
+    const multiline = multiline: {
+        if (!ast.tokensOnSameLine(open, close)) break :multiline true;
+        var token = open + 1;
+        while (token < close) : (token += 1) {
+            if (tags[token] == .l_brace and tags[token + 1] != .r_brace)
+                break :multiline true;
+        }
+        break :multiline false;
+    };
+    if (multiline) try self.ais.pushIndent(.normal);
+    defer if (multiline) self.ais.popIndent();
+    try self.renderToken(open, if (multiline) .newline else .none);
+    for (items) |item| {
+        const first = ast.firstToken(item);
+        if (named and first >= 2 and tags[first - 1] == .colon) {
+            try self.renderIdentifier(first - 2, .none, .preserve_when_shadowing);
+            try self.renderToken(first - 1, .space);
+        }
+        const last = ast.lastToken(item);
+        var next = last + 1;
+        while (tags[next] == .newline) : (next += 1) {}
+        try self.renderExpression(item, if (tags[next] == .comma) .none else if (multiline) .newline else .none);
+        if (tags[next] == .comma) {
+            var after = next + 1;
+            while (tags[after] == .newline) : (after += 1) {}
+            try self.renderToken(next, if (multiline) .newline else if (after == close) .none else .space);
+        }
     }
 }
 
@@ -541,19 +598,15 @@ fn renderDeclWithoutFixups(
     }
 }
 
-// TODO: renderIf
-// TODO: renderLoop
 // TODO: renderContainerField
 // TODO: renderBuiltin
-// TODO: renderFnProto
+
 // TODO: renderMatchCase
-// TODO: renderBlock
-// TODO: finishRenderBlock
+
 // TODO: renderStructInit
 // TODO: renderArrayInit
 // TODO: renderContainerDecl
-// TODO: renderCall
-// TODO: renderParamList
+
 // TODO: renderExpressionComma
 // TODO: renderTokenComma
 // TODO: renderIdentifierComma

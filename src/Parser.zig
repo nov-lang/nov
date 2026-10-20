@@ -1650,7 +1650,8 @@ test "condition loop AST preserves nested blocks controls and source boundaries"
         if (tag == .@"break" or tag == .@"continue")
             try std.testing.expectEqual(ast.firstToken(@intCast(node)), ast.lastToken(@intCast(node)));
     }
-    try std.testing.expectError(error.UnsupportedSyntax, @import("Formatter.zig").format(std.testing.allocator, source));
+    const formatted = try @import("Formatter.zig").format(std.testing.allocator, source);
+    defer std.testing.allocator.free(formatted);
 }
 
 test "unsupported loops diagnose their keyword and preserve following declarations" {

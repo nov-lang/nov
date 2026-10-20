@@ -318,11 +318,20 @@ unsupported and diagnosed; no loop-result/value-break semantics are introduced.
 
 Format files in place with `zig build run -- fmt file.nov`, or use
 `zig build run -- fmt --check file.nov` to check formatting without writing.
-Both commands accept multiple file paths. Formatting currently supports simple
-`let` declarations, literals, operators, and comments, but not function signatures,
-calls or blocks (including the executable examples above); unsupported syntax is
-reported without modifying the file. Formatted output is reparsed and checked
-for structural, token, and comment preservation before atomic replacement.
+Both commands accept multiple file paths. Formatting supports scalar `let`/`let mut`
+declarations, literals and operators, function signatures and bodies, calls (including
+`@print`/`@println`), local blocks, `if`/`else if`/`else`, condition loops, returns,
+unlabeled `break`/`continue`, and direct identifier assignments (`=`, `+=`, `-=`,
+`*=`, `/=`, `%=`). Nonempty blocks use four-space indentation. Function parentheses,
+list commas (including trailing commas), precedence, comments, and multiline
+continuations are preserved; no grouping parentheses are invented.
+This is syntax formatting, not semantic validation: existing literal/bitwise/shift
+formatting does not make those forms executable. Memory/container forms, labels,
+value-carrying breaks, iterator/other loop forms, attributes, quoted identifiers,
+BOMs and shebangs remain unsupported or invalid. Unsupported syntax is reported
+without modifying the file. Formatted output is reparsed and checked for structural,
+token, and comment preservation before atomic replacement; any failed preservation
+check also leaves the file unchanged.
 Declarations are separated by newlines; EOF also terminates a complete declaration,
 so the final newline is optional. Formatting adds a final newline.
 
