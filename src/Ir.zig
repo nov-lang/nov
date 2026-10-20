@@ -35,6 +35,7 @@ pub const Operation = union(enum) {
     array_literal: []const ValueId,
     /// Independent scalar element storage; every value boundary is explicit.
     array_clone: ValueId,
+    /// Byte length for strings; element count for arrays.
     array_len: ValueId,
     array_index: struct { array: ValueId, index: ValueId },
     array_set: struct { array: ValueId, index: ValueId, value: ValueId },
@@ -73,6 +74,7 @@ pub const Operation = union(enum) {
 pub const Type = union(enum) {
     void,
     boolean,
+    string,
     integer: Integer,
     function: Type.Function,
     array: TypeId,
@@ -98,6 +100,7 @@ pub const Constant = struct {
         boolean: bool,
         signed_integer: i128,
         unsigned_integer: u128,
+        string: []const u8,
     };
 };
 
@@ -146,6 +149,9 @@ pub fn deinit(self: *Ir) void {
         }
     }
     self.types.deinit(self.allocator);
+    for (self.constants.items) |constant| if (constant.value == .string) {
+        self.allocator.free(constant.value.string);
+    };
     self.constants.deinit(self.allocator);
     self.* = undefined;
 }
@@ -254,11 +260,14 @@ pub fn internType(self: *Ir, ty: Type) InternError!TypeId {
 pub fn internConstant(self: *Ir, constant: Constant) InternError!ConstId {
     try self.validateConstant(constant);
     for (self.constants.items, 0..) |existing, i| {
-        if (std.meta.eql(existing, constant)) return @enumFromInt(i);
+        if (constantEql(existing, constant)) return @enumFromInt(i);
     }
     if (self.constants.items.len == std.math.maxInt(u32)) return error.TooManyEntries;
     const id: ConstId = @enumFromInt(self.constants.items.len);
-    try self.constants.append(self.allocator, constant);
+    try self.constants.ensureUnusedCapacity(self.allocator, 1);
+    var owned = constant;
+    if (constant.value == .string) owned.value = .{ .string = try self.allocator.dupe(u8, constant.value.string) };
+    self.constants.appendAssumeCapacity(owned);
     return id;
 }
 
@@ -274,7 +283,7 @@ pub fn verify(self: *const Ir) VerifyError!void {
     for (self.constants.items, 0..) |constant, i| {
         try self.validateConstant(constant);
         for (self.constants.items[0..i]) |previous| {
-            if (std.meta.eql(previous, constant)) return error.NonCanonicalConstant;
+            if (constantEql(previous, constant)) return error.NonCanonicalConstant;
         }
     }
     // Check every declaration before bodies, allowing forward and recursive refs.
@@ -426,7 +435,7 @@ fn validateBody(self: *const Ir, function: Function, body: Body) VerifyError!voi
             },
             .array_len => |value| {
                 if (!isNativeInteger(ty, .unsigned)) return error.OperandTypeMismatch;
-                if (self.getType(try operandType(body, value, i)).? != .array) return error.InvalidOperation;
+                if (!isManaged(self.getType(try operandType(body, value, i)).?)) return error.InvalidOperation;
             },
             .array_index => |r| {
                 const array = self.getType(try operandType(body, r.array, i)).?;
@@ -444,7 +453,7 @@ fn validateBody(self: *const Ir, function: Function, body: Body) VerifyError!voi
                 if (try operandType(body, r.lhs, i) != instruction.ty or try operandType(body, r.rhs, i) != instruction.ty) return error.OperandTypeMismatch;
             },
             .local_slot => |value| {
-                if (ty != .boolean and ty != .integer and ty != .function and ty != .array) return error.InvalidOperation;
+                if (ty != .boolean and ty != .integer and ty != .function and ty != .array and ty != .string) return error.InvalidOperation;
                 if (try operandType(body, value, i) != instruction.ty) return error.OperandTypeMismatch;
             },
             .local_load => |slot| {
@@ -505,7 +514,7 @@ fn validateBody(self: *const Ir, function: Function, body: Body) VerifyError!voi
                 const operand = self.getType(lhs) orelse return error.InvalidTypeId;
                 switch (binary.op) {
                     .add, .sub, .mul, .div, .mod => {
-                        if (operand != .integer) return error.InvalidOperation;
+                        if (operand != .integer and !(operand == .string and binary.op == .add)) return error.InvalidOperation;
                         if (instruction.ty != lhs) return error.OperandTypeMismatch;
                     },
                     .eq, .ne, .lt, .le, .gt, .ge => {
@@ -538,7 +547,7 @@ fn validateBody(self: *const Ir, function: Function, body: Body) VerifyError!voi
                 if (ty != .void) return error.InvalidOperation;
                 for (print.args) |arg| {
                     const operand = self.getType(try operandType(body, arg, i)) orelse return error.InvalidTypeId;
-                    if (operand != .boolean and operand != .integer) return error.InvalidOperation;
+                    if (operand != .boolean and operand != .integer and operand != .string) return error.InvalidOperation;
                 }
             },
             .call => |call| {
@@ -561,7 +570,7 @@ fn validateBody(self: *const Ir, function: Function, body: Body) VerifyError!voi
 
 fn validateType(self: *const Ir, ty: Type, before: usize) ValidationError!void {
     switch (ty) {
-        .void, .boolean => {},
+        .void, .boolean, .string => {},
         .integer => |integer| {
             if (integer.bits == 0 or integer.bits > 128) return error.InvalidIntegerWidth;
         },
@@ -587,6 +596,10 @@ fn validateConstant(self: *const Ir, constant: Constant) ValidationError!void {
     switch (ty) {
         .void => if (constant.value != .void) return error.ConstantTypeMismatch,
         .boolean => if (constant.value != .boolean) return error.ConstantTypeMismatch,
+        .string => {
+            if (constant.value != .string) return error.ConstantTypeMismatch;
+            if (!std.unicode.utf8ValidateSlice(constant.value.string)) return error.ConstantTypeMismatch;
+        },
         .function, .array => return error.NonConstantType,
         .integer => |integer| switch (integer.signedness) {
             .signed => {
@@ -616,6 +629,16 @@ pub fn isNativeInteger(ty: Type, signedness: std.builtin.Signedness) bool {
     return ty == .integer and ty.integer.bits == native_pointer_bits and ty.integer.signedness == signedness;
 }
 
+fn constantEql(a: Constant, b: Constant) bool {
+    if (a.ty != b.ty or std.meta.activeTag(a.value) != std.meta.activeTag(b.value)) return false;
+    if (a.value == .string) return std.mem.eql(u8, a.value.string, b.value.string);
+    return std.meta.eql(a, b);
+}
+
+pub fn isManaged(ty: Type) bool {
+    return ty == .array or ty == .string;
+}
+
 pub fn isArrayElement(ty: Type) bool {
     return ty == .boolean or (ty == .integer and switch (ty.integer.bits) {
         8, 16, 32, 64 => true,
@@ -626,12 +649,46 @@ pub fn isArrayElement(ty: Type) bool {
 fn typeEql(a: Type, b: Type) bool {
     if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
     return switch (a) {
-        .void, .boolean => true,
+        .void, .boolean, .string => true,
         .integer => |integer| std.meta.eql(integer, b.integer),
         .array => |element| element == b.array,
         .function => |function| function.result == b.function.result and
             std.mem.eql(TypeId, function.params, b.function.params),
     };
+}
+
+test "string constants are canonical owned UTF8 and operations verify exact types" {
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    const string = try ir.internType(.string);
+    const integer = try ir.internType(.{ .integer = .{ .bits = native_pointer_bits, .signedness = .unsigned } });
+    const boolean = try ir.internType(.boolean);
+    const signature = try ir.internType(.{ .function = .{ .params = &.{}, .result = string } });
+    var bytes = [_]u8{ 'a', 0, 'b' };
+    const literal = try ir.internConstant(.{ .ty = string, .value = .{ .string = &bytes } });
+    bytes[0] = 'z';
+    try std.testing.expectEqualStrings("a\x00b", ir.getConstant(literal).?.value.string);
+    try std.testing.expectEqual(literal, try ir.internConstant(.{ .ty = string, .value = .{ .string = "a\x00b" } }));
+    try std.testing.expectError(error.ConstantTypeMismatch, ir.internConstant(.{ .ty = string, .value = .{ .string = "\xff" } }));
+    try std.testing.expectError(error.InvalidArrayElement, ir.internType(.{ .array = string }));
+    const f = try ir.addFunction("f", signature, .{ .start = 0, .end = 0 });
+    var instructions = [_]Instruction{
+        .{ .ty = string, .span = .{ .start = 0, .end = 0 }, .op = .{ .constant = literal } },
+        .{ .ty = string, .span = .{ .start = 0, .end = 0 }, .op = .{ .binary = .{ .op = .add, .lhs = @enumFromInt(0), .rhs = @enumFromInt(0) } } },
+        .{ .ty = integer, .span = .{ .start = 0, .end = 0 }, .op = .{ .array_len = @enumFromInt(1) } },
+    };
+    instructions[1].op.binary.op = .sub;
+    try std.testing.expectError(error.InvalidOperation, ir.setFunctionBody(f, &instructions, @enumFromInt(1)));
+    instructions[1].op.binary.op = .eq;
+    instructions[1].ty = boolean;
+    try std.testing.expectError(error.InvalidOperation, ir.setFunctionBody(f, &instructions, @enumFromInt(0)));
+    instructions[1].op.binary.op = .add;
+    instructions[1].ty = string;
+    instructions[2].ty = boolean;
+    try std.testing.expectError(error.OperandTypeMismatch, ir.setFunctionBody(f, &instructions, @enumFromInt(1)));
+    instructions[2].ty = integer;
+    try ir.setFunctionBody(f, &instructions, @enumFromInt(1));
+    try ir.verify();
 }
 
 test "scalar array types operations and owned operands are verified" {

@@ -2,7 +2,8 @@
 
 `gc.h` is a standalone libc-only C11, nonmoving, single-threaded mark/sweep
 collector for **fixed-layout internal objects**. `GcRuntime.zig.source` embeds
-it conditionally for scalar-array code generation alongside `array.h`.
+it conditionally for scalar-array and immutable-string code generation alongside
+`array.h` and on-demand `string.h` concatenation helpers.
 Scalar-only emission is unchanged. Managed emission defines `NOV_GC_PANIC` as
 `nov_rt_panic` to share the emitted panic helper. The standalone
 fallback follows the existing contract: flush stdout, `panic: <message>\n` on
@@ -148,5 +149,33 @@ on **every** allocation, injected allocation failures/retries, strict C11/UBSan,
 -O0 and -O2 bounds checks, argument-order effects, nested loops and early returns.
 
 Writable length (especially growth initialization), slices/invalidation, nested
-or pointer elements, explicit aliases, strings and managed FFI remain deferred.
+or pointer elements, explicit aliases and managed FFI remain deferred.
 See the main README for delivered source syntax and copy/evaluation contracts.
+
+## Generated immutable strings
+
+`nov_string { void *owner; const unsigned char *data; uintptr_t len; }` separates
+traced ownership from byte access. Literals use read-only static C bytes, explicit
+lengths and a NULL owner: foreign/static data is **never** submitted to tracing.
+Concatenation checks native length addition and size limits before allocation,
+then uses an exact `len`-byte, byte-aligned, zero-pointer descriptor. Empty results
+need no allocation. Both operands are rooted by the caller while allocation may
+collect or retry. Only the result owner is mutable inside runtime construction;
+Nov never exposes byte mutation. No NUL terminator is required or inspected.
+
+String parameters, results, local slots, snapshots and branch merges share the
+view without clones. Function root tables contain actual `void *owner` slots for
+strings (and `void *data` for arrays), initialized before frame registration.
+Returning a view pops the frame without an intervening safepoint, just like arrays.
+Immutable literal-only globals require no GC registration or eager initialization.
+The internal C ABI trusts lengths and valid UTF-8; it is not a checked foreign API.
+UTF-8 validation occurs at literal checking, and concatenation preserves it.
+
+Printing uses checked `fwrite` lengths, including NUL; first printing switches
+Windows stdout to binary mode. The host must not change stdout mode while using
+the emitted printing helpers. Library hosts remain responsible for the final
+stdout flush and heap shutdown.
+
+Validation includes strict generated-C compilation for Windows. Windows binary
+stdout behavior has not been runtime-tested on Windows; the byte-output execution
+tests currently run on the native host.

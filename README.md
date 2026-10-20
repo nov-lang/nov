@@ -20,7 +20,7 @@ Scalar growable arrays use an internal libc-only nonmoving mark/sweep GC. The
 runtime is emitted only for managed values; scalar-only programs stay unchanged.
 See the [runtime API and root discipline](src/runtime/README.md) for layout, C
 boundary, OOM, testing, and unsupported-reference contracts. Slices, nested arrays,
-explicit aliases and strings remain deferred.
+and explicit aliases remain deferred. Immutable UTF-8 strings are supported below.
 
 ```sh
 zig build
@@ -48,16 +48,16 @@ arguments, explicit returns, and structured regions for boolean `and`/`or`,
 It requires immutable literal globals; unit/global block initializers are
 not lowered yet. An internal C11 backend emits verified IR, including fixed-width
 integer arithmetic and program entrypoint emission through `emit-c`.
-`@print`/`@println` support booleans and explicitly typed integers, including
-`int`/`uint`. Plain `check` remains syntax-only.
+`@print`/`@println` support booleans, strings and explicitly typed integers,
+including `int`/`uint`. Plain `check` remains syntax-only.
 
 Use `zig build run -- check --semantic file.nov` for the current bounded
 semantic/lowering subset. It runs declaration collection, initializer dependency
 analysis, annotation/literal and function-body checking, then typed lowering and
 IR verification. Source errors and unsupported/deferred forms fail with source
 diagnostics (including related notes where available); recovered syntax errors
-stop semantic analysis. Globals must be immutable, explicitly typed integer or
-boolean literals. Functions need explicit supported signatures and bounded
+stop semantic analysis. Globals must be immutable, explicitly typed integer,
+boolean or string literals. Functions need explicit supported signatures and bounded
 expression bodies (including forward/recursive calls, local declarations and
 assignments, nested blocks, boolean short-circuiting, `if`/`else`, explicit returns,
 condition-based loops with unlabeled `break`/`continue`, and empty void bodies).
@@ -164,7 +164,7 @@ let main: () -> void = @println(true, answer())
 This outputs `true -42` followed by a newline. Bare integer literals such as
 `@println(42)` still require a type context: use a typed global, local, parameter, or
 function result. Native aliases do not introduce bare-literal inference defaults.
-Strings/interpolation, function values and void arguments remain unsupported for
+Interpolation, function values and void arguments remain unsupported for
 printing; the C backend
 continues to reject widths other than 8/16/32/64.
 
@@ -205,7 +205,7 @@ let main: () -> void = {
 This prints `42` on two lines. Locals require an initializer. The annotation may
 be omitted in `let name = expression` and `let mut name = expression` when the
 initializer already determines a supported `bool`, integer (fixed-width or native
-`int`/`uint`), existing function-value or scalar-array type. Examples include
+`int`/`uint`), string, existing function-value or scalar-array type. Examples include
 `let ready = true`, `let result = value + 1`, `let callback = twice`, and
 `let mut copy = values` for an already typed array. Calls, indexing, `.len`, and
 block/conditional results use the same bidirectional rules as other expressions.
@@ -224,7 +224,7 @@ Explicit annotations remain supported, including immutable `void` values and
 function values with unnamed parameter types (e.g. `let callback: (int) -> int = twice`).
 Inferred `void` locals, named local function definitions/closures, labels and
 other managed types remain unsupported. Mutable locals use `let mut` and support
-`bool`, integer, existing function and scalar-array values (not `void`). Direct
+`bool`, integer, string, existing function and scalar-array values (not `void`). Direct
 identifier assignment (`n = value`) and integer-only `+=`, `-=`, `*=`, `/=`, `%=`
 return `void`; a block ending in assignment therefore also returns `void`.
 Assignments require a mutable local, not a parameter or global. RHS types must
@@ -798,7 +798,7 @@ trailing comma.
 ```nov
 let mut my_array = [1, 2, 3]
 @TypeOf(my_array) ; returns []int
-; arrays have a special field for its len, it is mutable if the string is mutable
+; array .len is read-only in the executable subset
 my_array.len == 3 ; true
 my_array[0] == 1 ; true
 my_array[-1] == 3 ; true
@@ -1058,7 +1058,7 @@ TODO
 |-----------------------|--------------------|----------------------------------------------|---------------------------------------------------------------------|
 | Assignment            | a = b              | All types                                    | `a` is an identifier and `b` is an expression.                      |
 | Addition              | a + b <br> a += b  | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                                |
-| Concatenation         | a + b <br> a += b  | string <br> [Arrays](#Arrays)                | TODO                                                                |
+| Concatenation         | a + b <br> a += b  | string <br> [Arrays](#Arrays)                | Strings: `+` only; scalar arrays: `+=` only                          |
 | Substraction          | a - b <br> a -= b  | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                                |
 | Negation              | -a                 | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                                |
 | Multiplication        | a * b <br> a \*= b | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                                |
@@ -1082,7 +1082,7 @@ TODO
 | Bind                  | a >>= \|b\| ...    | Monads                                       | TODO                                                                |
 | Function Pipe         | a \|> f            | [Functions](#Functions)                      | TODO                                                                |
 | Member Search         | a **in** b         | [Arrays](#Arrays)                            | TODO                                                                |
-| Access                | a\[b]              | [Arrays](#Arrays) <br> string                | TODO: b is an Integer                                               |
+| Access                | a\[b]              | [Arrays](#Arrays)                            | Scalar array indexing supported; string indexing deferred          |
 | Field / Method Access | a.b                | All types                                    | TODO                                                                |
 | Reference Type        | \*T <br> \*mut T   | All types                                    | Create a reference type from `T`. Unless `mut` is specified the wrapped value is constant |
 | Reference Of          | &a                 | All types                                    | Returns a reference to `a`.                                         |
@@ -1140,10 +1140,51 @@ let y: Complex = [ .re = 2, .im = 7 ]
 x + y ; returns Complex[ .re = 7, .im = 10 ]
 ```
 
-## String Interpolation
-`"{varname:[fill][alignment][width][.precision]}"`
+## Strings
 
-Escape `{` and `}` with `\`.
+`string` is immutable, valid UTF-8 on every platform, including Windows. Assignment,
+initialization, parameters and returns share immutable storage; `let mut` allows
+replacing the binding, never changing bytes. `+` concatenates strings, evaluating
+operands once, left to right. Concatenation checks length overflow and allocates
+GC-managed backing; allocation failure panics. String equality, other operators
+(including `+=`), indexing, slicing, interpolation and Unicode operations remain
+deferred. Arrays remain bool/integer-only: `[]string` and nested arrays are rejected.
+
+`.len` is the byte length as native `uint`, not a character or grapheme count.
+`"é".len` is 2 and `"😀".len` is 4. Literals use the existing escapes (`\n`, `\r`,
+`\t`, `\\`, `\"`, `\'`, `\0`, `\xNN`, `\u{...}`, `\{`, `\}`). Decoded bytes
+must be valid UTF-8; NUL is valid, including through `\x00` or `\u{0}`. Invalid
+escapes/UTF-8 report source locations. Unescaped braces are reserved for deferred
+interpolation and rejected; use `\{` and `\}` for literal braces.
+
+`@print`/`@println` write exact UTF-8 bytes with explicit lengths, including embedded
+NUL, with the same spaces, buffering, checked writes/final flush and panic behavior
+as scalars. Windows stdout is switched to binary mode on the first print to avoid
+newline translation; this is UTF-8 byte output, not UTF-16 console conversion.
+Literal-only immutable globals with explicit `string` annotations are supported
+without eager initialization calls; inferred/mutable globals and global concatenation
+or calls remain unsupported.
+
+```nov
+let prefix: string = "Hello"
+let identity: (text: string) -> string = text
+let main: () -> void = {
+    let mut text = prefix + ", 世界!"
+    let shared = identity(text)
+    text = "replacement"
+    @println(shared, shared.len, text)
+}
+```
+
+See [`examples/strings.nov`](examples/strings.nov), which also demonstrates escaped
+braces and embedded-NUL output. String formatting preserves literal tokens and escapes.
+Literals use static read-only bytes with a null GC owner; concatenation results
+have an exact scalar GC backing descriptor. Only managed owner fields are traced,
+never static byte pointers. Temporaries use the same precise root frames as arrays.
+
+## String Interpolation
+
+Deferred. No interpolation syntax or formatting-option semantics are implemented.
 
 ## Concurrency
 TODO

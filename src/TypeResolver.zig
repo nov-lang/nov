@@ -85,6 +85,7 @@ fn resolveDepth(module: *Module, ir: *Ir, node: Ast.Node.Index, depth: usize) Er
     // Until aliasing/shadowing rules exist, a module binding is never a type.
     if (module.lookup(name) != null) return diagnose(module, node, .unsupported_type);
     if (std.mem.eql(u8, name, "true") or std.mem.eql(u8, name, "false")) return diagnose(module, node, .not_a_type);
+    if (std.mem.eql(u8, name, "string")) return try ir.internType(.string);
     if (std.mem.eql(u8, name, "bool")) return try ir.internType(.boolean);
     if (std.mem.eql(u8, name, "void")) return try ir.internType(.void);
     if (std.mem.eql(u8, name, "int") or std.mem.eql(u8, name, "uint")) {
@@ -244,7 +245,7 @@ test "unsupported unknown and non-type forms have source diagnostics" {
         try std.testing.expectEqualStrings(case.span, module.sourceSlice(diagnostic.span).?);
         try std.testing.expect(diagnostic.related == null);
     }
-    for ([_][]const u8{ "float", "f16", "f32", "f64", "f80", "f128", "string", "rune", "type" }) |name| {
+    for ([_][]const u8{ "float", "f16", "f32", "f64", "f80", "f128", "rune", "type" }) |name| {
         const source = try std.fmt.allocPrint(std.testing.allocator, "let value: {s}", .{name});
         defer std.testing.allocator.free(source);
         var module = try Module.init(std.testing.allocator, "unsupported.nov", source);

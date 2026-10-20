@@ -330,14 +330,10 @@ TODO:
   - `let x = [@as(uint, 1)].repeat(50)` x is an array of 50 uint with value 1
   - `let x: []uint = [1].repeat(50)` x is an array of 50 uint with value 1
 
-Store arrays/strings as:
-```
-buffer: [*]T
-len: u32
-capacity: u32 // 0 when literal
-```
-Use uint instead of u32?
--> is it better to save a bunch of memory or handle arrays of more than 4GB?
+Approved executable storage contracts supersede the earlier shared-layout proposal:
+arrays have independent scalar backing with native `uint` len/cap; strings share
+immutable UTF-8 backing with native `uint` byte length and no exposed capacity.
+See README and src/runtime/README.md for the implemented root/ownership model.
 
 See [1](https://docs.vlang.io/v-types.html#array-methods)
 [2](https://docs.vlang.io/v-types.html#array-method-chaining)
@@ -586,25 +582,15 @@ let ArrayList: (T: #type) -> type = { ... }
   - warn if y >= @bitSizeOf(x): `x >> ${y} is the same as x >> ${y % @bitSizeOf(x)}`
 - Remember to check [value.zig](https://github.com/nov-lang/nov/blob/d8cc0edc95c43461e37b48a72d1e02b2307d278c/src/vm/value.zig) for cool stuff
 - Declarations in top level can't be `mut`
-- All arrays and strings should be 0 terminated (what about array of structs?)
-- strings:
-  - string is an array of u8. (u16 on windows)
-    - array of rune for unicode aware strings
-```nov
-let s: []rune = "hey! 😀"
-s.len == 6 ; true, actual size is 9
-s[-1] == 😀
-```
-  - all strings are 0 terminated by default? or add a `toCString()` method
-  - strings can't be directly modified like an array, `str[i] = ...` is a compile error
-  - const strings are fixed length, stored in .rodata like a C string
-    - note that the "a" + "b" is done at compile time
-  - mut string are variable length, allocated "slices" (storing ptr and len), just like a []u8
-  - it's a compile error to modify a string with []?
-  - PROPOSAL: make all string immutable they are all pointer to rodata, that pointer can be mut
-    - allow for more optimization
-    - probably better semantic
-    - string manipulation is done with []u8 instead
+- Approved strings (implemented; supersedes earlier platform/termination/mutation proposals):
+  - Immutable valid UTF-8 on every platform, including Windows; shared storage at
+    assignment and call/return boundaries. `let mut` replaces the binding only.
+  - Explicit lengths, embedded NUL valid; `.len` is native `uint` byte length.
+  - Literals, `+`, printing, locals, parameters/returns, conditionals and explicitly
+    typed immutable literal globals are supported. Concatenation uses rooted GC
+    backing; literals use static read-only bytes with a null traced owner.
+  - Indexing, slicing, interpolation, Unicode operations, string arrays and C-string
+    conversion are deferred. No terminator or compile-time concatenation promise.
 - `void` is Nov's unit type (`()` in Rust and OCaml, `Nil` in Gleam)
   - `void` only value is `[]` (`{}` in zig)
 - about variable initialization:

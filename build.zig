@@ -118,6 +118,7 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     _ = fixtures.add("let-only.nov", "let number: i32 = 42\n");
     _ = fixtures.add("print-program.nov", "let number: i32 = -42\nlet answer: () -> i32 = number\nlet main: () -> void = @println(true, answer())\n");
     _ = fixtures.add("checkout.nov", @embedFile("examples/checkout.nov"));
+    _ = fixtures.add("strings.nov", @embedFile("examples/strings.nov"));
     _ = fixtures.add("inferred-locals.nov", @embedFile("examples/inferred-locals.nov"));
     _ = fixtures.add("inferred-integer.nov", "let main: () -> void = {let n = 1\n@println(n)}\n");
     _ = fixtures.add("inferred-empty-array.nov", "let main: () -> void = {let a = []\n}\n");
@@ -276,6 +277,19 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
 
     // An isolated PATH exercises real `zig cc` discovery, independent of host CC.
     for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+        const strings = b.addRunArtifact(exe);
+        strings.step.name = b.fmt("CLI: UTF8 strings and NUL ({s})", .{mode});
+        strings.setCwd(fixtures.getDirectory());
+        strings.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+        strings.setEnvironmentVariable("NOV_CC", "");
+        strings.setEnvironmentVariable("CC", "");
+        strings.addArgs(&.{ "run", "strings.nov" });
+        if (mode.len != 0) strings.addArg(mode);
+        strings.expectExitCode(0);
+        strings.expectStdOutEqual("Hello, 世界! 14\n[new binding]\n[Hello, 世界!]\n{UTF-8} 4\na\x00b 3\n");
+        strings.expectStdErrEqual("");
+        test_step.dependOn(&strings.step);
+
         const inferred = b.addRunArtifact(exe);
         inferred.step.name = b.fmt("CLI: inferred locals ({s})", .{mode});
         inferred.setCwd(fixtures.getDirectory());

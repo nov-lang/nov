@@ -49,10 +49,71 @@ pub fn check(module: *Module, ir: *Ir, node: Ast.Node.Index, expected: Ir.TypeId
                 }
                 return .not_literal;
             },
-            .char_literal, .string_literal => return failLiteral(module, .unsupported_literal, span, annotation),
+            .string_literal => {
+                const bytes = module.sourceSlice(span).?;
+                var decoded = std.Io.Writer.Allocating.init(module.allocator);
+                defer decoded.deinit();
+                const result = @import("string_literal.zig").parseWrite(&decoded.writer, bytes) catch return error.OutOfMemory;
+                switch (result) {
+                    .failure => |failure| {
+                        const offset: u32 = @intCast(switch (failure) {
+                            .empty_char_literal => unreachable,
+                            inline else => |index| index,
+                        });
+                        return failLiteral(module, .invalid_literal, .{ .start = span.start + offset, .end = @min(span.end, span.start + offset + 1) }, null);
+                    },
+                    .success => {},
+                }
+                if (stringIssue(bytes, decoded.written())) |issue| {
+                    const start = span.start + @as(u32, @intCast(issue.offset));
+                    return failLiteral(module, issue.tag, .{ .start = start, .end = start + 1 }, null);
+                }
+                return internLiteral(module, ir, expected, .{ .string = decoded.written() }, span, annotation);
+            },
+            .char_literal => return failLiteral(module, .unsupported_literal, span, annotation),
             else => return .not_literal,
         }
     }
+}
+
+// Map decoded-byte failures back to the escape/raw source byte that produced
+// them. Decoding itself stays in the shared parser, including hex byte escapes.
+fn stringIssue(source: []const u8, decoded: []const u8) ?struct { offset: usize, tag: Module.Diagnostic.Tag } {
+    var invalid: usize = decoded.len;
+    var i: usize = 0;
+    while (i < decoded.len) {
+        const n = std.unicode.utf8ByteSequenceLength(decoded[i]) catch {
+            invalid = i;
+            break;
+        };
+        if (n > decoded.len - i) {
+            invalid = i;
+            break;
+        }
+        _ = std.unicode.utf8Decode(decoded[i..][0..n]) catch {
+            invalid = i;
+            break;
+        };
+        i += n;
+    }
+    var offset: usize = 1;
+    var output: usize = 0;
+    while (offset < source.len - 1) {
+        const start = offset;
+        if (source[offset] == '{' or source[offset] == '}') return .{ .offset = offset, .tag = .unsupported_literal };
+        if (source[offset] == '\\') {
+            const unicode = source[offset + 1] == 'u';
+            const point = @import("string_literal.zig").parseEscapeSequence(source, &offset).success;
+            const n = if (unicode) std.unicode.utf8CodepointSequenceLength(point) catch unreachable else 1;
+            if (invalid >= output and invalid < output + n) return .{ .offset = start, .tag = .invalid_literal };
+            output += n;
+        } else {
+            if (output == invalid) return .{ .offset = start, .tag = .invalid_literal };
+            output += 1;
+            offset += 1;
+        }
+    }
+    return null;
 }
 
 fn failLiteral(module: *Module, tag: Module.Diagnostic.Tag, span: Module.Span, annotation: ?Module.Span) std.mem.Allocator.Error!Result {
@@ -114,6 +175,48 @@ const test_u8: Ir.Type = .{ .integer = .{ .signedness = .unsigned, .bits = 8 } }
 const test_i128: Ir.Type = .{ .integer = .{ .signedness = .signed, .bits = 128 } };
 const test_u128: Ir.Type = .{ .integer = .{ .signedness = .unsigned, .bits = 128 } };
 
+test "string decoding owns canonical UTF8 bytes independently of source" {
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    const ty = try ir.internType(.string);
+    var id: Ir.ConstId = undefined;
+    {
+        var module = try Module.init(std.testing.allocator, "string.nov", "let a = \"é\\0\\u{1f600}\"\nlet b = \"\\xC3\\xA9\\x00😀\"");
+        defer module.deinit();
+        id = (try check(&module, &ir, testNode(&module, 0), ty, null)).constant;
+        try std.testing.expectEqual(id, (try check(&module, &ir, testNode(&module, 1), ty, null)).constant);
+    }
+    try std.testing.expectEqualStrings("é\x00😀", ir.getConstant(id).?.value.string);
+    try ir.verify();
+}
+
+test "strings diagnose invalid escapes UTF8 and deferred interpolation at source bytes" {
+    const Case = struct { source: []const u8, offset: usize, tag: Module.Diagnostic.Tag = .invalid_literal };
+    for ([_]Case{
+        .{ .source = "\"a\\q\"", .offset = 3 },
+        .{ .source = "\"\\xGG\"", .offset = 3 },
+        .{ .source = "\"a\\xFF\"", .offset = 2 },
+        .{ .source = "\"a\\xC0\\x80\"", .offset = 2 },
+        .{ .source = "\"a\xff\"", .offset = 2 },
+        .{ .source = "\"a\\u{D800}\"", .offset = 4 },
+        .{ .source = "\"a{value}\"", .offset = 2, .tag = .unsupported_literal },
+        .{ .source = "\"a${value}\"", .offset = 3, .tag = .unsupported_literal },
+    }) |case| {
+        const source = try std.mem.concat(std.testing.allocator, u8, &.{ "let x = ", case.source });
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "bad-string.nov", source);
+        defer module.deinit();
+        var ir = Ir.init(std.testing.allocator);
+        defer ir.deinit();
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expectEqual(Result.failed, try check(&module, &ir, testNode(&module, 0), try ir.internType(.string), null));
+        const diagnostic = module.diagnostics.items[0];
+        try std.testing.expectEqual(case.tag, diagnostic.tag);
+        try std.testing.expectEqual(8 + case.offset, diagnostic.span.start);
+        try std.testing.expectEqual(diagnostic.span.start + 1, diagnostic.span.end);
+    }
+}
+
 test "integer boundaries bases separators and grouping preserve typed constants" {
     const Case = struct { expression: []const u8, ty: Ir.Type, value: Ir.Constant.Value };
     for ([_]Case{
@@ -171,7 +274,7 @@ test "invalid literals fail with source spans and only optional type notes" {
         .{ .expression = "1.0", .tag = .unsupported_literal },
         .{ .expression = "-1.0", .tag = .unsupported_literal },
         .{ .expression = "'a'", .tag = .unsupported_literal },
-        .{ .expression = "\"true\"", .tag = .unsupported_literal },
+        .{ .expression = "\"true\"", .tag = .literal_type_mismatch },
     }) |case| {
         const source = try std.fmt.allocPrint(std.testing.allocator, "let x: Expected = {s}", .{case.expression});
         defer std.testing.allocator.free(source);
@@ -260,6 +363,22 @@ fn testAllocationFailures(allocator: std.mem.Allocator) !void {
     try std.testing.expectEqual(@as(usize, 1), ir.constants.items.len);
     try std.testing.expectEqual(@as(usize, 3), module.diagnostics.items.len);
     try ir.verify();
+}
+
+fn testStringAllocationFailures(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "strings.nov", "let valid = \"é\\0😀\"\nlet invalid = \"a\\xFF\"\nlet escape = \"\\q\"\nlet interpolation = \"{deferred}\"");
+    defer module.deinit();
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    const string = try ir.internType(.string);
+    for (0..module.declarations.items.len) |i| _ = try check(&module, &ir, testNode(&module, i), string, null);
+    try std.testing.expectEqual(@as(usize, 1), ir.constants.items.len);
+    try std.testing.expectEqual(@as(usize, 3), module.diagnostics.items.len);
+    try ir.verify();
+}
+
+test "string decoding and diagnostics clean up on every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testStringAllocationFailures, .{});
 }
 
 test "caller cleanup handles every allocation failure after constants or diagnostics" {

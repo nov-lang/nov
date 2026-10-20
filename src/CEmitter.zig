@@ -116,7 +116,7 @@ fn analyze(ir: *const Ir, origins: []?Origin, diagnostic: ?*Diagnostic) Error!vo
         i -= 1;
         const origin = origins[i] orelse continue;
         switch (ir.types.items[i]) {
-            .void, .boolean => {},
+            .void, .boolean, .string => {},
             .array => |element| mark(origins, element, origin),
             .integer => |integer| switch (integer.bits) {
                 8, 16, 32, 64 => {},
@@ -136,8 +136,14 @@ fn write(allocator: std.mem.Allocator, ir: *const Ir, origins: []const ?Origin, 
     // Transitive signature types need declarations even when no function holds
     // an array value. Only direct managed values need the runtime/root frames.
     for (origins, ir.types.items) |origin, ty| {
-        if (origin != null and ty == .array) {
+        if ((origin != null and ty == .array) or usesManagedRuntime(ir)) {
             try w.writeAll("typedef struct { void *data; uintptr_t len, cap; } nov_array;\n");
+            break;
+        }
+    }
+    for (origins, ir.types.items) |origin, ty| {
+        if (origin != null and ty == .string) {
+            try w.writeAll("typedef struct { void *owner; const unsigned char *data; uintptr_t len; } nov_string;\n");
             break;
         }
     }
@@ -147,6 +153,7 @@ fn write(allocator: std.mem.Allocator, ir: *const Ir, origins: []const ?Origin, 
         try w.writeAll(@import("GcRuntime.zig").source);
         try w.writeByte('\n');
         try w.writeAll(@embedFile("runtime/array.h"));
+        if (usesStringConcat(ir)) try w.writeAll(@embedFile("runtime/string.h"));
     }
     try writeArithmeticRuntime(ir, w);
     var first_typedef = true;
@@ -177,13 +184,22 @@ fn write(allocator: std.mem.Allocator, ir: *const Ir, origins: []const ?Origin, 
 
 fn needsRootFrame(ir: *const Ir, function: Ir.Function) bool {
     const signature = ir.getType(function.ty).?.function;
-    for (signature.params) |param| if (ir.getType(param).? == .array) return true;
-    for (function.body.?.instructions) |instruction| if (ir.getType(instruction.ty).? == .array) return true;
-    return ir.getType(signature.result).? == .array;
+    for (signature.params) |param| if (Ir.isManaged(ir.getType(param).?)) return true;
+    for (function.body.?.instructions) |instruction| if (Ir.isManaged(ir.getType(instruction.ty).?)) return true;
+    return Ir.isManaged(ir.getType(signature.result).?);
 }
 
 fn usesManagedRuntime(ir: *const Ir) bool {
     for (ir.functions.items) |function| if (needsRootFrame(ir, function)) return true;
+    return false;
+}
+
+fn usesStringConcat(ir: *const Ir) bool {
+    for (ir.functions.items) |function| {
+        for (function.body.?.instructions) |instruction| {
+            if (instruction.op == .binary and ir.getType(instruction.ty).? == .string) return true;
+        }
+    }
     return false;
 }
 
@@ -212,6 +228,9 @@ fn writeRuntime(ir: *const Ir, w: *std.Io.Writer) WriteError!void {
     );
     if (printing) try w.writeAll(
         "#include <inttypes.h>\n\n" ++
+            "#if defined(_WIN32)\n#include <io.h>\n#include <fcntl.h>\n#endif\n" ++
+            "static void nov_rt_init_stdout(void) {\n" ++
+            "#if defined(_WIN32)\n    static bool initialized;\n    if (!initialized) {\n        if (_setmode(_fileno(stdout), _O_BINARY) == -1) nov_rt_panic(\"stdout write failed\");\n        initialized = true;\n    }\n#endif\n}\n" ++
             "static void nov_rt_check(int result) {\n" ++
             "    if (result < 0) nov_rt_panic(\"stdout write failed\");\n}\n",
     );
@@ -267,6 +286,7 @@ fn writeType(ir: *const Ir, w: *std.Io.Writer, id: Ir.TypeId) WriteError!void {
         .integer => |integer| try w.print("{s}int{d}_t", .{ if (integer.signedness == .unsigned) "u" else "", integer.bits }),
         .function => try w.print("nov_fn_{d}", .{@intFromEnum(id)}),
         .array => try w.writeAll("nov_array"),
+        .string => try w.writeAll("nov_string"),
     }
 }
 
@@ -307,6 +327,11 @@ fn writeFunctionName(w: *std.Io.Writer, name: []const u8) WriteError!void {
 
 fn writeConstant(w: *std.Io.Writer, constant: Ir.Constant, ty: Ir.Type) WriteError!void {
     switch (constant.value) {
+        .string => |bytes| {
+            try w.writeAll("(nov_string){NULL, (const unsigned char *)\"");
+            for (bytes) |byte| try w.print("\\{o:0>3}", .{byte});
+            try w.print("\", {d}}}", .{bytes.len});
+        },
         .void => unreachable, // void values have no C object
         .boolean => |value| try w.writeAll(if (value) "true" else "false"),
         .unsigned_integer => |value| try w.print("UINT{d}_C({d})", .{ ty.integer.bits, value }),
@@ -397,22 +422,24 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
         // owns shutdown. Keep strict C11 unused-function warnings portable.
         try w.writeAll("    (void)nov_gc_register_globals; (void)nov_gc_unregister_globals; (void)nov_gc_shutdown;\n    (void)nov_array_clone; (void)nov_array_index; (void)nov_array_append;\n");
         var roots: usize = 0;
-        for (signature.params) |param| if (ir.getType(param).? == .array) {
+        for (signature.params) |param| if (Ir.isManaged(ir.getType(param).?)) {
             roots += 1;
         };
         for (body.instructions, 0..) |instruction, i| {
-            if (ir.getType(instruction.ty).? != .array) continue;
-            try w.print("    nov_array v{d} = {{NULL, 0, 0}};\n", .{i});
+            if (!Ir.isManaged(ir.getType(instruction.ty).?)) continue;
+            try w.writeAll("    ");
+            try writeType(ir, w, instruction.ty);
+            try w.print(" v{d} = {{0}};\n", .{i});
             roots += 1;
         }
         // Stable function-scope void* fields, never casts from typed T** slots.
         if (roots != 0) {
             try w.writeAll("    void **nov_roots[] = {");
-            for (signature.params, 0..) |param, p| if (ir.getType(param).? == .array) {
-                try w.print(" &p{d}.data,", .{p});
+            for (signature.params, 0..) |param, p| if (Ir.isManaged(ir.getType(param).?)) {
+                try w.print(" &p{d}.{s},", .{ p, if (ir.getType(param).? == .string) "owner" else "data" });
             };
-            for (body.instructions, 0..) |instruction, i| if (ir.getType(instruction.ty).? == .array) {
-                try w.print(" &v{d}.data,", .{i});
+            for (body.instructions, 0..) |instruction, i| if (Ir.isManaged(ir.getType(instruction.ty).?)) {
+                try w.print(" &v{d}.{s},", .{ i, if (ir.getType(instruction.ty).? == .string) "owner" else "data" });
             };
             try w.print(" }};\n    nov_gc_roots nov_frame = {{0}};\n    nov_gc_push(&nov_rt_heap, &nov_frame, nov_roots, {d});\n", .{roots});
         } else {
@@ -439,7 +466,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
                 const region = candidate.op.branch;
                 const has_value = ir.types.items[@intFromEnum(candidate.ty)] != .void;
                 if (region.then_start == i) {
-                    if (has_value and ir.getType(candidate.ty).? != .array) {
+                    if (has_value and !Ir.isManaged(ir.getType(candidate.ty).?)) {
                         try w.writeAll("    ");
                         try writeType(ir, w, candidate.ty);
                         try w.print(" v{d};\n", .{end});
@@ -500,6 +527,20 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
                 try writeCall(w, instruction.op.call);
                 try w.writeAll(";\n");
             }
+            continue;
+        }
+        if (ty == .string) {
+            try w.print("    v{d} = ", .{i});
+            switch (instruction.op) {
+                .constant => |id| try writeConstant(w, ir.getConstant(id).?, ty),
+                .parameter => |index| try w.print("p{d}", .{index}),
+                .local_slot, .local_load => |value| try w.print("v{d}", .{@intFromEnum(value)}),
+                .binary => |b| try w.print("nov_string_concat(v{d}, v{d})", .{ @intFromEnum(b.lhs), @intFromEnum(b.rhs) }),
+                .call => |call| try writeCall(w, call),
+                else => unreachable,
+            }
+            try w.writeAll(";\n");
+            if (!value_used[i] or instruction.op == .local_slot) try w.print("    (void)v{d};\n", .{i});
             continue;
         }
         if (ty == .array) {
@@ -630,11 +671,15 @@ fn writeArrayValue(ir: *const Ir, w: *std.Io.Writer, instruction: Ir.Instruction
 }
 
 fn writePrint(ir: *const Ir, w: *std.Io.Writer, body: Ir.Body, print: anytype) WriteError!void {
+    // Single-string print uses fwrite directly, and library emission has no
+    // final-flush wrapper to reference the shared scalar/flush check helper.
+    try w.writeAll("    (void)nov_rt_check;\n    nov_rt_init_stdout();\n");
     if (print.args.len == 0 and !print.newline) try w.writeAll("    nov_rt_check(fputs(\"\", stdout));\n");
     for (print.args, 0..) |arg, i| {
         if (i != 0) try w.writeAll("    nov_rt_check(fputc(' ', stdout));\n");
         const ty = ir.types.items[@intFromEnum(body.instructions[@intFromEnum(arg)].ty)];
         switch (ty) {
+            .string => try w.print("    if (v{d}.len && fwrite(v{d}.data, 1, (size_t)v{d}.len, stdout) != (size_t)v{d}.len) nov_rt_panic(\"stdout write failed\");\n", .{ @intFromEnum(arg), @intFromEnum(arg), @intFromEnum(arg), @intFromEnum(arg) }),
             .boolean => try w.print("    nov_rt_check(fputs(v{d} ? \"true\" : \"false\", stdout));\n", .{@intFromEnum(arg)}),
             .integer => |integer| try w.print("    nov_rt_check(fprintf(stdout, \"%\" PRI{s}MAX, ({s}intmax_t)v{d}));\n", .{ if (integer.signedness == .signed) "d" else "u", if (integer.signedness == .signed) "" else "u", @intFromEnum(arg) }),
             else => unreachable,
@@ -762,6 +807,142 @@ fn arrayTestProgram(source: []const u8) ![]u8 {
             "if (nov_rt_heap.frames) return 70; nov_gc_collect(&nov_rt_heap); " ++
             "if (nov_rt_heap.live_objects) return 71; nov_gc_shutdown(&nov_rt_heap); return 0; }\n",
     });
+}
+
+const string_example =
+    \\let greeting: string = "hé\0"
+    \\let identity: (s: string) -> string = s
+    \\let effect: (s: string) -> string = {@print(s)
+    \\    s + "!"}
+    \\let choose: (b: bool) -> string = {if b {return "early" + "!"}
+    \\    "late"}
+    \\let main: () -> void = {
+    \\    let mut value = greeting + "😀"
+    \\    let shared = identity(value)
+    \\    value = "new"
+    \\    @println(shared, shared.len, value)
+    \\    @println(effect("A"), effect("B"))
+    \\    let chosen = if false {"skip" + "!"} else {shared}
+    \\    @println(chosen, choose(true), choose(false))
+    \\    let mut count: int = 0
+    \\    loop count < 3 {
+    \\        value = value + "x"
+    \\        count += 1
+    \\        if count == 1 {continue}
+    \\        if count == 3 {break}
+    \\    }
+    \\    @println(value, "".len, "" + "", "\{literal\}", "\xC3\xA9")
+    \\    let a = [true, false]
+    \\    @println(a.len, shared)
+    \\}
+;
+const string_output = "hé\x00😀 8 new\nABA! B!\nhé\x00😀 early! late\nnewxxx 0  {literal} é\n2 hé\x00😀\n";
+
+test "immutable strings share UTF8 bytes across calls replacements control flow and GC" {
+    const c = try arrayTestProgram(string_example);
+    defer test_gpa.free(c);
+    try compileAndRunExpected(c, "typedef int nonempty_translation_unit;", 0, string_output, "");
+    try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, string_output, "", "-O0");
+}
+
+test "string parameters returns and assignments share backing without allocation" {
+    const library = try emitSource("let id: (s: string) -> string = {let mut x = s\nx = s\nx}\nlet make: () -> string = \"a\" + \"b\"", null);
+    defer test_gpa.free(library);
+    const c = try std.mem.concat(test_gpa, u8, &.{
+        library,
+        "\nint main(void) { nov_string s = nov_make(); nov_string t = nov_id(s); if (s.owner != t.owner || s.data != t.data || s.len != t.len) return 1; if (nov_rt_heap.live_objects != 1) return 2; nov_gc_shutdown(&nov_rt_heap); return 0; }\n",
+    });
+    defer test_gpa.free(c);
+    try compileAndRun(c, "typedef int nonempty_translation_unit;");
+}
+
+test "single string print libraries compile strictly without a program wrapper" {
+    for ([_][]const u8{ "\"text\"", "\"\"", "\"a\\0b\"" }, [_][]const u8{ "text", "", "a\x00b" }) |literal, output| {
+        const source = try std.fmt.allocPrint(test_gpa, "let main: () -> void = @print({s})", .{literal});
+        defer test_gpa.free(source);
+        const library = try emitSource(source, null);
+        defer test_gpa.free(library);
+        try std.testing.expect(std.mem.indexOf(u8, library, "int main(") == null);
+        try std.testing.expect(std.mem.indexOf(u8, library, "nov_rt_check(fflush(stdout))") == null);
+        try compileAndRunExpected(library, "#include <stdio.h>\nvoid nov_main(void);\nint main(void) { nov_main(); return fflush(stdout) == EOF; }\n", 0, output, "");
+    }
+}
+
+test "string output preserves NUL and checks fwrite and final flush failures" {
+    var module = try Module.init(test_gpa, "stdout.nov", "let main: () -> void = @print(\"a\\0b\")");
+    defer module.deinit();
+    var sema = try Lowering.lower(&module);
+    defer sema.deinit();
+    const program = try emitProgram(test_gpa, &sema.ir, null);
+    defer test_gpa.free(program);
+    try compileAndRunExpected(program, "typedef int nonempty_translation_unit;", 0, "a\x00b", "");
+    for ([_][]const u8{
+        "#include <stdio.h>\nstatic size_t fail_write(const void *s, size_t n, size_t c, FILE *f) { (void)s; (void)n; (void)c; (void)f; return 0; }\n#define fwrite fail_write\n",
+        "#include <stdio.h>\nstatic int fail_flush(FILE *f) { if (f == stdout) return EOF; return fflush(f); }\n#define fflush fail_flush\n",
+    }, [_][]const u8{ "", "a\x00b" }) |prefix, output| {
+        const injected = try std.mem.concat(test_gpa, u8, &.{ prefix, program });
+        defer test_gpa.free(injected);
+        try compileAndRunExpected(injected, "typedef int nonempty_translation_unit;", 1, output, "panic: stdout write failed\n");
+    }
+}
+
+test "string callback signatures need declarations but not a managed runtime" {
+    const library = try emitSource("let f: (callback: (string) -> string) -> void = {}", null);
+    defer test_gpa.free(library);
+    try std.testing.expect(std.mem.indexOf(u8, library, "} nov_string;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, library, "nov_gc_") == null);
+    try compileAndRun(library, "int main(void) { return 0; }");
+}
+
+test "generated string programs compile for Windows with binary UTF8 output" {
+    const zig_exe = std.testing.environ.getAlloc(test_gpa, "NOV_TEST_ZIG") catch try test_gpa.dupe(u8, "zig");
+    defer test_gpa.free(zig_exe);
+    var module = try Module.init(test_gpa, "windows.nov", string_example);
+    defer module.deinit();
+    var sema = try Lowering.lower(&module);
+    defer sema.deinit();
+    const program = try emitProgram(test_gpa, &sema.ir, null);
+    defer test_gpa.free(program);
+    try std.testing.expect(std.mem.indexOf(u8, program, "_setmode(_fileno(stdout), _O_BINARY)") != null);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "strings.c", .data = program });
+    const compiled = try std.process.run(test_gpa, std.testing.io, .{
+        .argv = &.{ zig_exe, "cc", "-target", "x86_64-windows-gnu", "-std=c11", "-Wall", "-Wextra", "-Wpedantic", "-Werror", "-c", "strings.c", "-o", "strings.o" },
+        .cwd = .{ .dir = tmp.dir },
+    });
+    defer test_gpa.free(compiled.stdout);
+    defer test_gpa.free(compiled.stderr);
+    try expectSuccess(compiled, "Windows string C compilation");
+}
+
+test "lowered strings emit after module and source storage are freed" {
+    var sema = blk: {
+        var module = try Module.init(test_gpa, "source-free.nov", "let text: string = \"a\\0é\"\nlet main: () -> void = @println(text + \"!\")");
+        defer module.deinit();
+        break :blk try Lowering.lower(&module);
+    };
+    defer sema.deinit();
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+    const program = try emitProgram(test_gpa, &sema.ir, null);
+    defer test_gpa.free(program);
+    try compileAndRunExpected(program, "typedef int nonempty_translation_unit;", 0, "a\x00é!\n", "");
+}
+
+test "string compiler ownership survives every allocation failure" {
+    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{string_example});
+}
+
+test "string length overflow panics before touching invalid backing in both modes" {
+    const library = try emitSource("let f: (a: string, b: string) -> string = a + b", null);
+    defer test_gpa.free(library);
+    const c = try std.mem.concat(test_gpa, u8, &.{
+        library,
+        "\nint main(void) { (void)nov_f((nov_string){NULL, NULL, UINTPTR_MAX}, (nov_string){NULL, NULL, 1}); return 99; }\n",
+    });
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 1, "", "panic: string size overflow\n", mode);
 }
 
 const inferred_example =
@@ -1051,7 +1232,7 @@ test "array capacity and append length overflow panic before accessing backing" 
 }
 
 test "array allocation failure retries preserve roots and shutdown frees backing" {
-    for ([_][]const u8{ array_example, array_compound_effects, inferred_example, inferred_arrays }, [_][]const u8{ "3 30 30 6\n454 15\n99 15 4\nfalse true 2\n0\n", array_compound_output, inferred_output, inferred_arrays_output }) |source, output| {
+    for ([_][]const u8{ array_example, array_compound_effects, inferred_example, inferred_arrays, string_example }, [_][]const u8{ "3 30 30 6\n454 15\n99 15 4\nfalse true 2\n0\n", array_compound_output, inferred_output, inferred_arrays_output, string_output }) |source, output| {
         const c = try arrayTestProgram(source);
         defer test_gpa.free(c);
         const injected = try std.mem.concat(test_gpa, u8, &.{

@@ -302,6 +302,7 @@ const Context = struct {
                 if (std.mem.eql(u8, name, "true") or std.mem.eql(u8, name, "false")) break :blk .{ .ty = try self.ir.internType(.boolean) };
                 break :blk null;
             },
+            .string_literal => .{ .ty = try self.ir.internType(.string) },
             .array_init, .array_init_comma, .array_init_two, .array_init_two_comma => try self.probeArray(node, depth),
             .array_access => blk: {
                 const array = (try self.probe(data.lhs, depth + 1)) orelse break :blk null;
@@ -593,7 +594,7 @@ const Context = struct {
                 const base = (try self.expression(data.lhs, null, depth + 1)) orelse return null;
                 if (self.terminated) return if (expected) |want| want.ty else base;
                 const array = self.ir.getType(base).?;
-                if (array != .array) return self.fail(.unsupported_body_expression, node, null);
+                if (array != .array and !(array == .string and ast.nodes.items(.tag)[node] == .field_access)) return self.fail(.unsupported_body_expression, node, null);
                 if (ast.nodes.items(.tag)[node] == .field_access) {
                     if (!std.mem.eql(u8, ast.tokenSlice(data.rhs), "len")) return self.fail(.unsupported_body_expression, node, null);
                     return self.fit(try self.ir.internType(.{ .integer = .{ .signedness = .unsigned, .bits = Ir.native_pointer_bits } }), expected, node);
@@ -754,7 +755,7 @@ const Context = struct {
             .add, .sub, .mul, .div, .mod => {
                 const integer_context = if (expected) |want| (if (self.ir.getType(want.ty).? == .integer) expected else null) else null;
                 const operand = (try self.probe(data.lhs, depth + 1)) orelse (try self.probe(data.rhs, depth + 1)) orelse integer_context orelse return self.missingOperandType(node, data.lhs, data.rhs, expected, depth);
-                if (self.ir.getType(operand.ty).? != .integer) return self.fail(.operator_not_supported, node, operand.annotation);
+                if (self.ir.getType(operand.ty).? != .integer and !(self.ir.getType(operand.ty).? == .string and ast.nodes.items(.tag)[node] == .add)) return self.fail(.operator_not_supported, node, operand.annotation);
                 const lhs = try self.expression(data.lhs, operand, depth + 1);
                 const rhs = try self.expression(data.rhs, operand, depth + 1);
                 if (lhs == null or rhs == null) return null;
@@ -809,7 +810,7 @@ const Context = struct {
                             continue;
                         };
                         const arg_ty = self.ir.getType(arg_type).?;
-                        if (!self.terminated and arg_ty != .boolean and arg_ty != .integer) {
+                        if (!self.terminated and arg_ty != .boolean and arg_ty != .integer and arg_ty != .string) {
                             _ = try self.fail(.unsupported_body_expression, arg, null);
                             valid = false;
                         }
@@ -837,6 +838,52 @@ const Context = struct {
         }
     }
 };
+
+test "string inference accepts late literals calls lengths and branch context" {
+    var module = try Module.init(std.testing.allocator, "strings.nov",
+        \\let id: (s: string) -> string = s
+        \\let f: (s: string, b: bool) -> string = {
+        \\    let mut x = {let y = "a"
+        \\        y + s}
+        \\    x = if b {id(x)} else {"b"}
+        \\    let length: uint = x.len
+        \\    @println(length, "", x)
+        \\    if b {"prefix"} else {s} + x
+        \\}
+    );
+    defer module.deinit();
+    var sema = try @import("Lowering.zig").lower(&module);
+    defer sema.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+}
+
+test "strings reject byte mutation indexing slicing arrays comparisons and eager globals" {
+    for ([_][]const u8{
+        "let f: () -> void = {let x: []string = []\n}",
+        "let f: () -> void = {let x = [\"a\"]\n}",
+        "let f: () -> void = {let mut x = \"a\"\nx[0] = \"b\"}",
+        "let f: () -> void = @println(\"a\"[0])",
+        "let f: () -> void = @println(\"a\"[0..1])",
+        "let f: () -> void = {let mut x = \"a\"\nx.len = 1}",
+        "let f: () -> void = {let mut x = \"a\"\nx += \"b\"}",
+        "let f: () -> bool = \"a\" == \"b\"",
+        "let f: () -> string = \"a\" - \"b\"",
+        "let f: () -> string = 1 + \"b\"",
+        "let f: () -> string = \"a\" + 1",
+        "let x: string = \"a\" + \"b\"",
+        "let mut x: string = \"a\"",
+        "let x = \"a\"",
+    }) |source| {
+        var module = try Module.init(std.testing.allocator, "unsupported-string.nov", source);
+        defer module.deinit();
+        if (module.hasErrors()) continue;
+        var sema = try @import("Lowering.zig").lower(&module);
+        defer sema.deinit();
+        try std.testing.expect(module.hasErrors());
+        try std.testing.expect(!sema.lowering_complete);
+    }
+}
 
 test "scalar array deferred and ill typed forms fail closed" {
     for ([_][]const u8{
@@ -1303,7 +1350,7 @@ test "printing rejects unresolved literals non-scalars unsupported builtins and 
         .{ .source = "let n: int = 1\nlet f: () -> void = @println(2)", .tag = .literal_needs_type },
         .{ .source = "let n: uint = 1\nlet f: () -> int = n", .tag = .expression_type_mismatch },
         .{ .source = "let f: () -> void = @println(-1)", .tag = .literal_needs_type },
-        .{ .source = "let f: () -> void = @println(\"text\")", .tag = .unsupported_literal },
+        .{ .source = "let f: () -> void = @println('a')", .tag = .unsupported_literal },
         .{ .source = "let f: () -> void = @println({})", .tag = .unsupported_body_expression },
         .{ .source = "let f: () -> void = @println(f)", .tag = .unsupported_body_expression },
         .{ .source = "let f: () -> void = @println(@print())", .tag = .unsupported_body_expression },
