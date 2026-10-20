@@ -67,12 +67,41 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_tests.step);
     addCliTests(b, exe, test_step);
+    addGcTests(b, test_step);
 
     const fmt_step = b.step("fmt", "Format all source files");
     fmt_step.dependOn(&b.addFmt(.{ .paths = &.{ "build.zig", "src" } }).step);
 
     const clean_step = b.step("clean", "Remove build artifacts");
     clean_step.makeFn = clean;
+}
+
+fn addGcTests(b: *std.Build, test_step: *std.Build.Step) void {
+    const compile = b.addSystemCommand(&.{ b.graph.zig_exe, "cc", "-std=c11", "-Wall", "-Wextra", "-Wpedantic", "-Werror", "-O2", "-fsanitize=undefined", "-fno-sanitize-recover=all" });
+    compile.addFileArg(b.path("src/runtime/gc_test.c"));
+    compile.addArg("-o");
+    const binary = compile.addOutputFileArg("gc-test");
+    const cases = [_]struct { arg: ?[]const u8, message: []const u8 }{
+        .{ .arg = null, .message = "" },
+        .{ .arg = "oom", .message = "GC allocation failed" },
+        .{ .arg = "double", .message = "GC roots already registered" },
+        .{ .arg = "pop", .message = "GC root frames must pop in LIFO order" },
+        .{ .arg = "interior", .message = "GC invalid managed pointer" },
+        .{ .arg = "foreign", .message = "GC invalid managed pointer" },
+        .{ .arg = "descriptor", .message = "GC invalid pointer offset" },
+        .{ .arg = "alignment", .message = "GC invalid descriptor" },
+        .{ .arg = "shutdown", .message = "GC shutdown with registered roots" },
+        .{ .arg = "unregister", .message = "GC globals not registered" },
+    };
+    for (cases) |case| {
+        const run = std.Build.Step.Run.create(b, b.fmt("GC runtime: {s}", .{case.arg orelse "stress"}));
+        run.addFileArg(binary);
+        if (case.arg) |arg| run.addArg(arg);
+        run.expectExitCode(if (case.arg == null) 0 else 1);
+        run.expectStdOutEqual("");
+        run.expectStdErrEqual(if (case.arg == null) "" else b.fmt("panic: {s}\n", .{case.message}));
+        test_step.dependOn(&run.step);
+    }
 }
 
 fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {

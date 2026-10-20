@@ -16,6 +16,12 @@ Nov has automatic memory management via a minimal tracing GC.
 
 Requires Zig 0.16.0.
 
+An opt-in, internal libc-only nonmoving mark/sweep GC foundation is available for
+future managed-value code generation. It is not emitted into current scalar
+programs and adds no language features. See the [runtime API and root discipline](src/runtime/README.md)
+for layout, C boundary, OOM, testing, and unsupported-reference contracts. Array,
+slice, and string semantics remain undecided.
+
 ```sh
 zig build
 zig build test
