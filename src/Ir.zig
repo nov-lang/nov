@@ -43,11 +43,22 @@ pub const Operation = union(enum) {
     /// Terminal control flow, never a value. Its optional operand is body-local.
     return_value: ?ValueId,
     /// Terminal exits target the innermost containing loop, including its condition.
-    loop_break,
+    loop_break: ?ValueId,
     loop_continue,
     /// Condition [condition_start, body_start) is reexecuted before every body
-    /// [body_start, this instruction). Only outer slots carry state on backedges.
-    loop: struct { condition_start: u32, body_start: u32, condition: ValueId, body: ValueId },
+    /// [body_start, continuation_start orelse this instruction). The optional
+    /// continuation occupies the remaining region. Body continue enters it;
+    /// condition/continuation continue reenters the condition. Break/return skip
+    /// it. Only outer slots carry state between these private sibling regions.
+    loop: struct {
+        unconditional: bool = false,
+        condition_start: u32,
+        body_start: u32,
+        continuation_start: ?u32 = null,
+        condition: ValueId,
+        body: ValueId,
+        continuation: ?ValueId = null,
+    },
     // Slot identities are instruction IDs, but are not expression values.
     local_slot: ValueId,
     local_load: ValueId,
@@ -322,7 +333,7 @@ fn regionOperandType(body: Body, id: ValueId, before: usize, yielding: ?usize) V
     if (index >= before or index >= body.instructions.len) return error.InvalidValueId;
     if (yielding != null and body.instructions[index].op == .local_slot) return error.InvalidValueId;
     for (body.instructions, 0..) |instruction, owner| {
-        var buffer: [2]Region = undefined;
+        var buffer: [3]Region = undefined;
         for (regions(instruction.op, owner, &buffer)) |region| {
             if (index >= region.start and index < region.end and
                 !(before >= region.start and before < region.end) and
@@ -341,21 +352,35 @@ pub fn terminates(body: Body, id: ValueId) bool {
     };
 }
 
+pub fn enclosingLoop(body: Body, index: usize) ?usize {
+    for (body.instructions[index + 1 ..], index + 1..) |instruction, end| {
+        if (instruction.op == .loop and index >= instruction.op.loop.condition_start) return end;
+    }
+    return null;
+}
+
 const Region = struct { start: usize, end: usize };
 
-fn regions(op: Operation, end: usize, buffer: *[2]Region) []const Region {
+fn regions(op: Operation, end: usize, buffer: *[3]Region) []const Region {
     switch (op) {
         .short_circuit => |r| {
             buffer[0] = .{ .start = r.rhs_start, .end = end };
             return buffer[0..1];
         },
         .loop => |r| {
-            buffer.* = .{ .{ .start = r.condition_start, .end = r.body_start }, .{ .start = r.body_start, .end = end } };
-            return buffer;
+            const continuation_start = r.continuation_start orelse end;
+            buffer[0] = .{ .start = r.condition_start, .end = r.body_start };
+            buffer[1] = .{ .start = r.body_start, .end = continuation_start };
+            if (r.continuation_start != null) {
+                buffer[2] = .{ .start = continuation_start, .end = end };
+                return buffer;
+            }
+            return buffer[0..2];
         },
         .branch => |r| {
-            buffer.* = .{ .{ .start = r.then_start, .end = r.else_start }, .{ .start = r.else_start, .end = end } };
-            return buffer;
+            buffer[0] = .{ .start = r.then_start, .end = r.else_start };
+            buffer[1] = .{ .start = r.else_start, .end = end };
+            return buffer[0..2];
         },
         else => return &.{},
     }
@@ -377,7 +402,11 @@ fn validateBody(self: *const Ir, function: Function, body: Body) VerifyError!voi
             .loop => |r| {
                 if (r.condition_start >= r.body_start or r.body_start >= end or
                     @intFromEnum(r.condition) < r.condition_start or @intFromEnum(r.condition) >= r.body_start or
-                    @intFromEnum(r.body) < r.body_start or @intFromEnum(r.body) >= end) return error.InvalidRegion;
+                    @intFromEnum(r.body) < r.body_start or @intFromEnum(r.body) >= (r.continuation_start orelse end)) return error.InvalidRegion;
+                if ((r.continuation_start == null) != (r.continuation == null)) return error.InvalidRegion;
+                if (r.continuation_start) |start| {
+                    if (start <= r.body_start or start >= end or @intFromEnum(r.continuation.?) < start or @intFromEnum(r.continuation.?) >= end) return error.InvalidRegion;
+                }
             },
             .short_circuit => |r| {
                 if (r.rhs_start > end or @intFromEnum(r.lhs) >= r.rhs_start) return error.InvalidRegion;
@@ -389,10 +418,10 @@ fn validateBody(self: *const Ir, function: Function, body: Body) VerifyError!voi
             },
             else => {},
         }
-        var buffer: [2]Region = undefined;
+        var buffer: [3]Region = undefined;
         for (regions(instruction.op, end, &buffer)) |region| {
             for (body.instructions[0..end], 0..) |previous, previous_end| {
-                var previous_buffer: [2]Region = undefined;
+                var previous_buffer: [3]Region = undefined;
                 for (regions(previous.op, previous_end, &previous_buffer)) |previous_region| {
                     // The nested merge belongs to the surrounding scope too.
                     if (previous_end >= region.start and previous_region.start < region.start) return error.InvalidRegion;
@@ -407,14 +436,18 @@ fn validateBody(self: *const Ir, function: Function, body: Body) VerifyError!voi
             var region_end = body.instructions.len;
             var result = body.result;
             for (body.instructions, 0..) |owner, end| {
-                var buffer: [2]Region = undefined;
+                var buffer: [3]Region = undefined;
                 for (regions(owner.op, end, &buffer), 0..) |region, r| {
                     if (i >= region.start and i < region.end and region.end <= region_end) {
                         region_end = region.end;
                         result = switch (owner.op) {
                             .branch => |b| if (r == 0) b.then_value else b.else_value.?,
                             .short_circuit => |s| s.rhs,
-                            .loop => |l| if (r == 0) l.condition else l.body,
+                            .loop => |l| switch (r) {
+                                0 => l.condition,
+                                1 => l.body,
+                                else => l.continuation.?,
+                            },
                             else => unreachable,
                         };
                     }
@@ -465,18 +498,40 @@ fn validateBody(self: *const Ir, function: Function, body: Body) VerifyError!voi
             },
             .loop_break, .loop_continue => {
                 if (ty != .void) return error.InvalidOperation;
-                var enclosed = false;
-                for (body.instructions, 0..) |owner, end| {
-                    if (owner.op == .loop and i >= owner.op.loop.condition_start and i < end) enclosed = true;
+                const owner = enclosingLoop(body, i) orelse return error.InvalidRegion;
+                if (instruction.op == .loop_break) {
+                    // The enclosing merge is later in the stream, so its type
+                    // has not yet passed the per-instruction validation below.
+                    const loop_ty = self.getType(body.instructions[owner].ty) orelse return error.InvalidTypeId;
+                    if (instruction.op.loop_break) |value| {
+                        if (!body.instructions[owner].op.loop.unconditional) return error.InvalidOperation;
+                        if (try operandType(body, value, i) != body.instructions[owner].ty) return error.OperandTypeMismatch;
+                    } else if (loop_ty != .void) return error.OperandTypeMismatch;
                 }
-                if (!enclosed) return error.InvalidRegion;
             },
             .loop => |r| {
-                if (ty != .void) return error.InvalidOperation;
+                if (!r.unconditional and ty != .void) return error.InvalidOperation;
+                if (r.unconditional) {
+                    const condition = body.instructions[@intFromEnum(r.condition)];
+                    if (condition.op != .constant) return error.InvalidOperation;
+                    const constant = self.getConstant(condition.op.constant) orelse return error.InvalidConstId;
+                    if (constant.value != .boolean or !constant.value.boolean) return error.InvalidOperation;
+                }
+                if (ty != .void) {
+                    var valued_break = false;
+                    for (body.instructions, 0..) |control, index| {
+                        if (control.op == .loop_break and control.op.loop_break != null and enclosingLoop(body, index) == i) valued_break = true;
+                    }
+                    if (!valued_break) return error.InvalidOperation;
+                }
                 const condition_ty = try regionOperandType(body, r.condition, r.body_start, i);
                 if (!terminates(body, r.condition) and self.getType(condition_ty).? != .boolean) return error.OperandTypeMismatch;
-                const body_ty = try regionOperandType(body, r.body, i, i);
+                const body_ty = try regionOperandType(body, r.body, r.continuation_start orelse i, i);
                 if (!terminates(body, r.body) and self.getType(body_ty).? != .void) return error.OperandTypeMismatch;
+                if (r.continuation) |value| {
+                    const continuation_ty = try regionOperandType(body, value, i, i);
+                    if (!terminates(body, value) and self.getType(continuation_ty).? != .void) return error.OperandTypeMismatch;
+                }
             },
             .return_value => |value| {
                 if (ty != .void) return error.InvalidReturn;
@@ -1188,7 +1243,7 @@ test "loop verification isolates regions slots backedges controls and terminal t
                 break :b error.InvalidValueId;
             },
             9 => b: {
-                bad[6] = ins(unit, .loop_break);
+                bad[6] = ins(unit, .{ .loop_break = null });
                 break :b error.UnreachableInstruction;
             },
             10 => b: {
@@ -1222,6 +1277,452 @@ test "loop verification isolates regions slots backedges controls and terminal t
     terminal[7] = ins(unit, .loop_continue);
     try fixture.ir.setFunctionBody(fixture.function, &terminal, @enumFromInt(9));
     try fixture.ir.verify();
+}
+
+const LoopTests = struct {
+    fn reject(fixture: *TestFunctions, expected: VerifyError, instructions: []const Instruction, result: ValueId) !void {
+        try fixture.reject(expected, instructions, result);
+        // Exercise verification of already-published malformed IR as well as
+        // validation before publication, without transferring slice ownership.
+        fixture.ir.functions.items[0].body = .{ .instructions = instructions, .result = result };
+        defer fixture.ir.functions.items[0].body = null;
+        try std.testing.expectError(expected, fixture.ir.verify());
+    }
+};
+
+test "loop continuation boundaries types and private sibling operands are verified" {
+    var t = try TestFunctions.init(std.testing.allocator);
+    defer t.ir.deinit();
+    const unit = try t.ir.internType(.void);
+    const nothing = try t.ir.internConstant(.{ .ty = unit, .value = .void });
+    const truth = try t.ir.internConstant(.{ .ty = t.boolean, .value = .{ .boolean = true } });
+    const ins = TestFunctions.instruction;
+    const good = [_]Instruction{
+        ins(t.integer, .{ .parameter = 0 }), // 0: outer value and slot
+        ins(t.integer, .{ .local_slot = @enumFromInt(0) }),
+        ins(t.boolean, .{ .constant = truth }), // 2: condition
+        ins(t.integer, .{ .local_slot = @enumFromInt(0) }),
+        ins(t.integer, .{ .local_load = @enumFromInt(3) }),
+        ins(t.integer, .{ .parameter = 0 }), // 5: body
+        ins(t.integer, .{ .local_slot = @enumFromInt(5) }),
+        ins(t.integer, .{ .local_load = @enumFromInt(6) }),
+        ins(unit, .{ .constant = nothing }),
+        ins(t.integer, .{ .parameter = 0 }), // 9: continuation
+        ins(t.integer, .{ .local_slot = @enumFromInt(9) }),
+        ins(t.integer, .{ .local_load = @enumFromInt(10) }),
+        ins(unit, .{ .constant = nothing }),
+        ins(unit, .{ .loop = .{ .condition_start = 2, .body_start = 5, .continuation_start = 9, .condition = @enumFromInt(2), .body = @enumFromInt(8), .continuation = @enumFromInt(12) } }),
+        ins(t.integer, .{ .local_load = @enumFromInt(1) }),
+    };
+    for (0..24) |case| {
+        var bad = good;
+        const r = &bad[13].op.loop;
+        const expected: VerifyError = switch (case) {
+            0 => b: {
+                r.continuation_start = null;
+                break :b error.InvalidRegion;
+            },
+            1 => b: {
+                r.continuation = null;
+                break :b error.InvalidRegion;
+            },
+            2 => b: {
+                r.continuation_start = 5;
+                break :b error.InvalidRegion;
+            },
+            3 => b: {
+                r.continuation_start = 4;
+                break :b error.InvalidRegion;
+            },
+            4 => b: {
+                r.continuation_start = 13;
+                break :b error.InvalidRegion;
+            },
+            5 => b: {
+                r.continuation_start = std.math.maxInt(u32);
+                break :b error.InvalidRegion;
+            },
+            6 => b: {
+                r.continuation = @enumFromInt(8);
+                break :b error.InvalidRegion;
+            },
+            7 => b: {
+                r.continuation = @enumFromInt(13);
+                break :b error.InvalidRegion;
+            },
+            8 => b: {
+                r.continuation = @enumFromInt(std.math.maxInt(u32));
+                break :b error.InvalidRegion;
+            },
+            9 => b: {
+                r.body = @enumFromInt(9);
+                break :b error.InvalidRegion;
+            },
+            10 => b: {
+                r.body = @enumFromInt(7);
+                break :b error.OperandTypeMismatch;
+            },
+            11 => b: {
+                r.continuation = @enumFromInt(11);
+                break :b error.OperandTypeMismatch;
+            },
+            12 => b: {
+                r.continuation = @enumFromInt(10);
+                break :b error.InvalidValueId;
+            },
+            13 => b: {
+                bad[11] = ins(unit, .loop_continue);
+                break :b error.UnreachableInstruction;
+            },
+            14 => b: {
+                bad[12] = ins(unit, .loop_continue);
+                r.continuation = @enumFromInt(9);
+                break :b error.UnreachableInstruction;
+            },
+            15 => b: {
+                bad[8] = ins(unit, .loop_continue);
+                r.body = @enumFromInt(5);
+                break :b error.UnreachableInstruction;
+            },
+            16 => b: {
+                bad[4] = ins(unit, .loop_continue);
+                break :b error.UnreachableInstruction;
+            },
+            17 => b: {
+                bad[12] = ins(t.integer, .loop_continue);
+                break :b error.InvalidOperation;
+            },
+            18 => b: {
+                bad[12] = ins(t.integer, .{ .loop_break = null });
+                break :b error.InvalidOperation;
+            },
+            19 => b: {
+                bad[12] = ins(unit, .{ .loop_break = @enumFromInt(9) });
+                break :b error.InvalidOperation;
+            },
+            20 => b: {
+                bad[13].ty = t.integer;
+                break :b error.InvalidOperation;
+            },
+            21 => b: {
+                bad[12] = ins(unit, .{ .loop_break = null });
+                bad[13].ty = @enumFromInt(999);
+                break :b error.InvalidTypeId;
+            },
+            // A nested region may not straddle the body/continuation boundary.
+            22 => b: {
+                bad[11] = ins(t.integer, .{ .branch = .{ .condition = @enumFromInt(2), .then_start = 8, .else_start = 10, .then_value = @enumFromInt(8), .else_value = @enumFromInt(10) } });
+                break :b error.InvalidRegion;
+            },
+            23 => b: {
+                bad[12].span.end = 11;
+                break :b error.InvalidSourceSpan;
+            },
+            else => unreachable,
+        };
+        errdefer std.debug.print("continuation verifier case {d}\n", .{case});
+        try LoopTests.reject(&t, expected, &bad, @enumFromInt(14));
+    }
+    // Each region's values and slot identities are private, even when an
+    // instruction in a later sibling or after the loop references them.
+    for ([_]usize{ 4, 7, 11 }) |source| {
+        for ([_]usize{ 7, 11, 14 }) |destination| {
+            if (source >= destination) continue;
+            for (0..3) |kind| {
+                var bad = good;
+                bad[destination] = switch (kind) {
+                    0 => ins(t.integer, .{ .unary = .{ .op = .negate, .operand = @enumFromInt(source) } }),
+                    1 => ins(t.integer, .{ .local_load = @enumFromInt(source - 1) }),
+                    2 => ins(unit, .{ .local_store = .{ .slot = @enumFromInt(source - 1), .value = @enumFromInt(0) } }),
+                    else => unreachable,
+                };
+                try LoopTests.reject(&t, error.InvalidValueId, &bad, @enumFromInt(14));
+            }
+        }
+    }
+    for ([_]usize{ 4, 8, 12 }) |tail| {
+        for (0..3) |kind| {
+            var valid = good;
+            valid[tail] = ins(unit, switch (kind) {
+                0 => .loop_continue,
+                1 => .{ .loop_break = null },
+                2 => .{ .return_value = @enumFromInt(0) },
+                else => unreachable,
+            });
+            if (tail == 4) valid[13].op.loop.condition = @enumFromInt(4);
+            try t.ir.setFunctionBody(t.function, &valid, @enumFromInt(14));
+            try t.ir.verify();
+            const body = t.ir.functions.items[0].body.?;
+            t.ir.allocator.free(body.instructions);
+            t.ir.functions.items[0].body = null;
+        }
+    }
+    try t.ir.setFunctionBody(t.function, &good, @enumFromInt(14));
+    try t.ir.verify();
+}
+
+test "unconditional loop break values require visible prior exact typed operands" {
+    var t = try TestFunctions.init(std.testing.allocator);
+    defer t.ir.deinit();
+    const unit = try t.ir.internType(.void);
+    const truth = try t.ir.internConstant(.{ .ty = t.boolean, .value = .{ .boolean = true } });
+    const falsity = try t.ir.internConstant(.{ .ty = t.boolean, .value = .{ .boolean = false } });
+    const ins = TestFunctions.instruction;
+    const good = [_]Instruction{
+        ins(t.integer, .{ .parameter = 0 }),
+        ins(t.integer, .{ .local_slot = @enumFromInt(0) }),
+        ins(t.boolean, .{ .constant = truth }),
+        ins(t.integer, .{ .constant = t.number }),
+        ins(unit, .{ .loop_break = @enumFromInt(3) }),
+        ins(unit, .loop_continue),
+        ins(t.integer, .{ .loop = .{ .unconditional = true, .condition_start = 2, .body_start = 3, .continuation_start = 5, .condition = @enumFromInt(2), .body = @enumFromInt(4), .continuation = @enumFromInt(5) } }),
+    };
+    for (0..17) |case| {
+        var bad = good;
+        const expected: VerifyError = switch (case) {
+            0 => b: {
+                bad[4].op.loop_break = null;
+                break :b error.OperandTypeMismatch;
+            },
+            1 => b: {
+                bad[4].op.loop_break = @enumFromInt(4);
+                break :b error.InvalidValueId;
+            },
+            2 => b: {
+                bad[4].op.loop_break = @enumFromInt(5);
+                break :b error.InvalidValueId;
+            },
+            3 => b: {
+                bad[4].op.loop_break = @enumFromInt(std.math.maxInt(u32));
+                break :b error.InvalidValueId;
+            },
+            4 => b: {
+                bad[4].op.loop_break = @enumFromInt(1);
+                break :b error.InvalidValueId;
+            },
+            5 => b: {
+                bad[4].op.loop_break = @enumFromInt(2);
+                break :b error.InvalidValueId;
+            },
+            6 => b: {
+                bad[3] = ins(t.boolean, .{ .constant = truth });
+                break :b error.OperandTypeMismatch;
+            },
+            7 => b: {
+                bad[4].ty = t.integer;
+                break :b error.InvalidOperation;
+            },
+            8 => b: {
+                bad[6].ty = @enumFromInt(999);
+                break :b error.InvalidTypeId;
+            },
+            9 => b: {
+                bad[4].op.loop_break = null;
+                bad[6].ty = @enumFromInt(999);
+                break :b error.InvalidTypeId;
+            },
+            10 => b: {
+                bad[4].op = .loop_continue;
+                break :b error.InvalidOperation;
+            },
+            11 => b: {
+                bad[4].op = .{ .return_value = @enumFromInt(3) };
+                break :b error.InvalidOperation;
+            },
+            12 => b: {
+                bad[2].op.constant = falsity;
+                break :b error.InvalidOperation;
+            },
+            13 => b: {
+                bad[2] = ins(t.integer, .{ .parameter = 0 });
+                break :b error.InvalidOperation;
+            },
+            14 => b: {
+                bad[2] = ins(t.integer, .{ .constant = t.number });
+                break :b error.InvalidOperation;
+            },
+            15 => b: {
+                bad[5].op = .{ .loop_break = @enumFromInt(3) };
+                break :b error.InvalidValueId;
+            },
+            16 => b: {
+                bad[6].op.loop.unconditional = false;
+                break :b error.InvalidOperation;
+            },
+            else => unreachable,
+        };
+        errdefer std.debug.print("break value verifier case {d}\n", .{case});
+        try LoopTests.reject(&t, expected, &bad, @enumFromInt(6));
+    }
+    // A terminal instruction in the body is not a value in the continuation.
+    var bad = good;
+    bad[5].op = .{ .loop_break = @enumFromInt(4) };
+    try LoopTests.reject(&t, error.InvalidValueId, &bad, @enumFromInt(6));
+    // The continuation may provide the value instead of the body.
+    var valid = good;
+    valid[4].op = .loop_continue;
+    valid[5].op = .{ .loop_break = @enumFromInt(0) };
+    try t.ir.setFunctionBody(t.function, &valid, @enumFromInt(6));
+    try t.ir.verify();
+}
+
+test "nested loop breaks target only the innermost loop including continuations" {
+    var t = try TestFunctions.init(std.testing.allocator);
+    defer t.ir.deinit();
+    const unit = try t.ir.internType(.void);
+    const truth = try t.ir.internConstant(.{ .ty = t.boolean, .value = .{ .boolean = true } });
+    const ins = TestFunctions.instruction;
+    const good = [_]Instruction{
+        ins(t.integer, .{ .parameter = 0 }),
+        ins(t.boolean, .{ .constant = truth }),
+        ins(t.boolean, .{ .constant = truth }),
+        ins(unit, .loop_continue),
+        ins(t.integer, .{ .parameter = 0 }),
+        ins(unit, .{ .loop_break = @enumFromInt(4) }),
+        ins(t.integer, .{ .loop = .{ .unconditional = true, .condition_start = 2, .body_start = 3, .continuation_start = 4, .condition = @enumFromInt(2), .body = @enumFromInt(3), .continuation = @enumFromInt(5) } }),
+        ins(unit, .{ .loop_break = @enumFromInt(6) }),
+        ins(t.integer, .{ .loop = .{ .unconditional = true, .condition_start = 1, .body_start = 2, .condition = @enumFromInt(1), .body = @enumFromInt(7) } }),
+    };
+    var bad = good;
+    bad[7].op = .loop_continue;
+    try LoopTests.reject(&t, error.InvalidOperation, &bad, @enumFromInt(8));
+    bad = good;
+    bad[5].op.loop_break = null;
+    try LoopTests.reject(&t, error.OperandTypeMismatch, &bad, @enumFromInt(8));
+    bad = good;
+    bad[7].op.loop_break = @enumFromInt(4);
+    try LoopTests.reject(&t, error.InvalidValueId, &bad, @enumFromInt(8));
+    bad = good;
+    bad[6].op.loop.body = @enumFromInt(5);
+    try LoopTests.reject(&t, error.InvalidRegion, &bad, @enumFromInt(8));
+    const body: Body = .{ .instructions = &good, .result = @enumFromInt(8) };
+    try std.testing.expectEqual(@as(?usize, 6), enclosingLoop(body, 2));
+    try std.testing.expectEqual(@as(?usize, 6), enclosingLoop(body, 3));
+    try std.testing.expectEqual(@as(?usize, 6), enclosingLoop(body, 5));
+    try std.testing.expectEqual(@as(?usize, 8), enclosingLoop(body, 6));
+    try std.testing.expectEqual(@as(?usize, 8), enclosingLoop(body, 7));
+    try std.testing.expectEqual(@as(?usize, null), enclosingLoop(body, 8));
+    try t.ir.setFunctionBody(t.function, &good, @enumFromInt(8));
+    try t.ir.verify();
+}
+
+test "unconditional loops preserve explicit resolved break types without defaults" {
+    const Kind = enum { boolean, signed, unsigned, string, array, function };
+    for (std.enums.values(Kind)) |kind| {
+        var ir = Ir.init(std.testing.allocator);
+        defer ir.deinit();
+        ir.source_len = 1;
+        const unit = try ir.internType(.void);
+        const boolean = try ir.internType(.boolean);
+        const integer = try ir.internType(.{ .integer = .{ .bits = 8, .signedness = .signed } });
+        const ty = switch (kind) {
+            .boolean => boolean,
+            .signed => integer,
+            .unsigned => try ir.internType(.{ .integer = .{ .bits = 128, .signedness = .unsigned } }),
+            .string => try ir.internType(.string),
+            .array => try ir.internType(.{ .array = integer }),
+            .function => try ir.internType(.{ .function = .{ .params = &.{boolean}, .result = integer } }),
+        };
+        const signature = try ir.internType(.{ .function = .{ .params = &.{ty}, .result = ty } });
+        const function = try ir.addFunction("typed", signature, test_span);
+        const truth = try ir.internConstant(.{ .ty = boolean, .value = .{ .boolean = true } });
+        const ins = TestFunctions.instruction;
+        const good = [_]Instruction{
+            ins(ty, .{ .parameter = 0 }),
+            ins(boolean, .{ .constant = truth }),
+            ins(unit, .{ .loop_break = @enumFromInt(0) }),
+            ins(ty, .{ .loop = .{ .unconditional = true, .condition_start = 1, .body_start = 2, .condition = @enumFromInt(1), .body = @enumFromInt(2) } }),
+        };
+        var bad = good;
+        bad[2].op.loop_break = null;
+        try std.testing.expectError(error.OperandTypeMismatch, ir.setFunctionBody(function, &bad, @enumFromInt(3)));
+        try std.testing.expect(ir.getFunction(function).?.body == null);
+        bad[2].op = .loop_continue;
+        try std.testing.expectError(error.InvalidOperation, ir.setFunctionBody(function, &bad, @enumFromInt(3)));
+        try std.testing.expect(ir.getFunction(function).?.body == null);
+        try ir.setFunctionBody(function, &good, @enumFromInt(3));
+        try ir.verify();
+        try std.testing.expectEqual(ty, ir.getFunction(function).?.body.?.instructions[3].ty);
+    }
+}
+
+test "void loops accept bare breaks but only unconditional loops accept unit values" {
+    for ([_]bool{ false, true }) |unconditional| {
+        for ([_]bool{ false, true }) |valued| {
+            var ir = Ir.init(std.testing.allocator);
+            defer ir.deinit();
+            ir.source_len = 1;
+            const unit = try ir.internType(.void);
+            const boolean = try ir.internType(.boolean);
+            const signature = try ir.internType(.{ .function = .{ .params = &.{}, .result = unit } });
+            const function = try ir.addFunction("unit", signature, test_span);
+            const truth = try ir.internConstant(.{ .ty = boolean, .value = .{ .boolean = true } });
+            const nothing = try ir.internConstant(.{ .ty = unit, .value = .void });
+            const ins = TestFunctions.instruction;
+            const instructions = [_]Instruction{
+                ins(boolean, .{ .constant = truth }),
+                ins(unit, .{ .constant = nothing }),
+                ins(unit, .{ .loop_break = if (valued) @enumFromInt(1) else null }),
+                ins(unit, .{ .loop = .{ .unconditional = unconditional, .condition_start = 0, .body_start = 1, .condition = @enumFromInt(0), .body = @enumFromInt(2) } }),
+            };
+            if (valued and !unconditional) {
+                try std.testing.expectError(error.InvalidOperation, ir.setFunctionBody(function, &instructions, @enumFromInt(3)));
+                try std.testing.expect(ir.getFunction(function).?.body == null);
+            } else {
+                try ir.setFunctionBody(function, &instructions, @enumFromInt(3));
+                try ir.verify();
+            }
+        }
+    }
+}
+
+fn testLoopAllocationFailures(allocator: std.mem.Allocator) !void {
+    var t = try TestFunctions.init(allocator);
+    defer t.ir.deinit();
+    const unit = try t.ir.internType(.void);
+    const array = try t.ir.internType(.{ .array = t.integer });
+    const truth = try t.ir.internConstant(.{ .ty = t.boolean, .value = .{ .boolean = true } });
+    const ins = TestFunctions.instruction;
+    var args = [_]ValueId{@enumFromInt(0)};
+    var instructions = [_]Instruction{
+        ins(t.integer, .{ .parameter = 0 }),
+        ins(t.signature, .{ .function_ref = t.function }),
+        ins(t.boolean, .{ .constant = truth }),
+        ins(array, .{ .array_literal = &args }),
+        ins(unit, .{ .print = .{ .args = &args, .newline = false } }),
+        ins(t.integer, .{ .call = .{ .callee = @enumFromInt(1), .args = &args } }),
+        ins(array, .{ .array_literal = &args }),
+        ins(unit, .{ .print = .{ .args = &args, .newline = true } }),
+        ins(unit, .loop_continue),
+        ins(t.integer, .{ .call = .{ .callee = @enumFromInt(1), .args = &args } }),
+        ins(array, .{ .array_literal = &args }),
+        ins(unit, .{ .print = .{ .args = &args, .newline = true } }),
+        ins(unit, .{ .loop_break = @enumFromInt(9) }),
+        ins(t.integer, .{ .loop = .{ .unconditional = true, .condition_start = 2, .body_start = 5, .continuation_start = 9, .condition = @enumFromInt(2), .body = @enumFromInt(8), .continuation = @enumFromInt(12) } }),
+    };
+    t.ir.setFunctionBody(t.function, &instructions, @enumFromInt(13)) catch |err| {
+        try std.testing.expect(t.ir.getFunction(t.function).?.body == null);
+        try std.testing.expectError(error.MissingFunctionBody, t.ir.verify());
+        return err;
+    };
+    args[0] = @enumFromInt(999);
+    instructions[12].op.loop_break = null;
+    instructions[13].op.loop.continuation_start = null;
+    try t.ir.verify();
+    const body = t.ir.getFunction(t.function).?.body.?;
+    try std.testing.expectEqual(@as(?u32, 9), body.instructions[13].op.loop.continuation_start);
+    try std.testing.expectEqual(@as(?ValueId, @enumFromInt(9)), body.instructions[12].op.loop_break);
+    for ([_]usize{ 3, 6, 10 }) |i| try std.testing.expectEqual(@as(ValueId, @enumFromInt(0)), body.instructions[i].op.array_literal[0]);
+    for ([_]usize{ 4, 7, 11 }) |i| try std.testing.expectEqual(@as(ValueId, @enumFromInt(0)), body.instructions[i].op.print.args[0]);
+    for ([_]usize{ 5, 9 }) |i| try std.testing.expectEqual(@as(ValueId, @enumFromInt(0)), body.instructions[i].op.call.args[0]);
+    try std.testing.expectError(error.BodyAlreadySet, t.ir.setFunctionBody(t.function, &instructions, @enumFromInt(13)));
+    try t.ir.verify();
+    t.ir.clearFunctions();
+    try t.ir.verify();
+}
+
+test "loop continuation and break body publication is atomic under every OOM" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testLoopAllocationFailures, .{});
 }
 
 test "conditional body operands are owned and publication is atomic under OOM" {

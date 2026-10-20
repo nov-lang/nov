@@ -57,6 +57,8 @@ pub const Diagnostic = struct {
         unreachable_code,
         loop_control_outside_loop,
         unsupported_loop_control,
+        conditional_value_break,
+        loop_missing_value_break,
         unsupported_shadowing,
         expression_type_mismatch,
         operator_not_supported,

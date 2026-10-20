@@ -57,6 +57,49 @@ pub fn lower(module: *Module) Error!Sema {
     return result;
 }
 
+test "loop continuation regions and value breaks outlive source storage" {
+    var module = try Module.init(std.testing.allocator, "loop-values.nov",
+        \\let f: (n: int) -> []int = {
+        \\    let mut i: int = 0
+        \\    let result = loop : {i += 1} {
+        \\        if i < n {continue}
+        \\        break [i, n]
+        \\    }
+        \\    result
+        \\}
+    );
+    var sema = lower(&module) catch |err| {
+        module.deinit();
+        return err;
+    };
+    defer sema.deinit();
+    const failed = module.hasErrors();
+    const body = sema.ir.functions.items[0].body.?;
+    var loop_owner: ?usize = null;
+    var break_value: ?Ir.ValueId = null;
+    for (body.instructions, 0..) |instruction, index| switch (instruction.op) {
+        .loop => |r| {
+            loop_owner = index;
+            try std.testing.expect(r.unconditional);
+            try std.testing.expect(r.condition_start < r.body_start);
+            try std.testing.expect(r.body_start < r.continuation_start.?);
+            try std.testing.expect(r.continuation_start.? < index);
+            try std.testing.expect(sema.ir.getType(instruction.ty).? == .array);
+            try std.testing.expectEqualStrings("loop : {i += 1}", module.ast.source[instruction.span.start .. instruction.span.start + 15]);
+        },
+        .loop_break => |value| break_value = value,
+        else => {},
+    };
+    try std.testing.expect(loop_owner != null);
+    try std.testing.expect(break_value != null);
+    try std.testing.expectEqual(loop_owner.?, Ir.enclosingLoop(body, @intFromEnum(break_value.?) + 1).?);
+    try std.testing.expect(body.instructions[@intFromEnum(break_value.?)].op == .array_clone);
+    module.deinit();
+    try std.testing.expect(!failed);
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+}
+
 test "string compound reuses binary add with old load before RHS replacement" {
     var module = try Module.init(std.testing.allocator, "compound.nov",
         \\let rhs: () -> string = "right" + "!"

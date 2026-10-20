@@ -273,7 +273,7 @@ fn parseDecl(self: *Parser) Error!Node.Index {
 }
 
 fn parseExpr(self: *Parser) Error!Node.Index {
-    return self.parseExprPrecedence(.assignment, false);
+    return self.parseExprPrecedence(.assignment, false, true);
 }
 
 fn expectExpr(self: *Parser) Error!Node.Index {
@@ -285,7 +285,7 @@ fn expectExpr(self: *Parser) Error!Node.Index {
 }
 
 fn parseExprStrict(self: *Parser) Error!Node.Index {
-    return self.parseExprPrecedence(.assignment, true);
+    return self.parseExprPrecedence(.assignment, true, true);
 }
 
 fn expectExprStrict(self: *Parser) Error!Node.Index {
@@ -365,13 +365,13 @@ const rules = std.enums.directEnumArrayDefault(Token.Tag, Rule, .{ .prec = .none
 //     .filter()
 //     .reduce()
 // or do like Roc aka remove variables don't have methods only containers do so we use |> instead
-fn parseExprPrecedence(self: *Parser, min_prec: Precedence, strict: bool) Error!Node.Index {
+fn parseExprPrecedence(self: *Parser, min_prec: Precedence, strict: bool, allow_block_label: bool) Error!Node.Index {
     std.debug.assert(@intFromEnum(min_prec) >= 0);
     if (!strict) {
         // allow for `let x =\n1 +\n 2` but not `let x =\n\n1 + 2`
         _ = self.eatToken(.newline);
     }
-    var node = try self.parsePrefixExpr();
+    var node = try self.parsePrefixExpr(allow_block_label);
     if (node == null_node) {
         return null_node;
     }
@@ -411,7 +411,7 @@ fn parseExprPrecedence(self: *Parser, min_prec: Precedence, strict: bool) Error!
             => try self.warnMsg(.{ .tag = .ambiguous_unary_operator, .token = op_token }),
             else => {},
         };
-        const rhs = try self.parseExprPrecedence(@enumFromInt(@intFromEnum(rule.prec) + 1), strict);
+        const rhs = try self.parseExprPrecedence(@enumFromInt(@intFromEnum(rule.prec) + 1), strict, allow_block_label);
         if (rhs == null_node) {
             // return self.fail(.expected_expr);
             try self.warn(.expected_expr);
@@ -448,26 +448,26 @@ fn parseExprPrecedence(self: *Parser, min_prec: Precedence, strict: bool) Error!
 
 /// PrefixExpr <- PrefixOp* PrimaryExpr
 /// PrefixOp <- EXCLAMATIONMARK / MINUS / TILDE / AMPERSAND
-fn parsePrefixExpr(self: *Parser) Error!Node.Index {
+fn parsePrefixExpr(self: *Parser, allow_block_label: bool) Error!Node.Index {
     const tag: Node.Tag = switch (self.token_tags[self.tok_i]) {
         .bang => .bool_not,
         .minus => .negation,
         .tilde => .bit_not,
         .ampersand => .ref_of,
-        else => return self.parsePrimaryExpr(),
+        else => return self.parsePrimaryExpr(allow_block_label),
     };
     return self.addNode(.{
         .tag = tag,
         .main_token = self.nextToken(),
         .data = .{
             .lhs = undefined,
-            .rhs = try self.expectPrefixExpr(),
+            .rhs = try self.expectPrefixExpr(allow_block_label),
         },
     });
 }
 
-fn expectPrefixExpr(self: *Parser) Error!Node.Index {
-    const node = try self.parsePrefixExpr();
+fn expectPrefixExpr(self: *Parser, allow_block_label: bool) Error!Node.Index {
+    const node = try self.parsePrefixExpr(allow_block_label);
     if (node == null_node) {
         return self.fail(.expected_prefix_expr);
     }
@@ -486,7 +486,7 @@ fn expectPrefixExpr(self: *Parser) Error!Node.Index {
 // TODO:
 // KEYWORD_nosuspend Expr
 // KEYWORD_resume Expr
-fn parsePrimaryExpr(self: *Parser) Error!Node.Index {
+fn parsePrimaryExpr(self: *Parser, allow_block_label: bool) Error!Node.Index {
     switch (self.token_tags[self.tok_i]) {
         .keyword_if => return self.parseIfExpr(),
         .octothorpe => return self.addNode(.{
@@ -537,6 +537,12 @@ fn parsePrimaryExpr(self: *Parser) Error!Node.Index {
                         return self.parseLoopExpr();
                     },
                     .l_brace => {
+                        // In a loop condition, this colon starts the continuation.
+                        if (!allow_block_label) return self.addNode(.{
+                            .tag = .identifier,
+                            .main_token = self.nextToken(),
+                            .data = .{ .lhs = undefined, .rhs = undefined },
+                        });
                         self.tok_i += 2;
                         return self.parseBlock();
                     },
@@ -609,25 +615,29 @@ fn parseElseExpr(self: *Parser) Error!Node.Index {
 // loop _ in y..z {}
 // loop x, y, z in a, b, c {}
 
-// loop i < 100 : i += 1 {}
 // loop ... {} else
 /// LoopExpr <- KEYWORD_loop LoopInput? Block ElseExpr?
 /// LoopInput
 ///     <- (AMPERSAND? IDENTIFIER)+ KEYWORD_in (Expr (DOT2 Expr?)?)+
 ///      / Expr (COLON AssignExpr)?
-/// Condition-and-block and unconditional block forms are enabled. Other documented
-/// forms fail at the loop keyword and use the usual balanced recovery.
+/// Condition-and-block and unconditional block forms, with optional continuations,
+/// are enabled. Iteration, labels, and else forms use balanced error recovery.
 fn parseLoopExpr(self: *Parser) Error!Node.Index {
     const loop_token = self.assertToken(.keyword_loop);
     if (loop_token >= 2 and self.token_tags[loop_token - 1] == .colon or self.token_tags[self.tok_i] == .eof)
         return self.failMsg(.{ .tag = .unsupported_loop, .token = loop_token });
-    var condition = try self.expectExpr();
+    var condition = if (self.token_tags[self.tok_i] == .colon) null_node else condition: {
+        const node = try self.parseExprPrecedence(.assignment, false, false);
+        if (node == null_node) return self.fail(.expected_expr);
+        break :condition node;
+    };
+    const continuation = if (self.eatToken(.colon) != null) try self.expectSingleAssignExprStrict() else null_node;
     const body = if (self.token_tags[self.tok_i] == .l_brace) body: {
-        if (self.nodes.items(.tag)[condition] == .in)
+        if (condition != 0 and self.nodes.items(.tag)[condition] == .in)
             return self.failMsg(.{ .tag = .unsupported_loop, .token = loop_token });
         break :body try self.expectBlock();
     } else body: {
-        if (self.token_tags[self.tok_i] == .colon or self.token_tags[self.tok_i] == .comma)
+        if (condition == 0 or continuation != 0)
             return self.failMsg(.{ .tag = .unsupported_loop, .token = loop_token });
         switch (self.nodes.items(.tag)[condition]) {
             .block, .block_two, .block_newline, .block_two_newline => {},
@@ -639,7 +649,11 @@ fn parseLoopExpr(self: *Parser) Error!Node.Index {
     };
     if (self.token_tags[self.tok_i] == .keyword_else)
         return self.failMsg(.{ .tag = .unsupported_loop, .token = loop_token });
-    return self.addNode(.{ .tag = .loop_condition, .main_token = loop_token, .data = .{ .lhs = condition, .rhs = body } });
+    return self.addNode(.{
+        .tag = if (continuation != 0) .loop_cont else .loop_condition,
+        .main_token = loop_token,
+        .data = .{ .lhs = condition, .rhs = if (continuation != 0) try self.addExtra(Node.LoopCont{ .continuation = continuation, .body = body }) else body },
+    });
 }
 
 /// AssignExpr <- Expr (AssignOp Expr)?
@@ -1639,6 +1653,13 @@ test "parser ownership survives allocation failures" {
         "let broken = f(1,,2)\nlet invalid: (x: int,,y: int) = 0\nlet valid = 42",
         "let value = loop {}\nlet f: () = {\nloop {}\nlet valid = 42\nvalid\n}",
         "let f: () -> void = loop true {loop false {continue}\nif true {break}}",
+        "let value = loop : tick() {break loop i < 10 : i += 1 {break 1 + 2}}",
+        "let broken = loop true : i +=\nlet valid = 42",
+        "let broken = loop : tick(",
+        "let broken = loop true : a[0] += 1 {break [1, 2, 3,]}",
+        "let value = loop ready : {loop i < limit : {i += 1} {break}} {break 1}",
+        "let value = loop : {tick()} {break 1}",
+        "let value = loop ready : label: {tick()} {break 1}",
         "let add: (a: int, b: int, c: int) -> int = {\nlet sum = a + b\nlet result = sum + c\nresult\n}\nlet answer = add(1, 2, 3)",
         "let value = {\nlet broken =\nlet valid = 42\nvalid\n}\nlet missing =",
         "let a =\nlet b =\nlet c =\nlet d =\nlet e =\nlet f =\nlet g =\nlet h =",
@@ -1682,6 +1703,145 @@ test "unconditional loops preserve blocks ambiguity comments and EOF spans" {
     }
 }
 
+test "continuation loop extras and EOF source spans" {
+    for ([_]struct { text: [:0]const u8, conditional: bool }{
+        .{ .text = "loop i < 10 : i += 1 {}", .conditional = true },
+        .{ .text = "loop : tick() {break 42}", .conditional = false },
+        .{ .text = "loop true : a[0] += ; step\n1 {continue}", .conditional = true },
+        .{ .text = "loop {true} : tick(1, 2,) {break [1, 2, 3,]}", .conditional = true },
+        .{ .text = "loop : tick() {; body\nbreak loop : next() {break 1 + 2 * 3}}", .conditional = false },
+    }) |case| {
+        const source = try std.fmt.allocPrintSentinel(std.testing.allocator, "let value = {s}", .{case.text}, 0);
+        defer std.testing.allocator.free(source);
+        var ast = try parse(std.testing.allocator, source);
+        defer ast.deinit(std.testing.allocator);
+
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+        const node = ast.decl(ast.rootDecls()[0]).ast.init_node;
+        try std.testing.expectEqual(Node.Tag.loop_cont, ast.nodes.items(.tag)[node]);
+        const loop = ast.fullLoop(node).?;
+        const extra = ast.extraData(ast.nodes.items(.data)[node].rhs, Node.LoopCont);
+        try std.testing.expectEqual(case.conditional, loop.condition != 0);
+        try std.testing.expectEqual(extra.continuation, loop.continuation);
+        try std.testing.expectEqual(extra.body, loop.body);
+        try std.testing.expect(loop.continuation != 0);
+        try std.testing.expectEqualStrings("loop", ast.tokenSlice(ast.firstToken(node)));
+        try std.testing.expectEqual(source.len - 1, ast.tokens.items(.start)[ast.lastToken(node)]);
+        try std.testing.expectEqualStrings("}", ast.tokenSlice(ast.lastToken(loop.body)));
+    }
+}
+
+test "bare block continuations distinguish separators from block labels" {
+    for ([_][:0]const u8{
+        "let value = loop ready : {tick()} {break 1}",
+        "let value = loop i < limit : {i += 1} {break 1}",
+        "let value = loop true : {} {break 1}",
+        "let value = loop {true} : {tick()} {break 1}",
+        "let value = loop : {tick()} {break 1}",
+        "let value = loop ready : {loop inner : {tick()} {break}} {break 1}",
+    }) |source| {
+        var ast = try parse(std.testing.allocator, source);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+        const node = ast.decl(ast.rootDecls()[0]).ast.init_node;
+        try std.testing.expectEqual(Node.Tag.loop_cont, ast.nodes.items(.tag)[node]);
+        const loop = ast.fullLoop(node).?;
+        try std.testing.expectEqual(std.mem.indexOf(u8, source, "loop :") == null, loop.condition != 0);
+        try std.testing.expectEqual(source.len - 1, ast.tokens.items(.start)[ast.lastToken(node)]);
+        for (ast.nodes.items(.tag), 0..) |tag, i| {
+            if (tag != .loop_cont) continue;
+            const nested = ast.fullLoop(@intCast(i)).?;
+            const brace = ast.nodes.items(.main_token)[nested.continuation];
+            try std.testing.expectEqual(Token.Tag.l_brace, ast.tokens.items(.tag)[brace]);
+            try std.testing.expectEqual(brace, ast.firstToken(nested.continuation));
+            const header_end = if (nested.condition == 0) ast.nodes.items(.main_token)[i] else ast.lastToken(nested.condition);
+            try std.testing.expectEqual(header_end + 2, brace);
+        }
+    }
+    for ([_][:0]const u8{
+        "let value = loop ready : label: {tick()} {break 1}",
+        "let value = loop : label: {tick()} {break 1}",
+        "let value = loop {label: {true}} : {} {break 1}",
+    }) |source| {
+        var ast = try parse(std.testing.allocator, source);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+        var labels: usize = 0;
+        for (ast.nodes.items(.tag), ast.nodes.items(.main_token), 0..) |tag, main, i| {
+            switch (tag) {
+                .block, .block_two, .block_newline, .block_two_newline => {
+                    const first = ast.firstToken(@intCast(i));
+                    if (first == main) continue;
+                    labels += 1;
+                    try std.testing.expectEqualStrings("label", ast.tokenSlice(first));
+                },
+                else => {},
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 1), labels);
+    }
+}
+
+test "value loops remain expressions inside lists and preserve break spans" {
+    for ([_][:0]const u8{
+        "let value = [loop {break 1}, loop : tick() {break 2}, 3]",
+        "let value = call(loop {break 1}, loop true : tick() {break 2},)",
+    }) |source| {
+        var ast = try parse(std.testing.allocator, source);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+        var breaks: usize = 0;
+        for (ast.nodes.items(.tag), 0..) |tag, i| {
+            if (tag != .@"break") continue;
+            breaks += 1;
+            const node: Node.Index = @intCast(i);
+            try std.testing.expectEqualStrings("break", ast.tokenSlice(ast.firstToken(node)));
+            try std.testing.expectEqual(ast.lastToken(ast.nodes.items(.data)[node].rhs), ast.lastToken(node));
+        }
+        try std.testing.expectEqual(@as(usize, 2), breaks);
+    }
+}
+
+test "malformed continuation loops recover through lists blocks and EOF" {
+    for ([_][]const u8{
+        "loop i < 10 : {}",
+        "loop true : i += {}",
+        "loop true : tick(1,,2) {}",
+        "loop true : a[,1] = 2 {}",
+        "loop true : i += 1, j += 1 {}",
+        "loop true\n: i += 1 {}",
+        "loop true :\ni += 1 {}",
+        "loop true : i += 1\n{}",
+    }) |expression| {
+        const source = try std.fmt.allocPrintSentinel(std.testing.allocator, "let broken = {s}\nlet valid = 42", .{expression}, 0);
+        defer std.testing.allocator.free(source);
+        var ast = try parse(std.testing.allocator, source);
+        defer ast.deinit(std.testing.allocator);
+
+        try std.testing.expect(ast.errors.len != 0);
+        try std.testing.expect(ast.rootDecls().len != 0);
+        const last = ast.decl(ast.rootDecls()[ast.rootDecls().len - 1]);
+        try std.testing.expectEqualStrings("valid", ast.tokenSlice(last.ast.let_token + 1));
+    }
+    for ([_][:0]const u8{
+        "let value = loop :",                   "let value = loop true : i +=",     "let value = loop : tick(",
+        "let value = loop : tick() {break [1,", "let value = loop true : tick() {",
+    }) |source| {
+        var ast = try parse(std.testing.allocator, source);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expect(ast.errors.len != 0);
+        for (ast.errors) |err| try std.testing.expect(ast.tokens.items(.start)[err.token] <= source.len);
+    }
+    var ast = try parse(std.testing.allocator, "let f = {\nloop true : tick(1,,2) {}\nlet valid = 42\nvalid\n}\nlet after = 0");
+    defer ast.deinit(std.testing.allocator);
+    try std.testing.expect(ast.errors.len != 0);
+    try std.testing.expectEqual(@as(usize, 2), ast.rootDecls().len);
+    var buffer: [2]Node.Index = undefined;
+    const block = ast.fullBlock(&buffer, ast.decl(ast.rootDecls()[0]).ast.init_node).?;
+    try std.testing.expectEqual(@as(usize, 2), block.ast.statements.len);
+    try std.testing.expectEqualStrings("valid", ast.tokenSlice(ast.decl(block.ast.statements[0]).ast.let_token + 1));
+}
+
 test "condition loop AST preserves nested blocks controls and source boundaries" {
     const source = "let f: () -> void = loop {true} {if false {break} else {continue}}";
     var ast = try parse(std.testing.allocator, source);
@@ -1702,10 +1862,10 @@ test "condition loop AST preserves nested blocks controls and source boundaries"
 test "unsupported loops diagnose their keyword and preserve following declarations" {
     const expressions = [_][]const u8{
         "loop item in items {\nlet hidden = 0\n}",
-        "loop i < 10 : i += 1 {}",
+        "loop i < 10 : i += 1, j += 1 {}",
         "loop {} else {}",
         "loop {} {} else {}",
-        "loop {} : next {}",
+        "loop true : next {} else {}",
         "outer: loop {}",
         "outer: loop true {}",
         "loop true {} else {}",

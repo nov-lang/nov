@@ -1,0 +1,25 @@
+; Search without a sentinel result: break supplies the matching value.
+let first_multiple: (minimum: int, divisor: int) -> int = {
+    let mut candidate = minimum
+    loop : candidate += 1 {
+        if candidate % divisor == 0 {
+            break candidate
+        }
+    }
+}
+
+let main: () -> void = {
+    let found = first_multiple(23, 7)
+    let mut total: int = 0
+    let mut n: int = 0
+    loop n < found : n += 1 {
+        if n % 7 != 0 {
+            continue
+        }
+        total += n
+    }
+    let message = loop {
+        break "First multiple: " + "found"
+    }
+    @println(message, found, total)
+}

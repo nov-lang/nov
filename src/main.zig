@@ -760,7 +760,8 @@ test "format files atomically and leave rejected input unchanged" {
         .{ .source = "let x=foo([1])\n", .valid = true, .expected = "let x = foo([1])\n" },
         .{ .source = "let x = foo([[1]])\n", .valid = false, .expected = "let x = foo([[1]])\n" },
         .{ .source = "let f:()->void={let mut a:[]int=[1]\na[-1]=2\na += []}\n", .valid = true, .expected = "let f: () -> void = {\n    let mut a: []int = [1]\n    a[-1] = 2\n    a += []\n}\n" },
-        .{ .source = "let f = loop true {break 1}\n", .valid = false, .expected = "let f = loop true {break 1}\n" },
+        .{ .source = "let f = loop true {break 1}\n", .valid = true, .expected = "let f = loop true {\n    break 1\n}\n" },
+        .{ .source = "let f = loop true {break :outer}\n", .valid = false, .expected = "let f = loop true {break :outer}\n" },
     };
     for (cases) |case| {
         try tmp.dir.writeFile(io, .{ .sub_path = "input.nov", .data = case.source });

@@ -44,7 +44,8 @@ with final-expression results are supported in function bodies. Literal defaults
 shadowing and global mutation remain deferred or unsupported.
 Lowering produces typed operations with source spans, ordered operands/call
 arguments, explicit returns, and structured regions for boolean `and`/`or`,
-`if`/`else`, and condition-based or unconditional loops.
+`if`/`else`, and condition-based or unconditional loops with optional continuation
+clauses and value-carrying breaks from unconditional loops.
 It requires immutable literal globals; unit/global block initializers are
 not lowered yet. An internal C11 backend emits verified IR, including fixed-width
 integer arithmetic and program entrypoint emission through `emit-c`.
@@ -60,7 +61,8 @@ stop semantic analysis. Globals must be immutable, explicitly typed integer,
 boolean or string literals. Functions need explicit supported signatures and bounded
 expression bodies (including forward/recursive calls, local declarations and
 assignments, nested blocks, boolean short-circuiting, `if`/`else`, explicit returns,
-condition-based or unconditional loops with unlabeled `break`/`continue`, and empty void bodies).
+condition-based or unconditional loops with continuation clauses and unlabeled
+`break`/`continue`, value-producing unconditional loops, and empty void bodies).
 Inferred globals, mutable globals, nonliteral global initializers, global unit
 values are currently rejected, along with the other
 unsupported forms listed above. This is not a backend compatibility check: it
@@ -300,9 +302,13 @@ paths and never reads a value from a returning path.
 
 Condition-based `loop condition { ... }` expressions return `void`. The condition
 must be `bool` and is evaluated before **every** iteration, including the first,
-using the current local state. False skips the body and exits; normal body
-completion and unlabeled `continue` reevaluate the condition. Unlabeled `break`
-exits the innermost loop. Both controls also work in nested blocks, initializers,
+using the current local state. False skips the body and exits. With no continuation,
+normal body completion and unlabeled `continue` reevaluate the condition. With a
+continuation, `loop condition : update { ... }`, normal body completion and a
+body-side `continue` execute `update` before reevaluating the condition. A `continue`
+inside the condition or continuation goes directly to the condition; it does not
+execute or restart the continuation. `break` and `return` skip the continuation.
+Unlabeled `break` exits the innermost loop. Both controls also work in nested blocks, initializers,
 branches, arguments and short-circuit RHS regions, without evaluating the rest of
 that path or performing a pending assignment. Within a nested loop's condition,
 they target that nested loop. `return` still exits the enclosing function.
@@ -310,10 +316,11 @@ they target that nested loop. `return` still exits the enclosing function.
 The body must produce `void` on paths that continue; a terminal `return`, `break`
 or `continue` needs no result. Its lexical scope is fresh each iteration: local
 initializers execute again, body-local slots do not escape, and updates to outer
-mutable locals persist. Condition blocks have their own scope, separate from the
-body. Both condition and body are checked even when the condition is literally
-false. Loops are conservatively considered able to finish; a non-void function
-still needs a result after a loop. Statements after an unconditional loop control
+mutable locals persist. Condition, body, and continuation blocks have separate
+lexical scopes; the continuation cannot access body locals. All regions are checked
+even when the condition is literally false. Conditional loops remain `void` and
+cannot break with a value: zero-iteration and loop-`else` result rules are deferred.
+Statements after an unconditional loop control
 within a block are unreachable. Existing one-newline expression continuation
 also applies to `break`: use `{break}` before a following expression to keep the
 break bare.
@@ -331,14 +338,35 @@ let main: () -> void = {
 }
 ```
 
-This prints `1`, `3`, and `4` on separate lines. Loop IR owns separate condition
-and body instruction ranges; verification checks nesting, terminal paths and
-region-private references. Only outer slots carry mutable state across the
-backedge. C emission reevaluates the ordered condition instructions, rather than
-hoisting a snapshot before the loop. Unconditional `loop { ... }` uses the same
-IR with a synthetic true condition and the same void-result rules. Iterator/range
-loops, post-expression (`:`) loops, loop `else`, labels and value-carrying breaks remain
-unsupported and diagnosed; no loop-result/value-break semantics are introduced.
+This prints `1`, `3`, and `4` on separate lines. Unconditional loops can produce a
+value with `break expression`; the loop's expected type constrains the expression,
+or a known break-value type supplies inference. Break values must have exactly
+compatible types; bare `break` produces `void` and cannot mix with nonvoid breaks.
+There are no implicit numeric defaults: `loop {break 1}` needs integer context,
+while breaking with an explicitly typed `int` local can infer `int`. As with returns and
+assignments, array break values are independent copies; immutable strings share
+storage. Inner loops have independent break-value scopes.
+
+```nov
+let answer: () -> int = loop {
+    let val: int = 42
+    break val
+}
+```
+
+Unconditional `loop : update { ... }` also supports continuation clauses and value
+breaks. Continuing body/continuation paths must still produce `void`. A nonvoid
+loop requires a value-carrying break; loops with only `return`/`continue` do not
+acquire a special never type. Loops are otherwise conservatively considered able
+to finish. See `examples/loop-values.nov` for a search loop returning its result.
+
+Loop IR owns separate condition, body, and optional continuation ranges, with
+checked break operands/result types. Verification checks nesting, terminal paths,
+and region-private references. Only outer slots carry mutable state across
+backedges. C emission evaluates ordered instructions in the correct region, rather
+than hoisting snapshots before the loop. Managed loop results stay rooted across
+allocations and function returns. Iterator/range loops, loop `else`, and labels
+remain unsupported and diagnosed.
 
 Format files in place with `zig build run -- fmt file.nov`, or use
 `zig build run -- fmt --check file.nov` to check formatting without writing.
@@ -392,7 +420,8 @@ promised to survive replacement.
 
 Formatting supports scalar `let`/`let mut`
 declarations, literals and operators, function signatures and bodies, calls (including
-`@print`/`@println`), local blocks, `if`/`else if`/`else`, condition and unconditional loops, returns,
+`@print`/`@println`), local blocks, `if`/`else if`/`else`, condition and unconditional
+loops with optional continuation clauses and value breaks, returns,
 unlabeled `break`/`continue`, and direct identifier assignments (`=`, `+=`, `-=`,
 `*=`, `/=`, `%=`). Scalar array annotations (`[]bool`, fixed-width integer types,
 `[]int`/`[]uint`), literals (including empty `[]`), indexing (including negative
@@ -407,7 +436,7 @@ not enable array globals or new language semantics. Other members, `.len` writes
 indexed compound stores and stores through computed bases remain unsupported.
 Nested array annotations, directly nested literals/indexing, slices, pointers,
 other memory/container forms, labels,
-value-carrying breaks, iterator/other loop forms, attributes, quoted identifiers,
+iterator/other unsupported loop forms, attributes, quoted identifiers,
 BOMs and shebangs remain unsupported or invalid. Unsupported syntax is reported
 without modifying the file. Formatted output is reparsed and checked for structural,
 token, and comment preservation before atomic replacement; any failed preservation
@@ -926,13 +955,14 @@ let x: Option(int) = if is_even {
 ```
 
 ## Loop
-Condition-based `loop condition { ... }` and unconditional `loop { ... }` are
-supported by `check`, semantic checking, the C backend and formatter. Both yield
-`void`, require a `void` body, and support innermost unlabeled `break`/`continue`
-and function returns. An unconditional loop repeats until control exits it; it
-has no special infinite-loop result type, so a nonvoid function still needs a
-result after the loop. See the executable subset above for scope and evaluation
-rules.
+Condition-based `loop condition { ... }` and unconditional `loop { ... }` support
+optional `: continuation` clauses in the parser, semantic checker, C backend and
+formatter. Continuing body/continuation paths must yield `void`; unlabeled
+`break`/`continue` target the innermost loop. Conditional loops yield `void`.
+Unconditional loops can yield `break value`, inferred from known break types or
+checked against the expected type. Loops without value breaks do not acquire a
+never type. See the executable subset above for continuation routing, scopes,
+copying and result rules.
 
 Two adjacent blocks, `loop { booleanExpression } { body }`, remain a block
 condition followed by a body. A newline before the second `{` ends the first
@@ -949,8 +979,8 @@ let main: () -> void = {
 }
 ```
 
-Other forms below describe intended syntax; only the condition and unconditional
-forms are currently executable.
+The condition/unconditional forms and continuation clauses below are executable.
+Iteration/ranges, references, labels, and loop `else` still describe intended syntax.
 
 ```nov
 ; items can be an array, a slice, a string or an iterator
@@ -982,8 +1012,8 @@ loop x > 10 {}
 ; infinite loop
 loop {}
 
-; "zig while" loop
-let mut i = 0
+; continuation loop (executable with explicit integer context)
+let mut i: int = 0
 loop i < 100 : i += 2 {}
 
 ; else branch
@@ -1002,9 +1032,11 @@ let rangeHasNumber: (begin: uint, end: uint, number: uint) -> bool = {
 
 ## Break & Continue
 Unlabeled `break` and `continue` target the innermost loop, including from nested
-blocks, branches and short-circuit expressions. `break` carries no value in the
-current executable subset; labels and value-carrying breaks are diagnosed as
-unsupported.
+blocks, branches and short-circuit expressions. Unconditional loops support
+`break value`; conditional loops currently support only bare `break`. With a
+continuation clause, body-side `continue` runs the continuation; condition-side
+or continuation-side `continue` reevaluates the condition directly. `break` and
+`return` skip the continuation. Labels remain unsupported.
 
 ## Defer
 TODO: same as zig

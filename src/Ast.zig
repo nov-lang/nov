@@ -587,6 +587,7 @@ pub fn firstToken(self: Ast, node: Node.Index) TokenIndex {
         .@"if",
         .if_else,
         .loop_condition,
+        .loop_cont,
         .@"continue",
         .@"break",
         .@"return",
@@ -677,7 +678,16 @@ pub fn firstToken(self: Ast, node: Node.Index) TokenIndex {
             if (lbrace >= 2 and token_tags[lbrace - 1] == .colon and
                 token_tags[lbrace - 2] == .identifier)
             {
-                end_offset += 2;
+                // A bare block continuation also follows `identifier :`, but
+                // that colon belongs to the loop header, not a block label.
+                const separator = for (tags, 0..) |tag, i| {
+                    if (tag != .loop_cont) continue;
+                    const loop = self.fullLoop(@intCast(i)).?;
+
+                    const header_end = if (loop.condition == 0) main_tokens[i] else self.lastToken(loop.condition);
+                    if (header_end + 1 == lbrace - 1) break true;
+                } else false;
+                if (!separator) end_offset += 2;
             }
             return lbrace - end_offset;
         },
@@ -750,6 +760,8 @@ pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
         .array_type,
         .@"defer",
         => n = datas[n].rhs,
+
+        .loop_cont => n = self.extraData(datas[n].rhs, Node.LoopCont).body,
 
         .field_access,
         .unwrap,
@@ -1096,6 +1108,21 @@ fn fullFnProtoComponents(self: Ast, info: full.FnProto.Components) full.FnProto 
 pub fn fullDecl(self: Ast, node: Node.Index) ?full.Decl {
     return switch (self.nodes.items(.tag)[node]) {
         .decl => self.decl(node),
+        else => null,
+    };
+}
+
+pub fn fullLoop(self: Ast, node: Node.Index) ?struct { condition: Node.Index, continuation: Node.Index, body: Node.Index } {
+    return switch (self.nodes.items(.tag)[node]) {
+        .loop_condition => blk: {
+            const data = self.nodes.items(.data)[node];
+            break :blk .{ .condition = data.lhs, .continuation = 0, .body = data.rhs };
+        },
+        .loop_cont => blk: {
+            const data = self.nodes.items(.data)[node];
+            const extra = self.extraData(data.rhs, Node.LoopCont);
+            break :blk .{ .condition = data.lhs, .continuation = extra.continuation, .body = extra.body };
+        },
         else => null,
     };
 }
@@ -1528,6 +1555,8 @@ pub const Node = struct {
         range,
         /// `loop lhs rhs`: optional boolean condition (0 for unconditional) and lexical body block.
         loop_condition,
+        /// Optional condition in lhs (0 for unconditional), LoopCont extra in rhs.
+        loop_cont,
         /// `if lhs {}`. rhs is the block.
         @"if",
         /// `if lhs {} else {}`. `If[rhs]`.
@@ -1620,6 +1649,11 @@ pub const Node = struct {
         mutable: bool,
         /// Can be Parser.null_node
         type_node: u31,
+    };
+
+    pub const LoopCont = struct {
+        continuation: Index,
+        body: Index,
     };
 
     pub const If = struct {

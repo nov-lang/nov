@@ -234,10 +234,15 @@ fn renderExpression(self: *Render, node: Ast.Node.Index, space: Space) RenderErr
             }
             return self.renderToken(block.ast.rbrace, space);
         },
-        .loop_condition => {
+        .loop_condition, .loop_cont => {
+            const loop = ast.fullLoop(node).?;
             try self.renderToken(main_tokens[node], .space);
-            if (datas[node].lhs != 0) try self.renderExpression(datas[node].lhs, .space);
-            return self.renderExpression(datas[node].rhs, space);
+            if (loop.condition != 0) try self.renderExpression(loop.condition, .space);
+            if (loop.continuation != 0) {
+                try self.renderToken(ast.firstToken(loop.continuation) - 1, .space);
+                try self.renderExpression(loop.continuation, .space);
+            }
+            return self.renderExpression(loop.body, space);
         },
 
         .@"defer" => {

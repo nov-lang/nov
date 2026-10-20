@@ -111,6 +111,8 @@ fn checkInner(module: *Module, ir: *Ir, types: []const ?Ir.TypeId, id: Module.De
 }
 
 const Context = struct {
+    const LoopContext = struct { unconditional: bool, result: ?Known, valued_break: bool = false };
+
     module: *Module,
     ir: *Ir,
     types: []const ?Ir.TypeId,
@@ -120,7 +122,7 @@ const Context = struct {
     // expression has no merge value, and enclosing expressions alias its exit.
     terminated: bool = false,
     terminal: ?Ir.ValueId = null,
-    loop_depth: usize = 0,
+    loop_context: ?*LoopContext = null,
     bindings: std.StringHashMapUnmanaged(Binding) = .empty,
     locals: std.ArrayList([]const u8) = .empty,
 
@@ -255,6 +257,62 @@ const Context = struct {
         return .{ .ty = try self.ir.internType(.void) };
     }
 
+    // Search only this loop's break scope. Like probeBlock, temporary bindings
+    // and type diagnostics are rolled back; no initializers are evaluated.
+    fn probeBreaks(self: *Context, node: Ast.Node.Index, depth: usize) Error!?Known {
+        if (node == 0 or depth >= max_recursive_depth) return null;
+        const ast = &self.module.ast;
+        const data = ast.nodes.items(.data)[node];
+        switch (ast.nodes.items(.tag)[node]) {
+            .loop_condition, .loop_cont => return null,
+            .@"break" => return if (data.rhs != 0) self.probe(data.rhs, depth + 1) else null,
+            .block, .block_two, .block_newline, .block_two_newline => {
+                const start = self.locals.items.len;
+                defer self.restoreScope(start);
+                const diagnostics_start = self.module.diagnostics.items.len;
+                defer self.module.diagnostics.shrinkRetainingCapacity(diagnostics_start);
+                var buffer: [2]Ast.Node.Index = undefined;
+                for (ast.fullBlock(&buffer, node).?.ast.statements) |statement| {
+                    const tag = ast.nodes.items(.tag)[statement];
+                    if (tag == .decl) {
+                        const decl = ast.decl(statement).ast;
+                        if (try self.probeBreaks(decl.init_node, depth + 1)) |known| return known;
+                        const token = decl.let_token + 1 + @as(u32, @intFromBool(decl.is_mutable));
+                        const name = ast.tokenSlice(token);
+                        if (self.conflict(name) != null or isPrimitive(name)) return null;
+                        const known: ?Known = if (decl.type_node != 0)
+                            if (try TypeResolver.resolve(self.module, self.ir, decl.type_node)) |ty| .{ .ty = ty } else null
+                        else if (decl.init_node != 0) try self.probe(decl.init_node, depth + 1) else null;
+                        if (known) |value| try self.bindLocal(name, .{ .known = value, .name_span = self.module.tokenSpan(token) });
+                    } else {
+                        if (try self.probeBreaks(statement, depth + 1)) |known| return known;
+                        if (tag == .@"return" or tag == .@"break" or tag == .@"continue") break;
+                    }
+                }
+            },
+            .@"if", .if_else => {
+                const branch = ast.fullIf(node).?.ast;
+                return (try self.probeBreaks(branch.cond_expr, depth + 1)) orelse
+                    (try self.probeBreaks(branch.then_expr, depth + 1)) orelse
+                    (try self.probeBreaks(branch.else_expr, depth + 1));
+            },
+            .call, .call_one => {
+                const call = ast.fullCall(node).?;
+                if (try self.probeBreaks(call.ast.fn_expr, depth + 1)) |known| return known;
+                for (call.ast.args) |arg| if (try self.probeBreaks(arg, depth + 1)) |known| return known;
+            },
+            .array_init, .array_init_comma, .array_init_two, .array_init_two_comma => {
+                var buffer: [2]Ast.Node.Index = undefined;
+                for (self.arrayElements(node, &buffer)) |element| if (try self.probeBreaks(element, depth + 1)) |known| return known;
+            },
+            .negation, .bit_not, .bool_not, .@"return" => return self.probeBreaks(data.rhs, depth + 1),
+            .field_access => return self.probeBreaks(data.lhs, depth + 1),
+            .add, .sub, .mul, .div, .mod, .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal, .bool_and, .bool_or, .array_access, .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod => return (try self.probeBreaks(data.lhs, depth + 1)) orelse (try self.probeBreaks(data.rhs, depth + 1)),
+            else => {},
+        }
+        return null;
+    }
+
     fn span(self: *Context, node: Ast.Node.Index) Module.Span {
         return self.module.tokenSpan(self.module.ast.nodes.items(.main_token)[node]);
     }
@@ -311,7 +369,13 @@ const Context = struct {
             },
             .field_access => if (std.mem.eql(u8, ast.tokenSlice(data.rhs), "len")) .{ .ty = try self.ir.internType(.{ .integer = .{ .signedness = .unsigned, .bits = Ir.native_pointer_bits } }) } else null,
             .block, .block_two, .block_newline, .block_two_newline => try self.probeBlock(node, depth),
-            .loop_condition, .@"if", .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod => .{ .ty = try self.ir.internType(.void) },
+            .loop_condition, .loop_cont => blk: {
+                const loop = ast.fullLoop(node).?;
+                if (loop.condition != 0) break :blk .{ .ty = try self.ir.internType(.void) };
+                break :blk (try self.probeBreaks(loop.body, depth + 1)) orelse
+                    (if (loop.continuation != 0) try self.probeBreaks(loop.continuation, depth + 1) else null);
+            },
+            .@"if", .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod => .{ .ty = try self.ir.internType(.void) },
             .if_else => blk: {
                 const branch = ast.fullIf(node).?.ast;
                 break :blk (try self.probe(branch.then_expr, depth + 1)) orelse try self.probe(branch.else_expr, depth + 1);
@@ -617,42 +681,66 @@ const Context = struct {
             },
             .@"break", .@"continue" => {
                 const is_break = ast.nodes.items(.tag)[node] == .@"break";
-                if (data.lhs != 0 or (is_break and data.rhs != 0)) return self.fail(.unsupported_loop_control, node, null);
-                if (self.loop_depth == 0) return self.fail(.loop_control_outside_loop, node, null);
+                if (data.lhs != 0) return self.fail(.unsupported_loop_control, node, null);
+                const loop = self.loop_context orelse return self.fail(.loop_control_outside_loop, node, null);
                 const unit = try self.ir.internType(.void);
+                if (is_break) {
+                    if (data.rhs != 0) {
+                        if (!loop.unconditional) return self.fail(.conditional_value_break, node, null);
+                        const ty = (try self.expression(data.rhs, loop.result, depth + 1)) orelse return null;
+                        if (self.terminated) return if (expected) |want| want.ty else unit;
+                        if (loop.result == null) loop.result = .{ .ty = ty };
+                        loop.valued_break = self.ir.getType(ty).? != .void or loop.valued_break;
+                        try self.copyNode(data.rhs, ty);
+                    } else {
+                        if (loop.result) |want| {
+                            if (want.ty != unit) return self.fail(.expression_type_mismatch, node, want.annotation);
+                        } else loop.result = .{ .ty = unit };
+                    }
+                }
                 if (self.emitter) |emitter| {
-                    try emitter.record(node, unit, self.irSpan(node), if (is_break) .loop_break else .loop_continue);
+                    try emitter.record(node, unit, self.irSpan(node), if (is_break) .{ .loop_break = if (data.rhs != 0) try emitter.value(data.rhs) else null } else .loop_continue);
                     self.terminal = try emitter.value(node);
                 }
                 self.terminated = true;
                 return if (expected) |want| want.ty else unit;
             },
-            .loop_condition => {
+            .loop_condition, .loop_cont => {
+                const loop = ast.fullLoop(node).?;
                 const unit = try self.ir.internType(.void);
                 const boolean = try self.ir.internType(.boolean);
-                self.loop_depth += 1;
-                defer self.loop_depth -= 1;
+                var context: LoopContext = .{ .unconditional = loop.condition == 0, .result = if (loop.condition == 0) hint else .{ .ty = unit } };
+                const parent = self.loop_context;
+                self.loop_context = &context;
+                defer self.loop_context = parent;
                 const condition_start: u32 = if (self.emitter) |emitter| @intCast(emitter.instructions.items.len) else 0;
-                const condition = if (data.lhs != 0) try self.expression(data.lhs, .{ .ty = boolean }, depth + 1) else boolean;
-                // The synthetic condition has a real source span but no AST/token identity.
+                const condition = if (loop.condition != 0) try self.expression(loop.condition, .{ .ty = boolean }, depth + 1) else boolean;
                 const condition_value: ?Ir.ValueId = if (self.emitter) |emitter|
-                    if (condition == null) null else if (data.lhs != 0) try emitter.value(data.lhs) else try emitter.append(boolean, self.irSpan(node), .{
+                    if (condition == null) null else if (loop.condition != 0) try emitter.value(loop.condition) else try emitter.append(boolean, self.irSpan(node), .{
                         .constant = try self.ir.internConstant(.{ .ty = boolean, .value = .{ .boolean = true } }),
                     })
                 else
                     null;
                 self.terminated = false;
                 const body_start: u32 = if (self.emitter) |emitter| @intCast(emitter.instructions.items.len) else 0;
-                const body = try self.expression(data.rhs, .{ .ty = unit }, depth + 1);
+                const body = try self.expression(loop.body, .{ .ty = unit }, depth + 1);
                 self.terminated = false;
-                if (condition == null or body == null) return null;
-                if (self.emitter) |emitter| try emitter.record(node, unit, self.irSpan(node), .{ .loop = .{
+                const continuation_start: ?u32 = if (loop.continuation != 0 and self.emitter != null) @intCast(self.emitter.?.instructions.items.len) else null;
+                const continuation = if (loop.continuation != 0) try self.expression(loop.continuation, .{ .ty = unit }, depth + 1) else unit;
+                self.terminated = false;
+                if (condition == null or body == null or continuation == null) return null;
+                const result = if (context.result) |known| known.ty else unit;
+                if (result != unit and !context.valued_break) return self.fail(.loop_missing_value_break, node, null);
+                if (self.emitter) |emitter| try emitter.record(node, result, self.irSpan(node), .{ .loop = .{
+                    .unconditional = loop.condition == 0,
                     .condition_start = condition_start,
                     .body_start = body_start,
+                    .continuation_start = continuation_start,
                     .condition = condition_value.?,
-                    .body = try emitter.value(data.rhs),
+                    .body = try emitter.value(loop.body),
+                    .continuation = if (loop.continuation != 0) try emitter.value(loop.continuation) else null,
                 } });
-                return self.fit(unit, expected, node);
+                return self.fit(result, expected, node);
             },
             .@"return" => {
                 if (data.rhs != 0) {
@@ -982,13 +1070,13 @@ test "condition loops diagnose controls types scope and unreachable tails" {
     for ([_]struct { body: []const u8, tag: Module.Diagnostic.Tag }{
         .{ .body = "{break}", .tag = .loop_control_outside_loop },
         .{ .body = "{continue}", .tag = .loop_control_outside_loop },
-        .{ .body = "loop true {break 1}", .tag = .unsupported_loop_control },
+        .{ .body = "loop true {break 1}", .tag = .conditional_value_break },
         .{ .body = "loop true {break :outer}", .tag = .unsupported_loop_control },
         .{ .body = "loop true {continue :outer}", .tag = .unsupported_loop_control },
         .{ .body = "loop 1 {}", .tag = .literal_type_mismatch },
         .{ .body = "loop {true}", .tag = .literal_type_mismatch },
         .{ .body = "{let n: int = loop {break}\n}", .tag = .expression_type_mismatch },
-        .{ .body = "loop {break 1}", .tag = .unsupported_loop_control },
+        .{ .body = "loop {break 1}", .tag = .literal_type_mismatch },
         .{ .body = "loop {continue :outer}", .tag = .unsupported_loop_control },
         .{ .body = "loop {continue\n@println(true)}", .tag = .unreachable_code },
         .{ .body = "{loop {break}\ncontinue}", .tag = .loop_control_outside_loop },
@@ -1016,7 +1104,7 @@ test "condition loops diagnose controls types scope and unreachable tails" {
     }
 }
 
-test "unconditional loops stay void even when all body paths return or continue" {
+test "value loops require a value break rather than introducing a never type" {
     for ([_][]const u8{ "loop {}", "loop {continue}", "loop {return 1}" }) |body| {
         const source = try std.fmt.allocPrint(std.testing.allocator, "let f: () -> int = {s}", .{body});
         defer std.testing.allocator.free(source);
@@ -1027,7 +1115,71 @@ test "unconditional loops stay void even when all body paths return or continue"
         defer sema.deinit();
         try std.testing.expect(!sema.lowering_complete);
         try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
-        try std.testing.expectEqual(Module.Diagnostic.Tag.expression_type_mismatch, module.diagnostics.items[0].tag);
+        try std.testing.expectEqual(Module.Diagnostic.Tag.loop_missing_value_break, module.diagnostics.items[0].tag);
+    }
+}
+
+test "loop values infer from typed breaks with exact branch types and scopes" {
+    const source =
+        \\let id: (n: int) -> int = n
+        \\let choose: (c: bool, n: int) -> int = loop {
+        \\    if c {break 1}
+        \\    let local = n
+        \\    break local
+        \\}
+        \\let main: () -> void = {
+        \\    let value = loop {let n: int = 0
+        \\        break n}
+        \\    let flag = loop {break true}
+        \\    let text = loop {break "result" + "!"}
+        \\    let array = loop {break [value, 1]}
+        \\    let callback = loop {break id}
+        \\    let nested = loop {let inner = loop {break callback(value)}
+        \\        break inner}
+        \\    let arithmetic = 1 + loop {break value}
+        \\    let mut count: int = 0
+        \\    loop count < 3 : {count += 1} {
+        \\        if count == 1 {continue}
+        \\        @println(count)
+        \\    }
+        \\    let from_update: int = loop : {break 7} {continue}
+        \\    @println(value, flag, text, array[-1], nested, arithmetic, from_update, choose(false, 9))
+        \\}
+    ;
+    var module = try Module.init(std.testing.allocator, "loop-values.nov", source);
+    defer module.deinit();
+    try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+    var sema = try @import("Lowering.zig").lower(&module);
+    defer sema.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+}
+
+test "loop value and continuation diagnostics preserve exact types and lexical scopes" {
+    for ([_]struct { source: []const u8, tag: Module.Diagnostic.Tag }{
+        .{ .source = "let f: () -> void = {let x = loop {break 1}\n}", .tag = .literal_needs_type },
+        .{ .source = "let f: () -> int = loop {if true {break} else {break 1}}", .tag = .expression_type_mismatch },
+        .{ .source = "let f: () -> int = loop {if true {break 1} else {break false}}", .tag = .literal_type_mismatch },
+        .{ .source = "let f: (a: i8, b: i16) -> void = {let x = loop {if true {break a} else {break b}}\n}", .tag = .expression_type_mismatch },
+        .{ .source = "let f: () -> int = loop {loop {break true}}", .tag = .literal_type_mismatch },
+        .{ .source = "let f: () -> void = {loop true : {} {let hidden: int = 1\n}\n@println(hidden)}", .tag = .unknown_name },
+        .{ .source = "let f: () -> void = loop true : @println(hidden) {let hidden: int = 1\n}", .tag = .unknown_name },
+        .{ .source = "let f: () -> void = loop {let hidden = true\nhidden} : @println(hidden) {}", .tag = .unknown_name },
+        .{ .source = "let f: () -> void = loop true : true {}", .tag = .literal_type_mismatch },
+        .{ .source = "let f: () -> void = loop true : {break 1} {}", .tag = .conditional_value_break },
+        .{ .source = "let f: () -> void = {loop false : {let hidden = true\n} {}\n@println(hidden)}", .tag = .unknown_name },
+        .{ .source = "let f: () -> void = {loop {if true {break missing}}}", .tag = .unknown_name },
+    }) |case| {
+        var module = try Module.init(std.testing.allocator, "bad-loop.nov", case.source);
+        defer module.deinit();
+        try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+        var sema = try @import("Lowering.zig").lower(&module);
+        defer sema.deinit();
+        errdefer std.debug.print("loop diagnostic case: {s}\n", .{case.source});
+        try std.testing.expect(module.hasErrors());
+        try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
+        try std.testing.expect(!sema.lowering_complete);
     }
 }
 
@@ -1594,6 +1746,10 @@ test "body checking rolls back diagnostics and owned storage on allocation failu
         "let f: (p: i8) -> void = {let a = [128, p]\n}",
         "let f: () -> void = {let n = []\n}",
         "let f: () -> void = {let n = {}\n}",
+        "let f: (p: int) -> void = {let value = loop {if true {break 1}\nlet local = p\nbreak local}\n@println(value)}",
+        "let f: (p: int) -> void = {let value = loop {if true {break 1}\nlet local: missing = p\nbreak local}\n}",
+        "let f: () -> void = loop false : {let hidden = true\n} {@println(hidden)}",
+        "let f: () -> int = loop {if true {break 1} else {break false}}",
     }) |source| {
         try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
     }

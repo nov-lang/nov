@@ -131,6 +131,7 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     _ = fixtures.add("if-program.nov", "let divide: (n: int) -> int = 1 / n\nlet main: () -> void = {\nlet n: int = if false {divide(0)} else if true {42} else {divide(0)}\nif n == 42 {@println(n)}\n}\n");
     _ = fixtures.add("return-program.nov", "let f: (c: bool) -> int = {if c {{return 42}}\n1 / 0}\nlet main: () -> void = {let b: bool = false and {return}\n@println(f(true), b)\nreturn}\n");
     _ = fixtures.add("mutable-program.nov", "let f: (c: bool) -> int = {let mut n: int = 1\nn += if c {return 42} else {2}\nn}\nlet main: () -> void = {let mut n: int = 1\nif true {n += 2}\nlet b: bool = false and {n = 99\ntrue}\n@println(n, b, f(true), f(false))}\n");
+    _ = fixtures.add("loop-values.nov", @embedFile("examples/loop-values.nov"));
     _ = fixtures.add("loop-program.nov", "let f: () -> int = {let mut n: int = 0\nloop {if n == 5 {break}\nn += 1\nloop false {continue}\nif n == 2 {continue}\nif n == 4 {break}\n@println(n)}\nn}\nlet main: () -> void = @println(f())\n");
     _ = fixtures.add("break-outside.nov", "let main: () -> void = {break}\n");
     _ = fixtures.add("value-break.nov", "let main: () -> void = loop true {break 1}\n");
@@ -190,9 +191,11 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         .{ .name = "reject array length writes", .args = &.{ "emit-c", "array-length-write.nov" }, .exit_code = 1, .stderr_match = "array .len is read-only" },
         .{ .name = "check semantic loops", .args = &.{ "check", "--semantic", "loop-program.nov" }, .exit_code = 0 },
         .{ .name = "check break outside loop", .args = &.{ "check", "--semantic", "break-outside.nov" }, .exit_code = 1, .stderr_match = "break and continue require an enclosing loop" },
-        .{ .name = "emit rejects value break", .args = &.{ "emit-c", "value-break.nov" }, .exit_code = 1, .stderr_match = "labeled and value-carrying loop control are not supported" },
+        .{ .name = "emit rejects conditional value break", .args = &.{ "emit-c", "value-break.nov" }, .exit_code = 1, .stderr_match = "conditional loops cannot break with a value" },
+        .{ .name = "check loop values and continuations", .args = &.{ "check", "--semantic", "loop-values.nov" }, .exit_code = 0 },
+        .{ .name = "fmt loop values and continuations", .args = &.{ "fmt", "--check", "loop-values.nov" }, .exit_code = 0 },
         .{ .name = "fmt condition loops detects changes", .args = &.{ "fmt", "--check", "loop-program.nov" }, .exit_code = 1, .stderr_match = "file is not formatted" },
-        .{ .name = "fmt value break remains unsupported", .args = &.{ "fmt", "--check", "value-break.nov" }, .exit_code = 1, .stderr_match = "formatting this syntax is not supported yet; file unchanged" },
+        .{ .name = "fmt value break checks syntax only", .args = &.{ "fmt", "--check", "value-break.nov" }, .exit_code = 1, .stderr_match = "file is not formatted" },
         .{ .name = "fmt scalar arrays example", .args = &.{ "fmt", "--check", "scalar-arrays.nov" }, .exit_code = 0 },
         .{ .name = "fmt rejects array length writes", .args = &.{ "fmt", "--check", "array-length-write.nov" }, .exit_code = 1, .stderr_match = "formatting this syntax is not supported yet; file unchanged" },
         .{ .name = "fmt executable example", .args = &.{ "fmt", "--check", "checkout.nov" }, .exit_code = 0 },
@@ -278,6 +281,19 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
 
     // An isolated PATH exercises real `zig cc` discovery, independent of host CC.
     for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+        const value_loops = b.addRunArtifact(exe);
+        value_loops.step.name = b.fmt("CLI: loop values and continuations ({s})", .{mode});
+        value_loops.setCwd(fixtures.getDirectory());
+        value_loops.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+        value_loops.setEnvironmentVariable("NOV_CC", "");
+        value_loops.setEnvironmentVariable("CC", "");
+        value_loops.addArgs(&.{ "run", "loop-values.nov" });
+        if (mode.len != 0) value_loops.addArg(mode);
+        value_loops.expectExitCode(0);
+        value_loops.expectStdOutEqual("First multiple: found 28 42\n");
+        value_loops.expectStdErrEqual("");
+        test_step.dependOn(&value_loops.step);
+
         const strings = b.addRunArtifact(exe);
         strings.step.name = b.fmt("CLI: UTF8 strings and NUL ({s})", .{mode});
         strings.setCwd(fixtures.getDirectory());

@@ -426,6 +426,14 @@ let getName: (s: string) -> string = {
 ```
 
 # Loop
+Approved and implemented: condition/unconditional loops support optional
+`: continuation` clauses. Body-side `continue` runs the continuation; `continue`
+in the condition or continuation reevaluates the condition directly. `break` and
+`return` skip the continuation. Unconditional loops can yield `break value` with
+an exact inferred/contextual result type. Conditional loops remain void until
+zero-iteration/loop-else result rules are settled. Labels and iterator/range forms
+remain deferred; see README for executable syntax and restrictions.
+
 - loop over multiple values with iterators, how? they need to have the same length
 - allow backward iteration, this means that indexes are int instead of uint?
   - what about backward iteration on arrays, etc...?
