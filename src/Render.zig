@@ -236,7 +236,7 @@ fn renderExpression(self: *Render, node: Ast.Node.Index, space: Space) RenderErr
         },
         .loop_condition => {
             try self.renderToken(main_tokens[node], .space);
-            try self.renderExpression(datas[node].lhs, .space);
+            if (datas[node].lhs != 0) try self.renderExpression(datas[node].lhs, .space);
             return self.renderExpression(datas[node].rhs, space);
         },
 

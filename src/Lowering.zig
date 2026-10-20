@@ -307,6 +307,29 @@ test "loop regions own repeated conditions bodies and spans after source destruc
     try sema.ir.verify();
 }
 
+test "unconditional loops reuse verified regions with source bounded true constants" {
+    var module = try Module.init(std.testing.allocator, "loop.nov", "let f: () -> void = loop {break}");
+    var sema = lower(&module) catch |err| {
+        module.deinit();
+        return err;
+    };
+    defer sema.deinit();
+    const failed = module.hasErrors();
+    const body = sema.ir.functions.items[0].body.?;
+    const loop = body.instructions[@intFromEnum(body.result)];
+    const region = loop.op.loop;
+    const condition = body.instructions[@intFromEnum(region.condition)];
+    try std.testing.expectEqualStrings("loop {break}", module.ast.source[loop.span.start..loop.span.end]);
+    try std.testing.expectEqual(loop.span, condition.span);
+    try std.testing.expectEqual(true, sema.ir.constants.items[@intFromEnum(condition.op.constant)].value.boolean);
+    module.deinit();
+    try std.testing.expect(!failed);
+    try std.testing.expect(sema.lowering_complete);
+    try std.testing.expectEqual(region.condition_start + 1, region.body_start);
+    try std.testing.expect(!Ir.terminates(body, body.result));
+    try sema.ir.verify();
+}
+
 test "return spans and owned terminal regions survive source destruction" {
     var module = try Module.init(std.testing.allocator, "return.nov",
         \\let f: (c: bool) -> int = if c {{return 42}} else {return 43}

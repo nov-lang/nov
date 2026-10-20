@@ -4,7 +4,7 @@ const Parser = @import("Parser.zig");
 const Tokenizer = @import("Tokenizer.zig");
 
 /// Supports scalar declarations/operators plus function signatures, calls,
-/// local blocks, if/else, condition loops, returns, unlabeled loop controls,
+/// local blocks, if/else, condition/unconditional loops, returns, unlabeled loop controls,
 /// direct identifier assignments, scalar array types/literals/indexing/.len,
 /// and indexed assignments to direct identifiers. Formatting is syntactic,
 /// not a scope, mutability, or type check. Preserves line/doc comments and tokens.
@@ -399,6 +399,10 @@ test "nested list expansion and empty block comments stabilize on the first pass
     for ([_][:0]const u8{
         "let f:()->void={loop true {let x:int={break}\n@println(x)}}",
         "let f:()->void={loop true {loop false {continue}\nbreak}}",
+        "let f:()->void=loop {}",
+        "let f:()->void=loop ; body\n{; entry\nloop false {continue}\nbreak}",
+        "let f:()->void={loop {break} ; end\n{}}",
+        "let f:()->void=loop {true} {loop {break}\nbreak}",
         "let f:()->void={return\n}\nlet g:()->void={}",
         "let f:(\n)->void=call(\n)",
         "let f:(\n x:int\n)->int=call(\n x\n)",
@@ -419,7 +423,7 @@ test "comments and continuations inside executable forms survive" {
 }
 
 fn testExecutableAllocationFailures(allocator: std.mem.Allocator) !void {
-    const output = try format(allocator, "let f:(n:int)->int={let mut x:int=n\nloop x > 0 {x -= 1\nif x == 2 {break}\ncontinue}\nreturn x}\n");
+    const output = try format(allocator, "let f:(n:int)->int={let mut x:int=n\nloop {if x == 0 {break}\nx -= 1\nif x == 2 {break}\ncontinue}\nreturn x}\n");
     defer allocator.free(output);
 }
 

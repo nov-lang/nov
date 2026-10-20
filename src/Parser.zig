@@ -610,22 +610,33 @@ fn parseElseExpr(self: *Parser) Error!Node.Index {
 // loop x, y, z in a, b, c {}
 
 // loop i < 100 : i += 1 {}
-// loop {}
 // loop ... {} else
 /// LoopExpr <- KEYWORD_loop LoopInput? Block ElseExpr?
 /// LoopInput
 ///     <- (AMPERSAND? IDENTIFIER)+ KEYWORD_in (Expr (DOT2 Expr?)?)+
 ///      / Expr (COLON AssignExpr)?
-/// Currently only the condition-and-block form is enabled. Other documented
+/// Condition-and-block and unconditional block forms are enabled. Other documented
 /// forms fail at the loop keyword and use the usual balanced recovery.
 fn parseLoopExpr(self: *Parser) Error!Node.Index {
     const loop_token = self.assertToken(.keyword_loop);
     if (loop_token >= 2 and self.token_tags[loop_token - 1] == .colon or self.token_tags[self.tok_i] == .eof)
         return self.failMsg(.{ .tag = .unsupported_loop, .token = loop_token });
-    const condition = try self.expectExpr();
-    if (self.nodes.items(.tag)[condition] == .in or self.token_tags[self.tok_i] != .l_brace)
-        return self.failMsg(.{ .tag = .unsupported_loop, .token = loop_token });
-    const body = try self.expectBlock();
+    var condition = try self.expectExpr();
+    const body = if (self.token_tags[self.tok_i] == .l_brace) body: {
+        if (self.nodes.items(.tag)[condition] == .in)
+            return self.failMsg(.{ .tag = .unsupported_loop, .token = loop_token });
+        break :body try self.expectBlock();
+    } else body: {
+        if (self.token_tags[self.tok_i] == .colon or self.token_tags[self.tok_i] == .comma)
+            return self.failMsg(.{ .tag = .unsupported_loop, .token = loop_token });
+        switch (self.nodes.items(.tag)[condition]) {
+            .block, .block_two, .block_newline, .block_two_newline => {},
+            else => return self.failMsg(.{ .tag = .unsupported_loop, .token = loop_token }),
+        }
+        const block = condition;
+        condition = null_node;
+        break :body block;
+    };
     if (self.token_tags[self.tok_i] == .keyword_else)
         return self.failMsg(.{ .tag = .unsupported_loop, .token = loop_token });
     return self.addNode(.{ .tag = .loop_condition, .main_token = loop_token, .data = .{ .lhs = condition, .rhs = body } });
@@ -1637,6 +1648,40 @@ test "parser ownership survives allocation failures" {
     }
 }
 
+test "unconditional loops preserve blocks ambiguity comments and EOF spans" {
+    for ([_]struct { text: [:0]const u8, conditional: bool }{
+        .{ .text = "loop {}", .conditional = false },
+        .{ .text = "loop {break}", .conditional = false },
+        .{ .text = "loop ; body\n{continue}", .conditional = false },
+        .{ .text = "loop {true} {}", .conditional = true },
+        .{ .text = "loop {true}{}", .conditional = true },
+        .{ .text = "loop\n{}", .conditional = false },
+        .{ .text = "loop {true} ; condition\n+ false {}", .conditional = true },
+        .{ .text = "loop {{break}}", .conditional = false },
+    }) |case| {
+        const source = try std.fmt.allocPrintSentinel(std.testing.allocator, "let f: () -> void = {s}", .{case.text}, 0);
+        defer std.testing.allocator.free(source);
+        var ast = try parse(std.testing.allocator, source);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+        const node = ast.decl(ast.rootDecls()[0]).ast.init_node;
+        try std.testing.expectEqual(Node.Tag.loop_condition, ast.nodes.items(.tag)[node]);
+        try std.testing.expectEqual(case.conditional, ast.nodes.items(.data)[node].lhs != 0);
+        try std.testing.expectEqualStrings("loop", ast.tokenSlice(ast.firstToken(node)));
+        try std.testing.expectEqual(source.len - 1, ast.tokens.items(.start)[ast.lastToken(node)]);
+    }
+    // A newline before a second block ends the first loop, as with condition loops.
+    var separate = try parse(std.testing.allocator, "let f: () -> void = {loop {break} ; end\n{}\n}");
+    defer separate.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), separate.errors.len);
+    for ([_][:0]const u8{ "let f = loop {", "let f = loop {break", "let f = loop {} {} else {}\nlet after = 0" }) |source| {
+        var broken = try parse(std.testing.allocator, source);
+        defer broken.deinit(std.testing.allocator);
+        try std.testing.expect(broken.errors.len != 0);
+        for (broken.errors) |err| try std.testing.expect(broken.tokens.items(.start)[err.token] <= source.len);
+    }
+}
+
 test "condition loop AST preserves nested blocks controls and source boundaries" {
     const source = "let f: () -> void = loop {true} {if false {break} else {continue}}";
     var ast = try parse(std.testing.allocator, source);
@@ -1656,10 +1701,11 @@ test "condition loop AST preserves nested blocks controls and source boundaries"
 
 test "unsupported loops diagnose their keyword and preserve following declarations" {
     const expressions = [_][]const u8{
-        "loop {}",
         "loop item in items {\nlet hidden = 0\n}",
         "loop i < 10 : i += 1 {}",
         "loop {} else {}",
+        "loop {} {} else {}",
+        "loop {} : next {}",
         "outer: loop {}",
         "outer: loop true {}",
         "loop true {} else {}",

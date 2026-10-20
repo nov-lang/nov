@@ -633,7 +633,14 @@ const Context = struct {
                 self.loop_depth += 1;
                 defer self.loop_depth -= 1;
                 const condition_start: u32 = if (self.emitter) |emitter| @intCast(emitter.instructions.items.len) else 0;
-                const condition = try self.expression(data.lhs, .{ .ty = boolean }, depth + 1);
+                const condition = if (data.lhs != 0) try self.expression(data.lhs, .{ .ty = boolean }, depth + 1) else boolean;
+                // The synthetic condition has a real source span but no AST/token identity.
+                const condition_value: ?Ir.ValueId = if (self.emitter) |emitter|
+                    if (condition == null) null else if (data.lhs != 0) try emitter.value(data.lhs) else try emitter.append(boolean, self.irSpan(node), .{
+                        .constant = try self.ir.internConstant(.{ .ty = boolean, .value = .{ .boolean = true } }),
+                    })
+                else
+                    null;
                 self.terminated = false;
                 const body_start: u32 = if (self.emitter) |emitter| @intCast(emitter.instructions.items.len) else 0;
                 const body = try self.expression(data.rhs, .{ .ty = unit }, depth + 1);
@@ -642,7 +649,7 @@ const Context = struct {
                 if (self.emitter) |emitter| try emitter.record(node, unit, self.irSpan(node), .{ .loop = .{
                     .condition_start = condition_start,
                     .body_start = body_start,
-                    .condition = try emitter.value(data.lhs),
+                    .condition = condition_value.?,
                     .body = try emitter.value(data.rhs),
                 } });
                 return self.fit(unit, expected, node);
@@ -979,6 +986,12 @@ test "condition loops diagnose controls types scope and unreachable tails" {
         .{ .body = "loop true {break :outer}", .tag = .unsupported_loop_control },
         .{ .body = "loop true {continue :outer}", .tag = .unsupported_loop_control },
         .{ .body = "loop 1 {}", .tag = .literal_type_mismatch },
+        .{ .body = "loop {true}", .tag = .literal_type_mismatch },
+        .{ .body = "{let n: int = loop {break}\n}", .tag = .expression_type_mismatch },
+        .{ .body = "loop {break 1}", .tag = .unsupported_loop_control },
+        .{ .body = "loop {continue :outer}", .tag = .unsupported_loop_control },
+        .{ .body = "loop {continue\n@println(true)}", .tag = .unreachable_code },
+        .{ .body = "{loop {break}\ncontinue}", .tag = .loop_control_outside_loop },
         .{ .body = "loop true {true}", .tag = .literal_type_mismatch },
         .{ .body = "{loop false {missing}}", .tag = .unknown_name },
         .{ .body = "{loop false {let hidden: int = 1\n}\n@println(hidden)}", .tag = .unknown_name },
@@ -1000,6 +1013,21 @@ test "condition loops diagnose controls types scope and unreachable tails" {
         try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
         try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
         try std.testing.expect(!sema.lowering_complete);
+    }
+}
+
+test "unconditional loops stay void even when all body paths return or continue" {
+    for ([_][]const u8{ "loop {}", "loop {continue}", "loop {return 1}" }) |body| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let f: () -> int = {s}", .{body});
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "loop.nov", source);
+        defer module.deinit();
+        try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+        var sema = try @import("Lowering.zig").lower(&module);
+        defer sema.deinit();
+        try std.testing.expect(!sema.lowering_complete);
+        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+        try std.testing.expectEqual(Module.Diagnostic.Tag.expression_type_mismatch, module.diagnostics.items[0].tag);
     }
 }
 

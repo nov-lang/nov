@@ -1526,7 +1526,7 @@ pub const Node = struct {
         /// rhs can be omitted.
         /// main_token is the `..` or `..=`.
         range,
-        /// `loop lhs rhs`: boolean condition and lexical body block.
+        /// `loop lhs rhs`: optional boolean condition (0 for unconditional) and lexical body block.
         loop_condition,
         /// `if lhs {}`. rhs is the block.
         @"if",

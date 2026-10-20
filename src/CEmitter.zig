@@ -1281,7 +1281,7 @@ test "array capacity and append length overflow panic before accessing backing" 
 }
 
 test "array allocation failure retries preserve roots and shutdown frees backing" {
-    for ([_][]const u8{ array_example, array_compound_effects, inferred_example, inferred_arrays, string_example, string_compound }, [_][]const u8{ "3 30 30 6\n454 15\n99 15 4\nfalse true 2\n0\n", array_compound_output, inferred_output, inferred_arrays_output, string_output, string_compound_output }) |source, output| {
+    for ([_][]const u8{ array_example, array_compound_effects, inferred_example, inferred_arrays, string_example, string_compound, unconditional_loops }, [_][]const u8{ "3 30 30 6\n454 15\n99 15 4\nfalse true 2\n0\n", array_compound_output, inferred_output, inferred_arrays_output, string_output, string_compound_output, unconditional_output }) |source, output| {
         const c = try arrayTestProgram(source);
         defer test_gpa.free(c);
         const injected = try std.mem.concat(test_gpa, u8, &.{
@@ -1316,6 +1316,47 @@ fn testArrayEmissionAllocationFailures(allocator: std.mem.Allocator, source: []c
 
 test "array compiler ownership survives every allocation failure" {
     for ([_][]const u8{ array_example, array_compound_effects, inferred_example, inferred_arrays }) |source| try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{source});
+}
+
+const unconditional_loops =
+    \\let build: (early: bool) -> string = {
+    \\    let mut text = ""
+    \\    let mut values: []int = []
+    \\    let mut n: int = 0
+    \\    loop {
+    \\        let fresh = "a" + "b"
+    \\        values += [n]
+    \\        n += 1
+    \\        loop n < 3 {loop {break}
+    \\            break}
+    \\        if n == 1 {continue}
+    \\        text += fresh
+    \\        if early {return text}
+    \\        if n == 3 {break}
+    \\    }
+    \\    @println(values.len, values[-1])
+    \\    text
+    \\}
+    \\let exit: () -> void = loop {return}
+    \\let dead: () -> void = {loop {continue}
+    \\    @println("not called")}
+    \\let main: () -> void = {exit()
+    \\    @println(build(true))
+    \\    @println(build(false))
+    \\    loop {true} {loop {break}
+    \\        break}}
+;
+const unconditional_output = "ab\n3 2\nabab\n";
+
+test "unconditional loops execute finite controls returns and managed roots after formatting" {
+    const formatted = try @import("Formatter.zig").format(test_gpa, unconditional_loops);
+    defer test_gpa.free(formatted);
+    for ([_][]const u8{ unconditional_loops, formatted }) |source| {
+        const c = try arrayTestProgram(source);
+        defer test_gpa.free(c);
+        for ([_][]const u8{ "-O0", "-O2" }) |mode|
+            try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, unconditional_output, "", mode);
+    }
 }
 
 test "condition loops repeat current reads and scope initialization with innermost controls" {
@@ -1555,6 +1596,7 @@ fn testLoopAllocationFailures(allocator: std.mem.Allocator) !void {
 
 test "loop source IR and C emission ownership survive every allocation failure" {
     try std.testing.checkAllAllocationFailures(test_gpa, testLoopAllocationFailures, .{});
+    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{unconditional_loops});
 }
 
 fn testMutableAllocationFailures(allocator: std.mem.Allocator) !void {

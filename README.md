@@ -44,7 +44,7 @@ with final-expression results are supported in function bodies. Literal defaults
 shadowing and global mutation remain deferred or unsupported.
 Lowering produces typed operations with source spans, ordered operands/call
 arguments, explicit returns, and structured regions for boolean `and`/`or`,
-`if`/`else`, and condition-based loops.
+`if`/`else`, and condition-based or unconditional loops.
 It requires immutable literal globals; unit/global block initializers are
 not lowered yet. An internal C11 backend emits verified IR, including fixed-width
 integer arithmetic and program entrypoint emission through `emit-c`.
@@ -60,7 +60,7 @@ stop semantic analysis. Globals must be immutable, explicitly typed integer,
 boolean or string literals. Functions need explicit supported signatures and bounded
 expression bodies (including forward/recursive calls, local declarations and
 assignments, nested blocks, boolean short-circuiting, `if`/`else`, explicit returns,
-condition-based loops with unlabeled `break`/`continue`, and empty void bodies).
+condition-based or unconditional loops with unlabeled `break`/`continue`, and empty void bodies).
 Inferred globals, mutable globals, nonliteral global initializers, global unit
 values are currently rejected, along with the other
 unsupported forms listed above. This is not a backend compatibility check: it
@@ -335,8 +335,9 @@ This prints `1`, `3`, and `4` on separate lines. Loop IR owns separate condition
 and body instruction ranges; verification checks nesting, terminal paths and
 region-private references. Only outer slots carry mutable state across the
 backedge. C emission reevaluates the ordered condition instructions, rather than
-hoisting a snapshot before the loop. Infinite `loop {}`, iterator/range loops,
-post-expression (`:`) loops, loop `else`, labels and value-carrying breaks remain
+hoisting a snapshot before the loop. Unconditional `loop { ... }` uses the same
+IR with a synthetic true condition and the same void-result rules. Iterator/range
+loops, post-expression (`:`) loops, loop `else`, labels and value-carrying breaks remain
 unsupported and diagnosed; no loop-result/value-break semantics are introduced.
 
 Format files in place with `zig build run -- fmt file.nov`, or use
@@ -391,7 +392,7 @@ promised to survive replacement.
 
 Formatting supports scalar `let`/`let mut`
 declarations, literals and operators, function signatures and bodies, calls (including
-`@print`/`@println`), local blocks, `if`/`else if`/`else`, condition loops, returns,
+`@print`/`@println`), local blocks, `if`/`else if`/`else`, condition and unconditional loops, returns,
 unlabeled `break`/`continue`, and direct identifier assignments (`=`, `+=`, `-=`,
 `*=`, `/=`, `%=`). Scalar array annotations (`[]bool`, fixed-width integer types,
 `[]int`/`[]uint`), literals (including empty `[]`), indexing (including negative
@@ -925,10 +926,31 @@ let x: Option(int) = if is_even {
 ```
 
 ## Loop
-Condition-based `loop condition { ... }` is supported by `check`, semantic
-checking and the C backend, with a `void` result and unlabeled `break`/`continue`.
-See the executable subset above for scope and evaluation rules. Formatting loops
-is not supported yet. Other forms below describe intended, unsupported syntax.
+Condition-based `loop condition { ... }` and unconditional `loop { ... }` are
+supported by `check`, semantic checking, the C backend and formatter. Both yield
+`void`, require a `void` body, and support innermost unlabeled `break`/`continue`
+and function returns. An unconditional loop repeats until control exits it; it
+has no special infinite-loop result type, so a nonvoid function still needs a
+result after the loop. See the executable subset above for scope and evaluation
+rules.
+
+Two adjacent blocks, `loop { booleanExpression } { body }`, remain a block
+condition followed by a body. A newline before the second `{` ends the first
+loop rather than continuing it, just as in the existing condition-loop grammar.
+
+```nov
+let main: () -> void = {
+    let mut remaining: int = 3
+    loop {
+        if remaining == 0 {break}
+        @println(remaining)
+        remaining -= 1
+    }
+}
+```
+
+Other forms below describe intended syntax; only the condition and unconditional
+forms are currently executable.
 
 ```nov
 ; items can be an array, a slice, a string or an iterator
