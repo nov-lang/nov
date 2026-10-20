@@ -729,14 +729,29 @@ let main: () -> void = {
   `-1` denoting the last element and `-len` the first. Every out-of-bounds access
   (including empty arrays and minimum native `int`) panics with
   `panic: array index out of bounds`, exit 1, identically in debug and release.
-- Plain `values[index] = element` and `values += other_array` require a mutable
-  direct local. Append accepts the same array type and self-append is safe.
-  Element compound assignments are not yet supported.
+- Plain `values[index] = element`, integer element `+=`, `-=`, `*=`, `/=`, `%=`
+  and `values += other_array` require a mutable direct local identifier base.
+  Element compound assignments use the existing wrapping arithmetic and guarded
+  division/remainder rules; bool compounds are unsupported. Append accepts the
+  same array type and self-append is safe. All assignments return `void`.
 - Evaluation is once, left-to-right: callee before arguments, literal elements in
   order, indexing base before index. Array reads capture values; read-modify-write
-  updates (`+=` and element replacement) capture the left array before index/RHS
-  effects, then store the updated value after the RHS. Bounds on replacement are
-  checked at that final update; a returning RHS does not perform it.
+  updates (append and indexed assignments) capture the left array before index/RHS
+  effects, then store the updated snapshot after the RHS. Indexed compounds evaluate
+  the index exactly once and read/bounds-check the old element from that same snapshot
+  **before** the RHS. Plain replacement needs no old element and checks bounds only
+  at its final update. A `return`, `break` or `continue` during index/RHS evaluation
+  skips the pending update; effects already performed remain visible.
+  The final store replaces the **whole local array** with the updated snapshot,
+  discarding changes to that array made by the index or RHS, including changes to
+  other elements or length. It does not reload the current array. For example:
+
+  ```nov
+  let mut a: []int = [10, 20]
+  a[-1] += {a = [99]
+      3}
+  @println(a[0], a[-1], a.len) ; 10 23 2
+  ```
 - This first implementation deliberately copies eagerly, including temporary
   snapshots. Reads and updates may allocate/copy O(n) elements; append does not yet
   promise amortized constant time or preserve spare capacity across value copies.
@@ -746,7 +761,7 @@ let main: () -> void = {
   on length growth remain undesigned. No array printing, equality, concatenation
   with `+`, slices, nested arrays, pointer/function elements, explicit aliases,
   array globals, capacity API, or iteration is delivered. The formatter supports
-    the scalar array syntax described above without extending these semantics.
+  the scalar array syntax described above without extending these semantics.
   `@print`/`@println` still accept only bool/integer values; indexing and `.len`
   can be printed.
 

@@ -477,20 +477,48 @@ const Context = struct {
         const ast = &self.module.ast;
         const data = ast.nodes.items(.data)[node];
         const target = ast.nodes.items(.data)[data.lhs];
-        if (ast.nodes.items(.tag)[node] != .assign or ast.nodes.items(.tag)[target.lhs] != .identifier) return self.fail(.unsupported_assignment_target, data.lhs, null);
+        const tag = ast.nodes.items(.tag)[node];
+        const compound = tag != .assign;
+        if (ast.nodes.items(.tag)[target.lhs] != .identifier) return self.fail(.unsupported_assignment_target, data.lhs, null);
         const name = self.module.sourceSlice(self.span(target.lhs)).?;
-        const binding = self.bindings.get(name) orelse return self.fail(.unsupported_assignment_target, data.lhs, null);
+        const binding = self.bindings.get(name) orelse {
+            if (self.module.lookup(name)) |id| return self.fail(.immutable_assignment, target.lhs, self.module.getDeclaration(id).?.name_span);
+            return self.fail(.unknown_name, target.lhs, null);
+        };
         const array = self.ir.getType(binding.known.ty).?;
         if (array != .array) return self.fail(.unsupported_assignment_target, data.lhs, null);
         if (!binding.mutable) return self.fail(.immutable_assignment, target.lhs, binding.name_span);
+        if (compound and self.ir.getType(array.array).? != .integer) return self.fail(.operator_not_supported, node, binding.known.annotation);
         if (try self.expression(target.lhs, binding.known, depth + 1) == null) return null;
         const index = try self.ir.internType(.{ .integer = .{ .signedness = .signed, .bits = Ir.native_pointer_bits } });
         if (try self.expression(target.rhs, .{ .ty = index }, depth + 1) == null) return null;
+        // Use the same pre-index snapshot for both the old element and final
+        // replacement, even if index/RHS effects replace the local array.
+        var old: ?Ir.ValueId = null;
+        if (compound and !self.terminated) {
+            if (self.emitter) |emitter| old = try emitter.append(array.array, self.irSpan(data.lhs), .{ .array_index = .{
+                .array = try emitter.value(target.lhs),
+                .index = try emitter.value(target.rhs),
+            } });
+        }
         if (try self.expression(data.rhs, .{ .ty = array.array }, depth + 1) == null) return null;
         const unit = try self.ir.internType(.void);
         if (!self.terminated) {
             if (self.emitter) |emitter| {
-                const updated = try emitter.append(binding.known.ty, self.irSpan(node), .{ .array_set = .{ .array = try emitter.value(target.lhs), .index = try emitter.value(target.rhs), .value = try emitter.value(data.rhs) } });
+                var value = try emitter.value(data.rhs);
+                if (compound) value = try emitter.append(array.array, self.irSpan(node), .{ .binary = .{
+                    .op = switch (tag) {
+                        .assign_add => .add,
+                        .assign_sub => .sub,
+                        .assign_mul => .mul,
+                        .assign_div => .div,
+                        .assign_mod => .mod,
+                        else => unreachable,
+                    },
+                    .lhs = old.?,
+                    .rhs = value,
+                } });
+                const updated = try emitter.append(binding.known.ty, self.irSpan(node), .{ .array_set = .{ .array = try emitter.value(target.lhs), .index = try emitter.value(target.rhs), .value = value } });
                 try emitter.record(node, unit, self.irSpan(node), .{ .local_store = .{ .slot = binding.slot.?, .value = updated } });
             }
         }
@@ -802,7 +830,7 @@ test "scalar array deferred and ill typed forms fail closed" {
         "let main: () -> void = {let a: []int = [1]\n@println(a[0..1])}",
         "let main: () -> void = {let mut a: []int = [1]\na += 2}",
         "let main: () -> void = {let mut a: []int = [1]\na -= [2]}",
-        "let main: () -> void = {let mut a: []int = [1]\na[0] += 2}",
+        "let main: () -> void = {let mut a: []bool = [true]\na[0] += false}",
     }) |source| {
         var module = try Module.init(std.testing.allocator, "arrays.nov", source);
         defer module.deinit();
@@ -812,6 +840,27 @@ test "scalar array deferred and ill typed forms fail closed" {
         try std.testing.expect(module.hasErrors());
         try std.testing.expect(!sema.lowering_complete);
         try std.testing.expectEqual(@as(usize, 0), sema.ir.functions.items.len);
+    }
+}
+
+test "all indexed compound operators reject bool elements immutable parameters and nonnative indices" {
+    for ([_][]const u8{ "+=", "-=", "*=", "/=", "%=" }) |op| {
+        inline for ([_]struct { source: []const u8, tag: Module.Diagnostic.Tag }{
+            .{ .source = "let f: () -> void = {{let mut a: []bool = [true]\na[0] {s} false}}", .tag = .operator_not_supported },
+            .{ .source = "let f: (a: []int) -> void = {{a[0] {s} 1}}", .tag = .immutable_assignment },
+            .{ .source = "let f: () -> void = {{let mut a: []int = [1]\nlet i: i8 = 0\na[i] {s} 1}}", .tag = .expression_type_mismatch },
+        }) |case| {
+            const source = try std.fmt.allocPrint(std.testing.allocator, case.source, .{op});
+            defer std.testing.allocator.free(source);
+            var module = try Module.init(std.testing.allocator, "compound.nov", source);
+            defer module.deinit();
+            try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+            var sema = try @import("Lowering.zig").lower(&module);
+            defer sema.deinit();
+            try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+            try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
+            try std.testing.expect(!sema.lowering_complete);
+        }
     }
 }
 
@@ -854,6 +903,14 @@ test "assignment diagnostics identify targets mutability types and lexical scope
         .{ .body = "{p += 1}", .tag = .immutable_assignment, .token = "p" },
         .{ .body = "{g = 2}", .tag = .immutable_assignment, .token = "g" },
         .{ .body = "{missing = 1}", .tag = .unknown_name, .token = "missing" },
+        .{ .body = "{missing[0] += 1}", .tag = .unknown_name, .token = "missing" },
+        .{ .body = "{g[0] += 1}", .tag = .immutable_assignment, .token = "g" },
+        .{ .body = "{let a: []int = [1]\na[0] += 2}", .tag = .immutable_assignment, .token = "a" },
+        .{ .body = "{let mut a: []bool = [true]\na[0] *= false}", .tag = .operator_not_supported, .token = "*=" },
+        .{ .body = "{let mut a: []int = [1]\na[0] -= false}", .tag = .literal_type_mismatch, .token = "false" },
+        .{ .body = "{let mut a: []int = [1]\nlet i: uint = 0\na[i] /= 2}", .tag = .expression_type_mismatch, .token = "i" },
+        .{ .body = "{let mut a: []int = [1]\nf(p)[0] %= 2}", .tag = .unsupported_assignment_target, .token = "[" },
+        .{ .body = "{let mut a: []int = [1]\na[0][0] += 2}", .tag = .unsupported_assignment_target, .token = "[" },
         .{ .body = "{let mut n: int = 1\nn = true}", .tag = .literal_type_mismatch, .token = "true" },
         .{ .body = "{let mut n: int = 1\nn = p}", .tag = .expression_type_mismatch, .token = "p" },
         .{ .body = "{let mut b: bool = true\nb += false}", .tag = .operator_not_supported, .token = "+=" },

@@ -772,6 +772,115 @@ test "scalar arrays copy grow and return with every allocation collecting" {
     }
 }
 
+test "array element compound arithmetic wraps at every approved width" {
+    var source = std.Io.Writer.Allocating.init(test_gpa);
+    defer source.deinit();
+    var output = std.Io.Writer.Allocating.init(test_gpa);
+    defer output.deinit();
+    try source.writer.writeAll("let main: () -> void = {\n");
+    for ([_][]const u8{ "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "int", "uint" }) |name| {
+        const signed = name[0] == 'i';
+        const bits = if (std.mem.eql(u8, name, "int") or std.mem.eql(u8, name, "uint")) Ir.native_pointer_bits else try std.fmt.parseInt(u16, name[1..], 10);
+        const maximum = (@as(u128, 1) << @intCast(bits - @as(u16, if (signed) 1 else 0))) - 1;
+        try source.writer.print("{{let mut a: []{s} = [{d}]\na[-1] += 1\n@println(a[0])\na[0] -= 1\n@println(a[0])\na[0] *= 2\n@println(a[0])\n", .{ name, maximum });
+        if (signed) {
+            try output.writer.print("-{d}\n{d}\n-2\n", .{ maximum + 1, maximum });
+            try source.writer.print("a[0] = -{d}\na[0] /= -1\n@println(a[0])\na[0] %= -1\n@println(a[0])\n", .{maximum + 1});
+            try output.writer.print("-{d}\n0\n", .{maximum + 1});
+            try source.writer.writeAll("a[0] = -7\na[0] /= 3\n@println(a[0])\na[0] = -7\na[0] %= 3\n@println(a[0])}\n");
+            try output.writer.writeAll("-2\n-1\n");
+        } else {
+            try output.writer.print("0\n{d}\n{d}\n", .{ maximum, maximum - 1 });
+            try source.writer.writeAll("a[0] = 7\na[0] /= 3\n@println(a[0])\na[0] = 7\na[0] %= 3\n@println(a[0])}\n");
+            try output.writer.writeAll("2\n1\n");
+        }
+    }
+    try source.writer.writeAll("}");
+    const c = try arrayTestProgram(source.written());
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, output.written(), "", mode);
+}
+
+const array_compound_effects =
+    \\let early: (c: bool) -> int = {
+    \\    let mut a: []int = [10]
+    \\    a[0] += if c {a = [88]
+    \\        return a[0]} else {2}
+    \\    a[0]}
+    \\let index_return: () -> int = {
+    \\    let mut a: []int = []
+    \\    a[{return 7}] += { @print(false)
+    \\        1}
+    \\}
+    \\let main: () -> void = {
+    \\    let mut a: []int = [10, 20]
+    \\    let copy: []int = a
+    \\    let mut count: int = 0
+    \\    a[{count += 1
+    \\        @print(count)
+    \\        a = [90]
+    \\        0 - 1}] += {let scratch: []int = [3]
+    \\        @print(a[0])
+    \\        a = []
+    \\        scratch[0]}
+    \\    @println(a[0], a[-1], a.len, copy[-1], count)
+    \\    a[-2] += {a[-1] = 99
+    \\        a[0] = 80
+    \\        2}
+    \\    @println(a[0], a[-1])
+    \\    a[-1] = {a = [77]
+    \\        5}
+    \\    @println(a[0], a[-1], a.len)
+    \\    let mut n: int = 0
+    \\    loop n < 4 {
+    \\        n += 1
+    \\        a[0] *= if n == 1 {a = [6, 7]
+    \\            continue} else if n == 3 {a[0] = 9
+    \\            break} else {let temp: []int = [2]
+    \\            temp[0]}
+    \\    }
+    \\    @println(n, a[0], a[-1])
+    \\    loop true {a[{break}] += 1}
+    \\    loop n < 5 {n += 1
+    \\        a[{continue}] -= 1}
+    \\    @println(a[0], n, early(true), early(false), index_return())
+    \\}
+;
+
+const array_compound_output = "19010 23 2 20 1\n12 23\n12 5 2\n3 9 7\n9 5 88 12 7\n";
+
+test "array compound stores share one pre-index snapshot and skip stores on terminal paths" {
+    const c = try arrayTestProgram(array_compound_effects);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, array_compound_output, "", mode);
+}
+
+test "array compound bounds precede RHS while plain replacement bounds follow RHS" {
+    for ([_][]const u8{ "0", "1", "-2", if (Ir.native_pointer_bits == 64) "-9223372036854775808" else "-2147483648" }) |index| {
+        for ([_][]const u8{ "=", "+=", "-=", "*=", "/=", "%=" }) |op| {
+            const source = try std.fmt.allocPrint(test_gpa, "let main: () -> void = {{let mut a: []int = {s}\na[{{@print(true)\n0 + {s}}}] {s} {{@print(false)\nreturn}}}}", .{ if (std.mem.eql(u8, index, "0")) "[]" else "[1]", index, op });
+            defer test_gpa.free(source);
+            const c = try arrayTestProgram(source);
+            defer test_gpa.free(c);
+            const plain = std.mem.eql(u8, op, "=");
+            for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", if (plain) 0 else 1, if (plain) "truefalse" else "true", if (plain) "" else "panic: array index out of bounds\n", mode);
+        }
+    }
+    const plain = try arrayTestProgram("let main: () -> void = {let mut a: []int = []\na[0] = {@print(true)\n1}}");
+    defer test_gpa.free(plain);
+    try compileAndRunExpected(plain, "typedef int nonempty_translation_unit;", 1, "true", "panic: array index out of bounds\n");
+}
+
+test "array compound division and remainder by zero panic after RHS effects" {
+    for ([_][]const u8{ "/=", "%=" }) |op| {
+        const source = try std.fmt.allocPrint(test_gpa, "let main: () -> void = {{let mut a: []i8 = [7]\na[-1] {s} {{a = []\n@print(true)\n0}}}}", .{op});
+        defer test_gpa.free(source);
+        const c = try arrayTestProgram(source);
+        defer test_gpa.free(c);
+        for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 1, "true", if (std.mem.eql(u8, op, "/=")) "panic: division by zero\n" else "panic: remainder by zero\n", mode);
+    }
+}
+
 test "arrays support every approved integer element type" {
     var source = std.Io.Writer.Allocating.init(test_gpa);
     defer source.deinit();
@@ -873,29 +982,31 @@ test "array capacity and append length overflow panic before accessing backing" 
 }
 
 test "array allocation failure retries preserve roots and shutdown frees backing" {
-    const c = try arrayTestProgram(array_example);
-    defer test_gpa.free(c);
-    const injected = try std.mem.concat(test_gpa, u8, &.{
-        "#include <stdlib.h>\n#include <assert.h>\nstatic unsigned attempts, outstanding;\n" ++
-            "static void *test_malloc(size_t n) { void *p; if (++attempts % 2) return NULL; p = malloc(n); if (p) ++outstanding; return p; }\n" ++
-            "static void test_free(void *p) { assert(outstanding); --outstanding; free(p); }\n" ++
-            "#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE test_free\n#define main test_main\n",
-        c,
-        "\n#undef main\nint main(void) { int result = test_main(); assert(!outstanding); return result; }\n",
-    });
-    defer test_gpa.free(injected);
-    try compileAndRunExpected(injected, "typedef int nonempty_translation_unit;", 0, "3 30 30 6\n454 15\n99 15 4\nfalse true 2\n0\n", "");
-    const exhausted = try std.mem.concat(test_gpa, u8, &.{
-        "#include <stdlib.h>\nstatic void *test_malloc(size_t n) { (void)n; return NULL; }\n" ++
-            "#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n",
-        c,
-    });
-    defer test_gpa.free(exhausted);
-    try compileAndRunExpected(exhausted, "typedef int nonempty_translation_unit;", 1, "", "panic: GC allocation failed\n");
+    for ([_][]const u8{ array_example, array_compound_effects }, [_][]const u8{ "3 30 30 6\n454 15\n99 15 4\nfalse true 2\n0\n", array_compound_output }) |source, output| {
+        const c = try arrayTestProgram(source);
+        defer test_gpa.free(c);
+        const injected = try std.mem.concat(test_gpa, u8, &.{
+            "#include <stdlib.h>\n#include <assert.h>\nstatic unsigned attempts, outstanding;\n" ++
+                "static void *test_malloc(size_t n) { void *p; if (++attempts % 2) return NULL; p = malloc(n); if (p) ++outstanding; return p; }\n" ++
+                "static void test_free(void *p) { assert(outstanding); --outstanding; free(p); }\n" ++
+                "#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE test_free\n#define main test_main\n",
+            c,
+            "\n#undef main\nint main(void) { int result = test_main(); assert(!outstanding); return result; }\n",
+        });
+        defer test_gpa.free(injected);
+        try compileAndRunExpected(injected, "typedef int nonempty_translation_unit;", 0, output, "");
+        const exhausted = try std.mem.concat(test_gpa, u8, &.{
+            "#include <stdlib.h>\nstatic void *test_malloc(size_t n) { (void)n; return NULL; }\n" ++
+                "#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n",
+            c,
+        });
+        defer test_gpa.free(exhausted);
+        try compileAndRunExpected(exhausted, "typedef int nonempty_translation_unit;", 1, "", "panic: GC allocation failed\n");
+    }
 }
 
-fn testArrayEmissionAllocationFailures(allocator: std.mem.Allocator) !void {
-    var module = try Module.init(allocator, "arrays.nov", array_example);
+fn testArrayEmissionAllocationFailures(allocator: std.mem.Allocator, source: []const u8) !void {
+    var module = try Module.init(allocator, "arrays.nov", source);
     defer module.deinit();
     var sema = try Lowering.lower(&module);
     defer sema.deinit();
@@ -905,7 +1016,7 @@ fn testArrayEmissionAllocationFailures(allocator: std.mem.Allocator) !void {
 }
 
 test "array compiler ownership survives every allocation failure" {
-    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{});
+    for ([_][]const u8{ array_example, array_compound_effects }) |source| try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{source});
 }
 
 test "condition loops repeat current reads and scope initialization with innermost controls" {

@@ -301,8 +301,12 @@ pointer-sized uint len/cap, native int negative indexing, independent copies at
 value boundaries, literals (including context-typed empty arrays), read-only
 `.len`, mutable element replacement and self-safe `+=` append. Formatting now
 covers scalar array annotations, literals, indexing, `.len` reads and direct
-indexed replacement, with token/comment/AST preservation and first-pass idempotence.
-This is syntax-only; it adds no array semantics or memory forms. See README's
+indexed replacement and integer element `+=`, `-=`, `*=`, `/=`, `%=`, with
+token/comment/AST preservation and first-pass idempotence. Integer element compounds
+now execute using one pre-index array snapshot and one index evaluation, reading
+the old element before the RHS and replacing the local with the updated snapshot
+afterwards. Plain replacement retains its final-update bounds check; compounds
+check on the pre-RHS read. No new memory forms are introduced. See README's
 executable subset for precise limits and evaluation order. The proposals below
 remain proposals; writable length, slices, nested/pointer elements, aliases,
 capacity APIs and efficient copy/append optimizations are still deferred.

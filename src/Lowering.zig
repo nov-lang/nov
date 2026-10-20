@@ -57,6 +57,54 @@ pub fn lower(module: *Module) Error!Sema {
     return result;
 }
 
+test "indexed compounds reuse one snapshot and index with old read before RHS" {
+    var module = try Module.init(std.testing.allocator, "compound.nov",
+        \\let index: () -> int = -1
+        \\let rhs: () -> int = 3
+        \\let main: () -> void = {let mut a: []int = [10, 20]
+        \\    a[index()] += rhs()}
+    );
+    defer module.deinit();
+    var sema = try lower(&module);
+    defer sema.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    const body = sema.ir.functions.items[2].body.?;
+    var read: ?Ir.ValueId = null;
+    var calls: usize = 0;
+    var sets: usize = 0;
+    for (body.instructions, 0..) |instruction, i| switch (instruction.op) {
+        .call => {
+            calls += 1;
+            try std.testing.expectEqual(calls == 2, read != null);
+        },
+        .array_index => |r| {
+            try std.testing.expect(read == null);
+            try std.testing.expectEqual(@as(usize, 1), calls);
+            try std.testing.expect(body.instructions[@intFromEnum(r.array)].op == .array_clone);
+            try std.testing.expect(body.instructions[@intFromEnum(r.index)].op == .call);
+            try std.testing.expect(@intFromEnum(r.array) < @intFromEnum(r.index));
+            read = @enumFromInt(i);
+        },
+        .array_set => |r| {
+            sets += 1;
+            const old = body.instructions[@intFromEnum(read.?)].op.array_index;
+            try std.testing.expectEqual(old.array, r.array);
+            try std.testing.expectEqual(old.index, r.index);
+            const binary = body.instructions[@intFromEnum(r.value)].op.binary;
+            try std.testing.expectEqual(Ir.BinaryOp.add, binary.op);
+            try std.testing.expectEqual(read.?, binary.lhs);
+            try std.testing.expect(@intFromEnum(read.?) < @intFromEnum(binary.rhs));
+            try std.testing.expectEqual(@as(usize, 2), calls);
+            try std.testing.expect(body.instructions[i + 1].op == .local_store);
+            try std.testing.expectEqual(@as(Ir.ValueId, @enumFromInt(i)), body.instructions[i + 1].op.local_store.value);
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 1), sets);
+    try sema.ir.verify();
+}
+
 test "locals alias evaluated values and nested results survive scope exit" {
     var module = try Module.init(std.testing.allocator, "locals.nov",
         \\let id: (x: i32) -> i32 = x
@@ -408,6 +456,8 @@ test "lowering ownership and source diagnostic rollback survive allocation failu
         "let f: (a: []int) -> []int = {let mut b: []int = a\nb += b\nb[-1] = 7\nb}",
         "let f: () -> void = {let mut a: []bool = [true]\na.len = 2}",
         "let f: () -> void = {let a: []int = [true]\n}",
+        "let f: (c: bool) -> void = {let mut a: []int = [1]\na[{a = []\n0}] += if c {return} else {a = [9]\n2}\na[0] -= 1\na[0] *= 3\na[0] /= 2\na[0] %= 5}",
+        "let f: () -> void = {let mut a: []bool = [true]\na[0] %= false}",
     }) |source| {
         try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
     }

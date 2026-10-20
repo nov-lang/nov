@@ -6,7 +6,7 @@ const Tokenizer = @import("Tokenizer.zig");
 /// Supports scalar declarations/operators plus function signatures, calls,
 /// local blocks, if/else, condition loops, returns, unlabeled loop controls,
 /// direct identifier assignments, scalar array types/literals/indexing/.len,
-/// and plain indexed assignments to direct identifiers. Formatting is syntactic,
+/// and indexed assignments to direct identifiers. Formatting is syntactic,
 /// not a scope, mutability, or type check. Preserves line/doc comments and tokens.
 /// All other AST tags and quoted identifiers/BOMs/shebangs are unsupported.
 /// Parse errors return InvalidSource; unsupported or unpreservable output
@@ -141,7 +141,7 @@ fn checkSupported(ast: Ast) !void {
             .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod => {
                 const lhs_tag = ast.nodes.items(.tag)[data.lhs];
                 if (lhs_tag == .identifier) continue;
-                if (tag != .assign or lhs_tag != .array_access or
+                if (lhs_tag != .array_access or
                     ast.nodes.items(.tag)[ast.nodes.items(.data)[data.lhs].lhs] != .identifier)
                     return error.UnsupportedSyntax;
             },
@@ -290,7 +290,9 @@ test "unsupported syntax fails closed including nested expressions" {
         "let x=a[0][1]\n",
         "let x=a[0..1]\n",
         "let f:()->void={a.len=1}\n",
-        "let f:()->void={a[0]+=1}\n",
+        "let f:()->void={make()[0]+=1}\n",
+        "let f:()->void={a[0][0]-=1}\n",
+        "let f:()->void={a.len%=1}\n",
         "let f:()->void={make()[0]=1}\n",
         "let x=#true\n",
         "@[test]\nlet x=1\n",
@@ -417,6 +419,7 @@ test "executable formatting survives allocation failures" {
 }
 
 test "scalar arrays render types literals indexing length and direct stores" {
+    try expectFormatted("let f:()->void={a[-1]+=1\na[0]-=2\na[0]*=3\na[0]/=4\na[0]%=5}\n", "let f: () -> void = {\n    a[-1] += 1\n    a[0] -= 2\n    a[0] *= 3\n    a[0] /= 4\n    a[0] %= 5\n}\n");
     try expectFormatted("let f:(a:[]int)->[]bool={let mut b:[]bool=[true,false,]\nb[-1]=!a[0] == 0\nb += []\nreturn b}\n", "let f: (a: []int) -> []bool = {\n    let mut b: []bool = [true, false,]\n    b[-1] = !a[0] == 0\n    b += []\n    return b\n}\n");
     try expectFormatted("let x:[]int=[]\nlet y=[1,2,3,]\nlet n=make()[0] + -a[-1] * a.len\n", "let x: []int = []\nlet y = [1, 2, 3,]\nlet n = make()[0] + -a[-1] * a.len\n");
     for ([_][]const u8{ "bool", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "int", "uint" }) |name| {
@@ -441,6 +444,7 @@ test "array comments continuations and expanding lists stabilize on the first pa
         "let f:(a:[]int)->int=a[{1}]\n",
         "let f:(a:[]int)->int=a[0].len + -a[-1]\n",
         "let f:()->void={let mut a:[]int= ; literal\n [1,2]\na[-1]= ; store\n 3\na += ; append\n []}\n",
+        "let f:()->void={a[; index\n -1] += ; RHS\n {2}\na[0] -= ; subtract\n 1\na[0] *= 2\na[0] /= 3\na[0] %= 4}\n",
         "let f:()->void=call([1,{2}],[])\n",
         "let f:()->[]int=[1,{let x:int=2\nx},3,]\n",
     }) |source| {
@@ -451,7 +455,7 @@ test "array comments continuations and expanding lists stabilize on the first pa
 }
 
 fn testArrayAllocationFailures(allocator: std.mem.Allocator) !void {
-    const output = try format(allocator, "let f:(a:[]int)->[]int={let mut b:[]int=[\n1, ; element\n{a[-1]},3,]\nb[0]=a.len\nb += []\nreturn b}\n");
+    const output = try format(allocator, "let f:(a:[]int)->[]int={let mut b:[]int=[\n1, ; element\n{a[-1]},3,]\nb[0]=a.len\nb[-1] += {a[0]}\nb[0] -= 1\nb[0] *= 2\nb[0] /= 2\nb[0] %= 3\nb += []\nreturn b}\n");
     defer allocator.free(output);
 }
 

@@ -120,6 +120,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     _ = fixtures.add("checkout.nov", @embedFile("examples/checkout.nov"));
     _ = fixtures.add("scalar-arrays.nov", @embedFile("examples/arrays.nov"));
     _ = fixtures.add("array-bounds.nov", "let main: () -> void = {let a: []bool = [true]\n@println(a[-2])}\n");
+    _ = fixtures.add("array-compound.nov", "let main: () -> void = {\n    let mut a: []i8 = [127, 10]\n    a[0] += 1\n    a[0] -= 1\n    a[0] *= 2\n    a[0] /= -1\n    a[0] %= 3\n    a[-1] += {\n        a = []\n        5\n    }\n    @println(a[0], a[-1], a.len)\n}\n");
+    _ = fixtures.add("array-bool-compound.nov", "let main: () -> void = {let mut a: []bool = [true]\na[0] += false}\n");
+    _ = fixtures.add("array-compound-bounds.nov", "let main: () -> void = {let mut a: []int = []\na[-1] += {@print(true)\nreturn}}\n");
     _ = fixtures.add("array-length-write.nov", "let main: () -> void = {let mut a: []int = []\na.len = 1}\n");
     _ = fixtures.add("if-program.nov", "let divide: (n: int) -> int = 1 / n\nlet main: () -> void = {\nlet n: int = if false {divide(0)} else if true {42} else {divide(0)}\nif n == 42 {@println(n)}\n}\n");
     _ = fixtures.add("return-program.nov", "let f: (c: bool) -> int = {if c {{return 42}}\n1 / 0}\nlet main: () -> void = {let b: bool = false and {return}\n@println(f(true), b)\nreturn}\n");
@@ -172,6 +175,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         .{ .name = "check rejects --check", .args = &.{ "check", "--check", "valid.nov" }, .exit_code = 1, .stderr_match = "--check" },
         .{ .name = "--check requires fmt", .args = &.{"--check"}, .exit_code = 1, .stderr_match = "--check" },
         .{ .name = "check valid syntax", .args = &.{ "check", "valid.nov" }, .exit_code = 0 },
+        .{ .name = "check array compounds", .args = &.{ "check", "--semantic", "array-compound.nov" }, .exit_code = 0 },
+        .{ .name = "fmt array compounds", .args = &.{ "fmt", "--check", "array-compound.nov" }, .exit_code = 0 },
+        .{ .name = "reject bool array compounds", .args = &.{ "emit-c", "array-bool-compound.nov" }, .exit_code = 1, .stderr_match = "operator is not supported" },
         .{ .name = "check scalar arrays", .args = &.{ "check", "--semantic", "scalar-arrays.nov" }, .exit_code = 0 },
         .{ .name = "reject array length writes", .args = &.{ "emit-c", "array-length-write.nov" }, .exit_code = 1, .stderr_match = "array .len is read-only" },
         .{ .name = "check semantic loops", .args = &.{ "check", "--semantic", "loop-program.nov" }, .exit_code = 0 },
@@ -243,6 +249,7 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         .{ .source = "let x=1", .check = true, .diagnostic = "<stdin>: error: input is not formatted", .code = 1 },
         .{ .source = "let x = 1\n", .check = true },
         .{ .source = "let x=", .diagnostic = "<stdin>:1:7: error:", .code = 1 },
+        .{ .source = "let f:()->void={a[-1]+=1\na[0]-=2\na[0]*=3\na[0]/=4\na[0]%=5}", .output = "let f: () -> void = {\n    a[-1] += 1\n    a[0] -= 2\n    a[0] *= 3\n    a[0] /= 4\n    a[0] %= 5\n}\n" },
         .{ .source = "let x:[]int=[1]", .output = "let x: []int = [1]\n" },
         .{ .source = "let x = [1]\n", .check = true },
         .{ .source = "let x=[1]", .check = true, .diagnostic = "<stdin>: error: input is not formatted", .code = 1 },
@@ -275,6 +282,20 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
             arrays.expectStdOutEqual(if (bounds) "" else "3 30 30 6\n454 15\n99 15 4\nfalse true 2\n0\n");
             arrays.expectStdErrEqual(if (bounds) "panic: array index out of bounds\n" else "");
             test_step.dependOn(&arrays.step);
+        }
+        for ([_]bool{ false, true }) |bounds| {
+            const compound = b.addRunArtifact(exe);
+            compound.step.name = b.fmt("CLI: array compounds bounds={any} ({s})", .{ bounds, mode });
+            compound.setCwd(fixtures.getDirectory());
+            compound.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+            compound.setEnvironmentVariable("NOV_CC", "");
+            compound.setEnvironmentVariable("CC", "");
+            compound.addArgs(&.{ "run", if (bounds) "array-compound-bounds.nov" else "array-compound.nov" });
+            if (mode.len != 0) compound.addArg(mode);
+            compound.expectExitCode(if (bounds) 1 else 0);
+            compound.expectStdOutEqual(if (bounds) "" else "2 15 2\n");
+            compound.expectStdErrEqual(if (bounds) "panic: array index out of bounds\n" else "");
+            test_step.dependOn(&compound.step);
         }
         const loops = b.addRunArtifact(exe);
         loops.step.name = b.fmt("CLI: condition loops ({s})", .{mode});
