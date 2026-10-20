@@ -211,9 +211,13 @@ initializer already determines a supported `bool`, integer (fixed-width or nativ
 block/conditional results use the same bidirectional rules as other expressions.
 No type is inferred from later uses or from the enclosing function result for a
 local initializer. `let n = 1` and `let n = 1 + 2` still need annotations; there
-are no integer defaults or widening conversions. Array literals still need an
-expected `[]T` type, even `[true]` or `[typed_value]`; `let values = []` cannot
-infer an element type. Inferred arrays keep the same copy and GC-root semantics
+are no integer defaults or widening conversions. Scalar array literals infer
+`[]bool` from boolean elements or `[]T` from an already typed integer element.
+A later element can supply context to earlier literals: `let values = [0, typed_value]`.
+Known element types must match exactly; no signedness or width widening occurs.
+An expected `[]T` takes precedence and checks every element against `T`, including
+literal bounds. `let values = []` and `let values = [1, 2]` still need context.
+Inferred arrays keep the same copy and GC-root semantics
 as annotated arrays. See [examples/inferred-locals.nov](examples/inferred-locals.nov).
 
 Explicit annotations remain supported, including immutable `void` values and
@@ -718,9 +722,14 @@ let prod = a.! * b.! ; will return .none to the calling function since b is .non
 ### Executable scalar subset
 
 Growable `[]T` arrays are supported in function bodies and signatures for `bool`,
-`i8/i16/i32/i64`, `u8/u16/u32/u64`, and native `int/uint`. Literals require an
-expected array type, including empty `[]`; numeric and array-element defaults
-remain deferred. Array-valued parameters, locals, calls and other already typed
+`i8/i16/i32/i64`, `u8/u16/u32/u64`, and native `int/uint`. Literals use an
+expected array type when available; otherwise, a known boolean or typed integer
+element determines the exact element type for the whole literal, even when it
+appears after untyped integer literals. For example, `[true, false]` infers
+`[]bool`, and `[0, typed_integer]` infers that integer's array type. Empty `[]`
+and all-untyped `[1, 2]` still need an expected `[]T`; numeric defaults remain
+deferred. Type inference does not evaluate elements: evaluation remains once,
+left-to-right. Array-valued parameters, locals, calls and other already typed
 expressions can initialize inferred locals without changing copy semantics. See [examples/arrays.nov](examples/arrays.nov):
 
 ```nov
@@ -780,8 +789,8 @@ let main: () -> void = {
   can be printed.
 
 The broader examples below describe future syntax as well as implemented syntax;
-printing arrays, inferred types and writable `.len` in them are **not** executable
-features of this subset.
+printing arrays, defaulting bare integer elements and writable `.len` in them
+are **not** executable features of this subset.
 
 Array literals are comma-separated, may span multiple lines, and may have a
 trailing comma.

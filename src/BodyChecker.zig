@@ -302,6 +302,7 @@ const Context = struct {
                 if (std.mem.eql(u8, name, "true") or std.mem.eql(u8, name, "false")) break :blk .{ .ty = try self.ir.internType(.boolean) };
                 break :blk null;
             },
+            .array_init, .array_init_comma, .array_init_two, .array_init_two_comma => try self.probeArray(node, depth),
             .array_access => blk: {
                 const array = (try self.probe(data.lhs, depth + 1)) orelse break :blk null;
                 const ty = self.ir.getType(array.ty).?;
@@ -392,6 +393,19 @@ const Context = struct {
                 break :blk buffer[0 .. @as(usize, @intFromBool(data.lhs != 0)) + @as(usize, @intFromBool(data.rhs != 0))];
             },
         };
+    }
+
+    fn probeArray(self: *Context, node: Ast.Node.Index, depth: usize) Error!?Known {
+        var buffer: [2]Ast.Node.Index = undefined;
+        // A later known scalar can constrain earlier literals. Never check or
+        // emit elements here: the real walk validates conflicts in source order.
+        for (self.arrayElements(node, &buffer)) |element| {
+            const known = (try self.probe(element, depth + 1)) orelse continue;
+            if (Ir.isArrayElement(self.ir.getType(known.ty).?)) {
+                return .{ .ty = try self.ir.internType(.{ .array = known.ty }) };
+            }
+        }
+        return null;
     }
 
     fn irSpan(self: *Context, node: Ast.Node.Index) Ir.Span {
@@ -566,7 +580,7 @@ const Context = struct {
         const data = ast.nodes.items(.data)[node];
         switch (ast.nodes.items(.tag)[node]) {
             .array_init, .array_init_comma, .array_init_two, .array_init_two_comma => {
-                const want = expected orelse return self.fail(.array_literal_needs_type, node, null);
+                const want = hint orelse return self.fail(.array_literal_needs_type, node, null);
                 const array = self.ir.getType(want.ty).?;
                 if (array != .array) return self.fail(.expression_type_mismatch, node, want.annotation);
                 var buffer: [2]Ast.Node.Index = undefined;
@@ -1103,14 +1117,96 @@ test "inferred locals reuse known expression types and nested probe scopes" {
     }
 }
 
+test "scalar array literals infer known elements bidirectionally across expression scopes" {
+    for ([_][]const u8{ "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "int", "uint" }) |name| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let global: {s} = 7\nlet id: (x: {s}) -> {s} = x\nlet f: (p: {s}) -> void = {{\n" ++
+            "let flags = [true, !false, p == 0]\nlet a = [-0, 1 + 2, global]\n" ++
+            "let b = [0, id(p)]\nlet mut c = [0, p]\nc[0] += 1\nlet copy = c\n" ++
+            "let indexed = c[-1]\nlet length = flags.len\n" ++
+            "let nested = 1 + {{let a_local = [0, p]\nlet inner = {{let b_local = [0, a_local[0]]\nb_local[0]}}\ninner}}\n" ++
+            "let late = [0, {{let reused = [0, p]\nreused[0]}}]\n" ++
+            "let branch = if true {{[1, p]}} else {{[2, 3]}}\n" ++
+            "@println(flags[0], a[0], b[0], copy[0], indexed, length, nested, late[0], branch[0])\n}}", .{ name, name, name, name });
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "array-inference.nov", source);
+        defer module.deinit();
+        var sema = try @import("Lowering.zig").lower(&module);
+        defer sema.deinit();
+        try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+        try std.testing.expect(!module.hasErrors());
+        try sema.ir.verify();
+    }
+}
+
+test "array inference uses exact literal boundaries and expected context" {
+    const Case = struct { ty: []const u8, literal: []const u8 };
+    for ([_]Case{
+        .{ .ty = "i8", .literal = "-{128}" },
+        .{ .ty = "i8", .literal = "127" },
+        .{ .ty = "u8", .literal = "255" },
+        .{ .ty = "u8", .literal = "-{0}" },
+        .{ .ty = "i64", .literal = "-9223372036854775808" },
+        .{ .ty = "u64", .literal = "18446744073709551615" },
+    }) |case| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let f: (p: {s}) -> []{s} = {{let a = [{s}, p]\na}}\n" ++
+            "let take: (a: []{s}) -> void = {{}}\n" ++
+            "let out: (p: {s}) -> void = {{let empty: []{s} = []\n" ++
+            "let explicit: []{s} = [{s}]\ntake([{s}, p])\n" ++
+            "let branch = if false {{[]}} else {{[p]}}\n@println(empty.len, explicit[0], branch[0])\n}}", .{ case.ty, case.ty, case.literal, case.ty, case.ty, case.ty, case.ty, case.literal, case.literal });
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "array-boundaries.nov", source);
+        defer module.deinit();
+        try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+        var sema = try @import("Lowering.zig").lower(&module);
+        defer sema.deinit();
+        try std.testing.expect(!module.hasErrors());
+        try sema.ir.verify();
+    }
+}
+
+test "array inference rejects conflicts defaults and scope leaks without probe diagnostics" {
+    const Case = struct { body: []const u8, tag: Module.Diagnostic.Tag, token: []const u8 };
+    for ([_]Case{
+        .{ .body = "let a = [p, wide]", .tag = .expression_type_mismatch, .token = "wide" },
+        .{ .body = "let a = [wide, p]", .tag = .expression_type_mismatch, .token = "p" },
+        .{ .body = "let a = [p, unsigned]", .tag = .expression_type_mismatch, .token = "unsigned" },
+        .{ .body = "let a = [p, true]", .tag = .literal_type_mismatch, .token = "true" },
+        .{ .body = "let a = [true, p]", .tag = .expression_type_mismatch, .token = "p" },
+        .{ .body = "let a = [1, true]", .tag = .literal_type_mismatch, .token = "1" },
+        .{ .body = "let a = [128, p]", .tag = .literal_out_of_range, .token = "128" },
+        .{ .body = "let a = [-129, p]", .tag = .literal_out_of_range, .token = "-129" },
+        .{ .body = "let a = [-1, unsigned]", .tag = .literal_out_of_range, .token = "-1" },
+        .{ .body = "let a: []i8 = [128, wide]", .tag = .literal_out_of_range, .token = "128" },
+        .{ .body = "let a: []i8 = [0, wide]", .tag = .expression_type_mismatch, .token = "wide" },
+        .{ .body = "let a = []", .tag = .array_literal_needs_type, .token = "[" },
+        .{ .body = "let a = [1, 2]", .tag = .array_literal_needs_type, .token = "[" },
+        .{ .body = "let a = [[true]]", .tag = .array_literal_needs_type, .token = "[" },
+        .{ .body = "let a = [f]", .tag = .array_literal_needs_type, .token = "[" },
+        .{ .body = "let a = [missing, p]", .tag = .unknown_name, .token = "missing" },
+        .{ .body = "let a = [0, {let hidden = p\nhidden}]\n@println(hidden)", .tag = .unknown_name, .token = "hidden" },
+        .{ .body = "let a = [0, {let x: missing = p\nx}, p]", .tag = .unknown_type, .token = "missing" },
+        .{ .body = "let a = [0, {let x = a\nx}, p]", .tag = .unknown_name, .token = "a" },
+    }) |case| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let f: (p: i8, wide: i16, unsigned: u8) -> void = {{{s}\n}}", .{case.body});
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "array-inference-errors.nov", source);
+        defer module.deinit();
+        try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+        var sema = try @import("Sema.zig").analyzeFunctions(&module);
+        defer sema.deinit();
+        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+        try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
+        try std.testing.expectEqualStrings(case.token, module.sourceSlice(module.diagnostics.items[0].span).?);
+    }
+}
+
 test "inferred local failures preserve typing and initializer scope" {
     const Case = struct { body: []const u8, tag: Module.Diagnostic.Tag, token: []const u8 };
     for ([_]Case{
         .{ .body = "let n = 1", .tag = .literal_needs_type, .token = "1" },
         .{ .body = "let mut n = 1 + 2", .tag = .literal_needs_type, .token = "1" },
         .{ .body = "let n = []", .tag = .array_literal_needs_type, .token = "[" },
-        .{ .body = "let n = [true]", .tag = .array_literal_needs_type, .token = "[" },
-        .{ .body = "let n = [p]", .tag = .array_literal_needs_type, .token = "[" },
+        .{ .body = "let n = [1, 2]", .tag = .array_literal_needs_type, .token = "[" },
         .{ .body = "let n = n", .tag = .unknown_name, .token = "n" },
         .{ .body = "let n = later\nlet later = p", .tag = .unknown_name, .token = "later" },
         .{ .body = "let n = missing + p", .tag = .unknown_name, .token = "missing" },
@@ -1383,6 +1479,9 @@ test "body checking rolls back diagnostics and owned storage on allocation failu
         "let f: () -> i32 = {let x: (missing) -> i32 = f\n1}",
         "let f: (p: i32) -> i32 = {let n = 1 + {let first = p\nlet second = {let inner = first\ninner}\nsecond}\nn}",
         "let f: () -> bool = {let n = missing\nn}",
+        "let f: (p: i8) -> void = {let a = [0, {let inner = [0, p]\ninner[0]}]\n@println(a[0])}",
+        "let f: (p: i8) -> void = {let a = [0, {let inner: missing = p\ninner}, p]\n}",
+        "let f: (p: i8) -> void = {let a = [128, p]\n}",
         "let f: () -> void = {let n = []\n}",
         "let f: () -> void = {let n = {}\n}",
     }) |source| {

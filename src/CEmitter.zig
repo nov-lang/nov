@@ -793,6 +793,46 @@ test "inferred locals preserve evaluation order snapshots copies and GC roots" {
     for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, inferred_output, "", mode);
 }
 
+const inferred_arrays =
+    \\let make: (n: int) -> []int = [n, n + 1]
+    \\let mark: (n: int) -> int = {@println(n)
+    \\    make(n)[0]}
+    \\let early: (stop: bool) -> int = {
+    \\    let a = [{if stop {return 9}
+    \\        mark(3)}, mark(4)]
+    \\    a[-1]}
+    \\let main: () -> void = {
+    \\    let mut count: int = 0
+    \\    let mut a = [0, mark(7), {count += 1
+    \\        mark(8)}]
+    \\    let original = a
+    \\    a[0] += {let temporary = [0, make(9)[0]]
+    \\        temporary[-1]}
+    \\    a += [count]
+    \\    @println(original[0], original[1], original[2], count, a[0], a.len)
+    \\    let flags = [true, false]
+    \\    @println(flags[0], flags[-1], flags.len)
+    \\    @println(early(true), early(false))
+    \\    loop count < 4 {
+    \\        count += 1
+    \\        let values = [{if count == 3 {continue}
+    \\            if count == 4 {break}
+    \\            mark(count)}, mark(20)]
+    \\        @println(values[0], values[-1])
+    \\    }
+    \\    let skipped = false and {let unused = [mark(99)]
+    \\        unused[0] == 99}
+    \\    @println(count, skipped)
+    \\}
+;
+const inferred_arrays_output = "7\n8\n0 7 8 1 9 4\ntrue false 2\n3\n4\n9 4\n2\n20\n2 20\n4 false\n";
+
+test "inferred array elements execute once in order with allocation control exits and GC" {
+    const c = try arrayTestProgram(inferred_arrays);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, inferred_arrays_output, "", mode);
+}
+
 test "scalar arrays copy grow and return with every allocation collecting" {
     const c = try arrayTestProgram(array_example);
     defer test_gpa.free(c);
@@ -1011,7 +1051,7 @@ test "array capacity and append length overflow panic before accessing backing" 
 }
 
 test "array allocation failure retries preserve roots and shutdown frees backing" {
-    for ([_][]const u8{ array_example, array_compound_effects, inferred_example }, [_][]const u8{ "3 30 30 6\n454 15\n99 15 4\nfalse true 2\n0\n", array_compound_output, inferred_output }) |source, output| {
+    for ([_][]const u8{ array_example, array_compound_effects, inferred_example, inferred_arrays }, [_][]const u8{ "3 30 30 6\n454 15\n99 15 4\nfalse true 2\n0\n", array_compound_output, inferred_output, inferred_arrays_output }) |source, output| {
         const c = try arrayTestProgram(source);
         defer test_gpa.free(c);
         const injected = try std.mem.concat(test_gpa, u8, &.{
@@ -1030,7 +1070,7 @@ test "array allocation failure retries preserve roots and shutdown frees backing
             c,
         });
         defer test_gpa.free(exhausted);
-        try compileAndRunExpected(exhausted, "typedef int nonempty_translation_unit;", 1, if (std.mem.eql(u8, source, inferred_example)) "7\n8\n" else "", "panic: GC allocation failed\n");
+        try compileAndRunExpected(exhausted, "typedef int nonempty_translation_unit;", 1, if (std.mem.eql(u8, source, inferred_example)) "7\n8\n" else if (std.mem.eql(u8, source, inferred_arrays)) "7\n" else "", "panic: GC allocation failed\n");
     }
 }
 
@@ -1045,7 +1085,7 @@ fn testArrayEmissionAllocationFailures(allocator: std.mem.Allocator, source: []c
 }
 
 test "array compiler ownership survives every allocation failure" {
-    for ([_][]const u8{ array_example, array_compound_effects, inferred_example }) |source| try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{source});
+    for ([_][]const u8{ array_example, array_compound_effects, inferred_example, inferred_arrays }) |source| try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{source});
 }
 
 test "condition loops repeat current reads and scope initialization with innermost controls" {
