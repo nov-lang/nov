@@ -191,6 +191,31 @@ test "unit comparisons and unary operations lower without arithmetic evaluation"
     try sema.ir.verify();
 }
 
+test "loop regions own repeated conditions bodies and spans after source destruction" {
+    var module = try Module.init(std.testing.allocator, "loop.nov",
+        \\let f: () -> void = {let mut n: int = 0
+        \\    loop n < 2 {n += 1
+        \\        if n == 1 {continue} else {break}}}
+    );
+    var sema = lower(&module) catch |err| {
+        module.deinit();
+        return err;
+    };
+    defer sema.deinit();
+    const failed = module.hasErrors();
+    const body = sema.ir.functions.items[0].body.?;
+    const loop = body.instructions[@intFromEnum(body.result)];
+    const region = loop.op.loop;
+    try std.testing.expectEqualStrings("loop n < 2 {n += 1\n        if n == 1 {continue} else {break}}", module.ast.source[loop.span.start..loop.span.end]);
+    module.deinit();
+    try std.testing.expect(!failed);
+    try std.testing.expect(sema.lowering_complete);
+    try std.testing.expect(body.instructions[region.condition_start].op == .local_load);
+    try std.testing.expect(Ir.terminates(body, region.body));
+    try std.testing.expect(!Ir.terminates(body, body.result));
+    try sema.ir.verify();
+}
+
 test "return spans and owned terminal regions survive source destruction" {
     var module = try Module.init(std.testing.allocator, "return.nov",
         \\let f: (c: bool) -> int = if c {{return 42}} else {return 43}
@@ -376,6 +401,10 @@ test "lowering ownership and source diagnostic rollback survive allocation failu
         "let main: () -> void = {let x: int = 1\nx = 2}",
         "let main: () -> void = {let mut x: int = 1\nx = false}",
         "let main: () -> void = {let mut x: int = 1\nx.field = 2}",
+        "let f: () -> void = {let mut n: int = 0\nloop n < 2 {let fresh: int = n\nn += 1\nloop false {continue}\nif fresh == 0 {continue} else {break}}}",
+        "let f: () -> void = loop true {break 1}",
+        "let f: () -> void = loop false {missing}",
+        "let f: () -> void = loop true {{break}\n@println(true)}",
     }) |source| {
         try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
     }

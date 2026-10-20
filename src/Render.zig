@@ -230,6 +230,7 @@ fn renderExpression(self: *Render, node: Ast.Node.Index, space: Space) RenderErr
             //     return renderBlock(r, node, statements[0..2], space);
             // }
         },
+        .loop_condition,
         .block,
         .block_newline,
         => {

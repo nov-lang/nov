@@ -398,7 +398,7 @@ pub fn renderError(self: Ast, parse_error: Error, writer: anytype) !void {
         //         token_tags[parse_error.token].symbol(),
         //     });
         // },
-        .unsupported_loop => return writer.writeAll("loop expressions are not implemented yet"),
+        .unsupported_loop => return writer.writeAll("unsupported loop form; expected 'loop condition { ... }'"),
         .expected_decl => {
             return writer.print("expected declaration, found '{s}'", .{
                 token_tags[parse_error.token + @intFromBool(parse_error.token_is_prev)].symbol(),
@@ -587,6 +587,7 @@ pub fn firstToken(self: Ast, node: Node.Index) TokenIndex {
         .match,
         .@"if",
         .if_else,
+        .loop_condition,
         .@"continue",
         .@"break",
         .@"return",
@@ -692,6 +693,11 @@ pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
     var end_offset: TokenIndex = 0;
     while (true) switch (tags[n]) {
         .root => return @intCast(self.tokens.len - 1),
+        .@"continue" => return if (datas[n].lhs == 0) main_tokens[n] + end_offset else datas[n].lhs + end_offset,
+        .@"break" => {
+            if (datas[n].rhs == 0) return if (datas[n].lhs == 0) main_tokens[n] + end_offset else datas[n].lhs + end_offset;
+            n = datas[n].rhs;
+        },
         .@"return" => {
             if (datas[n].rhs == 0) return main_tokens[n] + end_offset;
             n = datas[n].rhs;
@@ -733,6 +739,7 @@ pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
         .bool_and,
         .bool_or,
         .@"if",
+        .loop_condition,
         .match_case_one,
         .match_case,
         .function_pipe,
@@ -1521,7 +1528,8 @@ pub const Node = struct {
         /// rhs can be omitted.
         /// main_token is the `..` or `..=`.
         range,
-        // TODO: loop
+        /// `loop lhs rhs`: boolean condition and lexical body block.
+        loop_condition,
         /// `if lhs {}`. rhs is the block.
         @"if",
         /// `if lhs {} else {}`. `If[rhs]`.

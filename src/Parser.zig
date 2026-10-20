@@ -608,7 +608,7 @@ fn parseElseExpr(self: *Parser) Error!Node.Index {
 // loop x in y {}
 // loop _ in y..z {}
 // loop x, y, z in a, b, c {}
-// loop x > 10 {}
+
 // loop i < 100 : i += 1 {}
 // loop {}
 // loop ... {} else
@@ -616,9 +616,19 @@ fn parseElseExpr(self: *Parser) Error!Node.Index {
 /// LoopInput
 ///     <- (AMPERSAND? IDENTIFIER)+ KEYWORD_in (Expr (DOT2 Expr?)?)+
 ///      / Expr (COLON AssignExpr)?
+/// Currently only the condition-and-block form is enabled. Other documented
+/// forms fail at the loop keyword and use the usual balanced recovery.
 fn parseLoopExpr(self: *Parser) Error!Node.Index {
     const loop_token = self.assertToken(.keyword_loop);
-    return self.failMsg(.{ .tag = .unsupported_loop, .token = loop_token });
+    if (loop_token >= 2 and self.token_tags[loop_token - 1] == .colon or self.token_tags[self.tok_i] == .eof)
+        return self.failMsg(.{ .tag = .unsupported_loop, .token = loop_token });
+    const condition = try self.expectExpr();
+    if (self.nodes.items(.tag)[condition] == .in or self.token_tags[self.tok_i] != .l_brace)
+        return self.failMsg(.{ .tag = .unsupported_loop, .token = loop_token });
+    const body = try self.expectBlock();
+    if (self.token_tags[self.tok_i] == .keyword_else)
+        return self.failMsg(.{ .tag = .unsupported_loop, .token = loop_token });
+    return self.addNode(.{ .tag = .loop_condition, .main_token = loop_token, .data = .{ .lhs = condition, .rhs = body } });
 }
 
 /// AssignExpr <- Expr (AssignOp Expr)?
@@ -1617,6 +1627,7 @@ test "parser ownership survives allocation failures" {
         "let arrays = [[\n], [1,], [1, 2, 3,\n],]\nlet broken = [1",
         "let broken = f(1,,2)\nlet invalid: (x: int,,y: int) = 0\nlet valid = 42",
         "let value = loop {}\nlet f: () = {\nloop {}\nlet valid = 42\nvalid\n}",
+        "let f: () -> void = loop true {loop false {continue}\nif true {break}}",
         "let add: (a: int, b: int, c: int) -> int = {\nlet sum = a + b\nlet result = sum + c\nresult\n}\nlet answer = add(1, 2, 3)",
         "let value = {\nlet broken =\nlet valid = 42\nvalid\n}\nlet missing =",
         "let a =\nlet b =\nlet c =\nlet d =\nlet e =\nlet f =\nlet g =\nlet h =",
@@ -1626,6 +1637,22 @@ test "parser ownership survives allocation failures" {
     }
 }
 
+test "condition loop AST preserves nested blocks controls and source boundaries" {
+    const source = "let f: () -> void = loop {true} {if false {break} else {continue}}";
+    var ast = try parse(std.testing.allocator, source);
+    defer ast.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    const loop = ast.decl(ast.rootDecls()[0]).ast.init_node;
+    try std.testing.expectEqual(Node.Tag.loop_condition, ast.nodes.items(.tag)[loop]);
+    try std.testing.expectEqualStrings("loop", ast.tokenSlice(ast.firstToken(loop)));
+    try std.testing.expectEqual(source.len - 1, ast.tokens.items(.start)[ast.lastToken(loop)]);
+    for (ast.nodes.items(.tag), 0..) |tag, node| {
+        if (tag == .@"break" or tag == .@"continue")
+            try std.testing.expectEqual(ast.firstToken(@intCast(node)), ast.lastToken(@intCast(node)));
+    }
+    try std.testing.expectError(error.UnsupportedSyntax, @import("Formatter.zig").format(std.testing.allocator, source));
+}
+
 test "unsupported loops diagnose their keyword and preserve following declarations" {
     const expressions = [_][]const u8{
         "loop {}",
@@ -1633,6 +1660,9 @@ test "unsupported loops diagnose their keyword and preserve following declaratio
         "loop i < 10 : i += 1 {}",
         "loop {} else {}",
         "outer: loop {}",
+        "outer: loop true {}",
+        "loop true {} else {}",
+        "loop i in 0..10 {}",
     };
     for (expressions) |expression| {
         const source = try std.fmt.allocPrintSentinel(std.testing.allocator, "let value = {s}\nlet valid = 42", .{expression}, 0);

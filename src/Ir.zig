@@ -34,6 +34,12 @@ pub const BinaryOp = enum { add, sub, mul, div, mod, eq, ne, lt, le, gt, ge };
 pub const Operation = union(enum) {
     /// Terminal control flow, never a value. Its optional operand is body-local.
     return_value: ?ValueId,
+    /// Terminal exits target the innermost containing loop, including its condition.
+    loop_break,
+    loop_continue,
+    /// Condition [condition_start, body_start) is reexecuted before every body
+    /// [body_start, this instruction). Only outer slots carry state on backedges.
+    loop: struct { condition_start: u32, body_start: u32, condition: ValueId, body: ValueId },
     // Slot identities are instruction IDs, but are not expression values.
     local_slot: ValueId,
     local_load: ValueId,
@@ -309,7 +315,7 @@ fn regionOperandType(body: Body, id: ValueId, before: usize, yielding: ?usize) V
 
 pub fn terminates(body: Body, id: ValueId) bool {
     return switch (body.instructions[@intFromEnum(id)].op) {
-        .return_value => true,
+        .return_value, .loop_break, .loop_continue => true,
         .branch => |r| r.returns,
         else => false,
     };
@@ -322,6 +328,10 @@ fn regions(op: Operation, end: usize, buffer: *[2]Region) []const Region {
         .short_circuit => |r| {
             buffer[0] = .{ .start = r.rhs_start, .end = end };
             return buffer[0..1];
+        },
+        .loop => |r| {
+            buffer.* = .{ .{ .start = r.condition_start, .end = r.body_start }, .{ .start = r.body_start, .end = end } };
+            return buffer;
         },
         .branch => |r| {
             buffer.* = .{ .{ .start = r.then_start, .end = r.else_start }, .{ .start = r.else_start, .end = end } };
@@ -344,6 +354,11 @@ fn validateBody(self: *const Ir, function: Function, body: Body) VerifyError!voi
     // in its parent's scope, never in a sibling's scope.
     for (body.instructions, 0..) |instruction, end| {
         switch (instruction.op) {
+            .loop => |r| {
+                if (r.condition_start >= r.body_start or r.body_start >= end or
+                    @intFromEnum(r.condition) < r.condition_start or @intFromEnum(r.condition) >= r.body_start or
+                    @intFromEnum(r.body) < r.body_start or @intFromEnum(r.body) >= end) return error.InvalidRegion;
+            },
             .short_circuit => |r| {
                 if (r.rhs_start > end or @intFromEnum(r.lhs) >= r.rhs_start) return error.InvalidRegion;
             },
@@ -379,6 +394,7 @@ fn validateBody(self: *const Ir, function: Function, body: Body) VerifyError!voi
                         result = switch (owner.op) {
                             .branch => |b| if (r == 0) b.then_value else b.else_value.?,
                             .short_circuit => |s| s.rhs,
+                            .loop => |l| if (r == 0) l.condition else l.body,
                             else => unreachable,
                         };
                     }
@@ -397,6 +413,21 @@ fn validateBody(self: *const Ir, function: Function, body: Body) VerifyError!voi
             .local_store => |store| {
                 if (ty != .void) return error.InvalidOperation;
                 if (try slotType(body, store.slot, i) != try operandType(body, store.value, i)) return error.OperandTypeMismatch;
+            },
+            .loop_break, .loop_continue => {
+                if (ty != .void) return error.InvalidOperation;
+                var enclosed = false;
+                for (body.instructions, 0..) |owner, end| {
+                    if (owner.op == .loop and i >= owner.op.loop.condition_start and i < end) enclosed = true;
+                }
+                if (!enclosed) return error.InvalidRegion;
+            },
+            .loop => |r| {
+                if (ty != .void) return error.InvalidOperation;
+                const condition_ty = try regionOperandType(body, r.condition, r.body_start, i);
+                if (!terminates(body, r.condition) and self.getType(condition_ty).? != .boolean) return error.OperandTypeMismatch;
+                const body_ty = try regionOperandType(body, r.body, i, i);
+                if (!terminates(body, r.body) and self.getType(body_ty).? != .void) return error.OperandTypeMismatch;
             },
             .return_value => |value| {
                 if (ty != .void) return error.InvalidReturn;
@@ -908,6 +939,99 @@ fn testConditionalAllocationFailures(allocator: std.mem.Allocator) !void {
     // Removing a nested body frees the same owned slices as final destruction.
     ir.clearFunctions();
     try ir.verify();
+}
+
+test "loop verification isolates regions slots backedges controls and terminal tails" {
+    var fixture = try TestFunctions.init(std.testing.allocator);
+    defer fixture.ir.deinit();
+    const unit = try fixture.ir.internType(.void);
+    const ins = TestFunctions.instruction;
+    const good = [_]Instruction{
+        ins(fixture.integer, .{ .parameter = 0 }),
+        ins(fixture.integer, .{ .local_slot = @enumFromInt(0) }),
+        ins(fixture.integer, .{ .local_load = @enumFromInt(1) }),
+        ins(fixture.integer, .{ .constant = fixture.number }),
+        ins(fixture.boolean, .{ .binary = .{ .op = .lt, .lhs = @enumFromInt(2), .rhs = @enumFromInt(3) } }),
+        ins(fixture.integer, .{ .local_slot = @enumFromInt(0) }),
+        ins(fixture.integer, .{ .local_load = @enumFromInt(5) }),
+        ins(unit, .{ .local_store = .{ .slot = @enumFromInt(1), .value = @enumFromInt(6) } }),
+        ins(unit, .{ .loop = .{ .condition_start = 2, .body_start = 5, .condition = @enumFromInt(4), .body = @enumFromInt(7) } }),
+        ins(fixture.integer, .{ .local_load = @enumFromInt(1) }),
+    };
+    for (0..15) |case| {
+        var bad = good;
+        const expected: VerifyError = switch (case) {
+            0 => b: {
+                bad[8].op.loop.condition_start = 6;
+                break :b error.InvalidRegion;
+            },
+            1 => b: {
+                bad[8].op.loop.body_start = 9;
+                break :b error.InvalidRegion;
+            },
+            2 => b: {
+                bad[8].op.loop.condition = @enumFromInt(8);
+                break :b error.InvalidRegion;
+            },
+            3 => b: {
+                bad[8].op.loop.body = @enumFromInt(99);
+                break :b error.InvalidRegion;
+            },
+            4 => b: {
+                bad[8].op.loop.condition = @enumFromInt(2);
+                break :b error.OperandTypeMismatch;
+            },
+            5 => b: {
+                bad[8].op.loop.body = @enumFromInt(5);
+                break :b error.InvalidValueId;
+            },
+            6 => b: {
+                bad[9].op.local_load = @enumFromInt(5);
+                break :b error.InvalidValueId;
+            },
+            7 => b: {
+                bad[6].op.local_load = @enumFromInt(2);
+                break :b error.InvalidValueId;
+            },
+            8 => b: {
+                bad[3].op = .{ .local_load = @enumFromInt(5) };
+                break :b error.InvalidValueId;
+            },
+            9 => b: {
+                bad[6] = ins(unit, .loop_break);
+                break :b error.UnreachableInstruction;
+            },
+            10 => b: {
+                bad[9] = ins(unit, .loop_continue);
+                break :b error.InvalidRegion;
+            },
+            11 => b: {
+                bad[7] = ins(fixture.integer, .{ .local_load = @enumFromInt(1) });
+                break :b error.OperandTypeMismatch;
+            },
+            12 => b: {
+                bad[8].ty = fixture.integer;
+                break :b error.InvalidOperation;
+            },
+            13 => b: {
+                bad[7] = ins(unit, .{ .short_circuit = .{ .kind = .@"and", .lhs = @enumFromInt(4), .rhs_start = 3, .rhs = @enumFromInt(6) } });
+                break :b error.InvalidRegion;
+            },
+            14 => b: {
+                bad[3] = ins(fixture.integer, .{ .local_slot = @enumFromInt(2) });
+                bad[4].op.binary.rhs = @enumFromInt(0);
+                bad[6].op.local_load = @enumFromInt(3);
+                break :b error.InvalidValueId;
+            },
+            else => unreachable,
+        };
+        errdefer std.debug.print("loop verifier case {d}\n", .{case});
+        try fixture.reject(expected, &bad, @enumFromInt(9));
+    }
+    var terminal = good;
+    terminal[7] = ins(unit, .loop_continue);
+    try fixture.ir.setFunctionBody(fixture.function, &terminal, @enumFromInt(9));
+    try fixture.ir.verify();
 }
 
 test "conditional body operands are owned and publication is atomic under OOM" {

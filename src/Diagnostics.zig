@@ -65,7 +65,9 @@ pub fn renderModule(module: *const Module, writer: *std.Io.Writer) !void {
             .unsupported_local_declaration => try writer.writeAll("local declarations require an explicitly typed value (mutable void, local function definitions and discards are not supported yet)"),
             .immutable_assignment => try writer.writeAll("assignment requires a mutable local"),
             .unsupported_assignment_target => try writer.writeAll("assignment target must be a direct local identifier"),
-            .unreachable_code => try writer.writeAll("unreachable statement after return"),
+            .unreachable_code => try writer.writeAll("unreachable statement after return, break or continue"),
+            .loop_control_outside_loop => try writer.writeAll("break and continue require an enclosing loop"),
+            .unsupported_loop_control => try writer.writeAll("labeled and value-carrying loop control are not supported"),
             .unused_block_value => try writer.writeAll("non-final block expression must return void; discarding values is not supported yet"),
             .unsupported_shadowing => try writer.writeAll("shadowing is not supported in body analysis yet"),
             .expression_type_mismatch => try writer.writeAll("expression does not match the expected type"),
@@ -381,7 +383,7 @@ test "unsupported loop diagnostics identify the keyword with tabs and CRLF" {
     defer output.deinit();
     try render(ast, "loop.nov", &output.writer);
     try std.testing.expectEqualStrings(
-        "loop.nov:2:9: error: loop expressions are not implemented yet\n\touter: loop {}\n\t       ^~~~\n",
+        "loop.nov:2:9: error: unsupported loop form; expected 'loop condition { ... }'\n\touter: loop {}\n\t       ^~~~\n",
         output.written(),
     );
 }

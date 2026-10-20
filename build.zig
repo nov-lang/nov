@@ -92,6 +92,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     _ = fixtures.add("if-program.nov", "let divide: (n: int) -> int = 1 / n\nlet main: () -> void = {\nlet n: int = if false {divide(0)} else if true {42} else {divide(0)}\nif n == 42 {@println(n)}\n}\n");
     _ = fixtures.add("return-program.nov", "let f: (c: bool) -> int = {if c {{return 42}}\n1 / 0}\nlet main: () -> void = {let b: bool = false and {return}\n@println(f(true), b)\nreturn}\n");
     _ = fixtures.add("mutable-program.nov", "let f: (c: bool) -> int = {let mut n: int = 1\nn += if c {return 42} else {2}\nn}\nlet main: () -> void = {let mut n: int = 1\nif true {n += 2}\nlet b: bool = false and {n = 99\ntrue}\n@println(n, b, f(true), f(false))}\n");
+    _ = fixtures.add("loop-program.nov", "let f: () -> int = {let mut n: int = 0\nloop n < 5 {n += 1\nif n == 2 {continue}\nif n == 4 {break}\n@println(n)}\nn}\nlet main: () -> void = @println(f())\n");
+    _ = fixtures.add("break-outside.nov", "let main: () -> void = {break}\n");
+    _ = fixtures.add("value-break.nov", "let main: () -> void = loop true {break 1}\n");
     _ = fixtures.add("immutable-assignment.nov", "let main: () -> void = {let n: int = 1\nn = 2}\n");
     _ = fixtures.add("return-invalid.nov", "let main: () -> void = return true\n");
     _ = fixtures.add("return-unreachable.nov", "let main: () -> void = {return @println(true)\n@println(false)}\n");
@@ -137,6 +140,10 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         .{ .name = "check rejects --check", .args = &.{ "check", "--check", "valid.nov" }, .exit_code = 1, .stderr_match = "--check" },
         .{ .name = "--check requires fmt", .args = &.{"--check"}, .exit_code = 1, .stderr_match = "--check" },
         .{ .name = "check valid syntax", .args = &.{ "check", "valid.nov" }, .exit_code = 0 },
+        .{ .name = "check semantic loops", .args = &.{ "check", "--semantic", "loop-program.nov" }, .exit_code = 0 },
+        .{ .name = "check break outside loop", .args = &.{ "check", "--semantic", "break-outside.nov" }, .exit_code = 1, .stderr_match = "break and continue require an enclosing loop" },
+        .{ .name = "emit rejects value break", .args = &.{ "emit-c", "value-break.nov" }, .exit_code = 1, .stderr_match = "labeled and value-carrying loop control are not supported" },
+        .{ .name = "fmt condition loops remains unsupported", .args = &.{ "fmt", "--check", "loop-program.nov" }, .exit_code = 1, .stderr_match = "formatting this syntax is not supported yet; file unchanged" },
         .{ .name = "check semantic mutable locals", .args = &.{ "check", "--semantic", "mutable-program.nov" }, .exit_code = 0 },
         .{ .name = "emit rejects immutable assignment", .args = &.{ "emit-c", "immutable-assignment.nov" }, .exit_code = 1, .stderr_match = "immutable-assignment.nov:2:1: error: assignment requires a mutable local" },
         .{ .name = "check semantic returns", .args = &.{ "check", "--semantic", "return-program.nov" }, .exit_code = 0 },
@@ -150,8 +157,8 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         .{ .name = "check without final newline", .args = &.{ "check", "no-final-newline.nov" }, .exit_code = 0 },
         .{ .name = "fmt check without final newline", .args = &.{ "fmt", "--check", "no-final-newline.nov" }, .exit_code = 1, .stderr_match = "no-final-newline.nov" },
         .{ .name = "check invalid syntax", .args = &.{ "check", "invalid.nov" }, .exit_code = 1, .stderr_match = "invalid.nov:1:13: error:" },
-        .{ .name = "check unsupported loop", .args = &.{ "check", "unsupported-loop.nov" }, .exit_code = 1, .stderr_match = "unsupported-loop.nov:1:13: error: loop expressions are not implemented yet" },
-        .{ .name = "fmt unsupported loop", .args = &.{ "fmt", "--check", "unsupported-loop.nov" }, .exit_code = 1, .stderr_match = "unsupported-loop.nov:1:13: error: loop expressions are not implemented yet" },
+        .{ .name = "check unsupported loop", .args = &.{ "check", "unsupported-loop.nov" }, .exit_code = 1, .stderr_match = "unsupported-loop.nov:1:13: error: unsupported loop form" },
+        .{ .name = "fmt unsupported loop", .args = &.{ "fmt", "--check", "unsupported-loop.nov" }, .exit_code = 1, .stderr_match = "unsupported-loop.nov:1:13: error: unsupported loop form" },
         .{ .name = "check missing source", .args = &.{ "check", "missing.nov" }, .exit_code = 1, .stderr_match = "missing.nov: error: FileNotFound" },
         .{ .name = "check multiple valid files", .args = &.{ "check", "valid.nov", "another-valid.nov" }, .exit_code = 0 },
         .{ .name = "check mixed files", .args = &.{ "check", "valid.nov", "invalid.nov", "another-valid.nov" }, .exit_code = 1, .stderr_match = "invalid.nov:1:13: error:" },
@@ -187,6 +194,37 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
 
     // An isolated PATH exercises real `zig cc` discovery, independent of host CC.
     for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+        const loops = b.addRunArtifact(exe);
+        loops.step.name = b.fmt("CLI: condition loops ({s})", .{mode});
+        loops.setCwd(fixtures.getDirectory());
+        loops.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+        loops.setEnvironmentVariable("NOV_CC", "");
+        loops.setEnvironmentVariable("CC", "");
+        loops.addArgs(&.{ "run", "loop-program.nov" });
+        if (mode.len != 0) loops.addArg(mode);
+        loops.expectExitCode(0);
+        loops.expectStdOutEqual("1\n3\n4\n");
+        loops.expectStdErrEqual("");
+        test_step.dependOn(&loops.step);
+        const loop_build = b.addRunArtifact(exe);
+        loop_build.step.name = b.fmt("CLI: build condition loops ({s})", .{mode});
+        loop_build.setCwd(fixtures.getDirectory());
+        loop_build.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+        loop_build.setEnvironmentVariable("NOV_CC", "");
+        loop_build.setEnvironmentVariable("CC", "");
+        loop_build.addArgs(&.{ "build", "loop-program.nov" });
+        if (mode.len != 0) loop_build.addArg(mode);
+        loop_build.addArg("-o");
+        const loop_program = loop_build.addOutputFileArg(if (exe.root_module.resolved_target.?.result.os.tag == .windows) "loops.exe" else "loops");
+        loop_build.expectExitCode(0);
+        loop_build.expectStdOutEqual("");
+        loop_build.expectStdErrEqual("");
+        const loop_run = std.Build.Step.Run.create(b, b.fmt("CLI: execute condition loops ({s})", .{mode}));
+        loop_run.addFileArg(loop_program);
+        loop_run.expectExitCode(0);
+        loop_run.expectStdOutEqual("1\n3\n4\n");
+        loop_run.expectStdErrEqual("");
+        test_step.dependOn(&loop_run.step);
         const mutable = b.addRunArtifact(exe);
         mutable.step.name = b.fmt("CLI: mutable locals ({s})", .{mode});
         mutable.setCwd(fixtures.getDirectory());

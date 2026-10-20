@@ -114,10 +114,11 @@ const Context = struct {
     types: []const ?Ir.TypeId,
     emitter: ?*Emitter = null,
     return_type: Known = undefined,
-    // Termination is independent of the contextual value type. A returning
+    // Termination is independent of the contextual value type. A terminal
     // expression has no merge value, and enclosing expressions alias its exit.
     terminated: bool = false,
     terminal: ?Ir.ValueId = null,
+    loop_depth: usize = 0,
     bindings: std.StringHashMapUnmanaged(Binding) = .empty,
     locals: std.ArrayList([]const u8) = .empty,
 
@@ -288,7 +289,7 @@ const Context = struct {
                 break :blk null;
             },
             .block, .block_two, .block_newline, .block_two_newline => try self.probeBlock(node, depth),
-            .@"if", .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod => .{ .ty = try self.ir.internType(.void) },
+            .loop_condition, .@"if", .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod => .{ .ty = try self.ir.internType(.void) },
             .if_else => blk: {
                 const branch = ast.fullIf(node).?.ast;
                 break :blk (try self.probe(branch.then_expr, depth + 1)) orelse try self.probe(branch.else_expr, depth + 1);
@@ -473,6 +474,38 @@ const Context = struct {
                 if (std.mem.startsWith(u8, name, "@\"")) return self.fail(.unsupported_name, node, null);
                 return self.fail(if (isPrimitive(name)) .unsupported_body_expression else .unknown_name, node, null);
             },
+            .@"break", .@"continue" => {
+                const is_break = ast.nodes.items(.tag)[node] == .@"break";
+                if (data.lhs != 0 or (is_break and data.rhs != 0)) return self.fail(.unsupported_loop_control, node, null);
+                if (self.loop_depth == 0) return self.fail(.loop_control_outside_loop, node, null);
+                const unit = try self.ir.internType(.void);
+                if (self.emitter) |emitter| {
+                    try emitter.record(node, unit, self.irSpan(node), if (is_break) .loop_break else .loop_continue);
+                    self.terminal = try emitter.value(node);
+                }
+                self.terminated = true;
+                return if (expected) |want| want.ty else unit;
+            },
+            .loop_condition => {
+                const unit = try self.ir.internType(.void);
+                const boolean = try self.ir.internType(.boolean);
+                self.loop_depth += 1;
+                defer self.loop_depth -= 1;
+                const condition_start: u32 = if (self.emitter) |emitter| @intCast(emitter.instructions.items.len) else 0;
+                const condition = try self.expression(data.lhs, .{ .ty = boolean }, depth + 1);
+                self.terminated = false;
+                const body_start: u32 = if (self.emitter) |emitter| @intCast(emitter.instructions.items.len) else 0;
+                const body = try self.expression(data.rhs, .{ .ty = unit }, depth + 1);
+                self.terminated = false;
+                if (condition == null or body == null) return null;
+                if (self.emitter) |emitter| try emitter.record(node, unit, self.irSpan(node), .{ .loop = .{
+                    .condition_start = condition_start,
+                    .body_start = body_start,
+                    .condition = try emitter.value(data.lhs),
+                    .body = try emitter.value(data.rhs),
+                } });
+                return self.fit(unit, expected, node);
+            },
             .@"return" => {
                 if (data.rhs != 0) {
                     if (try self.expression(data.rhs, self.return_type, depth + 1) == null) return null;
@@ -648,6 +681,38 @@ const Context = struct {
         }
     }
 };
+
+test "condition loops diagnose controls types scope and unreachable tails" {
+    for ([_]struct { body: []const u8, tag: Module.Diagnostic.Tag }{
+        .{ .body = "{break}", .tag = .loop_control_outside_loop },
+        .{ .body = "{continue}", .tag = .loop_control_outside_loop },
+        .{ .body = "loop true {break 1}", .tag = .unsupported_loop_control },
+        .{ .body = "loop true {break :outer}", .tag = .unsupported_loop_control },
+        .{ .body = "loop true {continue :outer}", .tag = .unsupported_loop_control },
+        .{ .body = "loop 1 {}", .tag = .literal_type_mismatch },
+        .{ .body = "loop true {true}", .tag = .literal_type_mismatch },
+        .{ .body = "{loop false {missing}}", .tag = .unknown_name },
+        .{ .body = "{loop false {let hidden: int = 1\n}\n@println(hidden)}", .tag = .unknown_name },
+        .{ .body = "{loop {let hidden: bool = true\nhidden} {@println(hidden)}}", .tag = .unknown_name },
+        .{ .body = "loop true {{break}\n@println(true)}", .tag = .unreachable_code },
+        .{ .body = "loop true {continue\n@println(true)}", .tag = .unreachable_code },
+        .{ .body = "loop true {if true {break} else {continue}\n@println(true)}", .tag = .unreachable_code },
+        .{ .body = "{let n: int = loop false {}\n}", .tag = .expression_type_mismatch },
+        .{ .body = "{loop false {}\nbreak}", .tag = .loop_control_outside_loop },
+    }) |case| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let f: () -> void = {s}", .{case.body});
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "loop.nov", source);
+        defer module.deinit();
+        errdefer std.debug.print("loop case: {s}\n", .{case.body});
+        try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+        var sema = try @import("Lowering.zig").lower(&module);
+        defer sema.deinit();
+        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+        try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
+        try std.testing.expect(!sema.lowering_complete);
+    }
+}
 
 test "assignment diagnostics identify targets mutability types and lexical scope" {
     const Case = struct { body: []const u8, tag: Module.Diagnostic.Tag, token: []const u8 };

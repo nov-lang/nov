@@ -53,6 +53,8 @@ pub const Diagnostic = struct {
         unsupported_assignment_target,
         unused_block_value,
         unreachable_code,
+        loop_control_outside_loop,
+        unsupported_loop_control,
         unsupported_shadowing,
         expression_type_mismatch,
         operator_not_supported,

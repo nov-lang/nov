@@ -35,9 +35,10 @@ parameters and checks integer arithmetic, boolean expressions, comparisons and
 calls against collected signatures, including recursive calls. Explicitly typed
 immutable and mutable scalar locals and blocks with final-expression results
 are supported in function bodies. Literal defaults, user-defined type aliases,
-shadowing, global mutation and loops remain deferred or unsupported.
+shadowing and global mutation remain deferred or unsupported.
 Lowering produces typed operations with source spans, ordered operands/call
-arguments, explicit returns, and structured conditional regions for boolean `and`/`or` and `if`/`else`.
+arguments, explicit returns, and structured regions for boolean `and`/`or`,
+`if`/`else`, and condition-based loops.
 It requires immutable literal globals; unit/global block initializers are
 not lowered yet. An internal C11 backend emits verified IR, including fixed-width
 integer arithmetic and program entrypoint emission through `emit-c`.
@@ -52,8 +53,8 @@ diagnostics (including related notes where available); recovered syntax errors
 stop semantic analysis. Globals must be immutable, explicitly typed integer or
 boolean literals. Functions need explicit supported signatures and bounded
 expression bodies (including forward/recursive calls, local declarations and
-assignments, nested blocks, boolean short-circuiting, `if`/`else`, explicit returns
-and empty void bodies).
+assignments, nested blocks, boolean short-circuiting, `if`/`else`, explicit returns,
+condition-based loops with unlabeled `break`/`continue`, and empty void bodies).
 Inferred globals, mutable globals, nonliteral global initializers, global unit
 values are currently rejected, along with the other
 unsupported forms listed above. This is not a backend compatibility check: it
@@ -198,7 +199,7 @@ let main: () -> void = {
 This prints `42` on two lines. Locals require an explicit supported type and an
 initializer. Immutable scalar/unit values and existing function values (with
 unnamed parameter types, e.g. `let callback: (int) -> int = twice`) work; named
-local function definitions/closures, inferred locals, labels, loops and
+local function definitions/closures, inferred locals, labels and
 memory-bearing values are rejected. Mutable locals use `let mut`
 and support `bool`, integer and existing function values (not `void`). Direct
 identifier assignment (`n = value`) and integer-only `+=`, `-=`, `*=`, `/=`, `%=`
@@ -273,6 +274,47 @@ Non-void functions still require a correctly typed final value on every path
 that reaches the end. IR verification checks return operands, signatures,
 region-private references and terminal tails; C emission merges only continuing
 paths and never reads a value from a returning path.
+
+Condition-based `loop condition { ... }` expressions return `void`. The condition
+must be `bool` and is evaluated before **every** iteration, including the first,
+using the current local state. False skips the body and exits; normal body
+completion and unlabeled `continue` reevaluate the condition. Unlabeled `break`
+exits the innermost loop. Both controls also work in nested blocks, initializers,
+branches, arguments and short-circuit RHS regions, without evaluating the rest of
+that path or performing a pending assignment. Within a nested loop's condition,
+they target that nested loop. `return` still exits the enclosing function.
+
+The body must produce `void` on paths that continue; a terminal `return`, `break`
+or `continue` needs no result. Its lexical scope is fresh each iteration: local
+initializers execute again, body-local slots do not escape, and updates to outer
+mutable locals persist. Condition blocks have their own scope, separate from the
+body. Both condition and body are checked even when the condition is literally
+false. Loops are conservatively considered able to finish; a non-void function
+still needs a result after a loop. Statements after an unconditional loop control
+within a block are unreachable. Existing one-newline expression continuation
+also applies to `break`: use `{break}` before a following expression to keep the
+break bare.
+
+```nov
+let main: () -> void = {
+    let mut n: int = 0
+    loop n < 5 {
+        n += 1
+        if n == 2 {continue}
+        if n == 4 {break}
+        @println(n)
+    }
+    @println(n)
+}
+```
+
+This prints `1`, `3`, and `4` on separate lines. Loop IR owns separate condition
+and body instruction ranges; verification checks nesting, terminal paths and
+region-private references. Only outer slots carry mutable state across the
+backedge. C emission reevaluates the ordered condition instructions, rather than
+hoisting a snapshot before the loop. Infinite `loop {}`, iterator/range loops,
+post-expression (`:`) loops, loop `else`, labels and value-carrying breaks remain
+unsupported and diagnosed; no loop-result/value-break semantics are introduced.
 
 Format files in place with `zig build run -- fmt file.nov`, or use
 `zig build run -- fmt --check file.nov` to check formatting without writing.
@@ -721,8 +763,10 @@ let x: Option(int) = if is_even {
 ```
 
 ## Loop
-Loop expressions are not implemented yet; `check` and `fmt` report a diagnostic.
-The examples below describe intended syntax, not currently supported behavior.
+Condition-based `loop condition { ... }` is supported by `check`, semantic
+checking and the C backend, with a `void` result and unlabeled `break`/`continue`.
+See the executable subset above for scope and evaluation rules. Formatting loops
+is not supported yet. Other forms below describe intended, unsupported syntax.
 
 ```nov
 ; items can be an array, a slice, a string or an iterator
@@ -773,7 +817,10 @@ let rangeHasNumber: (begin: uint, end: uint, number: uint) -> bool = {
 ```
 
 ## Break & Continue
-TODO: same as zig
+Unlabeled `break` and `continue` target the innermost loop, including from nested
+blocks, branches and short-circuit expressions. `break` carries no value in the
+current executable subset; labels and value-carrying breaks are diagnosed as
+unsupported.
 
 ## Defer
 TODO: same as zig

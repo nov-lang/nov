@@ -339,7 +339,11 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
         .return_value => |value| {
             if (value) |v| value_used[@intFromEnum(v)] = true;
         },
-        .constant, .function_ref => {},
+        .loop => |region| {
+            value_used[@intFromEnum(region.condition)] = true;
+            value_used[@intFromEnum(region.body)] = true;
+        },
+        .loop_break, .loop_continue, .constant, .function_ref => {},
     };
 
     // Silence unused diagnostics instead of requiring non-standard attributes.
@@ -352,7 +356,12 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
         while (end > i) {
             end -= 1;
             const candidate = body.instructions[end];
-            if (candidate.op == .branch) {
+            if (candidate.op == .loop) {
+                const region = candidate.op.loop;
+                if (region.condition_start == i) try w.writeAll("    while (true) {\n");
+                if (region.body_start == i and !Ir.terminates(body, region.condition))
+                    try w.print("    if (!v{d}) break;\n", .{@intFromEnum(region.condition)});
+            } else if (candidate.op == .branch) {
                 const region = candidate.op.branch;
                 const has_value = ir.types.items[@intFromEnum(candidate.ty)] != .void;
                 if (region.then_start == i) {
@@ -371,6 +380,14 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
                 const region = candidate.op.short_circuit;
                 try w.print("    bool v{d} = v{d};\n    if ({s}v{d}) {{\n", .{ end, @intFromEnum(region.lhs), if (region.kind == .@"or") "!" else "", @intFromEnum(region.lhs) });
             }
+        }
+        if (instruction.op == .loop) {
+            try w.writeAll("    }\n");
+            continue;
+        }
+        if (instruction.op == .loop_break or instruction.op == .loop_continue) {
+            try w.writeAll(if (instruction.op == .loop_break) "    break;\n" else "    continue;\n");
+            continue;
         }
         if (instruction.op == .branch) {
             if (ir.types.items[@intFromEnum(instruction.ty)] != .void and !Ir.terminates(body, instruction.op.branch.else_value.?)) {
@@ -466,7 +483,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
                 try w.print("v{d} {s} v{d}", .{ @intFromEnum(binary.lhs), operator, @intFromEnum(binary.rhs) });
             },
             .call => |call| try writeCall(w, call),
-            .return_value, .print, .short_circuit, .branch, .local_store => unreachable,
+            .loop, .loop_break, .loop_continue, .return_value, .print, .short_circuit, .branch, .local_store => unreachable,
         }
         try w.writeAll(";\n");
         if (!value_used[i] or instruction.op == .local_slot) try w.print("    (void)v{d};\n", .{i});
@@ -516,6 +533,116 @@ fn emitSource(source: []const u8, diagnostic: ?*Diagnostic) ![]u8 {
     try std.testing.expect(!module.hasErrors());
     try std.testing.expect(sema.lowering_complete);
     return emit(test_gpa, &sema.ir, diagnostic);
+}
+
+test "condition loops repeat current reads and scope initialization with innermost controls" {
+    const c = try emitSource(
+        \\let mark: (n: int) -> int = {@print(n)
+        \\    n}
+        \\let out: () -> void = {
+        \\    let mut n: int = 0
+        \\    loop false {@println(mark(99))}
+        \\    loop mark(n) < 4 and {n += 1
+        \\        true} {
+        \\        let mut fresh: int = mark(n)
+        \\        fresh += 10
+        \\        if n == 2 {continue}
+        \\        let mut j: int = 0
+        \\        loop j < 3 {
+        \\            j += 1
+        \\            if j == 1 {continue}
+        \\            if j == 3 {break}
+        \\            @print(j)
+        \\        }
+        \\        @println(fresh)
+        \\        if n == 3 {break}
+        \\    }
+        \\    @println(n)
+        \\    loop n < 5 {n += 1}
+        \\    @println(n)
+        \\    loop false {let fresh: int = 99
+        \\        @println(fresh)}
+        \\}
+    , null);
+    defer test_gpa.free(c);
+    try compileAndRunExpected(c, "void nov_out(void); int main(void) { nov_out(); return 0; }", 0, "01211\n1223213\n3\n5\n", "");
+}
+
+test "loop conditions execute once per attempt including zero and final false" {
+    const c = try emitSource(
+        \\let out: () -> void = {
+        \\    let mut n: int = 0
+        \\    let mut attempts: int = 0
+        \\    loop {attempts += 1
+        \\        @print(attempts)
+        \\        n < 2} {n += 1
+        \\        @print(n)}
+        \\    @println(attempts, n)
+        \\    loop {attempts += 1
+        \\        false} {let bad: int = 1 / 0
+        \\        @println(bad)}
+        \\    @println(attempts)
+        \\}
+    , null);
+    defer test_gpa.free(c);
+    try compileAndRunExpected(c, "void nov_out(void); int main(void) { nov_out(); return 0; }", 0, "112233 2\n4\n", "");
+}
+
+test "loop exits compose with value branches assignments calls short circuit and returns" {
+    const c = try emitSource(
+        \\let sum: (a: int, b: int) -> int = a + b
+        \\let early: (stop: bool) -> int = {
+        \\    let mut n: int = 0
+        \\    loop n < 4 {
+        \\        n += 1
+        \\        let b: bool = false and {break}
+        \\        let d: bool = true or {continue}
+        \\        if b or !d {return 99}
+        \\        n += if n == 1 {continue} else {0}
+        \\        let value: int = if n == 2 {if stop {return n} else {continue}} else {n}
+        \\        @println(value)
+        \\        let ignored: int = sum({if n == 3 {break}
+        \\            n}, {return 88})
+        \\    }
+        \\    n
+        \\}
+        \\let condition: () -> int = {loop {return 7} {}
+        \\    99}
+        \\let control: () -> void = {
+        \\    let mut n: int = 0
+        \\    loop {n += 1
+        \\        if n == 1 {continue}
+        \\        if n == 3 {break}
+        \\        true} {@println(n)}
+        \\    @println(n)
+        \\}
+        \\let out: () -> void = {@println(early(true), early(false), condition())
+        \\    control()}
+    , null);
+    defer test_gpa.free(c);
+    try compileAndRunExpected(c, "void nov_out(void); int main(void) { nov_out(); return 0; }", 0, "3\n2 3 7\n2\n3\n", "");
+}
+
+test "loop conditions short circuit panics and skipped bodies stay conditional" {
+    const c = try emitSource(
+        \\let f: (take: bool) -> void = {
+        \\    let mut n: int = 0
+        \\    loop n < 2 and {n += 1
+        \\        if take {let bad: int = 1 / 0
+        \\            @println(bad)}
+        \\        true} {
+        \\        @println(n)
+        \\    }
+        \\    loop false {let bad: int = 1 / 0
+        \\        @println(bad)}
+        \\}
+        \\let bodypanic: () -> void = {loop true {let bad: int = 1 % 0
+        \\    @println(bad)}}
+    , null);
+    defer test_gpa.free(c);
+    try compileAndRunExpected(c, "#include <stdbool.h>\nvoid nov_f(bool); int main(void) { nov_f(false); return 0; }", 0, "1\n2\n", "");
+    try compileAndRunExpected(c, "#include <stdbool.h>\nvoid nov_f(bool); int main(void) { nov_f(true); return 0; }", 1, "", "panic: division by zero\n");
+    try compileAndRunExpected(c, "void nov_bodypanic(void); int main(void) { nov_bodypanic(); return 0; }", 1, "", "panic: remainder by zero\n");
 }
 
 test "mutable locals snapshot reads and preserve conditional sequential effects" {
@@ -614,6 +741,37 @@ test "assignment and initializer returns skip stores and subsequent effects" {
     , null);
     defer test_gpa.free(c);
     try compileAndRunExpected(c, "void nov_out(void); int main(void) { nov_out(); return 0; }", 0, "4 3 1 7 2 1\n", "");
+}
+
+fn testLoopAllocationFailures(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "loops.nov",
+        \\let f: (stop: bool) -> int = {let mut n: int = 0
+        \\    loop n < 3 and {if stop {return n} else {true}} {
+        \\        let mut fresh: int = n
+        \\        n += 1
+        \\        loop fresh < 2 {fresh += 1
+        \\            if stop {continue} else {break}}
+        \\        if stop {break} else {continue}
+        \\    }
+        \\    n}
+        \\let main: () -> void = @println(f(true), f(false))
+    );
+    var result = Lowering.lower(&module) catch |err| {
+        module.deinit();
+        return err;
+    };
+    defer result.deinit();
+    const failed = module.hasErrors();
+    module.deinit();
+    try std.testing.expect(!failed);
+    try std.testing.expect(result.lowering_complete);
+    try result.ir.verify();
+    const c = try emitProgram(allocator, &result.ir, null);
+    defer allocator.free(c);
+}
+
+test "loop source IR and C emission ownership survive every allocation failure" {
+    try std.testing.checkAllAllocationFailures(test_gpa, testLoopAllocationFailures, .{});
 }
 
 fn testMutableAllocationFailures(allocator: std.mem.Allocator) !void {
