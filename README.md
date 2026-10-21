@@ -1035,8 +1035,14 @@ scalar literal patterns, `|` alternatives within a positional pattern, and `_`
 wildcards. Subjects are evaluated **once, left to right, before selection**.
 Prongs are tested in source order and only the first matching body executes.
 With multiple subjects, commas separate positional patterns; a single `_`
-matches all subjects. A final catchall (`_` or all positional `_`s) is required,
-even for booleans: this is bounded exhaustiveness, not full pattern analysis.
+matches all subjects. A single canonical `bool` subject (including type aliases)
+is exhaustive when its patterns cover both `true` and `false`, even without a
+final catchall. Alternatives such as `true | false` cover both values; `_` inside
+an alternative is universal. Completely covered boolean prongs are rejected,
+but partial overlaps retain first-match behavior. Coverage depends on the subject
+type, not its runtime or literal value. Integer, string and multi-subject matches
+still require a final catchall (`_` or all positional `_`s); general finite-domain
+exhaustiveness is not implemented.
 
 ```nov
 let classify: (n: uint) -> string = match n % 3, n % 5 {

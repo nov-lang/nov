@@ -422,8 +422,13 @@ This will probably be implemented in stdlib instead.
 
 # Match
 Delivered bounded executable slice: bool/integer/string literal alternatives,
-positional multi-subject patterns, `_` wildcards and first-match selection with a
-required final catchall. Unary function/print pipes are also executable; fibo.nov
+positional multi-subject patterns, `_` wildcards and first-match selection. A single
+canonical bool subject (including aliases) needs coverage of true and false, not
+necessarily a final catchall; `|` combines coverage and `_` is universal even in
+alternatives. Completely covered boolean prongs diagnose; partial overlaps remain
+allowed. Integer/string/multi-subject matches still require a final catchall,
+including full integer-domain enumerations. General finite-domain analysis remains
+deferred. Unary function/print pipes are also executable; fibo.nov
 runs unchanged. Match subjects evaluate once left-to-right; pipes evaluate as
 callee-first unary calls. Exact branch types, private scopes and terminal paths
 reuse typed branch IR. Captures/enums/complex patterns/full exhaustiveness,

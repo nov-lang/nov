@@ -1089,6 +1089,126 @@ test "match and pipes clean up every compiler allocation failure" {
     try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{match_pipes});
 }
 
+const boolean_match_program =
+    \\let Flag = bool
+    \\let identity: (n: int) -> int = n
+    \\let subject: (b: Flag) -> Flag = {@print("S")
+    \\    b}
+    \\let select: (b: Flag) -> string = match subject(b) {
+    \\    true => {@print("T")
+    \\        "yes" + "!"}
+    \\    false => {@print("F")
+    \\        "no" + "!"}
+    \\}
+    \\let early: (b: bool) -> int = match b {
+    \\    false => {return 4}
+    \\    true => {return 5}
+    \\}
+    \\let mixed: (b: bool) -> int = match b {
+    \\    true => {return 6}
+    \\    false => 7
+    \\}
+    \\let subjectExit: () -> int = match {return 8} {
+    \\    true => 99
+    \\    false => 100
+    \\}
+    \\let main: () = {
+    \\    @println(select(true), select(false))
+    \\    @println(early(false), early(true), mixed(true), mixed(false), subjectExit())
+    \\    let mut count: int = 0
+    \\    let value = @as(int, match {count += 1
+    \\        true} {true => 1
+    \\        true | false => 2})
+    \\    @println(value, count)
+    \\    @println(@as(int, match subject(false) {true | false => 3}))
+    \\    @println(@as(int, match subject(true) {_ | true => 9}))
+    \\    @println(@as(int, match false {true => 10
+    \\        false | _ => 11}))
+    \\    let text = "root" + "ed"
+    \\    @println(match false {true => "bad"
+    \\        false => text}, "later" + "!")
+    \\    let original: []int = [12, 13]
+    \\    let mut chosen = match false {true => []
+    \\        false => original}
+    \\    chosen[0] = 99
+    \\    let later: []int = [14]
+    \\    @println(original[0], chosen[0], chosen.len, later[0])
+    \\    let callback = match true {true => identity
+    \\        false => identity}
+    \\    @println(callback(15))
+    \\    let inferred = match false {true => 16
+    \\        false => count}
+    \\    @println(inferred)
+    \\    let result = loop {
+    \\        loop false {} else {
+    \\            match count == 1 {
+    \\                true => {count += 1
+    \\                    continue}
+    \\                false => {break count}
+    \\            }
+    \\        }
+    \\    }
+    \\    @println(result)
+    \\    let nested: int = loop {
+    \\        match loop false {} else {break 17} {
+    \\            true => @println("bad")
+    \\            false => @println("bad")
+    \\        }
+    \\    }
+    \\    @println(nested)
+    \\    loop {
+    \\        match {if count == 2 {count += 1
+    \\                continue}
+    \\            break} {true => @println("bad")
+    \\            false => @println("bad")}
+    \\    }
+    \\    @println(count)
+    \\}
+;
+const boolean_match_output = "STSFyes! no!\n4 5 6 7 8\n1 1\nS3\nS9\n11\nrooted later!\n12 99 2 14\n15\n1\n2\n17\n3\n";
+
+test "exhaustive boolean match preserves effects terminal paths managed results formatting and forced GC" {
+    const c = try arrayTestProgram(boolean_match_program);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, boolean_match_output, "", mode);
+}
+
+test "exhaustive boolean match owns metadata after source release" {
+    var sema = blk: {
+        var module = try Module.init(test_gpa, "boolean-match.nov", boolean_match_program);
+        defer module.deinit();
+        var result = try Lowering.lower(&module);
+        errdefer result.deinit();
+        try std.testing.expect(!module.hasErrors());
+        break :blk result;
+    };
+    defer sema.deinit();
+    const c = try emitProgram(test_gpa, &sema.ir, null);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, boolean_match_output, "", mode);
+}
+
+test "exhaustive boolean match cleans up every compiler allocation failure" {
+    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{boolean_match_program});
+}
+
+test "exhaustive boolean match allocates only in selected prong and reports runtime OOM" {
+    for ([_]bool{ false, true }) |allocate| {
+        const c = try arrayTestProgram(if (allocate)
+            "let main: () = match false {true => @println(\"ok\")\nfalse => @println(\"a\" + \"b\")}"
+        else
+            "let main: () = match false {true => @println(\"a\" + \"b\")\nfalse => @println(\"ok\")}");
+        defer test_gpa.free(c);
+        const exhausted = try std.mem.concat(test_gpa, u8, &.{
+            "#include <stdlib.h>\nstatic void *test_malloc(size_t n) { (void)n; return NULL; }\n" ++
+                "#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n",
+            c,
+        });
+        defer test_gpa.free(exhausted);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(exhausted, "typedef int nonempty_translation_unit;", if (allocate) 1 else 0, if (allocate) "" else "ok\n", if (allocate) "panic: GC allocation failed\n" else "", mode);
+    }
+}
+
 const bitwise_program =
     \\let left: () -> i8 = {@print("L")
     \\    let a: []i8 = [6]

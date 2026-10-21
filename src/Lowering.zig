@@ -85,6 +85,16 @@ test "rejected matches and pipes roll back diagnostics on allocation failure" {
     }) |source| try std.testing.checkAllAllocationFailures(std.testing.allocator, testRejectedMatchAllocations, .{source});
 }
 
+test "rejected boolean matches roll back diagnostics on allocation failure" {
+    for ([_][]const u8{
+        "let f: (b: bool) -> int = match b {}",
+        "let f: (b: bool) -> int = match b {true => 1}",
+        "let f: (b: bool) -> int = match b {false => 1}",
+        "let f: (b: bool) -> int = match b {true => 1\ntrue | true => 2\nfalse => 3}",
+        "let f: (b: bool) -> int = match b {true => 1\nfalse | 1 => 2}",
+    }) |source| try std.testing.checkAllAllocationFailures(std.testing.allocator, testRejectedMatchAllocations, .{source});
+}
+
 test "rejected bitwise binaries roll back diagnostics on allocation failure" {
     for ([_][]const u8{
         "let f: () -> int = 1 & missing",
@@ -238,6 +248,45 @@ test "match reuses branch verification for sibling privacy and terminal metadata
     terminal.op.branch.returns = false;
     try std.testing.expectError(error.InvalidReturn, sema.ir.verify());
     terminal.op.branch.returns = true;
+    try sema.ir.verify();
+}
+
+test "exhaustive boolean match keeps private branches and terminal metadata" {
+    var module = try Module.init(std.testing.allocator, "boolean-match.nov",
+        \\let f: (b: bool) -> int = match b {
+        \\    true => {let private: int = 1
+        \\        private}
+        \\    false => 2
+        \\}
+        \\let g: (b: bool) -> int = match b {
+        \\    true => {return 3}
+        \\    false => {return 4}
+        \\}
+        \\let h: (b: bool) -> int = match b {true | false => 5}
+    );
+    defer module.deinit();
+    var sema = try lower(&module);
+    defer sema.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    const body = sema.ir.functions.items[0].body.?;
+    const merge = &@constCast(body.instructions)[@intFromEnum(body.result)];
+    try std.testing.expect(merge.op == .branch);
+    const saved = merge.op.branch;
+    merge.op.branch.else_value = saved.then_value;
+    try std.testing.expectError(error.InvalidValueId, sema.ir.verify());
+    merge.op.branch = saved;
+    merge.op.branch.then_value = saved.else_value.?;
+    try std.testing.expectError(error.InvalidValueId, sema.ir.verify());
+    merge.op.branch = saved;
+    const terminal_body = sema.ir.functions.items[1].body.?;
+    const terminal = &@constCast(terminal_body.instructions)[@intFromEnum(terminal_body.result)];
+    try std.testing.expect(terminal.op.branch.returns);
+    terminal.op.branch.returns = false;
+    try std.testing.expectError(error.InvalidReturn, sema.ir.verify());
+    terminal.op.branch.returns = true;
+    // A universal alternative needs neither a synthetic fallback nor a branch.
+    for (sema.ir.functions.items[2].body.?.instructions) |instruction| try std.testing.expect(instruction.op != .branch);
     try sema.ir.verify();
 }
 

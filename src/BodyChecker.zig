@@ -753,6 +753,32 @@ const Context = struct {
         return false;
     }
 
+    // Only a single canonical bool has finite coverage in this bounded slice.
+    // Validate even the final pattern: lowering may omit its comparison only
+    // after this proof, never merely because it is the last source prong.
+    fn booleanPatternCoverage(self: *Context, node: Ast.Node.Index, ty: Ir.TypeId, depth: usize) Error!?u2 {
+        if (depth >= max_recursive_depth) {
+            _ = try self.fail(.body_nesting_limit, node, null);
+            return null;
+        }
+        const ast = &self.module.ast;
+        if (ast.nodes.items(.tag)[node] == .bit_or) {
+            const data = ast.nodes.items(.data)[node];
+            const left = (try self.booleanPatternCoverage(data.lhs, ty, depth + 1)) orelse return null;
+            const right = (try self.booleanPatternCoverage(data.rhs, ty, depth + 1)) orelse return null;
+            return left | right;
+        }
+        if (self.wildcard(node)) return 3;
+        return switch (try Literal.check(self.module, self.ir, node, ty, null)) {
+            .constant => |id| if (self.ir.getConstant(id).?.value.boolean) @as(u2, 2) else @as(u2, 1),
+            .failed => null,
+            .not_literal => blk: {
+                _ = try self.fail(.unsupported_match_pattern, node, null);
+                break :blk null;
+            },
+        };
+    }
+
     // Patterns contain no effects. Comparisons use the subject snapshots, never
     // revisit subject ASTs, and reuse verified short-circuit boolean regions.
     fn matchPattern(self: *Context, node: Ast.Node.Index, subject: MatchSubject, depth: usize) Error!?MatchResult {
@@ -851,15 +877,11 @@ const Context = struct {
     fn matchExpression(self: *Context, node: Ast.Node.Index, expected: ?Known, hint: ?Known, depth: usize) Error!?Ir.TypeId {
         const ast = &self.module.ast;
         const match = ast.fullMatch(node).?.ast;
-        if (match.cases.len == 0) return self.fail(.match_missing_catchall, node, null);
-        for (match.cases, 0..) |case, i| {
+        for (match.cases) |case| {
             const patterns = ast.fullMatchCase(case).?.ast.values;
             const fallback = patterns.len == 1 and self.wildcard(patterns[0]);
             if (!fallback and patterns.len != match.subjects.len) return self.fail(.match_pattern_count, case, null);
             for (patterns) |pattern| if (!try self.patternShape(pattern, depth + 1)) return null;
-            const all = fallback or self.catchall(patterns);
-            if (all and i + 1 != match.cases.len) return self.fail(.match_catchall_not_last, case, null);
-            if (!all and i + 1 == match.cases.len) return self.fail(.match_missing_catchall, case, null);
         }
         const subjects = try self.module.allocator.alloc(MatchSubject, match.subjects.len);
         defer self.module.allocator.free(subjects);
@@ -869,6 +891,33 @@ const Context = struct {
             const scalar = self.ir.getType(ty).?;
             if (scalar != .boolean and scalar != .integer and scalar != .string) return self.fail(.unsupported_match_subject, subject, null);
             snapshot.* = .{ .ty = ty, .value = if (self.emitter) |emitter| try emitter.value(subject) else null };
+        }
+        if (subjects.len == 1 and self.ir.getType(subjects[0].ty).? == .boolean) {
+            var covered: u2 = 0;
+            var first_true: ?Module.Span = null;
+            var first_false: ?Module.Span = null;
+            for (match.cases) |case| {
+                const pattern = ast.fullMatchCase(case).?.ast.values[0];
+                const coverage = (try self.booleanPatternCoverage(pattern, subjects[0].ty, depth + 1)) orelse return null;
+                if (coverage & ~covered == 0) return self.fail(.match_covered_boolean_prong, pattern, if (coverage & 2 != 0) first_true else first_false);
+                if (coverage & 2 != 0 and first_true == null) first_true = self.span(pattern);
+                if (coverage & 1 != 0 and first_false == null) first_false = self.span(pattern);
+                covered |= coverage;
+            }
+            if (covered != 3) return self.fail(switch (covered) {
+                0 => .match_missing_boolean_values,
+                1 => .match_missing_true,
+                2 => .match_missing_false,
+                3 => unreachable,
+            }, node, null);
+        } else {
+            if (match.cases.len == 0) return self.fail(.match_missing_catchall, node, null);
+            for (match.cases, 0..) |case, i| {
+                const patterns = ast.fullMatchCase(case).?.ast.values;
+                const all = self.catchall(patterns);
+                if (all and i + 1 != match.cases.len) return self.fail(.match_catchall_not_last, case, null);
+                if (!all and i + 1 == match.cases.len) return self.fail(.match_missing_catchall, case, null);
+            }
         }
         const result = (try self.matchProngs(node, match.cases, subjects, hint, depth + 1)) orelse return null;
         if (self.emitter) |emitter| try emitter.values.put(emitter.allocator, node, result.value.?);
@@ -1589,6 +1638,95 @@ test "interpolation diagnoses names grammar types scopes and exact source bytes"
         try std.testing.expectEqual(case.tag, diagnostic.tag);
         try std.testing.expectEqualStrings(case.token, module.sourceSlice(diagnostic.span).?);
     }
+}
+
+test "boolean match coverage diagnoses missing values covered prongs and invalid final patterns" {
+    const Case = struct { patterns: []const u8, tag: Module.Diagnostic.Tag, token: []const u8, related: ?[]const u8 = null };
+    for ([_]Case{
+        .{ .patterns = "", .tag = .match_missing_boolean_values, .token = "match" },
+        .{ .patterns = "true => 1", .tag = .match_missing_false, .token = "match" },
+        .{ .patterns = "false | false => 1", .tag = .match_missing_true, .token = "match" },
+        .{ .patterns = "true => 1\ntrue | true => 2\nfalse => 3", .tag = .match_covered_boolean_prong, .token = "|", .related = "true" },
+        .{ .patterns = "false => 1\nfalse => 2\n_ => 3", .tag = .match_covered_boolean_prong, .token = "false", .related = "false" },
+        .{ .patterns = "true => 1\nfalse => 2\n_ => 3", .tag = .match_covered_boolean_prong, .token = "_", .related = "true" },
+        .{ .patterns = "_ | false => 1\ntrue => 2", .tag = .match_covered_boolean_prong, .token = "true", .related = "|" },
+        .{ .patterns = "true | false => 1\nfalse => 2", .tag = .match_covered_boolean_prong, .token = "false", .related = "|" },
+        .{ .patterns = "true => 1\n1 => 2", .tag = .literal_type_mismatch, .token = "1" },
+        .{ .patterns = "_ | 1 => 1", .tag = .literal_type_mismatch, .token = "1" },
+        .{ .patterns = "true, false => 1", .tag = .match_pattern_count, .token = "=>" },
+    }) |case| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let Flag = bool\nlet f: (b: Flag) -> int = match b {{{s}}}", .{case.patterns});
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "bool-match-error.nov", source);
+        defer module.deinit();
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+        const diagnostic = module.diagnostics.items[0];
+        try std.testing.expectEqual(case.tag, diagnostic.tag);
+        try std.testing.expectEqualStrings(case.token, module.sourceSlice(diagnostic.span).?);
+        if (case.related) |related| {
+            try std.testing.expectEqualStrings(related, module.sourceSlice(diagnostic.related.?).?);
+            try std.testing.expect(diagnostic.related.?.start < diagnostic.span.start);
+        }
+        try std.testing.expect(!sema.lowering_complete);
+        try std.testing.expectEqual(@as(usize, 0), sema.ir.functions.items.len);
+    }
+}
+
+test "boolean match coverage retains exact bidirectional types scopes and nonboolean restrictions" {
+    for ([_][]const u8{
+        "let f: (b: bool) -> int = match b {true => 1\nfalse => 2}",
+        "let f: (b: bool) -> int = match b {false | false => 1\ntrue => 2}",
+        "let f: (b: bool) -> int = match b {true => 1\ntrue | false => 2}",
+        "let f: (b: bool) -> int = match b {false => 1\nfalse | _ => 2}",
+        "let f: () -> int = match true {true => 1\n_ => 2}",
+        "let f: (b: bool, n: int) -> void = {let x = match b {true => 1\nfalse => n}\n@println(x)}",
+        "let f: (b: bool, a: []int) -> void = {let x = match b {true => []\nfalse => a}\n@println(x.len)}",
+        "let f: (b: bool, n: int) -> void = {let x = match b {true => {return}\nfalse => match b {true => 1\nfalse => n}}\n@println(x)}",
+        "let f: () -> int = match {return 7} {true => 1\nfalse => 2}",
+    }) |source| {
+        var module = try Module.init(std.testing.allocator, "bool-match.nov", source);
+        defer module.deinit();
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expect(sema.lowering_complete);
+        try sema.ir.verify();
+    }
+    const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag };
+    for ([_]Case{
+        .{ .source = "let f: () = {let x = match true {true => 1\nfalse => 2}\n@println(x)}", .tag = .literal_needs_type },
+        .{ .source = "let f: (b: bool) -> i8 = match b {true => 1\nfalse => 128}", .tag = .literal_out_of_range },
+        .{ .source = "let f: (b: bool) -> int = match b {true => 1\nfalse => false}", .tag = .literal_type_mismatch },
+        .{ .source = "let f: (b: bool) -> int = match b {true => {let private: int = 1\nprivate}\nfalse => private}", .tag = .unknown_name },
+        .{ .source = "let f: (b: bool) -> int = match b, b {true, true => 1\ntrue, false => 2\nfalse, true => 3\nfalse, false => 4}", .tag = .match_missing_catchall },
+        .{ .source = "let f: (n: u8) -> int = match n {0 | 255 => 1}", .tag = .match_missing_catchall },
+        .{ .source = "let f: (s: string) -> int = match s {\"\" => 1}", .tag = .match_missing_catchall },
+    }) |case| {
+        var module = try Module.init(std.testing.allocator, "bool-match-error.nov", case.source);
+        defer module.deinit();
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+        try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
+        try std.testing.expect(!sema.lowering_complete);
+    }
+}
+
+test "full integer domain coverage still requires a final catchall" {
+    var source = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer source.deinit();
+    try source.writer.writeAll("let f: (n: u8) -> int = match n {\n");
+    for (0..256) |n| try source.writer.print("{d} => 1\n", .{n});
+    try source.writer.writeAll("}");
+    var module = try Module.init(std.testing.allocator, "integer-match.nov", source.written());
+    defer module.deinit();
+    var sema = try Lowering.lower(&module);
+    defer sema.deinit();
+    try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+    try std.testing.expectEqual(Module.Diagnostic.Tag.match_missing_catchall, module.diagnostics.items[0].tag);
+    try std.testing.expect(!sema.lowering_complete);
 }
 
 test "match and pipes reject unsupported patterns arity defaults and inexact types" {

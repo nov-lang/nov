@@ -125,6 +125,26 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     _ = fixtures.add("strings.nov", @embedFile("examples/strings.nov"));
     _ = fixtures.add("interpolation.nov", @embedFile("examples/interpolation.nov"));
     _ = fixtures.add("type-aliases.nov", @embedFile("examples/type-aliases.nov"));
+    _ = fixtures.add("boolean-match.nov",
+        \\let Flag = bool
+        \\let choose: (b: Flag) -> int = match b {
+        \\    true => 1
+        \\    false => 2
+        \\}
+        \\let main: () -> void = {
+        \\    @println(
+        \\        choose(true),
+        \\        choose(false),
+        \\        @as(
+        \\            int,
+        \\            match false {
+        \\                true | false => 3
+        \\            }
+        \\        )
+        \\    )
+        \\}
+        \\
+    );
     _ = fixtures.add("alias-value.nov", "let Count = uint\nlet main: () = @println(Count)\n");
     _ = fixtures.add("alias-cycle.nov", "let A = []B\nlet B = A\n");
     _ = fixtures.add("ascription.nov", "let main: () -> void = {\n    @println(\"{@as(int, 1)}\", @as(uint, 1))\n    let a = @as([]int, [2])\n    @println(a[0])\n}\n");
@@ -217,6 +237,8 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         .{ .name = "fmt type aliases", .args = &.{ "fmt", "--check", "type-aliases.nov" }, .exit_code = 0 },
         .{ .name = "reject alias value", .args = &.{ "emit-c", "alias-value.nov" }, .exit_code = 1, .stderr_match = "expected a runtime value, found a type alias" },
         .{ .name = "reject alias cycle", .args = &.{ "check", "--semantic", "alias-cycle.nov" }, .exit_code = 1, .stderr_match = "cyclic type alias dependency" },
+        .{ .name = "check exhaustive boolean match", .args = &.{ "check", "--semantic", "boolean-match.nov" }, .exit_code = 0 },
+        .{ .name = "fmt exhaustive boolean match", .args = &.{ "fmt", "--check", "boolean-match.nov" }, .exit_code = 0 },
         .{ .name = "check ascription", .args = &.{ "check", "--semantic", "ascription.nov" }, .exit_code = 0 },
         .{ .name = "fmt ascription", .args = &.{ "fmt", "--check", "ascription.nov" }, .exit_code = 0 },
         .{ .name = "check interpolation", .args = &.{ "check", "--semantic", "interpolation.nov" }, .exit_code = 0 },
@@ -490,6 +512,19 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         aliases.expectStdOutEqual("Count: 8 8\n");
         aliases.expectStdErrEqual("");
         test_step.dependOn(&aliases.step);
+
+        const boolean_match = b.addRunArtifact(exe);
+        boolean_match.step.name = b.fmt("CLI: exhaustive boolean match ({s})", .{mode});
+        boolean_match.setCwd(fixtures.getDirectory());
+        boolean_match.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+        boolean_match.setEnvironmentVariable("NOV_CC", "");
+        boolean_match.setEnvironmentVariable("CC", "");
+        boolean_match.addArgs(&.{ "run", "boolean-match.nov" });
+        if (mode.len != 0) boolean_match.addArg(mode);
+        boolean_match.expectExitCode(0);
+        boolean_match.expectStdOutEqual("1 2 3\n");
+        boolean_match.expectStdErrEqual("");
+        test_step.dependOn(&boolean_match.step);
 
         const ascription = b.addRunArtifact(exe);
         ascription.step.name = b.fmt("CLI: ascription ({s})", .{mode});
