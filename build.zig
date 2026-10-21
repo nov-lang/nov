@@ -141,6 +141,22 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     _ = fixtures.add("return-program.nov", "let f: (c: bool) -> int = {if c {{return 42}}\n1 / 0}\nlet main: () -> void = {let b: bool = false and {return}\n@println(f(true), b)\nreturn}\n");
     _ = fixtures.add("mutable-program.nov", "let f: (c: bool) -> int = {let mut n: int = 1\nn += if c {return 42} else {2}\nn}\nlet main: () -> void = {let mut n: int = 1\nif true {n += 2}\nlet b: bool = false and {n = 99\ntrue}\n@println(n, b, f(true), f(false))}\n");
     _ = fixtures.add("loop-values.nov", @embedFile("examples/loop-values.nov"));
+    _ = fixtures.add("inclusive-range.nov",
+        \\let main: () = {
+        \\    loop i in 0..=2 {
+        \\        @println(i)
+        \\    }
+        \\    let max: u64 = 18446744073709551615
+        \\    loop i in max..=max {
+        \\        @println(i)
+        \\        continue
+        \\    }
+        \\    loop _ in 2..=1 {
+        \\        @println(false)
+        \\    }
+        \\}
+        \\
+    );
     _ = fixtures.add("loop-program.nov", "let f: () -> int = {let mut n: int = 0\nloop {if n == 5 {break}\nn += 1\nloop false {continue}\nif n == 2 {continue}\nif n == 4 {break}\n@println(n)}\nn}\nlet main: () -> void = @println(f())\n");
     _ = fixtures.add("else-break-outside.nov", "let main: () -> void = loop false {} else {break}\n");
     _ = fixtures.add("else-mismatch.nov", "let main: () -> void = {let x: bool = loop true {break true} else {1}\n}\n");
@@ -212,6 +228,8 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         .{ .name = "reject membership widening", .args = &.{ "emit-c", "membership-width.nov" }, .exit_code = 1, .stderr_match = "expression does not match the expected type" },
         .{ .name = "reject string membership", .args = &.{ "emit-c", "membership-string.nov" }, .exit_code = 1, .stderr_match = "operator is not supported for this operand type" },
         .{ .name = "reject array length writes", .args = &.{ "emit-c", "array-length-write.nov" }, .exit_code = 1, .stderr_match = "array .len is read-only" },
+        .{ .name = "check inclusive ranges", .args = &.{ "check", "--semantic", "inclusive-range.nov" }, .exit_code = 0 },
+        .{ .name = "fmt inclusive ranges", .args = &.{ "fmt", "--check", "inclusive-range.nov" }, .exit_code = 0 },
         .{ .name = "check semantic loops", .args = &.{ "check", "--semantic", "loop-program.nov" }, .exit_code = 0 },
         .{ .name = "check break outside loop", .args = &.{ "check", "--semantic", "break-outside.nov" }, .exit_code = 1, .stderr_match = "break and continue require an enclosing loop" },
         .{ .name = "emit rejects conditional value break", .args = &.{ "emit-c", "value-break.nov" }, .exit_code = 1, .stderr_match = "conditional loops cannot break with a value" },
@@ -328,9 +346,42 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         fizzbuzz.addArgs(&.{ "run", "fizzbuzz.nov" });
         if (mode.len != 0) fizzbuzz.addArg(mode);
         fizzbuzz.expectExitCode(0);
-        fizzbuzz.expectStdOutEqual("FizzBuzz\n1\n2\nFizz\n4\nBuzz\nFizz\n7\n8\nFizz\n");
+        fizzbuzz.expectStdOutEqual("1\n2\nFizz\n4\nBuzz\nFizz\n7\n8\nFizz\nBuzz\n11\nFizz\n13\n14\nFizzBuzz\n");
         fizzbuzz.expectStdErrEqual("");
         test_step.dependOn(&fizzbuzz.step);
+
+        const inclusive = b.addRunArtifact(exe);
+        inclusive.step.name = b.fmt("CLI: inclusive ranges ({s})", .{mode});
+        inclusive.setCwd(fixtures.getDirectory());
+        inclusive.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+        inclusive.setEnvironmentVariable("NOV_CC", "");
+        inclusive.setEnvironmentVariable("CC", "");
+        inclusive.addArgs(&.{ "run", "inclusive-range.nov" });
+        if (mode.len != 0) inclusive.addArg(mode);
+        inclusive.expectExitCode(0);
+        inclusive.expectStdOutEqual("0\n1\n2\n18446744073709551615\n");
+        inclusive.expectStdErrEqual("");
+        test_step.dependOn(&inclusive.step);
+
+        const inclusive_build = b.addRunArtifact(exe);
+        inclusive_build.step.name = b.fmt("CLI: build inclusive ranges ({s})", .{mode});
+        inclusive_build.setCwd(fixtures.getDirectory());
+        inclusive_build.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+        inclusive_build.setEnvironmentVariable("NOV_CC", "");
+        inclusive_build.setEnvironmentVariable("CC", "");
+        inclusive_build.addArgs(&.{ "build", "inclusive-range.nov" });
+        if (mode.len != 0) inclusive_build.addArg(mode);
+        inclusive_build.addArg("-o");
+        const inclusive_program = inclusive_build.addOutputFileArg(if (exe.root_module.resolved_target.?.result.os.tag == .windows) "inclusive.exe" else "inclusive");
+        inclusive_build.expectExitCode(0);
+        inclusive_build.expectStdOutEqual("");
+        inclusive_build.expectStdErrEqual("");
+        const inclusive_run = std.Build.Step.Run.create(b, b.fmt("CLI: execute inclusive ranges ({s})", .{mode}));
+        inclusive_run.addFileArg(inclusive_program);
+        inclusive_run.expectExitCode(0);
+        inclusive_run.expectStdOutEqual("0\n1\n2\n18446744073709551615\n");
+        inclusive_run.expectStdErrEqual("");
+        test_step.dependOn(&inclusive_run.step);
 
         const value_loops = b.addRunArtifact(exe);
         value_loops.step.name = b.fmt("CLI: loop values and continuations ({s})", .{mode});

@@ -398,7 +398,7 @@ pub fn renderError(self: Ast, parse_error: Error, writer: anytype) !void {
         //     });
         // },
         .unsupported_loop => return writer.writeAll("unsupported loop form; expected 'loop condition { ... }'"),
-        .unsupported_range_loop => return writer.writeAll("unsupported range loop; expected 'loop name in start..end { ... }' with both bounds; inclusive ranges, iterators, continuations and else are unsupported"),
+        .unsupported_range_loop => return writer.writeAll("unsupported range loop; expected 'loop name in start..end { ... }' or 'loop name in start..=end { ... }' with both bounds; iterators, continuations and else are unsupported"),
         .expected_decl => {
             return writer.print("expected declaration, found '{s}'", .{
                 token_tags[parse_error.token + @intFromBool(parse_error.token_is_prev)].symbol(),
@@ -1109,9 +1109,17 @@ pub fn fullDecl(self: Ast, node: Node.Index) ?full.Decl {
     };
 }
 
-pub fn fullRange(self: Ast, node: Node.Index) ?Node.RangeLoop {
+pub fn fullRange(self: Ast, node: Node.Index) ?full.RangeLoop {
     if (self.nodes.items(.tag)[node] != .loop_range) return null;
-    return self.extraData(self.nodes.items(.data)[node].lhs, Node.RangeLoop);
+    const range = self.extraData(self.nodes.items(.data)[node].lhs, Node.RangeLoop);
+    return .{
+        .binding = range.binding,
+        .start = range.start,
+        .end = range.end,
+        .body = range.body,
+        .range_token = range.range_token,
+        .inclusive = self.tokens.items(.tag)[range.range_token] == .period_period_equal,
+    };
 }
 
 pub fn fullLoop(self: Ast, node: Node.Index) ?struct { condition: Node.Index, continuation: Node.Index, body: Node.Index, else_expr: Node.Index = 0 } {
@@ -1222,6 +1230,14 @@ pub fn fullBlock(self: Ast, buffer: *[2]Node.Index, node: Node.Index) ?full.Bloc
 
 /// Fully assembled AST node information.
 pub const full = struct {
+    pub const RangeLoop = struct {
+        binding: Node.Index,
+        start: Node.Index,
+        end: Node.Index,
+        body: Node.Index,
+        range_token: TokenIndex,
+        inclusive: bool,
+    };
     // TODO: do we really need a separate struct for Decl just have a AttrDecl struct
     pub const Decl = struct {
         attributes: []const Node.Index,
@@ -1660,6 +1676,7 @@ pub const Node = struct {
     };
 
     pub const RangeLoop = struct {
+        range_token: TokenIndex,
         binding: Index,
         start: Index,
         end: Index,

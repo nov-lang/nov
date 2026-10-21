@@ -7,7 +7,7 @@ const Tokenizer = @import("Tokenizer.zig");
 /// local blocks, if/else, loops with optional conditions/continuations, returns,
 /// unlabeled loop controls (including value-bearing breaks),
 /// direct identifier assignments, scalar array types/literals/indexing/.len,
-/// membership, bounded exclusive integer range loops, scalar match/prongs, unary pipes,
+/// membership, bounded integer range loops, scalar match/prongs, unary pipes,
 /// and indexed assignments to direct identifiers.
 /// Formatting is syntactic,
 /// not a scope, mutability, or type check. Preserves line/doc comments and tokens.
@@ -171,7 +171,18 @@ fn checkSupported(ast: Ast) !void {
 fn sameStructure(a: Ast, b: Ast) bool {
     const tags = a.nodes.items(.tag);
     if (!std.mem.eql(Ast.Node.Tag, tags, b.nodes.items(.tag)) or
-        !std.mem.eql(Ast.Node.Index, a.extra_data, b.extra_data)) return false;
+        a.extra_data.len != b.extra_data.len) return false;
+    for (a.extra_data, b.extra_data, 0..) |x, y, i| {
+        if (x == y) continue;
+        // Raw range-token indices can shift when newlines are formatted.
+        // Compare token spelling instead; all node indices remain exact.
+        for (tags, a.nodes.items(.data)) |tag, data| {
+            if (tag == .loop_range and data.lhs == i) {
+                if (!std.mem.eql(u8, a.tokenSlice(x), b.tokenSlice(y))) return false;
+                break;
+            }
+        } else return false;
+    }
     for (tags, a.nodes.items(.data), b.nodes.items(.data)) |tag, x, y| {
         switch (tag) {
             .identifier, .number_literal, .char_literal, .string_literal, .builtin_literal => {},
@@ -573,6 +584,15 @@ test "range headers preserve comments newlines tokens and AST on the first pass"
         defer std.testing.allocator.free(formatted);
         try expectFormatted(source, formatted);
     }
+}
+
+test "inclusive range formatting preserves comments and is idempotent" {
+    const source = "let f: ()=loop _ in ; lower\n-{{128}}..= ; upper\n0 {continue}";
+    const formatted = try format(std.testing.allocator, source);
+    defer std.testing.allocator.free(formatted);
+    try expectFormatted(source, formatted);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{"let f: ()=loop i in 0..= ; upper\n2 {loop j in 0..=i {continue}}"});
+    try std.testing.expectError(error.InvalidSource, format(std.testing.allocator, "let x = 0..=2"));
 }
 
 test "range formatting survives every allocation failure" {

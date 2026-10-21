@@ -1341,9 +1341,13 @@ test "range endpoint controls belong to the enclosing scope and snapshots preced
         \\    @println(text)
         \\}
     ;
-    const c = try arrayTestProgram(source);
-    defer test_gpa.free(c);
-    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "01 2 17 18 42\n123 2 99 0\nmanaged result\n", "", mode);
+    for ([_]bool{ false, true }) |inclusive| {
+        const bounds = try std.mem.replaceOwned(u8, test_gpa, source, "..", if (inclusive) "..=" else "..");
+        defer test_gpa.free(bounds);
+        const c = try arrayTestProgram(bounds);
+        defer test_gpa.free(c);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, if (inclusive) "012 2 17 18 42\n1234 2 99 0\nmanaged result\n" else "01 2 17 18 42\n123 2 99 0\nmanaged result\n", "", mode);
+    }
 }
 
 const terminal_range_bounds =
@@ -1371,14 +1375,140 @@ test "range lowering and formatting survive every allocation failure" {
 }
 
 test "range allocating bodies report runtime OOM" {
-    const c = try arrayTestProgram("let main: () = loop i in 0..1 {@println(\"{i}\")}\n");
+    for ([_][]const u8{
+        "let main: () = loop i in 0..1 {@println(\"{i}\")}\n",
+        "let main: () = loop i in 0..=0 {@println(\"{i}\")}\n",
+    }) |source| {
+        const c = try arrayTestProgram(source);
+        defer test_gpa.free(c);
+        const exhausted = try std.mem.concat(test_gpa, u8, &.{
+            "#include <stdlib.h>\nstatic void *test_malloc(size_t n) { (void)n; return NULL; }\n#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n",
+            c,
+        });
+        defer test_gpa.free(exhausted);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(exhausted, "typedef int nonempty_translation_unit;", 1, "", "panic: GC allocation failed\n", mode);
+    }
+}
+
+const inclusive_range_program =
+    \\let mark: (s: string, n: uint) -> uint = {@print(s)
+    \\    n}
+    \\let early: () -> uint = {loop i in 0..=3 {if i == 1 {return i}}
+    \\    99}
+    \\let main: () = {
+    \\    let mut lo: uint = 0
+    \\    let mut hi: uint = 2
+    \\    loop i in mark("S", lo)..={lo = 9
+    \\        mark("E", hi)} {
+    \\        hi = 0
+    \\        let text = "i={i}" + "!"
+    \\        let a: []uint = [i, i + 1]
+    \\        loop j in 0..=2 {
+    \\            if j == 1 {continue}
+    \\            if j == 2 {break}
+    \\            @print(text, a[0])
+    \\        }
+    \\        continue
+    \\    }
+    \\    @println("", lo, hi, early())
+    \\    loop _ in 2..=1 {@println(false)}
+    \\    loop i in -1..=1 {@print(i)}
+    \\    loop _ in 0..=0 {@println(" done")}
+    \\}
+;
+
+test "inclusive ranges preserve snapshots controls fresh bindings formatting and GC roots" {
+    const c = try arrayTestProgram(inclusive_range_program);
     defer test_gpa.free(c);
-    const exhausted = try std.mem.concat(test_gpa, u8, &.{
-        "#include <stdlib.h>\nstatic void *test_malloc(size_t n) { (void)n; return NULL; }\n#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n",
-        c,
-    });
-    defer test_gpa.free(exhausted);
-    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(exhausted, "typedef int nonempty_translation_unit;", 1, "", "panic: GC allocation failed\n", mode);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "SEi=0! 0i=1! 1i=2! 2 9 0 1\n-101 done\n", "", mode);
+}
+
+test "inclusive nested range guards and endpoint controls target the correct owner" {
+    const source =
+        \\let main: () = {
+        \\    let lo: u8 = 254
+        \\    let hi: u8 = 255
+        \\    loop i in lo..=hi {
+        \\        loop _ in hi..=hi {continue}
+        \\        loop j in {if i == hi {continue}
+        \\            i}..=hi {@println(i, j)
+        \\            break}
+        \\        @println("body", i)
+        \\    }
+        \\    let mut hits: uint = 0
+        \\    loop i in lo..=hi {
+        \\        loop _ in lo..={if i == hi {break}
+        \\            hi} {hits += 1}
+        \\    }
+        \\    @println(hits)
+        \\}
+    ;
+    const c = try emitSource(source, null);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "void nov_main(void); int main(void) {nov_main(); return 0;}", 0, "254 254\nbody 254\n2\n", "", mode);
+}
+
+test "inclusive range terminal bounds retain parent control without type hints" {
+    const source = try std.mem.replaceOwned(u8, test_gpa, terminal_range_bounds, "..", "..=");
+    defer test_gpa.free(source);
+    const c = try arrayTestProgram(source);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "7 8 9 ab\n3\n", "", mode);
+}
+
+test "inclusive ranges visit all integer edge endpoints once including continue at MAX" {
+    var source = std.Io.Writer.Allocating.init(test_gpa);
+    defer source.deinit();
+    var output = std.Io.Writer.Allocating.init(test_gpa);
+    defer output.deinit();
+    try source.writer.writeAll("let main: () = {\n");
+    for ([_][]const u8{ "i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "int", "uint" }) |name| {
+        const bits: u7 = if (std.mem.eql(u8, name, "int") or std.mem.eql(u8, name, "uint")) @intCast(Ir.native_pointer_bits) else try std.fmt.parseInt(u7, name[1..], 10);
+        const signed = name[0] == 'i';
+        const min: i128 = if (signed) -(@as(i128, 1) << @intCast(bits - 1)) else 0;
+        const max: i128 = (@as(i128, 1) << @intCast(bits - @as(u7, @intFromBool(signed)))) - 1;
+        try source.writer.print("{{let a: {s} = {d}\nlet b: {s} = {d}\nloop i in a..={d} {{@println(i)}}\nloop i in {d}..=b {{@println(i)\ncontinue}}\nloop i in b..=b {{@println(i)\ncontinue}}\nloop _ in b..=a {{@println(false)}}\n}}\n", .{ name, min, name, max, min + 1, max - 1 });
+        try output.writer.print("{d}\n{d}\n{d}\n{d}\n{d}\n", .{ min, min + 1, max - 1, max, max });
+    }
+    const min: i128 = -(@as(i128, 1) << (Ir.native_pointer_bits - 1));
+    const max: u128 = (@as(u128, 1) << Ir.native_pointer_bits) - 1;
+    try source.writer.print("loop i in -{{{{{d}}}}}..={d} {{@println(i)}}\nloop i in {d}..={d} {{@println(i)\ncontinue}}\nloop i in {d}..={d} {{@println(i)}}\n}}\n", .{ -min, min, max, max, max - 1, max });
+    try output.writer.print("{d}\n{d}\n{d}\n{d}\n", .{ min, max, max - 1, max });
+    const terminated = try test_gpa.dupeZ(u8, source.written());
+    defer test_gpa.free(terminated);
+    const formatted = try @import("Formatter.zig").format(test_gpa, terminated);
+    defer test_gpa.free(formatted);
+    const c = try emitSource(source.written(), null);
+    defer test_gpa.free(c);
+    const formatted_c = try emitSource(formatted, null);
+    defer test_gpa.free(formatted_c);
+    try std.testing.expectEqualStrings(c, formatted_c);
+    try std.testing.expect(std.mem.indexOf(u8, c, "nov_rt_heap") == null);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "void nov_main(void); int main(void) {nov_main(); return 0;}", 0, output.written(), "", mode);
+}
+
+test "inclusive range C emission owns all data after source destruction" {
+    var sema = owned: {
+        var module = try Module.init(test_gpa, "inclusive.nov", inclusive_range_program);
+        defer module.deinit();
+        var result = try Lowering.lower(&module);
+        errdefer result.deinit();
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expect(result.lowering_complete);
+        break :owned result;
+    };
+    defer sema.deinit();
+    try sema.ir.verify();
+    const c = try emitProgram(test_gpa, &sema.ir, null);
+    defer test_gpa.free(c);
+    try compileAndRunExpected(c, "typedef int nonempty_translation_unit;", 0, "SEi=0! 0i=1! 1i=2! 2 9 0 1\n-101 done\n", "");
+}
+
+test "inclusive range compiler ownership survives every allocation failure" {
+    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{inclusive_range_program});
+    const source = try std.mem.replaceOwned(u8, test_gpa, terminal_range_bounds, "..", "..=");
+    defer test_gpa.free(source);
+    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{source});
 }
 
 const string_interpolation =

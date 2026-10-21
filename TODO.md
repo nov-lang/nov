@@ -461,14 +461,17 @@ or return. It is outside the completed loop's control scope: its break/continue
 target an outer loop or diagnose. Terminal exhaustion paths do not contribute a
 merge value. Arrays copy at value boundaries; strings share. Conditional loops
 without `else` remain void and reject value breaks; unconditional `else` remains
-rejected. Bounded ascending `loop i in start..end { ... }` is implemented with
+rejected. Bounded ascending `loop i in start..end { ... }` and
+`loop i in start..=end { ... }` are implemented with
 once-only left-to-right endpoint snapshots, an immutable per-iteration index (or
-`_` discard), exact known integer bound types and overflow-free exclusive-end
-iteration. Only two untyped literal bounds default: native `uint` when both are
-nonnegative (including zero), otherwise native `int`, with checked native fits.
+`_` discard), exact known integer bound types and overflow-free iteration.
+Inclusive iteration visits the endpoint once and exits before incrementing it,
+including on `continue` at the maximum integer. Only two untyped literal bounds
+default: native `uint` when both are nonnegative (including zero), otherwise native
+`int`, with checked native fits.
 This is not a general literal default or runtime signedness selection. Range loops
 yield void; continue increments, break/return do not. Range-loop else, explicit
-continuations, value breaks, inclusive/unbounded/stepped/descending ranges,
+continuations, value breaks, unbounded/stepped/descending ranges,
 general iterators, references, multiple bindings and labels remain rejected.
 Ranges are not general values or membership containers. See README for syntax.
 `examples/fibo.nov` (unchanged) and `examples/fizzbuzz.nov` now pass semantic and

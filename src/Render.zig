@@ -240,7 +240,7 @@ fn renderExpression(self: *Render, node: Ast.Node.Index, space: Space) RenderErr
             try self.renderExpression(loop.binding, .space);
             try self.renderToken(ast.lastToken(loop.binding) + 1, .space);
             try self.renderExpression(loop.start, .none);
-            try self.renderToken(ast.lastToken(loop.start) + 1, .none);
+            try self.renderToken(loop.range_token, .none);
             try self.renderExpression(loop.end, .space);
             return self.renderExpression(loop.body, space);
         },

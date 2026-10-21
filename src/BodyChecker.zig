@@ -963,7 +963,7 @@ const Context = struct {
             counter = try emitter.append(index_type, self.irSpan(node), .{ .local_slot = try emitter.value(loop.start) });
             condition_start = @intCast(emitter.instructions.items.len);
             const loaded = try emitter.append(index_type, self.irSpan(node), .{ .local_load = counter });
-            condition = try emitter.append(boolean, self.irSpan(node), .{ .binary = .{ .op = .lt, .lhs = loaded, .rhs = try emitter.value(loop.end) } });
+            condition = try emitter.append(boolean, self.irSpan(node), .{ .binary = .{ .op = if (loop.inclusive) .le else .lt, .lhs = loaded, .rhs = try emitter.value(loop.end) } });
         }
         const body_start: u32 = if (self.emitter) |emitter| @intCast(emitter.instructions.items.len) else 0;
         if (self.emitter) |emitter| current = try emitter.append(index_type, self.irSpan(node), .{ .local_load = counter });
@@ -973,9 +973,21 @@ const Context = struct {
         if (self.emitter) |emitter| {
             const continuation_start: u32 = @intCast(emitter.instructions.items.len);
             const old = try emitter.append(index_type, self.irSpan(node), .{ .local_load = counter });
+            if (loop.inclusive) {
+                const at_end = try emitter.append(boolean, self.irSpan(node), .{ .binary = .{ .op = .eq, .lhs = old, .rhs = try emitter.value(loop.end) } });
+                const then_start: u32 = @intCast(emitter.instructions.items.len);
+                const exit = try emitter.append(unit, self.irSpan(node), .{ .loop_break = null });
+                _ = try emitter.append(unit, self.irSpan(node), .{ .branch = .{
+                    .condition = at_end,
+                    .then_start = then_start,
+                    .else_start = @intCast(emitter.instructions.items.len),
+                    .then_value = exit,
+                    .else_value = null,
+                } });
+            }
             const one = try emitter.append(index_type, self.irSpan(node), .{ .constant = try self.ir.internConstant(.{ .ty = index_type, .value = if (self.ir.getType(index_type).?.integer.signedness == .signed) .{ .signed_integer = 1 } else .{ .unsigned_integer = 1 } }) });
-            // current < end <= MAX, so this addition cannot overflow, even
-            // when MAX itself is the excluded endpoint.
+            // Exclusive conditions and the inclusive terminal guard both
+            // establish current < end <= MAX before this addition.
             const next = try emitter.append(index_type, self.irSpan(node), .{ .binary = .{ .op = .add, .lhs = old, .rhs = one } });
             const continuation = try emitter.append(unit, self.irSpan(node), .{ .local_store = .{ .slot = counter, .value = next } });
             try emitter.record(node, unit, self.irSpan(node), .{ .loop = .{
@@ -1692,6 +1704,7 @@ test "range bounds require exact integer types and immutable lexical bindings" {
         .{ .body = "loop int in 0..2 {}", .tag = .unsupported_shadowing },
         .{ .body = "loop i in 0..2 {let i: int = 1\n}", .tag = .unsupported_shadowing },
         .{ .body = "{let a: i8 = -1\nlet b: i16 = 2\nloop i in a..b {}}", .tag = .expression_type_mismatch },
+        .{ .body = "{let a: i8 = 1\nlet b: u8 = 2\nloop i in a..b {}}", .tag = .expression_type_mismatch },
         .{ .body = "{let a: i8 = -1\nloop i in a..128 {}}", .tag = .literal_out_of_range },
         .{ .body = "{let a: u8 = 1\nloop i in -1..a {}}", .tag = .literal_out_of_range },
         .{ .body = "loop i in true..false {}", .tag = .operator_not_supported },
@@ -1703,17 +1716,21 @@ test "range bounds require exact integer types and immutable lexical bindings" {
         .{ .body = "loop i in 0..2 {continue\n@println(i)}", .tag = .unreachable_code },
         .{ .body = "loop i in 0..2 {@println(_)}", .tag = .unknown_name },
     }) |case| {
-        const source = try std.fmt.allocPrint(std.testing.allocator, "let f: () -> void = {s}", .{case.body});
-        defer std.testing.allocator.free(source);
-        var module = try Module.init(std.testing.allocator, "range.nov", source);
-        defer module.deinit();
-        errdefer std.debug.print("range case: {s}\n", .{case.body});
-        try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
-        var sema = try @import("Lowering.zig").lower(&module);
-        defer sema.deinit();
-        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
-        try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
-        try std.testing.expect(!sema.lowering_complete);
+        for ([_][]const u8{ "..", "..=" }) |operator| {
+            const body = try std.mem.replaceOwned(u8, std.testing.allocator, case.body, "..", operator);
+            defer std.testing.allocator.free(body);
+            const source = try std.fmt.allocPrint(std.testing.allocator, "let f: () -> void = {s}", .{body});
+            defer std.testing.allocator.free(source);
+            var module = try Module.init(std.testing.allocator, "range.nov", source);
+            defer module.deinit();
+            errdefer std.debug.print("range case: {s}\n", .{case.body});
+            try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+            var sema = try @import("Lowering.zig").lower(&module);
+            defer sema.deinit();
+            try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+            try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
+            try std.testing.expect(!sema.lowering_complete);
+        }
     }
 }
 
@@ -1726,15 +1743,19 @@ test "range literal defaults are native checked and never widen typed bounds" {
         try std.fmt.allocPrint(std.testing.allocator, "loop _ in -1..{d} {{}}", .{@as(u128, 1) << (Ir.native_pointer_bits - 1)}),
     }) |body| {
         defer std.testing.allocator.free(body);
-        const source = try std.mem.concat(std.testing.allocator, u8, &.{ "let f: () = ", body });
-        defer std.testing.allocator.free(source);
-        var module = try Module.init(std.testing.allocator, "range.nov", source);
-        defer module.deinit();
-        var sema = try @import("Lowering.zig").lower(&module);
-        defer sema.deinit();
-        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
-        try std.testing.expectEqual(Module.Diagnostic.Tag.literal_out_of_range, module.diagnostics.items[0].tag);
-        try std.testing.expect(!sema.lowering_complete);
+        for ([_][]const u8{ "..", "..=" }) |operator| {
+            const bounds = try std.mem.replaceOwned(u8, std.testing.allocator, body, "..", operator);
+            defer std.testing.allocator.free(bounds);
+            const source = try std.mem.concat(std.testing.allocator, u8, &.{ "let f: () = ", bounds });
+            defer std.testing.allocator.free(source);
+            var module = try Module.init(std.testing.allocator, "range.nov", source);
+            defer module.deinit();
+            var sema = try @import("Lowering.zig").lower(&module);
+            defer sema.deinit();
+            try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+            try std.testing.expectEqual(Module.Diagnostic.Tag.literal_out_of_range, module.diagnostics.items[0].tag);
+            try std.testing.expect(!sema.lowering_complete);
+        }
     }
 }
 

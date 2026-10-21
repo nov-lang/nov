@@ -102,7 +102,7 @@ nov file.nov --cc /path/to/cc
 nov check --semantic examples/fibo.nov examples/fizzbuzz.nov
 nov fmt --check examples/fibo.nov examples/fizzbuzz.nov
 nov run examples/fibo.nov            # 55
-nov run examples/fizzbuzz.nov        # ten lines, FizzBuzz at 0 through Fizz at 9
+nov run examples/fizzbuzz.nov        # fifteen lines, 1 through FizzBuzz at 15
 ```
 
 Both examples also work with `--debug` and `--release`, and can be built with
@@ -409,9 +409,10 @@ ranges, with checked break operands/result types and explicit terminal merges.
 Verification checks nesting, terminal paths, and region-private references. Only outer slots carry mutable state across
 backedges. C emission evaluates ordered instructions in the correct region, rather
 than hoisting snapshots before the loop. Managed loop results stay rooted across
-allocations and function returns. Bounded ascending exclusive integer range loops
-reuse this IR with endpoint snapshots and a private counter. General iterators and
-labels remain unsupported and diagnosed.
+allocations and function returns. Bounded ascending exclusive/inclusive integer
+range loops reuse this IR with endpoint snapshots and a private counter. Inclusive
+continuations exit at the endpoint before adding one, so even MAX cannot overflow.
+General iterators and labels remain unsupported and diagnosed.
 
 Format files in place with `zig build run -- fmt file.nov`, or use
 `zig build run -- fmt --check file.nov` to check formatting without writing.
@@ -947,6 +948,7 @@ The executable subset supports bounded ascending integer iteration only:
 let accept: (n: uint) -> void = @println(n)
 let main: () = {
     loop i in 0..10 {accept(i)}
+    loop i in 0..=10 {accept(i)} ; includes 10
     loop _ in -2..2 {} ; discard the index
 }
 ```
@@ -955,7 +957,9 @@ let main: () = {
   scope. Both values are snapshots: changing their source bindings in the body
   does not change the counter or endpoint. The index is not in scope in bounds.
 - `..` excludes the upper endpoint. `start >= end` is empty; otherwise increment
-  by one. Even a maximum-integer exclusive endpoint is finite and cannot wrap.
+  by one. `..=` includes the upper endpoint; `start > end` is empty. Both
+  forms are finite even at a maximum-integer endpoint: inclusive iteration exits
+  after that endpoint without incrementing it, including on body-side `continue`.
 - If either bound has a known integer type, use that **exact** type for both
   bounds and the index; no implicit widening or signedness conversion occurs.
   A dynamic signed bound stays signed, even when its runtime value is positive.
@@ -968,15 +972,16 @@ let main: () = {
 - The index is immutable and fresh in the body's lexical scope each iteration.
   `_` discards it and creates no binding. Existing no-shadowing rules apply.
 - Range loops yield `void`; continuing bodies must yield `void`. Body-side
-  `continue` increments then checks the condition; `break` and `return` skip the
-  increment. Bounds use the enclosing control scope, before the new loop starts.
+  `continue` advances (or exits at an inclusive endpoint) then checks the condition;
+  `break` and `return` skip the increment. Bounds use the enclosing control scope,
+  before the new loop starts.
 
-Ranges are not general values or membership containers. Missing bounds, `..=`,
+Ranges are not general values or membership containers. Missing bounds,
 steps/descending iteration, array/string/general iterators, multiple bindings,
 references, labels, user continuation clauses, range-loop `else`, and value breaks
 are explicitly unsupported. There is no `for` keyword alias. Header expressions
 retain the existing single-newline continuation rules, including after `in` and
-`..`; the body follows the completed upper-bound expression without a newline.
+`..`/`..=`; the body follows the completed upper-bound expression without a newline.
 
 ## Match
 
@@ -1071,9 +1076,9 @@ let main: () -> void = {
 ```
 
 The condition/unconditional forms and continuation clauses below are executable.
-The conditional `else` and bounded exclusive integer range examples are also
-executable (see [Range](#range)). General iteration, inclusive ranges, references,
-and labels below still describe intended syntax.
+The conditional `else` and bounded exclusive/inclusive integer range examples are
+also executable (see [Range](#range)). General iteration, references, and labels
+below still describe intended syntax.
 
 ```nov
 ; items can be an array, a slice, a string or an iterator

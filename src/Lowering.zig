@@ -237,15 +237,25 @@ test "exhaustion controls belong to parent loops and IR outlives the source" {
 }
 
 test "range snapshots private counter and iteration values retain verified ownership" {
+    try testRangeOwnership(false);
+}
+
+test "inclusive range guarded continuation retains source-free ownership and privacy" {
+    try testRangeOwnership(true);
+}
+
+fn testRangeOwnership(inclusive: bool) !void {
     var sema = owned: {
-        var module = try Module.init(std.testing.allocator, "range.nov",
+        const source = try std.mem.replaceOwned(u8, std.testing.allocator,
             \\let f: (a: i8, b: i8) -> void = {
             \\    loop i in a..b {let mut local: i8 = i
             \\        local += 1
             \\        if i == 0 {continue}
             \\    }
             \\}
-        );
+        , "..", if (inclusive) "..=" else "..");
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "range.nov", source);
         defer module.deinit();
         var result = try lower(&module);
         errdefer result.deinit();
@@ -274,6 +284,15 @@ test "range snapshots private counter and iteration values retain verified owner
     // A body-private snapshot must not leak into a sibling continuation,
     // and a body-local slot cannot replace the enclosing counter identity.
     const continuation = loop.continuation_start.?;
+    try std.testing.expectEqual(if (inclusive) Ir.BinaryOp.le else Ir.BinaryOp.lt, instructions[condition].op.binary.op);
+    if (inclusive) {
+        try std.testing.expectEqual(Ir.BinaryOp.eq, instructions[continuation + 1].op.binary.op);
+        try std.testing.expect(instructions[continuation + 2].op == .loop_break);
+        try std.testing.expect(instructions[continuation + 2].op.loop_break == null);
+        try std.testing.expectEqual(owner, Ir.enclosingLoop(body, continuation + 2).?);
+        try std.testing.expect(instructions[continuation + 3].op == .branch);
+        try std.testing.expectEqual(Ir.BinaryOp.add, instructions[continuation + 5].op.binary.op);
+    }
     const saved = instructions[continuation];
     instructions[continuation].op = .{ .unary = .{ .op = .negate, .operand = private_current } };
     try std.testing.expectError(error.InvalidValueId, sema.ir.verify());
