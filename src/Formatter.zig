@@ -471,6 +471,55 @@ test "nested list expansion and empty block comments stabilize on the first pass
     }
 }
 
+test "standalone block comments use statement indentation" {
+    try expectFormatted(
+        "let main:()->void={@println(true)\n; @println(\"{describe(1, 5, 5)}\\n{describe(5, 1, 3)}\")\nlet max:u64=1\n; before close\n}\n",
+        "let main: () -> void = {\n    @println(true)\n    ; @println(\"{describe(1, 5, 5)}\\n{describe(5, 1, 3)}\")\n    let max: u64 = 1\n    ; before close\n}\n",
+    );
+    const expected =
+        \\let main: () -> void = {
+        \\    ; before first statement
+        \\    let mut n = 0 ; inline declaration
+        \\    ; after declaration
+        \\    if true {
+        \\        ; before loop
+        \\        loop n < 2 {
+        \\            n += 1 ; inline assignment
+        \\            ; after assignment
+        \\            @println(n) ; inline call
+        \\            ; after call
+        \\            continue ; inline continue
+        \\            ; before loop close
+        \\        }
+        \\        ; after loop
+        \\    } else {
+        \\        ; empty else block
+        \\    }
+        \\    ; after if
+        \\    match n {
+        \\        0 => {
+        \\            ; before nested block
+        \\            {
+        \\                @println(n)
+        \\                ; before nested close
+        \\            }
+        \\            ; before prong close
+        \\        }
+        \\        ; between prongs
+        \\        _ => {
+        \\            ; empty prong block
+        \\        }
+        \\    }
+        \\    ; after match
+        \\    return ; inline return
+        \\    ; before function close
+        \\}
+        \\; after function
+        \\
+    ;
+    try expectFormatted(expected, expected);
+}
+
 test "comments and continuations inside executable forms survive" {
     const source = ";;; function\nlet f:(x:int)->int={ ; open\n; local\nlet mut n:int= ; init\n x + ; add\n 1\n\nn *= ; store\n 2\nif n > 0 {; then\nreturn ; result\n n ; value\n} else {return 0} ; branch\n} ; end\n";
     const formatted = try format(std.testing.allocator, source);

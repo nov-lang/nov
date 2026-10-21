@@ -222,6 +222,9 @@ fn renderExpression(self: *Render, node: Ast.Node.Index, space: Space) RenderErr
             } else {
                 try ais.pushIndent(.normal);
                 try self.renderToken(block.ast.lbrace, .newline);
+                // Statement-ending comments belong to this block, not the
+                // enclosing declaration's spacing scope.
+                try ais.pushSpace(.endline);
                 for (block.ast.statements, 0..) |statement, i| {
                     if (i != 0) try self.renderExtraNewline(statement);
                     if (node_tags[statement] == .decl) {
@@ -230,6 +233,7 @@ fn renderExpression(self: *Render, node: Ast.Node.Index, space: Space) RenderErr
                         try self.renderExpression(statement, .endline);
                     }
                 }
+                ais.popSpace();
                 ais.popIndent();
             }
             return self.renderToken(block.ast.rbrace, space);
