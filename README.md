@@ -47,7 +47,7 @@ this is not a general integer-literal default.
 Lowering produces typed operations with source spans, ordered operands/call
 arguments, explicit returns, and structured regions for boolean `and`/`or`,
 `if`/`else`, scalar `match`, and condition-based or unconditional loops with optional continuation
-clauses, value-carrying breaks, and conditional-loop exhaustion (`else`) results.
+clauses, value-carrying breaks, and conditional/range-loop exhaustion (`else`) results.
 It requires immutable literal globals; unit/global block initializers are
 not lowered yet. An internal C11 backend emits verified IR, including fixed-width
 integer arithmetic and program entrypoint emission through `emit-c`.
@@ -64,7 +64,7 @@ boolean or string literals. Functions need explicit supported signatures and bou
 expression bodies (including forward/recursive calls, local declarations and
 assignments, nested blocks, boolean short-circuiting, `if`/`else`, explicit returns,
 bounded integer range loops, condition-based or unconditional loops with continuation clauses and unlabeled
-`break`/`continue`, value-producing unconditional or conditional-with-`else` loops,
+`break`/`continue`, value-producing unconditional, conditional-with-`else`, or range-with-`else` loops,
 and empty void bodies).
 Inferred globals, mutable globals, nonliteral global initializers, global unit
 values are currently rejected, along with the other
@@ -103,6 +103,7 @@ nov check --semantic examples/fibo.nov examples/fizzbuzz.nov
 nov fmt --check examples/fibo.nov examples/fizzbuzz.nov
 nov run examples/fibo.nov            # 55
 nov run examples/fizzbuzz.nov        # fifteen lines, 1 through FizzBuzz at 15
+nov run examples/range-search.nov    # exclusive/inclusive searches and MAX exhaustion
 ```
 
 Both examples also work with `--debug` and `--release`, and can be built with
@@ -971,14 +972,34 @@ let main: () = {
   or untyped arithmetic expressions. It does not involve constant folding.
 - The index is immutable and fresh in the body's lexical scope each iteration.
   `_` discards it and creates no binding. Existing no-shadowing rules apply.
-- Range loops yield `void`; continuing bodies must yield `void`. Body-side
-  `continue` advances (or exits at an inclusive endpoint) then checks the condition;
-  `break` and `return` skip the increment. Bounds use the enclosing control scope,
-  before the new loop starts.
+- Without `else`, range loops yield `void` and reject value breaks. Continuing
+  bodies always yield `void`. Body-side `continue` advances (or exhausts at an
+  inclusive endpoint); `break` and `return` skip the increment.
+- With `else`, normal exhaustion runs the fallback exactly once, including empty
+  and reversed ranges. Source `break` (including at MAX) and `return` skip it;
+  inclusive endpoint completion, including `continue` at MAX, does not skip it.
+  `break value` and continuing fallback results use the same exact contextual or
+  bidirectional inference as conditional-loop results: bool, integer, string,
+  scalar array, or function, with no widening or general literal defaults.
+  Arrays copy independently at break/fallback and result boundaries; immutable
+  strings share rooted storage. Terminal fallback paths contribute no merge value.
+- Bounds use the enclosing control scope before the new loop starts. The fallback
+  is also outside the completed range's control scope: its `break`/`continue`
+  targets an outer loop or diagnoses if none exists. The index is visible only in
+  the body, never in either bound or the fallback; body locals do not escape.
+
+```nov
+let contains: (start: uint, end: uint, target: uint) -> bool = loop i in start..end {
+    if i == target {break true}
+} else {false}
+```
+
+See [`examples/range-search.nov`](examples/range-search.nov) for executable
+exclusive/inclusive searches and overflow-free MAX exhaustion.
 
 Ranges are not general values or membership containers. Missing bounds,
 steps/descending iteration, array/string/general iterators, multiple bindings,
-references, labels, user continuation clauses, range-loop `else`, and value breaks
+references, labels, user continuation clauses, and value breaks without `else`
 are explicitly unsupported. There is no `for` keyword alias. Header expressions
 retain the existing single-newline continuation rules, including after `in` and
 `..`/`..=`; the body follows the completed upper-bound expression without a newline.
@@ -1131,7 +1152,8 @@ let rangeHasNumber: (begin: uint, end: uint, number: uint) -> bool = {
 ## Break & Continue
 Unlabeled `break` and `continue` target the innermost loop, including from nested
 blocks, branches and short-circuit expressions. Unconditional loops and conditional
-loops with `else` support `break value`; conditional loops without `else` support
+loops with `else`, including bounded ranges, support `break value`; conditional
+and range loops without `else` support
 only bare `break`. A loop's `else` is outside that loop's control scope. With a
 continuation clause, body-side `continue` runs the continuation; condition-side
 or continuation-side `continue` reevaluates the condition directly. `break` and

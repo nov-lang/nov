@@ -1511,6 +1511,120 @@ test "inclusive range compiler ownership survives every allocation failure" {
     try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{source});
 }
 
+const range_else_program =
+    \\let identity: (n: int) -> int = n
+    \\let allocate: (n: int) -> []int = [n, n + 1]
+    \\let search: (lo: uint, hi: uint, target: uint) -> bool = loop i in lo..hi {
+    \\    if i == target {break true}
+    \\} else {false}
+    \\let early: () -> string = loop _ in 0..2 {return "return"} else {"wrong"}
+    \\let outer: () -> int = loop {
+    \\    loop _ in 2..1 {} else {break 42}
+    \\}
+    \\let terminal: () -> int = loop _ in 0..0 {} else {return 7}
+    \\let parent: () -> int = loop {loop _ in {break 8}..10 {} else {break 9}}
+    \\let main: () = {
+    \\    @println(search(0, 3, 2), search(0, 2, 2), search(3, 1, 2), early(), outer(), terminal(), parent())
+    \\    let a = loop i in 0..2 {if i == 0 {break 4}
+    \\        break identity(5)} else {6}
+    \\    let b = loop _ in 0..0 {break 1} else {identity(2)}
+    \\    let index = loop i in 0..2 {if i == 0 {break 3}
+    \\        break i} else {4}
+    \\    let callback = loop _ in 0..0 {break identity} else {identity}
+    \\    @println(a, b, index, callback(9))
+    \\    let from_index = if true {0} else {loop i in 0..2 {break i} else {1}}
+    \\    let inferred_outer = loop {loop _ in 1..0 {} else {break identity(12)}}
+    \\    let empty_array = loop _ in 0..1 {break []} else {allocate(1)}
+    \\    @println(from_index, inferred_outer, empty_array.len)
+    \\    let mut source: []int = [10, 11]
+    \\    let mut broken = loop _ in 0..1 {break source} else {allocate(99)}
+    \\    let mut exhausted = loop _ in 2..1 {break allocate(99)} else {source}
+    \\    broken[0] = 20
+    \\    exhausted[0] = 30
+    \\    source[0] = 40
+    \\    let text = loop _ in 0..0 {break "bad"} else {"fall" + "back"}
+    \\    let shared = text
+    \\    let allocated = allocate(50)
+    \\    @println(source[0], broken[0], exhausted[0], allocated[0], shared, text)
+    \\    let subject = match loop _ in 0..1 {break 1} else {identity(2)} {1 => "one"
+    \\        _ => "other"}
+    \\    @println(subject)
+    \\    let mut attempts: int = 0
+    \\    loop attempts < 3 : attempts += 1 {
+    \\        loop _ in 0..0 {} else {continue}
+    \\    }
+    \\    @println(attempts)
+    \\    loop _ in 0..1 {} else {let i: int = 5
+    \\        loop _ in 0..1 {break}
+    \\        @println(i)}
+    \\}
+;
+
+test "range else results infer exactly copy arrays share strings and preserve outer controls" {
+    for ([_]bool{ false, true }) |inclusive| {
+        // Keep zero-iteration ranges empty in both forms.
+        const empty = try std.mem.replaceOwned(u8, test_gpa, range_else_program, "0..0", "1..0");
+        defer test_gpa.free(empty);
+        const source = try std.mem.replaceOwned(u8, test_gpa, empty, "..", if (inclusive) "..=" else "..");
+        defer test_gpa.free(source);
+        const c = try arrayTestProgram(source);
+        defer test_gpa.free(c);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, if (inclusive) "true true false return 42 7 8\n4 2 3 9\n0 12 0\n40 20 30 50 fallback fallback\none\n3\n5\n" else "true false false return 42 7 8\n4 2 3 9\n0 12 0\n40 20 30 50 fallback fallback\none\n3\n5\n", "", mode);
+    }
+}
+
+test "range else distinguishes inclusive MAX exhaustion continue source break and return" {
+    var source = std.Io.Writer.Allocating.init(test_gpa);
+    defer source.deinit();
+    var output = std.Io.Writer.Allocating.init(test_gpa);
+    defer output.deinit();
+    try source.writer.writeAll("let main: () = {\n");
+    for ([_][]const u8{ "i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "int", "uint" }) |name| {
+        const bits: u7 = if (std.mem.eql(u8, name, "int") or std.mem.eql(u8, name, "uint")) @intCast(Ir.native_pointer_bits) else try std.fmt.parseInt(u7, name[1..], 10);
+        const max: i128 = (@as(i128, 1) << @intCast(bits - @as(u7, @intFromBool(name[0] == 'i')))) - 1;
+        try source.writer.print("{{let hi: {s} = {d}\nlet mut hits: int = 0\nloop _ in hi..hi {{hits += 100}} else {{hits += 1}}\nloop _ in hi..=hi {{hits += 10\ncontinue}} else {{hits += 1}}\nloop _ in hi..=hi {{break}} else {{hits += 100}}\nlet found = loop i in hi..=hi {{break i}} else {{hi}}\n@println(hits, found)\n}}\n", .{ name, max });
+        try output.writer.print("12 {d}\n", .{max});
+    }
+    try source.writer.writeAll("}\n");
+    const c = try emitSource(source.written(), null);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "void nov_main(void); int main(void) {nov_main(); return 0;}", 0, output.written(), "", mode);
+}
+
+test "range else ownership and probes survive every allocation failure" {
+    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{range_else_program});
+    const inclusive = try std.mem.replaceOwned(u8, test_gpa, range_else_program, "..", "..=");
+    defer test_gpa.free(inclusive);
+    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{inclusive});
+}
+
+test "range else emitted results outlive source and report allocation failure" {
+    var sema = owned: {
+        var module = try Module.init(test_gpa, "range-else.nov", range_else_program);
+        defer module.deinit();
+        var result = try Lowering.lower(&module);
+        errdefer result.deinit();
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expect(result.lowering_complete);
+        break :owned result;
+    };
+    defer sema.deinit();
+    try sema.ir.verify();
+    const c = try emitProgram(test_gpa, &sema.ir, null);
+    defer test_gpa.free(c);
+    try compileAndRunExpected(c, "typedef int nonempty_translation_unit;", 0, "true false false return 42 7 8\n4 2 3 9\n0 12 0\n40 20 30 50 fallback fallback\none\n3\n5\n", "");
+    for ([_][]const u8{
+        "let main: () = @println(loop _ in 0..0 {break \"unused\"} else {\"a\" + \"b\"})",
+        "let main: () = {let a: []bool = loop _ in 1..=0 {break [true]} else {[false]}\n@println(a[0])}",
+    }) |source| {
+        const generated = try arrayTestProgram(source);
+        defer test_gpa.free(generated);
+        const exhausted = try std.mem.concat(test_gpa, u8, &.{ "#include <stdlib.h>\nstatic void *test_malloc(size_t n) { (void)n; return NULL; }\n#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n", generated });
+        defer test_gpa.free(exhausted);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(exhausted, "typedef int nonempty_translation_unit;", 1, "", "panic: GC allocation failed\n", mode);
+    }
+}
+
 const string_interpolation =
     \\let prefix: string = "é\0"
     \\let fizz: (n: int) -> string = match n % 3, n % 5 {

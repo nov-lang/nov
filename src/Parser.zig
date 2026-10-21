@@ -638,12 +638,13 @@ fn parseLoopExpr(self: *Parser) Error!Node.Index {
         if (end == 0 or self.token_tags[self.tok_i] != .l_brace)
             return self.failMsg(.{ .tag = .unsupported_range_loop, .token = loop_token });
         const body = try self.expectBlock();
-        if (self.token_tags[self.tok_i] == .keyword_else or self.token_tags[self.tok_i] == .colon)
+        if (self.token_tags[self.tok_i] == .colon)
             return self.failMsg(.{ .tag = .unsupported_range_loop, .token = loop_token });
+        const else_expr = try self.parseElseExpr();
         return self.addNode(.{
             .tag = .loop_range,
             .main_token = loop_token,
-            .data = .{ .lhs = try self.addExtra(Node.RangeLoop{ .range_token = range_token, .binding = binding, .start = start, .end = end, .body = body }), .rhs = body },
+            .data = .{ .lhs = try self.addExtra(Node.RangeLoop{ .range_token = range_token, .binding = binding, .start = start, .end = end, .body = body, .else_expr = else_expr }), .rhs = if (else_expr != 0) else_expr else body },
         });
     }
     var condition = if (self.token_tags[self.tok_i] == .colon) null_node else condition: {
@@ -1684,11 +1685,11 @@ test "range headers preserve dedicated fields spans delimiters and recovery" {
     try std.testing.expect(ast.fullRange(range.end) == null);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
     for ([_][:0]const u8{
-        "loop i in ..2 {}",          "loop i in 0.. {}",           "loop i in 0..= {}",
-        "loop i in 0..2 {} else {}", "loop i in 0..2 : tick() {}", "loop i, j in 0..2 {}",
-        "loop &i in 0..2 {}",        "loop i in values {}",        "loop i in 0..2, 0..3 {}",
-        "loop i in 0..2",            "loop i in 0..",              "loop i in 0..2 += 1 {}",
-        "loop i in 0..2\n\n{}",      "for i in 0..2 {}",
+        "loop i in ..2 {}",       "loop i in 0.. {}",           "loop i in 0..= {}",
+        "loop i in 0..2 {} else", "loop i in 0..2 : tick() {}", "loop i, j in 0..2 {}",
+        "loop &i in 0..2 {}",     "loop i in values {}",        "loop i in 0..2, 0..3 {}",
+        "loop i in 0..2",         "loop i in 0..",              "loop i in 0..2 += 1 {}",
+        "loop i in 0..2\n\n{}",   "for i in 0..2 {}",
     }) |header| {
         const broken = try std.fmt.allocPrintSentinel(std.testing.allocator, "let f: () = {s}\nlet valid: int = 42", .{header}, 0);
         defer std.testing.allocator.free(broken);
@@ -1698,6 +1699,23 @@ test "range headers preserve dedicated fields spans delimiters and recovery" {
         try std.testing.expect(result.errors.len != 0);
         for (result.errors) |err| try std.testing.expect(result.tokens.items(.start)[err.token] <= broken.len);
         try std.testing.expectEqualStrings("42", result.tokenSlice(result.lastToken(result.rootDecls()[result.rootDecls().len - 1])));
+    }
+}
+
+test "range else metadata preserves source bounds delimiters and raw operators" {
+    for ([_][]const u8{ "..", "..=" }) |operator| {
+        const source = try std.fmt.allocPrintSentinel(std.testing.allocator, "let f: () = loop i in ; start\n{{0}}{s} ; end\n2 {{break true}} else if true {{false}} else {{true}}", .{operator}, 0);
+        defer std.testing.allocator.free(source);
+        var ast = try parse(std.testing.allocator, source);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+        const node = ast.decl(ast.rootDecls()[0]).ast.init_node;
+        const range = ast.fullRange(node).?;
+        try std.testing.expectEqualStrings(operator, ast.tokenSlice(range.range_token));
+        try std.testing.expectEqual(Node.Tag.if_else, ast.nodes.items(.tag)[range.else_expr]);
+        try std.testing.expectEqualStrings("else", ast.tokenSlice(ast.lastToken(range.body) + 1));
+        try std.testing.expectEqual(source.len - 1, ast.tokens.items(.start)[ast.lastToken(node)]);
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
     }
 }
 
@@ -1712,7 +1730,7 @@ test "inclusive range headers retain raw tokens and reject non-loop ranges" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
     for ([_][:0]const u8{
         "let f: () = loop i in ..=2 {}",
-        "let f: () = loop i in 0..=2 {} else {}",
+        "let f: () = loop i in 0..=2 {} else",
         "let f: () = loop i in 0..=2 : tick() {}",
         "let f: () = loop i in 0..=2\n\n{}",
         "let x = 0..=2",

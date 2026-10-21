@@ -120,6 +120,7 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     _ = fixtures.add("checkout.nov", @embedFile("examples/checkout.nov"));
     _ = fixtures.add("fibo.nov", @embedFile("examples/fibo.nov"));
     _ = fixtures.add("fizzbuzz.nov", @embedFile("examples/fizzbuzz.nov"));
+    _ = fixtures.add("range-search.nov", @embedFile("examples/range-search.nov"));
     _ = fixtures.add("strings.nov", @embedFile("examples/strings.nov"));
     _ = fixtures.add("interpolation.nov", @embedFile("examples/interpolation.nov"));
     _ = fixtures.add("interpolation-format.nov", "let main: () -> void = {let n: int = 1\n@println(\"{n:02}\")}\n");
@@ -228,6 +229,8 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         .{ .name = "reject membership widening", .args = &.{ "emit-c", "membership-width.nov" }, .exit_code = 1, .stderr_match = "expression does not match the expected type" },
         .{ .name = "reject string membership", .args = &.{ "emit-c", "membership-string.nov" }, .exit_code = 1, .stderr_match = "operator is not supported for this operand type" },
         .{ .name = "reject array length writes", .args = &.{ "emit-c", "array-length-write.nov" }, .exit_code = 1, .stderr_match = "array .len is read-only" },
+        .{ .name = "check range search", .args = &.{ "check", "--semantic", "range-search.nov" }, .exit_code = 0 },
+        .{ .name = "fmt range search", .args = &.{ "fmt", "--check", "range-search.nov" }, .exit_code = 0 },
         .{ .name = "check inclusive ranges", .args = &.{ "check", "--semantic", "inclusive-range.nov" }, .exit_code = 0 },
         .{ .name = "fmt inclusive ranges", .args = &.{ "fmt", "--check", "inclusive-range.nov" }, .exit_code = 0 },
         .{ .name = "check semantic loops", .args = &.{ "check", "--semantic", "loop-program.nov" }, .exit_code = 0 },
@@ -349,6 +352,40 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         fizzbuzz.expectStdOutEqual("1\n2\nFizz\n4\nBuzz\nFizz\n7\n8\nFizz\nBuzz\n11\nFizz\n13\n14\nFizzBuzz\n");
         fizzbuzz.expectStdErrEqual("");
         test_step.dependOn(&fizzbuzz.step);
+
+        const search_output = "true false false\nFound 5 Not found\nExhausted at MAX\n";
+        const search = b.addRunArtifact(exe);
+        search.step.name = b.fmt("CLI: range search ({s})", .{mode});
+        search.setCwd(fixtures.getDirectory());
+        search.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+        search.setEnvironmentVariable("NOV_CC", "");
+        search.setEnvironmentVariable("CC", "");
+        search.addArgs(&.{ "run", "range-search.nov" });
+        if (mode.len != 0) search.addArg(mode);
+        search.expectExitCode(0);
+        search.expectStdOutEqual(search_output);
+        search.expectStdErrEqual("");
+        test_step.dependOn(&search.step);
+
+        const search_build = b.addRunArtifact(exe);
+        search_build.step.name = b.fmt("CLI: build range search ({s})", .{mode});
+        search_build.setCwd(fixtures.getDirectory());
+        search_build.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+        search_build.setEnvironmentVariable("NOV_CC", "");
+        search_build.setEnvironmentVariable("CC", "");
+        search_build.addArgs(&.{ "build", "range-search.nov" });
+        if (mode.len != 0) search_build.addArg(mode);
+        search_build.addArg("-o");
+        const search_program = search_build.addOutputFileArg(if (exe.root_module.resolved_target.?.result.os.tag == .windows) "search.exe" else "search");
+        search_build.expectExitCode(0);
+        search_build.expectStdOutEqual("");
+        search_build.expectStdErrEqual("");
+        const search_run = std.Build.Step.Run.create(b, b.fmt("CLI: execute range search ({s})", .{mode}));
+        search_run.addFileArg(search_program);
+        search_run.expectExitCode(0);
+        search_run.expectStdOutEqual(search_output);
+        search_run.expectStdErrEqual("");
+        test_step.dependOn(&search_run.step);
 
         const inclusive = b.addRunArtifact(exe);
         inclusive.step.name = b.fmt("CLI: inclusive ranges ({s})", .{mode});

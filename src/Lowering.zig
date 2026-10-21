@@ -273,10 +273,10 @@ fn testRangeOwnership(inclusive: bool) !void {
         try std.testing.expect(instruction.span.end > instruction.span.start);
     }
     const loop = instructions[owner].op.loop;
-    const counter = instructions[loop.condition_start].op.local_load;
+    const counter = instructions[loop.body_start].op.local_load;
     try std.testing.expect(@intFromEnum(counter) < loop.condition_start);
     try std.testing.expect(instructions[@intFromEnum(counter)].op == .local_slot);
-    const condition = @intFromEnum(loop.condition);
+    const condition = @intFromEnum(if (inclusive) instructions[@intFromEnum(loop.condition)].op.short_circuit.rhs else loop.condition);
     const endpoint = instructions[condition].op.binary.rhs;
     try std.testing.expect(@intFromEnum(endpoint) < @intFromEnum(counter));
     try std.testing.expect(instructions[loop.body_start].op == .local_load);
@@ -287,11 +287,11 @@ fn testRangeOwnership(inclusive: bool) !void {
     try std.testing.expectEqual(if (inclusive) Ir.BinaryOp.le else Ir.BinaryOp.lt, instructions[condition].op.binary.op);
     if (inclusive) {
         try std.testing.expectEqual(Ir.BinaryOp.eq, instructions[continuation + 1].op.binary.op);
-        try std.testing.expect(instructions[continuation + 2].op == .loop_break);
-        try std.testing.expect(instructions[continuation + 2].op.loop_break == null);
-        try std.testing.expectEqual(owner, Ir.enclosingLoop(body, continuation + 2).?);
-        try std.testing.expect(instructions[continuation + 3].op == .branch);
+        try std.testing.expect(instructions[continuation + 2].op == .constant);
+        try std.testing.expect(instructions[continuation + 3].op == .local_store);
         try std.testing.expectEqual(Ir.BinaryOp.add, instructions[continuation + 5].op.binary.op);
+        try std.testing.expect(instructions[continuation + 7].op == .branch);
+        for (instructions) |instruction| try std.testing.expect(instruction.op != .loop_break);
     }
     const saved = instructions[continuation];
     instructions[continuation].op = .{ .unary = .{ .op = .negate, .operand = private_current } };
@@ -304,6 +304,43 @@ fn testRangeOwnership(inclusive: bool) !void {
     try std.testing.expectError(error.InvalidValueId, sema.ir.verify());
     instructions[condition].op.binary.rhs = endpoint;
     try sema.ir.verify();
+}
+
+test "range else regions keep index continuation and fallback values private" {
+    for ([_][]const u8{ "..", "..=" }) |operator| {
+        const source = try std.mem.replaceOwned(u8, std.testing.allocator,
+            \\let f: (a: i8, b: i8) -> i8 = loop i in a..b {
+            \\    if i == a {break i}
+            \\} else {let fallback: i8 = 7
+            \\    fallback}
+        , "..", operator);
+        defer std.testing.allocator.free(source);
+        var sema = owned: {
+            var module = try Module.init(std.testing.allocator, "range-else.nov", source);
+            defer module.deinit();
+            var result = try lower(&module);
+            errdefer result.deinit();
+            try std.testing.expect(!module.hasErrors());
+            try std.testing.expect(result.lowering_complete);
+            break :owned result;
+        };
+        defer sema.deinit();
+        try sema.ir.verify();
+        const body = sema.ir.functions.items[0].body.?;
+        const instructions = @constCast(body.instructions);
+        var owner: usize = 0;
+        for (instructions, 0..) |instruction, i| if (instruction.op == .loop) {
+            owner = i;
+        };
+        const saved = instructions[owner].op.loop;
+        instructions[owner].op.loop.else_value = @enumFromInt(saved.body_start);
+        try std.testing.expectError(error.InvalidValueId, sema.ir.verify());
+        instructions[owner].op.loop = saved;
+        instructions[owner].op.loop.else_start = saved.body_start;
+        try std.testing.expectError(error.InvalidRegion, sema.ir.verify());
+        instructions[owner].op.loop = saved;
+        try sema.ir.verify();
+    }
 }
 
 test "loop continuation regions and value breaks outlive source storage" {

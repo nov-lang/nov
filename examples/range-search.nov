@@ -1,0 +1,27 @@
+; Search a bounded range; exhaustion supplies the not-found result.
+let contains: (start: uint, end: uint, target: uint) -> bool = loop i in start..end {
+    if i == target {
+        break true
+    }
+} else {
+    false
+}
+
+let describe: (start: uint, end: uint, target: uint) -> string = loop i in start..=end {
+    if i == target {
+        break "Found {i}"
+    }
+} else {
+    "Not found"
+}
+
+let main: () -> void = {
+    @println(contains(1, 5, 4), contains(1, 5, 5), contains(5, 1, 3))
+    @println(describe(1, 5, 5), describe(5, 1, 3))
+    let max: u64 = 18446744073709551615
+    loop _ in max..=max {
+        continue
+    } else {
+        @println("Exhausted at MAX")
+    }
+}

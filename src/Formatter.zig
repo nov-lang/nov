@@ -595,6 +595,19 @@ test "inclusive range formatting preserves comments and is idempotent" {
     try std.testing.expectError(error.InvalidSource, format(std.testing.allocator, "let x = 0..=2"));
 }
 
+test "range else formatting preserves comments newlines and idempotent metadata" {
+    for ([_][:0]const u8{
+        "let f: ()=loop i in ; lower\n{0}.. ; upper\n2 {break true} else {; fallback\nfalse}",
+        "let f: ()=loop _ in 0..=2 {continue} else if ready {; branch\ntrue} else {false} ; done",
+        "let f: ()=loop i in 0..=2 {loop j in 0..i {} else {continue}} else {loop _ in 0..0 {} else {return}}",
+    }) |source| {
+        const formatted = try format(std.testing.allocator, source);
+        defer std.testing.allocator.free(formatted);
+        try expectFormatted(source, formatted);
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{source});
+    }
+}
+
 test "range formatting survives every allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{"let f: ()=loop _ in ; lower\n-{{128}}.. ; upper\n0 {loop i in 0..2 {continue}}"});
 }

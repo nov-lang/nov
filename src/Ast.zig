@@ -398,7 +398,7 @@ pub fn renderError(self: Ast, parse_error: Error, writer: anytype) !void {
         //     });
         // },
         .unsupported_loop => return writer.writeAll("unsupported loop form; expected 'loop condition { ... }'"),
-        .unsupported_range_loop => return writer.writeAll("unsupported range loop; expected 'loop name in start..end { ... }' or 'loop name in start..=end { ... }' with both bounds; iterators, continuations and else are unsupported"),
+        .unsupported_range_loop => return writer.writeAll("unsupported range loop; expected 'loop name in start..end { ... }' or 'loop name in start..=end { ... }' with both bounds; iterators and continuations are unsupported"),
         .expected_decl => {
             return writer.print("expected declaration, found '{s}'", .{
                 token_tags[parse_error.token + @intFromBool(parse_error.token_is_prev)].symbol(),
@@ -1117,6 +1117,7 @@ pub fn fullRange(self: Ast, node: Node.Index) ?full.RangeLoop {
         .start = range.start,
         .end = range.end,
         .body = range.body,
+        .else_expr = range.else_expr,
         .range_token = range.range_token,
         .inclusive = self.tokens.items(.tag)[range.range_token] == .period_period_equal,
     };
@@ -1235,6 +1236,7 @@ pub const full = struct {
         start: Node.Index,
         end: Node.Index,
         body: Node.Index,
+        else_expr: Node.Index,
         range_token: TokenIndex,
         inclusive: bool,
     };
@@ -1586,7 +1588,7 @@ pub const Node = struct {
         /// rhs can be omitted.
         /// main_token is the `..` or `..=`.
         range,
-        /// Bounded integer iterator. `RangeLoop[lhs]`, rhs is the body.
+        /// Bounded integer iterator. `RangeLoop[lhs]`, rhs is the final body/else.
         loop_range,
         /// `loop lhs rhs`: optional boolean condition (0 for unconditional) and lexical body block.
         loop_condition,
@@ -1681,6 +1683,7 @@ pub const Node = struct {
         start: Index,
         end: Index,
         body: Index,
+        else_expr: Index,
     };
 
     pub const SubRange = struct {

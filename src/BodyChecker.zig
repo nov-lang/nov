@@ -267,7 +267,9 @@ const Context = struct {
         switch (ast.nodes.items(.tag)[node]) {
             .loop_range => {
                 const range = ast.fullRange(node).?;
-                return (try self.probeBreaks(range.start, depth + 1)) orelse try self.probeBreaks(range.end, depth + 1);
+                return (try self.probeBreaks(range.start, depth + 1)) orelse
+                    (try self.probeBreaks(range.end, depth + 1)) orelse
+                    try self.probeBreaks(range.else_expr, depth + 1);
             },
             .loop_condition, .loop_cont, .loop_else => return self.probeBreaks(ast.fullLoop(node).?.else_expr, depth + 1),
             // The operand runs before this break. Its own controls may exit
@@ -327,6 +329,38 @@ const Context = struct {
             else => {},
         }
         return null;
+    }
+
+    fn probeRange(self: *Context, node: Ast.Node.Index, depth: usize) Error!?Known {
+        const ast = &self.module.ast;
+        const range = ast.fullRange(node).?;
+        if (range.else_expr == 0) return .{ .ty = try self.ir.internType(.void) };
+        const diagnostics_start = self.module.diagnostics.items.len;
+        defer self.module.diagnostics.shrinkRetainingCapacity(diagnostics_start);
+        // Probe fallback in the parent scope, then make the index available only
+        // while looking for owned break hints. Neither walk evaluates bounds.
+        const fallback = try self.probe(range.else_expr, depth + 1);
+        var index = (try self.probe(range.start, depth + 1)) orelse try self.probe(range.end, depth + 1);
+        if (index == null) infer: {
+            const wide = try self.ir.internType(.{ .integer = .{ .signedness = .signed, .bits = 128 } });
+            var negative = false;
+            for ([_]Ast.Node.Index{ range.start, range.end }) |bound| {
+                switch (try Literal.check(self.module, self.ir, bound, wide, null)) {
+                    .constant => |id| negative = negative or self.ir.getConstant(id).?.value.signed_integer < 0,
+                    else => break :infer,
+                }
+            }
+            index = .{ .ty = try self.ir.internType(.{ .integer = .{ .signedness = if (negative) .signed else .unsigned, .bits = Ir.native_pointer_bits } }) };
+        }
+        const scope = self.locals.items.len;
+        defer self.restoreScope(scope);
+        const token = ast.nodes.items(.main_token)[range.binding];
+        const name = ast.tokenSlice(token);
+        if (index) |known| {
+            if (!std.mem.eql(u8, name, "_") and self.conflict(name) == null and !isPrimitive(name))
+                try self.bindLocal(name, .{ .known = known, .name_span = self.module.tokenSpan(token) });
+        }
+        return (try self.probeBreaks(range.body, depth + 1)) orelse fallback;
     }
 
     fn span(self: *Context, node: Ast.Node.Index) Module.Span {
@@ -393,7 +427,8 @@ const Context = struct {
                     (try self.probeBreaks(loop.continuation, depth + 1)) orelse
                     (if (loop.else_expr != 0) try self.probe(loop.else_expr, depth + 1) else null);
             },
-            .loop_range, .@"if", .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod => .{ .ty = try self.ir.internType(.void) },
+            .loop_range => try self.probeRange(node, depth),
+            .@"if", .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod => .{ .ty = try self.ir.internType(.void) },
             .if_else => blk: {
                 const branch = ast.fullIf(node).?.ast;
                 break :blk (try self.probe(branch.then_expr, depth + 1)) orelse try self.probe(branch.else_expr, depth + 1);
@@ -950,7 +985,10 @@ const Context = struct {
         }
         const scope = self.locals.items.len;
         defer self.restoreScope(scope);
-        var context: LoopContext = .{ .allows_value = false, .result = .{ .ty = unit } };
+        var context: LoopContext = .{
+            .allows_value = loop.else_expr != 0,
+            .result = if (loop.else_expr != 0) expected orelse try self.probe(node, depth) else .{ .ty = unit },
+        };
         const parent = self.loop_context;
         self.loop_context = &context;
         defer self.loop_context = parent;
@@ -958,48 +996,85 @@ const Context = struct {
         var condition: Ir.ValueId = undefined;
         var current: ?Ir.ValueId = null;
         var condition_start: u32 = 0;
+        var done: ?Ir.ValueId = null;
         const boolean = try self.ir.internType(.boolean);
         if (self.emitter) |emitter| {
             counter = try emitter.append(index_type, self.irSpan(node), .{ .local_slot = try emitter.value(loop.start) });
+            if (loop.inclusive) {
+                const initial = try emitter.append(boolean, self.irSpan(node), .{ .constant = try self.ir.internConstant(.{ .ty = boolean, .value = .{ .boolean = false } }) });
+                done = try emitter.append(boolean, self.irSpan(node), .{ .local_slot = initial });
+            }
             condition_start = @intCast(emitter.instructions.items.len);
+            const active = if (done) |slot| active: {
+                const loaded = try emitter.append(boolean, self.irSpan(node), .{ .local_load = slot });
+                break :active try emitter.append(boolean, self.irSpan(node), .{ .unary = .{ .op = .bool_not, .operand = loaded } });
+            } else null;
+            const rhs_start: u32 = @intCast(emitter.instructions.items.len);
             const loaded = try emitter.append(index_type, self.irSpan(node), .{ .local_load = counter });
             condition = try emitter.append(boolean, self.irSpan(node), .{ .binary = .{ .op = if (loop.inclusive) .le else .lt, .lhs = loaded, .rhs = try emitter.value(loop.end) } });
+            if (active) |lhs| condition = try emitter.append(boolean, self.irSpan(node), .{ .short_circuit = .{ .kind = .@"and", .lhs = lhs, .rhs_start = rhs_start, .rhs = condition } });
         }
         const body_start: u32 = if (self.emitter) |emitter| @intCast(emitter.instructions.items.len) else 0;
         if (self.emitter) |emitter| current = try emitter.append(index_type, self.irSpan(node), .{ .local_load = counter });
         if (!discard) try self.bindLocal(name, .{ .known = known.?, .name_span = self.module.tokenSpan(binding_token), .value = current });
+        if (loop.else_expr != 0 and context.result == null) context.result = try self.probeBreaks(loop.body, depth + 1);
         if (try self.expression(loop.body, .{ .ty = unit }, depth + 1) == null) return null;
         self.terminated = false;
+        var continuation_start: ?u32 = null;
+        var continuation: ?Ir.ValueId = null;
         if (self.emitter) |emitter| {
-            const continuation_start: u32 = @intCast(emitter.instructions.items.len);
+            continuation_start = @intCast(emitter.instructions.items.len);
             const old = try emitter.append(index_type, self.irSpan(node), .{ .local_load = counter });
-            if (loop.inclusive) {
-                const at_end = try emitter.append(boolean, self.irSpan(node), .{ .binary = .{ .op = .eq, .lhs = old, .rhs = try emitter.value(loop.end) } });
-                const then_start: u32 = @intCast(emitter.instructions.items.len);
-                const exit = try emitter.append(unit, self.irSpan(node), .{ .loop_break = null });
-                _ = try emitter.append(unit, self.irSpan(node), .{ .branch = .{
-                    .condition = at_end,
-                    .then_start = then_start,
-                    .else_start = @intCast(emitter.instructions.items.len),
-                    .then_value = exit,
-                    .else_value = null,
-                } });
+            var at_end: ?Ir.ValueId = null;
+            var then_start: u32 = 0;
+            var exhausted: ?Ir.ValueId = null;
+            if (done) |slot| {
+                at_end = try emitter.append(boolean, self.irSpan(node), .{ .binary = .{ .op = .eq, .lhs = old, .rhs = try emitter.value(loop.end) } });
+                then_start = @intCast(emitter.instructions.items.len);
+                const yes = try emitter.append(boolean, self.irSpan(node), .{ .constant = try self.ir.internConstant(.{ .ty = boolean, .value = .{ .boolean = true } }) });
+                exhausted = try emitter.append(unit, self.irSpan(node), .{ .local_store = .{ .slot = slot, .value = yes } });
             }
+            const increment_start: u32 = @intCast(emitter.instructions.items.len);
             const one = try emitter.append(index_type, self.irSpan(node), .{ .constant = try self.ir.internConstant(.{ .ty = index_type, .value = if (self.ir.getType(index_type).?.integer.signedness == .signed) .{ .signed_integer = 1 } else .{ .unsigned_integer = 1 } }) });
-            // Exclusive conditions and the inclusive terminal guard both
-            // establish current < end <= MAX before this addition.
+            // Only current < end <= MAX reaches the increment. Endpoint completion
+            // sets done instead of a source break, preserving exhaustion routing.
             const next = try emitter.append(index_type, self.irSpan(node), .{ .binary = .{ .op = .add, .lhs = old, .rhs = one } });
-            const continuation = try emitter.append(unit, self.irSpan(node), .{ .local_store = .{ .slot = counter, .value = next } });
-            try emitter.record(node, unit, self.irSpan(node), .{ .loop = .{
+            continuation = try emitter.append(unit, self.irSpan(node), .{ .local_store = .{ .slot = counter, .value = next } });
+            if (at_end) |test_value| continuation = try emitter.append(unit, self.irSpan(node), .{ .branch = .{
+                .condition = test_value,
+                .then_start = then_start,
+                .else_start = increment_start,
+                .then_value = exhausted.?,
+                .else_value = continuation,
+            } });
+        }
+        self.restoreScope(scope);
+        self.loop_context = parent;
+        const else_start: ?u32 = if (loop.else_expr != 0 and self.emitter != null) @intCast(self.emitter.?.instructions.items.len) else null;
+        const exhaustion = if (loop.else_expr != 0) try self.expression(loop.else_expr, context.result, depth + 1) else unit;
+        if (exhaustion == null) return null;
+        const else_terminal = self.terminated;
+        if (loop.else_expr != 0 and !else_terminal) {
+            if (context.result == null) context.result = .{ .ty = exhaustion.? };
+            try self.copyNode(loop.else_expr, exhaustion.?);
+        }
+        self.terminated = loop.else_expr != 0 and else_terminal and !context.has_break;
+        const result = if (self.terminated) unit else if (context.result) |value| value.ty else unit;
+        if (self.emitter) |emitter| {
+            try emitter.record(node, result, self.irSpan(node), .{ .loop = .{
                 .condition_start = condition_start,
                 .body_start = body_start,
                 .continuation_start = continuation_start,
+                .else_start = else_start,
+                .else_value = if (loop.else_expr != 0) try emitter.value(loop.else_expr) else null,
+                .returns = self.terminated,
                 .condition = condition,
                 .body = try emitter.value(loop.body),
                 .continuation = continuation,
             } });
+            if (self.terminated) self.terminal = try emitter.value(node);
         }
-        return self.fit(unit, expected, node);
+        return self.fit(result, expected, node);
     }
 
     fn expression(self: *Context, node: Ast.Node.Index, expected: ?Known, depth: usize) Error!?Ir.TypeId {
@@ -1724,6 +1799,37 @@ test "range bounds require exact integer types and immutable lexical bindings" {
             var module = try Module.init(std.testing.allocator, "range.nov", source);
             defer module.deinit();
             errdefer std.debug.print("range case: {s}\n", .{case.body});
+            try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+            var sema = try @import("Lowering.zig").lower(&module);
+            defer sema.deinit();
+            try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+            try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
+            try std.testing.expect(!sema.lowering_complete);
+        }
+    }
+}
+
+test "range else rejects incompatible results missing context and escaped indices or controls" {
+    for ([_]struct { body: []const u8, tag: Module.Diagnostic.Tag }{
+        .{ .body = "loop i in 0..2 {} else {@println(i)}", .tag = .unknown_name },
+        .{ .body = "loop i in i..2 {} else {}", .tag = .unknown_name },
+        .{ .body = "loop _ in 0..2 {} else {break}", .tag = .loop_control_outside_loop },
+        .{ .body = "loop _ in 0..2 {} else {continue}", .tag = .loop_control_outside_loop },
+        .{ .body = "{let a = loop _ in 0..2 {break} else {true}\n}", .tag = .expression_type_mismatch },
+        .{ .body = "{let a: int = loop _ in 0..2 {break} else {1}\n}", .tag = .expression_type_mismatch },
+        .{ .body = "{let a = loop _ in 0..2 {break 1} else {2}\n}", .tag = .literal_needs_type },
+        .{ .body = "{let x: i8 = 1\nlet y: i16 = 2\nlet a = loop _ in 0..2 {break x} else {y}\n}", .tag = .expression_type_mismatch },
+        .{ .body = "{let a = loop _ in 0..2 {break []} else {[]}\n}", .tag = .array_literal_needs_type },
+        .{ .body = "loop _ in 0..2 {} else {return}\n@println(true)", .tag = .unreachable_code },
+    }) |case| {
+        for ([_][]const u8{ "..", "..=" }) |operator| {
+            const body = try std.mem.replaceOwned(u8, std.testing.allocator, case.body, "..", operator);
+            defer std.testing.allocator.free(body);
+            const source = try std.fmt.allocPrint(std.testing.allocator, "let f: () -> void = {{{s}}}", .{body});
+            defer std.testing.allocator.free(source);
+            var module = try Module.init(std.testing.allocator, "range-else.nov", source);
+            defer module.deinit();
+            errdefer std.debug.print("range else case: {s}\n", .{source});
             try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
             var sema = try @import("Lowering.zig").lower(&module);
             defer sema.deinit();

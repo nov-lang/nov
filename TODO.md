@@ -470,9 +470,16 @@ including on `continue` at the maximum integer. Only two untyped literal bounds
 default: native `uint` when both are nonnegative (including zero), otherwise native
 `int`, with checked native fits.
 This is not a general literal default or runtime signedness selection. Range loops
-yield void; continue increments, break/return do not. Range-loop else, explicit
-continuations, value breaks, unbounded/stepped/descending ranges,
-general iterators, references, multiple bindings and labels remain rejected.
+without `else` yield void and reject value breaks. Both range forms now support
+`else` and exact contextual/bidirectional break/fallback results using the approved
+generic loop semantics. Normal exhaustion (including empty/reversed ranges and
+inclusive MAX completion/continue) runs fallback once; source break/return skip it.
+The fallback is outside the completed loop's control scope and cannot see its
+index; bounds retain the parent scope. Arrays copy, strings share rooted storage,
+and terminal fallback paths contribute no merge value. See
+`examples/range-search.nov`. Explicit range continuations,
+unbounded/stepped/descending ranges, general iterators, references, multiple
+bindings and labels remain rejected.
 Ranges are not general values or membership containers. See README for syntax.
 `examples/fibo.nov` (unchanged) and `examples/fizzbuzz.nov` now pass semantic and
 format checks and execute in default/debug/release modes.
