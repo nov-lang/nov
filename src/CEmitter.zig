@@ -1777,6 +1777,69 @@ test "identifier interpolation preserves chunks formatting roots loops matches a
     for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, string_interpolation_output, "", mode);
 }
 
+const type_alias_program =
+    \\let Count = Forward
+    \\let Forward = uint
+    \\let Counts = []Count
+    \\let Callback = (Count) -> Count
+    \\let Text = string
+    \\let Unit = void
+    \\let Flag = bool
+    \\let increment: (value: Count) -> Count = {@print("E")
+    \\    value + 1}
+    \\let apply: (callback: Callback, values: Counts) -> Count = callback(values[0])
+    \\let main: () -> Unit = {
+    \\    let mut values: Counts = [7]
+    \\    let mut copy = @as(Counts, values)
+    \\    copy[0] = 9
+    \\    let callback = @as(Callback, increment)
+    \\    let text: Text = "alias" + "es"
+    \\    @println(apply(callback, values), copy[0], "{@as(Count, 10)}", @as(Flag, true), text)
+    \\}
+;
+
+test "type aliases preserve callbacks array copies effects formatting and forced GC" {
+    const c = try arrayTestProgram(type_alias_program);
+    defer test_gpa.free(c);
+    try std.testing.expect(std.mem.indexOf(u8, c, "nov_Count") == null);
+    try std.testing.expect(std.mem.indexOf(u8, c, "nov_Callback") == null);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "E8 9 10 true aliases\n", "", mode);
+}
+
+test "type aliases retain existing backend width diagnostics" {
+    try std.testing.expectError(error.UnsupportedIntegerWidth, emitSource("let Wide = i128\nlet f: (x: Wide) -> Wide = x", null));
+    // An unused alias creates no runtime object or backend requirement.
+    const c = try emitSource("let Wide = i128\nlet f: () -> int = 1", null);
+    defer test_gpa.free(c);
+    try std.testing.expect(std.mem.indexOf(u8, c, "nov_Wide") == null);
+}
+
+test "type aliases compiler ownership survives every allocation failure" {
+    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{type_alias_program});
+}
+
+test "type aliases preserve every supported integer boundary" {
+    var source = std.Io.Writer.Allocating.init(test_gpa);
+    defer source.deinit();
+    var output = std.Io.Writer.Allocating.init(test_gpa);
+    defer output.deinit();
+    const names = [_][]const u8{ "i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "int", "uint" };
+    for (names) |name| try source.writer.print("let Alias_{s} = {s}\n", .{ name, name });
+    try source.writer.writeAll("let main: () -> void = {\n");
+    for (names) |name| {
+        const bits: u7 = if (std.mem.eql(u8, name, "int") or std.mem.eql(u8, name, "uint")) @intCast(Ir.native_pointer_bits) else try std.fmt.parseInt(u7, name[1..], 10);
+        const signed = name[0] == 'i';
+        const min: i128 = if (signed) -(@as(i128, 1) << @intCast(bits - 1)) else 0;
+        const max: i128 = (@as(i128, 1) << @intCast(bits - @as(u7, @intFromBool(signed)))) - 1;
+        try source.writer.print("@println(@as(Alias_{s}, {d}), @as(Alias_{s}, {d}))\n", .{ name, min, name, max });
+        try output.writer.print("{d} {d}\n", .{ min, max });
+    }
+    try source.writer.writeAll("}\n");
+    const c = try emitSource(source.written(), null);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "void nov_main(void); int main(void) { nov_main(); return 0; }", 0, output.written(), "", mode);
+}
+
 const ascription_program =
     \\let id: (n: int) -> int = {@print("E")
     \\    n}

@@ -34,13 +34,15 @@ input or unreadable files produce a nonzero exit status. Single-file programs ca
 be compiled and executed through the C11 backend. The new typed IR provides
 owned, canonical type/constant storage and verification. Internal module passes
 collect names and diagnose duplicate/unknown names and initializer dependency
-cycles for a bounded expression subset. Internal annotation analysis resolves
+cycles for a bounded expression subset (type aliases are not runtime initializers).
+Internal annotation analysis resolves
 explicit `bool`, `void`, fixed-width integer, native `int`/`uint` and function
 types, and checks integer and boolean literals against annotations. Bounded function-body checking binds
 parameters and checks integer arithmetic, boolean expressions, comparisons and
 calls against collected signatures, including recursive calls. Immutable and mutable
 locals (explicitly typed or inferred from an already typed initializer) and blocks
-with final-expression results are supported in function bodies. Literal defaults, user-defined type aliases,
+with final-expression results are supported in function bodies. Immutable module-level
+[type aliases](#type-aliases) name existing canonical types. General literal defaults,
 shadowing and global mutation remain deferred or unsupported. Bounded range-loop
 literal bounds have a specific native `uint`/`int` default (see [Range](#range));
 this is not a general integer-literal default.
@@ -59,8 +61,8 @@ semantic/lowering subset. It runs declaration collection, initializer dependency
 analysis, annotation/literal and function-body checking, then typed lowering and
 IR verification. Source errors and unsupported/deferred forms fail with source
 diagnostics (including related notes where available); recovered syntax errors
-stop semantic analysis. Globals must be immutable, explicitly typed integer,
-boolean or string literals. Functions need explicit supported signatures and bounded
+stop semantic analysis. Runtime globals must be immutable, explicitly typed integer,
+boolean or string literals; immutable module-level type aliases are also supported. Functions need explicit supported signatures and bounded
 expression bodies (including forward/recursive calls, local declarations and
 assignments, nested blocks, boolean short-circuiting, `if`/`else`, explicit returns,
 bounded integer range loops, condition-based or unconditional loops with continuation clauses and unlabeled
@@ -1218,6 +1220,60 @@ let x = a += b ; parse error
 let x = {y = 3} ; should be fine, @TypeOf(x) == void
 let z += 3 ; compile error, expected `=`
 ```
+
+## Type Aliases
+
+Immutable module declarations can name supported types:
+
+```nov
+let Count = uint
+let Counts = []Count
+let Callback = (Count) -> Count
+let NextCount = Count
+
+let increment: (value: NextCount) -> Count = value + 1
+let main: () -> void = {
+    let values: Counts = [7]
+    let callback = @as(Callback, increment)
+    @println(callback(values[0]), "{@as(Count, 8)}")
+}
+```
+
+Aliases are canonical synonyms, **not distinct newtypes**: `Count` and `uint`
+match exactly, with the same literal bounds, operations and backend restrictions.
+Supported RHS forms are `bool`, `void`, fixed-width integers, native `int`/`uint`,
+`string`, scalar array types and function types, including aliases in nested
+parameter/result/array-element positions. Function-type parameters may be unnamed.
+`let Callback = (int) -> int` declares a type alias, not a function body.
+Function definitions still use explicit signature syntax, such as
+`let increment: (value: Count) -> Count = value + 1`; a function-type alias can
+annotate a function-valued local or parameter, but does not define parameter names
+or introduce a new function-definition shorthand.
+
+Forward references and alias chains are supported. Cycles, including cycles
+through function or array components, diagnose with source notes independently
+of runtime initializer cycles. Expansion uses an iterative work stack bounded to
+128 active alias expansions; explicit type-syntax nesting has its own limit of
+128. Invalid aliases fail analysis even when unused; an unused valid alias creates
+no runtime global, function or initialization code. As with direct type spellings,
+128-bit integer types can resolve but executable C emission rejects reachable
+128-bit values.
+
+Only plain immutable module declarations `let Name = typeExpression` define
+aliases. They share the existing module namespace: duplicates and implicit
+shadowing are rejected. An identifier RHS names a type only when its target is a
+type (or a type position demands resolution and reports a type error); aliases
+of runtime values do not become types, and inferred runtime globals remain
+unsupported. Unknown identifier RHSs without type context are diagnosed as
+unknown names, not assumed to be function types. Identifier-only cycles with no
+type context remain value-dependency errors; a type annotation or `@as` demand
+classifies the same candidates as attempted aliases and reports type-alias cycles.
+
+Aliases work in annotations and `@as`, not runtime expressions:
+`@println(Count)` and `Count(1)` are errors. There are no alias constructors,
+mutable/local aliases, general runtime type values, `@TypeOf`, generics or
+comptime functions. `@as` remains exact expected-type ascription, not a checked
+numeric cast. See [examples/type-aliases.nov](examples/type-aliases.nov).
 
 ## Primitive Types
 TODO

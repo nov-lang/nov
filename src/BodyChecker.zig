@@ -1165,6 +1165,7 @@ const Context = struct {
                 if (self.module.lookup(name)) |id| {
                     const declaration = self.module.getDeclaration(id).?;
                     if (isPrimitive(name)) return self.fail(.unsupported_shadowing, node, declaration.name_span);
+                    if (declaration.is_type_alias) return self.fail(.not_a_value, node, declaration.name_span);
                     const known = self.globalType(id) orelse return self.fail(.unresolved_value_type, node, declaration.name_span);
                     return self.fit(known.ty, expected, node);
                 }

@@ -1,0 +1,18 @@
+; Aliases name canonical types, not distinct types or runtime values.
+let Count = NativeCount
+let NativeCount = uint
+let Counts = []Count
+let Callback = (Count) -> Count
+let Text = string
+let Unit = void
+
+let increment: (value: Count) -> Count = value + 1
+
+let apply: (callback: Callback, values: Counts) -> Count = callback(values[0])
+
+let main: () -> Unit = {
+    let values: Counts = [7]
+    let callback = @as(Callback, increment)
+    let message: Text = "Count: {@as(Count, 8)}"
+    @println(message, apply(callback, values))
+}

@@ -7,16 +7,63 @@ const primitives = @import("primitives.zig");
 pub const Error = Ir.InternError;
 
 /// Resolves an explicit, nonzero type node in a syntax-valid AST, without
-/// evaluating aliases, values or bodies.
+/// evaluating runtime values or bodies. Aliases have canonical identity.
 /// Semantic failures append source diagnostics and return null. Child types and
 /// diagnostics may remain after OOM; callers needing a transaction must own and
 /// discard the output IR and roll back diagnostics, as Sema does.
 pub fn resolve(module: *Module, ir: *Ir, node: Ast.Node.Index) Error!?Ir.TypeId {
-    return resolveDepth(module, ir, node, 0);
+    var aliases: AliasMap = .empty;
+    defer aliases.deinit(module.allocator);
+    const Task = union(enum) {
+        visit: struct { node: Ast.Node.Index, depth: usize = 0, alias_depth: usize = 0 },
+        finish: Module.DeclId,
+    };
+    var work: std.ArrayList(Task) = .empty;
+    defer work.deinit(module.allocator);
+    try work.append(module.allocator, .{ .visit = .{ .node = node } });
+    while (work.pop()) |task| switch (task) {
+        .finish => |id| {
+            const initializer = module.ast.decl(module.getDeclaration(id).?.node).ast.init_node;
+            const ty = try resolveDepth(module, ir, initializer, 0, &aliases);
+            try aliases.put(module.allocator, id, .{ .ty = ty });
+        },
+        .visit => |visit| {
+            if (visit.depth >= max_type_depth) continue; // resolveDepth diagnoses this path.
+            const ast = &module.ast;
+            if (ast.fullFnProto(visit.node)) |proto| {
+                var iterator = proto.iterate(ast);
+                while (iterator.next()) |param| try work.append(module.allocator, .{ .visit = .{ .node = param.type_expr, .depth = visit.depth + 1, .alias_depth = visit.alias_depth } });
+                if (proto.ast.return_type) |result| try work.append(module.allocator, .{ .visit = .{ .node = result, .depth = visit.depth + 1, .alias_depth = visit.alias_depth } });
+            } else if (ast.nodes.items(.tag)[visit.node] == .array_type) {
+                try work.append(module.allocator, .{ .visit = .{ .node = ast.nodes.items(.data)[visit.node].rhs, .depth = visit.depth + 1, .alias_depth = visit.alias_depth } });
+            } else if (ast.nodes.items(.tag)[visit.node] == .identifier) {
+                const id = module.lookup(ast.tokenSlice(ast.firstToken(visit.node))) orelse continue;
+                const declaration = module.getDeclaration(id).?;
+                if (!declaration.is_type_alias) continue;
+                if (aliases.get(id)) |entry| {
+                    if (entry.visiting) {
+                        try module.diagnostics.append(module.allocator, .{ .tag = .type_alias_cycle, .span = module.tokenSpan(ast.firstToken(visit.node)), .related = declaration.name_span });
+                    }
+                    continue;
+                }
+                if (visit.alias_depth >= max_alias_depth) {
+                    try module.diagnostics.append(module.allocator, .{ .tag = .type_alias_limit, .span = module.tokenSpan(ast.firstToken(visit.node)), .related = declaration.name_span });
+                    try aliases.put(module.allocator, id, .{});
+                    continue;
+                }
+                try aliases.put(module.allocator, id, .{ .visiting = true });
+                try work.append(module.allocator, .{ .finish = id });
+                try work.append(module.allocator, .{ .visit = .{ .node = ast.decl(declaration.node).ast.init_node, .alias_depth = visit.alias_depth + 1 } });
+            }
+        },
+    };
+    return resolveDepth(module, ir, node, 0, &aliases);
 }
 
 // Count all explicit type nodes on a path, including the root and leaf.
 const max_type_depth = 128;
+pub const max_alias_depth = 128;
+const AliasMap = std.AutoHashMapUnmanaged(Module.DeclId, struct { visiting: bool = false, ty: ?Ir.TypeId = null });
 
 fn diagnose(module: *Module, node: Ast.Node.Index, tag: Module.Diagnostic.Tag) Error!?Ir.TypeId {
     try module.diagnostics.append(module.allocator, .{
@@ -26,7 +73,7 @@ fn diagnose(module: *Module, node: Ast.Node.Index, tag: Module.Diagnostic.Tag) E
     return null;
 }
 
-fn resolveDepth(module: *Module, ir: *Ir, node: Ast.Node.Index, depth: usize) Error!?Ir.TypeId {
+fn resolveDepth(module: *Module, ir: *Ir, node: Ast.Node.Index, depth: usize, aliases: *const AliasMap) Error!?Ir.TypeId {
     if (depth >= max_type_depth) return diagnose(module, node, .type_nesting_limit);
     const ast = &module.ast;
     if (ast.fullFnProto(node)) |proto| {
@@ -57,7 +104,7 @@ fn resolveDepth(module: *Module, ir: *Ir, node: Ast.Node.Index, depth: usize) Er
                     }
                 }
             }
-            if (try resolveDepth(module, ir, param.type_expr, depth + 1)) |ty| {
+            if (try resolveDepth(module, ir, param.type_expr, depth + 1, aliases)) |ty| {
                 if (ir.getType(ty).? == .void) {
                     _ = try diagnose(module, param.type_expr, .invalid_parameter_type);
                     valid = false;
@@ -69,21 +116,24 @@ fn resolveDepth(module: *Module, ir: *Ir, node: Ast.Node.Index, depth: usize) Er
             }
         }
         const result = if (proto.ast.return_type) |return_node|
-            try resolveDepth(module, ir, return_node, depth + 1)
+            try resolveDepth(module, ir, return_node, depth + 1, aliases)
         else
             try ir.internType(.void);
         if (!valid or result == null) return null;
         return try ir.internType(.{ .function = .{ .params = params.items, .result = result.? } });
     }
     if (ast.nodes.items(.tag)[node] == .array_type) {
-        const element = (try resolveDepth(module, ir, ast.nodes.items(.data)[node].rhs, depth + 1)) orelse return null;
+        const element = (try resolveDepth(module, ir, ast.nodes.items(.data)[node].rhs, depth + 1, aliases)) orelse return null;
         if (!Ir.isArrayElement(ir.getType(element).?)) return diagnose(module, node, .unsupported_type);
         return try ir.internType(.{ .array = element });
     }
     if (ast.nodes.items(.tag)[node] != .identifier) return diagnose(module, node, .unsupported_type);
     const name = ast.tokenSlice(ast.firstToken(node));
-    // Until aliasing/shadowing rules exist, a module binding is never a type.
-    if (module.lookup(name) != null) return diagnose(module, node, .unsupported_type);
+    if (module.lookup(name)) |id| {
+        if (primitives.isPrimitive(name)) return diagnose(module, node, .unsupported_type);
+        if (module.getDeclaration(id).?.is_type_alias) return if (aliases.get(id)) |entry| entry.ty else null;
+        return diagnose(module, node, .not_a_type);
+    }
     if (std.mem.eql(u8, name, "true") or std.mem.eql(u8, name, "false")) return diagnose(module, node, .not_a_type);
     if (std.mem.eql(u8, name, "string")) return try ir.internType(.string);
     if (std.mem.eql(u8, name, "bool")) return try ir.internType(.boolean);
@@ -223,7 +273,7 @@ test "unsupported unknown and non-type forms have source diagnostics" {
     const Case = struct { spelling: []const u8, tag: Module.Diagnostic.Tag, span: []const u8 };
     const cases = [_]Case{
         .{ .spelling = "Missing", .tag = .unknown_type, .span = "Missing" },
-        .{ .spelling = "alias", .tag = .unsupported_type, .span = "alias" },
+        .{ .spelling = "alias", .tag = .not_a_type, .span = "alias" },
         .{ .spelling = "true", .tag = .not_a_type, .span = "true" },
         .{ .spelling = "false", .tag = .not_a_type, .span = "false" },
         .{ .spelling = "*i32", .tag = .unsupported_type, .span = "*" },
@@ -231,7 +281,7 @@ test "unsupported unknown and non-type forms have source diagnostics" {
         .{ .spelling = "i7", .tag = .unknown_type, .span = "i7" },
     };
     for (cases) |case| {
-        const source = try std.fmt.allocPrint(std.testing.allocator, "let alias = i32\nlet value: {s}", .{case.spelling});
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let alias = 1\nlet value: {s}", .{case.spelling});
         defer std.testing.allocator.free(source);
         var module = try Module.init(std.testing.allocator, "bad.nov", source);
         defer module.deinit();

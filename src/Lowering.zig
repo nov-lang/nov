@@ -18,6 +18,7 @@ pub fn lower(module: *Module) Error!Sema {
     if (module.hasErrors()) return result;
     result.ir.source_len = @intCast(module.ast.source.len);
     for (module.declarations.items, result.entries) |declaration, entry| {
+        if (entry.status == .type_alias) continue;
         if (module.ast.decl(declaration.node).ast.is_mutable or (entry.status != .body_checked and entry.status != .constant_checked)) {
             try module.diagnostics.append(module.allocator, .{ .tag = .unsupported_lowering, .span = declaration.name_span });
         }

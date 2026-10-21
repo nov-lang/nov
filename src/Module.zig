@@ -1,6 +1,7 @@
 const std = @import("std");
 const Ast = @import("Ast.zig");
 const Parser = @import("Parser.zig");
+const primitives = @import("primitives.zig");
 const Module = @This();
 
 allocator: std.mem.Allocator,
@@ -22,6 +23,7 @@ pub const Declaration = struct {
     name: []const u8,
     name_span: Span,
     node: Ast.Node.Index,
+    is_type_alias: bool = false,
 };
 
 pub const Diagnostic = struct {
@@ -35,6 +37,9 @@ pub const Diagnostic = struct {
         unsupported_declaration,
         unsupported_name,
         value_cycle,
+        type_alias_cycle,
+        type_alias_limit,
+        not_a_value,
         unsupported_dependency_expression,
         missing_initializer,
         unknown_type,
@@ -105,7 +110,10 @@ pub fn init(allocator: std.mem.Allocator, path: []const u8, source: []const u8) 
     errdefer module.names.deinit(allocator);
     // Recovered ASTs remain available for syntax diagnostics, but must not feed
     // declaration collection or later semantic phases.
-    if (module.ast.errors.len == 0) try module.collectDeclarations();
+    if (module.ast.errors.len == 0) {
+        try module.collectDeclarations();
+        try module.classifyAliases();
+    }
     return module;
 }
 
@@ -153,6 +161,85 @@ pub fn resolveName(self: *Module, span: Span) (std.mem.Allocator.Error || error{
     if (self.lookup(name)) |id| return id;
     try self.diagnostics.append(self.allocator, .{ .tag = .unknown_name, .span = span });
     return null;
+}
+
+/// Only immutable, unannotated module declarations can name types. An
+/// identifier initializer is not evidence of a type until its target is known
+/// to be a type, or a type position demands it (including otherwise ambiguous
+/// unknown names and cycles). Unconstrained references to runtime values stay
+/// ordinary value declarations; demanded candidates must still pass resolution.
+fn aliasCandidate(self: *const Module, id: DeclId) bool {
+    const full = self.ast.decl(self.getDeclaration(id).?.node).ast;
+    if (full.is_mutable or full.type_node != 0 or full.init_node == 0) return false;
+    return switch (self.ast.nodes.items(.tag)[full.init_node]) {
+        .identifier, .array_type, .fn_proto, .fn_proto_one => true,
+        else => false,
+    };
+}
+
+fn classifyAliases(self: *Module) std.mem.Allocator.Error!void {
+    var work: std.ArrayList(Ast.Node.Index) = .empty;
+    defer work.deinit(self.allocator);
+    const tags = self.ast.nodes.items(.tag);
+    const data = self.ast.nodes.items(.data);
+    // Explicit type positions include local annotations and @as arguments.
+    for (tags, 0..) |tag, i| {
+        const node: Ast.Node.Index = @intCast(i);
+        switch (tag) {
+            .decl => {
+                const full = self.ast.decl(node).ast;
+                if (full.type_node != 0) try work.append(self.allocator, full.type_node);
+            },
+            .fn_proto, .fn_proto_one, .array_type => try work.append(self.allocator, node),
+            .call, .call_one, .call_comma, .call_one_comma => {
+                const call = self.ast.fullCall(node).?;
+                if (std.mem.eql(u8, self.ast.tokenSlice(self.ast.firstToken(call.ast.fn_expr)), "@as") and call.ast.args.len != 0)
+                    try work.append(self.allocator, call.ast.args[0]);
+            },
+            else => {},
+        }
+    }
+    for (self.declarations.items, 0..) |*declaration, i| {
+        if (!self.aliasCandidate(@enumFromInt(i))) continue;
+        const init_node = self.ast.decl(declaration.node).ast.init_node;
+        const name = self.ast.tokenSlice(self.ast.firstToken(init_node));
+        if (tags[init_node] != .identifier or (primitives.isPrimitive(name) and !std.mem.eql(u8, name, "true") and !std.mem.eql(u8, name, "false") and self.lookup(name) == null)) {
+            declaration.is_type_alias = true;
+            try work.append(self.allocator, init_node);
+        }
+    }
+    while (true) {
+        while (work.pop()) |node| {
+            if (self.ast.fullFnProto(node)) |proto| {
+                var iterator = proto.iterate(&self.ast);
+                while (iterator.next()) |param| try work.append(self.allocator, param.type_expr);
+                if (proto.ast.return_type) |result| try work.append(self.allocator, result);
+            } else if (tags[node] == .array_type) {
+                try work.append(self.allocator, data[node].rhs);
+            } else if (tags[node] == .identifier) {
+                const name = self.ast.tokenSlice(self.ast.firstToken(node));
+                if (self.lookup(name)) |id| {
+                    const declaration = &self.declarations.items[@intFromEnum(id)];
+                    if (!declaration.is_type_alias and self.aliasCandidate(id)) {
+                        declaration.is_type_alias = true;
+                        try work.append(self.allocator, self.ast.decl(declaration.node).ast.init_node);
+                    }
+                }
+            }
+        }
+        var changed = false;
+        for (self.declarations.items, 0..) |*declaration, i| {
+            if (declaration.is_type_alias or !self.aliasCandidate(@enumFromInt(i))) continue;
+            const init_node = self.ast.decl(declaration.node).ast.init_node;
+            if (tags[init_node] != .identifier) continue;
+            const target = self.lookup(self.ast.tokenSlice(self.ast.firstToken(init_node))) orelse continue;
+            if (self.getDeclaration(target).?.is_type_alias) {
+                declaration.is_type_alias = true;
+                changed = true;
+            }
+        }
+        if (!changed) break;
+    }
 }
 
 fn collectDeclarations(self: *Module) (std.mem.Allocator.Error || error{TooManyDeclarations})!void {

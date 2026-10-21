@@ -14,6 +14,15 @@ literal bounds without a runtime conversion or additional array-copy boundary.
 Numeric conversions, widening, signedness changes and general type values still
 need language-design decisions; `@as` does not choose those semantics.
 
+Canonical type aliases: plain immutable module `let Name = typeExpression` is
+implemented for existing supported scalar, scalar-array and function types,
+including forward chains and aliases in nested type components. Aliases work in
+annotations and `@as`, never as runtime values or constructors. Cycles have
+source-related diagnostics; alias expansion is iterative and bounded to 128 active
+expansions. Local/mutable aliases, newtypes, general type values, `@TypeOf`,
+generics and comptime functions remain unsupported. Numeric conversion design
+remains deferred; this does not add casts or general literal defaults.
+
 Next step: add new IR that
 - forward declaration
 - resolve literals

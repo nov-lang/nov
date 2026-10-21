@@ -50,6 +50,9 @@ pub fn renderModule(module: *const Module, writer: *std.Io.Writer) !void {
             .unknown_name => try writer.print("unknown name '{s}'", .{module.sourceSlice(diagnostic.span).?}),
             .unsupported_declaration => try writer.writeAll("declaration attributes are not supported in semantic analysis yet"),
             .unsupported_name => try writer.writeAll("quoted identifiers are not supported in semantic analysis yet"),
+            .type_alias_cycle => try writer.print("cyclic type alias dependency on '{s}'", .{module.sourceSlice(diagnostic.span).?}),
+            .type_alias_limit => try writer.writeAll("type alias expansion exceeds the current analysis limit of 128"),
+            .not_a_value => try writer.writeAll("expected a runtime value, found a type alias"),
             .value_cycle => try writer.print("cyclic value dependency on '{s}'", .{module.sourceSlice(diagnostic.span).?}),
             .unsupported_dependency_expression => try writer.writeAll("dependency analysis for this expression is not implemented yet"),
             .missing_initializer => try writer.writeAll("dependency analysis requires an initializer"),
@@ -96,7 +99,8 @@ pub fn renderModule(module: *const Module, writer: *std.Io.Writer) !void {
         try location.renderExcerpt(module.ast.source, diagnostic.span.end - diagnostic.span.start, writer);
         const note: ?[]const u8 = switch (diagnostic.tag) {
             .duplicate_name => "first declaration here",
-            .value_cycle => "declaration in this cycle",
+            .value_cycle, .type_alias_cycle => "declaration in this cycle",
+            .type_alias_limit, .not_a_value => "type alias declared here",
             .duplicate_parameter => "first parameter here",
             .literal_type_mismatch, .literal_out_of_range => "type annotation here",
             .expression_type_mismatch, .literal_needs_type => "expected type required here",

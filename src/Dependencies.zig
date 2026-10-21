@@ -74,6 +74,7 @@ fn scanInitializer(self: *Dependencies, module: *Module, id: Module.DeclId, work
     const declaration = module.getDeclaration(id).?;
     const ast = &module.ast;
     const full = ast.decl(declaration.node);
+    if (declaration.is_type_alias) return;
     if (full.ast.init_node == 0) {
         try module.diagnostics.append(self.allocator, .{ .tag = .missing_initializer, .span = declaration.name_span });
         entry.state = .failed;

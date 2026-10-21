@@ -6,6 +6,7 @@ const Ir = @import("Ir.zig");
 const TypeResolver = @import("TypeResolver.zig");
 const Literal = @import("Literal.zig");
 const BodyChecker = @import("BodyChecker.zig");
+const primitives = @import("primitives.zig");
 const Sema = @This();
 
 allocator: std.mem.Allocator,
@@ -15,9 +16,11 @@ entries: []Entry,
 /// Entry-point/backend/runtime configuration is still a separate obligation.
 lowering_complete: bool = false,
 
-pub const Status = enum { deferred, signature_only, constant_checked, body_checked, lowered, failed };
+pub const Status = enum { deferred, type_alias, signature_only, constant_checked, body_checked, lowered, failed };
 pub const Entry = struct {
     type_id: ?Ir.TypeId = null,
+    /// Represented type, never the runtime type of this declaration.
+    alias_type: ?Ir.TypeId = null,
     constant: ?Ir.ConstId = null,
     function: ?Ir.FunctionId = null,
     status: Status = .deferred,
@@ -40,6 +43,16 @@ pub fn analyzeAnnotations(module: *Module) Error!Sema {
     @memset(result.entries, .{});
     for (module.declarations.items, 0..) |declaration, i| {
         const full = module.ast.decl(declaration.node);
+        if (declaration.is_type_alias) {
+            if (primitives.isPrimitive(declaration.name)) {
+                try module.diagnostics.append(module.allocator, .{ .tag = .unsupported_shadowing, .span = declaration.name_span });
+                result.entries[i].status = .failed;
+                continue;
+            }
+            result.entries[i].alias_type = try TypeResolver.resolve(module, &result.ir, full.ast.init_node);
+            result.entries[i].status = if (result.entries[i].alias_type != null) .type_alias else .failed;
+            continue;
+        }
         if (full.ast.type_node == 0) continue;
         const type_id = (try TypeResolver.resolve(module, &result.ir, full.ast.type_node)) orelse {
             result.entries[i].status = .failed;

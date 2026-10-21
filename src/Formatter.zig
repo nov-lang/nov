@@ -2,6 +2,7 @@ const std = @import("std");
 const Ast = @import("Ast.zig");
 const Parser = @import("Parser.zig");
 const Tokenizer = @import("Tokenizer.zig");
+const primitives = @import("primitives.zig");
 
 /// Supports scalar declarations/operators plus function signatures, calls,
 /// local blocks, if/else, loops with optional conditions/continuations, returns,
@@ -123,7 +124,7 @@ fn checkSupported(ast: Ast) !void {
                 const scalar_types = [_][]const u8{ "bool", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "int", "uint" };
                 for (scalar_types) |scalar| {
                     if (std.mem.eql(u8, name, scalar)) break;
-                } else return error.UnsupportedSyntax;
+                } else if (primitives.isPrimitive(name)) return error.UnsupportedSyntax;
             },
             .array_init_two, .array_init_two_comma, .array_init, .array_init_comma => {
                 const buffer = [_]Ast.Node.Index{ data.lhs, data.rhs };

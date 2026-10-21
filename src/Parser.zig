@@ -191,12 +191,20 @@ fn interpolationExpression(self: *Parser, tokens: *Ast.TokenList, start: usize, 
     defer self.tok_i = saved_token;
     const errors_start = self.errors.items.len;
     defer self.errors.shrinkRetainingCapacity(errors_start);
+    const nodes_start = self.nodes.len;
+    const extra_start = self.extra_data.items.len;
+    var complete = false;
+    defer if (!complete) {
+        self.nodes.shrinkRetainingCapacity(nodes_start);
+        self.extra_data.shrinkRetainingCapacity(extra_start);
+    };
     self.tok_i = first;
     const expression = self.expectExpr() catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.ParseError => return 0,
     };
     if (self.token_tags[self.tok_i] != .eof or self.errors.items.len != errors_start) return 0;
+    complete = true;
     return expression;
 }
 
@@ -346,7 +354,17 @@ fn parseDecl(self: *Parser) Error!Node.Index {
 
     _ = try self.expectToken(.identifier);
     const type_expr = if (self.eatToken(.colon) != null) try self.expectTypeExpr() else null_node;
-    const initializer = if (self.eatToken(.equal) != null) try self.expectExpr() else null_node;
+    const initializer = if (self.eatToken(.equal) != null) blk: {
+        // []T is unambiguous here; [] and [values] remain runtime literals.
+        // Keep this restricted to declaration RHSs, not general expressions.
+        if (type_expr == null_node and self.token_tags[self.tok_i] == .l_bracket and
+            self.token_tags[self.tok_i + 1] == .r_bracket and
+            (self.token_tags[self.tok_i + 2] == .identifier or
+                self.token_tags[self.tok_i + 2] == .l_bracket or
+                self.token_tags[self.tok_i + 2] == .l_paren))
+            break :blk try self.expectTypeExpr();
+        break :blk try self.expectExpr();
+    } else null_node;
 
     if (type_expr == null_node and initializer == null_node) {
         return self.failExpected(.equal);
