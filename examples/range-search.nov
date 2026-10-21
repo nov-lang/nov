@@ -17,7 +17,7 @@ let describe: (start: uint, end: uint, target: uint) -> string = loop i in start
 
 let main: () -> void = {
     @println(contains(1, 5, 4), contains(1, 5, 5), contains(5, 1, 3))
-    @println(describe(1, 5, 5), describe(5, 1, 3))
+    @println("{describe(1, 5, 5)}\n{describe(5, 1, 3)}")
     let max: u64 = 18446744073709551615
     loop _ in max..=max {
         continue

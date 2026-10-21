@@ -1775,6 +1775,35 @@ test "identifier interpolation preserves chunks formatting roots loops matches a
     for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, string_interpolation_output, "", mode);
 }
 
+test "expression interpolation reuses calls scopes ordering and rooted temporaries" {
+    const c = try arrayTestProgram(
+        \\let echo: (n: int) -> string = {@print(n)
+        \\    if n == 0 {return "zero"}
+        \\    "{n}" + "!"}
+        \\let argument: (n: int) -> int = {@print("A")
+        \\    n}
+        \\let factory: () -> (int) -> string = {@print("C")
+        \\    echo}
+        \\let join: (a: string, b: string) -> string = a + b
+        \\let main: () -> void = {
+        \\    let n: int = 2
+        \\    let bytes = "é\0😀"
+        \\    @println("{factory()(argument(1))}/{echo(argument(n + 1))}:{bytes}", echo(4))
+        \\    @println("{join(echo(5), echo(6))}", "{ n + 1 }", "{bytes.len}")
+        \\    let a = [true, false]
+        \\    @println("{a[0]}:{true and false}")
+        \\    let zero: int = 0
+        \\    loop i in zero..2 {
+        \\        loop j in zero..1 {
+        \\            @println("{echo(i + j)}")
+        \\        }
+        \\    }
+        \\}
+    );
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "CA1A341!/3!:é\x00😀 4!\n565!6! 3 7\ntrue:false\n0zero\n11!\n", "", mode);
+}
+
 test "interpolation decimal formatting is exact at every supported integer boundary" {
     var source = std.Io.Writer.Allocating.init(test_gpa);
     defer source.deinit();
@@ -1813,6 +1842,8 @@ test "interpolation allocations panic on exhaustion while bool and string sharin
     for ([_]struct { source: []const u8, output: []const u8 = "", allocates: bool = true }{
         .{ .source = "let main: () -> void = {let n: int = 1\n@println(\"{n}\")}" },
         .{ .source = "let main: () -> void = {let b = true\n@println(\"value={b}\")}" },
+        .{ .source = "let make: (n: int) -> string = \"{n}\"\nlet main: () -> void = @println(\"{make(42)}\")" },
+        .{ .source = "let yes: () -> bool = true\nlet main: () -> void = @println(\"{yes()}\")", .output = "true\n", .allocates = false },
         .{ .source = "let main: () -> void = {let s = \"é\\0\"\n@println(\"{s}\", \"{false}\")}", .output = "é\x00 false\n", .allocates = false },
     }) |case| {
         const c = try arrayTestProgram(case.source);

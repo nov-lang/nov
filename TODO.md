@@ -47,9 +47,9 @@ Keep Nov away from:
 - strings:
   - [x] immutable UTF-8 literals, sharing, concatenation, `+=`, byte length and output
   - [x] allocation-free, byte-exact `==`/`!=` (including NUL; no normalization)
-  - [x] identifier-only `{name}` interpolation for bool/fixed/native integers/strings;
+  - [x] `{expression}` interpolation (including nested calls) for bool/fixed/native integers/strings;
     decimal boundaries, UTF-8/NUL, rooted temporaries and formatter preservation
-  - expressions/calls/formats/captures and global interpolation remain unsupported
+  - blocks/control flow/quoted literals/formats/captures and global interpolation remain unsupported
   - ordering, indexing, slicing and Unicode operations remain deferred
 - add tests, mainly for Parser, IRs, Codegen and Runtime
   - [x] initial parser, formatter, file-safety, and CLI regression coverage
@@ -141,7 +141,7 @@ let myStruct = struct {}
 - Move `@print` etc... to stdlib? (either need to wrap args in an anonymous
   struct or allow to pass a variadic amount of parameters to a function).
 - Make `*` always `*mut`? What are the positives and negatives of this change?
-- Future format-option proposal (identifier-only interpolation is implemented):
+- Future format-option proposal (expression interpolation is implemented):
   `"{varname:[fill][alignment][width][.precision]:[custom options]}"`
   and use format like zig instead of toString?
 - **Rework Parser to remove newline if they are unnecessary**
@@ -656,9 +656,10 @@ let ArrayList: (T: #type) -> type = { ... }
   - Literals, `+`, printing, locals, parameters/returns, conditionals and explicitly
     typed immutable literal globals are supported. Concatenation uses rooted GC
     backing; literals use static read-only bytes with a null traced owner.
-  - Identifier interpolation supports bool, fixed/native decimal integers and
+  - Expression interpolation supports bool, fixed/native decimal integers and
     shared strings, preserving UTF-8/NUL with no normalization. Placeholders are
-    evaluated left-to-right once; calls/expressions/formats/captures are unsupported.
+    evaluated left-to-right once, including nested calls and scalar expressions.
+        Blocks/control flow/quoted literals/formats/captures remain unsupported.
     Global interpolation is nonliteral and rejected, not eagerly evaluated.
   - Indexing, slicing, Unicode operations, string arrays and C-string conversion
     are deferred. No terminator or compile-time concatenation promise.

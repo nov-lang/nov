@@ -1390,8 +1390,8 @@ Arrays remain bool/integer-only: `[]string` and nested arrays are rejected.
 `"é".len` is 2 and `"😀".len` is 4. Literals use the existing escapes (`\n`, `\r`,
 `\t`, `\\`, `\"`, `\'`, `\0`, `\xNN`, `\u{...}`, `\{`, `\}`). Decoded bytes
 must be valid UTF-8; NUL is valid, including through `\x00` or `\u{0}`. Invalid
-escapes/UTF-8 report source locations. Unescaped `{identifier}` interpolates a
-value; use `\{` and `\}` for literal braces. Other brace forms are rejected.
+escapes/UTF-8 report source locations. Unescaped `{expression}` interpolates a
+scalar value, including function calls; use `\{` and `\}` for literal braces.
 
 `@print`/`@println` write exact UTF-8 bytes with explicit lengths, including embedded
 NUL, with the same spaces, buffering, checked writes/final flush and panic behavior
@@ -1422,7 +1422,7 @@ never static byte pointers. Temporaries use the same precise root frames as arra
 
 ## String Interpolation
 
-`"{identifier}"` evaluates an identifier in the current lexical scope and produces
+`"{expression}"` evaluates an expression in the current lexical scope and produces
 an immutable `string`. Placeholders support `bool` (`true`/`false`), signed and
 unsigned fixed-width integers (`i8`/`u8` through `i64`/`u64`), native `int`/`uint`
 (exact decimal, including minimum/maximum values), and strings (unchanged bytes).
@@ -1432,13 +1432,21 @@ No numeric defaults, widening or implicit fallback formatting are introduced.
 let describe: (n: int, ready: bool) -> string = "n={n}, ready={ready}"
 ```
 
-Placeholders are ordinary unquoted identifiers only (`[A-Za-z_][A-Za-z0-9_]*`).
-They resolve existing locals, parameters and supported literal globals; builtin
-`true`/`false` also work. Existing no-shadowing and declaration-before-use rules
-apply. Expressions, calls, fields, quoted identifiers, captures and format options
-such as `"{n:02}"` are not supported. Malformed/unescaped braces diagnose rather
-than silently printing text. Escaped braces and braces produced by `\xNN` or
-`\u{...}` remain literal, and inserted strings are never reinterpreted.
+Placeholders use the normal expression parser and checker: identifiers, calls
+(including nested calls), scalar operators, array access and `.len` work with the
+usual type contexts. For example, `"{describe(1, 5, 5)}\n{describe(5, 1, 3)}"`
+uses the callee's parameter types for the numeric arguments. Existing lexical
+scope, no-shadowing and declaration-before-use rules apply; spaces are allowed.
+Bare numbers still need a type context (`"{1}"` is rejected).
+
+This bounded syntax excludes blocks/braces, control flow, comments, quotes and
+backslashes inside placeholders. String/character literals and quoted names
+inside calls are therefore unsupported, even with source escapes: bind them to
+locals first. Captures and format options such as `"{n:02}"` remain unsupported.
+The entire placeholder must parse as one expression; trailing tokens and
+malformed/unescaped braces diagnose rather than silently printing text. Escaped
+braces and braces produced by `\xNN` or `\u{...}` remain literal, and inserted
+strings are never reinterpreted.
 
 Chunks and placeholders evaluate once, left to right. UTF-8 bytes and embedded NUL
 are preserved, with no Unicode normalization. String placeholders share storage;

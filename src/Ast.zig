@@ -1635,8 +1635,9 @@ pub const Node = struct {
         /// lhs is the dot token index, rhs unused.
         /// main_token is the identifier.
         enum_literal,
-        /// main_token is the string literal token
-        /// Both lhs and rhs unused.
+        /// main_token is the complete outer string literal token.
+        /// extra_data[lhs..rhs] holds placeholder expression nodes in source order;
+        /// zero entries represent invalid placeholder syntax.
         string_literal,
         /// `{lhs rhs}`. lhs and rhs can be omitted.
         /// main_token points at the lbrace.

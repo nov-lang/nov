@@ -37,7 +37,7 @@ const Error = error{ParseError} || Allocator.Error;
 
 const Parser = @This();
 
-source: []const u8,
+source: [:0]const u8,
 allocator: Allocator,
 token_tags: []const Token.Tag,
 token_starts: []const Tokenizer.ByteOffset,
@@ -88,6 +88,7 @@ pub fn parse(allocator: Allocator, source: [:0]const u8) Allocator.Error!Ast {
     try parser.nodes.ensureTotalCapacity(allocator, estimated_node_count);
 
     try parser.parseRoot();
+    try parser.parseInterpolations(&tokens);
 
     // Finish fallible transfers before releasing the token and node owners.
     const extra_data = try parser.extra_data.toOwnedSlice(allocator);
@@ -101,6 +102,100 @@ pub fn parse(allocator: Allocator, source: [:0]const u8) Allocator.Error!Ast {
         .extra_data = extra_data,
         .errors = errors,
     };
+}
+
+/// Keep the outer literal token intact for rendering. Placeholder nodes share
+/// this AST's identity space and borrow only original-source token offsets.
+/// The literal's data indexes an extra_data slice (zero denotes invalid syntax).
+fn parseInterpolations(self: *Parser, tokens: *Ast.TokenList) Allocator.Error!void {
+    const original_tokens = tokens.len;
+    const original_nodes = self.nodes.len;
+    for (0..original_nodes) |index| {
+        if (self.nodes.items(.tag)[index] != .string_literal) continue;
+        const token = self.nodes.items(.main_token)[index];
+        var lexer = Tokenizer.init(self.source);
+        lexer.index = self.token_starts[token];
+        const literal = lexer.next();
+        const bytes = self.source[literal.start..literal.end];
+        const scratch_top = self.scratch.items.len;
+        defer self.scratch.shrinkRetainingCapacity(scratch_top);
+        var offset: usize = 1;
+        while (offset < bytes.len - 1) {
+            if (bytes[offset] == '\\') {
+                switch (@import("string_literal.zig").parseEscapeSequence(bytes, &offset)) {
+                    .success => continue,
+                    .failure => break,
+                }
+            }
+            if (bytes[offset] != '{') {
+                offset += 1;
+                continue;
+            }
+            const start = offset + 1;
+            offset = start;
+            while (offset < bytes.len - 1 and bytes[offset] != '}') : (offset += 1) {}
+            if (offset == bytes.len - 1) break;
+            const expression = try self.interpolationExpression(tokens, literal.start + start, literal.start + offset);
+            try self.scratch.append(self.allocator, expression);
+            offset += 1;
+        }
+        const start = self.extra_data.items.len;
+        try self.extra_data.appendSlice(self.allocator, self.scratch.items[scratch_top..]);
+        self.nodes.items(.data)[index] = .{ .lhs = @intCast(start), .rhs = @intCast(self.extra_data.items.len) };
+    }
+    if (tokens.len != original_tokens) {
+        // Root spans end at the final token. Retain the original EOF index for
+        // parse diagnostics and the fragment EOFs that bound child expressions.
+        try tokens.append(self.allocator, .{ .tag = .eof, .start = @intCast(self.source.len) });
+        self.token_tags = tokens.items(.tag);
+        self.token_starts = tokens.items(.start);
+    }
+}
+
+fn interpolationExpression(self: *Parser, tokens: *Ast.TokenList, start: usize, end: usize) Allocator.Error!Node.Index {
+    // Quoting/escaping a nested source language is deliberately not defined yet.
+    // Reject statement/control syntax as well, rather than inheriting terminal
+    // paths or allowing a trailing statement to escape the placeholder.
+    const raw = self.source[start..end];
+    if (std.mem.indexOfAny(u8, raw, "\"'{};\\") != null) return 0;
+    const fragment = try self.allocator.dupeZ(u8, raw);
+    defer self.allocator.free(fragment);
+    const first: TokenIndex = @intCast(tokens.len);
+    var lexer = Tokenizer.init(fragment);
+    var valid = true;
+    while (true) {
+        const token = lexer.next();
+        switch (token.tag) {
+            .invalid,
+            .colon,
+            .keyword_return,
+            .keyword_break,
+            .keyword_continue,
+            .keyword_loop,
+            .keyword_if,
+            .keyword_match,
+            .keyword_defer,
+            .keyword_let,
+            => valid = false,
+            else => {},
+        }
+        try tokens.append(self.allocator, .{ .tag = token.tag, .start = @intCast(start + token.start) });
+        if (token.tag == .eof) break;
+    }
+    self.token_tags = tokens.items(.tag);
+    self.token_starts = tokens.items(.start);
+    if (!valid) return 0;
+    const saved_token = self.tok_i;
+    defer self.tok_i = saved_token;
+    const errors_start = self.errors.items.len;
+    defer self.errors.shrinkRetainingCapacity(errors_start);
+    self.tok_i = first;
+    const expression = self.expectExpr() catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.ParseError => return 0,
+    };
+    if (self.token_tags[self.tok_i] != .eof or self.errors.items.len != errors_start) return 0;
+    return expression;
 }
 
 /// Root <- (doc_comment? Attr* Decl)*
@@ -1640,6 +1735,94 @@ fn testParseAllocationFailures(allocator: Allocator, source: [:0]const u8) !void
     var ast = try parse(allocator, source);
     defer ast.deinit(allocator);
     try std.testing.expectEqual(Token.Tag.eof, ast.tokens.items(.tag)[ast.tokens.len - 1]);
+    try std.testing.expectEqual(source.len, ast.tokens.items(.start)[ast.lastToken(0)]);
+}
+
+test "interpolation preserves root EOF and original token indices" {
+    for ([_][:0]const u8{
+        "let text=\"{f(1)}\"\nlet later=42\n; trailing",
+        "let text=\"{f(1)}:{g(2)}\"\nlet later=42\n; trailing",
+        "let text=\"{f(}:{g(2)}:{h(3)}\"\nlet later=42\n; trailing",
+        "let text=\"{f(1)}:{g(}\"\nlet later=42\n; trailing",
+        "let text=\"{return 1}\"\nlet later=42\n; trailing",
+        "let text=\"{f(1)\"\nlet later=42\n; trailing",
+        "let text=\"{\\\"quoted\\\"}\"\nlet later=42\n; trailing",
+        "let text=\"\\{literal\\}\"\nlet later=42\n; trailing",
+        "let text=\"plain\"\nlet later=42\n; trailing",
+    }) |source| {
+        var ast = try parse(std.testing.allocator, source);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+        const last = ast.lastToken(0);
+        try std.testing.expectEqual(Token.Tag.eof, ast.tokens.items(.tag)[last]);
+        try std.testing.expectEqual(source.len, ast.tokens.items(.start)[last]);
+        try std.testing.expectEqualStrings("", ast.tokenSlice(last));
+        try std.testing.expectEqualStrings(source, ast.getNodeSource(0));
+        try std.testing.expectEqualStrings("let later=42", ast.getNodeSource(ast.rootDecls()[1]));
+        var lexer = Tokenizer.init(source);
+        var index: usize = 0;
+        while (true) : (index += 1) {
+            const token = lexer.next();
+            try std.testing.expectEqual(token.tag, ast.tokens.items(.tag)[index]);
+            try std.testing.expectEqual(token.start, ast.tokens.items(.start)[index]);
+            if (token.tag == .eof) break;
+        }
+        const original_count = index + 1;
+        // No synthetic EOF is needed if no fragment tokens were appended.
+        if (ast.tokens.len != original_count) {
+            try std.testing.expect(last > index);
+            try std.testing.expectEqual(Token.Tag.eof, ast.tokens.items(.tag)[last - 1]);
+            try std.testing.expect(ast.tokens.items(.start)[last - 1] < source.len);
+        }
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
+    }
+}
+
+test "interpolation retains original EOF diagnostic indices" {
+    for ([_][:0]const u8{
+        "let text=\"{f(1)}\"\nlet broken=",
+        "let text=\"{f(1)}:{g(2)}\"\nlet broken=",
+        "let text=\"{f(}:{g(2)}\"\nlet broken=",
+        "let text=\"{f(1)}:{g(}\"\nlet broken=",
+    }) |source| {
+        var ast = try parse(std.testing.allocator, source);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 1), ast.errors.len);
+        try std.testing.expectEqual(Ast.Error.Tag.expected_expr, ast.errors[0].tag);
+        const error_token = ast.errors[0].token;
+        var lexer = Tokenizer.init(source);
+        var original_eof: TokenIndex = 0;
+        while (lexer.next().tag != .eof) : (original_eof += 1) {}
+        try std.testing.expectEqual(original_eof, error_token);
+        try std.testing.expectEqual(Token.Tag.eof, ast.tokens.items(.tag)[error_token]);
+        try std.testing.expectEqual(source.len, ast.tokens.items(.start)[error_token]);
+        try std.testing.expectEqual(source.len, ast.tokens.items(.start)[ast.lastToken(0)]);
+        try std.testing.expect(error_token < ast.lastToken(0));
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
+    }
+}
+
+test "interpolation nodes share identities and retain original source offsets" {
+    const source = "let text = \"a{outer(inner(1), 2)}b{n + 1}c\\{literal\\}\"";
+    var ast = try parse(std.testing.allocator, source);
+    defer ast.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    const string = ast.decl(ast.rootDecls()[0]).ast.init_node;
+    const data = ast.nodes.items(.data)[string];
+    const expressions = ast.extra_data[data.lhs..data.rhs];
+    try std.testing.expectEqual(@as(usize, 2), expressions.len);
+    try std.testing.expect(expressions[0] > string and expressions[1] > expressions[0]);
+    try std.testing.expect(ast.fullCall(expressions[0]) != null);
+    try std.testing.expectEqual(Node.Tag.add, ast.nodes.items(.tag)[expressions[1]]);
+    for (expressions, [_][]const u8{ "outer(inner(1), 2)", "n + 1" }) |node, expected| {
+        const first = ast.firstToken(node);
+        const last = ast.lastToken(node);
+        const starts = ast.tokens.items(.start);
+        try std.testing.expectEqualStrings(expected, source[starts[first] .. starts[last] + ast.tokenSlice(last).len]);
+    }
+    for ([_][:0]const u8{ source, "let text = \"{f(1,)}:{f(} {return 1}\"" }) |raw| {
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{raw});
+    }
 }
 
 test "parser ownership survives allocation failures" {

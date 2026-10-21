@@ -149,6 +149,23 @@ test "interpolation chunks and ordered conversions own storage after source rele
     try std.testing.expectEqual(@as(usize, 4), chunks);
 }
 
+test "interpolated call IR owns storage after releasing source and fragment tokens" {
+    var module = try Module.init(std.testing.allocator, "calls.nov", "let id: (s: string) -> string = s\nlet add: (a: int, b: int) -> int = a + b\nlet f: (n: int, s: string) -> string = \"é\\0{id(s)}:{add(n, add(1, 2))}😀\"");
+    var sema = lower(&module) catch |err| {
+        module.deinit();
+        return err;
+    };
+    defer sema.deinit();
+    const failed = module.hasErrors();
+    module.deinit();
+    try std.testing.expect(!failed);
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+    const c = try @import("CEmitter.zig").emit(std.testing.allocator, &sema.ir, null);
+    defer std.testing.allocator.free(c);
+    try std.testing.expect(std.mem.indexOf(u8, c, "nov_add") != null);
+}
+
 test "interpolation conversions cannot reference sibling private match values" {
     var module = try Module.init(std.testing.allocator, "private-interpolation.nov", "let f: (n: int) -> string = match n {0 => \"{n}\"\n_ => \"{n}\"}");
     defer module.deinit();
@@ -863,6 +880,10 @@ test "lowering ownership and source diagnostic rollback survive allocation failu
         "",
         "let f: (a: i32, b: i32) -> i32 = a + b\nlet main: () -> i32 = f(1, f(2, 3))",
         "let first: () = {}\nlet last: () -> bool = true and false",
+        "let id: (n: int) -> int = n\nlet f: (n: int) -> string = \"{id(id(n + 1))}:{n}\\0\"",
+        "let f: (n: int) -> string = \"{n + missing}\"",
+        "let f: (n: int) -> string = \"{f(n) n}\"",
+        "let f: (n: int) -> string = \"{f(n + (1)}\"",
         "let f: (x: bool) -> bool = x and {let y: bool = x or false\n@println(y)\ny and x}\nlet main: () -> void = @println(f(true), false or f(false))",
         "let f: (x: bool) -> bool = if x {let y: bool = x or false\n@println(y)\ny} else if !x {true and x} else {false}\nlet main: () -> void = {if f(true) {@println(true)}\n}",
         "let f: () -> void = if false {missing} else {}",

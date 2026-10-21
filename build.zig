@@ -211,7 +211,7 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         .{ .name = "check valid syntax", .args = &.{ "check", "valid.nov" }, .exit_code = 0 },
         .{ .name = "check interpolation", .args = &.{ "check", "--semantic", "interpolation.nov" }, .exit_code = 0 },
         .{ .name = "fmt interpolation", .args = &.{ "fmt", "--check", "interpolation.nov" }, .exit_code = 0 },
-        .{ .name = "reject interpolation formats", .args = &.{ "emit-c", "interpolation-format.nov" }, .exit_code = 1, .stderr_match = "expected {identifier}; expressions, calls and format options are unsupported" },
+        .{ .name = "reject interpolation formats", .args = &.{ "emit-c", "interpolation-format.nov" }, .exit_code = 1, .stderr_match = "expected {expression}; blocks, control flow, quotes and format options are unsupported" },
         .{ .name = "reject interpolation unknown names", .args = &.{ "emit-c", "interpolation-name.nov" }, .exit_code = 1, .stderr_match = "unknown name 'missing'" },
         .{ .name = "reject global interpolation", .args = &.{ "check", "--semantic", "interpolation-global.nov" }, .exit_code = 1, .stderr_match = "global strings require literal initializers; move interpolation into a function" },
         .{ .name = "check unchanged fibo", .args = &.{ "check", "--semantic", "fibo.nov" }, .exit_code = 0 },
@@ -387,7 +387,7 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         bits_run.expectStdErrEqual("");
         test_step.dependOn(&bits_run.step);
 
-        const search_output = "true false false\nFound 5 Not found\nExhausted at MAX\n";
+        const search_output = "true false false\nFound 5\nNot found\nExhausted at MAX\n";
         const search = b.addRunArtifact(exe);
         search.step.name = b.fmt("CLI: range search ({s})", .{mode});
         search.setCwd(fixtures.getDirectory());
