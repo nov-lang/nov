@@ -109,6 +109,22 @@ compatible, fundamentally aligned and nonreentrant. No hook may reenter the heap
 checks. GCC can run the same harness with the identical flags. The harness counts
 outstanding host allocations to check deterministic cleanup.
 
+## Generated nominal value structs
+
+Bounded records are flat C value structs, not GC allocations. Their supported
+fields are bool/integer scalars and immutable `nov_string` values. Assignment and
+by-value call/return boundaries copy fields; string backing is shared. The emitter
+predeclares record instruction/slot/merge storage at function scope, zero-initializes
+it, and adds each string field's real `void *owner` address to the function frame,
+along with record-parameter owners. Skipped branches therefore contain initialized
+NULL roots; prior constructor arguments and allocating `toString` results remain
+rooted. No `T **` cast or string `.data` pointer is used for tracing. A uniform
+record path currently installs a frame even for records with no string fields.
+No runtime helper or heap-object descriptor was added for records. Nested records,
+array/function fields, record arrays, field writes and foreign retention remain
+unsupported. The existing allocation retry, panic, shutdown and immutable-string
+contracts apply unchanged.
+
 ## Generated scalar arrays
 
 The approved first array slice uses `nov_array { void *data; uintptr_t len, cap; }`.

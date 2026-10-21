@@ -1,5 +1,22 @@
 # TODO
 
+Bounded nominal value structs are executable; `examples/type.nov` is unchanged
+and runs/checks/formats successfully. Separate declarations have distinct identities;
+module aliases preserve identity. Flat bool/integer/string fields have exact types,
+literal-only defaults and required-field diagnostics. Explicit `Type[.field=value]`
+constructors evaluate supplied fields once left-to-right, then omitted literal defaults
+in declaration order. Record value boundaries copy fields; strings share immutable
+storage. Field reads work in interpolation. Container methods support scoped and
+static `Type.method(...)` calls; print calls exact `toString: (MyType) -> string` once
+immediately after each argument is evaluated, before the next argument. Only
+`@[public]` on structs/methods is accepted, as future visibility metadata, not imports
+or a new C export policy. C value layouts/root frames retain every string owner in
+parameters, temporaries, local slots and control-flow merges. Contextual/anonymous
+constructors, instance-method syntax, field mutation, nested/array/function fields,
+record arrays/globals, container constants/types, derived printing, record
+interpolation, generics and FFI remain deferred. See README's executable struct
+contract; the older broader syntax examples below are not delivery claims.
+
 Executable scalar status: integer binary `&`, `|`, `^` and unary `~` support
 exact matching fixed-width 8/16/32/64 and native `int`/`uint` types, with same-width
 two's-complement results, contextual literals, no widening/defaults and no overflow
@@ -26,8 +43,10 @@ need language-design decisions; `@as` does not choose those semantics.
 
 Canonical type aliases: plain immutable module `let Name = typeExpression` is
 implemented for existing supported scalar, scalar-array and function types,
-including forward chains and aliases in nested type components. Aliases work in
-annotations and `@as`, never as runtime values or constructors. Cycles have
+including nominal structs, forward chains and aliases in nested type components.
+Aliases work in annotations and `@as`, never as runtime type values. Nominal struct
+aliases additionally preserve explicit `Alias[...]` constructors and static methods;
+this does not introduce numeric constructors. Cycles have
 source-related diagnostics; alias expansion is iterative and bounded to 128 active
 expansions. Local/mutable aliases, newtypes, general type values, `@TypeOf`,
 generics and comptime functions remain unsupported. Numeric conversion design

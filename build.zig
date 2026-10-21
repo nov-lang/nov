@@ -125,6 +125,12 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     _ = fixtures.add("strings.nov", @embedFile("examples/strings.nov"));
     _ = fixtures.add("interpolation.nov", @embedFile("examples/interpolation.nov"));
     _ = fixtures.add("type-aliases.nov", @embedFile("examples/type-aliases.nov"));
+    _ = fixtures.add("type.nov", @embedFile("examples/type.nov"));
+    _ = fixtures.add("wide-record.nov", "let R=struct{x:i128,}\nlet f:(r:R)= {}\nlet main:()={}\n");
+    _ = fixtures.add("wide-record-alias.nov", "let Wide=u128\nlet Alias=R\nlet R=struct{x:Wide,}\nlet f:(r:Alias)= {}\nlet main:()={}\n");
+    _ = fixtures.add("unused-wide-record.nov", "let R=struct{x:i128,}\nlet main:()={}\n");
+    _ = fixtures.add("wide-record-bounds.nov", "let R=struct{x:i128=170141183460469231731687303715884105728,}\n");
+    _ = fixtures.add("wide-record-array.nov", "let R=struct{x:[]u128,}\n");
     _ = fixtures.add("boolean-match.nov",
         \\let Flag = bool
         \\let choose: (b: Flag) -> int = match b {
@@ -275,6 +281,15 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         .{ .name = "global ascription exact nesting", .args = &.{ "emit-c", "global-nesting.nov" }, .exit_code = 1, .stderr_match = "expression does not match the expected type" },
         .{ .name = "global ascription rejects blocks", .args = &.{ "emit-c", "global-block.nov" }, .exit_code = 1, .stderr_match = "inferred globals require immutable" },
         .{ .name = "global ascription rejects interpolation", .args = &.{ "check", "--semantic", "global-interpolation.nov" }, .exit_code = 1, .stderr_match = "move interpolation into a function" },
+        .{ .name = "check wide record", .args = &.{ "check", "--semantic", "wide-record.nov" }, .exit_code = 0 },
+        .{ .name = "reject reachable wide record backend", .args = &.{ "emit-c", "wide-record.nov" }, .exit_code = 1, .stderr_match = "C backend only supports 8, 16, 32 and 64-bit integers" },
+        .{ .name = "check wide record aliases", .args = &.{ "check", "--semantic", "wide-record-alias.nov" }, .exit_code = 0 },
+        .{ .name = "reject reachable wide record alias backend", .args = &.{ "emit-c", "wide-record-alias.nov" }, .exit_code = 1, .stderr_match = "C backend only supports 8, 16, 32 and 64-bit integers" },
+        .{ .name = "run unused wide record", .args = &.{ "run", "unused-wide-record.nov" }, .exit_code = 0 },
+        .{ .name = "wide record literal bounds", .args = &.{ "check", "--semantic", "wide-record-bounds.nov" }, .exit_code = 1, .stderr_match = "integer literal does not fit the annotated type" },
+        .{ .name = "wide record arrays remain unsupported", .args = &.{ "check", "--semantic", "wide-record-array.nov" }, .exit_code = 1, .stderr_match = "this type is not supported" },
+        .{ .name = "check nominal structs", .args = &.{ "check", "--semantic", "type.nov" }, .exit_code = 0 },
+        .{ .name = "fmt nominal structs", .args = &.{ "fmt", "--check", "type.nov" }, .exit_code = 0 },
         .{ .name = "check type aliases", .args = &.{ "check", "--semantic", "type-aliases.nov" }, .exit_code = 0 },
         .{ .name = "fmt type aliases", .args = &.{ "fmt", "--check", "type-aliases.nov" }, .exit_code = 0 },
         .{ .name = "reject alias value", .args = &.{ "emit-c", "alias-value.nov" }, .exit_code = 1, .stderr_match = "expected a runtime value, found a type alias" },
@@ -460,6 +475,38 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         bits_run.expectStdOutEqual("-1 0 127 0\n");
         bits_run.expectStdErrEqual("");
         test_step.dependOn(&bits_run.step);
+
+        const record_run = b.addRunArtifact(exe);
+        record_run.step.name = b.fmt("CLI: nominal structs ({s})", .{mode});
+        record_run.setCwd(fixtures.getDirectory());
+        record_run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+        record_run.setEnvironmentVariable("NOV_CC", "");
+        record_run.setEnvironmentVariable("CC", "");
+        record_run.addArgs(&.{ "run", "type.nov" });
+        if (mode.len != 0) record_run.addArg(mode);
+        record_run.expectExitCode(0);
+        record_run.expectStdOutEqual("x: 5, y: hello. z: true\n");
+        record_run.expectStdErrEqual("");
+        test_step.dependOn(&record_run.step);
+        const record_build = b.addRunArtifact(exe);
+        record_build.step.name = b.fmt("CLI: build nominal structs ({s})", .{mode});
+        record_build.setCwd(fixtures.getDirectory());
+        record_build.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+        record_build.setEnvironmentVariable("NOV_CC", "");
+        record_build.setEnvironmentVariable("CC", "");
+        record_build.addArgs(&.{ "build", "type.nov" });
+        if (mode.len != 0) record_build.addArg(mode);
+        record_build.addArg("-o");
+        const record_binary = record_build.addOutputFileArg(if (exe.root_module.resolved_target.?.result.os.tag == .windows) "record.exe" else "record");
+        record_build.expectExitCode(0);
+        record_build.expectStdOutEqual("");
+        record_build.expectStdErrEqual("");
+        const record_execute = std.Build.Step.Run.create(b, b.fmt("CLI: execute nominal structs ({s})", .{mode}));
+        record_execute.addFileArg(record_binary);
+        record_execute.expectExitCode(0);
+        record_execute.expectStdOutEqual("x: 5, y: hello. z: true\n");
+        record_execute.expectStdErrEqual("");
+        test_step.dependOn(&record_execute.step);
 
         const search_output = "true false false\nFound 5\nNot found\nExhausted at MAX\n";
         const search = b.addRunArtifact(exe);

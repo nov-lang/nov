@@ -614,7 +614,6 @@ pub fn firstToken(self: Ast, node: Node.Index) TokenIndex {
         .container_decl_trailing,
         .container_decl_two,
         .container_decl_two_trailing,
-        .container_decl_arg,
         .container_decl_arg_trailing,
         .container_field,
         => return main_tokens[n] - end_offset,
@@ -622,6 +621,7 @@ pub fn firstToken(self: Ast, node: Node.Index) TokenIndex {
         .enum_literal,
         => return main_tokens[n] - 1 - end_offset,
 
+        .container_decl_arg,
         .field_access,
         .unwrap,
         .deref,
@@ -822,9 +822,14 @@ pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
         .call_comma,
         => return self.matchingDelimiter(main_tokens[n]) + end_offset,
 
-        .array_access => return self.matchingDelimiter(main_tokens[n]) + end_offset,
+        .container_decl => return self.matchingDelimiter(main_tokens[n] + 1) + end_offset,
+        .container_decl_arg, .array_access => return self.matchingDelimiter(main_tokens[n]) + end_offset,
+        .container_field => {
+            n = if (datas[n].rhs != 0) datas[n].rhs else datas[n].lhs;
+        },
 
         .attr_one => {
+            if (datas[n].rhs == 0) return main_tokens[n] + 2 + end_offset;
             end_offset += 1; // for the rbracket
             if (datas[n].rhs == 0) {
                 return main_tokens[n] + end_offset;
@@ -883,9 +888,42 @@ pub fn getNodeSource(self: Ast, node: Node.Index) []const u8 {
     return self.source[start..end];
 }
 
+pub fn declarationAttributes(self: Ast, node: Node.Index) []const Node.Index {
+    const data = &self.nodes.items(.data)[node];
+    return switch (self.nodes.items(.tag)[node]) {
+        .attr_decl_one => @as(*const [1]Node.Index, &data.lhs),
+        .attr_decl => blk: {
+            const range = self.extraData(data.lhs, Node.SubRange);
+            break :blk self.extra_data[range.start..range.end];
+        },
+        else => &.{},
+    };
+}
+
+/// Ordered field/declaration nodes borrowed from this AST, including attribute wrappers.
+pub fn fullStruct(self: Ast, node: Node.Index) ?[]const Node.Index {
+    if (self.nodes.items(.tag)[node] != .container_decl) return null;
+    const data = self.nodes.items(.data)[node];
+    return self.extra_data[data.lhs..data.rhs];
+}
+
+/// Constructor operands remain in source order, not layout order.
+pub const StructInit = struct { type_node: Node.Index, fields: []const Node.Index };
+pub fn fullStructInit(self: Ast, node: Node.Index) ?StructInit {
+    if (self.nodes.items(.tag)[node] != .container_decl_arg) return null;
+    const data = self.nodes.items(.data)[node];
+    const range = self.extraData(data.rhs, Node.SubRange);
+    return .{ .type_node = data.lhs, .fields = self.extra_data[range.start..range.end] };
+}
+
 // TODO: all of this
 
 pub fn decl(self: Ast, node: Node.Index) full.Decl {
+    if (self.nodes.items(.tag)[node] == .attr_decl_one or self.nodes.items(.tag)[node] == .attr_decl) {
+        var result = self.decl(self.nodes.items(.data)[node].rhs);
+        result.attributes = self.declarationAttributes(node);
+        return result;
+    }
     assert(self.nodes.items(.tag)[node] == .decl);
     const let_token = self.nodes.items(.main_token)[node];
     const data = self.nodes.items(.data)[node];
@@ -1104,7 +1142,7 @@ fn fullFnProtoComponents(self: Ast, info: full.FnProto.Components) full.FnProto 
 
 pub fn fullDecl(self: Ast, node: Node.Index) ?full.Decl {
     return switch (self.nodes.items(.tag)[node]) {
-        .decl => self.decl(node),
+        .decl, .attr_decl_one, .attr_decl => self.decl(node),
         else => null,
     };
 }
@@ -1649,7 +1687,7 @@ pub const Node = struct {
         block,
         /// Same as block but there is known to be a newline before the rbrace.
         block_newline,
-        /// `struct []`, `union []`, `opaque []`, `enum []`. `extra_data[lhs..rhs]`.
+        /// Delivered `struct { ... }` members in `extra_data[lhs..rhs]`.
         /// main_token is `struct`, `union`, `opaque`, `enum` keyword.
         container_decl,
         /// Same as container_decl but there is known to be a trailing comma
@@ -1662,12 +1700,14 @@ pub const Node = struct {
         /// Same as container_decl_two except there is known to be a trailing comma
         /// or newline before the rbrace.
         container_decl_two_trailing,
-        /// `struct(lhs)` / `union(lhs)` / `enum(lhs)`. `SubRange[rhs]`.
+        /// Delivered `lhs[ .field = value, ... ]` constructor. `SubRange[rhs]`
+        /// contains container_field nodes with lhs=0; main_token is the `[`.
         container_decl_arg,
         /// Same as container_decl_arg but there is known to be a trailing
         /// comma or newline before the rbrace.
         container_decl_arg_trailing,
-        /// `a: lhs = rhs,`. lhs and rhs can be omitted.
+        /// Declaration `a: lhs = rhs,` (rhs optional), or constructor `.a = rhs`
+        /// (lhs=0). Constructor punctuation belongs to the surrounding initializer.
         /// main_token is the field name identifier.
         /// lastToken() does not include the possible trailing comma.
         container_field,

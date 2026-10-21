@@ -54,7 +54,8 @@ It requires immutable literal globals; unit/global block initializers are
 not lowered yet. An internal C11 backend emits verified IR, including fixed-width
 integer arithmetic and program entrypoint emission through `emit-c`.
 `@print`/`@println` support booleans, strings and explicitly typed integers,
-including `int`/`uint`. Plain `check` remains syntax-only.
+including `int`/`uint`, and [nominal value structs](#executable-nominal-value-structs)
+with an exact container `toString` method. Plain `check` remains syntax-only.
 
 Use `zig build run -- check --semantic file.nov` for the current bounded
 semantic/lowering subset. It runs declaration collection, initializer dependency
@@ -109,6 +110,7 @@ nov fmt --check examples/fibo.nov examples/fizzbuzz.nov
 nov run examples/fibo.nov            # 55
 nov run examples/fizzbuzz.nov        # fifteen lines, 1 through FizzBuzz at 15
 nov run examples/range-search.nov    # exclusive/inclusive searches and MAX exhaustion
+nov run examples/type.nov            # x: 5, y: hello. z: true
 ```
 
 Both examples also work with `--debug` and `--release`, and can be built with
@@ -625,6 +627,78 @@ match s1 {
 ```
 
 ### Struct
+
+#### Executable nominal value structs
+
+[examples/type.nov](examples/type.nov) runs unchanged through semantic checking,
+format checking, C emission, and default/debug/release build and execution.
+The delivered subset is deliberately bounded:
+
+- An immutable module declaration `let MyType = struct { ... }` introduces a
+  **nominal** type. Separately declared structs are distinct even with identical
+  fields. `let Alias = MyType` preserves the original identity, fields and methods;
+  aliases work in annotations, method signatures, constructors and static calls.
+  Forward module type names and method signatures are supported.
+- Named fields require explicit `bool`, integer (including `i128`/`u128` and native
+  `int`/`uint`), or immutable `string` types (including aliases). Semantic checking
+  uses the same integer-width and literal-bound rules as scalar values. The C
+  backend still supports only 8/16/32/64-bit integers: a reachable record layout
+  containing a 128-bit field fails C emission with a backend width diagnostic;
+  an unused record layout adds no backend requirement or emitted definition.
+  Array element restrictions are unchanged. Fields end with a comma. A field may have a literal default of its exact type, with ordinary
+  literal-bound checks. Defaults cannot call functions, compute values, reference
+  globals or interpolate strings. Nested/recursive records, array/function/void/
+  float fields, record arrays and field mutation are rejected, not partially
+  implemented.
+- Construct explicitly with `MyType[ .x = 5, .z = true ]` (or `Alias[...]`).
+  Empty `MyType[]` works only when every field has a default. Unknown, duplicate,
+  missing required and mistyped fields diagnose. Supplied expressions evaluate
+  **once, left to right in source order**, independent of field declaration order.
+  Omitted literal defaults are then inserted in declaration order and have no
+  effects. Contextual `[ .x = ... ]`, anonymous records and tuples are not part
+  of this slice.
+- Read fields with `item.x`, including inside interpolation (`"{self.x}"`). Field
+  lookup is type-directed: a record field named `len` is an ordinary field and
+  does not change array/string `.len`. Assignment, locals, parameters, returns,
+  branches and loop results copy record field values; immutable strings share
+  their backing storage. Replacing a mutable record binding does not change copies.
+- Container declarations are ordinary explicitly typed functions, not runtime
+  initializers. Methods have their own container scope; they can call sibling or
+  recursive methods by name. Outside that scope use `MyType.method(args...)` (an
+  alias works too). Parameters, including a parameter named `self`, are ordinary
+  by-value parameters; no receiver is inserted. `item.method(...)` is deferred.
+  Container constants, nested type declarations, generics, general type values,
+  struct global instances and C FFI are unsupported.
+- Printing requires exactly the container method `toString: (MyType) -> string`.
+  The parameter name is unrestricted, and aliases of the exact nominal type and
+  `string` are accepted. Missing/wrong signatures diagnose when the record is
+  printed. No global overload lookup, automatically derived representation or
+  implicit record interpolation is provided. Explicit `MyType.toString(item)`
+  is also an ordinary call.
+- Each print argument is evaluated, then (if a record) converted by **one** call
+  to its `toString`, before moving to the next argument. Only after all arguments
+  and conversions finish does the final print operation write their values,
+  separated by spaces, with the existing checked-write/flush behavior. Thus a
+  method's own effects can precede later argument effects; conversions are not
+  repeated by the final write. Allocating methods return normal immutable strings.
+- Exactly one argument-free `@[public]` is accepted on struct and method
+  declarations. Metadata is preserved for future visibility work; this does not
+  implement imports, cross-module access control or change the C export policy.
+  Other attributes, duplicate attributes and `public` on other declarations
+  diagnose instead of being ignored.
+
+C emission uses flat stack value structs with index-mangled fields and injectively
+mangled method symbols. Reachable layouts precede function-pointer typedefs and
+prototypes. Record temporaries live at function scope, including skipped-branch
+slots; every string field's actual `void *owner` is rooted across allocations.
+String byte-data pointers (including static literals) are never traced. The
+current uniform record path installs a GC frame even for scalar-only records;
+this is implementation overhead, not heap allocation of the records themselves.
+
+#### Broader struct syntax (design, not fully executable)
+
+The following older examples describe future syntax outside the bounded subset
+above (including floats, container constants, contextual and anonymous values).
 Struct is Nov's equivalent of [Product type](https://en.wikipedia.org/wiki/Product_type).
 ```nov
 let MyStruct = struct {
@@ -1283,7 +1357,7 @@ let main: () -> void = {
 Aliases are canonical synonyms, **not distinct newtypes**: `Count` and `uint`
 match exactly, with the same literal bounds, operations and backend restrictions.
 Supported RHS forms are `bool`, `void`, fixed-width integers, native `int`/`uint`,
-`string`, scalar array types and function types, including aliases in nested
+`string`, nominal struct types, scalar array types and function types, including aliases in nested
 parameter/result/array-element positions. Function-type parameters may be unnamed.
 `let Callback = (int) -> int` declares a type alias, not a function body.
 Function definitions still use explicit signature syntax, such as
@@ -1311,8 +1385,9 @@ type context remain value-dependency errors; a type annotation or `@as` demand
 classifies the same candidates as attempted aliases and reports type-alias cycles.
 
 Aliases work in annotations and `@as`, not runtime expressions:
-`@println(Count)` and `Count(1)` are errors. There are no alias constructors,
-mutable/local aliases, general runtime type values, `@TypeOf`, generics or
+`@println(Count)` and `Count(1)` are errors. An alias of a nominal struct supports
+that struct's explicit `Alias[ .field = value ]` constructor and static methods;
+this does not add numeric alias constructors, mutable/local aliases, general runtime type values, `@TypeOf`, generics or
 comptime functions. `@as` remains exact expected-type ascription, not a checked
 numeric cast. See [examples/type-aliases.nov](examples/type-aliases.nov).
 
@@ -1591,7 +1666,7 @@ TODO
 - `@TypeOf(...)`: Returns the type of a value.
 - `@typeInfo(...)`: Returns type information about a value.
 - `@This()`: Returns the type of the current container
-- `@print(...)`: Output bool, fixed/native integer and string args separated with a space to stdout; returns void. Interpolated strings work like other strings.
+- `@print(...)`: Output bool, fixed/native integer and string args separated with a space to stdout; returns void. Nominal structs require their exact `toString: (MyType) -> string` method, called once immediately after evaluating each record argument. Interpolated strings work like other strings.
 - `@println(...)`: Same as print with a newline at the end, including with no args.
 - `@fprint(file: File, ...)`: Same as print but output to a specific file. Returns a Result<>.
 <!-- - `@eprint(...)`: Same as print but output to stderr. -->
@@ -1645,9 +1720,16 @@ TODO
 - `@[require(condition..., "optional error message")`: Ensure that the specified conditions are verified for the arguments given to a function or to a container initializer.
 <!-- - `@[ensure(condition..., "optional error message")`: Ensure that the specified conditions are verified for the values returned by a function. -->
 
+The executable subset accepts only a single argument-free `@[public]` on a nominal
+struct or its method declaration, preserving metadata without enforcing cross-module
+visibility or changing C exports. Unknown/unsupported attributes diagnose. Other
+entries in this list remain design proposals.
+
 Attributes can be set only on top level / container declarations
 
 ## Visibility
+The following visibility rules are a design description, not delivered import or
+access-control behavior. The bounded struct slice only preserves `public` metadata.
 Visibility is modified via [attributes](#Attributes).
 
 - public: visible everywhere

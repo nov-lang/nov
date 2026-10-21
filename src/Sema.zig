@@ -40,9 +40,21 @@ pub fn analyzeAnnotations(module: *Module) Error!Sema {
         .entries = try module.allocator.alloc(Entry, module.declarations.items.len),
     };
     errdefer result.deinit();
+    result.ir.source_len = @intCast(module.ast.source.len);
     @memset(result.entries, .{});
     for (module.declarations.items, 0..) |declaration, i| {
+        if (!declaration.is_record) continue;
+        result.entries[i].alias_type = try result.ir.internType(.{ .record = .{ .identity = @intCast(i), .fields = &.{}, .public = declaration.public } });
+        result.entries[i].status = .type_alias;
+    }
+    for (module.declarations.items, 0..) |declaration, i| {
         const full = module.ast.decl(declaration.node);
+        if (declaration.is_record) continue;
+        if (declaration.container != null and (full.ast.is_mutable or module.ast.fullFnProto(full.ast.type_node) == null)) {
+            try module.diagnostics.append(module.allocator, .{ .tag = .unsupported_declaration, .span = declaration.name_span });
+            result.entries[i].status = .failed;
+            continue;
+        }
         if (declaration.is_type_alias) {
             if (primitives.isPrimitive(declaration.name)) {
                 try module.diagnostics.append(module.allocator, .{ .tag = .unsupported_shadowing, .span = declaration.name_span });
@@ -72,6 +84,55 @@ pub fn analyzeAnnotations(module: *Module) Error!Sema {
                 try result.checkLiteral(module, i, full.ast.init_node, annotation);
             }
         }
+    }
+    for (module.declarations.items, 0..) |declaration, i| {
+        if (!declaration.is_record) continue;
+        const full = module.ast.decl(declaration.node);
+        if (declaration.container != null or primitives.isPrimitive(declaration.name)) {
+            try module.diagnostics.append(module.allocator, .{ .tag = if (declaration.container != null) .unsupported_declaration else .unsupported_shadowing, .span = declaration.name_span });
+            result.entries[i].status = .failed;
+            continue;
+        }
+        if (full.ast.is_mutable or full.ast.type_node != 0) {
+            try module.diagnostics.append(module.allocator, .{ .tag = .unsupported_type, .span = declaration.name_span });
+            continue;
+        }
+        var fields: std.ArrayList(Ir.Field) = .empty;
+        defer fields.deinit(module.allocator);
+        for (module.ast.fullStruct(full.ast.init_node).?) |member| {
+            if (module.ast.nodes.items(.tag)[member] != .container_field) continue;
+            const data = module.ast.nodes.items(.data)[member];
+            const token = module.ast.nodes.items(.main_token)[member];
+            const span = module.tokenSpan(token);
+            const name = module.ast.tokenSlice(token);
+            var duplicate = module.lookupMethod(@enumFromInt(i), name) != null;
+            for (fields.items) |field| {
+                if (std.mem.eql(u8, field.name, name)) duplicate = true;
+            }
+            if (duplicate) {
+                try module.diagnostics.append(module.allocator, .{ .tag = .duplicate_field, .span = span });
+                continue;
+            }
+            const ty = (try TypeResolver.resolve(module, &result.ir, data.lhs)) orelse continue;
+            const ft = result.ir.getType(ty).?;
+            if (!Ir.isRecordField(ft)) {
+                try module.diagnostics.append(module.allocator, .{ .tag = .unsupported_type, .span = module.tokenSpan(module.ast.firstToken(data.lhs)) });
+                continue;
+            }
+            var default: ?Ir.ConstId = null;
+            if (data.rhs != 0) {
+                switch (try Literal.check(module, &result.ir, data.rhs, ty, span)) {
+                    .constant => |constant| default = constant,
+                    .failed => continue,
+                    .not_literal => {
+                        try module.diagnostics.append(module.allocator, .{ .tag = .invalid_field_default, .span = module.tokenSpan(module.ast.firstToken(data.rhs)) });
+                        continue;
+                    },
+                }
+            }
+            try fields.append(module.allocator, .{ .name = name, .ty = ty, .span = .{ .start = span.start, .end = span.end }, .default = default });
+        }
+        try result.ir.setRecordFields(result.entries[i].alias_type.?, fields.items);
     }
     return result;
 }
@@ -464,6 +525,56 @@ test "signatures are resolved but bodies and unannotated expressions stay deferr
     try std.testing.expect(pending.type_id == null);
     try std.testing.expectEqual(Status.deferred, sema.getEntry(module.lookup("expression").?).?.status);
     try std.testing.expectEqual(Status.deferred, sema.getEntry(module.lookup("storage").?).?.status);
+}
+
+test "record 128 bit literal defaults preserve exact limits aliases and source free ownership" {
+    const source = "let R=struct{lo:i128=-170141183460469231731687303715884105728,hi:Signed=170141183460469231731687303715884105727,top:Unsigned=340282366920938463463374607431768211455,}\nlet Signed=i128\nlet Unsigned=u128";
+    var sema = blk: {
+        var module = try Module.init(std.testing.allocator, "wide-defaults.nov", source);
+        defer module.deinit();
+        var result = try analyzeAnnotations(&module);
+        errdefer result.deinit();
+        try std.testing.expect(!module.hasErrors());
+        break :blk result;
+    };
+    defer sema.deinit();
+    const fields = sema.ir.getType(sema.entries[0].alias_type.?).?.record.fields;
+    try std.testing.expectEqual(@as(usize, 3), fields.len);
+    try std.testing.expectEqual(std.math.minInt(i128), sema.ir.getConstant(fields[0].default.?).?.value.signed_integer);
+    try std.testing.expectEqual(std.math.maxInt(i128), sema.ir.getConstant(fields[1].default.?).?.value.signed_integer);
+    try std.testing.expectEqual(std.math.maxInt(u128), sema.ir.getConstant(fields[2].default.?).?.value.unsigned_integer);
+    try sema.ir.verify();
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+}
+
+test "record 128 bit defaults retain literal bounds and source diagnostics without widening arrays" {
+    for ([_]struct { ty: []const u8, literal: []const u8 }{
+        .{ .ty = "i128", .literal = "170141183460469231731687303715884105728" },
+        .{ .ty = "i128", .literal = "-170141183460469231731687303715884105729" },
+        .{ .ty = "u128", .literal = "340282366920938463463374607431768211456" },
+        .{ .ty = "u128", .literal = "-1" },
+    }) |case| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let Wide={s}\nlet R=struct{{x:Wide={s},}}", .{ case.ty, case.literal });
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "wide-bounds.nov", source);
+        defer module.deinit();
+        var sema = try analyzeAnnotations(&module);
+        defer sema.deinit();
+        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+        const diagnostic = module.diagnostics.items[0];
+        try std.testing.expectEqual(Module.Diagnostic.Tag.literal_out_of_range, diagnostic.tag);
+        try std.testing.expectEqualStrings(case.literal, module.sourceSlice(diagnostic.span).?);
+        try std.testing.expectEqualStrings("x", module.sourceSlice(diagnostic.related.?).?);
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+    }
+    for ([_][]const u8{ "let f:(a:[]i128)={}", "let R=struct{x:[]u128,}" }) |source| {
+        var module = try Module.init(std.testing.allocator, "wide-array.nov", source);
+        defer module.deinit();
+        var sema = try analyzeAnnotations(&module);
+        defer sema.deinit();
+        try std.testing.expect(module.hasErrors());
+        try std.testing.expectEqual(Module.Diagnostic.Tag.unsupported_type, module.diagnostics.items[0].tag);
+    }
 }
 
 test "invalid annotations and unsupported literals never become checked constants" {

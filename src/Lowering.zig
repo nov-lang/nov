@@ -41,7 +41,10 @@ pub fn lower(module: *Module) Error!Sema {
         constant.* = entry.constant;
         if (entry.status != .body_checked) continue;
         const span: Ir.Span = .{ .start = declaration.name_span.start, .end = declaration.name_span.end };
-        const function = try result.ir.addFunction(declaration.name, entry.type_id.?, span);
+        const qualified = if (declaration.container) |owner| try std.fmt.allocPrint(result.allocator, "{s}.{s}", .{ module.getDeclaration(owner).?.name, declaration.name }) else null;
+        defer if (qualified) |name| result.allocator.free(name);
+        const function = try result.ir.addFunction(qualified orelse declaration.name, entry.type_id.?, span);
+        result.ir.functions.items[@intFromEnum(function)].public = declaration.public;
         entry.function = function;
         functions[i] = function;
     }
@@ -62,6 +65,95 @@ pub fn lower(module: *Module) Error!Sema {
         result.lowering_complete = true;
     }
     return result;
+}
+
+test "nominal records reject mismatches malformed constructors defaults fields and printing signatures" {
+    const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag };
+    for ([_]Case{
+        .{ .source = "let A=struct{x:int,}\nlet B=struct{x:int,}\nlet f:(a:A)->B=a", .tag = .expression_type_mismatch },
+        .{ .source = "let A=struct{x:int,}\nlet f:(a:A)=@println(a)", .tag = .invalid_to_string },
+        .{ .source = "let A=struct{x:int,}\nlet toString:(a:A)->string=\"not a method\"\nlet f:(a:A)=@println(a)", .tag = .invalid_to_string },
+        .{ .source = "let A=struct{x:int,\nlet toString:(b:B)->string=\"wrong nominal receiver\"\n}\nlet B=struct{x:int,}\nlet f:(a:A)=@println(a)", .tag = .invalid_to_string },
+        .{ .source = "let A=struct{x:int,\nlet toString:(a:A)->bool=true\n}\nlet f:(a:A)=@println(a)", .tag = .invalid_to_string },
+        .{ .source = "let A=struct{x:int,\nlet toString:()->string=\"bad\"\n}\nlet f:(a:A)=@println(a)", .tag = .invalid_to_string },
+        .{ .source = "let A=struct{x:int,}\nlet B=struct{x:int,}\nlet f:(a:B)=@println(a)\nlet main:()=f(A[.x=1])", .tag = .invalid_to_string },
+        .{ .source = "let A=struct{x:int,}\nlet f:()->A=A[]", .tag = .missing_field },
+        .{ .source = "let A=struct{x:int,}\nlet f:()->A=A[.x=1,.x=2]", .tag = .duplicate_field },
+        .{ .source = "let A=struct{x:int,}\nlet f:()->A=A[.y=1]", .tag = .unknown_field },
+        .{ .source = "let A=struct{x:int,}\nlet f:()->A=A[.x=true]", .tag = .literal_type_mismatch },
+        .{ .source = "let A=struct{x:i8=128,}", .tag = .literal_out_of_range },
+        .{ .source = "let A=struct{x:int=1+2,}", .tag = .invalid_field_default },
+        .{ .source = "let A=struct{x:string=\"{true}\",}", .tag = .invalid_field_default },
+        .{ .source = "let A=struct{x:int,x:int,}", .tag = .duplicate_field },
+        .{ .source = "let A=struct{x:[]int,}", .tag = .unsupported_type },
+        .{ .source = "let A=struct{x:()->int,}", .tag = .unsupported_type },
+        .{ .source = "let A=struct{x:A,}", .tag = .unsupported_type },
+        .{ .source = "let A=struct{x:B,}\nlet B=struct{x:A,}", .tag = .unsupported_type },
+        .{ .source = "let A=struct{x:int,}\nlet f:(a:A)={a.x=1}", .tag = .unsupported_assignment_target },
+        .{ .source = "let A=struct{x:int,}\nlet f:(a:A)->int=a.y", .tag = .unknown_field },
+        .{ .source = "let A=struct{x:int,}\nlet f:(a:[]A)= {}", .tag = .unsupported_type },
+        .{ .source = "let A=struct{x:int=0,}\nlet a=A[]", .tag = .unsupported_global_initializer },
+        .{ .source = "let A=struct{\nlet B=struct{x:int,}\n}", .tag = .unsupported_declaration },
+        .{ .source = "let int=struct{}", .tag = .unsupported_shadowing },
+        .{ .source = "let A=struct{\nlet constant:int=1\n}", .tag = .unsupported_declaration },
+        .{ .source = "let A=struct{\nlet Alias=int\n}", .tag = .unsupported_declaration },
+        .{ .source = "let A=struct{x:Cycle,}\nlet Cycle=Other\nlet Other=Cycle", .tag = .type_alias_cycle },
+        .{ .source = "let A=struct{x:int=0,}\nlet B=struct{x:int=0,}\nlet f:(a:B)={}\nlet main:()=f(A[])", .tag = .expression_type_mismatch },
+    }) |case| {
+        var module = try Module.init(std.testing.allocator, "record-error.nov", case.source);
+        defer module.deinit();
+        try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+        var result = try lower(&module);
+        defer result.deinit();
+        try std.testing.expect(!result.lowering_complete);
+        var found = false;
+        for (module.diagnostics.items) |diagnostic| if (diagnostic.tag == case.tag) {
+            found = true;
+        };
+        if (!found) std.debug.print("missing {t}: {s}\n", .{ case.tag, case.source });
+        try std.testing.expect(found);
+        try std.testing.expectEqual(@as(usize, 0), result.ir.functions.items.len);
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, testRejectedMatchAllocations, .{case.source});
+    }
+}
+
+test "record verifier rejects corrupt field counts indices types defaults spans and nominal identities" {
+    var module = try Module.init(std.testing.allocator, "record-ir.nov", "let A=struct{x:int=0,}\nlet B=struct{x:int=0,}\nlet f:(a:A)->int=a.x\nlet g:()->B=B[]");
+    defer module.deinit();
+    var result = try lower(&module);
+    defer result.deinit();
+    try std.testing.expect(result.lowering_complete);
+    const a = result.entries[0].alias_type.?;
+    const b = result.entries[1].alias_type.?;
+    try std.testing.expect(a != b);
+    for (result.ir.functions.items) |function| {
+        for (@constCast(function.body.?.instructions)) |*instruction| {
+            const saved = instruction.*;
+            defer instruction.* = saved;
+            if (instruction.op == .field_read) {
+                instruction.op.field_read.index = 99;
+                try std.testing.expectError(error.InvalidOperation, result.ir.verify());
+                instruction.* = saved;
+                instruction.ty = try result.ir.internType(.boolean);
+                try std.testing.expectError(error.OperandTypeMismatch, result.ir.verify());
+            } else if (instruction.op == .record_init) {
+                instruction.op.record_init = &.{};
+                try std.testing.expectError(error.InvalidOperation, result.ir.verify());
+            }
+        }
+    }
+    const fields = @constCast(result.ir.getType(a).?.record.fields);
+    const saved = fields[0];
+    fields[0].ty = b;
+    try std.testing.expectError(error.InvalidArrayElement, result.ir.verify());
+    fields[0] = saved;
+    fields[0].default = @enumFromInt(999);
+    try std.testing.expectError(error.ConstantTypeMismatch, result.ir.verify());
+    fields[0] = saved;
+    fields[0].span.end = std.math.maxInt(u32);
+    try std.testing.expectError(error.InvalidTypeId, result.ir.verify());
+    fields[0] = saved;
+    try result.ir.verify();
 }
 
 fn testRejectedMatchAllocations(allocator: std.mem.Allocator, source: []const u8) !void {

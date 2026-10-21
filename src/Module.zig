@@ -24,6 +24,9 @@ pub const Declaration = struct {
     name_span: Span,
     node: Ast.Node.Index,
     is_type_alias: bool = false,
+    is_record: bool = false,
+    container: ?DeclId = null,
+    public: bool = false,
 };
 
 pub const Diagnostic = struct {
@@ -33,6 +36,12 @@ pub const Diagnostic = struct {
 
     pub const Tag = enum {
         duplicate_name,
+        unsupported_attribute,
+        duplicate_field,
+        unknown_field,
+        missing_field,
+        invalid_field_default,
+        invalid_to_string,
         unknown_name,
         unsupported_declaration,
         unsupported_name,
@@ -177,7 +186,7 @@ fn aliasCandidate(self: *const Module, id: DeclId) bool {
     const full = self.ast.decl(self.getDeclaration(id).?.node).ast;
     if (full.is_mutable or full.type_node != 0 or full.init_node == 0) return false;
     return switch (self.ast.nodes.items(.tag)[full.init_node]) {
-        .identifier, .array_type, .fn_proto, .fn_proto_one => true,
+        .identifier, .array_type, .fn_proto, .fn_proto_one, .container_decl => true,
         else => false,
     };
 }
@@ -195,6 +204,8 @@ fn classifyAliases(self: *Module) std.mem.Allocator.Error!void {
                 const full = self.ast.decl(node).ast;
                 if (full.type_node != 0) try work.append(self.allocator, full.type_node);
             },
+            .container_field => if (data[node].lhs != 0) try work.append(self.allocator, data[node].lhs),
+            .container_decl_arg => try work.append(self.allocator, data[node].lhs),
             .fn_proto, .fn_proto_one, .array_type => try work.append(self.allocator, node),
             .call, .call_one, .call_comma, .call_one_comma => {
                 const call = self.ast.fullCall(node).?;
@@ -247,35 +258,61 @@ fn classifyAliases(self: *Module) std.mem.Allocator.Error!void {
     }
 }
 
+pub fn lookupMethod(self: *const Module, container: DeclId, name: []const u8) ?DeclId {
+    for (self.declarations.items, 0..) |decl, i| if (decl.container == container and std.mem.eql(u8, decl.name, name)) return @enumFromInt(i);
+    return null;
+}
+
 fn collectDeclarations(self: *Module) (std.mem.Allocator.Error || error{TooManyDeclarations})!void {
-    for (self.ast.rootDecls()) |node| {
+    for (self.ast.rootDecls()) |node| try self.collectDeclaration(node, null);
+    const top_count = self.declarations.items.len;
+    for (0..top_count) |i| {
+        const decl = self.declarations.items[i];
+        if (!decl.is_record) continue;
+        for (self.ast.fullStruct(self.ast.decl(decl.node).ast.init_node).?) |member| {
+            if (self.ast.nodes.items(.tag)[member] != .container_field) try self.collectDeclaration(member, @enumFromInt(i));
+        }
+    }
+}
+
+fn collectDeclaration(self: *Module, node: Ast.Node.Index, container: ?DeclId) (std.mem.Allocator.Error || error{TooManyDeclarations})!void {
+    {
         const declaration = self.ast.fullDecl(node) orelse {
             try self.diagnostics.append(self.allocator, .{
                 .tag = .unsupported_declaration,
                 .span = self.tokenSpan(self.ast.firstToken(node)),
             });
-            continue;
+            return;
         };
         const name_token = declaration.ast.let_token + 1 + @intFromBool(declaration.ast.is_mutable);
         const name = self.ast.tokenSlice(name_token);
         const name_span = self.tokenSpan(name_token);
         if (std.mem.startsWith(u8, name, "@\"")) {
             try self.diagnostics.append(self.allocator, .{ .tag = .unsupported_name, .span = name_span });
-            continue;
+            return;
         }
-        const entry = try self.names.getOrPut(self.allocator, name);
-        if (entry.found_existing) {
-            const previous = self.getDeclaration(entry.value_ptr.*).?;
+        const previous_id = if (container) |owner| self.lookupMethod(owner, name) else self.lookup(name);
+        if (previous_id) |previous_decl| {
+            const previous = self.getDeclaration(previous_decl).?;
             try self.diagnostics.append(self.allocator, .{
                 .tag = .duplicate_name,
                 .span = name_span,
                 .related = previous.name_span,
             });
-            continue;
+            return;
         }
         if (self.declarations.items.len == std.math.maxInt(u32)) return error.TooManyDeclarations;
-        entry.value_ptr.* = @enumFromInt(self.declarations.items.len);
-        try self.declarations.append(self.allocator, .{ .name = name, .name_span = name_span, .node = node });
+        const id: DeclId = @enumFromInt(self.declarations.items.len);
+        if (container == null) try self.names.put(self.allocator, name, id);
+        const is_record = declaration.ast.init_node != 0 and self.ast.fullStruct(declaration.ast.init_node) != null;
+        var public = false;
+        for (declaration.attributes) |attribute| {
+            const data = self.ast.nodes.items(.data)[attribute];
+            if (self.ast.nodes.items(.tag)[attribute] == .attr_one and data.rhs == 0 and std.mem.eql(u8, self.ast.tokenSlice(data.lhs), "public") and (is_record or container != null) and !public) {
+                public = true;
+            } else try self.diagnostics.append(self.allocator, .{ .tag = .unsupported_attribute, .span = self.tokenSpan(self.ast.firstToken(attribute)) });
+        }
+        try self.declarations.append(self.allocator, .{ .name = name, .name_span = name_span, .node = node, .container = container, .is_record = is_record, .is_type_alias = is_record, .public = public });
     }
 }
 
@@ -360,14 +397,47 @@ test "source modules own input and skip collection after syntax errors" {
     try std.testing.expectError(error.InvalidSource, Module.init(allocator, "nul.nov", "let a = 1\x00let b = 2"));
 }
 
+test "struct methods have separate scopes stable module IDs and preserved public metadata" {
+    const source = "@[public]\nlet A=struct{x:int,\n@[public]\nlet method:(a:A)->int=a.x\n}\nlet B=struct{x:int,\nlet method:(b:B)->int=b.x\n}\nlet method:()->int=0";
+    var module = try Module.init(std.testing.allocator, "scopes.nov", source);
+    defer module.deinit();
+    try std.testing.expect(!module.hasErrors());
+    const a = module.lookup("A").?;
+    const b = module.lookup("B").?;
+    try std.testing.expectEqual(@as(u32, 0), @intFromEnum(a));
+    try std.testing.expectEqual(@as(u32, 1), @intFromEnum(b));
+    try std.testing.expectEqual(@as(u32, 2), @intFromEnum(module.lookup("method").?));
+    const am = module.lookupMethod(a, "method").?;
+    const bm = module.lookupMethod(b, "method").?;
+    try std.testing.expect(am != bm and am != module.lookup("method").?);
+    try std.testing.expect(module.getDeclaration(a).?.public and module.getDeclaration(am).?.public);
+    try std.testing.expect(!module.getDeclaration(bm).?.public);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+}
+
+test "struct attributes and duplicate method names diagnose without leaking declarations" {
+    for ([_][]const u8{
+        "@[unknown]\nlet A=struct{}",                "@[public(1)]\nlet A=struct{}",
+        "@[public]\n@[public]\nlet A=struct{}",      "@[public]\nlet f:()={}",
+        "let A=struct{\n@[private]\nlet f:()={}\n}", "let A=struct{\nlet f:()={}\nlet f:()={}\n}",
+    }) |source| {
+        var module = try Module.init(std.testing.allocator, "bad-scope.nov", source);
+        defer module.deinit();
+        try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+        try std.testing.expect(module.hasErrors());
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+    }
+}
+
 test "unsupported attributes and quoted names diagnose rather than silently bind" {
     var module = try Module.init(std.testing.allocator, "unsupported.nov", "@[export]\n@[tag]\nlet decorated = 1\nlet @\"quoted\" = 2\nlet valid = 3");
     defer module.deinit();
     try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
-    try std.testing.expectEqual(@as(usize, 2), module.diagnostics.items.len);
-    try std.testing.expectEqual(Diagnostic.Tag.unsupported_declaration, module.diagnostics.items[0].tag);
-    try std.testing.expectEqual(Diagnostic.Tag.unsupported_name, module.diagnostics.items[1].tag);
-    try std.testing.expect(module.lookup("decorated") == null);
+    try std.testing.expectEqual(@as(usize, 3), module.diagnostics.items.len);
+    try std.testing.expectEqual(Diagnostic.Tag.unsupported_attribute, module.diagnostics.items[0].tag);
+    try std.testing.expectEqual(Diagnostic.Tag.unsupported_attribute, module.diagnostics.items[1].tag);
+    try std.testing.expectEqual(Diagnostic.Tag.unsupported_name, module.diagnostics.items[2].tag);
+    try std.testing.expect(module.lookup("decorated") != null);
     try std.testing.expect(module.lookup("valid") != null);
 }
 

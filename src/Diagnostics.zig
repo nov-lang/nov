@@ -46,9 +46,15 @@ pub fn renderModule(module: *const Module, writer: *std.Io.Writer) !void {
         const location = Location.init(module.ast.source, diagnostic.span.start);
         try location.renderPrefix(module.path, "error", writer);
         switch (diagnostic.tag) {
+            .unsupported_attribute => try writer.writeAll("only a single @[public] on struct or method declarations is supported"),
+            .duplicate_field => try writer.writeAll("duplicate struct field"),
+            .unknown_field => try writer.writeAll("unknown struct field"),
+            .missing_field => if (diagnostic.related) |field| try writer.print("missing required struct field '{s}'", .{module.sourceSlice(field).?}) else try writer.writeAll("missing required struct field"),
+            .invalid_field_default => try writer.writeAll("struct field default must be a literal of the exact field type"),
+            .invalid_to_string => try writer.writeAll("printing a struct requires its method toString: (MyType) -> string"),
             .duplicate_name => try writer.print("duplicate declaration '{s}'", .{module.sourceSlice(diagnostic.span).?}),
             .unknown_name => try writer.print("unknown name '{s}'", .{module.sourceSlice(diagnostic.span).?}),
-            .unsupported_declaration => try writer.writeAll("declaration attributes are not supported in semantic analysis yet"),
+            .unsupported_declaration => try writer.writeAll("unsupported declaration; struct containers currently allow only explicitly typed methods"),
             .unsupported_name => try writer.writeAll("quoted identifiers are not supported in semantic analysis yet"),
             .type_alias_cycle => try writer.print("cyclic type alias dependency on '{s}'", .{module.sourceSlice(diagnostic.span).?}),
             .type_alias_limit => try writer.writeAll("type alias expansion exceeds the current analysis limit of 128"),
@@ -107,6 +113,7 @@ pub fn renderModule(module: *const Module, writer: *std.Io.Writer) !void {
             .value_cycle, .type_alias_cycle => "declaration in this cycle",
             .type_alias_limit, .not_a_value => "type alias declared here",
             .duplicate_parameter => "first parameter here",
+            .missing_field => "required field declared here",
             .match_covered_boolean_prong => "earlier pattern covers this boolean value",
             .literal_type_mismatch, .literal_out_of_range => "type annotation here",
             .expression_type_mismatch, .literal_needs_type => "expected type required here",
@@ -380,7 +387,7 @@ test "module unsupported attributes and quoted names render semantic diagnostics
     defer output.deinit();
     try renderModule(&module, &output.writer);
     try std.testing.expectEqualStrings(
-        "unsupported.nov:1:1: error: declaration attributes are not supported in semantic analysis yet\n@[export]\n^~\n" ++
+        "unsupported.nov:1:1: error: only a single @[public] on struct or method declarations is supported\n@[export]\n^~\n" ++
             "unsupported.nov:3:5: error: quoted identifiers are not supported in semantic analysis yet\nlet @\"quoted\" = 2\n    ^~~~~~~~~\n",
         output.written(),
     );

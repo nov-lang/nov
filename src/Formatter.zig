@@ -3,6 +3,7 @@ const Ast = @import("Ast.zig");
 const Parser = @import("Parser.zig");
 const Tokenizer = @import("Tokenizer.zig");
 const primitives = @import("primitives.zig");
+const Literal = @import("Literal.zig");
 
 /// Supports scalar declarations/operators plus function signatures, calls,
 /// local blocks, if/else, loops with optional conditions/continuations, returns,
@@ -44,11 +45,35 @@ pub fn format(allocator: std.mem.Allocator, source: [:0]const u8) ![]u8 {
     return rendered;
 }
 
+fn fieldDefaultSupported(ast: Ast, node: Ast.Node.Index) bool {
+    var current = node;
+    var buffer: [2]Ast.Node.Index = undefined;
+    while (ast.fullBlock(&buffer, current)) |block| {
+        if (block.ast.statements.len != 1) return false;
+        current = block.ast.statements[0];
+    }
+    const tag = ast.nodes.items(.tag)[current];
+    if (tag == .negation) return ast.nodes.items(.tag)[ast.nodes.items(.data)[current].rhs] == .number_literal;
+    if (tag == .number_literal) return true;
+    if (tag == .string_literal) return !Literal.hasInterpolation(ast.tokenSlice(ast.firstToken(current)));
+    if (tag == .identifier) {
+        const name = ast.tokenSlice(ast.firstToken(current));
+        return std.mem.eql(u8, name, "true") or std.mem.eql(u8, name, "false");
+    }
+    return false;
+}
+
 fn checkSupported(ast: Ast) !void {
     // Inspect ALL nodes, not only roots: unsupported expressions can be nested
     // inside otherwise renderable declarations and operators. New tags fail closed.
     for (ast.nodes.items(.tag)) |tag| switch (tag) {
         .root,
+        .container_decl,
+        .container_decl_arg,
+        .container_field,
+        .attr_one,
+        .attr_decl_one,
+        .attr_decl,
         .decl,
         .fn_proto_one,
         .fn_proto,
@@ -118,6 +143,24 @@ fn checkSupported(ast: Ast) !void {
     };
     for (ast.nodes.items(.tag), ast.nodes.items(.data), ast.nodes.items(.main_token), 0..) |tag, data, main, i| {
         switch (tag) {
+            .container_decl => {
+                for (ast.fullStruct(@intCast(i)).?) |member| {
+                    if (ast.nodes.items(.tag)[member] == .container_field) continue;
+                    const declaration = ast.fullDecl(member) orelse return error.UnsupportedSyntax;
+                    if (declaration.ast.is_mutable or declaration.ast.type_node == 0 or ast.fullFnProto(declaration.ast.type_node) == null) return error.UnsupportedSyntax;
+                }
+            },
+            .container_field => if (data.lhs != 0) {
+                if (ast.nodes.items(.tag)[data.lhs] != .identifier) return error.UnsupportedSyntax;
+                const name = ast.tokenSlice(ast.firstToken(data.lhs));
+                if (primitives.isPrimitive(name)) {
+                    const allowed = [_][]const u8{ "bool", "string", "int", "uint", "i8", "i16", "i32", "i64", "i128", "u8", "u16", "u32", "u64", "u128" };
+                    for (allowed) |scalar| {
+                        if (std.mem.eql(u8, name, scalar)) break;
+                    } else return error.UnsupportedSyntax;
+                }
+                if (data.rhs != 0 and !fieldDefaultSupported(ast, data.rhs)) return error.UnsupportedSyntax;
+            },
             .array_type => {
                 if (ast.nodes.items(.tag)[data.rhs] != .identifier) return error.UnsupportedSyntax;
                 const name = ast.tokenSlice(ast.nodes.items(.main_token)[data.rhs]);
@@ -138,7 +181,7 @@ fn checkSupported(ast: Ast) !void {
                 };
             },
             .array_access => if (ast.nodes.items(.tag)[data.lhs] == .array_access) return error.UnsupportedSyntax,
-            .field_access => if (!std.mem.eql(u8, ast.tokenSlice(data.rhs), "len")) return error.UnsupportedSyntax,
+            .attr_one => if (data.rhs != 0 or !std.mem.eql(u8, ast.tokenSlice(data.lhs), "public")) return error.UnsupportedSyntax,
             .builtin_literal => {
                 const name = ast.tokenSlice(main);
                 if (!std.mem.eql(u8, name, "@print") and !std.mem.eql(u8, name, "@println") and !std.mem.eql(u8, name, "@as"))
@@ -186,6 +229,7 @@ fn sameStructure(a: Ast, b: Ast) bool {
     }
     for (tags, a.nodes.items(.data), b.nodes.items(.data)) |tag, x, y| {
         switch (tag) {
+            .attr_one => if (!std.mem.eql(u8, a.tokenSlice(x.lhs), b.tokenSlice(y.lhs)) or x.rhs != y.rhs) return false,
             .identifier, .number_literal, .char_literal, .string_literal, .builtin_literal => {},
             // The parser leaves unused node data undefined; never read it.
             .negation, .bool_not, .bit_not, .@"return", .array_type => if (x.rhs != y.rhs) return false,
@@ -314,7 +358,7 @@ test "unsupported syntax fails closed including nested expressions" {
     for ([_][:0]const u8{
         "let x=@import(\"memory\")\n",
         "let x=call({&value})\n",
-        "let x=a.b\n",
+        "let x=a[0..2].b\n",
         "let x=[[1], [2]]\n",
         "let x:[][]int\n",
         "let x:[]string\n",
@@ -345,6 +389,20 @@ test "unsupported syntax fails closed including nested expressions" {
         if (ast.errors.len != 0) std.debug.print("invalid unsupported test fixture: {s}\n", .{source});
         try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
         try std.testing.expectError(error.UnsupportedSyntax, format(std.testing.allocator, source));
+    }
+}
+
+test "nominal struct formatting preserves public attributes fields defaults methods constructor comments and interpolation" {
+    for ([_][:0]const u8{
+        "let R=struct{lo:i128=-170141183460469231731687303715884105728,top:u128=340282366920938463463374607431768211455,}\nlet f:(r:R)={}",
+        "@[public]\nlet R=struct{; open\nx:int=0, ; default\n; next field\ny:string,\n\n@[public]\nlet toString:(self:R)->string=\"{self.x}:{self.y}\"\n}\nlet main:()={let r=R[.x=1,.y=\"hello\"]\n@println(r)}",
+        "let R=struct{\n; empty\n}\nlet main:()={let r=R[\n; empty constructor\n]\n@println(true)}",
+        "let R=struct{x:string,}\nlet main:()={let r=R[\n.x=\"hello\", ; value\n]\n@println(r.x)}",
+    }) |source| {
+        const result = try format(std.testing.allocator, source);
+        defer std.testing.allocator.free(result);
+        try expectFormatted(source, result);
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{source});
     }
 }
 
@@ -400,17 +458,18 @@ test "executable local blocks round trip" {
 
 test "every unsupported AST tag is rejected before rendering" {
     const supported = [_]Ast.Node.Tag{
-        .root,           .decl,                 .identifier,     .number_literal,   .char_literal,      .string_literal,
-        .add,            .sub,                  .mul,            .div,              .mod,               .shl,
-        .shr,            .bit_and,              .bit_or,         .bit_xor,          .equal_equal,       .bang_equal,
-        .less_than,      .less_or_equal,        .greater_than,   .greater_or_equal, .bool_and,          .bool_or,
-        .negation,       .bool_not,             .bit_not,        .fn_proto_one,     .fn_proto,          .call_one,
-        .call_one_comma, .call,                 .call_comma,     .block_two,        .block_two_newline, .block,
-        .block_newline,  .@"if",                .if_else,        .loop_range,       .loop_condition,    .loop_cont,
-        .loop_else,      .@"return",            .@"break",       .@"continue",      .assign,            .assign_add,
-        .assign_sub,     .assign_mul,           .assign_div,     .assign_mod,       .builtin_literal,   .array_type,
-        .array_init_two, .array_init_two_comma, .array_init,     .array_init_comma, .array_access,      .field_access,
-        .in,             .match,                .match_case_one, .match_case,       .function_pipe,
+        .root,               .decl,                 .identifier,     .number_literal,   .char_literal,      .string_literal,
+        .add,                .sub,                  .mul,            .div,              .mod,               .shl,
+        .shr,                .bit_and,              .bit_or,         .bit_xor,          .equal_equal,       .bang_equal,
+        .less_than,          .less_or_equal,        .greater_than,   .greater_or_equal, .bool_and,          .bool_or,
+        .negation,           .bool_not,             .bit_not,        .fn_proto_one,     .fn_proto,          .call_one,
+        .call_one_comma,     .call,                 .call_comma,     .block_two,        .block_two_newline, .block,
+        .block_newline,      .@"if",                .if_else,        .loop_range,       .loop_condition,    .loop_cont,
+        .loop_else,          .@"return",            .@"break",       .@"continue",      .assign,            .assign_add,
+        .assign_sub,         .assign_mul,           .assign_div,     .assign_mod,       .builtin_literal,   .array_type,
+        .array_init_two,     .array_init_two_comma, .array_init,     .array_init_comma, .array_access,      .field_access,
+        .in,                 .match,                .match_case_one, .match_case,       .function_pipe,     .container_decl,
+        .container_decl_arg, .container_field,      .attr_one,       .attr_decl_one,    .attr_decl,
     };
     var ast = try Parser.parse(std.testing.allocator, "let x=1\n");
     defer ast.deinit(std.testing.allocator);
@@ -420,7 +479,7 @@ test "every unsupported AST tag is rejected before rendering" {
         ast.nodes.items(.tag)[1] = tag;
         if (std.mem.indexOfScalar(Ast.Node.Tag, &supported, tag) != null) {
             // This synthetic leaf has no valid child/label data for these tags.
-            if (tag == .builtin_literal or tag == .@"break" or tag == .@"continue" or tag == .assign or
+            if (tag == .container_decl or tag == .attr_one or tag == .container_field or tag == .builtin_literal or tag == .@"break" or tag == .@"continue" or tag == .assign or
                 tag == .assign_add or tag == .assign_sub or tag == .assign_mul or
                 tag == .assign_div or tag == .assign_mod or tag == .array_type or
                 tag == .array_init_two or tag == .array_init_two_comma or tag == .array_init or

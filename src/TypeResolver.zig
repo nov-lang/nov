@@ -127,6 +127,13 @@ fn resolveDepth(module: *Module, ir: *Ir, node: Ast.Node.Index, depth: usize, al
         if (!Ir.isArrayElement(ir.getType(element).?)) return diagnose(module, node, .unsupported_type);
         return try ir.internType(.{ .array = element });
     }
+    if (ast.fullStruct(node) != null) {
+        for (module.declarations.items, 0..) |declaration, i| {
+            if (declaration.is_record and ast.decl(declaration.node).ast.init_node == node)
+                return try ir.internType(.{ .record = .{ .identity = @intCast(i), .fields = &.{}, .public = declaration.public } });
+        }
+        return diagnose(module, node, .unsupported_type);
+    }
     if (ast.nodes.items(.tag)[node] != .identifier) return diagnose(module, node, .unsupported_type);
     const name = ast.tokenSlice(ast.firstToken(node));
     if (module.lookup(name)) |id| {

@@ -1266,6 +1266,7 @@ fn parsePrimaryTypeExpr(self: *Parser) Error!Node.Index {
         // .keyword_loop => return self.parseLoop(expectTypeExpr) // do not add yet
         // .keyword_match => return self.parseMatchExpr(), // do not add yet
         // TODO
+        .keyword_struct => return self.parseStruct(),
         // .keyword_struct,
         // .keyword_opaque,
         // .keyword_enum,
@@ -1316,6 +1317,69 @@ fn parsePrimaryTypeExpr(self: *Parser) Error!Node.Index {
     }
 }
 
+test "struct AST owns ordered members constructors attributes interpolation and exact source ranges" {
+    const source = "@[public]\nlet A=struct {; fields\nx:int=0,\ny:string,\n@[public]\nlet toString:(self:A)->string=\"{self.x}:{self.y}\"\n}\nlet main:()={let a=A[\n.x=1, ; argument\n.y=\"hé\",\n]\n@println(a)}";
+    var ast = try parse(std.testing.allocator, source);
+    defer ast.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    const declaration = ast.decl(ast.rootDecls()[0]);
+    try std.testing.expectEqual(@as(usize, 1), declaration.attributes.len);
+    const members = ast.fullStruct(declaration.ast.init_node).?;
+    try std.testing.expectEqual(@as(usize, 3), members.len);
+    try std.testing.expectEqualStrings("struct {; fields\nx:int=0,\ny:string,\n@[public]\nlet toString:(self:A)->string=\"{self.x}:{self.y}\"\n}", ast.getNodeSource(declaration.ast.init_node));
+    for (ast.nodes.items(.tag), 0..) |tag, i| if (tag == .container_decl_arg) {
+        const node: Node.Index = @intCast(i);
+        const init = ast.fullStructInit(node).?;
+        try std.testing.expectEqual(@as(usize, 2), init.fields.len);
+        try std.testing.expectEqualStrings("A[\n.x=1, ; argument\n.y=\"hé\",\n]", ast.getNodeSource(node));
+    };
+}
+
+test "malformed structs constructors and attributes recover without panicking" {
+    for ([_][:0]const u8{
+        "let A=struct",               "let A=struct {x}",           "let A=struct {x:int}",
+        "let A=struct {x:int=,}",     "let A=struct {@[public]\n}", "let A=struct {var x:int,}",
+        "let a=A[.x]",                "let a=A[.x=]",               "let a=A[.x=1,.x]",
+        "let A=struct {let f:()=\n}",
+    }) |source| {
+        var ast = try parse(std.testing.allocator, source);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expect(ast.errors.len != 0);
+    }
+}
+
+fn parseStruct(self: *Parser) Error!Node.Index {
+    const keyword = self.assertToken(.keyword_struct);
+    _ = try self.expectToken(.l_brace);
+    const top = self.scratch.items.len;
+    defer self.scratch.shrinkRetainingCapacity(top);
+    while (true) {
+        _ = try self.eatDocComments();
+        const member = switch (self.token_tags[self.tok_i]) {
+            .newline => {
+                self.tok_i += 1;
+                continue;
+            },
+            .r_brace => break,
+            .keyword_let => try self.parseDecl(),
+            .at_sign_l_bracket => try self.expectAttrDecl(),
+            .identifier => blk: {
+                const name = self.nextToken();
+                _ = try self.expectToken(.colon);
+                const ty = try self.expectTypeExpr();
+                const value = if (self.eatToken(.equal) != null) try self.expectExpr() else 0;
+                _ = try self.expectToken(.comma);
+                break :blk try self.addNode(.{ .tag = .container_field, .main_token = name, .data = .{ .lhs = ty, .rhs = value } });
+            },
+            else => return self.fail(.expected_decl),
+        };
+        try self.scratch.append(self.allocator, member);
+    }
+    _ = self.nextToken();
+    const members = try self.listToSpan(self.scratch.items[top..]);
+    return self.addNode(.{ .tag = .container_decl, .main_token = keyword, .data = .{ .lhs = members.start, .rhs = members.end } });
+}
+
 /// SuffixOp
 ///     <- LBRACKET Expr ((DOTDOT / DOTDOTEQUAL) Expr?)? RBRACKET
 ///      / DOT IDENTIFIER
@@ -1325,6 +1389,27 @@ fn parseSuffixOp(self: *Parser, lhs: Node.Index) Error!Node.Index {
     switch (self.token_tags[self.tok_i]) {
         .l_bracket => {
             const lbracket = self.nextToken();
+            if (self.token_tags[self.tok_i] == .newline) {
+                var next = self.tok_i;
+                while (self.token_tags[next] == .newline) : (next += 1) {}
+                if (self.token_tags[next] == .period or self.token_tags[next] == .r_bracket) self.tok_i = next;
+            }
+            if (self.token_tags[self.tok_i] == .period or self.token_tags[self.tok_i] == .r_bracket) {
+                const top = self.scratch.items.len;
+                defer self.scratch.shrinkRetainingCapacity(top);
+                while (self.token_tags[self.tok_i] != .r_bracket) {
+                    _ = try self.expectToken(.period);
+                    const name = try self.expectToken(.identifier);
+                    _ = try self.expectToken(.equal);
+                    const value = try self.expectExpr();
+                    try self.scratch.append(self.allocator, try self.addNode(.{ .tag = .container_field, .main_token = name, .data = .{ .lhs = 0, .rhs = value } }));
+                    const comma = self.eatToken(.comma) != null;
+                    while (self.token_tags[self.tok_i] == .newline) self.tok_i += 1;
+                    if (!comma) break;
+                }
+                _ = try self.expectToken(.r_bracket);
+                return self.addNode(.{ .tag = .container_decl_arg, .main_token = lbracket, .data = .{ .lhs = lhs, .rhs = try self.addExtra(try self.listToSpan(self.scratch.items[top..])) } });
+            }
             const index_expr = try self.expectExpr();
 
             switch (self.token_tags[self.tok_i]) {

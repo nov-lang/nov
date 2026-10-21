@@ -106,7 +106,8 @@ fn mark(origins: []?Origin, ty: Ir.TypeId, origin: Origin) void {
 
 /// Rejects unsupported operations and records which pool types are reachable
 /// from function signatures and instructions. Type references only point to
-/// lower indices, so one descending pass reaches every nested type.
+/// lower indices, except nominal record fields (restricted to scalar leaves).
+/// One descending pass reaches signatures; record leaves are checked directly.
 fn analyze(ir: *const Ir, origins: []?Origin, diagnostic: ?*Diagnostic) Error!void {
     for (ir.functions.items, 0..) |function, f| {
         const id: Ir.FunctionId = @enumFromInt(f);
@@ -122,6 +123,14 @@ fn analyze(ir: *const Ir, origins: []?Origin, diagnostic: ?*Diagnostic) Error!vo
         const origin = origins[i] orelse continue;
         switch (ir.types.items[i]) {
             .void, .boolean, .string => {},
+            .record => |record| for (record.fields) |field| {
+                mark(origins, field.ty, origin);
+                const ft = ir.getType(field.ty).?;
+                if (ft == .integer) switch (ft.integer.bits) {
+                    8, 16, 32, 64 => {},
+                    else => return fail(diagnostic, .integer_width_unsupported, .{ .function = origin.function, .span = field.span }),
+                };
+            },
             .array => |element| mark(origins, element, origin),
             .integer => |integer| switch (integer.bits) {
                 8, 16, 32, 64 => {},
@@ -177,6 +186,17 @@ fn write(allocator: std.mem.Allocator, ir: *const Ir, origins: []const ?Origin, 
         try w.writeAll(" *data = array.data;\n    for (uintptr_t i = 0; i < array.len; ++i) {\n        if (value == data[i]) return true;\n    }\n    return false;\n}\n");
     }
     try writeArithmeticRuntime(ir, w);
+    for (origins, ir.types.items, 0..) |origin, ty, i| {
+        if (origin == null or ty != .record) continue;
+        try w.print("typedef struct {{\n", .{});
+        for (ty.record.fields, 0..) |field, f| {
+            try w.writeAll("    ");
+            try writeType(ir, w, field.ty);
+            try w.print(" f{d};\n", .{f});
+        }
+        if (ty.record.fields.len == 0) try w.writeAll("    unsigned char empty;\n");
+        try w.print("}} nov_record_{d};\n", .{i});
+    }
     var first_typedef = true;
     for (origins, ir.types.items, 0..) |origin, ty, i| {
         if (origin == null or ty != .function) continue;
@@ -201,6 +221,27 @@ fn write(allocator: std.mem.Allocator, ir: *const Ir, origins: []const ?Origin, 
         try writeBody(allocator, ir, w, function);
         try w.writeAll("}\n");
     }
+}
+
+fn rootCount(ir: *const Ir, id: Ir.TypeId) usize {
+    const ty = ir.getType(id).?;
+    if (ty == .record) {
+        var count: usize = 0;
+        for (ty.record.fields) |field| {
+            if (ir.getType(field.ty).? == .string) count += 1;
+        }
+        return count;
+    }
+    return @intFromBool(Ir.isManaged(ty));
+}
+
+fn writeRoots(ir: *const Ir, w: *std.Io.Writer, id: Ir.TypeId, prefix: []const u8, index: usize) WriteError!void {
+    const ty = ir.getType(id).?;
+    if (ty == .record) {
+        for (ty.record.fields, 0..) |field, f| if (ir.getType(field.ty).? == .string) {
+            try w.print(" &{s}{d}.f{d}.owner,", .{ prefix, index, f });
+        };
+    } else try w.print(" &{s}{d}.{s},", .{ prefix, index, if (ty == .string) "owner" else "data" });
 }
 
 fn needsRootFrame(ir: *const Ir, function: Ir.Function) bool {
@@ -340,6 +381,7 @@ fn writeType(ir: *const Ir, w: *std.Io.Writer, id: Ir.TypeId) WriteError!void {
         .function => try w.print("nov_fn_{d}", .{@intFromEnum(id)}),
         .array => try w.writeAll("nov_array"),
         .string => try w.writeAll("nov_string"),
+        .record => try w.print("nov_record_{d}", .{@intFromEnum(id)}),
     }
 }
 
@@ -424,9 +466,10 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
     @memset(param_used, false);
     value_used[@intFromEnum(body.result)] = true;
     for (body.instructions) |instruction| switch (instruction.op) {
-        .array_literal => |elements| for (elements) |value| {
+        .array_literal, .record_init => |elements| for (elements) |value| {
             value_used[@intFromEnum(value)] = true;
         },
+        .field_read => |read| value_used[@intFromEnum(read.base)] = true,
         .array_clone, .array_len, .to_string => |value| value_used[@intFromEnum(value)] = true,
         .array_index => |r| {
             value_used[@intFromEnum(r.array)] = true;
@@ -492,23 +535,23 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
         try w.writeAll("    (void)nov_gc_register_globals; (void)nov_gc_unregister_globals; (void)nov_gc_shutdown;\n    (void)nov_array_clone; (void)nov_array_index; (void)nov_array_append;\n");
         var roots: usize = 0;
         for (signature.params) |param| if (Ir.isManaged(ir.getType(param).?)) {
-            roots += 1;
+            roots += rootCount(ir, param);
         };
         for (body.instructions, 0..) |instruction, i| {
             if (!Ir.isManaged(ir.getType(instruction.ty).?)) continue;
             try w.writeAll("    ");
             try writeType(ir, w, instruction.ty);
             try w.print(" v{d} = {{0}};\n", .{i});
-            roots += 1;
+            roots += rootCount(ir, instruction.ty);
         }
         // Stable function-scope void* fields, never casts from typed T** slots.
         if (roots != 0) {
             try w.writeAll("    void **nov_roots[] = {");
             for (signature.params, 0..) |param, p| if (Ir.isManaged(ir.getType(param).?)) {
-                try w.print(" &p{d}.{s},", .{ p, if (ir.getType(param).? == .string) "owner" else "data" });
+                try writeRoots(ir, w, param, "p", p);
             };
             for (body.instructions, 0..) |instruction, i| if (Ir.isManaged(ir.getType(instruction.ty).?)) {
-                try w.print(" &v{d}.{s},", .{ i, if (ir.getType(instruction.ty).? == .string) "owner" else "data" });
+                try writeRoots(ir, w, instruction.ty, "v", i);
             };
             try w.print(" }};\n    nov_gc_roots nov_frame = {{0}};\n    nov_gc_push(&nov_rt_heap, &nov_frame, nov_roots, {d});\n", .{roots});
         } else {
@@ -628,6 +671,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
         if (ty == .string) {
             try w.print("    v{d} = ", .{i});
             switch (instruction.op) {
+                .field_read => |read| try w.print("v{d}.f{d}", .{ @intFromEnum(read.base), read.index }),
                 .constant => |id| try writeConstant(w, ir.getConstant(id).?, ty),
                 .parameter => |index| try w.print("p{d}", .{index}),
                 .local_slot, .local_load => |value| try w.print("v{d}", .{@intFromEnum(value)}),
@@ -653,10 +697,26 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
             if (!value_used[i] or instruction.op == .local_slot) try w.print("    (void)v{d};\n", .{i});
             continue;
         }
-        try w.writeAll(if (instruction.op == .local_slot) "    " else "    const ");
-        try writeType(ir, w, instruction.ty);
-        try w.print(" v{d} = ", .{i});
+        if (ty == .record) {
+            try w.print("    v{d} = ", .{i});
+        } else {
+            try w.writeAll(if (instruction.op == .local_slot) "    " else "    const ");
+            try writeType(ir, w, instruction.ty);
+            try w.print(" v{d} = ", .{i});
+        }
         switch (instruction.op) {
+            .record_init => |values| {
+                try w.writeByte('(');
+                try writeType(ir, w, instruction.ty);
+                try w.writeAll("){ ");
+                for (values, 0..) |value, f| {
+                    if (f != 0) try w.writeAll(", ");
+                    try w.print("v{d}", .{@intFromEnum(value)});
+                }
+                if (values.len == 0) try w.writeByte('0');
+                try w.writeAll(" }");
+            },
+            .field_read => |read| try w.print("v{d}.f{d}", .{ @intFromEnum(read.base), read.index }),
             .array_len => |value| try w.print("v{d}.len", .{@intFromEnum(value)}),
             .array_index => |r| {
                 try w.writeAll("((");
@@ -816,6 +876,177 @@ fn writeCall(w: *std.Io.Writer, call: anytype) WriteError!void {
 // ---------------------------------------------------------------------------
 
 const test_gpa = std.testing.allocator;
+
+const record_program =
+    \\let Alias = R
+    \\@[public]
+    \\let R = struct {
+    \\    s: string = "hé\0",
+    \\    n: int = 0,
+    \\    b: bool = false,
+    \\    @[public]
+    \\    let toString: (self: Alias) -> string = {
+    \\        @print("T")
+    \\        "{self.s}:{self.n}:{self.b}"
+    \\    }
+    \\    let switch: (value: R) -> Alias = value
+    \\}
+    \\let num: () -> int = {@print("N")
+    \\    5}
+    \\let text: () -> string = {@print("S")
+    \\    "hé\0" + "!"}
+    \\let main: () = {
+    \\    let mut item = Alias[ .n = num(), .s = text(), .b = true ]
+    \\    let copy = item
+    \\    item = R[ .s = "replacement" ]
+    \\    @println(copy, R[ .s = text() ], item)
+    \\    let chosen = if false { R[ .s = text() ] } else { R.switch(copy) }
+    \\    @println(chosen)
+    \\    @println(R.toString(R[]))
+    \\}
+;
+const record_output = "NSTSTThé\x00!:5:true hé\x00!:0:false replacement:0:false\nThé\x00!:5:true\nThé\x00:0:false\n";
+
+test "nominal records preserve copies aliases effects field roots and formatting" {
+    const c = try arrayTestProgram(record_program);
+    defer test_gpa.free(c);
+    try std.testing.expect(std.mem.indexOf(u8, c, ".f0.owner") != null);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, record_output, "", mode);
+}
+
+test "record fields defaults methods and C output survive source release and every allocation failure" {
+    var sema = blk: {
+        var module = try Module.init(test_gpa, "records.nov", record_program);
+        defer module.deinit();
+        var result = try Lowering.lower(&module);
+        errdefer result.deinit();
+        try std.testing.expect(!module.hasErrors());
+        break :blk result;
+    };
+    defer sema.deinit();
+    try sema.ir.verify();
+    const c = try emitProgram(test_gpa, &sema.ir, null);
+    defer test_gpa.free(c);
+    try compileAndRunExpected(c, "typedef int nonempty_translation_unit;", 0, record_output, "");
+    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{record_program});
+}
+
+test "record parameters returns and assignments share immutable string backing" {
+    const library = try emitSource("let R = struct { s: string, n: int = 7, }\nlet make: () -> R = R[.s=\"a\"+\"b\"]\nlet share: (r: R) -> R = {let mut copy=r\ncopy=r\ncopy}\n", null);
+    defer test_gpa.free(library);
+    const c = try std.mem.concat(test_gpa, u8, &.{ library, "\nint main(void) { nov_rt_heap.collect_every_allocation = 1; " ++
+        "nov_record_0 a = nov_make(); nov_record_0 b = nov_share(a); " ++
+        "if (!a.f0.owner || a.f0.owner != b.f0.owner || a.f0.data != b.f0.data || b.f1 != 7) return 1; " ++
+        "b.f1 = 9; if (a.f1 != 7 || nov_rt_heap.live_objects != 1 || nov_rt_heap.frames) return 2; " ++
+        "nov_gc_shutdown(&nov_rt_heap); return 0; }\n" });
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "", "", mode);
+}
+
+test "record 128 bit fields type check but reachable layouts retain backend width diagnostics" {
+    for ([_][]const u8{
+        "let R=struct{x:i128,}\nlet f:(r:R)= {}\nlet main:()={}",
+        "let Wide=u128\nlet Alias=R\nlet R=struct{x:Wide,}\nlet f:(r:Alias)= {}\nlet main:()={}",
+        "let Wide=u128\nlet Alias=R\nlet R=struct{x:Wide=340282366920938463463374607431768211455,}\nlet f:(r:Alias)= {}\nlet main:()={}",
+    }) |source| {
+        var module = try Module.init(test_gpa, "wide-record.nov", source);
+        defer module.deinit();
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expect(sema.lowering_complete);
+        try sema.ir.verify();
+        var diagnostic: Diagnostic = undefined;
+        try std.testing.expectError(error.UnsupportedIntegerWidth, emitProgram(test_gpa, &sema.ir, &diagnostic));
+        try std.testing.expectEqual(Diagnostic.Reason.integer_width_unsupported, diagnostic.reason);
+        try std.testing.expect(diagnostic.function != null);
+        try std.testing.expectEqualStrings("x", source[diagnostic.span.start..diagnostic.span.end]);
+    }
+}
+
+test "unused record 128 bit fields leave emitted C unchanged" {
+    const narrow = try emitSource("let Wide=i64\nlet Alias=R\nlet R=struct{x:Wide,}\nlet main:()={}", null);
+    defer test_gpa.free(narrow);
+    for ([_][]const u8{ "i128", "u128" }) |width| {
+        const source = try std.fmt.allocPrint(test_gpa, "let Wide={s}\nlet Alias=R\nlet R=struct{{x:Wide,}}\nlet main:()={{}}", .{width});
+        defer test_gpa.free(source);
+        const c = try emitSource(source, null);
+        defer test_gpa.free(c);
+        try std.testing.expectEqualStrings(narrow, c);
+        try std.testing.expect(std.mem.indexOf(u8, c, "nov_record_") == null);
+    }
+}
+
+test "record scalar fields cover every supported integer width and literal limits" {
+    const source =
+        \\let R = struct {
+        \\ a: i8 = -128, b: u8 = 255,
+        \\ c: i16 = -32768, d: u16 = 65535,
+        \\ e: i32 = -2147483648, f: u32 = 4294967295,
+        \\ g: i64 = -9223372036854775808, h: u64 = 18446744073709551615,
+        \\ i: int = -1, j: uint = 1,
+        \\}
+        \\let main: () = { let r = R[]
+        \\ @println(r.a, r.b, r.c, r.d, r.e, r.f, r.g, r.h, r.i, r.j)
+        \\}
+    ;
+    const c = try arrayTestProgram(source);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "-128 255 -32768 65535 -2147483648 4294967295 -9223372036854775808 18446744073709551615 -1 1\n", "", mode);
+}
+
+test "record scoped forward methods override module homonyms without global printing overloads" {
+    const source =
+        \\let Alias=R
+        \\let first: (r: R) -> string = "wrong"
+        \\let R=struct { s: Text="right",
+        \\ let toString: (self: Alias) -> Text = first(self)
+        \\ let first: (self: R) -> string = second(self)
+        \\ let second: (self: R) -> string = self.s+"!"
+        \\}
+        \\let Text=string
+        \\let main:()={ @println(Alias[], Alias.first(R[])) }
+    ;
+    const c = try arrayTestProgram(source);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "right! right!\n", "", mode);
+}
+
+test "record constructors and allocating toString report OOM while skipped constructors allocate nothing" {
+    for ([_]struct { body: []const u8, allocates: bool }{
+        .{ .body = "let r = if true { R[] } else { R[.s=\"a\"+\"b\"] }\n@println(r.s)", .allocates = false },
+        .{ .body = "let r=R[.s=\"a\"+\"b\"]\n@println(r.s)", .allocates = true },
+        .{ .body = "@println(R[])", .allocates = true },
+    }) |case| {
+        const source = try std.fmt.allocPrint(test_gpa, "let R=struct{{s:string=\"ok\",\nlet toString:(self:R)->string=self.s+\"!\"\n}}\nlet main:()={{{s}\n}}", .{case.body});
+        defer test_gpa.free(source);
+        const library = try emitSource(source, null);
+        defer test_gpa.free(library);
+        const program = try collectingTestProgram(library);
+        defer test_gpa.free(program);
+        const exhausted = try std.mem.concat(test_gpa, u8, &.{ "#include <stdlib.h>\nstatic void *test_malloc(size_t n) { (void)n; return NULL; }\n#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n", program });
+        defer test_gpa.free(exhausted);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(exhausted, "typedef int nonempty_translation_unit;", if (case.allocates) 1 else 0, if (case.allocates) "" else "ok\n", if (case.allocates) "panic: GC allocation failed\n" else "", mode);
+    }
+}
+
+test "record string field roots cover branch and loop merges early returns and allocating arguments" {
+    const source =
+        \\let R = struct { s: string,
+        \\ let toString: (self: R) -> string = self.s + "!"
+        \\}
+        \\let make: (r: R, text: string) -> R = { @println(text)
+        \\ return r }
+        \\let main: () = {
+        \\ let a = if true { R[.s="a"+"b"] } else { R[.s="unused"+"x"] }
+        \\ let b: R = loop { break a }
+        \\ @println(make(b, "allocate"+"!"), R[.s="c"+"d"])
+        \\}
+    ;
+    const c = try arrayTestProgram(source);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "allocate!\nab! cd!\n", "", mode);
+}
 
 /// Lowers `source`, which must be accepted by the frontend, and emits C.
 fn emitSource(source: []const u8, diagnostic: ?*Diagnostic) ![]u8 {
@@ -2734,7 +2965,7 @@ test "array capacity and append length overflow panic before accessing backing" 
 }
 
 test "array allocation failure retries preserve roots and shutdown frees backing" {
-    for ([_][]const u8{ array_example, array_compound_effects, inferred_example, inferred_arrays, string_example, string_compound, string_equality, unconditional_loops, else_loops, array_membership, string_interpolation }, [_][]const u8{ "3 30 30 6\n454 15\n99 15 4\nfalse true 2\n0\n", array_compound_output, inferred_output, inferred_arrays_output, string_output, string_compound_output, string_equality_output, unconditional_output, else_loop_output, array_membership_output, string_interpolation_output }) |source, output| {
+    for ([_][]const u8{ array_example, array_compound_effects, inferred_example, inferred_arrays, string_example, string_compound, string_equality, unconditional_loops, else_loops, array_membership, string_interpolation, record_program }, [_][]const u8{ "3 30 30 6\n454 15\n99 15 4\nfalse true 2\n0\n", array_compound_output, inferred_output, inferred_arrays_output, string_output, string_compound_output, string_equality_output, unconditional_output, else_loop_output, array_membership_output, string_interpolation_output, record_output }) |source, output| {
         const c = try arrayTestProgram(source);
         defer test_gpa.free(c);
         const injected = try std.mem.concat(test_gpa, u8, &.{
@@ -2753,7 +2984,7 @@ test "array allocation failure retries preserve roots and shutdown frees backing
             c,
         });
         defer test_gpa.free(exhausted);
-        for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(exhausted, "typedef int nonempty_translation_unit;", 1, if (std.mem.eql(u8, source, inferred_example)) "7\n8\n" else if (std.mem.eql(u8, source, inferred_arrays)) "7\n" else if (std.mem.eql(u8, source, else_loops)) "false true false\n42 42 5\nexhausted 5 3 3\ncondition continuation body\n10 11 12 14\n3 7\n31 32 3\ntrue\n" else "", "panic: GC allocation failed\n", mode);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(exhausted, "typedef int nonempty_translation_unit;", 1, if (std.mem.eql(u8, source, inferred_example)) "7\n8\n" else if (std.mem.eql(u8, source, inferred_arrays)) "7\n" else if (std.mem.eql(u8, source, else_loops)) "false true false\n42 42 5\nexhausted 5 3 3\ncondition continuation body\n10 11 12 14\n3 7\n31 32 3\ntrue\n" else if (std.mem.eql(u8, source, record_program)) "NS" else "", "panic: GC allocation failed\n", mode);
     }
 }
 

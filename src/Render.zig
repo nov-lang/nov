@@ -136,8 +136,6 @@ fn renderMember(
     decl: Ast.Node.Index,
     space: Space,
 ) RenderError!void {
-    _ = container;
-    _ = space;
     const ast = self.ast;
     const ais = self.ais;
     const node_tags: []const Ast.Node.Tag = ast.nodes.items(.tag);
@@ -147,12 +145,14 @@ fn renderMember(
     if (self.fixups.omit_nodes.contains(decl)) return;
     try self.renderDocComments(ast.firstToken(decl));
     switch (node_tags[decl]) {
-        .attr_decl_one => {
-            @panic("TODO");
-        },
-
-        .attr_decl => {
-            @panic("TODO");
+        .attr_decl_one, .attr_decl => {
+            for (ast.declarationAttributes(decl)) |attribute| {
+                const token = ast.nodes.items(.main_token)[attribute];
+                try self.renderToken(token, .none);
+                try self.renderToken(token + 1, .none);
+                try self.renderToken(ast.lastToken(attribute), .endline);
+            }
+            try self.renderMember(container, ast.nodes.items(.data)[decl].rhs, space);
         },
 
         .decl => {
@@ -162,7 +162,16 @@ fn renderMember(
         },
 
         .container_field => {
-            @panic("TODO");
+            const data = ast.nodes.items(.data)[decl];
+            const token = ast.nodes.items(.main_token)[decl];
+            try self.renderToken(token, .none);
+            try self.renderToken(token + 1, .space);
+            try self.renderExpression(data.lhs, if (data.rhs != 0) .space else .none);
+            if (data.rhs != 0) {
+                try self.renderToken(ast.lastToken(data.lhs) + 1, .space);
+                try self.renderExpression(data.rhs, .none);
+            }
+            try self.renderToken(ast.lastToken(decl) + 1, .endline);
         },
 
         else => unreachable,
@@ -467,11 +476,39 @@ fn renderExpression(self: *Render, node: Ast.Node.Index, space: Space) RenderErr
 
         // TODO: grouped_expression (if it goes back into the language)
 
-        .container_decl,
+        .container_decl => {
+            try self.renderToken(main_tokens[node], .space);
+            try ais.pushIndent(.normal);
+            try ais.pushSpace(.endline);
+            try self.renderToken(main_tokens[node] + 1, .newline);
+            try self.renderMembers(ast.fullStruct(node).?);
+            ais.popSpace();
+            ais.popIndent();
+            return self.renderToken(ast.lastToken(node), space);
+        },
+        .container_decl_arg => {
+            const init = ast.fullStructInit(node).?;
+            try self.renderExpression(init.type_node, .none);
+            const multiline = self.listIsMultiline(main_tokens[node], ast.lastToken(node));
+            if (multiline) try ais.pushIndent(.normal);
+            try self.renderToken(main_tokens[node], if (multiline) .newline else if (init.fields.len != 0) .space else .none);
+            for (init.fields) |field| {
+                const token = main_tokens[field];
+                const value = datas[field].rhs;
+                try self.renderToken(token - 1, .none);
+                try self.renderToken(token, .space);
+                try self.renderToken(token + 1, .space);
+                const last = ast.lastToken(value);
+                const comma = token_tags[last + 1] == .comma;
+                try self.renderExpression(value, if (comma) .none else if (multiline) .newline else .space);
+                if (comma) try self.renderToken(last + 1, if (multiline) .newline else .space);
+            }
+            if (multiline) ais.popIndent();
+            return self.renderToken(ast.lastToken(node), space);
+        },
         .container_decl_trailing,
         .container_decl_two,
         .container_decl_two_trailing,
-        .container_decl_arg,
         .container_decl_arg_trailing,
         => {
             @panic("TODO");
