@@ -8,8 +8,18 @@ bitwise compound assignments and computed match patterns remain unsupported.
 See README's integer section for the executable contract; proposals below are
 not an implementation checklist.
 
+Bounded immutable global inference: bool and plain UTF-8 string literals infer
+canonical types; numeric literals require explicit `@as(T, literal)` context.
+Nested scalar ascriptions require exact canonical types (including forward type
+aliases and any explicit declaration annotation), with checked literal bounds and
+no runtime conversion. Constants own
+string bytes and inline at use sites. Bare integer globals have no default;
+identifier chains, computation, blocks, eager calls, arrays, void/function values,
+mutable globals and global interpolation remain unsupported. Existing annotated
+globals and body/control-flow ascriptions are unchanged.
+
 Explicit expression type context: `@as(T, value)` is implemented in function
-bodies, including interpolation. It checks exact canonical types and contextual
+bodies, including interpolation, and for the bounded scalar globals above. It checks exact canonical types and contextual
 literal bounds without a runtime conversion or additional array-copy boundary.
 Numeric conversions, widening, signedness changes and general type values still
 need language-design decisions; `@as` does not choose those semantics.

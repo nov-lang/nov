@@ -1897,6 +1897,103 @@ test "identifier interpolation preserves chunks formatting roots loops matches a
     for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, string_interpolation_output, "", mode);
 }
 
+const inferred_global_program =
+    \\let enabled = true
+    \\let disabled = @as(Flag, @as(bool, false))
+    \\let prefix = "hé\0"
+    \\let suffix = @as(string, "😀")
+    \\let count = @as(Count, @as(int, -42))
+    \\let Count = int
+    \\let Flag = bool
+    \\let choose: (b: Flag) -> string = match b {
+    \\    true => prefix
+    \\    false => suffix
+    \\}
+    \\let main: () -> void = {
+    \\    @println(enabled, disabled, count < 0, count == -42)
+    \\    @println("{prefix}{suffix}:{count}:{enabled}", choose(disabled), choose(enabled))
+    \\}
+;
+
+const annotated_global_program =
+    \\let inferred_bool = @as(Flag, true)
+    \\let annotated_bool: Flag = @as(bool, @as(Flag, true))
+    \\let inferred_int = @as(Count, -42)
+    \\let annotated_int: Count = @as(int, @as(Count, -42))
+    \\let inferred_string = @as(Text, "hé\0")
+    \\let annotated_string: Text = @as(string, @as(Text, "hé\0"))
+    \\let Flag = bool
+    \\let Count = int
+    \\let Text = string
+    \\let main: () -> void = {
+    \\    @println(inferred_bool, annotated_bool, inferred_int, annotated_int)
+    \\    @println("{inferred_string}:{annotated_string}")
+    \\}
+;
+
+test "annotated scalar ascriptions match inferred runtime values formatting and forced GC" {
+    const c = try arrayTestProgram(annotated_global_program);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "true true -42 -42\nhé\x00:hé\x00\n", "", mode);
+}
+
+test "annotated scalar ascriptions survive every compiler allocation failure" {
+    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{annotated_global_program});
+}
+
+test "inferred global scalars inline into printing interpolation and boolean matches" {
+    const c = try arrayTestProgram(inferred_global_program);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "true false true true\nhé\x00😀:-42:true 😀 hé\x00\n", "", mode);
+}
+
+test "inferred global scalars survive every compiler allocation failure" {
+    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{inferred_global_program});
+}
+
+test "inferred global scalars preserve all native and fixed integer boundaries" {
+    var source = std.Io.Writer.Allocating.init(test_gpa);
+    defer source.deinit();
+    var output = std.Io.Writer.Allocating.init(test_gpa);
+    defer output.deinit();
+    const names = [_][]const u8{ "i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "int", "uint" };
+    for (names) |name| {
+        const bits: u7 = if (std.mem.eql(u8, name, "int") or std.mem.eql(u8, name, "uint")) @intCast(Ir.native_pointer_bits) else try std.fmt.parseInt(u7, name[1..], 10);
+        const signed = name[0] == 'i';
+        const min: i128 = if (signed) -(@as(i128, 1) << @intCast(bits - 1)) else 0;
+        const max: i128 = (@as(i128, 1) << @intCast(bits - @as(u7, @intFromBool(signed)))) - 1;
+        try source.writer.print("let min_{s} = @as({s}, {d})\nlet max_{s} = @as({s}, {d})\n", .{ name, name, min, name, name, max });
+        try output.writer.print("{d} {d}\n", .{ min, max });
+    }
+    try source.writer.writeAll("let main: () -> void = {\n");
+    for (names) |name| try source.writer.print("@println(min_{s}, max_{s})\n", .{ name, name });
+    try source.writer.writeAll("}\n");
+    const c = try emitSource(source.written(), null);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "void nov_main(void); int main(void) { nov_main(); return 0; }", 0, output.written(), "", mode);
+}
+
+test "inferred global scalars emit literal strings after releasing source" {
+    var module = try Module.init(test_gpa, "owned-global.nov", "let text = \"hé\\0\\{ok\\}😀\"\nlet wrapped: string = @as(string, \"literal\")\nlet main: () -> void = @println(text, wrapped)");
+    var sema = Lowering.lower(&module) catch |err| {
+        module.deinit();
+        return err;
+    };
+    const failed = module.hasErrors();
+    module.deinit();
+    defer sema.deinit();
+    try std.testing.expect(!failed);
+    try std.testing.expect(sema.lowering_complete);
+    const c = try emitProgram(test_gpa, &sema.ir, null);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "hé\x00{ok}😀 literal\n", "", mode);
+}
+
+test "inferred global scalars retain the existing 128 bit backend rejection" {
+    try std.testing.expectError(error.UnsupportedIntegerWidth, emitSource("let n = @as(i128, -170141183460469231731687303715884105728)\nlet f: () -> i128 = n", null));
+    try std.testing.expectError(error.UnsupportedIntegerWidth, emitSource("let n = @as(u128, 340282366920938463463374607431768211455)\nlet f: () -> u128 = n", null));
+}
+
 const type_alias_program =
     \\let Count = Forward
     \\let Forward = uint

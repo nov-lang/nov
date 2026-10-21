@@ -20,7 +20,12 @@ pub fn lower(module: *Module) Error!Sema {
     for (module.declarations.items, result.entries) |declaration, entry| {
         if (entry.status == .type_alias) continue;
         if (module.ast.decl(declaration.node).ast.is_mutable or (entry.status != .body_checked and entry.status != .constant_checked)) {
-            try module.diagnostics.append(module.allocator, .{ .tag = .unsupported_lowering, .span = declaration.name_span });
+            const full = module.ast.decl(declaration.node).ast;
+            const tag: Module.Diagnostic.Tag = if (!full.is_mutable and full.type_node == 0 and full.init_node != 0) blk: {
+                const init_tag = module.ast.nodes.items(.tag)[full.init_node];
+                break :blk if (init_tag == .number_literal or (init_tag == .negation and module.ast.nodes.items(.tag)[module.ast.nodes.items(.data)[full.init_node].rhs] == .number_literal)) .literal_needs_type else .unsupported_global_initializer;
+            } else .unsupported_lowering;
+            try module.diagnostics.append(module.allocator, .{ .tag = tag, .span = declaration.name_span });
         }
     }
     if (module.hasErrors()) return result;
@@ -863,9 +868,77 @@ test "short-circuit expressions lower explicit conditional RHS regions" {
     }
 }
 
+test "inferred global constants and inline uses outlive source storage" {
+    const source = "let text = @as(string, \"hé\\0\")\nlet n = @as(int, @as(int, -42))\nlet yes = true\nlet f: () -> string = text\nlet g: () -> int = n\nlet h: () -> bool = yes";
+    var module = try Module.init(std.testing.allocator, "owned-global.nov", source);
+    var sema = lower(&module) catch |err| {
+        module.deinit();
+        return err;
+    };
+    const failed = module.hasErrors();
+    module.deinit();
+    defer sema.deinit();
+    try std.testing.expect(!failed);
+    try std.testing.expect(sema.lowering_complete);
+    for (sema.ir.functions.items, 0..) |function, i| {
+        try std.testing.expectEqual(@as(usize, 1), function.body.?.instructions.len);
+        try std.testing.expectEqual(sema.entries[i].constant.?, function.body.?.instructions[0].op.constant);
+    }
+    try std.testing.expectEqualStrings("hé\x00", sema.ir.getConstant(sema.entries[0].constant.?).?.value.string);
+    try sema.ir.verify();
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+}
+
+test "inferred global boundary rejects computation blocks chains and runtime effects" {
+    for ([_][]const u8{
+        "let value: int = @as(int, 1 + 2)",
+        "let value: int = @as(int, {1})",
+        "let value: int = @as(int, missing())",
+        "let value: int = @as(int, {@println(true)\n1})",
+        "let value: int = @as(int, other)\nlet other: int = 1",
+        "let value: []int = @as([]int, [1])",
+        "let value: void = @as(void, {})",
+        "let value: Fn = @as(Fn, f)\nlet Fn = () -> int\nlet f: () -> int = 1",
+        "let value: uint = @as(int, 1)",
+        "let value: uint = @as(uint, @as(int, 1))",
+        "let value: string = @as(string, \"{true}\")",
+        "let value = @as(int, 1 + 2)",
+        "let value = @as(int, {1})",
+        "let value = {true}",
+        "let value = @as(void, {})",
+        "let value = @as([]int, [1])",
+        "let value = @as(int, missing())",
+        "let value = @as(int, {@println(true)\n1})",
+        "let value = @as(int, {return 1})",
+        "let value = other\nlet other = true",
+        "let f: () -> int = 1\nlet value = @as(() -> int, f)",
+        "let mut value = true",
+        "let mut value = @as(int, 1)",
+    }) |source| {
+        var module = try Module.init(std.testing.allocator, "global-boundary.nov", source);
+        defer module.deinit();
+        var sema = try lower(&module);
+        defer sema.deinit();
+        try std.testing.expect(module.hasErrors());
+        try std.testing.expect(!sema.lowering_complete);
+        try std.testing.expectEqual(@as(usize, 0), sema.ir.functions.items.len);
+        for (sema.entries) |entry| try std.testing.expect(entry.function == null);
+        try sema.ir.verify();
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+    }
+    for ([_][]const u8{ "let n = 1", "let n = -1" }) |source| {
+        var module = try Module.init(std.testing.allocator, "untyped-global.nov", source);
+        defer module.deinit();
+        var sema = try lower(&module);
+        defer sema.deinit();
+        try std.testing.expectEqual(Module.Diagnostic.Tag.literal_needs_type, module.diagnostics.items[0].tag);
+        try std.testing.expect(sema.entries[0].type_id == null and sema.entries[0].constant == null);
+        try std.testing.expect(!sema.lowering_complete);
+    }
+}
+
 test "deferred and mutable globals cannot silently become executable constants" {
     for ([_][]const u8{
-        "let value = 1\nlet f: () -> i32 = 1",
         "let value: i32 = 1 + 2\nlet f: () -> i32 = 1",
         "let mut value: i32 = 1\nlet f: () -> i32 = value",
         "let mut f: () -> i32 = 1",

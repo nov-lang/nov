@@ -61,14 +61,17 @@ semantic/lowering subset. It runs declaration collection, initializer dependency
 analysis, annotation/literal and function-body checking, then typed lowering and
 IR verification. Source errors and unsupported/deferred forms fail with source
 diagnostics (including related notes where available); recovered syntax errors
-stop semantic analysis. Runtime globals must be immutable, explicitly typed integer,
-boolean or string literals; immutable module-level type aliases are also supported. Functions need explicit supported signatures and bounded
+stop semantic analysis. Runtime globals must be immutable scalar constants: explicitly
+typed integer/boolean/string literals, inferred boolean or plain UTF-8 string
+literals, or scalar literals explicitly contextualized with `@as(T, literal)`.
+Immutable module-level type aliases are also supported. Functions need explicit supported signatures and bounded
 expression bodies (including forward/recursive calls, local declarations and
 assignments, nested blocks, boolean short-circuiting, `if`/`else`, explicit returns,
 bounded integer range loops, condition-based or unconditional loops with continuation clauses and unlabeled
 `break`/`continue`, value-producing unconditional, conditional-with-`else`, or range-with-`else` loops,
 and empty void bodies).
-Inferred globals, mutable globals, nonliteral global initializers, global unit
+Bare integer globals still need type context; no numeric default is chosen.
+Mutable globals, general nonliteral global initializers and global unit
 values are currently rejected, along with the other
 unsupported forms listed above. This is not a backend compatibility check: it
 does not emit C, validate C integer widths, require `main`, build, or execute a
@@ -1227,6 +1230,38 @@ let x = {y = 3} ; should be fine, @TypeOf(x) == void
 let z += 3 ; compile error, expected `=`
 ```
 
+## Scalar Constant Globals
+
+Immutable module bindings infer `bool` from `true`/`false` and `string` from plain
+UTF-8 string literals. Numeric inference requires explicit type context:
+
+```nov
+let enabled = true
+let label = "Count:"
+let count = @as(Count, @as(uint, 8))
+let Count = uint
+let main: () -> void = @println("{label} {count}", enabled)
+```
+
+These are owned constants, inlined at use sites, not runtime initialization code.
+Forward type aliases work in `@as`; nested ascriptions must have exactly the same
+canonical type, including an explicit declaration annotation when present:
+`let count: Count = @as(uint, 8)` works, while `let n: uint = @as(int, 1)`
+and `@as(int, @as(uint, 1))` are errors, not conversions. Literal
+bounds remain exact, including native `int`/`uint`; explicit 128-bit constants
+can type-check but retain the C backend's width rejection.
+
+There are no implicit integer defaults: `let count = 8` needs an annotation or
+`@as`. Inference does not evaluate expressions: identifier chains, arithmetic,
+blocks, calls, function values, arrays and void globals remain unsupported, even
+under `@as`. Existing explicitly annotated literal globals are unchanged.
+Interpolated strings still require a function; plain literals support UTF-8,
+escaped braces and embedded NUL. Mutable globals remain unsupported. Type
+ascriptions inside function bodies retain their existing expression semantics.
+
+See [examples/type-aliases.nov](examples/type-aliases.nov) for globals together
+with aliases, array locals and an exhaustive boolean match.
+
 ## Type Aliases
 
 Immutable module declarations can name supported types:
@@ -1269,8 +1304,8 @@ Only plain immutable module declarations `let Name = typeExpression` define
 aliases. They share the existing module namespace: duplicates and implicit
 shadowing are rejected. An identifier RHS names a type only when its target is a
 type (or a type position demands resolution and reports a type error); aliases
-of runtime values do not become types, and inferred runtime globals remain
-unsupported. Unknown identifier RHSs without type context are diagnosed as
+of runtime values do not become types. Scalar literal globals infer independently;
+identifier-chain global initialization remains unsupported. Unknown identifier RHSs without type context are diagnosed as
 unknown names, not assumed to be function types. Identifier-only cycles with no
 type context remain value-dependency errors; a type annotation or `@as` demand
 classifies the same candidates as attempted aliases and reports type-alias cycles.

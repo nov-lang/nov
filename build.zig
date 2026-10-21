@@ -145,6 +145,34 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         \\}
         \\
     );
+    _ = fixtures.add("annotated-globals.nov",
+        \\let inferred_bool = @as(Flag, true)
+        \\let annotated_bool: Flag = @as(bool, @as(Flag, true))
+        \\let inferred_int = @as(Count, -42)
+        \\let annotated_int: Count = @as(int, @as(Count, -42))
+        \\let inferred_string = @as(Text, "hé\0")
+        \\let annotated_string: Text = @as(string, @as(Text, "hé\0"))
+        \\let Flag = bool
+        \\let Count = int
+        \\let Text = string
+        \\let main: () -> void = {
+        \\    @println(inferred_bool, annotated_bool, inferred_int, annotated_int)
+        \\    @println("{inferred_string}:{annotated_string}")
+        \\}
+        \\
+    );
+    _ = fixtures.add("annotated-global-mismatch.nov", "let n: uint = @as(int, 1)\n");
+    _ = fixtures.add("annotated-global-nesting.nov", "let n: uint = @as(uint, @as(int, 1))\n");
+    _ = fixtures.add("annotated-global-bounds.nov", "let n: u8 = @as(u8, 256)\n");
+    _ = fixtures.add("annotated-global-interpolation.nov", "let s: string = @as(string, \"{true}\")\n");
+    _ = fixtures.add("global-untyped.nov", "let n = 1\n");
+    _ = fixtures.add("global-bounds.nov", "let n = @as(u8, 256)\n");
+    _ = fixtures.add("global-call.nov", "let n = @as(int, missing())\n");
+    _ = fixtures.add("global-unknown.nov", "let n = @as(int, missing)\n");
+    _ = fixtures.add("global-type.nov", "let n = @as(Missing, 1)\n");
+    _ = fixtures.add("global-nesting.nov", "let n = @as(int, @as(uint, 1))\n");
+    _ = fixtures.add("global-block.nov", "let n = @as(int, {1})\n");
+    _ = fixtures.add("global-interpolation.nov", "let n = @as(string, \"{true}\")\n");
     _ = fixtures.add("alias-value.nov", "let Count = uint\nlet main: () = @println(Count)\n");
     _ = fixtures.add("alias-cycle.nov", "let A = []B\nlet B = A\n");
     _ = fixtures.add("ascription.nov", "let main: () -> void = {\n    @println(\"{@as(int, 1)}\", @as(uint, 1))\n    let a = @as([]int, [2])\n    @println(a[0])\n}\n");
@@ -233,6 +261,20 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         .{ .name = "check rejects --check", .args = &.{ "check", "--check", "valid.nov" }, .exit_code = 1, .stderr_match = "--check" },
         .{ .name = "--check requires fmt", .args = &.{"--check"}, .exit_code = 1, .stderr_match = "--check" },
         .{ .name = "check valid syntax", .args = &.{ "check", "valid.nov" }, .exit_code = 0 },
+        .{ .name = "check annotated scalar globals", .args = &.{ "check", "--semantic", "annotated-globals.nov" }, .exit_code = 0 },
+        .{ .name = "fmt annotated scalar globals", .args = &.{ "fmt", "--check", "annotated-globals.nov" }, .exit_code = 0 },
+        .{ .name = "annotated global exact declaration type", .args = &.{ "emit-c", "annotated-global-mismatch.nov" }, .exit_code = 1, .stderr_match = "expression does not match the expected type" },
+        .{ .name = "annotated global exact nested types", .args = &.{ "check", "--semantic", "annotated-global-nesting.nov" }, .exit_code = 1, .stderr_match = "expression does not match the expected type" },
+        .{ .name = "annotated global literal bounds", .args = &.{ "check", "--semantic", "annotated-global-bounds.nov" }, .exit_code = 1, .stderr_match = "integer literal does not fit" },
+        .{ .name = "annotated global interpolation diagnostic", .args = &.{ "emit-c", "annotated-global-interpolation.nov" }, .exit_code = 1, .stderr_match = "move interpolation into a function" },
+        .{ .name = "global integer needs context", .args = &.{ "check", "--semantic", "global-untyped.nov" }, .exit_code = 1, .stderr_match = "integer literal needs an expected type" },
+        .{ .name = "global ascription bounds", .args = &.{ "check", "--semantic", "global-bounds.nov" }, .exit_code = 1, .stderr_match = "integer literal does not fit" },
+        .{ .name = "global ascription rejects eager calls", .args = &.{ "check", "--semantic", "global-call.nov" }, .exit_code = 1, .stderr_match = "dependency analysis for this expression" },
+        .{ .name = "global ascription unknown value", .args = &.{ "check", "--semantic", "global-unknown.nov" }, .exit_code = 1, .stderr_match = "unknown name 'missing'" },
+        .{ .name = "global ascription unknown type", .args = &.{ "check", "--semantic", "global-type.nov" }, .exit_code = 1, .stderr_match = "unknown type 'Missing'" },
+        .{ .name = "global ascription exact nesting", .args = &.{ "emit-c", "global-nesting.nov" }, .exit_code = 1, .stderr_match = "expression does not match the expected type" },
+        .{ .name = "global ascription rejects blocks", .args = &.{ "emit-c", "global-block.nov" }, .exit_code = 1, .stderr_match = "inferred globals require immutable" },
+        .{ .name = "global ascription rejects interpolation", .args = &.{ "check", "--semantic", "global-interpolation.nov" }, .exit_code = 1, .stderr_match = "move interpolation into a function" },
         .{ .name = "check type aliases", .args = &.{ "check", "--semantic", "type-aliases.nov" }, .exit_code = 0 },
         .{ .name = "fmt type aliases", .args = &.{ "fmt", "--check", "type-aliases.nov" }, .exit_code = 0 },
         .{ .name = "reject alias value", .args = &.{ "emit-c", "alias-value.nov" }, .exit_code = 1, .stderr_match = "expected a runtime value, found a type alias" },
@@ -512,6 +554,19 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         aliases.expectStdOutEqual("Count: 8 8\n");
         aliases.expectStdErrEqual("");
         test_step.dependOn(&aliases.step);
+
+        const annotated_globals = b.addRunArtifact(exe);
+        annotated_globals.step.name = b.fmt("CLI: annotated scalar globals ({s})", .{mode});
+        annotated_globals.setCwd(fixtures.getDirectory());
+        annotated_globals.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+        annotated_globals.setEnvironmentVariable("NOV_CC", "");
+        annotated_globals.setEnvironmentVariable("CC", "");
+        annotated_globals.addArgs(&.{ "run", "annotated-globals.nov" });
+        if (mode.len != 0) annotated_globals.addArg(mode);
+        annotated_globals.expectExitCode(0);
+        annotated_globals.expectStdOutEqual("true true -42 -42\nhé\x00:hé\x00\n");
+        annotated_globals.expectStdErrEqual("");
+        test_step.dependOn(&annotated_globals.step);
 
         const boolean_match = b.addRunArtifact(exe);
         boolean_match.step.name = b.fmt("CLI: exhaustive boolean match ({s})", .{mode});

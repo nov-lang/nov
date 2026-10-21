@@ -53,6 +53,7 @@ pub const Diagnostic = struct {
         invalid_interpolation,
         unsupported_interpolation_type,
         unsupported_global_interpolation,
+        unsupported_global_initializer,
         literal_type_mismatch,
         literal_out_of_range,
         unsupported_body_expression,

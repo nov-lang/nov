@@ -1996,7 +1996,7 @@ test "strings reject byte mutation indexing slicing arrays ordering and eager gl
         "let f: () -> string = \"a\" + 1",
         "let x: string = \"a\" + \"b\"",
         "let mut x: string = \"a\"",
-        "let x = \"a\"",
+        "let x = @as(string, \"a\" + \"b\")",
     }) |source| {
         var module = try Module.init(std.testing.allocator, "unsupported-string.nov", source);
         defer module.deinit();

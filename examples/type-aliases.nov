@@ -1,4 +1,9 @@
 ; Aliases name canonical types, not distinct types or runtime values.
+let initial = @as(Count, 7)
+let expected = @as(Count, @as(uint, 8))
+let label = "Count:"
+let enabled = true
+
 let Count = NativeCount
 let NativeCount = uint
 let Counts = []Count
@@ -11,8 +16,11 @@ let increment: (value: Count) -> Count = value + 1
 let apply: (callback: Callback, values: Counts) -> Count = callback(values[0])
 
 let main: () -> Unit = {
-    let values: Counts = [7]
+    let values: Counts = [initial]
     let callback = @as(Callback, increment)
-    let message: Text = "Count: {@as(Count, 8)}"
+    let message: Text = match enabled {
+        true => "{label} {expected}"
+        false => "disabled"
+    }
     @println(message, apply(callback, values))
 }

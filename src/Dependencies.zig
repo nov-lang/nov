@@ -91,6 +91,19 @@ fn scanInitializer(self: *Dependencies, module: *Module, id: Module.DeclId, work
         const span = module.tokenSpan(ast.nodes.items(.main_token)[node]);
         switch (tag) {
             .number_literal, .char_literal, .string_literal => {},
+            .call, .call_one, .call_comma, .call_one_comma => {
+                const call = ast.fullCall(node).?;
+                if (ast.nodes.items(.tag)[call.ast.fn_expr] == .builtin_literal and
+                    std.mem.eql(u8, ast.tokenSlice(ast.nodes.items(.main_token)[call.ast.fn_expr]), "@as"))
+                {
+                    // The type is resolved by Sema, never read as a runtime value.
+                    // Even malformed ascriptions must not hide eager value reads.
+                    for (call.ast.args[@min(@as(usize, 1), call.ast.args.len)..]) |arg| try work.append(self.allocator, arg);
+                } else {
+                    try module.diagnostics.append(self.allocator, .{ .tag = .unsupported_dependency_expression, .span = span });
+                    entry.state = .failed;
+                }
+            },
             .identifier => {
                 const name = module.sourceSlice(span).?;
                 if (std.mem.startsWith(u8, name, "@\"")) {
@@ -197,6 +210,34 @@ fn resolveGraph(self: *Dependencies, module: *Module) std.mem.Allocator.Error!vo
             }
         }
     }
+}
+
+test "global ascriptions skip types but never hide runtime dependencies" {
+    var module = try Module.init(std.testing.allocator, "as-globals.nov", "let n = @as(Count, @as(int, 1))\nlet yes = true\nlet text = @as(string, \"hé\")\nlet Count = int");
+    defer module.deinit();
+    var result = try analyze(&module);
+    defer result.deinit();
+    try std.testing.expect(!module.hasErrors());
+    for (module.declarations.items, 0..) |_, i| {
+        try std.testing.expectEqual(State.resolved, result.entries[i].state);
+        try std.testing.expectEqual(@as(usize, 0), result.getEdges(@enumFromInt(i)).?.len);
+    }
+    for ([_][]const u8{
+        "let n = @as(int, missing)",
+        "let n = @as(int, missing())",
+        "let n = @as(int, f())\nlet f: () -> int = n",
+        "let n = @as(int, n)",
+        "let n = @as(int, @as(int, n))",
+    }) |source| {
+        var invalid = try Module.init(std.testing.allocator, "invalid-as.nov", source);
+        defer invalid.deinit();
+        var rejected = try analyze(&invalid);
+        defer rejected.deinit();
+        try std.testing.expect(invalid.hasErrors());
+        try std.testing.expectEqual(State.failed, rejected.entries[0].state);
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+    }
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{module.ast.source});
 }
 
 test "value dependencies resolve forward references in dependency-first order" {

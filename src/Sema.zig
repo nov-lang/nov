@@ -53,7 +53,10 @@ pub fn analyzeAnnotations(module: *Module) Error!Sema {
             result.entries[i].status = if (result.entries[i].alias_type != null) .type_alias else .failed;
             continue;
         }
-        if (full.ast.type_node == 0) continue;
+        if (full.ast.type_node == 0) {
+            if (!full.ast.is_mutable and full.ast.init_node != 0) try result.checkScalarGlobal(module, i, full.ast.init_node, null);
+            continue;
+        }
         const type_id = (try TypeResolver.resolve(module, &result.ir, full.ast.type_node)) orelse {
             result.entries[i].status = .failed;
             continue;
@@ -62,7 +65,12 @@ pub fn analyzeAnnotations(module: *Module) Error!Sema {
         if (module.ast.fullFnProto(full.ast.type_node) != null) {
             result.entries[i].status = .signature_only;
         } else if (full.ast.init_node != 0) {
-            try result.checkLiteral(module, i, full.ast.init_node, module.tokenSpan(module.ast.firstToken(full.ast.type_node)));
+            const annotation = module.tokenSpan(module.ast.firstToken(full.ast.type_node));
+            if (!full.ast.is_mutable and module.ast.fullCall(full.ast.init_node) != null) {
+                try result.checkScalarGlobal(module, i, full.ast.init_node, annotation);
+            } else {
+                try result.checkLiteral(module, i, full.ast.init_node, annotation);
+            }
         }
     }
     return result;
@@ -99,6 +107,55 @@ pub fn getEntry(self: *const Sema, id: Module.DeclId) ?Entry {
     return self.entries[index];
 }
 
+/// Checks/infers only syntax-known scalars, with the declared type (if any)
+/// constraining every ascription. In particular, do not invoke
+/// body checking: effects, value references, blocks and computation are not
+/// compile-time evaluation, even beneath an explicit type ascription.
+fn checkScalarGlobal(self: *Sema, module: *Module, index: usize, initializer: Ast.Node.Index, declared_annotation: ?Module.Span) Error!void {
+    const ast = &module.ast;
+    var node = initializer;
+    var expected = self.entries[index].type_id;
+    var annotation = declared_annotation;
+    while (ast.fullCall(node)) |call| {
+        if (ast.nodes.items(.tag)[call.ast.fn_expr] != .builtin_literal or
+            !std.mem.eql(u8, ast.tokenSlice(ast.nodes.items(.main_token)[call.ast.fn_expr]), "@as")) return;
+        if (call.ast.args.len != 2) {
+            try module.diagnostics.append(module.allocator, .{ .tag = .argument_count_mismatch, .span = module.tokenSpan(ast.nodes.items(.main_token)[node]) });
+            self.entries[index].status = .failed;
+            return;
+        }
+        const ty = (try TypeResolver.resolve(module, &self.ir, call.ast.args[0])) orelse {
+            self.entries[index].status = .failed;
+            return;
+        };
+        if (expected != null and expected.? != ty) {
+            try module.diagnostics.append(module.allocator, .{ .tag = .expression_type_mismatch, .span = module.tokenSpan(ast.firstToken(node)), .related = annotation });
+            self.entries[index].status = .failed;
+            return;
+        }
+        expected = ty;
+        annotation = module.tokenSpan(ast.firstToken(call.ast.args[0]));
+        node = call.ast.args[1];
+    }
+    switch (ast.nodes.items(.tag)[node]) {
+        .identifier => {
+            const name = ast.tokenSlice(ast.firstToken(node));
+            if (module.lookup(name) != null or (!std.mem.eql(u8, name, "true") and !std.mem.eql(u8, name, "false"))) return;
+            if (expected == null) expected = try self.ir.internType(.boolean);
+        },
+        .string_literal => {
+            if (expected == null) expected = try self.ir.internType(.string);
+        },
+        .number_literal => if (expected == null) return,
+        .negation => {
+            if (expected == null or ast.nodes.items(.tag)[ast.nodes.items(.data)[node].rhs] != .number_literal) return;
+        },
+        else => return,
+    }
+    self.entries[index].type_id = expected;
+    try self.checkLiteral(module, index, node, annotation orelse module.tokenSpan(ast.firstToken(node)));
+}
+
 fn checkLiteral(self: *Sema, module: *Module, index: usize, initializer: Ast.Node.Index, annotation: Module.Span) Error!void {
     switch (try Literal.check(module, &self.ir, initializer, self.entries[index].type_id.?, annotation)) {
         .not_literal => {
@@ -119,6 +176,160 @@ fn checkLiteral(self: *Sema, module: *Module, index: usize, initializer: Ast.Nod
             self.entries[index].status = .constant_checked;
         },
     }
+}
+
+test "annotated scalar ascriptions match inferred pairs and preserve plain literal groups" {
+    const source =
+        \\let inferred_bool = @as(Flag, @as(bool, true))
+        \\let annotated_bool: Flag = @as(bool, @as(Flag, true))
+        \\let inferred_int = @as(Count, @as(int, -42))
+        \\let annotated_int: int = @as(Count, @as(int, -42))
+        \\let inferred_string = @as(Text, @as(string, "hé\0"))
+        \\let annotated_string: Text = @as(string, @as(Text, "hé\0"))
+        \\let grouped_bool: bool = {{true}}
+        \\let grouped_int: int = -{{42}}
+        \\let grouped_string: string = {{"hé\0"}}
+        \\let Flag = bool
+        \\let Count = int
+        \\let Text = string
+    ;
+    var module = try Module.init(std.testing.allocator, "annotated-as.nov", source);
+    var sema = analyzeAnnotations(&module) catch |err| {
+        module.deinit();
+        return err;
+    };
+    const failed = module.hasErrors();
+    module.deinit();
+    defer sema.deinit();
+    try std.testing.expect(!failed);
+    for (sema.entries[0..9]) |entry| try std.testing.expectEqual(Status.constant_checked, entry.status);
+    for (0..3) |i| {
+        const inferred = sema.entries[2 * i];
+        const annotated = sema.entries[2 * i + 1];
+        try std.testing.expectEqual(inferred.type_id, annotated.type_id);
+        try std.testing.expectEqual(inferred.constant, annotated.constant);
+        try std.testing.expectEqual(inferred.constant, sema.entries[6 + i].constant);
+    }
+    try std.testing.expectEqualStrings("hé\x00", sema.ir.getConstant(sema.entries[5].constant.?).?.value.string);
+    try sema.ir.verify();
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+}
+
+test "annotated scalar ascriptions diagnose declared and nested mismatches bounds and interpolation" {
+    const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag };
+    for ([_]Case{
+        .{ .source = "let n: uint = @as(int, 1)", .tag = .expression_type_mismatch },
+        .{ .source = "let n: uint = @as(int, @as(uint, 1))", .tag = .expression_type_mismatch },
+        .{ .source = "let n: uint = @as(uint, @as(int, 1))", .tag = .expression_type_mismatch },
+        .{ .source = "let s: string = @as(bool, true)", .tag = .expression_type_mismatch },
+        .{ .source = "let n: i8 = @as(i8, 128)", .tag = .literal_out_of_range },
+        .{ .source = "let n: u8 = @as(u8, @as(u8, -1))", .tag = .literal_out_of_range },
+        .{ .source = "let n: int = @as(int, false)", .tag = .literal_type_mismatch },
+        .{ .source = "let s: string = @as(string, @as(string, \"{true}\"))", .tag = .unsupported_global_interpolation },
+        .{ .source = "let s: string = {{\"{true}\"}}", .tag = .unsupported_global_interpolation },
+        .{ .source = "let n: int = @as(Missing, 1)", .tag = .unknown_type },
+        .{ .source = "let n: int = @as(int)", .tag = .argument_count_mismatch },
+    }) |case| {
+        var module = try Module.init(std.testing.allocator, "annotated-as-error.nov", case.source);
+        defer module.deinit();
+        var sema = try analyzeAnnotations(&module);
+        defer sema.deinit();
+        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+        try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
+        try std.testing.expectEqual(Status.failed, sema.entries[0].status);
+        try std.testing.expect(sema.entries[0].constant == null);
+        try sema.ir.verify();
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{case.source});
+    }
+}
+
+test "annotated ascriptions keep general global initialization deferred" {
+    for ([_][]const u8{
+        "let n: int = @as(int, 1 + 2)",
+        "let n: int = @as(int, {1})",
+        "let n: int = @as(int, missing())",
+        "let n: int = @as(int, {@println(true)\n1})",
+        "let n: int = @as(int, other)\nlet other: int = 1",
+        "let a: []int = @as([]int, [1])",
+        "let u: void = @as(void, {})",
+        "let f: Fn = @as(Fn, other)\nlet Fn = () -> int\nlet other: () -> int = 1",
+        "let mut n: int = @as(int, 1)",
+    }) |source| {
+        var module = try Module.init(std.testing.allocator, "annotated-as-deferred.nov", source);
+        defer module.deinit();
+        var sema = try analyzeAnnotations(&module);
+        defer sema.deinit();
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expectEqual(Status.deferred, sema.entries[0].status);
+        try std.testing.expect(sema.entries[0].constant == null);
+        try sema.ir.verify();
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+    }
+}
+
+test "inferred globals own canonical scalar constants and keep aliases distinct" {
+    var module = try Module.init(std.testing.allocator, "globals.nov", "let yes = true\nlet no = @as(bool, @as(bool, false))\nlet text = \"hé\\0\\{ok\\}\"\n" ++
+        "let wrapped = @as(string, \"owned\")\nlet number = @as(Count, @as(int, -42))\nlet Count = int\nlet pending = 42\nlet chain = yes\nlet block = {true}\nlet mut mutable = true");
+    var sema = analyzeAnnotations(&module) catch |err| {
+        module.deinit();
+        return err;
+    };
+    const errors = module.hasErrors();
+    module.deinit();
+    defer sema.deinit();
+    try std.testing.expect(!errors);
+    for (sema.entries[0..5]) |entry| {
+        try std.testing.expectEqual(Status.constant_checked, entry.status);
+        try std.testing.expectEqual(entry.type_id.?, sema.ir.getConstant(entry.constant.?).?.ty);
+    }
+    try std.testing.expectEqualStrings("hé\x00{ok}", sema.ir.getConstant(sema.entries[2].constant.?).?.value.string);
+    try std.testing.expectEqualStrings("owned", sema.ir.getConstant(sema.entries[3].constant.?).?.value.string);
+    try std.testing.expectEqual(@as(i128, -42), sema.ir.getConstant(sema.entries[4].constant.?).?.value.signed_integer);
+    try std.testing.expectEqual(sema.entries[4].type_id, sema.entries[5].alias_type);
+    try std.testing.expectEqual(Status.type_alias, sema.entries[5].status);
+    for (sema.entries[6..]) |entry| {
+        try std.testing.expectEqual(Status.deferred, entry.status);
+        try std.testing.expect(entry.type_id == null and entry.constant == null);
+    }
+    try sema.ir.verify();
+}
+
+test "inferred global ascriptions diagnose exact types bounds arity and interpolation" {
+    const Case = struct { expression: []const u8, tag: Module.Diagnostic.Tag };
+    for ([_]Case{
+        .{ .expression = "@as(i8, 128)", .tag = .literal_out_of_range },
+        .{ .expression = "@as(u8, -1)", .tag = .literal_out_of_range },
+        .{ .expression = "@as(int, @as(uint, 1))", .tag = .expression_type_mismatch },
+        .{ .expression = "@as(bool, @as(string, \"x\"))", .tag = .expression_type_mismatch },
+        .{ .expression = "@as(int, true)", .tag = .literal_type_mismatch },
+        .{ .expression = "@as(bool, 1)", .tag = .literal_type_mismatch },
+        .{ .expression = "@as(string, false)", .tag = .literal_type_mismatch },
+        .{ .expression = "@as(Unknown, 1)", .tag = .unknown_type },
+        .{ .expression = "@as(true, 1)", .tag = .not_a_type },
+        .{ .expression = "@as()", .tag = .argument_count_mismatch },
+        .{ .expression = "@as(int)", .tag = .argument_count_mismatch },
+        .{ .expression = "@as(int, 1, 2)", .tag = .argument_count_mismatch },
+        .{ .expression = "\"{true}\"", .tag = .unsupported_global_interpolation },
+        .{ .expression = "@as(string, \"{true}\")", .tag = .unsupported_global_interpolation },
+        .{ .expression = "\"\\xff\"", .tag = .invalid_literal },
+    }) |case| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let value = {s}", .{case.expression});
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "invalid-global.nov", source);
+        defer module.deinit();
+        var sema = try analyzeAnnotations(&module);
+        defer sema.deinit();
+        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+        try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
+        try std.testing.expectEqual(Status.failed, sema.entries[0].status);
+        try std.testing.expect(sema.entries[0].constant == null);
+        try sema.ir.verify();
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+    }
+}
+
+test "inferred global constants clean up on every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{"let yes = true\nlet text = @as(string, \"hé\\0\")\nlet n = @as(Count, @as(int, -42))\nlet Count = int"});
 }
 
 test "native aliases check literal boundaries without defaulting untyped globals" {
