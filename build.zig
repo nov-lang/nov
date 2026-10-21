@@ -124,6 +124,7 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     _ = fixtures.add("bitwise.nov", "let main: () -> void = {let n: i8 = -128\nlet m: u64 = 18446744073709551615\n@println(n | 127, n & 127, n ^ -1, m ^ m)}\n");
     _ = fixtures.add("strings.nov", @embedFile("examples/strings.nov"));
     _ = fixtures.add("interpolation.nov", @embedFile("examples/interpolation.nov"));
+    _ = fixtures.add("ascription.nov", "let main: () -> void = {\n    @println(\"{@as(int, 1)}\", @as(uint, 1))\n    let a = @as([]int, [2])\n    @println(a[0])\n}\n");
     _ = fixtures.add("interpolation-format.nov", "let main: () -> void = {let n: int = 1\n@println(\"{n:02}\")}\n");
     _ = fixtures.add("interpolation-name.nov", "let main: () -> void = @println(\"{missing}\")\n");
     _ = fixtures.add("interpolation-global.nov", "let n: int = 1\nlet text: string = \"{n}\"\n");
@@ -209,6 +210,8 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         .{ .name = "check rejects --check", .args = &.{ "check", "--check", "valid.nov" }, .exit_code = 1, .stderr_match = "--check" },
         .{ .name = "--check requires fmt", .args = &.{"--check"}, .exit_code = 1, .stderr_match = "--check" },
         .{ .name = "check valid syntax", .args = &.{ "check", "valid.nov" }, .exit_code = 0 },
+        .{ .name = "check ascription", .args = &.{ "check", "--semantic", "ascription.nov" }, .exit_code = 0 },
+        .{ .name = "fmt ascription", .args = &.{ "fmt", "--check", "ascription.nov" }, .exit_code = 0 },
         .{ .name = "check interpolation", .args = &.{ "check", "--semantic", "interpolation.nov" }, .exit_code = 0 },
         .{ .name = "fmt interpolation", .args = &.{ "fmt", "--check", "interpolation.nov" }, .exit_code = 0 },
         .{ .name = "reject interpolation formats", .args = &.{ "emit-c", "interpolation-format.nov" }, .exit_code = 1, .stderr_match = "expected {expression}; blocks, control flow, quotes and format options are unsupported" },
@@ -468,6 +471,19 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         test_step.dependOn(&value_loops.step);
 
         const interpolation_output = "1: 1\n2: 2\n3: Fizz\n4: 4\n5: Buzz\n6: Fizz\n7: 7\n8: 8\n9: Fizz\n10: Buzz\n11: 11\n12: Fizz\n13: 13\n14: 14\n15: FizzBuzz\n{literal}: true: é\x00😀 7\n";
+        const ascription = b.addRunArtifact(exe);
+        ascription.step.name = b.fmt("CLI: ascription ({s})", .{mode});
+        ascription.setCwd(fixtures.getDirectory());
+        ascription.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+        ascription.setEnvironmentVariable("NOV_CC", "");
+        ascription.setEnvironmentVariable("CC", "");
+        ascription.addArgs(&.{ "run", "ascription.nov" });
+        if (mode.len != 0) ascription.addArg(mode);
+        ascription.expectExitCode(0);
+        ascription.expectStdOutEqual("1 1\n2\n");
+        ascription.expectStdErrEqual("");
+        test_step.dependOn(&ascription.step);
+
         const interpolation = b.addRunArtifact(exe);
         interpolation.step.name = b.fmt("CLI: interpolation ({s})", .{mode});
         interpolation.setCwd(fixtures.getDirectory());

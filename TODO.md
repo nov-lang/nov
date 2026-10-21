@@ -8,6 +8,12 @@ bitwise compound assignments and computed match patterns remain unsupported.
 See README's integer section for the executable contract; proposals below are
 not an implementation checklist.
 
+Explicit expression type context: `@as(T, value)` is implemented in function
+bodies, including interpolation. It checks exact canonical types and contextual
+literal bounds without a runtime conversion or additional array-copy boundary.
+Numeric conversions, widening, signedness changes and general type values still
+need language-design decisions; `@as` does not choose those semantics.
+
 Next step: add new IR that
 - forward declaration
 - resolve literals

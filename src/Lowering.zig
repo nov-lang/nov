@@ -569,6 +569,30 @@ test "locals alias evaluated values and nested results survive scope exit" {
     try sema.ir.verify();
 }
 
+test "ascription aliases child IR values without casts or extra array boundaries" {
+    var module = try Module.init(std.testing.allocator, "as.nov", "let f: (n: int) -> int = @as(int, @as(int, n))\nlet a: () -> []int = @as([]int, [1])\nlet fun: ((int) -> int) -> (int) -> int = @as((int) -> int, f)");
+    var sema = lower(&module) catch |err| {
+        module.deinit();
+        return err;
+    };
+    module.deinit();
+    defer sema.deinit();
+    try std.testing.expect(sema.lowering_complete);
+    const scalar = sema.ir.functions.items[0].body.?;
+    try std.testing.expectEqual(@as(usize, 1), scalar.instructions.len);
+    try std.testing.expect(scalar.instructions[0].op == .parameter);
+    try std.testing.expectEqual(@as(u32, 0), @intFromEnum(scalar.result));
+    var copies: usize = 0;
+    for (sema.ir.functions.items[1].body.?.instructions) |instruction| {
+        if (instruction.op == .array_clone) copies += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), copies);
+    try sema.ir.verify();
+    const c = try CEmitter.emit(std.testing.allocator, &sema.ir, null);
+    defer std.testing.allocator.free(c);
+    try std.testing.expect(std.mem.indexOf(u8, c, "typedef") != null);
+}
+
 test "printing lowers owned ordered arguments and operation spans" {
     var module = try Module.init(std.testing.allocator, "print.nov", "let id: (x: i32) -> i32 = x\nlet main: () -> void = @println(id(1), id(2), true)");
     var sema = lower(&module) catch |err| {

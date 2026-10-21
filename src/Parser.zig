@@ -1178,7 +1178,14 @@ fn parseSuffixExpr(self: *Parser) Error!Node.Index {
             continue;
         }
         const lparen = self.eatToken(.l_paren) orelse return res;
-        const params = try self.parseExprList(.r_paren, .expected_comma_after_arg);
+        const is_ascription = blk: {
+            if (self.nodes.items(.tag)[res] != .builtin_literal) break :blk false;
+            const start = self.token_starts[self.nodes.items(.main_token)[res]];
+            var lexer = Tokenizer.init(self.source[start..]);
+            const token = lexer.next();
+            break :blk std.mem.eql(u8, self.source[start..][0..token.end], "@as");
+        };
+        const params = try self.parseList(.r_paren, .expected_comma_after_arg, expectExpr, is_ascription);
         res = try switch (params) {
             .zero_or_one => |param| self.addNode(.{
                 .tag = .call_one,
@@ -1379,7 +1386,7 @@ fn parseFnProto(self: *Parser) Error!Node.Index {
     // We want the fn proto node to be before its children in the array. TODO: why?
     const fn_proto_index = try self.reserveNode(.fn_proto);
     errdefer self.unreserveNode(fn_proto_index);
-    const params = try self.parseList(.r_paren, .expected_comma_after_param, expectParamDecl);
+    const params = try self.parseList(.r_paren, .expected_comma_after_param, expectParamDecl, false);
     const ret_type = if (self.eatToken(.arrow) != null) try self.expectTypeExpr() else null_node;
 
     return switch (params) {
@@ -1444,7 +1451,7 @@ fn parseExprList(
     comptime ending_token_tag: Token.Tag,
     comptime error_tag: Ast.Error.Tag,
 ) Error!SmallSpan {
-    return self.parseList(ending_token_tag, error_tag, expectExpr);
+    return self.parseList(ending_token_tag, error_tag, expectExpr, false);
 }
 
 const SmallSpan = union(enum) {
@@ -1459,6 +1466,7 @@ fn parseList(
     comptime ending_token_tag: Token.Tag,
     comptime error_tag: Ast.Error.Tag,
     comptime parseFn: fn (*Parser) Error!Node.Index,
+    first_is_type: bool,
 ) Error!SmallSpan {
     if (self.eatToken(ending_token_tag) != null) {
         return .{ .zero_or_one = null_node };
@@ -1486,7 +1494,10 @@ fn parseList(
             if (!comma) {
                 try self.warn(error_tag);
             }
-            const item = try parseFn(self);
+            const item = if (first_is_type and self.scratch.items.len == scratch_top)
+                try self.expectTypeExpr()
+            else
+                try parseFn(self);
             try self.scratch.append(self.allocator, item);
             comma = false;
             continue :sw self.token_tags[self.tok_i];
@@ -1738,6 +1749,21 @@ fn testParseAllocationFailures(allocator: Allocator, source: [:0]const u8) !void
     defer ast.deinit(allocator);
     try std.testing.expectEqual(Token.Tag.eof, ast.tokens.items(.tag)[ast.tokens.len - 1]);
     try std.testing.expectEqual(source.len, ast.tokens.items(.start)[ast.lastToken(0)]);
+}
+
+test "ascription parses explicit array and function types in ordinary call views" {
+    const source = "let a = @as([]int, [])\nlet f = @as((n: int) -> int, id)\nlet s = \"{@as((int) -> int, id)(1)}\"\nlet other = @assert([1], true)";
+    var ast = try parse(std.testing.allocator, source);
+    defer ast.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    const array = ast.fullCall(ast.decl(ast.rootDecls()[0]).ast.init_node).?;
+    try std.testing.expectEqual(@as(usize, 2), array.ast.args.len);
+    try std.testing.expectEqual(Node.Tag.array_type, ast.nodes.items(.tag)[array.ast.args[0]]);
+    const function = ast.fullCall(ast.decl(ast.rootDecls()[1]).ast.init_node).?;
+    try std.testing.expect(ast.fullFnProto(function.ast.args[0]) != null);
+    try std.testing.expectEqualStrings("@as", ast.tokenSlice(ast.firstToken(function.ast.fn_expr)));
+    try std.testing.expectEqualStrings(")", ast.tokenSlice(ast.lastToken(ast.decl(ast.rootDecls()[1]).ast.init_node)));
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
 }
 
 test "interpolation preserves root EOF and original token indices" {

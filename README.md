@@ -176,11 +176,33 @@ let main: () -> void = @println(true, answer())
 ```
 
 This outputs `true -42` followed by a newline. Bare integer literals such as
-`@println(42)` still require a type context: use a typed global, local, parameter, or
-function result. Native aliases do not introduce bare-literal inference defaults.
+`@println(42)` still require a type context: use `@as(int, 42)`, a typed global,
+local, parameter, or function result. Native aliases do not introduce bare-literal inference defaults.
 Interpolated strings can be printed like any string; function values and void
 arguments remain unsupported for printing. The C backend
 continues to reject widths other than 8/16/32/64.
+
+`@as(T, value)` supplies an explicit expected type inside a function body:
+
+```nov
+let main: () -> void = {
+    @println("{@as(int, 1)}", @as(uint, 1))
+    let numbers = @as([]int, [1, 2])
+    @println(numbers[0])
+}
+```
+
+The first argument uses annotation type syntax, including supported array and
+function types; it is not evaluated as a value. The second argument is evaluated
+exactly once and checked against that canonical type. Boolean, string, function
+and void values are supported as well as contextual integer and array literals.
+The enclosing context must still match exactly: `@as(int, @as(uint, 1))` is an
+error, not a signedness conversion. There is no widening, narrowing, numeric cast,
+type-alias evaluation or general type-value inference. Ascription adds no array
+copy boundary; existing local, argument and return copy rules still apply.
+Interpolation accepts ascription within its existing bounded expression grammar
+(unnamed function parameter types work; quoted strings and named parameter colons
+inside interpolation remain unsupported).
 
 A runnable arithmetic example is [`examples/checkout.nov`](examples/checkout.nov):
 

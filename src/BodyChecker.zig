@@ -390,6 +390,19 @@ const Context = struct {
         return .{ .ty = ty, .annotation = if (full.ast.type_node != 0) self.module.tokenSpan(self.module.ast.firstToken(full.ast.type_node)) else null };
     }
 
+    fn isAscription(self: *Context, node: Ast.Node.Index) bool {
+        const ast = &self.module.ast;
+        return ast.nodes.items(.tag)[node] == .builtin_literal and
+            std.mem.eql(u8, ast.tokenSlice(ast.nodes.items(.main_token)[node]), "@as");
+    }
+
+    fn ascribedType(self: *Context, call: Ast.full.Call) Error!?Known {
+        if (call.ast.args.len != 2) return null;
+        const node = call.ast.args[0];
+        const ty = (try TypeResolver.resolve(self.module, self.ir, node)) orelse return null;
+        return .{ .ty = ty, .annotation = self.span(node) };
+    }
+
     fn printing(self: *Context, node: Ast.Node.Index) ?bool {
         const ast = &self.module.ast;
         if (ast.nodes.items(.tag)[node] != .builtin_literal) return null;
@@ -453,6 +466,11 @@ const Context = struct {
             },
             .call, .call_one => blk: {
                 const call = ast.fullCall(node).?;
+                if (self.isAscription(call.ast.fn_expr)) {
+                    const diagnostics_start = self.module.diagnostics.items.len;
+                    defer self.module.diagnostics.shrinkRetainingCapacity(diagnostics_start);
+                    break :blk try self.ascribedType(call);
+                }
                 if (self.printing(call.ast.fn_expr) != null) break :blk .{ .ty = try self.ir.internType(.void) };
                 const callee = (try self.probe(call.ast.fn_expr, depth + 1)) orelse break :blk null;
                 const ty = self.ir.getType(callee.ty).?;
@@ -630,6 +648,10 @@ const Context = struct {
             },
             .call, .call_one => blk: {
                 const call = ast.fullCall(node).?;
+                if (self.isAscription(call.ast.fn_expr)) {
+                    try emitter.values.put(emitter.allocator, node, try emitter.value(call.ast.args[1]));
+                    return true;
+                }
                 const args = try emitter.allocator.alloc(Ir.ValueId, call.ast.args.len);
                 for (call.ast.args, args) |arg, *value| value.* = try emitter.value(arg);
                 if (self.printing(call.ast.fn_expr)) |newline| break :blk .{ .print = .{ .args = args, .newline = newline } };
@@ -1412,6 +1434,12 @@ const Context = struct {
             },
             .call, .call_one => {
                 const call = ast.fullCall(node).?;
+                if (self.isAscription(call.ast.fn_expr)) {
+                    if (call.ast.args.len != 2) return self.fail(.argument_count_mismatch, node, null);
+                    const ascribed = (try self.ascribedType(call)) orelse return null;
+                    if (try self.expression(call.ast.args[1], ascribed, depth + 1) == null) return null;
+                    return self.fit(ascribed.ty, expected, node);
+                }
                 if (self.printing(call.ast.fn_expr) != null) {
                     var valid = true;
                     for (call.ast.args) |arg| {
@@ -1448,6 +1476,73 @@ const Context = struct {
         }
     }
 };
+
+test "ascription diagnoses arity types exact mismatches and interpolation source spans" {
+    const Case = struct { expression: []const u8, tag: Module.Diagnostic.Tag, token: []const u8 };
+    for ([_]Case{
+        .{ .expression = "@as()", .tag = .argument_count_mismatch, .token = "(" },
+        .{ .expression = "@as(int)", .tag = .argument_count_mismatch, .token = "(" },
+        .{ .expression = "@as(int, 1, 2)", .tag = .argument_count_mismatch, .token = "(" },
+        .{ .expression = "@as(missing, 1)", .tag = .unknown_type, .token = "missing" },
+        .{ .expression = "@as(true, 1)", .tag = .not_a_type, .token = "true" },
+        .{ .expression = "@as(1, 1)", .tag = .unsupported_type, .token = "1" },
+        .{ .expression = "@as(bool, 1)", .tag = .literal_type_mismatch, .token = "1" },
+        .{ .expression = "@as(int, true)", .tag = .literal_type_mismatch, .token = "true" },
+        .{ .expression = "@as(int, @as(uint, 1))", .tag = .expression_type_mismatch, .token = "(" },
+        .{ .expression = "@as(i16, @as(i8, 1))", .tag = .expression_type_mismatch, .token = "(" },
+        .{ .expression = "@as([]int, [true])", .tag = .literal_type_mismatch, .token = "true" },
+        .{ .expression = "@as((int) -> int, true)", .tag = .literal_type_mismatch, .token = "true" },
+        .{ .expression = "@as(void, true)", .tag = .literal_type_mismatch, .token = "true" },
+        .{ .expression = "@as(int, @print())", .tag = .expression_type_mismatch, .token = "(" },
+        .{ .expression = "@as(u128, 340282366920938463463374607431768211456)", .tag = .literal_out_of_range, .token = "340282366920938463463374607431768211456" },
+        .{ .expression = "@as(int, -@as(uint, 1))", .tag = .unsupported_body_expression, .token = "-" },
+        .{ .expression = "@as", .tag = .unsupported_body_expression, .token = "@as" },
+        .{ .expression = "\"é{@as(u8, 256)}\"", .tag = .literal_out_of_range, .token = "256" },
+        .{ .expression = "\"{@as(missing, 1)}\"", .tag = .unknown_type, .token = "missing" },
+    }) |case| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let f: () -> void = @println({s})", .{case.expression});
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "as-error.nov", source);
+        defer module.deinit();
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        try std.testing.expect(!sema.lowering_complete);
+        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+        const diagnostic = module.diagnostics.items[0];
+        try std.testing.expectEqual(case.tag, diagnostic.tag);
+        try std.testing.expectEqualStrings(case.token, module.sourceSlice(diagnostic.span).?);
+    }
+}
+
+test "ascription contextual bounds cover every integer width without defaults or conversions" {
+    for ([_][]const u8{ "i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "i128", "u128", "int", "uint" }) |name| {
+        const bits: u8 = if (std.mem.eql(u8, name, "int") or std.mem.eql(u8, name, "uint")) @intCast(Ir.native_pointer_bits) else try std.fmt.parseInt(u8, name[1..], 10);
+        const signed = name[0] == 'i';
+        const max: u128 = if (bits == 128 and !signed) std.math.maxInt(u128) else (@as(u128, 1) << @intCast(bits - @as(u8, @intFromBool(signed)))) - 1;
+        for ([_]bool{ false, true }) |overflow| {
+            if (overflow and max == std.math.maxInt(u128)) continue;
+            const source = try std.fmt.allocPrint(std.testing.allocator, "let f: () -> {s} = @as({s}, {d})", .{ name, name, max + @intFromBool(overflow) });
+            defer std.testing.allocator.free(source);
+            var module = try Module.init(std.testing.allocator, "as-bounds.nov", source);
+            defer module.deinit();
+            var sema = try Sema.analyzeFunctions(&module);
+            defer sema.deinit();
+            try std.testing.expectEqual(overflow, module.hasErrors());
+            if (overflow) try std.testing.expectEqual(Module.Diagnostic.Tag.literal_out_of_range, module.diagnostics.items[0].tag);
+        }
+        const minimum_magnitude: u128 = if (signed) @as(u128, 1) << @intCast(bits - 1) else 0;
+        for ([_]bool{ false, true }) |overflow| {
+            const source = try std.fmt.allocPrint(std.testing.allocator, "let f: () -> {s} = @as({s}, -{d})", .{ name, name, minimum_magnitude + @intFromBool(overflow) });
+            defer std.testing.allocator.free(source);
+            var module = try Module.init(std.testing.allocator, "as-minimum.nov", source);
+            defer module.deinit();
+            var sema = try Sema.analyzeFunctions(&module);
+            defer sema.deinit();
+            try std.testing.expectEqual(overflow, module.hasErrors());
+            if (overflow) try std.testing.expectEqual(Module.Diagnostic.Tag.literal_out_of_range, module.diagnostics.items[0].tag);
+        }
+    }
+}
 
 test "interpolation diagnoses names grammar types scopes and exact source bytes" {
     const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag, token: []const u8 };

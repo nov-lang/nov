@@ -1777,6 +1777,61 @@ test "identifier interpolation preserves chunks formatting roots loops matches a
     for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, string_interpolation_output, "", mode);
 }
 
+const ascription_program =
+    \\let id: (n: int) -> int = {@print("E")
+    \\    n}
+    \\let early: () -> int = @as(bool, {return 7})
+    \\let main: () -> void = {
+    \\    @println("{@as(int, 1)}", @as(uint, 1))
+    \\    let f = @as((int) -> int, id)
+    \\    @println(@as(int, f(2)), 3 |> @as((int) -> int, id), early())
+    \\    let mut a = @as([]int, [1, 2])
+    \\    let mut b = @as([]int, a)
+    \\    b[0] = 9
+    \\    @println(a[0], b[0], @as([]int, []).len)
+    \\    let text = "hé" + "!"
+    \\    @println("{@as(string, text)}", @as(bool, true))
+    \\    @println(@as(int, match true {true => 4
+    \\        _ => 5}), @as(int, loop {break 6}))
+    \\    loop {
+    \\        @as(void, {break})
+    \\    }
+    \\    let mut n = @as(int, 0)
+    \\    loop n < 1 : n += 1 {@as(void, {continue})}
+    \\    @as(void, @println(n))
+    \\}
+;
+
+test "ascription preserves exact values effects array copies terminals formatting and forced GC" {
+    const c = try arrayTestProgram(ascription_program);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "1 1\nEE2 3 7\n1 9 0\nhé! true\n4 6\n1\n", "", mode);
+}
+
+test "ascription compiler ownership survives every allocation failure" {
+    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{ascription_program});
+}
+
+test "ascribed interpolation prints every supported integer boundary" {
+    var source = std.Io.Writer.Allocating.init(test_gpa);
+    defer source.deinit();
+    var output = std.Io.Writer.Allocating.init(test_gpa);
+    defer output.deinit();
+    try source.writer.writeAll("let main: () -> void = {\n");
+    for ([_][]const u8{ "i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "int", "uint" }) |name| {
+        const bits: u7 = if (std.mem.eql(u8, name, "int") or std.mem.eql(u8, name, "uint")) @intCast(Ir.native_pointer_bits) else try std.fmt.parseInt(u7, name[1..], 10);
+        const signed = name[0] == 'i';
+        const min: i128 = if (signed) -(@as(i128, 1) << @intCast(bits - 1)) else 0;
+        const max: i128 = (@as(i128, 1) << @intCast(bits - @as(u7, @intFromBool(signed)))) - 1;
+        try source.writer.print("@println(\"{{@as({s}, {d})}}:{{@as({s}, {d})}}\")\n", .{ name, min, name, max });
+        try output.writer.print("{d}:{d}\n", .{ min, max });
+    }
+    try source.writer.writeAll("}\n");
+    const c = try arrayTestProgram(source.written());
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, output.written(), "", mode);
+}
+
 test "expression interpolation reuses calls scopes ordering and rooted temporaries" {
     const c = try arrayTestProgram(
         \\let echo: (n: int) -> string = {@print(n)

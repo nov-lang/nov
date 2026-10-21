@@ -140,7 +140,7 @@ fn checkSupported(ast: Ast) !void {
             .field_access => if (!std.mem.eql(u8, ast.tokenSlice(data.rhs), "len")) return error.UnsupportedSyntax,
             .builtin_literal => {
                 const name = ast.tokenSlice(main);
-                if (!std.mem.eql(u8, name, "@print") and !std.mem.eql(u8, name, "@println"))
+                if (!std.mem.eql(u8, name, "@print") and !std.mem.eql(u8, name, "@println") and !std.mem.eql(u8, name, "@as"))
                     return error.UnsupportedSyntax;
             },
             .@"break" => if (data.lhs != 0) return error.UnsupportedSyntax,
@@ -344,6 +344,18 @@ test "unsupported syntax fails closed including nested expressions" {
         if (ast.errors.len != 0) std.debug.print("invalid unsupported test fixture: {s}\n", .{source});
         try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
         try std.testing.expectError(error.UnsupportedSyntax, format(std.testing.allocator, source));
+    }
+}
+
+test "ascription preserves type syntax comments nested calls interpolation and allocation cleanup" {
+    for ([_][:0]const u8{
+        "let a=@as(\n[]int, ; type\n[1,2],)\nlet f=@as((n:int)->int,id)\nlet s=\"{@as(int, 1)}\"",
+        "let n=@as(int,@as(int,1))\nlet f=@as(()->void,unit)",
+    }) |source| {
+        const result = try format(std.testing.allocator, source);
+        defer std.testing.allocator.free(result);
+        try expectFormatted(source, result);
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{source});
     }
 }
 
