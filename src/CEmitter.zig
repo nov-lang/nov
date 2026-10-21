@@ -1045,7 +1045,7 @@ const match_pipes_output = "55\nFizzBuzz Fizz Buzz number\nCA7\n8\nCA12 13 14 15
 test "match and pipes preserve recursion effects exits exact results formatting and forced GC" {
     const c = try arrayTestProgram(match_pipes);
     defer test_gpa.free(c);
-    for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, match_pipes_output, "", mode);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, match_pipes_output, "", mode);
 }
 
 test "match allocates only in the selected prong and reports runtime OOM" {
@@ -1061,7 +1061,7 @@ test "match allocates only in the selected prong and reports runtime OOM" {
             c,
         });
         defer test_gpa.free(exhausted);
-        for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(exhausted, "typedef int nonempty_translation_unit;", if (allocate) 1 else 0, if (allocate) "" else "ok\n", if (allocate) "panic: GC allocation failed\n" else "", mode);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(exhausted, "typedef int nonempty_translation_unit;", if (allocate) 1 else 0, if (allocate) "" else "ok\n", if (allocate) "panic: GC allocation failed\n" else "", mode);
     }
 }
 
@@ -1134,7 +1134,7 @@ const array_membership_output = "true true true false\ntrue false false false\nL
 test "array membership preserves exact equality effects controls formatting and forced GC" {
     const c = try arrayTestProgram(array_membership);
     defer test_gpa.free(c);
-    for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, array_membership_output, "", mode);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, array_membership_output, "", mode);
 }
 
 test "array membership supports every fixed and native scalar element type" {
@@ -1150,7 +1150,7 @@ test "array membership supports every fixed and native scalar element type" {
     try source.writer.writeAll("}\n");
     const c = try arrayTestProgram(source.written());
     defer test_gpa.free(c);
-    for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "true false false\n" ** 11, "", mode);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "true false false\n" ** 11, "", mode);
 }
 
 test "array membership scan allocates nothing ignores capacity and stops at first match" {
@@ -1183,7 +1183,7 @@ test "array membership scan allocates nothing ignores capacity and stops at firs
         main,
     });
     defer test_gpa.free(c);
-    for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "", "", mode);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "", "", mode);
 }
 
 test "array membership helpers are demand only including nested callback signatures" {
@@ -1269,7 +1269,7 @@ const range_output = "0\n1\n2\n-2\n-1\n0\n4 0 0\nSE0123 1 0\niteration=0!  itera
 test "ranges preserve defaults snapshots controls fresh values formatting and GC roots" {
     const c = try arrayTestProgram(range_program);
     defer test_gpa.free(c);
-    for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, range_output, "", mode);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, range_output, "", mode);
 }
 
 test "ranges are finite at every integer maximum and accept grouped minimum bounds" {
@@ -1300,7 +1300,7 @@ test "ranges are finite at every integer maximum and accept grouped minimum boun
     defer test_gpa.free(formatted_c);
     try std.testing.expectEqualStrings(c, formatted_c);
     try std.testing.expect(std.mem.indexOf(u8, c, "nov_rt_heap") == null);
-    for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(c, "void nov_main(void); int main(void) {nov_main(); return 0;}", 0, output.written(), "", mode);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "void nov_main(void); int main(void) {nov_main(); return 0;}", 0, output.written(), "", mode);
 }
 
 test "range endpoint controls belong to the enclosing scope and snapshots precede effects" {
@@ -1343,7 +1343,7 @@ test "range endpoint controls belong to the enclosing scope and snapshots preced
     ;
     const c = try arrayTestProgram(source);
     defer test_gpa.free(c);
-    for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "01 2 17 18 42\n123 2 99 0\nmanaged result\n", "", mode);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "01 2 17 18 42\n123 2 99 0\nmanaged result\n", "", mode);
 }
 
 const terminal_range_bounds =
@@ -1362,7 +1362,7 @@ const terminal_range_bounds =
 test "range endpoint controls do not require an inferred iteration type" {
     const c = try arrayTestProgram(terminal_range_bounds);
     defer test_gpa.free(c);
-    for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "7 8 9 ab\n3\n", "", mode);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "7 8 9 ab\n3\n", "", mode);
 }
 
 test "range lowering and formatting survive every allocation failure" {
@@ -1378,7 +1378,7 @@ test "range allocating bodies report runtime OOM" {
         c,
     });
     defer test_gpa.free(exhausted);
-    for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(exhausted, "typedef int nonempty_translation_unit;", 1, "", "panic: GC allocation failed\n", mode);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(exhausted, "typedef int nonempty_translation_unit;", 1, "", "panic: GC allocation failed\n", mode);
 }
 
 const string_interpolation =
@@ -1417,7 +1417,7 @@ const string_interpolation_output = "Atrue:false:0:{é\x00😀}:Z 7 true/false\n
 test "identifier interpolation preserves chunks formatting roots loops matches and returns" {
     const c = try arrayTestProgram(string_interpolation);
     defer test_gpa.free(c);
-    for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, string_interpolation_output, "", mode);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, string_interpolation_output, "", mode);
 }
 
 test "interpolation decimal formatting is exact at every supported integer boundary" {
@@ -1437,7 +1437,7 @@ test "interpolation decimal formatting is exact at every supported integer bound
     try source.writer.writeAll("}\n");
     const c = try arrayTestProgram(source.written());
     defer test_gpa.free(c);
-    for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, output.written(), "", mode);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, output.written(), "", mode);
 }
 
 test "interpolation escapes and inserted strings never become syntax or normalize" {
@@ -1467,7 +1467,7 @@ test "interpolation allocations panic on exhaustion while bool and string sharin
             c,
         });
         defer test_gpa.free(exhausted);
-        for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(exhausted, "typedef int nonempty_translation_unit;", if (case.allocates) 1 else 0, case.output, if (case.allocates) "panic: GC allocation failed\n" else "", mode);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(exhausted, "typedef int nonempty_translation_unit;", if (case.allocates) 1 else 0, case.output, if (case.allocates) "panic: GC allocation failed\n" else "", mode);
     }
 }
 
@@ -1535,7 +1535,7 @@ const string_equality_output = "true true false true\ntrue true true true\ntrue 
 test "string equality compares bytes and preserves effects terminal paths formatting and GC roots" {
     const c = try arrayTestProgram(string_equality);
     defer test_gpa.free(c);
-    for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, string_equality_output, "", mode);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, string_equality_output, "", mode);
 }
 
 test "string equality library is allocation free and handles null empty views" {
@@ -1556,7 +1556,7 @@ test "string equality library is allocation free and handles null empty views" {
             "nov_gc_shutdown(&nov_rt_heap); return 0; }\n",
     });
     defer test_gpa.free(c);
-    for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "", "", mode);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "", "", mode);
 }
 
 test "string equality helper is emitted only on demand" {
@@ -1613,7 +1613,7 @@ const string_compound_output = "hé\x00hé\x00 8 hé\x00 4\nhé\x00hé\x00😀\x
 test "string compounds capture before RHS and preserve aliases terminal effects and GC roots" {
     const c = try arrayTestProgram(string_compound);
     defer test_gpa.free(c);
-    for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, string_compound_output, "", mode);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, string_compound_output, "", mode);
 }
 
 test "string parameters returns and assignments share backing without allocation" {
@@ -1720,7 +1720,7 @@ test "string length overflow panics before touching invalid backing in both mode
             "\nint main(void) { (void)nov_f((nov_string){NULL, NULL, UINTPTR_MAX}, (nov_string){NULL, NULL, 1}); return 99; }\n",
         });
         defer test_gpa.free(c);
-        for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 1, "", "panic: string size overflow\n", mode);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 1, "", "panic: string size overflow\n", mode);
     }
 }
 
@@ -1750,7 +1750,7 @@ const inferred_output = "7\n8\n9\n7 8 8 9 3 true\n";
 test "inferred locals preserve evaluation order snapshots copies and GC roots" {
     const c = try arrayTestProgram(inferred_example);
     defer test_gpa.free(c);
-    for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, inferred_output, "", mode);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, inferred_output, "", mode);
 }
 
 const inferred_arrays =
@@ -1790,13 +1790,13 @@ const inferred_arrays_output = "7\n8\n0 7 8 1 9 4\ntrue false 2\n3\n4\n9 4\n2\n2
 test "inferred array elements execute once in order with allocation control exits and GC" {
     const c = try arrayTestProgram(inferred_arrays);
     defer test_gpa.free(c);
-    for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, inferred_arrays_output, "", mode);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, inferred_arrays_output, "", mode);
 }
 
 test "scalar arrays copy grow and return with every allocation collecting" {
     const c = try arrayTestProgram(array_example);
     defer test_gpa.free(c);
-    for ([_][]const u8{ "-O0", "-O2" }) |mode| {
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| {
         try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "3 30 30 6\n454 15\n99 15 4\nfalse true 2\n0\n", "", mode);
     }
 }
@@ -1827,7 +1827,7 @@ test "array element compound arithmetic wraps at every approved width" {
     try source.writer.writeAll("}");
     const c = try arrayTestProgram(source.written());
     defer test_gpa.free(c);
-    for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, output.written(), "", mode);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, output.written(), "", mode);
 }
 
 const array_compound_effects =
@@ -1881,7 +1881,7 @@ const array_compound_output = "19010 23 2 20 1\n12 23\n12 5 2\n3 9 7\n9 5 88 12 
 test "array compound stores share one pre-index snapshot and skip stores on terminal paths" {
     const c = try arrayTestProgram(array_compound_effects);
     defer test_gpa.free(c);
-    for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, array_compound_output, "", mode);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, array_compound_output, "", mode);
 }
 
 test "array compound bounds precede RHS while plain replacement bounds follow RHS" {
@@ -1892,7 +1892,7 @@ test "array compound bounds precede RHS while plain replacement bounds follow RH
             const c = try arrayTestProgram(source);
             defer test_gpa.free(c);
             const plain = std.mem.eql(u8, op, "=");
-            for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", if (plain) 0 else 1, if (plain) "truefalse" else "true", if (plain) "" else "panic: array index out of bounds\n", mode);
+            for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", if (plain) 0 else 1, if (plain) "truefalse" else "true", if (plain) "" else "panic: array index out of bounds\n", mode);
         }
     }
     const plain = try arrayTestProgram("let main: () -> void = {let mut a: []int = []\na[0] = {@print(true)\n1}}");
@@ -1906,7 +1906,7 @@ test "array compound division and remainder by zero panic after RHS effects" {
         defer test_gpa.free(source);
         const c = try arrayTestProgram(source);
         defer test_gpa.free(c);
-        for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 1, "true", if (std.mem.eql(u8, op, "/=")) "panic: division by zero\n" else "panic: remainder by zero\n", mode);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 1, "true", if (std.mem.eql(u8, op, "/=")) "panic: division by zero\n" else "panic: remainder by zero\n", mode);
     }
 }
 
@@ -1993,7 +1993,7 @@ test "array negative bounds and minimum native index panic identically in both m
         defer test_gpa.free(source);
         const c = try arrayTestProgram(source);
         defer test_gpa.free(c);
-        for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 1, "", "panic: array index out of bounds\n", mode);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 1, "", "panic: array index out of bounds\n", mode);
     }
 }
 
@@ -2023,14 +2023,14 @@ test "array allocation failure retries preserve roots and shutdown frees backing
             "\n#undef main\nint main(void) { int result = test_main(); assert(!outstanding); return result; }\n",
         });
         defer test_gpa.free(injected);
-        for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(injected, "typedef int nonempty_translation_unit;", 0, output, "", mode);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(injected, "typedef int nonempty_translation_unit;", 0, output, "", mode);
         const exhausted = try std.mem.concat(test_gpa, u8, &.{
             "#include <stdlib.h>\nstatic void *test_malloc(size_t n) { (void)n; return NULL; }\n" ++
                 "#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n",
             c,
         });
         defer test_gpa.free(exhausted);
-        for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(exhausted, "typedef int nonempty_translation_unit;", 1, if (std.mem.eql(u8, source, inferred_example)) "7\n8\n" else if (std.mem.eql(u8, source, inferred_arrays)) "7\n" else if (std.mem.eql(u8, source, else_loops)) "false true false\n42 42 5\nexhausted 5 3 3\ncondition continuation body\n10 11 12 14\n3 7\n31 32 3\ntrue\n" else "", "panic: GC allocation failed\n", mode);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(exhausted, "typedef int nonempty_translation_unit;", 1, if (std.mem.eql(u8, source, inferred_example)) "7\n8\n" else if (std.mem.eql(u8, source, inferred_arrays)) "7\n" else if (std.mem.eql(u8, source, else_loops)) "false true false\n42 42 5\nexhausted 5 3 3\ncondition continuation body\n10 11 12 14\n3 7\n31 32 3\ntrue\n" else "", "panic: GC allocation failed\n", mode);
     }
 }
 
@@ -2103,7 +2103,7 @@ const continuation_output = "1021035 3 3\n7 8\n2\n4\n";
 test "continuation loops route nested branch short circuit and RHS controls in strict C11" {
     const c = try arrayTestProgram(continuation_loops);
     defer test_gpa.free(c);
-    for ([_][]const u8{ "-O0", "-O2" }) |mode|
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
         try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, continuation_output, "", mode);
 }
 
@@ -2204,7 +2204,7 @@ test "break operands infer owner target controls before their eventual values" {
         defer test_gpa.free(source);
         const c = try emitSource(source, null);
         defer test_gpa.free(c);
-        for ([_][]const u8{ "-O0", "-O2" }) |mode|
+        for ([_][]const u8{ "-O0", "-O3" }) |mode|
             try compileAndRunMode(c, "void nov_main(void);\nint main(void) { nov_main(); return 0; }", 0, "7\n", "", mode);
     }
 }
@@ -2212,7 +2212,7 @@ test "break operands infer owner target controls before their eventual values" {
 test "conditional loop else results exhaust break return and target parent controls" {
     const c = try arrayTestProgram(else_loops);
     defer test_gpa.free(c);
-    for ([_][]const u8{ "-O0", "-O2" }) |mode|
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
         try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, else_loop_output, "", mode);
 }
 
@@ -2296,7 +2296,7 @@ const value_loop_output = "true 42 5\n7 2 1 8\n9 3\ncd\n3 4 4 2 2\nabef abef\n3 
 test "value loops merge scalar function and managed results with every allocation collecting" {
     const c = try arrayTestProgram(value_loops);
     defer test_gpa.free(c);
-    for ([_][]const u8{ "-O0", "-O2" }) |mode|
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
         try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, value_loop_output, "", mode);
 }
 
@@ -2314,7 +2314,7 @@ test "loop exhaustion strings share backing without allocation and terminal fall
             "if (nov_rt_heap.live_objects != 1 || nov_rt_heap.frames) return 2; nov_gc_shutdown(&nov_rt_heap); return 0; }\n",
     });
     defer test_gpa.free(c);
-    for ([_][]const u8{ "-O0", "-O2" }) |mode|
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
         try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "", "", mode);
 }
 
@@ -2332,7 +2332,7 @@ test "value loop string breaks share backing without allocating" {
             "nov_gc_collect(&nov_rt_heap); if (nov_rt_heap.live_objects) return 3; nov_gc_shutdown(&nov_rt_heap); return 0; }\n",
     });
     defer test_gpa.free(c);
-    for ([_][]const u8{ "-O0", "-O2" }) |mode|
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
         try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "", "", mode);
 }
 
@@ -2342,7 +2342,7 @@ test "loop continuations and value results execute before formatting" {
         defer test_gpa.free(library);
         const c = try collectingTestProgram(library);
         defer test_gpa.free(c);
-        for ([_][]const u8{ "-O0", "-O2" }) |mode|
+        for ([_][]const u8{ "-O0", "-O3" }) |mode|
             try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, output, "", mode);
     }
 }
@@ -2388,7 +2388,7 @@ test "unconditional loops execute finite controls returns and managed roots afte
     for ([_][]const u8{ unconditional_loops, formatted }) |source| {
         const c = try arrayTestProgram(source);
         defer test_gpa.free(c);
-        for ([_][]const u8{ "-O0", "-O2" }) |mode|
+        for ([_][]const u8{ "-O0", "-O3" }) |mode|
             try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, unconditional_output, "", mode);
     }
 }
@@ -3406,7 +3406,7 @@ fn compileAndRun(c_source: []const u8, harness: []const u8) !void {
 }
 
 fn compileAndRunExpected(c_source: []const u8, harness: []const u8, exit_code: u8, stdout: []const u8, stderr: []const u8) !void {
-    return compileAndRunMode(c_source, harness, exit_code, stdout, stderr, "-O2");
+    return compileAndRunMode(c_source, harness, exit_code, stdout, stderr, "-O3");
 }
 
 fn compileAndRunMode(c_source: []const u8, harness: []const u8, exit_code: u8, stdout: []const u8, stderr: []const u8, mode: []const u8) !void {

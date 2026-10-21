@@ -77,7 +77,7 @@ pub fn build(b: *std.Build) void {
 }
 
 fn addGcTests(b: *std.Build, test_step: *std.Build.Step) void {
-    const compile = b.addSystemCommand(&.{ b.graph.zig_exe, "cc", "-std=c11", "-Wall", "-Wextra", "-Wpedantic", "-Werror", "-O2", "-fsanitize=undefined", "-fno-sanitize-recover=all" });
+    const compile = b.addSystemCommand(&.{ b.graph.zig_exe, "cc", "-std=c11", "-Wall", "-Wextra", "-Wpedantic", "-Werror", "-O3", "-fsanitize=undefined", "-fno-sanitize-recover=all" });
     compile.addFileArg(b.path("src/runtime/gc_test.c"));
     compile.addArg("-o");
     const binary = compile.addOutputFileArg("gc-test");

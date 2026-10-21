@@ -105,7 +105,7 @@ may be defined together before inclusion for testing; they must be malloc/free
 compatible, fundamentally aligned and nonreentrant. No hook may reenter the heap.
 
 `zig build test` compiles/runs `gc_test.c` with pinned `zig cc`, strict C11 warnings,
-`-O2`, and fatal UBSan, including failure-injected allocations and panic subprocess
+`-O3`, and fatal UBSan, including failure-injected allocations and panic subprocess
 checks. GCC can run the same harness with the identical flags. The harness counts
 outstanding host allocations to check deterministic cleanup.
 
@@ -146,7 +146,7 @@ heap cleanup as above. Library emission's host owns lifetime/shutdown; the manag
 C ABI is internal, not an approved FFI. Single-threading and no foreign unwinding
 across frames remain requirements. Tests run generated programs with collection
 on **every** allocation, injected allocation failures/retries, strict C11/UBSan,
--O0 and -O2 bounds checks, argument-order effects, nested loops and early returns.
+-O0 and -O3 bounds checks, argument-order effects, nested loops and early returns.
 
 Writable length (especially growth initialization), slices/invalidation, nested
 or pointer elements, explicit aliases and managed FFI remain deferred.

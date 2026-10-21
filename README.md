@@ -96,7 +96,7 @@ nov file.nov                         # same as nov build file.nov
 nov build file.nov                    # ./file (file.exe on Windows)
 nov file.nov -o path/to/program       # --output is equivalent
 nov run file.nov --debug              # -O0 -g
-nov build file.nov --release          # -O2 (also the default)
+nov build file.nov --release          # -O3 (also the default)
 nov file.nov --cc /path/to/cc
 
 nov check --semantic examples/fibo.nov examples/fizzbuzz.nov
@@ -131,7 +131,7 @@ Missing executables advance to the next candidate, including missing explicit or
 environment selections. An executable that cannot start for another reason, or
 starts and fails, stops discovery and fails the command. Empty environment values
 are ignored; an empty `--cc` is an error. Every invocation uses `-std=c11`;
-default/release builds add `-O2`, while debug builds add `-O0 -g`. These select C
+default/release builds add `-O3`, while debug builds add `-O0 -g`. These select C
 optimization/debug information only, not different Nov semantics: wrapping
 arithmetic, panic checks, output, and exit behavior stay identical in both modes.
 No shell is involved. Compiler diagnostics (including compiler stdout) go to

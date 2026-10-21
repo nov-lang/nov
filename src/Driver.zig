@@ -35,7 +35,7 @@ pub fn compile(io: std.Io, discovery: Discovery, source: []const u8, output: []c
             count += 1;
         }
         arguments[count] = "-std=c11";
-        arguments[count + 1] = if (discovery.mode == .debug) "-O0" else "-O2";
+        arguments[count + 1] = if (discovery.mode == .debug) "-O0" else "-O3";
         count += 2;
         if (discovery.mode == .debug) {
             arguments[count] = "-g";
@@ -147,7 +147,7 @@ test "compiler discovery uses literal executables in approved order and exact fl
     defer allocator.free(missing);
     for ([_]Mode{ .release, .debug }) |mode| {
         try fakeCompiler(tmp.dir, "compiler with spaces;literal", if (mode == .release)
-            "#!/bin/sh\n[ \"$#\" = 5 ] && [ \"$1\" = -std=c11 ] && [ \"$2\" = -O2 ] && [ \"$3\" = 'source with spaces.c' ] && [ \"$4\" = -o ] && [ \"$5\" = 'output;literal' ]\n"
+            "#!/bin/sh\n[ \"$#\" = 5 ] && [ \"$1\" = -std=c11 ] && [ \"$2\" = -O3 ] && [ \"$3\" = 'source with spaces.c' ] && [ \"$4\" = -o ] && [ \"$5\" = 'output;literal' ]\n"
         else
             "#!/bin/sh\n[ \"$#\" = 6 ] && [ \"$1\" = -std=c11 ] && [ \"$2\" = -O0 ] && [ \"$3\" = -g ] && [ \"$4\" = 'source with spaces.c' ] && [ \"$5\" = -o ] && [ \"$6\" = 'output;literal' ]\n");
         for (0..4) |selected| {
@@ -162,7 +162,7 @@ test "compiler discovery uses literal executables in approved order and exact fl
             try std.testing.expectEqualStrings("", diagnostics.written());
         }
         try fakeCompiler(tmp.dir, "zig", if (mode == .release)
-            "#!/bin/sh\n[ \"$#\" = 6 ] && [ \"$1\" = cc ] && [ \"$2\" = -std=c11 ] && [ \"$3\" = -O2 ] && [ \"$4\" = source ] && [ \"$5\" = -o ] && [ \"$6\" = output ]\n"
+            "#!/bin/sh\n[ \"$#\" = 6 ] && [ \"$1\" = cc ] && [ \"$2\" = -std=c11 ] && [ \"$3\" = -O3 ] && [ \"$4\" = source ] && [ \"$5\" = -o ] && [ \"$6\" = output ]\n"
         else
             "#!/bin/sh\n[ \"$#\" = 7 ] && [ \"$1\" = cc ] && [ \"$2\" = -std=c11 ] && [ \"$3\" = -O0 ] && [ \"$4\" = -g ] && [ \"$5\" = source ] && [ \"$6\" = -o ] && [ \"$7\" = output ]\n");
         const zig = try std.fs.path.join(allocator, &.{ root, "zig" });

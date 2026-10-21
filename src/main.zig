@@ -18,7 +18,7 @@ const params = clap.parseParamsComptime(
     \\--exclude <str>...      Exclude a literal file/directory path (fmt only).
     \\--semantic             Check the bounded semantic/lowering subset (check only).
     \\--debug                Compile with -O0 -g (build/run only).
-    \\--release              Compile with -O2 (default; build/run only).
+    \\--release              Compile with -O3 (default; build/run only).
     \\--cc <str>             C compiler executable (build/run only).
     \\-o, --output <str>      Output executable path (build only).
     \\<arg>...
@@ -510,7 +510,7 @@ test "format executable programs without changing generated C or runtime behavio
         defer allocator.free(directory);
         const path = try std.fs.path.join(allocator, &.{ directory, executable });
         defer allocator.free(path);
-        for ([_][]const u8{ "-O0", "-O2" }) |mode| {
+        for ([_][]const u8{ "-O0", "-O3" }) |mode| {
             var argv: std.ArrayList([]const u8) = .empty;
             defer argv.deinit(allocator);
             if (zig_exe) |zig| try argv.appendSlice(allocator, &.{ zig, "cc" }) else try argv.append(allocator, "cc");
@@ -838,7 +838,7 @@ test "build and run integrate discovery, preserve outputs, and clean temporary f
         defer allocator.free(name);
         const script = try std.fmt.allocPrint(
             allocator,
-            "#!/bin/sh\n[ \"$1\" = -std=c11 ] && [ \"$2\" = -O2 ] && [ -f \"$3\" ] && [ \"$4\" = -o ] || exit 90\nprintf '#!/bin/sh\\nexit {d}\\n' > \"$5\"\n/bin/chmod 700 \"$5\"\n",
+            "#!/bin/sh\n[ \"$1\" = -std=c11 ] && [ \"$2\" = -O3 ] && [ -f \"$3\" ] && [ \"$4\" = -o ] || exit 90\nprintf '#!/bin/sh\\nexit {d}\\n' > \"$5\"\n/bin/chmod 700 \"$5\"\n",
             .{37 + index},
         );
         defer allocator.free(script);
