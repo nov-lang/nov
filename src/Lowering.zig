@@ -236,6 +236,57 @@ test "exhaustion controls belong to parent loops and IR outlives the source" {
     try sema.ir.verify();
 }
 
+test "range snapshots private counter and iteration values retain verified ownership" {
+    var sema = owned: {
+        var module = try Module.init(std.testing.allocator, "range.nov",
+            \\let f: (a: i8, b: i8) -> void = {
+            \\    loop i in a..b {let mut local: i8 = i
+            \\        local += 1
+            \\        if i == 0 {continue}
+            \\    }
+            \\}
+        );
+        defer module.deinit();
+        var result = try lower(&module);
+        errdefer result.deinit();
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expect(result.lowering_complete);
+        break :owned result;
+    };
+    defer sema.deinit();
+    try sema.ir.verify();
+    const body = sema.ir.functions.items[0].body.?;
+    const instructions = @constCast(body.instructions);
+    var owner: usize = 0;
+    for (instructions, 0..) |instruction, i| {
+        if (instruction.op == .loop) owner = i;
+        try std.testing.expect(instruction.span.end > instruction.span.start);
+    }
+    const loop = instructions[owner].op.loop;
+    const counter = instructions[loop.condition_start].op.local_load;
+    try std.testing.expect(@intFromEnum(counter) < loop.condition_start);
+    try std.testing.expect(instructions[@intFromEnum(counter)].op == .local_slot);
+    const condition = @intFromEnum(loop.condition);
+    const endpoint = instructions[condition].op.binary.rhs;
+    try std.testing.expect(@intFromEnum(endpoint) < @intFromEnum(counter));
+    try std.testing.expect(instructions[loop.body_start].op == .local_load);
+    const private_current: Ir.ValueId = @enumFromInt(loop.body_start);
+    // A body-private snapshot must not leak into a sibling continuation,
+    // and a body-local slot cannot replace the enclosing counter identity.
+    const continuation = loop.continuation_start.?;
+    const saved = instructions[continuation];
+    instructions[continuation].op = .{ .unary = .{ .op = .negate, .operand = private_current } };
+    try std.testing.expectError(error.InvalidValueId, sema.ir.verify());
+    instructions[continuation] = saved;
+    instructions[continuation].op.local_load = @enumFromInt(loop.body_start + 1);
+    try std.testing.expectError(error.InvalidValueId, sema.ir.verify());
+    instructions[continuation] = saved;
+    instructions[condition].op.binary.rhs = @enumFromInt(owner);
+    try std.testing.expectError(error.InvalidValueId, sema.ir.verify());
+    instructions[condition].op.binary.rhs = endpoint;
+    try sema.ir.verify();
+}
+
 test "loop continuation regions and value breaks outlive source storage" {
     var module = try Module.init(std.testing.allocator, "loop-values.nov",
         \\let f: (n: int) -> []int = {

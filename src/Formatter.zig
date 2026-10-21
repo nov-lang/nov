@@ -7,7 +7,7 @@ const Tokenizer = @import("Tokenizer.zig");
 /// local blocks, if/else, loops with optional conditions/continuations, returns,
 /// unlabeled loop controls (including value-bearing breaks),
 /// direct identifier assignments, scalar array types/literals/indexing/.len,
-/// membership (`in`, not ranges), scalar match/prongs, unary pipes,
+/// membership, bounded exclusive integer range loops, scalar match/prongs, unary pipes,
 /// and indexed assignments to direct identifiers.
 /// Formatting is syntactic,
 /// not a scope, mutability, or type check. Preserves line/doc comments and tokens.
@@ -65,6 +65,7 @@ fn checkSupported(ast: Ast) !void {
         .match_case_one,
         .match_case,
         .function_pipe,
+        .loop_range,
         .loop_condition,
         .loop_cont,
         .loop_else,
@@ -370,17 +371,17 @@ test "executable local blocks round trip" {
 
 test "every unsupported AST tag is rejected before rendering" {
     const supported = [_]Ast.Node.Tag{
-        .root,                 .decl,           .identifier,       .number_literal,   .char_literal,      .string_literal,
-        .add,                  .sub,            .mul,              .div,              .mod,               .shl,
-        .shr,                  .bit_and,        .bit_or,           .bit_xor,          .equal_equal,       .bang_equal,
-        .less_than,            .less_or_equal,  .greater_than,     .greater_or_equal, .bool_and,          .bool_or,
-        .negation,             .bool_not,       .bit_not,          .fn_proto_one,     .fn_proto,          .call_one,
-        .call_one_comma,       .call,           .call_comma,       .block_two,        .block_two_newline, .block,
-        .block_newline,        .@"if",          .if_else,          .loop_condition,   .loop_cont,         .loop_else,
-        .@"return",            .@"break",       .@"continue",      .assign,           .assign_add,        .assign_sub,
-        .assign_mul,           .assign_div,     .assign_mod,       .builtin_literal,  .array_type,        .array_init_two,
-        .array_init_two_comma, .array_init,     .array_init_comma, .array_access,     .field_access,      .in,
-        .match,                .match_case_one, .match_case,       .function_pipe,
+        .root,           .decl,                 .identifier,     .number_literal,   .char_literal,      .string_literal,
+        .add,            .sub,                  .mul,            .div,              .mod,               .shl,
+        .shr,            .bit_and,              .bit_or,         .bit_xor,          .equal_equal,       .bang_equal,
+        .less_than,      .less_or_equal,        .greater_than,   .greater_or_equal, .bool_and,          .bool_or,
+        .negation,       .bool_not,             .bit_not,        .fn_proto_one,     .fn_proto,          .call_one,
+        .call_one_comma, .call,                 .call_comma,     .block_two,        .block_two_newline, .block,
+        .block_newline,  .@"if",                .if_else,        .loop_range,       .loop_condition,    .loop_cont,
+        .loop_else,      .@"return",            .@"break",       .@"continue",      .assign,            .assign_add,
+        .assign_sub,     .assign_mul,           .assign_div,     .assign_mod,       .builtin_literal,   .array_type,
+        .array_init_two, .array_init_two_comma, .array_init,     .array_init_comma, .array_access,      .field_access,
+        .in,             .match,                .match_case_one, .match_case,       .function_pipe,
     };
     var ast = try Parser.parse(std.testing.allocator, "let x=1\n");
     defer ast.deinit(std.testing.allocator);
@@ -559,6 +560,23 @@ test "loop continuations and value breaks are idempotent" {
         defer std.testing.allocator.free(formatted);
         try expectFormatted(source, formatted);
     }
+}
+
+test "range headers preserve comments newlines tokens and AST on the first pass" {
+    for ([_][:0]const u8{
+        "let f: ()=loop i in 0..10 {@println(i)}",
+        "let f: ()=loop _ in ; lower\n-{{128}}.. ; upper\n0 {break} ; done",
+        "let f: ()=loop i in {let a: uint = 0\na}..{limit()} {loop j in 0..i {continue}}",
+        "let f: ()=loop i in begin(; argument\n0)..end(10,) {; body\n@println(i)}",
+    }) |source| {
+        const formatted = try format(std.testing.allocator, source);
+        defer std.testing.allocator.free(formatted);
+        try expectFormatted(source, formatted);
+    }
+}
+
+test "range formatting survives every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{"let f: ()=loop _ in ; lower\n-{{128}}.. ; upper\n0 {loop i in 0..2 {continue}}"});
 }
 
 test "bare block continuations format without accepting genuine labels" {

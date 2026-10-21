@@ -621,11 +621,30 @@ fn parseElseExpr(self: *Parser) Error!Node.Index {
 ///     <- (AMPERSAND? IDENTIFIER)+ KEYWORD_in (Expr (DOT2 Expr?)?)+
 ///      / Expr (COLON AssignExpr)?
 /// Condition-and-block and unconditional block forms, with optional continuations,
-/// and conditional exhaustion branches are enabled. Iteration and labels remain unsupported.
+/// and conditional exhaustion branches are enabled. Bounded exclusive integer
+/// ranges have a dedicated header; general iteration and labels remain unsupported.
 fn parseLoopExpr(self: *Parser) Error!Node.Index {
     const loop_token = self.assertToken(.keyword_loop);
     if (loop_token >= 2 and self.token_tags[loop_token - 1] == .colon or self.token_tags[self.tok_i] == .eof)
         return self.failMsg(.{ .tag = .unsupported_loop, .token = loop_token });
+    if (self.token_tags[self.tok_i] == .identifier and self.token_tags[self.tok_i + 1] == .keyword_in) {
+        const binding = try self.addNode(.{ .tag = .identifier, .main_token = self.nextToken(), .data = undefined });
+        _ = self.nextToken();
+        const start = try self.parseExprPrecedence(.assignment, false, false);
+        if (start == 0 or self.eatToken(.period_period) == null)
+            return self.failMsg(.{ .tag = .unsupported_range_loop, .token = loop_token });
+        const end = try self.parseExprPrecedence(.assignment, false, false);
+        if (end == 0 or self.token_tags[self.tok_i] != .l_brace)
+            return self.failMsg(.{ .tag = .unsupported_range_loop, .token = loop_token });
+        const body = try self.expectBlock();
+        if (self.token_tags[self.tok_i] == .keyword_else or self.token_tags[self.tok_i] == .colon)
+            return self.failMsg(.{ .tag = .unsupported_range_loop, .token = loop_token });
+        return self.addNode(.{
+            .tag = .loop_range,
+            .main_token = loop_token,
+            .data = .{ .lhs = try self.addExtra(Node.RangeLoop{ .binding = binding, .start = start, .end = end, .body = body }), .rhs = body },
+        });
+    }
     var condition = if (self.token_tags[self.tok_i] == .colon) null_node else condition: {
         const node = try self.parseExprPrecedence(.assignment, false, false);
         if (node == null_node) return self.fail(.expected_expr);
@@ -1632,6 +1651,9 @@ test "parser ownership survives allocation failures" {
         "let value = loop : tick() {break loop i < 10 : i += 1 {break 1 + 2}}",
         "let broken = loop true : i +=\nlet valid = 42",
         "let broken = loop : tick(",
+        "let f: () = loop i in 0..10 {continue}",
+        "let f: () = loop _ in -{{128}}..{0} {break}",
+        "let broken = loop i in 0..\nlet valid = 42",
         "let broken = loop true : a[0] += 1 {break [1, 2, 3,]}",
         "let value = loop ready : {loop i < limit : {i += 1} {break}} {break 1}",
         "let value = loop : {tick()} {break 1}",
@@ -1642,6 +1664,37 @@ test "parser ownership survives allocation failures" {
     };
     for (sources) |source| {
         try std.testing.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
+    }
+}
+
+test "range headers preserve dedicated fields spans delimiters and recovery" {
+    const source = "let f: () = loop i in ; start\n{0}.. ; end\n10 {continue}";
+    var ast = try parse(std.testing.allocator, source);
+    defer ast.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    const node = ast.decl(ast.rootDecls()[0]).ast.init_node;
+    const range = ast.fullRange(node).?;
+    try std.testing.expectEqualStrings("i", ast.tokenSlice(ast.nodes.items(.main_token)[range.binding]));
+    try std.testing.expectEqualStrings("loop", ast.tokenSlice(ast.firstToken(node)));
+    try std.testing.expectEqual(source.len - 1, ast.tokens.items(.start)[ast.lastToken(node)]);
+    try std.testing.expectEqual(Node.Tag.number_literal, ast.nodes.items(.tag)[range.end]);
+    try std.testing.expect(ast.fullRange(range.end) == null);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
+    for ([_][:0]const u8{
+        "loop i in ..2 {}",          "loop i in 0.. {}",           "loop i in 0..=2 {}",
+        "loop i in 0..2 {} else {}", "loop i in 0..2 : tick() {}", "loop i, j in 0..2 {}",
+        "loop &i in 0..2 {}",        "loop i in values {}",        "loop i in 0..2, 0..3 {}",
+        "loop i in 0..2",            "loop i in 0..",              "loop i in 0..2 += 1 {}",
+        "loop i in 0..2\n\n{}",      "for i in 0..2 {}",
+    }) |header| {
+        const broken = try std.fmt.allocPrintSentinel(std.testing.allocator, "let f: () = {s}\nlet valid: int = 42", .{header}, 0);
+        defer std.testing.allocator.free(broken);
+        var result = try parse(std.testing.allocator, broken);
+        defer result.deinit(std.testing.allocator);
+        errdefer std.debug.print("range header: {s}\n", .{header});
+        try std.testing.expect(result.errors.len != 0);
+        for (result.errors) |err| try std.testing.expect(result.tokens.items(.start)[err.token] <= broken.len);
+        try std.testing.expectEqualStrings("42", result.tokenSlice(result.lastToken(result.rootDecls()[result.rootDecls().len - 1])));
     }
 }
 
@@ -1890,13 +1943,12 @@ test "condition loop AST preserves nested blocks controls and source boundaries"
 
 test "unsupported loops diagnose their keyword and preserve following declarations" {
     const expressions = [_][]const u8{
-        "loop item in items {\nlet hidden = 0\n}",
+        "loop &item in items {\nlet hidden = 0\n}",
         "loop i < 10 : i += 1, j += 1 {}",
         "loop {} else {}",
         "loop : next {} else {}",
         "outer: loop {}",
         "outer: loop true {}",
-        "loop i in 0..10 {}",
     };
     for (expressions) |expression| {
         const source = try std.fmt.allocPrintSentinel(std.testing.allocator, "let value = {s}\nlet valid = 42", .{expression}, 0);

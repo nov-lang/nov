@@ -1220,6 +1220,167 @@ test "array membership compiler ownership survives every allocation failure" {
     try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{array_membership});
 }
 
+const range_program =
+    \\let accept: (n: uint) -> void = @println(n)
+    \\let signed: (n: int) -> void = @println(n)
+    \\let count: (a: i8, b: i8) -> uint = {
+    \\    let mut total: uint = 0
+    \\    loop _ in a..b {total += 1}
+    \\    total
+    \\}
+    \\let early: () -> string = {
+    \\    loop i in 0..5 {if i == 2 {return "ret" + "urn"}}
+    \\    "unreachable result"
+    \\}
+    \\let mark: (s: string, n: uint) -> uint = {@print(s)
+    \\    n}
+    \\let main: () = {
+    \\    loop i in 0..3 {accept(i)}
+    \\    loop i in -2..1 {signed(i)}
+    \\    @println(count(-2, 2), count(2, 2), count(3, -2))
+    \\    let mut hi: uint = 4
+    \\    let mut calls: uint = 0
+    \\    loop i in mark("S", 0)..{calls += 1
+    \\        mark("E", hi)} {
+    \\        hi = 0
+    \\        @print(i)
+    \\    }
+    \\    @println("", calls, hi)
+    \\    let mut total: uint = 0
+    \\    loop i in 0..3 {
+    \\        let text = "iteration={i}"
+    \\        let values: []uint = [i, i + 1]
+    \\        loop j in 0..5 {
+    \\            if j == 1 {continue}
+    \\            if j == 3 {break}
+    \\            total += 1
+    \\            let other = text + "!"
+    \\            if values[0] == i {@print(other, " ")}
+    \\        }
+    \\        if i == 1 {continue}
+    \\        @print(i)
+    \\    }
+    \\    @println("", total, early())
+    \\    loop _ in 4..4 {@println(false)}
+    \\}
+;
+const range_output = "0\n1\n2\n-2\n-1\n0\n4 0 0\nSE0123 1 0\niteration=0!  iteration=0!  0iteration=1!  iteration=1!  iteration=2!  iteration=2!  2 6 return\n";
+
+test "ranges preserve defaults snapshots controls fresh values formatting and GC roots" {
+    const c = try arrayTestProgram(range_program);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, range_output, "", mode);
+}
+
+test "ranges are finite at every integer maximum and accept grouped minimum bounds" {
+    var source = std.Io.Writer.Allocating.init(test_gpa);
+    defer source.deinit();
+    var output = std.Io.Writer.Allocating.init(test_gpa);
+    defer output.deinit();
+    try source.writer.writeAll("let main: () = {\n");
+    for ([_][]const u8{ "i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "int", "uint" }) |name| {
+        const bits: u7 = if (std.mem.eql(u8, name, "int") or std.mem.eql(u8, name, "uint")) @intCast(Ir.native_pointer_bits) else try std.fmt.parseInt(u7, name[1..], 10);
+        const signed = name[0] == 'i';
+        const min: i128 = if (signed) -(@as(i128, 1) << @intCast(bits - 1)) else 0;
+        const max: i128 = (@as(i128, 1) << @intCast(bits - @as(u7, @intFromBool(signed)))) - 1;
+        try source.writer.print("{{let a: {s} = {d}\nlet b: {s} = {d}\nloop i in a..{d} {{@println(i)}}\nloop i in {d}..b {{@println(i)}}\nloop _ in b..b {{@println(false)}}\n}}\n", .{ name, min, name, max, min + 2, max - 2 });
+        try output.writer.print("{d}\n{d}\n{d}\n{d}\n", .{ min, min + 1, max - 2, max - 1 });
+    }
+    const min: i128 = -(@as(i128, 1) << (Ir.native_pointer_bits - 1));
+    const max: u128 = (@as(u128, 1) << Ir.native_pointer_bits) - 1;
+    try source.writer.print("loop i in -{{{{{d}}}}}..{d} {{@println(i)}}\nloop i in {d}..{d} {{@println(i)}}\n}}\n", .{ -min, min + 1, max - 1, max });
+    try output.writer.print("{d}\n{d}\n", .{ min, max - 1 });
+    const terminated = try test_gpa.dupeZ(u8, source.written());
+    defer test_gpa.free(terminated);
+    const formatted = try @import("Formatter.zig").format(test_gpa, terminated);
+    defer test_gpa.free(formatted);
+    const c = try emitSource(source.written(), null);
+    defer test_gpa.free(c);
+    const formatted_c = try emitSource(formatted, null);
+    defer test_gpa.free(formatted_c);
+    try std.testing.expectEqualStrings(c, formatted_c);
+    try std.testing.expect(std.mem.indexOf(u8, c, "nov_rt_heap") == null);
+    for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(c, "void nov_main(void); int main(void) {nov_main(); return 0;}", 0, output.written(), "", mode);
+}
+
+test "range endpoint controls belong to the enclosing scope and snapshots precede effects" {
+    const source =
+        \\let mark: (n: uint) -> uint = {@print("end")
+        \\    n}
+        \\let first: () -> uint = {
+        \\    loop i in {return 17}..mark(1) {@println(i)}
+        \\}
+        \\let second: () -> uint = {
+        \\    let zero: uint = 0
+        \\    loop i in zero..{return 18} {@println(i)}
+        \\}
+        \\let outer: () -> uint = loop {
+        \\    loop i in {break 42}..mark(1) {@println(i)}
+        \\}
+        \\let main: () = {
+        \\    let zero: uint = 0
+        \\    let two: uint = 2
+        \\    let mut tries: uint = 0
+        \\    loop tries < 3 : tries += 1 {
+        \\        loop i in {if tries == 0 {continue}
+        \\            zero}..{if tries == 2 {break}
+        \\            two} {@print(i)}
+        \\    }
+        \\    @println("", tries, first(), second(), outer())
+        \\    let mut lo: uint = 1
+        \\    let mut hi: uint = 4
+        \\    let mut calls: uint = 0
+        \\    loop __range_counter in {calls += 1
+        \\        lo}..{calls += 1
+        \\        lo = 9
+        \\        hi} {lo = 99
+        \\        hi = 0
+        \\        @print(__range_counter)}
+        \\    @println("", calls, lo, hi)
+        \\    let text = "managed" + " result"
+        \\    @println(text)
+        \\}
+    ;
+    const c = try arrayTestProgram(source);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "01 2 17 18 42\n123 2 99 0\nmanaged result\n", "", mode);
+}
+
+const terminal_range_bounds =
+    \\let first: () -> int = loop _ in {return 7}..10 {}
+    \\let last: () -> int = loop _ in 0..{return 8} {}
+    \\let outer: () -> int = loop {loop _ in {break 9}..10 {}}
+    \\let main: () -> void = {
+    \\    let text = "a" + "b"
+    \\    @println(first(), last(), outer(), text)
+    \\    let mut n: int = 0
+    \\    loop n < 3 : n += 1 {loop _ in {continue}..10 {}}
+    \\    @println(n)
+    \\}
+;
+
+test "range endpoint controls do not require an inferred iteration type" {
+    const c = try arrayTestProgram(terminal_range_bounds);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "7 8 9 ab\n3\n", "", mode);
+}
+
+test "range lowering and formatting survive every allocation failure" {
+    for ([_][]const u8{ range_program, terminal_range_bounds }) |source|
+        try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{source});
+}
+
+test "range allocating bodies report runtime OOM" {
+    const c = try arrayTestProgram("let main: () = loop i in 0..1 {@println(\"{i}\")}\n");
+    defer test_gpa.free(c);
+    const exhausted = try std.mem.concat(test_gpa, u8, &.{
+        "#include <stdlib.h>\nstatic void *test_malloc(size_t n) { (void)n; return NULL; }\n#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n",
+        c,
+    });
+    defer test_gpa.free(exhausted);
+    for ([_][]const u8{ "-O0", "-O2" }) |mode| try compileAndRunMode(exhausted, "typedef int nonempty_translation_unit;", 1, "", "panic: GC allocation failed\n", mode);
+}
+
 const string_interpolation =
     \\let prefix: string = "é\0"
     \\let fizz: (n: int) -> string = match n % 3, n % 5 {

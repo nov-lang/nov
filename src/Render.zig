@@ -234,6 +234,16 @@ fn renderExpression(self: *Render, node: Ast.Node.Index, space: Space) RenderErr
             }
             return self.renderToken(block.ast.rbrace, space);
         },
+        .loop_range => {
+            const loop = ast.fullRange(node).?;
+            try self.renderToken(main_tokens[node], .space);
+            try self.renderExpression(loop.binding, .space);
+            try self.renderToken(ast.lastToken(loop.binding) + 1, .space);
+            try self.renderExpression(loop.start, .none);
+            try self.renderToken(ast.lastToken(loop.start) + 1, .none);
+            try self.renderExpression(loop.end, .space);
+            return self.renderExpression(loop.body, space);
+        },
         .loop_condition, .loop_cont, .loop_else => {
             const loop = ast.fullLoop(node).?;
             try self.renderToken(main_tokens[node], .space);

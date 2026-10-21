@@ -119,6 +119,7 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     _ = fixtures.add("print-program.nov", "let number: i32 = -42\nlet answer: () -> i32 = number\nlet main: () -> void = @println(true, answer())\n");
     _ = fixtures.add("checkout.nov", @embedFile("examples/checkout.nov"));
     _ = fixtures.add("fibo.nov", @embedFile("examples/fibo.nov"));
+    _ = fixtures.add("fizzbuzz.nov", @embedFile("examples/fizzbuzz.nov"));
     _ = fixtures.add("strings.nov", @embedFile("examples/strings.nov"));
     _ = fixtures.add("interpolation.nov", @embedFile("examples/interpolation.nov"));
     _ = fixtures.add("interpolation-format.nov", "let main: () -> void = {let n: int = 1\n@println(\"{n:02}\")}\n");
@@ -196,6 +197,8 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         .{ .name = "reject interpolation unknown names", .args = &.{ "emit-c", "interpolation-name.nov" }, .exit_code = 1, .stderr_match = "unknown name 'missing'" },
         .{ .name = "reject global interpolation", .args = &.{ "check", "--semantic", "interpolation-global.nov" }, .exit_code = 1, .stderr_match = "global strings require literal initializers; move interpolation into a function" },
         .{ .name = "check unchanged fibo", .args = &.{ "check", "--semantic", "fibo.nov" }, .exit_code = 0 },
+        .{ .name = "check fizzbuzz", .args = &.{ "check", "--semantic", "fizzbuzz.nov" }, .exit_code = 0 },
+        .{ .name = "fmt fizzbuzz", .args = &.{ "fmt", "--check", "fizzbuzz.nov" }, .exit_code = 0 },
         .{ .name = "fmt unchanged fibo", .args = &.{ "fmt", "--check", "fibo.nov" }, .exit_code = 0 },
         .{ .name = "check inferred locals", .args = &.{ "check", "--semantic", "inferred-locals.nov" }, .exit_code = 0 },
         .{ .name = "fmt inferred locals", .args = &.{ "fmt", "--check", "inferred-locals.nov" }, .exit_code = 0 },
@@ -315,6 +318,19 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         fibo.expectStdOutEqual("55\n");
         fibo.expectStdErrEqual("");
         test_step.dependOn(&fibo.step);
+
+        const fizzbuzz = b.addRunArtifact(exe);
+        fizzbuzz.step.name = b.fmt("CLI: fizzbuzz ({s})", .{mode});
+        fizzbuzz.setCwd(fixtures.getDirectory());
+        fizzbuzz.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+        fizzbuzz.setEnvironmentVariable("NOV_CC", "");
+        fizzbuzz.setEnvironmentVariable("CC", "");
+        fizzbuzz.addArgs(&.{ "run", "fizzbuzz.nov" });
+        if (mode.len != 0) fizzbuzz.addArg(mode);
+        fizzbuzz.expectExitCode(0);
+        fizzbuzz.expectStdOutEqual("FizzBuzz\n1\n2\nFizz\n4\nBuzz\nFizz\n7\n8\nFizz\n");
+        fizzbuzz.expectStdErrEqual("");
+        test_step.dependOn(&fizzbuzz.step);
 
         const value_loops = b.addRunArtifact(exe);
         value_loops.step.name = b.fmt("CLI: loop values and continuations ({s})", .{mode});

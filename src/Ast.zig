@@ -398,6 +398,7 @@ pub fn renderError(self: Ast, parse_error: Error, writer: anytype) !void {
         //     });
         // },
         .unsupported_loop => return writer.writeAll("unsupported loop form; expected 'loop condition { ... }'"),
+        .unsupported_range_loop => return writer.writeAll("unsupported range loop; expected 'loop name in start..end { ... }' with both bounds; inclusive ranges, iterators, continuations and else are unsupported"),
         .expected_decl => {
             return writer.print("expected declaration, found '{s}'", .{
                 token_tags[parse_error.token + @intFromBool(parse_error.token_is_prev)].symbol(),
@@ -586,6 +587,7 @@ pub fn firstToken(self: Ast, node: Node.Index) TokenIndex {
         .match,
         .@"if",
         .if_else,
+        .loop_range,
         .loop_condition,
         .loop_cont,
         .loop_else,
@@ -749,6 +751,7 @@ pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
         .bool_and,
         .bool_or,
         .@"if",
+        .loop_range,
         .loop_condition,
         .match_case_one,
         .match_case,
@@ -1106,6 +1109,11 @@ pub fn fullDecl(self: Ast, node: Node.Index) ?full.Decl {
     };
 }
 
+pub fn fullRange(self: Ast, node: Node.Index) ?Node.RangeLoop {
+    if (self.nodes.items(.tag)[node] != .loop_range) return null;
+    return self.extraData(self.nodes.items(.data)[node].lhs, Node.RangeLoop);
+}
+
 pub fn fullLoop(self: Ast, node: Node.Index) ?struct { condition: Node.Index, continuation: Node.Index, body: Node.Index, else_expr: Node.Index = 0 } {
     return switch (self.nodes.items(.tag)[node]) {
         .loop_condition => blk: {
@@ -1378,6 +1386,7 @@ pub const Error = struct {
         unattached_doc_comment,
         nov_style_container,
         unsupported_loop,
+        unsupported_range_loop,
         expected_decl,
         expected_expr,
         expected_expr_or_assignment,
@@ -1561,6 +1570,8 @@ pub const Node = struct {
         /// rhs can be omitted.
         /// main_token is the `..` or `..=`.
         range,
+        /// Bounded integer iterator. `RangeLoop[lhs]`, rhs is the body.
+        loop_range,
         /// `loop lhs rhs`: optional boolean condition (0 for unconditional) and lexical body block.
         loop_condition,
         /// Optional condition in lhs (0 for unconditional), LoopCont extra in rhs.
@@ -1646,6 +1657,13 @@ pub const Node = struct {
     pub const Data = struct {
         lhs: Index,
         rhs: Index,
+    };
+
+    pub const RangeLoop = struct {
+        binding: Index,
+        start: Index,
+        end: Index,
+        body: Index,
     };
 
     pub const SubRange = struct {
