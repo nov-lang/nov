@@ -1,4 +1,7 @@
 const std = @import("std");
+const string_literal = @import("string_literal.zig");
+const Lowering = @import("Lowering.zig");
+const Sema = @import("Sema.zig");
 const Ast = @import("Ast.zig");
 const Module = @import("Module.zig");
 const Ir = @import("Ir.zig");
@@ -860,7 +863,7 @@ const Context = struct {
         defer self.module.allocator.free(bytes);
         var decoded = std.Io.Writer.Allocating.init(self.module.allocator);
         defer decoded.deinit();
-        const result = @import("string_literal.zig").parseWrite(&decoded.writer, bytes) catch return error.OutOfMemory;
+        const result = string_literal.parseWrite(&decoded.writer, bytes) catch return error.OutOfMemory;
         const issue: ?Literal.StringIssue = switch (result) {
             .success => Literal.stringIssue(bytes, decoded.written()),
             .failure => |failure| .{ .offset = switch (failure) {
@@ -888,7 +891,7 @@ const Context = struct {
         var placeholder: usize = 0;
         while (offset < bytes.len) {
             if (offset < bytes.len - 1 and bytes[offset] == '\\') {
-                switch (@import("string_literal.zig").parseEscapeSequence(bytes, &offset)) {
+                switch (string_literal.parseEscapeSequence(bytes, &offset)) {
                     .success => continue,
                     .failure => return self.interpolationError(.invalid_literal, location),
                 }
@@ -1482,7 +1485,7 @@ test "interpolation diagnoses names grammar types scopes and exact source bytes"
     }) |case| {
         var module = try Module.init(std.testing.allocator, "interpolation-error.nov", case.source);
         defer module.deinit();
-        var sema = try @import("Lowering.zig").lower(&module);
+        var sema = try Lowering.lower(&module);
         defer sema.deinit();
         try std.testing.expect(!sema.lowering_complete);
         try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
@@ -1522,7 +1525,7 @@ test "match and pipes reject unsupported patterns arity defaults and inexact typ
     }) |case| {
         var module = try Module.init(std.testing.allocator, "match-error.nov", case.source);
         defer module.deinit();
-        var sema = try @import("Lowering.zig").lower(&module);
+        var sema = try Lowering.lower(&module);
         defer sema.deinit();
         if (module.diagnostics.items.len != 1 or module.diagnostics.items[0].tag != case.tag) {
             std.debug.print("unexpected diagnostics for {s}: {any}\n", .{ case.source, module.diagnostics.items });
@@ -1551,7 +1554,7 @@ test "bitwise binaries infer exact integer operands through late result hints" {
             defer std.testing.allocator.free(source);
             var module = try Module.init(std.testing.allocator, "bitwise.nov", source);
             defer module.deinit();
-            var sema = try @import("Lowering.zig").lower(&module);
+            var sema = try Lowering.lower(&module);
             defer sema.deinit();
             try std.testing.expect(!module.hasErrors());
             try std.testing.expect(sema.lowering_complete);
@@ -1581,7 +1584,7 @@ test "bitwise binaries reject defaults nonintegers mismatches and literal bounds
             defer std.testing.allocator.free(source);
             var module = try Module.init(std.testing.allocator, "bitwise-error.nov", source);
             defer module.deinit();
-            var sema = try @import("Lowering.zig").lower(&module);
+            var sema = try Lowering.lower(&module);
             defer sema.deinit();
             try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
             try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
@@ -1607,7 +1610,7 @@ test "membership infers exact scalar operands without numeric defaults" {
     }) |source| {
         var module = try Module.init(std.testing.allocator, "membership.nov", source);
         defer module.deinit();
-        var sema = try @import("Lowering.zig").lower(&module);
+        var sema = try Lowering.lower(&module);
         defer sema.deinit();
         try std.testing.expect(!module.hasErrors());
         try std.testing.expect(sema.lowering_complete);
@@ -1638,7 +1641,7 @@ test "membership rejects defaults widening nonscalar elements and nonboolean res
     }) |case| {
         var module = try Module.init(std.testing.allocator, "membership-error.nov", case.source);
         defer module.deinit();
-        var sema = try @import("Lowering.zig").lower(&module);
+        var sema = try Lowering.lower(&module);
         defer sema.deinit();
         try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
         try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
@@ -1661,7 +1664,7 @@ test "string inference accepts late literals calls lengths and branch context" {
         \\}
     );
     defer module.deinit();
-    var sema = try @import("Lowering.zig").lower(&module);
+    var sema = try Lowering.lower(&module);
     defer sema.deinit();
     try std.testing.expect(!module.hasErrors());
     try std.testing.expect(sema.lowering_complete);
@@ -1679,7 +1682,7 @@ test "string equality infers exact operands and a boolean result" {
         \\}
     );
     defer module.deinit();
-    var sema = try @import("Lowering.zig").lower(&module);
+    var sema = try Lowering.lower(&module);
     defer sema.deinit();
     try std.testing.expect(!module.hasErrors());
     try std.testing.expect(sema.lowering_complete);
@@ -1703,7 +1706,7 @@ test "string comparisons reject ordered mixed and nonboolean result types" {
     }) |case| {
         var module = try Module.init(std.testing.allocator, "comparison.nov", case.source);
         defer module.deinit();
-        var sema = try @import("Lowering.zig").lower(&module);
+        var sema = try Lowering.lower(&module);
         defer sema.deinit();
         try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
         try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
@@ -1724,7 +1727,7 @@ test "string compounds retain mutability operator and operand diagnostics" {
     }) |case| {
         var module = try Module.init(std.testing.allocator, "compound.nov", case.source);
         defer module.deinit();
-        var sema = try @import("Lowering.zig").lower(&module);
+        var sema = try Lowering.lower(&module);
         defer sema.deinit();
         try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
         try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
@@ -1736,7 +1739,7 @@ test "string compounds retain mutability operator and operand diagnostics" {
         defer std.testing.allocator.free(source);
         var module = try Module.init(std.testing.allocator, "compound.nov", source);
         defer module.deinit();
-        var sema = try @import("Lowering.zig").lower(&module);
+        var sema = try Lowering.lower(&module);
         defer sema.deinit();
         try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
         try std.testing.expectEqual(Module.Diagnostic.Tag.operator_not_supported, module.diagnostics.items[0].tag);
@@ -1764,7 +1767,7 @@ test "strings reject byte mutation indexing slicing arrays ordering and eager gl
         var module = try Module.init(std.testing.allocator, "unsupported-string.nov", source);
         defer module.deinit();
         if (module.hasErrors()) continue;
-        var sema = try @import("Lowering.zig").lower(&module);
+        var sema = try Lowering.lower(&module);
         defer sema.deinit();
         try std.testing.expect(module.hasErrors());
         try std.testing.expect(!sema.lowering_complete);
@@ -1793,7 +1796,7 @@ test "scalar array deferred and ill typed forms fail closed" {
         var module = try Module.init(std.testing.allocator, "arrays.nov", source);
         defer module.deinit();
         try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
-        var sema = try @import("Lowering.zig").lower(&module);
+        var sema = try Lowering.lower(&module);
         defer sema.deinit();
         try std.testing.expect(module.hasErrors());
         try std.testing.expect(!sema.lowering_complete);
@@ -1813,7 +1816,7 @@ test "all indexed compound operators reject bool elements immutable parameters a
             var module = try Module.init(std.testing.allocator, "compound.nov", source);
             defer module.deinit();
             try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
-            var sema = try @import("Lowering.zig").lower(&module);
+            var sema = try Lowering.lower(&module);
             defer sema.deinit();
             try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
             try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
@@ -1852,7 +1855,7 @@ test "range bounds require exact integer types and immutable lexical bindings" {
             defer module.deinit();
             errdefer std.debug.print("range case: {s}\n", .{case.body});
             try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
-            var sema = try @import("Lowering.zig").lower(&module);
+            var sema = try Lowering.lower(&module);
             defer sema.deinit();
             try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
             try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
@@ -1883,7 +1886,7 @@ test "range else rejects incompatible results missing context and escaped indice
             defer module.deinit();
             errdefer std.debug.print("range else case: {s}\n", .{source});
             try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
-            var sema = try @import("Lowering.zig").lower(&module);
+            var sema = try Lowering.lower(&module);
             defer sema.deinit();
             try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
             try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
@@ -1908,7 +1911,7 @@ test "range literal defaults are native checked and never widen typed bounds" {
             defer std.testing.allocator.free(source);
             var module = try Module.init(std.testing.allocator, "range.nov", source);
             defer module.deinit();
-            var sema = try @import("Lowering.zig").lower(&module);
+            var sema = try Lowering.lower(&module);
             defer sema.deinit();
             try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
             try std.testing.expectEqual(Module.Diagnostic.Tag.literal_out_of_range, module.diagnostics.items[0].tag);
@@ -1947,7 +1950,7 @@ test "condition loops diagnose controls types scope and unreachable tails" {
         defer module.deinit();
         errdefer std.debug.print("loop case: {s}\n", .{case.body});
         try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
-        var sema = try @import("Lowering.zig").lower(&module);
+        var sema = try Lowering.lower(&module);
         defer sema.deinit();
         try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
         try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
@@ -1962,7 +1965,7 @@ test "value loops require a value break rather than introducing a never type" {
         var module = try Module.init(std.testing.allocator, "loop.nov", source);
         defer module.deinit();
         try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
-        var sema = try @import("Lowering.zig").lower(&module);
+        var sema = try Lowering.lower(&module);
         defer sema.deinit();
         try std.testing.expect(!sema.lowering_complete);
         try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
@@ -2000,7 +2003,7 @@ test "loop values infer from typed breaks with exact branch types and scopes" {
     var module = try Module.init(std.testing.allocator, "loop-values.nov", source);
     defer module.deinit();
     try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
-    var sema = try @import("Lowering.zig").lower(&module);
+    var sema = try Lowering.lower(&module);
     defer sema.deinit();
     try std.testing.expect(!module.hasErrors());
     try std.testing.expect(sema.lowering_complete);
@@ -2021,7 +2024,7 @@ test "break operand probes do not borrow discarded nested loop result types" {
         defer std.testing.allocator.free(source);
         var module = try Module.init(std.testing.allocator, "operand-scope.nov", source);
         defer module.deinit();
-        var sema = try @import("Lowering.zig").lower(&module);
+        var sema = try Lowering.lower(&module);
         defer sema.deinit();
         try std.testing.expect(!sema.lowering_complete);
         try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
@@ -2054,7 +2057,7 @@ test "conditional loop else results use exact bidirectional types and ignore ter
     ;
     var module = try Module.init(std.testing.allocator, "else.nov", source);
     defer module.deinit();
-    var sema = try @import("Lowering.zig").lower(&module);
+    var sema = try Lowering.lower(&module);
     defer sema.deinit();
     for (module.diagnostics.items) |diagnostic| std.debug.print("else diagnostic {s}\n", .{@tagName(diagnostic.tag)});
     try std.testing.expect(!module.hasErrors());
@@ -2094,7 +2097,7 @@ test "loop value and continuation diagnostics preserve exact types and lexical s
         var module = try Module.init(std.testing.allocator, "bad-loop.nov", case.source);
         defer module.deinit();
         try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
-        var sema = try @import("Lowering.zig").lower(&module);
+        var sema = try Lowering.lower(&module);
         defer sema.deinit();
         errdefer std.debug.print("loop diagnostic case: {s}\n", .{case.source});
         try std.testing.expect(module.hasErrors());
@@ -2135,7 +2138,7 @@ test "assignment diagnostics identify targets mutability types and lexical scope
         defer module.deinit();
         errdefer std.debug.print("assignment case: {s}\n", .{case.body});
         try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
-        var sema = try @import("Lowering.zig").lower(&module);
+        var sema = try Lowering.lower(&module);
         defer sema.deinit();
         try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
         try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
@@ -2169,7 +2172,7 @@ test "returns use enclosing signatures and merge only continuing paths" {
         \\let negate: () -> int = !{return 15}
     );
     defer module.deinit();
-    var sema = try @import("Sema.zig").analyzeFunctions(&module);
+    var sema = try Sema.analyzeFunctions(&module);
     defer sema.deinit();
     try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
     try std.testing.expect(!module.hasErrors());
@@ -2193,7 +2196,7 @@ test "return diagnostics retain value locations signature notes and reachability
         defer module.deinit();
 
         try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
-        var sema = try @import("Sema.zig").analyzeFunctions(&module);
+        var sema = try Sema.analyzeFunctions(&module);
         defer sema.deinit();
         try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
         try std.testing.expect(module.hasErrors());
@@ -2219,7 +2222,7 @@ test "if branches infer bidirectionally and keep separate lexical scopes" {
         \\}
     );
     defer module.deinit();
-    var sema = try @import("Sema.zig").analyzeFunctions(&module);
+    var sema = try Sema.analyzeFunctions(&module);
     defer sema.deinit();
     try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
     try std.testing.expect(!module.hasErrors());
@@ -2241,7 +2244,7 @@ test "if diagnostics check conditions both branches results and lexical visibili
     }) |case| {
         var module = try Module.init(std.testing.allocator, "if.nov", case.source);
         defer module.deinit();
-        var sema = try @import("Sema.zig").analyzeFunctions(&module);
+        var sema = try Sema.analyzeFunctions(&module);
         defer sema.deinit();
         try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
         try std.testing.expect(module.hasErrors());
@@ -2273,7 +2276,7 @@ test "typed locals and final expressions work across lexical blocks" {
         \\}
     );
     defer module.deinit();
-    var sema = try @import("Sema.zig").analyzeFunctions(&module);
+    var sema = try Sema.analyzeFunctions(&module);
     defer sema.deinit();
     try std.testing.expect(!module.hasErrors());
 }
@@ -2293,7 +2296,7 @@ test "inferred locals reuse known expression types and nested probe scopes" {
         defer std.testing.allocator.free(source);
         var module = try Module.init(std.testing.allocator, "inferred.nov", source);
         defer module.deinit();
-        var sema = try @import("Sema.zig").analyzeFunctions(&module);
+        var sema = try Sema.analyzeFunctions(&module);
         defer sema.deinit();
         try std.testing.expect(!module.hasErrors());
     }
@@ -2312,7 +2315,7 @@ test "scalar array literals infer known elements bidirectionally across expressi
         defer std.testing.allocator.free(source);
         var module = try Module.init(std.testing.allocator, "array-inference.nov", source);
         defer module.deinit();
-        var sema = try @import("Lowering.zig").lower(&module);
+        var sema = try Lowering.lower(&module);
         defer sema.deinit();
         try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
         try std.testing.expect(!module.hasErrors());
@@ -2339,7 +2342,7 @@ test "array inference uses exact literal boundaries and expected context" {
         var module = try Module.init(std.testing.allocator, "array-boundaries.nov", source);
         defer module.deinit();
         try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
-        var sema = try @import("Lowering.zig").lower(&module);
+        var sema = try Lowering.lower(&module);
         defer sema.deinit();
         try std.testing.expect(!module.hasErrors());
         try sema.ir.verify();
@@ -2374,7 +2377,7 @@ test "array inference rejects conflicts defaults and scope leaks without probe d
         var module = try Module.init(std.testing.allocator, "array-inference-errors.nov", source);
         defer module.deinit();
         try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
-        var sema = try @import("Sema.zig").analyzeFunctions(&module);
+        var sema = try Sema.analyzeFunctions(&module);
         defer sema.deinit();
         try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
         try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
@@ -2411,7 +2414,7 @@ test "inferred local failures preserve typing and initializer scope" {
         defer module.deinit();
 
         try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
-        var sema = try @import("Sema.zig").analyzeFunctions(&module);
+        var sema = try Sema.analyzeFunctions(&module);
         defer sema.deinit();
         try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
         try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
@@ -2447,7 +2450,7 @@ test "local scope declaration and block result diagnostics" {
         defer std.testing.allocator.free(source);
         var module = try Module.init(std.testing.allocator, "locals.nov", source);
         defer module.deinit();
-        var sema = try @import("Sema.zig").analyzeFunctions(&module);
+        var sema = try Sema.analyzeFunctions(&module);
         defer sema.deinit();
         try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
         try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
@@ -2458,7 +2461,7 @@ test "local scope declaration and block result diagnostics" {
 test "local shadowing reports both declarations and locals do not leak to other functions" {
     var module = try Module.init(std.testing.allocator, "scope.nov", "let first: () -> void = {let secret: i32 = 1\n{let secret: i32 = 2\n}\n}\nlet second: () -> i32 = secret");
     defer module.deinit();
-    var sema = try @import("Sema.zig").analyzeFunctions(&module);
+    var sema = try Sema.analyzeFunctions(&module);
     defer sema.deinit();
     try std.testing.expectEqual(@as(usize, 2), module.diagnostics.items.len);
     const diagnostic = module.diagnostics.items[0];
@@ -2472,10 +2475,10 @@ test "local shadowing reports both declarations and locals do not leak to other 
 test "printing accepts typed scalar arguments and returns void" {
     var module = try Module.init(std.testing.allocator, "print.nov", "let empty: () -> void = @print()\nlet line: () -> void = @println()\nlet out: (a: i8, b: u64, c: bool) -> void = @println(a, b, c, true, false, a + 1)");
     defer module.deinit();
-    var sema = try @import("Sema.zig").analyzeFunctions(&module);
+    var sema = try Sema.analyzeFunctions(&module);
     defer sema.deinit();
     try std.testing.expect(!module.hasErrors());
-    for (sema.entries) |entry| try std.testing.expectEqual(@import("Sema.zig").Status.body_checked, entry.status);
+    for (sema.entries) |entry| try std.testing.expectEqual(Sema.Status.body_checked, entry.status);
 }
 
 test "printing rejects unresolved literals non-scalars unsupported builtins and nonvoid results" {
@@ -2496,7 +2499,7 @@ test "printing rejects unresolved literals non-scalars unsupported builtins and 
     }) |case| {
         var module = try Module.init(std.testing.allocator, "print.nov", case.source);
         defer module.deinit();
-        var sema = try @import("Sema.zig").analyzeFunctions(&module);
+        var sema = try Sema.analyzeFunctions(&module);
         defer sema.deinit();
         try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
         try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
@@ -2506,11 +2509,11 @@ test "printing rejects unresolved literals non-scalars unsupported builtins and 
 test "function parameters literals arithmetic and forward calls type-check" {
     var module = try Module.init(std.testing.allocator, "functions.nov", "let caller: () -> i32 = add(1, 2)\nlet add: (a: i32, b: i32) -> i32 = {a + b}\nlet minimum: () -> i8 = -{128}\nlet empty: () = {}\nlet overflow_pending: () -> i8 = 127 + 1");
     defer module.deinit();
-    var sema = try @import("Sema.zig").analyzeFunctions(&module);
+    var sema = try Sema.analyzeFunctions(&module);
     defer sema.deinit();
     try std.testing.expect(!module.hasErrors());
     for (sema.entries) |entry| {
-        try std.testing.expectEqual(@import("Sema.zig").Status.body_checked, entry.status);
+        try std.testing.expectEqual(Sema.Status.body_checked, entry.status);
         try std.testing.expect(entry.constant == null);
     }
     try sema.ir.verify();
@@ -2519,20 +2522,20 @@ test "function parameters literals arithmetic and forward calls type-check" {
 test "mutual recursion and function-typed parameters use known signatures" {
     var module = try Module.init(std.testing.allocator, "recursive.nov", "let first: (x: i32) -> i32 = second(x)\nlet second: (x: i32) -> i32 = first(x)\nlet apply: (callback: (i32) -> i32, value: i32) -> i32 = callback(value)\nlet identity: (x: i32) -> i32 = x\nlet factory: () -> (i32) -> i32 = identity\nlet caller: () -> i32 = factory()(42)");
     defer module.deinit();
-    var sema = try @import("Sema.zig").analyzeFunctions(&module);
+    var sema = try Sema.analyzeFunctions(&module);
     defer sema.deinit();
     try std.testing.expect(!module.hasErrors());
-    for (sema.entries) |entry| try std.testing.expectEqual(@import("Sema.zig").Status.body_checked, entry.status);
+    for (sema.entries) |entry| try std.testing.expectEqual(Sema.Status.body_checked, entry.status);
     try sema.ir.verify();
 }
 
 test "boolean expressions and comparisons infer operand literals from parameters" {
     var module = try Module.init(std.testing.allocator, "booleans.nov", "let less: (value: i32) -> bool = 0 < value\nlet both: (a: bool, b: bool) -> bool = a and !b\nlet equal: () -> bool = true == false\nlet bits: (value: u32) -> u32 = ~value\nlet negative: (value: i32) -> i32 = -value");
     defer module.deinit();
-    var sema = try @import("Sema.zig").analyzeFunctions(&module);
+    var sema = try Sema.analyzeFunctions(&module);
     defer sema.deinit();
     try std.testing.expect(!module.hasErrors());
-    for (sema.entries) |entry| try std.testing.expectEqual(@import("Sema.zig").Status.body_checked, entry.status);
+    for (sema.entries) |entry| try std.testing.expectEqual(Sema.Status.body_checked, entry.status);
 }
 
 test "body errors identify mismatched returns operands names and calls" {
@@ -2556,11 +2559,11 @@ test "body errors identify mismatched returns operands names and calls" {
     }) |case| {
         var module = try Module.init(std.testing.allocator, "invalid.nov", case.source);
         defer module.deinit();
-        var sema = try @import("Sema.zig").analyzeFunctions(&module);
+        var sema = try Sema.analyzeFunctions(&module);
         defer sema.deinit();
         try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
         try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
-        try std.testing.expectEqual(@import("Sema.zig").Status.failed, sema.entries[sema.entries.len - 1].status);
+        try std.testing.expectEqual(Sema.Status.failed, sema.entries[sema.entries.len - 1].status);
         try sema.ir.verify();
     }
 }
@@ -2571,7 +2574,7 @@ test "control flow and parameter shadowing stay explicitly unsupported" {
     }) |source| {
         var module = try Module.init(std.testing.allocator, "unsupported.nov", source);
         defer module.deinit();
-        var sema = try @import("Sema.zig").analyzeFunctions(&module);
+        var sema = try Sema.analyzeFunctions(&module);
         defer sema.deinit();
         try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
         try std.testing.expectEqual(Module.Diagnostic.Tag.unsupported_body_expression, module.diagnostics.items[0].tag);
@@ -2582,7 +2585,7 @@ test "control flow and parameter shadowing stay explicitly unsupported" {
     }) |source| {
         var module = try Module.init(std.testing.allocator, "shadow.nov", source);
         defer module.deinit();
-        var sema = try @import("Sema.zig").analyzeFunctions(&module);
+        var sema = try Sema.analyzeFunctions(&module);
         defer sema.deinit();
         try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
         try std.testing.expectEqual(Module.Diagnostic.Tag.unsupported_shadowing, module.diagnostics.items[0].tag);
@@ -2592,13 +2595,13 @@ test "control flow and parameter shadowing stay explicitly unsupported" {
 test "unconstrained operands still diagnose unknown names and unsupported shapes" {
     var module = try Module.init(std.testing.allocator, "names.nov", "let f: () -> bool = missing == other");
     defer module.deinit();
-    var sema = try @import("Sema.zig").analyzeFunctions(&module);
+    var sema = try Sema.analyzeFunctions(&module);
     defer sema.deinit();
     try std.testing.expectEqual(@as(usize, 2), module.diagnostics.items.len);
     for (module.diagnostics.items) |diagnostic| try std.testing.expectEqual(Module.Diagnostic.Tag.unknown_name, diagnostic.tag);
     var unsupported = try Module.init(std.testing.allocator, "local.nov", "let f: () -> bool = {\nlet local = 1\nlocal\n} == 2");
     defer unsupported.deinit();
-    var unsupported_sema = try @import("Sema.zig").analyzeFunctions(&unsupported);
+    var unsupported_sema = try Sema.analyzeFunctions(&unsupported);
     defer unsupported_sema.deinit();
     try std.testing.expectEqual(@as(usize, 1), unsupported.diagnostics.items.len);
     try std.testing.expectEqual(Module.Diagnostic.Tag.literal_needs_type, unsupported.diagnostics.items[0].tag);
@@ -2607,14 +2610,14 @@ test "unconstrained operands still diagnose unknown names and unsupported shapes
 test "parameter bindings do not leak between functions and annotated globals remain readable" {
     var module = try Module.init(std.testing.allocator, "scope.nov", "let global: i32 = 42\nlet read: () -> i32 = global\nlet first: (secret: i32) -> i32 = secret\nlet second: () -> i32 = secret");
     defer module.deinit();
-    var sema = try @import("Sema.zig").analyzeFunctions(&module);
+    var sema = try Sema.analyzeFunctions(&module);
     defer sema.deinit();
     try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
     try std.testing.expectEqual(Module.Diagnostic.Tag.unknown_name, module.diagnostics.items[0].tag);
-    try std.testing.expectEqual(@import("Sema.zig").Status.constant_checked, sema.entries[0].status);
-    try std.testing.expectEqual(@import("Sema.zig").Status.body_checked, sema.entries[1].status);
-    try std.testing.expectEqual(@import("Sema.zig").Status.body_checked, sema.entries[2].status);
-    try std.testing.expectEqual(@import("Sema.zig").Status.failed, sema.entries[3].status);
+    try std.testing.expectEqual(Sema.Status.constant_checked, sema.entries[0].status);
+    try std.testing.expectEqual(Sema.Status.body_checked, sema.entries[1].status);
+    try std.testing.expectEqual(Sema.Status.body_checked, sema.entries[2].status);
+    try std.testing.expectEqual(Sema.Status.failed, sema.entries[3].status);
 }
 
 test "recursive depth is bounded while literal grouping uses iteration" {
@@ -2627,14 +2630,14 @@ test "recursive depth is bounded while literal grouping uses iteration" {
         try source.writer.splatByteAll('}', 132);
         var module = try Module.init(std.testing.allocator, "deep.nov", source.written());
         defer module.deinit();
-        var sema = try @import("Sema.zig").analyzeFunctions(&module);
+        var sema = try Sema.analyzeFunctions(&module);
         defer sema.deinit();
         if (i == 0) {
             try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
             try std.testing.expectEqual(Module.Diagnostic.Tag.body_nesting_limit, module.diagnostics.items[0].tag);
         } else {
             try std.testing.expect(!module.hasErrors());
-            try std.testing.expectEqual(@import("Sema.zig").Status.body_checked, sema.entries[0].status);
+            try std.testing.expectEqual(Sema.Status.body_checked, sema.entries[0].status);
         }
     }
 }
@@ -2642,7 +2645,7 @@ test "recursive depth is bounded while literal grouping uses iteration" {
 fn testAllocationFailures(allocator: std.mem.Allocator, source: []const u8) !void {
     var module = try Module.init(allocator, "oom.nov", source);
     defer module.deinit();
-    var sema = @import("Sema.zig").analyzeFunctions(&module) catch |err| {
+    var sema = Sema.analyzeFunctions(&module) catch |err| {
         try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
         return err;
     };

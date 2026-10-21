@@ -26,9 +26,11 @@
 // - ...
 
 const std = @import("std");
+const string_literal = @import("string_literal.zig");
+const Formatter = @import("Formatter.zig");
 const Tokenizer = @import("Tokenizer.zig");
-const Token = Tokenizer.Token;
 const Ast = @import("Ast.zig");
+const Token = Tokenizer.Token;
 const Node = Ast.Node;
 const TokenIndex = Ast.TokenIndex;
 const Allocator = std.mem.Allocator;
@@ -122,7 +124,7 @@ fn parseInterpolations(self: *Parser, tokens: *Ast.TokenList) Allocator.Error!vo
         var offset: usize = 1;
         while (offset < bytes.len - 1) {
             if (bytes[offset] == '\\') {
-                switch (@import("string_literal.zig").parseEscapeSequence(bytes, &offset)) {
+                switch (string_literal.parseEscapeSequence(bytes, &offset)) {
                     .success => continue,
                     .failure => break,
                 }
@@ -2190,7 +2192,7 @@ test "condition loop AST preserves nested blocks controls and source boundaries"
         if (tag == .@"break" or tag == .@"continue")
             try std.testing.expectEqual(ast.firstToken(@intCast(node)), ast.lastToken(@intCast(node)));
     }
-    const formatted = try @import("Formatter.zig").format(std.testing.allocator, source);
+    const formatted = try Formatter.format(std.testing.allocator, source);
     defer std.testing.allocator.free(formatted);
 }
 

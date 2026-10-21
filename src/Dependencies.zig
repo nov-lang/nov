@@ -1,4 +1,5 @@
 const std = @import("std");
+const Diagnostics = @import("Diagnostics.zig");
 const Module = @import("Module.zig");
 const Ast = @import("Ast.zig");
 const isPrimitive = @import("primitives.zig").isPrimitive;
@@ -287,7 +288,7 @@ test "dependency cycle diagnostics render the use and declaration locations" {
     defer result.deinit();
     var output = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer output.deinit();
-    try @import("Diagnostics.zig").renderModule(&module, &output.writer);
+    try Diagnostics.renderModule(&module, &output.writer);
     try std.testing.expectEqualStrings(
         "cycle.nov:2:9: error: cyclic value dependency on 'a'\nlet b = a\n        ^\n" ++
             "cycle.nov:1:5: note: declaration in this cycle\nlet a = b\n    ^\n",

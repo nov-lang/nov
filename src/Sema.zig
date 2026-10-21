@@ -1,4 +1,5 @@
 const std = @import("std");
+const Diagnostics = @import("Diagnostics.zig");
 const Ast = @import("Ast.zig");
 const Module = @import("Module.zig");
 const Ir = @import("Ir.zig");
@@ -305,7 +306,7 @@ test "literal diagnostics render the actual value and annotation" {
     defer sema.deinit();
     var output = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer output.deinit();
-    try @import("Diagnostics.zig").renderModule(&module, &output.writer);
+    try Diagnostics.renderModule(&module, &output.writer);
     try std.testing.expectEqualStrings(
         "range.nov:1:17: error: integer literal does not fit the annotated type\nlet value: i8 = -129\n                ^~~~\n" ++
             "range.nov:1:12: note: type annotation here\nlet value: i8 = -129\n           ^~\n",

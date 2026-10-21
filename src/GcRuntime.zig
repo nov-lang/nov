@@ -1,11 +1,12 @@
 //! Opt-in C11 runtime text for managed scalar-array backing.
 //! Scalar-only C emission stays unchanged.
+const std = @import("std");
+const CEmitter = @import("CEmitter.zig");
+const Ir = @import("Ir.zig");
+
 pub const source = @embedFile("runtime/gc.h");
 
 test "GC template is embedded without changing scalar emission" {
-    const std = @import("std");
-    const CEmitter = @import("CEmitter.zig");
-    const Ir = @import("Ir.zig");
     var ir = Ir.init(std.testing.allocator);
     defer ir.deinit();
     const c = try CEmitter.emit(std.testing.allocator, &ir, null);

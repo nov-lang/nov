@@ -1,4 +1,5 @@
 const std = @import("std");
+const string_literal = @import("string_literal.zig");
 const Ast = @import("Ast.zig");
 const Module = @import("Module.zig");
 const Ir = @import("Ir.zig");
@@ -53,7 +54,7 @@ pub fn check(module: *Module, ir: *Ir, node: Ast.Node.Index, expected: Ir.TypeId
                 const bytes = module.sourceSlice(span).?;
                 var decoded = std.Io.Writer.Allocating.init(module.allocator);
                 defer decoded.deinit();
-                const result = @import("string_literal.zig").parseWrite(&decoded.writer, bytes) catch return error.OutOfMemory;
+                const result = string_literal.parseWrite(&decoded.writer, bytes) catch return error.OutOfMemory;
                 switch (result) {
                     .failure => |failure| {
                         const offset: u32 = @intCast(switch (failure) {
@@ -82,7 +83,7 @@ pub fn hasInterpolation(bytes: []const u8) bool {
     while (offset < bytes.len - 1) {
         if (bytes[offset] == '{') return true;
         if (bytes[offset] == '\\') {
-            switch (@import("string_literal.zig").parseEscapeSequence(bytes, &offset)) {
+            switch (string_literal.parseEscapeSequence(bytes, &offset)) {
                 .success => {},
                 .failure => return false,
             }
@@ -119,7 +120,7 @@ pub fn stringIssue(source: []const u8, decoded: []const u8) ?StringIssue {
         if (source[offset] == '{' or source[offset] == '}') return .{ .offset = offset, .tag = .invalid_interpolation };
         if (source[offset] == '\\') {
             const unicode = source[offset + 1] == 'u';
-            const point = @import("string_literal.zig").parseEscapeSequence(source, &offset).success;
+            const point = string_literal.parseEscapeSequence(source, &offset).success;
             const n = if (unicode) std.unicode.utf8CodepointSequenceLength(point) catch unreachable else 1;
             if (invalid >= output and invalid < output + n) return .{ .offset = start, .tag = .invalid_literal };
             output += n;

@@ -1,4 +1,14 @@
 const std = @import("std");
+const builtin = @import("builtin");
+const Ast = @import("Ast.zig");
+const Ir = @import("Ir.zig");
+const TypeResolver = @import("TypeResolver.zig");
+const Sema = @import("Sema.zig");
+const Literal = @import("Literal.zig");
+const BodyChecker = @import("BodyChecker.zig");
+const GcRuntime = @import("GcRuntime.zig");
+const Tokenizer = @import("Tokenizer.zig");
+const string_literal = @import("string_literal.zig");
 const build_options = @import("build_options");
 const clap = @import("clap");
 const Parser = @import("Parser.zig");
@@ -295,12 +305,12 @@ fn buildFile(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.E
     if (!try emitFile(io, allocator, path, stderr, &source.writer)) return 1;
 
     const temp_root = env.get("TMPDIR") orelse env.get("TEMP") orelse
-        (if (@import("builtin").os.tag == .windows) "." else "/tmp");
+        (if (builtin.os.tag == .windows) "." else "/tmp");
     const workspace = try Driver.Workspace.init(io, allocator, temp_root);
     defer workspace.deinit(io);
     const c_path = try workspace.file("program.c");
     defer allocator.free(c_path);
-    const exe_path = try workspace.file(if (@import("builtin").os.tag == .windows) "program.exe" else "program");
+    const exe_path = try workspace.file(if (builtin.os.tag == .windows) "program.exe" else "program");
     defer allocator.free(exe_path);
     const cwd = std.Io.Dir.cwd();
     try cwd.writeFile(io, .{ .sub_path = c_path, .data = source.written() });
@@ -505,7 +515,7 @@ test "format executable programs without changing generated C or runtime behavio
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         try tmp.dir.writeFile(io, .{ .sub_path = "formatted.c", .data = formatted_c.written() });
-        const executable = "formatted" ++ (if (@import("builtin").os.tag == .windows) ".exe" else "");
+        const executable = "formatted" ++ (if (builtin.os.tag == .windows) ".exe" else "");
         const directory = try tmp.dir.realPathFileAlloc(io, ".", allocator);
         defer allocator.free(directory);
         const path = try std.fs.path.join(allocator, &.{ directory, executable });
@@ -613,7 +623,7 @@ test "recursive check and errors never stop other supported files" {
 }
 
 test "formatter preserves file symlinks permissions and avoids directory cycles" {
-    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -641,7 +651,7 @@ test "formatter preserves file symlinks permissions and avoids directory cycles"
 }
 
 test "formatter excludes symlink targets and diagnoses broken links while continuing" {
-    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -667,7 +677,7 @@ test "formatter excludes symlink targets and diagnoses broken links while contin
 }
 
 test "unreadable formatter input reports failure and continues" {
-    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -817,7 +827,7 @@ test "semantic file checks reject errors and deferred forms without writing" {
 }
 
 test "build and run integrate discovery, preserve outputs, and clean temporary files" {
-    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -876,19 +886,19 @@ test "build and run integrate discovery, preserve outputs, and clean temporary f
 }
 
 test {
-    _ = @import("Ast.zig");
-    _ = @import("Ir.zig");
-    _ = @import("Module.zig");
-    _ = @import("Dependencies.zig");
-    _ = @import("TypeResolver.zig");
-    _ = @import("Sema.zig");
-    _ = @import("Literal.zig");
-    _ = @import("BodyChecker.zig");
-    _ = @import("Lowering.zig");
-    _ = @import("CEmitter.zig");
-    _ = @import("GcRuntime.zig");
-    _ = @import("Tokenizer.zig");
-    _ = @import("string_literal.zig");
+    _ = Ast;
+    _ = Ir;
+    _ = Module;
+    _ = Dependencies;
+    _ = TypeResolver;
+    _ = Sema;
+    _ = Literal;
+    _ = BodyChecker;
+    _ = Lowering;
+    _ = CEmitter;
+    _ = GcRuntime;
+    _ = Tokenizer;
+    _ = string_literal;
     _ = Driver;
     _ = Diagnostics;
     _ = Formatter;

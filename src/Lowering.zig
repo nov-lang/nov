@@ -1,4 +1,5 @@
 const std = @import("std");
+const CEmitter = @import("CEmitter.zig");
 const Module = @import("Module.zig");
 const Sema = @import("Sema.zig");
 const Ir = @import("Ir.zig");
@@ -161,7 +162,7 @@ test "interpolated call IR owns storage after releasing source and fragment toke
     try std.testing.expect(!failed);
     try std.testing.expect(sema.lowering_complete);
     try sema.ir.verify();
-    const c = try @import("CEmitter.zig").emit(std.testing.allocator, &sema.ir, null);
+    const c = try CEmitter.emit(std.testing.allocator, &sema.ir, null);
     defer std.testing.allocator.free(c);
     try std.testing.expect(std.mem.indexOf(u8, c, "nov_add") != null);
 }

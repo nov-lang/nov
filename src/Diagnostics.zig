@@ -1,4 +1,6 @@
 const std = @import("std");
+const CEmitter = @import("CEmitter.zig");
+const Parser = @import("Parser.zig");
 const Ast = @import("Ast.zig");
 const Module = @import("Module.zig");
 
@@ -116,7 +118,7 @@ pub fn renderModule(module: *const Module, writer: *std.Io.Writer) !void {
     }
 }
 
-pub fn renderBackend(module: *const Module, diagnostic: @import("CEmitter.zig").Diagnostic, writer: *std.Io.Writer) !void {
+pub fn renderBackend(module: *const Module, diagnostic: CEmitter.Diagnostic, writer: *std.Io.Writer) !void {
     const location = Location.init(module.ast.source, diagnostic.span.start);
     try location.renderPrefix(module.path, "error", writer);
     try writer.writeAll(diagnostic.reason.message());
@@ -390,7 +392,7 @@ test "syntax-only module rendering matches parser rendering" {
 }
 
 test "unsupported loop diagnostics identify the keyword with tabs and CRLF" {
-    var ast = try @import("Parser.zig").parse(std.testing.allocator, "let f: () = {\r\n\touter: loop {}\r\n}\r\n");
+    var ast = try Parser.parse(std.testing.allocator, "let f: () = {\r\n\touter: loop {}\r\n}\r\n");
     defer ast.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), ast.errors.len);
     var output = std.Io.Writer.Allocating.init(std.testing.allocator);
@@ -403,7 +405,7 @@ test "unsupported loop diagnostics identify the keyword with tabs and CRLF" {
 }
 
 test "diagnostics include filename source and caret at EOF" {
-    var ast = try @import("Parser.zig").parse(std.testing.allocator, "let broken =");
+    var ast = try Parser.parse(std.testing.allocator, "let broken =");
     defer ast.deinit(std.testing.allocator);
     try std.testing.expect(ast.errors.len > 0);
     var output = std.Io.Writer.Allocating.init(std.testing.allocator);
@@ -414,7 +416,7 @@ test "diagnostics include filename source and caret at EOF" {
 }
 
 test "diagnostics point after previous token and preserve tabs" {
-    var ast = try @import("Parser.zig").parse(std.testing.allocator, "\tlet x = 1 let y = 2\n");
+    var ast = try Parser.parse(std.testing.allocator, "\tlet x = 1 let y = 2\n");
     defer ast.deinit(std.testing.allocator);
     try std.testing.expect(ast.errors.len > 0);
     var output = std.Io.Writer.Allocating.init(std.testing.allocator);

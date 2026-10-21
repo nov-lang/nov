@@ -11,7 +11,12 @@
 //! modular unsigned-to-signed conversion provided by GCC, Clang and MSVC.
 //! Widths other than 8/16/32/64 remain unsupported.
 const std = @import("std");
+const builtin = @import("builtin");
 const Ir = @import("Ir.zig");
+const Module = @import("Module.zig");
+const Lowering = @import("Lowering.zig");
+const GcRuntime = @import("GcRuntime.zig");
+const Formatter = @import("Formatter.zig");
 
 pub const Error = Ir.VerifyError || std.mem.Allocator.Error || error{
     UnsupportedIntegerWidth,
@@ -150,7 +155,7 @@ fn write(allocator: std.mem.Allocator, ir: *const Ir, origins: []const ?Origin, 
     try writeRuntime(ir, w);
     if (usesManagedRuntime(ir)) {
         try w.writeAll("#define NOV_GC_PANIC nov_rt_panic\n");
-        try w.writeAll(@import("GcRuntime.zig").source);
+        try w.writeAll(GcRuntime.source);
         try w.writeByte('\n');
         try w.writeAll(@embedFile("runtime/array.h"));
         if (usesStringConcat(ir)) try w.writeAll(@embedFile("runtime/string.h"));
@@ -810,9 +815,6 @@ fn writeCall(w: *std.Io.Writer, call: anytype) WriteError!void {
 // Tests
 // ---------------------------------------------------------------------------
 
-const Module = @import("Module.zig");
-const Lowering = @import("Lowering.zig");
-
 const test_gpa = std.testing.allocator;
 
 /// Lowers `source`, which must be accepted by the frontend, and emits C.
@@ -902,11 +904,11 @@ const array_example =
 fn arrayTestProgram(source: []const u8) ![]u8 {
     const terminated = try test_gpa.dupeZ(u8, source);
     defer test_gpa.free(terminated);
-    const formatted = try @import("Formatter.zig").format(test_gpa, terminated);
+    const formatted = try Formatter.format(test_gpa, terminated);
     defer test_gpa.free(formatted);
     const formatted_z = try test_gpa.dupeZ(u8, formatted);
     defer test_gpa.free(formatted_z);
-    const again = try @import("Formatter.zig").format(test_gpa, formatted_z);
+    const again = try Formatter.format(test_gpa, formatted_z);
     defer test_gpa.free(again);
     try std.testing.expectEqualStrings(formatted, again);
     const original = try emitSource(source, null);
@@ -1403,7 +1405,7 @@ test "ranges are finite at every integer maximum and accept grouped minimum boun
     try output.writer.print("{d}\n{d}\n", .{ min, max - 1 });
     const terminated = try test_gpa.dupeZ(u8, source.written());
     defer test_gpa.free(terminated);
-    const formatted = try @import("Formatter.zig").format(test_gpa, terminated);
+    const formatted = try Formatter.format(test_gpa, terminated);
     defer test_gpa.free(formatted);
     const c = try emitSource(source.written(), null);
     defer test_gpa.free(c);
@@ -1587,7 +1589,7 @@ test "inclusive ranges visit all integer edge endpoints once including continue 
     try output.writer.print("{d}\n{d}\n{d}\n{d}\n", .{ min, max, max - 1, max });
     const terminated = try test_gpa.dupeZ(u8, source.written());
     defer test_gpa.free(terminated);
-    const formatted = try @import("Formatter.zig").format(test_gpa, terminated);
+    const formatted = try Formatter.format(test_gpa, terminated);
     defer test_gpa.free(formatted);
     const c = try emitSource(source.written(), null);
     defer test_gpa.free(c);
@@ -2769,7 +2771,7 @@ const unconditional_loops =
 const unconditional_output = "ab\n3 2\nabab\n";
 
 test "unconditional loops execute finite controls returns and managed roots after formatting" {
-    const formatted = try @import("Formatter.zig").format(test_gpa, unconditional_loops);
+    const formatted = try Formatter.format(test_gpa, unconditional_loops);
     defer test_gpa.free(formatted);
     for ([_][]const u8{ unconditional_loops, formatted }) |source| {
         const c = try arrayTestProgram(source);
@@ -3441,7 +3443,7 @@ test "stdout failures panic including the program final flush" {
         defer test_gpa.free(injected);
         try compileAndRunExpected(injected, "typedef int nonempty_translation_unit;\n", 1, case.stdout, "panic: stdout write failed\n");
     }
-    if (@import("builtin").os.tag == .linux) {
+    if (builtin.os.tag == .linux) {
         // Exercise real libc errors too: unbuffered writes fail immediately,
         // while buffered writes succeed until emitProgram's final flush.
         for ([_][]const u8{ "_IONBF", "_IOFBF" }) |mode| {
@@ -3805,7 +3807,7 @@ fn compileAndRunMode(c_source: []const u8, harness: []const u8, exit_code: u8, s
     // `zig build test` provides the pinned toolchain's `zig cc`; otherwise use `cc`.
     const zig_exe = std.testing.environ.getAlloc(test_gpa, "NOV_TEST_ZIG") catch null;
     defer if (zig_exe) |path| test_gpa.free(path);
-    const program = "program" ++ (if (@import("builtin").os.tag == .windows) ".exe" else "");
+    const program = "program" ++ (if (builtin.os.tag == .windows) ".exe" else "");
     const flags = [_][]const u8{ "-std=c11", mode, "-fsanitize=undefined", "-fno-sanitize-recover=all", "-Wall", "-Wextra", "-Wpedantic", "-Werror", "generated.c", "harness.c", "-o", program };
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(test_gpa);
