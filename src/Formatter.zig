@@ -268,6 +268,11 @@ test "declarations arithmetic strings and idempotence" {
     try expectFormatted("let flag=!ready\nlet bits=~mask\n", "let flag = !ready\nlet bits = ~mask\n");
 }
 
+test "bitwise syntax roundtrips shared precedence and match alternatives" {
+    try expectFormatted("let f:(a:i8,b:i8)->bool=~a&b^1|2==0", "let f: (a: i8, b: i8) -> bool = ~a & b ^ 1 | 2 == 0\n");
+    try expectFormatted("let f:(a:i8)->i8=match a{0|1=>a&3\n_=>a^2}", "let f: (a: i8) -> i8 = match a {\n    0 | 1 => a & 3\n    _ => a ^ 2\n}\n");
+}
+
 test "string compounds format syntactically without semantic restrictions" {
     try expectFormatted("let f:()->void={let mut s=\"é\\0\"\ns+=s\ns+={s=\"new\"\n\"😀\"}}", "let f: () -> void = {\n    let mut s = \"é\\0\"\n    s += s\n    s += {\n        s = \"new\"\n        \"😀\"\n    }\n}\n");
     try expectFormatted("let f:(s:string)->void={s+=true\ns-=\"a\"}", "let f: (s: string) -> void = {\n    s += true\n    s -= \"a\"\n}\n");

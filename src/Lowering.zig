@@ -83,6 +83,43 @@ test "rejected matches and pipes roll back diagnostics on allocation failure" {
     }) |source| try std.testing.checkAllAllocationFailures(std.testing.allocator, testRejectedMatchAllocations, .{source});
 }
 
+test "rejected bitwise binaries roll back diagnostics on allocation failure" {
+    for ([_][]const u8{
+        "let f: () -> int = 1 & missing",
+        "let f: (n: i8) -> i8 = n | 128",
+        "let f: () -> bool = true ^ false",
+    }) |source| try std.testing.checkAllAllocationFailures(std.testing.allocator, testRejectedMatchAllocations, .{source});
+}
+
+test "bitwise binary operands and spans remain owned after source release" {
+    const source = "let f: (a: i8, b: i8) -> i8 = a & b ^ a | b";
+    var sema = blk: {
+        var module = try Module.init(std.testing.allocator, "bitwise.nov", source);
+        defer module.deinit();
+        var result = try lower(&module);
+        errdefer result.deinit();
+        try std.testing.expect(!module.hasErrors());
+        break :blk result;
+    };
+    defer sema.deinit();
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+    const body = sema.ir.functions.items[0].body.?;
+    var count: usize = 0;
+    for (body.instructions, 0..) |instruction, i| {
+        if (instruction.op != .binary) continue;
+        const binary = instruction.op.binary;
+        try std.testing.expectEqual(([_]Ir.BinaryOp{ .bit_and, .bit_xor, .bit_or })[count], binary.op);
+        try std.testing.expectEqualStrings(([_][]const u8{ "a & b", "a & b ^ a", "a & b ^ a | b" })[count], source[instruction.span.start..instruction.span.end]);
+        try std.testing.expect(@intFromEnum(binary.lhs) < i);
+        try std.testing.expect(@intFromEnum(binary.rhs) < i);
+        try std.testing.expectEqual(instruction.ty, body.instructions[@intFromEnum(binary.lhs)].ty);
+        try std.testing.expectEqual(instruction.ty, body.instructions[@intFromEnum(binary.rhs)].ty);
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), count);
+}
+
 test "interpolation chunks and ordered conversions own storage after source release" {
     var module = try Module.init(std.testing.allocator, "interpolation.nov", "let f: (n: int, s: string) -> string = \"é\\0{n}:{s}/{n}😀\"");
     var sema = lower(&module) catch |err| {

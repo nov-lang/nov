@@ -687,13 +687,16 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
                     break :arithmetic;
                 }
                 switch (binary.op) {
-                    .add, .sub, .mul => {
+                    .add, .sub, .mul, .bit_and, .bit_or, .bit_xor => {
                         try w.writeByte('(');
                         try writeType(ir, w, instruction.ty);
                         const op = switch (binary.op) {
                             .add => "+",
                             .sub => "-",
                             .mul => "*",
+                            .bit_and => "&",
+                            .bit_or => "|",
+                            .bit_xor => "^",
                             else => unreachable,
                         };
                         try w.print(")((uint{d}_t)v{d} {s} (uint{d}_t)v{d})", .{ workingBits(ty), lhs, op, workingBits(ty), rhs });
@@ -712,7 +715,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
                     .le => "<=",
                     .gt => ">",
                     .ge => ">=",
-                    .add, .sub, .mul, .div, .mod => unreachable,
+                    .add, .sub, .mul, .div, .mod, .bit_and, .bit_or, .bit_xor => unreachable,
                 };
                 try w.print("v{d} {s} v{d}", .{ @intFromEnum(binary.lhs), operator, @intFromEnum(binary.rhs) });
             },
@@ -1082,6 +1085,114 @@ test "match and pipes own metadata after source release" {
 
 test "match and pipes clean up every compiler allocation failure" {
     try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{match_pipes});
+}
+
+const bitwise_program =
+    \\let left: () -> i8 = {@print("L")
+    \\    let a: []i8 = [6]
+    \\    a[0]}
+    \\let right: () -> i8 = {@print("R")
+    \\    let s = "alloc" + "ated"
+    \\    let a: []i8 = [3]
+    \\    if s == "allocated" {a[0]} else {0}}
+    \\let early_left: () -> i8 = {return 7} & right()
+    \\let early_right: () -> i8 = left() ^ {return 8}
+    \\let factory: () -> (i8) -> i8 = {@print("F")
+    \\    let s = "a" + "b"
+    \\    if s == "ab" {identity} else {identity}}
+    \\let identity: (n: i8) -> i8 = n
+    \\let main: () -> void = {
+    \\    @println(left() & right(), left() | right(), left() ^ right())
+    \\    @println(early_left(), early_right())
+    \\    @println(factory()(left() | right()))
+    \\    let mut n: i8 = 1
+    \\    @println({n = 6
+    \\        n} & {n = 3
+    \\        n}, n)
+    \\    let chosen = loop {let skipped = {break 5 | n} & right()
+    \\    }
+    \\    let other: i8 = loop {let skipped = left() ^ {break 9}
+    \\    }
+    \\    @println(chosen, other)
+    \\    let mut steps: int = 0
+    \\    loop steps < 3 : steps += 1 {
+    \\        let skipped: i8 = {if steps == 0 {continue}
+    \\            6} & {if steps == 2 {break}
+    \\            right()}
+    \\        @println(skipped)
+    \\    }
+    \\    @println(steps)
+    \\    let typed: i8 = 7
+    \\    @println(match typed {0 | 1 => false
+    \\        _ => true})
+    \\    let a: i8 = 1 | 2 & 4
+    \\    let b: i8 = 7 ^ 3 & 2
+    \\    @println(a, b, ~typed & 3 == 0, 1 | typed ^ 2 == 5)
+    \\}
+;
+const bitwise_output = "LRLRLR2 7 5\nL7 8\nFLR7\n2 3\nL7 9\nR2\n2\ntrue\n0 0 true true\n";
+
+test "bitwise binaries preserve effects controls precedence formatting and forced GC" {
+    const c = try arrayTestProgram(bitwise_program);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, bitwise_output, "", mode);
+}
+
+test "bitwise binary scalar emission needs no runtime helpers" {
+    const c = try emitSource("let f: (a: i8, b: i8) -> i8 = a & b | a ^ b\nlet g: (a: u64, b: u64) -> u64 = a ^ b", null);
+    defer test_gpa.free(c);
+    try std.testing.expect(std.mem.indexOf(u8, c, "nov_rt_") == null);
+    try std.testing.expect(std.mem.indexOf(u8, c, "nov_gc_") == null);
+    try std.testing.expect(std.mem.indexOf(u8, c, "nov_panic") == null);
+    try compileAndRun(c, "int main(void) { return 0; }");
+}
+
+test "bitwise binaries support all fixed and native integer boundaries without helpers" {
+    var source = std.Io.Writer.Allocating.init(test_gpa);
+    defer source.deinit();
+    var output = std.Io.Writer.Allocating.init(test_gpa);
+    defer output.deinit();
+    try source.writer.writeAll("let main: () -> void = {\n");
+    for ([_][]const u8{ "i8", "i16", "i32", "i64", "int", "u8", "u16", "u32", "u64", "uint" }, 0..) |name, i| {
+        const signed = name[0] == 'i';
+        const bits = if (std.mem.eql(u8, name, "int") or std.mem.eql(u8, name, "uint")) Ir.native_pointer_bits else try std.fmt.parseInt(u16, name[1..], 10);
+        const sign: u128 = @as(u128, 1) << @intCast(bits - 1);
+        const max = if (signed) sign - 1 else (sign * 2) - 1;
+        const min: i128 = if (signed) -@as(i128, @intCast(sign)) else 0;
+        try source.writer.print("let lo{d}: {s} = {d}\nlet hi{d}: {s} = {d}\nlet sign{d}: {s} = {d}\n", .{ i, name, min, i, name, max, i, name, if (signed) min else @as(i128, @intCast(sign)) });
+        try source.writer.print("@println(lo{d} & hi{d}, lo{d} | hi{d}, hi{d} ^ hi{d}, ~hi{d} & hi{d}, sign{d} & sign{d}, sign{d} | hi{d})\n", .{ i, i, i, i, i, i, i, i, i, i, i, i });
+        try source.writer.print("let p{d}: {s} = 6\n@println(p{d} & 3, 3 | p{d}, p{d} ^ 3)\n", .{ i, name, i, i, i });
+        try output.writer.print("0 {d} 0 0 {d} {d}\n2 7 5\n", .{ if (signed) @as(i128, -1) else @as(i128, @intCast(max)), if (signed) min else @as(i128, @intCast(sign)), if (signed) @as(i128, -1) else @as(i128, @intCast(max)) });
+    }
+    try source.writer.writeAll("}\n");
+    const c = try emitSource(source.written(), null);
+    defer test_gpa.free(c);
+    try std.testing.expect(std.mem.indexOf(u8, c, "nov_rt_div_") == null);
+    try std.testing.expect(std.mem.indexOf(u8, c, "nov_rt_mod_") == null);
+    try std.testing.expect(std.mem.indexOf(u8, c, "nov_gc_") == null);
+    try std.testing.expect(std.mem.indexOf(u8, c, "uint32_t)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, c, "uint64_t)") != null);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "void nov_main(void); int main(void) { nov_main(); return 0; }", 0, output.written(), "", mode);
+}
+
+test "bitwise binary owned lowering emits after source release" {
+    var sema = blk: {
+        var module = try Module.init(test_gpa, "source-free.nov", bitwise_program);
+        defer module.deinit();
+        var result = try Lowering.lower(&module);
+        errdefer result.deinit();
+        try std.testing.expect(!module.hasErrors());
+        break :blk result;
+    };
+    defer sema.deinit();
+    try sema.ir.verify();
+    const c = try emitProgram(test_gpa, &sema.ir, null);
+    defer test_gpa.free(c);
+    try compileAndRunExpected(c, "typedef int nonempty_translation_unit;", 0, bitwise_output, "");
+}
+
+test "bitwise binaries survive every compiler allocation failure" {
+    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{bitwise_program});
 }
 
 const array_membership =

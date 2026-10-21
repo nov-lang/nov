@@ -1742,6 +1742,32 @@ test "inclusive range headers retain raw tokens and reject non-loop ranges" {
     }
 }
 
+test "bitwise binaries retain shared precedence and reject compound assignments" {
+    var ast = try parse(std.testing.allocator, "let f: (a: i8, b: i8) -> bool = ~a & b ^ 1 | 2 == 0");
+    defer ast.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    const tags = ast.nodes.items(.tag);
+    const data = ast.nodes.items(.data);
+    const comparison = ast.decl(ast.rootDecls()[0]).ast.init_node;
+    try std.testing.expectEqual(Node.Tag.equal_equal, tags[comparison]);
+    const bit_or = data[comparison].lhs;
+    try std.testing.expectEqual(Node.Tag.bit_or, tags[bit_or]);
+    const bit_xor = data[bit_or].lhs;
+    try std.testing.expectEqual(Node.Tag.bit_xor, tags[bit_xor]);
+    const bit_and = data[bit_xor].lhs;
+    try std.testing.expectEqual(Node.Tag.bit_and, tags[bit_and]);
+    try std.testing.expectEqual(Node.Tag.bit_not, tags[data[bit_and].lhs]);
+    for ([_][:0]const u8{
+        "let f: () = {let mut n: int = 1\nn &= 2}",
+        "let f: () = {let mut n: int = 1\nn |= 2}",
+        "let f: () = {let mut n: int = 1\nn ^= 2}",
+    }) |source| {
+        var result = try parse(std.testing.allocator, source);
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expect(result.errors.len != 0);
+    }
+}
+
 test "match subjects alternatives helpers delimiters recovery and OOM" {
     const source = "let f: (n: int) -> int = match n, n {\n0 | 1, _ => {let x: int = n\nx}\n_ => n\n}";
     var ast = try parse(std.testing.allocator, source);

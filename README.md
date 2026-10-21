@@ -1217,7 +1217,20 @@ sign. `MIN / -1` wraps to `MIN`, and `MIN % -1` is zero. Division or remainder b
 zero flushes stdout, writes `panic: division by zero` or `panic: remainder by zero`
 (with a newline) to stderr, and exits with status 1.
 
-C arithmetic uses `uint32_t`/`uint64_t` working values to avoid signed overflow
+Integer bitwise `&`, `|`, `^` and unary `~` are executable for signed/unsigned
+8/16/32/64-bit integers and native `int`/`uint`. Binary operands must have exactly
+the same integer type; the result keeps that type and width, using two's-complement
+bit patterns without overflow panics. A known operand or expected result type can
+constrain literals, including through block, match and loop results. Literal bounds
+are checked; there are no defaults, widening or implicit signedness conversions.
+Booleans are not integers: use `and`/`or` for boolean operations. Binary operands
+execute once, left to right; terminal paths skip remaining operands. Match-pattern
+`0 | 1` remains a literal alternative, not a computed bitwise pattern. Computed
+patterns, shifts and bitwise compound assignments (`&=`, `|=`, `^=`) remain
+unsupported. Precedence is unchanged: `~` binds tighter than the shared,
+left-associative `& ^ |` level, which binds tighter than comparisons.
+
+C arithmetic and binary bitwise operations use `uint32_t`/`uint64_t` working values to avoid signed overflow
 and narrow integer promotions. Conversion back to signed integers relies on the
 modular unsigned-to-signed conversion provided by GCC, Clang and MSVC. Shifts,
 128-bit and odd-width backend integers remain unsupported. `int` and `uint` are
@@ -1275,10 +1288,10 @@ nov run examples/fibo.nov --release # 55
 | Remainder Division    | a % b <br> a %= b  | [Integers](#Integers)                        | TODO                                                                |
 | Bit Shift Left        | a << b             | [Integers](#Integers)                        | TODO                                                                |
 | Bit Shift Right       | a >> b             | [Integers](#Integers)                        | TODO                                                                |
-| Bitwise And           | a & b              | [Integers](#Integers)                        | TODO                                                                |
-| Bitwise Or            | a \| b             | [Integers](#Integers)                        | TODO                                                                |
-| Bitwise Xor           | a ^ b              | [Integers](#Integers)                        | TODO                                                                |
-| Bitwise Not           | ~a                 | [Integers](#Integers)                        | TODO                                                                |
+| Bitwise And           | a & b              | [Integers](#Integers)                        | Executable; exact matching integer types                                                                |
+| Bitwise Or            | a \| b             | [Integers](#Integers)                        | Executable; exact matching integer types                                                                |
+| Bitwise Xor           | a ^ b              | [Integers](#Integers)                        | Executable; exact matching integer types                                                                |
+| Bitwise Not           | ~a                 | [Integers](#Integers)                        | Executable; same-width integer complement                                                                |
 | Logical And           | a **and** b        | bool                                         | TODO                                                                |
 | Logical Or            | a **or** b         | bool                                         | TODO                                                                |
 | Boolean Not           | !a                 | bool                                         | TODO                                                                |

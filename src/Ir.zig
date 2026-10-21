@@ -30,7 +30,7 @@ pub const Function = struct {
 pub const Body = struct { instructions: []const Instruction, result: ValueId };
 pub const Instruction = struct { ty: TypeId, span: Span, op: Operation };
 pub const UnaryOp = enum { negate, bit_not, bool_not };
-pub const BinaryOp = enum { add, sub, mul, div, mod, eq, ne, lt, le, gt, ge };
+pub const BinaryOp = enum { add, sub, mul, div, mod, bit_and, bit_or, bit_xor, eq, ne, lt, le, gt, ge };
 pub const Operation = union(enum) {
     /// Decimal integers, true/false booleans, or a shared immutable string.
     to_string: ValueId,
@@ -615,7 +615,7 @@ fn validateBody(self: *const Ir, function: Function, body: Body) VerifyError!voi
                 if (lhs != rhs) return error.OperandTypeMismatch;
                 const operand = self.getType(lhs) orelse return error.InvalidTypeId;
                 switch (binary.op) {
-                    .add, .sub, .mul, .div, .mod => {
+                    .add, .sub, .mul, .div, .mod, .bit_and, .bit_or, .bit_xor => {
                         if (operand != .integer and !(operand == .string and binary.op == .add)) return error.InvalidOperation;
                         if (instruction.ty != lhs) return error.OperandTypeMismatch;
                     },
@@ -2414,7 +2414,7 @@ test "all integer unary binary and comparison operations have exact types" {
         const signature = try ir.internType(.{ .function = .{ .params = &.{integer}, .result = integer } });
         for (std.enums.values(BinaryOp)) |op| {
             const comparison = switch (op) {
-                .add, .sub, .mul, .div, .mod => false,
+                .add, .sub, .mul, .div, .mod, .bit_and, .bit_or, .bit_xor => false,
                 else => true,
             };
             const result_type = if (comparison) fixture.boolean else integer;
@@ -2522,6 +2522,36 @@ test "body validation rejects invalid ids parameter types spans and returns" {
     try fixture.ir.verify();
 }
 
+test "bitwise binary verifier rejects invalid operands result types and ids" {
+    var fixture = try TestFunctions.init(std.testing.allocator);
+    defer fixture.ir.deinit();
+    const integer = fixture.integer;
+    const first = TestFunctions.instruction(integer, .{ .parameter = 0 });
+    const unsigned_constant = try fixture.ir.internConstant(.{ .ty = fixture.unsigned, .value = .{ .unsigned_integer = 1 } });
+    const second = TestFunctions.instruction(fixture.unsigned, .{ .constant = unsigned_constant });
+    for ([_]BinaryOp{ .bit_and, .bit_or, .bit_xor }) |op| {
+        try fixture.reject(error.OperandTypeMismatch, &.{ first, second, TestFunctions.instruction(integer, .{ .binary = .{ .op = op, .lhs = @enumFromInt(0), .rhs = @enumFromInt(1) } }) }, @enumFromInt(2));
+        try fixture.reject(error.OperandTypeMismatch, &.{ first, TestFunctions.instruction(fixture.unsigned, .{ .binary = .{ .op = op, .lhs = @enumFromInt(0), .rhs = @enumFromInt(0) } }) }, @enumFromInt(1));
+        try fixture.reject(error.OperandTypeMismatch, &.{ first, TestFunctions.instruction(fixture.boolean, .{ .binary = .{ .op = op, .lhs = @enumFromInt(0), .rhs = @enumFromInt(0) } }) }, @enumFromInt(1));
+        for ([_]u32{ 1, 999 }) |invalid| {
+            try fixture.reject(error.InvalidValueId, &.{ first, TestFunctions.instruction(integer, .{ .binary = .{ .op = op, .lhs = @enumFromInt(0), .rhs = @enumFromInt(invalid) } }) }, @enumFromInt(1));
+        }
+        const narrow = try fixture.ir.internType(.{ .integer = .{ .signedness = .signed, .bits = 8 } });
+        const number = try fixture.ir.internConstant(.{ .ty = narrow, .value = .{ .signed_integer = 1 } });
+        try fixture.reject(error.OperandTypeMismatch, &.{ first, TestFunctions.instruction(narrow, .{ .constant = number }), TestFunctions.instruction(integer, .{ .binary = .{ .op = op, .lhs = @enumFromInt(0), .rhs = @enumFromInt(1) } }) }, @enumFromInt(2));
+        const string = try fixture.ir.internType(.string);
+        const constant = try fixture.ir.internConstant(.{ .ty = string, .value = .{ .string = "" } });
+        const array = try fixture.ir.internType(.{ .array = integer });
+        for ([_]Instruction{
+            TestFunctions.instruction(string, .{ .constant = constant }),
+            TestFunctions.instruction(array, .{ .array_literal = &.{} }),
+            TestFunctions.instruction(fixture.signature, .{ .function_ref = fixture.function }),
+        }) |invalid| {
+            try fixture.reject(error.InvalidOperation, &.{ invalid, TestFunctions.instruction(invalid.ty, .{ .binary = .{ .op = op, .lhs = @enumFromInt(0), .rhs = @enumFromInt(0) } }) }, @enumFromInt(1));
+        }
+    }
+}
+
 test "SSA operands must precede their use and operation types must agree" {
     var fixture = try TestFunctions.init(std.testing.allocator);
     defer fixture.ir.deinit();
@@ -2545,7 +2575,7 @@ test "SSA operands must precede their use and operation types must agree" {
     for ([_]UnaryOp{ .negate, .bit_not }) |op| {
         try fixture.reject(error.InvalidOperation, &.{ boolean_first, TestFunctions.instruction(fixture.boolean, .{ .unary = .{ .op = op, .operand = @enumFromInt(0) } }) }, @enumFromInt(1));
     }
-    for ([_]BinaryOp{ .add, .sub, .mul, .div, .mod, .lt, .le, .gt, .ge }) |op| {
+    for ([_]BinaryOp{ .add, .sub, .mul, .div, .mod, .bit_and, .bit_or, .bit_xor, .lt, .le, .gt, .ge }) |op| {
         try fixture.reject(error.InvalidOperation, &.{ boolean_first, TestFunctions.instruction(fixture.boolean, .{ .binary = .{ .op = op, .lhs = @enumFromInt(0), .rhs = @enumFromInt(0) } }) }, @enumFromInt(1));
     }
     // A value in another function cannot satisfy an operand in this body.

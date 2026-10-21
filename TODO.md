@@ -1,4 +1,13 @@
 # TODO
+
+Executable scalar status: integer binary `&`, `|`, `^` and unary `~` support
+exact matching fixed-width 8/16/32/64 and native `int`/`uint` types, with same-width
+two's-complement results, contextual literals, no widening/defaults and no overflow
+panic. Booleans use `and`/`or`; match-pattern `|` remains alternatives. Shifts,
+bitwise compound assignments and computed match patterns remain unsupported.
+See README's integer section for the executable contract; proposals below are
+not an implementation checklist.
+
 Next step: add new IR that
 - forward declaration
 - resolve literals

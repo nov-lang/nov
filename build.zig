@@ -121,6 +121,7 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     _ = fixtures.add("fibo.nov", @embedFile("examples/fibo.nov"));
     _ = fixtures.add("fizzbuzz.nov", @embedFile("examples/fizzbuzz.nov"));
     _ = fixtures.add("range-search.nov", @embedFile("examples/range-search.nov"));
+    _ = fixtures.add("bitwise.nov", "let main: () -> void = {let n: i8 = -128\nlet m: u64 = 18446744073709551615\n@println(n | 127, n & 127, n ^ -1, m ^ m)}\n");
     _ = fixtures.add("strings.nov", @embedFile("examples/strings.nov"));
     _ = fixtures.add("interpolation.nov", @embedFile("examples/interpolation.nov"));
     _ = fixtures.add("interpolation-format.nov", "let main: () -> void = {let n: int = 1\n@println(\"{n:02}\")}\n");
@@ -352,6 +353,39 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         fizzbuzz.expectStdOutEqual("1\n2\nFizz\n4\nBuzz\nFizz\n7\n8\nFizz\nBuzz\n11\nFizz\n13\n14\nFizzBuzz\n");
         fizzbuzz.expectStdErrEqual("");
         test_step.dependOn(&fizzbuzz.step);
+
+        const bits = b.addRunArtifact(exe);
+        bits.step.name = b.fmt("CLI: bitwise ({s})", .{mode});
+        bits.setCwd(fixtures.getDirectory());
+        bits.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+        bits.setEnvironmentVariable("NOV_CC", "");
+        bits.setEnvironmentVariable("CC", "");
+        bits.addArgs(&.{ "run", "bitwise.nov" });
+        if (mode.len != 0) bits.addArg(mode);
+        bits.expectExitCode(0);
+        bits.expectStdOutEqual("-1 0 127 0\n");
+        bits.expectStdErrEqual("");
+        test_step.dependOn(&bits.step);
+
+        const bits_build = b.addRunArtifact(exe);
+        bits_build.step.name = b.fmt("CLI: build bitwise ({s})", .{mode});
+        bits_build.setCwd(fixtures.getDirectory());
+        bits_build.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+        bits_build.setEnvironmentVariable("NOV_CC", "");
+        bits_build.setEnvironmentVariable("CC", "");
+        bits_build.addArgs(&.{ "build", "bitwise.nov" });
+        if (mode.len != 0) bits_build.addArg(mode);
+        bits_build.addArg("-o");
+        const bits_program = bits_build.addOutputFileArg(if (exe.root_module.resolved_target.?.result.os.tag == .windows) "bits.exe" else "bits");
+        bits_build.expectExitCode(0);
+        bits_build.expectStdOutEqual("");
+        bits_build.expectStdErrEqual("");
+        const bits_run = std.Build.Step.Run.create(b, b.fmt("CLI: execute bitwise ({s})", .{mode}));
+        bits_run.addFileArg(bits_program);
+        bits_run.expectExitCode(0);
+        bits_run.expectStdOutEqual("-1 0 127 0\n");
+        bits_run.expectStdErrEqual("");
+        test_step.dependOn(&bits_run.step);
 
         const search_output = "true false false\nFound 5 Not found\nExhausted at MAX\n";
         const search = b.addRunArtifact(exe);

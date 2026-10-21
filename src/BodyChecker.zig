@@ -325,7 +325,7 @@ const Context = struct {
             },
             .negation, .bit_not, .bool_not, .@"return" => return self.probeBreaks(data.rhs, depth + 1),
             .field_access => return self.probeBreaks(data.lhs, depth + 1),
-            .add, .sub, .mul, .div, .mod, .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal, .bool_and, .bool_or, .in, .array_access, .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod => return (try self.probeBreaks(data.lhs, depth + 1)) orelse (try self.probeBreaks(data.rhs, depth + 1)),
+            .add, .sub, .mul, .div, .mod, .bit_and, .bit_or, .bit_xor, .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal, .bool_and, .bool_or, .in, .array_access, .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod => return (try self.probeBreaks(data.lhs, depth + 1)) orelse (try self.probeBreaks(data.rhs, depth + 1)),
             else => {},
         }
         return null;
@@ -434,7 +434,7 @@ const Context = struct {
                 break :blk (try self.probe(branch.then_expr, depth + 1)) orelse try self.probe(branch.else_expr, depth + 1);
             },
             .negation, .bit_not => try self.probe(data.rhs, depth + 1),
-            .add, .sub, .mul, .div, .mod => (try self.probe(data.lhs, depth + 1)) orelse try self.probe(data.rhs, depth + 1),
+            .add, .sub, .mul, .div, .mod, .bit_and, .bit_or, .bit_xor => (try self.probe(data.lhs, depth + 1)) orelse try self.probe(data.rhs, depth + 1),
             .in, .bool_not, .bool_and, .bool_or, .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal => .{ .ty = try self.ir.internType(.boolean) },
             .match => blk: {
                 for (ast.fullMatch(node).?.ast.cases) |case| {
@@ -483,7 +483,7 @@ const Context = struct {
             },
             .identifier, .call, .call_one => return (try self.expression(node, null, depth + 1)) != null,
             .negation, .bit_not, .bool_not => return self.validateUnconstrained(data.rhs, depth + 1),
-            .add, .sub, .mul, .div, .mod, .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal, .bool_and, .bool_or => {
+            .add, .sub, .mul, .div, .mod, .bit_and, .bit_or, .bit_xor, .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal, .bool_and, .bool_or => {
                 const lhs = try self.validateUnconstrained(data.lhs, depth + 1);
                 const rhs = try self.validateUnconstrained(data.rhs, depth + 1);
                 return lhs and rhs;
@@ -598,13 +598,16 @@ const Context = struct {
                 },
                 .operand = try emitter.value(data.rhs),
             } },
-            .add, .sub, .mul, .div, .mod, .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal => .{ .binary = .{
+            .add, .sub, .mul, .div, .mod, .bit_and, .bit_or, .bit_xor, .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal => .{ .binary = .{
                 .op = switch (tag) {
                     .add => .add,
                     .sub => .sub,
                     .mul => .mul,
                     .div => .div,
                     .mod => .mod,
+                    .bit_and => .bit_and,
+                    .bit_or => .bit_or,
+                    .bit_xor => .bit_xor,
                     .equal_equal => .eq,
                     .bang_equal => .ne,
                     .less_than => .lt,
@@ -1351,7 +1354,7 @@ const Context = struct {
                 }
                 return if (self.terminated) (if (expected) |want| want.ty else merged) else merged;
             },
-            .add, .sub, .mul, .div, .mod => {
+            .add, .sub, .mul, .div, .mod, .bit_and, .bit_or, .bit_xor => {
                 const integer_context = if (expected) |want| (if (self.ir.getType(want.ty).? == .integer) expected else null) else null;
                 const operand = (try self.probe(data.lhs, depth + 1)) orelse (try self.probe(data.rhs, depth + 1)) orelse integer_context orelse return self.missingOperandType(node, data.lhs, data.rhs, expected, depth);
                 if (self.ir.getType(operand.ty).? != .integer and !(self.ir.getType(operand.ty).? == .string and ast.nodes.items(.tag)[node] == .add)) return self.fail(.operator_not_supported, node, operand.annotation);
@@ -1537,6 +1540,64 @@ test "match and pipes reject unsupported patterns arity defaults and inexact typ
         try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
         try std.testing.expect(!sema.lowering_complete);
         try std.testing.expectEqual(@as(usize, 0), sema.ir.functions.items.len);
+    }
+}
+
+test "bitwise binaries infer exact integer operands through late result hints" {
+    for ([_][]const u8{ "&", "|", "^" }) |op| {
+        inline for ([_][]const u8{
+            "let f: () -> i8 = 1 {s} 2",
+            "let f: (n: u64) -> u64 = 1 {s} n",
+            "let f: (n: int) -> int = n {s} 1",
+            "let f: (n: i16) -> void = {{let x = {{1 {s} n}}\n@println(x)}}",
+            "let f: (n: i16) -> void = {{let x = if true {{1 {s} 2}} else {{n}}\n@println(x)}}",
+            "let f: (n: i16) -> void = {{let x = match true {{true => 1 {s} 2\n_ => n}}\n@println(x)}}",
+            "let f: (n: i16) -> void = {{let x = loop {{if false {{break 1 {s} 2}}\nbreak n}}\n@println(x)}}",
+            "let f: (n: i16) -> void = {{let x = loop {{let skipped = {{break 1 {s} n}} & n\n}}\n@println(x)}}",
+            "let f: (n: i16) -> void = {{let x = loop {{let skipped = n {s} {{break n}}\n}}\n@println(x)}}",
+        }) |template| {
+            const source = try std.fmt.allocPrint(std.testing.allocator, template, .{op});
+            defer std.testing.allocator.free(source);
+            var module = try Module.init(std.testing.allocator, "bitwise.nov", source);
+            defer module.deinit();
+            var sema = try @import("Lowering.zig").lower(&module);
+            defer sema.deinit();
+            try std.testing.expect(!module.hasErrors());
+            try std.testing.expect(sema.lowering_complete);
+            try sema.ir.verify();
+        }
+    }
+}
+
+test "bitwise binaries reject defaults nonintegers mismatches and literal bounds" {
+    for ([_][]const u8{ "&", "|", "^" }) |op| {
+        inline for ([_]struct { source: []const u8, tag: Module.Diagnostic.Tag }{
+            .{ .source = "let f: () -> void = {{let n = 1 {s} 2\n}}", .tag = .literal_needs_type },
+            .{ .source = "let f: () -> int = 1 {s} missing", .tag = .unknown_name },
+            .{ .source = "let f: () -> void = {{let n = 1 {s} missing\n}}", .tag = .unknown_name },
+            .{ .source = "let f: () -> i8 = 128 {s} 0", .tag = .literal_out_of_range },
+            .{ .source = "let f: () -> u8 = 0 {s} -1", .tag = .literal_out_of_range },
+            .{ .source = "let f: (a: i8, b: i16) -> i8 = a {s} b", .tag = .expression_type_mismatch },
+            .{ .source = "let f: (a: u8, b: i8) -> u8 = a {s} b", .tag = .expression_type_mismatch },
+            .{ .source = "let f: (a: i8) -> i16 = a {s} 1", .tag = .expression_type_mismatch },
+            .{ .source = "let f: () -> bool = true {s} false", .tag = .operator_not_supported },
+            .{ .source = "let f: () -> string = \"a\" {s} \"b\"", .tag = .operator_not_supported },
+            .{ .source = "let f: (a: []int) -> []int = a {s} a", .tag = .operator_not_supported },
+            .{ .source = "let f: (a: () -> int) -> int = a {s} a", .tag = .operator_not_supported },
+            .{ .source = "let f: (a: int) -> int = match a {{{{0 {s} 1}} => 2\n_ => 3}}", .tag = .unsupported_match_pattern },
+        }) |case| {
+            const source = try std.fmt.allocPrint(std.testing.allocator, case.source, .{op});
+            defer std.testing.allocator.free(source);
+            var module = try Module.init(std.testing.allocator, "bitwise-error.nov", source);
+            defer module.deinit();
+            var sema = try @import("Lowering.zig").lower(&module);
+            defer sema.deinit();
+            try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+            try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
+            try std.testing.expect(module.sourceSlice(module.diagnostics.items[0].span).?.len != 0);
+            try std.testing.expect(!sema.lowering_complete);
+            try std.testing.expectEqual(@as(usize, 0), sema.ir.functions.items.len);
+        }
     }
 }
 
