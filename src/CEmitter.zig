@@ -311,15 +311,24 @@ fn usesPrinting(ir: *const Ir) bool {
 fn writeRuntime(ir: *const Ir, w: *std.Io.Writer) WriteError!void {
     const printing = usesPrinting(ir);
     var panic_used = printing or usesManagedRuntime(ir);
+    var source_panic = false;
     for (ir.functions.items) |function| {
         for (function.body.?.instructions) |instruction| {
             if (instruction.op == .binary and (instruction.op.binary.op == .div or instruction.op.binary.op == .mod)) panic_used = true;
+            if (instruction.op == .panic) source_panic = true;
         }
     }
-    if (!panic_used) return;
-    try w.writeAll(
-        "#include <stdio.h>\n#include <stdlib.h>\n\n" ++
-            "static _Noreturn void nov_rt_panic(const char *message) {\n" ++
+    if (!panic_used and !source_panic) return;
+    try w.writeAll("#include <stdio.h>\n#include <stdlib.h>\n\n");
+    if (source_panic) try w.writeAll(
+        "static _Noreturn void nov_rt_panic_bytes(const unsigned char *message, uintptr_t len) {\n" ++
+            "    (void)fflush(stdout);\n" ++
+            "    (void)fwrite(\"panic: \", 1, 7, stderr);\n" ++
+            "    if (len) (void)fwrite(message, 1, (size_t)len, stderr);\n" ++
+            "    (void)fputc('\\n', stderr);\n    exit(1);\n}\n",
+    );
+    if (panic_used) try w.writeAll(
+        "static _Noreturn void nov_rt_panic(const char *message) {\n" ++
             "    (void)fflush(stdout);\n    (void)fprintf(stderr, \"panic: %s\\n\", message);\n    exit(1);\n}\n",
     );
     if (printing) try w.writeAll(
@@ -396,6 +405,7 @@ fn writeParamTypes(ir: *const Ir, w: *std.Io.Writer, params: []const Ir.TypeId) 
 }
 
 fn writeSignature(ir: *const Ir, w: *std.Io.Writer, function: Ir.Function) WriteError!void {
+    if (function.noreturn) try w.writeAll("_Noreturn ");
     const signature = ir.types.items[@intFromEnum(function.ty)].function;
     try writeType(ir, w, signature.result);
     try w.writeByte(' ');
@@ -507,7 +517,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
             value_used[@intFromEnum(binary.rhs)] = true;
         },
         .call => |call| {
-            value_used[@intFromEnum(call.callee)] = true;
+            if (!call.noreturn or std.mem.eql(u8, ir.functions.items[@intFromEnum(body.instructions[@intFromEnum(call.callee)].op.function_ref)].name, function.name)) value_used[@intFromEnum(call.callee)] = true;
             for (call.args) |arg| value_used[@intFromEnum(arg)] = true;
         },
         .print => |print| for (print.args) |arg| {
@@ -522,11 +532,12 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
             value_used[@intFromEnum(region.then_value)] = true;
             if (region.else_value) |value| value_used[@intFromEnum(value)] = true;
         },
+        .panic => |value| value_used[@intFromEnum(value)] = true,
         .return_value, .loop_break => |value| {
             if (value) |v| value_used[@intFromEnum(v)] = true;
         },
         .loop => |region| {
-            value_used[@intFromEnum(region.condition)] = true;
+            if (!region.unconditional) value_used[@intFromEnum(region.condition)] = true;
             value_used[@intFromEnum(region.body)] = true;
             if (region.continuation) |value| value_used[@intFromEnum(value)] = true;
             if (region.else_value) |value| value_used[@intFromEnum(value)] = true;
@@ -538,7 +549,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
     if (managed) {
         // The embedded internal API also serves library emission, whose host
         // owns shutdown. Keep strict C11 unused-function warnings portable.
-        try w.writeAll("    (void)nov_gc_register_globals; (void)nov_gc_unregister_globals; (void)nov_gc_shutdown;\n    (void)nov_array_clone; (void)nov_array_index; (void)nov_array_append;\n");
+        try w.writeAll("    (void)nov_gc_register_globals; (void)nov_gc_unregister_globals; (void)nov_gc_shutdown; (void)nov_gc_pop;\n    (void)nov_array_clone; (void)nov_array_index; (void)nov_array_append;\n");
         var roots: usize = 0;
         for (signature.params) |param| if (Ir.isManaged(ir.getType(param).?)) {
             roots += rootCount(ir, param);
@@ -585,7 +596,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
                     }
                     try w.print("    while (true) {{\n    goto nov_cond{d};\n    nov_cond{d}:;\n", .{ end, end });
                 }
-                if (region.body_start == i and !Ir.terminates(body, region.condition))
+                if (region.body_start == i and !region.unconditional and !Ir.terminates(body, region.condition))
                     try w.print("    if (!v{d}) goto nov_{s}{d};\n", .{ @intFromEnum(region.condition), if (region.else_start != null) "else" else "exit", end });
                 if (region.continuation_start != null and region.continuation_start.? == i)
                     try w.print("    goto nov_cont{d};\n    nov_cont{d}:;\n", .{ end, end });
@@ -650,6 +661,38 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
             continue;
         }
         const ty = ir.types.items[@intFromEnum(instruction.ty)];
+        if (instruction.op == .call and instruction.op.call.noreturn) {
+            const call = instruction.op.call;
+            const target = body.instructions[@intFromEnum(call.callee)].op.function_ref;
+            try w.writeAll("    ");
+            if (std.mem.eql(u8, ir.functions.items[@intFromEnum(target)].name, function.name)) {
+                // Volatile indirection avoids C compilers rejecting valid Nov
+                // recursion under -Winfinite-recursion. C11 has no noreturn
+                // pointer qualifier, so explicitly represent the absent successor.
+                try w.writeAll("{ ");
+                try writeType(ir, w, body.instructions[@intFromEnum(call.callee)].ty);
+                try w.print(" volatile nov_target = v{d};\n    nov_target(", .{@intFromEnum(call.callee)});
+                for (call.args, 0..) |arg, index| {
+                    if (index != 0) try w.writeAll(", ");
+                    try w.print("v{d}", .{@intFromEnum(arg)});
+                }
+                try w.writeAll(");\n    for (;;) {}\n    }\n");
+            } else {
+                try writeFunctionName(w, ir.functions.items[@intFromEnum(target)].name);
+                try w.writeByte('(');
+                for (call.args, 0..) |arg, index| {
+                    if (index != 0) try w.writeAll(", ");
+                    try w.print("v{d}", .{@intFromEnum(arg)});
+                }
+                try w.writeAll(");\n");
+            }
+            continue;
+        }
+        if (instruction.op == .panic) {
+            const value = @intFromEnum(instruction.op.panic);
+            try w.print("    nov_rt_panic_bytes(v{d}.data, v{d}.len);\n", .{ value, value });
+            continue;
+        }
         if (instruction.op == .return_value) {
             if (managed) try w.writeAll("    nov_gc_pop(&nov_rt_heap, &nov_frame);\n");
             if (instruction.op.return_value) |value| {
@@ -804,7 +847,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
                 try w.print("v{d} {s} v{d}", .{ @intFromEnum(binary.lhs), operator, @intFromEnum(binary.rhs) });
             },
             .call => |call| try writeCall(w, call),
-            .loop, .loop_break, .loop_continue, .return_value, .print, .short_circuit, .branch, .local_store => unreachable,
+            .panic, .loop, .loop_break, .loop_continue, .return_value, .print, .short_circuit, .branch, .local_store => unreachable,
         }
         try w.writeAll(";\n");
         if (!value_used[i] or instruction.op == .local_slot) try w.print("    (void)v{d};\n", .{i});
@@ -1028,6 +1071,221 @@ test "generic union instantiation and propagation own source and survive OOM" {
     defer test_gpa.free(c);
     try compileAndRunExpected(c, "typedef int nonempty_translation_unit;", 0, generic_union_output, "");
     try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{generic_union_program});
+}
+
+const noreturn_program =
+    \\@[noreturn]
+    \\let recursive:()=recursive()
+    \\@[noreturn]
+    \\let stop:(s:string)->void=@panic(s)
+    \\@[noreturn]
+    \\let spin:()=loop {loop {break}
+    \\    continue}
+    \\let A=struct{
+    \\    @[noreturn]
+    \\    @[public]
+    \\    let halt:(s:string)=stop(s)
+    \\}
+    \\let side:()->int={@print("bad")
+    \\    1}
+    \\let arg:()->int={@print("A")
+    \\    7}
+    \\let f:(a:int,b:int,c:int)->int=a+b+c
+    \\let indirect:(g:()->void)={g()
+    \\    @print("I")}
+    \\let normal:()={}
+    \\@[noreturn]
+    \\let choose:(b:bool)=if b {A.halt("hé\0"+"!")} else {spin()}
+    \\let main:()={indirect(normal)
+    \\    @println(f(arg(), choose(true), side()))}
+;
+
+test "noreturn metadata owns source survives OOM formatting and GC with C11 prototypes" {
+    const formatted = try Formatter.format(test_gpa, noreturn_program);
+    defer test_gpa.free(formatted);
+    for ([_][]const u8{ noreturn_program, formatted }) |source| {
+        const c = try arrayTestProgram(source);
+        defer test_gpa.free(c);
+        try std.testing.expect(std.mem.indexOf(u8, c, "_Noreturn void nov_stop(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, c, "_Noreturn void nov_spin(") != null);
+        try std.testing.expect(std.mem.indexOf(u8, c, "typedef _Noreturn") == null);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode|
+            try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 1, "IA", "panic: hé\x00!\n", mode);
+    }
+    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{noreturn_program});
+}
+
+test "terminal loop conditions skip body continuation exhaustion and preserve nested effects" {
+    const prelude = "@[noreturn]\nlet stop:()=@panic(\"stop\")\n";
+    const Case = struct { body: []const u8, stdout: []const u8 = "", stderr: []const u8 = "panic: stop\n", code: u8 = 1, annotation: []const u8 = "@[noreturn]\n" };
+    for ([_]Case{
+        .{ .body = "loop @panic(\"stop\") {}" },
+        .{ .body = "loop stop() {}" },
+        .{ .body = "loop {@print(\"C\")\nstop()} : @print(\"bad cont\") {@print(\"bad body\")\nbreak} else {@print(\"bad else\")}", .stdout = "C" },
+        .{ .body = "loop {if true {@print(\"T\")\nstop()} else {@print(\"bad branch\")\n@panic(\"wrong\")}} {@print(\"bad body\")}", .stdout = "T" },
+        .{ .body = "loop {@print(\"O\")\nloop {@print(\"I\")\nstop()} {@print(\"bad inner\")}} {@print(\"bad outer\")}", .stdout = "OI" },
+        .{ .body = "loop {loop {break} {@print(\"bad inner\")}\n@print(\"C\")\nstop()} {@print(\"bad outer\")}", .stdout = "C" },
+        .{ .body = "{loop {return} {@print(\"bad body\")}\n}", .annotation = "", .stderr = "", .code = 0 },
+        .{ .body = "{loop {break} {@print(\"bad body\")} else {@print(\"bad else\")}\n@println(\"tail\")}", .annotation = "", .stdout = "tail\n", .stderr = "", .code = 0 },
+        .{ .body = "{loop {if true {break} else {stop()}} {@print(\"bad body\")}\n@println(\"tail\")}", .annotation = "", .stdout = "tail\n", .stderr = "", .code = 0 },
+        .{ .body = "{let mut n:int=0\nloop {n+=1\nif n<3 {continue} else {@print(n)\nstop()}} {break}}", .stdout = "3" },
+        .{ .body = "{let mut n:int=0\nloop {n+=1\nif n<3 {continue}\nbreak} {@print(\"bad body\")}\n@println(n)}", .annotation = "", .stdout = "3\n", .stderr = "", .code = 0 },
+        .{ .body = "loop {let mut n:int=0\nloop {n+=1\nif n<3 {continue}\nbreak} {@print(\"bad inner\")}\n@print(n)\nstop()} {@print(\"bad outer\")}", .stdout = "3" },
+    }) |case| {
+        const source = try std.mem.concat(test_gpa, u8, &.{ prelude, case.annotation, "let main:()=", case.body });
+        defer test_gpa.free(source);
+        const c = try arrayTestProgram(source);
+        defer test_gpa.free(c);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode|
+            try compileAndRunMode(c, "typedef int nonempty_translation_unit;", case.code, case.stdout, case.stderr, mode);
+    }
+}
+
+test "direct noreturn calls are terminal in operands branches and argument paths" {
+    const prelude =
+        \\@[noreturn]
+        \\let stop:()=@panic("stop")
+        \\@[noreturn]
+        \\let take:(s:string)=@panic(s)
+        \\let side:()->int={@print("bad")
+        \\    9}
+        \\let arg:()->int={@print("A")
+        \\    1}
+        \\let f:(a:int,b:int,c:int)->int=a+b+c
+        \\let returning:()->string=take({return "returned"})
+        \\let main:()=
+    ;
+    for ([_][]const u8{
+        "@println(stop()+side())",                            "@println(-stop())",                "@println(stop()==stop())",
+        "@println(arg()+stop(), side())",                     "@println(f(arg(),stop(),side()))", "@println(if false {side()} else {stop()})",
+        "@println(match true {true=>stop()\nfalse=>side()})", "@println(true and stop(),side())", "@println(stop()(side()))",
+        "@panic(stop())",                                     "@println(\"{stop()}\")",           "{@print(returning())\nstop()}",
+        "@println(take(stop()),side())",
+    }) |body| {
+        const source = try std.mem.concat(test_gpa, u8, &.{ prelude, body });
+        defer test_gpa.free(source);
+        const c = try arrayTestProgram(source);
+        defer test_gpa.free(c);
+        const output: []const u8 = if (std.mem.indexOf(u8, body, "arg()") != null) "A" else if (std.mem.indexOf(u8, body, "returning()") != null) "returned" else "";
+        for ([_][]const u8{ "-O0", "-O3" }) |mode|
+            try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 1, output, "panic: stop\n", mode);
+    }
+}
+
+const panic_program =
+    \\let message: () -> string = {@print("M")
+    \\    "hé\0" + "!"}
+    \\let stop: (b: bool) -> int = match b {
+    \\    true => @panic("{message()}")
+    \\    false => @panic("wrong")
+    \\}
+    \\let main: () = @println("before", stop(true), "after")
+;
+
+test "panic prints UTF8 and embedded NUL once with allocating interpolation and forced GC" {
+    const c = try arrayTestProgram(panic_program);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 1, "M", "panic: hé\x00!\n", mode);
+}
+
+test "panic literal empty and NUL messages need no allocation" {
+    for ([_][]const u8{ "", "hé\\0!" }, [_][]const u8{ "panic: \n", "panic: hé\x00!\n" }) |message, expected| {
+        const source = try std.fmt.allocPrint(test_gpa, "let main: () = @panic(\"{s}\")", .{message});
+        defer test_gpa.free(source);
+        var module = try Module.init(test_gpa, "panic.nov", source);
+        defer module.deinit();
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        try std.testing.expect(!module.hasErrors());
+        const c = try emitProgram(test_gpa, &sema.ir, null);
+        defer test_gpa.free(c);
+        const exhausted = try std.mem.concat(test_gpa, u8, &.{ "#include <stdlib.h>\nstatic void *test_malloc(size_t n) { (void)n; return NULL; }\n#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n", c });
+        defer test_gpa.free(exhausted);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode|
+            try compileAndRunMode(exhausted, "typedef int nonempty_translation_unit;", 1, "", expected, mode);
+    }
+}
+
+test "panic branches operands and terminal arguments preserve selected effects" {
+    const prelude =
+        \\let U = union {ok: int, err: string,}
+        \\let side: () -> int = {@print("bad")
+        \\    9}
+        \\let arg: () -> int = {@print("A")
+        \\    1}
+        \\let f: (a: int, b: int, c: int) -> int = a + b + c
+        \\let pick: (b: bool) -> int = if b {@panic("stop")} else {arg()}
+        \\let both: (b: bool) -> string = if b {@panic("stop")} else {@panic("other")}
+        \\let returning: () -> string = @panic({return "returned"})
+        \\let breaking: () -> int = loop {@panic({break 7})}
+        \\let continuing: () -> int = {let mut n: int = 0
+        \\    loop n < 2 {n += 1
+        \\        @panic({continue})}
+        \\    n}
+        \\let main: () =
+    ;
+    const Case = struct { body: []const u8, stdout: []const u8 = "", stderr: []const u8 = "panic: stop\n", code: u8 = 1 };
+    for ([_]Case{
+        .{ .body = "@println(pick(false), returning(), breaking(), continuing())", .stdout = "A1 returned 7 2\n", .stderr = "", .code = 0 },
+        .{ .body = "@println(pick(true), side())" },
+        .{ .body = "@println(both(true), side())" },
+        .{ .body = "@println(match U.err[\"stop\"] {.ok => |n| n\n.err => |e| @panic(e)}, side())" },
+        .{ .body = "@println(match true {true => @panic(\"stop\")\nfalse => @panic(\"other\")}, side())" },
+        .{ .body = "@println(@panic(\"stop\") + side())" },
+        .{ .body = "@println(-@panic(\"stop\"))" },
+        .{ .body = "@println(@panic(\"stop\") + @panic(\"other\"))" },
+        .{ .body = "@println(@panic(\"stop\") == @panic(\"other\"))" },
+        .{ .body = "@println(if false {@panic(\"wrong\")} else {arg()})", .stdout = "A1\n", .stderr = "", .code = 0 },
+        .{ .body = "@println(match false {true => @panic(\"wrong\")\nfalse => arg()})", .stdout = "A1\n", .stderr = "", .code = 0 },
+        .{ .body = "@println(match U.ok[7] {.ok => |n| n\n.err => |e| @panic(e)})", .stdout = "7\n", .stderr = "", .code = 0 },
+        .{ .body = "@println(arg() + @panic(\"stop\"), side())", .stdout = "A" },
+        .{ .body = "@println(f(arg(), @panic(\"stop\"), side()))", .stdout = "A" },
+        .{ .body = "@println(@panic(\"stop\")(side()))" },
+        .{ .body = "@println(@panic(@panic(\"stop\")), side())" },
+        .{ .body = "@println(if @panic(\"stop\") {side()} else {side()})" },
+        .{ .body = "@println(true and @panic(\"stop\"), side())" },
+        .{ .body = "@println(false or @panic(\"stop\"), side())" },
+        .{ .body = "@println(false and @panic(\"stop\"), true or @panic(\"stop\"))", .stdout = "false true\n", .stderr = "", .code = 0 },
+        .{ .body = "@println(loop false {} else {@panic(\"stop\")})" },
+        .{ .body = "loop {break @panic(\"stop\")}" },
+    }) |case| {
+        const source = try std.mem.concat(test_gpa, u8, &.{ prelude, case.body });
+        defer test_gpa.free(source);
+        errdefer std.debug.print("panic expression: {s}\n", .{case.body});
+        const c = try arrayTestProgram(source);
+        defer test_gpa.free(c);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode|
+            try compileAndRunMode(c, "typedef int nonempty_translation_unit;", case.code, case.stdout, case.stderr, mode);
+    }
+}
+
+test "panic and noreturn source free IR emission and lowering survive every allocation failure" {
+    for ([_][]const u8{ panic_program, noreturn_program }, [_][]const u8{ "M", "IA" }) |source, stdout| {
+        var sema = blk: {
+            var module = try Module.init(test_gpa, "panic.nov", source);
+            defer module.deinit();
+            var result = try Lowering.lower(&module);
+            errdefer result.deinit();
+            try std.testing.expect(!module.hasErrors());
+            break :blk result;
+        };
+        defer sema.deinit();
+        try sema.ir.verify();
+        const c = try emitProgram(test_gpa, &sema.ir, null);
+        defer test_gpa.free(c);
+        try compileAndRunExpected(c, "typedef int nonempty_translation_unit;", 1, stdout, "panic: hé\x00!\n");
+        try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{source});
+    }
+}
+
+test "panic allocation OOM keeps existing runtime diagnostics and flushed effects" {
+    const c = try arrayTestProgram(panic_program);
+    defer test_gpa.free(c);
+    const exhausted = try std.mem.concat(test_gpa, u8, &.{ "#include <stdlib.h>\nstatic void *test_malloc(size_t n) { (void)n; return NULL; }\n#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n", c });
+    defer test_gpa.free(exhausted);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(exhausted, "typedef int nonempty_translation_unit;", 1, "M", "panic: GC allocation failed\n", mode);
 }
 
 const union_program =
@@ -3623,8 +3881,7 @@ const unconditional_loops =
     \\    text
     \\}
     \\let exit: () -> void = loop {return}
-    \\let dead: () -> void = {loop {continue}
-    \\    @println("not called")}
+    \\let dead: () -> void = loop {continue}
     \\let main: () -> void = {exit()
     \\    @println(build(true))
     \\    @println(build(false))
@@ -3715,8 +3972,7 @@ test "loop exits compose with value branches assignments calls short circuit and
         \\    }
         \\    n
         \\}
-        \\let condition: () -> int = {loop {return 7} {}
-        \\    99}
+        \\let condition: () -> int = loop {return 7} {}
         \\let control: () -> void = {
         \\    let mut n: int = 0
         \\    loop {n += 1

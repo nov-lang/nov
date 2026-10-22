@@ -107,9 +107,23 @@ fn checkInner(module: *Module, ir: *Ir, types: []const ?Ir.TypeId, id: Module.De
         try module.diagnostics.append(module.allocator, .{ .tag = .missing_initializer, .span = declaration.name_span });
         return false;
     }
+    if (declaration.noreturn) {
+        const first = module.ast.firstToken(full.ast.init_node);
+        const last = module.ast.lastToken(full.ast.init_node);
+        for (module.ast.tokens.items(.tag)[first .. last + 1], first..) |tag, token| {
+            if (tag == .keyword_return) {
+                try module.diagnostics.append(module.allocator, .{ .tag = .noreturn_return, .span = module.tokenSpan(@intCast(token)) });
+                return false;
+            }
+        }
+    }
     const annotation = module.tokenSpan(if (proto.ast.return_type) |node| module.ast.firstToken(node) else proto.lparen);
     context.return_type = .{ .ty = ty.function.result, .annotation = annotation };
     const checked = (try context.expression(full.ast.init_node, .{ .ty = ty.function.result, .annotation = annotation }, 0)) != null;
+    if (checked and declaration.noreturn and !context.terminated) {
+        _ = try context.fail(.noreturn_completion, full.ast.init_node, declaration.name_span);
+        return false;
+    }
     if (checked and !context.terminated) try context.copyNode(full.ast.init_node, ty.function.result);
     return checked;
 }
@@ -422,6 +436,27 @@ const Context = struct {
         return self.module.lookupMethod(@enumFromInt(record.record.identity), ast.tokenSlice(data.rhs));
     }
 
+    fn directNoreturn(self: *Context, node: Ast.Node.Index) Error!bool {
+        const ast = &self.module.ast;
+        const id = if (ast.nodes.items(.tag)[node] == .identifier) blk: {
+            const name = self.module.sourceSlice(self.span(node)).?;
+            if (self.bindings.contains(name)) return false;
+            break :blk self.valueDeclaration(name) orelse return false;
+        } else (try self.staticMethod(node)) orelse return false;
+        return self.module.getDeclaration(id).?.noreturn;
+    }
+
+    fn finishCall(self: *Context, node: Ast.Node.Index, callee: Ast.Node.Index, result: Ir.TypeId, expected: ?Known) Error!?Ir.TypeId {
+        if (!self.terminated and try self.directNoreturn(callee)) {
+            if (self.emitter) |emitter| {
+                if (!try self.emitNode(node, result)) return null;
+                self.terminal = try emitter.value(node);
+            }
+            self.terminated = true;
+        }
+        return self.fit(result, expected, node);
+    }
+
     fn fieldIndex(self: *Context, ty: Ir.TypeId, name: []const u8) ?u32 {
         const record = self.ir.getType(ty).?;
         if (record != .record) return null;
@@ -569,6 +604,11 @@ const Context = struct {
         return ty;
     }
 
+    fn isPanic(self: *Context, node: Ast.Node.Index) bool {
+        return self.module.ast.nodes.items(.tag)[node] == .builtin_literal and
+            std.mem.eql(u8, self.module.sourceSlice(self.span(node)).?, "@panic");
+    }
+
     fn printing(self: *Context, node: Ast.Node.Index) ?bool {
         const ast = &self.module.ast;
         if (ast.nodes.items(.tag)[node] != .builtin_literal) return null;
@@ -656,6 +696,7 @@ const Context = struct {
                 break :blk null;
             },
             .function_pipe => blk: {
+                if (try self.directNoreturn(data.rhs)) break :blk null;
                 if (self.printing(data.rhs) != null) break :blk .{ .ty = try self.ir.internType(.void) };
                 const callee = (try self.probe(data.rhs, depth + 1)) orelse break :blk null;
                 const ty = self.ir.getType(callee.ty).?;
@@ -663,6 +704,7 @@ const Context = struct {
             },
             .call, .call_one => blk: {
                 const call = ast.fullCall(node).?;
+                if (try self.directNoreturn(call.ast.fn_expr)) break :blk null;
                 if (self.isAscription(call.ast.fn_expr)) {
                     const diagnostics_start = self.module.diagnostics.items.len;
                     defer self.module.diagnostics.shrinkRetainingCapacity(diagnostics_start);
@@ -717,6 +759,7 @@ const Context = struct {
         const left_valid = try self.validateUnconstrained(lhs, depth + 1);
         const right_valid = if (rhs) |right| try self.validateUnconstrained(right, depth + 1) else true;
         if (!left_valid or !right_valid) return null;
+        if (self.terminated) return if (expected) |want| want.ty else try self.ir.internType(.void);
         if (expected) |want| {
             if (self.ir.getType(want.ty).? != .integer) return self.fail(.operator_not_supported, node, want.annotation);
         }
@@ -846,7 +889,7 @@ const Context = struct {
                 const args = try emitter.allocator.alloc(Ir.ValueId, 1);
                 args[0] = try emitter.value(data.lhs);
                 if (self.printing(data.rhs)) |newline| break :blk .{ .print = .{ .args = args, .newline = newline } };
-                break :blk .{ .call = .{ .callee = try emitter.value(data.rhs), .args = args } };
+                break :blk .{ .call = .{ .callee = try emitter.value(data.rhs), .args = args, .noreturn = try self.directNoreturn(data.rhs) } };
             },
             .call, .call_one => blk: {
                 const call = ast.fullCall(node).?;
@@ -857,7 +900,7 @@ const Context = struct {
                 const args = try emitter.allocator.alloc(Ir.ValueId, call.ast.args.len);
                 for (call.ast.args, args) |arg, *value| value.* = try emitter.value(arg);
                 if (self.printing(call.ast.fn_expr)) |newline| break :blk .{ .print = .{ .args = args, .newline = newline } };
-                break :blk .{ .call = .{ .callee = try emitter.value(call.ast.fn_expr), .args = args } };
+                break :blk .{ .call = .{ .callee = try emitter.value(call.ast.fn_expr), .args = args, .noreturn = try self.directNoreturn(call.ast.fn_expr) } };
             },
             else => {
                 _ = try self.fail(.unsupported_lowering, node, null);
@@ -1254,6 +1297,7 @@ const Context = struct {
                 const embedded = expressions[placeholder];
                 placeholder += 1;
                 const ty = (try self.expression(embedded, null, depth + 1)) orelse return null;
+                if (self.terminated) return self.fit(string, expected, node);
                 const scalar = self.ir.getType(ty).?;
                 if (scalar != .boolean and scalar != .integer and scalar != .string) return self.interpolationError(.unsupported_interpolation_type, .{ .start = location.start + @as(u32, @intCast(start)), .end = location.start + @as(u32, @intCast(offset)) });
                 if (self.emitter) |emitter| {
@@ -1456,7 +1500,7 @@ const Context = struct {
                 if (ty.function.params.len != 1) return self.fail(.argument_count_mismatch, node, null);
                 if (try self.expression(data.lhs, .{ .ty = ty.function.params[0] }, depth + 1) == null) return null;
                 if (!self.terminated) try self.copyNode(data.lhs, ty.function.params[0]);
-                return self.fit(ty.function.result, expected, node);
+                return self.finishCall(node, data.rhs, ty.function.result, expected);
             },
             .array_init, .array_init_comma, .array_init_two, .array_init_two_comma => {
                 const want = hint orelse return self.fail(.array_literal_needs_type, node, null);
@@ -1538,6 +1582,10 @@ const Context = struct {
                 defer self.loop_context = parent;
                 const condition_start: u32 = if (self.emitter) |emitter| @intCast(emitter.instructions.items.len) else 0;
                 const condition = if (loop.condition != 0) try self.expression(loop.condition, .{ .ty = boolean }, depth + 1) else boolean;
+                // A terminal condition never reaches the body or exhaustion.
+                // Its owned breaks can still complete this loop; continues only
+                // restart the condition. Snapshot before checking other regions.
+                const condition_terminal = self.terminated and !context.has_break;
                 const condition_value: ?Ir.ValueId = if (self.emitter) |emitter|
                     if (condition == null) null else if (loop.condition != 0) try emitter.value(loop.condition) else try emitter.append(boolean, self.irSpan(node), .{
                         .constant = try self.ir.internConstant(.{ .ty = boolean, .value = .{ .boolean = true } }),
@@ -1563,7 +1611,7 @@ const Context = struct {
                     if (context.result == null) context.result = .{ .ty = exhaustion.? };
                     try self.copyNode(loop.else_expr, exhaustion.?);
                 }
-                self.terminated = loop.else_expr != 0 and else_terminal and !context.has_break;
+                self.terminated = condition_terminal or ((loop.condition == 0 or (loop.else_expr != 0 and else_terminal)) and !context.has_break);
                 const result = if (self.terminated) unit else if (context.result) |known| known.ty else unit;
                 if (loop.else_expr == 0 and result != unit and !context.valued_break) return self.fail(.loop_missing_value_break, node, null);
                 if (self.emitter) |emitter| try emitter.record(node, result, self.irSpan(node), .{ .loop = .{
@@ -1769,6 +1817,20 @@ const Context = struct {
                     if (try self.expression(call.ast.args[1], ascribed, depth + 1) == null) return null;
                     return self.fit(ascribed.ty, expected, node);
                 }
+                if (self.isPanic(call.ast.fn_expr)) {
+                    if (call.ast.args.len != 1) return self.fail(.argument_count_mismatch, node, null);
+                    const string = try self.ir.internType(.string);
+                    if (try self.expression(call.ast.args[0], .{ .ty = string }, depth + 1) == null) return null;
+                    if (!self.terminated) {
+                        const unit = try self.ir.internType(.void);
+                        if (self.emitter) |emitter| {
+                            try emitter.record(node, unit, self.irSpan(node), .{ .panic = try emitter.value(call.ast.args[0]) });
+                            self.terminal = try emitter.value(node);
+                        }
+                        self.terminated = true;
+                    }
+                    return if (expected) |want| want.ty else try self.ir.internType(.void);
+                }
                 if (self.printing(call.ast.fn_expr) != null) {
                     var valid = true;
                     for (call.ast.args) |arg| {
@@ -1795,12 +1857,165 @@ const Context = struct {
                     } else if (!self.terminated) try self.copyNode(arg, param);
                 }
                 if (!valid) return null;
-                return self.fit(ty.function.result, expected, node);
+                return self.finishCall(node, call.ast.fn_expr, ty.function.result, expected);
             },
             else => return self.fail(.unsupported_body_expression, node, null),
         }
     }
 };
+
+test "noreturn declarations reject nonvoid results returns and normal completion" {
+    const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag };
+    for ([_]Case{
+        .{ .source = "@[noreturn]\nlet f:()->int=@panic(\"x\")", .tag = .noreturn_result },
+        .{ .source = "@[noreturn]\nlet f:()={}", .tag = .noreturn_completion },
+        .{ .source = "@[noreturn]\nlet f:()=return", .tag = .noreturn_return },
+        .{ .source = "@[noreturn]\nlet f:()=return @panic(\"x\")", .tag = .noreturn_return },
+        .{ .source = "@[noreturn]\nlet f:()=if true {@panic(\"x\")}", .tag = .noreturn_completion },
+        .{ .source = "@[noreturn]\nlet f:()=loop {break}", .tag = .noreturn_completion },
+        .{ .source = "@[noreturn]\nlet f:()=loop true {}", .tag = .noreturn_completion },
+        .{ .source = "@[noreturn]\nlet f:(g:()->void)=g()", .tag = .noreturn_completion },
+        .{ .source = "@[noreturn]\nlet stop:()=@panic(\"x\")\n@[noreturn]\nlet f:()={let g=stop\ng()}", .tag = .noreturn_completion },
+        .{ .source = "let f:()->noreturn=@panic(\"x\")", .tag = .unknown_type },
+        .{ .source = "let f:()->int=@print()", .tag = .expression_type_mismatch },
+    }) |case| {
+        var module = try Module.init(std.testing.allocator, "noreturn.nov", case.source);
+        defer module.deinit();
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        errdefer std.debug.print("noreturn source {s}: {any}\n", .{ case.source, module.diagnostics.items });
+        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+        try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
+        try std.testing.expect(!sema.lowering_complete);
+    }
+}
+
+test "noreturn attributes require unique argumentless function placement" {
+    for ([_][]const u8{
+        "@[noreturn]\n@[noreturn]\nlet f:()=loop {}",
+        "@[noreturn(1)]\nlet f:()=loop {}",
+
+        "@[noreturn]\nlet n:int=1",
+        "@[noreturn]\nlet A=struct{}",
+        "@[noreturn]\nlet mut f:()=loop {}",
+        "@[public]\n@[noreturn]\nlet f:()=loop {}",
+    }) |source| {
+        var module = try Module.init(std.testing.allocator, "attributes.nov", source);
+        defer module.deinit();
+        try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+        try std.testing.expectEqual(Module.Diagnostic.Tag.unsupported_attribute, module.diagnostics.items[0].tag);
+    }
+}
+
+test "terminal loop conditions preserve termination without swallowing owned controls" {
+    const prelude = "@[noreturn]\nlet stop:()=@panic(\"stop\")\n";
+    const Case = struct { body: []const u8, annotation: []const u8 = "@[noreturn]\n", tag: ?Module.Diagnostic.Tag = null };
+    for ([_]Case{
+        .{ .body = "loop @panic(\"stop\") {}" },
+        .{ .body = "loop stop() {}" },
+        .{ .body = "loop {if true {@panic(\"stop\")} else {stop()}} {}" },
+        .{ .body = "loop stop() : @print(\"bad\") {break} else {@print(\"bad\")}" },
+        .{ .body = "loop {loop stop() {}} {}" },
+        .{ .body = "loop {loop {break} {}\nstop()} {}" },
+        .{ .body = "loop {continue} {break}" },
+        .{ .body = "loop {if true {continue} else {stop()}} {break}" },
+        .{ .body = "loop {return} {}", .annotation = "" },
+        .{ .body = "{loop @panic(\"stop\") {}\n@println(\"tail\")}", .annotation = "", .tag = .unreachable_code },
+        .{ .body = "{loop stop() {}\n@println(\"tail\")}", .tag = .unreachable_code },
+        .{ .body = "{loop {if true {stop()} else {stop()}} {}\n@println(\"tail\")}", .tag = .unreachable_code },
+        .{ .body = "{loop {loop stop() {}} {}\n@println(\"tail\")}", .tag = .unreachable_code },
+        .{ .body = "{loop {continue} {}\n@println(\"tail\")}", .annotation = "", .tag = .unreachable_code },
+        .{ .body = "loop {break} {}", .tag = .noreturn_completion },
+        .{ .body = "loop {if true {break} else {stop()}} {}", .tag = .noreturn_completion },
+        .{ .body = "loop {if true {continue} else {break}} {}", .tag = .noreturn_completion },
+        .{ .body = "{loop {break} {}\n@println(\"tail\")}", .annotation = "" },
+    }) |case| {
+        const source = try std.mem.concat(std.testing.allocator, u8, &.{ prelude, case.annotation, "let main:()=", case.body });
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "condition.nov", source);
+        defer module.deinit();
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        errdefer std.debug.print("condition source {s}: {any}\n", .{ source, module.diagnostics.items });
+        try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+        if (case.tag) |tag| {
+            try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+            try std.testing.expectEqual(tag, module.diagnostics.items[0].tag);
+            try std.testing.expect(!sema.lowering_complete);
+        } else {
+            try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+            try std.testing.expect(sema.lowering_complete);
+        }
+    }
+}
+
+test "empty noreturn attribute parentheses are rejected by parser" {
+    var module = try Module.init(std.testing.allocator, "attribute.nov", "@[noreturn()]\nlet f:()=loop {}");
+    defer module.deinit();
+    try std.testing.expect(module.ast.errors.len != 0);
+}
+
+test "noreturn direct recursion methods loops and terminal operands lower" {
+    const source =
+        \\@[noreturn]
+        \\let stop:()=@panic("stop")
+        \\@[noreturn]
+        \\let recurse:()=recurse()
+        \\@[noreturn]
+        \\let spin:()=loop {loop {break}
+        \\    continue}
+        \\let A=struct{
+        \\    @[public]
+        \\    @[noreturn]
+        \\    let stop:()=stop()
+        \\}
+        \\@[noreturn]
+        \\let method:()=A.stop()
+        \\@[noreturn]
+        \\let choose:(b:bool)=if b {stop()} else {spin()}
+        \\let value:(b:bool)->int=match b {true=>stop()
+        \\    false=>7}
+        \\let indirect:()={let g:()->void=stop
+        \\    g()
+        \\    @print("still statically reachable")}
+    ;
+    var module = try Module.init(std.testing.allocator, "noreturn.nov", source);
+    defer module.deinit();
+    var sema = try Lowering.lower(&module);
+    defer sema.deinit();
+    errdefer std.debug.print("noreturn diagnostics: {any}\n", .{module.diagnostics.items});
+    try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+    try std.testing.expect(sema.lowering_complete);
+    try std.testing.expect(sema.entries[0].noreturn);
+    try std.testing.expect(sema.ir.functions.items[0].noreturn);
+}
+
+test "panic requires exactly one exact string argument" {
+    const Case = struct { expression: []const u8, tag: Module.Diagnostic.Tag };
+    for ([_]Case{
+        .{ .expression = "@panic()", .tag = .argument_count_mismatch },
+        .{ .expression = "@panic(\"a\", \"b\")", .tag = .argument_count_mismatch },
+        .{ .expression = "@panic(true)", .tag = .literal_type_mismatch },
+        .{ .expression = "@panic(1)", .tag = .literal_type_mismatch },
+        .{ .expression = "@panic(@as(int, 1))", .tag = .expression_type_mismatch },
+        .{ .expression = "@panic(@print())", .tag = .expression_type_mismatch },
+        .{ .expression = "@panic([true])", .tag = .expression_type_mismatch },
+        .{ .expression = "@panic", .tag = .unsupported_body_expression },
+        .{ .expression = "{@panic(\"stop\")\n@print(\"unreachable\")}", .tag = .unreachable_code },
+    }) |case| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let main: () = {s}", .{case.expression});
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "panic.nov", source);
+        defer module.deinit();
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        errdefer std.debug.print("panic case {s}: {any}\n", .{ source, module.diagnostics.items });
+        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+        try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
+        try std.testing.expect(!sema.lowering_complete);
+    }
+}
 
 test "ascription diagnoses arity types exact mismatches and interpolation source spans" {
     const Case = struct { expression: []const u8, tag: Module.Diagnostic.Tag, token: []const u8 };
@@ -2530,7 +2745,7 @@ test "condition loops diagnose controls types scope and unreachable tails" {
     }
 }
 
-test "value loops require a value break rather than introducing a never type" {
+test "terminal value loops need no break value or never type" {
     for ([_][]const u8{ "loop {}", "loop {continue}", "loop {return 1}" }) |body| {
         const source = try std.fmt.allocPrint(std.testing.allocator, "let f: () -> int = {s}", .{body});
         defer std.testing.allocator.free(source);
@@ -2539,9 +2754,8 @@ test "value loops require a value break rather than introducing a never type" {
         try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
         var sema = try Lowering.lower(&module);
         defer sema.deinit();
-        try std.testing.expect(!sema.lowering_complete);
-        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
-        try std.testing.expectEqual(Module.Diagnostic.Tag.loop_missing_value_break, module.diagnostics.items[0].tag);
+        try std.testing.expect(sema.lowering_complete);
+        try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
     }
 }
 

@@ -26,6 +26,7 @@ pub const Function = struct {
     span: Span,
     body: ?Body = null,
     public: bool = false,
+    noreturn: bool = false,
 };
 /// `result` is either a continuing value or the final terminal instruction.
 pub const Body = struct { instructions: []const Instruction, result: ValueId };
@@ -54,6 +55,8 @@ pub const Operation = union(enum) {
     array_append: struct { lhs: ValueId, rhs: ValueId },
     /// Terminal control flow, never a value. Its optional operand is body-local.
     return_value: ?ValueId,
+    /// Terminal panic with an exact string operand; has no continuing value.
+    panic: ValueId,
     /// Terminal exits target the innermost containing loop, including its condition.
     loop_break: ?ValueId,
     loop_continue,
@@ -87,7 +90,7 @@ pub const Operation = union(enum) {
     function_ref: FunctionId,
     unary: struct { op: UnaryOp, operand: ValueId },
     binary: struct { op: BinaryOp, lhs: ValueId, rhs: ValueId },
-    call: struct { callee: ValueId, args: []const ValueId },
+    call: struct { callee: ValueId, args: []const ValueId, noreturn: bool = false },
     print: struct { args: []const ValueId, newline: bool },
     /// Instructions [rhs_start, this instruction) form a conditional RHS region.
     /// Regions nest or are disjoint; only this merged boolean escapes. Empty
@@ -384,6 +387,7 @@ fn validateFunction(self: *const Ir, function: Function) VerifyError!void {
     if (ty != .function) return error.InvalidFunctionType;
     try self.validateType(ty, self.types.items.len);
     try self.validateSpan(function.span);
+    if (function.noreturn and self.getType(ty.function.result).? != .void) return error.InvalidReturn;
 }
 
 fn operandType(body: Body, id: ValueId, before: usize) VerifyError!TypeId {
@@ -414,9 +418,10 @@ fn regionOperandType(body: Body, id: ValueId, before: usize, yielding: ?Yield) V
 
 pub fn terminates(body: Body, id: ValueId) bool {
     return switch (body.instructions[@intFromEnum(id)].op) {
-        .return_value, .loop_break, .loop_continue => true,
+        .panic, .return_value, .loop_break, .loop_continue => true,
         .branch => |r| r.returns,
         .loop => |r| r.returns,
+        .call => |call| call.noreturn,
         else => false,
     };
 }
@@ -634,15 +639,18 @@ fn validateBody(self: *const Ir, function: Function, body: Body) VerifyError!voi
                     if (constant.value != .boolean or !constant.value.boolean) return error.InvalidOperation;
                 }
                 var has_break = false;
+                var condition_has_break = false;
                 var valued_break = false;
                 for (body.instructions, 0..) |control, index| {
                     if (control.op == .loop_break and enclosingLoop(body, index) == i) {
                         has_break = true;
+                        if (index < r.body_start) condition_has_break = true;
                         if (control.op.loop_break != null) valued_break = true;
                     }
                 }
                 if (ty != .void and r.else_value == null and !valued_break) return error.InvalidOperation;
-                const returns = if (r.else_value) |value| terminates(body, value) and !has_break else false;
+                const condition_terminal = terminates(body, r.condition) and !condition_has_break;
+                const returns = condition_terminal or (if (r.else_value) |value| terminates(body, value) and !has_break else r.unconditional and !has_break);
                 if (r.returns != returns or (returns and ty != .void)) return error.InvalidReturn;
                 if (r.else_value) |value| {
                     const else_ty = try regionOperandType(body, value, i, .{ .owner = i, .start = r.else_start.? });
@@ -657,7 +665,12 @@ fn validateBody(self: *const Ir, function: Function, body: Body) VerifyError!voi
                     if (!terminates(body, value) and self.getType(continuation_ty).? != .void) return error.OperandTypeMismatch;
                 }
             },
+            .panic => |value| {
+                if (ty != .void) return error.InvalidOperation;
+                if (self.getType(try operandType(body, value, i)).? != .string) return error.OperandTypeMismatch;
+            },
             .return_value => |value| {
+                if (function.noreturn) return error.InvalidReturn;
                 if (ty != .void) return error.InvalidReturn;
                 if (value) |v| {
                     if (try operandType(body, v, i) != signature.result) return error.InvalidReturn;
@@ -739,11 +752,15 @@ fn validateBody(self: *const Ir, function: Function, body: Body) VerifyError!voi
                     if (try operandType(body, arg, i) != param) return error.OperandTypeMismatch;
                 }
                 if (instruction.ty != callee.function.result) return error.InvalidCall;
+                const reference = body.instructions[@intFromEnum(call.callee)].op;
+                const direct_noreturn = if (reference == .function_ref) (self.getFunction(reference.function_ref) orelse return error.InvalidFunctionId).noreturn else false;
+                if (call.noreturn and !direct_noreturn) return error.InvalidCall;
             },
         }
     }
     const result_ty = try regionOperandType(body, body.result, body.instructions.len, .{ .owner = body.instructions.len, .start = 0 });
     if (body.instructions[@intFromEnum(body.result)].op == .local_slot) return error.InvalidValueId;
+    if (function.noreturn and !terminates(body, body.result)) return error.InvalidReturn;
     if (!terminates(body, body.result) and result_ty != signature.result) return error.InvalidReturn;
 }
 
@@ -2012,7 +2029,12 @@ test "loop continuation boundaries types and private sibling operands are verifi
                 else => unreachable,
             });
             if (tail == 4) valid[13].op.loop.condition = @enumFromInt(4);
-            try t.ir.setFunctionBody(t.function, &valid, @enumFromInt(14));
+            const terminal_condition = tail == 4 and kind != 1;
+            if (terminal_condition) {
+                valid[13].op.loop.returns = true;
+                try LoopTests.reject(&t, error.UnreachableInstruction, &valid, @enumFromInt(14));
+            }
+            try t.ir.setFunctionBody(t.function, valid[0..(if (terminal_condition) @as(usize, 14) else 15)], @enumFromInt(if (terminal_condition) @as(u32, 13) else 14));
             try t.ir.verify();
             const body = t.ir.functions.items[0].body.?;
             t.ir.allocator.free(body.instructions);
@@ -2289,6 +2311,158 @@ test "loop continuation and break body publication is atomic under every OOM" {
 
 test "conditional body operands are owned and publication is atomic under OOM" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, testConditionalAllocationFailures, .{});
+}
+
+test "loop verifier derives terminal conditions and distinguishes owned breaks" {
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    ir.source_len = 1;
+    const unit = try ir.internType(.void);
+    const string = try ir.internType(.string);
+    const boolean = try ir.internType(.boolean);
+    const signature = try ir.internType(.{ .function = .{ .params = &.{}, .result = unit } });
+    const function = try ir.addFunction("condition", signature, .{ .start = 0, .end = 1 });
+    const text = try ir.internConstant(.{ .ty = string, .value = .{ .string = "stop" } });
+    const empty = try ir.internConstant(.{ .ty = unit, .value = .void });
+    const truth = try ir.internConstant(.{ .ty = boolean, .value = .{ .boolean = true } });
+    const ins = TestFunctions.instruction;
+    const good = [_]Instruction{
+        ins(string, .{ .constant = text }),
+        ins(unit, .{ .panic = @enumFromInt(0) }),
+        ins(unit, .{ .constant = empty }),
+        ins(unit, .{ .loop = .{ .condition_start = 0, .body_start = 2, .condition = @enumFromInt(1), .body = @enumFromInt(2), .returns = true } }),
+    };
+    try ir.validateBody(ir.functions.items[0], .{ .instructions = &good, .result = @enumFromInt(3) });
+    var bad = good;
+    bad[3].op.loop.returns = false;
+    try std.testing.expectError(error.InvalidReturn, ir.validateBody(ir.functions.items[0], .{ .instructions = &bad, .result = @enumFromInt(3) }));
+    for ([_]Operation{ .loop_continue, .{ .return_value = null }, .{ .call = .{ .callee = @enumFromInt(0), .args = &.{}, .noreturn = true } } }) |op| {
+        var terminal = good;
+        terminal[1].op = op;
+        if (op == .call) {
+            ir.functions.items[0].noreturn = true;
+            terminal[0] = ins(signature, .{ .function_ref = function });
+        }
+        try ir.validateBody(ir.functions.items[0], .{ .instructions = &terminal, .result = @enumFromInt(3) });
+        ir.functions.items[0].noreturn = false;
+    }
+    bad = good;
+    bad[1].op = .{ .loop_break = null };
+    try std.testing.expectError(error.InvalidReturn, ir.validateBody(ir.functions.items[0], .{ .instructions = &bad, .result = @enumFromInt(3) }));
+    bad[3].op.loop.returns = false;
+    try ir.validateBody(ir.functions.items[0], .{ .instructions = &bad, .result = @enumFromInt(3) });
+    bad = good;
+    bad[2].op = .{ .loop_break = null };
+    try ir.validateBody(ir.functions.items[0], .{ .instructions = &bad, .result = @enumFromInt(3) });
+    const branch = [_]Instruction{
+        ins(boolean, .{ .constant = truth }),
+        ins(string, .{ .constant = text }),
+        ins(unit, .{ .panic = @enumFromInt(1) }),
+        ins(string, .{ .constant = text }),
+        ins(unit, .{ .panic = @enumFromInt(3) }),
+        ins(unit, .{ .branch = .{ .condition = @enumFromInt(0), .then_start = 1, .else_start = 3, .then_value = @enumFromInt(2), .else_value = @enumFromInt(4), .returns = true } }),
+        ins(unit, .{ .constant = empty }),
+        ins(unit, .{ .loop = .{ .condition_start = 0, .body_start = 6, .condition = @enumFromInt(5), .body = @enumFromInt(6), .returns = true } }),
+    };
+    try ir.validateBody(ir.functions.items[0], .{ .instructions = &branch, .result = @enumFromInt(7) });
+    var mixed = branch;
+    mixed[4].op = .{ .loop_break = null };
+    try std.testing.expectError(error.InvalidReturn, ir.validateBody(ir.functions.items[0], .{ .instructions = &mixed, .result = @enumFromInt(7) }));
+    mixed[7].op.loop.returns = false;
+    try ir.validateBody(ir.functions.items[0], .{ .instructions = &mixed, .result = @enumFromInt(7) });
+    const nested = [_]Instruction{
+        ins(unit, .{ .constant = empty }),
+        ins(unit, .{ .loop_break = null }),
+        ins(unit, .{ .constant = empty }),
+        ins(unit, .{ .loop = .{ .condition_start = 0, .body_start = 2, .condition = @enumFromInt(1), .body = @enumFromInt(2) } }),
+        ins(string, .{ .constant = text }),
+        ins(unit, .{ .panic = @enumFromInt(4) }),
+        ins(unit, .{ .constant = empty }),
+        ins(unit, .{ .loop = .{ .condition_start = 0, .body_start = 6, .condition = @enumFromInt(5), .body = @enumFromInt(6), .returns = true } }),
+    };
+    try ir.validateBody(ir.functions.items[0], .{ .instructions = &nested, .result = @enumFromInt(7) });
+    const nested_terminal = good ++ [_]Instruction{
+        ins(unit, .{ .constant = empty }),
+        ins(unit, .{ .loop = .{ .condition_start = 0, .body_start = 4, .condition = @enumFromInt(3), .body = @enumFromInt(4), .returns = true } }),
+    };
+    try ir.validateBody(ir.functions.items[0], .{ .instructions = &nested_terminal, .result = @enumFromInt(5) });
+    const after = good ++ [_]Instruction{ins(unit, .{ .constant = empty })};
+    try std.testing.expectError(error.UnreachableInstruction, ir.validateBody(ir.functions.items[0], .{ .instructions = &after, .result = @enumFromInt(4) }));
+}
+
+test "noreturn verifier rejects false terminal call claims returns and completion" {
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    ir.source_len = 1;
+    const unit = try ir.internType(.void);
+    const signature = try ir.internType(.{ .function = .{ .params = &.{}, .result = unit } });
+    const function = try ir.addFunction("stop", signature, .{ .start = 0, .end = 1 });
+    ir.functions.items[0].noreturn = true;
+    const ins = TestFunctions.instruction;
+    const good = [_]Instruction{
+        ins(signature, .{ .function_ref = function }),
+        ins(unit, .{ .call = .{ .callee = @enumFromInt(0), .args = &.{}, .noreturn = true } }),
+    };
+    try ir.setFunctionBody(function, &good, @enumFromInt(1));
+    try ir.verify();
+    ir.functions.items[0].noreturn = false;
+    try std.testing.expectError(error.InvalidCall, ir.verify());
+    ir.functions.items[0].noreturn = true;
+    var bad = good;
+    bad[1].op.call.noreturn = false;
+    try std.testing.expectError(error.InvalidReturn, ir.validateBody(ir.functions.items[0], .{ .instructions = &bad, .result = @enumFromInt(1) }));
+    bad = good;
+    bad[1].op = .{ .return_value = null };
+    try std.testing.expectError(error.InvalidReturn, ir.validateBody(ir.functions.items[0], .{ .instructions = &bad, .result = @enumFromInt(1) }));
+    const value = try ir.internConstant(.{ .ty = unit, .value = .void });
+    const after = good ++ [_]Instruction{ins(unit, .{ .constant = value })};
+    try std.testing.expectError(error.UnreachableInstruction, ir.validateBody(ir.functions.items[0], .{ .instructions = &after, .result = @enumFromInt(2) }));
+    const indirect_signature = try ir.internType(.{ .function = .{ .params = &.{signature}, .result = unit } });
+    ir.functions.items[0].ty = indirect_signature;
+    bad = good;
+    bad[0].op = .{ .parameter = 0 };
+    try std.testing.expectError(error.InvalidCall, ir.validateBody(ir.functions.items[0], .{ .instructions = &bad, .result = @enumFromInt(1) }));
+    ir.functions.items[0].ty = try ir.internType(.{ .function = .{ .params = &.{}, .result = try ir.internType(.boolean) } });
+    try std.testing.expectError(error.InvalidReturn, ir.verify());
+}
+
+test "panic validates exact string prior visible operands void type and terminal tails" {
+    var fixture = try TestFunctions.init(std.testing.allocator);
+    defer fixture.ir.deinit();
+    const unit = try fixture.ir.internType(.void);
+    const string = try fixture.ir.internType(.string);
+    const text = try fixture.ir.internConstant(.{ .ty = string, .value = .{ .string = "hé\x00!" } });
+    const ins = TestFunctions.instruction;
+    const good = [_]Instruction{
+        ins(string, .{ .constant = text }),
+        ins(unit, .{ .panic = @enumFromInt(0) }),
+    };
+    var bad = good;
+    bad[1].op.panic = @enumFromInt(1);
+    try fixture.reject(error.InvalidValueId, &bad, @enumFromInt(1));
+    bad[1].op.panic = @enumFromInt(999);
+    try fixture.reject(error.InvalidValueId, &bad, @enumFromInt(1));
+    bad = good;
+    bad[0] = ins(fixture.integer, .{ .parameter = 0 });
+    try fixture.reject(error.OperandTypeMismatch, &bad, @enumFromInt(1));
+    bad = good;
+    bad[1].ty = string;
+    try fixture.reject(error.InvalidOperation, &bad, @enumFromInt(1));
+    const after = good ++ [_]Instruction{ins(fixture.integer, .{ .parameter = 0 })};
+    try fixture.reject(error.UnreachableInstruction, &after, @enumFromInt(2));
+    const consume = good ++ [_]Instruction{ins(unit, .{ .panic = @enumFromInt(1) })};
+    try fixture.reject(error.UnreachableInstruction, &consume, @enumFromInt(2));
+    const boolean = try fixture.ir.internConstant(.{ .ty = fixture.boolean, .value = .{ .boolean = true } });
+    const private = [_]Instruction{
+        ins(fixture.boolean, .{ .constant = boolean }),
+        ins(string, .{ .constant = text }),
+        ins(unit, .{ .panic = @enumFromInt(1) }),
+        ins(unit, .{ .panic = @enumFromInt(1) }),
+        ins(unit, .{ .branch = .{ .condition = @enumFromInt(0), .then_start = 1, .else_start = 3, .then_value = @enumFromInt(2), .else_value = @enumFromInt(3), .returns = true } }),
+    };
+    try fixture.reject(error.InvalidValueId, &private, @enumFromInt(4));
+    try fixture.ir.setFunctionBody(fixture.function, &good, @enumFromInt(1));
+    try fixture.ir.verify();
 }
 
 test "explicit returns validate signatures prior values spans and terminal tails" {

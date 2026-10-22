@@ -236,6 +236,7 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     _ = fixtures.add("return-invalid.nov", "let main: () -> void = return true\n");
     _ = fixtures.add("return-unreachable.nov", "let main: () -> void = {return @println(true)\n@println(false)}\n");
     _ = fixtures.add("if-invalid.nov", "let main: () -> void = if true {} else {@println(missing)}\n");
+    _ = fixtures.add("source-panic.nov", "let message: () -> string = {@print(\"before\")\n\"hé\\0\" + \"!\"}\n@[noreturn]\nlet stop: (s: string) -> void = @panic(s)\nlet main: () = stop(\"{message()}\")\n");
     _ = fixtures.add("panic-program.nov", "let zero: i32 = 0\nlet divide: () -> i32 = 1 / zero\nlet main: () -> void = @println(divide())\n");
 
     const Case = struct {
@@ -360,7 +361,7 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         .{ .name = "emit rejects immutable assignment", .args = &.{ "emit-c", "immutable-assignment.nov" }, .exit_code = 1, .stderr_match = "immutable-assignment.nov:2:1: error: assignment requires a mutable local" },
         .{ .name = "check semantic returns", .args = &.{ "check", "--semantic", "return-program.nov" }, .exit_code = 0 },
         .{ .name = "check return signature diagnostic", .args = &.{ "check", "--semantic", "return-invalid.nov" }, .exit_code = 1, .stderr_match = "return-invalid.nov:1:31: error: literal does not match the annotated type" },
-        .{ .name = "emit rejects unreachable statement", .args = &.{ "emit-c", "return-unreachable.nov" }, .exit_code = 1, .stderr_match = "return-unreachable.nov:2:1: error: unreachable statement after return" },
+        .{ .name = "emit rejects unreachable statement", .args = &.{ "emit-c", "return-unreachable.nov" }, .exit_code = 1, .stderr_match = "return-unreachable.nov:2:1: error: unreachable statement after terminal control flow" },
         .{ .name = "check semantic if expressions", .args = &.{ "check", "--semantic", "if-program.nov" }, .exit_code = 0 },
         .{ .name = "check semantic unselected if branch", .args = &.{ "check", "--semantic", "if-invalid.nov" }, .exit_code = 1, .stderr_match = "unknown name" },
         .{ .name = "check remains syntax only", .args = &.{ "check", "syntax-only.nov" }, .exit_code = 0 },
@@ -472,6 +473,19 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         generic_execute.expectStdOutEqual("MM7 bad\n");
         generic_execute.expectStdErrEqual("");
         test_step.dependOn(&generic_execute.step);
+
+        const source_panic = b.addRunArtifact(exe);
+        source_panic.step.name = b.fmt("CLI: source panic ({s})", .{mode});
+        source_panic.setCwd(fixtures.getDirectory());
+        source_panic.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+        source_panic.setEnvironmentVariable("NOV_CC", "");
+        source_panic.setEnvironmentVariable("CC", "");
+        source_panic.addArgs(&.{ "run", "source-panic.nov" });
+        if (mode.len != 0) source_panic.addArg(mode);
+        source_panic.expectExitCode(1);
+        source_panic.expectStdOutEqual("before");
+        source_panic.expectStdErrEqual("panic: hé\x00!\n");
+        test_step.dependOn(&source_panic.step);
 
         const union_run = b.addRunArtifact(exe);
         union_run.step.name = b.fmt("CLI: nominal unions ({s})", .{mode});

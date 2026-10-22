@@ -63,7 +63,10 @@ pub fn renderModule(module: *const Module, writer: *std.Io.Writer) !void {
             .match_missing_variants => try writer.writeAll("union match must cover every variant or end with a wildcard (_)"),
             .match_covered_union_prong => try writer.writeAll("union match prong is already covered by earlier prongs"),
             .invalid_match_capture => try writer.writeAll("payload capture requires a single union variant pattern and an immutable named binding"),
-            .unsupported_attribute => try writer.writeAll("only a single @[public] on struct, union or method declarations is supported"),
+            .unsupported_attribute => try writer.writeAll("unsupported, misplaced or duplicate attribute; @[public] requires a container or method, @[noreturn] requires a function"),
+            .noreturn_result => try writer.writeAll("@[noreturn] function must return void"),
+            .noreturn_return => try writer.writeAll("return is forbidden in an @[noreturn] function"),
+            .noreturn_completion => try writer.writeAll("@[noreturn] function may complete normally"),
             .duplicate_field => try writer.writeAll("duplicate container field"),
             .unknown_field => try writer.writeAll("unknown container field or union variant"),
             .missing_field => if (diagnostic.related) |field| try writer.print("missing required struct field '{s}'", .{module.sourceSlice(field).?}) else try writer.writeAll("missing required struct field"),
@@ -107,7 +110,7 @@ pub fn renderModule(module: *const Module, writer: *std.Io.Writer) !void {
             .unsupported_assignment_target => try writer.writeAll("assignment target must be a direct local identifier or, for plain =, its scalar-array element"),
             .unsupported_array_length_write => try writer.writeAll("array .len is read-only in the current subset; length writes and growth initialization are deferred"),
             .array_literal_needs_type => try writer.writeAll("array literal needs an expected []T type"),
-            .unreachable_code => try writer.writeAll("unreachable statement after return, break or continue"),
+            .unreachable_code => try writer.writeAll("unreachable statement after terminal control flow"),
             .loop_control_outside_loop => try writer.writeAll("break and continue require an enclosing loop"),
             .unsupported_loop_control => try writer.writeAll("labeled loop control is not supported"),
             .conditional_value_break => try writer.writeAll("conditional loops cannot break with a value without an else branch"),
@@ -405,7 +408,7 @@ test "module unsupported attributes and quoted names render semantic diagnostics
     defer output.deinit();
     try renderModule(&module, &output.writer);
     try std.testing.expectEqualStrings(
-        "unsupported.nov:1:1: error: only a single @[public] on struct, union or method declarations is supported\n@[export]\n^~\n" ++
+        "unsupported.nov:1:1: error: unsupported, misplaced or duplicate attribute; @[public] requires a container or method, @[noreturn] requires a function\n@[export]\n^~\n" ++
             "unsupported.nov:3:5: error: quoted identifiers are not supported in semantic analysis yet\nlet @\"quoted\" = 2\n    ^~~~~~~~~\n",
         output.written(),
     );

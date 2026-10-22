@@ -28,6 +28,7 @@ pub const Declaration = struct {
     is_generic: bool = false,
     container: ?DeclId = null,
     public: bool = false,
+    noreturn: bool = false,
 };
 
 pub const Diagnostic = struct {
@@ -38,6 +39,9 @@ pub const Diagnostic = struct {
     pub const Tag = enum {
         duplicate_name,
         unsupported_attribute,
+        noreturn_result,
+        noreturn_return,
+        noreturn_completion,
         invalid_generic_declaration,
         generic_needs_arguments,
         not_a_generic,
@@ -366,13 +370,16 @@ fn collectDeclaration(self: *Module, node: Ast.Node.Index, container: ?DeclId) (
         const is_record = declaration.ast.init_node != 0 and self.ast.fullStruct(declaration.ast.init_node) != null;
         const is_generic = is_record and self.ast.isUnion(declaration.ast.init_node) and declaration.ast.type_node != 0;
         var public = false;
+        var noreturn_annotation = false;
         for (declaration.attributes) |attribute| {
             const data = self.ast.nodes.items(.data)[attribute];
             if (self.ast.nodes.items(.tag)[attribute] == .attr_one and data.rhs == 0 and std.mem.eql(u8, self.ast.tokenSlice(data.lhs), "public") and (is_record or container != null) and !public) {
                 public = true;
+            } else if (self.ast.nodes.items(.tag)[attribute] == .attr_one and data.rhs == 0 and std.mem.eql(u8, self.ast.tokenSlice(data.lhs), "noreturn") and self.ast.fullFnProto(declaration.ast.type_node) != null and !declaration.ast.is_mutable and !noreturn_annotation) {
+                noreturn_annotation = true;
             } else try self.diagnostics.append(self.allocator, .{ .tag = .unsupported_attribute, .span = self.tokenSpan(self.ast.firstToken(attribute)) });
         }
-        try self.declarations.append(self.allocator, .{ .name = name, .name_span = name_span, .node = node, .container = container, .is_record = is_record, .is_generic = is_generic, .is_type_alias = is_record, .public = public });
+        try self.declarations.append(self.allocator, .{ .name = name, .name_span = name_span, .node = node, .container = container, .is_record = is_record, .is_generic = is_generic, .is_type_alias = is_record, .public = public, .noreturn = noreturn_annotation });
     }
 }
 

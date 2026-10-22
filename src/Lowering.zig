@@ -45,6 +45,7 @@ pub fn lower(module: *Module) Error!Sema {
         defer if (qualified) |name| result.allocator.free(name);
         const function = try result.ir.addFunction(qualified orelse declaration.name, entry.type_id.?, span);
         result.ir.functions.items[@intFromEnum(function)].public = declaration.public;
+        result.ir.functions.items[@intFromEnum(function)].noreturn = entry.noreturn;
         entry.function = function;
         functions[i] = function;
     }

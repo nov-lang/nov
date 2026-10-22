@@ -24,6 +24,7 @@ pub const Entry = struct {
     constant: ?Ir.ConstId = null,
     function: ?Ir.FunctionId = null,
     status: Status = .deferred,
+    noreturn: bool = false,
 };
 pub const Error = Ir.BuildError || error{InvalidModule};
 
@@ -84,6 +85,12 @@ pub fn analyzeAnnotations(module: *Module) Error!Sema {
         };
         result.entries[i].type_id = type_id;
         if (module.ast.fullFnProto(full.ast.type_node) != null) {
+            result.entries[i].noreturn = declaration.noreturn;
+            if (declaration.noreturn and result.ir.getType(result.ir.getType(type_id).?.function.result).? != .void) {
+                try module.diagnostics.append(module.allocator, .{ .tag = .noreturn_result, .span = declaration.name_span });
+                result.entries[i].status = .failed;
+                continue;
+            }
             result.entries[i].status = .signature_only;
         } else if (full.ast.init_node != 0) {
             const annotation = module.tokenSpan(module.ast.firstToken(full.ast.type_node));

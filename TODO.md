@@ -1,5 +1,14 @@
 # TODO
 
+Terminal `@panic(message)` and function annotation `@[noreturn]` are executable.
+`noreturn` is not a type: annotated functions return void, reject explicit returns
+and possible normal completion. Direct annotated calls are terminal; ordinary
+function values erase the guarantee and indirect calls conservatively complete.
+Panic takes one exact string, evaluates once, attempts stdout flush, writes
+length-based UTF-8 `panic: <bytes>\n` to stderr (including NUL), and exits 1 without
+a backtrace. Branch/match merges and loop conditions track terminal paths; C emits
+_Noreturn only on annotated functions, not function-pointer types.
+
 Ordinary nominal tagged unions, exhaustive payload-capturing matches and bounded
 ordinary generic union declarations are executable. `Result` is defined in Nov,
 not a compiler builtin; see `examples/results.nov`. Explicit `U.ok[value]` and
@@ -16,7 +25,7 @@ variant with identical error type. Ordinary returns never implicitly wrap payloa
 Generic methods, generic structs, general comptime/value parameters, nested/record/
 array/function payloads, explicit tag enums and Option propagation remain deferred.
 The updated filesystem error example remains design-only: imports, file-resource
-semantics, error kinds, instance calls, @panic and record interpolation are missing.
+semantics, error kinds, instance calls and record interpolation are missing.
 
 Bounded nominal value structs are executable; `examples/type.nov` is unchanged
 and runs/checks/formats successfully. Separate declarations have distinct identities;

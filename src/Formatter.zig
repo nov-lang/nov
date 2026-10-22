@@ -183,10 +183,10 @@ fn checkSupported(ast: Ast) !void {
                 };
             },
             .array_access => if (ast.nodes.items(.tag)[data.lhs] == .array_access) return error.UnsupportedSyntax,
-            .attr_one => if (data.rhs != 0 or !std.mem.eql(u8, ast.tokenSlice(data.lhs), "public")) return error.UnsupportedSyntax,
+            .attr_one => if (data.rhs != 0 or (!std.mem.eql(u8, ast.tokenSlice(data.lhs), "public") and !std.mem.eql(u8, ast.tokenSlice(data.lhs), "noreturn"))) return error.UnsupportedSyntax,
             .builtin_literal => {
                 const name = ast.tokenSlice(main);
-                if (!std.mem.eql(u8, name, "@print") and !std.mem.eql(u8, name, "@println") and !std.mem.eql(u8, name, "@as"))
+                if (!std.mem.eql(u8, name, "@print") and !std.mem.eql(u8, name, "@println") and !std.mem.eql(u8, name, "@as") and !std.mem.eql(u8, name, "@panic"))
                     return error.UnsupportedSyntax;
             },
             .@"break" => if (data.lhs != 0) return error.UnsupportedSyntax,

@@ -911,7 +911,8 @@ in the broader definitions below also remain design-only.
 `examples/error.nov` now uses `.!` and explicit Result returns, with its alternative
 implementations commented out. It is still a filesystem design example, not an
 executable program: imports, filesystem resources, record payloads, enum error kinds,
-instance calls, terminal `@panic` and record interpolation remain future work.
+instance calls and record interpolation remain future work. Terminal `@panic`
+is implemented with the `@[noreturn]` void-function contract described below.
 
 ```nov
 @[public]
@@ -1754,7 +1755,7 @@ TODO
 - `@fprint(file: File, ...)`: Same as print but output to a specific file. Returns a Result<>.
 <!-- - `@eprint(...)`: Same as print but output to stderr. -->
 <!-- - `@printf(fmt: #string, args: ...)` works like std.fmt.format and print to stdout -->
-- `@panic(s: string)`: Output `s` and backtrace to stderr, then terminate the program with error code 1.
+- `@panic(s: string)`: A terminal, void-returning builtin following the `@[noreturn]` contract. Evaluate exactly one string argument once, attempt to flush stdout, write `panic: <message>\n` to stderr, then exit with code 1. Messages are length-based UTF-8 bytes, including embedded NUL. No backtrace is produced; debug and release behave identically.
 - `@max(a: T, b: T, ...)`: Returns the maximum value between all the supplied arguments
 - `@min(a: T, b: T, ...)`: Returns the minimum value between all the supplied arguments
 - `@dump(expr)`: TODO: https://docs.vlang.io/builtin-functions.html#dumping-expressions-at-runtime
@@ -1803,10 +1804,41 @@ TODO
 - `@[require(condition..., "optional error message")`: Ensure that the specified conditions are verified for the arguments given to a function or to a container initializer.
 <!-- - `@[ensure(condition..., "optional error message")`: Ensure that the specified conditions are verified for the values returned by a function. -->
 
-The executable subset accepts only a single argument-free `@[public]` on a nominal
-struct or its method declaration, preserving metadata without enforcing cross-module
-visibility or changing C exports. Unknown/unsupported attributes diagnose. Other
-entries in this list remain design proposals.
+The executable subset accepts a single argument-free `@[public]` on a nominal
+struct/union or its method declaration, preserving metadata without enforcing
+cross-module visibility or changing C exports. It also accepts argument-free
+`@[noreturn]` on ordinary function and method declarations; the attributes may be
+combined where both are supported. Duplicate attributes, arguments, invalid
+placements and unknown/unsupported attributes diagnose. Other entries in this list
+remain design proposals.
+
+### Non-returning functions
+
+`@[noreturn]` is a function annotation, **not a type**. Annotated functions must
+have return type `void`, either explicit or omitted. They cannot contain an
+explicit `return` or complete normally. Panic, direct annotated calls, and
+unconditional loops without an owned exit can satisfy this guarantee.
+
+```nov
+@[noreturn]
+let fail: (message: string) -> void = {
+    @panic(message)
+}
+
+let require: (valid: bool) -> uint = {
+    if valid { @as(uint, 1) } else { fail("invalid input") }
+}
+```
+
+A direct call to an annotated function is terminal: it contributes no continuing
+value to an `if`/`match` merge, skips later operand/argument effects, and makes
+following statements unreachable. Terminal loop conditions are tracked too;
+loop-local `break` and `continue` retain their ordinary control targets.
+
+The guarantee belongs to the declaration, not the function type. Ordinary function
+values keep their `(...) -> void` signature and erase the annotation; indirect
+calls are conservatively treated as possibly completing. Annotated C functions
+use `_Noreturn`; function-pointer typedefs remain ordinary void-returning types.
 
 Attributes can be set only on top level / container declarations
 
