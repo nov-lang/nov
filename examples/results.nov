@@ -1,0 +1,29 @@
+let Result: (T: type, E: type) -> type = union {
+    ok: T,
+    err: E,
+}
+
+let checkedDouble: (value: uint) -> Result(uint, string) = {
+    if value > 100 {
+        return .err["value exceeds 100"]
+    }
+    .ok[value * 2]
+}
+
+let describe: (value: uint) -> Result(string, string) = {
+    let doubled = checkedDouble(value).!
+    .ok["Doubled: {doubled}"]
+}
+
+let report: (value: uint) = {
+    let message = match describe(value) {
+        .ok => |text| text
+        .err => |error| "Error: {error}"
+    }
+    @println(message)
+}
+
+let main: () = {
+    report(21)
+    report(101)
+}

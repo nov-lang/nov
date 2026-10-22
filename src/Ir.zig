@@ -32,9 +32,14 @@ pub const Body = struct { instructions: []const Instruction, result: ValueId };
 pub const Instruction = struct { ty: TypeId, span: Span, op: Operation };
 pub const UnaryOp = enum { negate, bit_not, bool_not };
 pub const BinaryOp = enum { add, sub, mul, div, mod, bit_and, bit_or, bit_xor, eq, ne, lt, le, gt, ge };
+pub const FieldRead = struct { base: ValueId, index: u32 };
 pub const Operation = union(enum) {
+    union_init: struct { index: u32, payload: ?ValueId },
+    union_tag: FieldRead,
+    /// Always checked at runtime, even for externally constructed or malformed values.
+    union_payload: FieldRead,
     record_init: []const ValueId,
-    field_read: struct { base: ValueId, index: u32 },
+    field_read: FieldRead,
     /// Decimal integers, true/false booleans, or a shared immutable string.
     to_string: ValueId,
     array_literal: []const ValueId,
@@ -97,7 +102,16 @@ pub const Operation = union(enum) {
 };
 
 pub const Field = struct { name: []const u8, ty: TypeId, span: Span, default: ?ConstId = null };
-pub const Record = struct { identity: u32, fields: []const Field, public: bool = false };
+/// Nominal aggregate layout. Tagged layouts have exactly one active scalar field.
+pub const Record = struct {
+    identity: u32,
+    fields: []const Field,
+    public: bool = false,
+    tagged: bool = false,
+    /// Empty for ordinary aggregates; canonical arguments distinguish nominal instances.
+    type_args: []const TypeId = &.{},
+    instance_state: enum { complete, building, failed } = .complete,
+};
 pub const Type = union(enum) {
     record: Record,
     void,
@@ -172,7 +186,10 @@ pub fn deinit(self: *Ir) void {
     self.functions.deinit(self.allocator);
     for (self.types.items) |ty| {
         switch (ty) {
-            .record => |record| self.freeFields(record.fields),
+            .record => |record| {
+                self.freeFields(record.fields);
+                self.allocator.free(record.type_args);
+            },
             .function => |function| self.allocator.free(function.params),
             else => {},
         }
@@ -275,7 +292,7 @@ fn freeFields(self: *Ir, fields: []const Field) void {
 pub fn setRecordFields(self: *Ir, id: TypeId, fields: []const Field) InternError!void {
     const ty = self.getType(id) orelse return error.InvalidTypeId;
     if (ty != .record) return error.InvalidTypeId;
-    try self.validateType(.{ .record = .{ .identity = ty.record.identity, .fields = fields } }, self.types.items.len);
+    try self.validateType(.{ .record = .{ .identity = ty.record.identity, .tagged = ty.record.tagged, .type_args = ty.record.type_args, .fields = fields } }, self.types.items.len);
     const owned = try self.allocator.dupe(Field, fields);
     var copied: usize = 0;
     errdefer {
@@ -300,7 +317,9 @@ pub fn internType(self: *Ir, ty: Type) InternError!TypeId {
     const owned: Type = switch (ty) {
         .record => |record| blk: {
             if (record.fields.len != 0) return error.InvalidTypeId;
-            break :blk .{ .record = .{ .identity = record.identity, .fields = try self.allocator.alloc(Field, 0), .public = record.public } };
+            const args = try self.allocator.dupe(TypeId, record.type_args);
+            errdefer self.allocator.free(args);
+            break :blk .{ .record = .{ .identity = record.identity, .fields = try self.allocator.alloc(Field, 0), .public = record.public, .tagged = record.tagged, .type_args = args, .instance_state = record.instance_state } };
         },
         .function => |function| .{ .function = .{
             .params = try self.allocator.dupe(TypeId, function.params),
@@ -517,13 +536,27 @@ fn validateBody(self: *const Ir, function: Function, body: Body) VerifyError!voi
             if (i + 1 != region_end or @intFromEnum(result) != i) return error.UnreachableInstruction;
         }
         switch (instruction.op) {
+            .union_init => |init_value| {
+                if (ty != .record or !ty.record.tagged or init_value.index >= ty.record.fields.len) return error.InvalidOperation;
+                const payload_ty = ty.record.fields[init_value.index].ty;
+                if (init_value.payload) |payload| {
+                    if (self.getType(payload_ty).? == .void or try operandType(body, payload, i) != payload_ty) return error.OperandTypeMismatch;
+                } else if (self.getType(payload_ty).? != .void) return error.OperandTypeMismatch;
+            },
+            .union_tag, .union_payload => |read| {
+                const base = self.getType(try operandType(body, read.base, i)).?;
+                if (base != .record or !base.record.tagged or read.index >= base.record.fields.len) return error.InvalidOperation;
+                if (instruction.op == .union_tag) {
+                    if (ty != .boolean) return error.OperandTypeMismatch;
+                } else if (instruction.ty != base.record.fields[read.index].ty) return error.OperandTypeMismatch;
+            },
             .record_init => |values| {
-                if (ty != .record or values.len != ty.record.fields.len) return error.InvalidOperation;
+                if (ty != .record or ty.record.tagged or values.len != ty.record.fields.len) return error.InvalidOperation;
                 for (values, ty.record.fields) |value, field| if (try operandType(body, value, i) != field.ty) return error.OperandTypeMismatch;
             },
             .field_read => |read| {
                 const base = self.getType(try operandType(body, read.base, i)).?;
-                if (base != .record or read.index >= base.record.fields.len) return error.InvalidOperation;
+                if (base != .record or base.record.tagged or read.index >= base.record.fields.len) return error.InvalidOperation;
                 if (instruction.ty != base.record.fields[read.index].ty) return error.OperandTypeMismatch;
             },
             .to_string => |value| {
@@ -717,10 +750,13 @@ fn validateBody(self: *const Ir, function: Function, body: Body) VerifyError!voi
 fn validateType(self: *const Ir, ty: Type, before: usize) ValidationError!void {
     switch (ty) {
         .record => |record| {
+            for (record.type_args) |arg| if (@intFromEnum(arg) >= before) return error.InvalidTypeId;
+            if (record.type_args.len != 0 and !record.tagged) return error.InvalidTypeId;
             for (record.fields, 0..) |field, i| {
                 if (@intFromEnum(field.ty) >= self.types.items.len) return error.InvalidTypeId;
                 const ft = self.getType(field.ty).?;
-                if (!isRecordField(ft)) return error.InvalidArrayElement;
+                if (!isRecordField(ft) and !(record.tagged and ft == .void)) return error.InvalidArrayElement;
+                if (record.tagged and field.default != null) return error.InvalidTypeId;
                 if (field.name.len == 0 or field.span.start > field.span.end or field.span.end > self.source_len) return error.InvalidTypeId;
                 for (record.fields[0..i]) |previous| if (std.mem.eql(u8, previous.name, field.name)) return error.InvalidTypeId;
                 if (field.default) |default| {
@@ -815,7 +851,7 @@ fn typeEql(a: Type, b: Type) bool {
     return switch (a) {
         .void, .boolean, .string => true,
         .integer => |integer| std.meta.eql(integer, b.integer),
-        .record => |record| record.identity == b.record.identity,
+        .record => |record| record.identity == b.record.identity and record.tagged == b.record.tagged and std.mem.eql(TypeId, record.type_args, b.record.type_args),
         .array => |element| element == b.array,
         .function => |function| function.result == b.function.result and
             std.mem.eql(TypeId, function.params, b.function.params),
@@ -840,6 +876,64 @@ test "record field integer widths follow IR limits independently of array elemen
     try std.testing.expect(!isRecordField(.{ .integer = .{ .bits = 129, .signedness = .unsigned } }));
     try std.testing.expect(!isRecordField(.void));
     try std.testing.expect(!isRecordField(ir.getType(record).?));
+}
+
+test "generic nominal keys own canonical arguments and do not collapse identical layouts" {
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    const boolean = try ir.internType(.boolean);
+    const integer = try ir.internType(.{ .integer = .{ .signedness = .signed, .bits = 32 } });
+    var args = [_]TypeId{boolean};
+    const first = try ir.internType(.{ .record = .{ .identity = 7, .fields = &.{}, .tagged = true, .type_args = &args } });
+    args[0] = integer;
+    try std.testing.expectEqual(boolean, ir.getType(first).?.record.type_args[0]);
+    const second = try ir.internType(.{ .record = .{ .identity = 7, .fields = &.{}, .tagged = true, .type_args = &args } });
+    try std.testing.expect(first != second);
+    try std.testing.expectEqual(first, try ir.internType(.{ .record = .{ .identity = 7, .fields = &.{}, .tagged = true, .type_args = &.{boolean} } }));
+    try ir.verify();
+    const owned = @constCast(ir.types.items[@intFromEnum(first)].record.type_args);
+    owned[0] = first;
+    try std.testing.expectError(error.InvalidTypeId, ir.verify());
+    owned[0] = boolean;
+}
+
+test "union IR rejects invalid constructors reads tags and private capture escape" {
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    const boolean = try ir.internType(.boolean);
+    const unit = try ir.internType(.void);
+    const u = try ir.internType(.{ .record = .{ .identity = 0, .fields = &.{}, .tagged = true } });
+    try ir.setRecordFields(u, &.{ .{ .name = "ok", .ty = boolean, .span = .{ .start = 0, .end = 0 } }, .{ .name = "none", .ty = unit, .span = .{ .start = 0, .end = 0 } } });
+    const sig = try ir.internType(.{ .function = .{ .params = &.{u}, .result = boolean } });
+    const f = try ir.addFunction("f", sig, .{ .start = 0, .end = 0 });
+    var body = [_]Instruction{
+        .{ .ty = u, .span = .{ .start = 0, .end = 0 }, .op = .{ .parameter = 0 } },
+        .{ .ty = boolean, .span = .{ .start = 0, .end = 0 }, .op = .{ .union_payload = .{ .base = @enumFromInt(0), .index = 0 } } },
+    };
+    body[1].op.union_payload.index = 2;
+    try std.testing.expectError(error.InvalidOperation, ir.setFunctionBody(f, &body, @enumFromInt(1)));
+    body[1].op = .{ .field_read = .{ .base = @enumFromInt(0), .index = 0 } };
+    try std.testing.expectError(error.InvalidOperation, ir.setFunctionBody(f, &body, @enumFromInt(1)));
+    body[1].ty = u;
+    body[1].op = .{ .union_init = .{ .index = 0, .payload = null } };
+    try std.testing.expectError(error.OperandTypeMismatch, ir.setFunctionBody(f, &body, @enumFromInt(0)));
+    body[1].op = .{ .record_init = &.{ @enumFromInt(0), @enumFromInt(0) } };
+    try std.testing.expectError(error.InvalidOperation, ir.setFunctionBody(f, &body, @enumFromInt(0)));
+    body[1].ty = unit;
+    body[1].op = .{ .union_tag = .{ .base = @enumFromInt(0), .index = 0 } };
+    try std.testing.expectError(error.OperandTypeMismatch, ir.setFunctionBody(f, &body, @enumFromInt(0)));
+    body[1].ty = boolean;
+    body[1].op = .{ .union_payload = .{ .base = @enumFromInt(0), .index = 0 } };
+    const private_body = [_]Instruction{
+        body[0],
+        .{ .ty = boolean, .span = .{ .start = 0, .end = 0 }, .op = .{ .union_tag = .{ .base = @enumFromInt(0), .index = 0 } } },
+        body[1],
+        .{ .ty = boolean, .span = .{ .start = 0, .end = 0 }, .op = .{ .branch = .{ .condition = @enumFromInt(1), .then_start = 2, .else_start = 3, .then_value = @enumFromInt(2), .else_value = @enumFromInt(1) } } },
+        .{ .ty = boolean, .span = .{ .start = 0, .end = 0 }, .op = .{ .unary = .{ .op = .bool_not, .operand = @enumFromInt(2) } } },
+    };
+    try std.testing.expectError(error.InvalidValueId, ir.setFunctionBody(f, &private_body, @enumFromInt(4)));
+    try ir.setFunctionBody(f, &body, @enumFromInt(1));
+    try ir.verify();
 }
 
 test "string constants are canonical owned UTF8 and operations verify exact types" {

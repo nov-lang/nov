@@ -126,6 +126,16 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     _ = fixtures.add("interpolation.nov", @embedFile("examples/interpolation.nov"));
     _ = fixtures.add("type-aliases.nov", @embedFile("examples/type-aliases.nov"));
     _ = fixtures.add("type.nov", @embedFile("examples/type.nov"));
+    _ = fixtures.add("unions.nov", "let Alias=U\nlet U=union{ok:int,err:string,none,}\nlet describe:(u:Alias)->string=match u{.ok=>|v|\"ok:{v}\"\n.err=>|s|s\n.none=>\"none\"}\nlet main:()={@println(describe(U.ok[7]),describe(.err[\"a\"+\"b\"]),describe(.none[]))}");
+    _ = fixtures.add("union-missing.nov", "let U=union{ok:int,none,}\nlet f:(u:U)->int=match u{.ok=>|n|n}");
+    _ = fixtures.add("union-duplicate.nov", "let U=union{ok:int,none,}\nlet f:(u:U)->int=match u{.ok=>0\n.ok=>1\n_=>2}");
+    _ = fixtures.add("union-capture.nov", "let U=union{ok:int,none,}\nlet f:(u:U)->int=match u{.ok=>|n|n\n_=>n}");
+    _ = fixtures.add("generic-unions.nov", "let G:(T:type,E:type)->type=union{err:E,ok:T,}\nlet R=G(int,string)\nlet Text=G(string,string)\nlet make:(b:bool)->R={@print(\"M\")\nif b{.ok[7]}else{.err[\"b\"+\"ad\"]}}\nlet wrap:(b:bool)->Text={let n=make(b).!\n.ok[\"{n}\"]}\nlet show:(r:Text)->string=match r{.ok=>|s|s\n.err=>|s|s}\nlet main:()=@println(show(wrap(true)),show(wrap(false)))");
+    _ = fixtures.add("generic-cycle.nov", "let G:(T:type)->type=union{ok:G(T),}\nlet R=G(int)");
+    _ = fixtures.add("generic-method.nov", "let G:(T:type)->type=union{ok:T,\nlet m:(x:T)->T=x\n}");
+    _ = fixtures.add("propagation-error.nov", "let G:(T:type,E:type)->type=union{ok:T,err:E,}\nlet f:(r:G(int,string))->G(int,bool)=.ok[r.!]");
+    _ = fixtures.add("wide-generic.nov", "let G:(T:type)->type=union{ok:T,err:string,}\nlet f:()->G(i128)=.ok[170141183460469231731687303715884105727]\nlet main:()={}");
+    _ = fixtures.add("wide-union.nov", "let U=union{ok:i128,none,}\nlet f:(u:U)={}\nlet main:()={}");
     _ = fixtures.add("wide-record.nov", "let R=struct{x:i128,}\nlet f:(r:R)= {}\nlet main:()={}\n");
     _ = fixtures.add("wide-record-alias.nov", "let Wide=u128\nlet Alias=R\nlet R=struct{x:Wide,}\nlet f:(r:Alias)= {}\nlet main:()={}\n");
     _ = fixtures.add("unused-wide-record.nov", "let R=struct{x:i128,}\nlet main:()={}\n");
@@ -236,6 +246,17 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         stderr_match: ?[]const u8 = null,
     };
     const cases = [_]Case{
+        .{ .name = "generic union semantic", .args = &.{ "check", "generic-unions.nov", "--semantic" }, .exit_code = 0 },
+        .{ .name = "generic cycle", .args = &.{ "check", "generic-cycle.nov", "--semantic" }, .exit_code = 1, .stderr_match = "cyclic generic union instantiation" },
+        .{ .name = "generic method diagnostic", .args = &.{ "check", "generic-method.nov", "--semantic" }, .exit_code = 1, .stderr_match = "generic union methods and container declarations are not supported" },
+        .{ .name = "propagation exact error", .args = &.{ "check", "propagation-error.nov", "--semantic" }, .exit_code = 1, .stderr_match = ".! error payload must exactly match" },
+        .{ .name = "generic 128 bit semantic", .args = &.{ "check", "wide-generic.nov", "--semantic" }, .exit_code = 0 },
+        .{ .name = "generic backend width", .args = &.{ "emit-c", "wide-generic.nov" }, .exit_code = 1, .stderr_match = "C backend only supports 8, 16, 32 and 64-bit integers" },
+        .{ .name = "union semantic", .args = &.{ "check", "unions.nov", "--semantic" }, .exit_code = 0 },
+        .{ .name = "union incomplete", .args = &.{ "check", "union-missing.nov", "--semantic" }, .exit_code = 1, .stderr_match = "union match must cover every variant" },
+        .{ .name = "union duplicate", .args = &.{ "check", "union-duplicate.nov", "--semantic" }, .exit_code = 1, .stderr_match = "union match prong is already covered" },
+        .{ .name = "union private capture", .args = &.{ "check", "union-capture.nov", "--semantic" }, .exit_code = 1, .stderr_match = "unknown name 'n'" },
+        .{ .name = "union backend width", .args = &.{ "emit-c", "wide-union.nov" }, .exit_code = 1, .stderr_match = "C backend only supports 8, 16, 32 and 64-bit integers" },
         .{ .name = "help", .args = &.{"--help"}, .exit_code = 0, .stderr_match = "Usage: nov" },
         .{ .name = "version", .args = &.{"--version"}, .exit_code = 0, .stdout = b.fmt("nov {f}\n", .{nov_version}) },
         .{ .name = "no arguments", .args = &.{}, .exit_code = 1, .stderr_match = "Usage: nov" },
@@ -390,6 +411,8 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     }
 
     const stdin_cases = [_]struct { source: []const u8, check: bool = false, output: []const u8 = "", diagnostic: ?[]const u8 = null, code: u8 = 0 }{
+        .{ .source = "let G:(T:type)->type=union{ok:T,err:string,}\nlet R=G(int)\nlet f:(r:R)->R=.ok[r.!]", .output = "let G: (T: type) -> type = union {\n    ok: T,\n    err: string,\n}\nlet R = G(int)\nlet f: (r: R) -> R = .ok[r.!]\n" },
+        .{ .source = "let U=union{ok:int,none,}\nlet f:(u:U)->int=match u{.ok=>|v|v\n.none=>0}", .output = "let U = union {\n    ok: int,\n    none,\n}\nlet f: (u: U) -> int = match u {\n    .ok => |v| v\n    .none => 0\n}\n" },
         .{ .source = "let x=1", .output = "let x = 1\n" },
         .{ .source = "let x = 1\n", .output = "let x = 1\n" },
         .{ .source = "" },
@@ -417,6 +440,52 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
 
     // An isolated PATH exercises real `zig cc` discovery, independent of host CC.
     for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+        const generic_run = b.addRunArtifact(exe);
+        generic_run.step.name = b.fmt("CLI: generic unions and propagation ({s})", .{mode});
+        generic_run.setCwd(fixtures.getDirectory());
+        generic_run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+        generic_run.setEnvironmentVariable("NOV_CC", "");
+        generic_run.setEnvironmentVariable("CC", "");
+        generic_run.addArgs(&.{ "run", "generic-unions.nov" });
+        if (mode.len != 0) generic_run.addArg(mode);
+        generic_run.expectExitCode(0);
+        generic_run.expectStdOutEqual("MM7 bad\n");
+        generic_run.expectStdErrEqual("");
+        test_step.dependOn(&generic_run.step);
+
+        const generic_build = b.addRunArtifact(exe);
+        generic_build.step.name = b.fmt("CLI: build generic unions ({s})", .{mode});
+        generic_build.setCwd(fixtures.getDirectory());
+        generic_build.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+        generic_build.setEnvironmentVariable("NOV_CC", "");
+        generic_build.setEnvironmentVariable("CC", "");
+        generic_build.addArgs(&.{ "build", "generic-unions.nov" });
+        if (mode.len != 0) generic_build.addArg(mode);
+        generic_build.addArg("-o");
+        const generic_program = generic_build.addOutputFileArg(if (exe.root_module.resolved_target.?.result.os.tag == .windows) "generic.exe" else "generic");
+        generic_build.expectExitCode(0);
+        generic_build.expectStdOutEqual("");
+        generic_build.expectStdErrEqual("");
+        const generic_execute = std.Build.Step.Run.create(b, b.fmt("CLI: execute generic unions ({s})", .{mode}));
+        generic_execute.addFileArg(generic_program);
+        generic_execute.expectExitCode(0);
+        generic_execute.expectStdOutEqual("MM7 bad\n");
+        generic_execute.expectStdErrEqual("");
+        test_step.dependOn(&generic_execute.step);
+
+        const union_run = b.addRunArtifact(exe);
+        union_run.step.name = b.fmt("CLI: nominal unions ({s})", .{mode});
+        union_run.setCwd(fixtures.getDirectory());
+        union_run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+        union_run.setEnvironmentVariable("NOV_CC", "");
+        union_run.setEnvironmentVariable("CC", "");
+        union_run.addArgs(&.{ "run", "unions.nov" });
+        if (mode.len != 0) union_run.addArg(mode);
+        union_run.expectExitCode(0);
+        union_run.expectStdOutEqual("ok:7 ab none\n");
+        union_run.expectStdErrEqual("");
+        test_step.dependOn(&union_run.step);
+
         const fibo = b.addRunArtifact(exe);
         fibo.step.name = b.fmt("CLI: unchanged fibo ({s})", .{mode});
         fibo.setCwd(fixtures.getDirectory());

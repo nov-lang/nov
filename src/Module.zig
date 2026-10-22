@@ -25,6 +25,7 @@ pub const Declaration = struct {
     node: Ast.Node.Index,
     is_type_alias: bool = false,
     is_record: bool = false,
+    is_generic: bool = false,
     container: ?DeclId = null,
     public: bool = false,
 };
@@ -37,6 +38,23 @@ pub const Diagnostic = struct {
     pub const Tag = enum {
         duplicate_name,
         unsupported_attribute,
+        invalid_generic_declaration,
+        generic_needs_arguments,
+        not_a_generic,
+        generic_argument_count,
+        generic_cycle,
+        generic_limit,
+        unsupported_generic_method,
+        invalid_propagation_operand,
+        invalid_propagation_return,
+        propagation_error_mismatch,
+        empty_union,
+        unsupported_union_default,
+        invalid_union_constructor,
+        union_needs_type,
+        match_missing_variants,
+        match_covered_union_prong,
+        invalid_match_capture,
         duplicate_field,
         unknown_field,
         missing_field,
@@ -186,7 +204,7 @@ fn aliasCandidate(self: *const Module, id: DeclId) bool {
     const full = self.ast.decl(self.getDeclaration(id).?.node).ast;
     if (full.is_mutable or full.type_node != 0 or full.init_node == 0) return false;
     return switch (self.ast.nodes.items(.tag)[full.init_node]) {
-        .identifier, .array_type, .fn_proto, .fn_proto_one, .container_decl => true,
+        .identifier, .array_type, .fn_proto, .fn_proto_one, .container_decl, .call, .call_one, .call_comma, .call_one_comma => true,
         else => false,
     };
 }
@@ -219,10 +237,38 @@ fn classifyAliases(self: *Module) std.mem.Allocator.Error!void {
         if (!self.aliasCandidate(@enumFromInt(i))) continue;
         const init_node = self.ast.decl(declaration.node).ast.init_node;
         const name = self.ast.tokenSlice(self.ast.firstToken(init_node));
+        if (self.ast.fullCall(init_node)) |call| {
+            if (tags[call.ast.fn_expr] != .identifier) continue;
+            const target = self.lookup(self.ast.tokenSlice(self.ast.firstToken(call.ast.fn_expr))) orelse continue;
+            if (!self.getDeclaration(target).?.is_generic) continue;
+        }
         if (tags[init_node] != .identifier or (primitives.isPrimitive(name) and !std.mem.eql(u8, name, "true") and !std.mem.eql(u8, name, "false") and self.lookup(name) == null)) {
             declaration.is_type_alias = true;
             try work.append(self.allocator, init_node);
         }
+    }
+    // Generic function aliases must stabilize before classifying application aliases.
+    var generic_changed = true;
+    while (generic_changed) {
+        generic_changed = false;
+        for (self.declarations.items, 0..) |*declaration, i| {
+            if (declaration.is_generic or !self.aliasCandidate(@enumFromInt(i))) continue;
+            const init_node = self.ast.decl(declaration.node).ast.init_node;
+            if (tags[init_node] != .identifier) continue;
+            const target = self.lookup(self.ast.tokenSlice(self.ast.firstToken(init_node))) orelse continue;
+            if (self.getDeclaration(target).?.is_generic) {
+                declaration.is_generic = true;
+                declaration.is_type_alias = true;
+                generic_changed = true;
+            }
+        }
+    }
+    for (tags, 0..) |_, i| {
+        const node: Ast.Node.Index = @intCast(i);
+        const call = self.ast.fullCall(node) orelse continue;
+        if (tags[call.ast.fn_expr] != .identifier) continue;
+        const target = self.lookup(self.ast.tokenSlice(self.ast.firstToken(call.ast.fn_expr))) orelse continue;
+        if (self.getDeclaration(target).?.is_generic) try work.append(self.allocator, node);
     }
     while (true) {
         while (work.pop()) |node| {
@@ -232,6 +278,8 @@ fn classifyAliases(self: *Module) std.mem.Allocator.Error!void {
                 if (proto.ast.return_type) |result| try work.append(self.allocator, result);
             } else if (tags[node] == .array_type) {
                 try work.append(self.allocator, data[node].rhs);
+            } else if (self.ast.fullCall(node)) |call| {
+                for (call.ast.args) |arg| try work.append(self.allocator, arg);
             } else if (tags[node] == .identifier) {
                 const name = self.ast.tokenSlice(self.ast.firstToken(node));
                 if (self.lookup(name)) |id| {
@@ -247,10 +295,21 @@ fn classifyAliases(self: *Module) std.mem.Allocator.Error!void {
         for (self.declarations.items, 0..) |*declaration, i| {
             if (declaration.is_type_alias or !self.aliasCandidate(@enumFromInt(i))) continue;
             const init_node = self.ast.decl(declaration.node).ast.init_node;
+            if (self.ast.fullCall(init_node)) |call| {
+                if (tags[call.ast.fn_expr] != .identifier) continue;
+                const target = self.lookup(self.ast.tokenSlice(self.ast.firstToken(call.ast.fn_expr))) orelse continue;
+                if (self.getDeclaration(target).?.is_generic) {
+                    declaration.is_type_alias = true;
+                    try work.append(self.allocator, init_node);
+                    changed = true;
+                }
+                continue;
+            }
             if (tags[init_node] != .identifier) continue;
             const target = self.lookup(self.ast.tokenSlice(self.ast.firstToken(init_node))) orelse continue;
             if (self.getDeclaration(target).?.is_type_alias) {
                 declaration.is_type_alias = true;
+                declaration.is_generic = self.getDeclaration(target).?.is_generic;
                 changed = true;
             }
         }
@@ -305,6 +364,7 @@ fn collectDeclaration(self: *Module, node: Ast.Node.Index, container: ?DeclId) (
         const id: DeclId = @enumFromInt(self.declarations.items.len);
         if (container == null) try self.names.put(self.allocator, name, id);
         const is_record = declaration.ast.init_node != 0 and self.ast.fullStruct(declaration.ast.init_node) != null;
+        const is_generic = is_record and self.ast.isUnion(declaration.ast.init_node) and declaration.ast.type_node != 0;
         var public = false;
         for (declaration.attributes) |attribute| {
             const data = self.ast.nodes.items(.data)[attribute];
@@ -312,7 +372,7 @@ fn collectDeclaration(self: *Module, node: Ast.Node.Index, container: ?DeclId) (
                 public = true;
             } else try self.diagnostics.append(self.allocator, .{ .tag = .unsupported_attribute, .span = self.tokenSpan(self.ast.firstToken(attribute)) });
         }
-        try self.declarations.append(self.allocator, .{ .name = name, .name_span = name_span, .node = node, .container = container, .is_record = is_record, .is_type_alias = is_record, .public = public });
+        try self.declarations.append(self.allocator, .{ .name = name, .name_span = name_span, .node = node, .container = container, .is_record = is_record, .is_generic = is_generic, .is_type_alias = is_record, .public = public });
     }
 }
 

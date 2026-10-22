@@ -165,8 +165,10 @@ fn renderMember(
             const data = ast.nodes.items(.data)[decl];
             const token = ast.nodes.items(.main_token)[decl];
             try self.renderToken(token, .none);
-            try self.renderToken(token + 1, .space);
-            try self.renderExpression(data.lhs, if (data.rhs != 0) .space else .none);
+            if (data.lhs != 0) {
+                try self.renderToken(token + 1, .space);
+                try self.renderExpression(data.lhs, if (data.rhs != 0) .space else .none);
+            }
             if (data.rhs != 0) {
                 try self.renderToken(ast.lastToken(data.lhs) + 1, .space);
                 try self.renderExpression(data.rhs, .none);
@@ -565,6 +567,11 @@ fn renderExpression(self: *Render, node: Ast.Node.Index, space: Space) RenderErr
                 if (token_tags[next] == .comma) try self.renderToken(next, .space);
             }
             try self.renderToken(prong.arrow_token, .space);
+            if (prong.capture_token) |token| {
+                try self.renderToken(token - 1, .none);
+                try self.renderToken(token, .none);
+                try self.renderToken(token + 1, .space);
+            }
             return self.renderExpression(prong.target_expr, space);
         },
 

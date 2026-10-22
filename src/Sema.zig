@@ -16,7 +16,7 @@ entries: []Entry,
 /// Entry-point/backend/runtime configuration is still a separate obligation.
 lowering_complete: bool = false,
 
-pub const Status = enum { deferred, type_alias, signature_only, constant_checked, body_checked, lowered, failed };
+pub const Status = enum { deferred, generic, type_alias, signature_only, constant_checked, body_checked, lowered, failed };
 pub const Entry = struct {
     type_id: ?Ir.TypeId = null,
     /// Represented type, never the runtime type of this declaration.
@@ -43,13 +43,22 @@ pub fn analyzeAnnotations(module: *Module) Error!Sema {
     result.ir.source_len = @intCast(module.ast.source.len);
     @memset(result.entries, .{});
     for (module.declarations.items, 0..) |declaration, i| {
+        if (declaration.is_generic) {
+            if (declaration.is_record) _ = try TypeResolver.validateGeneric(module, @enumFromInt(i));
+            result.entries[i].status = .generic;
+            continue;
+        }
         if (!declaration.is_record) continue;
-        result.entries[i].alias_type = try result.ir.internType(.{ .record = .{ .identity = @intCast(i), .fields = &.{}, .public = declaration.public } });
+        result.entries[i].alias_type = try result.ir.internType(.{ .record = .{ .identity = @intCast(i), .fields = &.{}, .public = declaration.public, .tagged = module.ast.isUnion(module.ast.decl(declaration.node).ast.init_node) } });
         result.entries[i].status = .type_alias;
     }
     for (module.declarations.items, 0..) |declaration, i| {
         const full = module.ast.decl(declaration.node);
-        if (declaration.is_record) continue;
+        if (declaration.is_record or declaration.is_generic) continue;
+        if (declaration.container) |owner| if (module.getDeclaration(owner).?.is_generic) {
+            result.entries[i].status = .failed;
+            continue;
+        };
         if (declaration.container != null and (full.ast.is_mutable or module.ast.fullFnProto(full.ast.type_node) == null)) {
             try module.diagnostics.append(module.allocator, .{ .tag = .unsupported_declaration, .span = declaration.name_span });
             result.entries[i].status = .failed;
@@ -86,7 +95,7 @@ pub fn analyzeAnnotations(module: *Module) Error!Sema {
         }
     }
     for (module.declarations.items, 0..) |declaration, i| {
-        if (!declaration.is_record) continue;
+        if (!declaration.is_record or declaration.is_generic) continue;
         const full = module.ast.decl(declaration.node);
         if (declaration.container != null or primitives.isPrimitive(declaration.name)) {
             try module.diagnostics.append(module.allocator, .{ .tag = if (declaration.container != null) .unsupported_declaration else .unsupported_shadowing, .span = declaration.name_span });
@@ -97,6 +106,7 @@ pub fn analyzeAnnotations(module: *Module) Error!Sema {
             try module.diagnostics.append(module.allocator, .{ .tag = .unsupported_type, .span = declaration.name_span });
             continue;
         }
+        const tagged = module.ast.isUnion(full.ast.init_node);
         var fields: std.ArrayList(Ir.Field) = .empty;
         defer fields.deinit(module.allocator);
         for (module.ast.fullStruct(full.ast.init_node).?) |member| {
@@ -113,14 +123,18 @@ pub fn analyzeAnnotations(module: *Module) Error!Sema {
                 try module.diagnostics.append(module.allocator, .{ .tag = .duplicate_field, .span = span });
                 continue;
             }
-            const ty = (try TypeResolver.resolve(module, &result.ir, data.lhs)) orelse continue;
+            const ty = if (tagged and data.lhs == 0) try result.ir.internType(.void) else (try TypeResolver.resolve(module, &result.ir, data.lhs)) orelse continue;
             const ft = result.ir.getType(ty).?;
-            if (!Ir.isRecordField(ft)) {
+            if (!Ir.isRecordField(ft) and !(tagged and ft == .void)) {
                 try module.diagnostics.append(module.allocator, .{ .tag = .unsupported_type, .span = module.tokenSpan(module.ast.firstToken(data.lhs)) });
                 continue;
             }
             var default: ?Ir.ConstId = null;
             if (data.rhs != 0) {
+                if (tagged) {
+                    try module.diagnostics.append(module.allocator, .{ .tag = .unsupported_union_default, .span = module.tokenSpan(module.ast.firstToken(data.rhs)) });
+                    continue;
+                }
                 switch (try Literal.check(module, &result.ir, data.rhs, ty, span)) {
                     .constant => |constant| default = constant,
                     .failed => continue,
@@ -132,6 +146,7 @@ pub fn analyzeAnnotations(module: *Module) Error!Sema {
             }
             try fields.append(module.allocator, .{ .name = name, .ty = ty, .span = .{ .start = span.start, .end = span.end }, .default = default });
         }
+        if (tagged and fields.items.len == 0) try module.diagnostics.append(module.allocator, .{ .tag = .empty_union, .span = declaration.name_span });
         try result.ir.setRecordFields(result.entries[i].alias_type.?, fields.items);
     }
     return result;

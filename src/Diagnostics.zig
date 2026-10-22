@@ -46,15 +46,32 @@ pub fn renderModule(module: *const Module, writer: *std.Io.Writer) !void {
         const location = Location.init(module.ast.source, diagnostic.span.start);
         try location.renderPrefix(module.path, "error", writer);
         switch (diagnostic.tag) {
-            .unsupported_attribute => try writer.writeAll("only a single @[public] on struct or method declarations is supported"),
-            .duplicate_field => try writer.writeAll("duplicate struct field"),
-            .unknown_field => try writer.writeAll("unknown struct field"),
+            .invalid_generic_declaration => try writer.writeAll("generic union declarations require named type parameters: (T: type, ...) -> type = union { ... }"),
+            .generic_needs_arguments => try writer.writeAll("generic union requires explicit type arguments"),
+            .not_a_generic => try writer.writeAll("type application requires an ordinary named generic union"),
+            .generic_argument_count => try writer.writeAll("type argument count does not match the generic union declaration"),
+            .generic_cycle => try writer.writeAll("cyclic generic union instantiation"),
+            .generic_limit => try writer.writeAll("generic union expansion exceeds the current limit of 64"),
+            .unsupported_generic_method => try writer.writeAll("generic union methods and container declarations are not supported yet; use an explicitly typed external function"),
+            .invalid_propagation_operand => try writer.writeAll(".! requires a union with exactly ok and err variants"),
+            .invalid_propagation_return => try writer.writeAll(".! requires an enclosing function returning a union with exactly ok and err variants"),
+            .propagation_error_mismatch => try writer.writeAll(".! error payload must exactly match the enclosing union's err type"),
+            .empty_union => try writer.writeAll("union requires at least one variant"),
+            .unsupported_union_default => try writer.writeAll("union payload defaults are not supported; construct a variant explicitly"),
+            .invalid_union_constructor => try writer.writeAll("union construction requires U.tag[payload] or .tag[payload], with an exact payload type and [] for void"),
+            .union_needs_type => try writer.writeAll("contextual union constructor needs an expected union type"),
+            .match_missing_variants => try writer.writeAll("union match must cover every variant or end with a wildcard (_)"),
+            .match_covered_union_prong => try writer.writeAll("union match prong is already covered by earlier prongs"),
+            .invalid_match_capture => try writer.writeAll("payload capture requires a single union variant pattern and an immutable named binding"),
+            .unsupported_attribute => try writer.writeAll("only a single @[public] on struct, union or method declarations is supported"),
+            .duplicate_field => try writer.writeAll("duplicate container field"),
+            .unknown_field => try writer.writeAll("unknown container field or union variant"),
             .missing_field => if (diagnostic.related) |field| try writer.print("missing required struct field '{s}'", .{module.sourceSlice(field).?}) else try writer.writeAll("missing required struct field"),
             .invalid_field_default => try writer.writeAll("struct field default must be a literal of the exact field type"),
-            .invalid_to_string => try writer.writeAll("printing a struct requires its method toString: (MyType) -> string"),
+            .invalid_to_string => try writer.writeAll("printing a struct or union requires its method toString: (MyType) -> string"),
             .duplicate_name => try writer.print("duplicate declaration '{s}'", .{module.sourceSlice(diagnostic.span).?}),
             .unknown_name => try writer.print("unknown name '{s}'", .{module.sourceSlice(diagnostic.span).?}),
-            .unsupported_declaration => try writer.writeAll("unsupported declaration; struct containers currently allow only explicitly typed methods"),
+            .unsupported_declaration => try writer.writeAll("unsupported declaration; containers currently allow only explicitly typed methods"),
             .unsupported_name => try writer.writeAll("quoted identifiers are not supported in semantic analysis yet"),
             .type_alias_cycle => try writer.print("cyclic type alias dependency on '{s}'", .{module.sourceSlice(diagnostic.span).?}),
             .type_alias_limit => try writer.writeAll("type alias expansion exceeds the current analysis limit of 128"),
@@ -75,8 +92,8 @@ pub fn renderModule(module: *const Module, writer: *std.Io.Writer) !void {
             .unsupported_global_interpolation => try writer.writeAll("global strings require literal initializers; move interpolation into a function"),
             .literal_type_mismatch => try writer.writeAll("literal does not match the annotated type"),
             .literal_out_of_range => try writer.writeAll("integer literal does not fit the annotated type"),
-            .unsupported_match_pattern => try writer.writeAll("match patterns support only scalar literals, literal alternatives (|), and wildcards (_); captures, enums and complex patterns are not supported"),
-            .unsupported_match_subject => try writer.writeAll("match subjects must be bool, integer or string values"),
+            .unsupported_match_pattern => try writer.writeAll("match patterns support scalar literals, literal alternatives (|), union variants and wildcards (_) only"),
+            .unsupported_match_subject => try writer.writeAll("match subjects must be bool, integer or string values, or one union value"),
             .match_missing_catchall => try writer.writeAll("match requires a final wildcard catchall (bounded exhaustiveness)"),
             .match_missing_boolean_values => try writer.writeAll("boolean match does not cover true or false; add both values or a wildcard (_)"),
             .match_missing_true => try writer.writeAll("boolean match does not cover true; add true or a wildcard (_)"),
@@ -115,6 +132,7 @@ pub fn renderModule(module: *const Module, writer: *std.Io.Writer) !void {
             .duplicate_parameter => "first parameter here",
             .missing_field => "required field declared here",
             .match_covered_boolean_prong => "earlier pattern covers this boolean value",
+            .match_covered_union_prong => "earlier pattern covers this variant",
             .literal_type_mismatch, .literal_out_of_range => "type annotation here",
             .expression_type_mismatch, .literal_needs_type => "expected type required here",
             .immutable_assignment => "immutable declaration here",
@@ -387,7 +405,7 @@ test "module unsupported attributes and quoted names render semantic diagnostics
     defer output.deinit();
     try renderModule(&module, &output.writer);
     try std.testing.expectEqualStrings(
-        "unsupported.nov:1:1: error: only a single @[public] on struct or method declarations is supported\n@[export]\n^~\n" ++
+        "unsupported.nov:1:1: error: only a single @[public] on struct, union or method declarations is supported\n@[export]\n^~\n" ++
             "unsupported.nov:3:5: error: quoted identifiers are not supported in semantic analysis yet\nlet @\"quoted\" = 2\n    ^~~~~~~~~\n",
         output.written(),
     );

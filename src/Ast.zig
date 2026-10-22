@@ -825,6 +825,7 @@ pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
         .container_decl => return self.matchingDelimiter(main_tokens[n] + 1) + end_offset,
         .container_decl_arg, .array_access => return self.matchingDelimiter(main_tokens[n]) + end_offset,
         .container_field => {
+            if (datas[n].lhs == 0 and datas[n].rhs == 0) return main_tokens[n] + end_offset;
             n = if (datas[n].rhs != 0) datas[n].rhs else datas[n].lhs;
         },
 
@@ -901,6 +902,10 @@ pub fn declarationAttributes(self: Ast, node: Node.Index) []const Node.Index {
 }
 
 /// Ordered field/declaration nodes borrowed from this AST, including attribute wrappers.
+pub fn isUnion(self: Ast, node: Node.Index) bool {
+    return self.nodes.items(.tag)[node] == .container_decl and self.tokens.items(.tag)[self.nodes.items(.main_token)[node]] == .keyword_union;
+}
+
 pub fn fullStruct(self: Ast, node: Node.Index) ?[]const Node.Index {
     if (self.nodes.items(.tag)[node] != .container_decl) return null;
     const data = self.nodes.items(.data)[node];
@@ -1085,6 +1090,7 @@ pub fn matchCaseOne(tree: Ast, node: Node.Index) full.MatchCase {
     return .{
         .ast = .{
             .values = if (data.lhs == 0) values[0..0] else values[0..1],
+            .capture_token = tree.matchCapture(node),
             .arrow_token = tree.nodes.items(.main_token)[node],
             .target_expr = data.rhs,
         },
@@ -1097,6 +1103,7 @@ pub fn matchCase(tree: Ast, node: Node.Index) full.MatchCase {
     return .{
         .ast = .{
             .values = tree.extra_data[extra.start..extra.end],
+            .capture_token = tree.matchCapture(node),
             .arrow_token = tree.nodes.items(.main_token)[node],
             .target_expr = data.rhs,
         },
@@ -1229,6 +1236,11 @@ pub fn fullMatch(self: Ast, node: Node.Index) ?full.Match {
         .subjects = values,
         .cases = self.extra_data[cases.start..cases.end],
     } };
+}
+
+fn matchCapture(self: Ast, node: Node.Index) ?TokenIndex {
+    const next = self.nodes.items(.main_token)[node] + 1;
+    return if (self.tokens.items(.tag)[next] == .pipe) next + 1 else null;
 }
 
 pub fn fullMatchCase(self: Ast, node: Node.Index) ?full.MatchCase {
@@ -1402,6 +1414,7 @@ pub const full = struct {
         ast: Components,
 
         pub const Components = struct {
+            capture_token: ?TokenIndex = null,
             /// Positional patterns; bit_or nodes represent literal alternatives.
             /// Wildcards are identifier nodes spelling `_`.
             values: []const Node.Index,
@@ -1503,7 +1516,7 @@ pub const Node = struct {
         field_access,
         /// `lhs.!`.
         /// main_token is the dot.
-        /// rhs is the `?` token index.
+        /// rhs is the `!` token index.
         unwrap,
         /// `lhs.*`.
         /// main_token is the dot.

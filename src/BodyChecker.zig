@@ -459,12 +459,92 @@ const Context = struct {
         return true;
     }
 
+    fn tagged(self: *Context, ty: Ir.TypeId) bool {
+        const t = self.ir.getType(ty).?;
+        return t == .record and t.record.tagged;
+    }
+
+    fn qualifiedUnion(self: *Context, base: Ast.Node.Index) Error!?Ir.TypeId {
+        const ast = &self.module.ast;
+        if (ast.nodes.items(.tag)[base] != .field_access) return null;
+        const qualifier = ast.nodes.items(.data)[base].lhs;
+        if (ast.fullCall(qualifier)) |call| {
+            if (TypeResolver.genericTarget(self.module, call.ast.fn_expr) == null) return null;
+        } else {
+            if (ast.nodes.items(.tag)[qualifier] != .identifier) return null;
+            const name = ast.tokenSlice(ast.firstToken(qualifier));
+            if (self.bindings.contains(name)) return null;
+            const id = self.module.lookup(name) orelse return null;
+            if (!self.module.getDeclaration(id).?.is_type_alias) return null;
+        }
+        const ty = (try TypeResolver.resolve(self.module, self.ir, qualifier)) orelse return null;
+        return if (self.tagged(ty)) ty else null;
+    }
+
+    const ResultShape = struct { ok: u32, err: u32 };
+
+    fn resultShape(self: *Context, ty: Ir.TypeId) ?ResultShape {
+        if (!self.tagged(ty) or self.ir.getType(ty).?.record.fields.len != 2) return null;
+        return .{ .ok = self.fieldIndex(ty, "ok") orelse return null, .err = self.fieldIndex(ty, "err") orelse return null };
+    }
+
+    fn propagate(self: *Context, node: Ast.Node.Index, expected: ?Known, depth: usize) Error!?Ir.TypeId {
+        const operand = self.module.ast.nodes.items(.data)[node].lhs;
+        const input = (try self.expression(operand, null, depth + 1)) orelse return null;
+        if (self.terminated) return if (expected) |want| want.ty else input;
+        const shape = self.resultShape(input) orelse return self.fail(.invalid_propagation_operand, node, null);
+        const output = self.return_type.ty;
+        const target = self.resultShape(output) orelse return self.fail(.invalid_propagation_return, node, self.return_type.annotation);
+        const ok = self.ir.getType(input).?.record.fields[shape.ok].ty;
+        const err = self.ir.getType(input).?.record.fields[shape.err].ty;
+        if (err != self.ir.getType(output).?.record.fields[target.err].ty) return self.fail(.propagation_error_mismatch, node, self.return_type.annotation);
+        if (try self.fit(ok, expected, node) == null) return null;
+        if (self.emitter) |emitter| {
+            const unit = try self.ir.internType(.void);
+            const boolean = try self.ir.internType(.boolean);
+            const value = try emitter.value(operand);
+            const condition = try emitter.append(boolean, self.irSpan(node), .{ .union_tag = .{ .base = value, .index = shape.err } });
+            const then_start: u32 = @intCast(emitter.instructions.items.len);
+            const payload = try emitter.append(err, self.irSpan(node), .{ .union_payload = .{ .base = value, .index = shape.err } });
+            const failure = try emitter.append(output, self.irSpan(node), .{ .union_init = .{ .index = target.err, .payload = if (self.ir.getType(err).? == .void) null else payload } });
+            const exit = try emitter.append(unit, self.irSpan(node), .{ .return_value = failure });
+            const else_start: u32 = @intCast(emitter.instructions.items.len);
+            const success = try emitter.append(ok, self.irSpan(node), .{ .union_payload = .{ .base = value, .index = shape.ok } });
+            try emitter.record(node, ok, self.irSpan(node), .{ .branch = .{ .condition = condition, .then_start = then_start, .else_start = else_start, .then_value = exit, .else_value = success } });
+        }
+        return ok;
+    }
+
+    fn unionInit(self: *Context, node: Ast.Node.Index, expected: ?Known, depth: usize) Error!?Ir.TypeId {
+        const ast = &self.module.ast;
+        const data = ast.nodes.items(.data)[node];
+        const base = data.lhs;
+        const contextual = ast.nodes.items(.tag)[base] == .enum_literal;
+        const ty = if (contextual) (if (expected) |want| want.ty else return self.fail(.union_needs_type, node, null)) else (try self.qualifiedUnion(base)).?;
+        if (!self.tagged(ty)) return self.fail(.invalid_union_constructor, node, null);
+        if (try self.fit(ty, expected, node) == null) return null;
+        const name = ast.tokenSlice(if (contextual) ast.nodes.items(.main_token)[base] else ast.nodes.items(.data)[base].rhs);
+        const index = self.fieldIndex(ty, name) orelse return self.fail(.unknown_field, base, null);
+        const payload_ty = self.ir.getType(ty).?.record.fields[index].ty;
+        const payload = if (ast.nodes.items(.tag)[node] == .array_access) data.rhs else blk: {
+            if (ast.fullStructInit(node).?.fields.len != 0) return self.fail(.invalid_union_constructor, node, null);
+            break :blk @as(Ast.Node.Index, 0);
+        };
+        const unit = self.ir.getType(payload_ty).? == .void;
+        if ((payload == 0) != unit) return self.fail(.invalid_union_constructor, node, null);
+        if (payload != 0 and try self.expression(payload, .{ .ty = payload_ty }, depth + 1) == null) return null;
+        if (self.terminated) return ty;
+        if (self.emitter) |emitter| try emitter.record(node, ty, self.irSpan(node), .{ .union_init = .{ .index = index, .payload = if (payload != 0) try emitter.value(payload) else null } });
+        return ty;
+    }
+
     fn recordInit(self: *Context, node: Ast.Node.Index, expected: ?Known, depth: usize) Error!?Ir.TypeId {
         const ast = &self.module.ast;
         const init = ast.fullStructInit(node).?;
         const ty = (try TypeResolver.resolve(self.module, self.ir, init.type_node)) orelse return null;
         const record = self.ir.getType(ty).?;
         if (record != .record) return self.fail(.not_a_type, init.type_node, null);
+        if (record.record.tagged) return self.fail(.invalid_union_constructor, node, null);
         if (try self.fit(ty, expected, node) == null) return null;
         const seen = try self.module.allocator.alloc(bool, record.record.fields.len);
         defer self.module.allocator.free(seen);
@@ -512,14 +592,22 @@ const Context = struct {
                 if (std.mem.eql(u8, name, "true") or std.mem.eql(u8, name, "false")) break :blk .{ .ty = try self.ir.internType(.boolean) };
                 break :blk null;
             },
+            .unwrap => blk: {
+                const operand = (try self.probe(data.lhs, depth + 1)) orelse break :blk null;
+                const shape = self.resultShape(operand.ty) orelse break :blk null;
+                break :blk .{ .ty = self.ir.getType(operand.ty).?.record.fields[shape.ok].ty };
+            },
             .string_literal => .{ .ty = try self.ir.internType(.string) },
             .array_init, .array_init_comma, .array_init_two, .array_init_two_comma => try self.probeArray(node, depth),
             .array_access => blk: {
+                if (try self.qualifiedUnion(data.lhs)) |ty| break :blk .{ .ty = ty };
                 const array = (try self.probe(data.lhs, depth + 1)) orelse break :blk null;
                 const ty = self.ir.getType(array.ty).?;
                 break :blk if (ty == .array) .{ .ty = ty.array } else null;
             },
             .container_decl_arg => blk: {
+                if (ast.nodes.items(.tag)[data.lhs] == .enum_literal) break :blk null;
+                if (try self.qualifiedUnion(data.lhs)) |ty| break :blk .{ .ty = ty };
                 const ty = (try TypeResolver.resolve(self.module, self.ir, data.lhs)) orelse break :blk null;
                 break :blk .{ .ty = ty };
             },
@@ -548,8 +636,22 @@ const Context = struct {
             .add, .sub, .mul, .div, .mod, .bit_and, .bit_or, .bit_xor => (try self.probe(data.lhs, depth + 1)) orelse try self.probe(data.rhs, depth + 1),
             .in, .bool_not, .bool_and, .bool_or, .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal => .{ .ty = try self.ir.internType(.boolean) },
             .match => blk: {
-                for (ast.fullMatch(node).?.ast.cases) |case| {
-                    if (try self.probe(ast.fullMatchCase(case).?.ast.target_expr, depth + 1)) |known| break :blk known;
+                const match = ast.fullMatch(node).?.ast;
+                const saved_emitter = self.emitter;
+                self.emitter = null;
+                defer self.emitter = saved_emitter;
+                const diagnostic_start = self.module.diagnostics.items.len;
+                defer self.module.diagnostics.shrinkRetainingCapacity(diagnostic_start);
+                const subject = if (match.subjects.len == 1) try self.probe(match.subjects[0], depth + 1) else null;
+                for (match.cases) |case| {
+                    const scope = self.locals.items.len;
+                    defer self.restoreScope(scope);
+                    const prong = ast.fullMatchCase(case).?.ast;
+                    if (prong.capture_token != null) {
+                        const known = subject orelse continue;
+                        if (!try self.bindMatchCapture(prong, &.{.{ .ty = known.ty, .value = null }})) continue;
+                    }
+                    if (try self.probe(prong.target_expr, depth + 1)) |known| break :blk known;
                 }
                 break :blk null;
             },
@@ -841,7 +943,7 @@ const Context = struct {
         const data = ast.nodes.items(.data)[node];
         switch (ast.nodes.items(.tag)[node]) {
             .bit_or => return try self.patternShape(data.lhs, depth + 1) and try self.patternShape(data.rhs, depth + 1),
-            .number_literal, .string_literal => return true,
+            .number_literal, .string_literal, .enum_literal => return true,
             .negation => if (ast.nodes.items(.tag)[data.rhs] == .number_literal) return true,
             .identifier => {
                 const name = ast.tokenSlice(ast.nodes.items(.main_token)[node]);
@@ -900,6 +1002,13 @@ const Context = struct {
                 .rhs = right.value.?,
             } }) else null };
         }
+        if (self.tagged(subject.ty) and ast.nodes.items(.tag)[node] == .enum_literal) {
+            const index = self.fieldIndex(subject.ty, ast.tokenSlice(ast.nodes.items(.main_token)[node])) orelse {
+                _ = try self.fail(.unknown_field, node, null);
+                return null;
+            };
+            return .{ .ty = boolean, .value = if (self.emitter) |emitter| try emitter.append(boolean, self.irSpan(node), .{ .union_tag = .{ .base = subject.value.?, .index = index } }) else null };
+        }
         const constant = if (self.wildcard(node))
             try self.ir.internConstant(.{ .ty = boolean, .value = .{ .boolean = true } })
         else switch (try Literal.check(self.module, self.ir, node, subject.ty, null)) {
@@ -918,6 +1027,29 @@ const Context = struct {
         return .{ .ty = boolean, .value = value };
     }
 
+    fn bindMatchCapture(self: *Context, prong: Ast.full.MatchCase.Components, subjects: []const MatchSubject) Error!bool {
+        const token = prong.capture_token orelse return true;
+        const ast = &self.module.ast;
+        if (subjects.len != 1 or !self.tagged(subjects[0].ty) or prong.values.len != 1 or ast.nodes.items(.tag)[prong.values[0]] != .enum_literal) {
+            _ = try self.fail(.invalid_match_capture, prong.target_expr, null);
+            return false;
+        }
+        const name = ast.tokenSlice(token);
+        if (std.mem.startsWith(u8, name, "@\"") or std.mem.eql(u8, name, "_")) {
+            _ = try self.fail(.invalid_match_capture, prong.target_expr, null);
+            return false;
+        }
+        if (self.conflict(name)) |previous| {
+            try self.module.diagnostics.append(self.module.allocator, .{ .tag = .unsupported_shadowing, .span = self.module.tokenSpan(token), .related = previous });
+            return false;
+        }
+        const index = self.fieldIndex(subjects[0].ty, ast.tokenSlice(ast.nodes.items(.main_token)[prong.values[0]])) orelse return false;
+        const ty = self.ir.getType(subjects[0].ty).?.record.fields[index].ty;
+        const value = if (self.emitter) |emitter| try emitter.append(ty, self.irSpan(prong.target_expr), .{ .union_payload = .{ .base = subjects[0].value.?, .index = index } }) else null;
+        try self.bindLocal(name, .{ .known = .{ .ty = ty }, .name_span = self.module.tokenSpan(token), .value = value });
+        return true;
+    }
+
     fn matchProngs(self: *Context, owner: Ast.Node.Index, cases: []const Ast.Node.Index, subjects: []const MatchSubject, hint: ?Known, depth: usize) Error!?MatchResult {
         if (depth >= max_recursive_depth) {
             _ = try self.fail(.body_nesting_limit, owner, null);
@@ -928,6 +1060,7 @@ const Context = struct {
         if (cases.len == 1) {
             const start = self.locals.items.len;
             defer self.restoreScope(start);
+            if (!try self.bindMatchCapture(prong, subjects)) return null;
             const ty = (try self.expression(prong.target_expr, hint, depth + 1)) orelse return null;
             if (!self.terminated) try self.copyNode(prong.target_expr, ty);
             return .{ .ty = ty, .value = if (self.emitter) |emitter| try emitter.value(prong.target_expr) else null };
@@ -946,6 +1079,7 @@ const Context = struct {
         }
         const then_start: u32 = if (self.emitter) |emitter| @intCast(emitter.instructions.items.len) else 0;
         const scope = self.locals.items.len;
+        if (!try self.bindMatchCapture(prong, subjects)) return null;
         const then_ty = try self.expression(prong.target_expr, hint, depth + 1);
         self.restoreScope(scope);
         if (then_ty == null) return null;
@@ -989,10 +1123,42 @@ const Context = struct {
             const ty = (try self.expression(subject, null, depth + 1)) orelse return null;
             if (self.terminated) return if (expected) |want| want.ty else ty;
             const scalar = self.ir.getType(ty).?;
-            if (scalar != .boolean and scalar != .integer and scalar != .string) return self.fail(.unsupported_match_subject, subject, null);
+            if (scalar != .boolean and scalar != .integer and scalar != .string and !(subjects.len == 1 and self.tagged(ty))) return self.fail(.unsupported_match_subject, subject, null);
             snapshot.* = .{ .ty = ty, .value = if (self.emitter) |emitter| try emitter.value(subject) else null };
         }
-        if (subjects.len == 1 and self.ir.getType(subjects[0].ty).? == .boolean) {
+        const union_match = subjects.len == 1 and self.tagged(subjects[0].ty);
+        if (!union_match) for (match.cases) |case| {
+            if (ast.fullMatchCase(case).?.ast.capture_token != null) return self.fail(.invalid_match_capture, case, null);
+        };
+        if (union_match) {
+            const fields = self.ir.getType(subjects[0].ty).?.record.fields;
+            const covered = try self.module.allocator.alloc(?Module.Span, fields.len);
+            defer self.module.allocator.free(covered);
+            @memset(covered, null);
+            var fallback: ?Module.Span = null;
+            for (match.cases) |case| {
+                const prong = ast.fullMatchCase(case).?.ast;
+                const pattern = prong.values[0];
+                if (fallback) |previous| return self.fail(.match_covered_union_prong, pattern, previous);
+                if (self.wildcard(pattern)) {
+                    if (prong.capture_token != null) return self.fail(.invalid_match_capture, case, null);
+                    var all = true;
+                    for (covered) |entry| if (entry == null) {
+                        all = false;
+                    };
+                    if (all) return self.fail(.match_covered_union_prong, pattern, covered[0]);
+                    fallback = self.span(pattern);
+                    continue;
+                }
+                if (ast.nodes.items(.tag)[pattern] != .enum_literal) return self.fail(.unsupported_match_pattern, pattern, null);
+                const index = self.fieldIndex(subjects[0].ty, ast.tokenSlice(ast.nodes.items(.main_token)[pattern])) orelse return self.fail(.unknown_field, pattern, null);
+                if (covered[index]) |previous| return self.fail(.match_covered_union_prong, pattern, previous);
+                covered[index] = self.span(pattern);
+            }
+            if (fallback == null) for (covered) |entry| {
+                if (entry == null) return self.fail(.match_missing_variants, node, null);
+            };
+        } else if (subjects.len == 1 and self.ir.getType(subjects[0].ty).? == .boolean) {
             var covered: u2 = 0;
             var first_true: ?Module.Span = null;
             var first_false: ?Module.Span = null;
@@ -1252,6 +1418,12 @@ const Context = struct {
 
     fn expressionInner(self: *Context, node: Ast.Node.Index, expected: ?Known, depth: usize) Error!?Ir.TypeId {
         if (depth >= max_recursive_depth) return self.fail(.body_nesting_limit, node, null);
+        const ast_early = &self.module.ast;
+        const tag_early = ast_early.nodes.items(.tag)[node];
+        const base_early = ast_early.nodes.items(.data)[node].lhs;
+        if ((tag_early == .array_access or tag_early == .container_decl_arg) and
+            (ast_early.nodes.items(.tag)[base_early] == .enum_literal or try self.qualifiedUnion(base_early) != null))
+            return self.unionInit(node, expected, depth);
         const hint = expected orelse try self.probe(node, depth);
         if (hint) |known| {
             switch (try Literal.check(self.module, self.ir, node, known.ty, known.annotation)) {
@@ -1266,6 +1438,7 @@ const Context = struct {
         const ast = &self.module.ast;
         const data = ast.nodes.items(.data)[node];
         switch (ast.nodes.items(.tag)[node]) {
+            .unwrap => return self.propagate(node, expected, depth),
             .container_decl_arg => return self.recordInit(node, expected, depth),
             .match => return self.matchExpression(node, expected, hint, depth),
             .function_pipe => {
@@ -1301,6 +1474,7 @@ const Context = struct {
                 if (self.terminated) return if (expected) |want| want.ty else base;
                 const array = self.ir.getType(base).?;
                 if (array == .record and ast.nodes.items(.tag)[node] == .field_access) {
+                    if (array.record.tagged) return self.fail(.unsupported_body_expression, node, null);
                     const index = self.fieldIndex(base, ast.tokenSlice(data.rhs)) orelse return self.fail(.unknown_field, node, null);
                     return self.fit(array.record.fields[index].ty, expected, node);
                 }
@@ -1738,6 +1912,69 @@ test "interpolation diagnoses names grammar types scopes and exact source bytes"
         const diagnostic = module.diagnostics.items[0];
         try std.testing.expectEqual(case.tag, diagnostic.tag);
         try std.testing.expectEqualStrings(case.token, module.sourceSlice(diagnostic.span).?);
+    }
+}
+
+test "union constructors captures and coverage diagnose exact scalar boundaries" {
+    const prefix = "let U=union{ok:int,err:string,none,flag:bool,}\n";
+    const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag };
+    for ([_]Case{
+        .{ .source = "let f:()->U=.ok[true]", .tag = .literal_type_mismatch },
+        .{ .source = "let f:()->U=1", .tag = .literal_type_mismatch },
+        .{ .source = "let f:()->U=U.ok[]", .tag = .invalid_union_constructor },
+        .{ .source = "let f:()->U=.none[true]", .tag = .invalid_union_constructor },
+        .{ .source = "let f:()->U=U[]", .tag = .invalid_union_constructor },
+        .{ .source = "let f:()->U=.missing[]", .tag = .unknown_field },
+        .{ .source = "let f:()={let x=.ok[1]\n}", .tag = .union_needs_type },
+        .{ .source = "let f:(u:U)->int=match u{.ok=>|v|v}", .tag = .match_missing_variants },
+        .{ .source = "let f:(u:U)->int=match u{.ok=>0\n.ok=>1\n_=>2}", .tag = .match_covered_union_prong },
+        .{ .source = "let f:(u:U)->int=match u{_=>0\n.none=>1}", .tag = .match_covered_union_prong },
+        .{ .source = "let f:(u:U)->int=match u{.ok=>0\n.err=>0\n.none=>0\n.flag=>0\n_=>0}", .tag = .match_covered_union_prong },
+        .{ .source = "let f:(u:U)->int=match u{.ok=>|v|v\n_=>v}", .tag = .unknown_name },
+        .{ .source = "let f:(u:U)->void=match u{.ok=>|v|{v=2}\n_=>{}}", .tag = .immutable_assignment },
+        .{ .source = "let f:(u:U)->int=match u{.ok=>|u|0\n_=>0}", .tag = .unsupported_shadowing },
+        .{ .source = "let f:(u:U)->int=match u{_=>|v|0}", .tag = .invalid_match_capture },
+        .{ .source = "let f:(u:U)->int=match u{.ok|.err=>|v|0\n_=>0}", .tag = .unsupported_match_pattern },
+        .{ .source = "let f:(u:U)->int=match u{.bad=>0\n_=>0}", .tag = .unknown_field },
+        .{ .source = "let f:(u:U)->int=match u,u{_,_=>0}", .tag = .unsupported_match_subject },
+        .{ .source = "let f:(u:U)->int=u.ok", .tag = .unsupported_body_expression },
+        .{ .source = "let V=union{ok:int,}\nlet f:()->V=U.ok[1]", .tag = .expression_type_mismatch },
+        .{ .source = "let f:(n:i8)->U=.ok[n]", .tag = .expression_type_mismatch },
+        .{ .source = "let f:()->U=.ok[\"x\"]", .tag = .literal_type_mismatch },
+    }) |case| {
+        const source = try std.mem.concat(std.testing.allocator, u8, &.{ prefix, case.source });
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "union-error.nov", source);
+        defer module.deinit();
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        if (module.diagnostics.items.len != 1 or module.diagnostics.items[0].tag != case.tag) std.debug.print("union case {s}: {any} parse={any}\n", .{ case.source, module.diagnostics.items, module.ast.errors });
+        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+        try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
+        try std.testing.expect(!sema.lowering_complete);
+        try std.testing.expectEqual(@as(usize, 0), sema.ir.functions.items.len);
+    }
+}
+
+test "union captures infer branch types without leaking and preserve contextual constructors" {
+    for ([_][]const u8{
+        "let f:(u:U)->int=match u{.ok=>|n|n\n.err=>0\n.none=>0}",
+        "let f:(u:U)={let n=match u{.ok=>|n|n\n_=>0}\n@println(n)}",
+        "let f:(u:U)->U=match u{.ok=>|n|.ok[n]\n_=>.none[]}",
+        "let f:(u:U)->int=match u{.ok=>|n|{return n}\n_=>1}",
+        "let f:(u:U)->int=match u{.ok=>|n|match u{.ok=>|m|n+m\n_=>n}\n_=>0}",
+        "let f:(u:U)={let n=match u{.ok=>0\n.err=>0\n.none=>|v|{let unit:void=v\n@as(int,1)}}\n@println(n)}",
+    }) |body| {
+        const source = try std.mem.concat(std.testing.allocator, u8, &.{ "let U=union{ok:int,err:string,none,}\n", body });
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "union.nov", source);
+        defer module.deinit();
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        if (module.hasErrors()) std.debug.print("union body {s}: {any}\n", .{ body, module.diagnostics.items });
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expect(sema.lowering_complete);
+        try sema.ir.verify();
     }
 }
 

@@ -12,10 +12,19 @@ pub const Error = Ir.InternError;
 /// diagnostics may remain after OOM; callers needing a transaction must own and
 /// discard the output IR and roll back diagnostics, as Sema does.
 pub fn resolve(module: *Module, ir: *Ir, node: Ast.Node.Index) Error!?Ir.TypeId {
+    return resolveWith(module, ir, node, &.{}, 0);
+}
+
+const Binding = struct { name: []const u8, ty: Ir.TypeId };
+const Environment = struct { bindings: []const Binding, expansions: usize };
+pub const max_instantiation_depth = 64;
+
+fn resolveWith(module: *Module, ir: *Ir, node: Ast.Node.Index, bindings: []const Binding, expansions: usize) Error!?Ir.TypeId {
+    if (expansions >= max_instantiation_depth) return diagnose(module, node, .generic_limit);
     var aliases: AliasMap = .empty;
     defer aliases.deinit(module.allocator);
     const Task = union(enum) {
-        visit: struct { node: Ast.Node.Index, depth: usize = 0, alias_depth: usize = 0 },
+        visit: struct { node: Ast.Node.Index, depth: usize = 0, alias_depth: usize = 0, local: bool = true },
         finish: Module.DeclId,
     };
     var work: std.ArrayList(Task) = .empty;
@@ -24,7 +33,7 @@ pub fn resolve(module: *Module, ir: *Ir, node: Ast.Node.Index) Error!?Ir.TypeId 
     while (work.pop()) |task| switch (task) {
         .finish => |id| {
             const initializer = module.ast.decl(module.getDeclaration(id).?.node).ast.init_node;
-            const ty = try resolveDepth(module, ir, initializer, 0, &aliases);
+            const ty = try resolveDepth(module, ir, initializer, 0, &aliases, .{ .bindings = &.{}, .expansions = expansions });
             try aliases.put(module.allocator, id, .{ .ty = ty });
         },
         .visit => |visit| {
@@ -32,14 +41,18 @@ pub fn resolve(module: *Module, ir: *Ir, node: Ast.Node.Index) Error!?Ir.TypeId 
             const ast = &module.ast;
             if (ast.fullFnProto(visit.node)) |proto| {
                 var iterator = proto.iterate(ast);
-                while (iterator.next()) |param| try work.append(module.allocator, .{ .visit = .{ .node = param.type_expr, .depth = visit.depth + 1, .alias_depth = visit.alias_depth } });
-                if (proto.ast.return_type) |result| try work.append(module.allocator, .{ .visit = .{ .node = result, .depth = visit.depth + 1, .alias_depth = visit.alias_depth } });
+                while (iterator.next()) |param| try work.append(module.allocator, .{ .visit = .{ .node = param.type_expr, .depth = visit.depth + 1, .alias_depth = visit.alias_depth, .local = visit.local } });
+                if (proto.ast.return_type) |result| try work.append(module.allocator, .{ .visit = .{ .node = result, .depth = visit.depth + 1, .alias_depth = visit.alias_depth, .local = visit.local } });
             } else if (ast.nodes.items(.tag)[visit.node] == .array_type) {
-                try work.append(module.allocator, .{ .visit = .{ .node = ast.nodes.items(.data)[visit.node].rhs, .depth = visit.depth + 1, .alias_depth = visit.alias_depth } });
+                try work.append(module.allocator, .{ .visit = .{ .node = ast.nodes.items(.data)[visit.node].rhs, .depth = visit.depth + 1, .alias_depth = visit.alias_depth, .local = visit.local } });
+            } else if (ast.fullCall(visit.node)) |call| {
+                for (call.ast.args) |arg| try work.append(module.allocator, .{ .visit = .{ .node = arg, .depth = visit.depth + 1, .alias_depth = visit.alias_depth, .local = visit.local } });
             } else if (ast.nodes.items(.tag)[visit.node] == .identifier) {
+                const name = ast.tokenSlice(ast.firstToken(visit.node));
+                if (visit.local and lookupBinding(bindings, name) != null) continue;
                 const id = module.lookup(ast.tokenSlice(ast.firstToken(visit.node))) orelse continue;
                 const declaration = module.getDeclaration(id).?;
-                if (!declaration.is_type_alias) continue;
+                if (!declaration.is_type_alias or declaration.is_generic) continue;
                 if (aliases.get(id)) |entry| {
                     if (entry.visiting) {
                         try module.diagnostics.append(module.allocator, .{ .tag = .type_alias_cycle, .span = module.tokenSpan(ast.firstToken(visit.node)), .related = declaration.name_span });
@@ -53,11 +66,11 @@ pub fn resolve(module: *Module, ir: *Ir, node: Ast.Node.Index) Error!?Ir.TypeId 
                 }
                 try aliases.put(module.allocator, id, .{ .visiting = true });
                 try work.append(module.allocator, .{ .finish = id });
-                try work.append(module.allocator, .{ .visit = .{ .node = ast.decl(declaration.node).ast.init_node, .alias_depth = visit.alias_depth + 1 } });
+                try work.append(module.allocator, .{ .visit = .{ .node = ast.decl(declaration.node).ast.init_node, .alias_depth = visit.alias_depth + 1, .local = false } });
             }
         },
     };
-    return resolveDepth(module, ir, node, 0, &aliases);
+    return resolveDepth(module, ir, node, 0, &aliases, .{ .bindings = bindings, .expansions = expansions });
 }
 
 // Count all explicit type nodes on a path, including the root and leaf.
@@ -73,7 +86,7 @@ fn diagnose(module: *Module, node: Ast.Node.Index, tag: Module.Diagnostic.Tag) E
     return null;
 }
 
-fn resolveDepth(module: *Module, ir: *Ir, node: Ast.Node.Index, depth: usize, aliases: *const AliasMap) Error!?Ir.TypeId {
+fn resolveDepth(module: *Module, ir: *Ir, node: Ast.Node.Index, depth: usize, aliases: *const AliasMap, env: Environment) Error!?Ir.TypeId {
     if (depth >= max_type_depth) return diagnose(module, node, .type_nesting_limit);
     const ast = &module.ast;
     if (ast.fullFnProto(node)) |proto| {
@@ -104,7 +117,7 @@ fn resolveDepth(module: *Module, ir: *Ir, node: Ast.Node.Index, depth: usize, al
                     }
                 }
             }
-            if (try resolveDepth(module, ir, param.type_expr, depth + 1, aliases)) |ty| {
+            if (try resolveDepth(module, ir, param.type_expr, depth + 1, aliases, env)) |ty| {
                 if (ir.getType(ty).? == .void) {
                     _ = try diagnose(module, param.type_expr, .invalid_parameter_type);
                     valid = false;
@@ -116,28 +129,31 @@ fn resolveDepth(module: *Module, ir: *Ir, node: Ast.Node.Index, depth: usize, al
             }
         }
         const result = if (proto.ast.return_type) |return_node|
-            try resolveDepth(module, ir, return_node, depth + 1, aliases)
+            try resolveDepth(module, ir, return_node, depth + 1, aliases, env)
         else
             try ir.internType(.void);
         if (!valid or result == null) return null;
         return try ir.internType(.{ .function = .{ .params = params.items, .result = result.? } });
     }
     if (ast.nodes.items(.tag)[node] == .array_type) {
-        const element = (try resolveDepth(module, ir, ast.nodes.items(.data)[node].rhs, depth + 1, aliases)) orelse return null;
+        const element = (try resolveDepth(module, ir, ast.nodes.items(.data)[node].rhs, depth + 1, aliases, env)) orelse return null;
         if (!Ir.isArrayElement(ir.getType(element).?)) return diagnose(module, node, .unsupported_type);
         return try ir.internType(.{ .array = element });
     }
+    if (ast.fullCall(node)) |call| return instantiate(module, ir, call, node, depth, aliases, env);
     if (ast.fullStruct(node) != null) {
         for (module.declarations.items, 0..) |declaration, i| {
             if (declaration.is_record and ast.decl(declaration.node).ast.init_node == node)
-                return try ir.internType(.{ .record = .{ .identity = @intCast(i), .fields = &.{}, .public = declaration.public } });
+                return try ir.internType(.{ .record = .{ .identity = @intCast(i), .fields = &.{}, .public = declaration.public, .tagged = ast.isUnion(node) } });
         }
         return diagnose(module, node, .unsupported_type);
     }
     if (ast.nodes.items(.tag)[node] != .identifier) return diagnose(module, node, .unsupported_type);
     const name = ast.tokenSlice(ast.firstToken(node));
+    if (lookupBinding(env.bindings, name)) |ty| return ty;
     if (module.lookup(name)) |id| {
         if (primitives.isPrimitive(name)) return diagnose(module, node, .unsupported_type);
+        if (module.getDeclaration(id).?.is_generic) return diagnose(module, node, .generic_needs_arguments);
         if (module.getDeclaration(id).?.is_type_alias) return if (aliases.get(id)) |entry| entry.ty else null;
         return diagnose(module, node, .not_a_type);
     }
@@ -158,6 +174,144 @@ fn resolveDepth(module: *Module, ir: *Ir, node: Ast.Node.Index, depth: usize, al
         } });
     }
     return diagnose(module, node, if (primitives.isPrimitive(name)) .unsupported_type else .unknown_type);
+}
+
+fn lookupBinding(bindings: []const Binding, name: []const u8) ?Ir.TypeId {
+    for (bindings) |binding| if (std.mem.eql(u8, binding.name, name)) return binding.ty;
+    return null;
+}
+
+/// Only ordinary named union templates and aliases to those templates are callable here.
+pub fn genericTarget(module: *const Module, node: Ast.Node.Index) ?Module.DeclId {
+    var current = node;
+    const ast = &module.ast;
+    for (0..max_alias_depth) |_| {
+        if (ast.nodes.items(.tag)[current] != .identifier) return null;
+        const id = module.lookup(ast.tokenSlice(ast.firstToken(current))) orelse return null;
+        const declaration = module.getDeclaration(id).?;
+        if (!declaration.is_generic) return null;
+        if (declaration.is_record) return id;
+        current = ast.decl(declaration.node).ast.init_node;
+    }
+    return null;
+}
+
+fn namedType(ast: *const Ast, node: Ast.Node.Index, name: []const u8) bool {
+    return node != 0 and ast.nodes.items(.tag)[node] == .identifier and std.mem.eql(u8, ast.tokenSlice(ast.firstToken(node)), name);
+}
+
+pub fn validateGeneric(module: *Module, id: Module.DeclId) Error!bool {
+    const ast = &module.ast;
+    const declaration = module.getDeclaration(id).?;
+    const full = ast.decl(declaration.node).ast;
+    const start = module.diagnostics.items.len;
+    if (primitives.isPrimitive(declaration.name)) {
+        try module.diagnostics.append(module.allocator, .{ .tag = .unsupported_shadowing, .span = declaration.name_span });
+    }
+    const proto = ast.fullFnProto(full.type_node) orelse {
+        _ = try diagnose(module, declaration.node, .invalid_generic_declaration);
+        return false;
+    };
+    if (full.is_mutable or declaration.container != null or !ast.isUnion(full.init_node) or proto.ast.params.len == 0 or !namedType(ast, proto.ast.return_type orelse 0, "type")) {
+        _ = try diagnose(module, declaration.node, .invalid_generic_declaration);
+        return false;
+    }
+    var names: std.StringHashMapUnmanaged(Module.Span) = .empty;
+    defer names.deinit(module.allocator);
+    var iterator = proto.iterate(ast);
+    while (iterator.next()) |param| {
+        const token = param.name_token orelse {
+            _ = try diagnose(module, param.type_expr, .invalid_generic_declaration);
+            continue;
+        };
+        if (!namedType(ast, param.type_expr, "type")) {
+            _ = try diagnose(module, param.type_expr, .invalid_generic_declaration);
+            continue;
+        }
+        const name = ast.tokenSlice(token);
+        const span = module.tokenSpan(token);
+        if (primitives.isPrimitive(name) or module.lookup(name) != null or std.mem.startsWith(u8, name, "@\"")) {
+            try module.diagnostics.append(module.allocator, .{ .tag = .unsupported_shadowing, .span = span });
+            continue;
+        }
+        const entry = try names.getOrPut(module.allocator, name);
+        if (entry.found_existing) try module.diagnostics.append(module.allocator, .{ .tag = .duplicate_parameter, .span = span, .related = entry.value_ptr.* }) else entry.value_ptr.* = span;
+    }
+    var fields: std.StringHashMapUnmanaged(Module.Span) = .empty;
+    defer fields.deinit(module.allocator);
+    for (ast.fullStruct(full.init_node).?) |member| {
+        if (ast.nodes.items(.tag)[member] != .container_field) {
+            _ = try diagnose(module, member, .unsupported_generic_method);
+            continue;
+        }
+        const token = ast.nodes.items(.main_token)[member];
+        const name = ast.tokenSlice(token);
+        const span = module.tokenSpan(token);
+        const entry = try fields.getOrPut(module.allocator, name);
+        if (entry.found_existing) try module.diagnostics.append(module.allocator, .{ .tag = .duplicate_field, .span = span, .related = entry.value_ptr.* }) else entry.value_ptr.* = span;
+        const data = ast.nodes.items(.data)[member];
+        if (data.rhs != 0) _ = try diagnose(module, data.rhs, .unsupported_union_default);
+    }
+    if (fields.count() == 0) _ = try diagnose(module, full.init_node, .empty_union);
+    return module.diagnostics.items.len == start;
+}
+
+fn instantiate(module: *Module, ir: *Ir, call: Ast.full.Call, node: Ast.Node.Index, depth: usize, aliases: *const AliasMap, env: Environment) Error!?Ir.TypeId {
+    const id = genericTarget(module, call.ast.fn_expr) orelse {
+        const ast = &module.ast;
+        if (ast.nodes.items(.tag)[call.ast.fn_expr] == .identifier) {
+            if (module.lookup(ast.tokenSlice(ast.firstToken(call.ast.fn_expr)))) |target| {
+                if (module.getDeclaration(target).?.is_generic) return diagnose(module, node, .generic_limit);
+            }
+        }
+        return diagnose(module, node, .not_a_generic);
+    };
+    if (!try validateGeneric(module, id)) return null;
+    const ast = &module.ast;
+    const declaration = module.getDeclaration(id).?;
+    const full = ast.decl(declaration.node).ast;
+    const proto = ast.fullFnProto(full.type_node).?;
+    if (call.ast.args.len != proto.ast.params.len) return diagnose(module, node, .generic_argument_count);
+    const args = try module.allocator.alloc(Ir.TypeId, call.ast.args.len);
+    defer module.allocator.free(args);
+    for (call.ast.args, args) |arg, *ty| ty.* = (try resolveDepth(module, ir, arg, depth + 1, aliases, env)) orelse return null;
+    var existing: ?Ir.TypeId = null;
+    for (ir.types.items, 0..) |ty, i| {
+        if (ty != .record or ty.record.identity != @intFromEnum(id) or !std.mem.eql(Ir.TypeId, ty.record.type_args, args)) continue;
+        switch (ty.record.instance_state) {
+            .complete => return @as(Ir.TypeId, @enumFromInt(i)),
+            .building => return diagnose(module, node, .generic_cycle),
+            // A speculative body probe may have rolled back its diagnostics.
+            // Retry failed layouts so the real check reports the original cause.
+            .failed => existing = @enumFromInt(i),
+        }
+        break;
+    }
+    const ty = existing orelse try ir.internType(.{ .record = .{ .identity = @intFromEnum(id), .fields = &.{}, .tagged = true, .public = declaration.public, .type_args = args, .instance_state = .building } });
+    ir.types.items[@intFromEnum(ty)].record.instance_state = .building;
+    var complete = false;
+    defer if (!complete) {
+        ir.types.items[@intFromEnum(ty)].record.instance_state = .failed;
+    };
+    const bindings = try module.allocator.alloc(Binding, args.len);
+    defer module.allocator.free(bindings);
+    var iterator = proto.iterate(ast);
+    for (args, bindings) |arg, *binding| binding.* = .{ .name = ast.tokenSlice(iterator.next().?.name_token.?), .ty = arg };
+    var fields: std.ArrayList(Ir.Field) = .empty;
+    defer fields.deinit(module.allocator);
+    for (ast.fullStruct(full.init_node).?) |member| {
+        const data = ast.nodes.items(.data)[member];
+        const field_ty = if (data.lhs == 0) try ir.internType(.void) else (try resolveWith(module, ir, data.lhs, bindings, env.expansions + 1)) orelse return null;
+        const ft = ir.getType(field_ty).?;
+        if (!Ir.isRecordField(ft) and ft != .void) return diagnose(module, member, .unsupported_type);
+        const token = ast.nodes.items(.main_token)[member];
+        const span = module.tokenSpan(token);
+        try fields.append(module.allocator, .{ .name = ast.tokenSlice(token), .ty = field_ty, .span = .{ .start = span.start, .end = span.end } });
+    }
+    try ir.setRecordFields(ty, fields.items);
+    ir.types.items[@intFromEnum(ty)].record.instance_state = .complete;
+    complete = true;
+    return ty;
 }
 
 fn testTypeNode(module: *const Module, name: []const u8) Ast.Node.Index {

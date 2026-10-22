@@ -18,7 +18,7 @@ pub fn lower(module: *Module) Error!Sema {
     if (module.hasErrors()) return result;
     result.ir.source_len = @intCast(module.ast.source.len);
     for (module.declarations.items, result.entries) |declaration, entry| {
-        if (entry.status == .type_alias) continue;
+        if (entry.status == .type_alias or entry.status == .generic) continue;
         if (module.ast.decl(declaration.node).ast.is_mutable or (entry.status != .body_checked and entry.status != .constant_checked)) {
             const full = module.ast.decl(declaration.node).ast;
             const tag: Module.Diagnostic.Tag = if (!full.is_mutable and full.type_node == 0 and full.init_node != 0) blk: {
@@ -65,6 +65,149 @@ pub fn lower(module: *Module) Error!Sema {
         result.lowering_complete = true;
     }
     return result;
+}
+
+test "generic union instances canonicalize aliases arguments and nominal declarations" {
+    const source = "let G:(T:type,E:type)->type=union{ok:T,err:E,}\n" ++
+        "let Other:(T:type,E:type)->type=union{ok:T,err:E,}\n" ++
+        "let Factory=Forward\nlet Forward=G\nlet Count=int\nlet A=Factory(Count,string)\nlet B=G(int,string)\nlet C=G(string,int)\nlet D=Other(int,string)\nlet Alias=A\n" ++
+        "let id:(v:Alias)->B=v\nlet make:()->A=G(int,string).ok[7]";
+    var module = try Module.init(std.testing.allocator, "instances.nov", source);
+    defer module.deinit();
+    var sema = try lower(&module);
+    defer sema.deinit();
+    if (module.hasErrors()) std.debug.print("generic errors: {any}, parse: {any}\n", .{ module.diagnostics.items, module.ast.errors });
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    const a = sema.getEntry(module.lookup("A").?).?.alias_type.?;
+    try std.testing.expectEqual(a, sema.getEntry(module.lookup("B").?).?.alias_type.?);
+    try std.testing.expectEqual(a, sema.getEntry(module.lookup("Alias").?).?.alias_type.?);
+    try std.testing.expect(a != sema.getEntry(module.lookup("C").?).?.alias_type.?);
+    try std.testing.expect(a != sema.getEntry(module.lookup("D").?).?.alias_type.?);
+    var instances: usize = 0;
+    for (sema.ir.types.items) |ty| if (ty == .record and ty.record.type_args.len != 0) {
+        instances += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 3), instances);
+    try sema.ir.verify();
+}
+
+test "generic union expansion and template alias traversal have explicit limits" {
+    for ([_]bool{ false, true }) |alias_chain| {
+        var source = std.Io.Writer.Allocating.init(std.testing.allocator);
+        defer source.deinit();
+        if (alias_chain) {
+            try source.writer.writeAll("let G:(T:type)->type=union{ok:T,}\n");
+            for (0..130) |i| try source.writer.print("let A{d}=A{d}\n", .{ i, i + 1 });
+            try source.writer.writeAll("let A130=G\nlet R=A0(int)");
+        } else {
+            for (0..65) |i| try source.writer.print("let G{d}:(T:type)->type=union{{ok:G{d}(T),}}\n", .{ i, i + 1 });
+            try source.writer.writeAll("let G65:(T:type)->type=union{ok:T,}\nlet R=G0(bool)");
+        }
+        var module = try Module.init(std.testing.allocator, "generic-limit.nov", source.written());
+        defer module.deinit();
+        var result = try lower(&module);
+        defer result.deinit();
+        var found = false;
+        for (module.diagnostics.items) |d| if (d.tag == .generic_limit) {
+            found = true;
+        };
+        if (!found) std.debug.print("limit diagnostics: {any}\n", .{module.diagnostics.items});
+        try std.testing.expect(found);
+        try std.testing.expect(!result.lowering_complete);
+    }
+}
+
+test "generic unions and propagation diagnose exact types unsupported forms and cycles under OOM" {
+    const prefix = "let G:(T:type,E:type)->type=union{ok:T,err:E,}\nlet R=G(int,string)\n";
+    const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag };
+    for ([_]Case{
+        .{ .source = "let A=G(int)", .tag = .generic_argument_count },
+        .{ .source = "let A=G(int,string,bool)", .tag = .generic_argument_count },
+        .{ .source = "let f:(v:G)={}", .tag = .generic_needs_arguments },
+        .{ .source = "let A=G(true,string)", .tag = .not_a_type },
+        .{ .source = "let A=G(Missing,string)", .tag = .unknown_type },
+        .{ .source = "let Other:(T:type,E:type)->type=union{ok:T,err:E,}\nlet f:()->Other(int,string)=R.ok[1]", .tag = .expression_type_mismatch },
+        .{ .source = "let f:()->R=7", .tag = .literal_type_mismatch },
+        .{ .source = "let f:()->R={return 7}", .tag = .literal_type_mismatch },
+        .{ .source = "let f:(r:R)->int=r.!", .tag = .invalid_propagation_return },
+        .{ .source = "let f:(r:R)->R={return r.!}", .tag = .expression_type_mismatch },
+        .{ .source = "let f:(r:G(int,i8))->G(bool,i16)=.ok[r.! == 1]", .tag = .propagation_error_mismatch },
+        .{ .source = "let f:(r:R)->R=.ok[r.!.!]", .tag = .invalid_propagation_operand },
+        .{ .source = "let f:(r:R)->G(int,bool)=.ok[r.!]", .tag = .propagation_error_mismatch },
+        .{ .source = "let f:()->R=.ok[true.!]", .tag = .invalid_propagation_operand },
+        .{ .source = "let U=union{ok:int,err:string,extra,}\nlet f:(u:U)->R=.ok[u.!]", .tag = .invalid_propagation_operand },
+        .{ .source = "let U=union{some:int,err:string,}\nlet f:(u:U)->R=.ok[u.!]", .tag = .invalid_propagation_operand },
+        .{ .source = "let f:(r:R)->G(bool,string)=.ok[r.!]", .tag = .expression_type_mismatch },
+        .{ .source = "let Cycle:(T:type)->type=union{ok:Cycle(T),}\nlet X=Cycle(int)", .tag = .generic_cycle },
+        .{ .source = "let Loop=G(Loop,string)", .tag = .type_alias_cycle },
+        .{ .source = "let A=B\nlet B=A\nlet R2=G(A,string)", .tag = .type_alias_cycle },
+        .{ .source = "let A=Missing\nlet R2=G(A,string)", .tag = .unknown_type },
+        .{ .source = "let Apply=G\nlet A=B\nlet B=A\nlet f:()->R=Apply(A,string).ok[1]", .tag = .type_alias_cycle },
+        .{ .source = "let Bad:(T:int)->type=union{ok:T,}", .tag = .invalid_generic_declaration },
+        .{ .source = "let Bad:(T:type)->int=union{ok:T,}", .tag = .invalid_generic_declaration },
+        .{ .source = "let Bad:(T:type,T:type)->type=union{ok:T,}", .tag = .duplicate_parameter },
+        .{ .source = "let Bad:(T:type)->type=union{ok:T,\nlet m:(x:T)->T=x\n}", .tag = .unsupported_generic_method },
+        .{ .source = "let Bad:(T:type)->type=union{ok:T,ok:T,}", .tag = .duplicate_field },
+        .{ .source = "let Bad:(T:type)->type=union{ok:T=1,}", .tag = .unsupported_union_default },
+        .{ .source = "let A=G((int)->int,string)", .tag = .unsupported_type },
+        .{ .source = "let A=G([]int,string)", .tag = .unsupported_type },
+        .{ .source = "let f:()={let x={let bad:G((int)->int,string)=R.ok[1]\nbad}\n}", .tag = .unsupported_type },
+        .{ .source = "let U=union{ok:int,err:bool,}\nlet f:(u:U)->R=.ok[u.!]", .tag = .propagation_error_mismatch },
+        .{ .source = "let int:(T:type)->type=union{ok:T,}", .tag = .unsupported_shadowing },
+    }) |case| {
+        const source = try std.mem.concat(std.testing.allocator, u8, &.{ prefix, case.source });
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "generic-error.nov", source);
+        defer module.deinit();
+        try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+        var result = try lower(&module);
+        defer result.deinit();
+        var found = false;
+        for (module.diagnostics.items) |d| if (d.tag == case.tag) {
+            found = true;
+        };
+        if (!found) std.debug.print("generic case {s}: {any}\n", .{ case.source, module.diagnostics.items });
+        try std.testing.expect(found);
+        try std.testing.expect(!result.lowering_complete);
+        try std.testing.expectEqual(@as(usize, 0), result.ir.functions.items.len);
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, testRejectedMatchAllocations, .{source});
+    }
+}
+
+test "unsupported union declarations and rejected matches roll back under OOM" {
+    const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag };
+    for ([_]Case{
+        .{ .source = "let U=union{}", .tag = .empty_union },
+        .{ .source = "let U=union{ok:int=0,}", .tag = .unsupported_union_default },
+        .{ .source = "let U=union{ok:int,ok:string,}", .tag = .duplicate_field },
+        .{ .source = "let U=union{ok:[]int,}", .tag = .unsupported_type },
+        .{ .source = "let R=struct{n:int,}\nlet U=union{ok:R,}", .tag = .unsupported_type },
+        .{ .source = "let U=union{ok:U,}", .tag = .unsupported_type },
+        .{ .source = "let U=union{ok:()->int,}", .tag = .unsupported_type },
+        .{ .source = "let U=union{ok:int,\nlet constant:int=1\n}", .tag = .unsupported_declaration },
+        .{ .source = "let U=union{ok:int,}\nlet f:()=@println(U.ok[1])", .tag = .invalid_to_string },
+        .{ .source = "let U=union{ok:int,\nlet toString:(u:U)->bool=true\n}\nlet f:()=@println(U.ok[1])", .tag = .invalid_to_string },
+        .{ .source = "let U=union{ok:int,none,}\nlet f:(u:U)->int=match u{.ok=>|n|n}", .tag = .match_missing_variants },
+        .{ .source = "let U=union{ok:int,none,}\nlet f:(u:U)->int=match u{.ok=>0\n.ok=>1\n_=>2}", .tag = .match_covered_union_prong },
+        .{ .source = "let U=union{ok:int,none,}\nlet f:(u:U)->int=match u{.ok=>|n|n\n_=>n}", .tag = .unknown_name },
+        .{ .source = "let U=union{ok:i8,}\nlet f:()->U=.ok[128]", .tag = .literal_out_of_range },
+        .{ .source = "let U=union{ok:u128,}\nlet f:()->U=.ok[340282366920938463463374607431768211456]", .tag = .literal_out_of_range },
+    }) |case| {
+        var module = try Module.init(std.testing.allocator, "union-errors.nov", case.source);
+        defer module.deinit();
+        var result = try lower(&module);
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+        var found = false;
+        for (module.diagnostics.items) |diagnostic| if (diagnostic.tag == case.tag) {
+            found = true;
+        };
+        try std.testing.expect(found);
+        try std.testing.expect(!result.lowering_complete);
+        try std.testing.expectEqual(@as(usize, 0), result.ir.functions.items.len);
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, testRejectedMatchAllocations, .{case.source});
+    }
 }
 
 test "nominal records reject mismatches malformed constructors defaults fields and printing signatures" {

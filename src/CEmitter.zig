@@ -189,7 +189,9 @@ fn write(allocator: std.mem.Allocator, ir: *const Ir, origins: []const ?Origin, 
     for (origins, ir.types.items, 0..) |origin, ty, i| {
         if (origin == null or ty != .record) continue;
         try w.print("typedef struct {{\n", .{});
+        if (ty.record.tagged) try w.writeAll("    uint32_t tag;\n");
         for (ty.record.fields, 0..) |field, f| {
+            if (ir.getType(field.ty).? == .void) continue;
             try w.writeAll("    ");
             try writeType(ir, w, field.ty);
             try w.print(" f{d};\n", .{f});
@@ -469,6 +471,10 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
         .array_literal, .record_init => |elements| for (elements) |value| {
             value_used[@intFromEnum(value)] = true;
         },
+        .union_init => |init_value| {
+            if (init_value.payload) |payload| value_used[@intFromEnum(payload)] = true;
+        },
+        .union_tag, .union_payload => |read| value_used[@intFromEnum(read.base)] = true,
         .field_read => |read| value_used[@intFromEnum(read.base)] = true,
         .array_clone, .array_len, .to_string => |value| value_used[@intFromEnum(value)] = true,
         .array_index => |r| {
@@ -658,6 +664,10 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
             try w.print("    v{d} = v{d};\n", .{ @intFromEnum(store.slot), @intFromEnum(store.value) });
             continue;
         }
+        if (instruction.op == .union_payload) {
+            const read = instruction.op.union_payload;
+            try w.print("    if (v{d}.tag != {d}) nov_rt_panic(\"inactive union payload\");\n", .{ @intFromEnum(read.base), read.index });
+        }
         if (ty == .void) {
             // Void values have no C object; emit their effects as statements.
             if (instruction.op == .print) try writePrint(ir, w, body, instruction.op.print);
@@ -671,7 +681,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
         if (ty == .string) {
             try w.print("    v{d} = ", .{i});
             switch (instruction.op) {
-                .field_read => |read| try w.print("v{d}.f{d}", .{ @intFromEnum(read.base), read.index }),
+                .field_read, .union_payload => |read| try w.print("v{d}.f{d}", .{ @intFromEnum(read.base), read.index }),
                 .constant => |id| try writeConstant(w, ir.getConstant(id).?, ty),
                 .parameter => |index| try w.print("p{d}", .{index}),
                 .local_slot, .local_load => |value| try w.print("v{d}", .{@intFromEnum(value)}),
@@ -705,6 +715,15 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
             try w.print(" v{d} = ", .{i});
         }
         switch (instruction.op) {
+            .union_init => |init_value| {
+                try w.writeByte('(');
+                try writeType(ir, w, instruction.ty);
+                try w.print("){{ .tag = {d}", .{init_value.index});
+                if (init_value.payload) |payload| try w.print(", .f{d} = v{d}", .{ init_value.index, @intFromEnum(payload) });
+                try w.writeAll(" }");
+            },
+            .union_tag => |read| try w.print("(v{d}.tag == {d})", .{ @intFromEnum(read.base), read.index }),
+            .union_payload => |read| try w.print("v{d}.f{d}", .{ @intFromEnum(read.base), read.index }),
             .record_init => |values| {
                 try w.writeByte('(');
                 try writeType(ir, w, instruction.ty);
@@ -876,6 +895,284 @@ fn writeCall(w: *std.Io.Writer, call: anytype) WriteError!void {
 // ---------------------------------------------------------------------------
 
 const test_gpa = std.testing.allocator;
+
+const generic_union_program =
+    \\let Result: (T: type, E: type) -> type = union { ok: T, err: E, }
+    \\let Apply = Result
+    \\let Count = int
+    \\let R = Apply(Count, string)
+    \\let TextResult = Result(string, string)
+    \\let Reversed = union { err: string, ok: bool, }
+    \\let source: (success: bool) -> R = {
+    \\    @print("P")
+    \\    if success { .ok[7] } else { .err["er" + "ror"] }
+    \\}
+    \\let transform: (success: bool) -> TextResult = {
+    \\    let n = source(success).!
+    \\    @print("S")
+    \\    return .ok["value:{n}"]
+    \\}
+    \\let boolean: (success: bool) -> Reversed = {
+    \\    let n = source(success).!
+    \\    .ok[n == 7]
+    \\}
+    \\let describe: (r: TextResult) -> string = match r {
+    \\    .ok => |s| "ok:" + s
+    \\    .err => |s| "err:" + s
+    \\}
+    \\let describeBool: (r: Reversed) -> string = match r {
+    \\    .ok => |b| "bool:{b}"
+    \\    .err => |s| "err:" + s
+    \\}
+    \\let main: () = {
+    \\    @println(describe(transform(true)), describe(transform(false)))
+    \\    @println(describeBool(boolean(true)), describeBool(boolean(false)))
+    \\    let mut item = Result(string, string).ok["a" + "b"]
+    \\    let copy: TextResult = item
+    \\    item = .err["c" + "d"]
+    \\    @println(describe(copy), describe(item))
+    \\}
+;
+const generic_union_output = "PSPok:value:7 err:error\nPPbool:true err:error\nok:ab err:cd\n";
+
+test "generic unions and structural propagation preserve identities effects and forced GC" {
+    const c = try arrayTestProgram(generic_union_program);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, generic_union_output, "", mode);
+}
+
+test "generic propagation preserves once only evaluation short circuit returns and void payloads" {
+    const source =
+        \\let G:(T:type,E:type)->type=union{ok:T,err:E,}
+        \\let R=G(int,string)
+        \\let read:(b:bool)->R={@print("R")
+        \\    if b {.ok[5]} else {.err["e"+"!"]}}
+        \\let rhs:()->int={@print("X")
+        \\    1}
+        \\let sum:(b:bool)->R=.ok[read(b).!+rhs()]
+        \\let lazy:(b:bool)->G(bool,string)=.ok[b and read(false).! == 0]
+        \\let unit:(b:bool)->G(void,string)=if b {.ok[]} else {.err["void"+"!"]}
+        \\let fromUnit:(b:bool)->R={let v:void=unit(b).!
+        \\    .ok[2]}
+        \\let emptyError:()->G(int,void)=.err[]
+        \\let remap:()->G(bool,void)=.ok[emptyError().! == 0]
+        \\let terminal:()->R=R.ok[{return .ok[9]}].!
+        \\let main:()={
+        \\    @println(match sum(false){.ok=>|v|"{v}"
+        \\        .err=>|s|s},match sum(true){.ok=>|v|"{v}"
+        \\        .err=>|s|s})
+        \\    @println(match lazy(false){.ok=>|b|"{b}"
+        \\        .err=>|s|s},match lazy(true){.ok=>|b|"{b}"
+        \\        .err=>|s|s})
+        \\    @println(match fromUnit(true){.ok=>|v|"{v}"
+        \\        .err=>|s|s},match fromUnit(false){.ok=>|v|"{v}"
+        \\        .err=>|s|s})
+        \\    @println(match remap(){.ok=>"bad"
+        \\        .err=>"empty"},match terminal(){.ok=>|v|"{v}"
+        \\        .err=>|s|s})
+        \\}
+    ;
+    const c = try arrayTestProgram(source);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "RRXe! 6\nRfalse e!\n2 void!\nempty 9\n", "", mode);
+}
+
+test "generic success string stays rooted across later allocating arguments and loops" {
+    const source =
+        \\let G:(T:type,E:type)->type=union{err:E,ok:T,}
+        \\let Input=G(string,string)
+        \\let Output=G(int,string)
+        \\let make:()->Input=.ok["a"+"b"]
+        \\let use:(s:string,other:string)->string=s+other
+        \\let run:()->Output={
+        \\    let s=make().!
+        \\    let n:int=loop{let copy=use(s,"c"+"d")
+        \\        @println(copy,s)
+        \\        break 3}
+        \\    .ok[n]
+        \\}
+        \\let main:()=@println(match run(){.ok=>|v|"{v}"
+        \\    .err=>|e|e})
+    ;
+    const c = try arrayTestProgram(source);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "abcd ab\n3\n", "", mode);
+}
+
+test "generic error propagation itself allocates nothing and payload OOM remains checked" {
+    for ([_]bool{ false, true }) |allocate| {
+        const source = try std.fmt.allocPrint(test_gpa, "let G:(T:type,E:type)->type=union{{ok:T,err:E,}}\nlet make:()->G(int,string)=.err[{s}]\nlet run:()->G(bool,string)=.ok[make().! == 0]\nlet main:()=@println(match run(){{.ok=>\"bad\"\n.err=>|e|e}})", .{if (allocate) "\"e\"+\"rr\"" else "\"err\""});
+        defer test_gpa.free(source);
+        const library = try emitSource(source, null);
+        defer test_gpa.free(library);
+        const program = try collectingTestProgram(library);
+        defer test_gpa.free(program);
+        const exhausted = try std.mem.concat(test_gpa, u8, &.{ "#include <stdlib.h>\nstatic void *test_malloc(size_t n) { (void)n; return NULL; }\n#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n", program });
+        defer test_gpa.free(exhausted);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(exhausted, "typedef int nonempty_translation_unit;", if (allocate) 1 else 0, if (allocate) "" else "err\n", if (allocate) "panic: GC allocation failed\n" else "", mode);
+    }
+}
+
+test "generic union instantiation and propagation own source and survive OOM" {
+    var sema = blk: {
+        var module = try Module.init(test_gpa, "generic-union.nov", generic_union_program);
+        defer module.deinit();
+        var result = try Lowering.lower(&module);
+        errdefer result.deinit();
+        try std.testing.expect(!module.hasErrors());
+        break :blk result;
+    };
+    defer sema.deinit();
+    try sema.ir.verify();
+    const c = try emitProgram(test_gpa, &sema.ir, null);
+    defer test_gpa.free(c);
+    try compileAndRunExpected(c, "typedef int nonempty_translation_unit;", 0, generic_union_output, "");
+    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{generic_union_program});
+}
+
+const union_program =
+    \\let Alias = U
+    \\@[public]
+    \\let U = union {
+    \\    ok: int, err: string, none, flag: bool,
+    \\    @[public]
+    \\    let toString: (u: Alias) -> string = describe(u)
+    \\    let describe: (u: U) -> string = match u {
+    \\        .ok => |v| "n:{v}"
+    \\        .err => |s| s + "!"
+    \\        .none => |unit| {let v: void = unit
+    \\            "none"}
+    \\        .flag => |b| "b:{b}"
+    \\    }
+    \\}
+    \\let id: (u: U) -> Alias = u
+    \\let make: () -> string = {@print("S")
+    \\    "hé\0" + "x"}
+    \\let choose: (u: U) -> int = match u {
+    \\    .ok => |n| n
+    \\    _ => -1
+    \\}
+    \\let main: () = {
+    \\    let mut u: Alias = .err[make()]
+    \\    let copy = id(u)
+    \\    let number = choose(.ok[7])
+    \\    u = .none[]
+    \\    @println(copy, u, U.flag[true], Alias.ok[number])
+    \\    let s = match copy {
+    \\        .err => |s| {u = .err["new" + "value"]
+    \\            s}
+    \\        _ => "unexpected"
+    \\    }
+    \\    @println(s, copy, u)
+    \\    @println(if false {U.err[make()]} else {.ok[3]})
+    \\    @println(choose(.none[]))
+    \\}
+;
+const union_output = "Shé\x00x! none b:true n:7\nhé\x00x hé\x00x! newvalue!\nn:3\n-1\n";
+
+test "unions preserve nominal copies private captures methods evaluation and forced GC" {
+    const c = try arrayTestProgram(union_program);
+    defer test_gpa.free(c);
+    try std.testing.expect(std.mem.indexOf(u8, c, ".f1.owner") != null);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, union_output, "", mode);
+}
+
+test "union copies share immutable owners and zero inactive fields" {
+    const library = try emitSource("let U=union{s:string,n:int,none,}\nlet make:()->U=U.s[\"a\"+\"b\"]\nlet copy:(u:U)->U=u\nlet none:()->U=.none[]", null);
+    defer test_gpa.free(library);
+    const c = try std.mem.concat(test_gpa, u8, &.{ library, "\nint main(void) { nov_rt_heap.collect_every_allocation = 1; " ++
+        "nov_record_0 a=nov_make(), b=nov_copy(a), n=nov_none(); " ++
+        "if (!a.f0.owner || a.f0.owner != b.f0.owner || a.f0.data != b.f0.data || n.f0.owner || n.f0.data || n.f0.len || n.f1) return 1; " ++
+        "if (nov_rt_heap.frames || nov_rt_heap.live_objects != 1) return 2; nov_gc_shutdown(&nov_rt_heap); return 0; }\n" });
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "", "", mode);
+}
+
+test "union extraction checks the active tag even in forged well typed IR" {
+    var module = try Module.init(test_gpa, "checked-union.nov", "let U=union{ok:int,none,}\nlet get:(u:U)->int=match u{.ok=>|v|v\n_=>0}\nlet main:()=@println(get(.none[]))");
+    defer module.deinit();
+    var sema = try Lowering.lower(&module);
+    defer sema.deinit();
+    try std.testing.expect(!module.hasErrors());
+    var changed = false;
+    for (sema.ir.functions.items) |f| for (@constCast(f.body.?.instructions)) |*instruction| {
+        if (instruction.op == .union_tag) {
+            instruction.op.union_tag.index = 1;
+            changed = true;
+        }
+    };
+    try std.testing.expect(changed);
+    try sema.ir.verify();
+    const c = try emitProgram(test_gpa, &sema.ir, null);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 1, "", "panic: inactive union payload\n", mode);
+}
+
+test "union payload integer storage preserves every backend width and boundary" {
+    const source = "let U=union{a:i8,b:u8,c:i16,d:u16,e:i32,f:u32,g:i64,h:u64,}\n" ++
+        "let show:(u:U)=match u{.a=>|v|@print(v)\n.b=>|v|@print(v)\n.c=>|v|@print(v)\n.d=>|v|@print(v)\n.e=>|v|@print(v)\n.f=>|v|@print(v)\n.g=>|v|@print(v)\n.h=>|v|@print(v)}\n" ++
+        "let main:()={show(.a[-128])\n@print(\" \")\nshow(.b[255])\n@print(\" \")\nshow(.c[-32768])\n@print(\" \")\nshow(.d[65535])\n@print(\" \")\nshow(.e[-2147483648])\n@print(\" \")\nshow(.f[4294967295])\n@print(\" \")\nshow(.g[-9223372036854775808])\n@print(\" \")\nshow(.h[18446744073709551615])\n@println()}";
+    const c = try arrayTestProgram(source);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "-128 255 -32768 65535 -2147483648 4294967295 -9223372036854775808 18446744073709551615\n", "", mode);
+}
+
+test "union payload allocation failure panics but skipped payloads allocate nothing" {
+    for ([_]struct { body: []const u8, allocates: bool }{
+        .{ .body = "@println(match U.none[] {.s=>|s|s\n.none=>\"ok\"})", .allocates = false },
+        .{ .body = "let u:U=if true {.none[]} else {.s[\"a\"+\"b\"]}\n@println(match u {.s=>|s|s\n.none=>\"ok\"})", .allocates = false },
+        .{ .body = "let u=U.s[\"a\"+\"b\"]\n@println(match u {.s=>|s|s\n.none=>\"ok\"})", .allocates = true },
+    }) |case| {
+        const source = try std.fmt.allocPrint(test_gpa, "let U=union{{s:string,none,}}\nlet main:()={{{s}\n}}", .{case.body});
+        defer test_gpa.free(source);
+        const library = try emitSource(source, null);
+        defer test_gpa.free(library);
+        const program = try collectingTestProgram(library);
+        defer test_gpa.free(program);
+        const exhausted = try std.mem.concat(test_gpa, u8, &.{ "#include <stdlib.h>\nstatic void *test_malloc(size_t n) { (void)n; return NULL; }\n#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n", program });
+        defer test_gpa.free(exhausted);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(exhausted, "typedef int nonempty_translation_unit;", if (case.allocates) 1 else 0, if (case.allocates) "" else "ok\n", if (case.allocates) "panic: GC allocation failed\n" else "", mode);
+    }
+}
+
+test "union semantic 128 bit payloads retain reachable C width diagnostics" {
+    for ([_][]const u8{ "i128", "u128" }) |width| {
+        const source = try std.fmt.allocPrint(test_gpa, "let Wide={s}\nlet Alias=U\nlet U=union{{value:Wide,none,}}\nlet f:(u:Alias)={{}}\nlet main:()={{}}", .{width});
+        defer test_gpa.free(source);
+        var module = try Module.init(test_gpa, "wide-union.nov", source);
+        defer module.deinit();
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expect(sema.lowering_complete);
+        var diagnostic: Diagnostic = undefined;
+        try std.testing.expectError(error.UnsupportedIntegerWidth, emitProgram(test_gpa, &sema.ir, &diagnostic));
+        try std.testing.expectEqual(Diagnostic.Reason.integer_width_unsupported, diagnostic.reason);
+        try std.testing.expectEqualStrings("value", module.sourceSlice(.{ .start = diagnostic.span.start, .end = diagnostic.span.end }).?);
+        const unused = try std.fmt.allocPrint(test_gpa, "let U=union{{value:{s},none,}}\nlet main:()={{}}", .{width});
+        defer test_gpa.free(unused);
+        const c = try emitSource(unused, null);
+        defer test_gpa.free(c);
+        try std.testing.expect(std.mem.indexOf(u8, c, "nov_record_") == null);
+    }
+}
+
+test "union lowering and emission own source and survive every allocation failure" {
+    var sema = blk: {
+        var module = try Module.init(test_gpa, "unions.nov", union_program);
+        defer module.deinit();
+        var result = try Lowering.lower(&module);
+        errdefer result.deinit();
+        try std.testing.expect(!module.hasErrors());
+        break :blk result;
+    };
+    defer sema.deinit();
+    try sema.ir.verify();
+    const c = try emitProgram(test_gpa, &sema.ir, null);
+    defer test_gpa.free(c);
+    try compileAndRunExpected(c, "typedef int nonempty_translation_unit;", 0, union_output, "");
+    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{union_program});
+}
 
 const record_program =
     \\let Alias = R

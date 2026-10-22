@@ -2,26 +2,26 @@ let std = @import("std")
 let File = std.fs.File
 
 let openFile: (path: string) -> Result(File, File.Error) = {
-    let file = File.open(path).?
+    let file = File.open(path).!
 
-    ; the .? operator does the same as
-    let file = match File.open(path) {
-        .ok => |f| f
-        .err => |err| return err
-    }
+    ; the .! operator does the same as
+    ; let file = match File.open(path) {
+    ;     .ok => |f| f
+    ;     .err => |err| return .err[err]
+    ; }
 
     ; we can also handle specific errors differently
-    let file = match File.open(path) {
-        .ok => |f| f
-        .err => |err| match err.kind {
-            .not_found => {
-                ; do something
-            },
-            _ => return err
-        }
-    }
+    ; let file = match File.open(path) {
+    ;     .ok => |f| f
+    ;     .err => |err| match err.kind {
+    ;         .not_found => {
+    ;             ; do something
+    ;         },
+    ;         _ => return .err[err]
+    ;     }
+    ; }
 
-    return file
+    return .ok[file]
 }
 
 let main: () -> void = {

@@ -111,6 +111,7 @@ nov run examples/fibo.nov            # 55
 nov run examples/fizzbuzz.nov        # fifteen lines, 1 through FizzBuzz at 15
 nov run examples/range-search.nov    # exclusive/inclusive searches and MAX exhaustion
 nov run examples/type.nov            # x: 5, y: hello. z: true
+nov run examples/results.nov         # success and propagated error handling
 ```
 
 Both examples also work with `--debug` and `--release`, and can be built with
@@ -740,6 +741,36 @@ let z = [ 10, 20, 30 ]
 ```
 
 ### Union
+
+#### Executable tagged unions
+
+Ordinary module declarations such as `let Value = union { number: int, text: string, empty, }`
+introduce nominal tagged value types. Separate declarations remain distinct; aliases
+preserve identity. The current executable subset supports bool, integer, string,
+and void payloads, with no payload defaults. As with structs, integer fields are
+checked semantically through 128 bits, while reachable C layouts require
+8/16/32/64-bit widths.
+
+- Construct with `Value.number[7]`, or `.number[7]` under an expected union type.
+  A payloadless variant uses `Value.empty[]` or contextual `.empty[]`. Payloads
+  have exact types and evaluate once. Bare payloads never implicitly become unions.
+- Match one union subject with `.number => |n| ...`, `.text => |s| ...`, and
+  `.empty => ...`. Captures are immutable and private to their prong; omit the
+  capture when unused. Every variant must be covered, or use a final `_`.
+  Unknown variants, repeated/covered prongs and missing variants diagnose.
+- Assignment, arguments, returns and control-flow results copy the tag and fields;
+  strings share immutable backing storage. C emission uses a tag and separate
+  zero-initialized payload fields, not an overlapping C union. String owner fields
+  are rooted, including across allocations and early returns. Payload extraction
+  checks the active tag in all build modes.
+- Non-generic union methods and `@[public]` use the same bounded container rules
+  as structs, including exact `toString` printing. Visibility is metadata only.
+- Explicit tag enums, nested/record/array/function payloads, variant-pattern
+  alternatives, nested destructuring, direct payload field access, union equality
+  and union globals remain unsupported.
+
+The examples below describe broader design, not additional implemented features.
+
 Union is Nov's equivalent of [Sum type](https://en.wikipedia.org/wiki/Tagged_union)
 since Nov's unions are always tagged unless annotated with `@[extern]`.
 Thus we can match on an union to find its active field.
@@ -799,6 +830,33 @@ x.text ; runtime error
 ```
 
 ### Generics
+
+#### Executable type-parameterized unions
+
+Named module declarations with explicit `type` parameters and `-> type` can
+produce ordinary unions:
+
+```nov
+let Result: (T: type, E: type) -> type = union {
+    ok: T,
+    err: E,
+}
+let CountResult = Result(uint, string)
+```
+
+`Result` is not a reserved builtin: its name and variant declarations are ordinary
+Nov source. Calls in type positions instantiate templates. Aliases of templates
+and instantiated types work; the same template with identical canonical type
+arguments produces the same nominal type. Distinct templates or different type
+arguments remain distinct, even with identical layouts. Expansion is bounded at
+64 levels, with alias traversal bounded at 128. Only plain named `type` parameters
+are supported in this slice, not value parameters, `#type`, general compile-time
+execution or generic functions returning runtime values. Generic methods/container
+declarations (including `@This()`) and generic structs remain unsupported; instantiated
+union payloads retain the restrictions above.
+
+The following broader generic-struct example remains design-only.
+
 We can generate a type with a function thus creating a generic type.
 ```nov
 let Stack: (T: #type) -> type = struct {
@@ -827,8 +885,33 @@ let Stack: (T: #type) -> type = struct {
 ```
 
 ### Result and Option unions
-`.!` is syntax sugar for Result/Option which is equivalent to unwrapping the
-value or returning it if it's `.err`/`.none`.
+
+#### Executable Result propagation
+
+[examples/results.nov](examples/results.nov) defines its own ordinary generic
+`Result`, handles both variants, and propagates errors with `.!`. It prints:
+
+```text
+Doubled: 42
+Error: value exceeds 100
+```
+
+For a union with exactly `ok` and `err` variants, `value.!` evaluates `value` once.
+It yields the `ok` payload on success. On error it constructs the enclosing
+function's `err` variant and returns immediately, skipping subsequent effects.
+The enclosing result must also have exactly `ok` and `err` variants, and its error
+payload type must match exactly; success types may differ. This is a structural
+operator rule, not special handling of a type named `Result`. Void payloads work.
+Outside propagation, construct returns explicitly with `.ok[value]` or
+`.err[error]`; bare payload returns remain type errors.
+
+Option-style `some`/`none` propagation is not yet implemented. The generic methods
+in the broader definitions below also remain design-only.
+
+`examples/error.nov` now uses `.!` and explicit Result returns, with its alternative
+implementations commented out. It is still a filesystem design example, not an
+executable program: imports, filesystem resources, record payloads, enum error kinds,
+instance calls, terminal `@panic` and record interpolation remain future work.
 
 ```nov
 @[public]

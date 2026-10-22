@@ -1,5 +1,23 @@
 # TODO
 
+Ordinary nominal tagged unions, exhaustive payload-capturing matches and bounded
+ordinary generic union declarations are executable. `Result` is defined in Nov,
+not a compiler builtin; see `examples/results.nov`. Explicit `U.ok[value]` and
+contextual `.ok[value]` constructors preserve exact types. Payloadless variants
+use `.none[]`. Copies preserve value semantics and share immutable string storage;
+GC roots track zero-initialized payload owner fields. Single-union matches require
+complete variant coverage or a catchall, with immutable private captures.
+
+Plain named `type` parameters instantiate union templates, with canonical identity
+by declaration and exact arguments. Template aliases and instantiated aliases work.
+Expansion is bounded at 64 levels. Structural `.!` requires exactly `ok`/`err`
+variants, evaluates once, yields success or constructs/returns the enclosing error
+variant with identical error type. Ordinary returns never implicitly wrap payloads.
+Generic methods, generic structs, general comptime/value parameters, nested/record/
+array/function payloads, explicit tag enums and Option propagation remain deferred.
+The updated filesystem error example remains design-only: imports, file-resource
+semantics, error kinds, instance calls, @panic and record interpolation are missing.
+
 Bounded nominal value structs are executable; `examples/type.nov` is unchanged
 and runs/checks/formats successfully. Separate declarations have distinct identities;
 module aliases preserve identity. Flat bool/integer/string fields have exact types,
@@ -14,7 +32,7 @@ or a new C export policy. C value layouts/root frames retain every string owner 
 parameters, temporaries, local slots and control-flow merges. Contextual/anonymous
 constructors, instance-method syntax, field mutation, nested/array/function fields,
 record arrays/globals, container constants/types, derived printing, record
-interpolation, generics and FFI remain deferred. See README's executable struct
+interpolation, generic structs and FFI remain deferred. See README's executable struct
 contract; the older broader syntax examples below are not delivery claims.
 
 Executable scalar status: integer binary `&`, `|`, `^` and unary `~` support
@@ -49,7 +67,8 @@ aliases additionally preserve explicit `Alias[...]` constructors and static meth
 this does not introduce numeric constructors. Cycles have
 source-related diagnostics; alias expansion is iterative and bounded to 128 active
 expansions. Local/mutable aliases, newtypes, general type values, `@TypeOf`,
-generics and comptime functions remain unsupported. Numeric conversion design
+general generics and comptime functions remain unsupported (bounded generic unions
+are delivered above). Numeric conversion design
 remains deferred; this does not add casts or general literal defaults.
 
 Next step: add new IR that

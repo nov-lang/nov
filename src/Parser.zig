@@ -1023,6 +1023,10 @@ fn parseMatchProng(self: *Parser) Error!Node.Index {
         return null_node;
     }
     const arrow_token = try self.expectToken(.equal_arrow);
+    if (self.eatToken(.pipe) != null) {
+        _ = try self.expectToken(.identifier);
+        _ = try self.expectToken(.pipe);
+    }
 
     const items = self.scratch.items[scratch_top..];
     switch (items.len) {
@@ -1181,6 +1185,15 @@ fn expectTypeExpr(self: *Parser) Error!Node.Index {
     return node;
 }
 
+fn expectCallArg(self: *Parser) Error!Node.Index {
+    // []T is unambiguous in an argument; [] alone remains an array literal.
+    // The semantic callee decides whether this argument is a type or a value.
+    if (self.token_tags[self.tok_i] == .l_bracket and self.token_tags[self.tok_i + 1] == .r_bracket and
+        (self.token_tags[self.tok_i + 2] == .identifier or self.token_tags[self.tok_i + 2] == .l_bracket or self.token_tags[self.tok_i + 2] == .l_paren))
+        return self.expectTypeExpr();
+    return self.expectExpr();
+}
+
 /// SuffixExpr <- PrimaryTypeExpr (SuffixOp / FnCallArguments)*
 /// FnCallArguments <- LPAREN ExprList RPAREN
 fn parseSuffixExpr(self: *Parser) Error!Node.Index {
@@ -1203,7 +1216,7 @@ fn parseSuffixExpr(self: *Parser) Error!Node.Index {
             const token = lexer.next();
             break :blk std.mem.eql(u8, self.source[start..][0..token.end], "@as");
         };
-        const params = try self.parseList(.r_paren, .expected_comma_after_arg, expectExpr, is_ascription);
+        const params = try self.parseList(.r_paren, .expected_comma_after_arg, expectCallArg, is_ascription);
         res = try switch (params) {
             .zero_or_one => |param| self.addNode(.{
                 .tag = .call_one,
@@ -1266,7 +1279,7 @@ fn parsePrimaryTypeExpr(self: *Parser) Error!Node.Index {
         // .keyword_loop => return self.parseLoop(expectTypeExpr) // do not add yet
         // .keyword_match => return self.parseMatchExpr(), // do not add yet
         // TODO
-        .keyword_struct => return self.parseStruct(),
+        .keyword_struct, .keyword_union => return self.parseStruct(),
         // .keyword_struct,
         // .keyword_opaque,
         // .keyword_enum,
@@ -1349,7 +1362,8 @@ test "malformed structs constructors and attributes recover without panicking" {
 }
 
 fn parseStruct(self: *Parser) Error!Node.Index {
-    const keyword = self.assertToken(.keyword_struct);
+    const keyword = self.nextToken();
+    const is_union = self.token_tags[keyword] == .keyword_union;
     _ = try self.expectToken(.l_brace);
     const top = self.scratch.items.len;
     defer self.scratch.shrinkRetainingCapacity(top);
@@ -1365,8 +1379,10 @@ fn parseStruct(self: *Parser) Error!Node.Index {
             .at_sign_l_bracket => try self.expectAttrDecl(),
             .identifier => blk: {
                 const name = self.nextToken();
-                _ = try self.expectToken(.colon);
-                const ty = try self.expectTypeExpr();
+                const ty = if (is_union and self.token_tags[self.tok_i] == .comma) 0 else blk_type: {
+                    _ = try self.expectToken(.colon);
+                    break :blk_type try self.expectTypeExpr();
+                };
                 const value = if (self.eatToken(.equal) != null) try self.expectExpr() else 0;
                 _ = try self.expectToken(.comma);
                 break :blk try self.addNode(.{ .tag = .container_field, .main_token = name, .data = .{ .lhs = ty, .rhs = value } });
@@ -2099,7 +2115,7 @@ test "match subjects alternatives helpers delimiters recovery and OOM" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
     for ([_][:0]const u8{
         "let f = match n {",                  "let f = match n {0 => 1",             "let f = match n {0 => 1\n",
-        "let f = match n, {}",                "let f = match n {0,,1 => 1\n_ => 2}", "let f = match n {0 => |capture| capture\n_ => 2}",
+        "let f = match n, {}",                "let f = match n {0,,1 => 1\n_ => 2}", "let f = match n {0 => |capture capture\n_ => 2}",
         "let f = match n {0 | => 1\n_ => 2}", "let f = 1 |>\n",
     }) |broken| {
         var result = try parse(std.testing.allocator, broken);

@@ -71,6 +71,8 @@ fn checkSupported(ast: Ast) !void {
         .container_decl,
         .container_decl_arg,
         .container_field,
+        .unwrap,
+        .enum_literal,
         .attr_one,
         .attr_decl_one,
         .attr_decl,
@@ -154,7 +156,7 @@ fn checkSupported(ast: Ast) !void {
                 if (ast.nodes.items(.tag)[data.lhs] != .identifier) return error.UnsupportedSyntax;
                 const name = ast.tokenSlice(ast.firstToken(data.lhs));
                 if (primitives.isPrimitive(name)) {
-                    const allowed = [_][]const u8{ "bool", "string", "int", "uint", "i8", "i16", "i32", "i64", "i128", "u8", "u16", "u32", "u64", "u128" };
+                    const allowed = [_][]const u8{ "void", "bool", "string", "int", "uint", "i8", "i16", "i32", "i64", "i128", "u8", "u16", "u32", "u64", "u128" };
                     for (allowed) |scalar| {
                         if (std.mem.eql(u8, name, scalar)) break;
                     } else return error.UnsupportedSyntax;
@@ -230,10 +232,10 @@ fn sameStructure(a: Ast, b: Ast) bool {
     for (tags, a.nodes.items(.data), b.nodes.items(.data)) |tag, x, y| {
         switch (tag) {
             .attr_one => if (!std.mem.eql(u8, a.tokenSlice(x.lhs), b.tokenSlice(y.lhs)) or x.rhs != y.rhs) return false,
-            .identifier, .number_literal, .char_literal, .string_literal, .builtin_literal => {},
+            .identifier, .number_literal, .char_literal, .string_literal, .builtin_literal, .enum_literal => {},
             // The parser leaves unused node data undefined; never read it.
             .negation, .bool_not, .bit_not, .@"return", .array_type => if (x.rhs != y.rhs) return false,
-            .field_access => if (x.lhs != y.lhs or !std.mem.eql(u8, a.tokenSlice(x.rhs), b.tokenSlice(y.rhs))) return false,
+            .field_access, .unwrap => if (x.lhs != y.lhs or !std.mem.eql(u8, a.tokenSlice(x.rhs), b.tokenSlice(y.rhs))) return false,
             .@"continue" => if ((x.lhs == 0) != (y.lhs == 0)) return false,
             else => if (x.lhs != y.lhs or x.rhs != y.rhs) return false,
         }
@@ -302,6 +304,16 @@ fn expectFormatted(source: [:0]const u8, expected: []const u8) !void {
     const again = try format(allocator, terminated);
     defer allocator.free(again);
     try std.testing.expectEqualStrings(formatted, again);
+}
+
+test "generic union signatures instantiations and propagation format idempotently" {
+    try expectFormatted("let Result:(T:type,E:type)->type=union{ok:T,err:E,}\nlet R=Result(int,string)\nlet f:(r:R)->R=.ok[r.!]", "let Result: (T: type, E: type) -> type = union {\n    ok: T,\n    err: E,\n}\nlet R = Result(int, string)\nlet f: (r: R) -> R = .ok[r.!]\n");
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{"let G:(T:type)->type=union{ok:T,err:void,}\nlet R=G(int)\nlet f:(r:R)->R=G(int).ok[r.!]"});
+}
+
+test "unions constructors captures and payloadless variants format idempotently" {
+    try expectFormatted("let U=union{ok:int,err:string,none,}\nlet f:(u:U)->int=match u{.ok=>|v|v\n.err=>0\n.none=>1}\nlet g:()->U=.none[]", "let U = union {\n    ok: int,\n    err: string,\n    none,\n}\nlet f: (u: U) -> int = match u {\n    .ok => |v| v\n    .err => 0\n    .none => 1\n}\nlet g: () -> U = .none[]\n");
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{"let U=union{ok:int,none,}\nlet f:(u:U)->int=match u{.ok=>|v|v\n.none=>0}"});
 }
 
 test "declarations arithmetic strings and idempotence" {
@@ -377,8 +389,6 @@ test "unsupported syntax fails closed including nested expressions" {
         "let f: () -> void = loop true {continue :outer}\n",
         "let f: () -> void = outer: {}\n",
         "let x=&value\n",
-
-        "let x=.value\n",
 
         "let @\"x\"=1\n",
         "#!nov\nlet x=1\n",
@@ -469,7 +479,8 @@ test "every unsupported AST tag is rejected before rendering" {
         .assign_sub,         .assign_mul,           .assign_div,     .assign_mod,       .builtin_literal,   .array_type,
         .array_init_two,     .array_init_two_comma, .array_init,     .array_init_comma, .array_access,      .field_access,
         .in,                 .match,                .match_case_one, .match_case,       .function_pipe,     .container_decl,
-        .container_decl_arg, .container_field,      .attr_one,       .attr_decl_one,    .attr_decl,
+        .container_decl_arg, .container_field,      .unwrap,         .enum_literal,     .attr_one,          .attr_decl_one,
+        .attr_decl,
     };
     var ast = try Parser.parse(std.testing.allocator, "let x=1\n");
     defer ast.deinit(std.testing.allocator);
