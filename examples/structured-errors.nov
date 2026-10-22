@@ -6,6 +6,8 @@ let Result: (T: type, E: type) -> type = union {
 let Entry = struct {
     name: string,
     size: uint,
+
+    let describe: (self: Entry) -> string = "{self.name}: {self.size} bytes"
 }
 
 let ErrorKind = enum {
@@ -36,10 +38,7 @@ let lookup: (name: string) -> Result(Entry, LookupError) = {
     }
 }
 
-let describe: (name: string) -> Result(string, LookupError) = {
-    let entry = lookup(name).!
-    .ok["{entry.name}: {entry.size} bytes"]
-}
+let describe: (name: string) -> Result(string, LookupError) = .ok[lookup(name).!.describe()]
 
 let report: (name: string) = {
     let message = match describe(name) {

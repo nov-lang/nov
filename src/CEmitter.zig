@@ -1030,6 +1030,148 @@ const enum_program =
     \\}
 ;
 
+const instance_program =
+    \\let text:(r:R)->string="WRONG"
+    \\let Alias=R
+    \\let R=struct{s:string,
+    \\    let next:(value:Alias,n:int,other:R)->R={@println("method",value.s,n,other.s)
+    \\        R[.s=value.s+other.s]}
+    \\    let text:(value:R)->string=value.s
+    \\    let replace:(value:R)->R={let mut copy=value
+    \\        copy=R[.s="changed"]
+    \\        copy}
+    \\}
+    \\let K=enum{x,y,
+    \\    let eql:(left:K,right:K)->bool=left==right
+    \\}
+    \\let U=union{record:R,empty,
+    \\    let text:(value:U)->string=match value{.record=>|r|r.text()
+    \\        .empty=>"empty"}
+    \\}
+    \\let make:(label:string)->R={@println(label)
+    \\    R[.s=label+"!"]}
+    \\let number:()->int={@println("arg")
+    \\    7}
+    \\let main:()={
+    \\    let original=make("receiver")
+    \\    let saved=original
+    \\    @println(original.next(number(),make("right")).text(),saved.text(),original.replace().text(),original.text())
+    \\    @println(make("nested").next(number(),make("last")).text())
+    \\    let k=K.x
+    \\    @println(k.eql(.x),K.y.eql(k))
+    \\    let u=U.record[make("payload")]
+    \\    @println(u.text(),match u{.record=>|record|record.next(number(),make("capture")).text()
+    \\        .empty=>"bad"})
+    \\}
+;
+const instance_output = "receiver\narg\nright\nmethod receiver! 7 right!\nreceiver!right! receiver! changed receiver!\nnested\narg\nlast\nmethod nested! 7 last!\nnested!last!\ntrue false\npayload\narg\ncapture\nmethod payload! 7 capture!\npayload! payload!capture!\n";
+
+test "instance calls preserve once only receiver argument order copies captures and forced GC" {
+    const c = try arrayTestProgram(instance_program);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, instance_output, "", mode);
+}
+
+test "instance calls skip later effects on receiver return panic propagation and terminal args" {
+    const prelude =
+        \\let R=struct{s:string="ok",
+        \\    let use:(r:R,n:int)->string=r.s
+        \\    let skip:(r:R,n:int,m:int)->string=r.s
+        \\    @[noreturn]
+        \\    let stop:(r:R)=@panic(r.s+"!")
+        \\}
+        \\@[noreturn]
+        \\let relay:(r:R)=r.stop()
+        \\let Result:(T:type,E:type)->type=union{ok:T,err:E,}
+        \\let RR=Result(R,string)
+        \\let RS=Result(string,string)
+        \\let failed:()->RR=.err["error"]
+        \\let arg:()->int={@print("BAD")
+        \\    1}
+        \\let receiver:()->R={@print("receiver")
+        \\    R[]}
+        \\let propagated:()->RS=.ok[failed().!.use(arg())]
+        \\let pass:(r:R)->R=r
+        \\let returned:()->string=pass({return "returned"}).use(arg())
+        \\let argument:()->string=receiver().use({return "argument"})
+        \\let main:()={
+        \\    @println(returned())
+        \\    @println(argument())
+        \\    @println(match propagated(){.ok=>|s|s
+        \\        .err=>|e|e})
+    ;
+    const Case = struct { tail: []const u8, output: []const u8, message: []const u8 };
+    for ([_]Case{
+        .{ .tail = "R[.s=\"st\"+\"op\"].stop()\n}", .output = "returned\nreceiverargument\nerror\n", .message = "panic: stop!\n" },
+        .{ .tail = "pass({@print(\"panic\")\n@panic(\"receiver\")}).use(arg())\n}", .output = "returned\nreceiverargument\nerror\npanic", .message = "panic: receiver\n" },
+        .{ .tail = "receiver().skip(@panic(\"argument\"),arg())\n}", .output = "returned\nreceiverargument\nerror\nreceiver", .message = "panic: argument\n" },
+    }) |case| {
+        const source = try std.mem.concat(test_gpa, u8, &.{ prelude, "\n", case.tail });
+        defer test_gpa.free(source);
+        errdefer std.debug.print("terminal instance source: {s}\n", .{source});
+        var module = try Module.init(test_gpa, "terminal-instance.nov", source);
+        defer module.deinit();
+        if (module.hasErrors()) {
+            var output = std.Io.Writer.Allocating.init(test_gpa);
+            defer output.deinit();
+            try Diagnostics.renderModule(&module, &output.writer);
+            std.debug.print("{s}", .{output.written()});
+        }
+        const c = try arrayTestProgram(source);
+        defer test_gpa.free(c);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 1, case.output, case.message, mode);
+    }
+}
+
+test "instance receiver snapshots survive later binding replacement" {
+    const source =
+        \\let R=struct{s:string,
+        \\    let join:(r:R,other:R)->string=r.s+other.s
+        \\}
+        \\let main:()={let mut r=R[.s="old"+"!"]
+        \\    @println(r.join({r=R[.s="new"+"!"]
+        \\        r}),r.s)}
+    ;
+    const c = try arrayTestProgram(source);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "old!new! new!\n", "", mode);
+}
+
+test "instance calls runtime allocation failures occur at receiver args and method in order" {
+    for ([_][]const u8{
+        "let main:()=@println(R[.s=\"a\"+\"b\"].join(arg()))",
+        "let main:()=@println(R[.s=\"ab\"].join(\"c\"+\"d\"))",
+        "let main:()=@println(R[.s=\"ab\"].join(\"cd\"))",
+    }) |body| {
+        const source = try std.mem.concat(test_gpa, u8, &.{
+            "let R=struct{s:string,\nlet join:(r:R,s:string)->string=r.s+s\n}\nlet arg:()->string={@print(\"BAD\")\n\"cd\"}\n", body,
+        });
+        defer test_gpa.free(source);
+        const program = try arrayTestProgram(source);
+        defer test_gpa.free(program);
+        const exhausted = try std.mem.concat(test_gpa, u8, &.{ "#include <stdlib.h>\nstatic void *test_malloc(size_t n) { (void)n; return NULL; }\n#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n", program });
+        defer test_gpa.free(exhausted);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(exhausted, "typedef int nonempty_translation_unit;", 1, "", "panic: GC allocation failed\n", mode);
+    }
+}
+
+test "instance calls source free ownership and every allocation failure" {
+    var sema = blk: {
+        var module = try Module.init(test_gpa, "methods.nov", instance_program);
+        defer module.deinit();
+        var result = try Lowering.lower(&module);
+        errdefer result.deinit();
+        try std.testing.expect(!module.hasErrors());
+        break :blk result;
+    };
+    defer sema.deinit();
+    try sema.ir.verify();
+    const c = try emitProgram(test_gpa, &sema.ir, null);
+    defer test_gpa.free(c);
+    try compileAndRunExpected(c, "typedef int nonempty_translation_unit;", 0, instance_output, "");
+    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{instance_program});
+}
+
 test "enum values methods defaults records generic payloads propagation and forced GC" {
     var module = try Module.init(test_gpa, "enums.nov", enum_program);
     defer module.deinit();

@@ -627,14 +627,15 @@ names and tags match; module aliases preserve identity.
 - Static container methods and `@[public]` metadata follow the existing bounded
   container rules. Printing/interpolation require the exact container method
   `toString: (Kind) -> string`; numeric or tag-name formatting is not derived.
-- Explicit numbered values/backing types, enum arrays and instance-method call
-  syntax remain unsupported.
+- Enum instance calls such as `kind.eql(other)` use the value-receiver rules below.
+  Explicit numbered values/backing types and enum arrays remain unsupported.
 
 [examples/structured-errors.nov](examples/structured-errors.nov) uses an enum error
 kind in a record payload, exhaustive error-message selection and special handling
 for `.not_found`.
 
-The broader numbered-enum and instance-call example below remains design-only.
+The numbered-enum example below remains design-only; its instance-call syntax is
+supported for unnumbered enums.
 
 Nov enums are just like C enums except that they can have methods and their fields are not global.
 
@@ -701,7 +702,17 @@ The delivered subset is deliberately bounded:
   initializers. Methods have their own container scope; they can call sibling or
   recursive methods by name. Outside that scope use `MyType.method(args...)` (an
   alias works too). Parameters, including a parameter named `self`, are ordinary
-  by-value parameters; no receiver is inserted. `item.method(...)` is deferred.
+  by-value parameters. Instance syntax `item.method(args...)` inserts `item` as the
+  explicit first argument; that parameter must have the exact nominal container
+  type (its name need not be `self`). The receiver evaluates once before explicit
+  arguments, which evaluate left-to-right. Value copies and string sharing remain
+  unchanged; there is no implicit mutation or borrowing. Instance calls also work
+  for non-generic unions and enums. Direct `@[noreturn]` method calls terminate
+  control flow, including through instance syntax.
+  Existing fields take precedence over method lookup; array/string `.len` is not
+  a method. A bare `item.method` does not create a bound function or closure;
+  explicit `Type.method` remains an ordinary unbound function value. Generic
+  methods remain unsupported.
   Container constants, nested type declarations, generics, general type values,
   struct global instances and C FFI are unsupported.
 - Printing requires exactly the container method `toString: (MyType) -> string`.
@@ -948,8 +959,8 @@ in the broader definitions below also remain design-only.
 
 `examples/error.nov` now uses `.!` and explicit Result returns, with its alternative
 implementations commented out. It is still a filesystem design example, not an
-executable program: imports, filesystem resources and instance calls remain future
-work. Nominal enum error kinds and exhaustive enum matches are implemented. Record payloads and record interpolation are implemented;
+executable program: imports and filesystem resources remain future work. Instance
+calls now support explicit by-value receivers. Nominal enum error kinds and exhaustive enum matches are implemented. Record payloads and record interpolation are implemented;
 terminal `@panic` follows the `@[noreturn]` void-function contract described below.
 
 [examples/structured-errors.nov](examples/structured-errors.nov) is a runnable

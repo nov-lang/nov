@@ -1,13 +1,19 @@
 # TODO
 
+Instance calls value.method(args) work on nominal structs, non-generic unions and
+enums as sugar for Type.method(value,args). The explicit first parameter must match
+the exact nominal receiver type. Receiver evaluates/snapshots once before explicit
+arguments left-to-right; direct noreturn methods remain terminal. Fields retain
+lookup precedence. No implicit mutation/borrowing, bound method references or
+generic methods were added. structured-errors.nov uses Entry.describe().
+
 Nominal unnumbered enums are executable: qualified/contextual tags, aliases, exact
 ==/!=, exhaustive single-enum matches with qualified patterns/alternatives/catchall,
 covered-pattern notes, literal globals, record fields and tag defaults, union
 payloads, generic arguments and .! error propagation. Static methods/public and
 exact toString printing/interpolation reuse container rules. Enum leaves add no GC
 roots; internal uint32 ordinals expose no numeric/FFI policy. Numbered values,
-backing types, numeric conversions/arithmetic/ordering, arrays and instance calls
-remain unsupported. structured-errors.nov now handles an enum .not_found kind.
+backing types, numeric conversions/arithmetic/ordering and arrays remain unsupported. structured-errors.nov now handles an enum .not_found kind.
 
 Flat nominal records now work as ordinary/generic union payloads, retaining exact
 identity through aliases, constructors, captures, copies and .! propagation. C
@@ -48,7 +54,7 @@ Generic methods, generic structs, general comptime/value parameters, nested unio
 array/function payloads, nested record fields, explicit tag enums and Option
 propagation remain deferred.
 The updated filesystem error example remains design-only: imports, file-resource
-semantics and instance calls are missing.
+semantics are missing.
 
 Bounded nominal value structs are executable; `examples/type.nov` is unchanged
 and runs/checks/formats successfully. Separate declarations have distinct identities;
@@ -62,7 +68,7 @@ immediately after each argument is evaluated, before the next argument. Only
 `@[public]` on structs/methods is accepted, as future visibility metadata, not imports
 or a new C export policy. C value layouts/root frames retain every string owner in
 parameters, temporaries, local slots and control-flow merges. Contextual/anonymous
-constructors, instance-method syntax, field mutation, nested/array/function fields,
+constructors, field mutation, nested/array/function fields,
 record arrays/globals, container constants/types, derived printing,
 generic structs and FFI remain deferred. See README's executable struct
 contract; the older broader syntax examples below are not delivery claims.

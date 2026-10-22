@@ -68,6 +68,7 @@ pub const Diagnostic = struct {
         missing_field,
         invalid_field_default,
         invalid_to_string,
+        invalid_method_receiver,
         unknown_name,
         unsupported_declaration,
         unsupported_name,

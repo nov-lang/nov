@@ -440,6 +440,17 @@ const Context = struct {
         return self.module.lookupMethod(@enumFromInt(identity), ast.tokenSlice(data.rhs));
     }
 
+    fn receiverMethod(self: *Context, ty: Ir.TypeId, name: []const u8) ?Module.DeclId {
+        if (self.fieldIndex(ty, name) != null) return null;
+        const container = self.ir.getType(ty).?;
+        const identity = switch (container) {
+            .record => container.record.identity,
+            .enumeration => container.enumeration.identity,
+            else => return null,
+        };
+        return self.module.lookupMethod(@enumFromInt(identity), name);
+    }
+
     fn directNoreturn(self: *Context, node: Ast.Node.Index) Error!bool {
         const ast = &self.module.ast;
         const id = if (ast.nodes.items(.tag)[node] == .identifier) blk: {
@@ -716,6 +727,17 @@ const Context = struct {
                     break :blk try self.ascribedType(call);
                 }
                 if (self.printing(call.ast.fn_expr) != null) break :blk .{ .ty = try self.ir.internType(.void) };
+                if (ast.nodes.items(.tag)[call.ast.fn_expr] == .field_access and try self.staticMethod(call.ast.fn_expr) == null) {
+                    const field = ast.nodes.items(.data)[call.ast.fn_expr];
+                    if (try self.probe(field.lhs, depth + 1)) |receiver| {
+                        if (self.receiverMethod(receiver.ty, ast.tokenSlice(field.rhs))) |method| {
+                            if (self.module.getDeclaration(method).?.noreturn) break :blk null;
+                            const signature = self.globalType(method) orelse break :blk null;
+                            const function = self.ir.getType(signature.ty).?;
+                            if (function == .function) break :blk .{ .ty = function.function.result };
+                        }
+                    }
+                }
                 const callee = (try self.probe(call.ast.fn_expr, depth + 1)) orelse break :blk null;
                 const ty = self.ir.getType(callee.ty).?;
                 if (ty != .function) break :blk null;
@@ -1909,6 +1931,47 @@ const Context = struct {
                     if (!valid) return null;
                     return self.fit(try self.ir.internType(.void), expected, node);
                 }
+                if (ast.nodes.items(.tag)[call.ast.fn_expr] == .field_access and try self.staticMethod(call.ast.fn_expr) == null) {
+                    const field = ast.nodes.items(.data)[call.ast.fn_expr];
+                    const receiver = (try self.expression(field.lhs, null, depth + 1)) orelse return null;
+                    if (self.terminated) return if (expected) |want| want.ty else try self.ir.internType(.void);
+                    if (self.receiverMethod(receiver, ast.tokenSlice(field.rhs))) |method| {
+                        const signature = self.globalType(method) orelse return self.fail(.unresolved_value_type, call.ast.fn_expr, null);
+                        const function = self.ir.getType(signature.ty).?.function;
+                        const related = self.module.getDeclaration(method).?.name_span;
+                        if (function.params.len == 0 or function.params[0] != receiver) return self.fail(.invalid_method_receiver, call.ast.fn_expr, related);
+                        if (call.ast.args.len != function.params.len - 1) return self.fail(.argument_count_mismatch, node, related);
+                        try self.copyNode(field.lhs, receiver);
+                        var valid = true;
+                        for (call.ast.args, function.params[1..]) |arg, param| {
+                            if (try self.expression(arg, .{ .ty = param, .annotation = related }, depth + 1) == null) {
+                                valid = false;
+                            } else if (!self.terminated) try self.copyNode(arg, param);
+                        }
+                        if (!valid) return null;
+                        if (!self.terminated) {
+                            const is_noreturn = self.module.getDeclaration(method).?.noreturn;
+                            if (self.emitter) |emitter| {
+                                const callee = try emitter.append(signature.ty, self.irSpan(call.ast.fn_expr), .{ .function_ref = emitter.functions[@intFromEnum(method)].? });
+                                const args = try emitter.allocator.alloc(Ir.ValueId, function.params.len);
+                                args[0] = try emitter.value(field.lhs);
+                                for (call.ast.args, args[1..]) |arg, *value| value.* = try emitter.value(arg);
+                                try emitter.record(node, function.result, self.irSpan(node), .{ .call = .{ .callee = callee, .args = args, .noreturn = is_noreturn } });
+                                if (is_noreturn) self.terminal = try emitter.value(node);
+                            }
+                            self.terminated = is_noreturn;
+                        }
+                        return self.fit(function.result, expected, node);
+                    }
+                    // All supported fields are non-callable. Do not reinterpret a
+                    // matching field (including array/string len) as a method.
+                    const container = self.ir.getType(receiver).?;
+                    if (self.fieldIndex(receiver, ast.tokenSlice(field.rhs)) != null or
+                        ((container == .array or container == .string) and std.mem.eql(u8, ast.tokenSlice(field.rhs), "len")))
+                        return self.fail(.not_callable, node, null);
+                    if (container == .record or container == .enumeration) return self.fail(.unknown_field, call.ast.fn_expr, null);
+                    return self.fail(.unsupported_body_expression, call.ast.fn_expr, null);
+                }
                 const callee = (try self.expression(call.ast.fn_expr, null, depth + 1)) orelse return null;
                 if (self.terminated) return if (expected) |want| want.ty else try self.ir.internType(.void);
                 const origin = try self.probe(call.ast.fn_expr, depth + 1);
@@ -1929,6 +1992,39 @@ const Context = struct {
         }
     }
 };
+
+test "instance calls diagnose signatures arity exact identity and preserve fields" {
+    const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag };
+    for ([_]Case{
+        .{ .source = "let R=struct{let f:()->bool=true\n}\nlet main:()={let r=R[]\nr.f()}", .tag = .invalid_method_receiver },
+        .{ .source = "let R=struct{let f:(n:int)->bool=true\n}\nlet main:()={let r=R[]\nr.f()}", .tag = .invalid_method_receiver },
+        .{ .source = "let S=struct{}\nlet R=struct{let f:(s:S)->bool=true\n}\nlet main:()={let r=R[]\nr.f()}", .tag = .invalid_method_receiver },
+        .{ .source = "let R=struct{let f:(r:R,n:int)->bool=true\n}\nlet main:()={let r=R[]\nr.f()}", .tag = .argument_count_mismatch },
+        .{ .source = "let R=struct{let f:(r:R,n:int)->bool=true\n}\nlet main:()={let r=R[]\nr.f(true)}", .tag = .literal_type_mismatch },
+        .{ .source = "let R=struct{}\nlet f:(r:R)->bool=true\nlet main:()={let r=R[]\nr.f()}", .tag = .unknown_field },
+        .{ .source = "let R=struct{f:bool=true,}\nlet main:()={let r=R[]\nr.f()}", .tag = .not_callable },
+        .{ .source = "let main:()={let s=\"hi\"\ns.len()}", .tag = .not_callable },
+        .{ .source = "let main:()={let a:[]int=[1]\na.len()}", .tag = .not_callable },
+        .{ .source = "let main:()={let s=\"hi\"\ns.close()}", .tag = .unsupported_body_expression },
+        .{ .source = "let main:()={let a:[]int=[1]\na.close()}", .tag = .unsupported_body_expression },
+        .{ .source = "let R=struct{let f:(r:R)->bool=true\n}\nlet main:()={let r=R[]\nlet f=r.f\n}", .tag = .unknown_field },
+        .{ .source = "let K=enum{x,let f:(k:K)->bool=true\n}\nlet main:()={let k=K.x\nlet f=k.f\n}", .tag = .unsupported_body_expression },
+        .{ .source = "let K=enum{x,let eql:(a:K,b:K)->bool=a==b\n}\nlet S=enum{x,}\nlet main:()={let k=K.x\nk.eql(S.x)}", .tag = .literal_type_mismatch },
+        .{ .source = "let R=struct{@[noreturn]\nlet stop:(r:R)=@panic(\"x\")\n}\nlet main:()={R[].stop()\n@print()}", .tag = .unreachable_code },
+        .{ .source = "let R=struct{@[noreturn]\nlet stop:(r:R)=@panic(\"x\")\n}\n@[noreturn]\nlet main:()={let f=R.stop\nf(R[])}", .tag = .noreturn_completion },
+    }) |case| {
+        var module = try Module.init(std.testing.allocator, "methods.nov", case.source);
+        defer module.deinit();
+        errdefer std.debug.print("instance parse {s}: {any} {any}\n", .{ case.source, module.ast.errors, module.diagnostics.items });
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        errdefer std.debug.print("instance source {s}: {any}\n", .{ case.source, module.diagnostics.items });
+        try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+        try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
+        try std.testing.expect(!sema.lowering_complete);
+    }
+}
 
 test "noreturn declarations reject nonvoid results returns and normal completion" {
     const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag };
