@@ -18,7 +18,7 @@ pub fn lower(module: *Module) Error!Sema {
     if (module.hasErrors()) return result;
     result.ir.source_len = @intCast(module.ast.source.len);
     for (module.declarations.items, result.entries) |declaration, entry| {
-        if (entry.status == .type_alias or entry.status == .generic) continue;
+        if (entry.status == .type_alias or entry.status == .generic or entry.status == .unrequested) continue;
         if (module.ast.decl(declaration.node).ast.is_mutable or (entry.status != .body_checked and entry.status != .constant_checked)) {
             const full = module.ast.decl(declaration.node).ast;
             const tag: Module.Diagnostic.Tag = if (!full.is_mutable and full.type_node == 0 and full.init_node != 0) blk: {
@@ -41,7 +41,10 @@ pub fn lower(module: *Module) Error!Sema {
         constant.* = entry.constant;
         if (entry.status != .body_checked) continue;
         const span: Ir.Span = .{ .start = declaration.name_span.start, .end = declaration.name_span.end };
-        const qualified = if (declaration.container) |owner| try std.fmt.allocPrint(result.allocator, "{s}.{s}", .{ module.getDeclaration(owner).?.name, declaration.name }) else null;
+        const qualified = if (declaration.container) |owner| if (declaration.concrete_type) |concrete|
+            try std.fmt.allocPrint(result.allocator, "{s}[{d}].{s}", .{ module.getDeclaration(owner).?.name, concrete, declaration.name })
+        else
+            try std.fmt.allocPrint(result.allocator, "{s}.{s}", .{ module.getDeclaration(owner).?.name, declaration.name }) else null;
         defer if (qualified) |name| result.allocator.free(name);
         const function = try result.ir.addFunction(qualified orelse declaration.name, entry.type_id.?, span);
         result.ir.functions.items[@intFromEnum(function)].public = declaration.public;
@@ -66,6 +69,178 @@ pub fn lower(module: *Module) Error!Sema {
         result.lowering_complete = true;
     }
     return result;
+}
+
+const demand_result_source =
+    \\@[public]
+    \\let Result:(T:type,E:type)->type=union{ok:T,err:E,
+    \\let Self=@This()
+    \\@[public]
+    \\let unwrapOr:(self:Self,fallback:T)->T=match self{.ok=>|v|v
+    \\.err=>fallback}
+    \\@[public]
+    \\let unwrapOrElse:(self:Self,fallback:(E)->T)->T=match self{.ok=>|v|v
+    \\.err=>|e|fallback(e)}
+    \\}
+;
+
+test "demand generic methods preserve void payload construction propagation and valid siblings" {
+    const source = demand_result_source ++ "\n" ++
+        \\let Unit=Result(void,string)
+        \\let Empty=Result(int,void)
+        \\let Both=Result(void,void)
+        \\let unit:(b:bool)->Unit=if b{.ok[]}else{.err["err"]}
+        \\let run:(b:bool)->Result(int,string)={let v:void=unit(b).!
+        \\.ok[2]}
+        \\let empty:()->Empty=.err[]
+        \\let remap:()->Result(bool,void)=.ok[empty().! == 0]
+        \\let both:()->Both=.ok[]
+        \\let use:(r:Empty)->int=r.unwrapOr(7)
+    ;
+    var module = try Module.init(std.testing.allocator, "demand-void.nov", source);
+    defer module.deinit();
+    var result = try lower(&module);
+    defer result.deinit();
+    try std.testing.expect(result.lowering_complete);
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expectEqual(@as(usize, 7), result.ir.functions.items.len);
+    try result.ir.verify();
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+}
+
+test "demand generic methods do not resolve unused signatures bodies or expanding instances" {
+    const source = "let G:(T:type)->type=union{ok:bool,\nlet bad:(x:Missing)->T=missing\nlet next:()->G((T)->T)=G((T)->T).next()\n}\nlet R=G(int)\nlet make:()->R=.ok[true]";
+    var module = try Module.init(std.testing.allocator, "demand-unused.nov", source);
+    defer module.deinit();
+    var result = try lower(&module);
+    defer result.deinit();
+    try std.testing.expect(result.lowering_complete);
+    try std.testing.expectEqual(@as(usize, 1), result.ir.functions.items.len);
+    var instances: usize = 0;
+    for (result.ir.types.items) |ty| if (ty == .record and ty.record.type_args.len != 0) {
+        instances += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 1), instances);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+}
+
+test "demand generic methods diagnose requested void parameter signatures including function references" {
+    for ([_][]const u8{
+        "let R=Result(void,string)\nlet use:()={let f=R.unwrapOr\n}",
+        "let R=Result(void,string)\nlet use:(r:R)=r.unwrapOr({})",
+        "let R=Result(int,void)\nlet use:()={let f=R.unwrapOrElse\n}",
+        "let R=Result(int,void)\nlet use:(r:R)={let f=match true{true=>R.unwrapOrElse\nfalse=>R.unwrapOrElse}\n}",
+    }) |body| {
+        const source = try std.mem.concat(std.testing.allocator, u8, &.{ demand_result_source, "\n", body });
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "demand-error.nov", source);
+        defer module.deinit();
+        var result = try lower(&module);
+        defer result.deinit();
+        var found = false;
+        for (module.diagnostics.items) |d| if (d.tag == .invalid_parameter_type) {
+            found = true;
+        };
+        try std.testing.expect(found);
+        try std.testing.expect(!result.lowering_complete);
+        try std.testing.expectEqual(@as(usize, 0), result.ir.functions.items.len);
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, testRejectedMatchAllocations, .{source});
+    }
+}
+
+test "generic methods reject inexact types leaked bindings and invalid concrete bodies" {
+    const prefix = "let G:(T:type,E:type)->type=union{ok:T,err:E,\nlet Self=@This()\nlet unwrapOr:(self:Self,fallback:T)->T=match self{.ok=>|v|v\n.err=>fallback}\nlet unwrapOrElse:(self:Self,fallback:(E)->T)->T=match self{.ok=>|v|v\n.err=>|e|fallback(e)}\n}\nlet R=G(int,string)\n";
+    const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag };
+    for ([_]Case{
+        .{ .source = "let f:(r:R)->int=r.unwrapOr(true)", .tag = .literal_type_mismatch },
+        .{ .source = "let f:(r:R)->int=r.unwrapOr()", .tag = .argument_count_mismatch },
+        .{ .source = "let cb:(x:bool)->int=0\nlet f:(r:R)->int=r.unwrapOrElse(cb)", .tag = .expression_type_mismatch },
+        .{ .source = "let S=G(int,bool)\nlet f:(s:S)->int=R.unwrapOr(s,0)", .tag = .expression_type_mismatch },
+        .{ .source = "let Other:(T:type,E:type)->type=union{ok:T,err:E,}\nlet f:(s:Other(int,string))->int=R.unwrapOr(s,0)", .tag = .expression_type_mismatch },
+        .{ .source = "let f:(x:T)={}", .tag = .unknown_type },
+        .{ .source = "let f:(x:Self)={}", .tag = .unknown_type },
+        .{ .source = "let Bad:(T:type)->type=union{ok:T,\nlet bad:()->T=true\n}\nlet B=Bad(int)\nlet use:()->int=B.bad()", .tag = .literal_type_mismatch },
+        .{ .source = "let Bad:(T:type)->type=union{ok:T,\nlet m:(T:int)={}\n}\nlet B=Bad(int)\nlet use:()=B.m(0)", .tag = .unsupported_shadowing },
+        .{ .source = "let Bad:(T:type)->type=union{ok:T,\nlet m:()={let T:int=1\n}\n}\nlet B=Bad(int)\nlet use:()=B.m()", .tag = .unsupported_shadowing },
+        .{ .source = "let Bad:(T:type)->type=union{ok:T,\n@[noreturn]\nlet m:()->T=@panic(\"bad\")\n}\nlet B=Bad(int)\nlet use:()=B.m()", .tag = .noreturn_result },
+        .{ .source = "let Bad:(T:type)->type=union{ok:T,\nlet toString:(self:@This())->T=match self{.ok=>|v|v}\n}\nlet B=Bad(int)\nlet f:(b:B)=@println(b)", .tag = .invalid_to_string },
+        .{ .source = "let A=struct{x:int,}\nlet B=struct{x:int,}\nlet f:(r:G(A,string),b:B)->A=r.unwrapOr(b)", .tag = .expression_type_mismatch },
+    }) |case| {
+        const source = try std.mem.concat(std.testing.allocator, u8, &.{ prefix, case.source });
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "generic-method-error.nov", source);
+        defer module.deinit();
+        if (module.hasErrors()) std.debug.print("invalid method case {s}: parse {any} collect {any}\n", .{ case.source, module.ast.errors, module.diagnostics.items });
+        var result = try lower(&module);
+        defer result.deinit();
+        var found = false;
+        for (module.diagnostics.items) |d| if (d.tag == case.tag) {
+            found = true;
+        };
+        if (!found) std.debug.print("method error {s}: {any}\n", .{ case.source, module.diagnostics.items });
+        try std.testing.expect(found);
+        try std.testing.expect(!result.lowering_complete);
+        try std.testing.expectEqual(@as(usize, 0), result.ir.functions.items.len);
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, testRejectedMatchAllocations, .{source});
+    }
+}
+
+test "generic method instantiation has a bounded expanding signature worklist" {
+    var module = try Module.init(std.testing.allocator, "method-limit.nov", "let G:(T:type)->type=union{ok:bool,\nlet next:()->G((T)->T)=G((T)->T).next()\n}\nlet R=G(int)\nlet use:()={let x=R.next()\n}");
+    defer module.deinit();
+    var result = try lower(&module);
+    defer result.deinit();
+    try std.testing.expect(!result.lowering_complete);
+    var found = false;
+    for (module.diagnostics.items) |d| if (d.tag == .generic_limit) {
+        found = true;
+    };
+    try std.testing.expect(found);
+}
+
+test "generic method bodies retain type parameters in annotations ascriptions and new instances" {
+    const source =
+        \\let G:(T:type,E:type)->type=union{ok:T,err:E,
+        \\let Self=@This()
+        \\let id:(self:Self,x:T)->T={let y:T=x
+        \\@as(T,y)}
+        \\let wrap:(self:Self,x:T)->Self=Self.ok[x]
+        \\let flag:(self:Self)->G(bool,E)={let result:G(bool,E)=G(bool,E).ok[true]
+        \\result}
+        \\}
+        \\let R=G(int,string)
+        \\let S=G(string,int)
+        \\let run:(r:R,s:S)->int={let flag=r.flag()
+        \\@println(flag.id(true),s.wrap("s").id("t"))
+        \\@println("{G(i8,bool).id(G(i8,bool).ok[1],2)}")
+        \\G(int,string).id(r.wrap(1),2)}
+    ;
+    var module = try Module.init(std.testing.allocator, "method-scope.nov", source);
+    defer module.deinit();
+    var result = try lower(&module);
+    defer result.deinit();
+    if (module.hasErrors()) std.debug.print("method scope: {any}\n", .{module.diagnostics.items});
+    try std.testing.expect(result.lowering_complete);
+    try result.ir.verify();
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+}
+
+test "generic method tables reset between analyses without changing canonical identity" {
+    var module = try Module.init(std.testing.allocator, "methods.nov", "let G:(T:type)->type=union{ok:T,\nlet get:(self:@This())->T=match self{.ok=>|v|v}\n}\nlet I=int\nlet A=G(I)\nlet B=G(int)\nlet C=G(bool)\nlet run:(a:A,b:B,c:C)->int={@println(c.get())\na.get()+B.get(b)}");
+    defer module.deinit();
+    var first = try lower(&module);
+    defer first.deinit();
+    try std.testing.expect(first.lowering_complete);
+    const count = module.declarations.items.len;
+    var second = try lower(&module);
+    defer second.deinit();
+    try std.testing.expect(second.lowering_complete);
+    try std.testing.expectEqual(count, module.declarations.items.len);
+    try std.testing.expectEqual(@as(usize, 3), second.ir.functions.items.len);
+    try std.testing.expectEqual(first.getEntry(module.lookup("A").?).?.alias_type, first.getEntry(module.lookup("B").?).?.alias_type);
+    try std.testing.expect(first.getEntry(module.lookup("A").?).?.alias_type != first.getEntry(module.lookup("C").?).?.alias_type);
+    try first.ir.verify();
+    try second.ir.verify();
 }
 
 test "generic union instances canonicalize aliases arguments and nominal declarations" {
@@ -170,7 +345,7 @@ test "generic unions and propagation diagnose exact types unsupported forms and 
         .{ .source = "let Bad:(T:int)->type=union{ok:T,}", .tag = .invalid_generic_declaration },
         .{ .source = "let Bad:(T:type)->int=union{ok:T,}", .tag = .invalid_generic_declaration },
         .{ .source = "let Bad:(T:type,T:type)->type=union{ok:T,}", .tag = .duplicate_parameter },
-        .{ .source = "let Bad:(T:type)->type=union{ok:T,\nlet m:(x:T)->T=x\n}", .tag = .unsupported_generic_method },
+        .{ .source = "let Bad:(T:type)->type=union{ok:T,\nlet m=1\n}", .tag = .unsupported_generic_method },
         .{ .source = "let Bad:(T:type)->type=union{ok:T,ok:T,}", .tag = .duplicate_field },
         .{ .source = "let Bad:(T:type)->type=union{ok:T=1,}", .tag = .unsupported_union_default },
         .{ .source = "let A=G((int)->int,string)", .tag = .unsupported_type },

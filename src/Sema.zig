@@ -16,7 +16,7 @@ entries: []Entry,
 /// Entry-point/backend/runtime configuration is still a separate obligation.
 lowering_complete: bool = false,
 
-pub const Status = enum { deferred, generic, type_alias, signature_only, constant_checked, body_checked, lowered, failed };
+pub const Status = enum { deferred, generic, unrequested, requested, type_alias, signature_only, constant_checked, body_checked, lowered, failed };
 pub const Entry = struct {
     type_id: ?Ir.TypeId = null,
     /// Represented type, never the runtime type of this declaration.
@@ -28,20 +28,23 @@ pub const Entry = struct {
 };
 pub const Error = Ir.BuildError || error{InvalidModule};
 
-/// A partial semantic pass: resolves explicit annotations and literal constants.
+/// A partial semantic pass: resolves explicit annotations and literal constants,
+/// leaving concrete generic method signatures dormant until referenced.
 /// Deferred entries and signatures are not checked bodies or executable IR.
 /// Owns all output storage; OOM rolls back diagnostics appended to the module.
 pub fn analyzeAnnotations(module: *Module) Error!Sema {
     if (module.hasErrors()) return error.InvalidModule;
     const diagnostics_start = module.diagnostics.items.len;
     errdefer module.diagnostics.shrinkRetainingCapacity(diagnostics_start);
+    module.clearSpecializations();
     var result: Sema = .{
         .allocator = module.allocator,
         .ir = Ir.init(module.allocator),
-        .entries = try module.allocator.alloc(Entry, module.declarations.items.len),
+        .entries = &.{},
     };
     errdefer result.deinit();
     result.ir.source_len = @intCast(module.ast.source.len);
+    result.entries = try module.allocator.alloc(Entry, module.declarations.items.len);
     @memset(result.entries, .{});
     for (module.declarations.items, 0..) |declaration, i| {
         if (declaration.is_generic) {
@@ -57,13 +60,22 @@ pub fn analyzeAnnotations(module: *Module) Error!Sema {
             try result.ir.internType(.{ .record = .{ .identity = @intCast(i), .fields = &.{}, .public = declaration.public, .tagged = module.ast.isUnion(init_node) } });
         result.entries[i].status = .type_alias;
     }
-    for (module.declarations.items, 0..) |declaration, i| {
+    var i: usize = 0;
+    while (i < module.declarations.items.len) : (i += 1) {
+        try result.syncEntries(module);
+        const declaration = module.declarations.items[i];
+        if (declaration.concrete_type != null) continue;
         const full = module.ast.decl(declaration.node);
         if (declaration.is_record or declaration.is_generic) continue;
-        if (declaration.container) |owner| if (module.getDeclaration(owner).?.is_generic) {
-            result.entries[i].status = .failed;
+        if (declaration.container) |owner| if (module.getDeclaration(owner).?.is_generic and declaration.concrete_type == null) {
+            result.entries[i].status = .generic;
             continue;
         };
+        if (TypeResolver.isThisAlias(&module.ast, declaration.node) and declaration.container != null) {
+            result.entries[i].alias_type = try TypeResolver.resolveInContainer(module, &result.ir, full.ast.init_node, declaration.container, declaration.concrete_type);
+            result.entries[i].status = .type_alias;
+            continue;
+        }
         if (declaration.container != null and (full.ast.is_mutable or module.ast.fullFnProto(full.ast.type_node) == null)) {
             try module.diagnostics.append(module.allocator, .{ .tag = .unsupported_declaration, .span = declaration.name_span });
             result.entries[i].status = .failed;
@@ -83,7 +95,7 @@ pub fn analyzeAnnotations(module: *Module) Error!Sema {
             if (!full.ast.is_mutable and full.ast.init_node != 0) try result.checkScalarGlobal(module, i, full.ast.init_node, null);
             continue;
         }
-        const type_id = (try TypeResolver.resolve(module, &result.ir, full.ast.type_node)) orelse {
+        const type_id = (try TypeResolver.resolveInContainer(module, &result.ir, full.ast.type_node, declaration.container, declaration.concrete_type)) orelse {
             result.entries[i].status = .failed;
             continue;
         };
@@ -105,7 +117,10 @@ pub fn analyzeAnnotations(module: *Module) Error!Sema {
             }
         }
     }
-    for (module.declarations.items, 0..) |declaration, i| {
+    i = 0;
+    while (i < module.declarations.items.len) : (i += 1) {
+        try result.syncEntries(module);
+        const declaration = module.declarations.items[i];
         if (!declaration.is_record or declaration.is_generic) continue;
         const full = module.ast.decl(declaration.node);
         if (declaration.container != null or primitives.isPrimitive(declaration.name)) {
@@ -172,14 +187,60 @@ pub fn analyzeFunctions(module: *Module) Error!Sema {
     var result = try analyzeAnnotations(module);
     errdefer result.deinit();
     if (module.hasErrors()) return result;
-    const types = try result.allocator.alloc(?Ir.TypeId, result.entries.len);
-    defer result.allocator.free(types);
-    for (result.entries, types) |entry, *ty| ty.* = entry.type_id;
-    for (result.entries, 0..) |*entry, i| {
-        if (entry.status != .signature_only) continue;
-        entry.status = if (try BodyChecker.check(module, &result.ir, types, @enumFromInt(i))) .body_checked else .failed;
+    while (true) {
+        try result.syncEntries(module);
+        var next: ?usize = null;
+        for (result.entries, 0..) |entry, index| {
+            if (entry.status == .signature_only or entry.status == .requested) {
+                next = index;
+                break;
+            }
+        }
+        const index = next orelse break;
+        const id: Module.DeclId = @enumFromInt(index);
+        if (result.entries[index].status == .requested and try result.requestType(module, id) == null) {
+            result.entries[index].status = .failed;
+            continue;
+        }
+        const checked = try BodyChecker.checkDemand(module, &result, id);
+        // Checking can instantiate containers and resize the entry table.
+        try result.syncEntries(module);
+        result.entries[index].status = if (checked) .body_checked else .failed;
     }
     return result;
+}
+
+/// New concrete containers may be discovered while checking a requested body.
+/// No caller may retain entry pointers across type resolution or body checking.
+fn syncEntries(self: *Sema, module: *Module) Ir.BuildError!void {
+    const old_len = self.entries.len;
+    if (old_len == module.declarations.items.len) return;
+    self.entries = try self.allocator.realloc(self.entries, module.declarations.items.len);
+    for (self.entries[old_len..]) |*entry| entry.* = .{ .status = .unrequested };
+}
+
+/// Resolves a referenced concrete method, but queues its body rather than
+/// recursively checking it. Publishing the signature first permits recursion.
+pub fn requestType(self: *Sema, module: *Module, id: Module.DeclId) Ir.BuildError!?Ir.TypeId {
+    try self.syncEntries(module);
+    const index = @intFromEnum(id);
+    if (index >= self.entries.len) return error.InvalidTypeId;
+    const entry = self.entries[index];
+    if (entry.status != .unrequested and entry.status != .requested) return entry.type_id;
+    const declaration = module.getDeclaration(id).?;
+    if (declaration.concrete_type == null or declaration.is_type_alias) return null;
+    // Failed speculative requests must be retried: probes may discard their
+    // diagnostics. The worklist performs a final, non-speculative request too.
+    self.entries[index].status = .requested;
+    const full = module.ast.decl(declaration.node).ast;
+    const ty = (try TypeResolver.resolveInContainer(module, &self.ir, full.type_node, declaration.container, declaration.concrete_type)) orelse return null;
+    try self.syncEntries(module);
+    if (declaration.noreturn and self.ir.getType(self.ir.getType(ty).?.function.result).? != .void) {
+        try module.diagnostics.append(module.allocator, .{ .tag = .noreturn_result, .span = declaration.name_span });
+        return null;
+    }
+    self.entries[index] = .{ .type_id = ty, .status = .signature_only, .noreturn = declaration.noreturn };
+    return ty;
 }
 
 pub fn deinit(self: *Sema) void {

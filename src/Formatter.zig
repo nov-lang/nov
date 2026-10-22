@@ -4,6 +4,7 @@ const Parser = @import("Parser.zig");
 const Tokenizer = @import("Tokenizer.zig");
 const primitives = @import("primitives.zig");
 const Literal = @import("Literal.zig");
+const TypeResolver = @import("TypeResolver.zig");
 
 /// Supports scalar declarations/operators plus function signatures, calls,
 /// local blocks, if/else, loops with optional conditions/continuations, returns,
@@ -150,7 +151,7 @@ fn checkSupported(ast: Ast) !void {
                 for (ast.fullStruct(@intCast(i)).?) |member| {
                     if (ast.nodes.items(.tag)[member] == .container_field) continue;
                     const declaration = ast.fullDecl(member) orelse return error.UnsupportedSyntax;
-                    if (declaration.ast.is_mutable or declaration.ast.type_node == 0 or ast.fullFnProto(declaration.ast.type_node) == null) return error.UnsupportedSyntax;
+                    if (!TypeResolver.isThisAlias(&ast, member) and (declaration.ast.is_mutable or declaration.ast.type_node == 0 or ast.fullFnProto(declaration.ast.type_node) == null)) return error.UnsupportedSyntax;
                 }
             },
             .container_field => if (data.lhs != 0) {
@@ -187,7 +188,7 @@ fn checkSupported(ast: Ast) !void {
             .attr_one => if (data.rhs != 0 or (!std.mem.eql(u8, ast.tokenSlice(data.lhs), "public") and !std.mem.eql(u8, ast.tokenSlice(data.lhs), "noreturn"))) return error.UnsupportedSyntax,
             .builtin_literal => {
                 const name = ast.tokenSlice(main);
-                if (!std.mem.eql(u8, name, "@print") and !std.mem.eql(u8, name, "@println") and !std.mem.eql(u8, name, "@as") and !std.mem.eql(u8, name, "@panic"))
+                if (!std.mem.eql(u8, name, "@print") and !std.mem.eql(u8, name, "@println") and !std.mem.eql(u8, name, "@as") and !std.mem.eql(u8, name, "@panic") and !std.mem.eql(u8, name, "@This"))
                     return error.UnsupportedSyntax;
             },
             .@"break" => if (data.lhs != 0) return error.UnsupportedSyntax,

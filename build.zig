@@ -27,6 +27,12 @@ pub fn build(b: *std.Build) void {
         .strip = strip,
     });
     b.installArtifact(exe);
+    const install_lib = b.addInstallDirectory(.{
+        .source_dir = b.path("lib"),
+        .install_dir = .lib,
+        .install_subdir = "nov",
+    });
+    b.getInstallStep().dependOn(&install_lib.step);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
@@ -37,6 +43,7 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 
     const release = b.step("release", "Make an upstream binary release");
+    release.dependOn(&install_lib.step);
     const release_targets = [_]std.Target.Query{
         .{ .cpu_arch = .aarch64, .os_tag = .macos },
         .{ .cpu_arch = .aarch64, .os_tag = .linux },
@@ -106,6 +113,31 @@ fn addGcTests(b: *std.Build, test_step: *std.Build.Step) void {
 
 fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
+    _ = fixtures.add("library-result-source.nov", @embedFile("lib/result.nov"));
+    // A single-module test harness for the actual library source, not import support.
+    _ = fixtures.add("library-result.nov", @embedFile("lib/result.nov") ++
+        \\
+        \\let R = Result(uint, string)
+        \\let eager: () -> uint = { @print("E")
+        \\    9 }
+        \\let recover: (error: string) -> uint = { @print("F")
+        \\    7 }
+        \\let text: (error: uint) -> string = "fallback:{error}"
+        \\let unit: () -> Result(void, string) = .ok[]
+        \\let fromUnit: () -> R = { unit().!
+        \\    .ok[3] }
+        \\let main: () = {
+        \\    let good: R = .ok[1]
+        \\    let bad: R = .err["missing"]
+        \\    @println(good.unwrapOr(eager()), bad.unwrapOr(9), good.unwrapOrElse(recover), bad.unwrapOrElse(recover))
+        \\    @println(Result(string, uint).err[2].unwrapOrElse(text))
+        \\    @println(fromUnit().unwrapOr(0), match Result(uint, void).err[] {
+        \\        .ok => |value| value
+        \\        .err => @as(uint, 4)
+        \\    })
+        \\}
+        \\
+    );
     _ = fixtures.add("valid.nov", "let answer = 1 + 2 * 3\n");
     _ = fixtures.add("another-valid.nov", "let text = \"hello\"\n");
     _ = fixtures.add("no-final-newline.nov", "let answer = 42");
@@ -142,7 +174,8 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     _ = fixtures.add("record-interpolation-missing.nov", "let R=struct{s:string,}\nlet f:(r:R)->string=\"{r}\"");
     _ = fixtures.add("wide-record-payload.nov", "let U=union{ok:R,}\nlet R=struct{wide:i128,}\nlet f:(u:U)={}\nlet main:()={}");
     _ = fixtures.add("generic-cycle.nov", "let G:(T:type)->type=union{ok:G(T),}\nlet R=G(int)");
-    _ = fixtures.add("generic-method.nov", "let G:(T:type)->type=union{ok:T,\nlet m:(x:T)->T=x\n}");
+    _ = fixtures.add("generic-methods.nov", "let Result:(T:type,E:type)->type=union{ok:T,err:E,\nlet Self=@This()\nlet unwrapOr:(self:Self,fallback:T)->T=match self{.ok=>|v|v\n.err=>fallback}\nlet unwrapOrElse:(self:Self,fallback:(E)->T)->T=match self{.ok=>|v|v\n.err=>|e|fallback(e)}\n}\nlet R=Result(int,string)\nlet cb:(e:string)->int={@print(e)\n7}\nlet main:()={let r:R=.err[\"E\"]\n@println(R.unwrapOr(r,3),r.unwrapOrElse(cb))}");
+    _ = fixtures.add("generic-method.nov", "let G:(T:type)->type=union{ok:T,\nlet m=1\n}");
     _ = fixtures.add("propagation-error.nov", "let G:(T:type,E:type)->type=union{ok:T,err:E,}\nlet f:(r:G(int,string))->G(int,bool)=.ok[r.!]");
     _ = fixtures.add("wide-generic.nov", "let G:(T:type)->type=union{ok:T,err:string,}\nlet f:()->G(i128)=.ok[170141183460469231731687303715884105727]\nlet main:()={}");
     _ = fixtures.add("wide-union.nov", "let U=union{ok:i128,none,}\nlet f:(u:U)={}\nlet main:()={}");
@@ -267,8 +300,11 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         .{ .name = "record payload 128 bit semantic", .args = &.{ "check", "wide-record-payload.nov", "--semantic" }, .exit_code = 0 },
         .{ .name = "record payload backend width", .args = &.{ "emit-c", "wide-record-payload.nov" }, .exit_code = 1, .stderr_match = "C backend only supports 8, 16, 32 and 64-bit integers" },
         .{ .name = "generic union semantic", .args = &.{ "check", "generic-unions.nov", "--semantic" }, .exit_code = 0 },
+        .{ .name = "library Result semantic", .args = &.{ "check", "library-result.nov", "--semantic" }, .exit_code = 0 },
+        .{ .name = "library Result format", .args = &.{ "fmt", "--check", "library-result-source.nov" }, .exit_code = 0 },
+        .{ .name = "generic methods semantic", .args = &.{ "check", "generic-methods.nov", "--semantic" }, .exit_code = 0 },
         .{ .name = "generic cycle", .args = &.{ "check", "generic-cycle.nov", "--semantic" }, .exit_code = 1, .stderr_match = "cyclic generic union instantiation" },
-        .{ .name = "generic method diagnostic", .args = &.{ "check", "generic-method.nov", "--semantic" }, .exit_code = 1, .stderr_match = "generic union methods and container declarations are not supported" },
+        .{ .name = "generic method diagnostic", .args = &.{ "check", "generic-method.nov", "--semantic" }, .exit_code = 1, .stderr_match = "generic union members require an ordinary function signature" },
         .{ .name = "propagation exact error", .args = &.{ "check", "propagation-error.nov", "--semantic" }, .exit_code = 1, .stderr_match = ".! error payload must exactly match" },
         .{ .name = "generic 128 bit semantic", .args = &.{ "check", "wide-generic.nov", "--semantic" }, .exit_code = 0 },
         .{ .name = "generic backend width", .args = &.{ "emit-c", "wide-generic.nov" }, .exit_code = 1, .stderr_match = "C backend only supports 8, 16, 32 and 64-bit integers" },
@@ -465,6 +501,31 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
 
     // An isolated PATH exercises real `zig cc` discovery, independent of host CC.
     for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+        const library_run = b.addRunArtifact(exe);
+        library_run.step.name = b.fmt("CLI: library Result ({s})", .{mode});
+        library_run.setCwd(fixtures.getDirectory());
+        library_run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+        library_run.setEnvironmentVariable("NOV_CC", "");
+        library_run.setEnvironmentVariable("CC", "");
+        library_run.addArgs(&.{ "run", "library-result.nov" });
+        if (mode.len != 0) library_run.addArg(mode);
+        library_run.expectExitCode(0);
+        library_run.expectStdOutEqual("EF1 9 1 7\nfallback:2\n3 4\n");
+        library_run.expectStdErrEqual("");
+        test_step.dependOn(&library_run.step);
+        const generic_method_run = b.addRunArtifact(exe);
+        generic_method_run.step.name = b.fmt("CLI: generic methods ({s})", .{mode});
+        generic_method_run.setCwd(fixtures.getDirectory());
+        generic_method_run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+        generic_method_run.setEnvironmentVariable("NOV_CC", "");
+        generic_method_run.setEnvironmentVariable("CC", "");
+        generic_method_run.addArgs(&.{ "run", "generic-methods.nov" });
+        if (mode.len != 0) generic_method_run.addArg(mode);
+        generic_method_run.expectExitCode(0);
+        generic_method_run.expectStdOutEqual("E3 7\n");
+        generic_method_run.expectStdErrEqual("");
+        test_step.dependOn(&generic_method_run.step);
+
         const instance_run = b.addRunArtifact(exe);
         instance_run.step.name = b.fmt("CLI: instance methods ({s})", .{mode});
         instance_run.setCwd(fixtures.getDirectory());

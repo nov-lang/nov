@@ -1496,6 +1496,226 @@ test "record interpolation conversion allocations fail safely and skipped conver
     }
 }
 
+const generic_method_program =
+    \\let Result:(T:type,E:type)->type=union{
+    \\ok:T,err:E,
+    \\let Self=@This()
+    \\let unwrapOr:(self:Self,fallback:T)->T=match self{.ok=>|v|v
+    \\.err=>fallback}
+    \\let unwrapOrElse:(self:@This(),fallback:(E)->T)->T=match self{.ok=>|v|v
+    \\.err=>|e|fallback(e)}
+    \\let forward:(self:Self,fallback:T)->T=Self.sibling(self,fallback)
+    \\let sibling:(self:Self,fallback:T)->T=unwrapOr(self,fallback)
+    \\let recur:(self:Self,fallback:T,n:int)->T=if n == 0 {self.forward(fallback)} else {recur(self,fallback,n - 1)}
+    \\let toString:(self:Self)->string=match self{.ok=>"ok"
+    \\.err=>"err"}
+    \\}
+    \\let Count=int
+    \\let R=Result(Count,string)
+    \\let Alias=R
+    \\let S=Result(string,int)
+    \\let errorInt:(e:string)->int={@print(e)
+    \\41}
+    \\let errorString:(e:int)->string={@print(e)
+    \\"fall"+"back"}
+    \\let make:()->R={@print("R")
+    \\.err["E"]}
+    \\let makeFallback:()->int={@print("F")
+    \\7}
+    \\let main:()={
+    \\let ok:R=.ok[3]
+    \\let err:Alias=.err["E"]
+    \\let text:S=.err[5]
+    \\let cb:(string)->int=errorInt
+    \\let method:(R,int)->int=Alias.unwrapOr
+    \\@println(ok.unwrapOr(9)," ",R.unwrapOr(err,8)," ",method(ok,0))
+    \\@println(ok.unwrapOrElse(cb)," ",err.unwrapOrElse(cb))
+    \\@println(text.unwrapOrElse(errorString))
+    \\@println(make().unwrapOr(makeFallback()))
+    \\@println(err.recur(6,3)," ",ok," ",text)
+    \\}
+;
+
+const generic_method_output = "3   8   3\nE3   41\n5fallback\nRF7\n6   ok   err\n";
+
+test "generic union ordinary methods specialize callbacks siblings recursion and printable signatures" {
+    var sema = blk: {
+        var module = try Module.init(test_gpa, "generic-method.nov", generic_method_program);
+        defer module.deinit();
+        if (module.hasErrors()) std.debug.print("parse {any} collection {any}\n", .{ module.ast.errors, module.diagnostics.items });
+        var result = try Lowering.lower(&module);
+        errdefer result.deinit();
+        if (module.hasErrors()) std.debug.print("generic methods: {any}\n", .{module.diagnostics.items});
+        try std.testing.expect(result.lowering_complete);
+        break :blk result;
+    };
+    defer sema.deinit();
+    try sema.ir.verify();
+    const c = try emitProgram(test_gpa, &sema.ir, null);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, generic_method_output, "", mode);
+    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{generic_method_program});
+}
+
+test "generic methods preserve formatter identity and roots under forced collection" {
+    const c = try arrayTestProgram(generic_method_program);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, generic_method_output, "", mode);
+}
+
+test "generic methods root allocated record payload copies across later arguments" {
+    const source =
+        \\let G:(T:type,E:type)->type=union{ok:T,err:E,
+        \\let unwrapOr:(self:@This(),fallback:T)->T=match self{.ok=>|v|v
+        \\.err=>fallback}
+        \\}
+        \\let Pair=struct{s:string,n:int,}
+        \\let R=G(Pair,string)
+        \\let S=G(string,bool)
+        \\let make:()->R=.ok[Pair[.s="a"+"b",.n=7]]
+        \\let later:()->Pair=Pair[.s="c"+"d",.n=9]
+        \\let consume:(p:Pair,s:string)=@println(p.s,p.n,s)
+        \\let main:()={
+        \\let mut original=make()
+        \\let copy=original
+        \\original=.err["discard"+"ed"]
+        \\loop i in 0..3 {consume(copy.unwrapOr(later()),"e"+"f")
+        \\let text:S=.ok["g"+"h"]
+        \\@println(text.unwrapOr("i"+"j"),i)}
+        \\}
+    ;
+    const c = try arrayTestProgram(source);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "ab 7 ef\ngh 0\nab 7 ef\ngh 1\nab 7 ef\ngh 2\n", "", mode);
+    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{source});
+}
+
+test "generic method terminal branches and noreturn methods retain void annotations" {
+    const source =
+        \\let G:(T:type)->type=union{ok:T,err:string,
+        \\let Self=@This()
+        \\let get:(self:Self)->T=match self{.ok=>|v|{return v}
+        \\.err=>|e|@panic(e)}
+        \\@[noreturn]
+        \\let halt:(self:Self,message:string)->void=@panic(message)
+        \\let stop:(self:Self)->T={Self.halt(self,"stopped")}
+        \\}
+        \\let R=G(int)
+        \\let main:()={let r:R=.ok[7]
+        \\@println(r.get())
+        \\r.halt("done")}
+    ;
+    const c = try arrayTestProgram(source);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 1, "7\n", "panic: done\n", mode);
+    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{source});
+}
+
+test "generic callback methods allocate only in selected ordinary bodies and report runtime OOM" {
+    for ([_]bool{ false, true }) |allocate| {
+        const source = try std.fmt.allocPrint(test_gpa, "let G:(T:type,E:type)->type=union{{ok:T,err:E,\nlet unwrapOrElse:(self:@This(),fallback:(E)->T)->T=match self{{.ok=>|v|v\n.err=>|e|fallback(e)}}\n}}\nlet R=G(string,string)\nlet cb:(e:string)->string={s}\nlet main:()={{let r:R=.err[\"err\"]\n@println(r.unwrapOrElse(cb))}}", .{if (allocate) "e+\"!\"" else "e"});
+        defer test_gpa.free(source);
+        const library = try emitSource(source, null);
+        defer test_gpa.free(library);
+        const program = try collectingTestProgram(library);
+        defer test_gpa.free(program);
+        const exhausted = try std.mem.concat(test_gpa, u8, &.{ "#include <stdlib.h>\nstatic void *test_malloc(size_t n) { (void)n; return NULL; }\n#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n", program });
+        defer test_gpa.free(exhausted);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(exhausted, "typedef int nonempty_translation_unit;", if (allocate) 1 else 0, if (allocate) "" else "err\n", if (allocate) "panic: GC allocation failed\n" else "", mode);
+    }
+}
+
+const demand_void_result_program =
+    \\@[public]
+    \\let Result:(T:type,E:type)->type=union{ok:T,err:E,
+    \\let Self=@This()
+    \\@[public]
+    \\let unwrapOr:(self:Self,fallback:T)->T=match self{.ok=>|v|v
+    \\.err=>fallback}
+    \\@[public]
+    \\let unwrapOrElse:(self:Self,fallback:(E)->T)->T=match self{.ok=>|v|v
+    \\.err=>|e|fallback(e)}
+    \\}
+    \\let Unit=Result(void,string)
+    \\let Empty=Result(int,void)
+    \\let Both=Result(void,void)
+    \\let unit:(b:bool)->Unit=if b{.ok[]}else{.err["err"+"!"]}
+    \\let run:(b:bool)->Result(int,string)={let v:void=unit(b).!
+    \\.ok[2]}
+    \\let makeEmpty:(b:bool)->Empty=if b{.ok[5]}else{.err[]}
+    \\let remap:(b:bool)->Result(bool,void)=.ok[makeEmpty(b).! == 5]
+    \\let both:()->Both=.err[]
+    \\let main:()={
+    \\@println(match run(true){.ok=>|v|v
+    \\.err=>0})
+    \\@println(match run(false){.ok=>"bad"
+    \\.err=>|e|e})
+    \\@println(makeEmpty(true).unwrapOr(9),makeEmpty(false).unwrapOr(9))
+    \\@println(match remap(false){.ok=>"bad"
+    \\.err=>"empty"},match both(){.ok=>"bad"
+    \\.err=>"both"})}
+;
+
+test "demand generic void Results retain source free ownership formatter roots and OOM safety" {
+    var sema = blk: {
+        var module = try Module.init(test_gpa, "demand-void-result.nov", demand_void_result_program);
+        defer module.deinit();
+        var result = try Lowering.lower(&module);
+        errdefer result.deinit();
+        try std.testing.expect(result.lowering_complete);
+        try std.testing.expectEqual(@as(usize, 7), result.ir.functions.items.len);
+        break :blk result;
+    };
+    defer sema.deinit();
+    try sema.ir.verify();
+    const library = try emit(test_gpa, &sema.ir, null);
+    defer test_gpa.free(library);
+    const program = try collectingTestProgram(library);
+    defer test_gpa.free(program);
+    const formatted = try arrayTestProgram(demand_void_result_program);
+    defer test_gpa.free(formatted);
+    try std.testing.expectEqualStrings(program, formatted);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(program, "typedef int nonempty_translation_unit;", 0, "2\nerr!\n5 9\nempty both\n", "", mode);
+    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{demand_void_result_program});
+}
+
+test "demand generic method body worklist discovers new containers callbacks and earlier siblings" {
+    const source =
+        \\let G:(T:type,E:type)->type=union{ok:T,err:E,
+        \\let Self=@This()
+        \\let identity:(self:Self,fallback:T)->T=match self{.ok=>|v|v
+        \\.err=>fallback}
+        \\let get:(self:Self,fallback:T)->T=identity(self,fallback)
+        \\let toString:(self:Self)->string={
+        \\let flag:G(bool,E)=.ok[true]
+        \\let cb:(G(bool,E),bool)->bool=G(bool,E).get
+        \\if cb(flag,false){"yes"+"!"}else{"no"}}
+        \\let unused:(x:void)->T=missing
+        \\let expand:()->G((T)->T)=G((T)->T).expand()
+        \\}
+        \\let R=G(int,string)
+        \\let main:()={let r:R=.ok[1]
+        \\@println("{r}")}
+    ;
+    var sema = blk: {
+        var module = try Module.init(test_gpa, "demand-closure.nov", source);
+        defer module.deinit();
+        var result = try Lowering.lower(&module);
+        errdefer result.deinit();
+        try std.testing.expect(result.lowering_complete);
+        try std.testing.expectEqual(@as(usize, 4), result.ir.functions.items.len);
+        break :blk result;
+    };
+    defer sema.deinit();
+    try sema.ir.verify();
+    const library = try emit(test_gpa, &sema.ir, null);
+    defer test_gpa.free(library);
+    const program = try collectingTestProgram(library);
+    defer test_gpa.free(program);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(program, "typedef int nonempty_translation_unit;", 0, "yes!\n", "", mode);
+    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{source});
+}
+
 const generic_union_output = "PSPok:value:7 err:error\nPPbool:true err:error\nok:ab err:cd\n";
 
 test "generic unions and structural propagation preserve identities effects and forced GC" {

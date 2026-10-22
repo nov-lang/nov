@@ -15,6 +15,41 @@ pub fn resolve(module: *Module, ir: *Ir, node: Ast.Node.Index) Error!?Ir.TypeId 
     return resolveWith(module, ir, node, &.{}, 0);
 }
 
+pub fn resolveInContainer(module: *Module, ir: *Ir, node: Ast.Node.Index, owner: ?Module.DeclId, concrete: ?u32) Error!?Ir.TypeId {
+    const container = owner orelse return resolve(module, ir, node);
+    var bindings: std.ArrayList(Binding) = .empty;
+    defer bindings.deinit(module.allocator);
+    const declaration = module.getDeclaration(container).?;
+    const full = module.ast.decl(declaration.node).ast;
+    const this_type = if (concrete) |id| @as(Ir.TypeId, @enumFromInt(id)) else (try resolve(module, ir, full.init_node)) orelse return null;
+    try bindings.append(module.allocator, .{ .name = "@This", .ty = this_type });
+    if (concrete != null) {
+        const args = ir.getType(this_type).?.record.type_args;
+        var iterator = module.ast.fullFnProto(full.type_node).?.iterate(&module.ast);
+        for (args) |arg| try bindings.append(module.allocator, .{ .name = module.ast.tokenSlice(iterator.next().?.name_token.?), .ty = arg });
+    }
+    for (module.ast.fullStruct(full.init_node).?) |member| {
+        const alias = module.ast.fullDecl(member) orelse continue;
+        if (!isThisAlias(&module.ast, member)) continue;
+        try bindings.append(module.allocator, .{ .name = module.ast.tokenSlice(alias.ast.let_token + 1), .ty = this_type });
+    }
+    var expansions: usize = 0;
+    if (concrete) |id| {
+        for (module.declarations.items) |method| if (method.concrete_type == id) {
+            expansions = method.specialization_depth;
+            break;
+        };
+    }
+    return resolveWith(module, ir, node, bindings.items, expansions);
+}
+
+pub fn isThisAlias(ast: *const Ast, node: Ast.Node.Index) bool {
+    const decl = ast.fullDecl(node) orelse return false;
+    if (decl.ast.is_mutable or decl.ast.type_node != 0 or decl.ast.init_node == 0) return false;
+    const call = ast.fullCall(decl.ast.init_node) orelse return false;
+    return call.ast.args.len == 0 and std.mem.eql(u8, ast.tokenSlice(ast.firstToken(call.ast.fn_expr)), "@This");
+}
+
 const Binding = struct { name: []const u8, ty: Ir.TypeId };
 const Environment = struct { bindings: []const Binding, expansions: usize };
 pub const max_instantiation_depth = 64;
@@ -140,7 +175,12 @@ fn resolveDepth(module: *Module, ir: *Ir, node: Ast.Node.Index, depth: usize, al
         if (!Ir.isArrayElement(ir.getType(element).?)) return diagnose(module, node, .unsupported_type);
         return try ir.internType(.{ .array = element });
     }
-    if (ast.fullCall(node)) |call| return instantiate(module, ir, call, node, depth, aliases, env);
+    if (ast.fullCall(node)) |call| {
+        if (call.ast.args.len == 0 and std.mem.eql(u8, ast.tokenSlice(ast.firstToken(call.ast.fn_expr)), "@This")) {
+            return lookupBinding(env.bindings, "@This") orelse diagnose(module, node, .unsupported_type);
+        }
+        return instantiate(module, ir, call, node, depth, aliases, env);
+    }
     if (ast.fullStruct(node) != null) {
         for (module.declarations.items, 0..) |declaration, i| {
             if (declaration.is_record and ast.decl(declaration.node).ast.init_node == node) {
@@ -279,12 +319,21 @@ pub fn validateGeneric(module: *Module, id: Module.DeclId) Error!bool {
     defer fields.deinit(module.allocator);
     for (ast.fullStruct(full.init_node).?) |member| {
         if (ast.nodes.items(.tag)[member] != .container_field) {
-            _ = try diagnose(module, member, .unsupported_generic_method);
+            const member_decl = ast.fullDecl(member);
+            if (member_decl) |decl| {
+                const member_name = ast.tokenSlice(decl.ast.let_token + 1 + @as(u32, @intFromBool(decl.ast.is_mutable)));
+                if (names.contains(member_name)) _ = try diagnose(module, member, .unsupported_shadowing);
+            }
+            if (isThisAlias(ast, member)) continue;
+            const method = ast.fullDecl(member);
+            if (method == null or method.?.ast.is_mutable or ast.fullFnProto(method.?.ast.type_node) == null)
+                _ = try diagnose(module, member, .unsupported_generic_method);
             continue;
         }
         const token = ast.nodes.items(.main_token)[member];
         const name = ast.tokenSlice(token);
         const span = module.tokenSpan(token);
+        if (module.lookupMethod(id, name) != null or names.contains(name)) _ = try diagnose(module, member, .duplicate_field);
         const entry = try fields.getOrPut(module.allocator, name);
         if (entry.found_existing) try module.diagnostics.append(module.allocator, .{ .tag = .duplicate_field, .span = span, .related = entry.value_ptr.* }) else entry.value_ptr.* = span;
         const data = ast.nodes.items(.data)[member];
@@ -338,6 +387,7 @@ fn instantiate(module: *Module, ir: *Ir, call: Ast.full.Call, node: Ast.Node.Ind
     var fields: std.ArrayList(Ir.Field) = .empty;
     defer fields.deinit(module.allocator);
     for (ast.fullStruct(full.init_node).?) |member| {
+        if (ast.nodes.items(.tag)[member] != .container_field) continue;
         const data = ast.nodes.items(.data)[member];
         const field_ty = if (data.lhs == 0) try ir.internType(.void) else (try resolveWith(module, ir, data.lhs, bindings, env.expansions + 1)) orelse return null;
         const ft = ir.getType(field_ty).?;
@@ -349,6 +399,17 @@ fn instantiate(module: *Module, ir: *Ir, call: Ast.full.Call, node: Ast.Node.Ind
     try ir.setRecordFields(ty, fields.items);
     ir.types.items[@intFromEnum(ty)].record.instance_state = .complete;
     complete = true;
+    // Specialized declarations retain source ASTs but have distinct stable IDs.
+    // Publish all siblings together before any signature or body is checked.
+    const count = module.declarations.items.len;
+    for (0..count) |i| {
+        var method = module.declarations.items[i];
+        if (method.container != id or method.concrete_type != null) continue;
+        if (module.declarations.items.len == std.math.maxInt(u32)) return error.TooManyEntries;
+        method.concrete_type = @intFromEnum(ty);
+        method.specialization_depth = env.expansions + 1;
+        try module.declarations.append(module.allocator, method);
+    }
     return ty;
 }
 

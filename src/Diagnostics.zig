@@ -52,7 +52,7 @@ pub fn renderModule(module: *const Module, writer: *std.Io.Writer) !void {
             .generic_argument_count => try writer.writeAll("type argument count does not match the generic union declaration"),
             .generic_cycle => try writer.writeAll("cyclic generic union instantiation"),
             .generic_limit => try writer.writeAll("generic union expansion exceeds the current limit of 64"),
-            .unsupported_generic_method => try writer.writeAll("generic union methods and container declarations are not supported yet; use an explicitly typed external function"),
+            .unsupported_generic_method => try writer.writeAll("generic union members require an ordinary function signature or an immutable @This() alias"),
             .invalid_propagation_operand => try writer.writeAll(".! requires a union with exactly ok and err variants"),
             .invalid_propagation_return => try writer.writeAll(".! requires an enclosing function returning a union with exactly ok and err variants"),
             .propagation_error_mismatch => try writer.writeAll(".! error payload must exactly match the enclosing union's err type"),

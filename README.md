@@ -711,8 +711,8 @@ The delivered subset is deliberately bounded:
   control flow, including through instance syntax.
   Existing fields take precedence over method lookup; array/string `.len` is not
   a method. A bare `item.method` does not create a bound function or closure;
-  explicit `Type.method` remains an ordinary unbound function value. Generic
-  methods remain unsupported.
+  explicit `Type.method` remains an ordinary unbound function value. Concrete
+  generic union instances support these same method calls.
   Container constants, nested type declarations, generics, general type values,
   struct global instances and C FFI are unsupported.
 - Printing requires exactly the container method `toString: (MyType) -> string`.
@@ -900,8 +900,20 @@ arguments produces the same nominal type. Distinct templates or different type
 arguments remain distinct, even with identical layouts. Expansion is bounded at
 64 levels, with alias traversal bounded at 128. Only plain named `type` parameters
 are supported in this slice, not value parameters, `#type`, general compile-time
-execution or generic functions returning runtime values. Generic methods/container
-declarations (including `@This()`) and generic structs remain unsupported; instantiated
+execution or generic functions returning runtime values. Generic union methods
+specialize by canonical concrete container type; aliases share specializations and
+different type arguments remain isolated. `@This()` and immutable
+`let Self = @This()` container aliases refer to that concrete type. Static and
+instance calls, callback function values, and recursive/forward/sibling calls use
+the ordinary exact typing, evaluation-order, copy and rooting contracts.
+
+Signatures and bodies are checked on demand when a concrete method is referenced,
+called, or required for `toString` conversion. Unused methods do not invalidate an
+otherwise valid type instance; requested methods still undergo full checking.
+This preserves void-payload Result construction/propagation without permitting
+void parameters. Method discovery and specialization are bounded; failed checking
+never exposes partial executable IR. Generic structs, general container constants,
+value parameters and general compile-time execution remain unsupported; instantiated
 union payloads retain the restrictions above.
 
 The following broader generic-struct example remains design-only.
@@ -954,8 +966,23 @@ operator rule, not special handling of a type named `Result`. Void payloads work
 Outside propagation, construct returns explicitly with `.ok[value]` or
 `.err[error]`; bare payload returns remain type errors.
 
-Option-style `some`/`none` propagation is not yet implemented. The generic methods
-in the broader definitions below also remain design-only.
+Option-style `some`/`none` propagation is not yet implemented. Ordinary generic
+union methods in the definitions below, including `unwrapOr`/`unwrapOrElse` and
+`@This()`, are supported.
+
+#### Standard-library foundation
+
+[`lib/result.nov`](lib/result.nov) provides the ordinary generic `Result` definition
+with public `unwrapOr` and `unwrapOrElse` methods. `unwrapOr` evaluates its fallback
+as an ordinary argument even on success. `unwrapOrElse` evaluates the callback
+value normally but calls its body only on error. Neither requires a Result builtin.
+
+The build installs `lib/` at `<prefix>/lib/nov`, and tests exercise the actual
+library source in single-module harnesses. **Imports are not implemented yet**:
+there is no automatic Result injection or library-path lookup, and the existing
+examples retain local definitions for now. See [`lib/README.md`](lib/README.md)
+for this integration boundary. A source-qualified multi-file compilation layer
+must precede consuming this module through `@import`.
 
 `examples/error.nov` now uses `.!` and explicit Result returns, with its alternative
 implementations commented out. It is still a filesystem design example, not an
@@ -1762,13 +1789,12 @@ never static byte pointers. Temporaries use the same precise root frames as arra
 an immutable `string`. Placeholders support `bool` (`true`/`false`), signed and
 unsigned fixed-width integers (`i8`/`u8` through `i64`/`u64`), native `int`/`uint`
 (exact decimal, including minimum/maximum values), and strings (unchanged bytes).
-Nominal enums, structs and non-generic unions also work when they define the exact
+Nominal enums, structs and concrete generic or non-generic unions also work when they define the exact
 container `toString: (SelfType) -> string` method already required by print.
 Each placeholder expression evaluates once, then converts once immediately before
 proceeding to the next chunk or placeholder. Aliases preserve the exact signature;
 allocating converters and managed payloads stay rooted. Missing/wrong converters
-diagnose; no derived formatting, global overload lookup or generic methods are
-introduced. Terminal expressions skip conversion and later placeholder effects.
+diagnose; no derived formatting or global overload lookup is introduced. Terminal expressions skip conversion and later placeholder effects.
 No numeric defaults, widening or implicit fallback formatting are introduced.
 
 ```nov

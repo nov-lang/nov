@@ -28,17 +28,23 @@ const max_recursive_depth = 128;
 /// Requires the complete, valid annotation table produced by Sema/TypeResolver.
 /// The caller owns rollback of diagnostics and IR allocations on failure.
 pub fn check(module: *Module, ir: *Ir, types: []const ?Ir.TypeId, id: Module.DeclId) Error!bool {
-    return checkInner(module, ir, types, id, null);
+    return checkInner(module, ir, types, id, null, null);
+}
+
+/// Checks against a resizable semantic table, requesting concrete signatures
+/// as references are encountered. Requested bodies are handled by Sema's queue.
+pub fn checkDemand(module: *Module, sema: *Sema, id: Module.DeclId) Error!bool {
+    return checkInner(module, &sema.ir, &.{}, id, null, sema);
 }
 
 /// Reuses the checked walk to emit values in callee/argument and operand order.
-/// Source length and all function identities must already be registered in IR.
+/// Source length and all requested function identities must already exist in IR.
 pub fn lower(module: *Module, ir: *Ir, types: []const ?Ir.TypeId, constants: []const ?Ir.ConstId, functions: []const ?Ir.FunctionId, id: Module.DeclId) Error!bool {
     if (constants.len != types.len or functions.len != types.len) return error.InvalidFunctionId;
     var arena = std.heap.ArenaAllocator.init(module.allocator);
     defer arena.deinit();
     var emitter: Emitter = .{ .allocator = arena.allocator(), .constants = constants, .functions = functions };
-    if (!try checkInner(module, ir, types, id, &emitter)) return false;
+    if (!try checkInner(module, ir, types, id, &emitter, null)) return false;
     const body_node = module.ast.decl(module.getDeclaration(id).?.node).ast.init_node;
     const result = emitter.values.get(body_node) orelse return error.InvalidValueId;
     const function = functions[@intFromEnum(id)] orelse return error.InvalidFunctionId;
@@ -71,16 +77,16 @@ const Emitter = struct {
     }
 };
 
-fn checkInner(module: *Module, ir: *Ir, types: []const ?Ir.TypeId, id: Module.DeclId, emitter: ?*Emitter) Error!bool {
-    if (types.len != module.declarations.items.len) return error.InvalidTypeId;
+fn checkInner(module: *Module, ir: *Ir, types: []const ?Ir.TypeId, id: Module.DeclId, emitter: ?*Emitter, sema: ?*Sema) Error!bool {
+    if (sema == null and types.len != module.declarations.items.len) return error.InvalidTypeId;
     const declaration = module.getDeclaration(id) orelse return error.InvalidTypeId;
-    const type_id = types[@intFromEnum(id)] orelse return false;
+    const type_id = (if (sema) |analysis| try analysis.requestType(module, id) else types[@intFromEnum(id)]) orelse return false;
     const ty = ir.getType(type_id) orelse return error.InvalidTypeId;
     if (ty != .function) return error.InvalidTypeId;
     const full = module.ast.decl(declaration.node);
     const proto = module.ast.fullFnProto(full.ast.type_node) orelse return error.InvalidTypeId;
     if (proto.ast.params.len != ty.function.params.len) return error.InvalidTypeId;
-    var context: Context = .{ .module = module, .ir = ir, .types = types, .emitter = emitter, .container = declaration.container };
+    var context: Context = .{ .module = module, .ir = ir, .types = types, .emitter = emitter, .container = declaration.container, .concrete_type = declaration.concrete_type, .sema = sema };
     defer context.bindings.deinit(module.allocator);
     defer context.locals.deinit(module.allocator);
     var iterator = proto.iterate(&module.ast);
@@ -90,8 +96,8 @@ fn checkInner(module: *Module, ir: *Ir, types: []const ?Ir.TypeId, id: Module.De
         if (param.name_token) |token| {
             const name = module.ast.tokenSlice(token);
             const span = module.tokenSpan(token);
-            if (context.valueDeclaration(name) != null or isPrimitive(name)) {
-                const related = if (context.valueDeclaration(name)) |other| module.getDeclaration(other).?.name_span else null;
+            if (context.conflict(name) != null or isPrimitive(name)) {
+                const related = context.conflict(name);
                 try module.diagnostics.append(module.allocator, .{ .tag = .unsupported_shadowing, .span = span, .related = related });
                 valid = false;
                 continue;
@@ -134,8 +140,10 @@ const Context = struct {
     module: *Module,
     ir: *Ir,
     types: []const ?Ir.TypeId,
+    sema: ?*Sema = null,
     emitter: ?*Emitter = null,
     container: ?Module.DeclId = null,
+    concrete_type: ?u32 = null,
     return_type: Known = undefined,
     // Termination is independent of the contextual value type. A terminal
     // expression has no merge value, and enclosing expressions alias its exit.
@@ -156,13 +164,22 @@ const Context = struct {
     }
 
     fn valueDeclaration(self: *Context, name: []const u8) ?Module.DeclId {
-        if (self.container) |owner| if (self.module.lookupMethod(owner, name)) |id| return id;
+        if (self.container) |owner| if (self.module.lookupConcreteMethod(owner, self.concrete_type, name)) |id| return id;
         return self.module.lookup(name);
     }
 
     fn conflict(self: *Context, name: []const u8) ?Module.Span {
         if (self.bindings.get(name)) |binding| return binding.name_span;
         if (self.valueDeclaration(name)) |id| return self.module.getDeclaration(id).?.name_span;
+        if (self.concrete_type != null) {
+            const owner = self.module.getDeclaration(self.container.?).?;
+            const full = self.module.ast.decl(owner.node).ast;
+            var iterator = self.module.ast.fullFnProto(full.type_node).?.iterate(&self.module.ast);
+            while (iterator.next()) |param| {
+                const token = param.name_token.?;
+                if (std.mem.eql(u8, name, self.module.ast.tokenSlice(token))) return self.module.tokenSpan(token);
+            }
+        }
         return null;
     }
 
@@ -201,7 +218,7 @@ const Context = struct {
             return false;
         }
         const annotation: ?Known = if (decl.type_node != 0) .{
-            .ty = (try TypeResolver.resolve(self.module, self.ir, decl.type_node)) orelse return false,
+            .ty = (try TypeResolver.resolveInContainer(self.module, self.ir, decl.type_node, self.container, self.concrete_type)) orelse return false,
             .annotation = self.module.tokenSpan(ast.firstToken(decl.type_node)),
         } else null;
         if (decl.is_mutable and annotation != null and self.ir.getType(annotation.?.ty).? == .void) {
@@ -268,7 +285,7 @@ const Context = struct {
                 const name = ast.tokenSlice(token);
                 if (self.conflict(name) != null or isPrimitive(name)) return null;
                 const known: Known = if (decl.type_node != 0)
-                    .{ .ty = (try TypeResolver.resolve(self.module, self.ir, decl.type_node)) orelse return null }
+                    .{ .ty = (try TypeResolver.resolveInContainer(self.module, self.ir, decl.type_node, self.container, self.concrete_type)) orelse return null }
                 else if (decl.init_node != 0)
                     (try self.probe(decl.init_node, depth + 1)) orelse return null
                 else
@@ -316,7 +333,7 @@ const Context = struct {
                         const name = ast.tokenSlice(token);
                         if (self.conflict(name) != null or isPrimitive(name)) return null;
                         const known: ?Known = if (decl.type_node != 0)
-                            if (try TypeResolver.resolve(self.module, self.ir, decl.type_node)) |ty| .{ .ty = ty } else null
+                            if (try TypeResolver.resolveInContainer(self.module, self.ir, decl.type_node, self.container, self.concrete_type)) |ty| .{ .ty = ty } else null
                         else if (decl.init_node != 0) try self.probe(decl.init_node, depth + 1) else null;
                         if (known) |value| try self.bindLocal(name, .{ .known = value, .name_span = self.module.tokenSpan(token) });
                     } else {
@@ -404,8 +421,8 @@ const Context = struct {
         return ty;
     }
 
-    fn globalType(self: *Context, id: Module.DeclId) ?Known {
-        const ty = self.types[@intFromEnum(id)] orelse return null;
+    fn globalType(self: *Context, id: Module.DeclId) Error!?Known {
+        const ty = (if (self.sema) |analysis| try analysis.requestType(self.module, id) else if (@intFromEnum(id) < self.types.len) self.types[@intFromEnum(id)] else null) orelse return null;
         const full = self.module.ast.decl(self.module.getDeclaration(id).?.node);
         return .{ .ty = ty, .annotation = if (full.ast.type_node != 0) self.module.tokenSpan(self.module.ast.firstToken(full.ast.type_node)) else null };
     }
@@ -419,7 +436,7 @@ const Context = struct {
     fn ascribedType(self: *Context, call: Ast.full.Call) Error!?Known {
         if (call.ast.args.len != 2) return null;
         const node = call.ast.args[0];
-        const ty = (try TypeResolver.resolve(self.module, self.ir, node)) orelse return null;
+        const ty = (try TypeResolver.resolveInContainer(self.module, self.ir, node, self.container, self.concrete_type)) orelse return null;
         return .{ .ty = ty, .annotation = self.span(node) };
     }
 
@@ -427,17 +444,22 @@ const Context = struct {
         const ast = &self.module.ast;
         if (ast.nodes.items(.tag)[node] != .field_access) return null;
         const data = ast.nodes.items(.data)[node];
-        if (ast.nodes.items(.tag)[data.lhs] != .identifier) return null;
-        const id = self.module.lookup(ast.tokenSlice(ast.firstToken(data.lhs))) orelse return null;
-        if (!self.module.getDeclaration(id).?.is_type_alias) return null;
-        const ty = (try TypeResolver.resolve(self.module, self.ir, data.lhs)) orelse return null;
+        if (ast.nodes.items(.tag)[data.lhs] == .identifier) {
+            const name = ast.tokenSlice(ast.firstToken(data.lhs));
+            if (self.bindings.contains(name)) return null;
+            const id = self.valueDeclaration(name) orelse return null;
+            if (!self.module.getDeclaration(id).?.is_type_alias and !TypeResolver.isThisAlias(ast, self.module.getDeclaration(id).?.node)) return null;
+        } else if (ast.fullCall(data.lhs)) |call| {
+            if (TypeResolver.genericTarget(self.module, call.ast.fn_expr) == null and !std.mem.eql(u8, ast.tokenSlice(ast.firstToken(call.ast.fn_expr)), "@This")) return null;
+        } else return null;
+        const ty = (try TypeResolver.resolveInContainer(self.module, self.ir, data.lhs, self.container, self.concrete_type)) orelse return null;
         const record = self.ir.getType(ty).?;
         const identity = switch (record) {
             .record => record.record.identity,
             .enumeration => record.enumeration.identity,
             else => return null,
         };
-        return self.module.lookupMethod(@enumFromInt(identity), ast.tokenSlice(data.rhs));
+        return self.module.lookupConcreteMethod(@enumFromInt(identity), if (record == .record and record.record.type_args.len != 0) @intFromEnum(ty) else null, ast.tokenSlice(data.rhs));
     }
 
     fn receiverMethod(self: *Context, ty: Ir.TypeId, name: []const u8) ?Module.DeclId {
@@ -448,7 +470,7 @@ const Context = struct {
             .enumeration => container.enumeration.identity,
             else => return null,
         };
-        return self.module.lookupMethod(@enumFromInt(identity), name);
+        return self.module.lookupConcreteMethod(@enumFromInt(identity), if (container == .record and container.record.type_args.len != 0) @intFromEnum(ty) else null, name);
     }
 
     fn directNoreturn(self: *Context, node: Ast.Node.Index) Error!bool {
@@ -486,11 +508,11 @@ const Context = struct {
             _ = try self.fail(.unsupported_body_expression, node, null);
             return false;
         }
-        const method = self.module.lookupMethod(@enumFromInt(if (record == .enumeration) record.enumeration.identity else record.record.identity), "toString") orelse {
+        const method = self.module.lookupConcreteMethod(@enumFromInt(if (record == .enumeration) record.enumeration.identity else record.record.identity), if (record == .record and record.record.type_args.len != 0) @intFromEnum(ty) else null, "toString") orelse {
             _ = try self.fail(.invalid_to_string, node, null);
             return false;
         };
-        const signature_id = self.types[@intFromEnum(method)] orelse {
+        const signature_id = if (try self.globalType(method)) |known| known.ty else {
             _ = try self.fail(.invalid_to_string, node, null);
             return false;
         };
@@ -519,15 +541,15 @@ const Context = struct {
         if (ast.nodes.items(.tag)[base] != .field_access) return null;
         const qualifier = ast.nodes.items(.data)[base].lhs;
         if (ast.fullCall(qualifier)) |call| {
-            if (TypeResolver.genericTarget(self.module, call.ast.fn_expr) == null) return null;
+            if (TypeResolver.genericTarget(self.module, call.ast.fn_expr) == null and !std.mem.eql(u8, ast.tokenSlice(ast.firstToken(call.ast.fn_expr)), "@This")) return null;
         } else {
             if (ast.nodes.items(.tag)[qualifier] != .identifier) return null;
             const name = ast.tokenSlice(ast.firstToken(qualifier));
             if (self.bindings.contains(name)) return null;
-            const id = self.module.lookup(name) orelse return null;
-            if (!self.module.getDeclaration(id).?.is_type_alias) return null;
+            const id = self.valueDeclaration(name) orelse return null;
+            if (!self.module.getDeclaration(id).?.is_type_alias and !TypeResolver.isThisAlias(ast, self.module.getDeclaration(id).?.node)) return null;
         }
-        const ty = (try TypeResolver.resolve(self.module, self.ir, qualifier)) orelse return null;
+        const ty = (try TypeResolver.resolveInContainer(self.module, self.ir, qualifier, self.container, self.concrete_type)) orelse return null;
         return if (self.tagged(ty)) ty else null;
     }
 
@@ -591,7 +613,7 @@ const Context = struct {
     fn recordInit(self: *Context, node: Ast.Node.Index, expected: ?Known, depth: usize) Error!?Ir.TypeId {
         const ast = &self.module.ast;
         const init = ast.fullStructInit(node).?;
-        const ty = (try TypeResolver.resolve(self.module, self.ir, init.type_node)) orelse return null;
+        const ty = (try TypeResolver.resolveInContainer(self.module, self.ir, init.type_node, self.container, self.concrete_type)) orelse return null;
         const record = self.ir.getType(ty).?;
         if (record != .record) return self.fail(.not_a_type, init.type_node, null);
         if (record.record.tagged) return self.fail(.invalid_union_constructor, node, null);
@@ -643,7 +665,7 @@ const Context = struct {
             .identifier => blk: {
                 const name = self.module.sourceSlice(self.span(node)).?;
                 if (self.bindings.get(name)) |binding| break :blk binding.known;
-                if (self.valueDeclaration(name)) |id| break :blk self.globalType(id);
+                if (self.valueDeclaration(name)) |id| break :blk try self.globalType(id);
                 if (std.mem.eql(u8, name, "true") or std.mem.eql(u8, name, "false")) break :blk .{ .ty = try self.ir.internType(.boolean) };
                 break :blk null;
             },
@@ -663,12 +685,12 @@ const Context = struct {
             .container_decl_arg => blk: {
                 if (ast.nodes.items(.tag)[data.lhs] == .enum_literal) break :blk null;
                 if (try self.qualifiedUnion(data.lhs)) |ty| break :blk .{ .ty = ty };
-                const ty = (try TypeResolver.resolve(self.module, self.ir, data.lhs)) orelse break :blk null;
+                const ty = (try TypeResolver.resolveInContainer(self.module, self.ir, data.lhs, self.container, self.concrete_type)) orelse break :blk null;
                 break :blk .{ .ty = ty };
             },
             .field_access => blk: {
                 if (try Literal.qualifiedEnum(self.module, self.ir, node)) |ty| break :blk .{ .ty = ty };
-                if (try self.staticMethod(node)) |id| break :blk self.globalType(id);
+                if (try self.staticMethod(node)) |id| break :blk try self.globalType(id);
                 const base = (try self.probe(data.lhs, depth + 1)) orelse break :blk null;
                 if (self.fieldIndex(base.ty, ast.tokenSlice(data.rhs))) |index| break :blk .{ .ty = self.ir.getType(base.ty).?.record.fields[index].ty };
                 break :blk if (std.mem.eql(u8, ast.tokenSlice(data.rhs), "len")) .{ .ty = try self.ir.internType(.{ .integer = .{ .signedness = .unsigned, .bits = Ir.native_pointer_bits } }) } else null;
@@ -732,7 +754,7 @@ const Context = struct {
                     if (try self.probe(field.lhs, depth + 1)) |receiver| {
                         if (self.receiverMethod(receiver.ty, ast.tokenSlice(field.rhs))) |method| {
                             if (self.module.getDeclaration(method).?.noreturn) break :blk null;
-                            const signature = self.globalType(method) orelse break :blk null;
+                            const signature = (try self.globalType(method)) orelse break :blk null;
                             const function = self.ir.getType(signature.ty).?;
                             if (function == .function) break :blk .{ .ty = function.function.result };
                         }
@@ -1601,7 +1623,10 @@ const Context = struct {
                 return want.ty;
             },
             .array_access, .field_access => {
-                if (try self.staticMethod(node)) |id| return self.fit(self.types[@intFromEnum(id)].?, expected, node);
+                if (try self.staticMethod(node)) |id| {
+                    const known = (try self.globalType(id)) orelse return self.fail(.unresolved_value_type, node, null);
+                    return self.fit(known.ty, expected, node);
+                }
                 const base = (try self.expression(data.lhs, null, depth + 1)) orelse return null;
                 if (self.terminated) return if (expected) |want| want.ty else base;
                 const array = self.ir.getType(base).?;
@@ -1626,7 +1651,7 @@ const Context = struct {
                     const declaration = self.module.getDeclaration(id).?;
                     if (isPrimitive(name)) return self.fail(.unsupported_shadowing, node, declaration.name_span);
                     if (declaration.is_type_alias) return self.fail(.not_a_value, node, declaration.name_span);
-                    const known = self.globalType(id) orelse return self.fail(.unresolved_value_type, node, declaration.name_span);
+                    const known = (try self.globalType(id)) orelse return self.fail(.unresolved_value_type, node, declaration.name_span);
                     return self.fit(known.ty, expected, node);
                 }
                 if (std.mem.startsWith(u8, name, "@\"")) return self.fail(.unsupported_name, node, null);
@@ -1936,7 +1961,7 @@ const Context = struct {
                     const receiver = (try self.expression(field.lhs, null, depth + 1)) orelse return null;
                     if (self.terminated) return if (expected) |want| want.ty else try self.ir.internType(.void);
                     if (self.receiverMethod(receiver, ast.tokenSlice(field.rhs))) |method| {
-                        const signature = self.globalType(method) orelse return self.fail(.unresolved_value_type, call.ast.fn_expr, null);
+                        const signature = (try self.globalType(method)) orelse return self.fail(.unresolved_value_type, call.ast.fn_expr, null);
                         const function = self.ir.getType(signature.ty).?.function;
                         const related = self.module.getDeclaration(method).?.name_span;
                         if (function.params.len == 0 or function.params[0] != receiver) return self.fail(.invalid_method_receiver, call.ast.fn_expr, related);

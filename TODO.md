@@ -1,11 +1,27 @@
 # TODO
 
+Ordinary generic union methods now specialize on demand by canonical concrete
+container type, preserving aliases and independent type arguments. @This and
+let Self=@This aliases work in signatures/bodies, as do static/instance calls,
+callbacks, sibling/forward/recursive calls and exact concretized toString.
+Unrequested signatures/bodies remain dormant; requested methods are fully checked.
+This keeps void Result payloads usable without changing void-parameter restrictions.
+
+lib/result.nov starts the Nov stdlib with ordinary public Result, unwrapOr and
+unwrapOrElse definitions. The actual source is CLI-tested with a single-module
+harness and installed at <prefix>/lib/nov, including release builds/package sources.
+Imports/library lookup are NOT implemented: examples retain local Result for now.
+Next: separate-source compilation ownership, canonical module/global declaration
+identities, source-qualified spans/diagnostics, namespace resolution and library
+import conventions. Do not implement imports by source concatenation/name rewriting
+or make Result a compiler builtin. General generic structs/value/comptime remain deferred.
+
 Instance calls value.method(args) work on nominal structs, non-generic unions and
 enums as sugar for Type.method(value,args). The explicit first parameter must match
 the exact nominal receiver type. Receiver evaluates/snapshots once before explicit
 arguments left-to-right; direct noreturn methods remain terminal. Fields retain
 lookup precedence. No implicit mutation/borrowing, bound method references or
-generic methods were added. structured-errors.nov uses Entry.describe().
+general generic functions were added. structured-errors.nov uses Entry.describe().
 
 Nominal unnumbered enums are executable: qualified/contextual tags, aliases, exact
 ==/!=, exhaustive single-enum matches with qualified patterns/alternatives/catchall,
@@ -50,7 +66,7 @@ by declaration and exact arguments. Template aliases and instantiated aliases wo
 Expansion is bounded at 64 levels. Structural `.!` requires exactly `ok`/`err`
 variants, evaluates once, yields success or constructs/returns the enclosing error
 variant with identical error type. Ordinary returns never implicitly wrap payloads.
-Generic methods, generic structs, general comptime/value parameters, nested union/
+Generic structs, general comptime/value parameters, nested union/
 array/function payloads, nested record fields, explicit tag enums and Option
 propagation remain deferred.
 The updated filesystem error example remains design-only: imports, file-resource

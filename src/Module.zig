@@ -29,6 +29,9 @@ pub const Declaration = struct {
     container: ?DeclId = null,
     public: bool = false,
     noreturn: bool = false,
+    /// Analysis-local canonical container TypeId for a specialized method.
+    concrete_type: ?u32 = null,
+    specialization_depth: usize = 0,
 };
 
 pub const Diagnostic = struct {
@@ -327,8 +330,20 @@ fn classifyAliases(self: *Module) std.mem.Allocator.Error!void {
 }
 
 pub fn lookupMethod(self: *const Module, container: DeclId, name: []const u8) ?DeclId {
-    for (self.declarations.items, 0..) |decl, i| if (decl.container == container and std.mem.eql(u8, decl.name, name)) return @enumFromInt(i);
+    return self.lookupConcreteMethod(container, null, name);
+}
+
+pub fn lookupConcreteMethod(self: *const Module, container: DeclId, concrete_type: ?u32, name: []const u8) ?DeclId {
+    for (self.declarations.items, 0..) |decl, i| if (decl.container == container and decl.concrete_type == concrete_type and std.mem.eql(u8, decl.name, name)) return @enumFromInt(i);
     return null;
+}
+
+/// TypeIds belong to one analysis IR; never reuse specializations in a fresh pass.
+pub fn clearSpecializations(self: *Module) void {
+    for (self.declarations.items, 0..) |decl, i| if (decl.concrete_type != null) {
+        self.declarations.shrinkRetainingCapacity(i);
+        return;
+    };
 }
 
 fn collectDeclarations(self: *Module) (std.mem.Allocator.Error || error{TooManyDeclarations})!void {
@@ -374,6 +389,10 @@ fn collectDeclaration(self: *Module, node: Ast.Node.Index, container: ?DeclId) (
         if (container == null) try self.names.put(self.allocator, name, id);
         const is_record = declaration.ast.init_node != 0 and self.ast.fullStruct(declaration.ast.init_node) != null;
         const is_generic = is_record and self.ast.isUnion(declaration.ast.init_node) and declaration.ast.type_node != 0;
+        const is_this_alias = container != null and !declaration.ast.is_mutable and declaration.ast.type_node == 0 and declaration.ast.init_node != 0 and blk: {
+            const call = self.ast.fullCall(declaration.ast.init_node) orelse break :blk false;
+            break :blk call.ast.args.len == 0 and std.mem.eql(u8, self.ast.tokenSlice(self.ast.firstToken(call.ast.fn_expr)), "@This");
+        };
         var public = false;
         var noreturn_annotation = false;
         for (declaration.attributes) |attribute| {
@@ -384,7 +403,7 @@ fn collectDeclaration(self: *Module, node: Ast.Node.Index, container: ?DeclId) (
                 noreturn_annotation = true;
             } else try self.diagnostics.append(self.allocator, .{ .tag = .unsupported_attribute, .span = self.tokenSpan(self.ast.firstToken(attribute)) });
         }
-        try self.declarations.append(self.allocator, .{ .name = name, .name_span = name_span, .node = node, .container = container, .is_record = is_record, .is_generic = is_generic, .is_type_alias = is_record, .public = public, .noreturn = noreturn_annotation });
+        try self.declarations.append(self.allocator, .{ .name = name, .name_span = name_span, .node = node, .container = container, .is_record = is_record, .is_generic = is_generic, .is_type_alias = is_record or is_this_alias, .public = public, .noreturn = noreturn_annotation });
     }
 }
 

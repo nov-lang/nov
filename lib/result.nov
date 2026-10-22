@@ -1,0 +1,19 @@
+@[public]
+let Result: (T: type, E: type) -> type = union {
+    ok: T,
+    err: E,
+
+    let Self = @This()
+
+    @[public]
+    let unwrapOr: (self: Self, fallback: T) -> T = match self {
+        .ok => |value| value
+        .err => fallback
+    }
+
+    @[public]
+    let unwrapOrElse: (self: Self, fallback: (E) -> T) -> T = match self {
+        .ok => |value| value
+        .err => |error| fallback(error)
+    }
+}
