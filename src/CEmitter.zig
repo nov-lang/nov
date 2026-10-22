@@ -104,10 +104,26 @@ fn mark(origins: []?Origin, ty: Ir.TypeId, origin: Origin) void {
     if (slot.* == null) slot.* = origin;
 }
 
-/// Rejects unsupported operations and records which pool types are reachable
-/// from function signatures and instructions. Type references only point to
-/// lower indices, except nominal record fields (restricted to scalar leaves).
-/// One descending pass reaches signatures; record leaves are checked directly.
+// Nominal placeholders can precede their payload records and scalar fields.
+// Verification bounds aggregate depth; visit these edges directly rather than
+// depending on pool order as we can for structural signature types.
+fn markRecord(ir: *const Ir, origins: []?Origin, id: Ir.TypeId, origin: Origin, diagnostic: ?*Diagnostic) Error!void {
+    mark(origins, id, origin);
+    for (ir.getType(id).?.record.fields) |field| {
+        const field_origin: Origin = .{ .function = origin.function, .span = field.span };
+        mark(origins, field.ty, field_origin);
+        const ft = ir.getType(field.ty).?;
+        if (ft == .record) {
+            try markRecord(ir, origins, field.ty, field_origin, diagnostic);
+        } else if (ft == .integer) switch (ft.integer.bits) {
+            8, 16, 32, 64 => {},
+            else => return fail(diagnostic, .integer_width_unsupported, field_origin),
+        };
+    }
+}
+
+/// Rejects unsupported widths and marks runtime types reachable from signatures
+/// and instructions, including nominal edges in either pool-index direction.
 fn analyze(ir: *const Ir, origins: []?Origin, diagnostic: ?*Diagnostic) Error!void {
     for (ir.functions.items, 0..) |function, f| {
         const id: Ir.FunctionId = @enumFromInt(f);
@@ -123,14 +139,7 @@ fn analyze(ir: *const Ir, origins: []?Origin, diagnostic: ?*Diagnostic) Error!vo
         const origin = origins[i] orelse continue;
         switch (ir.types.items[i]) {
             .void, .boolean, .string => {},
-            .record => |record| for (record.fields) |field| {
-                mark(origins, field.ty, origin);
-                const ft = ir.getType(field.ty).?;
-                if (ft == .integer) switch (ft.integer.bits) {
-                    8, 16, 32, 64 => {},
-                    else => return fail(diagnostic, .integer_width_unsupported, .{ .function = origin.function, .span = field.span }),
-                };
-            },
+            .record => try markRecord(ir, origins, @enumFromInt(i), origin, diagnostic),
             .array => |element| mark(origins, element, origin),
             .integer => |integer| switch (integer.bits) {
                 8, 16, 32, 64 => {},
@@ -186,18 +195,21 @@ fn write(allocator: std.mem.Allocator, ir: *const Ir, origins: []const ?Origin, 
         try w.writeAll(" *data = array.data;\n    for (uintptr_t i = 0; i < array.len; ++i) {\n        if (value == data[i]) return true;\n    }\n    return false;\n}\n");
     }
     try writeArithmeticRuntime(ir, w);
-    for (origins, ir.types.items, 0..) |origin, ty, i| {
-        if (origin == null or ty != .record) continue;
-        try w.print("typedef struct {{\n", .{});
-        if (ty.record.tagged) try w.writeAll("    uint32_t tag;\n");
-        for (ty.record.fields, 0..) |field, f| {
-            if (ir.getType(field.ty).? == .void) continue;
-            try w.writeAll("    ");
-            try writeType(ir, w, field.ty);
-            try w.print(" f{d};\n", .{f});
+    // Flat records must precede tagged layouts regardless of placeholder IDs.
+    for ([_]bool{ false, true }) |tagged| {
+        for (origins, ir.types.items, 0..) |origin, ty, i| {
+            if (origin == null or ty != .record or ty.record.tagged != tagged) continue;
+            try w.print("typedef struct {{\n", .{});
+            if (ty.record.tagged) try w.writeAll("    uint32_t tag;\n");
+            for (ty.record.fields, 0..) |field, f| {
+                if (ir.getType(field.ty).? == .void) continue;
+                try w.writeAll("    ");
+                try writeType(ir, w, field.ty);
+                try w.print(" f{d};\n", .{f});
+            }
+            if (ty.record.fields.len == 0) try w.writeAll("    unsigned char empty;\n");
+            try w.print("}} nov_record_{d};\n", .{i});
         }
-        if (ty.record.fields.len == 0) try w.writeAll("    unsigned char empty;\n");
-        try w.print("}} nov_record_{d};\n", .{i});
     }
     var first_typedef = true;
     for (origins, ir.types.items, 0..) |origin, ty, i| {
@@ -230,7 +242,7 @@ fn rootCount(ir: *const Ir, id: Ir.TypeId) usize {
     if (ty == .record) {
         var count: usize = 0;
         for (ty.record.fields) |field| {
-            if (ir.getType(field.ty).? == .string) count += 1;
+            count += rootCount(ir, field.ty);
         }
         return count;
     }
@@ -240,9 +252,16 @@ fn rootCount(ir: *const Ir, id: Ir.TypeId) usize {
 fn writeRoots(ir: *const Ir, w: *std.Io.Writer, id: Ir.TypeId, prefix: []const u8, index: usize) WriteError!void {
     const ty = ir.getType(id).?;
     if (ty == .record) {
-        for (ty.record.fields, 0..) |field, f| if (ir.getType(field.ty).? == .string) {
-            try w.print(" &{s}{d}.f{d}.owner,", .{ prefix, index, f });
-        };
+        for (ty.record.fields, 0..) |field, f| {
+            const ft = ir.getType(field.ty).?;
+            if (ft == .string) {
+                try w.print(" &{s}{d}.f{d}.owner,", .{ prefix, index, f });
+            } else if (ft == .record) {
+                for (ft.record.fields, 0..) |nested, n| if (ir.getType(nested.ty).? == .string) {
+                    try w.print(" &{s}{d}.f{d}.f{d}.owner,", .{ prefix, index, f, n });
+                };
+            }
+        }
     } else try w.print(" &{s}{d}.{s},", .{ prefix, index, if (ty == .string) "owner" else "data" });
 }
 
@@ -976,6 +995,251 @@ const generic_union_program =
     \\    @println(describe(copy), describe(item))
     \\}
 ;
+const record_payload_program =
+    \\let Result:(T:type,E:type)->type=union{ok:T,err:E,}
+    \\let Apply=Result
+    \\let U=union{ok:File,err:Error,none,}
+    \\let File=struct{name:string,extra:string,n:int,valid:bool=true,}
+    \\let Error=struct{message:string,detail:string,code:i8,}
+    \\let Alias=File
+    \\let Input=Apply(Alias,Error)
+    \\let Output=Result(bool,Error)
+    \\let text:(s:string)->string={@print(s)
+    \\    s+"!"}
+    \\let make:(good:bool)->Input={@print("M")
+    \\    if good {.ok[Alias[.extra=text("b"),.name=text("a"),.n=7]]} else {.err[Error[.message="er"+"ror",.detail="de"+"tail",.code=-8]]}}
+    \\let use:(r:Alias,later:string)->string="{r.name}:{r.extra}:{r.n}:{r.valid}:"+later
+    \\let run:(good:bool)->Output={let file=make(good).!
+    \\    @println(use(file,"x"+"y"))
+    \\    .ok[file.valid]}
+    \\let show:(r:Output)->string=match r{.ok=>|b|"{b}"
+    \\    .err=>|e|"{e.message}:{e.detail}:{e.code}"}
+    \\let copy:(u:U)->U=u
+    \\let main:()={@println(show(run(true)),show(run(false)))
+    \\    let mut u=U.ok[File[.name="c"+"d",.extra="e"+"f",.n=9]]
+    \\    let saved=copy(u)
+    \\    loop i in 0..4 {u=if i == 0 {saved} else if i == 1 {.err[Error[.message="g"+"h",.detail="i"+"j",.code=2]]} else {.none[]}
+    \\        let value:U=loop{break u}
+    \\        @println(match value{.ok=>|f|use(f,"k"+"l")
+    \\            .err=>|e|e.message+e.detail
+    \\            .none=>"none"})}
+    \\    @println(match saved{.ok=>|f|use(f,"m"+"n")
+    \\        .err=>@panic("wrong error")
+    \\        .none=>@panic("wrong none")})}
+;
+const record_payload_output = "Mbaa!:b!:7:true:xy\nMtrue error:detail:-8\ncd:ef:9:true:kl\nghij\nnone\nnone\ncd:ef:9:true:mn\n";
+
+test "record payloads preserve layout order copies effects propagation captures and forced GC" {
+    const c = try arrayTestProgram(record_payload_program);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, record_payload_output, "", mode);
+}
+
+test "record payload inactive storage stays zero when loop temporaries change variants" {
+    const library = try emitSource(
+        "let U=union{ok:R,err:R,none,}\nlet R=struct{s:string,t:string,n:int,}\n" ++
+            "let make:(which:uint)->U={let mut result:U=.none[]\nloop i in 0..which {result=if i == 0 {.ok[R[.s=\"a\"+\"b\",.t=\"c\"+\"d\",.n=1]]} else if i == 1 {.err[R[.s=\"e\"+\"f\",.t=\"g\"+\"h\",.n=2]]} else {.none[]}}\nresult}\nlet copy:(u:U)->U=u",
+        null,
+    );
+    defer test_gpa.free(library);
+    const c = try std.mem.concat(test_gpa, u8, &.{ library, "\nstatic int empty(nov_record_1 r) { return !r.f0.owner && !r.f0.data && !r.f0.len && !r.f1.owner && !r.f1.data && !r.f1.len && !r.f2; }\n" ++
+        "int main(void) { nov_rt_heap.collect_every_allocation = 1; " ++
+        "for (uintptr_t i=0; i<4; ++i) { nov_record_0 a=nov_make(i), b=nov_copy(a); " ++
+        "if (a.tag != (i==1 ? 0u : i==2 ? 1u : 2u)) return 1; " ++
+        "if ((a.tag != 0 && !empty(a.f0)) || (a.tag != 1 && !empty(a.f1))) return 2; " ++
+        "if (a.tag == 0 && (a.f0.f0.owner != b.f0.f0.owner || a.f0.f1.owner != b.f0.f1.owner || a.f0.f0.data != b.f0.f0.data)) return 3; " ++
+        "if (a.tag == 1 && (a.f1.f0.owner != b.f1.f0.owner || a.f1.f1.owner != b.f1.f1.owner)) return 4; " ++
+        "if (nov_rt_heap.frames) return 5; nov_gc_collect(&nov_rt_heap); if (nov_rt_heap.live_objects) return 6; " ++
+        "} nov_gc_shutdown(&nov_rt_heap); return 0; }\n" });
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "", "", mode);
+}
+
+test "record payload width checking follows reverse dependencies and reports leaf source" {
+    for ([_][]const u8{ "i128", "u128" }) |width| {
+        for ([_]bool{ false, true }) |generic| {
+            const source = try std.fmt.allocPrint(test_gpa, "{s}\nlet R=struct{{wide:{s},s:string,}}\nlet f:(cb:(U)->void)={{}}\nlet main:()={{}}", .{ if (generic) "let G:(T:type)->type=union{ok:T,}\nlet U=G(R)" else "let U=union{ok:R,}", width });
+            defer test_gpa.free(source);
+            var module = try Module.init(test_gpa, "record-width.nov", source);
+            defer module.deinit();
+            var sema = try Lowering.lower(&module);
+            defer sema.deinit();
+            try std.testing.expect(!module.hasErrors());
+            var diagnostic: Diagnostic = undefined;
+            try std.testing.expectError(error.UnsupportedIntegerWidth, emit(test_gpa, &sema.ir, &diagnostic));
+            try std.testing.expectEqualStrings("wide", module.sourceSlice(.{ .start = diagnostic.span.start, .end = diagnostic.span.end }).?);
+        }
+        const unused = try std.fmt.allocPrint(test_gpa, "let U=union{{ok:R,}}\nlet R=struct{{wide:{s},}}\nlet main:()={{}}", .{width});
+        defer test_gpa.free(unused);
+        const c = try emitSource(unused, null);
+        defer test_gpa.free(c);
+        try std.testing.expect(std.mem.indexOf(u8, c, "nov_record_") == null);
+    }
+}
+
+test "record payload propagation allocates only evaluated strings and handles OOM" {
+    for ([_]bool{ false, true }) |allocate| {
+        const source = try std.fmt.allocPrint(test_gpa, "let G:(T:type,E:type)->type=union{{ok:T,err:E,}}\nlet R=struct{{s:string,}}\nlet make:()->G(int,R)=.err[R[.s={s}]]\nlet run:()->G(bool,R)=.ok[make().! == 0]\nlet main:()=@println(match run(){{.ok=>@panic(\"bad\")\n.err=>|r|r.s}})", .{if (allocate) "\"e\"+\"rr\"" else "\"err\""});
+        defer test_gpa.free(source);
+        const library = try emitSource(source, null);
+        defer test_gpa.free(library);
+        const program = try collectingTestProgram(library);
+        defer test_gpa.free(program);
+        const exhausted = try std.mem.concat(test_gpa, u8, &.{ "#include <stdlib.h>\nstatic void *test_malloc(size_t n) { (void)n; return NULL; }\n#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n", program });
+        defer test_gpa.free(exhausted);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(exhausted, "typedef int nonempty_translation_unit;", if (allocate) 1 else 0, if (allocate) "" else "err\n", if (allocate) "panic: GC allocation failed\n" else "", mode);
+    }
+}
+
+test "record payload captures stay rooted through terminal panic and skip later effects" {
+    const source =
+        \\let G:(T:type,E:type)->type=union{ok:T,err:E,}
+        \\let R=struct{s:string,t:string,}
+        \\let fail:()->G(R,R)={@print("F")
+        \\    return .err[R[.s="pa"+"nic",.t="mes"+"sage"]]}
+        \\let later:()->string={@print("BAD")
+        \\    "later"}
+        \\let use:(r:R,s:string)->bool=r.s == s
+        \\let run:()->G(bool,R)=.ok[use(fail().!,later())]
+        \\let suffix:()->string="x"+"y"
+        \\let main:()=match run(){.ok=>@panic("bad success")
+        \\    .err=>|r|@panic("{r.s}:{r.t}:"+suffix())}
+    ;
+
+    const c = try arrayTestProgram(source);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 1, "F", "panic: panic:message:xy\n", mode);
+}
+
+test "record payload IR owns source and emission survives every allocation failure" {
+    var sema = blk: {
+        var module = try Module.init(test_gpa, "record-payload.nov", record_payload_program);
+        defer module.deinit();
+
+        var result = try Lowering.lower(&module);
+        errdefer result.deinit();
+        try std.testing.expect(!module.hasErrors());
+        break :blk result;
+    };
+    defer sema.deinit();
+    try sema.ir.verify();
+    const library = try emit(test_gpa, &sema.ir, null);
+    defer test_gpa.free(library);
+    const c = try collectingTestProgram(library);
+    defer test_gpa.free(c);
+    try compileAndRunExpected(c, "typedef int nonempty_translation_unit;", 0, record_payload_output, "");
+    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{"let G:(T:type)->type=union{ok:T,}\nlet R=struct{s:string,}\nlet main:()={let u=G(R).ok[R[.s=\"a\"+\"b\"]]\n@println(match u{.ok=>|r|r.s})}"});
+}
+
+const record_interpolation_program =
+    \\let Alias=R
+    \\let Text=string
+    \\let Leaf=struct{s:string,
+    \\    let toString:(l:Leaf)->string={@print("L")
+    \\        "leaf:"+l.s}
+    \\}
+    \\let R=struct{s:string,t:string,
+    \\    let toString:(r:Alias)->Text={@print("R")
+    \\        let leaf=Leaf[.s=r.s+"!"]
+    \\        "{leaf}/{r.t}"}
+    \\}
+    \\let make:()->Alias={@print("M")
+    \\    R[.s="a"+"b",.t="c"+"d"]}
+    \\let scalar:()->bool={@print("S")
+    \\    true}
+    \\let U=union{item:string,none,
+    \\    let toString:(u:U)->string={@print("U")
+    \\        match u{.item=>|s|"union:"+s
+    \\            .none=>"none"}}
+    \\}
+    \\let UnionAlias=U
+    \\let main:()={let r=make()
+    \\    @println("<{r}>|{r}|{make()}|{scalar()}")
+    \\    let u=UnionAlias.item["x"+"y"]
+    \\    @println("{u}:{@as(i8, -8)}:{false}")
+    \\    @println(r)}
+;
+const record_interpolation_output = "MRLRLMRLS<leaf:ab!/cd>|leaf:ab!/cd|leaf:ab!/cd|true\nUunion:xy:-8:false\nRLleaf:ab!/cd\n";
+
+test "record interpolation reuses print conversions with exact aliases nested allocations and ordered effects" {
+    const c = try arrayTestProgram(record_interpolation_program);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, record_interpolation_output, "", mode);
+}
+
+test "record interpolation captures errors for panic and keeps nested payload owners rooted" {
+    const source =
+        \\let G:(T:type,E:type)->type=union{ok:T,err:E,}
+        \\let Error=struct{message:string,detail:string,
+        \\    let toString:(err:Error)->string={@print("C")
+        \\        "{err.message}: {err.detail}"}
+        \\}
+        \\let fail:()->G(int,Error)=.err[Error[.message="not "+"found",.detail="fi"+"le"]]
+        \\let main:()=match fail(){.ok=>@panic("unexpected")
+        \\    .err=>|err|@panic("Error: {err}")}
+    ;
+    const c = try arrayTestProgram(source);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 1, "C", "panic: Error: not found: file\n", mode);
+}
+
+test "record interpolation skips converters and later placeholders on propagated or terminal paths" {
+    const source =
+        \\let G:(T:type,E:type)->type=union{ok:T,err:E,}
+        \\let R=struct{s:string,
+        \\    let toString:(r:R)->string={@print("BAD-CONVERT")
+        \\        r.s}
+        \\}
+        \\let fail:()->G(R,string)={@print("F")
+        \\    .err["e"+"rr"]}
+        \\let later:()->string={@print("BAD-LATER")
+        \\    "later"}
+        \\let run:()->G(string,string)=.ok["prefix:{fail().!}:{later()}"]
+        \\@[noreturn]
+        \\let stop:()=@panic("stop")
+        \\let terminal:()->string="{stop()}{missing}"
+        \\let main:()={@println(match run(){.ok=>|s|s
+        \\    .err=>|s|s})
+        \\    @print(terminal())}
+    ;
+    const c = try arrayTestProgram(source);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 1, "Ferr\n", "panic: stop\n", mode);
+}
+
+test "record interpolation survives source release and every compiler allocation failure" {
+    var sema = blk: {
+        var module = try Module.init(test_gpa, "record-interpolation.nov", record_interpolation_program);
+        defer module.deinit();
+        var result = try Lowering.lower(&module);
+        errdefer result.deinit();
+        try std.testing.expect(!module.hasErrors());
+        break :blk result;
+    };
+    defer sema.deinit();
+    try sema.ir.verify();
+    const library = try emit(test_gpa, &sema.ir, null);
+    defer test_gpa.free(library);
+    const c = try collectingTestProgram(library);
+    defer test_gpa.free(c);
+    try compileAndRunExpected(c, "typedef int nonempty_translation_unit;", 0, record_interpolation_output, "");
+    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{record_interpolation_program});
+}
+
+test "record interpolation conversion allocations fail safely and skipped conversions allocate nothing" {
+    for ([_]bool{ false, true }) |convert| {
+        const source = try std.fmt.allocPrint(test_gpa, "let R=struct{{s:string,\nlet toString:(r:R)->string=r.s+\"!\"\n}}\nlet main:()={{let r=R[.s=\"ok\"]\n@println(if {s} {{\"{{r}}\"}} else {{\"skip\"}})}}", .{if (convert) "true" else "false"});
+        defer test_gpa.free(source);
+        const library = try emitSource(source, null);
+        defer test_gpa.free(library);
+        const program = try collectingTestProgram(library);
+        defer test_gpa.free(program);
+        const exhausted = try std.mem.concat(test_gpa, u8, &.{ "#include <stdlib.h>\nstatic void *test_malloc(size_t n) { (void)n; return NULL; }\n#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n", program });
+        defer test_gpa.free(exhausted);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(exhausted, "typedef int nonempty_translation_unit;", if (convert) 1 else 0, if (convert) "" else "skip\n", if (convert) "panic: GC allocation failed\n" else "", mode);
+    }
+}
+
 const generic_union_output = "PSPok:value:7 err:error\nPPbool:true err:error\nok:ab err:cd\n";
 
 test "generic unions and structural propagation preserve identities effects and forced GC" {

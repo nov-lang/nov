@@ -93,6 +93,28 @@ test "generic union instances canonicalize aliases arguments and nominal declara
     try sema.ir.verify();
 }
 
+test "record payload generic identities canonicalize aliases but preserve nominal distinctions" {
+    const source = "let G:(T:type,E:type)->type=union{ok:T,err:E,}\nlet Factory=G\n" ++
+        "let A=Factory(Alias,ErrorAlias)\nlet B=G(File,Error)\nlet C=G(Other,Error)\nlet D=G(File,Other)\n" ++
+        "let Alias=File\nlet ErrorAlias=Error\nlet File=struct{s:string,}\nlet Other=struct{s:string,}\nlet Error=struct{s:string,}\n" ++
+        "let id:(a:A)->B=a\nlet make:()->A=.ok[Alias[.s=\"value\"]]";
+    var module = try Module.init(std.testing.allocator, "record-identities.nov", source);
+    defer module.deinit();
+    var sema = try lower(&module);
+    defer sema.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    const a = sema.getEntry(module.lookup("A").?).?.alias_type.?;
+    try std.testing.expectEqual(a, sema.getEntry(module.lookup("B").?).?.alias_type.?);
+    for ([_][]const u8{ "C", "D" }) |name| try std.testing.expect(a != sema.getEntry(module.lookup(name).?).?.alias_type.?);
+    var instances: usize = 0;
+    for (sema.ir.types.items) |ty| if (ty == .record and ty.record.type_args.len != 0) {
+        instances += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 3), instances);
+    try sema.ir.verify();
+}
+
 test "generic union expansion and template alias traversal have explicit limits" {
     for ([_]bool{ false, true }) |alias_chain| {
         var source = std.Io.Writer.Allocating.init(std.testing.allocator);
@@ -183,7 +205,14 @@ test "unsupported union declarations and rejected matches roll back under OOM" {
         .{ .source = "let U=union{ok:int=0,}", .tag = .unsupported_union_default },
         .{ .source = "let U=union{ok:int,ok:string,}", .tag = .duplicate_field },
         .{ .source = "let U=union{ok:[]int,}", .tag = .unsupported_type },
-        .{ .source = "let R=struct{n:int,}\nlet U=union{ok:R,}", .tag = .unsupported_type },
+        .{ .source = "let R=struct{n:[]int,}\nlet U=union{ok:R,}", .tag = .unsupported_type },
+        .{ .source = "let R=struct{n:U,}\nlet U=union{ok:R,}", .tag = .unsupported_type },
+        .{ .source = "let R=struct{n:R,}\nlet U=union{ok:R,}", .tag = .unsupported_type },
+        .{ .source = "let R=struct{n:S,}\nlet S=struct{n:int,}\nlet U=union{ok:R,}", .tag = .unsupported_type },
+        .{ .source = "let V=union{n:int,}\nlet U=union{ok:V,}", .tag = .unsupported_type },
+        .{ .source = "let G:(T:type)->type=union{ok:T,}\nlet V=union{n:int,}\nlet U=G(V)", .tag = .unsupported_type },
+        .{ .source = "let A=struct{n:int,}\nlet B=struct{n:int,}\nlet U=union{ok:A,}\nlet f:()->U=.ok[B[.n=1]]", .tag = .expression_type_mismatch },
+        .{ .source = "let A=struct{n:int,}\nlet B=struct{n:int,}\nlet G:(T:type,E:type)->type=union{ok:T,err:E,}\nlet f:(r:G(int,A))->G(bool,B)=.ok[r.! == 0]", .tag = .propagation_error_mismatch },
         .{ .source = "let U=union{ok:U,}", .tag = .unsupported_type },
         .{ .source = "let U=union{ok:()->int,}", .tag = .unsupported_type },
         .{ .source = "let U=union{ok:int,\nlet constant:int=1\n}", .tag = .unsupported_declaration },

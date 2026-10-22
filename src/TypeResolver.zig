@@ -303,7 +303,7 @@ fn instantiate(module: *Module, ir: *Ir, call: Ast.full.Call, node: Ast.Node.Ind
         const data = ast.nodes.items(.data)[member];
         const field_ty = if (data.lhs == 0) try ir.internType(.void) else (try resolveWith(module, ir, data.lhs, bindings, env.expansions + 1)) orelse return null;
         const ft = ir.getType(field_ty).?;
-        if (!Ir.isRecordField(ft) and ft != .void) return diagnose(module, member, .unsupported_type);
+        if (!Ir.isUnionPayload(ft)) return diagnose(module, member, .unsupported_type);
         const token = ast.nodes.items(.main_token)[member];
         const span = module.tokenSpan(token);
         try fields.append(module.allocator, .{ .name = ast.tokenSlice(token), .ty = field_ty, .span = .{ .start = span.start, .end = span.end } });

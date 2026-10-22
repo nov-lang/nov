@@ -673,8 +673,8 @@ The delivered subset is deliberately bounded:
 - Printing requires exactly the container method `toString: (MyType) -> string`.
   The parameter name is unrestricted, and aliases of the exact nominal type and
   `string` are accepted. Missing/wrong signatures diagnose when the record is
-  printed. No global overload lookup, automatically derived representation or
-  implicit record interpolation is provided. Explicit `MyType.toString(item)`
+  printed. No global overload lookup or automatically derived representation is
+  provided. Interpolation reuses this exact converter. Explicit `MyType.toString(item)`
   is also an ordinary call.
 - Each print argument is evaluated, then (if a record) converted by **one** call
   to its `toString`, before moving to the next argument. Only after all arguments
@@ -747,7 +747,7 @@ let z = [ 10, 20, 30 ]
 Ordinary module declarations such as `let Value = union { number: int, text: string, empty, }`
 introduce nominal tagged value types. Separate declarations remain distinct; aliases
 preserve identity. The current executable subset supports bool, integer, string,
-and void payloads, with no payload defaults. As with structs, integer fields are
+void, and existing flat nominal struct payloads, with no payload defaults. As with structs, integer fields are
 checked semantically through 128 bits, while reachable C layouts require
 8/16/32/64-bit widths.
 
@@ -765,7 +765,11 @@ checked semantically through 128 bits, while reachable C layouts require
   checks the active tag in all build modes.
 - Non-generic union methods and `@[public]` use the same bounded container rules
   as structs, including exact `toString` printing. Visibility is metadata only.
-- Explicit tag enums, nested/record/array/function payloads, variant-pattern
+- Flat record payloads retain exact nominal identity and value-copy semantics;
+  their string fields share immutable storage. Constructors, captures and `.!`
+  work with records and aliases. C emits payload record layouts before containing
+  unions and roots each nested string owner, with inactive payload fields zeroed.
+- Explicit tag enums, nested union/array/function payloads, nested record fields, variant-pattern
   alternatives, nested destructuring, direct payload field access, union equality
   and union globals remain unsupported.
 
@@ -910,9 +914,18 @@ in the broader definitions below also remain design-only.
 
 `examples/error.nov` now uses `.!` and explicit Result returns, with its alternative
 implementations commented out. It is still a filesystem design example, not an
-executable program: imports, filesystem resources, record payloads, enum error kinds,
-instance calls and record interpolation remain future work. Terminal `@panic`
-is implemented with the `@[noreturn]` void-function contract described below.
+executable program: imports, filesystem resources, enum error kinds and instance
+calls remain future work. Record payloads and record interpolation are implemented;
+terminal `@panic` follows the `@[noreturn]` void-function contract described below.
+
+[examples/structured-errors.nov](examples/structured-errors.nov) is a runnable
+in-memory example with records on both sides of Result, `.!` propagation into a
+different success type, and captured error interpolation. It prints:
+
+```text
+readme: 42 bytes
+Error: missing: entry not found
+```
 
 ```nov
 @[public]
@@ -1704,6 +1717,13 @@ never static byte pointers. Temporaries use the same precise root frames as arra
 an immutable `string`. Placeholders support `bool` (`true`/`false`), signed and
 unsigned fixed-width integers (`i8`/`u8` through `i64`/`u64`), native `int`/`uint`
 (exact decimal, including minimum/maximum values), and strings (unchanged bytes).
+Nominal structs and non-generic unions also work when they define the exact
+container `toString: (SelfType) -> string` method already required by print.
+Each placeholder expression evaluates once, then converts once immediately before
+proceeding to the next chunk or placeholder. Aliases preserve the exact signature;
+allocating converters and managed payloads stay rooted. Missing/wrong converters
+diagnose; no derived formatting, global overload lookup or generic methods are
+introduced. Terminal expressions skip conversion and later placeholder effects.
 No numeric defaults, widening or implicit fallback formatting are introduced.
 
 ```nov

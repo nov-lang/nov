@@ -464,7 +464,7 @@ const Context = struct {
         return null;
     }
 
-    fn printArgument(self: *Context, node: Ast.Node.Index, ty: Ir.TypeId) Error!bool {
+    fn convertPrintable(self: *Context, node: Ast.Node.Index, ty: Ir.TypeId) Error!bool {
         const record = self.ir.getType(ty).?;
         if (record == .boolean or record == .integer or record == .string) return true;
         if (record != .record) {
@@ -1299,7 +1299,8 @@ const Context = struct {
                 const ty = (try self.expression(embedded, null, depth + 1)) orelse return null;
                 if (self.terminated) return self.fit(string, expected, node);
                 const scalar = self.ir.getType(ty).?;
-                if (scalar != .boolean and scalar != .integer and scalar != .string) return self.interpolationError(.unsupported_interpolation_type, .{ .start = location.start + @as(u32, @intCast(start)), .end = location.start + @as(u32, @intCast(offset)) });
+                if (scalar != .boolean and scalar != .integer and scalar != .string and scalar != .record) return self.interpolationError(.unsupported_interpolation_type, .{ .start = location.start + @as(u32, @intCast(start)), .end = location.start + @as(u32, @intCast(offset)) });
+                if (!try self.convertPrintable(embedded, ty)) return null;
                 if (self.emitter) |emitter| {
                     const converted = try emitter.append(string, self.irSpan(node), .{ .to_string = try emitter.value(embedded) });
                     result = if (result) |left| try emitter.append(string, self.irSpan(node), .{ .binary = .{ .op = .add, .lhs = left, .rhs = converted } }) else converted;
@@ -1489,7 +1490,7 @@ const Context = struct {
                 const unit = try self.ir.internType(.void);
                 if (self.printing(data.rhs) != null) {
                     const arg = (try self.expression(data.lhs, null, depth + 1)) orelse return null;
-                    if (!self.terminated and !try self.printArgument(data.lhs, arg)) return null;
+                    if (!self.terminated and !try self.convertPrintable(data.lhs, arg)) return null;
                     return self.fit(unit, expected, node);
                 }
                 // Exactly rhs(lhs): evaluate the callee before the sole argument.
@@ -1838,7 +1839,7 @@ const Context = struct {
                             valid = false;
                             continue;
                         };
-                        if (!self.terminated and !try self.printArgument(arg, arg_type)) valid = false;
+                        if (!self.terminated and !try self.convertPrintable(arg, arg_type)) valid = false;
                     }
                     if (!valid) return null;
                     return self.fit(try self.ir.internType(.void), expected, node);
@@ -2127,6 +2128,34 @@ test "interpolation diagnoses names grammar types scopes and exact source bytes"
         const diagnostic = module.diagnostics.items[0];
         try std.testing.expectEqual(case.tag, diagnostic.tag);
         try std.testing.expectEqualStrings(case.token, module.sourceSlice(diagnostic.span).?);
+    }
+}
+
+test "record interpolation uses print signature diagnostics at the placeholder source" {
+    for ([_]struct { declaration: []const u8, related: bool = false }{
+        .{ .declaration = "let R=struct{s:string,}" },
+        .{ .declaration = "let R=struct{s:string,}\nlet toString:(r:R)->string=r.s" },
+        .{ .declaration = "let R=struct{s:string,\nlet toString:()->string=\"wrong\"\n}", .related = true },
+        .{ .declaration = "let R=struct{s:string,\nlet toString:(r:R,extra:string)->string=r.s+extra\n}", .related = true },
+        .{ .declaration = "let R=struct{s:string,\nlet toString:(r:R)->bool=true\n}", .related = true },
+        .{ .declaration = "let Other=struct{s:string,}\nlet R=struct{s:string,\nlet toString:(r:Other)->string=r.s\n}", .related = true },
+        .{ .declaration = "let R=union{item:string,}" },
+        .{ .declaration = "let G:(T:type)->type=union{item:T,}\nlet R=G(string)" },
+    }) |case| {
+        const source = try std.mem.concat(std.testing.allocator, u8, &.{ case.declaration, "\nlet Alias=R\nlet f:(r:Alias)->string=\"prefix:{r}\"" });
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "record-interpolation-error.nov", source);
+        defer module.deinit();
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        try std.testing.expect(!sema.lowering_complete);
+        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+        const diagnostic = module.diagnostics.items[0];
+        try std.testing.expectEqual(Module.Diagnostic.Tag.invalid_to_string, diagnostic.tag);
+        try std.testing.expectEqualStrings("r", module.sourceSlice(diagnostic.span).?);
+        try std.testing.expectEqual(case.related, diagnostic.related != null);
+        if (diagnostic.related) |related| try std.testing.expectEqualStrings("toString", module.sourceSlice(related).?);
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
     }
 }
 

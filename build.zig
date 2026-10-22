@@ -131,6 +131,10 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     _ = fixtures.add("union-duplicate.nov", "let U=union{ok:int,none,}\nlet f:(u:U)->int=match u{.ok=>0\n.ok=>1\n_=>2}");
     _ = fixtures.add("union-capture.nov", "let U=union{ok:int,none,}\nlet f:(u:U)->int=match u{.ok=>|n|n\n_=>n}");
     _ = fixtures.add("generic-unions.nov", "let G:(T:type,E:type)->type=union{err:E,ok:T,}\nlet R=G(int,string)\nlet Text=G(string,string)\nlet make:(b:bool)->R={@print(\"M\")\nif b{.ok[7]}else{.err[\"b\"+\"ad\"]}}\nlet wrap:(b:bool)->Text={let n=make(b).!\n.ok[\"{n}\"]}\nlet show:(r:Text)->string=match r{.ok=>|s|s\n.err=>|s|s}\nlet main:()=@println(show(wrap(true)),show(wrap(false)))");
+    _ = fixtures.add("record-payloads.nov", "let G:(T:type,Failure:type)->type=union{ok:T,err:Failure,}\nlet U=union{ok:R,err:E,}\nlet R=struct{s:string,}\nlet E=struct{message:string,}\nlet make:(b:bool)->G(R,E)=if b{.ok[R[.s=\"o\"+\"k\"]]}else{.err[E[.message=\"e\"+\"rr\"]]}\nlet wrap:(b:bool)->G(bool,E)={let r=make(b).!\n.ok[r.s == \"ok\"]}\nlet show:(r:G(bool,E))->string=match r{.ok=>|b|\"{b}\"\n.err=>|e|e.message}\nlet main:()=@println(show(wrap(true)),show(wrap(false)),match U.ok[R[.s=\"record\"]]{.ok=>|r|r.s\n.err=>|e|e.message})");
+    _ = fixtures.add("record-interpolation.nov", "let G:(T:type,E:type)->type=union{ok:T,err:E,}\nlet Error=struct{s:string,\nlet toString:(err:Error)->string={@print(\"C\")\nerr.s+\"!\"}\n}\nlet fail:()->G(int,Error)=.err[Error[.s=\"not \"+\"found\"]]\nlet main:()=match fail(){.ok=>@panic(\"bad\")\n.err=>|err|@panic(\"Error: {err}\")}");
+    _ = fixtures.add("record-interpolation-missing.nov", "let R=struct{s:string,}\nlet f:(r:R)->string=\"{r}\"");
+    _ = fixtures.add("wide-record-payload.nov", "let U=union{ok:R,}\nlet R=struct{wide:i128,}\nlet f:(u:U)={}\nlet main:()={}");
     _ = fixtures.add("generic-cycle.nov", "let G:(T:type)->type=union{ok:G(T),}\nlet R=G(int)");
     _ = fixtures.add("generic-method.nov", "let G:(T:type)->type=union{ok:T,\nlet m:(x:T)->T=x\n}");
     _ = fixtures.add("propagation-error.nov", "let G:(T:type,E:type)->type=union{ok:T,err:E,}\nlet f:(r:G(int,string))->G(int,bool)=.ok[r.!]");
@@ -247,6 +251,11 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         stderr_match: ?[]const u8 = null,
     };
     const cases = [_]Case{
+        .{ .name = "record interpolation semantic", .args = &.{ "check", "record-interpolation.nov", "--semantic" }, .exit_code = 0 },
+        .{ .name = "record interpolation missing method", .args = &.{ "check", "record-interpolation-missing.nov", "--semantic" }, .exit_code = 1, .stderr_match = "printing a struct or union requires its method toString: (MyType) -> string" },
+        .{ .name = "record payload semantic", .args = &.{ "check", "record-payloads.nov", "--semantic" }, .exit_code = 0 },
+        .{ .name = "record payload 128 bit semantic", .args = &.{ "check", "wide-record-payload.nov", "--semantic" }, .exit_code = 0 },
+        .{ .name = "record payload backend width", .args = &.{ "emit-c", "wide-record-payload.nov" }, .exit_code = 1, .stderr_match = "C backend only supports 8, 16, 32 and 64-bit integers" },
         .{ .name = "generic union semantic", .args = &.{ "check", "generic-unions.nov", "--semantic" }, .exit_code = 0 },
         .{ .name = "generic cycle", .args = &.{ "check", "generic-cycle.nov", "--semantic" }, .exit_code = 1, .stderr_match = "cyclic generic union instantiation" },
         .{ .name = "generic method diagnostic", .args = &.{ "check", "generic-method.nov", "--semantic" }, .exit_code = 1, .stderr_match = "generic union methods and container declarations are not supported" },
@@ -412,6 +421,7 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     }
 
     const stdin_cases = [_]struct { source: []const u8, check: bool = false, output: []const u8 = "", diagnostic: ?[]const u8 = null, code: u8 = 0 }{
+        .{ .source = "let U=union{ok:R,}\nlet R=struct{s:string,}\nlet f:()->U=.ok[R[.s=\"ok\"]]", .output = "let U = union {\n    ok: R,\n}\nlet R = struct {\n    s: string,\n}\nlet f: () -> U = .ok[R[ .s = \"ok\" ]]\n" },
         .{ .source = "let G:(T:type)->type=union{ok:T,err:string,}\nlet R=G(int)\nlet f:(r:R)->R=.ok[r.!]", .output = "let G: (T: type) -> type = union {\n    ok: T,\n    err: string,\n}\nlet R = G(int)\nlet f: (r: R) -> R = .ok[r.!]\n" },
         .{ .source = "let U=union{ok:int,none,}\nlet f:(u:U)->int=match u{.ok=>|v|v\n.none=>0}", .output = "let U = union {\n    ok: int,\n    none,\n}\nlet f: (u: U) -> int = match u {\n    .ok => |v| v\n    .none => 0\n}\n" },
         .{ .source = "let x=1", .output = "let x = 1\n" },
@@ -441,6 +451,32 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
 
     // An isolated PATH exercises real `zig cc` discovery, independent of host CC.
     for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+        const record_interpolation_run = b.addRunArtifact(exe);
+        record_interpolation_run.step.name = b.fmt("CLI: record interpolation panic ({s})", .{mode});
+        record_interpolation_run.setCwd(fixtures.getDirectory());
+        record_interpolation_run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+        record_interpolation_run.setEnvironmentVariable("NOV_CC", "");
+        record_interpolation_run.setEnvironmentVariable("CC", "");
+        record_interpolation_run.addArgs(&.{ "run", "record-interpolation.nov" });
+        if (mode.len != 0) record_interpolation_run.addArg(mode);
+        record_interpolation_run.expectExitCode(1);
+        record_interpolation_run.expectStdOutEqual("C");
+        record_interpolation_run.expectStdErrEqual("panic: Error: not found!\n");
+        test_step.dependOn(&record_interpolation_run.step);
+
+        const payload_run = b.addRunArtifact(exe);
+        payload_run.step.name = b.fmt("CLI: record payloads and propagation ({s})", .{mode});
+        payload_run.setCwd(fixtures.getDirectory());
+        payload_run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+        payload_run.setEnvironmentVariable("NOV_CC", "");
+        payload_run.setEnvironmentVariable("CC", "");
+        payload_run.addArgs(&.{ "run", "record-payloads.nov" });
+        if (mode.len != 0) payload_run.addArg(mode);
+        payload_run.expectExitCode(0);
+        payload_run.expectStdOutEqual("true err record\n");
+        payload_run.expectStdErrEqual("");
+        test_step.dependOn(&payload_run.step);
+
         const generic_run = b.addRunArtifact(exe);
         generic_run.step.name = b.fmt("CLI: generic unions and propagation ({s})", .{mode});
         generic_run.setCwd(fixtures.getDirectory());

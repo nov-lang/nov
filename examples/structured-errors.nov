@@ -1,0 +1,44 @@
+let Result: (T: type, E: type) -> type = union {
+    ok: T,
+    err: E,
+}
+
+let Entry = struct {
+    name: string,
+    size: uint,
+}
+
+let LookupError = struct {
+    name: string,
+    message: string,
+
+    let toString: (self: LookupError) -> string = {
+        "{self.name}: {self.message}"
+    }
+}
+
+let lookup: (name: string) -> Result(Entry, LookupError) = {
+    if name == "readme" {
+        .ok[Entry[ .name = name, .size = 42 ]]
+    } else {
+        .err[LookupError[ .name = name, .message = "entry not found" ]]
+    }
+}
+
+let describe: (name: string) -> Result(string, LookupError) = {
+    let entry = lookup(name).!
+    .ok["{entry.name}: {entry.size} bytes"]
+}
+
+let report: (name: string) = {
+    let message = match describe(name) {
+        .ok => |text| text
+        .err => |error| "Error: {error}"
+    }
+    @println(message)
+}
+
+let main: () = {
+    report("readme")
+    report("missing")
+}

@@ -132,7 +132,7 @@ pub fn analyzeAnnotations(module: *Module) Error!Sema {
             }
             const ty = if (tagged and data.lhs == 0) try result.ir.internType(.void) else (try TypeResolver.resolve(module, &result.ir, data.lhs)) orelse continue;
             const ft = result.ir.getType(ty).?;
-            if (!Ir.isRecordField(ft) and !(tagged and ft == .void)) {
+            if (!(if (tagged) Ir.isUnionPayload(ft) else Ir.isRecordField(ft))) {
                 try module.diagnostics.append(module.allocator, .{ .tag = .unsupported_type, .span = module.tokenSpan(module.ast.firstToken(data.lhs)) });
                 continue;
             }

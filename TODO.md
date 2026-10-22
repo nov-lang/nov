@@ -1,5 +1,18 @@
 # TODO
 
+Flat nominal records now work as ordinary/generic union payloads, retaining exact
+identity through aliases, constructors, captures, copies and .! propagation. C
+layouts are dependency-ordered and every nested string owner is rooted; inactive
+payload fields are zeroed. Nested record fields, nested union/array/function
+payloads and recursive layouts remain unsupported. Reachable wide scalar leaves
+still produce backend width diagnostics at the leaf field.
+
+Record interpolation now uses the same exact container toString method as print,
+once after each placeholder expression and before later chunks/placeholders.
+Non-generic unions with an exact converter also work. No derived formatting or
+global overload lookup was added. See examples/structured-errors.nov for record
+success/error payloads, propagation and captured error interpolation.
+
 Terminal `@panic(message)` and function annotation `@[noreturn]` are executable.
 `noreturn` is not a type: annotated functions return void, reject explicit returns
 and possible normal completion. Direct annotated calls are terminal; ordinary
@@ -22,10 +35,11 @@ by declaration and exact arguments. Template aliases and instantiated aliases wo
 Expansion is bounded at 64 levels. Structural `.!` requires exactly `ok`/`err`
 variants, evaluates once, yields success or constructs/returns the enclosing error
 variant with identical error type. Ordinary returns never implicitly wrap payloads.
-Generic methods, generic structs, general comptime/value parameters, nested/record/
-array/function payloads, explicit tag enums and Option propagation remain deferred.
+Generic methods, generic structs, general comptime/value parameters, nested union/
+array/function payloads, nested record fields, explicit tag enums and Option
+propagation remain deferred.
 The updated filesystem error example remains design-only: imports, file-resource
-semantics, error kinds, instance calls and record interpolation are missing.
+semantics, error kinds and instance calls are missing.
 
 Bounded nominal value structs are executable; `examples/type.nov` is unchanged
 and runs/checks/formats successfully. Separate declarations have distinct identities;
@@ -40,8 +54,8 @@ immediately after each argument is evaluated, before the next argument. Only
 or a new C export policy. C value layouts/root frames retain every string owner in
 parameters, temporaries, local slots and control-flow merges. Contextual/anonymous
 constructors, instance-method syntax, field mutation, nested/array/function fields,
-record arrays/globals, container constants/types, derived printing, record
-interpolation, generic structs and FFI remain deferred. See README's executable struct
+record arrays/globals, container constants/types, derived printing,
+generic structs and FFI remain deferred. See README's executable struct
 contract; the older broader syntax examples below are not delivery claims.
 
 Executable scalar status: integer binary `&`, `|`, `^` and unary `~` support

@@ -105,7 +105,7 @@ pub const Operation = union(enum) {
 };
 
 pub const Field = struct { name: []const u8, ty: TypeId, span: Span, default: ?ConstId = null };
-/// Nominal aggregate layout. Tagged layouts have exactly one active scalar field.
+/// Nominal aggregate layout. Tagged layouts have one active scalar or flat record payload.
 pub const Record = struct {
     identity: u32,
     fields: []const Field,
@@ -772,7 +772,7 @@ fn validateType(self: *const Ir, ty: Type, before: usize) ValidationError!void {
             for (record.fields, 0..) |field, i| {
                 if (@intFromEnum(field.ty) >= self.types.items.len) return error.InvalidTypeId;
                 const ft = self.getType(field.ty).?;
-                if (!isRecordField(ft) and !(record.tagged and ft == .void)) return error.InvalidArrayElement;
+                if (!(if (record.tagged) isUnionPayload(ft) else isRecordField(ft))) return error.InvalidArrayElement;
                 if (record.tagged and field.default != null) return error.InvalidTypeId;
                 if (field.name.len == 0 or field.span.start > field.span.end or field.span.end > self.source_len) return error.InvalidTypeId;
                 for (record.fields[0..i]) |previous| if (std.mem.eql(u8, previous.name, field.name)) return error.InvalidTypeId;
@@ -851,6 +851,13 @@ pub fn isManaged(ty: Type) bool {
     return ty == .array or ty == .string or ty == .record;
 }
 
+/// Ordinary flat records retain nominal identity as union payloads. Their own
+/// layout is independently validated, so neither cycles nor deeper aggregates
+/// become valid through a tagged parent.
+pub fn isUnionPayload(ty: Type) bool {
+    return isRecordField(ty) or ty == .void or (ty == .record and !ty.record.tagged);
+}
+
 /// Record fields use semantic integer limits, not array/backend storage widths.
 pub fn isRecordField(ty: Type) bool {
     return ty == .boolean or ty == .string or (ty == .integer and ty.integer.bits > 0 and ty.integer.bits <= 128);
@@ -912,6 +919,41 @@ test "generic nominal keys own canonical arguments and do not collapse identical
     owned[0] = first;
     try std.testing.expectError(error.InvalidTypeId, ir.verify());
     owned[0] = boolean;
+}
+
+test "record payload layouts reject nested aggregates cycles and forged nominal operands" {
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    const span: Span = .{ .start = 0, .end = 0 };
+    const u = try ir.internType(.{ .record = .{ .identity = 0, .fields = &.{}, .tagged = true } });
+    const r = try ir.internType(.{ .record = .{ .identity = 1, .fields = &.{} } });
+    const other = try ir.internType(.{ .record = .{ .identity = 2, .fields = &.{} } });
+    const text = try ir.internType(.string);
+    const array = try ir.internType(.{ .array = try ir.internType(.boolean) });
+    try ir.setRecordFields(r, &.{.{ .name = "s", .ty = text, .span = span }});
+    try ir.setRecordFields(other, &.{.{ .name = "s", .ty = text, .span = span }});
+    try ir.setRecordFields(u, &.{.{ .name = "ok", .ty = r, .span = span }});
+    for ([_]TypeId{ r, u, other, array }) |invalid| {
+        try std.testing.expectError(error.InvalidArrayElement, ir.setRecordFields(r, &.{.{ .name = "nested", .ty = invalid, .span = span }}));
+    }
+    try std.testing.expectError(error.InvalidArrayElement, ir.setRecordFields(u, &.{.{ .name = "nested", .ty = u, .span = span }}));
+    const sig = try ir.internType(.{ .function = .{ .params = &.{other}, .result = u } });
+    const f = try ir.addFunction("f", sig, span);
+    const body = [_]Instruction{
+        .{ .ty = other, .span = span, .op = .{ .parameter = 0 } },
+        .{ .ty = u, .span = span, .op = .{ .union_init = .{ .index = 0, .payload = @enumFromInt(0) } } },
+    };
+    try std.testing.expectError(error.OperandTypeMismatch, ir.setFunctionBody(f, &body, @enumFromInt(1)));
+    ir.clearFunctions();
+    try ir.verify();
+    const fields = @constCast(ir.types.items[@intFromEnum(r)].record.fields);
+    fields[0].ty = u;
+    try std.testing.expectError(error.InvalidArrayElement, ir.verify());
+    fields[0].ty = text;
+    ir.types.items[@intFromEnum(r)].record.tagged = true;
+    try std.testing.expectError(error.InvalidArrayElement, ir.verify());
+    ir.types.items[@intFromEnum(r)].record.tagged = false;
+    try ir.verify();
 }
 
 test "union IR rejects invalid constructors reads tags and private capture escape" {

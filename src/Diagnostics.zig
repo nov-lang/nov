@@ -91,7 +91,7 @@ pub fn renderModule(module: *const Module, writer: *std.Io.Writer) !void {
             .invalid_literal => try writer.writeAll("invalid numeric literal"),
             .unsupported_literal => try writer.writeAll("this literal is not supported in semantic analysis yet"),
             .invalid_interpolation => try writer.writeAll("expected {expression}; blocks, control flow, quotes and format options are unsupported; escape literal braces as \\{ and \\}"),
-            .unsupported_interpolation_type => try writer.writeAll("interpolation requires a bool, integer or string value"),
+            .unsupported_interpolation_type => try writer.writeAll("interpolation requires a bool, integer, string, or struct/union with toString: (MyType) -> string"),
             .unsupported_global_interpolation => try writer.writeAll("global strings require literal initializers; move interpolation into a function"),
             .literal_type_mismatch => try writer.writeAll("literal does not match the annotated type"),
             .literal_out_of_range => try writer.writeAll("integer literal does not fit the annotated type"),

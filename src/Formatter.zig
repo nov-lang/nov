@@ -664,6 +664,14 @@ test "array formatting survives every allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, testArrayAllocationFailures, .{});
 }
 
+test "record interpolation formatting preserves captures aliases conversions and allocation cleanup" {
+    const source = "let Alias=Error\nlet Error=struct{s:string,\nlet toString:(e:Alias)->string=e.s\n}\nlet U=union{err:Error,}\nlet f:(u:U)=match u{.err=>|err|@panic(\"Error: {err}\")}\nlet g:(e:Alias)->string=\"{e} {Error.toString(e)} {e}\"";
+    const formatted = try format(std.testing.allocator, source);
+    defer std.testing.allocator.free(formatted);
+    try expectFormatted(source, formatted);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{source});
+}
+
 test "interpolation formatting preserves literal chunks escapes and placeholders" {
     try expectFormatted("let f:(n:int,s:string)->string=\"é\\{\\}\\0{n}:{s}😀\"", "let f: (n: int, s: string) -> string = \"é\\{\\}\\0{n}:{s}😀\"\n");
 }
