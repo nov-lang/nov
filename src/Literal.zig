@@ -3,6 +3,7 @@ const string_literal = @import("string_literal.zig");
 const Ast = @import("Ast.zig");
 const Module = @import("Module.zig");
 const Ir = @import("Ir.zig");
+const TypeResolver = @import("TypeResolver.zig");
 
 pub const Result = union(enum) { not_literal, failed, constant: Ir.ConstId };
 pub const Error = Ir.InternError;
@@ -24,6 +25,17 @@ pub fn check(module: *Module, ir: *Ir, node: Ast.Node.Index, expected: Ir.TypeId
                 if (ast.firstToken(current) != block.ast.lbrace or block.ast.statements.len != 1) return .not_literal;
                 if (ast.nodes.items(.tag)[block.ast.statements[0]] == .decl) return .not_literal;
                 current = block.ast.statements[0];
+            },
+            .enum_literal, .field_access => {
+                const qualified = if (ast.nodes.items(.tag)[current] == .field_access) try qualifiedEnum(module, ir, current) else null;
+                if (ast.nodes.items(.tag)[current] == .field_access and qualified == null) return .not_literal;
+                if (qualified != null and qualified.? != expected) return failLiteral(module, .literal_type_mismatch, span, annotation);
+                const ty = ir.getType(expected).?;
+                if (ty != .enumeration) return failLiteral(module, .literal_type_mismatch, span, annotation);
+                const token = if (qualified != null) ast.nodes.items(.data)[current].rhs else ast.nodes.items(.main_token)[current];
+                const name = ast.tokenSlice(token);
+                for (ty.enumeration.tags, 0..) |tag, i| if (std.mem.eql(u8, tag.name, name)) return internLiteral(module, ir, expected, .{ .enum_tag = @intCast(i) }, module.tokenSpan(token), annotation);
+                return failLiteral(module, .unknown_field, module.tokenSpan(token), null);
             },
             .number_literal => return checkNumber(module, ir, current, expected, false, span, annotation),
             .negation => {
@@ -76,6 +88,20 @@ pub fn check(module: *Module, ir: *Ir, node: Ast.Node.Index, expected: Ir.TypeId
             else => return .not_literal,
         }
     }
+}
+
+pub fn qualifiedEnum(module: *Module, ir: *Ir, node: Ast.Node.Index) Error!?Ir.TypeId {
+    const ast = &module.ast;
+    if (ast.nodes.items(.tag)[node] != .field_access) return null;
+    const base = ast.nodes.items(.data)[node].lhs;
+    if (ast.nodes.items(.tag)[base] != .identifier) return null;
+    const id = module.lookup(ast.tokenSlice(ast.nodes.items(.main_token)[base])) orelse return null;
+    if (!module.getDeclaration(id).?.is_type_alias or module.getDeclaration(id).?.is_generic) return null;
+    const ty = (try TypeResolver.resolve(module, ir, base)) orelse return null;
+    const t = ir.getType(ty).?;
+    if (t != .enumeration) return null;
+    if (module.lookupMethod(@enumFromInt(t.enumeration.identity), ast.tokenSlice(ast.nodes.items(.data)[node].rhs)) != null) return null;
+    return ty;
 }
 
 pub fn hasInterpolation(bytes: []const u8) bool {

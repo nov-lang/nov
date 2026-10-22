@@ -363,6 +363,7 @@ pub fn errorOffset(tree: Ast, parse_error: Error) u32 {
 pub fn renderError(self: Ast, parse_error: Error, writer: anytype) !void {
     const token_tags = self.tokens.items(.tag);
     switch (parse_error.tag) {
+        .unsupported_enum_backing => return writer.writeAll("explicit enum backing types are unsupported; use enum { ... }"),
         .chained_comparison_operators => {
             return writer.writeAll("comparison operators cannot be chained");
         },
@@ -1455,6 +1456,7 @@ pub const Error = struct {
         unattached_doc_comment,
         nov_style_container,
         unsupported_loop,
+        unsupported_enum_backing,
         unsupported_range_loop,
         expected_decl,
         expected_expr,

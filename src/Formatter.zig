@@ -54,7 +54,8 @@ fn fieldDefaultSupported(ast: Ast, node: Ast.Node.Index) bool {
     }
     const tag = ast.nodes.items(.tag)[current];
     if (tag == .negation) return ast.nodes.items(.tag)[ast.nodes.items(.data)[current].rhs] == .number_literal;
-    if (tag == .number_literal) return true;
+    if (tag == .number_literal or tag == .enum_literal) return true;
+    if (tag == .field_access) return ast.nodes.items(.tag)[ast.nodes.items(.data)[current].lhs] == .identifier;
     if (tag == .string_literal) return !Literal.hasInterpolation(ast.tokenSlice(ast.firstToken(current)));
     if (tag == .identifier) {
         const name = ast.tokenSlice(ast.firstToken(current));

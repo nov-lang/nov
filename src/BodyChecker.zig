@@ -432,8 +432,12 @@ const Context = struct {
         if (!self.module.getDeclaration(id).?.is_type_alias) return null;
         const ty = (try TypeResolver.resolve(self.module, self.ir, data.lhs)) orelse return null;
         const record = self.ir.getType(ty).?;
-        if (record != .record) return null;
-        return self.module.lookupMethod(@enumFromInt(record.record.identity), ast.tokenSlice(data.rhs));
+        const identity = switch (record) {
+            .record => record.record.identity,
+            .enumeration => record.enumeration.identity,
+            else => return null,
+        };
+        return self.module.lookupMethod(@enumFromInt(identity), ast.tokenSlice(data.rhs));
     }
 
     fn directNoreturn(self: *Context, node: Ast.Node.Index) Error!bool {
@@ -467,11 +471,11 @@ const Context = struct {
     fn convertPrintable(self: *Context, node: Ast.Node.Index, ty: Ir.TypeId) Error!bool {
         const record = self.ir.getType(ty).?;
         if (record == .boolean or record == .integer or record == .string) return true;
-        if (record != .record) {
+        if (record != .record and record != .enumeration) {
             _ = try self.fail(.unsupported_body_expression, node, null);
             return false;
         }
-        const method = self.module.lookupMethod(@enumFromInt(record.record.identity), "toString") orelse {
+        const method = self.module.lookupMethod(@enumFromInt(if (record == .enumeration) record.enumeration.identity else record.record.identity), "toString") orelse {
             _ = try self.fail(.invalid_to_string, node, null);
             return false;
         };
@@ -652,6 +656,7 @@ const Context = struct {
                 break :blk .{ .ty = ty };
             },
             .field_access => blk: {
+                if (try Literal.qualifiedEnum(self.module, self.ir, node)) |ty| break :blk .{ .ty = ty };
                 if (try self.staticMethod(node)) |id| break :blk self.globalType(id);
                 const base = (try self.probe(data.lhs, depth + 1)) orelse break :blk null;
                 if (self.fieldIndex(base.ty, ast.tokenSlice(data.rhs))) |index| break :blk .{ .ty = self.ir.getType(base.ty).?.record.fields[index].ty };
@@ -987,6 +992,7 @@ const Context = struct {
         switch (ast.nodes.items(.tag)[node]) {
             .bit_or => return try self.patternShape(data.lhs, depth + 1) and try self.patternShape(data.rhs, depth + 1),
             .number_literal, .string_literal, .enum_literal => return true,
+            .field_access => if (try Literal.qualifiedEnum(self.module, self.ir, node) != null) return true,
             .negation => if (ast.nodes.items(.tag)[data.rhs] == .number_literal) return true,
             .identifier => {
                 const name = ast.tokenSlice(ast.nodes.items(.main_token)[node]);
@@ -1024,6 +1030,49 @@ const Context = struct {
         };
     }
 
+    const EnumCoverage = struct { fresh: bool, previous: ?Module.Span = null };
+
+    fn enumPatternCoverage(self: *Context, node: Ast.Node.Index, ty: Ir.TypeId, covered: []?Module.Span, depth: usize) Error!?EnumCoverage {
+        if (depth >= max_recursive_depth) {
+            _ = try self.fail(.body_nesting_limit, node, null);
+            return null;
+        }
+        const ast = &self.module.ast;
+        if (ast.nodes.items(.tag)[node] == .bit_or) {
+            const data = ast.nodes.items(.data)[node];
+            const left = (try self.enumPatternCoverage(data.lhs, ty, covered, depth + 1)) orelse return null;
+            const right = (try self.enumPatternCoverage(data.rhs, ty, covered, depth + 1)) orelse return null;
+            return .{ .fresh = left.fresh or right.fresh, .previous = left.previous orelse right.previous };
+        }
+        const location = self.irSpan(node);
+        const pattern_span: Module.Span = .{ .start = location.start, .end = location.end };
+        if (self.wildcard(node)) {
+            var coverage: EnumCoverage = .{ .fresh = false };
+            for (covered) |*entry| {
+                if (entry.*) |previous| {
+                    if (coverage.previous == null) coverage.previous = previous;
+                } else {
+                    entry.* = pattern_span;
+                    coverage.fresh = true;
+                }
+            }
+            return coverage;
+        }
+        switch (try Literal.check(self.module, self.ir, node, ty, null)) {
+            .failed => return null,
+            .not_literal => {
+                _ = try self.fail(.unsupported_match_pattern, node, null);
+                return null;
+            },
+            .constant => |constant| {
+                const index = self.ir.getConstant(constant).?.value.enum_tag;
+                const previous = covered[index];
+                if (previous == null) covered[index] = pattern_span;
+                return .{ .fresh = previous == null, .previous = previous };
+            },
+        }
+    }
+
     // Patterns contain no effects. Comparisons use the subject snapshots, never
     // revisit subject ASTs, and reuse verified short-circuit boolean regions.
     fn matchPattern(self: *Context, node: Ast.Node.Index, subject: MatchSubject, depth: usize) Error!?MatchResult {
@@ -1051,6 +1100,10 @@ const Context = struct {
                 return null;
             };
             return .{ .ty = boolean, .value = if (self.emitter) |emitter| try emitter.append(boolean, self.irSpan(node), .{ .union_tag = .{ .base = subject.value.?, .index = index } }) else null };
+        }
+        if (ast.nodes.items(.tag)[node] == .enum_literal and self.ir.getType(subject.ty).? != .enumeration) {
+            _ = try self.fail(.unsupported_match_pattern, node, null);
+            return null;
         }
         const constant = if (self.wildcard(node))
             try self.ir.internConstant(.{ .ty = boolean, .value = .{ .boolean = true } })
@@ -1166,7 +1219,7 @@ const Context = struct {
             const ty = (try self.expression(subject, null, depth + 1)) orelse return null;
             if (self.terminated) return if (expected) |want| want.ty else ty;
             const scalar = self.ir.getType(ty).?;
-            if (scalar != .boolean and scalar != .integer and scalar != .string and !(subjects.len == 1 and self.tagged(ty))) return self.fail(.unsupported_match_subject, subject, null);
+            if (scalar != .boolean and scalar != .integer and scalar != .string and !(subjects.len == 1 and (self.tagged(ty) or scalar == .enumeration))) return self.fail(.unsupported_match_subject, subject, null);
             snapshot.* = .{ .ty = ty, .value = if (self.emitter) |emitter| try emitter.value(subject) else null };
         }
         const union_match = subjects.len == 1 and self.tagged(subjects[0].ty);
@@ -1201,6 +1254,17 @@ const Context = struct {
             if (fallback == null) for (covered) |entry| {
                 if (entry == null) return self.fail(.match_missing_variants, node, null);
             };
+        } else if (subjects.len == 1 and self.ir.getType(subjects[0].ty).? == .enumeration) {
+            const tags = self.ir.getType(subjects[0].ty).?.enumeration.tags;
+            const covered = try self.module.allocator.alloc(?Module.Span, tags.len);
+            defer self.module.allocator.free(covered);
+            @memset(covered, null);
+            for (match.cases) |case| {
+                const pattern = ast.fullMatchCase(case).?.ast.values[0];
+                const coverage = (try self.enumPatternCoverage(pattern, subjects[0].ty, covered, depth + 1)) orelse return null;
+                if (!coverage.fresh) return self.fail(.match_covered_enum_prong, pattern, coverage.previous);
+            }
+            for (covered) |entry| if (entry == null) return self.fail(.match_missing_variants, node, null);
         } else if (subjects.len == 1 and self.ir.getType(subjects[0].ty).? == .boolean) {
             var covered: u2 = 0;
             var first_true: ?Module.Span = null;
@@ -1299,7 +1363,7 @@ const Context = struct {
                 const ty = (try self.expression(embedded, null, depth + 1)) orelse return null;
                 if (self.terminated) return self.fit(string, expected, node);
                 const scalar = self.ir.getType(ty).?;
-                if (scalar != .boolean and scalar != .integer and scalar != .string and scalar != .record) return self.interpolationError(.unsupported_interpolation_type, .{ .start = location.start + @as(u32, @intCast(start)), .end = location.start + @as(u32, @intCast(offset)) });
+                if (scalar != .boolean and scalar != .integer and scalar != .string and scalar != .record and scalar != .enumeration) return self.interpolationError(.unsupported_interpolation_type, .{ .start = location.start + @as(u32, @intCast(start)), .end = location.start + @as(u32, @intCast(offset)) });
                 if (!try self.convertPrintable(embedded, ty)) return null;
                 if (self.emitter) |emitter| {
                     const converted = try emitter.append(string, self.irSpan(node), .{ .to_string = try emitter.value(embedded) });
@@ -1483,6 +1547,7 @@ const Context = struct {
         const ast = &self.module.ast;
         const data = ast.nodes.items(.data)[node];
         switch (ast.nodes.items(.tag)[node]) {
+            .enum_literal => return self.fail(.enum_needs_type, node, null),
             .unwrap => return self.propagate(node, expected, depth),
             .container_decl_arg => return self.recordInit(node, expected, depth),
             .match => return self.matchExpression(node, expected, hint, depth),
@@ -1775,7 +1840,7 @@ const Context = struct {
                 const operand = (try self.probe(data.lhs, depth + 1)) orelse (try self.probe(data.rhs, depth + 1)) orelse return self.missingOperandType(node, data.lhs, data.rhs, null, depth);
                 const ty = self.ir.getType(operand.ty).?;
                 const equality = ast.nodes.items(.tag)[node] == .equal_equal or ast.nodes.items(.tag)[node] == .bang_equal;
-                if (ty != .integer and !((ty == .boolean or ty == .string) and equality)) return self.fail(.operator_not_supported, node, operand.annotation);
+                if (ty != .integer and !((ty == .boolean or ty == .string or ty == .enumeration) and equality)) return self.fail(.operator_not_supported, node, operand.annotation);
                 const lhs = try self.expression(data.lhs, operand, depth + 1);
                 const rhs = try self.expression(data.rhs, operand, depth + 1);
                 if (lhs == null or rhs == null) return null;

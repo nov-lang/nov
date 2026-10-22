@@ -1279,7 +1279,7 @@ fn parsePrimaryTypeExpr(self: *Parser) Error!Node.Index {
         // .keyword_loop => return self.parseLoop(expectTypeExpr) // do not add yet
         // .keyword_match => return self.parseMatchExpr(), // do not add yet
         // TODO
-        .keyword_struct, .keyword_union => return self.parseStruct(),
+        .keyword_struct, .keyword_union, .keyword_enum => return self.parseStruct(),
         // .keyword_struct,
         // .keyword_opaque,
         // .keyword_enum,
@@ -1352,7 +1352,7 @@ test "malformed structs constructors and attributes recover without panicking" {
     for ([_][:0]const u8{
         "let A=struct",               "let A=struct {x}",           "let A=struct {x:int}",
         "let A=struct {x:int=,}",     "let A=struct {@[public]\n}", "let A=struct {var x:int,}",
-        "let a=A[.x]",                "let a=A[.x=]",               "let a=A[.x=1,.x]",
+        "let a=A[.x=,]",              "let a=A[.x=]",               "let a=A[.x=1,.x]",
         "let A=struct {let f:()=\n}",
     }) |source| {
         var ast = try parse(std.testing.allocator, source);
@@ -1364,6 +1364,8 @@ test "malformed structs constructors and attributes recover without panicking" {
 fn parseStruct(self: *Parser) Error!Node.Index {
     const keyword = self.nextToken();
     const is_union = self.token_tags[keyword] == .keyword_union;
+    const is_enum = self.token_tags[keyword] == .keyword_enum;
+    if (is_enum and self.token_tags[self.tok_i] == .l_paren) return self.fail(.unsupported_enum_backing);
     _ = try self.expectToken(.l_brace);
     const top = self.scratch.items.len;
     defer self.scratch.shrinkRetainingCapacity(top);
@@ -1379,7 +1381,7 @@ fn parseStruct(self: *Parser) Error!Node.Index {
             .at_sign_l_bracket => try self.expectAttrDecl(),
             .identifier => blk: {
                 const name = self.nextToken();
-                const ty = if (is_union and self.token_tags[self.tok_i] == .comma) 0 else blk_type: {
+                const ty = if ((is_enum and self.token_tags[self.tok_i] != .colon) or (is_union and self.token_tags[self.tok_i] == .comma)) 0 else blk_type: {
                     _ = try self.expectToken(.colon);
                     break :blk_type try self.expectTypeExpr();
                 };
@@ -1410,7 +1412,7 @@ fn parseSuffixOp(self: *Parser, lhs: Node.Index) Error!Node.Index {
                 while (self.token_tags[next] == .newline) : (next += 1) {}
                 if (self.token_tags[next] == .period or self.token_tags[next] == .r_bracket) self.tok_i = next;
             }
-            if (self.token_tags[self.tok_i] == .period or self.token_tags[self.tok_i] == .r_bracket) {
+            if ((self.token_tags[self.tok_i] == .period and self.token_tags[self.tok_i + 1] == .identifier and self.token_tags[self.tok_i + 2] == .equal) or self.token_tags[self.tok_i] == .r_bracket) {
                 const top = self.scratch.items.len;
                 defer self.scratch.shrinkRetainingCapacity(top);
                 while (self.token_tags[self.tok_i] != .r_bracket) {

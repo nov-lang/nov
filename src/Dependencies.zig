@@ -90,7 +90,15 @@ fn scanInitializer(self: *Dependencies, module: *Module, id: Module.DeclId, work
         const data = ast.nodes.items(.data)[node];
         const span = module.tokenSpan(ast.nodes.items(.main_token)[node]);
         switch (tag) {
-            .number_literal, .char_literal, .string_literal => {},
+            .number_literal, .char_literal, .string_literal, .enum_literal => {},
+            .field_access => {
+                const base = data.lhs;
+                const target = if (ast.nodes.items(.tag)[base] == .identifier) module.lookup(ast.tokenSlice(ast.nodes.items(.main_token)[base])) else null;
+                if (target == null or !module.getDeclaration(target.?).?.is_type_alias) {
+                    try module.diagnostics.append(self.allocator, .{ .tag = .unsupported_dependency_expression, .span = span });
+                    entry.state = .failed;
+                }
+            },
             .call, .call_one, .call_comma, .call_one_comma => {
                 const call = ast.fullCall(node).?;
                 if (ast.nodes.items(.tag)[call.ast.fn_expr] == .builtin_literal and

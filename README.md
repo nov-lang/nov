@@ -602,6 +602,40 @@ containers are [Enum](#Enum), [Struct](#Struct) and [Union](#Union).
 Similarly to functions, brackets are specific to containers.
 
 ### Enum
+
+#### Executable nominal enums
+
+Unnumbered module declarations such as `let Kind = enum { not_found, permission_denied, io, }`
+introduce nominal enum types. Different declarations are distinct even when their
+names and tags match; module aliases preserve identity.
+
+- `Kind.not_found` determines its own type. Contextual `.not_found` requires an
+  expected enum type; bare tags do not infer a type. Tags use no brackets.
+- Equality and inequality require exactly the same enum type. Enums are not
+  integers: numeric conversions, arithmetic, ordering and integer-backed syntax
+  are unsupported. Internal `uint32_t` ordinals are private implementation details,
+  not an exposed numeric or FFI contract.
+- Single-enum matches accept contextual or qualified tag patterns, `|` alternatives,
+  and `_`. All tags must be covered or a final catchall supplied. Unknown tags and
+  wholly covered prongs diagnose with related earlier-pattern notes; partially
+  overlapping alternatives retain first-match behavior. Enum patterns do not bind
+  payload captures.
+- Enum locals, parameters, returns, control-flow results, literal globals, flat
+  record fields (including tag defaults), union payloads and generic type arguments
+  work with exact nominal typing. `Result(uint, Kind)` supports ordinary `.!`
+  propagation with exact error identity. Enum leaves need no GC roots.
+- Static container methods and `@[public]` metadata follow the existing bounded
+  container rules. Printing/interpolation require the exact container method
+  `toString: (Kind) -> string`; numeric or tag-name formatting is not derived.
+- Explicit numbered values/backing types, enum arrays and instance-method call
+  syntax remain unsupported.
+
+[examples/structured-errors.nov](examples/structured-errors.nov) uses an enum error
+kind in a record payload, exhaustive error-message selection and special handling
+for `.not_found`.
+
+The broader numbered-enum and instance-call example below remains design-only.
+
 Nov enums are just like C enums except that they can have methods and their fields are not global.
 
 Overall enums are a nice way to represent tags or constant numbers.
@@ -747,7 +781,7 @@ let z = [ 10, 20, 30 ]
 Ordinary module declarations such as `let Value = union { number: int, text: string, empty, }`
 introduce nominal tagged value types. Separate declarations remain distinct; aliases
 preserve identity. The current executable subset supports bool, integer, string,
-void, and existing flat nominal struct payloads, with no payload defaults. As with structs, integer fields are
+void, enum, and existing flat nominal struct payloads, with no payload defaults. As with structs, integer fields are
 checked semantically through 128 bits, while reachable C layouts require
 8/16/32/64-bit widths.
 
@@ -914,8 +948,8 @@ in the broader definitions below also remain design-only.
 
 `examples/error.nov` now uses `.!` and explicit Result returns, with its alternative
 implementations commented out. It is still a filesystem design example, not an
-executable program: imports, filesystem resources, enum error kinds and instance
-calls remain future work. Record payloads and record interpolation are implemented;
+executable program: imports, filesystem resources and instance calls remain future
+work. Nominal enum error kinds and exhaustive enum matches are implemented. Record payloads and record interpolation are implemented;
 terminal `@panic` follows the `@[noreturn]` void-function contract described below.
 
 [examples/structured-errors.nov](examples/structured-errors.nov) is a runnable
@@ -1717,7 +1751,7 @@ never static byte pointers. Temporaries use the same precise root frames as arra
 an immutable `string`. Placeholders support `bool` (`true`/`false`), signed and
 unsigned fixed-width integers (`i8`/`u8` through `i64`/`u64`), native `int`/`uint`
 (exact decimal, including minimum/maximum values), and strings (unchanged bytes).
-Nominal structs and non-generic unions also work when they define the exact
+Nominal enums, structs and non-generic unions also work when they define the exact
 container `toString: (SelfType) -> string` method already required by print.
 Each placeholder expression evaluates once, then converts once immediately before
 proceeding to the next chunk or placeholder. Aliases preserve the exact signature;

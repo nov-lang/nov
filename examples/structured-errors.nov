@@ -8,12 +8,23 @@ let Entry = struct {
     size: uint,
 }
 
+let ErrorKind = enum {
+    not_found,
+    permission_denied,
+    io,
+}
+
 let LookupError = struct {
     name: string,
-    message: string,
+    kind: ErrorKind = .not_found,
 
     let toString: (self: LookupError) -> string = {
-        "{self.name}: {self.message}"
+        let message = match self.kind {
+            .not_found => "entry not found"
+            .permission_denied => "permission denied"
+            .io => "I/O failure"
+        }
+        "{self.name}: {message}"
     }
 }
 
@@ -21,7 +32,7 @@ let lookup: (name: string) -> Result(Entry, LookupError) = {
     if name == "readme" {
         .ok[Entry[ .name = name, .size = 42 ]]
     } else {
-        .err[LookupError[ .name = name, .message = "entry not found" ]]
+        .err[LookupError[ .name = name ]]
     }
 }
 
@@ -33,7 +44,10 @@ let describe: (name: string) -> Result(string, LookupError) = {
 let report: (name: string) = {
     let message = match describe(name) {
         .ok => |text| text
-        .err => |error| "Error: {error}"
+        .err => |error| match error.kind {
+            .not_found => "Error: {error}"
+            _ => @panic("Unexpected error: {error}")
+        }
     }
     @println(message)
 }

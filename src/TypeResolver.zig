@@ -143,8 +143,10 @@ fn resolveDepth(module: *Module, ir: *Ir, node: Ast.Node.Index, depth: usize, al
     if (ast.fullCall(node)) |call| return instantiate(module, ir, call, node, depth, aliases, env);
     if (ast.fullStruct(node) != null) {
         for (module.declarations.items, 0..) |declaration, i| {
-            if (declaration.is_record and ast.decl(declaration.node).ast.init_node == node)
+            if (declaration.is_record and ast.decl(declaration.node).ast.init_node == node) {
+                if (ast.tokens.items(.tag)[ast.nodes.items(.main_token)[node]] == .keyword_enum) return resolveEnum(module, ir, @intCast(i), node);
                 return try ir.internType(.{ .record = .{ .identity = @intCast(i), .fields = &.{}, .public = declaration.public, .tagged = ast.isUnion(node) } });
+            }
         }
         return diagnose(module, node, .unsupported_type);
     }
@@ -174,6 +176,42 @@ fn resolveDepth(module: *Module, ir: *Ir, node: Ast.Node.Index, depth: usize, al
         } });
     }
     return diagnose(module, node, if (primitives.isPrimitive(name)) .unsupported_type else .unknown_type);
+}
+
+fn resolveEnum(module: *Module, ir: *Ir, identity: u32, node: Ast.Node.Index) Error!?Ir.TypeId {
+    for (ir.types.items, 0..) |ty, i| if (ty == .enumeration and ty.enumeration.identity == identity) return @enumFromInt(i);
+    const declaration = module.getDeclaration(@enumFromInt(identity)).?;
+    const ast = &module.ast;
+    var tags: std.ArrayList(Ir.EnumTag) = .empty;
+    defer tags.deinit(module.allocator);
+    var valid = true;
+    for (ast.fullStruct(node).?) |member| {
+        if (ast.nodes.items(.tag)[member] != .container_field) continue;
+        const data = ast.nodes.items(.data)[member];
+        const token = ast.nodes.items(.main_token)[member];
+        const span = module.tokenSpan(token);
+        const name = ast.tokenSlice(token);
+        if (data.lhs != 0 or data.rhs != 0) {
+            _ = try diagnose(module, member, .unsupported_enum_value);
+            valid = false;
+        }
+        if (std.mem.startsWith(u8, name, "@\"")) {
+            _ = try diagnose(module, member, .unsupported_name);
+            valid = false;
+        }
+        var duplicate = module.lookupMethod(@enumFromInt(identity), name) != null;
+        for (tags.items) |tag| if (std.mem.eql(u8, name, tag.name)) {
+            duplicate = true;
+        };
+        if (duplicate) {
+            _ = try diagnose(module, member, .duplicate_field);
+            valid = false;
+        }
+        try tags.append(module.allocator, .{ .name = name, .span = .{ .start = span.start, .end = span.end } });
+    }
+    if (tags.items.len == 0) return diagnose(module, node, .empty_enum);
+    if (!valid) return null;
+    return try ir.internType(.{ .enumeration = .{ .identity = identity, .name = declaration.name, .tags = tags.items, .public = declaration.public } });
 }
 
 fn lookupBinding(bindings: []const Binding, name: []const u8) ?Ir.TypeId {

@@ -1,5 +1,14 @@
 # TODO
 
+Nominal unnumbered enums are executable: qualified/contextual tags, aliases, exact
+==/!=, exhaustive single-enum matches with qualified patterns/alternatives/catchall,
+covered-pattern notes, literal globals, record fields and tag defaults, union
+payloads, generic arguments and .! error propagation. Static methods/public and
+exact toString printing/interpolation reuse container rules. Enum leaves add no GC
+roots; internal uint32 ordinals expose no numeric/FFI policy. Numbered values,
+backing types, numeric conversions/arithmetic/ordering, arrays and instance calls
+remain unsupported. structured-errors.nov now handles an enum .not_found kind.
+
 Flat nominal records now work as ordinary/generic union payloads, retaining exact
 identity through aliases, constructors, captures, copies and .! propagation. C
 layouts are dependency-ordered and every nested string owner is rooted; inactive
@@ -39,11 +48,11 @@ Generic methods, generic structs, general comptime/value parameters, nested unio
 array/function payloads, nested record fields, explicit tag enums and Option
 propagation remain deferred.
 The updated filesystem error example remains design-only: imports, file-resource
-semantics, error kinds and instance calls are missing.
+semantics and instance calls are missing.
 
 Bounded nominal value structs are executable; `examples/type.nov` is unchanged
 and runs/checks/formats successfully. Separate declarations have distinct identities;
-module aliases preserve identity. Flat bool/integer/string fields have exact types,
+module aliases preserve identity. Flat bool/integer/string/enum fields have exact types,
 literal-only defaults and required-field diagnostics. Explicit `Type[.field=value]`
 constructors evaluate supplied fields once left-to-right, then omitted literal defaults
 in declaration order. Record value boundaries copy fields; strings share immutable

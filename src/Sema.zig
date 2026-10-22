@@ -50,7 +50,11 @@ pub fn analyzeAnnotations(module: *Module) Error!Sema {
             continue;
         }
         if (!declaration.is_record) continue;
-        result.entries[i].alias_type = try result.ir.internType(.{ .record = .{ .identity = @intCast(i), .fields = &.{}, .public = declaration.public, .tagged = module.ast.isUnion(module.ast.decl(declaration.node).ast.init_node) } });
+        const init_node = module.ast.decl(declaration.node).ast.init_node;
+        result.entries[i].alias_type = if (module.ast.tokens.items(.tag)[module.ast.nodes.items(.main_token)[init_node]] == .keyword_enum)
+            try TypeResolver.resolve(module, &result.ir, init_node)
+        else
+            try result.ir.internType(.{ .record = .{ .identity = @intCast(i), .fields = &.{}, .public = declaration.public, .tagged = module.ast.isUnion(init_node) } });
         result.entries[i].status = .type_alias;
     }
     for (module.declarations.items, 0..) |declaration, i| {
@@ -113,6 +117,7 @@ pub fn analyzeAnnotations(module: *Module) Error!Sema {
             try module.diagnostics.append(module.allocator, .{ .tag = .unsupported_type, .span = declaration.name_span });
             continue;
         }
+        if (module.ast.tokens.items(.tag)[module.ast.nodes.items(.main_token)[full.ast.init_node]] == .keyword_enum) continue;
         const tagged = module.ast.isUnion(full.ast.init_node);
         var fields: std.ArrayList(Ir.Field) = .empty;
         defer fields.deinit(module.allocator);
@@ -221,6 +226,11 @@ fn checkScalarGlobal(self: *Sema, module: *Module, index: usize, initializer: As
         node = call.ast.args[1];
     }
     switch (ast.nodes.items(.tag)[node]) {
+        .field_access => {
+            const ty = (try Literal.qualifiedEnum(module, &self.ir, node)) orelse return;
+            if (expected == null) expected = ty;
+        },
+        .enum_literal => if (expected == null) return,
         .identifier => {
             const name = ast.tokenSlice(ast.firstToken(node));
             if (module.lookup(name) != null or (!std.mem.eql(u8, name, "true") and !std.mem.eql(u8, name, "false"))) return;

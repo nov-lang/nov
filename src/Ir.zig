@@ -115,7 +115,10 @@ pub const Record = struct {
     type_args: []const TypeId = &.{},
     instance_state: enum { complete, building, failed } = .complete,
 };
+pub const EnumTag = struct { name: []const u8, span: Span };
+pub const Enumeration = struct { identity: u32, name: []const u8, tags: []const EnumTag, public: bool = false };
 pub const Type = union(enum) {
+    enumeration: Enumeration,
     record: Record,
     void,
     boolean,
@@ -141,6 +144,7 @@ pub const Constant = struct {
     value: Value,
 
     pub const Value = union(enum) {
+        enum_tag: u32,
         void,
         boolean: bool,
         signed_integer: i128,
@@ -192,6 +196,11 @@ pub fn deinit(self: *Ir) void {
             .record => |record| {
                 self.freeFields(record.fields);
                 self.allocator.free(record.type_args);
+            },
+            .enumeration => |enumeration| {
+                self.allocator.free(enumeration.name);
+                for (enumeration.tags) |tag| self.allocator.free(tag.name);
+                self.allocator.free(enumeration.tags);
             },
             .function => |function| self.allocator.free(function.params),
             else => {},
@@ -313,11 +322,32 @@ pub fn setRecordFields(self: *Ir, id: TypeId, fields: []const Field) InternError
 pub fn internType(self: *Ir, ty: Type) InternError!TypeId {
     try self.validateType(ty, self.types.items.len);
     for (self.types.items, 0..) |existing, i| {
-        if (typeEql(existing, ty)) return @enumFromInt(i);
+        if (typeEql(existing, ty)) {
+            if (ty == .enumeration) {
+                if (!std.mem.eql(u8, existing.enumeration.name, ty.enumeration.name) or existing.enumeration.public != ty.enumeration.public or existing.enumeration.tags.len != ty.enumeration.tags.len) return error.InvalidTypeId;
+                for (existing.enumeration.tags, ty.enumeration.tags) |a, b| if (!std.mem.eql(u8, a.name, b.name) or !std.meta.eql(a.span, b.span)) return error.InvalidTypeId;
+            }
+            return @enumFromInt(i);
+        }
     }
     if (self.types.items.len == std.math.maxInt(u32)) return error.TooManyEntries;
     try self.types.ensureUnusedCapacity(self.allocator, 1);
     const owned: Type = switch (ty) {
+        .enumeration => |enumeration| blk: {
+            const name = try self.allocator.dupe(u8, enumeration.name);
+            errdefer self.allocator.free(name);
+            const tags = try self.allocator.dupe(EnumTag, enumeration.tags);
+            var copied: usize = 0;
+            errdefer {
+                for (tags[0..copied]) |tag| self.allocator.free(tag.name);
+                self.allocator.free(tags);
+            }
+            for (tags) |*tag| {
+                tag.name = try self.allocator.dupe(u8, tag.name);
+                copied += 1;
+            }
+            break :blk .{ .enumeration = .{ .identity = enumeration.identity, .name = name, .tags = tags, .public = enumeration.public } };
+        },
         .record => |record| blk: {
             if (record.fields.len != 0) return error.InvalidTypeId;
             const args = try self.allocator.dupe(TypeId, record.type_args);
@@ -607,7 +637,7 @@ fn validateBody(self: *const Ir, function: Function, body: Body) VerifyError!voi
                 if (try operandType(body, r.lhs, i) != instruction.ty or try operandType(body, r.rhs, i) != instruction.ty) return error.OperandTypeMismatch;
             },
             .local_slot => |value| {
-                if (ty != .boolean and ty != .integer and ty != .function and ty != .array and ty != .string and ty != .record) return error.InvalidOperation;
+                if (ty != .boolean and ty != .integer and ty != .function and ty != .array and ty != .string and ty != .record and ty != .enumeration) return error.InvalidOperation;
                 if (try operandType(body, value, i) != instruction.ty) return error.OperandTypeMismatch;
             },
             .local_load => |slot| {
@@ -710,7 +740,7 @@ fn validateBody(self: *const Ir, function: Function, body: Body) VerifyError!voi
                         if (instruction.ty != lhs) return error.OperandTypeMismatch;
                     },
                     .eq, .ne, .lt, .le, .gt, .ge => {
-                        if (operand != .integer and !((binary.op == .eq or binary.op == .ne) and (operand == .boolean or operand == .string))) return error.InvalidOperation;
+                        if (operand != .integer and !((binary.op == .eq or binary.op == .ne) and (operand == .boolean or operand == .string or operand == .enumeration))) return error.InvalidOperation;
                         if (ty != .boolean) return error.OperandTypeMismatch;
                     },
                 }
@@ -766,6 +796,14 @@ fn validateBody(self: *const Ir, function: Function, body: Body) VerifyError!voi
 
 fn validateType(self: *const Ir, ty: Type, before: usize) ValidationError!void {
     switch (ty) {
+        .enumeration => |enumeration| {
+            if (enumeration.name.len == 0 or enumeration.tags.len == 0 or enumeration.tags.len > std.math.maxInt(u32)) return error.InvalidTypeId;
+            for (enumeration.tags, 0..) |tag, i| {
+                if (tag.name.len == 0) return error.InvalidTypeId;
+                if (tag.span.start > tag.span.end or tag.span.end > self.source_len) return error.InvalidTypeId;
+                for (enumeration.tags[0..i]) |previous| if (std.mem.eql(u8, previous.name, tag.name)) return error.InvalidTypeId;
+            }
+        },
         .record => |record| {
             for (record.type_args) |arg| if (@intFromEnum(arg) >= before) return error.InvalidTypeId;
             if (record.type_args.len != 0 and !record.tagged) return error.InvalidTypeId;
@@ -806,6 +844,10 @@ fn validateConstant(self: *const Ir, constant: Constant) ValidationError!void {
     const ty = self.getType(constant.ty) orelse return error.InvalidTypeId;
     try self.validateType(ty, self.types.items.len);
     switch (ty) {
+        .enumeration => |enumeration| {
+            if (constant.value != .enum_tag) return error.ConstantTypeMismatch;
+            if (constant.value.enum_tag >= enumeration.tags.len) return error.ConstantTypeMismatch;
+        },
         .void => if (constant.value != .void) return error.ConstantTypeMismatch,
         .boolean => if (constant.value != .boolean) return error.ConstantTypeMismatch,
         .string => {
@@ -860,7 +902,7 @@ pub fn isUnionPayload(ty: Type) bool {
 
 /// Record fields use semantic integer limits, not array/backend storage widths.
 pub fn isRecordField(ty: Type) bool {
-    return ty == .boolean or ty == .string or (ty == .integer and ty.integer.bits > 0 and ty.integer.bits <= 128);
+    return ty == .enumeration or ty == .boolean or ty == .string or (ty == .integer and ty.integer.bits > 0 and ty.integer.bits <= 128);
 }
 
 pub fn isArrayElement(ty: Type) bool {
@@ -874,6 +916,7 @@ fn typeEql(a: Type, b: Type) bool {
     if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
     return switch (a) {
         .void, .boolean, .string => true,
+        .enumeration => |enumeration| enumeration.identity == b.enumeration.identity,
         .integer => |integer| std.meta.eql(integer, b.integer),
         .record => |record| record.identity == b.record.identity and record.tagged == b.record.tagged and std.mem.eql(TypeId, record.type_args, b.record.type_args),
         .array => |element| element == b.array,

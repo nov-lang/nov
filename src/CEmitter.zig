@@ -17,6 +17,7 @@ const Module = @import("Module.zig");
 const Lowering = @import("Lowering.zig");
 const GcRuntime = @import("GcRuntime.zig");
 const Formatter = @import("Formatter.zig");
+const Diagnostics = @import("Diagnostics.zig");
 
 pub const Error = Ir.VerifyError || std.mem.Allocator.Error || error{
     UnsupportedIntegerWidth,
@@ -138,7 +139,7 @@ fn analyze(ir: *const Ir, origins: []?Origin, diagnostic: ?*Diagnostic) Error!vo
         i -= 1;
         const origin = origins[i] orelse continue;
         switch (ir.types.items[i]) {
-            .void, .boolean, .string => {},
+            .void, .boolean, .string, .enumeration => {},
             .record => try markRecord(ir, origins, @enumFromInt(i), origin, diagnostic),
             .array => |element| mark(origins, element, origin),
             .integer => |integer| switch (integer.bits) {
@@ -407,6 +408,7 @@ fn writeType(ir: *const Ir, w: *std.Io.Writer, id: Ir.TypeId) WriteError!void {
     switch (ir.types.items[@intFromEnum(id)]) {
         .void => try w.writeAll("void"),
         .boolean => try w.writeAll("bool"),
+        .enumeration => try w.writeAll("uint32_t"),
         .integer => |integer| try w.print("{s}int{d}_t", .{ if (integer.signedness == .unsigned) "u" else "", integer.bits }),
         .function => try w.print("nov_fn_{d}", .{@intFromEnum(id)}),
         .array => try w.writeAll("nov_array"),
@@ -460,6 +462,7 @@ fn writeConstant(w: *std.Io.Writer, constant: Ir.Constant, ty: Ir.Type) WriteErr
         },
         .void => unreachable, // void values have no C object
         .boolean => |value| try w.writeAll(if (value) "true" else "false"),
+        .enum_tag => |value| try w.print("UINT32_C({d})", .{value}),
         .unsigned_integer => |value| try w.print("UINT{d}_C({d})", .{ ty.integer.bits, value }),
         .signed_integer => |value| {
             const integer = ty.integer;
@@ -995,6 +998,117 @@ const generic_union_program =
     \\    @println(describe(copy), describe(item))
     \\}
 ;
+const enum_program =
+    \\@[public]
+    \\let Kind=enum{not_found,permission_denied,io,
+    \\    @[public]
+    \\    let toString:(self:Kind)->string=match self{Alias.not_found=>"not_found"
+    \\        Kind.permission_denied | .io=>"other"}
+    \\    let eql:(a:Kind,b:Kind)->bool=a==b
+    \\}
+    \\let Alias=Kind
+    \\let initial=Alias.not_found
+    \\let Result:(T:type,E:type)->type=union{ok:T,err:E,}
+    \\let Error=struct{kind:Alias=.not_found,message:string,valid:bool=true,code:uint=7,}
+    \\let R=Result(uint,Alias)
+    \\let S=Result(uint,Error)
+    \\let make:()->R=.err[.not_found]
+    \\let pass:()->R={let n=make().!
+    \\    .ok[n]}
+    \\let structured:()->S=.err[Error[.message="de"+"tail"]]
+    \\let copy:(e:Error)->Error=e
+    \\let main:()={
+    \\    let mut k:Kind=.io
+    \\    let saved=k
+    \\    k=initial
+    \\    let e=copy(Error[.message="hel"+"lo"])
+    \\    @println(k,"{saved}",Kind.eql(k,.not_found),saved!=k,e.kind,e.message,e.valid,e.code)
+    \\    @println(match pass(){.ok=>|n|"{n}"
+    \\        .err=>|kind|"{kind}"})
+    \\    @println(match structured(){.ok=>|n|"{n}"
+    \\        .err=>|err|"{err.kind}:{err.message}"})
+    \\}
+;
+
+test "enum values methods defaults records generic payloads propagation and forced GC" {
+    var module = try Module.init(test_gpa, "enums.nov", enum_program);
+    defer module.deinit();
+    if (module.hasErrors()) {
+        var output = std.Io.Writer.Allocating.init(test_gpa);
+        defer output.deinit();
+        try Diagnostics.renderModule(&module, &output.writer);
+        std.debug.print("{s}", .{output.written()});
+    }
+    const c = try arrayTestProgram(enum_program);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "not_found other true true not_found hello true 7\nnot_found\nnot_found:detail\n", "", mode);
+}
+
+test "qualified enum match patterns and mixed alternatives execute with exact alias identity" {
+    const c = try emitSource(
+        "let K=enum{x,y,z,}\nlet Alias=K\n" ++
+            "let qualified:(k:K)->bool=match k{K.x=>true\nAlias.y=>false\nK.z=>true}\n" ++
+            "let mixed:(k:Alias)->bool=match k{Alias.x | .y=>true\nK.z=>false}\n" ++
+            "let main:()=@println(qualified(.x),qualified(.y),qualified(.z),mixed(.x),mixed(.y),mixed(.z))",
+        null,
+    );
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "void nov_main(void); int main(void) { nov_main(); return 0; }", 0, "true false true true true false\n", "", mode);
+}
+
+test "enum source-free emission and every compiler allocation failure" {
+    var sema = blk: {
+        var module = try Module.init(test_gpa, "enum-owned.nov", enum_program);
+        defer module.deinit();
+        var result = try Lowering.lower(&module);
+        errdefer result.deinit();
+        try std.testing.expect(!module.hasErrors());
+        break :blk result;
+    };
+    defer sema.deinit();
+    const c = try emitProgram(test_gpa, &sema.ir, null);
+    defer test_gpa.free(c);
+    try compileAndRunExpected(c, "typedef int nonempty_translation_unit;", 0, "not_found other true true not_found hello true 7\nnot_found\nnot_found:detail\n", "");
+    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{enum_program});
+}
+
+test "root enum scalars need no GC owners or integer operations" {
+    const library = try emitSource("let K=enum{x,y,}\nlet choose:(k:K)->K=match k{.x=>.y\n.y=>.x}\nlet main:()={let a=K.x\nlet b=choose(a)\n@println(b==.y)}", null);
+    defer test_gpa.free(library);
+    try std.testing.expect(std.mem.indexOf(u8, library, "nov_gc_") == null);
+    try std.testing.expect(std.mem.indexOf(u8, library, "nov_record_") == null);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(library, "void nov_main(void); int main(void) { nov_main(); return 0; }", 0, "true\n", "", mode);
+}
+
+test "transitive enum record leaves are reachable through placeholders in every field order" {
+    for ([_][]const u8{
+        "k:K,b:bool,n:uint,s:string,",
+        "s:string,k:K,b:bool,n:uint,",
+        "n:uint,s:string,b:bool,k:K,",
+        "b:bool,n:uint,k:K,s:string,",
+    }) |fields| {
+        const source = try std.fmt.allocPrint(test_gpa, "let U=union{{ok:R,}}\nlet R=struct{{{s}}}\nlet K=enum{{x,y,}}\nlet unused:(cb:(U)->void)={{}}\nlet main:()={{}}", .{fields});
+        defer test_gpa.free(source);
+        const c = try emitSource(source, null);
+        defer test_gpa.free(c);
+        try std.testing.expect(std.mem.indexOf(u8, c, "nov_string;") != null);
+        try std.testing.expect(std.mem.indexOf(u8, c, "nov_gc_") == null);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "void nov_main(void); int main(void) { nov_main(); return 0; }", 0, "", "", mode);
+    }
+    for ([_][]const u8{ "i128", "u128" }) |width| {
+        const source = try std.fmt.allocPrint(test_gpa, "let U=union{{ok:R,}}\nlet R=struct{{k:K,b:bool,s:string,n:{s},}}\nlet K=enum{{x,}}\nlet unused:(cb:(U)->void)={{}}\nlet main:()={{}}", .{width});
+        defer test_gpa.free(source);
+        var module = try Module.init(test_gpa, "enum-width.nov", source);
+        defer module.deinit();
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        try std.testing.expect(!module.hasErrors());
+        var diagnostic: Diagnostic = undefined;
+        try std.testing.expectError(error.UnsupportedIntegerWidth, emit(test_gpa, &sema.ir, &diagnostic));
+        try std.testing.expectEqualStrings("n", module.sourceSlice(.{ .start = diagnostic.span.start, .end = diagnostic.span.end }).?);
+    }
+}
+
 const record_payload_program =
     \\let Result:(T:type,E:type)->type=union{ok:T,err:E,}
     \\let Apply=Result

@@ -126,6 +126,10 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     _ = fixtures.add("interpolation.nov", @embedFile("examples/interpolation.nov"));
     _ = fixtures.add("type-aliases.nov", @embedFile("examples/type-aliases.nov"));
     _ = fixtures.add("type.nov", @embedFile("examples/type.nov"));
+    _ = fixtures.add("enums.nov", "let Kind=enum{not_found,permission_denied,io,\nlet toString:(k:Kind)->string=match k{.not_found=>\"not_found\"\n.permission_denied | .io=>\"other\"}\n}\nlet Result:(T:type,E:type)->type=union{ok:T,err:E,}\nlet R=Result(uint,Kind)\nlet Error=struct{kind:Kind=.not_found,message:string,}\nlet fail:()->R=.err[.not_found]\nlet pass:()->R={let n=fail().!\n.ok[n]}\nlet main:()={let e=Error[.message=\"not \"+\"found\"]\n@println(e.kind,e.message,Kind.io!=.not_found,match pass(){.ok=>|n|\"{n}\"\n.err=>|k|\"{k}\"})}");
+    _ = fixtures.add("enum-missing.nov", "let K=enum{x,y,}\nlet f:(k:K)->bool=match k{.x=>true}");
+    _ = fixtures.add("enum-numbered.nov", "let K=enum{x=7,y,}");
+    _ = fixtures.add("enum-backing.nov", "let K=enum(u8){x,}");
     _ = fixtures.add("unions.nov", "let Alias=U\nlet U=union{ok:int,err:string,none,}\nlet describe:(u:Alias)->string=match u{.ok=>|v|\"ok:{v}\"\n.err=>|s|s\n.none=>\"none\"}\nlet main:()={@println(describe(U.ok[7]),describe(.err[\"a\"+\"b\"]),describe(.none[]))}");
     _ = fixtures.add("union-missing.nov", "let U=union{ok:int,none,}\nlet f:(u:U)->int=match u{.ok=>|n|n}");
     _ = fixtures.add("union-duplicate.nov", "let U=union{ok:int,none,}\nlet f:(u:U)->int=match u{.ok=>0\n.ok=>1\n_=>2}");
@@ -251,8 +255,12 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         stderr_match: ?[]const u8 = null,
     };
     const cases = [_]Case{
+        .{ .name = "enum semantic", .args = &.{ "check", "enums.nov", "--semantic" }, .exit_code = 0 },
+        .{ .name = "enum missing variant", .args = &.{ "check", "enum-missing.nov", "--semantic" }, .exit_code = 1, .stderr_match = "match must cover every variant" },
+        .{ .name = "enum numbered unsupported", .args = &.{ "check", "enum-numbered.nov", "--semantic" }, .exit_code = 1, .stderr_match = "explicit enum values" },
+        .{ .name = "enum backing unsupported", .args = &.{ "check", "enum-backing.nov", "--semantic" }, .exit_code = 1, .stderr_match = "explicit enum backing types are unsupported" },
         .{ .name = "record interpolation semantic", .args = &.{ "check", "record-interpolation.nov", "--semantic" }, .exit_code = 0 },
-        .{ .name = "record interpolation missing method", .args = &.{ "check", "record-interpolation-missing.nov", "--semantic" }, .exit_code = 1, .stderr_match = "printing a struct or union requires its method toString: (MyType) -> string" },
+        .{ .name = "record interpolation missing method", .args = &.{ "check", "record-interpolation-missing.nov", "--semantic" }, .exit_code = 1, .stderr_match = "printing a struct, enum or union requires its method toString: (MyType) -> string" },
         .{ .name = "record payload semantic", .args = &.{ "check", "record-payloads.nov", "--semantic" }, .exit_code = 0 },
         .{ .name = "record payload 128 bit semantic", .args = &.{ "check", "wide-record-payload.nov", "--semantic" }, .exit_code = 0 },
         .{ .name = "record payload backend width", .args = &.{ "emit-c", "wide-record-payload.nov" }, .exit_code = 1, .stderr_match = "C backend only supports 8, 16, 32 and 64-bit integers" },
@@ -421,6 +429,7 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     }
 
     const stdin_cases = [_]struct { source: []const u8, check: bool = false, output: []const u8 = "", diagnostic: ?[]const u8 = null, code: u8 = 0 }{
+        .{ .source = "let K=enum{not_found,io,}\nlet E=struct{k:K=.not_found,}\nlet f:()->K=K.io", .output = "let K = enum {\n    not_found,\n    io,\n}\nlet E = struct {\n    k: K = .not_found,\n}\nlet f: () -> K = K.io\n" },
         .{ .source = "let U=union{ok:R,}\nlet R=struct{s:string,}\nlet f:()->U=.ok[R[.s=\"ok\"]]", .output = "let U = union {\n    ok: R,\n}\nlet R = struct {\n    s: string,\n}\nlet f: () -> U = .ok[R[ .s = \"ok\" ]]\n" },
         .{ .source = "let G:(T:type)->type=union{ok:T,err:string,}\nlet R=G(int)\nlet f:(r:R)->R=.ok[r.!]", .output = "let G: (T: type) -> type = union {\n    ok: T,\n    err: string,\n}\nlet R = G(int)\nlet f: (r: R) -> R = .ok[r.!]\n" },
         .{ .source = "let U=union{ok:int,none,}\nlet f:(u:U)->int=match u{.ok=>|v|v\n.none=>0}", .output = "let U = union {\n    ok: int,\n    none,\n}\nlet f: (u: U) -> int = match u {\n    .ok => |v| v\n    .none => 0\n}\n" },
@@ -451,6 +460,19 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
 
     // An isolated PATH exercises real `zig cc` discovery, independent of host CC.
     for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+        const enums_run = b.addRunArtifact(exe);
+        enums_run.step.name = b.fmt("CLI: enums and Result propagation ({s})", .{mode});
+        enums_run.setCwd(fixtures.getDirectory());
+        enums_run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+        enums_run.setEnvironmentVariable("NOV_CC", "");
+        enums_run.setEnvironmentVariable("CC", "");
+        enums_run.addArgs(&.{ "run", "enums.nov" });
+        if (mode.len != 0) enums_run.addArg(mode);
+        enums_run.expectExitCode(0);
+        enums_run.expectStdOutEqual("not_found not found true not_found\n");
+        enums_run.expectStdErrEqual("");
+        test_step.dependOn(&enums_run.step);
+
         const record_interpolation_run = b.addRunArtifact(exe);
         record_interpolation_run.step.name = b.fmt("CLI: record interpolation panic ({s})", .{mode});
         record_interpolation_run.setCwd(fixtures.getDirectory());
