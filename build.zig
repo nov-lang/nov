@@ -1123,7 +1123,9 @@ fn addOptionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *st
         \\    .some => true
         \\    .none => false
         \\}
+        \\let propagate: (value: O) -> standard.Option(string) = .some["value:{value.!}"]
         \\let main: () = {
+        \\    @println(propagate(make(true)).unwrapOr("bad"), standard.Option(string).unwrapOr(propagate(make(false)), "none"))
         \\    @println(make(true).unwrapOr(eager()))
         \\    @println(O.unwrapOr(make(false), eager()))
         \\    @println(O.unwrapOrElse(make(true), lazy))
@@ -1148,7 +1150,7 @@ fn addOptionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *st
         \\}
         \\
     );
-    const output = "SE1\nNE9\nS1\nNL7\n3 4\ntrue false true true\nsome eager lazy some\nsome record eager record\nlazy record some record\ntrue false\nsome:none:unit:done\n";
+    const output = "SNvalue:1 none\nSE1\nNE9\nS1\nNL7\n3 4\ntrue false true true\nsome eager lazy some\nsome record eager record\nlazy record some record\ntrue false\nsome:none:unit:done\n";
     _ = fixtures.add("options-example.nov", @embedFile("examples/options.nov"));
     const Reject = struct { name: []const u8, source: []const u8, diagnostic: []const u8 = "expression does not match the expected type" };
     const rejects = [_]Reject{
@@ -1161,7 +1163,7 @@ fn addOptionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *st
         .{ .name = "distinct-record", .source = "let A = struct { value: int, }\nlet B = struct { value: int, }\nlet f: (o: direct.Option(A)) -> standard.Option(B) = o\n" },
         .{ .name = "distinct-result", .source = "let f: (o: O) -> standard.Result(int, void) = o\n" },
         .{ .name = "missing-none", .source = "let f: (o: O) -> int = match o { .some => |value| value }\n", .diagnostic = "enum or union match must cover every variant or end with a wildcard (_)" },
-        .{ .name = "propagation", .source = "let f: (o: O) -> O = .some[o.!]\n", .diagnostic = ".! requires a union with exactly ok and err variants" },
+        .{ .name = "propagation-family", .source = "let f: (o: O) -> standard.Result(int, void) = .ok[o.!]\n", .diagnostic = ".! requires an enclosing function returning the same union family" },
     };
     for (rejects) |case| {
         const name = b.fmt("option-{s}.nov", .{case.name});

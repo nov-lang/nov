@@ -4,8 +4,11 @@ lib/option.nov provides ordinary public Option(T), re-exported as std.Option, wi
 some payload/none variants, unwrapOr (eager fallback) and unwrapOrElse (zero-argument
 callback invoked only for none). Real-import tests cover identity, exact types,
 scalars/records/void, exhaustive matching, fallback effects and debug/release runs.
-examples/options.nov demonstrates safe division. Option .! propagation is still
-unsupported; no compiler builtin or new propagation policy was introduced.
+examples/options.nov demonstrates safe division and .! propagation from Option(uint)
+to Option(string). Structural .! accepts exactly some/none with void none, yields
+some or immediately returns enclosing none. Result behavior is unchanged; crossing
+Option/Result families is rejected. Evaluation is once-only and later effects skip
+on none; no builtin Option or implicit payload wrapping was introduced.
 
 Ordinary generic union methods now specialize on demand by canonical concrete
 container type, preserving aliases and independent type arguments. @This and

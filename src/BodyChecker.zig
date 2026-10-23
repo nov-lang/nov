@@ -596,20 +596,27 @@ const Context = struct {
         return if (self.tagged(ty)) ty else null;
     }
 
-    const ResultShape = struct { ok: u32, err: u32 };
+    const PropagationShape = struct { family: enum { result, option }, ok: u32, err: u32 };
 
-    fn resultShape(self: *Context, ty: Ir.TypeId) ?ResultShape {
+    fn propagationShape(self: *Context, ty: Ir.TypeId) ?PropagationShape {
         if (!self.tagged(ty) or self.ir.getType(ty).?.record.fields.len != 2) return null;
-        return .{ .ok = self.fieldIndex(ty, "ok") orelse return null, .err = self.fieldIndex(ty, "err") orelse return null };
+        if (self.fieldIndex(ty, "ok")) |ok| {
+            return .{ .family = .result, .ok = ok, .err = self.fieldIndex(ty, "err") orelse return null };
+        }
+        const some = self.fieldIndex(ty, "some") orelse return null;
+        const none = self.fieldIndex(ty, "none") orelse return null;
+        if (self.ir.getType(self.ir.getType(ty).?.record.fields[none].ty).? != .void) return null;
+        return .{ .family = .option, .ok = some, .err = none };
     }
 
     fn propagate(self: *Context, node: Ast.Node.Index, expected: ?Known, depth: usize) Error!?Ir.TypeId {
         const operand = self.module.source.ast.nodes.items(.data)[node].lhs;
         const input = (try self.expression(operand, null, depth + 1)) orelse return null;
         if (self.terminated) return if (expected) |want| want.ty else input;
-        const shape = self.resultShape(input) orelse return self.fail(.invalid_propagation_operand, node, null);
+        const shape = self.propagationShape(input) orelse return self.fail(.invalid_propagation_operand, node, null);
         const output = self.return_type.ty;
-        const target = self.resultShape(output) orelse return self.fail(.invalid_propagation_return, node, self.return_type.annotation);
+        const target = self.propagationShape(output) orelse return self.fail(.invalid_propagation_return, node, self.return_type.annotation);
+        if (shape.family != target.family) return self.fail(.invalid_propagation_return, node, self.return_type.annotation);
         const ok = self.ir.getType(input).?.record.fields[shape.ok].ty;
         const err = self.ir.getType(input).?.record.fields[shape.err].ty;
         if (err != self.ir.getType(output).?.record.fields[target.err].ty) return self.fail(.propagation_error_mismatch, node, self.return_type.annotation);
@@ -714,7 +721,7 @@ const Context = struct {
             },
             .unwrap => blk: {
                 const operand = (try self.probe(data.lhs, depth + 1)) orelse break :blk null;
-                const shape = self.resultShape(operand.ty) orelse break :blk null;
+                const shape = self.propagationShape(operand.ty) orelse break :blk null;
                 break :blk .{ .ty = self.ir.getType(operand.ty).?.record.fields[shape.ok].ty };
             },
             .string_literal => .{ .ty = try self.ir.internType(.string) },

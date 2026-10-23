@@ -1357,6 +1357,83 @@ test "record payload width checking follows reverse dependencies and reports lea
     }
 }
 
+const option_propagation_program =
+    \\let O:(T:type)->type=union{none,some:T,}
+    \\let Text=union{some:string,none,}
+    \\let Item=struct{s:string,}
+    \\let Items=union{some:Item,none,}
+    \\let make:(yes:bool)->O(int)={@print("M")
+    \\if yes{.some[7]}else{.none[]}}
+    \\let later:()->int={@print("BAD")
+    \\1}
+    \\let use:(a:int,b:int)->int=a+b
+    \\let rhs:()->Text=.some["{make(false).!+later()}"]
+    \\let args:()->Text=.some["{use(make(false).!,later())}"]
+    \\let inLoop:()->Text={loop i in 0..3{let n=make(false).!
+    \\@println(n,later())}
+    \\.some["BAD"]}
+    \\let returned:()->Text={return .some["{make(true).!}"]}
+    \\let nested:()->Text=.some[returned().!+"!"]
+    \\let unit:(o:O(void))->Text={o.!
+    \\.some["unit"]}
+    \\let records:(o:O(Item))->Items={let mut item=o.!
+    \\let copy=item
+    \\item=Item[.s="new"+"!"]
+    \\.some[Item[.s=copy.s+item.s]]}
+    \\let show:(o:Text)=@println(match o{.some=>|s|s
+    \\.none=>"none"})
+    \\let main:()={show(rhs())
+    \\show(args())
+    \\show(inLoop())
+    \\show(nested())
+    \\show(unit(O(void).some[]))
+    \\show(unit(O(void).none[]))
+    \\let item=records(O(Item).some[Item[.s="old"+"!"]])
+    \\let noise="collect"+"!"
+    \\@println(match item{.some=>|r|r.s
+    \\.none=>"BAD"},noise)
+    \\@println(match records(O(Item).none[]){.some=>"BAD"
+    \\.none=>"none"})}
+;
+const option_propagation_output = "Mnone\nMnone\nMnone\nM7!\nunit\nnone\nold!new! collect!\nnone\n";
+
+test "Option propagation once only early returns calls loops records void and forced GC" {
+    const c = try arrayTestProgram(option_propagation_program);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, option_propagation_output, "", mode);
+}
+
+test "Option propagation source free IR and every compiler allocation failure" {
+    var sema = blk: {
+        var module = try Module.init(test_gpa, "option-owned.nov", option_propagation_program);
+        defer module.deinit();
+        var result = try Lowering.lower(&module);
+        errdefer result.deinit();
+        try std.testing.expect(!module.hasErrors());
+        break :blk result;
+    };
+    defer sema.deinit();
+    try sema.ir.verify();
+    const library = try emit(test_gpa, &sema.ir, null);
+    defer test_gpa.free(library);
+    const c = try collectingTestProgram(library);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, option_propagation_output, "", mode);
+    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{option_propagation_program});
+}
+
+test "Option propagation none skips allocations and some reports runtime OOM" {
+    for ([_]bool{ false, true }) |allocate| {
+        const source = try std.fmt.allocPrint(test_gpa, "let O:(T:type)->type=union{{some:T,none,}}\nlet make:()->O(string)={s}\nlet run:()->O(string)=.some[make().!+\"!\"]\nlet main:()=@println(match run(){{.some=>|s|s\n.none=>\"none\"}})", .{if (allocate) ".some[\"a\"+\"b\"]" else ".none[]"});
+        defer test_gpa.free(source);
+        const program = try arrayTestProgram(source);
+        defer test_gpa.free(program);
+        const exhausted = try std.mem.concat(test_gpa, u8, &.{ "#include <stdlib.h>\nstatic void *test_malloc(size_t n) { (void)n; return NULL; }\n#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n", program });
+        defer test_gpa.free(exhausted);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(exhausted, "typedef int nonempty_translation_unit;", if (allocate) 1 else 0, if (allocate) "" else "none\n", if (allocate) "panic: GC allocation failed\n" else "", mode);
+    }
+}
+
 test "record payload propagation allocates only evaluated strings and handles OOM" {
     for ([_]bool{ false, true }) |allocate| {
         const source = try std.fmt.allocPrint(test_gpa, "let G:(T:type,E:type)->type=union{{ok:T,err:E,}}\nlet R=struct{{s:string,}}\nlet make:()->G(int,R)=.err[R[.s={s}]]\nlet run:()->G(bool,R)=.ok[make().! == 0]\nlet main:()=@println(match run(){{.ok=>@panic(\"bad\")\n.err=>|r|r.s}})", .{if (allocate) "\"e\"+\"rr\"" else "\"err\""});

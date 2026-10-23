@@ -9,14 +9,19 @@ let divide: (numerator: uint, denominator: uint) -> Option(uint) = {
     }
 }
 
-let fallback: () -> uint = {
+let describeDivision: (numerator: uint, denominator: uint) -> Option(string) = {
+    let quotient = divide(numerator, denominator).!
+    .some["{quotient}"]
+}
+
+let fallback: () -> string = {
     @println("Using fallback")
-    0
+    "0"
 }
 
 let main: () = {
-    let quotient = divide(42, 2)
-    let missing = divide(42, 0)
+    let quotient = describeDivision(42, 2)
+    let missing = describeDivision(42, 0)
     @println("Quotient:", quotient.unwrapOrElse(fallback))
     @println("Missing:", missing.unwrapOrElse(fallback))
 }

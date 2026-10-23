@@ -966,9 +966,9 @@ operator rule, not special handling of a type named `Result`. Void payloads work
 Outside propagation, construct returns explicitly with `.ok[value]` or
 `.err[error]`; bare payload returns remain type errors.
 
-Option-style `some`/`none` propagation is not yet implemented. Ordinary generic
-union methods in the definitions below, including `unwrapOr`/`unwrapOrElse` and
-`@This()`, are supported.
+Option-style `some`/`none` propagation is also supported as described below.
+Ordinary generic union methods in the definitions below, including
+`unwrapOr`/`unwrapOrElse` and `@This()`, are supported.
 
 #### Executable Option
 
@@ -983,10 +983,17 @@ or include a catchall; `some` can capture its exact payload type.
 callback only for `none`. These are ordinary generic methods, not compiler
 special cases. Aliases, value-copy semantics, supported scalar/flat-record payloads,
 and void construction/matching follow the existing generic union rules.
-Option `.!` propagation remains unsupported.
+`value.!` evaluates an Option-shaped union once, yields its `some` payload, or
+constructs and returns `.none[]` from the enclosing Option-shaped result. Both
+unions must have exactly `some` and `none` variants, with a void `none` payload;
+variant order and nominal name do not matter. The enclosing success type may
+differ, including void. Cross-family Option/Result propagation is rejected; no
+implicit conversion or ordinary return wrapping is introduced. Later operand,
+argument and statement effects are skipped when `none` propagates.
 
-[examples/options.nov](examples/options.nov) uses Option for safe division and
-shows that its lazy fallback runs only for a missing quotient:
+[examples/options.nov](examples/options.nov) uses safe division, propagates from
+`Option(uint)` into `Option(string)` with `.!`, and shows that its lazy fallback
+runs only for a missing quotient:
 
 ```text
 Quotient: 21

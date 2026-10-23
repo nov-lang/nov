@@ -41,10 +41,15 @@ Option type. Exhaustive matches can capture the `some` payload or handle `none`.
   `() -> T` callback for `none` only. Evaluating the callback value is not deferred.
 - `Option(void)` can be constructed and matched. `unwrapOr` cannot be requested
   for it because void parameters are disallowed; `unwrapOrElse: (() -> void)` works.
-- Option-style `.!` propagation is **not implemented**; use matching or these methods.
+- `value.!` evaluates once, yields the `some` payload, or immediately returns
+  `.none[]` from the enclosing Option-returning function. The enclosing success
+  payload type may differ. The operator structurally requires exactly `some` and
+  `none` variants with a void `none` payload; it does not depend on the Option name.
+  Result-to-Option and Option-to-Result propagation are rejected.
 
 See `examples/options.nov`: division by zero yields `none` rather than panicking,
-and the fallback runs only for the absent quotient.
+`.!` propagates it from `Option(uint)` into `Option(string)`, and the fallback runs
+only for the absent quotient.
 
 ## Loading and installation
 

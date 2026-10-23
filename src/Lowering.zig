@@ -381,6 +381,69 @@ test "generic union expansion and template alias traversal have explicit limits"
     }
 }
 
+test "Option propagation accepts structural families exact contexts inference and void under OOM" {
+    const source =
+        \\let O:(T:type)->type=union{none,some:T,}
+        \\let A=union{some:u8,none,}
+        \\let B=union{none:void,some:string,}
+        \\let use:(n:u8)->u8=n
+        \\let inferred:(o:A)->B={let n=o.!
+        \\let sum=1+o.!
+        \\let exact:u8=use(n+sum)
+        \\.some["{exact}"]}
+        \\let reverse:(o:O(u8))->A=.some[o.!]
+        \\let unit:(o:O(void))->B={o.!
+        \\.some["unit"]}
+        \\let returned:(o:O(string))->B={return .some[o.!]}
+    ;
+    var module = try Module.init(std.testing.allocator, "option.nov", source);
+    defer module.deinit();
+    var result = try lower(&module);
+    defer result.deinit();
+    if (module.hasErrors()) std.debug.print("option errors: {any}\n", .{module.diagnostics.items});
+    try std.testing.expect(result.lowering_complete);
+    try result.ir.verify();
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+}
+
+test "Option propagation rejects malformed shapes cross families and implicit conversions under OOM" {
+    const prefix = "let O:(T:type)->type=union{some:T,none,}\nlet R:(T:type,E:type)->type=union{ok:T,err:E,}\n";
+    const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag };
+    for ([_]Case{
+        .{ .source = "let f:(o:O(int))->int=o.!", .tag = .invalid_propagation_return },
+        .{ .source = "let f:(o:O(int))->O(int)=o.!", .tag = .expression_type_mismatch },
+        .{ .source = "let f:(o:O(int))->O(uint)=.some[o.!]", .tag = .expression_type_mismatch },
+        .{ .source = "let f:(o:O(int))->R(int,void)=.ok[o.!]", .tag = .invalid_propagation_return },
+        .{ .source = "let f:(r:R(int,void))->O(int)=.some[r.!]", .tag = .invalid_propagation_return },
+        .{ .source = "let U=union{some:int,none:int,}\nlet f:(u:U)->O(int)=.some[u.!]", .tag = .invalid_propagation_operand },
+        .{ .source = "let U=union{some:int,}\nlet f:(u:U)->O(int)=.some[u.!]", .tag = .invalid_propagation_operand },
+        .{ .source = "let U=union{some:int,none,extra,}\nlet f:(u:U)->O(int)=.some[u.!]", .tag = .invalid_propagation_operand },
+        .{ .source = "let U=union{ok:int,none,}\nlet f:(u:U)->O(int)=.some[u.!]", .tag = .invalid_propagation_operand },
+        .{ .source = "let U=union{some:int,err,}\nlet f:(u:U)->O(int)=.some[u.!]", .tag = .invalid_propagation_operand },
+        .{ .source = "let U=union{some:int,none:bool,}\nlet f:(o:O(int))->U=.some[o.!]", .tag = .invalid_propagation_return },
+        .{ .source = "let U=union{some:int,none,extra,}\nlet f:(o:O(int))->U=.some[o.!]", .tag = .invalid_propagation_return },
+        .{ .source = "let A=struct{s:string,}\nlet B=struct{s:string,}\nlet f:(o:O(A))->O(B)=.some[o.!]", .tag = .expression_type_mismatch },
+        .{ .source = "let A=struct{s:string,}\nlet B=struct{s:string,}\nlet f:(r:R(int,A))->R(int,B)=.ok[r.!]", .tag = .propagation_error_mismatch },
+        .{ .source = "let f:(r:R(int,u8))->R(int,u16)=.ok[r.!]", .tag = .propagation_error_mismatch },
+    }) |case| {
+        const source = try std.mem.concat(std.testing.allocator, u8, &.{ prefix, case.source });
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "option-error.nov", source);
+        defer module.deinit();
+        try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
+        var result = try lower(&module);
+        defer result.deinit();
+        var found = false;
+        for (module.diagnostics.items) |d| if (d.tag == case.tag) {
+            found = true;
+        };
+        if (!found) std.debug.print("option error {s}: {any}\n", .{ case.source, module.diagnostics.items });
+        try std.testing.expect(found);
+        try std.testing.expect(!result.lowering_complete);
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, testRejectedMatchAllocations, .{source});
+    }
+}
+
 test "generic unions and propagation diagnose exact types unsupported forms and cycles under OOM" {
     const prefix = "let G:(T:type,E:type)->type=union{ok:T,err:E,}\nlet R=G(int,string)\n";
     const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag };
