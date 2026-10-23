@@ -140,6 +140,7 @@ fn checkSupported(ast: Ast) !void {
         .greater_or_equal,
         .bool_and,
         .bool_or,
+        .ref_of,
         .negation,
         .bool_not,
         .bit_not,
@@ -148,6 +149,18 @@ fn checkSupported(ast: Ast) !void {
     };
     for (ast.nodes.items(.tag), ast.nodes.items(.data), ast.nodes.items(.main_token), 0..) |tag, data, main, i| {
         switch (tag) {
+            .ref_of => {
+                if (ast.nodes.items(.tag)[data.rhs] != .array_access or
+                    ast.nodes.items(.tag)[ast.nodes.items(.data)[data.rhs].lhs] != .identifier) return error.UnsupportedSyntax;
+                var binding = false;
+                for (ast.nodes.items(.tag), 0..) |parent_tag, parent| {
+                    if (parent_tag == .decl and ast.decl(@intCast(parent)).ast.init_node == i) {
+                        binding = true;
+                        break;
+                    }
+                }
+                if (!binding) return error.UnsupportedSyntax;
+            },
             .container_decl => {
                 for (ast.fullStruct(@intCast(i)).?) |member| {
                     if (ast.nodes.items(.tag)[member] == .container_field) continue;
@@ -238,7 +251,7 @@ fn sameStructure(a: Ast, b: Ast) bool {
             .attr_one => if (!std.mem.eql(u8, a.tokenSlice(x.lhs), b.tokenSlice(y.lhs)) or x.rhs != y.rhs) return false,
             .identifier, .number_literal, .char_literal, .string_literal, .builtin_literal, .enum_literal => {},
             // The parser leaves unused node data undefined; never read it.
-            .negation, .bool_not, .bit_not, .@"return", .array_type => if (x.rhs != y.rhs) return false,
+            .ref_of, .negation, .bool_not, .bit_not, .@"return", .array_type => if (x.rhs != y.rhs) return false,
             .field_access, .unwrap => if (x.lhs != y.lhs or !std.mem.eql(u8, a.tokenSlice(x.rhs), b.tokenSlice(y.rhs))) return false,
             .@"continue" => if ((x.lhs == 0) != (y.lhs == 0)) return false,
             else => if (x.lhs != y.lhs or x.rhs != y.rhs) return false,
@@ -472,19 +485,19 @@ test "executable local blocks round trip" {
 
 test "every unsupported AST tag is rejected before rendering" {
     const supported = [_]Ast.Node.Tag{
-        .root,           .decl,               .identifier,           .number_literal,   .char_literal,      .string_literal,
-        .add,            .sub,                .mul,                  .div,              .mod,               .shl,
-        .shr,            .bit_and,            .bit_or,               .bit_xor,          .equal_equal,       .bang_equal,
-        .less_than,      .less_or_equal,      .greater_than,         .greater_or_equal, .bool_and,          .bool_or,
-        .negation,       .bool_not,           .bit_not,              .fn_proto_one,     .fn_proto,          .call_one,
-        .call_one_comma, .call,               .call_comma,           .block_two,        .block_two_newline, .block,
-        .block_newline,  .@"if",              .if_else,              .range,            .loop_range,        .loop_condition,
-        .loop_cont,      .loop_else,          .@"return",            .@"break",         .@"continue",       .assign,
-        .assign_add,     .assign_sub,         .assign_mul,           .assign_div,       .assign_mod,        .builtin_literal,
-        .array_type,     .array_init_two,     .array_init_two_comma, .array_init,       .array_init_comma,  .array_access,
-        .field_access,   .in,                 .match,                .match_case_one,   .match_case,        .function_pipe,
-        .container_decl, .container_decl_arg, .container_field,      .unwrap,           .enum_literal,      .attr_one,
-        .attr_decl_one,  .attr_decl,
+        .root,            .decl,           .identifier,         .number_literal,       .char_literal,   .string_literal,
+        .add,             .sub,            .mul,                .div,                  .mod,            .shl,
+        .shr,             .bit_and,        .bit_or,             .bit_xor,              .equal_equal,    .bang_equal,
+        .less_than,       .less_or_equal,  .greater_than,       .greater_or_equal,     .bool_and,       .bool_or,
+        .ref_of,          .negation,       .bool_not,           .bit_not,              .fn_proto_one,   .fn_proto,
+        .call_one,        .call_one_comma, .call,               .call_comma,           .block_two,      .block_two_newline,
+        .block,           .block_newline,  .@"if",              .if_else,              .range,          .loop_range,
+        .loop_condition,  .loop_cont,      .loop_else,          .@"return",            .@"break",       .@"continue",
+        .assign,          .assign_add,     .assign_sub,         .assign_mul,           .assign_div,     .assign_mod,
+        .builtin_literal, .array_type,     .array_init_two,     .array_init_two_comma, .array_init,     .array_init_comma,
+        .array_access,    .field_access,   .in,                 .match,                .match_case_one, .match_case,
+        .function_pipe,   .container_decl, .container_decl_arg, .container_field,      .unwrap,         .enum_literal,
+        .attr_one,        .attr_decl_one,  .attr_decl,
     };
     var ast = try Parser.parse(std.testing.allocator, "let x=1\n");
     defer ast.deinit(std.testing.allocator);
@@ -494,7 +507,7 @@ test "every unsupported AST tag is rejected before rendering" {
         ast.nodes.items(.tag)[1] = tag;
         if (std.mem.indexOfScalar(Ast.Node.Tag, &supported, tag) != null) {
             // This synthetic leaf has no valid child/label data for these tags.
-            if (tag == .container_decl or tag == .attr_one or tag == .container_field or tag == .builtin_literal or tag == .@"break" or tag == .@"continue" or tag == .assign or
+            if (tag == .ref_of or tag == .container_decl or tag == .attr_one or tag == .container_field or tag == .builtin_literal or tag == .@"break" or tag == .@"continue" or tag == .assign or
                 tag == .assign_add or tag == .assign_sub or tag == .assign_mul or
                 tag == .assign_div or tag == .assign_mod or tag == .array_type or
                 tag == .array_init_two or tag == .array_init_two_comma or tag == .array_init or

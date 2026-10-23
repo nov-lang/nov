@@ -16,10 +16,10 @@ let main: () = {
 
     let mut people = [Person[ .name = Name[ .text = "Ada" ] ]]
     let originalPeople = people
-    let mut changed = people[0]
+    let changed = &people[0]
     changed.name.text += " Lovelace"
     changed.score += 1
-    people[0] = changed
+    ; people[0] = changed
     @println(people[0].name.text, people[0].score)
     @println(originalPeople[0].name.text, originalPeople[0].score)
 }

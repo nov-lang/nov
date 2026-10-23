@@ -78,6 +78,9 @@ fn renderModuleWithSources(module: *const Module, compilation: ?*const Compilati
         const location = Location.init(source.ast.source, diagnostic.span.start);
         try location.renderPrefix(source.path, "error", writer);
         switch (diagnostic.tag) {
+            .borrow_conflict => try writer.writeAll("owner array access conflicts with a live element borrow"),
+            .borrow_escape => try writer.writeAll("borrowed identifiers may only be used as field bases; copying, escaping and rebinding references are unsupported"),
+            .unsupported_borrow => try writer.writeAll("borrow requires let name = &localArray[index] with a nominal record element and no pointer annotation"),
             .invalid_generic_declaration => try writer.writeAll("generic container declarations require named type parameters: (T: type, ...) -> type = struct { ... } or union { ... }"),
             .generic_needs_arguments => try writer.writeAll("generic container requires explicit type arguments"),
             .not_a_generic => try writer.writeAll("type application requires an ordinary named generic container"),
@@ -168,6 +171,7 @@ fn renderModuleWithSources(module: *const Module, compilation: ?*const Compilati
         }
         try location.renderExcerpt(source.ast.source, diagnostic.span.end - diagnostic.span.start, writer);
         const note: ?[]const u8 = switch (diagnostic.tag) {
+            .borrow_conflict, .borrow_escape => "borrow originates here",
             .duplicate_name => "first declaration here",
             .value_cycle, .type_alias_cycle => "declaration in this cycle",
             .type_alias_limit, .not_a_value => "type alias declared here",

@@ -20,7 +20,8 @@ Growable arrays use an internal libc-only nonmoving mark/sweep GC. The
 runtime is emitted only for managed values; scalar-only programs stay unchanged.
 See the [runtime API and root discipline](src/runtime/README.md) for layout, C
 boundary, OOM, testing, and unsupported-reference contracts. Slices, nested arrays,
-and explicit aliases remain deferred. Immutable UTF-8 strings are supported below.
+and general aliases remain deferred; bounded local array-element borrowing is
+supported below. Immutable UTF-8 strings are supported below.
 
 ```sh
 zig build
@@ -715,8 +716,9 @@ The delivered subset is deliberately bounded:
   stable local field storage, not the whole-array snapshot update rule.
 - Field mutation does not alter earlier value copies or immutable string backing.
   Immutable bindings/ordinary parameters (including `self`), union payloads/tags,
-  temporary values and pointer-based targets remain unsupported or
-  diagnose immutable assignment. No implicit mutable receiver or borrowing is added.
+  temporary values and general pointer-based targets remain unsupported or
+  diagnose immutable assignment. Bounded local element borrows support field updates
+  as described under arrays. No implicit mutable receiver or borrowing is added.
   See [examples/struct-mutation.nov](examples/struct-mutation.nov) and
   [examples/nested-structs.nov](examples/nested-structs.nov). Nested record copies
   have independent value storage at every level; immutable string backing shares.
@@ -1247,7 +1249,7 @@ let main: () -> void = {
 - String/record arrays have independent element storage at ordinary copy boundaries.
   Record fields copy recursively by value; immutable string backing shares. Indexing
   returns a value, not an element reference. To edit a record element, copy it to a
-  mutable local, update its fields, then assign the whole record back to the index.
+  mutable local and assign it back, or use the checked local borrowing form below.
   Direct `items[index].field` mutation remains unsupported.
 - String membership compares exact UTF-8 bytes/length, including embedded NUL, not
   owner identity. Record membership remains unsupported until record equality is
@@ -1259,11 +1261,52 @@ let main: () -> void = {
   See [examples/managed-arrays.nov](examples/managed-arrays.nov).
 - `.len` writes are explicitly rejected: shrinking and especially initialization
   on length growth remain undesigned. No array printing, equality, concatenation
-  with `+`, slices, nested arrays, enum/union/pointer/function elements, explicit aliases,
+  with `+`, slices, nested arrays, enum/union/pointer/function elements, general aliases,
   array globals, capacity API, or iteration is delivered. The formatter supports
   the array syntax described above without extending these semantics.
   Indexed elements use normal scalar/record printing rules; array values themselves
   cannot be printed.
+
+### Local array-element borrowing
+
+A direct local binding `let changed = &people[index]` borrows a nominal record
+element of a local array without copying it. Nested field reads/writes, subrecord
+replacement, integer field compounds and string field `+=` use the actual element.
+A mutable owner permits writes; an immutable owner permits field reads only. The
+reference binding itself is fixed—`let changed` does not make a mutable owner’s
+pointee immutable. No explicit pointer annotation or `let mut` reference is supported.
+
+```nov
+let changed = &people[0]
+changed.name.text += " Lovelace"
+changed.score += 1
+; last use of changed ends the borrow
+@println(people[0].name.text, people[0].score)
+```
+
+- Validity is checked **statically** with control-flow liveness, including branches,
+  loop backedges, break/continue, returns and short-circuit paths. While a borrow
+  is live, the entire owner array is unavailable for direct reads, copies, `.len`,
+  writes, append, replacement or other borrows—even of a different index. Access
+  resumes after the last possible reference use on the current path. This first
+  implementation is conservatively exclusive even for readonly owners; it does
+  not implement shared-borrow splitting.
+- A field compound keeps the loan live through RHS evaluation and final store.
+  The compiler rejects owner replacement inside that RHS. It also reserves the
+  owner during borrow-index evaluation: accessing the owner from the index
+  expression is conservatively rejected, including read-only access.
+- The index evaluates once, with native-int negative-index rules and ordinary
+  runtime bounds checking. The compiler retains a rooted owner slot and normalized
+  index, deriving field addresses only when used. There are no runtime generation
+  or reference-invalidation checks, and no interior pointer is traced by GC.
+- References cannot escape, be copied/rebound, be returned or stored in aggregates,
+  be passed as arguments or be used directly as method receivers. Borrowed names
+  may only be field bases; field reads yield ordinary copied values. General pointer
+  types/APIs, reborrows, temporary array owners and non-record elements remain deferred.
+- Normal array snapshots/copies remain independent, including snapshots evaluated
+  before a later borrow inside an index or RHS. In-place borrowed writes do not
+  alter earlier copies. See the unchanged borrowed-element form in
+  [examples/managed-arrays.nov](examples/managed-arrays.nov).
 
 The broader examples below describe future syntax as well as implemented syntax;
 printing arrays, defaulting bare integer elements and writable `.len` in them

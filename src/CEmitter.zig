@@ -654,6 +654,10 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
             value_used[@intFromEnum(r.lhs)] = true;
             value_used[@intFromEnum(r.rhs)] = true;
         },
+        .borrow_reserve => |slot| value_used[@intFromEnum(slot)] = true,
+        .borrow_start => |start| value_used[@intFromEnum(start.index)] = true,
+        .borrow_read => {},
+        .borrow_store => |store| value_used[@intFromEnum(store.value)] = true,
         .parameter => |index| param_used[index] = true,
         .local_slot => |value| value_used[@intFromEnum(value)] = true,
         .local_load => |slot| value_used[@intFromEnum(slot)] = true,
@@ -856,6 +860,24 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
             } else try w.writeAll("    return;\n");
             continue;
         }
+        if (instruction.op == .borrow_reserve) continue;
+        if (instruction.op == .borrow_start) {
+            const start = instruction.op.borrow_start;
+            const slot = body.instructions[@intFromEnum(start.reservation)].op.borrow_reserve;
+            try w.print("    const uintptr_t b{d} = nov_array_index(v{d}, v{d});\n    (void)b{d};\n", .{ i, @intFromEnum(slot), @intFromEnum(start.index), i });
+            continue;
+        }
+        if (instruction.op == .borrow_store) {
+            const store = instruction.op.borrow_store;
+            const slot = Ir.borrowOwner(body, store.borrow);
+            const element = ir.getType(body.instructions[@intFromEnum(slot)].ty).?.array;
+            try w.writeAll("    ((");
+            try writeType(ir, w, element);
+            try w.print(" *)v{d}.data)[b{d}]", .{ @intFromEnum(slot), @intFromEnum(store.borrow) });
+            for (store.path) |index| try w.print(".f{d}", .{index});
+            try w.print(" = v{d};\n", .{@intFromEnum(store.value)});
+            continue;
+        }
         if (instruction.op == .field_store) {
             const store = instruction.op.field_store;
             try w.print("    v{d}", .{@intFromEnum(store.slot)});
@@ -951,6 +973,13 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
                 if (values.len == 0) try w.writeByte('0');
                 try w.writeAll(" }");
             },
+            .borrow_read => |borrow| {
+                const slot = Ir.borrowOwner(body, borrow);
+                try w.writeAll("((");
+                try writeType(ir, w, instruction.ty);
+                try w.print(" *)v{d}.data)[b{d}]", .{ @intFromEnum(slot), @intFromEnum(borrow) });
+            },
+            .borrow_reserve, .borrow_start, .borrow_store => unreachable,
             .field_read => |read| try w.print("v{d}.f{d}", .{ @intFromEnum(read.base), read.index }),
             .array_len => |value| try w.print("v{d}.len", .{@intFromEnum(value)}),
             .array_index => |r| {
@@ -6686,4 +6715,187 @@ test "reusable range storage does not need a managed runtime" {
     try std.testing.expect(std.mem.indexOf(u8, c, "nov_gc_") == null);
     for ([_][]const u8{ "-O0", "-O3" }) |mode|
         try compileAndRunMode(c, "void nov_main(void); int main(void) { nov_main(); return 0; }", 0, "0101", "", mode);
+}
+
+const static_borrow_program =
+    \\let Name=struct{text:string,}
+    \\let G:(T:type)->type=struct{name:T,score:uint=1,enabled:bool=false,small:i8=2,}
+    \\let Person=G(Name)
+    \\let pick:()->int={@print("I")
+    \\@as(int,-1)}
+    \\let main:()={
+    \\    let mut people=[Person[.name=Name[.text="A"+"da"]]]
+    \\    let original=people
+    \\    let changed=&people[pick()]
+    \\    let saved=changed.name
+    \\    changed.name.text+=" Lovelace"
+    \\    changed.score+=1
+    \\    changed.enabled=true
+    \\    changed.small*=3
+    \\    let noise="collect"+"!"
+    \\    @println(changed.name.text,changed.score,changed.enabled,changed.small,saved.text,noise)
+    \\    @println(people[0].name.text,people[0].score,original[0].name.text,original[0].score)
+    \\    let again=&people[0]
+    \\    again.name=Name[.text="new"+"!"]
+    \\    @println(people[0].name.text)
+    \\    loop i in 0..3 {let each=&people[0]
+    \\        each.score+=1
+    \\        @println(i,people[0].score)}
+    \\}
+;
+
+test "static borrowing owner indexed updates copies once index source free GC C11 O0 O3 and OOM" {
+    var result = blk: {
+        var module = try Module.init(test_gpa, "borrow-runtime.nov", static_borrow_program);
+        defer module.deinit();
+        if (module.hasErrors()) {
+            var out = std.Io.Writer.Allocating.init(test_gpa);
+            defer out.deinit();
+            try Diagnostics.renderModule(&module, &out.writer);
+            std.debug.print("{s}", .{out.written()});
+        }
+        var result = try Lowering.lower(&module);
+        errdefer result.deinit();
+        if (module.hasErrors()) for (module.diagnostics.items) |d| std.debug.print("{s}: {s}\n", .{ @tagName(d.tag), module.sourceSlice(d.span).? });
+        try std.testing.expect(result.lowering_complete);
+        break :blk result;
+    };
+    defer result.deinit();
+    try result.ir.verify();
+    const library = try emit(test_gpa, &result.ir, null);
+    defer test_gpa.free(library);
+    const c = try collectingTestProgram(library);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "IAda Lovelace 2 true 6 Ada collect!\nAda Lovelace 2 Ada 1\nnew!\n0 3\n1 4\n2 5\n", "", mode);
+    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{static_borrow_program});
+}
+
+test "static borrowing checks bounds once before subsequent effects" {
+    const source =
+        \\let R=struct{x:int=0,}
+        \\let main:()={let mut a=[R[]]
+        \\let r=&a[{@print("index")
+        \\@as(int,-2)}]
+        \\@print("BAD")
+        \\r.x=1}
+    ;
+    const c = try arrayTestProgram(source);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 1, "index", "panic: array index out of bounds\n", mode);
+}
+
+test "static borrowing string RHS runtime allocation failure follows activation" {
+    const library = try emitSource("let R=struct{s:string,}\nlet main:()={let mut a=[R[.s=\"old\"]]\nlet r=&a[0]\n@print(\"borrowed\")\nr.s+=\"!\"}", null);
+    defer test_gpa.free(library);
+    const c = try collectingTestProgram(library);
+    defer test_gpa.free(c);
+    const exhausted = try std.mem.concat(test_gpa, u8, &.{
+        "#include <stdlib.h>\nstatic unsigned allocations;\nstatic void *test_malloc(size_t n) { return ++allocations > 2 ? NULL : malloc(n); }\n#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n", c,
+    });
+    defer test_gpa.free(exhausted);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(exhausted, "typedef int nonempty_translation_unit;", 1, "borrowed", "panic: GC allocation failed\n", mode);
+}
+
+const borrow_snapshot_program =
+    \\let R=struct{x:int=0,s:string="old",}
+    \\let main:()={
+    \\    let mut a=[R[],R[.x=1]]
+    \\    let before=a
+    \\    let value=a[{let r=&a[0]
+    \\        r.x=9
+    \\        r.s="new"+"!"
+    \\        @print("I")
+    \\        0}]
+    \\    @println(value.x,value.s,a[0].x,a[0].s,before[0].x,before[0].s)
+    \\    a=[R[],R[.x=1]]
+    \\    a+={let r=&a[0]
+    \\        r.x=9
+    \\        @print("A")
+    \\        [R[.x=2]]}
+    \\    @println(a[0].x,a[1].x,a[2].x)
+    \\    a=[R[],R[.x=1]]
+    \\    a[{let r=&a[0]
+    \\        r.x=9
+    \\        @print("J")
+    \\        1}]={let r=&a[0]
+    \\        r.x=8
+    \\        @print("S")
+    \\        R[.x=2]}
+    \\    @println(a[0].x,a[1].x)
+    \\    a=[R[],R[.x=1]]
+    \\    a[1]={let r=&a[0]
+    \\        r.x=9
+    \\        @print("R")
+    \\        R[.x=2]}
+    \\    @println(a[0].x,a[1].x)
+    \\}
+;
+
+test "static borrowing normal array snapshots precede index update and append effects" {
+    const library = try emitSource(borrow_snapshot_program, null);
+    defer test_gpa.free(library);
+    const c = try collectingTestProgram(library);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "I0 old 9 new! 0 old\nA0 1 2\nJS0 2\nR0 2\n", "", mode);
+}
+
+const borrow_snapshot_terminal_program =
+    \\let R=struct{x:int=0,}
+    \\let read:(stop:bool)={let mut a=[R[]]
+    \\    let value=a[{if stop {let r=&a[0]
+    \\        r.x=9
+    \\        @println("exit-index",a[0].x)
+    \\        return}
+    \\        let r=&a[0]
+    \\        r.x=7
+    \\        0}]
+    \\    @println("read",value.x,a[0].x)}
+    \\let append:(stop:bool)={let mut a=[R[]]
+    \\    a+=if stop {let r=&a[0]
+    \\        r.x=9
+    \\        @println("exit-append",a[0].x)
+    \\        return} else {let r=&a[0]
+    \\        r.x=7
+    \\        [R[]]}
+    \\    @println("append",a[0].x,a.len)}
+    \\let update:(stop:bool)={let mut a=[R[],R[]]
+    \\    a[1]=if stop {let r=&a[0]
+    \\        r.x=9
+    \\        @println("exit-update",a[0].x)
+    \\        return} else {let r=&a[0]
+    \\        r.x=7
+    \\        R[.x=2]}
+    \\    @println("update",a[0].x,a[1].x)}
+    \\let main:()={read(true)
+    \\    read(false)
+    \\    append(true)
+    \\    append(false)
+    \\    update(true)
+    \\    update(false)}
+;
+
+test "static borrowing snapshots preserve terminal index append and update branches" {
+    const library = try emitSource(borrow_snapshot_terminal_program, null);
+    defer test_gpa.free(library);
+    const c = try collectingTestProgram(library);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "exit-index 9\nread 0 7\nexit-append 9\nappend 0 2\nexit-update 9\nupdate 0 2\n", "", mode);
+}
+
+test "static borrowing normal snapshot OOM precedes index and RHS effects" {
+    const source = "let R=struct{x:int=0,}\nlet main:()={let mut a=[R[]]\n@print(\"base\")\nlet value=a[{let r=&a[0]\nr.x=9\n@print(\"BAD\")\n0}]\n@println(value.x)}";
+    const library = try emitSource(source, null);
+    defer test_gpa.free(library);
+    const c = try collectingTestProgram(library);
+    defer test_gpa.free(c);
+    const exhausted = try std.mem.concat(test_gpa, u8, &.{
+        "#include <stdlib.h>\nstatic unsigned allocations;\nstatic void *test_malloc(size_t n) { return ++allocations > 2 ? NULL : malloc(n); }\n#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n", c,
+    });
+    defer test_gpa.free(exhausted);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(exhausted, "typedef int nonempty_translation_unit;", 1, "base", "panic: GC allocation failed\n", mode);
+}
+
+test "static borrowing snapshot lowering and emission survive every allocation failure" {
+    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{borrow_snapshot_program});
+    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{borrow_snapshot_terminal_program});
 }

@@ -38,6 +38,9 @@ pub const Diagnostic = struct {
     related: ?Span = null,
 
     pub const Tag = enum {
+        borrow_conflict,
+        borrow_escape,
+        unsupported_borrow,
         duplicate_name,
         unsupported_attribute,
         noreturn_result,

@@ -123,6 +123,7 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     addFieldMutationCliTests(b, exe, test_step, fixtures);
     addGenericStructCliTests(b, exe, test_step, fixtures);
     addRangeValueCliTests(b, exe, test_step, fixtures);
+    addBorrowCliTests(b, exe, test_step, fixtures);
     _ = fixtures.add("library-result-source.nov", @embedFile("lib/result.nov"));
     const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
     _ = fixtures.add("library-result.nov",
@@ -1628,6 +1629,41 @@ fn makeExe(b: *std.Build, options: ExecutableOptions) *std.Build.Step.Compile {
     exe.root_module.addImport("known-folders", known_folders);
 
     return exe;
+}
+
+fn addBorrowCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step, fixtures: *std.Build.Step.WriteFile) void {
+    _ = fixtures.add("borrowed-elements.nov", @embedFile("examples/managed-arrays.nov"));
+    _ = fixtures.add("borrow-conflict.nov", "let R = struct { n: uint = 0, }\nlet main: () = {\nlet mut items = [R[]]\nlet item = &items[0]\nitems += [R[]]\nitem.n += 1\n}\n");
+    for ([_][]const u8{ "semantic", "fmt", "default", "--debug", "--release" }) |mode| {
+        const run = b.addRunArtifact(exe);
+        run.step.name = b.fmt("CLI static borrowing: {s}", .{mode});
+        run.setCwd(fixtures.getDirectory());
+        const semantic = std.mem.eql(u8, mode, "semantic");
+        const fmt = std.mem.eql(u8, mode, "fmt");
+        if (semantic) {
+            run.addArgs(&.{ "check", "--semantic", "borrowed-elements.nov" });
+        } else if (fmt) {
+            run.addArgs(&.{ "fmt", "--check", "borrowed-elements.nov" });
+        } else {
+            run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+            run.setEnvironmentVariable("NOV_CC", "");
+            run.setEnvironmentVariable("CC", "");
+            run.addArgs(&.{ "run", "borrowed-elements.nov" });
+            if (!std.mem.eql(u8, mode, "default")) run.addArg(mode);
+        }
+        run.expectExitCode(0);
+        run.expectStdOutEqual(if (semantic or fmt) "" else "Linus Edsger true false\nAda Lovelace 2\nAda 1\n");
+        run.expectStdErrEqual("");
+        test_step.dependOn(&run.step);
+    }
+    const reject = b.addRunArtifact(exe);
+    reject.step.name = "CLI static borrowing: conflicting append";
+    reject.setCwd(fixtures.getDirectory());
+    reject.addArgs(&.{ "check", "--semantic", "borrow-conflict.nov" });
+    reject.expectExitCode(1);
+    reject.expectStdOutEqual("");
+    reject.expectStdErrMatch("owner array access conflicts with a live element borrow");
+    test_step.dependOn(&reject.step);
 }
 
 fn addRangeValueCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step, fixtures: *std.Build.Step.WriteFile) void {

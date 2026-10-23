@@ -2411,3 +2411,165 @@ test "nested records late body recursive generic instances retain source diagnos
         }
     }
 }
+
+test "static borrowing verified capability types owner paths index and regions survive source release" {
+    var result = blk: {
+        var module = try Module.init(std.testing.allocator, "borrow-ir.nov", "let A=struct{b:B,}\nlet B=struct{x:int=0,}\nlet f:()={let mut a=[A[.b=B[]]]\nlet r=&a[0]\nr.b.x+=1\n@println(a.len)}");
+        defer module.deinit();
+        const result = try lower(&module);
+        try std.testing.expect(result.lowering_complete);
+        break :blk result;
+    };
+    defer result.deinit();
+    try result.ir.verify();
+    const body = result.ir.functions.items[0].body.?;
+    const instructions = @constCast(body.instructions);
+    var reserve: usize = 0;
+    var start: usize = 0;
+    var read: usize = 0;
+    var store: usize = 0;
+    for (instructions, 0..) |instruction, i| switch (instruction.op) {
+        .borrow_reserve => reserve = i,
+        .borrow_start => start = i,
+        .borrow_read => read = i,
+        .borrow_store => store = i,
+        else => {},
+    };
+    const saved = instructions[store];
+    try std.testing.expectEqualSlices(u32, &.{ 0, 0 }, saved.op.borrow_store.path);
+    @constCast(saved.op.borrow_store.path)[0] = 99;
+    try std.testing.expectError(error.InvalidOperation, result.ir.verify());
+    @constCast(saved.op.borrow_store.path)[0] = 0;
+    instructions[store].op.borrow_store.borrow = @enumFromInt(reserve);
+    try std.testing.expectError(error.InvalidOperation, result.ir.verify());
+    instructions[store] = saved;
+    const old_read = instructions[read];
+    instructions[read].ty = instructions[reserve].ty;
+    try std.testing.expectError(error.OperandTypeMismatch, result.ir.verify());
+    instructions[read] = old_read;
+    const old_start = instructions[start];
+    instructions[start].op.borrow_start.index = @enumFromInt(reserve);
+    try std.testing.expectError(error.OperandTypeMismatch, result.ir.verify());
+    instructions[start] = old_start;
+    const old_reserve = instructions[reserve];
+    instructions[reserve].op.borrow_reserve = @enumFromInt(0);
+    try std.testing.expectError(error.InvalidOperation, result.ir.verify());
+    instructions[reserve] = old_reserve;
+    // A forged direct owner load during RHS evaluation must fail the same proof
+    // as source lowering, even with all value/region types otherwise valid.
+    const old = instructions[read];
+    instructions[read].ty = instructions[@intFromEnum(old_reserve.op.borrow_reserve)].ty;
+    instructions[read].op = .{ .local_load = old_reserve.op.borrow_reserve };
+    // First check the standalone lifetime proof (later field operands now have
+    // intentionally inconsistent types, which normal verification also rejects).
+    try std.testing.expect(try result.ir.borrowConflict(body) != null);
+    instructions[read] = old;
+    try result.ir.verify();
+}
+
+test "static borrowing imported generic nominal owners preserve exact identities" {
+    var comp = Compilation.init(std.testing.allocator);
+    defer comp.deinit();
+    const root = try comp.addSource("/main.nov", "let types=@import(\"types.nov\")\nlet Alias=types.R(int)\nlet main:()={let mut a=[Alias[.x=1]]\nlet r=&a[0]\nr.x+=1\n@println(a[0].x)}");
+    const types = try comp.addSource("/types.nov", "@[public]\nlet R:(T:type)->type=struct{x:T,}");
+    try testImport(&comp, root, "types", types, true);
+    comp.setRoot(root);
+    var sema = try lowerCompilation(&comp);
+    try std.testing.expect(!comp.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    defer sema.deinit();
+    try sema.ir.verify();
+}
+
+fn testBorrowRejectionAllocations(allocator: std.mem.Allocator, source: []const u8) !void {
+    var module = try Module.init(allocator, "borrow-oom.nov", source);
+    defer module.deinit();
+    var result = lower(&module) catch |err| {
+        try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+        return err;
+    };
+    defer result.deinit();
+    try std.testing.expect(module.hasErrors());
+    try std.testing.expect(!result.lowering_complete);
+}
+
+test "static borrowing rejected conflicts and escapes roll back every allocation failure" {
+    for ([_][]const u8{
+        "let R=struct{x:int=0,}\nlet f:()={let mut a=[R[]]\nlet r=&a[0]\nr.x+={a=[R[]]\n1}}",
+        "let R=struct{x:int=0,}\nlet f:()={let mut a=[R[]]\nlet r=&a[0]\nlet alias=r\n@println(alias.x)}",
+        "let R=struct{x:int=0,}\nlet f:()={let mut a=[R[]]\nlet r=&a[{a=[R[]]\n0}]\nr.x=1}",
+    }) |source| try std.testing.checkAllAllocationFailures(std.testing.allocator, testBorrowRejectionAllocations, .{source});
+}
+
+test "static borrowing verifier rejects well typed forged owner access and sibling capabilities" {
+    var module = try Module.init(std.testing.allocator, "borrow-proof.nov", "let R=struct{x:int=0,}\nlet f:(flag:bool)={let mut a=[R[]]\nlet r=&a[0]\nr.x=1\n@println(a[0].x)\nif flag {let s=&a[0]\ns.x+=1} else {let t=&a[0]\nt.x+=1}}");
+    defer module.deinit();
+    var result = try lower(&module);
+    defer result.deinit();
+    try std.testing.expect(result.lowering_complete);
+    const body = result.ir.functions.items[0].body.?;
+    const instructions = @constCast(body.instructions);
+    var outer: Ir.ValueId = undefined;
+    var sibling: ?Ir.ValueId = null;
+    var index: usize = 0;
+    var reads: usize = 0;
+    for (instructions, 0..) |instruction, i| {
+        if (instruction.op == .borrow_start and index == 0) outer = @enumFromInt(i);
+        if (instruction.op == .array_index) index = i;
+        if (instruction.op == .borrow_read) {
+            if (sibling == null) sibling = instruction.op.borrow_read;
+            reads = i;
+        }
+    }
+    const old = instructions[index];
+    instructions[index].op = .{ .borrow_read = outer };
+    try std.testing.expectError(error.BorrowConflict, result.ir.verify());
+    instructions[index] = old;
+    const old_read = instructions[reads];
+    instructions[reads].op = .{ .borrow_read = sibling.? };
+    try std.testing.expectError(error.InvalidValueId, result.ir.verify());
+    instructions[reads] = old_read;
+    try result.ir.verify();
+}
+
+test "static borrowing normal array loads clone immediately before later borrow effects" {
+    var module = try Module.init(std.testing.allocator, "borrow-snapshot-ir.nov", "let R=struct{x:int=0,}\nlet main:()={let mut a=[R[],R[]]\nlet before=a\nlet value=a[{let r=&a[0]\nr.x=9\n0}]\na+={let r=&a[0]\nr.x=8\n[R[]]}\na[{let r=&a[0]\nr.x=7\n1}]={let r=&a[0]\nr.x=6\nR[]}\n@println(value.x,before[0].x,a[0].x)}");
+    defer module.deinit();
+    var result = try lower(&module);
+    defer result.deinit();
+    try std.testing.expect(result.lowering_complete);
+    const body = result.ir.functions.items[0].body.?;
+    var loads: usize = 0;
+    var reservations: usize = 0;
+    var updates: usize = 0;
+    var appends: usize = 0;
+    for (body.instructions, 0..) |instruction, i| switch (instruction.op) {
+        .local_load => {
+            if (result.ir.getType(instruction.ty).? != .array) continue;
+            loads += 1;
+            const next = body.instructions[i + 1];
+            try std.testing.expect(next.op == .array_clone);
+            try std.testing.expectEqual(@as(Ir.ValueId, @enumFromInt(i)), next.op.array_clone);
+        },
+        .array_index => |access| try std.testing.expect(body.instructions[@intFromEnum(access.array)].op == .array_clone),
+        .array_set => |update| {
+            updates += 1;
+            try std.testing.expect(body.instructions[@intFromEnum(update.array)].op == .array_clone);
+        },
+        .array_append => |append| {
+            appends += 1;
+            try std.testing.expect(body.instructions[@intFromEnum(append.lhs)].op == .array_clone);
+        },
+        .borrow_reserve => |owner| {
+            reservations += 1;
+            // Borrowing names the actual owner slot, never one of these copies.
+            try std.testing.expect(body.instructions[@intFromEnum(owner)].op == .local_slot);
+        },
+        else => {},
+    };
+    try std.testing.expect(loads >= 4);
+    try std.testing.expectEqual(@as(usize, 4), reservations);
+    try std.testing.expectEqual(@as(usize, 1), updates);
+    try std.testing.expectEqual(@as(usize, 1), appends);
+    try result.ir.verify();
+}

@@ -1,6 +1,7 @@
 const std = @import("std");
 const Ir = @This();
 const Source = @import("Source.zig");
+const BorrowCheck = @import("BorrowCheck.zig");
 
 // Integer widths describe resolved values; no literal defaults or overflow policy
 // live here. Source lengths and qualified spans remain valid after AST release.
@@ -38,6 +39,11 @@ pub const UnaryOp = enum { negate, bit_not, bool_not };
 pub const BinaryOp = enum { add, sub, mul, div, mod, bit_and, bit_or, bit_xor, eq, ne, lt, le, gt, ge };
 pub const FieldRead = struct { base: ValueId, index: u32 };
 pub const Operation = union(enum) {
+    // Capabilities are unit-typed, never ordinary runtime values.
+    borrow_reserve: ValueId,
+    borrow_start: struct { reservation: ValueId, index: ValueId },
+    borrow_read: ValueId,
+    borrow_store: struct { borrow: ValueId, value: ValueId, path: []const u32 },
     range_init: struct { start: ValueId, end: ValueId, inclusive: bool },
     range_start: ValueId,
     range_end: ValueId,
@@ -191,6 +197,7 @@ pub const VerifyError = ValidationError || error{
     InvalidParameter,
     OperandTypeMismatch,
     InvalidOperation,
+    BorrowConflict,
     InvalidCall,
     InvalidReturn,
     InvalidConstId,
@@ -283,6 +290,7 @@ pub fn setFunctionBody(self: *Ir, id: FunctionId, instructions: []const Instruct
             .print => |*print| print.args = try self.allocator.dupe(ValueId, print.args),
             .array_literal, .record_init => |*elements| elements.* = try self.allocator.dupe(ValueId, elements.*),
             .field_store => |*store| store.path = try self.allocator.dupe(u32, store.path),
+            .borrow_store => |*store| store.path = try self.allocator.dupe(u32, store.path),
             else => {},
         }
         copied += 1;
@@ -296,6 +304,7 @@ fn freeOperands(self: *Ir, op: Operation) void {
         .print => |print| self.allocator.free(print.args),
         .array_literal, .record_init => |elements| self.allocator.free(elements),
         .field_store => |store| self.allocator.free(store.path),
+        .borrow_store => |store| self.allocator.free(store.path),
         else => {},
     }
 }
@@ -581,7 +590,33 @@ fn slotType(body: Body, id: ValueId, before: usize) VerifyError!TypeId {
     return ty;
 }
 
+pub fn verifyBodyStructure(self: *const Ir, function: FunctionId, body: Body) VerifyError!void {
+    try self.validateBodyStructure(self.getFunction(function) orelse return error.InvalidFunctionId, body);
+}
+
 fn validateBody(self: *const Ir, function: Function, body: Body) VerifyError!void {
+    try self.validateBodyStructure(function, body);
+    if (try self.borrowConflict(body) != null) return error.BorrowConflict;
+}
+
+pub const BorrowConflict = struct { access: Span, origin: Span };
+pub fn borrowConflict(self: *const Ir, body: Body) VerifyError!?BorrowConflict {
+    return BorrowCheck.check(self.allocator, body);
+}
+
+pub fn borrowOwner(body: Body, borrow: ValueId) ValueId {
+    const reservation = body.instructions[@intFromEnum(borrow)].op.borrow_start.reservation;
+    return body.instructions[@intFromEnum(reservation)].op.borrow_reserve;
+}
+
+fn borrowElement(self: *const Ir, body: Body, borrow: ValueId, before: usize) VerifyError!TypeId {
+    _ = try regionOperandType(body, borrow, before, null);
+    if (body.instructions[@intFromEnum(borrow)].op != .borrow_start) return error.InvalidOperation;
+    const slot = borrowOwner(body, borrow);
+    return self.getType(body.instructions[@intFromEnum(slot)].ty).?.array;
+}
+
+fn validateBodyStructure(self: *const Ir, function: Function, body: Body) VerifyError!void {
     const signature = (self.getType(function.ty) orelse return error.InvalidTypeId).function;
     if (body.instructions.len > std.math.maxInt(u32)) return error.InvalidRegion;
     // Validate structure before resolving operands. A region includes its merge
@@ -650,6 +685,36 @@ fn validateBody(self: *const Ir, function: Function, body: Body) VerifyError!voi
             if (i + 1 != region_end or @intFromEnum(result) != i) return error.UnreachableInstruction;
         }
         switch (instruction.op) {
+            .borrow_reserve => |slot| {
+                if (ty != .void) return error.InvalidOperation;
+                const array = self.getType(try slotType(body, slot, i)).?;
+                if (array != .array) return error.InvalidOperation;
+                const element = self.getType(array.array).?;
+                if (element != .record or element.record.tagged) return error.InvalidOperation;
+            },
+            .borrow_start => |start| {
+                if (ty != .void) return error.InvalidOperation;
+                _ = try regionOperandType(body, start.reservation, i, null);
+                if (body.instructions[@intFromEnum(start.reservation)].op != .borrow_reserve) return error.InvalidOperation;
+                if (!isNativeInteger(self.getType(try operandType(body, start.index, i)).?, .signed)) return error.OperandTypeMismatch;
+                // One normalized index per reservation; capabilities cannot be forked.
+                for (body.instructions[0..i]) |previous| {
+                    if (previous.op == .borrow_start and previous.op.borrow_start.reservation == start.reservation) return error.InvalidOperation;
+                }
+            },
+            .borrow_read => |borrow| {
+                if (instruction.ty != try self.borrowElement(body, borrow, i)) return error.OperandTypeMismatch;
+            },
+            .borrow_store => |store| {
+                if (ty != .void or store.path.len == 0 or store.path.len > max_record_depth) return error.InvalidOperation;
+                var field_ty = try self.borrowElement(body, store.borrow, i);
+                for (store.path) |index| {
+                    const record = self.getType(field_ty).?;
+                    if (record != .record or record.record.tagged or index >= record.record.fields.len) return error.InvalidOperation;
+                    field_ty = record.record.fields[index].ty;
+                }
+                if (try operandType(body, store.value, i) != field_ty) return error.OperandTypeMismatch;
+            },
             .range_init => |r| {
                 if (ty != .range) return error.InvalidOperation;
                 if (try operandType(body, r.start, i) != ty.range or try operandType(body, r.end, i) != ty.range) return error.OperandTypeMismatch;

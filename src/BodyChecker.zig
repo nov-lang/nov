@@ -20,6 +20,8 @@ const Binding = struct {
     slot: ?Ir.ValueId = null,
     value: ?Ir.ValueId = null,
     name_span: Module.Span,
+    borrowed: bool = false,
+    borrow: ?Ir.ValueId = null,
 };
 // Bounds recursive checking/probing, not the iterative literal-grouping walk.
 const max_recursive_depth = 128;
@@ -49,6 +51,13 @@ pub fn lower(module: *Module, ir: *Ir, types: []const ?Ir.TypeId, constants: []c
     const body_node = module.source.ast.decl(module.getDeclaration(id).?.node).ast.init_node;
     const result = emitter.values.get(body_node) orelse return error.InvalidValueId;
     const function = functions[tableIndex(module, id)] orelse return error.InvalidFunctionId;
+    const body: Ir.Body = .{ .instructions = emitter.instructions.items, .result = result };
+    // Structural/type verification precedes the control-flow borrow proof.
+    try ir.verifyBodyStructure(function, body);
+    if (try ir.borrowConflict(body)) |conflict| {
+        try module.diagnostics.append(module.allocator, .{ .tag = .borrow_conflict, .span = conflict.access, .related = conflict.origin });
+        return false;
+    }
     try ir.setFunctionBody(function, emitter.instructions.items, result);
     return true;
 }
@@ -141,6 +150,7 @@ fn checkInner(module: *Module, ir: *Ir, types: []const ?Ir.TypeId, id: Module.De
 }
 
 const Context = struct {
+    const Reservation = struct { owner: Module.Span, origin: Module.Span, parent: ?*const Reservation };
     const LoopContext = struct { allows_value: bool, result: ?Known, valued_break: bool = false, has_break: bool = false };
 
     module: *Module,
@@ -158,6 +168,16 @@ const Context = struct {
     loop_context: ?*LoopContext = null,
     bindings: std.StringHashMapUnmanaged(Binding) = .empty,
     locals: std.ArrayList([]const u8) = .empty,
+    borrow_base: ?Ast.Node.Index = null,
+    reservation: ?*const Reservation = null,
+
+    fn reservedOrigin(self: *const Context, owner: Module.Span) ?Module.Span {
+        var cursor = self.reservation;
+        while (cursor) |current| : (cursor = current.parent) {
+            if (std.meta.eql(owner, current.owner)) return current.origin;
+        }
+        return null;
+    }
 
     fn restoreScope(self: *Context, start: usize) void {
         for (self.locals.items[start..]) |name| _ = self.bindings.remove(name);
@@ -257,6 +277,8 @@ const Context = struct {
             _ = try self.fail(.missing_initializer, node, null);
             return false;
         }
+        if (ast.nodes.items(.tag)[decl.init_node] == .ref_of)
+            return self.borrowLocal(node, name, name_span, depth);
         const annotation: ?Known = if (decl.type_node != 0) .{
             .ty = (try TypeResolver.resolveInContainer(self.module, self.ir, decl.type_node, self.container, self.concrete_type)) orelse return false,
             .annotation = self.module.tokenSpan(ast.firstToken(decl.type_node)),
@@ -275,11 +297,54 @@ const Context = struct {
         }
         const known = annotation orelse Known{ .ty = ty };
         try self.copyNode(decl.init_node, ty);
-        const slot = if (decl.is_mutable and self.emitter != null)
+        const slot = if ((decl.is_mutable or self.ir.getType(ty).? == .array) and self.emitter != null)
             try self.emitter.?.append(ty, self.irSpan(node), .{ .local_slot = try self.emitter.?.value(decl.init_node) })
         else
             null;
         try self.bindLocal(name, .{ .known = known, .initializer = decl.init_node, .name_span = name_span, .mutable = decl.is_mutable, .slot = slot });
+        return true;
+    }
+
+    fn borrowLocal(self: *Context, node: Ast.Node.Index, name: []const u8, name_span: Module.Span, depth: usize) Error!bool {
+        const ast = &self.module.source.ast;
+        const decl = ast.decl(node).ast;
+        const operand = ast.nodes.items(.data)[decl.init_node].rhs;
+        if (decl.is_mutable or decl.type_node != 0 or ast.nodes.items(.tag)[operand] != .array_access) {
+            _ = try self.fail(.unsupported_borrow, decl.init_node, null);
+            return false;
+        }
+        const access = ast.nodes.items(.data)[operand];
+        if (ast.nodes.items(.tag)[access.lhs] != .identifier) {
+            _ = try self.fail(.unsupported_borrow, operand, null);
+            return false;
+        }
+        const owner = self.bindings.get(ast.tokenSlice(ast.nodes.items(.main_token)[access.lhs])) orelse {
+            _ = try self.fail(.unsupported_borrow, access.lhs, null);
+            return false;
+        };
+        if (self.reservedOrigin(owner.name_span)) |origin| {
+            _ = try self.fail(.borrow_conflict, access.lhs, origin);
+            return false;
+        }
+        const array = self.ir.getType(owner.known.ty).?;
+        if (array != .array or owner.initializer == null or self.ir.getType(array.array).? != .record or self.ir.getType(array.array).?.record.tagged) {
+            _ = try self.fail(.unsupported_borrow, operand, owner.name_span);
+            return false;
+        }
+        const unit = try self.ir.internType(.void);
+        const reservation = if (self.emitter) |emitter| try emitter.append(unit, self.irSpan(decl.init_node), .{ .borrow_reserve = owner.slot.? }) else null;
+        const index_ty = try self.ir.internType(.{ .integer = .{ .signedness = .signed, .bits = Ir.native_pointer_bits } });
+        // Reserve the source throughout index evaluation, including terminal
+        // paths that never reach activation. Nested independent reservations
+        // retain their parents rather than opening an invalidation window.
+        const index_reservation: Reservation = .{ .owner = owner.name_span, .origin = self.span(decl.init_node), .parent = self.reservation };
+        const parent_reservation = self.reservation;
+        self.reservation = &index_reservation;
+        defer self.reservation = parent_reservation;
+        if (try self.expression(access.rhs, .{ .ty = index_ty }, depth + 1) == null) return false;
+        if (self.terminated) return true;
+        const borrow = if (self.emitter) |emitter| try emitter.append(unit, self.irSpan(decl.init_node), .{ .borrow_start = .{ .reservation = reservation.?, .index = try emitter.value(access.rhs) } }) else null;
+        try self.bindLocal(name, .{ .known = .{ .ty = array.array }, .name_span = name_span, .mutable = owner.mutable, .borrowed = true, .borrow = borrow });
         return true;
     }
 
@@ -708,6 +773,7 @@ const Context = struct {
                 if (std.mem.eql(u8, name, "true") or std.mem.eql(u8, name, "false")) break :blk .{ .ty = try self.ir.internType(.boolean) };
                 break :blk null;
             },
+            .ref_of => self.probe(data.rhs, depth + 1),
             .unwrap => blk: {
                 const operand = (try self.probe(data.lhs, depth + 1)) orelse break :blk null;
                 const shape = self.propagationShape(operand.ty) orelse break :blk null;
@@ -942,6 +1008,7 @@ const Context = struct {
             .identifier => blk: {
                 const name = self.module.sourceSlice(self.span(node)).?;
                 if (self.bindings.get(name)) |binding| {
+                    if (binding.borrowed) break :blk .{ .borrow_read = binding.borrow.? };
                     if (binding.value) |value| {
                         try emitter.values.put(emitter.allocator, node, value);
                         return true;
@@ -1018,6 +1085,9 @@ const Context = struct {
             },
         };
         try emitter.record(node, ty, self.irSpan(node), op);
+        // Ordinary reads must detach immediately, before any index/RHS effects:
+        // a later borrow can mutate the owner's backing in place. Borrow reads
+        // use their capability above and never pass through this copy boundary.
         if (tag == .identifier and self.ir.getType(ty).? == .array) try self.copyNode(node, ty);
         return true;
     }
@@ -1086,7 +1156,11 @@ const Context = struct {
                     .lhs = try emitter.value(data.lhs),
                     .rhs = value,
                 } });
-                try emitter.record(node, unit, self.irSpan(node), .{ .field_store = .{ .slot = binding.slot.?, .index = index, .value = value, .path = try emitter.allocator.dupe(u32, path[0..path_len]) } });
+                if (binding.borrowed) {
+                    if (path_len == path.len) return self.fail(.record_layout_limit, data.lhs, null);
+                    path[path_len] = index;
+                    try emitter.record(node, unit, self.irSpan(node), .{ .borrow_store = .{ .borrow = binding.borrow.?, .value = value, .path = try emitter.allocator.dupe(u32, path[0 .. path_len + 1]) } });
+                } else try emitter.record(node, unit, self.irSpan(node), .{ .field_store = .{ .slot = binding.slot.?, .index = index, .value = value, .path = try emitter.allocator.dupe(u32, path[0..path_len]) } });
             }
         }
         return self.fit(unit, expected, node);
@@ -1757,6 +1831,7 @@ const Context = struct {
         const ast = &self.module.source.ast;
         const data = ast.nodes.items(.data)[node];
         switch (ast.nodes.items(.tag)[node]) {
+            .ref_of => return self.fail(.unsupported_borrow, node, null),
             .enum_literal => return self.fail(.enum_needs_type, node, null),
             .unwrap => return self.propagate(node, expected, depth),
             .match => return self.matchExpression(node, expected, hint, depth),
@@ -1792,7 +1867,13 @@ const Context = struct {
                     const known = (try self.globalType(id)) orelse return self.fail(.unresolved_value_type, node, null);
                     return self.fit(known.ty, expected, node);
                 }
-                const base = (try self.expression(data.lhs, null, depth + 1)) orelse return null;
+                const previous_base = self.borrow_base;
+                self.borrow_base = if (ast.nodes.items(.tag)[node] == .field_access) data.lhs else null;
+                const base = (try self.expression(data.lhs, null, depth + 1)) orelse {
+                    self.borrow_base = previous_base;
+                    return null;
+                };
+                self.borrow_base = previous_base;
                 if (self.terminated) return if (expected) |want| want.ty else base;
                 const array = self.ir.getType(base).?;
                 if (array == .record and ast.nodes.items(.tag)[node] == .field_access) {
@@ -1811,7 +1892,11 @@ const Context = struct {
             },
             .identifier => {
                 const name = self.module.sourceSlice(self.span(node)).?;
-                if (self.bindings.get(name)) |binding| return self.fit(binding.known.ty, expected, node);
+                if (self.bindings.get(name)) |binding| {
+                    if (self.reservedOrigin(binding.name_span)) |origin| return self.fail(.borrow_conflict, node, origin);
+                    if (binding.borrowed and self.borrow_base != node) return self.fail(.borrow_escape, node, binding.name_span);
+                    return self.fit(binding.known.ty, expected, node);
+                }
                 if (self.valueDeclaration(name)) |id| {
                     const declaration = self.getDeclaration(id);
                     if (isPrimitive(name)) return self.fail(.unsupported_shadowing, node, declaration.name_span);
@@ -1935,6 +2020,8 @@ const Context = struct {
                     if (self.module.lookup(name)) |id| return self.fail(.immutable_assignment, data.lhs, self.module.getDeclaration(id).?.name_span);
                     return self.fail(.unknown_name, data.lhs, null);
                 };
+                if (self.reservedOrigin(binding.name_span)) |origin| return self.fail(.borrow_conflict, data.lhs, origin);
+                if (binding.borrowed) return self.fail(.borrow_escape, data.lhs, binding.name_span);
                 if (!binding.mutable) return self.fail(.immutable_assignment, data.lhs, binding.name_span);
                 const tag = ast.nodes.items(.tag)[node];
                 const compound = tag != .assign;
@@ -3903,6 +3990,79 @@ test "reusable range values preserve exact inference and reject unsupported valu
         for (module.diagnostics.items) |diagnostic| {
             try std.testing.expect(diagnostic.span.start < diagnostic.span.end);
             try std.testing.expect(diagnostic.span.end <= source.len);
+        }
+    }
+}
+
+test "static borrowing structured last use conflicts and bounded escapes" {
+    const Case = struct { body: []const u8, diagnostic: ?Module.Diagnostic.Tag = null };
+    for ([_]Case{
+        .{ .body = "let r=&a[0]; r.x+=1; @println(a.len,a[0].x)" },
+        .{ .body = "let r=&a[0]; if flag {r.x+=1} else {@println(a.len)}; @println(a.len)" },
+        .{ .body = "if flag {let r=&a[0]; r.x=1} else {let s=&a[0]; s.x=2}; @println(a.len)" },
+        .{ .body = "loop i in 0..3 {let r=&a[0]; r.x+=1; @println(i,a.len)}" },
+        .{ .body = "let r=&a[0]; loop {r.x+=1; break}; @println(a.len)" },
+        .{ .body = "let r=&a[0]; loop {if flag {r.x+=1; break} else {@println(a.len); return}}; @println(a.len)" },
+        .{ .body = "let r=&a[0]; let independent=[R[]]; let copy=independent; r.x=copy[0].x" },
+        .{ .body = "let r=&a[0]; loop flag {r.x+=1; @println(a.len); break}; @println(a.len)" },
+        .{ .body = "let r=&a[0]; loop flag {if flag {r.x+=1; @println(a.len); break} else {return}}" },
+        .{ .body = "let r=&a[0]; loop flag {r.x+=1}; @println(a.len)" },
+        .{ .body = "let r=&a[0]; let n:int={loop {r.x+=1; break}; @println(a.len); 1}; @println(n)" },
+        .{ .body = "let r=&a[0]; loop {r.x+=1; loop {break}; @println(a.len); break}" },
+        .{ .body = "let r=&a[0]; if flag {r.x+=1} else {@println(a.len)}; r.x+=1", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[0]; loop {r.x+=1; loop {@println(a.len); break}; if flag {break}}", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[0]; loop {a.len==1} {r.x+=1}", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[0]; loop flag : @println(a.len) {r.x+=1}", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[0]; let b=flag and {a=[R[]]; return}; r.x=1; @println(b)" },
+        .{ .body = "let r=&a[0]; let b=flag and {r.x=1; true}; @println(a.len,b)" },
+        .{ .body = "let r=&a[0]; match flag {true=>r.x=1; false=>@println(a.len)}; @println(a.len)" },
+        .{ .body = "let r=&a[0]; match flag {true=>r.x=1; false=>@println(a.len)}; r.x=2", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[0]; return r", .diagnostic = .borrow_escape },
+        .{ .body = "let r=&a[0]; @println(a.len); r.x=1", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[0]; let b=a; r.x=1", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[0]; a=[R[]]; r.x=1", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[0]; a+=[R[]]; r.x=1", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[0]; a[0]=R[]; r.x=1", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[0]; let s=&a[-1]; r.x=1; s.x=2", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[0]; r.x+={a=[R[]]; 1}", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[0]; r.x={a=[R[]]; 1}", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[{a=[R[]]; 0}]; r.x=1", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[{a=[R[]]; return}]; r.x=1", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[{@println(a.len); 0}]; r.x=1", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[0]; loop {r.x+=1; @println(a.len); if flag {break}}", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[0]; loop {r.x+=1; if flag {@println(a.len); continue} else {break}}", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[0]; loop {if flag {@println(a.len); continue} else {r.x+=1; break}}", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[0]; let b=flag and {a=[R[]]; true}; r.x=1; @println(b)", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[0]; let alias=r; alias.x=1", .diagnostic = .borrow_escape },
+        .{ .body = "let r=&a[0]; consume(r)", .diagnostic = .borrow_escape },
+        .{ .body = "let r=&a[0]; let b:[]R=[r,r]", .diagnostic = .borrow_escape },
+        .{ .body = "let r=&a[0]; let b={r}", .diagnostic = .borrow_escape },
+        .{ .body = "let r=&a[0]; let s=&r.x", .diagnostic = .unsupported_borrow },
+        .{ .body = "let r=&a[0]; r=R[]", .diagnostic = .borrow_escape },
+        .{ .body = "let immutable=[R[]]; let r=&immutable[0]; @println(r.x)" },
+        .{ .body = "let immutable=[R[]]; let r=&immutable[0]; r.x=1", .diagnostic = .immutable_assignment },
+    }) |case| {
+        const body_text = try std.testing.allocator.dupe(u8, case.body);
+        defer std.testing.allocator.free(body_text);
+        for (body_text) |*byte| if (byte.* == 59) {
+            byte.* = 10;
+        };
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let R=struct{{x:int=0,}}\nlet consume:(r:R)={{}}\nlet f:(flag:bool)={{let mut a=[R[]]\n{s}\n}}", .{body_text});
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "borrow.nov", source);
+        defer module.deinit();
+        errdefer std.debug.print("borrow case: {s}; diagnostics: {any}\n", .{ case.body, module.diagnostics.items });
+        errdefer std.debug.print("parse: {any} source: {s}", .{ module.source.ast.errors, source });
+        var result = try Lowering.lower(&module);
+        defer result.deinit();
+        if (case.diagnostic) |tag| {
+            try std.testing.expect(module.hasErrors());
+            try std.testing.expectEqual(tag, module.diagnostics.items[0].tag);
+            if (tag == .borrow_conflict or tag == .borrow_escape) try std.testing.expect(module.diagnostics.items[0].related != null);
+        } else {
+            try std.testing.expect(!module.hasErrors());
+            try std.testing.expect(result.lowering_complete);
+            try result.ir.verify();
         }
     }
 }

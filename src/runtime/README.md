@@ -82,9 +82,11 @@ foreign unwinding across active frames are unsupported.
 
 Only NULL and exact payload-base pointers owned by the same heap are valid in
 managed slots/fields. Interior references, tagged pointers, foreign pointers and
-stale references are unsupported. Retain a rooted base and an integer offset if
-future compiler lowering needs a derived address; do not keep the derived address
-across a safepoint. Invalid pointers encountered during tracing panic before
+stale references are unsupported. Local array-element borrowing retains a rooted
+owner slot and normalized integer index, derives addresses only for immediate
+reads/stores, and statically excludes conflicting owner access until last use.
+Borrowed references cannot escape; there are no runtime generation checks. Do not
+keep a derived interior address across a safepoint or put it in a root table. Invalid pointers encountered during tracing panic before
 being dereferenced. This is not a memory-safety boundary: unregistered dangling
 roots, malformed metadata, cross-heap root record reuse and use-after-free outside
 tracing remain caller/compiler errors. A stale pointer whose address has been

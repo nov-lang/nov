@@ -1,5 +1,18 @@
 # TODO
 
+Local static array-element borrowing is executable: let ref=&localArray[index]
+for nominal record elements, with nested field reads/writes and compounds in place.
+Mutable owners permit writes; immutable owners permit reads. CFG fixed-point
+liveness ends the exclusive whole-array loan after its last use, tracking branches,
+loops/backedges, terminal controls and RHS stores. Conflicting owner access and
+reference escape/copy/rebind/reborrow/method receiver use diagnose. Owner access
+during index evaluation is conservatively rejected too. References are bounded
+local capabilities, not general first-class pointers; readonly loans also remain
+exclusive. Index normalization/bounds happens once, owner base is rooted, and no
+runtime reference-validity checks or interior GC roots are introduced. Normal array
+copies and pre-borrow snapshots remain independent. User's managed-arrays.nov now
+works unchanged with &people[0]; explicit annotations/escaping refs remain deferred.
+
 Reusable range values are executable: start..end / start..=end construct integer
 bounds once left-to-right, and loop i in range snapshots the source once per loop.
 Reuse restarts at the beginning; source-binding replacement cannot affect an active
@@ -24,7 +37,7 @@ append, literal inference, copies/returns and managed owner tracing work. String
 membership compares bytes, including UTF-8/NUL; record membership/equality and
 indexed string compounds remain unsupported. Owned expanded GC pointer maps cover
 all managed capacity slots, with checked alignment/size/OOM and zeroed owners.
-No nested/enum/union/function arrays, element aliases or array record fields yet.
+No nested/enum/union/function arrays, escaping element aliases or array record fields yet.
 See examples/managed-arrays.nov. Generic structs now work with supported field types.
 
 Acyclic nested nominal struct fields and mutable-local nested field paths now work,
@@ -41,7 +54,8 @@ integer +=/-=/*=//=/%= and string +=. Compounds snapshot the old field before RH
 final stores change only that field in the current local, preserving other-field
 and whole-record RHS changes. Terminal RHS skips the pending operation/store.
 Copies remain independent, strings share immutable storage, and string owners stay
-rooted. No temporary/union/parameter/pointer mutation or implicit borrowing.
+rooted. Bounded local element borrows also mutate fields; general temporary/union/
+parameter/pointer mutation and implicit borrowing remain unsupported.
 See examples/struct-mutation.nov; generic structs now use the same mutation rules;
 prioritized roadmap is in local PLAN.md.
 
