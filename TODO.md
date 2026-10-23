@@ -1,5 +1,14 @@
 # TODO
 
+Growable []string and acyclic nested-record arrays are executable with independent
+element storage and shared immutable string backing. Index values and replacements,
+append, literal inference, copies/returns and managed owner tracing work. String
+membership compares bytes, including UTF-8/NUL; record membership/equality and
+indexed string compounds remain unsupported. Owned expanded GC pointer maps cover
+all managed capacity slots, with checked alignment/size/OOM and zeroed owners.
+No nested/enum/union/function arrays, element aliases or array record fields yet.
+See examples/managed-arrays.nov; generic structs are next in the roadmap.
+
 Acyclic nested nominal struct fields and mutable-local nested field paths now work,
 including aliases/imports/forward layouts and nested structs as union payloads.
 Value copies have independent struct storage; immutable strings share backing.
@@ -15,7 +24,7 @@ final stores change only that field in the current local, preserving other-field
 and whole-record RHS changes. Terminal RHS skips the pending operation/store.
 Copies remain independent, strings share immutable storage, and string owners stay
 rooted. No temporary/union/parameter/pointer mutation or implicit borrowing.
-See examples/struct-mutation.nov. Broader arrays and generic structs are next;
+See examples/struct-mutation.nov. Generic structs are next;
 prioritized roadmap is in local PLAN.md.
 
 Option.isSome/isNone and Result.isOk/isErr are ordinary public bool-returning

@@ -567,7 +567,7 @@ test "nominal records reject mismatches malformed constructors defaults fields a
         .{ .source = "let A=struct{x:B,}\nlet B=struct{x:A,}", .tag = .record_layout_cycle },
         .{ .source = "let A=struct{x:int,}\nlet f:(a:A)={a.x=1}", .tag = .immutable_assignment },
         .{ .source = "let A=struct{x:int,}\nlet f:(a:A)->int=a.y", .tag = .unknown_field },
-        .{ .source = "let A=struct{x:int,}\nlet f:(a:[]A)= {}", .tag = .unsupported_type },
+        .{ .source = "let A=struct{x:int,}\nlet f:(a:[][]A)= {}", .tag = .unsupported_type },
         .{ .source = "let A=struct{x:int=0,}\nlet a=A[]", .tag = .unsupported_global_initializer },
         .{ .source = "let A=struct{\nlet B=struct{x:int,}\n}", .tag = .unsupported_declaration },
         .{ .source = "let int=struct{}", .tag = .unsupported_shadowing },

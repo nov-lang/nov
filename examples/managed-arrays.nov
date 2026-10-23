@@ -1,0 +1,25 @@
+let Name = struct {
+    text: string,
+}
+
+let Person = struct {
+    name: Name,
+    score: uint = 1,
+}
+
+let main: () = {
+    let mut names: []string = ["Ada", "Grace"]
+    let originalNames = names
+    names[0] = "Lin" + "us"
+    names += ["Edsger"]
+    @println(names[0], names[-1], "Ada" in originalNames, "Ada" in names)
+
+    let mut people = [Person[ .name = Name[ .text = "Ada" ] ]]
+    let originalPeople = people
+    let mut changed = people[0]
+    changed.name.text += " Lovelace"
+    changed.score += 1
+    people[0] = changed
+    @println(people[0].name.text, people[0].score)
+    @println(originalPeople[0].name.text, originalPeople[0].score)
+}

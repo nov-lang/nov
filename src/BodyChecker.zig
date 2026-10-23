@@ -1997,6 +1997,7 @@ const Context = struct {
                     if (try self.expression(data.rhs, null, depth + 1) == null) return null;
                     return self.fail(.operator_not_supported, node, null);
                 };
+                if (self.ir.getType(element.ty).? == .record) return self.fail(.operator_not_supported, node, element.annotation);
                 if (try self.expression(data.lhs, element, depth + 1) == null) return null;
                 const array: Known = .{ .ty = try self.ir.internType(.{ .array = element.ty }), .annotation = element.annotation };
                 if (try self.expression(data.rhs, array, depth + 1) == null) return null;
@@ -2753,7 +2754,7 @@ test "membership rejects defaults widening nonscalar elements and nonboolean res
         .{ .source = "let f: (a: []int) -> int = 1 in a", .tag = .expression_type_mismatch },
         .{ .source = "let f: () -> bool = true in false", .tag = .operator_not_supported },
         .{ .source = "let f: () -> bool = \"a\" in \"abc\"", .tag = .operator_not_supported },
-        .{ .source = "let f: () -> bool = \"a\" in []", .tag = .operator_not_supported },
+        .{ .source = "let A=struct{s:string,}\nlet f: (a: A) -> bool = a in []", .tag = .operator_not_supported },
         .{ .source = "let f: (a: []int) -> bool = a in []", .tag = .operator_not_supported },
         .{ .source = "let f: () -> bool = {} in []", .tag = .operator_not_supported },
         .{ .source = "let f: (a: []int) -> bool = missing in a", .tag = .unknown_name },
@@ -2867,10 +2868,9 @@ test "string compounds retain mutability operator and operand diagnostics" {
     }
 }
 
-test "strings reject byte mutation indexing slicing arrays ordering and eager globals" {
+test "strings reject byte mutation indexing slicing ordering and eager globals" {
     for ([_][]const u8{
-        "let f: () -> void = {let x: []string = []\n}",
-        "let f: () -> void = {let x = [\"a\"]\n}",
+        "let f: () -> void = {let mut x = [\"a\"]\nx[0] += \"b\"}",
         "let f: () -> void = {let mut x = \"a\"\nx[0] = \"b\"}",
         "let f: () -> void = @println(\"a\"[0])",
         "let f: () -> void = @println(\"a\"[0..1])",
@@ -2887,6 +2887,34 @@ test "strings reject byte mutation indexing slicing arrays ordering and eager gl
         var module = try Module.init(std.testing.allocator, "unsupported-string.nov", source);
         defer module.deinit();
         if (module.hasErrors()) continue;
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        try std.testing.expect(module.hasErrors());
+        try std.testing.expect(!sema.lowering_complete);
+    }
+}
+
+test "managed arrays reject unsupported payloads nominal mismatches and record membership" {
+    for ([_][]const u8{
+        "let A=struct{s:string,}\nlet B=struct{s:string,}\nlet f:(a:A,b:B)={let x=[a,b]\n}",
+        "let A=struct{s:string,}\nlet f:(a:A)->bool=a in [a]",
+        "let A=struct{s:string,}\nlet f:(a:A)->bool=a in []",
+        "let A=struct{s:string,}\nlet f:(a:A)={let mut x=[a]\nx[0]+=a}",
+        "let A=struct{s:string,}\nlet f:(a:A)={let mut x=[a]\nx[0].s=\"bad\"}",
+        "let A=struct{s:string,}\nlet f:(a:A)={let x:[]A=[]\nlet y:[]string=x\n}",
+        "let A=struct{s:[]string,}",
+        "let U=union{s:string,none,}\nlet f:(a:[]U)={}",
+        "let E=enum{a,b,}\nlet f:(a:[]E)={}",
+        "let f:(a:[]()->string)={}",
+        "let f:(a:[][]string)={}",
+        "let O:(T:type)->type=union{some:T,none,}\nlet f:(a:O([]string))={}",
+        "let R:(T:type,E:type)->type=union{ok:T,err:E,}\nlet f:(a:R([]string,string))={}",
+        "let f:()={let a:[]string=[]\nlet b:[]bool=[]\nlet c:[]string=b\n}",
+        "let f:()={let a=[\"a\",true]\n}",
+    }) |source| {
+        var module = try Module.init(std.testing.allocator, "bad-managed-array.nov", source);
+        defer module.deinit();
+        try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
         var sema = try Lowering.lower(&module);
         defer sema.deinit();
         try std.testing.expect(module.hasErrors());

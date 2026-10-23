@@ -162,7 +162,10 @@ fn analyze(allocator: std.mem.Allocator, ir: *const Ir, origins: []?Origin, diag
         switch (ir.types.items[i]) {
             .void, .boolean, .string, .enumeration => {},
             .record => try markRecord(ir, origins, visited, @enumFromInt(i), origin, diagnostic),
-            .array => |element| mark(origins, element, origin),
+            .array => |element| {
+                mark(origins, element, origin);
+                if (ir.getType(element).? == .record) try markRecord(ir, origins, visited, element, origin, diagnostic);
+            },
             .integer => |integer| switch (integer.bits) {
                 8, 16, 32, 64 => {},
                 else => return fail(diagnostic, .integer_width_unsupported, origin),
@@ -214,7 +217,9 @@ fn write(allocator: std.mem.Allocator, ir: *const Ir, origins: []const ?Origin, 
         try writeType(ir, w, element);
         try w.writeAll(" value, nov_array array) {\n    const ");
         try writeType(ir, w, element);
-        try w.writeAll(" *data = array.data;\n    for (uintptr_t i = 0; i < array.len; ++i) {\n        if (value == data[i]) return true;\n    }\n    return false;\n}\n");
+        try w.writeAll(" *data = array.data;\n    for (uintptr_t i = 0; i < array.len; ++i) {\n        if (");
+        try w.writeAll(if (ir.getType(element).? == .string) "nov_string_equal(value, data[i])" else "value == data[i]");
+        try w.writeAll(") return true;\n    }\n    return false;\n}\n");
     }
     try writeArithmeticRuntime(ir, w);
     // Nominal placeholders may precede dependencies in either pool direction.
@@ -251,6 +256,23 @@ fn write(allocator: std.mem.Allocator, ir: *const Ir, origins: []const ?Origin, 
             try w.print("}} nov_record_{d};\n", .{i});
         }
     }
+    for (ir.types.items, 0..) |_, t| {
+        const element: Ir.TypeId = @enumFromInt(t);
+        if (!usesElementLayout(ir, element)) continue;
+        const count = root_counts[t];
+        if (count != 0) {
+            try w.print("static const size_t nov_element_offsets_{d}[] = {{", .{t});
+            try writeElementOffsets(ir, root_counts, w, element);
+            try w.writeAll(" };\n");
+        }
+        try w.print("static const nov_gc_descriptor nov_element_{d} = {{ sizeof(", .{t});
+        try writeType(ir, w, element);
+        try w.writeAll("), _Alignof(");
+        try writeType(ir, w, element);
+        try w.print("), {d}, ", .{count});
+        if (count == 0) try w.writeAll("NULL") else try w.print("nov_element_offsets_{d}", .{t});
+        try w.writeAll(" };\n");
+    }
     var first_typedef = true;
     for (origins, ir.types.items, 0..) |origin, ty, i| {
         if (origin == null or ty != .function) continue;
@@ -274,6 +296,46 @@ fn write(allocator: std.mem.Allocator, ir: *const Ir, origins: []const ?Origin, 
         try w.writeAll(" {\n");
         try writeBody(allocator, ir, root_counts, w, function);
         try w.writeAll("}\n");
+    }
+}
+
+fn usesElementLayout(ir: *const Ir, element: Ir.TypeId) bool {
+    for (ir.functions.items) |function| {
+        for (function.body.?.instructions) |instruction| switch (instruction.op) {
+            .array_literal, .array_clone, .array_set, .array_append => if (ir.getType(instruction.ty).?.array == element) return true,
+            else => {},
+        };
+    }
+    return false;
+}
+
+fn writeElementOffsets(ir: *const Ir, root_counts: []const usize, w: *std.Io.Writer, id: Ir.TypeId) WriteError!void {
+    const Frame = struct { ty: Ir.TypeId, next: usize = 0 };
+    var stack: [Ir.max_record_depth + 1]Frame = undefined;
+    stack[0] = .{ .ty = id };
+    var len: usize = 1;
+    while (len != 0) {
+        const frame = &stack[len - 1];
+        const ty = ir.getType(frame.ty).?;
+        if (ty == .record) {
+            if (frame.next == ty.record.fields.len) {
+                len -= 1;
+            } else {
+                const field = ty.record.fields[frame.next];
+                frame.next += 1;
+                if (root_counts[@intFromEnum(field.ty)] == 0) continue;
+                stack[len] = .{ .ty = field.ty };
+                len += 1;
+            }
+        } else {
+            std.debug.assert(ty == .string);
+            try w.writeAll(" offsetof(");
+            try writeType(ir, w, id);
+            try w.writeAll(", ");
+            for (stack[0 .. len - 1]) |parent| try w.print("f{d}.", .{parent.next - 1});
+            try w.writeAll("owner),");
+            len -= 1;
+        }
     }
 }
 
@@ -320,6 +382,9 @@ fn usesManagedRuntime(ir: *const Ir) bool {
 }
 
 fn usesStringEquality(ir: *const Ir) bool {
+    for (ir.types.items, 0..) |ty, t| {
+        if (ty == .string and usesArrayContains(ir, @enumFromInt(t))) return true;
+    }
     for (ir.functions.items) |function| {
         const body = function.body.?;
         for (body.instructions) |instruction| {
@@ -626,7 +691,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
     if (managed) {
         // The embedded internal API also serves library emission, whose host
         // owns shutdown. Keep strict C11 unused-function warnings portable.
-        try w.writeAll("    (void)nov_gc_register_globals; (void)nov_gc_unregister_globals; (void)nov_gc_shutdown; (void)nov_gc_pop;\n    (void)nov_array_clone; (void)nov_array_index; (void)nov_array_append;\n");
+        try w.writeAll("    (void)nov_gc_register_globals; (void)nov_gc_unregister_globals; (void)nov_gc_shutdown; (void)nov_gc_pop; (void)nov_gc_alloc;\n    (void)nov_array_clone; (void)nov_array_index; (void)nov_array_append;\n");
         var roots: usize = 0;
         for (signature.params) |param| if (Ir.isManaged(ir.getType(param).?)) {
             roots = std.math.add(usize, roots, root_counts[@intFromEnum(param)]) catch return error.OutOfMemory;
@@ -822,6 +887,10 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
                     }
                 },
                 .binary => |b| try w.print("nov_string_concat(v{d}, v{d})", .{ @intFromEnum(b.lhs), @intFromEnum(b.rhs) }),
+                .array_index => |r| {
+                    try w.writeAll("((nov_string *)");
+                    try w.print("v{d}.data)[nov_array_index(v{d}, v{d})]", .{ @intFromEnum(r.array), @intFromEnum(r.array), @intFromEnum(r.index) });
+                },
                 .call => |call| try writeCall(w, call),
                 else => unreachable,
             }
@@ -941,12 +1010,8 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
     if (result_type != .void and !Ir.terminates(body, body.result)) try w.print("    return v{d};\n", .{@intFromEnum(body.result)});
 }
 
-fn writeElementLayout(ir: *const Ir, w: *std.Io.Writer, element: Ir.TypeId) WriteError!void {
-    try w.writeAll("sizeof(");
-    try writeType(ir, w, element);
-    try w.writeAll("), _Alignof(");
-    try writeType(ir, w, element);
-    try w.writeByte(')');
+fn writeElementLayout(_: *const Ir, w: *std.Io.Writer, element: Ir.TypeId) WriteError!void {
+    try w.print("&nov_element_{d}", .{@intFromEnum(element)});
 }
 
 fn writeArrayValue(ir: *const Ir, w: *std.Io.Writer, instruction: Ir.Instruction, i: usize) WriteError!void {
@@ -4515,8 +4580,8 @@ test "array capacity and append length overflow panic before accessing backing" 
     const library = try emitSource("let anchor: (unused: []bool) -> void = {}", null);
     defer test_gpa.free(library);
     for ([_][]const u8{
-        "(void)nov_array_new(UINTPTR_MAX, UINTPTR_MAX, sizeof(uint64_t), _Alignof(uint64_t));",
-        "(void)nov_array_append((nov_array){NULL, UINTPTR_MAX, UINTPTR_MAX}, (nov_array){NULL, 1, 1}, 1, 1);",
+        "(void)nov_array_new(UINTPTR_MAX, UINTPTR_MAX, &(nov_gc_descriptor){sizeof(uint64_t), _Alignof(uint64_t), 0, NULL});",
+        "(void)nov_array_append((nov_array){NULL, UINTPTR_MAX, UINTPTR_MAX}, (nov_array){NULL, 1, 1}, &(nov_gc_descriptor){1, 1, 0, NULL});",
     }) |operation| {
         const c = try std.fmt.allocPrint(test_gpa, "{s}\nint main(void) {{{s} return 99;}}\n", .{ library, operation });
         defer test_gpa.free(c);
@@ -4525,7 +4590,7 @@ test "array capacity and append length overflow panic before accessing backing" 
 }
 
 test "array allocation failure retries preserve roots and shutdown frees backing" {
-    for ([_][]const u8{ array_example, array_compound_effects, inferred_example, inferred_arrays, string_example, string_compound, string_equality, unconditional_loops, else_loops, array_membership, string_interpolation, record_program, field_mutation }, [_][]const u8{ "3 30 30 6\n454 15\n99 15 4\nfalse true 2\n0\n", array_compound_output, inferred_output, inferred_arrays_output, string_output, string_compound_output, string_equality_output, unconditional_output, else_loop_output, array_membership_output, string_interpolation_output, record_output, field_mutation_output }) |source, output| {
+    for ([_][]const u8{ array_example, array_compound_effects, inferred_example, inferred_arrays, string_example, string_compound, string_equality, unconditional_loops, else_loops, array_membership, string_interpolation, record_program, field_mutation, managed_array_program }, [_][]const u8{ "3 30 30 6\n454 15\n99 15 4\nfalse true 2\n0\n", array_compound_output, inferred_output, inferred_arrays_output, string_output, string_compound_output, string_equality_output, unconditional_output, else_loop_output, array_membership_output, string_interpolation_output, record_output, field_mutation_output, managed_array_output }) |source, output| {
         const c = try arrayTestProgram(source);
         defer test_gpa.free(c);
         const injected = try std.mem.concat(test_gpa, u8, &.{
@@ -6143,6 +6208,23 @@ test "nested records emission and path ownership survive every allocation failur
     try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{nested_record_program});
 }
 
+test "managed array record widths retain semantic limits and report exact backend leaf spans" {
+    for ([_][]const u8{
+        "let Outer=struct{inner:Inner,}\nlet Inner=struct{wide:i128,}\nlet f:(a:[]Outer)={}",
+        "let f:(a:[]Outer)={}\nlet Outer=struct{inner:Inner,}\nlet Inner=struct{wide:u128,}",
+        "let Outer=struct{inner:Inner,}\nlet Inner=struct{wide:i128,}\nlet f:(cb:([]Outer)->[]Outer)={}",
+    }) |source| {
+        var module = try Module.init(test_gpa, "array-width.nov", source);
+        defer module.deinit();
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        try std.testing.expect(!module.hasErrors());
+        var diagnostic: Diagnostic = undefined;
+        try std.testing.expectError(error.UnsupportedIntegerWidth, emit(test_gpa, &sema.ir, &diagnostic));
+        try std.testing.expectEqualStrings("wide", module.sourceSlice(diagnostic.span).?);
+    }
+}
+
 test "nested records callback widths report transitive exact leaf spans" {
     var module = try Module.init(test_gpa, "nested-width.nov", "let Outer=struct{left:Middle,right:Middle,}\nlet Middle=struct{leaf:Leaf,}\nlet Leaf=struct{wide:i128,}\nlet U=union{ok:Outer,none,}\nlet f:(cb:(U)->void)={}");
     defer module.deinit();
@@ -6160,7 +6242,8 @@ test "nested records imported forward diamond identities survive graph release a
         defer comp.deinit();
         const root = try comp.addSource("/main.nov", "let left=@import(\"left.nov\")\nlet right=@import(\"right.nov\")\n" ++
             "let Root=struct{left:left.Box,right:right.Box,}\n" ++
-            "let main:()={let mut r=Root[.left=left.make(),.right=right.make()]\nlet saved=r\nr.left.inner.s=\"changed\"+\"!\"\n@println(r.left.inner.s,saved.left.inner.s,r.right.inner.s)}");
+            "let main:()={let mut r=Root[.left=left.make(),.right=right.make()]\nlet saved=r\nr.left.inner.s=\"changed\"+\"!\"\n@println(r.left.inner.s,saved.left.inner.s,r.right.inner.s)\n" ++
+            "let mut a=[left.make(),right.make()]\nlet old=a\nlet mut v=a[0]\nv.inner.s=\"array\"+\"!\"\na[-1]=v\n@println(old[-1].inner.s,a[-1].inner.s)}");
         const left = try comp.addSource("/left.nov", "let shared=@import(\"shared.nov\")\nlet Box=shared.Box\nlet make:()->Box=shared.make()");
         const right = try comp.addSource("/right.nov", "let shared=@import(\"shared.nov\")\nlet Box=shared.Box\nlet make:()->Box=shared.make()");
         const shared = try comp.addSource("/shared.nov", "let Box=struct{inner:Alias,}\nlet Alias=Leaf\nlet Leaf=struct{s:string,}\nlet make:()->Box=Box[.inner=Alias[.s=\"sha\"+\"red\"]]");
@@ -6194,7 +6277,7 @@ test "nested records imported forward diamond identities survive graph release a
     const c = try collectingTestProgram(library);
     defer test_gpa.free(c);
     for ([_][]const u8{ "-O0", "-O3" }) |mode|
-        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "changed! shared shared\n", "", mode);
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "changed! shared shared\nshared array!\n", "", mode);
 }
 
 test "nested records deepest supported declarations compile in dependency order" {
@@ -6227,15 +6310,112 @@ test "nested records propagation shares immutable strings and skips allocations 
     }
 }
 
+const managed_array_program =
+    \\let Kind=enum{first,second,}
+    \\let Alias=Outer
+    \\let Outer=struct{inner:Inner,other:string,k:Kind=.first,}
+    \\let Inner=struct{s:string,n:int=1,}
+    \\let O:(T:type)->type=union{some:T,none,}
+    \\let R:(T:type,E:type)->type=union{ok:T,err:E,}
+    \\let make:(s:string)->Alias=Alias[.inner=Inner[.s=s+"!"],.other="other"+"!"]
+    \\let strings:()->[]string=["hé\0"+"😀","later"+"!","", "static"]
+    \\let records:()->[]Outer=[make("a"),make("b")]
+    \\let copy:(a:[]Outer)->[]Outer=a
+    \\let identity:(a:[]string)->[]string=a
+    \\let append:()->[]Outer={let mut a=records()
+    \\a += [make("c")]
+    \\a += []
+    \\a}
+    \\let terminal:()->[]string=["root"+"!",{return []},"BAD"+"!"]
+    \\let main:()={
+    \\let mut a=identity(strings())
+    \\let b=a
+    \\a[0]="changed"+"!"
+    \\a += ["tail"+"!"]
+    \\@println(b[0],a[0],a[-1],a.len,"hé\0😀" in b,"hé"+"\0😀" in b,"hé" in b,"" in b,"missing" in b,"" in [])
+    \\a[0]={a=["discard"+"!"]
+    \\"snapshot"+"!"}
+    \\@println(a[0],a[-1],a.len,b[-1])
+    \\let mut r=copy(append())
+    \\let original=r
+    \\let mut value=r[0]
+    \\value.inner.s="value"+"!"
+    \\value.inner.n=9
+    \\value.k=.second
+    \\r[-1]=value
+    \\let mut first=r[0]
+    \\first.inner.s="first"+"!"
+    \\@println(original[0].inner.s,original[-1].inner.s,r[-1].inner.s,r[0].inner.s,first.inner.s,r[-1].inner.n,r[-1].k==Kind.second)
+    \\r[0]={r=[make("discard")]
+    \\make("stored")}
+    \\@println(r[0].inner.s,r[-1].inner.s,r.len,original[0].other)
+    \\let option:O(Outer)=.some[r[0]]
+    \\let result:R(Outer,Outer)=.ok[original[0]]
+    \\@println(match option{.some=>|v|v.inner.s
+    \\.none=>"BAD"},match result{.ok=>|v|v.inner.s
+    \\.err=>|v|v.other})
+    \\let empty:[]Outer=[]
+    \\let empty2:[]string=[]
+    \\let again:[]Outer=[]
+    \\@println(empty.len,empty2.len,again.len,terminal().len)
+    \\}
+;
+const managed_array_output = "hé\x00😀 changed! tail! 5 true true false true false false\nsnapshot! tail! 5 static\na! c! value! a! first! 9 true\nstored! value! 3 other!\nstored! a!\n0 0 0 0\n";
+
+test "managed arrays copy nested record values and share immutable bytes under forced GC" {
+    const c = try arrayTestProgram(managed_array_program);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, managed_array_output, "", mode);
+}
+
+test "managed array literal and indexed stores preserve ordered effects snapshots and terminal paths" {
+    const c = try arrayTestProgram(
+        \\let A=struct{s:string,}
+        \\let mark:(s:string)->string={@print(s)
+        \\s+"!"}
+        \\let record:(s:string)->A=A[.s=mark(s)]
+        \\let main:()={
+        \\let mut a=[mark("A"),mark("B")]
+        \\a[{a=["discard"+"!"]
+        \\@print("I")
+        \\0}]={@print("R")
+        \\mark("N")}
+        \\@println("",a[0],a[-1],a.len)
+        \\let mut r=[record("C"),record("D")]
+        \\r[{r=[record("X")]
+        \\@print("J")
+        \\0}]={@print("S")
+        \\record("E")}
+        \\@println("",r[0].s,r[-1].s,r.len)
+        \\let mut count:int=0
+        \\loop count<3{count+=1
+        \\let skipped=[mark("L"),{if count==1{continue}
+        \\if count==2{break}
+        \\mark("BAD")}]
+        \\@println(skipped[0])}
+        \\@println(count)
+        \\}
+    );
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "ABIRN N! B! 2\nCDXJSE E! D! 2\nLL2\n", "", mode);
+}
+
+test "managed array compiler metadata survives every allocation failure" {
+    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{managed_array_program});
+}
+
 test "nested records root enumeration prunes large scalar diamonds beside managed roots" {
     var source = std.Io.Writer.Allocating.init(test_gpa);
     defer source.deinit();
     try source.writer.writeAll("let R0=struct{n:int,}\n");
     for (1..31) |i| try source.writer.print("let R{d}=struct{{left:R{d},right:R{d},}}\n", .{ i, i - 1, i - 1 });
-    try source.writer.writeAll("let Mixed=struct{scalar:R30,text:string,}\nlet f:(r:R30,s:string)={let copy=r\n}\nlet g:(r:Mixed)={}");
+    try source.writer.writeAll("let Mixed=struct{scalar:R30,text:string,}\nlet f:(r:R30,s:string)={let copy=r\n}\nlet g:(r:Mixed)={}\nlet h:(a:[]Mixed)->[]Mixed=a");
     const c = try emitSource(source.written(), null);
     defer test_gpa.free(c);
     try std.testing.expect(std.mem.indexOf(u8, c, "void **nov_roots[] = { &p1.owner, };") != null);
     try std.testing.expect(std.mem.indexOf(u8, c, "void **nov_roots[] = { &p0.f1.owner, };") != null);
     try std.testing.expect(c.len < 32 * 1024);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, c, "offsetof(nov_record_"));
 }

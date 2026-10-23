@@ -42,6 +42,53 @@ static void *scalar_backing(nov_gc_heap *heap, size_t bytes) {
     return p;
 }
 
+typedef struct { void *data; uintptr_t len, cap; } nov_array;
+#define nov_rt_panic nov_gc_panic
+#include "array.h"
+
+typedef struct { unsigned char pad; node nested; void *owner; } array_element;
+static void managed_arrays(void) {
+    size_t map[] = { offsetof(array_element, nested.left), offsetof(array_element, nested.right), offsetof(array_element, owner) };
+    nov_gc_descriptor element = {sizeof(array_element), _Alignof(array_element), 3, map};
+    nov_array a = {0}, b = {0}, c = {0};
+    void **slots[] = {&a.data, &b.data, &c.data};
+    nov_gc_roots frame = {0};
+    size_t before, i;
+    nov_rt_heap.collect_every_allocation = 1;
+    nov_gc_push(&nov_rt_heap, &frame, slots, 3);
+    a = nov_array_new(2, 4, &element);
+    for (i = 0; i < 4; ++i) {
+        array_element *p = a.data;
+        assert(!p[i].nested.left && !p[i].nested.right && !p[i].owner);
+    }
+    ((array_element *)a.data)[0].nested.left = nov_gc_alloc(&nov_rt_heap, &descriptor);
+    ((array_element *)a.data)[1].owner = nov_gc_alloc(&nov_rt_heap, &descriptor);
+    /* Capacity slots are traced too; new slots started with actual NULLs. */
+    ((array_element *)a.data)[3].owner = nov_gc_alloc(&nov_rt_heap, &descriptor);
+    nov_gc_collect(&nov_rt_heap);
+    assert(nov_rt_heap.live_objects == 4);
+    before = attempts;
+    failures = 1;
+    b = nov_array_clone(a, &element);
+    assert(attempts == before + 2 && a.data != b.data);
+    c = nov_array_append(a, b, &element);
+    assert(c.len == 4 && c.cap == 4 && c.data != a.data && c.data != b.data);
+    /* Neither the per-element map nor descriptor is borrowed by any backing. */
+    map[0] = map[1] = map[2] = SIZE_MAX;
+    element = (nov_gc_descriptor){0};
+    a.data = b.data = NULL;
+    nov_gc_collect(&nov_rt_heap);
+    assert(nov_rt_heap.live_objects == 3);
+    assert(((array_element *)c.data)[0].nested.left == ((array_element *)c.data)[2].nested.left);
+    ((array_element *)c.data)[0].nested.value = 99;
+    assert(!((array_element *)c.data)[2].nested.value);
+    c.data = NULL;
+    nov_gc_collect(&nov_rt_heap);
+    assert(!nov_rt_heap.live_objects && !nov_rt_heap.live_bytes);
+    nov_gc_pop(&nov_rt_heap, &frame);
+    nov_gc_shutdown(&nov_rt_heap);
+}
+
 int main(int argc, char **argv) {
     nov_gc_heap heap;
     nov_gc_roots frame = {0}, global = {0}, inner = {0};
@@ -71,6 +118,10 @@ int main(int argc, char **argv) {
             const size_t bad[] = { sizeof(node) };
             const nov_gc_descriptor d = { sizeof(node), _Alignof(node), 1, bad };
             (void)nov_gc_alloc(&heap, &d);
+        } else if (!strcmp(argv[1], "stride")) {
+            const size_t offset = 0;
+            const nov_gc_descriptor d = { sizeof(void *) + 1, 1, 1, &offset };
+            (void)nov_gc_alloc_repeated(&heap, &d, 2);
         } else if (!strcmp(argv[1], "alignment")) {
             const nov_gc_descriptor d = { 64, _Alignof(max_align_t) * 2, 0, NULL };
             (void)nov_gc_alloc(&heap, &d);
@@ -170,11 +221,21 @@ int main(int argc, char **argv) {
         before = attempts;
         assert(!nov_gc_try_alloc(&heap, &huge));
         assert(attempts == before);
+        assert(!nov_gc_try_alloc_repeated(&heap, &descriptor, SIZE_MAX));
+        assert(!nov_gc_try_alloc_repeated(&heap, &descriptor, 0));
+        {
+            const size_t offset = 0;
+            const nov_gc_descriptor pointer = {sizeof(void *), _Alignof(void *), 1, &offset};
+            assert(!nov_gc_try_alloc_repeated(&heap, &pointer, SIZE_MAX / sizeof(void *) / 2));
+        }
+        assert(attempts == before);
     }
     nov_gc_unregister_globals(&heap, &global);
     nov_gc_pop(&heap, &frame);
     nov_gc_shutdown(&heap); /* Frees even still reachable objects, no GC needed. */
     nov_gc_shutdown(&heap);
     assert(!outstanding && !heap.live_bytes && !heap.live_objects);
+    managed_arrays();
+    assert(!outstanding);
     return 0;
 }

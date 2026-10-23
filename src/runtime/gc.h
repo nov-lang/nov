@@ -32,6 +32,7 @@ union nov_gc_object {
         nov_gc_object *next, *gray;
         const nov_gc_descriptor *descriptor;
         nov_gc_descriptor owned_descriptor;
+        size_t allocation_size;
         unsigned marked;
     } h;
 };
@@ -138,7 +139,7 @@ static inline void nov_gc_collect(nov_gc_heap *heap) {
             link = &p->h.next;
         } else {
             *link = p->h.next;
-            heap->live_bytes -= sizeof *p + p->h.descriptor->size;
+            heap->live_bytes -= p->h.allocation_size;
             --heap->live_objects;
             NOV_GC_FREE(p);
         }
@@ -166,12 +167,22 @@ static inline void nov_gc_validate(const nov_gc_descriptor *d) {
 }
 
 /* NULL means OOM/size overflow only; invalid contracts always panic. */
-static inline void *nov_gc_try_alloc(nov_gc_heap *heap, const nov_gc_descriptor *d) {
+static inline void *nov_gc_try_alloc_repeated(nov_gc_heap *heap, const nov_gc_descriptor *d, size_t count) {
     nov_gc_object *p;
-    size_t size, i;
+    size_t size, bytes, pointers, metadata, padding, i, j;
+    size_t *offsets;
     nov_gc_validate(d);
-    if (d->size > SIZE_MAX - sizeof *p) return NULL;
-    size = sizeof *p + d->size;
+    if (count > 1 && d->pointer_count && d->size % _Alignof(void *))
+        NOV_GC_PANIC("GC invalid pointer offset");
+    if (!count || count > SIZE_MAX / d->size ||
+        (d->pointer_count && count > SIZE_MAX / d->pointer_count)) return NULL;
+    bytes = count * d->size;
+    pointers = count * d->pointer_count;
+    padding = pointers ? (_Alignof(size_t) - bytes % _Alignof(size_t)) % _Alignof(size_t) : 0;
+    if (bytes > SIZE_MAX - sizeof *p || padding > SIZE_MAX - sizeof *p - bytes) return NULL;
+    metadata = sizeof *p + bytes + padding;
+    if (pointers > (SIZE_MAX - metadata) / sizeof(size_t)) return NULL;
+    size = metadata + pointers * sizeof(size_t);
     if (heap->collect_every_allocation || size > heap->next_collection ||
         heap->live_bytes > heap->next_collection - size)
         nov_gc_collect(heap);
@@ -182,21 +193,37 @@ static inline void *nov_gc_try_alloc(nov_gc_heap *heap, const nov_gc_descriptor 
         p = NOV_GC_MALLOC(size);
         if (!p) return NULL;
     }
-    memset(p + 1, 0, d->size);
-    /* C does not require a null pointer to have an all-zero representation. */
-    for (i = 0; i < d->pointer_count; ++i) {
-        void *null_pointer = NULL;
-        memcpy((unsigned char *)(p + 1) + d->pointer_offsets[i], &null_pointer, sizeof null_pointer);
+    memset(p + 1, 0, bytes);
+    offsets = pointers ? (size_t *)((unsigned char *)p + metadata) : NULL;
+    /* Own the expanded map in the same allocation: no borrowed stack metadata,
+     * extra allocation, or collection after publishing a partially built map. */
+    for (i = 0; i < count && pointers; ++i) {
+        for (j = 0; j < d->pointer_count; ++j) {
+            void *null_pointer = NULL;
+            size_t offset = i * d->size + d->pointer_offsets[j];
+            offsets[i * d->pointer_count + j] = offset;
+            /* C does not require all-zero bytes to represent a null pointer. */
+            memcpy((unsigned char *)(p + 1) + offset, &null_pointer, sizeof null_pointer);
+        }
     }
     p->h.next = heap->objects;
     p->h.gray = NULL;
-    p->h.owned_descriptor = *d;
+    p->h.owned_descriptor = (nov_gc_descriptor){bytes, d->alignment, pointers, offsets};
     p->h.descriptor = &p->h.owned_descriptor;
+    p->h.allocation_size = size;
     p->h.marked = 0;
     heap->objects = p;
     ++heap->live_objects;
     heap->live_bytes += size;
     return p + 1;
+}
+static inline void *nov_gc_try_alloc(nov_gc_heap *heap, const nov_gc_descriptor *d) {
+    return nov_gc_try_alloc_repeated(heap, d, 1);
+}
+static inline void *nov_gc_alloc_repeated(nov_gc_heap *heap, const nov_gc_descriptor *d, size_t count) {
+    void *p = nov_gc_try_alloc_repeated(heap, d, count);
+    if (!p) NOV_GC_PANIC("GC allocation failed");
+    return p;
 }
 static inline void *nov_gc_alloc(nov_gc_heap *heap, const nov_gc_descriptor *d) {
     void *p = nov_gc_try_alloc(heap, d);

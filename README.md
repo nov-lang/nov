@@ -16,7 +16,7 @@ Nov has automatic memory management via a minimal tracing GC.
 
 Requires Zig 0.16.0.
 
-Scalar growable arrays use an internal libc-only nonmoving mark/sweep GC. The
+Growable arrays use an internal libc-only nonmoving mark/sweep GC. The
 runtime is emitted only for managed values; scalar-only programs stay unchanged.
 See the [runtime API and root discipline](src/runtime/README.md) for layout, C
 boundary, OOM, testing, and unsupported-reference contracts. Slices, nested arrays,
@@ -687,8 +687,8 @@ The delivered subset is deliberately bounded:
   globals or interpolate strings. Aggregate defaults are not supported: nested
   struct values must be supplied explicitly. Recursive by-value layouts and layouts
   deeper than 128 aggregate levels diagnose, including aliases/imports and late
-  generic instantiations. Array/union/function/void/float fields and record arrays
-  remain unsupported.
+  generic instantiations. Array/union/function/void/float fields remain unsupported;
+  arrays of supported records are described below.
 - Construct explicitly with `MyType[ .x = 5, .z = true ]` (or `Alias[...]`).
   Empty `MyType[]` works only when every field has a default. Unknown, duplicate,
   missing required and mistyped fields diagnose. Supplied expressions evaluate
@@ -1164,12 +1164,13 @@ let prod = a.! * b.! ; will return .none to the calling function since b is .non
 
 ## Arrays
 
-### Executable scalar subset
+### Executable array subset
 
 Growable `[]T` arrays are supported in function bodies and signatures for `bool`,
-`i8/i16/i32/i64`, `u8/u16/u32/u64`, and native `int/uint`. Literals use an
-expected array type when available; otherwise, a known boolean or typed integer
-element determines the exact element type for the whole literal, even when it
+`i8/i16/i32/i64`, `u8/u16/u32/u64`, native `int/uint`, immutable `string`, and
+finite acyclic nominal structs (including nested structs). Literals use an
+expected array type when available; otherwise, a known supported element type
+determines the exact element type for the whole literal, even when it
 appears after untyped integer literals. For example, `[true, false]` infers
 `[]bool`, and `[0, typed_integer]` infers that integer's array type. Empty `[]`
 and all-untyped `[1, 2]` still need an expected `[]T`; numeric defaults remain
@@ -1225,13 +1226,26 @@ let main: () -> void = {
   promise amortized constant time or preserve spare capacity across value copies.
   Compiler roots conservatively retain temporary backing until its instruction is
   reused or the function returns, rather than doing last-use liveness analysis.
+- String/record arrays have independent element storage at ordinary copy boundaries.
+  Record fields copy recursively by value; immutable string backing shares. Indexing
+  returns a value, not an element reference. To edit a record element, copy it to a
+  mutable local, update its fields, then assign the whole record back to the index.
+  Direct `items[index].field` mutation remains unsupported.
+- String membership compares exact UTF-8 bytes/length, including embedded NUL, not
+  owner identity. Record membership remains unsupported until record equality is
+  defined. Indexed compounds remain integer-only; string indexed `+=` is not added.
+- Managed backing allocations own repeated element descriptors and expanded pointer
+  maps, tracing actual string-owner fields across the entire zero-initialized
+  capacity. Record layout dependencies precede array descriptors. Map storage costs
+  capacity times managed owner fields; GC never traces static byte pointers.
+  See [examples/managed-arrays.nov](examples/managed-arrays.nov).
 - `.len` writes are explicitly rejected: shrinking and especially initialization
   on length growth remain undesigned. No array printing, equality, concatenation
-  with `+`, slices, nested arrays, pointer/function elements, explicit aliases,
+  with `+`, slices, nested arrays, enum/union/pointer/function elements, explicit aliases,
   array globals, capacity API, or iteration is delivered. The formatter supports
-  the scalar array syntax described above without extending these semantics.
-  `@print`/`@println` still accept only bool/integer values; indexing and `.len`
-  can be printed.
+  the array syntax described above without extending these semantics.
+  Indexed elements use normal scalar/record printing rules; array values themselves
+  cannot be printed.
 
 The broader examples below describe future syntax as well as implemented syntax;
 printing arrays, defaulting bare integer elements and writable `.len` in them
@@ -1845,7 +1859,8 @@ operand skips the remaining comparison without undoing earlier effects.
 
 Ordering (`<`, `<=`, `>`, `>=`), other operators (including `-=`, `*=`, `/=` and
 `%=`), indexing, slicing and Unicode operations remain deferred.
-Arrays remain bool/integer-only: `[]string` and nested arrays are rejected.
+`[]string` and supported record arrays work with independent element storage and
+shared immutable string backing; nested arrays remain unsupported.
 
 `.len` is the byte length as native `uint`, not a character or grapheme count.
 `"é".len` is 2 and `"😀".len` is 4. Literals use the existing escapes (`\n`, `\r`,

@@ -49,12 +49,12 @@ pub const Operation = union(enum) {
     /// Decimal integers, true/false booleans, or a shared immutable string.
     to_string: ValueId,
     array_literal: []const ValueId,
-    /// Independent scalar element storage; every value boundary is explicit.
+    /// Independent element storage; records copy by value, string backing shares.
     array_clone: ValueId,
     /// Byte length for strings; element count for arrays.
     array_len: ValueId,
     array_index: struct { array: ValueId, index: ValueId },
-    /// Allocation-free scalar equality scan; operands retain their read/copy rules.
+    /// Allocation-free scalar/string equality scan; record equality is unsupported.
     array_contains: struct { value: ValueId, array: ValueId },
     array_set: struct { array: ValueId, index: ValueId, value: ValueId },
     array_append: struct { lhs: ValueId, rhs: ValueId },
@@ -698,6 +698,7 @@ fn validateBody(self: *const Ir, function: Function, body: Body) VerifyError!voi
                 const array = self.getType(try operandType(body, r.array, i)).?;
                 if (array != .array) return error.InvalidOperation;
                 if (value != array.array) return error.OperandTypeMismatch;
+                if (self.getType(value).? == .record) return error.InvalidOperation;
             },
             .array_set => |r| {
                 if (ty != .array) return error.InvalidOperation;
@@ -990,7 +991,7 @@ pub fn isRecordField(ty: Type) bool {
 }
 
 pub fn isArrayElement(ty: Type) bool {
-    return ty == .boolean or (ty == .integer and switch (ty.integer.bits) {
+    return ty == .string or (ty == .record and !ty.record.tagged) or ty == .boolean or (ty == .integer and switch (ty.integer.bits) {
         8, 16, 32, 64 => true,
         else => false,
     });
@@ -1168,7 +1169,7 @@ test "string constants are canonical owned UTF8 and operations verify exact type
     try std.testing.expectEqualStrings("a\x00b", ir.getConstant(literal).?.value.string);
     try std.testing.expectEqual(literal, try ir.internConstant(.{ .ty = string, .value = .{ .string = "a\x00b" } }));
     try std.testing.expectError(error.ConstantTypeMismatch, ir.internConstant(.{ .ty = string, .value = .{ .string = "\xff" } }));
-    try std.testing.expectError(error.InvalidArrayElement, ir.internType(.{ .array = string }));
+    _ = try ir.internType(.{ .array = string });
     const f = try ir.addFunction("f", signature, .{ .start = 0, .end = 0 });
     var instructions = [_]Instruction{
         .{ .ty = string, .span = .{ .start = 0, .end = 0 }, .op = .{ .constant = literal } },
@@ -3278,6 +3279,38 @@ test "nested records bounded graph validation rejects forged cycles and deep lay
     try std.testing.expectError(error.InvalidTypeId, ir.verify());
     fields[0].ty = saved;
     try ir.verify();
+}
+
+test "managed array IR owns layouts and rejects forged record equality and payloads" {
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    const span: Span = .{ .start = 0, .end = 0 };
+    const string = try ir.internType(.string);
+    const boolean = try ir.internType(.boolean);
+    const record = try ir.internType(.{ .record = .{ .identity = 0, .fields = &.{} } });
+    try ir.setRecordFields(record, &.{.{ .name = "s", .ty = string, .span = span }});
+    const tagged = try ir.internType(.{ .record = .{ .identity = 1, .fields = &.{}, .tagged = true } });
+    const array = try ir.internType(.{ .array = record });
+    const strings = try ir.internType(.{ .array = string });
+    try std.testing.expectError(error.InvalidArrayElement, ir.internType(.{ .array = array }));
+    try std.testing.expectError(error.InvalidArrayElement, ir.internType(.{ .array = tagged }));
+    const signature = try ir.internType(.{ .function = .{ .params = &.{ record, array }, .result = boolean } });
+    const function = try ir.addFunction("contains", signature, span);
+    var instructions = [_]Instruction{
+        .{ .ty = record, .span = span, .op = .{ .parameter = 0 } },
+        .{ .ty = array, .span = span, .op = .{ .parameter = 1 } },
+        .{ .ty = boolean, .span = span, .op = .{ .array_contains = .{ .value = @enumFromInt(0), .array = @enumFromInt(1) } } },
+    };
+    try std.testing.expectError(error.InvalidOperation, ir.setFunctionBody(function, &instructions, @enumFromInt(2)));
+    instructions[2] = .{ .ty = array, .span = span, .op = .{ .array_literal = &.{@enumFromInt(1)} } };
+    try std.testing.expectError(error.OperandTypeMismatch, ir.setFunctionBody(function, &instructions, @enumFromInt(2)));
+    // Whole-pool verification still checks an array element's nominal graph.
+    ir.types.items[@intFromEnum(array)] = .{ .array = tagged };
+    try std.testing.expectError(error.InvalidArrayElement, ir.verify());
+    ir.types.items[@intFromEnum(array)] = .{ .array = record };
+    const fields = @constCast(ir.types.items[@intFromEnum(record)].record.fields);
+    fields[0].ty = strings;
+    try std.testing.expectError(error.InvalidArrayElement, ir.verify());
 }
 
 test "nested records diamond graph traversal completes without expanding value paths" {

@@ -168,7 +168,7 @@ fn checkSupported(ast: Ast) !void {
             .array_type => {
                 if (ast.nodes.items(.tag)[data.rhs] != .identifier) return error.UnsupportedSyntax;
                 const name = ast.tokenSlice(ast.nodes.items(.main_token)[data.rhs]);
-                const scalar_types = [_][]const u8{ "bool", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "int", "uint" };
+                const scalar_types = [_][]const u8{ "bool", "string", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "int", "uint" };
                 for (scalar_types) |scalar| {
                     if (std.mem.eql(u8, name, scalar)) break;
                 } else if (primitives.isPrimitive(name)) return error.UnsupportedSyntax;
@@ -378,7 +378,7 @@ test "unsupported syntax fails closed including nested expressions" {
         "let x=a[0..2].b\n",
         "let x=[[1], [2]]\n",
         "let x:[][]int\n",
-        "let x:[]string\n",
+        "let x:[]i128\n",
         "let x:[]*int\n",
         "let x:[]() -> int\n",
         "let x=a[0][1]\n",

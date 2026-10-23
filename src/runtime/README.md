@@ -2,7 +2,7 @@
 
 `gc.h` is a standalone libc-only C11, nonmoving, single-threaded mark/sweep
 collector for **fixed-layout internal objects**. `GcRuntime.zig.source` embeds
-it conditionally for scalar-array and immutable-string code generation alongside
+it conditionally for scalar/managed-array and immutable-string code generation alongside
 `array.h` and on-demand `string.h` concatenation helpers.
 Scalar-only emission is unchanged. Managed emission defines `NOV_GC_PANIC` as
 `nov_rt_panic` to share the emitted panic helper. The standalone
@@ -15,10 +15,12 @@ concurrency, or conservative stack scanning is involved.
 Initialize one `nov_gc_heap` with `nov_gc_init`; do not copy it or reinitialize a
 live heap. Allocate using `nov_gc_alloc` (panic on failure) or
 `nov_gc_try_alloc` (NULL on size overflow or exhausted allocation retry).
-The descriptor value is copied into the allocation header, so a stack-local
-descriptor is safe. Pointer-offset tables remain borrowed, immutable, and must
-outlive their objects. This permits exact, variable-size scalar backing blocks
-without allocating or retaining separate descriptor objects.
+The descriptor and pointer-offset map are copied into the allocation itself, so
+caller metadata need not outlive the allocation. `nov_gc_alloc_repeated` and its
+try variant expand an element layout across a checked element count; arrays use
+this to trace string owner fields inside string or nested-record elements. Expanded
+offset storage scales with capacity times managed fields and is included in heap
+accounting. Metadata and payload share one allocation and are freed together.
 Use `sizeof(T)`, `_Alignof(T)` and sorted `offsetof(T, field)` entries. Every strong
 managed field must be an actual C `void *` object and appear exactly once. Nested
 inline records can be flattened into offsets. Do not describe arbitrary typed
@@ -30,7 +32,9 @@ that no pointer fields were omitted.
 Allocation includes an aligned private header; the returned pointer is the stable
 payload base. Sizes, accounting additions and alignment are checked. Only positive
 fixed payload sizes and fundamental alignment up to `_Alignof(max_align_t)` are
-supported, not over-aligned objects or variable-length pointer maps. The payload
+supported, not over-aligned objects. Repeated pointer-bearing layouts require
+correctly aligned element strides; size/map/padding arithmetic is overflow-checked.
+The payload
 is zero-filled and every described pointer field is explicitly initialized to
 NULL, so collection during partial initialization is safe. This promises byte
 zeroes for scalar storage, not default constructors or language-level zero values.

@@ -103,6 +103,7 @@ fn addGcTests(b: *std.Build, test_step: *std.Build.Step) void {
         .{ .arg = "foreign", .message = "GC invalid managed pointer" },
         .{ .arg = "descriptor", .message = "GC invalid pointer offset" },
         .{ .arg = "alignment", .message = "GC invalid descriptor" },
+        .{ .arg = "stride", .message = "GC invalid pointer offset" },
         .{ .arg = "shutdown", .message = "GC shutdown with registered roots" },
         .{ .arg = "unregister", .message = "GC globals not registered" },
     };
