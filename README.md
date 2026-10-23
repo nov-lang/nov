@@ -970,6 +970,30 @@ Option-style `some`/`none` propagation is not yet implemented. Ordinary generic
 union methods in the definitions below, including `unwrapOr`/`unwrapOrElse` and
 `@This()`, are supported.
 
+#### Executable Option
+
+[`lib/option.nov`](lib/option.nov) defines the ordinary generic `Option(T)` union,
+publicly available as `std.Option`. It has `some: T` and payloadless `none` variants.
+Use `.some[value]` / `.none[]` under an expected Option type, or qualified
+constructors such as `Option(uint).some[21]`. Matches must cover both variants
+or include a catchall; `some` can capture its exact payload type.
+
+`unwrapOr(fallback)` returns the payload or an eagerly evaluated fallback argument.
+`unwrapOrElse(callback)` returns the payload or calls a zero-argument `() -> T`
+callback only for `none`. These are ordinary generic methods, not compiler
+special cases. Aliases, value-copy semantics, supported scalar/flat-record payloads,
+and void construction/matching follow the existing generic union rules.
+Option `.!` propagation remains unsupported.
+
+[examples/options.nov](examples/options.nov) uses Option for safe division and
+shows that its lazy fallback runs only for a missing quotient:
+
+```text
+Quotient: 21
+Using fallback
+Missing: 0
+```
+
 #### Standard-library foundation
 
 [`lib/result.nov`](lib/result.nov) provides the ordinary generic `Result` definition
@@ -977,12 +1001,13 @@ with public `unwrapOr` and `unwrapOrElse` methods. `unwrapOr` evaluates its fall
 as an ordinary argument even on success. `unwrapOrElse` evaluates the callback
 value normally but calls its body only on error. Neither requires a Result builtin.
 
-[`lib/std.nov`](lib/std.nov) publicly re-exports Result from `result.nov`. Both Result
-examples now use real imports rather than copied definitions:
+[`lib/std.nov`](lib/std.nov) publicly re-exports Result from `result.nov` and Option
+from `option.nov`. Examples use real imports rather than copied definitions:
 
 ```nov
 let std = @import("std")
 let Result = std.Result
+let Option = std.Option
 ```
 
 The build installs `lib/` at `<prefix>/lib/nov`. The compiler finds `std.nov` relative

@@ -1085,6 +1085,131 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     }
 }
 
+fn addOptionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step, fixtures: *std.Build.Step.WriteFile, library: std.Build.LazyPath) void {
+    const imports = "let standard = @import(\"std\")\nlet direct = @import(\"library/option.nov\")\nlet alternate = @import(\"library/./option.nov\")\nlet O = standard.Option(int)\n";
+    _ = fixtures.add("options.nov", imports ++
+        \\let Record = struct {
+        \\    value: string,
+        \\}
+        \\let viaFile: (value: O) -> direct.Option(int) = value
+        \\let viaAlias: (value: alternate.Option(int)) -> O = value
+        \\let make: (present: bool) -> O = {
+        \\    @print(
+        \\        if present {
+        \\            "S"
+        \\        } else {
+        \\            "N"
+        \\        }
+        \\    )
+        \\    if present {
+        \\        .some[1]
+        \\    } else {
+        \\        .none[]
+        \\    }
+        \\}
+        \\let eager: () -> int = {
+        \\    @print("E")
+        \\    9
+        \\}
+        \\let lazy: () -> int = {
+        \\    @print("L")
+        \\    7
+        \\}
+        \\let flag: () -> bool = true
+        \\let text: () -> string = "lazy"
+        \\let record: () -> Record = Record[ .value = "lazy record" ]
+        \\let unitCallback: () -> void = @print("unit:")
+        \\let unit: (value: standard.Option(void)) -> bool = match value {
+        \\    .some => true
+        \\    .none => false
+        \\}
+        \\let main: () = {
+        \\    @println(make(true).unwrapOr(eager()))
+        \\    @println(O.unwrapOr(make(false), eager()))
+        \\    @println(O.unwrapOrElse(make(true), lazy))
+        \\    @println(make(false).unwrapOrElse(lazy))
+        \\    @println(viaAlias(viaFile(O.some[3])).unwrapOr(0), viaFile(alternate.Option(int).none[]).unwrapOr(4))
+        \\    let yes: standard.Option(bool) = .some[true]
+        \\    let no: direct.Option(bool) = .none[]
+        \\    @println(yes.unwrapOr(false), standard.Option(bool).unwrapOr(no, false), no.unwrapOrElse(flag), standard.Option(bool).unwrapOrElse(yes, flag))
+        \\    let word: standard.Option(string) = .some["s" + "ome"]
+        \\    let empty: direct.Option(string) = .none[]
+        \\    @println(word.unwrapOr("bad"), standard.Option(string).unwrapOr(empty, "eager"), empty.unwrapOrElse(text), standard.Option(string).unwrapOrElse(word, text))
+        \\    let item: standard.Option(Record) = .some[Record[ .value = "some record" ]]
+        \\    let absent: direct.Option(Record) = .none[]
+        \\    @println(item.unwrapOr(Record[ .value = "bad" ]).value, standard.Option(Record).unwrapOr(absent, Record[ .value = "eager record" ]).value)
+        \\    @println(absent.unwrapOrElse(record).value, standard.Option(Record).unwrapOrElse(item, record).value)
+        \\    @println(unit(standard.Option(void).some[]), unit(direct.Option(void).none[]))
+        \\    @print("some:")
+        \\    standard.Option(void).some[].unwrapOrElse(unitCallback)
+        \\    @print("none:")
+        \\    direct.Option(void).none[].unwrapOrElse(unitCallback)
+        \\    @println("done")
+        \\}
+        \\
+    );
+    const output = "SE1\nNE9\nS1\nNL7\n3 4\ntrue false true true\nsome eager lazy some\nsome record eager record\nlazy record some record\ntrue false\nsome:none:unit:done\n";
+    _ = fixtures.add("options-example.nov", @embedFile("examples/options.nov"));
+    const Reject = struct { name: []const u8, source: []const u8, diagnostic: []const u8 = "expression does not match the expected type" };
+    const rejects = [_]Reject{
+        .{ .name = "payload", .source = "let f: () -> O = .some[@as(uint, 1)]\n" },
+        .{ .name = "fallback", .source = "let f: (o: O) -> int = o.unwrapOr(@as(uint, 1))\n" },
+        .{ .name = "void-fallback", .source = "let f: () -> void = standard.Option(void).unwrapOr(standard.Option(void).none[], @print(\"fallback\"))\n", .diagnostic = "void is not a parameter type" },
+        .{ .name = "callback-argument", .source = "let cb: (value: int) -> int = value\nlet f: (o: O) -> int = o.unwrapOrElse(cb)\n" },
+        .{ .name = "callback-return", .source = "let cb: () -> uint = 1\nlet f: (o: O) -> int = O.unwrapOrElse(o, cb)\n" },
+        .{ .name = "distinct-payload", .source = "let f: (o: direct.Option(uint)) -> O = o\n" },
+        .{ .name = "distinct-record", .source = "let A = struct { value: int, }\nlet B = struct { value: int, }\nlet f: (o: direct.Option(A)) -> standard.Option(B) = o\n" },
+        .{ .name = "distinct-result", .source = "let f: (o: O) -> standard.Result(int, void) = o\n" },
+        .{ .name = "missing-none", .source = "let f: (o: O) -> int = match o { .some => |value| value }\n", .diagnostic = "enum or union match must cover every variant or end with a wildcard (_)" },
+        .{ .name = "propagation", .source = "let f: (o: O) -> O = .some[o.!]\n", .diagnostic = ".! requires a union with exactly ok and err variants" },
+    };
+    for (rejects) |case| {
+        const name = b.fmt("option-{s}.nov", .{case.name});
+        _ = fixtures.add(name, b.fmt("{s}{s}", .{ imports, case.source }));
+        const check = b.addRunArtifact(exe);
+        check.step.name = b.fmt("CLI Option: reject {s}", .{case.name});
+        check.setCwd(fixtures.getDirectory());
+        check.addArgs(&.{ "check", "--semantic", name, "--lib-dir" });
+        check.addDirectoryArg(library);
+        check.expectExitCode(1);
+        check.expectStdOutEqual("");
+        check.expectStdErrMatch(case.diagnostic);
+        test_step.dependOn(&check.step);
+    }
+    const Program = struct { source: []const u8, output: []const u8 };
+    for ([_]Program{
+        .{ .source = "options.nov", .output = output },
+        .{ .source = "options-example.nov", .output = "Quotient: 21\nUsing fallback\nMissing: 0\n" },
+    }) |program| {
+        for ([_][]const u8{ "semantic", "fmt", "default", "--debug", "--release" }) |mode| {
+            const run = b.addRunArtifact(exe);
+            run.step.name = b.fmt("CLI Option: {s} {s}", .{ program.source, mode });
+            run.setCwd(fixtures.getDirectory());
+            const semantic = std.mem.eql(u8, mode, "semantic");
+            const fmt = std.mem.eql(u8, mode, "fmt");
+            if (semantic) {
+                run.addArgs(&.{ "check", "--semantic", program.source });
+            } else if (fmt) {
+                run.addArgs(&.{ "fmt", "--check", program.source });
+            } else {
+                run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+                run.setEnvironmentVariable("NOV_CC", "");
+                run.setEnvironmentVariable("CC", "");
+                run.addArgs(&.{ "run", program.source });
+                if (!std.mem.eql(u8, mode, "default")) run.addArg(mode);
+            }
+            if (!fmt) {
+                run.addArg("--lib-dir");
+                run.addDirectoryArg(library);
+            }
+            run.expectExitCode(0);
+            run.expectStdOutEqual(if (semantic or fmt) "" else program.output);
+            run.expectStdErrEqual("");
+            test_step.dependOn(&run.step);
+        }
+    }
+}
+
 fn addImportCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
     const library = fixtures.addCopyDirectory(b.path("lib"), "library", .{});
@@ -1116,6 +1241,7 @@ fn addImportCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *st
     _ = fixtures.add("errors/wide.nov", "let wide: () -> i128 = 1\n");
     _ = fixtures.add("hidden.nov", "let standard = @import(\"std\")\nlet value: bool = standard.hidden\n");
     const visibility = fixtures.add("visibility/std.nov", "let hidden = true\n");
+    addOptionCliTests(b, exe, test_step, fixtures, library);
     const Case = struct { name: []const u8, args: []const []const u8, code: u8, diagnostic: ?[]const u8 = null };
     const cases = [_]Case{
         .{ .name = "relative diamond", .args = &.{ "check", "--semantic", "relative.nov" }, .code = 0 },

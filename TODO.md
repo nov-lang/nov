@@ -1,5 +1,12 @@
 # TODO
 
+lib/option.nov provides ordinary public Option(T), re-exported as std.Option, with
+some payload/none variants, unwrapOr (eager fallback) and unwrapOrElse (zero-argument
+callback invoked only for none). Real-import tests cover identity, exact types,
+scalars/records/void, exhaustive matching, fallback effects and debug/release runs.
+examples/options.nov demonstrates safe division. Option .! propagation is still
+unsupported; no compiler builtin or new propagation policy was introduced.
+
 Ordinary generic union methods now specialize on demand by canonical concrete
 container type, preserving aliases and independent type arguments. @This and
 let Self=@This aliases work in signatures/bodies, as do static/instance calls,

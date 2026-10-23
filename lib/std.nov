@@ -1,4 +1,8 @@
 let result = @import("result.nov")
+let option = @import("option.nov")
 
 @[public]
 let Result = result.Result
+
+@[public]
+let Option = option.Option

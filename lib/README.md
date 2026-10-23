@@ -1,15 +1,20 @@
 # Nov standard library foundation
 
-Import the standard namespace and alias its ordinary `Result` template:
+Import the standard namespace and alias its ordinary union templates:
 
 ```nov
 let std = @import("std")
 let Result = std.Result
+let Option = std.Option
 ```
 
-`std.nov` is the entry module. It publicly re-exports `Result` from `result.nov`;
-there is no compiler builtin or automatic bare-name injection for Result.
-Its variants are `ok: T` and `err: E`.
+`std.nov` is the entry module. It publicly re-exports `Result` from `result.nov`
+and `Option` from `option.nov`; neither is a compiler builtin or automatically
+injected bare name.
+
+## Result
+
+`Result(T, E)` has variants `ok: T` and `err: E`.
 
 - `value.unwrapOr(fallback)` returns the success payload or the supplied fallback.
   The fallback expression is an ordinary argument and always evaluates.
@@ -23,6 +28,23 @@ Methods specialize on demand. Void success/error payloads remain valid; a method
 whose concrete signature would contain a void parameter cannot be used, following
 Nov's existing parameter rules. For example, `Result(void, string)` can be
 constructed and propagated without requesting `unwrapOr`.
+
+## Option
+
+`Option(T)` has variants `some: T` and payloadless `none`. Construct it explicitly
+with `Option(uint).some[21]`, or use `.some[21]` / `.none[]` under an expected
+Option type. Exhaustive matches can capture the `some` payload or handle `none`.
+
+- `value.unwrapOr(fallback)` returns the payload or the supplied fallback. As an
+  ordinary argument, the fallback expression always evaluates.
+- `value.unwrapOrElse(callback)` returns the payload or invokes a zero-argument
+  `() -> T` callback for `none` only. Evaluating the callback value is not deferred.
+- `Option(void)` can be constructed and matched. `unwrapOr` cannot be requested
+  for it because void parameters are disallowed; `unwrapOrElse: (() -> void)` works.
+- Option-style `.!` propagation is **not implemented**; use matching or these methods.
+
+See `examples/options.nov`: division by zero yields `none` rather than panicking,
+and the fallback runs only for the absent quotient.
 
 ## Loading and installation
 

@@ -1,0 +1,22 @@
+let std = @import("std")
+let Option = std.Option
+
+let divide: (numerator: uint, denominator: uint) -> Option(uint) = {
+    if denominator == 0 {
+        .none[]
+    } else {
+        .some[numerator / denominator]
+    }
+}
+
+let fallback: () -> uint = {
+    @println("Using fallback")
+    0
+}
+
+let main: () = {
+    let quotient = divide(42, 2)
+    let missing = divide(42, 0)
+    @println("Quotient:", quotient.unwrapOrElse(fallback))
+    @println("Missing:", missing.unwrapOrElse(fallback))
+}
