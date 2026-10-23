@@ -1703,6 +1703,9 @@ const Context = struct {
         if ((tag_early == .array_access or tag_early == .container_decl_arg) and
             (ast_early.nodes.items(.tag)[base_early] == .enum_literal or try self.qualifiedUnion(base_early) != null))
             return self.unionInit(node, expected, depth);
+        // Explicit record constructors already carry their type. Resolve it once,
+        // rather than probing and then retrying a failed concrete specialization.
+        if (tag_early == .container_decl_arg) return self.recordInit(node, expected, depth);
         const hint = expected orelse try self.probe(node, depth);
         if (hint) |known| {
             switch (try Literal.check(self.module, self.ir, node, known.ty, known.annotation)) {
@@ -1719,7 +1722,6 @@ const Context = struct {
         switch (ast.nodes.items(.tag)[node]) {
             .enum_literal => return self.fail(.enum_needs_type, node, null),
             .unwrap => return self.propagate(node, expected, depth),
-            .container_decl_arg => return self.recordInit(node, expected, depth),
             .match => return self.matchExpression(node, expected, hint, depth),
             .function_pipe => {
                 const unit = try self.ir.internType(.void);

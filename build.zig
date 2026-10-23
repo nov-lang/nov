@@ -121,6 +121,7 @@ fn addGcTests(b: *std.Build, test_step: *std.Build.Step) void {
 fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
     addFieldMutationCliTests(b, exe, test_step, fixtures);
+    addGenericStructCliTests(b, exe, test_step, fixtures);
     _ = fixtures.add("library-result-source.nov", @embedFile("lib/result.nov"));
     const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
     _ = fixtures.add("library-result.nov",
@@ -314,8 +315,8 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         .{ .name = "library Result semantic", .args = &.{ "check", "library-result.nov", "--semantic" }, .exit_code = 0, .lib_dir = true },
         .{ .name = "library Result format", .args = &.{ "fmt", "--check", "library-result-source.nov" }, .exit_code = 0 },
         .{ .name = "generic methods semantic", .args = &.{ "check", "generic-methods.nov", "--semantic" }, .exit_code = 0 },
-        .{ .name = "generic cycle", .args = &.{ "check", "generic-cycle.nov", "--semantic" }, .exit_code = 1, .stderr_match = "cyclic generic union instantiation" },
-        .{ .name = "generic method diagnostic", .args = &.{ "check", "generic-method.nov", "--semantic" }, .exit_code = 1, .stderr_match = "generic union members require an ordinary function signature" },
+        .{ .name = "generic cycle", .args = &.{ "check", "generic-cycle.nov", "--semantic" }, .exit_code = 1, .stderr_match = "cyclic generic container instantiation" },
+        .{ .name = "generic method diagnostic", .args = &.{ "check", "generic-method.nov", "--semantic" }, .exit_code = 1, .stderr_match = "generic container members require an ordinary function signature" },
         .{ .name = "propagation exact error", .args = &.{ "check", "propagation-error.nov", "--semantic" }, .exit_code = 1, .stderr_match = ".! error payload must exactly match" },
         .{ .name = "generic 128 bit semantic", .args = &.{ "check", "wide-generic.nov", "--semantic" }, .exit_code = 0 },
         .{ .name = "generic backend width", .args = &.{ "emit-c", "wide-generic.nov" }, .exit_code = 1, .stderr_match = "C backend only supports 8, 16, 32 and 64-bit integers" },
@@ -1087,6 +1088,87 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
                 }
             }
         }
+    }
+}
+
+fn addGenericStructCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step, fixtures: *std.Build.Step.WriteFile) void {
+    _ = fixtures.add("generic-struct-library.nov",
+        \\@[public]
+        \\let Box: (T: type) -> type = struct {
+        \\    value: T,
+        \\
+        \\    let Self = @This()
+        \\
+        \\    let make: (value: T) -> Self = Self[ .value = value ]
+        \\
+        \\    let get: (self: Self) -> T = self.value
+        \\
+        \\    let toString: (self: Self) -> string = "<{self.value}>"
+        \\}
+        \\
+    );
+    _ = fixtures.add("generic-struct-api.nov", "let library = @import(\"generic-struct-library.nov\")\n@[public]\nlet Box = library.Box\n");
+    _ = fixtures.add("generic-struct-main.nov",
+        \\let api = @import("generic-struct-api.nov")
+        \\let library = @import("generic-struct-library.nov")
+        \\let Box = api.Box
+        \\let B = Box(string)
+        \\
+        \\let main: () = {
+        \\    let mut x: B = library.Box(string)[ .value = "a" + "b" ]
+        \\    let copy = x
+        \\    x.value += "!"
+        \\    let nested = Box(B)[ .value = x ]
+        \\    let values: []Box(string) = [copy, B.make("new" + "!")]
+        \\    @println(nested, values[0].get(), values[1])
+        \\}
+        \\
+    );
+    for ([_][]const u8{ "generic-struct-main.nov", "generic-struct-library.nov", "generic-struct-api.nov" }) |source| {
+        const fmt = b.addRunArtifact(exe);
+        fmt.step.name = b.fmt("CLI generic structs fmt: {s}", .{source});
+        fmt.setCwd(fixtures.getDirectory());
+        fmt.addArgs(&.{ "fmt", "--check", source });
+        fmt.expectExitCode(0);
+        fmt.expectStdOutEqual("");
+        fmt.expectStdErrEqual("");
+        test_step.dependOn(&fmt.step);
+    }
+    for ([_][]const u8{ "semantic", "default", "--debug", "--release" }) |mode| {
+        const run = b.addRunArtifact(exe);
+        run.step.name = b.fmt("CLI generic structs: {s}", .{mode});
+        run.setCwd(fixtures.getDirectory());
+        const semantic = std.mem.eql(u8, mode, "semantic");
+        if (semantic) {
+            run.addArgs(&.{ "check", "--semantic", "generic-struct-main.nov" });
+        } else {
+            run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+            run.setEnvironmentVariable("NOV_CC", "");
+            run.setEnvironmentVariable("CC", "");
+            run.addArgs(&.{ "run", "generic-struct-main.nov" });
+            if (!std.mem.eql(u8, mode, "default")) run.addArg(mode);
+        }
+        run.expectExitCode(0);
+        run.expectStdOutEqual(if (semantic) "" else "<<ab!>> ab <new!>\n");
+        run.expectStdErrEqual("");
+        test_step.dependOn(&run.step);
+    }
+    const Case = struct { name: []const u8, source: []const u8, diagnostic: []const u8 };
+    for ([_]Case{
+        .{ .name = "array-field", .source = "let G:(T:type)->type=struct{value:[]T,}\nlet main:()={let x=G(int)[]\n}", .diagnostic = "this type is not supported in semantic analysis yet" },
+        .{ .name = "default", .source = "let G:(T:type)->type=struct{value:T=1,}\nlet main:()={let x=G(bool)[]\n}", .diagnostic = "literal does not match" },
+        .{ .name = "cycle", .source = "let G:(T:type)->type=struct{value:G(T),}\nlet main:()={let x=G(int)[]\n}", .diagnostic = "cyclic generic container instantiation" },
+    }) |case| {
+        const name = b.fmt("generic-struct-{s}.nov", .{case.name});
+        _ = fixtures.add(name, case.source);
+        const check = b.addRunArtifact(exe);
+        check.step.name = b.fmt("CLI generic structs reject: {s}", .{case.name});
+        check.setCwd(fixtures.getDirectory());
+        check.addArgs(&.{ "check", "--semantic", name });
+        check.expectExitCode(1);
+        check.expectStdOutEqual("");
+        check.addCheck(.{ .expect_stderr_match = case.diagnostic });
+        test_step.dependOn(&check.step);
     }
 }
 

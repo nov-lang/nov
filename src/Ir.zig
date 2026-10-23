@@ -891,7 +891,6 @@ fn validateType(self: *const Ir, ty: Type, before: usize) ValidationError!void {
         },
         .record => |record| {
             for (record.type_args) |arg| if (@intFromEnum(arg) >= before) return error.InvalidTypeId;
-            if (record.type_args.len != 0 and !record.tagged) return error.InvalidTypeId;
             for (record.fields, 0..) |field, i| {
                 if (@intFromEnum(field.ty) >= self.types.items.len) return error.InvalidTypeId;
                 const ft = self.getType(field.ty).?;
@@ -1080,6 +1079,41 @@ test "generic nominal keys own canonical arguments and do not collapse identical
     owned[0] = first;
     try std.testing.expectError(error.InvalidTypeId, ir.verify());
     owned[0] = boolean;
+}
+
+test "generic structs IR owns nominal arguments and rejects recursive keys and array fields" {
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    const integer = try ir.internType(.{ .integer = .{ .signedness = .signed, .bits = 32 } });
+    const boolean = try ir.internType(.boolean);
+    const array = try ir.internType(.{ .array = integer });
+    var args = [_]TypeId{integer};
+    const a = try ir.internType(.{ .record = .{ .identity = 7, .type_args = &args, .fields = &.{} } });
+    args[0] = boolean;
+    const b = try ir.internType(.{ .record = .{ .identity = 7, .type_args = &args, .fields = &.{} } });
+    const other = try ir.internType(.{ .record = .{ .identity = 8, .type_args = &.{integer}, .fields = &.{} } });
+    try std.testing.expect(a != b and a != other);
+    try std.testing.expectEqual(integer, ir.getType(a).?.record.type_args[0]);
+    try std.testing.expectEqual(a, try ir.internType(.{ .record = .{ .identity = 7, .type_args = &.{integer}, .fields = &.{} } }));
+    const field: Field = .{ .name = "value", .ty = integer, .span = .{ .start = 0, .end = 0 } };
+    try ir.setRecordFields(a, &.{field});
+    try ir.verify();
+    const owned_args = @constCast(ir.types.items[@intFromEnum(a)].record.type_args);
+    for ([_]TypeId{ a, b, other, @enumFromInt(std.math.maxInt(u32)) }) |bad| {
+        owned_args[0] = bad;
+        try std.testing.expectError(error.InvalidTypeId, ir.verify());
+    }
+    owned_args[0] = integer;
+    const fields = @constCast(ir.types.items[@intFromEnum(a)].record.fields);
+    const saved = fields[0];
+    fields[0].ty = array;
+    try std.testing.expectError(error.InvalidArrayElement, ir.verify());
+    fields[0] = saved;
+    const wrong_default = try ir.internConstant(.{ .ty = boolean, .value = .{ .boolean = true } });
+    fields[0].default = wrong_default;
+    try std.testing.expectError(error.ConstantTypeMismatch, ir.verify());
+    fields[0] = saved;
+    try ir.verify();
 }
 
 test "record payload layouts reject tagged fields and forged nominal operands" {

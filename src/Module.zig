@@ -381,7 +381,7 @@ fn collectDeclaration(self: *Module, node: Ast.Node.Index, container: ?DeclId) (
         const id: DeclId = @enumFromInt(self.declarations.items.len);
         if (container == null) try self.names.put(self.allocator, name, id);
         const is_record = declaration.ast.init_node != 0 and self.source.ast.fullStruct(declaration.ast.init_node) != null;
-        const is_generic = is_record and self.source.ast.isUnion(declaration.ast.init_node) and declaration.ast.type_node != 0;
+        const is_generic = is_record and declaration.ast.type_node != 0 and (self.source.ast.isUnion(declaration.ast.init_node) or self.source.ast.tokens.items(.tag)[self.source.ast.nodes.items(.main_token)[declaration.ast.init_node]] == .keyword_struct);
         const is_this_alias = container != null and !declaration.ast.is_mutable and declaration.ast.type_node == 0 and declaration.ast.init_node != 0 and blk: {
             const call = self.source.ast.fullCall(declaration.ast.init_node) orelse break :blk false;
             break :blk call.ast.args.len == 0 and std.mem.eql(u8, self.source.ast.tokenSlice(self.source.ast.firstToken(call.ast.fn_expr)), "@This");

@@ -1,0 +1,20 @@
+let Box: (T: type) -> type = struct {
+    value: T,
+
+    let Self = @This()
+
+    let get: (self: Self) -> T = self.value
+}
+
+let main: () = {
+    let mut name = Box(string)[ .value = "Ada" ]
+    let original = name
+    name.value += " Lovelace"
+    let names = [name, original]
+    @println(names[0].get(), names[1].get())
+
+    let number = Box(uint)[ .value = 42 ]
+    let mut nested = Box(Box(uint))[ .value = number ]
+    nested.value.value += 1
+    @println(nested.get().get(), number.get())
+}

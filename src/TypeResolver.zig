@@ -4,6 +4,7 @@ const Module = @import("Module.zig");
 const Ir = @import("Ir.zig");
 const Compilation = @import("Compilation.zig");
 const primitives = @import("primitives.zig");
+const Literal = @import("Literal.zig");
 
 pub const Error = Ir.InternError;
 
@@ -269,7 +270,7 @@ fn lookupBinding(bindings: []const Binding, name: []const u8) ?Ir.TypeId {
     return null;
 }
 
-/// Only ordinary named union templates and aliases to those templates are callable here.
+/// Only ordinary named container templates and aliases to them are callable here.
 pub fn genericTarget(module: *const Module, node: Ast.Node.Index) ?Module.DeclId {
     return (genericReference(module, node) orelse return null).local;
 }
@@ -307,7 +308,9 @@ pub fn validateGeneric(module: *Module, id: Module.DeclId) Error!bool {
         _ = try diagnose(module, declaration.node, .invalid_generic_declaration);
         return false;
     };
-    if (full.is_mutable or declaration.container != null or !ast.isUnion(full.init_node) or proto.ast.params.len == 0 or !namedType(ast, proto.ast.return_type orelse 0, "type")) {
+    const tagged = ast.isUnion(full.init_node);
+    const is_struct = ast.fullStruct(full.init_node) != null and ast.tokens.items(.tag)[ast.nodes.items(.main_token)[full.init_node]] == .keyword_struct;
+    if (full.is_mutable or declaration.container != null or (!tagged and !is_struct) or proto.ast.params.len == 0 or !namedType(ast, proto.ast.return_type orelse 0, "type")) {
         _ = try diagnose(module, declaration.node, .invalid_generic_declaration);
         return false;
     }
@@ -354,9 +357,9 @@ pub fn validateGeneric(module: *Module, id: Module.DeclId) Error!bool {
         const entry = try fields.getOrPut(module.allocator, name);
         if (entry.found_existing) try module.diagnostics.append(module.allocator, .{ .tag = .duplicate_field, .span = span, .related = entry.value_ptr.* }) else entry.value_ptr.* = span;
         const data = ast.nodes.items(.data)[member];
-        if (data.rhs != 0) _ = try diagnose(module, data.rhs, .unsupported_union_default);
+        if (tagged and data.rhs != 0) _ = try diagnose(module, data.rhs, .unsupported_union_default);
     }
-    if (fields.count() == 0) _ = try diagnose(module, full.init_node, .empty_union);
+    if (tagged and fields.count() == 0) _ = try diagnose(module, full.init_node, .empty_union);
     return module.diagnostics.items.len == start;
 }
 
@@ -399,27 +402,43 @@ fn instantiateArguments(module: *Module, ir: *Ir, id: Module.DeclId, args: []con
         }
         break;
     }
-    const ty = existing orelse try ir.internType(.{ .record = .{ .source = module.source.id, .identity = @intFromEnum(id), .fields = &.{}, .tagged = true, .public = declaration.public, .type_args = args, .instance_state = .building } });
+    const tagged = ast.isUnion(full.init_node);
+    const ty = existing orelse try ir.internType(.{ .record = .{ .source = module.source.id, .identity = @intFromEnum(id), .fields = &.{}, .tagged = tagged, .public = declaration.public, .type_args = args, .instance_state = .building } });
     ir.types.items[@intFromEnum(ty)].record.instance_state = .building;
     var complete = false;
     defer if (!complete) {
         ir.types.items[@intFromEnum(ty)].record.instance_state = .failed;
     };
-    const bindings = try module.allocator.alloc(Binding, args.len);
-    defer module.allocator.free(bindings);
+    var bindings: std.ArrayList(Binding) = .empty;
+    defer bindings.deinit(module.allocator);
     var iterator = proto.iterate(ast);
-    for (args, bindings) |arg, *binding| binding.* = .{ .name = ast.tokenSlice(iterator.next().?.name_token.?), .ty = arg };
+    for (args) |arg| try bindings.append(module.allocator, .{ .name = ast.tokenSlice(iterator.next().?.name_token.?), .ty = arg });
+    try bindings.append(module.allocator, .{ .name = "@This", .ty = ty });
+    for (ast.fullStruct(full.init_node).?) |member| {
+        if (isThisAlias(ast, member)) try bindings.append(module.allocator, .{ .name = ast.tokenSlice(ast.fullDecl(member).?.ast.let_token + 1), .ty = ty });
+    }
     var fields: std.ArrayList(Ir.Field) = .empty;
     defer fields.deinit(module.allocator);
     for (ast.fullStruct(full.init_node).?) |member| {
         if (ast.nodes.items(.tag)[member] != .container_field) continue;
         const data = ast.nodes.items(.data)[member];
-        const field_ty = if (data.lhs == 0) try ir.internType(.void) else (try resolveWith(module, ir, data.lhs, bindings, expansions + 1)) orelse return null;
+        if (!tagged and data.lhs == 0) return diagnose(module, member, .unsupported_type);
+        const field_ty = if (data.lhs == 0) try ir.internType(.void) else (try resolveWith(module, ir, data.lhs, bindings.items, expansions + 1)) orelse return null;
         const ft = ir.getType(field_ty).?;
-        if (!Ir.isUnionPayload(ft)) return diagnose(module, member, .unsupported_type);
+        if (ft == .record and ft.record.instance_state == .building) return diagnose(module, member, .generic_cycle);
+        if (!(if (tagged) Ir.isUnionPayload(ft) else Ir.isRecordField(ft))) return diagnose(module, member, .unsupported_type);
         const token = ast.nodes.items(.main_token)[member];
         const span = module.tokenSpan(token);
-        try fields.append(module.allocator, .{ .name = ast.tokenSlice(token), .ty = field_ty, .span = span });
+        var default: ?Ir.ConstId = null;
+        if (data.rhs != 0) {
+            if (ft == .record) return diagnose(module, data.rhs, .invalid_field_default);
+            switch (try Literal.check(module, ir, data.rhs, field_ty, span)) {
+                .constant => |constant| default = constant,
+                .failed => return null,
+                .not_literal => return diagnose(module, data.rhs, .invalid_field_default),
+            }
+        }
+        try fields.append(module.allocator, .{ .name = ast.tokenSlice(token), .ty = field_ty, .span = span, .default = default });
     }
     try ir.setRecordFields(ty, fields.items);
     ir.types.items[@intFromEnum(ty)].record.instance_state = .complete;

@@ -1700,6 +1700,186 @@ test "record interpolation conversion allocations fail safely and skipped conver
     }
 }
 
+const generic_struct_program =
+    \\let Box:(T:type)->type=struct{value:T,
+    \\let Self=@This()
+    \\let get:(self:Self)->T=self.value
+    \\let forward:(self:Self)->T=sibling(self)
+    \\let sibling:(self:Self)->T=self.get()
+    \\let make:(value:T)->Self=Self[.value=value]
+    \\let wrap:(self:Self)->Box(Self)=Box(Self)[.value=self]
+    \\let toString:(self:Self)->string="<{self.value}>"
+    \\let unused:()->T=unknown
+    \\}
+    \\let Pair:(A:type,B:type)->type=struct{first:A,second:B,}
+    \\let Default:(T:type)->type=struct{value:T=7,}
+    \\let Kind=enum{first,second,}
+    \\let Flags:(T:type)->type=struct{value:T=.second,enabled:bool=true,text:string="default",}
+    \\let R:(T:type,E:type)->type=union{ok:T,err:E,}
+    \\let O:(T:type)->type=union{some:T,none,}
+    \\let Template=Box
+    \\let IntBox=Template(int)
+    \\let Alias=IntBox
+    \\let Nested=struct{box:Box(Box(string)),}
+    \\let option:(x:O(Box(string)))->O(Box(int))={let value=x.!
+    \\.some[Box(int)[.value=4]]}
+    \\let result:(x:R(Box(string),Box(string)))->R(Box(int),Box(string))={let value=x.!
+    \\.ok[Box(int)[.value=5]]}
+    \\let main:()={
+    \\let mut a=Box(int)[.value=1]
+    \\let saved:Alias=a
+    \\a.value+=2
+    \\let wrapped=a.wrap()
+    \\let mut nested=Nested[.box=Box(Box(string))[.value=Box(string)[.value="a"+"b"]]]
+    \\let original=nested
+    \\nested.box.value.value+="!"
+    \\nested.box.value=Box(string).make("new"+"!")
+    \\let pair=Pair(string,int)[.second=wrapped.value.forward(),.first=nested.box.value.get()]
+    \\let reverse=Pair(int,string)[.first=pair.second,.second=pair.first]
+    \\let flags=Flags(Kind)[]
+    \\@println(saved.value,a.get(),pair.first,reverse.first,original.box,Default(int)[].value,flags.value==Kind.second,flags.enabled,flags.text)
+    \\let mut arr:[]Box(string)=[Box(string)[.value="x"+"y"],nested.box.value]
+    \\let copy=arr
+    \\arr[0]=Box(string)[.value="z"+"!"]
+    \\arr += [Box(string)[.value="tail"+"!"]]
+    \\let ok:O(Box(string))=.some[copy[0]]
+    \\let err:R(Box(string),Box(string))=.err[copy[1]]
+    \\@println(copy[0],arr[0],arr[-1],match option(ok){.some=>|v|v.value
+    \\.none=>0},match result(err){.ok=>|v|"BAD"
+    \\.err=>|v|v.value})
+    \\}
+;
+const generic_struct_output = "1 3 new! 3 <<ab>> 7 true true default\n<xy> <z!> <tail!> 4 new!\n";
+
+test "generic structs specialize nested constructors methods defaults arrays and propagation under forced GC" {
+    const c = try arrayTestProgram(generic_struct_program);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, generic_struct_output, "", mode);
+}
+
+test "generic structs own source free IR and survive every allocation failure" {
+    var sema = blk: {
+        var module = try Module.init(test_gpa, "generic-struct.nov", generic_struct_program);
+        defer module.deinit();
+        var result = try Lowering.lower(&module);
+        errdefer result.deinit();
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expect(result.lowering_complete);
+        break :blk result;
+    };
+    defer sema.deinit();
+    try sema.ir.verify();
+    const c = try emitProgram(test_gpa, &sema.ir, null);
+    defer test_gpa.free(c);
+    try compileAndRunExpected(c, "typedef int nonempty_translation_unit;", 0, generic_struct_output, "");
+    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{generic_struct_program});
+}
+
+fn testImportedGenericStructs(allocator: std.mem.Allocator) ![]u8 {
+    var sema = blk: {
+        var comp = Compilation.init(allocator);
+        defer comp.deinit();
+        const root = try comp.addSource("/app/main.nov",
+            \\let api=@import("api.nov")
+            \\let library=@import("box.nov")
+            \\let Box=api.Box
+            \\let B=Box(int)
+            \\let Alias=B
+            \\let Kind=enum{wrong,}
+            \\let prefix="WRONG"
+            \\let helper:()->string="WRONG"
+            \\let main:()={let x:Alias=library.Box(int)[.value=3]
+            \\let y:api.Box(int)=B.make(x.value)
+            \\let z=Box(string).make("a"+"b")
+            \\@println(x,y,z,z.message(),x.kind==library.Kind.good)
+            \\}
+        );
+        const api = try comp.addSource("/lib/api.nov",
+            \\let implementation=@import("box.nov")
+            \\@[public]
+            \\let Box=implementation.Box
+        );
+        const library = try comp.addSource("/lib/box.nov",
+            \\let prefix="library:"
+            \\let helper:()->string="helper"
+            \\@[public]
+            \\let Kind=enum{good,bad,}
+            \\@[public]
+            \\let Box:(T:type)->type=struct{value:T,kind:Kind=.good,
+            \\let Self=@This()
+            \\let make:(value:T)->Self=Self[.value=value]
+            \\let toString:(self:Self)->string="<{self.value}>"
+            \\let message:(self:Self)->string=prefix+helper()
+            \\}
+        );
+        for ([_]struct { source: Source.Id, name: []const u8, target: Source.Id }{
+            .{ .source = root, .name = "api", .target = api },
+            .{ .source = root, .name = "library", .target = library },
+            .{ .source = api, .name = "implementation", .target = library },
+        }) |edge| {
+            const module = comp.getModule(edge.source).?;
+            const local = module.lookup(edge.name).?;
+            try comp.imports.append(allocator, .{ .declaration = comp.declaration_ids.get(.{ .source = edge.source, .local = local }).?, .target = edge.target, .named = false, .span = module.getDeclaration(local).?.name_span });
+        }
+        comp.setRoot(root);
+        var result = try Lowering.lowerCompilation(&comp);
+        errdefer result.deinit();
+        if (comp.hasErrors()) for (comp.modules.items) |module| std.debug.print("imported struct {s}: {any}\n", .{ module.source.path, module.diagnostics.items });
+        try std.testing.expect(!comp.hasErrors());
+        try std.testing.expect(result.lowering_complete);
+        var instances: usize = 0;
+        for (result.ir.types.items) |ty| if (ty == .record and ty.record.type_args.len != 0) {
+            try std.testing.expectEqual(library, ty.record.source);
+            instances += 1;
+        };
+        try std.testing.expectEqual(@as(usize, 2), instances);
+        break :blk result;
+    };
+    defer sema.deinit();
+    try sema.ir.verify();
+    return emit(allocator, &sema.ir, null);
+}
+
+fn testImportedGenericStructAllocations(allocator: std.mem.Allocator) !void {
+    allocator.free(try testImportedGenericStructs(allocator));
+}
+
+test "generic structs imported aliases share canonical instances and defining free names after graph release" {
+    const library = try testImportedGenericStructs(test_gpa);
+    defer test_gpa.free(library);
+    const c = try collectingTestProgram(library);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "<3> <3> <ab> library:helper true\n", "", mode);
+    try std.testing.checkAllAllocationFailures(test_gpa, testImportedGenericStructAllocations, .{});
+}
+
+test "generic structs method worklist handles concrete typed locals void and noreturn methods" {
+    const c = try arrayTestProgram(
+        \\let Box:(T:type)->type=struct{value:T,
+        \\let Self=@This()
+        \\let earlier:(value:T)->T={let x:T=value
+        \\x}
+        \\let next:(self:Self)->Box(bool)=Box(bool).make(true)
+        \\let make:(value:T)->Self=Self[.value=earlier(value)]
+        \\let touch:(self:Self)->void=@print(self.value)
+        \\@[noreturn]
+        \\let stop:()->void=@panic("stop")
+        \\}
+        \\let main:()={let x=Box(int).make(3)
+        \\x.touch()
+        \\let y=x.next()
+        \\y.touch()
+        \\let stop:()->void=Box(string).stop
+        \\@println("done")
+        \\}
+    );
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "3truedone\n", "", mode);
+}
+
 const generic_method_program =
     \\let Result:(T:type,E:type)->type=union{
     \\ok:T,err:E,

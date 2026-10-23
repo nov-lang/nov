@@ -1,5 +1,13 @@
 # TODO
 
+Ordinary generic structs are executable alongside generic unions: named type
+parameters, canonical declaration+argument identity through aliases/imports,
+concrete fields/defaults, finite nested instances, direct Box(T)[...] constructors,
+@This/Self and demand-specialized methods. They work in arrays and Option/Result
+payloads with existing value-copy/GC rules. See examples/generic-structs.nov.
+Array-valued fields are still unsupported pending recursive copy-depth semantics;
+contextual constructors, value generics and general comptime remain deferred.
+
 Growable []string and acyclic nested-record arrays are executable with independent
 element storage and shared immutable string backing. Index values and replacements,
 append, literal inference, copies/returns and managed owner tracing work. String
@@ -7,7 +15,7 @@ membership compares bytes, including UTF-8/NUL; record membership/equality and
 indexed string compounds remain unsupported. Owned expanded GC pointer maps cover
 all managed capacity slots, with checked alignment/size/OOM and zeroed owners.
 No nested/enum/union/function arrays, element aliases or array record fields yet.
-See examples/managed-arrays.nov; generic structs are next in the roadmap.
+See examples/managed-arrays.nov. Generic structs now work with supported field types.
 
 Acyclic nested nominal struct fields and mutable-local nested field paths now work,
 including aliases/imports/forward layouts and nested structs as union payloads.
@@ -24,7 +32,7 @@ final stores change only that field in the current local, preserving other-field
 and whole-record RHS changes. Terminal RHS skips the pending operation/store.
 Copies remain independent, strings share immutable storage, and string owners stay
 rooted. No temporary/union/parameter/pointer mutation or implicit borrowing.
-See examples/struct-mutation.nov. Generic structs are next;
+See examples/struct-mutation.nov; generic structs now use the same mutation rules;
 prioritized roadmap is in local PLAN.md.
 
 Option.isSome/isNone and Result.isOk/isErr are ordinary public bool-returning
@@ -63,7 +71,7 @@ cannot overwrite any loaded source, including imported library/symlink targets.
 No source concatenation/name rewriting or builtin Result is used. Named imports
 require public top-level exports; file imports also allow unmarked declarations.
 Full member visibility/private attributes, runtime module initialization, arbitrary
-package search, generic structs/value/comptime remain deferred.
+package search, value generics/comptime remain deferred.
 
 Instance calls value.method(args) work on nominal structs, non-generic unions and
 enums as sugar for Type.method(value,args). The explicit first parameter must match
@@ -115,7 +123,7 @@ by declaration and exact arguments. Template aliases and instantiated aliases wo
 Expansion is bounded at 64 levels. Structural `.!` requires exactly `ok`/`err`
 variants, evaluates once, yields success or constructs/returns the enclosing error
 variant with identical error type. Ordinary returns never implicitly wrap payloads.
-Generic structs, general comptime/value parameters, nested union/
+General comptime/value parameters, nested union/
 array/function payloads and explicit tag enums remain deferred.
 The filesystem error example remains design-only: filesystem APIs and file-resource
 semantics are missing and intentionally deprioritized; imports are implemented.
@@ -134,7 +142,7 @@ imports enforce public top-level access, not full member visibility or a C expor
 parameters, temporaries, local slots and control-flow merges. Contextual/anonymous
 constructors, nested/array/function fields,
 record arrays/globals, container constants/types, derived printing,
-generic structs and FFI remain deferred. See README's executable struct
+FFI remains deferred. See README's executable struct
 contract; the older broader syntax examples below are not delivery claims.
 
 Executable scalar status: integer binary `&`, `|`, `^` and unary `~` support

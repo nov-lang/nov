@@ -155,9 +155,13 @@ fn checkSupported(ast: Ast) !void {
                 }
             },
             .container_field => if (data.lhs != 0) {
-                if (ast.nodes.items(.tag)[data.lhs] != .identifier) return error.UnsupportedSyntax;
+                const field_tag = ast.nodes.items(.tag)[data.lhs];
+                switch (field_tag) {
+                    .identifier, .field_access, .call, .call_one => {},
+                    else => return error.UnsupportedSyntax,
+                }
                 const name = ast.tokenSlice(ast.firstToken(data.lhs));
-                if (primitives.isPrimitive(name)) {
+                if (field_tag == .identifier and primitives.isPrimitive(name)) {
                     const allowed = [_][]const u8{ "void", "bool", "string", "int", "uint", "i8", "i16", "i32", "i64", "i128", "u8", "u16", "u32", "u64", "u128" };
                     for (allowed) |scalar| {
                         if (std.mem.eql(u8, name, scalar)) break;
@@ -166,7 +170,11 @@ fn checkSupported(ast: Ast) !void {
                 if (data.rhs != 0 and !fieldDefaultSupported(ast, data.rhs)) return error.UnsupportedSyntax;
             },
             .array_type => {
-                if (ast.nodes.items(.tag)[data.rhs] != .identifier) return error.UnsupportedSyntax;
+                switch (ast.nodes.items(.tag)[data.rhs]) {
+                    .field_access, .call, .call_one => continue,
+                    .identifier => {},
+                    else => return error.UnsupportedSyntax,
+                }
                 const name = ast.tokenSlice(ast.nodes.items(.main_token)[data.rhs]);
                 const scalar_types = [_][]const u8{ "bool", "string", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "int", "uint" };
                 for (scalar_types) |scalar| {

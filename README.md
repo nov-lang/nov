@@ -736,7 +736,7 @@ The delivered subset is deliberately bounded:
   a method. A bare `item.method` does not create a bound function or closure;
   explicit `Type.method` remains an ordinary unbound function value. Concrete
   generic union instances support these same method calls.
-  Container constants, nested type declarations, generics, general type values,
+  Container constants, nested type declarations, general type values,
   struct global instances and C FFI are unsupported.
 - Printing requires exactly the container method `toString: (MyType) -> string`.
   The parameter name is unrestricted, and aliases of the exact nominal type and
@@ -903,10 +903,10 @@ x.text ; runtime error
 
 ### Generics
 
-#### Executable type-parameterized unions
+#### Executable type-parameterized containers
 
 Named module declarations with explicit `type` parameters and `-> type` can
-produce ordinary unions:
+produce ordinary unions or structs:
 
 ```nov
 let Result: (T: type, E: type) -> type = union {
@@ -923,7 +923,7 @@ arguments produces the same nominal type. Distinct templates or different type
 arguments remain distinct, even with identical layouts. Expansion is bounded at
 64 levels, with alias traversal bounded at 128. Only plain named `type` parameters
 are supported in this slice, not value parameters, `#type`, general compile-time
-execution or generic functions returning runtime values. Generic union methods
+execution or generic functions returning runtime values. Generic container methods
 specialize by canonical concrete container type; aliases share specializations and
 different type arguments remain isolated. `@This()` and immutable
 `let Self = @This()` container aliases refer to that concrete type. Static and
@@ -935,11 +935,29 @@ called, or required for `toString` conversion. Unused methods do not invalidate 
 otherwise valid type instance; requested methods still undergo full checking.
 This preserves void-payload Result construction/propagation without permitting
 void parameters. Method discovery and specialization are bounded; failed checking
-never exposes partial executable IR. Generic structs, general container constants,
-value parameters and general compile-time execution remain unsupported; instantiated
-union payloads retain the restrictions above.
+never exposes partial executable IR. Generic struct fields are resolved for each
+concrete instance, retaining exact nominal identity. Scalar literal defaults are
+checked against concrete field types; aggregate defaults remain unsupported.
 
-The following broader generic-struct example remains design-only.
+```nov
+let Box: (T: type) -> type = struct {
+    value: T,
+    let get: (self: @This()) -> T = self.value
+}
+let main: () = {
+    let boxed = Box(uint)[ .value = 42 ]
+    @println(boxed.get())
+}
+```
+
+Generic structs support direct instantiated constructors, aliases/imports, finite
+nested instances, field mutation, array elements and Option/Result payloads using
+the existing copy/rooting rules. See [examples/generic-structs.nov](examples/generic-structs.nov).
+Array-valued fields, recursive layouts, contextual constructors, general container
+constants, value parameters and general compile-time execution remain unsupported.
+
+The following broader stack example remains design-only: array fields, `#type`
+and pointer-based mutable receivers are not delivered.
 
 We can generate a type with a function thus creating a generic type.
 ```nov

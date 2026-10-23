@@ -78,13 +78,13 @@ fn renderModuleWithSources(module: *const Module, compilation: ?*const Compilati
         const location = Location.init(source.ast.source, diagnostic.span.start);
         try location.renderPrefix(source.path, "error", writer);
         switch (diagnostic.tag) {
-            .invalid_generic_declaration => try writer.writeAll("generic union declarations require named type parameters: (T: type, ...) -> type = union { ... }"),
-            .generic_needs_arguments => try writer.writeAll("generic union requires explicit type arguments"),
-            .not_a_generic => try writer.writeAll("type application requires an ordinary named generic union"),
-            .generic_argument_count => try writer.writeAll("type argument count does not match the generic union declaration"),
-            .generic_cycle => try writer.writeAll("cyclic generic union instantiation"),
-            .generic_limit => try writer.writeAll("generic union expansion exceeds the current limit of 64"),
-            .unsupported_generic_method => try writer.writeAll("generic union members require an ordinary function signature or an immutable @This() alias"),
+            .invalid_generic_declaration => try writer.writeAll("generic container declarations require named type parameters: (T: type, ...) -> type = struct { ... } or union { ... }"),
+            .generic_needs_arguments => try writer.writeAll("generic container requires explicit type arguments"),
+            .not_a_generic => try writer.writeAll("type application requires an ordinary named generic container"),
+            .generic_argument_count => try writer.writeAll("type argument count does not match the generic container declaration"),
+            .generic_cycle => try writer.writeAll("cyclic generic container instantiation"),
+            .generic_limit => try writer.writeAll("generic container expansion exceeds the current limit of 64"),
+            .unsupported_generic_method => try writer.writeAll("generic container members require an ordinary function signature or an immutable @This() alias"),
             .invalid_propagation_operand => try writer.writeAll(".! requires a union with exactly ok and err variants, or exactly some and none variants with a void none payload"),
             .invalid_propagation_return => try writer.writeAll(".! requires an enclosing function returning the same union family: exactly ok and err, or exactly some and none with a void none payload"),
             .propagation_error_mismatch => try writer.writeAll(".! error payload must exactly match the enclosing union's err type"),

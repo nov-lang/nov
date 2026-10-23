@@ -213,6 +213,97 @@ test "demand generic methods diagnose requested void parameter signatures includ
     }
 }
 
+test "generic structs reject unsupported fields inexact defaults constructors and receivers" {
+    const prefix = "let Box:(T:type)->type=struct{value:T,\nlet Self=@This()\nlet get:(self:Self)->T=self.value\n}\n";
+    const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag };
+    for ([_]Case{
+        .{ .source = "let Bad=Box([]int)", .tag = .unsupported_type },
+        .{ .source = "let Bad=Box(void)", .tag = .unsupported_type },
+        .{ .source = "let Bad=Box(()->int)", .tag = .unsupported_type },
+        .{ .source = "let U=union{ok:int,}\nlet Bad=Box(U)", .tag = .unsupported_type },
+        .{ .source = "let G:(T:type)->type=struct{items:[]T,}\nlet Bad=G(int)", .tag = .unsupported_type },
+        .{ .source = "let G:(T:type)->type=struct{value:T=true,}\nlet Bad=G(int)", .tag = .literal_type_mismatch },
+        .{ .source = "let G:(T:type)->type=struct{value:T=256,}\nlet Bad=G(u8)", .tag = .literal_out_of_range },
+        .{ .source = "let G:(T:type)->type=struct{value:T=Box(int)[.value=1],}\nlet Bad=G(Box(int))", .tag = .invalid_field_default },
+        .{ .source = "let G:(T:type)->type=struct{value:T=unknown,}\nlet Bad=G(int)", .tag = .invalid_field_default },
+        .{ .source = "let f:()={let x=Box(int)[.value=true]\n}", .tag = .literal_type_mismatch },
+        .{ .source = "let f:()={let x=Box(int)[]\n}", .tag = .missing_field },
+        .{ .source = "let f:()={let x=Box(int)[.other=1]\n}", .tag = .unknown_field },
+        .{ .source = "let f:()={let x=Box(int)[.value=1,.value=2]\n}", .tag = .duplicate_field },
+        .{ .source = "let f:(x:Box(int))->Box(bool)=x", .tag = .expression_type_mismatch },
+        .{ .source = "let Other:(T:type)->type=struct{value:T,}\nlet f:(x:Box(int))->Other(int)=x", .tag = .expression_type_mismatch },
+        .{ .source = "let f:(x:Box(bool))->int=Box(int).get(x)", .tag = .expression_type_mismatch },
+        .{ .source = "let f:(x:Box(int))={x.value=2\n}", .tag = .immutable_assignment },
+        .{ .source = "let f:()={let x=Box(int)[.value=1]\nx.value=2\n}", .tag = .immutable_assignment },
+        .{ .source = "let G:(T:type)->type=struct{value:T,\nlet bad:()->T={let x:T=true\nx}\n}\nlet f:()->int=G(int).bad()", .tag = .literal_type_mismatch },
+        .{ .source = "let G:(T:type)->type=struct{value:T,\nlet bad:()->T=true\n}\nlet f:()->int=G(int).bad()", .tag = .literal_type_mismatch },
+        .{ .source = "let x:Box", .tag = .generic_needs_arguments },
+        .{ .source = "let x:Box(int,bool)", .tag = .generic_argument_count },
+        .{ .source = "let G:(n:int)->type=struct{value:int,}", .tag = .invalid_generic_declaration },
+    }) |case| {
+        const source = try std.mem.concat(std.testing.allocator, u8, &.{ prefix, case.source });
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "generic-struct-error.nov", source);
+        defer module.deinit();
+        try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
+        var result = try lower(&module);
+        defer result.deinit();
+        var found = false;
+        for (module.diagnostics.items) |d| if (d.tag == case.tag) {
+            found = true;
+        };
+        if (!found) std.debug.print("generic struct error {s}: {any}\n", .{ case.source, module.diagnostics.items });
+        try std.testing.expect(found);
+        try std.testing.expect(!result.lowering_complete);
+        try std.testing.expectEqual(@as(usize, 0), result.ir.functions.items.len);
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, testRejectedMatchAllocations, .{source});
+    }
+}
+
+test "generic structs check defaults only for used concrete types including late body instances" {
+    for ([_][]const u8{
+        "let G:(T:type)->type=struct{value:T=1,}\nlet run:()={let x=G(bool)[]\n}",
+        "let G:(T:type)->type=struct{value:T=1,}\nlet run:()={let x=G(bool)[.value=true]\n}",
+    }) |source| {
+        for ([_]bool{ false, true }) |imported| {
+            try testLateGenericLayout(std.testing.allocator, source, .literal_type_mismatch, imported);
+            try std.testing.checkAllAllocationFailures(std.testing.allocator, testLateGenericLayout, .{ source, @as(?Module.Diagnostic.Tag, .literal_type_mismatch), imported });
+        }
+    }
+    const source = "let Unused:(T:type)->type=struct{value:T=unknown,}\nlet G:(T:type)->type=struct{value:T=true,\nlet typed:(x:T)->T={let y:T=x\ny}\n}\nlet run:()={let x=G(bool)[]\nlet y=G(bool).typed(x.value)\n}";
+    try testLateGenericLayout(std.testing.allocator, source, null, false);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testLateGenericLayout, .{ source, @as(?Module.Diagnostic.Tag, null), false });
+}
+
+test "generic structs late cycles expanding type arguments and layout depth retain source diagnostics" {
+    const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag };
+    for ([_]Case{
+        .{ .source = "let G:(T:type)->type=struct{value:G(T),}\nlet run:()={let x=G(int)[]\n}", .tag = .generic_cycle },
+        .{ .source = "let G:(T:type)->type=struct{value:H(T),}\nlet H:(T:type)->type=struct{value:G(T),}\nlet run:()={let x=G(int)[]\n}", .tag = .generic_cycle },
+        .{ .source = "let G:(T:type)->type=struct{value:@This(),}\nlet run:()={let x=G(int)[]\n}", .tag = .generic_cycle },
+        .{ .source = "let G:(T:type)->type=struct{value:Self,\nlet Self=@This()\n}\nlet run:()={let x=G(int)[]\n}", .tag = .generic_cycle },
+        .{ .source = "let G:(T:type)->type=struct{value:H(G(T)),}\nlet H:(T:type)->type=struct{value:T,}\nlet run:()={let x=G(int)[]\n}", .tag = .generic_cycle },
+        .{ .source = "let G:(T:type)->type=struct{value:G((T)->T),}\nlet run:()={let x=G(int)[]\n}", .tag = .generic_limit },
+    }) |case| {
+        for ([_]bool{ false, true }) |imported| {
+            try testLateGenericLayout(std.testing.allocator, case.source, case.tag, imported);
+            try std.testing.checkAllAllocationFailures(std.testing.allocator, testLateGenericLayout, .{ case.source, @as(?Module.Diagnostic.Tag, case.tag), imported });
+        }
+    }
+    for ([_]usize{ Ir.max_record_depth - 1, Ir.max_record_depth }) |depth| {
+        var source = std.Io.Writer.Allocating.init(std.testing.allocator);
+        defer source.deinit();
+        for (0..depth - 1) |i| try source.writer.print("let R{d}=struct{{next:R{d},}}\n", .{ i, i + 1 });
+        try source.writer.print("let R{d}=struct{{n:int=1,}}\n", .{depth - 1});
+        try source.writer.writeAll("let G:(T:type)->type=struct{some:T,}\nlet run:()={let x=G(R0)[.some={return}]\n}");
+        const expected: ?Module.Diagnostic.Tag = if (depth == Ir.max_record_depth) .record_layout_limit else null;
+        for ([_]bool{ false, true }) |imported| {
+            try testLateGenericLayout(std.testing.allocator, source.written(), expected, imported);
+            if (expected != null) try std.testing.checkAllAllocationFailures(std.testing.allocator, testLateGenericLayout, .{ source.written(), expected, imported });
+        }
+    }
+}
+
 test "generic methods reject inexact types leaked bindings and invalid concrete bodies" {
     const prefix = "let G:(T:type,E:type)->type=union{ok:T,err:E,\nlet Self=@This()\nlet unwrapOr:(self:Self,fallback:T)->T=match self{.ok=>|v|v\n.err=>fallback}\nlet unwrapOrElse:(self:Self,fallback:(E)->T)->T=match self{.ok=>|v|v\n.err=>|e|fallback(e)}\n}\nlet R=G(int,string)\n";
     const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag };
