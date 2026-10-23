@@ -38,6 +38,10 @@ pub const UnaryOp = enum { negate, bit_not, bool_not };
 pub const BinaryOp = enum { add, sub, mul, div, mod, bit_and, bit_or, bit_xor, eq, ne, lt, le, gt, ge };
 pub const FieldRead = struct { base: ValueId, index: u32 };
 pub const Operation = union(enum) {
+    range_init: struct { start: ValueId, end: ValueId, inclusive: bool },
+    range_start: ValueId,
+    range_end: ValueId,
+    range_inclusive: ValueId,
     union_init: struct { index: u32, payload: ?ValueId },
     union_tag: FieldRead,
     /// Always checked at runtime, even for externally constructed or malformed values.
@@ -132,6 +136,8 @@ pub const Type = union(enum) {
     integer: Integer,
     function: Type.Function,
     array: TypeId,
+    /// Reusable integer bounds; inclusivity belongs to each value.
+    range: TypeId,
 
     pub const Integer = struct {
         signedness: std.builtin.Signedness,
@@ -644,6 +650,17 @@ fn validateBody(self: *const Ir, function: Function, body: Body) VerifyError!voi
             if (i + 1 != region_end or @intFromEnum(result) != i) return error.UnreachableInstruction;
         }
         switch (instruction.op) {
+            .range_init => |r| {
+                if (ty != .range) return error.InvalidOperation;
+                if (try operandType(body, r.start, i) != ty.range or try operandType(body, r.end, i) != ty.range) return error.OperandTypeMismatch;
+            },
+            .range_start, .range_end, .range_inclusive => |value| {
+                const range_ty = self.getType(try operandType(body, value, i)) orelse return error.InvalidTypeId;
+                if (range_ty != .range) return error.InvalidOperation;
+                if (instruction.op == .range_inclusive) {
+                    if (ty != .boolean) return error.OperandTypeMismatch;
+                } else if (instruction.ty != range_ty.range) return error.OperandTypeMismatch;
+            },
             .union_init => |init_value| {
                 if (ty != .record or !ty.record.tagged or init_value.index >= ty.record.fields.len) return error.InvalidOperation;
                 const payload_ty = ty.record.fields[init_value.index].ty;
@@ -711,7 +728,7 @@ fn validateBody(self: *const Ir, function: Function, body: Body) VerifyError!voi
                 if (try operandType(body, r.lhs, i) != instruction.ty or try operandType(body, r.rhs, i) != instruction.ty) return error.OperandTypeMismatch;
             },
             .local_slot => |value| {
-                if (ty != .boolean and ty != .integer and ty != .function and ty != .array and ty != .string and ty != .record and ty != .enumeration) return error.InvalidOperation;
+                if (ty != .boolean and ty != .integer and ty != .function and ty != .array and ty != .string and ty != .record and ty != .enumeration and ty != .range) return error.InvalidOperation;
                 if (try operandType(body, value, i) != instruction.ty) return error.OperandTypeMismatch;
             },
             .local_load => |slot| {
@@ -909,6 +926,10 @@ fn validateType(self: *const Ir, ty: Type, before: usize) ValidationError!void {
         .integer => |integer| {
             if (integer.bits == 0 or integer.bits > 128) return error.InvalidIntegerWidth;
         },
+        .range => |element| {
+            if (@intFromEnum(element) >= before) return error.InvalidTypeId;
+            if (self.getType(element).? != .integer) return error.InvalidTypeId;
+        },
         .array => |element| {
             if (@intFromEnum(element) >= before) return error.InvalidTypeId;
             if (!isArrayElement(self.getType(element).?)) return error.InvalidArrayElement;
@@ -939,7 +960,7 @@ fn validateConstant(self: *const Ir, constant: Constant) ValidationError!void {
             if (constant.value != .string) return error.ConstantTypeMismatch;
             if (!std.unicode.utf8ValidateSlice(constant.value.string)) return error.ConstantTypeMismatch;
         },
-        .function, .array, .record => return error.NonConstantType,
+        .function, .array, .record, .range => return error.NonConstantType,
         .integer => |integer| switch (integer.signedness) {
             .signed => {
                 const value = switch (constant.value) {
@@ -1003,6 +1024,7 @@ fn typeEql(a: Type, b: Type) bool {
         .enumeration => |enumeration| enumeration.source == b.enumeration.source and enumeration.identity == b.enumeration.identity,
         .integer => |integer| std.meta.eql(integer, b.integer),
         .record => |record| record.source == b.record.source and record.identity == b.record.identity and record.tagged == b.record.tagged and std.mem.eql(TypeId, record.type_args, b.record.type_args),
+        .range => |element| element == b.range,
         .array => |element| element == b.array,
         .function => |function| function.result == b.function.result and
             std.mem.eql(TypeId, function.params, b.function.params),
@@ -3360,4 +3382,94 @@ test "nested records diamond graph traversal completes without expanding value p
         child = parent;
     }
     try ir.verify();
+}
+
+test "range values require integer elements exact visible operands and immutable projections" {
+    var t = try TestFunctions.init(std.testing.allocator);
+    defer t.ir.deinit();
+    const range = try t.ir.internType(.{ .range = t.integer });
+    try std.testing.expectEqual(range, try t.ir.internType(.{ .range = t.integer }));
+    try std.testing.expectError(error.InvalidTypeId, t.ir.internType(.{ .range = t.boolean }));
+    try std.testing.expectError(error.InvalidTypeId, t.ir.internType(.{ .range = @enumFromInt(999) }));
+    try std.testing.expectError(error.InvalidArrayElement, t.ir.internType(.{ .array = range }));
+    try std.testing.expectError(error.NonConstantType, t.ir.internConstant(.{ .ty = range, .value = .void }));
+    try std.testing.expect(!isManaged(t.ir.getType(range).?));
+    try std.testing.expect(!isRecordField(t.ir.getType(range).?));
+    try std.testing.expect(!isUnionPayload(t.ir.getType(range).?));
+    const make = TestFunctions.instruction;
+    const good = [_]Instruction{
+        make(t.integer, .{ .parameter = 0 }),
+        make(range, .{ .range_init = .{ .start = @enumFromInt(0), .end = @enumFromInt(0), .inclusive = true } }),
+        make(t.integer, .{ .range_start = @enumFromInt(1) }),
+        make(t.integer, .{ .range_end = @enumFromInt(1) }),
+        make(t.boolean, .{ .range_inclusive = @enumFromInt(1) }),
+    };
+    try t.ir.setFunctionBody(t.function, &good, @enumFromInt(3));
+    const owned = @constCast(t.ir.getFunction(t.function).?.body.?.instructions);
+    for ([_]u32{ 1, 99 }) |bad| {
+        owned[1].op.range_init.start = @enumFromInt(bad);
+        try std.testing.expectError(error.InvalidValueId, t.ir.verify());
+        owned[1] = good[1];
+        owned[1].op.range_init.end = @enumFromInt(bad);
+        try std.testing.expectError(error.InvalidValueId, t.ir.verify());
+        owned[1] = good[1];
+    }
+    for ([_]usize{ 2, 3, 4 }) |i| {
+        const invalid: Operation = switch (i) {
+            2 => .{ .range_start = @enumFromInt(0) },
+            3 => .{ .range_end = @enumFromInt(0) },
+            else => .{ .range_inclusive = @enumFromInt(0) },
+        };
+        owned[i].op = invalid;
+        try std.testing.expectError(error.InvalidOperation, t.ir.verify());
+        owned[i] = good[i];
+        owned[i].ty = range;
+        try std.testing.expectError(error.OperandTypeMismatch, t.ir.verify());
+        owned[i] = good[i];
+    }
+    owned[1].op.range_init.start = @enumFromInt(4);
+    try std.testing.expectError(error.InvalidValueId, t.ir.verify());
+    owned[1] = good[1];
+    owned[0].ty = t.unsigned;
+    const saved_signature = t.ir.functions.items[0].ty;
+    t.ir.functions.items[0].ty = try t.ir.internType(.{ .function = .{ .params = &.{t.unsigned}, .result = t.integer } });
+    try std.testing.expectError(error.OperandTypeMismatch, t.ir.verify());
+    t.ir.functions.items[0].ty = saved_signature;
+    owned[0] = good[0];
+    owned[1].ty = t.integer;
+    try std.testing.expectError(error.InvalidOperation, t.ir.verify());
+    owned[1] = good[1];
+    owned[1].span.end = 11;
+    try std.testing.expectError(error.InvalidSourceSpan, t.ir.verify());
+    owned[1] = good[1];
+    try t.ir.verify();
+}
+
+test "range operands and projections cannot escape private branch regions" {
+    var t = try TestFunctions.init(std.testing.allocator);
+    defer t.ir.deinit();
+    const range = try t.ir.internType(.{ .range = t.integer });
+    const truth = try t.ir.internConstant(.{ .ty = t.boolean, .value = .{ .boolean = true } });
+    const make = TestFunctions.instruction;
+    const good = [_]Instruction{
+        make(t.boolean, .{ .constant = truth }),
+        make(t.integer, .{ .parameter = 0 }),
+        make(range, .{ .range_init = .{ .start = @enumFromInt(1), .end = @enumFromInt(1), .inclusive = false } }),
+        make(range, .{ .range_init = .{ .start = @enumFromInt(1), .end = @enumFromInt(1), .inclusive = true } }),
+        make(range, .{ .branch = .{ .condition = @enumFromInt(0), .then_start = 2, .else_start = 3, .then_value = @enumFromInt(2), .else_value = @enumFromInt(3) } }),
+        make(t.integer, .{ .range_end = @enumFromInt(4) }),
+    };
+    try t.ir.setFunctionBody(t.function, &good, @enumFromInt(5));
+    const owned = @constCast(t.ir.getFunction(t.function).?.body.?.instructions);
+    for ([_]Operation{
+        .{ .range_start = @enumFromInt(2) },
+        .{ .range_end = @enumFromInt(3) },
+        .{ .range_inclusive = @enumFromInt(2) },
+        .{ .range_init = .{ .start = @enumFromInt(2), .end = @enumFromInt(1), .inclusive = false } },
+    }) |op| {
+        owned[5] = make(if (op == .range_init) range else t.integer, op);
+        try std.testing.expectError(error.InvalidValueId, t.ir.verify());
+    }
+    owned[5] = good[5];
+    try t.ir.verify();
 }

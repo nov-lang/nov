@@ -162,6 +162,7 @@ fn analyze(allocator: std.mem.Allocator, ir: *const Ir, origins: []?Origin, diag
         switch (ir.types.items[i]) {
             .void, .boolean, .string, .enumeration => {},
             .record => try markRecord(ir, origins, visited, @enumFromInt(i), origin, diagnostic),
+            .range => |element| mark(origins, element, origin),
             .array => |element| {
                 mark(origins, element, origin);
                 if (ir.getType(element).? == .record) try markRecord(ir, origins, visited, element, origin, diagnostic);
@@ -272,6 +273,12 @@ fn write(allocator: std.mem.Allocator, ir: *const Ir, origins: []const ?Origin, 
         try w.print("), {d}, ", .{count});
         if (count == 0) try w.writeAll("NULL") else try w.print("nov_element_offsets_{d}", .{t});
         try w.writeAll(" };\n");
+    }
+    for (origins, ir.types.items, 0..) |origin, ty, i| {
+        if (origin == null or ty != .range) continue;
+        try w.writeAll("typedef struct { ");
+        try writeType(ir, w, ty.range);
+        try w.print(" start, end; bool inclusive; }} nov_range_{d};\n", .{i});
     }
     var first_typedef = true;
     for (origins, ir.types.items, 0..) |origin, ty, i| {
@@ -517,6 +524,7 @@ fn writeType(ir: *const Ir, w: *std.Io.Writer, id: Ir.TypeId) WriteError!void {
         .enumeration => try w.writeAll("uint32_t"),
         .integer => |integer| try w.print("{s}int{d}_t", .{ if (integer.signedness == .unsigned) "u" else "", integer.bits }),
         .function => try w.print("nov_fn_{d}", .{@intFromEnum(id)}),
+        .range => try w.print("nov_range_{d}", .{@intFromEnum(id)}),
         .array => try w.writeAll("nov_array"),
         .string => try w.writeAll("nov_string"),
         .record => try w.print("nov_record_{d}", .{@intFromEnum(id)}),
@@ -624,7 +632,11 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
         },
         .union_tag, .union_payload => |read| value_used[@intFromEnum(read.base)] = true,
         .field_read => |read| value_used[@intFromEnum(read.base)] = true,
-        .array_clone, .array_len, .to_string => |value| value_used[@intFromEnum(value)] = true,
+        .range_init => |r| {
+            value_used[@intFromEnum(r.start)] = true;
+            value_used[@intFromEnum(r.end)] = true;
+        },
+        .range_start, .range_end, .range_inclusive, .array_clone, .array_len, .to_string => |value| value_used[@intFromEnum(value)] = true,
         .array_index => |r| {
             value_used[@intFromEnum(r.array)] = true;
             value_used[@intFromEnum(r.index)] = true;
@@ -911,6 +923,14 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
             try w.print(" v{d} = ", .{i});
         }
         switch (instruction.op) {
+            .range_init => |r| {
+                try w.writeByte('(');
+                try writeType(ir, w, instruction.ty);
+                try w.print("){{v{d}, v{d}, {s}}}", .{ @intFromEnum(r.start), @intFromEnum(r.end), if (r.inclusive) "true" else "false" });
+            },
+            .range_start => |value| try w.print("v{d}.start", .{@intFromEnum(value)}),
+            .range_end => |value| try w.print("v{d}.end", .{@intFromEnum(value)}),
+            .range_inclusive => |value| try w.print("v{d}.inclusive", .{@intFromEnum(value)}),
             .union_init => |init_value| {
                 try w.writeByte('(');
                 try writeType(ir, w, instruction.ty);
@@ -6598,4 +6618,72 @@ test "nested records root enumeration prunes large scalar diamonds beside manage
     try std.testing.expect(std.mem.indexOf(u8, c, "void **nov_roots[] = { &p0.f1.owner, };") != null);
     try std.testing.expect(c.len < 32 * 1024);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, c, "offsetof(nov_record_"));
+}
+
+const reusable_range_program =
+    \\let bound: (x: uint) -> uint = {@print(x)
+    \\x}
+    \\let main: () = {
+    \\let mut range = bound(0)..bound(3)
+    \\let copy = range
+    \\loop i in range {@print(i)
+    \\range = 8..=9}
+    \\loop i in copy {@print(i)}
+    \\loop i in range {@print(i)}
+    \\loop i in if true {0..2} else {0..=2} {@print(i)}
+    \\let chosen = loop {break 4..=5}
+    \\loop i in chosen {@print(i)}
+    \\loop i in { @print("S")
+    \\copy } {@print(i)
+    \\continue}
+    \\@println()
+    \\}
+;
+test "reusable range values snapshot copy branches and loop results O0 O3" {
+    const c = try arrayTestProgram(reusable_range_program);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "03012012890145S012\n", "", mode);
+}
+
+test "reusable range source free emission and every compiler allocation failure" {
+    var sema = blk: {
+        var module = try Module.init(test_gpa, "range-values.nov", reusable_range_program);
+        defer module.deinit();
+        var result = try Lowering.lower(&module);
+        errdefer result.deinit();
+        try std.testing.expect(!module.hasErrors());
+        break :blk result;
+    };
+    defer sema.deinit();
+    try sema.ir.verify();
+    const c = try emitProgram(test_gpa, &sema.ir, null);
+    defer test_gpa.free(c);
+    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{reusable_range_program});
+}
+
+test "reusable range runtime boundaries per-loop effects and terminal controls" {
+    const cases = [_]struct { source: []const u8, output: []const u8, code: u8, message: []const u8 }{
+        .{ .source = "let main: () = {let range=0..10\nloop i in range {@print(\"{i} \")}\n@println()}", .output = "0 1 2 3 4 5 6 7 8 9 \n", .code = 0, .message = "" },
+        .{ .source = "let main: () = {let r=@as(u8, 255)..=@as(u8, 255)\nloop i in r {@print(i)\ncontinue}\nloop i in r {@print(i)}\nlet s=@as(i8, -128)..=@as(i8, -127)\nloop i in s {@print(i)}\nlet empty=3..3\nloop _ in empty {@print(\"BAD\")}\nlet reversed=4..=2\nloop _ in reversed {@print(\"BAD\")}\n@println()}", .output = "255255-128-127\n", .code = 0, .message = "" },
+        .{ .source = "let main: () = {let r=0..2\nloop _ in 0..2 {loop i in {@print(\"S\")\nr} {@print(i)}}\nlet copy=loop _ in 0..0 {} else {r}\nloop i in copy {@print(i)\nbreak}\nloop i in r {@print(i)}\n@println()}", .output = "S01S01001\n", .code = 0, .message = "" },
+        .{ .source = "let end: () -> uint = {@print(\"BAD\")\n1}\nlet main: () = {let r={@print(\"R\")\nreturn}..end()\n}", .output = "R", .code = 0, .message = "" },
+        .{ .source = "let main: () = {let r={@print(\"P\")\n@panic(\"stop\")}..{@print(\"BAD\")\n@as(uint, 1)}\n}", .output = "P", .code = 1, .message = "panic: stop\n" },
+        .{ .source = "let main: () = {let r=0..3\nloop _ in 0..1 {loop i in {break} {@print(i)}}\n@print(\"\")\n@println()}", .output = "\n", .code = 0, .message = "" },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("range source: {s}\n", .{case.source});
+        const c = try arrayTestProgram(case.source);
+        defer test_gpa.free(c);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode|
+            try compileAndRunMode(c, "typedef int nonempty_translation_unit;", case.code, case.output, case.message, mode);
+    }
+}
+
+test "reusable range storage does not need a managed runtime" {
+    const c = try emitSource("let main: () = {let mut r=0..2\nlet copy=r\nloop i in r {r=8..=9\n@print(i)}\nloop i in copy {@print(i)}}", null);
+    defer test_gpa.free(c);
+    try std.testing.expect(std.mem.indexOf(u8, c, "nov_gc_") == null);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(c, "void nov_main(void); int main(void) { nov_main(); return 0; }", 0, "0101", "", mode);
 }

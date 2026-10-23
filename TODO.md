@@ -1,5 +1,15 @@
 # TODO
 
+Reusable range values are executable: start..end / start..=end construct integer
+bounds once left-to-right, and loop i in range snapshots the source once per loop.
+Reuse restarts at the beginning; source-binding replacement cannot affect an active
+loop. Locals/copies/assignment and inferred branch/block/loop results work. Inclusive
+state is per value, endpoint type exact; existing range-only int/uint defaults,
+empty reversed ranges and inclusive-MAX exhaustion remain unchanged. No allocation.
+No new range annotation syntax, signatures, aggregate fields/payloads, arrays,
+globals, field attributes, printing/equality/membership or iterator protocol yet.
+See examples/range-values.nov. Chained ranges diagnose; slice/match syntax preserved.
+
 Ordinary generic structs are executable alongside generic unions: named type
 parameters, canonical declaration+argument identity through aliases/imports,
 concrete fields/defaults, finite nested instances, direct Box(T)[...] constructors,

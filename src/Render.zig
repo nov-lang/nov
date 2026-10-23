@@ -254,9 +254,7 @@ fn renderExpression(self: *Render, node: Ast.Node.Index, space: Space) RenderErr
             try self.renderToken(main_tokens[node], .space);
             try self.renderExpression(loop.binding, .space);
             try self.renderToken(ast.lastToken(loop.binding) + 1, .space);
-            try self.renderExpression(loop.start, .none);
-            try self.renderToken(loop.range_token, .none);
-            try self.renderExpression(loop.end, .space);
+            try self.renderExpression(loop.source, .space);
             if (loop.else_expr != 0) {
                 try self.renderExpression(loop.body, .space);
                 try self.renderToken(ast.lastToken(loop.body) + 1, .space);

@@ -1135,7 +1135,7 @@ fn testRangeOwnership(inclusive: bool) !void {
     const counter = instructions[loop.body_start].op.local_load;
     try std.testing.expect(@intFromEnum(counter) < loop.condition_start);
     try std.testing.expect(instructions[@intFromEnum(counter)].op == .local_slot);
-    const condition = @intFromEnum(if (inclusive) instructions[@intFromEnum(loop.condition)].op.short_circuit.rhs else loop.condition);
+    const condition = loop.condition_start + 3;
     const endpoint = instructions[condition].op.binary.rhs;
     try std.testing.expect(@intFromEnum(endpoint) < @intFromEnum(counter));
     try std.testing.expect(instructions[loop.body_start].op == .local_load);
@@ -1143,7 +1143,7 @@ fn testRangeOwnership(inclusive: bool) !void {
     // A body-private snapshot must not leak into a sibling continuation,
     // and a body-local slot cannot replace the enclosing counter identity.
     const continuation = loop.continuation_start.?;
-    try std.testing.expectEqual(if (inclusive) Ir.BinaryOp.le else Ir.BinaryOp.lt, instructions[condition].op.binary.op);
+    try std.testing.expectEqual(Ir.BinaryOp.lt, instructions[condition].op.binary.op);
     if (inclusive) {
         try std.testing.expectEqual(Ir.BinaryOp.eq, instructions[continuation + 1].op.binary.op);
         try std.testing.expect(instructions[continuation + 2].op == .constant);

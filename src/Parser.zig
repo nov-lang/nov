@@ -414,6 +414,7 @@ fn expectExprStrict(self: *Parser) Error!Node.Index {
 const Precedence = enum(i8) {
     none = -1,
     assignment = 0, // = *= /= %= += -=
+    range = 5, // .. ..= (bounded, non-associative)
     piped_call = 10, // |> >>=
     bool_or = 20, // or
     bool_and = 30, // and
@@ -444,6 +445,8 @@ const Rule = struct {
 };
 
 const rules = std.enums.directEnumArrayDefault(Token.Tag, Rule, .{ .prec = .none, .tag = .root }, 0, .{
+    .period_period = .{ .prec = .range, .tag = .range, .assoc = .none },
+    .period_period_equal = .{ .prec = .range, .tag = .range, .assoc = .none },
     .pipe_arrow = .{ .prec = .piped_call, .tag = .function_pipe },
     .r_angle_bracket_angle_bracket_equal = .{ .prec = .piped_call, .tag = .bind },
 
@@ -505,7 +508,7 @@ fn parseExprPrecedence(self: *Parser, min_prec: Precedence, strict: bool, allow_
             return node;
         }
         if (@intFromEnum(rule.prec) == @intFromEnum(banned_prec)) {
-            return self.fail(.chained_comparison_operators);
+            return self.fail(if (rule.tag == .range) .chained_range_operators else .chained_comparison_operators);
         }
 
         const op_token = self.nextToken();
@@ -541,7 +544,7 @@ fn parseExprPrecedence(self: *Parser, min_prec: Precedence, strict: bool, allow_
                 // without types we don't know if '&&' was intended as 'bitwise_and ref_of', or a c-style logical_and
                 // The best the parser can do is recommend changing it to 'and' or ' & &'
                 try self.warnMsg(.{ .tag = .invalid_ampersand_ampersand, .token = op_token });
-            } else if (std.ascii.isWhitespace(char_before) != std.ascii.isWhitespace(char_after)) {
+            } else if (rule.tag != .range and std.ascii.isWhitespace(char_before) != std.ascii.isWhitespace(char_after)) {
                 try self.warnMsg(.{ .tag = .mismatched_binary_op_whitespace, .token = op_token });
             }
         }
@@ -737,7 +740,7 @@ fn parseElseExpr(self: *Parser) Error!Node.Index {
 ///      / Expr (COLON AssignExpr)?
 /// Condition-and-block and unconditional block forms, with optional continuations,
 /// and conditional exhaustion branches are enabled. Bounded integer
-/// ranges have a dedicated header; general iteration and labels remain unsupported.
+/// ranges are ordinary source expressions; general iteration and labels remain unsupported.
 fn parseLoopExpr(self: *Parser) Error!Node.Index {
     const loop_token = self.assertToken(.keyword_loop);
     if (loop_token >= 2 and self.token_tags[loop_token - 1] == .colon or self.token_tags[self.tok_i] == .eof)
@@ -745,12 +748,8 @@ fn parseLoopExpr(self: *Parser) Error!Node.Index {
     if (self.token_tags[self.tok_i] == .identifier and self.token_tags[self.tok_i + 1] == .keyword_in) {
         const binding = try self.addNode(.{ .tag = .identifier, .main_token = self.nextToken(), .data = undefined });
         _ = self.nextToken();
-        const start = try self.parseExprPrecedence(.assignment, false, false);
-        if (start == 0 or (self.token_tags[self.tok_i] != .period_period and self.token_tags[self.tok_i] != .period_period_equal))
-            return self.failMsg(.{ .tag = .unsupported_range_loop, .token = loop_token });
-        const range_token = self.nextToken();
-        const end = try self.parseExprPrecedence(.assignment, false, false);
-        if (end == 0 or self.token_tags[self.tok_i] != .l_brace)
+        const source = try self.parseExprPrecedence(.assignment, false, false);
+        if (source == 0 or self.token_tags[self.tok_i] != .l_brace)
             return self.failMsg(.{ .tag = .unsupported_range_loop, .token = loop_token });
         const body = try self.expectBlock();
         if (self.token_tags[self.tok_i] == .colon)
@@ -759,7 +758,7 @@ fn parseLoopExpr(self: *Parser) Error!Node.Index {
         return self.addNode(.{
             .tag = .loop_range,
             .main_token = loop_token,
-            .data = .{ .lhs = try self.addExtra(Node.RangeLoop{ .range_token = range_token, .binding = binding, .start = start, .end = end, .body = body, .else_expr = else_expr }), .rhs = if (else_expr != 0) else_expr else body },
+            .data = .{ .lhs = try self.addExtra(Node.RangeLoop{ .binding = binding, .source = source, .body = body, .else_expr = else_expr }), .rhs = if (else_expr != 0) else_expr else body },
         });
     }
     var condition = if (self.token_tags[self.tok_i] == .colon) null_node else condition: {
@@ -769,7 +768,8 @@ fn parseLoopExpr(self: *Parser) Error!Node.Index {
     };
     const continuation = if (self.eatToken(.colon) != null) try self.expectSingleAssignExprStrict() else null_node;
     const body = if (self.token_tags[self.tok_i] == .l_brace) body: {
-        if (condition != 0 and self.nodes.items(.tag)[condition] == .in)
+        if (condition != 0 and (self.nodes.items(.tag)[condition] == .in or
+            (self.nodes.items(.tag)[condition] == .range and self.nodes.items(.tag)[self.nodes.items(.data)[condition].lhs] == .in)))
             return self.failMsg(.{ .tag = .unsupported_loop, .token = loop_token });
         break :body try self.expectBlock();
     } else body: {
@@ -1428,7 +1428,8 @@ fn parseSuffixOp(self: *Parser, lhs: Node.Index) Error!Node.Index {
                 _ = try self.expectToken(.r_bracket);
                 return self.addNode(.{ .tag = .container_decl_arg, .main_token = lbracket, .data = .{ .lhs = lhs, .rhs = try self.addExtra(try self.listToSpan(self.scratch.items[top..])) } });
             }
-            const index_expr = try self.expectExpr();
+            const index_expr = try self.parseExprPrecedence(.piped_call, false, true);
+            if (index_expr == 0) return self.fail(.expected_expr);
 
             switch (self.token_tags[self.tok_i]) {
                 .period_period, .period_period_equal => {
@@ -2009,19 +2010,20 @@ test "range headers preserve dedicated fields spans delimiters and recovery" {
     const node = ast.decl(ast.rootDecls()[0]).ast.init_node;
     const range = ast.fullRange(node).?;
     try std.testing.expectEqualStrings("i", ast.tokenSlice(ast.nodes.items(.main_token)[range.binding]));
-    try std.testing.expect(!range.inclusive);
-    try std.testing.expectEqualStrings("..", ast.tokenSlice(range.range_token));
+    try std.testing.expect(!(ast.tokens.items(.tag)[ast.nodes.items(.main_token)[range.source]] == .period_period_equal));
+    try std.testing.expectEqualStrings("..", ast.tokenSlice(ast.nodes.items(.main_token)[range.source]));
     try std.testing.expectEqualStrings("loop", ast.tokenSlice(ast.firstToken(node)));
     try std.testing.expectEqual(source.len - 1, ast.tokens.items(.start)[ast.lastToken(node)]);
-    try std.testing.expectEqual(Node.Tag.number_literal, ast.nodes.items(.tag)[range.end]);
-    try std.testing.expect(ast.fullRange(range.end) == null);
+    try std.testing.expectEqual(Node.Tag.range, ast.nodes.items(.tag)[range.source]);
+    try std.testing.expectEqual(Node.Tag.number_literal, ast.nodes.items(.tag)[ast.nodes.items(.data)[range.source].rhs]);
+    try std.testing.expect(ast.fullRange(range.source) == null);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
     for ([_][:0]const u8{
         "loop i in ..2 {}",       "loop i in 0.. {}",           "loop i in 0..= {}",
         "loop i in 0..2 {} else", "loop i in 0..2 : tick() {}", "loop i, j in 0..2 {}",
-        "loop &i in 0..2 {}",     "loop i in values {}",        "loop i in 0..2, 0..3 {}",
-        "loop i in 0..2",         "loop i in 0..",              "loop i in 0..2 += 1 {}",
-        "loop i in 0..2\n\n{}",   "for i in 0..2 {}",
+        "loop &i in 0..2 {}",     "loop i in 0..2, 0..3 {}",    "loop i in 0..2",
+        "loop i in 0..",          "loop i in 0..2 += 1 {}",     "loop i in 0..2\n\n{}",
+        "for i in 0..2 {}",
     }) |header| {
         const broken = try std.fmt.allocPrintSentinel(std.testing.allocator, "let f: () = {s}\nlet valid: int = 42", .{header}, 0);
         defer std.testing.allocator.free(broken);
@@ -2043,7 +2045,7 @@ test "range else metadata preserves source bounds delimiters and raw operators" 
         try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
         const node = ast.decl(ast.rootDecls()[0]).ast.init_node;
         const range = ast.fullRange(node).?;
-        try std.testing.expectEqualStrings(operator, ast.tokenSlice(range.range_token));
+        try std.testing.expectEqualStrings(operator, ast.tokenSlice(ast.nodes.items(.main_token)[range.source]));
         try std.testing.expectEqual(Node.Tag.if_else, ast.nodes.items(.tag)[range.else_expr]);
         try std.testing.expectEqualStrings("else", ast.tokenSlice(ast.lastToken(range.body) + 1));
         try std.testing.expectEqual(source.len - 1, ast.tokens.items(.start)[ast.lastToken(node)]);
@@ -2051,22 +2053,20 @@ test "range else metadata preserves source bounds delimiters and raw operators" 
     }
 }
 
-test "inclusive range headers retain raw tokens and reject non-loop ranges" {
+test "inclusive range headers retain raw tokens and reject malformed ranges" {
     const source = "let f: () = loop i in ; start\n{0}..= ; end\n10 {continue}";
     var ast = try parse(std.testing.allocator, source);
     defer ast.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
     const range = ast.fullRange(ast.decl(ast.rootDecls()[0]).ast.init_node).?;
-    try std.testing.expect(range.inclusive);
-    try std.testing.expectEqualStrings("..=", ast.tokenSlice(range.range_token));
+    try std.testing.expect((ast.tokens.items(.tag)[ast.nodes.items(.main_token)[range.source]] == .period_period_equal));
+    try std.testing.expectEqualStrings("..=", ast.tokenSlice(ast.nodes.items(.main_token)[range.source]));
     try std.testing.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
     for ([_][:0]const u8{
         "let f: () = loop i in ..=2 {}",
         "let f: () = loop i in 0..=2 {} else",
         "let f: () = loop i in 0..=2 : tick() {}",
         "let f: () = loop i in 0..=2\n\n{}",
-        "let x = 0..=2",
-        "let f: (n: uint) -> bool = n in 0..=2",
     }) |broken| {
         var result = try parse(std.testing.allocator, broken);
         defer result.deinit(std.testing.allocator);
@@ -2650,4 +2650,32 @@ test "recover after a declaration without an initializer" {
     const declaration = ast.rootDecls()[0];
     const let_token = ast.nodes.items(.main_token)[declaration];
     try std.testing.expectEqualStrings("valid", ast.tokenSlice(let_token + 1));
+}
+
+test "reusable range expression precedence slice match separation and malformed input" {
+    for ([_][:0]const u8{
+        "let r=1 + 2..=3 * 4",
+        "let f: () = loop i in range {}",
+        "let f: () = loop i in source() {}",
+        "let f: () = loop i in if true {0..2} else {1..=2} {}",
+        "let f: () = loop i in {let r=0..2\nr} {}",
+        "let f: () = a[1..3]",
+        "let f: () = a[1..=3]",
+        "let f: () = a[1..]",
+        "let f: () = match n {0..=3 => true\n_ => false}",
+    }) |source| {
+        var ast = try parse(std.testing.allocator, source);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
+    }
+    for ([_][:0]const u8{
+        "let r=0..1..2", "let r=0..=1..2", "let r=..2", "let r=0..", "let r=0..=", "let r=0..2 by 1",
+    }) |source| {
+        var ast = try parse(std.testing.allocator, source);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expect(ast.errors.len != 0);
+        if (std.mem.indexOf(u8, source, "1..2") != null)
+            try std.testing.expectEqual(@as(Ast.Error.Tag, .chained_range_operators), ast.errors[0].tag);
+    }
 }

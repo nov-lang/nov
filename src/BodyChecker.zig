@@ -347,8 +347,7 @@ const Context = struct {
         switch (ast.nodes.items(.tag)[node]) {
             .loop_range => {
                 const range = ast.fullRange(node).?;
-                return (try self.probeBreaks(range.start, depth + 1)) orelse
-                    (try self.probeBreaks(range.end, depth + 1)) orelse
+                return (try self.probeBreaks(range.source, depth + 1)) orelse
                     try self.probeBreaks(range.else_expr, depth + 1);
             },
             .loop_condition, .loop_cont, .loop_else => return self.probeBreaks(ast.fullLoop(node).?.else_expr, depth + 1),
@@ -405,7 +404,7 @@ const Context = struct {
             },
             .negation, .bit_not, .bool_not, .@"return" => return self.probeBreaks(data.rhs, depth + 1),
             .field_access => return self.probeBreaks(data.lhs, depth + 1),
-            .add, .sub, .mul, .div, .mod, .bit_and, .bit_or, .bit_xor, .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal, .bool_and, .bool_or, .in, .array_access, .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod => return (try self.probeBreaks(data.lhs, depth + 1)) orelse (try self.probeBreaks(data.rhs, depth + 1)),
+            .range, .add, .sub, .mul, .div, .mod, .bit_and, .bit_or, .bit_xor, .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal, .bool_and, .bool_or, .in, .array_access, .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod => return (try self.probeBreaks(data.lhs, depth + 1)) orelse (try self.probeBreaks(data.rhs, depth + 1)),
             else => {},
         }
         return null;
@@ -420,18 +419,8 @@ const Context = struct {
         // Probe fallback in the parent scope, then make the index available only
         // while looking for owned break hints. Neither walk evaluates bounds.
         const fallback = try self.probe(range.else_expr, depth + 1);
-        var index = (try self.probe(range.start, depth + 1)) orelse try self.probe(range.end, depth + 1);
-        if (index == null) infer: {
-            const wide = try self.ir.internType(.{ .integer = .{ .signedness = .signed, .bits = 128 } });
-            var negative = false;
-            for ([_]Ast.Node.Index{ range.start, range.end }) |bound| {
-                switch (try Literal.check(self.module, self.ir, bound, wide, null)) {
-                    .constant => |id| negative = negative or self.ir.getConstant(id).?.value.signed_integer < 0,
-                    else => break :infer,
-                }
-            }
-            index = .{ .ty = try self.ir.internType(.{ .integer = .{ .signedness = if (negative) .signed else .unsigned, .bits = Ir.native_pointer_bits } }) };
-        }
+        const source = try self.probe(range.source, depth + 1);
+        const index: ?Known = if (source) |known| if (self.ir.getType(known.ty).? == .range) .{ .ty = self.ir.getType(known.ty).?.range } else null else null;
         const scope = self.locals.items.len;
         defer self.restoreScope(scope);
         const token = ast.nodes.items(.main_token)[range.binding];
@@ -753,6 +742,23 @@ const Context = struct {
                     (try self.probeBreaks(loop.body, depth + 1)) orelse
                     (try self.probeBreaks(loop.continuation, depth + 1)) orelse
                     (if (loop.else_expr != 0) try self.probe(loop.else_expr, depth + 1) else null);
+            },
+            .range => blk: {
+                var element = (try self.probe(data.lhs, depth + 1)) orelse try self.probe(data.rhs, depth + 1);
+                if (element == null) infer: {
+                    const wide = try self.ir.internType(.{ .integer = .{ .signedness = .signed, .bits = 128 } });
+                    const diagnostics_start = self.module.diagnostics.items.len;
+                    defer self.module.diagnostics.shrinkRetainingCapacity(diagnostics_start);
+                    var negative = false;
+                    for ([_]Ast.Node.Index{ data.lhs, data.rhs }) |bound| switch (try Literal.check(self.module, self.ir, bound, wide, null)) {
+                        .constant => |id| negative = negative or self.ir.getConstant(id).?.value.signed_integer < 0,
+                        else => break :infer,
+                    };
+                    element = .{ .ty = try self.ir.internType(.{ .integer = .{ .signedness = if (negative) .signed else .unsigned, .bits = Ir.native_pointer_bits } }) };
+                }
+                const known = element orelse break :blk null;
+                if (self.ir.getType(known.ty).? != .integer) break :blk null;
+                break :blk .{ .ty = try self.ir.internType(.{ .range = known.ty }) };
             },
             .loop_range => try self.probeRange(node, depth),
             .@"if", .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod => .{ .ty = try self.ir.internType(.void) },
@@ -1547,17 +1553,17 @@ const Context = struct {
         return self.fit(string, expected, node);
     }
 
-    fn rangeExpression(self: *Context, node: Ast.Node.Index, expected: ?Known, depth: usize) Error!?Ir.TypeId {
+    fn rangeValue(self: *Context, node: Ast.Node.Index, expected: ?Known, depth: usize) Error!?Ir.TypeId {
         const ast = &self.module.source.ast;
-        const loop = ast.fullRange(node).?;
+        const data = ast.nodes.items(.data)[node];
         const unit = try self.ir.internType(.void);
-        var known = (try self.probe(loop.start, depth + 1)) orelse try self.probe(loop.end, depth + 1);
+        var known = (try self.probe(data.lhs, depth + 1)) orelse try self.probe(data.rhs, depth + 1);
         if (known == null) {
             // Only literal decoding participates in this range-specific default;
             // arithmetic expressions are deliberately not constant-folded here.
             const wide = try self.ir.internType(.{ .integer = .{ .signedness = .signed, .bits = 128 } });
             var negative = false;
-            for ([_]Ast.Node.Index{ loop.start, loop.end }) |bound| {
+            for ([_]Ast.Node.Index{ data.lhs, data.rhs }) |bound| {
                 switch (try Literal.check(self.module, self.ir, bound, wide, null)) {
                     .failed => return null,
                     .not_literal => {
@@ -1575,10 +1581,38 @@ const Context = struct {
         }
         const index_type = known.?.ty;
         if (self.ir.getType(index_type).? != .integer) return self.fail(.operator_not_supported, node, known.?.annotation);
-        if (try self.expression(loop.start, known, depth + 1) == null) return null;
+        if (try self.expression(data.lhs, known, depth + 1) == null) return null;
         if (self.terminated) return if (expected) |want| want.ty else unit;
-        if (try self.expression(loop.end, known, depth + 1) == null) return null;
+        if (try self.expression(data.rhs, known, depth + 1) == null) return null;
         if (self.terminated) return if (expected) |want| want.ty else unit;
+        const ty = try self.ir.internType(.{ .range = index_type });
+        if (self.emitter) |emitter| try emitter.record(node, ty, self.irSpan(node), .{ .range_init = .{
+            .start = try emitter.value(data.lhs),
+            .end = try emitter.value(data.rhs),
+            .inclusive = ast.tokens.items(.tag)[ast.nodes.items(.main_token)[node]] == .period_period_equal,
+        } });
+        return self.fit(ty, expected, node);
+    }
+
+    fn rangeExpression(self: *Context, node: Ast.Node.Index, expected: ?Known, depth: usize) Error!?Ir.TypeId {
+        const ast = &self.module.source.ast;
+        const loop = ast.fullRange(node).?;
+        const unit = try self.ir.internType(.void);
+        const source_type = (try self.expression(loop.source, null, depth + 1)) orelse return null;
+        if (self.terminated) return if (expected) |want| want.ty else unit;
+        const source = self.ir.getType(source_type).?;
+        if (source != .range) return self.fail(.operator_not_supported, loop.source, null);
+        const index_type = source.range;
+        const known: ?Known = .{ .ty = index_type };
+        var start_value: Ir.ValueId = undefined;
+        var end_value: Ir.ValueId = undefined;
+        var inclusive: Ir.ValueId = undefined;
+        if (self.emitter) |emitter| {
+            const value = try emitter.value(loop.source);
+            start_value = try emitter.append(index_type, self.irSpan(node), .{ .range_start = value });
+            end_value = try emitter.append(index_type, self.irSpan(node), .{ .range_end = value });
+            inclusive = try emitter.append(try self.ir.internType(.boolean), self.irSpan(node), .{ .range_inclusive = value });
+        }
         const binding_token = ast.nodes.items(.main_token)[loop.binding];
         const name = ast.tokenSlice(binding_token);
         const discard = std.mem.eql(u8, name, "_");
@@ -1604,8 +1638,8 @@ const Context = struct {
         var done: ?Ir.ValueId = null;
         const boolean = try self.ir.internType(.boolean);
         if (self.emitter) |emitter| {
-            counter = try emitter.append(index_type, self.irSpan(node), .{ .local_slot = try emitter.value(loop.start) });
-            if (loop.inclusive) {
+            counter = try emitter.append(index_type, self.irSpan(node), .{ .local_slot = start_value });
+            {
                 const initial = try emitter.append(boolean, self.irSpan(node), .{ .constant = try self.ir.internConstant(.{ .ty = boolean, .value = .{ .boolean = false } }) });
                 done = try emitter.append(boolean, self.irSpan(node), .{ .local_slot = initial });
             }
@@ -1616,7 +1650,10 @@ const Context = struct {
             } else null;
             const rhs_start: u32 = @intCast(emitter.instructions.items.len);
             const loaded = try emitter.append(index_type, self.irSpan(node), .{ .local_load = counter });
-            condition = try emitter.append(boolean, self.irSpan(node), .{ .binary = .{ .op = if (loop.inclusive) .le else .lt, .lhs = loaded, .rhs = try emitter.value(loop.end) } });
+            const less = try emitter.append(boolean, self.irSpan(node), .{ .binary = .{ .op = .lt, .lhs = loaded, .rhs = end_value } });
+            const equal = try emitter.append(boolean, self.irSpan(node), .{ .binary = .{ .op = .eq, .lhs = loaded, .rhs = end_value } });
+            const equal_inclusive = try emitter.append(boolean, self.irSpan(node), .{ .branch = .{ .condition = equal, .then_start = @intCast(emitter.instructions.items.len), .else_start = @intCast(emitter.instructions.items.len), .then_value = inclusive, .else_value = equal } });
+            condition = try emitter.append(boolean, self.irSpan(node), .{ .branch = .{ .condition = less, .then_start = @intCast(emitter.instructions.items.len), .else_start = @intCast(emitter.instructions.items.len), .then_value = less, .else_value = equal_inclusive } });
             if (active) |lhs| condition = try emitter.append(boolean, self.irSpan(node), .{ .short_circuit = .{ .kind = .@"and", .lhs = lhs, .rhs_start = rhs_start, .rhs = condition } });
         }
         const body_start: u32 = if (self.emitter) |emitter| @intCast(emitter.instructions.items.len) else 0;
@@ -1634,7 +1671,7 @@ const Context = struct {
             var then_start: u32 = 0;
             var exhausted: ?Ir.ValueId = null;
             if (done) |slot| {
-                at_end = try emitter.append(boolean, self.irSpan(node), .{ .binary = .{ .op = .eq, .lhs = old, .rhs = try emitter.value(loop.end) } });
+                at_end = try emitter.append(boolean, self.irSpan(node), .{ .binary = .{ .op = .eq, .lhs = old, .rhs = end_value } });
                 then_start = @intCast(emitter.instructions.items.len);
                 const yes = try emitter.append(boolean, self.irSpan(node), .{ .constant = try self.ir.internConstant(.{ .ty = boolean, .value = .{ .boolean = true } }) });
                 exhausted = try emitter.append(unit, self.irSpan(node), .{ .local_store = .{ .slot = slot, .value = yes } });
@@ -1812,6 +1849,7 @@ const Context = struct {
                 self.terminated = true;
                 return if (expected) |want| want.ty else unit;
             },
+            .range => return self.rangeValue(node, expected, depth),
             .loop_range => return self.rangeExpression(node, expected, depth),
             .loop_condition, .loop_cont, .loop_else => {
                 const loop = ast.fullLoop(node).?;
@@ -3824,5 +3862,47 @@ test "body checking rolls back diagnostics and owned storage on allocation failu
         "let f: () -> int = loop {if true {break 1} else {break false}}",
     }) |source| {
         try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+    }
+}
+
+test "reusable range values preserve exact inference and reject unsupported value uses" {
+    const cases = [_]struct { body: []const u8, accepted: bool }{
+        .{ .body = "{let r=0..2\nlet copy=r\nloop i in copy {let n: uint=i\n}}", .accepted = true },
+        .{ .body = "{let r=-1..2\nloop i in r {let n: int=i\n}}", .accepted = true },
+        .{ .body = "{let a: i8=-1\nlet r=a..2\nloop i in r {let n: i8=i\n}}", .accepted = true },
+        .{ .body = "{let r=if true {0..2} else {0..=3}\nloop i in r {}}", .accepted = true },
+        .{ .body = "{let r=loop _ in 0..1 {break 0..2} else {1..=2}\nloop i in r {}}", .accepted = true },
+        .{ .body = "{let r=0..2\nloop _ in r {}\nloop _ in r {}}", .accepted = true },
+        .{ .body = "{let r=1..2\nloop i in r {let n: int=i\n}}", .accepted = false },
+        .{ .body = "{let r=-1..2\nloop i in r {let n: uint=i\n}}", .accepted = false },
+        .{ .body = "{let a: i8=1\nlet b: i16=2\nlet r=a..b\n}", .accepted = false },
+        .{ .body = "{let mut r=0..2\nr=-1..2}", .accepted = false },
+        .{ .body = "{let mut r=0..2\nr.start=1}", .accepted = false },
+        .{ .body = "{let r=0..2\n@println(r.start)}", .accepted = false },
+        .{ .body = "{let r=0..2\nlet items=[r]\n}", .accepted = false },
+        .{ .body = "{let r=true..false\n}", .accepted = false },
+        .{ .body = "{loop i in true {}}", .accepted = false },
+        .{ .body = "{let r=0..2\nloop i in r {} else {@println(i)}}", .accepted = false },
+        .{ .body = "{let r=0..2\nlet n=42\n}", .accepted = false },
+        .{ .body = "{let r=if true {@as(i8, 0)..2} else {0..2}\n}", .accepted = false },
+        .{ .body = "{let r=0..2\nlet s=r..r\n}", .accepted = false },
+        .{ .body = "{let r=1 + 1..3\n}", .accepted = false },
+    };
+    for (cases) |case| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let f: () = {s}", .{case.body});
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "range-value-types.nov", source);
+        defer module.deinit();
+        errdefer std.debug.print("range value case: {s}\n", .{case.body});
+        try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        try std.testing.expectEqual(case.accepted, sema.lowering_complete);
+        try std.testing.expectEqual(!case.accepted, module.hasErrors());
+        if (case.accepted) try sema.ir.verify();
+        for (module.diagnostics.items) |diagnostic| {
+            try std.testing.expect(diagnostic.span.start < diagnostic.span.end);
+            try std.testing.expect(diagnostic.span.end <= source.len);
+        }
     }
 }

@@ -1343,20 +1343,35 @@ TODO
 
 ## Range
 
-The executable subset supports bounded ascending integer iteration only:
+Bounded integer ranges are reusable values describing ascending iteration:
 
 ```nov
 let accept: (n: uint) -> void = @println(n)
 let main: () = {
-    loop i in 0..10 {accept(i)}
+    let range = 0..10
+    loop i in range {accept(i)}
+    loop i in range {accept(i)} ; starts again from 0
     loop i in 0..=10 {accept(i)} ; includes 10
     loop _ in -2..2 {} ; discard the index
 }
 ```
 
-- Evaluate `start`, then `end`, exactly once before iteration, in the enclosing
-  scope. Both values are snapshots: changing their source bindings in the body
-  does not change the counter or endpoint. The index is not in scope in bounds.
+- `start..end` / `start..=end` evaluate `start`, then `end`, exactly once when
+  constructing the range. Stored bounds do not change when their source bindings
+  change later. Ranges copy by value, require no allocation, and are not consumable
+  iterators: each loop starts again from the stored start.
+- Each loop evaluates its source range expression once and snapshots both bounds
+  and inclusivity. Reassigning a mutable range binding in the body cannot change
+  an active loop. Inline bounds use the same construction and snapshot rules.
+  The index is not in scope while constructing or selecting the source range.
+- Range type identity depends on the exact integer endpoint type; inclusivity is
+  part of the value. Inferred locals, assignment/copies, and branch/block/loop
+  results can carry ranges, including mixed inclusive/exclusive branches. No new
+  source-level range annotation syntax is provided yet, so range parameters/return
+  signatures, fields, arrays, union payloads and globals remain unsupported.
+  Range field access, equality, membership and direct printing are not introduced.
+- Ordinary range operators bind above assignment and below pipes/other binary
+  operators; chaining `a..b..c` is rejected. Existing slice/match syntax is preserved.
 - `..` excludes the upper endpoint. `start >= end` is empty; otherwise increment
   by one. `..=` includes the upper endpoint; `start > end` is empty. Both
   forms are finite even at a maximum-integer endpoint: inclusive iteration exits
@@ -1379,8 +1394,8 @@ let main: () = {
   and reversed ranges. Source `break` (including at MAX) and `return` skip it;
   inclusive endpoint completion, including `continue` at MAX, does not skip it.
   `break value` and continuing fallback results use the same exact contextual or
-  bidirectional inference as conditional-loop results: bool, integer, string,
-  scalar array, or function, with no widening or general literal defaults.
+  bidirectional inference as conditional-loop results, including range values,
+  with no widening or general literal defaults.
   Arrays copy independently at break/fallback and result boundaries; immutable
   strings share rooted storage. Terminal fallback paths contribute no merge value.
 - Bounds use the enclosing control scope before the new loop starts. The fallback
@@ -1397,7 +1412,10 @@ let contains: (start: uint, end: uint, target: uint) -> bool = loop i in start..
 See [`examples/range-search.nov`](examples/range-search.nov) for executable
 exclusive/inclusive searches and overflow-free MAX exhaustion.
 
-Ranges are not general values or membership containers. Missing bounds,
+See [`examples/range-values.nov`](examples/range-values.nov) for stored bounds
+iterated twice, first to print 0 through 9 and then to compute a sum of 45.
+
+Ranges are not general iterable or membership containers. Missing bounds,
 steps/descending iteration, array/string/general iterators, multiple bindings,
 references, labels, user continuation clauses, and value breaks without `else`
 are explicitly unsupported. There is no `for` keyword alias. Header expressions

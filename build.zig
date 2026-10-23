@@ -122,6 +122,7 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const fixtures = b.addWriteFiles();
     addFieldMutationCliTests(b, exe, test_step, fixtures);
     addGenericStructCliTests(b, exe, test_step, fixtures);
+    addRangeValueCliTests(b, exe, test_step, fixtures);
     _ = fixtures.add("library-result-source.nov", @embedFile("lib/result.nov"));
     const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
     _ = fixtures.add("library-result.nov",
@@ -1627,4 +1628,49 @@ fn makeExe(b: *std.Build, options: ExecutableOptions) *std.Build.Step.Compile {
     exe.root_module.addImport("known-folders", known_folders);
 
     return exe;
+}
+
+fn addRangeValueCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step, fixtures: *std.Build.Step.WriteFile) void {
+    _ = fixtures.add("range-values.nov",
+        \\let main: () = {
+        \\    let mut range = 0..10
+        \\    let copy = range
+        \\    loop i in range {
+        \\        @print("{i} ")
+        \\        range = 8..=9
+        \\    }
+        \\    @println()
+        \\    loop i in copy {
+        \\        @print("{i} ")
+        \\    }
+        \\    @println()
+        \\    loop i in range {
+        \\        @print("{i} ")
+        \\    }
+        \\    @println()
+        \\}
+        \\
+    );
+    for ([_][]const u8{ "--debug", "--release" }) |mode| {
+        const run = b.addRunArtifact(exe);
+        run.step.name = b.fmt("CLI: reusable range values ({s})", .{mode});
+        run.setCwd(fixtures.getDirectory());
+        run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+        run.setEnvironmentVariable("NOV_CC", "");
+        run.setEnvironmentVariable("CC", "");
+        run.addArgs(&.{ "run", "range-values.nov", mode });
+        run.expectExitCode(0);
+        run.expectStdOutEqual("0 1 2 3 4 5 6 7 8 9 \n0 1 2 3 4 5 6 7 8 9 \n8 9 \n");
+        run.expectStdErrEqual("");
+        test_step.dependOn(&run.step);
+    }
+    for ([_][]const u8{ "check", "fmt" }) |command| {
+        const run = b.addRunArtifact(exe);
+        run.setCwd(fixtures.getDirectory());
+        run.addArgs(&.{ command, if (std.mem.eql(u8, command, "check")) "--semantic" else "--check", "range-values.nov" });
+        run.expectExitCode(0);
+        run.expectStdOutEqual("");
+        run.expectStdErrEqual("");
+        test_step.dependOn(&run.step);
+    }
 }

@@ -364,6 +364,7 @@ pub fn renderError(self: Ast, parse_error: Error, writer: anytype) !void {
     const token_tags = self.tokens.items(.tag);
     switch (parse_error.tag) {
         .unsupported_enum_backing => return writer.writeAll("explicit enum backing types are unsupported; use enum { ... }"),
+        .chained_range_operators => return writer.writeAll("range operators cannot be chained"),
         .chained_comparison_operators => {
             return writer.writeAll("comparison operators cannot be chained");
         },
@@ -399,7 +400,7 @@ pub fn renderError(self: Ast, parse_error: Error, writer: anytype) !void {
         //     });
         // },
         .unsupported_loop => return writer.writeAll("unsupported loop form; expected 'loop condition { ... }'"),
-        .unsupported_range_loop => return writer.writeAll("unsupported range loop; expected 'loop name in start..end { ... }' or 'loop name in start..=end { ... }' with both bounds; iterators and continuations are unsupported"),
+        .unsupported_range_loop => return writer.writeAll("unsupported range loop; expected 'loop name in range_expression { ... }'; ranges require both bounds, without steps or continuations"),
         .expected_decl => {
             return writer.print("expected declaration, found '{s}'", .{
                 token_tags[parse_error.token + @intFromBool(parse_error.token_is_prev)].symbol(),
@@ -706,6 +707,10 @@ pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
     var end_offset: TokenIndex = 0;
     while (true) switch (tags[n]) {
         .root => return @intCast(self.tokens.len - 1),
+        .range => {
+            if (datas[n].rhs == 0) return main_tokens[n] + end_offset;
+            n = datas[n].rhs;
+        },
         .@"continue" => return if (datas[n].lhs == 0) main_tokens[n] + end_offset else datas[n].lhs + end_offset,
         .@"break" => {
             if (datas[n].rhs == 0) return if (datas[n].lhs == 0) main_tokens[n] + end_offset else datas[n].lhs + end_offset;
@@ -1155,18 +1160,9 @@ pub fn fullDecl(self: Ast, node: Node.Index) ?full.Decl {
     };
 }
 
-pub fn fullRange(self: Ast, node: Node.Index) ?full.RangeLoop {
+pub fn fullRange(self: Ast, node: Node.Index) ?Node.RangeLoop {
     if (self.nodes.items(.tag)[node] != .loop_range) return null;
-    const range = self.extraData(self.nodes.items(.data)[node].lhs, Node.RangeLoop);
-    return .{
-        .binding = range.binding,
-        .start = range.start,
-        .end = range.end,
-        .body = range.body,
-        .else_expr = range.else_expr,
-        .range_token = range.range_token,
-        .inclusive = self.tokens.items(.tag)[range.range_token] == .period_period_equal,
-    };
+    return self.extraData(self.nodes.items(.data)[node].lhs, Node.RangeLoop);
 }
 
 pub fn fullLoop(self: Ast, node: Node.Index) ?struct { condition: Node.Index, continuation: Node.Index, body: Node.Index, else_expr: Node.Index = 0 } {
@@ -1282,15 +1278,6 @@ pub fn fullBlock(self: Ast, buffer: *[2]Node.Index, node: Node.Index) ?full.Bloc
 
 /// Fully assembled AST node information.
 pub const full = struct {
-    pub const RangeLoop = struct {
-        binding: Node.Index,
-        start: Node.Index,
-        end: Node.Index,
-        body: Node.Index,
-        else_expr: Node.Index,
-        range_token: TokenIndex,
-        inclusive: bool,
-    };
     // TODO: do we really need a separate struct for Decl just have a AttrDecl struct
     pub const Decl = struct {
         attributes: []const Node.Index,
@@ -1448,6 +1435,7 @@ pub const Error = struct {
 
     pub const Tag = enum {
         chained_comparison_operators,
+        chained_range_operators,
         attr_without_args,
         mismatched_binary_op_whitespace,
         invalid_ampersand_ampersand,
@@ -1641,7 +1629,7 @@ pub const Node = struct {
         /// rhs can be omitted.
         /// main_token is the `..` or `..=`.
         range,
-        /// Bounded integer iterator. `RangeLoop[lhs]`, rhs is the final body/else.
+        /// Iteration over a reusable bounds expression. `RangeLoop[lhs]`, rhs is the final body/else.
         loop_range,
         /// `loop lhs rhs`: optional boolean condition (0 for unconditional) and lexical body block.
         loop_condition,
@@ -1734,10 +1722,8 @@ pub const Node = struct {
     };
 
     pub const RangeLoop = struct {
-        range_token: TokenIndex,
         binding: Index,
-        start: Index,
-        end: Index,
+        source: Index,
         body: Index,
         else_expr: Index,
     };

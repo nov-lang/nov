@@ -95,6 +95,7 @@ fn checkSupported(ast: Ast) !void {
         .match_case_one,
         .match_case,
         .function_pipe,
+        .range,
         .loop_range,
         .loop_condition,
         .loop_cont,
@@ -231,17 +232,7 @@ fn sameStructure(a: Ast, b: Ast) bool {
     const tags = a.nodes.items(.tag);
     if (!std.mem.eql(Ast.Node.Tag, tags, b.nodes.items(.tag)) or
         a.extra_data.len != b.extra_data.len) return false;
-    for (a.extra_data, b.extra_data, 0..) |x, y, i| {
-        if (x == y) continue;
-        // Raw range-token indices can shift when newlines are formatted.
-        // Compare token spelling instead; all node indices remain exact.
-        for (tags, a.nodes.items(.data)) |tag, data| {
-            if (tag == .loop_range and data.lhs == i) {
-                if (!std.mem.eql(u8, a.tokenSlice(x), b.tokenSlice(y))) return false;
-                break;
-            }
-        } else return false;
-    }
+    if (!std.mem.eql(Ast.Node.Index, a.extra_data, b.extra_data)) return false;
     for (tags, a.nodes.items(.data), b.nodes.items(.data)) |tag, x, y| {
         switch (tag) {
             .attr_one => if (!std.mem.eql(u8, a.tokenSlice(x.lhs), b.tokenSlice(y.lhs)) or x.rhs != y.rhs) return false,
@@ -481,19 +472,19 @@ test "executable local blocks round trip" {
 
 test "every unsupported AST tag is rejected before rendering" {
     const supported = [_]Ast.Node.Tag{
-        .root,               .decl,                 .identifier,     .number_literal,   .char_literal,      .string_literal,
-        .add,                .sub,                  .mul,            .div,              .mod,               .shl,
-        .shr,                .bit_and,              .bit_or,         .bit_xor,          .equal_equal,       .bang_equal,
-        .less_than,          .less_or_equal,        .greater_than,   .greater_or_equal, .bool_and,          .bool_or,
-        .negation,           .bool_not,             .bit_not,        .fn_proto_one,     .fn_proto,          .call_one,
-        .call_one_comma,     .call,                 .call_comma,     .block_two,        .block_two_newline, .block,
-        .block_newline,      .@"if",                .if_else,        .loop_range,       .loop_condition,    .loop_cont,
-        .loop_else,          .@"return",            .@"break",       .@"continue",      .assign,            .assign_add,
-        .assign_sub,         .assign_mul,           .assign_div,     .assign_mod,       .builtin_literal,   .array_type,
-        .array_init_two,     .array_init_two_comma, .array_init,     .array_init_comma, .array_access,      .field_access,
-        .in,                 .match,                .match_case_one, .match_case,       .function_pipe,     .container_decl,
-        .container_decl_arg, .container_field,      .unwrap,         .enum_literal,     .attr_one,          .attr_decl_one,
-        .attr_decl,
+        .root,           .decl,               .identifier,           .number_literal,   .char_literal,      .string_literal,
+        .add,            .sub,                .mul,                  .div,              .mod,               .shl,
+        .shr,            .bit_and,            .bit_or,               .bit_xor,          .equal_equal,       .bang_equal,
+        .less_than,      .less_or_equal,      .greater_than,         .greater_or_equal, .bool_and,          .bool_or,
+        .negation,       .bool_not,           .bit_not,              .fn_proto_one,     .fn_proto,          .call_one,
+        .call_one_comma, .call,               .call_comma,           .block_two,        .block_two_newline, .block,
+        .block_newline,  .@"if",              .if_else,              .range,            .loop_range,        .loop_condition,
+        .loop_cont,      .loop_else,          .@"return",            .@"break",         .@"continue",       .assign,
+        .assign_add,     .assign_sub,         .assign_mul,           .assign_div,       .assign_mod,        .builtin_literal,
+        .array_type,     .array_init_two,     .array_init_two_comma, .array_init,       .array_init_comma,  .array_access,
+        .field_access,   .in,                 .match,                .match_case_one,   .match_case,        .function_pipe,
+        .container_decl, .container_decl_arg, .container_field,      .unwrap,           .enum_literal,      .attr_one,
+        .attr_decl_one,  .attr_decl,
     };
     var ast = try Parser.parse(std.testing.allocator, "let x=1\n");
     defer ast.deinit(std.testing.allocator);
@@ -515,11 +506,11 @@ test "every unsupported AST tag is rejected before rendering" {
     }
 }
 
-test "membership formatting preserves syntactic operands but rejects ranges" {
+test "membership formatting preserves syntactic operands and range expressions" {
     try expectFormatted("let f:(a:[]i8)->bool=-1 in a\n", "let f: (a: []i8) -> bool = -1 in a\n");
     try expectFormatted("let f:()->bool=true in [false,true,]\n", "let f: () -> bool = true in [false, true,]\n");
     try expectFormatted("let f:(n:int)->bool=n in [\n; values\n1,2,]\n", "let f: (n: int) -> bool = n in [\n    ; values\n    1,\n    2,\n]\n");
-    try std.testing.expectError(error.InvalidSource, format(std.testing.allocator, "let f: (n: int) -> bool = n in 1..3\n"));
+    try expectFormatted("let f: (n: int) -> bool = n in 1..3\n", "let f: (n: int) -> bool = n in 1..3\n");
     try std.testing.expectError(error.UnsupportedSyntax, format(std.testing.allocator, "let f: (n: int, a: []int) -> bool = n in a[1..3]\n"));
 }
 
@@ -750,7 +741,7 @@ test "inclusive range formatting preserves comments and is idempotent" {
     defer std.testing.allocator.free(formatted);
     try expectFormatted(source, formatted);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{"let f: ()=loop i in 0..= ; upper\n2 {loop j in 0..=i {continue}}"});
-    try std.testing.expectError(error.InvalidSource, format(std.testing.allocator, "let x = 0..=2"));
+    try expectFormatted("let x=0..=2", "let x = 0..=2\n");
 }
 
 test "range else formatting preserves comments newlines and idempotent metadata" {
