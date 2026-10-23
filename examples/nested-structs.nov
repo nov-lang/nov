@@ -1,0 +1,22 @@
+let Location = struct {
+    city: string,
+    visits: uint = 0,
+}
+
+let Profile = struct {
+    name: string,
+    location: Location,
+
+    let toString: (self: Profile) -> string = {
+        "{self.name}: {self.location.city} ({self.location.visits})"
+    }
+}
+
+let main: () = {
+    let mut profile = Profile[ .name = "Ada", .location = Location[ .city = "Paris" ] ]
+    let original = profile
+    profile.location.city += " updated"
+    profile.location.visits += 2
+    @println(profile)
+    @println(original)
+}

@@ -45,7 +45,7 @@ pub const Operation = union(enum) {
     record_init: []const ValueId,
     field_read: FieldRead,
     /// Update only this field of the current mutable local, not a record snapshot.
-    field_store: struct { slot: ValueId, index: u32, value: ValueId },
+    field_store: struct { slot: ValueId, index: u32, value: ValueId, path: []const u32 = &.{} },
     /// Decimal integers, true/false booleans, or a shared immutable string.
     to_string: ValueId,
     array_literal: []const ValueId,
@@ -110,7 +110,7 @@ pub const Operation = union(enum) {
 };
 
 pub const Field = struct { name: []const u8, ty: TypeId, span: Span, default: ?ConstId = null };
-/// Nominal aggregate layout. Tagged layouts have one active scalar or flat record payload.
+/// Nominal by-value layout. Tagged layouts have one active scalar or record payload.
 pub const Record = struct {
     source: Source.Id = @enumFromInt(0),
     identity: u32,
@@ -170,6 +170,9 @@ pub const ValidationError = error{
 };
 pub const InternError = ValidationError || std.mem.Allocator.Error || error{TooManyEntries};
 pub const VerifyError = ValidationError || error{
+    CyclicRecordLayout,
+    RecordNestingLimit,
+    OutOfMemory,
     NonCanonicalType,
     NonCanonicalConstant,
     InvalidFunctionId,
@@ -273,6 +276,7 @@ pub fn setFunctionBody(self: *Ir, id: FunctionId, instructions: []const Instruct
             .call => |*call| call.args = try self.allocator.dupe(ValueId, call.args),
             .print => |*print| print.args = try self.allocator.dupe(ValueId, print.args),
             .array_literal, .record_init => |*elements| elements.* = try self.allocator.dupe(ValueId, elements.*),
+            .field_store => |*store| store.path = try self.allocator.dupe(u32, store.path),
             else => {},
         }
         copied += 1;
@@ -285,6 +289,7 @@ fn freeOperands(self: *Ir, op: Operation) void {
         .call => |call| self.allocator.free(call.args),
         .print => |print| self.allocator.free(print.args),
         .array_literal, .record_init => |elements| self.allocator.free(elements),
+        .field_store => |store| self.allocator.free(store.path),
         else => {},
     }
 }
@@ -411,7 +416,64 @@ pub fn verify(self: *const Ir) VerifyError!void {
     for (self.functions.items) |function| {
         if (function.body == null) return error.MissingFunctionBody;
     }
+    if (try self.recordLayoutIssue()) |issue| return if (issue.cycle) error.CyclicRecordLayout else error.RecordNestingLimit;
     for (self.functions.items) |function| try self.validateBody(function, function.body.?);
+}
+
+/// Bounds all later recursive backend walks, including source-free forged IR.
+pub const max_record_depth = 128;
+pub const LayoutIssue = struct { span: Span, related: Span, cycle: bool };
+
+/// Iterative tri-color DFS, linear in graph size even for diamond layouts.
+/// Completed subtree heights enforce the limit independently of visitation order.
+pub fn recordLayoutIssue(self: *const Ir) (std.mem.Allocator.Error || error{InvalidTypeId})!?LayoutIssue {
+    var has_record = false;
+    for (self.types.items) |ty| {
+        if (ty == .record) has_record = true;
+    }
+    if (!has_record) return null;
+    const State = struct { color: enum { white, gray, black } = .white, height: usize = 1 };
+    const states = try self.allocator.alloc(State, self.types.items.len);
+    defer self.allocator.free(states);
+    @memset(states, .{});
+    const Frame = struct { id: TypeId, next: usize = 0 };
+    var stack: [max_record_depth]Frame = undefined;
+    for (self.types.items, 0..) |ty, root| {
+        if (ty != .record or states[root].color != .white) continue;
+        stack[0] = .{ .id = @enumFromInt(root) };
+        states[root].color = .gray;
+        var len: usize = 1;
+        while (len != 0) {
+            const frame = &stack[len - 1];
+            const index = @intFromEnum(frame.id);
+            const fields = self.types.items[index].record.fields;
+            if (frame.next == fields.len) {
+                states[index].color = .black;
+                len -= 1;
+                continue;
+            }
+            const field = fields[frame.next];
+            const child = @intFromEnum(field.ty);
+            const ft = self.getType(field.ty) orelse return error.InvalidTypeId;
+            if (ft != .record) {
+                frame.next += 1;
+                continue;
+            }
+            const related = if (ft.record.fields.len != 0) ft.record.fields[0].span else field.span;
+            if (states[child].color == .gray) return .{ .span = field.span, .related = related, .cycle = true };
+            if (states[child].color == .white) {
+                if (len == stack.len) return .{ .span = field.span, .related = related, .cycle = false };
+                states[child].color = .gray;
+                stack[len] = .{ .id = field.ty };
+                len += 1;
+                continue;
+            }
+            states[index].height = @max(states[index].height, states[child].height + 1);
+            if (states[index].height > max_record_depth) return .{ .span = field.span, .related = related, .cycle = false };
+            frame.next += 1;
+        }
+    }
+    return null;
 }
 
 fn validateSpan(self: *const Ir, span: Span) VerifyError!void {
@@ -656,7 +718,12 @@ fn validateBody(self: *const Ir, function: Function, body: Body) VerifyError!voi
             },
             .field_store => |store| {
                 if (ty != .void) return error.InvalidOperation;
-                const base = self.getType(try slotType(body, store.slot, i)).?;
+                var base = self.getType(try slotType(body, store.slot, i)).?;
+                if (store.path.len >= max_record_depth) return error.InvalidOperation;
+                for (store.path) |index| {
+                    if (base != .record or base.record.tagged or index >= base.record.fields.len) return error.InvalidOperation;
+                    base = self.getType(base.record.fields[index].ty) orelse return error.InvalidTypeId;
+                }
                 if (base != .record or base.record.tagged or store.index >= base.record.fields.len) return error.InvalidOperation;
                 if (try operandType(body, store.value, i) != base.record.fields[store.index].ty) return error.OperandTypeMismatch;
             },
@@ -911,16 +978,15 @@ pub fn isManaged(ty: Type) bool {
     return ty == .array or ty == .string or ty == .record;
 }
 
-/// Ordinary flat records retain nominal identity as union payloads. Their own
-/// layout is independently validated, so neither cycles nor deeper aggregates
-/// become valid through a tagged parent.
+/// Untagged records retain nominal identity as union payloads. Layout graph
+/// validation independently rejects cycles and excessive by-value depth.
 pub fn isUnionPayload(ty: Type) bool {
     return isRecordField(ty) or ty == .void or (ty == .record and !ty.record.tagged);
 }
 
 /// Record fields use semantic integer limits, not array/backend storage widths.
 pub fn isRecordField(ty: Type) bool {
-    return ty == .enumeration or ty == .boolean or ty == .string or (ty == .integer and ty.integer.bits > 0 and ty.integer.bits <= 128);
+    return ty == .enumeration or ty == .boolean or ty == .string or (ty == .record and !ty.record.tagged) or (ty == .integer and ty.integer.bits > 0 and ty.integer.bits <= 128);
 }
 
 pub fn isArrayElement(ty: Type) bool {
@@ -993,7 +1059,7 @@ test "record field integer widths follow IR limits independently of array elemen
     try std.testing.expect(!isRecordField(.{ .integer = .{ .bits = 0, .signedness = .signed } }));
     try std.testing.expect(!isRecordField(.{ .integer = .{ .bits = 129, .signedness = .unsigned } }));
     try std.testing.expect(!isRecordField(.void));
-    try std.testing.expect(!isRecordField(ir.getType(record).?));
+    try std.testing.expect(isRecordField(ir.getType(record).?));
 }
 
 test "generic nominal keys own canonical arguments and do not collapse identical layouts" {
@@ -1015,7 +1081,7 @@ test "generic nominal keys own canonical arguments and do not collapse identical
     owned[0] = boolean;
 }
 
-test "record payload layouts reject nested aggregates cycles and forged nominal operands" {
+test "record payload layouts reject tagged fields and forged nominal operands" {
     var ir = Ir.init(std.testing.allocator);
     defer ir.deinit();
     const span: Span = .{ .start = 0, .end = 0 };
@@ -1027,7 +1093,7 @@ test "record payload layouts reject nested aggregates cycles and forged nominal 
     try ir.setRecordFields(r, &.{.{ .name = "s", .ty = text, .span = span }});
     try ir.setRecordFields(other, &.{.{ .name = "s", .ty = text, .span = span }});
     try ir.setRecordFields(u, &.{.{ .name = "ok", .ty = r, .span = span }});
-    for ([_]TypeId{ r, u, other, array }) |invalid| {
+    for ([_]TypeId{ u, array }) |invalid| {
         try std.testing.expectError(error.InvalidArrayElement, ir.setRecordFields(r, &.{.{ .name = "nested", .ty = invalid, .span = span }}));
     }
     try std.testing.expectError(error.InvalidArrayElement, ir.setRecordFields(u, &.{.{ .name = "nested", .ty = u, .span = span }}));
@@ -3186,4 +3252,45 @@ test "body insertion checks referenced signatures and verification checks pools 
 
 test "function ownership and body publication survive every allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, testFunctionAllocationFailures, .{});
+}
+
+test "nested records bounded graph validation rejects forged cycles and deep layouts" {
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    const span: Span = .{ .start = 0, .end = 0 };
+    var ids: [max_record_depth + 1]TypeId = undefined;
+    for (&ids, 0..) |*id, i| id.* = try ir.internType(.{ .record = .{ .identity = @intCast(i), .fields = &.{} } });
+    for (ids[0 .. max_record_depth - 1], ids[1..max_record_depth]) |id, child| {
+        try ir.setRecordFields(id, &.{.{ .name = "next", .ty = child, .span = span }});
+    }
+    try ir.verify();
+    try ir.setRecordFields(ids[max_record_depth], &.{.{ .name = "head", .ty = ids[0], .span = span }});
+    try std.testing.expectError(error.RecordNestingLimit, ir.verify());
+    try ir.setRecordFields(ids[max_record_depth], &.{});
+    try ir.setRecordFields(ids[max_record_depth - 1], &.{.{ .name = "back", .ty = ids[0], .span = span }});
+    try std.testing.expectError(error.CyclicRecordLayout, ir.verify());
+    try ir.setRecordFields(ids[max_record_depth - 1], &.{});
+    const fields = @constCast(ir.types.items[@intFromEnum(ids[0])].record.fields);
+    const saved = fields[0].ty;
+    fields[0].ty = ids[0];
+    try std.testing.expectError(error.CyclicRecordLayout, ir.verify());
+    fields[0].ty = @enumFromInt(std.math.maxInt(u32));
+    try std.testing.expectError(error.InvalidTypeId, ir.verify());
+    fields[0].ty = saved;
+    try ir.verify();
+}
+
+test "nested records diamond graph traversal completes without expanding value paths" {
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    var child = try ir.internType(.{ .record = .{ .identity = 0, .fields = &.{} } });
+    for (1..100) |i| {
+        const parent = try ir.internType(.{ .record = .{ .identity = @intCast(i), .fields = &.{} } });
+        try ir.setRecordFields(parent, &.{
+            .{ .name = "left", .ty = child, .span = .{ .start = 0, .end = 0 } },
+            .{ .name = "right", .ty = child, .span = .{ .start = 0, .end = 0 } },
+        });
+        child = parent;
+    }
+    try ir.verify();
 }

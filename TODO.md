@@ -1,13 +1,22 @@
 # TODO
 
+Acyclic nested nominal struct fields and mutable-local nested field paths now work,
+including aliases/imports/forward layouts and nested structs as union payloads.
+Value copies have independent struct storage; immutable strings share backing.
+Recursive layouts or depth over 128 aggregate levels diagnose; nested values must
+be supplied explicitly (scalar literal defaults unchanged). C topological layouts
+and recursively flattened string-owner roots preserve GC safety. Validation includes
+late generic layouts, forged cycles, deep graphs and zero-root diamond performance.
+See examples/nested-structs.nov. Array/union/function fields remain unsupported.
+
 Direct mutable-local struct fields support exact bool/integer/string/enum assignment,
 integer +=/-=/*=//=/%= and string +=. Compounds snapshot the old field before RHS;
 final stores change only that field in the current local, preserving other-field
 and whole-record RHS changes. Terminal RHS skips the pending operation/store.
 Copies remain independent, strings share immutable storage, and string owners stay
-rooted. No nested/temporary/union/parameter/pointer mutation or implicit borrowing.
-See examples/struct-mutation.nov. Nested records, broader arrays and generic structs
-are the next aggregate foundations; prioritized roadmap is in local PLAN.md.
+rooted. No temporary/union/parameter/pointer mutation or implicit borrowing.
+See examples/struct-mutation.nov. Broader arrays and generic structs are next;
+prioritized roadmap is in local PLAN.md.
 
 Option.isSome/isNone and Result.isOk/isErr are ordinary public bool-returning
 methods that test only the active variant, without unwrapping or inspecting payloads.
@@ -62,11 +71,11 @@ exact toString printing/interpolation reuse container rules. Enum leaves add no 
 roots; internal uint32 ordinals expose no numeric/FFI policy. Numbered values,
 backing types, numeric conversions/arithmetic/ordering and arrays remain unsupported. structured-errors.nov now handles an enum .not_found kind.
 
-Flat nominal records now work as ordinary/generic union payloads, retaining exact
+Acyclic nominal records now work as ordinary/generic union payloads, retaining exact
 identity through aliases, constructors, captures, copies and .! propagation. C
 layouts are dependency-ordered and every nested string owner is rooted; inactive
-payload fields are zeroed. Nested record fields, nested union/array/function
-payloads and recursive layouts remain unsupported. Reachable wide scalar leaves
+payload fields are zeroed. Nested union/array/function payloads and recursive
+layouts remain unsupported. Reachable wide scalar leaves
 still produce backend width diagnostics at the leaf field.
 
 Record interpolation now uses the same exact container toString method as print,
@@ -98,8 +107,7 @@ Expansion is bounded at 64 levels. Structural `.!` requires exactly `ok`/`err`
 variants, evaluates once, yields success or constructs/returns the enclosing error
 variant with identical error type. Ordinary returns never implicitly wrap payloads.
 Generic structs, general comptime/value parameters, nested union/
-array/function payloads, nested record fields, explicit tag enums and Option
-propagation remain deferred.
+array/function payloads and explicit tag enums remain deferred.
 The filesystem error example remains design-only: filesystem APIs and file-resource
 semantics are missing and intentionally deprioritized; imports are implemented.
 

@@ -67,8 +67,11 @@ pub fn build(b: *std.Build) void {
         release.dependOn(&install.step);
     }
 
-    const tests = b.addTest(.{ .root_module = exe.root_module });
+    const test_filter = b.option([]const u8, "test-filter", "Run matching unit tests");
+    const tests = b.addTest(.{ .root_module = exe.root_module, .filters = if (test_filter) |filter| &.{filter} else &.{} });
+    const unit_step = b.step("test-unit", "Run unit and generated-C tests");
     const run_tests = b.addRunArtifact(tests);
+    unit_step.dependOn(&run_tests.step);
     // Generated-C tests compile with the pinned toolchain's `zig cc`.
     run_tests.setEnvironmentVariable("NOV_TEST_ZIG", b.graph.zig_exe);
     const test_step = b.step("test", "Run tests");

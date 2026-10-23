@@ -1027,16 +1027,36 @@ const Context = struct {
                 if (ty == .array or ty == .string) return self.fail(.unsupported_array_length_write, data.lhs, null);
             }
         }
-        if (ast.nodes.items(.tag)[target.lhs] != .identifier) return self.fail(.unsupported_assignment_target, data.lhs, null);
-        const binding_name = self.module.sourceSlice(self.span(target.lhs)).?;
+        var path_nodes: [Ir.max_record_depth]Ast.Node.Index = undefined;
+        var path_len: usize = 0;
+        var root = target.lhs;
+        while (ast.nodes.items(.tag)[root] == .field_access) {
+            if (path_len == path_nodes.len) return self.fail(.record_layout_limit, data.lhs, null);
+            path_nodes[path_len] = root;
+            path_len += 1;
+            root = ast.nodes.items(.data)[root].lhs;
+        }
+        if (ast.nodes.items(.tag)[root] != .identifier) return self.fail(.unsupported_assignment_target, data.lhs, null);
+        const binding_name = self.module.sourceSlice(self.span(root)).?;
         const binding = self.bindings.get(binding_name) orelse {
             if (self.module.lookup(binding_name)) |id| return self.fail(.immutable_assignment, target.lhs, self.module.getDeclaration(id).?.name_span);
             return self.fail(.unknown_name, target.lhs, null);
         };
-        const record = self.ir.getType(binding.known.ty).?;
+        var record_id = binding.known.ty;
+        var path: [Ir.max_record_depth]u32 = undefined;
+        for (0..path_len) |p| {
+            const access = path_nodes[path_len - p - 1];
+            const part = ast.tokenSlice(ast.nodes.items(.data)[access].rhs);
+            const current = self.ir.getType(record_id).?;
+            if (current != .record or current.record.tagged) return self.fail(.unsupported_assignment_target, access, null);
+            const index = self.fieldIndex(record_id, part) orelse return self.fail(.unknown_field, access, null);
+            path[p] = index;
+            record_id = current.record.fields[index].ty;
+        }
+        const record = self.ir.getType(record_id).?;
         if (record != .record or record.record.tagged) return self.fail(.unsupported_assignment_target, data.lhs, null);
-        if (!binding.mutable) return self.fail(.immutable_assignment, target.lhs, binding.name_span);
-        const index = self.fieldIndex(binding.known.ty, name) orelse return self.fail(.unknown_field, data.lhs, null);
+        if (!binding.mutable) return self.fail(.immutable_assignment, root, binding.name_span);
+        const index = self.fieldIndex(record_id, name) orelse return self.fail(.unknown_field, data.lhs, null);
         const field = record.record.fields[index];
         const tag = ast.nodes.items(.tag)[node];
         const compound = tag != .assign;
@@ -1060,7 +1080,7 @@ const Context = struct {
                     .lhs = try emitter.value(data.lhs),
                     .rhs = value,
                 } });
-                try emitter.record(node, unit, self.irSpan(node), .{ .field_store = .{ .slot = binding.slot.?, .index = index, .value = value } });
+                try emitter.record(node, unit, self.irSpan(node), .{ .field_store = .{ .slot = binding.slot.?, .index = index, .value = value, .path = try emitter.allocator.dupe(u32, path[0..path_len]) } });
             }
         }
         return self.fit(unit, expected, node);

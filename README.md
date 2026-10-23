@@ -676,15 +676,19 @@ The delivered subset is deliberately bounded:
   aliases work in annotations, method signatures, constructors and static calls.
   Forward module type names and method signatures are supported.
 - Named fields require explicit `bool`, integer (including `i128`/`u128` and native
-  `int`/`uint`), immutable `string`, or nominal enum types (including aliases). Semantic checking
+  `int`/`uint`), immutable `string`, nominal enum, or acyclic nominal struct types
+  (including aliases). Semantic checking
   uses the same integer-width and literal-bound rules as scalar values. The C
   backend still supports only 8/16/32/64-bit integers: a reachable record layout
   containing a 128-bit field fails C emission with a backend width diagnostic;
   an unused record layout adds no backend requirement or emitted definition.
   Array element restrictions are unchanged. Fields end with a comma. A field may have a literal default of its exact type, with ordinary
   literal-bound checks. Defaults cannot call functions, compute values, reference
-  globals or interpolate strings. Nested/recursive records, array/function/void/
-  float fields and record arrays are rejected, not partially implemented.
+  globals or interpolate strings. Aggregate defaults are not supported: nested
+  struct values must be supplied explicitly. Recursive by-value layouts and layouts
+  deeper than 128 aggregate levels diagnose, including aliases/imports and late
+  generic instantiations. Array/union/function/void/float fields and record arrays
+  remain unsupported.
 - Construct explicitly with `MyType[ .x = 5, .z = true ]` (or `Alias[...]`).
   Empty `MyType[]` works only when every field has a default. Unknown, duplicate,
   missing required and mistyped fields diagnose. Supplied expressions evaluate
@@ -698,7 +702,8 @@ The delivered subset is deliberately bounded:
   branches and loop results copy record field values; immutable strings share
   their backing storage. Replacing a mutable record binding does not change copies.
 - Fields of a direct mutable local support `item.field = value` with exact bool,
-  integer, string or enum type. Integer fields support `+= -= *= /= %=`, with the
+  integer, string, enum or struct type. Nested paths such as `item.inner.count += 1`
+  and exact-type subrecord replacements are supported. Integer fields support `+= -= *= /= %=`, with the
   same wrapping/division/panic rules as scalar integers; string fields support `+=`.
   These assignments yield void. A real struct field named `len` is writable;
   array/string lengths remain read-only.
@@ -710,9 +715,12 @@ The delivered subset is deliberately bounded:
   stable local field storage, not the whole-array snapshot update rule.
 - Field mutation does not alter earlier value copies or immutable string backing.
   Immutable bindings/ordinary parameters (including `self`), union payloads/tags,
-  temporary values, nested paths and pointer-based targets remain unsupported or
+  temporary values and pointer-based targets remain unsupported or
   diagnose immutable assignment. No implicit mutable receiver or borrowing is added.
-  See [examples/struct-mutation.nov](examples/struct-mutation.nov).
+  See [examples/struct-mutation.nov](examples/struct-mutation.nov) and
+  [examples/nested-structs.nov](examples/nested-structs.nov). Nested record copies
+  have independent value storage at every level; immutable string backing shares.
+  C declarations follow dependency order and GC roots flatten all nested owners.
 - Container declarations are ordinary explicitly typed functions, not runtime
   initializers. Methods have their own container scope; they can call sibling or
   recursive methods by name. Outside that scope use `MyType.method(args...)` (an
@@ -748,7 +756,7 @@ The delivered subset is deliberately bounded:
   incomplete. This does not change C export policy. Duplicate, unknown or invalidly
   placed attributes diagnose instead of being ignored.
 
-C emission uses flat stack value structs with index-mangled fields and injectively
+C emission uses stack value structs with index-mangled fields and injectively
 mangled method symbols. Reachable layouts precede function-pointer typedefs and
 prototypes. Record temporaries live at function scope, including skipped-branch
 slots; every string field's actual `void *owner` is rooted across allocations.
@@ -807,7 +815,7 @@ let z = [ 10, 20, 30 ]
 Ordinary module declarations such as `let Value = union { number: int, text: string, empty, }`
 introduce nominal tagged value types. Separate declarations remain distinct; aliases
 preserve identity. The current executable subset supports bool, integer, string,
-void, enum, and existing flat nominal struct payloads, with no payload defaults. As with structs, integer fields are
+void, enum, and existing acyclic nominal struct payloads, with no payload defaults. As with structs, integer fields are
 checked semantically through 128 bits, while reachable C layouts require
 8/16/32/64-bit widths.
 
@@ -825,11 +833,11 @@ checked semantically through 128 bits, while reachable C layouts require
   checks the active tag in all build modes.
 - Non-generic union methods and `@[public]` use the same bounded container rules
   as structs, including exact `toString` printing. Visibility is metadata only.
-- Flat record payloads retain exact nominal identity and value-copy semantics;
+- Record payloads, including nested structs, retain exact nominal identity and value-copy semantics;
   their string fields share immutable storage. Constructors, captures and `.!`
   work with records and aliases. C emits payload record layouts before containing
   unions and roots each nested string owner, with inactive payload fields zeroed.
-- Explicit tag enums, nested union/array/function payloads, nested record fields, variant-pattern
+- Explicit tag enums, nested union/array/function payloads, variant-pattern
   alternatives, nested destructuring, direct payload field access, union equality
   and union globals remain unsupported.
 
@@ -999,7 +1007,7 @@ or inspecting the payload, including for `Option(void)` and `some[false]`.
 `unwrapOr(fallback)` returns the payload or an eagerly evaluated fallback argument.
 `unwrapOrElse(callback)` returns the payload or calls a zero-argument `() -> T`
 callback only for `none`. These are ordinary generic methods, not compiler
-special cases. Aliases, value-copy semantics, supported scalar/flat-record payloads,
+special cases. Aliases, value-copy semantics, supported scalar/record payloads,
 and void construction/matching follow the existing generic union rules.
 `value.!` evaluates an Option-shaped union once, yields its `some` payload, or
 constructs and returns `.none[]` from the enclosing Option-shaped result. Both

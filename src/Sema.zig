@@ -48,6 +48,7 @@ pub fn analyzeAnnotations(module: *Module) Error!Sema {
     errdefer result.deinit();
     result.ir.source_len = @intCast(module.source.ast.source.len);
     try result.analyzeModuleAnnotations(module);
+    try result.finalizeRecordLayouts(module);
     return result;
 }
 
@@ -170,25 +171,62 @@ fn analyzeModuleAnnotations(result: *Sema, module: *Module) Error!void {
                 try module.diagnostics.append(module.allocator, .{ .tag = .unsupported_type, .span = module.tokenSpan(module.source.ast.firstToken(data.lhs)) });
                 continue;
             }
-            var default: ?Ir.ConstId = null;
-            if (data.rhs != 0) {
-                if (tagged) {
-                    try module.diagnostics.append(module.allocator, .{ .tag = .unsupported_union_default, .span = module.tokenSpan(module.source.ast.firstToken(data.rhs)) });
-                    continue;
-                }
-                switch (try Literal.check(module, &result.ir, data.rhs, ty, span)) {
-                    .constant => |constant| default = constant,
-                    .failed => continue,
-                    .not_literal => {
-                        try module.diagnostics.append(module.allocator, .{ .tag = .invalid_field_default, .span = module.tokenSpan(module.source.ast.firstToken(data.rhs)) });
-                        continue;
-                    },
-                }
-            }
-            try fields.append(module.allocator, .{ .name = name, .ty = ty, .span = span, .default = default });
+            try fields.append(module.allocator, .{ .name = name, .ty = ty, .span = span });
         }
         if (tagged and fields.items.len == 0) try module.diagnostics.append(module.allocator, .{ .tag = .empty_union, .span = declaration.name_span });
         try result.ir.setRecordFields(result.entries[result.entryIndex(module, @enumFromInt(i))].alias_type.?, fields.items);
+    }
+}
+
+fn validateRecordLayouts(self: *Sema, root: *Module) Error!bool {
+    if (try self.ir.recordLayoutIssue()) |issue| {
+        const owner = if (self.compilation) |comp| comp.getModule(issue.span.source).? else root;
+        try owner.diagnostics.append(owner.allocator, .{ .tag = if (issue.cycle) .record_layout_cycle else .record_layout_limit, .span = issue.span, .related = issue.related });
+        return false;
+    }
+    return true;
+}
+
+/// Finalize the entire placeholder graph before defaults or any body can use it.
+fn finalizeRecordLayouts(self: *Sema, root: *Module) Error!void {
+    if (!try self.validateRecordLayouts(root)) return;
+    if (self.compilation) |comp| {
+        for (comp.modules.items) |module| try self.finalizeFieldDefaults(module);
+    } else try self.finalizeFieldDefaults(root);
+}
+
+fn finalizeFieldDefaults(self: *Sema, module: *Module) Error!void {
+    const ast = &module.source.ast;
+    for (module.declarations.items, 0..) |declaration, i| {
+        if (!declaration.is_record or declaration.is_generic) continue;
+        const id = self.entries[self.entryIndex(module, @enumFromInt(i))].alias_type orelse continue;
+        const ty = self.ir.getType(id).?;
+        if (ty != .record) continue;
+        for (ast.fullStruct(ast.decl(declaration.node).ast.init_node).?) |member| {
+            if (ast.nodes.items(.tag)[member] != .container_field) continue;
+            const data = ast.nodes.items(.data)[member];
+            if (data.rhs == 0) continue;
+            const span = module.tokenSpan(ast.firstToken(data.rhs));
+            if (ty.record.tagged) {
+                try module.diagnostics.append(module.allocator, .{ .tag = .unsupported_union_default, .span = span });
+                continue;
+            }
+            const name = ast.tokenSlice(ast.nodes.items(.main_token)[member]);
+            for (ty.record.fields, 0..) |field, f| {
+                if (!std.mem.eql(u8, name, field.name)) continue;
+                if (self.ir.getType(field.ty).? == .record) {
+                    try module.diagnostics.append(module.allocator, .{ .tag = .invalid_field_default, .span = span });
+                    break;
+                }
+                const checked = try Literal.check(module, &self.ir, data.rhs, field.ty, field.span);
+                switch (checked) {
+                    .constant => |constant| @constCast(self.ir.types.items[@intFromEnum(id)].record.fields)[f].default = constant,
+                    .failed => {},
+                    .not_literal => try module.diagnostics.append(module.allocator, .{ .tag = .invalid_field_default, .span = span }),
+                }
+                break;
+            }
+        }
     }
 }
 
@@ -220,6 +258,8 @@ pub fn analyzeFunctions(module: *Module) Error!Sema {
         try result.syncEntries(module);
         result.entries[index].status = if (checked) .body_checked else .failed;
     }
+    // Demand checking can add layouts after annotation finalization.
+    if (!module.hasErrors()) _ = try result.validateRecordLayouts(module);
     return result;
 }
 
@@ -243,6 +283,7 @@ pub fn analyzeCompilation(comp: *Compilation) Error!Sema {
     }
     if (comp.hasErrors()) return result;
     for (comp.modules.items) |module| try result.analyzeModuleAnnotations(module);
+    try result.finalizeRecordLayouts(comp.modules.items[0]);
     if (comp.hasErrors()) return result;
     while (true) {
         try result.syncEntries(comp.modules.items[0]);
@@ -262,6 +303,7 @@ pub fn analyzeCompilation(comp: *Compilation) Error!Sema {
         try result.syncEntries(module);
         result.entries[index].status = if (checked) .body_checked else .failed;
     }
+    if (!comp.hasErrors()) _ = try result.validateRecordLayouts(comp.modules.items[0]);
     return result;
 }
 

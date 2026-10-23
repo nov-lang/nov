@@ -200,9 +200,12 @@ fn checkSupported(ast: Ast) !void {
             .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod => {
                 const lhs_tag = ast.nodes.items(.tag)[data.lhs];
                 if (lhs_tag == .identifier) continue;
-                if ((lhs_tag != .array_access and lhs_tag != .field_access) or
-                    ast.nodes.items(.tag)[ast.nodes.items(.data)[data.lhs].lhs] != .identifier)
-                    return error.UnsupportedSyntax;
+                if (lhs_tag != .array_access and lhs_tag != .field_access) return error.UnsupportedSyntax;
+                var base = ast.nodes.items(.data)[data.lhs].lhs;
+                if (lhs_tag == .field_access) {
+                    while (ast.nodes.items(.tag)[base] == .field_access) base = ast.nodes.items(.data)[base].lhs;
+                }
+                if (ast.nodes.items(.tag)[base] != .identifier) return error.UnsupportedSyntax;
             },
             else => {},
         }
@@ -380,10 +383,10 @@ test "unsupported syntax fails closed including nested expressions" {
         "let x:[]() -> int\n",
         "let x=a[0][1]\n",
         "let x=a[0..1]\n",
-        "let f:()->void={a.inner.len=1}\n",
+        "let f:()->void={make().inner.len=1}\n",
         "let f:()->void={make()[0]+=1}\n",
         "let f:()->void={a[0][0]-=1}\n",
-        "let f:()->void={a.inner.len%=1}\n",
+        "let f:()->void={make().inner.len%=1}\n",
         "let f:()->void={make()[0]=1}\n",
         "let x=#true\n",
         "@[test]\nlet x=1\n",

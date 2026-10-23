@@ -510,8 +510,8 @@ test "unsupported union declarations and rejected matches roll back under OOM" {
         .{ .source = "let U=union{ok:[]int,}", .tag = .unsupported_type },
         .{ .source = "let R=struct{n:[]int,}\nlet U=union{ok:R,}", .tag = .unsupported_type },
         .{ .source = "let R=struct{n:U,}\nlet U=union{ok:R,}", .tag = .unsupported_type },
-        .{ .source = "let R=struct{n:R,}\nlet U=union{ok:R,}", .tag = .unsupported_type },
-        .{ .source = "let R=struct{n:S,}\nlet S=struct{n:int,}\nlet U=union{ok:R,}", .tag = .unsupported_type },
+        .{ .source = "let R=struct{n:R,}\nlet U=union{ok:R,}", .tag = .record_layout_cycle },
+
         .{ .source = "let V=union{n:int,}\nlet U=union{ok:V,}", .tag = .unsupported_type },
         .{ .source = "let G:(T:type)->type=union{ok:T,}\nlet V=union{n:int,}\nlet U=G(V)", .tag = .unsupported_type },
         .{ .source = "let A=struct{n:int,}\nlet B=struct{n:int,}\nlet U=union{ok:A,}\nlet f:()->U=.ok[B[.n=1]]", .tag = .expression_type_mismatch },
@@ -563,8 +563,8 @@ test "nominal records reject mismatches malformed constructors defaults fields a
         .{ .source = "let A=struct{x:int,x:int,}", .tag = .duplicate_field },
         .{ .source = "let A=struct{x:[]int,}", .tag = .unsupported_type },
         .{ .source = "let A=struct{x:()->int,}", .tag = .unsupported_type },
-        .{ .source = "let A=struct{x:A,}", .tag = .unsupported_type },
-        .{ .source = "let A=struct{x:B,}\nlet B=struct{x:A,}", .tag = .unsupported_type },
+        .{ .source = "let A=struct{x:A,}", .tag = .record_layout_cycle },
+        .{ .source = "let A=struct{x:B,}\nlet B=struct{x:A,}", .tag = .record_layout_cycle },
         .{ .source = "let A=struct{x:int,}\nlet f:(a:A)={a.x=1}", .tag = .immutable_assignment },
         .{ .source = "let A=struct{x:int,}\nlet f:(a:A)->int=a.y", .tag = .unknown_field },
         .{ .source = "let A=struct{x:int,}\nlet f:(a:[]A)= {}", .tag = .unsupported_type },
@@ -711,7 +711,7 @@ test "record verifier rejects corrupt field counts indices types defaults spans 
     const fields = @constCast(result.ir.getType(a).?.record.fields);
     const saved = fields[0];
     fields[0].ty = b;
-    try std.testing.expectError(error.InvalidArrayElement, result.ir.verify());
+    try std.testing.expectError(error.ConstantTypeMismatch, result.ir.verify());
     fields[0] = saved;
     fields[0].default = @enumFromInt(999);
     try std.testing.expectError(error.ConstantTypeMismatch, result.ir.verify());
@@ -2138,4 +2138,185 @@ test "named namespace exported enum methods retain current unmarked and public a
         \\let x:lib.E=lib.E.a
         \\let main:()=@println(x.unmarked(),lib.E.unmarked(x),x.published(),lib.E.published(x))
     , null);
+}
+
+test "nested records diagnose cycles defaults nominal replacements and invalid path bases under OOM" {
+    for ([_]struct { source: []const u8, tag: Module.Diagnostic.Tag }{
+        .{ .source = "let A=struct{edge:Alias,}\nlet Alias=A", .tag = .record_layout_cycle },
+        .{ .source = "let A=struct{to_b:Alias,}\nlet Alias=B\nlet B=struct{to_a:A,}", .tag = .record_layout_cycle },
+        .{ .source = "let A=struct{b:B=B[],}\nlet B=struct{x:int=1,}", .tag = .invalid_field_default },
+        .{ .source = "let A=struct{b:B,}\nlet B=struct{x:int=1,}\nlet f:()->A=A[]", .tag = .missing_field },
+        .{ .source = "let A=struct{b:B,}\nlet B=struct{x:int=1,}\nlet C=struct{x:int=1,}\nlet f:()={let mut a=A[.b=B[]]\na.b=C[]}", .tag = .expression_type_mismatch },
+        .{ .source = "let A=struct{b:B,}\nlet B=struct{x:int=1,}\nlet f:(a:A)={a.b.x=3}", .tag = .immutable_assignment },
+        .{ .source = "let A=struct{b:B,}\nlet B=struct{x:int=1,}\nlet f:()={A[.b=B[]].b.x=3}", .tag = .unsupported_assignment_target },
+        .{ .source = "let A=struct{b:B,}\nlet B=struct{x:int=1,}\nlet f:()={let mut a=A[.b=B[]]\na.b.missing=3}", .tag = .unknown_field },
+    }) |case| {
+        var module = try Module.init(std.testing.allocator, "nested-invalid.nov", case.source);
+        defer module.deinit();
+        var result = try lower(&module);
+        defer result.deinit();
+        try std.testing.expect(module.hasErrors());
+        var found = false;
+        for (module.diagnostics.items) |diagnostic| {
+            if (diagnostic.tag == case.tag) found = true;
+        }
+        try std.testing.expect(found);
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, testRejectedMatchAllocations, .{case.source});
+    }
+}
+
+test "nested records field store paths are owned and verified after source release" {
+    var result = blk: {
+        var module = try Module.init(std.testing.allocator, "path.nov", "let A=struct{b:B,}\nlet B=struct{c:C,}\nlet C=struct{x:int=1,}\nlet f:()={let mut a=A[.b=B[.c=C[]]]\na.b.c.x=2}");
+        defer module.deinit();
+        const result = try lower(&module);
+        try std.testing.expect(result.lowering_complete);
+        break :blk result;
+    };
+    defer result.deinit();
+    try result.ir.verify();
+    const body = result.ir.functions.items[0].body.?;
+    const instruction = &@constCast(body.instructions)[body.instructions.len - 1];
+    const saved = instruction.op.field_store;
+    try std.testing.expectEqualSlices(u32, &.{ 0, 0 }, saved.path);
+    const path = @constCast(saved.path);
+    path[0] = 999;
+    try std.testing.expectError(error.InvalidOperation, result.ir.verify());
+    path[0] = 0;
+    instruction.op.field_store.path = &.{ 0, 0, 0 };
+    try std.testing.expectError(error.InvalidOperation, result.ir.verify());
+    instruction.op.field_store.path = &.{};
+    try std.testing.expectError(error.OperandTypeMismatch, result.ir.verify());
+    instruction.op.field_store = saved;
+    try result.ir.verify();
+}
+
+test "nested records imported cyclic layouts retain deterministic qualified diagnostics" {
+    var comp = Compilation.init(std.testing.allocator);
+    defer comp.deinit();
+    const root = try comp.addSource("/main.nov", "let types=@import(\"types.nov\")\nlet Outer=struct{inner:types.A,}\nlet main:()={}");
+    const types = try comp.addSource("/types.nov", "let A=struct{edge:Alias,}\nlet Alias=B\nlet B=struct{back:A,}");
+    try testImport(&comp, root, "types", types, false);
+    comp.setRoot(root);
+    var result = try lowerCompilation(&comp);
+    defer result.deinit();
+    try std.testing.expect(!result.lowering_complete);
+    const diagnostics = comp.getModule(types).?.diagnostics.items;
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try std.testing.expectEqual(Module.Diagnostic.Tag.record_layout_cycle, diagnostics[0].tag);
+    try std.testing.expectEqual(types, diagnostics[0].span.source);
+    try std.testing.expectEqualStrings("back", comp.sourceSlice(diagnostics[0].span).?);
+    try std.testing.expectEqualStrings("edge", comp.sourceSlice(diagnostics[0].related.?).?);
+}
+
+test "nested records source nesting limit is bounded before IR or defaults become ready" {
+    var source = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer source.deinit();
+    for (0..Ir.max_record_depth) |i| try source.writer.print("let R{d}=struct{{next:R{d},}}\n", .{ i, i + 1 });
+    try source.writer.print("let R{d}=struct{{n:int=1,}}", .{Ir.max_record_depth});
+    var module = try Module.init(std.testing.allocator, "depth.nov", source.written());
+    defer module.deinit();
+    var result = try lower(&module);
+    defer result.deinit();
+    try std.testing.expect(!result.lowering_complete);
+    try std.testing.expectEqual(Module.Diagnostic.Tag.record_layout_limit, module.diagnostics.items[0].tag);
+    try std.testing.expectEqualStrings("next", module.sourceSlice(module.diagnostics.items[0].span).?);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testRejectedMatchAllocations, .{source.written()});
+}
+
+test "nested records imported integer leaf widths preserve exact qualified backend spans" {
+    for ([_][]const u8{ "i128", "u128" }) |width| {
+        var comp = Compilation.init(std.testing.allocator);
+        defer comp.deinit();
+        const root = try comp.addSource("/main.nov", "let types=@import(\"types.nov\")\nlet U=union{ok:types.Outer,none,}\nlet f:(cb:(U)->void)={}");
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let Outer=struct{{left:Middle,right:Middle,}}\nlet Middle=struct{{leaf:Alias,}}\nlet Alias=Leaf\nlet Leaf=struct{{wide:{s},}}", .{width});
+        defer std.testing.allocator.free(source);
+        const types = try comp.addSource("/types.nov", source);
+        try testImport(&comp, root, "types", types, false);
+        comp.setRoot(root);
+        var result = try lowerCompilation(&comp);
+        defer result.deinit();
+        try std.testing.expect(result.lowering_complete);
+        var diagnostic: CEmitter.Diagnostic = undefined;
+        try std.testing.expectError(error.UnsupportedIntegerWidth, CEmitter.emit(std.testing.allocator, &result.ir, &diagnostic));
+        try std.testing.expectEqual(types, diagnostic.span.source);
+        try std.testing.expectEqualStrings("wide", comp.sourceSlice(diagnostic.span).?);
+    }
+}
+
+fn testLateGenericLayout(allocator: std.mem.Allocator, source: []const u8, expected: ?Module.Diagnostic.Tag, imported: bool) !void {
+    if (imported) {
+        var comp = Compilation.init(allocator);
+        defer comp.deinit();
+        const root = try comp.addSource("/main.nov", "let types=@import(\"types.nov\")\nlet main:()=types.run()");
+        const types = try comp.addSource("/types.nov", source);
+        try testImport(&comp, root, "types", types, false);
+        comp.setRoot(root);
+        var result = lowerCompilation(&comp) catch |err| {
+            if (err == error.OutOfMemory) for (comp.modules.items) |module| try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+            return err;
+        };
+        defer result.deinit();
+        try std.testing.expectEqual(expected != null, comp.hasErrors());
+        try std.testing.expectEqual(expected == null, result.lowering_complete);
+        if (expected) |tag| {
+            try std.testing.expectEqual(@as(usize, 0), result.ir.functions.items.len);
+            const diagnostics = comp.getModule(types).?.diagnostics.items;
+            try std.testing.expectEqual(@as(usize, 1), diagnostics.len);
+            const diagnostic = diagnostics[0];
+            try std.testing.expectEqual(tag, diagnostic.tag);
+            try std.testing.expectEqual(types, diagnostic.span.source);
+            if (tag == .record_layout_limit) {
+                try std.testing.expectEqualStrings("some", comp.sourceSlice(diagnostic.span).?);
+                try std.testing.expectEqualStrings("next", comp.sourceSlice(diagnostic.related.?).?);
+            }
+        }
+    } else {
+        var module = try Module.init(allocator, "late-layout.nov", source);
+        defer module.deinit();
+        var result = lower(&module) catch |err| {
+            if (err == error.OutOfMemory) try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+            return err;
+        };
+        defer result.deinit();
+        try std.testing.expectEqual(expected != null, module.hasErrors());
+        try std.testing.expectEqual(expected == null, result.lowering_complete);
+        if (expected) |tag| {
+            try std.testing.expectEqual(@as(usize, 0), result.ir.functions.items.len);
+            try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+            const diagnostic = module.diagnostics.items[0];
+            try std.testing.expectEqual(tag, diagnostic.tag);
+            if (tag == .record_layout_limit) {
+                try std.testing.expectEqualStrings("some", module.sourceSlice(diagnostic.span).?);
+                try std.testing.expectEqualStrings("next", module.sourceSlice(diagnostic.related.?).?);
+            }
+        }
+    }
+}
+
+test "nested records late body generic layouts diagnose depth before lowering publication" {
+    for ([_]usize{ Ir.max_record_depth - 1, Ir.max_record_depth }) |depth| {
+        var source = std.Io.Writer.Allocating.init(std.testing.allocator);
+        defer source.deinit();
+        for (0..depth - 1) |i| try source.writer.print("let R{d}=struct{{next:R{d},}}\n", .{ i, i + 1 });
+        try source.writer.print("let R{d}=struct{{n:int=1,}}\n", .{depth - 1});
+        try source.writer.writeAll("let G:(T:type)->type=union{some:T,none,}\nlet run:()={let u:G(R0)=.none[]\n}");
+        const expected: ?Module.Diagnostic.Tag = if (depth == Ir.max_record_depth) .record_layout_limit else null;
+        for ([_]bool{ false, true }) |imported| {
+            try testLateGenericLayout(std.testing.allocator, source.written(), expected, imported);
+            if (expected != null) try std.testing.checkAllAllocationFailures(std.testing.allocator, testLateGenericLayout, .{ source.written(), expected, imported });
+        }
+    }
+}
+
+test "nested records late body recursive generic instances retain source diagnostics" {
+    for ([_][]const u8{
+        "let G:(T:type)->type=union{some:G(T),none,}\nlet run:()={let u:G(int)=.none[]\n}",
+        "let G:(T:type)->type=union{some:H(T),none,}\nlet H:(T:type)->type=union{some:G(T),none,}\nlet run:()={let u:G(int)=.none[]\n}",
+    }) |source| {
+        for ([_]bool{ false, true }) |imported| {
+            try testLateGenericLayout(std.testing.allocator, source, .generic_cycle, imported);
+            try std.testing.checkAllAllocationFailures(std.testing.allocator, testLateGenericLayout, .{ source, @as(?Module.Diagnostic.Tag, .generic_cycle), imported });
+        }
+    }
 }

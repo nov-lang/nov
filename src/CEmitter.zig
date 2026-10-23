@@ -18,6 +18,8 @@ const Lowering = @import("Lowering.zig");
 const GcRuntime = @import("GcRuntime.zig");
 const Formatter = @import("Formatter.zig");
 const Diagnostics = @import("Diagnostics.zig");
+const Compilation = @import("Compilation.zig");
+const Source = @import("Source.zig");
 
 pub const Error = Ir.VerifyError || std.mem.Allocator.Error || error{
     UnsupportedIntegerWidth,
@@ -64,7 +66,7 @@ pub fn emit(allocator: std.mem.Allocator, ir: *const Ir, diagnostic: ?*Diagnosti
     const origins = try allocator.alloc(?Origin, ir.types.items.len);
     defer allocator.free(origins);
     @memset(origins, null);
-    try analyze(ir, origins, diagnostic);
+    try analyze(allocator, ir, origins, diagnostic);
 
     var out = std.Io.Writer.Allocating.init(allocator);
     errdefer out.deinit();
@@ -122,14 +124,16 @@ fn mark(origins: []?Origin, ty: Ir.TypeId, origin: Origin) void {
 // Nominal placeholders can precede their payload records and scalar fields.
 // Verification bounds aggregate depth; visit these edges directly rather than
 // depending on pool order as we can for structural signature types.
-fn markRecord(ir: *const Ir, origins: []?Origin, id: Ir.TypeId, origin: Origin, diagnostic: ?*Diagnostic) Error!void {
+fn markRecord(ir: *const Ir, origins: []?Origin, visited: []bool, id: Ir.TypeId, origin: Origin, diagnostic: ?*Diagnostic) Error!void {
+    if (visited[@intFromEnum(id)]) return;
+    visited[@intFromEnum(id)] = true;
     mark(origins, id, origin);
     for (ir.getType(id).?.record.fields) |field| {
         const field_origin: Origin = .{ .function = origin.function, .span = field.span };
         mark(origins, field.ty, field_origin);
         const ft = ir.getType(field.ty).?;
         if (ft == .record) {
-            try markRecord(ir, origins, field.ty, field_origin, diagnostic);
+            try markRecord(ir, origins, visited, field.ty, field_origin, diagnostic);
         } else if (ft == .integer) switch (ft.integer.bits) {
             8, 16, 32, 64 => {},
             else => return fail(diagnostic, .integer_width_unsupported, field_origin),
@@ -139,7 +143,10 @@ fn markRecord(ir: *const Ir, origins: []?Origin, id: Ir.TypeId, origin: Origin, 
 
 /// Rejects unsupported widths and marks runtime types reachable from signatures
 /// and instructions, including nominal edges in either pool-index direction.
-fn analyze(ir: *const Ir, origins: []?Origin, diagnostic: ?*Diagnostic) Error!void {
+fn analyze(allocator: std.mem.Allocator, ir: *const Ir, origins: []?Origin, diagnostic: ?*Diagnostic) Error!void {
+    const visited = try allocator.alloc(bool, ir.types.items.len);
+    defer allocator.free(visited);
+    @memset(visited, false);
     for (ir.functions.items, 0..) |function, f| {
         const id: Ir.FunctionId = @enumFromInt(f);
         mark(origins, function.ty, .{ .function = id, .span = function.span });
@@ -154,7 +161,7 @@ fn analyze(ir: *const Ir, origins: []?Origin, diagnostic: ?*Diagnostic) Error!vo
         const origin = origins[i] orelse continue;
         switch (ir.types.items[i]) {
             .void, .boolean, .string, .enumeration => {},
-            .record => try markRecord(ir, origins, @enumFromInt(i), origin, diagnostic),
+            .record => try markRecord(ir, origins, visited, @enumFromInt(i), origin, diagnostic),
             .array => |element| mark(origins, element, origin),
             .integer => |integer| switch (integer.bits) {
                 8, 16, 32, 64 => {},
@@ -210,10 +217,28 @@ fn write(allocator: std.mem.Allocator, ir: *const Ir, origins: []const ?Origin, 
         try w.writeAll(" *data = array.data;\n    for (uintptr_t i = 0; i < array.len; ++i) {\n        if (value == data[i]) return true;\n    }\n    return false;\n}\n");
     }
     try writeArithmeticRuntime(ir, w);
-    // Flat records must precede tagged layouts regardless of placeholder IDs.
-    for ([_]bool{ false, true }) |tagged| {
+    // Nominal placeholders may precede dependencies in either pool direction.
+    const declared = try allocator.alloc(bool, ir.types.items.len);
+    defer allocator.free(declared);
+    @memset(declared, false);
+    const root_counts = try allocator.alloc(usize, ir.types.items.len);
+    defer allocator.free(root_counts);
+    for (ir.types.items, root_counts) |ty, *count| count.* = @intFromBool(ty == .string or ty == .array);
+    var remaining: usize = 0;
+    for (origins, ir.types.items) |origin, ty| {
+        if (origin != null and ty == .record) remaining += 1;
+    }
+    while (remaining != 0) {
         for (origins, ir.types.items, 0..) |origin, ty, i| {
-            if (origin == null or ty != .record or ty.record.tagged != tagged) continue;
+            if (origin == null or ty != .record or declared[i]) continue;
+            var ready = true;
+            for (ty.record.fields) |field| {
+                if (ir.getType(field.ty).? == .record and !declared[@intFromEnum(field.ty)]) ready = false;
+            }
+            if (!ready) continue;
+            declared[i] = true;
+            remaining -= 1;
+            for (ty.record.fields) |field| root_counts[i] = std.math.add(usize, root_counts[i], root_counts[@intFromEnum(field.ty)]) catch return error.OutOfMemory;
             try w.print("typedef struct {{\n", .{});
             if (ty.record.tagged) try w.writeAll("    uint32_t tag;\n");
             for (ty.record.fields, 0..) |field, f| {
@@ -247,37 +272,39 @@ fn write(allocator: std.mem.Allocator, ir: *const Ir, origins: []const ?Origin, 
         try w.writeByte('\n');
         try writeSignature(ir, w, function);
         try w.writeAll(" {\n");
-        try writeBody(allocator, ir, w, function);
+        try writeBody(allocator, ir, root_counts, w, function);
         try w.writeAll("}\n");
     }
 }
 
-fn rootCount(ir: *const Ir, id: Ir.TypeId) usize {
-    const ty = ir.getType(id).?;
-    if (ty == .record) {
-        var count: usize = 0;
-        for (ty.record.fields) |field| {
-            count += rootCount(ir, field.ty);
-        }
-        return count;
-    }
-    return @intFromBool(Ir.isManaged(ty));
-}
-
-fn writeRoots(ir: *const Ir, w: *std.Io.Writer, id: Ir.TypeId, prefix: []const u8, index: usize) WriteError!void {
-    const ty = ir.getType(id).?;
-    if (ty == .record) {
-        for (ty.record.fields, 0..) |field, f| {
-            const ft = ir.getType(field.ty).?;
-            if (ft == .string) {
-                try w.print(" &{s}{d}.f{d}.owner,", .{ prefix, index, f });
-            } else if (ft == .record) {
-                for (ft.record.fields, 0..) |nested, n| if (ir.getType(nested.ty).? == .string) {
-                    try w.print(" &{s}{d}.f{d}.f{d}.owner,", .{ prefix, index, f, n });
-                };
+fn writeRoots(ir: *const Ir, root_counts: []const usize, w: *std.Io.Writer, id: Ir.TypeId, prefix: []const u8, index: usize) WriteError!void {
+    if (root_counts[@intFromEnum(id)] == 0) return;
+    const Frame = struct { ty: Ir.TypeId, next: usize = 0 };
+    var stack: [Ir.max_record_depth + 1]Frame = undefined;
+    stack[0] = .{ .ty = id };
+    var len: usize = 1;
+    while (len != 0) {
+        const frame = &stack[len - 1];
+        const ty = ir.getType(frame.ty).?;
+        if (ty == .record) {
+            if (frame.next == ty.record.fields.len) {
+                len -= 1;
+            } else {
+                const field = ty.record.fields[frame.next];
+                frame.next += 1;
+                if (root_counts[@intFromEnum(field.ty)] == 0) continue;
+                stack[len] = .{ .ty = field.ty };
+                len += 1;
             }
+        } else {
+            if (Ir.isManaged(ty)) {
+                try w.print(" &{s}{d}", .{ prefix, index });
+                for (stack[0 .. len - 1]) |parent| try w.print(".f{d}", .{parent.next - 1});
+                try w.print(".{s},", .{if (ty == .string) "owner" else "data"});
+            }
+            len -= 1;
         }
-    } else try w.print(" &{s}{d}.{s},", .{ prefix, index, if (ty == .string) "owner" else "data" });
+    }
 }
 
 fn needsRootFrame(ir: *const Ir, function: Ir.Function) bool {
@@ -513,7 +540,7 @@ fn usesArrayContains(ir: *const Ir, element: Ir.TypeId) bool {
     return false;
 }
 
-fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, function: Ir.Function) (WriteError || std.mem.Allocator.Error)!void {
+fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const usize, w: *std.Io.Writer, function: Ir.Function) (WriteError || std.mem.Allocator.Error)!void {
     const signature = ir.types.items[@intFromEnum(function.ty)].function;
     const body = function.body.?;
     const value_used = try allocator.alloc(bool, body.instructions.len);
@@ -602,23 +629,23 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
         try w.writeAll("    (void)nov_gc_register_globals; (void)nov_gc_unregister_globals; (void)nov_gc_shutdown; (void)nov_gc_pop;\n    (void)nov_array_clone; (void)nov_array_index; (void)nov_array_append;\n");
         var roots: usize = 0;
         for (signature.params) |param| if (Ir.isManaged(ir.getType(param).?)) {
-            roots += rootCount(ir, param);
+            roots = std.math.add(usize, roots, root_counts[@intFromEnum(param)]) catch return error.OutOfMemory;
         };
         for (body.instructions, 0..) |instruction, i| {
             if (!Ir.isManaged(ir.getType(instruction.ty).?)) continue;
             try w.writeAll("    ");
             try writeType(ir, w, instruction.ty);
             try w.print(" v{d} = {{0}};\n", .{i});
-            roots += rootCount(ir, instruction.ty);
+            roots = std.math.add(usize, roots, root_counts[@intFromEnum(instruction.ty)]) catch return error.OutOfMemory;
         }
         // Stable function-scope void* fields, never casts from typed T** slots.
         if (roots != 0) {
             try w.writeAll("    void **nov_roots[] = {");
             for (signature.params, 0..) |param, p| if (Ir.isManaged(ir.getType(param).?)) {
-                try writeRoots(ir, w, param, "p", p);
+                try writeRoots(ir, root_counts, w, param, "p", p);
             };
             for (body.instructions, 0..) |instruction, i| if (Ir.isManaged(ir.getType(instruction.ty).?)) {
-                try writeRoots(ir, w, instruction.ty, "v", i);
+                try writeRoots(ir, root_counts, w, instruction.ty, "v", i);
             };
             try w.print(" }};\n    nov_gc_roots nov_frame = {{0}};\n    nov_gc_push(&nov_rt_heap, &nov_frame, nov_roots, {d});\n", .{roots});
         } else {
@@ -754,7 +781,9 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
         }
         if (instruction.op == .field_store) {
             const store = instruction.op.field_store;
-            try w.print("    v{d}.f{d} = v{d};\n", .{ @intFromEnum(store.slot), store.index, @intFromEnum(store.value) });
+            try w.print("    v{d}", .{@intFromEnum(store.slot)});
+            for (store.path) |index| try w.print(".f{d}", .{index});
+            try w.print(".f{d} = v{d};\n", .{ store.index, @intFromEnum(store.value) });
             continue;
         }
         if (instruction.op == .local_store) {
@@ -5996,7 +6025,6 @@ test "fixed width arithmetic boundaries and zero panics in generated C" {
 }
 
 test "cross source generic reexports retain defining scope under forced GC after graph release" {
-    const Compilation = @import("Compilation.zig");
     var sema = blk: {
         var comp = Compilation.init(test_gpa);
         defer comp.deinit();
@@ -6029,7 +6057,7 @@ test "cross source generic reexports retain defining scope under forced GC after
             \\let message:(self:Self)->string=prefix+helper()
             \\}
         );
-        for ([_]struct { source: @import("Source.zig").Id, name: []const u8, target: @import("Source.zig").Id, named: bool }{
+        for ([_]struct { source: Source.Id, name: []const u8, target: Source.Id, named: bool }{
             .{ .source = root, .name = "std", .target = entry, .named = true },
             .{ .source = entry, .name = "result", .target = library, .named = false },
         }) |edge| {
@@ -6050,4 +6078,164 @@ test "cross source generic reexports retain defining scope under forced GC after
     const program = try collectingTestProgram(library);
     defer test_gpa.free(program);
     for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(program, "typedef int nonempty_translation_unit;", 0, "ab fallback library:helper\n", "", mode);
+}
+
+const nested_record_program =
+    \\let Alias=Deep
+    \\let Deep=struct{box:Box,
+    \\let toString:(r:Deep)->string="{r.box.inner.s}:{r.box.inner.n}:{r.box.other.s}"
+    \\}
+    \\let Box=struct{inner:Leaf,other:Leaf,}
+    \\let Leaf=struct{s:string,n:int=1,}
+    \\let R:(T:type,E:type)->type=union{ok:T,err:E,}
+    \\let O:(T:type)->type=union{some:T,none,}
+    \\let text:(s:string)->string={@print(s)
+    \\s+"!"}
+    \\let leaf:(s:string)->Leaf=Leaf[.s=s+"!"]
+    \\let deep:(s:string)->Alias=Alias[.box=Box[.inner=leaf(s),.other=leaf("other")]]
+    \\let identity:(r:Deep)->Deep=r
+    \\let invoke:(cb:(Deep)->Deep,r:Deep)->Deep=cb(r)
+    \\let result:(ok:bool)->R(Deep,Deep)=if ok{.ok[deep("ok")]}else{.err[deep("err")]}
+    \\let propagate:(ok:bool)->R(Deep,Deep)={let mut r=result(ok).!
+    \\r.box.inner.s="new"+"!"
+    \\.ok[r]}
+    \\let option:(o:O(Deep))->O(Deep)={let mut r=o.!
+    \\r.box.inner.n=8
+    \\.some[r]}
+    \\let terminal:()={let ignored=Deep[.box={return}]
+    \\}
+    \\let main:()={
+    \\let mut r=Deep[.box=Box[.other=Leaf[.s=text("b")],.inner=Leaf[.s=text("a")]]]
+    \\let saved=r
+    \\let called=invoke(identity,r)
+    \\let merged=if true{r}else{deep("BAD")}
+    \\let looped:Deep=loop{break r}
+    \\r.box.inner.n += {r=deep("replaced")
+    \\5}
+    \\r.box.inner.s="live"+"!"
+    \\@println(r,saved,called,merged,looped)
+    \\r.box.inner=leaf("whole")
+    \\let copied=r.box
+    \\r.box.other.s="changed"+"!"
+    \\@println(r,copied.inner.s,copied.other.s)
+    \\@println(match propagate(true){.ok=>|v|"{v}"
+    \\.err=>|v|"{v}"},match propagate(false){.ok=>|v|"{v}"
+    \\.err=>|v|"{v}"})
+    \\@println(match option(.some[saved]){.some=>|v|"{v}"
+    \\.none=>"none"},match option(.none[]){.some=>"BAD"
+    \\.none=>"none"},saved)
+    \\if false{let skipped=deep("BAD")
+    \\@println(skipped)}
+    \\terminal()
+    \\}
+;
+
+test "nested records preserve recursive copies current slot paths captures and roots under forced GC" {
+    const c = try arrayTestProgram(nested_record_program);
+    defer test_gpa.free(c);
+    const output = "balive!:6:other! a!:1:b! a!:1:b! a!:1:b! a!:1:b!\n" ++
+        "whole!:1:changed! whole! other!\nnew!:1:other! err!:1:other!\na!:8:b! none a!:1:b!\n";
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, output, "", mode);
+}
+
+test "nested records emission and path ownership survive every allocation failure" {
+    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{nested_record_program});
+}
+
+test "nested records callback widths report transitive exact leaf spans" {
+    var module = try Module.init(test_gpa, "nested-width.nov", "let Outer=struct{left:Middle,right:Middle,}\nlet Middle=struct{leaf:Leaf,}\nlet Leaf=struct{wide:i128,}\nlet U=union{ok:Outer,none,}\nlet f:(cb:(U)->void)={}");
+    defer module.deinit();
+    var sema = try Lowering.lower(&module);
+    defer sema.deinit();
+    try std.testing.expect(!module.hasErrors());
+    var diagnostic: Diagnostic = undefined;
+    try std.testing.expectError(error.UnsupportedIntegerWidth, emit(test_gpa, &sema.ir, &diagnostic));
+    try std.testing.expectEqualStrings("wide", module.sourceSlice(diagnostic.span).?);
+}
+
+test "nested records imported forward diamond identities survive graph release and forced GC" {
+    var sema = blk: {
+        var comp = Compilation.init(test_gpa);
+        defer comp.deinit();
+        const root = try comp.addSource("/main.nov", "let left=@import(\"left.nov\")\nlet right=@import(\"right.nov\")\n" ++
+            "let Root=struct{left:left.Box,right:right.Box,}\n" ++
+            "let main:()={let mut r=Root[.left=left.make(),.right=right.make()]\nlet saved=r\nr.left.inner.s=\"changed\"+\"!\"\n@println(r.left.inner.s,saved.left.inner.s,r.right.inner.s)}");
+        const left = try comp.addSource("/left.nov", "let shared=@import(\"shared.nov\")\nlet Box=shared.Box\nlet make:()->Box=shared.make()");
+        const right = try comp.addSource("/right.nov", "let shared=@import(\"shared.nov\")\nlet Box=shared.Box\nlet make:()->Box=shared.make()");
+        const shared = try comp.addSource("/shared.nov", "let Box=struct{inner:Alias,}\nlet Alias=Leaf\nlet Leaf=struct{s:string,}\nlet make:()->Box=Box[.inner=Alias[.s=\"sha\"+\"red\"]]");
+        for ([_]struct { source: Source.Id, name: []const u8, target: Source.Id }{
+            .{ .source = root, .name = "left", .target = left },
+            .{ .source = root, .name = "right", .target = right },
+            .{ .source = left, .name = "shared", .target = shared },
+            .{ .source = right, .name = "shared", .target = shared },
+        }) |edge| {
+            const module = comp.getModule(edge.source).?;
+            const local = module.lookup(edge.name).?;
+            try comp.imports.append(test_gpa, .{ .declaration = comp.declaration_ids.get(.{ .source = edge.source, .local = local }).?, .target = edge.target, .named = false, .span = module.getDeclaration(local).?.name_span });
+        }
+        comp.setRoot(root);
+        var result = try Lowering.lowerCompilation(&comp);
+        errdefer result.deinit();
+        if (comp.hasErrors()) {
+            var output = std.Io.Writer.Allocating.init(test_gpa);
+            defer output.deinit();
+            try Diagnostics.renderCompilation(&comp, &output.writer);
+            std.debug.print("{s}", .{output.written()});
+        }
+        try std.testing.expect(result.lowering_complete);
+        const record = result.ir.getType(result.entries[2].alias_type.?).?.record;
+        try std.testing.expectEqual(record.fields[0].ty, record.fields[1].ty);
+        break :blk result;
+    };
+    defer sema.deinit();
+    const library = try emit(test_gpa, &sema.ir, null);
+    defer test_gpa.free(library);
+    const c = try collectingTestProgram(library);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "changed! shared shared\n", "", mode);
+}
+
+test "nested records deepest supported declarations compile in dependency order" {
+    var source = std.Io.Writer.Allocating.init(test_gpa);
+    defer source.deinit();
+    for (0..Ir.max_record_depth - 1) |i| try source.writer.print("let R{d}=struct{{next:R{d},}}\n", .{ i, i + 1 });
+    try source.writer.print("let R{d}=struct{{s:string,}}\nlet f:(r:R0)={{}}\nlet main:()={{}}", .{Ir.max_record_depth - 1});
+    const library = try emitSource(source.written(), null);
+    defer test_gpa.free(library);
+    const c = try collectingTestProgram(library);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "", "", mode);
+}
+
+test "nested records propagation shares immutable strings and skips allocations on terminal paths" {
+    for ([_]bool{ false, true }) |allocate| {
+        const source = try std.fmt.allocPrint(test_gpa, "let R:(T:type,E:type)->type=union{{ok:T,err:E,}}\nlet Outer=struct{{middle:Middle,}}\nlet Middle=struct{{leaf:Leaf,}}\nlet Leaf=struct{{s:string,}}\n" ++
+            "let make:()->R(int,Outer)=.err[Outer[.middle=Middle[.leaf=Leaf[.s={s}]]]]\n" ++
+            "let run:()->R(bool,Outer)=.ok[make().! == 0]\nlet main:()=@println(match run(){{.ok=>\"BAD\"\n.err=>|r|r.middle.leaf.s}})", .{if (allocate) "\"e\"+\"rr\"" else "\"err\""});
+        defer test_gpa.free(source);
+        const library = try emitSource(source, null);
+        defer test_gpa.free(library);
+        const program = try collectingTestProgram(library);
+        defer test_gpa.free(program);
+        const c = try std.mem.concat(test_gpa, u8, &.{ "#include <stdlib.h>\nstatic void *test_malloc(size_t n) { (void)n; return NULL; }\n#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n", program });
+        defer test_gpa.free(c);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode|
+            try compileAndRunMode(c, "typedef int nonempty_translation_unit;", if (allocate) 1 else 0, if (allocate) "" else "err\n", if (allocate) "panic: GC allocation failed\n" else "", mode);
+    }
+}
+
+test "nested records root enumeration prunes large scalar diamonds beside managed roots" {
+    var source = std.Io.Writer.Allocating.init(test_gpa);
+    defer source.deinit();
+    try source.writer.writeAll("let R0=struct{n:int,}\n");
+    for (1..31) |i| try source.writer.print("let R{d}=struct{{left:R{d},right:R{d},}}\n", .{ i, i - 1, i - 1 });
+    try source.writer.writeAll("let Mixed=struct{scalar:R30,text:string,}\nlet f:(r:R30,s:string)={let copy=r\n}\nlet g:(r:Mixed)={}");
+    const c = try emitSource(source.written(), null);
+    defer test_gpa.free(c);
+    try std.testing.expect(std.mem.indexOf(u8, c, "void **nov_roots[] = { &p1.owner, };") != null);
+    try std.testing.expect(std.mem.indexOf(u8, c, "void **nov_roots[] = { &p0.f1.owner, };") != null);
+    try std.testing.expect(c.len < 32 * 1024);
 }
