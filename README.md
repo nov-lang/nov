@@ -978,6 +978,9 @@ Use `.some[value]` / `.none[]` under an expected Option type, or qualified
 constructors such as `Option(uint).some[21]`. Matches must cover both variants
 or include a catchall; `some` can capture its exact payload type.
 
+`isSome()` / `isNone()` test the active variant and return bool without unwrapping
+or inspecting the payload, including for `Option(void)` and `some[false]`.
+
 `unwrapOr(fallback)` returns the payload or an eagerly evaluated fallback argument.
 `unwrapOrElse(callback)` returns the payload or calls a zero-argument `() -> T`
 callback only for `none`. These are ordinary generic methods, not compiler
@@ -1004,7 +1007,9 @@ Missing: 0
 #### Standard-library foundation
 
 [`lib/result.nov`](lib/result.nov) provides the ordinary generic `Result` definition
-with public `unwrapOr` and `unwrapOrElse` methods. `unwrapOr` evaluates its fallback
+with public `isOk`, `isErr`, `unwrapOr` and `unwrapOrElse` methods. The predicates
+return bool based only on the active tag, including with void payloads.
+`unwrapOr` evaluates its fallback
 as an ordinary argument even on success. `unwrapOrElse` evaluates the callback
 value normally but calls its body only on error. Neither requires a Result builtin.
 

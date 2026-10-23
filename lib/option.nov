@@ -6,6 +6,18 @@ let Option: (T: type) -> type = union {
     let Self = @This()
 
     @[public]
+    let isSome: (self: Self) -> bool = match self {
+        .some => true
+        .none => false
+    }
+
+    @[public]
+    let isNone: (self: Self) -> bool = match self {
+        .some => false
+        .none => true
+    }
+
+    @[public]
     let unwrapOr: (self: Self, fallback: T) -> T = match self {
         .some => |value| value
         .none => fallback

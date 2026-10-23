@@ -1152,6 +1152,46 @@ fn addOptionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *st
     );
     const output = "SNvalue:1 none\nSE1\nNE9\nS1\nNL7\n3 4\ntrue false true true\nsome eager lazy some\nsome record eager record\nlazy record some record\ntrue false\nsome:none:unit:done\n";
     _ = fixtures.add("options-example.nov", @embedFile("examples/options.nov"));
+    _ = fixtures.add("variant-predicates.nov", imports ++
+        \\let Record = struct {
+        \\    text: string,
+        \\}
+        \\let R = standard.Result(Record, Record)
+        \\let makeOption: (present: bool) -> O = {
+        \\    @print("O")
+        \\    if present {
+        \\        .some[1]
+        \\    } else {
+        \\        .none[]
+        \\    }
+        \\}
+        \\let makeResult: (success: bool) -> R = {
+        \\    @print("R")
+        \\    if success {
+        \\        .ok[Record[ .text = "o" + "k" ]]
+        \\    } else {
+        \\        .err[Record[ .text = "e" + "rr" ]]
+        \\    }
+        \\}
+        \\let main: () = {
+        \\    let some = O.some[1]
+        \\    let none: direct.Option(int) = .none[]
+        \\    let predicate: (O) -> bool = alternate.Option(int).isSome
+        \\    @println(predicate(some), some.isNone(), O.isSome(none), none.isNone())
+        \\    @println(makeOption(true).isSome(), makeOption(false).isNone())
+        \\    let ok = makeResult(true)
+        \\    let err = makeResult(false)
+        \\    @println(ok.isOk(), ok.isErr(), R.isOk(err), R.isErr(err))
+        \\    @println(makeResult(false).isErr())
+        \\    let item = standard.Option(Record).some[Record[ .text = "value" ]]
+        \\    @println(item.isSome(), standard.Option(Record).none[].isNone())
+        \\    @println(standard.Option(void).some[].isSome(), standard.Option(void).none[].isNone())
+        \\    @println(standard.Result(void, void).ok[].isOk(), standard.Result(void, void).err[].isErr())
+        \\    @println(standard.Option(bool).some[false].isSome(), standard.Result(bool, string).ok[false].isOk())
+        \\    @println(ok.unwrapOr(Record[ .text = "fallback" ]).text, err.isErr())
+        \\}
+        \\
+    );
     const Reject = struct { name: []const u8, source: []const u8, diagnostic: []const u8 = "expression does not match the expected type" };
     const rejects = [_]Reject{
         .{ .name = "payload", .source = "let f: () -> O = .some[@as(uint, 1)]\n" },
@@ -1182,6 +1222,7 @@ fn addOptionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *st
     for ([_]Program{
         .{ .source = "options.nov", .output = output },
         .{ .source = "options-example.nov", .output = "Quotient: 21\nUsing fallback\nMissing: 0\n" },
+        .{ .source = "variant-predicates.nov", .output = "true false false true\nOOtrue true\nRRtrue false false true\nRtrue\ntrue true\ntrue true\ntrue true\ntrue true\nok true\n" },
     }) |program| {
         for ([_][]const u8{ "semantic", "fmt", "default", "--debug", "--release" }) |mode| {
             const run = b.addRunArtifact(exe);

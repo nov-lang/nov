@@ -1,5 +1,10 @@
 # TODO
 
+Option.isSome/isNone and Result.isOk/isErr are ordinary public bool-returning
+methods that test only the active variant, without unwrapping or inspecting payloads.
+They work with scalar, record and void payloads. Real-import CLI tests cover both
+tags, static/instance calls, method references, aliases and receiver effects.
+
 lib/option.nov provides ordinary public Option(T), re-exported as std.Option, with
 some payload/none variants, unwrapOr (eager fallback) and unwrapOrElse (zero-argument
 callback invoked only for none). Real-import tests cover identity, exact types,

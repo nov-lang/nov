@@ -16,6 +16,9 @@ injected bare name.
 
 `Result(T, E)` has variants `ok: T` and `err: E`.
 
+- `value.isOk()` / `value.isErr()` report the active variant as a bool, without
+  inspecting or unwrapping its payload. They also work with void payloads.
+
 - `value.unwrapOr(fallback)` returns the success payload or the supplied fallback.
   The fallback expression is an ordinary argument and always evaluates.
 - `value.unwrapOrElse(callback)` returns the success payload or calls the callback
@@ -34,6 +37,10 @@ constructed and propagated without requesting `unwrapOr`.
 `Option(T)` has variants `some: T` and payloadless `none`. Construct it explicitly
 with `Option(uint).some[21]`, or use `.some[21]` / `.none[]` under an expected
 Option type. Exhaustive matches can capture the `some` payload or handle `none`.
+
+- `value.isSome()` / `value.isNone()` report the active variant as a bool, without
+  inspecting or unwrapping its payload. `some[false]` is still present; these methods
+  work with void and record payloads too.
 
 - `value.unwrapOr(fallback)` returns the payload or the supplied fallback. As an
   ordinary argument, the fallback expression always evaluates.
