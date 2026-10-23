@@ -676,7 +676,7 @@ The delivered subset is deliberately bounded:
   aliases work in annotations, method signatures, constructors and static calls.
   Forward module type names and method signatures are supported.
 - Named fields require explicit `bool`, integer (including `i128`/`u128` and native
-  `int`/`uint`), or immutable `string` types (including aliases). Semantic checking
+  `int`/`uint`), immutable `string`, or nominal enum types (including aliases). Semantic checking
   uses the same integer-width and literal-bound rules as scalar values. The C
   backend still supports only 8/16/32/64-bit integers: a reachable record layout
   containing a 128-bit field fails C emission with a backend width diagnostic;
@@ -684,8 +684,7 @@ The delivered subset is deliberately bounded:
   Array element restrictions are unchanged. Fields end with a comma. A field may have a literal default of its exact type, with ordinary
   literal-bound checks. Defaults cannot call functions, compute values, reference
   globals or interpolate strings. Nested/recursive records, array/function/void/
-  float fields, record arrays and field mutation are rejected, not partially
-  implemented.
+  float fields and record arrays are rejected, not partially implemented.
 - Construct explicitly with `MyType[ .x = 5, .z = true ]` (or `Alias[...]`).
   Empty `MyType[]` works only when every field has a default. Unknown, duplicate,
   missing required and mistyped fields diagnose. Supplied expressions evaluate
@@ -698,6 +697,22 @@ The delivered subset is deliberately bounded:
   does not change array/string `.len`. Assignment, locals, parameters, returns,
   branches and loop results copy record field values; immutable strings share
   their backing storage. Replacing a mutable record binding does not change copies.
+- Fields of a direct mutable local support `item.field = value` with exact bool,
+  integer, string or enum type. Integer fields support `+= -= *= /= %=`, with the
+  same wrapping/division/panic rules as scalar integers; string fields support `+=`.
+  These assignments yield void. A real struct field named `len` is writable;
+  array/string lengths remain read-only.
+- A compound reads the old field **before** evaluating the RHS once. After the RHS,
+  the final store updates only that field of the **current local slot**. Changes
+  made by the RHS to other fields, or to the whole record, are preserved except
+  for the targeted field. Plain assignment does not read its old field. A terminal
+  RHS skips the pending operation/store without undoing earlier effects. This uses
+  stable local field storage, not the whole-array snapshot update rule.
+- Field mutation does not alter earlier value copies or immutable string backing.
+  Immutable bindings/ordinary parameters (including `self`), union payloads/tags,
+  temporary values, nested paths and pointer-based targets remain unsupported or
+  diagnose immutable assignment. No implicit mutable receiver or borrowing is added.
+  See [examples/struct-mutation.nov](examples/struct-mutation.nov).
 - Container declarations are ordinary explicitly typed functions, not runtime
   initializers. Methods have their own container scope; they can call sibling or
   recursive methods by name. Outside that scope use `MyType.method(args...)` (an

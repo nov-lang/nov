@@ -553,6 +553,10 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
         .parameter => |index| param_used[index] = true,
         .local_slot => |value| value_used[@intFromEnum(value)] = true,
         .local_load => |slot| value_used[@intFromEnum(slot)] = true,
+        .field_store => |store| {
+            value_used[@intFromEnum(store.slot)] = true;
+            value_used[@intFromEnum(store.value)] = true;
+        },
         .local_store => |store| {
             value_used[@intFromEnum(store.slot)] = true;
             value_used[@intFromEnum(store.value)] = true;
@@ -748,6 +752,11 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
             } else try w.writeAll("    return;\n");
             continue;
         }
+        if (instruction.op == .field_store) {
+            const store = instruction.op.field_store;
+            try w.print("    v{d}.f{d} = v{d};\n", .{ @intFromEnum(store.slot), store.index, @intFromEnum(store.value) });
+            continue;
+        }
         if (instruction.op == .local_store) {
             const store = instruction.op.local_store;
             try w.print("    v{d} = v{d};\n", .{ @intFromEnum(store.slot), @intFromEnum(store.value) });
@@ -832,7 +841,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
                 try w.print(" *)v{d}.data)[nov_array_index(v{d}, v{d})]", .{ @intFromEnum(r.array), @intFromEnum(r.array), @intFromEnum(r.index) });
             },
             .array_contains => |r| try w.print("nov_array_contains_{d}(v{d}, v{d})", .{ @intFromEnum(body.instructions[@intFromEnum(r.value)].ty), @intFromEnum(r.value), @intFromEnum(r.array) }),
-            .array_literal, .array_clone, .array_set, .array_append, .to_string => unreachable,
+            .array_literal, .array_clone, .array_set, .array_append, .to_string, .field_store => unreachable,
             .constant => |id| try writeConstant(w, ir.constants.items[@intFromEnum(id)], ty),
             .parameter => |index| try w.print("p{d}", .{index}),
             .local_slot, .local_load => |value| try w.print("v{d}", .{@intFromEnum(value)}),
@@ -2271,6 +2280,102 @@ test "union lowering and emission own source and survive every allocation failur
     defer test_gpa.free(c);
     try compileAndRunExpected(c, "typedef int nonempty_translation_unit;", 0, union_output, "");
     try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{union_program});
+}
+
+const field_mutation =
+    \\let K = enum { first, second, }
+    \\let Alias = R
+    \\let R = struct { x: i8 = 10, y: int = 0, s: string = "hé\0", b: bool = false, k: K = .first, len: uint = 0, }
+    \\let copy: (r: R) -> R = {let mut local = r
+    \\    local.x = 99
+    \\    local.s += "copy"
+    \\    local}
+    \\let early: () -> R = {let mut r = R[]
+    \\    r.x += {r.y = 7
+    \\        return r}}
+    \\let O = union { some: i8, none, }
+    \\let propagate: (o: O) -> O = {let mut r = R[]
+    \\    r.x += o.!
+    \\    .some[r.x]}
+    \\let main: () = {
+    \\    let mut r: Alias = R[]
+    \\    let saved = r
+    \\    r.x += {r.y = 7
+    \\        r.x = 90
+    \\        @print("A")
+    \\        3}
+    \\    @println(r.x, r.y, saved.x)
+    \\    r.x *= {r = R[.x = 100, .y = 8, .s = "new" + "!"]
+    \\        2}
+    \\    r.x -= 1
+    \\    r.x /= 5
+    \\    r.x %= 3
+    \\    r.b = true
+    \\    r.k = .second
+    \\    r.len = 42
+    \\    @println(r.x, r.y, r.s, r.b, r.k == K.second, r.len)
+    \\    r.s = "hé\0" + "old"
+    \\    let old = r
+    \\    r.s += {r.s = "discard" + "!"
+    \\        r.y = 9
+    \\        "tail" + "\0"}
+    \\    @println(r.s, old.s, r.y, copy(r).x, r.x)
+    \\    r.s += {r = R[.s = "whole" + "record", .y = 11]
+    \\        "!" + "!"}
+    \\    @println(r.s, r.y)
+    \\    let mut n: int = 0
+    \\    loop n < 3 {
+    \\        n += 1
+    \\        r.x += if n == 1 {continue} else {if n == 3 {break} else {2}}
+    \\    }
+    \\    @println(r.x, n, early().x, early().y)
+    \\    @println(match propagate(.none[]) {.some => false
+    \\        .none => true}, match propagate(.some[2]) {.some => |v| v
+    \\        .none => 0})
+    \\}
+;
+const field_mutation_output = "A13 7 10\n2 8 new! true true 42\nhé\x00oldtail\x00 hé\x00old 9 99 2\nhé\x00oldtail\x00!! 11\n12 3 10 7\ntrue 12\n";
+
+test "field mutation snapshots old fields but stores into current slots in strict C11" {
+    const c = try arrayTestProgram(field_mutation);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, field_mutation_output, "", mode);
+}
+
+test "field mutation terminal RHS panics before pending arithmetic or stores" {
+    for ([_][]const u8{ "=", "+=", "-=", "*=", "/=", "%=" }) |op| {
+        for ([_][]const u8{ "@panic(\"stop\")", "die()", "{let a:[]i8=[]\na[0]}" }) |rhs| {
+            const source = try std.fmt.allocPrint(test_gpa, "let R=struct{{x:i8=7,}}\n@[noreturn]\nlet die:()=@panic(\"stop\")\nlet main:()={{let mut r=R[]\nr.x {s} {{@print(\"R\")\n{s}}}}}", .{ op, rhs });
+            defer test_gpa.free(source);
+            const c = try arrayTestProgram(source);
+            defer test_gpa.free(c);
+            for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 1, "R", if (rhs[0] == '{') "panic: array index out of bounds\n" else "panic: stop\n", mode);
+        }
+    }
+    for ([_][]const u8{ "/=", "%=" }) |op| {
+        const source = try std.fmt.allocPrint(test_gpa, "let R=struct{{x:i8=7,}}\nlet main:()={{let mut r=R[]\nr.x {s} {{r=R[.x=99]\n@print(\"R\")\n0}}}}", .{op});
+        defer test_gpa.free(source);
+        const c = try arrayTestProgram(source);
+        defer test_gpa.free(c);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 1, "R", if (std.mem.eql(u8, op, "/=")) "panic: division by zero\n" else "panic: remainder by zero\n", mode);
+    }
+}
+
+test "field mutation owns source-free IR and survives every compiler allocation failure" {
+    var sema = blk: {
+        var module = try Module.init(test_gpa, "fields.nov", field_mutation);
+        defer module.deinit();
+        var result = try Lowering.lower(&module);
+        errdefer result.deinit();
+        try std.testing.expect(!module.hasErrors());
+        break :blk result;
+    };
+    defer sema.deinit();
+    try sema.ir.verify();
+    const c = try emitProgram(test_gpa, &sema.ir, null);
+    defer test_gpa.free(c);
+    try compileAndRunExpected(c, "typedef int nonempty_translation_unit;", 0, field_mutation_output, "");
+    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{field_mutation});
 }
 
 const record_program =
@@ -4180,6 +4285,36 @@ test "array element compound arithmetic wraps at every approved width" {
     for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, output.written(), "", mode);
 }
 
+test "struct field compound arithmetic wraps at every approved width" {
+    var source = std.Io.Writer.Allocating.init(test_gpa);
+    defer source.deinit();
+    var output = std.Io.Writer.Allocating.init(test_gpa);
+    defer output.deinit();
+    for ([_][]const u8{ "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "int", "uint" }) |name| try source.writer.print("let R_{s}=struct{{x:{s},}}\n", .{ name, name });
+    try source.writer.writeAll("let main: () -> void = {\n");
+    for ([_][]const u8{ "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "int", "uint" }) |name| {
+        const signed = name[0] == 'i';
+        const bits = if (std.mem.eql(u8, name, "int") or std.mem.eql(u8, name, "uint")) Ir.native_pointer_bits else try std.fmt.parseInt(u16, name[1..], 10);
+        const maximum = (@as(u128, 1) << @intCast(bits - @as(u16, if (signed) 1 else 0))) - 1;
+        try source.writer.print("{{let mut a = R_{s}[.x = {d}]\na.x += 1\n@println(a.x)\na.x -= 1\n@println(a.x)\na.x *= 2\n@println(a.x)\n", .{ name, maximum });
+        if (signed) {
+            try output.writer.print("-{d}\n{d}\n-2\n", .{ maximum + 1, maximum });
+            try source.writer.print("a.x = -{d}\na.x /= -1\n@println(a.x)\na.x %= -1\n@println(a.x)\n", .{maximum + 1});
+            try output.writer.print("-{d}\n0\n", .{maximum + 1});
+            try source.writer.writeAll("a.x = -7\na.x /= 3\n@println(a.x)\na.x = -7\na.x %= 3\n@println(a.x)}\n");
+            try output.writer.writeAll("-2\n-1\n");
+        } else {
+            try output.writer.print("0\n{d}\n{d}\n", .{ maximum, maximum - 1 });
+            try source.writer.writeAll("a.x = 7\na.x /= 3\n@println(a.x)\na.x = 7\na.x %= 3\n@println(a.x)}\n");
+            try output.writer.writeAll("2\n1\n");
+        }
+    }
+    try source.writer.writeAll("}");
+    const c = try arrayTestProgram(source.written());
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, output.written(), "", mode);
+}
+
 const array_compound_effects =
     \\let early: (c: bool) -> int = {
     \\    let mut a: []int = [10]
@@ -4361,7 +4496,7 @@ test "array capacity and append length overflow panic before accessing backing" 
 }
 
 test "array allocation failure retries preserve roots and shutdown frees backing" {
-    for ([_][]const u8{ array_example, array_compound_effects, inferred_example, inferred_arrays, string_example, string_compound, string_equality, unconditional_loops, else_loops, array_membership, string_interpolation, record_program }, [_][]const u8{ "3 30 30 6\n454 15\n99 15 4\nfalse true 2\n0\n", array_compound_output, inferred_output, inferred_arrays_output, string_output, string_compound_output, string_equality_output, unconditional_output, else_loop_output, array_membership_output, string_interpolation_output, record_output }) |source, output| {
+    for ([_][]const u8{ array_example, array_compound_effects, inferred_example, inferred_arrays, string_example, string_compound, string_equality, unconditional_loops, else_loops, array_membership, string_interpolation, record_program, field_mutation }, [_][]const u8{ "3 30 30 6\n454 15\n99 15 4\nfalse true 2\n0\n", array_compound_output, inferred_output, inferred_arrays_output, string_output, string_compound_output, string_equality_output, unconditional_output, else_loop_output, array_membership_output, string_interpolation_output, record_output, field_mutation_output }) |source, output| {
         const c = try arrayTestProgram(source);
         defer test_gpa.free(c);
         const injected = try std.mem.concat(test_gpa, u8, &.{
@@ -4380,7 +4515,7 @@ test "array allocation failure retries preserve roots and shutdown frees backing
             c,
         });
         defer test_gpa.free(exhausted);
-        for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(exhausted, "typedef int nonempty_translation_unit;", 1, if (std.mem.eql(u8, source, inferred_example)) "7\n8\n" else if (std.mem.eql(u8, source, inferred_arrays)) "7\n" else if (std.mem.eql(u8, source, else_loops)) "false true false\n42 42 5\nexhausted 5 3 3\ncondition continuation body\n10 11 12 14\n3 7\n31 32 3\ntrue\n" else if (std.mem.eql(u8, source, record_program)) "NS" else "", "panic: GC allocation failed\n", mode);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(exhausted, "typedef int nonempty_translation_unit;", 1, if (std.mem.eql(u8, source, inferred_example)) "7\n8\n" else if (std.mem.eql(u8, source, inferred_arrays)) "7\n" else if (std.mem.eql(u8, source, else_loops)) "false true false\n42 42 5\nexhausted 5 3 3\ncondition continuation body\n10 11 12 14\n3 7\n31 32 3\ntrue\n" else if (std.mem.eql(u8, source, record_program)) "NS" else if (std.mem.eql(u8, source, field_mutation)) "A13 7 10\n" else "", "panic: GC allocation failed\n", mode);
     }
 }
 

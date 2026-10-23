@@ -44,6 +44,8 @@ pub const Operation = union(enum) {
     union_payload: FieldRead,
     record_init: []const ValueId,
     field_read: FieldRead,
+    /// Update only this field of the current mutable local, not a record snapshot.
+    field_store: struct { slot: ValueId, index: u32, value: ValueId },
     /// Decimal integers, true/false booleans, or a shared immutable string.
     to_string: ValueId,
     array_literal: []const ValueId,
@@ -651,6 +653,12 @@ fn validateBody(self: *const Ir, function: Function, body: Body) VerifyError!voi
             },
             .local_load => |slot| {
                 if (try slotType(body, slot, i) != instruction.ty) return error.OperandTypeMismatch;
+            },
+            .field_store => |store| {
+                if (ty != .void) return error.InvalidOperation;
+                const base = self.getType(try slotType(body, store.slot, i)).?;
+                if (base != .record or base.record.tagged or store.index >= base.record.fields.len) return error.InvalidOperation;
+                if (try operandType(body, store.value, i) != base.record.fields[store.index].ty) return error.OperandTypeMismatch;
             },
             .local_store => |store| {
                 if (ty != .void) return error.InvalidOperation;

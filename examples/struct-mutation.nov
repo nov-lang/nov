@@ -1,0 +1,25 @@
+let State = enum {
+    idle,
+    active,
+}
+
+let Counter = struct {
+    count: uint = 0,
+    label: string = "Counter",
+    enabled: bool = false,
+    state: State = .idle,
+}
+
+let main: () = {
+    let mut counter = Counter[]
+    let original = counter
+    loop _ in 0..3 {
+        counter.count += 1
+    }
+    counter.count *= 2
+    counter.label += " updated"
+    counter.enabled = true
+    counter.state = .active
+    @println(counter.label, counter.count, counter.enabled, counter.state == .active)
+    @println(original.label, original.count, original.enabled, original.state == .idle)
+}

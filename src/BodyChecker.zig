@@ -1016,6 +1016,56 @@ const Context = struct {
         return true;
     }
 
+    fn fieldAssignment(self: *Context, node: Ast.Node.Index, expected: ?Known, depth: usize) Error!?Ir.TypeId {
+        const ast = &self.module.source.ast;
+        const data = ast.nodes.items(.data)[node];
+        const target = ast.nodes.items(.data)[data.lhs];
+        const name = ast.tokenSlice(target.rhs);
+        if (std.mem.eql(u8, name, "len")) {
+            if (try self.probe(target.lhs, depth + 1)) |base| {
+                const ty = self.ir.getType(base.ty).?;
+                if (ty == .array or ty == .string) return self.fail(.unsupported_array_length_write, data.lhs, null);
+            }
+        }
+        if (ast.nodes.items(.tag)[target.lhs] != .identifier) return self.fail(.unsupported_assignment_target, data.lhs, null);
+        const binding_name = self.module.sourceSlice(self.span(target.lhs)).?;
+        const binding = self.bindings.get(binding_name) orelse {
+            if (self.module.lookup(binding_name)) |id| return self.fail(.immutable_assignment, target.lhs, self.module.getDeclaration(id).?.name_span);
+            return self.fail(.unknown_name, target.lhs, null);
+        };
+        const record = self.ir.getType(binding.known.ty).?;
+        if (record != .record or record.record.tagged) return self.fail(.unsupported_assignment_target, data.lhs, null);
+        if (!binding.mutable) return self.fail(.immutable_assignment, target.lhs, binding.name_span);
+        const index = self.fieldIndex(binding.known.ty, name) orelse return self.fail(.unknown_field, data.lhs, null);
+        const field = record.record.fields[index];
+        const tag = ast.nodes.items(.tag)[node];
+        const compound = tag != .assign;
+        const ty = self.ir.getType(field.ty).?;
+        if (compound and ty != .integer and !(ty == .string and tag == .assign_add)) return self.fail(.operator_not_supported, node, null);
+        if (compound and try self.expression(data.lhs, .{ .ty = field.ty }, depth + 1) == null) return null;
+        if (try self.expression(data.rhs, .{ .ty = field.ty }, depth + 1) == null) return null;
+        const unit = try self.ir.internType(.void);
+        if (!self.terminated) {
+            if (self.emitter) |emitter| {
+                var value = try emitter.value(data.rhs);
+                if (compound) value = try emitter.append(field.ty, self.irSpan(node), .{ .binary = .{
+                    .op = switch (tag) {
+                        .assign_add => .add,
+                        .assign_sub => .sub,
+                        .assign_mul => .mul,
+                        .assign_div => .div,
+                        .assign_mod => .mod,
+                        else => unreachable,
+                    },
+                    .lhs = try emitter.value(data.lhs),
+                    .rhs = value,
+                } });
+                try emitter.record(node, unit, self.irSpan(node), .{ .field_store = .{ .slot = binding.slot.?, .index = index, .value = value } });
+            }
+        }
+        return self.fit(unit, expected, node);
+    }
+
     fn elementAssignment(self: *Context, node: Ast.Node.Index, expected: ?Known, depth: usize) Error!?Ir.TypeId {
         const ast = &self.module.source.ast;
         const data = ast.nodes.items(.data)[node];
@@ -1817,14 +1867,7 @@ const Context = struct {
                 return if (expected) |want| want.ty else unit;
             },
             .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod => {
-                if (ast.nodes.items(.tag)[data.lhs] == .field_access) {
-                    const target = ast.nodes.items(.data)[data.lhs];
-                    if (std.mem.eql(u8, ast.tokenSlice(target.rhs), "len")) {
-                        if (try self.probe(target.lhs, depth + 1)) |base| {
-                            if (self.ir.getType(base.ty).? == .array) return self.fail(.unsupported_array_length_write, data.lhs, null);
-                        }
-                    }
-                }
+                if (ast.nodes.items(.tag)[data.lhs] == .field_access) return self.fieldAssignment(node, expected, depth);
                 if (ast.nodes.items(.tag)[data.lhs] == .array_access) return self.elementAssignment(node, expected, depth);
                 if (ast.nodes.items(.tag)[data.lhs] != .identifier) return self.fail(.unsupported_assignment_target, data.lhs, null);
                 const name = self.module.sourceSlice(self.span(data.lhs)).?;

@@ -1,5 +1,14 @@
 # TODO
 
+Direct mutable-local struct fields support exact bool/integer/string/enum assignment,
+integer +=/-=/*=//=/%= and string +=. Compounds snapshot the old field before RHS;
+final stores change only that field in the current local, preserving other-field
+and whole-record RHS changes. Terminal RHS skips the pending operation/store.
+Copies remain independent, strings share immutable storage, and string owners stay
+rooted. No nested/temporary/union/parameter/pointer mutation or implicit borrowing.
+See examples/struct-mutation.nov. Nested records, broader arrays and generic structs
+are the next aggregate foundations; prioritized roadmap is in local PLAN.md.
+
 Option.isSome/isNone and Result.isOk/isErr are ordinary public bool-returning
 methods that test only the active variant, without unwrapping or inspecting payloads.
 They work with scalar, record and void payloads. Real-import CLI tests cover both
@@ -106,7 +115,7 @@ immediately after each argument is evaluated, before the next argument. Only
 argument-free `@[public]` on immutable supported declarations is accepted; named
 imports enforce public top-level access, not full member visibility or a C export policy. C value layouts/root frames retain every string owner in
 parameters, temporaries, local slots and control-flow merges. Contextual/anonymous
-constructors, field mutation, nested/array/function fields,
+constructors, nested/array/function fields,
 record arrays/globals, container constants/types, derived printing,
 generic structs and FFI remain deferred. See README's executable struct
 contract; the older broader syntax examples below are not delivery claims.

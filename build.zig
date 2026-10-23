@@ -116,6 +116,7 @@ fn addGcTests(b: *std.Build, test_step: *std.Build.Step) void {
 
 fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
+    addFieldMutationCliTests(b, exe, test_step, fixtures);
     _ = fixtures.add("library-result-source.nov", @embedFile("lib/result.nov"));
     const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
     _ = fixtures.add("library-result.nov",
@@ -419,7 +420,7 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         .{ .name = "fmt condition loops detects changes", .args = &.{ "fmt", "--check", "loop-program.nov" }, .exit_code = 1, .stderr_match = "file is not formatted" },
         .{ .name = "fmt value break checks syntax only", .args = &.{ "fmt", "--check", "value-break.nov" }, .exit_code = 1, .stderr_match = "file is not formatted" },
         .{ .name = "fmt scalar arrays example", .args = &.{ "fmt", "--check", "scalar-arrays.nov" }, .exit_code = 0 },
-        .{ .name = "fmt rejects array length writes", .args = &.{ "fmt", "--check", "array-length-write.nov" }, .exit_code = 1, .stderr_match = "formatting this syntax is not supported yet; file unchanged" },
+        .{ .name = "fmt length writes checks syntax only", .args = &.{ "fmt", "--check", "array-length-write.nov" }, .exit_code = 1, .stderr_match = "file is not formatted" },
         .{ .name = "fmt executable example", .args = &.{ "fmt", "--check", "checkout.nov" }, .exit_code = 0 },
         .{ .name = "check semantic mutable locals", .args = &.{ "check", "--semantic", "mutable-program.nov" }, .exit_code = 0 },
         .{ .name = "emit rejects immutable assignment", .args = &.{ "emit-c", "immutable-assignment.nov" }, .exit_code = 1, .stderr_match = "immutable-assignment.nov:2:1: error: assignment requires a mutable local" },
@@ -1083,6 +1084,54 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
             }
         }
     }
+}
+
+fn addFieldMutationCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step, fixtures: *std.Build.Step.WriteFile) void {
+    _ = fixtures.add("field-library.nov", "let K = enum { no, yes, }\nlet R = struct { x: int = 1, s: string = \"old\", b: bool = false, k: K = .no, len: uint = 0, }\n");
+    _ = fixtures.add("field-mutation.nov",
+        \\let library = @import("field-library.nov")
+        \\let Alias = library.R
+        \\let main: () = {
+        \\    let mut r = Alias[]
+        \\    let copy = r
+        \\    r.x += {
+        \\        r = Alias[ .x = 99, .len = 8 ]
+        \\        2
+        \\    }
+        \\    r.s += "!"
+        \\    r.b = true
+        \\    r.k = .yes
+        \\    @println(r.x, r.s, r.b, r.k == library.K.yes, r.len, copy.x, copy.s)
+        \\}
+        \\
+    );
+    _ = fixtures.add("struct-mutation-example.nov", @embedFile("examples/struct-mutation.nov"));
+    const programs = [_]struct { source: []const u8, output: []const u8 }{
+        .{ .source = "field-mutation.nov", .output = "3 old! true true 8 1 old\n" },
+        .{ .source = "struct-mutation-example.nov", .output = "Counter updated 6 true true\nCounter 0 false true\n" },
+    };
+    for (programs) |program| for ([_][]const u8{ "semantic", "fmt", "default", "--debug", "--release" }) |mode| {
+        const run = b.addRunArtifact(exe);
+        run.step.name = b.fmt("CLI field mutation: {s} {s}", .{ program.source, mode });
+        run.setCwd(fixtures.getDirectory());
+        const semantic = std.mem.eql(u8, mode, "semantic");
+        const fmt = std.mem.eql(u8, mode, "fmt");
+        if (semantic) {
+            run.addArgs(&.{ "check", "--semantic", program.source });
+        } else if (fmt) {
+            run.addArgs(&.{ "fmt", "--check", program.source });
+        } else {
+            run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+            run.setEnvironmentVariable("NOV_CC", "");
+            run.setEnvironmentVariable("CC", "");
+            run.addArgs(&.{ "run", program.source });
+            if (!std.mem.eql(u8, mode, "default")) run.addArg(mode);
+        }
+        run.expectExitCode(0);
+        run.expectStdOutEqual(if (semantic or fmt) "" else program.output);
+        run.expectStdErrEqual("");
+        test_step.dependOn(&run.step);
+    };
 }
 
 fn addOptionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step, fixtures: *std.Build.Step.WriteFile, library: std.Build.LazyPath) void {

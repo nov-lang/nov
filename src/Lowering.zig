@@ -565,7 +565,7 @@ test "nominal records reject mismatches malformed constructors defaults fields a
         .{ .source = "let A=struct{x:()->int,}", .tag = .unsupported_type },
         .{ .source = "let A=struct{x:A,}", .tag = .unsupported_type },
         .{ .source = "let A=struct{x:B,}\nlet B=struct{x:A,}", .tag = .unsupported_type },
-        .{ .source = "let A=struct{x:int,}\nlet f:(a:A)={a.x=1}", .tag = .unsupported_assignment_target },
+        .{ .source = "let A=struct{x:int,}\nlet f:(a:A)={a.x=1}", .tag = .immutable_assignment },
         .{ .source = "let A=struct{x:int,}\nlet f:(a:A)->int=a.y", .tag = .unknown_field },
         .{ .source = "let A=struct{x:int,}\nlet f:(a:[]A)= {}", .tag = .unsupported_type },
         .{ .source = "let A=struct{x:int=0,}\nlet a=A[]", .tag = .unsupported_global_initializer },
@@ -591,6 +591,96 @@ test "nominal records reject mismatches malformed constructors defaults fields a
         try std.testing.expectEqual(@as(usize, 0), result.ir.functions.items.len);
         try std.testing.checkAllAllocationFailures(std.testing.allocator, testRejectedMatchAllocations, .{case.source});
     }
+}
+
+test "field mutation rejects nonlocals immutable bindings unsupported operators and inexact types" {
+    const prefix = "let K=enum{a,b,}\nlet Other=enum{a,b,}\nlet R=struct{x:i8=0,s:string=\"\",b:bool=false,k:K=.a,}\nlet U=union{x:i8,}\n";
+    const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag };
+    for ([_]Case{
+        .{ .source = "let f:(r:R)={r.x=1}", .tag = .immutable_assignment },
+        .{ .source = "let f:()={let r=R[]\nr.x=1}", .tag = .immutable_assignment },
+        .{ .source = "let f:()={R[].x=1}", .tag = .unsupported_assignment_target },
+        .{ .source = "let f:()={let mut r=R[]\nr.s.len=1}", .tag = .unsupported_array_length_write },
+        .{ .source = "let f:()={let mut r=R[]\nr.x.missing=1}", .tag = .unsupported_assignment_target },
+        .{ .source = "let f:()={let mut u:U=.x[1]\nu.x=2}", .tag = .unsupported_assignment_target },
+        .{ .source = "let f:()={let mut r=R[]\nr.missing=1}", .tag = .unknown_field },
+        .{ .source = "let f:()={let mut r=R[]\nr.x=128}", .tag = .literal_out_of_range },
+        .{ .source = "let f:()={let mut r=R[]\nr.x=true}", .tag = .literal_type_mismatch },
+        .{ .source = "let f:(n:i16)={let mut r=R[]\nr.x=n}", .tag = .expression_type_mismatch },
+        .{ .source = "let f:()={let mut r=R[]\nr.k=Other.a}", .tag = .literal_type_mismatch },
+        .{ .source = "let f:()={let mut r=R[]\nr.b+=true}", .tag = .operator_not_supported },
+        .{ .source = "let f:()={let mut r=R[]\nr.k+=.a}", .tag = .operator_not_supported },
+        .{ .source = "let f:()={let mut r=R[]\nr.s-=\"x\"}", .tag = .operator_not_supported },
+        .{ .source = "let f:()->i8={let mut r=R[]\nr.x=1}", .tag = .expression_type_mismatch },
+    }) |case| {
+        const source = try std.mem.concat(std.testing.allocator, u8, &.{ prefix, case.source });
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "field-errors.nov", source);
+        defer module.deinit();
+        var result = try lower(&module);
+        defer result.deinit();
+        try std.testing.expect(module.hasErrors());
+        try std.testing.expectEqual(case.tag, module.diagnostics.items[module.diagnostics.items.len - 1].tag);
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+    }
+}
+
+test "field stores verify slot identity field bounds exact types prior operands spans and private regions" {
+    var module = try Module.init(std.testing.allocator, "field-ir.nov",
+        \\let R=struct{x:int=0,s:string="",}
+        \\let U=union{x:int,}
+        \\let f:()={let mut r=R[]
+        \\    let mut u:U=.x[1]
+        \\    let mut scalar:int=1
+        \\    if true {let mut private=R[]
+        \\        private.x=23}
+        \\    r.x=7}
+    );
+    defer module.deinit();
+    var result = try lower(&module);
+    defer result.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try result.ir.verify();
+    const body = result.ir.functions.items[0].body.?;
+    const instructions = @constCast(body.instructions);
+    const last = &instructions[instructions.len - 1];
+    try std.testing.expect(last.op == .field_store);
+    const saved = last.*;
+    defer last.* = saved;
+    for (0..11) |case| {
+        last.* = saved;
+        switch (case) {
+            0 => last.op.field_store.slot = @enumFromInt(0),
+            1 => last.op.field_store.slot = @enumFromInt(instructions.len),
+            2 => last.op.field_store.index = 99,
+            3 => last.op.field_store.value = saved.op.field_store.slot,
+            4 => last.op.field_store.value = @enumFromInt(instructions.len - 1),
+            5 => last.ty = instructions[@intFromEnum(saved.op.field_store.value)].ty,
+            6 => last.op.field_store.index = 1,
+            7 => last.span.end = std.math.maxInt(u32),
+            10 => last.ty = @enumFromInt(std.math.maxInt(u32)),
+            8, 9 => {
+                for (instructions[0 .. instructions.len - 1]) |instruction| {
+                    if (instruction.op == .field_store) {
+                        if (case == 8) last.op.field_store.slot = instruction.op.field_store.slot else last.op.field_store.value = instruction.op.field_store.value;
+                    }
+                }
+            },
+            else => unreachable,
+        }
+        if (result.ir.verify()) |_| return error.ExpectedInvalidFieldStore else |_| {}
+    }
+    // Tagged and nonrecord mutable slots are valid slots, but never field bases.
+    for (instructions, 0..) |instruction, i| {
+        if (instruction.op != .local_slot) continue;
+        const ty = result.ir.getType(instruction.ty).?;
+        if (ty == .record and !ty.record.tagged) continue;
+        last.* = saved;
+        last.op.field_store.slot = @enumFromInt(i);
+        try std.testing.expectError(error.InvalidOperation, result.ir.verify());
+    }
+    last.* = saved;
+    try result.ir.verify();
 }
 
 test "record verifier rejects corrupt field counts indices types defaults spans and nominal identities" {
