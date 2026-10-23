@@ -1,0 +1,4 @@
+let result = @import("result.nov")
+
+@[public]
+let Result = result.Result

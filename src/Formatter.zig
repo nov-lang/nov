@@ -188,7 +188,7 @@ fn checkSupported(ast: Ast) !void {
             .attr_one => if (data.rhs != 0 or (!std.mem.eql(u8, ast.tokenSlice(data.lhs), "public") and !std.mem.eql(u8, ast.tokenSlice(data.lhs), "noreturn"))) return error.UnsupportedSyntax,
             .builtin_literal => {
                 const name = ast.tokenSlice(main);
-                if (!std.mem.eql(u8, name, "@print") and !std.mem.eql(u8, name, "@println") and !std.mem.eql(u8, name, "@as") and !std.mem.eql(u8, name, "@panic") and !std.mem.eql(u8, name, "@This"))
+                if (!std.mem.eql(u8, name, "@print") and !std.mem.eql(u8, name, "@println") and !std.mem.eql(u8, name, "@as") and !std.mem.eql(u8, name, "@panic") and !std.mem.eql(u8, name, "@This") and !std.mem.eql(u8, name, "@import"))
                     return error.UnsupportedSyntax;
             },
             .@"break" => if (data.lhs != 0) return error.UnsupportedSyntax,
@@ -370,7 +370,7 @@ test "invalid sources are rejected" {
 
 test "unsupported syntax fails closed including nested expressions" {
     for ([_][:0]const u8{
-        "let x=@import(\"memory\")\n",
+        "let x=@unknown(\"memory\")\n",
         "let x=call({&value})\n",
         "let x=a[0..2].b\n",
         "let x=[[1], [2]]\n",
@@ -849,4 +849,33 @@ test "preservation checks detect code comment and structural loss" {
     var b = try Parser.parse(std.testing.allocator, "let x=1 * 2 + 3\n");
     defer b.deinit(std.testing.allocator);
     try std.testing.expect(!sameStructure(a, b));
+}
+
+test "namespace import formatting preserves literal spellings comments and idempotence" {
+    for ([_][:0]const u8{
+        \\let std=@import("std"); named namespace
+        \\let Result=std.Result
+        ,
+        \\; paths retain escapes and relative spelling
+        \\let sibling=@import("./sub/../helper.nov")
+        \\let escaped=@import("\x2e/helper.nov")
+        ,
+        \\let module=@import( ; literal argument
+        \\"../helper.nov")
+        \\let alias=module
+        ,
+        // Formatting is syntactic; the loader, not the formatter, validates calls.
+        \\let computed=@import(path)
+        \\let missing=@import()
+        ,
+    }) |source| {
+        const formatted = try format(std.testing.allocator, source);
+        defer std.testing.allocator.free(formatted);
+        const terminated = try std.testing.allocator.dupeZ(u8, formatted);
+        defer std.testing.allocator.free(terminated);
+        try std.testing.expect(sameTokensAndComments(source, terminated));
+        const again = try format(std.testing.allocator, terminated);
+        defer std.testing.allocator.free(again);
+        try std.testing.expectEqualStrings(formatted, again);
+    }
 }

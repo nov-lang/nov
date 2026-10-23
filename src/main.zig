@@ -17,6 +17,7 @@ const Parser = @import("Parser.zig");
 const Diagnostics = @import("Diagnostics.zig");
 const Formatter = @import("Formatter.zig");
 const Module = @import("Module.zig");
+const Compilation = @import("Compilation.zig");
 const Dependencies = @import("Dependencies.zig");
 const Lowering = @import("Lowering.zig");
 const CEmitter = @import("CEmitter.zig");
@@ -29,6 +30,7 @@ const params = clap.parseParamsComptime(
     \\--check                Check formatting without changing files (fmt only).
     \\--exclude <str>...      Exclude a literal file/directory path (fmt only).
     \\--semantic             Check the bounded semantic/lowering subset (check only).
+    \\--lib-dir <str>         Override the library root (semantic check/emit-c/build/run).
     \\--debug                Compile with -O0 -g (build/run only).
     \\--release              Compile with -O3 (default; build/run only).
     \\--cc <str>             C compiler executable (build/run only).
@@ -47,6 +49,7 @@ fn usage(writer: *std.Io.Writer) !void {
         \\       nov run <file> [--cc <executable>] [--debug|--release]
         \\
         \\Check syntax, or the bounded semantic subset with --semantic.
+        \\Semantic commands accept --lib-dir; the default is executable-relative ../lib/nov.
         \\Emit program C11 with emit-c, compile with build, or compile and run with run.
         \\
         \\Options:
@@ -129,6 +132,16 @@ pub fn main(init: std.process.Init) !u8 {
         try stderr.writeAll("error: --semantic requires the check command\n");
         return 1;
     }
+    if (res.args.@"lib-dir") |lib_dir| {
+        if (!is_build and !is_run and !is_emit and !(args.len != 0 and std.mem.eql(u8, args[0], "check") and res.args.semantic != 0)) {
+            try stderr.writeAll("error: --lib-dir requires semantic check, emit-c, build, or run\n");
+            return 1;
+        }
+        if (lib_dir.len == 0) {
+            try stderr.writeAll("error: --lib-dir requires a nonempty path\n");
+            return 1;
+        }
+    }
     if (res.args.check != 0 and !is_fmt) {
         try stderr.writeAll("error: --check requires the fmt command\n");
         return 1;
@@ -150,7 +163,7 @@ pub fn main(init: std.process.Init) !u8 {
             try stderr.print("error: {s} requires exactly one file; program arguments are not supported yet\n", .{if (is_run) "run" else "build"});
             return 1;
         }
-        return buildFile(init.io, init.gpa, init.environ_map, files[0], res.args.output, res.args.cc, mode, is_run, stderr) catch |err| {
+        return buildFileWithLibrary(init.io, init.gpa, init.environ_map, files[0], res.args.output, res.args.cc, mode, is_run, res.args.@"lib-dir", stderr) catch |err| {
             try stderr.print("{s}: error: {s}\n", .{ files[0], @errorName(err) });
             return 1;
         };
@@ -162,7 +175,7 @@ pub fn main(init: std.process.Init) !u8 {
         }
         var buffer: [4096]u8 = undefined;
         var stdout = std.Io.File.stdout().writer(init.io, &buffer);
-        const valid = emitFile(init.io, init.gpa, args[1], stderr, &stdout.interface) catch |err| {
+        const valid = emitFileWithLibrary(init.io, init.gpa, args[1], res.args.@"lib-dir", stderr, &stdout.interface) catch |err| {
             try stderr.print("{s}: error: {s}\n", .{ args[1], @errorName(err) });
             return 1;
         };
@@ -197,7 +210,10 @@ pub fn main(init: std.process.Init) !u8 {
     }
     var failed = false;
     for (args[1..]) |path| {
-        const valid = processFile(init.io, init.gpa, path, stderr, is_fmt, res.args.check != 0, res.args.semantic != 0) catch |err| {
+        const valid = (if (res.args.semantic != 0)
+            checkFile(init.io, init.gpa, path, res.args.@"lib-dir", stderr)
+        else
+            processFile(init.io, init.gpa, path, stderr, false, false, false)) catch |err| {
             try stderr.print("{s}: error: {s}\n", .{ path, @errorName(err) });
             failed = true;
             continue;
@@ -268,6 +284,7 @@ fn formatStdin(allocator: std.mem.Allocator, input: *std.Io.Reader, output: *std
 }
 
 fn processFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, stderr: *std.Io.Writer, is_fmt: bool, check_only: bool, semantic: bool) !bool {
+    if (semantic) return checkFile(io, allocator, path, null, stderr);
     const cwd = std.Io.Dir.cwd();
     // Resolve symlinks so atomic replacement updates the target, not the link.
     const resolved = try cwd.realPathFileAlloc(io, path, allocator);
@@ -275,7 +292,7 @@ fn processFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, stder
     const source = try cwd.readFileAllocOptions(io, resolved, allocator, .limited(1024 * 1024), .of(u8), 0);
     defer allocator.free(source);
     if (std.mem.indexOfScalar(u8, source, 0) != null) return error.InvalidSource;
-    if (semantic) return checkSemantic(allocator, path, source, stderr);
+
     var ast = try Parser.parse(allocator, source);
     defer ast.deinit(allocator);
     try Diagnostics.render(ast, path, stderr);
@@ -302,9 +319,15 @@ fn processFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, stder
 }
 
 fn buildFile(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Environ.Map, path: []const u8, output_option: ?[]const u8, cc: ?[]const u8, mode: Driver.Mode, execute: bool, stderr: *std.Io.Writer) !u8 {
+    return buildFileWithLibrary(io, allocator, env, path, output_option, cc, mode, execute, null, stderr);
+}
+
+fn buildFileWithLibrary(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Environ.Map, path: []const u8, output_option: ?[]const u8, cc: ?[]const u8, mode: Driver.Mode, execute: bool, lib_dir: ?[]const u8, stderr: *std.Io.Writer) !u8 {
+    var compilation = try loadCompilation(io, allocator, path, lib_dir);
+    defer compilation.deinit();
     var source = std.Io.Writer.Allocating.init(allocator);
     defer source.deinit();
-    if (!try emitFile(io, allocator, path, stderr, &source.writer)) return 1;
+    if (!try emitCompilation(allocator, &compilation, stderr, &source.writer)) return 1;
 
     const temp_root = env.get("TMPDIR") orelse env.get("TEMP") orelse
         (if (builtin.os.tag == .windows) "." else "/tmp");
@@ -322,17 +345,18 @@ fn buildFile(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.E
     const default_output = if (output_option == null) try Driver.defaultOutput(allocator, path) else null;
     defer if (default_output) |output| allocator.free(output);
     const output = output_option orelse default_output.?;
-    const source_path = try cwd.realPathFileAlloc(io, path, allocator);
-    defer allocator.free(source_path);
+
     const existing_output = cwd.realPathFileAlloc(io, output, allocator) catch |err| switch (err) {
         error.FileNotFound => null,
         else => return err,
     };
     defer if (existing_output) |resolved| allocator.free(resolved);
     if (existing_output) |resolved| {
-        if (std.mem.eql(u8, source_path, resolved)) {
-            try stderr.writeAll("error: output path refers to the input source file\n");
-            return 1;
+        for (compilation.modules.items) |module| {
+            if (std.mem.eql(u8, module.source.path, resolved)) {
+                try stderr.writeAll("error: output path refers to the input source file\n");
+                return 1;
+            }
         }
     }
     // Publish only a successful build, retaining executable permissions.
@@ -341,10 +365,65 @@ fn buildFile(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.E
 }
 
 fn emitFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, stderr: *std.Io.Writer, stdout: *std.Io.Writer) !bool {
-    const source = try std.Io.Dir.cwd().readFileAllocOptions(io, path, allocator, .limited(1024 * 1024), .of(u8), 0);
-    defer allocator.free(source);
-    if (std.mem.indexOfScalar(u8, source, 0) != null) return error.InvalidSource;
-    return emitSource(allocator, path, source, stderr, stdout);
+    return emitFileWithLibrary(io, allocator, path, null, stderr, stdout);
+}
+
+fn loadCompilation(io: std.Io, allocator: std.mem.Allocator, path: []const u8, lib_dir: ?[]const u8) !Compilation {
+    if (lib_dir) |root| return Compilation.load(allocator, io, path, .{ .lib_dir = root });
+    const exe_dir = try std.process.executableDirPathAlloc(io, allocator);
+    defer allocator.free(exe_dir);
+    const root = try std.fs.path.resolve(allocator, &.{ exe_dir, "..", "lib", "nov" });
+    defer allocator.free(root);
+    return Compilation.load(allocator, io, path, .{ .lib_dir = root });
+}
+
+fn checkFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, lib_dir: ?[]const u8, stderr: *std.Io.Writer) !bool {
+    var compilation = try loadCompilation(io, allocator, path, lib_dir);
+    defer compilation.deinit();
+    if (compilation.hasErrors()) {
+        try Diagnostics.renderCompilation(&compilation, stderr);
+        return false;
+    }
+    var result = try Lowering.lowerCompilation(&compilation);
+    defer result.deinit();
+    try Diagnostics.renderCompilation(&compilation, stderr);
+    return !compilation.hasErrors();
+}
+
+fn emitFileWithLibrary(io: std.Io, allocator: std.mem.Allocator, path: []const u8, lib_dir: ?[]const u8, stderr: *std.Io.Writer, stdout: *std.Io.Writer) !bool {
+    var compilation = try loadCompilation(io, allocator, path, lib_dir);
+    defer compilation.deinit();
+    return emitCompilation(allocator, &compilation, stderr, stdout);
+}
+
+fn emitCompilation(allocator: std.mem.Allocator, compilation: *Compilation, stderr: *std.Io.Writer, stdout: *std.Io.Writer) !bool {
+    if (compilation.hasErrors()) {
+        try Diagnostics.renderCompilation(compilation, stderr);
+        return false;
+    }
+    var result = try Lowering.lowerCompilation(compilation);
+    defer result.deinit();
+    if (compilation.hasErrors()) {
+        try Diagnostics.renderCompilation(compilation, stderr);
+        return false;
+    }
+    const entry = if (compilation.root_main) |id| result.getCompilationEntry(id).?.function else null;
+    const missing_span: Ir.Span = if (compilation.root_main) |id| blk: {
+        const ref = compilation.getDeclaration(id).?;
+        break :blk compilation.getModule(ref.source).?.getDeclaration(ref.local).?.name_span;
+    } else .{ .source = compilation.root.?, .start = 0, .end = 0 };
+    var diagnostic: CEmitter.Diagnostic = undefined;
+    const c_source = CEmitter.emitProgramRoot(allocator, &result.ir, entry, missing_span, &diagnostic) catch |err| switch (err) {
+        error.UnsupportedIntegerWidth, error.MissingEntrypoint, error.InvalidEntrypoint => {
+            if (err == error.MissingEntrypoint and compilation.root_main != null) diagnostic.reason = .entrypoint_signature;
+            try Diagnostics.renderCompilationBackend(compilation, diagnostic, stderr);
+            return false;
+        },
+        else => return err,
+    };
+    defer allocator.free(c_source);
+    try stdout.writeAll(c_source);
+    return true;
 }
 
 fn emitSource(allocator: std.mem.Allocator, path: []const u8, source: [:0]const u8, stderr: *std.Io.Writer, stdout: *std.Io.Writer) !bool {
@@ -884,6 +963,24 @@ test "build and run integrate discovery, preserve outputs, and clean temporary f
     const source = try tmp.dir.readFileAlloc(io, "input.nov", allocator, .limited(1024));
     defer allocator.free(source);
     try std.testing.expectEqualStrings("let main: () -> void = {}\n", source);
+
+    const imported_source = "let value: () -> bool = true\n";
+    try tmp.dir.writeFile(io, .{ .sub_path = "imported.nov", .data = imported_source });
+    try tmp.dir.writeFile(io, .{ .sub_path = "input.nov", .data = "let imported = @import(\"imported.nov\")\nlet main: () = @println(imported.value())\n" });
+    try tmp.dir.symLink(io, "imported.nov", "imported-link.nov", .{});
+    for ([_][]const u8{ "imported.nov", "imported-link.nov" }) |name| {
+        const imported_output = try std.fs.path.join(allocator, &.{ root, name });
+        defer allocator.free(imported_output);
+        var guard_diagnostics = std.Io.Writer.Allocating.init(allocator);
+        defer guard_diagnostics.deinit();
+        try std.testing.expectEqual(@as(u8, 1), try buildFile(io, allocator, &env, input, imported_output, compilers[0], .release, false, &guard_diagnostics.writer));
+        try std.testing.expectEqualStrings("error: output path refers to the input source file\n", guard_diagnostics.written());
+        const preserved = try tmp.dir.readFileAlloc(io, name, allocator, .limited(1024));
+        defer allocator.free(preserved);
+        try std.testing.expectEqualStrings(imported_source, preserved);
+    }
+    const link = try tmp.dir.statFile(io, "imported-link.nov", .{ .follow_symlinks = false });
+    try std.testing.expectEqual(.sym_link, link.kind);
     var iterator = tmp.dir.iterate();
     while (try iterator.next(io)) |entry| {
         try std.testing.expect(!std.mem.startsWith(u8, entry.name, "nov-"));
@@ -891,6 +988,7 @@ test "build and run integrate discovery, preserve outputs, and clean temporary f
 }
 
 test {
+    _ = Compilation;
     _ = Ast;
     _ = Ir;
     _ = Module;

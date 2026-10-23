@@ -727,11 +727,11 @@ The delivered subset is deliberately bounded:
   separated by spaces, with the existing checked-write/flush behavior. Thus a
   method's own effects can precede later argument effects; conversions are not
   repeated by the final write. Allocating methods return normal immutable strings.
-- Exactly one argument-free `@[public]` is accepted on struct and method
-  declarations. Metadata is preserved for future visibility work; this does not
-  implement imports, cross-module access control or change the C export policy.
-  Other attributes, duplicate attributes and `public` on other declarations
-  diagnose instead of being ignored.
+- Exactly one argument-free `@[public]` is accepted on supported immutable
+  declarations, including structs, methods and module re-exports. Named import
+  namespaces enforce public top-level exports; method-level access control remains
+  incomplete. This does not change C export policy. Duplicate, unknown or invalidly
+  placed attributes diagnose instead of being ignored.
 
 C emission uses flat stack value structs with index-mangled fields and injectively
 mangled method symbols. Reachable layouts precede function-pointer typedefs and
@@ -949,8 +949,8 @@ let Stack: (T: #type) -> type = struct {
 
 #### Executable Result propagation
 
-[examples/results.nov](examples/results.nov) defines its own ordinary generic
-`Result`, handles both variants, and propagates errors with `.!`. It prints:
+[examples/results.nov](examples/results.nov) imports the standard library's ordinary
+generic `Result`, handles both variants, and propagates errors with `.!`. It prints:
 
 ```text
 Doubled: 42
@@ -977,17 +977,55 @@ with public `unwrapOr` and `unwrapOrElse` methods. `unwrapOr` evaluates its fall
 as an ordinary argument even on success. `unwrapOrElse` evaluates the callback
 value normally but calls its body only on error. Neither requires a Result builtin.
 
-The build installs `lib/` at `<prefix>/lib/nov`, and tests exercise the actual
-library source in single-module harnesses. **Imports are not implemented yet**:
-there is no automatic Result injection or library-path lookup, and the existing
-examples retain local definitions for now. See [`lib/README.md`](lib/README.md)
-for this integration boundary. A source-qualified multi-file compilation layer
-must precede consuming this module through `@import`.
+[`lib/std.nov`](lib/std.nov) publicly re-exports Result from `result.nov`. Both Result
+examples now use real imports rather than copied definitions:
+
+```nov
+let std = @import("std")
+let Result = std.Result
+```
+
+The build installs `lib/` at `<prefix>/lib/nov`. The compiler finds `std.nov` relative
+to its executable at `../lib/nov`; semantic check, emit-c, build and run accept
+`--lib-dir <path>` to override the library root. No implicit working-directory
+search or developer-checkout path is used. Tests exercise real library imports,
+callbacks and void payloads, plus a relocated executable/library installation.
+See [`lib/README.md`](lib/README.md).
+
+#### Executable imports
+
+- Only immutable top-level `let ns = @import("literal")` namespace bindings are
+  supported. `"std"` names the installed entry module; explicit relative paths
+  must end in `.nov` and resolve against the importing source directory. Computed,
+  interpolated, local/runtime, absolute-path and other named imports diagnose.
+- Imports do not inject bare names. Namespace aliases, qualified declarations and
+  explicit re-exports work. Supported ordinary functions, constants, nominal types,
+  aliases and generic union templates/methods retain their defining scope.
+- Canonical paths cache each source once, including repeated/diamond imports.
+  Independently declared types in different files remain nominally distinct;
+  aliases and generic arguments preserve canonical identity across import paths.
+  Import cycles and excessive import depth diagnose rather than partially compile.
+- Each file retains its own AST and source-qualified locations. One semantic
+  worklist and shared IR pools cover the compilation; diagnostics and related
+  notes can refer to different files. IR owns names/layouts/body storage and source
+  bounds independently of source ASTs. Imported declarations are not simulated by
+  concatenation, source-name rewriting or special Result handling.
+- Only the root source's `main` is an entrypoint. Imported same-named functions
+  cannot collide or become the entrypoint. Build output cannot overwrite any loaded
+  source, including imported/library files or their resolved symlink targets.
+- Named namespaces expose public top-level declarations only; explicit file imports
+  also expose unmarked declarations. This is not complete visibility enforcement:
+  method access through exported nominal types still permits unmarked methods,
+  and `@[private]` remains unsupported. Public exports do not define a C ABI.
+- Plain `check` remains syntax-only for its input files; `check --semantic`, emit-c,
+  build and run load the import graph. Formatting preserves import literals and
+  does not load imports. General runtime module initializers, wildcard injection,
+  arbitrary package search and broader visibility/resource policies remain deferred.
 
 `examples/error.nov` now uses `.!` and explicit Result returns, with its alternative
 implementations commented out. It is still a filesystem design example, not an
-executable program: imports and filesystem resources remain future work. Instance
-calls now support explicit by-value receivers. Nominal enum error kinds and exhaustive enum matches are implemented. Record payloads and record interpolation are implemented;
+executable program: the filesystem library and its resource semantics remain future
+work. Imports are implemented. Instance calls support explicit by-value receivers. Nominal enum error kinds and exhaustive enum matches are implemented. Record payloads and record interpolation are implemented;
 terminal `@panic` follows the `@[noreturn]` void-function contract described below.
 
 [examples/structured-errors.nov](examples/structured-errors.nov) is a runnable
@@ -1895,9 +1933,10 @@ TODO
 - `@[require(condition..., "optional error message")`: Ensure that the specified conditions are verified for the arguments given to a function or to a container initializer.
 <!-- - `@[ensure(condition..., "optional error message")`: Ensure that the specified conditions are verified for the values returned by a function. -->
 
-The executable subset accepts a single argument-free `@[public]` on a nominal
-struct/union or its method declaration, preserving metadata without enforcing
-cross-module visibility or changing C exports. It also accepts argument-free
+The executable subset accepts a single argument-free `@[public]` on supported
+immutable declarations, including types, functions, constants and re-exports.
+Named namespaces enforce public top-level access, while member-level visibility
+remains incomplete; C exports are unchanged. It also accepts argument-free
 `@[noreturn]` on ordinary function and method declarations; the attributes may be
 combined where both are supported. Duplicate attributes, arguments, invalid
 placements and unknown/unsupported attributes diagnose. Other entries in this list
@@ -1934,8 +1973,11 @@ use `_Noreturn`; function-pointer typedefs remain ordinary void-returning types.
 Attributes can be set only on top level / container declarations
 
 ## Visibility
-The following visibility rules are a design description, not delivered import or
-access-control behavior. The bounded struct slice only preserves `public` metadata.
+Named import namespaces currently enforce `@[public]` for top-level exports;
+explicit file imports also expose unmarked declarations. Public re-exports work.
+Full member-level access control and `@[private]` are not implemented; method lookup
+through exported nominal types still permits unmarked methods. The broader rules
+below describe the intended design, not a claim of complete enforcement.
 Visibility is modified via [attributes](#Attributes).
 
 - public: visible everywhere

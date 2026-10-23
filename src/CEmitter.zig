@@ -76,19 +76,33 @@ pub fn emit(allocator: std.mem.Allocator, ir: *const Ir, diagnostic: ?*Diagnosti
 
 /// Emits a program, leaving library emission through `emit` unchanged.
 pub fn emitProgram(allocator: std.mem.Allocator, ir: *const Ir, diagnostic: ?*Diagnostic) Error![]u8 {
-    try ir.verify();
     for (ir.functions.items, 0..) |function, i| {
-        if (!std.mem.eql(u8, function.name, "main")) continue;
-        const signature = ir.types.items[@intFromEnum(function.ty)].function;
-        if (signature.params.len != 0 or ir.types.items[@intFromEnum(signature.result)] != .void) {
-            return fail(diagnostic, .entrypoint_signature, .{ .function = @enumFromInt(i), .span = function.span });
-        }
-        const library = try emit(allocator, ir, diagnostic);
-        defer allocator.free(library);
-        return std.fmt.allocPrint(allocator, "{s}\nint main(void) {{\n    nov_main();\n{s}{s}    return 0;\n}}\n", .{ library, if (usesPrinting(ir)) "    nov_rt_check(fflush(stdout));\n" else "", if (usesManagedRuntime(ir)) "    nov_gc_shutdown(&nov_rt_heap);\n" else "" });
+        if (@intFromEnum(function.span.source) == 0 and std.mem.eql(u8, function.name, "main"))
+            return emitProgramRoot(allocator, ir, @enumFromInt(i), .{ .start = ir.source_len, .end = ir.source_len }, diagnostic);
     }
-    if (diagnostic) |d| d.* = .{ .reason = .entrypoint_missing, .function = null, .span = .{ .start = ir.source_len, .end = ir.source_len } };
-    return error.MissingEntrypoint;
+    return emitProgramRoot(allocator, ir, null, .{ .start = ir.source_len, .end = ir.source_len }, diagnostic);
+}
+
+/// The caller supplies the root declaration's FunctionId. An imported function
+/// named main must never implicitly become the process entrypoint.
+pub fn emitProgramRoot(allocator: std.mem.Allocator, ir: *const Ir, entry: ?Ir.FunctionId, missing_span: Ir.Span, diagnostic: ?*Diagnostic) Error![]u8 {
+    try ir.verify();
+    const id = entry orelse {
+        if (diagnostic) |d| d.* = .{ .reason = .entrypoint_missing, .function = null, .span = missing_span };
+        return error.MissingEntrypoint;
+    };
+    const function = ir.getFunction(id) orelse return error.InvalidFunctionId;
+    const signature = ir.types.items[@intFromEnum(function.ty)].function;
+    if (signature.params.len != 0 or ir.types.items[@intFromEnum(signature.result)] != .void)
+        return fail(diagnostic, .entrypoint_signature, .{ .function = id, .span = function.span });
+    const library = try emit(allocator, ir, diagnostic);
+    defer allocator.free(library);
+    var out = std.Io.Writer.Allocating.init(allocator);
+    errdefer out.deinit();
+    out.writer.print("{s}\nint main(void) {{\n    ", .{library}) catch return error.OutOfMemory;
+    writeScopedFunctionName(&out.writer, function) catch return error.OutOfMemory;
+    out.writer.print("();\n{s}{s}    return 0;\n}}\n", .{ if (usesPrinting(ir)) "    nov_rt_check(fflush(stdout));\n" else "", if (usesManagedRuntime(ir)) "    nov_gc_shutdown(&nov_rt_heap);\n" else "" }) catch return error.OutOfMemory;
+    return out.toOwnedSlice();
 }
 
 fn fail(diagnostic: ?*Diagnostic, reason: Diagnostic.Reason, origin: Origin) Error {
@@ -430,7 +444,7 @@ fn writeSignature(ir: *const Ir, w: *std.Io.Writer, function: Ir.Function) Write
     const signature = ir.types.items[@intFromEnum(function.ty)].function;
     try writeType(ir, w, signature.result);
     try w.writeByte(' ');
-    try writeFunctionName(w, function.name);
+    try writeScopedFunctionName(w, function);
     try w.writeByte('(');
     if (signature.params.len == 0) try w.writeAll("void");
     for (signature.params, 0..) |param, i| {
@@ -444,6 +458,16 @@ fn writeSignature(ir: *const Ir, w: *std.Io.Writer, function: Ir.Function) Write
 /// Injective: `_` becomes `__` and any other non-alphanumeric byte `_XX`, so
 /// Nov names can neither collide with each other nor with C keywords, libc or
 /// the generated `nov_fn_N` typedefs.
+fn sameFunction(a: Ir.Function, b: Ir.Function) bool {
+    return a.span.source == b.span.source and std.mem.eql(u8, a.name, b.name);
+}
+
+fn writeScopedFunctionName(w: *std.Io.Writer, function: Ir.Function) WriteError!void {
+    // The single underscore separator cannot occur inside an encoded Nov name.
+    if (@intFromEnum(function.span.source) != 0) try w.print("nov_M{d}_", .{@intFromEnum(function.span.source)});
+    try writeFunctionName(w, function.name);
+}
+
 fn writeFunctionName(w: *std.Io.Writer, name: []const u8) WriteError!void {
     try w.writeAll("nov_");
     for (name) |c| switch (c) {
@@ -539,7 +563,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
             value_used[@intFromEnum(binary.rhs)] = true;
         },
         .call => |call| {
-            if (!call.noreturn or std.mem.eql(u8, ir.functions.items[@intFromEnum(body.instructions[@intFromEnum(call.callee)].op.function_ref)].name, function.name)) value_used[@intFromEnum(call.callee)] = true;
+            if (!call.noreturn or sameFunction(ir.functions.items[@intFromEnum(body.instructions[@intFromEnum(call.callee)].op.function_ref)], function)) value_used[@intFromEnum(call.callee)] = true;
             for (call.args) |arg| value_used[@intFromEnum(arg)] = true;
         },
         .print => |print| for (print.args) |arg| {
@@ -687,7 +711,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
             const call = instruction.op.call;
             const target = body.instructions[@intFromEnum(call.callee)].op.function_ref;
             try w.writeAll("    ");
-            if (std.mem.eql(u8, ir.functions.items[@intFromEnum(target)].name, function.name)) {
+            if (sameFunction(ir.functions.items[@intFromEnum(target)], function)) {
                 // Volatile indirection avoids C compilers rejecting valid Nov
                 // recursion under -Winfinite-recursion. C11 has no noreturn
                 // pointer qualifier, so explicitly represent the absent successor.
@@ -700,7 +724,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
                 }
                 try w.writeAll(");\n    for (;;) {}\n    }\n");
             } else {
-                try writeFunctionName(w, ir.functions.items[@intFromEnum(target)].name);
+                try writeScopedFunctionName(w, ir.functions.items[@intFromEnum(target)]);
                 try w.writeByte('(');
                 for (call.args, 0..) |arg, index| {
                     if (index != 0) try w.writeAll(", ");
@@ -812,7 +836,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, w: *std.Io.Writer, fun
             .constant => |id| try writeConstant(w, ir.constants.items[@intFromEnum(id)], ty),
             .parameter => |index| try w.print("p{d}", .{index}),
             .local_slot, .local_load => |value| try w.print("v{d}", .{@intFromEnum(value)}),
-            .function_ref => |id| try writeFunctionName(w, ir.functions.items[@intFromEnum(id)].name),
+            .function_ref => |id| try writeScopedFunctionName(w, ir.functions.items[@intFromEnum(id)]),
             .unary => |unary| switch (unary.op) {
                 .bool_not => try w.print("!v{d}", .{@intFromEnum(unary.operand)}),
                 .bit_not => {
@@ -1542,7 +1566,7 @@ test "generic union ordinary methods specialize callbacks siblings recursion and
     var sema = blk: {
         var module = try Module.init(test_gpa, "generic-method.nov", generic_method_program);
         defer module.deinit();
-        if (module.hasErrors()) std.debug.print("parse {any} collection {any}\n", .{ module.ast.errors, module.diagnostics.items });
+        if (module.hasErrors()) std.debug.print("parse {any} collection {any}\n", .{ module.source.ast.errors, module.diagnostics.items });
         var result = try Lowering.lower(&module);
         errdefer result.deinit();
         if (module.hasErrors()) std.debug.print("generic methods: {any}\n", .{module.diagnostics.items});
@@ -2350,7 +2374,7 @@ fn emitSource(source: []const u8, diagnostic: ?*Diagnostic) ![]u8 {
     var sema = try Lowering.lower(&module);
     defer sema.deinit();
     if (module.hasErrors()) {
-        for (module.ast.errors) |err| std.debug.print("parse error: {any}\n", .{err});
+        for (module.source.ast.errors) |err| std.debug.print("parse error: {any}\n", .{err});
         for (module.diagnostics.items) |err| std.debug.print("{s} at {d}: {s}\n", .{ @tagName(err.tag), err.span.start, module.sourceSlice(err.span) orelse "<invalid span>" });
     }
     try std.testing.expect(!module.hasErrors());
@@ -5475,6 +5499,26 @@ test "integer constants cover every supported width without invalid literals" {
     }
 }
 
+test "source-qualified functions share pools without entrypoint or C symbol collisions" {
+    var ir = Ir.init(test_gpa);
+    defer ir.deinit();
+    try ir.source_lengths.appendSlice(test_gpa, &.{ 1, 1 });
+    const unit = try ir.internType(.void);
+    const signature = try ir.internType(.{ .function = .{ .params = &.{}, .result = unit } });
+    const imported_span: Ir.Span = .{ .source = @enumFromInt(1), .start = 0, .end = 1 };
+    const root_span: Ir.Span = .{ .start = 0, .end = 1 };
+    const imported = try ir.addFunction("main", signature, imported_span);
+    try ir.setFunctionBody(imported, &.{.{ .ty = unit, .span = imported_span, .op = .{ .return_value = null } }}, @enumFromInt(0));
+    try std.testing.expectError(error.MissingEntrypoint, emitProgram(test_gpa, &ir, null));
+    const root = try ir.addFunction("main", signature, root_span);
+    try ir.setFunctionBody(root, &.{.{ .ty = unit, .span = root_span, .op = .{ .return_value = null } }}, @enumFromInt(0));
+    const source = try emitProgramRoot(test_gpa, &ir, root, root_span, null);
+    defer test_gpa.free(source);
+    try std.testing.expect(std.mem.indexOf(u8, source, "void nov_M1_nov_main(void)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, source, "int main(void) {\n    nov_main();") != null);
+    try compileAndRun(source, "typedef int nonempty_translation_unit;");
+}
+
 test "function names are mangled injectively" {
     var out = std.Io.Writer.Allocating.init(test_gpa);
     defer out.deinit();
@@ -5737,4 +5781,61 @@ test "fixed width arithmetic boundaries and zero panics in generated C" {
             }
         }
     }
+}
+
+test "cross source generic reexports retain defining scope under forced GC after graph release" {
+    const Compilation = @import("Compilation.zig");
+    var sema = blk: {
+        var comp = Compilation.init(test_gpa);
+        defer comp.deinit();
+        const root = try comp.addSource("/app/main.nov",
+            \\let std=@import("std")
+            \\let Result=std.Result
+            \\let R=Result(string,string)
+            \\let prefix="WRONG"
+            \\let helper:()->string="WRONG"
+            \\let main:()={let mut r:R=.ok["a"+"b"]
+            \\    let saved=r
+            \\    r=.err["error"]
+            \\    @println(saved.unwrapOr("fallback"),r.unwrapOr("fall"+"back"),saved.message())}
+        );
+        const entry = try comp.addSource("/lib/std.nov",
+            \\let result=@import("result.nov")
+            \\@[public]
+            \\let Result=result.Result
+            \\let main:()=@println("WRONG MAIN")
+        );
+        const library = try comp.addSource("/lib/result.nov",
+            \\let prefix="library:"
+            \\let helper:()->string="helper"
+            \\@[public]
+            \\let Result:(T:type,E:type)->type=union{ok:T,err:E,
+            \\let Self=@This()
+            \\@[public]
+            \\let unwrapOr:(self:Self,fallback:T)->T=match self{.ok=>|v|v
+            \\.err=>fallback}
+            \\let message:(self:Self)->string=prefix+helper()
+            \\}
+        );
+        for ([_]struct { source: @import("Source.zig").Id, name: []const u8, target: @import("Source.zig").Id, named: bool }{
+            .{ .source = root, .name = "std", .target = entry, .named = true },
+            .{ .source = entry, .name = "result", .target = library, .named = false },
+        }) |edge| {
+            const module = comp.getModule(edge.source).?;
+            const local = module.lookup(edge.name).?;
+            try comp.imports.append(test_gpa, .{ .declaration = comp.declaration_ids.get(.{ .source = edge.source, .local = local }).?, .target = edge.target, .named = edge.named, .span = module.getDeclaration(local).?.name_span });
+        }
+        comp.setRoot(root);
+        var result = try Lowering.lowerCompilation(&comp);
+        errdefer result.deinit();
+        try std.testing.expect(!comp.hasErrors());
+        try std.testing.expect(result.lowering_complete);
+        break :blk result;
+    };
+    defer sema.deinit();
+    const library = try emit(test_gpa, &sema.ir, null);
+    defer test_gpa.free(library);
+    const program = try collectingTestProgram(library);
+    defer test_gpa.free(program);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(program, "typedef int nonempty_translation_unit;", 0, "ab fallback library:helper\n", "", mode);
 }

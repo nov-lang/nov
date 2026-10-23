@@ -5,7 +5,69 @@ const Sema = @import("Sema.zig");
 const Ir = @import("Ir.zig");
 const BodyChecker = @import("BodyChecker.zig");
 
+const Compilation = @import("Compilation.zig");
+
 pub const Error = Sema.Error;
+
+/// Whole-graph lowering uses one semantic table and one set of IR pools.
+/// The returned owner remains valid after the Compilation is destroyed.
+pub fn lowerCompilation(comp: *Compilation) Error!Sema {
+    const starts = try comp.allocator.alloc(usize, comp.modules.items.len);
+    defer comp.allocator.free(starts);
+    for (comp.modules.items, starts) |module, *start| start.* = module.diagnostics.items.len;
+    errdefer for (comp.modules.items, starts) |module, start| module.diagnostics.shrinkRetainingCapacity(start);
+    var result = try Sema.analyzeCompilation(comp);
+    errdefer result.deinit();
+    if (comp.hasErrors()) return result;
+    for (comp.declarations.items, result.entries) |ref, entry| {
+        const module = comp.getModule(ref.source).?;
+        const declaration = module.getDeclaration(ref.local).?;
+        if (entry.status == .namespace or entry.status == .type_alias or entry.status == .generic or entry.status == .unrequested) continue;
+        if (module.source.ast.decl(declaration.node).ast.is_mutable or (entry.status != .body_checked and entry.status != .constant_checked)) {
+            try module.diagnostics.append(comp.allocator, .{ .tag = deferredDiagnostic(module, declaration), .span = declaration.name_span });
+        }
+    }
+    if (comp.hasErrors()) return result;
+    const types = try comp.allocator.alloc(?Ir.TypeId, result.entries.len);
+    defer comp.allocator.free(types);
+    const constants = try comp.allocator.alloc(?Ir.ConstId, result.entries.len);
+    defer comp.allocator.free(constants);
+    const functions = try comp.allocator.alloc(?Ir.FunctionId, result.entries.len);
+    defer comp.allocator.free(functions);
+    @memset(functions, null);
+    for (comp.declarations.items, result.entries, types, constants, 0..) |ref, *entry, *ty, *constant, i| {
+        const module = comp.getModule(ref.source).?;
+        const declaration = module.getDeclaration(ref.local).?;
+        ty.* = entry.type_id;
+        constant.* = entry.constant;
+        if (entry.status != .body_checked) continue;
+        const qualified = if (declaration.container) |owner| if (declaration.concrete_type) |concrete|
+            try std.fmt.allocPrint(comp.allocator, "{s}[{d}].{s}", .{ module.getDeclaration(owner).?.name, concrete, declaration.name })
+        else
+            try std.fmt.allocPrint(comp.allocator, "{s}.{s}", .{ module.getDeclaration(owner).?.name, declaration.name }) else null;
+        defer if (qualified) |name| comp.allocator.free(name);
+        const function = try result.ir.addFunction(qualified orelse declaration.name, entry.type_id.?, declaration.name_span);
+        result.ir.functions.items[@intFromEnum(function)].public = declaration.public;
+        result.ir.functions.items[@intFromEnum(function)].noreturn = entry.noreturn;
+        entry.function = function;
+        functions[i] = function;
+    }
+    for (comp.declarations.items, result.entries) |ref, *entry| {
+        if (entry.status != .body_checked) continue;
+        entry.status = if (try BodyChecker.lower(comp.getModule(ref.source).?, &result.ir, types, constants, functions, ref.local)) .lowered else .failed;
+    }
+    if (comp.hasErrors()) {
+        result.ir.clearFunctions();
+        for (result.entries) |*entry| {
+            entry.function = null;
+            if (entry.status == .lowered) entry.status = .body_checked;
+        }
+    } else {
+        try result.ir.verify();
+        result.lowering_complete = true;
+    }
+    return result;
+}
 
 /// Lowers a closed, bounded module: immutable literal globals and supported
 /// expression-body functions. Owns the returned IR independently of the AST.
@@ -16,16 +78,11 @@ pub fn lower(module: *Module) Error!Sema {
     var result = try Sema.analyzeFunctions(module);
     errdefer result.deinit();
     if (module.hasErrors()) return result;
-    result.ir.source_len = @intCast(module.ast.source.len);
+    result.ir.source_len = @intCast(module.source.ast.source.len);
     for (module.declarations.items, result.entries) |declaration, entry| {
-        if (entry.status == .type_alias or entry.status == .generic or entry.status == .unrequested) continue;
-        if (module.ast.decl(declaration.node).ast.is_mutable or (entry.status != .body_checked and entry.status != .constant_checked)) {
-            const full = module.ast.decl(declaration.node).ast;
-            const tag: Module.Diagnostic.Tag = if (!full.is_mutable and full.type_node == 0 and full.init_node != 0) blk: {
-                const init_tag = module.ast.nodes.items(.tag)[full.init_node];
-                break :blk if (init_tag == .number_literal or (init_tag == .negation and module.ast.nodes.items(.tag)[module.ast.nodes.items(.data)[full.init_node].rhs] == .number_literal)) .literal_needs_type else .unsupported_global_initializer;
-            } else .unsupported_lowering;
-            try module.diagnostics.append(module.allocator, .{ .tag = tag, .span = declaration.name_span });
+        if (entry.status == .namespace or entry.status == .type_alias or entry.status == .generic or entry.status == .unrequested) continue;
+        if (module.source.ast.decl(declaration.node).ast.is_mutable or (entry.status != .body_checked and entry.status != .constant_checked)) {
+            try module.diagnostics.append(module.allocator, .{ .tag = deferredDiagnostic(module, declaration), .span = declaration.name_span });
         }
     }
     if (module.hasErrors()) return result;
@@ -40,7 +97,7 @@ pub fn lower(module: *Module) Error!Sema {
         ty.* = entry.type_id;
         constant.* = entry.constant;
         if (entry.status != .body_checked) continue;
-        const span: Ir.Span = .{ .start = declaration.name_span.start, .end = declaration.name_span.end };
+        const span: Ir.Span = declaration.name_span;
         const qualified = if (declaration.container) |owner| if (declaration.concrete_type) |concrete|
             try std.fmt.allocPrint(result.allocator, "{s}[{d}].{s}", .{ module.getDeclaration(owner).?.name, concrete, declaration.name })
         else
@@ -69,6 +126,14 @@ pub fn lower(module: *Module) Error!Sema {
         result.lowering_complete = true;
     }
     return result;
+}
+
+fn deferredDiagnostic(module: *const Module, declaration: Module.Declaration) Module.Diagnostic.Tag {
+    const full = module.source.ast.decl(declaration.node).ast;
+    if (full.is_mutable or full.type_node != 0 or full.init_node == 0) return .unsupported_lowering;
+    const ast = &module.source.ast;
+    const tag = ast.nodes.items(.tag)[full.init_node];
+    return if (tag == .number_literal or (tag == .negation and ast.nodes.items(.tag)[ast.nodes.items(.data)[full.init_node].rhs] == .number_literal)) .literal_needs_type else .unsupported_global_initializer;
 }
 
 const demand_result_source =
@@ -170,7 +235,7 @@ test "generic methods reject inexact types leaked bindings and invalid concrete 
         defer std.testing.allocator.free(source);
         var module = try Module.init(std.testing.allocator, "generic-method-error.nov", source);
         defer module.deinit();
-        if (module.hasErrors()) std.debug.print("invalid method case {s}: parse {any} collect {any}\n", .{ case.source, module.ast.errors, module.diagnostics.items });
+        if (module.hasErrors()) std.debug.print("invalid method case {s}: parse {any} collect {any}\n", .{ case.source, module.source.ast.errors, module.diagnostics.items });
         var result = try lower(&module);
         defer result.deinit();
         var found = false;
@@ -252,7 +317,7 @@ test "generic union instances canonicalize aliases arguments and nominal declara
     defer module.deinit();
     var sema = try lower(&module);
     defer sema.deinit();
-    if (module.hasErrors()) std.debug.print("generic errors: {any}, parse: {any}\n", .{ module.diagnostics.items, module.ast.errors });
+    if (module.hasErrors()) std.debug.print("generic errors: {any}, parse: {any}\n", .{ module.diagnostics.items, module.source.ast.errors });
     try std.testing.expect(!module.hasErrors());
     try std.testing.expect(sema.lowering_complete);
     const a = sema.getEntry(module.lookup("A").?).?.alias_type.?;
@@ -358,7 +423,7 @@ test "generic unions and propagation diagnose exact types unsupported forms and 
         defer std.testing.allocator.free(source);
         var module = try Module.init(std.testing.allocator, "generic-error.nov", source);
         defer module.deinit();
-        try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+        try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
         var result = try lower(&module);
         defer result.deinit();
         var found = false;
@@ -403,7 +468,7 @@ test "unsupported union declarations and rejected matches roll back under OOM" {
         defer module.deinit();
         var result = try lower(&module);
         defer result.deinit();
-        try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+        try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
         var found = false;
         for (module.diagnostics.items) |diagnostic| if (diagnostic.tag == case.tag) {
             found = true;
@@ -450,7 +515,7 @@ test "nominal records reject mismatches malformed constructors defaults fields a
     }) |case| {
         var module = try Module.init(std.testing.allocator, "record-error.nov", case.source);
         defer module.deinit();
-        try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+        try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
         var result = try lower(&module);
         defer result.deinit();
         try std.testing.expect(!result.lowering_complete);
@@ -921,7 +986,7 @@ test "loop continuation regions and value breaks outlive source storage" {
             try std.testing.expect(r.body_start < r.continuation_start.?);
             try std.testing.expect(r.continuation_start.? < index);
             try std.testing.expect(sema.ir.getType(instruction.ty).? == .array);
-            try std.testing.expectEqualStrings("loop : {i += 1}", module.ast.source[instruction.span.start .. instruction.span.start + 15]);
+            try std.testing.expectEqualStrings("loop : {i += 1}", module.source.ast.source[instruction.span.start .. instruction.span.start + 15]);
         },
         .loop_break => |value| break_value = value,
         else => {},
@@ -1101,7 +1166,7 @@ test "printing lowers owned ordered arguments and operation spans" {
     const body = sema.ir.functions.items[1].body.?;
     const instruction = body.instructions[body.instructions.len - 1];
     try std.testing.expect(instruction.op.print.newline);
-    try std.testing.expectEqualStrings("@println(id(1), id(2), true)", module.ast.source[instruction.span.start..instruction.span.end]);
+    try std.testing.expectEqualStrings("@println(id(1), id(2), true)", module.source.ast.source[instruction.span.start..instruction.span.end]);
     const args = instruction.op.print.args;
     try std.testing.expectEqual(@as(usize, 3), args.len);
     try std.testing.expect(@intFromEnum(args[0]) < @intFromEnum(args[1]));
@@ -1130,7 +1195,7 @@ test "checked parameter arithmetic lowers into typed ordered values" {
     try std.testing.expectEqual(@as(u32, 1), @intFromEnum(body.instructions[2].op.binary.rhs));
     try std.testing.expectEqual(@as(u32, 2), @intFromEnum(body.result));
     const span = body.instructions[2].span;
-    try std.testing.expectEqualStrings("a + b", module.ast.source[span.start..span.end]);
+    try std.testing.expectEqualStrings("a + b", module.source.ast.source[span.start..span.end]);
     try sema.ir.verify();
 }
 
@@ -1200,7 +1265,7 @@ test "loop regions own repeated conditions bodies and spans after source destruc
     const body = sema.ir.functions.items[0].body.?;
     const loop = body.instructions[@intFromEnum(body.result)];
     const region = loop.op.loop;
-    try std.testing.expectEqualStrings("loop n < 2 {n += 1\n        if n == 1 {continue} else {break}}", module.ast.source[loop.span.start..loop.span.end]);
+    try std.testing.expectEqualStrings("loop n < 2 {n += 1\n        if n == 1 {continue} else {break}}", module.source.ast.source[loop.span.start..loop.span.end]);
     module.deinit();
     try std.testing.expect(!failed);
     try std.testing.expect(sema.lowering_complete);
@@ -1222,7 +1287,7 @@ test "unconditional loops reuse verified regions with source bounded true consta
     const loop = body.instructions[@intFromEnum(body.result)];
     const region = loop.op.loop;
     const condition = body.instructions[@intFromEnum(region.condition)];
-    try std.testing.expectEqualStrings("loop {break}", module.ast.source[loop.span.start..loop.span.end]);
+    try std.testing.expectEqualStrings("loop {break}", module.source.ast.source[loop.span.start..loop.span.end]);
     try std.testing.expectEqual(loop.span, condition.span);
     try std.testing.expectEqual(true, sema.ir.constants.items[@intFromEnum(condition.op.constant)].value.boolean);
     module.deinit();
@@ -1245,7 +1310,7 @@ test "return spans and owned terminal regions survive source destruction" {
     defer sema.deinit();
     const failed = module.hasErrors();
     for (sema.ir.functions.items[0].body.?.instructions) |instruction| {
-        if (instruction.op == .return_value) try std.testing.expect(std.mem.startsWith(u8, module.ast.source[instruction.span.start..instruction.span.end], "return 4"));
+        if (instruction.op == .return_value) try std.testing.expect(std.mem.startsWith(u8, module.source.ast.source[instruction.span.start..instruction.span.end], "return 4"));
     }
     module.deinit();
     try std.testing.expect(!failed);
@@ -1271,7 +1336,7 @@ test "if lowering owns branch ranges results and spans after source destruction"
     const body = sema.ir.functions.items[0].body.?;
     const merge = body.instructions[body.instructions.len - 1];
     const r = merge.op.branch;
-    try std.testing.expectEqualStrings("if c {n} else if c {1} else {2}", module.ast.source[merge.span.start..merge.span.end]);
+    try std.testing.expectEqualStrings("if c {n} else if c {1} else {2}", module.source.ast.source[merge.span.start..merge.span.end]);
     module.deinit();
     try std.testing.expect(!failed);
     try std.testing.expect(sema.lowering_complete);
@@ -1303,7 +1368,7 @@ test "short-circuit expressions lower explicit conditional RHS regions" {
         try std.testing.expectEqual(@as(u32, 1), region.rhs_start);
         try std.testing.expectEqual(@as(u32, 0), @intFromEnum(region.lhs));
         try std.testing.expect(body.instructions[@intFromEnum(region.rhs)].op == .call);
-        try std.testing.expectEqualStrings(source[std.mem.indexOf(u8, source, "false").?..], module.ast.source[merge.span.start..merge.span.end]);
+        try std.testing.expectEqualStrings(source[std.mem.indexOf(u8, source, "false").?..], module.source.ast.source[merge.span.start..merge.span.end]);
         try sema.ir.verify();
     }
 }
@@ -1419,21 +1484,21 @@ test "grouped values alias child values with operation-origin spans" {
     const id_body = sema.ir.getFunction(sema.getEntry(module.lookup("id").?).?.function.?).?.body.?;
     try std.testing.expectEqual(@as(usize, 1), id_body.instructions.len);
     const id_span = id_body.instructions[0].span;
-    try std.testing.expectEqualStrings("x", module.ast.source[id_span.start..id_span.end]);
+    try std.testing.expectEqualStrings("x", module.source.ast.source[id_span.start..id_span.end]);
     const factory = sema.ir.getFunction(sema.getEntry(module.lookup("factory").?).?.function.?).?.body.?;
     try std.testing.expectEqual(sema.getEntry(module.lookup("id").?).?.function.?, factory.instructions[0].op.function_ref);
     const main = sema.ir.getFunction(sema.getEntry(module.lookup("main").?).?.function.?).?.body.?;
     try std.testing.expectEqual(@as(usize, 6), main.instructions.len);
     try std.testing.expectEqual(Ir.BinaryOp.add, main.instructions[4].op.binary.op);
     const add_span = main.instructions[4].span;
-    try std.testing.expectEqualStrings("1 + 2", module.ast.source[add_span.start..add_span.end]);
+    try std.testing.expectEqualStrings("1 + 2", module.source.ast.source[add_span.start..add_span.end]);
     try std.testing.expectEqual(@as(u32, 4), @intFromEnum(main.instructions[5].op.call.args[0]));
     const empty = sema.ir.getFunction(sema.getEntry(module.lookup("empty").?).?.function.?).?.body.?;
     try std.testing.expectEqual(@as(usize, 1), empty.instructions.len);
     try std.testing.expect(sema.ir.getConstant(empty.instructions[0].op.constant).?.value == .void);
     const minimum = sema.ir.getFunction(sema.getEntry(module.lookup("minimum").?).?.function.?).?.body.?;
     const minimum_span = minimum.instructions[0].span;
-    try std.testing.expectEqualStrings("-{{128}}", module.ast.source[minimum_span.start..minimum_span.end]);
+    try std.testing.expectEqualStrings("-{{128}}", module.source.ast.source[minimum_span.start..minimum_span.end]);
     try sema.ir.verify();
 }
 
@@ -1507,4 +1572,417 @@ test "lowering ownership and source diagnostic rollback survive allocation failu
     }) |source| {
         try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
     }
+}
+
+fn testImport(comp: *Compilation, source: @import("Source.zig").Id, name: []const u8, target: @import("Source.zig").Id, named: bool) !void {
+    const module = comp.getModule(source).?;
+    const local = module.lookup(name).?;
+    try comp.imports.append(comp.allocator, .{ .declaration = comp.declaration_ids.get(.{ .source = source, .local = local }).?, .target = target, .named = named, .span = module.getDeclaration(local).?.name_span });
+}
+
+fn testImportProgram(allocator: std.mem.Allocator) !Sema {
+    var comp = Compilation.init(allocator);
+    defer comp.deinit();
+    const root = try comp.addSource("/app/main.nov",
+        \\let std=@import("std")
+        \\let Result=std.Result
+        \\let R=Result(string,string)
+        \\let prefix="WRONG"
+        \\let helper:()->string="WRONG"
+        \\let main:()={let r:R=.ok["value"]
+        \\    @println(r.unwrapOr("fallback"),r.label(),std.helper())}
+    );
+    const entry = try comp.addSource("/lib/std.nov",
+        \\let result=@import("result.nov")
+        \\@[public]
+        \\let Result=result.Result
+        \\@[public]
+        \\let helper:()->string=result.helper()
+        \\let main:()={}
+    );
+    const result = try comp.addSource("/lib/result.nov",
+        \\let prefix="library:"
+        \\let helper:()->string="helper"
+        \\@[public]
+        \\let Result:(T:type,E:type)->type=union{ok:T,err:E,
+        \\let Self=@This()
+        \\@[public]
+        \\let unwrapOr:(self:Self,fallback:T)->T=match self{.ok=>|v|v
+        \\.err=>fallback}
+        \\let label:(self:Self)->string=prefix+helper()
+        \\}
+    );
+    try testImport(&comp, root, "std", entry, true);
+    try testImport(&comp, entry, "result", result, false);
+    comp.setRoot(root);
+    var sema = try lowerCompilation(&comp);
+    errdefer sema.deinit();
+    if (comp.hasErrors()) {
+        for (comp.modules.items) |module| for (module.diagnostics.items) |diagnostic| std.debug.print("{s}: {s}: {s}\n", .{ module.source.path, @tagName(diagnostic.tag), module.sourceSlice(diagnostic.span) orelse "?" });
+    }
+    try std.testing.expect(!comp.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    const main_entry = sema.getCompilationEntry(comp.root_main.?).?;
+    try std.testing.expectEqual(root, sema.ir.getFunction(main_entry.function.?).?.span.source);
+    try sema.ir.verify();
+    return sema;
+}
+
+test "compilation imports lower reexported generic methods in defining scope and own source free IR" {
+    var sema = try testImportProgram(std.testing.allocator);
+    defer sema.deinit();
+    try sema.ir.verify();
+    const c = try CEmitter.emitProgramRoot(std.testing.allocator, &sema.ir, sema.entries[5].function, .{ .start = 0, .end = 0 }, null);
+    defer std.testing.allocator.free(c);
+    try std.testing.expect(c.len != 0);
+}
+
+test "compilation imports lower across every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var sema = try testImportProgram(allocator);
+            defer sema.deinit();
+        }
+    }.run, .{});
+}
+
+test "compilation diamond aliases canonicalize while colliding record and enum locals remain nominal" {
+    var comp = Compilation.init(std.testing.allocator);
+    defer comp.deinit();
+    const root = try comp.addSource("/root.nov",
+        \\let left=@import("left.nov")
+        \\let right=@import("right.nov")
+        \\let other=@import("other.nov")
+        \\let A=left.Shared
+        \\let B=right.Shared
+        \\let C=other.Shared
+        \\let E=left.Kind
+        \\let F=other.Kind
+        \\let main:()={let a:A=A[.value=true]
+        \\    let b:B=a
+        \\    @println(b.get(),left.answer(),other.answer())}
+    );
+    const left = try comp.addSource("/left.nov",
+        \\let lib=@import("shared.nov")
+        \\let Shared=lib.Shared
+        \\let Kind=lib.Kind
+        \\let answer:()->bool=lib.answer()
+    );
+    const right = try comp.addSource("/right.nov",
+        \\let lib=@import("shared.nov")
+        \\let Shared=lib.Shared
+    );
+    const shared = try comp.addSource("/shared.nov",
+        \\let Shared=struct{value:bool,
+        \\    let get:(self:Shared)->bool=self.value
+        \\}
+        \\let Kind=enum{one,two,}
+        \\let answer:()->bool=true
+    );
+    const other = try comp.addSource("/other.nov",
+        \\let Shared=struct{value:bool,
+        \\    let get:(self:Shared)->bool=false
+        \\}
+        \\let Kind=enum{one,two,}
+        \\let answer:()->bool=false
+    );
+    try testImport(&comp, root, "left", left, false);
+    try testImport(&comp, root, "right", right, false);
+    try testImport(&comp, root, "other", other, false);
+    try testImport(&comp, left, "lib", shared, false);
+    try testImport(&comp, right, "lib", shared, false);
+    comp.setRoot(root);
+    for (0..2) |_| {
+        var sema = try lowerCompilation(&comp);
+        defer sema.deinit();
+        try std.testing.expect(!comp.hasErrors());
+        try std.testing.expect(sema.lowering_complete);
+        const module = comp.getModule(root).?;
+        const a = sema.entries[sema.entryIndex(module, module.lookup("A").?)].alias_type.?;
+        const b = sema.entries[sema.entryIndex(module, module.lookup("B").?)].alias_type.?;
+        const c = sema.entries[sema.entryIndex(module, module.lookup("C").?)].alias_type.?;
+        try std.testing.expectEqual(a, b);
+        try std.testing.expect(a != c);
+        const e = sema.entries[sema.entryIndex(module, module.lookup("E").?)].alias_type.?;
+        const f = sema.entries[sema.entryIndex(module, module.lookup("F").?)].alias_type.?;
+        try std.testing.expect(e != f);
+        try std.testing.expectEqual(sema.ir.getType(a).?.record.identity, sema.ir.getType(c).?.record.identity);
+        try std.testing.expect(sema.ir.getType(a).?.record.source != sema.ir.getType(c).?.record.source);
+    }
+}
+
+test "compilation named namespaces reject unexported names and diagnose imported bodies at their source" {
+    for ([_]bool{ true, false }) |named| {
+        var comp = Compilation.init(std.testing.allocator);
+        defer comp.deinit();
+        const root = try comp.addSource("/root.nov",
+            \\let lib=@import("lib")
+            \\let Alias=lib.Hidden
+            \\let use:(x:Alias)->Alias=x
+            \\let main:()={}
+        );
+        const lib = try comp.addSource("/lib.nov",
+            \\let Hidden=struct{value:bool,}
+            \\let broken:()->bool=missing
+        );
+        try testImport(&comp, root, "lib", lib, named);
+        comp.setRoot(root);
+        var sema = try lowerCompilation(&comp);
+        defer sema.deinit();
+        try std.testing.expect(comp.hasErrors());
+        try std.testing.expect(!sema.lowering_complete);
+        const module = comp.getModule(if (named) root else lib).?;
+        try std.testing.expect(module.diagnostics.items.len != 0);
+        try std.testing.expectEqual(if (named) root else lib, module.diagnostics.items[0].span.source);
+    }
+}
+
+test "compilation namespace aliases direct generic applications and repeated diamonds share instances" {
+    var comp = Compilation.init(std.testing.allocator);
+    defer comp.deinit();
+    const root = try comp.addSource("/main.nov",
+        \\let left=@import("left.nov")
+        \\let right=@import("right.nov")
+        \\let ns=left
+        \\let A=ns.Result(bool,string)
+        \\let B=right.Result(bool,string)
+        \\let C=ns.types.Result(bool,string)
+        \\let main:()={let a:A=left.Result(bool,string).ok[true]
+        \\    let b:B=a
+        \\    let c:C=b
+        \\    @println(c.get(false))}
+    );
+    const left = try comp.addSource("/left.nov",
+        \\let types=@import("types.nov")
+        \\let Result=types.Result
+    );
+    const right = try comp.addSource("/right.nov",
+        \\let types=@import("types.nov")
+        \\let Result=types.Result
+    );
+    const types = try comp.addSource("/types.nov",
+        \\let Result:(T:type,E:type)->type=union{ok:T,err:E,
+        \\let Self=@This()
+        \\let get:(self:Self,fallback:T)->T=match self{.ok=>|v|v
+        \\.err=>fallback}
+        \\}
+    );
+    try testImport(&comp, root, "left", left, false);
+    try testImport(&comp, root, "right", right, false);
+    try testImport(&comp, left, "types", types, false);
+    try testImport(&comp, right, "types", types, false);
+    comp.setRoot(root);
+    var previous: ?Ir.TypeId = null;
+    for (0..2) |_| {
+        var sema = try lowerCompilation(&comp);
+        defer sema.deinit();
+        if (comp.hasErrors()) for (comp.modules.items) |m| for (m.diagnostics.items) |d| std.debug.print("{s}: {s}: {s}", .{ m.source.path, @tagName(d.tag), m.sourceSlice(d.span) orelse "?" });
+        try std.testing.expect(!comp.hasErrors());
+        const module = comp.getModule(root).?;
+        const a = sema.entries[sema.entryIndex(module, module.lookup("A").?)].alias_type.?;
+        for ([_][]const u8{ "B", "C" }) |name| try std.testing.expectEqual(a, sema.entries[sema.entryIndex(module, module.lookup(name).?)].alias_type.?);
+        if (previous) |id| try std.testing.expectEqual(id, a);
+        previous = a;
+        var instances: usize = 0;
+        for (sema.ir.types.items) |ty| if (ty == .record and ty.record.source == types) {
+            instances += 1;
+        };
+        try std.testing.expectEqual(@as(usize, 1), instances);
+    }
+}
+
+test "compilation in memory cycles reject before semantic analysis without namespace injection" {
+    var comp = Compilation.init(std.testing.allocator);
+    defer comp.deinit();
+    const root = try comp.addSource("/main.nov", "let other=@import(\"other.nov\")");
+    const other = try comp.addSource("/other.nov", "let root=@import(\"main.nov\")");
+    try testImport(&comp, root, "other", other, false);
+    try testImport(&comp, other, "root", root, false);
+    comp.setRoot(root);
+    var sema = try lowerCompilation(&comp);
+    defer sema.deinit();
+    try std.testing.expect(comp.hasErrors());
+    try std.testing.expectEqual(.import_cycle, comp.diagnostics.items[0].tag);
+    try std.testing.expect(!sema.lowering_complete);
+    try std.testing.expectEqual(@as(usize, 0), sema.ir.functions.items.len);
+}
+
+fn testCompilationGlobalDiagnostic(allocator: std.mem.Allocator, source: []const u8, expected: Module.Diagnostic.Tag, imported: bool) !void {
+    var comp = Compilation.init(allocator);
+    defer comp.deinit();
+    const root = try comp.addSource("/app/main.nov", if (imported) "let lib=@import(\"helper.nov\")" else source);
+    const target = if (imported) try comp.addSource("/app/helper.nov", source) else root;
+    if (imported) try testImport(&comp, root, "lib", target, false);
+    comp.setRoot(root);
+    var result = lowerCompilation(&comp) catch |err| {
+        for (comp.modules.items) |module| try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+        return err;
+    };
+    defer result.deinit();
+    const module = comp.getModule(target).?;
+    try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+    try std.testing.expectEqual(expected, module.diagnostics.items[0].tag);
+    try std.testing.expectEqual(target, module.diagnostics.items[0].span.source);
+    if (module.diagnostics.items[0].related) |note| try std.testing.expectEqual(target, note.source);
+    try std.testing.expect(!result.lowering_complete);
+    // Match the legacy CLI pipeline, including dependency diagnostics and spans.
+    var standalone = try Module.init(allocator, "/standalone.nov", source);
+    defer standalone.deinit();
+    var dependencies = try @import("Dependencies.zig").analyze(&standalone);
+    defer dependencies.deinit();
+    if (!standalone.hasErrors()) {
+        var lowered = try lower(&standalone);
+        defer lowered.deinit();
+    }
+    const actual = module.diagnostics.items[0];
+    const legacy = standalone.diagnostics.items[0];
+    try std.testing.expectEqual(legacy.tag, actual.tag);
+    try std.testing.expectEqual(legacy.span.start, actual.span.start);
+    try std.testing.expectEqual(legacy.span.end, actual.span.end);
+    try std.testing.expectEqual(legacy.related != null, actual.related != null);
+    if (legacy.related) |note| {
+        try std.testing.expectEqual(note.start, actual.related.?.start);
+        try std.testing.expectEqual(note.end, actual.related.?.end);
+    }
+}
+
+test "compilation deferred globals preserve standalone diagnostics root and imported source spans under OOM" {
+    const cases = [_]struct { source: []const u8, tag: Module.Diagnostic.Tag }{
+        .{ .source = "let n=1", .tag = .literal_needs_type },
+        .{ .source = "let n=-1", .tag = .literal_needs_type },
+        .{ .source = "let n=@as(int,missing)", .tag = .unknown_name },
+        .{ .source = "let n=@as(int,missing())", .tag = .unsupported_dependency_expression },
+        .{ .source = "let n=@as(int,{1})", .tag = .unsupported_global_initializer },
+        .{ .source = "let n=absent", .tag = .unknown_name },
+        .{ .source = "let x=y\nlet y=x", .tag = .value_cycle },
+        .{ .source = "let mut n:int=1", .tag = .unsupported_lowering },
+        .{ .source = "let n={let x=1\nx}", .tag = .unsupported_dependency_expression },
+    };
+    for (cases) |case| for ([_]bool{ false, true }) |imported| {
+        try testCompilationGlobalDiagnostic(std.testing.allocator, case.source, case.tag, imported);
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, testCompilationGlobalDiagnostic, .{ case.source, case.tag, imported });
+    };
+}
+
+fn testQualifiedEnumGlobal(allocator: std.mem.Allocator, source: []const u8, expected: ?Module.Diagnostic.Tag) !void {
+    var comp = Compilation.init(allocator);
+    defer comp.deinit();
+    _ = try comp.addSource("/unrelated.nov", "let marker=true");
+    const root = try comp.addSource("/app/main.nov", source);
+    const api = try comp.addSource("/lib/api.nov",
+        \\let enums=@import("enums.nov")
+        \\@[public]
+        \\let E=enums.E
+        \\@[public]
+        \\let Other=enums.Other
+        \\@[public]
+        \\let value=true
+        \\let hidden=true
+    );
+    const enums = try comp.addSource("/lib/enums.nov",
+        \\let E=enum{a,b,
+        \\let unmarked:(self:E)->bool=true
+        \\@[public]
+        \\let published:(self:E)->bool=false
+        \\}
+        \\let Other=enum{a,b,}
+    );
+    try testImport(&comp, root, "lib", api, true);
+    try testImport(&comp, api, "enums", enums, false);
+    comp.setRoot(root);
+    var result = lowerCompilation(&comp) catch |err| {
+        for (comp.modules.items) |module| try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+        return err;
+    };
+    defer result.deinit();
+    const module = comp.getModule(root).?;
+    if (expected) |tag| {
+        try std.testing.expect(!result.lowering_complete);
+        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+        const diagnostic = module.diagnostics.items[0];
+        try std.testing.expectEqual(tag, diagnostic.tag);
+        try std.testing.expectEqual(root, diagnostic.span.source);
+        try std.testing.expect(module.sourceSlice(diagnostic.span) != null);
+        if (tag == .literal_type_mismatch) {
+            try std.testing.expectEqual(root, diagnostic.related.?.source);
+            try std.testing.expectEqualStrings("lib", module.sourceSlice(diagnostic.related.?).?);
+        }
+        if (tag == .unknown_field) try std.testing.expectEqualStrings("missing", module.sourceSlice(diagnostic.span).?);
+    } else {
+        try std.testing.expect(!comp.hasErrors());
+        try std.testing.expect(result.lowering_complete);
+        try result.ir.verify();
+        for (module.declarations.items, 0..) |decl, i| {
+            if (!std.mem.eql(u8, decl.name, "x")) continue;
+            const entry = result.getCompilationEntry(comp.declaration_ids.get(.{ .source = root, .local = @enumFromInt(i) }).?).?;
+            try std.testing.expectEqual(Sema.Status.constant_checked, entry.status);
+            const nominal = result.ir.getType(entry.type_id.?).?.enumeration;
+            try std.testing.expectEqual(enums, nominal.source);
+            try std.testing.expectEqual(@as(u32, 0), nominal.identity);
+        }
+    }
+    // Named namespaces gate top-level exports. Existing nominal method lookup
+    // retains public metadata but does not enforce a separate access policy.
+    const namespace = comp.declaration_ids.get(.{ .source = root, .local = module.lookup("lib").? }).?;
+    try std.testing.expect(comp.lookupNamespace(namespace, "hidden") == null);
+    const defining = comp.getModule(enums).?;
+    const owner = defining.lookup("E").?;
+    try std.testing.expect(!defining.getDeclaration(defining.lookupMethod(owner, "unmarked").?).?.public);
+    try std.testing.expect(defining.getDeclaration(defining.lookupMethod(owner, "published").?).?.public);
+}
+
+test "namespace qualified enum globals support annotations inference aliases reexports and exact nominal diagnostics under OOM" {
+    const cases = [_]struct { source: []const u8, expected: ?Module.Diagnostic.Tag = null }{
+        .{ .source =
+        \\let lib=@import("api")
+        \\let x:lib.E=lib.E.a
+        \\let main:()=@println(x==lib.E.a)
+        },
+        .{ .source =
+        \\let lib=@import("api")
+        \\let x=lib.E.a
+        \\let main:()=@println(x==lib.E.a)
+        },
+        .{ .source =
+        \\let lib=@import("api")
+        \\let ns=lib
+        \\let Alias=lib.E
+        \\let x:Alias=ns.E.b
+        \\let main:()=@println(x==Alias.b)
+        },
+        .{ .source =
+        \\let lib=@import("api")
+        \\let Alias=lib.E
+        \\let x=Alias.a
+        \\let main:()=@println(x==lib.E.a)
+        },
+        .{ .source =
+        \\let lib=@import("api")
+        \\let x:lib.E=lib.Other.a
+        , .expected = .literal_type_mismatch },
+        .{ .source =
+        \\let lib=@import("api")
+        \\let x=lib.E.missing
+        , .expected = .unknown_field },
+        .{ .source =
+        \\let lib=@import("api")
+        \\let x=lib.value.flag
+        , .expected = .unsupported_dependency_expression },
+        .{ .source =
+        \\let lib=@import("api")
+        \\let x=lib.E.unmarked
+        , .expected = .unsupported_global_initializer },
+    };
+    for (cases) |case| {
+        try testQualifiedEnumGlobal(std.testing.allocator, case.source, case.expected);
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, testQualifiedEnumGlobal, .{ case.source, case.expected });
+    }
+}
+
+test "named namespace exported enum methods retain current unmarked and public access behavior" {
+    try testQualifiedEnumGlobal(std.testing.allocator,
+        \\let lib=@import("api")
+        \\let x:lib.E=lib.E.a
+        \\let main:()=@println(x.unmarked(),lib.E.unmarked(x),x.published(),lib.E.published(x))
+    , null);
 }

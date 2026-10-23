@@ -8,15 +8,18 @@ const Literal = @import("Literal.zig");
 const BodyChecker = @import("BodyChecker.zig");
 const primitives = @import("primitives.zig");
 const Sema = @This();
+const Compilation = @import("Compilation.zig");
+const Dependencies = @import("Dependencies.zig");
 
 allocator: std.mem.Allocator,
 ir: Ir,
 entries: []Entry,
+compilation: ?*Compilation = null,
 /// True only after whole-module lowering and structural verification succeed.
 /// Entry-point/backend/runtime configuration is still a separate obligation.
 lowering_complete: bool = false,
 
-pub const Status = enum { deferred, generic, unrequested, requested, type_alias, signature_only, constant_checked, body_checked, lowered, failed };
+pub const Status = enum { deferred, generic, unrequested, requested, namespace, type_alias, signature_only, constant_checked, body_checked, lowered, failed };
 pub const Entry = struct {
     type_id: ?Ir.TypeId = null,
     /// Represented type, never the runtime type of this declaration.
@@ -43,52 +46,63 @@ pub fn analyzeAnnotations(module: *Module) Error!Sema {
         .entries = &.{},
     };
     errdefer result.deinit();
-    result.ir.source_len = @intCast(module.ast.source.len);
-    result.entries = try module.allocator.alloc(Entry, module.declarations.items.len);
-    @memset(result.entries, .{});
+    result.ir.source_len = @intCast(module.source.ast.source.len);
+    try result.analyzeModuleAnnotations(module);
+    return result;
+}
+
+fn analyzeModuleAnnotations(result: *Sema, module: *Module) Error!void {
+    try result.syncEntries(module);
+    for (module.declarations.items, 0..) |decl, i| if (decl.concrete_type == null) {
+        result.entries[result.entryIndex(module, @enumFromInt(i))] = .{};
+    };
     for (module.declarations.items, 0..) |declaration, i| {
         if (declaration.is_generic) {
             if (declaration.is_record) _ = try TypeResolver.validateGeneric(module, @enumFromInt(i));
-            result.entries[i].status = .generic;
+            result.entries[result.entryIndex(module, @enumFromInt(i))].status = .generic;
             continue;
         }
         if (!declaration.is_record) continue;
-        const init_node = module.ast.decl(declaration.node).ast.init_node;
-        result.entries[i].alias_type = if (module.ast.tokens.items(.tag)[module.ast.nodes.items(.main_token)[init_node]] == .keyword_enum)
+        const init_node = module.source.ast.decl(declaration.node).ast.init_node;
+        result.entries[result.entryIndex(module, @enumFromInt(i))].alias_type = if (module.source.ast.tokens.items(.tag)[module.source.ast.nodes.items(.main_token)[init_node]] == .keyword_enum)
             try TypeResolver.resolve(module, &result.ir, init_node)
         else
-            try result.ir.internType(.{ .record = .{ .identity = @intCast(i), .fields = &.{}, .public = declaration.public, .tagged = module.ast.isUnion(init_node) } });
-        result.entries[i].status = .type_alias;
+            try result.ir.internType(.{ .record = .{ .source = module.source.id, .identity = @intCast(i), .fields = &.{}, .public = declaration.public, .tagged = module.source.ast.isUnion(init_node) } });
+        result.entries[result.entryIndex(module, @enumFromInt(i))].status = .type_alias;
     }
     var i: usize = 0;
     while (i < module.declarations.items.len) : (i += 1) {
         try result.syncEntries(module);
         const declaration = module.declarations.items[i];
         if (declaration.concrete_type != null) continue;
-        const full = module.ast.decl(declaration.node);
-        if (declaration.is_record or declaration.is_generic) continue;
-        if (declaration.container) |owner| if (module.getDeclaration(owner).?.is_generic and declaration.concrete_type == null) {
-            result.entries[i].status = .generic;
-            continue;
-        };
-        if (TypeResolver.isThisAlias(&module.ast, declaration.node) and declaration.container != null) {
-            result.entries[i].alias_type = try TypeResolver.resolveInContainer(module, &result.ir, full.ast.init_node, declaration.container, declaration.concrete_type);
-            result.entries[i].status = .type_alias;
+        const full = module.source.ast.decl(declaration.node);
+        if (declaration.is_namespace) {
+            result.entries[result.entryIndex(module, @enumFromInt(i))].status = .namespace;
             continue;
         }
-        if (declaration.container != null and (full.ast.is_mutable or module.ast.fullFnProto(full.ast.type_node) == null)) {
+        if (declaration.is_record or declaration.is_generic) continue;
+        if (declaration.container) |owner| if (module.getDeclaration(owner).?.is_generic and declaration.concrete_type == null) {
+            result.entries[result.entryIndex(module, @enumFromInt(i))].status = .generic;
+            continue;
+        };
+        if (TypeResolver.isThisAlias(&module.source.ast, declaration.node) and declaration.container != null) {
+            result.entries[result.entryIndex(module, @enumFromInt(i))].alias_type = try TypeResolver.resolveInContainer(module, &result.ir, full.ast.init_node, declaration.container, declaration.concrete_type);
+            result.entries[result.entryIndex(module, @enumFromInt(i))].status = .type_alias;
+            continue;
+        }
+        if (declaration.container != null and (full.ast.is_mutable or module.source.ast.fullFnProto(full.ast.type_node) == null)) {
             try module.diagnostics.append(module.allocator, .{ .tag = .unsupported_declaration, .span = declaration.name_span });
-            result.entries[i].status = .failed;
+            result.entries[result.entryIndex(module, @enumFromInt(i))].status = .failed;
             continue;
         }
         if (declaration.is_type_alias) {
             if (primitives.isPrimitive(declaration.name)) {
                 try module.diagnostics.append(module.allocator, .{ .tag = .unsupported_shadowing, .span = declaration.name_span });
-                result.entries[i].status = .failed;
+                result.entries[result.entryIndex(module, @enumFromInt(i))].status = .failed;
                 continue;
             }
-            result.entries[i].alias_type = try TypeResolver.resolve(module, &result.ir, full.ast.init_node);
-            result.entries[i].status = if (result.entries[i].alias_type != null) .type_alias else .failed;
+            result.entries[result.entryIndex(module, @enumFromInt(i))].alias_type = try TypeResolver.resolve(module, &result.ir, full.ast.init_node);
+            result.entries[result.entryIndex(module, @enumFromInt(i))].status = if (result.entries[result.entryIndex(module, @enumFromInt(i))].alias_type != null) .type_alias else .failed;
             continue;
         }
         if (full.ast.type_node == 0) {
@@ -96,21 +110,21 @@ pub fn analyzeAnnotations(module: *Module) Error!Sema {
             continue;
         }
         const type_id = (try TypeResolver.resolveInContainer(module, &result.ir, full.ast.type_node, declaration.container, declaration.concrete_type)) orelse {
-            result.entries[i].status = .failed;
+            result.entries[result.entryIndex(module, @enumFromInt(i))].status = .failed;
             continue;
         };
-        result.entries[i].type_id = type_id;
-        if (module.ast.fullFnProto(full.ast.type_node) != null) {
-            result.entries[i].noreturn = declaration.noreturn;
+        result.entries[result.entryIndex(module, @enumFromInt(i))].type_id = type_id;
+        if (module.source.ast.fullFnProto(full.ast.type_node) != null) {
+            result.entries[result.entryIndex(module, @enumFromInt(i))].noreturn = declaration.noreturn;
             if (declaration.noreturn and result.ir.getType(result.ir.getType(type_id).?.function.result).? != .void) {
                 try module.diagnostics.append(module.allocator, .{ .tag = .noreturn_result, .span = declaration.name_span });
-                result.entries[i].status = .failed;
+                result.entries[result.entryIndex(module, @enumFromInt(i))].status = .failed;
                 continue;
             }
-            result.entries[i].status = .signature_only;
+            result.entries[result.entryIndex(module, @enumFromInt(i))].status = .signature_only;
         } else if (full.ast.init_node != 0) {
-            const annotation = module.tokenSpan(module.ast.firstToken(full.ast.type_node));
-            if (!full.ast.is_mutable and module.ast.fullCall(full.ast.init_node) != null) {
+            const annotation = module.tokenSpan(module.source.ast.firstToken(full.ast.type_node));
+            if (!full.ast.is_mutable and module.source.ast.fullCall(full.ast.init_node) != null) {
                 try result.checkScalarGlobal(module, i, full.ast.init_node, annotation);
             } else {
                 try result.checkLiteral(module, i, full.ast.init_node, annotation);
@@ -122,26 +136,26 @@ pub fn analyzeAnnotations(module: *Module) Error!Sema {
         try result.syncEntries(module);
         const declaration = module.declarations.items[i];
         if (!declaration.is_record or declaration.is_generic) continue;
-        const full = module.ast.decl(declaration.node);
+        const full = module.source.ast.decl(declaration.node);
         if (declaration.container != null or primitives.isPrimitive(declaration.name)) {
             try module.diagnostics.append(module.allocator, .{ .tag = if (declaration.container != null) .unsupported_declaration else .unsupported_shadowing, .span = declaration.name_span });
-            result.entries[i].status = .failed;
+            result.entries[result.entryIndex(module, @enumFromInt(i))].status = .failed;
             continue;
         }
         if (full.ast.is_mutable or full.ast.type_node != 0) {
             try module.diagnostics.append(module.allocator, .{ .tag = .unsupported_type, .span = declaration.name_span });
             continue;
         }
-        if (module.ast.tokens.items(.tag)[module.ast.nodes.items(.main_token)[full.ast.init_node]] == .keyword_enum) continue;
-        const tagged = module.ast.isUnion(full.ast.init_node);
+        if (module.source.ast.tokens.items(.tag)[module.source.ast.nodes.items(.main_token)[full.ast.init_node]] == .keyword_enum) continue;
+        const tagged = module.source.ast.isUnion(full.ast.init_node);
         var fields: std.ArrayList(Ir.Field) = .empty;
         defer fields.deinit(module.allocator);
-        for (module.ast.fullStruct(full.ast.init_node).?) |member| {
-            if (module.ast.nodes.items(.tag)[member] != .container_field) continue;
-            const data = module.ast.nodes.items(.data)[member];
-            const token = module.ast.nodes.items(.main_token)[member];
+        for (module.source.ast.fullStruct(full.ast.init_node).?) |member| {
+            if (module.source.ast.nodes.items(.tag)[member] != .container_field) continue;
+            const data = module.source.ast.nodes.items(.data)[member];
+            const token = module.source.ast.nodes.items(.main_token)[member];
             const span = module.tokenSpan(token);
-            const name = module.ast.tokenSlice(token);
+            const name = module.source.ast.tokenSlice(token);
             var duplicate = module.lookupMethod(@enumFromInt(i), name) != null;
             for (fields.items) |field| {
                 if (std.mem.eql(u8, field.name, name)) duplicate = true;
@@ -153,30 +167,29 @@ pub fn analyzeAnnotations(module: *Module) Error!Sema {
             const ty = if (tagged and data.lhs == 0) try result.ir.internType(.void) else (try TypeResolver.resolve(module, &result.ir, data.lhs)) orelse continue;
             const ft = result.ir.getType(ty).?;
             if (!(if (tagged) Ir.isUnionPayload(ft) else Ir.isRecordField(ft))) {
-                try module.diagnostics.append(module.allocator, .{ .tag = .unsupported_type, .span = module.tokenSpan(module.ast.firstToken(data.lhs)) });
+                try module.diagnostics.append(module.allocator, .{ .tag = .unsupported_type, .span = module.tokenSpan(module.source.ast.firstToken(data.lhs)) });
                 continue;
             }
             var default: ?Ir.ConstId = null;
             if (data.rhs != 0) {
                 if (tagged) {
-                    try module.diagnostics.append(module.allocator, .{ .tag = .unsupported_union_default, .span = module.tokenSpan(module.ast.firstToken(data.rhs)) });
+                    try module.diagnostics.append(module.allocator, .{ .tag = .unsupported_union_default, .span = module.tokenSpan(module.source.ast.firstToken(data.rhs)) });
                     continue;
                 }
                 switch (try Literal.check(module, &result.ir, data.rhs, ty, span)) {
                     .constant => |constant| default = constant,
                     .failed => continue,
                     .not_literal => {
-                        try module.diagnostics.append(module.allocator, .{ .tag = .invalid_field_default, .span = module.tokenSpan(module.ast.firstToken(data.rhs)) });
+                        try module.diagnostics.append(module.allocator, .{ .tag = .invalid_field_default, .span = module.tokenSpan(module.source.ast.firstToken(data.rhs)) });
                         continue;
                     },
                 }
             }
-            try fields.append(module.allocator, .{ .name = name, .ty = ty, .span = .{ .start = span.start, .end = span.end }, .default = default });
+            try fields.append(module.allocator, .{ .name = name, .ty = ty, .span = span, .default = default });
         }
         if (tagged and fields.items.len == 0) try module.diagnostics.append(module.allocator, .{ .tag = .empty_union, .span = declaration.name_span });
-        try result.ir.setRecordFields(result.entries[i].alias_type.?, fields.items);
+        try result.ir.setRecordFields(result.entries[result.entryIndex(module, @enumFromInt(i))].alias_type.?, fields.items);
     }
-    return result;
 }
 
 /// Checks the bounded expression-body subset after collecting all annotations.
@@ -210,12 +223,73 @@ pub fn analyzeFunctions(module: *Module) Error!Sema {
     return result;
 }
 
+/// Owns one shared IR; entries are indexed by Compilation.DeclId.
+pub fn analyzeCompilation(comp: *Compilation) Error!Sema {
+    if (comp.hasErrors()) return error.InvalidModule;
+    const starts = try comp.allocator.alloc(usize, comp.modules.items.len);
+    defer comp.allocator.free(starts);
+    for (comp.modules.items, starts) |module, *start| start.* = module.diagnostics.items.len;
+    errdefer for (comp.modules.items, starts) |module, start| module.diagnostics.shrinkRetainingCapacity(start);
+    const graph_diagnostics_start = comp.diagnostics.items.len;
+    errdefer comp.diagnostics.shrinkRetainingCapacity(graph_diagnostics_start);
+    try comp.prepareSemantics();
+    var result: Sema = .{ .allocator = comp.allocator, .ir = Ir.init(comp.allocator), .entries = &.{}, .compilation = comp };
+    errdefer result.deinit();
+    for (comp.modules.items) |module| try result.ir.source_lengths.append(comp.allocator, @intCast(module.source.ast.source.len));
+    if (comp.hasErrors()) return result;
+    for (comp.modules.items) |module| {
+        var dependencies = try Dependencies.analyze(module);
+        dependencies.deinit();
+    }
+    if (comp.hasErrors()) return result;
+    for (comp.modules.items) |module| try result.analyzeModuleAnnotations(module);
+    if (comp.hasErrors()) return result;
+    while (true) {
+        try result.syncEntries(comp.modules.items[0]);
+        var next: ?usize = null;
+        for (result.entries, 0..) |entry, i| if (entry.status == .signature_only or entry.status == .requested) {
+            next = i;
+            break;
+        };
+        const index = next orelse break;
+        const ref = comp.declarations.items[index];
+        const module = comp.getModule(ref.source).?;
+        if (result.entries[index].status == .requested and try result.requestType(module, ref.local) == null) {
+            result.entries[index].status = .failed;
+            continue;
+        }
+        const checked = try BodyChecker.checkDemand(module, &result, ref.local);
+        try result.syncEntries(module);
+        result.entries[index].status = if (checked) .body_checked else .failed;
+    }
+    return result;
+}
+
+pub fn getCompilationEntry(self: *const Sema, id: Compilation.DeclId) ?Entry {
+    const index = @intFromEnum(id);
+    return if (index < self.entries.len) self.entries[index] else null;
+}
+
 /// New concrete containers may be discovered while checking a requested body.
 /// No caller may retain entry pointers across type resolution or body checking.
-fn syncEntries(self: *Sema, module: *Module) Ir.BuildError!void {
+pub fn entryIndex(self: *const Sema, module: *const Module, id: Module.DeclId) usize {
+    if (self.compilation) |comp| return @intFromEnum(comp.declaration_ids.get(.{ .source = module.source.id, .local = id }).?);
+    return @intFromEnum(id);
+}
+
+pub fn syncEntries(self: *Sema, module: *Module) Ir.BuildError!void {
     const old_len = self.entries.len;
-    if (old_len == module.declarations.items.len) return;
-    self.entries = try self.allocator.realloc(self.entries, module.declarations.items.len);
+    const count = if (self.compilation) |comp| blk: {
+        for (comp.modules.items) |owner| for (owner.declarations.items, 0..) |_, i| {
+            _ = comp.internDeclaration(.{ .source = owner.source.id, .local = @enumFromInt(i) }) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.TooManyDeclarations => return error.TooManyEntries,
+            };
+        };
+        break :blk comp.declarations.items.len;
+    } else module.declarations.items.len;
+    if (old_len == count) return;
+    self.entries = try self.allocator.realloc(self.entries, count);
     for (self.entries[old_len..]) |*entry| entry.* = .{ .status = .unrequested };
 }
 
@@ -224,22 +298,22 @@ fn syncEntries(self: *Sema, module: *Module) Ir.BuildError!void {
 pub fn requestType(self: *Sema, module: *Module, id: Module.DeclId) Ir.BuildError!?Ir.TypeId {
     try self.syncEntries(module);
     const index = @intFromEnum(id);
-    if (index >= self.entries.len) return error.InvalidTypeId;
-    const entry = self.entries[index];
+    if (self.entryIndex(module, id) >= self.entries.len) return error.InvalidTypeId;
+    const entry = self.entries[self.entryIndex(module, @enumFromInt(index))];
     if (entry.status != .unrequested and entry.status != .requested) return entry.type_id;
     const declaration = module.getDeclaration(id).?;
     if (declaration.concrete_type == null or declaration.is_type_alias) return null;
     // Failed speculative requests must be retried: probes may discard their
     // diagnostics. The worklist performs a final, non-speculative request too.
-    self.entries[index].status = .requested;
-    const full = module.ast.decl(declaration.node).ast;
+    self.entries[self.entryIndex(module, @enumFromInt(index))].status = .requested;
+    const full = module.source.ast.decl(declaration.node).ast;
     const ty = (try TypeResolver.resolveInContainer(module, &self.ir, full.type_node, declaration.container, declaration.concrete_type)) orelse return null;
     try self.syncEntries(module);
     if (declaration.noreturn and self.ir.getType(self.ir.getType(ty).?.function.result).? != .void) {
         try module.diagnostics.append(module.allocator, .{ .tag = .noreturn_result, .span = declaration.name_span });
         return null;
     }
-    self.entries[index] = .{ .type_id = ty, .status = .signature_only, .noreturn = declaration.noreturn };
+    self.entries[self.entryIndex(module, @enumFromInt(index))] = .{ .type_id = ty, .status = .signature_only, .noreturn = declaration.noreturn };
     return ty;
 }
 
@@ -261,25 +335,25 @@ pub fn getEntry(self: *const Sema, id: Module.DeclId) ?Entry {
 /// body checking: effects, value references, blocks and computation are not
 /// compile-time evaluation, even beneath an explicit type ascription.
 fn checkScalarGlobal(self: *Sema, module: *Module, index: usize, initializer: Ast.Node.Index, declared_annotation: ?Module.Span) Error!void {
-    const ast = &module.ast;
+    const ast = &module.source.ast;
     var node = initializer;
-    var expected = self.entries[index].type_id;
+    var expected = self.entries[self.entryIndex(module, @enumFromInt(index))].type_id;
     var annotation = declared_annotation;
     while (ast.fullCall(node)) |call| {
         if (ast.nodes.items(.tag)[call.ast.fn_expr] != .builtin_literal or
             !std.mem.eql(u8, ast.tokenSlice(ast.nodes.items(.main_token)[call.ast.fn_expr]), "@as")) return;
         if (call.ast.args.len != 2) {
             try module.diagnostics.append(module.allocator, .{ .tag = .argument_count_mismatch, .span = module.tokenSpan(ast.nodes.items(.main_token)[node]) });
-            self.entries[index].status = .failed;
+            self.entries[self.entryIndex(module, @enumFromInt(index))].status = .failed;
             return;
         }
         const ty = (try TypeResolver.resolve(module, &self.ir, call.ast.args[0])) orelse {
-            self.entries[index].status = .failed;
+            self.entries[self.entryIndex(module, @enumFromInt(index))].status = .failed;
             return;
         };
         if (expected != null and expected.? != ty) {
             try module.diagnostics.append(module.allocator, .{ .tag = .expression_type_mismatch, .span = module.tokenSpan(ast.firstToken(node)), .related = annotation });
-            self.entries[index].status = .failed;
+            self.entries[self.entryIndex(module, @enumFromInt(index))].status = .failed;
             return;
         }
         expected = ty;
@@ -306,28 +380,28 @@ fn checkScalarGlobal(self: *Sema, module: *Module, index: usize, initializer: As
         },
         else => return,
     }
-    self.entries[index].type_id = expected;
+    self.entries[self.entryIndex(module, @enumFromInt(index))].type_id = expected;
     try self.checkLiteral(module, index, node, annotation orelse module.tokenSpan(ast.firstToken(node)));
 }
 
 fn checkLiteral(self: *Sema, module: *Module, index: usize, initializer: Ast.Node.Index, annotation: Module.Span) Error!void {
-    switch (try Literal.check(module, &self.ir, initializer, self.entries[index].type_id.?, annotation)) {
+    switch (try Literal.check(module, &self.ir, initializer, self.entries[self.entryIndex(module, @enumFromInt(index))].type_id.?, annotation)) {
         .not_literal => {
             var node = initializer;
             var buffer: [2]Ast.Node.Index = undefined;
-            while (module.ast.fullBlock(&buffer, node)) |block| {
-                if (module.ast.firstToken(node) != block.ast.lbrace or block.ast.statements.len != 1) break;
+            while (module.source.ast.fullBlock(&buffer, node)) |block| {
+                if (module.source.ast.firstToken(node) != block.ast.lbrace or block.ast.statements.len != 1) break;
                 node = block.ast.statements[0];
             }
-            if (module.ast.nodes.items(.tag)[node] == .string_literal and Literal.hasInterpolation(module.ast.tokenSlice(module.ast.nodes.items(.main_token)[node]))) {
-                try module.diagnostics.append(module.allocator, .{ .tag = .unsupported_global_interpolation, .span = module.tokenSpan(module.ast.nodes.items(.main_token)[node]) });
-                self.entries[index].status = .failed;
+            if (module.source.ast.nodes.items(.tag)[node] == .string_literal and Literal.hasInterpolation(module.source.ast.tokenSlice(module.source.ast.nodes.items(.main_token)[node]))) {
+                try module.diagnostics.append(module.allocator, .{ .tag = .unsupported_global_interpolation, .span = module.tokenSpan(module.source.ast.nodes.items(.main_token)[node]) });
+                self.entries[self.entryIndex(module, @enumFromInt(index))].status = .failed;
             }
         },
-        .failed => self.entries[index].status = .failed,
+        .failed => self.entries[self.entryIndex(module, @enumFromInt(index))].status = .failed,
         .constant => |constant| {
-            self.entries[index].constant = constant;
-            self.entries[index].status = .constant_checked;
+            self.entries[self.entryIndex(module, @enumFromInt(index))].constant = constant;
+            self.entries[self.entryIndex(module, @enumFromInt(index))].status = .constant_checked;
         },
     }
 }

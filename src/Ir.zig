@@ -1,12 +1,15 @@
 const std = @import("std");
 const Ir = @This();
+const Source = @import("Source.zig");
 
 // Integer widths describe resolved values; no literal defaults or overflow policy
-// live here. Spans borrow offsets into a single externally owned source.
+// live here. Source lengths and qualified spans remain valid after AST release.
 allocator: std.mem.Allocator,
 types: std.ArrayList(Type) = .empty,
 constants: std.ArrayList(Constant) = .empty,
+/// Legacy standalone-source bound. Compilation IR uses source_lengths instead.
 source_len: u32 = 0,
+source_lengths: std.ArrayList(u32) = .empty,
 functions: std.ArrayList(Function) = .empty,
 
 /// The current pipeline targets the machine running Nov, not a separate target.
@@ -19,7 +22,7 @@ pub const FunctionId = enum(u32) { _ };
 /// Zero-based instruction index, local to a single body. Region-private values
 /// are visible only within that region (or as its explicit result).
 pub const ValueId = enum(u32) { _ };
-pub const Span = struct { start: u32, end: u32 };
+pub const Span = Source.Span;
 pub const Function = struct {
     name: []const u8,
     ty: TypeId,
@@ -107,6 +110,7 @@ pub const Operation = union(enum) {
 pub const Field = struct { name: []const u8, ty: TypeId, span: Span, default: ?ConstId = null };
 /// Nominal aggregate layout. Tagged layouts have one active scalar or flat record payload.
 pub const Record = struct {
+    source: Source.Id = @enumFromInt(0),
     identity: u32,
     fields: []const Field,
     public: bool = false,
@@ -116,7 +120,7 @@ pub const Record = struct {
     instance_state: enum { complete, building, failed } = .complete,
 };
 pub const EnumTag = struct { name: []const u8, span: Span };
-pub const Enumeration = struct { identity: u32, name: []const u8, tags: []const EnumTag, public: bool = false };
+pub const Enumeration = struct { source: Source.Id = @enumFromInt(0), identity: u32, name: []const u8, tags: []const EnumTag, public: bool = false };
 pub const Type = union(enum) {
     enumeration: Enumeration,
     record: Record,
@@ -211,6 +215,7 @@ pub fn deinit(self: *Ir) void {
         self.allocator.free(constant.value.string);
     };
     self.constants.deinit(self.allocator);
+    self.source_lengths.deinit(self.allocator);
     self.* = undefined;
 }
 
@@ -237,7 +242,7 @@ pub fn getFunction(self: *const Ir, id: FunctionId) ?Function {
 pub fn addFunction(self: *Ir, name: []const u8, ty: TypeId, span: Span) BuildError!FunctionId {
     try self.validateFunction(.{ .name = name, .ty = ty, .span = span });
     for (self.functions.items) |existing| {
-        if (std.mem.eql(u8, name, existing.name)) return error.DuplicateFunctionName;
+        if (span.source == existing.span.source and std.mem.eql(u8, name, existing.name)) return error.DuplicateFunctionName;
     }
     if (self.functions.items.len == std.math.maxInt(u32)) return error.TooManyEntries;
     const owned_name = try self.allocator.dupe(u8, name);
@@ -304,7 +309,7 @@ fn freeFields(self: *Ir, fields: []const Field) void {
 pub fn setRecordFields(self: *Ir, id: TypeId, fields: []const Field) InternError!void {
     const ty = self.getType(id) orelse return error.InvalidTypeId;
     if (ty != .record) return error.InvalidTypeId;
-    try self.validateType(.{ .record = .{ .identity = ty.record.identity, .tagged = ty.record.tagged, .type_args = ty.record.type_args, .fields = fields } }, self.types.items.len);
+    try self.validateType(.{ .record = .{ .source = ty.record.source, .identity = ty.record.identity, .tagged = ty.record.tagged, .type_args = ty.record.type_args, .fields = fields } }, self.types.items.len);
     const owned = try self.allocator.dupe(Field, fields);
     var copied: usize = 0;
     errdefer {
@@ -346,13 +351,13 @@ pub fn internType(self: *Ir, ty: Type) InternError!TypeId {
                 tag.name = try self.allocator.dupe(u8, tag.name);
                 copied += 1;
             }
-            break :blk .{ .enumeration = .{ .identity = enumeration.identity, .name = name, .tags = tags, .public = enumeration.public } };
+            break :blk .{ .enumeration = .{ .source = enumeration.source, .identity = enumeration.identity, .name = name, .tags = tags, .public = enumeration.public } };
         },
         .record => |record| blk: {
             if (record.fields.len != 0) return error.InvalidTypeId;
             const args = try self.allocator.dupe(TypeId, record.type_args);
             errdefer self.allocator.free(args);
-            break :blk .{ .record = .{ .identity = record.identity, .fields = try self.allocator.alloc(Field, 0), .public = record.public, .tagged = record.tagged, .type_args = args, .instance_state = record.instance_state } };
+            break :blk .{ .record = .{ .source = record.source, .identity = record.identity, .fields = try self.allocator.alloc(Field, 0), .public = record.public, .tagged = record.tagged, .type_args = args, .instance_state = record.instance_state } };
         },
         .function => |function| .{ .function = .{
             .params = try self.allocator.dupe(TypeId, function.params),
@@ -398,7 +403,7 @@ pub fn verify(self: *const Ir) VerifyError!void {
     for (self.functions.items, 0..) |function, i| {
         try self.validateFunction(function);
         for (self.functions.items[0..i]) |previous| {
-            if (std.mem.eql(u8, previous.name, function.name)) return error.DuplicateFunctionName;
+            if (previous.span.source == function.span.source and std.mem.eql(u8, previous.name, function.name)) return error.DuplicateFunctionName;
         }
     }
     for (self.functions.items) |function| {
@@ -408,7 +413,11 @@ pub fn verify(self: *const Ir) VerifyError!void {
 }
 
 fn validateSpan(self: *const Ir, span: Span) VerifyError!void {
-    if (span.start > span.end or span.end > self.source_len) return error.InvalidSourceSpan;
+    const index = @intFromEnum(span.source);
+    const length = if (self.source_lengths.items.len != 0)
+        if (index < self.source_lengths.items.len) self.source_lengths.items[index] else return error.InvalidSourceSpan
+    else if (index == 0) self.source_len else return error.InvalidSourceSpan;
+    if (span.start > span.end or span.end > length) return error.InvalidSourceSpan;
 }
 
 fn validateFunction(self: *const Ir, function: Function) VerifyError!void {
@@ -800,7 +809,7 @@ fn validateType(self: *const Ir, ty: Type, before: usize) ValidationError!void {
             if (enumeration.name.len == 0 or enumeration.tags.len == 0 or enumeration.tags.len > std.math.maxInt(u32)) return error.InvalidTypeId;
             for (enumeration.tags, 0..) |tag, i| {
                 if (tag.name.len == 0) return error.InvalidTypeId;
-                if (tag.span.start > tag.span.end or tag.span.end > self.source_len) return error.InvalidTypeId;
+                self.validateSpan(tag.span) catch return error.InvalidTypeId;
                 for (enumeration.tags[0..i]) |previous| if (std.mem.eql(u8, previous.name, tag.name)) return error.InvalidTypeId;
             }
         },
@@ -812,7 +821,8 @@ fn validateType(self: *const Ir, ty: Type, before: usize) ValidationError!void {
                 const ft = self.getType(field.ty).?;
                 if (!(if (record.tagged) isUnionPayload(ft) else isRecordField(ft))) return error.InvalidArrayElement;
                 if (record.tagged and field.default != null) return error.InvalidTypeId;
-                if (field.name.len == 0 or field.span.start > field.span.end or field.span.end > self.source_len) return error.InvalidTypeId;
+                if (field.name.len == 0) return error.InvalidTypeId;
+                self.validateSpan(field.span) catch return error.InvalidTypeId;
                 for (record.fields[0..i]) |previous| if (std.mem.eql(u8, previous.name, field.name)) return error.InvalidTypeId;
                 if (field.default) |default| {
                     const constant = self.getConstant(default) orelse return error.ConstantTypeMismatch;
@@ -916,13 +926,46 @@ fn typeEql(a: Type, b: Type) bool {
     if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
     return switch (a) {
         .void, .boolean, .string => true,
-        .enumeration => |enumeration| enumeration.identity == b.enumeration.identity,
+        .enumeration => |enumeration| enumeration.source == b.enumeration.source and enumeration.identity == b.enumeration.identity,
         .integer => |integer| std.meta.eql(integer, b.integer),
-        .record => |record| record.identity == b.record.identity and record.tagged == b.record.tagged and std.mem.eql(TypeId, record.type_args, b.record.type_args),
+        .record => |record| record.source == b.record.source and record.identity == b.record.identity and record.tagged == b.record.tagged and std.mem.eql(TypeId, record.type_args, b.record.type_args),
         .array => |element| element == b.array,
         .function => |function| function.result == b.function.result and
             std.mem.eql(TypeId, function.params, b.function.params),
     };
+}
+
+test "shared pools retain source-qualified nominal identities after AST release" {
+    const Compilation = @import("Compilation.zig");
+    var ir = block: {
+        var compilation = Compilation.init(std.testing.allocator);
+        defer compilation.deinit();
+        const first = try compilation.addSource("first.nov", "let A = true");
+        const second = try compilation.addSource("second.nov", "let A = false");
+        const pool = &compilation.ir;
+        const boolean = try pool.internType(.boolean);
+        const span: Span = .{ .source = second, .start = 4, .end = 5 };
+        const field = [_]Field{.{ .name = "x", .ty = boolean, .span = span }};
+        const a = try pool.internType(.{ .record = .{ .source = first, .identity = 0, .fields = &.{}, .tagged = true, .type_args = &.{boolean} } });
+        const b = try pool.internType(.{ .record = .{ .source = second, .identity = 0, .fields = &.{}, .tagged = true, .type_args = &.{boolean} } });
+        try pool.setRecordFields(a, &field);
+        try pool.setRecordFields(b, &field);
+        try std.testing.expect(a != b);
+        try std.testing.expectEqual(b, try pool.internType(.{ .record = .{ .source = second, .identity = 0, .fields = &.{}, .tagged = true, .type_args = &.{boolean} } }));
+        const tags = [_]EnumTag{.{ .name = "tag", .span = span }};
+        const e1 = try pool.internType(.{ .enumeration = .{ .source = first, .identity = 1, .name = "E", .tags = &tags } });
+        const e2 = try pool.internType(.{ .enumeration = .{ .source = second, .identity = 1, .name = "E", .tags = &tags } });
+        try std.testing.expect(e1 != e2);
+        const output = compilation.ir;
+        compilation.ir = Ir.init(std.testing.allocator);
+        break :block output;
+    };
+    defer ir.deinit();
+    try ir.verify();
+    const unit = try ir.internType(.void);
+    const signature = try ir.internType(.{ .function = .{ .params = &.{}, .result = unit } });
+    try std.testing.expectError(error.InvalidSourceSpan, ir.addFunction("bad", signature, .{ .source = @enumFromInt(2), .start = 0, .end = 0 }));
+    try std.testing.expectError(error.InvalidSourceSpan, ir.addFunction("bad", signature, .{ .source = @enumFromInt(1), .start = 0, .end = 1000 }));
 }
 
 test "record field integer widths follow IR limits independently of array elements" {

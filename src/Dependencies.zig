@@ -72,9 +72,9 @@ pub fn getEdges(self: *const Dependencies, id: Module.DeclId) ?[]const Edge {
 fn scanInitializer(self: *Dependencies, module: *Module, id: Module.DeclId, work: *std.ArrayList(Ast.Node.Index)) std.mem.Allocator.Error!void {
     const entry = &self.entries[@intFromEnum(id)];
     const declaration = module.getDeclaration(id).?;
-    const ast = &module.ast;
+    const ast = &module.source.ast;
     const full = ast.decl(declaration.node);
-    if (declaration.is_type_alias) return;
+    if (declaration.is_type_alias or declaration.is_namespace) return;
     if (full.ast.init_node == 0) {
         try module.diagnostics.append(self.allocator, .{ .tag = .missing_initializer, .span = declaration.name_span });
         entry.state = .failed;
@@ -93,8 +93,17 @@ fn scanInitializer(self: *Dependencies, module: *Module, id: Module.DeclId, work
             .number_literal, .char_literal, .string_literal, .enum_literal => {},
             .field_access => {
                 const base = data.lhs;
-                const target = if (ast.nodes.items(.tag)[base] == .identifier) module.lookup(ast.tokenSlice(ast.nodes.items(.main_token)[base])) else null;
-                if (target == null or !module.getDeclaration(target.?).?.is_type_alias) {
+                // A qualified type names an enum literal without reading a
+                // runtime aggregate. Resolve its namespace in the defining scope;
+                // Sema still validates the nominal type and the selected tag.
+                const qualifier = if (module.compilation) |comp| blk: {
+                    const ref = comp.reference(module, base) orelse break :blk null;
+                    break :blk comp.getModule(ref.source).?.getDeclaration(ref.local);
+                } else if (ast.nodes.items(.tag)[base] == .identifier) blk: {
+                    const target = module.lookup(ast.tokenSlice(ast.nodes.items(.main_token)[base])) orelse break :blk null;
+                    break :blk module.getDeclaration(target);
+                } else null;
+                if (qualifier == null or !qualifier.?.is_type_alias or qualifier.?.is_namespace) {
                     try module.diagnostics.append(self.allocator, .{ .tag = .unsupported_dependency_expression, .span = span });
                     entry.state = .failed;
                 }
@@ -245,7 +254,7 @@ test "global ascriptions skip types but never hide runtime dependencies" {
         try std.testing.expectEqual(State.failed, rejected.entries[0].state);
         try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
     }
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{module.ast.source});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{module.source.ast.source});
 }
 
 test "value dependencies resolve forward references in dependency-first order" {

@@ -34,7 +34,7 @@ pub fn build(b: *std.Build) void {
     });
     b.getInstallStep().dependOn(&install_lib.step);
 
-    const run_cmd = b.addRunArtifact(exe);
+    const run_cmd = b.addSystemCommand(&.{b.getInstallPath(.bin, exe.out_filename)});
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| {
         run_cmd.addArgs(args);
@@ -73,7 +73,10 @@ pub fn build(b: *std.Build) void {
     run_tests.setEnvironmentVariable("NOV_TEST_ZIG", b.graph.zig_exe);
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_tests.step);
-    addCliTests(b, exe, test_step);
+    const cli_step = b.step("test-cli", "Run CLI integration tests");
+    test_step.dependOn(cli_step);
+    addCliTests(b, exe, cli_step);
+    addImportCliTests(b, exe, cli_step);
     addGcTests(b, test_step);
 
     const fmt_step = b.step("fmt", "Format all source files");
@@ -114,8 +117,10 @@ fn addGcTests(b: *std.Build, test_step: *std.Build.Step) void {
 fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
     _ = fixtures.add("library-result-source.nov", @embedFile("lib/result.nov"));
-    // A single-module test harness for the actual library source, not import support.
-    _ = fixtures.add("library-result.nov", @embedFile("lib/result.nov") ++
+    const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
+    _ = fixtures.add("library-result.nov",
+        \\let standard = @import("std")
+        \\let Result = standard.Result
         \\
         \\let R = Result(uint, string)
         \\let eager: () -> uint = { @print("E")
@@ -288,6 +293,7 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         exit_code: u8,
         stdout: []const u8 = "",
         stderr_match: ?[]const u8 = null,
+        lib_dir: bool = false,
     };
     const cases = [_]Case{
         .{ .name = "enum semantic", .args = &.{ "check", "enums.nov", "--semantic" }, .exit_code = 0 },
@@ -300,7 +306,7 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         .{ .name = "record payload 128 bit semantic", .args = &.{ "check", "wide-record-payload.nov", "--semantic" }, .exit_code = 0 },
         .{ .name = "record payload backend width", .args = &.{ "emit-c", "wide-record-payload.nov" }, .exit_code = 1, .stderr_match = "C backend only supports 8, 16, 32 and 64-bit integers" },
         .{ .name = "generic union semantic", .args = &.{ "check", "generic-unions.nov", "--semantic" }, .exit_code = 0 },
-        .{ .name = "library Result semantic", .args = &.{ "check", "library-result.nov", "--semantic" }, .exit_code = 0 },
+        .{ .name = "library Result semantic", .args = &.{ "check", "library-result.nov", "--semantic" }, .exit_code = 0, .lib_dir = true },
         .{ .name = "library Result format", .args = &.{ "fmt", "--check", "library-result-source.nov" }, .exit_code = 0 },
         .{ .name = "generic methods semantic", .args = &.{ "check", "generic-methods.nov", "--semantic" }, .exit_code = 0 },
         .{ .name = "generic cycle", .args = &.{ "check", "generic-cycle.nov", "--semantic" }, .exit_code = 1, .stderr_match = "cyclic generic union instantiation" },
@@ -313,6 +319,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         .{ .name = "union duplicate", .args = &.{ "check", "union-duplicate.nov", "--semantic" }, .exit_code = 1, .stderr_match = "union match prong is already covered" },
         .{ .name = "union private capture", .args = &.{ "check", "union-capture.nov", "--semantic" }, .exit_code = 1, .stderr_match = "unknown name 'n'" },
         .{ .name = "union backend width", .args = &.{ "emit-c", "wide-union.nov" }, .exit_code = 1, .stderr_match = "C backend only supports 8, 16, 32 and 64-bit integers" },
+        .{ .name = "syntax check rejects lib-dir", .args = &.{ "check", "valid.nov", "--lib-dir", "library" }, .exit_code = 1, .stderr_match = "--lib-dir requires semantic check" },
+        .{ .name = "fmt rejects lib-dir", .args = &.{ "fmt", "valid.nov", "--lib-dir", "library" }, .exit_code = 1, .stderr_match = "--lib-dir requires semantic check" },
+        .{ .name = "semantic check rejects empty lib-dir", .args = &.{ "check", "--semantic", "valid.nov", "--lib-dir", "" }, .exit_code = 1, .stderr_match = "--lib-dir requires a nonempty path" },
         .{ .name = "help", .args = &.{"--help"}, .exit_code = 0, .stderr_match = "Usage: nov" },
         .{ .name = "version", .args = &.{"--version"}, .exit_code = 0, .stdout = b.fmt("nov {f}\n", .{nov_version}) },
         .{ .name = "no arguments", .args = &.{}, .exit_code = 1, .stderr_match = "Usage: nov" },
@@ -446,6 +455,10 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         run.step.name = b.fmt("CLI: {s}", .{case.name});
         run.setCwd(fixtures.getDirectory());
         run.addArgs(case.args);
+        if (case.lib_dir) {
+            run.addArg("--lib-dir");
+            run.addDirectoryArg(library);
+        }
         run.expectExitCode(case.exit_code);
         run.expectStdOutEqual(case.stdout);
         if (case.stderr_match) |expected| {
@@ -474,6 +487,7 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         .{ .source = "let U=union{ok:R,}\nlet R=struct{s:string,}\nlet f:()->U=.ok[R[.s=\"ok\"]]", .output = "let U = union {\n    ok: R,\n}\nlet R = struct {\n    s: string,\n}\nlet f: () -> U = .ok[R[ .s = \"ok\" ]]\n" },
         .{ .source = "let G:(T:type)->type=union{ok:T,err:string,}\nlet R=G(int)\nlet f:(r:R)->R=.ok[r.!]", .output = "let G: (T: type) -> type = union {\n    ok: T,\n    err: string,\n}\nlet R = G(int)\nlet f: (r: R) -> R = .ok[r.!]\n" },
         .{ .source = "let U=union{ok:int,none,}\nlet f:(u:U)->int=match u{.ok=>|v|v\n.none=>0}", .output = "let U = union {\n    ok: int,\n    none,\n}\nlet f: (u: U) -> int = match u {\n    .ok => |v| v\n    .none => 0\n}\n" },
+        .{ .source = "let standard=@import(\"std\")\nlet file=@import(\"./a/../file.nov\")", .output = "let standard = @import(\"std\")\nlet file = @import(\"./a/../file.nov\")\n" },
         .{ .source = "let x=1", .output = "let x = 1\n" },
         .{ .source = "let x = 1\n", .output = "let x = 1\n" },
         .{ .source = "" },
@@ -507,7 +521,8 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         library_run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
         library_run.setEnvironmentVariable("NOV_CC", "");
         library_run.setEnvironmentVariable("CC", "");
-        library_run.addArgs(&.{ "run", "library-result.nov" });
+        library_run.addArgs(&.{ "run", "library-result.nov", "--lib-dir" });
+        library_run.addDirectoryArg(library);
         if (mode.len != 0) library_run.addArg(mode);
         library_run.expectExitCode(0);
         library_run.expectStdOutEqual("EF1 9 1 7\nfallback:2\n3 4\n");
@@ -1068,6 +1083,200 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
             }
         }
     }
+}
+
+fn addImportCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    const fixtures = b.addWriteFiles();
+    const library = fixtures.addCopyDirectory(b.path("lib"), "library", .{});
+    const program = fixtures.add("app/main.nov",
+        \\let standard = @import("std")
+        \\let left = @import("parts/left.nov")
+        \\let right = @import("parts/right.nov")
+        \\let R = standard.Result(uint, string)
+        \\let recover: (error: string) -> uint = { @print(error)
+        \\    left.value() }
+        \\let main: () = {
+        \\    let bad: R = .err["fallback:"]
+        \\    @println(bad.unwrapOrElse(recover), right.value())
+        \\}
+        \\
+    );
+    _ = fixtures.add("app/parts/left.nov", "let shared = @import(\"../shared.nov\")\nlet value: () -> uint = shared.value()\n");
+    _ = fixtures.add("app/parts/right.nov", "let shared = @import(\".././shared.nov\")\nlet value: () -> uint = shared.value()\n");
+    _ = fixtures.add("app/shared.nov", "let value: () -> uint = 7\nlet main: () = @println(\"wrong entry\")\n");
+    _ = fixtures.add("relative.nov", "let left = @import(\"app/parts/left.nov\")\nlet right = @import(\"app/parts/right.nov\")\nlet main: () = @println(left.value(), right.value())\n");
+    _ = fixtures.add("missing.nov", "let absent = @import(\"not-found.nov\")\nlet main: () = {}\n");
+    _ = fixtures.add("cycle/a.nov", "let b = @import(\"b.nov\")\n");
+    _ = fixtures.add("cycle/b.nov", "let a = @import(\"a.nov\")\n");
+    _ = fixtures.add("no-entry.nov", "let imported = @import(\"app/shared.nov\")\n");
+    _ = fixtures.add("bad-entry.nov", "let imported = @import(\"app/shared.nov\")\nlet main = true\n");
+    _ = fixtures.add("bad-import.nov", "let imported = @import(\"errors/body.nov\")\nlet main: () = {}\n");
+    _ = fixtures.add("errors/body.nov", "let bad: () -> bool = absent\n");
+    _ = fixtures.add("wide-import.nov", "let imported = @import(\"errors/wide.nov\")\nlet main: () = {}\n");
+    _ = fixtures.add("errors/wide.nov", "let wide: () -> i128 = 1\n");
+    _ = fixtures.add("hidden.nov", "let standard = @import(\"std\")\nlet value: bool = standard.hidden\n");
+    const visibility = fixtures.add("visibility/std.nov", "let hidden = true\n");
+    const Case = struct { name: []const u8, args: []const []const u8, code: u8, diagnostic: ?[]const u8 = null };
+    const cases = [_]Case{
+        .{ .name = "relative diamond", .args = &.{ "check", "--semantic", "relative.nov" }, .code = 0 },
+        .{ .name = "relative diamond and library callbacks", .args = &.{ "check", "--semantic", "app/main.nov" }, .code = 0 },
+        .{ .name = "missing imports stay syntax only", .args = &.{ "check", "missing.nov" }, .code = 0 },
+        .{ .name = "missing import", .args = &.{ "check", "--semantic", "missing.nov" }, .code = 1, .diagnostic = "cannot load imported source: FileNotFound" },
+        .{ .name = "missing import buffers C", .args = &.{ "emit-c", "missing.nov" }, .code = 1, .diagnostic = "cannot load imported source" },
+        .{ .name = "cycle with source note", .args = &.{ "emit-c", "cycle/a.nov" }, .code = 1, .diagnostic = "a.nov:1:9: note: earlier import in this cycle" },
+        .{ .name = "imported main is not entry", .args = &.{ "emit-c", "no-entry.nov" }, .code = 1, .diagnostic = "no-entry.nov:1:1: error:" },
+        .{ .name = "root entry signature", .args = &.{ "emit-c", "bad-entry.nov" }, .code = 1, .diagnostic = "bad-entry.nov:2:5: error:" },
+        .{ .name = "imported body diagnostic", .args = &.{ "emit-c", "bad-import.nov" }, .code = 1, .diagnostic = "body.nov:1:23: error: unknown name 'absent'" },
+        .{ .name = "imported backend diagnostic", .args = &.{ "emit-c", "wide-import.nov" }, .code = 1, .diagnostic = "wide.nov:1:" },
+    };
+    for (cases) |case| {
+        const run = b.addRunArtifact(exe);
+        run.step.name = b.fmt("CLI imports: {s}", .{case.name});
+        run.setCwd(fixtures.getDirectory());
+        run.addArgs(case.args);
+        if (!(case.args.len == 2 and std.mem.eql(u8, case.args[0], "check"))) {
+            run.addArg("--lib-dir");
+            run.addDirectoryArg(library);
+        }
+        run.expectExitCode(case.code);
+        run.expectStdOutEqual("");
+        if (case.diagnostic) |message| run.expectStdErrMatch(message) else run.expectStdErrEqual("");
+        test_step.dependOn(&run.step);
+    }
+    for ([_][]const u8{ "root", "relative", "std", "result" }) |target| {
+        const protected = b.addWriteFiles();
+        const root_name = b.fmt("protect-{s}.nov", .{target});
+        const root_source = "let imported = @import(\"imported.nov\")\nlet standard = @import(\"std\")\nlet R = standard.Result(uint, string)\nlet main: () = @println(imported.value())\n";
+        const root_file = protected.add(root_name, root_source);
+        const imported_source = "let value: () -> uint = 7\n";
+        const imported_file = protected.add("imported.nov", imported_source);
+        const protected_library = protected.addCopyDirectory(b.path("lib"), "library", .{});
+        const output_file = if (std.mem.eql(u8, target, "root")) root_file else if (std.mem.eql(u8, target, "relative")) imported_file else protected_library.path(b, b.fmt("{s}.nov", .{target}));
+        const expected_source = if (std.mem.eql(u8, target, "root")) root_source else if (std.mem.eql(u8, target, "relative")) imported_source else if (std.mem.eql(u8, target, "std")) @embedFile("lib/std.nov") else @embedFile("lib/result.nov");
+        const reject = b.addRunArtifact(exe);
+        reject.step.name = b.fmt("CLI imports: protect {s} source from output overwrite", .{target});
+        reject.setCwd(protected.getDirectory());
+        reject.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+        reject.setEnvironmentVariable("NOV_CC", "");
+        reject.setEnvironmentVariable("CC", "");
+        reject.addArgs(&.{ "build", root_name, "--lib-dir" });
+        reject.addDirectoryArg(protected_library);
+        reject.addArg("-o");
+        reject.addFileArg(output_file);
+        reject.expectExitCode(1);
+        reject.expectStdOutEqual("");
+        reject.expectStdErrEqual("error: output path refers to the input source file\n");
+        const preserved = b.addCheckFile(output_file, .{ .expected_exact = expected_source });
+        preserved.setName(b.fmt("CLI imports: {s} source remains unchanged", .{target}));
+        preserved.step.dependOn(&reject.step);
+        test_step.dependOn(&preserved.step);
+    }
+
+    const relative = b.addRunArtifact(exe);
+    relative.step.name = "CLI imports: relative diamond run selects root main";
+    relative.setCwd(fixtures.getDirectory());
+    relative.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+    relative.setEnvironmentVariable("NOV_CC", "");
+    relative.setEnvironmentVariable("CC", "");
+    relative.addArgs(&.{ "run", "relative.nov" });
+    relative.expectExitCode(0);
+    relative.expectStdOutEqual("7 7\n");
+    relative.expectStdErrEqual("");
+    test_step.dependOn(&relative.step);
+
+    const hidden = b.addRunArtifact(exe);
+    hidden.step.name = "CLI imports: named module hides private declarations";
+    hidden.setCwd(fixtures.getDirectory());
+    hidden.addArgs(&.{ "check", "--semantic", "hidden.nov", "--lib-dir" });
+    hidden.addDirectoryArg(visibility.dirname());
+    hidden.expectExitCode(1);
+    hidden.expectStdOutEqual("");
+    hidden.expectStdErrMatch("hidden.nov:2:");
+    test_step.dependOn(&hidden.step);
+
+    for ([_][]const u8{ "--debug", "--release" }) |mode| {
+        for ([_]bool{ false, true }) |build_program| {
+            const run = b.addRunArtifact(exe);
+            run.step.name = b.fmt("CLI imports: {s} {s}", .{ if (build_program) "build" else "run", mode });
+            run.setCwd(fixtures.getDirectory());
+            run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+            run.setEnvironmentVariable("NOV_CC", "");
+            run.setEnvironmentVariable("CC", "");
+            run.addArgs(&.{ if (build_program) "build" else "run", "app/main.nov", mode, "--lib-dir" });
+            run.addDirectoryArg(library);
+            run.expectExitCode(0);
+            run.expectStdErrEqual("");
+            if (build_program) {
+                run.addArg("-o");
+                const binary = run.addOutputFileArg(if (exe.root_module.resolved_target.?.result.os.tag == .windows) "imports.exe" else "imports");
+                run.expectStdOutEqual("");
+                const execute = std.Build.Step.Run.create(b, b.fmt("CLI imports: execute built {s}", .{mode}));
+                execute.addFileArg(binary);
+                execute.expectExitCode(0);
+                execute.expectStdOutEqual("fallback:7 7\n");
+                execute.expectStdErrEqual("");
+                test_step.dependOn(&execute.step);
+            } else {
+                run.expectStdOutEqual("fallback:7 7\n");
+                test_step.dependOn(&run.step);
+            }
+        }
+    }
+
+    const emit = b.addRunArtifact(exe);
+    emit.step.name = "CLI imports: emitted C compiles and runs";
+    emit.setCwd(fixtures.getDirectory());
+    emit.addArgs(&.{ "emit-c", "app/main.nov", "--lib-dir" });
+    emit.addDirectoryArg(library);
+    emit.expectExitCode(0);
+    emit.expectStdErrEqual("");
+    const c_source = emit.captureStdOut(.{});
+    const compile = b.addSystemCommand(&.{ b.graph.zig_exe, "cc", "-x", "c", "-std=c11", "-Wall", "-Wextra", "-Werror" });
+    compile.addFileArg(c_source);
+    compile.addArg("-o");
+    const binary = compile.addOutputFileArg(if (exe.root_module.resolved_target.?.result.os.tag == .windows) "emitted.exe" else "emitted");
+    const execute = std.Build.Step.Run.create(b, "CLI imports: execute emitted C");
+    execute.addFileArg(binary);
+    execute.expectExitCode(0);
+    execute.expectStdOutEqual("fallback:7 7\n");
+    execute.expectStdErrEqual("");
+    test_step.dependOn(&execute.step);
+
+    // Recreate the installed layout in the cache, away from both source and cwd.
+    const package = b.addWriteFiles();
+    const installed_exe = package.addCopyFile(exe.getEmittedBin(), b.fmt("bin/{s}", .{exe.out_filename}));
+    _ = package.addCopyDirectory(b.path("lib"), "lib/nov", .{});
+    for ([_][]const u8{ "check", "emit-c", "build", "run" }) |command| {
+        const installed = std.Build.Step.Run.create(b, b.fmt("CLI imports: relocated installed {s}", .{command}));
+        installed.addFileArg(installed_exe);
+        installed.setCwd(fixtures.getDirectory());
+        installed.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+        installed.setEnvironmentVariable("NOV_CC", "");
+        installed.setEnvironmentVariable("CC", "");
+        installed.addArg(command);
+        if (std.mem.eql(u8, command, "check")) installed.addArg("--semantic");
+        installed.addFileArg(program);
+        if (std.mem.eql(u8, command, "build")) {
+            installed.addArg("-o");
+            _ = installed.addOutputFileArg(if (exe.root_module.resolved_target.?.result.os.tag == .windows) "installed-program.exe" else "installed-program");
+        }
+        installed.expectExitCode(0);
+        installed.expectStdErrEqual("");
+        if (std.mem.eql(u8, command, "emit-c")) {
+            _ = installed.captureStdOut(.{});
+        } else {
+            installed.expectStdOutEqual(if (std.mem.eql(u8, command, "run")) "fallback:7 7\n" else "");
+        }
+        test_step.dependOn(&installed.step);
+    }
+    const override = std.Build.Step.Run.create(b, "CLI imports: explicit library overrides installed default");
+    override.addFileArg(installed_exe);
+    override.setCwd(fixtures.getDirectory());
+    override.addArgs(&.{ "check", "--semantic", "app/main.nov", "--lib-dir", "missing-library" });
+    override.expectExitCode(1);
+    override.expectStdOutEqual("");
+    override.expectStdErrMatch("cannot load imported source: FileNotFound");
+    test_step.dependOn(&override.step);
 }
 
 fn clean(step: *std.Build.Step, _: std.Build.Step.MakeOptions) !void {

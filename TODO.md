@@ -7,14 +7,21 @@ callbacks, sibling/forward/recursive calls and exact concretized toString.
 Unrequested signatures/bodies remain dormant; requested methods are fully checked.
 This keeps void Result payloads usable without changing void-parameter restrictions.
 
-lib/result.nov starts the Nov stdlib with ordinary public Result, unwrapOr and
-unwrapOrElse definitions. The actual source is CLI-tested with a single-module
-harness and installed at <prefix>/lib/nov, including release builds/package sources.
-Imports/library lookup are NOT implemented: examples retain local Result for now.
-Next: separate-source compilation ownership, canonical module/global declaration
-identities, source-qualified spans/diagnostics, namespace resolution and library
-import conventions. Do not implement imports by source concatenation/name rewriting
-or make Result a compiler builtin. General generic structs/value/comptime remain deferred.
+lib/std.nov now publicly re-exports ordinary Result from lib/result.nov. Examples
+use `let std=@import("std")` and `let Result=std.Result`; real-import CLI tests cover
+its unwrapOr/unwrapOrElse methods and void payloads. Library lookup uses executable-
+relative ../lib/nov or explicit --lib-dir, including relocated installs. Explicit
+relative .nov imports resolve from the importer, cache canonical paths and reject
+cycles. Namespaces do not inject bare names; aliases/re-exports preserve identities.
+
+Separate AST owners, source-qualified spans/diagnostics, canonical declaration
+identities, shared semantic/IR pools and defining-scope generic method resolution
+now support multi-source compilation. Only root main is an entrypoint. Build output
+cannot overwrite any loaded source, including imported library/symlink targets.
+No source concatenation/name rewriting or builtin Result is used. Named imports
+require public top-level exports; file imports also allow unmarked declarations.
+Full member visibility/private attributes, runtime module initialization, arbitrary
+package search, generic structs/value/comptime remain deferred.
 
 Instance calls value.method(args) work on nominal structs, non-generic unions and
 enums as sugar for Type.method(value,args). The explicit first parameter must match
@@ -69,8 +76,8 @@ variant with identical error type. Ordinary returns never implicitly wrap payloa
 Generic structs, general comptime/value parameters, nested union/
 array/function payloads, nested record fields, explicit tag enums and Option
 propagation remain deferred.
-The updated filesystem error example remains design-only: imports, file-resource
-semantics are missing.
+The filesystem error example remains design-only: filesystem APIs and file-resource
+semantics are missing and intentionally deprioritized; imports are implemented.
 
 Bounded nominal value structs are executable; `examples/type.nov` is unchanged
 and runs/checks/formats successfully. Separate declarations have distinct identities;
@@ -81,8 +88,8 @@ in declaration order. Record value boundaries copy fields; strings share immutab
 storage. Field reads work in interpolation. Container methods support scoped and
 static `Type.method(...)` calls; print calls exact `toString: (MyType) -> string` once
 immediately after each argument is evaluated, before the next argument. Only
-`@[public]` on structs/methods is accepted, as future visibility metadata, not imports
-or a new C export policy. C value layouts/root frames retain every string owner in
+argument-free `@[public]` on immutable supported declarations is accepted; named
+imports enforce public top-level access, not full member visibility or a C export policy. C value layouts/root frames retain every string owner in
 parameters, temporaries, local slots and control-flow merges. Contextual/anonymous
 constructors, field mutation, nested/array/function fields,
 record arrays/globals, container constants/types, derived printing,

@@ -13,7 +13,7 @@ pub const Error = Ir.InternError;
 /// On allocation failure, interned constants and diagnostics may remain: the
 /// caller owns rollback as well as the lifetime of both module and IR storage.
 pub fn check(module: *Module, ir: *Ir, node: Ast.Node.Index, expected: Ir.TypeId, annotation: ?Module.Span) Error!Result {
-    const ast = &module.ast;
+    const ast = &module.source.ast;
     var current = node;
     while (true) {
         const span = module.tokenSpan(ast.nodes.items(.main_token)[current]);
@@ -51,7 +51,7 @@ pub fn check(module: *Module, ir: *Ir, node: Ast.Node.Index, expected: Ir.TypeId
                 }
                 if (ast.nodes.items(.tag)[operand] != .number_literal) return .not_literal;
                 const end = module.tokenSpan(ast.lastToken(original_operand)).end;
-                return checkNumber(module, ir, operand, expected, true, .{ .start = span.start, .end = end }, annotation);
+                return checkNumber(module, ir, operand, expected, true, .{ .source = span.source, .start = span.start, .end = end }, annotation);
             },
             .identifier => {
                 const name = module.sourceSlice(span).?;
@@ -73,14 +73,14 @@ pub fn check(module: *Module, ir: *Ir, node: Ast.Node.Index, expected: Ir.TypeId
                             .empty_char_literal => unreachable,
                             inline else => |index| index,
                         });
-                        return failLiteral(module, .invalid_literal, .{ .start = span.start + offset, .end = @min(span.end, span.start + offset + 1) }, null);
+                        return failLiteral(module, .invalid_literal, .{ .source = span.source, .start = span.start + offset, .end = @min(span.end, span.start + offset + 1) }, null);
                     },
                     .success => {},
                 }
                 if (hasInterpolation(bytes)) return .not_literal;
                 if (stringIssue(bytes, decoded.written())) |issue| {
                     const start = span.start + @as(u32, @intCast(issue.offset));
-                    return failLiteral(module, issue.tag, .{ .start = start, .end = start + 1 }, null);
+                    return failLiteral(module, issue.tag, .{ .source = span.source, .start = start, .end = start + 1 }, null);
                 }
                 return internLiteral(module, ir, expected, .{ .string = decoded.written() }, span, annotation);
             },
@@ -91,16 +91,23 @@ pub fn check(module: *Module, ir: *Ir, node: Ast.Node.Index, expected: Ir.TypeId
 }
 
 pub fn qualifiedEnum(module: *Module, ir: *Ir, node: Ast.Node.Index) Error!?Ir.TypeId {
-    const ast = &module.ast;
+    const ast = &module.source.ast;
     if (ast.nodes.items(.tag)[node] != .field_access) return null;
     const base = ast.nodes.items(.data)[node].lhs;
-    if (ast.nodes.items(.tag)[base] != .identifier) return null;
-    const id = module.lookup(ast.tokenSlice(ast.nodes.items(.main_token)[base])) orelse return null;
-    if (!module.getDeclaration(id).?.is_type_alias or module.getDeclaration(id).?.is_generic) return null;
+    if (module.compilation) |comp| {
+        const ref = comp.reference(module, base) orelse return null;
+        const decl = comp.getModule(ref.source).?.getDeclaration(ref.local).?;
+        if (!decl.is_type_alias or decl.is_generic or decl.is_namespace) return null;
+    } else {
+        if (ast.nodes.items(.tag)[base] != .identifier) return null;
+        const id = module.lookup(ast.tokenSlice(ast.nodes.items(.main_token)[base])) orelse return null;
+        if (!module.getDeclaration(id).?.is_type_alias or module.getDeclaration(id).?.is_generic) return null;
+    }
     const ty = (try TypeResolver.resolve(module, ir, base)) orelse return null;
     const t = ir.getType(ty).?;
     if (t != .enumeration) return null;
-    if (module.lookupMethod(@enumFromInt(t.enumeration.identity), ast.tokenSlice(ast.nodes.items(.data)[node].rhs)) != null) return null;
+    const owner = if (module.compilation) |comp| comp.getModule(t.enumeration.source).? else module;
+    if (owner.lookupMethod(@enumFromInt(t.enumeration.identity), ast.tokenSlice(ast.nodes.items(.data)[node].rhs)) != null) return null;
     return ty;
 }
 
@@ -178,7 +185,7 @@ fn internLiteral(module: *Module, ir: *Ir, expected: Ir.TypeId, value: Ir.Consta
 }
 
 fn checkNumber(module: *Module, ir: *Ir, node: Ast.Node.Index, expected: Ir.TypeId, negative: bool, span: Module.Span, annotation: ?Module.Span) Error!Result {
-    const bytes = module.ast.tokenSlice(module.ast.nodes.items(.main_token)[node]);
+    const bytes = module.source.ast.tokenSlice(module.source.ast.nodes.items(.main_token)[node]);
     switch (std.zig.parseNumberLiteral(bytes)) {
         .float => return failLiteral(module, .unsupported_literal, span, annotation),
         .failure => return failLiteral(module, .invalid_literal, span, annotation),
@@ -210,7 +217,7 @@ fn checkNumber(module: *Module, ir: *Ir, node: Ast.Node.Index, expected: Ir.Type
 }
 
 fn testNode(module: *const Module, index: usize) Ast.Node.Index {
-    return module.ast.decl(module.declarations.items[index].node).ast.init_node;
+    return module.source.ast.decl(module.declarations.items[index].node).ast.init_node;
 }
 
 const test_i8: Ir.Type = .{ .integer = .{ .signedness = .signed, .bits = 8 } };
@@ -325,8 +332,8 @@ test "invalid literals fail with source spans and only optional type notes" {
         var ir = Ir.init(std.testing.allocator);
         defer ir.deinit();
         const expected = try ir.internType(case.ty);
-        const full = module.ast.decl(module.declarations.items[0].node);
-        const annotation = module.tokenSpan(module.ast.firstToken(full.ast.type_node));
+        const full = module.source.ast.decl(module.declarations.items[0].node);
+        const annotation = module.tokenSpan(module.source.ast.firstToken(full.ast.type_node));
         for ([_]?Module.Span{ annotation, null }, 0..) |note, i| {
             try std.testing.expectEqual(Result.failed, try check(&module, &ir, full.ast.init_node, expected, note));
             try std.testing.expectEqual(i + 1, module.diagnostics.items.len);

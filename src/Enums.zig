@@ -177,7 +177,7 @@ test "enums reject inexact types arithmetic ordering conversions captures and in
         defer std.testing.allocator.free(source);
         var module = try Module.init(std.testing.allocator, "bad-enum.nov", source);
         defer module.deinit();
-        try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+        try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
         var result = try Lowering.lower(&module);
         defer result.deinit();
         var found = false;
@@ -268,7 +268,7 @@ test "enum declarations share the namespace and unsupported backing syntax diagn
     for ([_][]const u8{ "let K=enum(u32){x,}", "let K=enum(int){x,}" }) |source| {
         var module = try Module.init(std.testing.allocator, "enum-backing.nov", source);
         defer module.deinit();
-        try std.testing.expect(module.ast.errors.len != 0);
+        try std.testing.expect(module.source.ast.errors.len != 0);
         var output = std.Io.Writer.Allocating.init(std.testing.allocator);
         defer output.deinit();
         try Diagnostics.renderModule(&module, &output.writer);

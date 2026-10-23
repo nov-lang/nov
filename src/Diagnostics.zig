@@ -3,6 +3,8 @@ const CEmitter = @import("CEmitter.zig");
 const Parser = @import("Parser.zig");
 const Ast = @import("Ast.zig");
 const Module = @import("Module.zig");
+const Source = @import("Source.zig");
+const Compilation = @import("Compilation.zig");
 
 const Location = struct {
     start: usize,
@@ -40,11 +42,41 @@ const Location = struct {
     }
 };
 
+test "compilation diagnostics render related locations and backend leaves from their owners" {
+    var compilation = Compilation.init(std.testing.allocator);
+    defer compilation.deinit();
+    const root = try compilation.addSource("root.nov", "let value = true");
+    const library = try compilation.addSource("library.nov", "let other = false");
+    const root_module = compilation.getModule(root).?;
+    const library_module = compilation.getModule(library).?;
+    const primary = root_module.getDeclaration(root_module.lookup("value").?).?.name_span;
+    const related = library_module.getDeclaration(library_module.lookup("other").?).?.name_span;
+    try root_module.diagnostics.append(std.testing.allocator, .{ .tag = .expression_type_mismatch, .span = primary, .related = related });
+    var out = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer out.deinit();
+    try renderCompilation(&compilation, &out.writer);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "root.nov:1:5: error:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "library.nov:1:5: note:") != null);
+    try renderCompilationBackend(&compilation, .{ .reason = .integer_width_unsupported, .function = null, .span = related }, &out.writer);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "library.nov:1:5: error: C backend") != null);
+}
+
 pub fn renderModule(module: *const Module, writer: *std.Io.Writer) !void {
-    try render(module.ast, module.path, writer);
+    try renderModuleWithSources(module, null, writer);
+}
+
+fn spanSource(module: *const Module, compilation: ?*const Compilation, span: Source.Span) !*const Source {
+    const source = if (compilation) |owner| owner.getSource(span.source) orelse return error.InvalidSpan else &module.source;
+    if (source.slice(span) == null) return error.InvalidSpan;
+    return source;
+}
+
+fn renderModuleWithSources(module: *const Module, compilation: ?*const Compilation, writer: *std.Io.Writer) !void {
+    try render(module.source.ast, module.source.path, writer);
     for (module.diagnostics.items) |diagnostic| {
-        const location = Location.init(module.ast.source, diagnostic.span.start);
-        try location.renderPrefix(module.path, "error", writer);
+        const source = try spanSource(module, compilation, diagnostic.span);
+        const location = Location.init(source.ast.source, diagnostic.span.start);
+        try location.renderPrefix(source.path, "error", writer);
         switch (diagnostic.tag) {
             .invalid_generic_declaration => try writer.writeAll("generic union declarations require named type parameters: (T: type, ...) -> type = union { ... }"),
             .generic_needs_arguments => try writer.writeAll("generic union requires explicit type arguments"),
@@ -67,30 +99,30 @@ pub fn renderModule(module: *const Module, writer: *std.Io.Writer) !void {
             .match_missing_variants => try writer.writeAll("enum or union match must cover every variant or end with a wildcard (_)"),
             .match_covered_union_prong => try writer.writeAll("union match prong is already covered by earlier prongs"),
             .invalid_match_capture => try writer.writeAll("payload capture requires a single union variant pattern and an immutable named binding"),
-            .unsupported_attribute => try writer.writeAll("unsupported, misplaced or duplicate attribute; @[public] requires a container or method, @[noreturn] requires a function"),
+            .unsupported_attribute => try writer.writeAll("unsupported, misplaced or duplicate attribute; @[public] requires an immutable declaration, @[noreturn] requires a function"),
             .noreturn_result => try writer.writeAll("@[noreturn] function must return void"),
             .noreturn_return => try writer.writeAll("return is forbidden in an @[noreturn] function"),
             .noreturn_completion => try writer.writeAll("@[noreturn] function may complete normally"),
             .duplicate_field => try writer.writeAll("duplicate container field"),
             .unknown_field => try writer.writeAll("unknown container field, method, enum tag or union variant"),
             .invalid_method_receiver => try writer.writeAll("instance method requires a first parameter of the exact receiver container type"),
-            .missing_field => if (diagnostic.related) |field| try writer.print("missing required struct field '{s}'", .{module.sourceSlice(field).?}) else try writer.writeAll("missing required struct field"),
+            .missing_field => if (diagnostic.related) |field| try writer.print("missing required struct field '{s}'", .{(try spanSource(module, compilation, field)).slice(field).?}) else try writer.writeAll("missing required struct field"),
             .invalid_field_default => try writer.writeAll("struct field default must be a literal of the exact field type"),
             .invalid_to_string => try writer.writeAll("printing a struct, enum or union requires its method toString: (MyType) -> string"),
-            .duplicate_name => try writer.print("duplicate declaration '{s}'", .{module.sourceSlice(diagnostic.span).?}),
-            .unknown_name => try writer.print("unknown name '{s}'", .{module.sourceSlice(diagnostic.span).?}),
+            .duplicate_name => try writer.print("duplicate declaration '{s}'", .{source.slice(diagnostic.span).?}),
+            .unknown_name => try writer.print("unknown name '{s}'", .{source.slice(diagnostic.span).?}),
             .unsupported_declaration => try writer.writeAll("unsupported declaration; containers currently allow only explicitly typed methods"),
             .unsupported_name => try writer.writeAll("quoted identifiers are not supported in semantic analysis yet"),
-            .type_alias_cycle => try writer.print("cyclic type alias dependency on '{s}'", .{module.sourceSlice(diagnostic.span).?}),
+            .type_alias_cycle => try writer.print("cyclic type alias dependency on '{s}'", .{source.slice(diagnostic.span).?}),
             .type_alias_limit => try writer.writeAll("type alias expansion exceeds the current analysis limit of 128"),
             .not_a_value => try writer.writeAll("expected a runtime value, found a type alias"),
-            .value_cycle => try writer.print("cyclic value dependency on '{s}'", .{module.sourceSlice(diagnostic.span).?}),
+            .value_cycle => try writer.print("cyclic value dependency on '{s}'", .{source.slice(diagnostic.span).?}),
             .unsupported_dependency_expression => try writer.writeAll("dependency analysis for this expression is not implemented yet"),
             .missing_initializer => try writer.writeAll("dependency analysis requires an initializer"),
-            .unknown_type => try writer.print("unknown type '{s}'", .{module.sourceSlice(diagnostic.span).?}),
+            .unknown_type => try writer.print("unknown type '{s}'", .{source.slice(diagnostic.span).?}),
             .unsupported_type => try writer.writeAll("this type is not supported in semantic analysis yet"),
             .not_a_type => try writer.writeAll("expected a type, found a value"),
-            .duplicate_parameter => try writer.print("duplicate parameter '{s}'", .{module.sourceSlice(diagnostic.span).?}),
+            .duplicate_parameter => try writer.print("duplicate parameter '{s}'", .{source.slice(diagnostic.span).?}),
             .invalid_parameter_type => try writer.writeAll("void is not a parameter type"),
             .type_nesting_limit => try writer.writeAll("type annotation nesting exceeds the current analysis limit of 128"),
             .invalid_literal => try writer.writeAll("invalid numeric literal"),
@@ -132,7 +164,7 @@ pub fn renderModule(module: *const Module, writer: *std.Io.Writer) !void {
             .unsupported_global_initializer => try writer.writeAll("inferred globals require immutable bool/string literals or @as(T, scalar literal); general global initialization is unsupported"),
             .unsupported_lowering => try writer.writeAll("lowering this source form is not implemented yet"),
         }
-        try location.renderExcerpt(module.ast.source, diagnostic.span.end - diagnostic.span.start, writer);
+        try location.renderExcerpt(source.ast.source, diagnostic.span.end - diagnostic.span.start, writer);
         const note: ?[]const u8 = switch (diagnostic.tag) {
             .duplicate_name => "first declaration here",
             .value_cycle, .type_alias_cycle => "declaration in this cycle",
@@ -152,20 +184,59 @@ pub fn renderModule(module: *const Module, writer: *std.Io.Writer) !void {
         };
         if (note) |message| {
             if (diagnostic.related) |related| {
-                const original = Location.init(module.ast.source, related.start);
-                try original.renderPrefix(module.path, "note", writer);
+                const related_source = try spanSource(module, compilation, related);
+                const original = Location.init(related_source.ast.source, related.start);
+                try original.renderPrefix(related_source.path, "note", writer);
                 try writer.writeAll(message);
-                try original.renderExcerpt(module.ast.source, related.end - related.start, writer);
+                try original.renderExcerpt(related_source.ast.source, related.end - related.start, writer);
             }
         }
     }
 }
 
 pub fn renderBackend(module: *const Module, diagnostic: CEmitter.Diagnostic, writer: *std.Io.Writer) !void {
-    const location = Location.init(module.ast.source, diagnostic.span.start);
-    try location.renderPrefix(module.path, "error", writer);
+    try renderBackendSource(try spanSource(module, null, diagnostic.span), diagnostic, writer);
+}
+
+fn renderBackendSource(source: *const Source, diagnostic: CEmitter.Diagnostic, writer: *std.Io.Writer) !void {
+    if (source.slice(diagnostic.span) == null) return error.InvalidSpan;
+    const location = Location.init(source.ast.source, diagnostic.span.start);
+    try location.renderPrefix(source.path, "error", writer);
     try writer.writeAll(diagnostic.reason.message());
-    try location.renderExcerpt(module.ast.source, diagnostic.span.end - diagnostic.span.start, writer);
+    try location.renderExcerpt(source.ast.source, diagnostic.span.end - diagnostic.span.start, writer);
+}
+
+pub fn renderCompilationBackend(compilation: *const Compilation, diagnostic: CEmitter.Diagnostic, writer: *std.Io.Writer) !void {
+    const source = compilation.getSource(diagnostic.span.source) orelse return error.InvalidSpan;
+    try renderBackendSource(source, diagnostic, writer);
+}
+
+pub fn renderCompilation(compilation: *const Compilation, writer: *std.Io.Writer) !void {
+    for (compilation.modules.items) |module| try renderModuleWithSources(module, compilation, writer);
+    for (compilation.diagnostics.items) |diagnostic| {
+        const source = compilation.getSource(diagnostic.span.source) orelse return error.InvalidSpan;
+        if (source.slice(diagnostic.span) == null) return error.InvalidSpan;
+        const location = Location.init(source.ast.source, diagnostic.span.start);
+        try location.renderPrefix(source.path, "error", writer);
+        try writer.writeAll(switch (diagnostic.tag) {
+            .invalid_import => "@import requires an immutable, unannotated top-level namespace declaration with one literal string argument",
+            .invalid_path => "import requires a relative literal .nov path or the named module 'std'",
+            .missing_library => "named import 'std' requires a configured library directory",
+            .load_failed => "cannot load imported source",
+            .import_cycle => "cyclic source import",
+            .import_depth => "import nesting exceeds the current limit of 256",
+        });
+        if (diagnostic.cause) |cause| try writer.print(": {s}", .{@errorName(cause)});
+        try location.renderExcerpt(source.ast.source, diagnostic.span.end - diagnostic.span.start, writer);
+        if (diagnostic.related) |related| {
+            const original_source = compilation.getSource(related.source) orelse return error.InvalidSpan;
+            if (original_source.slice(related) == null) return error.InvalidSpan;
+            const original = Location.init(original_source.ast.source, related.start);
+            try original.renderPrefix(original_source.path, "note", writer);
+            try writer.writeAll("earlier import in this cycle");
+            try original.renderExcerpt(original_source.ast.source, related.end - related.start, writer);
+        }
+    }
 }
 
 pub fn render(ast: Ast, path: []const u8, writer: *std.Io.Writer) !void {
@@ -413,7 +484,7 @@ test "module unsupported attributes and quoted names render semantic diagnostics
     defer output.deinit();
     try renderModule(&module, &output.writer);
     try std.testing.expectEqualStrings(
-        "unsupported.nov:1:1: error: unsupported, misplaced or duplicate attribute; @[public] requires a container or method, @[noreturn] requires a function\n@[export]\n^~\n" ++
+        "unsupported.nov:1:1: error: unsupported, misplaced or duplicate attribute; @[public] requires an immutable declaration, @[noreturn] requires a function\n@[export]\n^~\n" ++
             "unsupported.nov:3:5: error: quoted identifiers are not supported in semantic analysis yet\nlet @\"quoted\" = 2\n    ^~~~~~~~~\n",
         output.written(),
     );
@@ -427,11 +498,11 @@ test "syntax-only module rendering matches parser rendering" {
     }) |source| {
         var module = try Module.init(std.testing.allocator, "syntax.nov", source);
         defer module.deinit();
-        try std.testing.expect(module.ast.errors.len > 0);
+        try std.testing.expect(module.source.ast.errors.len > 0);
         try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
         var expected = std.Io.Writer.Allocating.init(std.testing.allocator);
         defer expected.deinit();
-        try render(module.ast, module.path, &expected.writer);
+        try render(module.source.ast, module.source.path, &expected.writer);
         var output = std.Io.Writer.Allocating.init(std.testing.allocator);
         defer output.deinit();
         try renderModule(&module, &output.writer);

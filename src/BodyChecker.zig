@@ -3,6 +3,7 @@ const string_literal = @import("string_literal.zig");
 const Lowering = @import("Lowering.zig");
 const Sema = @import("Sema.zig");
 const Ast = @import("Ast.zig");
+const Compilation = @import("Compilation.zig");
 const Module = @import("Module.zig");
 const Ir = @import("Ir.zig");
 const Literal = @import("Literal.zig");
@@ -45,11 +46,16 @@ pub fn lower(module: *Module, ir: *Ir, types: []const ?Ir.TypeId, constants: []c
     defer arena.deinit();
     var emitter: Emitter = .{ .allocator = arena.allocator(), .constants = constants, .functions = functions };
     if (!try checkInner(module, ir, types, id, &emitter, null)) return false;
-    const body_node = module.ast.decl(module.getDeclaration(id).?.node).ast.init_node;
+    const body_node = module.source.ast.decl(module.getDeclaration(id).?.node).ast.init_node;
     const result = emitter.values.get(body_node) orelse return error.InvalidValueId;
-    const function = functions[@intFromEnum(id)] orelse return error.InvalidFunctionId;
+    const function = functions[tableIndex(module, id)] orelse return error.InvalidFunctionId;
     try ir.setFunctionBody(function, emitter.instructions.items, result);
     return true;
+}
+
+fn tableIndex(module: *const Module, id: Module.DeclId) usize {
+    if (module.compilation) |comp| return @intFromEnum(comp.declaration_ids.get(.{ .source = module.source.id, .local = id }).?);
+    return @intFromEnum(id);
 }
 
 const Emitter = struct {
@@ -78,23 +84,23 @@ const Emitter = struct {
 };
 
 fn checkInner(module: *Module, ir: *Ir, types: []const ?Ir.TypeId, id: Module.DeclId, emitter: ?*Emitter, sema: ?*Sema) Error!bool {
-    if (sema == null and types.len != module.declarations.items.len) return error.InvalidTypeId;
+    if (sema == null and module.compilation == null and types.len != module.declarations.items.len) return error.InvalidTypeId;
     const declaration = module.getDeclaration(id) orelse return error.InvalidTypeId;
-    const type_id = (if (sema) |analysis| try analysis.requestType(module, id) else types[@intFromEnum(id)]) orelse return false;
+    const type_id = (if (sema) |analysis| try analysis.requestType(module, id) else types[tableIndex(module, id)]) orelse return false;
     const ty = ir.getType(type_id) orelse return error.InvalidTypeId;
     if (ty != .function) return error.InvalidTypeId;
-    const full = module.ast.decl(declaration.node);
-    const proto = module.ast.fullFnProto(full.ast.type_node) orelse return error.InvalidTypeId;
+    const full = module.source.ast.decl(declaration.node);
+    const proto = module.source.ast.fullFnProto(full.ast.type_node) orelse return error.InvalidTypeId;
     if (proto.ast.params.len != ty.function.params.len) return error.InvalidTypeId;
     var context: Context = .{ .module = module, .ir = ir, .types = types, .emitter = emitter, .container = declaration.container, .concrete_type = declaration.concrete_type, .sema = sema };
     defer context.bindings.deinit(module.allocator);
     defer context.locals.deinit(module.allocator);
-    var iterator = proto.iterate(&module.ast);
+    var iterator = proto.iterate(&module.source.ast);
     var i: usize = 0;
     var valid = true;
     while (iterator.next()) |param| : (i += 1) {
         if (param.name_token) |token| {
-            const name = module.ast.tokenSlice(token);
+            const name = module.source.ast.tokenSlice(token);
             const span = module.tokenSpan(token);
             if (context.conflict(name) != null or isPrimitive(name)) {
                 const related = context.conflict(name);
@@ -104,7 +110,7 @@ fn checkInner(module: *Module, ir: *Ir, types: []const ?Ir.TypeId, id: Module.De
             }
             try context.bindings.put(module.allocator, name, .{ .index = @intCast(i), .name_span = span, .known = .{
                 .ty = ty.function.params[i],
-                .annotation = module.tokenSpan(module.ast.firstToken(param.type_expr)),
+                .annotation = module.tokenSpan(module.source.ast.firstToken(param.type_expr)),
             } });
         }
     }
@@ -114,16 +120,16 @@ fn checkInner(module: *Module, ir: *Ir, types: []const ?Ir.TypeId, id: Module.De
         return false;
     }
     if (declaration.noreturn) {
-        const first = module.ast.firstToken(full.ast.init_node);
-        const last = module.ast.lastToken(full.ast.init_node);
-        for (module.ast.tokens.items(.tag)[first .. last + 1], first..) |tag, token| {
+        const first = module.source.ast.firstToken(full.ast.init_node);
+        const last = module.source.ast.lastToken(full.ast.init_node);
+        for (module.source.ast.tokens.items(.tag)[first .. last + 1], first..) |tag, token| {
             if (tag == .keyword_return) {
                 try module.diagnostics.append(module.allocator, .{ .tag = .noreturn_return, .span = module.tokenSpan(@intCast(token)) });
                 return false;
             }
         }
     }
-    const annotation = module.tokenSpan(if (proto.ast.return_type) |node| module.ast.firstToken(node) else proto.lparen);
+    const annotation = module.tokenSpan(if (proto.ast.return_type) |node| module.source.ast.firstToken(node) else proto.lparen);
     context.return_type = .{ .ty = ty.function.result, .annotation = annotation };
     const checked = (try context.expression(full.ast.init_node, .{ .ty = ty.function.result, .annotation = annotation }, 0)) != null;
     if (checked and declaration.noreturn and !context.terminated) {
@@ -163,28 +169,62 @@ const Context = struct {
         try self.bindings.put(self.module.allocator, name, binding);
     }
 
+    // Context declaration IDs address the shared semantic table, whereas AST
+    // container IDs remain local to the current defining module.
+    fn qualify(self: *Context, module: *const Module, id: Module.DeclId) Module.DeclId {
+        _ = self;
+        return @enumFromInt(tableIndex(module, id));
+    }
+
+    fn declarationModule(self: *Context, id: Module.DeclId) *Module {
+        if (self.module.compilation) |comp| return comp.getModule(comp.declarations.items[@intFromEnum(id)].source).?;
+        return self.module;
+    }
+
+    fn localId(self: *Context, id: Module.DeclId) Module.DeclId {
+        if (self.module.compilation) |comp| return comp.declarations.items[@intFromEnum(id)].local;
+        return id;
+    }
+
+    fn getDeclaration(self: *Context, id: Module.DeclId) Module.Declaration {
+        return self.declarationModule(id).getDeclaration(self.localId(id)).?;
+    }
+
     fn valueDeclaration(self: *Context, name: []const u8) ?Module.DeclId {
-        if (self.container) |owner| if (self.module.lookupConcreteMethod(owner, self.concrete_type, name)) |id| return id;
-        return self.module.lookup(name);
+        if (self.container) |owner| if (self.module.lookupConcreteMethod(owner, self.concrete_type, name)) |id| return self.qualify(self.module, id);
+        return self.qualify(self.module, self.module.lookup(name) orelse return null);
+    }
+
+    fn nominalMethod(self: *Context, ty: Ir.TypeId, name: []const u8) ?Module.DeclId {
+        const nominal = self.ir.getType(ty).?;
+        const source = switch (nominal) {
+            .record => nominal.record.source,
+            .enumeration => nominal.enumeration.source,
+            else => return null,
+        };
+        const identity = if (nominal == .record) nominal.record.identity else nominal.enumeration.identity;
+        const owner = if (self.module.compilation) |comp| comp.getModule(source).? else self.module;
+        const method = owner.lookupConcreteMethod(@enumFromInt(identity), if (nominal == .record and nominal.record.type_args.len != 0) @intFromEnum(ty) else null, name) orelse return null;
+        return self.qualify(owner, method);
     }
 
     fn conflict(self: *Context, name: []const u8) ?Module.Span {
         if (self.bindings.get(name)) |binding| return binding.name_span;
-        if (self.valueDeclaration(name)) |id| return self.module.getDeclaration(id).?.name_span;
+        if (self.valueDeclaration(name)) |id| return self.getDeclaration(id).name_span;
         if (self.concrete_type != null) {
             const owner = self.module.getDeclaration(self.container.?).?;
-            const full = self.module.ast.decl(owner.node).ast;
-            var iterator = self.module.ast.fullFnProto(full.type_node).?.iterate(&self.module.ast);
+            const full = self.module.source.ast.decl(owner.node).ast;
+            var iterator = self.module.source.ast.fullFnProto(full.type_node).?.iterate(&self.module.source.ast);
             while (iterator.next()) |param| {
                 const token = param.name_token.?;
-                if (std.mem.eql(u8, name, self.module.ast.tokenSlice(token))) return self.module.tokenSpan(token);
+                if (std.mem.eql(u8, name, self.module.source.ast.tokenSlice(token))) return self.module.tokenSpan(token);
             }
         }
         return null;
     }
 
     fn local(self: *Context, node: Ast.Node.Index, depth: usize) Error!bool {
-        const ast = &self.module.ast;
+        const ast = &self.module.source.ast;
         const decl = ast.decl(node).ast;
         const token = decl.let_token + 1 + @as(u32, @intFromBool(decl.is_mutable));
         const name = ast.tokenSlice(token);
@@ -244,7 +284,7 @@ const Context = struct {
     }
 
     fn blockExpression(self: *Context, node: Ast.Node.Index, expected: ?Known, depth: usize) Error!?Ir.TypeId {
-        const ast = &self.module.ast;
+        const ast = &self.module.source.ast;
         var buffer: [2]Ast.Node.Index = undefined;
         const block = ast.fullBlock(&buffer, node).?;
         if (ast.firstToken(node) != block.ast.lbrace) return self.fail(.unsupported_body_expression, node, null);
@@ -268,7 +308,7 @@ const Context = struct {
     }
 
     fn probeBlock(self: *Context, node: Ast.Node.Index, depth: usize) Error!?Known {
-        const ast = &self.module.ast;
+        const ast = &self.module.source.ast;
         var buffer: [2]Ast.Node.Index = undefined;
         const block = ast.fullBlock(&buffer, node).?;
         if (ast.firstToken(node) != block.ast.lbrace) return null;
@@ -302,7 +342,7 @@ const Context = struct {
     // and type diagnostics are rolled back; no initializers are evaluated.
     fn probeBreaks(self: *Context, node: Ast.Node.Index, depth: usize) Error!?Known {
         if (node == 0 or depth >= max_recursive_depth) return null;
-        const ast = &self.module.ast;
+        const ast = &self.module.source.ast;
         const data = ast.nodes.items(.data)[node];
         switch (ast.nodes.items(.tag)[node]) {
             .loop_range => {
@@ -372,7 +412,7 @@ const Context = struct {
     }
 
     fn probeRange(self: *Context, node: Ast.Node.Index, depth: usize) Error!?Known {
-        const ast = &self.module.ast;
+        const ast = &self.module.source.ast;
         const range = ast.fullRange(node).?;
         if (range.else_expr == 0) return .{ .ty = try self.ir.internType(.void) };
         const diagnostics_start = self.module.diagnostics.items.len;
@@ -404,11 +444,11 @@ const Context = struct {
     }
 
     fn span(self: *Context, node: Ast.Node.Index) Module.Span {
-        return self.module.tokenSpan(self.module.ast.nodes.items(.main_token)[node]);
+        return self.module.tokenSpan(self.module.source.ast.nodes.items(.main_token)[node]);
     }
 
     fn fail(self: *Context, tag: Module.Diagnostic.Tag, node: Ast.Node.Index, related: ?Module.Span) Error!?Ir.TypeId {
-        const location = if (tag == .unreachable_code) self.module.tokenSpan(self.module.ast.firstToken(node)) else if (tag == .unknown_field and self.module.ast.nodes.items(.tag)[node] == .field_access) self.module.tokenSpan(self.module.ast.nodes.items(.data)[node].rhs) else self.span(node);
+        const location = if (tag == .unreachable_code) self.module.tokenSpan(self.module.source.ast.firstToken(node)) else if (tag == .unknown_field and self.module.source.ast.nodes.items(.tag)[node] == .field_access) self.module.tokenSpan(self.module.source.ast.nodes.items(.data)[node].rhs) else self.span(node);
         try self.module.diagnostics.append(self.module.allocator, .{ .tag = tag, .span = location, .related = related });
         return null;
     }
@@ -422,13 +462,14 @@ const Context = struct {
     }
 
     fn globalType(self: *Context, id: Module.DeclId) Error!?Known {
-        const ty = (if (self.sema) |analysis| try analysis.requestType(self.module, id) else if (@intFromEnum(id) < self.types.len) self.types[@intFromEnum(id)] else null) orelse return null;
-        const full = self.module.ast.decl(self.module.getDeclaration(id).?.node);
-        return .{ .ty = ty, .annotation = if (full.ast.type_node != 0) self.module.tokenSpan(self.module.ast.firstToken(full.ast.type_node)) else null };
+        const owner = self.declarationModule(id);
+        const ty = (if (self.sema) |analysis| try analysis.requestType(owner, self.localId(id)) else if (@intFromEnum(id) < self.types.len) self.types[@intFromEnum(id)] else null) orelse return null;
+        const full = owner.source.ast.decl(self.getDeclaration(id).node);
+        return .{ .ty = ty, .annotation = if (full.ast.type_node != 0) owner.tokenSpan(owner.source.ast.firstToken(full.ast.type_node)) else null };
     }
 
     fn isAscription(self: *Context, node: Ast.Node.Index) bool {
-        const ast = &self.module.ast;
+        const ast = &self.module.source.ast;
         return ast.nodes.items(.tag)[node] == .builtin_literal and
             std.mem.eql(u8, ast.tokenSlice(ast.nodes.items(.main_token)[node]), "@as");
     }
@@ -441,46 +482,44 @@ const Context = struct {
     }
 
     fn staticMethod(self: *Context, node: Ast.Node.Index) Error!?Module.DeclId {
-        const ast = &self.module.ast;
+        const ast = &self.module.source.ast;
         if (ast.nodes.items(.tag)[node] != .field_access) return null;
         const data = ast.nodes.items(.data)[node];
+        if (self.module.compilation) |comp| if (comp.reference(self.module, node)) |ref| {
+            const owner = comp.getModule(ref.source).?;
+            if (self.sema) |analysis| try analysis.syncEntries(owner);
+            return self.qualify(owner, ref.local);
+        };
         if (ast.nodes.items(.tag)[data.lhs] == .identifier) {
             const name = ast.tokenSlice(ast.firstToken(data.lhs));
             if (self.bindings.contains(name)) return null;
             const id = self.valueDeclaration(name) orelse return null;
-            if (!self.module.getDeclaration(id).?.is_type_alias and !TypeResolver.isThisAlias(ast, self.module.getDeclaration(id).?.node)) return null;
+            if (!self.getDeclaration(id).is_type_alias and !TypeResolver.isThisAlias(&self.declarationModule(id).source.ast, self.getDeclaration(id).node)) return null;
         } else if (ast.fullCall(data.lhs)) |call| {
             if (TypeResolver.genericTarget(self.module, call.ast.fn_expr) == null and !std.mem.eql(u8, ast.tokenSlice(ast.firstToken(call.ast.fn_expr)), "@This")) return null;
-        } else return null;
+        } else {
+            const comp = self.module.compilation orelse return null;
+            const ref = comp.reference(self.module, data.lhs) orelse return null;
+            if (!comp.getModule(ref.source).?.getDeclaration(ref.local).?.is_type_alias) return null;
+        }
         const ty = (try TypeResolver.resolveInContainer(self.module, self.ir, data.lhs, self.container, self.concrete_type)) orelse return null;
-        const record = self.ir.getType(ty).?;
-        const identity = switch (record) {
-            .record => record.record.identity,
-            .enumeration => record.enumeration.identity,
-            else => return null,
-        };
-        return self.module.lookupConcreteMethod(@enumFromInt(identity), if (record == .record and record.record.type_args.len != 0) @intFromEnum(ty) else null, ast.tokenSlice(data.rhs));
+        if (self.sema) |analysis| try analysis.syncEntries(self.module);
+        return self.nominalMethod(ty, ast.tokenSlice(data.rhs));
     }
 
     fn receiverMethod(self: *Context, ty: Ir.TypeId, name: []const u8) ?Module.DeclId {
         if (self.fieldIndex(ty, name) != null) return null;
-        const container = self.ir.getType(ty).?;
-        const identity = switch (container) {
-            .record => container.record.identity,
-            .enumeration => container.enumeration.identity,
-            else => return null,
-        };
-        return self.module.lookupConcreteMethod(@enumFromInt(identity), if (container == .record and container.record.type_args.len != 0) @intFromEnum(ty) else null, name);
+        return self.nominalMethod(ty, name);
     }
 
     fn directNoreturn(self: *Context, node: Ast.Node.Index) Error!bool {
-        const ast = &self.module.ast;
+        const ast = &self.module.source.ast;
         const id = if (ast.nodes.items(.tag)[node] == .identifier) blk: {
             const name = self.module.sourceSlice(self.span(node)).?;
             if (self.bindings.contains(name)) return false;
             break :blk self.valueDeclaration(name) orelse return false;
         } else (try self.staticMethod(node)) orelse return false;
-        return self.module.getDeclaration(id).?.noreturn;
+        return self.getDeclaration(id).noreturn;
     }
 
     fn finishCall(self: *Context, node: Ast.Node.Index, callee: Ast.Node.Index, result: Ir.TypeId, expected: ?Known) Error!?Ir.TypeId {
@@ -508,7 +547,7 @@ const Context = struct {
             _ = try self.fail(.unsupported_body_expression, node, null);
             return false;
         }
-        const method = self.module.lookupConcreteMethod(@enumFromInt(if (record == .enumeration) record.enumeration.identity else record.record.identity), if (record == .record and record.record.type_args.len != 0) @intFromEnum(ty) else null, "toString") orelse {
+        const method = self.nominalMethod(ty, "toString") orelse {
             _ = try self.fail(.invalid_to_string, node, null);
             return false;
         };
@@ -518,7 +557,7 @@ const Context = struct {
         };
         const signature = self.ir.getType(signature_id).?;
         if (signature != .function or signature.function.params.len != 1 or signature.function.params[0] != ty or self.ir.getType(signature.function.result).? != .string) {
-            _ = try self.fail(.invalid_to_string, node, self.module.getDeclaration(method).?.name_span);
+            _ = try self.fail(.invalid_to_string, node, self.getDeclaration(method).name_span);
             return false;
         }
         if (self.emitter) |emitter| {
@@ -537,17 +576,21 @@ const Context = struct {
     }
 
     fn qualifiedUnion(self: *Context, base: Ast.Node.Index) Error!?Ir.TypeId {
-        const ast = &self.module.ast;
+        const ast = &self.module.source.ast;
         if (ast.nodes.items(.tag)[base] != .field_access) return null;
         const qualifier = ast.nodes.items(.data)[base].lhs;
         if (ast.fullCall(qualifier)) |call| {
             if (TypeResolver.genericTarget(self.module, call.ast.fn_expr) == null and !std.mem.eql(u8, ast.tokenSlice(ast.firstToken(call.ast.fn_expr)), "@This")) return null;
         } else {
+            if (self.module.compilation) |comp| if (comp.reference(self.module, qualifier)) |ref| {
+                if (!comp.getModule(ref.source).?.getDeclaration(ref.local).?.is_type_alias) return null;
+                return try TypeResolver.resolveInContainer(self.module, self.ir, qualifier, self.container, self.concrete_type);
+            };
             if (ast.nodes.items(.tag)[qualifier] != .identifier) return null;
             const name = ast.tokenSlice(ast.firstToken(qualifier));
             if (self.bindings.contains(name)) return null;
             const id = self.valueDeclaration(name) orelse return null;
-            if (!self.module.getDeclaration(id).?.is_type_alias and !TypeResolver.isThisAlias(ast, self.module.getDeclaration(id).?.node)) return null;
+            if (!self.getDeclaration(id).is_type_alias and !TypeResolver.isThisAlias(&self.declarationModule(id).source.ast, self.getDeclaration(id).node)) return null;
         }
         const ty = (try TypeResolver.resolveInContainer(self.module, self.ir, qualifier, self.container, self.concrete_type)) orelse return null;
         return if (self.tagged(ty)) ty else null;
@@ -561,7 +604,7 @@ const Context = struct {
     }
 
     fn propagate(self: *Context, node: Ast.Node.Index, expected: ?Known, depth: usize) Error!?Ir.TypeId {
-        const operand = self.module.ast.nodes.items(.data)[node].lhs;
+        const operand = self.module.source.ast.nodes.items(.data)[node].lhs;
         const input = (try self.expression(operand, null, depth + 1)) orelse return null;
         if (self.terminated) return if (expected) |want| want.ty else input;
         const shape = self.resultShape(input) orelse return self.fail(.invalid_propagation_operand, node, null);
@@ -588,7 +631,7 @@ const Context = struct {
     }
 
     fn unionInit(self: *Context, node: Ast.Node.Index, expected: ?Known, depth: usize) Error!?Ir.TypeId {
-        const ast = &self.module.ast;
+        const ast = &self.module.source.ast;
         const data = ast.nodes.items(.data)[node];
         const base = data.lhs;
         const contextual = ast.nodes.items(.tag)[base] == .enum_literal;
@@ -611,7 +654,7 @@ const Context = struct {
     }
 
     fn recordInit(self: *Context, node: Ast.Node.Index, expected: ?Known, depth: usize) Error!?Ir.TypeId {
-        const ast = &self.module.ast;
+        const ast = &self.module.source.ast;
         const init = ast.fullStructInit(node).?;
         const ty = (try TypeResolver.resolveInContainer(self.module, self.ir, init.type_node, self.container, self.concrete_type)) orelse return null;
         const record = self.ir.getType(ty).?;
@@ -634,7 +677,7 @@ const Context = struct {
         }
         for (record.record.fields, seen, 0..) |field, supplied, i| {
             if (supplied) continue;
-            const default = field.default orelse return self.fail(.missing_field, node, .{ .start = field.span.start, .end = field.span.end });
+            const default = field.default orelse return self.fail(.missing_field, node, field.span);
             if (self.emitter) |emitter| values.?[i] = try emitter.append(field.ty, self.irSpan(node), .{ .constant = default });
         }
         if (self.emitter) |emitter| try emitter.record(node, ty, self.irSpan(node), .{ .record_init = values.? });
@@ -642,12 +685,12 @@ const Context = struct {
     }
 
     fn isPanic(self: *Context, node: Ast.Node.Index) bool {
-        return self.module.ast.nodes.items(.tag)[node] == .builtin_literal and
+        return self.module.source.ast.nodes.items(.tag)[node] == .builtin_literal and
             std.mem.eql(u8, self.module.sourceSlice(self.span(node)).?, "@panic");
     }
 
     fn printing(self: *Context, node: Ast.Node.Index) ?bool {
-        const ast = &self.module.ast;
+        const ast = &self.module.source.ast;
         if (ast.nodes.items(.tag)[node] != .builtin_literal) return null;
         const name = self.module.sourceSlice(self.span(node)).?;
         if (std.mem.eql(u8, name, "@print")) return false;
@@ -659,7 +702,7 @@ const Context = struct {
     // or diagnosing unbound names. The actual walk still checks both operands.
     fn probe(self: *Context, node: Ast.Node.Index, depth: usize) Error!?Known {
         if (depth >= max_recursive_depth) return null;
-        const ast = &self.module.ast;
+        const ast = &self.module.source.ast;
         const data = ast.nodes.items(.data)[node];
         return switch (ast.nodes.items(.tag)[node]) {
             .identifier => blk: {
@@ -753,7 +796,7 @@ const Context = struct {
                     const field = ast.nodes.items(.data)[call.ast.fn_expr];
                     if (try self.probe(field.lhs, depth + 1)) |receiver| {
                         if (self.receiverMethod(receiver.ty, ast.tokenSlice(field.rhs))) |method| {
-                            if (self.module.getDeclaration(method).?.noreturn) break :blk null;
+                            if (self.getDeclaration(method).noreturn) break :blk null;
                             const signature = (try self.globalType(method)) orelse break :blk null;
                             const function = self.ir.getType(signature.ty).?;
                             if (function == .function) break :blk .{ .ty = function.function.result };
@@ -776,7 +819,7 @@ const Context = struct {
             _ = try self.fail(.body_nesting_limit, node, null);
             return false;
         }
-        const ast = &self.module.ast;
+        const ast = &self.module.source.ast;
         const data = ast.nodes.items(.data)[node];
         switch (ast.nodes.items(.tag)[node]) {
             .number_literal => switch (std.zig.parseNumberLiteral(self.module.sourceSlice(self.span(node)).?)) {
@@ -824,7 +867,7 @@ const Context = struct {
     }
 
     fn arrayElements(self: *Context, node: Ast.Node.Index, buffer: *[2]Ast.Node.Index) []const Ast.Node.Index {
-        const ast = &self.module.ast;
+        const ast = &self.module.source.ast;
         const data = ast.nodes.items(.data)[node];
         return switch (ast.nodes.items(.tag)[node]) {
             .array_init, .array_init_comma => ast.extra_data[data.lhs..data.rhs],
@@ -849,8 +892,9 @@ const Context = struct {
     }
 
     fn irSpan(self: *Context, node: Ast.Node.Index) Ir.Span {
-        const ast = &self.module.ast;
+        const ast = &self.module.source.ast;
         return .{
+            .source = self.module.source.id,
             .start = self.module.tokenSpan(ast.firstToken(node)).start,
             .end = self.module.tokenSpan(ast.lastToken(node)).end,
         };
@@ -859,7 +903,7 @@ const Context = struct {
     fn emitNode(self: *Context, node: Ast.Node.Index, ty: Ir.TypeId) Error!bool {
         const emitter = self.emitter.?;
         if (emitter.values.contains(node)) return true;
-        const ast = &self.module.ast;
+        const ast = &self.module.source.ast;
         const data = ast.nodes.items(.data)[node];
         const tag = ast.nodes.items(.tag)[node];
         const op: Ir.Operation = switch (tag) {
@@ -872,7 +916,11 @@ const Context = struct {
             },
             .array_access => .{ .array_index = .{ .array = try emitter.value(data.lhs), .index = try emitter.value(data.rhs) } },
             .field_access => blk: {
-                if (try self.staticMethod(node)) |id| break :blk .{ .function_ref = emitter.functions[@intFromEnum(id)].? };
+                if (try self.staticMethod(node)) |id| {
+                    if (emitter.functions[@intFromEnum(id)]) |function| break :blk .{ .function_ref = function };
+                    if (emitter.constants[@intFromEnum(id)]) |constant| break :blk .{ .constant = constant };
+                    return error.InvalidFunctionId;
+                }
                 const base = try emitter.value(data.lhs);
                 if (self.fieldIndex(emitter.instructions.items[@intFromEnum(base)].ty, ast.tokenSlice(data.rhs))) |index| break :blk .{ .field_read = .{ .base = base, .index = index } };
                 break :blk .{ .array_len = base };
@@ -962,7 +1010,7 @@ const Context = struct {
     }
 
     fn elementAssignment(self: *Context, node: Ast.Node.Index, expected: ?Known, depth: usize) Error!?Ir.TypeId {
-        const ast = &self.module.ast;
+        const ast = &self.module.source.ast;
         const data = ast.nodes.items(.data)[node];
         const target = ast.nodes.items(.data)[data.lhs];
         const tag = ast.nodes.items(.tag)[node];
@@ -1017,7 +1065,7 @@ const Context = struct {
     const MatchResult = struct { ty: Ir.TypeId, value: ?Ir.ValueId };
 
     fn wildcard(self: *Context, node: Ast.Node.Index) bool {
-        const ast = &self.module.ast;
+        const ast = &self.module.source.ast;
         return ast.nodes.items(.tag)[node] == .identifier and std.mem.eql(u8, ast.tokenSlice(ast.nodes.items(.main_token)[node]), "_");
     }
 
@@ -1031,7 +1079,7 @@ const Context = struct {
             _ = try self.fail(.body_nesting_limit, node, null);
             return false;
         }
-        const ast = &self.module.ast;
+        const ast = &self.module.source.ast;
         const data = ast.nodes.items(.data)[node];
         switch (ast.nodes.items(.tag)[node]) {
             .bit_or => return try self.patternShape(data.lhs, depth + 1) and try self.patternShape(data.rhs, depth + 1),
@@ -1056,7 +1104,7 @@ const Context = struct {
             _ = try self.fail(.body_nesting_limit, node, null);
             return null;
         }
-        const ast = &self.module.ast;
+        const ast = &self.module.source.ast;
         if (ast.nodes.items(.tag)[node] == .bit_or) {
             const data = ast.nodes.items(.data)[node];
             const left = (try self.booleanPatternCoverage(data.lhs, ty, depth + 1)) orelse return null;
@@ -1081,7 +1129,7 @@ const Context = struct {
             _ = try self.fail(.body_nesting_limit, node, null);
             return null;
         }
-        const ast = &self.module.ast;
+        const ast = &self.module.source.ast;
         if (ast.nodes.items(.tag)[node] == .bit_or) {
             const data = ast.nodes.items(.data)[node];
             const left = (try self.enumPatternCoverage(data.lhs, ty, covered, depth + 1)) orelse return null;
@@ -1089,7 +1137,7 @@ const Context = struct {
             return .{ .fresh = left.fresh or right.fresh, .previous = left.previous orelse right.previous };
         }
         const location = self.irSpan(node);
-        const pattern_span: Module.Span = .{ .start = location.start, .end = location.end };
+        const pattern_span: Module.Span = location;
         if (self.wildcard(node)) {
             var coverage: EnumCoverage = .{ .fresh = false };
             for (covered) |*entry| {
@@ -1125,7 +1173,7 @@ const Context = struct {
             return null;
         }
         const boolean = try self.ir.internType(.boolean);
-        const ast = &self.module.ast;
+        const ast = &self.module.source.ast;
         const data = ast.nodes.items(.data)[node];
         if (ast.nodes.items(.tag)[node] == .bit_or) {
             const left = (try self.matchPattern(data.lhs, subject, depth + 1)) orelse return null;
@@ -1169,7 +1217,7 @@ const Context = struct {
 
     fn bindMatchCapture(self: *Context, prong: Ast.full.MatchCase.Components, subjects: []const MatchSubject) Error!bool {
         const token = prong.capture_token orelse return true;
-        const ast = &self.module.ast;
+        const ast = &self.module.source.ast;
         if (subjects.len != 1 or !self.tagged(subjects[0].ty) or prong.values.len != 1 or ast.nodes.items(.tag)[prong.values[0]] != .enum_literal) {
             _ = try self.fail(.invalid_match_capture, prong.target_expr, null);
             return false;
@@ -1195,7 +1243,7 @@ const Context = struct {
             _ = try self.fail(.body_nesting_limit, owner, null);
             return null;
         }
-        const ast = &self.module.ast;
+        const ast = &self.module.source.ast;
         const prong = ast.fullMatchCase(cases[0]).?.ast;
         if (cases.len == 1) {
             const start = self.locals.items.len;
@@ -1249,7 +1297,7 @@ const Context = struct {
     }
 
     fn matchExpression(self: *Context, node: Ast.Node.Index, expected: ?Known, hint: ?Known, depth: usize) Error!?Ir.TypeId {
-        const ast = &self.module.ast;
+        const ast = &self.module.source.ast;
         const match = ast.fullMatch(node).?.ast;
         for (match.cases) |case| {
             const patterns = ast.fullMatchCase(case).?.ast.values;
@@ -1361,7 +1409,7 @@ const Context = struct {
         };
         if (issue) |bad| {
             const start = location.start + @as(u32, @intCast(bad.offset - 1));
-            _ = try self.interpolationError(bad.tag, .{ .start = start, .end = @min(location.end, start + 1) });
+            _ = try self.interpolationError(bad.tag, .{ .source = location.source, .start = start, .end = @min(location.end, start + 1) });
             return null;
         }
         return try self.ir.internConstant(.{ .ty = ty, .value = .{ .string = decoded.written() } });
@@ -1374,8 +1422,8 @@ const Context = struct {
         var result: ?Ir.ValueId = null;
         var offset: usize = 1;
         var chunk: usize = 1;
-        const data = self.module.ast.nodes.items(.data)[node];
-        const expressions = self.module.ast.extra_data[data.lhs..data.rhs];
+        const data = self.module.source.ast.nodes.items(.data)[node];
+        const expressions = self.module.source.ast.extra_data[data.lhs..data.rhs];
         var placeholder: usize = 0;
         while (offset < bytes.len) {
             if (offset < bytes.len - 1 and bytes[offset] == '\\') {
@@ -1387,6 +1435,7 @@ const Context = struct {
             if (offset == bytes.len - 1 or bytes[offset] == '{' or bytes[offset] == '}') {
                 if (offset > chunk) {
                     const constant = (try self.stringChunk(bytes[chunk..offset], .{
+                        .source = location.source,
                         .start = location.start + @as(u32, @intCast(chunk)),
                         .end = location.start + @as(u32, @intCast(offset)),
                     }, string)) orelse return null;
@@ -1401,13 +1450,13 @@ const Context = struct {
                 const start = offset;
                 while (offset < bytes.len - 1 and bytes[offset] != '}') : (offset += 1) {}
                 if (bytes[brace] != '{' or offset == bytes.len - 1 or placeholder >= expressions.len or expressions[placeholder] == 0)
-                    return self.interpolationError(.invalid_interpolation, .{ .start = location.start + @as(u32, @intCast(brace)), .end = location.start + @as(u32, @intCast(@min(offset + 1, bytes.len - 1))) });
+                    return self.interpolationError(.invalid_interpolation, .{ .source = location.source, .start = location.start + @as(u32, @intCast(brace)), .end = location.start + @as(u32, @intCast(@min(offset + 1, bytes.len - 1))) });
                 const embedded = expressions[placeholder];
                 placeholder += 1;
                 const ty = (try self.expression(embedded, null, depth + 1)) orelse return null;
                 if (self.terminated) return self.fit(string, expected, node);
                 const scalar = self.ir.getType(ty).?;
-                if (scalar != .boolean and scalar != .integer and scalar != .string and scalar != .record and scalar != .enumeration) return self.interpolationError(.unsupported_interpolation_type, .{ .start = location.start + @as(u32, @intCast(start)), .end = location.start + @as(u32, @intCast(offset)) });
+                if (scalar != .boolean and scalar != .integer and scalar != .string and scalar != .record and scalar != .enumeration) return self.interpolationError(.unsupported_interpolation_type, .{ .source = location.source, .start = location.start + @as(u32, @intCast(start)), .end = location.start + @as(u32, @intCast(offset)) });
                 if (!try self.convertPrintable(embedded, ty)) return null;
                 if (self.emitter) |emitter| {
                     const converted = try emitter.append(string, self.irSpan(node), .{ .to_string = try emitter.value(embedded) });
@@ -1422,7 +1471,7 @@ const Context = struct {
     }
 
     fn rangeExpression(self: *Context, node: Ast.Node.Index, expected: ?Known, depth: usize) Error!?Ir.TypeId {
-        const ast = &self.module.ast;
+        const ast = &self.module.source.ast;
         const loop = ast.fullRange(node).?;
         const unit = try self.ir.internType(.void);
         var known = (try self.probe(loop.start, depth + 1)) orelse try self.probe(loop.end, depth + 1);
@@ -1571,7 +1620,7 @@ const Context = struct {
 
     fn expressionInner(self: *Context, node: Ast.Node.Index, expected: ?Known, depth: usize) Error!?Ir.TypeId {
         if (depth >= max_recursive_depth) return self.fail(.body_nesting_limit, node, null);
-        const ast_early = &self.module.ast;
+        const ast_early = &self.module.source.ast;
         const tag_early = ast_early.nodes.items(.tag)[node];
         const base_early = ast_early.nodes.items(.data)[node].lhs;
         if ((tag_early == .array_access or tag_early == .container_decl_arg) and
@@ -1588,7 +1637,7 @@ const Context = struct {
                 .not_literal => {},
             }
         }
-        const ast = &self.module.ast;
+        const ast = &self.module.source.ast;
         const data = ast.nodes.items(.data)[node];
         switch (ast.nodes.items(.tag)[node]) {
             .enum_literal => return self.fail(.enum_needs_type, node, null),
@@ -1648,7 +1697,7 @@ const Context = struct {
                 const name = self.module.sourceSlice(self.span(node)).?;
                 if (self.bindings.get(name)) |binding| return self.fit(binding.known.ty, expected, node);
                 if (self.valueDeclaration(name)) |id| {
-                    const declaration = self.module.getDeclaration(id).?;
+                    const declaration = self.getDeclaration(id);
                     if (isPrimitive(name)) return self.fail(.unsupported_shadowing, node, declaration.name_span);
                     if (declaration.is_type_alias) return self.fail(.not_a_value, node, declaration.name_span);
                     const known = (try self.globalType(id)) orelse return self.fail(.unresolved_value_type, node, declaration.name_span);
@@ -1963,7 +2012,7 @@ const Context = struct {
                     if (self.receiverMethod(receiver, ast.tokenSlice(field.rhs))) |method| {
                         const signature = (try self.globalType(method)) orelse return self.fail(.unresolved_value_type, call.ast.fn_expr, null);
                         const function = self.ir.getType(signature.ty).?.function;
-                        const related = self.module.getDeclaration(method).?.name_span;
+                        const related = self.getDeclaration(method).name_span;
                         if (function.params.len == 0 or function.params[0] != receiver) return self.fail(.invalid_method_receiver, call.ast.fn_expr, related);
                         if (call.ast.args.len != function.params.len - 1) return self.fail(.argument_count_mismatch, node, related);
                         try self.copyNode(field.lhs, receiver);
@@ -1975,7 +2024,7 @@ const Context = struct {
                         }
                         if (!valid) return null;
                         if (!self.terminated) {
-                            const is_noreturn = self.module.getDeclaration(method).?.noreturn;
+                            const is_noreturn = self.getDeclaration(method).noreturn;
                             if (self.emitter) |emitter| {
                                 const callee = try emitter.append(signature.ty, self.irSpan(call.ast.fn_expr), .{ .function_ref = emitter.functions[@intFromEnum(method)].? });
                                 const args = try emitter.allocator.alloc(Ir.ValueId, function.params.len);
@@ -2040,11 +2089,11 @@ test "instance calls diagnose signatures arity exact identity and preserve field
     }) |case| {
         var module = try Module.init(std.testing.allocator, "methods.nov", case.source);
         defer module.deinit();
-        errdefer std.debug.print("instance parse {s}: {any} {any}\n", .{ case.source, module.ast.errors, module.diagnostics.items });
+        errdefer std.debug.print("instance parse {s}: {any} {any}\n", .{ case.source, module.source.ast.errors, module.diagnostics.items });
         var sema = try Lowering.lower(&module);
         defer sema.deinit();
         errdefer std.debug.print("instance source {s}: {any}\n", .{ case.source, module.diagnostics.items });
-        try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+        try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
         try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
         try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
         try std.testing.expect(!sema.lowering_complete);
@@ -2085,11 +2134,10 @@ test "noreturn attributes require unique argumentless function placement" {
         "@[noreturn]\nlet n:int=1",
         "@[noreturn]\nlet A=struct{}",
         "@[noreturn]\nlet mut f:()=loop {}",
-        "@[public]\n@[noreturn]\nlet f:()=loop {}",
     }) |source| {
         var module = try Module.init(std.testing.allocator, "attributes.nov", source);
         defer module.deinit();
-        try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+        try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
         try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
         try std.testing.expectEqual(Module.Diagnostic.Tag.unsupported_attribute, module.diagnostics.items[0].tag);
     }
@@ -2125,7 +2173,7 @@ test "terminal loop conditions preserve termination without swallowing owned con
         var sema = try Lowering.lower(&module);
         defer sema.deinit();
         errdefer std.debug.print("condition source {s}: {any}\n", .{ source, module.diagnostics.items });
-        try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+        try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
         if (case.tag) |tag| {
             try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
             try std.testing.expectEqual(tag, module.diagnostics.items[0].tag);
@@ -2140,7 +2188,7 @@ test "terminal loop conditions preserve termination without swallowing owned con
 test "empty noreturn attribute parentheses are rejected by parser" {
     var module = try Module.init(std.testing.allocator, "attribute.nov", "@[noreturn()]\nlet f:()=loop {}");
     defer module.deinit();
-    try std.testing.expect(module.ast.errors.len != 0);
+    try std.testing.expect(module.source.ast.errors.len != 0);
 }
 
 test "noreturn direct recursion methods loops and terminal operands lower" {
@@ -2378,7 +2426,7 @@ test "union constructors captures and coverage diagnose exact scalar boundaries"
         defer module.deinit();
         var sema = try Lowering.lower(&module);
         defer sema.deinit();
-        if (module.diagnostics.items.len != 1 or module.diagnostics.items[0].tag != case.tag) std.debug.print("union case {s}: {any} parse={any}\n", .{ case.source, module.diagnostics.items, module.ast.errors });
+        if (module.diagnostics.items.len != 1 or module.diagnostics.items[0].tag != case.tag) std.debug.print("union case {s}: {any} parse={any}\n", .{ case.source, module.diagnostics.items, module.source.ast.errors });
         try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
         try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
         try std.testing.expect(!sema.lowering_complete);
@@ -2797,7 +2845,7 @@ test "scalar array deferred and ill typed forms fail closed" {
     }) |source| {
         var module = try Module.init(std.testing.allocator, "arrays.nov", source);
         defer module.deinit();
-        try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+        try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
         var sema = try Lowering.lower(&module);
         defer sema.deinit();
         try std.testing.expect(module.hasErrors());
@@ -2817,7 +2865,7 @@ test "all indexed compound operators reject bool elements immutable parameters a
             defer std.testing.allocator.free(source);
             var module = try Module.init(std.testing.allocator, "compound.nov", source);
             defer module.deinit();
-            try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+            try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
             var sema = try Lowering.lower(&module);
             defer sema.deinit();
             try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
@@ -2856,7 +2904,7 @@ test "range bounds require exact integer types and immutable lexical bindings" {
             var module = try Module.init(std.testing.allocator, "range.nov", source);
             defer module.deinit();
             errdefer std.debug.print("range case: {s}\n", .{case.body});
-            try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+            try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
             var sema = try Lowering.lower(&module);
             defer sema.deinit();
             try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
@@ -2887,7 +2935,7 @@ test "range else rejects incompatible results missing context and escaped indice
             var module = try Module.init(std.testing.allocator, "range-else.nov", source);
             defer module.deinit();
             errdefer std.debug.print("range else case: {s}\n", .{source});
-            try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+            try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
             var sema = try Lowering.lower(&module);
             defer sema.deinit();
             try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
@@ -2951,7 +2999,7 @@ test "condition loops diagnose controls types scope and unreachable tails" {
         var module = try Module.init(std.testing.allocator, "loop.nov", source);
         defer module.deinit();
         errdefer std.debug.print("loop case: {s}\n", .{case.body});
-        try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+        try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
         var sema = try Lowering.lower(&module);
         defer sema.deinit();
         try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
@@ -2966,7 +3014,7 @@ test "terminal value loops need no break value or never type" {
         defer std.testing.allocator.free(source);
         var module = try Module.init(std.testing.allocator, "loop.nov", source);
         defer module.deinit();
-        try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+        try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
         var sema = try Lowering.lower(&module);
         defer sema.deinit();
         try std.testing.expect(sema.lowering_complete);
@@ -3003,7 +3051,7 @@ test "loop values infer from typed breaks with exact branch types and scopes" {
     ;
     var module = try Module.init(std.testing.allocator, "loop-values.nov", source);
     defer module.deinit();
-    try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+    try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
     var sema = try Lowering.lower(&module);
     defer sema.deinit();
     try std.testing.expect(!module.hasErrors());
@@ -3097,7 +3145,7 @@ test "loop value and continuation diagnostics preserve exact types and lexical s
     }) |case| {
         var module = try Module.init(std.testing.allocator, "bad-loop.nov", case.source);
         defer module.deinit();
-        try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+        try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
         var sema = try Lowering.lower(&module);
         defer sema.deinit();
         errdefer std.debug.print("loop diagnostic case: {s}\n", .{case.source});
@@ -3138,10 +3186,10 @@ test "assignment diagnostics identify targets mutability types and lexical scope
         var module = try Module.init(std.testing.allocator, "assign.nov", source);
         defer module.deinit();
         errdefer std.debug.print("assignment case: {s}\n", .{case.body});
-        try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+        try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
         var sema = try Lowering.lower(&module);
         defer sema.deinit();
-        try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+        try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
         try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
         try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
         try std.testing.expectEqualStrings(case.token, module.sourceSlice(module.diagnostics.items[0].span).?);
@@ -3175,7 +3223,7 @@ test "returns use enclosing signatures and merge only continuing paths" {
     defer module.deinit();
     var sema = try Sema.analyzeFunctions(&module);
     defer sema.deinit();
-    try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+    try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
     try std.testing.expect(!module.hasErrors());
 }
 
@@ -3196,10 +3244,10 @@ test "return diagnostics retain value locations signature notes and reachability
         var module = try Module.init(std.testing.allocator, "return.nov", case.source);
         defer module.deinit();
 
-        try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+        try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
         var sema = try Sema.analyzeFunctions(&module);
         defer sema.deinit();
-        try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+        try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
         try std.testing.expect(module.hasErrors());
         const diagnostic = module.diagnostics.items[0];
         try std.testing.expectEqual(case.tag, diagnostic.tag);
@@ -3225,7 +3273,7 @@ test "if branches infer bidirectionally and keep separate lexical scopes" {
     defer module.deinit();
     var sema = try Sema.analyzeFunctions(&module);
     defer sema.deinit();
-    try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+    try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
     try std.testing.expect(!module.hasErrors());
 }
 
@@ -3247,7 +3295,7 @@ test "if diagnostics check conditions both branches results and lexical visibili
         defer module.deinit();
         var sema = try Sema.analyzeFunctions(&module);
         defer sema.deinit();
-        try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+        try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
         try std.testing.expect(module.hasErrors());
         const diagnostic = module.diagnostics.items[0];
         try std.testing.expectEqual(case.tag, diagnostic.tag);
@@ -3318,7 +3366,7 @@ test "scalar array literals infer known elements bidirectionally across expressi
         defer module.deinit();
         var sema = try Lowering.lower(&module);
         defer sema.deinit();
-        try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+        try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
         try std.testing.expect(!module.hasErrors());
         try sema.ir.verify();
     }
@@ -3342,7 +3390,7 @@ test "array inference uses exact literal boundaries and expected context" {
         defer std.testing.allocator.free(source);
         var module = try Module.init(std.testing.allocator, "array-boundaries.nov", source);
         defer module.deinit();
-        try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+        try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
         var sema = try Lowering.lower(&module);
         defer sema.deinit();
         try std.testing.expect(!module.hasErrors());
@@ -3377,7 +3425,7 @@ test "array inference rejects conflicts defaults and scope leaks without probe d
         defer std.testing.allocator.free(source);
         var module = try Module.init(std.testing.allocator, "array-inference-errors.nov", source);
         defer module.deinit();
-        try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+        try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
         var sema = try Sema.analyzeFunctions(&module);
         defer sema.deinit();
         try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
@@ -3414,7 +3462,7 @@ test "inferred local failures preserve typing and initializer scope" {
         var module = try Module.init(std.testing.allocator, "inferred-errors.nov", source);
         defer module.deinit();
 
-        try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+        try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
         var sema = try Sema.analyzeFunctions(&module);
         defer sema.deinit();
         try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
@@ -3453,7 +3501,7 @@ test "local scope declaration and block result diagnostics" {
         defer module.deinit();
         var sema = try Sema.analyzeFunctions(&module);
         defer sema.deinit();
-        try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+        try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
         try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
         try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
     }

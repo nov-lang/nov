@@ -76,8 +76,8 @@ test "type aliases reject runtime uses value aliases shadowing and invalid types
     for (failures) |case| {
         var module = try Module.init(std.testing.allocator, "bad-alias.nov", case.source);
         defer module.deinit();
-        if (module.ast.errors.len != 0) std.debug.print("syntax failure in {s}\n", .{case.source});
-        try std.testing.expectEqual(@as(usize, 0), module.ast.errors.len);
+        if (module.source.ast.errors.len != 0) std.debug.print("syntax failure in {s}\n", .{case.source});
+        try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
         var sema = try Lowering.lower(&module);
         defer sema.deinit();
         try std.testing.expect(module.hasErrors());
