@@ -250,6 +250,47 @@ Keep Nov away from:
 - Really low level stuff aka assembly, kernel or drivers. Use zig instead.
 
 # Proposals and stuff to add
+
+## Explicit member bindings and fallible main (not implemented)
+
+Leading `use` syntax candidate:
+```nov
+let std = @import("std")
+use std.{Option, Result}
+```
+This is explicit binding shorthand, not a new import mechanism: equivalent to
+`let Option = std.Option` and `let Result = std.Result`. Preserve visibility and
+no-shadowing rules; do not make bindings public implicitly. Initially limit it to
+top-level namespace member bindings supported by ordinary declarations, not runtime
+destructuring. No wildcard imports. Braces allow multiline lists; optional renaming
+such as `Result as Outcome` is a syntax candidate, not a settled grammar. Public
+re-exports remain a separate concern.
+
+Separate entrypoint proposal:
+```nov
+let main: () -> Result(void, string) = {
+    .err["error from main"]
+}
+```
+Keep ordinary function-body `=` syntax. Returning `.ok[]` would exit 0; returning
+`.err[message]` would print the message to stderr and exit 1. Recognition of Result
+and exact error-output/flush details still need specification. Current executable
+main remains `() -> void`; neither proposal changes the implementation roadmap yet.
+
+## Same-name constructor fields (not implemented)
+
+```nov
+Rectangle[.width, .height]
+Rectangle[.width, .height = 10]
+```
+Shorthand `.width` means `.width = width`, resolved in the current scope with
+ordinary type and visibility checks. Allow mixing shorthand and explicit fields;
+preserve left-to-right evaluation, existing copy semantics, and duplicate/missing-
+field diagnostics. An unresolved shorthand name is an unknown-name error, even
+when that field has a default. This is not positional initialization or destructuring
+and does not change the implementation roadmap yet.
+
+## Other proposals
 - transform this file into GitHub issues
 - commands:
   - no cmd: same as build
