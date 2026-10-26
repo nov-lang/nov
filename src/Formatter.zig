@@ -150,8 +150,9 @@ fn checkSupported(ast: Ast) !void {
     for (ast.nodes.items(.tag), ast.nodes.items(.data), ast.nodes.items(.main_token), 0..) |tag, data, main, i| {
         switch (tag) {
             .ref_of => {
-                if (ast.nodes.items(.tag)[data.rhs] != .array_access or
-                    ast.nodes.items(.tag)[ast.nodes.items(.data)[data.rhs].lhs] != .identifier) return error.UnsupportedSyntax;
+                if (ast.nodes.items(.tag)[data.rhs] != .identifier and
+                    (ast.nodes.items(.tag)[data.rhs] != .array_access or
+                        ast.nodes.items(.tag)[ast.nodes.items(.data)[data.rhs].lhs] != .identifier)) return error.UnsupportedSyntax;
                 var binding = false;
                 for (ast.nodes.items(.tag), 0..) |parent_tag, parent| {
                     if (parent_tag == .decl and ast.decl(@intCast(parent)).ast.init_node == i) {
@@ -383,6 +384,18 @@ test "invalid sources are rejected" {
     }
 }
 
+test "static integer borrow formatting is idempotent" {
+    const source: [:0]const u8 = "let main:()={let mut x:uint=1\nlet earlierx=x\nlet y=&x\ny+=1\n@println(x,earlierx)}";
+    const formatted = try format(std.testing.allocator, source);
+    defer std.testing.allocator.free(formatted);
+    const terminated = try std.testing.allocator.dupeZ(u8, formatted);
+    defer std.testing.allocator.free(terminated);
+    const again = try format(std.testing.allocator, terminated);
+    defer std.testing.allocator.free(again);
+    try std.testing.expectEqualStrings(formatted, again);
+    try std.testing.expect(std.mem.indexOf(u8, formatted, "let y = &x") != null);
+}
+
 test "unsupported syntax fails closed including nested expressions" {
     for ([_][:0]const u8{
         "let x=@unknown(\"memory\")\n",
@@ -405,7 +418,7 @@ test "unsupported syntax fails closed including nested expressions" {
         "let f: () -> void = loop true {break :outer 1}\n",
         "let f: () -> void = loop true {continue :outer}\n",
         "let f: () -> void = outer: {}\n",
-        "let x=&value\n",
+        "let x=&value.field\n",
 
         "let @\"x\"=1\n",
         "#!nov\nlet x=1\n",

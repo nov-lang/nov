@@ -1,5 +1,13 @@
 # TODO
 
+Mutable integer locals support let ref=&local and +=/-=/*=//=/%= through the
+reference with the same static last-use exclusivity as array-element borrowing.
+Old value precedes RHS once, terminal RHS skips stores, exact integer types and
+arithmetic behavior remain unchanged. Stable local slots need no GC/lifetime checks.
+Only compound targets are supported: no bare borrowed scalar reads/copies/plain
+assignment/rebinding/escape, immutable integer or other scalar borrows yet.
+See examples/local-borrows.nov; original owner access resumes after last use.
+
 Local static array-element borrowing is executable: let ref=&localArray[index]
 for nominal record elements, with nested field reads/writes and compounds in place.
 Mutable owners permit writes; immutable owners permit reads. CFG fixed-point

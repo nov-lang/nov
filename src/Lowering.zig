@@ -2412,6 +2412,67 @@ test "nested records late body recursive generic instances retain source diagnos
     }
 }
 
+test "static integer borrowing forged IR owner kinds exact types paths and source release" {
+    var result = blk: {
+        var module = try Module.init(std.testing.allocator, "integer-borrow-ir.nov", "let R=struct{n:int=0,}\nlet f:()={let mut a=[R[]]\nlet mut flag=true\nlet mut x:int=1\nlet y=&x\ny+=1\n@println(x,a.len,flag)}");
+        defer module.deinit();
+        const result = try lower(&module);
+        try std.testing.expect(result.lowering_complete);
+        break :blk result;
+    };
+    defer result.deinit();
+    try result.ir.verify();
+    const body = result.ir.functions.items[0].body.?;
+    const instructions = @constCast(body.instructions);
+    var reserve: usize = 0;
+    var start: usize = 0;
+    var read: usize = 0;
+    var store: usize = 0;
+    var array: Ir.ValueId = undefined;
+    var boolean: Ir.ValueId = undefined;
+    for (instructions, 0..) |instruction, i| switch (instruction.op) {
+        .borrow_reserve => reserve = i,
+        .borrow_start => start = i,
+        .borrow_read => read = i,
+        .borrow_store => store = i,
+        .local_slot => switch (result.ir.getType(instruction.ty).?) {
+            .array => array = @enumFromInt(i),
+            .boolean => boolean = @enumFromInt(i),
+            else => {},
+        },
+        else => {},
+    };
+    const saved_reserve = instructions[reserve];
+    const saved_start = instructions[start];
+    const saved_read = instructions[read];
+    const saved_store = instructions[store];
+    try std.testing.expect(saved_start.op.borrow_start.index == null);
+    try std.testing.expectEqual(@as(usize, 0), saved_store.op.borrow_store.path.len);
+    instructions[reserve].op.borrow_reserve = boolean;
+    try std.testing.expectError(error.InvalidOperation, result.ir.verify());
+    instructions[reserve] = saved_reserve;
+    instructions[reserve].op.borrow_reserve = array;
+    try std.testing.expectError(error.InvalidOperation, result.ir.verify());
+    instructions[reserve] = saved_reserve;
+    instructions[start].op.borrow_start.index = saved_reserve.op.borrow_reserve;
+    try std.testing.expectError(error.InvalidOperation, result.ir.verify());
+    instructions[start] = saved_start;
+    instructions[read].ty = try result.ir.internType(.{ .integer = .{ .signedness = .unsigned, .bits = Ir.native_pointer_bits } });
+    try std.testing.expectError(error.OperandTypeMismatch, result.ir.verify());
+    instructions[read] = saved_read;
+    const path = [_]u32{0};
+    instructions[store].op.borrow_store.path = &path;
+    try std.testing.expectError(error.InvalidOperation, result.ir.verify());
+    instructions[store] = saved_store;
+    instructions[store].op.borrow_store.value = instructions[@intFromEnum(boolean)].op.local_slot;
+    try std.testing.expectError(error.OperandTypeMismatch, result.ir.verify());
+    instructions[store] = saved_store;
+    instructions[read].op = .{ .local_load = saved_reserve.op.borrow_reserve };
+    try std.testing.expectError(error.BorrowConflict, result.ir.verify());
+    instructions[read] = saved_read;
+    try result.ir.verify();
+}
+
 test "static borrowing verified capability types owner paths index and regions survive source release" {
     var result = blk: {
         var module = try Module.init(std.testing.allocator, "borrow-ir.nov", "let A=struct{b:B,}\nlet B=struct{x:int=0,}\nlet f:()={let mut a=[A[.b=B[]]]\nlet r=&a[0]\nr.b.x+=1\n@println(a.len)}");
@@ -2436,6 +2497,9 @@ test "static borrowing verified capability types owner paths index and regions s
         else => {},
     };
     const saved = instructions[store];
+    instructions[store].op.borrow_store.path = &.{};
+    try std.testing.expectError(error.InvalidOperation, result.ir.verify());
+    instructions[store] = saved;
     try std.testing.expectEqualSlices(u32, &.{ 0, 0 }, saved.op.borrow_store.path);
     @constCast(saved.op.borrow_store.path)[0] = 99;
     try std.testing.expectError(error.InvalidOperation, result.ir.verify());
@@ -2448,6 +2512,9 @@ test "static borrowing verified capability types owner paths index and regions s
     try std.testing.expectError(error.OperandTypeMismatch, result.ir.verify());
     instructions[read] = old_read;
     const old_start = instructions[start];
+    instructions[start].op.borrow_start.index = null;
+    try std.testing.expectError(error.InvalidOperation, result.ir.verify());
+    instructions[start] = old_start;
     instructions[start].op.borrow_start.index = @enumFromInt(reserve);
     try std.testing.expectError(error.OperandTypeMismatch, result.ir.verify());
     instructions[start] = old_start;

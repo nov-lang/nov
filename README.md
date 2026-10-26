@@ -1267,7 +1267,29 @@ let main: () -> void = {
   Indexed elements use normal scalar/record printing rules; array values themselves
   cannot be printed.
 
-### Local array-element borrowing
+### Local static borrowing
+
+Mutable integer locals support direct borrows and arithmetic compound updates:
+
+```nov
+let mut x: uint = 1
+let y = &x
+y += 1
+@println(x) ; 2; access resumes after y's last use
+```
+
+`+=`, `-=`, `*=`, `/=` and `%=` update the borrowed integer with its exact type
+and normal wrapping/division rules. The old value is read before evaluating the
+RHS once; terminal RHS paths skip the pending update. No heap allocation or runtime
+reference-validity check is needed. The owner cannot be accessed or borrowed again
+while the alias is live, including from a compound RHS. See
+[examples/local-borrows.nov](examples/local-borrows.nov).
+
+This integer slice permits compound targets only: bare reads such as `@println(y)`,
+`y += y`, reference copying/escaping and plain `y = value` remain unsupported.
+Immutable integer locals, non-integer scalar locals and explicit pointer annotations
+are not included. `let y` fixes the reference binding; `y += 1` updates the pointee,
+not the binding.
 
 A direct local binding `let changed = &people[index]` borrows a nominal record
 element of a local array without copying it. Nested field reads/writes, subrecord
@@ -1286,12 +1308,13 @@ changed.score += 1
 
 - Validity is checked **statically** with control-flow liveness, including branches,
   loop backedges, break/continue, returns and short-circuit paths. While a borrow
-  is live, the entire owner array is unavailable for direct reads, copies, `.len`,
+  is live, its owner is unavailable for conflicting access. For an array element,
+  the entire owner array is unavailable for direct reads, copies, `.len`,
   writes, append, replacement or other borrows—even of a different index. Access
   resumes after the last possible reference use on the current path. This first
   implementation is conservatively exclusive even for readonly owners; it does
   not implement shared-borrow splitting.
-- A field compound keeps the loan live through RHS evaluation and final store.
+- A compound keeps the loan live through RHS evaluation and final store.
   The compiler rejects owner replacement inside that RHS. It also reserves the
   owner during borrow-index evaluation: accessing the owner from the index
   expression is conservatively rejected, including read-only access.
@@ -1301,7 +1324,8 @@ changed.score += 1
   or reference-invalidation checks, and no interior pointer is traced by GC.
 - References cannot escape, be copied/rebound, be returned or stored in aggregates,
   be passed as arguments or be used directly as method receivers. Borrowed names
-  may only be field bases; field reads yield ordinary copied values. General pointer
+  may only be record field bases or supported integer compound targets; field
+  reads yield ordinary copied values. General pointer
   types/APIs, reborrows, temporary array owners and non-record elements remain deferred.
 - Normal array snapshots/copies remain independent, including snapshots evaluated
   before a later borrow inside an index or RHS. In-place borrowed writes do not

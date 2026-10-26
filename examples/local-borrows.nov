@@ -1,0 +1,7 @@
+let main: () = {
+    let mut x: uint = 1
+    let original = x
+    let y = &x
+    y += 1
+    @println(x, original)
+}

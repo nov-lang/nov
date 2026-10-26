@@ -655,7 +655,9 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
             value_used[@intFromEnum(r.rhs)] = true;
         },
         .borrow_reserve => |slot| value_used[@intFromEnum(slot)] = true,
-        .borrow_start => |start| value_used[@intFromEnum(start.index)] = true,
+        .borrow_start => |start| if (start.index) |index| {
+            value_used[@intFromEnum(index)] = true;
+        },
         .borrow_read => {},
         .borrow_store => |store| value_used[@intFromEnum(store.value)] = true,
         .parameter => |index| param_used[index] = true,
@@ -864,16 +866,20 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
         if (instruction.op == .borrow_start) {
             const start = instruction.op.borrow_start;
             const slot = body.instructions[@intFromEnum(start.reservation)].op.borrow_reserve;
-            try w.print("    const uintptr_t b{d} = nov_array_index(v{d}, v{d});\n    (void)b{d};\n", .{ i, @intFromEnum(slot), @intFromEnum(start.index), i });
+            if (start.index) |index| try w.print("    const uintptr_t b{d} = nov_array_index(v{d}, v{d});\n    (void)b{d};\n", .{ i, @intFromEnum(slot), @intFromEnum(index), i });
             continue;
         }
         if (instruction.op == .borrow_store) {
             const store = instruction.op.borrow_store;
             const slot = Ir.borrowOwner(body, store.borrow);
-            const element = ir.getType(body.instructions[@intFromEnum(slot)].ty).?.array;
-            try w.writeAll("    ((");
-            try writeType(ir, w, element);
-            try w.print(" *)v{d}.data)[b{d}]", .{ @intFromEnum(slot), @intFromEnum(store.borrow) });
+            const owner = ir.getType(body.instructions[@intFromEnum(slot)].ty).?;
+            if (owner == .integer) {
+                try w.print("    v{d}", .{@intFromEnum(slot)});
+            } else {
+                try w.writeAll("    ((");
+                try writeType(ir, w, owner.array);
+                try w.print(" *)v{d}.data)[b{d}]", .{ @intFromEnum(slot), @intFromEnum(store.borrow) });
+            }
             for (store.path) |index| try w.print(".f{d}", .{index});
             try w.print(" = v{d};\n", .{@intFromEnum(store.value)});
             continue;
@@ -975,9 +981,13 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
             },
             .borrow_read => |borrow| {
                 const slot = Ir.borrowOwner(body, borrow);
-                try w.writeAll("((");
-                try writeType(ir, w, instruction.ty);
-                try w.print(" *)v{d}.data)[b{d}]", .{ @intFromEnum(slot), @intFromEnum(borrow) });
+                if (ir.getType(body.instructions[@intFromEnum(slot)].ty).? == .integer) {
+                    try w.print("v{d}", .{@intFromEnum(slot)});
+                } else {
+                    try w.writeAll("((");
+                    try writeType(ir, w, instruction.ty);
+                    try w.print(" *)v{d}.data)[b{d}]", .{ @intFromEnum(slot), @intFromEnum(borrow) });
+                }
             },
             .borrow_reserve, .borrow_start, .borrow_store => unreachable,
             .field_read => |read| try w.print("v{d}.f{d}", .{ @intFromEnum(read.base), read.index }),
@@ -6647,6 +6657,109 @@ test "nested records root enumeration prunes large scalar diamonds beside manage
     try std.testing.expect(std.mem.indexOf(u8, c, "void **nov_roots[] = { &p0.f1.owner, };") != null);
     try std.testing.expect(c.len < 32 * 1024);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, c, "offsetof(nov_record_"));
+}
+
+const integer_borrow_program =
+    \\let R=struct{n:int=0,}
+    \\let main:()={
+    \\let mut x:uint=1
+    \\let earlierx=x
+    \\let y=&x
+    \\y+=1
+    \\y*=6
+    \\y-=2
+    \\y/=2
+    \\y%=3
+    \\@println(x,earlierx)
+    \\let mut a=[R[]]
+    \\let r=&a[0]
+    \\let z=&x
+    \\z+={r.n+=3
+    \\2}
+    \\@println(x,a[0].n)
+    \\let mut small:i8=127
+    \\let s=&small
+    \\s+=1
+    \\@println(small)
+    \\let mut byte:u8=0
+    \\let b=&byte
+    \\b-=1
+    \\b*=2
+    \\@println(byte)
+    \\loop i in 0..3 {let t=&x
+    \\t+=i}
+    \\@println(x)
+    \\let last=&x
+    \\let truth=true and {last+=1
+    \\true}
+    \\@println(x,truth)
+    \\}
+;
+
+test "static integer borrowing direct slots snapshots mixed loans C11 O0 O3" {
+    const c = try arrayTestProgram(integer_borrow_program);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "2 1\n4 3\n-128\n254\n7\n8 true\n", "", mode);
+}
+
+test "static integer borrowing source free emission and every allocation failure" {
+    var result = blk: {
+        var module = try Module.init(test_gpa, "integer-borrow.nov", integer_borrow_program);
+        defer module.deinit();
+        var result = try Lowering.lower(&module);
+        errdefer result.deinit();
+        try std.testing.expect(!module.hasErrors());
+        break :blk result;
+    };
+    defer result.deinit();
+    try result.ir.verify();
+    const c = try emitProgram(test_gpa, &result.ir, null);
+    defer test_gpa.free(c);
+    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{integer_borrow_program});
+}
+
+test "static integer borrowing backend preserves semantic 128 bit rejection" {
+    for ([_][]const u8{ "i128", "u128" }) |name| {
+        const source = try std.fmt.allocPrint(test_gpa, "let main:()={{let mut x:{s}=1\nlet y=&x\ny+=1\n@println(x)}}", .{name});
+        defer test_gpa.free(source);
+        var diagnostic: Diagnostic = undefined;
+        try std.testing.expectError(error.UnsupportedIntegerWidth, emitSource(source, &diagnostic));
+        try std.testing.expectEqual(Diagnostic.Reason.integer_width_unsupported, diagnostic.reason);
+    }
+}
+
+test "static integer borrowing arithmetic failures terminal RHS and backend width policy" {
+    const cases = [_]struct { source: []const u8, output: []const u8 = "", code: u8 = 0, message: []const u8 = "" }{
+        .{ .source = "let main:()={let mut x:uint=1\nlet y=&x\ny/=0}", .code = 1, .message = "panic: division by zero\n" },
+        .{ .source = "let main:()={let mut x:int=1\nlet y=&x\ny%=0}", .code = 1, .message = "panic: remainder by zero\n" },
+        .{ .source = "let main:()={let mut x:i8=-128\nlet y=&x\ny/=-1\n@println(x)}", .output = "-128\n" },
+        .{ .source = "let main:()={let mut x:i8=-128\nlet y=&x\ny%=-1\n@println(x)}", .output = "0\n" },
+        .{ .source = "let main:()={let mut x:uint=1\nlet y=&x\ny+={@print(\"R\")\nreturn}}", .output = "R" },
+        .{ .source = "let main:()={let mut x:uint=1\nlet y=&x\ny+={@panic(\"stop\")}}", .code = 1, .message = "panic: stop\n" },
+        .{ .source = "let main:()={let mut x:uint=1\nlet y=&x\nloop {y+={break}}\n@println(x)}", .output = "1\n" },
+        .{ .source = "let main:()={let mut x:uint=1\nlet y=&x\nloop i in 0..2 {y+={continue}}\n@println(x)}", .output = "1\n" },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("integer borrow runtime: {s}\n", .{case.source});
+        const c = try emitSource(case.source, null);
+        defer test_gpa.free(c);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode|
+            try compileAndRunMode(c, "void nov_main(void); int main(void) { nov_main(); return 0; }", case.code, case.output, case.message, mode);
+    }
+    for ([_][]const u8{ "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "int", "uint" }) |name| {
+        const bits: u7 = if (std.mem.eql(u8, name, "int") or std.mem.eql(u8, name, "uint")) Ir.native_pointer_bits else try std.fmt.parseInt(u7, name[1..], 10);
+        const signed = name[0] == 'i';
+        const maximum = (@as(i128, 1) << (if (signed) bits - 1 else bits)) - 1;
+        const minimum = if (signed) -(@as(i128, 1) << (bits - 1)) else @as(i128, 0);
+        const source = try std.fmt.allocPrint(test_gpa, "let main:()={{let mut x:{s}=6\nlet y=&x\ny+=2\ny*=3\ny-=4\ny/=2\ny%=3\nlet mut edge:{s}={d}\nlet e=&edge\ne+=1\n@println(x,edge==@as({s},{d}))}}", .{ name, name, maximum, name, minimum });
+        defer test_gpa.free(source);
+        const c = try emitSource(source, null);
+        defer test_gpa.free(c);
+        try std.testing.expect(std.mem.indexOf(u8, c, "nov_rt_heap") == null);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode|
+            try compileAndRunMode(c, "void nov_main(void); int main(void) { nov_main(); return 0; }", 0, "1 true\n", "", mode);
+    }
 }
 
 const reusable_range_program =

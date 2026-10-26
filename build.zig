@@ -1633,6 +1633,38 @@ fn makeExe(b: *std.Build, options: ExecutableOptions) *std.Build.Step.Compile {
 
 fn addBorrowCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step, fixtures: *std.Build.Step.WriteFile) void {
     _ = fixtures.add("borrowed-elements.nov", @embedFile("examples/managed-arrays.nov"));
+    _ = fixtures.add("borrowed-integer.nov",
+        \\let main: () = {
+        \\    let mut x: uint = 1
+        \\    let earlierx = x
+        \\    let y = &x
+        \\    y += 1
+        \\    @println(x, earlierx)
+        \\}
+        \\
+    );
+    for ([_][]const u8{ "semantic", "fmt", "default", "--debug", "--release" }) |mode| {
+        const run = b.addRunArtifact(exe);
+        run.step.name = b.fmt("CLI static integer borrowing: {s}", .{mode});
+        run.setCwd(fixtures.getDirectory());
+        const semantic = std.mem.eql(u8, mode, "semantic");
+        const fmt = std.mem.eql(u8, mode, "fmt");
+        if (semantic) {
+            run.addArgs(&.{ "check", "--semantic", "borrowed-integer.nov" });
+        } else if (fmt) {
+            run.addArgs(&.{ "fmt", "--check", "borrowed-integer.nov" });
+        } else {
+            run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+            run.setEnvironmentVariable("NOV_CC", "");
+            run.setEnvironmentVariable("CC", "");
+            run.addArgs(&.{ "run", "borrowed-integer.nov" });
+            if (!std.mem.eql(u8, mode, "default")) run.addArg(mode);
+        }
+        run.expectExitCode(0);
+        run.expectStdOutEqual(if (semantic or fmt) "" else "2 1\n");
+        run.expectStdErrEqual("");
+        test_step.dependOn(&run.step);
+    }
     _ = fixtures.add("borrow-conflict.nov", "let R = struct { n: uint = 0, }\nlet main: () = {\nlet mut items = [R[]]\nlet item = &items[0]\nitems += [R[]]\nitem.n += 1\n}\n");
     for ([_][]const u8{ "semantic", "fmt", "default", "--debug", "--release" }) |mode| {
         const run = b.addRunArtifact(exe);
@@ -1662,7 +1694,7 @@ fn addBorrowCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *st
     reject.addArgs(&.{ "check", "--semantic", "borrow-conflict.nov" });
     reject.expectExitCode(1);
     reject.expectStdOutEqual("");
-    reject.expectStdErrMatch("owner array access conflicts with a live element borrow");
+    reject.expectStdErrMatch("owner access conflicts with a live borrow");
     test_step.dependOn(&reject.step);
 }
 

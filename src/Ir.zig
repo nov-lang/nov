@@ -41,7 +41,8 @@ pub const FieldRead = struct { base: ValueId, index: u32 };
 pub const Operation = union(enum) {
     // Capabilities are unit-typed, never ordinary runtime values.
     borrow_reserve: ValueId,
-    borrow_start: struct { reservation: ValueId, index: ValueId },
+    // Null index denotes a whole integer local, never an array element.
+    borrow_start: struct { reservation: ValueId, index: ?ValueId },
     borrow_read: ValueId,
     borrow_store: struct { borrow: ValueId, value: ValueId, path: []const u32 },
     range_init: struct { start: ValueId, end: ValueId, inclusive: bool },
@@ -613,7 +614,9 @@ fn borrowElement(self: *const Ir, body: Body, borrow: ValueId, before: usize) Ve
     _ = try regionOperandType(body, borrow, before, null);
     if (body.instructions[@intFromEnum(borrow)].op != .borrow_start) return error.InvalidOperation;
     const slot = borrowOwner(body, borrow);
-    return self.getType(body.instructions[@intFromEnum(slot)].ty).?.array;
+    const owner_ty = body.instructions[@intFromEnum(slot)].ty;
+    const owner = self.getType(owner_ty).?;
+    return if (owner == .integer) owner_ty else owner.array;
 }
 
 fn validateBodyStructure(self: *const Ir, function: Function, body: Body) VerifyError!void {
@@ -687,16 +690,23 @@ fn validateBodyStructure(self: *const Ir, function: Function, body: Body) Verify
         switch (instruction.op) {
             .borrow_reserve => |slot| {
                 if (ty != .void) return error.InvalidOperation;
-                const array = self.getType(try slotType(body, slot, i)).?;
-                if (array != .array) return error.InvalidOperation;
-                const element = self.getType(array.array).?;
-                if (element != .record or element.record.tagged) return error.InvalidOperation;
+                const owner = self.getType(try slotType(body, slot, i)).?;
+                if (owner != .integer) {
+                    if (owner != .array) return error.InvalidOperation;
+                    const element = self.getType(owner.array).?;
+                    if (element != .record or element.record.tagged) return error.InvalidOperation;
+                }
             },
             .borrow_start => |start| {
                 if (ty != .void) return error.InvalidOperation;
                 _ = try regionOperandType(body, start.reservation, i, null);
                 if (body.instructions[@intFromEnum(start.reservation)].op != .borrow_reserve) return error.InvalidOperation;
-                if (!isNativeInteger(self.getType(try operandType(body, start.index, i)).?, .signed)) return error.OperandTypeMismatch;
+                const slot = body.instructions[@intFromEnum(start.reservation)].op.borrow_reserve;
+                const owner = self.getType(try slotType(body, slot, i)).?;
+                if (owner == .array) {
+                    const index = start.index orelse return error.InvalidOperation;
+                    if (!isNativeInteger(self.getType(try operandType(body, index, i)).?, .signed)) return error.OperandTypeMismatch;
+                } else if (owner != .integer or start.index != null) return error.InvalidOperation;
                 // One normalized index per reservation; capabilities cannot be forked.
                 for (body.instructions[0..i]) |previous| {
                     if (previous.op == .borrow_start and previous.op.borrow_start.reservation == start.reservation) return error.InvalidOperation;
@@ -706,8 +716,9 @@ fn validateBodyStructure(self: *const Ir, function: Function, body: Body) Verify
                 if (instruction.ty != try self.borrowElement(body, borrow, i)) return error.OperandTypeMismatch;
             },
             .borrow_store => |store| {
-                if (ty != .void or store.path.len == 0 or store.path.len > max_record_depth) return error.InvalidOperation;
+                if (ty != .void or store.path.len > max_record_depth) return error.InvalidOperation;
                 var field_ty = try self.borrowElement(body, store.borrow, i);
+                if ((store.path.len == 0) != (self.getType(field_ty).? == .integer)) return error.InvalidOperation;
                 for (store.path) |index| {
                     const record = self.getType(field_ty).?;
                     if (record != .record or record.record.tagged or index >= record.record.fields.len) return error.InvalidOperation;
