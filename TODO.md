@@ -312,6 +312,10 @@ Keep Nov away from:
 - Add in scope closure so `xxx.orelse(return 0)` could smh work?
 - Look at [gleam](https://gleam.run) parser because they have no ; and cool expr
 - Look at https://tour.gleam.run/data-types/bit-arrays/ idk if it's useful in Nov
+- Proposal: `pub let` as shorter syntax for `@[public]` on declarations/methods.
+  Keep private-by-default and identical file/named import visibility; this is syntax
+  only, not implemented or approved as a replacement. Foreign symbol export remains
+  a separate `@[export("symbol_name")]` annotation, not Nov import visibility.
 - change attributes as a special anonymous struct?
   - from
 ```nov
