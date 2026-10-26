@@ -103,6 +103,7 @@ pub fn check(allocator: std.mem.Allocator, body: Ir.Body) Ir.VerifyError!?Ir.Bor
             const slot: ?Ir.ValueId = switch (instruction.op) {
                 .local_load, .borrow_reserve => |s| s,
                 .local_store => |s| s.slot,
+                .field_store => |s| s.slot,
                 else => null,
             };
             if (slot != null and slot.? == reservation.op.borrow_reserve)

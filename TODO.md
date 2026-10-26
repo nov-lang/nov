@@ -1,19 +1,19 @@
 # TODO
 
-Mutable integer locals support let ref=&local and +=/-=/*=//=/%= through the
-reference with the same static last-use exclusivity as array-element borrowing.
-Old value precedes RHS once, terminal RHS skips stores, exact integer types and
-arithmetic behavior remain unchanged. Stable local slots need no GC/lifetime checks.
-Only compound targets are supported: no bare borrowed scalar reads/copies/plain
-assignment/rebinding/escape, immutable integer or other scalar borrows yet.
-See examples/local-borrows.nov; original owner access resumes after last use.
+Scoped borrowing now covers every supported non-void runtime value type: bool,
+integers, strings, enums, structs/unions, arrays, ranges and functions. let ref=&local
+also supports readonly locals/parameters; mutability follows owner. Reads yield
+ordinary copied values, so copying/arguments/returns/methods do not escape references.
+Assignment writes the pointee, compounds/array updates use ordinary exact-type rules.
+No runtime validity checks. General pointer annotations, nonlocal/void sources,
+reborrows and escaping capabilities remain unsupported. See examples/local-borrows.nov.
 
 Local static array-element borrowing is executable: let ref=&localArray[index]
-for nominal record elements, with nested field reads/writes and compounds in place.
+for all supported array elements, with whole-element and nested record updates.
 Mutable owners permit writes; immutable owners permit reads. CFG fixed-point
 liveness ends the exclusive whole-array loan after its last use, tracking branches,
 loops/backedges, terminal controls and RHS stores. Conflicting owner access and
-reference escape/copy/rebind/reborrow/method receiver use diagnose. Owner access
+reference-capability escape/rebind/reborrow use diagnose; value copies are allowed. Owner access
 during index evaluation is conservatively rejected too. References are bounded
 local capabilities, not general first-class pointers; readonly loans also remain
 exclusive. Index normalization/bounds happens once, owner base is rooted, and no

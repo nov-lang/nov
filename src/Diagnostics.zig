@@ -79,8 +79,8 @@ fn renderModuleWithSources(module: *const Module, compilation: ?*const Compilati
         try location.renderPrefix(source.path, "error", writer);
         switch (diagnostic.tag) {
             .borrow_conflict => try writer.writeAll("owner access conflicts with a live borrow"),
-            .borrow_escape => try writer.writeAll("borrowed identifiers may only be used as record field bases or integer compound targets; copying, escaping and rebinding references are unsupported"),
-            .unsupported_borrow => try writer.writeAll("borrow requires a fixed unannotated let binding to &mutableIntegerLocal or &localArray[index] with a nominal record element; immutable integer owners are unsupported"),
+            .borrow_escape => try writer.writeAll("references cannot escape as capabilities; read the borrowed value instead"),
+            .unsupported_borrow => try writer.writeAll("borrow requires a fixed unannotated let binding to &local or &localArray[index]; void has no borrowable storage; nonlocal owners, reborrows and explicit reference types are unsupported"),
             .invalid_generic_declaration => try writer.writeAll("generic container declarations require named type parameters: (T: type, ...) -> type = struct { ... } or union { ... }"),
             .generic_needs_arguments => try writer.writeAll("generic container requires explicit type arguments"),
             .not_a_generic => try writer.writeAll("type application requires an ordinary named generic container"),

@@ -2449,10 +2449,10 @@ test "static integer borrowing forged IR owner kinds exact types paths and sourc
     try std.testing.expect(saved_start.op.borrow_start.index == null);
     try std.testing.expectEqual(@as(usize, 0), saved_store.op.borrow_store.path.len);
     instructions[reserve].op.borrow_reserve = boolean;
-    try std.testing.expectError(error.InvalidOperation, result.ir.verify());
+    try std.testing.expectError(error.OperandTypeMismatch, result.ir.verify());
     instructions[reserve] = saved_reserve;
     instructions[reserve].op.borrow_reserve = array;
-    try std.testing.expectError(error.InvalidOperation, result.ir.verify());
+    try std.testing.expectError(error.OperandTypeMismatch, result.ir.verify());
     instructions[reserve] = saved_reserve;
     instructions[start].op.borrow_start.index = saved_reserve.op.borrow_reserve;
     try std.testing.expectError(error.InvalidOperation, result.ir.verify());
@@ -2498,7 +2498,7 @@ test "static borrowing verified capability types owner paths index and regions s
     };
     const saved = instructions[store];
     instructions[store].op.borrow_store.path = &.{};
-    try std.testing.expectError(error.InvalidOperation, result.ir.verify());
+    try std.testing.expectError(error.OperandTypeMismatch, result.ir.verify());
     instructions[store] = saved;
     try std.testing.expectEqualSlices(u32, &.{ 0, 0 }, saved.op.borrow_store.path);
     @constCast(saved.op.borrow_store.path)[0] = 99;
@@ -2513,7 +2513,7 @@ test "static borrowing verified capability types owner paths index and regions s
     instructions[read] = old_read;
     const old_start = instructions[start];
     instructions[start].op.borrow_start.index = null;
-    try std.testing.expectError(error.InvalidOperation, result.ir.verify());
+    try std.testing.expectError(error.OperandTypeMismatch, result.ir.verify());
     instructions[start] = old_start;
     instructions[start].op.borrow_start.index = @enumFromInt(reserve);
     try std.testing.expectError(error.OperandTypeMismatch, result.ir.verify());
@@ -2563,7 +2563,7 @@ fn testBorrowRejectionAllocations(allocator: std.mem.Allocator, source: []const 
 test "static borrowing rejected conflicts and escapes roll back every allocation failure" {
     for ([_][]const u8{
         "let R=struct{x:int=0,}\nlet f:()={let mut a=[R[]]\nlet r=&a[0]\nr.x+={a=[R[]]\n1}}",
-        "let R=struct{x:int=0,}\nlet f:()={let mut a=[R[]]\nlet r=&a[0]\nlet alias=r\n@println(alias.x)}",
+        "let R=struct{x:int=0,}\nlet f:()={let mut a=[R[]]\nlet r=&a[0]\nlet alias=&r\n@println(alias.x)}",
         "let R=struct{x:int=0,}\nlet f:()={let mut a=[R[]]\nlet r=&a[{a=[R[]]\n0}]\nr.x=1}",
     }) |source| try std.testing.checkAllAllocationFailures(std.testing.allocator, testBorrowRejectionAllocations, .{source});
 }

@@ -22,7 +22,7 @@ const Binding = struct {
     name_span: Module.Span,
     borrowed: bool = false,
     borrow: ?Ir.ValueId = null,
-    scalar_borrow: ?struct { owner: Module.Span, origin: Module.Span } = null,
+    loan_owner: ?struct { owner: Module.Span, origin: Module.Span } = null,
 };
 // Bounds recursive checking/probing, not the iterative literal-grouping walk.
 const max_recursive_depth = 128;
@@ -118,7 +118,11 @@ fn checkInner(module: *Module, ir: *Ir, types: []const ?Ir.TypeId, id: Module.De
                 valid = false;
                 continue;
             }
-            try context.bindings.put(module.allocator, name, .{ .index = @intCast(i), .name_span = span, .known = .{
+            const slot = if (emitter != null and context.borrowedName(name) and ir.getType(ty.function.params[i]).? != .void) blk: {
+                const value = try emitter.?.append(ty.function.params[i], span, .{ .parameter = @intCast(i) });
+                break :blk try emitter.?.append(ty.function.params[i], span, .{ .local_slot = value });
+            } else null;
+            try context.bindings.put(module.allocator, name, .{ .slot = slot, .index = @intCast(i), .name_span = span, .known = .{
                 .ty = ty.function.params[i],
                 .annotation = module.tokenSpan(module.source.ast.firstToken(param.type_expr)),
             } });
@@ -185,9 +189,28 @@ const Context = struct {
         self.locals.shrinkRetainingCapacity(start);
     }
 
+    // Decide storage at declaration time so loans in a branch never create a
+    // slot whose definition fails to dominate later identifier reads. Names
+    // cannot shadow, and this syntax scan does not change value/type policy.
+    fn borrowedName(self: *const Context, name: []const u8) bool {
+        const ast = &self.module.source.ast;
+        for (ast.nodes.items(.tag), ast.nodes.items(.data)) |tag, data| {
+            if (tag != .ref_of) continue;
+            var owner = data.rhs;
+            if (ast.nodes.items(.tag)[owner] == .array_access) owner = ast.nodes.items(.data)[owner].lhs;
+            if (ast.nodes.items(.tag)[owner] == .identifier and std.mem.eql(u8, name, ast.tokenSlice(ast.nodes.items(.main_token)[owner]))) return true;
+        }
+        return false;
+    }
+
     fn bindLocal(self: *Context, name: []const u8, binding: Binding) Error!void {
         try self.locals.append(self.module.allocator, name);
-        try self.bindings.put(self.module.allocator, name, binding);
+        var stored = binding;
+        if (self.borrowedName(name) and !stored.borrowed and stored.slot == null and stored.value != null and self.emitter != null and self.ir.getType(stored.known.ty).? != .void) {
+            stored.slot = try self.emitter.?.append(stored.known.ty, stored.name_span, .{ .local_slot = stored.value.? });
+            stored.value = null;
+        }
+        try self.bindings.put(self.module.allocator, name, stored);
     }
 
     // Context declaration IDs address the shared semantic table, whereas AST
@@ -298,7 +321,7 @@ const Context = struct {
         }
         const known = annotation orelse Known{ .ty = ty };
         try self.copyNode(decl.init_node, ty);
-        const slot = if ((decl.is_mutable or self.ir.getType(ty).? == .array) and self.emitter != null)
+        const slot = if ((decl.is_mutable or self.ir.getType(ty).? == .array or self.borrowedName(name)) and self.ir.getType(ty).? != .void and self.emitter != null)
             try self.emitter.?.append(ty, self.irSpan(node), .{ .local_slot = try self.emitter.?.value(decl.init_node) })
         else
             null;
@@ -330,11 +353,8 @@ const Context = struct {
             return false;
         }
         const owner_type = self.ir.getType(owner.known.ty).?;
-        const supported = if (scalar)
-            owner_type == .integer and owner.mutable
-        else
-            owner_type == .array and self.ir.getType(owner_type.array).? == .record and !self.ir.getType(owner_type.array).?.record.tagged;
-        if (owner.borrowed or owner.initializer == null or !supported) {
+        const supported = if (scalar) owner_type != .void else owner_type == .array;
+        if (owner.borrowed or !supported) {
             _ = try self.fail(.unsupported_borrow, operand, owner.name_span);
             return false;
         }
@@ -342,7 +362,7 @@ const Context = struct {
         const reservation = if (self.emitter) |emitter| try emitter.append(unit, self.irSpan(decl.init_node), .{ .borrow_reserve = owner.slot.? }) else null;
         if (scalar) {
             const borrow = if (self.emitter) |emitter| try emitter.append(unit, self.irSpan(decl.init_node), .{ .borrow_start = .{ .reservation = reservation.?, .index = null } }) else null;
-            try self.bindLocal(name, .{ .known = owner.known, .name_span = name_span, .mutable = true, .borrowed = true, .borrow = borrow, .scalar_borrow = .{ .owner = owner.name_span, .origin = self.irSpan(decl.init_node) } });
+            try self.bindLocal(name, .{ .known = owner.known, .name_span = name_span, .mutable = owner.mutable, .borrowed = true, .borrow = borrow, .loan_owner = .{ .owner = owner.name_span, .origin = self.irSpan(decl.init_node) } });
             return true;
         }
         const index_ty = try self.ir.internType(.{ .integer = .{ .signedness = .signed, .bits = Ir.native_pointer_bits } });
@@ -356,7 +376,7 @@ const Context = struct {
         if (try self.expression(access.rhs, .{ .ty = index_ty }, depth + 1) == null) return false;
         if (self.terminated) return true;
         const borrow = if (self.emitter) |emitter| try emitter.append(unit, self.irSpan(decl.init_node), .{ .borrow_start = .{ .reservation = reservation.?, .index = try emitter.value(access.rhs) } }) else null;
-        try self.bindLocal(name, .{ .known = .{ .ty = owner_type.array }, .name_span = name_span, .mutable = owner.mutable, .borrowed = true, .borrow = borrow });
+        try self.bindLocal(name, .{ .known = .{ .ty = owner_type.array }, .name_span = name_span, .mutable = owner.mutable, .borrowed = true, .borrow = borrow, .loan_owner = .{ .owner = owner.name_span, .origin = self.irSpan(decl.init_node) } });
         return true;
     }
 
@@ -1097,43 +1117,10 @@ const Context = struct {
             },
         };
         try emitter.record(node, ty, self.irSpan(node), op);
-        // Ordinary reads must detach immediately, before any index/RHS effects:
-        // a later borrow can mutate the owner's backing in place. Borrow reads
-        // use their capability above and never pass through this copy boundary.
+        // All ordinary array reads, including alias reads, detach before
+        // index/RHS effects. Creating a loan itself never reads or clones.
         if (tag == .identifier and self.ir.getType(ty).? == .array) try self.copyNode(node, ty);
         return true;
-    }
-
-    fn scalarBorrowCompound(self: *Context, node: Ast.Node.Index, binding: Binding, expected: ?Known, depth: usize) Error!?Ir.TypeId {
-        const ast = &self.module.source.ast;
-        const data = ast.nodes.items(.data)[node];
-        // Only the compound LHS may read this capability; RHS identifier reads
-        // still follow the ordinary no-copy/no-escape restriction.
-        const old = if (self.emitter) |emitter| try emitter.append(binding.known.ty, self.irSpan(data.lhs), .{ .borrow_read = binding.borrow.? }) else null;
-        const reservation: Reservation = .{ .owner = binding.scalar_borrow.?.owner, .origin = binding.scalar_borrow.?.origin, .parent = self.reservation };
-        const parent = self.reservation;
-        self.reservation = &reservation;
-        defer self.reservation = parent;
-        if (try self.expression(data.rhs, binding.known, depth + 1) == null) return null;
-        const unit = try self.ir.internType(.void);
-        if (!self.terminated) {
-            if (self.emitter) |emitter| {
-                const value = try emitter.append(binding.known.ty, self.irSpan(node), .{ .binary = .{
-                    .op = switch (ast.nodes.items(.tag)[node]) {
-                        .assign_add => .add,
-                        .assign_sub => .sub,
-                        .assign_mul => .mul,
-                        .assign_div => .div,
-                        .assign_mod => .mod,
-                        else => unreachable,
-                    },
-                    .lhs = old.?,
-                    .rhs = try emitter.value(data.rhs),
-                } });
-                try emitter.record(node, unit, self.irSpan(node), .{ .borrow_store = .{ .borrow = binding.borrow.?, .value = value, .path = try emitter.allocator.dupe(u32, &.{}) } });
-            }
-        }
-        return self.fit(unit, expected, node);
     }
 
     fn fieldAssignment(self: *Context, node: Ast.Node.Index, expected: ?Known, depth: usize) Error!?Ir.TypeId {
@@ -1162,6 +1149,7 @@ const Context = struct {
             if (self.module.lookup(binding_name)) |id| return self.fail(.immutable_assignment, target.lhs, self.module.getDeclaration(id).?.name_span);
             return self.fail(.unknown_name, target.lhs, null);
         };
+        if (self.reservedOrigin(binding.name_span)) |origin| return self.fail(.borrow_conflict, root, origin);
         var record_id = binding.known.ty;
         var path: [Ir.max_record_depth]u32 = undefined;
         for (0..path_len) |p| {
@@ -1178,6 +1166,10 @@ const Context = struct {
         if (!binding.mutable) return self.fail(.immutable_assignment, root, binding.name_span);
         const index = self.fieldIndex(record_id, name) orelse return self.fail(.unknown_field, data.lhs, null);
         const field = record.record.fields[index];
+        const reservation: Reservation = .{ .owner = if (binding.loan_owner) |loan| loan.owner else binding.name_span, .origin = if (binding.loan_owner) |loan| loan.origin else self.irSpan(node), .parent = self.reservation };
+        const parent = self.reservation;
+        if (binding.borrowed) self.reservation = &reservation;
+        defer self.reservation = parent;
         const tag = ast.nodes.items(.tag)[node];
         const compound = tag != .assign;
         const ty = self.ir.getType(field.ty).?;
@@ -1222,6 +1214,10 @@ const Context = struct {
             if (self.module.lookup(name)) |id| return self.fail(.immutable_assignment, target.lhs, self.module.getDeclaration(id).?.name_span);
             return self.fail(.unknown_name, target.lhs, null);
         };
+        const reservation: Reservation = .{ .owner = if (binding.loan_owner) |loan| loan.owner else binding.name_span, .origin = if (binding.loan_owner) |loan| loan.origin else self.irSpan(node), .parent = self.reservation };
+        const parent = self.reservation;
+        if (binding.borrowed) self.reservation = &reservation;
+        defer self.reservation = parent;
         const array = self.ir.getType(binding.known.ty).?;
         if (array != .array) return self.fail(.unsupported_assignment_target, data.lhs, null);
         if (!binding.mutable) return self.fail(.immutable_assignment, target.lhs, binding.name_span);
@@ -1256,7 +1252,9 @@ const Context = struct {
                     .rhs = value,
                 } });
                 const updated = try emitter.append(binding.known.ty, self.irSpan(node), .{ .array_set = .{ .array = try emitter.value(target.lhs), .index = try emitter.value(target.rhs), .value = value } });
-                try emitter.record(node, unit, self.irSpan(node), .{ .local_store = .{ .slot = binding.slot.?, .value = updated } });
+                if (binding.borrowed) {
+                    try emitter.record(node, unit, self.irSpan(node), .{ .borrow_store = .{ .borrow = binding.borrow.?, .value = updated, .path = &.{} } });
+                } else try emitter.record(node, unit, self.irSpan(node), .{ .local_store = .{ .slot = binding.slot.?, .value = updated } });
             }
         }
         return self.fit(unit, expected, node);
@@ -1938,7 +1936,7 @@ const Context = struct {
                 const name = self.module.sourceSlice(self.span(node)).?;
                 if (self.bindings.get(name)) |binding| {
                     if (self.reservedOrigin(binding.name_span)) |origin| return self.fail(.borrow_conflict, node, origin);
-                    if (binding.borrowed and self.borrow_base != node) return self.fail(.borrow_escape, node, binding.name_span);
+
                     return self.fit(binding.known.ty, expected, node);
                 }
                 if (self.valueDeclaration(name)) |id| {
@@ -2065,11 +2063,11 @@ const Context = struct {
                     return self.fail(.unknown_name, data.lhs, null);
                 };
                 if (self.reservedOrigin(binding.name_span)) |origin| return self.fail(.borrow_conflict, data.lhs, origin);
-                if (binding.borrowed) {
-                    if (ast.nodes.items(.tag)[node] == .assign or self.ir.getType(binding.known.ty).? != .integer)
-                        return self.fail(.borrow_escape, data.lhs, binding.name_span);
-                    return self.scalarBorrowCompound(node, binding, expected, depth);
-                }
+
+                const reservation: Reservation = .{ .owner = if (binding.loan_owner) |loan| loan.owner else binding.name_span, .origin = if (binding.loan_owner) |loan| loan.origin else self.irSpan(node), .parent = self.reservation };
+                const parent = self.reservation;
+                if (binding.borrowed) self.reservation = &reservation;
+                defer self.reservation = parent;
                 if (!binding.mutable) return self.fail(.immutable_assignment, data.lhs, binding.name_span);
                 const tag = ast.nodes.items(.tag)[node];
                 const compound = tag != .assign;
@@ -2100,7 +2098,9 @@ const Context = struct {
                             .rhs = value,
                         } });
                         if (self.ir.getType(binding.known.ty).? == .array) value = try emitter.append(binding.known.ty, self.irSpan(node), .{ .array_clone = value });
-                        try emitter.record(node, unit, self.irSpan(node), .{ .local_store = .{ .slot = binding.slot.?, .value = value } });
+                        if (binding.borrowed) {
+                            try emitter.record(node, unit, self.irSpan(node), .{ .borrow_store = .{ .borrow = binding.borrow.?, .value = value, .path = &.{} } });
+                        } else try emitter.record(node, unit, self.irSpan(node), .{ .local_store = .{ .slot = binding.slot.?, .value = value } });
                     }
                 }
                 return self.fit(unit, expected, node);
@@ -4074,17 +4074,17 @@ test "static integer borrowing types CFG last use and bounded escapes" {
         .{ .body = "let y=&x; loop x==1 {y+=1}", .diagnostic = .borrow_conflict },
         .{ .body = "let y=&x; loop flag : @println(x) {y+=1}", .diagnostic = .borrow_conflict },
         .{ .body = "let y=&x; y+={let z=&x; z+=1; 1}", .diagnostic = .borrow_conflict },
-        .{ .body = "let y=&x; y+=y", .diagnostic = .borrow_escape },
-        .{ .body = "let y=&x; y=1", .diagnostic = .borrow_escape },
-        .{ .body = "let y=&x; let z=y", .diagnostic = .borrow_escape },
-        .{ .body = "let y=&x; @println(y)", .diagnostic = .borrow_escape },
-        .{ .body = "let y=&x; return y", .diagnostic = .borrow_escape },
+        .{ .body = "let y=&x; y+=y" },
+        .{ .body = "let y=&x; y=1" },
+        .{ .body = "let y=&x; let z=y" },
+        .{ .body = "let y=&x; @println(y)" },
+        .{ .body = "let y=&x; return y", .diagnostic = .expression_type_mismatch },
         .{ .body = "let y=&x; let z=&y", .diagnostic = .unsupported_borrow },
         .{ .body = "let mut y=&x", .diagnostic = .unsupported_borrow },
         .{ .body = "let y:int=&x", .diagnostic = .unsupported_borrow },
-        .{ .body = "let fixed:int=1; let y=&fixed", .diagnostic = .unsupported_borrow },
-        .{ .body = "let mut b=true; let y=&b", .diagnostic = .unsupported_borrow },
-        .{ .body = "let y=&a", .diagnostic = .unsupported_borrow },
+        .{ .body = "let fixed:int=1; let y=&fixed" },
+        .{ .body = "let mut b=true; let y=&b" },
+        .{ .body = "let y=&a" },
         .{ .body = "let y=&x; y.n+=1", .diagnostic = .unsupported_assignment_target },
         .{ .body = "let y=&x; y+=@as(i8,1)", .diagnostic = .expression_type_mismatch },
     }) |case| {
@@ -4151,7 +4151,7 @@ test "static borrowing structured last use conflicts and bounded escapes" {
         .{ .body = "let r=&a[0]; let b=flag and {r.x=1; true}; @println(a.len,b)" },
         .{ .body = "let r=&a[0]; match flag {true=>r.x=1; false=>@println(a.len)}; @println(a.len)" },
         .{ .body = "let r=&a[0]; match flag {true=>r.x=1; false=>@println(a.len)}; r.x=2", .diagnostic = .borrow_conflict },
-        .{ .body = "let r=&a[0]; return r", .diagnostic = .borrow_escape },
+        .{ .body = "let r=&a[0]; return r", .diagnostic = .expression_type_mismatch },
         .{ .body = "let r=&a[0]; @println(a.len); r.x=1", .diagnostic = .borrow_conflict },
         .{ .body = "let r=&a[0]; let b=a; r.x=1", .diagnostic = .borrow_conflict },
         .{ .body = "let r=&a[0]; a=[R[]]; r.x=1", .diagnostic = .borrow_conflict },
@@ -4167,12 +4167,12 @@ test "static borrowing structured last use conflicts and bounded escapes" {
         .{ .body = "let r=&a[0]; loop {r.x+=1; if flag {@println(a.len); continue} else {break}}", .diagnostic = .borrow_conflict },
         .{ .body = "let r=&a[0]; loop {if flag {@println(a.len); continue} else {r.x+=1; break}}", .diagnostic = .borrow_conflict },
         .{ .body = "let r=&a[0]; let b=flag and {a=[R[]]; true}; r.x=1; @println(b)", .diagnostic = .borrow_conflict },
-        .{ .body = "let r=&a[0]; let alias=r; alias.x=1", .diagnostic = .borrow_escape },
-        .{ .body = "let r=&a[0]; consume(r)", .diagnostic = .borrow_escape },
-        .{ .body = "let r=&a[0]; let b:[]R=[r,r]", .diagnostic = .borrow_escape },
-        .{ .body = "let r=&a[0]; let b={r}", .diagnostic = .borrow_escape },
+        .{ .body = "let r=&a[0]; let alias=r; alias.x=1", .diagnostic = .immutable_assignment },
+        .{ .body = "let r=&a[0]; consume(r)" },
+        .{ .body = "let r=&a[0]; let b:[]R=[r,r]" },
+        .{ .body = "let r=&a[0]; let b={r}" },
         .{ .body = "let r=&a[0]; let s=&r.x", .diagnostic = .unsupported_borrow },
-        .{ .body = "let r=&a[0]; r=R[]", .diagnostic = .borrow_escape },
+        .{ .body = "let r=&a[0]; r=R[]" },
         .{ .body = "let immutable=[R[]]; let r=&immutable[0]; @println(r.x)" },
         .{ .body = "let immutable=[R[]]; let r=&immutable[0]; r.x=1", .diagnostic = .immutable_assignment },
     }) |case| {
@@ -4197,6 +4197,115 @@ test "static borrowing structured last use conflicts and bounded escapes" {
             try std.testing.expect(!module.hasErrors());
             try std.testing.expect(result.lowering_complete);
             try result.ir.verify();
+        }
+    }
+}
+
+test "general borrowing readonly parameters exact types conflicts and unsupported capabilities" {
+    const Case = struct { ty: []const u8, init: []const u8, replacement: []const u8 };
+    for ([_]Case{
+        .{ .ty = "bool", .init = "true", .replacement = "false" },
+        .{ .ty = "int", .init = "@as(int,1)", .replacement = "2" },
+        .{ .ty = "string", .init = "\"a\"+\"b\"", .replacement = "\"c\"" },
+        .{ .ty = "E", .init = "E.a", .replacement = ".b" },
+        .{ .ty = "R", .init = "R[.s=\"a\"]", .replacement = "R[.s=\"b\"]" },
+        .{ .ty = "U", .init = "U.some[\"a\"]", .replacement = ".none[]" },
+        .{ .ty = "G(string)", .init = "G(string).some[\"a\"]", .replacement = ".none[]" },
+        .{ .ty = "[]int", .init = "[@as(int,1)]", .replacement = "[2]" },
+        .{ .ty = "(int)->int", .init = "inc", .replacement = "inc" },
+    }) |case| {
+        inline for (0..7) |mode| {
+            const body = try std.fmt.allocPrint(std.testing.allocator, switch (mode) {
+                0 => "let r=&x\nlet copy=r\nconsume(r)\nreturn copy",
+                1 => "let r=&x\nr={s}\nreturn x",
+                2 => "let r=&x\nlet copy=x\nconsume(r)\nreturn copy",
+                3 => "let r=&x\nlet s=&x\nconsume(r)\nreturn s",
+                4 => "let mut local=x\nlet r=&local\nr={s}\nreturn local",
+                5 => "let local=x\nlet r=&local\nr={s}\nreturn local",
+                else => "let local=x\nlet r=&local\nlet s=&r\nreturn s",
+            }, if (mode == 1 or mode == 4 or mode == 5) .{case.replacement} else .{});
+            defer std.testing.allocator.free(body);
+            const source = try std.fmt.allocPrint(std.testing.allocator, "let E=enum{{a,b,}}\nlet R=struct{{s:string,}}\nlet U=union{{some:string,none,}}\nlet G:(T:type)->type=union{{some:T,none,}}\nlet inc:(x:int)->int=x+1\nlet consume:(v:{s})={{}}\nlet f:(x:{s})->{s}={{{s}\n}}\nlet entry:()={{let v:{s}={s}\nconsume(f(v))}}", .{ case.ty, case.ty, case.ty, body, case.ty, case.init });
+            defer std.testing.allocator.free(source);
+            var module = try Module.init(std.testing.allocator, "general-readonly.nov", source);
+            defer module.deinit();
+            var result = try Lowering.lower(&module);
+            defer result.deinit();
+            errdefer std.debug.print("case {s} mode {d}: {any}\n{s}\n", .{ case.ty, mode, module.diagnostics.items, source });
+            if (mode == 0 or mode == 4) {
+                try std.testing.expect(!module.hasErrors());
+                try std.testing.expect(result.lowering_complete);
+                try result.ir.verify();
+            } else {
+                const expected: Module.Diagnostic.Tag = switch (mode) {
+                    1, 5 => .immutable_assignment,
+                    2, 3 => .borrow_conflict,
+                    else => .unsupported_borrow,
+                };
+                try std.testing.expect(module.hasErrors());
+                try std.testing.expectEqual(expected, module.diagnostics.items[0].tag);
+            }
+        }
+    }
+}
+
+test "general borrowing rejects void nonlocal capabilities wrong exact types and invalid operations" {
+    const Case = struct { source: []const u8, diagnostic: Module.Diagnostic.Tag };
+    for ([_]Case{
+        .{ .source = "let f:()={let x:void={}\nlet r=&x\n}", .diagnostic = .unsupported_borrow },
+        .{ .source = "let f:(x:void)={let r=&x\n}", .diagnostic = .invalid_parameter_type },
+        .{ .source = "let x=true\nlet f:()={let r=&x\n}", .diagnostic = .unsupported_borrow },
+        .{ .source = "let f:()={let mut x=true\nlet r=&x\nr=1}", .diagnostic = .literal_type_mismatch },
+        .{ .source = "let f:()={let mut x:int=1\nlet r=&x\nr=@as(i8,2)}", .diagnostic = .expression_type_mismatch },
+        .{ .source = "let R=struct{n:int,}\nlet S=struct{n:int,}\nlet f:()={let mut x=R[.n=1]\nlet r=&x\nr=S[.n=2]}", .diagnostic = .expression_type_mismatch },
+        .{ .source = "let f:()={let mut x=true\nlet r=&x\nr+=true}", .diagnostic = .operator_not_supported },
+        .{ .source = "let f:()={let mut x=\"a\"\nlet r=&x\nr-=\"b\"}", .diagnostic = .operator_not_supported },
+        .{ .source = "let f:()={let x=[true]\nlet r=&x[0]\nr=false}", .diagnostic = .immutable_assignment },
+        .{ .source = "let f:(x:[]string)={let r=&x[0]\nr+=\"b\"}", .diagnostic = .immutable_assignment },
+        .{ .source = "let R=struct{n:int=0,}\nlet f:(x:R)={let r=&x\nr.n=1}", .diagnostic = .immutable_assignment },
+        .{ .source = "let R=struct{n:int=0,}\nlet f:()={let mut x=R[]\nlet r=&x\nx.n=1\n@println(r.n)}", .diagnostic = .borrow_conflict },
+        .{ .source = "let f:(x:bool)={let r=&x\n@println(x)\n@println(r)}", .diagnostic = .borrow_conflict },
+        .{ .source = "let f:()={let x=true\nlet r=&x\n@println(x)\n@println(r)}", .diagnostic = .borrow_conflict },
+        .{ .source = "let f:()={let mut x=[true]\nlet r=&x\nr[0]={x=[false]\nreturn}}", .diagnostic = .borrow_conflict },
+    }) |case| {
+        var module = try Module.init(std.testing.allocator, "general-negative.nov", case.source);
+        defer module.deinit();
+        errdefer std.debug.print("{s}: {any}\n", .{ case.source, module.diagnostics.items });
+        var result = try Lowering.lower(&module);
+        defer result.deinit();
+        try std.testing.expect(module.hasErrors());
+        try std.testing.expectEqual(case.diagnostic, module.diagnostics.items[0].tag);
+    }
+}
+
+test "general borrowing reserves record owners through terminal field assignment RHS" {
+    for ([_][]const u8{ "n", "inner.n" }) |field| {
+        for ([_][]const u8{ "=", "+=" }) |outer_op| {
+            for ([_][]const u8{ "=", "+=" }) |inner_op| {
+                for ([_][]const u8{ "return .none[]", "break", "continue", "@panic(\"stop\")", "stop().!" }) |exit| {
+                    for ([_]bool{ true, false }) |conflicts| {
+                        const owner = if (conflicts) "x" else "independent";
+                        const source = try std.fmt.allocPrint(std.testing.allocator, "let I=struct{{n:int=0,}}\nlet R=struct{{n:int=0,inner:I,}}\nlet O:(T:type)->type=union{{some:T,none,}}\nlet stop:()->O(int)=.none[]\nlet f:(flag:bool)->O(int)={{let mut x=R[.inner=I[]]\nlet mut independent=R[.inner=I[]]\nlet r=&x\nloop {{if flag {{r.{s}{s}{{{s}.{s}{s}2\n{s}}}}} else {{break}}}}\n.some[0]}}", .{ field, outer_op, owner, field, inner_op, exit });
+                        defer std.testing.allocator.free(source);
+                        var module = try Module.init(std.testing.allocator, "terminal-field-reservation.nov", source);
+                        defer module.deinit();
+                        errdefer std.debug.print("{s}: {any}\n", .{ source, module.diagnostics.items });
+                        var result = try Lowering.lower(&module);
+                        defer result.deinit();
+                        if (conflicts) {
+                            try std.testing.expect(module.hasErrors());
+                            const diagnostic = module.diagnostics.items[0];
+                            try std.testing.expectEqual(Module.Diagnostic.Tag.borrow_conflict, diagnostic.tag);
+                            try std.testing.expectEqualStrings("x", module.sourceSlice(diagnostic.span).?);
+                            try std.testing.expectEqualStrings("&x", module.sourceSlice(diagnostic.related.?).?);
+                        } else {
+                            try std.testing.expect(!module.hasErrors());
+                            try std.testing.expect(result.lowering_complete);
+                            try result.ir.verify();
+                        }
+                    }
+                }
+            }
         }
     }
 }

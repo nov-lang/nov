@@ -1643,28 +1643,33 @@ fn addBorrowCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *st
         \\}
         \\
     );
-    for ([_][]const u8{ "semantic", "fmt", "default", "--debug", "--release" }) |mode| {
+    _ = fixtures.add("local-borrows-example.nov", @embedFile("examples/local-borrows.nov"));
+    const programs = [_]struct { source: []const u8, output: []const u8 }{
+        .{ .source = "borrowed-integer.nov", .output = "2 1\n" },
+        .{ .source = "local-borrows-example.nov", .output = "2 1\ntrue\nhello world hello world\ntrue\n5\n3 2 1\n1 2 \n9\n7\n" },
+    };
+    for (programs) |program| for ([_][]const u8{ "semantic", "fmt", "default", "--debug", "--release" }) |mode| {
         const run = b.addRunArtifact(exe);
-        run.step.name = b.fmt("CLI static integer borrowing: {s}", .{mode});
+        run.step.name = b.fmt("CLI local borrowing: {s} {s}", .{ program.source, mode });
         run.setCwd(fixtures.getDirectory());
         const semantic = std.mem.eql(u8, mode, "semantic");
         const fmt = std.mem.eql(u8, mode, "fmt");
         if (semantic) {
-            run.addArgs(&.{ "check", "--semantic", "borrowed-integer.nov" });
+            run.addArgs(&.{ "check", "--semantic", program.source });
         } else if (fmt) {
-            run.addArgs(&.{ "fmt", "--check", "borrowed-integer.nov" });
+            run.addArgs(&.{ "fmt", "--check", program.source });
         } else {
             run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
             run.setEnvironmentVariable("NOV_CC", "");
             run.setEnvironmentVariable("CC", "");
-            run.addArgs(&.{ "run", "borrowed-integer.nov" });
+            run.addArgs(&.{ "run", program.source });
             if (!std.mem.eql(u8, mode, "default")) run.addArg(mode);
         }
         run.expectExitCode(0);
-        run.expectStdOutEqual(if (semantic or fmt) "" else "2 1\n");
+        run.expectStdOutEqual(if (semantic or fmt) "" else program.output);
         run.expectStdErrEqual("");
         test_step.dependOn(&run.step);
-    }
+    };
     _ = fixtures.add("borrow-conflict.nov", "let R = struct { n: uint = 0, }\nlet main: () = {\nlet mut items = [R[]]\nlet item = &items[0]\nitems += [R[]]\nitem.n += 1\n}\n");
     for ([_][]const u8{ "semantic", "fmt", "default", "--debug", "--release" }) |mode| {
         const run = b.addRunArtifact(exe);

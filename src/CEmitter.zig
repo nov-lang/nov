@@ -873,7 +873,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
             const store = instruction.op.borrow_store;
             const slot = Ir.borrowOwner(body, store.borrow);
             const owner = ir.getType(body.instructions[@intFromEnum(slot)].ty).?;
-            if (owner == .integer) {
+            if (body.instructions[@intFromEnum(store.borrow)].op.borrow_start.index == null) {
                 try w.print("    v{d}", .{@intFromEnum(slot)});
             } else {
                 try w.writeAll("    ((");
@@ -914,6 +914,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
             try w.print("    v{d} = ", .{i});
             switch (instruction.op) {
                 .field_read, .union_payload => |read| try w.print("v{d}.f{d}", .{ @intFromEnum(read.base), read.index }),
+                .borrow_read => |borrow| try writeBorrowRead(ir, w, body, borrow, instruction.ty),
                 .constant => |id| try writeConstant(w, ir.getConstant(id).?, ty),
                 .parameter => |index| try w.print("p{d}", .{index}),
                 .local_slot, .local_load => |value| try w.print("v{d}", .{@intFromEnum(value)}),
@@ -939,7 +940,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
             continue;
         }
         if (ty == .array) {
-            try writeArrayValue(ir, w, instruction, i);
+            try writeArrayValue(ir, w, body, instruction, i);
             if (!value_used[i] or instruction.op == .local_slot) try w.print("    (void)v{d};\n", .{i});
             continue;
         }
@@ -979,16 +980,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
                 if (values.len == 0) try w.writeByte('0');
                 try w.writeAll(" }");
             },
-            .borrow_read => |borrow| {
-                const slot = Ir.borrowOwner(body, borrow);
-                if (ir.getType(body.instructions[@intFromEnum(slot)].ty).? == .integer) {
-                    try w.print("v{d}", .{@intFromEnum(slot)});
-                } else {
-                    try w.writeAll("((");
-                    try writeType(ir, w, instruction.ty);
-                    try w.print(" *)v{d}.data)[b{d}]", .{ @intFromEnum(slot), @intFromEnum(borrow) });
-                }
-            },
+            .borrow_read => |borrow| try writeBorrowRead(ir, w, body, borrow, instruction.ty),
             .borrow_reserve, .borrow_start, .borrow_store => unreachable,
             .field_read => |read| try w.print("v{d}.f{d}", .{ @intFromEnum(read.base), read.index }),
             .array_len => |value| try w.print("v{d}.len", .{@intFromEnum(value)}),
@@ -1073,10 +1065,22 @@ fn writeElementLayout(_: *const Ir, w: *std.Io.Writer, element: Ir.TypeId) Write
     try w.print("&nov_element_{d}", .{@intFromEnum(element)});
 }
 
-fn writeArrayValue(ir: *const Ir, w: *std.Io.Writer, instruction: Ir.Instruction, i: usize) WriteError!void {
+fn writeBorrowRead(ir: *const Ir, w: *std.Io.Writer, body: Ir.Body, borrow: Ir.ValueId, ty: Ir.TypeId) WriteError!void {
+    const slot = Ir.borrowOwner(body, borrow);
+    if (body.instructions[@intFromEnum(borrow)].op.borrow_start.index == null) {
+        try w.print("v{d}", .{@intFromEnum(slot)});
+    } else {
+        try w.writeAll("((");
+        try writeType(ir, w, ty);
+        try w.print(" *)v{d}.data)[b{d}]", .{ @intFromEnum(slot), @intFromEnum(borrow) });
+    }
+}
+
+fn writeArrayValue(ir: *const Ir, w: *std.Io.Writer, body: Ir.Body, instruction: Ir.Instruction, i: usize) WriteError!void {
     const element = ir.getType(instruction.ty).?.array;
     try w.print("    v{d} = ", .{i});
     switch (instruction.op) {
+        .borrow_read => |borrow| try writeBorrowRead(ir, w, body, borrow, instruction.ty),
         .array_literal => |elements| {
             try w.print("nov_array_new({d}, {d}, ", .{ elements.len, elements.len });
             try writeElementLayout(ir, w, element);
@@ -7011,4 +7015,167 @@ test "static borrowing normal snapshot OOM precedes index and RHS effects" {
 test "static borrowing snapshot lowering and emission survive every allocation failure" {
     try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{borrow_snapshot_program});
     try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{borrow_snapshot_terminal_program});
+}
+
+const general_borrow_program =
+    \\let E=enum{a,b,}
+    \\let R=struct{s:string,n:int=1,
+    \\let change:(self:R)->R={let mut copy=self
+    \\copy.n=99
+    \\copy}
+    \\}
+    \\let O:(T:type)->type=union{some:T,none,}
+    \\let inc:(x:int)->int=x+1
+    \\let dec:(x:int)->int=x-1
+    \\let read:(x:string)->string={let r=&x
+    \\return r}
+    \\let readArray:(x:[]int)->[]int={let r=&x
+    \\return r}
+    \\let option:(x:O(string))->O(string)={let r=&x
+    \\.some[r.!+"!"]}
+    \\let main:()={
+    \\let mut b=false
+    \\let rb=&b
+    \\rb=true
+    \\@println(rb,b)
+    \\let mut e:E=.a
+    \\let re=&e
+    \\re=.b
+    \\@println(re==.b,e==.b)
+    \\let mut s="a"+"b"
+    \\let rs=&s
+    \\let old=rs
+    \\rs+="c"
+    \\@println(read(rs),old,s)
+    \\let mut r=R[.s="old"+"!"]
+    \\let rr=&r
+    \\let saved=rr
+    \\rr.s+="!"
+    \\rr.n+=2
+    \\@println(rr.change().n,rr.n,saved.s)
+    \\rr=R[.s="new"+"!"]
+    \\@println(r.s,r.n)
+    \\let mut o:O(string)=.none[]
+    \\let ro=&o
+    \\ro=.some["yes"+"!"]
+    \\@println(match option(ro){.some=>|v|v
+    \\.none=>"bad"})
+    \\let mut a:[]int=[1,2]
+    \\let ra=&a
+    \\let copy=ra
+    \\ra+=[3]
+    \\ra[0]+=4
+    \\@println(readArray(ra)[0],copy[0],a.len)
+    \\let mut flags=[false]
+    \\let rf=&flags[0]
+    \\rf=true
+    \\@println(rf,flags[0])
+    \\let mut nums:[]int=[5]
+    \\let rn=&nums[0]
+    \\rn*=2
+    \\rn=inc(rn)
+    \\@println(nums[0])
+    \\let mut strings=["a"+"b"]
+    \\let rt=&strings[0]
+    \\let before=rt
+    \\rt+="!"
+    \\@println(rt,before,strings[0])
+    \\let mut records=[R[.s="one"]]
+    \\let item=&records[0]
+    \\let snapshot=item
+    \\item=R[.s="two"]
+    \\@println(snapshot.s,records[0].s)
+    \\let mut range=@as(int,0)..2
+    \\let rg=&range
+    \\rg=@as(int,1)..3
+    \\loop i in rg {@print(i)}
+    \\@println("")
+    \\let mut f=inc
+    \\let fun=&f
+    \\@println(fun(5))
+    \\fun=dec
+    \\@println(f(5))
+    \\let fixed=true
+    \\let readonly=&fixed
+    \\@println(readonly)
+    \\let fixedArray=["keep"+"!"]
+    \\let elem=&fixedArray[0]
+    \\@println(read(elem))
+    \\}
+;
+
+test "general borrowing runtime type matrix copied reads source free GC C11 O0 O3 OOM" {
+    var result = blk: {
+        var module = try Module.init(test_gpa, "general-borrow.nov", general_borrow_program);
+        defer module.deinit();
+        if (module.hasErrors()) {
+            var out = std.Io.Writer.Allocating.init(test_gpa);
+            defer out.deinit();
+            try Diagnostics.renderModule(&module, &out.writer);
+            std.debug.print("{s}", .{out.written()});
+        }
+        var result = try Lowering.lower(&module);
+        errdefer result.deinit();
+        if (module.hasErrors()) {
+            var out = std.Io.Writer.Allocating.init(test_gpa);
+            defer out.deinit();
+            try Diagnostics.renderModule(&module, &out.writer);
+            std.debug.print("{s}", .{out.written()});
+        }
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expect(result.lowering_complete);
+        break :blk result;
+    };
+    defer result.deinit();
+    try result.ir.verify();
+    const library = try emit(test_gpa, &result.ir, null);
+    defer test_gpa.free(library);
+    try std.testing.expect(std.mem.indexOf(u8, library, "generation") == null);
+    const c = try collectingTestProgram(library);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "true true\ntrue true\nabc ab abc\n99 3 old!\nnew! 1\nyes!!\n5 1 3\ntrue true\n11\nab! ab ab!\none two\n12\n6\n4\ntrue\nkeep!\n", "", mode);
+    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{general_borrow_program});
+}
+
+test "general borrowing snapshots before alias index RHS effects and readonly CFG slots" {
+    const source =
+        \\let use:(x:[]int)->[]int={let r=&x
+        \\if true {let copy=r
+        \\return copy} else {return r}}
+        \\let read:(x:bool)->bool={if x {let r=&x
+        \\if r {return r}}
+        \\return x}
+        \\let main:()={let mut a:[]int=[1,2]
+        \\let r=&a
+        \\let mut independent=r
+        \\independent[0]=99
+        \\r[0]={r=[7,8]
+        \\5}
+        \\r+={r=[9]
+        \\[3]}
+        \\let before=r[{r[0]=44
+        \\0}]
+        \\let saved=use(r)
+        \\r=[8]
+        \\@println(before,saved[0],saved[1],saved[2],independent[0],a[0],read(true),read(false))
+        \\let fixed="safe"+"!"
+        \\if false {let unused=&fixed
+        \\@println(unused)}
+        \\@println(fixed)
+        \\}
+    ;
+    const c = try arrayTestProgram(source);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "5 44 2 3 99 8 true false\nsafe!\n", "", mode);
+}
+
+test "general borrowing runtime allocation failure does not need reference validity machinery" {
+    const c = try arrayTestProgram("let main:()={let mut s=\"a\"\nlet r=&s\nr+=\"b\"\n@println(r)}");
+    defer test_gpa.free(c);
+    const exhausted = try std.mem.concat(test_gpa, u8, &.{ "#include <stdlib.h>\nstatic void *test_malloc(size_t n) { (void)n; return NULL; }\n#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n", c });
+    defer test_gpa.free(exhausted);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(exhausted, "typedef int nonempty_translation_unit;", 1, "", "panic: GC allocation failed\n", mode);
 }

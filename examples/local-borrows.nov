@@ -1,7 +1,75 @@
+let Mode = enum {
+    idle,
+    active,
+}
+
+let Counter = struct {
+    count: uint = 0,
+}
+
+let Value = union {
+    count: uint,
+    empty,
+}
+
+let double: (number: uint) -> uint = number * 2
+let triple: (number: uint) -> uint = number * 3
+
 let main: () = {
     let mut x: uint = 1
     let original = x
     let y = &x
     y += 1
     @println(x, original)
+
+    let mut enabled = false
+    let flag = &enabled
+    flag = true
+    @println(enabled)
+
+    let mut text = "hello"
+    let message = &text
+    message += " world"
+    let copied = message
+    @println(text, copied)
+
+    let mut mode = Mode.idle
+    let modeView = &mode
+    modeView = .active
+    @println(mode == .active)
+
+    let mut counter = Counter[]
+    let counterView = &counter
+    counterView.count = 5
+    @println(counter.count)
+
+    let mut numbers: []uint = [1]
+    let items = &numbers
+    let snapshot = items
+    items += [2]
+    items[0] = 3
+    @println(numbers[0], numbers.len, snapshot[0])
+
+    let mut range = 0..2
+    let selected = &range
+    selected = 1..=2
+    loop i in selected {
+        @print("{i} ")
+    }
+    @println()
+
+    let mut operation = double
+    let callback = &operation
+    callback = triple
+    @println(callback(3))
+
+    let mut result: Value = .empty[]
+    let resultView = &result
+    resultView = .count[7]
+    @println(
+        match resultView {
+            .count => |number| number
+            .empty => @as(uint, 0)
+        }
+    )
 }

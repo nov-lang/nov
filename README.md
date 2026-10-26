@@ -1269,7 +1269,11 @@ let main: () -> void = {
 
 ### Local static borrowing
 
-Mutable integer locals support direct borrows and arithmetic compound updates:
+Scoped borrows support every currently implemented non-void runtime value type:
+bool, integer, string, enum, struct, union, array, range and function values. Borrow
+a local with `let view = &value`, or a supported array element with
+`let view = &items[index]`. Readonly locals and parameters can be borrowed for
+reading; writes require a mutable owner.
 
 ```nov
 let mut x: uint = 1
@@ -1278,23 +1282,29 @@ y += 1
 @println(x) ; 2; access resumes after y's last use
 ```
 
-`+=`, `-=`, `*=`, `/=` and `%=` update the borrowed integer with its exact type
-and normal wrapping/division rules. The old value is read before evaluating the
-RHS once; terminal RHS paths skip the pending update. No heap allocation or runtime
-reference-validity check is needed. The owner cannot be accessed or borrowed again
-while the alias is live, including from a compound RHS. See
-[examples/local-borrows.nov](examples/local-borrows.nov).
+Assignment through a borrowed name replaces the **pointee**, not the fixed reference
+binding: `view = value` writes to its source. Supported operations are the ordinary
+ones for that type: integer arithmetic compounds, string `+=`, array append/index
+updates, record field updates, range replacement and function-value calls/replacement.
+Exact typing and arithmetic rules do not change. Compounds read the old value before
+RHS evaluation; a terminal RHS skips the pending operation/store.
 
-This integer slice permits compound targets only: bare reads such as `@println(y)`,
-`y += y`, reference copying/escaping and plain `y = value` remain unsupported.
-Immutable integer locals, non-integer scalar locals and explicit pointer annotations
-are not included. `let y` fixes the reference binding; `y += 1` updates the pointee,
-not the binding.
+Reading `view` yields an ordinary value. `let copy = view`, function arguments,
+returns and method receivers copy values according to existing rules: arrays have
+independent element storage, records copy by value and immutable strings share.
+These operations do **not** copy or escape a reference capability. In particular,
+passing a borrowed record to a by-value method does not give the method mutable
+access to the original. Reborrowing with `&view` remains unsupported.
 
-A direct local binding `let changed = &people[index]` borrows a nominal record
-element of a local array without copying it. Nested field reads/writes, subrecord
-replacement, integer field compounds and string field `+=` use the actual element.
-A mutable owner permits writes; an immutable owner permits field reads only. The
+Borrow creation itself does not clone or allocate its target. Ordinary value reads
+and operations may allocate as usual. No runtime reference-validity check is added.
+See [examples/local-borrows.nov](examples/local-borrows.nov) for the type matrix.
+
+A direct local binding `let changed = &people[index]` borrows an element of a local
+array without copying it. All currently supported element types are borrowable.
+Nested record field reads/writes, subrecord replacement, integer compounds, string
+`+=` and whole-element replacement use the actual element. A mutable owner permits
+writes; an immutable owner permits reads only. The
 reference binding itself is fixed—`let changed` does not make a mutable owner’s
 pointee immutable. No explicit pointer annotation or `let mut` reference is supported.
 
@@ -1318,15 +1328,16 @@ changed.score += 1
   The compiler rejects owner replacement inside that RHS. It also reserves the
   owner during borrow-index evaluation: accessing the owner from the index
   expression is conservatively rejected, including read-only access.
-- The index evaluates once, with native-int negative-index rules and ordinary
-  runtime bounds checking. The compiler retains a rooted owner slot and normalized
-  index, deriving field addresses only when used. There are no runtime generation
+- For element borrows, the index evaluates once with native-int negative-index
+  rules and ordinary runtime bounds checking. The compiler retains a stable owner
+  slot and optional normalized index, rooting managed owners and deriving addresses
+  only when used. There are no runtime generation
   or reference-invalidation checks, and no interior pointer is traced by GC.
-- References cannot escape, be copied/rebound, be returned or stored in aggregates,
-  be passed as arguments or be used directly as method receivers. Borrowed names
-  may only be record field bases or supported integer compound targets; field
-  reads yield ordinary copied values. General pointer
-  types/APIs, reborrows, temporary array owners and non-record elements remain deferred.
+- The reference capability cannot escape or be rebound; ordinary copied pointee
+  values may be returned, passed or stored. Void has no borrowable storage. Nonlocal
+  sources, explicit pointer annotations, reborrows, closure captures, temporary
+  owners and general pointer APIs remain unsupported. Array-valued struct fields,
+  nested arrays and other unsupported value types are not enabled by borrowing.
 - Normal array snapshots/copies remain independent, including snapshots evaluated
   before a later borrow inside an index or RHS. In-place borrowed writes do not
   alter earlier copies. See the unchanged borrowed-element form in
