@@ -7,6 +7,8 @@ const Ir = @import("Ir.zig");
 const BodyChecker = @import("BodyChecker.zig");
 
 const Compilation = @import("Compilation.zig");
+const Source = @import("Source.zig");
+const Dependencies = @import("Dependencies.zig");
 
 pub const Error = Sema.Error;
 
@@ -48,6 +50,7 @@ pub fn lowerCompilation(comp: *Compilation) Error!Sema {
             try std.fmt.allocPrint(comp.allocator, "{s}.{s}", .{ module.getDeclaration(owner).?.name, declaration.name }) else null;
         defer if (qualified) |name| comp.allocator.free(name);
         const function = try result.ir.addFunction(qualified orelse declaration.name, entry.type_id.?, declaration.name_span);
+        if (declaration.export_name) |name| try result.ir.setExportName(function, name);
         result.ir.functions.items[@backingInt(function)].public = declaration.public;
         result.ir.functions.items[@backingInt(function)].noreturn = entry.noreturn;
         entry.function = function;
@@ -105,6 +108,7 @@ pub fn lower(module: *Module) Error!Sema {
             try std.fmt.allocPrint(result.allocator, "{s}.{s}", .{ module.getDeclaration(owner).?.name, declaration.name }) else null;
         defer if (qualified) |name| result.allocator.free(name);
         const function = try result.ir.addFunction(qualified orelse declaration.name, entry.type_id.?, span);
+        if (declaration.export_name) |name| try result.ir.setExportName(function, name);
         result.ir.functions.items[@backingInt(function)].public = declaration.public;
         result.ir.functions.items[@backingInt(function)].noreturn = entry.noreturn;
         entry.function = function;
@@ -135,6 +139,64 @@ fn deferredDiagnostic(module: *const Module, declaration: Module.Declaration) Mo
     const ast = &module.source.ast;
     const tag = ast.nodes.items(.tag)[full.init_node];
     return if (tag == .number_literal or (tag == .negation and ast.nodes.items(.tag)[ast.nodes.items(.data)[full.init_node].rhs] == .number_literal)) .literal_needs_type else .unsupported_global_initializer;
+}
+
+fn testExportOwnership(allocator: std.mem.Allocator) !void {
+    var sema = blk: {
+        var module = try Module.init(allocator, "exports.nov", "@[export]\nlet add: (x: i32) -> i32 = x\n@[public]\n@[export(\"nov_\\x61dd\")]\nlet visible: () = {}\n@[public]\nlet internal: () = {}");
+        defer module.deinit();
+        var result = lower(&module) catch |err| {
+            try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+            return err;
+        };
+        errdefer result.deinit();
+        try std.testing.expect(!module.hasErrors());
+        break :blk result;
+    };
+    defer sema.deinit();
+    try std.testing.expect(sema.lowering_complete);
+    try std.testing.expectEqualStrings("add", sema.ir.functions.items[0].export_name.?);
+    try std.testing.expect(!sema.ir.functions.items[0].public);
+    try std.testing.expectEqualStrings("nov_add", sema.ir.functions.items[1].export_name.?);
+    try std.testing.expect(sema.ir.functions.items[1].public);
+    try std.testing.expect(sema.ir.functions.items[2].export_name == null);
+    try sema.ir.verify();
+}
+
+test "export lowering owns decoded names after source release and every allocation failure" {
+    try testExportOwnership(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testExportOwnership, .{});
+}
+
+fn testCompilationExportOwnership(allocator: std.mem.Allocator) !void {
+    var sema = blk: {
+        var comp = Compilation.init(allocator);
+        defer comp.deinit();
+        const root = try comp.addSource("/app/root.nov", "let imported = @import(\"lib.nov\")\nlet main: () = {}");
+        const imported = try comp.addSource("/app/lib.nov", "@[export(\"external_symbol\")]\nlet hidden: (x: uint) -> uint = x");
+        try testImport(&comp, root, "imported", imported, false);
+        var result = lowerCompilation(&comp) catch |err| {
+            for (comp.modules.items) |module| try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+            return err;
+        };
+        errdefer result.deinit();
+        try std.testing.expect(!comp.hasErrors());
+        break :blk result;
+    };
+    defer sema.deinit();
+    var found = false;
+    for (sema.ir.functions.items) |function| if (function.export_name) |name| {
+        try std.testing.expectEqualStrings("external_symbol", name);
+        try std.testing.expect(!function.public);
+        found = true;
+    };
+    try std.testing.expect(found);
+    try sema.ir.verify();
+}
+
+test "export compilation lowering owns imported nonpublic symbols under OOM" {
+    try testCompilationExportOwnership(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testCompilationExportOwnership, .{});
 }
 
 const demand_result_source =
@@ -1819,7 +1881,7 @@ test "lowering ownership and source diagnostic rollback survive allocation failu
     }
 }
 
-fn testImport(comp: *Compilation, source: @import("Source.zig").Id, name: []const u8, target: @import("Source.zig").Id, named: bool) !void {
+fn testImport(comp: *Compilation, source: Source.Id, name: []const u8, target: Source.Id, named: bool) !void {
     const module = comp.getModule(source).?;
     const local = module.lookup(name).?;
     try comp.imports.append(comp.allocator, .{ .declaration = comp.declaration_ids.get(.{ .source = source, .local = local }).?, .target = target, .named = named, .span = module.getDeclaration(local).?.name_span });
@@ -2091,7 +2153,7 @@ fn testCompilationGlobalDiagnostic(allocator: std.mem.Allocator, source: []const
     // Match the legacy CLI pipeline, including dependency diagnostics and spans.
     var standalone = try Module.init(allocator, "/standalone.nov", source);
     defer standalone.deinit();
-    var dependencies = try @import("Dependencies.zig").analyze(&standalone);
+    var dependencies = try Dependencies.analyze(&standalone);
     defer dependencies.deinit();
     if (!standalone.hasErrors()) {
         var lowered = try lower(&standalone);

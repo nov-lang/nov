@@ -50,6 +50,9 @@ pub fn analyzeAnnotations(module: *Module) Error!Sema {
     result.ir.source_len = @intCast(module.source.ast.source.len);
     try result.analyzeModuleAnnotations(module);
     try result.finalizeRecordLayouts(module);
+    var exports: std.StringHashMapUnmanaged(Module.Span) = .empty;
+    defer exports.deinit(result.allocator);
+    try result.validateExports(module, &exports);
     return result;
 }
 
@@ -179,6 +182,41 @@ fn analyzeModuleAnnotations(result: *Sema, module: *Module) Error!void {
     }
 }
 
+fn exportScalar(ty: Ir.Type, result: bool) bool {
+    return switch (ty) {
+        .void => result,
+        .boolean => true,
+        .integer => |integer| switch (integer.bits) {
+            8, 16, 32, 64 => true,
+            else => false,
+        },
+        else => false,
+    };
+}
+
+fn validateExports(self: *Sema, module: *Module, names: *std.StringHashMapUnmanaged(Module.Span)) Error!void {
+    for (module.declarations.items, 0..) |declaration, i| {
+        const name = declaration.export_name orelse continue;
+        const binding = try names.getOrPut(self.allocator, name);
+        if (binding.found_existing) {
+            try module.diagnostics.append(module.allocator, .{ .tag = .duplicate_export_name, .span = declaration.name_span, .related = binding.value_ptr.* });
+        } else binding.value_ptr.* = declaration.name_span;
+        const entry = &self.entries[self.entryIndex(module, @fromBackingInt(@intCast(i)))];
+        const ty = self.ir.getType(entry.type_id orelse continue).?;
+        var valid = ty == .function;
+        if (ty == .function) {
+            valid = exportScalar(self.ir.getType(ty.function.result).?, true);
+            for (ty.function.params) |param| {
+                if (!exportScalar(self.ir.getType(param).?, false)) valid = false;
+            }
+        }
+        if (!valid) {
+            try module.diagnostics.append(module.allocator, .{ .tag = .invalid_export_signature, .span = declaration.name_span });
+            entry.status = .failed;
+        }
+    }
+}
+
 fn validateRecordLayouts(self: *Sema, root: *Module) Error!bool {
     if (try self.ir.recordLayoutIssue()) |issue| {
         const owner = if (self.compilation) |comp| comp.getModule(issue.span.source).? else root;
@@ -285,6 +323,9 @@ pub fn analyzeCompilation(comp: *Compilation) Error!Sema {
     if (comp.hasErrors()) return result;
     for (comp.modules.items) |module| try result.analyzeModuleAnnotations(module);
     try result.finalizeRecordLayouts(comp.modules.items[0]);
+    var exports: std.StringHashMapUnmanaged(Module.Span) = .empty;
+    defer exports.deinit(result.allocator);
+    for (comp.modules.items) |module| try result.validateExports(module, &exports);
     if (comp.hasErrors()) return result;
     while (true) {
         try result.syncEntries(comp.modules.items[0]);
@@ -447,6 +488,140 @@ fn checkLiteral(self: *Sema, module: *Module, index: usize, initializer: Ast.Nod
             self.entries[self.entryIndex(module, @fromBackingInt(@intCast(index)))].status = .constant_checked;
         },
     }
+}
+
+test "export ABI integer widths are a finite allowlist for parameters and results" {
+    for ([_]std.builtin.Signedness{ .signed, .unsigned }) |signedness| {
+        for (0..130) |bits| {
+            const ty: Ir.Type = .{ .integer = .{ .signedness = signedness, .bits = @intCast(bits) } };
+            const allowed = bits == 8 or bits == 16 or bits == 32 or bits == 64;
+            try std.testing.expectEqual(allowed, exportScalar(ty, false));
+            try std.testing.expectEqual(allowed, exportScalar(ty, true));
+        }
+    }
+    try std.testing.expect(exportScalar(.boolean, false));
+    try std.testing.expect(exportScalar(.boolean, true));
+    try std.testing.expect(!exportScalar(.void, false));
+    try std.testing.expect(exportScalar(.void, true));
+    try std.testing.expect(!exportScalar(.string, false));
+    try std.testing.expect(!exportScalar(.string, true));
+}
+
+test "export ABI validates resolved aliases native integers and unused signatures" {
+    for ([_][]const u8{ "bool", "i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "int", "uint" }) |ty| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let Alias = {s}\n@[export]\nlet identity: (x: Alias) -> Alias = x", .{ty});
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "abi.nov", source);
+        defer module.deinit();
+        var sema = try analyzeAnnotations(&module);
+        defer sema.deinit();
+        try std.testing.expect(!module.hasErrors());
+    }
+    for ([_][]const u8{ "i128", "u128", "string", "[]i32", "() -> i32", "R", "E" }) |ty| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let R = struct {{ x: i32, }}\nlet E = enum {{ a, }}\n@[export]\nlet unused: (x: {s}) -> {s} = x", .{ ty, ty });
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "abi.nov", source);
+        defer module.deinit();
+        try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
+        var sema = try analyzeAnnotations(&module);
+        defer sema.deinit();
+        try std.testing.expect(module.hasErrors());
+        try std.testing.expectEqual(Module.Diagnostic.Tag.invalid_export_signature, module.diagnostics.items[0].tag);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+    }
+    for ([_][]const u8{
+        "@[export]\nlet bad: (x: void) = {}",
+        "@[export]\nlet bad: () -> string = \"text\"",
+        "@[export]\nlet bad: () -> i128 = 0",
+        "@[export]\nlet bad: () -> () = {}",
+    }) |bad| {
+        var rejected = try Module.init(std.testing.allocator, "result-abi.nov", bad);
+        defer rejected.deinit();
+        var checked = try analyzeAnnotations(&rejected);
+        defer checked.deinit();
+        try std.testing.expect(rejected.hasErrors());
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{bad});
+    }
+    const source = "@[export]\nlet unit: () = {}\n@[export]\n@[noreturn]\nlet stop: () = loop {}";
+    var module = try Module.init(std.testing.allocator, "abi.nov", source);
+    defer module.deinit();
+    var sema = try analyzeFunctions(&module);
+    defer sema.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+}
+
+fn testExportSpecializationOwnership(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "export-specializations.nov",
+        \\@[export("owned_symbol")]
+        \\let exported: () = {}
+        \\let G: (T: type) -> type = struct {
+        \\    value: T,
+        \\    let method: () = {}
+        \\}
+        \\let Concrete = G(i32)
+    );
+    defer module.deinit();
+    const original_count = module.declarations.items.len;
+    for (0..2) |_| {
+        var sema = analyzeAnnotations(&module) catch |err| {
+            try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+            return err;
+        };
+        defer sema.deinit();
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expect(module.declarations.items.len > original_count);
+        for (module.declarations.items[original_count..]) |declaration| {
+            try std.testing.expect(declaration.concrete_type != null);
+            try std.testing.expect(declaration.export_name == null);
+        }
+        try std.testing.expectEqualStrings("owned_symbol", module.getDeclaration(module.lookup("exported").?).?.export_name.?);
+    }
+    module.clearSpecializations();
+    try std.testing.expectEqual(original_count, module.declarations.items.len);
+    try std.testing.expectEqualStrings("owned_symbol", module.getDeclaration(module.lookup("exported").?).?.export_name.?);
+}
+
+test "export ownership survives repeated generic specialization clearing and OOM" {
+    try testExportSpecializationOwnership(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testExportSpecializationOwnership, .{});
+}
+
+fn testExportDuplicates(allocator: std.mem.Allocator) !void {
+    var comp = Compilation.init(allocator);
+    defer comp.deinit();
+    const root = try comp.addSource("/app/root.nov", "let imported = @import(\"lib.nov\")\n@[export(\"shared_symbol\")]\nlet first: () = {}");
+    const imported = try comp.addSource("/app/lib.nov", "@[export(\"shared_symbol\")]\nlet second: () = {}");
+    const module = comp.getModule(root).?;
+    const local = module.lookup("imported").?;
+    try comp.imports.append(allocator, .{ .declaration = comp.declaration_ids.get(.{ .source = root, .local = local }).?, .target = imported, .named = false, .span = module.getDeclaration(local).?.name_span });
+    var sema = analyzeCompilation(&comp) catch |err| {
+        for (comp.modules.items) |m| try std.testing.expectEqual(@as(usize, 0), m.diagnostics.items.len);
+        return err;
+    };
+    defer sema.deinit();
+    const diagnostic = comp.getModule(imported).?.diagnostics.items[0];
+    try std.testing.expectEqual(Module.Diagnostic.Tag.duplicate_export_name, diagnostic.tag);
+    try std.testing.expectEqual(imported, diagnostic.span.source);
+    try std.testing.expectEqual(root, diagnostic.related.?.source);
+    var rendered = std.Io.Writer.Allocating.init(allocator);
+    defer rendered.deinit();
+    Diagnostics.renderCompilation(&comp, &rendered.writer) catch return error.OutOfMemory;
+    try std.testing.expect(std.mem.indexOf(u8, rendered.written(), "/app/lib.nov:2:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered.written(), "/app/root.nov:3:") != null);
+}
+
+test "export duplicates across imported sources render qualified related spans and roll back OOM" {
+    try testExportDuplicates(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testExportDuplicates, .{});
+    const source = "@[export(\"shared_symbol\")]\nlet first: () = {}\n@[export(\"shared_symbol\")]\nlet second: () = {}";
+    var module = try Module.init(std.testing.allocator, "duplicate.nov", source);
+    defer module.deinit();
+    var sema = try analyzeAnnotations(&module);
+    defer sema.deinit();
+    try std.testing.expectEqual(Module.Diagnostic.Tag.duplicate_export_name, module.diagnostics.items[0].tag);
+    try std.testing.expect(module.diagnostics.items[0].related != null);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
 }
 
 test "annotated scalar ascriptions match inferred pairs and preserve plain literal groups" {

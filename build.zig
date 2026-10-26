@@ -115,6 +115,9 @@ fn addGcTests(b: *std.Build, test_step: *std.Build.Step) void {
 
 fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
+    const export_tests = b.step("test-cli-exports", "Run export CLI and separate-TU C ABI tests");
+    addExportCliTests(b, exe, export_tests);
+    test_step.dependOn(export_tests);
     addFieldMutationCliTests(b, exe, test_step, fixtures);
     addGenericStructCliTests(b, exe, test_step, fixtures);
     addRangeValueCliTests(b, exe, test_step, fixtures);
@@ -1385,6 +1388,158 @@ fn addOptionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *st
             run.expectStdErrEqual("");
             test_step.dependOn(&run.step);
         }
+    }
+}
+
+fn addExportCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    const fixtures = b.addWriteFiles();
+    _ = fixtures.add("exports.nov", @embedFile("examples/exports.nov"));
+
+    _ = fixtures.add("default.nov", "@[export]\nlet exact: (x: i32) -> i32 = x\n");
+    _ = fixtures.add("custom.nov", "@[export(\"custom_exact\")]\nlet renamed: (x: bool) -> bool = x\n");
+    const library = fixtures.add("library/std.nov", "@[export]\nlet hidden: (x: i32) -> i32 = x\n" ++
+        "@[export(\"custom_hidden\")]\nlet hiddenCustom: (x: bool) -> bool = x\n" ++
+        "@[public]\n@[export(\"api_visible\")]\nlet visible: (x: i32) -> i32 = hidden(x)\n");
+    for ([_][]const u8{ "file", "named" }) |kind| {
+        const imported = if (std.mem.eql(u8, kind, "file")) "library/std.nov" else "std";
+        for ([_][]const u8{ "hidden", "hiddenCustom", "visible" }) |member| {
+            _ = fixtures.add(b.fmt("{s}-{s}.nov", .{ kind, member }), b.fmt(
+                "let api = @import(\"{s}\")\nlet main: () = @println(api.{s}({s}))\n",
+                .{ imported, member, if (std.mem.eql(u8, member, "hiddenCustom")) "true" else "7" },
+            ));
+        }
+    }
+    _ = fixtures.add("bad-name.nov", "@[export(\"not-a-name\")]\nlet f: () -> i32 = 1\n");
+    _ = fixtures.add("bad-abi.nov", "@[export]\nlet f: (x: string) -> string = x\n");
+    _ = fixtures.add("duplicate.nov", "@[export(\"same\")]\nlet f: () -> i32 = 1\n@[export(\"same\")]\nlet g: () -> i32 = 2\n");
+    // Default names are exact too, so this collides with helper's generated name.
+    _ = fixtures.add("collision.nov", "let helper: () -> i32 = 1\n@[export]\nlet nov_helper: () -> i32 = 2\n");
+    const Case = struct { args: []const []const u8, diagnostic: ?[]const u8 = null };
+    const cases = [_]Case{
+        .{ .args = &.{ "check", "--semantic", "exports.nov" } },
+        .{ .args = &.{ "fmt", "--check", "exports.nov" } },
+
+        .{ .args = &.{ "check", "--semantic", "default.nov", "custom.nov" } },
+        .{ .args = &.{ "fmt", "--check", "default.nov" } },
+        .{ .args = &.{ "fmt", "--check", "custom.nov" } },
+        .{ .args = &.{ "emit-c", "exports.nov" }, .diagnostic = "requires a root function 'main'" },
+        .{ .args = &.{ "build", "exports.nov" }, .diagnostic = "requires a root function 'main'" },
+        .{ .args = &.{ "run", "exports.nov" }, .diagnostic = "requires a root function 'main'" },
+        .{ .args = &.{ "emit-c", "--library", "bad-name.nov" }, .diagnostic = "bad-name.nov:1:1: error: export name" },
+        .{ .args = &.{ "emit-c", "--library", "bad-abi.nov" }, .diagnostic = "export ABI supports only" },
+        .{ .args = &.{ "emit-c", "--library", "duplicate.nov" }, .diagnostic = "first export of this symbol here" },
+        .{ .args = &.{ "emit-c", "--library", "collision.nov" }, .diagnostic = "export symbol conflicts with a generated function name" },
+    };
+    for (cases) |case| {
+        const run = b.addRunArtifact(exe);
+        run.step.name = b.fmt("CLI exports: {s} {s}", .{ case.args[0], case.args[case.args.len - 1] });
+        run.setCwd(fixtures.getDirectory());
+        run.addArgs(case.args);
+        run.expectExitCode(if (case.diagnostic != null) 1 else 0);
+        run.expectStdOutEqual("");
+        if (case.diagnostic) |message| run.expectStdErrMatch(message) else run.expectStdErrEqual("");
+        test_step.dependOn(&run.step);
+    }
+    for ([_][]const u8{ "check", "fmt", "build", "run", "exports.nov" }) |command| {
+        const run = b.addRunArtifact(exe);
+        run.step.name = b.fmt("CLI exports: reject --library for {s}", .{command});
+        run.setCwd(fixtures.getDirectory());
+        run.addArgs(&.{ command, "--library" });
+        if (!std.mem.eql(u8, command, "exports.nov")) run.addArg("exports.nov");
+        run.expectExitCode(1);
+        run.expectStdOutEqual("");
+        run.expectStdErrEqual("error: --library requires the emit-c command\n");
+        test_step.dependOn(&run.step);
+    }
+    for ([_][]const u8{ "file", "named" }) |kind| {
+        for ([_][]const u8{ "hidden", "hiddenCustom", "visible" }) |member| {
+            const run = b.addRunArtifact(exe);
+            run.step.name = b.fmt("CLI exports: {s} import {s}", .{ kind, member });
+            run.setCwd(fixtures.getDirectory());
+            run.addArgs(&.{ "check", "--semantic", b.fmt("{s}-{s}.nov", .{ kind, member }), "--lib-dir" });
+            run.addDirectoryArg(library.dirname());
+            const visible = std.mem.eql(u8, member, "visible");
+            run.expectExitCode(if (visible) 0 else 1);
+            run.expectStdOutEqual("");
+            if (visible) run.expectStdErrEqual("") else run.expectStdErrMatch(b.fmt("{s}-{s}.nov:2:", .{ kind, member }));
+            test_step.dependOn(&run.step);
+        }
+    }
+    const package = b.addWriteFiles();
+    const installed_exe = package.addCopyFile(exe.getEmittedBin(), b.fmt("bin/{s}", .{exe.out_filename}));
+    _ = package.addCopyFile(library, "lib/nov/std.nov");
+    for ([_][]const u8{ "check", "emit-c" }) |command| {
+        const installed = std.Build.Step.Run.create(b, b.fmt("CLI exports: installed default library {s}", .{command}));
+        installed.addFileArg(installed_exe);
+        installed.setCwd(fixtures.getDirectory());
+        installed.addArg(command);
+        installed.addArg(if (std.mem.eql(u8, command, "check")) "--semantic" else "--library");
+        installed.addArg("named-visible.nov");
+        installed.expectExitCode(0);
+        installed.expectStdErrEqual("");
+        if (std.mem.eql(u8, command, "check")) installed.expectStdOutEqual("") else _ = installed.captureStdOut(.{});
+        test_step.dependOn(&installed.step);
+    }
+    const override = std.Build.Step.Run.create(b, "CLI exports: --library preserves explicit lib-dir override");
+    override.addFileArg(installed_exe);
+    override.setCwd(fixtures.getDirectory());
+    override.addArgs(&.{ "emit-c", "--library", "named-visible.nov", "--lib-dir", "missing-library" });
+    override.expectExitCode(1);
+    override.expectStdOutEqual("");
+    override.expectStdErrMatch("cannot load imported source: FileNotFound");
+    test_step.dependOn(&override.step);
+    const client = fixtures.add("client.c",
+        \\#include <stdbool.h>
+        \\#include <stdint.h>
+        \\extern int32_t add_i32(int32_t, int32_t);
+        \\extern uint64_t api_select_u64(bool, uint64_t, uint64_t);
+        \\extern bool invert(bool);
+        \\int main(void) {
+        \\    if (add_i32(-40, 2) != -38) return 1;
+        \\    if (api_select_u64(true, UINT64_MAX, 7) != UINT64_MAX) return 2;
+        \\    if (api_select_u64(false, UINT64_MAX, 7) != 7) return 3;
+        \\    if (!invert(false) || invert(true)) return 4;
+        \\    return 0;
+        \\}
+        \\
+    );
+    const emit = b.addRunArtifact(exe);
+    emit.step.name = "CLI exports: emit library without main";
+    emit.setCwd(fixtures.getDirectory());
+    emit.addArgs(&.{ "emit-c", "--library", "exports.nov", "--lib-dir" });
+    emit.addDirectoryArg(library.dirname());
+    emit.expectExitCode(0);
+    emit.expectStdErrEqual("");
+    const c_source = emit.captureStdOut(.{});
+    const inspect = b.addCheckFile(c_source, .{ .expected_matches = &.{ "int32_t add_i32(", "uint64_t api_select_u64(", "bool invert(" } });
+    inspect.setName("CLI exports: raw exact scalar symbols");
+    test_step.dependOn(&inspect.step);
+    for ([_][]const u8{ "-O0", "-O3" }) |optimization| {
+        const compile = b.addSystemCommand(&.{ b.graph.zig_exe, "cc", "-x", "c", "-std=c11", "-Wall", "-Wextra", "-Werror", optimization });
+        if (std.mem.eql(u8, optimization, "-O0")) compile.addArg("-g");
+        compile.addFileArg(c_source);
+        compile.addFileArg(client);
+        compile.addArg("-o");
+        const binary = compile.addOutputFileArg(if (exe.root_module.resolved_target.?.result.os.tag == .windows) "exports.exe" else "exports");
+        const execute = std.Build.Step.Run.create(b, b.fmt("CLI exports: separate-TU C ABI {s}", .{optimization}));
+        execute.addFileArg(binary);
+        execute.expectExitCode(0);
+        execute.expectStdOutEqual("");
+        execute.expectStdErrEqual("");
+        test_step.dependOn(&execute.step);
+    }
+    for ([_][]const u8{ "-O0", "-O3" }) |optimization| {
+        const compile = b.addSystemCommand(&.{ b.graph.zig_exe, "cc", "-x", "c", "-std=c11", "-Wall", "-Wextra", "-Wpedantic", "-Werror", "-fsanitize=undefined", "-fno-sanitize-recover=all", optimization });
+        compile.addFileArg(c_source);
+        compile.addFileArg(b.path("examples/exports.c"));
+        compile.addArg("-o");
+        const binary = compile.addOutputFileArg(if (exe.root_module.resolved_target.?.result.os.tag == .windows) "example.exe" else "example");
+        const execute = std.Build.Step.Run.create(b, b.fmt("CLI exports: checked-in example {s}", .{optimization}));
+        execute.addFileArg(binary);
+        execute.expectExitCode(0);
+        execute.expectStdOutEqual("Sum: 42\nSelected: 42\nInverted: true\nArea: 42\nPerimeter: 26\n");
+        execute.expectStdErrEqual("");
+        test_step.dependOn(&execute.step);
     }
 }
 

@@ -4,6 +4,9 @@ const Ast = @import("Ast.zig");
 const Source = @import("Source.zig");
 const primitives = @import("primitives.zig");
 const Compilation = @import("Compilation.zig");
+const Literal = @import("Literal.zig");
+const string_literal = @import("string_literal.zig");
+const ExportNames = @import("ExportNames.zig");
 const Module = @This();
 
 allocator: std.mem.Allocator,
@@ -29,6 +32,8 @@ pub const Declaration = struct {
     container: ?DeclId = null,
     public: bool = false,
     noreturn: bool = false,
+    /// Owned by this module; absent on generic templates and specializations.
+    export_name: ?[]const u8 = null,
     /// Analysis-local canonical container TypeId for a specialized method.
     concrete_type: ?u32 = null,
     specialization_depth: usize = 0,
@@ -45,6 +50,11 @@ pub const Diagnostic = struct {
         unsupported_borrow,
         duplicate_name,
         unsupported_attribute,
+        invalid_export_declaration,
+        invalid_export_attribute,
+        invalid_export_name,
+        invalid_export_signature,
+        duplicate_export_name,
         noreturn_result,
         noreturn_return,
         noreturn_completion,
@@ -151,7 +161,10 @@ pub fn initSource(allocator: std.mem.Allocator, id: Source.Id, path: []const u8,
         .source = try Source.init(allocator, id, path, text),
     };
     errdefer module.source.deinit();
-    errdefer module.declarations.deinit(allocator);
+    errdefer {
+        for (module.declarations.items) |decl| if (decl.export_name) |name| allocator.free(name);
+        module.declarations.deinit(allocator);
+    }
     errdefer module.diagnostics.deinit(allocator);
     errdefer module.names.deinit(allocator);
     // Recovered ASTs remain available for syntax diagnostics, but must not feed
@@ -165,6 +178,7 @@ pub fn initSource(allocator: std.mem.Allocator, id: Source.Id, path: []const u8,
 
 pub fn deinit(self: *Module) void {
     self.names.deinit(self.allocator);
+    for (self.declarations.items) |decl| if (decl.export_name) |name| self.allocator.free(name);
     self.declarations.deinit(self.allocator);
     self.diagnostics.deinit(self.allocator);
     self.source.deinit();
@@ -393,15 +407,113 @@ fn collectDeclaration(self: *Module, node: Ast.Node.Index, container: ?DeclId) (
         };
         var public = false;
         var noreturn_annotation = false;
+        var export_name: ?[]const u8 = null;
+        errdefer if (export_name) |symbol| self.allocator.free(symbol);
+        var export_seen = false;
         for (declaration.attributes) |attribute| {
             const data = self.source.ast.nodes.items(.data)[attribute];
-            if (self.source.ast.nodes.items(.tag)[attribute] == .attr_one and data.rhs == 0 and std.mem.eql(u8, self.source.ast.tokenSlice(data.lhs), "public") and !declaration.ast.is_mutable and !public) {
+            if (std.mem.eql(u8, self.source.ast.tokenSlice(data.lhs), "export")) {
+                const span = self.tokenSpan(self.source.ast.firstToken(attribute));
+                if (export_seen or self.source.ast.nodes.items(.tag)[attribute] != .attr_one) {
+                    try self.diagnostics.append(self.allocator, .{ .tag = .invalid_export_attribute, .span = span });
+                    continue;
+                }
+                export_seen = true;
+                if (container != null or declaration.ast.is_mutable or is_record or is_generic or declaration.ast.init_node == 0 or self.source.ast.fullFnProto(declaration.ast.type_node) == null) {
+                    try self.diagnostics.append(self.allocator, .{ .tag = .invalid_export_declaration, .span = span });
+                    continue;
+                }
+                if (data.rhs == 0) {
+                    export_name = try self.allocator.dupe(u8, name);
+                } else {
+                    if (self.source.ast.nodes.items(.tag)[data.rhs] != .string_literal) {
+                        try self.diagnostics.append(self.allocator, .{ .tag = .invalid_export_attribute, .span = span });
+                        continue;
+                    }
+                    const bytes = self.source.ast.getNodeSource(data.rhs);
+                    if (Literal.hasInterpolation(bytes)) {
+                        try self.diagnostics.append(self.allocator, .{ .tag = .invalid_export_attribute, .span = span });
+                        continue;
+                    }
+                    var decoded = std.Io.Writer.Allocating.init(self.allocator);
+                    defer decoded.deinit();
+                    switch (string_literal.parseWrite(&decoded.writer, bytes) catch return error.OutOfMemory) {
+                        .success => {},
+                        .failure => {
+                            try self.diagnostics.append(self.allocator, .{ .tag = .invalid_export_attribute, .span = span });
+                            continue;
+                        },
+                    }
+                    export_name = try self.allocator.dupe(u8, decoded.written());
+                }
+                if (!ExportNames.validName(export_name.?)) {
+                    self.allocator.free(export_name.?);
+                    export_name = null;
+                    try self.diagnostics.append(self.allocator, .{ .tag = .invalid_export_name, .span = span });
+                }
+            } else if (self.source.ast.nodes.items(.tag)[attribute] == .attr_one and data.rhs == 0 and std.mem.eql(u8, self.source.ast.tokenSlice(data.lhs), "public") and !declaration.ast.is_mutable and !public) {
                 public = true;
             } else if (self.source.ast.nodes.items(.tag)[attribute] == .attr_one and data.rhs == 0 and std.mem.eql(u8, self.source.ast.tokenSlice(data.lhs), "noreturn") and self.source.ast.fullFnProto(declaration.ast.type_node) != null and !declaration.ast.is_mutable and !noreturn_annotation) {
                 noreturn_annotation = true;
             } else try self.diagnostics.append(self.allocator, .{ .tag = .unsupported_attribute, .span = self.tokenSpan(self.source.ast.firstToken(attribute)) });
         }
-        try self.declarations.append(self.allocator, .{ .name = name, .name_span = name_span, .node = node, .container = container, .is_record = is_record, .is_generic = is_generic, .is_type_alias = is_record or is_this_alias, .public = public, .noreturn = noreturn_annotation });
+        try self.declarations.append(self.allocator, .{ .name = name, .name_span = name_span, .node = node, .container = container, .is_record = is_record, .is_generic = is_generic, .is_type_alias = is_record or is_this_alias, .public = public, .noreturn = noreturn_annotation, .export_name = export_name });
+    }
+}
+
+test "export attributes own decoded names independently of visibility" {
+    const source = "@[export]\nlet add: (a: i32) -> i32 = a\n@[public]\n@[export(\"nov_\\x61dd\")]\nlet other: () = {}\n";
+    var module = try Module.init(std.testing.allocator, "exports.nov", source);
+    defer module.deinit();
+    try std.testing.expect(!module.hasErrors());
+    const add = module.getDeclaration(module.lookup("add").?).?;
+    try std.testing.expect(!add.public);
+    try std.testing.expectEqualStrings("add", add.export_name.?);
+    try std.testing.expect(add.export_name.?.ptr != add.name.ptr);
+    const other = module.getDeclaration(module.lookup("other").?).?;
+    try std.testing.expect(other.public);
+    try std.testing.expectEqualStrings("nov_add", other.export_name.?);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+}
+
+test "export rejects C11 external library names even without emitted headers" {
+    for ([_][]const u8{ "sin", "sqrt", "time", "signal" }) |symbol| {
+        for ([_]bool{ false, true }) |explicit| {
+            const source = if (explicit)
+                try std.fmt.allocPrint(std.testing.allocator, "@[export(\"{s}\")]\nlet ordinary: () = {{}}", .{symbol})
+            else
+                try std.fmt.allocPrint(std.testing.allocator, "@[export]\nlet {s}: () = {{}}", .{symbol});
+            defer std.testing.allocator.free(source);
+            var module = try Module.init(std.testing.allocator, "reserved-library-export.nov", source);
+            defer module.deinit();
+            try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
+            try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+            try std.testing.expectEqual(Diagnostic.Tag.invalid_export_name, module.diagnostics.items[0].tag);
+            try std.testing.expect(module.declarations.items[0].export_name == null);
+            try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+        }
+    }
+}
+
+test "export rejects misplaced repeated malformed interpolated and reserved attributes" {
+    for ([_][]const u8{
+        "@[export]\nlet value = true",
+        "@[export]\nlet mut value: () = {}",
+        "@[export]\nlet Alias = i32",
+        "@[export]\nlet Record = struct { x: i32, }",
+        "@[export]\nlet Generic: (T: type) -> type = struct { x: T, }",
+        "let Record = struct { @[export]\nlet method: () = {}\n}",
+        "@[export]\n@[export]\nlet f: () = {}",
+        "@[export(1)]\nlet f: () = {}",
+        "@[export(\"a\", \"b\")]\nlet f: () = {}",
+        "@[export(\"{value}\")]\nlet f: () = {}",
+        "@[export(\"bad-name\")]\nlet f: () = {}",
+        "@[export(\"printf\")]\nlet f: () = {}",
+    }) |source| {
+        var module = try Module.init(std.testing.allocator, "bad-export.nov", source);
+        defer module.deinit();
+        try std.testing.expect(module.hasErrors());
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
     }
 }
 
@@ -603,7 +715,7 @@ test "unsupported attributes and quoted names diagnose rather than silently bind
     defer module.deinit();
     try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
     try std.testing.expectEqual(@as(usize, 3), module.diagnostics.items.len);
-    try std.testing.expectEqual(Diagnostic.Tag.unsupported_attribute, module.diagnostics.items[0].tag);
+    try std.testing.expectEqual(Diagnostic.Tag.invalid_export_declaration, module.diagnostics.items[0].tag);
     try std.testing.expectEqual(Diagnostic.Tag.unsupported_attribute, module.diagnostics.items[1].tag);
     try std.testing.expectEqual(Diagnostic.Tag.unsupported_name, module.diagnostics.items[2].tag);
     try std.testing.expect(module.lookup("decorated") != null);

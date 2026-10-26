@@ -103,6 +103,11 @@ fn renderModuleWithSources(module: *const Module, compilation: ?*const Compilati
             .match_covered_union_prong => try writer.writeAll("union match prong is already covered by earlier prongs"),
             .invalid_match_capture => try writer.writeAll("payload capture requires a single union variant pattern and an immutable named binding"),
             .unsupported_attribute => try writer.writeAll("unsupported, misplaced or duplicate attribute; @[public] requires an immutable declaration, @[noreturn] requires a function"),
+            .invalid_export_declaration => try writer.writeAll("@[export] requires an ordinary immutable top-level function with a body"),
+            .invalid_export_attribute => try writer.writeAll("@[export] accepts no argument or one ordinary non-interpolated string literal and cannot be repeated"),
+            .invalid_export_name => try writer.writeAll("export name must be a nonreserved ASCII C11 identifier outside the backend namespaces"),
+            .invalid_export_signature => try writer.writeAll("export ABI supports only bool and 8/16/32/64-bit integers, with void allowed only as the result"),
+            .duplicate_export_name => try writer.writeAll("duplicate exported symbol"),
             .noreturn_result => try writer.writeAll("@[noreturn] function must return void"),
             .noreturn_return => try writer.writeAll("return is forbidden in an @[noreturn] function"),
             .noreturn_completion => try writer.writeAll("@[noreturn] function may complete normally"),
@@ -173,6 +178,7 @@ fn renderModuleWithSources(module: *const Module, compilation: ?*const Compilati
         const note: ?[]const u8 = switch (diagnostic.tag) {
             .borrow_conflict, .borrow_escape => "borrow originates here",
             .duplicate_name => "first declaration here",
+            .duplicate_export_name => "first export of this symbol here",
             .value_cycle, .type_alias_cycle => "declaration in this cycle",
             .type_alias_limit, .not_a_value => "type alias declared here",
             .duplicate_parameter => "first parameter here",
@@ -492,7 +498,7 @@ test "module unsupported attributes and quoted names render semantic diagnostics
     defer output.deinit();
     try renderModule(&module, &output.writer);
     try std.testing.expectEqualStrings(
-        "unsupported.nov:1:1: error: unsupported, misplaced or duplicate attribute; @[public] requires an immutable declaration, @[noreturn] requires a function\n@[export]\n^~\n" ++
+        "unsupported.nov:1:1: error: @[export] requires an ordinary immutable top-level function with a body\n@[export]\n^~\n" ++
             "unsupported.nov:3:5: error: quoted identifiers are not supported in semantic analysis yet\nlet @\"quoted\" = 2\n    ^~~~~~~~~\n",
         output.written(),
     );

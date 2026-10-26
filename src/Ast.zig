@@ -704,7 +704,7 @@ pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
     const datas = self.nodes.items(.data);
     const main_tokens = self.nodes.items(.main_token);
     var n = node;
-    var end_offset: TokenIndex = 0;
+    const end_offset: TokenIndex = 0;
     while (true) switch (tags[n]) {
         .root => return @intCast(self.tokens.len - 1),
         .range => {
@@ -835,22 +835,7 @@ pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
             n = if (datas[n].rhs != 0) datas[n].rhs else datas[n].lhs;
         },
 
-        .attr_one => {
-            if (datas[n].rhs == 0) return main_tokens[n] + 2 + end_offset;
-            end_offset += 1; // for the rbracket
-            if (datas[n].rhs == 0) {
-                return main_tokens[n] + end_offset;
-            }
-            end_offset += 1; // for the rparen
-            n = datas[n].rhs;
-        },
-
-        .attr => {
-            const extra = self.extraData(datas[n].rhs, Node.SubRange);
-            assert(extra.end - extra.start > 0);
-            end_offset += 2; // rparen rbracket
-            n = self.extra_data[extra.end - 1]; // last attribute
-        },
+        .attr_one, .attr => return self.matchingDelimiter(main_tokens[n]) + end_offset,
 
         .match => return self.matchingDelimiter(self.fullMatch(n).?.ast.lbrace) + end_offset,
     };
@@ -864,13 +849,13 @@ fn matchingDelimiter(self: Ast, opening: TokenIndex) TokenIndex {
     const close_tag: Token.Tag = switch (open_tag) {
         .l_brace => .r_brace,
         .l_paren => .r_paren,
-        .l_bracket => .r_bracket,
+        .l_bracket, .at_sign_l_bracket => .r_bracket,
         else => unreachable,
     };
     var depth: usize = 1;
     var token = opening + 1;
     while (token < token_tags.len) : (token += 1) {
-        if (token_tags[token] == open_tag) {
+        if (token_tags[token] == open_tag or (open_tag == .at_sign_l_bracket and token_tags[token] == .l_bracket)) {
             depth += 1;
         } else if (token_tags[token] == close_tag) {
             depth -= 1;

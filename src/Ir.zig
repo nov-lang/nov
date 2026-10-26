@@ -3,6 +3,7 @@ const TestAllocations = @import("TestAllocations.zig");
 const Ir = @This();
 const Source = @import("Source.zig");
 const BorrowCheck = @import("BorrowCheck.zig");
+const ExportNames = @import("ExportNames.zig");
 
 // Integer widths describe resolved values; no literal defaults or overflow policy
 // live here. Source lengths and qualified spans remain valid after AST release.
@@ -32,6 +33,7 @@ pub const Function = struct {
     body: ?Body = null,
     public: bool = false,
     noreturn: bool = false,
+    export_name: ?[]const u8 = null,
 };
 /// `result` is either a continuing value or the final terminal instruction.
 pub const Body = struct { instructions: []const Instruction, result: ValueId };
@@ -193,6 +195,9 @@ pub const VerifyError = ValidationError || error{
     InvalidFunctionType,
     InvalidFunctionName,
     DuplicateFunctionName,
+    InvalidExportName,
+    InvalidExportSignature,
+    DuplicateExportName,
     InvalidSourceSpan,
     MissingFunctionBody,
     InvalidValueId,
@@ -272,6 +277,22 @@ pub fn addFunction(self: *Ir, name: []const u8, ty: TypeId, span: Span) BuildErr
     return id;
 }
 
+/// Owns the exact foreign symbol separately from the Nov declaration name.
+pub fn setExportName(self: *Ir, id: FunctionId, name: []const u8) BuildError!void {
+    const function = self.getFunction(id) orelse return error.InvalidFunctionId;
+    var exported = function;
+    exported.export_name = name;
+    try self.validateFunction(exported);
+    for (self.functions.items, 0..) |other, i| {
+        if (i == @backingInt(id)) continue;
+        if (other.export_name) |symbol| if (std.mem.eql(u8, symbol, name)) return error.DuplicateExportName;
+    }
+    const owned = try self.allocator.dupe(u8, name);
+    const slot = &self.functions.items[@backingInt(id)];
+    if (slot.export_name) |old| self.allocator.free(old);
+    slot.export_name = owned;
+}
+
 /// Validation and allocation complete before publishing any part of the body.
 /// Referenced function declarations may still be awaiting their own bodies.
 pub fn setFunctionBody(self: *Ir, id: FunctionId, instructions: []const Instruction, result: ValueId) BuildError!void {
@@ -315,6 +336,7 @@ fn freeOperands(self: *Ir, op: Operation) void {
 pub fn clearFunctions(self: *Ir) void {
     for (self.functions.items) |function| {
         self.allocator.free(function.name);
+        if (function.export_name) |name| self.allocator.free(name);
         if (function.body) |body| {
             for (body.instructions) |instruction| {
                 self.freeOperands(instruction.op);
@@ -428,6 +450,9 @@ pub fn verify(self: *const Ir) VerifyError!void {
         try self.validateFunction(function);
         for (self.functions.items[0..i]) |previous| {
             if (previous.span.source == function.span.source and std.mem.eql(u8, previous.name, function.name)) return error.DuplicateFunctionName;
+            if (previous.export_name) |a| if (function.export_name) |b| {
+                if (std.mem.eql(u8, a, b)) return error.DuplicateExportName;
+            };
         }
     }
     for (self.functions.items) |function| {
@@ -508,6 +533,23 @@ fn validateFunction(self: *const Ir, function: Function) VerifyError!void {
     try self.validateType(ty, self.types.items.len);
     try self.validateSpan(function.span);
     if (function.noreturn and self.getType(ty.function.result).? != .void) return error.InvalidReturn;
+    if (function.export_name) |name| {
+        if (!ExportNames.validName(name)) return error.InvalidExportName;
+        if (!self.exportScalar(ty.function.result, true)) return error.InvalidExportSignature;
+        for (ty.function.params) |param| if (!self.exportScalar(param, false)) return error.InvalidExportSignature;
+    }
+}
+
+fn exportScalar(self: *const Ir, id: TypeId, result: bool) bool {
+    return switch (self.getType(id).?) {
+        .void => result,
+        .boolean => true,
+        .integer => |integer| switch (integer.bits) {
+            8, 16, 32, 64 => true,
+            else => false,
+        },
+        else => false,
+    };
 }
 
 fn operandType(body: Body, id: ValueId, before: usize) VerifyError!TypeId {
@@ -3131,6 +3173,210 @@ test "all integer unary binary and comparison operations have exact types" {
         TestFunctions.instruction(fixture.boolean, .{ .binary = .{ .op = .ne, .lhs = @fromBackingInt(@intCast(1)), .rhs = @fromBackingInt(@intCast(2)) } }),
     }, @fromBackingInt(@intCast(3)));
     try ir.verify();
+}
+
+test "export IR owns source names replacements and clears exports" {
+    var fixture = try TestFunctions.init(std.testing.allocator);
+    defer fixture.ir.deinit();
+    const ir = &fixture.ir;
+    try std.testing.expect(ir.getFunction(fixture.function).?.export_name == null);
+    {
+        const source = try std.testing.allocator.dupe(u8, "foreign_identity");
+        defer std.testing.allocator.free(source);
+        try ir.setExportName(fixture.function, source);
+        @memset(source, 'x');
+    }
+    try std.testing.expectEqualStrings("foreign_identity", ir.getFunction(fixture.function).?.export_name.?);
+    try std.testing.expectEqualStrings("identity", ir.getFunction(fixture.function).?.name);
+    // A borrowed export slice may itself be the replacement input.
+    try ir.setExportName(fixture.function, ir.getFunction(fixture.function).?.export_name.?);
+    try ir.setExportName(fixture.function, "replacement");
+    try std.testing.expectEqualStrings("replacement", ir.getFunction(fixture.function).?.export_name.?);
+    try ir.setFunctionBody(fixture.function, &.{TestFunctions.instruction(fixture.integer, .{ .parameter = 0 })}, @fromBackingInt(@intCast(0)));
+    try ir.verify();
+    ir.clearFunctions();
+    try ir.verify();
+    const reused = try ir.addFunction("identity", fixture.signature, test_span);
+    try std.testing.expect(ir.getFunction(reused).?.export_name == null);
+    try ir.setExportName(reused, "replacement");
+    try ir.setFunctionBody(reused, &.{TestFunctions.instruction(fixture.integer, .{ .parameter = 0 })}, @fromBackingInt(@intCast(0)));
+    try ir.verify();
+}
+
+test "export IR accepts bool native integers scalar widths and void results" {
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    ir.source_len = 1;
+    const boolean = try ir.internType(.boolean);
+    const unit = try ir.internType(.void);
+    const unit_value = try ir.internConstant(.{ .ty = unit, .value = .void });
+    var scalars: std.ArrayList(TypeId) = .empty;
+    defer scalars.deinit(std.testing.allocator);
+    try scalars.append(std.testing.allocator, boolean);
+    for ([_]std.builtin.Signedness{ .signed, .unsigned }) |signedness| {
+        for ([_]u16{ 8, 16, 32, 64, native_pointer_bits }) |bits| {
+            try scalars.append(std.testing.allocator, try ir.internType(.{ .integer = .{ .signedness = signedness, .bits = bits } }));
+        }
+    }
+    for (scalars.items) |scalar| {
+        const signature = try ir.internType(.{ .function = .{ .params = &.{scalar}, .result = scalar } });
+        const function = try ir.addFunction("identity", signature, test_span);
+        try ir.setExportName(function, "scalar_identity");
+        try ir.setFunctionBody(function, &.{TestFunctions.instruction(scalar, .{ .parameter = 0 })}, @fromBackingInt(@intCast(0)));
+        try ir.verify();
+        ir.clearFunctions();
+        const sink_type = try ir.internType(.{ .function = .{ .params = &.{scalar}, .result = unit } });
+        const sink = try ir.addFunction("sink", sink_type, test_span);
+        try ir.setExportName(sink, "scalar_sink");
+        try ir.setFunctionBody(sink, &.{TestFunctions.instruction(unit, .{ .constant = unit_value })}, @fromBackingInt(@intCast(0)));
+        try ir.verify();
+        ir.clearFunctions();
+    }
+    const signature = try ir.internType(.{ .function = .{ .params = &.{}, .result = unit } });
+    const function = try ir.addFunction("unit", signature, test_span);
+    try ir.setExportName(function, "unit_result");
+    try ir.setFunctionBody(function, &.{TestFunctions.instruction(unit, .{ .constant = unit_value })}, @fromBackingInt(@intCast(0)));
+    try ir.verify();
+}
+
+test "export IR setter and verifier reject unsafe names without replacing metadata" {
+    var fixture = try TestFunctions.init(std.testing.allocator);
+    defer fixture.ir.deinit();
+    const ir = &fixture.ir;
+    try ir.setExportName(fixture.function, "valid_export");
+    try ir.setFunctionBody(fixture.function, &.{TestFunctions.instruction(fixture.integer, .{ .parameter = 0 })}, @fromBackingInt(@intCast(0)));
+    const original = ir.functions.items[0];
+    defer ir.functions.items[0] = original;
+    for ([_][]const u8{ "", "_private", "9bad", "a-b", "a\x00b", "é", "main", "while", "bool", "INT64_MAX", "PRId64", "uint32_t", "FILE", "malloc", "sin", "sqrt", "time", "signal", "p0", "v12", "nov_frame", "nov_roots", "nov_target", "nov_rt_x", "nov_gc_x", "nov_fn_x", "nov_record_x", "nov_range_x", "nov_stringFoo", "nov_arrayFoo", "nov_M0" }) |name| {
+        try std.testing.expectError(error.InvalidExportName, ir.setExportName(fixture.function, name));
+        try std.testing.expectEqual(original.export_name.?.ptr, ir.functions.items[0].export_name.?.ptr);
+        ir.functions.items[0].export_name = name;
+        const result = ir.verify();
+        ir.functions.items[0].export_name = original.export_name;
+        try std.testing.expectError(error.InvalidExportName, result);
+    }
+    try std.testing.expectError(error.InvalidFunctionId, ir.setExportName(@fromBackingInt(@intCast(999)), "valid_export"));
+    try ir.verify();
+}
+
+test "export IR rejects nonscalar signatures including forged export metadata" {
+    var fixture = try TestFunctions.init(std.testing.allocator);
+    defer fixture.ir.deinit();
+    const ir = &fixture.ir;
+    const string = try ir.internType(.string);
+    const array = try ir.internType(.{ .array = fixture.integer });
+    const range = try ir.internType(.{ .range = fixture.integer });
+    const record = try ir.internType(.{ .record = .{ .identity = 0, .fields = &.{} } });
+    const tagged = try ir.internType(.{ .record = .{ .identity = 1, .fields = &.{}, .tagged = true } });
+    const enumeration = try ir.internType(.{ .enumeration = .{ .identity = 2, .name = "E", .tags = &.{.{ .name = "tag", .span = test_span }} } });
+    const original = ir.functions.items[0];
+    defer ir.functions.items[0] = original;
+    for ([_]TypeId{ string, array, range, record, tagged, enumeration, fixture.signature }) |nonscalar| {
+        for ([_]bool{ false, true }) |as_result| {
+            const signature = try ir.internType(.{ .function = .{
+                .params = if (as_result) &.{} else &.{nonscalar},
+                .result = if (as_result) nonscalar else fixture.integer,
+            } });
+            ir.functions.items[0].ty = signature;
+            try std.testing.expectError(error.InvalidExportSignature, ir.setExportName(fixture.function, "bad_signature"));
+            try std.testing.expect(ir.functions.items[0].export_name == null);
+            ir.functions.items[0].export_name = "forged_export";
+            const result = ir.verify();
+            ir.functions.items[0] = original;
+            try std.testing.expectError(error.InvalidExportSignature, result);
+        }
+    }
+    for ([_]std.builtin.Signedness{ .signed, .unsigned }) |signedness| {
+        for ([_]u16{ 1, 7, 24, 65, 128 }) |bits| {
+            const integer = try ir.internType(.{ .integer = .{ .signedness = signedness, .bits = bits } });
+            for ([_]bool{ false, true }) |as_result| {
+                const signature = try ir.internType(.{ .function = .{
+                    .params = if (as_result) &.{} else &.{integer},
+                    .result = if (as_result) integer else fixture.integer,
+                } });
+                ir.functions.items[0].ty = signature;
+                try std.testing.expectError(error.InvalidExportSignature, ir.setExportName(fixture.function, "bad_width"));
+                ir.functions.items[0].export_name = "forged_export";
+                const result = ir.verify();
+                ir.functions.items[0] = original;
+                try std.testing.expectError(error.InvalidExportSignature, result);
+            }
+        }
+    }
+}
+
+test "export IR duplicate names are compilation wide and malformed ids are rejected" {
+    var fixture = try TestFunctions.init(std.testing.allocator);
+    defer fixture.ir.deinit();
+    const ir = &fixture.ir;
+    try ir.source_lengths.appendSlice(std.testing.allocator, &.{ 10, 10 });
+    const other = try ir.addFunction("identity", fixture.signature, .{ .source = @fromBackingInt(@intCast(1)), .start = 0, .end = 1 });
+    try ir.setExportName(fixture.function, "first_export");
+    try ir.setExportName(other, "second_export");
+    try std.testing.expectError(error.DuplicateExportName, ir.setExportName(other, "first_export"));
+    const original = ir.functions.items[@backingInt(other)];
+    defer ir.functions.items[@backingInt(other)] = original;
+    try std.testing.expectEqualStrings("second_export", original.export_name.?);
+    ir.functions.items[@backingInt(other)].export_name = ir.functions.items[0].export_name;
+    try std.testing.expectError(error.DuplicateExportName, ir.verify());
+    ir.functions.items[@backingInt(other)] = original;
+    ir.functions.items[@backingInt(other)].ty = @fromBackingInt(@intCast(999));
+    try std.testing.expectError(error.InvalidTypeId, ir.setExportName(other, "replacement"));
+    try std.testing.expectError(error.InvalidTypeId, ir.verify());
+    ir.functions.items[@backingInt(other)].ty = fixture.integer;
+    try std.testing.expectError(error.InvalidFunctionType, ir.verify());
+    ir.functions.items[@backingInt(other)] = original;
+    const unit = try ir.internType(.void);
+    const later_signature = try ir.internType(.{ .function = .{ .params = &.{ fixture.integer, fixture.integer }, .result = fixture.integer } });
+    ir.functions.items[@backingInt(other)].ty = later_signature;
+    const signature = &ir.types.items[@backingInt(later_signature)].function;
+    const old_result = signature.result;
+    defer signature.result = old_result;
+    signature.result = @fromBackingInt(@intCast(999));
+    try std.testing.expectError(error.InvalidTypeId, ir.setExportName(other, "replacement"));
+    try std.testing.expectError(error.InvalidTypeId, ir.verify());
+    signature.result = old_result;
+    const params = @constCast(signature.params);
+    const old_param = params[0];
+    defer params[0] = old_param;
+    params[0] = @fromBackingInt(@intCast(999));
+    try std.testing.expectError(error.InvalidTypeId, ir.setExportName(other, "replacement"));
+    try std.testing.expectError(error.InvalidTypeId, ir.verify());
+    params[0] = unit;
+    try std.testing.expectError(error.VoidParameter, ir.setExportName(other, "replacement"));
+    try std.testing.expectError(error.VoidParameter, ir.verify());
+    params[0] = old_param;
+    try std.testing.expectEqualStrings("second_export", ir.getFunction(other).?.export_name.?);
+}
+
+fn testExportAllocationFailures(allocator: std.mem.Allocator) !void {
+    var fixture = try TestFunctions.init(allocator);
+    defer fixture.ir.deinit();
+    const ir = &fixture.ir;
+    try ir.setFunctionBody(fixture.function, &.{TestFunctions.instruction(fixture.integer, .{ .parameter = 0 })}, @fromBackingInt(@intCast(0)));
+    ir.setExportName(fixture.function, "initial_export") catch |err| {
+        try std.testing.expect(ir.getFunction(fixture.function).?.export_name == null);
+        try ir.verify();
+        return err;
+    };
+    const original = ir.getFunction(fixture.function).?;
+    ir.setExportName(fixture.function, "replacement_export") catch |err| {
+        const retained = ir.getFunction(fixture.function).?;
+        try std.testing.expectEqual(original.export_name.?.ptr, retained.export_name.?.ptr);
+        try std.testing.expectEqualStrings("initial_export", retained.export_name.?);
+        try std.testing.expectEqual(original.name.ptr, retained.name.ptr);
+        try std.testing.expectEqual(original.body.?.instructions.ptr, retained.body.?.instructions.ptr);
+        try ir.verify();
+        return err;
+    };
+    try std.testing.expectEqualStrings("replacement_export", ir.getFunction(fixture.function).?.export_name.?);
+    try ir.verify();
+    ir.clearFunctions();
+    try ir.verify();
+}
+
+test "export IR setter ownership and replacement are atomic under every OOM" {
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testExportAllocationFailures, .{});
 }
 
 test "function metadata validation rejects corruption and preserves declarations" {

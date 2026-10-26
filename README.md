@@ -164,10 +164,13 @@ let main: () -> void = helper()
 The C wrapper exits 0 when Nov `main` returns and the final stdout flush succeeds;
 arithmetic and stdout failures panic with exit status 1. A panic first attempts to
 flush stdout, then writes `panic: <message>\n` to stderr (no backtrace yet).
-Library `CEmitter.emit` still emits no C `main`; only
-`CEmitter.emitProgram` adds the wrapper. Backend integer widths are restricted to
-8, 16, 32 and 64 bits, including nested function signatures, with source diagnostics
-for unsupported widths.
+`nov emit-c --library file.nov` emits library C11 without a process `main` and does
+not require a Nov entrypoint. Plain `emit-c`, build and run still require the root
+entrypoint above. The library mode accepts `--lib-dir` but is not a shared-library
+builder; compile/link the emitted C with your chosen C toolchain. Internally,
+`CEmitter.emit` emits the library and `CEmitter.emitProgram` adds the wrapper.
+Backend integer widths are restricted to 8, 16, 32 and 64 bits, including nested
+function signatures, with source diagnostics for unsupported widths.
 
 `@print` and `@println` return `void` and write arguments to buffered stdout,
 separated by one space. Booleans use `true`/`false`; integers use decimal notation.
@@ -2111,7 +2114,7 @@ TODO
              can only call pure functions but impure functions can call a pure function without issue.
 - `@[extern]`
 - `@[packed]`
-- `@[export]`
+- `@[export]` / `@[export("symbol_name")]`: expose an ordinary function through the C ABI.
 - `@[inline]`
 - `@[noinline]`
 - `@[cold]`
@@ -2130,8 +2133,55 @@ methods are file-private by default, with identical rules for file and named imp
 `@[private]` is unsupported; omit the attribute instead. Argument-free `@[noreturn]`
 on ordinary functions and methods may be combined with `@[public]` where supported.
 Duplicate attributes, arguments, invalid placements and unknown/unsupported
-attributes diagnose. C exports are unchanged. Other entries in this list remain
+attributes diagnose. `@[export]` and `@[export("symbol_name")]` are supported as
+described below and do not imply `@[public]`. Other entries in this list remain
 design proposals.
+
+### C function exports
+
+```nov
+@[export]
+let add: (a: i32, b: i32) -> i32 = a + b
+
+@[export("api_invert")]
+let invert: (value: bool) -> bool = !value
+```
+
+The C symbols are exactly `add` and `api_invert`, with no Nov prefix, suffix or
+module mangling. The optional argument must be one ordinary string literal;
+escapes are decoded, but interpolation and computed names are unsupported. Export
+names must be nonreserved ASCII C11 identifiers. C keywords, C11 library names
+(including functions such as `sin` even when their header is not included),
+`main`, leading underscores, backend namespaces and generated local names (`pN`,
+`vN`, `nov_frame`, `nov_roots`, `nov_target`) are rejected. Duplicate symbols across
+loaded files diagnose with a note to the first declaration. Exact collisions with
+other generated function names are rejected before any C is returned.
+
+Exports are limited to immutable, ordinary top-level function declarations with
+bodies. Parameters/results may be `bool` or 8/16/32/64-bit signed/unsigned integers;
+results may also be `void`. Canonical aliases are accepted, including pointer-sized
+`int`/`uint`. The C types are `bool` (include `<stdbool.h>`) and the corresponding
+`intN_t`/`uintN_t` (include `<stdint.h>`); native integers match `intptr_t`/`uintptr_t`
+on the native target. Calls use the C compiler's ordinary C calling convention.
+Strings, arrays, ranges, enums, records/unions, function values, wider integers,
+methods and generic exports are not supported as foreign ABI declarations.
+
+`@[public]` controls **Nov import visibility**; export controls the **foreign symbol**.
+Neither implies the other. Use both when both APIs are intended. `@[noreturn]` may
+combine with export for a void-returning function. Unreferenced exports are retained
+in emitted C, and internal calls/function values refer to the exact exported symbol.
+Other generated mangled symbols are implementation details, not a stable foreign API.
+
+[`examples/exports.nov`](examples/exports.nov) and its
+[C caller](examples/exports.c) demonstrate scalar exports and a private Nov struct
+behind scalar wrappers. Build/run commands are in the Nov file's opening comments.
+The separate-translation-unit example is tested at `-O0` and `-O3`.
+
+This slice adds no foreign calls, pointers, callbacks, generated headers, shared-
+library packaging or DLL export-list support. Managed values cannot cross the ABI;
+the existing runtime remains single-threaded. Automatic library teardown and
+concurrent foreign entry are not provided. Panics remain process-terminating;
+exports do not turn them into recoverable C errors.
 
 ### Non-returning functions
 

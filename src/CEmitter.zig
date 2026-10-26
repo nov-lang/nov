@@ -1,7 +1,7 @@
 //! C11 backend for verified typed IR.
 //!
-//! Emits one translation unit with externally visible `nov_`-prefixed functions
-//! and function-pointer typedefs. IR values become ordered const locals;
+//! Emits one translation unit with mangled internal function names and explicit
+//! exact-name C exports, plus function-pointer typedefs. IR values become ordered const locals;
 //! local slots and conditional merges use mutable temporaries, so
 //! the IR's callee-first, left-to-right order is preserved without relying on C
 //! argument evaluation order.
@@ -26,6 +26,7 @@ pub const Error = Ir.VerifyError || std.mem.Allocator.Error || error{
     UnsupportedIntegerWidth,
     MissingEntrypoint,
     InvalidEntrypoint,
+    ExportSymbolCollision,
 };
 
 /// Describes the first construct the backend rejected. `span` indexes the source
@@ -39,12 +40,14 @@ pub const Diagnostic = struct {
         integer_width_unsupported,
         entrypoint_missing,
         entrypoint_signature,
+        export_symbol_collision,
 
         pub fn message(reason: Reason) []const u8 {
             return switch (reason) {
                 .integer_width_unsupported => "C backend only supports 8, 16, 32 and 64-bit integers",
                 .entrypoint_missing => "program requires a root function 'main' with type () -> void",
                 .entrypoint_signature => "program entrypoint 'main' must have type () -> void",
+                .export_symbol_collision => "export symbol conflicts with a generated function name; choose another export name",
             };
         }
     };
@@ -114,6 +117,7 @@ fn fail(diagnostic: ?*Diagnostic, reason: Diagnostic.Reason, origin: Origin) Err
         .integer_width_unsupported => error.UnsupportedIntegerWidth,
         .entrypoint_missing => error.MissingEntrypoint,
         .entrypoint_signature => error.InvalidEntrypoint,
+        .export_symbol_collision => error.ExportSymbolCollision,
     };
 }
 
@@ -150,6 +154,15 @@ fn analyze(allocator: std.mem.Allocator, ir: *const Ir, origins: []?Origin, diag
     @memset(visited, false);
     for (ir.functions.items, 0..) |function, f| {
         const id: Ir.FunctionId = @fromBackingInt(@intCast(f));
+        if (function.export_name) |symbol| {
+            for (ir.functions.items) |other| {
+                if (other.export_name != null) continue;
+                var generated = std.Io.Writer.Allocating.init(allocator);
+                defer generated.deinit();
+                writeScopedFunctionName(&generated.writer, other) catch return error.OutOfMemory;
+                if (std.mem.eql(u8, symbol, generated.written())) return fail(diagnostic, .export_symbol_collision, .{ .function = id, .span = function.span });
+            }
+        }
         mark(origins, function.ty, .{ .function = id, .span = function.span });
         for (function.body.?.instructions) |instruction| {
             const origin: Origin = .{ .function = id, .span = instruction.span };
@@ -564,6 +577,7 @@ fn sameFunction(a: Ir.Function, b: Ir.Function) bool {
 }
 
 fn writeScopedFunctionName(w: *std.Io.Writer, function: Ir.Function) WriteError!void {
+    if (function.export_name) |symbol| return w.writeAll(symbol);
     // The single underscore separator cannot occur inside an encoded Nov name.
     if (@backingInt(function.span.source) != 0) try w.print("nov_M{d}_", .{@backingInt(function.span.source)});
     try writeFunctionName(w, function.name);
@@ -6296,6 +6310,94 @@ fn compileAndRunMode(c_source: []const u8, harness: []const u8, exit_code: u8, s
     try std.testing.expectEqual(std.process.Child.Term{ .exited = exit_code }, ran.term);
     try std.testing.expectEqualStrings(stdout, ran.stdout);
     try std.testing.expectEqualStrings(stderr, ran.stderr);
+}
+
+test "export exact default and custom names link from a separate C translation unit" {
+    const source =
+        \\let offset: (x: i32) -> i32 = x + 1
+        \\@[export]
+        \\let add: (a: i32, b: i32) -> i32 = offset(a) + b
+        \\@[public]
+        \\@[export("nov_fibonacci")]
+        \\let fib: (n: uint) -> uint = if n < 2 { n } else { fib(n - 1) + fib(n - 2) }
+        \\@[export]
+        \\let invoke: (a: i32) -> i32 = {let f: (i32, i32) -> i32 = add
+        \\f(a, 2)}
+        \\@[export]
+        \\let unit: () = {}
+        \\let main: () = {}
+    ;
+    const c = try emitSource(source, null);
+    defer test_gpa.free(c);
+    try std.testing.expect(std.mem.indexOf(u8, c, "int32_t add(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, c, "nov_add(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, c, "nov_fib(") == null);
+    const harness =
+        \\#include <stdint.h>
+        \\int32_t add(int32_t, int32_t);
+        \\uintptr_t nov_fibonacci(uintptr_t);
+        \\int32_t invoke(int32_t);
+        \\void unit(void);
+        \\int main(void) {
+        \\    unit();
+        \\    return add(20, 21) != 42 || invoke(39) != 42 || nov_fibonacci(10) != 55;
+        \\}
+    ;
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, harness, 0, "", "", mode);
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{source});
+}
+
+test "export scalar ABI uses exact integer widths bool and native pointer widths" {
+    var source = std.Io.Writer.Allocating.init(test_gpa);
+    defer source.deinit();
+    var harness = std.Io.Writer.Allocating.init(test_gpa);
+    defer harness.deinit();
+    try harness.writer.writeAll("#include <stdint.h>\n#include <stdbool.h>\n");
+    const types = [_][]const u8{ "bool", "i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "int", "uint" };
+    const c_types = [_][]const u8{ "bool", "int8_t", "uint8_t", "int16_t", "uint16_t", "int32_t", "uint32_t", "int64_t", "uint64_t", "intptr_t", "uintptr_t" };
+    const values = [_][]const u8{ "true", "INT8_MIN", "UINT8_MAX", "INT16_MIN", "UINT16_MAX", "INT32_MIN", "UINT32_MAX", "INT64_MIN", "UINT64_MAX", "INTPTR_MIN", "UINTPTR_MAX" };
+    for (types, c_types) |ty, c_ty| {
+        try source.writer.print("@[export]\nlet identity_{s}: (x: {s}) -> {s} = x\n", .{ ty, ty, ty });
+        try harness.writer.print("{s} identity_{s}({s});\n", .{ c_ty, ty, c_ty });
+    }
+    try harness.writer.writeAll("int main(void) {\n");
+    for (types, values, 1..) |ty, value, code| try harness.writer.print("if (identity_{s}({s}) != {s}) return {d};\n", .{ ty, value, value, code });
+    try harness.writer.writeAll("return 0;\n}\n");
+    const c = try emitSource(source.written(), null);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, harness.written(), 0, "", "", mode);
+}
+
+test "export noreturn annotation preserves panic and terminal call behavior in C" {
+    const c = try emitSource("@[export]\n@[noreturn]\nlet stop: () = @panic(\"foreign call\")", null);
+    defer test_gpa.free(c);
+    try std.testing.expect(std.mem.indexOf(u8, c, "_Noreturn void stop(void)") != null);
+    const harness = "_Noreturn void stop(void);\nint main(void) { stop(); }\n";
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, harness, 1, "", "panic: foreign call\n", mode);
+}
+
+test "export collision with generated private symbol reports the exporting source" {
+    const source = "let helper: () -> i32 = 1\n@[export(\"nov_helper\")]\nlet exposed: () -> i32 = 2";
+    var diagnostic: Diagnostic = undefined;
+    try std.testing.expectError(error.ExportSymbolCollision, emitSource(source, &diagnostic));
+    try std.testing.expectEqual(Diagnostic.Reason.export_symbol_collision, diagnostic.reason);
+    try std.testing.expectEqualStrings("exposed", source[diagnostic.span.start..diagnostic.span.end]);
+    try TestAllocations.checkAllAllocationFailures(test_gpa, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var module = try Module.init(allocator, "collision.nov", source);
+            defer module.deinit();
+            var result = try Lowering.lower(&module);
+            defer result.deinit();
+            try std.testing.expect(!module.hasErrors());
+            const emitted = emit(allocator, &result.ir, null) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                try std.testing.expectEqual(error.ExportSymbolCollision, err);
+                return;
+            };
+            defer allocator.free(emitted);
+            return error.TestUnexpectedResult;
+        }
+    }.run, .{});
 }
 
 test "generated C compiles with strict warnings and behaves correctly" {

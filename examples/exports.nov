@@ -1,0 +1,43 @@
+; From the repository root:
+; zig build
+; zig-out/bin/nov emit-c --library examples/exports.nov > zig-out/exports.c
+; zig cc -std=c11 -O3 zig-out/exports.c examples/exports.c -o zig-out/exports-demo
+; ./zig-out/exports-demo
+;
+; C calls scalar exports; Rectangle and its layout stay private to Nov.
+
+@[export]
+let add_i32: (left: i32, right: i32) -> i32 = left + right
+
+@[export("api_select_u64")]
+let select: (condition: bool, yes: u64, no: u64) -> u64 = if condition {
+    yes
+} else {
+    no
+}
+
+@[export]
+let invert: (value: bool) -> bool = !value
+
+let Rectangle = struct {
+    width: u32,
+    height: u32,
+
+    let area: (self: Rectangle) -> u32 = self.width * self.height
+
+    let perimeter: (self: Rectangle) -> u32 = {
+        self.width + self.height
+    } * 2
+}
+
+@[export]
+let rectangle_area: (width: u32, height: u32) -> u32 = {
+    let rectangle = Rectangle[ .width = width, .height = height ]
+    rectangle.area()
+}
+
+@[export("rectangle_perimeter")]
+let perimeter: (width: u32, height: u32) -> u32 = {
+    let rectangle = Rectangle[ .width = width, .height = height ]
+    rectangle.perimeter()
+}

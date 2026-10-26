@@ -6,6 +6,7 @@ const TypeResolver = @import("TypeResolver.zig");
 const TypeAliases = @import("TypeAliases.zig");
 const Enums = @import("Enums.zig");
 const Visibility = @import("Visibility.zig");
+const Exports = @import("Exports.zig");
 const Sema = @import("Sema.zig");
 const Literal = @import("Literal.zig");
 const BodyChecker = @import("BodyChecker.zig");
@@ -32,6 +33,7 @@ const params = clap.parseParamsComptime(
     \\--exclude <str>...      Exclude a literal file/directory path (fmt only).
     \\--semantic             Check the bounded semantic/lowering subset (check only).
     \\--lib-dir <str>         Override the library root (semantic check/emit-c/build/run).
+    \\--library               Emit library C without a process entrypoint (emit-c only).
     \\--debug                Compile with -O0 -g (build/run only).
     \\--release              Compile with -O3 (default; build/run only).
     \\--cc <str>             C compiler executable (build/run only).
@@ -45,7 +47,7 @@ fn usage(writer: *std.Io.Writer) !void {
         \\Usage: nov check [--semantic] <file>...
         \\       nov fmt [--check] [--exclude <path>] <file|directory>...
         \\       nov fmt [--check] -
-        \\       nov emit-c <file>
+        \\       nov emit-c [--library] <file>
         \\       nov [build] <file> [-o|--output <path>] [--cc <executable>] [--debug|--release]
         \\       nov run <file> [--cc <executable>] [--debug|--release]
         \\
@@ -100,6 +102,10 @@ pub fn main(init: std.process.Init) !u8 {
         std.mem.indexOfAny(u8, args[0], "/\\") != null);
     const is_build = implicit_build or (args.len != 0 and std.mem.eql(u8, args[0], "build"));
     const is_run = args.len != 0 and std.mem.eql(u8, args[0], "run");
+    if (res.args.library != 0 and !is_emit) {
+        try stderr.writeAll("error: --library requires the emit-c command\n");
+        return 1;
+    }
     if (res.args.debug != 0 and res.args.release != 0) {
         try stderr.writeAll("error: --debug and --release are mutually exclusive\n");
         return 1;
@@ -176,7 +182,7 @@ pub fn main(init: std.process.Init) !u8 {
         }
         var buffer: [4096]u8 = undefined;
         var stdout = std.Io.File.stdout().writer(init.io, &buffer);
-        const valid = emitFileWithLibrary(init.io, init.gpa, args[1], res.args.@"lib-dir", stderr, &stdout.interface) catch |err| {
+        const valid = emitFileMode(init.io, init.gpa, args[1], res.args.@"lib-dir", if (res.args.library != 0) .library else .program, stderr, &stdout.interface) catch |err| {
             try stderr.print("{s}: error: {s}\n", .{ args[1], @errorName(err) });
             return 1;
         };
@@ -391,13 +397,23 @@ fn checkFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, lib_dir
     return !compilation.hasErrors();
 }
 
+const EmitMode = enum { program, library };
+
 fn emitFileWithLibrary(io: std.Io, allocator: std.mem.Allocator, path: []const u8, lib_dir: ?[]const u8, stderr: *std.Io.Writer, stdout: *std.Io.Writer) !bool {
+    return emitFileMode(io, allocator, path, lib_dir, .program, stderr, stdout);
+}
+
+fn emitFileMode(io: std.Io, allocator: std.mem.Allocator, path: []const u8, lib_dir: ?[]const u8, mode: EmitMode, stderr: *std.Io.Writer, stdout: *std.Io.Writer) !bool {
     var compilation = try loadCompilation(io, allocator, path, lib_dir);
     defer compilation.deinit();
-    return emitCompilation(allocator, &compilation, stderr, stdout);
+    return emitCompilationMode(allocator, &compilation, mode, stderr, stdout);
 }
 
 fn emitCompilation(allocator: std.mem.Allocator, compilation: *Compilation, stderr: *std.Io.Writer, stdout: *std.Io.Writer) !bool {
+    return emitCompilationMode(allocator, compilation, .program, stderr, stdout);
+}
+
+fn emitCompilationMode(allocator: std.mem.Allocator, compilation: *Compilation, mode: EmitMode, stderr: *std.Io.Writer, stdout: *std.Io.Writer) !bool {
     if (compilation.hasErrors()) {
         try Diagnostics.renderCompilation(compilation, stderr);
         return false;
@@ -414,8 +430,11 @@ fn emitCompilation(allocator: std.mem.Allocator, compilation: *Compilation, stde
         break :blk compilation.getModule(ref.source).?.getDeclaration(ref.local).?.name_span;
     } else .{ .source = compilation.root.?, .start = 0, .end = 0 };
     var diagnostic: CEmitter.Diagnostic = undefined;
-    const c_source = CEmitter.emitProgramRoot(allocator, &result.ir, entry, missing_span, &diagnostic) catch |err| switch (err) {
-        error.UnsupportedIntegerWidth, error.MissingEntrypoint, error.InvalidEntrypoint => {
+    const c_source = (switch (mode) {
+        .program => CEmitter.emitProgramRoot(allocator, &result.ir, entry, missing_span, &diagnostic),
+        .library => CEmitter.emit(allocator, &result.ir, &diagnostic),
+    }) catch |err| switch (err) {
+        error.UnsupportedIntegerWidth, error.MissingEntrypoint, error.InvalidEntrypoint, error.ExportSymbolCollision => {
             if (err == error.MissingEntrypoint and compilation.root_main != null) diagnostic.reason = .entrypoint_signature;
             try Diagnostics.renderCompilationBackend(compilation, diagnostic, stderr);
             return false;
@@ -439,7 +458,7 @@ fn emitSource(allocator: std.mem.Allocator, path: []const u8, source: [:0]const 
             if (!module.hasErrors()) {
                 var diagnostic: CEmitter.Diagnostic = undefined;
                 const c_source = CEmitter.emitProgram(allocator, &result.ir, &diagnostic) catch |err| switch (err) {
-                    error.UnsupportedIntegerWidth, error.MissingEntrypoint, error.InvalidEntrypoint => {
+                    error.UnsupportedIntegerWidth, error.MissingEntrypoint, error.InvalidEntrypoint, error.ExportSymbolCollision => {
                         if (err == error.MissingEntrypoint) {
                             if (module.lookup("main")) |id| {
                                 const declaration = module.getDeclaration(id).?;
@@ -502,6 +521,45 @@ fn replaceFormattedFile(io: std.Io, allocator: std.mem.Allocator, path: []const 
     try atomic.replace(io);
 }
 
+test "library emission omits process main and buffers export diagnostics" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cases = [_]struct { source: []const u8, message: ?[]const u8 = null }{
+        .{ .source = "@[export]\nlet exact: (x: i32) -> i32 = x\n@[export(\"custom\")]\nlet renamed: (x: bool) -> bool = x\n" },
+        .{ .source = "let main: () = {}\n@[export]\nlet exact: () -> u8 = 7\n" },
+        .{ .source = "@[export(\"bad-name\")]\nlet f: () -> i32 = 1", .message = "export name must be" },
+        .{ .source = "@[export]\nlet f: (x: string) -> string = x", .message = "export ABI supports only" },
+        .{ .source = "@[export(\"same\")]\nlet f: () = {}\n@[export(\"same\")]\nlet g: () = {}", .message = "duplicate exported symbol" },
+        .{ .source = "let helper: () = {}\n@[export]\nlet nov_helper: () = {}", .message = "export symbol conflicts with a generated function name" },
+    };
+    for (cases) |case| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "library.nov", .data = case.source });
+        const path = try tmp.dir.realPathFileAlloc(io, "library.nov", allocator);
+        defer allocator.free(path);
+        var diagnostics = std.Io.Writer.Allocating.init(allocator);
+        defer diagnostics.deinit();
+        var output = std.Io.Writer.Allocating.init(allocator);
+        defer output.deinit();
+        try std.testing.expectEqual(case.message == null, try emitFileMode(io, allocator, path, null, .library, &diagnostics.writer, &output.writer));
+        if (case.message) |message| {
+            try std.testing.expectEqualStrings("", output.written());
+            try std.testing.expect(std.mem.indexOf(u8, diagnostics.written(), message) != null);
+            try std.testing.expect(std.mem.indexOf(u8, diagnostics.written(), "library.nov:") != null);
+            try std.testing.expect(std.mem.indexOf(u8, diagnostics.written(), "^") != null);
+        } else {
+            try std.testing.expectEqualStrings("", diagnostics.written());
+            try std.testing.expect(std.mem.indexOf(u8, output.written(), "int main(") == null);
+            try std.testing.expect(std.mem.indexOf(u8, output.written(), " exact(") != null);
+            if (std.mem.indexOf(u8, case.source, "renamed") != null) {
+                try std.testing.expect(std.mem.indexOf(u8, output.written(), "bool custom(bool p0)") != null);
+                try std.testing.expect(std.mem.indexOf(u8, output.written(), "nov_renamed") == null);
+            }
+        }
+    }
+}
+
 test "emit-c buffers source and renders frontend entrypoint and backend failures" {
     const allocator = std.testing.allocator;
     const cases = [_]struct { source: [:0]const u8, message: ?[]const u8 = null }{
@@ -510,6 +568,7 @@ test "emit-c buffers source and renders frontend entrypoint and backend failures
         .{ .source = "let main: i32 = 1", .message = "must have type () -> void" },
         .{ .source = "let main: () -> bool = true", .message = "must have type () -> void" },
         .{ .source = "let main: (x: bool) -> void = {}", .message = "must have type () -> void" },
+        .{ .source = "let helper: () = {}\n@[export]\nlet nov_helper: () = {}\nlet main: () = {}", .message = "export symbol conflicts with a generated function name" },
         .{ .source = "let broken =", .message = "expected" },
         .{ .source = "let main: () -> void = absent()", .message = "unknown name" },
         .{ .source = "let main: () -> void = {}\r\n\tlet wide: (x: i128) -> i128 = x", .message = "C backend only supports" },
@@ -998,6 +1057,7 @@ test {
     _ = TypeAliases;
     _ = Enums;
     _ = Visibility;
+    _ = Exports;
     _ = Sema;
     _ = Literal;
     _ = BodyChecker;

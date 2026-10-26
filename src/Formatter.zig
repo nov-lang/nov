@@ -209,7 +209,12 @@ fn checkSupported(ast: Ast) !void {
                 };
             },
             .array_access => if (ast.nodes.items(.tag)[data.lhs] == .array_access) return error.UnsupportedSyntax,
-            .attr_one => if (data.rhs != 0 or (!std.mem.eql(u8, ast.tokenSlice(data.lhs), "public") and !std.mem.eql(u8, ast.tokenSlice(data.lhs), "noreturn"))) return error.UnsupportedSyntax,
+            .attr_one => {
+                const name = ast.tokenSlice(data.lhs);
+                if (std.mem.eql(u8, name, "export")) {
+                    if (data.rhs != 0 and ast.nodes.items(.tag)[data.rhs] != .string_literal) return error.UnsupportedSyntax;
+                } else if (data.rhs != 0 or (!std.mem.eql(u8, name, "public") and !std.mem.eql(u8, name, "noreturn"))) return error.UnsupportedSyntax;
+            },
             .builtin_literal => {
                 const name = ast.tokenSlice(main);
                 if (!std.mem.eql(u8, name, "@print") and !std.mem.eql(u8, name, "@println") and !std.mem.eql(u8, name, "@as") and !std.mem.eql(u8, name, "@panic") and !std.mem.eql(u8, name, "@This") and !std.mem.eql(u8, name, "@import"))
@@ -430,6 +435,20 @@ test "unsupported syntax fails closed including nested expressions" {
         if (ast.errors.len != 0) std.debug.print("invalid unsupported test fixture: {s}\n", .{source});
         try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
         try std.testing.expectError(error.UnsupportedSyntax, format(std.testing.allocator, source));
+    }
+}
+
+test "export formatting preserves exact symbol literals comments delimiters and attribute combinations" {
+    for ([_][:0]const u8{
+        "@[export]\nlet add:(x:i32)->i32=x",
+        "@[public]\n@[export(\"nov_add\")]\nlet add:(x:i32)->i32=x",
+        "@[export(\"nov_\\x61dd\",)]\nlet add:(x:i32)->i32=x",
+        "@[export( ; symbol\n\"nov_add\", ; keep comma\n)] ; end\n@[noreturn]\nlet stop:()=loop{}",
+    }) |source| {
+        const result = try format(std.testing.allocator, source);
+        defer std.testing.allocator.free(result);
+        try expectFormatted(source, result);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{source});
     }
 }
 

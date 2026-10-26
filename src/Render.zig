@@ -150,6 +150,13 @@ fn renderMember(
                 const token = ast.nodes.items(.main_token)[attribute];
                 try self.renderToken(token, .none);
                 try self.renderToken(token + 1, .none);
+                const data = ast.nodes.items(.data)[attribute];
+                if (data.rhs != 0) {
+                    const args = [_]Ast.Node.Index{data.rhs};
+                    const close = ast.lastToken(attribute) - 1;
+                    try self.renderList(token + 2, close, &args, false);
+                    try self.renderToken(close, .none);
+                }
                 try self.renderToken(ast.lastToken(attribute), .endline);
             }
             try self.renderMember(container, ast.nodes.items(.data)[decl].rhs, space);

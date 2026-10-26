@@ -172,8 +172,8 @@ static `Type.method(...)` calls; print calls exact `toString: (MyType) -> string
 immediately after each argument is evaluated, before the next argument. Only
 argument-free `@[public]` on immutable supported declarations is accepted;
 declarations and methods are otherwise file-private under both import forms.
-`@[private]` is unsupported. C export policy is unchanged. C value layouts/root
-frames retain every string owner in
+`@[private]` is unsupported. Explicit C export annotations are separate from Nov
+visibility. C value layouts/root frames retain every string owner in
 parameters, temporaries, local slots and control-flow merges. Contextual/anonymous
 constructors, nested/array/function fields,
 record arrays/globals, container constants/types, derived printing,
@@ -790,7 +790,18 @@ TODO:
 - for unary negation `-`, autogen it from `-` operator and `zero` decl?
 
 # C FFI
-TODO
+
+Implemented: `@[export]` (exact declaration name) and `@[export("symbol_name")]`
+(exact explicit C symbol) on ordinary immutable top-level functions. Export is
+independent of Nov `@[public]`. The initial ABI admits bool, 8/16/32/64-bit integers,
+native int/uint, and void results; unsupported names/signatures and duplicate symbols
+diagnose. `nov emit-c --library file.nov` emits a translation unit without a process
+main. Separate-TU C callers are tested with -O0/-O3 and strict warnings/UBSan. See
+README and examples/exports.nov for the supported contract.
+
+Deferred: foreign calls/extern declarations, C-specific integer aliases, pointers,
+managed-value boundaries, callbacks, generated headers and library packaging.
+The broader examples below remain proposals:
 ```nov
 @[extern("malloc")]
 let c_malloc: (uint) -> voidptr
