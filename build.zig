@@ -1416,9 +1416,42 @@ fn addImportCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *st
     _ = fixtures.add("errors/wide.nov", "let wide: () -> i128 = 1\n");
     _ = fixtures.add("hidden.nov", "let standard = @import(\"std\")\nlet value: bool = standard.hidden\n");
     const visibility = fixtures.add("visibility/std.nov", "let hidden = true\n");
+    _ = fixtures.add("private/library.nov",
+        \\@[private]
+        \\let secret:int=7
+        \\@[public]
+        \\let Thing=struct{name:string,
+        \\@[private]
+        \\let toString:(self:Thing)->string=self.name
+        \\@[private]
+        \\let get:(self:Thing)->int=secret
+        \\@[public]
+        \\let report:(self:Thing)=@println(self,self.get())
+        \\}
+    );
+    _ = fixtures.add("private/main.nov", "let lib=@import(\"library.nov\")\nlet Thing=lib.Thing\nlet main:()={let x=Thing[.name=\"private helper\"]\nx.report()}\n");
+    _ = fixtures.add("private/global.nov", "let lib=@import(\"library.nov\")\nlet main:()=@println(lib.secret)\n");
+    _ = fixtures.add("private/method.nov", "let lib=@import(\"library.nov\")\nlet main:()={let x=lib.Thing[.name=\"hidden\"]\n@println(x.get())}\n");
+    _ = fixtures.add("private/print.nov", "let lib=@import(\"library.nov\")\nlet main:()=@println(lib.Thing[.name=\"hidden\"])\n");
+    for ([_][]const u8{ "--debug", "--release" }) |mode| {
+        const run = b.addRunArtifact(exe);
+        run.step.name = b.fmt("CLI visibility: defining-file helpers {s}", .{mode});
+        run.setCwd(fixtures.getDirectory());
+        run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+        run.setEnvironmentVariable("NOV_CC", "");
+        run.setEnvironmentVariable("CC", "");
+        run.addArgs(&.{ "run", "private/main.nov", mode });
+        run.expectExitCode(0);
+        run.expectStdOutEqual("private helper 7\n");
+        run.expectStdErrEqual("");
+        test_step.dependOn(&run.step);
+    }
     addOptionCliTests(b, exe, test_step, fixtures, library);
     const Case = struct { name: []const u8, args: []const []const u8, code: u8, diagnostic: ?[]const u8 = null };
     const cases = [_]Case{
+        .{ .name = "private top level", .args = &.{ "emit-c", "private/global.nov" }, .code = 1, .diagnostic = "global.nov:2:" },
+        .{ .name = "private receiver method", .args = &.{ "emit-c", "private/method.nov" }, .code = 1, .diagnostic = "method.nov:3:" },
+        .{ .name = "private converter", .args = &.{ "emit-c", "private/print.nov" }, .code = 1, .diagnostic = "print.nov:2:" },
         .{ .name = "relative diamond", .args = &.{ "check", "--semantic", "relative.nov" }, .code = 0 },
         .{ .name = "relative diamond and library callbacks", .args = &.{ "check", "--semantic", "app/main.nov" }, .code = 0 },
         .{ .name = "missing imports stay syntax only", .args = &.{ "check", "missing.nov" }, .code = 0 },

@@ -102,8 +102,10 @@ now support multi-source compilation. Only root main is an entrypoint. Build out
 cannot overwrite any loaded source, including imported library/symlink targets.
 No source concatenation/name rewriting or builtin Result is used. Named imports
 require public top-level exports; file imports also allow unmarked declarations.
-Full member visibility/private attributes, runtime module initialization, arbitrary
-package search, value generics/comptime remain deferred.
+Private declarations and nominal methods are now restricted to their defining file,
+including aliases/reexports, generic instances and implicit toString calls. Unmarked
+method access policy, runtime module initialization, arbitrary package search and
+value generics/comptime remain deferred.
 
 Instance calls value.method(args) work on nominal structs, non-generic unions and
 enums as sugar for Type.method(value,args). The explicit first parameter must match
@@ -169,8 +171,9 @@ in declaration order. Record value boundaries copy fields; strings share immutab
 storage. Field reads work in interpolation. Container methods support scoped and
 static `Type.method(...)` calls; print calls exact `toString: (MyType) -> string` once
 immediately after each argument is evaluated, before the next argument. Only
-argument-free `@[public]` on immutable supported declarations is accepted; named
-imports enforce public top-level access, not full member visibility or a C export policy. C value layouts/root frames retain every string owner in
+argument-free `@[public]` or `@[private]` on immutable supported declarations is
+accepted; private methods/declarations are file-private and named imports require
+public top-level exports. Unmarked method access and C export policy are unchanged. C value layouts/root frames retain every string owner in
 parameters, temporaries, local slots and control-flow merges. Contextual/anonymous
 constructors, nested/array/function fields,
 record arrays/globals, container constants/types, derived printing,

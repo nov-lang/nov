@@ -250,6 +250,7 @@ const Context = struct {
         const identity = if (nominal == .record) nominal.record.identity else nominal.enumeration.identity;
         const owner = if (self.module.compilation) |comp| comp.getModule(source).? else self.module;
         const method = owner.lookupConcreteMethod(@fromBackingInt(@intCast(identity)), if (nominal == .record and nominal.record.type_args.len != 0) @backingInt(ty) else null, name) orelse return null;
+        if (owner.source.id != self.module.source.id and owner.getDeclaration(method).?.private) return null;
         return self.qualify(owner, method);
     }
 

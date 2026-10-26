@@ -2169,7 +2169,7 @@ fn testQualifiedEnumGlobal(allocator: std.mem.Allocator, source: []const u8, exp
     // Named namespaces gate top-level exports. Existing nominal method lookup
     // retains public metadata but does not enforce a separate access policy.
     const namespace = comp.declaration_ids.get(.{ .source = root, .local = module.lookup("lib").? }).?;
-    try std.testing.expect(comp.lookupNamespace(namespace, "hidden") == null);
+    try std.testing.expect(comp.lookupNamespace(root, namespace, "hidden") == null);
     const defining = comp.getModule(enums).?;
     const owner = defining.lookup("E").?;
     try std.testing.expect(!defining.getDeclaration(defining.lookupMethod(owner, "unmarked").?).?.public);

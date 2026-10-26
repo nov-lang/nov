@@ -135,12 +135,15 @@ pub fn namespace(self: *const Compilation, declaration: DeclId) ?Import {
 }
 
 /// File imports see unmarked declarations; named modules require public metadata.
+/// Private declarations are only visible to syntax in their defining source.
 /// The returned identity retains the defining scope, including for reexports.
-pub fn lookupNamespace(self: *const Compilation, declaration: DeclId, name: []const u8) ?DeclId {
+pub fn lookupNamespace(self: *const Compilation, caller: Source.Id, declaration: DeclId, name: []const u8) ?DeclId {
     const edge = self.namespace(declaration) orelse return null;
     const module = self.getModule(edge.target).?;
     const local = module.lookup(name) orelse return null;
-    if (edge.named and !module.getDeclaration(local).?.public) return null;
+    const member = module.getDeclaration(local).?;
+    if (member.private and caller != edge.target) return null;
+    if (edge.named and !member.public and !(member.private and caller == edge.target)) return null;
     return self.declaration_ids.get(.{ .source = edge.target, .local = local });
 }
 
@@ -160,7 +163,7 @@ fn referenceDepth(self: *const Compilation, module: *const Module, node: Ast.Nod
             for (0..128) |_| {
                 const global = self.declaration_ids.get(base) orelse return null;
                 if (self.namespace(global) != null) {
-                    const member = self.lookupNamespace(global, ast.tokenSlice(data.rhs)) orelse return null;
+                    const member = self.lookupNamespace(module.source.id, global, ast.tokenSlice(data.rhs)) orelse return null;
                     break :blk self.getDeclaration(member);
                 }
                 const owner = self.getModule(base.source).?;
@@ -404,10 +407,10 @@ test "named std imports require explicit library roots and public metadata" {
     const named = compilation.imports.items[0];
     const file = compilation.imports.items[compilation.imports.items.len - 1];
     try std.testing.expectEqual(named.target, file.target);
-    try std.testing.expect(compilation.lookupNamespace(named.declaration, "hidden") == null);
-    try std.testing.expect(compilation.lookupNamespace(file.declaration, "hidden") != null);
+    try std.testing.expect(compilation.lookupNamespace(compilation.root.?, named.declaration, "hidden") == null);
+    try std.testing.expect(compilation.lookupNamespace(compilation.root.?, file.declaration, "hidden") != null);
     for ([_][]const u8{ "visible", "helper", "Result" }) |name| {
-        try std.testing.expectEqual(compilation.lookupNamespace(named.declaration, name).?, compilation.lookupNamespace(file.declaration, name).?);
+        try std.testing.expectEqual(compilation.lookupNamespace(compilation.root.?, named.declaration, name).?, compilation.lookupNamespace(compilation.root.?, file.declaration, name).?);
     }
 }
 
@@ -462,6 +465,84 @@ test "compilation publication rolls back under allocation failures" {
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, ownershipAllocationTest, .{});
 }
 
+fn visibilityAllocationTest(allocator: std.mem.Allocator) !void {
+    var compilation = Compilation.init(allocator);
+    defer compilation.deinit();
+    const root = try compilation.addSource("/visibility/main.nov",
+        \\let file = @import("lib.nov")
+        \\let named = @import("std")
+        \\let plain = file.unmarked
+        \\let denied = file.secret
+        \\let named_denied = named.unmarked
+        \\let exported = named.exported
+        \\let denied_namespace = file.hidden.visible
+        \\let allowed_alias = named.exposed.visible
+        \\let denied_alias = named.exposed.secret
+        \\let chained = named.chain.visible
+        \\let chained_denied = named.chain.secret
+    );
+    const library = try compilation.addSource("/visibility/lib.nov",
+        \\let unmarked = true
+        \\@[private]
+        \\let secret = true
+        \\@[public]
+        \\let exported = secret
+        \\@[private]
+        \\let hidden = @import("leaf.nov")
+        \\@[public]
+        \\let exposed = hidden
+        \\@[private]
+        \\let local_alias = exposed
+        \\@[public]
+        \\let chain = local_alias
+    );
+    const leaf = try compilation.addSource("/visibility/leaf.nov", "let visible = true\n@[private]\nlet secret = false");
+    compilation.setRoot(root);
+    const module = compilation.getModule(root).?;
+    const owner = compilation.getModule(library).?;
+    for ([_]struct { source: Source.Id, name: []const u8, target: Source.Id, named: bool }{
+        .{ .source = root, .name = "file", .target = library, .named = false },
+        .{ .source = root, .name = "named", .target = library, .named = true },
+        .{ .source = library, .name = "hidden", .target = leaf, .named = false },
+    }) |entry| {
+        const importing = compilation.getModule(entry.source).?;
+        const local = importing.lookup(entry.name).?;
+        try compilation.imports.append(allocator, .{
+            .declaration = compilation.declaration_ids.get(.{ .source = entry.source, .local = local }).?,
+            .target = entry.target,
+            .named = entry.named,
+            .span = importing.getDeclaration(local).?.name_span,
+        });
+    }
+    try compilation.prepareSemantics();
+    try std.testing.expect(!compilation.hasErrors());
+    for (compilation.imports.items[0..2]) |edge| {
+        try std.testing.expect(compilation.lookupNamespace(root, edge.declaration, "secret") == null);
+        const secret = compilation.lookupNamespace(library, edge.declaration, "secret").?;
+        try std.testing.expectEqual(owner.lookup("secret").?, compilation.getDeclaration(secret).?.local);
+        const exported = compilation.lookupNamespace(root, edge.declaration, "exported").?;
+        try std.testing.expectEqual(owner.lookup("exported").?, compilation.getDeclaration(exported).?.local);
+    }
+    for ([_][]const u8{ "denied", "named_denied", "denied_namespace", "denied_alias", "chained_denied" }) |name| {
+        const init_node = module.source.ast.decl(module.getDeclaration(module.lookup(name).?).?.node).ast.init_node;
+        try std.testing.expect(compilation.reference(module, init_node) == null);
+    }
+    for ([_][]const u8{ "plain", "exported", "allowed_alias", "chained" }) |name| {
+        const init_node = module.source.ast.decl(module.getDeclaration(module.lookup(name).?).?.node).ast.init_node;
+        const ref = compilation.reference(module, init_node).?;
+        try std.testing.expectEqual(if (std.mem.eql(u8, name, "allowed_alias") or std.mem.eql(u8, name, "chained")) leaf else library, ref.source);
+    }
+    const exported = owner.getDeclaration(owner.lookup("exported").?).?;
+    const ref = compilation.reference(owner, owner.source.ast.decl(exported.node).ast.init_node).?;
+    try std.testing.expectEqual(library, ref.source);
+    try std.testing.expectEqual(owner.lookup("secret").?, ref.local);
+}
+
+test "private namespace visibility preserves defining scopes and intentional reexports" {
+    try visibilityAllocationTest(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, visibilityAllocationTest, .{});
+}
+
 test "canonical diamond imports preserve namespaces and defining scopes" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
@@ -482,7 +563,7 @@ test "canonical diamond imports preserve namespaces and defining scopes" {
     const root = compilation.getModule(compilation.root.?).?;
     try std.testing.expect(root.lookup("Value") == null);
     const edge = compilation.imports.items[0];
-    const helper = compilation.lookupNamespace(edge.declaration, "helper").?;
+    const helper = compilation.lookupNamespace(root.source.id, edge.declaration, "helper").?;
     try std.testing.expectEqual(edge.target, compilation.getDeclaration(helper).?.source);
 }
 

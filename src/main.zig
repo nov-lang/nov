@@ -5,6 +5,7 @@ const Ir = @import("Ir.zig");
 const TypeResolver = @import("TypeResolver.zig");
 const TypeAliases = @import("TypeAliases.zig");
 const Enums = @import("Enums.zig");
+const Visibility = @import("Visibility.zig");
 const Sema = @import("Sema.zig");
 const Literal = @import("Literal.zig");
 const BodyChecker = @import("BodyChecker.zig");
@@ -996,6 +997,7 @@ test {
     _ = TypeResolver;
     _ = TypeAliases;
     _ = Enums;
+    _ = Visibility;
     _ = Sema;
     _ = Literal;
     _ = BodyChecker;

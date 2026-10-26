@@ -752,11 +752,12 @@ The delivered subset is deliberately bounded:
   separated by spaces, with the existing checked-write/flush behavior. Thus a
   method's own effects can precede later argument effects; conversions are not
   repeated by the final write. Allocating methods return normal immutable strings.
-- Exactly one argument-free `@[public]` is accepted on supported immutable
-  declarations, including structs, methods and module re-exports. Named import
-  namespaces enforce public top-level exports; method-level access control remains
-  incomplete. This does not change C export policy. Duplicate, unknown or invalidly
-  placed attributes diagnose instead of being ignored.
+- One argument-free `@[public]` or `@[private]` is accepted on supported immutable
+  declarations, including structs, methods and module re-exports. Private declarations
+  and methods are accessible only within their defining file, including implicit
+  `toString` calls. Named imports require public top-level exports; unmarked method
+  access remains unchanged. This does not change C export policy. Duplicate,
+  conflicting, unknown or invalidly placed attributes diagnose.
 
 C emission uses stack value structs with index-mangled fields and injectively
 mangled method symbols. Reachable layouts precede function-pointer typedefs and
@@ -1094,9 +1095,11 @@ See [`lib/README.md`](lib/README.md).
   cannot collide or become the entrypoint. Build output cannot overwrite any loaded
   source, including imported/library files or their resolved symlink targets.
 - Named namespaces expose public top-level declarations only; explicit file imports
-  also expose unmarked declarations. This is not complete visibility enforcement:
-  method access through exported nominal types still permits unmarked methods,
-  and `@[private]` remains unsupported. Public exports do not define a C ABI.
+  also expose unmarked declarations. `@[private]` top-level declarations and methods
+  are file-private through either import form, including aliases and re-exports.
+  A public local alias may intentionally expose a private type; its private methods
+  remain hidden. Unmarked methods remain accessible through exported nominal types;
+  their broader visibility policy is deferred. Public exports do not define a C ABI.
 - Plain `check` remains syntax-only for its input files; `check --semantic`, emit-c,
   build and run load the import graph. Formatting preserves import literals and
   does not load imports. General runtime module initializers, wildcard injection,
@@ -2122,14 +2125,14 @@ TODO
 - `@[require(condition..., "optional error message")`: Ensure that the specified conditions are verified for the arguments given to a function or to a container initializer.
 <!-- - `@[ensure(condition..., "optional error message")`: Ensure that the specified conditions are verified for the values returned by a function. -->
 
-The executable subset accepts a single argument-free `@[public]` on supported
-immutable declarations, including types, functions, constants and re-exports.
-Named namespaces enforce public top-level access, while member-level visibility
-remains incomplete; C exports are unchanged. It also accepts argument-free
-`@[noreturn]` on ordinary function and method declarations; the attributes may be
-combined where both are supported. Duplicate attributes, arguments, invalid
-placements and unknown/unsupported attributes diagnose. Other entries in this list
-remain design proposals.
+The executable subset accepts one argument-free `@[public]` or `@[private]` on
+supported immutable declarations, including types, functions, constants and
+re-exports. Private declarations and methods are file-private; named namespaces
+require public top-level exports. Unmarked method access remains unchanged; C
+exports are unchanged. Argument-free `@[noreturn]` on ordinary functions and methods
+may be combined with either visibility attribute where supported. Duplicate or
+conflicting attributes, arguments, invalid placements and unknown/unsupported
+attributes diagnose. Other entries in this list remain design proposals.
 
 ### Non-returning functions
 
@@ -2162,17 +2165,25 @@ use `_Noreturn`; function-pointer typedefs remain ordinary void-returning types.
 Attributes can be set only on top level / container declarations
 
 ## Visibility
-Named import namespaces currently enforce `@[public]` for top-level exports;
-explicit file imports also expose unmarked declarations. Public re-exports work.
-Full member-level access control and `@[private]` are not implemented; method lookup
-through exported nominal types still permits unmarked methods. The broader rules
-below describe the intended design, not a claim of complete enforcement.
-Visibility is modified via [attributes](#Attributes).
+Named import namespaces enforce `@[public]` for top-level exports; explicit file
+imports also expose unmarked declarations. `@[private]` declarations and methods
+are accessible only to code in their defining file, not merely their container.
+Aliases and re-exports do not bypass private namespace members or methods; public
+wrappers can call private helpers in their defining file. Public type aliases may
+intentionally expose private local types without exposing private methods.
+
+Visibility is modified via [attributes](#Attributes). The implemented rules are:
 
 - public: visible everywhere
 - private: visible only in current file
-- no modifier: visible when importing as a file (`@import("std.nov")`) but not
-               when importing as a module (`@import("std")`)
+- no modifier on top-level declarations: visible when importing as a file
+  (`@import("std.nov")`) but not as a module (`@import("std")`)
+
+Unmarked methods are still callable through accessible nominal types, including
+through named imports. Applying the file-versus-module distinction to those methods
+is deferred; private methods are already checked for static calls, receiver calls,
+function-value extraction, printing and interpolation. Fields and union variants do
+not support visibility attributes.
 
 ## Comptime
 Works almost like zig except that we use `#` instead of `comptime`
