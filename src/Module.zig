@@ -3,10 +3,11 @@ const TestAllocations = @import("TestAllocations.zig");
 const Ast = @import("Ast.zig");
 const Source = @import("Source.zig");
 const primitives = @import("primitives.zig");
+const Compilation = @import("Compilation.zig");
 const Module = @This();
 
 allocator: std.mem.Allocator,
-compilation: ?*@import("Compilation.zig") = null,
+compilation: ?*Compilation = null,
 source: Source,
 declarations: std.ArrayList(Declaration) = .empty,
 diagnostics: std.ArrayList(Diagnostic) = .empty,
@@ -27,7 +28,6 @@ pub const Declaration = struct {
     is_generic: bool = false,
     container: ?DeclId = null,
     public: bool = false,
-    private: bool = false,
     noreturn: bool = false,
     /// Analysis-local canonical container TypeId for a specialized method.
     concrete_type: ?u32 = null,
@@ -392,19 +392,16 @@ fn collectDeclaration(self: *Module, node: Ast.Node.Index, container: ?DeclId) (
             break :blk call.ast.args.len == 0 and std.mem.eql(u8, self.source.ast.tokenSlice(self.source.ast.firstToken(call.ast.fn_expr)), "@This");
         };
         var public = false;
-        var private = false;
         var noreturn_annotation = false;
         for (declaration.attributes) |attribute| {
             const data = self.source.ast.nodes.items(.data)[attribute];
-            if (self.source.ast.nodes.items(.tag)[attribute] == .attr_one and data.rhs == 0 and std.mem.eql(u8, self.source.ast.tokenSlice(data.lhs), "public") and !declaration.ast.is_mutable and !public and !private) {
+            if (self.source.ast.nodes.items(.tag)[attribute] == .attr_one and data.rhs == 0 and std.mem.eql(u8, self.source.ast.tokenSlice(data.lhs), "public") and !declaration.ast.is_mutable and !public) {
                 public = true;
-            } else if (self.source.ast.nodes.items(.tag)[attribute] == .attr_one and data.rhs == 0 and std.mem.eql(u8, self.source.ast.tokenSlice(data.lhs), "private") and !declaration.ast.is_mutable and !public and !private) {
-                private = true;
             } else if (self.source.ast.nodes.items(.tag)[attribute] == .attr_one and data.rhs == 0 and std.mem.eql(u8, self.source.ast.tokenSlice(data.lhs), "noreturn") and self.source.ast.fullFnProto(declaration.ast.type_node) != null and !declaration.ast.is_mutable and !noreturn_annotation) {
                 noreturn_annotation = true;
             } else try self.diagnostics.append(self.allocator, .{ .tag = .unsupported_attribute, .span = self.tokenSpan(self.source.ast.firstToken(attribute)) });
         }
-        try self.declarations.append(self.allocator, .{ .name = name, .name_span = name_span, .node = node, .container = container, .is_record = is_record, .is_generic = is_generic, .is_type_alias = is_record or is_this_alias, .public = public, .private = private, .noreturn = noreturn_annotation });
+        try self.declarations.append(self.allocator, .{ .name = name, .name_span = name_span, .node = node, .container = container, .is_record = is_record, .is_generic = is_generic, .is_type_alias = is_record or is_this_alias, .public = public, .noreturn = noreturn_annotation });
     }
 }
 
@@ -510,28 +507,19 @@ test "struct methods have separate scopes stable module IDs and preserved public
 test "visibility metadata supports immutable declarations and noreturn in either order" {
     const source =
         \\let unmarked = true
-        \\@[private]
         \\let value = true
         \\@[public]
         \\let alias = value
-        \\@[private]
         \\let ns = @import("other.nov")
-        \\@[private]
         \\let R = struct {
-        \\@[private]
         \\let method: () = {}
         \\}
-        \\@[private]
         \\let E = enum { x, }
-        \\@[private]
         \\let U = union { x: bool, }
-        \\@[private]
         \\let G: (T: type) -> type = struct { x: T, }
-        \\@[private]
         \\@[noreturn]
         \\let stop: () = loop {}
         \\@[noreturn]
-        \\@[private]
         \\let halt: () = loop {}
         \\@[public]
         \\@[noreturn]
@@ -544,26 +532,26 @@ test "visibility metadata supports immutable declarations and noreturn in either
     defer module.deinit();
     try std.testing.expect(!module.hasErrors());
     const unmarked = module.getDeclaration(module.lookup("unmarked").?).?;
-    try std.testing.expect(!unmarked.private and !unmarked.public);
+    try std.testing.expect(!unmarked.public);
     for ([_][]const u8{ "value", "ns", "R", "E", "U", "G", "stop", "halt" }) |name| {
         const decl = module.getDeclaration(module.lookup(name).?).?;
-        try std.testing.expect(decl.private and !decl.public);
+        try std.testing.expect(!decl.public);
     }
     for ([_][]const u8{ "alias", "exit", "quit" }) |name| {
         const decl = module.getDeclaration(module.lookup(name).?).?;
-        try std.testing.expect(decl.public and !decl.private);
+        try std.testing.expect(decl.public);
     }
     const method = module.getDeclaration(module.lookupMethod(module.lookup("R").?, "method").?).?;
-    try std.testing.expect(method.private and !method.public);
+    try std.testing.expect(!method.public);
     for ([_][]const u8{ "stop", "halt", "exit", "quit" }) |name| {
         try std.testing.expect(module.getDeclaration(module.lookup(name).?).?.noreturn);
     }
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
 }
 
-test "duplicate conflicting and argument-bearing visibility attributes diagnose" {
+test "private unsupported duplicate and argument-bearing visibility attributes diagnose" {
     for ([_][]const u8{
-        "@[private]\n@[private]\nlet value = true",
+        "@[private]\nlet value = true",
         "@[private]\n@[public]\nlet value = true",
         "@[public]\n@[private]\nlet value = true",
         "@[public]\n@[public]\nlet value = true",
@@ -581,6 +569,19 @@ test "duplicate conflicting and argument-bearing visibility attributes diagnose"
         try std.testing.expectEqual(Diagnostic.Tag.unsupported_attribute, module.diagnostics.items[0].tag);
         try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
     }
+}
+
+test "repeated private attributes are each unsupported" {
+    const source = "@[private]\n@[private]\nlet value = true";
+    var module = try Module.init(std.testing.allocator, "private.nov", source);
+    defer module.deinit();
+    try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
+    try std.testing.expectEqual(@as(usize, 2), module.diagnostics.items.len);
+    for (module.diagnostics.items) |diagnostic| {
+        try std.testing.expectEqual(Diagnostic.Tag.unsupported_attribute, diagnostic.tag);
+    }
+    try std.testing.expect(!module.getDeclaration(module.lookup("value").?).?.public);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
 }
 
 test "struct attributes and duplicate method names diagnose without leaking declarations" {

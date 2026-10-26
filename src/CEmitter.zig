@@ -1872,8 +1872,11 @@ fn testImportedGenericStructs(allocator: std.mem.Allocator) ![]u8 {
             \\@[public]
             \\let Box:(T:type)->type=struct{value:T,kind:Kind=.good,
             \\let Self=@This()
+            \\@[public]
             \\let make:(value:T)->Self=Self[.value=value]
+            \\@[public]
             \\let toString:(self:Self)->string="<{self.value}>"
+            \\@[public]
             \\let message:(self:Self)->string=prefix+helper()
             \\}
         );
@@ -6369,6 +6372,7 @@ test "cross source generic reexports retain defining scope under forced GC after
             \\@[public]
             \\let unwrapOr:(self:Self,fallback:T)->T=match self{.ok=>|v|v
             \\.err=>fallback}
+            \\@[public]
             \\let message:(self:Self)->string=prefix+helper()
             \\}
         );
@@ -6494,9 +6498,9 @@ test "nested records imported forward diamond identities survive graph release a
             "let Root=struct{left:left.Box,right:right.Box,}\n" ++
             "let main:()={let mut r=Root[.left=left.make(),.right=right.make()]\nlet saved=r\nr.left.inner.s=\"changed\"+\"!\"\n@println(r.left.inner.s,saved.left.inner.s,r.right.inner.s)\n" ++
             "let mut a=[left.make(),right.make()]\nlet old=a\nlet mut v=a[0]\nv.inner.s=\"array\"+\"!\"\na[-1]=v\n@println(old[-1].inner.s,a[-1].inner.s)}");
-        const left = try comp.addSource("/left.nov", "let shared=@import(\"shared.nov\")\nlet Box=shared.Box\nlet make:()->Box=shared.make()");
-        const right = try comp.addSource("/right.nov", "let shared=@import(\"shared.nov\")\nlet Box=shared.Box\nlet make:()->Box=shared.make()");
-        const shared = try comp.addSource("/shared.nov", "let Box=struct{inner:Alias,}\nlet Alias=Leaf\nlet Leaf=struct{s:string,}\nlet make:()->Box=Box[.inner=Alias[.s=\"sha\"+\"red\"]]");
+        const left = try comp.addSource("/left.nov", "let shared=@import(\"shared.nov\")\n@[public]\nlet Box=shared.Box\n@[public]\nlet make:()->Box=shared.make()");
+        const right = try comp.addSource("/right.nov", "let shared=@import(\"shared.nov\")\n@[public]\nlet Box=shared.Box\n@[public]\nlet make:()->Box=shared.make()");
+        const shared = try comp.addSource("/shared.nov", "@[public]\nlet Box=struct{inner:Alias,}\nlet Alias=Leaf\nlet Leaf=struct{s:string,}\n@[public]\nlet make:()->Box=Box[.inner=Alias[.s=\"sha\"+\"red\"]]");
         for ([_]struct { source: Source.Id, name: []const u8, target: Source.Id }{
             .{ .source = root, .name = "left", .target = left },
             .{ .source = root, .name = "right", .target = right },

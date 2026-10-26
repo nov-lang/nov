@@ -965,7 +965,7 @@ test "build and run integrate discovery, preserve outputs, and clean temporary f
     defer allocator.free(source);
     try std.testing.expectEqualStrings("let main: () -> void = {}\n", source);
 
-    const imported_source = "let value: () -> bool = true\n";
+    const imported_source = "@[public]\nlet value: () -> bool = true\n";
     try tmp.dir.writeFile(io, .{ .sub_path = "imported.nov", .data = imported_source });
     try tmp.dir.writeFile(io, .{ .sub_path = "input.nov", .data = "let imported = @import(\"imported.nov\")\nlet main: () = @println(imported.value())\n" });
     try tmp.dir.symLink(io, "imported.nov", "imported-link.nov", .{});

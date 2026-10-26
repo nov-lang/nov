@@ -1096,10 +1096,13 @@ fn addGenericStructCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_st
         \\
         \\    let Self = @This()
         \\
+        \\    @[public]
         \\    let make: (value: T) -> Self = Self[ .value = value ]
         \\
+        \\    @[public]
         \\    let get: (self: Self) -> T = self.value
         \\
+        \\    @[public]
         \\    let toString: (self: Self) -> string = "<{self.value}>"
         \\}
         \\
@@ -1170,7 +1173,7 @@ fn addGenericStructCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_st
 }
 
 fn addFieldMutationCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step, fixtures: *std.Build.Step.WriteFile) void {
-    _ = fixtures.add("field-library.nov", "let K = enum { no, yes, }\nlet R = struct { x: int = 1, s: string = \"old\", b: bool = false, k: K = .no, len: uint = 0, }\n");
+    _ = fixtures.add("field-library.nov", "@[public]\nlet K = enum { no, yes, }\n@[public]\nlet R = struct { x: int = 1, s: string = \"old\", b: bool = false, k: K = .no, len: uint = 0, }\n");
     _ = fixtures.add("field-mutation.nov",
         \\let library = @import("field-library.nov")
         \\let Alias = library.R
@@ -1401,9 +1404,9 @@ fn addImportCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *st
         \\}
         \\
     );
-    _ = fixtures.add("app/parts/left.nov", "let shared = @import(\"../shared.nov\")\nlet value: () -> uint = shared.value()\n");
-    _ = fixtures.add("app/parts/right.nov", "let shared = @import(\".././shared.nov\")\nlet value: () -> uint = shared.value()\n");
-    _ = fixtures.add("app/shared.nov", "let value: () -> uint = 7\nlet main: () = @println(\"wrong entry\")\n");
+    _ = fixtures.add("app/parts/left.nov", "let shared = @import(\"../shared.nov\")\n@[public]\nlet value: () -> uint = shared.value()\n");
+    _ = fixtures.add("app/parts/right.nov", "let shared = @import(\".././shared.nov\")\n@[public]\nlet value: () -> uint = shared.value()\n");
+    _ = fixtures.add("app/shared.nov", "@[public]\nlet value: () -> uint = 7\nlet main: () = @println(\"wrong entry\")\n");
     _ = fixtures.add("relative.nov", "let left = @import(\"app/parts/left.nov\")\nlet right = @import(\"app/parts/right.nov\")\nlet main: () = @println(left.value(), right.value())\n");
     _ = fixtures.add("missing.nov", "let absent = @import(\"not-found.nov\")\nlet main: () = {}\n");
     _ = fixtures.add("cycle/a.nov", "let b = @import(\"b.nov\")\n");
@@ -1417,13 +1420,10 @@ fn addImportCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *st
     _ = fixtures.add("hidden.nov", "let standard = @import(\"std\")\nlet value: bool = standard.hidden\n");
     const visibility = fixtures.add("visibility/std.nov", "let hidden = true\n");
     _ = fixtures.add("private/library.nov",
-        \\@[private]
         \\let secret:int=7
         \\@[public]
         \\let Thing=struct{name:string,
-        \\@[private]
         \\let toString:(self:Thing)->string=self.name
-        \\@[private]
         \\let get:(self:Thing)->int=secret
         \\@[public]
         \\let report:(self:Thing)=@println(self,self.get())
@@ -1482,7 +1482,7 @@ fn addImportCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *st
         const root_name = b.fmt("protect-{s}.nov", .{target});
         const root_source = "let imported = @import(\"imported.nov\")\nlet standard = @import(\"std\")\nlet R = standard.Result(uint, string)\nlet main: () = @println(imported.value())\n";
         const root_file = protected.add(root_name, root_source);
-        const imported_source = "let value: () -> uint = 7\n";
+        const imported_source = "@[public]\nlet value: () -> uint = 7\n";
         const imported_file = protected.add("imported.nov", imported_source);
         const protected_library = protected.addCopyDirectory(b.path("lib"), "library", .{});
         const output_file = if (std.mem.eql(u8, target, "root")) root_file else if (std.mem.eql(u8, target, "relative")) imported_file else protected_library.path(b, b.fmt("{s}.nov", .{target}));

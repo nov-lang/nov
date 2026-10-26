@@ -296,7 +296,7 @@ test "generic structs late cycles expanding type arguments and layout depth reta
         defer source.deinit();
         for (0..depth - 1) |i| try source.writer.print("let R{d}=struct{{next:R{d},}}\n", .{ i, i + 1 });
         try source.writer.print("let R{d}=struct{{n:int=1,}}\n", .{depth - 1});
-        try source.writer.writeAll("let G:(T:type)->type=struct{some:T,}\nlet run:()={let x=G(R0)[.some={return}]\n}");
+        try source.writer.writeAll("let G:(T:type)->type=struct{some:T,}\n@[public]\nlet run:()={let x=G(R0)[.some={return}]\n}");
         const expected: ?Module.Diagnostic.Tag = if (depth == Ir.max_record_depth) .record_layout_limit else null;
         for ([_]bool{ false, true }) |imported| {
             try testLateGenericLayout(std.testing.allocator, source.written(), expected, imported);
@@ -1847,6 +1847,7 @@ fn testImportProgram(allocator: std.mem.Allocator) !Sema {
     );
     const result = try comp.addSource("/lib/result.nov",
         \\let prefix="library:"
+        \\@[public]
         \\let helper:()->string="helper"
         \\@[public]
         \\let Result:(T:type,E:type)->type=union{ok:T,err:E,
@@ -1854,6 +1855,7 @@ fn testImportProgram(allocator: std.mem.Allocator) !Sema {
         \\@[public]
         \\let unwrapOr:(self:Self,fallback:T)->T=match self{.ok=>|v|v
         \\.err=>fallback}
+        \\@[public]
         \\let label:(self:Self)->string=prefix+helper()
         \\}
     );
@@ -1909,26 +1911,37 @@ test "compilation diamond aliases canonicalize while colliding record and enum l
     );
     const left = try comp.addSource("/left.nov",
         \\let lib=@import("shared.nov")
+        \\@[public]
         \\let Shared=lib.Shared
+        \\@[public]
         \\let Kind=lib.Kind
+        \\@[public]
         \\let answer:()->bool=lib.answer()
     );
     const right = try comp.addSource("/right.nov",
         \\let lib=@import("shared.nov")
+        \\@[public]
         \\let Shared=lib.Shared
     );
     const shared = try comp.addSource("/shared.nov",
+        \\@[public]
         \\let Shared=struct{value:bool,
+        \\    @[public]
         \\    let get:(self:Shared)->bool=self.value
         \\}
+        \\@[public]
         \\let Kind=enum{one,two,}
+        \\@[public]
         \\let answer:()->bool=true
     );
     const other = try comp.addSource("/other.nov",
+        \\@[public]
         \\let Shared=struct{value:bool,
         \\    let get:(self:Shared)->bool=false
         \\}
+        \\@[public]
         \\let Kind=enum{one,two,}
+        \\@[public]
         \\let answer:()->bool=false
     );
     try testImport(&comp, root, "left", left, false);
@@ -1976,9 +1989,9 @@ test "compilation named namespaces reject unexported names and diagnose imported
         defer sema.deinit();
         try std.testing.expect(comp.hasErrors());
         try std.testing.expect(!sema.lowering_complete);
-        const module = comp.getModule(if (named) root else lib).?;
+        const module = comp.getModule(root).?;
         try std.testing.expect(module.diagnostics.items.len != 0);
-        try std.testing.expectEqual(if (named) root else lib, module.diagnostics.items[0].span.source);
+        try std.testing.expectEqual(root, module.diagnostics.items[0].span.source);
     }
 }
 
@@ -1998,16 +2011,21 @@ test "compilation namespace aliases direct generic applications and repeated dia
         \\    @println(c.get(false))}
     );
     const left = try comp.addSource("/left.nov",
+        \\@[public]
         \\let types=@import("types.nov")
+        \\@[public]
         \\let Result=types.Result
     );
     const right = try comp.addSource("/right.nov",
         \\let types=@import("types.nov")
+        \\@[public]
         \\let Result=types.Result
     );
     const types = try comp.addSource("/types.nov",
+        \\@[public]
         \\let Result:(T:type,E:type)->type=union{ok:T,err:E,
         \\let Self=@This()
+        \\@[public]
         \\let get:(self:Self,fallback:T)->T=match self{.ok=>|v|v
         \\.err=>fallback}
         \\}
@@ -2109,7 +2127,7 @@ test "compilation deferred globals preserve standalone diagnostics root and impo
     };
 }
 
-fn testQualifiedEnumGlobal(allocator: std.mem.Allocator, source: []const u8, expected: ?Module.Diagnostic.Tag) !void {
+fn testQualifiedEnumGlobal(allocator: std.mem.Allocator, source: []const u8, expected: ?Module.Diagnostic.Tag, named: bool) !void {
     var comp = Compilation.init(allocator);
     defer comp.deinit();
     _ = try comp.addSource("/unrelated.nov", "let marker=true");
@@ -2125,14 +2143,16 @@ fn testQualifiedEnumGlobal(allocator: std.mem.Allocator, source: []const u8, exp
         \\let hidden=true
     );
     const enums = try comp.addSource("/lib/enums.nov",
+        \\@[public]
         \\let E=enum{a,b,
         \\let unmarked:(self:E)->bool=true
         \\@[public]
         \\let published:(self:E)->bool=false
         \\}
+        \\@[public]
         \\let Other=enum{a,b,}
     );
-    try testImport(&comp, root, "lib", api, true);
+    try testImport(&comp, root, "lib", api, named);
     try testImport(&comp, api, "enums", enums, false);
     comp.setRoot(root);
     var result = lowerCompilation(&comp) catch |err| {
@@ -2152,7 +2172,7 @@ fn testQualifiedEnumGlobal(allocator: std.mem.Allocator, source: []const u8, exp
             try std.testing.expectEqual(root, diagnostic.related.?.source);
             try std.testing.expectEqualStrings("lib", module.sourceSlice(diagnostic.related.?).?);
         }
-        if (tag == .unknown_field) try std.testing.expectEqualStrings("missing", module.sourceSlice(diagnostic.span).?);
+        if (tag == .unknown_field) try std.testing.expectEqualStrings(if (std.mem.indexOf(u8, source, ".missing") != null) "missing" else "unmarked", module.sourceSlice(diagnostic.span).?);
     } else {
         try std.testing.expect(!comp.hasErrors());
         try std.testing.expect(result.lowering_complete);
@@ -2166,8 +2186,7 @@ fn testQualifiedEnumGlobal(allocator: std.mem.Allocator, source: []const u8, exp
             try std.testing.expectEqual(@as(u32, 0), nominal.identity);
         }
     }
-    // Named namespaces gate top-level exports. Existing nominal method lookup
-    // retains public metadata but does not enforce a separate access policy.
+    // Both import forms gate exports and preserve method visibility metadata.
     const namespace = comp.declaration_ids.get(.{ .source = root, .local = module.lookup("lib").? }).?;
     try std.testing.expect(comp.lookupNamespace(root, namespace, "hidden") == null);
     const defining = comp.getModule(enums).?;
@@ -2219,17 +2238,30 @@ test "namespace qualified enum globals support annotations inference aliases ree
         , .expected = .unsupported_global_initializer },
     };
     for (cases) |case| {
-        try testQualifiedEnumGlobal(std.testing.allocator, case.source, case.expected);
-        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testQualifiedEnumGlobal, .{ case.source, case.expected });
+        try testQualifiedEnumGlobal(std.testing.allocator, case.source, case.expected, true);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testQualifiedEnumGlobal, .{ case.source, case.expected, true });
     }
 }
 
-test "named namespace exported enum methods retain current unmarked and public access behavior" {
-    try testQualifiedEnumGlobal(std.testing.allocator,
-        \\let lib=@import("api")
-        \\let x:lib.E=lib.E.a
-        \\let main:()=@println(x.unmarked(),lib.E.unmarked(x),x.published(),lib.E.published(x))
-    , null);
+test "file and named namespace exported enum methods require explicit public access" {
+    for ([_]bool{ false, true }) |named| {
+        try testQualifiedEnumGlobal(std.testing.allocator,
+            \\let lib=@import("api")
+            \\let x:lib.E=lib.E.a
+            \\let main:()=@println(x.published(),lib.E.published(x))
+        , null, named);
+        try testQualifiedEnumGlobal(std.testing.allocator,
+            \\let lib=@import("api")
+            \\let x:lib.E=lib.E.a
+            \\let main:()=@println(x.unmarked())
+        , .unknown_field, named);
+        try testQualifiedEnumGlobal(std.testing.allocator,
+            \\let lib=@import("api")
+            \\let E=lib.E
+            \\let x:E=E.a
+            \\let main:()=@println(E.unmarked(x))
+        , .not_a_value, named);
+    }
 }
 
 test "nested records diagnose cycles defaults nominal replacements and invalid path bases under OOM" {
@@ -2287,7 +2319,7 @@ test "nested records imported cyclic layouts retain deterministic qualified diag
     var comp = Compilation.init(std.testing.allocator);
     defer comp.deinit();
     const root = try comp.addSource("/main.nov", "let types=@import(\"types.nov\")\nlet Outer=struct{inner:types.A,}\nlet main:()={}");
-    const types = try comp.addSource("/types.nov", "let A=struct{edge:Alias,}\nlet Alias=B\nlet B=struct{back:A,}");
+    const types = try comp.addSource("/types.nov", "@[public]\nlet A=struct{edge:Alias,}\nlet Alias=B\nlet B=struct{back:A,}");
     try testImport(&comp, root, "types", types, false);
     comp.setRoot(root);
     var result = try lowerCompilation(&comp);
@@ -2321,7 +2353,7 @@ test "nested records imported integer leaf widths preserve exact qualified backe
         var comp = Compilation.init(std.testing.allocator);
         defer comp.deinit();
         const root = try comp.addSource("/main.nov", "let types=@import(\"types.nov\")\nlet U=union{ok:types.Outer,none,}\nlet f:(cb:(U)->void)={}");
-        const source = try std.fmt.allocPrint(std.testing.allocator, "let Outer=struct{{left:Middle,right:Middle,}}\nlet Middle=struct{{leaf:Alias,}}\nlet Alias=Leaf\nlet Leaf=struct{{wide:{s},}}", .{width});
+        const source = try std.fmt.allocPrint(std.testing.allocator, "@[public]\nlet Outer=struct{{left:Middle,right:Middle,}}\nlet Middle=struct{{leaf:Alias,}}\nlet Alias=Leaf\nlet Leaf=struct{{wide:{s},}}", .{width});
         defer std.testing.allocator.free(source);
         const types = try comp.addSource("/types.nov", source);
         try testImport(&comp, root, "types", types, false);
@@ -2392,7 +2424,7 @@ test "nested records late body generic layouts diagnose depth before lowering pu
         defer source.deinit();
         for (0..depth - 1) |i| try source.writer.print("let R{d}=struct{{next:R{d},}}\n", .{ i, i + 1 });
         try source.writer.print("let R{d}=struct{{n:int=1,}}\n", .{depth - 1});
-        try source.writer.writeAll("let G:(T:type)->type=union{some:T,none,}\nlet run:()={let u:G(R0)=.none[]\n}");
+        try source.writer.writeAll("let G:(T:type)->type=union{some:T,none,}\n@[public]\nlet run:()={let u:G(R0)=.none[]\n}");
         const expected: ?Module.Diagnostic.Tag = if (depth == Ir.max_record_depth) .record_layout_limit else null;
         for ([_]bool{ false, true }) |imported| {
             try testLateGenericLayout(std.testing.allocator, source.written(), expected, imported);
@@ -2403,8 +2435,8 @@ test "nested records late body generic layouts diagnose depth before lowering pu
 
 test "nested records late body recursive generic instances retain source diagnostics" {
     for ([_][]const u8{
-        "let G:(T:type)->type=union{some:G(T),none,}\nlet run:()={let u:G(int)=.none[]\n}",
-        "let G:(T:type)->type=union{some:H(T),none,}\nlet H:(T:type)->type=union{some:G(T),none,}\nlet run:()={let u:G(int)=.none[]\n}",
+        "let G:(T:type)->type=union{some:G(T),none,}\n@[public]\nlet run:()={let u:G(int)=.none[]\n}",
+        "let G:(T:type)->type=union{some:H(T),none,}\nlet H:(T:type)->type=union{some:G(T),none,}\n@[public]\nlet run:()={let u:G(int)=.none[]\n}",
     }) |source| {
         for ([_]bool{ false, true }) |imported| {
             try testLateGenericLayout(std.testing.allocator, source, .generic_cycle, imported);

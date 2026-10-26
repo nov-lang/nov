@@ -115,19 +115,12 @@ fn checkCase(allocator: std.mem.Allocator, case: Case) !void {
 }
 
 const private_declarations =
-    \\@[private]
     \\let value:int=7
-    \\@[private]
     \\let secret:()->int=value
-    \\@[private]
     \\let Hidden=struct{value:int,}
-    \\@[private]
     \\let Kind=enum{one,two,}
-    \\@[private]
     \\let Choice=union{some:int,none:void,}
-    \\@[private]
     \\let Box:(T:type)->type=struct{value:T,}
-    \\@[private]
     \\let Option:(T:type)->type=union{some:T,none:void,}
     \\@[public]
     \\let exposedValue:()->int=value
@@ -192,6 +185,24 @@ test "visibility private top level declarations reject direct and namespace alia
     }
 }
 
+test "visibility unmarked reexports stay private in both import modes" {
+    const facade = declaration_reexports ++ "\nlet Local=lib.Exposed\nlet LocalBox=lib.ExposedBox\nlet localRun:()->int=lib.wrapper()";
+    for ([_]bool{ false, true }) |named| {
+        for ([_][]const u8{
+            "let H=api.Local\nlet main:()={let h:H=H[.value=1]\n}",
+            "let G=api.LocalBox\nlet main:()={let g:G(int)=G(int)[.value=1]\n}",
+            "let main:()=@println(api.localRun())",
+            "let main:()=@println(api.lib.wrapper())",
+        }) |root| try checkCase(std.testing.allocator, .{
+            .library = private_declarations,
+            .facade = facade,
+            .root = root,
+            .named = named,
+            .rejected = true,
+        });
+    }
+}
+
 test "visibility public type aliases reexports and wrappers expose private local declarations" {
     for ([_]bool{ false, true }) |named| {
         try checkCase(std.testing.allocator, .{
@@ -221,12 +232,19 @@ const shapes = [_]Shape{
     .{ .declaration = "let Thing:(T:type)->type=union{some:T,none:void,\n", .concrete = "Thing(int)", .constructor = ".some[1]" },
 };
 
-fn methodLibrary(allocator: std.mem.Allocator, shape: Shape) ![]const u8 {
+fn methodLibrary(allocator: std.mem.Allocator, shape: Shape, public_methods: bool) ![]const u8 {
     return std.mem.concat(allocator, u8, &.{
-        "@[private]\nlet free:int=7\n@[private]\nlet helper:()->int=free\n@[public]\n",
+        "let free:int=7\nlet helper:()->int=free\n@[public]\n",
         shape.declaration,
-        "let Self=@This()\n@[private]\nlet secret:()->int=helper()\n@[private]\nlet get:(self:Self)->int=helper()\n@[private]\nlet toString:(self:Self)->string=\"private\"\n",
+        "let Self=@This()\n",
+        if (public_methods) "@[public]\n" else "",
+        "let secret:()->int=helper()\n",
+        if (public_methods) "@[public]\n" else "",
+        "let get:(self:Self)->int=helper()\n",
+        if (public_methods) "@[public]\n" else "",
+        "let toString:(self:Self)->string=\"private\"\n",
         "@[public]\nlet wrapper:(self:Self)->int=Self.secret()+self.get()\n",
+        if (public_methods) "@[public]\n" else "",
         "let unmarked:(self:Self)->int=self.get()\n}\n",
         "@[public]\nlet Alias=Thing\n@[public]\nlet run:()->int={let x:",
         shape.concrete,
@@ -248,13 +266,33 @@ fn methodLibrary(allocator: std.mem.Allocator, shape: Shape) ![]const u8 {
 
 const method_reexports = "@[public]\nlet Thing=lib.Alias\n@[public]\nlet run:()->int=lib.run()";
 
-test "visibility private methods allow defining file calls wrappers and unchanged unmarked methods" {
+test "visibility private methods allow defining file calls and public wrappers" {
     for (shapes) |shape| {
-        const library = try methodLibrary(std.testing.allocator, shape);
+        const library = try methodLibrary(std.testing.allocator, shape, false);
         defer std.testing.allocator.free(library);
         const root = try std.mem.concat(std.testing.allocator, u8, &.{
-            "let Thing=api.Thing\nlet main:()={let x:",        shape.concrete, "=", shape.constructor,
-            "\n@println(x.wrapper(),x.unmarked(),api.run())}",
+            "let Thing=api.Thing\nlet main:()={let x:", shape.concrete, "=", shape.constructor,
+            "\n@println(x.wrapper(),api.run())}",
+        });
+        defer std.testing.allocator.free(root);
+        for ([_]bool{ false, true }) |named| try checkCase(std.testing.allocator, .{
+            .library = library,
+            .facade = method_reexports,
+            .root = root,
+            .named = named,
+        });
+    }
+}
+
+test "visibility explicit public static receiver extracted and toString methods work across files" {
+    for (shapes) |shape| {
+        const library = try methodLibrary(std.testing.allocator, shape, true);
+        defer std.testing.allocator.free(library);
+        const root = try std.mem.concat(std.testing.allocator, u8, &.{
+            "let Thing=api.Thing\nlet main:()={let x:", shape.concrete, "=",                                                                                    shape.constructor,
+            "\nlet f:()->int=",                         shape.concrete, ".secret\nlet get:(",                                                                   shape.concrete,
+            ")->int=",                                  shape.concrete, ".get\nlet text:(",                                                                     shape.concrete,
+            ")->string=",                               shape.concrete, ".toString\n@println(f(),get(x),text(x),x.get(),x.unmarked(),x.toString(),x,\"{x}\")}",
         });
         defer std.testing.allocator.free(root);
         for ([_]bool{ false, true }) |named| try checkCase(std.testing.allocator, .{
@@ -268,12 +306,14 @@ test "visibility private methods allow defining file calls wrappers and unchange
 
 test "visibility private static receiver toString and method extraction stay hidden through aliases" {
     for (shapes) |shape| {
-        const library = try methodLibrary(std.testing.allocator, shape);
+        const library = try methodLibrary(std.testing.allocator, shape, false);
         defer std.testing.allocator.free(library);
         for ([_][]const u8{ "lib.Thing", "lib.Alias", "api.Thing", "api.ns.Thing" }) |path| {
             for ([_][]const u8{
                 "@println(TYPE.secret())",
                 "@println(x.get())",
+                "@println(x.unmarked())",
+                "let f:(TYPE)->int=TYPE.unmarked\n@println(f(x))",
                 "@println(x.toString())",
                 "@println(x)",
                 "@println(\"{x}\")",
@@ -287,10 +327,11 @@ test "visibility private static receiver toString and method extraction stay hid
                     "let Thing=", path, "\nlet main:()={let x:", shape.concrete, "=", shape.constructor, "\n", call, "}",
                 });
                 defer std.testing.allocator.free(root);
-                try checkCase(std.testing.allocator, .{
+                for ([_]bool{ false, true }) |named| try checkCase(std.testing.allocator, .{
                     .library = library,
                     .facade = method_reexports,
                     .root = root,
+                    .named = named,
                     .rejected = true,
                 });
             }
@@ -298,18 +339,55 @@ test "visibility private static receiver toString and method extraction stay hid
     }
 }
 
+test "visibility returned private nominal values retain method visibility" {
+    const library =
+        \\let Hidden=struct{value:int,
+        \\let get:(self:Hidden)->int=self.value
+        \\let toString:(self:Hidden)->string="hidden"
+        \\@[public]
+        \\let visible:(self:Hidden)->int=self.get()
+        \\}
+        \\@[public]
+        \\let make:()->Hidden=Hidden[.value=7]
+        \\@[public]
+        \\let wrapper:()->int={let x=make()
+        \\let f:(Hidden)->int=Hidden.get
+        \\@println(x,"{x}",x.toString())
+        \\f(x)+x.get()}
+    ;
+    for ([_]bool{ false, true }) |named| {
+        try checkCase(std.testing.allocator, .{
+            .library = library,
+            .root = "let main:()={let x=lib.make()\n@println(x.visible(),lib.wrapper())}",
+            .named = named,
+        });
+        for ([_][]const u8{
+            "@println(x.get())",
+            "let f=x.get\n@println(f(x))",
+            "@println(x.toString())",
+            "let f=x.toString\n@println(f(x))",
+            "@println(x)",
+            "@println(\"{x}\")",
+        }) |expression| {
+            const root = try std.mem.concat(std.testing.allocator, u8, &.{
+                "let main:()={let x=lib.make()\n", expression, "}",
+            });
+            defer std.testing.allocator.free(root);
+            try checkCase(std.testing.allocator, .{ .library = library, .root = root, .named = named, .rejected = true });
+        }
+    }
+}
+
 test "visibility namespace aliases retain member privacy despite public and private alias hops" {
     const library =
-        \\@[private]
         \\let hidden:int=7
+        \\@[public]
         \\let visible:()->int=hidden
     ;
     const facade =
-        \\@[private]
         \\let local=lib
         \\@[public]
         \\let exported=local
-        \\@[private]
         \\let again=exported
         \\@[public]
         \\let chain=again
@@ -320,7 +398,7 @@ test "visibility namespace aliases retain member privacy despite public and priv
                 "let main:()=@println(", path, if (rejected) ".hidden)" else ".visible())",
             });
             defer std.testing.allocator.free(root);
-            try checkCase(std.testing.allocator, .{ .library = library, .facade = facade, .root = root, .rejected = rejected });
+            for ([_]bool{ false, true }) |named| try checkCase(std.testing.allocator, .{ .library = library, .facade = facade, .root = root, .named = named, .rejected = rejected });
         }
     }
 }
@@ -337,7 +415,7 @@ fn ownedCase(allocator: std.mem.Allocator, case: Case) !void {
     }
 }
 
-fn aliasVisibility(allocator: std.mem.Allocator) !void {
+fn aliasVisibility(allocator: std.mem.Allocator, named: bool) !void {
     var comp = Compilation.init(allocator);
     defer comp.deinit();
     const root = try comp.addSource("/visibility/main.nov",
@@ -349,11 +427,8 @@ fn aliasVisibility(allocator: std.mem.Allocator) !void {
         \\let blocked=api.ns.secret
     );
     const library = try comp.addSource("/visibility/library.nov",
-        \\@[private]
         \\let secret:int=7
-        \\@[private]
         \\let hidden:()->int=secret
-        \\@[private]
         \\let Hidden=struct{value:int,}
         \\@[public]
         \\let value=secret
@@ -363,7 +438,6 @@ fn aliasVisibility(allocator: std.mem.Allocator) !void {
         \\let Type=Hidden
     );
     const facade = try comp.addSource("/visibility/facade.nov",
-        \\@[private]
         \\let lib=@import("library.nov")
         \\@[public]
         \\let ns=lib
@@ -374,8 +448,8 @@ fn aliasVisibility(allocator: std.mem.Allocator) !void {
         \\@[public]
         \\let Type=lib.Type
     );
-    try addImport(&comp, root, "lib", library, true);
-    try addImport(&comp, root, "api", facade, true);
+    try addImport(&comp, root, "lib", library, named);
+    try addImport(&comp, root, "api", facade, named);
     try addImport(&comp, facade, "lib", library, false);
     comp.setRoot(root);
     const root_module = comp.getModule(root).?;
@@ -410,12 +484,14 @@ fn aliasVisibility(allocator: std.mem.Allocator) !void {
 }
 
 test "visibility public local value function and type aliases retain defining file access" {
-    try aliasVisibility(std.testing.allocator);
-    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, aliasVisibility, .{});
+    for ([_]bool{ false, true }) |named| {
+        try aliasVisibility(std.testing.allocator, named);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, aliasVisibility, .{named});
+    }
 }
 
 test "visibility semantic ownership diagnostics and imports survive allocation failure sweeps" {
-    const library = try methodLibrary(std.testing.allocator, shapes[3]);
+    const library = try methodLibrary(std.testing.allocator, shapes[3], false);
     defer std.testing.allocator.free(library);
     for ([_]Case{
         .{ .library = library, .facade = method_reexports, .named = true, .root = "let main:()=@println(api.run())" },

@@ -70,9 +70,10 @@ Explicit relative `.nov` imports resolve from the importing file, not the proces
 working directory. For example, `@import("result.nov")` in `std.nov` refers to this
 directory's file. Imports yield compile-time namespaces, never runtime values.
 Canonical paths share one source and nominal identity across repeated/diamond
-imports; cycles diagnose. Named namespaces expose only public top-level exports;
-file namespaces also expose unmarked declarations. Member-level privacy and the
-`@[private]` attribute are not implemented yet.
+imports; cycles diagnose. Declarations and methods are file-private by default;
+both named and file imports expose only `@[public]` declarations. Public types do
+not automatically expose their methods. Aliases/re-exports and implicit `toString`
+calls preserve access checks. There is no `@[private]` attribute.
 
 The actual library is tested through real imports in semantic, emit-C, build/run,
 formatter, and relocated-install checks. `examples/results.nov` and
