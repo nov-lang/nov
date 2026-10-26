@@ -5869,14 +5869,16 @@ test "stdout failures panic including the program final flush" {
     try compileAndRunExpected(program, "typedef int nonempty_translation_unit;\n", 0, "true 42\n", "");
     // Replace one libc entry at a time. The wrappers fail only stdout, keeping
     // stderr reporting real and exercising panic's best-effort flush too.
+    // Fortified libc may define fprintf as a macro; enable fortification here
+    // so replacing that entry also exercises removal of the libc definition.
     const Case = struct { prefix: []const u8, stdout: []const u8 };
     for ([_]Case{
         .{ .prefix = "#include <stdio.h>\nstatic int fail_puts(const char *s, FILE *f) { (void)s; (void)f; return EOF; }\n#define fputs fail_puts\n", .stdout = "" },
         .{ .prefix = "#include <stdio.h>\nstatic int fail_putc(int c, FILE *f) { (void)c; (void)f; return EOF; }\n#define fputc fail_putc\n", .stdout = "true" },
-        .{ .prefix = "#include <stdio.h>\n#include <stdarg.h>\nstatic int fail_printf(FILE *f, const char *fmt, ...) { if (f == stdout) return -1; va_list args; va_start(args,fmt); int n = vfprintf(f,fmt,args); va_end(args); return n; }\n#define fprintf fail_printf\n", .stdout = "true " },
+        .{ .prefix = "#include <stdio.h>\n#include <stdarg.h>\nstatic int fail_printf(FILE *f, const char *fmt, ...) { if (f == stdout) return -1; va_list args; va_start(args,fmt); int n = vfprintf(f,fmt,args); va_end(args); return n; }\n#undef fprintf\n#define fprintf fail_printf\n", .stdout = "true " },
         .{ .prefix = "#include <stdio.h>\nstatic int fail_flush(FILE *f) { if (f == stdout) return EOF; return fflush(f); }\n#define fflush fail_flush\n", .stdout = "true 42\n" },
     }) |case| {
-        const injected = try std.mem.concat(test_gpa, u8, &.{ case.prefix, program });
+        const injected = try std.mem.concat(test_gpa, u8, &.{ "#ifndef _FORTIFY_SOURCE\n#define _FORTIFY_SOURCE 2\n#endif\n", case.prefix, program });
         defer test_gpa.free(injected);
         try compileAndRunExpected(injected, "typedef int nonempty_translation_unit;\n", 1, case.stdout, "panic: stdout write failed\n");
     }
