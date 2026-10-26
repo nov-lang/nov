@@ -1,4 +1,5 @@
 const std = @import("std");
+const TestAllocations = @import("TestAllocations.zig");
 const Diagnostics = @import("Diagnostics.zig");
 const Module = @import("Module.zig");
 const Ast = @import("Ast.zig");
@@ -40,7 +41,7 @@ pub fn analyze(module: *Module) Error!Dependencies {
     defer work.deinit(module.allocator);
     for (result.entries, 0..) |*entry, i| {
         entry.start = result.edges.items.len;
-        try result.scanInitializer(module, @enumFromInt(i), &work);
+        try result.scanInitializer(module, @fromBackingInt(@intCast(i)), &work);
         entry.end = result.edges.items.len;
     }
     try result.resolveGraph(module);
@@ -55,7 +56,7 @@ pub fn deinit(self: *Dependencies) void {
 }
 
 pub fn getState(self: *const Dependencies, id: Module.DeclId) ?State {
-    const index = @intFromEnum(id);
+    const index = @backingInt(id);
     if (index >= self.entries.len) return null;
     return self.entries[index].state;
 }
@@ -63,14 +64,14 @@ pub fn getState(self: *const Dependencies, id: Module.DeclId) ?State {
 /// Edges borrow this result; failed declarations may have only partial edges
 /// because unsupported subtrees are not traversed.
 pub fn getEdges(self: *const Dependencies, id: Module.DeclId) ?[]const Edge {
-    const index = @intFromEnum(id);
+    const index = @backingInt(id);
     if (index >= self.entries.len) return null;
     const entry = self.entries[index];
     return self.edges.items[entry.start..entry.end];
 }
 
 fn scanInitializer(self: *Dependencies, module: *Module, id: Module.DeclId, work: *std.ArrayList(Ast.Node.Index)) std.mem.Allocator.Error!void {
-    const entry = &self.entries[@intFromEnum(id)];
+    const entry = &self.entries[@backingInt(id)];
     const declaration = module.getDeclaration(id).?;
     const ast = &module.source.ast;
     const full = ast.decl(declaration.node);
@@ -190,11 +191,11 @@ fn resolveGraph(self: *Dependencies, module: *Module) std.mem.Allocator.Error!vo
     defer stack.deinit(self.allocator);
     for (self.entries, 0..) |*root, i| {
         if (root.state != .unvisited) continue;
-        try stack.append(self.allocator, .{ .id = @enumFromInt(i), .next = root.start });
+        try stack.append(self.allocator, .{ .id = @fromBackingInt(@intCast(i)), .next = root.start });
         root.state = .visiting;
         while (stack.items.len != 0) {
             const frame = &stack.items[stack.items.len - 1];
-            const entry = &self.entries[@intFromEnum(frame.id)];
+            const entry = &self.entries[@backingInt(frame.id)];
             if (frame.next == entry.end) {
                 if (entry.state == .visiting) {
                     entry.state = .resolved;
@@ -202,13 +203,13 @@ fn resolveGraph(self: *Dependencies, module: *Module) std.mem.Allocator.Error!vo
                 }
                 stack.items.len -= 1;
                 if (entry.state == .failed and stack.items.len != 0) {
-                    self.entries[@intFromEnum(stack.items[stack.items.len - 1].id)].state = .failed;
+                    self.entries[@backingInt(stack.items[stack.items.len - 1].id)].state = .failed;
                 }
                 continue;
             }
             const edge = self.edges.items[frame.next];
             frame.next += 1;
-            const target = &self.entries[@intFromEnum(edge.target)];
+            const target = &self.entries[@backingInt(edge.target)];
             switch (target.state) {
                 .unvisited => {
                     try stack.append(self.allocator, .{ .id = edge.target, .next = target.start });
@@ -237,7 +238,7 @@ test "global ascriptions skip types but never hide runtime dependencies" {
     try std.testing.expect(!module.hasErrors());
     for (module.declarations.items, 0..) |_, i| {
         try std.testing.expectEqual(State.resolved, result.entries[i].state);
-        try std.testing.expectEqual(@as(usize, 0), result.getEdges(@enumFromInt(i)).?.len);
+        try std.testing.expectEqual(@as(usize, 0), result.getEdges(@fromBackingInt(@intCast(i))).?.len);
     }
     for ([_][]const u8{
         "let n = @as(int, missing)",
@@ -252,9 +253,9 @@ test "global ascriptions skip types but never hide runtime dependencies" {
         defer rejected.deinit();
         try std.testing.expect(invalid.hasErrors());
         try std.testing.expectEqual(State.failed, rejected.entries[0].state);
-        try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
     }
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{module.source.ast.source});
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{module.source.ast.source});
 }
 
 test "value dependencies resolve forward references in dependency-first order" {
@@ -269,8 +270,8 @@ test "value dependencies resolve forward references in dependency-first order" {
     try std.testing.expectEqual(module.lookup("b").?, edges[0].target);
     try std.testing.expectEqualStrings("b", module.sourceSlice(edges[0].span).?);
     try std.testing.expectEqual(State.resolved, result.getState(module.lookup("a").?).?);
-    try std.testing.expect(result.getState(@enumFromInt(999)) == null);
-    try std.testing.expect(result.getEdges(@enumFromInt(999)) == null);
+    try std.testing.expect(result.getState(@fromBackingInt(@intCast(999))) == null);
+    try std.testing.expect(result.getEdges(@fromBackingInt(@intCast(999))) == null);
 }
 
 test "self and indirect value cycles identify the reference closing the cycle" {
@@ -385,7 +386,7 @@ test "dependency ownership and diagnostic rollback survive allocation failures" 
         "let a = f()\nlet f: () -> i32 = a",
         "let a: i32",
     }) |source| {
-        try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
     }
 }
 
@@ -402,5 +403,5 @@ test "long forward chains use an explicit work stack" {
     try std.testing.expectEqual(@as(usize, 257), result.order.items.len);
     try std.testing.expectEqual(module.lookup("name_256").?, result.order.items[0]);
     try std.testing.expectEqual(module.lookup("name_0").?, result.order.items[256]);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source.written()});
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source.written()});
 }

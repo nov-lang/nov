@@ -131,7 +131,7 @@ pub fn generate(allocator: Allocator, ast: *const Ast) Allocator.Error!Nir {
         error.AnalysisFail => {}, // Handled via compile_errors below.
     }
 
-    const err_index = @intFromEnum(Nir.ExtraIndex.compile_errors);
+    const err_index = @backingInt(Nir.ExtraIndex.compile_errors);
     if (astgen.compile_errors.items.len == 0) {
         astgen.extra.items[err_index] = 0;
     } else {
@@ -147,7 +147,7 @@ pub fn generate(allocator: Allocator, ast: *const Ast) Allocator.Error!Nir {
         }
     }
 
-    const imports_index = @intFromEnum(Nir.ExtraIndex.imports);
+    const imports_index = @backingInt(Nir.ExtraIndex.imports);
     if (astgen.imports.count() == 0) {
         astgen.extra.items[imports_index] = 0;
     } else {
@@ -742,7 +742,7 @@ const WipMembers = struct {
     }
 
     fn nextDecl(self: *WipMembers, decl_inst: Nir.Inst.Index) void {
-        self.payload.items[self.payload_top + self.decl_index] = @intFromEnum(decl_inst);
+        self.payload.items[self.payload_top + self.decl_index] = @backingInt(decl_inst);
         self.decl_index += 1;
     }
 
@@ -1091,7 +1091,7 @@ fn numberLiteral(
             var big_int = try std.math.big.int.Managed.init(astgen.allocator);
             defer big_int.deinit();
             const prefix_offset: usize = if (base == .decimal) 0 else 2;
-            big_int.setString(@intFromEnum(base), bytes[prefix_offset..]) catch |err| switch (err) {
+            big_int.setString(@backingInt(base), bytes[prefix_offset..]) catch |err| switch (err) {
                 error.InvalidCharacter => unreachable, // caught in parseNumberLiteral
                 error.InvalidBase => unreachable, // we only pass 16, 8, 2, see above
                 error.OutOfMemory => return error.OutOfMemory,
@@ -1325,8 +1325,8 @@ fn rvalueInner(
     const result = r: {
         if (raw_result.toIndex()) |result_index| {
             const nir_tags = ng.astgen.instructions.items(.tag);
-            const data = ng.astgen.instructions.items(.data)[@intFromEnum(result_index)];
-            if (nir_tags[@intFromEnum(result_index)].isAlwaysVoid(data)) {
+            const data = ng.astgen.instructions.items(.data)[@backingInt(result_index)];
+            if (nir_tags[@backingInt(result_index)].isAlwaysVoid(data)) {
                 break :r Nir.Inst.Ref.void_value;
             }
         }
@@ -1358,7 +1358,7 @@ fn rvalueInner(
             const result_index = coerced_result.toIndex() orelse
                 return ng.addUnTok(.ref, coerced_result, src_token);
             const nir_tags = ng.astgen.instructions.items(.tag);
-            if (nir_tags[@intFromEnum(result_index)].isParam() or astgen.isInferred(coerced_result))
+            if (nir_tags[@backingInt(result_index)].isParam() or astgen.isInferred(coerced_result))
                 return ng.addUnTok(.ref, coerced_result, src_token);
             const gop = try astgen.ref_table.getOrPut(astgen.allocator, result_index);
             if (!gop.found_existing) {
@@ -1368,25 +1368,25 @@ fn rvalueInner(
         },
         .ty => |ty_inst| {
             // Quickly eliminate some common, unnecessary type coercion.
-            const as_ty = @as(u64, @intFromEnum(Nir.Inst.Ref.type_type)) << 32;
-            const as_bool = @as(u64, @intFromEnum(Nir.Inst.Ref.bool_type)) << 32;
-            const as_void = @as(u64, @intFromEnum(Nir.Inst.Ref.void_type)) << 32;
-            const as_comptime_int = @as(u64, @intFromEnum(Nir.Inst.Ref.comptime_int_type)) << 32;
+            const as_ty = @as(u64, @backingInt(Nir.Inst.Ref.type_type)) << 32;
+            const as_bool = @as(u64, @backingInt(Nir.Inst.Ref.bool_type)) << 32;
+            const as_void = @as(u64, @backingInt(Nir.Inst.Ref.void_type)) << 32;
+            const as_comptime_int = @as(u64, @backingInt(Nir.Inst.Ref.comptime_int_type)) << 32;
             // const as_usize = @as(u64, @intFromEnum(Nir.Inst.Ref.usize_type)) << 32;
             // const as_u8 = @as(u64, @intFromEnum(Nir.Inst.Ref.u8_type)) << 32;
-            switch ((@as(u64, @intFromEnum(ty_inst)) << 32) | @as(u64, @intFromEnum(result))) {
-                as_ty | @intFromEnum(Nir.Inst.Ref.u8_type),
-                as_ty | @intFromEnum(Nir.Inst.Ref.i8_type),
-                as_ty | @intFromEnum(Nir.Inst.Ref.u16_type),
-                as_ty | @intFromEnum(Nir.Inst.Ref.i16_type),
-                as_ty | @intFromEnum(Nir.Inst.Ref.u32_type),
-                as_ty | @intFromEnum(Nir.Inst.Ref.i32_type),
-                as_ty | @intFromEnum(Nir.Inst.Ref.u64_type),
-                as_ty | @intFromEnum(Nir.Inst.Ref.i64_type),
-                as_ty | @intFromEnum(Nir.Inst.Ref.u128_type),
-                as_ty | @intFromEnum(Nir.Inst.Ref.i128_type),
-                as_ty | @intFromEnum(Nir.Inst.Ref.uint_type),
-                as_ty | @intFromEnum(Nir.Inst.Ref.int_type),
+            switch ((@as(u64, @backingInt(ty_inst)) << 32) | @as(u64, @backingInt(result))) {
+                as_ty | @backingInt(Nir.Inst.Ref.u8_type),
+                as_ty | @backingInt(Nir.Inst.Ref.i8_type),
+                as_ty | @backingInt(Nir.Inst.Ref.u16_type),
+                as_ty | @backingInt(Nir.Inst.Ref.i16_type),
+                as_ty | @backingInt(Nir.Inst.Ref.u32_type),
+                as_ty | @backingInt(Nir.Inst.Ref.i32_type),
+                as_ty | @backingInt(Nir.Inst.Ref.u64_type),
+                as_ty | @backingInt(Nir.Inst.Ref.i64_type),
+                as_ty | @backingInt(Nir.Inst.Ref.u128_type),
+                as_ty | @backingInt(Nir.Inst.Ref.i128_type),
+                as_ty | @backingInt(Nir.Inst.Ref.uint_type),
+                as_ty | @backingInt(Nir.Inst.Ref.int_type),
                 // as_ty | @intFromEnum(Nir.Inst.Ref.c_char_type),
                 // as_ty | @intFromEnum(Nir.Inst.Ref.c_short_type),
                 // as_ty | @intFromEnum(Nir.Inst.Ref.c_ushort_type),
@@ -1398,14 +1398,14 @@ fn rvalueInner(
                 // as_ty | @intFromEnum(Nir.Inst.Ref.c_ulonglong_type),
                 // as_ty | @intFromEnum(Nir.Inst.Ref.c_longdouble_type),
                 // as_ty | @intFromEnum(Nir.Inst.Ref.f16_type),
-                as_ty | @intFromEnum(Nir.Inst.Ref.f32_type),
-                as_ty | @intFromEnum(Nir.Inst.Ref.f64_type),
+                as_ty | @backingInt(Nir.Inst.Ref.f32_type),
+                as_ty | @backingInt(Nir.Inst.Ref.f64_type),
                 // as_ty | @intFromEnum(Nir.Inst.Ref.f80_type),
-                as_ty | @intFromEnum(Nir.Inst.Ref.f128_type),
-                as_ty | @intFromEnum(Nir.Inst.Ref.anyptr_type),
-                as_ty | @intFromEnum(Nir.Inst.Ref.bool_type),
-                as_ty | @intFromEnum(Nir.Inst.Ref.void_type),
-                as_ty | @intFromEnum(Nir.Inst.Ref.type_type),
+                as_ty | @backingInt(Nir.Inst.Ref.f128_type),
+                as_ty | @backingInt(Nir.Inst.Ref.anyptr_type),
+                as_ty | @backingInt(Nir.Inst.Ref.bool_type),
+                as_ty | @backingInt(Nir.Inst.Ref.void_type),
+                as_ty | @backingInt(Nir.Inst.Ref.type_type),
                 // as_ty | @intFromEnum(Nir.Inst.Ref.anyerror_type),
                 // as_ty | @intFromEnum(Nir.Inst.Ref.comptime_int_type),
                 // as_ty | @intFromEnum(Nir.Inst.Ref.comptime_float_type),
@@ -1423,17 +1423,17 @@ fn rvalueInner(
                 // as_ty | @intFromEnum(Nir.Inst.Ref.anyerror_void_error_union_type),
                 // as_ty | @intFromEnum(Nir.Inst.Ref.generic_poison_type),
                 // as_ty | @intFromEnum(Nir.Inst.Ref.empty_struct_type),
-                as_comptime_int | @intFromEnum(Nir.Inst.Ref.zero),
-                as_comptime_int | @intFromEnum(Nir.Inst.Ref.one),
-                as_comptime_int | @intFromEnum(Nir.Inst.Ref.negative_one),
+                as_comptime_int | @backingInt(Nir.Inst.Ref.zero),
+                as_comptime_int | @backingInt(Nir.Inst.Ref.one),
+                as_comptime_int | @backingInt(Nir.Inst.Ref.negative_one),
                 // as_usize | @intFromEnum(Nir.Inst.Ref.zero_usize),
                 // as_usize | @intFromEnum(Nir.Inst.Ref.one_usize),
                 // as_u8 | @intFromEnum(Nir.Inst.Ref.zero_u8),
                 // as_u8 | @intFromEnum(Nir.Inst.Ref.one_u8),
                 // as_u8 | @intFromEnum(Nir.Inst.Ref.four_u8),
-                as_bool | @intFromEnum(Nir.Inst.Ref.bool_true),
-                as_bool | @intFromEnum(Nir.Inst.Ref.bool_false),
-                as_void | @intFromEnum(Nir.Inst.Ref.void_value),
+                as_bool | @backingInt(Nir.Inst.Ref.bool_true),
+                as_bool | @backingInt(Nir.Inst.Ref.bool_false),
+                as_void | @backingInt(Nir.Inst.Ref.void_value),
                 => return result, // type of result is already correct
 
                 // as_usize | @intFromEnum(Nir.Inst.Ref.zero) => return .zero_usize,
@@ -1690,7 +1690,7 @@ fn appendErrorNodeNotes(
 ) Allocator.Error!void {
     @branchHint(.cold);
     const string_bytes = &astgen.string_bytes;
-    const msg: Nir.NullTerminatedString = @enumFromInt(string_bytes.items.len);
+    const msg: Nir.NullTerminatedString = @fromBackingInt(@intCast(string_bytes.items.len));
     try string_bytes.writer(astgen.allocator).print(format ++ "\x00", args);
     const notes_index: u32 = if (notes.len != 0) blk: {
         const notes_start = astgen.extra.items.len;
@@ -1782,7 +1782,7 @@ fn appendErrorTokNotesOff(
     @branchHint(.cold);
     const allocator = astgen.allocator;
     const string_bytes = &astgen.string_bytes;
-    const msg: Nir.NullTerminatedString = @enumFromInt(string_bytes.items.len);
+    const msg: Nir.NullTerminatedString = @fromBackingInt(@intCast(string_bytes.items.len));
     try string_bytes.writer(allocator).print(format ++ "\x00", args);
     const notes_index: u32 = if (notes.len != 0) blk: {
         const notes_start = astgen.extra.items.len;
@@ -1818,7 +1818,7 @@ fn errNoteTokOff(
 ) Allocator.Error!u32 {
     @branchHint(.cold);
     const string_bytes = &astgen.string_bytes;
-    const msg: Nir.NullTerminatedString = @enumFromInt(string_bytes.items.len);
+    const msg: Nir.NullTerminatedString = @fromBackingInt(@intCast(string_bytes.items.len));
     try string_bytes.writer(astgen.allocator).print(format ++ "\x00", args);
     return astgen.addExtra(Nir.Inst.CompileErrors.Item{
         .msg = msg,
@@ -1837,7 +1837,7 @@ fn errNoteNode(
 ) Allocator.Error!u32 {
     @branchHint(.cold);
     const string_bytes = &astgen.string_bytes;
-    const msg: Nir.NullTerminatedString = @enumFromInt(string_bytes.items.len);
+    const msg: Nir.NullTerminatedString = @fromBackingInt(@intCast(string_bytes.items.len));
     try string_bytes.writer(astgen.allocator).print(format ++ "\x00", args);
     return astgen.addExtra(Nir.Inst.CompileErrors.Item{
         .msg = msg,
@@ -1862,11 +1862,11 @@ fn identAsString(astgen: *AstGen, ident_token: Ast.TokenIndex) Error!Nir.NullTer
     );
     if (gop.found_existing) {
         string_bytes.shrinkRetainingCapacity(str_index);
-        return @enumFromInt(gop.key_ptr.*);
+        return @fromBackingInt(@intCast(gop.key_ptr.*));
     } else {
         gop.key_ptr.* = str_index;
         try string_bytes.append(allocator, 0);
-        return @enumFromInt(str_index);
+        return @fromBackingInt(@intCast(str_index));
     }
 }
 
@@ -1931,11 +1931,11 @@ fn docCommentAsStringFromFirst(
 
     if (gop.found_existing) {
         string_bytes.shrinkRetainingCapacity(str_index);
-        return @enumFromInt(gop.key_ptr.*);
+        return @fromBackingInt(@intCast(gop.key_ptr.*));
     } else {
         gop.key_ptr.* = str_index;
         try string_bytes.append(allocator, 0);
-        return @enumFromInt(str_index);
+        return @fromBackingInt(@intCast(str_index));
     }
 }
 
@@ -1949,7 +1949,7 @@ fn strLitAsString(astgen: *AstGen, str_lit_token: Ast.TokenIndex) !IndexSlice {
     try astgen.parseStrLit(str_lit_token, string_bytes, token_bytes, 0);
     const key: []const u8 = string_bytes.items[str_index..];
     if (std.mem.indexOfScalar(u8, key, 0)) |_| return .{
-        .index = @enumFromInt(str_index),
+        .index = @fromBackingInt(@intCast(str_index)),
         .len = @intCast(key.len),
     };
     const gop = try astgen.string_table.getOrPutContextAdapted(allocator, key, StringIndexAdapter{
@@ -1960,7 +1960,7 @@ fn strLitAsString(astgen: *AstGen, str_lit_token: Ast.TokenIndex) !IndexSlice {
     if (gop.found_existing) {
         string_bytes.shrinkRetainingCapacity(str_index);
         return .{
-            .index = @enumFromInt(gop.key_ptr.*),
+            .index = @fromBackingInt(@intCast(gop.key_ptr.*)),
             .len = @intCast(key.len),
         };
     } else {
@@ -1970,7 +1970,7 @@ fn strLitAsString(astgen: *AstGen, str_lit_token: Ast.TokenIndex) !IndexSlice {
         // be null terminated for that to work.
         try string_bytes.append(allocator, 0);
         return .{
-            .index = @enumFromInt(str_index),
+            .index = @fromBackingInt(@intCast(str_index)),
             .len = @intCast(key.len),
         };
     }
@@ -2008,7 +2008,7 @@ fn strLitNodeAsString(astgen: *AstGen, node: Ast.Node.Index) !IndexSlice {
     const len = string_bytes.items.len - str_index;
     try string_bytes.append(allocator, 0);
     return IndexSlice{
-        .index = @enumFromInt(str_index),
+        .index = @fromBackingInt(@intCast(str_index)),
         .len = @intCast(len),
     };
 }
@@ -2027,7 +2027,7 @@ fn testNameString(astgen: *AstGen, str_lit_token: Ast.TokenIndex) !Nir.NullTermi
         return astgen.failTok(str_lit_token, "empty test name must be omitted", .{});
     }
     try string_bytes.append(allocator, 0);
-    return @enumFromInt(str_index);
+    return @fromBackingInt(@intCast(str_index));
 }
 
 const Scope = struct {
@@ -2281,13 +2281,13 @@ const NirGen = struct {
         if (self.isEmpty()) return false;
         const tags = self.astgen.instructions.items(.tag);
         const last_inst = self.instructions.items[self.instructions.items.len - 1];
-        return tags[@intFromEnum(last_inst)].isNoReturn();
+        return tags[@backingInt(last_inst)].isNoReturn();
     }
 
     /// TODO all uses of this should be replaced with uses of `endsWithNoReturn`.
     fn refIsNoReturn(self: NirGen, inst_ref: Nir.Inst.Ref) bool {
         if (inst_ref.toIndex()) |inst_index| {
-            return self.astgen.instructions.items(.tag)[@intFromEnum(inst_index)].isNoReturn();
+            return self.astgen.instructions.items(.tag)[@backingInt(inst_index)].isNoReturn();
         }
         return false;
     }
@@ -2338,7 +2338,7 @@ const NirGen = struct {
             @typeInfo(Nir.Inst.BoolBr).Struct.fields.len + body_len,
         );
         const nir_datas = astgen.instructions.items(.data);
-        nir_datas[@intFromEnum(bool_br)].pl_node.payload_index = astgen.addExtraAssumeCapacity(Nir.Inst.BoolBr{
+        nir_datas[@backingInt(bool_br)].pl_node.payload_index = astgen.addExtraAssumeCapacity(Nir.Inst.BoolBr{
             .lhs = bool_br_lhs,
             .body_len = body_len,
         });
@@ -2357,7 +2357,7 @@ const NirGen = struct {
             @typeInfo(Nir.Inst.Block).Struct.fields.len + body_len,
         );
         const nir_datas = astgen.instructions.items(.data);
-        nir_datas[@intFromEnum(inst)].pl_node.payload_index = astgen.addExtraAssumeCapacity(
+        nir_datas[@backingInt(inst)].pl_node.payload_index = astgen.addExtraAssumeCapacity(
             Nir.Inst.Block{ .body_len = body_len },
         );
         astgen.appendBodyWithFixups(body);
@@ -2375,7 +2375,7 @@ const NirGen = struct {
             @typeInfo(Nir.Inst.Try).Struct.fields.len + body_len,
         );
         const nir_datas = astgen.instructions.items(.data);
-        nir_datas[@intFromEnum(inst)].pl_node.payload_index = astgen.addExtraAssumeCapacity(
+        nir_datas[@backingInt(inst)].pl_node.payload_index = astgen.addExtraAssumeCapacity(
             Nir.Inst.Try{
                 .operand = operand,
                 .body_len = body_len,
@@ -2425,7 +2425,7 @@ const NirGen = struct {
         const astgen = ng.astgen;
         const allocator = astgen.allocator;
         const ret_ref = if (args.ret_ref == .void_type) .none else args.ret_ref;
-        const new_index: Nir.Inst.Index = @enumFromInt(astgen.instructions.len);
+        const new_index: Nir.Inst.Index = @fromBackingInt(@intCast(astgen.instructions.len));
 
         try astgen.instructions.ensureUnusedCapacity(allocator, 1);
 
@@ -2531,56 +2531,56 @@ const NirGen = struct {
                 },
             });
             if (args.lib_name != .empty) {
-                astgen.extra.appendAssumeCapacity(@intFromEnum(args.lib_name));
+                astgen.extra.appendAssumeCapacity(@backingInt(args.lib_name));
             }
 
             const nir_datas = astgen.instructions.items(.data);
             if (align_body.len != 0) {
                 astgen.extra.appendAssumeCapacity(countBodyLenAfterFixups(astgen, align_body));
                 astgen.appendBodyWithFixups(align_body);
-                const break_extra = nir_datas[@intFromEnum(align_body[align_body.len - 1])].@"break".payload_index;
+                const break_extra = nir_datas[@backingInt(align_body[align_body.len - 1])].@"break".payload_index;
                 astgen.extra.items[break_extra + std.meta.fieldIndex(Nir.Inst.Break, "block_inst").?] =
-                    @intFromEnum(new_index);
+                    @backingInt(new_index);
             } else if (args.align_ref != .none) {
-                astgen.extra.appendAssumeCapacity(@intFromEnum(args.align_ref));
+                astgen.extra.appendAssumeCapacity(@backingInt(args.align_ref));
             }
             if (addrspace_body.len != 0) {
                 astgen.extra.appendAssumeCapacity(countBodyLenAfterFixups(astgen, addrspace_body));
                 astgen.appendBodyWithFixups(addrspace_body);
                 const break_extra =
-                    nir_datas[@intFromEnum(addrspace_body[addrspace_body.len - 1])].@"break".payload_index;
+                    nir_datas[@backingInt(addrspace_body[addrspace_body.len - 1])].@"break".payload_index;
                 astgen.extra.items[break_extra + std.meta.fieldIndex(Nir.Inst.Break, "block_inst").?] =
-                    @intFromEnum(new_index);
+                    @backingInt(new_index);
             } else if (args.addrspace_ref != .none) {
-                astgen.extra.appendAssumeCapacity(@intFromEnum(args.addrspace_ref));
+                astgen.extra.appendAssumeCapacity(@backingInt(args.addrspace_ref));
             }
             if (section_body.len != 0) {
                 astgen.extra.appendAssumeCapacity(countBodyLenAfterFixups(astgen, section_body));
                 astgen.appendBodyWithFixups(section_body);
                 const break_extra =
-                    nir_datas[@intFromEnum(section_body[section_body.len - 1])].@"break".payload_index;
+                    nir_datas[@backingInt(section_body[section_body.len - 1])].@"break".payload_index;
                 astgen.extra.items[break_extra + std.meta.fieldIndex(Nir.Inst.Break, "block_inst").?] =
-                    @intFromEnum(new_index);
+                    @backingInt(new_index);
             } else if (args.section_ref != .none) {
-                astgen.extra.appendAssumeCapacity(@intFromEnum(args.section_ref));
+                astgen.extra.appendAssumeCapacity(@backingInt(args.section_ref));
             }
             if (cc_body.len != 0) {
                 astgen.extra.appendAssumeCapacity(countBodyLenAfterFixups(astgen, cc_body));
                 astgen.appendBodyWithFixups(cc_body);
-                const break_extra = nir_datas[@intFromEnum(cc_body[cc_body.len - 1])].@"break".payload_index;
+                const break_extra = nir_datas[@backingInt(cc_body[cc_body.len - 1])].@"break".payload_index;
                 astgen.extra.items[break_extra + std.meta.fieldIndex(Nir.Inst.Break, "block_inst").?] =
-                    @intFromEnum(new_index);
+                    @backingInt(new_index);
             } else if (args.cc_ref != .none) {
-                astgen.extra.appendAssumeCapacity(@intFromEnum(args.cc_ref));
+                astgen.extra.appendAssumeCapacity(@backingInt(args.cc_ref));
             }
             if (ret_body.len != 0) {
                 astgen.extra.appendAssumeCapacity(countBodyLenAfterFixups(astgen, ret_body));
                 astgen.appendBodyWithFixups(ret_body);
-                const break_extra = nir_datas[@intFromEnum(ret_body[ret_body.len - 1])].@"break".payload_index;
+                const break_extra = nir_datas[@backingInt(ret_body[ret_body.len - 1])].@"break".payload_index;
                 astgen.extra.items[break_extra + std.meta.fieldIndex(Nir.Inst.Break, "block_inst").?] =
-                    @intFromEnum(new_index);
+                    @backingInt(new_index);
             } else if (ret_ref != .none) {
-                astgen.extra.appendAssumeCapacity(@intFromEnum(ret_ref));
+                astgen.extra.appendAssumeCapacity(@backingInt(ret_ref));
             }
 
             if (args.noalias_bits != 0) {
@@ -2633,11 +2633,11 @@ const NirGen = struct {
             if (ret_body.len != 0) {
                 astgen.appendBodyWithFixups(ret_body);
 
-                const break_extra = nir_datas[@intFromEnum(ret_body[ret_body.len - 1])].@"break".payload_index;
+                const break_extra = nir_datas[@backingInt(ret_body[ret_body.len - 1])].@"break".payload_index;
                 astgen.extra.items[break_extra + std.meta.fieldIndex(Nir.Inst.Break, "block_inst").?] =
-                    @intFromEnum(new_index);
+                    @backingInt(new_index);
             } else if (ret_ref != .none) {
-                astgen.extra.appendAssumeCapacity(@intFromEnum(ret_ref));
+                astgen.extra.appendAssumeCapacity(@backingInt(ret_ref));
             }
             astgen.appendBodyWithFixups(body);
             astgen.extra.appendSliceAssumeCapacity(src_locs_and_hash);
@@ -2697,16 +2697,16 @@ const NirGen = struct {
             .var_type = args.var_type,
         });
         if (args.lib_name != .empty) {
-            astgen.extra.appendAssumeCapacity(@intFromEnum(args.lib_name));
+            astgen.extra.appendAssumeCapacity(@backingInt(args.lib_name));
         }
         if (args.align_inst != .none) {
-            astgen.extra.appendAssumeCapacity(@intFromEnum(args.align_inst));
+            astgen.extra.appendAssumeCapacity(@backingInt(args.align_inst));
         }
         if (args.init != .none) {
-            astgen.extra.appendAssumeCapacity(@intFromEnum(args.init));
+            astgen.extra.appendAssumeCapacity(@backingInt(args.init));
         }
 
-        const new_index: Nir.Inst.Index = @enumFromInt(astgen.instructions.len);
+        const new_index: Nir.Inst.Index = @fromBackingInt(@intCast(astgen.instructions.len));
         astgen.instructions.appendAssumeCapacity(.{
             .tag = .extended,
             .data = .{ .extended = .{
@@ -2740,11 +2740,11 @@ const NirGen = struct {
         try astgen.instructions.ensureUnusedCapacity(allocator, 1);
         try astgen.string_bytes.ensureUnusedCapacity(allocator, @sizeOf(std.math.big.Limb) * limbs.len);
 
-        const new_index: Nir.Inst.Index = @enumFromInt(astgen.instructions.len);
+        const new_index: Nir.Inst.Index = @fromBackingInt(@intCast(astgen.instructions.len));
         astgen.instructions.appendAssumeCapacity(.{
             .tag = .int_big,
             .data = .{ .str = .{
-                .start = @enumFromInt(astgen.string_bytes.items.len),
+                .start = @fromBackingInt(@intCast(astgen.string_bytes.items.len)),
                 .len = @intCast(limbs.len),
             } },
         });
@@ -2785,7 +2785,7 @@ const NirGen = struct {
         src_node: Ast.Node.Index,
     ) !Nir.Inst.Index {
         assert(operand != .none);
-        const new_index: Nir.Inst.Index = @enumFromInt(ng.astgen.instructions.len);
+        const new_index: Nir.Inst.Index = @fromBackingInt(@intCast(ng.astgen.instructions.len));
         try ng.astgen.instructions.append(ng.astgen.allocator, .{
             .tag = tag,
             .data = .{ .un_node = .{
@@ -2808,7 +2808,7 @@ const NirGen = struct {
         try ng.astgen.instructions.ensureUnusedCapacity(allocator, 1);
 
         const payload_index = try ng.astgen.addExtra(extra);
-        const new_index: Nir.Inst.Index = @enumFromInt(ng.astgen.instructions.len);
+        const new_index: Nir.Inst.Index = @fromBackingInt(@intCast(ng.astgen.instructions.len));
         ng.astgen.instructions.appendAssumeCapacity(.{
             .tag = tag,
             .data = .{ .pl_node = .{
@@ -2865,7 +2865,7 @@ const NirGen = struct {
         ng.astgen.appendBodyWithFixups(param_body);
         param_ng.unstack();
 
-        const new_index: Nir.Inst.Index = @enumFromInt(ng.astgen.instructions.len);
+        const new_index: Nir.Inst.Index = @fromBackingInt(@intCast(ng.astgen.instructions.len));
         ng.astgen.instructions.appendAssumeCapacity(.{
             .tag = tag,
             .data = .{ .pl_tok = .{
@@ -2893,7 +2893,7 @@ const NirGen = struct {
         try ng.astgen.instructions.ensureUnusedCapacity(allocator, 1);
 
         const payload_index = try ng.astgen.addExtra(extra);
-        const new_index: Nir.Inst.Index = @enumFromInt(ng.astgen.instructions.len);
+        const new_index: Nir.Inst.Index = @fromBackingInt(@intCast(ng.astgen.instructions.len));
         ng.astgen.instructions.appendAssumeCapacity(.{
             .tag = .extended,
             .data = .{ .extended = .{
@@ -2925,7 +2925,7 @@ const NirGen = struct {
         const payload_index = astgen.addExtraAssumeCapacity(Nir.Inst.NodeMultiOp{
             .src_node = ng.nodeIndexToRelative(node),
         });
-        const new_index: Nir.Inst.Index = @enumFromInt(astgen.instructions.len);
+        const new_index: Nir.Inst.Index = @fromBackingInt(@intCast(astgen.instructions.len));
         astgen.instructions.appendAssumeCapacity(.{
             .tag = .extended,
             .data = .{ .extended = .{
@@ -2950,7 +2950,7 @@ const NirGen = struct {
 
         try ng.instructions.ensureUnusedCapacity(allocator, 1);
         try astgen.instructions.ensureUnusedCapacity(allocator, 1);
-        const new_index: Nir.Inst.Index = @enumFromInt(astgen.instructions.len);
+        const new_index: Nir.Inst.Index = @fromBackingInt(@intCast(astgen.instructions.len));
         astgen.instructions.appendAssumeCapacity(.{
             .tag = .extended,
             .data = .{ .extended = .{
@@ -2974,7 +2974,7 @@ const NirGen = struct {
 
         try ng.instructions.ensureUnusedCapacity(allocator, 1);
         try astgen.instructions.ensureUnusedCapacity(allocator, 1);
-        const new_index: Nir.Inst.Index = @enumFromInt(astgen.instructions.len);
+        const new_index: Nir.Inst.Index = @fromBackingInt(@intCast(astgen.instructions.len));
         astgen.instructions.appendAssumeCapacity(.{
             .tag = .extended,
             .data = .{ .extended = .{
@@ -3012,7 +3012,7 @@ const NirGen = struct {
         abs_tok_index: Ast.TokenIndex,
     ) !Nir.Inst.Index {
         const astgen = ng.astgen;
-        const new_index: Nir.Inst.Index = @enumFromInt(astgen.instructions.len);
+        const new_index: Nir.Inst.Index = @fromBackingInt(@intCast(astgen.instructions.len));
         assert(operand != .none);
         try astgen.instructions.append(astgen.allocator, .{
             .tag = tag,
@@ -3162,7 +3162,7 @@ const NirGen = struct {
         try ng.astgen.instructions.ensureUnusedCapacity(allocator, 1);
         try ng.astgen.extra.ensureUnusedCapacity(allocator, @typeInfo(Nir.Inst.Break).@"struct".fields.len);
 
-        const new_index: Nir.Inst.Index = @enumFromInt(ng.astgen.instructions.len);
+        const new_index: Nir.Inst.Index = @fromBackingInt(@intCast(ng.astgen.instructions.len));
         ng.astgen.instructions.appendAssumeCapacity(.{
             .tag = tag,
             .data = .{ .@"break" = .{
@@ -3291,10 +3291,10 @@ const NirGen = struct {
             .src_node = ng.nodeIndexToRelative(args.node),
         });
         if (args.type_inst != .none) {
-            astgen.extra.appendAssumeCapacity(@intFromEnum(args.type_inst));
+            astgen.extra.appendAssumeCapacity(@backingInt(args.type_inst));
         }
         if (args.align_inst != .none) {
-            astgen.extra.appendAssumeCapacity(@intFromEnum(args.align_inst));
+            astgen.extra.appendAssumeCapacity(@backingInt(args.align_inst));
         }
 
         const has_type: u4 = @intFromBool(args.type_inst != .none);
@@ -3303,7 +3303,7 @@ const NirGen = struct {
         const is_comptime: u4 = @intFromBool(args.is_comptime);
         const small: u16 = has_type | (has_align << 1) | (is_const << 2) | (is_comptime << 3);
 
-        const new_index: Nir.Inst.Index = @enumFromInt(astgen.instructions.len);
+        const new_index: Nir.Inst.Index = @fromBackingInt(@intCast(astgen.instructions.len));
         astgen.instructions.appendAssumeCapacity(.{
             .tag = .extended,
             .data = .{ .extended = .{
@@ -3362,7 +3362,7 @@ const NirGen = struct {
             @as(u16, @intCast(args.clobbers.len << 10)) |
             (@as(u16, @intFromBool(args.is_volatile)) << 15);
 
-        const new_index: Nir.Inst.Index = @enumFromInt(astgen.instructions.len);
+        const new_index: Nir.Inst.Index = @fromBackingInt(@intCast(astgen.instructions.len));
         astgen.instructions.appendAssumeCapacity(.{
             .tag = .extended,
             .data = .{ .extended = .{
@@ -3379,7 +3379,7 @@ const NirGen = struct {
     /// Does *not* append the block instruction to the scope.
     /// Leaves the `payload_index` field undefined.
     fn makeBlockInst(ng: *NirGen, tag: Nir.Inst.Tag, node: Ast.Node.Index) !Nir.Inst.Index {
-        const new_index: Nir.Inst.Index = @enumFromInt(ng.astgen.instructions.len);
+        const new_index: Nir.Inst.Index = @fromBackingInt(@intCast(ng.astgen.instructions.len));
         const allocator = ng.astgen.allocator;
         try ng.astgen.instructions.append(allocator, .{
             .tag = tag,
@@ -3395,7 +3395,7 @@ const NirGen = struct {
     /// Does *not* append the block instruction to the scope.
     /// Leaves the `payload_index` field undefined. Use `setDeclaration` to finalize.
     fn makeDeclaration(ng: *NirGen, node: Ast.Node.Index) !Nir.Inst.Index {
-        const new_index: Nir.Inst.Index = @enumFromInt(ng.astgen.instructions.len);
+        const new_index: Nir.Inst.Index = @fromBackingInt(@intCast(ng.astgen.instructions.len));
         try ng.astgen.instructions.append(ng.astgen.allocator, .{
             .tag = .declaration,
             .data = .{ .declaration = .{
@@ -3411,7 +3411,7 @@ const NirGen = struct {
     fn addCondBr(ng: *NirGen, tag: Nir.Inst.Tag, node: Ast.Node.Index) !Nir.Inst.Index {
         const allocator = ng.astgen.allocator;
         try ng.instructions.ensureUnusedCapacity(allocator, 1);
-        const new_index: Nir.Inst.Index = @enumFromInt(ng.astgen.instructions.len);
+        const new_index: Nir.Inst.Index = @fromBackingInt(@intCast(ng.astgen.instructions.len));
         try ng.astgen.instructions.append(allocator, .{
             .tag = tag,
             .data = .{ .pl_node = .{
@@ -3465,7 +3465,7 @@ const NirGen = struct {
         if (args.decls_len != 0) {
             astgen.extra.appendAssumeCapacity(args.decls_len);
         }
-        astgen.instructions.set(@intFromEnum(inst), .{
+        astgen.instructions.set(@backingInt(inst), .{
             .tag = .extended,
             .data = .{ .extended = .{
                 .opcode = .struct_decl,
@@ -3517,7 +3517,7 @@ const NirGen = struct {
         });
 
         if (args.tag_type != .none) {
-            astgen.extra.appendAssumeCapacity(@intFromEnum(args.tag_type));
+            astgen.extra.appendAssumeCapacity(@backingInt(args.tag_type));
         }
         if (args.captures_len != 0) {
             astgen.extra.appendAssumeCapacity(args.captures_len);
@@ -3531,7 +3531,7 @@ const NirGen = struct {
         if (args.decls_len != 0) {
             astgen.extra.appendAssumeCapacity(args.decls_len);
         }
-        astgen.instructions.set(@intFromEnum(inst), .{
+        astgen.instructions.set(@backingInt(inst), .{
             .tag = .extended,
             .data = .{ .extended = .{
                 .opcode = .union_decl,
@@ -3578,7 +3578,7 @@ const NirGen = struct {
         });
 
         if (args.tag_type != .none) {
-            astgen.extra.appendAssumeCapacity(@intFromEnum(args.tag_type));
+            astgen.extra.appendAssumeCapacity(@backingInt(args.tag_type));
         }
         if (args.captures_len != 0) {
             astgen.extra.appendAssumeCapacity(args.captures_len);
@@ -3592,7 +3592,7 @@ const NirGen = struct {
         if (args.decls_len != 0) {
             astgen.extra.appendAssumeCapacity(args.decls_len);
         }
-        astgen.instructions.set(@intFromEnum(inst), .{
+        astgen.instructions.set(@backingInt(inst), .{
             .tag = .extended,
             .data = .{ .extended = .{
                 .opcode = .enum_decl,
@@ -3631,7 +3631,7 @@ const NirGen = struct {
         if (args.decls_len != 0) {
             astgen.extra.appendAssumeCapacity(args.decls_len);
         }
-        astgen.instructions.set(@intFromEnum(inst), .{
+        astgen.instructions.set(@backingInt(inst), .{
             .tag = .extended,
             .data = .{ .extended = .{
                 .opcode = .opaque_decl,
@@ -3654,7 +3654,7 @@ const NirGen = struct {
         try ng.instructions.ensureUnusedCapacity(allocator, 1);
         try ng.astgen.instructions.ensureUnusedCapacity(allocator, 1);
 
-        const new_index: Nir.Inst.Index = @enumFromInt(ng.astgen.instructions.len);
+        const new_index: Nir.Inst.Index = @fromBackingInt(@intCast(ng.astgen.instructions.len));
         ng.astgen.instructions.appendAssumeCapacity(inst);
         ng.instructions.appendAssumeCapacity(new_index);
         return new_index;
@@ -3665,7 +3665,7 @@ const NirGen = struct {
         try ng.instructions.ensureUnusedCapacity(allocator, 1);
         try ng.astgen.instructions.ensureUnusedCapacity(allocator, 1);
 
-        const new_index: Nir.Inst.Index = @enumFromInt(ng.astgen.instructions.len);
+        const new_index: Nir.Inst.Index = @fromBackingInt(@intCast(ng.astgen.instructions.len));
         ng.astgen.instructions.len += 1;
         ng.instructions.appendAssumeCapacity(new_index);
         return new_index;
@@ -3694,7 +3694,7 @@ const NirGen = struct {
 /// This can only be for short-lived references; the memory becomes invalidated
 /// when another string is added.
 fn nullTerminatedString(astgen: AstGen, index: Nir.NullTerminatedString) [*:0]const u8 {
-    return @ptrCast(astgen.string_bytes.items[@intFromEnum(index)..]);
+    return @ptrCast(astgen.string_bytes.items[@backingInt(index)..]);
 }
 
 /// Local variables shadowing detection, including function parameters.
@@ -4096,7 +4096,7 @@ fn scanContainer(
 fn isInferred(astgen: *AstGen, ref: Nir.Inst.Ref) bool {
     const inst = ref.toIndex() orelse return false;
     const nir_tags = astgen.instructions.items(.tag);
-    return switch (nir_tags[@intFromEnum(inst)]) {
+    return switch (nir_tags[@backingInt(inst)]) {
         .alloc_inferred,
         .alloc_inferred_mut,
         .alloc_inferred_comptime,
@@ -4105,8 +4105,8 @@ fn isInferred(astgen: *AstGen, ref: Nir.Inst.Ref) bool {
 
         .extended => {
             const nir_data = astgen.instructions.items(.data);
-            if (nir_data[@intFromEnum(inst)].extended.opcode != .alloc) return false;
-            const small: Nir.Inst.AllocExtended.Small = @bitCast(nir_data[@intFromEnum(inst)].extended.small);
+            if (nir_data[@backingInt(inst)].extended.opcode != .alloc) return false;
+            const small: Nir.Inst.AllocExtended.Small = @bitCast(nir_data[@backingInt(inst)].extended.small);
             return !small.has_type;
         },
 
@@ -4135,7 +4135,7 @@ fn appendPossiblyRefdBodyInst(
     list: *std.ArrayListUnmanaged(u32),
     body_inst: Nir.Inst.Index,
 ) void {
-    list.appendAssumeCapacity(@intFromEnum(body_inst));
+    list.appendAssumeCapacity(@backingInt(body_inst));
     const kv = astgen.ref_table.fetchRemove(body_inst) orelse return;
     const ref_inst = kv.value;
     return appendPossiblyRefdBodyInst(astgen, list, ref_inst);
@@ -4158,8 +4158,8 @@ fn emitDbgStmt(ng: *NirGen, lc: LineColumn) !void {
     if (ng.instructions.items.len > ng.instructions_top) {
         const astgen = ng.astgen;
         const last = ng.instructions.items[ng.instructions.items.len - 1];
-        if (astgen.instructions.items(.tag)[@intFromEnum(last)] == .dbg_stmt) {
-            astgen.instructions.items(.data)[@intFromEnum(last)].dbg_stmt = .{
+        if (astgen.instructions.items(.tag)[@backingInt(last)] == .dbg_stmt) {
+            astgen.instructions.items(.data)[@backingInt(last)].dbg_stmt = .{
                 .line = lc[0],
                 .column = lc[1],
             };
@@ -4182,7 +4182,7 @@ fn emitDbgStmt(ng: *NirGen, lc: LineColumn) !void {
 fn emitDbgStmtForceCurrentIndex(ng: *NirGen, lc: LineColumn) !void {
     const astgen = ng.astgen;
     if (ng.instructions.items.len > ng.instructions_top and
-        @intFromEnum(ng.instructions.items[ng.instructions.items.len - 1]) == astgen.instructions.len - 1)
+        @backingInt(ng.instructions.items[ng.instructions.items.len - 1]) == astgen.instructions.len - 1)
     {
         const last = astgen.instructions.len - 1;
         if (astgen.instructions.items(.tag)[last] == .dbg_stmt) {
@@ -4281,8 +4281,8 @@ fn setDeclaration(
         .src_hash_2 = src_hash_arr[2],
         .src_hash_3 = src_hash_arr[3],
         .name = switch (name) {
-            .named => |tok| @enumFromInt(@intFromEnum(try astgen.identAsString(tok))),
-            .named_test => |tok| @enumFromInt(@intFromEnum(try astgen.testNameString(tok))),
+            .named => |tok| @fromBackingInt(@intCast(@backingInt(try astgen.identAsString(tok)))),
+            .named_test => |tok| @fromBackingInt(@intCast(@backingInt(try astgen.testNameString(tok)))),
             .unnamed_test => .unnamed_test,
             .decltest => .decltest,
             .@"comptime" => .@"comptime",
@@ -4296,9 +4296,9 @@ fn setDeclaration(
             .has_align_linksection_addrspace = false,
         },
     };
-    astgen.instructions.items(.data)[@intFromEnum(decl_inst)].declaration.payload_index = try astgen.addExtra(extra);
+    astgen.instructions.items(.data)[@backingInt(decl_inst)].declaration.payload_index = try astgen.addExtra(extra);
     if (extra.flags.has_doc_comment) {
-        try astgen.extra.append(allocator, @intFromEnum(true_doc_comment));
+        try astgen.extra.append(allocator, @backingInt(true_doc_comment));
     }
     try astgen.extra.ensureUnusedCapacity(allocator, value_len);
     astgen.appendBodyWithFixups(value_body);
@@ -4330,7 +4330,7 @@ fn setExtra(self: *AstGen, index: usize, extra: anytype) void {
             Nir.Inst.Index,
             Nir.Inst.Declaration.Name,
             Nir.NullTerminatedString,
-            => @intFromEnum(@field(extra, field.name)),
+            => @backingInt(@field(extra, field.name)),
 
             i32,
             // Nir.Inst.Call.Flags,

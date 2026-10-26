@@ -1,4 +1,5 @@
 const std = @import("std");
+const TestAllocations = @import("TestAllocations.zig");
 const Source = @import("Source.zig");
 const Module = @import("Module.zig");
 const Ir = @import("Ir.zig");
@@ -63,7 +64,7 @@ pub fn deinit(self: *Compilation) void {
 }
 
 pub fn getModule(self: *const Compilation, id: Source.Id) ?*Module {
-    const index = @intFromEnum(id);
+    const index = @backingInt(id);
     if (index >= self.modules.items.len) return null;
     return self.modules.items[index];
 }
@@ -77,7 +78,7 @@ pub fn sourceSlice(self: *const Compilation, span: Source.Span) ?[]const u8 {
 }
 
 pub fn getDeclaration(self: *const Compilation, id: DeclId) ?DeclRef {
-    const index = @intFromEnum(id);
+    const index = @backingInt(id);
     if (index >= self.declarations.items.len) return null;
     return self.declarations.items[index];
 }
@@ -87,7 +88,7 @@ pub fn getDeclaration(self: *const Compilation, id: DeclId) ?DeclRef {
 pub fn internDeclaration(self: *Compilation, ref: DeclRef) error{ OutOfMemory, TooManyDeclarations }!DeclId {
     if (self.declaration_ids.get(ref)) |id| return id;
     if (self.declarations.items.len == std.math.maxInt(u32)) return error.TooManyDeclarations;
-    const id: DeclId = @enumFromInt(self.declarations.items.len);
+    const id: DeclId = @fromBackingInt(@intCast(self.declarations.items.len));
     try self.declarations.ensureUnusedCapacity(self.allocator, 1);
     try self.declaration_ids.put(self.allocator, ref, id);
     self.declarations.appendAssumeCapacity(ref);
@@ -100,7 +101,7 @@ pub fn internDeclaration(self: *Compilation, ref: DeclRef) error{ OutOfMemory, T
 pub fn addSource(self: *Compilation, canonical_path: []const u8, text: []const u8) Error!Source.Id {
     if (self.paths.get(canonical_path)) |id| return id;
     if (self.modules.items.len == std.math.maxInt(u32)) return error.TooManySources;
-    const id: Source.Id = @enumFromInt(self.modules.items.len);
+    const id: Source.Id = @fromBackingInt(@intCast(self.modules.items.len));
     const module = try self.allocator.create(Module);
     errdefer self.allocator.destroy(module);
     module.* = try Module.initSource(self.allocator, id, canonical_path, text);
@@ -114,7 +115,7 @@ pub fn addSource(self: *Compilation, canonical_path: []const u8, text: []const u
         self.declarations.shrinkRetainingCapacity(declarations_start);
     }
     for (module.declarations.items, 0..) |_, local| {
-        _ = try self.internDeclaration(.{ .source = id, .local = @enumFromInt(local) });
+        _ = try self.internDeclaration(.{ .source = id, .local = @fromBackingInt(@intCast(local)) });
     }
     self.modules.appendAssumeCapacity(module);
     self.ir.source_lengths.appendAssumeCapacity(@intCast(text.len));
@@ -182,14 +183,14 @@ pub fn prepareSemantics(self: *Compilation) std.mem.Allocator.Error!void {
     // Drop only analysis-created suffix identities. Source declarations and
     // namespace edges keep their canonical IDs across repeated analyses.
     for (self.declarations.items, 0..) |ref, i| {
-        if (@intFromEnum(ref.local) < self.getModule(ref.source).?.declarations.items.len) continue;
+        if (@backingInt(ref.local) < self.getModule(ref.source).?.declarations.items.len) continue;
         for (self.declarations.items[i..]) |stale| _ = self.declaration_ids.remove(stale);
         self.declarations.shrinkRetainingCapacity(i);
         break;
     }
     for (self.imports.items) |edge| {
         const ref = self.getDeclaration(edge.declaration).?;
-        self.getModule(ref.source).?.declarations.items[@intFromEnum(ref.local)].is_namespace = true;
+        self.getModule(ref.source).?.declarations.items[@backingInt(ref.local)].is_namespace = true;
     }
     try self.validateImportGraph();
     // Public reexports and generic aliases can cross several namespace edges.
@@ -237,7 +238,7 @@ fn validateImportGraph(self: *Compilation) std.mem.Allocator.Error!void {
     defer stack.deinit(self.allocator);
     for (self.modules.items, 0..) |_, start| {
         if (colors[start] != .unseen) continue;
-        try stack.append(self.allocator, .{ .source = @enumFromInt(start) });
+        try stack.append(self.allocator, .{ .source = @fromBackingInt(@intCast(start)) });
         colors[start] = .active;
         while (stack.items.len != 0) {
             const frame = &stack.items[stack.items.len - 1];
@@ -247,7 +248,7 @@ fn validateImportGraph(self: *Compilation) std.mem.Allocator.Error!void {
                 frame.next += 1;
                 const ref = self.getDeclaration(edge.declaration).?;
                 if (ref.source != frame.source) continue;
-                switch (colors[@intFromEnum(edge.target)]) {
+                switch (colors[@backingInt(edge.target)]) {
                     .done => {},
                     .active => {
                         try self.diagnostics.append(self.allocator, .{ .tag = .import_cycle, .span = edge.span });
@@ -260,10 +261,10 @@ fn validateImportGraph(self: *Compilation) std.mem.Allocator.Error!void {
                 }
             }
             if (child) |source| {
-                colors[@intFromEnum(source)] = .active;
+                colors[@backingInt(source)] = .active;
                 try stack.append(self.allocator, .{ .source = source });
             } else {
-                colors[@intFromEnum(frame.source)] = .done;
+                colors[@backingInt(frame.source)] = .done;
                 _ = stack.pop();
             }
         }
@@ -318,7 +319,7 @@ fn discover(self: *Compilation, io: std.Io, id: Source.Id, options: Options, act
         for (module.declarations.items, 0..) |decl, local| {
             const full = ast.decl(decl.node).ast;
             if (decl.container == null and !full.is_mutable and full.type_node == 0 and full.init_node == node) {
-                declaration = @enumFromInt(local);
+                declaration = @fromBackingInt(@intCast(local));
                 break;
             }
         }
@@ -425,7 +426,7 @@ test "canonical loader owns graph storage across allocation failures" {
     try tmp.dir.writeFile(io, .{ .sub_path = "leaf.nov", .data = "let value = true" });
     const path = try tmp.dir.realPathFileAlloc(io, "main.nov", std.testing.allocator);
     defer std.testing.allocator.free(path);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, loaderAllocationTest, .{path});
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, loaderAllocationTest, .{path});
 }
 
 test "compilation owners and global declaration identities survive graph growth" {
@@ -458,7 +459,7 @@ fn ownershipAllocationTest(allocator: std.mem.Allocator) !void {
 }
 
 test "compilation publication rolls back under allocation failures" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, ownershipAllocationTest, .{});
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, ownershipAllocationTest, .{});
 }
 
 test "canonical diamond imports preserve namespaces and defining scopes" {

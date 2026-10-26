@@ -1162,7 +1162,7 @@ fn tokenSliceForRender(ast: Ast, token_index: Ast.TokenIndex) []const u8 {
 
 fn writeFixingWhitespace(writer: *std.Io.Writer, slice: []const u8) std.Io.Writer.Error!void {
     for (slice) |byte| switch (byte) {
-        '\t' => try writer.writeAll(" " ** indent_delta),
+        '\t' => try writer.splatByteAll(' ', indent_delta),
         '\r' => {},
         else => try writer.writeByte(byte),
     };

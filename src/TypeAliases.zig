@@ -1,4 +1,5 @@
 const std = @import("std");
+const TestAllocations = @import("TestAllocations.zig");
 const Module = @import("Module.zig");
 const Dependencies = @import("Dependencies.zig");
 const Sema = @import("Sema.zig");
@@ -35,7 +36,7 @@ test "type aliases canonicalize forward chains nested components and named signa
     defer dependencies.deinit();
     try std.testing.expect(!module.hasErrors());
     for (module.declarations.items, 0..) |decl, i| {
-        if (decl.is_type_alias) try std.testing.expectEqual(@as(usize, 0), dependencies.getEdges(@enumFromInt(i)).?.len);
+        if (decl.is_type_alias) try std.testing.expectEqual(@as(usize, 0), dependencies.getEdges(@fromBackingInt(@intCast(i))).?.len);
     }
     var sema = try Lowering.lower(&module);
     defer sema.deinit();
@@ -48,7 +49,7 @@ test "type aliases canonicalize forward chains nested components and named signa
     try std.testing.expectEqual(count.alias_type, sema.getEntry(module.lookup("global").?).?.type_id);
     try std.testing.expectEqual(sema.getEntry(module.lookup("Callback").?).?.alias_type, sema.getEntry(module.lookup("Named").?).?.alias_type);
     try std.testing.expectEqual(@as(usize, 3), sema.ir.functions.items.len);
-    try std.testing.expectEqual(module.lookup("main").?, @as(Module.DeclId, @enumFromInt(12)));
+    try std.testing.expectEqual(module.lookup("main").?, @as(Module.DeclId, @fromBackingInt(@intCast(12))));
     try sema.ir.verify();
 }
 
@@ -195,7 +196,7 @@ test "type alias resolution and diagnostics roll back on every allocation failur
         "let A = () -> B\nlet B = []A",
         "let A = []Missing",
         "let A = uint\nlet main: () = @println(A)",
-    }) |source| try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationTest, .{source});
+    }) |source| try TestAllocations.checkAllAllocationFailures(std.testing.allocator, allocationTest, .{source});
 }
 
 test "type alias IR survives source destruction and formatter preservation" {
@@ -212,7 +213,7 @@ test "type alias IR survives source destruction and formatter preservation" {
     try std.testing.expect(sema.lowering_complete);
     const formatted = try Formatter.format(std.testing.allocator, canonical_program);
     defer std.testing.allocator.free(formatted);
-    const terminated = try std.testing.allocator.dupeZ(u8, formatted);
+    const terminated = try std.testing.allocator.dupeSentinel(u8, formatted, 0);
     defer std.testing.allocator.free(terminated);
     const again = try Formatter.format(std.testing.allocator, terminated);
     defer std.testing.allocator.free(again);

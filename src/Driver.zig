@@ -80,8 +80,8 @@ pub fn run(io: std.Io, executable: []const u8, stderr: *std.Io.Writer) !u8 {
     return switch (term) {
         .exited => |code| code,
         .signal => |signal| blk: {
-            try stderr.print("error: program terminated by signal {d}\n", .{@intFromEnum(signal)});
-            break :blk @intCast(@min(255, 128 + @as(u32, @intFromEnum(signal))));
+            try stderr.print("error: program terminated by signal {d}\n", .{@backingInt(signal)});
+            break :blk @intCast(@min(255, 128 + @as(u32, @backingInt(signal))));
         },
         else => blk: {
             try stderr.print("error: program terminated abnormally ({s})\n", .{@tagName(term)});
@@ -152,7 +152,7 @@ test "compiler discovery uses literal executables in approved order and exact fl
             "#!/bin/sh\n[ \"$#\" = 6 ] && [ \"$1\" = -std=c11 ] && [ \"$2\" = -O0 ] && [ \"$3\" = -g ] && [ \"$4\" = 'source with spaces.c' ] && [ \"$5\" = -o ] && [ \"$6\" = 'output;literal' ]\n");
         for (0..4) |selected| {
             const candidates: [4][]const u8 = blk: {
-                var values = [_][]const u8{missing} ** 4;
+                var values: [4][]const u8 = @splat(missing);
                 values[selected] = good;
                 break :blk values;
             };

@@ -6,7 +6,7 @@ const nov_version: std.SemanticVersion = .{ .major = 0, .minor = 0, .patch = 0 }
 pub fn build(b: *std.Build) void {
     comptime {
         const current_zig = builtin.zig_version;
-        const min_zig = std.SemanticVersion.parse("0.16.0") catch unreachable;
+        const min_zig = std.SemanticVersion.parse("0.17.0") catch unreachable;
         if (current_zig.order(min_zig) == .lt) {
             @compileError(std.fmt.comptimePrint(
                 \\Your zig version ({}) does not meet the minimum required version ({})
@@ -34,11 +34,9 @@ pub fn build(b: *std.Build) void {
     });
     b.getInstallStep().dependOn(&install_lib.step);
 
-    const run_cmd = b.addSystemCommand(&.{b.getInstallPath(.bin, exe.out_filename)});
+    const run_cmd = b.addRunFile(.{ .relative = .{ .base = .install_bin, .sub_path = exe.out_filename } });
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    run_cmd.addPassthruArgs();
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
 
@@ -83,10 +81,7 @@ pub fn build(b: *std.Build) void {
     addGcTests(b, test_step);
 
     const fmt_step = b.step("fmt", "Format all source files");
-    fmt_step.dependOn(&b.addFmt(.{ .paths = &.{ "build.zig", "src" } }).step);
-
-    const clean_step = b.step("clean", "Remove build artifacts");
-    clean_step.makeFn = clean;
+    fmt_step.dependOn(&b.addFmt(.{ .paths = b.pathList(&.{ "build.zig", "src" }) }).step);
 }
 
 fn addGcTests(b: *std.Build, test_step: *std.Build.Step) void {
@@ -1583,15 +1578,6 @@ fn addImportCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *st
     override.expectStdOutEqual("");
     override.expectStdErrMatch("cannot load imported source: FileNotFound");
     test_step.dependOn(&override.step);
-}
-
-fn clean(step: *std.Build.Step, _: std.Build.Step.MakeOptions) !void {
-    const b = step.owner;
-    for ([_][]const u8{ "zig-out", ".zig-cache" }) |path| {
-        std.Io.Dir.cwd().deleteTree(b.graph.io, b.pathFromRoot(path)) catch |err| {
-            return step.fail("unable to remove {s}: {s}", .{ path, @errorName(err) });
-        };
-    }
 }
 
 const ExecutableOptions = struct {

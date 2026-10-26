@@ -11,6 +11,7 @@
 //! modular unsigned-to-signed conversion provided by GCC, Clang and MSVC.
 //! Widths other than 8/16/32/64 remain unsupported.
 const std = @import("std");
+const TestAllocations = @import("TestAllocations.zig");
 const builtin = @import("builtin");
 const Ir = @import("Ir.zig");
 const Module = @import("Module.zig");
@@ -79,8 +80,8 @@ pub fn emit(allocator: std.mem.Allocator, ir: *const Ir, diagnostic: ?*Diagnosti
 /// Emits a program, leaving library emission through `emit` unchanged.
 pub fn emitProgram(allocator: std.mem.Allocator, ir: *const Ir, diagnostic: ?*Diagnostic) Error![]u8 {
     for (ir.functions.items, 0..) |function, i| {
-        if (@intFromEnum(function.span.source) == 0 and std.mem.eql(u8, function.name, "main"))
-            return emitProgramRoot(allocator, ir, @enumFromInt(i), .{ .start = ir.source_len, .end = ir.source_len }, diagnostic);
+        if (@backingInt(function.span.source) == 0 and std.mem.eql(u8, function.name, "main"))
+            return emitProgramRoot(allocator, ir, @fromBackingInt(@intCast(i)), .{ .start = ir.source_len, .end = ir.source_len }, diagnostic);
     }
     return emitProgramRoot(allocator, ir, null, .{ .start = ir.source_len, .end = ir.source_len }, diagnostic);
 }
@@ -94,8 +95,8 @@ pub fn emitProgramRoot(allocator: std.mem.Allocator, ir: *const Ir, entry: ?Ir.F
         return error.MissingEntrypoint;
     };
     const function = ir.getFunction(id) orelse return error.InvalidFunctionId;
-    const signature = ir.types.items[@intFromEnum(function.ty)].function;
-    if (signature.params.len != 0 or ir.types.items[@intFromEnum(signature.result)] != .void)
+    const signature = ir.types.items[@backingInt(function.ty)].function;
+    if (signature.params.len != 0 or ir.types.items[@backingInt(signature.result)] != .void)
         return fail(diagnostic, .entrypoint_signature, .{ .function = id, .span = function.span });
     const library = try emit(allocator, ir, diagnostic);
     defer allocator.free(library);
@@ -117,7 +118,7 @@ fn fail(diagnostic: ?*Diagnostic, reason: Diagnostic.Reason, origin: Origin) Err
 }
 
 fn mark(origins: []?Origin, ty: Ir.TypeId, origin: Origin) void {
-    const slot = &origins[@intFromEnum(ty)];
+    const slot = &origins[@backingInt(ty)];
     if (slot.* == null) slot.* = origin;
 }
 
@@ -125,8 +126,8 @@ fn mark(origins: []?Origin, ty: Ir.TypeId, origin: Origin) void {
 // Verification bounds aggregate depth; visit these edges directly rather than
 // depending on pool order as we can for structural signature types.
 fn markRecord(ir: *const Ir, origins: []?Origin, visited: []bool, id: Ir.TypeId, origin: Origin, diagnostic: ?*Diagnostic) Error!void {
-    if (visited[@intFromEnum(id)]) return;
-    visited[@intFromEnum(id)] = true;
+    if (visited[@backingInt(id)]) return;
+    visited[@backingInt(id)] = true;
     mark(origins, id, origin);
     for (ir.getType(id).?.record.fields) |field| {
         const field_origin: Origin = .{ .function = origin.function, .span = field.span };
@@ -148,7 +149,7 @@ fn analyze(allocator: std.mem.Allocator, ir: *const Ir, origins: []?Origin, diag
     defer allocator.free(visited);
     @memset(visited, false);
     for (ir.functions.items, 0..) |function, f| {
-        const id: Ir.FunctionId = @enumFromInt(f);
+        const id: Ir.FunctionId = @fromBackingInt(@intCast(f));
         mark(origins, function.ty, .{ .function = id, .span = function.span });
         for (function.body.?.instructions) |instruction| {
             const origin: Origin = .{ .function = id, .span = instruction.span };
@@ -161,7 +162,7 @@ fn analyze(allocator: std.mem.Allocator, ir: *const Ir, origins: []?Origin, diag
         const origin = origins[i] orelse continue;
         switch (ir.types.items[i]) {
             .void, .boolean, .string, .enumeration => {},
-            .record => try markRecord(ir, origins, visited, @enumFromInt(i), origin, diagnostic),
+            .record => try markRecord(ir, origins, visited, @fromBackingInt(@intCast(i)), origin, diagnostic),
             .range => |element| mark(origins, element, origin),
             .array => |element| {
                 mark(origins, element, origin);
@@ -212,7 +213,7 @@ fn write(allocator: std.mem.Allocator, ir: *const Ir, origins: []const ?Origin, 
             "}\n",
     );
     for (ir.types.items, 0..) |_, t| {
-        const element: Ir.TypeId = @enumFromInt(t);
+        const element: Ir.TypeId = @fromBackingInt(@intCast(t));
         if (!usesArrayContains(ir, element)) continue;
         try w.print("static bool nov_array_contains_{d}(", .{t});
         try writeType(ir, w, element);
@@ -239,12 +240,12 @@ fn write(allocator: std.mem.Allocator, ir: *const Ir, origins: []const ?Origin, 
             if (origin == null or ty != .record or declared[i]) continue;
             var ready = true;
             for (ty.record.fields) |field| {
-                if (ir.getType(field.ty).? == .record and !declared[@intFromEnum(field.ty)]) ready = false;
+                if (ir.getType(field.ty).? == .record and !declared[@backingInt(field.ty)]) ready = false;
             }
             if (!ready) continue;
             declared[i] = true;
             remaining -= 1;
-            for (ty.record.fields) |field| root_counts[i] = std.math.add(usize, root_counts[i], root_counts[@intFromEnum(field.ty)]) catch return error.OutOfMemory;
+            for (ty.record.fields) |field| root_counts[i] = std.math.add(usize, root_counts[i], root_counts[@backingInt(field.ty)]) catch return error.OutOfMemory;
             try w.print("typedef struct {{\n", .{});
             if (ty.record.tagged) try w.writeAll("    uint32_t tag;\n");
             for (ty.record.fields, 0..) |field, f| {
@@ -258,7 +259,7 @@ fn write(allocator: std.mem.Allocator, ir: *const Ir, origins: []const ?Origin, 
         }
     }
     for (ir.types.items, 0..) |_, t| {
-        const element: Ir.TypeId = @enumFromInt(t);
+        const element: Ir.TypeId = @fromBackingInt(@intCast(t));
         if (!usesElementLayout(ir, element)) continue;
         const count = root_counts[t];
         if (count != 0) {
@@ -330,7 +331,7 @@ fn writeElementOffsets(ir: *const Ir, root_counts: []const usize, w: *std.Io.Wri
             } else {
                 const field = ty.record.fields[frame.next];
                 frame.next += 1;
-                if (root_counts[@intFromEnum(field.ty)] == 0) continue;
+                if (root_counts[@backingInt(field.ty)] == 0) continue;
                 stack[len] = .{ .ty = field.ty };
                 len += 1;
             }
@@ -347,7 +348,7 @@ fn writeElementOffsets(ir: *const Ir, root_counts: []const usize, w: *std.Io.Wri
 }
 
 fn writeRoots(ir: *const Ir, root_counts: []const usize, w: *std.Io.Writer, id: Ir.TypeId, prefix: []const u8, index: usize) WriteError!void {
-    if (root_counts[@intFromEnum(id)] == 0) return;
+    if (root_counts[@backingInt(id)] == 0) return;
     const Frame = struct { ty: Ir.TypeId, next: usize = 0 };
     var stack: [Ir.max_record_depth + 1]Frame = undefined;
     stack[0] = .{ .ty = id };
@@ -361,7 +362,7 @@ fn writeRoots(ir: *const Ir, root_counts: []const usize, w: *std.Io.Writer, id: 
             } else {
                 const field = ty.record.fields[frame.next];
                 frame.next += 1;
-                if (root_counts[@intFromEnum(field.ty)] == 0) continue;
+                if (root_counts[@backingInt(field.ty)] == 0) continue;
                 stack[len] = .{ .ty = field.ty };
                 len += 1;
             }
@@ -390,14 +391,14 @@ fn usesManagedRuntime(ir: *const Ir) bool {
 
 fn usesStringEquality(ir: *const Ir) bool {
     for (ir.types.items, 0..) |ty, t| {
-        if (ty == .string and usesArrayContains(ir, @enumFromInt(t))) return true;
+        if (ty == .string and usesArrayContains(ir, @fromBackingInt(@intCast(t)))) return true;
     }
     for (ir.functions.items) |function| {
         const body = function.body.?;
         for (body.instructions) |instruction| {
             if (instruction.op != .binary) continue;
             const binary = instruction.op.binary;
-            if ((binary.op == .eq or binary.op == .ne) and ir.getType(body.instructions[@intFromEnum(binary.lhs)].ty).? == .string) return true;
+            if ((binary.op == .eq or binary.op == .ne) and ir.getType(body.instructions[@backingInt(binary.lhs)].ty).? == .string) return true;
         }
     }
     return false;
@@ -410,13 +411,13 @@ fn writeStringConversions(ir: *const Ir, w: *std.Io.Writer) WriteError!void {
         for (ir.functions.items) |function| {
             const body = function.body.?;
             for (body.instructions) |instruction| {
-                if (instruction.op == .to_string and @intFromEnum(body.instructions[@intFromEnum(instruction.op.to_string)].ty) == t) used = true;
+                if (instruction.op == .to_string and @backingInt(body.instructions[@backingInt(instruction.op.to_string)].ty) == t) used = true;
             }
         }
         if (!used) continue;
         try w.writeAll("#include <inttypes.h>\nstatic nov_string nov_to_string_");
         try w.print("{d}(", .{t});
-        try writeType(ir, w, @enumFromInt(t));
+        try writeType(ir, w, @fromBackingInt(@intCast(t)));
         try w.print(" value) {{\n    char bytes[32];\n    int len = snprintf(bytes, sizeof bytes, \"%\" PRI{s}64, ({s}int64_t)value);\n", .{ if (ty.integer.signedness == .signed) "d" else "u", if (ty.integer.signedness == .signed) "" else "u" });
         try w.writeAll("    if (len < 0 || (size_t)len >= sizeof bytes) nov_rt_panic(\"integer formatting failed\");\n    return nov_string_concat((nov_string){0}, (nov_string){NULL, (const unsigned char *)bytes, (uintptr_t)len});\n}\n");
     }
@@ -426,7 +427,7 @@ fn usesStringConcat(ir: *const Ir) bool {
     for (ir.functions.items) |function| {
         for (function.body.?.instructions) |instruction| {
             if (instruction.op == .binary and ir.getType(instruction.ty).? == .string) return true;
-            if (instruction.op == .to_string and ir.getType(function.body.?.instructions[@intFromEnum(instruction.op.to_string)].ty).? == .integer) return true;
+            if (instruction.op == .to_string and ir.getType(function.body.?.instructions[@backingInt(instruction.op.to_string)].ty).? == .integer) return true;
         }
     }
     return false;
@@ -487,29 +488,29 @@ fn writeArithmeticRuntime(ir: *const Ir, w: *std.Io.Writer) WriteError!void {
             var used = false;
             for (ir.functions.items) |function| {
                 for (function.body.?.instructions) |instruction| {
-                    if (@intFromEnum(instruction.ty) == t and instruction.op == .binary and instruction.op.binary.op == op) used = true;
+                    if (@backingInt(instruction.ty) == t and instruction.op == .binary and instruction.op.binary.op == op) used = true;
                 }
             }
             if (!used) continue;
 
             const bits = workingBits(ty);
             try w.writeAll("\nstatic ");
-            try writeType(ir, w, @enumFromInt(t));
+            try writeType(ir, w, @fromBackingInt(@intCast(t)));
             try w.print(" nov_rt_{s}_{d}(", .{ @tagName(op), t });
-            try writeType(ir, w, @enumFromInt(t));
+            try writeType(ir, w, @fromBackingInt(@intCast(t)));
             try w.writeAll(" a, ");
-            try writeType(ir, w, @enumFromInt(t));
+            try writeType(ir, w, @fromBackingInt(@intCast(t)));
             try w.print(" b) {{\n    if (b == 0) nov_rt_panic(\"{s} by zero\");\n", .{if (op == .div) "division" else "remainder"});
             if (ty.integer.signedness == .signed) {
                 // Unsigned subtraction also handles the magnitude of MIN.
                 try w.print("    const uint{d}_t x = a < 0 ? UINT{d}_C(0) - (uint{d}_t)a : (uint{d}_t)a;\n", .{ bits, bits, bits, bits });
                 try w.print("    const uint{d}_t y = b < 0 ? UINT{d}_C(0) - (uint{d}_t)b : (uint{d}_t)b;\n", .{ bits, bits, bits, bits });
                 try w.print("    const uint{d}_t r = x {s} y;\n    return (", .{ bits, if (op == .div) "/" else "%" });
-                try writeType(ir, w, @enumFromInt(t));
+                try writeType(ir, w, @fromBackingInt(@intCast(t)));
                 try w.print(")({s} ? UINT{d}_C(0) - r : r);\n}}\n", .{ if (op == .div) "(a < 0) != (b < 0)" else "a < 0", bits });
             } else {
                 try w.writeAll("    return (");
-                try writeType(ir, w, @enumFromInt(t));
+                try writeType(ir, w, @fromBackingInt(@intCast(t)));
                 try w.print(")((uint{d}_t)a {s} (uint{d}_t)b);\n}}\n", .{ bits, if (op == .div) "/" else "%", bits });
             }
         }
@@ -518,16 +519,16 @@ fn writeArithmeticRuntime(ir: *const Ir, w: *std.Io.Writer) WriteError!void {
 
 /// Only called for types accepted by `analyze`.
 fn writeType(ir: *const Ir, w: *std.Io.Writer, id: Ir.TypeId) WriteError!void {
-    switch (ir.types.items[@intFromEnum(id)]) {
+    switch (ir.types.items[@backingInt(id)]) {
         .void => try w.writeAll("void"),
         .boolean => try w.writeAll("bool"),
         .enumeration => try w.writeAll("uint32_t"),
         .integer => |integer| try w.print("{s}int{d}_t", .{ if (integer.signedness == .unsigned) "u" else "", integer.bits }),
-        .function => try w.print("nov_fn_{d}", .{@intFromEnum(id)}),
-        .range => try w.print("nov_range_{d}", .{@intFromEnum(id)}),
+        .function => try w.print("nov_fn_{d}", .{@backingInt(id)}),
+        .range => try w.print("nov_range_{d}", .{@backingInt(id)}),
         .array => try w.writeAll("nov_array"),
         .string => try w.writeAll("nov_string"),
-        .record => try w.print("nov_record_{d}", .{@intFromEnum(id)}),
+        .record => try w.print("nov_record_{d}", .{@backingInt(id)}),
     }
 }
 
@@ -541,7 +542,7 @@ fn writeParamTypes(ir: *const Ir, w: *std.Io.Writer, params: []const Ir.TypeId) 
 
 fn writeSignature(ir: *const Ir, w: *std.Io.Writer, function: Ir.Function) WriteError!void {
     if (function.noreturn) try w.writeAll("_Noreturn ");
-    const signature = ir.types.items[@intFromEnum(function.ty)].function;
+    const signature = ir.types.items[@backingInt(function.ty)].function;
     try writeType(ir, w, signature.result);
     try w.writeByte(' ');
     try writeScopedFunctionName(w, function);
@@ -564,7 +565,7 @@ fn sameFunction(a: Ir.Function, b: Ir.Function) bool {
 
 fn writeScopedFunctionName(w: *std.Io.Writer, function: Ir.Function) WriteError!void {
     // The single underscore separator cannot occur inside an encoded Nov name.
-    if (@intFromEnum(function.span.source) != 0) try w.print("nov_M{d}_", .{@intFromEnum(function.span.source)});
+    if (@backingInt(function.span.source) != 0) try w.print("nov_M{d}_", .{@backingInt(function.span.source)});
     try writeFunctionName(w, function.name);
 }
 
@@ -607,14 +608,14 @@ fn usesArrayContains(ir: *const Ir, element: Ir.TypeId) bool {
     for (ir.functions.items) |function| {
         const body = function.body.?;
         for (body.instructions) |instruction| {
-            if (instruction.op == .array_contains and body.instructions[@intFromEnum(instruction.op.array_contains.value)].ty == element) return true;
+            if (instruction.op == .array_contains and body.instructions[@backingInt(instruction.op.array_contains.value)].ty == element) return true;
         }
     }
     return false;
 }
 
 fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const usize, w: *std.Io.Writer, function: Ir.Function) (WriteError || std.mem.Allocator.Error)!void {
-    const signature = ir.types.items[@intFromEnum(function.ty)].function;
+    const signature = ir.types.items[@backingInt(function.ty)].function;
     const body = function.body.?;
     const value_used = try allocator.alloc(bool, body.instructions.len);
     defer allocator.free(value_used);
@@ -622,85 +623,85 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
     const param_used = try allocator.alloc(bool, signature.params.len);
     defer allocator.free(param_used);
     @memset(param_used, false);
-    value_used[@intFromEnum(body.result)] = true;
+    value_used[@backingInt(body.result)] = true;
     for (body.instructions) |instruction| switch (instruction.op) {
         .array_literal, .record_init => |elements| for (elements) |value| {
-            value_used[@intFromEnum(value)] = true;
+            value_used[@backingInt(value)] = true;
         },
         .union_init => |init_value| {
-            if (init_value.payload) |payload| value_used[@intFromEnum(payload)] = true;
+            if (init_value.payload) |payload| value_used[@backingInt(payload)] = true;
         },
-        .union_tag, .union_payload => |read| value_used[@intFromEnum(read.base)] = true,
-        .field_read => |read| value_used[@intFromEnum(read.base)] = true,
+        .union_tag, .union_payload => |read| value_used[@backingInt(read.base)] = true,
+        .field_read => |read| value_used[@backingInt(read.base)] = true,
         .range_init => |r| {
-            value_used[@intFromEnum(r.start)] = true;
-            value_used[@intFromEnum(r.end)] = true;
+            value_used[@backingInt(r.start)] = true;
+            value_used[@backingInt(r.end)] = true;
         },
-        .range_start, .range_end, .range_inclusive, .array_clone, .array_len, .to_string => |value| value_used[@intFromEnum(value)] = true,
+        .range_start, .range_end, .range_inclusive, .array_clone, .array_len, .to_string => |value| value_used[@backingInt(value)] = true,
         .array_index => |r| {
-            value_used[@intFromEnum(r.array)] = true;
-            value_used[@intFromEnum(r.index)] = true;
+            value_used[@backingInt(r.array)] = true;
+            value_used[@backingInt(r.index)] = true;
         },
         .array_contains => |r| {
-            value_used[@intFromEnum(r.value)] = true;
-            value_used[@intFromEnum(r.array)] = true;
+            value_used[@backingInt(r.value)] = true;
+            value_used[@backingInt(r.array)] = true;
         },
         .array_set => |r| {
-            value_used[@intFromEnum(r.array)] = true;
-            value_used[@intFromEnum(r.index)] = true;
-            value_used[@intFromEnum(r.value)] = true;
+            value_used[@backingInt(r.array)] = true;
+            value_used[@backingInt(r.index)] = true;
+            value_used[@backingInt(r.value)] = true;
         },
         .array_append => |r| {
-            value_used[@intFromEnum(r.lhs)] = true;
-            value_used[@intFromEnum(r.rhs)] = true;
+            value_used[@backingInt(r.lhs)] = true;
+            value_used[@backingInt(r.rhs)] = true;
         },
-        .borrow_reserve => |slot| value_used[@intFromEnum(slot)] = true,
+        .borrow_reserve => |slot| value_used[@backingInt(slot)] = true,
         .borrow_start => |start| if (start.index) |index| {
-            value_used[@intFromEnum(index)] = true;
+            value_used[@backingInt(index)] = true;
         },
         .borrow_read => {},
-        .borrow_store => |store| value_used[@intFromEnum(store.value)] = true,
+        .borrow_store => |store| value_used[@backingInt(store.value)] = true,
         .parameter => |index| param_used[index] = true,
-        .local_slot => |value| value_used[@intFromEnum(value)] = true,
-        .local_load => |slot| value_used[@intFromEnum(slot)] = true,
+        .local_slot => |value| value_used[@backingInt(value)] = true,
+        .local_load => |slot| value_used[@backingInt(slot)] = true,
         .field_store => |store| {
-            value_used[@intFromEnum(store.slot)] = true;
-            value_used[@intFromEnum(store.value)] = true;
+            value_used[@backingInt(store.slot)] = true;
+            value_used[@backingInt(store.value)] = true;
         },
         .local_store => |store| {
-            value_used[@intFromEnum(store.slot)] = true;
-            value_used[@intFromEnum(store.value)] = true;
+            value_used[@backingInt(store.slot)] = true;
+            value_used[@backingInt(store.value)] = true;
         },
-        .unary => |unary| value_used[@intFromEnum(unary.operand)] = true,
+        .unary => |unary| value_used[@backingInt(unary.operand)] = true,
         .binary => |binary| {
-            value_used[@intFromEnum(binary.lhs)] = true;
-            value_used[@intFromEnum(binary.rhs)] = true;
+            value_used[@backingInt(binary.lhs)] = true;
+            value_used[@backingInt(binary.rhs)] = true;
         },
         .call => |call| {
-            if (!call.noreturn or sameFunction(ir.functions.items[@intFromEnum(body.instructions[@intFromEnum(call.callee)].op.function_ref)], function)) value_used[@intFromEnum(call.callee)] = true;
-            for (call.args) |arg| value_used[@intFromEnum(arg)] = true;
+            if (!call.noreturn or sameFunction(ir.functions.items[@backingInt(body.instructions[@backingInt(call.callee)].op.function_ref)], function)) value_used[@backingInt(call.callee)] = true;
+            for (call.args) |arg| value_used[@backingInt(arg)] = true;
         },
         .print => |print| for (print.args) |arg| {
-            value_used[@intFromEnum(arg)] = true;
+            value_used[@backingInt(arg)] = true;
         },
         .short_circuit => |region| {
-            value_used[@intFromEnum(region.lhs)] = true;
-            value_used[@intFromEnum(region.rhs)] = true;
+            value_used[@backingInt(region.lhs)] = true;
+            value_used[@backingInt(region.rhs)] = true;
         },
         .branch => |region| {
-            value_used[@intFromEnum(region.condition)] = true;
-            value_used[@intFromEnum(region.then_value)] = true;
-            if (region.else_value) |value| value_used[@intFromEnum(value)] = true;
+            value_used[@backingInt(region.condition)] = true;
+            value_used[@backingInt(region.then_value)] = true;
+            if (region.else_value) |value| value_used[@backingInt(value)] = true;
         },
-        .panic => |value| value_used[@intFromEnum(value)] = true,
+        .panic => |value| value_used[@backingInt(value)] = true,
         .return_value, .loop_break => |value| {
-            if (value) |v| value_used[@intFromEnum(v)] = true;
+            if (value) |v| value_used[@backingInt(v)] = true;
         },
         .loop => |region| {
-            if (!region.unconditional) value_used[@intFromEnum(region.condition)] = true;
-            value_used[@intFromEnum(region.body)] = true;
-            if (region.continuation) |value| value_used[@intFromEnum(value)] = true;
-            if (region.else_value) |value| value_used[@intFromEnum(value)] = true;
+            if (!region.unconditional) value_used[@backingInt(region.condition)] = true;
+            value_used[@backingInt(region.body)] = true;
+            if (region.continuation) |value| value_used[@backingInt(value)] = true;
+            if (region.else_value) |value| value_used[@backingInt(value)] = true;
         },
         .loop_continue, .constant, .function_ref => {},
     };
@@ -712,14 +713,14 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
         try w.writeAll("    (void)nov_gc_register_globals; (void)nov_gc_unregister_globals; (void)nov_gc_shutdown; (void)nov_gc_pop; (void)nov_gc_alloc;\n    (void)nov_array_clone; (void)nov_array_index; (void)nov_array_append;\n");
         var roots: usize = 0;
         for (signature.params) |param| if (Ir.isManaged(ir.getType(param).?)) {
-            roots = std.math.add(usize, roots, root_counts[@intFromEnum(param)]) catch return error.OutOfMemory;
+            roots = std.math.add(usize, roots, root_counts[@backingInt(param)]) catch return error.OutOfMemory;
         };
         for (body.instructions, 0..) |instruction, i| {
             if (!Ir.isManaged(ir.getType(instruction.ty).?)) continue;
             try w.writeAll("    ");
             try writeType(ir, w, instruction.ty);
             try w.print(" v{d} = {{0}};\n", .{i});
-            roots = std.math.add(usize, roots, root_counts[@intFromEnum(instruction.ty)]) catch return error.OutOfMemory;
+            roots = std.math.add(usize, roots, root_counts[@backingInt(instruction.ty)]) catch return error.OutOfMemory;
         }
         // Stable function-scope void* fields, never casts from typed T** slots.
         if (roots != 0) {
@@ -757,35 +758,35 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
                     try w.print("    while (true) {{\n    goto nov_cond{d};\n    nov_cond{d}:;\n", .{ end, end });
                 }
                 if (region.body_start == i and !region.unconditional and !Ir.terminates(body, region.condition))
-                    try w.print("    if (!v{d}) goto nov_{s}{d};\n", .{ @intFromEnum(region.condition), if (region.else_start != null) "else" else "exit", end });
+                    try w.print("    if (!v{d}) goto nov_{s}{d};\n", .{ @backingInt(region.condition), if (region.else_start != null) "else" else "exit", end });
                 if (region.continuation_start != null and region.continuation_start.? == i)
                     try w.print("    goto nov_cont{d};\n    nov_cont{d}:;\n", .{ end, end });
                 if (region.else_start != null and region.else_start.? == i)
                     try w.print("    }}\n    goto nov_else{d};\n    nov_else{d}:;\n    {{\n", .{ end, end });
             } else if (candidate.op == .branch) {
                 const region = candidate.op.branch;
-                const has_value = ir.types.items[@intFromEnum(candidate.ty)] != .void;
+                const has_value = ir.types.items[@backingInt(candidate.ty)] != .void;
                 if (region.then_start == i) {
                     if (has_value and !Ir.isManaged(ir.getType(candidate.ty).?)) {
                         try w.writeAll("    ");
                         try writeType(ir, w, candidate.ty);
                         try w.print(" v{d};\n", .{end});
                     }
-                    try w.print("    if (v{d}) {{\n", .{@intFromEnum(region.condition)});
+                    try w.print("    if (v{d}) {{\n", .{@backingInt(region.condition)});
                 }
                 if (region.else_start == i) {
-                    if (has_value and !Ir.terminates(body, region.then_value)) try w.print("    v{d} = v{d};\n", .{ end, @intFromEnum(region.then_value) });
+                    if (has_value and !Ir.terminates(body, region.then_value)) try w.print("    v{d} = v{d};\n", .{ end, @backingInt(region.then_value) });
                     try w.writeAll("    } else {\n");
                 }
             } else if (candidate.op == .short_circuit and candidate.op.short_circuit.rhs_start == i) {
                 const region = candidate.op.short_circuit;
-                try w.print("    bool v{d} = v{d};\n    if ({s}v{d}) {{\n", .{ end, @intFromEnum(region.lhs), if (region.kind == .@"or") "!" else "", @intFromEnum(region.lhs) });
+                try w.print("    bool v{d} = v{d};\n    if ({s}v{d}) {{\n", .{ end, @backingInt(region.lhs), if (region.kind == .@"or") "!" else "", @backingInt(region.lhs) });
             }
         }
         if (instruction.op == .loop) {
             if (instruction.op.loop.else_value) |value| {
                 if (ir.getType(instruction.ty).? != .void and !Ir.terminates(body, value))
-                    try w.print("    v{d} = v{d};\n", .{ i, @intFromEnum(value) });
+                    try w.print("    v{d} = v{d};\n", .{ i, @backingInt(value) });
             }
             try w.print("    }}\n    goto nov_exit{d};\n    nov_exit{d}:;\n", .{ i, i });
             if (ir.getType(instruction.ty).? != .void and !value_used[i]) try w.print("    (void)v{d};\n", .{i});
@@ -797,7 +798,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
             if (instruction.op == .loop_break) {
                 if (instruction.op.loop_break) |value| {
                     if (ir.getType(body.instructions[owner].ty).? != .void)
-                        try w.print("    v{d} = v{d};\n", .{ owner, @intFromEnum(value) });
+                        try w.print("    v{d} = v{d};\n", .{ owner, @backingInt(value) });
                 }
                 try w.print("    goto nov_exit{d};\n", .{owner});
             } else {
@@ -807,57 +808,57 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
             continue;
         }
         if (instruction.op == .branch) {
-            if (ir.types.items[@intFromEnum(instruction.ty)] != .void and !Ir.terminates(body, instruction.op.branch.else_value.?)) {
-                try w.print("    v{d} = v{d};\n", .{ i, @intFromEnum(instruction.op.branch.else_value.?) });
+            if (ir.types.items[@backingInt(instruction.ty)] != .void and !Ir.terminates(body, instruction.op.branch.else_value.?)) {
+                try w.print("    v{d} = v{d};\n", .{ i, @backingInt(instruction.op.branch.else_value.?) });
             }
             try w.writeAll("    }\n");
-            if (ir.types.items[@intFromEnum(instruction.ty)] != .void and !value_used[i]) try w.print("    (void)v{d};\n", .{i});
+            if (ir.types.items[@backingInt(instruction.ty)] != .void and !value_used[i]) try w.print("    (void)v{d};\n", .{i});
             continue;
         }
         if (instruction.op == .short_circuit) {
-            if (!Ir.terminates(body, instruction.op.short_circuit.rhs)) try w.print("    v{d} = v{d};\n", .{ i, @intFromEnum(instruction.op.short_circuit.rhs) });
+            if (!Ir.terminates(body, instruction.op.short_circuit.rhs)) try w.print("    v{d} = v{d};\n", .{ i, @backingInt(instruction.op.short_circuit.rhs) });
             try w.writeAll("    }\n");
             if (!value_used[i]) try w.print("    (void)v{d};\n", .{i});
             continue;
         }
-        const ty = ir.types.items[@intFromEnum(instruction.ty)];
+        const ty = ir.types.items[@backingInt(instruction.ty)];
         if (instruction.op == .call and instruction.op.call.noreturn) {
             const call = instruction.op.call;
-            const target = body.instructions[@intFromEnum(call.callee)].op.function_ref;
+            const target = body.instructions[@backingInt(call.callee)].op.function_ref;
             try w.writeAll("    ");
-            if (sameFunction(ir.functions.items[@intFromEnum(target)], function)) {
+            if (sameFunction(ir.functions.items[@backingInt(target)], function)) {
                 // Volatile indirection avoids C compilers rejecting valid Nov
                 // recursion under -Winfinite-recursion. C11 has no noreturn
                 // pointer qualifier, so explicitly represent the absent successor.
                 try w.writeAll("{ ");
-                try writeType(ir, w, body.instructions[@intFromEnum(call.callee)].ty);
-                try w.print(" volatile nov_target = v{d};\n    nov_target(", .{@intFromEnum(call.callee)});
+                try writeType(ir, w, body.instructions[@backingInt(call.callee)].ty);
+                try w.print(" volatile nov_target = v{d};\n    nov_target(", .{@backingInt(call.callee)});
                 for (call.args, 0..) |arg, index| {
                     if (index != 0) try w.writeAll(", ");
-                    try w.print("v{d}", .{@intFromEnum(arg)});
+                    try w.print("v{d}", .{@backingInt(arg)});
                 }
                 try w.writeAll(");\n    for (;;) {}\n    }\n");
             } else {
-                try writeScopedFunctionName(w, ir.functions.items[@intFromEnum(target)]);
+                try writeScopedFunctionName(w, ir.functions.items[@backingInt(target)]);
                 try w.writeByte('(');
                 for (call.args, 0..) |arg, index| {
                     if (index != 0) try w.writeAll(", ");
-                    try w.print("v{d}", .{@intFromEnum(arg)});
+                    try w.print("v{d}", .{@backingInt(arg)});
                 }
                 try w.writeAll(");\n");
             }
             continue;
         }
         if (instruction.op == .panic) {
-            const value = @intFromEnum(instruction.op.panic);
+            const value = @backingInt(instruction.op.panic);
             try w.print("    nov_rt_panic_bytes(v{d}.data, v{d}.len);\n", .{ value, value });
             continue;
         }
         if (instruction.op == .return_value) {
             if (managed) try w.writeAll("    nov_gc_pop(&nov_rt_heap, &nov_frame);\n");
             if (instruction.op.return_value) |value| {
-                if (ir.types.items[@intFromEnum(body.instructions[@intFromEnum(value)].ty)] != .void) {
-                    try w.print("    return v{d};\n", .{@intFromEnum(value)});
+                if (ir.types.items[@backingInt(body.instructions[@backingInt(value)].ty)] != .void) {
+                    try w.print("    return v{d};\n", .{@backingInt(value)});
                 } else try w.writeAll("    return;\n");
             } else try w.writeAll("    return;\n");
             continue;
@@ -865,40 +866,40 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
         if (instruction.op == .borrow_reserve) continue;
         if (instruction.op == .borrow_start) {
             const start = instruction.op.borrow_start;
-            const slot = body.instructions[@intFromEnum(start.reservation)].op.borrow_reserve;
-            if (start.index) |index| try w.print("    const uintptr_t b{d} = nov_array_index(v{d}, v{d});\n    (void)b{d};\n", .{ i, @intFromEnum(slot), @intFromEnum(index), i });
+            const slot = body.instructions[@backingInt(start.reservation)].op.borrow_reserve;
+            if (start.index) |index| try w.print("    const uintptr_t b{d} = nov_array_index(v{d}, v{d});\n    (void)b{d};\n", .{ i, @backingInt(slot), @backingInt(index), i });
             continue;
         }
         if (instruction.op == .borrow_store) {
             const store = instruction.op.borrow_store;
             const slot = Ir.borrowOwner(body, store.borrow);
-            const owner = ir.getType(body.instructions[@intFromEnum(slot)].ty).?;
-            if (body.instructions[@intFromEnum(store.borrow)].op.borrow_start.index == null) {
-                try w.print("    v{d}", .{@intFromEnum(slot)});
+            const owner = ir.getType(body.instructions[@backingInt(slot)].ty).?;
+            if (body.instructions[@backingInt(store.borrow)].op.borrow_start.index == null) {
+                try w.print("    v{d}", .{@backingInt(slot)});
             } else {
                 try w.writeAll("    ((");
                 try writeType(ir, w, owner.array);
-                try w.print(" *)v{d}.data)[b{d}]", .{ @intFromEnum(slot), @intFromEnum(store.borrow) });
+                try w.print(" *)v{d}.data)[b{d}]", .{ @backingInt(slot), @backingInt(store.borrow) });
             }
             for (store.path) |index| try w.print(".f{d}", .{index});
-            try w.print(" = v{d};\n", .{@intFromEnum(store.value)});
+            try w.print(" = v{d};\n", .{@backingInt(store.value)});
             continue;
         }
         if (instruction.op == .field_store) {
             const store = instruction.op.field_store;
-            try w.print("    v{d}", .{@intFromEnum(store.slot)});
+            try w.print("    v{d}", .{@backingInt(store.slot)});
             for (store.path) |index| try w.print(".f{d}", .{index});
-            try w.print(".f{d} = v{d};\n", .{ store.index, @intFromEnum(store.value) });
+            try w.print(".f{d} = v{d};\n", .{ store.index, @backingInt(store.value) });
             continue;
         }
         if (instruction.op == .local_store) {
             const store = instruction.op.local_store;
-            try w.print("    v{d} = v{d};\n", .{ @intFromEnum(store.slot), @intFromEnum(store.value) });
+            try w.print("    v{d} = v{d};\n", .{ @backingInt(store.slot), @backingInt(store.value) });
             continue;
         }
         if (instruction.op == .union_payload) {
             const read = instruction.op.union_payload;
-            try w.print("    if (v{d}.tag != {d}) nov_rt_panic(\"inactive union payload\");\n", .{ @intFromEnum(read.base), read.index });
+            try w.print("    if (v{d}.tag != {d}) nov_rt_panic(\"inactive union payload\");\n", .{ @backingInt(read.base), read.index });
         }
         if (ty == .void) {
             // Void values have no C object; emit their effects as statements.
@@ -913,24 +914,24 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
         if (ty == .string) {
             try w.print("    v{d} = ", .{i});
             switch (instruction.op) {
-                .field_read, .union_payload => |read| try w.print("v{d}.f{d}", .{ @intFromEnum(read.base), read.index }),
+                .field_read, .union_payload => |read| try w.print("v{d}.f{d}", .{ @backingInt(read.base), read.index }),
                 .borrow_read => |borrow| try writeBorrowRead(ir, w, body, borrow, instruction.ty),
                 .constant => |id| try writeConstant(w, ir.getConstant(id).?, ty),
                 .parameter => |index| try w.print("p{d}", .{index}),
-                .local_slot, .local_load => |value| try w.print("v{d}", .{@intFromEnum(value)}),
+                .local_slot, .local_load => |value| try w.print("v{d}", .{@backingInt(value)}),
                 .to_string => |value| {
-                    const source_ty = body.instructions[@intFromEnum(value)].ty;
+                    const source_ty = body.instructions[@backingInt(value)].ty;
                     switch (ir.getType(source_ty).?) {
-                        .string => try w.print("v{d}", .{@intFromEnum(value)}),
-                        .boolean => try w.print("(v{d} ? (nov_string){{NULL, (const unsigned char *)\"true\", 4}} : (nov_string){{NULL, (const unsigned char *)\"false\", 5}})", .{@intFromEnum(value)}),
-                        .integer => try w.print("nov_to_string_{d}(v{d})", .{ @intFromEnum(source_ty), @intFromEnum(value) }),
+                        .string => try w.print("v{d}", .{@backingInt(value)}),
+                        .boolean => try w.print("(v{d} ? (nov_string){{NULL, (const unsigned char *)\"true\", 4}} : (nov_string){{NULL, (const unsigned char *)\"false\", 5}})", .{@backingInt(value)}),
+                        .integer => try w.print("nov_to_string_{d}(v{d})", .{ @backingInt(source_ty), @backingInt(value) }),
                         else => unreachable,
                     }
                 },
-                .binary => |b| try w.print("nov_string_concat(v{d}, v{d})", .{ @intFromEnum(b.lhs), @intFromEnum(b.rhs) }),
+                .binary => |b| try w.print("nov_string_concat(v{d}, v{d})", .{ @backingInt(b.lhs), @backingInt(b.rhs) }),
                 .array_index => |r| {
                     try w.writeAll("((nov_string *)");
-                    try w.print("v{d}.data)[nov_array_index(v{d}, v{d})]", .{ @intFromEnum(r.array), @intFromEnum(r.array), @intFromEnum(r.index) });
+                    try w.print("v{d}.data)[nov_array_index(v{d}, v{d})]", .{ @backingInt(r.array), @backingInt(r.array), @backingInt(r.index) });
                 },
                 .call => |call| try writeCall(w, call),
                 else => unreachable,
@@ -955,63 +956,63 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
             .range_init => |r| {
                 try w.writeByte('(');
                 try writeType(ir, w, instruction.ty);
-                try w.print("){{v{d}, v{d}, {s}}}", .{ @intFromEnum(r.start), @intFromEnum(r.end), if (r.inclusive) "true" else "false" });
+                try w.print("){{v{d}, v{d}, {s}}}", .{ @backingInt(r.start), @backingInt(r.end), if (r.inclusive) "true" else "false" });
             },
-            .range_start => |value| try w.print("v{d}.start", .{@intFromEnum(value)}),
-            .range_end => |value| try w.print("v{d}.end", .{@intFromEnum(value)}),
-            .range_inclusive => |value| try w.print("v{d}.inclusive", .{@intFromEnum(value)}),
+            .range_start => |value| try w.print("v{d}.start", .{@backingInt(value)}),
+            .range_end => |value| try w.print("v{d}.end", .{@backingInt(value)}),
+            .range_inclusive => |value| try w.print("v{d}.inclusive", .{@backingInt(value)}),
             .union_init => |init_value| {
                 try w.writeByte('(');
                 try writeType(ir, w, instruction.ty);
                 try w.print("){{ .tag = {d}", .{init_value.index});
-                if (init_value.payload) |payload| try w.print(", .f{d} = v{d}", .{ init_value.index, @intFromEnum(payload) });
+                if (init_value.payload) |payload| try w.print(", .f{d} = v{d}", .{ init_value.index, @backingInt(payload) });
                 try w.writeAll(" }");
             },
-            .union_tag => |read| try w.print("(v{d}.tag == {d})", .{ @intFromEnum(read.base), read.index }),
-            .union_payload => |read| try w.print("v{d}.f{d}", .{ @intFromEnum(read.base), read.index }),
+            .union_tag => |read| try w.print("(v{d}.tag == {d})", .{ @backingInt(read.base), read.index }),
+            .union_payload => |read| try w.print("v{d}.f{d}", .{ @backingInt(read.base), read.index }),
             .record_init => |values| {
                 try w.writeByte('(');
                 try writeType(ir, w, instruction.ty);
                 try w.writeAll("){ ");
                 for (values, 0..) |value, f| {
                     if (f != 0) try w.writeAll(", ");
-                    try w.print("v{d}", .{@intFromEnum(value)});
+                    try w.print("v{d}", .{@backingInt(value)});
                 }
                 if (values.len == 0) try w.writeByte('0');
                 try w.writeAll(" }");
             },
             .borrow_read => |borrow| try writeBorrowRead(ir, w, body, borrow, instruction.ty),
             .borrow_reserve, .borrow_start, .borrow_store => unreachable,
-            .field_read => |read| try w.print("v{d}.f{d}", .{ @intFromEnum(read.base), read.index }),
-            .array_len => |value| try w.print("v{d}.len", .{@intFromEnum(value)}),
+            .field_read => |read| try w.print("v{d}.f{d}", .{ @backingInt(read.base), read.index }),
+            .array_len => |value| try w.print("v{d}.len", .{@backingInt(value)}),
             .array_index => |r| {
                 try w.writeAll("((");
                 try writeType(ir, w, instruction.ty);
-                try w.print(" *)v{d}.data)[nov_array_index(v{d}, v{d})]", .{ @intFromEnum(r.array), @intFromEnum(r.array), @intFromEnum(r.index) });
+                try w.print(" *)v{d}.data)[nov_array_index(v{d}, v{d})]", .{ @backingInt(r.array), @backingInt(r.array), @backingInt(r.index) });
             },
-            .array_contains => |r| try w.print("nov_array_contains_{d}(v{d}, v{d})", .{ @intFromEnum(body.instructions[@intFromEnum(r.value)].ty), @intFromEnum(r.value), @intFromEnum(r.array) }),
+            .array_contains => |r| try w.print("nov_array_contains_{d}(v{d}, v{d})", .{ @backingInt(body.instructions[@backingInt(r.value)].ty), @backingInt(r.value), @backingInt(r.array) }),
             .array_literal, .array_clone, .array_set, .array_append, .to_string, .field_store => unreachable,
-            .constant => |id| try writeConstant(w, ir.constants.items[@intFromEnum(id)], ty),
+            .constant => |id| try writeConstant(w, ir.constants.items[@backingInt(id)], ty),
             .parameter => |index| try w.print("p{d}", .{index}),
-            .local_slot, .local_load => |value| try w.print("v{d}", .{@intFromEnum(value)}),
-            .function_ref => |id| try writeScopedFunctionName(w, ir.functions.items[@intFromEnum(id)]),
+            .local_slot, .local_load => |value| try w.print("v{d}", .{@backingInt(value)}),
+            .function_ref => |id| try writeScopedFunctionName(w, ir.functions.items[@backingInt(id)]),
             .unary => |unary| switch (unary.op) {
-                .bool_not => try w.print("!v{d}", .{@intFromEnum(unary.operand)}),
+                .bool_not => try w.print("!v{d}", .{@backingInt(unary.operand)}),
                 .bit_not => {
                     // Operands may be promoted to int, so convert back explicitly.
                     try w.writeByte('(');
                     try writeType(ir, w, instruction.ty);
-                    try w.print(")~v{d}", .{@intFromEnum(unary.operand)});
+                    try w.print(")~v{d}", .{@backingInt(unary.operand)});
                 },
                 .negate => {
                     try w.writeByte('(');
                     try writeType(ir, w, instruction.ty);
-                    try w.print(")(UINT{d}_C(0) - (uint{d}_t)v{d})", .{ workingBits(ty), workingBits(ty), @intFromEnum(unary.operand) });
+                    try w.print(")(UINT{d}_C(0) - (uint{d}_t)v{d})", .{ workingBits(ty), workingBits(ty), @backingInt(unary.operand) });
                 },
             },
             .binary => |binary| arithmetic: {
-                const lhs = @intFromEnum(binary.lhs);
-                const rhs = @intFromEnum(binary.rhs);
+                const lhs = @backingInt(binary.lhs);
+                const rhs = @backingInt(binary.rhs);
                 if (ir.getType(body.instructions[lhs].ty).? == .string) {
                     if (binary.op == .ne) try w.writeByte('!');
                     try w.print("nov_string_equal(v{d}, v{d})", .{ lhs, rhs });
@@ -1034,7 +1035,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
                         break :arithmetic;
                     },
                     .div, .mod => {
-                        try w.print("nov_rt_{s}_{d}(v{d}, v{d})", .{ @tagName(binary.op), @intFromEnum(instruction.ty), lhs, rhs });
+                        try w.print("nov_rt_{s}_{d}(v{d}, v{d})", .{ @tagName(binary.op), @backingInt(instruction.ty), lhs, rhs });
                         break :arithmetic;
                     },
                     else => {},
@@ -1048,7 +1049,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
                     .ge => ">=",
                     .add, .sub, .mul, .div, .mod, .bit_and, .bit_or, .bit_xor => unreachable,
                 };
-                try w.print("v{d} {s} v{d}", .{ @intFromEnum(binary.lhs), operator, @intFromEnum(binary.rhs) });
+                try w.print("v{d} {s} v{d}", .{ @backingInt(binary.lhs), operator, @backingInt(binary.rhs) });
             },
             .call => |call| try writeCall(w, call),
             .panic, .loop, .loop_break, .loop_continue, .return_value, .print, .short_circuit, .branch, .local_store => unreachable,
@@ -1056,23 +1057,23 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
         try w.writeAll(";\n");
         if (!value_used[i] or instruction.op == .local_slot) try w.print("    (void)v{d};\n", .{i});
     }
-    const result_type = ir.types.items[@intFromEnum(signature.result)];
+    const result_type = ir.types.items[@backingInt(signature.result)];
     if (managed and !Ir.terminates(body, body.result)) try w.writeAll("    nov_gc_pop(&nov_rt_heap, &nov_frame);\n");
-    if (result_type != .void and !Ir.terminates(body, body.result)) try w.print("    return v{d};\n", .{@intFromEnum(body.result)});
+    if (result_type != .void and !Ir.terminates(body, body.result)) try w.print("    return v{d};\n", .{@backingInt(body.result)});
 }
 
 fn writeElementLayout(_: *const Ir, w: *std.Io.Writer, element: Ir.TypeId) WriteError!void {
-    try w.print("&nov_element_{d}", .{@intFromEnum(element)});
+    try w.print("&nov_element_{d}", .{@backingInt(element)});
 }
 
 fn writeBorrowRead(ir: *const Ir, w: *std.Io.Writer, body: Ir.Body, borrow: Ir.ValueId, ty: Ir.TypeId) WriteError!void {
     const slot = Ir.borrowOwner(body, borrow);
-    if (body.instructions[@intFromEnum(borrow)].op.borrow_start.index == null) {
-        try w.print("v{d}", .{@intFromEnum(slot)});
+    if (body.instructions[@backingInt(borrow)].op.borrow_start.index == null) {
+        try w.print("v{d}", .{@backingInt(slot)});
     } else {
         try w.writeAll("((");
         try writeType(ir, w, ty);
-        try w.print(" *)v{d}.data)[b{d}]", .{ @intFromEnum(slot), @intFromEnum(borrow) });
+        try w.print(" *)v{d}.data)[b{d}]", .{ @backingInt(slot), @backingInt(borrow) });
     }
 }
 
@@ -1088,30 +1089,30 @@ fn writeArrayValue(ir: *const Ir, w: *std.Io.Writer, body: Ir.Body, instruction:
             for (elements, 0..) |value, index| {
                 try w.writeAll("    ((");
                 try writeType(ir, w, element);
-                try w.print(" *)v{d}.data)[{d}] = v{d};\n", .{ i, index, @intFromEnum(value) });
+                try w.print(" *)v{d}.data)[{d}] = v{d};\n", .{ i, index, @backingInt(value) });
             }
             return;
         },
         .array_clone => |value| {
-            try w.print("nov_array_clone(v{d}, ", .{@intFromEnum(value)});
+            try w.print("nov_array_clone(v{d}, ", .{@backingInt(value)});
             try writeElementLayout(ir, w, element);
             try w.writeByte(')');
         },
         .array_set => |r| {
-            try w.print("nov_array_clone(v{d}, ", .{@intFromEnum(r.array)});
+            try w.print("nov_array_clone(v{d}, ", .{@backingInt(r.array)});
             try writeElementLayout(ir, w, element);
             try w.writeAll(");\n    ((");
             try writeType(ir, w, element);
-            try w.print(" *)v{d}.data)[nov_array_index(v{d}, v{d})] = v{d};\n", .{ i, i, @intFromEnum(r.index), @intFromEnum(r.value) });
+            try w.print(" *)v{d}.data)[nov_array_index(v{d}, v{d})] = v{d};\n", .{ i, i, @backingInt(r.index), @backingInt(r.value) });
             return;
         },
         .array_append => |r| {
-            try w.print("nov_array_append(v{d}, v{d}, ", .{ @intFromEnum(r.lhs), @intFromEnum(r.rhs) });
+            try w.print("nov_array_append(v{d}, v{d}, ", .{ @backingInt(r.lhs), @backingInt(r.rhs) });
             try writeElementLayout(ir, w, element);
             try w.writeByte(')');
         },
         .parameter => |index| try w.print("p{d}", .{index}),
-        .local_slot, .local_load => |value| try w.print("v{d}", .{@intFromEnum(value)}),
+        .local_slot, .local_load => |value| try w.print("v{d}", .{@backingInt(value)}),
         .call => |call| try writeCall(w, call),
         else => unreachable,
     }
@@ -1125,11 +1126,11 @@ fn writePrint(ir: *const Ir, w: *std.Io.Writer, body: Ir.Body, print: anytype) W
     if (print.args.len == 0 and !print.newline) try w.writeAll("    nov_rt_check(fputs(\"\", stdout));\n");
     for (print.args, 0..) |arg, i| {
         if (i != 0) try w.writeAll("    nov_rt_check(fputc(' ', stdout));\n");
-        const ty = ir.types.items[@intFromEnum(body.instructions[@intFromEnum(arg)].ty)];
+        const ty = ir.types.items[@backingInt(body.instructions[@backingInt(arg)].ty)];
         switch (ty) {
-            .string => try w.print("    if (v{d}.len && fwrite(v{d}.data, 1, (size_t)v{d}.len, stdout) != (size_t)v{d}.len) nov_rt_panic(\"stdout write failed\");\n", .{ @intFromEnum(arg), @intFromEnum(arg), @intFromEnum(arg), @intFromEnum(arg) }),
-            .boolean => try w.print("    nov_rt_check(fputs(v{d} ? \"true\" : \"false\", stdout));\n", .{@intFromEnum(arg)}),
-            .integer => |integer| try w.print("    nov_rt_check(fprintf(stdout, \"%\" PRI{s}MAX, ({s}intmax_t)v{d}));\n", .{ if (integer.signedness == .signed) "d" else "u", if (integer.signedness == .signed) "" else "u", @intFromEnum(arg) }),
+            .string => try w.print("    if (v{d}.len && fwrite(v{d}.data, 1, (size_t)v{d}.len, stdout) != (size_t)v{d}.len) nov_rt_panic(\"stdout write failed\");\n", .{ @backingInt(arg), @backingInt(arg), @backingInt(arg), @backingInt(arg) }),
+            .boolean => try w.print("    nov_rt_check(fputs(v{d} ? \"true\" : \"false\", stdout));\n", .{@backingInt(arg)}),
+            .integer => |integer| try w.print("    nov_rt_check(fprintf(stdout, \"%\" PRI{s}MAX, ({s}intmax_t)v{d}));\n", .{ if (integer.signedness == .signed) "d" else "u", if (integer.signedness == .signed) "" else "u", @backingInt(arg) }),
             else => unreachable,
         }
     }
@@ -1137,10 +1138,10 @@ fn writePrint(ir: *const Ir, w: *std.Io.Writer, body: Ir.Body, print: anytype) W
 }
 
 fn writeCall(w: *std.Io.Writer, call: anytype) WriteError!void {
-    try w.print("v{d}(", .{@intFromEnum(call.callee)});
+    try w.print("v{d}(", .{@backingInt(call.callee)});
     for (call.args, 0..) |arg, i| {
         if (i != 0) try w.writeAll(", ");
-        try w.print("v{d}", .{@intFromEnum(arg)});
+        try w.print("v{d}", .{@backingInt(arg)});
     }
     try w.writeByte(')');
 }
@@ -1359,7 +1360,7 @@ test "instance calls source free ownership and every allocation failure" {
     const c = try emitProgram(test_gpa, &sema.ir, null);
     defer test_gpa.free(c);
     try compileAndRunExpected(c, "typedef int nonempty_translation_unit;", 0, instance_output, "");
-    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{instance_program});
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{instance_program});
 }
 
 test "enum values methods defaults records generic payloads propagation and forced GC" {
@@ -1401,7 +1402,7 @@ test "enum source-free emission and every compiler allocation failure" {
     const c = try emitProgram(test_gpa, &sema.ir, null);
     defer test_gpa.free(c);
     try compileAndRunExpected(c, "typedef int nonempty_translation_unit;", 0, "not_found other true true not_found hello true 7\nnot_found\nnot_found:detail\n", "");
-    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{enum_program});
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{enum_program});
 }
 
 test "root enum scalars need no GC owners or integer operations" {
@@ -1585,7 +1586,7 @@ test "Option propagation source free IR and every compiler allocation failure" {
     const c = try collectingTestProgram(library);
     defer test_gpa.free(c);
     for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, option_propagation_output, "", mode);
-    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{option_propagation_program});
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{option_propagation_program});
 }
 
 test "Option propagation none skips allocations and some reports runtime OOM" {
@@ -1651,7 +1652,7 @@ test "record payload IR owns source and emission survives every allocation failu
     const c = try collectingTestProgram(library);
     defer test_gpa.free(c);
     try compileAndRunExpected(c, "typedef int nonempty_translation_unit;", 0, record_payload_output, "");
-    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{"let G:(T:type)->type=union{ok:T,}\nlet R=struct{s:string,}\nlet main:()={let u=G(R).ok[R[.s=\"a\"+\"b\"]]\n@println(match u{.ok=>|r|r.s})}"});
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{"let G:(T:type)->type=union{ok:T,}\nlet R=struct{s:string,}\nlet main:()={let u=G(R).ok[R[.s=\"a\"+\"b\"]]\n@println(match u{.ok=>|r|r.s})}"});
 }
 
 const record_interpolation_program =
@@ -1746,7 +1747,7 @@ test "record interpolation survives source release and every compiler allocation
     const c = try collectingTestProgram(library);
     defer test_gpa.free(c);
     try compileAndRunExpected(c, "typedef int nonempty_translation_unit;", 0, record_interpolation_output, "");
-    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{record_interpolation_program});
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{record_interpolation_program});
 }
 
 test "record interpolation conversion allocations fail safely and skipped conversions allocate nothing" {
@@ -1836,7 +1837,7 @@ test "generic structs own source free IR and survive every allocation failure" {
     const c = try emitProgram(test_gpa, &sema.ir, null);
     defer test_gpa.free(c);
     try compileAndRunExpected(c, "typedef int nonempty_translation_unit;", 0, generic_struct_output, "");
-    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{generic_struct_program});
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{generic_struct_program});
 }
 
 fn testImportedGenericStructs(allocator: std.mem.Allocator) ![]u8 {
@@ -1915,7 +1916,7 @@ test "generic structs imported aliases share canonical instances and defining fr
     defer test_gpa.free(c);
     for ([_][]const u8{ "-O0", "-O3" }) |mode|
         try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "<3> <3> <ab> library:helper true\n", "", mode);
-    try std.testing.checkAllAllocationFailures(test_gpa, testImportedGenericStructAllocations, .{});
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testImportedGenericStructAllocations, .{});
 }
 
 test "generic structs method worklist handles concrete typed locals void and noreturn methods" {
@@ -2001,7 +2002,7 @@ test "generic union ordinary methods specialize callbacks siblings recursion and
     const c = try emitProgram(test_gpa, &sema.ir, null);
     defer test_gpa.free(c);
     for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, generic_method_output, "", mode);
-    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{generic_method_program});
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{generic_method_program});
 }
 
 test "generic methods preserve formatter identity and roots under forced collection" {
@@ -2034,7 +2035,7 @@ test "generic methods root allocated record payload copies across later argument
     const c = try arrayTestProgram(source);
     defer test_gpa.free(c);
     for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "ab 7 ef\ngh 0\nab 7 ef\ngh 1\nab 7 ef\ngh 2\n", "", mode);
-    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{source});
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{source});
 }
 
 test "generic method terminal branches and noreturn methods retain void annotations" {
@@ -2055,7 +2056,7 @@ test "generic method terminal branches and noreturn methods retain void annotati
     const c = try arrayTestProgram(source);
     defer test_gpa.free(c);
     for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 1, "7\n", "panic: done\n", mode);
-    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{source});
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{source});
 }
 
 test "generic callback methods allocate only in selected ordinary bodies and report runtime OOM" {
@@ -2123,7 +2124,7 @@ test "demand generic void Results retain source free ownership formatter roots a
     defer test_gpa.free(formatted);
     try std.testing.expectEqualStrings(program, formatted);
     for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(program, "typedef int nonempty_translation_unit;", 0, "2\nerr!\n5 9\nempty both\n", "", mode);
-    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{demand_void_result_program});
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{demand_void_result_program});
 }
 
 test "demand generic method body worklist discovers new containers callbacks and earlier siblings" {
@@ -2160,7 +2161,7 @@ test "demand generic method body worklist discovers new containers callbacks and
     const program = try collectingTestProgram(library);
     defer test_gpa.free(program);
     for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(program, "typedef int nonempty_translation_unit;", 0, "yes!\n", "", mode);
-    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{source});
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{source});
 }
 
 const generic_union_output = "PSPok:value:7 err:error\nPPbool:true err:error\nok:ab err:cd\n";
@@ -2257,7 +2258,7 @@ test "generic union instantiation and propagation own source and survive OOM" {
     const c = try emitProgram(test_gpa, &sema.ir, null);
     defer test_gpa.free(c);
     try compileAndRunExpected(c, "typedef int nonempty_translation_unit;", 0, generic_union_output, "");
-    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{generic_union_program});
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{generic_union_program});
 }
 
 const noreturn_program =
@@ -2299,7 +2300,7 @@ test "noreturn metadata owns source survives OOM formatting and GC with C11 prot
         for ([_][]const u8{ "-O0", "-O3" }) |mode|
             try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 1, "IA", "panic: hé\x00!\n", mode);
     }
-    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{noreturn_program});
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{noreturn_program});
 }
 
 test "terminal loop conditions skip body continuation exhaustion and preserve nested effects" {
@@ -2462,7 +2463,7 @@ test "panic and noreturn source free IR emission and lowering survive every allo
         const c = try emitProgram(test_gpa, &sema.ir, null);
         defer test_gpa.free(c);
         try compileAndRunExpected(c, "typedef int nonempty_translation_unit;", 1, stdout, "panic: hé\x00!\n");
-        try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{source});
+        try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{source});
     }
 }
 
@@ -2616,7 +2617,7 @@ test "union lowering and emission own source and survive every allocation failur
     const c = try emitProgram(test_gpa, &sema.ir, null);
     defer test_gpa.free(c);
     try compileAndRunExpected(c, "typedef int nonempty_translation_unit;", 0, union_output, "");
-    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{union_program});
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{union_program});
 }
 
 const field_mutation =
@@ -2712,7 +2713,7 @@ test "field mutation owns source-free IR and survives every compiler allocation 
     const c = try emitProgram(test_gpa, &sema.ir, null);
     defer test_gpa.free(c);
     try compileAndRunExpected(c, "typedef int nonempty_translation_unit;", 0, field_mutation_output, "");
-    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{field_mutation});
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{field_mutation});
 }
 
 const record_program =
@@ -2766,7 +2767,7 @@ test "record fields defaults methods and C output survive source release and eve
     const c = try emitProgram(test_gpa, &sema.ir, null);
     defer test_gpa.free(c);
     try compileAndRunExpected(c, "typedef int nonempty_translation_unit;", 0, record_output, "");
-    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{record_program});
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{record_program});
 }
 
 test "record parameters returns and assignments share immutable string backing" {
@@ -2971,11 +2972,11 @@ const array_example =
 ;
 
 fn arrayTestProgram(source: []const u8) ![]u8 {
-    const terminated = try test_gpa.dupeZ(u8, source);
+    const terminated = try test_gpa.dupeSentinel(u8, source, 0);
     defer test_gpa.free(terminated);
     const formatted = try Formatter.format(test_gpa, terminated);
     defer test_gpa.free(formatted);
-    const formatted_z = try test_gpa.dupeZ(u8, formatted);
+    const formatted_z = try test_gpa.dupeSentinel(u8, formatted, 0);
     defer test_gpa.free(formatted_z);
     const again = try Formatter.format(test_gpa, formatted_z);
     defer test_gpa.free(again);
@@ -3155,7 +3156,7 @@ test "match and pipes own metadata after source release" {
 }
 
 test "match and pipes clean up every compiler allocation failure" {
-    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{match_pipes});
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{match_pipes});
 }
 
 const boolean_match_program =
@@ -3258,7 +3259,7 @@ test "exhaustive boolean match owns metadata after source release" {
 }
 
 test "exhaustive boolean match cleans up every compiler allocation failure" {
-    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{boolean_match_program});
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{boolean_match_program});
 }
 
 test "exhaustive boolean match allocates only in selected prong and reports runtime OOM" {
@@ -3383,7 +3384,7 @@ test "bitwise binary owned lowering emits after source release" {
 }
 
 test "bitwise binaries survive every compiler allocation failure" {
-    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{bitwise_program});
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{bitwise_program});
 }
 
 const array_membership =
@@ -3452,7 +3453,9 @@ test "array membership supports every fixed and native scalar element type" {
     try source.writer.writeAll("}\n");
     const c = try arrayTestProgram(source.written());
     defer test_gpa.free(c);
-    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "true false false\n" ** 11, "", mode);
+    const expected = try std.mem.join(test_gpa, "", &@as([11][]const u8, @splat("true false false\n")));
+    defer test_gpa.free(expected);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, expected, "", mode);
 }
 
 test "array membership scan allocates nothing ignores capacity and stops at first match" {
@@ -3519,7 +3522,7 @@ test "array membership owned lowering emits after freeing source" {
 }
 
 test "array membership compiler ownership survives every allocation failure" {
-    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{array_membership});
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{array_membership});
 }
 
 const range_program =
@@ -3592,7 +3595,7 @@ test "ranges are finite at every integer maximum and accept grouped minimum boun
     const max: u128 = (@as(u128, 1) << Ir.native_pointer_bits) - 1;
     try source.writer.print("loop i in -{{{{{d}}}}}..{d} {{@println(i)}}\nloop i in {d}..{d} {{@println(i)}}\n}}\n", .{ -min, min + 1, max - 1, max });
     try output.writer.print("{d}\n{d}\n", .{ min, max - 1 });
-    const terminated = try test_gpa.dupeZ(u8, source.written());
+    const terminated = try test_gpa.dupeSentinel(u8, source.written(), 0);
     defer test_gpa.free(terminated);
     const formatted = try Formatter.format(test_gpa, terminated);
     defer test_gpa.free(formatted);
@@ -3673,7 +3676,7 @@ test "range endpoint controls do not require an inferred iteration type" {
 
 test "range lowering and formatting survive every allocation failure" {
     for ([_][]const u8{ range_program, terminal_range_bounds }) |source|
-        try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{source});
+        try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{source});
 }
 
 test "range allocating bodies report runtime OOM" {
@@ -3776,7 +3779,7 @@ test "inclusive ranges visit all integer edge endpoints once including continue 
     const max: u128 = (@as(u128, 1) << Ir.native_pointer_bits) - 1;
     try source.writer.print("loop i in -{{{{{d}}}}}..={d} {{@println(i)}}\nloop i in {d}..={d} {{@println(i)\ncontinue}}\nloop i in {d}..={d} {{@println(i)}}\n}}\n", .{ -min, min, max, max, max - 1, max });
     try output.writer.print("{d}\n{d}\n{d}\n{d}\n", .{ min, max, max - 1, max });
-    const terminated = try test_gpa.dupeZ(u8, source.written());
+    const terminated = try test_gpa.dupeSentinel(u8, source.written(), 0);
     defer test_gpa.free(terminated);
     const formatted = try Formatter.format(test_gpa, terminated);
     defer test_gpa.free(formatted);
@@ -3807,10 +3810,10 @@ test "inclusive range C emission owns all data after source destruction" {
 }
 
 test "inclusive range compiler ownership survives every allocation failure" {
-    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{inclusive_range_program});
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{inclusive_range_program});
     const source = try std.mem.replaceOwned(u8, test_gpa, terminal_range_bounds, "..", "..=");
     defer test_gpa.free(source);
-    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{source});
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{source});
 }
 
 const range_else_program =
@@ -3894,10 +3897,10 @@ test "range else distinguishes inclusive MAX exhaustion continue source break an
 }
 
 test "range else ownership and probes survive every allocation failure" {
-    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{range_else_program});
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{range_else_program});
     const inclusive = try std.mem.replaceOwned(u8, test_gpa, range_else_program, "..", "..=");
     defer test_gpa.free(inclusive);
-    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{inclusive});
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{inclusive});
 }
 
 test "range else emitted results outlive source and report allocation failure" {
@@ -4007,7 +4010,7 @@ test "annotated scalar ascriptions match inferred runtime values formatting and 
 }
 
 test "annotated scalar ascriptions survive every compiler allocation failure" {
-    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{annotated_global_program});
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{annotated_global_program});
 }
 
 test "inferred global scalars inline into printing interpolation and boolean matches" {
@@ -4017,7 +4020,7 @@ test "inferred global scalars inline into printing interpolation and boolean mat
 }
 
 test "inferred global scalars survive every compiler allocation failure" {
-    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{inferred_global_program});
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{inferred_global_program});
 }
 
 test "inferred global scalars preserve all native and fixed integer boundaries" {
@@ -4101,7 +4104,7 @@ test "type aliases retain existing backend width diagnostics" {
 }
 
 test "type aliases compiler ownership survives every allocation failure" {
-    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{type_alias_program});
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{type_alias_program});
 }
 
 test "type aliases preserve every supported integer boundary" {
@@ -4158,7 +4161,7 @@ test "ascription preserves exact values effects array copies terminals formattin
 }
 
 test "ascription compiler ownership survives every allocation failure" {
-    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{ascription_program});
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{ascription_program});
 }
 
 test "ascribed interpolation prints every supported integer boundary" {
@@ -4496,7 +4499,7 @@ test "lowered strings emit after module and source storage are freed" {
 }
 
 test "string compiler ownership survives every allocation failure" {
-    for ([_][]const u8{ string_example, string_compound, string_equality, string_interpolation }) |source| try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{source});
+    for ([_][]const u8{ string_example, string_compound, string_equality, string_interpolation }) |source| try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{source});
 }
 
 test "string length overflow panics before touching invalid backing in both modes" {
@@ -4742,7 +4745,9 @@ test "arrays support every approved integer element type" {
     try source.writer.writeAll("}");
     const c = try arrayTestProgram(source.written());
     defer test_gpa.free(c);
-    try compileAndRunExpected(c, "typedef int nonempty_translation_unit;", 0, "2 1 2\n" ** 10, "");
+    const expected = try std.mem.join(test_gpa, "", &@as([10][]const u8, @splat("2 1 2\n")));
+    defer test_gpa.free(expected);
+    try compileAndRunExpected(c, "typedef int nonempty_translation_unit;", 0, expected, "");
 }
 
 test "array evaluation snapshots arguments and evaluates allocating bases and indices once" {
@@ -4870,7 +4875,7 @@ fn testArrayEmissionAllocationFailures(allocator: std.mem.Allocator, source: []c
 }
 
 test "array compiler ownership survives every allocation failure" {
-    for ([_][]const u8{ array_example, array_compound_effects, inferred_example, inferred_arrays }) |source| try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{source});
+    for ([_][]const u8{ array_example, array_compound_effects, inferred_example, inferred_arrays }) |source| try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{source});
 }
 
 const continuation_loops =
@@ -5171,7 +5176,7 @@ test "loop continuations and value results execute before formatting" {
 
 test "continuation and value loop lowering and emission survive every allocation failure" {
     for ([_][]const u8{ continuation_loops, value_loops, else_loops }) |source|
-        try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{source});
+        try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{source});
 }
 
 const unconditional_loops =
@@ -5449,8 +5454,8 @@ fn testLoopAllocationFailures(allocator: std.mem.Allocator) !void {
 }
 
 test "loop source IR and C emission ownership survive every allocation failure" {
-    try std.testing.checkAllAllocationFailures(test_gpa, testLoopAllocationFailures, .{});
-    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{unconditional_loops});
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testLoopAllocationFailures, .{});
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{unconditional_loops});
 }
 
 fn testMutableAllocationFailures(allocator: std.mem.Allocator) !void {
@@ -5480,7 +5485,7 @@ fn testMutableAllocationFailures(allocator: std.mem.Allocator) !void {
 }
 
 test "mutable slot ownership lowering and emission survive every allocation failure" {
-    try std.testing.checkAllAllocationFailures(test_gpa, testMutableAllocationFailures, .{});
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testMutableAllocationFailures, .{});
 }
 
 test "early returns preserve effects fallbacks nested merges and function values" {
@@ -5578,7 +5583,7 @@ fn testReturnAllocationFailures(allocator: std.mem.Allocator) !void {
 }
 
 test "return ownership and C emission survive every allocation failure" {
-    try std.testing.checkAllAllocationFailures(test_gpa, testReturnAllocationFailures, .{});
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testReturnAllocationFailures, .{});
 }
 
 test "if branches execute selected effects once with nesting and function results" {
@@ -5712,7 +5717,7 @@ fn testShortCircuitAllocationFailures(allocator: std.mem.Allocator) !void {
 }
 
 test "nested conditional ownership and emission survive every allocation failure" {
-    try std.testing.checkAllAllocationFailures(test_gpa, testShortCircuitAllocationFailures, .{});
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testShortCircuitAllocationFailures, .{});
 }
 
 test "local initializers statements and nested results execute in source order" {
@@ -5844,7 +5849,7 @@ fn testPrintingEmissionAllocationFailures(allocator: std.mem.Allocator) !void {
 }
 
 test "printing program emission survives every allocation failure" {
-    try std.testing.checkAllAllocationFailures(test_gpa, testPrintingEmissionAllocationFailures, .{});
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testPrintingEmissionAllocationFailures, .{});
 }
 
 test "printing rejects unsupported backend integer widths" {
@@ -6054,13 +6059,13 @@ test "source-qualified functions share pools without entrypoint or C symbol coll
     try ir.source_lengths.appendSlice(test_gpa, &.{ 1, 1 });
     const unit = try ir.internType(.void);
     const signature = try ir.internType(.{ .function = .{ .params = &.{}, .result = unit } });
-    const imported_span: Ir.Span = .{ .source = @enumFromInt(1), .start = 0, .end = 1 };
+    const imported_span: Ir.Span = .{ .source = @fromBackingInt(@intCast(1)), .start = 0, .end = 1 };
     const root_span: Ir.Span = .{ .start = 0, .end = 1 };
     const imported = try ir.addFunction("main", signature, imported_span);
-    try ir.setFunctionBody(imported, &.{.{ .ty = unit, .span = imported_span, .op = .{ .return_value = null } }}, @enumFromInt(0));
+    try ir.setFunctionBody(imported, &.{.{ .ty = unit, .span = imported_span, .op = .{ .return_value = null } }}, @fromBackingInt(@intCast(0)));
     try std.testing.expectError(error.MissingEntrypoint, emitProgram(test_gpa, &ir, null));
     const root = try ir.addFunction("main", signature, root_span);
-    try ir.setFunctionBody(root, &.{.{ .ty = unit, .span = root_span, .op = .{ .return_value = null } }}, @enumFromInt(0));
+    try ir.setFunctionBody(root, &.{.{ .ty = unit, .span = root_span, .op = .{ .return_value = null } }}, @fromBackingInt(@intCast(0)));
     const source = try emitProgramRoot(test_gpa, &ir, root, root_span, null);
     defer test_gpa.free(source);
     try std.testing.expect(std.mem.indexOf(u8, source, "void nov_M1_nov_main(void)") != null);
@@ -6089,7 +6094,7 @@ test "unsupported integer widths are rejected wherever they are reachable" {
     var diagnostic: Diagnostic = undefined;
     try std.testing.expectError(error.UnsupportedIntegerWidth, emitSource("let wide: (x: i128) -> i128 = x", &diagnostic));
     try std.testing.expectEqual(Diagnostic.Reason.integer_width_unsupported, diagnostic.reason);
-    try std.testing.expectEqual(@as(u32, 0), @intFromEnum(diagnostic.function.?));
+    try std.testing.expectEqual(@as(u32, 0), @backingInt(diagnostic.function.?));
     // Nested inside a function type that only appears as a parameter.
     try std.testing.expectError(error.UnsupportedIntegerWidth, emitSource("let f: (g: (u128) -> bool) -> bool = true", null));
 }
@@ -6102,17 +6107,17 @@ test "non-byte-sized integer pool entries do not matter unless reachable" {
     const function_type = try ir.internType(.{ .function = .{ .params = &.{}, .result = void_type } });
     const function = try ir.addFunction("f", function_type, .{ .start = 0, .end = 0 });
     const unit = try ir.internConstant(.{ .ty = void_type, .value = .void });
-    try ir.setFunctionBody(function, &.{.{ .ty = void_type, .span = .{ .start = 0, .end = 0 }, .op = .{ .constant = unit } }}, @enumFromInt(0));
+    try ir.setFunctionBody(function, &.{.{ .ty = void_type, .span = .{ .start = 0, .end = 0 }, .op = .{ .constant = unit } }}, @fromBackingInt(@intCast(0)));
     const c = try emit(test_gpa, &ir, null);
     defer test_gpa.free(c);
     try std.testing.expect(std.mem.indexOf(u8, c, "void nov_f(void) {\n}\n") != null);
 
     const odd_function_type = try ir.internType(.{ .function = .{ .params = &.{odd}, .result = void_type } });
     const odd_function = try ir.addFunction("g", odd_function_type, .{ .start = 0, .end = 0 });
-    try ir.setFunctionBody(odd_function, &.{.{ .ty = void_type, .span = .{ .start = 0, .end = 0 }, .op = .{ .constant = unit } }}, @enumFromInt(0));
+    try ir.setFunctionBody(odd_function, &.{.{ .ty = void_type, .span = .{ .start = 0, .end = 0 }, .op = .{ .constant = unit } }}, @fromBackingInt(@intCast(0)));
     var diagnostic: Diagnostic = undefined;
     try std.testing.expectError(error.UnsupportedIntegerWidth, emit(test_gpa, &ir, &diagnostic));
-    try std.testing.expectEqual(@as(u32, 1), @intFromEnum(diagnostic.function.?));
+    try std.testing.expectEqual(@as(u32, 1), @backingInt(diagnostic.function.?));
 }
 
 test "unverified IR is rejected before emission" {
@@ -6135,7 +6140,7 @@ test "emission survives allocation failures" {
             allocator.free(c);
         }
     };
-    try std.testing.checkAllAllocationFailures(test_gpa, Case.run, .{
+    try TestAllocations.checkAllAllocationFailures(test_gpa, Case.run, .{
         "let id: (x: i32) -> i32 = x\nlet unused: (a: bool, b: bool) -> bool = a\nlet quotient: (a: i32, b: i32) -> i32 = a / b",
     });
 }
@@ -6448,7 +6453,7 @@ test "nested records preserve recursive copies current slot paths captures and r
 }
 
 test "nested records emission and path ownership survive every allocation failure" {
-    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{nested_record_program});
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{nested_record_program});
 }
 
 test "managed array record widths retain semantic limits and report exact backend leaf spans" {
@@ -6646,7 +6651,7 @@ test "managed array literal and indexed stores preserve ordered effects snapshot
 }
 
 test "managed array compiler metadata survives every allocation failure" {
-    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{managed_array_program});
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{managed_array_program});
 }
 
 test "nested records root enumeration prunes large scalar diamonds beside managed roots" {
@@ -6720,7 +6725,7 @@ test "static integer borrowing source free emission and every allocation failure
     try result.ir.verify();
     const c = try emitProgram(test_gpa, &result.ir, null);
     defer test_gpa.free(c);
-    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{integer_borrow_program});
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{integer_borrow_program});
 }
 
 test "static integer borrowing backend preserves semantic 128 bit rejection" {
@@ -6805,7 +6810,7 @@ test "reusable range source free emission and every compiler allocation failure"
     try sema.ir.verify();
     const c = try emitProgram(test_gpa, &sema.ir, null);
     defer test_gpa.free(c);
-    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{reusable_range_program});
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{reusable_range_program});
 }
 
 test "reusable range runtime boundaries per-loop effects and terminal controls" {
@@ -6884,7 +6889,7 @@ test "static borrowing owner indexed updates copies once index source free GC C1
     const c = try collectingTestProgram(library);
     defer test_gpa.free(c);
     for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "IAda Lovelace 2 true 6 Ada collect!\nAda Lovelace 2 Ada 1\nnew!\n0 3\n1 4\n2 5\n", "", mode);
-    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{static_borrow_program});
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{static_borrow_program});
 }
 
 test "static borrowing checks bounds once before subsequent effects" {
@@ -7013,8 +7018,8 @@ test "static borrowing normal snapshot OOM precedes index and RHS effects" {
 }
 
 test "static borrowing snapshot lowering and emission survive every allocation failure" {
-    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{borrow_snapshot_program});
-    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{borrow_snapshot_terminal_program});
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{borrow_snapshot_program});
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{borrow_snapshot_terminal_program});
 }
 
 const general_borrow_program =
@@ -7135,7 +7140,7 @@ test "general borrowing runtime type matrix copied reads source free GC C11 O0 O
     defer test_gpa.free(c);
     for ([_][]const u8{ "-O0", "-O3" }) |mode|
         try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "true true\ntrue true\nabc ab abc\n99 3 old!\nnew! 1\nyes!!\n5 1 3\ntrue true\n11\nab! ab ab!\none two\n12\n6\n4\ntrue\nkeep!\n", "", mode);
-    try std.testing.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{general_borrow_program});
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{general_borrow_program});
 }
 
 test "general borrowing snapshots before alias index RHS effects and readonly CFG slots" {

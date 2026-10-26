@@ -73,9 +73,9 @@ pub fn check(allocator: std.mem.Allocator, body: Ir.Body) Ir.VerifyError!?Ir.Bor
                 if (i == origin) continue;
                 const op = body.instructions[i].op;
                 const use = switch (op) {
-                    .borrow_start => |b| @intFromEnum(b.reservation) == origin,
-                    .borrow_read => |b| @intFromEnum(body.instructions[@intFromEnum(b)].op.borrow_start.reservation) == origin,
-                    .borrow_store => |b| @intFromEnum(body.instructions[@intFromEnum(b.borrow)].op.borrow_start.reservation) == origin,
+                    .borrow_start => |b| @backingInt(b.reservation) == origin,
+                    .borrow_read => |b| @backingInt(body.instructions[@backingInt(b)].op.borrow_start.reservation) == origin,
+                    .borrow_store => |b| @backingInt(body.instructions[@backingInt(b.borrow)].op.borrow_start.reservation) == origin,
                     else => false,
                 };
                 if (!live[i] and (use or live[edges[i][0]] or live[edges[i][1]])) {

@@ -1,5 +1,6 @@
 //! Regression coverage for bounded nominal, unnumbered enums.
 const std = @import("std");
+const TestAllocations = @import("TestAllocations.zig");
 const Module = @import("Module.zig");
 const Lowering = @import("Lowering.zig");
 const Ir = @import("Ir.zig");
@@ -56,7 +57,7 @@ test "enum aliases globals generic arguments defaults and source-free names pres
     defer again.deinit();
     try std.testing.expect(!module.hasErrors());
     try again.ir.verify();
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationTest, .{program});
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, allocationTest, .{program});
 }
 
 test "qualified enum patterns accept aliases mixed alternatives and exhaustive qualified prongs" {
@@ -71,7 +72,7 @@ test "qualified enum patterns accept aliases mixed alternatives and exhaustive q
     try std.testing.expect(!module.hasErrors());
     try std.testing.expect(result.lowering_complete);
     try result.ir.verify();
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationTest, .{source});
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, allocationTest, .{source});
 }
 
 test "covered enum prong notes identify the relevant tag and alternative source span" {
@@ -105,7 +106,7 @@ test "covered enum prong notes identify the relevant tag and alternative source 
         defer output.deinit();
         try Diagnostics.renderModule(&module, &output.writer);
         try std.testing.expect(std.mem.indexOf(u8, output.written(), "note: earlier pattern covers this variant") != null);
-        try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationTest, .{source});
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, allocationTest, .{source});
     }
 }
 
@@ -188,7 +189,7 @@ test "enums reject inexact types arithmetic ordering conversions captures and in
         try std.testing.expect(found);
         try std.testing.expect(!result.lowering_complete);
         try std.testing.expectEqual(@as(usize, 0), result.ir.functions.items.len);
-        try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationTest, .{source});
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, allocationTest, .{source});
     }
 }
 
@@ -201,12 +202,12 @@ fn irAllocationTest(allocator: std.mem.Allocator) !void {
     const c = try ir.internConstant(.{ .ty = ty, .value = .{ .enum_tag = 0 } });
     const signature = try ir.internType(.{ .function = .{ .params = &.{ty}, .result = ty } });
     const f = try ir.addFunction("identity", signature, .{ .start = 0, .end = 1 });
-    try ir.setFunctionBody(f, &.{.{ .ty = ty, .span = .{ .start = 0, .end = 1 }, .op = .{ .constant = c } }}, @enumFromInt(0));
+    try ir.setFunctionBody(f, &.{.{ .ty = ty, .span = .{ .start = 0, .end = 1 }, .op = .{ .constant = c } }}, @fromBackingInt(@intCast(0)));
     try ir.verify();
 }
 
 test "enum IR validates owned nominal metadata constants operations and allocation rollback" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, irAllocationTest, .{});
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, irAllocationTest, .{});
     var ir = Ir.init(std.testing.allocator);
     defer ir.deinit();
     ir.source_len = 1;
@@ -242,21 +243,21 @@ test "enum IR validates owned nominal metadata constants operations and allocati
     var body = [_]Ir.Instruction{
         .{ .ty = ty, .span = .{ .start = 0, .end = 1 }, .op = .{ .parameter = 0 } },
         .{ .ty = ty, .span = .{ .start = 0, .end = 1 }, .op = .{ .constant = c } },
-        .{ .ty = boolean, .span = .{ .start = 0, .end = 1 }, .op = .{ .binary = .{ .op = .lt, .lhs = @enumFromInt(0), .rhs = @enumFromInt(1) } } },
+        .{ .ty = boolean, .span = .{ .start = 0, .end = 1 }, .op = .{ .binary = .{ .op = .lt, .lhs = @fromBackingInt(@intCast(0)), .rhs = @fromBackingInt(@intCast(1)) } } },
     };
-    try std.testing.expectError(error.InvalidOperation, ir.setFunctionBody(f, &body, @enumFromInt(2)));
+    try std.testing.expectError(error.InvalidOperation, ir.setFunctionBody(f, &body, @fromBackingInt(@intCast(2))));
     body[2].op.binary.op = .eq;
     body[1] = .{ .ty = other, .span = .{ .start = 0, .end = 1 }, .op = .{ .parameter = 1 } };
-    try std.testing.expectError(error.OperandTypeMismatch, ir.setFunctionBody(f, &body, @enumFromInt(2)));
+    try std.testing.expectError(error.OperandTypeMismatch, ir.setFunctionBody(f, &body, @fromBackingInt(@intCast(2))));
     body[1] = .{ .ty = ty, .span = .{ .start = 0, .end = 1 }, .op = .{ .constant = c } };
-    try ir.setFunctionBody(f, &body, @enumFromInt(2));
+    try ir.setFunctionBody(f, &body, @fromBackingInt(@intCast(2)));
     try ir.verify();
-    ir.constants.items[@intFromEnum(c)].value.enum_tag = 1;
+    ir.constants.items[@backingInt(c)].value.enum_tag = 1;
     try std.testing.expectError(error.ConstantTypeMismatch, ir.verify());
-    ir.constants.items[@intFromEnum(c)].value.enum_tag = 0;
-    ir.types.items[@intFromEnum(other)].enumeration.identity = 0;
+    ir.constants.items[@backingInt(c)].value.enum_tag = 0;
+    ir.types.items[@backingInt(other)].enumeration.identity = 0;
     try std.testing.expectError(error.NonCanonicalType, ir.verify());
-    ir.types.items[@intFromEnum(other)].enumeration.identity = 1;
+    ir.types.items[@backingInt(other)].enumeration.identity = 1;
 }
 
 test "enum declarations share the namespace and unsupported backing syntax diagnoses" {

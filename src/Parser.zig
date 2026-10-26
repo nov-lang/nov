@@ -26,6 +26,7 @@
 // - ...
 
 const std = @import("std");
+const TestAllocations = @import("TestAllocations.zig");
 const string_literal = @import("string_literal.zig");
 const Formatter = @import("Formatter.zig");
 const Tokenizer = @import("Tokenizer.zig");
@@ -160,7 +161,7 @@ fn interpolationExpression(self: *Parser, tokens: *Ast.TokenList, start: usize, 
     // paths or allowing a trailing statement to escape the placeholder.
     const raw = self.source[start..end];
     if (std.mem.indexOfAny(u8, raw, "\"'{};\\") != null) return 0;
-    const fragment = try self.allocator.dupeZ(u8, raw);
+    const fragment = try self.allocator.dupeSentinel(u8, raw, 0);
     defer self.allocator.free(fragment);
     const first: TokenIndex = @intCast(tokens.len);
     var lexer = Tokenizer.init(fragment);
@@ -484,7 +485,7 @@ const rules = std.enums.directEnumArrayDefault(Token.Tag, Rule, .{ .prec = .none
 //     .reduce()
 // or do like Roc aka remove variables don't have methods only containers do so we use |> instead
 fn parseExprPrecedence(self: *Parser, min_prec: Precedence, strict: bool, allow_block_label: bool) Error!Node.Index {
-    std.debug.assert(@intFromEnum(min_prec) >= 0);
+    std.debug.assert(@backingInt(min_prec) >= 0);
     if (!strict) {
         // allow for `let x =\n1 +\n 2` but not `let x =\n\n1 + 2`
         _ = self.eatToken(.newline);
@@ -500,14 +501,14 @@ fn parseExprPrecedence(self: *Parser, min_prec: Precedence, strict: bool, allow_
         // allow for `let x = 1\n+ 2` but not `let x = 1\n\n+ 2`
         const ate_newline = !strict and self.eatToken(.newline) != null;
         const tok_tag = self.token_tags[self.tok_i];
-        const rule = rules[@intFromEnum(tok_tag)];
-        if (@intFromEnum(rule.prec) < @intFromEnum(min_prec)) {
+        const rule = rules[@backingInt(tok_tag)];
+        if (@backingInt(rule.prec) < @backingInt(min_prec)) {
             if (ate_newline) {
                 self.tok_i -= 1;
             }
             return node;
         }
-        if (@intFromEnum(rule.prec) == @intFromEnum(banned_prec)) {
+        if (@backingInt(rule.prec) == @backingInt(banned_prec)) {
             return self.fail(if (rule.tag == .range) .chained_range_operators else .chained_comparison_operators);
         }
 
@@ -529,7 +530,7 @@ fn parseExprPrecedence(self: *Parser, min_prec: Precedence, strict: bool, allow_
             => try self.warnMsg(.{ .tag = .ambiguous_unary_operator, .token = op_token }),
             else => {},
         };
-        const rhs = try self.parseExprPrecedence(@enumFromInt(@intFromEnum(rule.prec) + 1), strict, allow_block_label);
+        const rhs = try self.parseExprPrecedence(@fromBackingInt(@intCast(@backingInt(rule.prec) + 1)), strict, allow_block_label);
         if (rhs == null_node) {
             // return self.fail(.expected_expr);
             try self.warn(.expected_expr);
@@ -1669,12 +1670,12 @@ fn unreserveNode(self: *Parser, node_index: usize) void {
 }
 
 fn addExtra(self: *Parser, extra: anytype) Allocator.Error!Node.Index {
-    const fields = std.meta.fields(@TypeOf(extra));
-    try self.extra_data.ensureUnusedCapacity(self.allocator, fields.len);
+    const info = @typeInfo(@TypeOf(extra)).@"struct";
+    try self.extra_data.ensureUnusedCapacity(self.allocator, info.field_names.len);
     const result: Node.Index = @intCast(self.extra_data.items.len);
-    inline for (fields) |field| {
-        comptime std.debug.assert(field.type == Node.Index);
-        self.extra_data.appendAssumeCapacity(@field(extra, field.name));
+    inline for (info.field_names, info.field_types) |name, field_type| {
+        comptime std.debug.assert(field_type == Node.Index);
+        self.extra_data.appendAssumeCapacity(@field(extra, name));
     }
     return result;
 }
@@ -1885,7 +1886,7 @@ test "ascription parses explicit array and function types in ordinary call views
     try std.testing.expect(ast.fullFnProto(function.ast.args[0]) != null);
     try std.testing.expectEqualStrings("@as", ast.tokenSlice(ast.firstToken(function.ast.fn_expr)));
     try std.testing.expectEqualStrings(")", ast.tokenSlice(ast.lastToken(ast.decl(ast.rootDecls()[1]).ast.init_node)));
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
 }
 
 test "interpolation preserves root EOF and original token indices" {
@@ -1924,7 +1925,7 @@ test "interpolation preserves root EOF and original token indices" {
             try std.testing.expectEqual(Token.Tag.eof, ast.tokens.items(.tag)[last - 1]);
             try std.testing.expect(ast.tokens.items(.start)[last - 1] < source.len);
         }
-        try std.testing.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
     }
 }
 
@@ -1948,7 +1949,7 @@ test "interpolation retains original EOF diagnostic indices" {
         try std.testing.expectEqual(source.len, ast.tokens.items(.start)[error_token]);
         try std.testing.expectEqual(source.len, ast.tokens.items(.start)[ast.lastToken(0)]);
         try std.testing.expect(error_token < ast.lastToken(0));
-        try std.testing.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
     }
 }
 
@@ -1971,7 +1972,7 @@ test "interpolation nodes share identities and retain original source offsets" {
         try std.testing.expectEqualStrings(expected, source[starts[first] .. starts[last] + ast.tokenSlice(last).len]);
     }
     for ([_][:0]const u8{ source, "let text = \"{f(1,)}:{f(} {return 1}\"" }) |raw| {
-        try std.testing.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{raw});
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{raw});
     }
 }
 
@@ -1998,7 +1999,7 @@ test "parser ownership survives allocation failures" {
         "let a =\nlet b =\nlet c =\nlet d =\nlet e =\nlet f =\nlet g =\nlet h =",
     };
     for (sources) |source| {
-        try std.testing.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
     }
 }
 
@@ -2017,7 +2018,7 @@ test "range headers preserve dedicated fields spans delimiters and recovery" {
     try std.testing.expectEqual(Node.Tag.range, ast.nodes.items(.tag)[range.source]);
     try std.testing.expectEqual(Node.Tag.number_literal, ast.nodes.items(.tag)[ast.nodes.items(.data)[range.source].rhs]);
     try std.testing.expect(ast.fullRange(range.source) == null);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
     for ([_][:0]const u8{
         "loop i in ..2 {}",       "loop i in 0.. {}",           "loop i in 0..= {}",
         "loop i in 0..2 {} else", "loop i in 0..2 : tick() {}", "loop i, j in 0..2 {}",
@@ -2049,7 +2050,7 @@ test "range else metadata preserves source bounds delimiters and raw operators" 
         try std.testing.expectEqual(Node.Tag.if_else, ast.nodes.items(.tag)[range.else_expr]);
         try std.testing.expectEqualStrings("else", ast.tokenSlice(ast.lastToken(range.body) + 1));
         try std.testing.expectEqual(source.len - 1, ast.tokens.items(.start)[ast.lastToken(node)]);
-        try std.testing.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
     }
 }
 
@@ -2061,7 +2062,7 @@ test "inclusive range headers retain raw tokens and reject malformed ranges" {
     const range = ast.fullRange(ast.decl(ast.rootDecls()[0]).ast.init_node).?;
     try std.testing.expect((ast.tokens.items(.tag)[ast.nodes.items(.main_token)[range.source]] == .period_period_equal));
     try std.testing.expectEqualStrings("..=", ast.tokenSlice(ast.nodes.items(.main_token)[range.source]));
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
     for ([_][:0]const u8{
         "let f: () = loop i in ..=2 {}",
         "let f: () = loop i in 0..=2 {} else",
@@ -2114,7 +2115,7 @@ test "match subjects alternatives helpers delimiters recovery and OOM" {
     const prong = ast.fullMatchCase(match.cases[0]).?.ast;
     try std.testing.expectEqual(@as(usize, 2), prong.values.len);
     try std.testing.expectEqual(Node.Tag.bit_or, ast.nodes.items(.tag)[prong.values[0]]);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
     for ([_][:0]const u8{
         "let f = match n {",                  "let f = match n {0 => 1",             "let f = match n {0 => 1\n",
         "let f = match n, {}",                "let f = match n {0,,1 => 1\n_ => 2}", "let f = match n {0 => |capture capture\n_ => 2}",
@@ -2667,7 +2668,7 @@ test "reusable range expression precedence slice match separation and malformed 
         var ast = try parse(std.testing.allocator, source);
         defer ast.deinit(std.testing.allocator);
         try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
-        try std.testing.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
     }
     for ([_][:0]const u8{
         "let r=0..1..2", "let r=0..=1..2", "let r=..2", "let r=0..", "let r=0..=", "let r=0..2 by 1",

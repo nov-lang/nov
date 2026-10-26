@@ -59,7 +59,7 @@ pub fn extraData(self: Nir, comptime T: type, index: usize) ExtraData(T) {
             Inst.Index,
             Inst.Declaration.Name,
             NullTerminatedString,
-            => @enumFromInt(self.extra[i]),
+            => @fromBackingInt(@intCast(self.extra[i])),
 
             i32,
             // Inst.Call.Flags,
@@ -87,7 +87,7 @@ pub const NullTerminatedString = enum(u32) {
 
 /// Given an index into `string_bytes` returns the null-terminated string found there.
 pub fn nullTerminatedString(self: Nir, index: NullTerminatedString) [:0]const u8 {
-    const slice = self.string_bytes[@intFromEnum(index)..];
+    const slice = self.string_bytes[@backingInt(index)..];
     return slice[0..std.mem.indexOfScalar(u8, slice, 0).? :0];
 }
 
@@ -100,7 +100,7 @@ pub fn bodySlice(self: Nir, start: usize, len: usize) []Inst.Index {
 }
 
 pub fn hasCompileErrors(self: Nir) bool {
-    return self.extra[@intFromEnum(ExtraIndex.compile_errors)] != 0;
+    return self.extra[@backingInt(ExtraIndex.compile_errors)] != 0;
 }
 
 pub fn deinit(self: *Nir, allocator: std.mem.Allocator) void {
@@ -212,14 +212,14 @@ pub const Inst = struct {
         ref_start_index = static_len,
         _,
 
-        pub const static_len = @intFromEnum(Ref.__last_ref);
+        pub const static_len = @backingInt(Ref.__last_ref);
 
         pub fn toRef(i: Index) Ref {
-            return @enumFromInt(@intFromEnum(Index.ref_start_index) + @intFromEnum(i));
+            return @fromBackingInt(@intCast(@backingInt(Index.ref_start_index) + @backingInt(i)));
         }
 
         pub fn toOptional(i: Index) OptionalIndex {
-            return @enumFromInt(@intFromEnum(i));
+            return @fromBackingInt(@intCast(@backingInt(i)));
         }
     };
 
@@ -230,7 +230,7 @@ pub const Inst = struct {
         _,
 
         pub fn unwrap(oi: OptionalIndex) ?Index {
-            return if (oi == .none) null else @enumFromInt(@intFromEnum(oi));
+            return if (oi == .none) null else @fromBackingInt(@intCast(@backingInt(oi)));
         }
     };
 
@@ -294,9 +294,9 @@ pub const Inst = struct {
 
         pub fn toIndex(inst: Ref) ?Index {
             std.debug.assert(inst != .none);
-            const ref_int = @intFromEnum(inst);
-            if (ref_int >= @intFromEnum(Index.ref_start_index)) {
-                return @enumFromInt(ref_int - @intFromEnum(Index.ref_start_index));
+            const ref_int = @backingInt(inst);
+            if (ref_int >= @backingInt(Index.ref_start_index)) {
+                return @fromBackingInt(@intCast(ref_int - @backingInt(Index.ref_start_index)));
             } else {
                 return null;
             }
@@ -354,7 +354,7 @@ pub const Inst = struct {
             len: u32,
 
             pub fn get(self: @This(), code: Nir) []const u8 {
-                return code.string_bytes[@intFromEnum(self.start)..][0..self.len];
+                return code.string_bytes[@backingInt(self.start)..][0..self.len];
             }
         },
         str_tok: struct {
@@ -578,7 +578,7 @@ pub const Inst = struct {
             pub fn isNamedTest(name: Name, nir: Nir) bool {
                 return switch (name) {
                     .@"comptime", .unnamed_test, .decltest => false,
-                    _ => nir.string_bytes[@intFromEnum(name)] == 0,
+                    _ => nir.string_bytes[@backingInt(name)] == 0,
                 };
             }
             pub fn toString(name: Name, nir: Nir) ?NullTerminatedString {
@@ -586,12 +586,12 @@ pub const Inst = struct {
                     .@"comptime", .unnamed_test, .decltest => return null,
                     _ => {},
                 }
-                const idx: u32 = @intFromEnum(name);
+                const idx: u32 = @backingInt(name);
                 if (nir.string_bytes[idx] == 0) {
                     // Named test
-                    return @enumFromInt(idx + 1);
+                    return @fromBackingInt(@intCast(idx + 1));
                 }
-                return @enumFromInt(idx);
+                return @fromBackingInt(@intCast(idx));
             }
         };
 
@@ -781,29 +781,29 @@ pub const Inst = struct {
                 },
                 .instruction => |inst| .{
                     .tag = .instruction,
-                    .data = @intCast(@intFromEnum(inst)),
+                    .data = @intCast(@backingInt(inst)),
                 },
                 .instruction_load => |inst| .{
                     .tag = .instruction_load,
-                    .data = @intCast(@intFromEnum(inst)),
+                    .data = @intCast(@backingInt(inst)),
                 },
                 .decl_val => |str| .{
                     .tag = .decl_val,
-                    .data = @intCast(@intFromEnum(str)),
+                    .data = @intCast(@backingInt(str)),
                 },
                 .decl_ref => |str| .{
                     .tag = .decl_ref,
-                    .data = @intCast(@intFromEnum(str)),
+                    .data = @intCast(@backingInt(str)),
                 },
             };
         }
         pub fn unwrap(cap: Capture) Unwrapped {
             return switch (cap.tag) {
                 .nested => .{ .nested = @intCast(cap.data) },
-                .instruction => .{ .instruction = @enumFromInt(cap.data) },
-                .instruction_load => .{ .instruction_load = @enumFromInt(cap.data) },
-                .decl_val => .{ .decl_val = @enumFromInt(cap.data) },
-                .decl_ref => .{ .decl_ref = @enumFromInt(cap.data) },
+                .instruction => .{ .instruction = @fromBackingInt(@intCast(cap.data)) },
+                .instruction_load => .{ .instruction_load = @fromBackingInt(@intCast(cap.data)) },
+                .decl_val => .{ .decl_val = @fromBackingInt(@intCast(cap.data)) },
+                .decl_ref => .{ .decl_ref = @fromBackingInt(@intCast(cap.data)) },
             };
         }
     };

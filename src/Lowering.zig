@@ -1,4 +1,5 @@
 const std = @import("std");
+const TestAllocations = @import("TestAllocations.zig");
 const CEmitter = @import("CEmitter.zig");
 const Module = @import("Module.zig");
 const Sema = @import("Sema.zig");
@@ -47,8 +48,8 @@ pub fn lowerCompilation(comp: *Compilation) Error!Sema {
             try std.fmt.allocPrint(comp.allocator, "{s}.{s}", .{ module.getDeclaration(owner).?.name, declaration.name }) else null;
         defer if (qualified) |name| comp.allocator.free(name);
         const function = try result.ir.addFunction(qualified orelse declaration.name, entry.type_id.?, declaration.name_span);
-        result.ir.functions.items[@intFromEnum(function)].public = declaration.public;
-        result.ir.functions.items[@intFromEnum(function)].noreturn = entry.noreturn;
+        result.ir.functions.items[@backingInt(function)].public = declaration.public;
+        result.ir.functions.items[@backingInt(function)].noreturn = entry.noreturn;
         entry.function = function;
         functions[i] = function;
     }
@@ -104,15 +105,15 @@ pub fn lower(module: *Module) Error!Sema {
             try std.fmt.allocPrint(result.allocator, "{s}.{s}", .{ module.getDeclaration(owner).?.name, declaration.name }) else null;
         defer if (qualified) |name| result.allocator.free(name);
         const function = try result.ir.addFunction(qualified orelse declaration.name, entry.type_id.?, span);
-        result.ir.functions.items[@intFromEnum(function)].public = declaration.public;
-        result.ir.functions.items[@intFromEnum(function)].noreturn = entry.noreturn;
+        result.ir.functions.items[@backingInt(function)].public = declaration.public;
+        result.ir.functions.items[@backingInt(function)].noreturn = entry.noreturn;
         entry.function = function;
         functions[i] = function;
     }
     // Function identities exist before bodies, so calls may be forward/recursive.
     for (result.entries, 0..) |*entry, i| {
         if (entry.status != .body_checked) continue;
-        entry.status = if (try BodyChecker.lower(module, &result.ir, types, constants, functions, @enumFromInt(i))) .lowered else .failed;
+        entry.status = if (try BodyChecker.lower(module, &result.ir, types, constants, functions, @fromBackingInt(@intCast(i)))) .lowered else .failed;
     }
     if (module.hasErrors()) {
         // Never expose dangling placeholders or a partly lowered program as ready.
@@ -170,7 +171,7 @@ test "demand generic methods preserve void payload construction propagation and 
     try std.testing.expect(!module.hasErrors());
     try std.testing.expectEqual(@as(usize, 7), result.ir.functions.items.len);
     try result.ir.verify();
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
 }
 
 test "demand generic methods do not resolve unused signatures bodies or expanding instances" {
@@ -186,7 +187,7 @@ test "demand generic methods do not resolve unused signatures bodies or expandin
         instances += 1;
     };
     try std.testing.expectEqual(@as(usize, 1), instances);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
 }
 
 test "demand generic methods diagnose requested void parameter signatures including function references" {
@@ -209,7 +210,7 @@ test "demand generic methods diagnose requested void parameter signatures includ
         try std.testing.expect(found);
         try std.testing.expect(!result.lowering_complete);
         try std.testing.expectEqual(@as(usize, 0), result.ir.functions.items.len);
-        try std.testing.checkAllAllocationFailures(std.testing.allocator, testRejectedMatchAllocations, .{source});
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testRejectedMatchAllocations, .{source});
     }
 }
 
@@ -256,7 +257,7 @@ test "generic structs reject unsupported fields inexact defaults constructors an
         try std.testing.expect(found);
         try std.testing.expect(!result.lowering_complete);
         try std.testing.expectEqual(@as(usize, 0), result.ir.functions.items.len);
-        try std.testing.checkAllAllocationFailures(std.testing.allocator, testRejectedMatchAllocations, .{source});
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testRejectedMatchAllocations, .{source});
     }
 }
 
@@ -267,12 +268,12 @@ test "generic structs check defaults only for used concrete types including late
     }) |source| {
         for ([_]bool{ false, true }) |imported| {
             try testLateGenericLayout(std.testing.allocator, source, .literal_type_mismatch, imported);
-            try std.testing.checkAllAllocationFailures(std.testing.allocator, testLateGenericLayout, .{ source, @as(?Module.Diagnostic.Tag, .literal_type_mismatch), imported });
+            try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testLateGenericLayout, .{ source, @as(?Module.Diagnostic.Tag, .literal_type_mismatch), imported });
         }
     }
     const source = "let Unused:(T:type)->type=struct{value:T=unknown,}\nlet G:(T:type)->type=struct{value:T=true,\nlet typed:(x:T)->T={let y:T=x\ny}\n}\nlet run:()={let x=G(bool)[]\nlet y=G(bool).typed(x.value)\n}";
     try testLateGenericLayout(std.testing.allocator, source, null, false);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testLateGenericLayout, .{ source, @as(?Module.Diagnostic.Tag, null), false });
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testLateGenericLayout, .{ source, @as(?Module.Diagnostic.Tag, null), false });
 }
 
 test "generic structs late cycles expanding type arguments and layout depth retain source diagnostics" {
@@ -287,7 +288,7 @@ test "generic structs late cycles expanding type arguments and layout depth reta
     }) |case| {
         for ([_]bool{ false, true }) |imported| {
             try testLateGenericLayout(std.testing.allocator, case.source, case.tag, imported);
-            try std.testing.checkAllAllocationFailures(std.testing.allocator, testLateGenericLayout, .{ case.source, @as(?Module.Diagnostic.Tag, case.tag), imported });
+            try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testLateGenericLayout, .{ case.source, @as(?Module.Diagnostic.Tag, case.tag), imported });
         }
     }
     for ([_]usize{ Ir.max_record_depth - 1, Ir.max_record_depth }) |depth| {
@@ -299,7 +300,7 @@ test "generic structs late cycles expanding type arguments and layout depth reta
         const expected: ?Module.Diagnostic.Tag = if (depth == Ir.max_record_depth) .record_layout_limit else null;
         for ([_]bool{ false, true }) |imported| {
             try testLateGenericLayout(std.testing.allocator, source.written(), expected, imported);
-            if (expected != null) try std.testing.checkAllAllocationFailures(std.testing.allocator, testLateGenericLayout, .{ source.written(), expected, imported });
+            if (expected != null) try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testLateGenericLayout, .{ source.written(), expected, imported });
         }
     }
 }
@@ -337,7 +338,7 @@ test "generic methods reject inexact types leaked bindings and invalid concrete 
         try std.testing.expect(found);
         try std.testing.expect(!result.lowering_complete);
         try std.testing.expectEqual(@as(usize, 0), result.ir.functions.items.len);
-        try std.testing.checkAllAllocationFailures(std.testing.allocator, testRejectedMatchAllocations, .{source});
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testRejectedMatchAllocations, .{source});
     }
 }
 
@@ -378,7 +379,7 @@ test "generic method bodies retain type parameters in annotations ascriptions an
     if (module.hasErrors()) std.debug.print("method scope: {any}\n", .{module.diagnostics.items});
     try std.testing.expect(result.lowering_complete);
     try result.ir.verify();
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
 }
 
 test "generic method tables reset between analyses without changing canonical identity" {
@@ -494,7 +495,7 @@ test "Option propagation accepts structural families exact contexts inference an
     if (module.hasErrors()) std.debug.print("option errors: {any}\n", .{module.diagnostics.items});
     try std.testing.expect(result.lowering_complete);
     try result.ir.verify();
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
 }
 
 test "Option propagation rejects malformed shapes cross families and implicit conversions under OOM" {
@@ -531,7 +532,7 @@ test "Option propagation rejects malformed shapes cross families and implicit co
         if (!found) std.debug.print("option error {s}: {any}\n", .{ case.source, module.diagnostics.items });
         try std.testing.expect(found);
         try std.testing.expect(!result.lowering_complete);
-        try std.testing.checkAllAllocationFailures(std.testing.allocator, testRejectedMatchAllocations, .{source});
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testRejectedMatchAllocations, .{source});
     }
 }
 
@@ -588,7 +589,7 @@ test "generic unions and propagation diagnose exact types unsupported forms and 
         try std.testing.expect(found);
         try std.testing.expect(!result.lowering_complete);
         try std.testing.expectEqual(@as(usize, 0), result.ir.functions.items.len);
-        try std.testing.checkAllAllocationFailures(std.testing.allocator, testRejectedMatchAllocations, .{source});
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testRejectedMatchAllocations, .{source});
     }
 }
 
@@ -630,7 +631,7 @@ test "unsupported union declarations and rejected matches roll back under OOM" {
         try std.testing.expect(found);
         try std.testing.expect(!result.lowering_complete);
         try std.testing.expectEqual(@as(usize, 0), result.ir.functions.items.len);
-        try std.testing.checkAllAllocationFailures(std.testing.allocator, testRejectedMatchAllocations, .{case.source});
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testRejectedMatchAllocations, .{case.source});
     }
 }
 
@@ -680,7 +681,7 @@ test "nominal records reject mismatches malformed constructors defaults fields a
         if (!found) std.debug.print("missing {t}: {s}\n", .{ case.tag, case.source });
         try std.testing.expect(found);
         try std.testing.expectEqual(@as(usize, 0), result.ir.functions.items.len);
-        try std.testing.checkAllAllocationFailures(std.testing.allocator, testRejectedMatchAllocations, .{case.source});
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testRejectedMatchAllocations, .{case.source});
     }
 }
 
@@ -712,7 +713,7 @@ test "field mutation rejects nonlocals immutable bindings unsupported operators 
         defer result.deinit();
         try std.testing.expect(module.hasErrors());
         try std.testing.expectEqual(case.tag, module.diagnostics.items[module.diagnostics.items.len - 1].tag);
-        try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
     }
 }
 
@@ -741,15 +742,15 @@ test "field stores verify slot identity field bounds exact types prior operands 
     for (0..11) |case| {
         last.* = saved;
         switch (case) {
-            0 => last.op.field_store.slot = @enumFromInt(0),
-            1 => last.op.field_store.slot = @enumFromInt(instructions.len),
+            0 => last.op.field_store.slot = @fromBackingInt(@intCast(0)),
+            1 => last.op.field_store.slot = @fromBackingInt(@intCast(instructions.len)),
             2 => last.op.field_store.index = 99,
             3 => last.op.field_store.value = saved.op.field_store.slot,
-            4 => last.op.field_store.value = @enumFromInt(instructions.len - 1),
-            5 => last.ty = instructions[@intFromEnum(saved.op.field_store.value)].ty,
+            4 => last.op.field_store.value = @fromBackingInt(@intCast(instructions.len - 1)),
+            5 => last.ty = instructions[@backingInt(saved.op.field_store.value)].ty,
             6 => last.op.field_store.index = 1,
             7 => last.span.end = std.math.maxInt(u32),
-            10 => last.ty = @enumFromInt(std.math.maxInt(u32)),
+            10 => last.ty = @fromBackingInt(@intCast(std.math.maxInt(u32))),
             8, 9 => {
                 for (instructions[0 .. instructions.len - 1]) |instruction| {
                     if (instruction.op == .field_store) {
@@ -767,7 +768,7 @@ test "field stores verify slot identity field bounds exact types prior operands 
         const ty = result.ir.getType(instruction.ty).?;
         if (ty == .record and !ty.record.tagged) continue;
         last.* = saved;
-        last.op.field_store.slot = @enumFromInt(i);
+        last.op.field_store.slot = @fromBackingInt(@intCast(i));
         try std.testing.expectError(error.InvalidOperation, result.ir.verify());
     }
     last.* = saved;
@@ -804,7 +805,7 @@ test "record verifier rejects corrupt field counts indices types defaults spans 
     fields[0].ty = b;
     try std.testing.expectError(error.ConstantTypeMismatch, result.ir.verify());
     fields[0] = saved;
-    fields[0].default = @enumFromInt(999);
+    fields[0].default = @fromBackingInt(@intCast(999));
     try std.testing.expectError(error.ConstantTypeMismatch, result.ir.verify());
     fields[0] = saved;
     fields[0].span.end = std.math.maxInt(u32);
@@ -836,7 +837,7 @@ test "rejected matches and pipes roll back diagnostics on allocation failure" {
         "let f: (n: int) -> int = match n {0 => 1}",
         "let f: (n: int) -> int = match n {0 => {let private: int = 1\nprivate}\n_ => true}",
         "let f: (n: int) -> int = n\nlet main: () = true |> f |> @println",
-    }) |source| try std.testing.checkAllAllocationFailures(std.testing.allocator, testRejectedMatchAllocations, .{source});
+    }) |source| try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testRejectedMatchAllocations, .{source});
 }
 
 test "rejected boolean matches roll back diagnostics on allocation failure" {
@@ -846,7 +847,7 @@ test "rejected boolean matches roll back diagnostics on allocation failure" {
         "let f: (b: bool) -> int = match b {false => 1}",
         "let f: (b: bool) -> int = match b {true => 1\ntrue | true => 2\nfalse => 3}",
         "let f: (b: bool) -> int = match b {true => 1\nfalse | 1 => 2}",
-    }) |source| try std.testing.checkAllAllocationFailures(std.testing.allocator, testRejectedMatchAllocations, .{source});
+    }) |source| try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testRejectedMatchAllocations, .{source});
 }
 
 test "rejected bitwise binaries roll back diagnostics on allocation failure" {
@@ -854,7 +855,7 @@ test "rejected bitwise binaries roll back diagnostics on allocation failure" {
         "let f: () -> int = 1 & missing",
         "let f: (n: i8) -> i8 = n | 128",
         "let f: () -> bool = true ^ false",
-    }) |source| try std.testing.checkAllAllocationFailures(std.testing.allocator, testRejectedMatchAllocations, .{source});
+    }) |source| try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testRejectedMatchAllocations, .{source});
 }
 
 test "bitwise binary operands and spans remain owned after source release" {
@@ -877,10 +878,10 @@ test "bitwise binary operands and spans remain owned after source release" {
         const binary = instruction.op.binary;
         try std.testing.expectEqual(([_]Ir.BinaryOp{ .bit_and, .bit_xor, .bit_or })[count], binary.op);
         try std.testing.expectEqualStrings(([_][]const u8{ "a & b", "a & b ^ a", "a & b ^ a | b" })[count], source[instruction.span.start..instruction.span.end]);
-        try std.testing.expect(@intFromEnum(binary.lhs) < i);
-        try std.testing.expect(@intFromEnum(binary.rhs) < i);
-        try std.testing.expectEqual(instruction.ty, body.instructions[@intFromEnum(binary.lhs)].ty);
-        try std.testing.expectEqual(instruction.ty, body.instructions[@intFromEnum(binary.rhs)].ty);
+        try std.testing.expect(@backingInt(binary.lhs) < i);
+        try std.testing.expect(@backingInt(binary.rhs) < i);
+        try std.testing.expectEqual(instruction.ty, body.instructions[@backingInt(binary.lhs)].ty);
+        try std.testing.expectEqual(instruction.ty, body.instructions[@backingInt(binary.rhs)].ty);
         count += 1;
     }
     try std.testing.expectEqual(@as(usize, 3), count);
@@ -902,7 +903,7 @@ test "interpolation chunks and ordered conversions own storage after source rele
     var chunks: usize = 0;
     for (sema.ir.functions.items[0].body.?.instructions, 0..) |instruction, i| {
         if (instruction.op == .to_string) {
-            try std.testing.expect(@intFromEnum(instruction.op.to_string) < i);
+            try std.testing.expect(@backingInt(instruction.op.to_string) < i);
             conversions += 1;
         }
         if (instruction.op == .constant) {
@@ -947,7 +948,7 @@ test "interpolation conversions cannot reference sibling private match values" {
             instruction.op.to_string = sibling;
             try std.testing.expectError(error.InvalidValueId, sema.ir.verify());
             instruction.op.to_string = saved;
-        } else first = @enumFromInt(i);
+        } else first = @fromBackingInt(@intCast(i));
     }
     try std.testing.expect(first != null);
     try sema.ir.verify();
@@ -984,7 +985,7 @@ test "match reuses branch verification for sibling privacy and terminal metadata
     try std.testing.expect(!module.hasErrors());
     try std.testing.expect(sema.lowering_complete);
     const body = sema.ir.functions.items[0].body.?;
-    const merge = &@constCast(body.instructions)[@intFromEnum(body.result)];
+    const merge = &@constCast(body.instructions)[@backingInt(body.result)];
     try std.testing.expect(merge.op == .branch);
     const saved = merge.op.branch;
     merge.op.branch.then_value = saved.else_value.?;
@@ -997,7 +998,7 @@ test "match reuses branch verification for sibling privacy and terminal metadata
     try std.testing.expectError(error.InvalidRegion, sema.ir.verify());
     merge.op.branch = saved;
     const terminal_body = sema.ir.functions.items[1].body.?;
-    const terminal = &@constCast(terminal_body.instructions)[@intFromEnum(terminal_body.result)];
+    const terminal = &@constCast(terminal_body.instructions)[@backingInt(terminal_body.result)];
     try std.testing.expect(terminal.op.branch.returns);
     terminal.op.branch.returns = false;
     try std.testing.expectError(error.InvalidReturn, sema.ir.verify());
@@ -1024,7 +1025,7 @@ test "exhaustive boolean match keeps private branches and terminal metadata" {
     try std.testing.expect(!module.hasErrors());
     try std.testing.expect(sema.lowering_complete);
     const body = sema.ir.functions.items[0].body.?;
-    const merge = &@constCast(body.instructions)[@intFromEnum(body.result)];
+    const merge = &@constCast(body.instructions)[@backingInt(body.result)];
     try std.testing.expect(merge.op == .branch);
     const saved = merge.op.branch;
     merge.op.branch.else_value = saved.then_value;
@@ -1034,7 +1035,7 @@ test "exhaustive boolean match keeps private branches and terminal metadata" {
     try std.testing.expectError(error.InvalidValueId, sema.ir.verify());
     merge.op.branch = saved;
     const terminal_body = sema.ir.functions.items[1].body.?;
-    const terminal = &@constCast(terminal_body.instructions)[@intFromEnum(terminal_body.result)];
+    const terminal = &@constCast(terminal_body.instructions)[@backingInt(terminal_body.result)];
     try std.testing.expect(terminal.op.branch.returns);
     terminal.op.branch.returns = false;
     try std.testing.expectError(error.InvalidReturn, sema.ir.verify());
@@ -1082,12 +1083,12 @@ test "exhaustion controls belong to parent loops and IR outlives the source" {
         // The completed inner loop is terminal in its parent's body, not the
         // owner of the control in its exhaustion region.
         const inner_id = body.instructions[outer].op.loop.body;
-        const inner = body.instructions[@intFromEnum(inner_id)];
+        const inner = body.instructions[@backingInt(inner_id)];
         try std.testing.expect(inner.op.loop.returns);
         try std.testing.expect(Ir.terminates(body, inner_id));
     }
     const body = sema.ir.functions.items[2].body.?;
-    const index = @intFromEnum(body.result);
+    const index = @backingInt(body.result);
     try std.testing.expect(body.instructions[index].op.loop.returns);
     @constCast(body.instructions)[index].op.loop.returns = false;
     try std.testing.expectError(error.InvalidReturn, sema.ir.verify());
@@ -1133,13 +1134,13 @@ fn testRangeOwnership(inclusive: bool) !void {
     }
     const loop = instructions[owner].op.loop;
     const counter = instructions[loop.body_start].op.local_load;
-    try std.testing.expect(@intFromEnum(counter) < loop.condition_start);
-    try std.testing.expect(instructions[@intFromEnum(counter)].op == .local_slot);
+    try std.testing.expect(@backingInt(counter) < loop.condition_start);
+    try std.testing.expect(instructions[@backingInt(counter)].op == .local_slot);
     const condition = loop.condition_start + 3;
     const endpoint = instructions[condition].op.binary.rhs;
-    try std.testing.expect(@intFromEnum(endpoint) < @intFromEnum(counter));
+    try std.testing.expect(@backingInt(endpoint) < @backingInt(counter));
     try std.testing.expect(instructions[loop.body_start].op == .local_load);
-    const private_current: Ir.ValueId = @enumFromInt(loop.body_start);
+    const private_current: Ir.ValueId = @fromBackingInt(@intCast(loop.body_start));
     // A body-private snapshot must not leak into a sibling continuation,
     // and a body-local slot cannot replace the enclosing counter identity.
     const continuation = loop.continuation_start.?;
@@ -1156,10 +1157,10 @@ fn testRangeOwnership(inclusive: bool) !void {
     instructions[continuation].op = .{ .unary = .{ .op = .negate, .operand = private_current } };
     try std.testing.expectError(error.InvalidValueId, sema.ir.verify());
     instructions[continuation] = saved;
-    instructions[continuation].op.local_load = @enumFromInt(loop.body_start + 1);
+    instructions[continuation].op.local_load = @fromBackingInt(@intCast(loop.body_start + 1));
     try std.testing.expectError(error.InvalidValueId, sema.ir.verify());
     instructions[continuation] = saved;
-    instructions[condition].op.binary.rhs = @enumFromInt(owner);
+    instructions[condition].op.binary.rhs = @fromBackingInt(@intCast(owner));
     try std.testing.expectError(error.InvalidValueId, sema.ir.verify());
     instructions[condition].op.binary.rhs = endpoint;
     try sema.ir.verify();
@@ -1192,7 +1193,7 @@ test "range else regions keep index continuation and fallback values private" {
             owner = i;
         };
         const saved = instructions[owner].op.loop;
-        instructions[owner].op.loop.else_value = @enumFromInt(saved.body_start);
+        instructions[owner].op.loop.else_value = @fromBackingInt(@intCast(saved.body_start));
         try std.testing.expectError(error.InvalidValueId, sema.ir.verify());
         instructions[owner].op.loop = saved;
         instructions[owner].op.loop.else_start = saved.body_start;
@@ -1237,8 +1238,8 @@ test "loop continuation regions and value breaks outlive source storage" {
     };
     try std.testing.expect(loop_owner != null);
     try std.testing.expect(break_value != null);
-    try std.testing.expectEqual(loop_owner.?, Ir.enclosingLoop(body, @intFromEnum(break_value.?) + 1).?);
-    try std.testing.expect(body.instructions[@intFromEnum(break_value.?)].op == .array_clone);
+    try std.testing.expectEqual(loop_owner.?, Ir.enclosingLoop(body, @backingInt(break_value.?) + 1).?);
+    try std.testing.expect(body.instructions[@backingInt(break_value.?)].op == .array_clone);
     module.deinit();
     try std.testing.expect(!failed);
     try std.testing.expect(sema.lowering_complete);
@@ -1270,16 +1271,16 @@ test "string compound reuses binary add with old load before RHS replacement" {
             try std.testing.expectEqual(@as(usize, 1), stores);
             try std.testing.expectEqual(Ir.BinaryOp.add, binary.op);
             try std.testing.expect(sema.ir.getType(instruction.ty).? == .string);
-            try std.testing.expect(body.instructions[@intFromEnum(binary.lhs)].op == .local_load);
-            try std.testing.expect(body.instructions[@intFromEnum(binary.rhs)].op == .call);
-            try std.testing.expect(@intFromEnum(binary.lhs) < @intFromEnum(binary.rhs));
+            try std.testing.expect(body.instructions[@backingInt(binary.lhs)].op == .local_load);
+            try std.testing.expect(body.instructions[@backingInt(binary.rhs)].op == .call);
+            try std.testing.expect(@backingInt(binary.lhs) < @backingInt(binary.rhs));
             var replacement: ?usize = null;
             for (body.instructions[0..i], 0..) |prior, j| {
                 if (prior.op == .local_store) replacement = j;
             }
-            try std.testing.expect(@intFromEnum(binary.lhs) < replacement.?);
-            try std.testing.expect(replacement.? < @intFromEnum(binary.rhs));
-            try std.testing.expectEqual(@as(Ir.ValueId, @enumFromInt(i)), body.instructions[i + 1].op.local_store.value);
+            try std.testing.expect(@backingInt(binary.lhs) < replacement.?);
+            try std.testing.expect(replacement.? < @backingInt(binary.rhs));
+            try std.testing.expectEqual(@as(Ir.ValueId, @fromBackingInt(@intCast(i))), body.instructions[i + 1].op.local_store.value);
         },
         else => {},
     };
@@ -1312,23 +1313,23 @@ test "indexed compounds reuse one snapshot and index with old read before RHS" {
         .array_index => |r| {
             try std.testing.expect(read == null);
             try std.testing.expectEqual(@as(usize, 1), calls);
-            try std.testing.expect(body.instructions[@intFromEnum(r.array)].op == .array_clone);
-            try std.testing.expect(body.instructions[@intFromEnum(r.index)].op == .call);
-            try std.testing.expect(@intFromEnum(r.array) < @intFromEnum(r.index));
-            read = @enumFromInt(i);
+            try std.testing.expect(body.instructions[@backingInt(r.array)].op == .array_clone);
+            try std.testing.expect(body.instructions[@backingInt(r.index)].op == .call);
+            try std.testing.expect(@backingInt(r.array) < @backingInt(r.index));
+            read = @fromBackingInt(@intCast(i));
         },
         .array_set => |r| {
             sets += 1;
-            const old = body.instructions[@intFromEnum(read.?)].op.array_index;
+            const old = body.instructions[@backingInt(read.?)].op.array_index;
             try std.testing.expectEqual(old.array, r.array);
             try std.testing.expectEqual(old.index, r.index);
-            const binary = body.instructions[@intFromEnum(r.value)].op.binary;
+            const binary = body.instructions[@backingInt(r.value)].op.binary;
             try std.testing.expectEqual(Ir.BinaryOp.add, binary.op);
             try std.testing.expectEqual(read.?, binary.lhs);
-            try std.testing.expect(@intFromEnum(read.?) < @intFromEnum(binary.rhs));
+            try std.testing.expect(@backingInt(read.?) < @backingInt(binary.rhs));
             try std.testing.expectEqual(@as(usize, 2), calls);
             try std.testing.expect(body.instructions[i + 1].op == .local_store);
-            try std.testing.expectEqual(@as(Ir.ValueId, @enumFromInt(i)), body.instructions[i + 1].op.local_store.value);
+            try std.testing.expectEqual(@as(Ir.ValueId, @fromBackingInt(@intCast(i))), body.instructions[i + 1].op.local_store.value);
         },
         else => {},
     };
@@ -1361,11 +1362,11 @@ test "locals alias evaluated values and nested results survive scope exit" {
     try std.testing.expectEqual(@as(usize, 6), body.instructions.len);
     try std.testing.expect(body.instructions[2].op == .call);
     const twice = body.instructions[3].op.binary;
-    try std.testing.expectEqual(@as(u32, 2), @intFromEnum(twice.lhs));
+    try std.testing.expectEqual(@as(u32, 2), @backingInt(twice.lhs));
     try std.testing.expectEqual(twice.lhs, twice.rhs);
     const sum = body.instructions[5].op.binary;
-    try std.testing.expectEqual(@as(u32, 3), @intFromEnum(sum.lhs));
-    try std.testing.expectEqual(@as(u32, 2), @intFromEnum(sum.rhs));
+    try std.testing.expectEqual(@as(u32, 3), @backingInt(sum.lhs));
+    try std.testing.expectEqual(@as(u32, 2), @backingInt(sum.rhs));
     const empty = sema.ir.functions.items[2].body.?;
     try std.testing.expect(empty.instructions[2].op == .call);
     try std.testing.expect(sema.ir.getConstant(empty.instructions[3].op.constant).?.value == .void);
@@ -1385,7 +1386,7 @@ test "ascription aliases child IR values without casts or extra array boundaries
     const scalar = sema.ir.functions.items[0].body.?;
     try std.testing.expectEqual(@as(usize, 1), scalar.instructions.len);
     try std.testing.expect(scalar.instructions[0].op == .parameter);
-    try std.testing.expectEqual(@as(u32, 0), @intFromEnum(scalar.result));
+    try std.testing.expectEqual(@as(u32, 0), @backingInt(scalar.result));
     var copies: usize = 0;
     for (sema.ir.functions.items[1].body.?.instructions) |instruction| {
         if (instruction.op == .array_clone) copies += 1;
@@ -1413,10 +1414,10 @@ test "printing lowers owned ordered arguments and operation spans" {
     try std.testing.expectEqualStrings("@println(id(1), id(2), true)", module.source.ast.source[instruction.span.start..instruction.span.end]);
     const args = instruction.op.print.args;
     try std.testing.expectEqual(@as(usize, 3), args.len);
-    try std.testing.expect(@intFromEnum(args[0]) < @intFromEnum(args[1]));
-    try std.testing.expect(@intFromEnum(args[1]) < @intFromEnum(args[2]));
-    try std.testing.expect(body.instructions[@intFromEnum(args[0])].op == .call);
-    try std.testing.expect(body.instructions[@intFromEnum(args[1])].op == .call);
+    try std.testing.expect(@backingInt(args[0]) < @backingInt(args[1]));
+    try std.testing.expect(@backingInt(args[1]) < @backingInt(args[2]));
+    try std.testing.expect(body.instructions[@backingInt(args[0])].op == .call);
+    try std.testing.expect(body.instructions[@backingInt(args[1])].op == .call);
     try sema.ir.verify();
 }
 
@@ -1435,9 +1436,9 @@ test "checked parameter arithmetic lowers into typed ordered values" {
     try std.testing.expectEqual(@as(u32, 0), body.instructions[0].op.parameter);
     try std.testing.expectEqual(@as(u32, 1), body.instructions[1].op.parameter);
     try std.testing.expectEqual(Ir.BinaryOp.add, body.instructions[2].op.binary.op);
-    try std.testing.expectEqual(@as(u32, 0), @intFromEnum(body.instructions[2].op.binary.lhs));
-    try std.testing.expectEqual(@as(u32, 1), @intFromEnum(body.instructions[2].op.binary.rhs));
-    try std.testing.expectEqual(@as(u32, 2), @intFromEnum(body.result));
+    try std.testing.expectEqual(@as(u32, 0), @backingInt(body.instructions[2].op.binary.lhs));
+    try std.testing.expectEqual(@as(u32, 1), @backingInt(body.instructions[2].op.binary.rhs));
+    try std.testing.expectEqual(@as(u32, 2), @backingInt(body.result));
     const span = body.instructions[2].span;
     try std.testing.expectEqualStrings("a + b", module.source.ast.source[span.start..span.end]);
     try sema.ir.verify();
@@ -1455,15 +1456,15 @@ test "callee then left-to-right arguments are explicit in instruction order" {
     var count: usize = 0;
     for (body.instructions, 0..) |instruction, i| {
         if (instruction.op != .call) continue;
-        calls[count] = @enumFromInt(i);
-        const callee = body.instructions[@intFromEnum(instruction.op.call.callee)].op.function_ref;
+        calls[count] = @fromBackingInt(@intCast(i));
+        const callee = body.instructions[@backingInt(instruction.op.call.callee)].op.function_ref;
         try std.testing.expectEqualStrings(if (count < 2) "f" else "combine", sema.ir.getFunction(callee).?.name);
         count += 1;
     }
     try std.testing.expectEqual(@as(usize, 3), count);
-    const outer = body.instructions[@intFromEnum(calls[2])].op.call;
+    const outer = body.instructions[@backingInt(calls[2])].op.call;
     try std.testing.expectEqualSlices(Ir.ValueId, calls[0..2], outer.args);
-    try std.testing.expect(@intFromEnum(outer.callee) < @intFromEnum(calls[0]));
+    try std.testing.expect(@backingInt(outer.callee) < @backingInt(calls[0]));
     try sema.ir.verify();
 }
 
@@ -1507,7 +1508,7 @@ test "loop regions own repeated conditions bodies and spans after source destruc
     defer sema.deinit();
     const failed = module.hasErrors();
     const body = sema.ir.functions.items[0].body.?;
-    const loop = body.instructions[@intFromEnum(body.result)];
+    const loop = body.instructions[@backingInt(body.result)];
     const region = loop.op.loop;
     try std.testing.expectEqualStrings("loop n < 2 {n += 1\n        if n == 1 {continue} else {break}}", module.source.ast.source[loop.span.start..loop.span.end]);
     module.deinit();
@@ -1528,12 +1529,12 @@ test "unconditional loops reuse verified regions with source bounded true consta
     defer sema.deinit();
     const failed = module.hasErrors();
     const body = sema.ir.functions.items[0].body.?;
-    const loop = body.instructions[@intFromEnum(body.result)];
+    const loop = body.instructions[@backingInt(body.result)];
     const region = loop.op.loop;
-    const condition = body.instructions[@intFromEnum(region.condition)];
+    const condition = body.instructions[@backingInt(region.condition)];
     try std.testing.expectEqualStrings("loop {break}", module.source.ast.source[loop.span.start..loop.span.end]);
     try std.testing.expectEqual(loop.span, condition.span);
-    try std.testing.expectEqual(true, sema.ir.constants.items[@intFromEnum(condition.op.constant)].value.boolean);
+    try std.testing.expectEqual(true, sema.ir.constants.items[@backingInt(condition.op.constant)].value.boolean);
     module.deinit();
     try std.testing.expect(!failed);
     try std.testing.expect(sema.lowering_complete);
@@ -1561,7 +1562,7 @@ test "return spans and owned terminal regions survive source destruction" {
     try std.testing.expect(sema.lowering_complete);
     const body = sema.ir.functions.items[0].body.?;
     try std.testing.expect(Ir.terminates(body, body.result));
-    try std.testing.expect(body.instructions[@intFromEnum(body.result)].op.branch.returns);
+    try std.testing.expect(body.instructions[@backingInt(body.result)].op.branch.returns);
     try std.testing.expect(sema.ir.functions.items[1].body.?.instructions[0].op.return_value == null);
     try sema.ir.verify();
 }
@@ -1586,8 +1587,8 @@ test "if lowering owns branch ranges results and spans after source destruction"
     try std.testing.expect(sema.lowering_complete);
     try std.testing.expectEqual(@as(u32, 1), r.then_start);
     try std.testing.expectEqual(@as(u32, 2), r.else_start);
-    try std.testing.expectEqual(@as(u32, 1), @intFromEnum(r.then_value));
-    try std.testing.expect(body.instructions[@intFromEnum(r.else_value.?)].op == .branch);
+    try std.testing.expectEqual(@as(u32, 1), @backingInt(r.then_value));
+    try std.testing.expect(body.instructions[@backingInt(r.else_value.?)].op == .branch);
     const main_body = sema.ir.functions.items[1].body.?;
     const no_else = main_body.instructions[main_body.instructions.len - 1].op.branch;
     try std.testing.expect(no_else.else_value == null);
@@ -1610,8 +1611,8 @@ test "short-circuit expressions lower explicit conditional RHS regions" {
         const region = merge.op.short_circuit;
         try std.testing.expectEqualStrings(operator, @tagName(region.kind));
         try std.testing.expectEqual(@as(u32, 1), region.rhs_start);
-        try std.testing.expectEqual(@as(u32, 0), @intFromEnum(region.lhs));
-        try std.testing.expect(body.instructions[@intFromEnum(region.rhs)].op == .call);
+        try std.testing.expectEqual(@as(u32, 0), @backingInt(region.lhs));
+        try std.testing.expect(body.instructions[@backingInt(region.rhs)].op == .call);
         try std.testing.expectEqualStrings(source[std.mem.indexOf(u8, source, "false").?..], module.source.ast.source[merge.span.start..merge.span.end]);
         try sema.ir.verify();
     }
@@ -1635,7 +1636,7 @@ test "inferred global constants and inline uses outlive source storage" {
     }
     try std.testing.expectEqualStrings("hé\x00", sema.ir.getConstant(sema.entries[0].constant.?).?.value.string);
     try sema.ir.verify();
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
 }
 
 test "inferred global boundary rejects computation blocks chains and runtime effects" {
@@ -1673,7 +1674,7 @@ test "inferred global boundary rejects computation blocks chains and runtime eff
         try std.testing.expectEqual(@as(usize, 0), sema.ir.functions.items.len);
         for (sema.entries) |entry| try std.testing.expect(entry.function == null);
         try sema.ir.verify();
-        try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
     }
     for ([_][]const u8{ "let n = 1", "let n = -1" }) |source| {
         var module = try Module.init(std.testing.allocator, "untyped-global.nov", source);
@@ -1736,7 +1737,7 @@ test "grouped values alias child values with operation-origin spans" {
     try std.testing.expectEqual(Ir.BinaryOp.add, main.instructions[4].op.binary.op);
     const add_span = main.instructions[4].span;
     try std.testing.expectEqualStrings("1 + 2", module.source.ast.source[add_span.start..add_span.end]);
-    try std.testing.expectEqual(@as(u32, 4), @intFromEnum(main.instructions[5].op.call.args[0]));
+    try std.testing.expectEqual(@as(u32, 4), @backingInt(main.instructions[5].op.call.args[0]));
     const empty = sema.ir.getFunction(sema.getEntry(module.lookup("empty").?).?.function.?).?.body.?;
     try std.testing.expectEqual(@as(usize, 1), empty.instructions.len);
     try std.testing.expect(sema.ir.getConstant(empty.instructions[0].op.constant).?.value == .void);
@@ -1814,7 +1815,7 @@ test "lowering ownership and source diagnostic rollback survive allocation failu
         "let f: () -> bool = 1 in [1, 2]",
         "let f: (n: i16, a: []i8) -> bool = n in a",
     }) |source| {
-        try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
     }
 }
 
@@ -1882,7 +1883,7 @@ test "compilation imports lower reexported generic methods in defining scope and
 }
 
 test "compilation imports lower across every allocation failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, struct {
         fn run(allocator: std.mem.Allocator) !void {
             var sema = try testImportProgram(allocator);
             defer sema.deinit();
@@ -2104,7 +2105,7 @@ test "compilation deferred globals preserve standalone diagnostics root and impo
     };
     for (cases) |case| for ([_]bool{ false, true }) |imported| {
         try testCompilationGlobalDiagnostic(std.testing.allocator, case.source, case.tag, imported);
-        try std.testing.checkAllAllocationFailures(std.testing.allocator, testCompilationGlobalDiagnostic, .{ case.source, case.tag, imported });
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testCompilationGlobalDiagnostic, .{ case.source, case.tag, imported });
     };
 }
 
@@ -2158,7 +2159,7 @@ fn testQualifiedEnumGlobal(allocator: std.mem.Allocator, source: []const u8, exp
         try result.ir.verify();
         for (module.declarations.items, 0..) |decl, i| {
             if (!std.mem.eql(u8, decl.name, "x")) continue;
-            const entry = result.getCompilationEntry(comp.declaration_ids.get(.{ .source = root, .local = @enumFromInt(i) }).?).?;
+            const entry = result.getCompilationEntry(comp.declaration_ids.get(.{ .source = root, .local = @fromBackingInt(@intCast(i)) }).?).?;
             try std.testing.expectEqual(Sema.Status.constant_checked, entry.status);
             const nominal = result.ir.getType(entry.type_id.?).?.enumeration;
             try std.testing.expectEqual(enums, nominal.source);
@@ -2219,7 +2220,7 @@ test "namespace qualified enum globals support annotations inference aliases ree
     };
     for (cases) |case| {
         try testQualifiedEnumGlobal(std.testing.allocator, case.source, case.expected);
-        try std.testing.checkAllAllocationFailures(std.testing.allocator, testQualifiedEnumGlobal, .{ case.source, case.expected });
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testQualifiedEnumGlobal, .{ case.source, case.expected });
     }
 }
 
@@ -2252,7 +2253,7 @@ test "nested records diagnose cycles defaults nominal replacements and invalid p
             if (diagnostic.tag == case.tag) found = true;
         }
         try std.testing.expect(found);
-        try std.testing.checkAllAllocationFailures(std.testing.allocator, testRejectedMatchAllocations, .{case.source});
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testRejectedMatchAllocations, .{case.source});
     }
 }
 
@@ -2312,7 +2313,7 @@ test "nested records source nesting limit is bounded before IR or defaults becom
     try std.testing.expect(!result.lowering_complete);
     try std.testing.expectEqual(Module.Diagnostic.Tag.record_layout_limit, module.diagnostics.items[0].tag);
     try std.testing.expectEqualStrings("next", module.sourceSlice(module.diagnostics.items[0].span).?);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testRejectedMatchAllocations, .{source.written()});
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testRejectedMatchAllocations, .{source.written()});
 }
 
 test "nested records imported integer leaf widths preserve exact qualified backend spans" {
@@ -2395,7 +2396,7 @@ test "nested records late body generic layouts diagnose depth before lowering pu
         const expected: ?Module.Diagnostic.Tag = if (depth == Ir.max_record_depth) .record_layout_limit else null;
         for ([_]bool{ false, true }) |imported| {
             try testLateGenericLayout(std.testing.allocator, source.written(), expected, imported);
-            if (expected != null) try std.testing.checkAllAllocationFailures(std.testing.allocator, testLateGenericLayout, .{ source.written(), expected, imported });
+            if (expected != null) try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testLateGenericLayout, .{ source.written(), expected, imported });
         }
     }
 }
@@ -2407,7 +2408,7 @@ test "nested records late body recursive generic instances retain source diagnos
     }) |source| {
         for ([_]bool{ false, true }) |imported| {
             try testLateGenericLayout(std.testing.allocator, source, .generic_cycle, imported);
-            try std.testing.checkAllAllocationFailures(std.testing.allocator, testLateGenericLayout, .{ source, @as(?Module.Diagnostic.Tag, .generic_cycle), imported });
+            try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testLateGenericLayout, .{ source, @as(?Module.Diagnostic.Tag, .generic_cycle), imported });
         }
     }
 }
@@ -2436,8 +2437,8 @@ test "static integer borrowing forged IR owner kinds exact types paths and sourc
         .borrow_read => read = i,
         .borrow_store => store = i,
         .local_slot => switch (result.ir.getType(instruction.ty).?) {
-            .array => array = @enumFromInt(i),
-            .boolean => boolean = @enumFromInt(i),
+            .array => array = @fromBackingInt(@intCast(i)),
+            .boolean => boolean = @fromBackingInt(@intCast(i)),
             else => {},
         },
         else => {},
@@ -2464,7 +2465,7 @@ test "static integer borrowing forged IR owner kinds exact types paths and sourc
     instructions[store].op.borrow_store.path = &path;
     try std.testing.expectError(error.InvalidOperation, result.ir.verify());
     instructions[store] = saved_store;
-    instructions[store].op.borrow_store.value = instructions[@intFromEnum(boolean)].op.local_slot;
+    instructions[store].op.borrow_store.value = instructions[@backingInt(boolean)].op.local_slot;
     try std.testing.expectError(error.OperandTypeMismatch, result.ir.verify());
     instructions[store] = saved_store;
     instructions[read].op = .{ .local_load = saved_reserve.op.borrow_reserve };
@@ -2504,7 +2505,7 @@ test "static borrowing verified capability types owner paths index and regions s
     @constCast(saved.op.borrow_store.path)[0] = 99;
     try std.testing.expectError(error.InvalidOperation, result.ir.verify());
     @constCast(saved.op.borrow_store.path)[0] = 0;
-    instructions[store].op.borrow_store.borrow = @enumFromInt(reserve);
+    instructions[store].op.borrow_store.borrow = @fromBackingInt(@intCast(reserve));
     try std.testing.expectError(error.InvalidOperation, result.ir.verify());
     instructions[store] = saved;
     const old_read = instructions[read];
@@ -2515,17 +2516,17 @@ test "static borrowing verified capability types owner paths index and regions s
     instructions[start].op.borrow_start.index = null;
     try std.testing.expectError(error.OperandTypeMismatch, result.ir.verify());
     instructions[start] = old_start;
-    instructions[start].op.borrow_start.index = @enumFromInt(reserve);
+    instructions[start].op.borrow_start.index = @fromBackingInt(@intCast(reserve));
     try std.testing.expectError(error.OperandTypeMismatch, result.ir.verify());
     instructions[start] = old_start;
     const old_reserve = instructions[reserve];
-    instructions[reserve].op.borrow_reserve = @enumFromInt(0);
+    instructions[reserve].op.borrow_reserve = @fromBackingInt(@intCast(0));
     try std.testing.expectError(error.InvalidOperation, result.ir.verify());
     instructions[reserve] = old_reserve;
     // A forged direct owner load during RHS evaluation must fail the same proof
     // as source lowering, even with all value/region types otherwise valid.
     const old = instructions[read];
-    instructions[read].ty = instructions[@intFromEnum(old_reserve.op.borrow_reserve)].ty;
+    instructions[read].ty = instructions[@backingInt(old_reserve.op.borrow_reserve)].ty;
     instructions[read].op = .{ .local_load = old_reserve.op.borrow_reserve };
     // First check the standalone lifetime proof (later field operands now have
     // intentionally inconsistent types, which normal verification also rejects).
@@ -2565,7 +2566,7 @@ test "static borrowing rejected conflicts and escapes roll back every allocation
         "let R=struct{x:int=0,}\nlet f:()={let mut a=[R[]]\nlet r=&a[0]\nr.x+={a=[R[]]\n1}}",
         "let R=struct{x:int=0,}\nlet f:()={let mut a=[R[]]\nlet r=&a[0]\nlet alias=&r\n@println(alias.x)}",
         "let R=struct{x:int=0,}\nlet f:()={let mut a=[R[]]\nlet r=&a[{a=[R[]]\n0}]\nr.x=1}",
-    }) |source| try std.testing.checkAllAllocationFailures(std.testing.allocator, testBorrowRejectionAllocations, .{source});
+    }) |source| try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testBorrowRejectionAllocations, .{source});
 }
 
 test "static borrowing verifier rejects well typed forged owner access and sibling capabilities" {
@@ -2581,7 +2582,7 @@ test "static borrowing verifier rejects well typed forged owner access and sibli
     var index: usize = 0;
     var reads: usize = 0;
     for (instructions, 0..) |instruction, i| {
-        if (instruction.op == .borrow_start and index == 0) outer = @enumFromInt(i);
+        if (instruction.op == .borrow_start and index == 0) outer = @fromBackingInt(@intCast(i));
         if (instruction.op == .array_index) index = i;
         if (instruction.op == .borrow_read) {
             if (sibling == null) sibling = instruction.op.borrow_read;
@@ -2616,21 +2617,21 @@ test "static borrowing normal array loads clone immediately before later borrow 
             loads += 1;
             const next = body.instructions[i + 1];
             try std.testing.expect(next.op == .array_clone);
-            try std.testing.expectEqual(@as(Ir.ValueId, @enumFromInt(i)), next.op.array_clone);
+            try std.testing.expectEqual(@as(Ir.ValueId, @fromBackingInt(@intCast(i))), next.op.array_clone);
         },
-        .array_index => |access| try std.testing.expect(body.instructions[@intFromEnum(access.array)].op == .array_clone),
+        .array_index => |access| try std.testing.expect(body.instructions[@backingInt(access.array)].op == .array_clone),
         .array_set => |update| {
             updates += 1;
-            try std.testing.expect(body.instructions[@intFromEnum(update.array)].op == .array_clone);
+            try std.testing.expect(body.instructions[@backingInt(update.array)].op == .array_clone);
         },
         .array_append => |append| {
             appends += 1;
-            try std.testing.expect(body.instructions[@intFromEnum(append.lhs)].op == .array_clone);
+            try std.testing.expect(body.instructions[@backingInt(append.lhs)].op == .array_clone);
         },
         .borrow_reserve => |owner| {
             reservations += 1;
             // Borrowing names the actual owner slot, never one of these copies.
-            try std.testing.expect(body.instructions[@intFromEnum(owner)].op == .local_slot);
+            try std.testing.expect(body.instructions[@backingInt(owner)].op == .local_slot);
         },
         else => {},
     };

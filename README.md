@@ -14,7 +14,7 @@ Nov has automatic memory management via a minimal tracing GC.
 
 ## Building
 
-Requires Zig 0.16.0.
+Requires Zig 0.17.0.
 
 Growable arrays use an internal libc-only nonmoving mark/sweep GC. The
 runtime is emitted only for managed values; scalar-only programs stay unchanged.

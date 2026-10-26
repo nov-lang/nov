@@ -6,7 +6,7 @@ const Source = @This();
 /// Compilation-local identity. Zero is also the standalone Module identity.
 pub const Id = enum(u32) { _ };
 pub const Span = struct {
-    source: Id = @enumFromInt(0),
+    source: Id = @fromBackingInt(@intCast(0)),
     start: u32,
     end: u32,
 };
@@ -25,7 +25,7 @@ pub fn init(allocator: std.mem.Allocator, id: Id, path: []const u8, text: []cons
     if (std.mem.indexOfScalar(u8, text, 0) != null) return error.InvalidSource;
     const owned_path = try allocator.dupe(u8, path);
     errdefer allocator.free(owned_path);
-    const owned_text = try allocator.dupeZ(u8, text);
+    const owned_text = try allocator.dupeSentinel(u8, text, 0);
     errdefer allocator.free(owned_text);
     return .{
         .allocator = allocator,
@@ -54,7 +54,7 @@ pub fn tokenSpan(self: *const Source, token: Ast.TokenIndex) Span {
 }
 
 test "source ranges cannot address another AST with equal offsets" {
-    var source = try Source.init(std.testing.allocator, @enumFromInt(3), "source.nov", "let value = true;");
+    var source = try Source.init(std.testing.allocator, @fromBackingInt(@intCast(3)), "source.nov", "let value = true;");
     defer source.deinit();
     const span = source.tokenSpan(1);
     try std.testing.expectEqualStrings("value", source.slice(span).?);

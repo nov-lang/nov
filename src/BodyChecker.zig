@@ -1,4 +1,5 @@
 const std = @import("std");
+const TestAllocations = @import("TestAllocations.zig");
 const string_literal = @import("string_literal.zig");
 const Lowering = @import("Lowering.zig");
 const Sema = @import("Sema.zig");
@@ -64,8 +65,8 @@ pub fn lower(module: *Module, ir: *Ir, types: []const ?Ir.TypeId, constants: []c
 }
 
 fn tableIndex(module: *const Module, id: Module.DeclId) usize {
-    if (module.compilation) |comp| return @intFromEnum(comp.declaration_ids.get(.{ .source = module.source.id, .local = id }).?);
-    return @intFromEnum(id);
+    if (module.compilation) |comp| return @backingInt(comp.declaration_ids.get(.{ .source = module.source.id, .local = id }).?);
+    return @backingInt(id);
 }
 
 const Emitter = struct {
@@ -77,7 +78,7 @@ const Emitter = struct {
 
     fn append(self: *Emitter, ty: Ir.TypeId, span: Ir.Span, op: Ir.Operation) Error!Ir.ValueId {
         if (self.instructions.items.len == std.math.maxInt(u32)) return error.TooManyEntries;
-        const id: Ir.ValueId = @enumFromInt(self.instructions.items.len);
+        const id: Ir.ValueId = @fromBackingInt(@intCast(self.instructions.items.len));
         try self.instructions.append(self.allocator, .{ .ty = ty, .span = span, .op = op });
         return id;
     }
@@ -217,16 +218,16 @@ const Context = struct {
     // container IDs remain local to the current defining module.
     fn qualify(self: *Context, module: *const Module, id: Module.DeclId) Module.DeclId {
         _ = self;
-        return @enumFromInt(tableIndex(module, id));
+        return @fromBackingInt(@intCast(tableIndex(module, id)));
     }
 
     fn declarationModule(self: *Context, id: Module.DeclId) *Module {
-        if (self.module.compilation) |comp| return comp.getModule(comp.declarations.items[@intFromEnum(id)].source).?;
+        if (self.module.compilation) |comp| return comp.getModule(comp.declarations.items[@backingInt(id)].source).?;
         return self.module;
     }
 
     fn localId(self: *Context, id: Module.DeclId) Module.DeclId {
-        if (self.module.compilation) |comp| return comp.declarations.items[@intFromEnum(id)].local;
+        if (self.module.compilation) |comp| return comp.declarations.items[@backingInt(id)].local;
         return id;
     }
 
@@ -248,7 +249,7 @@ const Context = struct {
         };
         const identity = if (nominal == .record) nominal.record.identity else nominal.enumeration.identity;
         const owner = if (self.module.compilation) |comp| comp.getModule(source).? else self.module;
-        const method = owner.lookupConcreteMethod(@enumFromInt(identity), if (nominal == .record and nominal.record.type_args.len != 0) @intFromEnum(ty) else null, name) orelse return null;
+        const method = owner.lookupConcreteMethod(@fromBackingInt(@intCast(identity)), if (nominal == .record and nominal.record.type_args.len != 0) @backingInt(ty) else null, name) orelse return null;
         return self.qualify(owner, method);
     }
 
@@ -549,7 +550,7 @@ const Context = struct {
 
     fn globalType(self: *Context, id: Module.DeclId) Error!?Known {
         const owner = self.declarationModule(id);
-        const ty = (if (self.sema) |analysis| try analysis.requestType(owner, self.localId(id)) else if (@intFromEnum(id) < self.types.len) self.types[@intFromEnum(id)] else null) orelse return null;
+        const ty = (if (self.sema) |analysis| try analysis.requestType(owner, self.localId(id)) else if (@backingInt(id) < self.types.len) self.types[@backingInt(id)] else null) orelse return null;
         const full = owner.source.ast.decl(self.getDeclaration(id).node);
         return .{ .ty = ty, .annotation = if (full.ast.type_node != 0) owner.tokenSpan(owner.source.ast.firstToken(full.ast.type_node)) else null };
     }
@@ -647,7 +648,7 @@ const Context = struct {
             return false;
         }
         if (self.emitter) |emitter| {
-            const callee = try emitter.append(signature_id, self.irSpan(node), .{ .function_ref = emitter.functions[@intFromEnum(method)].? });
+            const callee = try emitter.append(signature_id, self.irSpan(node), .{ .function_ref = emitter.functions[@backingInt(method)].? });
             const args = try emitter.allocator.alloc(Ir.ValueId, 1);
             args[0] = try emitter.value(node);
             const value = try emitter.append(signature.function.result, self.irSpan(node), .{ .call = .{ .callee = callee, .args = args } });
@@ -1028,12 +1029,12 @@ const Context = struct {
             .array_access => .{ .array_index = .{ .array = try emitter.value(data.lhs), .index = try emitter.value(data.rhs) } },
             .field_access => blk: {
                 if (try self.staticMethod(node)) |id| {
-                    if (emitter.functions[@intFromEnum(id)]) |function| break :blk .{ .function_ref = function };
-                    if (emitter.constants[@intFromEnum(id)]) |constant| break :blk .{ .constant = constant };
+                    if (emitter.functions[@backingInt(id)]) |function| break :blk .{ .function_ref = function };
+                    if (emitter.constants[@backingInt(id)]) |constant| break :blk .{ .constant = constant };
                     return error.InvalidFunctionId;
                 }
                 const base = try emitter.value(data.lhs);
-                if (self.fieldIndex(emitter.instructions.items[@intFromEnum(base)].ty, ast.tokenSlice(data.rhs))) |index| break :blk .{ .field_read = .{ .base = base, .index = index } };
+                if (self.fieldIndex(emitter.instructions.items[@backingInt(base)].ty, ast.tokenSlice(data.rhs))) |index| break :blk .{ .field_read = .{ .base = base, .index = index } };
                 break :blk .{ .array_len = base };
             },
             .in => .{ .array_contains = .{ .value = try emitter.value(data.lhs), .array = try emitter.value(data.rhs) } },
@@ -1054,8 +1055,8 @@ const Context = struct {
                     break :blk .{ .parameter = binding.index };
                 }
                 const id = self.valueDeclaration(name) orelse return error.InvalidFunctionId;
-                if (emitter.functions[@intFromEnum(id)]) |function| break :blk .{ .function_ref = function };
-                if (emitter.constants[@intFromEnum(id)]) |constant| break :blk .{ .constant = constant };
+                if (emitter.functions[@backingInt(id)]) |function| break :blk .{ .function_ref = function };
+                if (emitter.constants[@backingInt(id)]) |constant| break :blk .{ .constant = constant };
                 _ = try self.fail(.unsupported_lowering, node, null);
                 return false;
             },
@@ -2272,7 +2273,7 @@ const Context = struct {
                         if (!self.terminated) {
                             const is_noreturn = self.getDeclaration(method).noreturn;
                             if (self.emitter) |emitter| {
-                                const callee = try emitter.append(signature.ty, self.irSpan(call.ast.fn_expr), .{ .function_ref = emitter.functions[@intFromEnum(method)].? });
+                                const callee = try emitter.append(signature.ty, self.irSpan(call.ast.fn_expr), .{ .function_ref = emitter.functions[@backingInt(method)].? });
                                 const args = try emitter.allocator.alloc(Ir.ValueId, function.params.len);
                                 args[0] = try emitter.value(field.lhs);
                                 for (call.ast.args, args[1..]) |arg, *value| value.* = try emitter.value(arg);
@@ -2635,7 +2636,7 @@ test "record interpolation uses print signature diagnostics at the placeholder s
         try std.testing.expectEqualStrings("r", module.sourceSlice(diagnostic.span).?);
         try std.testing.expectEqual(case.related, diagnostic.related != null);
         if (diagnostic.related) |related| try std.testing.expectEqualStrings("toString", module.sourceSlice(related).?);
-        try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
     }
 }
 
@@ -3996,7 +3997,7 @@ test "body checking rolls back diagnostics and owned storage on allocation failu
         "let f: () -> void = loop false : {let hidden = true\n} {@println(hidden)}",
         "let f: () -> int = loop {if true {break 1} else {break false}}",
     }) |source| {
-        try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
     }
 }
 

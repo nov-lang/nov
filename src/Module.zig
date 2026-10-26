@@ -1,4 +1,5 @@
 const std = @import("std");
+const TestAllocations = @import("TestAllocations.zig");
 const Ast = @import("Ast.zig");
 const Source = @import("Source.zig");
 const primitives = @import("primitives.zig");
@@ -140,7 +141,7 @@ pub const InitError = std.mem.Allocator.Error || error{
 /// Owns copies of the path and source, the AST, names and diagnostics. This is a
 /// module-scope collection pass only: no expression/type checking is performed.
 pub fn init(allocator: std.mem.Allocator, path: []const u8, source: []const u8) InitError!Module {
-    return initSource(allocator, @enumFromInt(0), path, source);
+    return initSource(allocator, @fromBackingInt(@intCast(0)), path, source);
 }
 
 pub fn initSource(allocator: std.mem.Allocator, id: Source.Id, path: []const u8, text: []const u8) InitError!Module {
@@ -179,7 +180,7 @@ pub fn lookup(self: *const Module, name: []const u8) ?DeclId {
 
 /// Returned names borrow the source; handles remain valid across table growth.
 pub fn getDeclaration(self: *const Module, id: DeclId) ?Declaration {
-    const index = @intFromEnum(id);
+    const index = @backingInt(id);
     if (index >= self.declarations.items.len) return null;
     return self.declarations.items[index];
 }
@@ -241,7 +242,7 @@ pub fn classifyAliases(self: *Module) std.mem.Allocator.Error!void {
         }
     }
     for (self.declarations.items, 0..) |*declaration, i| {
-        if (!self.aliasCandidate(@enumFromInt(i))) continue;
+        if (!self.aliasCandidate(@fromBackingInt(@intCast(i)))) continue;
         const init_node = self.source.ast.decl(declaration.node).ast.init_node;
         const name = self.source.ast.tokenSlice(self.source.ast.firstToken(init_node));
         if (self.source.ast.fullCall(init_node)) |call| {
@@ -260,7 +261,7 @@ pub fn classifyAliases(self: *Module) std.mem.Allocator.Error!void {
     while (generic_changed) {
         generic_changed = false;
         for (self.declarations.items, 0..) |*declaration, i| {
-            if (declaration.is_generic or !self.aliasCandidate(@enumFromInt(i))) continue;
+            if (declaration.is_generic or !self.aliasCandidate(@fromBackingInt(@intCast(i)))) continue;
             const init_node = self.source.ast.decl(declaration.node).ast.init_node;
             if (tags[init_node] != .identifier) continue;
             const target = self.lookup(self.source.ast.tokenSlice(self.source.ast.firstToken(init_node))) orelse continue;
@@ -291,7 +292,7 @@ pub fn classifyAliases(self: *Module) std.mem.Allocator.Error!void {
             } else if (tags[node] == .identifier) {
                 const name = self.source.ast.tokenSlice(self.source.ast.firstToken(node));
                 if (self.lookup(name)) |id| {
-                    const declaration = &self.declarations.items[@intFromEnum(id)];
+                    const declaration = &self.declarations.items[@backingInt(id)];
                     if (!declaration.is_type_alias and self.aliasCandidate(id)) {
                         declaration.is_type_alias = true;
                         try work.append(self.allocator, self.source.ast.decl(declaration.node).ast.init_node);
@@ -301,7 +302,7 @@ pub fn classifyAliases(self: *Module) std.mem.Allocator.Error!void {
         }
         var changed = false;
         for (self.declarations.items, 0..) |*declaration, i| {
-            if (declaration.is_type_alias or !self.aliasCandidate(@enumFromInt(i))) continue;
+            if (declaration.is_type_alias or !self.aliasCandidate(@fromBackingInt(@intCast(i)))) continue;
             const init_node = self.source.ast.decl(declaration.node).ast.init_node;
             if (self.source.ast.fullCall(init_node)) |call| {
                 if (tags[call.ast.fn_expr] != .identifier) continue;
@@ -330,7 +331,7 @@ pub fn lookupMethod(self: *const Module, container: DeclId, name: []const u8) ?D
 }
 
 pub fn lookupConcreteMethod(self: *const Module, container: DeclId, concrete_type: ?u32, name: []const u8) ?DeclId {
-    for (self.declarations.items, 0..) |decl, i| if (decl.container == container and decl.concrete_type == concrete_type and std.mem.eql(u8, decl.name, name)) return @enumFromInt(i);
+    for (self.declarations.items, 0..) |decl, i| if (decl.container == container and decl.concrete_type == concrete_type and std.mem.eql(u8, decl.name, name)) return @fromBackingInt(@intCast(i));
     return null;
 }
 
@@ -349,7 +350,7 @@ fn collectDeclarations(self: *Module) (std.mem.Allocator.Error || error{TooManyD
         const decl = self.declarations.items[i];
         if (!decl.is_record) continue;
         for (self.source.ast.fullStruct(self.source.ast.decl(decl.node).ast.init_node).?) |member| {
-            if (self.source.ast.nodes.items(.tag)[member] != .container_field) try self.collectDeclaration(member, @enumFromInt(i));
+            if (self.source.ast.nodes.items(.tag)[member] != .container_field) try self.collectDeclaration(member, @fromBackingInt(@intCast(i)));
         }
     }
 }
@@ -381,7 +382,7 @@ fn collectDeclaration(self: *Module, node: Ast.Node.Index, container: ?DeclId) (
             return;
         }
         if (self.declarations.items.len == std.math.maxInt(u32)) return error.TooManyDeclarations;
-        const id: DeclId = @enumFromInt(self.declarations.items.len);
+        const id: DeclId = @fromBackingInt(@intCast(self.declarations.items.len));
         if (container == null) try self.names.put(self.allocator, name, id);
         const is_record = declaration.ast.init_node != 0 and self.source.ast.fullStruct(declaration.ast.init_node) != null;
         const is_generic = is_record and declaration.ast.type_node != 0 and (self.source.ast.isUnion(declaration.ast.init_node) or self.source.ast.tokens.items(.tag)[self.source.ast.nodes.items(.main_token)[declaration.ast.init_node]] == .keyword_struct);
@@ -414,7 +415,7 @@ test "collection makes later declarations available before resolving uses" {
     const token = module.source.ast.nodes.items(.main_token)[initializer];
     try std.testing.expectEqual(later_id, (try module.resolveName(module.tokenSpan(token))).?);
     try std.testing.expect(module.lookup("absent") == null);
-    try std.testing.expect(module.getDeclaration(@enumFromInt(99)) == null);
+    try std.testing.expect(module.getDeclaration(@fromBackingInt(@intCast(99))) == null);
 }
 
 test "duplicate diagnostics retain both name locations and the first binding" {
@@ -491,15 +492,15 @@ test "struct methods have separate scopes stable module IDs and preserved public
     try std.testing.expect(!module.hasErrors());
     const a = module.lookup("A").?;
     const b = module.lookup("B").?;
-    try std.testing.expectEqual(@as(u32, 0), @intFromEnum(a));
-    try std.testing.expectEqual(@as(u32, 1), @intFromEnum(b));
-    try std.testing.expectEqual(@as(u32, 2), @intFromEnum(module.lookup("method").?));
+    try std.testing.expectEqual(@as(u32, 0), @backingInt(a));
+    try std.testing.expectEqual(@as(u32, 1), @backingInt(b));
+    try std.testing.expectEqual(@as(u32, 2), @backingInt(module.lookup("method").?));
     const am = module.lookupMethod(a, "method").?;
     const bm = module.lookupMethod(b, "method").?;
     try std.testing.expect(am != bm and am != module.lookup("method").?);
     try std.testing.expect(module.getDeclaration(a).?.public and module.getDeclaration(am).?.public);
     try std.testing.expect(!module.getDeclaration(bm).?.public);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
 }
 
 test "struct attributes and duplicate method names diagnose without leaking declarations" {
@@ -512,7 +513,7 @@ test "struct attributes and duplicate method names diagnose without leaking decl
         defer module.deinit();
         try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
         try std.testing.expect(module.hasErrors());
-        try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
     }
 }
 
@@ -542,12 +543,12 @@ test "declaration identities and source-backed names survive table growth" {
     defer module.deinit();
     try std.testing.expect(!module.hasErrors());
     try std.testing.expectEqual(@as(usize, 32), module.declarations.items.len);
-    try std.testing.expectEqual(@as(u32, 0), @intFromEnum(module.lookup("name_0").?));
-    try std.testing.expectEqual(@as(u32, 31), @intFromEnum(module.lookup("name_31").?));
+    try std.testing.expectEqual(@as(u32, 0), @backingInt(module.lookup("name_0").?));
+    try std.testing.expectEqual(@as(u32, 31), @backingInt(module.lookup("name_31").?));
     const first = module.getDeclaration(module.lookup("name_0").?).?;
     try std.testing.expectEqualStrings("name_0", first.name);
     try std.testing.expectEqualStrings("name_0", module.sourceSlice(first.name_span).?);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source.written()});
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source.written()});
 }
 
 test "module ownership survives allocation failures during collection and diagnostics" {
@@ -558,6 +559,6 @@ test "module ownership survives allocation failures during collection and diagno
         "let broken =",
         "@[export]\nlet decorated = 1\nlet @\"quoted\" = 2",
     }) |source| {
-        try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
     }
 }

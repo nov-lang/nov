@@ -1,4 +1,5 @@
 const std = @import("std");
+const TestAllocations = @import("TestAllocations.zig");
 const Ast = @import("Ast.zig");
 const Module = @import("Module.zig");
 const Ir = @import("Ir.zig");
@@ -23,7 +24,7 @@ pub fn resolveInContainer(module: *Module, ir: *Ir, node: Ast.Node.Index, owner:
     defer bindings.deinit(module.allocator);
     const declaration = module.getDeclaration(container).?;
     const full = module.source.ast.decl(declaration.node).ast;
-    const this_type = if (concrete) |id| @as(Ir.TypeId, @enumFromInt(id)) else (try resolve(module, ir, full.init_node)) orelse return null;
+    const this_type = if (concrete) |id| @as(Ir.TypeId, @fromBackingInt(@intCast(id))) else (try resolve(module, ir, full.init_node)) orelse return null;
     try bindings.append(module.allocator, .{ .name = "@This", .ty = this_type });
     if (concrete != null) {
         const args = ir.getType(this_type).?.record.type_args;
@@ -230,8 +231,8 @@ fn resolveDepth(module: *Module, ir: *Ir, node: Ast.Node.Index, depth: usize, al
 }
 
 fn resolveEnum(module: *Module, ir: *Ir, identity: u32, node: Ast.Node.Index) Error!?Ir.TypeId {
-    for (ir.types.items, 0..) |ty, i| if (ty == .enumeration and ty.enumeration.source == module.source.id and ty.enumeration.identity == identity) return @enumFromInt(i);
-    const declaration = module.getDeclaration(@enumFromInt(identity)).?;
+    for (ir.types.items, 0..) |ty, i| if (ty == .enumeration and ty.enumeration.source == module.source.id and ty.enumeration.identity == identity) return @fromBackingInt(@intCast(i));
+    const declaration = module.getDeclaration(@fromBackingInt(@intCast(identity))).?;
     const ast = &module.source.ast;
     var tags: std.ArrayList(Ir.EnumTag) = .empty;
     defer tags.deinit(module.allocator);
@@ -250,7 +251,7 @@ fn resolveEnum(module: *Module, ir: *Ir, identity: u32, node: Ast.Node.Index) Er
             _ = try diagnose(module, member, .unsupported_name);
             valid = false;
         }
-        var duplicate = module.lookupMethod(@enumFromInt(identity), name) != null;
+        var duplicate = module.lookupMethod(@fromBackingInt(@intCast(identity)), name) != null;
         for (tags.items) |tag| if (std.mem.eql(u8, name, tag.name)) {
             duplicate = true;
         };
@@ -392,22 +393,22 @@ fn instantiateArguments(module: *Module, ir: *Ir, id: Module.DeclId, args: []con
     const proto = ast.fullFnProto(full.type_node).?;
     var existing: ?Ir.TypeId = null;
     for (ir.types.items, 0..) |ty, i| {
-        if (ty != .record or ty.record.source != module.source.id or ty.record.identity != @intFromEnum(id) or !std.mem.eql(Ir.TypeId, ty.record.type_args, args)) continue;
+        if (ty != .record or ty.record.source != module.source.id or ty.record.identity != @backingInt(id) or !std.mem.eql(Ir.TypeId, ty.record.type_args, args)) continue;
         switch (ty.record.instance_state) {
-            .complete => return @as(Ir.TypeId, @enumFromInt(i)),
+            .complete => return @as(Ir.TypeId, @fromBackingInt(@intCast(i))),
             .building => return diagnose(module, node, .generic_cycle),
             // A speculative body probe may have rolled back its diagnostics.
             // Retry failed layouts so the real check reports the original cause.
-            .failed => existing = @enumFromInt(i),
+            .failed => existing = @fromBackingInt(@intCast(i)),
         }
         break;
     }
     const tagged = ast.isUnion(full.init_node);
-    const ty = existing orelse try ir.internType(.{ .record = .{ .source = module.source.id, .identity = @intFromEnum(id), .fields = &.{}, .tagged = tagged, .public = declaration.public, .type_args = args, .instance_state = .building } });
-    ir.types.items[@intFromEnum(ty)].record.instance_state = .building;
+    const ty = existing orelse try ir.internType(.{ .record = .{ .source = module.source.id, .identity = @backingInt(id), .fields = &.{}, .tagged = tagged, .public = declaration.public, .type_args = args, .instance_state = .building } });
+    ir.types.items[@backingInt(ty)].record.instance_state = .building;
     var complete = false;
     defer if (!complete) {
-        ir.types.items[@intFromEnum(ty)].record.instance_state = .failed;
+        ir.types.items[@backingInt(ty)].record.instance_state = .failed;
     };
     var bindings: std.ArrayList(Binding) = .empty;
     defer bindings.deinit(module.allocator);
@@ -441,7 +442,7 @@ fn instantiateArguments(module: *Module, ir: *Ir, id: Module.DeclId, args: []con
         try fields.append(module.allocator, .{ .name = ast.tokenSlice(token), .ty = field_ty, .span = span, .default = default });
     }
     try ir.setRecordFields(ty, fields.items);
-    ir.types.items[@intFromEnum(ty)].record.instance_state = .complete;
+    ir.types.items[@backingInt(ty)].record.instance_state = .complete;
     complete = true;
     // Specialized declarations retain source ASTs but have distinct stable IDs.
     // Publish all siblings together before any signature or body is checked.
@@ -450,11 +451,11 @@ fn instantiateArguments(module: *Module, ir: *Ir, id: Module.DeclId, args: []con
         var method = module.declarations.items[i];
         if (method.container != id or method.concrete_type != null) continue;
         if (module.declarations.items.len == std.math.maxInt(u32)) return error.TooManyEntries;
-        method.concrete_type = @intFromEnum(ty);
+        method.concrete_type = @backingInt(ty);
         method.specialization_depth = expansions + 1;
         try module.declarations.append(module.allocator, method);
         if (module.compilation) |comp| {
-            _ = comp.internDeclaration(.{ .source = module.source.id, .local = @enumFromInt(module.declarations.items.len - 1) }) catch |err| switch (err) {
+            _ = comp.internDeclaration(.{ .source = module.source.id, .local = @fromBackingInt(@intCast(module.declarations.items.len - 1)) }) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.TooManyDeclarations => return error.TooManyEntries,
             };
@@ -725,6 +726,6 @@ test "module IR temporary signatures and diagnostics clean up on every allocatio
         "let value: (x: i32, x: bool)",
         "let value: int",
     }) |source| {
-        try std.testing.checkAllAllocationFailures(std.testing.allocator, testResolve, .{source});
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testResolve, .{source});
     }
 }

@@ -1,12 +1,12 @@
 .{
     .name = .nov,
     .version = "0.0.0",
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .fingerprint = 0xe60b9c59a00e14ef,
     .dependencies = .{
         .clap = .{
-            .url = "git+https://github.com/Hejsil/zig-clap#8d97efa1ee1e575443c7888d5c38e1c3fc145cf5",
-            .hash = "clap-0.12.0-oBajB7foAQDqlSwaSG5g0yq7xGbQARUsBk5T64gAOqP5",
+            .url = "git+https://github.com/Hejsil/zig-clap#05faf3905e8548f5cc269a8836e154065e70128d",
+            .hash = "clap-0.12.0-oBajB4XpAQCF1WRKnD5KOKPsnwwT_NNdAJ7Ww3irYJac",
         },
         .isocline = .{
             .url = "git+https://github.com/ratakor/isocline-zig#4441805bc1ca663b2b6fa7b62e2552e96449538b",
@@ -17,8 +17,8 @@
             .hash = "known_folders-0.0.0-Fy-PJiDLAAB98m3uYUzatrTb2mO2fpvwx2zpSroEtfbO",
         },
         .axe = .{
-            .url = "git+https://github.com/ratakor/axe#186078c497e4e4dab20926c1b135fa9ab8a6a3b1",
-            .hash = "axe-0.8.0-M2JU5SuRAABRUbICFInh_GltUm46JBd986HQCE7j6BJz",
+            .url = "git+https://github.com/ratakor/axe#9fd354c246ae4aa0e45dde6b00ee3f970201be5c",
+            .hash = "axe-0.9.0-M2JU5R6RAAA-iU1v8YHw3dSB8XMmnltmDT1aQJCTqlgp",
         },
     },
     .paths = .{

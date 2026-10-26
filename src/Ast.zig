@@ -336,11 +336,11 @@ pub fn tokenSlice(self: Ast, token_index: TokenIndex) []const u8 {
 }
 
 pub fn extraData(tree: Ast, index: usize, comptime T: type) T {
-    const fields = std.meta.fields(T);
+    const info = @typeInfo(T).@"struct";
     var result: T = undefined;
-    inline for (fields, 0..) |field, i| {
-        comptime assert(field.type == Node.Index);
-        @field(result, field.name) = tree.extra_data[index + i];
+    inline for (info.field_names, info.field_types, 0..) |name, field_type, i| {
+        comptime assert(field_type == Node.Index);
+        @field(result, name) = tree.extra_data[index + i];
     }
     return result;
 }

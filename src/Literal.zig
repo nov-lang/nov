@@ -1,4 +1,5 @@
 const std = @import("std");
+const TestAllocations = @import("TestAllocations.zig");
 const string_literal = @import("string_literal.zig");
 const Ast = @import("Ast.zig");
 const Module = @import("Module.zig");
@@ -107,7 +108,7 @@ pub fn qualifiedEnum(module: *Module, ir: *Ir, node: Ast.Node.Index) Error!?Ir.T
     const t = ir.getType(ty).?;
     if (t != .enumeration) return null;
     const owner = if (module.compilation) |comp| comp.getModule(t.enumeration.source).? else module;
-    if (owner.lookupMethod(@enumFromInt(t.enumeration.identity), ast.tokenSlice(ast.nodes.items(.data)[node].rhs)) != null) return null;
+    if (owner.lookupMethod(@fromBackingInt(@intCast(t.enumeration.identity)), ast.tokenSlice(ast.nodes.items(.data)[node].rhs)) != null) return null;
     return ty;
 }
 
@@ -426,9 +427,9 @@ fn testStringAllocationFailures(allocator: std.mem.Allocator) !void {
 }
 
 test "string decoding and diagnostics clean up on every allocation failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testStringAllocationFailures, .{});
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testStringAllocationFailures, .{});
 }
 
 test "caller cleanup handles every allocation failure after constants or diagnostics" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{});
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{});
 }

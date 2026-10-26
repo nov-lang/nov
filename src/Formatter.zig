@@ -1,4 +1,5 @@
 const std = @import("std");
+const TestAllocations = @import("TestAllocations.zig");
 const Ast = @import("Ast.zig");
 const Parser = @import("Parser.zig");
 const Tokenizer = @import("Tokenizer.zig");
@@ -34,7 +35,7 @@ pub fn format(allocator: std.mem.Allocator, source: [:0]const u8) ![]u8 {
 
     const rendered = try ast.render(allocator);
     errdefer allocator.free(rendered);
-    const terminated = try allocator.dupeZ(u8, rendered);
+    const terminated = try allocator.dupeSentinel(u8, rendered, 0);
     defer allocator.free(terminated);
     var result = try Parser.parse(allocator, terminated);
     defer result.deinit(allocator);
@@ -317,7 +318,7 @@ fn expectFormatted(source: [:0]const u8, expected: []const u8) !void {
     const formatted = try format(allocator, source);
     defer allocator.free(formatted);
     try std.testing.expectEqualStrings(expected, formatted);
-    const terminated = try allocator.dupeZ(u8, formatted);
+    const terminated = try allocator.dupeSentinel(u8, formatted, 0);
     defer allocator.free(terminated);
     const again = try format(allocator, terminated);
     defer allocator.free(again);
@@ -326,12 +327,12 @@ fn expectFormatted(source: [:0]const u8, expected: []const u8) !void {
 
 test "generic union signatures instantiations and propagation format idempotently" {
     try expectFormatted("let Result:(T:type,E:type)->type=union{ok:T,err:E,}\nlet R=Result(int,string)\nlet f:(r:R)->R=.ok[r.!]", "let Result: (T: type, E: type) -> type = union {\n    ok: T,\n    err: E,\n}\nlet R = Result(int, string)\nlet f: (r: R) -> R = .ok[r.!]\n");
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{"let G:(T:type)->type=union{ok:T,err:void,}\nlet R=G(int)\nlet f:(r:R)->R=G(int).ok[r.!]"});
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{"let G:(T:type)->type=union{ok:T,err:void,}\nlet R=G(int)\nlet f:(r:R)->R=G(int).ok[r.!]"});
 }
 
 test "unions constructors captures and payloadless variants format idempotently" {
     try expectFormatted("let U=union{ok:int,err:string,none,}\nlet f:(u:U)->int=match u{.ok=>|v|v\n.err=>0\n.none=>1}\nlet g:()->U=.none[]", "let U = union {\n    ok: int,\n    err: string,\n    none,\n}\nlet f: (u: U) -> int = match u {\n    .ok => |v| v\n    .err => 0\n    .none => 1\n}\nlet g: () -> U = .none[]\n");
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{"let U=union{ok:int,none,}\nlet f:(u:U)->int=match u{.ok=>|v|v\n.none=>0}"});
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{"let U=union{ok:int,none,}\nlet f:(u:U)->int=match u{.ok=>|v|v\n.none=>0}"});
 }
 
 test "declarations arithmetic strings and idempotence" {
@@ -388,7 +389,7 @@ test "static integer borrow formatting is idempotent" {
     const source: [:0]const u8 = "let main:()={let mut x:uint=1\nlet earlierx=x\nlet y=&x\ny+=1\n@println(x,earlierx)}";
     const formatted = try format(std.testing.allocator, source);
     defer std.testing.allocator.free(formatted);
-    const terminated = try std.testing.allocator.dupeZ(u8, formatted);
+    const terminated = try std.testing.allocator.dupeSentinel(u8, formatted, 0);
     defer std.testing.allocator.free(terminated);
     const again = try format(std.testing.allocator, terminated);
     defer std.testing.allocator.free(again);
@@ -442,7 +443,7 @@ test "nominal struct formatting preserves public attributes fields defaults meth
         const result = try format(std.testing.allocator, source);
         defer std.testing.allocator.free(result);
         try expectFormatted(source, result);
-        try std.testing.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{source});
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{source});
     }
 }
 
@@ -454,7 +455,7 @@ test "ascription preserves type syntax comments nested calls interpolation and a
         const result = try format(std.testing.allocator, source);
         defer std.testing.allocator.free(result);
         try expectFormatted(source, result);
-        try std.testing.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{source});
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{source});
     }
 }
 
@@ -474,7 +475,7 @@ test "match and pipes preserve comments tokens private blocks and multiline pron
         const result = try format(std.testing.allocator, source);
         defer std.testing.allocator.free(result);
         try expectFormatted(source, result);
-        try std.testing.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{source});
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{source});
     }
 }
 
@@ -646,7 +647,7 @@ fn testExecutableAllocationFailures(allocator: std.mem.Allocator) !void {
 }
 
 test "executable formatting survives allocation failures" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testExecutableAllocationFailures, .{});
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testExecutableAllocationFailures, .{});
 }
 
 test "scalar arrays render types literals indexing length and direct stores" {
@@ -691,7 +692,7 @@ fn testArrayAllocationFailures(allocator: std.mem.Allocator) !void {
 }
 
 test "array formatting survives every allocation failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testArrayAllocationFailures, .{});
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testArrayAllocationFailures, .{});
 }
 
 test "record interpolation formatting preserves captures aliases conversions and allocation cleanup" {
@@ -699,7 +700,7 @@ test "record interpolation formatting preserves captures aliases conversions and
     const formatted = try format(std.testing.allocator, source);
     defer std.testing.allocator.free(formatted);
     try expectFormatted(source, formatted);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{source});
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{source});
 }
 
 test "interpolation formatting preserves literal chunks escapes and placeholders" {
@@ -716,7 +717,7 @@ test "conditional loop exhaustion formatting preserves tokens comments and struc
     }) |source| {
         const formatted = try format(std.testing.allocator, source);
         defer std.testing.allocator.free(formatted);
-        const terminated = try std.testing.allocator.dupeZ(u8, formatted);
+        const terminated = try std.testing.allocator.dupeSentinel(u8, formatted, 0);
         defer std.testing.allocator.free(terminated);
         const twice = try format(std.testing.allocator, terminated);
         defer std.testing.allocator.free(twice);
@@ -766,7 +767,7 @@ test "inclusive range formatting preserves comments and is idempotent" {
     const formatted = try format(std.testing.allocator, source);
     defer std.testing.allocator.free(formatted);
     try expectFormatted(source, formatted);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{"let f: ()=loop i in 0..= ; upper\n2 {loop j in 0..=i {continue}}"});
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{"let f: ()=loop i in 0..= ; upper\n2 {loop j in 0..=i {continue}}"});
     try expectFormatted("let x=0..=2", "let x = 0..=2\n");
 }
 
@@ -779,12 +780,12 @@ test "range else formatting preserves comments newlines and idempotent metadata"
         const formatted = try format(std.testing.allocator, source);
         defer std.testing.allocator.free(formatted);
         try expectFormatted(source, formatted);
-        try std.testing.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{source});
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{source});
     }
 }
 
 test "range formatting survives every allocation failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{"let f: ()=loop _ in ; lower\n-{{128}}.. ; upper\n0 {loop i in 0..2 {continue}}"});
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{"let f: ()=loop _ in ; lower\n-{{128}}.. ; upper\n0 {loop i in 0..2 {continue}}"});
 }
 
 test "bare block continuations format without accepting genuine labels" {
@@ -823,7 +824,7 @@ fn testBlockContinuationAllocationFailures(allocator: std.mem.Allocator) !void {
 }
 
 test "bare block continuation formatting survives every allocation failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testBlockContinuationAllocationFailures, .{});
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testBlockContinuationAllocationFailures, .{});
 }
 
 test "loop structure checks inspect extras without reading unused fields" {
@@ -864,7 +865,7 @@ fn testLoopAllocationFailures(allocator: std.mem.Allocator) !void {
 }
 
 test "continuation and value loop formatting survives every allocation failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testLoopAllocationFailures, .{});
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testLoopAllocationFailures, .{});
 }
 
 test "preservation checks detect code comment and structural loss" {
@@ -899,7 +900,7 @@ test "namespace import formatting preserves literal spellings comments and idemp
     }) |source| {
         const formatted = try format(std.testing.allocator, source);
         defer std.testing.allocator.free(formatted);
-        const terminated = try std.testing.allocator.dupeZ(u8, formatted);
+        const terminated = try std.testing.allocator.dupeSentinel(u8, formatted, 0);
         defer std.testing.allocator.free(terminated);
         try std.testing.expect(sameTokensAndComments(source, terminated));
         const again = try format(std.testing.allocator, terminated);

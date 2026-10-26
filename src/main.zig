@@ -527,7 +527,7 @@ test "emit-c buffers source and renders frontend entrypoint and backend failures
             try std.testing.expect(std.mem.indexOf(u8, diagnostics.written(), "^") != null);
             if (std.mem.indexOf(u8, case.source, "\r\n") != null) {
                 try std.testing.expect(std.mem.indexOf(u8, diagnostics.written(), "input.nov:2:32: error:") != null);
-                try std.testing.expect(std.mem.indexOf(u8, diagnostics.written(), "\n\t" ++ " " ** 30 ++ "^\n") != null);
+                try std.testing.expect(std.mem.indexOf(u8, diagnostics.written(), "\n\t" ++ @as([30]u8, @splat(' ')) ++ "^\n") != null);
             }
         } else {
             try std.testing.expectEqualStrings("", diagnostics.written());
@@ -576,7 +576,7 @@ test "format executable programs without changing generated C or runtime behavio
     for (programs) |program| {
         const formatted = try Formatter.format(allocator, program.source);
         defer allocator.free(formatted);
-        const terminated = try allocator.dupeZ(u8, formatted);
+        const terminated = try allocator.dupeSentinel(u8, formatted, 0);
         defer allocator.free(terminated);
         const again = try Formatter.format(allocator, terminated);
         defer allocator.free(again);
