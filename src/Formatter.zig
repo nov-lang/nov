@@ -211,7 +211,7 @@ fn checkSupported(ast: Ast) !void {
             .array_access => if (ast.nodes.items(.tag)[data.lhs] == .array_access) return error.UnsupportedSyntax,
             .attr_one => {
                 const name = ast.tokenSlice(data.lhs);
-                if (std.mem.eql(u8, name, "export")) {
+                if (std.mem.eql(u8, name, "export") or std.mem.eql(u8, name, "extern")) {
                     if (data.rhs != 0 and ast.nodes.items(.tag)[data.rhs] != .string_literal) return error.UnsupportedSyntax;
                 } else if (data.rhs != 0 or (!std.mem.eql(u8, name, "public") and !std.mem.eql(u8, name, "noreturn"))) return error.UnsupportedSyntax;
             },
@@ -449,6 +449,23 @@ test "export formatting preserves exact symbol literals comments delimiters and 
         defer std.testing.allocator.free(result);
         try expectFormatted(source, result);
         try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{source});
+    }
+}
+
+test "extern formatting preserves bodyless declarations comments escapes and trailing commas" {
+    for ([_][:0]const u8{
+        "@[extern]\nlet abs:(x:i32)->i32",
+        "@[public]\n@[extern(\"nov_\\x61dd\",)]\nlet add:(x:i32,y:i32)->i32",
+        "@[extern( ; symbol\n\"foreign_stop\", ; keep comma\n)] ; end\n@[noreturn]\nlet stop:() ; no body\n@[extern]\nlet unit:()",
+    }) |source| {
+        const result = try format(std.testing.allocator, source);
+        defer std.testing.allocator.free(result);
+        try expectFormatted(source, result);
+        try std.testing.expect(std.mem.indexOf(u8, result, "=") == null);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{source});
+    }
+    for ([_][:0]const u8{ "@[extern(1)]\nlet f:()", "@[extern(\"a\",\"b\")]\nlet f:()" }) |source| {
+        try std.testing.expectError(error.UnsupportedSyntax, format(std.testing.allocator, source));
     }
 }
 

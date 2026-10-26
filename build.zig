@@ -118,6 +118,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const export_tests = b.step("test-cli-exports", "Run export CLI and separate-TU C ABI tests");
     addExportCliTests(b, exe, export_tests);
     test_step.dependOn(export_tests);
+    const extern_tests = b.step("test-cli-extern", "Run extern CLI and separate-TU C ABI tests");
+    addExternCliTests(b, exe, extern_tests);
+    test_step.dependOn(extern_tests);
     addFieldMutationCliTests(b, exe, test_step, fixtures);
     addGenericStructCliTests(b, exe, test_step, fixtures);
     addRangeValueCliTests(b, exe, test_step, fixtures);
@@ -1540,6 +1543,152 @@ fn addExportCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *st
         execute.expectStdOutEqual("Sum: 42\nSelected: 42\nInverted: true\nArea: 42\nPerimeter: 26\n");
         execute.expectStdErrEqual("");
         test_step.dependOn(&execute.step);
+    }
+}
+
+fn addExternCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    const fixtures = b.addWriteFiles();
+    _ = fixtures.add("extern.nov", @embedFile("examples/extern.nov"));
+    _ = fixtures.add("libc.nov", "@[extern]\nlet abs: (x: i32) -> i32\nlet main: () = @println(abs(-42))\n");
+    _ = fixtures.add("library.nov", "@[extern]\nlet foreign_unit: ()\n@[extern(\"foreign_\\x73top\")]\n@[noreturn]\nlet stop: ()\n");
+    var scalar_source: std.Io.Writer.Allocating = .init(b.allocator);
+    for ([_][]const u8{ "bool", "i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "int", "uint" }) |ty| {
+        scalar_source.writer.print("@[extern]\nlet identity_{s}: (x: {s}) -> {s}\n", .{ ty, ty, ty }) catch @panic("OOM");
+    }
+    _ = fixtures.add("scalars.nov", scalar_source.written());
+    for ([_][]const u8{ "extern.nov", "library.nov", "scalars.nov" }) |source| {
+        for ([_][]const u8{ "semantic", "fmt" }) |mode| {
+            const check = b.addRunArtifact(exe);
+            check.step.name = b.fmt("CLI extern: {s} {s}", .{ mode, source });
+            check.setCwd(fixtures.getDirectory());
+            check.addArgs(if (std.mem.eql(u8, mode, "semantic")) &.{ "check", "--semantic", source } else &.{ "fmt", "--check", source });
+            check.expectExitCode(0);
+            check.expectStdOutEqual("");
+            check.expectStdErrEqual("");
+            test_step.dependOn(&check.step);
+        }
+    }
+    const Rejection = struct { name: []const u8, source: []const u8, diagnostic: []const u8 };
+    for ([_]Rejection{
+        .{ .name = "body", .source = "@[extern]\nlet f: () = {}\n", .diagnostic = "prototype without a body" },
+        .{ .name = "mut", .source = "@[extern]\nlet mut f: ()\n", .diagnostic = "immutable top-level function" },
+        .{ .name = "missing-body", .source = "let f: ()\n", .diagnostic = "initializer" },
+        .{ .name = "argument", .source = "@[extern(1)]\nlet f: ()\n", .diagnostic = "accepts no argument" },
+        .{ .name = "arguments", .source = "@[extern(\"a\", \"b\")]\nlet f: ()\n", .diagnostic = "accepts no argument" },
+        .{ .name = "duplicate", .source = "@[extern]\n@[extern]\nlet f: ()\n", .diagnostic = "cannot be repeated" },
+        .{ .name = "abi-param", .source = "@[extern]\nlet f: (x: string)\n", .diagnostic = "extern ABI supports only" },
+        .{ .name = "abi-result", .source = "@[extern]\nlet f: () -> string\n", .diagnostic = "extern ABI supports only" },
+        .{ .name = "abi-wide", .source = "@[extern]\nlet f: (x: i128)\n", .diagnostic = "extern ABI supports only" },
+        .{ .name = "name", .source = "@[extern(\"not-a-name\")]\nlet f: ()\n", .diagnostic = "extern name must be" },
+        .{ .name = "export", .source = "@[extern]\n@[export]\nlet f: ()\n", .diagnostic = "cannot be combined" },
+        .{ .name = "conflict", .source = "@[extern(\"same\")]\nlet f: (x: i32)\n@[extern(\"same\")]\nlet g: (x: bool)\n", .diagnostic = "same canonical signature" },
+        .{ .name = "noreturn-result", .source = "@[extern]\n@[noreturn]\nlet f: () -> i32\n", .diagnostic = "must return void" },
+        .{ .name = "collision", .source = "let helper: () = {}\n@[extern(\"nov_helper\")]\nlet f: ()\n", .diagnostic = "extern symbol conflicts" },
+    }) |case| {
+        const source = b.fmt("bad-{s}.nov", .{case.name});
+        _ = fixtures.add(source, case.source);
+        const reject = b.addRunArtifact(exe);
+        reject.step.name = b.fmt("CLI extern: reject {s} without stdout", .{case.name});
+        reject.setCwd(fixtures.getDirectory());
+        reject.addArgs(&.{ "emit-c", "--library", source });
+        reject.expectExitCode(1);
+        reject.expectStdOutEqual("");
+        reject.expectStdErrMatch(case.diagnostic);
+        test_step.dependOn(&reject.step);
+    }
+    const library = fixtures.add("library/std.nov", "@[extern]\nlet abs: (x: i32) -> i32\n@[extern(\"c_hidden\")]\nlet hidden: (x: i32) -> i32\n@[public]\n@[extern(\"abs\")]\nlet visible: (x: i32) -> i32\n");
+    for ([_][]const u8{ "file", "named" }) |kind| {
+        for ([_][]const u8{ "abs", "hidden", "visible" }) |member| {
+            const source = b.fmt("{s}-{s}.nov", .{ kind, member });
+            _ = fixtures.add(source, b.fmt("let api = @import(\"{s}\")\nlet main: () = @println(api.{s}(-42))\n", .{ if (std.mem.eql(u8, kind, "file")) "library/std.nov" else "std", member }));
+            const check = b.addRunArtifact(exe);
+            check.step.name = b.fmt("CLI extern: {s} import {s}", .{ kind, member });
+            check.setCwd(fixtures.getDirectory());
+            check.addArgs(&.{ "check", "--semantic", source, "--lib-dir" });
+            check.addDirectoryArg(library.dirname());
+            const visible = std.mem.eql(u8, member, "visible");
+            check.expectExitCode(if (visible) 0 else 1);
+            check.expectStdOutEqual("");
+            if (visible) check.expectStdErrEqual("") else check.expectStdErrMatch(b.fmt("{s}:2:", .{source}));
+            test_step.dependOn(&check.step);
+        }
+    }
+    const emit_library = b.addRunArtifact(exe);
+    emit_library.setCwd(fixtures.getDirectory());
+    emit_library.addArgs(&.{ "emit-c", "--library", "library.nov" });
+    emit_library.expectExitCode(0);
+    emit_library.expectStdErrEqual("");
+    const library_c = emit_library.captureStdOut(.{});
+    const inspect = b.addCheckFile(library_c, .{ .expected_matches = &.{ "void foreign_unit(void);", "_Noreturn void foreign_stop(void);" } });
+    inspect.setName("CLI extern: exact and decoded library prototypes");
+    test_step.dependOn(&inspect.step);
+    // Linking with a separate C main also proves --library emits no process main.
+    const client = fixtures.add("library-client.c", "int main(void) { return 0; }\n");
+    const compile_library = b.addSystemCommand(&.{ b.graph.zig_exe, "cc", "-x", "c", "-std=c11", "-Wall", "-Wextra", "-Wpedantic", "-Werror" });
+    compile_library.addFileArg(library_c);
+    compile_library.addFileArg(client);
+    compile_library.addArg("-o");
+    _ = compile_library.addOutputFileArg("extern-library");
+    test_step.dependOn(&compile_library.step);
+
+    const emit = b.addRunArtifact(exe);
+    emit.setCwd(fixtures.getDirectory());
+    emit.addArgs(&.{ "emit-c", "extern.nov" });
+    emit.expectExitCode(0);
+    emit.expectStdErrEqual("");
+    const c_source = emit.captureStdOut(.{});
+    if (builtin.os.tag != .windows) {
+        // Linker exit codes vary; the matching positive compile below checks the C itself.
+        const missing = b.addSystemCommand(&.{ "sh", "-c", "if \"$@\"; then exit 1; else exit 0; fi", "extern-missing-provider", b.graph.zig_exe, "cc", "-x", "c", "-std=c11", "-O0" });
+        missing.step.name = "CLI extern: missing provider fails to link";
+        missing.addFileArg(c_source);
+        missing.addArg("-o");
+        _ = missing.addOutputFileArg("missing-provider");
+        missing.expectExitCode(0);
+        missing.expectStdOutEqual("");
+        missing.expectStdErrMatch("c_max_i32");
+        test_step.dependOn(&missing.step);
+    }
+    for ([_][]const u8{ "-O0", "-O3" }) |optimization| {
+        const compile = b.addSystemCommand(&.{ b.graph.zig_exe, "cc", "-x", "c", "-std=c11", "-Wall", "-Wextra", "-Wpedantic", "-Werror", "-fsanitize=undefined", "-fno-sanitize-recover=all", optimization });
+        compile.addFileArg(c_source);
+        compile.addFileArg(b.path("examples/extern.c"));
+        compile.addArg("-o");
+        const binary = compile.addOutputFileArg(if (exe.root_module.resolved_target.?.result.os.tag == .windows) "extern.exe" else "extern");
+        const execute = std.Build.Step.Run.create(b, b.fmt("CLI extern: checked-in example {s}", .{optimization}));
+        execute.addFileArg(binary);
+        execute.expectExitCode(0);
+        execute.expectStdOutEqual("Abs: 42\nMaximum: 42\nEven: true\n");
+        execute.expectStdErrEqual("");
+        test_step.dependOn(&execute.step);
+    }
+    for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+        for ([_]bool{ false, true }) |build_program| {
+            const run = b.addRunArtifact(exe);
+            run.step.name = b.fmt("CLI extern: libc {s} {s}", .{ if (build_program) "build" else "run", mode });
+            run.setCwd(fixtures.getDirectory());
+            run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+            run.setEnvironmentVariable("NOV_CC", "");
+            run.setEnvironmentVariable("CC", "");
+            run.addArgs(&.{ if (build_program) "build" else "run", "libc.nov" });
+            if (mode.len != 0) run.addArg(mode);
+            run.expectExitCode(0);
+            run.expectStdErrEqual("");
+            if (build_program) {
+                run.addArg("-o");
+                const binary = run.addOutputFileArg(if (exe.root_module.resolved_target.?.result.os.tag == .windows) "libc.exe" else "libc");
+                run.expectStdOutEqual("");
+                const execute = std.Build.Step.Run.create(b, b.fmt("CLI extern: execute libc build {s}", .{mode}));
+                execute.addFileArg(binary);
+                execute.expectExitCode(0);
+                execute.expectStdOutEqual("42\n");
+                execute.expectStdErrEqual("");
+                test_step.dependOn(&execute.step);
+            } else {
+                run.expectStdOutEqual("42\n");
+                test_step.dependOn(&run.step);
+            }
+        }
     }
 }
 

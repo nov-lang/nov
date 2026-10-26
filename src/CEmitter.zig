@@ -27,6 +27,7 @@ pub const Error = Ir.VerifyError || std.mem.Allocator.Error || error{
     MissingEntrypoint,
     InvalidEntrypoint,
     ExportSymbolCollision,
+    ExternSymbolCollision,
 };
 
 /// Describes the first construct the backend rejected. `span` indexes the source
@@ -40,14 +41,18 @@ pub const Diagnostic = struct {
         integer_width_unsupported,
         entrypoint_missing,
         entrypoint_signature,
+        entrypoint_external,
         export_symbol_collision,
+        extern_symbol_collision,
 
         pub fn message(reason: Reason) []const u8 {
             return switch (reason) {
                 .integer_width_unsupported => "C backend only supports 8, 16, 32 and 64-bit integers",
                 .entrypoint_missing => "program requires a root function 'main' with type () -> void",
                 .entrypoint_signature => "program entrypoint 'main' must have type () -> void",
+                .entrypoint_external => "program entrypoint 'main' must have a Nov body, not an extern declaration",
                 .export_symbol_collision => "export symbol conflicts with a generated function name; choose another export name",
+                .extern_symbol_collision => "extern symbol conflicts with a generated function name; choose another extern name",
             };
         }
     };
@@ -98,6 +103,8 @@ pub fn emitProgramRoot(allocator: std.mem.Allocator, ir: *const Ir, entry: ?Ir.F
         return error.MissingEntrypoint;
     };
     const function = ir.getFunction(id) orelse return error.InvalidFunctionId;
+    if (function.extern_name != null)
+        return fail(diagnostic, .entrypoint_external, .{ .function = id, .span = function.span });
     const signature = ir.types.items[@backingInt(function.ty)].function;
     if (signature.params.len != 0 or ir.types.items[@backingInt(signature.result)] != .void)
         return fail(diagnostic, .entrypoint_signature, .{ .function = id, .span = function.span });
@@ -116,8 +123,9 @@ fn fail(diagnostic: ?*Diagnostic, reason: Diagnostic.Reason, origin: Origin) Err
     return switch (reason) {
         .integer_width_unsupported => error.UnsupportedIntegerWidth,
         .entrypoint_missing => error.MissingEntrypoint,
-        .entrypoint_signature => error.InvalidEntrypoint,
+        .entrypoint_signature, .entrypoint_external => error.InvalidEntrypoint,
         .export_symbol_collision => error.ExportSymbolCollision,
+        .extern_symbol_collision => error.ExternSymbolCollision,
     };
 }
 
@@ -154,17 +162,18 @@ fn analyze(allocator: std.mem.Allocator, ir: *const Ir, origins: []?Origin, diag
     @memset(visited, false);
     for (ir.functions.items, 0..) |function, f| {
         const id: Ir.FunctionId = @fromBackingInt(@intCast(f));
-        if (function.export_name) |symbol| {
+        if (function.export_name orelse function.extern_name) |symbol| {
             for (ir.functions.items) |other| {
-                if (other.export_name != null) continue;
+                if (other.export_name != null or other.extern_name != null) continue;
                 var generated = std.Io.Writer.Allocating.init(allocator);
                 defer generated.deinit();
                 writeScopedFunctionName(&generated.writer, other) catch return error.OutOfMemory;
-                if (std.mem.eql(u8, symbol, generated.written())) return fail(diagnostic, .export_symbol_collision, .{ .function = id, .span = function.span });
+                if (std.mem.eql(u8, symbol, generated.written())) return fail(diagnostic, if (function.extern_name != null) .extern_symbol_collision else .export_symbol_collision, .{ .function = id, .span = function.span });
             }
         }
         mark(origins, function.ty, .{ .function = id, .span = function.span });
-        for (function.body.?.instructions) |instruction| {
+        const body = function.body orelse continue;
+        for (body.instructions) |instruction| {
             const origin: Origin = .{ .function = id, .span = instruction.span };
             mark(origins, instruction.ty, origin);
         }
@@ -312,6 +321,7 @@ fn write(allocator: std.mem.Allocator, ir: *const Ir, origins: []const ?Origin, 
         try w.writeAll(";\n");
     }
     for (ir.functions.items) |function| {
+        if (function.body == null) continue;
         try w.writeByte('\n');
         try writeSignature(ir, w, function);
         try w.writeAll(" {\n");
@@ -322,7 +332,8 @@ fn write(allocator: std.mem.Allocator, ir: *const Ir, origins: []const ?Origin, 
 
 fn usesElementLayout(ir: *const Ir, element: Ir.TypeId) bool {
     for (ir.functions.items) |function| {
-        for (function.body.?.instructions) |instruction| switch (instruction.op) {
+        const body = function.body orelse continue;
+        for (body.instructions) |instruction| switch (instruction.op) {
             .array_literal, .array_clone, .array_set, .array_append => if (ir.getType(instruction.ty).?.array == element) return true,
             else => {},
         };
@@ -391,9 +402,10 @@ fn writeRoots(ir: *const Ir, root_counts: []const usize, w: *std.Io.Writer, id: 
 }
 
 fn needsRootFrame(ir: *const Ir, function: Ir.Function) bool {
+    const body = function.body orelse return false;
     const signature = ir.getType(function.ty).?.function;
     for (signature.params) |param| if (Ir.isManaged(ir.getType(param).?)) return true;
-    for (function.body.?.instructions) |instruction| if (Ir.isManaged(ir.getType(instruction.ty).?)) return true;
+    for (body.instructions) |instruction| if (Ir.isManaged(ir.getType(instruction.ty).?)) return true;
     return Ir.isManaged(ir.getType(signature.result).?);
 }
 
@@ -407,7 +419,7 @@ fn usesStringEquality(ir: *const Ir) bool {
         if (ty == .string and usesArrayContains(ir, @fromBackingInt(@intCast(t)))) return true;
     }
     for (ir.functions.items) |function| {
-        const body = function.body.?;
+        const body = function.body orelse continue;
         for (body.instructions) |instruction| {
             if (instruction.op != .binary) continue;
             const binary = instruction.op.binary;
@@ -422,7 +434,7 @@ fn writeStringConversions(ir: *const Ir, w: *std.Io.Writer) WriteError!void {
         if (ty != .integer) continue;
         var used = false;
         for (ir.functions.items) |function| {
-            const body = function.body.?;
+            const body = function.body orelse continue;
             for (body.instructions) |instruction| {
                 if (instruction.op == .to_string and @backingInt(body.instructions[@backingInt(instruction.op.to_string)].ty) == t) used = true;
             }
@@ -438,9 +450,10 @@ fn writeStringConversions(ir: *const Ir, w: *std.Io.Writer) WriteError!void {
 
 fn usesStringConcat(ir: *const Ir) bool {
     for (ir.functions.items) |function| {
-        for (function.body.?.instructions) |instruction| {
+        const body = function.body orelse continue;
+        for (body.instructions) |instruction| {
             if (instruction.op == .binary and ir.getType(instruction.ty).? == .string) return true;
-            if (instruction.op == .to_string and ir.getType(function.body.?.instructions[@backingInt(instruction.op.to_string)].ty).? == .integer) return true;
+            if (instruction.op == .to_string and ir.getType(body.instructions[@backingInt(instruction.op.to_string)].ty).? == .integer) return true;
         }
     }
     return false;
@@ -448,7 +461,8 @@ fn usesStringConcat(ir: *const Ir) bool {
 
 fn usesPrinting(ir: *const Ir) bool {
     for (ir.functions.items) |function| {
-        for (function.body.?.instructions) |instruction| {
+        const body = function.body orelse continue;
+        for (body.instructions) |instruction| {
             if (instruction.op == .print) return true;
         }
     }
@@ -460,7 +474,8 @@ fn writeRuntime(ir: *const Ir, w: *std.Io.Writer) WriteError!void {
     var panic_used = printing or usesManagedRuntime(ir);
     var source_panic = false;
     for (ir.functions.items) |function| {
-        for (function.body.?.instructions) |instruction| {
+        const body = function.body orelse continue;
+        for (body.instructions) |instruction| {
             if (instruction.op == .binary and (instruction.op.binary.op == .div or instruction.op.binary.op == .mod)) panic_used = true;
             if (instruction.op == .panic) source_panic = true;
         }
@@ -500,7 +515,8 @@ fn writeArithmeticRuntime(ir: *const Ir, w: *std.Io.Writer) WriteError!void {
         for ([_]Ir.BinaryOp{ .div, .mod }) |op| {
             var used = false;
             for (ir.functions.items) |function| {
-                for (function.body.?.instructions) |instruction| {
+                const body = function.body orelse continue;
+                for (body.instructions) |instruction| {
                     if (@backingInt(instruction.ty) == t and instruction.op == .binary and instruction.op.binary.op == op) used = true;
                 }
             }
@@ -573,11 +589,16 @@ fn writeSignature(ir: *const Ir, w: *std.Io.Writer, function: Ir.Function) Write
 /// Nov names can neither collide with each other nor with C keywords, libc or
 /// the generated `nov_fn_N` typedefs.
 fn sameFunction(a: Ir.Function, b: Ir.Function) bool {
+    // Verified extern/export aliases can denote one C function under distinct
+    // Nov names, including recursive calls through a bodyless declaration.
+    if (a.extern_name orelse a.export_name) |a_symbol| {
+        if (b.extern_name orelse b.export_name) |b_symbol| return std.mem.eql(u8, a_symbol, b_symbol);
+    }
     return a.span.source == b.span.source and std.mem.eql(u8, a.name, b.name);
 }
 
 fn writeScopedFunctionName(w: *std.Io.Writer, function: Ir.Function) WriteError!void {
-    if (function.export_name) |symbol| return w.writeAll(symbol);
+    if (function.extern_name orelse function.export_name) |symbol| return w.writeAll(symbol);
     // The single underscore separator cannot occur inside an encoded Nov name.
     if (@backingInt(function.span.source) != 0) try w.print("nov_M{d}_", .{@backingInt(function.span.source)});
     try writeFunctionName(w, function.name);
@@ -620,7 +641,7 @@ fn writeConstant(w: *std.Io.Writer, constant: Ir.Constant, ty: Ir.Type) WriteErr
 
 fn usesArrayContains(ir: *const Ir, element: Ir.TypeId) bool {
     for (ir.functions.items) |function| {
-        const body = function.body.?;
+        const body = function.body orelse continue;
         for (body.instructions) |instruction| {
             if (instruction.op == .array_contains and body.instructions[@backingInt(instruction.op.array_contains.value)].ty == element) return true;
         }
@@ -6310,6 +6331,222 @@ fn compileAndRunMode(c_source: []const u8, harness: []const u8, exit_code: u8, s
     try std.testing.expectEqual(std.process.Child.Term{ .exited = exit_code }, ran.term);
     try std.testing.expectEqualStrings(stdout, ran.stdout);
     try std.testing.expectEqualStrings(stderr, ran.stderr);
+}
+
+fn externTestProgram(source: []const u8) ![]u8 {
+    const terminated = try test_gpa.dupeSentinel(u8, source, 0);
+    defer test_gpa.free(terminated);
+    const formatted = try Formatter.format(test_gpa, terminated);
+    defer test_gpa.free(formatted);
+    const original = try emitSource(source, null);
+    defer test_gpa.free(original);
+    const library = try emitSource(formatted, null);
+    defer test_gpa.free(library);
+    try std.testing.expectEqualStrings(original, library);
+    var module = try Module.init(test_gpa, "extern.nov", formatted);
+    defer module.deinit();
+    var result = try Lowering.lower(&module);
+    defer result.deinit();
+    try std.testing.expect(!module.hasErrors());
+    return emitProgram(test_gpa, &result.ir, null);
+}
+
+const extern_program =
+    \\@[extern("foreign_add")]
+    \\let add: (x: i32, y: i32) -> i32
+    \\@[extern("foreign_add")]
+    \\let alias: (x: i32, y: i32) -> i32
+    \\@[extern]
+    \\let foreign_unit: ()
+    \\@[extern]
+    \\let abs: (x: i32) -> i32
+    \\@[extern]
+    \\let putchar: (x: i32) -> i32
+    \\let callee: () -> (i32, i32) -> i32 = {@print("C")
+    \\    add}
+    \\let arg: (label: string, n: i32) -> i32 = {@print(label)
+    \\    n}
+    \\let main: () = {
+    \\    foreign_unit()
+    \\    let f: (i32, i32) -> i32 = add
+    \\    @println(callee()(arg("L", 20), arg("R", 22)))
+    \\    @println(f(1, 2), alias(3, 4), abs(-9))
+    \\    if putchar(65) != 65 { @panic("putchar letter failed") }
+    \\    if putchar(10) != 10 { @panic("putchar newline failed") }
+    \\}
+;
+
+const extern_provider =
+    \\#include <stdint.h>
+    \\#include <stdio.h>
+    \\int32_t foreign_add(int32_t x, int32_t y) { return x + y; }
+    \\void foreign_unit(void) { (void)putchar('U'); }
+;
+
+test "extern raw symbols libc function values aliases and ordered callee arguments link separate TU" {
+    const c = try externTestProgram(extern_program);
+    defer test_gpa.free(c);
+    try std.testing.expect(std.mem.indexOf(u8, c, "int32_t foreign_add(int32_t p0, int32_t p1);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, c, "void foreign_unit(void);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, c, "nov_add") == null);
+    try std.testing.expect(std.mem.indexOf(u8, c, "foreign_add(int32_t p0, int32_t p1) {") == null);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, extern_provider, 0, "UCLR42\n3 7 9\nA\n", "", mode);
+}
+
+test "extern custom scalar providers preserve every supported ABI width" {
+    var source = std.Io.Writer.Allocating.init(test_gpa);
+    defer source.deinit();
+    var provider = std.Io.Writer.Allocating.init(test_gpa);
+    defer provider.deinit();
+    try provider.writer.writeAll("#include <stdint.h>\n#include <stdbool.h>\n");
+    const types = [_][]const u8{ "bool", "i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "int", "uint" };
+    const c_types = [_][]const u8{ "bool", "int8_t", "uint8_t", "int16_t", "uint16_t", "int32_t", "uint32_t", "int64_t", "uint64_t", "intptr_t", "uintptr_t" };
+    const values = [_][]const u8{ "true", "-128", "255", "-32768", "65535", "-2147483648", "4294967295", "-9223372036854775808", "18446744073709551615", "-7", "9" };
+    for (types, c_types) |ty, c_ty| {
+        try source.writer.print("@[extern(\"provider_{s}\")]\nlet identity_{s}: (x: {s}) -> {s}\n", .{ ty, ty, ty, ty });
+        try provider.writer.print("{s} provider_{s}({s} x) {{ return x; }}\n", .{ c_ty, ty, c_ty });
+    }
+    try source.writer.writeAll("let main: () = {\n");
+    for (types, values) |ty, value| try source.writer.print("if identity_{s}({s}) != {s} {{ @panic(\"ABI mismatch\") }}\n", .{ ty, value, value });
+    try source.writer.writeAll("}\n");
+    const c = try externTestProgram(source.written());
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, provider.written(), 0, "", "", mode);
+}
+
+test "extern noreturn prototype terminates before later argument effects" {
+    const source =
+        \\@[extern("foreign_stop")]
+        \\@[noreturn]
+        \\let stop: ()
+        \\let consume: (x: i32, y: i32) = {}
+        \\let main: () = { @print("before")
+        \\    consume({stop()}, {@print("BAD")
+        \\        1}) }
+    ;
+    const c = try externTestProgram(source);
+    defer test_gpa.free(c);
+    try std.testing.expect(std.mem.indexOf(u8, c, "_Noreturn void foreign_stop(void);") != null);
+    const provider = "#include <stdlib.h>\n_Noreturn void foreign_stop(void) { exit(7); }\n";
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, provider, 7, "before", "", mode);
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{source});
+}
+
+test "extern matching export aliases share one definition" {
+    const c = try externTestProgram(
+        \\@[extern("shared")]
+        \\let external: (x: i32) -> i32
+        \\@[export("shared")]
+        \\let definition: (x: i32) -> i32 = x
+        \\let main: () = @println(external(42))
+    );
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "42\n", "", mode);
+}
+
+test "extern noreturn export alias recursion compiles without being called" {
+    const c = try emitSource(
+        \\@[extern("foreign_spin")]
+        \\@[noreturn]
+        \\let recur: ()
+        \\@[export("foreign_spin")]
+        \\@[noreturn]
+        \\let spin: () = recur()
+    , null);
+    defer test_gpa.free(c);
+    const harness = "int main(void) { return 0; }";
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, harness, 0, "", "", mode);
+}
+
+test "extern ordinary export alias recursion through function values terminates" {
+    const c = try emitSource(
+        \\@[extern("foreign_countdown")]
+        \\let recur: (n: i32) -> i32
+        \\@[export("foreign_countdown")]
+        \\let countdown: (n: i32) -> i32 = {
+        \\    let f: (i32) -> i32 = recur
+        \\    if n == 0 { 42 } else { f(n - 1) }
+        \\}
+    , null);
+    defer test_gpa.free(c);
+    const harness =
+        \\#include <stdint.h>
+        \\int32_t foreign_countdown(int32_t);
+        \\int main(void) { return foreign_countdown(4) != 42; }
+    ;
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, harness, 0, "", "", mode);
+}
+
+test "extern unused declarations need no link provider or runtime" {
+    const c = try emitSource("@[extern]\nlet absent_provider: (x: i32) -> i32\n@[extern]\n@[noreturn]\nlet absent_stop: ()", null);
+    defer test_gpa.free(c);
+    try std.testing.expect(std.mem.indexOf(u8, c, "int32_t absent_provider(int32_t p0);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, c, "_Noreturn void absent_stop(void);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, c, "nov_rt_") == null);
+    try std.testing.expect(std.mem.indexOf(u8, c, "nov_gc_") == null);
+    try std.testing.expect(std.mem.indexOf(u8, c, " {\n") == null);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "int main(void) { return 0; }", 0, "", "", mode);
+}
+
+fn testExternSourceFree(allocator: std.mem.Allocator) !void {
+    var result = blk: {
+        const source = try allocator.dupe(u8, extern_program);
+        defer allocator.free(source);
+        var module = try Module.init(allocator, "extern.nov", source);
+        defer module.deinit();
+        var lowered = try Lowering.lower(&module);
+        errdefer lowered.deinit();
+        try std.testing.expect(!module.hasErrors());
+        break :blk lowered;
+    };
+    defer result.deinit();
+    try result.ir.verify();
+    const c = try emitProgram(allocator, &result.ir, null);
+    defer allocator.free(c);
+    try std.testing.expect(std.mem.indexOf(u8, c, "int32_t foreign_add(") != null);
+}
+
+test "extern source free ownership and every compiler allocation failure" {
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testExternSourceFree, .{});
+}
+
+test "extern generated collision diagnostics and allocation cleanup" {
+    const source = "let helper: () = {}\n@[extern(\"nov_helper\")]\nlet foreign: ()";
+    var diagnostic: Diagnostic = undefined;
+    try std.testing.expectError(error.ExternSymbolCollision, emitSource(source, &diagnostic));
+    try std.testing.expectEqual(Diagnostic.Reason.extern_symbol_collision, diagnostic.reason);
+    try std.testing.expectEqualStrings("foreign", source[diagnostic.span.start..diagnostic.span.end]);
+    try TestAllocations.checkAllAllocationFailures(test_gpa, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var module = try Module.init(allocator, "collision.nov", source);
+            defer module.deinit();
+            var result = try Lowering.lower(&module);
+            defer result.deinit();
+            try std.testing.expect(!module.hasErrors());
+            const c = emit(allocator, &result.ir, null) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                try std.testing.expectEqual(error.ExternSymbolCollision, err);
+                return;
+            };
+            defer allocator.free(c);
+            return error.TestUnexpectedResult;
+        }
+    }.run, .{});
+}
+
+test "extern root main is invalid as a program but emits a library prototype" {
+    var module = try Module.init(test_gpa, "entry.nov", "@[extern(\"foreign_main\")]\nlet main: ()");
+    defer module.deinit();
+    var result = try Lowering.lower(&module);
+    defer result.deinit();
+    try std.testing.expect(!module.hasErrors());
+    var diagnostic: Diagnostic = undefined;
+    try std.testing.expectError(error.InvalidEntrypoint, emitProgram(test_gpa, &result.ir, &diagnostic));
+    try std.testing.expectEqual(Diagnostic.Reason.entrypoint_external, diagnostic.reason);
+    const c = try emit(test_gpa, &result.ir, null);
+    defer test_gpa.free(c);
+    try std.testing.expect(std.mem.indexOf(u8, c, "void foreign_main(void);") != null);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "int main(void) { return 0; }", 0, "", "", mode);
 }
 
 test "export exact default and custom names link from a separate C translation unit" {

@@ -21,10 +21,9 @@ fn floatingName(name: []const u8, functions: []const u8) bool {
     return false;
 }
 
-/// Portable external C11 names, excluding all standard-library external names,
-/// future library reservations and backend namespaces, regardless of headers used.
-/// Exact collisions with generated private symbols are checked by the backend.
-pub fn validName(name: []const u8) bool {
+/// Declaration names may refer to C library functions; definitions may not.
+/// Both forms must avoid C tokens/types/macros and generated-code collisions.
+pub fn validExternName(name: []const u8) bool {
     if (name.len == 0 or !std.ascii.isAlphabetic(name[0])) return false;
     for (name[1..]) |c| if (!std.ascii.isAlphanumeric(c) and c != '_') return false;
     // Function references also appear in scopes containing generated parameters
@@ -42,7 +41,7 @@ pub fn validName(name: []const u8) bool {
     }
     // Integer limits, constructors and format macros from stdint/inttypes.
     // Do not reserve unrelated user names such as INTERFACE or PRIVATE.
-    inline for (.{ "8", "16", "32", "64", "MAX", "PTR", "LEAST8", "LEAST16", "LEAST32", "LEAST64", "FAST8", "FAST16", "FAST32", "FAST64" }) |width| {
+    inline for (.{ "8", "16", "32", "64", "MAX", "PTR", "_LEAST8", "_LEAST16", "_LEAST32", "_LEAST64", "_FAST8", "_FAST16", "_FAST32", "_FAST64" }) |width| {
         inline for (.{ "INT", "UINT" }) |prefix| {
             inline for (.{ "_MIN", "_MAX", "_C" }) |suffix| {
                 if (std.mem.eql(u8, name, prefix ++ width ++ suffix)) return false;
@@ -55,6 +54,22 @@ pub fn validName(name: []const u8) bool {
         }
     }
     if ((std.mem.startsWith(u8, name, "int") or std.mem.startsWith(u8, name, "uint")) and std.mem.endsWith(u8, name, "_t")) return false;
+    const reserved =
+        "nov_frame nov_roots nov_target main auto break case char const continue default do double else enum extern float for goto if inline int long register restrict return short signed sizeof static struct switch typedef union unsigned void volatile while " ++
+        "alignas alignof bool true false static_assert thread_local " ++
+        "CHAR_BIT SCHAR_MIN SCHAR_MAX UCHAR_MAX CHAR_MIN CHAR_MAX MB_LEN_MAX SHRT_MIN SHRT_MAX USHRT_MAX INT_MIN INT_MAX UINT_MAX LONG_MIN LONG_MAX ULONG_MAX LLONG_MIN LLONG_MAX ULLONG_MAX " ++
+        "SIZE_MAX PTRDIFF_MIN PTRDIFF_MAX SIG_ATOMIC_MIN SIG_ATOMIC_MAX WCHAR_MIN WCHAR_MAX WINT_MIN WINT_MAX " ++
+        "NULL size_t ptrdiff_t wchar_t max_align_t va_list offsetof FILE fpos_t EOF BUFSIZ FOPEN_MAX FILENAME_MAX L_tmpnam SEEK_CUR SEEK_END SEEK_SET TMP_MAX stderr stdin stdout " ++
+        "EXIT_FAILURE EXIT_SUCCESS RAND_MAX MB_CUR_MAX div_t ldiv_t lldiv_t imaxdiv_t";
+    var names = std.mem.tokenizeScalar(u8, reserved, ' ');
+    while (names.next()) |word| if (std.mem.eql(u8, word, name)) return false;
+    return true;
+}
+
+/// Portable C11 definitions additionally avoid all standard-library external names
+/// and future library reservations, regardless of which headers are emitted.
+pub fn validName(name: []const u8) bool {
+    if (!validExternName(name)) return false;
     if (floatingName(name, math_functions) or floatingName(name, complex_functions)) return false;
     for ([_][]const u8{ "atomic_", "cnd_", "mtx_", "thrd_", "tss_" }) |prefix| {
         if (std.mem.startsWith(u8, name, prefix)) return false;
@@ -95,6 +110,27 @@ pub fn validName(name: []const u8) bool {
     var names = std.mem.tokenizeScalar(u8, reserved, ' ');
     while (names.next()) |word| if (std.mem.eql(u8, word, name)) return false;
     return true;
+}
+
+test "foreign names reject integer least and fast limit macros in every width" {
+    inline for (.{ "INT", "UINT" }) |prefix| {
+        inline for (.{ "_LEAST", "_FAST" }) |family| {
+            inline for (.{ "8", "16", "32", "64" }) |width| {
+                inline for (.{ "_MIN", "_MAX" }) |suffix| {
+                    const name = prefix ++ family ++ width ++ suffix;
+                    try std.testing.expect(!validExternName(name));
+                    try std.testing.expect(!validName(name));
+                }
+            }
+        }
+    }
+}
+
+test "extern names permit library functions but reject C tokens and generated locals" {
+    for ([_][]const u8{ "abs", "putchar", "rand", "exit", "sin", "nov_add", "custom_func", "memcustom" }) |name| try std.testing.expect(validExternName(name));
+    for ([_][]const u8{ "", "_private", "9bad", "a-b", "a\x00b", "é", "main", "while", "bool", "true", "FILE", "EOF", "size_t", "int32_t", "UINT64_MAX", "PRId32", "nov_rt_x", "nov_gc_x", "nov_fn_x", "p0", "v123", "nov_roots", "nov_frame", "nov_target" }) |name| {
+        try std.testing.expect(!validExternName(name));
+    }
 }
 
 test "export names reject C11 math complex and future functions in every precision" {

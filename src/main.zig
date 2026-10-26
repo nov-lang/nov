@@ -7,6 +7,7 @@ const TypeAliases = @import("TypeAliases.zig");
 const Enums = @import("Enums.zig");
 const Visibility = @import("Visibility.zig");
 const Exports = @import("Exports.zig");
+const Externs = @import("Externs.zig");
 const Sema = @import("Sema.zig");
 const Literal = @import("Literal.zig");
 const BodyChecker = @import("BodyChecker.zig");
@@ -434,7 +435,7 @@ fn emitCompilationMode(allocator: std.mem.Allocator, compilation: *Compilation, 
         .program => CEmitter.emitProgramRoot(allocator, &result.ir, entry, missing_span, &diagnostic),
         .library => CEmitter.emit(allocator, &result.ir, &diagnostic),
     }) catch |err| switch (err) {
-        error.UnsupportedIntegerWidth, error.MissingEntrypoint, error.InvalidEntrypoint, error.ExportSymbolCollision => {
+        error.UnsupportedIntegerWidth, error.MissingEntrypoint, error.InvalidEntrypoint, error.ExportSymbolCollision, error.ExternSymbolCollision => {
             if (err == error.MissingEntrypoint and compilation.root_main != null) diagnostic.reason = .entrypoint_signature;
             try Diagnostics.renderCompilationBackend(compilation, diagnostic, stderr);
             return false;
@@ -458,7 +459,7 @@ fn emitSource(allocator: std.mem.Allocator, path: []const u8, source: [:0]const 
             if (!module.hasErrors()) {
                 var diagnostic: CEmitter.Diagnostic = undefined;
                 const c_source = CEmitter.emitProgram(allocator, &result.ir, &diagnostic) catch |err| switch (err) {
-                    error.UnsupportedIntegerWidth, error.MissingEntrypoint, error.InvalidEntrypoint, error.ExportSymbolCollision => {
+                    error.UnsupportedIntegerWidth, error.MissingEntrypoint, error.InvalidEntrypoint, error.ExportSymbolCollision, error.ExternSymbolCollision => {
                         if (err == error.MissingEntrypoint) {
                             if (module.lookup("main")) |id| {
                                 const declaration = module.getDeclaration(id).?;
@@ -560,6 +561,37 @@ test "library emission omits process main and buffers export diagnostics" {
     }
 }
 
+test "extern library prototypes and compilation entrypoint backend diagnostics" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cases = [_]struct { source: []const u8, mode: EmitMode, message: ?[]const u8 = null }{
+        .{ .source = "@[extern(\"foreign_main\")]\nlet main: ()", .mode = .library },
+        .{ .source = "@[extern(\"foreign_main\")]\nlet main: ()", .mode = .program, .message = "must have a Nov body, not an extern declaration" },
+        .{ .source = "let helper: () = {}\n@[extern(\"nov_helper\")]\nlet foreign: ()\nlet main: () = {}", .mode = .library, .message = "extern symbol conflicts with a generated function name" },
+    };
+    for (cases) |case| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "extern.nov", .data = case.source });
+        const path = try tmp.dir.realPathFileAlloc(io, "extern.nov", allocator);
+        defer allocator.free(path);
+        var diagnostics = std.Io.Writer.Allocating.init(allocator);
+        defer diagnostics.deinit();
+        var output = std.Io.Writer.Allocating.init(allocator);
+        defer output.deinit();
+        try std.testing.expectEqual(case.message == null, try emitFileMode(io, allocator, path, null, case.mode, &diagnostics.writer, &output.writer));
+        if (case.message) |message| {
+            try std.testing.expectEqualStrings("", output.written());
+            try std.testing.expect(std.mem.indexOf(u8, diagnostics.written(), message) != null);
+            try std.testing.expect(std.mem.indexOf(u8, diagnostics.written(), "extern.nov:") != null);
+        } else {
+            try std.testing.expectEqualStrings("", diagnostics.written());
+            try std.testing.expect(std.mem.indexOf(u8, output.written(), "void foreign_main(void);") != null);
+            try std.testing.expect(std.mem.indexOf(u8, output.written(), "int main(") == null);
+        }
+    }
+}
+
 test "emit-c buffers source and renders frontend entrypoint and backend failures" {
     const allocator = std.testing.allocator;
     const cases = [_]struct { source: [:0]const u8, message: ?[]const u8 = null }{
@@ -569,6 +601,8 @@ test "emit-c buffers source and renders frontend entrypoint and backend failures
         .{ .source = "let main: () -> bool = true", .message = "must have type () -> void" },
         .{ .source = "let main: (x: bool) -> void = {}", .message = "must have type () -> void" },
         .{ .source = "let helper: () = {}\n@[export]\nlet nov_helper: () = {}\nlet main: () = {}", .message = "export symbol conflicts with a generated function name" },
+        .{ .source = "@[extern(\"foreign_main\")]\nlet main: ()", .message = "must have a Nov body, not an extern declaration" },
+        .{ .source = "let helper: () = {}\n@[extern(\"nov_helper\")]\nlet foreign: ()\nlet main: () = {}", .message = "extern symbol conflicts with a generated function name" },
         .{ .source = "let broken =", .message = "expected" },
         .{ .source = "let main: () -> void = absent()", .message = "unknown name" },
         .{ .source = "let main: () -> void = {}\r\n\tlet wide: (x: i128) -> i128 = x", .message = "C backend only supports" },
@@ -1058,6 +1092,7 @@ test {
     _ = Enums;
     _ = Visibility;
     _ = Exports;
+    _ = Externs;
     _ = Sema;
     _ = Literal;
     _ = BodyChecker;

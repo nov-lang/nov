@@ -20,7 +20,7 @@ compilation: ?*Compilation = null,
 /// Entry-point/backend/runtime configuration is still a separate obligation.
 lowering_complete: bool = false,
 
-pub const Status = enum { deferred, generic, unrequested, requested, namespace, type_alias, signature_only, constant_checked, body_checked, lowered, failed };
+pub const Status = enum { deferred, generic, unrequested, requested, namespace, type_alias, signature_only, external, constant_checked, body_checked, lowered, failed };
 pub const Entry = struct {
     type_id: ?Ir.TypeId = null,
     /// Represented type, never the runtime type of this declaration.
@@ -50,7 +50,7 @@ pub fn analyzeAnnotations(module: *Module) Error!Sema {
     result.ir.source_len = @intCast(module.source.ast.source.len);
     try result.analyzeModuleAnnotations(module);
     try result.finalizeRecordLayouts(module);
-    var exports: std.StringHashMapUnmanaged(Module.Span) = .empty;
+    var exports: std.StringHashMapUnmanaged(ForeignSymbol) = .empty;
     defer exports.deinit(result.allocator);
     try result.validateExports(module, &exports);
     return result;
@@ -126,7 +126,7 @@ fn analyzeModuleAnnotations(result: *Sema, module: *Module) Error!void {
                 result.entries[result.entryIndex(module, @fromBackingInt(@intCast(i)))].status = .failed;
                 continue;
             }
-            result.entries[result.entryIndex(module, @fromBackingInt(@intCast(i)))].status = .signature_only;
+            result.entries[result.entryIndex(module, @fromBackingInt(@intCast(i)))].status = if (declaration.extern_name != null) .external else .signature_only;
         } else if (full.ast.init_node != 0) {
             const annotation = module.tokenSpan(module.source.ast.firstToken(full.ast.type_node));
             if (!full.ast.is_mutable and module.source.ast.fullCall(full.ast.init_node) != null) {
@@ -194,13 +194,16 @@ fn exportScalar(ty: Ir.Type, result: bool) bool {
     };
 }
 
-fn validateExports(self: *Sema, module: *Module, names: *std.StringHashMapUnmanaged(Module.Span)) Error!void {
+const ForeignSymbol = struct {
+    span: Module.Span,
+    type_id: Ir.TypeId,
+    noreturn: bool,
+    export_span: ?Module.Span,
+};
+
+fn validateExports(self: *Sema, module: *Module, names: *std.StringHashMapUnmanaged(ForeignSymbol)) Error!void {
     for (module.declarations.items, 0..) |declaration, i| {
-        const name = declaration.export_name orelse continue;
-        const binding = try names.getOrPut(self.allocator, name);
-        if (binding.found_existing) {
-            try module.diagnostics.append(module.allocator, .{ .tag = .duplicate_export_name, .span = declaration.name_span, .related = binding.value_ptr.* });
-        } else binding.value_ptr.* = declaration.name_span;
+        const name = declaration.extern_name orelse declaration.export_name orelse continue;
         const entry = &self.entries[self.entryIndex(module, @fromBackingInt(@intCast(i)))];
         const ty = self.ir.getType(entry.type_id orelse continue).?;
         var valid = ty == .function;
@@ -211,9 +214,29 @@ fn validateExports(self: *Sema, module: *Module, names: *std.StringHashMapUnmana
             }
         }
         if (!valid) {
-            try module.diagnostics.append(module.allocator, .{ .tag = .invalid_export_signature, .span = declaration.name_span });
+            try module.diagnostics.append(module.allocator, .{ .tag = if (declaration.extern_name != null) .invalid_extern_signature else .invalid_export_signature, .span = declaration.name_span });
             entry.status = .failed;
+            continue;
         }
+        if (entry.status == .failed) continue;
+        const binding = try names.getOrPut(self.allocator, name);
+        if (binding.found_existing) {
+            const previous = binding.value_ptr;
+            if (declaration.export_name != null) {
+                if (previous.export_span) |span| {
+                    try module.diagnostics.append(module.allocator, .{ .tag = .duplicate_export_name, .span = declaration.name_span, .related = span });
+                } else previous.export_span = declaration.name_span;
+            }
+            if (previous.type_id != entry.type_id.? or previous.noreturn != entry.noreturn) {
+                try module.diagnostics.append(module.allocator, .{ .tag = .conflicting_foreign_signature, .span = declaration.name_span, .related = previous.span });
+                entry.status = .failed;
+            }
+        } else binding.value_ptr.* = .{
+            .span = declaration.name_span,
+            .type_id = entry.type_id.?,
+            .noreturn = entry.noreturn,
+            .export_span = if (declaration.export_name != null) declaration.name_span else null,
+        };
     }
 }
 
@@ -323,7 +346,7 @@ pub fn analyzeCompilation(comp: *Compilation) Error!Sema {
     if (comp.hasErrors()) return result;
     for (comp.modules.items) |module| try result.analyzeModuleAnnotations(module);
     try result.finalizeRecordLayouts(comp.modules.items[0]);
-    var exports: std.StringHashMapUnmanaged(Module.Span) = .empty;
+    var exports: std.StringHashMapUnmanaged(ForeignSymbol) = .empty;
     defer exports.deinit(result.allocator);
     for (comp.modules.items) |module| try result.validateExports(module, &exports);
     if (comp.hasErrors()) return result;
@@ -1054,5 +1077,77 @@ test "annotation analysis owns its storage and rolls back diagnostics on allocat
         "let f: (x: void, x: i32) -> bool = true",
     }) |source| {
         try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+    }
+}
+
+test "extern ABI accepts scalar aliases and leaves bodyless signatures external" {
+    for ([_][]const u8{ "bool", "i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "int", "uint" }) |ty| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let Alias = {s}\n@[extern]\nlet foreign: (x: Alias) -> Alias\n@[noreturn]\n@[extern]\nlet stop: ()", .{ty});
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "extern-abi.nov", source);
+        defer module.deinit();
+        var sema = try analyzeFunctions(&module);
+        defer sema.deinit();
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expectEqual(Status.external, sema.getEntry(module.lookup("foreign").?).?.status);
+        try std.testing.expectEqual(Status.external, sema.getEntry(module.lookup("stop").?).?.status);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+    }
+    for ([_][]const u8{ "i128", "u128", "string", "[]i32", "() -> i32", "R", "E" }) |ty| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let R = struct {{ x: i32, }}\nlet E = enum {{ a, }}\n@[extern]\nlet foreign: (x: {s}) -> {s}", .{ ty, ty });
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "extern-abi.nov", source);
+        defer module.deinit();
+        var sema = try analyzeAnnotations(&module);
+        defer sema.deinit();
+        try std.testing.expectEqual(Module.Diagnostic.Tag.invalid_extern_signature, module.diagnostics.items[0].tag);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+    }
+}
+
+fn testForeignSymbols(allocator: std.mem.Allocator, first: []const u8, second: []const u8, expected: ?Module.Diagnostic.Tag, separate: bool) !void {
+    var comp = Compilation.init(allocator);
+    defer comp.deinit();
+    const source = try std.fmt.allocPrint(allocator, "{s}\n{s}", .{ first, if (separate) "" else second });
+    defer allocator.free(source);
+    const root = try comp.addSource("/app/first.nov", source);
+    const other = if (separate) try comp.addSource("/app/second.nov", second) else root;
+    var sema = analyzeCompilation(&comp) catch |err| {
+        for (comp.modules.items) |module| try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+        return err;
+    };
+    defer sema.deinit();
+    if (expected) |tag| {
+        const module = comp.getModule(other).?;
+        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+        const diagnostic = module.diagnostics.items[0];
+        try std.testing.expectEqual(tag, diagnostic.tag);
+        try std.testing.expectEqual(root, diagnostic.related.?.source);
+        try std.testing.expectEqual(other, diagnostic.span.source);
+        var rendered = std.Io.Writer.Allocating.init(allocator);
+        defer rendered.deinit();
+        Diagnostics.renderCompilation(&comp, &rendered.writer) catch return error.OutOfMemory;
+        try std.testing.expect(std.mem.indexOf(u8, rendered.written(), "/app/first.nov:") != null);
+        if (separate) try std.testing.expect(std.mem.indexOf(u8, rendered.written(), "/app/second.nov:") != null);
+    } else try std.testing.expect(!comp.hasErrors());
+}
+
+test "extern shared symbols compare canonical signatures and noreturn across both sources under OOM" {
+    const external = "@[extern(\"shared_symbol\")]\nlet first: (x: i32) -> i32";
+    const exported = "@[export(\"shared_symbol\")]\nlet first: (x: i32) -> i32 = x";
+    for ([_]bool{ false, true }) |separate| {
+        for ([_]struct { first: []const u8, second: []const u8, tag: ?Module.Diagnostic.Tag = null }{
+            .{ .first = external, .second = "let Alias = i32\n@[extern(\"shared_symbol\")]\nlet second: (x: Alias) -> Alias" },
+            .{ .first = exported, .second = "@[extern(\"shared_symbol\")]\nlet second: (x: i32) -> i32" },
+            .{ .first = external, .second = "@[export(\"shared_symbol\")]\nlet second: (x: i32) -> i32 = x" },
+            .{ .first = external, .second = "@[extern(\"shared_symbol\")]\nlet second: (x: u32) -> i32", .tag = .conflicting_foreign_signature },
+            .{ .first = external, .second = "@[extern(\"shared_symbol\")]\nlet second: (x: i32) -> u32", .tag = .conflicting_foreign_signature },
+            .{ .first = exported, .second = "@[extern(\"shared_symbol\")]\nlet second: ()", .tag = .conflicting_foreign_signature },
+            .{ .first = "@[noreturn]\n@[extern(\"shared_symbol\")]\nlet first: ()", .second = "@[extern(\"shared_symbol\")]\nlet second: ()", .tag = .conflicting_foreign_signature },
+            .{ .first = exported, .second = "@[export(\"shared_symbol\")]\nlet second: (x: i32) -> i32 = x", .tag = .duplicate_export_name },
+        }) |case| {
+            try testForeignSymbols(std.testing.allocator, case.first, case.second, case.tag, separate);
+            try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testForeignSymbols, .{ case.first, case.second, case.tag, separate });
+        }
     }
 }

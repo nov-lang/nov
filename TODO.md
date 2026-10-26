@@ -799,8 +799,15 @@ diagnose. `nov emit-c --library file.nov` emits a translation unit without a pro
 main. Separate-TU C callers are tested with -O0/-O3 and strict warnings/UBSan. See
 README and examples/exports.nov for the supported contract.
 
-Deferred: foreign calls/extern declarations, C-specific integer aliases, pointers,
-managed-value boundaries, callbacks, generated headers and library packaging.
+Implemented: bodyless `@[extern]` / `@[extern("symbol_name")]` declarations call C
+functions under the same scalar ABI. Extern does not imply public; compatible
+aliases share a symbol and incompatible signatures/noreturn contracts diagnose.
+Direct/indirect/libc/custom-provider calls and source-free IR/OOM are tested.
+examples/extern.nov contains compile commands for its examples/extern.c provider.
+
+Deferred: C-specific integer aliases, variadics, pointers, managed-value boundaries,
+foreign callbacks, extra object/library driver flags, generated headers and library
+packaging.
 The broader examples below remain proposals:
 ```nov
 @[extern("malloc")]

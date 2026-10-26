@@ -34,6 +34,8 @@ pub const Declaration = struct {
     noreturn: bool = false,
     /// Owned by this module; absent on generic templates and specializations.
     export_name: ?[]const u8 = null,
+    /// Owned by this module; only validated top-level bodyless prototypes.
+    extern_name: ?[]const u8 = null,
     /// Analysis-local canonical container TypeId for a specialized method.
     concrete_type: ?u32 = null,
     specialization_depth: usize = 0,
@@ -55,6 +57,11 @@ pub const Diagnostic = struct {
         invalid_export_name,
         invalid_export_signature,
         duplicate_export_name,
+        invalid_extern_declaration,
+        invalid_extern_attribute,
+        invalid_extern_name,
+        invalid_extern_signature,
+        conflicting_foreign_signature,
         noreturn_result,
         noreturn_return,
         noreturn_completion,
@@ -162,7 +169,10 @@ pub fn initSource(allocator: std.mem.Allocator, id: Source.Id, path: []const u8,
     };
     errdefer module.source.deinit();
     errdefer {
-        for (module.declarations.items) |decl| if (decl.export_name) |name| allocator.free(name);
+        for (module.declarations.items) |decl| {
+            if (decl.export_name) |name| allocator.free(name);
+            if (decl.extern_name) |name| allocator.free(name);
+        }
         module.declarations.deinit(allocator);
     }
     errdefer module.diagnostics.deinit(allocator);
@@ -178,7 +188,10 @@ pub fn initSource(allocator: std.mem.Allocator, id: Source.Id, path: []const u8,
 
 pub fn deinit(self: *Module) void {
     self.names.deinit(self.allocator);
-    for (self.declarations.items) |decl| if (decl.export_name) |name| self.allocator.free(name);
+    for (self.declarations.items) |decl| {
+        if (decl.export_name) |name| self.allocator.free(name);
+        if (decl.extern_name) |name| self.allocator.free(name);
+    }
     self.declarations.deinit(self.allocator);
     self.diagnostics.deinit(self.allocator);
     self.source.deinit();
@@ -409,30 +422,41 @@ fn collectDeclaration(self: *Module, node: Ast.Node.Index, container: ?DeclId) (
         var noreturn_annotation = false;
         var export_name: ?[]const u8 = null;
         errdefer if (export_name) |symbol| self.allocator.free(symbol);
+        var extern_name: ?[]const u8 = null;
+        errdefer if (extern_name) |symbol| self.allocator.free(symbol);
         var export_seen = false;
+        var extern_seen = false;
         for (declaration.attributes) |attribute| {
             const data = self.source.ast.nodes.items(.data)[attribute];
-            if (std.mem.eql(u8, self.source.ast.tokenSlice(data.lhs), "export")) {
+            const attr_name = self.source.ast.tokenSlice(data.lhs);
+            const external = std.mem.eql(u8, attr_name, "extern");
+            if (external or std.mem.eql(u8, attr_name, "export")) {
                 const span = self.tokenSpan(self.source.ast.firstToken(attribute));
-                if (export_seen or self.source.ast.nodes.items(.tag)[attribute] != .attr_one) {
-                    try self.diagnostics.append(self.allocator, .{ .tag = .invalid_export_attribute, .span = span });
+                const seen = if (external) extern_seen else export_seen;
+                const conflict = if (external) export_seen else extern_seen;
+                if (external) extern_seen = true else export_seen = true;
+                const invalid_attribute: Diagnostic.Tag = if (external) .invalid_extern_attribute else .invalid_export_attribute;
+                const invalid_declaration: Diagnostic.Tag = if (external) .invalid_extern_declaration else .invalid_export_declaration;
+                const invalid_name: Diagnostic.Tag = if (external) .invalid_extern_name else .invalid_export_name;
+                if (seen or conflict or self.source.ast.nodes.items(.tag)[attribute] != .attr_one) {
+                    try self.diagnostics.append(self.allocator, .{ .tag = invalid_attribute, .span = span });
                     continue;
                 }
-                export_seen = true;
-                if (container != null or declaration.ast.is_mutable or is_record or is_generic or declaration.ast.init_node == 0 or self.source.ast.fullFnProto(declaration.ast.type_node) == null) {
-                    try self.diagnostics.append(self.allocator, .{ .tag = .invalid_export_declaration, .span = span });
+                if (container != null or declaration.ast.is_mutable or is_record or is_generic or (if (external) declaration.ast.init_node != 0 else declaration.ast.init_node == 0) or self.source.ast.fullFnProto(declaration.ast.type_node) == null) {
+                    try self.diagnostics.append(self.allocator, .{ .tag = invalid_declaration, .span = span });
                     continue;
                 }
+                const symbol_name = if (external) &extern_name else &export_name;
                 if (data.rhs == 0) {
-                    export_name = try self.allocator.dupe(u8, name);
+                    symbol_name.* = try self.allocator.dupe(u8, name);
                 } else {
                     if (self.source.ast.nodes.items(.tag)[data.rhs] != .string_literal) {
-                        try self.diagnostics.append(self.allocator, .{ .tag = .invalid_export_attribute, .span = span });
+                        try self.diagnostics.append(self.allocator, .{ .tag = invalid_attribute, .span = span });
                         continue;
                     }
                     const bytes = self.source.ast.getNodeSource(data.rhs);
                     if (Literal.hasInterpolation(bytes)) {
-                        try self.diagnostics.append(self.allocator, .{ .tag = .invalid_export_attribute, .span = span });
+                        try self.diagnostics.append(self.allocator, .{ .tag = invalid_attribute, .span = span });
                         continue;
                     }
                     var decoded = std.Io.Writer.Allocating.init(self.allocator);
@@ -440,16 +464,16 @@ fn collectDeclaration(self: *Module, node: Ast.Node.Index, container: ?DeclId) (
                     switch (string_literal.parseWrite(&decoded.writer, bytes) catch return error.OutOfMemory) {
                         .success => {},
                         .failure => {
-                            try self.diagnostics.append(self.allocator, .{ .tag = .invalid_export_attribute, .span = span });
+                            try self.diagnostics.append(self.allocator, .{ .tag = invalid_attribute, .span = span });
                             continue;
                         },
                     }
-                    export_name = try self.allocator.dupe(u8, decoded.written());
+                    symbol_name.* = try self.allocator.dupe(u8, decoded.written());
                 }
-                if (!ExportNames.validName(export_name.?)) {
-                    self.allocator.free(export_name.?);
-                    export_name = null;
-                    try self.diagnostics.append(self.allocator, .{ .tag = .invalid_export_name, .span = span });
+                if (!(if (external) ExportNames.validExternName(symbol_name.*.?) else ExportNames.validName(symbol_name.*.?))) {
+                    self.allocator.free(symbol_name.*.?);
+                    symbol_name.* = null;
+                    try self.diagnostics.append(self.allocator, .{ .tag = invalid_name, .span = span });
                 }
             } else if (self.source.ast.nodes.items(.tag)[attribute] == .attr_one and data.rhs == 0 and std.mem.eql(u8, self.source.ast.tokenSlice(data.lhs), "public") and !declaration.ast.is_mutable and !public) {
                 public = true;
@@ -457,7 +481,7 @@ fn collectDeclaration(self: *Module, node: Ast.Node.Index, container: ?DeclId) (
                 noreturn_annotation = true;
             } else try self.diagnostics.append(self.allocator, .{ .tag = .unsupported_attribute, .span = self.tokenSpan(self.source.ast.firstToken(attribute)) });
         }
-        try self.declarations.append(self.allocator, .{ .name = name, .name_span = name_span, .node = node, .container = container, .is_record = is_record, .is_generic = is_generic, .is_type_alias = is_record or is_this_alias, .public = public, .noreturn = noreturn_annotation, .export_name = export_name });
+        try self.declarations.append(self.allocator, .{ .name = name, .name_span = name_span, .node = node, .container = container, .is_record = is_record, .is_generic = is_generic, .is_type_alias = is_record or is_this_alias, .public = public, .noreturn = noreturn_annotation, .export_name = export_name, .extern_name = extern_name });
     }
 }
 
@@ -752,6 +776,63 @@ test "module ownership survives allocation failures during collection and diagno
         "let broken =",
         "@[export]\nlet decorated = 1\nlet @\"quoted\" = 2",
     }) |source| {
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+    }
+}
+
+test "extern attributes own exact and decoded names independently of visibility" {
+    const source = "@[extern]\nlet abs: (x: i32) -> i32\n@[public]\n@[extern(\"nov_\\x61dd\")]\nlet visible: ()\n@[extern]\n@[noreturn]\nlet abort: ()";
+    var module = try Module.init(std.testing.allocator, "extern.nov", source);
+    defer module.deinit();
+    try std.testing.expect(!module.hasErrors());
+    const abs = module.getDeclaration(module.lookup("abs").?).?;
+    try std.testing.expectEqualStrings("abs", abs.extern_name.?);
+    try std.testing.expect(abs.extern_name.?.ptr != abs.name.ptr);
+    try std.testing.expect(!abs.public);
+    const visible = module.getDeclaration(module.lookup("visible").?).?;
+    try std.testing.expect(visible.public);
+    try std.testing.expectEqualStrings("nov_add", visible.extern_name.?);
+    try std.testing.expect(module.getDeclaration(module.lookup("abort").?).?.noreturn);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+}
+
+test "extern and export reject actual least and fast integer header macros" {
+    for ([_][]const u8{ "INT_LEAST8_MAX", "INT_LEAST64_MIN", "UINT_FAST32_MAX", "INT_FAST16_MIN" }) |name| {
+        for ([_]bool{ false, true }) |external| {
+            const source = try std.fmt.allocPrint(std.testing.allocator, "@[{s}(\"{s}\")]\nlet foreign: (){s}", .{ if (external) "extern" else "export", name, if (external) "" else " = {}" });
+            defer std.testing.allocator.free(source);
+            var module = try Module.init(std.testing.allocator, "macro.nov", source);
+            defer module.deinit();
+            try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+            try std.testing.expectEqual(if (external) Diagnostic.Tag.invalid_extern_name else Diagnostic.Tag.invalid_export_name, module.diagnostics.items[0].tag);
+            try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+        }
+    }
+}
+
+test "extern rejects bodies methods aliases constants generics and invalid attributes" {
+    for ([_][]const u8{
+        "@[extern]\nlet f: () = {}",
+        "@[extern]\nlet mut f: ()",
+        "@[extern]\nlet Alias = i32",
+        "@[extern]\nlet value = true",
+        "@[extern]\nlet Generic: (T: type) -> type = struct { x: T, }",
+        "let R = struct { @[extern]\nlet method: ()\n}",
+        "@[extern]\n@[extern]\nlet f: ()",
+        "@[extern(1)]\nlet f: ()",
+        "@[extern(\"a\", \"b\")]\nlet f: ()",
+        "@[extern(\"{value}\")]\nlet f: ()",
+        "@[extern(\"bad-name\")]\nlet f: ()",
+        "@[extern(\"int\")]\nlet f: ()",
+        "@[extern]\n@[export]\nlet f: ()",
+        "@[export]\n@[extern]\nlet f: () = {}",
+        "@[export]\n@[extern]\nlet f: ()",
+        "@[extern]\n@[export]\nlet f: () = {}",
+    }) |source| {
+        var module = try Module.init(std.testing.allocator, "bad-extern.nov", source);
+        defer module.deinit();
+        try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
+        try std.testing.expect(module.hasErrors());
         try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
     }
 }

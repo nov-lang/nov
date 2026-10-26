@@ -75,7 +75,7 @@ fn scanInitializer(self: *Dependencies, module: *Module, id: Module.DeclId, work
     const declaration = module.getDeclaration(id).?;
     const ast = &module.source.ast;
     const full = ast.decl(declaration.node);
-    if (declaration.is_type_alias or declaration.is_namespace) return;
+    if (declaration.is_type_alias or declaration.is_namespace or declaration.extern_name != null) return;
     if (full.ast.init_node == 0) {
         try module.diagnostics.append(self.allocator, .{ .tag = .missing_initializer, .span = declaration.name_span });
         entry.state = .failed;
@@ -404,4 +404,23 @@ test "long forward chains use an explicit work stack" {
     try std.testing.expectEqual(module.lookup("name_256").?, result.order.items[0]);
     try std.testing.expectEqual(module.lookup("name_0").?, result.order.items[256]);
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source.written()});
+}
+
+test "extern skips missing initializers only on validated foreign prototypes" {
+    const source = "@[extern]\nlet foreign: (x: i32) -> i32\nlet caller: (x: i32) -> i32 = foreign(x)";
+    var module = try Module.init(std.testing.allocator, "extern.nov", source);
+    defer module.deinit();
+    var result = try analyze(&module);
+    defer result.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expectEqual(State.resolved, result.getState(module.lookup("foreign").?).?);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+    var missing = try Module.init(std.testing.allocator, "missing.nov", "let ordinary: ()");
+    defer missing.deinit();
+    var rejected = try analyze(&missing);
+    defer rejected.deinit();
+    try std.testing.expectEqual(Module.Diagnostic.Tag.missing_initializer, missing.diagnostics.items[0].tag);
+    var invalid = try Module.init(std.testing.allocator, "invalid.nov", "@[extern]\nlet value: i32");
+    defer invalid.deinit();
+    try std.testing.expectError(error.InvalidModule, analyze(&invalid));
 }

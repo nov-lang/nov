@@ -34,6 +34,7 @@ pub const Function = struct {
     public: bool = false,
     noreturn: bool = false,
     export_name: ?[]const u8 = null,
+    extern_name: ?[]const u8 = null,
 };
 /// `result` is either a continuing value or the final terminal instruction.
 pub const Body = struct { instructions: []const Instruction, result: ValueId };
@@ -198,6 +199,11 @@ pub const VerifyError = ValidationError || error{
     InvalidExportName,
     InvalidExportSignature,
     DuplicateExportName,
+    InvalidExternName,
+    InvalidExternSignature,
+    InvalidForeignFunction,
+    ExternFunctionBody,
+    ConflictingForeignSignature,
     InvalidSourceSpan,
     MissingFunctionBody,
     InvalidValueId,
@@ -283,20 +289,41 @@ pub fn setExportName(self: *Ir, id: FunctionId, name: []const u8) BuildError!voi
     var exported = function;
     exported.export_name = name;
     try self.validateFunction(exported);
-    for (self.functions.items, 0..) |other, i| {
-        if (i == @backingInt(id)) continue;
-        if (other.export_name) |symbol| if (std.mem.eql(u8, symbol, name)) return error.DuplicateExportName;
-    }
+    try self.validateForeignSymbol(id, exported);
     const owned = try self.allocator.dupe(u8, name);
     const slot = &self.functions.items[@backingInt(id)];
     if (slot.export_name) |old| self.allocator.free(old);
     slot.export_name = owned;
 }
 
+/// External declarations own a symbol but never a Nov body.
+pub fn setExternName(self: *Ir, id: FunctionId, name: []const u8) BuildError!void {
+    var function = self.getFunction(id) orelse return error.InvalidFunctionId;
+    function.extern_name = name;
+    try self.validateFunction(function);
+    try self.validateForeignSymbol(id, function);
+    const owned = try self.allocator.dupe(u8, name);
+    const slot = &self.functions.items[@backingInt(id)];
+    if (slot.extern_name) |old| self.allocator.free(old);
+    slot.extern_name = owned;
+}
+
+fn validateForeignSymbol(self: *const Ir, id: FunctionId, function: Function) VerifyError!void {
+    const symbol = function.export_name orelse function.extern_name orelse return;
+    for (self.functions.items, 0..) |other, i| {
+        if (i == @backingInt(id)) continue;
+        const previous = other.export_name orelse other.extern_name orelse continue;
+        if (!std.mem.eql(u8, previous, symbol)) continue;
+        if (function.export_name != null and other.export_name != null) return error.DuplicateExportName;
+        if (function.ty != other.ty or function.noreturn != other.noreturn) return error.ConflictingForeignSignature;
+    }
+}
+
 /// Validation and allocation complete before publishing any part of the body.
 /// Referenced function declarations may still be awaiting their own bodies.
 pub fn setFunctionBody(self: *Ir, id: FunctionId, instructions: []const Instruction, result: ValueId) BuildError!void {
     const function = self.getFunction(id) orelse return error.InvalidFunctionId;
+    if (function.extern_name != null) return error.ExternFunctionBody;
     if (function.body != null) return error.BodyAlreadySet;
     if (instructions.len > std.math.maxInt(u32)) return error.TooManyEntries;
     try self.validateFunction(function);
@@ -337,6 +364,7 @@ pub fn clearFunctions(self: *Ir) void {
     for (self.functions.items) |function| {
         self.allocator.free(function.name);
         if (function.export_name) |name| self.allocator.free(name);
+        if (function.extern_name) |name| self.allocator.free(name);
         if (function.body) |body| {
             for (body.instructions) |instruction| {
                 self.freeOperands(instruction.op);
@@ -450,16 +478,19 @@ pub fn verify(self: *const Ir) VerifyError!void {
         try self.validateFunction(function);
         for (self.functions.items[0..i]) |previous| {
             if (previous.span.source == function.span.source and std.mem.eql(u8, previous.name, function.name)) return error.DuplicateFunctionName;
-            if (previous.export_name) |a| if (function.export_name) |b| {
-                if (std.mem.eql(u8, a, b)) return error.DuplicateExportName;
-            };
+            const a = previous.export_name orelse previous.extern_name orelse continue;
+            const b = function.export_name orelse function.extern_name orelse continue;
+            if (std.mem.eql(u8, a, b)) {
+                if (previous.export_name != null and function.export_name != null) return error.DuplicateExportName;
+                if (previous.ty != function.ty or previous.noreturn != function.noreturn) return error.ConflictingForeignSignature;
+            }
         }
     }
     for (self.functions.items) |function| {
-        if (function.body == null) return error.MissingFunctionBody;
+        if (function.body == null and function.extern_name == null) return error.MissingFunctionBody;
     }
     if (try self.recordLayoutIssue()) |issue| return if (issue.cycle) error.CyclicRecordLayout else error.RecordNestingLimit;
-    for (self.functions.items) |function| try self.validateBody(function, function.body.?);
+    for (self.functions.items) |function| if (function.body) |body| try self.validateBody(function, body);
 }
 
 /// Bounds all later recursive backend walks, including source-free forged IR.
@@ -533,6 +564,13 @@ fn validateFunction(self: *const Ir, function: Function) VerifyError!void {
     try self.validateType(ty, self.types.items.len);
     try self.validateSpan(function.span);
     if (function.noreturn and self.getType(ty.function.result).? != .void) return error.InvalidReturn;
+    if (function.extern_name) |name| {
+        if (function.export_name != null) return error.InvalidForeignFunction;
+        if (function.body != null) return error.ExternFunctionBody;
+        if (!ExportNames.validExternName(name)) return error.InvalidExternName;
+        if (!self.exportScalar(ty.function.result, true)) return error.InvalidExternSignature;
+        for (ty.function.params) |param| if (!self.exportScalar(param, false)) return error.InvalidExternSignature;
+    }
     if (function.export_name) |name| {
         if (!ExportNames.validName(name)) return error.InvalidExportName;
         if (!self.exportScalar(ty.function.result, true)) return error.InvalidExportSignature;
@@ -663,6 +701,7 @@ fn borrowElement(self: *const Ir, body: Body, borrow: ValueId, before: usize) Ve
 }
 
 fn validateBodyStructure(self: *const Ir, function: Function, body: Body) VerifyError!void {
+    if (function.extern_name != null) return error.ExternFunctionBody;
     const signature = (self.getType(function.ty) orelse return error.InvalidTypeId).function;
     if (body.instructions.len > std.math.maxInt(u32)) return error.InvalidRegion;
     // Validate structure before resolving operands. A region includes its merge
@@ -3247,7 +3286,7 @@ test "export IR setter and verifier reject unsafe names without replacing metada
     try ir.setFunctionBody(fixture.function, &.{TestFunctions.instruction(fixture.integer, .{ .parameter = 0 })}, @fromBackingInt(@intCast(0)));
     const original = ir.functions.items[0];
     defer ir.functions.items[0] = original;
-    for ([_][]const u8{ "", "_private", "9bad", "a-b", "a\x00b", "é", "main", "while", "bool", "INT64_MAX", "PRId64", "uint32_t", "FILE", "malloc", "sin", "sqrt", "time", "signal", "p0", "v12", "nov_frame", "nov_roots", "nov_target", "nov_rt_x", "nov_gc_x", "nov_fn_x", "nov_record_x", "nov_range_x", "nov_stringFoo", "nov_arrayFoo", "nov_M0" }) |name| {
+    for ([_][]const u8{ "", "_private", "9bad", "a-b", "a\x00b", "é", "main", "while", "bool", "INT64_MAX", "INT_LEAST8_MAX", "INT_LEAST64_MIN", "UINT_FAST32_MAX", "INT_FAST16_MIN", "PRId64", "uint32_t", "FILE", "malloc", "sin", "sqrt", "time", "signal", "p0", "v12", "nov_frame", "nov_roots", "nov_target", "nov_rt_x", "nov_gc_x", "nov_fn_x", "nov_record_x", "nov_range_x", "nov_stringFoo", "nov_arrayFoo", "nov_M0" }) |name| {
         try std.testing.expectError(error.InvalidExportName, ir.setExportName(fixture.function, name));
         try std.testing.expectEqual(original.export_name.?.ptr, ir.functions.items[0].export_name.?.ptr);
         ir.functions.items[0].export_name = name;

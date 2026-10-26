@@ -850,7 +850,8 @@ checked semantically through 128 bits, while reachable C layouts require
 The examples below describe broader design, not additional implemented features.
 
 Union is Nov's equivalent of [Sum type](https://en.wikipedia.org/wiki/Tagged_union)
-since Nov's unions are always tagged unless annotated with `@[extern]`.
+since Nov's executable unions are always tagged. Untagged C unions remain a
+proposal; `@[extern]` currently applies only to function declarations.
 Thus we can match on an union to find its active field.
 
 See [Result and Option unions](#result-and-option-unions) for an example of generic unions.
@@ -2114,7 +2115,7 @@ TODO
 - `@[operator(op)]`: Note that op is an enum for easier parsing.
 - `@[pure]`: Mainly for extern functions, a [pure function](https://en.wikipedia.org/wiki/Functional_programming#Pure_functions)
              can only call pure functions but impure functions can call a pure function without issue.
-- `@[extern]`
+- `@[extern]` / `@[extern("symbol_name")]`: declare a bodyless external C function.
 - `@[packed]`
 - `@[export]` / `@[export("symbol_name")]`: expose an ordinary function through the C ABI.
 - `@[inline]`
@@ -2135,9 +2136,8 @@ methods are file-private by default, with identical rules for file and named imp
 `@[private]` is unsupported; omit the attribute instead. Argument-free `@[noreturn]`
 on ordinary functions and methods may be combined with `@[public]` where supported.
 Duplicate attributes, arguments, invalid placements and unknown/unsupported
-attributes diagnose. `@[export]` and `@[export("symbol_name")]` are supported as
-described below and do not imply `@[public]`. Other entries in this list remain
-design proposals.
+attributes diagnose. The `extern` and `export` forms described below are supported
+and do not imply `@[public]`. Other entries in this list remain design proposals.
 
 ### C function exports
 
@@ -2179,11 +2179,57 @@ Other generated mangled symbols are implementation details, not a stable foreign
 behind scalar wrappers. Build/run commands are in the Nov file's opening comments.
 The separate-translation-unit example is tested at `-O0` and `-O3`.
 
-This slice adds no foreign calls, pointers, callbacks, generated headers, shared-
-library packaging or DLL export-list support. Managed values cannot cross the ABI;
+Foreign calls use the `extern` annotation below. Pointers, callbacks, generated
+headers, shared-library packaging and DLL export-list support remain deferred. Managed values cannot cross the ABI;
 the existing runtime remains single-threaded. Automatic library teardown and
 concurrent foreign entry are not provided. Panics remain process-terminating;
 exports do not turn them into recoverable C errors.
+
+### Calling external C functions
+
+```nov
+@[extern]
+let abs: (value: i32) -> i32
+
+@[extern("c_max_i32")]
+let max: (left: i32, right: i32) -> i32
+
+let main: () = @println(abs(-42), max(7, 42))
+```
+
+`@[extern]` uses the declaration's exact name; its optional single ordinary string
+literal selects an explicit C name. Escapes are decoded; computed/interpolated
+names are unsupported. Extern declarations must be immutable, ordinary top-level
+function prototypes **without a body**. They cannot also carry `@[export]`.
+
+The initial ABI is the same scalar subset as exports: bool and 8/16/32/64-bit
+signed/unsigned integers, pointer-sized int/uint, and void results. No variadics,
+C-specific integer aliases, strings, pointers, aggregates or function-valued ABI
+parameters/results are supported. Extern functions can still be called indirectly
+or passed as ordinary function values inside Nov. Standard C function names such
+as `abs` and `putchar` are accepted; C keywords, emitted-header macros/types and
+backend-reserved names are rejected.
+
+**These declarations are trusted FFI contracts.** Match the real C signature,
+calling convention and target exactly: Nov `int` is pointer-sized, not C `int`.
+On the supported native platforms the example's `i32` matches C `int`. Nov checks
+its own declarations, not arbitrary linked C implementations. C undefined behavior
+and external side effects are not made safe by Nov's arithmetic or memory rules.
+A matching `@[noreturn]` extern declaration is allowed for a void result, but its
+C implementation must actually never return.
+
+Repeated declarations of one C symbol must have the same canonical signature and
+`noreturn` annotation, including across imports and when matching a Nov export.
+Extern does not grant Nov import access: add `@[public]` when another Nov file
+should call it. An extern prototype cannot serve as the program's root `main`.
+
+[`examples/extern.nov`](examples/extern.nov) calls libc plus the custom provider
+in [`examples/extern.c`](examples/extern.c); compile/run instructions are comments
+in the Nov file. Emit program C and link the provider with a C compiler. Missing
+referenced symbols fail at C link time; an unused prototype needs no provider.
+`nov build`/`nov run` can call functions already provided by the normal C link, but
+do not yet accept extra C objects or library flags. Library mode also accepts
+extern-only modules and emits declarations without a process main.
 
 ### Non-returning functions
 

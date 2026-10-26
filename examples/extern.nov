@@ -1,0 +1,20 @@
+; From the repository root:
+; zig build
+; zig-out/bin/nov emit-c examples/extern.nov > zig-out/extern.c
+; zig cc -std=c11 -O3 zig-out/extern.c examples/extern.c -o zig-out/extern-demo
+; ./zig-out/extern-demo
+
+@[extern]
+let abs: (value: i32) -> i32
+
+@[extern("c_max_i32")]
+let max: (left: i32, right: i32) -> i32
+
+@[extern]
+let c_is_even: (value: u32) -> bool
+
+let main: () = {
+    @println("Abs:", abs(-42))
+    @println("Maximum:", max(-7, 42))
+    @println("Even:", c_is_even(42))
+}

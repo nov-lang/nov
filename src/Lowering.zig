@@ -26,7 +26,7 @@ pub fn lowerCompilation(comp: *Compilation) Error!Sema {
         const module = comp.getModule(ref.source).?;
         const declaration = module.getDeclaration(ref.local).?;
         if (entry.status == .namespace or entry.status == .type_alias or entry.status == .generic or entry.status == .unrequested) continue;
-        if (module.source.ast.decl(declaration.node).ast.is_mutable or (entry.status != .body_checked and entry.status != .constant_checked)) {
+        if (module.source.ast.decl(declaration.node).ast.is_mutable or (entry.status != .body_checked and entry.status != .constant_checked and entry.status != .external)) {
             try module.diagnostics.append(comp.allocator, .{ .tag = deferredDiagnostic(module, declaration), .span = declaration.name_span });
         }
     }
@@ -43,16 +43,17 @@ pub fn lowerCompilation(comp: *Compilation) Error!Sema {
         const declaration = module.getDeclaration(ref.local).?;
         ty.* = entry.type_id;
         constant.* = entry.constant;
-        if (entry.status != .body_checked) continue;
+        if (entry.status != .body_checked and entry.status != .external) continue;
         const qualified = if (declaration.container) |owner| if (declaration.concrete_type) |concrete|
             try std.fmt.allocPrint(comp.allocator, "{s}[{d}].{s}", .{ module.getDeclaration(owner).?.name, concrete, declaration.name })
         else
             try std.fmt.allocPrint(comp.allocator, "{s}.{s}", .{ module.getDeclaration(owner).?.name, declaration.name }) else null;
         defer if (qualified) |name| comp.allocator.free(name);
         const function = try result.ir.addFunction(qualified orelse declaration.name, entry.type_id.?, declaration.name_span);
-        if (declaration.export_name) |name| try result.ir.setExportName(function, name);
         result.ir.functions.items[@backingInt(function)].public = declaration.public;
         result.ir.functions.items[@backingInt(function)].noreturn = entry.noreturn;
+        if (declaration.export_name) |name| try result.ir.setExportName(function, name);
+        if (declaration.extern_name) |name| try result.ir.setExternName(function, name);
         entry.function = function;
         functions[i] = function;
     }
@@ -85,7 +86,7 @@ pub fn lower(module: *Module) Error!Sema {
     result.ir.source_len = @intCast(module.source.ast.source.len);
     for (module.declarations.items, result.entries) |declaration, entry| {
         if (entry.status == .namespace or entry.status == .type_alias or entry.status == .generic or entry.status == .unrequested) continue;
-        if (module.source.ast.decl(declaration.node).ast.is_mutable or (entry.status != .body_checked and entry.status != .constant_checked)) {
+        if (module.source.ast.decl(declaration.node).ast.is_mutable or (entry.status != .body_checked and entry.status != .constant_checked and entry.status != .external)) {
             try module.diagnostics.append(module.allocator, .{ .tag = deferredDiagnostic(module, declaration), .span = declaration.name_span });
         }
     }
@@ -100,7 +101,7 @@ pub fn lower(module: *Module) Error!Sema {
     for (module.declarations.items, result.entries, types, constants, 0..) |declaration, *entry, *ty, *constant, i| {
         ty.* = entry.type_id;
         constant.* = entry.constant;
-        if (entry.status != .body_checked) continue;
+        if (entry.status != .body_checked and entry.status != .external) continue;
         const span: Ir.Span = declaration.name_span;
         const qualified = if (declaration.container) |owner| if (declaration.concrete_type) |concrete|
             try std.fmt.allocPrint(result.allocator, "{s}[{d}].{s}", .{ module.getDeclaration(owner).?.name, concrete, declaration.name })
@@ -108,9 +109,10 @@ pub fn lower(module: *Module) Error!Sema {
             try std.fmt.allocPrint(result.allocator, "{s}.{s}", .{ module.getDeclaration(owner).?.name, declaration.name }) else null;
         defer if (qualified) |name| result.allocator.free(name);
         const function = try result.ir.addFunction(qualified orelse declaration.name, entry.type_id.?, span);
-        if (declaration.export_name) |name| try result.ir.setExportName(function, name);
         result.ir.functions.items[@backingInt(function)].public = declaration.public;
         result.ir.functions.items[@backingInt(function)].noreturn = entry.noreturn;
+        if (declaration.export_name) |name| try result.ir.setExportName(function, name);
+        if (declaration.extern_name) |name| try result.ir.setExternName(function, name);
         entry.function = function;
         functions[i] = function;
     }
@@ -2734,4 +2736,81 @@ test "static borrowing normal array loads clone immediately before later borrow 
     try std.testing.expectEqual(@as(usize, 1), updates);
     try std.testing.expectEqual(@as(usize, 1), appends);
     try result.ir.verify();
+}
+
+fn testExternOwnership(allocator: std.mem.Allocator) !void {
+    var sema = blk: {
+        var module = try Module.init(allocator, "extern.nov", "@[extern(\"nov_\\x61bs\")]\nlet foreign: (x: i32) -> i32\n@[public]\n@[extern]\nlet predicate: (x: bool) -> bool\n@[noreturn]\n@[extern]\nlet abort: ()\nlet call: (x: i32) -> i32 = foreign(x)\nlet indirect: (x: i32) -> i32 = { let f = foreign\nf(x) }\nlet stop: () = abort()");
+        defer module.deinit();
+
+        var result = lower(&module) catch |err| {
+            try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+            return err;
+        };
+        errdefer result.deinit();
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expectEqual(Sema.Status.external, result.getEntry(module.lookup("foreign").?).?.status);
+        break :blk result;
+    };
+    defer sema.deinit();
+    try std.testing.expect(sema.lowering_complete);
+    try std.testing.expectEqualStrings("nov_abs", sema.ir.functions.items[0].extern_name.?);
+    try std.testing.expectEqualStrings("predicate", sema.ir.functions.items[1].extern_name.?);
+    try std.testing.expect(!sema.ir.functions.items[0].public);
+    try std.testing.expect(sema.ir.functions.items[1].public);
+    try std.testing.expect(sema.ir.functions.items[2].noreturn);
+    try sema.ir.verify();
+}
+
+test "extern bodyless typed direct and indirect calls own names after source release under OOM" {
+    try testExternOwnership(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testExternOwnership, .{});
+}
+
+fn testCompilationExternOwnership(allocator: std.mem.Allocator) !void {
+    var sema = blk: {
+        var comp = Compilation.init(allocator);
+        defer comp.deinit();
+        const root = try comp.addSource("/app/root.nov", "let imported = @import(\"lib.nov\")\n@[extern(\"shared_symbol\")]\nlet local: (x: i32) -> i32\nlet caller: (x: i32) -> i32 = imported.foreign(x)");
+        const imported = try comp.addSource("/app/lib.nov", "@[public]\n@[extern(\"shared_symbol\")]\nlet foreign: (x: i32) -> i32");
+        try testImport(&comp, root, "imported", imported, false);
+        var result = lowerCompilation(&comp) catch |err| {
+            for (comp.modules.items) |module| try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+            return err;
+        };
+        errdefer result.deinit();
+        try std.testing.expect(!comp.hasErrors());
+        break :blk result;
+    };
+    defer sema.deinit();
+    try std.testing.expect(sema.lowering_complete);
+    var count: usize = 0;
+    for (sema.ir.functions.items) |function| if (function.extern_name) |name| {
+        try std.testing.expectEqualStrings("shared_symbol", name);
+        count += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 2), count);
+    try sema.ir.verify();
+}
+
+test "extern compilation aliases and imported typed calls own names under OOM" {
+    try testCompilationExternOwnership(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testCompilationExternOwnership, .{});
+}
+
+test "extern typed calls reject wrong arguments results and noreturn results" {
+    for ([_]struct { source: []const u8, tag: Module.Diagnostic.Tag }{
+        .{ .source = "@[extern]\nlet foreign: (x: i32) -> i32\nlet call: () -> i32 = foreign(true)", .tag = .literal_type_mismatch },
+        .{ .source = "@[extern]\nlet foreign: (x: i32) -> i32\nlet call: () -> i32 = foreign()", .tag = .argument_count_mismatch },
+        .{ .source = "@[extern]\nlet foreign: () -> i32\nlet call: () -> bool = foreign()", .tag = .expression_type_mismatch },
+        .{ .source = "@[extern]\n@[noreturn]\nlet foreign: () -> i32", .tag = .noreturn_result },
+    }) |case| {
+        var module = try Module.init(std.testing.allocator, "bad-extern-call.nov", case.source);
+        defer module.deinit();
+        var sema = try lower(&module);
+        defer sema.deinit();
+        try std.testing.expect(!sema.lowering_complete);
+        try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{case.source});
+    }
 }
