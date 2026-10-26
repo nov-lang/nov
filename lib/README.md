@@ -68,7 +68,10 @@ working-directory library search or embedded developer-checkout path.
 
 Explicit relative `.nov` imports resolve from the importing file, not the process
 working directory. For example, `@import("result.nov")` in `std.nov` refers to this
-directory's file. Imports yield compile-time namespaces, never runtime values.
+directory's file. A re-export may select a member directly:
+`@[public] let Result = @import("result.nov").Result` (place the attribute on its
+own line). This has the same identity and visibility as a separate namespace binding.
+Imports yield compile-time namespaces, never runtime values.
 Canonical paths share one source and nominal identity across repeated/diamond
 imports; cycles diagnose. Declarations and methods are file-private by default;
 both named and file imports expose only `@[public]` declarations. Public types do

@@ -26,6 +26,9 @@ pub const DeclId = enum(u32) { _ };
 pub const DeclRef = struct { source: Source.Id, local: Module.DeclId };
 pub const Import = struct {
     declaration: DeclId,
+    /// Present only when the import is the base of an initializer member chain.
+    /// Bare namespace imports (including client-created edges) omit this node.
+    node: ?Ast.Node.Index = null,
     target: Source.Id,
     named: bool,
     span: Source.Span,
@@ -130,7 +133,7 @@ pub fn setRoot(self: *Compilation, id: Source.Id) void {
 }
 
 pub fn namespace(self: *const Compilation, declaration: DeclId) ?Import {
-    for (self.imports.items) |edge| if (edge.declaration == declaration) return edge;
+    for (self.imports.items) |edge| if (edge.node == null and edge.declaration == declaration) return edge;
     return null;
 }
 
@@ -138,7 +141,10 @@ pub fn namespace(self: *const Compilation, declaration: DeclId) ?Import {
 /// Unmarked declarations are only visible to syntax in their defining source.
 /// The returned identity retains the defining scope, including for reexports.
 pub fn lookupNamespace(self: *const Compilation, caller: Source.Id, declaration: DeclId, name: []const u8) ?DeclId {
-    const edge = self.namespace(declaration) orelse return null;
+    return self.lookupImport(caller, self.namespace(declaration) orelse return null, name);
+}
+
+fn lookupImport(self: *const Compilation, caller: Source.Id, edge: Import, name: []const u8) ?DeclId {
     const module = self.getModule(edge.target).?;
     const local = module.lookup(name) orelse return null;
     const member = module.getDeclaration(local).?;
@@ -158,6 +164,12 @@ fn referenceDepth(self: *const Compilation, module: *const Module, node: Ast.Nod
         .identifier => .{ .source = module.source.id, .local = module.lookup(ast.tokenSlice(ast.firstToken(node))) orelse return null },
         .field_access => blk: {
             const data = ast.nodes.items(.data)[node];
+            for (self.imports.items) |edge| {
+                if (edge.span.source == module.source.id and edge.node == data.lhs) {
+                    const member = self.lookupImport(module.source.id, edge, ast.tokenSlice(data.rhs)) orelse return null;
+                    break :blk self.getDeclaration(member);
+                }
+            }
             var base = self.referenceDepth(module, data.lhs, depth + 1) orelse return null;
             for (0..128) |_| {
                 const global = self.declaration_ids.get(base) orelse return null;
@@ -191,6 +203,7 @@ pub fn prepareSemantics(self: *Compilation) std.mem.Allocator.Error!void {
         break;
     }
     for (self.imports.items) |edge| {
+        if (edge.node != null) continue;
         const ref = self.getDeclaration(edge.declaration).?;
         self.getModule(ref.source).?.declarations.items[@backingInt(ref.local)].is_namespace = true;
     }
@@ -320,7 +333,10 @@ fn discover(self: *Compilation, io: std.Io, id: Source.Id, options: Options, act
         var declaration: ?Module.DeclId = null;
         for (module.declarations.items, 0..) |decl, local| {
             const full = ast.decl(decl.node).ast;
-            if (decl.container == null and !full.is_mutable and full.type_node == 0 and full.init_node == node) {
+            if (decl.container != null or full.is_mutable or full.type_node != 0) continue;
+            var base = full.init_node;
+            while (ast.nodes.items(.tag)[base] == .field_access) base = ast.nodes.items(.data)[base].lhs;
+            if (base == node) {
                 declaration = @fromBackingInt(@intCast(local));
                 break;
             }
@@ -379,7 +395,13 @@ fn discover(self: *Compilation, io: std.Io, id: Source.Id, options: Options, act
             try self.diagnostics.append(self.allocator, .{ .tag = .import_depth, .span = span });
             continue;
         }
-        try self.imports.append(self.allocator, .{ .declaration = global, .target = target, .named = named, .span = span });
+        try self.imports.append(self.allocator, .{
+            .declaration = global,
+            .node = if (ast.decl(module.getDeclaration(declaration.?).?.node).ast.init_node == node) null else node,
+            .target = target,
+            .named = named,
+            .span = span,
+        });
         try self.discover(io, target, options, active, completed);
     }
     try completed.put(self.allocator, id, {});
@@ -562,6 +584,209 @@ test "canonical diamond imports preserve namespaces and defining scopes" {
     const edge = compilation.imports.items[0];
     const helper = compilation.lookupNamespace(root.source.id, edge.declaration, "helper").?;
     try std.testing.expectEqual(edge.target, compilation.getDeclaration(helper).?.source);
+}
+
+fn initializerReference(compilation: *const Compilation, module: *const Module, name: []const u8) ?DeclRef {
+    const decl = module.getDeclaration(module.lookup(name).?).?;
+    return compilation.reference(module, module.source.ast.decl(decl.node).ast.init_node);
+}
+
+fn inlineLoaderAllocationTest(allocator: std.mem.Allocator, path: []const u8, lib: []const u8) !void {
+    var compilation = try Compilation.load(allocator, std.testing.io, path, .{ .lib_dir = lib });
+    defer compilation.deinit();
+    try compilation.prepareSemantics();
+    try std.testing.expect(!compilation.hasErrors());
+    try std.testing.expectEqual(@as(usize, 5), compilation.modules.items.len);
+    const root = compilation.getModule(compilation.root.?).?;
+    const standard = compilation.getModule(initializerReference(&compilation, root, "Result").?.source).?;
+    const result_ref = initializerReference(&compilation, standard, "Result").?;
+    const result = compilation.getModule(result_ref.source).?;
+    try std.testing.expectEqual(result.lookup("Result").?, result_ref.local);
+    const option_ref = initializerReference(&compilation, standard, "Option").?;
+    const option = compilation.getModule(option_ref.source).?;
+    try std.testing.expectEqual(option.lookup("Option").?, option_ref.local);
+    try std.testing.expectEqual(result_ref, initializerReference(&compilation, root, "relative").?);
+    try std.testing.expectEqual(initializerReference(&compilation, root, "Result").?, initializerReference(&compilation, root, "file_result").?);
+    for ([_][]const u8{ "Result", "Option", "relative", "file_result" }) |name| {
+        const decl = root.getDeclaration(root.lookup(name).?).?;
+        const global = compilation.declaration_ids.get(.{ .source = root.source.id, .local = root.lookup(name).? }).?;
+        try std.testing.expect(compilation.namespace(global) == null);
+        try std.testing.expect(!decl.is_namespace);
+        try std.testing.expect(decl.is_generic);
+    }
+    for ([_][]const u8{ "chain", "via_alias", "file_chain" }) |name| {
+        const ref = initializerReference(&compilation, root, name).?;
+        const owner = compilation.getModule(ref.source).?;
+        try std.testing.expectEqual(owner.lookup("visible").?, ref.local);
+    }
+    for ([_][]const u8{ "denied", "file_denied", "deep_denied", "file_deep_denied", "hidden_namespace" }) |name| {
+        try std.testing.expect(initializerReference(&compilation, root, name) == null);
+    }
+    // An alias may use private names in its own defining source, not its caller's.
+    const exposed = initializerReference(&compilation, standard, "exposed").?;
+    try std.testing.expectEqual(standard.source.id, exposed.source);
+    try std.testing.expectEqual(standard.lookup("hidden").?, exposed.local);
+    for (compilation.imports.items) |edge| {
+        if (edge.node != null) try std.testing.expect(compilation.namespace(edge.declaration) == null);
+    }
+    try compilation.prepareSemantics();
+    try std.testing.expect(!compilation.hasErrors());
+}
+
+test "inline imports load relative and std public aliases namespaces and private boundaries with OOM" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "lib/types");
+    try tmp.dir.writeFile(io, .{ .sub_path = "main.nov", .data =
+        \\let standard = @import("std")
+        \\let Result = @import("std").Result
+        \\let Option = @import("std").Option
+        \\let relative = @import("lib/types/result.nov").Result
+        \\let file_result = @import("lib/./std.nov").Result
+        \\let chain = @import("std").chain.visible
+        \\let via_alias = standard.chain.visible
+        \\let file_chain = @import("lib/std.nov").chain.visible
+        \\let denied = @import("std").hidden
+        \\let file_denied = @import("lib/std.nov").hidden
+        \\let deep_denied = @import("std").chain.secret
+        \\let file_deep_denied = @import("lib/std.nov").chain.secret
+        \\let hidden_namespace = @import("std").private_chain.visible
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "lib/std.nov", .data =
+        \\@[public]
+        \\let Result = @import("types/result.nov").Result
+        \\@[public]
+        \\let Option = @import("types/option.nov").Option
+        \\let private_chain = @import("types/result.nov").child
+        \\let local_alias = private_chain
+        \\@[public]
+        \\let chain = local_alias
+        \\let hidden = true
+        \\@[public]
+        \\let exposed = hidden
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "lib/types/result.nov", .data =
+        \\@[public]
+        \\let Result: (T: type, E: type) -> type = union { ok: T, err: E, }
+        \\@[public]
+        \\let child = @import("../leaf.nov")
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "lib/types/option.nov", .data = "@[public]\nlet Option: (T: type) -> type = union { some: T, none, }" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "lib/leaf.nov", .data = "@[public]\nlet visible = true\nlet secret = false" });
+    const path = try tmp.dir.realPathFileAlloc(io, "main.nov", allocator);
+    defer allocator.free(path);
+    const lib = try tmp.dir.realPathFileAlloc(io, "lib", allocator);
+    defer allocator.free(lib);
+    try inlineLoaderAllocationTest(allocator, path, lib);
+    try TestAllocations.checkAllAllocationFailures(allocator, inlineLoaderAllocationTest, .{ path, lib });
+}
+
+fn inlineErrorAllocationTest(allocator: std.mem.Allocator, path: []const u8) !void {
+    var compilation = try Compilation.load(allocator, std.testing.io, path, .{});
+    defer compilation.deinit();
+
+    var invalid: usize = 0;
+    var cycles: usize = 0;
+    var missing: usize = 0;
+    var library: usize = 0;
+    var paths: usize = 0;
+    for (compilation.diagnostics.items) |diagnostic| {
+        try std.testing.expectEqualStrings("@import", compilation.sourceSlice(diagnostic.span).?);
+        switch (diagnostic.tag) {
+            .invalid_import => invalid += 1,
+            .import_cycle => {
+                cycles += 1;
+                try std.testing.expect(diagnostic.related.?.source != diagnostic.span.source);
+            },
+            .load_failed => {
+                missing += 1;
+                try std.testing.expect(diagnostic.cause != null);
+            },
+            .missing_library => library += 1,
+            .invalid_path => paths += 1,
+            else => return error.UnexpectedDiagnostic,
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 8), invalid);
+    try std.testing.expectEqual(@as(usize, 1), cycles);
+    try std.testing.expectEqual(@as(usize, 1), missing);
+    try std.testing.expectEqual(@as(usize, 1), library);
+    try std.testing.expectEqual(@as(usize, 1), paths);
+    const root = compilation.getModule(compilation.root.?).?;
+    try std.testing.expect(initializerReference(&compilation, root, "missing") == null);
+    try std.testing.expect(initializerReference(&compilation, root, "bounded") == null);
+}
+
+test "inline imports reject runtime local computed mutable annotated forms and preserve errors with OOM" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "main.nov", .data =
+        \\let next = @import("next.nov").value
+        \\let missing = @import("missing.nov").value
+        \\let standard = @import("std").Result
+        \\let bad_path = @import("other.txt").value
+        \\let mut mutable = @import("next.nov").value
+        \\let annotated: bool = @import("next.nov").value
+        \\let computed = @import(path).value
+        \\let extra = @import("next.nov", "next.nov").value
+        \\let missing_arg = @import().value
+        \\let runtime = consume(@import("next.nov").value)
+        \\let f: () -> void = {
+        \\let local = @import("next.nov").value
+        \\}
+        \\let container = struct {
+        \\let nested = @import("next.nov").value
+        \\}
+        \\let bounded = @import("next.nov").spin.visible
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "next.nov", .data =
+        \\@[public]
+        \\let value = @import("main.nov").next
+        \\@[public]
+        \\let spin = spin
+    });
+    const path = try tmp.dir.realPathFileAlloc(io, "main.nov", allocator);
+    defer allocator.free(path);
+    try inlineErrorAllocationTest(allocator, path);
+    try TestAllocations.checkAllAllocationFailures(allocator, inlineErrorAllocationTest, .{path});
+}
+
+test "inline imports retain loader and reference depth limits" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for (0..257) |index| {
+        const name = try std.fmt.allocPrint(allocator, "{d}.nov", .{index});
+        defer allocator.free(name);
+        const text = try std.fmt.allocPrint(allocator, "@[public]\nlet value = @import(\"{d}.nov\").value", .{index + 1});
+        defer allocator.free(text);
+        try tmp.dir.writeFile(io, .{ .sub_path = name, .data = text });
+    }
+    const path = try tmp.dir.realPathFileAlloc(io, "0.nov", allocator);
+    defer allocator.free(path);
+    var compilation = try Compilation.load(allocator, io, path, .{});
+    defer compilation.deinit();
+    try std.testing.expectEqual(@as(usize, 1), compilation.diagnostics.items.len);
+    try std.testing.expectEqual(.import_depth, compilation.diagnostics.items[0].tag);
+    try std.testing.expectEqual(@as(usize, 257), compilation.modules.items.len);
+
+    // A long member chain is bounded independently of the loader's graph limit.
+    var text: std.Io.Writer.Allocating = .init(allocator);
+    defer text.deinit();
+    try text.writer.writeAll("let deep = @import(\"0.nov\")");
+    for (0..129) |_| try text.writer.writeAll(".value");
+    try tmp.dir.writeFile(io, .{ .sub_path = "deep.nov", .data = text.written() });
+    const deep_path = try tmp.dir.realPathFileAlloc(io, "deep.nov", allocator);
+    defer allocator.free(deep_path);
+    var deep = try Compilation.load(allocator, io, deep_path, .{});
+    defer deep.deinit();
+    try std.testing.expect(deep.imports.items[0].node != null);
+    try std.testing.expect(initializerReference(&deep, deep.getModule(deep.root.?).?, "deep") == null);
 }
 
 test "loader rejects cycles missing files mutable computed and local imports" {

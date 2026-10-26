@@ -1078,10 +1078,12 @@ See [`lib/README.md`](lib/README.md).
 
 #### Executable imports
 
-- Only immutable top-level `let ns = @import("literal")` namespace bindings are
-  supported. `"std"` names the installed entry module; explicit relative paths
-  must end in `.nov` and resolve against the importing source directory. Computed,
-  interpolated, local/runtime, absolute-path and other named imports diagnose.
+- Immutable, unannotated top-level imports support namespace bindings such as
+  `let ns = @import("literal")` and direct member aliases such as
+  `let Result = @import("result.nov").Result`, including qualified member chains.
+  `"std"` names the installed entry module; explicit relative paths must end in
+  `.nov` and resolve against the importing source directory. Computed, interpolated,
+  local/runtime, mutable, annotated, absolute-path and other named imports diagnose.
 - Imports do not inject bare names. Namespace aliases, qualified declarations and
   explicit re-exports work. Supported ordinary functions, constants, nominal types,
   aliases and generic union templates/methods retain their defining scope.

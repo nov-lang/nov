@@ -233,7 +233,7 @@ pub fn renderCompilation(compilation: *const Compilation, writer: *std.Io.Writer
         const location = Location.init(source.ast.source, diagnostic.span.start);
         try location.renderPrefix(source.path, "error", writer);
         try writer.writeAll(switch (diagnostic.tag) {
-            .invalid_import => "@import requires an immutable, unannotated top-level namespace declaration with one literal string argument",
+            .invalid_import => "@import requires one literal string argument and must be the initializer or the base of a qualified member chain in an immutable, unannotated top-level declaration",
             .invalid_path => "import requires a relative literal .nov path or the named module 'std'",
             .missing_library => "named import 'std' requires a configured library directory",
             .load_failed => "cannot load imported source",
