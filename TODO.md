@@ -1,5 +1,15 @@
 # TODO
 
+Language tests are executable: `@[test]` marks top-level `() -> void` functions,
+excluded from normal semantic analysis/emission and not callable as ordinary values.
+`nov test file.nov` selects only root-file tests in source order, compiles once and
+runs each in a fresh subprocess, continuing after failures/crashes and reporting a
+summary/nonzero failure status. No main required; supports --cc, --debug/--release
+and --lib-dir. `@assert(bool[, string])` evaluates arguments eagerly once in order,
+reports source locations, and remains active in all modes. No unwinding/recovery,
+parallel execution, test filters, timeout flags or automatic dependency-test discovery.
+See examples/tests.nov and README.
+
 Scoped borrowing now covers every supported non-void runtime value type: bool,
 integers, strings, enums, structs/unions, arrays, ranges and functions. let ref=&local
 also supports readonly locals/parameters; mutability follows owner. Reads yield

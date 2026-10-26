@@ -100,6 +100,10 @@ fn checkInner(module: *Module, ir: *Ir, types: []const ?Ir.TypeId, id: Module.De
     const type_id = (if (sema) |analysis| try analysis.requestType(module, id) else types[tableIndex(module, id)]) orelse return false;
     const ty = ir.getType(type_id) orelse return error.InvalidTypeId;
     if (ty != .function) return error.InvalidTypeId;
+    if (declaration.is_test and (ty.function.params.len != 0 or ir.getType(ty.function.result).? != .void or declaration.noreturn)) {
+        try module.diagnostics.append(module.allocator, .{ .tag = .invalid_test_signature, .span = declaration.name_span });
+        return false;
+    }
     const full = module.source.ast.decl(declaration.node);
     const proto = module.source.ast.fullFnProto(full.ast.type_node) orelse return error.InvalidTypeId;
     if (proto.ast.params.len != ty.function.params.len) return error.InvalidTypeId;
@@ -551,9 +555,19 @@ const Context = struct {
 
     fn globalType(self: *Context, id: Module.DeclId) Error!?Known {
         const owner = self.declarationModule(id);
+        if (self.getDeclaration(id).is_test) {
+            try self.module.diagnostics.append(self.module.allocator, .{ .tag = .test_not_callable, .span = self.getDeclaration(id).name_span });
+            return null;
+        }
         const ty = (if (self.sema) |analysis| try analysis.requestType(owner, self.localId(id)) else if (@backingInt(id) < self.types.len) self.types[@backingInt(id)] else null) orelse return null;
         const full = owner.source.ast.decl(self.getDeclaration(id).node);
         return .{ .ty = ty, .annotation = if (full.ast.type_node != 0) owner.tokenSpan(owner.source.ast.firstToken(full.ast.type_node)) else null };
+    }
+
+    fn isAssertion(self: *Context, node: Ast.Node.Index) bool {
+        const ast = &self.module.source.ast;
+        return ast.nodes.items(.tag)[node] == .builtin_literal and
+            std.mem.eql(u8, ast.tokenSlice(ast.nodes.items(.main_token)[node]), "@assert");
     }
 
     fn isAscription(self: *Context, node: Ast.Node.Index) bool {
@@ -904,7 +918,7 @@ const Context = struct {
                     defer self.module.diagnostics.shrinkRetainingCapacity(diagnostics_start);
                     break :blk try self.ascribedType(call);
                 }
-                if (self.printing(call.ast.fn_expr) != null) break :blk .{ .ty = try self.ir.internType(.void) };
+                if (self.isAssertion(call.ast.fn_expr) or self.printing(call.ast.fn_expr) != null) break :blk .{ .ty = try self.ir.internType(.void) };
                 if (ast.nodes.items(.tag)[call.ast.fn_expr] == .field_access and try self.staticMethod(call.ast.fn_expr) == null) {
                     const field = ast.nodes.items(.data)[call.ast.fn_expr];
                     if (try self.probe(field.lhs, depth + 1)) |receiver| {
@@ -2227,6 +2241,33 @@ const Context = struct {
                     if (try self.expression(call.ast.args[1], ascribed, depth + 1) == null) return null;
                     return self.fit(ascribed.ty, expected, node);
                 }
+                if (self.isAssertion(call.ast.fn_expr)) {
+                    if (call.ast.args.len < 1 or call.ast.args.len > 2) return self.fail(.argument_count_mismatch, node, null);
+                    const unit = try self.ir.internType(.void);
+                    for (call.ast.args, 0..) |arg, index| {
+                        const argument_type = try self.ir.internType(if (index == 0) .boolean else .string);
+                        if (try self.expression(arg, .{ .ty = argument_type }, depth + 1) == null) return null;
+                        if (self.terminated) return if (expected) |want| want.ty else unit;
+                    }
+                    if (self.emitter) |emitter| {
+                        const start = self.span(call.ast.fn_expr).start;
+                        var line: usize = 1;
+                        var line_start: usize = 0;
+                        for (ast.source[0..start], 0..) |byte, index| {
+                            if (byte == '\n') {
+                                line += 1;
+                                line_start = index + 1;
+                            }
+                        }
+                        const location = try std.fmt.allocPrint(emitter.allocator, "{s}:{d}:{d}", .{ self.module.source.path, line, start - line_start + 1 });
+                        try emitter.record(node, unit, self.irSpan(node), .{ .assertion = .{
+                            .condition = try emitter.value(call.ast.args[0]),
+                            .message = if (call.ast.args.len == 2) try emitter.value(call.ast.args[1]) else null,
+                            .location = location,
+                        } });
+                    }
+                    return self.fit(unit, expected, node);
+                }
                 if (self.isPanic(call.ast.fn_expr)) {
                     if (call.ast.args.len != 1) return self.fail(.argument_count_mismatch, node, null);
                     const string = try self.ir.internType(.string);
@@ -2472,6 +2513,48 @@ test "noreturn direct recursion methods loops and terminal operands lower" {
     try std.testing.expect(sema.lowering_complete);
     try std.testing.expect(sema.entries[0].noreturn);
     try std.testing.expect(sema.ir.functions.items[0].noreturn);
+}
+
+test "assert requires bool and optional exact string without conversion" {
+    const cases = [_]struct { expression: []const u8, tag: Module.Diagnostic.Tag }{
+        .{ .expression = "@assert()", .tag = .argument_count_mismatch },
+        .{ .expression = "@assert(true,\"a\",\"b\")", .tag = .argument_count_mismatch },
+        .{ .expression = "@assert(1)", .tag = .literal_type_mismatch },
+        .{ .expression = "@assert(\"true\")", .tag = .literal_type_mismatch },
+        .{ .expression = "@assert(true,false)", .tag = .literal_type_mismatch },
+        .{ .expression = "@assert(true,@as(int,1))", .tag = .expression_type_mismatch },
+        .{ .expression = "@assert", .tag = .unsupported_body_expression },
+    };
+    for (cases) |case| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let f:()={s}", .{case.expression});
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "assert.nov", source);
+        defer module.deinit();
+        var result = try Lowering.lower(&module);
+        defer result.deinit();
+        try std.testing.expect(module.hasErrors());
+        try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
+    }
+}
+
+test "test declarations cannot be called or extracted from any ordinary body" {
+    for ([_][]const u8{
+        "@[test]\nlet check:()={}\nlet main:()=check()",
+        "@[test]\nlet check:()={}\nlet main:()={let callback=check\ncallback()}",
+        "@[test]\nlet check:()=check()",
+        "@[test]\nlet check:()={}\n@[test]\nlet other:()={let callback=check\ncallback()}",
+    }) |source| {
+        var module = try Module.init(std.testing.allocator, "test.nov", source);
+        defer module.deinit();
+        module.tests_enabled = true;
+        var result = try Lowering.lower(&module);
+        defer result.deinit();
+        var rejected = false;
+        for (module.diagnostics.items) |diagnostic| if (diagnostic.tag == .test_not_callable) {
+            rejected = true;
+        };
+        try std.testing.expect(rejected);
+    }
 }
 
 test "panic requires exactly one exact string argument" {
@@ -4041,6 +4124,55 @@ test "reusable range values preserve exact inference and reject unsupported valu
             try std.testing.expect(diagnostic.span.start < diagnostic.span.end);
             try std.testing.expect(diagnostic.span.end <= source.len);
         }
+    }
+}
+
+test "assert borrow CFG preserves branch loop continuation and fallback boundaries" {
+    for ([_]struct { body: []const u8, conflict: bool = false }{
+        .{ .body = "loop {@println(r)\nn=1\n@assert(true)}", .conflict = true },
+        .{ .body = "loop {@println(r)\nn=1\n@assert(false)}", .conflict = true },
+        .{ .body = "if flag {n=1\n@assert(true)} else {@println(r)}" },
+        .{ .body = "if flag {@println(r)} else {n=1\n@assert(true)}" },
+        .{ .body = "if flag {n=1\n@assert(false)} else {@println(r)}" },
+        .{ .body = "if flag {n=1\n@assert(true)} else {@assert(true)}\n@println(r)", .conflict = true },
+        .{ .body = "loop flag {@println(r)\nn=1\n@assert(true)}", .conflict = true },
+        .{ .body = "loop flag : @assert(true) {@println(r)\nn=1}", .conflict = true },
+        .{ .body = "loop flag : @println(r) {n=1\n@assert(true)}", .conflict = true },
+        .{ .body = "loop {@println(r)\nif flag {n=1\n@assert(true)} else {continue}}", .conflict = true },
+        .{ .body = "loop {if flag {loop {break}\n@println(r)\nn=1\n@assert(true)} else {continue}}", .conflict = true },
+        .{ .body = "if flag {loop false {} else {n=1\n@assert(true)}} else {@println(r)}" },
+        .{ .body = "loop false {} else {n=1\n@assert(true)}\n@println(r)", .conflict = true },
+        .{ .body = "loop false {} else {@println(r)\n@assert(true)}\nn=1" },
+        .{ .body = "@assert(r==0,{n=1\n\"snapshot\"})" },
+        .{ .body = "@assert(false,{n=1\n\"{r}\"})", .conflict = true },
+        .{ .body = "@assert(true,{n=1\n\"{r}\"})", .conflict = true },
+        .{ .body = "@assert(false,\"{r}\")\nn=1" },
+        .{ .body = "@assert(true)\nn=1\n@println(r)", .conflict = true },
+        .{ .body = "@assert(false)\nn=1\n@println(r)", .conflict = true },
+        .{ .body = "if flag {n=1\n@assert(true,{return})} else {@println(r)}" },
+    }) |case| try testAssertBorrowCfg(std.testing.allocator, case.body, case.conflict);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAssertBorrowCfg, .{ "loop {@println(r)\nn=1\n@assert(true)}", true });
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAssertBorrowCfg, .{ "if flag {n=1\n@assert(true)} else {@println(r)}", false });
+}
+
+fn testAssertBorrowCfg(allocator: std.mem.Allocator, body: []const u8, conflict: bool) !void {
+    const source = try std.fmt.allocPrint(allocator, "let f:(flag:bool)={{let mut n:int=0\nlet r=&n\n{s}\n}}", .{body});
+    defer allocator.free(source);
+    var module = try Module.init(allocator, "assert-borrow.nov", source);
+    defer module.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
+    var result = try Lowering.lower(&module);
+    defer result.deinit();
+    if (conflict) {
+        try std.testing.expect(module.hasErrors());
+        try std.testing.expectEqual(Module.Diagnostic.Tag.borrow_conflict, module.diagnostics.items[0].tag);
+        try std.testing.expectEqualStrings("&n", module.sourceSlice(module.diagnostics.items[0].related.?).?);
+        try std.testing.expect(!result.lowering_complete);
+    } else {
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expect(result.lowering_complete);
+        try result.ir.verify();
     }
 }
 

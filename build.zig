@@ -121,6 +121,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const extern_tests = b.step("test-cli-extern", "Run extern CLI and separate-TU C ABI tests");
     addExternCliTests(b, exe, extern_tests);
     test_step.dependOn(extern_tests);
+    const language_tests = b.step("test-cli-language-tests", "Run test command and assertion language CLI tests");
+    addLanguageTestCliTests(b, exe, language_tests);
+    test_step.dependOn(language_tests);
     addFieldMutationCliTests(b, exe, test_step, fixtures);
     addGenericStructCliTests(b, exe, test_step, fixtures);
     addRangeValueCliTests(b, exe, test_step, fixtures);
@@ -485,7 +488,7 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
             run.addArgs(&.{ command, "valid.nov", mode });
             run.expectExitCode(1);
             run.expectStdOutEqual("");
-            run.expectStdErrMatch("require the build or run command");
+            run.expectStdErrMatch("require the build, run, or test command");
             test_step.dependOn(&run.step);
         }
     }
@@ -1091,6 +1094,184 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
                 }
             }
         }
+    }
+}
+
+fn addLanguageTestCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    const fixtures = b.addWriteFiles();
+    const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
+    _ = fixtures.add("tests.nov", @embedFile("examples/tests.nov"));
+    _ = fixtures.add("imported.nov", "@[public]\n@[export(\"test_helper\")]\nlet helper: () -> i32 = 42\n" ++
+        "@[test]\nlet panic_test: () = @panic(\"imported test ran\")\n" ++
+        "@[test]\nlet ignored: (x: Missing) -> Missing = {let local = @import(\"missing.nov\")\nunknown}\n");
+    _ = fixtures.add("ordered.nov", "let api = @import(\"imported.nov\")\n" ++
+        "@[test]\nlet zebra: () = @assert(api.helper() == 42)\n" ++
+        "let main: () = @panic(\"main ran\")\n" ++
+        "@[test]\nlet alpha: () = {}\n");
+    _ = fixtures.add("excluded.nov", "let api = @import(\"imported.nov\")\n" ++
+        "let G: (T: type) -> type = struct { value: T, }\n" ++
+        "@[test]\nlet ignored: (x: Missing) -> G(Missing) = {let local = @import(\"absent.nov\")\n@assert(false)\nunknown}\n" ++
+        "let main: () = @println(api.helper())\n");
+    _ = fixtures.add("syntax-error.nov", "@[test]\nlet broken: () = {let x = }\n");
+    _ = fixtures.add("empty.nov", "let helper: () -> i32 = 42\n");
+    _ = fixtures.add("failures.nov", "@[extern]\nlet exit: (status: i32)\n" ++
+        "@[test]\nlet before: () = {}\n" ++
+        "@[test]\nlet panic_test: () = @panic(\"intentional panic\")\n" ++
+        "@[test]\nlet assertion: () = @assert(false, \"intentional assertion\")\n" ++
+        "@[test]\nlet no_message: () = @assert(false)\n" ++
+        "@[test]\nlet nonzero: () = exit(7)\n" ++
+        "@[test]\nlet after: () = {}\n");
+    _ = fixtures.add("eager.nov", "let condition: () -> bool = {@print(\"C\")\ntrue}\n" ++
+        "let message: () -> string = {@print(\"M\")\n\"unused\"}\n" ++
+        "@[test]\nlet eager: () = {let unit: void = @assert(condition(), message())\n@assert(true)\n@print(\"T\")}\n");
+    _ = fixtures.add("isolation.nov", "@[extern]\nlet rand: () -> i32\n@[extern]\nlet srand: (seed: u32)\n" ++
+        "@[test]\nlet first: () = {let initial = rand()\nsrand(1)\n@assert(rand() == initial)}\n" ++
+        "@[test]\nlet second: () = {let initial = rand()\nsrand(1)\n@assert(rand() == initial)}\n");
+    const Case = struct {
+        args: []const []const u8,
+        output: []const u8 = "",
+        diagnostic: ?[]const u8 = null,
+        code: u8 = 0,
+    };
+    const cases = [_]Case{
+        .{ .args = &.{"test"}, .code = 1, .diagnostic = "test requires exactly one file" },
+        .{ .args = &.{ "test", "empty.nov", "empty.nov" }, .code = 1, .diagnostic = "test requires exactly one file" },
+        .{ .args = &.{ "test", "empty.nov", "extra" }, .code = 1, .diagnostic = "test requires exactly one file" },
+        .{ .args = &.{ "test", "empty.nov", "--debug", "--release" }, .code = 1, .diagnostic = "--debug and --release are mutually exclusive" },
+        .{ .args = &.{ "test", "empty.nov", "-o", "out" }, .code = 1, .diagnostic = "--output requires the build command" },
+        .{ .args = &.{ "test", "empty.nov", "--library" }, .code = 1, .diagnostic = "--library requires the emit-c command" },
+        .{ .args = &.{ "test", "empty.nov", "--check" }, .code = 1, .diagnostic = "--check requires the fmt command" },
+        .{ .args = &.{ "test", "empty.nov", "--exclude", "x" }, .code = 1, .diagnostic = "--exclude requires the fmt command" },
+        .{ .args = &.{ "test", "empty.nov", "--semantic" }, .code = 1, .diagnostic = "--semantic requires the check command" },
+        .{ .args = &.{ "test", "empty.nov", "--cc", "" }, .code = 1, .diagnostic = "--cc requires a nonempty executable name or path" },
+        .{ .args = &.{ "test", "empty.nov", "--lib-dir", "" }, .code = 1, .diagnostic = "--lib-dir requires a nonempty path" },
+        .{ .args = &.{ "test", "missing.nov" }, .code = 1, .diagnostic = "FileNotFound" },
+        .{ .args = &.{ "check", "excluded.nov" } },
+        .{ .args = &.{ "check", "--semantic", "excluded.nov" } },
+        .{ .args = &.{ "check", "syntax-error.nov" }, .code = 1, .diagnostic = "error:" },
+        .{ .args = &.{ "test", "syntax-error.nov" }, .code = 1, .diagnostic = "error:" },
+        .{ .args = &.{ "fmt", "--check", "tests.nov" } },
+    };
+    for (cases) |case| {
+        const run = b.addRunArtifact(exe);
+        run.step.name = b.fmt("CLI language tests: {s} ({d} arguments)", .{ case.args[0], case.args.len });
+        run.setCwd(fixtures.getDirectory());
+        run.addArgs(case.args);
+        run.expectExitCode(case.code);
+        run.expectStdOutEqual(case.output);
+        if (case.diagnostic) |message| run.expectStdErrMatch(message) else run.expectStdErrEqual("");
+        test_step.dependOn(&run.step);
+    }
+    const invalid = [_]struct { name: []const u8, source: []const u8, diagnostic: []const u8 }{
+        .{ .name = "signature", .source = "@[test]\nlet bad: (x: i32) = {}\n", .diagnostic = "test function must have type () -> void" },
+        .{ .name = "return-type", .source = "@[test]\nlet bad: () -> i32 = 1\n", .diagnostic = "test function must have type () -> void" },
+        .{ .name = "call", .source = "@[test]\nlet hidden: () = {}\nlet helper: () = hidden()\n", .diagnostic = "test functions cannot be referenced or called" },
+        .{ .name = "extract", .source = "@[test]\nlet hidden: () = {}\nlet helper: () = {let f = hidden\n}\n", .diagnostic = "test functions cannot be referenced or called" },
+        .{ .name = "test-call", .source = "@[test]\nlet hidden: () = {}\n@[test]\nlet caller: () = hidden()\n", .diagnostic = "test functions cannot be referenced or called" },
+        .{ .name = "public-reference", .source = "let api = @import(\"public-test.nov\")\n@[test]\nlet caller: () = api.hidden()\n", .diagnostic = "test functions cannot be referenced or called" },
+        .{ .name = "condition", .source = "@[test]\nlet bad: () = @assert(1)\n", .diagnostic = "literal does not match the annotated type" },
+        .{ .name = "message", .source = "@[test]\nlet bad: () = @assert(true, 1)\n", .diagnostic = "literal does not match the annotated type" },
+        .{ .name = "arity-zero", .source = "@[test]\nlet bad: () = @assert()\n", .diagnostic = "error:" },
+        .{ .name = "arity-three", .source = "@[test]\nlet bad: () = @assert(true, \"x\", \"y\")\n", .diagnostic = "error:" },
+        .{ .name = "compile-error", .source = "@[test]\nlet before: () = @println(\"must not run\")\n@[test]\nlet bad: () = missing()\n", .diagnostic = "unknown name 'missing'" },
+        .{ .name = "width", .source = "@[test]\nlet bad: () = {let n: i128 = 1\n@assert(n == 1)}\n", .diagnostic = "C backend only supports 8, 16, 32 and 64-bit integers" },
+    };
+    _ = fixtures.add("public-test.nov", "@[public]\n@[test]\nlet hidden: () = {}\n");
+    _ = fixtures.add("public-normal.nov", "let api = @import(\"public-test.nov\")\nlet helper: () = api.hidden()\n");
+    for (invalid) |case| {
+        const source = b.fmt("invalid-{s}.nov", .{case.name});
+        _ = fixtures.add(source, case.source);
+        const run = b.addRunArtifact(exe);
+        run.step.name = b.fmt("CLI language tests: reject {s}", .{case.name});
+        run.setCwd(fixtures.getDirectory());
+        run.addArgs(&.{ "test", source });
+        run.expectExitCode(1);
+        run.expectStdOutEqual("");
+        run.expectStdErrMatch(case.diagnostic);
+        test_step.dependOn(&run.step);
+        if (std.mem.eql(u8, case.name, "call") or std.mem.eql(u8, case.name, "extract") or std.mem.eql(u8, case.name, "public-reference")) {
+            const normal = b.addRunArtifact(exe);
+            normal.step.name = b.fmt("CLI language tests: normal code rejects {s}", .{case.name});
+            normal.setCwd(fixtures.getDirectory());
+            normal.addArgs(&.{ "check", "--semantic", if (std.mem.eql(u8, case.name, "public-reference")) "public-normal.nov" else source });
+            normal.expectExitCode(1);
+            normal.expectStdOutEqual("");
+            normal.expectStdErrMatch(case.diagnostic);
+            test_step.dependOn(&normal.step);
+        }
+    }
+    for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+        const runtime_cases = [_]Case{
+            .{ .args = &.{ "test", "tests.nov" }, .output = "PASS addition\nPASS array_copies\nPASS option_value\n3 passed; 0 failed; 3 total\n" },
+            .{ .args = &.{ "test", "ordered.nov" }, .output = "PASS zebra\nPASS alpha\n2 passed; 0 failed; 2 total\n" },
+            .{ .args = &.{ "test", "empty.nov" }, .output = "0 passed; 0 failed; 0 total\n" },
+            .{ .args = &.{ "test", "eager.nov" }, .output = "CMTPASS eager\n1 passed; 0 failed; 1 total\n" },
+            .{ .args = &.{ "test", "isolation.nov" }, .output = "PASS first\nPASS second\n2 passed; 0 failed; 2 total\n" },
+            .{ .args = &.{ "test", "failures.nov" }, .code = 1, .output = "PASS before\nFAIL panic_test (exit 1)\nFAIL assertion (exit 1)\nFAIL no_message (exit 1)\nFAIL nonzero (exit 7)\nPASS after\n2 passed; 4 failed; 6 total\n", .diagnostic = "failures.nov:8:21: assertion failed: intentional assertion\n" },
+            .{ .args = &.{ "run", "excluded.nov" }, .output = "42\n" },
+        };
+        for (runtime_cases) |case| {
+            const run = b.addRunArtifact(exe);
+            run.step.name = b.fmt("CLI language tests: {s} {s} {s}", .{ case.args[0], case.args[1], mode });
+            run.setCwd(fixtures.getDirectory());
+            run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+            run.setEnvironmentVariable("NOV_CC", "");
+            run.setEnvironmentVariable("CC", "");
+            run.addArgs(case.args);
+            if (mode.len != 0) run.addArg(mode);
+            if (std.mem.eql(u8, case.args[1], "tests.nov")) run.addArgs(&.{ "--cc", "/nov-missing/explicit" });
+            run.addArg("--lib-dir");
+            run.addDirectoryArg(library);
+            run.expectExitCode(case.code);
+            run.expectStdOutEqual(case.output);
+            if (case.diagnostic) |message| {
+                run.expectStdErrMatch(message);
+                run.expectStdErrMatch("panic: intentional panic");
+                run.expectStdErrMatch("failures.nov:10:22: assertion failed\n");
+            } else run.expectStdErrEqual("");
+            test_step.dependOn(&run.step);
+        }
+    }
+    const emit = b.addRunArtifact(exe);
+    emit.setCwd(fixtures.getDirectory());
+    emit.addArgs(&.{ "emit-c", "excluded.nov" });
+    emit.expectExitCode(0);
+    emit.expectStdErrEqual("");
+    const emitted = emit.captureStdOut(.{});
+    const inspect = b.addCheckFile(emitted, .{ .expected_matches = &.{"int main("} });
+    test_step.dependOn(&inspect.step);
+    const compile = b.addRunArtifact(exe);
+    compile.setCwd(fixtures.getDirectory());
+    compile.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+    compile.setEnvironmentVariable("NOV_CC", "");
+    compile.setEnvironmentVariable("CC", "");
+    compile.addArgs(&.{ "build", "excluded.nov", "-o" });
+    const binary = compile.addOutputFileArg(if (exe.root_module.resolved_target.?.result.os.tag == .windows) "excluded.exe" else "excluded");
+    compile.expectExitCode(0);
+    compile.expectStdOutEqual("");
+    compile.expectStdErrEqual("");
+    const execute = std.Build.Step.Run.create(b, "CLI language tests: normal build excludes tests");
+    execute.addFileArg(binary);
+    execute.expectExitCode(0);
+    execute.expectStdOutEqual("42\n");
+    execute.expectStdErrEqual("");
+    test_step.dependOn(&execute.step);
+    const package = b.addWriteFiles();
+    const installed_exe = package.addCopyFile(exe.getEmittedBin(), b.fmt("bin/{s}", .{exe.out_filename}));
+    _ = package.addCopyDirectory(b.path("lib"), "lib/nov", .{});
+    for ([_]bool{ false, true }) |override| {
+        const installed = std.Build.Step.Run.create(b, b.fmt("CLI language tests: installed std override={}", .{override}));
+        installed.addFileArg(installed_exe);
+        installed.setCwd(fixtures.getDirectory());
+        installed.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+        installed.setEnvironmentVariable("NOV_CC", "");
+        installed.setEnvironmentVariable("CC", "");
+        installed.addArgs(&.{ "test", "tests.nov" });
+        if (override) installed.addArgs(&.{ "--lib-dir", "missing-library" });
+        installed.expectExitCode(if (override) 1 else 0);
+        installed.expectStdOutEqual(if (override) "" else "PASS addition\nPASS array_copies\nPASS option_value\n3 passed; 0 failed; 3 total\n");
+        if (override) installed.expectStdErrMatch("cannot load imported source: FileNotFound") else installed.expectStdErrEqual("");
+        test_step.dependOn(&installed.step);
     }
 }
 

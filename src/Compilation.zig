@@ -129,7 +129,7 @@ pub fn addSource(self: *Compilation, canonical_path: []const u8, text: []const u
 pub fn setRoot(self: *Compilation, id: Source.Id) void {
     const module = self.getModule(id).?;
     self.root = id;
-    self.root_main = if (module.lookup("main")) |local| self.declaration_ids.get(.{ .source = id, .local = local }) else null;
+    self.root_main = if (module.lookup("main")) |local| if (!module.getDeclaration(local).?.is_test) self.declaration_ids.get(.{ .source = id, .local = local }) else null else null;
 }
 
 pub fn namespace(self: *const Compilation, declaration: DeclId) ?Import {
@@ -193,6 +193,7 @@ pub fn prepareSemantics(self: *Compilation) std.mem.Allocator.Error!void {
     for (self.modules.items) |module| {
         module.compilation = self;
         module.clearSpecializations();
+        module.resetAliases();
     }
     // Drop only analysis-created suffix identities. Source declarations and
     // namespace edges keep their canonical IDs across repeated analyses.
@@ -213,6 +214,7 @@ pub fn prepareSemantics(self: *Compilation) std.mem.Allocator.Error!void {
         var changed = false;
         for (self.modules.items) |module| {
             for (module.declarations.items) |*decl| {
+                if (decl.is_test) continue;
                 const full = module.source.ast.decl(decl.node).ast;
                 if (full.is_mutable or full.type_node != 0 or full.init_node == 0) continue;
                 if (module.source.ast.fullCall(full.init_node)) |call| {
@@ -323,10 +325,12 @@ fn discover(self: *Compilation, io: std.Io, id: Source.Id, options: Options, act
     const module = self.getModule(id).?;
     const ast = &module.source.ast;
     if (ast.errors.len != 0) return;
-    // Scan every call, not just declaration initializers: runtime/local/computed
-    // imports must not disappear into an ignored body or dormant generic method.
+    // Neither test signatures nor bodies contribute to the source graph.
+    // Enabled tests validate both later in Sema without supporting local imports.
+    // Other local/computed imports still diagnose, even in dormant generics.
     for (ast.nodes.items(.tag), 0..) |_, index| {
         const node: u32 = @intCast(index);
+        if (module.inTest(node, false)) continue;
         const call = ast.fullCall(node) orelse continue;
         if (!std.mem.eql(u8, ast.tokenSlice(ast.firstToken(call.ast.fn_expr)), "@import")) continue;
         const span = module.tokenSpan(ast.firstToken(node));
@@ -787,6 +791,46 @@ test "inline imports retain loader and reference depth limits" {
     defer deep.deinit();
     try std.testing.expect(deep.imports.items[0].node != null);
     try std.testing.expect(initializerReference(&deep, deep.getModule(deep.root.?).?, "deep") == null);
+}
+
+fn testIgnoredBodyImports(allocator: std.mem.Allocator, path: []const u8) !void {
+    var comp = try Compilation.load(allocator, std.testing.io, path, .{});
+    defer comp.deinit();
+
+    try std.testing.expect(!comp.hasErrors());
+    try std.testing.expectEqual(@as(usize, 2), comp.modules.items.len);
+    try std.testing.expectEqual(@as(usize, 1), comp.imports.items.len);
+    const module = comp.getModule(comp.root.?).?;
+    module.tests_enabled = true;
+    try comp.prepareSemantics();
+    try std.testing.expect(!comp.hasErrors());
+    try std.testing.expectEqual(@as(usize, 2), comp.modules.items.len);
+}
+
+test "test body imports never load sources or diagnose during graph discovery under OOM" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "main.nov", .data =
+        \\let library = @import("library.nov")
+        \\@[test]
+        \\let sample: () = {
+        \\let missing = @import("missing.nov")
+        \\let standard = @import("std")
+        \\let computed = @import(path)
+        \\}
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "library.nov", .data =
+        \\@[test]
+        \\let ignored: () = {
+        \\let cyclic = @import("main.nov")
+        \\}
+    });
+    const path = try tmp.dir.realPathFileAlloc(io, "main.nov", allocator);
+    defer allocator.free(path);
+    try testIgnoredBodyImports(allocator, path);
+    try TestAllocations.checkAllAllocationFailures(allocator, testIgnoredBodyImports, .{path});
 }
 
 test "loader rejects cycles missing files mutable computed and local imports" {

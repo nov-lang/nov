@@ -20,7 +20,7 @@ compilation: ?*Compilation = null,
 /// Entry-point/backend/runtime configuration is still a separate obligation.
 lowering_complete: bool = false,
 
-pub const Status = enum { deferred, generic, unrequested, requested, namespace, type_alias, signature_only, external, constant_checked, body_checked, lowered, failed };
+pub const Status = enum { ignored, deferred, generic, unrequested, requested, namespace, type_alias, signature_only, external, constant_checked, body_checked, lowered, failed };
 pub const Entry = struct {
     type_id: ?Ir.TypeId = null,
     /// Represented type, never the runtime type of this declaration.
@@ -41,6 +41,8 @@ pub fn analyzeAnnotations(module: *Module) Error!Sema {
     const diagnostics_start = module.diagnostics.items.len;
     errdefer module.diagnostics.shrinkRetainingCapacity(diagnostics_start);
     module.clearSpecializations();
+    module.resetAliases();
+    try module.classifyAliases();
     var result: Sema = .{
         .allocator = module.allocator,
         .ir = Ir.init(module.allocator),
@@ -62,6 +64,10 @@ fn analyzeModuleAnnotations(result: *Sema, module: *Module) Error!void {
         result.entries[result.entryIndex(module, @fromBackingInt(@intCast(i)))] = .{};
     };
     for (module.declarations.items, 0..) |declaration, i| {
+        if (declaration.is_test and !module.testEnabled()) {
+            result.entries[result.entryIndex(module, @fromBackingInt(@intCast(i)))].status = .ignored;
+            continue;
+        }
         if (declaration.is_generic) {
             if (declaration.is_record) _ = try TypeResolver.validateGeneric(module, @fromBackingInt(@intCast(i)));
             result.entries[result.entryIndex(module, @fromBackingInt(@intCast(i)))].status = .generic;
@@ -79,7 +85,7 @@ fn analyzeModuleAnnotations(result: *Sema, module: *Module) Error!void {
     while (i < module.declarations.items.len) : (i += 1) {
         try result.syncEntries(module);
         const declaration = module.declarations.items[i];
-        if (declaration.concrete_type != null) continue;
+        if (declaration.concrete_type != null or (declaration.is_test and !module.testEnabled())) continue;
         const full = module.source.ast.decl(declaration.node);
         if (declaration.is_namespace) {
             result.entries[result.entryIndex(module, @fromBackingInt(@intCast(i)))].status = .namespace;
@@ -120,6 +126,14 @@ fn analyzeModuleAnnotations(result: *Sema, module: *Module) Error!void {
         };
         result.entries[result.entryIndex(module, @fromBackingInt(@intCast(i)))].type_id = type_id;
         if (module.source.ast.fullFnProto(full.ast.type_node) != null) {
+            if (declaration.is_test) {
+                const signature = result.ir.getType(type_id).?.function;
+                if (signature.params.len != 0 or result.ir.getType(signature.result).? != .void) {
+                    try module.diagnostics.append(module.allocator, .{ .tag = .invalid_test_signature, .span = declaration.name_span });
+                    result.entries[result.entryIndex(module, @fromBackingInt(@intCast(i)))].status = .failed;
+                    continue;
+                }
+            }
             result.entries[result.entryIndex(module, @fromBackingInt(@intCast(i)))].noreturn = declaration.noreturn;
             if (declaration.noreturn and result.ir.getType(result.ir.getType(type_id).?.function.result).? != .void) {
                 try module.diagnostics.append(module.allocator, .{ .tag = .noreturn_result, .span = declaration.name_span });
@@ -406,9 +420,13 @@ pub fn requestType(self: *Sema, module: *Module, id: Module.DeclId) Ir.BuildErro
     try self.syncEntries(module);
     const index = @backingInt(id);
     if (self.entryIndex(module, id) >= self.entries.len) return error.InvalidTypeId;
+    const declaration = module.getDeclaration(id).?;
+    if (declaration.is_test and !module.testEnabled()) {
+        try module.diagnostics.append(module.allocator, .{ .tag = .test_not_callable, .span = declaration.name_span });
+        return null;
+    }
     const entry = self.entries[self.entryIndex(module, @fromBackingInt(@intCast(index)))];
     if (entry.status != .unrequested and entry.status != .requested) return entry.type_id;
-    const declaration = module.getDeclaration(id).?;
     if (declaration.concrete_type == null or declaration.is_type_alias) return null;
     // Failed speculative requests must be retried: probes may discard their
     // diagnostics. The worklist performs a final, non-speculative request too.
@@ -1130,6 +1148,35 @@ fn testForeignSymbols(allocator: std.mem.Allocator, first: []const u8, second: [
         try std.testing.expect(std.mem.indexOf(u8, rendered.written(), "/app/first.nov:") != null);
         if (separate) try std.testing.expect(std.mem.indexOf(u8, rendered.written(), "/app/second.nov:") != null);
     } else try std.testing.expect(!comp.hasErrors());
+}
+
+fn testDisabledRequest(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "disabled-request.nov", "@[test]\nlet sample: () = {}");
+    defer module.deinit();
+    var sema = try analyzeAnnotations(&module);
+    defer sema.deinit();
+    const id = module.lookup("sample").?;
+    try std.testing.expectEqual(Status.ignored, sema.getEntry(id).?.status);
+    try std.testing.expectEqual(@as(?Ir.TypeId, null), try sema.requestType(&module, id));
+    try std.testing.expectEqual(Module.Diagnostic.Tag.test_not_callable, module.diagnostics.items[0].tag);
+    try std.testing.expectEqual(Status.ignored, sema.getEntry(id).?.status);
+}
+
+test "disabled test type requests fail without activating entries under OOM" {
+    try testDisabledRequest(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testDisabledRequest, .{});
+}
+
+test "enabled test signature remains available for its own body check" {
+    var module = try Module.init(std.testing.allocator, "enabled-request.nov", "@[test]\nlet sample: () = {}");
+    defer module.deinit();
+    module.tests_enabled = true;
+    var sema = try analyzeAnnotations(&module);
+    defer sema.deinit();
+    const id = module.lookup("sample").?;
+    try std.testing.expectEqual(Status.signature_only, sema.getEntry(id).?.status);
+    try std.testing.expect(try sema.requestType(&module, id) != null);
+    try std.testing.expect(!module.hasErrors());
 }
 
 test "extern shared symbols compare canonical signatures and noreturn across both sources under OOM" {

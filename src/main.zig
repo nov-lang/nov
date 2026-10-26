@@ -25,6 +25,7 @@ const Dependencies = @import("Dependencies.zig");
 const Lowering = @import("Lowering.zig");
 const CEmitter = @import("CEmitter.zig");
 const Driver = @import("Driver.zig");
+const TestRunner = @import("TestRunner.zig");
 const FmtPaths = @import("FmtPaths.zig");
 
 const params = clap.parseParamsComptime(
@@ -33,11 +34,11 @@ const params = clap.parseParamsComptime(
     \\--check                Check formatting without changing files (fmt only).
     \\--exclude <str>...      Exclude a literal file/directory path (fmt only).
     \\--semantic             Check the bounded semantic/lowering subset (check only).
-    \\--lib-dir <str>         Override the library root (semantic check/emit-c/build/run).
+    \\--lib-dir <str>         Override the library root (semantic check/emit-c/build/run/test).
     \\--library               Emit library C without a process entrypoint (emit-c only).
-    \\--debug                Compile with -O0 -g (build/run only).
-    \\--release              Compile with -O3 (default; build/run only).
-    \\--cc <str>             C compiler executable (build/run only).
+    \\--debug                Compile with -O0 -g (build/run/test only).
+    \\--release              Compile with -O3 (default; build/run/test only).
+    \\--cc <str>             C compiler executable (build/run/test only).
     \\-o, --output <str>      Output executable path (build only).
     \\<arg>...
     \\
@@ -51,10 +52,12 @@ fn usage(writer: *std.Io.Writer) !void {
         \\       nov emit-c [--library] <file>
         \\       nov [build] <file> [-o|--output <path>] [--cc <executable>] [--debug|--release]
         \\       nov run <file> [--cc <executable>] [--debug|--release]
+        \\       nov test <file> [--cc <executable>] [--debug|--release] [--lib-dir <path>]
         \\
         \\Check syntax, or the bounded semantic subset with --semantic.
         \\Semantic commands accept --lib-dir; the default is executable-relative ../lib/nov.
         \\Emit program C11 with emit-c, compile with build, or compile and run with run.
+        \\Run root-source tests in separate processes with test; no main is required.
         \\
         \\Options:
         \\
@@ -103,6 +106,7 @@ pub fn main(init: std.process.Init) !u8 {
         std.mem.indexOfAny(u8, args[0], "/\\") != null);
     const is_build = implicit_build or (args.len != 0 and std.mem.eql(u8, args[0], "build"));
     const is_run = args.len != 0 and std.mem.eql(u8, args[0], "run");
+    const is_test = args.len != 0 and std.mem.eql(u8, args[0], "test");
     if (res.args.library != 0 and !is_emit) {
         try stderr.writeAll("error: --library requires the emit-c command\n");
         return 1;
@@ -111,13 +115,13 @@ pub fn main(init: std.process.Init) !u8 {
         try stderr.writeAll("error: --debug and --release are mutually exclusive\n");
         return 1;
     }
-    if ((res.args.debug != 0 or res.args.release != 0) and !is_build and !is_run) {
-        try stderr.writeAll("error: --debug and --release require the build or run command\n");
+    if ((res.args.debug != 0 or res.args.release != 0) and !is_build and !is_run and !is_test) {
+        try stderr.writeAll("error: --debug and --release require the build, run, or test command\n");
         return 1;
     }
     const mode: Driver.Mode = if (res.args.debug != 0) .debug else .release;
-    if (res.args.cc != null and !is_build and !is_run) {
-        try stderr.writeAll("error: --cc requires the build or run command\n");
+    if (res.args.cc != null and !is_build and !is_run and !is_test) {
+        try stderr.writeAll("error: --cc requires the build, run, or test command\n");
         return 1;
     }
     if (res.args.output != null and !is_build) {
@@ -141,8 +145,8 @@ pub fn main(init: std.process.Init) !u8 {
         return 1;
     }
     if (res.args.@"lib-dir") |lib_dir| {
-        if (!is_build and !is_run and !is_emit and !(args.len != 0 and std.mem.eql(u8, args[0], "check") and res.args.semantic != 0)) {
-            try stderr.writeAll("error: --lib-dir requires semantic check, emit-c, build, or run\n");
+        if (!is_build and !is_run and !is_test and !is_emit and !(args.len != 0 and std.mem.eql(u8, args[0], "check") and res.args.semantic != 0)) {
+            try stderr.writeAll("error: --lib-dir requires semantic check, emit-c, build, run, or test\n");
             return 1;
         }
         if (lib_dir.len == 0) {
@@ -165,6 +169,19 @@ pub fn main(init: std.process.Init) !u8 {
         }
     }
 
+    if (is_test) {
+        if (args.len != 2) {
+            try stderr.writeAll("error: test requires exactly one file\n");
+            return 1;
+        }
+        var buffer: [4096]u8 = undefined;
+        var stdout = std.Io.File.stdout().writer(init.io, &buffer);
+        defer stdout.interface.flush() catch {};
+        return testFile(init.io, init.gpa, init.environ_map, args[1], res.args.cc, mode, res.args.@"lib-dir", &stdout.interface, stderr) catch |err| {
+            try stderr.print("{s}: error: {s}\n", .{ args[1], @errorName(err) });
+            return 1;
+        };
+    }
     if (is_build or is_run) {
         const files = if (implicit_build) args else args[1..];
         if (files.len != 1) {
@@ -191,7 +208,7 @@ pub fn main(init: std.process.Init) !u8 {
         return if (valid) 0 else 1;
     }
     if (args.len < 2 or (!is_fmt and !std.mem.eql(u8, args[0], "check"))) {
-        if (args.len != 0) try stderr.print("error: unknown command or missing file for '{s}'; expected 'check', 'fmt', 'emit-c', 'build', 'run', or a .nov file/path\n", .{args[0]});
+        if (args.len != 0) try stderr.print("error: unknown command or missing file for '{s}'; expected 'check', 'fmt', 'emit-c', 'build', 'run', 'test', or a .nov file/path\n", .{args[0]});
         try usage(stderr);
         return 1;
     }
@@ -326,6 +343,15 @@ fn processFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, stder
     return true;
 }
 
+fn testFile(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Environ.Map, path: []const u8, cc: ?[]const u8, mode: Driver.Mode, lib_dir: ?[]const u8, stdout: *std.Io.Writer, stderr: *std.Io.Writer) !u8 {
+    var compilation = try loadCompilation(io, allocator, path, lib_dir);
+    defer compilation.deinit();
+    return TestRunner.run(io, allocator, &compilation, .{
+        .discovery = .{ .cc = cc, .nov_cc = env.get("NOV_CC"), .env_cc = env.get("CC"), .mode = mode },
+        .temp_root = env.get("TMPDIR") orelse env.get("TEMP") orelse (if (builtin.os.tag == .windows) "." else "/tmp"),
+    }, stdout, stderr);
+}
+
 fn buildFile(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Environ.Map, path: []const u8, output_option: ?[]const u8, cc: ?[]const u8, mode: Driver.Mode, execute: bool, stderr: *std.Io.Writer) !u8 {
     return buildFileWithLibrary(io, allocator, env, path, output_option, cc, mode, execute, null, stderr);
 }
@@ -435,7 +461,7 @@ fn emitCompilationMode(allocator: std.mem.Allocator, compilation: *Compilation, 
         .program => CEmitter.emitProgramRoot(allocator, &result.ir, entry, missing_span, &diagnostic),
         .library => CEmitter.emit(allocator, &result.ir, &diagnostic),
     }) catch |err| switch (err) {
-        error.UnsupportedIntegerWidth, error.MissingEntrypoint, error.InvalidEntrypoint, error.ExportSymbolCollision, error.ExternSymbolCollision => {
+        error.UnsupportedIntegerWidth, error.MissingEntrypoint, error.InvalidEntrypoint, error.InvalidTestEntrypoint, error.ExportSymbolCollision, error.ExternSymbolCollision => {
             if (err == error.MissingEntrypoint and compilation.root_main != null) diagnostic.reason = .entrypoint_signature;
             try Diagnostics.renderCompilationBackend(compilation, diagnostic, stderr);
             return false;
@@ -459,7 +485,7 @@ fn emitSource(allocator: std.mem.Allocator, path: []const u8, source: [:0]const 
             if (!module.hasErrors()) {
                 var diagnostic: CEmitter.Diagnostic = undefined;
                 const c_source = CEmitter.emitProgram(allocator, &result.ir, &diagnostic) catch |err| switch (err) {
-                    error.UnsupportedIntegerWidth, error.MissingEntrypoint, error.InvalidEntrypoint, error.ExportSymbolCollision, error.ExternSymbolCollision => {
+                    error.UnsupportedIntegerWidth, error.MissingEntrypoint, error.InvalidEntrypoint, error.InvalidTestEntrypoint, error.ExportSymbolCollision, error.ExternSymbolCollision => {
                         if (err == error.MissingEntrypoint) {
                             if (module.lookup("main")) |id| {
                                 const declaration = module.getDeclaration(id).?;
@@ -1102,6 +1128,7 @@ test {
     _ = Tokenizer;
     _ = string_literal;
     _ = Driver;
+    _ = TestRunner;
     _ = Diagnostics;
     _ = Formatter;
 }

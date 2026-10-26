@@ -1,0 +1,32 @@
+; nov test examples/tests.nov
+
+let std = @import("std")
+
+let add: (a: i32, b: i32) -> i32 = a + b
+
+@[test]
+let addition: () = {
+    @assert(add(19, 23) == 42)
+    @assert(add(-7, 7) == 0, "addition handles negative operands")
+}
+
+@[test]
+let array_copies: () = {
+    let original: []uint = [2, 4, 6]
+    let mut copy: []uint = original
+    copy[0] = 99
+    copy += [8]
+    @assert(original[0] == 2, "copy mutation must not change the original")
+    @assert(original.len == 3)
+    @assert(copy[0] == 99 and copy.len == 4)
+}
+
+@[test]
+let option_value: () = {
+    let value: std.Option(uint) = .some[42]
+    @assert(value.isSome())
+    @assert(value.unwrapOr(0) == 42)
+    let missing: std.Option(uint) = .none[]
+    @assert(missing.isSome() == false)
+    @assert(missing.unwrapOr(7) == 7)
+}

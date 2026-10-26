@@ -36,6 +36,7 @@ pub fn check(allocator: std.mem.Allocator, body: Ir.Body) Ir.VerifyError!?Ir.Bor
     for (body.instructions, 0..) |instruction, i| {
         switch (instruction.op) {
             .return_value, .panic => edges[i] = .{ n, n },
+
             .call => |c| if (c.noreturn) {
                 edges[i] = .{ n, n };
             },
@@ -51,6 +52,8 @@ pub fn check(allocator: std.mem.Allocator, body: Ir.Body) Ir.VerifyError!?Ir.Bor
             .loop => |l| if (l.returns) {
                 edges[i] = .{ n, n };
             },
+            // Assertions keep region-specific success edges. Failure exits,
+            // so it adds no continuing-path liveness or successor.
             else => {},
         }
     }

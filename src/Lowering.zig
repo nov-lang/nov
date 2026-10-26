@@ -25,7 +25,7 @@ pub fn lowerCompilation(comp: *Compilation) Error!Sema {
     for (comp.declarations.items, result.entries) |ref, entry| {
         const module = comp.getModule(ref.source).?;
         const declaration = module.getDeclaration(ref.local).?;
-        if (entry.status == .namespace or entry.status == .type_alias or entry.status == .generic or entry.status == .unrequested) continue;
+        if (entry.status == .ignored or entry.status == .namespace or entry.status == .type_alias or entry.status == .generic or entry.status == .unrequested) continue;
         if (module.source.ast.decl(declaration.node).ast.is_mutable or (entry.status != .body_checked and entry.status != .constant_checked and entry.status != .external)) {
             try module.diagnostics.append(comp.allocator, .{ .tag = deferredDiagnostic(module, declaration), .span = declaration.name_span });
         }
@@ -50,6 +50,7 @@ pub fn lowerCompilation(comp: *Compilation) Error!Sema {
             try std.fmt.allocPrint(comp.allocator, "{s}.{s}", .{ module.getDeclaration(owner).?.name, declaration.name }) else null;
         defer if (qualified) |name| comp.allocator.free(name);
         const function = try result.ir.addFunction(qualified orelse declaration.name, entry.type_id.?, declaration.name_span);
+        result.ir.functions.items[@backingInt(function)].is_test = declaration.is_test;
         result.ir.functions.items[@backingInt(function)].public = declaration.public;
         result.ir.functions.items[@backingInt(function)].noreturn = entry.noreturn;
         if (declaration.export_name) |name| try result.ir.setExportName(function, name);
@@ -85,7 +86,7 @@ pub fn lower(module: *Module) Error!Sema {
     if (module.hasErrors()) return result;
     result.ir.source_len = @intCast(module.source.ast.source.len);
     for (module.declarations.items, result.entries) |declaration, entry| {
-        if (entry.status == .namespace or entry.status == .type_alias or entry.status == .generic or entry.status == .unrequested) continue;
+        if (entry.status == .ignored or entry.status == .namespace or entry.status == .type_alias or entry.status == .generic or entry.status == .unrequested) continue;
         if (module.source.ast.decl(declaration.node).ast.is_mutable or (entry.status != .body_checked and entry.status != .constant_checked and entry.status != .external)) {
             try module.diagnostics.append(module.allocator, .{ .tag = deferredDiagnostic(module, declaration), .span = declaration.name_span });
         }
@@ -109,6 +110,7 @@ pub fn lower(module: *Module) Error!Sema {
             try std.fmt.allocPrint(result.allocator, "{s}.{s}", .{ module.getDeclaration(owner).?.name, declaration.name }) else null;
         defer if (qualified) |name| result.allocator.free(name);
         const function = try result.ir.addFunction(qualified orelse declaration.name, entry.type_id.?, span);
+        result.ir.functions.items[@backingInt(function)].is_test = declaration.is_test;
         result.ir.functions.items[@backingInt(function)].public = declaration.public;
         result.ir.functions.items[@backingInt(function)].noreturn = entry.noreturn;
         if (declaration.export_name) |name| try result.ir.setExportName(function, name);
@@ -2796,6 +2798,195 @@ fn testCompilationExternOwnership(allocator: std.mem.Allocator) !void {
 test "extern compilation aliases and imported typed calls own names under OOM" {
     try testCompilationExternOwnership(std.testing.allocator);
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testCompilationExternOwnership, .{});
+}
+
+fn testSemanticTestModes(allocator: std.mem.Allocator) !void {
+    var sema = blk: {
+        var comp = Compilation.init(allocator);
+        defer comp.deinit();
+        const root = try comp.addSource("/app/tests.nov",
+            \\let library = @import("library.nov")
+            \\@[test]
+            \\let main: () = {}
+            \\@[public]
+            \\@[test]
+            \\let second: () -> void = {}
+        );
+        comp.setRoot(root);
+        const imported = try comp.addSource("/app/library.nov",
+            \\@[public]
+            \\@[test]
+            \\let ignored: (x: Missing) -> Missing = unknown
+        );
+        try testImport(&comp, root, "library", imported, false);
+        const module = comp.getModule(root).?;
+        // Even an accidentally enabled imported module must stay excluded.
+        comp.getModule(imported).?.tests_enabled = true;
+        try std.testing.expect(comp.root_main == null);
+        for ([_]bool{ false, true, false, true }) |enabled| {
+            module.tests_enabled = enabled;
+            var result = try lowerCompilation(&comp);
+            defer result.deinit();
+            try std.testing.expect(!comp.hasErrors());
+            try std.testing.expect(result.lowering_complete);
+            try std.testing.expectEqual(@as(usize, if (enabled) 2 else 0), result.ir.functions.items.len);
+            const first = result.entries[result.entryIndex(module, module.lookup("main").?)];
+            try std.testing.expectEqual(if (enabled) Sema.Status.lowered else .ignored, first.status);
+            try std.testing.expectEqual(enabled, first.function != null);
+            const library = comp.getModule(imported).?;
+            try std.testing.expectEqual(Sema.Status.ignored, result.entries[result.entryIndex(library, library.lookup("ignored").?)].status);
+        }
+        break :blk try lowerCompilation(&comp);
+    };
+    defer sema.deinit();
+    try sema.ir.verify();
+    try std.testing.expectEqualStrings("main", sema.ir.functions.items[0].name);
+    try std.testing.expectEqualStrings("second", sema.ir.functions.items[1].name);
+    for (sema.ir.functions.items) |function| try std.testing.expect(function.is_test);
+}
+
+test "semantic tests are root only source ordered source free and repeatable under OOM" {
+    try testSemanticTestModes(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testSemanticTestModes, .{});
+}
+
+fn testSignatureImports(allocator: std.mem.Allocator, path: []const u8, enabled: bool, invalid_root: bool) !void {
+    var sema = blk: {
+        var comp = try Compilation.load(allocator, std.testing.io, path, .{});
+        defer comp.deinit();
+        try std.testing.expect(!comp.hasErrors());
+        try std.testing.expectEqual(@as(usize, 2), comp.modules.items.len);
+        try std.testing.expectEqual(@as(usize, 1), comp.imports.items.len);
+        const root = comp.getModule(comp.root.?).?;
+        root.tests_enabled = enabled;
+        var result = try lowerCompilation(&comp);
+        errdefer result.deinit();
+        // Missing relative and named imports inside signatures never become
+        // graph edges, even when Sema rejects an enabled root signature.
+        try std.testing.expectEqual(@as(usize, 0), comp.diagnostics.items.len);
+        try std.testing.expectEqual(@as(usize, 2), comp.modules.items.len);
+        try std.testing.expectEqual(@as(usize, 1), comp.imports.items.len);
+        for (comp.modules.items) |module| {
+            if (module == root) continue;
+            try std.testing.expect(!module.hasErrors());
+            for (module.declarations.items, 0..) |_, i|
+                try std.testing.expectEqual(Sema.Status.ignored, result.entries[result.entryIndex(module, @fromBackingInt(@intCast(i)))].status);
+        }
+        if (enabled and invalid_root) {
+            try std.testing.expect(root.hasErrors());
+            try std.testing.expect(!result.lowering_complete);
+            for (root.diagnostics.items) |diagnostic| {
+                try std.testing.expectEqual(root.source.id, diagnostic.span.source);
+                try std.testing.expectEqual(Module.Diagnostic.Tag.unknown_type, diagnostic.tag);
+            }
+        } else {
+            try std.testing.expect(!comp.hasErrors());
+            try std.testing.expect(result.lowering_complete);
+            try std.testing.expectEqual(@as(usize, if (enabled) 2 else 1), result.ir.functions.items.len);
+        }
+        break :blk result;
+    };
+    defer sema.deinit();
+    if (sema.lowering_complete) try sema.ir.verify();
+}
+
+test "test signature imports stay outside source graph in root and dependencies under OOM" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "invalid-root.nov", .data =
+        \\let library = @import("library.nov")
+        \\@[test]
+        \\let relative: (x: @import("missing.nov").T) = {}
+        \\@[test]
+        \\let named: () -> @import("std").T = {}
+        \\let main: () = {}
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "valid-root.nov", .data =
+        \\let library = @import("library.nov")
+        \\@[test]
+        \\let valid: () = {}
+        \\let main: () = {}
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "library.nov", .data =
+        \\@[test]
+        \\let relative: (x: @import("missing-dependency.nov").T) = {}
+        \\@[test]
+        \\let named: () -> @import("std").T = {}
+    });
+    for ([_]bool{ false, true }) |invalid_root| {
+        const path = try tmp.dir.realPathFileAlloc(io, if (invalid_root) "invalid-root.nov" else "valid-root.nov", allocator);
+        defer allocator.free(path);
+        for ([_]bool{ false, true }) |enabled| {
+            try testSignatureImports(allocator, path, enabled, invalid_root);
+            try TestAllocations.checkAllAllocationFailures(allocator, testSignatureImports, .{ path, enabled, invalid_root });
+        }
+    }
+}
+
+fn testIgnoredTestBody(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "ignored-tests.nov",
+        \\let Box: (T: type) -> type = struct { value: T, }
+        \\@[test]
+        \\let ignored: (x: Missing) -> Missing = {
+        \\let x: Box(Unknown) = missing
+        \\let library = @import("does-not-exist.nov")
+        \\unknown()
+        \\}
+        \\let main: () = {}
+    );
+    defer module.deinit();
+    var dependencies = try Dependencies.analyze(&module);
+    defer dependencies.deinit();
+    var result = try lower(&module);
+    defer result.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(result.lowering_complete);
+    try std.testing.expectEqual(Sema.Status.ignored, result.getEntry(module.lookup("ignored").?).?.status);
+    try std.testing.expectEqual(@as(usize, 1), result.ir.functions.items.len);
+    try std.testing.expect(!result.ir.functions.items[0].is_test);
+    try std.testing.expectEqual(@as(usize, 3), module.declarations.items.len);
+}
+
+test "ordinary builds ignore test signatures bodies and generic demands under OOM" {
+    try testIgnoredTestBody(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testIgnoredTestBody, .{});
+}
+
+fn testRejectedTest(allocator: std.mem.Allocator, source: []const u8, enabled: bool, expected: Module.Diagnostic.Tag) !void {
+    var module = try Module.init(allocator, "rejected-test.nov", source);
+    defer module.deinit();
+    module.tests_enabled = enabled;
+    var result = try lower(&module);
+    defer result.deinit();
+    try std.testing.expect(module.hasErrors());
+    try std.testing.expect(!result.lowering_complete);
+    try std.testing.expectEqual(expected, module.diagnostics.items[0].tag);
+}
+
+test "enabled tests validate signatures free names and reject ordinary references in both modes" {
+    for ([_]struct { source: []const u8, tag: Module.Diagnostic.Tag }{
+        .{ .source = "@[test]\nlet sample: (x: i32) = {}", .tag = .invalid_test_signature },
+        .{ .source = "@[test]\nlet sample: () -> i32 = 1", .tag = .invalid_test_signature },
+        .{ .source = "let Box: (T: type) -> type = struct { value: T, }\n@[test]\nlet sample: () = {\nlet x: Box(Missing) = missing\n}", .tag = .unknown_type },
+        .{ .source = "@[test]\nlet sample: () = unknown", .tag = .unknown_name },
+    }) |case| {
+        try testRejectedTest(std.testing.allocator, case.source, true, case.tag);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testRejectedTest, .{ case.source, true, case.tag });
+    }
+    const test_call = "@[test]\nlet first: () = {}\n@[test]\nlet second: () = first()";
+    try testRejectedTest(std.testing.allocator, test_call, true, .test_not_callable);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testRejectedTest, .{ test_call, true, Module.Diagnostic.Tag.test_not_callable });
+    for ([_]bool{ false, true }) |enabled| {
+        for ([_][]const u8{
+            "@[public]\n@[test]\nlet sample: () = {}\nlet ordinary: () = sample()",
+            "@[test]\nlet sample: () = {}\nlet ordinary: () -> () -> void = sample",
+        }) |source| {
+            try testRejectedTest(std.testing.allocator, source, enabled, .test_not_callable);
+            try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testRejectedTest, .{ source, enabled, Module.Diagnostic.Tag.test_not_callable });
+        }
+    }
 }
 
 test "extern typed calls reject wrong arguments results and noreturn results" {

@@ -11,6 +11,7 @@ const Module = @This();
 
 allocator: std.mem.Allocator,
 compilation: ?*Compilation = null,
+tests_enabled: bool = false,
 source: Source,
 declarations: std.ArrayList(Declaration) = .empty,
 diagnostics: std.ArrayList(Diagnostic) = .empty,
@@ -29,6 +30,7 @@ pub const Declaration = struct {
     is_namespace: bool = false,
     is_record: bool = false,
     is_generic: bool = false,
+    is_test: bool = false,
     container: ?DeclId = null,
     public: bool = false,
     noreturn: bool = false,
@@ -52,6 +54,9 @@ pub const Diagnostic = struct {
         unsupported_borrow,
         duplicate_name,
         unsupported_attribute,
+        invalid_test_declaration,
+        invalid_test_signature,
+        test_not_callable,
         invalid_export_declaration,
         invalid_export_attribute,
         invalid_export_name,
@@ -237,12 +242,55 @@ pub fn resolveName(self: *Module, span: Span) (std.mem.Allocator.Error || error{
 /// unknown names and cycles). Unconstrained references to runtime values stay
 /// ordinary value declarations; demanded candidates must still pass resolution.
 fn aliasCandidate(self: *const Module, id: DeclId) bool {
+    if (self.getDeclaration(id).?.is_test) return false;
     const full = self.source.ast.decl(self.getDeclaration(id).?.node).ast;
     if (full.is_mutable or full.type_node != 0 or full.init_node == 0) return false;
     return switch (self.source.ast.nodes.items(.tag)[full.init_node]) {
         .identifier, .field_access, .array_type, .fn_proto, .fn_proto_one, .container_decl, .call, .call_one, .call_comma, .call_one_comma => true,
         else => false,
     };
+}
+
+/// Imported test declarations are never activated, even if their flag is set.
+pub fn testEnabled(self: *const Module) bool {
+    if (!self.tests_enabled) return false;
+    if (self.compilation) |comp| return comp.root == self.source.id;
+    return true;
+}
+
+/// AST-wide semantic scans must not discover demands inside disabled tests.
+pub fn inDisabledTest(self: *const Module, node: Ast.Node.Index) bool {
+    if (self.testEnabled()) return false;
+    return self.inTest(node, false);
+}
+
+/// Import discovery ignores entire test declarations in both modes. Imports in
+/// enabled signatures or bodies remain semantic errors, never graph dependencies.
+pub fn inTest(self: *const Module, node: Ast.Node.Index, body_only: bool) bool {
+    if (node == 0) return false;
+    const token = self.source.ast.firstToken(node);
+    for (self.declarations.items) |decl| {
+        if (!decl.is_test) continue;
+        const root = if (body_only) self.source.ast.decl(decl.node).ast.init_node else decl.node;
+        if (root == 0) continue;
+        if (token >= self.source.ast.firstToken(root) and token <= self.source.ast.lastToken(root)) return true;
+    }
+    return false;
+}
+
+/// Alias demands are analysis-local: a previous test-mode pass must not make
+/// free names in now-disabled bodies affect an ordinary build.
+pub fn resetAliases(self: *Module) void {
+    for (self.declarations.items) |*decl| {
+        if (decl.concrete_type != null) continue;
+        const full = self.source.ast.decl(decl.node).ast;
+        const this_alias = decl.container != null and !full.is_mutable and full.type_node == 0 and full.init_node != 0 and blk: {
+            const call = self.source.ast.fullCall(full.init_node) orelse break :blk false;
+            break :blk call.ast.args.len == 0 and std.mem.eql(u8, self.source.ast.tokenSlice(self.source.ast.firstToken(call.ast.fn_expr)), "@This");
+        };
+        decl.is_type_alias = decl.is_record or this_alias;
+        decl.is_generic = decl.is_record and full.type_node != 0 and (self.source.ast.isUnion(full.init_node) or self.source.ast.tokens.items(.tag)[self.source.ast.nodes.items(.main_token)[full.init_node]] == .keyword_struct);
+    }
 }
 
 pub fn classifyAliases(self: *Module) std.mem.Allocator.Error!void {
@@ -253,6 +301,7 @@ pub fn classifyAliases(self: *Module) std.mem.Allocator.Error!void {
     // Explicit type positions include local annotations and @as arguments.
     for (tags, 0..) |tag, i| {
         const node: Ast.Node.Index = @intCast(i);
+        if (self.inDisabledTest(node)) continue;
         switch (tag) {
             .decl => {
                 const full = self.source.ast.decl(node).ast;
@@ -302,6 +351,7 @@ pub fn classifyAliases(self: *Module) std.mem.Allocator.Error!void {
     }
     for (tags, 0..) |_, i| {
         const node: Ast.Node.Index = @intCast(i);
+        if (self.inDisabledTest(node)) continue;
         const call = self.source.ast.fullCall(node) orelse continue;
         if (tags[call.ast.fn_expr] != .identifier) continue;
         const target = self.lookup(self.source.ast.tokenSlice(self.source.ast.firstToken(call.ast.fn_expr))) orelse continue;
@@ -418,6 +468,7 @@ fn collectDeclaration(self: *Module, node: Ast.Node.Index, container: ?DeclId) (
             const call = self.source.ast.fullCall(declaration.ast.init_node) orelse break :blk false;
             break :blk call.ast.args.len == 0 and std.mem.eql(u8, self.source.ast.tokenSlice(self.source.ast.firstToken(call.ast.fn_expr)), "@This");
         };
+        var is_test = false;
         var public = false;
         var noreturn_annotation = false;
         var export_name: ?[]const u8 = null;
@@ -430,7 +481,11 @@ fn collectDeclaration(self: *Module, node: Ast.Node.Index, container: ?DeclId) (
             const data = self.source.ast.nodes.items(.data)[attribute];
             const attr_name = self.source.ast.tokenSlice(data.lhs);
             const external = std.mem.eql(u8, attr_name, "extern");
-            if (external or std.mem.eql(u8, attr_name, "export")) {
+            if (std.mem.eql(u8, attr_name, "test")) {
+                if (is_test or self.source.ast.nodes.items(.tag)[attribute] != .attr_one or data.rhs != 0)
+                    try self.diagnostics.append(self.allocator, .{ .tag = .invalid_test_declaration, .span = self.tokenSpan(self.source.ast.firstToken(attribute)) });
+                is_test = true;
+            } else if (external or std.mem.eql(u8, attr_name, "export")) {
                 const span = self.tokenSpan(self.source.ast.firstToken(attribute));
                 const seen = if (external) extern_seen else export_seen;
                 const conflict = if (external) export_seen else extern_seen;
@@ -481,8 +536,62 @@ fn collectDeclaration(self: *Module, node: Ast.Node.Index, container: ?DeclId) (
                 noreturn_annotation = true;
             } else try self.diagnostics.append(self.allocator, .{ .tag = .unsupported_attribute, .span = self.tokenSpan(self.source.ast.firstToken(attribute)) });
         }
-        try self.declarations.append(self.allocator, .{ .name = name, .name_span = name_span, .node = node, .container = container, .is_record = is_record, .is_generic = is_generic, .is_type_alias = is_record or is_this_alias, .public = public, .noreturn = noreturn_annotation, .export_name = export_name, .extern_name = extern_name });
+        if (is_test and (container != null or declaration.ast.is_mutable or is_record or is_generic or declaration.ast.init_node == 0 or self.source.ast.fullFnProto(declaration.ast.type_node) == null or export_seen or extern_seen or noreturn_annotation))
+            try self.diagnostics.append(self.allocator, .{ .tag = .invalid_test_declaration, .span = name_span });
+        try self.declarations.append(self.allocator, .{ .is_test = is_test, .name = name, .name_span = name_span, .node = node, .container = container, .is_record = is_record, .is_generic = is_generic, .is_type_alias = is_record or is_this_alias, .public = public, .noreturn = noreturn_annotation, .export_name = export_name, .extern_name = extern_name });
     }
+}
+
+test "test declarations preserve metadata and reject placement and conflicts" {
+    var valid = try Module.init(std.testing.allocator, "tests.nov", "@[public]\n@[test]\nlet sample: () -> void = {}");
+    defer valid.deinit();
+    try std.testing.expect(!valid.hasErrors());
+    try std.testing.expect(valid.getDeclaration(valid.lookup("sample").?).?.is_test);
+    try std.testing.expect(!valid.tests_enabled);
+    for ([_][]const u8{
+        "@[test(1)]\nlet sample: () = {}",
+        "@[test]\n@[test]\nlet sample: () = {}",
+        "@[test]\nlet mut sample: () = {}",
+        "@[test]\nlet sample: ()",
+        "@[test]\nlet sample = 1",
+        "@[test]\n@[noreturn]\nlet sample: () = {}",
+        "@[noreturn]\n@[test]\nlet sample: () = {}",
+        "@[test]\n@[export]\nlet sample: () = {}",
+        "@[extern]\n@[test]\nlet sample: ()",
+        "let Container = struct {\n@[test]\nlet sample: () = {}\n}",
+        "@[test]\nlet Container: (T: type) -> type = struct { value: T, }",
+    }) |source| {
+        var module = try Module.init(std.testing.allocator, "bad-test.nov", source);
+        defer module.deinit();
+        try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
+        try std.testing.expect(module.hasErrors());
+        try std.testing.expectEqual(Diagnostic.Tag.invalid_test_declaration, module.diagnostics.items[0].tag);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+    }
+}
+
+test "disabled test scans do not classify free names or generic applications" {
+    var module = try Module.init(std.testing.allocator, "tests.nov",
+        \\let ambiguous = missing
+        \\let Box: (T: type) -> type = struct { value: T, }
+        \\@[test]
+        \\let sample: () = {
+        \\let x: ambiguous = missing
+        \\let y: Box(unknown) = missing
+        \\}
+    );
+    defer module.deinit();
+    try std.testing.expect(!module.hasErrors());
+    const ambiguous = module.lookup("ambiguous").?;
+    try std.testing.expect(!module.getDeclaration(ambiguous).?.is_type_alias);
+    module.tests_enabled = true;
+    module.resetAliases();
+    try module.classifyAliases();
+    try std.testing.expect(module.getDeclaration(ambiguous).?.is_type_alias);
+    module.tests_enabled = false;
+    module.resetAliases();
+    try module.classifyAliases();
+    try std.testing.expect(!module.getDeclaration(ambiguous).?.is_type_alias);
 }
 
 test "export attributes own decoded names independently of visibility" {

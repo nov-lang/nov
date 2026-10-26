@@ -32,6 +32,7 @@ pub const Function = struct {
     span: Span,
     body: ?Body = null,
     public: bool = false,
+    is_test: bool = false,
     noreturn: bool = false,
     export_name: ?[]const u8 = null,
     extern_name: ?[]const u8 = null,
@@ -77,6 +78,8 @@ pub const Operation = union(enum) {
     return_value: ?ValueId,
     /// Terminal panic with an exact string operand; has no continuing value.
     panic: ValueId,
+    /// Eager operands; failure exits at runtime but success continues.
+    assertion: struct { condition: ValueId, message: ?ValueId, location: []const u8 },
     /// Terminal exits target the innermost containing loop, including its condition.
     loop_break: ?ValueId,
     loop_continue,
@@ -338,6 +341,7 @@ pub fn setFunctionBody(self: *Ir, id: FunctionId, instructions: []const Instruct
         switch (instruction.op) {
             .call => |*call| call.args = try self.allocator.dupe(ValueId, call.args),
             .print => |*print| print.args = try self.allocator.dupe(ValueId, print.args),
+            .assertion => |*assertion| assertion.location = try self.allocator.dupe(u8, assertion.location),
             .array_literal, .record_init => |*elements| elements.* = try self.allocator.dupe(ValueId, elements.*),
             .field_store => |*store| store.path = try self.allocator.dupe(u32, store.path),
             .borrow_store => |*store| store.path = try self.allocator.dupe(u32, store.path),
@@ -352,6 +356,7 @@ fn freeOperands(self: *Ir, op: Operation) void {
     switch (op) {
         .call => |call| self.allocator.free(call.args),
         .print => |print| self.allocator.free(print.args),
+        .assertion => |assertion| self.allocator.free(assertion.location),
         .array_literal, .record_init => |elements| self.allocator.free(elements),
         .field_store => |store| self.allocator.free(store.path),
         .borrow_store => |store| self.allocator.free(store.path),
@@ -562,6 +567,7 @@ fn validateFunction(self: *const Ir, function: Function) VerifyError!void {
     const ty = self.getType(function.ty) orelse return error.InvalidTypeId;
     if (ty != .function) return error.InvalidFunctionType;
     try self.validateType(ty, self.types.items.len);
+    if (function.is_test and (ty.function.params.len != 0 or self.getType(ty.function.result).? != .void or function.noreturn or function.export_name != null or function.extern_name != null)) return error.InvalidFunctionType;
     try self.validateSpan(function.span);
     if (function.noreturn and self.getType(ty.function.result).? != .void) return error.InvalidReturn;
     if (function.extern_name) |name| {
@@ -974,6 +980,7 @@ fn validateBodyStructure(self: *const Ir, function: Function, body: Body) Verify
             .function_ref => |id| {
                 const referenced = self.getFunction(id) orelse return error.InvalidFunctionId;
                 try self.validateFunction(referenced);
+                if (referenced.is_test) return error.InvalidOperation;
                 if (referenced.ty != instruction.ty) return error.OperandTypeMismatch;
             },
             .unary => |unary| {
@@ -1020,6 +1027,14 @@ fn validateBodyStructure(self: *const Ir, function: Function, body: Body) Verify
                     if (!else_returns and else_ty != instruction.ty) return error.OperandTypeMismatch;
                 } else if (ty != .void) return error.OperandTypeMismatch;
                 if (r.returns != (then_returns and else_returns) or (r.returns and ty != .void)) return error.InvalidReturn;
+            },
+            .assertion => |assertion| {
+                if (ty != .void) return error.InvalidOperation;
+                if (self.getType(try operandType(body, assertion.condition, i)).? != .boolean) return error.OperandTypeMismatch;
+                if (assertion.message) |message| {
+                    if (self.getType(try operandType(body, message, i)).? != .string) return error.OperandTypeMismatch;
+                }
+                if (assertion.location.len == 0 or std.mem.indexOfScalar(u8, assertion.location, 0) != null) return error.InvalidOperation;
             },
             .print => |print| {
                 if (ty != .void) return error.InvalidOperation;
@@ -2837,6 +2852,120 @@ test "noreturn verifier rejects false terminal call claims returns and completio
     try std.testing.expectError(error.InvalidCall, ir.validateBody(ir.functions.items[0], .{ .instructions = &bad, .result = @fromBackingInt(@intCast(1)) }));
     ir.functions.items[0].ty = try ir.internType(.{ .function = .{ .params = &.{}, .result = try ir.internType(.boolean) } });
     try std.testing.expectError(error.InvalidReturn, ir.verify());
+}
+
+test "assert borrow CFG rejects loop backedge conflicts and preserves branch exclusivity" {
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAssertBorrowRegions, .{});
+}
+
+fn testAssertBorrowRegions(allocator: std.mem.Allocator) !void {
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    ir.source_len = 100;
+    const unit = try ir.internType(.void);
+    const boolean = try ir.internType(.boolean);
+    const signature = try ir.internType(.{ .function = .{ .params = &.{boolean}, .result = unit } });
+    const function = try ir.addFunction("f", signature, .{ .start = 0, .end = 1 });
+    const yes = try ir.internConstant(.{ .ty = boolean, .value = .{ .boolean = true } });
+    const ins = TestFunctions.instruction;
+    const prefix = [_]Instruction{
+        ins(boolean, .{ .constant = yes }),
+        ins(boolean, .{ .local_slot = @fromBackingInt(0) }),
+        ins(unit, .{ .borrow_reserve = @fromBackingInt(1) }),
+        ins(unit, .{ .borrow_start = .{ .reservation = @fromBackingInt(2), .index = null } }),
+        ins(boolean, .{ .parameter = 0 }),
+    };
+    const assertion = ins(unit, .{ .assertion = .{ .condition = @fromBackingInt(0), .message = null, .location = "test.nov:1:1" } });
+    var loop = prefix ++ [_]Instruction{
+        ins(boolean, .{ .borrow_read = @fromBackingInt(3) }),
+        ins(unit, .{ .local_store = .{ .slot = @fromBackingInt(1), .value = @fromBackingInt(0) } }),
+        assertion,
+        ins(unit, .{ .loop = .{ .unconditional = true, .condition_start = 4, .body_start = 5, .condition = @fromBackingInt(4), .body = @fromBackingInt(7), .returns = true } }),
+    };
+    loop[4] = ins(boolean, .{ .constant = yes });
+    const loop_body: Body = .{ .instructions = &loop, .result = @fromBackingInt(8) };
+    try ir.verifyBodyStructure(function, loop_body);
+    const conflict = (try ir.borrowConflict(loop_body)).?;
+    try std.testing.expectEqual(loop[6].span, conflict.access);
+    try std.testing.expectEqual(loop[2].span, conflict.origin);
+    if (ir.setFunctionBody(function, &loop, loop_body.result)) |_| {
+        return error.TestExpectedError;
+    } else |err| {
+        if (err == error.OutOfMemory) return err;
+        try std.testing.expectEqual(error.BorrowConflict, err);
+    }
+    try std.testing.expect(ir.getFunction(function).?.body == null);
+    const branch = prefix ++ [_]Instruction{
+        ins(unit, .{ .local_store = .{ .slot = @fromBackingInt(1), .value = @fromBackingInt(0) } }),
+        assertion,
+        ins(boolean, .{ .borrow_read = @fromBackingInt(3) }),
+        ins(unit, .{ .print = .{ .args = &.{@fromBackingInt(7)}, .newline = false } }),
+        ins(unit, .{ .branch = .{ .condition = @fromBackingInt(4), .then_start = 5, .else_start = 7, .then_value = @fromBackingInt(6), .else_value = @fromBackingInt(8) } }),
+    };
+    const branch_body: Body = .{ .instructions = &branch, .result = @fromBackingInt(9) };
+    try ir.verifyBodyStructure(function, branch_body);
+    try std.testing.expect(try ir.borrowConflict(branch_body) == null);
+    try ir.setFunctionBody(function, &branch, branch_body.result);
+    try ir.verify();
+}
+
+test "assertion validates visible operands types location and owned publication rollback" {
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAssertionOwnership, .{});
+}
+
+fn testAssertionOwnership(allocator: std.mem.Allocator) !void {
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    ir.source_len = 100;
+    const unit = try ir.internType(.void);
+    const boolean = try ir.internType(.boolean);
+    const string = try ir.internType(.string);
+    const signature = try ir.internType(.{ .function = .{ .params = &.{}, .result = unit } });
+    const function = try ir.addFunction("check", signature, .{ .start = 0, .end = 0 });
+    const yes = try ir.internConstant(.{ .ty = boolean, .value = .{ .boolean = true } });
+    const text = try ir.internConstant(.{ .ty = string, .value = .{ .string = "message" } });
+    const ins = TestFunctions.instruction;
+    var location = [_]u8{ 'a', ':', '1', ':', '2' };
+    const good = [_]Instruction{
+        ins(boolean, .{ .constant = yes }),
+        ins(string, .{ .constant = text }),
+        ins(unit, .{ .assertion = .{ .condition = @fromBackingInt(0), .message = @fromBackingInt(1), .location = &location } }),
+    };
+    var bad = good;
+    bad[2].op.assertion.condition = @fromBackingInt(2);
+    try std.testing.expectError(error.InvalidValueId, ir.validateBody(ir.getFunction(function).?, .{ .instructions = &bad, .result = @fromBackingInt(2) }));
+    bad = good;
+    bad[2].op.assertion.message = @fromBackingInt(0);
+    try std.testing.expectError(error.OperandTypeMismatch, ir.validateBody(ir.getFunction(function).?, .{ .instructions = &bad, .result = @fromBackingInt(2) }));
+    bad = good;
+    bad[2].ty = boolean;
+    try std.testing.expectError(error.InvalidOperation, ir.validateBody(ir.getFunction(function).?, .{ .instructions = &bad, .result = @fromBackingInt(2) }));
+    bad = good;
+    bad[2].op.assertion.location = "";
+    try std.testing.expectError(error.InvalidOperation, ir.validateBody(ir.getFunction(function).?, .{ .instructions = &bad, .result = @fromBackingInt(2) }));
+    const private = good ++ [_]Instruction{
+        ins(unit, .{ .branch = .{ .condition = @fromBackingInt(0), .then_start = 1, .else_start = 3, .then_value = @fromBackingInt(2), .else_value = null } }),
+        ins(unit, .{ .assertion = .{ .condition = @fromBackingInt(0), .message = @fromBackingInt(1), .location = &location } }),
+    };
+    try std.testing.expectError(error.InvalidValueId, ir.validateBody(ir.getFunction(function).?, .{ .instructions = &private, .result = @fromBackingInt(4) }));
+    try ir.setFunctionBody(function, &good, @fromBackingInt(2));
+    location[0] = 'b';
+    try std.testing.expectEqualStrings("a:1:2", ir.getFunction(function).?.body.?.instructions[2].op.assertion.location);
+    try ir.verify();
+}
+
+test "test functions reject ordinary IR references and invalid signatures" {
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    ir.source_len = 100;
+    const unit = try ir.internType(.void);
+    const signature = try ir.internType(.{ .function = .{ .params = &.{}, .result = unit } });
+    const function = try ir.addFunction("test", signature, .{ .start = 0, .end = 0 });
+    ir.functions.items[0].is_test = true;
+    const ins = TestFunctions.instruction;
+    try std.testing.expectError(error.InvalidOperation, ir.setFunctionBody(function, &.{ins(signature, .{ .function_ref = function })}, @fromBackingInt(0)));
+    ir.functions.items[0].noreturn = true;
+    try std.testing.expectError(error.InvalidFunctionType, ir.verify());
 }
 
 test "panic validates exact string prior visible operands void type and terminal tails" {

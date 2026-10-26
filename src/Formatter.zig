@@ -213,11 +213,11 @@ fn checkSupported(ast: Ast) !void {
                 const name = ast.tokenSlice(data.lhs);
                 if (std.mem.eql(u8, name, "export") or std.mem.eql(u8, name, "extern")) {
                     if (data.rhs != 0 and ast.nodes.items(.tag)[data.rhs] != .string_literal) return error.UnsupportedSyntax;
-                } else if (data.rhs != 0 or (!std.mem.eql(u8, name, "public") and !std.mem.eql(u8, name, "noreturn"))) return error.UnsupportedSyntax;
+                } else if (data.rhs != 0 or (!std.mem.eql(u8, name, "public") and !std.mem.eql(u8, name, "noreturn") and !std.mem.eql(u8, name, "test"))) return error.UnsupportedSyntax;
             },
             .builtin_literal => {
                 const name = ast.tokenSlice(main);
-                if (!std.mem.eql(u8, name, "@print") and !std.mem.eql(u8, name, "@println") and !std.mem.eql(u8, name, "@as") and !std.mem.eql(u8, name, "@panic") and !std.mem.eql(u8, name, "@This") and !std.mem.eql(u8, name, "@import"))
+                if (!std.mem.eql(u8, name, "@print") and !std.mem.eql(u8, name, "@println") and !std.mem.eql(u8, name, "@as") and !std.mem.eql(u8, name, "@panic") and !std.mem.eql(u8, name, "@assert") and !std.mem.eql(u8, name, "@This") and !std.mem.eql(u8, name, "@import"))
                     return error.UnsupportedSyntax;
             },
             .@"break" => if (data.lhs != 0) return error.UnsupportedSyntax,
@@ -340,6 +340,11 @@ test "unions constructors captures and payloadless variants format idempotently"
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{"let U=union{ok:int,none,}\nlet f:(u:U)->int=match u{.ok=>|v|v\n.none=>0}"});
 }
 
+test "test attributes and assert arguments format and survive OOM" {
+    try expectFormatted("@[test]\nlet check:()=@assert(true,\"ok\")", "@[test]\nlet check: () = @assert(true, \"ok\")\n");
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{"@[test]\nlet check:()={@assert(true)\n@assert(false,\"message\")}"});
+}
+
 test "declarations arithmetic strings and idempotence" {
     try expectFormatted("", "");
     try expectFormatted(" \n\t\n", "");
@@ -420,7 +425,7 @@ test "unsupported syntax fails closed including nested expressions" {
         "let f:()->void={make().inner.len%=1}\n",
         "let f:()->void={make()[0]=1}\n",
         "let x=#true\n",
-        "@[test]\nlet x=1\n",
+        "@[test(true)]\nlet x=1\n",
         "let f: () -> void = loop true {break :outer 1}\n",
         "let f: () -> void = loop true {continue :outer}\n",
         "let f: () -> void = outer: {}\n",

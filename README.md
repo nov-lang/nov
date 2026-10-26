@@ -525,6 +525,52 @@ check also leaves the file unchanged.
 Declarations are separated by newlines; EOF also terminates a complete declaration,
 so the final newline is optional. Formatting adds a final newline.
 
+## Testing Nov code
+
+`nov test file.nov` runs top-level `@[test]` functions in that file, in source order.
+Tests must be ordinary immutable `() -> void` functions with bodies. No Nov `main`
+is required, and an ordinary `main` is not executed. Imported files provide helpers
+and types, but their tests are not automatically selected.
+
+```nov
+let add: (a: i32, b: i32) -> i32 = a + b
+
+@[test]
+let addition: () = {
+    @assert(add(19, 23) == 42)
+    @assert(add(-7, 7) == 0, "addition handles negative operands")
+}
+```
+
+`@assert(condition)` and `@assert(condition, message)` require a bool condition and
+an optional string message, and return void. Both arguments follow ordinary eager,
+left-to-right evaluation, exactly once—even when the assertion succeeds. A failure
+prints `path:line:column: assertion failed`, optionally followed by `: message`,
+and terminates the process with exit status 1. Assertions work in ordinary functions
+too and remain enabled in every debug/release mode.
+
+Test declarations are excluded from ordinary semantic checking and emission:
+their signatures, bodies, imports and generic demands are ignored by normal builds.
+Source syntax is still parsed and attribute placement is validated. Neither ordinary
+code nor other tests may call or extract a test function, even if it is public.
+Tests cannot also be extern, export, noreturn, methods or generic containers.
+
+The command compiles one executable, then runs each test in a fresh subprocess.
+Panic, nonzero exit or a crash fails that test without stopping the remaining tests;
+there is no panic recovery or stack unwinding. Child output is inherited, each test
+gets a `PASS`/`FAIL` result, and a final summary reports passed, failed and total counts.
+The command exits 0 only if compilation and every test process succeed. Empty suites
+still compile and report `0 passed; 0 failed; 0 total`.
+
+`--cc`, `--debug`, `--release` and `--lib-dir` use the same compiler and installed-
+stdlib rules as build/run; default C optimization is `-O3`. Processes run sequentially,
+inherit the environment and share the filesystem; this is memory isolation, not a
+sandbox. There is no default timeout or test-filter option in this initial runner.
+Temporary generated files/executables are removed on normal completion and errors.
+
+[`examples/tests.nov`](examples/tests.nov) covers arithmetic, independent array
+copies and standard-library Option, with commands in its opening comments.
+
 # Concepts
 
 ## Comments
@@ -2122,7 +2168,7 @@ TODO
 - `@[noinline]`
 - `@[cold]`
 - `@[noreturn]`: Specify that a function can't return.
-- `@[test]`: Decl with it are ignored unless run with `nov test` where it behave like `zig test`.
+- `@[test]`: test-only top-level `() -> void` function, selected by `nov test`.
 <!-- - `@[callconv]` -->
 - `@[public]`
 
@@ -2137,7 +2183,9 @@ methods are file-private by default, with identical rules for file and named imp
 on ordinary functions and methods may be combined with `@[public]` where supported.
 Duplicate attributes, arguments, invalid placements and unknown/unsupported
 attributes diagnose. The `extern` and `export` forms described below are supported
-and do not imply `@[public]`. Other entries in this list remain design proposals.
+and do not imply `@[public]`. `@[test]` is supported under the separate
+[test-only declaration rules](#testing-nov-code). Other entries in this list remain
+design proposals.
 
 ### C function exports
 

@@ -26,6 +26,7 @@ pub const Error = Ir.VerifyError || std.mem.Allocator.Error || error{
     UnsupportedIntegerWidth,
     MissingEntrypoint,
     InvalidEntrypoint,
+    InvalidTestEntrypoint,
     ExportSymbolCollision,
     ExternSymbolCollision,
 };
@@ -42,6 +43,7 @@ pub const Diagnostic = struct {
         entrypoint_missing,
         entrypoint_signature,
         entrypoint_external,
+        test_entrypoint,
         export_symbol_collision,
         extern_symbol_collision,
 
@@ -50,6 +52,7 @@ pub const Diagnostic = struct {
                 .integer_width_unsupported => "C backend only supports 8, 16, 32 and 64-bit integers",
                 .entrypoint_missing => "program requires a root function 'main' with type () -> void",
                 .entrypoint_signature => "program entrypoint 'main' must have type () -> void",
+                .test_entrypoint => "test entrypoints must be distinct test functions with type () -> void and a Nov body",
                 .entrypoint_external => "program entrypoint 'main' must have a Nov body, not an extern declaration",
                 .export_symbol_collision => "export symbol conflicts with a generated function name; choose another export name",
                 .extern_symbol_collision => "extern symbol conflicts with a generated function name; choose another extern name",
@@ -106,7 +109,7 @@ pub fn emitProgramRoot(allocator: std.mem.Allocator, ir: *const Ir, entry: ?Ir.F
     if (function.extern_name != null)
         return fail(diagnostic, .entrypoint_external, .{ .function = id, .span = function.span });
     const signature = ir.types.items[@backingInt(function.ty)].function;
-    if (signature.params.len != 0 or ir.types.items[@backingInt(signature.result)] != .void)
+    if (function.is_test or signature.params.len != 0 or ir.types.items[@backingInt(signature.result)] != .void)
         return fail(diagnostic, .entrypoint_signature, .{ .function = id, .span = function.span });
     const library = try emit(allocator, ir, diagnostic);
     defer allocator.free(library);
@@ -118,9 +121,37 @@ pub fn emitProgramRoot(allocator: std.mem.Allocator, ir: *const Ir, entry: ?Ir.F
     return out.toOwnedSlice();
 }
 
+/// Emits a one-test-per-process driver without requiring or invoking Nov main.
+pub fn emitTestProgram(allocator: std.mem.Allocator, ir: *const Ir, tests: []const Ir.FunctionId, diagnostic: ?*Diagnostic) Error![]u8 {
+    try ir.verify();
+    for (tests, 0..) |id, index| {
+        const function = ir.getFunction(id) orelse return fail(diagnostic, .test_entrypoint, .{ .function = id, .span = .{ .start = 0, .end = 0 } });
+        const signature = ir.getType(function.ty).?.function;
+        if (!function.is_test or function.body == null or function.noreturn or function.export_name != null or function.extern_name != null or signature.params.len != 0 or ir.getType(signature.result).? != .void)
+            return fail(diagnostic, .test_entrypoint, .{ .function = id, .span = function.span });
+        for (tests[0..index]) |previous| if (previous == id)
+            return fail(diagnostic, .test_entrypoint, .{ .function = id, .span = function.span });
+    }
+    const library = try emit(allocator, ir, diagnostic);
+    defer allocator.free(library);
+    var out = std.Io.Writer.Allocating.init(allocator);
+    errdefer out.deinit();
+    const w = &out.writer;
+    w.print("{s}\n#include <string.h>\nint main(int argc, char **argv) {{\n    (void)argv;\n    if (argc != 2) return 2;\n", .{library}) catch return error.OutOfMemory;
+    for (tests, 0..) |id, index| {
+        w.print("    {s}if (strcmp(argv[1], \"{d}\") == 0) {{\n        ", .{ if (index == 0) "" else "else ", index }) catch return error.OutOfMemory;
+        writeScopedFunctionName(w, ir.getFunction(id).?) catch return error.OutOfMemory;
+        w.writeAll("();\n    }\n") catch return error.OutOfMemory;
+    }
+    w.writeAll(if (tests.len == 0) "    return 2;\n" else "    else return 2;\n") catch return error.OutOfMemory;
+    w.print("{s}{s}    return 0;\n}}\n", .{ if (usesPrinting(ir)) "    nov_rt_check(fflush(stdout));\n" else "", if (usesManagedRuntime(ir)) "    nov_gc_shutdown(&nov_rt_heap);\n" else "" }) catch return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
 fn fail(diagnostic: ?*Diagnostic, reason: Diagnostic.Reason, origin: Origin) Error {
     if (diagnostic) |d| d.* = .{ .reason = reason, .function = origin.function, .span = origin.span };
     return switch (reason) {
+        .test_entrypoint => error.InvalidTestEntrypoint,
         .integer_width_unsupported => error.UnsupportedIntegerWidth,
         .entrypoint_missing => error.MissingEntrypoint,
         .entrypoint_signature, .entrypoint_external => error.InvalidEntrypoint,
@@ -473,14 +504,16 @@ fn writeRuntime(ir: *const Ir, w: *std.Io.Writer) WriteError!void {
     const printing = usesPrinting(ir);
     var panic_used = printing or usesManagedRuntime(ir);
     var source_panic = false;
+    var assertion_used = false;
     for (ir.functions.items) |function| {
         const body = function.body orelse continue;
         for (body.instructions) |instruction| {
             if (instruction.op == .binary and (instruction.op.binary.op == .div or instruction.op.binary.op == .mod)) panic_used = true;
             if (instruction.op == .panic) source_panic = true;
+            if (instruction.op == .assertion) assertion_used = true;
         }
     }
-    if (!panic_used and !source_panic) return;
+    if (!panic_used and !source_panic and !assertion_used) return;
     try w.writeAll("#include <stdio.h>\n#include <stdlib.h>\n\n");
     if (source_panic) try w.writeAll(
         "static _Noreturn void nov_rt_panic_bytes(const unsigned char *message, uintptr_t len) {\n" ++
@@ -728,6 +761,10 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
             value_used[@backingInt(region.then_value)] = true;
             if (region.else_value) |value| value_used[@backingInt(value)] = true;
         },
+        .assertion => |assertion| {
+            value_used[@backingInt(assertion.condition)] = true;
+            if (assertion.message) |message| value_used[@backingInt(message)] = true;
+        },
         .panic => |value| value_used[@backingInt(value)] = true,
         .return_value, .loop_break => |value| {
             if (value) |v| value_used[@backingInt(v)] = true;
@@ -882,6 +919,18 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
                 }
                 try w.writeAll(");\n");
             }
+            continue;
+        }
+        if (instruction.op == .assertion) {
+            const assertion = instruction.op.assertion;
+            try w.print("    if (!v{d}) {{\n        (void)fflush(stdout);\n        (void)fwrite(\"", .{@backingInt(assertion.condition)});
+            for (assertion.location) |byte| try w.print("\\{o:0>3}", .{byte});
+            try w.print(": assertion failed\", 1, {d}, stderr);\n", .{assertion.location.len + ": assertion failed".len});
+            if (assertion.message) |message| {
+                const value = @backingInt(message);
+                try w.print("        (void)fwrite(\": \", 1, 2, stderr);\n        if (v{d}.len) (void)fwrite(v{d}.data, 1, (size_t)v{d}.len, stderr);\n", .{ value, value, value });
+            }
+            try w.writeAll("        (void)fputc('\\n', stderr);\n        exit(1);\n    }\n");
             continue;
         }
         if (instruction.op == .panic) {
@@ -1087,7 +1136,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
                 try w.print("v{d} {s} v{d}", .{ @backingInt(binary.lhs), operator, @backingInt(binary.rhs) });
             },
             .call => |call| try writeCall(w, call),
-            .panic, .loop, .loop_break, .loop_continue, .return_value, .print, .short_circuit, .branch, .local_store => unreachable,
+            .assertion, .panic, .loop, .loop_break, .loop_continue, .return_value, .print, .short_circuit, .branch, .local_store => unreachable,
         }
         try w.writeAll(";\n");
         if (!value_used[i] or instruction.op == .local_slot) try w.print("    (void)v{d};\n", .{i});
@@ -6331,6 +6380,84 @@ fn compileAndRunMode(c_source: []const u8, harness: []const u8, exit_code: u8, s
     try std.testing.expectEqual(std.process.Child.Term{ .exited = exit_code }, ran.term);
     try std.testing.expectEqualStrings(stdout, ran.stdout);
     try std.testing.expectEqualStrings(stderr, ran.stderr);
+}
+
+test "assert eager message evaluation exact bytes source ownership and terminal operands" {
+    const cases = [_]struct { source: []const u8, code: u8 = 0, output: []const u8, diagnostic: []const u8 = "" }{
+        .{ .source = "let condition:()->bool={@print(\"C\")\ntrue}\nlet message:()->string={@print(\"M\")\n\"unused\"+\" message\"}\nlet main:()={@assert(condition(),message())\n@print(\"T\")}", .output = "CMT" },
+        .{ .source = "let main:()={@print(\"before\")\n@assert(false,\"hé\\0\"+\"!\")}", .code = 1, .output = "before", .diagnostic = "test.nov:2:1: assertion failed: hé\x00!\n" },
+        .{ .source = "let main:()={\nlet mut n:int=0\nlet r=&n\n@assert(false,\"{r}\")\nn=1\n}", .code = 1, .output = "", .diagnostic = "test.nov:4:1: assertion failed: 0\n" },
+        .{ .source = "let main:()={\nlet mut s=\"a\"+\"b\"\nlet r=&s\n@assert(false,{@print(r)\n\"message:\"+r})\ns=\"after\"\n}", .code = 1, .output = "ab", .diagnostic = "test.nov:4:1: assertion failed: message:ab\n" },
+        .{ .source = "let f:(flag:bool)={let mut n:int=0\nlet r=&n\nif flag {n=1\n@assert(true)} else {@print(r)}\n@print(n)}\nlet main:()={f(true)\nf(false)}", .output = "100" },
+        .{ .source = "let main:()=@assert(false)", .code = 1, .output = "", .diagnostic = "test.nov:1:13: assertion failed\n" },
+        .{ .source = "let main:()={@assert({return},@panic(\"unreached\"))}", .output = "" },
+        .{ .source = "let main:()=@assert(false,{@print(\"M\")\nreturn})", .output = "M" },
+        .{ .source = "let main:()={let mut n:int=0\nlet r=&n\n@assert(r==0,{n=1\n\"snapshot\"})\n@assert(n==1)}", .output = "" },
+        .{ .source = "let main:()={let mut n:int=0\nloop n<3 {let r=&n\n@assert(r<3,\"iteration\")\nr+=1}\n@assert(n==3)\nif true {@assert(true)} else {@assert(false)}}", .output = "" },
+    };
+    for (cases) |case| {
+        var lowered = blk: {
+            var module = try Module.init(test_gpa, "test.nov", case.source);
+            defer module.deinit();
+            var result = try Lowering.lower(&module);
+            errdefer result.deinit();
+            try std.testing.expect(!module.hasErrors());
+            break :blk result;
+        };
+        defer lowered.deinit();
+        const c = try emitProgram(test_gpa, &lowered.ir, null);
+        defer test_gpa.free(c);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", case.code, case.output, case.diagnostic, mode);
+    }
+}
+
+test "assert and test driver emission survive allocation failures and source release" {
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testAssertionEmissionAllocations, .{});
+}
+
+fn testAssertionEmissionAllocations(allocator: std.mem.Allocator) !void {
+    var lowered = blk: {
+        var module = try Module.init(allocator, "assert.nov", "@[test]\nlet check:()=@assert(true,\"owned\"+\" message\")");
+        defer module.deinit();
+        module.tests_enabled = true;
+        var result = try Lowering.lower(&module);
+        errdefer result.deinit();
+        try std.testing.expect(!module.hasErrors());
+        break :blk result;
+    };
+    defer lowered.deinit();
+    const c = try emitTestProgram(allocator, &lowered.ir, &.{@fromBackingInt(0)}, null);
+    defer allocator.free(c);
+}
+
+test "test executable selects exactly one test and rejects invalid selections" {
+    var ir = Ir.init(test_gpa);
+    defer ir.deinit();
+    const unit = try ir.internType(.void);
+    const signature = try ir.internType(.{ .function = .{ .params = &.{}, .result = unit } });
+    const value = try ir.internConstant(.{ .ty = unit, .value = .void });
+    const id = try ir.addFunction("check", signature, .{ .start = 0, .end = 0 });
+    ir.functions.items[@backingInt(id)].is_test = true;
+    try ir.setFunctionBody(id, &.{.{ .ty = unit, .span = .{ .start = 0, .end = 0 }, .op = .{ .constant = value } }}, @fromBackingInt(0));
+    try std.testing.expectError(error.InvalidEntrypoint, emitProgramRoot(test_gpa, &ir, id, .{ .start = 0, .end = 0 }, null));
+    try std.testing.expectError(error.InvalidTestEntrypoint, emitTestProgram(test_gpa, &ir, &.{ id, id }, null));
+    try std.testing.expectError(error.InvalidTestEntrypoint, emitTestProgram(test_gpa, &ir, &.{@fromBackingInt(999)}, null));
+    const string = try ir.internType(.string);
+    const text = try ir.internConstant(.{ .ty = string, .value = .{ .string = "once" } });
+    const second = try ir.addFunction("second", signature, .{ .start = 0, .end = 0 });
+    ir.functions.items[@backingInt(second)].is_test = true;
+    try ir.setFunctionBody(second, &.{
+        .{ .ty = string, .span = .{ .start = 0, .end = 0 }, .op = .{ .constant = text } },
+        .{ .ty = unit, .span = .{ .start = 0, .end = 0 }, .op = .{ .print = .{ .args = &.{@fromBackingInt(0)}, .newline = false } } },
+    }, @fromBackingInt(1));
+    const c = try emitTestProgram(test_gpa, &ir, &.{ id, second }, null);
+    defer test_gpa.free(c);
+    const renamed = try std.mem.concat(test_gpa, u8, &.{ "#define main test_driver\n", c, "\n#undef main\nint main(void) { char *good[] = {\"driver\", \"0\"}; char *bad[] = {\"driver\", \"00\"}; char *second[] = {\"driver\", \"1\"}; if (test_driver(2, good) || test_driver(2, second)) return 1; if (test_driver(2, bad) != 2 || test_driver(1, good) != 2) return 1; return 0; }\n" });
+    defer test_gpa.free(renamed);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(renamed, "typedef int nonempty_translation_unit;", 0, "once", "", mode);
+    const empty = try emitTestProgram(test_gpa, &ir, &.{}, null);
+    defer test_gpa.free(empty);
+    try compileAndRunExpected(empty, "typedef int nonempty_translation_unit;", 2, "", "");
 }
 
 fn externTestProgram(source: []const u8) ![]u8 {
