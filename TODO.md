@@ -1,5 +1,33 @@
 # TODO
 
+## HIGH PRIORITY: optimize expensive recursive value copies
+
+Array-valued struct fields are implemented.
+The copy-depth question is settled: ordinary value boundaries eagerly create
+recursively independent array backing through nested structs, record elements and
+union record payloads; immutable strings share. These recursive copies are a major
+performance concern, especially repeated snapshots and updates. Targeted copy
+elision now transfers fresh temporaries rather than recloning at binding/call/return
+boundaries; readonly field/simple-index projections avoid enclosing aggregate copies.
+Effectful indices retain snapshots. Allocation-count regressions cover these paths.
+Insertion/replacement/append and indexed updates still need further optimization.
+Broader elision, moves/consuming transfers and copy-on-write remain candidates,
+**not approved designs**. Preserve observable value independence, static borrowing and GC safety.
+This targeted high-priority follow-up is not blanket approval for other optimizations.
+`defer` implementation remains explicitly postponed until the user asks to resume.
+
+Plain/generic acyclic struct array fields support reads, replacement, append and
+indexed replacement/integer compounds on nested mutable-local paths. Updates snapshot
+the array before index/RHS effects, then replace only the target field in the current
+record; sibling changes survive. Existing whole-record/record-element stable loans
+support array-field replacement/append and ordinary recursively copied reads, but
+not indexed field updates. No field-specific loans, implicit mutable receivers,
+nested arrays or recursive layouts through arrays are added. Immutable closure
+captures snapshot recursively; mutable captures share a cell, not ordinary read
+results. See `examples/array-fields.nov`.
+
+## Current delivered status
+
 Runes and Unicode scalar string inspection are implemented. `rune` is distinct from integers: `0..=0x10FFFF` excluding `0xD800..=0xDFFF`.
 Single quotes hold exactly one scalar or escape (`'é'`, `'😀'`, `'\n'`, `'\xE9'`,
 `'\u{1F600}'`); empty/multiple-scalar or invalid literals reject. Runes support
@@ -71,8 +99,8 @@ parameters, canonical declaration+argument identity through aliases/imports,
 concrete fields/defaults, finite nested instances, direct Box(T)[...] constructors,
 @This/Self and demand-specialized methods. They work in arrays and Option/Result
 payloads with existing value-copy/GC rules. See examples/generic-structs.nov.
-Array-valued fields are still unsupported pending recursive copy-depth semantics;
-contextual constructors, value generics and general comptime remain deferred.
+Array-valued fields now use recursive independent copies, including concrete array
+type arguments; contextual constructors, value generics and general comptime remain deferred.
 
 Growable []string and acyclic nested-record arrays are executable with independent
 element storage and shared immutable string backing. Index values and replacements,
@@ -80,7 +108,8 @@ append, literal inference, copies/returns and managed owner tracing work. String
 membership compares bytes, including UTF-8/NUL; record membership/equality and
 indexed string compounds remain unsupported. Owned expanded GC pointer maps cover
 all managed capacity slots, with checked alignment/size/OOM and zeroed owners.
-No nested/enum/union/function arrays, escaping element aliases or array record fields yet.
+No nested/enum/union/function arrays or escaping element aliases. Record elements
+may themselves contain supported array fields with recursively independent backing.
 See examples/managed-arrays.nov. Generic structs now work with supported field types.
 
 Acyclic nested nominal struct fields and mutable-local nested field paths now work,
@@ -90,7 +119,7 @@ Recursive layouts or depth over 128 aggregate levels diagnose; nested values mus
 be supplied explicitly (scalar literal defaults unchanged). C topological layouts
 and recursively flattened string-owner roots preserve GC safety. Validation includes
 late generic layouts, forged cycles, deep graphs and zero-root diamond performance.
-See examples/nested-structs.nov. Array/union/function fields remain unsupported.
+See examples/nested-structs.nov. Array fields now work; union/function fields remain unsupported.
 
 Direct mutable-local struct fields support exact bool/integer/rune/string/enum assignment,
 integer +=/-=/*=//=/%= and string +=. Compounds snapshot the old field before RHS;
@@ -210,9 +239,9 @@ declarations and methods are otherwise file-private under both import forms.
 `@[private]` is unsupported. Explicit C export annotations are separate from Nov
 visibility. C value layouts/root frames retain every string owner in
 parameters, temporaries, local slots and control-flow merges. Contextual/anonymous
-constructors, nested/array/function fields,
-record arrays/globals, container constants/types, derived printing,
-FFI remains deferred. See README's executable struct
+constructors, union/function fields, record globals, container constants/types,
+derived printing and FFI remain deferred. Nested structs, array fields and record
+arrays are delivered under the recursive value-copy rules above. See README's executable struct
 contract; the older broader syntax examples below are not delivery claims.
 
 Executable scalar status: integer binary `&`, `|`, `^` and unary `~` support

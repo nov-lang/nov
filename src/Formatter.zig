@@ -177,7 +177,7 @@ fn checkSupported(ast: Ast) !void {
             .container_field => if (data.lhs != 0) {
                 const field_tag = ast.nodes.items(.tag)[data.lhs];
                 switch (field_tag) {
-                    .identifier, .field_access, .call, .call_one => {},
+                    .identifier, .field_access, .call, .call_one, .array_type => {},
                     else => return error.UnsupportedSyntax,
                 }
                 const name = ast.tokenSlice(ast.firstToken(data.lhs));
@@ -234,9 +234,7 @@ fn checkSupported(ast: Ast) !void {
                 if (lhs_tag == .identifier) continue;
                 if (lhs_tag != .array_access and lhs_tag != .field_access) return error.UnsupportedSyntax;
                 var base = ast.nodes.items(.data)[data.lhs].lhs;
-                if (lhs_tag == .field_access) {
-                    while (ast.nodes.items(.tag)[base] == .field_access) base = ast.nodes.items(.data)[base].lhs;
-                }
+                while (ast.nodes.items(.tag)[base] == .field_access) base = ast.nodes.items(.data)[base].lhs;
                 if (ast.nodes.items(.tag)[base] != .identifier) return error.UnsupportedSyntax;
             },
             else => {},

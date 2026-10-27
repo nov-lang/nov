@@ -70,7 +70,8 @@ pub const Operation = union(enum) {
     /// Decimal integers, true/false booleans, UTF8 runes, or a shared immutable string.
     to_string: ValueId,
     array_literal: []const ValueId,
-    /// Independent element storage; records copy by value, string backing shares.
+    /// Eager recursive array backing copy, including record fields/elements.
+    /// Immutable strings and closure environments remain shared.
     array_clone: ValueId,
     /// Unicode scalar count for strings; element count for arrays.
     array_len: ValueId,
@@ -555,8 +556,13 @@ pub fn recordLayoutIssue(self: *const Ir) (std.mem.Allocator.Error || error{Inva
                 continue;
             }
             const field = fields[frame.next];
-            const child = @backingInt(field.ty);
-            const ft = self.getType(field.ty) orelse return error.InvalidTypeId;
+            var child_id = field.ty;
+            var ft = self.getType(child_id) orelse return error.InvalidTypeId;
+            if (ft == .array) {
+                child_id = ft.array;
+                ft = self.getType(child_id) orelse return error.InvalidTypeId;
+            }
+            const child = @backingInt(child_id);
             if (ft != .record) {
                 frame.next += 1;
                 continue;
@@ -566,7 +572,7 @@ pub fn recordLayoutIssue(self: *const Ir) (std.mem.Allocator.Error || error{Inva
             if (states[child].color == .white) {
                 if (len == stack.len) return .{ .span = field.span, .related = related, .cycle = false };
                 states[child].color = .gray;
-                stack[len] = .{ .id = field.ty };
+                stack[len] = .{ .id = child_id };
                 len += 1;
                 continue;
             }
@@ -905,7 +911,7 @@ fn validateBodyStructure(self: *const Ir, function: Function, body: Body) Verify
                 }
             },
             .array_clone => |value| {
-                if (ty != .array) return error.InvalidOperation;
+                if (!try self.needsArrayCopy(instruction.ty)) return error.InvalidOperation;
                 if (try operandType(body, value, i) != instruction.ty) return error.OperandTypeMismatch;
             },
             .array_len => |value| {
@@ -1255,12 +1261,41 @@ pub fn isManaged(ty: Type) bool {
 /// Untagged records retain nominal identity as union payloads. Layout graph
 /// validation independently rejects cycles and excessive by-value depth.
 pub fn isUnionPayload(ty: Type) bool {
-    return isRecordField(ty) or ty == .void or (ty == .record and !ty.record.tagged);
+    return (ty != .array and isRecordField(ty)) or ty == .void or (ty == .record and !ty.record.tagged);
+}
+
+/// Query the layout DAG, visiting scalar diamonds only once. Closure values
+/// intentionally do not traverse their signatures or shared environments.
+pub fn needsArrayCopy(self: *const Ir, id: TypeId) std.mem.Allocator.Error!bool {
+    const ty = self.getType(id) orelse return false;
+    if (ty == .array) return true;
+    if (ty != .record) return false;
+    const visited = try self.allocator.alloc(bool, self.types.items.len);
+    defer self.allocator.free(visited);
+    @memset(visited, false);
+    const work = try self.allocator.alloc(TypeId, self.types.items.len);
+    defer self.allocator.free(work);
+    work[0] = id;
+    visited[@backingInt(id)] = true;
+    var len: usize = 1;
+    while (len != 0) {
+        len -= 1;
+        const current = self.getType(work[len]).?.record;
+        for (current.fields) |field| {
+            const ft = self.getType(field.ty) orelse continue;
+            if (ft == .array) return true;
+            if (ft != .record or visited[@backingInt(field.ty)]) continue;
+            visited[@backingInt(field.ty)] = true;
+            work[len] = field.ty;
+            len += 1;
+        }
+    }
+    return false;
 }
 
 /// Record fields use semantic integer limits, not array/backend storage widths.
 pub fn isRecordField(ty: Type) bool {
-    return ty == .enumeration or ty == .boolean or ty == .rune or ty == .string or (ty == .record and !ty.record.tagged) or (ty == .integer and ty.integer.bits > 0 and ty.integer.bits <= 128);
+    return ty == .array or ty == .enumeration or ty == .boolean or ty == .rune or ty == .string or (ty == .record and !ty.record.tagged) or (ty == .integer and ty.integer.bits > 0 and ty.integer.bits <= 128);
 }
 
 pub fn isArrayElement(ty: Type) bool {
@@ -1355,7 +1390,7 @@ test "generic nominal keys own canonical arguments and do not collapse identical
     owned[0] = boolean;
 }
 
-test "generic structs IR owns nominal arguments and rejects recursive keys and array fields" {
+test "generic structs IR owns nominal arguments accepts array fields and rejects recursive keys" {
     var ir = Ir.init(std.testing.allocator);
     defer ir.deinit();
     const integer = try ir.internType(.{ .integer = .{ .signedness = .signed, .bits = 32 } });
@@ -1381,7 +1416,7 @@ test "generic structs IR owns nominal arguments and rejects recursive keys and a
     const fields = @constCast(ir.types.items[@backingInt(a)].record.fields);
     const saved = fields[0];
     fields[0].ty = array;
-    try std.testing.expectError(error.InvalidArrayElement, ir.verify());
+    try ir.verify();
     fields[0] = saved;
     const wrong_default = try ir.internConstant(.{ .ty = boolean, .value = .{ .boolean = true } });
     fields[0].default = wrong_default;
@@ -1402,9 +1437,8 @@ test "record payload layouts reject tagged fields and forged nominal operands" {
     try ir.setRecordFields(r, &.{.{ .name = "s", .ty = text, .span = span }});
     try ir.setRecordFields(other, &.{.{ .name = "s", .ty = text, .span = span }});
     try ir.setRecordFields(u, &.{.{ .name = "ok", .ty = r, .span = span }});
-    for ([_]TypeId{ u, array }) |invalid| {
-        try std.testing.expectError(error.InvalidArrayElement, ir.setRecordFields(r, &.{.{ .name = "nested", .ty = invalid, .span = span }}));
-    }
+    try std.testing.expectError(error.InvalidArrayElement, ir.setRecordFields(r, &.{.{ .name = "nested", .ty = u, .span = span }}));
+    try std.testing.expectError(error.InvalidArrayElement, ir.setRecordFields(u, &.{.{ .name = "nested", .ty = array, .span = span }}));
     try std.testing.expectError(error.InvalidArrayElement, ir.setRecordFields(u, &.{.{ .name = "nested", .ty = u, .span = span }}));
     const sig = try ir.internType(.{ .function = .{ .params = &.{other}, .result = u } });
     const f = try ir.addFunction("f", sig, span);
@@ -4102,7 +4136,11 @@ test "managed array IR owns layouts and rejects forged record equality and paylo
     ir.types.items[@backingInt(array)] = .{ .array = record };
     const fields = @constCast(ir.types.items[@backingInt(record)].record.fields);
     fields[0].ty = strings;
-    try std.testing.expectError(error.InvalidArrayElement, ir.verify());
+    ir.clearFunctions();
+    try ir.verify();
+    // Arrays must not hide a cycle in an otherwise by-value layout DAG.
+    fields[0].ty = array;
+    try std.testing.expectError(error.CyclicRecordLayout, ir.verify());
 }
 
 test "nested records diamond graph traversal completes without expanding value paths" {

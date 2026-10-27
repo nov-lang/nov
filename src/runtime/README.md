@@ -19,8 +19,8 @@ live heap. Allocate using `nov_gc_alloc` (panic on failure) or
 The descriptor and pointer-offset map are copied into the allocation itself, so
 caller metadata need not outlive the allocation. `nov_gc_alloc_repeated` and its
 try variant expand an element layout across a checked element count; arrays use
-this to trace string owner fields inside string or nested-record elements. Expanded
-offset storage scales with capacity times managed fields and is included in heap
+this to trace string owners and array backing fields inside string or nested-record
+elements. Expanded offset storage scales with capacity times managed fields and is included in heap
 accounting. Metadata and payload share one allocation and are freed together.
 Use `sizeof(T)`, `_Alignof(T)` and sorted `offsetof(T, field)` entries. Every strong
 managed field must be an actual C `void *` object and appear exactly once. Nested
@@ -101,9 +101,13 @@ use adapters with NULL environments. The Nov function type and scalar foreign
 ABI are unchanged; function-valued foreign boundaries remain unsupported.
 
 Environments are repeated arrays of real `void *` fields, rooted before any
-capture allocation. Immutable captures use typed snapshot boxes (arrays clone
-at capture creation). Mutable captures point to shared typed cells: the defining
-local and all closures access the same GC allocation, never a stack address.
+capture allocation. Immutable captures use typed snapshot boxes: array backing is
+cloned recursively through nested records, record elements and union record payloads
+at capture creation; immutable strings share. Mutable captures point to shared typed
+cells: the defining local and all closures access the same GC allocation, never a
+stack address.
+Ordinary reads of a mutable capture still recursively copy array-bearing values;
+cell sharing is not permission to alias ordinary value results.
 Descriptors trace the managed fields of each box/cell, including nested record
 owners, array backing, strings and function environments. Cells created in loop
 iterations are distinct allocations. Unreachable environment/cell cycles are
@@ -140,19 +144,54 @@ outstanding host allocations to check deterministic cleanup.
 
 ## Generated nominal value structs
 
-Bounded records are flat C value structs, not GC allocations. Their supported
-fields are bool/integer scalars and immutable `nov_string` values. Assignment and
-by-value call/return boundaries copy fields; string backing is shared. The emitter
-predeclares record instruction/slot/merge storage at function scope, zero-initializes
-it, and adds each string field's real `void *owner` address to the function frame,
-along with record-parameter owners. Skipped branches therefore contain initialized
-NULL roots; prior constructor arguments and allocating `toString` results remain
-rooted. No `T **` cast or string `.data` pointer is used for tracing. A uniform
-record path currently installs a frame even for records with no string fields.
-No runtime helper or heap-object descriptor was added for records. Nested records,
-array/function fields, record arrays, field writes and foreign retention remain
-unsupported. The existing allocation retry, panic, shutdown and immutable-string
+Bounded plain/generic records use inline C value structs, not GC allocations for
+the records themselves. Fields support bool/integer/rune/enum scalars, immutable
+`nov_string`, acyclic nested records and arrays of supported elements. Record arrays
+and struct payloads of unions may contain these array-bearing records. Nested array
+types, layout cycles (including through arrays), union/function fields and managed
+foreign retention remain unsupported.
+
+Ordinary value boundaries preserve recursive array independence; immutable string
+backing shares. Storage reads clone when producing independent values, while fresh
+expression temporaries transfer through initialization, argument, return and
+control-flow boundaries without another clone. Readonly field/simple-index
+projections avoid copying the enclosing aggregate. Effectful indices retain
+pre-effect snapshots, including when shared closure cells can mutate the source. Generated typed copy helpers
+clone outer backing and recursively detach array-bearing elements/fields. Tagged
+unions copy only the active payload. Helpers root both input and partially copied
+output across allocations; nested allocations can trigger collection/retry. The
+scalar array helper's one-backing-per-call property does not bound allocations of a
+recursive generated copy.
+
+The emitter predeclares instruction/slot/merge storage at function scope,
+zero-initializes it, and roots actual `void *owner` and `void *data` fields, flattened
+through inline records and parameters. Repeated element maps trace backing fields
+inside record elements; each backing allocation traces its own elements. Skipped
+branches therefore contain initialized NULL roots. No `T **` cast, string byte
+pointer or derived interior address is traced. Record/element loans retain their
+existing stable owner-slot/index representation: no field-specific loan form is
+added. Whole-record/record-element loans support array-field replacement/append;
+indexed array-field updates through these loans remain unsupported.
+
+Nested mutable-local field paths support replacement, append and indexed updates.
+Append/index updates capture independent target-array snapshots before index/RHS
+effects and store only that field into the current record slot, preserving siblings.
+A terminal index/RHS skips the pending store. Borrowing and GC do not introduce
+implicit mutable receivers. Allocation retry, panic, shutdown and immutable-string
 contracts apply unchanged.
+
+### HIGH PRIORITY: recursive-copy performance
+
+Eager recursive backing copies are a major performance concern, not an optimized
+ownership strategy. Reads, snapshots and updates may copy entire reachable array
+contents repeatedly and keep temporary backing rooted until function exit/reuse.
+Targeted fresh-value and projection elision is implemented and allocation-count
+regressions cover it at O0/O3 with forced GC. Insertion, replacement, append and
+indexed updates still contain redundant recursive copies. Investigate broader
+elision, moves/consuming transfers and copy-on-write as candidates, **not approved
+designs**. Any optimization must preserve observable independence,
+static borrow exclusivity and precise GC/root/OOM safety. No aliasing or COW behavior
+is delivered by this implementation. See `examples/array-fields.nov`.
 
 ## Generated scalar arrays
 
@@ -194,7 +233,9 @@ on **every** allocation, injected allocation failures/retries, strict C11/UBSan,
 -O0 and -O3 bounds checks, argument-order effects, nested loops and early returns.
 
 Writable length (especially growth initialization), slices/invalidation, nested
-or pointer elements, explicit aliases and managed FFI remain deferred.
+array or pointer elements, explicit aliases and managed FFI remain deferred.
+String/record elements and array-valued record fields use managed element maps
+and recursive generated copies as described above.
 See the main README for delivered source syntax and copy/evaluation contracts.
 
 ## Generated immutable strings

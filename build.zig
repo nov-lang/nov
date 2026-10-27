@@ -139,6 +139,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const closure_tests = b.step("test-cli-closures", "Run function expression and closure CLI tests");
     addClosureCliTests(b, exe, closure_tests);
     test_step.dependOn(closure_tests);
+    const array_field_tests = b.step("test-cli-array-fields", "Run array-valued struct field CLI tests");
+    addArrayFieldCliTests(b, exe, array_field_tests);
+    test_step.dependOn(array_field_tests);
     addFieldMutationCliTests(b, exe, test_step, fixtures);
     addGenericStructCliTests(b, exe, test_step, fixtures);
     addRangeValueCliTests(b, exe, test_step, fixtures);
@@ -1741,7 +1744,7 @@ fn addGenericStructCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_st
     }
     const Case = struct { name: []const u8, source: []const u8, diagnostic: []const u8 };
     for ([_]Case{
-        .{ .name = "array-field", .source = "let G:(T:type)->type=struct{value:[]T,}\nlet main:()={let x=G(int)[]\n}", .diagnostic = "this type is not supported in semantic analysis yet" },
+        .{ .name = "nested-array-field", .source = "let G:(T:type)->type=struct{value:[][]T,}\nlet main:()={let x=G(int)[]\n}", .diagnostic = "this type is not supported in semantic analysis yet" },
         .{ .name = "default", .source = "let G:(T:type)->type=struct{value:T=1,}\nlet main:()={let x=G(bool)[]\n}", .diagnostic = "literal does not match" },
         .{ .name = "cycle", .source = "let G:(T:type)->type=struct{value:G(T),}\nlet main:()={let x=G(int)[]\n}", .diagnostic = "cyclic generic container instantiation" },
     }) |case| {
@@ -1754,6 +1757,65 @@ fn addGenericStructCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_st
         check.expectExitCode(1);
         check.expectStdOutEqual("");
         check.addCheck(.{ .expect_stderr_match = case.diagnostic });
+        test_step.dependOn(&check.step);
+    }
+}
+
+fn addArrayFieldCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    const fixtures = b.addWriteFiles();
+    _ = fixtures.add("array-fields.nov", @embedFile("examples/array-fields.nov"));
+    for ([_][]const u8{ "fmt", "semantic" }) |mode| {
+        const run = b.addRunArtifact(exe);
+        run.step.name = b.fmt("CLI array fields: {s}", .{mode});
+        run.setCwd(fixtures.getDirectory());
+        run.addArgs(if (std.mem.eql(u8, mode, "fmt")) &.{ "fmt", "--check", "array-fields.nov" } else &.{ "check", "--semantic", "array-fields.nov" });
+        run.expectExitCode(0);
+        run.expectStdOutEqual("");
+        run.expectStdErrEqual("");
+        test_step.dependOn(&run.step);
+    }
+    for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+        for ([_][]const u8{ "run", "test" }) |command| {
+            const run = b.addRunArtifact(exe);
+            run.step.name = b.fmt("CLI array fields: {s} ({s})", .{ command, mode });
+            run.setCwd(fixtures.getDirectory());
+            run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+            run.setEnvironmentVariable("NOV_CC", "");
+            run.setEnvironmentVariable("CC", "");
+            run.addArgs(&.{ command, "array-fields.nov" });
+            if (mode.len != 0) run.addArg(mode);
+            run.expectExitCode(0);
+            run.expectStdOutEqual(if (std.mem.eql(u8, command, "test"))
+                "PASS field_mutations\nPASS recursive_copies\nPASS payload_and_control_flow\nPASS closure_copies\nPASS mutation_order_and_record_loans\n5 passed; 0 failed; 5 total\n"
+            else
+                "Saved: 2 2\nUpdated: 12 3\n");
+            run.expectStdErrEqual("");
+            test_step.dependOn(&run.step);
+        }
+    }
+    const unsupported_type = "this type is not supported in semantic analysis yet";
+    const unsupported_borrow = "borrow requires a fixed unannotated let binding to &local or &localArray[index]";
+    const unsupported_assignment = "assignment target must be a mutable local, its struct field path, or its scalar-array element";
+    for ([_]struct { name: []const u8, source: []const u8, diagnostic: []const u8 }{
+        .{ .name = "nested-field", .source = "let A=struct{a:[][]int,}\nlet main:()={}", .diagnostic = unsupported_type },
+        .{ .name = "nested-local", .source = "let main:()={let a:[][]int=[]\n}", .diagnostic = unsupported_type },
+        .{ .name = "nested-generic", .source = "let A:(T:type)->type=struct{a:[]T,}\nlet main:(a:A([]int))={}", .diagnostic = unsupported_type },
+        .{ .name = "recursive", .source = "let A=struct{a:[]A,}\nlet main:()={}", .diagnostic = "cyclic by-value struct layout" },
+        .{ .name = "mutually-recursive", .source = "let A=struct{b:[]B,}\nlet B=struct{a:A,}\nlet main:()={}", .diagnostic = "cyclic by-value struct layout" },
+        .{ .name = "recursive-generic", .source = "let A:(T:type)->type=struct{a:[]A(T),}\nlet main:(a:A(int))={}", .diagnostic = "cyclic generic container instantiation" },
+        .{ .name = "borrow-field", .source = "let A=struct{a:[]int,}\nlet main:()={let mut a=A[.a=[1]]\nlet r=&a.a\n}", .diagnostic = unsupported_borrow },
+        .{ .name = "borrow-field-element", .source = "let A=struct{a:[]int,}\nlet main:()={let mut a=A[.a=[1]]\nlet r=&a.a[0]\n}", .diagnostic = unsupported_borrow },
+        .{ .name = "borrowed-field-index", .source = "let A=struct{a:[]int,}\nlet main:()={let mut a=A[.a=[1]]\nlet r=&a\nr.a[0]=2}", .diagnostic = unsupported_assignment },
+    }) |case| {
+        const source = b.fmt("invalid-array-field-{s}.nov", .{case.name});
+        _ = fixtures.add(source, case.source);
+        const check = b.addRunArtifact(exe);
+        check.step.name = b.fmt("CLI array fields: reject {s}", .{case.name});
+        check.setCwd(fixtures.getDirectory());
+        check.addArgs(&.{ "check", "--semantic", source });
+        check.expectExitCode(1);
+        check.expectStdOutEqual("");
+        check.expectStdErrMatch(case.diagnostic);
         test_step.dependOn(&check.step);
     }
 }

@@ -191,6 +191,7 @@ const Context = struct {
     bindings: std.StringHashMapUnmanaged(Binding) = .empty,
     locals: std.ArrayList([]const u8) = .empty,
     borrow_base: ?Ast.Node.Index = null,
+    projection_base: ?Ast.Node.Index = null,
     reservation: ?*const Reservation = null,
     parent: ?*Context = null,
     captures: std.ArrayList(Ir.Capture) = .empty,
@@ -227,7 +228,7 @@ const Context = struct {
                 var value = if (outer.slot) |slot|
                     try source.append(outer.known.ty, outer.name_span, .{ .local_load = slot })
                 else if (outer.value) |value| value else if (outer.initializer) |initializer| try source.value(initializer) else try source.append(outer.known.ty, outer.name_span, .{ .parameter = outer.index });
-                if (self.ir.getType(outer.known.ty).? == .array) value = try source.append(outer.known.ty, outer.name_span, .{ .array_clone = value });
+                if (try self.ir.needsArrayCopy(outer.known.ty)) value = try source.append(outer.known.ty, outer.name_span, .{ .array_clone = value });
                 break :blk value;
             };
             try self.capture_values.append(self.module.allocator, value);
@@ -1152,11 +1153,42 @@ const Context = struct {
     }
 
     fn copyNode(self: *Context, node: Ast.Node.Index, ty: Ir.TypeId) Error!void {
-        if (self.ir.getType(ty).? != .array) return;
+        if (!try self.ir.needsArrayCopy(ty)) return;
+        if (self.emitter) |emitter| {
+            // These operations already produce independent storage. Their result
+            // is an expression temporary, not another read of its eventual binding.
+            switch (emitter.instructions.items[@backingInt(try emitter.value(node))].op) {
+                .array_clone, .array_literal, .array_set, .array_append, .record_init, .union_init, .call, .branch, .loop => return,
+                else => {},
+            }
+        }
+        try self.copyRead(node, ty);
+    }
+
+    fn copyRead(self: *Context, node: Ast.Node.Index, ty: Ir.TypeId) Error!void {
+        if (self.projection_base == node or !try self.ir.needsArrayCopy(ty)) return;
         if (self.emitter) |emitter| {
             const copy = try emitter.append(ty, self.irSpan(node), .{ .array_clone = try emitter.value(node) });
             try emitter.values.put(emitter.allocator, node, copy);
         }
+    }
+
+    fn projection(self: *Context, node: Ast.Node.Index, depth: usize) Error!?Ir.TypeId {
+        const previous = self.projection_base;
+        self.projection_base = node;
+        defer self.projection_base = previous;
+        return self.expression(node, null, depth);
+    }
+
+    // Be conservative: an effectful index must see a recursively detached base
+    // from before the index executes, including mutations through closure cells.
+    fn inertIndex(self: *Context, node: Ast.Node.Index) bool {
+        const ast = &self.module.source.ast;
+        return switch (ast.nodes.items(.tag)[node]) {
+            .identifier, .number_literal => true,
+            .negation => ast.nodes.items(.tag)[ast.nodes.items(.data)[node].rhs] == .number_literal,
+            else => false,
+        };
     }
 
     fn arrayElements(self: *Context, node: Ast.Node.Index, buffer: *[2]Ast.Node.Index) []const Ast.Node.Index {
@@ -1234,13 +1266,13 @@ const Context = struct {
                     if (binding.borrowed) break :blk .{ .borrow_read = binding.borrow.? };
                     if (binding.value) |value| {
                         try emitter.values.put(emitter.allocator, node, value);
-                        if (self.ir.getType(ty).? == .array) try self.copyNode(node, ty);
+                        try self.copyRead(node, ty);
                         return true;
                     }
                     if (binding.slot) |slot| break :blk .{ .local_load = slot };
                     if (binding.initializer) |initializer| {
                         try emitter.values.put(emitter.allocator, node, try emitter.value(initializer));
-                        if (self.ir.getType(ty).? == .array) try self.copyNode(node, ty);
+                        try self.copyRead(node, ty);
                         return true;
                     }
                     break :blk .{ .parameter = binding.index };
@@ -1326,9 +1358,9 @@ const Context = struct {
             }
         }
         try emitter.record(node, ty, self.irSpan(node), op);
-        // All ordinary array reads, including alias reads, detach before
-        // index/RHS effects. Creating a loan itself never reads or clones.
-        if (tag == .identifier and self.ir.getType(ty).? == .array) try self.copyNode(node, ty);
+        // Storage reads snapshot immediately; projection bases only borrow the
+        // aggregate until its selected value is read, without intervening effects.
+        if (tag == .identifier or tag == .field_access or tag == .array_access) try self.copyRead(node, ty);
         return true;
     }
 
@@ -1382,14 +1414,16 @@ const Context = struct {
         const tag = ast.nodes.items(.tag)[node];
         const compound = tag != .assign;
         const ty = self.ir.getType(field.ty).?;
-        if (compound and ty != .integer and !(ty == .string and tag == .assign_add)) return self.fail(.operator_not_supported, node, null);
+        if (compound and ty != .integer and !((ty == .string or ty == .array) and tag == .assign_add)) return self.fail(.operator_not_supported, node, null);
         if (compound and try self.expression(data.lhs, .{ .ty = field.ty }, depth + 1) == null) return null;
         if (try self.expression(data.rhs, .{ .ty = field.ty }, depth + 1) == null) return null;
         const unit = try self.ir.internType(.void);
         if (!self.terminated) {
             if (self.emitter) |emitter| {
                 var value = try emitter.value(data.rhs);
-                if (compound) value = try emitter.append(field.ty, self.irSpan(node), .{ .binary = .{
+                if (compound and ty == .array) {
+                    value = try emitter.append(field.ty, self.irSpan(node), .{ .array_append = .{ .lhs = try emitter.value(data.lhs), .rhs = value } });
+                } else if (compound) value = try emitter.append(field.ty, self.irSpan(node), .{ .binary = .{
                     .op = switch (tag) {
                         .assign_add => .add,
                         .assign_sub => .sub,
@@ -1417,8 +1451,17 @@ const Context = struct {
         const target = ast.nodes.items(.data)[data.lhs];
         const tag = ast.nodes.items(.tag)[node];
         const compound = tag != .assign;
-        if (ast.nodes.items(.tag)[target.lhs] != .identifier) return self.fail(.unsupported_assignment_target, data.lhs, null);
-        const name = self.module.sourceSlice(self.span(target.lhs)).?;
+        var root = target.lhs;
+        var nodes: [Ir.max_record_depth]Ast.Node.Index = undefined;
+        var path_len: usize = 0;
+        while (ast.nodes.items(.tag)[root] == .field_access) {
+            if (path_len == nodes.len) return self.fail(.record_layout_limit, data.lhs, null);
+            nodes[path_len] = root;
+            path_len += 1;
+            root = ast.nodes.items(.data)[root].lhs;
+        }
+        if (ast.nodes.items(.tag)[root] != .identifier) return self.fail(.unsupported_assignment_target, data.lhs, null);
+        const name = self.module.sourceSlice(self.span(root)).?;
         const binding = (try self.captureBinding(name, node)) orelse {
             if (self.module.lookup(name)) |id| return self.fail(.immutable_assignment, target.lhs, self.module.getDeclaration(id).?.name_span);
             return self.fail(.unknown_name, target.lhs, null);
@@ -1428,11 +1471,23 @@ const Context = struct {
         if (binding.borrowed) self.reservation = &reservation;
         defer self.reservation = parent;
         if (self.mutationOrigin(binding)) |origin| return self.fail(.borrow_conflict, target.lhs, origin);
-        const array = self.ir.getType(binding.known.ty).?;
+        var array_id = binding.known.ty;
+        var path: [Ir.max_record_depth]u32 = undefined;
+        for (0..path_len) |p| {
+            const access = nodes[path_len - p - 1];
+            const record = self.ir.getType(array_id).?;
+            if (record != .record or record.record.tagged) return self.fail(.unsupported_assignment_target, access, null);
+            const field = self.fieldIndex(array_id, ast.tokenSlice(ast.nodes.items(.data)[access].rhs)) orelse return self.fail(.unknown_field, access, null);
+            path[p] = field;
+            array_id = record.record.fields[field].ty;
+        }
+        // Loans into array fields do not yet have a stable owner+path representation.
+        if (binding.borrowed and path_len != 0) return self.fail(.unsupported_assignment_target, data.lhs, null);
+        const array = self.ir.getType(array_id).?;
         if (array != .array) return self.fail(.unsupported_assignment_target, data.lhs, null);
         if (!binding.mutable) return self.fail(.immutable_assignment, target.lhs, binding.name_span);
         if (compound and self.ir.getType(array.array).? != .integer) return self.fail(.operator_not_supported, node, binding.known.annotation);
-        if (try self.expression(target.lhs, binding.known, depth + 1) == null) return null;
+        if (try self.expression(target.lhs, .{ .ty = array_id }, depth + 1) == null) return null;
         const index = try self.ir.internType(.{ .integer = .{ .signedness = .signed, .bits = Ir.native_pointer_bits } });
         if (try self.expression(target.rhs, .{ .ty = index }, depth + 1) == null) return null;
         // Use the same pre-index snapshot for both the old element and final
@@ -1461,9 +1516,11 @@ const Context = struct {
                     .lhs = old.?,
                     .rhs = value,
                 } });
-                const updated = try emitter.append(binding.known.ty, self.irSpan(node), .{ .array_set = .{ .array = try emitter.value(target.lhs), .index = try emitter.value(target.rhs), .value = value } });
+                const updated = try emitter.append(array_id, self.irSpan(node), .{ .array_set = .{ .array = try emitter.value(target.lhs), .index = try emitter.value(target.rhs), .value = value } });
                 if (binding.borrowed) {
                     try emitter.record(node, unit, self.irSpan(node), .{ .borrow_store = .{ .borrow = binding.borrow.?, .value = updated, .path = &.{} } });
+                } else if (path_len != 0) {
+                    try emitter.record(node, unit, self.irSpan(node), .{ .field_store = .{ .slot = binding.slot.?, .index = path[path_len - 1], .value = updated, .path = try emitter.allocator.dupe(u32, path[0 .. path_len - 1]) } });
                 } else try emitter.record(node, unit, self.irSpan(node), .{ .local_store = .{ .slot = binding.slot.?, .value = updated } });
             }
         }
@@ -2176,7 +2233,8 @@ const Context = struct {
                 }
                 const previous_base = self.borrow_base;
                 self.borrow_base = if (ast.nodes.items(.tag)[node] == .field_access) data.lhs else null;
-                const base = (try self.expression(data.lhs, null, depth + 1)) orelse {
+                const project = ast.nodes.items(.tag)[node] == .field_access or self.inertIndex(data.rhs);
+                const base = (if (project) try self.projection(data.lhs, depth + 1) else try self.expression(data.lhs, null, depth + 1)) orelse {
                     self.borrow_base = previous_base;
                     return null;
                 };
@@ -2377,7 +2435,7 @@ const Context = struct {
                             .lhs = try emitter.value(data.lhs),
                             .rhs = value,
                         } });
-                        if (self.ir.getType(binding.known.ty).? == .array) value = try emitter.append(binding.known.ty, self.irSpan(node), .{ .array_clone = value });
+                        // RHS reads already snapshot; append produces new storage.
                         if (binding.borrowed) {
                             try emitter.record(node, unit, self.irSpan(node), .{ .borrow_store = .{ .borrow = binding.borrow.?, .value = value, .path = &.{} } });
                         } else try emitter.record(node, unit, self.irSpan(node), .{ .local_store = .{ .slot = binding.slot.?, .value = value } });
@@ -3715,7 +3773,7 @@ test "managed arrays reject unsupported payloads nominal mismatches and record m
         "let A=struct{s:string,}\nlet f:(a:A)={let mut x=[a]\nx[0]+=a}",
         "let A=struct{s:string,}\nlet f:(a:A)={let mut x=[a]\nx[0].s=\"bad\"}",
         "let A=struct{s:string,}\nlet f:(a:A)={let x:[]A=[]\nlet y:[]string=x\n}",
-        "let A=struct{s:[]string,}",
+        "let A=struct{s:[][]string,}",
         "let U=union{s:string,none,}\nlet f:(a:[]U)={}",
         "let E=enum{a,b,}\nlet f:(a:[]E)={}",
         "let f:(a:[]()->string)={}",

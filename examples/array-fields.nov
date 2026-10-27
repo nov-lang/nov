@@ -1,0 +1,156 @@
+; nov run examples/array-fields.nov
+; nov test examples/array-fields.nov
+; Array fields copy eagerly, including arrays inside nested records and payloads.
+; Optimizing these expensive recursive copies is high priority; this is not COW.
+
+let Batch: (T: type) -> type = struct {
+    items: []T,
+}
+
+let Leaf = struct {
+    values: []int,
+}
+
+let Tree = struct {
+    leaf: Leaf,
+    records: []Leaf,
+}
+
+let Payload = union {
+    some: Tree,
+    none,
+}
+
+let leaf: (n: int) -> Leaf = Leaf[ .values = [n, n + 1] ]
+let tree: () -> Tree = Tree[ .leaf = leaf(1), .records = [leaf(3)] ]
+let identity: (value: Tree) -> Tree = value
+
+let main: () = {
+    let mut batch = Batch(int)[ .items = [2, 4] ]
+    let saved = batch
+    batch.items[0] += 10
+    batch.items += [6]
+    @println("Saved:", saved.items[0], saved.items.len)
+    @println("Updated:", batch.items[0], batch.items.len)
+}
+
+@[test]
+let field_mutations: () = {
+    let mut batch = Batch(int)[ .items = [] ]
+    batch.items = [2, 4]
+    let saved = batch
+    batch.items += [6]
+    batch.items[-1] *= 2
+    @assert(saved.items.len == 2 and saved.items[1] == 4)
+    @assert(batch.items.len == 3 and batch.items[2] == 12)
+    let mut read = batch.items
+    read[0] = 99
+    @assert(batch.items[0] == 2)
+}
+
+@[test]
+let recursive_copies: () = {
+    let mut current = tree()
+    let saved = identity(current)
+    let mut assigned = tree()
+    assigned = current
+    current.leaf.values[0] = 10
+    current.leaf.values += [9]
+    let mut records = current.records
+    let mut first = records[0]
+    first.values[0] = 30
+    records[0] = first
+    records += [leaf(5)]
+    current.records = records
+    first.values[0] = 99
+    @assert(saved.leaf.values[0] == 1 and saved.leaf.values.len == 2)
+    @assert(saved.records[0].values[0] == 3 and saved.records.len == 1)
+    @assert(assigned.leaf.values[0] == 1 and assigned.records[0].values[0] == 3)
+    @assert(current.records[0].values[0] == 30 and current.records.len == 2)
+    let mut boxed = Batch(Tree)[ .items = [current] ]
+    current.leaf.values[0] = 20
+    let mut item = boxed.items[0]
+    item.leaf.values[0] = 40
+    boxed.items[0] = item
+    @assert(current.leaf.values[0] == 20)
+    @assert(boxed.items[0].leaf.values[0] == 40)
+}
+
+@[test]
+let payload_and_control_flow: () = {
+    let original = tree()
+    let wrapped = Payload.some[original]
+    let mut extracted = match wrapped {
+        .some => |value| value
+        .none => tree()
+    }
+    extracted.records = [leaf(9)]
+    extracted.leaf.values[0] = 8
+    let again = match wrapped {
+        .some => |value| value
+        .none => tree()
+    }
+    @assert(again.leaf.values[0] == 1 and again.records[0].values[0] == 3)
+    let mut branch = if true {
+        original
+    } else {
+        tree()
+    }
+    let mut looped = loop {
+        break original
+    }
+    branch.leaf.values[0] = 7
+    looped.leaf.values[0] = 6
+    @assert(original.leaf.values[0] == 1)
+    @assert(branch.leaf.values[0] == 7 and looped.leaf.values[0] == 6)
+}
+
+@[test]
+let closure_copies: () = {
+    let mut current = tree()
+    let frozen = current
+    let snapshot = () -> Tree {
+        frozen
+    }
+    let read = () -> Tree {
+        current
+    }
+    let change = () {
+        current.leaf.values[0] += 1
+    }
+    let same = change
+    change()
+    same()
+    let mut detached = read()
+    detached.leaf.values[0] = 90
+    detached.records = [leaf(8)]
+    let mut immutable_read = snapshot()
+    immutable_read.leaf.values[0] = 80
+    @assert(snapshot().leaf.values[0] == 1)
+    @assert(read().leaf.values[0] == 3 and read().records[0].values[0] == 3)
+    @assert(detached.leaf.values[0] == 90)
+}
+
+@[test]
+let mutation_order_and_record_loans: () = {
+    let mut current = tree()
+    current.leaf.values[1] = {
+        current.leaf = leaf(7)
+        8
+    }
+    @assert(current.leaf.values[0] == 1 and current.leaf.values[1] == 8)
+    let mut records = [leaf(3)]
+    let snapshot = records[
+        {
+            let loan = &records[0]
+            loan.values = [9]
+            0
+        }]
+    @assert(snapshot.values[0] == 3 and records[0].values[0] == 9)
+    let loan = &current
+    let mut detached = loan
+    loan.leaf.values += [5]
+    detached.leaf.values[0] = 99
+    @assert(loan.leaf.values.len == 3 and detached.leaf.values.len == 2)
+    @assert(loan.leaf.values[0] == 1)
+}

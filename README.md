@@ -611,11 +611,13 @@ The new form also works for module functions, methods and `@[test]` functions.
 Referenced outer bindings are captured automatically when the function expression
 is evaluated:
 
-- Immutable bindings and parameters capture readonly snapshots. Arrays receive
-  independent backing storage; records copy by value and immutable strings share.
+- Immutable bindings and parameters capture readonly snapshots. Arrays and arrays
+  inside nested records/union record payloads receive recursively independent backing
+  storage; immutable strings share.
 - Mutable bindings capture shared GC-managed cells. The outer binding and every
   capturing closure observe the same updates, even after the defining function
-  returns. This does not turn ordinary array reads/assignments into aliases.
+  returns. Ordinary reads still make normal recursive value copies; sharing the
+  captured cell does not turn array or record reads/assignments into aliases.
 - Copying or passing a function value shares its environment and captured cells;
   it does not repeat capture evaluation or deep-copy the environment.
 - Captures propagate through nested closures. GC retains environments, cells and
@@ -791,8 +793,8 @@ The delivered subset is deliberately bounded:
   aliases work in annotations, method signatures, constructors and static calls.
   Forward module type names and method signatures are supported.
 - Named fields require explicit `bool`, `rune`, integer (including `i128`/`u128` and native
-  `int`/`uint`), immutable `string`, nominal enum, or acyclic nominal struct types
-  (including aliases). Semantic checking
+  `int`/`uint`), immutable `string`, nominal enum, acyclic nominal struct types,
+  or arrays of supported element types (including aliases). Semantic checking
   uses the same integer-width and literal-bound rules as scalar values. The C
   backend still supports only 8/16/32/64-bit integers: a reachable record layout
   containing a 128-bit field fails C emission with a backend width diagnostic;
@@ -800,9 +802,10 @@ The delivered subset is deliberately bounded:
   Array element restrictions are unchanged. Fields end with a comma. A field may have a literal default of its exact type, with ordinary
   literal-bound checks. Defaults cannot call functions, compute values, reference
   globals or interpolate strings. Aggregate defaults are not supported: nested
-  struct values must be supplied explicitly. Recursive by-value layouts and layouts
-  deeper than 128 aggregate levels diagnose, including aliases/imports and late
-  generic instantiations. Array/union/function/void/float fields remain unsupported;
+  struct and array values must be supplied explicitly. Recursive layouts (including
+  cycles through array element types) and layouts deeper than 128 aggregate levels
+  diagnose, including aliases/imports and late generic instantiations.
+  Union/function/void/float fields and nested array types remain unsupported;
   arrays of supported records are described below.
 - Construct explicitly with `MyType[ .x = 5, .z = true ]` (or `Alias[...]`).
   Empty `MyType[]` works only when every field has a default. Unknown, duplicate,
@@ -814,10 +817,13 @@ The delivered subset is deliberately bounded:
 - Read fields with `item.x`, including inside interpolation (`"{self.x}"`). Field
   lookup is type-directed: a record field named `len` is an ordinary field and
   does not change array/string `.len`. Assignment, locals, parameters, returns,
-  branches and loop results copy record field values; immutable strings share
-  their backing storage. Replacing a mutable record binding does not change copies.
+  branches and loop results copy record field values. Array backing is copied
+  recursively through nested structs, record-array elements and union record
+  payloads; immutable strings share their backing storage. Constructors, field/index
+  reads, method receivers and ordinary reads through loans obey the same independence
+  rule. Replacing or mutating a record binding does not change earlier copies.
 - Fields of a direct mutable local support `item.field = value` with exact bool,
-  integer, string, enum or struct type. Nested paths such as `item.inner.count += 1`
+  integer, rune, string, enum, struct or array type. Nested paths such as `item.inner.count += 1`
   and exact-type subrecord replacements are supported. Integer fields support `+= -= *= /= %=`, with the
   same wrapping/division/panic rules as scalar integers; string fields support `+=`.
   These assignments yield void. A real struct field named `len` is writable;
@@ -827,7 +833,17 @@ The delivered subset is deliberately bounded:
   made by the RHS to other fields, or to the whole record, are preserved except
   for the targeted field. Plain assignment does not read its old field. A terminal
   RHS skips the pending operation/store without undoing earlier effects. This uses
-  stable local field storage, not the whole-array snapshot update rule.
+  stable local field storage, not a whole-record snapshot replacement.
+- Array-valued fields support reads, exact-type replacement, `item.inner.values += rhs`,
+  indexed replacement and integer indexed compounds on nested mutable-local paths.
+  Append/index updates snapshot the target array before index/RHS effects and store
+  the updated snapshot into **only that field of the current record slot**. RHS
+  changes to siblings survive; RHS changes to the target array are overwritten.
+  Index evaluation, negative indices, bounds-check timing and terminal-control
+  behavior follow the ordinary array rules below. Direct `items[index].field`
+  mutation is still unsupported. Existing whole-record/record-element loans permit
+  array-field replacement and append, but not indexed updates through such paths.
+  See `examples/array-fields.nov` (being added).
 - Field mutation does not alter earlier value copies or immutable string backing.
   Immutable bindings/ordinary parameters (including `self`), union payloads/tags,
   temporary values and general pointer-based targets remain unsupported or
@@ -835,7 +851,8 @@ The delivered subset is deliberately bounded:
   as described under arrays. No implicit mutable receiver or borrowing is added.
   See [examples/struct-mutation.nov](examples/struct-mutation.nov) and
   [examples/nested-structs.nov](examples/nested-structs.nov). Nested record copies
-  have independent value storage at every level; immutable string backing shares.
+  have independent value storage and recursively independent array backing at every
+  level; immutable string backing shares.
   C declarations follow dependency order and GC roots flatten all nested owners.
 - Container declarations are ordinary explicitly typed functions, not runtime
   initializers. Methods have their own container scope; they can call sibling or
@@ -876,7 +893,8 @@ The delivered subset is deliberately bounded:
 C emission uses stack value structs with index-mangled fields and injectively
 mangled method symbols. Reachable layouts precede function-pointer typedefs and
 prototypes. Record temporaries live at function scope, including skipped-branch
-slots; every string field's actual `void *owner` is rooted across allocations.
+slots; actual string `void *owner` and array `void *data` fields are rooted across
+allocations, recursively through inline records.
 String byte-data pointers (including static literals) are never traced. The
 current uniform record path installs a GC frame even for scalar-only records;
 this is implementation overhead, not heap allocation of the records themselves.
@@ -1071,11 +1089,14 @@ let main: () = {
 Generic structs support direct instantiated constructors, aliases/imports, finite
 nested instances, field mutation, array elements and Option/Result payloads using
 the existing copy/rooting rules. See [examples/generic-structs.nov](examples/generic-structs.nov).
-Array-valued fields, recursive layouts, contextual constructors, general container
-constants, value parameters and general compile-time execution remain unsupported.
+Array-valued fields work in plain and generic acyclic structs, including `value: T`
+with an array type argument or `items: []T` with a supported element type. Copies
+recursively detach array backing; this copy-depth contract is settled. Recursive
+layouts (also through arrays), contextual constructors, general container constants,
+value parameters and general compile-time execution remain unsupported.
 
-The following broader stack example remains design-only: array fields, `#type`
-and pointer-based mutable receivers are not delivered.
+The following broader stack example remains design-only: `#type`, aggregate defaults
+and pointer-based mutable receivers are not delivered. Array fields themselves work.
 
 We can generate a type with a function thus creating a generic type.
 ```nov
@@ -1338,7 +1359,8 @@ let main: () -> void = {
   (including empty arrays and minimum native `int`) panics with
   `panic: array index out of bounds`, exit 1, identically in debug and release.
 - Plain `values[index] = element`, integer element `+=`, `-=`, `*=`, `/=`, `%=`
-  and `values += other_array` require a mutable direct local identifier base.
+  and `values += other_array` require a mutable local base (a direct array local or
+  a supported nested struct field path).
   Element compound assignments use the existing wrapping arithmetic and guarded
   division/remainder rules; bool compounds are unsupported. Append accepts the
   same array type and self-append is safe. All assignments return `void`.
@@ -1352,7 +1374,9 @@ let main: () -> void = {
   skips the pending update; effects already performed remain visible.
   The final store replaces the **whole local array** with the updated snapshot,
   discarding changes to that array made by the index or RHS, including changes to
-  other elements or length. It does not reload the current array. For example:
+  other elements or length. For an array-valued struct field, it replaces only the
+  target field in the current record, preserving sibling fields. It does not reload
+  the current target array. For example:
 
   ```nov
   let mut a: []int = [10, 20]
@@ -1360,13 +1384,24 @@ let main: () -> void = {
       3}
   @println(a[0], a[-1], a.len) ; 10 23 2
   ```
-- This first implementation deliberately copies eagerly, including temporary
-  snapshots. Reads and updates may allocate/copy O(n) elements; append does not yet
-  promise amortized constant time or preserve spare capacity across value copies.
+- **HIGH PRIORITY follow-up: optimize expensive recursive copies.** The current
+  implementation eagerly copies storage reads when independent values are needed,
+  including every reachable array backing in record elements. Already-fresh
+  temporaries transfer through binding, argument and return boundaries without
+  being cloned again. Readonly field and simple-index projections avoid copying
+  the enclosing aggregate; effectful indices retain pre-effect snapshots.
+  Recursive copying remains a major performance concern: cost follows the copied
+  contents, not just outer array length. Insertion, replacement and append can
+  still perform redundant copies. Broader elision, moves/consuming transfers and
+  copy-on-write remain candidates to investigate, **not approved designs**;
+  any optimization must preserve value independence, static borrowing and GC safety.
+  Append does not yet promise amortized constant time or preserve spare capacity
+  across value copies.
   Compiler roots conservatively retain temporary backing until its instruction is
   reused or the function returns, rather than doing last-use liveness analysis.
 - String/record arrays have independent element storage at ordinary copy boundaries.
-  Record fields copy recursively by value; immutable string backing shares. Indexing
+  Record fields copy recursively by value, including all nested array backing;
+  immutable string backing shares. Indexing
   returns a value, not an element reference. To edit a record element, copy it to a
   mutable local and assign it back, or use the checked local borrowing form below.
   Direct `items[index].field` mutation remains unsupported.
@@ -1374,8 +1409,8 @@ let main: () -> void = {
   owner identity. Record membership remains unsupported until record equality is
   defined. Indexed compounds remain integer-only; string indexed `+=` is not added.
 - Managed backing allocations own repeated element descriptors and expanded pointer
-  maps, tracing actual string-owner fields across the entire zero-initialized
-  capacity. Record layout dependencies precede array descriptors. Map storage costs
+  maps, tracing actual string-owner and array-backing fields across the entire
+  zero-initialized capacity. Record layout dependencies precede array descriptors. Map storage costs
   capacity times managed owner fields; GC never traces static byte pointers.
   See [examples/managed-arrays.nov](examples/managed-arrays.nov).
 - `.len` writes are explicitly rejected: shrinking and especially initialization
@@ -1456,8 +1491,11 @@ changed.score += 1
 - The reference capability cannot escape or be rebound; ordinary copied pointee
   values may be returned, passed or stored. Void has no borrowable storage. Nonlocal
   sources, explicit pointer annotations, reborrows, captures of borrowed bindings, temporary
-  owners and general pointer APIs remain unsupported. Array-valued struct fields,
-  nested arrays and other unsupported value types are not enabled by borrowing.
+  owners and general pointer APIs remain unsupported. Array-valued struct fields
+  add no new borrowing forms: `&record.field`, `&record.field[index]` and indexed
+  array-field updates through a whole-record/record-element loan remain unsupported.
+  Those existing loans still support array-field replacement/append and ordinary
+  recursively copied reads. Nested arrays remain unsupported.
 - Normal array snapshots/copies remain independent, including snapshots evaluated
   before a later borrow inside an index or RHS. In-place borrowed writes do not
   alter earlier copies. See the unchanged borrowed-element form in

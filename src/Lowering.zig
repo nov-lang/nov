@@ -284,11 +284,11 @@ test "generic structs reject unsupported fields inexact defaults constructors an
     const prefix = "let Box:(T:type)->type=struct{value:T,\nlet Self=@This()\nlet get:(self:Self)->T=self.value\n}\n";
     const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag };
     for ([_]Case{
-        .{ .source = "let Bad=Box([]int)", .tag = .unsupported_type },
+        .{ .source = "let Bad=Box([][]int)", .tag = .unsupported_type },
         .{ .source = "let Bad=Box(void)", .tag = .unsupported_type },
         .{ .source = "let Bad=Box(()->int)", .tag = .unsupported_type },
         .{ .source = "let U=union{ok:int,}\nlet Bad=Box(U)", .tag = .unsupported_type },
-        .{ .source = "let G:(T:type)->type=struct{items:[]T,}\nlet Bad=G(int)", .tag = .unsupported_type },
+        .{ .source = "let G:(T:type)->type=struct{items:[]T,}\nlet Bad=G([]int)", .tag = .unsupported_type },
         .{ .source = "let G:(T:type)->type=struct{value:T=true,}\nlet Bad=G(int)", .tag = .literal_type_mismatch },
         .{ .source = "let G:(T:type)->type=struct{value:T=256,}\nlet Bad=G(u8)", .tag = .literal_out_of_range },
         .{ .source = "let G:(T:type)->type=struct{value:T=Box(int)[.value=1],}\nlet Bad=G(Box(int))", .tag = .invalid_field_default },
@@ -666,7 +666,7 @@ test "unsupported union declarations and rejected matches roll back under OOM" {
         .{ .source = "let U=union{ok:int=0,}", .tag = .unsupported_union_default },
         .{ .source = "let U=union{ok:int,ok:string,}", .tag = .duplicate_field },
         .{ .source = "let U=union{ok:[]int,}", .tag = .unsupported_type },
-        .{ .source = "let R=struct{n:[]int,}\nlet U=union{ok:R,}", .tag = .unsupported_type },
+        .{ .source = "let R=struct{n:[][]int,}\nlet U=union{ok:R,}", .tag = .unsupported_type },
         .{ .source = "let R=struct{n:U,}\nlet U=union{ok:R,}", .tag = .unsupported_type },
         .{ .source = "let R=struct{n:R,}\nlet U=union{ok:R,}", .tag = .record_layout_cycle },
 
@@ -719,7 +719,7 @@ test "nominal records reject mismatches malformed constructors defaults fields a
         .{ .source = "let A=struct{x:int=1+2,}", .tag = .invalid_field_default },
         .{ .source = "let A=struct{x:string=\"{true}\",}", .tag = .invalid_field_default },
         .{ .source = "let A=struct{x:int,x:int,}", .tag = .duplicate_field },
-        .{ .source = "let A=struct{x:[]int,}", .tag = .unsupported_type },
+        .{ .source = "let A=struct{x:[][]int,}", .tag = .unsupported_type },
         .{ .source = "let A=struct{x:()->int,}", .tag = .unsupported_type },
         .{ .source = "let A=struct{x:A,}", .tag = .record_layout_cycle },
         .{ .source = "let A=struct{x:B,}\nlet B=struct{x:A,}", .tag = .record_layout_cycle },
@@ -1305,7 +1305,7 @@ test "loop continuation regions and value breaks outlive source storage" {
     try std.testing.expect(loop_owner != null);
     try std.testing.expect(break_value != null);
     try std.testing.expectEqual(loop_owner.?, Ir.enclosingLoop(body, @backingInt(break_value.?) + 1).?);
-    try std.testing.expect(body.instructions[@backingInt(break_value.?)].op == .array_clone);
+    try std.testing.expect(body.instructions[@backingInt(break_value.?)].op == .array_literal);
     module.deinit();
     try std.testing.expect(!failed);
     try std.testing.expect(sema.lowering_complete);
@@ -1457,7 +1457,7 @@ test "ascription aliases child IR values without casts or extra array boundaries
     for (sema.ir.functions.items[1].body.?.instructions) |instruction| {
         if (instruction.op == .array_clone) copies += 1;
     }
-    try std.testing.expectEqual(@as(usize, 1), copies);
+    try std.testing.expectEqual(@as(usize, 0), copies);
     try sema.ir.verify();
     const c = try CEmitter.emit(std.testing.allocator, &sema.ir, null);
     defer std.testing.allocator.free(c);
@@ -2748,6 +2748,7 @@ test "static borrowing normal array loads clone immediately before later borrow 
     try std.testing.expect(result.lowering_complete);
     const body = result.ir.functions.items[0].body.?;
     var loads: usize = 0;
+    var snapshots: usize = 0;
     var reservations: usize = 0;
     var updates: usize = 0;
     var appends: usize = 0;
@@ -2756,10 +2757,15 @@ test "static borrowing normal array loads clone immediately before later borrow 
             if (result.ir.getType(instruction.ty).? != .array) continue;
             loads += 1;
             const next = body.instructions[i + 1];
-            try std.testing.expect(next.op == .array_clone);
-            try std.testing.expectEqual(@as(Ir.ValueId, @fromBackingInt(@intCast(i))), next.op.array_clone);
+            if (next.op == .array_clone) {
+                snapshots += 1;
+                try std.testing.expectEqual(@as(Ir.ValueId, @fromBackingInt(@intCast(i))), next.op.array_clone);
+            }
         },
-        .array_index => |access| try std.testing.expect(body.instructions[@backingInt(access.array)].op == .array_clone),
+        .array_index => |access| {
+            const base = body.instructions[@backingInt(access.array)].op;
+            try std.testing.expect(base == .array_clone or base == .local_load);
+        },
         .array_set => |update| {
             updates += 1;
             try std.testing.expect(body.instructions[@backingInt(update.array)].op == .array_clone);
@@ -2775,7 +2781,8 @@ test "static borrowing normal array loads clone immediately before later borrow 
         },
         else => {},
     };
-    try std.testing.expect(loads >= 4);
+    try std.testing.expect(loads > snapshots);
+    try std.testing.expectEqual(@as(usize, 4), snapshots);
     try std.testing.expectEqual(@as(usize, 4), reservations);
     try std.testing.expectEqual(@as(usize, 1), updates);
     try std.testing.expectEqual(@as(usize, 1), appends);
