@@ -69,6 +69,8 @@ pub const Operation = union(enum) {
     array_clone: ValueId,
     /// Byte length for strings; element count for arrays.
     array_len: ValueId,
+    /// Prior visible array/string value indexed by canonical signed pointer-sized int.
+    /// Arrays yield their exact element type; immutable strings yield exact u8 bytes.
     array_index: struct { array: ValueId, index: ValueId },
     /// Allocation-free scalar/string equality scan; record equality is unsupported.
     array_contains: struct { value: ValueId, array: ValueId },
@@ -866,8 +868,13 @@ fn validateBodyStructure(self: *const Ir, function: Function, body: Body) Verify
             },
             .array_index => |r| {
                 const array = self.getType(try operandType(body, r.array, i)).?;
-                if (array != .array) return error.InvalidOperation;
-                if (array.array != instruction.ty or !isNativeInteger(self.getType(try operandType(body, r.index, i)).?, .signed)) return error.OperandTypeMismatch;
+                const index = self.getType(try operandType(body, r.index, i)).?;
+                switch (array) {
+                    .array => |element| if (element != instruction.ty) return error.OperandTypeMismatch,
+                    .string => if (ty != .integer or ty.integer.signedness != .unsigned or ty.integer.bits != 8) return error.OperandTypeMismatch,
+                    else => return error.InvalidOperation,
+                }
+                if (!isNativeInteger(index, .signed)) return error.OperandTypeMismatch;
             },
             .array_contains => |r| {
                 if (ty != .boolean) return error.InvalidOperation;
@@ -1443,6 +1450,53 @@ test "string equality verifier requires exact string operands and boolean result
     }
     instructions[2].op.binary.op = .ne;
     try ir.setFunctionBody(f, &instructions, @fromBackingInt(@intCast(2)));
+    try ir.verify();
+}
+
+test "string byte indexing verifies exact types and prior visible operands without source" {
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    const string = try ir.internType(.string);
+    const integer = try ir.internType(.{ .integer = .{ .signedness = .signed, .bits = native_pointer_bits } });
+    const byte = try ir.internType(.{ .integer = .{ .signedness = .unsigned, .bits = 8 } });
+    const wide = try ir.internType(.{ .integer = .{ .signedness = .unsigned, .bits = 16 } });
+    const uint = try ir.internType(.{ .integer = .{ .signedness = .unsigned, .bits = native_pointer_bits } });
+    const narrow = try ir.internType(.{ .integer = .{ .signedness = .signed, .bits = 8 } });
+    const boolean = try ir.internType(.boolean);
+    const params = [_]TypeId{ string, integer, wide, boolean, byte, uint, narrow };
+    const signature = try ir.internType(.{ .function = .{ .params = &params, .result = byte } });
+    const function = try ir.addFunction("byte", signature, .{ .start = 0, .end = 0 });
+    const make = TestFunctions.instruction;
+    var instructions: [8]Instruction = undefined;
+    for (params, 0..) |ty, i| instructions[i] = make(ty, .{ .parameter = @intCast(i) });
+    instructions[7] = make(byte, .{ .array_index = .{ .array = @fromBackingInt(0), .index = @fromBackingInt(1) } });
+    // No source text or nonempty source span is needed to verify the operation.
+    for (&instructions) |*instruction| instruction.span = .{ .start = 0, .end = 0 };
+    try ir.setFunctionBody(function, &instructions, @fromBackingInt(7));
+    try ir.verify();
+    const owned = @constCast(ir.functions.items[0].body.?.instructions);
+    const saved = owned[7];
+    for ([_]TypeId{ string, integer, wide, boolean, uint, narrow }) |ty| {
+        owned[7].ty = ty;
+        try std.testing.expectError(error.OperandTypeMismatch, ir.verify());
+    }
+    owned[7] = saved;
+    for ([_]u32{ 0, 2, 3, 4, 5, 6 }) |index| {
+        owned[7].op.array_index.index = @fromBackingInt(index);
+        try std.testing.expectError(error.OperandTypeMismatch, ir.verify());
+    }
+    owned[7] = saved;
+    for ([_]u32{ 7, 99 }) |index| {
+        owned[7].op.array_index.index = @fromBackingInt(index);
+        try std.testing.expectError(error.InvalidValueId, ir.verify());
+        owned[7] = saved;
+        owned[7].op.array_index.array = @fromBackingInt(index);
+        try std.testing.expectError(error.InvalidValueId, ir.verify());
+        owned[7] = saved;
+    }
+    owned[7].op.array_index.array = @fromBackingInt(3);
+    try std.testing.expectError(error.InvalidOperation, ir.verify());
+    owned[7] = saved;
     try ir.verify();
 }
 

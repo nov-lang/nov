@@ -515,7 +515,7 @@ formatting does not make those forms executable. Array formatting does not check
 expected literal types, scope, mutability, or whether a base is an array; it does
 not enable array globals or new language semantics. Other members, `.len` writes,
 indexed compound stores and stores through computed bases remain unsupported.
-Nested array annotations, directly nested literals/indexing, slices, pointers,
+Nested array annotations and directly nested array literals, slices, pointers,
 other memory/container forms, labels,
 iterator/other unsupported loop forms, attributes, quoted identifiers,
 BOMs and shebangs remain unsupported or invalid. Unsupported syntax is reported
@@ -1844,7 +1844,7 @@ numeric cast. See [examples/type-aliases.nov](examples/type-aliases.nov).
 TODO
 - bool
 - string
-- rune
+- rune (proposed Unicode scalar type; not implemented)
 
 See also:
 - [Integers](#Integers)
@@ -1947,7 +1947,7 @@ nov run examples/fibo.nov --release # 55
 | Bind                  | a >>= \|b\| ...    | Monads                                       | TODO                                                                |
 | Function Pipe         | a \|> f            | [Functions](#Functions)                      | TODO                                                                |
 | Member Search         | a **in** b         | [Arrays](#Arrays)                            | TODO                                                                |
-| Access                | a\[b]              | [Arrays](#Arrays)                            | Scalar array indexing supported; string indexing deferred          |
+| Access                | a\[b]              | [Arrays](#Arrays)                            | Array elements and immutable string bytes supported          |
 | Field / Method Access | a.b                | All types                                    | TODO                                                                |
 | Reference Type        | \*T <br> \*mut T   | All types                                    | Create a reference type from `T`. Unless `mut` is specified the wrapped value is constant |
 | Reference Of          | &a                 | All types                                    | Returns a reference to `a`.                                         |
@@ -2026,9 +2026,41 @@ is false, while `"é" == "\u{e9}"` is true. A return, break or continue in an
 operand skips the remaining comparison without undoing earlier effects.
 
 Ordering (`<`, `<=`, `>`, `>=`), other operators (including `-=`, `*=`, `/=` and
-`%=`), indexing, slicing and Unicode operations remain deferred.
+`%=`), slicing and Unicode-aware operations remain deferred.
 `[]string` and supported record arrays work with independent element storage and
 shared immutable string backing; nested arrays remain unsupported.
+
+`text[index]` reads one byte as **exactly `u8`**, using a native signed `int` index.
+Negative indices count from the end: `-1` is the last byte. Out-of-bounds access,
+including indexing an empty string, panics with `string index out of bounds` in
+all build modes. No implicit integer widening or index signedness conversion occurs.
+The string and index evaluate once, left to right; the string value is captured
+before index effects can replace its binding or trigger GC. Reads allocate nothing.
+
+```nov
+let main: () = {
+    let text = "é"
+    let first: u8 = text[0] ; 195
+    let last: u8 = text[-1] ; 169
+    @println(first, last)
+}
+```
+
+This is UTF-8 **byte** access, not rune/character indexing; continuation bytes and
+embedded NUL are readable. Indexed assignment, compound assignment and string-element
+borrows are unsupported, even for `let mut` bindings. Whole-string aliases retain
+the existing borrowing rules. Chained reads such as `strings[0][1]` work for arrays
+of strings; this does not enable nested arrays. See
+[`examples/string-bytes.nov`](examples/string-bytes.nov).
+
+For editing, keep the distinction between a mutable binding and mutable storage:
+`s += "more"` produces a new immutable string and rebinds `s`, preserving older
+copies. Agreed future APIs will provide independent string-to-`[]u8` copies and
+validated, recoverable-error byte-buffer-to-string conversion. A separate stdlib
+builder may preserve UTF-8 while appending/editing and produce independent immutable
+snapshots. These conversions and builder are **not implemented**; there is no second
+built-in mutable-string type. `rune`, UTF-8 decoding/iteration and grapheme operations
+remain deferred; a Unicode scalar is not necessarily one visible character.
 
 `.len` is the byte length as native `uint`, not a character or grapheme count.
 `"é".len` is 2 and `"😀".len` is 4. Literals use the existing escapes (`\n`, `\r`,

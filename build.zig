@@ -124,6 +124,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const language_tests = b.step("test-cli-language-tests", "Run test command and assertion language CLI tests");
     addLanguageTestCliTests(b, exe, language_tests);
     test_step.dependOn(language_tests);
+    const string_byte_tests = b.step("test-cli-string-bytes", "Run immutable string byte indexing CLI tests");
+    addStringByteCliTests(b, exe, string_byte_tests);
+    test_step.dependOn(string_byte_tests);
     addFieldMutationCliTests(b, exe, test_step, fixtures);
     addGenericStructCliTests(b, exe, test_step, fixtures);
     addRangeValueCliTests(b, exe, test_step, fixtures);
@@ -1094,6 +1097,86 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
                 }
             }
         }
+    }
+}
+
+fn addStringByteCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    const fixtures = b.addWriteFiles();
+    _ = fixtures.add("string-bytes.nov", @embedFile("examples/string-bytes.nov"));
+    _ = fixtures.add("excluded.nov", "@[test]\nlet excluded: () = @panic(\"test body ran\")\n" ++
+        "let main: () = {let mut text = \"hello\"\nlet alias = &text\n@assert(alias[0] == 104)\n@assert(alias[-1] == 111)}\n");
+    for ([_][]const u8{ "fmt", "semantic" }) |mode| {
+        const run = b.addRunArtifact(exe);
+        run.step.name = b.fmt("CLI string bytes: example {s}", .{mode});
+        run.setCwd(fixtures.getDirectory());
+        run.addArgs(if (std.mem.eql(u8, mode, "fmt")) &.{ "fmt", "--check", "string-bytes.nov" } else &.{ "check", "--semantic", "string-bytes.nov" });
+        run.expectExitCode(0);
+        run.expectStdOutEqual("");
+        run.expectStdErrEqual("");
+        test_step.dependOn(&run.step);
+    }
+    for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+        for ([_][]const u8{ "run", "test", "excluded" }) |command| {
+            const run = b.addRunArtifact(exe);
+            run.step.name = b.fmt("CLI string bytes: {s} ({s})", .{ command, mode });
+            run.setCwd(fixtures.getDirectory());
+            run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+            run.setEnvironmentVariable("NOV_CC", "");
+            run.setEnvironmentVariable("CC", "");
+            const excluded = std.mem.eql(u8, command, "excluded");
+            const tests = std.mem.eql(u8, command, "test");
+            run.addArgs(&.{ if (tests) "test" else "run", if (excluded) "excluded.nov" else "string-bytes.nov" });
+            if (mode.len != 0) run.addArg(mode);
+            run.expectExitCode(0);
+            run.expectStdOutEqual(if (excluded) "" else if (tests) "PASS ascii_negative\nPASS utf8_nul\nPASS original_snapshot\n3 passed; 0 failed; 3 total\n" else "hello hello world 104 100\n195 169 0 3\n");
+            run.expectStdErrEqual("");
+            test_step.dependOn(&run.step);
+        }
+    }
+    for ([_]struct { name: []const u8, source: []const u8 }{
+        .{ .name = "positive", .source = "let main: () = {let text = \"abc\"\n@println(text[3])}\n" },
+        .{ .name = "too-negative", .source = "let main: () = {let text = \"abc\"\n@println(text[-4])}\n" },
+        .{ .name = "empty", .source = "let main: () = {let text = \"\"\n@println(text[0])}\n" },
+    }) |case| {
+        const source = b.fmt("bounds-{s}.nov", .{case.name});
+        _ = fixtures.add(source, case.source);
+        for ([_][]const u8{ "--debug", "--release" }) |mode| {
+            const run = b.addRunArtifact(exe);
+            run.step.name = b.fmt("CLI string bytes: bounds {s} ({s})", .{ case.name, mode });
+            run.setCwd(fixtures.getDirectory());
+            run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+            run.setEnvironmentVariable("NOV_CC", "");
+            run.setEnvironmentVariable("CC", "");
+            run.addArgs(&.{ "run", source, mode });
+            run.expectExitCode(1);
+            run.expectStdOutEqual("");
+            run.expectStdErrEqual("panic: string index out of bounds\n");
+            test_step.dependOn(&run.step);
+        }
+    }
+    const mismatch = "expression does not match the expected type";
+    const assignment = "assignment target must be a mutable local, its struct field path, or its scalar-array element";
+    const borrow = "borrow requires a fixed unannotated let binding to &local or &localArray[index]; void has no borrowable storage; nonlocal owners, reborrows and explicit reference types are unsupported";
+    for ([_]struct { name: []const u8, source: []const u8, diagnostic: []const u8 }{
+        .{ .name = "result-uint", .source = "let byte: (text: string) -> uint = text[0]\n", .diagnostic = mismatch },
+        .{ .name = "index-uint", .source = "let byte: (text: string, index: uint) -> u8 = text[index]\n", .diagnostic = mismatch },
+        .{ .name = "write", .source = "let main: () = {let mut text = \"a\"\ntext[0] = 98}\n", .diagnostic = assignment },
+        .{ .name = "compound", .source = "let main: () = {let mut text = \"a\"\ntext[0] += 1}\n", .diagnostic = assignment },
+        .{ .name = "alias-write", .source = "let main: () = {let mut text = \"a\"\nlet alias = &text\nalias[0] = 98}\n", .diagnostic = assignment },
+        .{ .name = "borrow", .source = "let main: () = {let text = \"a\"\nlet byte = &text[0]\n}\n", .diagnostic = borrow },
+        .{ .name = "mutable-borrow", .source = "let main: () = {let mut text = \"a\"\nlet byte = &text[0]\n}\n", .diagnostic = borrow },
+        .{ .name = "alias-borrow", .source = "let main: () = {let mut text = \"a\"\nlet alias = &text\nlet byte = &alias[0]\n}\n", .diagnostic = borrow },
+    }) |case| {
+        const source = b.fmt("invalid-{s}.nov", .{case.name});
+        _ = fixtures.add(source, case.source);
+        const run = b.addRunArtifact(exe);
+        run.step.name = b.fmt("CLI string bytes: reject {s}", .{case.name});
+        run.setCwd(fixtures.getDirectory());
+        run.addArgs(&.{ "check", "--semantic", source });
+        run.expectExitCode(1);
+        run.expectStdOutEqual("");
+        run.expectStdErrMatch(case.diagnostic);
+        test_step.dependOn(&run.step);
     }
 }
 

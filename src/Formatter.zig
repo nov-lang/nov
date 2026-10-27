@@ -208,7 +208,6 @@ fn checkSupported(ast: Ast) !void {
                     else => {},
                 };
             },
-            .array_access => if (ast.nodes.items(.tag)[data.lhs] == .array_access) return error.UnsupportedSyntax,
             .attr_one => {
                 const name = ast.tokenSlice(data.lhs);
                 if (std.mem.eql(u8, name, "export") or std.mem.eql(u8, name, "extern")) {
@@ -407,6 +406,24 @@ test "static integer borrow formatting is idempotent" {
     try std.testing.expect(std.mem.indexOf(u8, formatted, "let y = &x") != null);
 }
 
+test "string byte indexing formats nested chains comments and arbitrary bases idempotently" {
+    try expectFormatted("let x=a[0][1]", "let x = a[0][1]\n");
+    try expectFormatted("let f:(elements:[]string)->u8=elements[0][1]", "let f: (elements: []string) -> u8 = elements[0][1]\n");
+    for ([_][:0]const u8{
+        "let f:(elements:[]string)->u8=elements[ ; element\n0][ ; byte\n-1] ; tail\n",
+        "let text:()->string=\"é\\0z\"\nlet f:()->u8=text()[2]",
+        "let f:()->u8=\"é\\0z\"[-1]",
+        "let U=union{text:string,}\nlet f:(s:string)->u8=U.text[s].text[0]",
+        "let f:(elements:[]string)->u8={let alias=&elements\nalias[0][1]}",
+    }) |source| {
+        errdefer std.debug.print("string byte formatter fixture: {s}\n", .{source});
+        const result = try format(std.testing.allocator, source);
+        defer std.testing.allocator.free(result);
+        try expectFormatted(source, result);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{source});
+    }
+}
+
 test "unsupported syntax fails closed including nested expressions" {
     for ([_][:0]const u8{
         "let x=@unknown(\"memory\")\n",
@@ -417,7 +434,6 @@ test "unsupported syntax fails closed including nested expressions" {
         "let x:[]i128\n",
         "let x:[]*int\n",
         "let x:[]() -> int\n",
-        "let x=a[0][1]\n",
         "let x=a[0..1]\n",
         "let f:()->void={make().inner.len=1}\n",
         "let f:()->void={make()[0]+=1}\n",

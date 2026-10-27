@@ -290,6 +290,26 @@ field diagnostics. An unresolved shorthand name is an unknown-name error, even
 when that field has a default. This is not positional initialization or destructuring
 and does not change the implementation roadmap yet.
 
+## Agreed text-storage design (future APIs)
+
+Keep one immutable, valid-UTF-8 `string` type. `let mut` permits rebinding and `+=`
+creates a new string; it does not permit in-place byte changes. Use mutable `[]u8`
+for unrestricted bytes. Future conversions must copy string bytes into independent
+array storage, and validate UTF-8 when turning arbitrary bytes into a string, with
+a recoverable error on invalid input. These conversions are not implemented.
+
+A separate stdlib builder (tentatively `StringBuilder`) should preserve UTF-8 for
+string/rune appends and require valid UTF-8 boundaries for text edits. Producing a
+string initially makes an independent snapshot so later builder edits cannot change
+it. Ownership-transfer optimizations, exact APIs and array-field/mutable-receiver
+contracts remain deferred. Do not add a second built-in mutable-string type.
+
+A proposed `rune` is a distinct Unicode scalar type: 0..=0x10FFFF excluding surrogate
+values 0xD800..=0xDFFF, not merely an unchecked u32 or a grapheme. Defer implementation
+until UTF-8 decoding/iteration and invalid-input handling are specified. String
+indexing returns u8 bytes, not runes. General string slicing and Unicode/grapheme
+operations remain deferred.
+
 ## Other proposals
 - transform this file into GitHub issues
 - commands:
@@ -309,7 +329,8 @@ and does not change the implementation roadmap yet.
   - [x] `{expression}` interpolation (including nested calls) for bool/fixed/native integers/strings;
     decimal boundaries, UTF-8/NUL, rooted temporaries and formatter preservation
   - blocks/control flow/quoted literals/formats/captures and global interpolation remain unsupported
-  - ordering, indexing, slicing and Unicode operations remain deferred
+  - [x] immutable byte reads return exact u8, with int/negative indices and all-mode bounds panics
+  - ordering, slicing, rune decoding/iteration, byte-buffer conversions and the UTF-8 builder remain deferred
 - add tests, mainly for Parser, IRs, Codegen and Runtime
   - [x] initial parser, formatter, file-safety, and CLI regression coverage
 - expand Render.zig to cover the full AST (simple declarations and expressions work)

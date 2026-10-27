@@ -259,6 +259,20 @@ fn write(allocator: std.mem.Allocator, ir: *const Ir, origins: []const ?Origin, 
         if (usesStringConcat(ir)) try w.writeAll(@embedFile("runtime/string.h"));
         try writeStringConversions(ir, w);
     }
+    if (usesStringByteIndex(ir)) try w.writeAll(
+        "static uint8_t nov_string_byte_at(nov_string text, intptr_t index) {\n" ++
+            "    uintptr_t offset;\n" ++
+            "    if (index < 0) {\n" ++
+            "        const uintptr_t distance = (uintptr_t)(-(index + 1)) + 1;\n" ++
+            "        if (distance > text.len) nov_rt_panic(\"string index out of bounds\");\n" ++
+            "        offset = text.len - distance;\n" ++
+            "    } else {\n" ++
+            "        offset = (uintptr_t)index;\n" ++
+            "    }\n" ++
+            "    if (offset >= text.len) nov_rt_panic(\"string index out of bounds\");\n" ++
+            "    return (uint8_t)text.data[offset];\n" ++
+            "}\n",
+    );
     if (usesStringEquality(ir)) try w.writeAll(
         "#include <string.h>\n" ++
             "static bool nov_string_equal(nov_string a, nov_string b) {\n" ++
@@ -442,6 +456,16 @@ fn needsRootFrame(ir: *const Ir, function: Ir.Function) bool {
 
 fn usesManagedRuntime(ir: *const Ir) bool {
     for (ir.functions.items) |function| if (needsRootFrame(ir, function)) return true;
+    return false;
+}
+
+fn usesStringByteIndex(ir: *const Ir) bool {
+    for (ir.functions.items) |function| {
+        const body = function.body orelse continue;
+        for (body.instructions) |instruction| {
+            if (instruction.op == .array_index and ir.getType(body.instructions[@backingInt(instruction.op.array_index.array)].ty).? == .string) return true;
+        }
+    }
     return false;
 }
 
@@ -1070,9 +1094,13 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
             .field_read => |read| try w.print("v{d}.f{d}", .{ @backingInt(read.base), read.index }),
             .array_len => |value| try w.print("v{d}.len", .{@backingInt(value)}),
             .array_index => |r| {
-                try w.writeAll("((");
-                try writeType(ir, w, instruction.ty);
-                try w.print(" *)v{d}.data)[nov_array_index(v{d}, v{d})]", .{ @backingInt(r.array), @backingInt(r.array), @backingInt(r.index) });
+                if (ir.getType(body.instructions[@backingInt(r.array)].ty).? == .string) {
+                    try w.print("nov_string_byte_at(v{d}, v{d})", .{ @backingInt(r.array), @backingInt(r.index) });
+                } else {
+                    try w.writeAll("((");
+                    try writeType(ir, w, instruction.ty);
+                    try w.print(" *)v{d}.data)[nov_array_index(v{d}, v{d})]", .{ @backingInt(r.array), @backingInt(r.array), @backingInt(r.index) });
+                }
             },
             .array_contains => |r| try w.print("nov_array_contains_{d}(v{d}, v{d})", .{ @backingInt(body.instructions[@backingInt(r.value)].ty), @backingInt(r.value), @backingInt(r.array) }),
             .array_literal, .array_clone, .array_set, .array_append, .to_string, .field_store => unreachable,
@@ -3610,6 +3638,189 @@ test "array membership owned lowering emits after freeing source" {
 
 test "array membership compiler ownership survives every allocation failure" {
     try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{array_membership});
+}
+
+const string_byte_program =
+    \\let Box:(T:type)->type=struct{value:T,}
+    \\let identity:(s:string)->string=s
+    \\let base:()->string={@print("B")
+    \\    "a"+"é\0Z"}
+    \\let index:()->int={let garbage="index"+" allocation"
+    \\    @print("I")
+    \\    return -2}
+    \\let accept:(b:u8)->u8=b
+    \\let gcIndex:(i:int)->int={let garbage="collect"+" index"
+    \\    i}
+    \\let terminalIndex:()->u8="x"[{return 8}]
+    \\let main:()={
+    \\    let text="aé\0Z"
+    \\    @println(text[0],text[1],text[2],text[3],text[4])
+    \\    @println(text[-1],text[-2],text[-3],text[-4],text[-5])
+    \\    let inferred=text[1]
+    \\    let bytes:[]u8=[text[2],inferred]
+    \\    @println(accept(inferred),inferred+1,1+text[2],bytes[0])
+    \\    @println(base()[index()])
+    \\    let mut owner="o"+"ld"
+    \\    @println(owner[{owner="n"+"ew"
+    \\        let garbage="collect"+" now"
+    \\        0}],owner)
+    \\    let array=["a"+"b","c"+"d"]
+    \\    let box=Box(string)[.value="e"+"f"]
+    \\    let chosen=if true {"i"+"j"}else{"k"+"l"}
+    \\    @println(array[-1][gcIndex(-1)],box.value[gcIndex(0)],identity("g"+"h")[gcIndex(1)],chosen[gcIndex(-2)])
+    \\    let r=&owner
+    \\    @println(r[0],r[-1],terminalIndex())
+    \\}
+;
+const string_byte_output = "97 195 169 0 90\n90 0 169 195 97\n195 196 170 169\nBI0\n111 new\n100 101 104 105\n110 119 8\n";
+
+test "string byte indexing exact types effects snapshots UTF8 NUL and forced GC" {
+    const c = try arrayTestProgram(string_byte_program);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, string_byte_output, "", mode);
+}
+
+test "string byte indexing bounds panic at both optimization levels" {
+    const min = try std.fmt.allocPrint(test_gpa, "{d}", .{std.math.minInt(isize)});
+    defer test_gpa.free(min);
+    const max = try std.fmt.allocPrint(test_gpa, "{d}", .{std.math.maxInt(isize)});
+    defer test_gpa.free(max);
+    for ([_]struct { text: []const u8, index: []const u8 }{
+        .{ .text = "abc", .index = "3" },
+        .{ .text = "abc", .index = "-4" },
+        .{ .text = "abc", .index = min },
+        .{ .text = "abc", .index = max },
+        .{ .text = "", .index = "0" },
+        .{ .text = "", .index = "-1" },
+    }) |case| {
+        const source = try std.fmt.allocPrint(test_gpa, "let main:()=@println(\"{s}\"[{s}])", .{ case.text, case.index });
+        defer test_gpa.free(source);
+        const c = try arrayTestProgram(source);
+        defer test_gpa.free(c);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode|
+            try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 1, "", "panic: string index out of bounds\n", mode);
+    }
+}
+
+test "string byte indexing helper is opt in and allocation free" {
+    for ([_][]const u8{
+        "let main:()={}",
+        "let f:(s:string)->string=s",
+        "let f:(a:[]string)->string=a[0]",
+        "let f:(a:[]u8)->u8=a[0]",
+    }) |source| {
+        const c = try emitSource(source, null);
+        defer test_gpa.free(c);
+        try std.testing.expect(std.mem.indexOf(u8, c, "nov_string_byte_at") == null);
+        try compileAndRun(c, "int main(void) { return 0; }");
+    }
+    const c = try emitSource("let at:(s:string,i:int)->u8=s[i]", null);
+    defer test_gpa.free(c);
+    const program = try std.mem.concat(test_gpa, u8, &.{
+        "#include <stdlib.h>\nstatic void *test_malloc(size_t n) { (void)n; return NULL; }\n#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n",
+        c,
+        "\nint main(void) { " ++
+            "if (nov_at((nov_string){NULL, (const unsigned char *)\"a\\0b\", 3}, -2) != 0) return 1; " ++
+            "nov_gc_shutdown(&nov_rt_heap); return 0; }\n",
+    });
+    defer test_gpa.free(program);
+    try compileAndRun(program, "typedef int nonempty_translation_unit;");
+}
+
+test "string byte indexing source free emission and compiler OOM sweep" {
+    var sema = blk: {
+        var module = try Module.init(test_gpa, "source-free.nov", string_byte_program);
+        defer module.deinit();
+        errdefer std.debug.print("string byte diagnostics: {any} parse: {any}\n", .{ module.diagnostics.items, module.source.ast.errors });
+        var result = try Lowering.lower(&module);
+        errdefer result.deinit();
+        try std.testing.expect(!module.hasErrors());
+        break :blk result;
+    };
+    defer sema.deinit();
+    try sema.ir.verify();
+    const c = try emitProgram(test_gpa, &sema.ir, null);
+    defer test_gpa.free(c);
+    try compileAndRunExpected(c, "typedef int nonempty_translation_unit;", 0, string_byte_output, "");
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{string_byte_program});
+}
+
+test "string byte indexing rejects escaped regions slots and borrow capabilities before C emission" {
+    var sema = blk: {
+        var module = try Module.init(test_gpa, "malformed-byte.nov", "let f:(flag:bool)->u8={let mut s=if flag {\"a\"}else{\"b\"}\nlet r=&s\nr[0]}");
+        defer module.deinit();
+        var result = try Lowering.lower(&module);
+        errdefer result.deinit();
+        try std.testing.expect(!module.hasErrors());
+        break :blk result;
+    };
+    defer sema.deinit();
+    const instructions = @constCast(sema.ir.functions.items[0].body.?.instructions);
+    var read: usize = 0;
+    var private: Ir.ValueId = undefined;
+    for (instructions, 0..) |instruction, i| {
+        if (instruction.op == .array_index) read = i;
+        if (instruction.op == .branch) private = instruction.op.branch.then_value;
+    }
+    const saved = instructions[read];
+    instructions[read].op.array_index.array = private;
+    try std.testing.expectError(error.InvalidValueId, emit(test_gpa, &sema.ir, null));
+    instructions[read] = saved;
+    for (instructions, 0..) |instruction, i| {
+        if (instruction.op != .local_slot and instruction.op != .borrow_reserve and instruction.op != .borrow_start) continue;
+        instructions[read].op.array_index.array = @fromBackingInt(@intCast(i));
+        try std.testing.expectError(if (instruction.op == .local_slot) error.InvalidValueId else error.InvalidOperation, emit(test_gpa, &sema.ir, null));
+        instructions[read] = saved;
+        instructions[read].op.array_index.index = @fromBackingInt(@intCast(i));
+        try std.testing.expectError(if (instruction.op == .local_slot) error.InvalidValueId else error.OperandTypeMismatch, emit(test_gpa, &sema.ir, null));
+        instructions[read] = saved;
+    }
+    try sema.ir.verify();
+}
+
+test "string byte indexing terminal base skips index calls" {
+    const library = try emitSource("let index:()->int={@print(\"wrong\")\n0}\nlet main:()=@println(@panic(\"base\")[index()])", null);
+    defer test_gpa.free(library);
+    const c = try collectingTestProgram(library);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 1, "", "panic: base\n", mode);
+    try std.testing.expect(std.mem.indexOf(u8, c, "nov_string_byte_at") == null);
+}
+
+fn importedStringByteProgram(allocator: std.mem.Allocator) ![]u8 {
+    var sema = blk: {
+        var comp = Compilation.init(allocator);
+        defer comp.deinit();
+        const root = try comp.addSource("/main.nov", "let api=@import(\"api.nov\")\nlet Alias=api.Text\nlet main:()={let s:Alias=api.make()\n@println(s[0],s[-1],api.make()[1])}");
+        const api = try comp.addSource("/api.nov", "@[public]\nlet Text=string\n@[public]\nlet make:()->Text=\"é\"+\"!\"");
+        const module = comp.getModule(root).?;
+        const local = module.lookup("api").?;
+        try comp.imports.append(allocator, .{ .declaration = comp.declaration_ids.get(.{ .source = root, .local = local }).?, .target = api, .named = false, .span = module.getDeclaration(local).?.name_span });
+        comp.setRoot(root);
+        var result = try Lowering.lowerCompilation(&comp);
+        errdefer result.deinit();
+        try std.testing.expect(!comp.hasErrors());
+        break :blk result;
+    };
+    defer sema.deinit();
+    try sema.ir.verify();
+    return emit(allocator, &sema.ir, null);
+}
+
+fn importedStringByteAllocations(allocator: std.mem.Allocator) !void {
+    allocator.free(try importedStringByteProgram(allocator));
+}
+
+test "string byte indexing imported aliases survive graph release GC and OOM" {
+    const library = try importedStringByteProgram(test_gpa);
+    defer test_gpa.free(library);
+    const c = try collectingTestProgram(library);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "195 33 169\n", "", mode);
+    try TestAllocations.checkAllAllocationFailures(test_gpa, importedStringByteAllocations, .{});
 }
 
 const range_program =

@@ -833,7 +833,11 @@ const Context = struct {
                 if (try self.qualifiedUnion(data.lhs)) |ty| break :blk .{ .ty = ty };
                 const array = (try self.probe(data.lhs, depth + 1)) orelse break :blk null;
                 const ty = self.ir.getType(array.ty).?;
-                break :blk if (ty == .array) .{ .ty = ty.array } else null;
+                break :blk switch (ty) {
+                    .array => .{ .ty = ty.array },
+                    .string => .{ .ty = try self.ir.internType(.{ .integer = .{ .signedness = .unsigned, .bits = 8 } }) },
+                    else => null,
+                };
             },
             .container_decl_arg => blk: {
                 if (ast.nodes.items(.tag)[data.lhs] == .enum_literal) break :blk null;
@@ -1939,14 +1943,16 @@ const Context = struct {
                     const index = self.fieldIndex(base, ast.tokenSlice(data.rhs)) orelse return self.fail(.unknown_field, node, null);
                     return self.fit(array.record.fields[index].ty, expected, node);
                 }
-                if (array != .array and !(array == .string and ast.nodes.items(.tag)[node] == .field_access)) return self.fail(.unsupported_body_expression, node, null);
+                if (array != .array and array != .string) return self.fail(.unsupported_body_expression, node, null);
                 if (ast.nodes.items(.tag)[node] == .field_access) {
                     if (!std.mem.eql(u8, ast.tokenSlice(data.rhs), "len")) return self.fail(.unsupported_body_expression, node, null);
                     return self.fit(try self.ir.internType(.{ .integer = .{ .signedness = .unsigned, .bits = Ir.native_pointer_bits } }), expected, node);
                 }
                 const index = try self.ir.internType(.{ .integer = .{ .signedness = .signed, .bits = Ir.native_pointer_bits } });
                 if (try self.expression(data.rhs, .{ .ty = index }, depth + 1) == null) return null;
-                return self.fit(array.array, expected, node);
+                const element = if (array == .string) try self.ir.internType(.{ .integer = .{ .signedness = .unsigned, .bits = 8 } }) else array.array;
+                if (self.terminated) return if (expected) |want| want.ty else element;
+                return self.fit(element, expected, node);
             },
             .identifier => {
                 const name = self.module.sourceSlice(self.span(node)).?;
@@ -3128,11 +3134,213 @@ test "string compounds retain mutability operator and operand diagnostics" {
     }
 }
 
-test "strings reject byte mutation indexing slicing ordering and eager globals" {
+test "string byte indexing has exact u8 inference through contexts constructors and generic methods" {
+    const source =
+        \\let G:(T:type)->type=struct{value:T,
+        \\    let byte:(self:@This(),i:int)->u8=self.value[i]
+        \\}
+        \\let U=union{text:string,}
+        \\let text:()->string="é\0z"
+        \\let take:(b:u8)->u8=b
+        \\let f:(s:string,a:[]string,i:int,b:bool)->u8={
+        \\    let inferred=s[i]
+        \\    let sum=1+s[0]
+        \\    let bytes=[0,s[-1],255]
+        \\    let branch=if b {0} else {s[0]}
+        \\    let matched=match b {true=>s[0]
+        \\        false=>255}
+        \\    let looped=loop {break s[0]}
+        \\    let alias=&s
+        \\    @assert(b and alias[0]==0 or s[-1]==255)
+        \\    @assert(text()[0]==195)
+        \\    @assert(text()[1]==169)
+        \\    @assert(text()[2]==0)
+        \\    @assert(text()[-1]==122)
+        \\    @println(sum,bytes[0],branch,matched,looped,a[0][1],s.len)
+        \\    let wrapped:U=U.text[s]
+        \\    @println(match wrapped {.text=>|v|v[0]})
+        \\    take(inferred)+G(string)[.value=s].byte(i)
+        \\}
+    ;
+    var module = try Module.init(std.testing.allocator, "string-byte.nov", source);
+    defer module.deinit();
+    var sema = try Lowering.lower(&module);
+    defer sema.deinit();
+    errdefer std.debug.print("string byte diagnostics: {any}\n", .{module.diagnostics.items});
+    try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+    var indexed: usize = 0;
+    for (sema.ir.functions.items) |function| {
+        for (function.body.?.instructions) |instruction| {
+            if (instruction.op != .array_index) continue;
+            const base = function.body.?.instructions[@backingInt(instruction.op.array_index.array)];
+            if (sema.ir.getType(base.ty).? != .string) continue;
+            indexed += 1;
+            const ty = sema.ir.getType(instruction.ty).?;
+            try std.testing.expect(ty == .integer);
+            try std.testing.expectEqual(Ir.Type.Integer{ .signedness = .unsigned, .bits = 8 }, ty.integer);
+            const index = function.body.?.instructions[@backingInt(instruction.op.array_index.index)];
+            try std.testing.expectEqual(Ir.Type.Integer{ .signedness = .signed, .bits = Ir.native_pointer_bits }, sema.ir.getType(index.ty).?.integer);
+        }
+    }
+    try std.testing.expect(indexed >= 15);
+}
+
+test "string byte indexing rejects nonnative indices and nonbyte result contexts" {
+    const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag };
+    for ([_]Case{
+        .{ .source = "let f:(s:string,i:uint)->u8=s[i]", .tag = .expression_type_mismatch },
+        .{ .source = "let f:(s:string,i:u8)->u8=s[i]", .tag = .expression_type_mismatch },
+        .{ .source = "let f:(s:string,i:i8)->u8=s[i]", .tag = .expression_type_mismatch },
+        .{ .source = "let f:(s:string)->u8=s[true]", .tag = .literal_type_mismatch },
+        .{ .source = "let f:(s:string)->u8=s[\"0\"]", .tag = .literal_type_mismatch },
+        .{ .source = "let f:(s:string)->int=s[0]", .tag = .expression_type_mismatch },
+        .{ .source = "let f:(s:string)->i8=s[0]", .tag = .expression_type_mismatch },
+        .{ .source = "let f:(s:string)->uint=s[0]", .tag = .expression_type_mismatch },
+        .{ .source = "let f:(s:string)->string=s[0]", .tag = .expression_type_mismatch },
+        .{ .source = "let f:(s:string)->bool=s[0]", .tag = .expression_type_mismatch },
+        .{ .source = "let f:(s:string)->u8=256+s[0]", .tag = .literal_out_of_range },
+    }) |case| {
+        var module = try Module.init(std.testing.allocator, "string-byte-error.nov", case.source);
+        defer module.deinit();
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+        try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
+        try std.testing.expect(!sema.lowering_complete);
+    }
+}
+
+test "string byte indexing preserves once only left to right evaluation and pre index snapshots" {
+    var module = try Module.init(std.testing.allocator, "string-byte-effects.nov",
+        \\let base:()->string={@print("B")
+        \\    "old"}
+        \\let index:()->int={@print("I")
+        \\    return -1}
+        \\let f:()->u8=base()[index()]
+        \\let snapshot:()->u8={let mut s="old"
+        \\    s[{s="new"
+        \\        index()}]}
+    );
+    defer module.deinit();
+    errdefer std.debug.print("string byte effects diagnostics: {any}\nparse errors: {any}\n", .{ module.diagnostics.items, module.source.ast.errors });
+    var sema = try Lowering.lower(&module);
+    defer sema.deinit();
+    try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+    var checked: usize = 0;
+    for (sema.ir.functions.items) |function| {
+        const is_snapshot = std.mem.eql(u8, function.name, "snapshot");
+        if (!is_snapshot and !std.mem.eql(u8, function.name, "f")) continue;
+        const body = function.body.?;
+        var calls: usize = 0;
+        var stores: usize = 0;
+        var store_at: usize = 0;
+        var indices: usize = 0;
+        for (body.instructions, 0..) |instruction, at| {
+            if (instruction.op == .call) calls += 1;
+            if (instruction.op == .local_store) {
+                stores += 1;
+                store_at = at;
+            }
+            if (instruction.op != .array_index) continue;
+            indices += 1;
+            const access = instruction.op.array_index;
+            try std.testing.expect(@backingInt(access.array) < @backingInt(access.index));
+            try std.testing.expect(@backingInt(access.index) < at);
+            try std.testing.expect(body.instructions[@backingInt(access.index)].op == .call);
+            if (is_snapshot) {
+                try std.testing.expect(body.instructions[@backingInt(access.array)].op == .local_load);
+                try std.testing.expect(@backingInt(access.array) < store_at);
+                try std.testing.expect(store_at < @backingInt(access.index));
+            } else try std.testing.expect(body.instructions[@backingInt(access.array)].op == .call);
+        }
+        try std.testing.expectEqual(@as(usize, 1), indices);
+        try std.testing.expectEqual(@as(usize, if (is_snapshot) 1 else 2), calls);
+        try std.testing.expectEqual(@as(usize, if (is_snapshot) 1 else 0), stores);
+        checked += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), checked);
+}
+
+test "string byte indexing terminal base and index operands skip unreachable operations" {
+    for ([_][]const u8{
+        "let f:()->u8=@panic(\"stop\")[missing]",
+        "let f:()->string=\"a\"[{return \"done\"}]",
+        "let f:()->bool=\"a\"[@panic(\"stop\")]",
+        "let f:()->u8=loop {\"a\"[{break 7}]}",
+        "let f:()->u8=loop {\"a\"[{continue}]}",
+        "let f:(b:bool)->bool=b and \"a\"[{return false}]==0",
+    }) |source| {
+        var module = try Module.init(std.testing.allocator, "string-byte-terminal.nov", source);
+        defer module.deinit();
+        errdefer std.debug.print("string byte terminal source: {s}\ndiagnostics: {any}\n", .{ source, module.diagnostics.items });
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+        try std.testing.expect(sema.lowering_complete);
+        try sema.ir.verify();
+        for (sema.ir.functions.items) |function| {
+            for (function.body.?.instructions) |instruction| try std.testing.expect(instruction.op != .array_index);
+        }
+    }
+}
+
+fn testStringByteAllocationFailures(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "string-byte-oom.nov",
+        \\let f:(s:string,a:[]string)->u8={let alias=&s
+        \\    let values=[0,alias[-1],a[0][1]]
+        \\    values[0]}
+    );
+    defer module.deinit();
+    var sema = try Lowering.lower(&module);
+    defer sema.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+}
+
+test "string byte indexing cleans up every allocation failure" {
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testStringByteAllocationFailures, .{});
+}
+
+test "string byte elements remain immutable through mutable bindings and whole string borrows" {
+    for ([_][]const u8{ "=", "+=", "-=", "*=", "/=", "%=" }) |op| {
+        for ([_][]const u8{ "let s=\"a\"", "let mut s=\"a\"", "let mut owner=\"a\"\nlet s=&owner" }) |binding| {
+            const source = try std.fmt.allocPrint(std.testing.allocator, "let f:()={{{s}\ns[0]{s}1}}", .{ binding, op });
+            defer std.testing.allocator.free(source);
+            var module = try Module.init(std.testing.allocator, "string-byte-mutation.nov", source);
+            defer module.deinit();
+            var sema = try Lowering.lower(&module);
+            defer sema.deinit();
+            try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+            try std.testing.expectEqual(Module.Diagnostic.Tag.unsupported_assignment_target, module.diagnostics.items[0].tag);
+            try std.testing.expect(!sema.lowering_complete);
+        }
+    }
+    for ([_][]const u8{
+        "let s=\"a\"\nlet byte=&s[0]",
+        "let mut s=\"a\"\nlet byte=&s[0]",
+        "let mut owner=\"a\"\nlet s=&owner\nlet byte=&s[0]",
+    }) |binding| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let f:()={{{s}\n}}", .{binding});
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "string-byte-borrow.nov", source);
+        defer module.deinit();
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+        try std.testing.expectEqual(Module.Diagnostic.Tag.unsupported_borrow, module.diagnostics.items[0].tag);
+        try std.testing.expect(!sema.lowering_complete);
+    }
+}
+
+test "strings reject byte mutation slicing ordering and eager globals" {
     for ([_][]const u8{
         "let f: () -> void = {let mut x = [\"a\"]\nx[0] += \"b\"}",
         "let f: () -> void = {let mut x = \"a\"\nx[0] = \"b\"}",
-        "let f: () -> void = @println(\"a\"[0])",
         "let f: () -> void = @println(\"a\"[0..1])",
         "let f: () -> void = {let mut x = \"a\"\nx.len = 1}",
         "let f: () -> void = {let mut x = \"a\"\nx -= \"b\"}",
