@@ -50,7 +50,7 @@ pub fn lower(module: *Module, ir: *Ir, types: []const ?Ir.TypeId, constants: []c
     defer arena.deinit();
     var emitter: Emitter = .{ .allocator = arena.allocator(), .constants = constants, .functions = functions };
     if (!try checkInner(module, ir, types, id, &emitter, null)) return false;
-    const body_node = module.source.ast.decl(module.getDeclaration(id).?.node).ast.init_node;
+    const body_node = module.source.ast.declFunction(module.getDeclaration(id).?.node).?.body;
     const result = emitter.values.get(body_node) orelse return error.InvalidValueId;
     const function = functions[tableIndex(module, id)] orelse return error.InvalidFunctionId;
     const body: Ir.Body = .{ .instructions = emitter.instructions.items, .result = result };
@@ -104,8 +104,8 @@ fn checkInner(module: *Module, ir: *Ir, types: []const ?Ir.TypeId, id: Module.De
         try module.diagnostics.append(module.allocator, .{ .tag = .invalid_test_signature, .span = declaration.name_span });
         return false;
     }
-    const full = module.source.ast.decl(declaration.node);
-    const proto = module.source.ast.fullFnProto(full.ast.type_node) orelse return error.InvalidTypeId;
+    const function = module.source.ast.declFunction(declaration.node) orelse return error.InvalidTypeId;
+    const proto = module.source.ast.fullFnProto(function.proto_node) orelse return error.InvalidTypeId;
     if (proto.ast.params.len != ty.function.params.len) return error.InvalidTypeId;
     var context: Context = .{ .module = module, .ir = ir, .types = types, .emitter = emitter, .container = declaration.container, .concrete_type = declaration.concrete_type, .sema = sema };
     defer context.bindings.deinit(module.allocator);
@@ -134,15 +134,27 @@ fn checkInner(module: *Module, ir: *Ir, types: []const ?Ir.TypeId, id: Module.De
         }
     }
     if (!valid) return false;
-    if (full.ast.init_node == 0) {
+    if (function.body == 0) {
         try module.diagnostics.append(module.allocator, .{ .tag = .missing_initializer, .span = declaration.name_span });
         return false;
     }
     if (declaration.noreturn) {
-        const first = module.source.ast.firstToken(full.ast.init_node);
-        const last = module.source.ast.lastToken(full.ast.init_node);
-        for (module.source.ast.tokens.items(.tag)[first .. last + 1], first..) |tag, token| {
+        const first = module.source.ast.firstToken(function.body);
+        const last = module.source.ast.lastToken(function.body);
+        returns: for (module.source.ast.tokens.items(.tag)[first .. last + 1], first..) |tag, token| {
             if (tag == .keyword_return) {
+                // A nested function's returns do not return from this declaration.
+                const ast = &module.source.ast;
+                for (ast.nodes.items(.tag), 0..) |node_tag, index| {
+                    const node: Ast.Node.Index = @intCast(index);
+                    if (node_tag != .function_expr and node_tag != .decl) continue;
+                    const start = ast.firstToken(node);
+                    if (start <= first or start > token or ast.lastToken(node) < token) continue;
+                    if (node_tag == .function_expr) continue :returns;
+                    const nested = ast.declFunction(node) orelse continue;
+                    var params = ast.fullFnProto(nested.proto_node).?.iterate(ast);
+                    while (params.next()) |param| if (param.name_token != null) continue :returns;
+                }
                 try module.diagnostics.append(module.allocator, .{ .tag = .noreturn_return, .span = module.tokenSpan(@intCast(token)) });
                 return false;
             }
@@ -150,12 +162,12 @@ fn checkInner(module: *Module, ir: *Ir, types: []const ?Ir.TypeId, id: Module.De
     }
     const annotation = module.tokenSpan(if (proto.ast.return_type) |node| module.source.ast.firstToken(node) else proto.lparen);
     context.return_type = .{ .ty = ty.function.result, .annotation = annotation };
-    const checked = (try context.expression(full.ast.init_node, .{ .ty = ty.function.result, .annotation = annotation }, 0)) != null;
+    const checked = (try context.expression(function.body, .{ .ty = ty.function.result, .annotation = annotation }, 0)) != null;
     if (checked and declaration.noreturn and !context.terminated) {
-        _ = try context.fail(.noreturn_completion, full.ast.init_node, declaration.name_span);
+        _ = try context.fail(.noreturn_completion, function.body, declaration.name_span);
         return false;
     }
-    if (checked and !context.terminated) try context.copyNode(full.ast.init_node, ty.function.result);
+    if (checked and !context.terminated) try context.copyNode(function.body, ty.function.result);
     return checked;
 }
 
@@ -180,6 +192,130 @@ const Context = struct {
     locals: std.ArrayList([]const u8) = .empty,
     borrow_base: ?Ast.Node.Index = null,
     reservation: ?*const Reservation = null,
+    parent: ?*Context = null,
+    captures: std.ArrayList(Ir.Capture) = .empty,
+    capture_names: std.ArrayList([]const u8) = .empty,
+    capture_values: std.ArrayList(Ir.ValueId) = .empty,
+
+    fn lookupBinding(self: *Context, name: []const u8) ?Binding {
+        return self.bindings.get(name) orelse if (self.parent) |parent| parent.lookupBinding(name) else null;
+    }
+
+    fn captureBinding(self: *Context, name: []const u8, node: Ast.Node.Index) Error!?Binding {
+        if (self.bindings.get(name)) |binding| return binding;
+        const parent = self.parent orelse return null;
+        const outer = (try parent.captureBinding(name, node)) orelse return null;
+        if (outer.borrowed) {
+            _ = try self.fail(.unsupported_borrow, node, outer.name_span);
+            return null;
+        }
+        if (parent.reservedOrigin(outer.name_span)) |origin| {
+            _ = try self.fail(.borrow_conflict, node, origin);
+            return null;
+        }
+        const index: u32 = @intCast(self.captures.items.len);
+        try self.captures.append(self.module.allocator, .{ .ty = outer.known.ty, .mutable = outer.mutable });
+        try self.capture_names.append(self.module.allocator, name);
+        var binding: Binding = .{ .known = outer.known, .name_span = outer.name_span, .mutable = outer.mutable };
+        if (self.emitter) |emitter| {
+            const source = parent.emitter.?;
+            const value = if (outer.mutable) blk: {
+                const slot = outer.slot orelse return error.InvalidValueId;
+                source.instructions.items[@backingInt(slot)].boxed = true;
+                break :blk slot;
+            } else blk: {
+                var value = if (outer.slot) |slot|
+                    try source.append(outer.known.ty, outer.name_span, .{ .local_load = slot })
+                else if (outer.value) |value| value else if (outer.initializer) |initializer| try source.value(initializer) else try source.append(outer.known.ty, outer.name_span, .{ .parameter = outer.index });
+                if (self.ir.getType(outer.known.ty).? == .array) value = try source.append(outer.known.ty, outer.name_span, .{ .array_clone = value });
+                break :blk value;
+            };
+            try self.capture_values.append(self.module.allocator, value);
+            const captured = try emitter.append(outer.known.ty, self.irSpan(node), if (outer.mutable) .{ .capture_cell = index } else .{ .capture_value = index });
+            if (outer.mutable) {
+                emitter.instructions.items[@backingInt(captured)].boxed = true;
+                binding.slot = captured;
+            } else if (self.ir.getType(outer.known.ty).? == .void) {
+                binding.value = captured;
+            } else {
+                binding.slot = try emitter.append(outer.known.ty, self.irSpan(node), .{ .local_slot = captured });
+            }
+        }
+        try self.bindings.put(self.module.allocator, name, binding);
+        return binding;
+    }
+
+    fn functionExpression(self: *Context, node: Ast.Node.Index, expected: ?Known, depth: usize) Error!?Ir.TypeId {
+        const data = self.module.source.ast.nodes.items(.data)[node];
+        return self.functionBody(node, data.lhs, data.rhs, expected, depth);
+    }
+
+    fn functionBody(self: *Context, node: Ast.Node.Index, proto_node: Ast.Node.Index, body_node: Ast.Node.Index, expected: ?Known, depth: usize) Error!?Ir.TypeId {
+        const ast = &self.module.source.ast;
+        const function = .{ .proto = ast.fullFnProto(proto_node).?, .body = body_node };
+        const ty = (try TypeResolver.resolveInContainer(self.module, self.ir, function.proto.ast.proto_node, self.container, self.concrete_type)) orelse return null;
+        if (try self.fit(ty, expected, node) == null) return null;
+        // Pool growth while checking nested bodies must not invalidate signatures.
+        const signature = self.ir.getType(ty).?.function;
+        var arena = std.heap.ArenaAllocator.init(self.module.allocator);
+        defer arena.deinit();
+        var emitter: Emitter = .{ .allocator = arena.allocator(), .constants = if (self.emitter) |e| e.constants else &.{}, .functions = if (self.emitter) |e| e.functions else &.{} };
+        var child: Context = .{ .module = self.module, .ir = self.ir, .types = self.types, .sema = self.sema, .container = self.container, .concrete_type = self.concrete_type, .parent = self, .emitter = null, .return_type = .{ .ty = signature.result } };
+        defer child.bindings.deinit(self.module.allocator);
+        defer child.locals.deinit(self.module.allocator);
+        defer child.captures.deinit(self.module.allocator);
+        defer child.capture_names.deinit(self.module.allocator);
+        defer child.capture_values.deinit(self.module.allocator);
+        var iterator = function.proto.iterate(ast);
+        var index: u32 = 0;
+        while (iterator.next()) |param| : (index += 1) {
+            const token = param.name_token orelse {
+                return self.fail(.unsupported_local_declaration, node, null);
+            };
+            const name = ast.tokenSlice(token);
+            if (child.conflict(name) != null or isPrimitive(name)) return self.fail(.unsupported_shadowing, node, child.conflict(name));
+            try child.bindings.put(self.module.allocator, name, .{ .known = .{ .ty = signature.params[index] }, .index = index, .name_span = self.module.tokenSpan(token) });
+        }
+        if (self.emitter != null) {
+            // Discover lexical free bindings without emitting private-region reads.
+            // Entry captures then dominate the entire body, including nested closures.
+            child.emitter = null;
+            if (try child.expression(function.body, .{ .ty = signature.result }, depth + 1) == null) return null;
+            const names = try arena.allocator().dupe([]const u8, child.capture_names.items);
+            child.bindings.clearRetainingCapacity();
+            child.locals.clearRetainingCapacity();
+            child.captures.clearRetainingCapacity();
+            child.capture_names.clearRetainingCapacity();
+            child.terminated = false;
+            child.terminal = null;
+            child.emitter = &emitter;
+            iterator = function.proto.iterate(ast);
+            index = 0;
+            while (iterator.next()) |param| : (index += 1) {
+                const token = param.name_token.?;
+                const name = ast.tokenSlice(token);
+                const param_span = self.module.tokenSpan(token);
+                const slot = if (child.borrowedName(name) and self.ir.getType(signature.params[index]).? != .void) blk: {
+                    const value = try emitter.append(signature.params[index], param_span, .{ .parameter = index });
+                    break :blk try emitter.append(signature.params[index], param_span, .{ .local_slot = value });
+                } else null;
+                try child.bindings.put(self.module.allocator, name, .{ .known = .{ .ty = signature.params[index] }, .index = index, .name_span = param_span, .slot = slot });
+            }
+            for (names) |name| if (try child.captureBinding(name, node) == null) return null;
+        }
+        if (try child.expression(function.body, .{ .ty = signature.result }, depth + 1) == null) return null;
+        if (!child.terminated) try child.copyNode(function.body, signature.result);
+        if (self.emitter) |outer| {
+            const name = try std.fmt.allocPrint(arena.allocator(), "$closure{d}", .{self.ir.functions.items.len});
+            const id = try self.ir.addFunction(name, ty, self.irSpan(node));
+            const captures = try self.ir.allocator.dupe(Ir.Capture, child.captures.items);
+            self.ir.functions.items[@backingInt(id)].captures = captures;
+            self.ir.functions.items[@backingInt(id)].is_closure = true;
+            try self.ir.setFunctionBody(id, emitter.instructions.items, try emitter.value(function.body));
+            try outer.record(node, ty, self.irSpan(node), .{ .closure_init = .{ .function = id, .captures = try outer.allocator.dupe(Ir.ValueId, child.capture_values.items) } });
+        }
+        return ty;
+    }
 
     fn reservedOrigin(self: *const Context, owner: Module.Span) ?Module.Span {
         var cursor = self.reservation;
@@ -273,7 +409,7 @@ const Context = struct {
     }
 
     fn conflict(self: *Context, name: []const u8) ?Module.Span {
-        if (self.bindings.get(name)) |binding| return binding.name_span;
+        if (self.lookupBinding(name)) |binding| return binding.name_span;
         if (self.valueDeclaration(name)) |id| return self.getDeclaration(id).name_span;
         if (self.concrete_type != null) {
             const owner = self.module.getDeclaration(self.container.?).?;
@@ -306,15 +442,13 @@ const Context = struct {
             _ = try self.fail(.unsupported_local_declaration, node, null);
             return false;
         }
-        // Named parameters introduce a local function definition, not a value
-        // annotation. Closures/local function bodies are outside this slice.
+        // Named parameter annotations retain the declaration form. Initializers
+        // are still checked before publication, so local recursion is rejected.
+        var local_function = false;
         if (if (decl.type_node != 0) ast.fullFnProto(decl.type_node) else null) |proto| {
             var iterator = proto.iterate(ast);
             while (iterator.next()) |param| {
-                if (param.name_token != null) {
-                    _ = try self.fail(.unsupported_local_declaration, node, null);
-                    return false;
-                }
+                if (param.name_token != null) local_function = true;
             }
         }
         if (decl.init_node == 0) {
@@ -333,7 +467,10 @@ const Context = struct {
         }
         // Publish only after checking/evaluating the initializer: no self or
         // forward local references, and initialization happens exactly once.
-        const ty = (try self.expression(decl.init_node, annotation, depth + 1)) orelse return false;
+        const ty = (if (local_function)
+            try self.functionBody(decl.init_node, decl.type_node, decl.init_node, annotation, depth + 1)
+        else
+            try self.expression(decl.init_node, annotation, depth + 1)) orelse return false;
         if (self.terminated) return true;
         if (annotation == null and self.ir.getType(ty).? == .void) {
             _ = try self.fail(.unsupported_local_declaration, node, null);
@@ -364,7 +501,7 @@ const Context = struct {
             _ = try self.fail(.unsupported_borrow, operand, null);
             return false;
         }
-        const owner = self.bindings.get(ast.tokenSlice(ast.nodes.items(.main_token)[owner_node])) orelse {
+        const owner = (try self.captureBinding(ast.tokenSlice(ast.nodes.items(.main_token)[owner_node]), owner_node)) orelse {
             _ = try self.fail(.unsupported_borrow, owner_node, null);
             return false;
         };
@@ -834,9 +971,13 @@ const Context = struct {
         const ast = &self.module.source.ast;
         const data = ast.nodes.items(.data)[node];
         return switch (ast.nodes.items(.tag)[node]) {
+            .function_expr => blk: {
+                const ty = (try TypeResolver.resolveInContainer(self.module, self.ir, ast.nodes.items(.data)[node].lhs, self.container, self.concrete_type)) orelse break :blk null;
+                break :blk .{ .ty = ty };
+            },
             .identifier => blk: {
                 const name = self.module.sourceSlice(self.span(node)).?;
-                if (self.bindings.get(name)) |binding| break :blk binding.known;
+                if (self.lookupBinding(name)) |binding| break :blk binding.known;
                 if (self.valueDeclaration(name)) |id| break :blk try self.globalType(id);
                 if (std.mem.eql(u8, name, "true") or std.mem.eql(u8, name, "false")) break :blk .{ .ty = try self.ir.internType(.boolean) };
                 break :blk null;
@@ -1092,6 +1233,7 @@ const Context = struct {
                     if (binding.borrowed) break :blk .{ .borrow_read = binding.borrow.? };
                     if (binding.value) |value| {
                         try emitter.values.put(emitter.allocator, node, value);
+                        if (self.ir.getType(ty).? == .array) try self.copyNode(node, ty);
                         return true;
                     }
                     if (binding.slot) |slot| break :blk .{ .local_load = slot };
@@ -1165,6 +1307,23 @@ const Context = struct {
                 return false;
             },
         };
+        if (op == .call) {
+            // Calls may mutate shared captures without naming the owner here.
+            // Until effect summaries exist, protect captured iteration sources
+            // even though ordinary iteration itself traverses a detached copy.
+            var reservation = self.reservation;
+            while (reservation) |current| : (reservation = current.parent) {
+                if (!current.reads_allowed) continue;
+                var bindings = self.bindings.valueIterator();
+                while (bindings.next()) |binding| {
+                    if (!std.meta.eql(binding.name_span, current.owner)) continue;
+                    if (binding.slot) |slot| if (emitter.instructions.items[@backingInt(slot)].boxed) {
+                        _ = try self.fail(.borrow_conflict, node, current.origin);
+                        return false;
+                    };
+                }
+            }
+        }
         try emitter.record(node, ty, self.irSpan(node), op);
         // All ordinary array reads, including alias reads, detach before
         // index/RHS effects. Creating a loan itself never reads or clones.
@@ -1194,7 +1353,7 @@ const Context = struct {
         }
         if (ast.nodes.items(.tag)[root] != .identifier) return self.fail(.unsupported_assignment_target, data.lhs, null);
         const binding_name = self.module.sourceSlice(self.span(root)).?;
-        const binding = self.bindings.get(binding_name) orelse {
+        const binding = (try self.captureBinding(binding_name, root)) orelse {
             if (self.module.lookup(binding_name)) |id| return self.fail(.immutable_assignment, target.lhs, self.module.getDeclaration(id).?.name_span);
             return self.fail(.unknown_name, target.lhs, null);
         };
@@ -1259,7 +1418,7 @@ const Context = struct {
         const compound = tag != .assign;
         if (ast.nodes.items(.tag)[target.lhs] != .identifier) return self.fail(.unsupported_assignment_target, data.lhs, null);
         const name = self.module.sourceSlice(self.span(target.lhs)).?;
-        const binding = self.bindings.get(name) orelse {
+        const binding = (try self.captureBinding(name, node)) orelse {
             if (self.module.lookup(name)) |id| return self.fail(.immutable_assignment, target.lhs, self.module.getDeclaration(id).?.name_span);
             return self.fail(.unknown_name, target.lhs, null);
         };
@@ -1767,7 +1926,7 @@ const Context = struct {
         const by_ref = ast.nodes.items(.tag)[loop.binding] == .ref_of;
         const source_type = if (by_ref) reference: {
             if (ast.nodes.items(.tag)[loop.source] != .identifier) return self.fail(.unsupported_iteration, loop.source, null);
-            const binding = self.bindings.get(ast.tokenSlice(ast.nodes.items(.main_token)[loop.source])) orelse return self.fail(.unsupported_iteration, loop.source, null);
+            const binding = (try self.captureBinding(ast.tokenSlice(ast.nodes.items(.main_token)[loop.source]), loop.source)) orelse return self.fail(.unsupported_iteration, loop.source, null);
             if (binding.borrowed or self.ir.getType(binding.known.ty).? != .array) return self.fail(.unsupported_iteration, loop.source, null);
             if (self.reservedOrigin(binding.name_span)) |origin| return self.fail(.borrow_conflict, loop.source, origin);
             // A loan selects the live owner storage, never an ordinary array clone.
@@ -1963,6 +2122,7 @@ const Context = struct {
         // Explicit record constructors already carry their type. Resolve it once,
         // rather than probing and then retrying a failed concrete specialization.
         if (tag_early == .container_decl_arg) return self.recordInit(node, expected, depth);
+        if (tag_early == .function_expr) return self.functionExpression(node, expected, depth);
         const hint = expected orelse try self.probe(node, depth);
         if (hint) |known| {
             switch (try Literal.check(self.module, self.ir, node, known.ty, known.annotation)) {
@@ -2040,7 +2200,7 @@ const Context = struct {
             },
             .identifier => {
                 const name = self.module.sourceSlice(self.span(node)).?;
-                if (self.bindings.get(name)) |binding| {
+                if (try self.captureBinding(name, node)) |binding| {
                     if (self.reservedOrigin(binding.name_span)) |origin| return self.fail(.borrow_conflict, node, origin);
 
                     return self.fit(binding.known.ty, expected, node);
@@ -2179,7 +2339,7 @@ const Context = struct {
                 if (ast.nodes.items(.tag)[data.lhs] == .array_access) return self.elementAssignment(node, expected, depth);
                 if (ast.nodes.items(.tag)[data.lhs] != .identifier) return self.fail(.unsupported_assignment_target, data.lhs, null);
                 const name = self.module.sourceSlice(self.span(data.lhs)).?;
-                const binding = self.bindings.get(name) orelse {
+                const binding = (try self.captureBinding(name, node)) orelse {
                     if (self.module.lookup(name)) |id| return self.fail(.immutable_assignment, data.lhs, self.module.getDeclaration(id).?.name_span);
                     return self.fail(.unknown_name, data.lhs, null);
                 };
@@ -4241,7 +4401,7 @@ test "local scope declaration and block result diagnostics" {
         .{ .body = "{let n: i32 = 1\n}", .tag = .expression_type_mismatch },
         .{ .body = "{p\np}", .tag = .unused_block_value },
         .{ .body = "{let n: i32 = 1\n{let n: i32 = 2\nn}}", .tag = .unsupported_shadowing },
-        .{ .body = "{let callback: (x: i32) -> i32 = x\n1}", .tag = .unsupported_local_declaration },
+        .{ .body = "{let callback: (x: i32) -> i32 = callback(x)\n1}", .tag = .unknown_name },
     }) |case| {
         const source = try std.fmt.allocPrint(std.testing.allocator, "let f: (p: i32) -> i32 = {s}", .{case.body});
         defer std.testing.allocator.free(source);

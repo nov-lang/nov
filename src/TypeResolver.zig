@@ -348,7 +348,7 @@ pub fn validateGeneric(module: *Module, id: Module.DeclId) Error!bool {
             }
             if (isThisAlias(ast, member)) continue;
             const method = ast.fullDecl(member);
-            if (method == null or method.?.ast.is_mutable or ast.fullFnProto(method.?.ast.type_node) == null)
+            if (method == null or method.?.ast.is_mutable or ast.declFunction(member) == null)
                 _ = try diagnose(module, member, .unsupported_generic_method);
             continue;
         }

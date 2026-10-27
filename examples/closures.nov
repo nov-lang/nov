@@ -1,0 +1,114 @@
+; nov run examples/closures.nov
+; nov test examples/closures.nov
+; Immutable bindings capture snapshots; mutable bindings capture shared storage.
+
+; let makeAdder: (base: int) -> (int) -> int = (value: int) -> int { base + value }
+let makeAdder = (base: int) -> (int) -> int {
+    (value: int) -> int {
+        base + value
+    }
+}
+
+let makeCounter = () -> () -> uint {
+    let mut count: uint = 0
+    () -> uint {
+        count += 1
+        count
+    }
+}
+
+let Box: (T: type) -> type = struct {
+    value: T,
+
+    let Self = @This()
+
+    let bind = (self: Self) -> () -> T {
+        () -> T {
+            self.value
+        }
+    }
+}
+
+let main = () {
+    let addFive = makeAdder(5)
+    @println("5 + 3 =", addFive(3))
+    let next = makeCounter()
+    let sameCounter = next
+    @println("Shared counter:", next(), sameCounter(), next())
+    let mut count: uint = 1
+    let saved = count
+    let snapshot = () -> uint {
+        saved
+    }
+    let increment = () {
+        count += 1
+    }
+    increment()
+    @println("Snapshot:", snapshot(), "Current:", count)
+}
+
+@[test]
+let escaping_snapshot = () {
+    let addFive = makeAdder(5)
+    @assert(addFive(3) == 8)
+}
+
+@[test]
+let shared_counter = () {
+    let next = makeCounter()
+    let other = next
+    @assert(next() == 1)
+    @assert(other() == 2)
+    @assert(next() == 3)
+}
+
+@[test]
+let outer_updates = () {
+    let mut count: uint = 0
+    let increment = () {
+        count += 1
+    }
+    increment()
+    @assert(count == 1)
+    count = 10
+    increment()
+    @assert(count == 11)
+}
+
+@[test]
+let array_copies = () {
+    let mut items: []int = [1]
+    let saved = items
+    let snapshot = () -> int {
+        saved[0]
+    }
+    let update = () {
+        items[0] += 1
+    }
+    update()
+    @assert(items[0] == 2)
+    @assert(snapshot() == 1)
+    let copy = items
+    update()
+    @assert(copy[0] == 2)
+    @assert(items[0] == 3)
+}
+
+@[test]
+let generic_method = () {
+    let box = Box(string)[ .value = "captured" ]
+    let get = box.bind()
+    @assert(get() == "captured")
+}
+
+@[test]
+let nested_capture = () {
+    let label = "hello" + "!"
+    let factory = () -> () -> string {
+        () -> string {
+            label
+        }
+    }
+    let inner = factory()
+    @assert(inner() == "hello!")
+}

@@ -103,6 +103,15 @@ pub fn check(allocator: std.mem.Allocator, body: Ir.Body) Ir.VerifyError!?Ir.Bor
         }
         for (body.instructions, 0..) |instruction, i| {
             if (i == origin or !active[i] or !live[i]) continue;
+            const owner = reservation.op.borrow_reserve;
+            // Environments hide cell accesses from the caller's ordinary operands.
+            // Until effect summaries exist, a call may touch any captured owner.
+            if (instruction.op == .call and body.instructions[@backingInt(owner)].boxed)
+                return .{ .access = instruction.span, .origin = reservation.span };
+            if (instruction.op == .closure_init) {
+                for (instruction.op.closure_init.captures) |capture| if (capture == owner)
+                    return .{ .access = instruction.span, .origin = reservation.span };
+            }
             const slot: ?Ir.ValueId = switch (instruction.op) {
                 .local_load, .borrow_reserve => |s| s,
                 .local_store => |s| s.slot,

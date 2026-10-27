@@ -513,12 +513,25 @@ let Todo = struct {
 ```
 
 # Closures, anonymous functions & bind
-Missing README examples:
-- return a function
-- return a closure
-- create a closure
-- pass a closure as argument
-- ...?
+
+Implemented: `(value: int) -> int { ... }` and `() { ... }` function expressions,
+inferred function bindings, nonrecursive local definitions, higher-order calls and
+escaping automatic captures. Immutable bindings/parameters snapshot by value
+(independent arrays, shared immutable strings); mutable bindings share GC-managed
+cells. Function copies/arguments share environments, without recopying captures.
+Transitive captures, generic methods, source-free IR and forced-GC/OOM paths are
+covered. See README and examples/closures.nov.
+
+Borrowed binding captures, recursive local definitions, inferred parameter/result
+types, function fields/array elements and C callback ABI remain deferred. Calls
+while a shared captured cell is borrowed are conservatively rejected, as are
+calls during iteration over an already captured mutable array; precise effect
+analysis and concurrent shared-state rules remain future work.
+
+Historical alternatives below are not executable contracts. Explicit C++-style
+`[]` capture syntax was rejected: brackets remain construction syntax. Automatic
+capture by binding mutability is the approved rule; `|x|` shorthand and bind
+operators below remain unapproved proposals.
 
 ```nov
 let forEach: (a: *mut []int, f: (int) -> int) = {

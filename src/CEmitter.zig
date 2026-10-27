@@ -285,7 +285,7 @@ fn write(allocator: std.mem.Allocator, ir: *const Ir, origins: []const ?Origin, 
     @memset(declared, false);
     const root_counts = try allocator.alloc(usize, ir.types.items.len);
     defer allocator.free(root_counts);
-    for (ir.types.items, root_counts) |ty, *count| count.* = @intFromBool(ty == .string or ty == .array);
+    for (ir.types.items, root_counts) |ty, *count| count.* = @intFromBool(ty == .string or ty == .array or (ty == .function and usesClosures(ir)));
     var remaining: usize = 0;
     for (origins, ir.types.items) |origin, ty| {
         if (origin != null and ty == .record) remaining += 1;
@@ -313,6 +313,29 @@ fn write(allocator: std.mem.Allocator, ir: *const Ir, origins: []const ?Origin, 
             try w.print("}} nov_record_{d};\n", .{i});
         }
     }
+    for (origins, ir.types.items, 0..) |origin, ty, i| {
+        if (origin == null or ty != .range) continue;
+        try w.writeAll("typedef struct { ");
+        try writeType(ir, w, ty.range);
+        try w.print(" start, end; bool inclusive; }} nov_range_{d};\n", .{i});
+    }
+    // Forward declarations permit higher-order signatures without recursive C typedefs.
+    if (usesClosures(ir)) {
+        for (origins, ir.types.items, 0..) |origin, ty, i| {
+            if (origin != null and ty == .function) try w.print("typedef struct nov_fn_{d} nov_fn_{d};\n", .{ i, i });
+        }
+        for (origins, ir.types.items, 0..) |origin, ty, i| {
+            if (origin == null or ty != .function) continue;
+            try w.print("struct nov_fn_{d} {{ ", .{i});
+            try writeType(ir, w, ty.function.result);
+            try w.writeAll(" (*code)(void *");
+            for (ty.function.params) |param| {
+                try w.writeAll(", ");
+                try writeType(ir, w, param);
+            }
+            try w.writeAll("); void *env; };\n");
+        }
+    }
     for (ir.types.items, 0..) |_, t| {
         const element: Ir.TypeId = @fromBackingInt(@intCast(t));
         if (!usesElementLayout(ir, element)) continue;
@@ -330,15 +353,9 @@ fn write(allocator: std.mem.Allocator, ir: *const Ir, origins: []const ?Origin, 
         if (count == 0) try w.writeAll("NULL") else try w.print("nov_element_offsets_{d}", .{t});
         try w.writeAll(" };\n");
     }
-    for (origins, ir.types.items, 0..) |origin, ty, i| {
-        if (origin == null or ty != .range) continue;
-        try w.writeAll("typedef struct { ");
-        try writeType(ir, w, ty.range);
-        try w.print(" start, end; bool inclusive; }} nov_range_{d};\n", .{i});
-    }
     var first_typedef = true;
     for (origins, ir.types.items, 0..) |origin, ty, i| {
-        if (origin == null or ty != .function) continue;
+        if (origin == null or ty != .function or usesClosures(ir)) continue;
         if (first_typedef) try w.writeByte('\n');
         first_typedef = false;
         try w.writeAll("typedef ");
@@ -352,6 +369,40 @@ fn write(allocator: std.mem.Allocator, ir: *const Ir, origins: []const ?Origin, 
     for (ir.functions.items) |function| {
         try writeSignature(ir, w, function);
         try w.writeAll(";\n");
+    }
+    if (usesClosures(ir)) {
+        try w.writeAll("static const size_t nov_env_offset[] = {0};\nstatic const nov_gc_descriptor nov_env_element = {sizeof(void *), _Alignof(void *), 1, nov_env_offset};\n");
+        for (ir.functions.items, 0..) |function, f| {
+            if (function.is_closure) continue;
+            var referenced = false;
+            for (ir.functions.items) |caller| {
+                if (caller.body) |body| for (body.instructions) |instruction| {
+                    if (instruction.op == .function_ref and @backingInt(instruction.op.function_ref) == f) {
+                        referenced = true;
+                        break;
+                    }
+                };
+            }
+            if (!referenced) continue;
+            const signature = ir.getType(function.ty).?.function;
+            try w.writeAll("static inline ");
+            try writeType(ir, w, signature.result);
+            try w.print(" nov_adapter_{d}(void *nov_env", .{f});
+            for (signature.params, 0..) |param, p| {
+                try w.writeAll(", ");
+                try writeType(ir, w, param);
+                try w.print(" p{d}", .{p});
+            }
+            try w.writeAll(") { (void)nov_env; ");
+            if (ir.getType(signature.result).? != .void) try w.writeAll("return ");
+            try writeScopedFunctionName(w, function);
+            try w.writeByte('(');
+            for (signature.params, 0..) |_, p| {
+                if (p != 0) try w.writeAll(", ");
+                try w.print("p{d}", .{p});
+            }
+            try w.writeAll("); }\n");
+        }
     }
     for (ir.functions.items) |function| {
         if (function.body == null) continue;
@@ -368,6 +419,10 @@ fn usesElementLayout(ir: *const Ir, element: Ir.TypeId) bool {
         const body = function.body orelse continue;
         for (body.instructions) |instruction| switch (instruction.op) {
             .array_literal, .array_clone, .array_set, .array_append => if (ir.getType(instruction.ty).?.array == element) return true,
+            .local_slot => if (instruction.boxed and instruction.ty == element) return true,
+            .closure_init => |closure| {
+                for (ir.getFunction(closure.function).?.captures) |capture| if (!capture.mutable and capture.ty == element and ir.getType(element).? != .void) return true;
+            },
             else => {},
         };
     }
@@ -393,12 +448,12 @@ fn writeElementOffsets(ir: *const Ir, root_counts: []const usize, w: *std.Io.Wri
                 len += 1;
             }
         } else {
-            std.debug.assert(ty == .string);
+            std.debug.assert(ty == .string or ty == .array or ty == .function);
             try w.writeAll(" offsetof(");
             try writeType(ir, w, id);
             try w.writeAll(", ");
             for (stack[0 .. len - 1]) |parent| try w.print("f{d}.", .{parent.next - 1});
-            try w.writeAll("owner),");
+            try w.print("{s}),", .{if (ty == .string) "owner" else if (ty == .function) "env" else "data"});
             len -= 1;
         }
     }
@@ -424,22 +479,33 @@ fn writeRoots(ir: *const Ir, root_counts: []const usize, w: *std.Io.Writer, id: 
                 len += 1;
             }
         } else {
-            if (Ir.isManaged(ty)) {
+            if (managedType(ir, ty)) {
                 try w.print(" &{s}{d}", .{ prefix, index });
                 for (stack[0 .. len - 1]) |parent| try w.print(".f{d}", .{parent.next - 1});
-                try w.print(".{s},", .{if (ty == .string) "owner" else "data"});
+                try w.print(".{s},", .{if (ty == .string) "owner" else if (ty == .function) "env" else "data"});
             }
             len -= 1;
         }
     }
 }
 
+fn usesClosures(ir: *const Ir) bool {
+    for (ir.functions.items) |function| if (function.is_closure) return true;
+    return false;
+}
+
+fn managedType(ir: *const Ir, ty: Ir.Type) bool {
+    return Ir.isManaged(ty) or (ty == .function and usesClosures(ir));
+}
+
 fn needsRootFrame(ir: *const Ir, function: Ir.Function) bool {
     const body = function.body orelse return false;
+    if (function.is_closure) return true;
+    for (body.instructions) |instruction| if (instruction.boxed) return true;
     const signature = ir.getType(function.ty).?.function;
-    for (signature.params) |param| if (Ir.isManaged(ir.getType(param).?)) return true;
-    for (body.instructions) |instruction| if (Ir.isManaged(ir.getType(instruction.ty).?)) return true;
-    return Ir.isManaged(ir.getType(signature.result).?);
+    for (signature.params) |param| if (managedType(ir, ir.getType(param).?)) return true;
+    for (body.instructions) |instruction| if (managedType(ir, ir.getType(instruction.ty).?)) return true;
+    return managedType(ir, ir.getType(signature.result).?);
 }
 
 fn usesManagedRuntime(ir: *const Ir) bool {
@@ -806,9 +872,9 @@ fn writeSignature(ir: *const Ir, w: *std.Io.Writer, function: Ir.Function) Write
     try w.writeByte(' ');
     try writeScopedFunctionName(w, function);
     try w.writeByte('(');
-    if (signature.params.len == 0) try w.writeAll("void");
+    if (function.is_closure) try w.writeAll("void *nov_env") else if (signature.params.len == 0) try w.writeAll("void");
     for (signature.params, 0..) |param, i| {
-        if (i != 0) try w.writeAll(", ");
+        if (i != 0 or function.is_closure) try w.writeAll(", ");
         try writeType(ir, w, param);
         try w.print(" p{d}", .{i});
     }
@@ -981,20 +1047,32 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
             if (region.continuation) |value| value_used[@backingInt(value)] = true;
             if (region.else_value) |value| value_used[@backingInt(value)] = true;
         },
-        .loop_continue, .constant, .function_ref => {},
+        .capture_value, .capture_cell, .loop_continue, .constant, .function_ref => {},
+        .closure_init => |closure| for (closure.captures) |value| {
+            value_used[@backingInt(value)] = true;
+        },
     };
 
     const managed = needsRootFrame(ir, function);
+    if (usesClosures(ir)) try w.writeAll("    (void)nov_env_element;\n");
     if (managed) {
         // The embedded internal API also serves library emission, whose host
         // owns shutdown. Keep strict C11 unused-function warnings portable.
         try w.writeAll("    (void)nov_gc_register_globals; (void)nov_gc_unregister_globals; (void)nov_gc_shutdown; (void)nov_gc_pop; (void)nov_gc_alloc;\n    (void)nov_array_clone; (void)nov_array_index; (void)nov_array_append;\n");
-        var roots: usize = 0;
-        for (signature.params) |param| if (Ir.isManaged(ir.getType(param).?)) {
+        var roots: usize = @intFromBool(function.is_closure);
+        if (function.is_closure) try w.writeAll("    (void)nov_env;\n");
+        for (body.instructions, 0..) |instruction, i| {
+            if (!instruction.boxed) continue;
+            try w.print("    void *nov_cell_{d} = NULL;\n#define v{d} (*(", .{ i, i });
+            try writeType(ir, w, instruction.ty);
+            try w.print(" *)nov_cell_{d})\n", .{i});
+            roots += 1;
+        }
+        for (signature.params) |param| if (managedType(ir, ir.getType(param).?)) {
             roots = std.math.add(usize, roots, root_counts[@backingInt(param)]) catch return error.OutOfMemory;
         };
         for (body.instructions, 0..) |instruction, i| {
-            if (!Ir.isManaged(ir.getType(instruction.ty).?)) continue;
+            if (instruction.boxed or !managedType(ir, ir.getType(instruction.ty).?)) continue;
             try w.writeAll("    ");
             try writeType(ir, w, instruction.ty);
             try w.print(" v{d} = {{0}};\n", .{i});
@@ -1003,10 +1081,14 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
         // Stable function-scope void* fields, never casts from typed T** slots.
         if (roots != 0) {
             try w.writeAll("    void **nov_roots[] = {");
-            for (signature.params, 0..) |param, p| if (Ir.isManaged(ir.getType(param).?)) {
+            if (function.is_closure) try w.writeAll(" &nov_env,");
+            for (body.instructions, 0..) |instruction, i| if (instruction.boxed) {
+                try w.print(" &nov_cell_{d},", .{i});
+            };
+            for (signature.params, 0..) |param, p| if (managedType(ir, ir.getType(param).?)) {
                 try writeRoots(ir, root_counts, w, param, "p", p);
             };
-            for (body.instructions, 0..) |instruction, i| if (Ir.isManaged(ir.getType(instruction.ty).?)) {
+            for (body.instructions, 0..) |instruction, i| if (!instruction.boxed and managedType(ir, ir.getType(instruction.ty).?)) {
                 try writeRoots(ir, root_counts, w, instruction.ty, "v", i);
             };
             try w.print(" }};\n    nov_gc_roots nov_frame = {{0}};\n    nov_gc_push(&nov_rt_heap, &nov_frame, nov_roots, {d});\n", .{roots});
@@ -1028,7 +1110,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
             if (candidate.op == .loop) {
                 const region = candidate.op.loop;
                 if (region.condition_start == i) {
-                    if (ir.getType(candidate.ty).? != .void and !Ir.isManaged(ir.getType(candidate.ty).?)) {
+                    if (ir.getType(candidate.ty).? != .void and !managedType(ir, ir.getType(candidate.ty).?)) {
                         try w.writeAll("    ");
                         try writeType(ir, w, candidate.ty);
                         try w.print(" v{d};\n", .{end});
@@ -1045,7 +1127,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
                 const region = candidate.op.branch;
                 const has_value = ir.types.items[@backingInt(candidate.ty)] != .void;
                 if (region.then_start == i) {
-                    if (has_value and !Ir.isManaged(ir.getType(candidate.ty).?)) {
+                    if (has_value and !managedType(ir, ir.getType(candidate.ty).?)) {
                         try w.writeAll("    ");
                         try writeType(ir, w, candidate.ty);
                         try w.print(" v{d};\n", .{end});
@@ -1110,9 +1192,9 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
                 // pointer qualifier, so explicitly represent the absent successor.
                 try w.writeAll("{ ");
                 try writeType(ir, w, body.instructions[@backingInt(call.callee)].ty);
-                try w.print(" volatile nov_target = v{d};\n    nov_target(", .{@backingInt(call.callee)});
+                if (usesClosures(ir)) try w.print(" volatile nov_target = v{d};\n    nov_target.code(nov_target.env", .{@backingInt(call.callee)}) else try w.print(" volatile nov_target = v{d};\n    nov_target(", .{@backingInt(call.callee)});
                 for (call.args, 0..) |arg, index| {
-                    if (index != 0) try w.writeAll(", ");
+                    if (index != 0 or (usesClosures(ir) and sameFunction(ir.functions.items[@backingInt(target)], function))) try w.writeAll(", ");
                     try w.print("v{d}", .{@backingInt(arg)});
                 }
                 try w.writeAll(");\n    for (;;) {}\n    }\n");
@@ -1120,7 +1202,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
                 try writeScopedFunctionName(w, ir.functions.items[@backingInt(target)]);
                 try w.writeByte('(');
                 for (call.args, 0..) |arg, index| {
-                    if (index != 0) try w.writeAll(", ");
+                    if (index != 0 or (usesClosures(ir) and sameFunction(ir.functions.items[@backingInt(target)], function))) try w.writeAll(", ");
                     try w.print("v{d}", .{@backingInt(arg)});
                 }
                 try w.writeAll(");\n");
@@ -1191,12 +1273,54 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
             const read = instruction.op.union_payload;
             try w.print("    if (v{d}.tag != {d}) nov_rt_panic(\"inactive union payload\");\n", .{ @backingInt(read.base), read.index });
         }
+        if (instruction.boxed) {
+            if (instruction.op == .local_slot) {
+                try w.print("    nov_cell_{d} = nov_gc_alloc(&nov_rt_heap, &nov_element_{d});\n    v{d} = v{d};\n", .{ i, @backingInt(instruction.ty), i, @backingInt(instruction.op.local_slot) });
+            } else {
+                try w.print("    nov_cell_{d} = ((void **)nov_env)[{d}];\n", .{ i, instruction.op.capture_cell });
+            }
+            try w.print("    (void)nov_cell_{d};\n", .{i});
+            continue;
+        }
+        if (instruction.op == .capture_value) {
+            if (ty == .void) continue;
+            if (managedType(ir, ty)) try w.print("    v{d} = ", .{i}) else {
+                try w.writeAll("    const ");
+                try writeType(ir, w, instruction.ty);
+                try w.print(" v{d} = ", .{i});
+            }
+            try w.writeAll("*(");
+            try writeType(ir, w, instruction.ty);
+            try w.print(" *)((void **)nov_env)[{d}];\n    (void)v{d};\n", .{ instruction.op.capture_value, i });
+            continue;
+        }
+        if (instruction.op == .closure_init) {
+            const closure = instruction.op.closure_init;
+            const target = ir.getFunction(closure.function).?;
+            try w.print("    v{d}.code = ", .{i});
+            try writeScopedFunctionName(w, target);
+            try w.writeAll(";\n");
+            if (closure.captures.len != 0) {
+                try w.print("    v{d}.env = nov_gc_alloc_repeated(&nov_rt_heap, &nov_env_element, {d});\n", .{ i, closure.captures.len });
+                for (closure.captures, target.captures, 0..) |value, capture, c| {
+                    if (capture.mutable) {
+                        try w.print("    ((void **)v{d}.env)[{d}] = nov_cell_{d};\n", .{ i, c, @backingInt(value) });
+                    } else if (ir.getType(capture.ty).? != .void) {
+                        try w.print("    ((void **)v{d}.env)[{d}] = nov_gc_alloc(&nov_rt_heap, &nov_element_{d});\n    *(", .{ i, c, @backingInt(capture.ty) });
+                        try writeType(ir, w, capture.ty);
+                        try w.print(" *)((void **)v{d}.env)[{d}] = v{d};\n", .{ i, c, @backingInt(value) });
+                    }
+                }
+            }
+            try w.print("    (void)v{d};\n", .{i});
+            continue;
+        }
         if (ty == .void) {
             // Void values have no C object; emit their effects as statements.
             if (instruction.op == .print) try writePrint(ir, w, body, instruction.op.print);
             if (instruction.op == .call) {
                 try w.writeAll("    ");
-                try writeCall(w, instruction.op.call);
+                try writeCall(ir, w, instruction.op.call);
                 try w.writeAll(";\n");
             }
             continue;
@@ -1230,7 +1354,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
                     try w.writeAll("((nov_string *)");
                     try w.print("v{d}.data)[nov_array_index(v{d}, v{d})]", .{ @backingInt(r.array), @backingInt(r.array), @backingInt(r.index) });
                 },
-                .call => |call| try writeCall(w, call),
+                .call => |call| try writeCall(ir, w, call),
                 else => unreachable,
             }
             try w.writeAll(";\n");
@@ -1242,7 +1366,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
             if (!value_used[i] or instruction.op == .local_slot) try w.print("    (void)v{d};\n", .{i});
             continue;
         }
-        if (ty == .record) {
+        if (ty == .record or (ty == .function and usesClosures(ir))) {
             try w.print("    v{d} = ", .{i});
         } else {
             try w.writeAll(if (instruction.op == .local_slot) "    " else "    const ");
@@ -1303,7 +1427,12 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
             .constant => |id| try writeConstant(w, ir.constants.items[@backingInt(id)], ty),
             .parameter => |index| try w.print("p{d}", .{index}),
             .local_slot, .local_load => |value| try w.print("v{d}", .{@backingInt(value)}),
-            .function_ref => |id| try writeScopedFunctionName(w, ir.functions.items[@backingInt(id)]),
+            .function_ref => |id| {
+                if (usesClosures(ir)) {
+                    try w.print("(nov_fn_{d}){{nov_adapter_{d}, NULL}}", .{ @backingInt(instruction.ty), @backingInt(id) });
+                } else try writeScopedFunctionName(w, ir.functions.items[@backingInt(id)]);
+            },
+            .capture_value, .capture_cell, .closure_init => unreachable,
             .unary => |unary| switch (unary.op) {
                 .bool_not => try w.print("!v{d}", .{@backingInt(unary.operand)}),
                 .bit_not => {
@@ -1359,7 +1488,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
                 };
                 try w.print("v{d} {s} v{d}", .{ @backingInt(binary.lhs), operator, @backingInt(binary.rhs) });
             },
-            .call => |call| try writeCall(w, call),
+            .call => |call| try writeCall(ir, w, call),
             .string_slice, .assertion, .panic, .loop, .loop_break, .loop_continue, .return_value, .print, .short_circuit, .branch, .local_store => unreachable,
         }
         try w.writeAll(";\n");
@@ -1368,6 +1497,9 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
     const result_type = ir.types.items[@backingInt(signature.result)];
     if (managed and !Ir.terminates(body, body.result)) try w.writeAll("    nov_gc_pop(&nov_rt_heap, &nov_frame);\n");
     if (result_type != .void and !Ir.terminates(body, body.result)) try w.print("    return v{d};\n", .{@backingInt(body.result)});
+    for (body.instructions, 0..) |instruction, i| if (instruction.boxed) {
+        try w.print("#undef v{d}\n", .{i});
+    };
 }
 
 fn writeElementLayout(_: *const Ir, w: *std.Io.Writer, element: Ir.TypeId) WriteError!void {
@@ -1421,7 +1553,7 @@ fn writeArrayValue(ir: *const Ir, w: *std.Io.Writer, body: Ir.Body, instruction:
         },
         .parameter => |index| try w.print("p{d}", .{index}),
         .local_slot, .local_load => |value| try w.print("v{d}", .{@backingInt(value)}),
-        .call => |call| try writeCall(w, call),
+        .call => |call| try writeCall(ir, w, call),
         else => unreachable,
     }
     try w.writeAll(";\n");
@@ -1446,10 +1578,10 @@ fn writePrint(ir: *const Ir, w: *std.Io.Writer, body: Ir.Body, print: anytype) W
     if (print.newline) try w.writeAll("    nov_rt_check(fputc('\\n', stdout));\n");
 }
 
-fn writeCall(w: *std.Io.Writer, call: anytype) WriteError!void {
-    try w.print("v{d}(", .{@backingInt(call.callee)});
+fn writeCall(ir: *const Ir, w: *std.Io.Writer, call: anytype) WriteError!void {
+    if (usesClosures(ir)) try w.print("v{d}.code(v{d}.env", .{ @backingInt(call.callee), @backingInt(call.callee) }) else try w.print("v{d}(", .{@backingInt(call.callee)});
     for (call.args, 0..) |arg, i| {
-        if (i != 0) try w.writeAll(", ");
+        if (i != 0 or usesClosures(ir)) try w.writeAll(", ");
         try w.print("v{d}", .{@backingInt(arg)});
     }
     try w.writeByte(')');
@@ -1618,6 +1750,281 @@ test "rune stdout write and final flush failures use the existing panic contract
 }
 
 const test_gpa = std.testing.allocator;
+
+const closures_program =
+    \\let inferred=(value:int)->int {value+3}
+    \\let apply: (f: (int)->int, n:int)->int = f(n)
+    \\let ordinary: (n:int)->int = n+1
+    \\let make: (seed:int)->()->int = {
+    \\ let mut n=seed
+    \\ let inc=()->int {
+    \\ n+=1
+    \\ n
+    \\ }
+    \\ let shared=inc
+    \\ @println(shared())
+    \\ inc
+    \\}
+    \\let main:()={
+    \\ let double=(value:int)->int {value+value}
+    \\ let declared:(value:int)->int=value+4
+    \\ @println(apply(double,3),apply(ordinary,3),inferred(2),declared(2))
+    \\ let f=make(10)
+    \\ @println(f(),f())
+    \\ let mut a:[]int=[1,2]
+    \\ let snapshot=a
+    \\ let read=()->int {snapshot[0]}
+    \\ let write=() {a[0]=9}
+    \\ let other=()->int {a[0]}
+    \\ write()
+    \\ @println(read(),other(),a[0])
+    \\ let nested=()->()->int {()->int {a[0]}}
+    \\ let inner=nested()
+    \\ a[0]=7
+    \\ @println(inner())
+    \\}
+;
+
+test "closures snapshots shared escaping cells nested functions and forced GC" {
+    const c = try arrayTestProgram(closures_program);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "/* separate translation unit */\nint nov_test_dummy;\n", 0, "6 4 5 6\n11\n12 13\n1 9 9\n7\n", "", mode);
+}
+
+const closure_types_program =
+    \\let K=enum{first,second,}
+    \\let R=struct{s:string,n:int,}
+    \\let U=union{none,some:R,}
+    \\let identity:(n:int)->int=n
+    \\let factory:(s:string, r:R, u:U, a:[]R, flag:bool, rune_value:rune, kind:K, callback:(int)->int)->()->string={
+    \\ let bounds=0..2
+    \\ ()->string {
+    \\  loop i in bounds {@print(i)}
+    \\  @println(flag,rune_value,kind==K.second,callback(r.n),a[0].s)
+    \\  match u {
+    \\   .none=>s
+    \\   .some=>|v| s+v.s
+    \\  }
+    \\ }
+    \\}
+    \\let main=(){
+    \\ let f=factory("a"+"b", R[.s="r"+"!",.n=7], .some[R[.s="u"+"!",.n=8]], [R[.s="array"+"!",.n=9]], true, 'é', K.second, identity)
+    \\ @println(f())
+    \\ let mut s="old"+"!"
+    \\ let snapshot=s
+    \\ let nested=()->()->string {()->string {snapshot}}
+    \\ s="new"+"!"
+    \\ let inner=nested()
+    \\ @println(inner(),s)
+    \\ let mut target=()->int {1}
+    \\ let invoke=()->int {target()}
+    \\ let saved=target
+    \\ target=()->int {2}
+    \\ @println(invoke(),saved())
+    \\ let branch=(b:bool)->string {if b {snapshot} else {snapshot+"?"}}
+    \\ @println(branch(true),branch(false))
+    \\}
+;
+
+test "closures capture supported local types ranges function cells and private branches" {
+    const c = try arrayTestProgram(closure_types_program);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "01true é true 7 array!\nabu!\nold! new!\n2 1\nold! old!?\n", "", mode);
+}
+
+fn testClosureOwnership(allocator: std.mem.Allocator, source: []const u8) !void {
+    var lowered = blk: {
+        var module = try Module.init(allocator, "closures.nov", source);
+        defer module.deinit();
+        var result = try Lowering.lower(&module);
+        errdefer result.deinit();
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expect(result.lowering_complete);
+        break :blk result;
+    };
+    defer lowered.deinit();
+    try lowered.ir.verify();
+    const c = try emitProgram(allocator, &lowered.ir, null);
+    defer allocator.free(c);
+    try std.testing.expect(std.mem.indexOf(u8, c, "nov_env_element") != null);
+}
+
+test "closures own source free metadata and survive every compiler allocation failure" {
+    for ([_][]const u8{ closures_program, closure_types_program }) |source| {
+        try testClosureOwnership(test_gpa, source);
+        try TestAllocations.checkAllAllocationFailures(test_gpa, testClosureOwnership, .{source});
+    }
+}
+
+test "closures runtime OOM checks cells environments snapshots and allocation free copies" {
+    const allocating = [_][]const u8{
+        "let main:()={let mut n:int=1\nlet f=()->int {n}\n@println(f())}",
+        "let main:()={let n:int=1\nlet f=()->int {n}\n@println(f())}",
+        "let main:()={let a:[]int=[1]\nlet f=()->int {a[0]}\n@println(f())}",
+    };
+    for (allocating) |source| {
+        const library = try arrayTestProgram(source);
+        defer test_gpa.free(library);
+        // Fail at successive allocation sites, including the immutable capture
+        // box after the environment has already been rooted.
+        for (0..3) |limit| {
+            const prefix = try std.fmt.allocPrint(test_gpa, "#include <stdlib.h>\nstatic size_t count;\nstatic void *test_malloc(size_t n) {{if(count++ >= {d}) return NULL; return malloc(n);}}\n#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n", .{limit});
+            defer test_gpa.free(prefix);
+            const c = try std.mem.concat(test_gpa, u8, &.{ prefix, library });
+            defer test_gpa.free(c);
+            const needed: usize = if (std.mem.indexOf(u8, source, "[]int") != null) 5 else 2;
+            try compileAndRunExpected(c, "typedef int nonempty_translation_unit;", if (limit < needed) 1 else 0, if (limit < needed) "" else "1\n", if (limit < needed) "panic: GC allocation failed\n" else "");
+        }
+    }
+    const library = try emitSource("let take:(f:()->string)->()->string=f\nlet main:()={let s=\"shared\"\nlet f=()->string {s}\nlet g=take(f)\nlet h=g\n@println(h())}", null);
+    defer test_gpa.free(library);
+    const c = try std.mem.concat(test_gpa, u8, &.{ "#include <stdlib.h>\nstatic size_t count;\nstatic void *test_malloc(size_t n) {if(count++ >= 2) return NULL; return malloc(n);}\n#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n", library, "\nint main(void){nov_rt_heap.collect_every_allocation=1;nov_main();nov_gc_collect(&nov_rt_heap);if(nov_rt_heap.frames || nov_rt_heap.live_objects)return 70;nov_gc_shutdown(&nov_rt_heap);return 0;}\n" });
+    defer test_gpa.free(c);
+    try compileAndRunExpected(c, "typedef int nonempty_translation_unit;", 0, "shared\n", "");
+}
+
+test "closures support scoped borrows reference iteration and per iteration cells" {
+    const c = try arrayTestProgram(
+        \\let main=(){
+        \\ let inspect=(input:int)->int {let view=&input
+        \\  view}
+        \\ @println(inspect(4))
+        \\ let visit=(items:[]int){loop &element in items {@print(element)}}
+        \\ visit([1,2])
+        \\ @println()
+        \\ let mut values:[]int=[1,2]
+        \\ let change=(){loop &item in values {item+=1}}
+        \\ change()
+        \\ @println(values[0],values[1])
+        \\ let frozen=values
+        \\ let read=()->int {
+        \\  let view=&frozen[0]
+        \\  view
+        \\ }
+        \\ let read_loop=(){loop &item in frozen {@print(item)}}
+        \\ @println(read())
+        \\ read_loop()
+        \\ @println()
+        \\ let mut first:()->int=()->int {0}
+        \\ let mut last:()->int=()->int {0}
+        \\ loop i in @as(int,0)..2 {
+        \\  let mut value=i
+        \\  let next=()->int {value+=1
+        \\   value}
+        \\  if i==0 {first=next} else {last=next}
+        \\ }
+        \\ @println(first(),first(),last(),last())
+        \\}
+    );
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "4\n12\n2 3\n2\n23\n1 2 2 3\n", "", mode);
+}
+
+test "closures evaluate callees before arguments and retain replaced environments" {
+    const c = try arrayTestProgram(
+        \\let apply=(callback:(int)->int,input:int)->int {callback(input)}
+        \\let main=(){
+        \\ @println(apply((value:int)->int {value+1},2))
+        \\ @println(() -> int {7}())
+        \\ let saved="saved"+"!"
+        \\ let mut target=(suffix:string)->string {saved+suffix}
+        \\ @println(target({target=(suffix:string)->string {"wrong"}
+        \\  "?"+"!"}))
+        \\ @println(target("ignored"))
+        \\ let mut n:int=1
+        \\ let outer=()->(int)->int {@print("C")
+        \\  (add:int)->int {n+add}}
+        \\ @println(outer()({@print("A")
+        \\  n=5
+        \\  @as(int,2)}))
+        \\}
+    );
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "3\n7\nsaved!?!\nwrong\nCA7\n", "", mode);
+}
+
+test "closures trace shared function cycles and keep propagation scoped" {
+    const c = try arrayTestProgram(
+        \\let R=union{ok:int,err:string,}
+        \\let main=(){
+        \\ let mut next:()->int=()->int {0}
+        \\ next=()->int {if false {next()} else {7}}
+        \\ @println(next())
+        \\ let message="failure"+"!"
+        \\ let choose=(success:bool)->R {if success {.ok[1]} else {.err[message]}}
+        \\ let transform=(success:bool)->R {
+        \\  let value=choose(success).!
+        \\  .ok[value+1]
+        \\ }
+        \\ loop success in [true,false] {
+        \\  match transform(success) {
+        \\   .ok=>|value| @println(value)
+        \\   .err=>|error| @println(error)
+        \\  }
+        \\ }
+        \\}
+    );
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "7\n2\nfailure!\n", "", mode);
+}
+
+test "closures reject forged capture indices kinds sources and cell flags" {
+    var module = try Module.init(test_gpa, "captures.nov", "let main=(){let mut n:int=1\nlet frozen:int=2\nlet f=()->int {n+frozen}\n@println(f())}");
+    defer module.deinit();
+    var lowered = try Lowering.lower(&module);
+    defer lowered.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try lowered.ir.verify();
+    var checked: usize = 0;
+    for (lowered.ir.functions.items) |function| {
+        const instructions = @constCast(function.body.?.instructions);
+        for (instructions) |*instruction| {
+            const saved = instruction.*;
+            switch (instruction.op) {
+                .capture_value, .capture_cell => {
+                    if (instruction.op == .capture_value) instruction.op.capture_value = std.math.maxInt(u32) else instruction.op.capture_cell = std.math.maxInt(u32);
+                    try std.testing.expectError(error.InvalidOperation, emit(test_gpa, &lowered.ir, null));
+                    instruction.* = saved;
+                    instruction.op = if (saved.op == .capture_value) .{ .capture_cell = saved.op.capture_value } else .{ .capture_value = saved.op.capture_cell };
+                    try std.testing.expectError(error.InvalidOperation, emit(test_gpa, &lowered.ir, null));
+                    checked += 1;
+                },
+                .closure_init => {
+                    instruction.op.closure_init.captures = &.{};
+                    try std.testing.expectError(error.InvalidOperation, emit(test_gpa, &lowered.ir, null));
+                    checked += 1;
+                },
+                .local_slot => if (instruction.boxed) {
+                    instruction.boxed = false;
+                    try std.testing.expectError(error.InvalidOperation, emit(test_gpa, &lowered.ir, null));
+                    checked += 1;
+                },
+                else => {},
+            }
+            instruction.* = saved;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 4), checked);
+    try lowered.ir.verify();
+}
+
+test "inferred function declarations preserve noreturn and nested return scopes" {
+    const c = try arrayTestProgram(
+        \\@[export]
+        \\let exported=(n:int)->int {n+1}
+        \\@[noreturn]
+        \\let stop=(){
+        \\ let inner=()->int {return 7}
+        \\ let named:(n:int)->int={return n}
+        \\ @println(named(inner()))
+        \\ @panic("done")
+        \\}
+        \\let main=(){@println(exported(2))
+        \\ stop()}
+    );
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 1, "3\n7\n", "panic: done\n", mode);
+}
 
 const generic_union_program =
     \\let Result: (T: type, E: type) -> type = union { ok: T, err: E, }
@@ -5533,7 +5940,7 @@ test "string callback signatures need declarations but not a managed runtime" {
 test "generated string and rune programs compile for Windows with binary UTF8 output" {
     const zig_exe = std.testing.environ.getAlloc(test_gpa, "NOV_TEST_ZIG") catch try test_gpa.dupe(u8, "zig");
     defer test_gpa.free(zig_exe);
-    for ([_][]const u8{ string_example, string_interpolation, rune_program }) |source| {
+    for ([_][]const u8{ string_example, string_interpolation, rune_program, closures_program, closure_types_program }) |source| {
         var module = try Module.init(test_gpa, "windows.nov", source);
         defer module.deinit();
         var sema = try Lowering.lower(&module);

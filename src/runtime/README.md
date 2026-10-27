@@ -3,8 +3,9 @@
 `gc.h` is a standalone libc-only C11, nonmoving, single-threaded mark/sweep
 collector for **fixed-layout internal objects**. `GcRuntime.zig.source` embeds
 it conditionally for scalar/managed-array and immutable-string code generation alongside
-`array.h` and on-demand `string.h` concatenation helpers.
-Scalar-only emission is unchanged. Managed emission defines `NOV_GC_PANIC` as
+`array.h` and on-demand `string.h` concatenation helpers. Closure programs also
+use this collector for environments and captured cells.
+Scalar-only emission without closures is unchanged. Managed emission defines `NOV_GC_PANIC` as
 `nov_rt_panic` to share the emitted panic helper. The standalone
 fallback follows the existing contract: flush stdout, `panic: <message>\n` on
 stderr, exit 1. No external collector, finalizers, weak references, moving,
@@ -91,6 +92,28 @@ being dereferenced. This is not a memory-safety boundary: unregistered dangling
 roots, malformed metadata, cross-heap root record reuse and use-after-free outside
 tracing remain caller/compiler errors. A stale pointer whose address has been
 reused cannot be distinguished from a current allocation.
+
+## Closure environments and shared cells
+
+When a program contains closures, internal function values carry a
+code pointer and a real `void *env` field. Only `env` is traced; ordinary functions
+use adapters with NULL environments. The Nov function type and scalar foreign
+ABI are unchanged; function-valued foreign boundaries remain unsupported.
+
+Environments are repeated arrays of real `void *` fields, rooted before any
+capture allocation. Immutable captures use typed snapshot boxes (arrays clone
+at capture creation). Mutable captures point to shared typed cells: the defining
+local and all closures access the same GC allocation, never a stack address.
+Descriptors trace the managed fields of each box/cell, including nested record
+owners, array backing, strings and function environments. Cells created in loop
+iterations are distinct allocations. Unreachable environment/cell cycles are
+collected normally.
+
+Captured parameters, callee snapshots, closure results, environments under
+construction and boxed locals all follow the root discipline above. Copying a
+function value shares its environment without allocation. Borrowed capabilities
+cannot be captured; calls while shared captured storage is borrowed are rejected
+conservatively until effect summaries can establish disjoint access.
 
 ## Collection, OOM, shutdown
 

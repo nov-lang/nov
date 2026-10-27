@@ -37,10 +37,13 @@ pub const Function = struct {
     noreturn: bool = false,
     export_name: ?[]const u8 = null,
     extern_name: ?[]const u8 = null,
+    is_closure: bool = false,
+    captures: []const Capture = &.{},
 };
 /// `result` is either a continuing value or the final terminal instruction.
 pub const Body = struct { instructions: []const Instruction, result: ValueId };
-pub const Instruction = struct { ty: TypeId, span: Span, op: Operation };
+pub const Capture = struct { ty: TypeId, mutable: bool };
+pub const Instruction = struct { ty: TypeId, span: Span, op: Operation, boxed: bool = false };
 pub const UnaryOp = enum { negate, bit_not, bool_not };
 pub const BinaryOp = enum { add, sub, mul, div, mod, bit_and, bit_or, bit_xor, eq, ne, lt, le, gt, ge };
 pub const FieldRead = struct { base: ValueId, index: u32 };
@@ -117,6 +120,9 @@ pub const Operation = union(enum) {
         returns: bool = false,
     },
     // Slot identities are instruction IDs, but are not expression values.
+    closure_init: struct { function: FunctionId, captures: []const ValueId },
+    capture_value: u32,
+    capture_cell: u32,
     local_slot: ValueId,
     local_load: ValueId,
     local_store: struct { slot: ValueId, value: ValueId },
@@ -353,6 +359,7 @@ pub fn setFunctionBody(self: *Ir, id: FunctionId, instructions: []const Instruct
     }
     for (owned) |*instruction| {
         switch (instruction.op) {
+            .closure_init => |*closure| closure.captures = try self.allocator.dupe(ValueId, closure.captures),
             .call => |*call| call.args = try self.allocator.dupe(ValueId, call.args),
             .print => |*print| print.args = try self.allocator.dupe(ValueId, print.args),
             .assertion => |*assertion| assertion.location = try self.allocator.dupe(u8, assertion.location),
@@ -368,6 +375,7 @@ pub fn setFunctionBody(self: *Ir, id: FunctionId, instructions: []const Instruct
 
 fn freeOperands(self: *Ir, op: Operation) void {
     switch (op) {
+        .closure_init => |closure| self.allocator.free(closure.captures),
         .call => |call| self.allocator.free(call.args),
         .print => |print| self.allocator.free(print.args),
         .assertion => |assertion| self.allocator.free(assertion.location),
@@ -382,6 +390,7 @@ fn freeOperands(self: *Ir, op: Operation) void {
 pub fn clearFunctions(self: *Ir) void {
     for (self.functions.items) |function| {
         self.allocator.free(function.name);
+        self.allocator.free(function.captures);
         if (function.export_name) |name| self.allocator.free(name);
         if (function.extern_name) |name| self.allocator.free(name);
         if (function.body) |body| {
@@ -581,6 +590,12 @@ fn validateFunction(self: *const Ir, function: Function) VerifyError!void {
     const ty = self.getType(function.ty) orelse return error.InvalidTypeId;
     if (ty != .function) return error.InvalidFunctionType;
     try self.validateType(ty, self.types.items.len);
+    if (!function.is_closure and function.captures.len != 0) return error.InvalidFunctionType;
+    if (function.is_closure and (function.export_name != null or function.extern_name != null or function.is_test)) return error.InvalidForeignFunction;
+    for (function.captures) |capture| {
+        const captured = self.getType(capture.ty) orelse return error.InvalidTypeId;
+        if (capture.mutable and captured == .void) return error.InvalidOperation;
+    }
     if (function.is_test and (ty.function.params.len != 0 or self.getType(ty.function.result).? != .void or function.noreturn or function.export_name != null or function.extern_name != null)) return error.InvalidFunctionType;
     try self.validateSpan(function.span);
     if (function.noreturn and self.getType(ty.function.result).? != .void) return error.InvalidReturn;
@@ -612,7 +627,7 @@ fn exportScalar(self: *const Ir, id: TypeId, result: bool) bool {
 
 fn operandType(body: Body, id: ValueId, before: usize) VerifyError!TypeId {
     const ty = try regionOperandType(body, id, before, null);
-    if (body.instructions[@backingInt(id)].op == .local_slot) return error.InvalidValueId;
+    if (isSlot(body.instructions[@backingInt(id)])) return error.InvalidValueId;
     return ty;
 }
 
@@ -623,7 +638,7 @@ const Yield = struct { owner: usize, start: usize };
 fn regionOperandType(body: Body, id: ValueId, before: usize, yielding: ?Yield) VerifyError!TypeId {
     const index = @backingInt(id);
     if (index >= before or index >= body.instructions.len) return error.InvalidValueId;
-    if (yielding != null and body.instructions[index].op == .local_slot) return error.InvalidValueId;
+    if (yielding != null and isSlot(body.instructions[index])) return error.InvalidValueId;
     for (body.instructions, 0..) |instruction, owner| {
         var buffer: [4]Region = undefined;
         for (regions(instruction.op, owner, &buffer)) |region| {
@@ -686,9 +701,13 @@ fn regions(op: Operation, end: usize, buffer: *[4]Region) []const Region {
     }
 }
 
+pub fn isSlot(instruction: Instruction) bool {
+    return instruction.op == .local_slot or instruction.op == .capture_cell;
+}
+
 fn slotType(body: Body, id: ValueId, before: usize) VerifyError!TypeId {
     const ty = try regionOperandType(body, id, before, null);
-    if (body.instructions[@backingInt(id)].op != .local_slot) return error.InvalidOperation;
+    if (!isSlot(body.instructions[@backingInt(id)])) return error.InvalidOperation;
     return ty;
 }
 
@@ -789,7 +808,22 @@ fn validateBodyStructure(self: *const Ir, function: Function, body: Body) Verify
             }
             if (i + 1 != region_end or @backingInt(result) != i) return error.UnreachableInstruction;
         }
+        if (instruction.boxed and instruction.op != .local_slot and instruction.op != .capture_cell) return error.InvalidOperation;
         switch (instruction.op) {
+            .closure_init => |closure| {
+                const target = self.getFunction(closure.function) orelse return error.InvalidFunctionId;
+                if (!target.is_closure or target.ty != instruction.ty or closure.captures.len != target.captures.len) return error.InvalidOperation;
+                for (closure.captures, target.captures) |value, capture| {
+                    if (capture.mutable) {
+                        if (try slotType(body, value, i) != capture.ty or !body.instructions[@backingInt(value)].boxed) return error.InvalidOperation;
+                    } else if (try operandType(body, value, i) != capture.ty) return error.OperandTypeMismatch;
+                }
+            },
+            .capture_value, .capture_cell => |index| {
+                if (!function.is_closure or index >= function.captures.len) return error.InvalidOperation;
+                const capture = function.captures[index];
+                if (capture.ty != instruction.ty or capture.mutable != (instruction.op == .capture_cell) or capture.mutable != instruction.boxed) return error.InvalidOperation;
+            },
             .borrow_reserve => |slot| {
                 if (ty != .void) return error.InvalidOperation;
                 const owner = self.getType(try slotType(body, slot, i)).?;
@@ -1020,7 +1054,7 @@ fn validateBodyStructure(self: *const Ir, function: Function, body: Body) Verify
             .function_ref => |id| {
                 const referenced = self.getFunction(id) orelse return error.InvalidFunctionId;
                 try self.validateFunction(referenced);
-                if (referenced.is_test) return error.InvalidOperation;
+                if (referenced.is_test or referenced.is_closure) return error.InvalidOperation;
                 if (referenced.ty != instruction.ty) return error.OperandTypeMismatch;
             },
             .unary => |unary| {

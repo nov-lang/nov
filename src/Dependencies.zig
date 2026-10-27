@@ -83,7 +83,7 @@ fn scanInitializer(self: *Dependencies, module: *Module, id: Module.DeclId, work
     }
     // A named function declaration creates a function value; its body is not
     // evaluated while creating it. Signatures and bodies are checked later.
-    if (full.ast.type_node != 0 and ast.fullFnProto(full.ast.type_node) != null) return;
+    if (ast.declFunction(declaration.node) != null) return;
     work.clearRetainingCapacity();
     try work.append(self.allocator, full.ast.init_node);
     while (work.pop()) |node| {

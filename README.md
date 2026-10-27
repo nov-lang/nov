@@ -17,7 +17,8 @@ Nov has automatic memory management via a minimal tracing GC.
 Requires Zig 0.17.0.
 
 Growable arrays use an internal libc-only nonmoving mark/sweep GC. The
-runtime is emitted only for managed values; scalar-only programs stay unchanged.
+runtime is emitted for managed values and closures; programs using only scalars
+and ordinary functions retain scalar-only emission.
 See the [runtime API and root discipline](src/runtime/README.md) for layout, C
 boundary, OOM, testing, and unsupported-reference contracts. Array slicing, nested arrays,
 and general aliases remain deferred; bounded local array-element borrowing is
@@ -271,8 +272,9 @@ as annotated arrays. See [examples/inferred-locals.nov](examples/inferred-locals
 
 Explicit annotations remain supported, including immutable `void` values and
 function values with unnamed parameter types (e.g. `let callback: (int) -> int = twice`).
-Inferred `void` locals, named local function definitions/closures, labels and
-other managed types remain unsupported. Mutable locals use `let mut` and support
+Function expressions and nonrecursive local function definitions support automatic
+captures, as described under [Functions](#functions). Inferred `void` locals,
+labels and other managed types remain unsupported. Mutable locals use `let mut` and support
 `bool`, integer, rune, string, existing function and scalar-array values (not `void`). Direct
 identifier assignment (`n = value`) and integer-only `+=`, `-=`, `*=`, `/=`, `%=`
 return `void`; a block ending in assignment therefore also returns `void`.
@@ -584,6 +586,68 @@ Doc comments are used to automatically generate documentation.
 Nov functions can be understood as lazy or postponed expressions that takes parameters.
 
 Parameters are immutable by default.
+
+### Function expressions and closures
+
+A function expression places its block directly after the signature, without `=`:
+
+```nov
+let double = (value: int) -> int { value * 2 }
+
+let makeAdder = (base: int) -> (int) -> int {
+    (value: int) -> int { base + value }
+}
+
+let addFive = makeAdder(5)
+@println(addFive(3)) ; 8
+```
+
+The binding infers the function type. Parameters still need names and explicit
+types; omitting the return annotation means `void`, not inferred return typing.
+`let printHello = () { @println("hello") }` is therefore a void function.
+Existing `let double: (value: int) -> int = value * 2` declarations remain valid.
+The new form also works for module functions, methods and `@[test]` functions.
+
+Referenced outer bindings are captured automatically when the function expression
+is evaluated:
+
+- Immutable bindings and parameters capture readonly snapshots. Arrays receive
+  independent backing storage; records copy by value and immutable strings share.
+- Mutable bindings capture shared GC-managed cells. The outer binding and every
+  capturing closure observe the same updates, even after the defining function
+  returns. This does not turn ordinary array reads/assignments into aliases.
+- Copying or passing a function value shares its environment and captured cells;
+  it does not repeat capture evaluation or deep-copy the environment.
+- Captures propagate through nested closures. GC retains environments, cells and
+  their managed contents; no stack reference escapes.
+
+```nov
+let mut count: uint = 0
+let increment = () { count += 1 }
+increment()
+@println(count) ; 1
+count = 10
+increment()
+@println(count) ; 11
+
+let saved = count
+let snapshot = () -> uint { saved } ; explicitly take a readonly snapshot
+```
+
+Captured mutable cells are shared state, **not** exclusive scoped `&local` loans.
+Borrowed bindings cannot be captured. Scoped borrows of captured values remain
+possible inside a closure, but calls while a loan of shared captured storage is
+live are conservatively rejected: the callee could access the same cell. Calls
+are also rejected during ordinary iteration over a mutable array already captured
+by a closure. These restrictions await interprocedural effect analysis.
+
+Functions may be returned, passed, assigned, and selected by control flow using
+exact existing function types. Recursive local definitions, escaping reference
+capabilities, function-valued fields/array elements, and function-valued C ABI
+boundaries remain unsupported. Shared captures are single-threaded; no concurrency
+semantics are introduced. See [`examples/closures.nov`](examples/closures.nov).
+
+### Other function syntax
 
 Parenthesis are specific to functions, whenever there is a parenthesis there is a function involved.
 ```nov
@@ -1391,7 +1455,7 @@ changed.score += 1
   or reference-invalidation checks, and no interior pointer is traced by GC.
 - The reference capability cannot escape or be rebound; ordinary copied pointee
   values may be returned, passed or stored. Void has no borrowable storage. Nonlocal
-  sources, explicit pointer annotations, reborrows, closure captures, temporary
+  sources, explicit pointer annotations, reborrows, captures of borrowed bindings, temporary
   owners and general pointer APIs remain unsupported. Array-valued struct fields,
   nested arrays and other unsupported value types are not enabled by borrowing.
 - Normal array snapshots/copies remain independent, including snapshots evaluated

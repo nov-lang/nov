@@ -521,6 +521,10 @@ fn renderExpression(self: *Render, node: Ast.Node.Index, space: Space) RenderErr
             @panic("TODO");
         },
 
+        .function_expr => {
+            try self.renderExpression(datas[node].lhs, .space);
+            return self.renderExpression(datas[node].rhs, space);
+        },
         .fn_proto_one, .fn_proto => {
             const proto = ast.fullFnProto(node).?;
             // The return type can itself contain delimiters, so find this

@@ -607,6 +607,7 @@ pub fn firstToken(self: Ast, node: Node.Index) TokenIndex {
         .builtin_literal,
         .fn_proto_one,
         .fn_proto,
+        .function_expr,
         .attr_one,
         .attr,
         .array_type,
@@ -809,6 +810,9 @@ pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
         .array_init_two_comma,
         => return self.matchingDelimiter(main_tokens[n]) + end_offset,
 
+        .function_expr => {
+            n = datas[n].rhs;
+        },
         .fn_proto_one,
         .fn_proto,
         => {
@@ -1166,6 +1170,22 @@ pub fn fullIf(self: Ast, node: Node.Index) ?full.If {
         .if_else => self.ifElse(node),
         else => null,
     };
+}
+
+/// Declaration bodies share one semantic view without rewriting expression syntax.
+pub fn declFunction(self: Ast, node: Node.Index) ?struct { proto_node: Node.Index, body: Node.Index } {
+    const declaration = self.decl(node).ast;
+    if (self.fullFnProto(declaration.type_node) != null) return .{ .proto_node = declaration.type_node, .body = declaration.init_node };
+    if (declaration.type_node == 0 and declaration.init_node != 0) {
+        if (self.functionExpr(declaration.init_node)) |function| return .{ .proto_node = function.proto.ast.proto_node, .body = function.body };
+    }
+    return null;
+}
+
+pub fn functionExpr(self: Ast, node: Node.Index) ?struct { proto: full.FnProto, body: Node.Index } {
+    if (self.nodes.items(.tag)[node] != .function_expr) return null;
+    const data = self.nodes.items(.data)[node];
+    return .{ .proto = self.fullFnProto(data.lhs).?, .body = data.rhs };
 }
 
 pub fn fullFnProto(self: Ast, node: Node.Index) ?full.FnProto {
@@ -1632,6 +1652,8 @@ pub const Node = struct {
         /// lhs and rhs can be omitted.
         /// main_token is the `(`.
         fn_proto_one,
+        /// Anonymous function: lhs prototype, rhs block body.
+        function_expr,
         /// `(a: b, c: d) -> rhs`. `SubRange[lhs]`.
         /// rhs can be omitted.
         /// main_token is the `(`

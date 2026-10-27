@@ -500,7 +500,7 @@ fn collectDeclaration(self: *Module, node: Ast.Node.Index, container: ?DeclId) (
                     try self.diagnostics.append(self.allocator, .{ .tag = invalid_attribute, .span = span });
                     continue;
                 }
-                if (container != null or declaration.ast.is_mutable or is_record or is_generic or (if (external) declaration.ast.init_node != 0 else declaration.ast.init_node == 0) or self.source.ast.fullFnProto(declaration.ast.type_node) == null) {
+                if (container != null or declaration.ast.is_mutable or is_record or is_generic or (if (external) declaration.ast.init_node != 0 else declaration.ast.init_node == 0) or self.source.ast.declFunction(node) == null) {
                     try self.diagnostics.append(self.allocator, .{ .tag = invalid_declaration, .span = span });
                     continue;
                 }
@@ -535,11 +535,11 @@ fn collectDeclaration(self: *Module, node: Ast.Node.Index, container: ?DeclId) (
                 }
             } else if (self.source.ast.nodes.items(.tag)[attribute] == .attr_one and data.rhs == 0 and std.mem.eql(u8, self.source.ast.tokenSlice(data.lhs), "public") and !declaration.ast.is_mutable and !public) {
                 public = true;
-            } else if (self.source.ast.nodes.items(.tag)[attribute] == .attr_one and data.rhs == 0 and std.mem.eql(u8, self.source.ast.tokenSlice(data.lhs), "noreturn") and self.source.ast.fullFnProto(declaration.ast.type_node) != null and !declaration.ast.is_mutable and !noreturn_annotation) {
+            } else if (self.source.ast.nodes.items(.tag)[attribute] == .attr_one and data.rhs == 0 and std.mem.eql(u8, self.source.ast.tokenSlice(data.lhs), "noreturn") and self.source.ast.declFunction(node) != null and !declaration.ast.is_mutable and !noreturn_annotation) {
                 noreturn_annotation = true;
             } else try self.diagnostics.append(self.allocator, .{ .tag = .unsupported_attribute, .span = self.tokenSpan(self.source.ast.firstToken(attribute)) });
         }
-        if (is_test and (container != null or declaration.ast.is_mutable or is_record or is_generic or declaration.ast.init_node == 0 or self.source.ast.fullFnProto(declaration.ast.type_node) == null or export_seen or extern_seen or noreturn_annotation))
+        if (is_test and (container != null or declaration.ast.is_mutable or is_record or is_generic or declaration.ast.init_node == 0 or self.source.ast.declFunction(node) == null or export_seen or extern_seen or noreturn_annotation))
             try self.diagnostics.append(self.allocator, .{ .tag = .invalid_test_declaration, .span = name_span });
         try self.declarations.append(self.allocator, .{ .is_test = is_test, .name = name, .name_span = name_span, .node = node, .container = container, .is_record = is_record, .is_generic = is_generic, .is_type_alias = is_record or is_this_alias, .public = public, .noreturn = noreturn_annotation, .export_name = export_name, .extern_name = extern_name });
     }

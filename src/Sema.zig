@@ -87,6 +87,8 @@ fn analyzeModuleAnnotations(result: *Sema, module: *Module) Error!void {
         const declaration = module.declarations.items[i];
         if (declaration.concrete_type != null or (declaration.is_test and !module.testEnabled())) continue;
         const full = module.source.ast.decl(declaration.node);
+        const function = module.source.ast.declFunction(declaration.node);
+        const type_node = if (function) |f| f.proto_node else full.ast.type_node;
         if (declaration.is_namespace) {
             result.entries[result.entryIndex(module, @fromBackingInt(@intCast(i)))].status = .namespace;
             continue;
@@ -101,7 +103,7 @@ fn analyzeModuleAnnotations(result: *Sema, module: *Module) Error!void {
             result.entries[result.entryIndex(module, @fromBackingInt(@intCast(i)))].status = .type_alias;
             continue;
         }
-        if (declaration.container != null and (full.ast.is_mutable or module.source.ast.fullFnProto(full.ast.type_node) == null)) {
+        if (declaration.container != null and (full.ast.is_mutable or function == null)) {
             try module.diagnostics.append(module.allocator, .{ .tag = .unsupported_declaration, .span = declaration.name_span });
             result.entries[result.entryIndex(module, @fromBackingInt(@intCast(i)))].status = .failed;
             continue;
@@ -116,16 +118,16 @@ fn analyzeModuleAnnotations(result: *Sema, module: *Module) Error!void {
             result.entries[result.entryIndex(module, @fromBackingInt(@intCast(i)))].status = if (result.entries[result.entryIndex(module, @fromBackingInt(@intCast(i)))].alias_type != null) .type_alias else .failed;
             continue;
         }
-        if (full.ast.type_node == 0) {
+        if (type_node == 0) {
             if (!full.ast.is_mutable and full.ast.init_node != 0) try result.checkScalarGlobal(module, i, full.ast.init_node, null);
             continue;
         }
-        const type_id = (try TypeResolver.resolveInContainer(module, &result.ir, full.ast.type_node, declaration.container, declaration.concrete_type)) orelse {
+        const type_id = (try TypeResolver.resolveInContainer(module, &result.ir, type_node, declaration.container, declaration.concrete_type)) orelse {
             result.entries[result.entryIndex(module, @fromBackingInt(@intCast(i)))].status = .failed;
             continue;
         };
         result.entries[result.entryIndex(module, @fromBackingInt(@intCast(i)))].type_id = type_id;
-        if (module.source.ast.fullFnProto(full.ast.type_node) != null) {
+        if (function != null) {
             if (declaration.is_test) {
                 const signature = result.ir.getType(type_id).?.function;
                 if (signature.params.len != 0 or result.ir.getType(signature.result).? != .void) {
@@ -431,8 +433,8 @@ pub fn requestType(self: *Sema, module: *Module, id: Module.DeclId) Ir.BuildErro
     // Failed speculative requests must be retried: probes may discard their
     // diagnostics. The worklist performs a final, non-speculative request too.
     self.entries[self.entryIndex(module, @fromBackingInt(@intCast(index)))].status = .requested;
-    const full = module.source.ast.decl(declaration.node).ast;
-    const ty = (try TypeResolver.resolveInContainer(module, &self.ir, full.type_node, declaration.container, declaration.concrete_type)) orelse return null;
+    const function = module.source.ast.declFunction(declaration.node) orelse return null;
+    const ty = (try TypeResolver.resolveInContainer(module, &self.ir, function.proto_node, declaration.container, declaration.concrete_type)) orelse return null;
     try self.syncEntries(module);
     if (declaration.noreturn and self.ir.getType(self.ir.getType(ty).?.function.result).? != .void) {
         try module.diagnostics.append(module.allocator, .{ .tag = .noreturn_result, .span = declaration.name_span });

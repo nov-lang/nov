@@ -1828,6 +1828,48 @@ test "successful empty lowering is distinct from source-error rollback" {
     try std.testing.expectEqual(@as(usize, 0), failure.ir.functions.items.len);
 }
 
+fn testClosureRejection(allocator: std.mem.Allocator, source: []const u8) !void {
+    var module = try Module.init(allocator, "closure-rejection.nov", source);
+    defer module.deinit();
+    errdefer if (module.source.ast.errors.len != 0) std.debug.print("closure rejection parse errors: {any}\n{s}\n", .{ module.source.ast.errors, source });
+
+    try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
+    var result = lower(&module) catch |err| {
+        try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+        return err;
+    };
+    defer result.deinit();
+    try std.testing.expect(module.hasErrors());
+    try std.testing.expect(!result.lowering_complete);
+    try std.testing.expectEqual(@as(usize, 0), result.ir.functions.items.len);
+}
+
+test "closures reject borrowed captures recursion inferred parameters foreign ABI and unsupported containers under OOM" {
+    for ([_][]const u8{
+        "let main:()={let mut n:int=1\nlet b=&n\nlet f=()->int {b}\n}",
+        "let main:()={let f=(n:int)->int {f(n)}\n}",
+        "let main:()={let f:(n:int)->int=f(n)\n}",
+        "let main:()={let f=(int)->int {1}\n}",
+        "let main:()={let f=(n:int)->int {true}\n}",
+        "let main:()={let f=()->int {break}\n}",
+        "let main:()={let f=()->int {unknown}\n}",
+        "@[extern(\"callback\")]\nlet foreign:(f:()->int)->int\nlet main:()={let f=()->int {1}\n@println(foreign(f))}",
+        "@[export]\nlet foreign:(f:()->int)->int=f()",
+        "let R=struct{f:()->int,}\nlet main:()={}",
+        "let main:()={let a:[]()->int=[]\n}",
+        "let main:()={let mut n:int=0\nlet f=()->int {n}\nlet b=&n\n@println(f(),b)}",
+        "let main:()={let mut n:int=0\nlet b=&n\nlet f=()->int {n}\n@println(b)}",
+        "let main=(){let n:int=1\nlet f=(n:int)->int {n}\n}",
+        "let main=(){let n:int=1\nlet f=()->int {let n:int=2\nn}\n}",
+        "let main=(){let mut values:[]int=[1]\nlet change=(){values[0]+=1}\nloop item in values {change()}}",
+        "let main=(){let mut values:[]int=[1]\nlet change=(){values[0]+=1}\nloop &item in values {change()\nitem+=1}}",
+        "let main=(){let mut values:[]int=[1]\nloop &item in values {let read=()->int {item}\n}}",
+    }) |source| {
+        try testClosureRejection(std.testing.allocator, source);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testClosureRejection, .{source});
+    }
+}
+
 fn testAllocationFailures(allocator: std.mem.Allocator, source: []const u8) !void {
     var module = try Module.init(allocator, "oom.nov", source);
     defer module.deinit();

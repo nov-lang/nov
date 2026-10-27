@@ -136,6 +136,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const iteration_tests = b.step("test-cli-iteration", "Run array and Unicode string iteration CLI tests");
     addIterationCliTests(b, exe, iteration_tests);
     test_step.dependOn(iteration_tests);
+    const closure_tests = b.step("test-cli-closures", "Run function expression and closure CLI tests");
+    addClosureCliTests(b, exe, closure_tests);
+    test_step.dependOn(closure_tests);
     addFieldMutationCliTests(b, exe, test_step, fixtures);
     addGenericStructCliTests(b, exe, test_step, fixtures);
     addRangeValueCliTests(b, exe, test_step, fixtures);
@@ -1106,6 +1109,64 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
                 }
             }
         }
+    }
+}
+
+fn addClosureCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    const fixtures = b.addWriteFiles();
+    _ = fixtures.add("closures.nov", @embedFile("examples/closures.nov"));
+    _ = fixtures.add("factory.nov", "@[public]\nlet counter=()->()->uint {let mut n:uint=0\n()->uint {n+=1\nn}}\n");
+    _ = fixtures.add("imported.nov", "let api=@import(\"factory.nov\")\nlet main=(){let next=api.counter()\n@println(next(),next())}\n");
+    _ = fixtures.add("excluded.nov", "@[test]\nlet ignored = (bad: Missing) {unknown()}\nlet main = () {let f = () -> int {7}\n@assert(f() == 7)}\n");
+    for ([_][]const u8{ "fmt", "semantic" }) |mode| {
+        const run = b.addRunArtifact(exe);
+        run.step.name = b.fmt("CLI closures: example {s}", .{mode});
+        run.setCwd(fixtures.getDirectory());
+        run.addArgs(if (std.mem.eql(u8, mode, "fmt")) &.{ "fmt", "--check", "closures.nov" } else &.{ "check", "--semantic", "closures.nov" });
+        run.expectExitCode(0);
+        run.expectStdOutEqual("");
+        run.expectStdErrEqual("");
+        test_step.dependOn(&run.step);
+    }
+    for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+        for ([_][]const u8{ "run", "test", "excluded", "imported" }) |command| {
+            const run = b.addRunArtifact(exe);
+            run.step.name = b.fmt("CLI closures: {s} ({s})", .{ command, mode });
+            run.setCwd(fixtures.getDirectory());
+            run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+            run.setEnvironmentVariable("NOV_CC", "");
+            run.setEnvironmentVariable("CC", "");
+            const excluded = std.mem.eql(u8, command, "excluded");
+            const tests = std.mem.eql(u8, command, "test");
+            const imported = std.mem.eql(u8, command, "imported");
+            run.addArgs(&.{ if (tests) "test" else "run", if (excluded) "excluded.nov" else if (imported) "imported.nov" else "closures.nov" });
+            if (mode.len != 0) run.addArg(mode);
+            run.expectExitCode(0);
+            run.expectStdOutEqual(if (excluded) "" else if (imported) "1 2\n" else if (tests)
+                "PASS escaping_snapshot\nPASS shared_counter\nPASS outer_updates\nPASS array_copies\nPASS generic_method\nPASS nested_capture\n6 passed; 0 failed; 6 total\n"
+            else
+                "5 + 3 = 8\nShared counter: 1 2 3\nSnapshot: 1 Current: 2\n");
+            run.expectStdErrEqual("");
+            test_step.dependOn(&run.step);
+        }
+    }
+    for ([_]struct { name: []const u8, source: []const u8, diagnostic: []const u8 }{
+        .{ .name = "borrow", .source = "let main=(){let mut n:int=1\nlet view=&n\nlet f=()->int {view}\n}\n", .diagnostic = "borrow requires" },
+        .{ .name = "recursion", .source = "let main=(){let f=(n:int)->int {f(n)}\n}\n", .diagnostic = "unknown name 'f'" },
+        .{ .name = "parameter", .source = "let main=(){let f=(int)->int {1}\n}\n", .diagnostic = "function parameters need names and types" },
+        .{ .name = "foreign", .source = "@[export]\nlet callback=(f:()->int)->int {f()}\n", .diagnostic = "export ABI supports only" },
+        .{ .name = "loan-call", .source = "let main=(){let mut n:int=0\nlet f=()->int {n}\nlet view=&n\n@println(f(),view)}\n", .diagnostic = "owner access conflicts with a live borrow" },
+    }) |case| {
+        const source = b.fmt("invalid-{s}.nov", .{case.name});
+        _ = fixtures.add(source, case.source);
+        const run = b.addRunArtifact(exe);
+        run.step.name = b.fmt("CLI closures: reject {s}", .{case.name});
+        run.setCwd(fixtures.getDirectory());
+        run.addArgs(&.{ "check", "--semantic", source });
+        run.expectExitCode(1);
+        run.expectStdOutEqual("");
+        run.expectStdErrMatch(case.diagnostic);
+        test_step.dependOn(&run.step);
     }
 }
 

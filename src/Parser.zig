@@ -607,6 +607,13 @@ fn expectPrefixExpr(self: *Parser, allow_block_label: bool) Error!Node.Index {
 // KEYWORD_resume Expr
 fn parsePrimaryExpr(self: *Parser, allow_block_label: bool) Error!Node.Index {
     switch (self.token_tags[self.tok_i]) {
+        .l_paren => {
+            const proto = try self.parseFnProto();
+            if (self.token_tags[self.tok_i] != .l_brace) return proto;
+            const body = try self.parseBlock();
+            const function = try self.addNode(.{ .tag = .function_expr, .main_token = self.nodes.items(.main_token)[proto], .data = .{ .lhs = proto, .rhs = body } });
+            return self.parseSuffixFrom(function);
+        },
         .keyword_if => return self.parseIfExpr(),
         .octothorpe => return self.addNode(.{
             .tag = .@"comptime",
@@ -1207,7 +1214,11 @@ fn expectCallArg(self: *Parser) Error!Node.Index {
 /// SuffixExpr <- PrimaryTypeExpr (SuffixOp / FnCallArguments)*
 /// FnCallArguments <- LPAREN ExprList RPAREN
 fn parseSuffixExpr(self: *Parser) Error!Node.Index {
-    var res = try self.parsePrimaryTypeExpr();
+    return self.parseSuffixFrom(try self.parsePrimaryTypeExpr());
+}
+
+fn parseSuffixFrom(self: *Parser, primary: Node.Index) Error!Node.Index {
+    var res = primary;
     if (res == null_node) {
         return null_node;
     }
@@ -1884,6 +1895,36 @@ fn testParseAllocationFailures(allocator: Allocator, source: [:0]const u8) !void
     defer ast.deinit(allocator);
     try std.testing.expectEqual(Token.Tag.eof, ast.tokens.items(.tag)[ast.tokens.len - 1]);
     try std.testing.expectEqual(source.len, ast.tokens.items(.start)[ast.lastToken(0)]);
+}
+
+test "closures preserve function expression views delimiters comments and parser OOM" {
+    const source = "let make=(base:int)->(int)->int {\n; capture\n(value:int)->int {base+value}\n}\nlet instant=()->int {7}()\n";
+    var ast = try parse(std.testing.allocator, source);
+    defer ast.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    const declaration = ast.rootDecls()[0];
+    const node = ast.decl(declaration).ast.init_node;
+    const function = ast.functionExpr(node).?;
+    try std.testing.expectEqual(function.proto.ast.proto_node, ast.declFunction(declaration).?.proto_node);
+    try std.testing.expectEqual(function.body, ast.declFunction(declaration).?.body);
+    try std.testing.expectEqualStrings("(", ast.tokenSlice(ast.firstToken(node)));
+    try std.testing.expectEqualStrings("}", ast.tokenSlice(ast.lastToken(node)));
+    var buffer: [2]Node.Index = undefined;
+    const inner = ast.fullBlock(&buffer, function.body).?.ast.statements[0];
+    try std.testing.expect(ast.functionExpr(inner) != null);
+    const immediate = ast.fullCall(ast.decl(ast.rootDecls()[1]).ast.init_node).?;
+    try std.testing.expect(ast.functionExpr(immediate.ast.fn_expr) != null);
+    try std.testing.expectEqualStrings(")", ast.tokenSlice(ast.lastToken(ast.decl(ast.rootDecls()[1]).ast.init_node)));
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
+    for ([_][:0]const u8{
+        "let f=()->int {", "let f=(x:int)->int {return", "let f=(x:)->int {}", "let f=()->int {()->int {",
+    }) |broken| {
+        var recovered = try parse(std.testing.allocator, broken);
+        defer recovered.deinit(std.testing.allocator);
+        try std.testing.expect(recovered.errors.len != 0);
+        try std.testing.expectEqual(Token.Tag.eof, recovered.tokens.items(.tag)[recovered.lastToken(0)]);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{broken});
+    }
 }
 
 test "string slicing parser accessors delimiters and OOM" {

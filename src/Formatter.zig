@@ -82,6 +82,7 @@ fn checkSupported(ast: Ast) !void {
         .decl,
         .fn_proto_one,
         .fn_proto,
+        .function_expr,
         .call_one,
         .call_one_comma,
         .call,
@@ -170,7 +171,7 @@ fn checkSupported(ast: Ast) !void {
                 for (ast.fullStruct(@intCast(i)).?) |member| {
                     if (ast.nodes.items(.tag)[member] == .container_field) continue;
                     const declaration = ast.fullDecl(member) orelse return error.UnsupportedSyntax;
-                    if (!TypeResolver.isThisAlias(&ast, member) and (declaration.ast.is_mutable or declaration.ast.type_node == 0 or ast.fullFnProto(declaration.ast.type_node) == null)) return error.UnsupportedSyntax;
+                    if (!TypeResolver.isThisAlias(&ast, member) and (declaration.ast.is_mutable or ast.declFunction(member) == null)) return error.UnsupportedSyntax;
                 }
             },
             .container_field => if (data.lhs != 0) {
@@ -584,19 +585,19 @@ test "executable local blocks round trip" {
 
 test "every unsupported AST tag is rejected before rendering" {
     const supported = [_]Ast.Node.Tag{
-        .root,            .decl,           .identifier,     .number_literal,       .char_literal,    .string_literal,
-        .add,             .sub,            .mul,            .div,                  .mod,             .shl,
-        .shr,             .bit_and,        .bit_or,         .bit_xor,              .equal_equal,     .bang_equal,
-        .less_than,       .less_or_equal,  .greater_than,   .greater_or_equal,     .bool_and,        .bool_or,
-        .ref_of,          .negation,       .bool_not,       .bit_not,              .fn_proto_one,    .fn_proto,
-        .call_one,        .call_one_comma, .call,           .call_comma,           .block_two,       .block_two_newline,
-        .block,           .block_newline,  .@"if",          .if_else,              .range,           .loop_range,
-        .loop_condition,  .loop_cont,      .loop_else,      .@"return",            .@"break",        .@"continue",
-        .assign,          .assign_add,     .assign_sub,     .assign_mul,           .assign_div,      .assign_mod,
-        .builtin_literal, .array_type,     .array_init_two, .array_init_two_comma, .array_init,      .array_init_comma,
-        .array_access,    .slice,          .field_access,   .in,                   .match,           .match_case_one,
-        .match_case,      .function_pipe,  .container_decl, .container_decl_arg,   .container_field, .unwrap,
-        .enum_literal,    .attr_one,       .attr_decl_one,  .attr_decl,
+        .root,              .decl,            .identifier,     .number_literal,   .char_literal,         .string_literal,
+        .add,               .sub,             .mul,            .div,              .mod,                  .shl,
+        .shr,               .bit_and,         .bit_or,         .bit_xor,          .equal_equal,          .bang_equal,
+        .less_than,         .less_or_equal,   .greater_than,   .greater_or_equal, .bool_and,             .bool_or,
+        .ref_of,            .negation,        .bool_not,       .bit_not,          .fn_proto_one,         .fn_proto,
+        .function_expr,     .call_one,        .call_one_comma, .call,             .call_comma,           .block_two,
+        .block_two_newline, .block,           .block_newline,  .@"if",            .if_else,              .range,
+        .loop_range,        .loop_condition,  .loop_cont,      .loop_else,        .@"return",            .@"break",
+        .@"continue",       .assign,          .assign_add,     .assign_sub,       .assign_mul,           .assign_div,
+        .assign_mod,        .builtin_literal, .array_type,     .array_init_two,   .array_init_two_comma, .array_init,
+        .array_init_comma,  .array_access,    .slice,          .field_access,     .in,                   .match,
+        .match_case_one,    .match_case,      .function_pipe,  .container_decl,   .container_decl_arg,   .container_field,
+        .unwrap,            .enum_literal,    .attr_one,       .attr_decl_one,    .attr_decl,
     };
     var ast = try Parser.parse(std.testing.allocator, "let x=1\n");
     defer ast.deinit(std.testing.allocator);
