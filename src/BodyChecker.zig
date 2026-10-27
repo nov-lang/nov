@@ -1213,6 +1213,7 @@ const Context = struct {
                     .base = try emitter.value(bounds.sliced),
                     .start = if (bounds.start != 0) try emitter.value(bounds.start) else null,
                     .end = if (bounds.end != 0) try emitter.value(bounds.end) else null,
+                    .inclusive = ast.tokens.items(.tag)[ast.nodes.items(.main_token)[data.rhs]] == .period_period_equal,
                 } };
             },
             .array_access => .{ .array_index = .{ .array = try emitter.value(data.lhs), .index = try emitter.value(data.rhs) } },
@@ -2244,8 +2245,6 @@ const Context = struct {
             },
             .slice => {
                 const bounds = ast.slice(node).ast;
-                if (ast.tokens.items(.tag)[ast.nodes.items(.main_token)[data.rhs]] == .period_period_equal)
-                    return self.fail(.inclusive_string_slice, data.rhs, null);
                 const base = (try self.expression(bounds.sliced, null, depth + 1)) orelse return null;
                 if (self.terminated) return if (expected) |want| want.ty else base;
                 if (self.ir.getType(base).? != .string) return self.fail(.string_slice_requires_string, bounds.sliced, null);
@@ -3450,8 +3449,8 @@ test "string scalar indexing has exact rune inference through contexts construct
 
 test "string slicing semantic types inference and rejection" {
     for ([_]struct { source: []const u8, tag: Module.Diagnostic.Tag }{
-        .{ .source = "let f:(s:string)->string=s[..=2]", .tag = .inclusive_string_slice },
-        .{ .source = "let f:(s:string)->string=s[0..=]", .tag = .inclusive_string_slice },
+        .{ .source = "let f:(s:string,n:uint)->string=s[..=n]", .tag = .expression_type_mismatch },
+        .{ .source = "let f:(s:string)->string=s[true..=]", .tag = .literal_type_mismatch },
         .{ .source = "let f:(s:[]u8)->string=s[..]", .tag = .string_slice_requires_string },
         .{ .source = "let f:(s:rune)->string=s[..]", .tag = .string_slice_requires_string },
         .{ .source = "let f:(s:string,n:uint)->string=s[n..]", .tag = .expression_type_mismatch },
@@ -3476,7 +3475,7 @@ test "string slicing semantic types inference and rejection" {
         \\}
         \\let U=union{text:string,}
         \\let f:(s:string,b:bool)->string={let alias=&s
-        \\    let view=alias[..]
+        \\    let view=alias[..=-1]
         \\    let a=[view,s[1..]]
         \\    let u:U=.text[s[..1]]
         \\    let chosen=if b {s[..]}else{view}
@@ -3494,9 +3493,11 @@ test "string slicing semantic types inference and rejection" {
     try std.testing.expect(!module.hasErrors());
     try std.testing.expect(sema.lowering_complete);
     try sema.ir.verify();
+    var inclusive_count: usize = 0;
     for (sema.ir.functions.items) |function| {
         for (function.body.?.instructions, 0..) |instruction, at| {
             if (instruction.op != .string_slice) continue;
+            if (instruction.op.string_slice.inclusive) inclusive_count += 1;
             const slice = instruction.op.string_slice;
             try std.testing.expect(sema.ir.getType(instruction.ty).? == .string);
             try std.testing.expect(@backingInt(slice.base) < at);
@@ -3507,10 +3508,13 @@ test "string slicing semantic types inference and rejection" {
             };
         }
     }
+    try std.testing.expectEqual(@as(usize, 1), inclusive_count);
 }
 
 test "string slicing terminal operands skip later bounds and slice IR" {
     for ([_][]const u8{
+        "let f:()->string=@panic(\"stop\")[missing..=missing]",
+        "let f:()->string=\"a\"[{return \"done\"}..=missing]",
         "let f:()->string=@panic(\"stop\")[missing..missing]",
         "let f:()->string=\"a\"[{return \"done\"}..missing]",
         "let f:()->bool=\"a\"[0..@panic(\"stop\")]",
@@ -3679,11 +3683,10 @@ test "string scalar elements remain immutable through mutable bindings and whole
     }
 }
 
-test "strings reject byte mutation inclusive slicing ordering and eager globals" {
+test "strings reject byte mutation ordering and eager globals" {
     for ([_][]const u8{
         "let f: () -> void = {let mut x = [\"a\"]\nx[0] += \"b\"}",
         "let f: () -> void = {let mut x = \"a\"\nx[0] = \"b\"}",
-        "let f: () -> void = @println(\"a\"[0..=1])",
         "let f: () -> void = {let mut x = \"a\"\nx.len = 1}",
         "let f: () -> void = {let mut x = \"a\"\nx -= \"b\"}",
         "let f: () -> bool = \"a\" < \"b\"",

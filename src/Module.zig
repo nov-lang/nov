@@ -124,7 +124,6 @@ pub const Diagnostic = struct {
         literal_type_mismatch,
         literal_out_of_range,
         unsupported_body_expression,
-        inclusive_string_slice,
         string_slice_requires_string,
         unsupported_match_pattern,
         unsupported_match_subject,

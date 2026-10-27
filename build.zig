@@ -1283,7 +1283,7 @@ fn addStringSliceCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step
             if (mode.len != 0) run.addArg(mode);
             run.expectExitCode(0);
             run.expectStdOutEqual(if (excluded) "" else if (tests)
-                "PASS half_open_and_omitted\nPASS empty_boundaries\nPASS unicode_and_nul\nPASS nested_views\nPASS immutable_snapshots\nPASS retained_owner\n6 passed; 0 failed; 6 total\n"
+                "PASS half_open_and_omitted\nPASS empty_boundaries\nPASS unicode_and_nul\nPASS nested_views\nPASS immutable_snapshots\nPASS inclusive_bounds\nPASS retained_owner\n7 passed; 0 failed; 7 total\n"
             else
                 "é😀 hé llo hé😀llo\né😀 hé😀llo! é😀llo\n");
             run.expectStdErrEqual("");
@@ -1291,6 +1291,12 @@ fn addStringSliceCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step
         }
     }
     for ([_]struct { name: []const u8, slice: []const u8, text: []const u8 = "é😀\\0", setup: []const u8 = "" }{
+        .{ .name = "inclusive-end-at-length", .slice = "[..=3]" },
+        .{ .name = "inclusive-empty", .text = "", .slice = "[..=0]" },
+        .{ .name = "inclusive-reversed", .slice = "[2..=0]" },
+        .{ .name = "inclusive-negative", .slice = "[..=-4]" },
+        .{ .name = "inclusive-minimum", .slice = "[..=minimum]", .setup = b.fmt("let minimum: int = {d} - 1\n", .{std.math.minInt(isize) + 1}) },
+        .{ .name = "inclusive-maximum", .slice = "[..=maximum]", .setup = b.fmt("let maximum: int = {d}\n", .{std.math.maxInt(isize)}) },
         .{ .name = "start-positive", .slice = "[4..]" },
         .{ .name = "end-positive", .slice = "[..4]" },
         .{ .name = "start-negative", .slice = "[-4..]" },
@@ -1321,7 +1327,7 @@ fn addStringSliceCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step
     }
     const mismatch = "expression does not match the expected type";
     const literal = "literal does not match the annotated type";
-    const inclusive = "string slicing requires half-open '..' bounds; '..=' is not supported";
+
     for ([_]struct { name: []const u8, source: []const u8, diagnostic: []const u8 }{
         .{ .name = "start-uint", .source = "let f: (s: string, n: uint) -> string = s[n..]\n", .diagnostic = mismatch },
         .{ .name = "end-uint", .source = "let f: (s: string, n: uint) -> string = s[..n]\n", .diagnostic = mismatch },
@@ -1330,9 +1336,9 @@ fn addStringSliceCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step
         .{ .name = "start-rune", .source = "let f: (s: string) -> string = s['a'..]\n", .diagnostic = literal },
         .{ .name = "end-bool", .source = "let f: (s: string) -> string = s[..true]\n", .diagnostic = literal },
         .{ .name = "result-rune", .source = "let f: (s: string) -> rune = s[..]\n", .diagnostic = mismatch },
-        .{ .name = "inclusive", .source = "let f: (s: string) -> string = s[0..=1]\n", .diagnostic = inclusive },
-        .{ .name = "inclusive-prefix", .source = "let f: (s: string) -> string = s[..=1]\n", .diagnostic = inclusive },
-        .{ .name = "inclusive-suffix", .source = "let f: (s: string) -> string = s[0..=]\n", .diagnostic = inclusive },
+        .{ .name = "inclusive-end-uint", .source = "let f: (s: string, n: uint) -> string = s[..=n]\n", .diagnostic = mismatch },
+        .{ .name = "inclusive-start-uint", .source = "let f: (s: string, n: uint) -> string = s[n..=]\n", .diagnostic = mismatch },
+        .{ .name = "inclusive-array", .source = "let f: (s: []u8) -> string = s[..=1]\n", .diagnostic = "slicing requires a string value" },
         .{ .name = "array", .source = "let f: (s: []u8) -> string = s[..]\n", .diagnostic = "slicing requires a string value" },
         .{ .name = "write", .source = "let main: () = {let mut s = \"abc\"\ns[..] = \"x\"}\n", .diagnostic = "assignment target must be a mutable local, its struct field path, or its scalar-array element" },
     }) |case| {

@@ -1927,6 +1927,22 @@ test "closures preserve function expression views delimiters comments and parser
     }
 }
 
+test "inclusive string slicing preserves operators omitted bounds spans and OOM" {
+    for ([_][:0]const u8{ "let x=text[1..=2]", "let x=text[..=2]", "let x=text[1..=]", "let x=text[..=]" }, 0..) |source, i| {
+        var ast = try parse(std.testing.allocator, source);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+        const node = ast.decl(ast.rootDecls()[0]).ast.init_node;
+        const view = ast.fullSlice(node).?.ast;
+        try std.testing.expectEqualStrings("..=", ast.tokenSlice(ast.nodes.items(.main_token)[ast.nodes.items(.data)[node].rhs]));
+        try std.testing.expectEqual(i == 0 or i == 2, view.start != 0);
+        try std.testing.expectEqual(i < 2, view.end != 0);
+        try std.testing.expectEqualStrings("text", ast.tokenSlice(ast.firstToken(node)));
+        try std.testing.expectEqualStrings("]", ast.tokenSlice(ast.lastToken(node)));
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
+    }
+}
+
 test "string slicing parser accessors delimiters and OOM" {
     const source = "let a=text[1..2]\nlet b=text[..2]\nlet c=text[1..]\nlet d=text[..]\nlet e=text[..][0..1]";
     var ast = try parse(std.testing.allocator, source);

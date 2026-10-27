@@ -83,8 +83,9 @@ pub const Operation = union(enum) {
     /// Arrays yield their exact element type; immutable strings yield distinct runes.
     /// String offsets count Unicode scalars.
     array_index: struct { array: ValueId, index: ValueId },
-    /// Half-open scalar bounds, defaulting to zero and scalar length. Shares owner.
-    string_slice: struct { base: ValueId, start: ?ValueId, end: ?ValueId },
+    /// Scalar bounds; explicit inclusive end names the final included scalar.
+    /// Omitted bounds default to zero and scalar length. Shares owner.
+    string_slice: struct { base: ValueId, start: ?ValueId, end: ?ValueId, inclusive: bool = false },
     /// Allocation-free scalar/string equality scan; record equality is unsupported.
     array_contains: struct { value: ValueId, array: ValueId },
     array_set: struct { array: ValueId, index: ValueId, value: ValueId },

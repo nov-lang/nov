@@ -612,10 +612,14 @@ fn writeStringScalarRuntime(ir: *const Ir, w: *std.Io.Writer) WriteError!void {
         \\    if ((uintptr_t)bound > count) nov_rt_panic("string slice out of bounds");
         \\    return (uintptr_t)bound;
         \\}
-        \\static nov_string nov_string_slice(nov_string text, intptr_t start, intptr_t end, bool has_end) {
+        \\static nov_string nov_string_slice(nov_string text, intptr_t start, intptr_t end, bool has_end, bool inclusive) {
         \\    const uintptr_t count = nov_string_scalar_len(text);
         \\    const uintptr_t first = nov_string_bound(start, count);
-        \\    const uintptr_t last = has_end ? nov_string_bound(end, count) : count;
+        \\    uintptr_t last = has_end ? nov_string_bound(end, count) : count;
+        \\    if (has_end && inclusive) {
+        \\        if (last == count) nov_rt_panic("string slice out of bounds");
+        \\        ++last;
+        \\    }
         \\    if (first > last) nov_rt_panic("string slice out of bounds");
         \\    uintptr_t offset = 0, scalar = 0;
         \\    while (scalar < first) { (void)nov_string_decode(text, &offset); ++scalar; }
@@ -1347,7 +1351,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
                     if (r.start) |value| try w.print("v{d}", .{@backingInt(value)}) else try w.writeAll("0");
                     try w.writeAll(", ");
                     if (r.end) |value| try w.print("v{d}", .{@backingInt(value)}) else try w.writeAll("0");
-                    try w.print(", {s})", .{if (r.end != null) "true" else "false"});
+                    try w.print(", {s}, {s})", .{ if (r.end != null) "true" else "false", if (r.inclusive) "true" else "false" });
                 },
                 .binary => |b| try w.print("nov_string_concat(v{d}, v{d})", .{ @backingInt(b.lhs), @backingInt(b.rhs) }),
                 .array_index => |r| {
@@ -4473,9 +4477,9 @@ const string_slice_program =
     \\let lower:()->int={@print("L")
     \\    1}
     \\let upper:()->int={@print("U")
-    \\    return -1}
+    \\    return -2}
     \\let main:()={
-    \\    let view=base()[lower()..upper()]
+    \\    let view=base()[lower()..=upper()]
     \\    @println(view,view.len,view[0],view[-2])
     \\    @println(view[..2],view[2..],view[..][1..3])
     \\    @println(""[..].len,view[4..].len,view[..0].len,view[-4..-4].len)
@@ -4588,6 +4592,12 @@ test "string slicing managed subviews retain original owner across frame release
 
 test "string slicing invalid normalized bounds panic in all modes" {
     for ([_][]const u8{
+        "\"é€😀\"[..=3]",
+        "\"é€😀\"[2..=0]",
+        "\"é€😀\"[..=-4]",
+        "\"\"[..=0]",
+        "\"é€😀\"[..=9223372036854775807]",
+        "\"é€😀\"[..=-9223372036854775808]",
         "\"é€😀\"[4..]",
         "\"é€😀\"[..4]",
         "\"é€😀\"[-4..]",
@@ -4609,7 +4619,7 @@ test "string slicing invalid normalized bounds panic in all modes" {
 }
 
 test "string slicing shares owner byte offsets permits NULL empty and allocates nothing" {
-    const c = try emitSource("let cut:(s:string,a:int,b:int)->string=s[a..b]\nlet all:(s:string)->string=s[..]\nlet tail:(s:string,a:int)->string=s[a..]", null);
+    const c = try emitSource("let cut:(s:string,a:int,b:int)->string=s[a..b]\nlet all:(s:string)->string=s[..]\nlet tail:(s:string,a:int)->string=s[a..]\nlet inclusive:(s:string,a:int,b:int)->string=s[a..=b]\nlet inclusive_all:(s:string)->string=s[..=]", null);
     defer test_gpa.free(c);
     const program = try std.mem.concat(test_gpa, u8, &.{
         "#include <stdlib.h>\nstatic void *test_malloc(size_t n) { (void)n; return NULL; }\n#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n",
@@ -4629,6 +4639,12 @@ test "string slicing shares owner byte offsets permits NULL empty and allocates 
         \\    if (v.data || v.owner || v.len) return 5;
         \\    v = nov_cut(text,6,6);
         \\    if (v.data != bytes+sizeof bytes-1 || v.len) return 6;
+        \\    v = nov_inclusive(text,1,-2);
+        \\    if (v.data != bytes+1 || v.len != 10 || v.owner != text.owner) return 7;
+        \\    v = nov_inclusive(text,2,1);
+        \\    if (v.data != bytes+3 || v.len) return 8;
+        \\    v = nov_inclusive__all((nov_string){0});
+        \\    if (v.data || v.owner || v.len) return 9;
         \\    nov_gc_shutdown(&nov_rt_heap); return 0;
         \\}
         ,

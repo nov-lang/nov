@@ -2187,10 +2187,19 @@ of strings; this does not enable nested arrays. See
 filename but now demonstrates Unicode scalar indexing and length.
 
 String slicing supports `text[start..end]`, `text[..end]`, `text[start..]` and
-`text[..]`. Only half-open `..` is supported, not `..=`. Bounds are native `int`
-Unicode scalar offsets; negatives count from the scalar end. Omitted bounds default
-to 0 and the scalar length. After normalization, `0 <= start <= end <= len` must
-hold; invalid bounds panic in every build mode (no clamping or reversed slices).
+`text[..]`, using either half-open `..` or inclusive `..=`. Bounds are native `int`
+Unicode scalar offsets; negatives count from the scalar end. An explicit inclusive
+end must name an existing scalar, and is converted to an exclusive boundary by
+adding one **after** normalization. For example, `"é😀x"[0..=1] == "é😀"` and
+`text[..=-1]` includes the last scalar. An explicit inclusive end equal to `.len`
+is out of bounds, even for an empty slice.
+
+Omitted bounds default to 0 and the scalar length for either operator:
+`text[1..=] == text[1..]`, `text[..=] == text[..]`. After conversion,
+`0 <= start <= exclusive_end <= len` must hold; invalid bounds panic in every build
+mode without clamping. Adjacent reversed inclusive bounds can describe an empty
+slice: `"abc"[2..=1] == ""`; further-reversed bounds panic. `""[..=]` is valid,
+but `""[..=0]` panics because no scalar exists at index 0.
 The base, start and end evaluate once, left to right. Slicing returns an immutable,
 allocation-free UTF-8 view sharing the original GC owner, without copying bytes;
 even a small view retains the full allocation. `.len` still counts scalars.

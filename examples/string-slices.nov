@@ -1,6 +1,7 @@
 ; nov run examples/string-slices.nov
 ; nov test examples/string-slices.nov
-; Half-open string slices are immutable, zero-copy views that keep their GC owner alive.
+; String slices are immutable, zero-copy views that keep their GC owner alive.
+; .. excludes the end; ..= includes an explicit end scalar.
 ; Bounds and .len count Unicode scalars, not UTF-8 bytes or grapheme clusters.
 ; Only native int bounds are accepted; negative bounds count from the scalar end.
 
@@ -13,7 +14,7 @@ let owned_view: () -> string = {
 
 let main: () = {
     let mut text = "hé😀llo"
-    let snapshot = text[1..3]
+    let snapshot = text[1..=2]
     @println(snapshot, text[..2], text[-3..], text[..])
     text += "!"
     @println(snapshot, text, middle(text))
@@ -97,9 +98,26 @@ let immutable_snapshots: () = {
 }
 
 @[test]
+let inclusive_bounds: () = {
+    let text = "aé€😀\0z"
+    @assert(text[1..=3] == "é€😀")
+    @assert(text[..=0] == "a")
+    @assert(text[-3..=-2] == "😀\0")
+    @assert(text[..=-1] == text)
+    @assert(text[4..=4] == "\0")
+    @assert(text[1..=] == text[1..])
+    @assert(text[..=] == text)
+    @assert(text[2..=1] == "")
+    @assert(text[6..=-1] == "")
+    @assert(""[..=] == "")
+    @assert(""[0..=] == "")
+    @assert(text[1..=3][1..=2] == "€😀")
+}
+
+@[test]
 let retained_owner: () = {
     let view = owned_view()
-    let nested = view[1..]
+    let nested = view[1..=-1]
     let stored: []string = [view, nested]
     loop i in 0..2000 {
         let temporary = "allocation:{i}:é😀"

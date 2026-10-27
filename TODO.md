@@ -13,10 +13,13 @@ scalars from the end. `.len` is native `uint` scalar count, not byte/grapheme co
 Both indexing and length scan UTF-8 in O(n), allocating nothing; storage remains
 UTF-8 bytes. See examples/runes.nov and examples/string-bytes.nov (historical name,
 now a Unicode scalar example). String slicing is implemented: `text[start..end]`,
-`text[..end]`, `text[start..]` and `text[..]`, with half-open `..` only (not `..=`).
-Bounds are native `int` scalar offsets; negatives count from the scalar end and
-omitted bounds default to 0/length. Normalized `0 <= start <= end <= len` is
-required; invalid bounds panic in all modes. Base/start/end evaluate once,
+`text[..end]`, `text[start..]` and `text[..]`, with half-open `..` or inclusive `..=`.
+Bounds are native `int` scalar offsets; negatives count from the scalar end.
+An explicit inclusive end must name an existing scalar, then advances one boundary;
+omitted ends mean through the string end for either operator. After conversion,
+`0 <= start <= exclusive_end <= len` is required; invalid bounds panic in all modes.
+Adjacent reversed inclusive bounds form an empty slice; an explicit end at `.len`
+or any explicit inclusive end on an empty string rejects. Base/start/end evaluate once,
 left to right. Views are immutable, allocation-free and share the original GC owner
 without copying UTF-8 bytes; small views retain the full allocation. `.len` counts
 scalars. Array slicing remains unsupported. Array/string iteration is supported
@@ -326,7 +329,7 @@ string initially makes an independent snapshot so later builder edits cannot cha
 it. Ownership-transfer optimizations, exact APIs and array-field/mutable-receiver
 contracts remain deferred. Do not add a second built-in mutable-string type.
 
-`rune`, scalar string indexing and half-open scalar slicing are implemented (see
+`rune`, scalar string indexing and half-open/inclusive scalar slicing are implemented (see
 above). String views share the original GC owner without copying UTF-8 bytes;
 small views retain the full allocation. Forward scalar string iteration is
 implemented; grapheme operations remain deferred.
@@ -352,7 +355,7 @@ implemented; grapheme operations remain deferred.
   - blocks/control flow/quoted literals/formats/captures and global interpolation remain unsupported
   - [x] allocation-free O(n) scalar indexing returns exact rune, with int/negative indices and all-mode bounds panics
   - [x] allocation-free O(n) `.len` counts scalars, not UTF-8 bytes or graphemes
-  - [x] half-open scalar slicing with native int/negative bounds, all-mode panics and allocation-free shared-owner views
+  - [x] half-open/inclusive scalar slicing with native int/negative bounds, all-mode panics and allocation-free shared-owner views
   - [x] forward O(n) scalar string iteration (see Loop)
   - ordering, byte-buffer conversions and the UTF-8 builder remain deferred
 - add tests, mainly for Parser, IRs, Codegen and Runtime
@@ -1035,7 +1038,7 @@ let ArrayList: (T: #type) -> type = { ... }
         Blocks/control flow/quoted literals/formats/captures remain unsupported.
     Global interpolation is nonliteral and rejected, not eagerly evaluated.
   - Scalar indexing returns rune without allocation; negative indices count scalars
-    from the end. Half-open scalar slicing returns allocation-free views with shared
+    from the end. Half-open/inclusive scalar slicing returns allocation-free views with shared
     GC ownership and no byte copy; small views retain the full allocation. String
     arrays work with shared immutable backing. Iteration, grapheme operations and
     C-string conversion remain deferred. No terminator or compile-time concatenation promise.
