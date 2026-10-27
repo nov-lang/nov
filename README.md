@@ -19,7 +19,7 @@ Requires Zig 0.17.0.
 Growable arrays use an internal libc-only nonmoving mark/sweep GC. The
 runtime is emitted only for managed values; scalar-only programs stay unchanged.
 See the [runtime API and root discipline](src/runtime/README.md) for layout, C
-boundary, OOM, testing, and unsupported-reference contracts. Slices, nested arrays,
+boundary, OOM, testing, and unsupported-reference contracts. Array slicing, nested arrays,
 and general aliases remain deferred; bounded local array-element borrowing is
 supported below. Immutable UTF-8 strings are supported below.
 
@@ -516,7 +516,7 @@ formatting does not make those forms executable. Array formatting does not check
 expected literal types, scope, mutability, or whether a base is an array; it does
 not enable array globals or new language semantics. Other members, `.len` writes,
 indexed compound stores and stores through computed bases remain unsupported.
-Nested array annotations and directly nested array literals, slices, pointers,
+Nested array annotations and directly nested array literals, array slicing, pointers,
 other memory/container forms, labels,
 iterator/other unsupported loop forms, attributes, quoted identifiers,
 BOMs and shebangs remain unsupported or invalid. Unsupported syntax is reported
@@ -1472,7 +1472,8 @@ arr_arr >>= |arr: []string| {
 ```
 
 ## Slice
-TODO
+
+Strings support [immutable scalar-offset views](#strings). Array slicing remains unsupported.
 
 ## Range
 
@@ -2056,7 +2057,7 @@ is false, while `"é" == "\u{e9}"` is true. A return, break or continue in an
 operand skips the remaining comparison without undoing earlier effects.
 
 Ordering (`<`, `<=`, `>`, `>=`), other operators (including `-=`, `*=`, `/=` and
-`%=`), slicing, iteration and grapheme operations remain deferred.
+`%=`), iteration and grapheme operations remain deferred.
 `[]string` and supported record arrays work with independent element storage and
 shared immutable string backing; nested arrays remain unsupported.
 
@@ -2087,9 +2088,16 @@ of strings; this does not enable nested arrays. See
 [`examples/string-bytes.nov`](examples/string-bytes.nov), which keeps its historical
 filename but now demonstrates Unicode scalar indexing and length.
 
-Approved future string slicing uses half-open scalar offsets, with negative offsets
-counted from the scalar end. Slices will share the original GC owner without copying
-UTF-8 bytes. **String slicing is not implemented.**
+String slicing supports `text[start..end]`, `text[..end]`, `text[start..]` and
+`text[..]`. Only half-open `..` is supported, not `..=`. Bounds are native `int`
+Unicode scalar offsets; negatives count from the scalar end. Omitted bounds default
+to 0 and the scalar length. After normalization, `0 <= start <= end <= len` must
+hold; invalid bounds panic in every build mode (no clamping or reversed slices).
+The base, start and end evaluate once, left to right. Slicing returns an immutable,
+allocation-free UTF-8 view sharing the original GC owner, without copying bytes;
+even a small view retains the full allocation. `.len` still counts scalars.
+For example, `"é😀x"[1..-1] == "😀"`. Array slicing remains unsupported. See
+[`examples/string-slices.nov`](examples/string-slices.nov).
 
 For editing, keep the distinction between a mutable binding and mutable storage:
 `s += "more"` produces a new immutable string and rebinds `s`, preserving older

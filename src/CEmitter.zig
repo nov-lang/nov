@@ -457,6 +457,14 @@ fn usesStringIndex(ir: *const Ir) bool {
     return false;
 }
 
+fn usesStringSlice(ir: *const Ir) bool {
+    for (ir.functions.items) |function| {
+        const body = function.body orelse continue;
+        for (body.instructions) |instruction| if (instruction.op == .string_slice) return true;
+    }
+    return false;
+}
+
 fn usesStringLength(ir: *const Ir) bool {
     for (ir.functions.items) |function| {
         const body = function.body orelse continue;
@@ -469,7 +477,8 @@ fn usesStringLength(ir: *const Ir) bool {
 
 fn writeStringScalarRuntime(ir: *const Ir, w: *std.Io.Writer) WriteError!void {
     const indexing = usesStringIndex(ir);
-    if (!indexing and !usesStringLength(ir)) return;
+    const slicing = usesStringSlice(ir);
+    if (!indexing and !slicing and !usesStringLength(ir)) return;
     // The representation keeps byte lengths; only language-facing offsets count scalars.
     try w.writeAll(
         \\static uint32_t nov_string_decode(nov_string text, uintptr_t *offset) {
@@ -495,6 +504,29 @@ fn writeStringScalarRuntime(ir: *const Ir, w: *std.Io.Writer) WriteError!void {
         \\    uintptr_t offset = 0, count = 0;
         \\    while (offset < text.len) { (void)nov_string_decode(text, &offset); ++count; }
         \\    return count;
+        \\}
+        \\
+    );
+    if (slicing) try w.writeAll(
+        \\static uintptr_t nov_string_bound(intptr_t bound, uintptr_t count) {
+        \\    if (bound < 0) {
+        \\        const uintptr_t distance = (uintptr_t)(-(bound + 1)) + 1;
+        \\        if (distance > count) nov_rt_panic("string slice out of bounds");
+        \\        return count - distance;
+        \\    }
+        \\    if ((uintptr_t)bound > count) nov_rt_panic("string slice out of bounds");
+        \\    return (uintptr_t)bound;
+        \\}
+        \\static nov_string nov_string_slice(nov_string text, intptr_t start, intptr_t end, bool has_end) {
+        \\    const uintptr_t count = nov_string_scalar_len(text);
+        \\    const uintptr_t first = nov_string_bound(start, count);
+        \\    const uintptr_t last = has_end ? nov_string_bound(end, count) : count;
+        \\    if (first > last) nov_rt_panic("string slice out of bounds");
+        \\    uintptr_t offset = 0, scalar = 0;
+        \\    while (scalar < first) { (void)nov_string_decode(text, &offset); ++scalar; }
+        \\    const uintptr_t begin = offset;
+        \\    while (scalar < last) { (void)nov_string_decode(text, &offset); ++scalar; }
+        \\    return (nov_string){text.owner, begin ? text.data + begin : text.data, offset - begin};
         \\}
         \\
     );
@@ -842,6 +874,11 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
             value_used[@backingInt(r.end)] = true;
         },
         .range_start, .range_end, .range_inclusive, .array_clone, .array_len, .to_string => |value| value_used[@backingInt(value)] = true,
+        .string_slice => |r| {
+            value_used[@backingInt(r.base)] = true;
+            if (r.start) |value| value_used[@backingInt(value)] = true;
+            if (r.end) |value| value_used[@backingInt(value)] = true;
+        },
         .array_index => |r| {
             value_used[@backingInt(r.array)] = true;
             value_used[@backingInt(r.index)] = true;
@@ -1148,6 +1185,13 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
                         else => unreachable,
                     }
                 },
+                .string_slice => |r| {
+                    try w.print("nov_string_slice(v{d}, ", .{@backingInt(r.base)});
+                    if (r.start) |value| try w.print("v{d}", .{@backingInt(value)}) else try w.writeAll("0");
+                    try w.writeAll(", ");
+                    if (r.end) |value| try w.print("v{d}", .{@backingInt(value)}) else try w.writeAll("0");
+                    try w.print(", {s})", .{if (r.end != null) "true" else "false"});
+                },
                 .binary => |b| try w.print("nov_string_concat(v{d}, v{d})", .{ @backingInt(b.lhs), @backingInt(b.rhs) }),
                 .array_index => |r| {
                     try w.writeAll("((nov_string *)");
@@ -1281,7 +1325,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
                 try w.print("v{d} {s} v{d}", .{ @backingInt(binary.lhs), operator, @backingInt(binary.rhs) });
             },
             .call => |call| try writeCall(w, call),
-            .assertion, .panic, .loop, .loop_break, .loop_continue, .return_value, .print, .short_circuit, .branch, .local_store => unreachable,
+            .string_slice, .assertion, .panic, .loop, .loop_break, .loop_continue, .return_value, .print, .short_circuit, .branch, .local_store => unreachable,
         }
         try w.writeAll(";\n");
         if (!value_used[i] or instruction.op == .local_slot) try w.print("    (void)v{d};\n", .{i});
@@ -3979,6 +4023,177 @@ test "string scalar indexing bounds panic at both optimization levels" {
         for ([_][]const u8{ "-O0", "-O3" }) |mode|
             try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 1, "", "panic: string index out of bounds\n", mode);
     }
+}
+
+const string_slice_program =
+    \\let base:()->string={@print("B")
+    \\    "aé€"+"😀\0z"}
+    \\let lower:()->int={@print("L")
+    \\    1}
+    \\let upper:()->int={@print("U")
+    \\    return -1}
+    \\let main:()={
+    \\    let view=base()[lower()..upper()]
+    \\    @println(view,view.len,view[0],view[-2])
+    \\    @println(view[..2],view[2..],view[..][1..3])
+    \\    @println(""[..].len,view[4..].len,view[..0].len,view[-4..-4].len)
+    \\    let mut text="aé"+"€😀"
+    \\    let mut start:int=1
+    \\    let snapshot=text[{text="re"+"bound"
+    \\        start}..{start=0
+    \\        @as(int,-1)}]
+    \\    @println(snapshot,text,start)
+    \\    let values=[view,snapshot]
+    \\    @println(values[0][..1],values[1][..])
+    \\}
+;
+const string_slice_output = "BLUé€😀\x00 4 é 😀\né€ 😀\x00 €😀\n0 0 0 0\né€ rebound 0\né é€\n";
+
+test "string slicing Unicode views order rebind forced GC source free and OOM" {
+    var sema = blk: {
+        var module = try Module.init(test_gpa, "slicing.nov", string_slice_program);
+        defer module.deinit();
+        errdefer std.debug.print("slice parse: {any}\n", .{module.source.ast.errors});
+        var result = try Lowering.lower(&module);
+        errdefer result.deinit();
+        errdefer std.debug.print("slice diagnostics: {any} parse: {any}\n", .{ module.diagnostics.items, module.source.ast.errors });
+        try std.testing.expect(!module.hasErrors());
+        break :blk result;
+    };
+    defer sema.deinit();
+    try sema.ir.verify();
+    const c = try arrayTestProgram(string_slice_program);
+    defer test_gpa.free(c);
+    const source_free = try emitProgram(test_gpa, &sema.ir, null);
+    defer test_gpa.free(source_free);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| {
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, string_slice_output, "", mode);
+        try compileAndRunMode(source_free, "typedef int nonempty_translation_unit;", 0, string_slice_output, "", mode);
+    }
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{string_slice_program});
+}
+
+test "string slicing rejects private region values slots and borrow capabilities" {
+    var module = try Module.init(test_gpa, "invalid-slice-ir.nov", "let f:(flag:bool,n:int)->string={let mut s=if flag {\"a\"}else{\"b\"}\nlet r=&s\nr[n..n]}");
+    defer module.deinit();
+    var sema = try Lowering.lower(&module);
+    defer sema.deinit();
+    try std.testing.expect(!module.hasErrors());
+    const instructions = @constCast(sema.ir.functions.items[0].body.?.instructions);
+    var read: usize = 0;
+    var private: Ir.ValueId = undefined;
+    for (instructions, 0..) |instruction, i| {
+        if (instruction.op == .string_slice) read = i;
+        if (instruction.op == .branch) private = instruction.op.branch.then_value;
+    }
+    const saved = instructions[read];
+    for (0..3) |operand| {
+        instructions[read] = saved;
+        switch (operand) {
+            0 => instructions[read].op.string_slice.base = private,
+            1 => instructions[read].op.string_slice.start = private,
+            2 => instructions[read].op.string_slice.end = private,
+            else => unreachable,
+        }
+        try std.testing.expectError(error.InvalidValueId, emit(test_gpa, &sema.ir, null));
+        for (instructions, 0..) |instruction, i| {
+            if (instruction.op != .local_slot and instruction.op != .borrow_reserve and instruction.op != .borrow_start) continue;
+            instructions[read] = saved;
+            const value: Ir.ValueId = @fromBackingInt(@intCast(i));
+            switch (operand) {
+                0 => instructions[read].op.string_slice.base = value,
+                1 => instructions[read].op.string_slice.start = value,
+                2 => instructions[read].op.string_slice.end = value,
+                else => unreachable,
+            }
+            try std.testing.expectError(if (instruction.op == .local_slot) error.InvalidValueId else if (operand == 0) error.InvalidOperation else error.OperandTypeMismatch, emit(test_gpa, &sema.ir, null));
+        }
+    }
+    instructions[read] = saved;
+    try sema.ir.verify();
+}
+
+test "string slicing managed subviews retain original owner across frame release and GC" {
+    const c = try emitSource("let make:()->string={let s=\"aé\"+\"€😀z\"\ns[1..-1]}\nlet cut:(s:string)->string=s[1..]\nlet empty:(s:string)->string=s[0..0]", null);
+    defer test_gpa.free(c);
+    const harness =
+        \\int main(void) {
+        \\    nov_rt_heap.collect_every_allocation = 1;
+        \\    nov_string view = nov_make();
+        \\    if (!view.owner || view.len != 9 || view.data == view.owner) return 1;
+        \\    void *owner = view.owner;
+        \\    void **roots[] = {&view.owner}; nov_gc_roots frame = {0};
+        \\    nov_gc_push(&nov_rt_heap, &frame, roots, 1);
+        \\    view = nov_cut(view);
+        \\    if (view.owner != owner || view.len != 7) return 2;
+        \\    nov_gc_collect(&nov_rt_heap);
+        \\    if (nov_rt_heap.live_objects != 1 || view.data[0] != 0xe2) return 3;
+        \\    view = nov_empty(view);
+        \\    if (view.owner != owner || view.len != 0) return 4;
+        \\    nov_gc_collect(&nov_rt_heap);
+        \\    if (nov_rt_heap.live_objects != 1) return 5;
+        \\    nov_gc_pop(&nov_rt_heap, &frame);
+        \\    nov_gc_collect(&nov_rt_heap);
+        \\    if (nov_rt_heap.live_objects) return 6;
+        \\    nov_gc_shutdown(&nov_rt_heap); return 0;
+        \\}
+    ;
+    const program = try std.mem.concat(test_gpa, u8, &.{ c, harness });
+    defer test_gpa.free(program);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(program, "typedef int nonempty_translation_unit;", 0, "", "", mode);
+}
+
+test "string slicing invalid normalized bounds panic in all modes" {
+    for ([_][]const u8{
+        "\"é€😀\"[4..]",
+        "\"é€😀\"[..4]",
+        "\"é€😀\"[-4..]",
+        "\"é€😀\"[..-4]",
+        "\"é€😀\"[2..1]",
+        "\"é€😀\"[-1..-2]",
+        "\"\"[1..]",
+        "\"\"[..-1]",
+        "\"é€😀\"[-9223372036854775808..]",
+        "\"é€😀\"[..-9223372036854775808]",
+    }) |expression| {
+        const source = try std.fmt.allocPrint(test_gpa, "let main:()=@println({s})", .{expression});
+        defer test_gpa.free(source);
+        const c = try arrayTestProgram(source);
+        defer test_gpa.free(c);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode|
+            try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 1, "", "panic: string slice out of bounds\n", mode);
+    }
+}
+
+test "string slicing shares owner byte offsets permits NULL empty and allocates nothing" {
+    const c = try emitSource("let cut:(s:string,a:int,b:int)->string=s[a..b]\nlet all:(s:string)->string=s[..]\nlet tail:(s:string,a:int)->string=s[a..]", null);
+    defer test_gpa.free(c);
+    const program = try std.mem.concat(test_gpa, u8, &.{
+        "#include <stdlib.h>\nstatic void *test_malloc(size_t n) { (void)n; return NULL; }\n#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n",
+        c,
+        \\int main(void) {
+        \\    static const unsigned char bytes[] = "a\xc3\xa9\xe2\x82\xac\xf0\x9f\x98\x80\0z";
+        \\    const nov_string text = {NULL,bytes,sizeof bytes - 1};
+        \\    nov_string v = nov_cut(text,1,-1);
+        \\    if (v.owner != text.owner || v.data != bytes+1 || v.len != 10) return 1;
+        \\    v = nov_cut(v,1,3);
+        \\    if (v.data != bytes+3 || v.len != 7) return 2;
+        \\    v = nov_all((nov_string){0});
+        \\    if (v.data || v.owner || v.len) return 3;
+        \\    v = nov_tail((nov_string){0},0);
+        \\    if (v.data || v.owner || v.len) return 4;
+        \\    v = nov_cut((nov_string){0},0,0);
+        \\    if (v.data || v.owner || v.len) return 5;
+        \\    v = nov_cut(text,6,6);
+        \\    if (v.data != bytes+sizeof bytes-1 || v.len) return 6;
+        \\    nov_gc_shutdown(&nov_rt_heap); return 0;
+        \\}
+        ,
+    });
+    defer test_gpa.free(program);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(program, "typedef int nonempty_translation_unit;", 0, "", "", mode);
 }
 
 test "string scalar indexing helper is opt in and allocation free" {

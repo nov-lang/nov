@@ -127,6 +127,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const string_byte_tests = b.step("test-cli-string-bytes", "Run immutable string scalar indexing CLI tests");
     addStringByteCliTests(b, exe, string_byte_tests);
     test_step.dependOn(string_byte_tests);
+    const string_slice_tests = b.step("test-cli-string-slices", "Run immutable scalar string slicing CLI tests");
+    addStringSliceCliTests(b, exe, string_slice_tests);
+    test_step.dependOn(string_slice_tests);
     const rune_tests = b.step("test-cli-runes", "Run Unicode rune CLI tests");
     addRuneCliTests(b, exe, rune_tests);
     test_step.dependOn(rune_tests);
@@ -1178,6 +1181,101 @@ fn addStringByteCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step:
         _ = fixtures.add(source, case.source);
         const run = b.addRunArtifact(exe);
         run.step.name = b.fmt("CLI string bytes: reject {s}", .{case.name});
+        run.setCwd(fixtures.getDirectory());
+        run.addArgs(&.{ "check", "--semantic", source });
+        run.expectExitCode(1);
+        run.expectStdOutEqual("");
+        run.expectStdErrMatch(case.diagnostic);
+        test_step.dependOn(&run.step);
+    }
+}
+
+fn addStringSliceCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    const fixtures = b.addWriteFiles();
+    _ = fixtures.add("string-slices.nov", @embedFile("examples/string-slices.nov"));
+    _ = fixtures.add("excluded.nov", "@[test]\nlet excluded: () = @panic(\"test body ran\")\n" ++
+        "let main: () = {let mut text = \"é😀\\0\"\nlet alias = &text\n@assert(alias[1..-1] == \"😀\")\n@assert(alias[..].len == 3)}\n");
+    for ([_][]const u8{ "fmt", "semantic" }) |mode| {
+        const run = b.addRunArtifact(exe);
+        run.step.name = b.fmt("CLI string slices: example {s}", .{mode});
+        run.setCwd(fixtures.getDirectory());
+        run.addArgs(if (std.mem.eql(u8, mode, "fmt")) &.{ "fmt", "--check", "string-slices.nov" } else &.{ "check", "--semantic", "string-slices.nov" });
+        run.expectExitCode(0);
+        run.expectStdOutEqual("");
+        run.expectStdErrEqual("");
+        test_step.dependOn(&run.step);
+    }
+    for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+        for ([_][]const u8{ "run", "test", "excluded" }) |command| {
+            const run = b.addRunArtifact(exe);
+            run.step.name = b.fmt("CLI string slices: {s} ({s})", .{ command, mode });
+            run.setCwd(fixtures.getDirectory());
+            run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+            run.setEnvironmentVariable("NOV_CC", "");
+            run.setEnvironmentVariable("CC", "");
+            const excluded = std.mem.eql(u8, command, "excluded");
+            const tests = std.mem.eql(u8, command, "test");
+            run.addArgs(&.{ if (tests) "test" else "run", if (excluded) "excluded.nov" else "string-slices.nov" });
+            if (mode.len != 0) run.addArg(mode);
+            run.expectExitCode(0);
+            run.expectStdOutEqual(if (excluded) "" else if (tests)
+                "PASS half_open_and_omitted\nPASS empty_boundaries\nPASS unicode_and_nul\nPASS nested_views\nPASS immutable_snapshots\nPASS retained_owner\n6 passed; 0 failed; 6 total\n"
+            else
+                "é😀 hé llo hé😀llo\né😀 hé😀llo! é😀llo\n");
+            run.expectStdErrEqual("");
+            test_step.dependOn(&run.step);
+        }
+    }
+    for ([_]struct { name: []const u8, slice: []const u8, text: []const u8 = "é😀\\0", setup: []const u8 = "" }{
+        .{ .name = "start-positive", .slice = "[4..]" },
+        .{ .name = "end-positive", .slice = "[..4]" },
+        .{ .name = "start-negative", .slice = "[-4..]" },
+        .{ .name = "end-negative", .slice = "[..-4]" },
+        .{ .name = "reversed", .slice = "[2..1]" },
+        .{ .name = "normalized-reversed", .slice = "[-1..-2]" },
+        .{ .name = "mixed-reversed", .slice = "[2..-2]" },
+        .{ .name = "empty-positive", .text = "", .slice = "[..1]" },
+        .{ .name = "empty-negative", .text = "", .slice = "[-1..]" },
+        .{ .name = "minimum-int", .slice = "[minimum..]", .setup = b.fmt("let minimum: int = {d} - 1\n", .{std.math.minInt(isize) + 1}) },
+    }) |case| {
+        const source = b.fmt("bounds-{s}.nov", .{case.name});
+        _ = fixtures.add(source, b.fmt("let main: () = {{let text = \"{s}\"\n{s}@println(text{s})}}\n", .{ case.text, case.setup, case.slice }));
+        for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+            const run = b.addRunArtifact(exe);
+            run.step.name = b.fmt("CLI string slices: bounds {s} ({s})", .{ case.name, mode });
+            run.setCwd(fixtures.getDirectory());
+            run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+            run.setEnvironmentVariable("NOV_CC", "");
+            run.setEnvironmentVariable("CC", "");
+            run.addArgs(&.{ "run", source });
+            if (mode.len != 0) run.addArg(mode);
+            run.expectExitCode(1);
+            run.expectStdOutEqual("");
+            run.expectStdErrEqual("panic: string slice out of bounds\n");
+            test_step.dependOn(&run.step);
+        }
+    }
+    const mismatch = "expression does not match the expected type";
+    const literal = "literal does not match the annotated type";
+    const inclusive = "string slicing requires half-open '..' bounds; '..=' is not supported";
+    for ([_]struct { name: []const u8, source: []const u8, diagnostic: []const u8 }{
+        .{ .name = "start-uint", .source = "let f: (s: string, n: uint) -> string = s[n..]\n", .diagnostic = mismatch },
+        .{ .name = "end-uint", .source = "let f: (s: string, n: uint) -> string = s[..n]\n", .diagnostic = mismatch },
+        .{ .name = "start-i8", .source = "let f: (s: string, n: i8) -> string = s[n..]\n", .diagnostic = mismatch },
+        .{ .name = "end-u8", .source = "let f: (s: string, n: u8) -> string = s[..n]\n", .diagnostic = mismatch },
+        .{ .name = "start-rune", .source = "let f: (s: string) -> string = s['a'..]\n", .diagnostic = literal },
+        .{ .name = "end-bool", .source = "let f: (s: string) -> string = s[..true]\n", .diagnostic = literal },
+        .{ .name = "result-rune", .source = "let f: (s: string) -> rune = s[..]\n", .diagnostic = mismatch },
+        .{ .name = "inclusive", .source = "let f: (s: string) -> string = s[0..=1]\n", .diagnostic = inclusive },
+        .{ .name = "inclusive-prefix", .source = "let f: (s: string) -> string = s[..=1]\n", .diagnostic = inclusive },
+        .{ .name = "inclusive-suffix", .source = "let f: (s: string) -> string = s[0..=]\n", .diagnostic = inclusive },
+        .{ .name = "array", .source = "let f: (s: []u8) -> string = s[..]\n", .diagnostic = "slicing requires a string value" },
+        .{ .name = "write", .source = "let main: () = {let mut s = \"abc\"\ns[..] = \"x\"}\n", .diagnostic = "assignment target must be a mutable local, its struct field path, or its scalar-array element" },
+    }) |case| {
+        const source = b.fmt("invalid-{s}.nov", .{case.name});
+        _ = fixtures.add(source, case.source);
+        const run = b.addRunArtifact(exe);
+        run.step.name = b.fmt("CLI string slices: reject {s}", .{case.name});
         run.setCwd(fixtures.getDirectory());
         run.addArgs(&.{ "check", "--semantic", source });
         run.expectExitCode(1);

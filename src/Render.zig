@@ -304,7 +304,7 @@ fn renderExpression(self: *Render, node: Ast.Node.Index, space: Space) RenderErr
 
         .range => {
             const infix = datas[node];
-            try self.renderExpression(infix.lhs, .none);
+            if (infix.lhs != 0) try self.renderExpression(infix.lhs, .none);
             if (infix.rhs != 0) {
                 try self.renderToken(main_tokens[node], .none);
                 return self.renderExpression(infix.rhs, space);

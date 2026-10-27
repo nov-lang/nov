@@ -507,7 +507,7 @@ const Context = struct {
             },
             .negation, .bit_not, .bool_not, .@"return" => return self.probeBreaks(data.rhs, depth + 1),
             .field_access => return self.probeBreaks(data.lhs, depth + 1),
-            .range, .add, .sub, .mul, .div, .mod, .bit_and, .bit_or, .bit_xor, .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal, .bool_and, .bool_or, .in, .array_access, .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod => return (try self.probeBreaks(data.lhs, depth + 1)) orelse (try self.probeBreaks(data.rhs, depth + 1)),
+            .slice, .range, .add, .sub, .mul, .div, .mod, .bit_and, .bit_or, .bit_xor, .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal, .bool_and, .bool_or, .in, .array_access, .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod => return (try self.probeBreaks(data.lhs, depth + 1)) orelse (try self.probeBreaks(data.rhs, depth + 1)),
             else => {},
         }
         return null;
@@ -827,7 +827,7 @@ const Context = struct {
                 const shape = self.propagationShape(operand.ty) orelse break :blk null;
                 break :blk .{ .ty = self.ir.getType(operand.ty).?.record.fields[shape.ok].ty };
             },
-            .string_literal => .{ .ty = try self.ir.internType(.string) },
+            .string_literal, .slice => .{ .ty = try self.ir.internType(.string) },
             .char_literal => .{ .ty = try self.ir.internType(.rune) },
             .array_init, .array_init_comma, .array_init_two, .array_init_two_comma => try self.probeArray(node, depth),
             .array_access => blk: {
@@ -1045,6 +1045,14 @@ const Context = struct {
                 const values = try emitter.allocator.alloc(Ir.ValueId, elements.len);
                 for (elements, values) |element, *value| value.* = try emitter.value(element);
                 break :blk .{ .array_literal = values };
+            },
+            .slice => blk: {
+                const bounds = ast.slice(node).ast;
+                break :blk .{ .string_slice = .{
+                    .base = try emitter.value(bounds.sliced),
+                    .start = if (bounds.start != 0) try emitter.value(bounds.start) else null,
+                    .end = if (bounds.end != 0) try emitter.value(bounds.end) else null,
+                } };
             },
             .array_access => .{ .array_index = .{ .array = try emitter.value(data.lhs), .index = try emitter.value(data.rhs) } },
             .field_access => blk: {
@@ -1998,6 +2006,21 @@ const Context = struct {
                 }
                 self.terminated = true;
                 return if (expected) |want| want.ty else unit;
+            },
+            .slice => {
+                const bounds = ast.slice(node).ast;
+                if (ast.tokens.items(.tag)[ast.nodes.items(.main_token)[data.rhs]] == .period_period_equal)
+                    return self.fail(.inclusive_string_slice, data.rhs, null);
+                const base = (try self.expression(bounds.sliced, null, depth + 1)) orelse return null;
+                if (self.terminated) return if (expected) |want| want.ty else base;
+                if (self.ir.getType(base).? != .string) return self.fail(.string_slice_requires_string, bounds.sliced, null);
+                const index = try self.ir.internType(.{ .integer = .{ .signedness = .signed, .bits = Ir.native_pointer_bits } });
+                for ([_]Ast.Node.Index{ bounds.start, bounds.end }) |bound| {
+                    if (bound == 0) continue;
+                    if (try self.expression(bound, .{ .ty = index }, depth + 1) == null) return null;
+                    if (self.terminated) return if (expected) |want| want.ty else base;
+                }
+                return self.fit(base, expected, node);
             },
             .range => return self.rangeValue(node, expected, depth),
             .loop_range => return self.rangeExpression(node, expected, depth),
@@ -3190,6 +3213,87 @@ test "string scalar indexing has exact rune inference through contexts construct
     try std.testing.expect(indexed >= 15);
 }
 
+test "string slicing semantic types inference and rejection" {
+    for ([_]struct { source: []const u8, tag: Module.Diagnostic.Tag }{
+        .{ .source = "let f:(s:string)->string=s[..=2]", .tag = .inclusive_string_slice },
+        .{ .source = "let f:(s:string)->string=s[0..=]", .tag = .inclusive_string_slice },
+        .{ .source = "let f:(s:[]u8)->string=s[..]", .tag = .string_slice_requires_string },
+        .{ .source = "let f:(s:rune)->string=s[..]", .tag = .string_slice_requires_string },
+        .{ .source = "let f:(s:string,n:uint)->string=s[n..]", .tag = .expression_type_mismatch },
+        .{ .source = "let f:(s:string,n:u8)->string=s[..n]", .tag = .expression_type_mismatch },
+        .{ .source = "let f:(s:string,n:i8)->string=s[n..]", .tag = .expression_type_mismatch },
+        .{ .source = "let f:(s:string)->string=s[..true]", .tag = .literal_type_mismatch },
+        .{ .source = "let f:(s:string)->string=s['a'..]", .tag = .literal_type_mismatch },
+        .{ .source = "let f:(s:string)->rune=s[..]", .tag = .expression_type_mismatch },
+        .{ .source = "let f:(s:string)->[]u8=s[..]", .tag = .expression_type_mismatch },
+    }) |case| {
+        var module = try Module.init(std.testing.allocator, "slice-error.nov", case.source);
+        defer module.deinit();
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+        try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
+        try std.testing.expect(!sema.lowering_complete);
+    }
+    var module = try Module.init(std.testing.allocator, "slice-types.nov",
+        \\let G:(T:type)->type=struct{value:T,
+        \\    let cut:(s:G(T))->string=s.value[..]
+        \\}
+        \\let U=union{text:string,}
+        \\let f:(s:string,b:bool)->string={let alias=&s
+        \\    let view=alias[..]
+        \\    let a=[view,s[1..]]
+        \\    let u:U=.text[s[..1]]
+        \\    let chosen=if b {s[..]}else{view}
+        \\    let matched=match b {true=>s[..]
+        \\        false=>view}
+        \\    let looped=loop {break s[..]}
+        \\    @println(a[0],chosen,matched,looped,match u {.text=>|v|v[..]})
+        \\    G(string)[.value=s].cut()}
+    );
+    defer module.deinit();
+    errdefer std.debug.print("slice parse: {any}\n", .{module.source.ast.errors});
+    var sema = try Lowering.lower(&module);
+    defer sema.deinit();
+    errdefer std.debug.print("slice types: {any}\n", .{module.diagnostics.items});
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+    for (sema.ir.functions.items) |function| {
+        for (function.body.?.instructions, 0..) |instruction, at| {
+            if (instruction.op != .string_slice) continue;
+            const slice = instruction.op.string_slice;
+            try std.testing.expect(sema.ir.getType(instruction.ty).? == .string);
+            try std.testing.expect(@backingInt(slice.base) < at);
+            for ([_]?Ir.ValueId{ slice.start, slice.end }) |bound| if (bound) |value| {
+                try std.testing.expect(@backingInt(slice.base) < @backingInt(value));
+                try std.testing.expect(@backingInt(value) < at);
+                try std.testing.expectEqual(Ir.Type.Integer{ .signedness = .signed, .bits = Ir.native_pointer_bits }, sema.ir.getType(function.body.?.instructions[@backingInt(value)].ty).?.integer);
+            };
+        }
+    }
+}
+
+test "string slicing terminal operands skip later bounds and slice IR" {
+    for ([_][]const u8{
+        "let f:()->string=@panic(\"stop\")[missing..missing]",
+        "let f:()->string=\"a\"[{return \"done\"}..missing]",
+        "let f:()->bool=\"a\"[0..@panic(\"stop\")]",
+        "let f:()->string=loop {\"a\"[..{break \"done\"}]}",
+        "let f:()->string=loop {\"a\"[{continue}..missing]}",
+    }) |source| {
+        var module = try Module.init(std.testing.allocator, "slice-terminal.nov", source);
+        defer module.deinit();
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expect(sema.lowering_complete);
+        try sema.ir.verify();
+        for (sema.ir.functions.items) |function|
+            for (function.body.?.instructions) |instruction| try std.testing.expect(instruction.op != .string_slice);
+    }
+}
+
 test "string scalar indexing rejects nonnative indices and nonrune result contexts" {
     const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag };
     for ([_]Case{
@@ -3340,11 +3444,11 @@ test "string scalar elements remain immutable through mutable bindings and whole
     }
 }
 
-test "strings reject byte mutation slicing ordering and eager globals" {
+test "strings reject byte mutation inclusive slicing ordering and eager globals" {
     for ([_][]const u8{
         "let f: () -> void = {let mut x = [\"a\"]\nx[0] += \"b\"}",
         "let f: () -> void = {let mut x = \"a\"\nx[0] = \"b\"}",
-        "let f: () -> void = @println(\"a\"[0..1])",
+        "let f: () -> void = @println(\"a\"[0..=1])",
         "let f: () -> void = {let mut x = \"a\"\nx.len = 1}",
         "let f: () -> void = {let mut x = \"a\"\nx -= \"b\"}",
         "let f: () -> bool = \"a\" < \"b\"",

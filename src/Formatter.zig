@@ -116,6 +116,7 @@ fn checkSupported(ast: Ast) !void {
         .array_init,
         .array_init_comma,
         .array_access,
+        .slice,
         .field_access,
         .identifier,
         .number_literal,
@@ -353,6 +354,22 @@ test "rune annotations arrays defaults escapes and comments format idempotently"
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{source});
 }
 
+test "string slicing formatter forms chains comments interpolation and OOM" {
+    try expectFormatted("let f:(s:string)->string=s[ 1 .. -1 ][..][0..]", "let f: (s: string) -> string = s[1..-1][..][0..]\n");
+    for ([_][:0]const u8{
+        "let x=text[..end()]\nlet y=text[start()..]",
+        "let x=a[0..2].b\nlet y=a[0..1]",
+        "let x=text[; lower\n{0}..; upper\n{2}]",
+        "let x=\"{text[..]}\"",
+        "let x=text[0..=2]",
+    }) |source| {
+        const result = try format(std.testing.allocator, source);
+        defer std.testing.allocator.free(result);
+        try expectFormatted(source, result);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{source});
+    }
+}
+
 test "declarations arithmetic strings and idempotence" {
     try expectFormatted("", "");
     try expectFormatted(" \n\t\n", "");
@@ -437,13 +454,13 @@ test "unsupported syntax fails closed including nested expressions" {
     for ([_][:0]const u8{
         "let x=@unknown(\"memory\")\n",
         "let x=call({&value})\n",
-        "let x=a[0..2].b\n",
+
         "let x=[[1], [2]]\n",
         "let x:[][]int\n",
         "let x:[]i128\n",
         "let x:[]*int\n",
         "let x:[]() -> int\n",
-        "let x=a[0..1]\n",
+
         "let f:()->void={make().inner.len=1}\n",
         "let f:()->void={make()[0]+=1}\n",
         "let f:()->void={a[0][0]-=1}\n",
@@ -565,19 +582,19 @@ test "executable local blocks round trip" {
 
 test "every unsupported AST tag is rejected before rendering" {
     const supported = [_]Ast.Node.Tag{
-        .root,            .decl,           .identifier,         .number_literal,       .char_literal,   .string_literal,
-        .add,             .sub,            .mul,                .div,                  .mod,            .shl,
-        .shr,             .bit_and,        .bit_or,             .bit_xor,              .equal_equal,    .bang_equal,
-        .less_than,       .less_or_equal,  .greater_than,       .greater_or_equal,     .bool_and,       .bool_or,
-        .ref_of,          .negation,       .bool_not,           .bit_not,              .fn_proto_one,   .fn_proto,
-        .call_one,        .call_one_comma, .call,               .call_comma,           .block_two,      .block_two_newline,
-        .block,           .block_newline,  .@"if",              .if_else,              .range,          .loop_range,
-        .loop_condition,  .loop_cont,      .loop_else,          .@"return",            .@"break",       .@"continue",
-        .assign,          .assign_add,     .assign_sub,         .assign_mul,           .assign_div,     .assign_mod,
-        .builtin_literal, .array_type,     .array_init_two,     .array_init_two_comma, .array_init,     .array_init_comma,
-        .array_access,    .field_access,   .in,                 .match,                .match_case_one, .match_case,
-        .function_pipe,   .container_decl, .container_decl_arg, .container_field,      .unwrap,         .enum_literal,
-        .attr_one,        .attr_decl_one,  .attr_decl,
+        .root,            .decl,           .identifier,     .number_literal,       .char_literal,    .string_literal,
+        .add,             .sub,            .mul,            .div,                  .mod,             .shl,
+        .shr,             .bit_and,        .bit_or,         .bit_xor,              .equal_equal,     .bang_equal,
+        .less_than,       .less_or_equal,  .greater_than,   .greater_or_equal,     .bool_and,        .bool_or,
+        .ref_of,          .negation,       .bool_not,       .bit_not,              .fn_proto_one,    .fn_proto,
+        .call_one,        .call_one_comma, .call,           .call_comma,           .block_two,       .block_two_newline,
+        .block,           .block_newline,  .@"if",          .if_else,              .range,           .loop_range,
+        .loop_condition,  .loop_cont,      .loop_else,      .@"return",            .@"break",        .@"continue",
+        .assign,          .assign_add,     .assign_sub,     .assign_mul,           .assign_div,      .assign_mod,
+        .builtin_literal, .array_type,     .array_init_two, .array_init_two_comma, .array_init,      .array_init_comma,
+        .array_access,    .slice,          .field_access,   .in,                   .match,           .match_case_one,
+        .match_case,      .function_pipe,  .container_decl, .container_decl_arg,   .container_field, .unwrap,
+        .enum_literal,    .attr_one,       .attr_decl_one,  .attr_decl,
     };
     var ast = try Parser.parse(std.testing.allocator, "let x=1\n");
     defer ast.deinit(std.testing.allocator);
@@ -604,7 +621,7 @@ test "membership formatting preserves syntactic operands and range expressions" 
     try expectFormatted("let f:()->bool=true in [false,true,]\n", "let f: () -> bool = true in [false, true,]\n");
     try expectFormatted("let f:(n:int)->bool=n in [\n; values\n1,2,]\n", "let f: (n: int) -> bool = n in [\n    ; values\n    1,\n    2,\n]\n");
     try expectFormatted("let f: (n: int) -> bool = n in 1..3\n", "let f: (n: int) -> bool = n in 1..3\n");
-    try std.testing.expectError(error.UnsupportedSyntax, format(std.testing.allocator, "let f: (n: int, a: []int) -> bool = n in a[1..3]\n"));
+    try expectFormatted("let f: (n: int, a: []int) -> bool = n in a[1..3]\n", "let f: (n: int, a: []int) -> bool = n in a[1..3]\n");
 }
 
 test "whitespace and additional supported operators are idempotent" {

@@ -1,0 +1,112 @@
+; nov run examples/string-slices.nov
+; nov test examples/string-slices.nov
+; Half-open string slices are immutable, zero-copy views that keep their GC owner alive.
+; Bounds and .len count Unicode scalars, not UTF-8 bytes or grapheme clusters.
+; Only native int bounds are accepted; negative bounds count from the scalar end.
+
+let middle: (text: string) -> string = text[1..-1]
+let owned_view: () -> string = {
+    let payload = "é😀\0tail"
+    let text = "prefix:{payload}:suffix"
+    text[7..10]
+}
+
+let main: () = {
+    let mut text = "hé😀llo"
+    let snapshot = text[1..3]
+    @println(snapshot, text[..2], text[-3..], text[..])
+    text += "!"
+    @println(snapshot, text, middle(text))
+    let with_nul = "é\0😀"
+    @assert(with_nul[1..2] == "\0")
+    @assert(with_nul[..].len == 3)
+}
+
+@[test]
+let half_open_and_omitted: () = {
+    let text = "hello"
+    let start: int = 1
+    let end: int = 4
+    @assert(text[start..end] == "ell")
+    @assert(text[..2] == "he")
+    @assert(text[2..] == "llo")
+    @assert(text[..] == text)
+    @assert(text[-5..-1] == "hell")
+    @assert(text[..-1] == "hell")
+    @assert(text[-2..] == "lo")
+    @assert(text[-4..4] == "ell")
+    @assert(middle(text) == "ell")
+}
+
+@[test]
+let empty_boundaries: () = {
+    let text = "é😀"
+    @assert(text[0..0] == "")
+    @assert(text[2..2] == "")
+    @assert(text[2..] == "")
+    @assert(text[..0] == "")
+    @assert(text[-2..-2].len == 0)
+    @assert(""[..] == "")
+    @assert(""[0..0] == "")
+    @assert(""[..0] == "")
+    @assert(""[0..] == "")
+}
+
+@[test]
+let unicode_and_nul: () = {
+    let text = "aé😀\0e\u{301}z"
+    @assert(text.len == 7)
+    @assert(text[1..4] == "é😀\0")
+    @assert(text[1..4].len == 3)
+    @assert(text[-4..-3] == "\0")
+    @assert(text[3..4][0] == '\0')
+    @assert(text[4..6] == "e\u{301}")
+    @assert(text[4..6].len == 2)
+    @assert(text[1..3][-1] == '😀')
+}
+
+@[test]
+let nested_views: () = {
+    let text = "xé😀\0yz"
+    let view = text[1..-1]
+    @assert(view == "é😀\0y")
+    @assert(view.len == 4)
+    @assert(view[1..-1] == "😀\0")
+    @assert(view[..2][1..] == "😀")
+    @assert(view[..] == view)
+    @assert(view[4..].len == 0)
+}
+
+@[test]
+let immutable_snapshots: () = {
+    let mut text = "hé😀llo"
+    let whole = text[..]
+    let alias = &text
+    let snapshot = alias[1..3]
+    alias += "!"
+    @assert(snapshot == "é😀")
+    @assert(whole == "hé😀llo")
+    @assert(alias[-1..] == "!")
+    alias = "replacement"
+    @assert(snapshot[0] == 'é')
+    @assert(whole[-1] == 'o')
+    let mut copy = snapshot
+    copy += "?"
+    @assert(copy == "é😀?")
+    @assert(snapshot == "é😀")
+}
+
+@[test]
+let retained_owner: () = {
+    let view = owned_view()
+    let nested = view[1..]
+    let stored: []string = [view, nested]
+    loop i in 0..2000 {
+        let temporary = "allocation:{i}:é😀"
+        @assert(temporary.len > 0)
+    }
+    @assert(stored[0] == "é😀\0")
+    @assert(stored[1] == "😀\0")
+    @assert(nested.len == 2)
+    @assert(nested[-1] == '\0')
+}

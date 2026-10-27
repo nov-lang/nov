@@ -1429,8 +1429,11 @@ fn parseSuffixOp(self: *Parser, lhs: Node.Index) Error!Node.Index {
                 _ = try self.expectToken(.r_bracket);
                 return self.addNode(.{ .tag = .container_decl_arg, .main_token = lbracket, .data = .{ .lhs = lhs, .rhs = try self.addExtra(try self.listToSpan(self.scratch.items[top..])) } });
             }
-            const index_expr = try self.parseExprPrecedence(.piped_call, false, true);
-            if (index_expr == 0) return self.fail(.expected_expr);
+            const index_expr = if (self.token_tags[self.tok_i] == .period_period or self.token_tags[self.tok_i] == .period_period_equal)
+                0
+            else
+                try self.parseExprPrecedence(.piped_call, false, true);
+            if (index_expr == 0 and self.token_tags[self.tok_i] != .period_period and self.token_tags[self.tok_i] != .period_period_equal) return self.fail(.expected_expr);
 
             switch (self.token_tags[self.tok_i]) {
                 .period_period, .period_period_equal => {
@@ -1872,6 +1875,25 @@ fn testParseAllocationFailures(allocator: Allocator, source: [:0]const u8) !void
     defer ast.deinit(allocator);
     try std.testing.expectEqual(Token.Tag.eof, ast.tokens.items(.tag)[ast.tokens.len - 1]);
     try std.testing.expectEqual(source.len, ast.tokens.items(.start)[ast.lastToken(0)]);
+}
+
+test "string slicing parser accessors delimiters and OOM" {
+    const source = "let a=text[1..2]\nlet b=text[..2]\nlet c=text[1..]\nlet d=text[..]\nlet e=text[..][0..1]";
+    var ast = try parse(std.testing.allocator, source);
+    defer ast.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    for (ast.rootDecls(), 0..) |decl, i| {
+        const node = ast.decl(decl).ast.init_node;
+        const view = ast.fullSlice(node).?.ast;
+        try std.testing.expectEqualStrings("text", ast.tokenSlice(ast.firstToken(node)));
+        try std.testing.expectEqualStrings("]", ast.tokenSlice(ast.lastToken(node)));
+        try std.testing.expectEqualStrings("[", ast.tokenSlice(view.lbracket));
+        try std.testing.expectEqual(i != 1 and i != 3, view.start != 0);
+        try std.testing.expectEqual(i != 2 and i != 3, view.end != 0);
+        const range = ast.nodes.items(.data)[node].rhs;
+        try std.testing.expectEqualStrings(if (view.start == 0) ".." else if (i == 4) "0" else "1", ast.tokenSlice(ast.firstToken(range)));
+    }
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
 }
 
 test "ascription parses explicit array and function types in ordinary call views" {

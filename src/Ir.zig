@@ -72,8 +72,10 @@ pub const Operation = union(enum) {
     array_len: ValueId,
     /// Prior visible array/string value indexed by canonical signed pointer-sized int.
     /// Arrays yield their exact element type; immutable strings yield distinct runes.
-    /// String offsets count Unicode scalars, including for future slicing.
+    /// String offsets count Unicode scalars.
     array_index: struct { array: ValueId, index: ValueId },
+    /// Half-open scalar bounds, defaulting to zero and scalar length. Shares owner.
+    string_slice: struct { base: ValueId, start: ?ValueId, end: ?ValueId },
     /// Allocation-free scalar/string equality scan; record equality is unsupported.
     array_contains: struct { value: ValueId, array: ValueId },
     array_set: struct { array: ValueId, index: ValueId, value: ValueId },
@@ -870,6 +872,15 @@ fn validateBodyStructure(self: *const Ir, function: Function, body: Body) Verify
                 const base = self.getType(try operandType(body, value, i)).?;
                 if (base != .array and base != .string) return error.InvalidOperation;
             },
+            .string_slice => |r| {
+                if (ty != .string) return error.OperandTypeMismatch;
+                if (self.getType(try operandType(body, r.base, i)).? != .string) return error.InvalidOperation;
+                for ([_]?ValueId{ r.start, r.end }) |bound| {
+                    if (bound) |value| {
+                        if (!isNativeInteger(self.getType(try operandType(body, value, i)).?, .signed)) return error.OperandTypeMismatch;
+                    }
+                }
+            },
             .array_index => |r| {
                 const array = self.getType(try operandType(body, r.array, i)).?;
                 const index = self.getType(try operandType(body, r.index, i)).?;
@@ -1510,6 +1521,54 @@ test "string scalar indexing verifies exact types and prior visible operands wit
     owned[7].op.array_index.array = @fromBackingInt(3);
     try std.testing.expectError(error.InvalidOperation, ir.verify());
     owned[7] = saved;
+    try ir.verify();
+}
+
+test "string slicing IR verifies optional native bounds types and prior operands without source" {
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    const string = try ir.internType(.string);
+    const integer = try ir.internType(.{ .integer = .{ .signedness = .signed, .bits = native_pointer_bits } });
+    const uint = try ir.internType(.{ .integer = .{ .signedness = .unsigned, .bits = native_pointer_bits } });
+    const narrow = try ir.internType(.{ .integer = .{ .signedness = .signed, .bits = 8 } });
+    const boolean = try ir.internType(.boolean);
+    const rune = try ir.internType(.rune);
+    const params = [_]TypeId{ string, integer, uint, narrow, boolean, rune };
+    const signature = try ir.internType(.{ .function = .{ .params = &params, .result = string } });
+    const function = try ir.addFunction("slice", signature, .{ .start = 0, .end = 0 });
+    var instructions: [7]Instruction = undefined;
+    for (params, 0..) |ty, i| instructions[i] = .{ .ty = ty, .span = .{ .start = 0, .end = 0 }, .op = .{ .parameter = @intCast(i) } };
+    instructions[6] = .{ .ty = string, .span = .{ .start = 0, .end = 0 }, .op = .{ .string_slice = .{ .base = @fromBackingInt(0), .start = @fromBackingInt(1), .end = @fromBackingInt(1) } } };
+    try ir.setFunctionBody(function, &instructions, @fromBackingInt(6));
+    try ir.verify();
+    const owned = @constCast(ir.functions.items[0].body.?.instructions);
+    const saved = owned[6];
+    for ([_]?ValueId{ null, @fromBackingInt(1) }) |start| {
+        for ([_]?ValueId{ null, @fromBackingInt(1) }) |end| {
+            owned[6].op.string_slice.start = start;
+            owned[6].op.string_slice.end = end;
+            try ir.verify();
+        }
+    }
+    for ([_]bool{ false, true }) |end| {
+        for ([_]u32{ 0, 2, 3, 4, 5, 6, 99 }) |bad| {
+            owned[6] = saved;
+            if (end) owned[6].op.string_slice.end = @fromBackingInt(bad) else owned[6].op.string_slice.start = @fromBackingInt(bad);
+            try std.testing.expectError(if (bad >= 6) error.InvalidValueId else error.OperandTypeMismatch, ir.verify());
+        }
+    }
+    for (params[1..]) |ty| {
+        owned[6] = saved;
+        owned[6].ty = ty;
+        try std.testing.expectError(error.OperandTypeMismatch, ir.verify());
+    }
+    owned[6] = saved;
+    owned[6].op.string_slice.base = @fromBackingInt(4);
+    try std.testing.expectError(error.InvalidOperation, ir.verify());
+    owned[6] = saved;
+    owned[6].op.string_slice.base = @fromBackingInt(6);
+    try std.testing.expectError(error.InvalidValueId, ir.verify());
+    owned[6] = saved;
     try ir.verify();
 }
 

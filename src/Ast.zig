@@ -579,6 +579,10 @@ pub fn firstToken(self: Ast, node: Node.Index) TokenIndex {
     var n = node;
     while (true) switch (tags[n]) {
         .root => return 0,
+        .range => {
+            if (datas[n].lhs == 0) return main_tokens[n] - end_offset;
+            n = datas[n].lhs;
+        },
 
         .decl,
         .bool_not,
@@ -655,7 +659,6 @@ pub fn firstToken(self: Ast, node: Node.Index) TokenIndex {
         .call_one_comma,
         .call,
         .call_comma,
-        .range,
         .function_pipe,
         .bind,
         .in,
@@ -829,7 +832,7 @@ pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
         => return self.matchingDelimiter(main_tokens[n]) + end_offset,
 
         .container_decl => return self.matchingDelimiter(main_tokens[n] + 1) + end_offset,
-        .container_decl_arg, .array_access => return self.matchingDelimiter(main_tokens[n]) + end_offset,
+        .container_decl_arg, .array_access, .slice => return self.matchingDelimiter(main_tokens[n]) + end_offset,
         .container_field => {
             if (datas[n].lhs == 0 and datas[n].rhs == 0) return main_tokens[n] + end_offset;
             n = if (datas[n].rhs != 0) datas[n].rhs else datas[n].lhs;
@@ -1048,29 +1051,16 @@ pub fn sliceInit(self: Ast, node: Node.Index) full.SliceInit {
     };
 }
 
-pub fn sliceOpen(self: Ast, node: Node.Index) full.Slice {
-    assert(self.nodes.items(.tag)[node] == .slice_open);
-    const data = self.nodes.items(.data)[node];
-    return .{
-        .ast = .{
-            .sliced = data.lhs,
-            .lbracket = self.nodes.items(.main_token)[node],
-            .start = data.rhs,
-            .end = 0,
-        },
-    };
-}
-
 pub fn slice(self: Ast, node: Node.Index) full.Slice {
     assert(self.nodes.items(.tag)[node] == .slice);
     const data = self.nodes.items(.data)[node];
-    const extra = self.extraData(data.rhs, Node.Slice);
+    const bounds = self.nodes.items(.data)[data.rhs];
     return .{
         .ast = .{
             .sliced = data.lhs,
             .lbracket = self.nodes.items(.main_token)[node],
-            .start = extra.start,
-            .end = extra.end,
+            .start = bounds.lhs,
+            .end = bounds.rhs,
         },
     };
 }
@@ -1198,7 +1188,6 @@ pub fn fullSliceInit(self: Ast, buffer: *[2]Node.Index, node: Node.Index) ?full.
 
 pub fn fullSlice(self: Ast, node: Node.Index) ?full.Slice {
     return switch (self.nodes.items(.tag)[node]) {
-        .slice_open => self.sliceOpen(node),
         .slice => self.slice(node),
         else => null,
     };
