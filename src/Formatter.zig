@@ -157,7 +157,9 @@ fn checkSupported(ast: Ast) !void {
                         ast.nodes.items(.tag)[ast.nodes.items(.data)[data.rhs].lhs] != .identifier)) return error.UnsupportedSyntax;
                 var binding = false;
                 for (ast.nodes.items(.tag), 0..) |parent_tag, parent| {
-                    if (parent_tag == .decl and ast.decl(@intCast(parent)).ast.init_node == i) {
+                    if ((parent_tag == .decl and ast.decl(@intCast(parent)).ast.init_node == i) or
+                        (parent_tag == .loop_range and ast.fullRange(@intCast(parent)).?.binding == i))
+                    {
                         binding = true;
                         break;
                     }
@@ -829,6 +831,21 @@ test "loop continuations and value breaks are idempotent" {
         };
         defer std.testing.allocator.free(formatted);
         try expectFormatted(source, formatted);
+    }
+}
+
+test "iteration formatting preserves copied and borrowed captures comments and nesting" {
+    try expectFormatted("let f:()=loop &item in items {item+=1}", "let f: () = loop &item in items {\n    item += 1\n}\n");
+    for ([_][:0]const u8{
+        "let f:()=loop item in [true,false,] {continue} else {}",
+        "let f:()=loop rune in \"é\\0😀\" {break rune} else {'?'}",
+        "let f:()=loop & ; capture\nitem in ; source\nitems {item+=1} else {; exhaustion\n}",
+        "let f:()=loop &item in items {loop rune in \"é\" {@print(item,rune)}}",
+    }) |source| {
+        const formatted = try format(std.testing.allocator, source);
+        defer std.testing.allocator.free(formatted);
+        try expectFormatted(source, formatted);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{source});
     }
 }
 

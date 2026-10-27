@@ -475,10 +475,21 @@ fn usesStringLength(ir: *const Ir) bool {
     return false;
 }
 
+fn usesStringIteration(ir: *const Ir) bool {
+    for (ir.functions.items) |function| {
+        const body = function.body orelse continue;
+        for (body.instructions) |instruction| {
+            if (instruction.op == .string_decode or instruction.op == .string_next) return true;
+        }
+    }
+    return false;
+}
+
 fn writeStringScalarRuntime(ir: *const Ir, w: *std.Io.Writer) WriteError!void {
     const indexing = usesStringIndex(ir);
     const slicing = usesStringSlice(ir);
-    if (!indexing and !slicing and !usesStringLength(ir)) return;
+    const iteration = usesStringIteration(ir);
+    if (!indexing and !slicing and !usesStringLength(ir) and !iteration) return;
     // The representation keeps byte lengths; only language-facing offsets count scalars.
     try w.writeAll(
         \\static uint32_t nov_string_decode(nov_string text, uintptr_t *offset) {
@@ -500,6 +511,24 @@ fn writeStringScalarRuntime(ir: *const Ir, w: *std.Io.Writer) WriteError!void {
         \\    if (value < minimum || value > 0x10ffffu || (value >= 0xd800u && value <= 0xdfffu)) nov_rt_panic("invalid UTF-8 string");
         \\    return value;
         \\}
+        \\
+    );
+    if (iteration) try w.writeAll(
+        \\static uint32_t nov_string_cursor_rune(nov_string text, intptr_t cursor) {
+        \\    if (cursor < 0) nov_rt_panic("invalid UTF-8 cursor");
+        \\    uintptr_t offset = (uintptr_t)cursor;
+        \\    return nov_string_decode(text, &offset);
+        \\}
+        \\static intptr_t nov_string_cursor_next(nov_string text, intptr_t cursor) {
+        \\    if (cursor < 0) nov_rt_panic("invalid UTF-8 cursor");
+        \\    uintptr_t offset = (uintptr_t)cursor;
+        \\    (void)nov_string_decode(text, &offset);
+        \\    if (offset > INTPTR_MAX) nov_rt_panic("iterable too long");
+        \\    return (intptr_t)offset;
+        \\}
+        \\
+    );
+    if (indexing or slicing or usesStringLength(ir)) try w.writeAll(
         \\static uintptr_t nov_string_scalar_len(nov_string text) {
         \\    uintptr_t offset = 0, count = 0;
         \\    while (offset < text.len) { (void)nov_string_decode(text, &offset); ++count; }
@@ -873,7 +902,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
             value_used[@backingInt(r.start)] = true;
             value_used[@backingInt(r.end)] = true;
         },
-        .range_start, .range_end, .range_inclusive, .array_clone, .array_len, .to_string => |value| value_used[@backingInt(value)] = true,
+        .range_start, .range_end, .range_inclusive, .array_clone, .array_len, .iteration_len, .to_string => |value| value_used[@backingInt(value)] = true,
         .string_slice => |r| {
             value_used[@backingInt(r.base)] = true;
             if (r.start) |value| value_used[@backingInt(value)] = true;
@@ -899,6 +928,10 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
         .borrow_reserve => |slot| value_used[@backingInt(slot)] = true,
         .borrow_start => |start| if (start.index) |index| {
             value_used[@backingInt(index)] = true;
+        },
+        .string_decode, .string_next => |r| {
+            value_used[@backingInt(r.array)] = true;
+            value_used[@backingInt(r.index)] = true;
         },
         .borrow_read => {},
         .borrow_store => |store| value_used[@backingInt(store.value)] = true,
@@ -1248,6 +1281,8 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
             .borrow_read => |borrow| try writeBorrowRead(ir, w, body, borrow, instruction.ty),
             .borrow_reserve, .borrow_start, .borrow_store => unreachable,
             .field_read => |read| try w.print("v{d}.f{d}", .{ @backingInt(read.base), read.index }),
+            .iteration_len => |value| try w.print("(v{d}.len > INTPTR_MAX ? (nov_rt_panic(\"iterable too long\"), (intptr_t)0) : (intptr_t)v{d}.len)", .{ @backingInt(value), @backingInt(value) }),
+            .string_decode, .string_next => |r| try w.print("nov_string_cursor_{s}(v{d}, v{d})", .{ if (instruction.op == .string_decode) "rune" else "next", @backingInt(r.array), @backingInt(r.index) }),
             .array_len => |value| {
                 if (ir.getType(body.instructions[@backingInt(value)].ty).? == .string)
                     try w.print("nov_string_scalar_len(v{d})", .{@backingInt(value)})
@@ -4423,6 +4458,188 @@ const range_program =
     \\}
 ;
 const range_output = "0\n1\n2\n-2\n-1\n0\n4 0 0\nSE0123 1 0\niteration=0!  iteration=0!  0iteration=1!  iteration=1!  iteration=2!  iteration=2!  2 6 return\n";
+
+const iteration_program =
+    \\let R=struct{n:int,s:string,}
+    \\let Nested=struct{inner:R,}
+    \\let sum:(a:[]int)->int={let mut n:int=0
+    \\    loop &x in a {n+=x}
+    \\    n}
+    \\let produce:()->[]int={@print("once:")
+    \\    [@as(int,1),2,3]}
+    \\let first:()->string=loop r in "😀é" {return "{r}"} else {"empty"}
+    \\let main:()={
+    \\    loop x in produce() {@print(x)}
+    \\    @println("")
+    \\    let empty:[]int=[]
+    \\    loop x in empty {@print(x)} else {@println("empty")}
+    \\    let mut a:[]int=[1,2,3]
+    \\    let before=a
+    \\    loop &x in a {x*=2
+    \\        if x==4 {continue}
+    \\        x+=1}
+    \\    loop x in a {@print(x)}
+    \\    @print(":")
+    \\    loop x in before {@print(x)}
+    \\    @println("")
+    \\    loop &x in a {x=9
+    \\        break}
+    \\    @println(a[0],a[1],a[2])
+    \\    if sum(a)!=20 {@panic("parameter loan")}
+    \\    let flags=[true,false]
+    \\    let mut seen:uint=0
+    \\    loop flag in flags {if flag {seen+=1}}
+    \\    if seen!=1 {@panic("bool iteration")}
+    \\    let mut runes=['é','😀']
+    \\    loop &r in runes {r='€'}
+    \\    loop r in runes {if r!='€' {@panic("rune iteration")}}
+    \\    let mut nested=[Nested[.inner=R[.n=1,.s="nested"+"!"]]]
+    \\    loop &r in nested {r.inner.n+=2
+    \\        r.inner.s+="?"
+    \\        let copy=r.inner
+    \\        r.inner=R[.n=copy.n*2,.s=copy.s+"."]}
+    \\    if nested[0].inner.n!=6 {@panic("nested integer write")}
+    \\    if nested[0].inner.s!="nested!?." {@panic("nested string write")}
+    \\    let mut records=[R[.n=1,.s="a"+"!"],R[.n=2,.s="b"+"!"]]
+    \\    let originals=records
+    \\    loop &r in records {r.n+=3
+    \\        r.s+="?"}
+    \\    loop &r in records {let old=r
+    \\        r=R[.n=old.n*2,.s=old.s+"."]}
+    \\    loop r in records {let mut copy=r
+    \\        copy.n=99
+    \\        @println(r.n,r.s,copy.n)}
+    \\    loop r in originals {@println(r.n,r.s)}
+    \\    let mut words=["a"+"b","é"+"😀"]
+    \\    loop &s in words {s+="!"}
+    \\    loop s in words {@println(s)}
+    \\    let mut text="Aé€😀\0Z"+"!"
+    \\    loop r in text {text="rebound"+"!"
+    \\        @print(r)}
+    \\    @println("",text)
+    \\    loop _ in "" {@print("bad")} else {@println("empty string")}
+    \\    loop r in "0é😀x"[-3..-1] {@print(r)}
+    \\    @println("")
+    \\    let choice=loop r in "é😀" {if r=='😀' {break r}} else {'?'}
+    \\    @println(choice,first())
+    \\    let picked=loop &x in a {if x==4 {break x}} else {0}
+    \\    @println(picked)
+    \\    loop &x in a {loop r in "é!" {if r=='!' {continue}
+    \\        @print(x,r)}}
+    \\    @println("")
+    \\}
+;
+const iteration_output = "once:123\nempty\n347:123\n9 4 7\n8 a!?. 99\n10 b!?. 99\n1 a!\n2 b!\nab!\né😀!\nAé€😀\x00Z! rebound!\nempty string\né😀\n😀 😀\n4\n9 é4 é7 é\n";
+
+test "iteration arrays strings scoped references snapshots Unicode NUL records and GC" {
+    const c = try arrayTestProgram(iteration_program);
+    defer test_gpa.free(c);
+    var sema = source_free: {
+        var module = try Module.init(test_gpa, "iteration.nov", iteration_program);
+        defer module.deinit();
+        var lowered = try Lowering.lower(&module);
+        errdefer lowered.deinit();
+        try std.testing.expect(!module.hasErrors());
+        break :source_free lowered;
+    };
+    defer sema.deinit();
+    const library = try emit(test_gpa, &sema.ir, null);
+    defer test_gpa.free(library);
+    const source_free = try collectingTestProgram(library);
+    defer test_gpa.free(source_free);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| {
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, iteration_output, "", mode);
+        try compileAndRunMode(source_free, "typedef int nonempty_translation_unit;", 0, iteration_output, "", mode);
+    }
+}
+
+test "iteration forward string decoder is linear allocation free and checks malformed input" {
+    const library = try emitSource("let f:(s:string)=loop r in s {@print(r)}", null);
+    defer test_gpa.free(library);
+    try std.testing.expect(std.mem.indexOf(u8, library, "nov_string_scalar_len") == null);
+    try std.testing.expect(std.mem.indexOf(u8, library, "nov_string_rune_at") == null);
+    try std.testing.expect(std.mem.indexOf(u8, library, "nov_string_cursor_next") != null);
+    const success = try std.mem.concat(test_gpa, u8, &.{ library, "\nint main(void) { nov_f((nov_string){0}); nov_f((nov_string){NULL,(const unsigned char *)\"A\\0\\303\\251\\360\\237\\230\\200\",8}); " ++
+        "if (nov_rt_heap.live_objects) return 8; nov_gc_shutdown(&nov_rt_heap); return 0; }\n" });
+    defer test_gpa.free(success);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(success, "typedef int nonempty_translation_unit;", 0, "A\x00é😀", "", mode);
+    for ([_][]const u8{ "\\200", "\\300\\200", "\\355\\240\\200", "\\364\\220\\200\\200", "\\360\\237\\230" }) |bytes| {
+        const c = try std.fmt.allocPrint(test_gpa, "{s}\nint main(void) {{static const unsigned char bytes[]=\"{s}\"; nov_f((nov_string){{NULL,bytes,sizeof bytes-1}});return 99;}}\n", .{ library, bytes });
+        defer test_gpa.free(c);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 1, "", "panic: invalid UTF-8 string\n", mode);
+    }
+}
+
+test "iteration backend rejects sibling cursors and escaped element loans" {
+    var module = try Module.init(test_gpa, "bad-iteration-ir.nov", "let f:(flag:bool)={let mut a:[]int=[1]\nlet s=if flag {\"é\"} else {\"😀\"}\nloop r in s {@print(r)}\nloop &x in a {x+=1}\n@println(\"\")} ");
+    defer module.deinit();
+    var sema = try Lowering.lower(&module);
+    defer sema.deinit();
+    try std.testing.expect(!module.hasErrors());
+    const instructions = @constCast(sema.ir.functions.items[0].body.?.instructions);
+    var private: Ir.ValueId = undefined;
+    var index: Ir.ValueId = undefined;
+    var element: Ir.ValueId = undefined;
+    for (instructions, 0..) |instruction, i| switch (instruction.op) {
+        .branch => |b| {
+            private = b.then_value;
+        },
+        .string_decode => index = @fromBackingInt(@intCast(i)),
+        .borrow_start => element = @fromBackingInt(@intCast(i)),
+        else => {},
+    };
+    const cursor = instructions[@backingInt(index)];
+    instructions[@backingInt(index)].op.string_decode.array = private;
+    try std.testing.expectError(error.InvalidValueId, emit(test_gpa, &sema.ir, null));
+    instructions[@backingInt(index)] = cursor;
+    const last = instructions[instructions.len - 1];
+    instructions[instructions.len - 1].op = .{ .borrow_read = element };
+    try std.testing.expectError(error.InvalidValueId, emit(test_gpa, &sema.ir, null));
+    instructions[instructions.len - 1] = last;
+    try sema.ir.verify();
+}
+
+test "iteration loop effects preserve return propagation exhaustion and outer control targets" {
+    const source =
+        \\let O:(T:type)->type=union{some:T,none,}
+        \\let get:(yes:bool)->O(int)=if yes {.some[1]} else {.none[]}
+        \\let refs:(yes:bool)->O(int)={let mut a:[]int=[1,2]
+        \\    loop &x in a {x+=get(yes).!}
+        \\    .some[a[0]+a[1]]}
+        \\let values:(yes:bool)->O(string)={loop r in "é😀" {let n=get(yes).!
+        \\    if n==1 {return .some["{r}"]}}
+        \\    .some["empty"]}
+        \\let early:()->int=loop x in {return 7} {}
+        \\let copied:()->string={let a=["a"+"b"]
+        \\    loop &s in a {return s} else {"empty"}}
+        \\let main:()={@println(early(),copied())
+        \\    @println(match refs(true){.some=>|n|n
+        \\        .none=>0},match refs(false){.some=>|n|n
+        \\        .none=>0})
+        \\    @println(match values(true){.some=>|s|s
+        \\        .none=>"none"},match values(false){.some=>|s|s
+        \\        .none=>"none"})
+        \\    let mut n:int=0
+        \\    loop n<3 : n+=1 {loop x in {continue} {@print("bad")}}
+        \\    @println(n)
+        \\    let value:int=loop {loop _ in "" {} else {break 8}}
+        \\    @println(value)
+        \\    let mut a:[]int=[1,2]
+        \\    loop &x in a {let mut b:[]int=[3]
+        \\        loop &y in b {y+=x
+        \\            x+=y}}
+        \\}
+    ;
+    const c = try arrayTestProgram(source);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "7 ab\n5 0\né none\n3\n8\n", "", mode);
+}
+
+test "iteration compiler allocation failure rollback covers copies and references" {
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{
+        "let main:()={let mut a=[\"a\"+\"b\",\"é\"]\nloop &s in a {s+=\"!\"}\nloop s in a {loop r in s {@print(r)}}}",
+    });
+}
 
 test "ranges preserve defaults snapshots controls fresh values formatting and GC roots" {
     const c = try arrayTestProgram(range_program);

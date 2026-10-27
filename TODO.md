@@ -19,7 +19,8 @@ omitted bounds default to 0/length. Normalized `0 <= start <= end <= len` is
 required; invalid bounds panic in all modes. Base/start/end evaluate once,
 left to right. Views are immutable, allocation-free and share the original GC owner
 without copying UTF-8 bytes; small views retain the full allocation. `.len` counts
-scalars. Array slicing and iteration remain unsupported. See examples/string-slices.nov.
+scalars. Array slicing remains unsupported. Array/string iteration is supported
+as described below; see examples/string-slices.nov for slicing.
 
 Language tests are executable: `@[test]` marks top-level `() -> void` functions,
 excluded from normal semantic analysis/emission and not callable as ordinary values.
@@ -327,7 +328,8 @@ contracts remain deferred. Do not add a second built-in mutable-string type.
 
 `rune`, scalar string indexing and half-open scalar slicing are implemented (see
 above). String views share the original GC owner without copying UTF-8 bytes;
-small views retain the full allocation. Iteration and grapheme operations remain deferred.
+small views retain the full allocation. Forward scalar string iteration is
+implemented; grapheme operations remain deferred.
 
 ## Other proposals
 - transform this file into GitHub issues
@@ -351,7 +353,8 @@ small views retain the full allocation. Iteration and grapheme operations remain
   - [x] allocation-free O(n) scalar indexing returns exact rune, with int/negative indices and all-mode bounds panics
   - [x] allocation-free O(n) `.len` counts scalars, not UTF-8 bytes or graphemes
   - [x] half-open scalar slicing with native int/negative bounds, all-mode panics and allocation-free shared-owner views
-  - ordering, iteration, byte-buffer conversions and the UTF-8 builder remain deferred
+  - [x] forward O(n) scalar string iteration (see Loop)
+  - ordering, byte-buffer conversions and the UTF-8 builder remain deferred
 - add tests, mainly for Parser, IRs, Codegen and Runtime
   - [x] initial parser, formatter, file-safety, and CLI regression coverage
 - expand Render.zig to cover the full AST (simple declarations and expressions work)
@@ -725,7 +728,8 @@ deferred. Unary function/print pipes are also executable; fibo.nov
 runs unchanged. Match subjects evaluate once left-to-right; pipes evaluate as
 callee-first unary calls. Exact branch types, private scopes and terminal paths
 reuse typed branch IR. Captures/enums/complex patterns/full exhaustiveness,
-ranges/iteration remain deferred. Identifier interpolation works in branch results.
+range patterns remain deferred. Bounded range and array/string loops are
+implemented separately (see Loop). Identifier interpolation works in branch results.
 Proposals below are not a claim of executable support.
 
 TODO: check https://docs.vlang.io/statements-&-expressions.html#match
@@ -800,9 +804,28 @@ The fallback is outside the completed loop's control scope and cannot see its
 index; bounds retain the parent scope. Arrays copy, strings share rooted storage,
 and terminal fallback paths contribute no merge value. See
 `examples/range-search.nov`. Explicit range continuations,
-unbounded/stepped/descending ranges, general iterators, references, multiple
-bindings and labels remain rejected.
-Ranges are not general values or membership containers. See README for syntax.
+unbounded/stepped/descending ranges, general iterators, reference iteration over
+ranges, multiple/zip bindings and labels remain rejected.
+Reusable bounded range values are implemented (see above); ranges are not
+membership containers. See README for syntax.
+
+Array/string iteration is implemented:
+`loop item in items` evaluates the iterable once. Array items are immutable
+copies using normal element-copy rules; source array mutation and new conflicting
+loans are statically rejected. Strings yield scalar `rune` values using a forward
+UTF-8 cursor, O(n) for the full traversal; rebinding the immutable string source
+is safe and cannot change the captured traversal.
+
+`loop &item in items` accepts only unborrowed local array owners. Its scoped,
+nonescaping reference uses a stable owner/index; mutable locals permit element
+writes and immutable locals permit only reads. The exclusive whole-array loan
+makes the owner unavailable in the body, including readonly iteration. No
+reference iteration over strings, ranges, temporaries or references/reborrows.
+Normal reference reads still copy values. Both forms preserve exhaustion `else`
+(including empty sources), exact valued-break/fallback typing and `continue`
+advancement. Break/return skip `else`; without `else`, value breaks reject.
+See examples/iteration.nov. Multiple/zip iteration and general
+iterator protocols/library-container iteration remain deferred.
 `examples/fibo.nov` (unchanged) and `examples/fizzbuzz.nov` now pass semantic and
 format checks and execute in default/debug/release modes.
 
@@ -824,6 +847,9 @@ for x: int in arr {
 ```
 
 ## Iterators
+Future proposals only: the bounded array/string loops above do not implement a
+general iterator protocol or multiple/zip iteration.
+
 - an iterator is any object with a public .next() method that returns an
   Option(T) e.g. `next: (*T) -> ?U` (yes)
   - need a `(*T) -> ?*mut U` (no, \*mut is included in U if needed)
@@ -839,10 +865,12 @@ for x: int in arr {
 - use async with yield for iterators
 
 ## Use after realloc / iterator invalidation
-Make all of these work fine in Nov.
-Make sure that all kind of Nov loop work fine.
+Current array iteration prevents source mutation/new conflicting loans statically;
+reference iteration exclusively borrows its local array owner. It does not promise
+that mutation-during-iteration examples below work. General iterator invalidation
+and growable aliases remain future design work.
 
-Proposal:
+Historical proposal:
 - make it work by definition for all primitives (i.e. everything but iterators)
 - for iterator do it like rust aka force immutability and stuff to prevent this from happening
 ```zig

@@ -52,6 +52,7 @@ pub const Diagnostic = struct {
         borrow_conflict,
         borrow_escape,
         unsupported_borrow,
+        unsupported_iteration,
         duplicate_name,
         unsupported_attribute,
         invalid_test_declaration,

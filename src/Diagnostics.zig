@@ -78,6 +78,7 @@ fn renderModuleWithSources(module: *const Module, compilation: ?*const Compilati
         const location = Location.init(source.ast.source, diagnostic.span.start);
         try location.renderPrefix(source.path, "error", writer);
         switch (diagnostic.tag) {
+            .unsupported_iteration => try writer.writeAll("iteration requires an array, string or bounded integer range; reference iteration requires a local array owner (not a string, range, temporary or reborrow)"),
             .borrow_conflict => try writer.writeAll("owner access conflicts with a live borrow"),
             .borrow_escape => try writer.writeAll("references cannot escape as capabilities; read the borrowed value instead"),
             .unsupported_borrow => try writer.writeAll("borrow requires a fixed unannotated let binding to &local or &localArray[index]; void has no borrowable storage; nonlocal owners, reborrows and explicit reference types are unsupported"),

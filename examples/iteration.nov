@@ -1,0 +1,176 @@
+; nov run examples/iteration.nov
+; nov test examples/iteration.nov
+; Ordinary elements are immutable copies; &item borrows local array storage.
+
+let Cell = struct {
+    count: int,
+    label: string,
+}
+let Row = struct {
+    cell: Cell,
+}
+
+let main: () = {
+    let mut scores: []int = [2, 4, 6]
+    let original = scores
+    loop &score in scores {
+        score += 1
+    }
+    loop score in scores {
+        @println(score)
+    }
+    @println("Original:", original[0], original[1], original[2])
+    loop letter in "aé😀" {
+        @print(letter)
+    } else {
+        @println()
+    }
+    let found = loop score in scores {
+        if score > 4 {
+            break score
+        }
+    } else {
+        -1
+    }
+    @println("Found:", found)
+}
+
+@[test]
+let copied_elements: () = {
+    let rows = [Row[ .cell = Cell[ .count = 2, .label = "old" ] ]]
+    loop row in rows {
+        let mut copy = row
+        copy.cell.count += 10
+        copy.cell.label += "!"
+        @assert(copy.cell.count == 12)
+        @assert(copy.cell.label == "old!")
+    }
+    @assert(rows[0].cell.count == 2)
+    @assert(rows[0].cell.label == "old")
+    let mut total: int = 0
+    loop row in rows {
+        loop other in rows {
+            total += row.cell.count + other.cell.count
+        }
+    }
+    @assert(total == 4)
+}
+
+@[test]
+let writable_references: () = {
+    let mut numbers: []int = [1, 2]
+    let snapshot = numbers
+    loop &number in numbers {
+        number = number + 2
+        number *= 3
+    }
+    @assert(numbers[0] == 9)
+    @assert(numbers[1] == 12)
+    @assert(snapshot[0] == 1)
+    let mut rows = [Row[ .cell = Cell[ .count = 1, .label = "old" ] ]]
+    let before = rows
+    loop &row in rows {
+        row = Row[ .cell = Cell[ .count = 2, .label = "new" ] ]
+        row.cell = Cell[ .count = 3, .label = "nested" ]
+        row.cell.count += 4
+        row.cell.label += "!"
+    }
+    @assert(rows[0].cell.count == 7)
+    @assert(rows[0].cell.label == "nested!")
+    @assert(before[0].cell.label == "old")
+    numbers += [5]
+    let last = &numbers[2]
+    last = 8
+    @assert(numbers[2] == 8)
+}
+
+@[test]
+let readonly_references: () = {
+    let numbers: []int = [2, 3]
+    let mut total: int = 0
+    loop &number in numbers {
+        let copy = number
+        total += copy
+    }
+    @assert(total == 5)
+}
+
+@[test]
+let unicode_and_once: () = {
+    let mut calls: int = 0
+    let mut total: int = 0
+    loop number in {
+        calls += 1
+        @as([]int, [2, 3])
+    } {
+        total += number
+    }
+    @assert(calls == 1)
+    @assert(total == 5)
+    let expected: []rune = ['a', 'é', '😀', '\0', '\u{10FFFF}']
+    let mut text = "aé😀\0\u{10FFFF}"
+    let mut index: int = 0
+    loop scalar in {
+        calls += 1
+        text
+    } {
+        let typed: rune = scalar
+        @assert(typed == expected[index])
+        text = "replaced"
+        index += 1
+    }
+    @assert(calls == 2)
+    @assert(index == 5)
+}
+
+@[test]
+let exhaustion_and_breaks: () = {
+    let empty: []int = []
+    let fallback = loop number in empty {
+        break number
+    } else {
+        9
+    }
+    @assert(fallback == 9)
+    let mut exhausted: int = 0
+    loop _ in "" {} else {
+        exhausted += 1
+    }
+    loop &number in empty {} else {
+        exhausted += 1
+    }
+    let found = loop number in @as([]int, [1, 2, 3]) {
+        if number == 1 {
+            continue
+        }
+        break number
+    } else {
+        exhausted += 100
+        0
+    }
+    @assert(found == 2)
+    let scalar = loop letter in "é😀" {
+        if letter == 'é' {
+            continue
+        }
+        break letter
+    } else {
+        '\0'
+    }
+    @assert(scalar == '😀')
+    let mut numbers: []int = [1, 2, 3]
+    loop &number in numbers {
+        number += 10
+        if number == 11 {
+            continue
+        }
+        break
+    } else {
+        exhausted += 100
+    }
+    @assert(numbers[0] == 11)
+    @assert(numbers[1] == 12)
+    @assert(numbers[2] == 3)
+    @assert(exhausted == 2)
+    numbers += [4]
+}

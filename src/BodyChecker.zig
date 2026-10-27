@@ -160,7 +160,7 @@ fn checkInner(module: *Module, ir: *Ir, types: []const ?Ir.TypeId, id: Module.De
 }
 
 const Context = struct {
-    const Reservation = struct { owner: Module.Span, origin: Module.Span, parent: ?*const Reservation };
+    const Reservation = struct { owner: Module.Span, origin: Module.Span, parent: ?*const Reservation, reads_allowed: bool = false };
     const LoopContext = struct { allows_value: bool, result: ?Known, valued_break: bool = false, has_break: bool = false };
 
     module: *Module,
@@ -184,7 +184,17 @@ const Context = struct {
     fn reservedOrigin(self: *const Context, owner: Module.Span) ?Module.Span {
         var cursor = self.reservation;
         while (cursor) |current| : (cursor = current.parent) {
-            if (std.meta.eql(owner, current.owner)) return current.origin;
+            if (!current.reads_allowed and std.meta.eql(owner, current.owner)) return current.origin;
+        }
+        return null;
+    }
+
+    fn mutationOrigin(self: *const Context, binding: Binding) ?Module.Span {
+        const owner = if (binding.loan_owner) |loan| loan.owner else binding.name_span;
+        var cursor = self.reservation;
+        while (cursor) |current| : (cursor = current.parent) {
+            // The iteration element itself may write through its exclusive loan.
+            if (std.meta.eql(owner, current.owner) and (!binding.borrowed or current.reads_allowed)) return current.origin;
         }
         return null;
     }
@@ -200,6 +210,10 @@ const Context = struct {
     fn borrowedName(self: *const Context, name: []const u8) bool {
         const ast = &self.module.source.ast;
         for (ast.nodes.items(.tag), ast.nodes.items(.data)) |tag, data| {
+            if (tag == .loop_range) {
+                const loop = ast.extraData(data.lhs, Ast.Node.RangeLoop);
+                if (ast.nodes.items(.tag)[loop.binding] == .ref_of and ast.nodes.items(.tag)[loop.source] == .identifier and std.mem.eql(u8, name, ast.tokenSlice(ast.nodes.items(.main_token)[loop.source]))) return true;
+            }
             if (tag != .ref_of) continue;
             var owner = data.rhs;
             if (ast.nodes.items(.tag)[owner] == .array_access) owner = ast.nodes.items(.data)[owner].lhs;
@@ -354,7 +368,7 @@ const Context = struct {
             _ = try self.fail(.unsupported_borrow, owner_node, null);
             return false;
         };
-        if (self.reservedOrigin(owner.name_span)) |origin| {
+        if (self.mutationOrigin(owner)) |origin| {
             _ = try self.fail(.borrow_conflict, owner_node, origin);
             return false;
         }
@@ -523,10 +537,16 @@ const Context = struct {
         // while looking for owned break hints. Neither walk evaluates bounds.
         const fallback = try self.probe(range.else_expr, depth + 1);
         const source = try self.probe(range.source, depth + 1);
-        const index: ?Known = if (source) |known| if (self.ir.getType(known.ty).? == .range) .{ .ty = self.ir.getType(known.ty).?.range } else null else null;
+        const index: ?Known = if (source) |known| switch (self.ir.getType(known.ty).?) {
+            .range => |ty| .{ .ty = ty },
+            .array => |ty| .{ .ty = ty },
+            .string => .{ .ty = try self.ir.internType(.rune) },
+            else => null,
+        } else null;
         const scope = self.locals.items.len;
         defer self.restoreScope(scope);
-        const token = ast.nodes.items(.main_token)[range.binding];
+        const capture = if (ast.nodes.items(.tag)[range.binding] == .ref_of) ast.nodes.items(.data)[range.binding].rhs else range.binding;
+        const token = ast.nodes.items(.main_token)[capture];
         const name = ast.tokenSlice(token);
         if (index) |known| {
             if (!std.mem.eql(u8, name, "_") and self.conflict(name) == null and !isPrimitive(name))
@@ -1178,7 +1198,7 @@ const Context = struct {
             if (self.module.lookup(binding_name)) |id| return self.fail(.immutable_assignment, target.lhs, self.module.getDeclaration(id).?.name_span);
             return self.fail(.unknown_name, target.lhs, null);
         };
-        if (self.reservedOrigin(binding.name_span)) |origin| return self.fail(.borrow_conflict, root, origin);
+        if (self.mutationOrigin(binding)) |origin| return self.fail(.borrow_conflict, root, origin);
         var record_id = binding.known.ty;
         var path: [Ir.max_record_depth]u32 = undefined;
         for (0..path_len) |p| {
@@ -1247,6 +1267,7 @@ const Context = struct {
         const parent = self.reservation;
         if (binding.borrowed) self.reservation = &reservation;
         defer self.reservation = parent;
+        if (self.mutationOrigin(binding)) |origin| return self.fail(.borrow_conflict, target.lhs, origin);
         const array = self.ir.getType(binding.known.ty).?;
         if (array != .array) return self.fail(.unsupported_assignment_target, data.lhs, null);
         if (!binding.mutable) return self.fail(.immutable_assignment, target.lhs, binding.name_span);
@@ -1743,22 +1764,57 @@ const Context = struct {
         const ast = &self.module.source.ast;
         const loop = ast.fullRange(node).?;
         const unit = try self.ir.internType(.void);
-        const source_type = (try self.expression(loop.source, null, depth + 1)) orelse return null;
+        const by_ref = ast.nodes.items(.tag)[loop.binding] == .ref_of;
+        const source_type = if (by_ref) reference: {
+            if (ast.nodes.items(.tag)[loop.source] != .identifier) return self.fail(.unsupported_iteration, loop.source, null);
+            const binding = self.bindings.get(ast.tokenSlice(ast.nodes.items(.main_token)[loop.source])) orelse return self.fail(.unsupported_iteration, loop.source, null);
+            if (binding.borrowed or self.ir.getType(binding.known.ty).? != .array) return self.fail(.unsupported_iteration, loop.source, null);
+            if (self.reservedOrigin(binding.name_span)) |origin| return self.fail(.borrow_conflict, loop.source, origin);
+            // A loan selects the live owner storage, never an ordinary array clone.
+            if (self.emitter) |emitter| try emitter.record(loop.source, binding.known.ty, self.irSpan(loop.source), .{ .local_load = binding.slot.? });
+            break :reference binding.known.ty;
+        } else (try self.expression(loop.source, null, depth + 1)) orelse return null;
         if (self.terminated) return if (expected) |want| want.ty else unit;
         const source = self.ir.getType(source_type).?;
-        if (source != .range) return self.fail(.operator_not_supported, loop.source, null);
-        const index_type = source.range;
-        const known: ?Known = .{ .ty = index_type };
+        if (source != .range and source != .array and source != .string) return self.fail(.unsupported_iteration, loop.source, null);
+        const sequence = source != .range;
+        const index_type = if (sequence) try self.ir.internType(.{ .integer = .{ .signedness = .signed, .bits = Ir.native_pointer_bits } }) else source.range;
+        const element_type = switch (source) {
+            .array => |ty| ty,
+            .string => try self.ir.internType(.rune),
+            .range => |ty| ty,
+            else => unreachable,
+        };
+        const known: ?Known = .{ .ty = element_type };
+        const owner: ?Binding = if (ast.nodes.items(.tag)[loop.source] == .identifier) self.bindings.get(ast.tokenSlice(ast.nodes.items(.main_token)[loop.source])) else null;
+        if (by_ref and (source != .array or owner == null or owner.?.borrowed)) return self.fail(.unsupported_iteration, loop.source, null);
+        if (by_ref) {
+            if (self.mutationOrigin(owner.?)) |origin| return self.fail(.borrow_conflict, loop.source, origin);
+        }
+        var iteration_reservation: Reservation = .{ .owner = if (owner) |binding| if (binding.loan_owner) |loan| loan.owner else binding.name_span else self.irSpan(node), .origin = self.irSpan(node), .parent = self.reservation, .reads_allowed = !by_ref };
+        const parent_reservation = self.reservation;
+        defer self.reservation = parent_reservation;
+        var loan: ?Ir.ValueId = null;
+        if (by_ref) if (self.emitter) |emitter| {
+            loan = try emitter.append(unit, self.irSpan(node), .{ .borrow_reserve = owner.?.slot.? });
+        };
         var start_value: Ir.ValueId = undefined;
         var end_value: Ir.ValueId = undefined;
         var inclusive: Ir.ValueId = undefined;
         if (self.emitter) |emitter| {
             const value = try emitter.value(loop.source);
-            start_value = try emitter.append(index_type, self.irSpan(node), .{ .range_start = value });
-            end_value = try emitter.append(index_type, self.irSpan(node), .{ .range_end = value });
-            inclusive = try emitter.append(try self.ir.internType(.boolean), self.irSpan(node), .{ .range_inclusive = value });
+            if (sequence) {
+                start_value = try emitter.append(index_type, self.irSpan(node), .{ .constant = try self.ir.internConstant(.{ .ty = index_type, .value = .{ .signed_integer = 0 } }) });
+                end_value = try emitter.append(index_type, self.irSpan(node), .{ .iteration_len = value });
+                inclusive = try emitter.append(try self.ir.internType(.boolean), self.irSpan(node), .{ .constant = try self.ir.internConstant(.{ .ty = try self.ir.internType(.boolean), .value = .{ .boolean = false } }) });
+            } else {
+                start_value = try emitter.append(index_type, self.irSpan(node), .{ .range_start = value });
+                end_value = try emitter.append(index_type, self.irSpan(node), .{ .range_end = value });
+                inclusive = try emitter.append(try self.ir.internType(.boolean), self.irSpan(node), .{ .range_inclusive = value });
+            }
         }
-        const binding_token = ast.nodes.items(.main_token)[loop.binding];
+        const capture = if (by_ref) ast.nodes.items(.data)[loop.binding].rhs else loop.binding;
+        const binding_token = ast.nodes.items(.main_token)[capture];
         const name = ast.tokenSlice(binding_token);
         const discard = std.mem.eql(u8, name, "_");
         if (std.mem.startsWith(u8, name, "@\"")) return self.fail(.unsupported_name, node, null);
@@ -1784,7 +1840,7 @@ const Context = struct {
         const boolean = try self.ir.internType(.boolean);
         if (self.emitter) |emitter| {
             counter = try emitter.append(index_type, self.irSpan(node), .{ .local_slot = start_value });
-            {
+            if (!sequence) {
                 const initial = try emitter.append(boolean, self.irSpan(node), .{ .constant = try self.ir.internConstant(.{ .ty = boolean, .value = .{ .boolean = false } }) });
                 done = try emitter.append(boolean, self.irSpan(node), .{ .local_slot = initial });
             }
@@ -1796,14 +1852,29 @@ const Context = struct {
             const rhs_start: u32 = @intCast(emitter.instructions.items.len);
             const loaded = try emitter.append(index_type, self.irSpan(node), .{ .local_load = counter });
             const less = try emitter.append(boolean, self.irSpan(node), .{ .binary = .{ .op = .lt, .lhs = loaded, .rhs = end_value } });
-            const equal = try emitter.append(boolean, self.irSpan(node), .{ .binary = .{ .op = .eq, .lhs = loaded, .rhs = end_value } });
-            const equal_inclusive = try emitter.append(boolean, self.irSpan(node), .{ .branch = .{ .condition = equal, .then_start = @intCast(emitter.instructions.items.len), .else_start = @intCast(emitter.instructions.items.len), .then_value = inclusive, .else_value = equal } });
-            condition = try emitter.append(boolean, self.irSpan(node), .{ .branch = .{ .condition = less, .then_start = @intCast(emitter.instructions.items.len), .else_start = @intCast(emitter.instructions.items.len), .then_value = less, .else_value = equal_inclusive } });
+            condition = less;
+            if (!sequence) {
+                const equal = try emitter.append(boolean, self.irSpan(node), .{ .binary = .{ .op = .eq, .lhs = loaded, .rhs = end_value } });
+                const equal_inclusive = try emitter.append(boolean, self.irSpan(node), .{ .branch = .{ .condition = equal, .then_start = @intCast(emitter.instructions.items.len), .else_start = @intCast(emitter.instructions.items.len), .then_value = inclusive, .else_value = equal } });
+                condition = try emitter.append(boolean, self.irSpan(node), .{ .branch = .{ .condition = less, .then_start = @intCast(emitter.instructions.items.len), .else_start = @intCast(emitter.instructions.items.len), .then_value = less, .else_value = equal_inclusive } });
+            }
             if (active) |lhs| condition = try emitter.append(boolean, self.irSpan(node), .{ .short_circuit = .{ .kind = .@"and", .lhs = lhs, .rhs_start = rhs_start, .rhs = condition } });
         }
         const body_start: u32 = if (self.emitter) |emitter| @intCast(emitter.instructions.items.len) else 0;
-        if (self.emitter) |emitter| current = try emitter.append(index_type, self.irSpan(node), .{ .local_load = counter });
-        if (!discard) try self.bindLocal(name, .{ .known = known.?, .name_span = self.module.tokenSpan(binding_token), .value = current });
+        var element_loan: ?Ir.ValueId = null;
+        if (self.emitter) |emitter| {
+            const index = try emitter.append(index_type, self.irSpan(node), .{ .local_load = counter });
+            if (by_ref) {
+                element_loan = try emitter.append(unit, self.irSpan(node), .{ .borrow_start = .{ .reservation = loan.?, .index = index } });
+            } else current = if (source == .array)
+                try emitter.append(element_type, self.irSpan(node), .{ .array_index = .{ .array = try emitter.value(loop.source), .index = index } })
+            else if (source == .string)
+                try emitter.append(element_type, self.irSpan(node), .{ .string_decode = .{ .array = try emitter.value(loop.source), .index = index } })
+            else
+                index;
+        }
+        if (!discard) try self.bindLocal(name, .{ .known = known.?, .name_span = self.module.tokenSpan(binding_token), .value = current, .mutable = by_ref and owner.?.mutable, .borrowed = by_ref, .borrow = element_loan, .loan_owner = if (by_ref) .{ .owner = owner.?.name_span, .origin = self.irSpan(node) } else null });
+        if (source == .array and owner != null) self.reservation = &iteration_reservation;
         if (loop.else_expr != 0 and context.result == null) context.result = try self.probeBreaks(loop.body, depth + 1);
         if (try self.expression(loop.body, .{ .ty = unit }, depth + 1) == null) return null;
         self.terminated = false;
@@ -1825,7 +1896,10 @@ const Context = struct {
             const one = try emitter.append(index_type, self.irSpan(node), .{ .constant = try self.ir.internConstant(.{ .ty = index_type, .value = if (self.ir.getType(index_type).?.integer.signedness == .signed) .{ .signed_integer = 1 } else .{ .unsigned_integer = 1 } }) });
             // Only current < end <= MAX reaches the increment. Endpoint completion
             // sets done instead of a source break, preserving exhaustion routing.
-            const next = try emitter.append(index_type, self.irSpan(node), .{ .binary = .{ .op = .add, .lhs = old, .rhs = one } });
+            const next = if (source == .string)
+                try emitter.append(index_type, self.irSpan(node), .{ .string_next = .{ .array = try emitter.value(loop.source), .index = old } })
+            else
+                try emitter.append(index_type, self.irSpan(node), .{ .binary = .{ .op = .add, .lhs = old, .rhs = one } });
             continuation = try emitter.append(unit, self.irSpan(node), .{ .local_store = .{ .slot = counter, .value = next } });
             if (at_end) |test_value| continuation = try emitter.append(unit, self.irSpan(node), .{ .branch = .{
                 .condition = test_value,
@@ -1837,6 +1911,7 @@ const Context = struct {
         }
         self.restoreScope(scope);
         self.loop_context = parent;
+        self.reservation = parent_reservation;
         const else_start: ?u32 = if (loop.else_expr != 0 and self.emitter != null) @intCast(self.emitter.?.instructions.items.len) else null;
         const exhaustion = if (loop.else_expr != 0) try self.expression(loop.else_expr, context.result, depth + 1) else unit;
         if (exhaustion == null) return null;
@@ -2108,7 +2183,7 @@ const Context = struct {
                     if (self.module.lookup(name)) |id| return self.fail(.immutable_assignment, data.lhs, self.module.getDeclaration(id).?.name_span);
                     return self.fail(.unknown_name, data.lhs, null);
                 };
-                if (self.reservedOrigin(binding.name_span)) |origin| return self.fail(.borrow_conflict, data.lhs, origin);
+                if (self.mutationOrigin(binding)) |origin| return self.fail(.borrow_conflict, data.lhs, origin);
 
                 const reservation: Reservation = .{ .owner = if (binding.loan_owner) |loan| loan.owner else binding.name_span, .origin = if (binding.loan_owner) |loan| loan.origin else self.irSpan(node), .parent = self.reservation };
                 const parent = self.reservation;
@@ -4268,7 +4343,7 @@ test "rune frontend rejects conversions operators ranges and malformed literals"
         .{ .source = "let f: () -> rune = ~'a'", .tag = .operator_not_supported },
         .{ .source = "let f: () = {let range = 'a'..'z'\n}", .tag = .operator_not_supported },
         .{ .source = "let f: () = loop r in 'a'..='z' {}", .tag = .operator_not_supported },
-        .{ .source = "let f: (r: rune) = loop value in r {}", .tag = .operator_not_supported },
+        .{ .source = "let f: (r: rune) = loop value in r {}", .tag = .unsupported_iteration },
         .{ .source = "let f: () -> rune = 'a' & 'b'", .tag = .operator_not_supported },
         .{ .source = "let f: () = {let mut r = 'a'\nr += 'b'}", .tag = .operator_not_supported },
         .{ .source = "let f: () = {let mut xs: []rune = ['a']\nxs[0] += 'b'}", .tag = .operator_not_supported },
@@ -4503,6 +4578,96 @@ test "body checking rolls back diagnostics and owned storage on allocation failu
         "let f: () -> int = loop {if true {break 1} else {break false}}",
     }) |source| {
         try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+    }
+}
+
+test "iteration record loans respect owner mutability and reject capability escapes" {
+    for ([_]struct { body: []const u8, tag: ?Module.Diagnostic.Tag = null }{
+        .{ .body = "let mut a=[R[.inner=Cell[.n=1,.s=\"x\"]]]\nloop &r in a {r.inner.n+=2\nr.inner.s+=\"!\"\nr.inner=Cell[.n=3,.s=\"new\"]\nr=R[.inner=Cell[.n=4,.s=\"row\"]]}" },
+        .{ .body = "let a=[R[.inner=Cell[.n=1,.s=\"x\"]]]\nloop &r in a {r.inner.n+=2}", .tag = .immutable_assignment },
+        .{ .body = "let mut a=[R[.inner=Cell[.n=1,.s=\"x\"]]]\nloop r in a {r.inner.n=2}", .tag = .immutable_assignment },
+        .{ .body = "let a=[R[.inner=Cell[.n=1,.s=\"x\"]]]\nloop &r in a {let copy=r\n@println(copy.inner.n)}" },
+        .{ .body = "let mut a=[R[.inner=Cell[.n=1,.s=\"x\"]]]\nloop &r in a {return &r}", .tag = .unsupported_borrow },
+        .{ .body = "let mut a=[R[.inner=Cell[.n=1,.s=\"x\"]]]\nloop &r in a {let escaped=[&r]\n}", .tag = .unsupported_borrow },
+    }) |case| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let Cell=struct{{n:int,s:string,}}\nlet R=struct{{inner:Cell,}}\nlet f:()={{\n{s}\n}}", .{case.body});
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "iteration-record.nov", source);
+        defer module.deinit();
+        errdefer std.debug.print("iteration record fixture: {s}\n", .{case.body});
+        try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        if (case.tag) |tag| {
+            try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+            try std.testing.expectEqual(tag, module.diagnostics.items[0].tag);
+        } else {
+            try std.testing.expect(!module.hasErrors());
+            try std.testing.expect(sema.lowering_complete);
+            try sema.ir.verify();
+        }
+    }
+}
+
+test "iteration validates copies scoped loans source protection and unsupported iterables" {
+    const cases = [_]struct { body: []const u8, tag: ?Module.Diagnostic.Tag = null }{
+        .{ .body = "let a:[]i8=[1,2]\nloop x in a {let n:i8=x\n@println(a[0])}" },
+        .{ .body = "let a:[]int=[1,2]\nloop x in a {loop y in a {@println(x,y)}}" },
+        .{ .body = "let mut a:[]int=[1]\nlet b=a\nloop x in a {let mut copy=x\ncopy+=1\n@println(copy,b[0])}" },
+        .{ .body = "let mut s=\"é😀\"\nloop r in s {let n:rune=r\ns=\"other\"\n@println(n)}" },
+        .{ .body = "let mut a:[]int=[1]\nloop &x in a {x+=1\nlet copy=x\n@println(copy)}\na+=[3]" },
+        .{ .body = "let a:[]int=[1]\nloop &x in a {@println(x)}" },
+        .{ .body = "let a:[]int=[]\nloop _ in a {} else {}\nloop &x in a {} else {@println(a.len)}" },
+        .{ .body = "let mut a:[]int=[1]\nloop &x in a {x=loop _ in 0..1 {break x+1} else {x}}" },
+        .{ .body = "let mut a:[]int=[1]\nlet r=&a\nloop x in r {@println(x)}" },
+        .{ .body = "let a:[]int=[1]\nloop x in a {x=2}", .tag = .immutable_assignment },
+        .{ .body = "let a:[]int=[1]\nloop &x in a {x+=2}", .tag = .immutable_assignment },
+        .{ .body = "let mut a:[]int=[1]\nloop x in a {a[0]=2}", .tag = .borrow_conflict },
+        .{ .body = "let mut a:[]int=[1]\nloop x in a {a[0]+=2}", .tag = .borrow_conflict },
+        .{ .body = "let mut a:[]int=[1]\nloop x in a {a=[2]}", .tag = .borrow_conflict },
+        .{ .body = "let mut a:[]int=[1]\nloop x in a {a+=[2]}", .tag = .borrow_conflict },
+        .{ .body = "let mut a:[]int=[1]\nloop x in a {let r=&a[0]\nr=2}", .tag = .borrow_conflict },
+        .{ .body = "let mut a:[]int=[1]\nloop x in a {loop &y in a {}}", .tag = .borrow_conflict },
+        .{ .body = "let mut a:[]int=[1]\nloop &x in a {@println(a[0])}", .tag = .borrow_conflict },
+        .{ .body = "let mut a:[]int=[1]\nloop &x in a {@println(a.len)}", .tag = .borrow_conflict },
+        .{ .body = "let mut a:[]int=[1]\nloop &x in a {a=[2]}", .tag = .borrow_conflict },
+        .{ .body = "let mut a:[]int=[1]\nloop &x in a {a+=[2]}", .tag = .borrow_conflict },
+        .{ .body = "let mut a:[]int=[1]\nloop &x in a {let r=&a[0]\n}", .tag = .borrow_conflict },
+        .{ .body = "let mut a:[]int=[1]\nloop &x in a {loop y in a {}}", .tag = .borrow_conflict },
+        .{ .body = "let mut a:[]int=[1]\nloop &x in a {let r=&x\n}", .tag = .unsupported_borrow },
+        .{ .body = "let mut a:[]int=[1]\nloop &x in a {}\n@println(x)", .tag = .unknown_name },
+        .{ .body = "let mut a:[]int=[1]\nloop &x in a {} else {@println(x)}", .tag = .unknown_name },
+        .{ .body = "loop &x in [true] {}", .tag = .unsupported_iteration },
+        .{ .body = "loop &x in \"é\" {}", .tag = .unsupported_iteration },
+        .{ .body = "loop &x in 0..2 {}", .tag = .unsupported_iteration },
+        .{ .body = "let a:[]int=[1]\nlet r=&a\nloop &x in r {}", .tag = .unsupported_iteration },
+        .{ .body = "loop x in true {}", .tag = .unsupported_iteration },
+        .{ .body = "loop x in f {}", .tag = .unsupported_iteration },
+        .{ .body = "let mut a:[]int=[1]\nlet r=&a[0]\nloop x in a {r+=1}", .tag = .borrow_conflict },
+        .{ .body = "let mut a:[]int=[1]\nlet r=&a\nloop &x in a {@println(r[0])}", .tag = .borrow_conflict },
+        .{ .body = "let mut a:[]int=[1]\nloop x in a {let r=&x\n@println(r)}" },
+        .{ .body = "let mut a:[]int=[1]\nloop &x in a {let copy=x\n@println(copy)}\nlet r=&a[0]\nr=3" },
+        .{ .body = "let mut a:[]int=[1]\nloop &x in a {x+=1\n@println(a)}", .tag = .borrow_conflict },
+        .{ .body = "loop x in [true] {break true}", .tag = .conditional_value_break },
+    };
+    for (cases) |case| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let f:()={{\n{s}\n}}", .{case.body});
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "iteration.nov", source);
+        defer module.deinit();
+        errdefer std.debug.print("iteration case: {s}\n", .{case.body});
+        try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        if (case.tag) |tag| {
+            try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+            try std.testing.expectEqual(tag, module.diagnostics.items[0].tag);
+            try std.testing.expect(!sema.lowering_complete);
+        } else {
+            try std.testing.expect(!module.hasErrors());
+            try std.testing.expect(sema.lowering_complete);
+            try sema.ir.verify();
+        }
     }
 }
 

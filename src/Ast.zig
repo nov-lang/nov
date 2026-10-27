@@ -400,7 +400,7 @@ pub fn renderError(self: Ast, parse_error: Error, writer: anytype) !void {
         //     });
         // },
         .unsupported_loop => return writer.writeAll("unsupported loop form; expected 'loop condition { ... }'"),
-        .unsupported_range_loop => return writer.writeAll("unsupported range loop; expected 'loop name in range_expression { ... }'; ranges require both bounds, without steps or continuations"),
+        .unsupported_range_loop => return writer.writeAll("unsupported iteration loop; expected 'loop name in iterable { ... }' or 'loop &name in local_array { ... }'; multiple/zip bindings, steps and continuations are unsupported"),
         .expected_decl => {
             return writer.print("expected declaration, found '{s}'", .{
                 token_tags[parse_error.token + @intFromBool(parse_error.token_is_prev)].symbol(),
@@ -1603,7 +1603,7 @@ pub const Node = struct {
         /// rhs can be omitted.
         /// main_token is the `..` or `..=`.
         range,
-        /// Iteration over a reusable bounds expression. `RangeLoop[lhs]`, rhs is the final body/else.
+        /// Iteration over a range, array or string. `RangeLoop[lhs]`, rhs is the final body/else.
         loop_range,
         /// `loop lhs rhs`: optional boolean condition (0 for unconditional) and lexical body block.
         loop_condition,
@@ -1696,6 +1696,7 @@ pub const Node = struct {
     };
 
     pub const RangeLoop = struct {
+        /// Identifier, or ref_of(identifier) for a scoped element loan.
         binding: Index,
         source: Index,
         body: Index,

@@ -133,6 +133,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const rune_tests = b.step("test-cli-runes", "Run Unicode rune CLI tests");
     addRuneCliTests(b, exe, rune_tests);
     test_step.dependOn(rune_tests);
+    const iteration_tests = b.step("test-cli-iteration", "Run array and Unicode string iteration CLI tests");
+    addIterationCliTests(b, exe, iteration_tests);
+    test_step.dependOn(iteration_tests);
     addFieldMutationCliTests(b, exe, test_step, fixtures);
     addGenericStructCliTests(b, exe, test_step, fixtures);
     addRangeValueCliTests(b, exe, test_step, fixtures);
@@ -2534,6 +2537,83 @@ fn addBorrowCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *st
     reject.expectStdOutEqual("");
     reject.expectStdErrMatch("owner access conflicts with a live borrow");
     test_step.dependOn(&reject.step);
+}
+
+fn addIterationCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    const fixtures = b.addWriteFiles();
+    _ = fixtures.add("iteration.nov", @embedFile("examples/iteration.nov"));
+    for ([_][]const u8{ "fmt", "semantic" }) |mode| {
+        const run = b.addRunArtifact(exe);
+        run.step.name = b.fmt("CLI iteration: {s}", .{mode});
+        run.setCwd(fixtures.getDirectory());
+        run.addArgs(if (std.mem.eql(u8, mode, "fmt")) &.{ "fmt", "--check", "iteration.nov" } else &.{ "check", "--semantic", "iteration.nov" });
+        run.expectExitCode(0);
+        run.expectStdOutEqual("");
+        run.expectStdErrEqual("");
+        test_step.dependOn(&run.step);
+    }
+    for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+        for ([_][]const u8{ "run", "test" }) |command| {
+            const run = b.addRunArtifact(exe);
+            run.step.name = b.fmt("CLI iteration: {s} ({s})", .{ command, mode });
+            run.setCwd(fixtures.getDirectory());
+            run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+            run.setEnvironmentVariable("NOV_CC", "");
+            run.setEnvironmentVariable("CC", "");
+            run.addArgs(&.{ command, "iteration.nov" });
+            if (mode.len != 0) run.addArg(mode);
+            run.expectExitCode(0);
+            run.expectStdOutEqual(if (std.mem.eql(u8, command, "run"))
+                "3\n5\n7\nOriginal: 2 4 6\naé😀\nFound: 5\n"
+            else
+                "PASS copied_elements\nPASS writable_references\nPASS readonly_references\nPASS unicode_and_once\nPASS exhaustion_and_breaks\n5 passed; 0 failed; 5 total\n");
+            run.expectStdErrEqual("");
+            test_step.dependOn(&run.step);
+        }
+    }
+    const conflict = "owner access conflicts with a live borrow";
+    const immutable = "assignment requires a mutable local";
+    const unsupported = "reference iteration requires a local array owner";
+    const reborrow = "borrow requires a fixed unannotated let binding";
+    for ([_]struct { name: []const u8, body: []const u8, diagnostic: []const u8 }{
+        .{ .name = "copy-assignment", .body = "let a:[]int=[1]\nloop x in a {x=2}", .diagnostic = immutable },
+        .{ .name = "copy-field", .body = "let a=[R[.n=1]]\nloop x in a {x.n+=1}", .diagnostic = immutable },
+        .{ .name = "source-element", .body = "let mut a:[]int=[1]\nloop x in a {a[0]=2}", .diagnostic = conflict },
+        .{ .name = "source-compound", .body = "let mut a:[]int=[1]\nloop x in a {a[0]+=2}", .diagnostic = conflict },
+        .{ .name = "source-replacement", .body = "let mut a:[]int=[1]\nloop x in a {a=[2]}", .diagnostic = conflict },
+        .{ .name = "source-growth", .body = "let mut a:[]int=[1]\nloop x in a {a+=[2]}", .diagnostic = conflict },
+        .{ .name = "new-loan", .body = "let mut a:[]int=[1]\nloop x in a {let r=&a[0]\nr=2}", .diagnostic = conflict },
+        .{ .name = "nested-exclusive", .body = "let mut a:[]int=[1]\nloop x in a {loop &y in a {}}", .diagnostic = conflict },
+        .{ .name = "prior-loan", .body = "let mut a:[]int=[1]\nlet r=&a\nloop &x in a {@println(r[0])}", .diagnostic = conflict },
+        .{ .name = "loan-source-read", .body = "let mut a:[]int=[1]\nloop &x in a {@println(a[0])}", .diagnostic = conflict },
+        .{ .name = "loan-source-growth", .body = "let mut a:[]int=[1]\nloop &x in a {a+=[2]}", .diagnostic = conflict },
+        .{ .name = "loan-new-loan", .body = "let mut a:[]int=[1]\nloop &x in a {let r=&a[0]\n}", .diagnostic = conflict },
+        .{ .name = "reference-string", .body = "let a=\"é😀\"\nloop &x in a {}", .diagnostic = unsupported },
+        .{ .name = "reference-range", .body = "loop &x in 0..2 {}", .diagnostic = unsupported },
+        .{ .name = "reference-temporary", .body = "loop &x in [true] {}", .diagnostic = unsupported },
+        .{ .name = "reference-reborrow", .body = "let a:[]int=[1]\nlet r=&a\nloop &x in r {}", .diagnostic = unsupported },
+        .{ .name = "readonly-assignment", .body = "let a:[]int=[1]\nloop &x in a {x=2}", .diagnostic = immutable },
+        .{ .name = "readonly-compound", .body = "let a:[]int=[1]\nloop &x in a {x+=2}", .diagnostic = immutable },
+        .{ .name = "readonly-field", .body = "let a=[R[.n=1]]\nloop &x in a {x.n+=1}", .diagnostic = immutable },
+        .{ .name = "escape-return", .body = "let mut a:[]int=[1]\nloop &x in a {return &x}", .diagnostic = reborrow },
+        .{ .name = "escape-array", .body = "let mut a:[]int=[1]\nloop &x in a {let escaped=[&x]\n}", .diagnostic = reborrow },
+        .{ .name = "escape-binding", .body = "let mut a:[]int=[1]\nloop &x in a {let r=&x\n}", .diagnostic = reborrow },
+        .{ .name = "escape-scope", .body = "let a:[]int=[1]\nloop &x in a {}\n@println(x)", .diagnostic = "unknown name" },
+    }) |case| {
+        const source = b.fmt("invalid-{s}.nov", .{case.name});
+        _ = fixtures.add(source, b.fmt("let R=struct{{n:int,}}\nlet main:()={{\n{s}\n}}\n", .{case.body}));
+        const run = b.addRunArtifact(exe);
+        run.step.name = b.fmt("CLI iteration: reject {s}", .{case.name});
+        run.setCwd(fixtures.getDirectory());
+        run.addArgs(&.{ "check", "--semantic", source });
+        run.expectExitCode(1);
+        run.expectStdOutEqual("");
+        run.expectStdErrMatch(b.fmt("{s}:", .{source}));
+        run.expectStdErrMatch("error:");
+        run.expectStdErrMatch(case.diagnostic);
+        if (std.mem.eql(u8, case.diagnostic, conflict)) run.expectStdErrMatch("borrow originates here");
+        test_step.dependOn(&run.step);
+    }
 }
 
 fn addRangeValueCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step, fixtures: *std.Build.Step.WriteFile) void {

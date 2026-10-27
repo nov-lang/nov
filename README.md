@@ -1317,7 +1317,8 @@ let main: () -> void = {
 - `.len` writes are explicitly rejected: shrinking and especially initialization
   on length growth remain undesigned. No array printing, equality, concatenation
   with `+`, slices, nested arrays, enum/union/pointer/function elements, general aliases,
-  array globals, capacity API, or iteration is delivered. The formatter supports
+  array globals, or capacity API is delivered. Bounded value/reference iteration is
+  supported (see [Loop](#loop)). The formatter supports
   the array syntax described above without extending these semantics.
   Indexed elements use normal scalar/record printing rules; array values themselves
   cannot be printed.
@@ -1549,10 +1550,11 @@ exclusive/inclusive searches and overflow-free MAX exhaustion.
 See [`examples/range-values.nov`](examples/range-values.nov) for stored bounds
 iterated twice, first to print 0 through 9 and then to compute a sum of 45.
 
-Ranges are not general iterable or membership containers. Missing bounds,
-steps/descending iteration, array/string/general iterators, multiple bindings,
-references, labels, user continuation clauses, and value breaks without `else`
-are explicitly unsupported. There is no `for` keyword alias. Header expressions
+Ranges are not membership containers or implementations of a general iterator
+protocol. Missing bounds, steps/descending iteration, general iterators, multiple
+bindings, reference iteration over ranges, labels, user continuation clauses, and
+value breaks without `else` are explicitly unsupported. Array/string iteration is
+supported separately (see [Loop](#loop)). There is no `for` keyword alias. Header expressions
 retain the existing single-newline continuation rules, including after `in` and
 `..`/`..=`; the body follows the completed upper-bound expression without a newline.
 
@@ -1654,15 +1656,42 @@ let main: () -> void = {
 }
 ```
 
-The condition/unconditional forms and continuation clauses below are executable.
-The conditional `else` and bounded exclusive/inclusive integer range examples are
-also executable (see [Range](#range)). General iteration, references, and labels
-below still describe intended syntax.
+### Array and string iteration
+
+`loop item in items { ... }` evaluates the iterable expression once. For arrays,
+`item` is an immutable value copied with the normal element-copy rules; it is not
+an alias into the source. Mutation of the source array and new conflicting loans
+are statically rejected during iteration. For strings, `item` is a Unicode scalar
+`rune`, not a byte or grapheme. A forward UTF-8 cursor makes the whole traversal
+O(n) in the byte length, rather than repeatedly scanning from the start. The
+immutable string value is captured once, so rebinding its source local is safe
+and does not change the active traversal.
+
+`loop &item in items { ... }` is supported only for an unborrowed local array
+owner. The item is a scoped, nonescaping reference represented by a stable owner
+and index, not a general pointer. A mutable local array permits element writes;
+an immutable local array permits only reads. The whole owner is exclusively
+borrowed and unavailable in the body, even for a readonly item. Reference
+iteration over strings, ranges, temporaries or references (reborrowing) is not
+supported. Ordinary reads of a reference still produce copied values.
+
+Both forms preserve the existing loop control/result rules: normal exhaustion,
+including an empty source, runs `else`; `break`/`return` skip it, and `continue`
+advances to the next element. With `else`, value breaks and exhaustion results
+must match exactly; without `else`, these loops yield `void` and reject value
+breaks. The item is scoped to the body, and `else` is outside the completed
+loop's control scope. See [`examples/iteration.nov`](examples/iteration.nov).
+Multiple/zip bindings, general iterator protocols, array slices and labels remain
+unsupported; this does not enable arbitrary library-container iteration.
+
+The condition/unconditional forms, continuation clauses, conditional `else`,
+array/string iteration and bounded integer range examples below are executable
+within these limits (see also [Range](#range)). The multiple-binding example is
+future syntax only.
 
 ```nov
-; items can be an array, a slice, a string or an iterator
-; iterator semantic are not defined yet...
-; type is always inferred
+; items can be a supported array or a string; type is inferred
+; slices and general iterators are not supported
 loop item in items {}
 
 ; n takes values [0;10[
@@ -1673,11 +1702,10 @@ loop n in 0..10 {}
 ; n takes values [0;10]
 loop n in 0..=10 {}
 
-; it's possible to loop on multiple values at the same time as long as they
-; have the same length
+; future proposal only: multiple/zip iteration is not implemented
 loop item, i in items, 0.. {}
 
-; item is a copy by default, add & to get a ref instead
+; scoped reference iteration: items must be an unborrowed local array owner
 loop &item in items {}
 
 ; use underscore to ignore a value
@@ -1710,15 +1738,20 @@ let rangeHasNumber: (begin: uint, end: uint, number: uint) -> bool = {
 ## Break & Continue
 Unlabeled `break` and `continue` target the innermost loop, including from nested
 blocks, branches and short-circuit expressions. Unconditional loops and conditional
-loops with `else`, including bounded ranges, support `break value`; conditional
-and range loops without `else` support
+loops with `else`, including bounded ranges and array/string iteration, support
+`break value`; conditional, range and array/string loops without `else` support
 only bare `break`. A loop's `else` is outside that loop's control scope. With a
 continuation clause, body-side `continue` runs the continuation; condition-side
 or continuation-side `continue` reevaluates the condition directly. `break` and
 `return` skip the continuation. Labels remain unsupported.
 
 ## Defer
-TODO: same as zig
+Not implemented; explicitly postponed. The approved rules in `PLAN.md` specify
+reverse-order block-exit cleanup on normal completion, return, break, continue
+and `.!` propagation (not panic), evaluated against current locals at exit.
+Results are saved before cleanup; deferred code must yield `void` and cannot
+return, break, continue or propagate with `.!`. GC roots and static borrowing
+must be preserved. These are future rules, not executable support.
 
 ## In
 `value in array` returns `bool`: true if any element equals the value, false
@@ -2057,7 +2090,8 @@ is false, while `"é" == "\u{e9}"` is true. A return, break or continue in an
 operand skips the remaining comparison without undoing earlier effects.
 
 Ordering (`<`, `<=`, `>`, `>=`), other operators (including `-=`, `*=`, `/=` and
-`%=`), iteration and grapheme operations remain deferred.
+`%=`) and grapheme operations remain deferred. Scalar string iteration is
+supported (see [Loop](#loop)).
 `[]string` and supported record arrays work with independent element storage and
 shared immutable string backing; nested arrays remain unsupported.
 
@@ -2106,7 +2140,8 @@ validated, recoverable-error byte-buffer-to-string conversion. A separate stdlib
 builder may preserve UTF-8 while appending/editing and produce independent immutable
 snapshots. These conversions and builder are **not implemented**; there is no second
 built-in mutable-string type. Rune decoding through indexing is implemented;
-iteration and grapheme operations remain deferred.
+forward scalar iteration is also implemented (see [Loop](#loop)); grapheme
+operations remain deferred.
 
 `.len` is the Unicode scalar count as native `uint`, **not byte length or a grapheme
 count**. It scans UTF-8 in O(n) time without allocations. `"é".len` and `"😀".len`

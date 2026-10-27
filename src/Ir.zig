@@ -44,6 +44,7 @@ pub const Instruction = struct { ty: TypeId, span: Span, op: Operation };
 pub const UnaryOp = enum { negate, bit_not, bool_not };
 pub const BinaryOp = enum { add, sub, mul, div, mod, bit_and, bit_or, bit_xor, eq, ne, lt, le, gt, ge };
 pub const FieldRead = struct { base: ValueId, index: u32 };
+pub const StringCursor = struct { array: ValueId, index: ValueId };
 pub const Operation = union(enum) {
     // Capabilities are unit-typed, never ordinary runtime values.
     borrow_reserve: ValueId,
@@ -70,6 +71,11 @@ pub const Operation = union(enum) {
     array_clone: ValueId,
     /// Unicode scalar count for strings; element count for arrays.
     array_len: ValueId,
+    /// Internal nonnegative signed cursor limit: array elements or string bytes.
+    iteration_len: ValueId,
+    /// Forward UTF8 cursor operations (byte offsets, not language scalar indices).
+    string_decode: StringCursor,
+    string_next: StringCursor,
     /// Prior visible array/string value indexed by canonical signed pointer-sized int.
     /// Arrays yield their exact element type; immutable strings yield distinct runes.
     /// String offsets count Unicode scalars.
@@ -871,6 +877,18 @@ fn validateBodyStructure(self: *const Ir, function: Function, body: Body) Verify
                 if (!isNativeInteger(ty, .unsigned)) return error.OperandTypeMismatch;
                 const base = self.getType(try operandType(body, value, i)).?;
                 if (base != .array and base != .string) return error.InvalidOperation;
+            },
+            .iteration_len => |value| {
+                if (!isNativeInteger(ty, .signed)) return error.OperandTypeMismatch;
+                const base = self.getType(try operandType(body, value, i)).?;
+                if (base != .array and base != .string) return error.InvalidOperation;
+            },
+            .string_decode, .string_next => |r| {
+                if (self.getType(try operandType(body, r.array, i)).? != .string) return error.InvalidOperation;
+                if (!isNativeInteger(self.getType(try operandType(body, r.index, i)).?, .signed)) return error.OperandTypeMismatch;
+                if (instruction.op == .string_decode) {
+                    if (ty != .rune) return error.OperandTypeMismatch;
+                } else if (!isNativeInteger(ty, .signed)) return error.OperandTypeMismatch;
             },
             .string_slice => |r| {
                 if (ty != .string) return error.OperandTypeMismatch;
@@ -4126,6 +4144,62 @@ test "range values require integer elements exact visible operands and immutable
     try std.testing.expectError(error.InvalidSourceSpan, t.ir.verify());
     owned[1] = good[1];
     try t.ir.verify();
+}
+
+test "iteration IR verifies cursor types limits visible values and nonescaping capabilities" {
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    ir.source_len = 100;
+    const string = try ir.internType(.string);
+    const rune = try ir.internType(.rune);
+    const integer = try ir.internType(.{ .integer = .{ .signedness = .signed, .bits = native_pointer_bits } });
+    const unsigned = try ir.internType(.{ .integer = .{ .signedness = .unsigned, .bits = native_pointer_bits } });
+    const unit = try ir.internType(.void);
+    const signature = try ir.internType(.{ .function = .{ .params = &.{ string, integer }, .result = rune } });
+    const function = try ir.addFunction("cursor", signature, .{ .start = 0, .end = 0 });
+    const make = TestFunctions.instruction;
+    const good = [_]Instruction{
+        make(string, .{ .parameter = 0 }),
+        make(integer, .{ .parameter = 1 }),
+        make(rune, .{ .string_decode = .{ .array = @fromBackingInt(0), .index = @fromBackingInt(1) } }),
+        make(integer, .{ .string_next = .{ .array = @fromBackingInt(0), .index = @fromBackingInt(1) } }),
+        make(integer, .{ .iteration_len = @fromBackingInt(0) }),
+        make(string, .{ .local_slot = @fromBackingInt(0) }),
+        make(unit, .{ .borrow_reserve = @fromBackingInt(5) }),
+        make(unit, .{ .borrow_start = .{ .reservation = @fromBackingInt(6), .index = null } }),
+        make(string, .{ .borrow_read = @fromBackingInt(7) }),
+        make(rune, .{ .string_decode = .{ .array = @fromBackingInt(8), .index = @fromBackingInt(1) } }),
+    };
+    try ir.setFunctionBody(function, &good, @fromBackingInt(9));
+    const owned = @constCast(ir.getFunction(function).?.body.?.instructions);
+    for ([_]usize{ 2, 3, 4 }) |i| {
+        for ([_]TypeId{ string, unsigned, unit }) |bad_type| {
+            owned[i].ty = bad_type;
+            try std.testing.expectError(error.OperandTypeMismatch, ir.verify());
+            owned[i] = good[i];
+        }
+        if (i == 4) {
+            owned[i].op.iteration_len = @fromBackingInt(1);
+            try std.testing.expectError(error.InvalidOperation, ir.verify());
+            owned[i] = good[i];
+        } else {
+            owned[i].op = if (i == 2) .{ .string_decode = .{ .array = @fromBackingInt(1), .index = @fromBackingInt(1) } } else .{ .string_next = .{ .array = @fromBackingInt(1), .index = @fromBackingInt(1) } };
+            try std.testing.expectError(error.InvalidOperation, ir.verify());
+            owned[i] = good[i];
+            owned[i].op = if (i == 2) .{ .string_decode = .{ .array = @fromBackingInt(0), .index = @fromBackingInt(0) } } else .{ .string_next = .{ .array = @fromBackingInt(0), .index = @fromBackingInt(0) } };
+            try std.testing.expectError(error.OperandTypeMismatch, ir.verify());
+            owned[i] = good[i];
+        }
+    }
+    for ([_]u32{ 5, 6, 7, 9, 99 }) |bad| {
+        owned[9].op.string_decode.array = @fromBackingInt(bad);
+        try std.testing.expectError(if (bad == 6 or bad == 7) error.InvalidOperation else error.InvalidValueId, ir.verify());
+        owned[9] = good[9];
+        owned[9].op.string_decode.index = @fromBackingInt(bad);
+        try std.testing.expectError(if (bad == 6 or bad == 7) error.OperandTypeMismatch else error.InvalidValueId, ir.verify());
+        owned[9] = good[9];
+    }
+    try ir.verify();
 }
 
 test "range operands and projections cannot escape private branch regions" {
