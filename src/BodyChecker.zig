@@ -644,7 +644,7 @@ const Context = struct {
 
     fn convertPrintable(self: *Context, node: Ast.Node.Index, ty: Ir.TypeId) Error!bool {
         const record = self.ir.getType(ty).?;
-        if (record == .boolean or record == .integer or record == .string) return true;
+        if (record == .boolean or record == .integer or record == .string or record == .rune) return true;
         if (record != .record and record != .enumeration) {
             _ = try self.fail(.unsupported_body_expression, node, null);
             return false;
@@ -828,6 +828,7 @@ const Context = struct {
                 break :blk .{ .ty = self.ir.getType(operand.ty).?.record.fields[shape.ok].ty };
             },
             .string_literal => .{ .ty = try self.ir.internType(.string) },
+            .char_literal => .{ .ty = try self.ir.internType(.rune) },
             .array_init, .array_init_comma, .array_init_two, .array_init_two_comma => try self.probeArray(node, depth),
             .array_access => blk: {
                 if (try self.qualifiedUnion(data.lhs)) |ty| break :blk .{ .ty = ty };
@@ -835,7 +836,7 @@ const Context = struct {
                 const ty = self.ir.getType(array.ty).?;
                 break :blk switch (ty) {
                     .array => .{ .ty = ty.array },
-                    .string => .{ .ty = try self.ir.internType(.{ .integer = .{ .signedness = .unsigned, .bits = 8 } }) },
+                    .string => .{ .ty = try self.ir.internType(.rune) },
                     else => null,
                 };
             },
@@ -1302,7 +1303,7 @@ const Context = struct {
         const data = ast.nodes.items(.data)[node];
         switch (ast.nodes.items(.tag)[node]) {
             .bit_or => return try self.patternShape(data.lhs, depth + 1) and try self.patternShape(data.rhs, depth + 1),
-            .number_literal, .string_literal, .enum_literal => return true,
+            .number_literal, .string_literal, .char_literal, .enum_literal => return true,
             .field_access => if (try Literal.qualifiedEnum(self.module, self.ir, node) != null) return true,
             .negation => if (ast.nodes.items(.tag)[data.rhs] == .number_literal) return true,
             .identifier => {
@@ -1530,7 +1531,7 @@ const Context = struct {
             const ty = (try self.expression(subject, null, depth + 1)) orelse return null;
             if (self.terminated) return if (expected) |want| want.ty else ty;
             const scalar = self.ir.getType(ty).?;
-            if (scalar != .boolean and scalar != .integer and scalar != .string and !(subjects.len == 1 and (self.tagged(ty) or scalar == .enumeration))) return self.fail(.unsupported_match_subject, subject, null);
+            if (scalar != .boolean and scalar != .integer and scalar != .string and scalar != .rune and !(subjects.len == 1 and (self.tagged(ty) or scalar == .enumeration))) return self.fail(.unsupported_match_subject, subject, null);
             snapshot.* = .{ .ty = ty, .value = if (self.emitter) |emitter| try emitter.value(subject) else null };
         }
         const union_match = subjects.len == 1 and self.tagged(subjects[0].ty);
@@ -1675,7 +1676,7 @@ const Context = struct {
                 const ty = (try self.expression(embedded, null, depth + 1)) orelse return null;
                 if (self.terminated) return self.fit(string, expected, node);
                 const scalar = self.ir.getType(ty).?;
-                if (scalar != .boolean and scalar != .integer and scalar != .string and scalar != .record and scalar != .enumeration) return self.interpolationError(.unsupported_interpolation_type, .{ .source = location.source, .start = location.start + @as(u32, @intCast(start)), .end = location.start + @as(u32, @intCast(offset)) });
+                if (scalar != .boolean and scalar != .integer and scalar != .string and scalar != .rune and scalar != .record and scalar != .enumeration) return self.interpolationError(.unsupported_interpolation_type, .{ .source = location.source, .start = location.start + @as(u32, @intCast(start)), .end = location.start + @as(u32, @intCast(offset)) });
                 if (!try self.convertPrintable(embedded, ty)) return null;
                 if (self.emitter) |emitter| {
                     const converted = try emitter.append(string, self.irSpan(node), .{ .to_string = try emitter.value(embedded) });
@@ -1950,7 +1951,7 @@ const Context = struct {
                 }
                 const index = try self.ir.internType(.{ .integer = .{ .signedness = .signed, .bits = Ir.native_pointer_bits } });
                 if (try self.expression(data.rhs, .{ .ty = index }, depth + 1) == null) return null;
-                const element = if (array == .string) try self.ir.internType(.{ .integer = .{ .signedness = .unsigned, .bits = 8 } }) else array.array;
+                const element = if (array == .string) try self.ir.internType(.rune) else array.array;
                 if (self.terminated) return if (expected) |want| want.ty else element;
                 return self.fit(element, expected, node);
             },
@@ -2129,7 +2130,7 @@ const Context = struct {
             },
             .number_literal => return self.fail(.literal_needs_type, node, null),
             .string_literal => return self.stringInterpolation(node, expected, depth),
-            .char_literal => return self.fail(.unsupported_literal, node, null),
+            .char_literal => unreachable, // Checked by Literal.check with its inferred rune type.
             .block, .block_two, .block_newline, .block_two_newline => return self.blockExpression(node, expected, depth),
             .@"if", .if_else => {
                 const branch = ast.fullIf(node).?.ast;
@@ -2204,7 +2205,7 @@ const Context = struct {
                 const operand = (try self.probe(data.lhs, depth + 1)) orelse (try self.probe(data.rhs, depth + 1)) orelse return self.missingOperandType(node, data.lhs, data.rhs, null, depth);
                 const ty = self.ir.getType(operand.ty).?;
                 const equality = ast.nodes.items(.tag)[node] == .equal_equal or ast.nodes.items(.tag)[node] == .bang_equal;
-                if (ty != .integer and !((ty == .boolean or ty == .string or ty == .enumeration) and equality)) return self.fail(.operator_not_supported, node, operand.annotation);
+                if (ty != .integer and !((ty == .boolean or ty == .string or ty == .rune or ty == .enumeration) and equality)) return self.fail(.operator_not_supported, node, operand.annotation);
                 const lhs = try self.expression(data.lhs, operand, depth + 1);
                 const rhs = try self.expression(data.rhs, operand, depth + 1);
                 if (lhs == null or rhs == null) return null;
@@ -2671,6 +2672,9 @@ test "interpolation diagnoses names grammar types scopes and exact source bytes"
         .{ .source = "let f: (n: int) -> string = \"{{n}}\"", .tag = .invalid_interpolation, .token = "{{n}" },
         .{ .source = "let f: (n: int) -> string = \"{1}\"", .tag = .literal_needs_type, .token = "1" },
         .{ .source = "let f: (n: int) -> string = \"{if}\"", .tag = .invalid_interpolation, .token = "{if}" },
+        .{ .source = "let f: () -> string = \"{'a'}\"", .tag = .invalid_interpolation, .token = "{'a'}" },
+        .{ .source = "let f: () -> string = \"{'é'}\"", .tag = .invalid_interpolation, .token = "{'é'}" },
+        .{ .source = "let f: () -> string = \"{'\\n'}\"", .tag = .invalid_interpolation, .token = "{'\\n'}" },
         .{ .source = "let f: (n: int) -> string = \"{f(n, n)}\"", .tag = .argument_count_mismatch, .token = "(" },
         .{ .source = "let f: (n: int) -> string = \"é{n + missing}\"", .tag = .unknown_name, .token = "missing" },
         .{ .source = "let f: (n: int) -> string = \"{f(true)}\"", .tag = .literal_type_mismatch, .token = "true" },
@@ -3134,39 +3138,39 @@ test "string compounds retain mutability operator and operand diagnostics" {
     }
 }
 
-test "string byte indexing has exact u8 inference through contexts constructors and generic methods" {
+test "string scalar indexing has exact rune inference through contexts constructors and generic methods" {
     const source =
         \\let G:(T:type)->type=struct{value:T,
-        \\    let byte:(self:@This(),i:int)->u8=self.value[i]
+        \\    let byte:(self:@This(),i:int)->rune=self.value[i]
         \\}
         \\let U=union{text:string,}
         \\let text:()->string="é\0z"
-        \\let take:(b:u8)->u8=b
-        \\let f:(s:string,a:[]string,i:int,b:bool)->u8={
+        \\let take:(b:rune)->rune=b
+        \\let f:(s:string,a:[]string,i:int,b:bool)->bool={
         \\    let inferred=s[i]
-        \\    let sum=1+s[0]
-        \\    let bytes=[0,s[-1],255]
-        \\    let branch=if b {0} else {s[0]}
+        \\    let sum=s[0]
+        \\    let bytes=['\0',s[-1],'ÿ']
+        \\    let branch=if b {'\0'} else {s[0]}
         \\    let matched=match b {true=>s[0]
-        \\        false=>255}
+        \\        false=>'ÿ'}
         \\    let looped=loop {break s[0]}
         \\    let alias=&s
-        \\    @assert(b and alias[0]==0 or s[-1]==255)
-        \\    @assert(text()[0]==195)
-        \\    @assert(text()[1]==169)
-        \\    @assert(text()[2]==0)
-        \\    @assert(text()[-1]==122)
+        \\    @assert(b and alias[0]=='\0' or s[-1]=='ÿ')
+        \\    @assert(text()[0]=='é')
+        \\    @assert(text()[1]=='\0')
+        \\    @assert(text()[2]=='z')
+        \\    @assert(text()[-1]=='z')
         \\    @println(sum,bytes[0],branch,matched,looped,a[0][1],s.len)
         \\    let wrapped:U=U.text[s]
         \\    @println(match wrapped {.text=>|v|v[0]})
-        \\    take(inferred)+G(string)[.value=s].byte(i)
+        \\    take(inferred)==G(string)[.value=s].byte(i)
         \\}
     ;
     var module = try Module.init(std.testing.allocator, "string-byte.nov", source);
     defer module.deinit();
     var sema = try Lowering.lower(&module);
     defer sema.deinit();
-    errdefer std.debug.print("string byte diagnostics: {any}\n", .{module.diagnostics.items});
+    errdefer std.debug.print("string scalar diagnostics: {any}\n", .{module.diagnostics.items});
     try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
     try std.testing.expect(sema.lowering_complete);
     try sema.ir.verify();
@@ -3178,8 +3182,7 @@ test "string byte indexing has exact u8 inference through contexts constructors 
             if (sema.ir.getType(base.ty).? != .string) continue;
             indexed += 1;
             const ty = sema.ir.getType(instruction.ty).?;
-            try std.testing.expect(ty == .integer);
-            try std.testing.expectEqual(Ir.Type.Integer{ .signedness = .unsigned, .bits = 8 }, ty.integer);
+            try std.testing.expect(ty == .rune);
             const index = function.body.?.instructions[@backingInt(instruction.op.array_index.index)];
             try std.testing.expectEqual(Ir.Type.Integer{ .signedness = .signed, .bits = Ir.native_pointer_bits }, sema.ir.getType(index.ty).?.integer);
         }
@@ -3187,20 +3190,20 @@ test "string byte indexing has exact u8 inference through contexts constructors 
     try std.testing.expect(indexed >= 15);
 }
 
-test "string byte indexing rejects nonnative indices and nonbyte result contexts" {
+test "string scalar indexing rejects nonnative indices and nonrune result contexts" {
     const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag };
     for ([_]Case{
-        .{ .source = "let f:(s:string,i:uint)->u8=s[i]", .tag = .expression_type_mismatch },
-        .{ .source = "let f:(s:string,i:u8)->u8=s[i]", .tag = .expression_type_mismatch },
-        .{ .source = "let f:(s:string,i:i8)->u8=s[i]", .tag = .expression_type_mismatch },
-        .{ .source = "let f:(s:string)->u8=s[true]", .tag = .literal_type_mismatch },
-        .{ .source = "let f:(s:string)->u8=s[\"0\"]", .tag = .literal_type_mismatch },
+        .{ .source = "let f:(s:string,i:uint)->rune=s[i]", .tag = .expression_type_mismatch },
+        .{ .source = "let f:(s:string,i:u8)->rune=s[i]", .tag = .expression_type_mismatch },
+        .{ .source = "let f:(s:string,i:i8)->rune=s[i]", .tag = .expression_type_mismatch },
+        .{ .source = "let f:(s:string)->rune=s[true]", .tag = .literal_type_mismatch },
+        .{ .source = "let f:(s:string)->rune=s[\"0\"]", .tag = .literal_type_mismatch },
         .{ .source = "let f:(s:string)->int=s[0]", .tag = .expression_type_mismatch },
         .{ .source = "let f:(s:string)->i8=s[0]", .tag = .expression_type_mismatch },
         .{ .source = "let f:(s:string)->uint=s[0]", .tag = .expression_type_mismatch },
         .{ .source = "let f:(s:string)->string=s[0]", .tag = .expression_type_mismatch },
         .{ .source = "let f:(s:string)->bool=s[0]", .tag = .expression_type_mismatch },
-        .{ .source = "let f:(s:string)->u8=256+s[0]", .tag = .literal_out_of_range },
+        .{ .source = "let f:(s:string)->u8=s[0]", .tag = .expression_type_mismatch },
     }) |case| {
         var module = try Module.init(std.testing.allocator, "string-byte-error.nov", case.source);
         defer module.deinit();
@@ -3212,19 +3215,19 @@ test "string byte indexing rejects nonnative indices and nonbyte result contexts
     }
 }
 
-test "string byte indexing preserves once only left to right evaluation and pre index snapshots" {
+test "string scalar indexing preserves once only left to right evaluation and pre index snapshots" {
     var module = try Module.init(std.testing.allocator, "string-byte-effects.nov",
         \\let base:()->string={@print("B")
         \\    "old"}
         \\let index:()->int={@print("I")
         \\    return -1}
-        \\let f:()->u8=base()[index()]
-        \\let snapshot:()->u8={let mut s="old"
+        \\let f:()->rune=base()[index()]
+        \\let snapshot:()->rune={let mut s="old"
         \\    s[{s="new"
         \\        index()}]}
     );
     defer module.deinit();
-    errdefer std.debug.print("string byte effects diagnostics: {any}\nparse errors: {any}\n", .{ module.diagnostics.items, module.source.ast.errors });
+    errdefer std.debug.print("string scalar effects diagnostics: {any}\nparse errors: {any}\n", .{ module.diagnostics.items, module.source.ast.errors });
     var sema = try Lowering.lower(&module);
     defer sema.deinit();
     try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
@@ -3265,18 +3268,18 @@ test "string byte indexing preserves once only left to right evaluation and pre 
     try std.testing.expectEqual(@as(usize, 2), checked);
 }
 
-test "string byte indexing terminal base and index operands skip unreachable operations" {
+test "string scalar indexing terminal base and index operands skip unreachable operations" {
     for ([_][]const u8{
-        "let f:()->u8=@panic(\"stop\")[missing]",
+        "let f:()->rune=@panic(\"stop\")[missing]",
         "let f:()->string=\"a\"[{return \"done\"}]",
         "let f:()->bool=\"a\"[@panic(\"stop\")]",
-        "let f:()->u8=loop {\"a\"[{break 7}]}",
-        "let f:()->u8=loop {\"a\"[{continue}]}",
-        "let f:(b:bool)->bool=b and \"a\"[{return false}]==0",
+        "let f:()->rune=loop {\"a\"[{break 'a'}]}",
+        "let f:()->rune=loop {\"a\"[{continue}]}",
+        "let f:(b:bool)->bool=b and \"a\"[{return false}]=='a'",
     }) |source| {
         var module = try Module.init(std.testing.allocator, "string-byte-terminal.nov", source);
         defer module.deinit();
-        errdefer std.debug.print("string byte terminal source: {s}\ndiagnostics: {any}\n", .{ source, module.diagnostics.items });
+        errdefer std.debug.print("string scalar terminal source: {s}\ndiagnostics: {any}\n", .{ source, module.diagnostics.items });
         var sema = try Lowering.lower(&module);
         defer sema.deinit();
         try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
@@ -3290,8 +3293,8 @@ test "string byte indexing terminal base and index operands skip unreachable ope
 
 fn testStringByteAllocationFailures(allocator: std.mem.Allocator) !void {
     var module = try Module.init(allocator, "string-byte-oom.nov",
-        \\let f:(s:string,a:[]string)->u8={let alias=&s
-        \\    let values=[0,alias[-1],a[0][1]]
+        \\let f:(s:string,a:[]string)->rune={let alias=&s
+        \\    let values=['\0',alias[-1],a[0][1]]
         \\    values[0]}
     );
     defer module.deinit();
@@ -3302,11 +3305,11 @@ fn testStringByteAllocationFailures(allocator: std.mem.Allocator) !void {
     try sema.ir.verify();
 }
 
-test "string byte indexing cleans up every allocation failure" {
+test "string scalar indexing cleans up every allocation failure" {
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testStringByteAllocationFailures, .{});
 }
 
-test "string byte elements remain immutable through mutable bindings and whole string borrows" {
+test "string scalar elements remain immutable through mutable bindings and whole string borrows" {
     for ([_][]const u8{ "=", "+=", "-=", "*=", "/=", "%=" }) |op| {
         for ([_][]const u8{ "let s=\"a\"", "let mut s=\"a\"", "let mut owner=\"a\"\nlet s=&owner" }) |binding| {
             const source = try std.fmt.allocPrint(std.testing.allocator, "let f:()={{{s}\ns[0]{s}1}}", .{ binding, op });
@@ -4087,6 +4090,112 @@ test "local shadowing reports both declarations and locals do not leak to other 
     try std.testing.expectEqual(Module.Diagnostic.Tag.unknown_name, module.diagnostics.items[1].tag);
 }
 
+test "rune frontend supports scalar boundaries matches printing and borrows" {
+    for ([_][]const u8{
+        "let Rune = rune\nlet identity: (x: Rune) -> Rune = x\nlet f: () -> rune = {let callback: (rune) -> rune = identity\nlet value = 'é'\ncallback(@as(Rune, value))}",
+        "let R = struct{value: rune = 'é',}\nlet U = union{value: rune,}\nlet f: () -> rune = {let r = R[]\nlet u: U = .value[r.value]\nmatch u {.value => |v| v}}",
+        "let f: (r: rune) -> rune = match r {'é' | '\\xE9' => '😀'\n_ => r}",
+        "let f: () -> bool = {let mut r = 'a'\nr = 'é'\nlet b = &r\nb = '😀'\nb == '😀'}",
+        "let f: () -> rune = {let mut xs: []rune = ['a', 'é']\nxs[0] = '😀'\nlet b = &xs[1]\nb = '\\0'\nb}",
+        "let f: () -> rune = {let xs = ['é', '😀']\nxs[0]}",
+        "let f: (r: rune) -> string = {let value = '😀'\n@println(r, value, '\\xE9')\n\"{r}:{value}\"}",
+        "let f: () -> bool = 'é' != '😀'",
+    }) |source| {
+        errdefer std.debug.print("rune frontend fixture: {s}\n", .{source});
+        var module = try Module.init(std.testing.allocator, "rune.nov", source);
+        defer module.deinit();
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expect(sema.lowering_complete);
+        try sema.ir.verify();
+    }
+}
+
+test "rune frontend specializes standard Option Result and generic struct fields" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "rune.nov", .data =
+        \\let standard = @import("std")
+        \\let Option = standard.Option
+        \\let Result = standard.Result
+        \\let Box: (T: type) -> type = struct { value: T, }
+        \\let fallback: () -> rune = '😀'
+        \\let recover: (error: rune) -> rune = error
+        \\let run: () -> rune = {
+        \\    let box = Box(rune)[.value = 'é']
+        \\    let option: Option(rune) = .some[box.value]
+        \\    let result: Result(rune, rune) = .ok[option.unwrapOr('a')]
+        \\    let empty: Option(rune) = .none[]
+        \\    let error: Result(rune, rune) = .err['é']
+        \\    @println(empty.unwrapOrElse(fallback), error.unwrapOrElse(recover))
+        \\    result.unwrapOr('\0')
+        \\}
+    });
+    const path = try tmp.dir.realPathFileAlloc(io, "rune.nov", allocator);
+    defer allocator.free(path);
+    const lib = try std.Io.Dir.cwd().realPathFileAlloc(io, "lib", allocator);
+    defer allocator.free(lib);
+    var comp = try Compilation.load(allocator, io, path, .{ .lib_dir = lib });
+    defer comp.deinit();
+    var sema = try Lowering.lowerCompilation(&comp);
+    defer sema.deinit();
+    try std.testing.expect(!comp.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+}
+
+test "rune frontend rejects conversions operators ranges and malformed literals" {
+    const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag };
+    for ([_]Case{
+        .{ .source = "let f: () -> rune = 97", .tag = .literal_type_mismatch },
+        .{ .source = "let f: () -> rune = @as(rune, 97)", .tag = .literal_type_mismatch },
+        .{ .source = "let f: () -> rune = \"a\"", .tag = .literal_type_mismatch },
+        .{ .source = "let f: () -> int = 'a'", .tag = .literal_type_mismatch },
+        .{ .source = "let f: () -> string = 'a'", .tag = .literal_type_mismatch },
+        .{ .source = "let f: (x: int) -> rune = @as(rune, x)", .tag = .expression_type_mismatch },
+        .{ .source = "let f: (r: rune) -> int = @as(int, r)", .tag = .expression_type_mismatch },
+        .{ .source = "let f: () -> bool = 'a' == 97", .tag = .literal_type_mismatch },
+        .{ .source = "let f: () -> bool = 'a' == \"a\"", .tag = .literal_type_mismatch },
+        .{ .source = "let f: () -> bool = 'a' < 'b'", .tag = .operator_not_supported },
+        .{ .source = "let f: () -> rune = 'a' + 'b'", .tag = .operator_not_supported },
+        .{ .source = "let f: () -> rune = ~'a'", .tag = .operator_not_supported },
+        .{ .source = "let f: () = {let range = 'a'..'z'\n}", .tag = .operator_not_supported },
+        .{ .source = "let f: () = loop r in 'a'..='z' {}", .tag = .operator_not_supported },
+        .{ .source = "let f: (r: rune) = loop value in r {}", .tag = .operator_not_supported },
+        .{ .source = "let f: () -> rune = 'a' & 'b'", .tag = .operator_not_supported },
+        .{ .source = "let f: () = {let mut r = 'a'\nr += 'b'}", .tag = .operator_not_supported },
+        .{ .source = "let f: () = {let mut xs: []rune = ['a']\nxs[0] += 'b'}", .tag = .operator_not_supported },
+        .{ .source = "let f: (r: rune) -> rune = match r {'a'..='z' => r\n_ => 'a'}", .tag = .unsupported_match_pattern },
+        .{ .source = "let f: () -> rune = ''", .tag = .invalid_literal },
+        .{ .source = "let f: () -> rune = 'ab'", .tag = .invalid_literal },
+        .{ .source = "let f: () -> rune = 'é'", .tag = .invalid_literal },
+        .{ .source = "let f: () -> rune = '\\u{D800}'", .tag = .invalid_literal },
+        .{ .source = "let f: () -> rune = '\\u{110000}'", .tag = .invalid_literal },
+        .{ .source = "let f: () -> rune = '\xff'", .tag = .invalid_literal },
+    }) |case| {
+        errdefer std.debug.print("rune negative fixture: {s}\n", .{case.source});
+        var module = try Module.init(std.testing.allocator, "rune-error.nov", case.source);
+        defer module.deinit();
+        try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
+        var sema = try Sema.analyzeFunctions(&module);
+        defer sema.deinit();
+        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+        try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
+        try std.testing.expect(module.sourceSlice(module.diagnostics.items[0].span) != null);
+    }
+}
+
+test "rune frontend diagnostics and bodies clean up on every allocation failure" {
+    for ([_][]const u8{
+        "let f: (r: rune) -> string = {let value = '😀'\n\"{r}:{value}\"}",
+        "let f: (r: rune) -> rune = match r {'é' => '😀'\n_ => r}",
+        "let f: () -> rune = '\\u{D800}'",
+    }) |source| try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+}
+
 test "printing accepts typed scalar arguments and returns void" {
     var module = try Module.init(std.testing.allocator, "print.nov", "let empty: () -> void = @print()\nlet line: () -> void = @println()\nlet out: (a: i8, b: u64, c: bool) -> void = @println(a, b, c, true, false, a + 1)");
     defer module.deinit();
@@ -4103,7 +4212,7 @@ test "printing rejects unresolved literals non-scalars unsupported builtins and 
         .{ .source = "let n: int = 1\nlet f: () -> void = @println(2)", .tag = .literal_needs_type },
         .{ .source = "let n: uint = 1\nlet f: () -> int = n", .tag = .expression_type_mismatch },
         .{ .source = "let f: () -> void = @println(-1)", .tag = .literal_needs_type },
-        .{ .source = "let f: () -> void = @println('a')", .tag = .unsupported_literal },
+        .{ .source = "let f: () -> void = @println('ab')", .tag = .invalid_literal },
         .{ .source = "let f: () -> void = @println({})", .tag = .unsupported_body_expression },
         .{ .source = "let f: () -> void = @println(f)", .tag = .unsupported_body_expression },
         .{ .source = "let f: () -> void = @println(@print())", .tag = .unsupported_body_expression },

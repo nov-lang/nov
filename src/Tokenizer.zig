@@ -725,6 +725,17 @@ pub fn next(self: *Tokenizer) Token {
     return result;
 }
 
+test "rune literal token spans include multiple scalars and malformed UTF8" {
+    for ([_][:0]const u8{ "'ab'", "'é'", "'é😀'", "'\xff'", "'\xed\xa0\x80'", "'\\u{D800}'", "''" }) |source| {
+        var tokenizer = Tokenizer.init(source);
+        const token = tokenizer.next();
+        try std.testing.expectEqual(Token.Tag.char_literal, token.tag);
+        try std.testing.expectEqual(@as(ByteOffset, 0), token.start);
+        try std.testing.expectEqual(source.len, token.end);
+        try std.testing.expectEqual(Token.Tag.eof, tokenizer.next().tag);
+    }
+}
+
 test "all keywords" {
     const source = try std.mem.joinZ(std.testing.allocator, " ", Token.keywords.keys());
     defer std.testing.allocator.free(source);

@@ -124,9 +124,12 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const language_tests = b.step("test-cli-language-tests", "Run test command and assertion language CLI tests");
     addLanguageTestCliTests(b, exe, language_tests);
     test_step.dependOn(language_tests);
-    const string_byte_tests = b.step("test-cli-string-bytes", "Run immutable string byte indexing CLI tests");
+    const string_byte_tests = b.step("test-cli-string-bytes", "Run immutable string scalar indexing CLI tests");
     addStringByteCliTests(b, exe, string_byte_tests);
     test_step.dependOn(string_byte_tests);
+    const rune_tests = b.step("test-cli-runes", "Run Unicode rune CLI tests");
+    addRuneCliTests(b, exe, rune_tests);
+    test_step.dependOn(rune_tests);
     addFieldMutationCliTests(b, exe, test_step, fixtures);
     addGenericStructCliTests(b, exe, test_step, fixtures);
     addRangeValueCliTests(b, exe, test_step, fixtures);
@@ -838,7 +841,7 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         value_loops.expectStdErrEqual("");
         test_step.dependOn(&value_loops.step);
 
-        const interpolation_output = "1: 1\n2: 2\n3: Fizz\n4: 4\n5: Buzz\n6: Fizz\n7: 7\n8: 8\n9: Fizz\n10: Buzz\n11: 11\n12: Fizz\n13: 13\n14: 14\n15: FizzBuzz\n{literal}: true: é\x00😀 7\n";
+        const interpolation_output = "1: 1\n2: 2\n3: Fizz\n4: 4\n5: Buzz\n6: Fizz\n7: 7\n8: 8\n9: Fizz\n10: Buzz\n11: 11\n12: Fizz\n13: 13\n14: 14\n15: FizzBuzz\n{literal}: true: é\x00😀 3\n";
         const aliases = b.addRunArtifact(exe);
         aliases.step.name = b.fmt("CLI: type aliases ({s})", .{mode});
         aliases.setCwd(fixtures.getDirectory());
@@ -932,7 +935,7 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         strings.addArgs(&.{ "run", "strings.nov" });
         if (mode.len != 0) strings.addArg(mode);
         strings.expectExitCode(0);
-        strings.expectStdOutEqual("Hello, 世界! 14\n[new binding]!\n[Hello, 世界!]\n{UTF-8} 4\na\x00b 3\nSame greeting: true true\nNUL bytes: true true\nUTF-8 equality: true false\n");
+        strings.expectStdOutEqual("Hello, 世界! 10\n[new binding]!\n[Hello, 世界!]\n{UTF-8} 1\na\x00b 3\nSame greeting: true true\nNUL bytes: true true\nUTF-8 equality: true false\n");
         strings.expectStdErrEqual("");
         test_step.dependOn(&strings.step);
 
@@ -1104,7 +1107,7 @@ fn addStringByteCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step:
     const fixtures = b.addWriteFiles();
     _ = fixtures.add("string-bytes.nov", @embedFile("examples/string-bytes.nov"));
     _ = fixtures.add("excluded.nov", "@[test]\nlet excluded: () = @panic(\"test body ran\")\n" ++
-        "let main: () = {let mut text = \"hello\"\nlet alias = &text\n@assert(alias[0] == 104)\n@assert(alias[-1] == 111)}\n");
+        "let main: () = {let mut text = \"é😀\\0\"\nlet alias = &text\n@assert(alias[0] == 'é')\n@assert(alias[-2] == '😀')\n@assert(alias[-1] == '\\0')\n@assert(alias.len == 3)}\n");
     for ([_][]const u8{ "fmt", "semantic" }) |mode| {
         const run = b.addRunArtifact(exe);
         run.step.name = b.fmt("CLI string bytes: example {s}", .{mode});
@@ -1128,7 +1131,7 @@ fn addStringByteCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step:
             run.addArgs(&.{ if (tests) "test" else "run", if (excluded) "excluded.nov" else "string-bytes.nov" });
             if (mode.len != 0) run.addArg(mode);
             run.expectExitCode(0);
-            run.expectStdOutEqual(if (excluded) "" else if (tests) "PASS ascii_negative\nPASS utf8_nul\nPASS original_snapshot\n3 passed; 0 failed; 3 total\n" else "hello hello world 104 100\n195 169 0 3\n");
+            run.expectStdOutEqual(if (excluded) "" else if (tests) "PASS ascii_negative\nPASS utf8_nul\nPASS original_snapshot\n3 passed; 0 failed; 3 total\n" else "hello hello world h d\nh d\né 😀 \x00 3\nRune: é\n");
             run.expectStdErrEqual("");
             test_step.dependOn(&run.step);
         }
@@ -1137,6 +1140,8 @@ fn addStringByteCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step:
         .{ .name = "positive", .source = "let main: () = {let text = \"abc\"\n@println(text[3])}\n" },
         .{ .name = "too-negative", .source = "let main: () = {let text = \"abc\"\n@println(text[-4])}\n" },
         .{ .name = "empty", .source = "let main: () = {let text = \"\"\n@println(text[0])}\n" },
+        .{ .name = "utf8-positive", .source = "let main: () = {let text = \"é😀\\0\"\n@println(text[3])}\n" },
+        .{ .name = "utf8-too-negative", .source = "let main: () = {let text = \"é😀\\0\"\n@println(text[-4])}\n" },
     }) |case| {
         const source = b.fmt("bounds-{s}.nov", .{case.name});
         _ = fixtures.add(source, case.source);
@@ -1159,10 +1164,12 @@ fn addStringByteCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step:
     const borrow = "borrow requires a fixed unannotated let binding to &local or &localArray[index]; void has no borrowable storage; nonlocal owners, reborrows and explicit reference types are unsupported";
     for ([_]struct { name: []const u8, source: []const u8, diagnostic: []const u8 }{
         .{ .name = "result-uint", .source = "let byte: (text: string) -> uint = text[0]\n", .diagnostic = mismatch },
-        .{ .name = "index-uint", .source = "let byte: (text: string, index: uint) -> u8 = text[index]\n", .diagnostic = mismatch },
-        .{ .name = "write", .source = "let main: () = {let mut text = \"a\"\ntext[0] = 98}\n", .diagnostic = assignment },
+        .{ .name = "result-u8", .source = "let byte: (text: string) -> u8 = text[0]\n", .diagnostic = mismatch },
+        .{ .name = "index-uint", .source = "let scalar: (text: string, index: uint) -> rune = text[index]\n", .diagnostic = mismatch },
+        .{ .name = "equality-integer", .source = "let main: () = @assert(\"a\"[0] == 97)\n", .diagnostic = "literal does not match the annotated type" },
+        .{ .name = "write", .source = "let main: () = {let mut text = \"a\"\ntext[0] = 'b'}\n", .diagnostic = assignment },
         .{ .name = "compound", .source = "let main: () = {let mut text = \"a\"\ntext[0] += 1}\n", .diagnostic = assignment },
-        .{ .name = "alias-write", .source = "let main: () = {let mut text = \"a\"\nlet alias = &text\nalias[0] = 98}\n", .diagnostic = assignment },
+        .{ .name = "alias-write", .source = "let main: () = {let mut text = \"a\"\nlet alias = &text\nalias[0] = 'b'}\n", .diagnostic = assignment },
         .{ .name = "borrow", .source = "let main: () = {let text = \"a\"\nlet byte = &text[0]\n}\n", .diagnostic = borrow },
         .{ .name = "mutable-borrow", .source = "let main: () = {let mut text = \"a\"\nlet byte = &text[0]\n}\n", .diagnostic = borrow },
         .{ .name = "alias-borrow", .source = "let main: () = {let mut text = \"a\"\nlet alias = &text\nlet byte = &alias[0]\n}\n", .diagnostic = borrow },
@@ -1177,6 +1184,147 @@ fn addStringByteCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step:
         run.expectStdOutEqual("");
         run.expectStdErrMatch(case.diagnostic);
         test_step.dependOn(&run.step);
+    }
+}
+
+fn addRuneCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    const fixtures = b.addWriteFiles();
+    const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
+    _ = fixtures.add("runes.nov", @embedFile("examples/runes.nov"));
+    _ = fixtures.add("generic.nov",
+        \\let Box: (T: type) -> type = struct {
+        \\    value: T,
+        \\    let Self = @This()
+        \\    let get: (self: Self) -> T = self.value
+        \\}
+        \\let main: () = {
+        \\    let mut box = Box(rune)[ .value = 'é' ]
+        \\    let copy = box
+        \\    box.value = '😀'
+        \\    @println(copy.get(), box.get())
+        \\    let zero = '\0'
+        \\    let maximum = '\u{10FFFF}'
+        \\    @print(zero, "{zero}{maximum}")
+        \\}
+        \\
+    );
+    for ([_][]const u8{ "fmt", "semantic" }) |mode| {
+        const run = b.addRunArtifact(exe);
+        run.step.name = b.fmt("CLI runes: example {s}", .{mode});
+        run.setCwd(fixtures.getDirectory());
+        run.addArgs(if (std.mem.eql(u8, mode, "fmt")) &.{ "fmt", "--check", "runes.nov" } else &.{ "check", "--semantic", "runes.nov" });
+        if (!std.mem.eql(u8, mode, "fmt")) {
+            run.addArg("--lib-dir");
+            run.addDirectoryArg(library);
+        }
+        run.expectExitCode(0);
+        run.expectStdOutEqual("");
+        run.expectStdErrEqual("");
+        test_step.dependOn(&run.step);
+    }
+    for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+        for ([_][]const u8{ "run", "test", "generic" }) |command| {
+            const run = b.addRunArtifact(exe);
+            run.step.name = b.fmt("CLI runes: {s} ({s})", .{ command, mode });
+            run.setCwd(fixtures.getDirectory());
+            run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+            run.setEnvironmentVariable("NOV_CC", "");
+            run.setEnvironmentVariable("CC", "");
+            const generic = std.mem.eql(u8, command, "generic");
+            const tests = std.mem.eql(u8, command, "test");
+            run.addArgs(&.{ if (tests) "test" else "run", if (generic) "generic.nov" else "runes.nov" });
+            if (mode.len != 0) run.addArg(mode);
+            run.addArg("--lib-dir");
+            run.addDirectoryArg(library);
+            run.expectExitCode(0);
+            run.expectStdOutEqual(if (generic) "é 😀\n\x00 \x00\xf4\x8f\xbf\xbf" else if (tests)
+                "PASS scalars_and_equality\nPASS interpolation_utf8\nPASS copies_and_borrows\nPASS optional_rune\n4 passed; 0 failed; 4 total\n"
+            else
+                "a é 😀\nRunes: aé😀\nIndexed: é 😀\nRune: h\na é\n");
+            run.expectStdErrEqual("");
+            test_step.dependOn(&run.step);
+        }
+    }
+    for ([_]struct { name: []const u8, source: []const u8 }{
+        .{ .name = "integer-to-rune", .source = "let value: rune = 97\n" },
+        .{ .name = "rune-to-integer", .source = "let value: u32 = 'a'\n" },
+        .{ .name = "string-to-rune", .source = "let value: rune = \"a\"\n" },
+        .{ .name = "rune-to-string", .source = "let value: string = 'a'\n" },
+        .{ .name = "argument", .source = "let f: (x: rune) = {}\nlet main: () = f(97)\n" },
+        .{ .name = "return", .source = "let f: () -> rune = 97\n" },
+        .{ .name = "array", .source = "let main: () = {let values: []rune = [97]}\n" },
+        .{ .name = "assignment", .source = "let main: () = {let mut r = 'a'\nr = 97}\n" },
+        .{ .name = "as-rune", .source = "let main: () = {let r = @as(rune, 97)}\n" },
+        .{ .name = "as-integer", .source = "let main: () = {let r = @as(u32, 'a')}\n" },
+        .{ .name = "index-to-integer", .source = "let f: () -> u8 = \"hello\"[0]\n" },
+        .{ .name = "equality-integer", .source = "let main: () = @assert('a' == 97)\n" },
+        .{ .name = "add", .source = "let main: () = @println('a' + 'b')\n" },
+        .{ .name = "order", .source = "let main: () = @println('a' < 'b')\n" },
+        .{ .name = "bitwise", .source = "let main: () = @println('a' | 'b')\n" },
+        .{ .name = "range", .source = "let main: () = {loop r in 'a'..'z' {}}\n" },
+        .{ .name = "inline-interpolation", .source = "let main: () = @println(\"{'a'}\")\n" },
+        .{ .name = "empty", .source = "let value = ''\n" },
+        .{ .name = "multiple", .source = "let value = 'ab'\n" },
+        .{ .name = "combining", .source = "let value = 'é'\n" },
+        .{ .name = "invalid-utf8", .source = "let value = '\xff'\n" },
+        .{ .name = "surrogate", .source = "let value = '\\u{D800}'\n" },
+        .{ .name = "out-of-range", .source = "let value = '\\u{110000}'\n" },
+    }) |case| {
+        const source = b.fmt("invalid-{s}.nov", .{case.name});
+        _ = fixtures.add(source, case.source);
+        const run = b.addRunArtifact(exe);
+        run.step.name = b.fmt("CLI runes: reject {s}", .{case.name});
+        run.setCwd(fixtures.getDirectory());
+        run.addArgs(&.{ "check", "--semantic", source });
+        run.expectExitCode(1);
+        run.expectStdOutEqual("");
+        run.expectStdErrMatch(b.fmt("{s}:", .{source}));
+        run.expectStdErrMatch("error:");
+        test_step.dependOn(&run.step);
+    }
+    for ([_][]const u8{ "extern", "export" }) |abi| {
+        for ([_][]const u8{ "parameter", "return" }) |position| {
+            const source = b.fmt("{s}-{s}.nov", .{ abi, position });
+            const parameter = std.mem.eql(u8, position, "parameter");
+            _ = fixtures.add(source, b.fmt("@[{s}]\nlet f: {s}{s}\n", .{
+                abi,
+                if (parameter) "(value: rune)" else "() -> rune",
+                if (std.mem.eql(u8, abi, "extern")) "" else if (parameter) " = {}" else " = 'a'",
+            }));
+            for ([_][]const u8{ "check", "emit-c" }) |command| {
+                const run = b.addRunArtifact(exe);
+                run.step.name = b.fmt("CLI runes: reject {s} {s}", .{ command, source });
+                run.setCwd(fixtures.getDirectory());
+                run.addArgs(&.{ command, if (std.mem.eql(u8, command, "check")) "--semantic" else "--library", source });
+                run.expectExitCode(1);
+                run.expectStdOutEqual("");
+                run.expectStdErrMatch(b.fmt("{s}:2:5: error:", .{source}));
+                run.expectStdErrMatch(b.fmt("{s} ABI supports only", .{abi}));
+                test_step.dependOn(&run.step);
+            }
+        }
+    }
+    for ([_]struct { name: []const u8, source: []const u8, diagnostic: []const u8 }{
+        .{ .name = "array-positive", .source = "let main: () = {let values: []rune = ['é']\n@println(values[1])}\n", .diagnostic = "panic: array index out of bounds\n" },
+        .{ .name = "array-negative", .source = "let main: () = {let values: []rune = ['é']\n@println(values[-2])}\n", .diagnostic = "panic: array index out of bounds\n" },
+        .{ .name = "string-scalar", .source = "let main: () = @println(\"é😀\"[2])\n", .diagnostic = "panic: string index out of bounds\n" },
+    }) |case| {
+        const source = b.fmt("bounds-{s}.nov", .{case.name});
+        _ = fixtures.add(source, case.source);
+        for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+            const run = b.addRunArtifact(exe);
+            run.step.name = b.fmt("CLI runes: bounds {s} ({s})", .{ case.name, mode });
+            run.setCwd(fixtures.getDirectory());
+            run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+            run.setEnvironmentVariable("NOV_CC", "");
+            run.setEnvironmentVariable("CC", "");
+            run.addArgs(&.{ "run", source });
+            if (mode.len != 0) run.addArg(mode);
+            run.expectExitCode(1);
+            run.expectStdOutEqual("");
+            run.expectStdErrEqual(case.diagnostic);
+            test_step.dependOn(&run.step);
+        }
     }
 }
 

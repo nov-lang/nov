@@ -1,8 +1,9 @@
 ; nov run examples/string-bytes.nov
 ; nov test examples/string-bytes.nov
-; String indices read immutable u8 bytes; negative int indices count from the end.
+; String indices decode Unicode scalars as runes; negative int indices count from the end.
+; String .len counts scalars, not UTF-8 bytes or grapheme clusters.
 
-let head: (s: string) -> u8 = s[0]
+let head: (s: string) -> rune = s[0]
 
 let main: () = {
     let mut text = "hello"
@@ -10,27 +11,41 @@ let main: () = {
     text += " world"
     @assert(original == "hello")
     @println(original, text, text[0], text[-1])
-    let utf8 = "é\0"
+    let first: rune = text[0]
+    let last: rune = text[-1]
+    @println(first, last)
+    let utf8 = "é😀\0"
     @println(utf8[0], utf8[1], utf8[-1], utf8.len)
+    let accent: rune = head(utf8)
+    @println("Rune: {accent}")
 }
 
 @[test]
 let ascii_negative: () = {
     let text = "hello"
     let first: int = -5
-    @assert(head(text) == 104)
-    @assert(text[first] == 104)
-    @assert(text[-1] == 111)
+    @assert(head(text) == 'h')
+    @assert(text[first] == 'h')
+    @assert(text[-1] == 'o')
+    @assert(text.len == 5)
     @assert(text[4] == text[-1])
 }
 
 @[test]
 let utf8_nul: () = {
-    let text = "é\0"
-    @assert(text[0] == 195)
-    @assert(text[1] == 169)
-    @assert(text[-1] == 0)
+    let text = "é😀\0"
+    let first: int = -3
+    @assert(head(text) == 'é')
+    @assert(text[first] == 'é')
+    @assert(text[1] == '😀')
+    @assert(text[2] == '\0')
+    @assert(text[-2] == '😀')
+    @assert(text[-1] == '\0')
     @assert(text.len == 3)
+    @assert("".len == 0)
+    @assert("é".len == 1)
+    @assert("😀".len == 1)
+    @assert("e\u{301}".len == 2)
 }
 
 @[test]
@@ -39,6 +54,6 @@ let original_snapshot: () = {
     let original = text
     text += " world"
     @assert(original == "hello")
-    @assert(original[-1] == 111)
-    @assert(text[-1] == 100)
+    @assert(original[-1] == 'o')
+    @assert(text[-1] == 'd')
 }

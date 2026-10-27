@@ -196,7 +196,7 @@ fn analyzeModuleAnnotations(result: *Sema, module: *Module) Error!void {
     }
 }
 
-fn exportScalar(ty: Ir.Type, result: bool) bool {
+fn foreignScalar(ty: Ir.Type, result: bool) bool {
     return switch (ty) {
         .void => result,
         .boolean => true,
@@ -222,9 +222,9 @@ fn validateExports(self: *Sema, module: *Module, names: *std.StringHashMapUnmana
         const ty = self.ir.getType(entry.type_id orelse continue).?;
         var valid = ty == .function;
         if (ty == .function) {
-            valid = exportScalar(self.ir.getType(ty.function.result).?, true);
+            valid = foreignScalar(self.ir.getType(ty.function.result).?, true);
             for (ty.function.params) |param| {
-                if (!exportScalar(self.ir.getType(param).?, false)) valid = false;
+                if (!foreignScalar(self.ir.getType(param).?, false)) valid = false;
             }
         }
         if (!valid) {
@@ -499,6 +499,9 @@ fn checkScalarGlobal(self: *Sema, module: *Module, index: usize, initializer: As
         .string_literal => {
             if (expected == null) expected = try self.ir.internType(.string);
         },
+        .char_literal => {
+            if (expected == null) expected = try self.ir.internType(.rune);
+        },
         .number_literal => if (expected == null) return,
         .negation => {
             if (expected == null or ast.nodes.items(.tag)[ast.nodes.items(.data)[node].rhs] != .number_literal) return;
@@ -536,16 +539,63 @@ test "export ABI integer widths are a finite allowlist for parameters and result
         for (0..130) |bits| {
             const ty: Ir.Type = .{ .integer = .{ .signedness = signedness, .bits = @intCast(bits) } };
             const allowed = bits == 8 or bits == 16 or bits == 32 or bits == 64;
-            try std.testing.expectEqual(allowed, exportScalar(ty, false));
-            try std.testing.expectEqual(allowed, exportScalar(ty, true));
+            try std.testing.expectEqual(allowed, foreignScalar(ty, false));
+            try std.testing.expectEqual(allowed, foreignScalar(ty, true));
         }
     }
-    try std.testing.expect(exportScalar(.boolean, false));
-    try std.testing.expect(exportScalar(.boolean, true));
-    try std.testing.expect(!exportScalar(.void, false));
-    try std.testing.expect(exportScalar(.void, true));
-    try std.testing.expect(!exportScalar(.string, false));
-    try std.testing.expect(!exportScalar(.string, true));
+    try std.testing.expect(foreignScalar(.boolean, false));
+    try std.testing.expect(foreignScalar(.boolean, true));
+    try std.testing.expect(!foreignScalar(.void, false));
+    try std.testing.expect(foreignScalar(.void, true));
+    try std.testing.expect(!foreignScalar(.string, false));
+    try std.testing.expect(!foreignScalar(.string, true));
+    try std.testing.expect(!foreignScalar(.rune, false));
+    try std.testing.expect(!foreignScalar(.rune, true));
+}
+
+test "rune annotations aliases and immutable globals preserve scalar constants" {
+    const source = "let inferred = 'é'\nlet annotated: Rune = '😀'\nlet escaped = @as(rune, '\\xE9')\nlet nested = @as(Rune, @as(rune, '\\u{10FFFF}'))\nlet Rune = rune\nlet zero: rune = '\\0'";
+    var module = try Module.init(std.testing.allocator, "rune-globals.nov", source);
+    defer module.deinit();
+    var sema = try analyzeAnnotations(&module);
+    defer sema.deinit();
+    try std.testing.expect(!module.hasErrors());
+    const rune = try sema.ir.internType(.rune);
+    for ([_]struct { name: []const u8, value: u32 }{
+        .{ .name = "inferred", .value = 0xe9 },
+        .{ .name = "annotated", .value = 0x1f600 },
+        .{ .name = "escaped", .value = 0xe9 },
+        .{ .name = "nested", .value = 0x10ffff },
+        .{ .name = "zero", .value = 0 },
+    }) |case| {
+        const entry = sema.getEntry(module.lookup(case.name).?).?;
+        try std.testing.expectEqual(Status.constant_checked, entry.status);
+        try std.testing.expectEqual(rune, entry.type_id.?);
+        try std.testing.expectEqual(case.value, sema.ir.getConstant(entry.constant.?).?.value.rune);
+    }
+    try sema.ir.verify();
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+}
+
+test "rune globals reject conversions malformed scalars and foreign ABI use" {
+    for ([_]struct { source: []const u8, tag: Module.Diagnostic.Tag }{
+        .{ .source = "let value: rune = 97", .tag = .literal_type_mismatch },
+        .{ .source = "let value = @as(rune, 97)", .tag = .literal_type_mismatch },
+        .{ .source = "let value: rune = \"a\"", .tag = .literal_type_mismatch },
+        .{ .source = "let value: u32 = 'a'", .tag = .literal_type_mismatch },
+        .{ .source = "let value = 'ab'", .tag = .invalid_literal },
+        .{ .source = "let value = '\\u{DFFF}'", .tag = .invalid_literal },
+        .{ .source = "@[extern]\nlet external: (rune) -> rune", .tag = .invalid_extern_signature },
+        .{ .source = "@[export]\nlet exported: (x: rune) -> rune = x", .tag = .invalid_export_signature },
+    }) |case| {
+        var module = try Module.init(std.testing.allocator, "rune-global-error.nov", case.source);
+        defer module.deinit();
+        var sema = try analyzeAnnotations(&module);
+        defer sema.deinit();
+        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+        try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{case.source});
+    }
 }
 
 test "export ABI validates resolved aliases native integers and unused signatures" {
@@ -558,7 +608,7 @@ test "export ABI validates resolved aliases native integers and unused signature
         defer sema.deinit();
         try std.testing.expect(!module.hasErrors());
     }
-    for ([_][]const u8{ "i128", "u128", "string", "[]i32", "() -> i32", "R", "E" }) |ty| {
+    for ([_][]const u8{ "i128", "u128", "string", "rune", "[]i32", "() -> i32", "R", "E" }) |ty| {
         const source = try std.fmt.allocPrint(std.testing.allocator, "let R = struct {{ x: i32, }}\nlet E = enum {{ a, }}\n@[export]\nlet unused: (x: {s}) -> {s} = x", .{ ty, ty });
         defer std.testing.allocator.free(source);
         var module = try Module.init(std.testing.allocator, "abi.nov", source);
@@ -1111,7 +1161,7 @@ test "extern ABI accepts scalar aliases and leaves bodyless signatures external"
         try std.testing.expectEqual(Status.external, sema.getEntry(module.lookup("stop").?).?.status);
         try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
     }
-    for ([_][]const u8{ "i128", "u128", "string", "[]i32", "() -> i32", "R", "E" }) |ty| {
+    for ([_][]const u8{ "i128", "u128", "string", "rune", "[]i32", "() -> i32", "R", "E" }) |ty| {
         const source = try std.fmt.allocPrint(std.testing.allocator, "let R = struct {{ x: i32, }}\nlet E = enum {{ a, }}\n@[extern]\nlet foreign: (x: {s}) -> {s}", .{ ty, ty });
         defer std.testing.allocator.free(source);
         var module = try Module.init(std.testing.allocator, "extern-abi.nov", source);

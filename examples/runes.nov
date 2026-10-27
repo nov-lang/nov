@@ -1,0 +1,77 @@
+; nov run examples/runes.nov
+; nov test examples/runes.nov
+; Runes are Unicode scalars; string indexing and .len count scalars.
+
+let std = @import("std")
+let Option = std.Option
+let letter = 'é'
+
+let identity: (value: rune) -> rune = value
+
+let main: () = {
+    @println('a', letter, '😀')
+    let a = 'a'
+    let emoji = '😀'
+    @println("Runes: {a}{letter}{emoji}")
+    @println("Indexed:", "é😀"[0], "é😀"[-1])
+    @println("Rune:", "hello"[0])
+    let letters: []rune = ['a', letter]
+    @println(letters[0], letters[1])
+}
+
+@[test]
+let scalars_and_equality: () = {
+    @assert(identity('a') == '\u{61}')
+    @assert(letter == '\xE9')
+    @assert('😀' == '\u{1F600}')
+    @assert('\0' == '\u{0}')
+    @assert('\u{10FFFF}' != '\0')
+    @assert('\n' != '\t')
+    @assert('\'' != '\\')
+}
+
+@[test]
+let interpolation_utf8: () = {
+    let zero = '\0'
+    let maximum = '\u{10FFFF}'
+    let emoji = '😀'
+    let text = "{letter}{zero}{emoji}{maximum}"
+    @assert(text == "é\0😀\u{10FFFF}")
+    @assert(text.len == 4)
+    @assert(text[0] == letter)
+    @assert(text[1] == zero)
+    @assert(text[2] == emoji)
+    @assert(text[3] == maximum)
+    @assert(text[-4] == letter)
+    @assert(text[-3] == zero)
+    @assert(text[-2] == emoji)
+    @assert(text[-1] == maximum)
+}
+
+@[test]
+let copies_and_borrows: () = {
+    let mut value = 'a'
+    let original = value
+    let view = &value
+    view = letter
+    @assert(value == letter)
+    @assert(original == 'a')
+    let mut letters: []rune = ['a', letter]
+    let snapshot = letters
+    let whole = &letters
+    whole[0] = '😀'
+    let element = &letters[1]
+    element = 'z'
+    @assert(letters[0] == '😀')
+    @assert(letters[1] == 'z')
+    @assert(snapshot[0] == 'a')
+    @assert(snapshot[1] == letter)
+}
+
+@[test]
+let optional_rune: () = {
+    let present: Option(rune) = .some[letter]
+    let missing: Option(rune) = .none[]
+    @assert(present.unwrapOr('a') == letter)
+    @assert(missing.unwrapOr('😀') == '😀')
+}

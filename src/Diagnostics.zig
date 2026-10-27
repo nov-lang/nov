@@ -143,15 +143,15 @@ fn renderModuleWithSources(module: *const Module, compilation: ?*const Compilati
             .duplicate_parameter => try writer.print("duplicate parameter '{s}'", .{source.slice(diagnostic.span).?}),
             .invalid_parameter_type => try writer.writeAll("void is not a parameter type"),
             .type_nesting_limit => try writer.writeAll("type annotation nesting exceeds the current analysis limit of 128"),
-            .invalid_literal => try writer.writeAll("invalid numeric literal"),
+            .invalid_literal => try writer.writeAll("invalid literal; rune literals require exactly one Unicode scalar"),
             .unsupported_literal => try writer.writeAll("this literal is not supported in semantic analysis yet"),
             .invalid_interpolation => try writer.writeAll("expected {expression}; blocks, control flow, quotes and format options are unsupported; escape literal braces as \\{ and \\}"),
-            .unsupported_interpolation_type => try writer.writeAll("interpolation requires a bool, integer, string, or struct/enum/union with toString: (MyType) -> string"),
+            .unsupported_interpolation_type => try writer.writeAll("interpolation requires a bool, integer, rune, string, or struct/enum/union with toString: (MyType) -> string"),
             .unsupported_global_interpolation => try writer.writeAll("global strings require literal initializers; move interpolation into a function"),
             .literal_type_mismatch => try writer.writeAll("literal does not match the annotated type"),
             .literal_out_of_range => try writer.writeAll("integer literal does not fit the annotated type"),
             .unsupported_match_pattern => try writer.writeAll("match patterns support scalar literals, literal alternatives (|), union variants and wildcards (_) only"),
-            .unsupported_match_subject => try writer.writeAll("match subjects must be bool, integer or string values, or one enum or union value"),
+            .unsupported_match_subject => try writer.writeAll("match subjects must be bool, integer, rune or string values, or one enum or union value"),
             .match_missing_catchall => try writer.writeAll("match requires a final wildcard catchall (bounded exhaustiveness)"),
             .match_missing_boolean_values => try writer.writeAll("boolean match does not cover true or false; add both values or a wildcard (_)"),
             .match_missing_true => try writer.writeAll("boolean match does not cover true; add true or a wildcard (_)"),
@@ -179,7 +179,7 @@ fn renderModuleWithSources(module: *const Module, compilation: ?*const Compilati
             .argument_count_mismatch => try writer.writeAll("argument count does not match the function signature"),
             .unresolved_value_type => try writer.writeAll("declaration needs a resolved type before use here"),
             .body_nesting_limit => try writer.writeAll("recursive body checking exceeds the current analysis limit of 128"),
-            .unsupported_global_initializer => try writer.writeAll("inferred globals require immutable bool/string literals or @as(T, scalar literal); general global initialization is unsupported"),
+            .unsupported_global_initializer => try writer.writeAll("inferred globals require immutable bool/rune/string literals or @as(T, scalar literal); general global initialization is unsupported"),
             .unsupported_lowering => try writer.writeAll("lowering this source form is not implemented yet"),
         }
         try location.renderExcerpt(source.ast.source, diagnostic.span.end - diagnostic.span.start, writer);
@@ -366,7 +366,8 @@ test "module type and literal diagnostics render messages and source excerpts" {
         .{ .tag = .not_a_type, .token = "value", .underline = "^~~~~", .message = "expected a type, found a value" },
         .{ .tag = .invalid_parameter_type, .token = "void", .underline = "^~~~", .message = "void is not a parameter type" },
         .{ .tag = .type_nesting_limit, .token = "i32", .underline = "^~~", .message = "type annotation nesting exceeds the current analysis limit of 128" },
-        .{ .tag = .invalid_literal, .token = "123", .underline = "^~~", .message = "invalid numeric literal" },
+        .{ .tag = .invalid_literal, .token = "123", .underline = "^~~", .message = "invalid literal; rune literals require exactly one Unicode scalar" },
+        .{ .tag = .invalid_literal, .token = "'ab'", .underline = "^~~~", .message = "invalid literal; rune literals require exactly one Unicode scalar" },
         .{ .tag = .unsupported_literal, .token = "1.5", .underline = "^~~", .message = "this literal is not supported in semantic analysis yet" },
     }) |case| {
         const source = try std.fmt.allocPrint(std.testing.allocator, "let value = {s}", .{case.token});
@@ -417,7 +418,7 @@ test "module body diagnostics render messages and optional related notes" {
         .{ .tag = .not_callable, .message = "expression is not callable", .note = "type specified here" },
         .{ .tag = .unresolved_value_type, .message = "declaration needs a resolved type before use here", .note = "declaration here" },
         .{ .tag = .body_nesting_limit, .message = "recursive body checking exceeds the current analysis limit of 128" },
-        .{ .tag = .unsupported_global_initializer, .message = "inferred globals require immutable bool/string literals or @as(T, scalar literal); general global initialization is unsupported" },
+        .{ .tag = .unsupported_global_initializer, .message = "inferred globals require immutable bool/rune/string literals or @as(T, scalar literal); general global initialization is unsupported" },
         .{ .tag = .unsupported_lowering, .message = "lowering this source form is not implemented yet" },
     }) |case| {
         for ([_]bool{ true, false }) |with_related| {

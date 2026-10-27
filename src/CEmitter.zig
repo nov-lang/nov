@@ -214,7 +214,7 @@ fn analyze(allocator: std.mem.Allocator, ir: *const Ir, origins: []?Origin, diag
         i -= 1;
         const origin = origins[i] orelse continue;
         switch (ir.types.items[i]) {
-            .void, .boolean, .string, .enumeration => {},
+            .void, .boolean, .rune, .string, .enumeration => {},
             .record => try markRecord(ir, origins, visited, @fromBackingInt(@intCast(i)), origin, diagnostic),
             .range => |element| mark(origins, element, origin),
             .array => |element| {
@@ -251,6 +251,7 @@ fn write(allocator: std.mem.Allocator, ir: *const Ir, origins: []const ?Origin, 
         }
     }
     try writeRuntime(ir, w);
+    try writeRuneRuntime(ir, w);
     if (usesManagedRuntime(ir)) {
         try w.writeAll("#define NOV_GC_PANIC nov_rt_panic\n");
         try w.writeAll(GcRuntime.source);
@@ -259,20 +260,7 @@ fn write(allocator: std.mem.Allocator, ir: *const Ir, origins: []const ?Origin, 
         if (usesStringConcat(ir)) try w.writeAll(@embedFile("runtime/string.h"));
         try writeStringConversions(ir, w);
     }
-    if (usesStringByteIndex(ir)) try w.writeAll(
-        "static uint8_t nov_string_byte_at(nov_string text, intptr_t index) {\n" ++
-            "    uintptr_t offset;\n" ++
-            "    if (index < 0) {\n" ++
-            "        const uintptr_t distance = (uintptr_t)(-(index + 1)) + 1;\n" ++
-            "        if (distance > text.len) nov_rt_panic(\"string index out of bounds\");\n" ++
-            "        offset = text.len - distance;\n" ++
-            "    } else {\n" ++
-            "        offset = (uintptr_t)index;\n" ++
-            "    }\n" ++
-            "    if (offset >= text.len) nov_rt_panic(\"string index out of bounds\");\n" ++
-            "    return (uint8_t)text.data[offset];\n" ++
-            "}\n",
-    );
+    try writeStringScalarRuntime(ir, w);
     if (usesStringEquality(ir)) try w.writeAll(
         "#include <string.h>\n" ++
             "static bool nov_string_equal(nov_string a, nov_string b) {\n" ++
@@ -459,7 +447,7 @@ fn usesManagedRuntime(ir: *const Ir) bool {
     return false;
 }
 
-fn usesStringByteIndex(ir: *const Ir) bool {
+fn usesStringIndex(ir: *const Ir) bool {
     for (ir.functions.items) |function| {
         const body = function.body orelse continue;
         for (body.instructions) |instruction| {
@@ -467,6 +455,69 @@ fn usesStringByteIndex(ir: *const Ir) bool {
         }
     }
     return false;
+}
+
+fn usesStringLength(ir: *const Ir) bool {
+    for (ir.functions.items) |function| {
+        const body = function.body orelse continue;
+        for (body.instructions) |instruction| {
+            if (instruction.op == .array_len and ir.getType(body.instructions[@backingInt(instruction.op.array_len)].ty).? == .string) return true;
+        }
+    }
+    return false;
+}
+
+fn writeStringScalarRuntime(ir: *const Ir, w: *std.Io.Writer) WriteError!void {
+    const indexing = usesStringIndex(ir);
+    if (!indexing and !usesStringLength(ir)) return;
+    // The representation keeps byte lengths; only language-facing offsets count scalars.
+    try w.writeAll(
+        \\static uint32_t nov_string_decode(nov_string text, uintptr_t *offset) {
+        \\    if (*offset >= text.len) nov_rt_panic("invalid UTF-8 string");
+        \\    const unsigned char lead = text.data[(*offset)++];
+        \\    if (lead < 0x80u) return lead;
+        \\    uint32_t value, minimum;
+        \\    uintptr_t extra;
+        \\    if (lead >= 0xc2u && lead <= 0xdfu) { value = lead & 0x1fu; minimum = 0x80u; extra = 1; }
+        \\    else if (lead >= 0xe0u && lead <= 0xefu) { value = lead & 0x0fu; minimum = 0x800u; extra = 2; }
+        \\    else if (lead >= 0xf0u && lead <= 0xf4u) { value = lead & 0x07u; minimum = 0x10000u; extra = 3; }
+        \\    else { nov_rt_panic("invalid UTF-8 string"); return 0; }
+        \\    if (extra > text.len - *offset) nov_rt_panic("invalid UTF-8 string");
+        \\    for (uintptr_t i = 0; i < extra; ++i) {
+        \\        const unsigned char next = text.data[(*offset)++];
+        \\        if ((next & 0xc0u) != 0x80u) nov_rt_panic("invalid UTF-8 string");
+        \\        value = (value << 6) | (next & 0x3fu);
+        \\    }
+        \\    if (value < minimum || value > 0x10ffffu || (value >= 0xd800u && value <= 0xdfffu)) nov_rt_panic("invalid UTF-8 string");
+        \\    return value;
+        \\}
+        \\static uintptr_t nov_string_scalar_len(nov_string text) {
+        \\    uintptr_t offset = 0, count = 0;
+        \\    while (offset < text.len) { (void)nov_string_decode(text, &offset); ++count; }
+        \\    return count;
+        \\}
+        \\
+    );
+    if (indexing) try w.writeAll(
+        \\static uint32_t nov_string_rune_at(nov_string text, intptr_t index) {
+        \\    uintptr_t target;
+        \\    if (index < 0) {
+        \\        const uintptr_t distance = (uintptr_t)(-(index + 1)) + 1;
+        \\        const uintptr_t count = nov_string_scalar_len(text);
+        \\        if (distance > count) nov_rt_panic("string index out of bounds");
+        \\        target = count - distance;
+        \\    } else target = (uintptr_t)index;
+        \\    uintptr_t offset = 0;
+        \\    while (offset < text.len) {
+        \\        const uint32_t value = nov_string_decode(text, &offset);
+        \\        if (target == 0) return value;
+        \\        --target;
+        \\    }
+        \\    nov_rt_panic("string index out of bounds");
+        \\    return 0;
+        \\}
+        \\
+    );
 }
 
 fn usesStringEquality(ir: *const Ir) bool {
@@ -484,9 +535,62 @@ fn usesStringEquality(ir: *const Ir) bool {
     return false;
 }
 
+fn writeRuneRuntime(ir: *const Ir, w: *std.Io.Writer) WriteError!void {
+    var printing = false;
+    var conversion = false;
+    for (ir.functions.items) |function| {
+        const body = function.body orelse continue;
+        for (body.instructions) |instruction| switch (instruction.op) {
+            .print => |p| {
+                for (p.args) |arg| {
+                    if (ir.getType(body.instructions[@backingInt(arg)].ty).? == .rune) printing = true;
+                }
+            },
+            .to_string => |value| {
+                if (ir.getType(body.instructions[@backingInt(value)].ty).? == .rune) conversion = true;
+            },
+            else => {},
+        };
+    }
+    if (!printing and !conversion) return;
+    try w.writeAll(
+        \\static uintptr_t nov_rt_encode_rune(uint32_t value, unsigned char bytes[4]) {
+        \\    if (value <= UINT32_C(0x7f)) {
+        \\        bytes[0] = (unsigned char)value;
+        \\        return 1;
+        \\    }
+        \\    if (value <= UINT32_C(0x7ff)) {
+        \\        bytes[0] = (unsigned char)(0xc0u | (value >> 6));
+        \\        bytes[1] = (unsigned char)(0x80u | (value & 0x3fu));
+        \\        return 2;
+        \\    }
+        \\    if (value <= UINT32_C(0xffff)) {
+        \\        bytes[0] = (unsigned char)(0xe0u | (value >> 12));
+        \\        bytes[1] = (unsigned char)(0x80u | ((value >> 6) & 0x3fu));
+        \\        bytes[2] = (unsigned char)(0x80u | (value & 0x3fu));
+        \\        return 3;
+        \\    }
+        \\    bytes[0] = (unsigned char)(0xf0u | (value >> 18));
+        \\    bytes[1] = (unsigned char)(0x80u | ((value >> 12) & 0x3fu));
+        \\    bytes[2] = (unsigned char)(0x80u | ((value >> 6) & 0x3fu));
+        \\    bytes[3] = (unsigned char)(0x80u | (value & 0x3fu));
+        \\    return 4;
+        \\}
+        \\
+    );
+    if (printing) try w.writeAll(
+        \\static void nov_rt_print_rune(uint32_t value) {
+        \\    unsigned char bytes[4];
+        \\    uintptr_t len = nov_rt_encode_rune(value, bytes);
+        \\    if (fwrite(bytes, 1, (size_t)len, stdout) != (size_t)len) nov_rt_panic("stdout write failed");
+        \\}
+        \\
+    );
+}
+
 fn writeStringConversions(ir: *const Ir, w: *std.Io.Writer) WriteError!void {
     for (ir.types.items, 0..) |ty, t| {
-        if (ty != .integer) continue;
+        if (ty != .integer and ty != .rune) continue;
         var used = false;
         for (ir.functions.items) |function| {
             const body = function.body orelse continue;
@@ -495,6 +599,11 @@ fn writeStringConversions(ir: *const Ir, w: *std.Io.Writer) WriteError!void {
             }
         }
         if (!used) continue;
+        if (ty == .rune) {
+            try w.print("static nov_string nov_to_string_{d}(uint32_t value) {{\n", .{t});
+            try w.writeAll("    unsigned char bytes[4];\n    uintptr_t len = nov_rt_encode_rune(value, bytes);\n    return nov_string_concat((nov_string){0}, (nov_string){NULL, bytes, len});\n}\n");
+            continue;
+        }
         try w.writeAll("#include <inttypes.h>\nstatic nov_string nov_to_string_");
         try w.print("{d}(", .{t});
         try writeType(ir, w, @fromBackingInt(@intCast(t)));
@@ -508,7 +617,10 @@ fn usesStringConcat(ir: *const Ir) bool {
         const body = function.body orelse continue;
         for (body.instructions) |instruction| {
             if (instruction.op == .binary and ir.getType(instruction.ty).? == .string) return true;
-            if (instruction.op == .to_string and ir.getType(body.instructions[@backingInt(instruction.op.to_string)].ty).? == .integer) return true;
+            if (instruction.op == .to_string) {
+                const ty = ir.getType(body.instructions[@backingInt(instruction.op.to_string)].ty).?;
+                if (ty == .integer or ty == .rune) return true;
+            }
         }
     }
     return false;
@@ -608,7 +720,7 @@ fn writeType(ir: *const Ir, w: *std.Io.Writer, id: Ir.TypeId) WriteError!void {
     switch (ir.types.items[@backingInt(id)]) {
         .void => try w.writeAll("void"),
         .boolean => try w.writeAll("bool"),
-        .enumeration => try w.writeAll("uint32_t"),
+        .enumeration, .rune => try w.writeAll("uint32_t"),
         .integer => |integer| try w.print("{s}int{d}_t", .{ if (integer.signedness == .unsigned) "u" else "", integer.bits }),
         .function => try w.print("nov_fn_{d}", .{@backingInt(id)}),
         .range => try w.print("nov_range_{d}", .{@backingInt(id)}),
@@ -679,7 +791,7 @@ fn writeConstant(w: *std.Io.Writer, constant: Ir.Constant, ty: Ir.Type) WriteErr
         },
         .void => unreachable, // void values have no C object
         .boolean => |value| try w.writeAll(if (value) "true" else "false"),
-        .enum_tag => |value| try w.print("UINT32_C({d})", .{value}),
+        .enum_tag, .rune => |value| try w.print("UINT32_C({d})", .{value}),
         .unsigned_integer => |value| try w.print("UINT{d}_C({d})", .{ ty.integer.bits, value }),
         .signed_integer => |value| {
             const integer = ty.integer;
@@ -1032,7 +1144,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
                     switch (ir.getType(source_ty).?) {
                         .string => try w.print("v{d}", .{@backingInt(value)}),
                         .boolean => try w.print("(v{d} ? (nov_string){{NULL, (const unsigned char *)\"true\", 4}} : (nov_string){{NULL, (const unsigned char *)\"false\", 5}})", .{@backingInt(value)}),
-                        .integer => try w.print("nov_to_string_{d}(v{d})", .{ @backingInt(source_ty), @backingInt(value) }),
+                        .integer, .rune => try w.print("nov_to_string_{d}(v{d})", .{ @backingInt(source_ty), @backingInt(value) }),
                         else => unreachable,
                     }
                 },
@@ -1092,10 +1204,15 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
             .borrow_read => |borrow| try writeBorrowRead(ir, w, body, borrow, instruction.ty),
             .borrow_reserve, .borrow_start, .borrow_store => unreachable,
             .field_read => |read| try w.print("v{d}.f{d}", .{ @backingInt(read.base), read.index }),
-            .array_len => |value| try w.print("v{d}.len", .{@backingInt(value)}),
+            .array_len => |value| {
+                if (ir.getType(body.instructions[@backingInt(value)].ty).? == .string)
+                    try w.print("nov_string_scalar_len(v{d})", .{@backingInt(value)})
+                else
+                    try w.print("v{d}.len", .{@backingInt(value)});
+            },
             .array_index => |r| {
                 if (ir.getType(body.instructions[@backingInt(r.array)].ty).? == .string) {
-                    try w.print("nov_string_byte_at(v{d}, v{d})", .{ @backingInt(r.array), @backingInt(r.index) });
+                    try w.print("nov_string_rune_at(v{d}, v{d})", .{ @backingInt(r.array), @backingInt(r.index) });
                 } else {
                     try w.writeAll("((");
                     try writeType(ir, w, instruction.ty);
@@ -1240,6 +1357,7 @@ fn writePrint(ir: *const Ir, w: *std.Io.Writer, body: Ir.Body, print: anytype) W
         if (i != 0) try w.writeAll("    nov_rt_check(fputc(' ', stdout));\n");
         const ty = ir.types.items[@backingInt(body.instructions[@backingInt(arg)].ty)];
         switch (ty) {
+            .rune => try w.print("    nov_rt_print_rune(v{d});\n", .{@backingInt(arg)}),
             .string => try w.print("    if (v{d}.len && fwrite(v{d}.data, 1, (size_t)v{d}.len, stdout) != (size_t)v{d}.len) nov_rt_panic(\"stdout write failed\");\n", .{ @backingInt(arg), @backingInt(arg), @backingInt(arg), @backingInt(arg) }),
             .boolean => try w.print("    nov_rt_check(fputs(v{d} ? \"true\" : \"false\", stdout));\n", .{@backingInt(arg)}),
             .integer => |integer| try w.print("    nov_rt_check(fprintf(stdout, \"%\" PRI{s}MAX, ({s}intmax_t)v{d}));\n", .{ if (integer.signedness == .signed) "d" else "u", if (integer.signedness == .signed) "" else "u", @backingInt(arg) }),
@@ -1261,6 +1379,164 @@ fn writeCall(w: *std.Io.Writer, call: anytype) WriteError!void {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+const rune_program =
+    \\let Rune = rune
+    \\let seed: Rune = 'é'
+    \\let R = struct { value: Rune, }
+    \\let Option: (T:type)->type = union { none, some:T, }
+    \\let Result: (T:type,E:type)->type = union { ok:T, err:E, }
+    \\let identity: (r: Rune)->Rune = r
+    \\let effect: (s:string,r:Rune)->Rune = {@print(s)
+    \\r}
+    \\let consume: (a:rune,b:rune)->string = "{a}/{b}"
+    \\let main: () = {
+    \\@println('A',seed,'😀','\u{10ffff}','\0','\n','\t','\'','\\')
+    \\let call=identity
+    \\@println(call(seed), seed=='é', seed!='😀', "hello"[0])
+    \\let mut r=R[.value=seed]
+    \\let saved=r
+    \\r.value='😀'
+    \\let opt:Option(rune)=.some[r.value]
+    \\let res:Result(rune,string)=.ok[saved.value]
+    \\@println(match opt {
+    \\.some=>|v| v
+    \\.none=>'x'
+    \\},match res {
+    \\.ok=>|v| v
+    \\.err=>'x'
+    \\})
+    \\let mut a:[]Rune=['A',seed,'😀']
+    \\let mut copy=a
+    \\copy[0]='Z'
+    \\a+=['\u{10ffff}']
+    \\@println(a[0],copy[0],a[1],a[2],a[-1],'é' in a,'x' in a)
+    \\let whole=&a
+    \\whole[0]='B'
+    \\let snapshot=whole
+    \\whole+=['C']
+    \\@println(snapshot.len,whole.len,whole[0],whole[-1])
+    \\let element=&a[1]
+    \\let old=element
+    \\element='Q'
+    \\@println(old,element)
+    \\@println(consume(effect("L",'é'),effect("R",'😀')))
+    \\let marker="I"
+    \\let face='😀'
+    \\let last='\u{10ffff}'
+    \\let text="prefix:{effect(marker,face)}:"+"{seed}:\0:{last}"
+    \\@println(text)
+    \\}
+;
+
+const rune_output = "A é 😀 \xf4\x8f\xbf\xbf \x00 \n \t ' \\\né true true h\n😀 é\nA Z é 😀 \xf4\x8f\xbf\xbf true false\n4 5 B C\né Q\nLRé/😀\nIprefix:😀:é:\x00:\xf4\x8f\xbf\xbf\n";
+
+test "rune UTF8 storage aliases calls arrays borrows interpolation source free GC C11 O0 O3" {
+    {
+        var module = try Module.init(test_gpa, "rune.nov", rune_program);
+        defer module.deinit();
+        if (module.hasErrors()) {
+            var out = std.Io.Writer.Allocating.init(test_gpa);
+            defer out.deinit();
+            try Diagnostics.renderModule(&module, &out.writer);
+            std.debug.print("{s}", .{out.written()});
+        }
+        try std.testing.expect(!module.hasErrors());
+    }
+    const c = try arrayTestProgram(rune_program);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, rune_output, "", mode);
+}
+
+fn testRuneSourceFree(allocator: std.mem.Allocator) !void {
+    var result = blk: {
+        const source = try allocator.dupe(u8, rune_program);
+        defer allocator.free(source);
+        var module = try Module.init(allocator, "rune.nov", source);
+        defer module.deinit();
+        var lowered = try Lowering.lower(&module);
+        errdefer lowered.deinit();
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expect(lowered.lowering_complete);
+        break :blk lowered;
+    };
+    defer result.deinit();
+    try result.ir.verify();
+    const c = try emitProgram(allocator, &result.ir, null);
+    defer allocator.free(c);
+}
+
+test "rune compiler ownership survives source release and every allocation failure" {
+    try testRuneSourceFree(test_gpa);
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testRuneSourceFree, .{});
+}
+
+test "rune UTF8 encoder boundaries agree for direct output and allocated conversion" {
+    var source = std.Io.Writer.Allocating.init(test_gpa);
+    defer source.deinit();
+    var expected = std.Io.Writer.Allocating.init(test_gpa);
+    defer expected.deinit();
+    try source.writer.writeAll("let main:()={\n");
+    for ([_]u21{ 0, 0x7f, 0x80, 0x7ff, 0x800, 0xd7ff, 0xe000, 0xffff, 0x10000, 0x10ffff }) |value| {
+        try source.writer.print("let r{x}='\\u{{{x}}}'\n@print(r{x})\n@print(\"{{r{x}}}\")\n", .{ value, value, value, value });
+        var bytes: [4]u8 = undefined;
+        const len = try std.unicode.utf8Encode(value, &bytes);
+        try expected.writer.writeAll(bytes[0..len]);
+        try expected.writer.writeAll(bytes[0..len]);
+    }
+    try source.writer.writeAll("}\n");
+    const c = try arrayTestProgram(source.written());
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, expected.written(), "", mode);
+}
+
+test "rune direct printing is allocation free and helpers are demand only" {
+    const c = try emitSource("let main:()=@print('A','é','€','😀','\\u{10ffff}','\\0')", null);
+    defer test_gpa.free(c);
+    try std.testing.expect(std.mem.indexOf(u8, c, "nov_gc_") == null);
+    try std.testing.expect(std.mem.indexOf(u8, c, "nov_string") == null);
+    try std.testing.expect(std.mem.indexOf(u8, c, "nov_rt_encode_rune") != null);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(c, "void nov_main(void); int main(void) {nov_main(); return 0;}", 0, "A é € 😀 \xf4\x8f\xbf\xbf \x00", "", mode);
+    const scalar = try emitSource("let f:(r:rune)->rune=r", null);
+    defer test_gpa.free(scalar);
+    try std.testing.expect(std.mem.indexOf(u8, scalar, "nov_rt_") == null);
+    try std.testing.expect(std.mem.indexOf(u8, scalar, "nov_string") == null);
+    try compileAndRun(scalar, "int main(void) {return 0;}");
+    const conversion = try emitSource("let f:(r:rune)->string=\"{r}\"", null);
+    defer test_gpa.free(conversion);
+    try std.testing.expect(std.mem.indexOf(u8, conversion, "nov_string_concat") != null);
+    try std.testing.expect(std.mem.indexOf(u8, conversion, "nov_rt_print_rune") == null);
+    try compileAndRun(conversion, "int main(void) {return 0;}");
+}
+
+test "rune interpolation allocation failure panics but direct print does not allocate" {
+    const library = try emitSource("let main:()={@print('é')\nlet r='😀'\n@println(\"{r}\")}", null);
+    defer test_gpa.free(library);
+    const c = try std.mem.concat(test_gpa, u8, &.{ "#include <stdlib.h>\nstatic void *test_malloc(size_t n) {(void)n; return NULL;}\n#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n", library, "\nint main(void) {nov_main(); return 0;}\n" });
+    defer test_gpa.free(c);
+    try compileAndRunExpected(c, "typedef int nonempty_translation_unit;", 1, "é", "panic: GC allocation failed\n");
+}
+
+test "rune stdout write and final flush failures use the existing panic contract" {
+    var module = try Module.init(test_gpa, "rune.nov", "let main:()=@print('é')");
+    defer module.deinit();
+    var lowered = try Lowering.lower(&module);
+    defer lowered.deinit();
+    const c = try emitProgram(test_gpa, &lowered.ir, null);
+    defer test_gpa.free(c);
+    for ([_]struct { prefix: []const u8, output: []const u8 }{
+        .{ .prefix = "#include <stdio.h>\nstatic size_t fail_write(const void *p,size_t s,size_t n,FILE *f) {if(f==stdout)return 0; return fwrite(p,s,n,f);}\n#define fwrite fail_write\n", .output = "" },
+        .{ .prefix = "#include <stdio.h>\nstatic int fail_flush(FILE *f) {if(f==stdout)return EOF; return fflush(f);}\n#define fflush fail_flush\n", .output = "é" },
+    }) |case| {
+        const injected = try std.mem.concat(test_gpa, u8, &.{ case.prefix, c });
+        defer test_gpa.free(injected);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode|
+            try compileAndRunMode(injected, "typedef int nonempty_translation_unit;", 1, case.output, "panic: stdout write failed\n", mode);
+    }
+}
 
 const test_gpa = std.testing.allocator;
 
@@ -3140,7 +3416,7 @@ const string_example =
     \\    @println(a.len, shared)
     \\}
 ;
-const string_output = "hé\x00😀 8 new\nABA! B!\nhé\x00😀 early! late\nnewxxx 0  {literal} é\n2 hé\x00😀\n";
+const string_output = "hé\x00😀 4 new\nABA! B!\nhé\x00😀 early! late\nnewxxx 0  {literal} é\n2 hé\x00😀\n";
 
 test "immutable strings share UTF8 bytes across calls replacements control flow and GC" {
     const c = try arrayTestProgram(string_example);
@@ -3648,17 +3924,17 @@ const string_byte_program =
     \\let index:()->int={let garbage="index"+" allocation"
     \\    @print("I")
     \\    return -2}
-    \\let accept:(b:u8)->u8=b
+    \\let accept:(b:rune)->rune=b
     \\let gcIndex:(i:int)->int={let garbage="collect"+" index"
     \\    i}
     \\let terminalIndex:()->u8="x"[{return 8}]
     \\let main:()={
-    \\    let text="aé\0Z"
-    \\    @println(text[0],text[1],text[2],text[3],text[4])
-    \\    @println(text[-1],text[-2],text[-3],text[-4],text[-5])
+    \\    let text="aé€😀\0Z"
+    \\    @println(text[0],text[1],text[2],text[3],text[4],text[5],text.len)
+    \\    @println(text[-1],text[-2],text[-3],text[-4],text[-5],text[-6])
     \\    let inferred=text[1]
-    \\    let bytes:[]u8=[text[2],inferred]
-    \\    @println(accept(inferred),inferred+1,1+text[2],bytes[0])
+    \\    let bytes:[]rune=[text[2],inferred]
+    \\    @println(accept(inferred),inferred=='é',text[2]=='€',bytes[0])
     \\    @println(base()[index()])
     \\    let mut owner="o"+"ld"
     \\    @println(owner[{owner="n"+"ew"
@@ -3672,22 +3948,24 @@ const string_byte_program =
     \\    @println(r[0],r[-1],terminalIndex())
     \\}
 ;
-const string_byte_output = "97 195 169 0 90\n90 0 169 195 97\n195 196 170 169\nBI0\n111 new\n100 101 104 105\n110 119 8\n";
+const string_byte_output = "a é € 😀 \x00 Z 6\nZ \x00 😀 € é a\né true true €\nBI\x00\no new\nd e h i\nn w 8\n";
 
-test "string byte indexing exact types effects snapshots UTF8 NUL and forced GC" {
+test "string scalar indexing exact types effects snapshots UTF8 NUL and forced GC" {
     const c = try arrayTestProgram(string_byte_program);
     defer test_gpa.free(c);
     for ([_][]const u8{ "-O0", "-O3" }) |mode|
         try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, string_byte_output, "", mode);
 }
 
-test "string byte indexing bounds panic at both optimization levels" {
+test "string scalar indexing bounds panic at both optimization levels" {
     const min = try std.fmt.allocPrint(test_gpa, "{d}", .{std.math.minInt(isize)});
     defer test_gpa.free(min);
     const max = try std.fmt.allocPrint(test_gpa, "{d}", .{std.math.maxInt(isize)});
     defer test_gpa.free(max);
     for ([_]struct { text: []const u8, index: []const u8 }{
         .{ .text = "abc", .index = "3" },
+        .{ .text = "é€😀", .index = "3" },
+        .{ .text = "é€😀", .index = "-4" },
         .{ .text = "abc", .index = "-4" },
         .{ .text = "abc", .index = min },
         .{ .text = "abc", .index = max },
@@ -3703,7 +3981,7 @@ test "string byte indexing bounds panic at both optimization levels" {
     }
 }
 
-test "string byte indexing helper is opt in and allocation free" {
+test "string scalar indexing helper is opt in and allocation free" {
     for ([_][]const u8{
         "let main:()={}",
         "let f:(s:string)->string=s",
@@ -3712,10 +3990,10 @@ test "string byte indexing helper is opt in and allocation free" {
     }) |source| {
         const c = try emitSource(source, null);
         defer test_gpa.free(c);
-        try std.testing.expect(std.mem.indexOf(u8, c, "nov_string_byte_at") == null);
+        try std.testing.expect(std.mem.indexOf(u8, c, "nov_string_rune_at") == null);
         try compileAndRun(c, "int main(void) { return 0; }");
     }
-    const c = try emitSource("let at:(s:string,i:int)->u8=s[i]", null);
+    const c = try emitSource("let at:(s:string,i:int)->rune=s[i]", null);
     defer test_gpa.free(c);
     const program = try std.mem.concat(test_gpa, u8, &.{
         "#include <stdlib.h>\nstatic void *test_malloc(size_t n) { (void)n; return NULL; }\n#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n",
@@ -3728,7 +4006,69 @@ test "string byte indexing helper is opt in and allocation free" {
     try compileAndRun(program, "typedef int nonempty_translation_unit;");
 }
 
-test "string byte indexing source free emission and compiler OOM sweep" {
+test "string scalar length is demand only and counts scalars not graphemes or bytes" {
+    const c = try arrayTestProgram(
+        \\let base:()->string={@print("B")
+        \\    "é"+"😀"}
+        \\let main:()={
+        \\    @println("".len,"\0".len,"e\u{301}".len,"é€😀".len,base().len)
+        \\    let bytes:[]u8=[195,169]
+        \\    @println(bytes.len,bytes[0])
+        \\}
+    );
+    defer test_gpa.free(c);
+    try std.testing.expect(std.mem.indexOf(u8, c, "nov_string_rune_at") == null);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "B0 1 2 3 2\n2 195\n", "", mode);
+}
+
+test "string scalar decoder accepts every UTF8 boundary without allocating" {
+    const c = try emitSource("let at:(s:string,i:int)->rune=s[i]\nlet size:(s:string)->uint=s.len", null);
+    defer test_gpa.free(c);
+    const harness =
+        \\int main(void) {
+        \\    static const unsigned char bytes[] = {0,0x7f,0xc2,0x80,0xdf,0xbf,0xe0,0xa0,0x80,0xed,0x9f,0xbf,0xee,0x80,0x80,0xef,0xbf,0xbf,0xf0,0x90,0x80,0x80,0xf4,0x8f,0xbf,0xbf};
+        \\    static const uint32_t expected[] = {0,0x7f,0x80,0x7ff,0x800,0xd7ff,0xe000,0xffff,0x10000,0x10ffff};
+        \\    const nov_string text = {NULL, bytes, sizeof bytes};
+        \\    if (nov_size(text) != 10) return 1;
+        \\    if (nov_size((nov_string){0}) != 0) return 2;
+        \\    for (intptr_t i = 0; i < 10; ++i) {
+        \\        if (nov_at(text, i) != expected[i]) return 3;
+        \\        if (nov_at(text, i - 10) != expected[i]) return 4;
+        \\    }
+        \\    nov_gc_shutdown(&nov_rt_heap); return 0;
+        \\}
+    ;
+    const program = try std.mem.concat(test_gpa, u8, &.{
+        "#include <stdlib.h>\nstatic void *test_malloc(size_t n) { (void)n; return NULL; }\n#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n",
+        c,
+        harness,
+    });
+    defer test_gpa.free(program);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(program, "typedef int nonempty_translation_unit;", 0, "", "", mode);
+}
+
+test "string scalar decoder rejects malformed truncated overlong surrogate and out of range UTF8" {
+    const c = try emitSource("let at:(s:string,i:int)->rune=s[i]\nlet size:(s:string)->uint=s.len", null);
+    defer test_gpa.free(c);
+    for ([_][]const u8{
+        "0x80",                "0xc0,0x80",           "0xc1,0xbf",      "0xc2",                "0xc2,0x41",
+        "0xe0,0x80,0x80",      "0xe2,0x82",           "0xed,0xa0,0x80", "0xf0,0x80,0x80,0x80", "0xf0,0x90,0x80",
+        "0xf4,0x90,0x80,0x80", "0xf5,0x80,0x80,0x80", "0xff",
+    }) |bytes| {
+        for ([_][]const u8{ "nov_at(text, 0)", "nov_at(text, -1)", "nov_size(text)" }) |operation| {
+            const harness = try std.fmt.allocPrint(test_gpa, "int main(void) {{ const unsigned char bytes[] = {{{s}}}; const nov_string text = {{NULL,bytes,sizeof bytes}}; (void){s}; return 2; }}", .{ bytes, operation });
+            defer test_gpa.free(harness);
+            const program = try std.mem.concat(test_gpa, u8, &.{ c, harness });
+            defer test_gpa.free(program);
+            for ([_][]const u8{ "-O0", "-O3" }) |mode|
+                try compileAndRunMode(program, "typedef int nonempty_translation_unit;", 1, "", "panic: invalid UTF-8 string\n", mode);
+        }
+    }
+}
+
+test "string scalar indexing source free emission and compiler OOM sweep" {
     var sema = blk: {
         var module = try Module.init(test_gpa, "source-free.nov", string_byte_program);
         defer module.deinit();
@@ -3746,9 +4086,9 @@ test "string byte indexing source free emission and compiler OOM sweep" {
     try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{string_byte_program});
 }
 
-test "string byte indexing rejects escaped regions slots and borrow capabilities before C emission" {
+test "string scalar indexing rejects escaped regions slots and borrow capabilities before C emission" {
     var sema = blk: {
-        var module = try Module.init(test_gpa, "malformed-byte.nov", "let f:(flag:bool)->u8={let mut s=if flag {\"a\"}else{\"b\"}\nlet r=&s\nr[0]}");
+        var module = try Module.init(test_gpa, "malformed-byte.nov", "let f:(flag:bool)->rune={let mut s=if flag {\"a\"}else{\"b\"}\nlet r=&s\nr[0]}");
         defer module.deinit();
         var result = try Lowering.lower(&module);
         errdefer result.deinit();
@@ -3779,14 +4119,14 @@ test "string byte indexing rejects escaped regions slots and borrow capabilities
     try sema.ir.verify();
 }
 
-test "string byte indexing terminal base skips index calls" {
+test "string scalar indexing terminal base skips index calls" {
     const library = try emitSource("let index:()->int={@print(\"wrong\")\n0}\nlet main:()=@println(@panic(\"base\")[index()])", null);
     defer test_gpa.free(library);
     const c = try collectingTestProgram(library);
     defer test_gpa.free(c);
     for ([_][]const u8{ "-O0", "-O3" }) |mode|
         try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 1, "", "panic: base\n", mode);
-    try std.testing.expect(std.mem.indexOf(u8, c, "nov_string_byte_at") == null);
+    try std.testing.expect(std.mem.indexOf(u8, c, "nov_string_rune_at") == null);
 }
 
 fn importedStringByteProgram(allocator: std.mem.Allocator) ![]u8 {
@@ -3813,13 +4153,13 @@ fn importedStringByteAllocations(allocator: std.mem.Allocator) !void {
     allocator.free(try importedStringByteProgram(allocator));
 }
 
-test "string byte indexing imported aliases survive graph release GC and OOM" {
+test "string scalar indexing imported aliases survive graph release GC and OOM" {
     const library = try importedStringByteProgram(test_gpa);
     defer test_gpa.free(library);
     const c = try collectingTestProgram(library);
     defer test_gpa.free(c);
     for ([_][]const u8{ "-O0", "-O3" }) |mode|
-        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "195 33 169\n", "", mode);
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "é ! !\n", "", mode);
     try TestAllocations.checkAllAllocationFailures(test_gpa, importedStringByteAllocations, .{});
 }
 
@@ -4259,7 +4599,7 @@ const string_interpolation =
     \\    @println(found, early(0), early(9), shared)
     \\}
 ;
-const string_interpolation_output = "Atrue:false:0:{é\x00😀}:Z 7 true/false\ntrue true 7\ntrue 11\n[1]=1\n[2]=2\n[3]=Fizz\n[4]=4\n[5]=Buzz\n[6]=Fizz\n[7]=7\n[8]=8\n[9]=Fizz\n[10]=Buzz\n[11]=11\n[12]=Fizz\n[13]=13\n[14]=14\n[15]=FizzBuzz\n16 0 number=9 é\x00😀\n";
+const string_interpolation_output = "Atrue:false:0:{é\x00😀}:Z 3 true/false\ntrue true 3\ntrue 6\n[1]=1\n[2]=2\n[3]=Fizz\n[4]=4\n[5]=Buzz\n[6]=Fizz\n[7]=7\n[8]=8\n[9]=Fizz\n[10]=Buzz\n[11]=11\n[12]=Fizz\n[13]=13\n[14]=14\n[15]=FizzBuzz\n16 0 number=9 é\x00😀\n";
 
 test "identifier interpolation preserves chunks formatting roots loops matches and returns" {
     const c = try arrayTestProgram(string_interpolation);
@@ -4508,7 +4848,7 @@ test "expression interpolation reuses calls scopes ordering and rooted temporari
         \\}
     );
     defer test_gpa.free(c);
-    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "CA1A341!/3!:é\x00😀 4!\n565!6! 3 7\ntrue:false\n0zero\n11!\n", "", mode);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "CA1A341!/3!:é\x00😀 4!\n565!6! 3 3\ntrue:false\n0zero\n11!\n", "", mode);
 }
 
 test "interpolation decimal formatting is exact at every supported integer boundary" {
@@ -4701,7 +5041,7 @@ const string_compound =
     \\    @println(empty, empty.len)
     \\}
 ;
-const string_compound_output = "hé\x00hé\x00 8 hé\x00 4\nhé\x00hé\x00😀\x00 hé\x00\ncontinue!tail!\nbreak! 3 returned old!tail hé\x00\né 2\n";
+const string_compound_output = "hé\x00hé\x00 6 hé\x00 3\nhé\x00hé\x00😀\x00 hé\x00\ncontinue!tail!\nbreak! 3 returned old!tail hé\x00\né 1\n";
 
 test "string compounds capture before RHS and preserve aliases terminal effects and GC roots" {
     const c = try arrayTestProgram(string_compound);
@@ -4758,10 +5098,10 @@ test "string callback signatures need declarations but not a managed runtime" {
     try compileAndRun(library, "int main(void) { return 0; }");
 }
 
-test "generated string programs compile for Windows with binary UTF8 output" {
+test "generated string and rune programs compile for Windows with binary UTF8 output" {
     const zig_exe = std.testing.environ.getAlloc(test_gpa, "NOV_TEST_ZIG") catch try test_gpa.dupe(u8, "zig");
     defer test_gpa.free(zig_exe);
-    for ([_][]const u8{ string_example, string_interpolation }) |source| {
+    for ([_][]const u8{ string_example, string_interpolation, rune_program }) |source| {
         var module = try Module.init(test_gpa, "windows.nov", source);
         defer module.deinit();
         var sema = try Lowering.lower(&module);

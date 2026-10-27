@@ -54,7 +54,7 @@ clauses, value-carrying breaks, and conditional/range-loop exhaustion (`else`) r
 It requires immutable literal globals; unit/global block initializers are
 not lowered yet. An internal C11 backend emits verified IR, including fixed-width
 integer arithmetic and program entrypoint emission through `emit-c`.
-`@print`/`@println` support booleans, strings and explicitly typed integers,
+`@print`/`@println` support booleans, runes, strings and explicitly typed integers,
 including `int`/`uint`, and [nominal value structs](#executable-nominal-value-structs)
 with an exact container `toString` method. Plain `check` remains syntax-only.
 
@@ -64,8 +64,8 @@ analysis, annotation/literal and function-body checking, then typed lowering and
 IR verification. Source errors and unsupported/deferred forms fail with source
 diagnostics (including related notes where available); recovered syntax errors
 stop semantic analysis. Runtime globals must be immutable scalar constants: explicitly
-typed integer/boolean/string literals, inferred boolean or plain UTF-8 string
-literals, or scalar literals explicitly contextualized with `@as(T, literal)`.
+typed integer/boolean/rune/string literals, inferred boolean, rune or plain UTF-8
+string literals, or scalar literals explicitly contextualized with `@as(T, literal)`.
 Immutable module-level type aliases are also supported. Functions need explicit supported signatures and bounded
 expression bodies (including forward/recursive calls, local declarations and
 assignments, nested blocks, boolean short-circuiting, `if`/`else`, explicit returns,
@@ -173,7 +173,8 @@ Backend integer widths are restricted to 8, 16, 32 and 64 bits, including nested
 function signatures, with source diagnostics for unsupported widths.
 
 `@print` and `@println` return `void` and write arguments to buffered stdout,
-separated by one space. Booleans use `true`/`false`; integers use decimal notation.
+separated by one space. Booleans use `true`/`false`; integers use decimal notation;
+runes encode their scalar as UTF-8, including NUL.
 `@println` appends a newline, including when called without arguments; `@print()`
 outputs nothing. Arguments are evaluated left to right before the builtin writes
 any output. Each stdout write and the program's final flush are checked; failure
@@ -253,7 +254,7 @@ let main: () -> void = {
 This prints `42` on two lines. Locals require an initializer. The annotation may
 be omitted in `let name = expression` and `let mut name = expression` when the
 initializer already determines a supported `bool`, integer (fixed-width or native
-`int`/`uint`), string, existing function-value or scalar-array type. Examples include
+`int`/`uint`), rune, string, existing function-value or scalar-array type. Examples include
 `let ready = true`, `let result = value + 1`, `let callback = twice`, and
 `let mut copy = values` for an already typed array. Calls, indexing, `.len`, and
 block/conditional results use the same bidirectional rules as other expressions.
@@ -272,7 +273,7 @@ Explicit annotations remain supported, including immutable `void` values and
 function values with unnamed parameter types (e.g. `let callback: (int) -> int = twice`).
 Inferred `void` locals, named local function definitions/closures, labels and
 other managed types remain unsupported. Mutable locals use `let mut` and support
-`bool`, integer, string, existing function and scalar-array values (not `void`). Direct
+`bool`, integer, rune, string, existing function and scalar-array values (not `void`). Direct
 identifier assignment (`n = value`) and integer-only `+=`, `-=`, `*=`, `/=`, `%=`
 return `void`; a block ending in assignment therefore also returns `void`.
 Assignments require a mutable local, not a parameter or global. RHS types must
@@ -725,7 +726,7 @@ The delivered subset is deliberately bounded:
   fields. `let Alias = MyType` preserves the original identity, fields and methods;
   aliases work in annotations, method signatures, constructors and static calls.
   Forward module type names and method signatures are supported.
-- Named fields require explicit `bool`, integer (including `i128`/`u128` and native
+- Named fields require explicit `bool`, `rune`, integer (including `i128`/`u128` and native
   `int`/`uint`), immutable `string`, nominal enum, or acyclic nominal struct types
   (including aliases). Semantic checking
   uses the same integer-width and literal-bound rules as scalar values. The C
@@ -866,7 +867,7 @@ let z = [ 10, 20, 30 ]
 
 Ordinary module declarations such as `let Value = union { number: int, text: string, empty, }`
 introduce nominal tagged value types. Separate declarations remain distinct; aliases
-preserve identity. The current executable subset supports bool, integer, string,
+preserve identity. The current executable subset supports bool, integer, rune, string,
 void, enum, and existing acyclic nominal struct payloads, with no payload defaults. As with structs, integer fields are
 checked semantically through 128 bits, while reachable C layouts require
 8/16/32/64-bit widths.
@@ -1241,7 +1242,7 @@ let prod = a.! * b.! ; will return .none to the calling function since b is .non
 ### Executable array subset
 
 Growable `[]T` arrays are supported in function bodies and signatures for `bool`,
-`i8/i16/i32/i64`, `u8/u16/u32/u64`, native `int/uint`, immutable `string`, and
+`rune`, `i8/i16/i32/i64`, `u8/u16/u32/u64`, native `int/uint`, immutable `string`, and
 finite acyclic nominal structs (including nested structs). Literals use an
 expected array type when available; otherwise, a known supported element type
 determines the exact element type for the whole literal, even when it
@@ -1324,7 +1325,7 @@ let main: () -> void = {
 ### Local static borrowing
 
 Scoped borrows support every currently implemented non-void runtime value type:
-bool, integer, string, enum, struct, union, array, range and function values. Borrow
+bool, integer, rune, string, enum, struct, union, array, range and function values. Borrow
 a local with `let view = &value`, or a supported array element with
 `let view = &items[index]`. Readonly locals and parameters can be borrowed for
 reading; writes require a mutable owner.
@@ -1556,7 +1557,7 @@ retain the existing single-newline continuation rules, including after `in` and
 
 ## Match
 
-The executable subset supports one or more `bool`, integer, or string subjects,
+The executable subset supports one or more `bool`, integer, `rune`, or string subjects,
 scalar literal patterns, `|` alternatives within a positional pattern, and `_`
 wildcards. Subjects are evaluated **once, left to right, before selection**.
 Prongs are tested in source order and only the first matching body executes.
@@ -1566,7 +1567,7 @@ is exhaustive when its patterns cover both `true` and `false`, even without a
 final catchall. Alternatives such as `true | false` cover both values; `_` inside
 an alternative is universal. Completely covered boolean prongs are rejected,
 but partial overlaps retain first-match behavior. Coverage depends on the subject
-type, not its runtime or literal value. Integer, string and multi-subject matches
+type, not its runtime or literal value. Integer, rune, string and multi-subject matches
 still require a final catchall (`_` or all positional `_`s); general finite-domain
 exhaustiveness is not implemented.
 
@@ -1727,8 +1728,8 @@ let nums: []int = [1, 2, 3]
 @println(5 in nums) ; false
 ```
 
-The executable subset supports the existing scalar `[]T` arrays only: `bool`,
-fixed 8/16/32/64-bit signed/unsigned integers, and native `int`/`uint`. Value and
+The executable subset supports membership in scalar `[]T` arrays: `bool`, `rune`,
+`string`, fixed 8/16/32/64-bit signed/unsigned integers, and native `int`/`uint`. Value and
 element types must match exactly; there is no widening or signedness conversion.
 A known array element type constrains the left literal; a known typed left value
 constrains an array literal, including `[]`. Boolean literals provide a known
@@ -1739,8 +1740,8 @@ does not choose an element type.
 Operands evaluate once, left then right, following the existing array read/copy
 rules. Membership itself is an allocation-free linear scan of the array's
 length, using scalar value equality and stopping at the first match. It neither
-mutates nor appends. Strings, nested arrays, pointers, ranges and iterators are
-not supported membership containers or element types.
+mutates nor appends. String elements compare exact bytes, including NUL. Strings
+as containers, nested arrays, records, pointers, ranges and iterators are unsupported.
 
 ## Assignment
 ```nov
@@ -1755,8 +1756,9 @@ let z += 3 ; compile error, expected `=`
 
 ## Scalar Constant Globals
 
-Immutable module bindings infer `bool` from `true`/`false` and `string` from plain
-UTF-8 string literals. Numeric inference requires explicit type context:
+Immutable module bindings infer `bool` from `true`/`false`, `rune` from single-quoted
+scalar literals and `string` from plain UTF-8 string literals. Numeric inference
+requires explicit type context:
 
 ```nov
 let enabled = true
@@ -1806,7 +1808,7 @@ let main: () -> void = {
 Aliases are canonical synonyms, **not distinct newtypes**: `Count` and `uint`
 match exactly, with the same literal bounds, operations and backend restrictions.
 Supported RHS forms are `bool`, `void`, fixed-width integers, native `int`/`uint`,
-`string`, nominal struct types, scalar array types and function types, including aliases in nested
+`rune`, `string`, nominal struct types, scalar array types and function types, including aliases in nested
 parameter/result/array-element positions. Function-type parameters may be unnamed.
 `let Callback = (int) -> int` declares a type alias, not a function body.
 Function definitions still use explicit signature syntax, such as
@@ -1844,12 +1846,40 @@ numeric cast. See [examples/type-aliases.nov](examples/type-aliases.nov).
 TODO
 - bool
 - string
-- rune (proposed Unicode scalar type; not implemented)
+- rune (distinct Unicode scalar type; see [Runes](#runes))
 
 See also:
 - [Integers](#Integers)
 - [Floats](#Floats)
 - [Arrays](#Arrays)
+
+## Runes
+
+`rune` is a distinct Unicode scalar type: `0..=0x10FFFF`, excluding surrogate
+values `0xD800..=0xDFFF`. It is neither an integer nor a grapheme (visible character).
+Single quotes contain exactly one scalar or escape: `'a'`, `'é'`, `'😀'`, `'\n'`,
+`'\0'`, `'\''`, `'\\'`, `'\xE9'` and `'\u{1F600}'`. Rune `\xNN` denotes
+that scalar value (`'\xE9' == 'é'`), not a standalone UTF-8 byte. Empty/multiple-scalar
+literals, malformed UTF-8, invalid escapes and surrogate/out-of-range scalars reject.
+
+Runes support inference, exact `@as(rune, value)` ascription, aliases, literal
+globals, parameters/returns, `==`/`!=`, arrays, fields, union payloads, literal
+matches (with a catchall) and scoped whole-value/array-element borrows.
+`@print`/`@println` and interpolation encode runes as UTF-8, including NUL:
+
+```nov
+let main: () = {
+    let accent = 'é'
+    let emoji = '\u{1F600}'
+    let letters: []rune = [accent, emoji]
+    @println(letters[0], "Runes: {accent}{emoji}")
+}
+```
+
+Bind rune literals to variables before interpolating: quoted literals inside
+placeholders remain unsupported. No numeric conversions, arithmetic, ordering,
+rune ranges or foreign ABI support are provided. See
+[`examples/runes.nov`](examples/runes.nov).
 
 ## Integers
 
@@ -1906,7 +1936,7 @@ TODO
 not a new left-to-right pipeline effect order. Chaining is left-associative.
 Named functions and function values require exactly one parameter; its exact type
 constrains literals (`10 |> fibo`). `value |> @print` and `value |> @println`
-accept an already typed bool/integer/string result and return void. They do not
+accept an already typed bool/integer/rune/string result and return void. They do not
 supply an integer default. No partial application or implicit conversions occur.
 
 The unchanged [`examples/fibo.nov`](examples/fibo.nov) now runs:
@@ -1947,7 +1977,7 @@ nov run examples/fibo.nov --release # 55
 | Bind                  | a >>= \|b\| ...    | Monads                                       | TODO                                                                |
 | Function Pipe         | a \|> f            | [Functions](#Functions)                      | TODO                                                                |
 | Member Search         | a **in** b         | [Arrays](#Arrays)                            | TODO                                                                |
-| Access                | a\[b]              | [Arrays](#Arrays)                            | Array elements and immutable string bytes supported          |
+| Access                | a\[b]              | [Arrays](#Arrays)                            | Array elements and immutable string scalars supported          |
 | Field / Method Access | a.b                | All types                                    | TODO                                                                |
 | Reference Type        | \*T <br> \*mut T   | All types                                    | Create a reference type from `T`. Unless `mut` is specified the wrapped value is constant |
 | Reference Of          | &a                 | All types                                    | Returns a reference to `a`.                                         |
@@ -2026,32 +2056,40 @@ is false, while `"é" == "\u{e9}"` is true. A return, break or continue in an
 operand skips the remaining comparison without undoing earlier effects.
 
 Ordering (`<`, `<=`, `>`, `>=`), other operators (including `-=`, `*=`, `/=` and
-`%=`), slicing and Unicode-aware operations remain deferred.
+`%=`), slicing, iteration and grapheme operations remain deferred.
 `[]string` and supported record arrays work with independent element storage and
 shared immutable string backing; nested arrays remain unsupported.
 
-`text[index]` reads one byte as **exactly `u8`**, using a native signed `int` index.
-Negative indices count from the end: `-1` is the last byte. Out-of-bounds access,
+`text[index]` decodes one Unicode scalar as **exactly `rune`**, using a native signed
+`int` index. Indices count scalars, not bytes or graphemes; `-1` is the last scalar. Out-of-bounds access,
 including indexing an empty string, panics with `string index out of bounds` in
 all build modes. No implicit integer widening or index signedness conversion occurs.
 The string and index evaluate once, left to right; the string value is captured
-before index effects can replace its binding or trigger GC. Reads allocate nothing.
+before index effects can replace its binding or trigger GC. Indexing scans UTF-8
+in O(n) time and allocates nothing; internal storage remains UTF-8 bytes.
 
 ```nov
 let main: () = {
-    let text = "é"
-    let first: u8 = text[0] ; 195
-    let last: u8 = text[-1] ; 169
-    @println(first, last)
+    let text = "é😀\0"
+    let first: rune = text[0] ; 'é'
+    let last: rune = text[-1] ; '\0'
+    @assert(text[1] == '😀')
+    @assert(text.len == 3)
+    @println("First: {first}", last)
 }
 ```
 
-This is UTF-8 **byte** access, not rune/character indexing; continuation bytes and
-embedded NUL are readable. Indexed assignment, compound assignment and string-element
+Embedded NUL is an ordinary scalar; continuation bytes are not exposed by indexing.
+Indexed assignment, compound assignment and string-element
 borrows are unsupported, even for `let mut` bindings. Whole-string aliases retain
 the existing borrowing rules. Chained reads such as `strings[0][1]` work for arrays
 of strings; this does not enable nested arrays. See
-[`examples/string-bytes.nov`](examples/string-bytes.nov).
+[`examples/string-bytes.nov`](examples/string-bytes.nov), which keeps its historical
+filename but now demonstrates Unicode scalar indexing and length.
+
+Approved future string slicing uses half-open scalar offsets, with negative offsets
+counted from the scalar end. Slices will share the original GC owner without copying
+UTF-8 bytes. **String slicing is not implemented.**
 
 For editing, keep the distinction between a mutable binding and mutable storage:
 `s += "more"` produces a new immutable string and rebinds `s`, preserving older
@@ -2059,11 +2097,12 @@ copies. Agreed future APIs will provide independent string-to-`[]u8` copies and
 validated, recoverable-error byte-buffer-to-string conversion. A separate stdlib
 builder may preserve UTF-8 while appending/editing and produce independent immutable
 snapshots. These conversions and builder are **not implemented**; there is no second
-built-in mutable-string type. `rune`, UTF-8 decoding/iteration and grapheme operations
-remain deferred; a Unicode scalar is not necessarily one visible character.
+built-in mutable-string type. Rune decoding through indexing is implemented;
+iteration and grapheme operations remain deferred.
 
-`.len` is the byte length as native `uint`, not a character or grapheme count.
-`"é".len` is 2 and `"😀".len` is 4. Literals use the existing escapes (`\n`, `\r`,
+`.len` is the Unicode scalar count as native `uint`, **not byte length or a grapheme
+count**. It scans UTF-8 in O(n) time without allocations. `"é".len` and `"😀".len`
+are both 1; `"e\u{301}".len` is 2 and `"".len` is 0. Literals use the existing escapes (`\n`, `\r`,
 `\t`, `\\`, `\"`, `\'`, `\0`, `\xNN`, `\u{...}`, `\{`, `\}`). Decoded bytes
 must be valid UTF-8; NUL is valid, including through `\x00` or `\u{0}`. Invalid
 escapes/UTF-8 report source locations. Unescaped `{expression}` interpolates a
@@ -2074,8 +2113,8 @@ NUL, with the same spaces, buffering, checked writes/final flush and panic behav
 as scalars. Windows stdout is switched to binary mode on the first print to avoid
 newline translation; this is UTF-8 byte output, not UTF-16 console conversion.
 Literal-only immutable globals with explicit `string` annotations are supported
-without eager initialization calls; inferred/mutable globals and global concatenation
-or calls remain unsupported. Global interpolation is also rejected as nonliteral;
+without eager initialization calls; inferred plain string globals also work. Mutable
+globals and global concatenation or calls remain unsupported. Global interpolation is also rejected as nonliteral;
 move it into a function.
 
 ```nov
@@ -2101,7 +2140,8 @@ never static byte pointers. Temporaries use the same precise root frames as arra
 `"{expression}"` evaluates an expression in the current lexical scope and produces
 an immutable `string`. Placeholders support `bool` (`true`/`false`), signed and
 unsigned fixed-width integers (`i8`/`u8` through `i64`/`u64`), native `int`/`uint`
-(exact decimal, including minimum/maximum values), and strings (unchanged bytes).
+(exact decimal, including minimum/maximum values), runes (UTF-8 encoded scalars),
+and strings (unchanged bytes).
 Nominal enums, structs and concrete generic or non-generic unions also work when they define the exact
 container `toString: (SelfType) -> string` method already required by print.
 Each placeholder expression evaluates once, then converts once immediately before
@@ -2154,7 +2194,7 @@ TODO
 - `@TypeOf(...)`: Returns the type of a value.
 - `@typeInfo(...)`: Returns type information about a value.
 - `@This()`: Returns the type of the current container
-- `@print(...)`: Output bool, fixed/native integer and string args separated with a space to stdout; returns void. Nominal structs require their exact `toString: (MyType) -> string` method, called once immediately after evaluating each record argument. Interpolated strings work like other strings.
+- `@print(...)`: Output bool, fixed/native integer, rune and string args separated with a space to stdout; returns void. Nominal structs require their exact `toString: (MyType) -> string` method, called once immediately after evaluating each record argument. Interpolated strings work like other strings.
 - `@println(...)`: Same as print with a newline at the end, including with no args.
 - `@fprint(file: File, ...)`: Same as print but output to a specific file. Returns a Result<>.
 <!-- - `@eprint(...)`: Same as print but output to stderr. -->
@@ -2245,7 +2285,7 @@ results may also be `void`. Canonical aliases are accepted, including pointer-si
 `int`/`uint`. The C types are `bool` (include `<stdbool.h>`) and the corresponding
 `intN_t`/`uintN_t` (include `<stdint.h>`); native integers match `intptr_t`/`uintptr_t`
 on the native target. Calls use the C compiler's ordinary C calling convention.
-Strings, arrays, ranges, enums, records/unions, function values, wider integers,
+Runes, strings, arrays, ranges, enums, records/unions, function values, wider integers,
 methods and generic exports are not supported as foreign ABI declarations.
 
 `@[public]` controls **Nov import visibility**; export controls the **foreign symbol**.

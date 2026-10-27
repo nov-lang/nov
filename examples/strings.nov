@@ -18,7 +18,7 @@ let main: () -> void = {
     @println(decorate(selected))
 ; Escaped braces are literal, unlike identifier placeholders.
     @println("\{UTF-8\}", "😀".len)
-; NUL is a valid byte, not an output terminator (length is 3).
+; NUL is a valid scalar, not an output terminator (length is 3).
     @println("a\0b", "a\0b".len)
 ; Equality compares bytes, not storage identity, including past NUL.
     let rebuilt = greeting + ", 世界!"

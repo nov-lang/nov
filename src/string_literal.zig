@@ -1,7 +1,6 @@
 // Originally based on https://github.com/ziglang/zig/blob/master/lib/std/zig/string_literal.zig
 // See https://github.com/ziglang/zig/blob/master/LICENSE for additional LICENSE details
 // Identifier interpolation is checked/lowered from the original token by BodyChecker.
-// TODO: treat characters as a whole new type instead of string?
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -45,12 +44,12 @@ pub const Error = union(enum) {
     empty_char_literal,
 };
 
-/// Asserts the slice starts and ends with single-quotes.
-/// Returns an error if there is not exactly one UTF-8 codepoint in between.
+/// Parses exactly one Unicode scalar between single quotes, including escapes.
+/// Malformed or truncated source is reported without assuming valid UTF-8.
 pub fn parseCharLiteral(slice: []const u8) ParsedCharLiteral {
-    if (slice.len < 3) return .{ .failure = .empty_char_literal };
-    assert(slice[0] == '\'');
-    assert(slice[slice.len - 1] == '\'');
+    if (slice.len == 0 or slice[0] != '\'') return .{ .failure = .{ .expected_single_quote = 0 } };
+    if (slice.len < 2 or slice[slice.len - 1] != '\'') return .{ .failure = .{ .expected_single_quote = slice.len } };
+    if (slice.len == 2) return .{ .failure = .empty_char_literal };
 
     switch (slice[1]) {
         '\\' => {
@@ -61,23 +60,14 @@ pub fn parseCharLiteral(slice: []const u8) ParsedCharLiteral {
 
             return result;
         },
-        0 => return .{ .failure = .{ .invalid_character = 1 } },
+        0, '\n', '\r', '\'' => return .{ .failure = .{ .invalid_character = 1 } },
         else => {
-            const codepoint = std.unicode.utf8Decode(slice[1 .. slice.len - 1]) catch unreachable;
+            const inner = slice[1 .. slice.len - 1];
+            const n = std.unicode.utf8ByteSequenceLength(inner[0]) catch return .{ .failure = .{ .invalid_unicode_codepoint = 1 } };
+            if (inner.len < n) return .{ .failure = .{ .invalid_unicode_codepoint = 1 } };
+            const codepoint = std.unicode.utf8Decode(inner[0..n]) catch return .{ .failure = .{ .invalid_unicode_codepoint = 1 } };
+            if (inner.len != n) return .{ .failure = .{ .expected_single_quote = 1 + n } };
             return .{ .success = codepoint };
-            // const inner = slice[1 .. slice.len - 1];
-            // const n = std.unicode.utf8ByteSequenceLength(inner[0]) catch return .{
-            //     .failure = .{ .invalid_unicode_codepoint = 1 },
-            // };
-            // if (inner.len > n) return .{ .failure = .{ .expected_single_quote = 1 + n } };
-            // const codepoint = switch (n) {
-            //     1 => inner[0],
-            //     2 => std.unicode.utf8Decode2(inner[0..2].*),
-            //     3 => std.unicode.utf8Decode3(inner[0..3].*),
-            //     4 => std.unicode.utf8Decode4(inner[0..4].*),
-            //     else => unreachable,
-            // } catch return .{ .failure = .{ .invalid_unicode_codepoint = 1 } };
-            // return .{ .success = codepoint };
         },
     }
 }
@@ -165,11 +155,44 @@ pub fn parseEscapeSequence(slice: []const u8, offset: *usize) ParsedCharLiteral 
             } else {
                 return .{ .failure = .{ .expected_rbrace = i } };
             }
+            // Preserve the string decoder's source location for surrogate escapes:
+            // the opening brace, rather than the closing brace after validation.
+            if (value >= 0xd800 and value <= 0xdfff) return .{ .failure = .{ .invalid_unicode_codepoint = offset.* } };
             offset.* = i;
             return .{ .success = @as(u21, @intCast(value)) };
         },
         else => return .{ .failure = .{ .invalid_escape_character = offset.* - 1 } },
     }
+}
+
+test "rune literals decode one scalar and reject malformed source without panics" {
+    const Case = struct { text: []const u8, value: u21 };
+    for ([_]Case{
+        .{ .text = "'a'", .value = 97 },
+        .{ .text = "'é'", .value = 0xe9 },
+        .{ .text = "'😀'", .value = 0x1f600 },
+        .{ .text = "'\\n'", .value = 10 },
+        .{ .text = "'\\0'", .value = 0 },
+        .{ .text = "'\\xE9'", .value = 0xe9 },
+        .{ .text = "'\\u{10FFFF}'", .value = 0x10ffff },
+        .{ .text = "'\\u{D7FF}'", .value = 0xd7ff },
+        .{ .text = "'\\u{E000}'", .value = 0xe000 },
+    }) |case| try std.testing.expectEqual(case.value, parseCharLiteral(case.text).success);
+    for ([_][]const u8{
+        "",            "'",           "''",            "a",                       "'a",                 "'ab'",
+        "'é'",
+        "'😀a'",
+        "'\\u{D800}'", "'\\u{DFFF}'", "'\\u{110000}'", "'\\u{FFFFFFFFFFFFFFFF}'", "'\\u{'",             "'\\x'",
+        "'\\'",        "'\xff'",      "'\xc0\x80'",    "'\xed\xa0\x80'",          "'\xf4\x90\x80\x80'", "'\xe2\x82'",
+        "'\x00'",      "'\n'",
+    }) |text| try std.testing.expect(parseCharLiteral(text) == .failure);
+}
+
+test "surrogate escapes retain shared string and rune diagnostic locations" {
+    try std.testing.expectEqual(ParsedCharLiteral{ .failure = .{ .invalid_unicode_codepoint = 3 } }, parseCharLiteral("'\\u{D800}'"));
+    var decoded = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer decoded.deinit();
+    try std.testing.expectEqual(Result{ .failure = .{ .invalid_unicode_codepoint = 4 } }, try parseWrite(&decoded.writer, "\"a\\u{D800}\""));
 }
 
 test parseCharLiteral {

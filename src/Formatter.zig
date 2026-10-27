@@ -56,7 +56,7 @@ fn fieldDefaultSupported(ast: Ast, node: Ast.Node.Index) bool {
     }
     const tag = ast.nodes.items(.tag)[current];
     if (tag == .negation) return ast.nodes.items(.tag)[ast.nodes.items(.data)[current].rhs] == .number_literal;
-    if (tag == .number_literal or tag == .enum_literal) return true;
+    if (tag == .number_literal or tag == .enum_literal or tag == .char_literal) return true;
     if (tag == .field_access) return ast.nodes.items(.tag)[ast.nodes.items(.data)[current].lhs] == .identifier;
     if (tag == .string_literal) return !Literal.hasInterpolation(ast.tokenSlice(ast.firstToken(current)));
     if (tag == .identifier) {
@@ -178,7 +178,7 @@ fn checkSupported(ast: Ast) !void {
                 }
                 const name = ast.tokenSlice(ast.firstToken(data.lhs));
                 if (field_tag == .identifier and primitives.isPrimitive(name)) {
-                    const allowed = [_][]const u8{ "void", "bool", "string", "int", "uint", "i8", "i16", "i32", "i64", "i128", "u8", "u16", "u32", "u64", "u128" };
+                    const allowed = [_][]const u8{ "void", "bool", "string", "rune", "int", "uint", "i8", "i16", "i32", "i64", "i128", "u8", "u16", "u32", "u64", "u128" };
                     for (allowed) |scalar| {
                         if (std.mem.eql(u8, name, scalar)) break;
                     } else return error.UnsupportedSyntax;
@@ -192,7 +192,7 @@ fn checkSupported(ast: Ast) !void {
                     else => return error.UnsupportedSyntax,
                 }
                 const name = ast.tokenSlice(ast.nodes.items(.main_token)[data.rhs]);
-                const scalar_types = [_][]const u8{ "bool", "string", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "int", "uint" };
+                const scalar_types = [_][]const u8{ "bool", "string", "rune", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "int", "uint" };
                 for (scalar_types) |scalar| {
                     if (std.mem.eql(u8, name, scalar)) break;
                 } else if (primitives.isPrimitive(name)) return error.UnsupportedSyntax;
@@ -342,6 +342,15 @@ test "unions constructors captures and payloadless variants format idempotently"
 test "test attributes and assert arguments format and survive OOM" {
     try expectFormatted("@[test]\nlet check:()=@assert(true,\"ok\")", "@[test]\nlet check: () = @assert(true, \"ok\")\n");
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{"@[test]\nlet check:()={@assert(true)\n@assert(false,\"message\")}"});
+}
+
+test "rune annotations arrays defaults escapes and comments format idempotently" {
+    try expectFormatted("let R=struct{value:rune='\\xE9',}\nlet f:(xs:[]rune)->rune=xs[0]", "let R = struct {\n    value: rune = '\\xE9',\n}\nlet f: (xs: []rune) -> rune = xs[0]\n");
+    const source = "let Rune=rune\nlet x:Rune='😀' ; scalar\nlet f:(r:rune)->string=\"{r}\"\nlet values:[]rune=['é','\\0','\\u{10FFFF}']";
+    const formatted = try format(std.testing.allocator, source);
+    defer std.testing.allocator.free(formatted);
+    try expectFormatted(source, formatted);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{source});
 }
 
 test "declarations arithmetic strings and idempotence" {

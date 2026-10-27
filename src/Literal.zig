@@ -85,7 +85,13 @@ pub fn check(module: *Module, ir: *Ir, node: Ast.Node.Index, expected: Ir.TypeId
                 }
                 return internLiteral(module, ir, expected, .{ .string = decoded.written() }, span, annotation);
             },
-            .char_literal => return failLiteral(module, .unsupported_literal, span, annotation),
+            .char_literal => {
+                const parsed = string_literal.parseCharLiteral(module.sourceSlice(span).?);
+                return switch (parsed) {
+                    .success => |value| internLiteral(module, ir, expected, .{ .rune = value }, span, annotation),
+                    .failure => failLiteral(module, .invalid_literal, span, null),
+                };
+            },
             else => return .not_literal,
         }
     }
@@ -226,6 +232,22 @@ const test_u8: Ir.Type = .{ .integer = .{ .signedness = .unsigned, .bits = 8 } }
 const test_i128: Ir.Type = .{ .integer = .{ .signedness = .signed, .bits = 128 } };
 const test_u128: Ir.Type = .{ .integer = .{ .signedness = .unsigned, .bits = 128 } };
 
+test "rune constants are scalar codepoints with exact literal typing" {
+    for ([_][]const u8{ "'é'", "'\\xE9'", "'\\u{e9}'" }) |text| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let value = {s}", .{text});
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "rune.nov", source);
+        defer module.deinit();
+        var ir = Ir.init(std.testing.allocator);
+        defer ir.deinit();
+        const rune = try ir.internType(.rune);
+        const result = try check(&module, &ir, testNode(&module, 0), rune, null);
+        try std.testing.expectEqual(@as(u32, 0xe9), ir.getConstant(result.constant).?.value.rune);
+        try std.testing.expectEqual(Result.failed, try check(&module, &ir, testNode(&module, 0), try ir.internType(test_u8), null));
+        try std.testing.expectEqual(Module.Diagnostic.Tag.literal_type_mismatch, module.diagnostics.items[0].tag);
+    }
+}
+
 test "string decoding owns canonical UTF8 bytes independently of source" {
     var ir = Ir.init(std.testing.allocator);
     defer ir.deinit();
@@ -322,7 +344,7 @@ test "invalid literals fail with source spans and only optional type notes" {
         .{ .expression = "0b102", .tag = .invalid_literal },
         .{ .expression = "1.0", .tag = .unsupported_literal },
         .{ .expression = "-1.0", .tag = .unsupported_literal },
-        .{ .expression = "'a'", .tag = .unsupported_literal },
+        .{ .expression = "'ab'", .tag = .invalid_literal },
         .{ .expression = "\"true\"", .tag = .literal_type_mismatch },
     }) |case| {
         const source = try std.fmt.allocPrint(std.testing.allocator, "let x: Expected = {s}", .{case.expression});

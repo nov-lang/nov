@@ -2,6 +2,7 @@ const std = @import("std");
 const TestAllocations = @import("TestAllocations.zig");
 const Ir = @This();
 const Source = @import("Source.zig");
+const Compilation = @import("Compilation.zig");
 const BorrowCheck = @import("BorrowCheck.zig");
 const ExportNames = @import("ExportNames.zig");
 
@@ -62,15 +63,16 @@ pub const Operation = union(enum) {
     field_read: FieldRead,
     /// Update only this field of the current mutable local, not a record snapshot.
     field_store: struct { slot: ValueId, index: u32, value: ValueId, path: []const u32 = &.{} },
-    /// Decimal integers, true/false booleans, or a shared immutable string.
+    /// Decimal integers, true/false booleans, UTF8 runes, or a shared immutable string.
     to_string: ValueId,
     array_literal: []const ValueId,
     /// Independent element storage; records copy by value, string backing shares.
     array_clone: ValueId,
-    /// Byte length for strings; element count for arrays.
+    /// Unicode scalar count for strings; element count for arrays.
     array_len: ValueId,
     /// Prior visible array/string value indexed by canonical signed pointer-sized int.
-    /// Arrays yield their exact element type; immutable strings yield exact u8 bytes.
+    /// Arrays yield their exact element type; immutable strings yield distinct runes.
+    /// String offsets count Unicode scalars, including for future slicing.
     array_index: struct { array: ValueId, index: ValueId },
     /// Allocation-free scalar/string equality scan; record equality is unsupported.
     array_contains: struct { value: ValueId, array: ValueId },
@@ -148,6 +150,7 @@ pub const Type = union(enum) {
     record: Record,
     void,
     boolean,
+    rune,
     string,
     integer: Integer,
     function: Type.Function,
@@ -175,6 +178,7 @@ pub const Constant = struct {
         enum_tag: u32,
         void,
         boolean: bool,
+        rune: u32,
         signed_integer: i128,
         unsigned_integer: u128,
         string: []const u8,
@@ -849,7 +853,7 @@ fn validateBodyStructure(self: *const Ir, function: Function, body: Body) Verify
             .to_string => |value| {
                 if (ty != .string) return error.InvalidOperation;
                 const operand = self.getType(try operandType(body, value, i)).?;
-                if (operand != .boolean and operand != .integer and operand != .string) return error.InvalidOperation;
+                if (operand != .boolean and operand != .integer and operand != .rune and operand != .string) return error.InvalidOperation;
             },
             .array_literal => |elements| {
                 if (ty != .array) return error.InvalidOperation;
@@ -871,7 +875,7 @@ fn validateBodyStructure(self: *const Ir, function: Function, body: Body) Verify
                 const index = self.getType(try operandType(body, r.index, i)).?;
                 switch (array) {
                     .array => |element| if (element != instruction.ty) return error.OperandTypeMismatch,
-                    .string => if (ty != .integer or ty.integer.signedness != .unsigned or ty.integer.bits != 8) return error.OperandTypeMismatch,
+                    .string => if (ty != .rune) return error.OperandTypeMismatch,
                     else => return error.InvalidOperation,
                 }
                 if (!isNativeInteger(index, .signed)) return error.OperandTypeMismatch;
@@ -895,7 +899,7 @@ fn validateBodyStructure(self: *const Ir, function: Function, body: Body) Verify
                 if (try operandType(body, r.lhs, i) != instruction.ty or try operandType(body, r.rhs, i) != instruction.ty) return error.OperandTypeMismatch;
             },
             .local_slot => |value| {
-                if (ty != .boolean and ty != .integer and ty != .function and ty != .array and ty != .string and ty != .record and ty != .enumeration and ty != .range) return error.InvalidOperation;
+                if (ty != .boolean and ty != .integer and ty != .rune and ty != .function and ty != .array and ty != .string and ty != .record and ty != .enumeration and ty != .range) return error.InvalidOperation;
                 if (try operandType(body, value, i) != instruction.ty) return error.OperandTypeMismatch;
             },
             .local_load => |slot| {
@@ -1010,7 +1014,7 @@ fn validateBodyStructure(self: *const Ir, function: Function, body: Body) Verify
                         if (instruction.ty != lhs) return error.OperandTypeMismatch;
                     },
                     .eq, .ne, .lt, .le, .gt, .ge => {
-                        if (operand != .integer and !((binary.op == .eq or binary.op == .ne) and (operand == .boolean or operand == .string or operand == .enumeration))) return error.InvalidOperation;
+                        if (operand != .integer and !((binary.op == .eq or binary.op == .ne) and (operand == .boolean or operand == .rune or operand == .string or operand == .enumeration))) return error.InvalidOperation;
                         if (ty != .boolean) return error.OperandTypeMismatch;
                     },
                 }
@@ -1047,7 +1051,7 @@ fn validateBodyStructure(self: *const Ir, function: Function, body: Body) Verify
                 if (ty != .void) return error.InvalidOperation;
                 for (print.args) |arg| {
                     const operand = self.getType(try operandType(body, arg, i)) orelse return error.InvalidTypeId;
-                    if (operand != .boolean and operand != .integer and operand != .string) return error.InvalidOperation;
+                    if (operand != .boolean and operand != .integer and operand != .rune and operand != .string) return error.InvalidOperation;
                 }
             },
             .call => |call| {
@@ -1098,7 +1102,7 @@ fn validateType(self: *const Ir, ty: Type, before: usize) ValidationError!void {
                 }
             }
         },
-        .void, .boolean, .string => {},
+        .void, .boolean, .rune, .string => {},
         .integer => |integer| {
             if (integer.bits == 0 or integer.bits > 128) return error.InvalidIntegerWidth;
         },
@@ -1132,6 +1136,10 @@ fn validateConstant(self: *const Ir, constant: Constant) ValidationError!void {
         },
         .void => if (constant.value != .void) return error.ConstantTypeMismatch,
         .boolean => if (constant.value != .boolean) return error.ConstantTypeMismatch,
+        .rune => {
+            if (constant.value != .rune) return error.ConstantTypeMismatch;
+            if (!isRuneValue(constant.value.rune)) return error.ConstantTypeMismatch;
+        },
         .string => {
             if (constant.value != .string) return error.ConstantTypeMismatch;
             if (!std.unicode.utf8ValidateSlice(constant.value.string)) return error.ConstantTypeMismatch;
@@ -1161,6 +1169,11 @@ fn validateConstant(self: *const Ir, constant: Constant) ValidationError!void {
     }
 }
 
+/// Unicode scalar values exclude surrogate code points.
+pub fn isRuneValue(value: u32) bool {
+    return value <= 0x10ffff and (value < 0xd800 or value > 0xdfff);
+}
+
 pub fn isNativeInteger(ty: Type, signedness: std.builtin.Signedness) bool {
     return ty == .integer and ty.integer.bits == native_pointer_bits and ty.integer.signedness == signedness;
 }
@@ -1183,11 +1196,11 @@ pub fn isUnionPayload(ty: Type) bool {
 
 /// Record fields use semantic integer limits, not array/backend storage widths.
 pub fn isRecordField(ty: Type) bool {
-    return ty == .enumeration or ty == .boolean or ty == .string or (ty == .record and !ty.record.tagged) or (ty == .integer and ty.integer.bits > 0 and ty.integer.bits <= 128);
+    return ty == .enumeration or ty == .boolean or ty == .rune or ty == .string or (ty == .record and !ty.record.tagged) or (ty == .integer and ty.integer.bits > 0 and ty.integer.bits <= 128);
 }
 
 pub fn isArrayElement(ty: Type) bool {
-    return ty == .string or (ty == .record and !ty.record.tagged) or ty == .boolean or (ty == .integer and switch (ty.integer.bits) {
+    return ty == .string or ty == .rune or (ty == .record and !ty.record.tagged) or ty == .boolean or (ty == .integer and switch (ty.integer.bits) {
         8, 16, 32, 64 => true,
         else => false,
     });
@@ -1196,7 +1209,7 @@ pub fn isArrayElement(ty: Type) bool {
 fn typeEql(a: Type, b: Type) bool {
     if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
     return switch (a) {
-        .void, .boolean, .string => true,
+        .void, .boolean, .rune, .string => true,
         .enumeration => |enumeration| enumeration.source == b.enumeration.source and enumeration.identity == b.enumeration.identity,
         .integer => |integer| std.meta.eql(integer, b.integer),
         .record => |record| record.source == b.record.source and record.identity == b.record.identity and record.tagged == b.record.tagged and std.mem.eql(TypeId, record.type_args, b.record.type_args),
@@ -1208,7 +1221,6 @@ fn typeEql(a: Type, b: Type) bool {
 }
 
 test "shared pools retain source-qualified nominal identities after AST release" {
-    const Compilation = @import("Compilation.zig");
     var ir = block: {
         var compilation = Compilation.init(std.testing.allocator);
         defer compilation.deinit();
@@ -1453,30 +1465,31 @@ test "string equality verifier requires exact string operands and boolean result
     try ir.verify();
 }
 
-test "string byte indexing verifies exact types and prior visible operands without source" {
+test "string scalar indexing verifies exact types and prior visible operands without source" {
     var ir = Ir.init(std.testing.allocator);
     defer ir.deinit();
     const string = try ir.internType(.string);
     const integer = try ir.internType(.{ .integer = .{ .signedness = .signed, .bits = native_pointer_bits } });
+    const rune = try ir.internType(.rune);
     const byte = try ir.internType(.{ .integer = .{ .signedness = .unsigned, .bits = 8 } });
     const wide = try ir.internType(.{ .integer = .{ .signedness = .unsigned, .bits = 16 } });
     const uint = try ir.internType(.{ .integer = .{ .signedness = .unsigned, .bits = native_pointer_bits } });
     const narrow = try ir.internType(.{ .integer = .{ .signedness = .signed, .bits = 8 } });
     const boolean = try ir.internType(.boolean);
     const params = [_]TypeId{ string, integer, wide, boolean, byte, uint, narrow };
-    const signature = try ir.internType(.{ .function = .{ .params = &params, .result = byte } });
+    const signature = try ir.internType(.{ .function = .{ .params = &params, .result = rune } });
     const function = try ir.addFunction("byte", signature, .{ .start = 0, .end = 0 });
     const make = TestFunctions.instruction;
     var instructions: [8]Instruction = undefined;
     for (params, 0..) |ty, i| instructions[i] = make(ty, .{ .parameter = @intCast(i) });
-    instructions[7] = make(byte, .{ .array_index = .{ .array = @fromBackingInt(0), .index = @fromBackingInt(1) } });
+    instructions[7] = make(rune, .{ .array_index = .{ .array = @fromBackingInt(0), .index = @fromBackingInt(1) } });
     // No source text or nonempty source span is needed to verify the operation.
     for (&instructions) |*instruction| instruction.span = .{ .start = 0, .end = 0 };
     try ir.setFunctionBody(function, &instructions, @fromBackingInt(7));
     try ir.verify();
     const owned = @constCast(ir.functions.items[0].body.?.instructions);
     const saved = owned[7];
-    for ([_]TypeId{ string, integer, wide, boolean, uint, narrow }) |ty| {
+    for ([_]TypeId{ string, integer, byte, wide, boolean, uint, narrow }) |ty| {
         owned[7].ty = ty;
         try std.testing.expectError(error.OperandTypeMismatch, ir.verify());
     }
@@ -1969,6 +1982,76 @@ fn testAllocationFailures(allocator: std.mem.Allocator) !void {
 
 test "type and constant ownership survives every allocation failure" {
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{});
+}
+
+test "rune pools preserve scalar identity reject invalid constants and survive OOM" {
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testRunePools, .{});
+}
+
+fn testRunePools(allocator: std.mem.Allocator) !void {
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    const rune = try ir.internType(.rune);
+    const integer = try ir.internType(.{ .integer = .{ .bits = 32, .signedness = .unsigned } });
+    try std.testing.expectEqual(rune, try ir.internType(.rune));
+    try std.testing.expect(rune != integer);
+    try std.testing.expect(!isManaged(.rune));
+    try std.testing.expect(isArrayElement(.rune) and isRecordField(.rune) and isUnionPayload(.rune));
+    _ = try ir.internType(.{ .array = rune });
+    try std.testing.expectError(error.InvalidTypeId, ir.internType(.{ .range = rune }));
+    for ([_]u32{ 0, 0x7f, 0x80, 0x7ff, 0x800, 0xd7ff, 0xe000, 0xffff, 0x10000, 0x10ffff }) |value| {
+        try std.testing.expect(isRuneValue(value));
+        const id = try ir.internConstant(.{ .ty = rune, .value = .{ .rune = value } });
+        try std.testing.expectEqual(id, try ir.internConstant(.{ .ty = rune, .value = .{ .rune = value } }));
+    }
+    for ([_]u32{ 0xd800, 0xdbff, 0xdfff, 0x110000, 0xffffffff }) |value| {
+        try std.testing.expect(!isRuneValue(value));
+        try std.testing.expectError(error.ConstantTypeMismatch, ir.internConstant(.{ .ty = rune, .value = .{ .rune = value } }));
+    }
+    try std.testing.expectError(error.ConstantTypeMismatch, ir.internConstant(.{ .ty = rune, .value = .{ .unsigned_integer = 65 } }));
+    try std.testing.expectError(error.ConstantTypeMismatch, ir.internConstant(.{ .ty = integer, .value = .{ .rune = 65 } }));
+    try ir.verify();
+    ir.constants.items[0].value.rune = 0xd800;
+    try std.testing.expectError(error.ConstantTypeMismatch, ir.verify());
+}
+
+test "rune operations verify exact types equality only and foreign exclusion without source" {
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    const rune = try ir.internType(.rune);
+    const boolean = try ir.internType(.boolean);
+    const string = try ir.internType(.string);
+    const integer = try ir.internType(.{ .integer = .{ .bits = 8, .signedness = .unsigned } });
+    const signature = try ir.internType(.{ .function = .{ .params = &.{rune}, .result = boolean } });
+    const span: Span = .{ .start = 0, .end = 0 };
+    const function = try ir.addFunction("equal", signature, span);
+    try std.testing.expectError(error.InvalidExportSignature, ir.setExportName(function, "equal"));
+    try std.testing.expectError(error.InvalidExternSignature, ir.setExternName(function, "equal"));
+    const ins = TestFunctions.instruction;
+    var body = [_]Instruction{
+        ins(rune, .{ .parameter = 0 }),
+        ins(string, .{ .to_string = @fromBackingInt(0) }),
+        ins(boolean, .{ .binary = .{ .op = .eq, .lhs = @fromBackingInt(0), .rhs = @fromBackingInt(0) } }),
+    };
+    for (&body) |*instruction| instruction.span = span;
+    try ir.setFunctionBody(function, &body, @fromBackingInt(2));
+    const owned = @constCast(ir.functions.items[0].body.?.instructions);
+    for (std.enums.values(BinaryOp)) |op| {
+        owned[2].op.binary.op = op;
+        if (op == .eq or op == .ne) try ir.verify() else try std.testing.expectError(error.InvalidOperation, ir.verify());
+    }
+    owned[2] = body[2];
+    owned[2].ty = rune;
+    try std.testing.expectError(error.OperandTypeMismatch, ir.verify());
+    owned[2] = body[2];
+    owned[1].ty = rune;
+    try std.testing.expectError(error.InvalidOperation, ir.verify());
+    owned[1] = body[1];
+    owned[0].ty = integer;
+    try std.testing.expectError(error.OperandTypeMismatch, ir.verify());
+    owned[0] = body[0];
+    ir.functions.items[0].export_name = try ir.allocator.dupe(u8, "equal");
+    try std.testing.expectError(error.InvalidExportSignature, ir.verify());
 }
 
 const test_span: Span = .{ .start = 0, .end = 1 };

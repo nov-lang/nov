@@ -1,5 +1,20 @@
 # TODO
 
+Runes and Unicode scalar string inspection are implemented. `rune` is distinct from integers: `0..=0x10FFFF` excluding `0xD800..=0xDFFF`.
+Single quotes hold exactly one scalar or escape (`'é'`, `'😀'`, `'\n'`, `'\xE9'`,
+`'\u{1F600}'`); empty/multiple-scalar or invalid literals reject. Runes support
+UTF-8 printing/interpolation via variables, exact equality, arrays, fields, literal
+matches with catchalls, union payloads and scoped borrows. No numeric conversions,
+arithmetic, ordering, rune ranges or foreign ABI support.
+
+String indexing decodes `rune` with native `int` scalar offsets; negatives count
+scalars from the end. `.len` is native `uint` scalar count, not byte/grapheme count:
+`"é😀\0".len == 3`, `"é😀"[-1] == '😀'`, `"e\u{301}".len == 2`.
+Both indexing and length scan UTF-8 in O(n), allocating nothing; storage remains
+UTF-8 bytes. See examples/runes.nov and examples/string-bytes.nov (historical name,
+now a Unicode scalar example). Decoding via indexing is delivered; iteration and
+string slicing remain deferred. Approved slicing contract is recorded below.
+
 Language tests are executable: `@[test]` marks top-level `() -> void` functions,
 excluded from normal semantic analysis/emission and not callable as ordinary values.
 `nov test file.nov` selects only root-file tests in source order, compiles once and
@@ -11,7 +26,7 @@ parallel execution, test filters, timeout flags or automatic dependency-test dis
 See examples/tests.nov and README.
 
 Scoped borrowing now covers every supported non-void runtime value type: bool,
-integers, strings, enums, structs/unions, arrays, ranges and functions. let ref=&local
+integers, runes, strings, enums, structs/unions, arrays, ranges and functions. let ref=&local
 also supports readonly locals/parameters; mutability follows owner. Reads yield
 ordinary copied values, so copying/arguments/returns/methods do not escape references.
 Assignment writes the pointee, compounds/array updates use ordinary exact-type rules.
@@ -67,7 +82,7 @@ and recursively flattened string-owner roots preserve GC safety. Validation incl
 late generic layouts, forged cycles, deep graphs and zero-root diamond performance.
 See examples/nested-structs.nov. Array/union/function fields remain unsupported.
 
-Direct mutable-local struct fields support exact bool/integer/string/enum assignment,
+Direct mutable-local struct fields support exact bool/integer/rune/string/enum assignment,
 integer +=/-=/*=//=/%= and string +=. Compounds snapshot the old field before RHS;
 final stores change only that field in the current local, preserving other-field
 and whole-record RHS changes. Terminal RHS skips the pending operation/store.
@@ -173,7 +188,7 @@ semantics are missing and intentionally deprioritized; imports are implemented.
 
 Bounded nominal value structs are executable; `examples/type.nov` is unchanged
 and runs/checks/formats successfully. Separate declarations have distinct identities;
-module aliases preserve identity. Flat bool/integer/string/enum fields have exact types,
+module aliases preserve identity. Flat bool/integer/rune/string/enum fields have exact types,
 literal-only defaults and required-field diagnostics. Explicit `Type[.field=value]`
 constructors evaluate supplied fields once left-to-right, then omitted literal defaults
 in declaration order. Record value boundaries copy fields; strings share immutable
@@ -198,7 +213,7 @@ bitwise compound assignments and computed match patterns remain unsupported.
 See README's integer section for the executable contract; proposals below are
 not an implementation checklist.
 
-Bounded immutable global inference: bool and plain UTF-8 string literals infer
+Bounded immutable global inference: bool, rune and plain UTF-8 string literals infer
 canonical types; numeric literals require explicit `@as(T, literal)` context.
 Nested scalar ascriptions require exact canonical types (including forward type
 aliases and any explicit declaration annotation), with checked literal bounds and
@@ -304,11 +319,10 @@ string initially makes an independent snapshot so later builder edits cannot cha
 it. Ownership-transfer optimizations, exact APIs and array-field/mutable-receiver
 contracts remain deferred. Do not add a second built-in mutable-string type.
 
-A proposed `rune` is a distinct Unicode scalar type: 0..=0x10FFFF excluding surrogate
-values 0xD800..=0xDFFF, not merely an unchecked u32 or a grapheme. Defer implementation
-until UTF-8 decoding/iteration and invalid-input handling are specified. String
-indexing returns u8 bytes, not runes. General string slicing and Unicode/grapheme
-operations remain deferred.
+`rune` and UTF-8 decoding through scalar string indexing are implemented (see above).
+Iteration and grapheme operations remain deferred. Approved future string slicing
+uses half-open Unicode scalar offsets, negative offsets from the scalar end, and
+shares the original GC owner without copying UTF-8 bytes. **Slicing is not implemented.**
 
 ## Other proposals
 - transform this file into GitHub issues
@@ -324,13 +338,14 @@ operations remain deferred.
     - expand beyond simple declarations, literals, operators, and comments
     - recursive directory traversal and stdin support
 - strings:
-  - [x] immutable UTF-8 literals, sharing, concatenation, `+=`, byte length and output
+  - [x] immutable UTF-8 literals, sharing, concatenation, `+=`, scalar length and output
   - [x] allocation-free, byte-exact `==`/`!=` (including NUL; no normalization)
-  - [x] `{expression}` interpolation (including nested calls) for bool/fixed/native integers/strings;
+  - [x] `{expression}` interpolation (including nested calls) for bool/fixed/native integers/rune variables/strings;
     decimal boundaries, UTF-8/NUL, rooted temporaries and formatter preservation
   - blocks/control flow/quoted literals/formats/captures and global interpolation remain unsupported
-  - [x] immutable byte reads return exact u8, with int/negative indices and all-mode bounds panics
-  - ordering, slicing, rune decoding/iteration, byte-buffer conversions and the UTF-8 builder remain deferred
+  - [x] allocation-free O(n) scalar indexing returns exact rune, with int/negative indices and all-mode bounds panics
+  - [x] allocation-free O(n) `.len` counts scalars, not UTF-8 bytes or graphemes
+  - ordering, slicing (approved scalar offsets/shared owner/no copy), iteration, byte-buffer conversions and the UTF-8 builder remain deferred
 - add tests, mainly for Parser, IRs, Codegen and Runtime
   - [x] initial parser, formatter, file-safety, and CLI regression coverage
 - expand Render.zig to cover the full AST (simple declarations and expressions work)
@@ -639,7 +654,8 @@ TODO:
 
 Approved executable storage contracts supersede the earlier shared-layout proposal:
 arrays have independent scalar backing with native `uint` len/cap; strings share
-immutable UTF-8 backing with native `uint` byte length and no exposed capacity.
+immutable UTF-8 byte backing and no exposed capacity; public `.len` scans for the
+native `uint` Unicode scalar count, not the internal byte length.
 See README and src/runtime/README.md for the implemented root/ownership model.
 
 See [1](https://docs.vlang.io/v-types.html#array-methods)
@@ -690,12 +706,12 @@ TODO: https://docs.vlang.io/v-types.html#maps
 This will probably be implemented in stdlib instead.
 
 # Match
-Delivered bounded executable slice: bool/integer/string literal alternatives,
+Delivered bounded executable slice: bool/integer/rune/string literal alternatives,
 positional multi-subject patterns, `_` wildcards and first-match selection. A single
 canonical bool subject (including aliases) needs coverage of true and false, not
 necessarily a final catchall; `|` combines coverage and `_` is universal even in
 alternatives. Completely covered boolean prongs diagnose; partial overlaps remain
-allowed. Integer/string/multi-subject matches still require a final catchall,
+allowed. Integer/rune/string/multi-subject matches still require a final catchall,
 including full integer-domain enumerations. General finite-domain analysis remains
 deferred. Unary function/print pipes are also executable; fibo.nov
 runs unchanged. Match subjects evaluate once left-to-right; pipes evaluate as
@@ -959,17 +975,21 @@ let ArrayList: (T: #type) -> type = { ... }
 - Approved strings (implemented; supersedes earlier platform/termination/mutation proposals):
   - Immutable valid UTF-8 on every platform, including Windows; shared storage at
     assignment and call/return boundaries. `let mut` replaces the binding only.
-  - Explicit lengths, embedded NUL valid; `.len` is native `uint` byte length.
+  - Internal lengths measure UTF-8 bytes; embedded NUL is valid. Public `.len` is
+    native `uint` Unicode scalar count, scanned in O(n) without allocation.
   - Literals, `+`, printing, locals, parameters/returns, conditionals and explicitly
     typed immutable literal globals are supported. Concatenation uses rooted GC
     backing; literals use static read-only bytes with a null traced owner.
-  - Expression interpolation supports bool, fixed/native decimal integers and
-    shared strings, preserving UTF-8/NUL with no normalization. Placeholders are
+  - Expression interpolation supports bool, fixed/native decimal integers, rune
+    variables and shared strings, preserving UTF-8/NUL with no normalization. Placeholders are
     evaluated left-to-right once, including nested calls and scalar expressions.
         Blocks/control flow/quoted literals/formats/captures remain unsupported.
     Global interpolation is nonliteral and rejected, not eagerly evaluated.
-  - Indexing, slicing, Unicode operations, string arrays and C-string conversion
-    are deferred. No terminator or compile-time concatenation promise.
+  - Scalar indexing returns rune without allocation; negative indices count scalars
+    from the end. String arrays work with shared immutable backing. Iteration,
+    slicing, grapheme operations and C-string conversion remain deferred. Approved
+    slicing uses half-open scalar offsets, negatives and shared GC ownership without
+    copying. No terminator or compile-time concatenation promise.
 - `void` is Nov's unit type (`()` in Rust and OCaml, `Nil` in Gleam)
   - `void` only value is `[]` (`{}` in zig)
 - about variable initialization:
