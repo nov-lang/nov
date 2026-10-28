@@ -142,6 +142,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const array_field_tests = b.step("test-cli-array-fields", "Run array-valued struct field CLI tests");
     addArrayFieldCliTests(b, exe, array_field_tests);
     test_step.dependOn(array_field_tests);
+    const storable_array_tests = b.step("test-cli-storable-arrays", "Run storable array CLI tests");
+    addStorableArrayCliTests(b, exe, storable_array_tests);
+    test_step.dependOn(storable_array_tests);
     const constructor_shorthand_tests = b.step("test-cli-constructor-shorthand", "Run constructor field shorthand CLI tests");
     addConstructorShorthandCliTests(b, exe, constructor_shorthand_tests);
     test_step.dependOn(constructor_shorthand_tests);
@@ -221,7 +224,7 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     _ = fixtures.add("wide-record-alias.nov", "let Wide=u128\nlet Alias=R\nlet R=struct{x:Wide,}\nlet f:(r:Alias)= {}\nlet main:()={}\n");
     _ = fixtures.add("unused-wide-record.nov", "let R=struct{x:i128,}\nlet main:()={}\n");
     _ = fixtures.add("wide-record-bounds.nov", "let R=struct{x:i128=170141183460469231731687303715884105728,}\n");
-    _ = fixtures.add("wide-record-array.nov", "let R=struct{x:[]u128,}\n");
+    _ = fixtures.add("wide-record-array.nov", "let R=struct{x:[][]u128,}\nlet f:(r:R)={}\nlet main:()={}\n");
     _ = fixtures.add("boolean-match.nov",
         \\let Flag = bool
         \\let choose: (b: Flag) -> int = match b {
@@ -406,7 +409,8 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         .{ .name = "reject reachable wide record alias backend", .args = &.{ "emit-c", "wide-record-alias.nov" }, .exit_code = 1, .stderr_match = "C backend only supports 8, 16, 32 and 64-bit integers" },
         .{ .name = "run unused wide record", .args = &.{ "run", "unused-wide-record.nov" }, .exit_code = 0 },
         .{ .name = "wide record literal bounds", .args = &.{ "check", "--semantic", "wide-record-bounds.nov" }, .exit_code = 1, .stderr_match = "integer literal does not fit the annotated type" },
-        .{ .name = "wide record arrays remain unsupported", .args = &.{ "check", "--semantic", "wide-record-array.nov" }, .exit_code = 1, .stderr_match = "this type is not supported" },
+        .{ .name = "check nested wide record arrays", .args = &.{ "check", "--semantic", "wide-record-array.nov" }, .exit_code = 0 },
+        .{ .name = "reject reachable nested wide record array backend", .args = &.{ "emit-c", "wide-record-array.nov" }, .exit_code = 1, .stderr_match = "C backend only supports 8, 16, 32 and 64-bit integers" },
         .{ .name = "check nominal structs", .args = &.{ "check", "--semantic", "type.nov" }, .exit_code = 0 },
         .{ .name = "fmt nominal structs", .args = &.{ "fmt", "--check", "type.nov" }, .exit_code = 0 },
         .{ .name = "check type aliases", .args = &.{ "check", "--semantic", "type-aliases.nov" }, .exit_code = 0 },
@@ -532,7 +536,7 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         .{ .source = "let x:[]int=[1]", .output = "let x: []int = [1]\n" },
         .{ .source = "let x = [1]\n", .check = true },
         .{ .source = "let x=[1]", .check = true, .diagnostic = "<stdin>: error: input is not formatted", .code = 1 },
-        .{ .source = "let x:[][]int=[[1]]", .diagnostic = "<stdin>: error: formatting this syntax is not supported yet", .code = 1 },
+        .{ .source = "let x:[]*int=[]", .diagnostic = "<stdin>: error: formatting this syntax is not supported yet", .code = 1 },
     };
     for (stdin_cases, 0..) |case, index| {
         const run = b.addRunArtifact(exe);
@@ -1747,7 +1751,7 @@ fn addGenericStructCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_st
     }
     const Case = struct { name: []const u8, source: []const u8, diagnostic: []const u8 };
     for ([_]Case{
-        .{ .name = "nested-array-field", .source = "let G:(T:type)->type=struct{value:[][]T,}\nlet main:()={let x=G(int)[]\n}", .diagnostic = "this type is not supported in semantic analysis yet" },
+        .{ .name = "nonstorable-array-field", .source = "let G:(T:type)->type=struct{value:[][]T,}\nlet main:()={let x=G(void)[]\n}", .diagnostic = "this type is not supported in semantic analysis yet" },
         .{ .name = "default", .source = "let G:(T:type)->type=struct{value:T=1,}\nlet main:()={let x=G(bool)[]\n}", .diagnostic = "literal does not match" },
         .{ .name = "cycle", .source = "let G:(T:type)->type=struct{value:G(T),}\nlet main:()={let x=G(int)[]\n}", .diagnostic = "cyclic generic container instantiation" },
     }) |case| {
@@ -1760,6 +1764,78 @@ fn addGenericStructCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_st
         check.expectExitCode(1);
         check.expectStdOutEqual("");
         check.addCheck(.{ .expect_stderr_match = case.diagnostic });
+        test_step.dependOn(&check.step);
+    }
+}
+
+fn addStorableArrayCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    const fixtures = b.addWriteFiles();
+    _ = fixtures.add("storable-arrays.nov", @embedFile("examples/storable-arrays.nov"));
+    for ([_][]const u8{ "fmt", "semantic" }) |mode| {
+        const run = b.addRunArtifact(exe);
+        run.step.name = b.fmt("CLI storable arrays: {s}", .{mode});
+        run.setCwd(fixtures.getDirectory());
+        run.addArgs(if (std.mem.eql(u8, mode, "fmt")) &.{ "fmt", "--check", "storable-arrays.nov" } else &.{ "check", "--semantic", "storable-arrays.nov" });
+        run.expectExitCode(0);
+        run.expectStdOutEqual("");
+        run.expectStdErrEqual("");
+        test_step.dependOn(&run.step);
+    }
+    for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+        for ([_][]const u8{ "run", "test" }) |command| {
+            const run = b.addRunArtifact(exe);
+            run.step.name = b.fmt("CLI storable arrays: {s} ({s})", .{ command, mode });
+            run.setCwd(fixtures.getDirectory());
+            run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+            run.setEnvironmentVariable("NOV_CC", "");
+            run.setEnvironmentVariable("CC", "");
+            run.addArgs(&.{ command, "storable-arrays.nov" });
+            if (mode.len != 0) run.addArg(mode);
+            run.expectExitCode(0);
+            run.expectStdOutEqual(if (std.mem.eql(u8, command, "test"))
+                "PASS enum_membership_and_refs\nPASS nested_copies_and_iteration\nPASS union_active_payload_copies\nPASS ordinary_function_arrays\nPASS escaping_closures_share_cells\nPASS range_bounds_and_loops\n6 passed; 0 failed; 6 total\n"
+            else
+                "Rows: Ada Ada!\nBlue: true\nShared: 1 2\n");
+            run.expectStdErrEqual("");
+            test_step.dependOn(&run.step);
+        }
+    }
+    const unsupported_type = "this type is not supported in semantic analysis yet";
+    const unsupported_operator = "operator is not supported for this operand type";
+    const mismatch = "expression does not match the expected type";
+    for ([_]struct { name: []const u8, source: []const u8, diagnostic: []const u8 }{
+        .{ .name = "void", .source = "let f:(a:[]void)={}", .diagnostic = unsupported_type },
+        .{ .name = "type", .source = "let f:(a:[]type)={}", .diagnostic = unsupported_type },
+        .{ .name = "nested-void", .source = "let f:(a:[][]void)={}", .diagnostic = unsupported_type },
+        .{ .name = "function-membership", .source = "let f:(a:()->int)->bool=a in [a]", .diagnostic = unsupported_operator },
+        .{ .name = "union-membership", .source = "let U=union{none,}\nlet f:(a:U)->bool=a in [a]", .diagnostic = unsupported_operator },
+        .{ .name = "record-membership", .source = "let R=struct{n:int,}\nlet f:(a:R)->bool=a in [a]", .diagnostic = unsupported_operator },
+        .{ .name = "nested-membership", .source = "let f:(a:[]int)->bool=a in [a]", .diagnostic = unsupported_operator },
+        .{ .name = "range-membership", .source = "let f:(n:int)->bool={let r=n..n\nr in [r]}", .diagnostic = unsupported_operator },
+        .{ .name = "function-equality", .source = "let f:(a:()->int)->bool=a==a", .diagnostic = unsupported_operator },
+        .{ .name = "union-equality", .source = "let U=union{none,}\nlet f:(a:U)->bool=a==a", .diagnostic = unsupported_operator },
+        .{ .name = "record-equality", .source = "let R=struct{n:int,}\nlet f:(a:R)->bool=a==a", .diagnostic = unsupported_operator },
+        .{ .name = "nested-equality", .source = "let f:(a:[][]int)->bool=a==a", .diagnostic = unsupported_operator },
+        .{ .name = "range-equality", .source = "let f:(n:int)->bool={let r=n..n\nr==r}", .diagnostic = unsupported_operator },
+        .{ .name = "enum-nominal", .source = "let E=enum{x,}\nlet F=enum{x,}\nlet f:(a:E,b:F)={let x:[]E=[a,b]\n}", .diagnostic = mismatch },
+        .{ .name = "enum-membership-nominal", .source = "let E=enum{x,}\nlet F=enum{x,}\nlet f:(a:E,b:F)->bool=a in [b]", .diagnostic = mismatch },
+        .{ .name = "union-nominal", .source = "let U=union{none,}\nlet V=union{none,}\nlet f:(a:U,b:V)={let x:[]U=[a,b]\n}", .diagnostic = mismatch },
+        .{ .name = "record-nominal", .source = "let R=struct{n:int,}\nlet S=struct{n:int,}\nlet f:(a:R,b:S)={let x:[]R=[a,b]\n}", .diagnostic = mismatch },
+        .{ .name = "recursive-record", .source = "let R=struct{items:[][]R,}\nlet main:()={}", .diagnostic = "cyclic by-value struct layout" },
+        .{ .name = "recursive-union", .source = "let U=union{items:[]U,none,}\nlet main:()={}", .diagnostic = unsupported_type },
+        .{ .name = "recursive-generic", .source = "let G:(T:type)->type=struct{items:[]G(T),}\nlet f:(a:G(int))={}", .diagnostic = "cyclic generic container instantiation" },
+    }) |case| {
+        const source = b.fmt("invalid-storable-array-{s}.nov", .{case.name});
+        _ = fixtures.add(source, case.source);
+        const check = b.addRunArtifact(exe);
+        check.step.name = b.fmt("CLI storable arrays: reject {s}", .{case.name});
+        check.setCwd(fixtures.getDirectory());
+        check.addArgs(&.{ "check", "--semantic", source });
+        check.expectExitCode(1);
+        check.expectStdOutEqual("");
+        check.expectStdErrMatch(b.fmt("{s}:", .{source}));
+        check.expectStdErrMatch("error:");
+        check.expectStdErrMatch(case.diagnostic);
         test_step.dependOn(&check.step);
     }
 }
@@ -1800,9 +1876,9 @@ fn addArrayFieldCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step:
     const unsupported_borrow = "borrow requires a fixed unannotated let binding to &local or &localArray[index]";
     const unsupported_assignment = "assignment target must be a mutable local, its struct field path, or its scalar-array element";
     for ([_]struct { name: []const u8, source: []const u8, diagnostic: []const u8 }{
-        .{ .name = "nested-field", .source = "let A=struct{a:[][]int,}\nlet main:()={}", .diagnostic = unsupported_type },
-        .{ .name = "nested-local", .source = "let main:()={let a:[][]int=[]\n}", .diagnostic = unsupported_type },
-        .{ .name = "nested-generic", .source = "let A:(T:type)->type=struct{a:[]T,}\nlet main:(a:A([]int))={}", .diagnostic = unsupported_type },
+        .{ .name = "nonstorable-field", .source = "let A=struct{a:[][]void,}\nlet main:()={}", .diagnostic = unsupported_type },
+        .{ .name = "nonstorable-local", .source = "let main:()={let a:[][]type=[]\n}", .diagnostic = unsupported_type },
+        .{ .name = "nonstorable-generic", .source = "let A:(T:type)->type=struct{a:[]T,}\nlet main:(a:A([]void))={}", .diagnostic = unsupported_type },
         .{ .name = "recursive", .source = "let A=struct{a:[]A,}\nlet main:()={}", .diagnostic = "cyclic by-value struct layout" },
         .{ .name = "mutually-recursive", .source = "let A=struct{b:[]B,}\nlet B=struct{a:A,}\nlet main:()={}", .diagnostic = "cyclic by-value struct layout" },
         .{ .name = "recursive-generic", .source = "let A:(T:type)->type=struct{a:[]A(T),}\nlet main:(a:A(int))={}", .diagnostic = "cyclic generic container instantiation" },

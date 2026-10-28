@@ -20,7 +20,7 @@ Growable arrays use an internal libc-only nonmoving mark/sweep GC. The
 runtime is emitted for managed values and closures; programs using only scalars
 and ordinary functions retain scalar-only emission.
 See the [runtime API and root discipline](src/runtime/README.md) for layout, C
-boundary, OOM, testing, and unsupported-reference contracts. Array slicing, nested arrays,
+boundary, OOM, testing, and unsupported-reference contracts. Array slicing
 and general aliases remain deferred; bounded local array-element borrowing is
 supported below. Immutable UTF-8 strings are supported below.
 
@@ -255,14 +255,14 @@ let main: () -> void = {
 This prints `42` on two lines. Locals require an initializer. The annotation may
 be omitted in `let name = expression` and `let mut name = expression` when the
 initializer already determines a supported `bool`, integer (fixed-width or native
-`int`/`uint`), rune, string, existing function-value or scalar-array type. Examples include
+`int`/`uint`), rune, string, enum, record/union, range, function-value or array type. Examples include
 `let ready = true`, `let result = value + 1`, `let callback = twice`, and
 `let mut copy = values` for an already typed array. Calls, indexing, `.len`, and
 block/conditional results use the same bidirectional rules as other expressions.
 No type is inferred from later uses or from the enclosing function result for a
 local initializer. `let n = 1` and `let n = 1 + 2` still need annotations; there
-are no integer defaults or widening conversions. Scalar array literals infer
-`[]bool` from boolean elements or `[]T` from an already typed integer element.
+are no general integer defaults or widening conversions. Array literals infer
+`[]T` from any already known storable element type, including nested arrays and ranges.
 A later element can supply context to earlier literals: `let values = [0, typed_value]`.
 Known element types must match exactly; no signedness or width widening occurs.
 An expected `[]T` takes precedence and checks every element against `T`, including
@@ -274,8 +274,8 @@ Explicit annotations remain supported, including immutable `void` values and
 function values with unnamed parameter types (e.g. `let callback: (int) -> int = twice`).
 Function expressions and nonrecursive local function definitions support automatic
 captures, as described under [Functions](#functions). Inferred `void` locals,
-labels and other managed types remain unsupported. Mutable locals use `let mut` and support
-`bool`, integer, rune, string, existing function and scalar-array values (not `void`). Direct
+and labels remain unsupported. Mutable locals use `let mut` and support
+existing storable runtime values (not `void`). Direct
 identifier assignment (`n = value`) and integer-only `+=`, `-=`, `*=`, `/=`, `%=`
 return `void`; a block ending in assignment therefore also returns `void`.
 Assignments require a mutable local, not a parameter or global. RHS types must
@@ -507,8 +507,8 @@ declarations, literals and operators, function signatures and bodies, calls (inc
 `@print`/`@println`), local blocks, `if`/`else if`/`else`, condition and unconditional
 loops with optional continuation clauses, conditional-loop `else` and value breaks,
 returns, unlabeled `break`/`continue`, and direct identifier assignments (`=`, `+=`, `-=`,
-`*=`, `/=`, `%=`). Scalar array annotations (`[]bool`, fixed-width integer types,
-`[]int`/`[]uint`), literals (including empty `[]`), indexing (including negative
+`*=`, `/=`, `%=`). Supported array annotations (including nested `[]T`),
+literals (including empty `[]` and nested literals), indexing (including negative
 indices), `.len` reads, and plain `name[index] = value` stores are also supported.
 Nonempty blocks use four-space indentation. Function parentheses,
 list commas (including trailing commas), precedence, comments, and multiline
@@ -518,8 +518,7 @@ formatting does not make those forms executable. Array formatting does not check
 expected literal types, scope, mutability, or whether a base is an array; it does
 not enable array globals or new language semantics. Other members, `.len` writes,
 indexed compound stores and stores through computed bases remain unsupported.
-Nested array annotations and directly nested array literals, array slicing, pointers,
-other memory/container forms, labels,
+Array slicing, pointers, other unsupported memory/container forms, labels,
 iterator/other unsupported loop forms, attributes, quoted identifiers,
 BOMs and shebangs remain unsupported or invalid. Unsupported syntax is reported
 without modifying the file. Formatted output is reparsed and checked for structural,
@@ -647,7 +646,7 @@ unsafe on a backedge. These conservative restrictions await effect analysis.
 
 Functions may be returned, passed, assigned, and selected by control flow using
 exact existing function types. Recursive local definitions, escaping reference
-capabilities, function-valued fields/array elements, and function-valued C ABI
+capabilities, function-valued fields, and function-valued C ABI
 boundaries remain unsupported. Shared captures are single-threaded; no concurrency
 semantics are introduced. See [`examples/closures.nov`](examples/closures.nov).
 
@@ -747,7 +746,8 @@ names and tags match; module aliases preserve identity.
   container rules. Printing/interpolation require the exact container method
   `toString: (Kind) -> string`; numeric or tag-name formatting is not derived.
 - Enum instance calls such as `kind.eql(other)` use the value-receiver rules below.
-  Explicit numbered values/backing types and enum arrays remain unsupported.
+  Enum arrays support exact-type element equality and membership. Explicit numbered
+  values/backing types remain unsupported.
 
 [examples/structured-errors.nov](examples/structured-errors.nov) uses an enum error
 kind in a record payload, exhaustive error-message selection and special handling
@@ -807,8 +807,9 @@ The delivered subset is deliberately bounded:
   struct and array values must be supplied explicitly. Recursive layouts (including
   cycles through array element types) and layouts deeper than 128 aggregate levels
   diagnose, including aliases/imports and late generic instantiations.
-  Union/function/void/float fields and nested array types remain unsupported;
-  arrays of supported records are described below.
+  Direct union/function/void/float fields remain unsupported; array fields may
+  contain any supported storable element type, including nested arrays. Arrays of
+  supported records are described below.
 - Construct explicitly with `MyType[ .x = 5, .z = true ]` (or `Alias[...]`).
   Empty `MyType[]` works only when every field has a default. Unknown, duplicate,
   missing required and mistyped fields diagnose. Supplied expressions evaluate
@@ -974,7 +975,8 @@ checked semantically through 128 bits, while reachable C layouts require
   `.empty => ...`. Captures are immutable and private to their prong; omit the
   capture when unused. Every variant must be covered, or use a final `_`.
   Unknown variants, repeated/covered prongs and missing variants diagnose.
-- Assignment, arguments, returns and control-flow results copy the tag and fields;
+- Assignment, arguments, returns and control-flow results copy the tag and active
+  payload, recursively detaching array backing in record payloads;
   strings share immutable backing storage. C emission uses a tag and separate
   zero-initialized payload fields, not an overlapping C union. String owner fields
   are rooted, including across allocations and early returns. Payload extraction
@@ -1339,9 +1341,15 @@ let prod = a.! * b.! ; will return .none to the calling function since b is .non
 
 ### Executable array subset
 
-Growable `[]T` arrays are supported in function bodies and signatures for `bool`,
-`rune`, `i8/i16/i32/i64`, `u8/u16/u32/u64`, native `int/uint`, immutable `string`, and
-finite acyclic nominal structs (including nested structs). Literals use an
+Growable `[]T` arrays support every existing storable runtime type: `bool`,
+`rune`, integers, immutable `string`, nominal enums, finite acyclic records and
+existing tagged unions, function values (including closures), nested arrays, and
+inferred integer range values. `void` and compile-time `type` are not storable;
+floats are not implemented. Semantic integer types extend through 128 bits, but
+reachable C layouts, including nested elements and function signatures, still
+require 8/16/32/64-bit widths (native `int/uint` retain their pointer-width rules).
+Existing annotation syntax applies in bodies and signatures; ranges have no
+source-level annotation syntax and enter arrays through inference. Literals use an
 expected array type when available; otherwise, a known supported element type
 determines the exact element type for the whole literal, even when it
 appears after untyped integer literals. For example, `[true, false]` infers
@@ -1363,7 +1371,14 @@ let main: () -> void = {
 ```
 
 - Array assignment, local initialization, by-value arguments and returns have
-  **copy semantics**: independent element storage, not aliases. Immutable arrays
+  **copy semantics**: recursively independent array backing, not aliases, including
+  nested arrays and arrays inside active union record payloads. Immutable strings
+  share backing. Function elements copy their function value and share the existing
+  closure environment/captured cells, not a deep-cloned closure; immutable capture
+  snapshots and mutable shared-cell capture rules are unchanged. Range elements
+  copy bounds and inclusivity by value. Union arrays do not expand the supported
+  payload types: direct array/union/function payloads remain unsupported.
+  Immutable arrays
   cannot have their elements changed. Parameters are immutable; copy into a
   mutable local to edit them.
 - `.len` has pointer-sized `uint` type. Internal capacity is also pointer-sized
@@ -1374,6 +1389,10 @@ let main: () -> void = {
 - Plain `values[index] = element`, integer element `+=`, `-=`, `*=`, `/=`, `%=`
   and `values += other_array` require a mutable local base (a direct array local or
   a supported nested struct field path).
+  Whole nested-array elements may be replaced, but direct chained writes such as
+  `rows[i][j] = value`, `items[i].field` writes and arbitrary computed-base writes
+  remain unsupported. Copy an element into a mutable local and assign it back,
+  or use an existing scoped element loan.
   Element compound assignments use the existing wrapping arithmetic and guarded
   division/remainder rules; bool compounds are unsupported. Append accepts the
   same array type and self-append is safe. All assignments return `void`.
@@ -1428,8 +1447,9 @@ let main: () -> void = {
   mutable local and assign it back, or use the checked local borrowing form below.
   Direct `items[index].field` mutation remains unsupported.
 - String membership compares exact UTF-8 bytes/length, including embedded NUL, not
-  owner identity. Record membership remains unsupported until record equality is
-  defined. Indexed compounds remain integer-only; string indexed `+=` is not added.
+  owner identity. Enum elements support exact nominal equality and membership.
+  Storage support adds no other equality or membership: functions, unions, records,
+  arrays and ranges reject comparisons and membership as element values. Indexed compounds remain integer-only; string indexed `+=` is not added.
 - Managed backing allocations own repeated element descriptors and expanded pointer
   maps, tracing actual string-owner and array-backing fields across the entire
   zero-initialized capacity. Record layout dependencies precede array descriptors. Map storage costs
@@ -1437,12 +1457,15 @@ let main: () -> void = {
   See [examples/managed-arrays.nov](examples/managed-arrays.nov).
 - `.len` writes are explicitly rejected: shrinking and especially initialization
   on length growth remain undesigned. No array printing, equality, concatenation
-  with `+`, slices, nested arrays, enum/union/pointer/function elements, general aliases,
+  with `+`, slices, pointer elements, general aliases,
   array globals, or capacity API is delivered. Bounded value/reference iteration is
   supported (see [Loop](#loop)). The formatter supports
   the array syntax described above without extending these semantics.
-  Indexed elements use normal scalar/record printing rules; array values themselves
-  cannot be printed.
+  Individual elements retain their existing scalar or exact container `toString`
+  printing/interpolation rules; storage adds no printer for functions or ranges,
+  and array values themselves still cannot be printed.
+  `examples/storable-arrays.nov` is being added for the expanded element matrix;
+  parent validation gates are pending.
 
 ### Local static borrowing
 
@@ -1517,7 +1540,10 @@ changed.score += 1
   add no new borrowing forms: `&record.field`, `&record.field[index]` and indexed
   array-field updates through a whole-record/record-element loan remain unsupported.
   Those existing loans still support array-field replacement/append and ordinary
-  recursively copied reads. Nested arrays remain unsupported.
+  recursively copied reads. Nested-array elements can use existing scoped element
+  loans for replacement/append and supported indexed updates. Stable owner slots
+  preserve scoped nested-array replacement; this adds no chained borrow syntax,
+  reborrows or direct/computed indexed-write forms.
 - Normal array snapshots/copies remain independent, including snapshots evaluated
   before a later borrow inside an index or RHS. In-place borrowed writes do not
   alter earlier copies. See the unchanged borrowed-element form in
@@ -1627,7 +1653,9 @@ let main: () = {
   part of the value. Inferred locals, assignment/copies, and branch/block/loop
   results can carry ranges, including mixed inclusive/exclusive branches. No new
   source-level range annotation syntax is provided yet, so range parameters/return
-  signatures, fields, arrays, union payloads and globals remain unsupported.
+  signatures, fields, union payloads and globals remain unsupported. Arrays can
+  infer range elements, for example `[0..3, 1..=2]`; their bounds and inclusivity
+  copy by value with exact endpoint typing and the existing range-only defaults.
   Range field access, equality, membership and direct printing are not introduced.
 - Ordinary range operators bind above assignment and below pipes/other binary
   operators; chaining `a..b..c` is rejected. Existing slice/match syntax is preserved.
@@ -1891,7 +1919,7 @@ let nums: []int = [1, 2, 3]
 ```
 
 The executable subset supports membership in scalar `[]T` arrays: `bool`, `rune`,
-`string`, fixed 8/16/32/64-bit signed/unsigned integers, and native `int`/`uint`. Value and
+`string`, nominal enums, fixed 8/16/32/64-bit signed/unsigned integers, and native `int`/`uint`. Value and
 element types must match exactly; there is no widening or signedness conversion.
 A known array element type constrains the left literal; a known typed left value
 constrains an array literal, including `[]`. Boolean literals provide a known
@@ -1905,7 +1933,9 @@ permitted readonly borrows. Required snapshots inside effectful computed bases a
 preserved; constructing the RHS can still allocate. The scan itself is an
 allocation-free linear traversal using scalar equality, stopping at the first match. It neither
 mutates nor appends. String elements compare exact bytes, including NUL. Strings
-as containers, nested arrays, records, pointers, ranges and iterators are unsupported.
+as containers are unsupported. Functions, unions, records, arrays and ranges have
+no element equality or membership, even though they are storable array elements;
+pointers and iterator protocols remain unsupported.
 
 ## Assignment
 ```nov
@@ -1972,7 +2002,7 @@ let main: () -> void = {
 Aliases are canonical synonyms, **not distinct newtypes**: `Count` and `uint`
 match exactly, with the same literal bounds, operations and backend restrictions.
 Supported RHS forms are `bool`, `void`, fixed-width integers, native `int`/`uint`,
-`rune`, `string`, nominal struct types, scalar array types and function types, including aliases in nested
+`rune`, `string`, nominal container types, supported array types and function types, including aliases in nested
 parameter/result/array-element positions. Function-type parameters may be unnamed.
 `let Callback = (int) -> int` declares a type alias, not a function body.
 Function definitions still use explicit signature syntax, such as
@@ -2117,7 +2147,7 @@ nov run examples/fibo.nov --release # 55
 |-----------------------|--------------------|----------------------------------------------|---------------------------------------------------------------------|
 | Assignment            | a = b              | All types                                    | `a` is an identifier and `b` is an expression.                      |
 | Addition              | a + b <br> a += b  | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                                |
-| Concatenation         | a + b <br> a += b  | string <br> [Arrays](#Arrays)                | Strings: `+` only; scalar arrays: `+=` only                          |
+| Concatenation         | a + b <br> a += b  | string <br> [Arrays](#Arrays)                | Strings: `+`/`+=`; arrays: `+=` only                          |
 | Substraction          | a - b <br> a -= b  | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                                |
 | Negation              | -a                 | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                                |
 | Multiplication        | a * b <br> a \*= b | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                                |
@@ -2223,7 +2253,7 @@ Ordering (`<`, `<=`, `>`, `>=`), other operators (including `-=`, `*=`, `/=` and
 `%=`) and grapheme operations remain deferred. Scalar string iteration is
 supported (see [Loop](#loop)).
 `[]string` and supported record arrays work with independent element storage and
-shared immutable string backing; nested arrays remain unsupported.
+shared immutable string backing; nested arrays recursively copy their array backing.
 
 `text[index]` decodes one Unicode scalar as **exactly `rune`**, using a native signed
 `int` index. Indices count scalars, not bytes or graphemes; `-1` is the last scalar. Out-of-bounds access,
@@ -2248,7 +2278,8 @@ Embedded NUL is an ordinary scalar; continuation bytes are not exposed by indexi
 Indexed assignment, compound assignment and string-element
 borrows are unsupported, even for `let mut` bindings. Whole-string aliases retain
 the existing borrowing rules. Chained reads such as `strings[0][1]` work for arrays
-of strings; this does not enable nested arrays. See
+of strings; nested arrays separately support chained value reads, not direct
+chained indexed writes. See
 [`examples/string-bytes.nov`](examples/string-bytes.nov), which keeps its historical
 filename but now demonstrates Unicode scalar indexing and length.
 

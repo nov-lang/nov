@@ -191,27 +191,17 @@ fn checkSupported(ast: Ast) !void {
             },
             .array_type => {
                 switch (ast.nodes.items(.tag)[data.rhs]) {
-                    .field_access, .call, .call_one => continue,
+                    .field_access, .call, .call_one, .array_type, .fn_proto, .fn_proto_one => continue,
                     .identifier => {},
                     else => return error.UnsupportedSyntax,
                 }
                 const name = ast.tokenSlice(ast.nodes.items(.main_token)[data.rhs]);
-                const scalar_types = [_][]const u8{ "bool", "string", "rune", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "int", "uint" };
+                const scalar_types = [_][]const u8{ "bool", "string", "rune", "i8", "i16", "i32", "i64", "i128", "u8", "u16", "u32", "u64", "u128", "int", "uint" };
                 for (scalar_types) |scalar| {
                     if (std.mem.eql(u8, name, scalar)) break;
                 } else if (primitives.isPrimitive(name)) return error.UnsupportedSyntax;
             },
-            .array_init_two, .array_init_two_comma, .array_init, .array_init_comma => {
-                const buffer = [_]Ast.Node.Index{ data.lhs, data.rhs };
-                const items = switch (tag) {
-                    .array_init_two, .array_init_two_comma => buffer[0..@as(usize, if (data.rhs != 0) 2 else if (data.lhs != 0) 1 else 0)],
-                    else => ast.extra_data[data.lhs..data.rhs],
-                };
-                for (items) |item| switch (ast.nodes.items(.tag)[item]) {
-                    .array_init_two, .array_init_two_comma, .array_init, .array_init_comma => return error.UnsupportedSyntax,
-                    else => {},
-                };
-            },
+            .array_init_two, .array_init_two_comma, .array_init, .array_init_comma => {},
             .attr_one => {
                 const name = ast.tokenSlice(data.lhs);
                 if (std.mem.eql(u8, name, "export") or std.mem.eql(u8, name, "extern")) {
@@ -456,11 +446,7 @@ test "unsupported syntax fails closed including nested expressions" {
         "let x=@unknown(\"memory\")\n",
         "let x=call({&value})\n",
 
-        "let x=[[1], [2]]\n",
-        "let x:[][]int\n",
-        "let x:[]i128\n",
         "let x:[]*int\n",
-        "let x:[]() -> int\n",
 
         "let f:()->void={make().inner.len=1}\n",
         "let f:()->void={make()[0]+=1}\n",

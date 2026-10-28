@@ -1,0 +1,196 @@
+; nov run examples/storable-arrays.nov
+; nov test examples/storable-arrays.nov
+; Managed values copy recursively; copied closures keep their shared cells.
+
+let Color = enum {
+    red,
+    blue,
+}
+
+let Row = struct {
+    values: []string,
+}
+
+let Payload = union {
+    row: Row,
+    text: string,
+    none,
+}
+
+let increment: (n: int) -> int = n + 1
+let double: (n: int) -> int = n * 2
+
+; funny syntax
+let counters = () -> []() -> int {
+    let mut count: int = 0
+    [
+        () -> int {
+            count += 1
+            count
+        }
+    ]
+}
+
+let main: () = {
+    let mut rows = [["Ada"], ["Grace"]]
+    let saved = rows
+    let first = &rows[0]
+    first[0] = first[0] + "!"
+    @println("Rows:", saved[0][0], rows[0][0])
+    let colors: []Color = [.red, .blue]
+    @println("Blue:", Color.blue in colors)
+    let next = counters()
+    let same = next
+    @println("Shared:", next[0](), same[0]())
+}
+
+@[test]
+let enum_membership_and_refs: () = {
+    let mut colors: []Color = [.red]
+    let saved = colors
+    colors += [.blue]
+    let first = &colors[0]
+    first = .blue
+    @assert(Color.red in saved)
+    let savedBlue = Color.blue in saved
+    @assert(savedBlue == false)
+    @assert(Color.blue in colors)
+    let currentRed = Color.red in colors
+    @assert(currentRed == false)
+    loop &color in colors {
+        color = .red
+    }
+    let currentBlue = Color.blue in colors
+    @assert(currentBlue == false)
+}
+
+@[test]
+let nested_copies_and_iteration: () = {
+    let mut rows: [][]string = [["a" + "b"], ["c"]]
+    let saved = rows
+    let mut assigned: [][]string = []
+    assigned = rows
+    let first = &rows[0]
+    first[0] = first[0] + "!"
+    first += ["d"]
+    @assert(saved[0][0] == "ab" and saved[0].len == 1)
+    @assert(assigned[0][0] == "ab")
+    loop row in rows {
+        let mut detached = row
+        detached[0] = "copy"
+    }
+    loop &row in rows {
+        row += ["tail"]
+    }
+    @assert(rows[0][0] == "ab!" and rows[0].len == 3)
+    @assert(rows[1].len == 2 and saved[1].len == 1)
+    let mut indexed = rows[0]
+    indexed[0] = "independent"
+    @assert(rows[0][0] == "ab!")
+}
+
+@[test]
+let union_active_payload_copies: () = {
+    let mut source = Row[ .values = ["old" + "!"] ]
+    let mut items: []Payload = [.row[source], .text["hel" + "lo"], .none[]]
+    let saved = items
+    source.values[0] = "source"
+    let mut extracted = match items[0] {
+        .row => |row| row
+        .text => Row[ .values = [] ]
+        .none => Row[ .values = [] ]
+    }
+    extracted.values[0] = "new"
+    items[0] = .row[extracted]
+    extracted.values[0] = "later"
+    @assert(
+        match saved[0] {
+            .row => |row| row.values[0] == "old!"
+            .text => false
+            .none => false
+        }
+    )
+    @assert(
+        match items[0] {
+            .row => |row| row.values[0] == "new"
+            .text => false
+            .none => false
+        }
+    )
+    @assert(
+        match saved[1] {
+            .text => |text| text == "hello"
+            .row => false
+            .none => false
+        }
+    )
+    @assert(
+        match saved[2] {
+            .none => true
+            .row => false
+            .text => false
+        }
+    )
+}
+
+@[test]
+let ordinary_function_arrays: () = {
+    let mut functions: [](int) -> int = [increment, double]
+    let saved = functions
+    functions[0] = double
+    functions += [increment]
+    @assert(saved[0](3) == 4 and functions[0](3) == 6)
+    @assert(functions[-1](3) == 4)
+    let mut total: int = 0
+    loop function in saved {
+        total += function(3)
+    }
+    @assert(total == 10)
+}
+
+@[test]
+let escaping_closures_share_cells: () = {
+    let mut functions = counters()
+    let saved = functions
+    @assert(functions[0]() == 1)
+    @assert(saved[0]() == 2)
+    let copied = [saved]
+    @assert(copied[0][0]() == 3)
+    functions += counters()
+    @assert(functions[1]() == 1)
+    @assert(saved[0]() == 4)
+    let first = &functions[0]
+    @assert(first() == 5)
+}
+
+@[test]
+let range_bounds_and_loops: () = {
+    let mut start: int = 1
+    let mut end: int = 3
+    let mut ranges = [start..end, start..=end]
+    let saved = ranges
+    start = 9
+    end = 10
+    ranges[0] = start..end
+    let mut total: int = 0
+    loop range in saved {
+        loop n in range {
+            total += n
+        }
+    }
+    @assert(total == 9)
+    let mut changed: int = 0
+    loop n in ranges[0] {
+        changed += n
+    }
+    @assert(changed == 9)
+    let first = &ranges[0]
+    start = 4
+    end = 5
+    first = start..=end
+    let mut borrowed: int = 0
+    loop n in first {
+        borrowed += n
+    }
+    @assert(borrowed == 9)
+}

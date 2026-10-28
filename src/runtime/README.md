@@ -147,9 +147,10 @@ outstanding host allocations to check deterministic cleanup.
 Bounded plain/generic records use inline C value structs, not GC allocations for
 the records themselves. Fields support bool/integer/rune/enum scalars, immutable
 `nov_string`, acyclic nested records and arrays of supported elements. Record arrays
-and struct payloads of unions may contain these array-bearing records. Nested array
-types, layout cycles (including through arrays), union/function fields and managed
-foreign retention remain unsupported.
+and struct payloads of unions may contain these array-bearing records. Nested
+arrays are supported. Layout cycles (including through arrays), direct union/function
+record fields and managed foreign retention remain unsupported. Aggregate depth
+is bounded at 128, counting nested array edges.
 
 Ordinary value boundaries preserve recursive array independence; immutable string
 backing shares. Storage reads clone when producing independent values, while fresh
@@ -157,8 +158,13 @@ expression temporaries transfer through initialization, argument, return and
 control-flow boundaries without another clone. Readonly field/simple-index
 projections avoid copying the enclosing aggregate. Effectful indices retain
 pre-effect snapshots, including when shared closure cells can mutate the source. Generated typed copy helpers
-clone outer backing and recursively detach array-bearing elements/fields. Tagged
-unions copy only the active payload. Helpers root both input and partially copied
+clone outer backing and recursively detach array-bearing elements/fields, including
+nested arrays. Tagged unions recursively detach only the active payload's array
+backing, including record payloads; direct array/union/function union payloads
+remain unsupported under the unchanged payload rules. Function values share their
+existing closure environment and captured cells, rather than deep-cloning a
+closure; immutable snapshot/mutable shared-cell capture rules remain unchanged.
+Range values copy bounds and inclusivity by value. Helpers root both input and partially copied
 output across allocations; nested allocations can trigger collection/retry. The
 scalar array helper's one-backing-per-call property does not bound allocations of a
 recursive generated copy.
@@ -231,16 +237,32 @@ retain stable owner slot IDs and validate final boxing state after top-level and
 child bodies are lowered; captures discovered later cannot invalidate earlier
 call checks across loop backedges. Without effect summaries this remains conservative.
 
-## Generated scalar arrays
+## Generated storable-value arrays
 
-The approved first array slice uses `nov_array { void *data; uintptr_t len, cap; }`.
+Arrays support every existing storable runtime type: bool, integer, rune, string,
+enum, finite acyclic record, existing tagged union, function/closure, nested array
+and inferred integer range. `void` and compile-time `type` are not storable; floats
+are not implemented. Semantic integer widths extend through 128 bits, but reachable
+backend leaves and function signatures still require 8/16/32/64-bit widths; native
+`int/uint` retain their pointer-width contract. There is no new range annotation
+syntax. Storage support does not grant equality, membership or printing: enums
+retain exact nominal equality/membership alongside existing scalar/string support;
+functions, unions, records, arrays and ranges reject comparisons/membership. Arrays
+still cannot be printed; individual elements use their existing scalar or exact
+container `toString` rules.
+
+The array representation uses `nov_array { void *data; uintptr_t len, cap; }`.
 The emitter declares this type for any transitively reachable array type, including
 arrays nested in callback parameter/result signatures. Signature-only callback
 uses need neither the GC helpers nor root frames; unreferenced pooled types emit
 nothing. Runtime emission and function rooting instead depend on direct managed
 parameters, results, or instruction values.
 Only backing storage is managed. Each nonempty allocation has an exact descriptor
-of `cap * sizeof(element)` bytes, element alignment, and zero pointer fields.
+of `cap * sizeof(element)` bytes and element alignment. Scalar elements have zero
+pointer fields; managed elements use owned expanded pointer maps over the entire
+zero-initialized capacity. Maps trace actual string owners, nested-array backing,
+closure environments and managed record/union payload fields, never code pointers,
+static byte pointers or interior addresses.
 Empty backing is NULL and requires no allocation. Size addition/multiplication
 are checked before allocation; self-append copies from rooted inputs into fresh
 backing. Copies and updates are eager, not a copy-on-write or amortized-growth
@@ -249,8 +271,9 @@ optimization. Bool elements are ordinary C bool objects, not bit-packed.
 Typed IR owns literal operand lists and represents clone, len, index, replacement
 and append explicitly, with exact element/index/result types and region privacy.
 Array value boundaries clone; returns transfer freshly copied backing without an
-intervening safepoint after popping the callee frame. C helpers allocate at most
-one backing per call and rely on compiler-rooted input values.
+intervening safepoint after popping the callee frame. The low-level C array helper
+allocates at most one outer backing per call and relies on compiler-rooted inputs;
+recursive generated copies may allocate additional nested backing.
 
 The emitter predeclares every managed instruction result at **function scope**,
 initializes all data fields to NULL, and pushes one frame containing their actual
@@ -270,10 +293,18 @@ across frames remain requirements. Tests run generated programs with collection
 on **every** allocation, injected allocation failures/retries, strict C11/UBSan,
 -O0 and -O3 bounds checks, argument-order effects, nested loops and early returns.
 
-Writable length (especially growth initialization), slices/invalidation, nested
-array or pointer elements, explicit aliases and managed FFI remain deferred.
-String/record elements and array-valued record fields use managed element maps
-and recursive generated copies as described above.
+Writable length (especially growth initialization), array slices/invalidation,
+pointer elements, general explicit aliases and managed FFI remain deferred.
+Direct chained indexed writes, record-field writes through computed elements and
+arbitrary computed-base writes remain unsupported. Existing scoped stable-owner
+loans allow supported nested-array element updates and replacement; no new borrow
+syntax, reborrows or escaping capabilities are added.
+Managed elements and array-valued record fields use precise element maps and
+recursive generated copies as described above. `examples/storable-arrays.nov` is
+being added; parent validation gates for this expansion remain pending. Existing
+validation descriptions above do not claim that those gates have passed.
+All further optimizations remain paused; `defer` remains postponed. Namespace `use`
+syntax remains undecided and its unfinished work stashed, not implemented.
 See the main README for delivered source syntax and copy/evaluation contracts.
 
 ## Generated immutable strings

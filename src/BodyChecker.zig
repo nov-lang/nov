@@ -2577,7 +2577,7 @@ const Context = struct {
                     if (try self.expression(data.rhs, null, depth + 1) == null) return null;
                     return self.fail(.operator_not_supported, node, null);
                 };
-                if (self.ir.getType(element.ty).? == .record) return self.fail(.operator_not_supported, node, element.annotation);
+                if (!Ir.hasEquality(self.ir.getType(element.ty).?)) return self.fail(.operator_not_supported, node, element.annotation);
                 if (try self.expression(data.lhs, element, depth + 1) == null) return null;
                 const array: Known = .{ .ty = try self.ir.internType(.{ .array = element.ty }), .annotation = element.annotation };
                 // The scan cannot mutate or retain its RHS. Only project the final
@@ -3844,11 +3844,19 @@ test "managed arrays reject unsupported payloads nominal mismatches and record m
         "let A=struct{s:string,}\nlet f:(a:A)={let mut x=[a]\nx[0]+=a}",
         "let A=struct{s:string,}\nlet f:(a:A)={let mut x=[a]\nx[0].s=\"bad\"}",
         "let A=struct{s:string,}\nlet f:(a:A)={let x:[]A=[]\nlet y:[]string=x\n}",
-        "let A=struct{s:[][]string,}",
-        "let U=union{s:string,none,}\nlet f:(a:[]U)={}",
-        "let E=enum{a,b,}\nlet f:(a:[]E)={}",
-        "let f:(a:[]()->string)={}",
-        "let f:(a:[][]string)={}",
+        "let U=union{s:string,none,}\nlet f:(a:U)->bool=a in [a]",
+        "let f:(a:()->string)->bool=a in [a]",
+        "let f:(a:[]string)->bool=a in [a]",
+        "let f:(a:()->int)->bool=a==a",
+        "let U=union{none,}\nlet f:(a:U)->bool=a==a",
+        "let f:(a:[][]int)={let mut b=a\nb[0][0]=1}",
+        "let f:(a:[]()->int)=@println(a[0])",
+        "let f:()={let r=0..1\nlet a=[r]\n@println(a[0])}",
+        "let f:(a:[]type)={}",
+        "let f:(a:[]*int)={}",
+        "let f:(n:int)->bool={let a=n..n\na in [a]}",
+        "let E=enum{a,b,}\nlet F=enum{a,b,}\nlet f:(a:E,b:F)->bool=a in [b]",
+        "let E=enum{a,b,}\nlet F=enum{a,b,}\nlet f:(a:E,b:F)->bool=a==b",
         "let O:(T:type)->type=union{some:T,none,}\nlet f:(a:O([]string))={}",
         "let R:(T:type,E:type)->type=union{ok:T,err:E,}\nlet f:(a:R([]string,string))={}",
         "let f:()={let a:[]string=[]\nlet b:[]bool=[]\nlet c:[]string=b\n}",
@@ -3873,8 +3881,7 @@ test "scalar array deferred and ill typed forms fail closed" {
         "let main: () -> void = {let mut a: []int = [1]\na.len += 2}",
         "let main: () -> void = {let a: []int = [1]\nlet index: uint = 0\n@println(a[index])}",
         "let main: () -> void = {let a: []int = [true]\n}",
-        "let main: () -> void = {let a: [][]int = [[1]]\n}",
-        "let main: () -> void = {let a: []i128 = []\n}",
+
         "let main: () -> void = {let a: []void = []\n}",
         "let main: () -> void = {let a: []int = [1]\n@println(a.cap)}",
         "let main: () -> void = {let a: []int = [1]\n@println(a == a)}",
@@ -4491,8 +4498,8 @@ test "array inference rejects conflicts defaults and scope leaks without probe d
         .{ .body = "let a: []i8 = [0, wide]", .tag = .expression_type_mismatch, .token = "wide" },
         .{ .body = "let a = []", .tag = .array_literal_needs_type, .token = "[" },
         .{ .body = "let a = [1, 2]", .tag = .array_literal_needs_type, .token = "[" },
-        .{ .body = "let a = [[true]]", .tag = .array_literal_needs_type, .token = "[" },
-        .{ .body = "let a = [f]", .tag = .array_literal_needs_type, .token = "[" },
+        .{ .body = "let a = [[1]]", .tag = .array_literal_needs_type, .token = "[" },
+        .{ .body = "let a = [[]]", .tag = .array_literal_needs_type, .token = "[" },
         .{ .body = "let a = [missing, p]", .tag = .unknown_name, .token = "missing" },
         .{ .body = "let a = [0, {let hidden = p\nhidden}]\n@println(hidden)", .tag = .unknown_name, .token = "hidden" },
         .{ .body = "let a = [0, {let x: missing = p\nx}, p]", .tag = .unknown_type, .token = "missing" },
@@ -5145,7 +5152,7 @@ test "reusable range values preserve exact inference and reject unsupported valu
         .{ .body = "{let mut r=0..2\nr=-1..2}", .accepted = false },
         .{ .body = "{let mut r=0..2\nr.start=1}", .accepted = false },
         .{ .body = "{let r=0..2\n@println(r.start)}", .accepted = false },
-        .{ .body = "{let r=0..2\nlet items=[r]\n}", .accepted = false },
+        .{ .body = "{let r=0..2\nlet items=[r]\n}", .accepted = true },
         .{ .body = "{let r=true..false\n}", .accepted = false },
         .{ .body = "{loop i in true {}}", .accepted = false },
         .{ .body = "{let r=0..2\nloop i in r {} else {@println(i)}}", .accepted = false },

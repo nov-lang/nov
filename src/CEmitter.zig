@@ -160,43 +160,27 @@ fn fail(diagnostic: ?*Diagnostic, reason: Diagnostic.Reason, origin: Origin) Err
     };
 }
 
-fn mark(origins: []?Origin, ty: Ir.TypeId, origin: Origin) void {
-    const slot = &origins[@backingInt(ty)];
-    if (slot.* == null) slot.* = origin;
-}
+const TypeReachability = struct {
+    origins: []?Origin,
+    pending: []Ir.TypeId,
+    len: usize = 0,
 
-// Nominal placeholders can precede their payload records and scalar fields.
-// Verification bounds aggregate depth; visit these edges directly rather than
-// depending on pool order as we can for structural signature types.
-fn markRecord(ir: *const Ir, origins: []?Origin, visited: []bool, id: Ir.TypeId, origin: Origin, diagnostic: ?*Diagnostic) Error!void {
-    if (visited[@backingInt(id)]) return;
-    visited[@backingInt(id)] = true;
-    mark(origins, id, origin);
-    for (ir.getType(id).?.record.fields) |field| {
-        const field_origin: Origin = .{ .function = origin.function, .span = field.span };
-        mark(origins, field.ty, field_origin);
-        var field_id = field.ty;
-        var ft = ir.getType(field_id).?;
-        if (ft == .array) {
-            field_id = ft.array;
-            mark(origins, field_id, field_origin);
-            ft = ir.getType(field_id).?;
-        }
-        if (ft == .record) {
-            try markRecord(ir, origins, visited, field_id, field_origin, diagnostic);
-        } else if (ft == .integer) switch (ft.integer.bits) {
-            8, 16, 32, 64 => {},
-            else => return fail(diagnostic, .integer_width_unsupported, field_origin),
-        };
+    fn mark(self: *TypeReachability, ty: Ir.TypeId, origin: Origin) void {
+        const slot = &self.origins[@backingInt(ty)];
+        if (slot.* != null) return;
+        slot.* = origin;
+        // Each type is queued once, including nominal edges in either pool direction.
+        self.pending[self.len] = ty;
+        self.len += 1;
     }
-}
+};
 
 /// Rejects unsupported widths and marks runtime types reachable from signatures
 /// and instructions, including nominal edges in either pool-index direction.
 fn analyze(allocator: std.mem.Allocator, ir: *const Ir, origins: []?Origin, diagnostic: ?*Diagnostic) Error!void {
-    const visited = try allocator.alloc(bool, ir.types.items.len);
-    defer allocator.free(visited);
-    @memset(visited, false);
+    const pending = try allocator.alloc(Ir.TypeId, ir.types.items.len);
+    defer allocator.free(pending);
+    var reachable: TypeReachability = .{ .origins = origins, .pending = pending };
     for (ir.functions.items, 0..) |function, f| {
         const id: Ir.FunctionId = @fromBackingInt(@intCast(f));
         if (function.export_name orelse function.extern_name) |symbol| {
@@ -208,32 +192,30 @@ fn analyze(allocator: std.mem.Allocator, ir: *const Ir, origins: []?Origin, diag
                 if (std.mem.eql(u8, symbol, generated.written())) return fail(diagnostic, if (function.extern_name != null) .extern_symbol_collision else .export_symbol_collision, .{ .function = id, .span = function.span });
             }
         }
-        mark(origins, function.ty, .{ .function = id, .span = function.span });
+        reachable.mark(function.ty, .{ .function = id, .span = function.span });
         const body = function.body orelse continue;
         for (body.instructions) |instruction| {
             const origin: Origin = .{ .function = id, .span = instruction.span };
-            mark(origins, instruction.ty, origin);
+            reachable.mark(instruction.ty, origin);
         }
     }
-    var i = origins.len;
-    while (i > 0) {
-        i -= 1;
-        const origin = origins[i] orelse continue;
-        switch (ir.types.items[i]) {
+    while (reachable.len != 0) {
+        reachable.len -= 1;
+        const id = pending[reachable.len];
+        const origin = origins[@backingInt(id)].?;
+        switch (ir.getType(id).?) {
             .void, .boolean, .rune, .string, .enumeration => {},
-            .record => try markRecord(ir, origins, visited, @fromBackingInt(@intCast(i)), origin, diagnostic),
-            .range => |element| mark(origins, element, origin),
-            .array => |element| {
-                mark(origins, element, origin);
-                if (ir.getType(element).? == .record) try markRecord(ir, origins, visited, element, origin, diagnostic);
+            .record => |record| for (record.fields) |field| {
+                reachable.mark(field.ty, .{ .function = origin.function, .span = field.span });
             },
+            .range, .array => |element| reachable.mark(element, origin),
             .integer => |integer| switch (integer.bits) {
                 8, 16, 32, 64 => {},
                 else => return fail(diagnostic, .integer_width_unsupported, origin),
             },
             .function => |function| {
-                for (function.params) |param| mark(origins, param, origin);
-                mark(origins, function.result, origin);
+                for (function.params) |param| reachable.mark(param, origin);
+                reachable.mark(function.result, origin);
             },
         }
     }
@@ -342,6 +324,18 @@ fn write(allocator: std.mem.Allocator, ir: *const Ir, origins: []const ?Origin, 
             try w.writeAll("); void *env; };\n");
         }
     }
+    // Array element descriptors can refer to ordinary function-pointer types.
+    var first_typedef = true;
+    for (origins, ir.types.items, 0..) |origin, ty, i| {
+        if (origin == null or ty != .function or usesClosures(ir)) continue;
+        if (first_typedef) try w.writeByte('\n');
+        first_typedef = false;
+        try w.writeAll("typedef ");
+        try writeType(ir, w, ty.function.result);
+        try w.print(" (*nov_fn_{d})(", .{i});
+        try writeParamTypes(ir, w, ty.function.params);
+        try w.writeAll(");\n");
+    }
     const copy_types = try allocator.alloc(bool, ir.types.items.len);
     defer allocator.free(copy_types);
     try markCopyTypes(allocator, ir, copy_types);
@@ -367,17 +361,6 @@ fn write(allocator: std.mem.Allocator, ir: *const Ir, origins: []const ?Origin, 
         try w.writeAll(" };\n");
     }
     try writeCopyHelpers(ir, copy_types, root_counts, w);
-    var first_typedef = true;
-    for (origins, ir.types.items, 0..) |origin, ty, i| {
-        if (origin == null or ty != .function or usesClosures(ir)) continue;
-        if (first_typedef) try w.writeByte('\n');
-        first_typedef = false;
-        try w.writeAll("typedef ");
-        try writeType(ir, w, ty.function.result);
-        try w.print(" (*nov_fn_{d})(", .{i});
-        try writeParamTypes(ir, w, ty.function.params);
-        try w.writeAll(");\n");
-    }
     if (ir.functions.items.len == 0) return;
     try w.writeByte('\n');
     for (ir.functions.items) |function| {
@@ -1768,6 +1751,7 @@ fn writeArrayValue(ir: *const Ir, w: *std.Io.Writer, body: Ir.Body, transfers: A
     const element = ir.getType(instruction.ty).?.array;
     try w.print("    v{d} = ", .{i});
     switch (instruction.op) {
+        .array_index => |r| try w.print("((nov_array *)v{d}.data)[nov_array_index(v{d}, v{d})]", .{ @backingInt(r.array), @backingInt(r.array), @backingInt(r.index) }),
         .field_read, .union_payload => |read| try w.print("v{d}.f{d}", .{ @backingInt(read.base), read.index }),
         .borrow_read => |borrow| try writeBorrowRead(ir, w, body, borrow, instruction.ty),
         .array_literal => |elements| {
@@ -2011,6 +1995,438 @@ test "rune stdout write and final flush failures use the existing panic contract
 }
 
 const test_gpa = std.testing.allocator;
+
+const type_reachability_cases = [_]struct { source: []const u8, output: []const u8 = "" }{
+    .{ .source =
+    \\let Row=struct{values:[][]string,}
+    \\let snapshot:(row:Row)->Row=row
+    \\let main:()={}
+    },
+    .{ .source =
+    \\let Outer=struct{rows:[][][]Row,}
+    \\let Row=struct{leaf:Leaf,}
+    \\let Leaf=struct{value:string,}
+    \\let snapshot:(row:Outer)->Outer=row
+    \\let main:()={}
+    },
+    .{ .source =
+    \\let Outer=struct{callbacks:[][]([][][]Leaf)->[][][]string,}
+    \\let Leaf=struct{value:string,}
+    \\let snapshot:(row:Outer)->Outer=row
+    \\let main:()={}
+    },
+    .{ .source =
+    \\let Outer=struct{rows:[][]Box(Box(string)),}
+    \\let Box:(T:type)->type=struct{values:[]T,}
+    \\let snapshot:(row:Outer)->Outer=row
+    \\let main:()={}
+    },
+    .{ .source =
+    \\let Outer=struct{callbacks:[][]([][][]Leaf)->[][][]string,}
+    \\let Leaf=struct{value:string,}
+    \\let snapshot:(row:Outer)->Outer=row
+    \\let make:(flag:bool)->()->bool=()->bool {flag}
+    \\let main:()={}
+    },
+    .{ .source =
+    \\let Outer=struct{rows:[][]Box(Box(string)),}
+    \\let Box:(T:type)->type=struct{values:[]T,}
+    \\let snapshot:(row:Outer)->Outer=row
+    \\let make:(row:Outer)->()->Outer=()->Outer {snapshot(row)}
+    \\let main:()={let mut row=Outer[.rows=[[Box(Box(string))[.values=[Box(string)[.values=["reachable"+"!"]]]]]]]
+    \\ let captured=make(row)
+    \\ row.rows=[]
+    \\ let copy=captured()
+    \\ @println(copy.rows[0][0].values[0].values[0])}
+    , .output = "reachable!\n" },
+};
+
+fn emitSourceFreeTypeReachability(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
+    var lowered = blk: {
+        const with_unused = try std.mem.concat(allocator, u8, &.{ source, "\nlet Unused=struct{wide:[][][]i128,}\n" });
+        defer allocator.free(with_unused);
+        var module = try Module.init(allocator, "type-reachability.nov", with_unused);
+        defer module.deinit();
+        var result = try Lowering.lower(&module);
+        errdefer result.deinit();
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expect(result.lowering_complete);
+        break :blk result;
+    };
+    defer lowered.deinit();
+    const c = try emit(allocator, &lowered.ir, null);
+    errdefer allocator.free(c);
+    try std.testing.expect(std.mem.indexOf(u8, c, "} nov_string;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, c, "int128_t") == null);
+    return c;
+}
+
+fn testTypeReachabilityAllocationFailures(allocator: std.mem.Allocator, source: []const u8) !void {
+    allocator.free(try emitSourceFreeTypeReachability(allocator, source));
+}
+
+test "type reachability completes nested nominal signature generic and closure edges source free C11 O0 O3 forced GC" {
+    for (type_reachability_cases) |case| {
+        const library = try emitSourceFreeTypeReachability(test_gpa, case.source);
+        defer test_gpa.free(library);
+        const c = try collectingTestProgram(library);
+        defer test_gpa.free(c);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode|
+            try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, case.output, "", mode);
+    }
+}
+
+test "type reachability transitive metadata survives every compiler allocation failure" {
+    for (type_reachability_cases) |case|
+        try TestAllocations.checkAllAllocationFailures(test_gpa, testTypeReachabilityAllocationFailures, .{case.source});
+}
+
+test "type reachability nested declarations compile as C11 for Windows and aarch64 Linux" {
+    if (Ir.native_pointer_bits != 64) return error.SkipZigTest;
+    const zig_exe = std.testing.environ.getAlloc(test_gpa, "NOV_TEST_ZIG") catch return error.SkipZigTest;
+    defer test_gpa.free(zig_exe);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for (type_reachability_cases) |case| {
+        const c = try emitSourceFreeTypeReachability(test_gpa, case.source);
+        defer test_gpa.free(c);
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "reachable.c", .data = c });
+        for ([_][]const u8{ "x86_64-windows-gnu", "aarch64-linux-gnu" }) |target| for ([_][]const u8{ "-O0", "-O3" }) |mode| {
+            const compiled = try std.process.run(test_gpa, std.testing.io, .{
+                .argv = &.{ zig_exe, "cc", "-target", target, "-std=c11", mode, "-Wall", "-Wextra", "-Wpedantic", "-Werror", "-c", "reachable.c", "-o", "reachable.o" },
+                .cwd = .{ .dir = tmp.dir },
+                .timeout = .{ .duration = .{ .raw = .fromSeconds(60), .clock = .awake } },
+            });
+            defer test_gpa.free(compiled.stdout);
+            defer test_gpa.free(compiled.stderr);
+            try expectSuccess(compiled, "cross-target C compilation");
+        };
+    }
+}
+
+test "type reachability checks demanded transitive wide fields without emitting unused layouts" {
+    for ([_][]const u8{
+        "let Row=struct{values:[][][]i128,}\nlet snapshot:(row:Row)->Row=row\nlet main:()={}",
+        "let Row=struct{values:[][]([][]u128)->void,}\nlet snapshot:(row:Row)->Row=row\nlet main:()={}",
+        "let Row=struct{box:Box(i128),}\nlet Box:(T:type)->type=struct{values:[][]T,}\nlet snapshot:(row:Row)->Row=row\nlet main:()={}",
+    }) |source| {
+        var module = try Module.init(test_gpa, "reachable-width.nov", source);
+        defer module.deinit();
+        var lowered = try Lowering.lower(&module);
+        defer lowered.deinit();
+        try std.testing.expect(!module.hasErrors());
+        var diagnostic: Diagnostic = undefined;
+        try std.testing.expectError(error.UnsupportedIntegerWidth, emit(test_gpa, &lowered.ir, &diagnostic));
+        try std.testing.expectEqualStrings("values", module.sourceSlice(.{ .start = diagnostic.span.start, .end = diagnostic.span.end }).?);
+    }
+}
+
+test "type reachability follows source free range edges discovered through nominal nested arrays" {
+    for ([_]u16{ 32, 128 }) |bits| {
+        var ir = Ir.init(test_gpa);
+        defer ir.deinit();
+        const span: Ir.Span = .{ .start = 0, .end = 0 };
+        const record = try ir.internType(.{ .record = .{ .identity = 0, .fields = &.{} } });
+        const integer = try ir.internType(.{ .integer = .{ .bits = bits, .signedness = .signed } });
+        const range = try ir.internType(.{ .range = integer });
+        var nested = range;
+        for (0..3) |_| nested = try ir.internType(.{ .array = nested });
+        try ir.setRecordFields(record, &.{.{ .name = "values", .ty = nested, .span = span }});
+        const signature = try ir.internType(.{ .function = .{ .params = &.{record}, .result = record } });
+        const function = try ir.addFunction("snapshot", signature, span);
+        try ir.setFunctionBody(function, &.{.{ .ty = record, .span = span, .op = .{ .parameter = 0 } }}, @fromBackingInt(0));
+        if (bits == 128) {
+            try std.testing.expectError(error.UnsupportedIntegerWidth, emit(test_gpa, &ir, null));
+        } else {
+            const library = try emit(test_gpa, &ir, null);
+            defer test_gpa.free(library);
+            const c = try std.mem.concat(test_gpa, u8, &.{ library, "\nint main(void) {nov_rt_heap.collect_every_allocation=1;nov_record_0 row=nov_snapshot((nov_record_0){0});if(row.f0.len)return 1;nov_gc_collect(&nov_rt_heap);nov_gc_shutdown(&nov_rt_heap);return 0;}\n" });
+            defer test_gpa.free(c);
+            for ([_][]const u8{ "-O0", "-O3" }) |mode|
+                try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "", "", mode);
+        }
+    }
+}
+
+const storable_arrays_program =
+    \\let E=enum{first,second,}
+    \\let Box:(T:type)->type=struct{value:T,}
+    \\let Row=struct{values:[][]string,}
+    \\let U=union{row:Row,text:string,none,}
+    \\let inc:(n:int)->int=n+1
+    \\let apply:(f:(int)->int,n:int)->int=f(n)
+    \\let callbacks:()->[](int)->int=[inc]
+    \\let snapshot:(a:[][]string)->[][]string=a
+    \\let main:()={
+    \\ let mut kinds:[]E=[.first,.second]
+    \\ let oldKinds=kinds
+    \\ kinds[0]=.second
+    \\ kinds+=[.first]
+    \\ loop &kind in kinds {kind=.second}
+    \\ let found=E.first in oldKinds
+    \\ let absent=E.first in kinds
+    \\ if oldKinds[0]!=E.first or !found or absent {@panic("enum equality")}
+    \\ let empty:[][]string=[[],[]]
+    \\ let mut rows=[[],["a"+"b"]]
+    \\ let old=snapshot(rows)
+    \\ rows[0]=["new"+"!"]
+    \\ loop &row in rows {row+=["tail"+"!"]}
+    \\ if old[0].len!=0 or old[1][0]!="ab" or rows[0][1]!="tail!" {@panic("nested snapshot")}
+    \\ let mut projected=rows[1]
+    \\ projected[0]="changed"
+    \\ if rows[1][0]!="ab" {@panic("projection copy")}
+    \\ let boxed=Box([][]string)[.value=rows]
+    \\ rows+=[["third"]]
+    \\ if boxed.value.len!=2 or empty[0].len!=0 {@panic("generic array field")}
+    \\ let mut unions:[]U=[.row[Row[.values=rows]],.text["text"+"!"],.none[]]
+    \\ let saved=unions
+    \\ unions[0]=.none[]
+    \\ unions+=[.row[Row[.values=old]]]
+    \\ loop &u in unions {u=.none[]}
+    \\ let mut extracted=match saved[0] {.row=>|r|r.values
+    \\ _=>[]}
+    \\ extracted[0]=["different"]
+    \\ if match saved[0] {.row=>|r|r.values[0][0]!="new!"
+    \\ _=>true} {@panic("union active payload snapshot")}
+    \\ let mut ordinary=callbacks()
+    \\ ordinary+=[inc]
+    \\ ordinary[0]=inc
+    \\ if apply(ordinary[1],3)!=4 {@panic("ordinary function array")}
+    \\ let mut counter:int=1
+    \\ let frozen=rows
+    \\ let f=()->int {counter+=1
+    \\ if frozen[0][0]!="new!" {@panic("capture snapshot")}
+    \\ counter}
+    \\ let mut functions=[f]
+    \\ let shared=functions
+    \\ functions+=[f]
+    \\ rows[0]=["rebound"]
+    \\ if functions[0]()!=2 or shared[0]()!=3 {@panic("closure shared cell")}
+    \\ loop &callback in functions {callback=f}
+    \\ loop callback in functions {let result=callback()
+    \\ if result<4 {@panic("closure iteration")}}
+    \\ let start:int=1
+    \\ let mut ranges=[start..3,start..=2]
+    \\ let bounds=ranges
+    \\ ranges[0]=start..1
+    \\ ranges+=[start..2]
+    \\ let mut total:int=0
+    \\ loop range in bounds {loop n in range {total+=n}}
+    \\ loop &range in ranges {range=start..2}
+    \\ if total!=6 {@panic("range value bounds")}
+    \\ @println("storable arrays ok")
+    \\}
+;
+
+test "storable arrays recursive snapshots enum union function closure range forced GC all modes" {
+    {
+        var module = try Module.init(test_gpa, "storable.nov", storable_arrays_program);
+        defer module.deinit();
+        if (!module.hasErrors()) {
+            var lowered = try Lowering.lower(&module);
+            defer lowered.deinit();
+        }
+        if (module.hasErrors()) {
+            var out = std.Io.Writer.Allocating.init(test_gpa);
+            defer out.deinit();
+            try Diagnostics.renderModule(&module, &out.writer);
+            std.debug.print("{s}", .{out.written()});
+        }
+        try std.testing.expect(!module.hasErrors());
+    }
+    const c = try arrayTestProgram(storable_arrays_program);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O1", "-O2", "-O3", "-Os" }) |mode|
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "storable arrays ok\n", "", mode);
+}
+
+test "storable arrays source free and every compiler allocation failure" {
+    try testClosureOwnership(test_gpa, storable_arrays_program);
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testClosureOwnership, .{storable_arrays_program});
+}
+
+test "storable arrays precise backing descriptors survive source release" {
+    var lowered = blk: {
+        var module = try Module.init(test_gpa, "storable.nov", storable_arrays_program);
+        defer module.deinit();
+        var result = try Lowering.lower(&module);
+        errdefer result.deinit();
+        try std.testing.expect(!module.hasErrors());
+        break :blk result;
+    };
+    defer lowered.deinit();
+    const library = try emit(test_gpa, &lowered.ir, null);
+    defer test_gpa.free(library);
+    var checks = std.Io.Writer.Allocating.init(test_gpa);
+    defer checks.deinit();
+    try checks.writer.writeAll("int main(void) {nov_rt_heap.collect_every_allocation=1;nov_main();\n");
+    for (lowered.ir.types.items, 0..) |ty, i| {
+        const id: Ir.TypeId = @fromBackingInt(@intCast(i));
+        if (!usesElementLayout(&lowered.ir, id)) continue;
+        const roots: usize = switch (ty) {
+            .enumeration, .range => 0,
+            .array, .function => 1,
+            .record => if (ty.record.tagged) 2 else continue,
+            else => continue,
+        };
+        try checks.writer.print("if(nov_element_{d}.pointer_count!={d})return 10;\n", .{ i, roots });
+        if (ty == .array or ty == .function) {
+            try checks.writer.print("if(nov_element_{d}.pointer_offsets[0]!=offsetof(", .{i});
+            try writeType(&lowered.ir, &checks.writer, id);
+            try checks.writer.print(",{s}))return 11;\n", .{if (ty == .array) "data" else "env"});
+        }
+    }
+    try checks.writer.writeAll("nov_gc_collect(&nov_rt_heap);nov_gc_shutdown(&nov_rt_heap);return 0;}\n");
+    const c = try std.mem.concat(test_gpa, u8, &.{ library, checks.written() });
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "storable arrays ok\n", "", mode);
+}
+
+test "storable arrays recursive runtime allocation failures" {
+    for ([_][]const u8{
+        "let main:()={let a:[][]int=[[1]]\nlet b=a\n@println(b[0][0],a[0][0])}",
+        "let R=struct{a:[][]int,}\nlet U=union{some:R,none,}\nlet main:()={let a:[]U=[.some[R[.a=[[1]]]],.none[]]\nlet b=a\n@println(match b[0] {.some=>|r|r.a[0][0]\n.none=>0},a.len)}",
+        "let main:()={let mut n:int=1\nlet f=()->int {n+=1\nn}\nlet a=[f]\nlet b=a\n@println(b[0](),a[0]())}",
+    }) |source| {
+        const library = try emitSource(source, null);
+        defer test_gpa.free(library);
+        for (0..3) |budget| {
+            const prefix = try std.fmt.allocPrint(test_gpa, "#include <stdlib.h>\nstatic size_t count;\nstatic void *test_malloc(size_t n) {{if(count++ >= {d})return NULL;return malloc(n);}}\n#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n", .{budget});
+            defer test_gpa.free(prefix);
+            const c = try std.mem.concat(test_gpa, u8, &.{ prefix, library, "\nint main(void) {nov_rt_heap.collect_every_allocation=1;nov_main();return 0;}\n" });
+            defer test_gpa.free(c);
+            for ([_][]const u8{ "-O0", "-O3" }) |mode|
+                try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 1, "", "panic: GC allocation failed\n", mode);
+        }
+    }
+}
+
+test "storable arrays forged reused nested and active union payloads detach recursive backing" {
+    for ([_]struct { source: []const u8, path: []const u8 }{
+        .{ .source = "let main:()={let seed:[]int=[1]\nlet mut a=[seed,seed]\na[-1]=seed\na+=a\n@println(a.len,seed[0],a[0][0])}", .path = "data" },
+        .{ .source = "let R=struct{a:[]int,}\nlet U=union{some:R,none,}\nlet main:()={let seed:U=.some[R[.a=[1]]]\nlet mut a=[seed,seed]\na[-1]=seed\na+=a\n@println(a.len,match seed {.some=>|r|r.a[0]\n.none=>0},match a[0] {.some=>|r|r.a[0]\n.none=>0})}", .path = "f0.f0.data" },
+    }) |case| {
+        var module = try Module.init(test_gpa, "forged-storable.nov", case.source);
+        defer module.deinit();
+        var lowered = try Lowering.lower(&module);
+        defer lowered.deinit();
+        try std.testing.expect(!module.hasErrors());
+        const body = lowered.ir.functions.items[0].body.?;
+        for (@constCast(body.instructions)) |*instruction| switch (instruction.op) {
+            .array_literal => |elements| if (elements.len == 2) {
+                @constCast(elements)[1] = elements[0];
+            },
+            .array_set => |*update| {
+                update.array = body.instructions[@backingInt(update.array)].op.array_clone;
+                update.value = body.instructions[@backingInt(update.value)].op.array_clone;
+            },
+            .array_append => |*append| append.rhs = append.lhs,
+            else => {},
+        };
+        try lowered.ir.verify();
+        const transfers = try ArrayTransfers.init(test_gpa, &lowered.ir, body);
+        defer transfers.deinit(test_gpa);
+        var instrumented = try emit(test_gpa, &lowered.ir, null);
+        defer test_gpa.free(instrumented);
+        var checked: usize = 0;
+        for (body.instructions, 0..) |instruction, i| {
+            const ty = lowered.ir.getType(instruction.ty).?;
+            if (ty != .array or !try lowered.ir.needsArrayCopy(ty.array)) continue;
+            switch (instruction.op) {
+                .array_literal, .array_set, .array_append => {},
+                else => continue,
+            }
+            var operation = std.Io.Writer.Allocating.init(test_gpa);
+            defer operation.deinit();
+            try writeArrayValue(&lowered.ir, &operation.writer, body, transfers, instruction, i);
+            var checks = std.Io.Writer.Allocating.init(test_gpa);
+            defer checks.deinit();
+            try checks.writer.writeAll(operation.written());
+            try checks.writer.writeAll("    { ");
+            try writeType(&lowered.ir, &checks.writer, ty.array);
+            try checks.writer.print(" *items=v{d}.data;\n", .{i});
+            try checks.writer.print("    for(uintptr_t j=0;j<v{d}.len;++j) for(uintptr_t k=0;k<j;++k) assert(items[j].{s}!=items[k].{s});\n", .{ i, case.path, case.path });
+            switch (instruction.op) {
+                .array_literal => |elements| for (elements, 0..) |value, j| {
+                    try checks.writer.print("    assert(items[{d}].{s}!=v{d}.{s});\n", .{ j, case.path, @backingInt(value), case.path });
+                },
+                .array_set => |update| {
+                    try checks.writer.print("    assert(v{d}.data!=v{d}.data);assert(items[1].{s}!=v{d}.{s});\n", .{ i, @backingInt(update.array), case.path, @backingInt(update.value), case.path });
+                },
+                .array_append => |append| {
+                    try checks.writer.writeAll("    ");
+                    try writeType(&lowered.ir, &checks.writer, ty.array);
+                    try checks.writer.print(" *original=v{d}.data;\n", .{@backingInt(append.lhs)});
+                    try checks.writer.print("    for(uintptr_t j=0;j<v{d}.len;++j) assert(items[j].{s}!=original[j%v{d}.len].{s});\n", .{ i, case.path, @backingInt(append.lhs), case.path });
+                },
+                else => unreachable,
+            }
+            try checks.writer.writeAll("    }\n");
+            try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, instrumented, operation.written()));
+            const replaced = try std.mem.replaceOwned(u8, test_gpa, instrumented, operation.written(), checks.written());
+            test_gpa.free(instrumented);
+            instrumented = replaced;
+            checked += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 3), checked);
+        const prefixed = try std.mem.concat(test_gpa, u8, &.{ "#include <assert.h>\n", instrumented });
+        defer test_gpa.free(prefixed);
+        const c = try collectingTestProgram(prefixed);
+        defer test_gpa.free(c);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode|
+            try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "4 1 1\n", "", mode);
+    }
+}
+
+test "storable arrays individual elements retain nominal printing contracts" {
+    const source =
+        \\let E=enum{first,second,
+        \\ let toString:(e:E)->string=if e==E.first {"first"} else {"second"}
+        \\}
+        \\let Alias=E
+        \\let R=struct{s:string,
+        \\ let toString:(r:R)->string=r.s+"!"
+        \\}
+        \\let U=union{some:R,none,
+        \\ let toString:(u:U)->string=match u {.some=>|r|"{r}"
+        \\ .none=>"none"}
+        \\}
+        \\let main:()={let a:[]Alias=[.first,.second]
+        \\ let r=[R[.s="record"]]
+        \\ let u:[]U=[.some[r[0]],.none[]]
+        \\ @println(a[0],r[0],u[0],u[1],a[0]==E.first,Alias.second in a)}
+    ;
+    var module = try Module.init(test_gpa, "print-storable.nov", source);
+    defer module.deinit();
+    if (module.hasErrors()) {
+        var out = std.Io.Writer.Allocating.init(test_gpa);
+        defer out.deinit();
+        try Diagnostics.renderModule(&module, &out.writer);
+        std.debug.print("{s}", .{out.written()});
+    }
+    try std.testing.expect(!module.hasErrors());
+    const c = try arrayTestProgram(source);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "first record! record! none true true\n", "", mode);
+}
+
+test "storable arrays ordinary higher order functions without closure representation" {
+    const c = try arrayTestProgram(
+        \\let inc:(n:int)->int=n+1
+        \\let identity:(f:(int)->int)->(int)->int=f
+        \\let main:()={let mut functions=[identity]
+        \\ let copy=functions
+        \\ functions+=[identity]
+        \\ functions[0]=identity
+        \\ loop &f in functions {f=identity}
+        \\ @println(copy[0](inc)(4),functions[1](inc)(8))}
+    );
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "5 9\n", "", mode);
+}
 
 const closures_program =
     \\let inferred=(value:int)->int {value+3}
@@ -10394,13 +10810,12 @@ test "array fields backing pointers are recursively independent and strings shar
     }
 }
 
-test "array fields reject recursive layouts nested arrays and unstable borrowed paths" {
+test "array fields reject recursive layouts and unstable borrowed paths" {
     for ([_][]const u8{
         "let A=struct{a:[]A,}\nlet main:()={}",
         "let A=struct{b:[]B,}\nlet B=struct{a:A,}\nlet main:()={}",
         "let A:(T:type)->type=struct{a:[]A(T),}\nlet main:(a:A(int))={}",
-        "let A=struct{a:[][]int,}\nlet main:()={}",
-        "let main:()={let a:[][]int=[]\n}",
+        "let A=struct{a:[][]A,}\nlet main:()={}",
         "let A=struct{a:[]int,}\nlet main:()={let mut a=A[.a=[1]]\nlet r=&a.a\n}",
         "let A=struct{a:[]int,}\nlet main:()={let mut a=A[.a=[1]]\nlet r=&a\nr.a[0]=2}",
     }) |source| {

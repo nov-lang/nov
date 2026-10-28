@@ -532,47 +532,47 @@ pub const LayoutIssue = struct { span: Span, related: Span, cycle: bool };
 pub fn recordLayoutIssue(self: *const Ir) (std.mem.Allocator.Error || error{InvalidTypeId})!?LayoutIssue {
     var has_record = false;
     for (self.types.items) |ty| {
-        if (ty == .record) has_record = true;
+        if (ty == .record or ty == .array) has_record = true;
     }
     if (!has_record) return null;
     const State = struct { color: enum { white, gray, black } = .white, height: usize = 1 };
     const states = try self.allocator.alloc(State, self.types.items.len);
     defer self.allocator.free(states);
     @memset(states, .{});
-    const Frame = struct { id: TypeId, next: usize = 0 };
+    const Frame = struct { id: TypeId, next: usize = 0, span: Span = .{ .start = 0, .end = 0 } };
     var stack: [max_record_depth]Frame = undefined;
     for (self.types.items, 0..) |ty, root| {
-        if (ty != .record or states[root].color != .white) continue;
+        if ((ty != .record and ty != .array) or states[root].color != .white) continue;
         stack[0] = .{ .id = @fromBackingInt(@intCast(root)) };
         states[root].color = .gray;
         var len: usize = 1;
         while (len != 0) {
             const frame = &stack[len - 1];
             const index = @backingInt(frame.id);
-            const fields = self.types.items[index].record.fields;
-            if (frame.next == fields.len) {
+            const current = self.types.items[index];
+            const count = if (current == .array) @as(usize, 1) else current.record.fields.len;
+            if (frame.next == count) {
                 states[index].color = .black;
                 len -= 1;
                 continue;
             }
-            const field = fields[frame.next];
-            var child_id = field.ty;
-            var ft = self.getType(child_id) orelse return error.InvalidTypeId;
-            if (ft == .array) {
-                child_id = ft.array;
-                ft = self.getType(child_id) orelse return error.InvalidTypeId;
-            }
+            const field: Field = if (current == .array)
+                .{ .name = "", .ty = current.array, .span = frame.span }
+            else
+                current.record.fields[frame.next];
+            const child_id = field.ty;
+            const ft = self.getType(child_id) orelse return error.InvalidTypeId;
             const child = @backingInt(child_id);
-            if (ft != .record) {
+            if (ft != .record and ft != .array) {
                 frame.next += 1;
                 continue;
             }
-            const related = if (ft.record.fields.len != 0) ft.record.fields[0].span else field.span;
+            const related = if (ft == .record and ft.record.fields.len != 0) ft.record.fields[0].span else field.span;
             if (states[child].color == .gray) return .{ .span = field.span, .related = related, .cycle = true };
             if (states[child].color == .white) {
                 if (len == stack.len) return .{ .span = field.span, .related = related, .cycle = false };
                 states[child].color = .gray;
-                stack[len] = .{ .id = child_id };
+                stack[len] = .{ .id = child_id, .span = field.span };
                 len += 1;
                 continue;
             }
@@ -956,7 +956,7 @@ fn validateBodyStructure(self: *const Ir, function: Function, body: Body) Verify
                 const array = self.getType(try operandType(body, r.array, i)).?;
                 if (array != .array) return error.InvalidOperation;
                 if (value != array.array) return error.OperandTypeMismatch;
-                if (self.getType(value).? == .record) return error.InvalidOperation;
+                if (!hasEquality(self.getType(value).?)) return error.InvalidOperation;
             },
             .array_set => |r| {
                 if (ty != .array) return error.InvalidOperation;
@@ -1299,10 +1299,19 @@ pub fn isRecordField(ty: Type) bool {
 }
 
 pub fn isArrayElement(ty: Type) bool {
-    return ty == .string or ty == .rune or (ty == .record and !ty.record.tagged) or ty == .boolean or (ty == .integer and switch (ty.integer.bits) {
-        8, 16, 32, 64 => true,
+    return switch (ty) {
+        .void => false,
+        .integer => |integer| integer.bits > 0 and integer.bits <= 128,
+        .boolean, .rune, .string, .enumeration, .record, .function, .array, .range => true,
+    };
+}
+
+/// Storage support does not imply equality (notably for closures and aggregates).
+pub fn hasEquality(ty: Type) bool {
+    return switch (ty) {
+        .boolean, .integer, .rune, .string, .enumeration => true,
         else => false,
-    });
+    };
 }
 
 fn typeEql(a: Type, b: Type) bool {
@@ -1351,7 +1360,7 @@ test "shared pools retain source-qualified nominal identities after AST release"
     try std.testing.expectError(error.InvalidSourceSpan, ir.addFunction("bad", signature, .{ .source = @fromBackingInt(@intCast(1)), .start = 0, .end = 1000 }));
 }
 
-test "record field integer widths follow IR limits independently of array elements" {
+test "record and array integer widths follow semantic IR limits" {
     var ir = Ir.init(std.testing.allocator);
     defer ir.deinit();
     const record = try ir.internType(.{ .record = .{ .identity = 0, .fields = &.{} } });
@@ -1361,8 +1370,9 @@ test "record field integer widths follow IR limits independently of array elemen
             try std.testing.expect(isRecordField(ty));
             const integer = try ir.internType(ty);
             try ir.setRecordFields(record, &.{.{ .name = "x", .ty = integer, .span = .{ .start = 0, .end = 0 } }});
+            try std.testing.expect(isArrayElement(ty));
+            _ = try ir.internType(.{ .array = integer });
             try ir.verify();
-            if (!isArrayElement(ty)) try std.testing.expectError(error.InvalidArrayElement, ir.internType(.{ .array = integer }));
         }
     }
     try std.testing.expect(!isRecordField(.{ .integer = .{ .bits = 0, .signedness = .signed } }));
@@ -1659,6 +1669,65 @@ test "string slicing IR verifies optional native bounds types and prior operands
     try ir.verify();
 }
 
+test "storable arrays source free exact membership and rejected aggregate equality" {
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    const span: Span = .{ .start = 0, .end = 0 };
+    const unit = try ir.internType(.void);
+    const boolean = try ir.internType(.boolean);
+    const integer = try ir.internType(.{ .integer = .{ .bits = 32, .signedness = .signed } });
+    const enumeration = try ir.internType(.{ .enumeration = .{ .name = "E", .identity = 0, .tags = &.{.{ .name = "a", .span = span }} } });
+    const other_enum = try ir.internType(.{ .enumeration = .{ .name = "F", .identity = 1, .tags = &.{.{ .name = "a", .span = span }} } });
+    const record = try ir.internType(.{ .record = .{ .identity = 0, .fields = &.{} } });
+    const tagged = try ir.internType(.{ .record = .{ .identity = 1, .tagged = true, .fields = &.{} } });
+    try ir.setRecordFields(tagged, &.{.{ .name = "none", .ty = unit, .span = span }});
+    const function_type = try ir.internType(.{ .function = .{ .params = &.{integer}, .result = integer } });
+    const range = try ir.internType(.{ .range = integer });
+    const nested = try ir.internType(.{ .array = integer });
+    for ([_]TypeId{ enumeration, record, tagged, function_type, range, nested }) |element| {
+        const array = try ir.internType(.{ .array = element });
+        const signature = try ir.internType(.{ .function = .{ .params = &.{ element, array }, .result = boolean } });
+        const f = try ir.addFunction("contains", signature, span);
+        var instructions = [_]Instruction{
+            .{ .ty = element, .span = span, .op = .{ .parameter = 0 } },
+            .{ .ty = array, .span = span, .op = .{ .parameter = 1 } },
+            .{ .ty = boolean, .span = span, .op = .{ .array_contains = .{ .value = @fromBackingInt(0), .array = @fromBackingInt(1) } } },
+        };
+        if (element == enumeration) {
+            try ir.setFunctionBody(f, &instructions, @fromBackingInt(2));
+            try ir.verify();
+            ir.clearFunctions();
+            const mismatched = try ir.internType(.{ .function = .{ .params = &.{ other_enum, array }, .result = boolean } });
+            const wrong = try ir.addFunction("mismatch", mismatched, span);
+            instructions[0].ty = other_enum;
+            try std.testing.expectError(error.OperandTypeMismatch, ir.setFunctionBody(wrong, &instructions, @fromBackingInt(2)));
+        } else {
+            try std.testing.expectError(error.InvalidOperation, ir.setFunctionBody(f, &instructions, @fromBackingInt(2)));
+            instructions[2].op = .{ .binary = .{ .op = .eq, .lhs = @fromBackingInt(0), .rhs = @fromBackingInt(0) } };
+            try std.testing.expectError(error.InvalidOperation, ir.setFunctionBody(f, &instructions, @fromBackingInt(2)));
+        }
+        ir.clearFunctions();
+        try std.testing.expectEqual(element == nested, try ir.needsArrayCopy(element));
+    }
+}
+
+test "storable arrays bound recursive copy depth including every nested array edge" {
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    const record = try ir.internType(.{ .record = .{ .identity = 0, .fields = &.{} } });
+    const array = try ir.internType(.{ .array = record });
+    const nested = try ir.internType(.{ .array = array });
+    try ir.setRecordFields(record, &.{.{ .name = "cycle", .ty = nested, .span = .{ .start = 0, .end = 0 } }});
+    try std.testing.expectError(error.CyclicRecordLayout, ir.verify());
+    try std.testing.expect(try ir.needsArrayCopy(record));
+    try ir.setRecordFields(record, &.{});
+    var child = record;
+    for (0..max_record_depth - 1) |_| child = try ir.internType(.{ .array = child });
+    try ir.verify();
+    _ = try ir.internType(.{ .array = child });
+    try std.testing.expectError(error.RecordNestingLimit, ir.verify());
+}
+
 test "scalar array types operations and owned operands are verified" {
     var ir = Ir.init(std.testing.allocator);
     defer ir.deinit();
@@ -1668,14 +1737,14 @@ test "scalar array types operations and owned operands are verified" {
     const boolean = try ir.internType(.boolean);
     const array = try ir.internType(.{ .array = integer });
     try std.testing.expectEqual(array, try ir.internType(.{ .array = integer }));
-    try std.testing.expectError(error.InvalidArrayElement, ir.internType(.{ .array = array }));
+    _ = try ir.internType(.{ .array = array });
     const unit = try ir.internType(.void);
     try std.testing.expectError(error.InvalidArrayElement, ir.internType(.{ .array = unit }));
     try std.testing.expectError(error.InvalidTypeId, ir.internType(.{ .array = @fromBackingInt(@intCast(999)) }));
     const wide = try ir.internType(.{ .integer = .{ .signedness = .signed, .bits = 128 } });
-    try std.testing.expectError(error.InvalidArrayElement, ir.internType(.{ .array = wide }));
+    _ = try ir.internType(.{ .array = wide });
     const signature = try ir.internType(.{ .function = .{ .params = &.{}, .result = array } });
-    try std.testing.expectError(error.InvalidArrayElement, ir.internType(.{ .array = signature }));
+    _ = try ir.internType(.{ .array = signature });
     const number = try ir.internConstant(.{ .ty = integer, .value = .{ .signed_integer = 0 } });
     const function = try ir.addFunction("arrays", signature, .{ .start = 0, .end = 0 });
     const make = TestFunctions.instruction;
@@ -4113,13 +4182,14 @@ test "managed array IR owns layouts and rejects forged record equality and paylo
     const span: Span = .{ .start = 0, .end = 0 };
     const string = try ir.internType(.string);
     const boolean = try ir.internType(.boolean);
+    const unit = try ir.internType(.void);
     const record = try ir.internType(.{ .record = .{ .identity = 0, .fields = &.{} } });
     try ir.setRecordFields(record, &.{.{ .name = "s", .ty = string, .span = span }});
     const tagged = try ir.internType(.{ .record = .{ .identity = 1, .fields = &.{}, .tagged = true } });
     const array = try ir.internType(.{ .array = record });
     const strings = try ir.internType(.{ .array = string });
-    try std.testing.expectError(error.InvalidArrayElement, ir.internType(.{ .array = array }));
-    try std.testing.expectError(error.InvalidArrayElement, ir.internType(.{ .array = tagged }));
+    _ = try ir.internType(.{ .array = array });
+    _ = try ir.internType(.{ .array = tagged });
     const signature = try ir.internType(.{ .function = .{ .params = &.{ record, array }, .result = boolean } });
     const function = try ir.addFunction("contains", signature, span);
     var instructions = [_]Instruction{
@@ -4131,7 +4201,7 @@ test "managed array IR owns layouts and rejects forged record equality and paylo
     instructions[2] = .{ .ty = array, .span = span, .op = .{ .array_literal = &.{@fromBackingInt(@intCast(1))} } };
     try std.testing.expectError(error.OperandTypeMismatch, ir.setFunctionBody(function, &instructions, @fromBackingInt(@intCast(2))));
     // Whole-pool verification still checks an array element's nominal graph.
-    ir.types.items[@backingInt(array)] = .{ .array = tagged };
+    ir.types.items[@backingInt(array)] = .{ .array = unit };
     try std.testing.expectError(error.InvalidArrayElement, ir.verify());
     ir.types.items[@backingInt(array)] = .{ .array = record };
     const fields = @constCast(ir.types.items[@backingInt(record)].record.fields);
@@ -4165,7 +4235,7 @@ test "range values require integer elements exact visible operands and immutable
     try std.testing.expectEqual(range, try t.ir.internType(.{ .range = t.integer }));
     try std.testing.expectError(error.InvalidTypeId, t.ir.internType(.{ .range = t.boolean }));
     try std.testing.expectError(error.InvalidTypeId, t.ir.internType(.{ .range = @fromBackingInt(@intCast(999)) }));
-    try std.testing.expectError(error.InvalidArrayElement, t.ir.internType(.{ .array = range }));
+    _ = try t.ir.internType(.{ .array = range });
     try std.testing.expectError(error.NonConstantType, t.ir.internConstant(.{ .ty = range, .value = .void }));
     try std.testing.expect(!isManaged(t.ir.getType(range).?));
     try std.testing.expect(!isRecordField(t.ir.getType(range).?));

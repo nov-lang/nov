@@ -8,8 +8,8 @@ optimizations and correctness/performance cautions below.
 
 Array-valued struct fields are implemented.
 The copy-depth question is settled: ordinary value boundaries eagerly create
-recursively independent array backing through nested structs, record elements and
-union record payloads; immutable strings share. These recursive copies are a major
+recursively independent array backing through nested arrays, structs, record elements
+and active union record payloads; immutable strings share. These recursive copies are a major
 performance concern, especially repeated snapshots and updates. Targeted copy
 elision now transfers fresh temporaries rather than recloning at binding/call/return
 boundaries; readonly field/simple-index projections avoid enclosing aggregate copies.
@@ -39,14 +39,45 @@ indexed replacement/integer compounds on nested mutable-local paths. Updates sna
 the array before index/RHS effects, then replace only the target field in the current
 record; sibling changes survive. Existing whole-record/record-element stable loans
 support array-field replacement/append and ordinary recursively copied reads, but
-not indexed field updates. No field-specific loans, implicit mutable receivers,
-nested arrays or recursive layouts through arrays are added. Immutable closure
+not indexed field updates. No field-specific loans or implicit mutable receivers
+are added. Nested arrays are supported; recursive layouts through arrays still
+reject, and every nested array edge counts toward the aggregate depth bound. Immutable closure
 captures snapshot recursively; mutable captures share a cell, not ordinary read
 results. See `examples/array-fields.nov`.
 
 ## Current delivered status
 
-Constructor-field shorthand is delivered **uncommitted**: `Type[.width, .height]`
+HEAD is `da7838c` (constructor-field shorthand). The expanded storable-array work
+is in the working tree; parent validation gates remain pending. `PLAN2.md` is the
+current untracked handoff; `PLAN.md` is an unchanged archive. No new pass counts
+are claimed for this work.
+
+Arrays now support all existing storable runtime types: bool, integer, rune,
+string, enums, finite acyclic records, existing tagged unions, functions/closures,
+nested arrays and inferred integer ranges. `void` and compile-time `type` are not
+storable; floats are not implemented. Semantic integers extend through 128 bits;
+reachable backend widths remain 8/16/32/64, including nested layouts and function
+signatures. No new range annotation syntax or general numeric defaults are added.
+Nested arrays copy recursively independently; tagged union copies detach only
+active payload array backing, including record payloads containing arrays. Existing
+union payload rules are unchanged: direct array/union/function payloads remain
+unsupported. Function copies share existing environments/captured cells rather
+than deep-cloning closures; immutable capture snapshots and mutable shared cells
+retain their existing rules. Ranges copy bounds/inclusivity by value.
+
+Enum elements support exact nominal equality/membership. No equality or membership
+is added for functions, unions, records, arrays or ranges. Printing arrays remains
+unsupported; individual elements retain existing scalar/exact `toString` rules.
+Direct chained indexed/computed writes and `items[i].field` mutation remain
+unsupported. Use a mutable element copy and assign it back, or existing scoped
+stable-owner element loans for supported nested-array updates/replacement. No new
+borrow forms or escaping references. Recursive layouts, including cycles through
+arrays, and aggregate depth beyond 128 remain rejected.
+`examples/storable-arrays.nov` is being added; parent gates are pending.
+All optimization work stays paused; `defer` stays postponed. Namespace `use` syntax
+is undecided; unfinished work is stashed, not implemented or approved for execution.
+
+Constructor-field shorthand is delivered in `da7838c`: `Type[.width, .height]`
 reads ordinary same-name scoped values with the field's exact expected type.
 It mixes with explicit fields in source order; omitted defaults follow supplied
 fields. Imported types and generic aliases work. Unknown/out-of-scope names
@@ -54,8 +85,9 @@ reject even when a default exists; unknown/duplicate/missing/mistyped fields ret
 normal diagnostics. Array deep-copy/read-copy behavior, borrowed-value reads and
 closure capture rules are unchanged. Union/enum payload grammar is unchanged;
 no contextual/anonymous structs or new `use`/`pub` syntax are added.
-See `examples/constructor-shorthand.nov` (five tests). Focused CLI validation:
-**24/24 steps**; static review: no findings. Parent final gates remain pending.
+See `examples/constructor-shorthand.nov` (five tests). Historical focused CLI
+validation: **24/24 steps**; static review: no findings. These are not results for
+the current storable-array work; its parent final gates remain pending.
 
 Runes and Unicode scalar string inspection are implemented. `rune` is distinct from integers: `0..=0x10FFFF` excluding `0xD800..=0xDFFF`.
 Single quotes hold exactly one scalar or escape (`'é'`, `'😀'`, `'\n'`, `'\xE9'`,
@@ -119,8 +151,9 @@ Reuse restarts at the beginning; source-binding replacement cannot affect an act
 loop. Locals/copies/assignment and inferred branch/block/loop results work. Inclusive
 state is per value, endpoint type exact; existing range-only int/uint defaults,
 empty reversed ranges and inclusive-MAX exhaustion remain unchanged. No allocation.
-No new range annotation syntax, signatures, aggregate fields/payloads, arrays,
-globals, field attributes, printing/equality/membership or iterator protocol yet.
+Inferred arrays of ranges work, copying bounds/inclusivity by value. No new range
+annotation syntax, signatures, aggregate fields/payloads, globals, field attributes,
+printing/equality/membership or iterator protocol yet.
 See examples/range-values.nov. Chained ranges diagnose; slice/match syntax preserved.
 
 Ordinary generic structs are executable alongside generic unions: named type
@@ -137,8 +170,9 @@ append, literal inference, copies/returns and managed owner tracing work. String
 membership compares bytes, including UTF-8/NUL; record membership/equality and
 indexed string compounds remain unsupported. Owned expanded GC pointer maps cover
 all managed capacity slots, with checked alignment/size/OOM and zeroed owners.
-No nested/enum/union/function arrays or escaping element aliases. Record elements
-may themselves contain supported array fields with recursively independent backing.
+Nested/enum/union/function/closure and inferred range arrays now work under the
+storable-array contract above; escaping element aliases remain unsupported. Record
+elements may contain supported array fields with recursively independent backing.
 See examples/managed-arrays.nov. Generic structs now work with supported field types.
 
 Acyclic nested nominal struct fields and mutable-local nested field paths now work,
@@ -158,7 +192,7 @@ Copies remain independent, strings share immutable storage, and string owners st
 rooted. Bounded local element borrows also mutate fields; general temporary/union/
 parameter/pointer mutation and implicit borrowing remain unsupported.
 See examples/struct-mutation.nov; generic structs now use the same mutation rules;
-prioritized roadmap is in local PLAN.md.
+prioritized roadmap is in local untracked PLAN2.md; PLAN.md is archived.
 
 Option.isSome/isNone and Result.isOk/isErr are ordinary public bool-returning
 methods that test only the active variant, without unwrapping or inspecting payloads.
@@ -212,7 +246,9 @@ covered-pattern notes, literal globals, record fields and tag defaults, union
 payloads, generic arguments and .! error propagation. Static methods/public and
 exact toString printing/interpolation reuse container rules. Enum leaves add no GC
 roots; internal uint32 ordinals expose no numeric/FFI policy. Numbered values,
-backing types, numeric conversions/arithmetic/ordering and arrays remain unsupported. structured-errors.nov now handles an enum .not_found kind.
+backing types and numeric conversions/arithmetic/ordering remain unsupported.
+Enum arrays support exact equality/membership. structured-errors.nov now handles
+an enum .not_found kind.
 
 Acyclic nominal records now work as ordinary/generic union payloads, retaining exact
 identity through aliases, constructors, captures, copies and .! propagation. C
@@ -298,7 +334,7 @@ Numeric conversions, widening, signedness changes and general type values still
 need language-design decisions; `@as` does not choose those semantics.
 
 Canonical type aliases: plain immutable module `let Name = typeExpression` is
-implemented for existing supported scalar, scalar-array and function types,
+implemented for existing supported scalar, array and function types,
 including nominal structs, forward chains and aliases in nested type components.
 Aliases work in annotations and `@as`, never as runtime type values. Nominal struct
 aliases additionally preserve explicit `Alias[...]` constructors and static methods;
@@ -572,7 +608,7 @@ Transitive captures, generic methods, source-free IR and forced-GC/OOM paths are
 covered. See README and examples/closures.nov.
 
 Borrowed binding captures, recursive local definitions, inferred parameter/result
-types, function fields/array elements and C callback ABI remain deferred. Calls
+types, function fields and C callback ABI remain deferred. Calls
 while a shared captured cell is borrowed are conservatively rejected, as are
 calls during iteration over a captured mutable array (all call paths, checked
 against final capture state, including captures discovered later); precise effect
@@ -683,11 +719,12 @@ if expr |val| {
 
 # Arrays
 
-Approved and delivered first slice: growable scalar `[]T` value arrays with
+Growable `[]T` value arrays now cover all existing storable runtime types under
+the current delivered contract above, with
 pointer-sized uint len/cap, native int negative indexing, independent copies at
 value boundaries, literals (including context-typed empty arrays), read-only
 `.len`, mutable element replacement and self-safe `+=` append. Formatting now
-covers scalar array annotations, literals, indexing, `.len` reads and direct
+covers supported array annotations (including nested arrays), literals, indexing, `.len` reads and direct
 indexed replacement and integer element `+=`, `-=`, `*=`, `/=`, `%=`, with
 token/comment/AST preservation and first-pass idempotence. Integer element compounds
 now execute using one pre-index array snapshot and one index evaluation, reading
@@ -695,15 +732,17 @@ the old element before the RHS and replacing the local with the updated snapshot
 afterwards. Plain replacement retains its final-update bounds check; compounds
 check on the pre-RHS read. No new memory forms are introduced. See README's
 executable subset for precise limits and evaluation order. The proposals below
-remain proposals; writable length, slices, nested/pointer elements, aliases,
-capacity APIs and efficient copy/append optimizations are still deferred.
+remain proposals; writable length, array slices, pointer elements, general aliases
+and capacity APIs are still deferred. All further optimizations remain paused.
 
-Scalar `value in array` membership is delivered for bool and supported fixed/native
-integers with exact element types, bidirectional literal context and no numeric
-defaults. It returns bool, evaluates left then right once, preserves array copy
-rules, and scans length with typed equality and early exit without allocating.
-Formatter support is syntactic only; ranges remain rejected. String/nested/pointer
-membership, conversions and iterators remain outside this slice.
+`value in array` membership is delivered for bool, rune, string, enums and supported
+fixed/native integers with exact element types, bidirectional literal context and
+no general numeric defaults. It returns bool, evaluates left then right once, uses
+readonly RHS projection with required effect snapshots, and scans with typed
+equality and early exit without allocating. Formatter support is syntactic only.
+Functions, unions, records, nested arrays and ranges are storable elements but
+have no comparisons/membership; pointer elements, conversions and general iterator
+protocols remain unsupported.
 
 Side note about mutability. A constant array cannot be modified in any way, its
 values are constant too. A mutable array can be reassigned/extanded and its

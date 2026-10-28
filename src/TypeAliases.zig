@@ -65,7 +65,7 @@ const failures = [_]Failure{
     .{ .source = "let A = Missing\nlet x: A = 1", .tag = .unknown_type, .text = "Missing" },
     .{ .source = "let A = []Missing", .tag = .unknown_type },
     .{ .source = "let A = (Missing) -> int", .tag = .unknown_type },
-    .{ .source = "let A = [][]string", .tag = .unsupported_type },
+    .{ .source = "let A = [][]void", .tag = .unsupported_type },
     .{ .source = "let mut Count = uint\nlet x: Count = 1", .tag = .not_a_type },
     .{ .source = "let Count = uint\nlet f: (Count: int) -> int = Count", .tag = .unsupported_shadowing },
     .{ .source = "let Count = uint\nlet main: () = {let Count: int = 1\n}", .tag = .unsupported_shadowing },

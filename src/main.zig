@@ -802,7 +802,7 @@ test "recursive check and errors never stop other supported files" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "a.nov", .data = "let x=1\n" });
-    try tmp.dir.writeFile(io, .{ .sub_path = "b.nov", .data = "let x = [[1]]\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b.nov", .data = "let x:[]*int\n" });
     try tmp.dir.writeFile(io, .{ .sub_path = "c.nov", .data = "let x=\n" });
     try tmp.dir.writeFile(io, .{ .sub_path = "z.nov", .data = "let z=2\n" });
     const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
@@ -916,7 +916,8 @@ test "stdin formatting buffers validation and check never emits source" {
         .{ .source = "let x = 1\n", .check = true, .valid = true },
         .{ .source = "let x=", .valid = false },
         .{ .source = "let x=[1]", .valid = true, .output = "let x = [1]\n" },
-        .{ .source = "let x=[[1]]", .valid = false },
+        .{ .source = "let x=[[1]]", .valid = true, .output = "let x = [[1]]\n" },
+        .{ .source = "let x:[]*int", .valid = false },
     };
     for (cases) |case| {
         var input = std.Io.Reader.fixed(case.source);
@@ -970,7 +971,8 @@ test "format files atomically and leave rejected input unchanged" {
         .{ .source = "let x=foo(1)\n", .valid = true, .expected = "let x = foo(1)\n" },
         .{ .source = "let f:()->void={return}\n", .valid = true, .expected = "let f: () -> void = {\n    return\n}\n" },
         .{ .source = "let x=foo([1])\n", .valid = true, .expected = "let x = foo([1])\n" },
-        .{ .source = "let x = foo([[1]])\n", .valid = false, .expected = "let x = foo([[1]])\n" },
+        .{ .source = "let x=foo([[1]])\n", .valid = true, .expected = "let x = foo([[1]])\n" },
+        .{ .source = "let x:[]*int\n", .valid = false, .expected = "let x:[]*int\n" },
         .{ .source = "let f:()->void={let mut a:[]int=[1]\na[-1]=2\na += []}\n", .valid = true, .expected = "let f: () -> void = {\n    let mut a: []int = [1]\n    a[-1] = 2\n    a += []\n}\n" },
         .{ .source = "let f = loop true {break 1}\n", .valid = true, .expected = "let f = loop true {\n    break 1\n}\n" },
         .{ .source = "let f = loop true {break :outer}\n", .valid = false, .expected = "let f = loop true {break :outer}\n" },
