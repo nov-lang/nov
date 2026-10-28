@@ -4663,6 +4663,163 @@ test "array membership compiler ownership survives every allocation failure" {
     try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{array_membership});
 }
 
+const readonly_membership_cases = [_]struct { source: []const u8, allocations: usize, output: []const u8 }{
+    .{
+        .source = "let main:()={let a:[]i16=[-3,2,7]\nloop _ in 0..4 {@println(2 in a,9 in a)}}",
+        .allocations = 1,
+        .output = "true false\ntrue false\ntrue false\ntrue false\n",
+    },
+    .{
+        .source = "let L=struct{a:[]int,b:[]int,}\nlet T=struct{leaf:L,}\nlet main:()={let t=T[.leaf=L[.a=[1],.b=[2]]]\nloop _ in 0..4 {@println(1 in t.leaf.a,3 in t.leaf.b)}}",
+        .allocations = 2,
+        .output = "true false\ntrue false\ntrue false\ntrue false\n",
+    },
+    .{
+        .source = "let L=struct{a:[]int,}\nlet main:()={let t=L[.a=[1]]\nlet r=&t\nloop _ in 0..4 {@println(1 in r.a,2 in r.a)}}",
+        .allocations = 1,
+        .output = "true false\ntrue false\ntrue false\ntrue false\n",
+    },
+    .{
+        .source = "let main:()={let a:[]u8=[]\nlet n:u8=255\n@println(n in a,n in [],true in [],'😀' in [],\"\" in [])}",
+        .allocations = 0,
+        .output = "false false false false false\n",
+    },
+    .{
+        .source = "let main:()={let n:i8=-128\n@println(n in [-128,127],true in [false,true],false in [true])}",
+        .allocations = 3,
+        .output = "true true false\n",
+    },
+    .{
+        .source = "let main:()={let a=[\"hé\"+\"\\0😀\",\"\"]\nlet r=['😀','\\0']\nlet b=[false,true]\nloop _ in 0..4 {@println(\"hé\\0😀\" in a,\"hé\" in a,'😀' in r,'x' in r,true in b)}}",
+        .allocations = 4,
+        .output = "true false true false true\ntrue false true false true\ntrue false true false true\ntrue false true false true\n",
+    },
+    .{
+        // The entire record array is detached before the index replaces it.
+        .source = "let L=struct{a:[]int,b:[]int,}\nlet main:()={let mut rows=[L[.a=[1],.b=[2]]]\nlet found=1 in rows[{rows=[L[.a=[9],.b=[8]]]\n0}].a\n@println(found,9 in rows[0].a)}",
+        .allocations = 9,
+        .output = "true true\n",
+    },
+    .{
+        // Both closures share the mutable cell. The index must use the old base.
+        .source = "let L=struct{a:[]int,}\nlet main:()={let mut rows=[L[.a=[1]]]\nlet change=(){rows=[L[.a=[9]]]}\nlet index=()->int {change()\n0}\nlet found=1 in rows[index()].a\n@println(found,9 in rows[0].a)}",
+        .allocations = 10,
+        .output = "true true\n",
+    },
+    .{
+        // A computed base must still snapshot its argument before later effects.
+        .source = "let L=struct{a:[]int,}\nlet select:(a:[]L,n:int)->L=a[n]\nlet main:()={let mut rows=[L[.a=[1]]]\nlet found=1 in select(rows,{rows=[L[.a=[9]]]\n0}).a\n@println(found,9 in rows[0].a)}",
+        .allocations = 7,
+        .output = "true true\n",
+    },
+    .{
+        .source = "let main:()={let a:[]int=[1]\nlet r=&a\nloop _ in 0..4 {@println(1 in r,2 in r)}}",
+        .allocations = 1,
+        .output = "true false\ntrue false\ntrue false\ntrue false\n",
+    },
+    .{
+        .source = "let L=struct{a:[]int,}\nlet stop:()->bool={let rows=[L[.a=[1]]]\n1 in rows[{return true}].a}\nlet main:()=@println(stop())",
+        .allocations = 4,
+        .output = "true\n",
+    },
+};
+
+test "readonly membership exact allocation counts and budgets preserve snapshots under forced GC" {
+    for (readonly_membership_cases, 0..) |case, case_index| {
+        errdefer std.debug.print("readonly membership case {d}: {s}\n", .{ case_index, case.source });
+        const program = try arrayTestProgram(case.source);
+        defer test_gpa.free(program);
+        for (0..case.allocations + 1) |budget| {
+            const prefix = try std.fmt.allocPrint(test_gpa, "#include <stdlib.h>\n#include <assert.h>\nstatic unsigned allocations, outstanding;\n" ++
+                "static void *test_malloc(size_t n) {{ if (allocations == {d}) return NULL; void *p = malloc(n); if (p) {{ ++allocations; ++outstanding; }} return p; }}\n" ++
+                "static void test_free(void *p) {{ assert(outstanding); --outstanding; free(p); }}\n" ++
+                "#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE test_free\n#define main test_main\n", .{budget});
+            defer test_gpa.free(prefix);
+            const suffix = try std.fmt.allocPrint(test_gpa, "\n#undef main\nint main(void) {{ int result = test_main(); assert(!outstanding); assert(allocations == {d}); return result; }}\n", .{case.allocations});
+            defer test_gpa.free(suffix);
+            const counted = try std.mem.concat(test_gpa, u8, &.{ prefix, program, suffix });
+            defer test_gpa.free(counted);
+            const success = budget == case.allocations;
+            for ([_][]const u8{ "-O0", "-O3" }) |mode|
+                try compileAndRunMode(counted, "typedef int nonempty_translation_unit;", if (success) 0 else 1, if (success) case.output else "", if (success) "" else "panic: GC allocation failed\n", mode);
+        }
+    }
+}
+
+test "readonly membership snapshots keep recursively independent backing" {
+    for (readonly_membership_cases[6..8]) |case| {
+        var module = try Module.init(test_gpa, "membership-backing.nov", case.source);
+        defer module.deinit();
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        try std.testing.expect(!module.hasErrors());
+        try sema.ir.verify();
+        const body = sema.ir.functions.items[0].body.?;
+        const transfers = try ArrayTransfers.init(test_gpa, &sema.ir, body);
+        defer transfers.deinit(test_gpa);
+        var library = try emit(test_gpa, &sema.ir, null);
+        defer test_gpa.free(library);
+        var checked: usize = 0;
+        for (body.instructions, 0..) |instruction, i| {
+            if (instruction.op != .array_clone) continue;
+            const ty = sema.ir.getType(instruction.ty).?;
+            if (ty != .array or sema.ir.getType(ty.array).? != .record) continue;
+            checked += 1;
+            const source = @backingInt(instruction.op.array_clone);
+            var operation = std.Io.Writer.Allocating.init(test_gpa);
+            defer operation.deinit();
+            try writeArrayValue(&sema.ir, &operation.writer, body, transfers, instruction, i);
+            var checks = std.Io.Writer.Allocating.init(test_gpa);
+            defer checks.deinit();
+            try checks.writer.writeAll(operation.written());
+            try checks.writer.print("    assert(v{d}.data != v{d}.data);\n", .{ i, source });
+            for (sema.ir.getType(ty.array).?.record.fields, 0..) |_, field|
+                try checks.writer.print("    assert(((nov_record_{d} *)v{d}.data)[0].f{d}.data != ((nov_record_{d} *)v{d}.data)[0].f{d}.data);\n", .{ @backingInt(ty.array), i, field, @backingInt(ty.array), source, field });
+            try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, library, operation.written()));
+            const replaced = try std.mem.replaceOwned(u8, test_gpa, library, operation.written(), checks.written());
+            test_gpa.free(library);
+            library = replaced;
+        }
+        try std.testing.expectEqual(@as(usize, 1), checked);
+        const prefixed = try std.mem.concat(test_gpa, u8, &.{ "#include <assert.h>\n", library });
+        defer test_gpa.free(prefixed);
+        const program = try collectingTestProgram(prefixed);
+        defer test_gpa.free(program);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode|
+            try compileAndRunMode(program, "typedef int nonempty_translation_unit;", 0, case.output, "", mode);
+    }
+}
+
+test "readonly membership orders lhs snapshot index effects and runtime OOM" {
+    const program = try arrayTestProgram(
+        \\let L=struct{a:[]int,b:[]int,}
+        \\let main:()={let mut rows=[L[.a=[1],.b=[2]]]
+        \\let found={@print("L")
+        \\1} in rows[{@print("I")
+        \\rows=[L[.a=[9],.b=[8]]]
+        \\0}].a
+        \\@println(found,9 in rows[0].a)}
+    );
+    defer test_gpa.free(program);
+    for ([_]usize{ 0, 3, 6, 9 }, [_][]const u8{ "", "L", "LI", "LItrue true\n" }) |budget, output| {
+        const prefix = try std.fmt.allocPrint(test_gpa, "#include <stdlib.h>\nstatic unsigned allocations;\n" ++
+            "static void *test_malloc(size_t n) {{ return ++allocations > {d} ? NULL : malloc(n); }}\n" ++
+            "#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n", .{budget});
+        defer test_gpa.free(prefix);
+        const c = try std.mem.concat(test_gpa, u8, &.{ prefix, program });
+        defer test_gpa.free(c);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode|
+            try compileAndRunMode(c, "typedef int nonempty_translation_unit;", if (budget == 9) 0 else 1, output, if (budget == 9) "" else "panic: GC allocation failed\n", mode);
+    }
+}
+
+test "readonly membership source free IR and every compiler allocation failure" {
+    for (readonly_membership_cases, 0..) |case, case_index| {
+        errdefer std.debug.print("readonly membership ownership case {d}: {s}\n", .{ case_index, case.source });
+        try TestAllocations.checkAllAllocationFailures(test_gpa, testCopyElisionOwnership, .{case.source});
+    }
+}
+
 const string_byte_program =
     \\let Box:(T:type)->type=struct{value:T,}
     \\let identity:(s:string)->string=s

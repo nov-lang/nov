@@ -1878,9 +1878,11 @@ constrains an array literal, including `[]`. Boolean literals provide a known
 `1 in [1, 2]` is rejected even with an expected `bool` result. The result type
 does not choose an element type.
 
-Operands evaluate once, left then right, following the existing array read/copy
-rules. Membership itself is an allocation-free linear scan of the array's
-length, using scalar value equality and stopping at the first match. It neither
+Operands evaluate once, left then right. Membership projects its RHS for a readonly
+scan rather than cloning existing array storage, including array-valued fields and
+permitted readonly borrows. Required snapshots inside effectful computed bases are
+preserved; constructing the RHS can still allocate. The scan itself is an
+allocation-free linear traversal using scalar equality, stopping at the first match. It neither
 mutates nor appends. String elements compare exact bytes, including NUL. Strings
 as containers, nested arrays, records, pointers, ranges and iterators are unsupported.
 

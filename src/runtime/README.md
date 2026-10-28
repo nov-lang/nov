@@ -186,7 +186,10 @@ Eager recursive backing copies are a major performance concern, not an optimized
 ownership strategy. Reads, snapshots and updates may copy entire reachable array
 contents repeatedly and keep temporary backing rooted until function exit/reuse.
 Targeted fresh-value and projection elision is implemented and allocation-count
-regressions cover it at O0/O3 with forced GC. The backend additionally transfers
+regressions cover it at O0/O3 with forced GC. Membership projects its RHS without
+cloning existing backing; computed-base effects retain their internal snapshots,
+and managed inputs stay rooted. Contextual literals/construction may still allocate.
+The backend additionally transfers
 proven-detached single-use elements/bases into insertion/replacement, and append
 retains its freshly allocated outer buffer while recursively copying only unproven
 input portions. The proof counts all IR references and checks recursive freshness.

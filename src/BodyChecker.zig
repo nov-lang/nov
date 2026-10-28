@@ -1173,11 +1173,11 @@ const Context = struct {
         }
     }
 
-    fn projection(self: *Context, node: Ast.Node.Index, depth: usize) Error!?Ir.TypeId {
+    fn projection(self: *Context, node: Ast.Node.Index, expected: ?Known, depth: usize) Error!?Ir.TypeId {
         const previous = self.projection_base;
         self.projection_base = node;
         defer self.projection_base = previous;
-        return self.expression(node, null, depth);
+        return self.expression(node, expected, depth);
     }
 
     // Be conservative: an effectful index must see a recursively detached base
@@ -2234,7 +2234,7 @@ const Context = struct {
                 const previous_base = self.borrow_base;
                 self.borrow_base = if (ast.nodes.items(.tag)[node] == .field_access) data.lhs else null;
                 const project = ast.nodes.items(.tag)[node] == .field_access or self.inertIndex(data.rhs);
-                const base = (if (project) try self.projection(data.lhs, depth + 1) else try self.expression(data.lhs, null, depth + 1)) orelse {
+                const base = (if (project) try self.projection(data.lhs, null, depth + 1) else try self.expression(data.lhs, null, depth + 1)) orelse {
                     self.borrow_base = previous_base;
                     return null;
                 };
@@ -2513,7 +2513,9 @@ const Context = struct {
                 if (self.ir.getType(element.ty).? == .record) return self.fail(.operator_not_supported, node, element.annotation);
                 if (try self.expression(data.lhs, element, depth + 1) == null) return null;
                 const array: Known = .{ .ty = try self.ir.internType(.{ .array = element.ty }), .annotation = element.annotation };
-                if (try self.expression(data.rhs, array, depth + 1) == null) return null;
+                // The scan cannot mutate or retain its RHS. Only project the final
+                // read; computed bases still snapshot before intervening effects.
+                if (try self.projection(data.rhs, array, depth + 1) == null) return null;
                 return self.fit(try self.ir.internType(.boolean), expected, node);
             },
             .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal => {
@@ -3344,6 +3346,8 @@ test "membership rejects defaults widening nonscalar elements and nonboolean res
         .{ .source = "let f: () -> bool = {} in []", .tag = .operator_not_supported },
         .{ .source = "let f: (a: []int) -> bool = missing in a", .tag = .unknown_name },
         .{ .source = "let f: (n: int) -> bool = n in missing", .tag = .unknown_name },
+        .{ .source = "let f: () = {let mut a:[]int=[1]\nlet r=&a\n@println(1 in a)\nr[0]=2}", .tag = .borrow_conflict },
+        .{ .source = "let f: () = {let mut a:[]int=[1]\nloop &x in a {@println(1 in a)\nx=2}}", .tag = .borrow_conflict },
     }) |case| {
         var module = try Module.init(std.testing.allocator, "membership-error.nov", case.source);
         defer module.deinit();

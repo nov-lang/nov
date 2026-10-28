@@ -9,7 +9,10 @@ union record payloads; immutable strings share. These recursive copies are a maj
 performance concern, especially repeated snapshots and updates. Targeted copy
 elision now transfers fresh temporaries rather than recloning at binding/call/return
 boundaries; readonly field/simple-index projections avoid enclosing aggregate copies.
-Effectful indices retain snapshots. Allocation-count regressions cover these paths.
+Effectful indices retain snapshots. Readonly membership also projects the RHS
+without cloning existing arrays/fields/borrowed values; contextual literals still
+work, and effectful computed bases retain required internal snapshots. Exact
+allocation-count regressions cover these paths.
 Insertion/replacement now adopt proven-detached single-use temporaries. Append
 keeps its fresh outer buffer and recursively copies only unproven input portions.
 All IR references are counted. Indexed compounds may transfer a detached snapshot
