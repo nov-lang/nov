@@ -5390,6 +5390,232 @@ test "iteration arrays strings scoped references snapshots Unicode NUL records a
     }
 }
 
+const iteration_source_cases = [_]struct { source: []const u8, allocations: usize, output: []const u8 }{
+    .{
+        .source = "let main:()={let a:[]int=[1,2,3]\nloop _ in 0..3 {loop x in a {@print(x)}}}",
+        .allocations = 1,
+        .output = "123123123",
+    },
+    .{
+        .source = "let main:()={let mut a:[]int=[1,2,3]\nloop x in a {if x==2 {continue}\n@print(x,a[0])}}",
+        .allocations = 1,
+        .output = "1 13 1",
+    },
+    .{
+        .source = "let main:()={let a:[]int=[]\n@println(loop x in a {break x} else {7})}",
+        .allocations = 0,
+        .output = "7\n",
+    },
+    .{
+        .source = "let scan:(a:[]int)={loop x in a {@print(x)}}\nlet main:()=scan([1,2])",
+        .allocations = 1,
+        .output = "12",
+    },
+    .{
+        // A later loan forces a parameter slot before the loop is lowered.
+        .source = "let scan:(a:[]int)={loop x in a {@print(x)}\nlet r=&a\n@print(r.len)}\nlet main:()=scan([1,2])",
+        .allocations = 1,
+        .output = "122",
+    },
+    .{
+        .source = "let scan:(a:[]int)={let mut b=a\nloop x in b {@print(x)}\n@print(a[0],b[0])}\nlet main:()=scan([1,2])",
+        .allocations = 2,
+        .output = "121 1",
+    },
+    .{
+        .source = "let R=struct{n:int,a:[]int,b:[]int,}\nlet main:()={let rows=[R[.n=1,.a=[2],.b=[3]]]\nloop _ in 0..3 {loop r in rows {@print(r.n)}}}",
+        .allocations = 3,
+        .output = "111",
+    },
+    .{
+        // Borrowed and computed bases must still take their ordinary snapshot.
+        .source = "let main:()={let a:[]int=[1,2]\nlet r=&a\nloop x in r {@print(x)}}",
+        .allocations = 2,
+        .output = "12",
+    },
+    .{
+        .source = "let main:()={let a:[]int=[1,2]\nloop x in {a} {@print(x)}}",
+        .allocations = 2,
+        .output = "12",
+    },
+};
+
+test "iteration source exact allocation counts budgets and forced GC" {
+    for (iteration_source_cases, 0..) |case, case_index| {
+        errdefer std.debug.print("iteration source case {d}: {s}\n", .{ case_index, case.source });
+        const program = try arrayTestProgram(case.source);
+        defer test_gpa.free(program);
+        for (0..case.allocations + 1) |budget| {
+            const prefix = try std.fmt.allocPrint(test_gpa, "#include <stdlib.h>\n#include <assert.h>\nstatic unsigned allocations, outstanding;\n" ++
+                "static void *test_malloc(size_t n) {{ if (allocations == {d}) return NULL; void *p = malloc(n); if (p) {{ ++allocations; ++outstanding; }} return p; }}\n" ++
+                "static void test_free(void *p) {{ assert(outstanding); --outstanding; free(p); }}\n" ++
+                "#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE test_free\n#define main test_main\n", .{budget});
+            defer test_gpa.free(prefix);
+            const suffix = try std.fmt.allocPrint(test_gpa, "\n#undef main\nint main(void) {{ int result = test_main(); assert(!outstanding); assert(allocations == {d}); return result; }}\n", .{case.allocations});
+            defer test_gpa.free(suffix);
+            const counted = try std.mem.concat(test_gpa, u8, &.{ prefix, program, suffix });
+            defer test_gpa.free(counted);
+            const success = budget == case.allocations;
+            for ([_][]const u8{ "-O0", "-O3" }) |mode|
+                try compileAndRunMode(counted, "typedef int nonempty_translation_unit;", if (success) 0 else 1, if (success) case.output else "", if (success) "" else "panic: GC allocation failed\n", mode);
+        }
+    }
+}
+
+const iteration_source_values =
+    \\let R=struct{a:[]int,}
+    \\let change:(r:R)->R={let mut copy=r
+    \\    copy.a[0]=8
+    \\    copy}
+    \\let make:()->[]R={@print("S")
+    \\    [R[.a=[4]]]}
+    \\let early:()->int=loop x in {return 7} {}
+    \\let main:()={let mut rows=[R[.a=[1]],R[.a=[2]]]
+    \\    let mut saved=R[.a=[]]
+    \\    let mut stored=R[.a=[]]
+    \\    let mut captured:()->int=()->int {0}
+    \\    loop r in rows {saved=change(r)
+    \\        stored=r
+    \\        captured=()->int {r.a[0]}
+    \\        @println(r.a[0],saved.a[0])}
+    \\    rows[1]=R[.a=[9]]
+    \\    saved.a[0]=6
+    \\    stored.a[0]=5
+    \\    @println(rows[0].a[0],rows[1].a[0],saved.a[0],stored.a[0],captured())
+    \\    loop r in make() {@print(r.a[0])}
+    \\    @println(early())
+    \\    let a:[]int=[1,2,3]
+    \\    @println(loop x in a {if x==2 {break x}} else {9})
+    \\    let exhausted:int=loop x in a {loop y in a {if y==1 {continue}
+    \\        if y==2 {break}}
+    \\        if x==3 {continue}} else {5}
+    \\    @println(exhausted)
+    \\}
+;
+const iteration_source_values_output = "1 8\n2 8\n1 9 6 5 2\nS47\n2\n5\n";
+
+test "iteration source copied records passed stored captured controls and source free GC" {
+    var sema = blk: {
+        var module = try Module.init(test_gpa, "iteration-source.nov", iteration_source_values);
+        defer module.deinit();
+        var result = try Lowering.lower(&module);
+        errdefer result.deinit();
+        if (module.hasErrors()) for (module.diagnostics.items) |diagnostic| {
+            std.debug.print("iteration source diagnostic: {any}\n", .{diagnostic});
+        };
+        try std.testing.expect(!module.hasErrors());
+        break :blk result;
+    };
+    defer sema.deinit();
+    try sema.ir.verify();
+    var library = try emit(test_gpa, &sema.ir, null);
+    defer test_gpa.free(library);
+    var checked: usize = 0;
+    for (sema.ir.functions.items) |function| {
+        if (!std.mem.eql(u8, function.name, "main")) continue;
+        const body = function.body.?;
+        for (body.instructions, 0..) |instruction, i| {
+            if (instruction.op != .array_clone or sema.ir.getType(instruction.ty).? != .record) continue;
+            const source = @backingInt(instruction.op.array_clone);
+            if (body.instructions[source].op != .array_index) continue;
+            // A passed, stored or captured item must recursively detach even
+            // though its loop source descriptor now shares the owner backing.
+            const operation = try std.fmt.allocPrint(test_gpa, "    v{d} = nov_copy_{d}(v{d});\n", .{ i, @backingInt(instruction.ty), source });
+            defer test_gpa.free(operation);
+            const checks = try std.fmt.allocPrint(test_gpa, "{s}    assert(v{d}.f0.data != v{d}.f0.data);\n", .{ operation, i, source });
+            defer test_gpa.free(checks);
+            try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, library, operation));
+            const replaced = try std.mem.replaceOwned(u8, test_gpa, library, operation, checks);
+            test_gpa.free(library);
+            library = replaced;
+            checked += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 3), checked);
+    const prefixed = try std.mem.concat(test_gpa, u8, &.{ "#include <assert.h>\n", library });
+    defer test_gpa.free(prefixed);
+    const program = try collectingTestProgram(prefixed);
+    defer test_gpa.free(program);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(program, "typedef int nonempty_translation_unit;", 0, iteration_source_values_output, "", mode);
+}
+
+test "iteration call protection permits disjoint unboxed methods and completed loop calls" {
+    const source =
+        \\let R=struct{n:int=0,
+        \\    let invoke:(self:R,cb:())={let run=(){cb()}
+        \\        run()}
+        \\    let toString:(self:R)->string="R"
+        \\}
+        \\let G:(T:type)->type=struct{value:T,
+        \\    let invoke:(self:@This(),cb:())=cb()
+        \\}
+        \\let main:()={let mut a:[]int=[1,2,3]
+        \\    let mut b:[]int=[0]
+        \\    let changeB=(){let loan=&b[0]
+        \\        loan+=1}
+        \\    let r=R[]
+        \\    let g=G(int)[.value=0]
+        \\    loop x in a {r.invoke(changeB)
+        \\        g.invoke((){@print(x)})
+        \\        let text="{r}"
+        \\        @print(text)}
+        \\    if b[0]!=3 {@panic("disjoint owner")}
+        \\    let mut c:[]int=[4,5,6]
+        \\    let changeC=(){let loan=&c[1]
+        \\        loan=9}
+        \\    loop x in c {@print(x)} else {r.invoke(changeC)}
+        \\    @print(c[1])
+        \\    loop _ in c {break} else {r.invoke(changeC)}
+        \\    r.invoke(changeC)
+        \\    if c[1]!=9 {@panic("completed reservation")}
+        \\}
+    ;
+    const program = try arrayTestProgram(source);
+    defer test_gpa.free(program);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(program, "typedef int nonempty_translation_unit;", 0, "1R2R3R4569", "", mode);
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testCopyElisionOwnership, .{source});
+}
+
+test "iteration call protection permits late captures after completed loops and computed snapshots" {
+    const source =
+        \\let after:()={let mut a:[]int=[1,2,3]
+        \\    loop x in a {@print(x)}
+        \\    let f=(){let loan=&a[2]
+        \\        loan=9}
+        \\    f()
+        \\    @print(a[2])}
+        \\let main:()={after()
+        \\    let run=(){let mut a:[]int=[1,2,3]
+        \\        loop x in a {@print(x)}
+        \\        let f=(){let loan=&a[2]
+        \\            loan=9}
+        \\        f()
+        \\        @print(a[2])}
+        \\    run()
+        \\    let mut a:[]int=[1,2,3]
+        \\    let mut f:()=(){}
+        \\    loop x in {a} {f()
+        \\        f=(){let loan=&a[2]
+        \\            loan=9}
+        \\        @print(x)}
+        \\    @print(a[2])
+        \\}
+    ;
+    const program = try arrayTestProgram(source);
+    defer test_gpa.free(program);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(program, "typedef int nonempty_translation_unit;", 0, "123912391239", "", mode);
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testCopyElisionOwnership, .{source});
+}
+
+test "iteration source source free IR survives every compiler allocation failure" {
+    for (iteration_source_cases) |case|
+        try TestAllocations.checkAllAllocationFailures(test_gpa, testCopyElisionOwnership, .{case.source});
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testCopyElisionOwnership, .{iteration_source_values});
+}
+
 test "iteration forward string decoder is linear allocation free and checks malformed input" {
     const library = try emitSource("let f:(s:string)=loop r in s {@print(r)}", null);
     defer test_gpa.free(library);

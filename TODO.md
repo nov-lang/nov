@@ -568,7 +568,8 @@ covered. See README and examples/closures.nov.
 Borrowed binding captures, recursive local definitions, inferred parameter/result
 types, function fields/array elements and C callback ABI remain deferred. Calls
 while a shared captured cell is borrowed are conservatively rejected, as are
-calls during iteration over an already captured mutable array; precise effect
+calls during iteration over a captured mutable array (all call paths, checked
+against final capture state, including captures discovered later); precise effect
 analysis and concurrent shared-state rules remain future work.
 
 Historical alternatives below are not executable contracts. Explicit C++-style
@@ -868,7 +869,12 @@ membership containers. See README for syntax.
 Array/string iteration is implemented:
 `loop item in items` evaluates the iterable once. Array items are immutable
 copies using normal element-copy rules; source array mutation and new conflicting
-loans are statically rejected. Strings yield scalar `rune` values using a forward
+loans are statically rejected. Direct unborrowed local arrays now retain rooted
+readonly descriptors without deep-copying their source backing; yielded values
+retain normal copy semantics. Computed/borrowed sources keep snapshot evaluation.
+All calls (methods/conversions/pipes included) are checked against finalized boxing
+state, so later captures cannot bypass protection on loop backedges.
+Strings yield scalar `rune` values using a forward
 UTF-8 cursor, O(n) for the full traversal; rebinding the immutable string source
 is safe and cannot change the captured traversal.
 

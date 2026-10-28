@@ -204,6 +204,15 @@ designs**. Any optimization must preserve observable independence,
 static borrow exclusivity and precise GC/root/OOM safety. No aliasing or COW behavior
 is delivered by this implementation. See `examples/array-fields.nov`.
 
+Ordinary iteration over a direct unborrowed local array retains a rooted readonly
+backing descriptor, avoiding a recursive source clone. Per-element ordinary copies
+still detach when passed, stored or captured. Computed and borrowed sources retain
+snapshot evaluation. The checker prohibits source mutation/conflicting loans and
+centralizes call protection (including methods/conversions/pipes). Pending checks
+retain stable owner slot IDs and validate final boxing state after top-level and
+child bodies are lowered; captures discovered later cannot invalidate earlier
+call checks across loop backedges. Without effect summaries this remains conservative.
+
 ## Generated scalar arrays
 
 The approved first array slice uses `nov_array { void *data; uintptr_t len, cap; }`.

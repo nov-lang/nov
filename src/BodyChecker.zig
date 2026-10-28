@@ -70,11 +70,23 @@ fn tableIndex(module: *const Module, id: Module.DeclId) usize {
 }
 
 const Emitter = struct {
+    const IterationCall = struct { owner_slot: Ir.ValueId, call_span: Ir.Span, origin: Ir.Span };
+
     allocator: std.mem.Allocator,
     constants: []const ?Ir.ConstId,
     functions: []const ?Ir.FunctionId,
     instructions: std.ArrayList(Ir.Instruction) = .empty,
     values: std.AutoHashMapUnmanaged(Ast.Node.Index, Ir.ValueId) = .empty,
+    iteration_calls: std.ArrayList(IterationCall) = .empty,
+
+    fn validateIterationCalls(self: *const Emitter, module: *Module) Error!bool {
+        for (self.iteration_calls.items) |call| {
+            if (!self.instructions.items[@backingInt(call.owner_slot)].boxed) continue;
+            try module.diagnostics.append(module.allocator, .{ .tag = .borrow_conflict, .span = call.call_span, .related = call.origin });
+            return false;
+        }
+        return true;
+    }
 
     fn append(self: *Emitter, ty: Ir.TypeId, span: Ir.Span, op: Ir.Operation) Error!Ir.ValueId {
         if (self.instructions.items.len == std.math.maxInt(u32)) return error.TooManyEntries;
@@ -168,6 +180,9 @@ fn checkInner(module: *Module, ir: *Ir, types: []const ?Ir.TypeId, id: Module.De
         return false;
     }
     if (checked and !context.terminated) try context.copyNode(function.body, ty.function.result);
+    if (checked) if (emitter) |output| {
+        if (!try output.validateIterationCalls(module)) return false;
+    };
     return checked;
 }
 
@@ -307,6 +322,7 @@ const Context = struct {
         if (try child.expression(function.body, .{ .ty = signature.result }, depth + 1) == null) return null;
         if (!child.terminated) try child.copyNode(function.body, signature.result);
         if (self.emitter) |outer| {
+            if (!try emitter.validateIterationCalls(self.module)) return null;
             const name = try std.fmt.allocPrint(arena.allocator(), "$closure{d}", .{self.ir.functions.items.len});
             const id = try self.ir.addFunction(name, ty, self.irSpan(node));
             const captures = try self.ir.allocator.dupe(Ir.Capture, child.captures.items);
@@ -800,6 +816,32 @@ const Context = struct {
         return null;
     }
 
+    fn emitCall(self: *Context, node: Ast.Node.Index, ty: Ir.TypeId, call: @FieldType(Ir.Operation, "call")) Error!bool {
+        const emitter = self.emitter.?;
+        // Any call can invoke a closure that mutates a shared owner cell,
+        // including receiver methods and implicit conversions. A later capture
+        // can box the owner and feed an earlier call through a loop backedge:
+        // retain checks in the emitter arena until final boxing is known.
+        var reservation = self.reservation;
+        while (reservation) |current| : (reservation = current.parent) {
+            if (!current.reads_allowed) continue;
+            var bindings = self.bindings.valueIterator();
+            while (bindings.next()) |binding| {
+                if (!std.meta.eql(binding.name_span, current.owner)) continue;
+                if (binding.slot) |slot| {
+                    if (emitter.instructions.items[@backingInt(slot)].boxed) {
+                        _ = try self.fail(.borrow_conflict, node, current.origin);
+                        return false;
+                    }
+                    try emitter.iteration_calls.append(emitter.allocator, .{ .owner_slot = slot, .call_span = self.irSpan(node), .origin = current.origin });
+                }
+            }
+        }
+        const value = try emitter.append(ty, self.irSpan(node), .{ .call = call });
+        try emitter.values.put(emitter.allocator, node, value);
+        return true;
+    }
+
     fn convertPrintable(self: *Context, node: Ast.Node.Index, ty: Ir.TypeId) Error!bool {
         const record = self.ir.getType(ty).?;
         if (record == .boolean or record == .integer or record == .string or record == .rune) return true;
@@ -824,8 +866,7 @@ const Context = struct {
             const callee = try emitter.append(signature_id, self.irSpan(node), .{ .function_ref = emitter.functions[@backingInt(method)].? });
             const args = try emitter.allocator.alloc(Ir.ValueId, 1);
             args[0] = try emitter.value(node);
-            const value = try emitter.append(signature.function.result, self.irSpan(node), .{ .call = .{ .callee = callee, .args = args } });
-            try emitter.values.put(emitter.allocator, node, value);
+            if (!try self.emitCall(node, signature.function.result, .{ .callee = callee, .args = args })) return false;
         }
         return true;
     }
@@ -1341,23 +1382,8 @@ const Context = struct {
             },
         };
         if (op == .call) {
-            // Calls may mutate shared captures without naming the owner here.
-            // Until effect summaries exist, protect captured iteration sources
-            // even though ordinary iteration itself traverses a detached copy.
-            var reservation = self.reservation;
-            while (reservation) |current| : (reservation = current.parent) {
-                if (!current.reads_allowed) continue;
-                var bindings = self.bindings.valueIterator();
-                while (bindings.next()) |binding| {
-                    if (!std.meta.eql(binding.name_span, current.owner)) continue;
-                    if (binding.slot) |slot| if (emitter.instructions.items[@backingInt(slot)].boxed) {
-                        _ = try self.fail(.borrow_conflict, node, current.origin);
-                        return false;
-                    };
-                }
-            }
-        }
-        try emitter.record(node, ty, self.irSpan(node), op);
+            if (!try self.emitCall(node, ty, op.call)) return false;
+        } else try emitter.record(node, ty, self.irSpan(node), op);
         // Storage reads snapshot immediately; projection bases only borrow the
         // aggregate until its selected value is read, without intervening effects.
         if (tag == .identifier or tag == .field_access or tag == .array_access) try self.copyRead(node, ty);
@@ -1990,7 +2016,18 @@ const Context = struct {
             // A loan selects the live owner storage, never an ordinary array clone.
             if (self.emitter) |emitter| try emitter.record(loop.source, binding.known.ty, self.irSpan(loop.source), .{ .local_load = binding.slot.? });
             break :reference binding.known.ty;
-        } else (try self.expression(loop.source, null, depth + 1)) orelse return null;
+        } else ordinary: {
+            // The body reservation prevents mutation and conflicting loans of a
+            // direct owner. Keep its rooted descriptor, not a recursive snapshot.
+            // Computed sources and borrowed bindings retain ordinary evaluation.
+            if (ast.nodes.items(.tag)[loop.source] == .identifier) {
+                if (self.lookupBinding(ast.tokenSlice(ast.nodes.items(.main_token)[loop.source]))) |binding| {
+                    if (!binding.borrowed and self.ir.getType(binding.known.ty).? == .array)
+                        break :ordinary (try self.projection(loop.source, null, depth + 1)) orelse return null;
+                }
+            }
+            break :ordinary (try self.expression(loop.source, null, depth + 1)) orelse return null;
+        };
         if (self.terminated) return if (expected) |want| want.ty else unit;
         const source = self.ir.getType(source_type).?;
         if (source != .range and source != .array and source != .string) return self.fail(.unsupported_iteration, loop.source, null);
@@ -2643,7 +2680,7 @@ const Context = struct {
                                 const args = try emitter.allocator.alloc(Ir.ValueId, function.params.len);
                                 args[0] = try emitter.value(field.lhs);
                                 for (call.ast.args, args[1..]) |arg, *value| value.* = try emitter.value(arg);
-                                try emitter.record(node, function.result, self.irSpan(node), .{ .call = .{ .callee = callee, .args = args, .noreturn = is_noreturn } });
+                                if (!try self.emitCall(node, function.result, .{ .callee = callee, .args = args, .noreturn = is_noreturn })) return null;
                                 if (is_noreturn) self.terminal = try emitter.value(node);
                             }
                             self.terminated = is_noreturn;
@@ -4874,6 +4911,13 @@ test "iteration validates copies scoped loans source protection and unsupported 
         .{ .body = "let mut a:[]int=[1]\nloop &x in a {let copy=x\n@println(copy)}\nlet r=&a[0]\nr=3" },
         .{ .body = "let mut a:[]int=[1]\nloop &x in a {x+=1\n@println(a)}", .tag = .borrow_conflict },
         .{ .body = "loop x in [true] {break true}", .tag = .conditional_value_break },
+        .{ .body = "let mut a:[]int=[1]\nloop x in a {let r=&a\n@println(r)}", .tag = .borrow_conflict },
+        .{ .body = "let mut a:[]int=[1]\nlet mutate=(){a[0]=2}\nloop x in a {mutate()}", .tag = .borrow_conflict },
+        .{ .body = "let mut a:[]int=[1]\nloop x in a {let mutate=(){a=[2]}\nmutate()}", .tag = .borrow_conflict },
+        .{ .body = "let mut a:[]int=[1]\nlet mutate=(){a+=[2]}\nlet hidden=(){mutate()}\nloop x in a {hidden()}", .tag = .borrow_conflict },
+        .{ .body = "let mut a:[]int=[1]\nlet r=&a[0]\nloop x in a {@println(x)}\nr=2", .tag = .borrow_conflict },
+        .{ .body = "let mut a:[]int=[1]\nlet b=a\nloop x in a {let mut copy=b\ncopy[0]=2\n@println(a[0],x)}" },
+        .{ .body = "let a:[]int=[1]\nloop x in a {let read=()->int {a[0]}\n@println(read(),x)}" },
     };
     for (cases) |case| {
         const source = try std.fmt.allocPrint(std.testing.allocator, "let f:()={{\n{s}\n}}", .{case.body});
@@ -4894,6 +4938,130 @@ test "iteration validates copies scoped loans source protection and unsupported 
             try sema.ir.verify();
         }
     }
+}
+
+const iteration_call_prelude =
+    \\let R=struct{n:int=0,
+    \\    let invoke:(self:R,cb:())=cb()
+    \\    let nested:(self:R,cb:())={let run=(){cb()}
+    \\        run()}
+    \\    let toString:(self:R)->string="R"
+    \\    @[noreturn]
+    \\    let stop:(self:R,cb:())={cb()
+    \\        @panic("stop")}
+    \\}
+    \\let G:(T:type)->type=struct{value:T,
+    \\    let invoke:(self:@This(),cb:())={let run=(){cb()}
+    \\        run()}
+    \\}
+    \\let Alias=R
+    \\let invoke:(cb:())=cb()
+    \\let main:()={let mut a:[]int=[1,2,3]
+    \\    let mutate=(){let loan=&a[1]
+    \\        loan=9}
+    \\    let r=R[]
+    \\    let g=G(int)[.value=0]
+    \\
+;
+
+fn testIterationCallProtection(allocator: std.mem.Allocator, source: []const u8) !void {
+    var module = try Module.init(allocator, "iteration-call.nov", source);
+    defer module.deinit();
+    try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
+    var sema = try Lowering.lower(&module);
+    defer sema.deinit();
+    errdefer std.debug.print("iteration call fixture: {s}\ndiagnostics: {any}\n", .{ source, module.diagnostics.items });
+    try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+    try std.testing.expectEqual(Module.Diagnostic.Tag.borrow_conflict, module.diagnostics.items[0].tag);
+    try std.testing.expect(module.diagnostics.items[0].related != null);
+    try std.testing.expect(!sema.lowering_complete);
+}
+
+test "iteration call protection covers every call emission path and allocation failure" {
+    for ([_][]const u8{
+        "r.invoke(mutate)",
+        "r.nested(mutate)",
+        "g.invoke(mutate)",
+        "R.invoke(r,mutate)",
+        "Alias.invoke(r,mutate)",
+        "G(int).invoke(g,mutate)",
+        "mutate()",
+        "mutate |> invoke",
+        "@print(r)",
+        "let text=\"{r}\"",
+        "r.stop(mutate)",
+        "R.stop(r,mutate)",
+        "let f=Alias.invoke\nf(r,mutate)",
+        "let f=G(int).invoke\nf(g,mutate)",
+        "loop y in [true] {r.invoke(mutate)}",
+    }) |call| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "{s}loop x in a {{{s}\n}}\n}}", .{ iteration_call_prelude, call });
+        defer std.testing.allocator.free(source);
+        try testIterationCallProtection(std.testing.allocator, source);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testIterationCallProtection, .{source});
+    }
+}
+
+test "iteration call protection uses final boxing across backedges and child bodies" {
+    const prelude =
+        \\let R=struct{let invoke:(self:R,cb:())={let run=(){cb()}
+        \\    run()}
+        \\    let toString:(self:R)->string="R"
+        \\}
+        \\let G:(T:type)->type=struct{value:T,
+        \\    let invoke:(self:@This(),cb:())=cb()
+        \\}
+        \\let invoke:(cb:())=cb()
+        \\
+    ;
+    for ([_]struct { call: []const u8, capture: []const u8 }{
+        .{ .call = "f()", .capture = "f=(){let loan=&a[2]\nloan=9}" },
+        .{ .call = "r.invoke(f)", .capture = "f=(){let loan=&a[2]\nloan=9}" },
+        .{ .call = "g.invoke(f)", .capture = "f=(){let loan=&a[2]\nloan=9}" },
+        .{ .call = "f |> invoke", .capture = "f=(){let loan=&a[2]\nloan=9}" },
+        .{ .call = "let call=R.invoke\ncall(r,f)", .capture = "f=(){let loan=&a[2]\nloan=9}" },
+        .{ .call = "loop _ in 0..1 {r.invoke(f)}", .capture = "loop _ in 0..1 {f=(){let loan=&a[2]\nloan=9}}" },
+        .{ .call = "f()", .capture = "f=(){let change=(){let loan=&a[2]\nloan=9}\nchange()}" },
+        .{ .call = "@print(r)", .capture = "f=(){let loan=&a[2]\nloan=9}" },
+        .{ .call = "let text=\"{r}\"", .capture = "f=(){let loan=&a[2]\nloan=9}" },
+    }) |case| {
+        const body = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "let mut a:[]int=[1,2,3]\nlet mut f:()=(){{}}\nlet r=R[]\nlet g=G(int)[.value=0]\nloop x in a {{{s}\n{s}\n@print(x)}}",
+            .{ case.call, case.capture },
+        );
+        defer std.testing.allocator.free(body);
+        for ([_]bool{ false, true }) |child| {
+            const source = if (child)
+                try std.fmt.allocPrint(std.testing.allocator, "{s}let main:()={{let run=(){{{s}\n}}\nrun()}}", .{ prelude, body })
+            else
+                try std.fmt.allocPrint(std.testing.allocator, "{s}let main:()={{{s}\n}}", .{ prelude, body });
+            defer std.testing.allocator.free(source);
+            try testIterationCallProtection(std.testing.allocator, source);
+            try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testIterationCallProtection, .{source});
+        }
+    }
+}
+
+test "iteration call protection retains spans and slots after loop scope restoration" {
+    const source =
+        \\let main:()={let mut a:[]int=[1,2,3]
+        \\    let mut f:()=(){}
+        \\    loop _ in 0..2 {loop x in a {f()
+        \\        @print(x)}
+        \\        f=(){let loan=&a[2]
+        \\            loan=9}}
+        \\}
+    ;
+    try testIterationCallProtection(std.testing.allocator, source);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testIterationCallProtection, .{source});
+    var module = try Module.init(std.testing.allocator, "iteration-call-span.nov", source);
+    defer module.deinit();
+    var sema = try Lowering.lower(&module);
+    defer sema.deinit();
+    const diagnostic = module.diagnostics.items[0];
+    try std.testing.expectEqualStrings("f()", module.sourceSlice(diagnostic.span).?);
+    try std.testing.expect(std.mem.startsWith(u8, module.sourceSlice(diagnostic.related.?).?, "loop x in a"));
 }
 
 test "reusable range values preserve exact inference and reject unsupported value uses" {

@@ -640,8 +640,10 @@ Captured mutable cells are shared state, **not** exclusive scoped `&local` loans
 Borrowed bindings cannot be captured. Scoped borrows of captured values remain
 possible inside a closure, but calls while a loan of shared captured storage is
 live are conservatively rejected: the callee could access the same cell. Calls
-are also rejected during ordinary iteration over a mutable array already captured
-by a closure. These restrictions await interprocedural effect analysis.
+are also rejected during ordinary iteration over a mutable array captured by a
+closure. This covers methods, pipes and implicit conversions, and uses finalized
+capture information: even a capture discovered later can make an earlier loop call
+unsafe on a backedge. These conservative restrictions await effect analysis.
 
 Functions may be returned, passed, assigned, and selected by control flow using
 exact existing function types. Recursive local definitions, escaping reference
@@ -1768,7 +1770,10 @@ let main: () -> void = {
 `loop item in items { ... }` evaluates the iterable expression once. For arrays,
 `item` is an immutable value copied with the normal element-copy rules; it is not
 an alias into the source. Mutation of the source array and new conflicting loans
-are statically rejected during iteration. For strings, `item` is a Unicode scalar
+are statically rejected during iteration. A direct unborrowed local-array source
+retains a rooted readonly descriptor instead of deep-copying the whole backing;
+yielded values still copy normally when passed, stored or captured. Computed and
+borrowed sources keep their existing snapshot evaluation. For strings, `item` is a Unicode scalar
 `rune`, not a byte or grapheme. A forward UTF-8 cursor makes the whole traversal
 O(n) in the byte length, rather than repeatedly scanning from the start. The
 immutable string value is captured once, so rebinding its source local is safe
