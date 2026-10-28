@@ -652,9 +652,9 @@ semantics are introduced. See [`examples/closures.nov`](examples/closures.nov).
 
 ### Inferred generic functions (bounded executable subset)
 
-Named generic functions support direct calls with backtick type variables in their
-signatures. A backtick marks an inferred type, not a runtime or explicit
-compile-time argument:
+Named generic functions support direct calls and contextual specialization as
+function values, using backtick type variables in their signatures. A backtick
+marks an inferred type, not a runtime or explicit compile-time argument:
 
 ```nov
 let first: (items: []`T) -> `T = items[0]
@@ -678,6 +678,34 @@ functions with function-typed parameters. Top-level functions, imported/public
 aliases, namespace static functions and generic-container static/sibling methods
 support direct calls; aliases share canonical specializations.
 
+A named generic function also specializes as a value when an exact concrete
+function type is expected, using existing syntax:
+
+```nov
+let identity: (x: `T) -> `T = x
+let apply: (f: (`T) -> `U, x: `T) -> `U = f(x)
+
+let callback: (uint) -> uint = identity
+let cast = @as((uint) -> uint, identity)
+let answer = apply(identity, @as(uint, 42)) ; uint from the other argument
+let contextual: uint = apply(identity, 42) ; expected result constrains the callback
+```
+
+Callback inference is bidirectional: it combines the callback signature, other
+arguments, expected result and supported body constraints until the signature is
+concrete. Specialization produces an ordinary function reference to the demanded
+canonical specialization, not a runtime-polymorphic or unspecialized function
+value. Inference does not duplicate runtime evaluation; callees and arguments
+retain their existing once-only evaluation order. Typed assignments, function
+results, branches and arrays can also supply an exact function-type context.
+Aliases, imports/public reexports, namespace static functions and generic-container
+static methods follow the same canonicalization and existing visibility rules;
+contextual specialization does not expose private members.
+
+Without enough context, `let callback = identity` and `apply(identity, 42)` are
+ambiguous. Conflicting signatures are errors; no implicit conversion or numeric
+default is introduced. No new parser or explicit specialization syntax is needed.
+
 Body inference is deliberately bounded. It gathers constraints from parameter/local
 reads and explicitly typed globals, string/rune/bool literals, boolean operations,
 exact operand relationships for arithmetic/bitwise/comparison operations, array
@@ -696,10 +724,9 @@ result to `void`. This is internal control-flow tracking, not a new source type.
 Ordinary closures inside a generic body can capture values with substituted
 concrete types, including signatures referring to the enclosing type variables.
 They are **not generic closures**: local generic templates, closures introducing
-their own inferred type variables, unspecialized generic function values,
-contextual specialization of a generic function value, and generic **instance**
-method inference are unsupported. Explicit function specialization syntax is not
-provided.
+their own inferred type variables, runtime-polymorphic unspecialized generic
+function values, and generic **instance** method inference remain deferred.
+Explicit function specialization syntax is not provided.
 
 Specialization is demand-driven and canonical, bounded to 64 expansion levels and
 1024 specializations per defining module; inference is bounded to 8192 terms and
@@ -1533,8 +1560,8 @@ let main: () -> void = {
   Individual elements retain their existing scalar or exact container `toString`
   printing/interpolation rules; storage adds no printer for functions or ranges,
   and array values themselves still cannot be printed.
-  `examples/storable-arrays.nov` is being added for the expanded element matrix;
-  parent validation gates are pending.
+  See [`examples/storable-arrays.nov`](examples/storable-arrays.nov) for the
+  expanded element matrix.
 
 ### Local static borrowing
 

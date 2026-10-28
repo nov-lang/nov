@@ -1690,9 +1690,22 @@ fn addLanguageTestCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_ste
 fn addGenericFunctionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
     _ = fixtures.add("generic-functions.nov", @embedFile("examples/generic-functions.nov"));
+    _ = fixtures.add("contextual-value.nov",
+        \\let identity: (x: `T) -> `T = x
+        \\let verify: () = {
+        \\    let cb: (uint) -> uint = identity
+        \\    @assert(cb(42) == 42)
+        \\}
+        \\@[test]
+        \\let contextual_value: () = verify()
+        \\let main: () = verify()
+        \\
+    );
     _ = fixtures.add("library.nov",
         \\let secret: uint = 9
         \\let hidden: (x: `T) -> `T = x
+        \\@[public]
+        \\let exposed = hidden
         \\@[public]
         \\let add: (x: `a, y: `b) -> `c = x + y
         \\@[public]
@@ -1730,6 +1743,22 @@ fn addGenericFunctionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_
         \\let sum = api.sum
         \\let method = api.namespace.id
         \\let secret: uint = 100
+        \\let apply: (f: (`T) -> `U, x: `T) -> `U = f(x)
+        \\let verifyCallbacks: () = {
+        \\    let cb: (string) -> string = library.identity
+        \\    let alias: (uint, uint) -> uint = sum
+        \\    let ns: (bool) -> bool = method
+        \\    let static: (string, uint) -> string = library.G(uint).call
+        \\    let exposed: (bool) -> bool = library.exposed
+        \\    let read: (string) -> uint = library.read
+        \\    @assert(cb("callback") == "callback" and alias(20, 22) == 42)
+        \\    @assert(ns(true) and exposed(true) and read("scope") == 9)
+        \\    @assert(static("static", 1) == "static")
+        \\    @assert(@as((bool) -> bool, same.identity)(true))
+        \\    @assert(apply(library.identity, "inferred") == "inferred")
+        \\}
+        \\@[test]
+        \\let imported_callbacks: () = verifyCallbacks()
         \\let main: () = {
         \\    let a: uint = sum(1, 2)
         \\    let b = library.add(@as(uint, 3), 4)
@@ -1737,10 +1766,13 @@ fn addGenericFunctionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_
         \\    let box: api.Box(string) = library.identity(same.Box(string)[ .value = "canonical" ])
         \\    @println(a, b, c, method(true), library.NS.id(false), box.value)
         \\    @println(library.read("scope"), library.G(uint).call("sibling", 1))
+        \\    verifyCallbacks()
+        \\    let cb: (bool) -> bool = api.namespace.id
+        \\    @println(cb(true), apply(same.identity, @as(uint, 42)))
         \\}
         \\
     );
-    for ([_][]const u8{ "generic-functions.nov", "library.nov", "api.nov", "imported.nov" }) |source| {
+    for ([_][]const u8{ "generic-functions.nov", "contextual-value.nov", "library.nov", "api.nov", "imported.nov" }) |source| {
         const fmt = b.addRunArtifact(exe);
         fmt.step.name = b.fmt("CLI generic functions fmt: {s}", .{source});
         fmt.setCwd(fixtures.getDirectory());
@@ -1750,7 +1782,7 @@ fn addGenericFunctionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_
         fmt.expectStdErrEqual("");
         test_step.dependOn(&fmt.step);
     }
-    for ([_][]const u8{ "generic-functions.nov", "imported.nov" }) |source| {
+    for ([_][]const u8{ "generic-functions.nov", "contextual-value.nov", "imported.nov" }) |source| {
         const check = b.addRunArtifact(exe);
         check.step.name = b.fmt("CLI generic functions semantic: {s}", .{source});
         check.setCwd(fixtures.getDirectory());
@@ -1761,24 +1793,29 @@ fn addGenericFunctionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_
         test_step.dependOn(&check.step);
     }
     for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
-        for ([_][]const u8{ "run", "test", "imported" }) |command| {
+        for ([_][]const u8{ "run", "test", "imported", "imported-test", "contextual-value", "contextual-value-test" }) |command| {
             const run = b.addRunArtifact(exe);
             run.step.name = b.fmt("CLI generic functions: {s} ({s})", .{ command, mode });
             run.setCwd(fixtures.getDirectory());
             run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
             run.setEnvironmentVariable("NOV_CC", "");
             run.setEnvironmentVariable("CC", "");
-            const tests = std.mem.eql(u8, command, "test");
-            const imported = std.mem.eql(u8, command, "imported");
-            run.addArgs(&.{ if (tests) "test" else "run", if (imported) "imported.nov" else "generic-functions.nov" });
+            const imported = std.mem.startsWith(u8, command, "imported");
+            const contextual = std.mem.startsWith(u8, command, "contextual-value");
+            const tests = std.mem.endsWith(u8, command, "test");
+            run.addArgs(&.{ if (tests) "test" else "run", if (imported) "imported.nov" else if (contextual) "contextual-value.nov" else "generic-functions.nov" });
             if (mode.len != 0) run.addArg(mode);
             run.expectExitCode(0);
-            run.expectStdOutEqual(if (tests)
-                "PASS first_and_nested_arrays\nPASS exact_add_constraints\nPASS ordinary_callback\nPASS nominal_box\nPASS returned_closures_and_array_copies\nPASS body_constraints\n6 passed; 0 failed; 6 total\n"
+            run.expectStdOutEqual(if (contextual)
+                (if (tests) "PASS contextual_value\n1 passed; 0 failed; 1 total\n" else "")
+            else if (tests and imported)
+                "PASS imported_callbacks\n1 passed; 0 failed; 1 total\n"
+            else if (tests)
+                "PASS first_and_nested_arrays\nPASS exact_add_constraints\nPASS ordinary_callback\nPASS contextual_callback_values\nPASS bidirectional_generic_callbacks\nPASS stored_contextual_callbacks\nPASS nominal_box\nPASS returned_closures_and_array_copies\nPASS body_constraints\n9 passed; 0 failed; 9 total\n"
             else if (imported)
-                "3 7 11 true false canonical\n9 sibling\n"
+                "3 7 11 true false canonical\n9 sibling\ntrue 42\n"
             else
-                "7 3 3 hello!\n5 boxed captured\n");
+                "7 3 3 hello!\n5 boxed captured\n42 43 44\n");
             run.expectStdErrEqual("");
             test_step.dependOn(&run.step);
         }
@@ -1800,17 +1837,22 @@ fn addGenericFunctionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_
             \\    var total: usize = 0;
             \\    var sums: usize = 0;
             \\    var ids: usize = 0;
+            \\    var identities: usize = 0;
+            \\    var hidden: usize = 0;
             \\    while (lines.next()) |line| {
             \\        if (!std.mem.endsWith(u8, line, " {") or std.mem.indexOf(u8, line, "_24generic") == null) continue;
             \\        total += 1;
             \\        if (std.mem.indexOf(u8, line, "_nov_add_24generic") != null) sums += 1;
             \\        if (std.mem.indexOf(u8, line, "_nov_id_24generic") != null) ids += 1;
+            \\        if (std.mem.indexOf(u8, line, "_nov_identity_24generic") != null) identities += 1;
+            \\        if (std.mem.indexOf(u8, line, "_nov_hidden_24generic") != null) hidden += 1;
             \\    }
-            \\    try std.testing.expectEqual(@as(usize, 6), total);
+            \\    try std.testing.expectEqual(@as(usize, 12), total);
             \\    try std.testing.expectEqual(@as(usize, 1), sums);
             \\    try std.testing.expectEqual(@as(usize, 1), ids);
+            \\    try std.testing.expectEqual(@as(usize, 4), identities);
+            \\    try std.testing.expectEqual(@as(usize, 1), hidden);
             \\    try std.testing.expect(std.mem.indexOf(u8, source, "_nov_unused") == null);
-            \\    try std.testing.expect(std.mem.indexOf(u8, source, "_nov_hidden") == null);
             \\}
             \\
         ),
@@ -1828,15 +1870,23 @@ fn addGenericFunctionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_
         .{ .name = "conflict", .source = prefix ++ "let main:()={let x=add(@as(uint,1),@as(int,2))\n}", .diagnostic = "constraints require exactly identical types" },
         .{ .name = "result-conflict", .source = prefix ++ "let main:()={let x:int=add(@as(uint,1),2)\n}", .diagnostic = "no implicit conversions are available" },
         .{ .name = "string-conflict", .source = prefix ++ "let main:()={let x=add(\"s\",@as(uint,2))\n}", .diagnostic = "constraints require exactly identical types" },
-        .{ .name = "function-value", .source = prefix ++ "let main:()={let f=id\n}", .diagnostic = "unspecialized function values are not supported yet" },
-        .{ .name = "contextual-value", .source = prefix ++ "let main:()={let f:(uint)->uint=id\n}", .diagnostic = "generic functions require direct calls to named module declarations" },
+        .{ .name = "function-value", .source = prefix ++ "let main:()={let f=id\n}", .diagnostic = "cannot infer every generic function type variable" },
+        .{ .name = "callback-ambiguous", .source = prefix ++ "let apply:(f:(`T)->`U,x:`T)->`U=f(x)\nlet main:()={let x=apply(id,42)\n}", .diagnostic = "cannot infer every generic function type variable" },
+        .{ .name = "callback-unbound", .source = "let f:(x:`T)->`U=1\nlet apply:(cb:(`T)->`U,x:`T)->`U=cb(x)\nlet main:()={let value=apply(f,true)\n}", .diagnostic = "integer literals have no default type" },
+        .{ .name = "callback-result-conflict", .source = prefix ++ "let main:()={let cb:(uint)->int=id\n}", .diagnostic = "constraints require exactly identical types" },
+        .{ .name = "callback-argument-conflict", .source = prefix ++ "let apply:(f:(`T)->`T,x:`T)->`T=f(x)\nlet main:()={let x:int=apply(id,@as(uint,42))\n}", .diagnostic = "constraints require exactly identical types" },
+        .{ .name = "callback-arity-conflict", .source = prefix ++ "let main:()={let cb:(uint,uint)->uint=id\n}", .diagnostic = "argument count does not match the function signature" },
+        .{ .name = "callback-non-function-context", .source = prefix ++ "let main:()={let cb:uint=id\n}", .diagnostic = "an exact concrete function signature in value contexts" },
+        .{ .name = "callback-private-function", .source = "let lib=@import(\"library.nov\")\nlet main:()={let cb:(bool)->bool=lib.hidden\n}", .diagnostic = "declaration needs a resolved type before use here" },
+        .{ .name = "callback-private-method", .source = "let lib=@import(\"library.nov\")\nlet main:()={let cb:(bool)->bool=lib.NS.private\n}", .diagnostic = "declaration needs a resolved type before use here" },
+        .{ .name = "callback-private-sibling", .source = "let lib=@import(\"library.nov\")\nlet main:()={let cb:(bool,uint)->bool=lib.G(uint).sibling\n}", .diagnostic = "declaration needs a resolved type before use here" },
         .{ .name = "local-template", .source = "let main:()={let f:(x:`T)->`T=x\n}", .diagnostic = "generic closures, local templates" },
         .{ .name = "generic-closure", .source = "let main:()={let f=(x:`T)->`T{x}\n}", .diagnostic = "generic closures, local templates" },
         .{ .name = "module-generic-closure", .source = "let f=(x:`T)->`T{x}\nlet main:()={}", .diagnostic = "generic closures, local templates" },
         .{ .name = "unbound", .source = "let x:`T=true\nlet main:()={}", .diagnostic = "unbound backtick type variable" },
         .{ .name = "unbound-body", .source = "let f:(x:`T)->`T={let y:`U=x\ny}\nlet main:()={let x=f(true)\n}", .diagnostic = "unbound backtick type variable" },
         .{ .name = "unsupported-inference", .source = "let f:(x:`T)->`U=match x{true=>\"yes\"\nfalse=>\"no\"}\nlet main:()={let x=f(true)\n}", .diagnostic = "type-constraint inference for this generic function body expression is not supported yet" },
-        .{ .name = "instance-call", .source = "let S=struct{let f:(self:S,x:`T)->`T=x\n}\nlet main:()={let s=S[]\nlet x=s.f(true)\n}", .diagnostic = "generic functions require direct calls" },
+        .{ .name = "instance-call", .source = "let S=struct{let f:(self:S,x:`T)->`T=x\n}\nlet main:()={let s=S[]\nlet x=s.f(true)\n}", .diagnostic = "generic functions require a named module template" },
         .{ .name = "private-function", .source = "let lib=@import(\"library.nov\")\nlet main:()={let x=lib.hidden(true)\n}", .diagnostic = "declaration needs a resolved type before use here" },
         .{ .name = "private-method", .source = "let lib=@import(\"library.nov\")\nlet main:()={let x=lib.NS.private(true)\n}", .diagnostic = "declaration needs a resolved type before use here" },
         .{ .name = "private-sibling", .source = "let lib=@import(\"library.nov\")\nlet main:()={let x=lib.G(uint).sibling(true,1)\n}", .diagnostic = "declaration needs a resolved type before use here" },

@@ -77,7 +77,7 @@ fn targetWith(module: *Module, node: Ast.Node.Index, generic_only: bool) ?Ref {
     return null;
 }
 
-pub const Argument = struct { ty: ?Ir.TypeId, span: Module.Span };
+pub const Argument = struct { ty: ?Ir.TypeId, span: Module.Span, template: ?Ref = null };
 const Term = struct {
     span: Module.Span,
     value: union(enum) {
@@ -245,7 +245,19 @@ const Solver = struct {
             try self.fail(.argument_count_mismatch, self.call_span, ref.module.getDeclaration(ref.id).?.name_span);
             return null;
         }
-        for (arguments, signature_type.params) |arg, param| if (arg.ty) |ty| try self.unify(param, try self.fromType(ty, arg.span, 0), arg.span, 0);
+        for (arguments, signature_type.params) |arg, param| {
+            if (arg.ty) |ty| try self.unify(param, try self.fromType(ty, arg.span, 0), arg.span, 0);
+            if (arg.template) |callback| {
+                const callback_container: ?Nominal = if (callback.container_type) |ty| blk: {
+                    const nominal = root(try self.fromType(ty, arg.span, 0));
+                    break :blk if (nominal.value == .nominal) nominal.value.nominal else null;
+                } else null;
+                const candidate = (try self.signature(callback, callback_container, 0)) orelse return null;
+                var callback_frame = candidate.frame;
+                try self.unify(param, try self.term(.{ .function = candidate.function }, arg.span), arg.span, 0);
+                if (!resolved(param, 0)) try self.body(&callback_frame, 0);
+            }
+        }
         if (!ref.module.getDeclaration(ref.id).?.noreturn) {
             if (expected) |arg| if (arg.ty) |ty| try self.unify(signature_type.result, try self.fromType(ty, arg.span, 0), arg.span, 0);
         }
@@ -620,6 +632,14 @@ const Solver = struct {
         if (depth >= max_depth) try self.fail(.generic_function_limit, self.call_span, span);
         if (self.failed) return self.term(.unknown, span);
         const data = ast.nodes.items(.data)[node];
+        if (try self.callTarget(frame, node, depth + 1)) |candidate| {
+            if (candidate.ref.module.getDeclaration(candidate.ref.id).?.is_generic_function) {
+                const instance = (try self.signature(candidate.ref, candidate.container, depth + 1)) orelse return self.term(.unknown, span);
+                var callback_frame = instance.frame;
+                try self.body(&callback_frame, depth + 1);
+                return self.term(.{ .function = instance.function }, span);
+            }
+        }
         switch (ast.nodes.items(.tag)[node]) {
             .identifier => {
                 const name = ast.tokenSlice(ast.firstToken(node));
@@ -854,8 +874,16 @@ test "backtick generic function rejects ambiguous conflicting unbound and unsupp
         .{ .source = "let main:()={let x=add(1,2)\n}", .tag = .generic_function_ambiguous },
         .{ .source = "let main:()={let x=add(@as(uint,1),@as(int,2))\n}", .tag = .generic_function_conflict },
         .{ .source = "let main:()={let x=add(\"s\",@as(uint,2))\n}", .tag = .generic_function_conflict },
-        .{ .source = "let main:()={let f=id\n}", .tag = .generic_function_context },
-        .{ .source = "let main:()={let f:(uint)->uint=id\n}", .tag = .generic_function_context },
+        .{ .source = "let main:()={let f=id\n}", .tag = .generic_function_ambiguous },
+        .{ .source = "let main:()={let f:(uint)->int=id\n}", .tag = .generic_function_conflict },
+        .{ .source = "let main:()={let f:(uint,uint)->uint=id\n}", .tag = .argument_count_mismatch },
+        .{ .source = "let main:()={let f:uint=id\n}", .tag = .generic_function_context },
+        .{ .source = "let main:()={let f=[id,id]\n}", .tag = .array_literal_needs_type },
+        .{ .source = "let main:()={let f=if true {id} else {id}\n}", .tag = .generic_function_ambiguous },
+        .{ .source = "let apply:(f:(`T)->`U,x:`T)->`U=f(x)\nlet main:()={let x=apply(id,42)\n}", .tag = .generic_function_ambiguous },
+        .{ .source = "let apply:(f:(`T)->`U,x:`T)->`U=f(x)\nlet main:()={let x:int=apply(id,@as(uint,42))\n}", .tag = .generic_function_conflict },
+        .{ .source = "let main:()={@println(id)}", .tag = .generic_function_ambiguous },
+        .{ .source = "let main:()={id}", .tag = .generic_function_context },
         .{ .source = "let main:()={let f:(x:`T)->`T=x\n}", .tag = .generic_function_context },
         .{ .source = "let main:()={let f=(x:`T)->`T{x}\n}", .tag = .generic_function_context },
         .{ .source = "let x:`T=true\nlet main:()={}", .tag = .unbound_type_variable },
@@ -930,7 +958,11 @@ fn imported(allocator: std.mem.Allocator) !void {
         \\let method=lib.NS.id
         \\let main:()={let a:uint=alias(1,2)
         \\let b=lib.add(@as(uint,3),4)
-        \\@print(a,b,lib.id("ok"),method(true),lib.NS.id(false))}
+        \\let cb:(uint,uint)->uint=alias
+        \\let other:(bool)->bool=method
+        \\let direct:(bool)->bool=lib.NS.id
+        \\let pubref:(string)->string=lib.id
+        \\@print(a,b,cb(1,2),other(true),direct(false),pubref("ok"),lib.id("ok"),method(true),lib.NS.id(false))}
     );
     const library = try comp.addSource("/app/lib.nov",
         \\@[public]
@@ -995,6 +1027,7 @@ fn testInferenceFailureAllocations(allocator: std.mem.Allocator, source: []const
     for (module.diagnostics.items) |diagnostic| if (diagnostic.tag == expected) {
         found = true;
     };
+    if (!found) std.debug.print("expected {any}: {any}\n", .{ expected, module.diagnostics.items });
     try std.testing.expect(found);
 }
 
@@ -1124,6 +1157,10 @@ fn testSpeculativeFailure(allocator: std.mem.Allocator, source: []const u8) !voi
 test "backtick speculative nested calls do not publish or demand specializations under OOM" {
     for ([_][]const u8{
         "let bad:(x:`T)->`T=missing\nlet first:(x:`A,y:`B)->`A=x\nlet main:()={let a=first(bad(true),1)\n}",
+        "let bad:(x:`T)->`T=missing\nlet first:(x:(bool)->bool,y:`B)->bool=x(true)\nlet main:()={let a=first(bad,1)\n}",
+        "let id:(x:`T)->`T=x\nlet apply:(f:(`T)->`U,x:`T)->`U=f(x)\nlet first:(x:`A,y:`B)->`A=x\nlet main:()={let a=first(apply(id,true),1)\n}",
+        "let id:(x:`T)->`T=x\nlet first:(x:`A,y:`B)->`A=x\nlet main:()={let a=first(@as((bool)->bool,id),1)\n}",
+        "let G:(T:type)->type=struct{let id:(x:`U,y:T)->`U=x\n}\nlet first:(x:(bool,uint)->bool,y:`B)->bool=x(true,1)\nlet main:()={let a=first(G(uint).id,1)\n}",
         "let G:(T:type)->type=struct{let id:(x:`U)->`U=x\n}\nlet wrap:(x:`T)->`U=G(uint).id(x)\nlet first:(x:`A,y:`B)->`A=x\nlet main:()={let a=first(wrap(\"s\"),1)\n}",
         "let G:(T:type)->type=struct{let id:(x:`U)->`U=x\n}\nlet first:(x:`A,y:`B)->`A=x\nlet main:()={let a=first(G(uint).id(\"s\"),1)\n}",
         "let Box:(T:type)->type=struct{value:T,let id:(x:`U)->`U=x\n}\nlet id:(x:`T)->`T=x\nlet first:(x:`A,y:`B)->`A=x\nlet main:()={let a=first(id(Box(uint)[.value=1]),1)\n}",
@@ -1396,4 +1433,135 @@ test "backtick named static imported noreturn constraints preserve canonical dem
 test "backtick imported public aliases share canonical function specializations under OOM" {
     try imported(std.testing.allocator);
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, imported, .{});
+}
+
+fn testContextualValues(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "contextual.nov",
+        \\let identity:(x:`T)->`T=x
+        \\let alias=identity
+        \\let Callback=(uint)->uint
+        \\let apply:(f:(`T)->`U,x:`T)->`U=f(x)
+        \\let reverse:(x:`T,f:(`T)->`U)->`U=f(x)
+        \\let chain:(f:(`T)->`U,g:(`U)->`V,x:`T)->`V=g(f(x))
+        \\let fixed:(f:(uint)->uint)->uint=f(42)
+        \\let result:()->(uint)->uint=identity
+        \\let inside:(x:`T)->`T={let cb:(`T)->`T=identity
+        \\cb(x)}
+        \\let NS=struct{let id:(x:`T)->`T=x
+        \\}
+        \\let G:(T:type)->type=struct{let pick:(x:`U,y:T)->`U=x
+        \\}
+        \\let main:()={
+        \\let cb:Callback=alias
+        \\let cast=@as((uint)->uint,identity)
+        \\let mut slot:Callback=identity
+        \\slot=alias
+        \\let branch:Callback=if true {identity} else {alias}
+        \\let funcs:[]Callback=[identity,alias]
+        \\let ns:Callback=NS.id
+        \\let method:(uint,bool)->uint=G(bool).pick
+        \\let a=apply(identity,@as(uint,42))
+        \\let b:uint=apply(alias,42)
+        \\let c:uint=reverse(42,identity)
+        \\let d:uint=chain(identity,alias,42)
+        \\@println(cb(a),cast(b),slot(c),branch(d),funcs[0](1),fixed(identity),result()(2),inside(a),ns(3),method(4,true))}
+    );
+    defer module.deinit();
+    const original = module.declarations.items.len;
+    var sema = Lowering.lower(&module) catch |err| {
+        try std.testing.expectEqual(original, module.declarations.items.len);
+        try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+        return err;
+    };
+    defer sema.deinit();
+    if (module.hasErrors()) std.debug.print("contextual values: {any} {any}\n", .{ module.source.ast.errors, module.diagnostics.items });
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+    var identities: usize = 0;
+    for (module.declarations.items) |decl| if (decl.function_template == module.lookup("identity")) {
+        identities += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 1), identities);
+}
+
+test "backtick contextual values exact signatures bidirectional callbacks and canonical demand under OOM" {
+    try testContextualValues(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testContextualValues, .{});
+}
+
+test "backtick contextual values consume canonical specialization budget" {
+    var source = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer source.deinit();
+    try source.writer.writeAll("let id:(x:`T)->`T=x\nlet alias=id\n");
+    for (0..max_specializations + 1) |i| try source.writer.print("let R{d}=struct{{}}\n", .{i});
+    try source.writer.writeAll("let main:()={\n");
+    for (0..max_specializations + 1) |i| {
+        try source.writer.print("let callback{d}:(R{d})->R{d}=id\nlet other{d}:(R{d})->R{d}=alias\n", .{ i, i, i, i, i, i });
+    }
+    try source.writer.writeAll("}");
+    try testInferenceFailureAllocations(std.testing.allocator, source.written(), .generic_function_limit);
+}
+
+test "backtick contextual abandoned callback probes do not consume generic budget" {
+    var source = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer source.deinit();
+    try source.writer.writeAll("let id:(x:`T)->`T=x\n");
+    for (0..max_specializations + 1) |i| try source.writer.print("let R{d}=struct{{}}\n", .{i});
+    try source.writer.writeAll("let first:(");
+    for (0..max_specializations + 1) |i| try source.writer.print("f{d}:(R{d})->R{d},", .{ i, i, i });
+    try source.writer.writeAll("last:`B)->bool=true\nlet main:()={let a=first(");
+    for (0..max_specializations + 1) |_| try source.writer.writeAll("id,");
+    try source.writer.writeAll("1)\n}");
+    try testSpeculativeFailure(std.testing.allocator, source.written());
+}
+
+fn testContextualVisibility(allocator: std.mem.Allocator, expression: []const u8, public: bool) !void {
+    var comp = Compilation.init(allocator);
+    defer comp.deinit();
+    const text = try std.mem.concat(allocator, u8, &.{ "let lib=@import(\"lib.nov\")\nlet main:()={let cb:(bool)->bool=", expression, "\n@println(cb(true))}" });
+    defer allocator.free(text);
+    const root = try comp.addSource("/app/main.nov", text);
+    const library = try comp.addSource("/app/lib.nov",
+        \\let hidden:(x:`T)->`T=x
+        \\@[public]
+        \\let alias=hidden
+        \\@[public]
+        \\let NS=struct{let hidden:(x:`T)->`T=x
+        \\@[public]
+        \\let alias=hidden
+        \\}
+        \\@[public]
+        \\let G:(T:type)->type=struct{let hidden:(x:`U)->`U=x
+        \\@[public]
+        \\let exposed:(x:`U)->`U=x
+        \\}
+    );
+    const module = comp.getModule(root).?;
+    const local = module.lookup("lib").?;
+    try comp.imports.append(allocator, .{ .declaration = comp.declaration_ids.get(.{ .source = root, .local = local }).?, .target = library, .named = false, .span = module.getDeclaration(local).?.name_span });
+    const count = comp.declarations.items.len;
+    var sema = Lowering.lowerCompilation(&comp) catch |err| {
+        try std.testing.expectEqual(count, comp.declarations.items.len);
+        for (comp.modules.items) |owner| try std.testing.expectEqual(@as(usize, 0), owner.diagnostics.items.len);
+        return err;
+    };
+    defer sema.deinit();
+
+    if (comp.hasErrors() == public) for (comp.modules.items) |owner| std.debug.print("visibility owner: {any} {any}\n", .{ owner.source.ast.errors, owner.diagnostics.items });
+    try std.testing.expectEqual(!public, comp.hasErrors());
+    try std.testing.expectEqual(public, sema.lowering_complete);
+    var specializations: usize = 0;
+    for (comp.getModule(library).?.declarations.items) |decl| if (decl.function_template != null) {
+        specializations += 1;
+    };
+    try std.testing.expectEqual(@as(usize, @intFromBool(public)), specializations);
+    if (public) try sema.ir.verify();
+}
+
+test "backtick contextual imported public aliases retain private template provenance and visibility under OOM" {
+    for ([_][]const u8{ "lib.hidden", "lib.NS.hidden", "lib.G(uint).hidden", "lib.alias", "lib.NS.alias", "lib.G(uint).exposed" }, 0..) |expression, i| {
+        try testContextualVisibility(std.testing.allocator, expression, i >= 3);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testContextualVisibility, .{ expression, i >= 3 });
+    }
 }

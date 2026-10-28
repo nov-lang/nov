@@ -47,9 +47,11 @@ results. See `examples/array-fields.nov`.
 
 ## Current delivered status
 
-Bounded named direct-call generic functions are implemented. Final native build,
-Debug/ReleaseSafe full gates (969/969 steps), four-target release builds, formatting
-and diff checks pass; the unit suite has 932 passes and one existing skip.
+Bounded named generic functions support direct calls and contextual specialization
+as function values when an exact concrete function type is expected. Final native
+build, Debug/ReleaseSafe gates (**988/988 steps**), four-target release builds,
+formatting and diff checks pass. The unit suite has **939 passes / 1 existing skip**
+(940 total); focused contextual tests passed **36/36**, generic CLI **60/60 steps**.
 `PLAN2.md` is the current untracked handoff; `PLAN.md` is an unchanged archive.
 
 Backtick inference combines typed runtime arguments, expected call results and
@@ -58,16 +60,20 @@ array/function signatures and nominal generic-container templates work, as do
 canonical top-level/imported/public aliases and namespace/generic-container
 static/sibling calls. Ordinary closures inside generic bodies capture substituted
 concrete types; this does not deliver generic closures or local generic templates.
-Unspecialized generic function values, contextual function-value specialization
-and generic instance-method inference remain explicitly unsupported. See the
-bounded inference section below and README.md for the precise solver boundary.
+Typed bindings, `@as` and callback contexts can demand ordinary canonical function
+references. Callback inference combines other arguments and expected results
+bidirectionally, without duplicating runtime evaluation. Aliases, imports/public
+reexports and static methods retain existing visibility rules. Runtime-polymorphic
+unspecialized values and generic instance-method inference remain deferred. See
+the bounded inference section below and README.md for the precise solver boundary.
 
 Demand-driven canonical specialization is bounded to 64 expansion levels and
 1024 specializations per defining module; inference has 8192-term/128-depth limits.
 Unused generic bodies are not type-checked. Failed/OOM lowering rolls back partial
 specializations/demands; speculative probes must not publish specializations or
 body demands. GenericFunctionTests has been merged into `src/GenericFunctions.zig`;
-See `examples/generic-functions.nov` and its six language tests.
+See `examples/generic-functions.nov`; the examples agent is updating that file and
+its build integration for contextual specialization.
 
 Arrays now support all existing storable runtime types: bool, integer, rune,
 string, enums, finite acyclic records, existing tagged unions, functions/closures,
@@ -1142,15 +1148,36 @@ Normal specialized-body checking still enforces supported operations. This is no
 a solver for arbitrary statements: needed constraints outside the subset diagnose
 unsupported inference; otherwise resolved bodies undergo ordinary checking.
 
-Remaining unsupported: generic closures, local generic templates, unspecialized
-generic function values, contextual function-value specialization and generic
-instance-method inference. No explicit function specialization syntax or general
-comptime evaluation is delivered. Existing explicit container parameters remain
-unchanged. `#` explicit compile-time arguments are still a separate proposal only.
+Exact concrete function-type contexts specialize named generic functions:
+
+```nov
+let identity: (x: `T) -> `T = x
+let apply: (f: (`T) -> `U, x: `T) -> `U = f(x)
+let callback: (uint) -> uint = identity
+let cast = @as((uint) -> uint, identity)
+let answer = apply(identity, @as(uint, 42))
+let contextual: uint = apply(identity, 42)
+```
+
+Callback inference combines signature/body constraints, other arguments and the
+expected result bidirectionally. It yields an ordinary function reference to a
+demanded canonical specialization, with no duplicated runtime evaluation. Typed
+assignments, results, branches and arrays also supply exact contexts. Aliases,
+imports/public reexports and namespace/generic-container static methods obey
+existing visibility. `let callback = identity` and `apply(identity, 42)` remain
+ambiguous; conflicts reject, with no numeric defaults or implicit conversions.
+
+Still deferred: generic closures, local generic templates, runtime-polymorphic
+unspecialized generic function values and generic instance-method inference. No
+new parser syntax, explicit function specialization syntax or general comptime
+evaluation is delivered. Existing explicit container parameters remain unchanged.
+`#` explicit compile-time arguments are a separate proposal, not implemented.
 Terminal paths do not impose `void` merge constraints; bare return constrains its
 own function result to void. Fresh nominal result layouts materialize without
 publishing method demands during probes, so inference is independent of prior
-instantiation order. Final parent validation passed.
+instantiation order. Final validation: 36 focused passes, unit suite 939 passes /
+1 existing skip, full Debug/ReleaseSafe 988/988 build steps; release builds and
+formatting/diff checks pass.
 
 # Comptime
 

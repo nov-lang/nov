@@ -2632,8 +2632,12 @@ const backtick_program =
 ;
 
 fn emitBacktickSourceFree(allocator: std.mem.Allocator) ![]u8 {
+    return emitBacktickProgramSourceFree(allocator, backtick_program);
+}
+
+fn emitBacktickProgramSourceFree(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
     var lowered = blk: {
-        var module = try Module.init(allocator, "backtick.nov", backtick_program);
+        var module = try Module.init(allocator, "backtick.nov", source);
         defer module.deinit();
         var result = try Lowering.lower(&module);
         errdefer result.deinit();
@@ -2666,6 +2670,85 @@ test "backtick source free compiler and emitter every allocation failure" {
     try TestAllocations.checkAllAllocationFailures(test_gpa, testBacktickSourceFree, .{});
 }
 
+const contextual_backtick_program =
+    \\let identity:(x:`T)->`T=x
+    \\let alias=identity
+    \\let apply:(f:(`T)->`U,x:`T)->`U=f(x)
+    \\let reverse:(x:`T,f:(`T)->`U)->`U=f(x)
+    \\let make:(x:`T)->()->`T=()->`T{x}
+    \\let result:()->(uint)->uint=identity
+    \\let NS=struct{let id:(x:`T)->`T=x
+    \\}
+    \\let G:(T:type)->type=struct{let pick:(x:`U,y:T)->`U=x
+    \\}
+    \\let main:()={
+    \\let mut order:uint=0
+    \\let callee=()->((uint)->uint,uint)->uint{order=order*10+1
+    \\@as(((uint)->uint,uint)->uint,apply)}
+    \\let callback=()->(uint)->uint{order=order*10+2
+    \\alias}
+    \\let arg=()->uint{order=order*10+3
+    \\42}
+    \\let a=callee()(callback(),arg())
+    \\@println(a,order)
+    \\let cb:(uint)->uint=identity
+    \\let cast=@as((uint)->uint,alias)
+    \\let mut slot:(uint)->uint=NS.id
+    \\slot=identity
+    \\let branch:(uint)->uint=if true {alias} else {NS.id}
+    \\let funcs:[](uint)->uint=[identity,alias]
+    \\let method:(uint,bool)->uint=G(bool).pick
+    \\let b:uint=apply(identity,42)
+    \\let c:uint=reverse(42,identity)
+    \\@println(cb(a),cast(b),slot(c),branch(4),funcs[1](5),method(6,true),result()(7))
+    \\let factory:([][]string)->()->[][]string=make
+    \\let mut rows:[][]string=[["old"+"!"]]
+    \\let saved=factory(rows)
+    \\rows[0]=["new"+"!"]
+    \\let copy=saved()
+    \\let through=apply(make,"captured"+"!")
+    \\@println(copy[0][0],rows[0][0],through())}
+;
+
+fn testContextualBacktickSourceFree(allocator: std.mem.Allocator) !void {
+    allocator.free(try emitBacktickProgramSourceFree(allocator, contextual_backtick_program));
+}
+
+test "backtick contextual values source free canonical callbacks LTR once captures forced GC C11 O0 O3" {
+    const library = try emitBacktickProgramSourceFree(test_gpa, contextual_backtick_program);
+    defer test_gpa.free(library);
+    const c = try collectingTestProgram(library);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "42 123\n42 42 42 4 5 6 7\nold! new! captured!\n", "", mode);
+}
+
+test "backtick contextual values source free compiler emitter every allocation failure" {
+    try testContextualBacktickSourceFree(test_gpa);
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testContextualBacktickSourceFree, .{});
+}
+
+test "backtick contextual returned closure exact runtime budgets and forced GC" {
+    const library = try emitBacktickProgramSourceFree(test_gpa,
+        \\let make:(x:`T)->()->`T=()->`T{x}
+        \\let main:()={let factory:(string)->()->string=make
+        \\let saved=factory("alive"+"!")
+        \\@println(saved())}
+    );
+    defer test_gpa.free(library);
+    const program = try collectingTestProgram(library);
+    defer test_gpa.free(program);
+    for (0..4) |budget| {
+        const prefix = try std.fmt.allocPrint(test_gpa, "#include <stdlib.h>\n#include <assert.h>\nstatic unsigned allocations, outstanding;\n" ++
+            "static void *test_malloc(size_t n) {{ if (allocations == {d}) return NULL; void *p = malloc(n); if (p) {{ ++allocations; ++outstanding; }} return p; }}\n" ++
+            "static void test_free(void *p) {{ assert(outstanding); --outstanding; free(p); }}\n" ++
+            "#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE test_free\n#define main test_main\n", .{budget});
+        defer test_gpa.free(prefix);
+        const counted = try std.mem.concat(test_gpa, u8, &.{ prefix, program, "\n#undef main\nint main(void) { int result = test_main(); assert(!outstanding); assert(allocations == 3); return result; }\n" });
+        defer test_gpa.free(counted);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(counted, "typedef int nonempty_translation_unit;", if (budget == 3) 0 else 1, if (budget == 3) "alive!\n" else "", if (budget == 3) "" else "panic: GC allocation failed\n", mode);
+    }
+}
+
 fn emitBacktickImportsSourceFree(allocator: std.mem.Allocator) ![]u8 {
     var sema = blk: {
         var comp = Compilation.init(allocator);
@@ -2676,8 +2759,11 @@ fn emitBacktickImportsSourceFree(allocator: std.mem.Allocator) ![]u8 {
             \\let method=api.NS.id
             \\let forward:(x:`T)->`T=api.stop()
             \\let staticForward:(x:`T)->`T=api.NS.stop()
-            \\let main:()={let n:uint=alias(1,2)
-            \\@println(n,api.alias("a","b"),method("namespace"),api.decorate("ok"),if false {forward(true)} else {true},if false {staticForward(true)} else {true})}
+            \\let main:()={let cb:(uint,uint)->uint=alias
+            \\let n:uint=cb(1,2)
+            \\let ns:(string)->string=method
+            \\let decorated:(string)->string=api.decorate
+            \\@println(n,api.alias("a","b"),ns("namespace"),decorated("ok"),if false {forward(true)} else {true},if false {staticForward(true)} else {true})}
         );
         const api = try comp.addSource("/app/api.nov",
             \\let prefix="library:"

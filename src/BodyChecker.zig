@@ -826,25 +826,33 @@ const Context = struct {
         return .{ .ty = signature, .noreturn = declaration.noreturn, .span = declaration.name_span };
     }
 
+    fn genericArgument(self: *Context, node: Ast.Node.Index, depth: usize) Error!GenericFunctions.Argument {
+        const was_probing = self.probing;
+        self.probing = true;
+        defer self.probing = was_probing;
+        const known = try self.probe(node, depth + 1);
+        return .{ .ty = if (known) |k| k.ty else null, .span = self.irSpan(node), .template = try self.genericTarget(node) };
+    }
+
     fn genericProbe(self: *Context, node: Ast.Node.Index, call: Ast.full.Call, ref: GenericFunctions.Ref, depth: usize) Error!?Ir.TypeId {
         const args = try self.module.allocator.alloc(GenericFunctions.Argument, call.ast.args.len);
         defer self.module.allocator.free(args);
-        for (call.ast.args, args) |arg, *out| {
-            const known = try self.probe(arg, depth + 1);
-            out.* = .{ .ty = if (known) |k| k.ty else null, .span = self.irSpan(arg) };
-        }
+        for (call.ast.args, args) |arg, *out| out.* = try self.genericArgument(arg, depth);
         return GenericFunctions.probeResult(self.module, self.ir, ref, args, self.irSpan(node));
     }
 
-    fn genericSignature(self: *Context, node: Ast.Node.Index, call: Ast.full.Call, ref: GenericFunctions.Ref, expected: ?Known, depth: usize) Error!?struct { id: Module.DeclId, ty: Ir.TypeId } {
+    const GenericSelection = struct { id: Module.DeclId, ty: Ir.TypeId };
+
+    fn genericSignature(self: *Context, node: Ast.Node.Index, call: Ast.full.Call, ref: GenericFunctions.Ref, expected: ?Known, depth: usize) Error!?GenericSelection {
         const args = try self.module.allocator.alloc(GenericFunctions.Argument, call.ast.args.len);
         defer self.module.allocator.free(args);
-        for (call.ast.args, args) |arg, *out| {
-            const known = try self.probe(arg, depth + 1);
-            out.* = .{ .ty = if (known) |k| k.ty else null, .span = self.irSpan(arg) };
-        }
+        for (call.ast.args, args) |arg, *out| out.* = try self.genericArgument(arg, depth);
         const bindings = (try GenericFunctions.infer(self.module, self.ir, ref, args, if (expected) |want| .{ .ty = want.ty, .span = want.annotation orelse self.irSpan(node) } else null, self.irSpan(node))) orelse return null;
         defer self.module.allocator.free(bindings);
+        return self.demandGeneric(node, ref, bindings);
+    }
+
+    fn demandGeneric(self: *Context, node: Ast.Node.Index, ref: GenericFunctions.Ref, bindings: []const Module.TypeBinding) Error!?GenericSelection {
         const specialized_id = if (self.sema) |analysis|
             (try analysis.specializeFunction(self.module, ref, bindings, self.specialization_depth, self.irSpan(node))) orelse return null
         else blk: {
@@ -862,6 +870,21 @@ const Context = struct {
         const id = self.qualify(ref.module, specialized_id);
         const known = (try self.globalType(id)) orelse return null;
         return .{ .id = id, .ty = known.ty };
+    }
+
+    fn genericValue(self: *Context, node: Ast.Node.Index, ref: GenericFunctions.Ref, expected: ?Known) Error!?Ir.TypeId {
+        const want = expected orelse return self.fail(.generic_function_ambiguous, node, ref.module.getDeclaration(ref.id).?.name_span);
+        const ty = self.ir.getType(want.ty).?;
+        if (ty != .function) return self.fail(.generic_function_context, node, want.annotation);
+        const args = try self.module.allocator.alloc(GenericFunctions.Argument, ty.function.params.len);
+        defer self.module.allocator.free(args);
+        for (args, ty.function.params) |*arg, param| arg.* = .{ .ty = param, .span = want.annotation orelse self.irSpan(node) };
+        const bindings = (try GenericFunctions.infer(self.module, self.ir, ref, args, .{ .ty = ty.function.result, .span = want.annotation orelse self.irSpan(node) }, self.irSpan(node))) orelse return null;
+        defer self.module.allocator.free(bindings);
+        const selected = (try self.demandGeneric(node, ref, bindings)) orelse return null;
+        if (try self.fit(selected.ty, expected, node) == null) return null;
+        if (self.emitter) |emitter| try emitter.record(node, selected.ty, self.irSpan(node), .{ .function_ref = emitter.functions[@backingInt(selected.id)].? });
+        return selected.ty;
     }
 
     fn genericCall(self: *Context, node: Ast.Node.Index, call: Ast.full.Call, ref: GenericFunctions.Ref, expected: ?Known, depth: usize) Error!?Ir.TypeId {
@@ -2400,6 +2423,9 @@ const Context = struct {
         // rather than probing and then retrying a failed concrete specialization.
         if (tag_early == .container_decl_arg) return self.recordInit(node, expected, depth);
         if (tag_early == .function_expr) return self.functionExpression(node, expected, depth);
+        if (tag_early == .identifier or tag_early == .field_access) {
+            if (try self.genericTarget(node)) |ref| return self.genericValue(node, ref, expected);
+        }
         const hint = expected orelse try self.probe(node, depth);
         if (hint) |known| {
             switch (try Literal.check(self.module, self.ir, node, known.ty, known.annotation)) {

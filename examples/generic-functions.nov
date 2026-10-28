@@ -2,11 +2,22 @@
 ; nov test examples/generic-functions.nov
 ; Backtick types are inferred exactly: literals need typed arguments or a result type.
 
+let identity: (value: `T) -> `T = value
+let identityAlias = identity
+let Callback = (uint) -> uint
 let first: (items: []`T) -> `T = items[0]
 let add: (x: `a, y: `b) -> `c = x + y
 let twice: (x: `T) -> `U = add(x, x)
 let apply: (f: (`T) -> `U, x: `T) -> `U = f(x)
 let increment: (x: uint) -> uint = x + 1
+let reverseApply: (x: `T, f: (`T) -> `U) -> `U = f(x)
+let chain: (f: (`T) -> `U, g: (`U) -> `V, x: `T) -> `V = g(f(x))
+let fixedCallback: (f: Callback) -> uint = f(42)
+let returnedCallback: () -> Callback = identity
+let contextualInside: (value: `T) -> `T = {
+    let cb: (`T) -> `T = identity
+    cb(value)
+}
 let snapshot: (value: `T) -> () -> `T = () -> `T {
     value
 }
@@ -32,6 +43,8 @@ let main: () = {
     let saved = snapshot("captured")
     @println(first(numbers), add(@as(uint, 1), 2), total, add("hello", "!"))
     @println(apply(increment, 4), unwrap(Box(string)[ .value = "boxed" ]), saved())
+    let cb: (uint) -> uint = identity
+    @println(cb(42), @as((uint) -> uint, identity)(43), apply(identity, @as(uint, 44)))
 }
 
 @[test]
@@ -58,6 +71,51 @@ let ordinary_callback: () = {
         x + x
     }
     @assert(apply(double, 3) == 6)
+}
+
+@[test]
+let contextual_callback_values: () = {
+    let cb: (uint) -> uint = identity
+    let alias: Callback = identityAlias
+    let cast = @as((uint) -> uint, identity)
+    @assert(cb(42) == 42 and alias(43) == 43 and cast(44) == 44)
+    @assert(fixedCallback(identity) == 42)
+    @assert(returnedCallback()(45) == 45)
+    @assert(contextualInside("inside") == "inside")
+}
+
+@[test]
+let bidirectional_generic_callbacks: () = {
+    @assert(apply(identity, @as(uint, 42)) == 42)
+    let result: uint = apply(identity, 43)
+    let reversed: uint = reverseApply(44, identityAlias)
+    let chained: uint = chain(identity, identityAlias, 45)
+    @assert(result == 43 and reversed == 44 and chained == 45)
+    @assert(chain(identity, increment, @as(uint, 46)) == 47)
+    @assert(chain(increment, identity, @as(uint, 47)) == 48)
+    @assert(apply(identity, "string") == "string")
+}
+
+@[test]
+let stored_contextual_callbacks: () = {
+    let mut slot: Callback = identity
+    slot = increment
+    @assert(slot(4) == 5)
+    slot = identityAlias
+    @assert(slot(4) == 4)
+    let branch: Callback = if true {
+        identity
+    } else {
+        identityAlias
+    }
+    @assert(branch(5) == 5)
+    let mut callbacks: []Callback = [identity, increment, identityAlias]
+    let saved = callbacks
+    callbacks[0] = increment
+    callbacks += [identity]
+    @assert(saved[0](6) == 6 and callbacks[0](6) == 7)
+    @assert(callbacks[1](7) == 8 and callbacks[2](8) == 8)
+    @assert(callbacks[-1](9) == 9)
 }
 
 @[test]
