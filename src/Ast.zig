@@ -1699,14 +1699,16 @@ pub const Node = struct {
         /// Same as container_decl_two except there is known to be a trailing comma
         /// or newline before the rbrace.
         container_decl_two_trailing,
-        /// Delivered `lhs[ .field = value, ... ]` constructor. `SubRange[rhs]`
-        /// contains container_field nodes with lhs=0; main_token is the `[`.
+        /// Explicit `lhs[ .field = value, .same_name, ... ]` constructor.
+        /// `SubRange[rhs]` contains container_field nodes with lhs=0;
+        /// main_token is the `[`. Shorthand fields have rhs=0.
         container_decl_arg,
         /// Same as container_decl_arg but there is known to be a trailing
         /// comma or newline before the rbrace.
         container_decl_arg_trailing,
         /// Declaration `a: lhs = rhs,` (rhs optional), or constructor `.a = rhs`
-        /// (lhs=0). Constructor punctuation belongs to the surrounding initializer.
+        /// (lhs=0), or shorthand `.a` (lhs=rhs=0).
+        /// Constructor punctuation belongs to the surrounding initializer.
         /// main_token is the field name identifier.
         /// lastToken() does not include the possible trailing comma.
         container_field,

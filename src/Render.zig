@@ -503,11 +503,14 @@ fn renderExpression(self: *Render, node: Ast.Node.Index, space: Space) RenderErr
                 const token = main_tokens[field];
                 const value = datas[field].rhs;
                 try self.renderToken(token - 1, .none);
-                try self.renderToken(token, .space);
-                try self.renderToken(token + 1, .space);
-                const last = ast.lastToken(value);
+                const last = if (value == 0) token else ast.lastToken(value);
                 const comma = token_tags[last + 1] == .comma;
-                try self.renderExpression(value, if (comma) .none else if (multiline) .newline else .space);
+                const ending: Space = if (comma) .none else if (multiline) .newline else .space;
+                try self.renderToken(token, if (value == 0) ending else .space);
+                if (value != 0) {
+                    try self.renderToken(token + 1, .space);
+                    try self.renderExpression(value, ending);
+                }
                 if (comma) try self.renderToken(last + 1, if (multiline) .newline else .space);
             }
             if (multiline) ais.popIndent();

@@ -1351,6 +1351,29 @@ fn parsePrimaryTypeExpr(self: *Parser) Error!Node.Index {
     }
 }
 
+test "constructor shorthand preserves structural operands and token ranges" {
+    const source = "let f:()=Rectangle[.width,.height=2,.depth,]";
+    var ast = try parse(std.testing.allocator, source);
+    defer ast.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+
+    for (ast.nodes.items(.tag), 0..) |tag, i| if (tag == .container_decl_arg) {
+        const node: Node.Index = @intCast(i);
+        const init = ast.fullStructInit(node).?;
+        try std.testing.expectEqual(@as(usize, 3), init.fields.len);
+        for (init.fields, [_][]const u8{ "width", "height=2", "depth" }, 0..) |field, text, index| {
+            try std.testing.expectEqualStrings(text, ast.getNodeSource(field));
+            try std.testing.expectEqual(index != 1, ast.nodes.items(.data)[field].rhs == 0);
+        }
+        try std.testing.expectEqualStrings("Rectangle[.width,.height=2,.depth,]", ast.getNodeSource(node));
+    };
+    for ([_][:0]const u8{ "let f:()=R[.a,.b.c]", "let f:()=R[.*]" }) |invalid| {
+        var bad = try parse(std.testing.allocator, invalid);
+        defer bad.deinit(std.testing.allocator);
+        try std.testing.expect(bad.errors.len != 0);
+    }
+}
+
 test "struct AST owns ordered members constructors attributes interpolation and exact source ranges" {
     const source = "@[public]\nlet A=struct {; fields\nx:int=0,\ny:string,\n@[public]\nlet toString:(self:A)->string=\"{self.x}:{self.y}\"\n}\nlet main:()={let a=A[\n.x=1, ; argument\n.y=\"hé\",\n]\n@println(a)}";
     var ast = try parse(std.testing.allocator, source);
@@ -1373,7 +1396,7 @@ test "malformed structs constructors and attributes recover without panicking" {
     for ([_][:0]const u8{
         "let A=struct",               "let A=struct {x}",           "let A=struct {x:int}",
         "let A=struct {x:int=,}",     "let A=struct {@[public]\n}", "let A=struct {var x:int,}",
-        "let a=A[.x=,]",              "let a=A[.x=]",               "let a=A[.x=1,.x]",
+        "let a=A[.x=,]",              "let a=A[.x=]",               "let a=A[.x=1,.x.y]",
         "let A=struct {let f:()=\n}",
     }) |source| {
         var ast = try parse(std.testing.allocator, source);
@@ -1433,14 +1456,18 @@ fn parseSuffixOp(self: *Parser, lhs: Node.Index) Error!Node.Index {
                 while (self.token_tags[next] == .newline) : (next += 1) {}
                 if (self.token_tags[next] == .period or self.token_tags[next] == .r_bracket) self.tok_i = next;
             }
-            if ((self.token_tags[self.tok_i] == .period and self.token_tags[self.tok_i + 1] == .identifier and self.token_tags[self.tok_i + 2] == .equal) or self.token_tags[self.tok_i] == .r_bracket) {
+            if ((self.token_tags[self.tok_i] == .period and self.token_tags[self.tok_i + 1] == .identifier and
+                switch (self.token_tags[self.tok_i + 2]) {
+                    .equal, .comma, .newline, .r_bracket => true,
+                    else => false,
+                }) or self.token_tags[self.tok_i] == .r_bracket)
+            {
                 const top = self.scratch.items.len;
                 defer self.scratch.shrinkRetainingCapacity(top);
                 while (self.token_tags[self.tok_i] != .r_bracket) {
                     _ = try self.expectToken(.period);
                     const name = try self.expectToken(.identifier);
-                    _ = try self.expectToken(.equal);
-                    const value = try self.expectExpr();
+                    const value = if (self.eatToken(.equal) != null) try self.expectExpr() else 0;
                     try self.scratch.append(self.allocator, try self.addNode(.{ .tag = .container_field, .main_token = name, .data = .{ .lhs = 0, .rhs = value } }));
                     const comma = self.eatToken(.comma) != null;
                     while (self.token_tags[self.tok_i] == .newline) self.tok_i += 1;

@@ -814,7 +814,18 @@ The delivered subset is deliberately bounded:
   missing required and mistyped fields diagnose. Supplied expressions evaluate
   **once, left to right in source order**, independent of field declaration order.
   Omitted literal defaults are then inserted in declaration order and have no
-  effects. Contextual `[ .x = ... ]`, anonymous records and tuples are not part
+  effects. Same-name shorthand `Type[.width, .height]` means
+  `Type[.width = width, .height = height]`: each name is an ordinary scoped read
+  checked against the field's exact expected type, with no implicit conversion.
+  Shorthand and explicit fields may mix in source order; defaults follow all
+  supplied fields. Imported types and generic aliases support the same syntax.
+  Unknown/out-of-scope names diagnose even if the field has a default; existing
+  unknown/duplicate/missing-field diagnostics remain. Array reads/deep copies,
+  borrowed-value read copies and closure capture rules are unchanged.
+  Union/enum payload grammar is unchanged (for example, `.item[.ready]` still
+  supplies an enum literal). No new `use`/`pub` syntax is introduced.
+  See [examples/constructor-shorthand.nov](examples/constructor-shorthand.nov).
+  Contextual `[ .x = ... ]`/`[.width]`, anonymous records and tuples are not part
   of this slice.
 - Read fields with `item.x`, including inside interpolation (`"{self.x}"`). Field
   lookup is type-directed: a record field named `len` is an ordinary field and
@@ -1386,7 +1397,8 @@ let main: () -> void = {
       3}
   @println(a[0], a[-1], a.len) ; 10 23 2
   ```
-- **HIGH PRIORITY follow-up: optimize expensive recursive copies.** The current
+- **IMPORTANT tracked cost — optimization PAUSED.** All further optimizations
+  are deferred; continue language features instead. The current
   implementation eagerly copies storage reads when independent values are needed,
   including every reachable array backing in record elements. Already-fresh
   temporaries transfer through binding, argument and return boundaries without
@@ -1403,7 +1415,7 @@ let main: () -> void = {
   region, avoiding a second backing allocation. Multiple consuming uses, escaping
   projections, later observations and region crossings retain safe copies. Calls,
   merges and storage reads are not backend ownership evidence. Broader elision, moves/consuming transfers and
-  copy-on-write remain candidates to investigate, **not approved designs**;
+  copy-on-write remain deferred candidates, **not approved designs**;
   any optimization must preserve value independence, static borrowing and GC safety.
   Append does not yet promise amortized constant time or preserve spare capacity
   across value copies.
@@ -1861,7 +1873,8 @@ or continuation-side `continue` reevaluates the condition directly. `break` and
 `return` skip the continuation. Labels remain unsupported.
 
 ## Defer
-Not implemented; explicitly postponed. The approved rules in `PLAN.md` specify
+Not implemented; explicitly postponed separately from the optimization pause.
+The approved rules in the current local handoff `PLAN2.md` specify
 reverse-order block-exit cleanup on normal completion, return, break, continue
 and `.!` propagation (not panic), evaluated against current locals at exit.
 Results are saved before cleanup; deferred code must yield `void` and cannot

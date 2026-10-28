@@ -949,13 +949,31 @@ const Context = struct {
         const name = ast.tokenSlice(if (contextual) ast.nodes.items(.main_token)[base] else ast.nodes.items(.data)[base].rhs);
         const index = self.fieldIndex(ty, name) orelse return self.fail(.unknown_field, base, null);
         const payload_ty = self.ir.getType(ty).?.record.fields[index].ty;
+        var enum_payload = false;
         const payload = if (ast.nodes.items(.tag)[node] == .array_access) data.rhs else blk: {
-            if (ast.fullStructInit(node).?.fields.len != 0) return self.fail(.invalid_union_constructor, node, null);
-            break :blk @as(Ast.Node.Index, 0);
+            const fields = ast.fullStructInit(node).?.fields;
+            if (fields.len == 0) break :blk @as(Ast.Node.Index, 0);
+            // A single `.tag` was already an enum payload expression, not a
+            // named union operand. Preserve that grammar, without allowing
+            // named fields, multiple operands, or a new trailing comma form.
+            if (fields.len != 1 or ast.nodes.items(.data)[fields[0]].rhs != 0 or
+                ast.tokens.items(.tag)[ast.lastToken(fields[0]) + 1] == .comma)
+                return self.fail(.invalid_union_constructor, node, null);
+            enum_payload = true;
+            break :blk fields[0];
         };
         const unit = self.ir.getType(payload_ty).? == .void;
         if ((payload == 0) != unit) return self.fail(.invalid_union_constructor, node, null);
-        if (payload != 0 and try self.expression(payload, .{ .ty = payload_ty }, depth + 1) == null) return null;
+        if (enum_payload) {
+            const token = ast.nodes.items(.main_token)[payload];
+            switch (try Literal.checkEnumToken(self.module, self.ir, token, payload_ty, self.span(payload), null)) {
+                .constant => |constant| if (self.emitter) |emitter| {
+                    try emitter.record(payload, payload_ty, .{ .source = self.module.source.id, .start = self.module.tokenSpan(token - 1).start, .end = self.span(payload).end }, .{ .constant = constant });
+                },
+                .failed => return null,
+                .not_literal => unreachable,
+            }
+        } else if (payload != 0 and try self.expression(payload, .{ .ty = payload_ty }, depth + 1) == null) return null;
         if (self.terminated) return ty;
         if (self.emitter) |emitter| try emitter.record(node, ty, self.irSpan(node), .{ .union_init = .{ .index = index, .payload = if (payload != 0) try emitter.value(payload) else null } });
         return ty;
@@ -978,7 +996,8 @@ const Context = struct {
             const index = self.fieldIndex(ty, name) orelse return self.fail(.unknown_field, field_node, null);
             if (seen[index]) return self.fail(.duplicate_field, field_node, null);
             seen[index] = true;
-            const value_node = ast.nodes.items(.data)[field_node].rhs;
+            const rhs = ast.nodes.items(.data)[field_node].rhs;
+            const value_node = if (rhs == 0) field_node else rhs;
             if (try self.expression(value_node, .{ .ty = record.record.fields[index].ty }, depth + 1) == null) return null;
             if (self.terminated) return ty;
             if (self.emitter) |emitter| values.?[index] = try emitter.value(value_node);
@@ -1301,7 +1320,7 @@ const Context = struct {
                 break :blk .{ .array_len = base };
             },
             .in => .{ .array_contains = .{ .value = try emitter.value(data.lhs), .array = try emitter.value(data.rhs) } },
-            .identifier => blk: {
+            .identifier, .container_field => blk: {
                 const name = self.module.sourceSlice(self.span(node)).?;
                 if (self.bindings.get(name)) |binding| {
                     if (binding.borrowed) break :blk .{ .borrow_read = binding.borrow.? };
@@ -1386,7 +1405,7 @@ const Context = struct {
         } else try emitter.record(node, ty, self.irSpan(node), op);
         // Storage reads snapshot immediately; projection bases only borrow the
         // aggregate until its selected value is read, without intervening effects.
-        if (tag == .identifier or tag == .field_access or tag == .array_access) try self.copyRead(node, ty);
+        if (tag == .identifier or tag == .container_field or tag == .field_access or tag == .array_access) try self.copyRead(node, ty);
         return true;
     }
 
@@ -2300,7 +2319,7 @@ const Context = struct {
                 if (self.terminated) return if (expected) |want| want.ty else element;
                 return self.fit(element, expected, node);
             },
-            .identifier => {
+            .identifier, .container_field => {
                 const name = self.module.sourceSlice(self.span(node)).?;
                 if (try self.captureBinding(name, node)) |binding| {
                     if (self.reservedOrigin(binding.name_span)) |origin| return self.fail(.borrow_conflict, node, origin);
@@ -4296,6 +4315,43 @@ test "if branches infer bidirectionally and keep separate lexical scopes" {
     defer sema.deinit();
     try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
     try std.testing.expect(!module.hasErrors());
+}
+
+test "constructor shorthand diagnoses ordinary names exact types and field spans" {
+    const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag, token: []const u8 = "x" };
+    for ([_]Case{
+        .{ .source = "let R=struct{x:int=1,}\nlet f:()->R=R[.x]", .tag = .unknown_name },
+        .{ .source = "let R=struct{x:int,}\nlet f:(x:bool)->R=R[.x]", .tag = .expression_type_mismatch },
+        .{ .source = "let R=struct{x:i8,}\nlet f:(x:i16)->R=R[.x]", .tag = .expression_type_mismatch },
+        .{ .source = "let R=struct{y:int,}\nlet f:(x:int)->R=R[.x]", .tag = .unknown_field },
+        .{ .source = "let R=struct{x:int,}\nlet f:(x:int)->R=R[.x,.x=2]", .tag = .duplicate_field },
+        .{ .source = "let R=struct{x:int,}\nlet f:(x:int)->R=R[.x=2,.x]", .tag = .duplicate_field },
+        .{ .source = "let R=struct{x:int,}\nlet x=1\nlet f:()->R=R[.x]", .tag = .unresolved_value_type },
+        .{ .source = "let R=struct{x:int,}\nlet f:()->R={if true {let x:int=1\n}\nR[.x]}", .tag = .unknown_name },
+        .{ .source = "let R=struct{x:int,let make:(self:@This())->R=R[.x]\n}\n", .tag = .unknown_name },
+        .{ .source = "let R=struct{x:int,}\nlet f:(x:int)->R={let x:int=2\nR[.x]}", .tag = .unsupported_shadowing },
+        .{ .source = "let R=struct{x:int,y:int,}\nlet f:(x:int)->R=R[.x]", .tag = .missing_field, .token = "[" },
+        .{ .source = "let R=struct{x:int,}\nlet f:(a:int)->()->R={let x=&a\n()->R {R[.x]}}", .tag = .unsupported_borrow },
+        .{ .source = "let A=struct{n:int,}\nlet B=struct{n:int,}\nlet R=struct{x:A,}\nlet f:(x:B)->R=R[.x]", .tag = .expression_type_mismatch },
+        .{ .source = "let K=enum{x,}\nlet U=union{some:K,}\nlet f:()->U=U.some[.x,]", .tag = .invalid_union_constructor, .token = "[" },
+        .{ .source = "let K=enum{x,}\nlet U=union{some:K,}\nlet f:()->U=.some[.x=1]", .tag = .invalid_union_constructor, .token = "[" },
+        .{ .source = "let K=enum{x,}\nlet U=union{some:K,}\nlet f:()->U=U.some[.x,.x]", .tag = .invalid_union_constructor, .token = "[" },
+        .{ .source = "let R=struct{x:int,}\nlet f:(x:int)->R=.x[]", .tag = .invalid_union_constructor, .token = "[" },
+        .{ .source = "let K=enum{x,}\nlet f:()->K=K[.x]", .tag = .not_a_type, .token = "K" },
+        .{ .source = "let R=struct{_:int,}\nlet f:()->R=R[._]", .tag = .unknown_name, .token = "_" },
+    }) |case| {
+        var module = try Module.init(std.testing.allocator, "shorthand.nov", case.source);
+        defer module.deinit();
+
+        var sema = try Sema.analyzeFunctions(&module);
+        defer sema.deinit();
+        try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
+        try std.testing.expect(module.hasErrors());
+        const diagnostic = module.diagnostics.items[0];
+        try std.testing.expectEqual(case.tag, diagnostic.tag);
+        try std.testing.expectEqualStrings(case.token, module.sourceSlice(diagnostic.span).?);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{case.source});
+    }
 }
 
 test "if diagnostics check conditions both branches results and lexical visibility" {

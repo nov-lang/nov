@@ -163,6 +163,15 @@ output across allocations; nested allocations can trigger collection/retry. The
 scalar array helper's one-backing-per-call property does not bound allocations of a
 recursive generated copy.
 
+Constructor-field shorthand `Type[.width, .height]` is an ordinary same-name
+scoped read at the exact expected field type, not an ownership transfer. Mixing
+explicit fields preserves source order; omitted defaults follow supplied fields.
+Imported types and generic aliases use the same path. Array backing still copies
+recursively on ordinary reads, borrowed values produce normal read copies, and
+immutable/mutable closure captures retain their existing snapshot/shared-cell
+rules. Union/enum payload grammar is unchanged; no contextual/anonymous structs
+or new `use`/`pub` syntax are introduced. See `examples/constructor-shorthand.nov`.
+
 The emitter predeclares instruction/slot/merge storage at function scope,
 zero-initializes it, and roots actual `void *owner` and `void *data` fields, flattened
 through inline records and parameters. Repeated element maps trace backing fields
@@ -180,7 +189,11 @@ A terminal index/RHS skips the pending store. Borrowing and GC do not introduce
 implicit mutable receivers. Allocation retry, panic, shutdown and immutable-string
 contracts apply unchanged.
 
-### HIGH PRIORITY: recursive-copy performance
+### IMPORTANT: recursive-copy costs tracked — optimization PAUSED
+
+All further optimizations are deferred; continue language features. Copy costs
+remain important tracked work, not the immediate next action. Separately, `defer`
+implementation remains postponed.
 
 Eager recursive backing copies are a major performance concern, not an optimized
 ownership strategy. Reads, snapshots and updates may copy entire reachable array
@@ -203,8 +216,8 @@ exactly one consuming array_set, provided all share conditional/loop execution
 regions. Later reads, escaping projections, repeated consuming operands and region
 crossings reject transfer. Calls, merges and storage reads cannot establish ownership. It does not trust lowering
 to have inserted copies in forged IR. Snapshot/conservative-fallback copies remain
-potentially expensive. Investigate broader
-elision, moves/consuming transfers and copy-on-write as candidates, **not approved
+potentially expensive. Broader
+elision, moves/consuming transfers and copy-on-write remain deferred candidates, **not approved
 designs**. Any optimization must preserve observable independence,
 static borrow exclusivity and precise GC/root/OOM safety. No aliasing or COW behavior
 is delivered by this implementation. See `examples/array-fields.nov`.

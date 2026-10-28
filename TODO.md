@@ -1,6 +1,10 @@
 # TODO
 
-## HIGH PRIORITY: optimize expensive recursive value copies
+## IMPORTANT: recursive-copy costs tracked — optimization PAUSED
+
+**Defer ALL further optimizations; continue FEATURES.** Copy costs remain
+important tracked work, not the immediate next action. Preserve delivered
+optimizations and correctness/performance cautions below.
 
 Array-valued struct fields are implemented.
 The copy-depth question is settled: ordinary value boundaries eagerly create
@@ -23,12 +27,12 @@ with one consuming update after earlier nonescaping scalar/length observations i
 the same conditional/loop region. Later reads, aggregate projections, repeated
 consumption and region crossings retain copies. Calls/merges/storage reads are not
 ownership evidence.
-Snapshot copies, conservative fallbacks and more general update paths still need
-further optimization.
+Snapshot copies, conservative fallbacks and more general update paths remain
+potentially costly; further optimization is paused.
 Broader elision, moves/consuming transfers and copy-on-write remain candidates,
 **not approved designs**. Preserve observable value independence, static borrowing and GC safety.
-This targeted high-priority follow-up is not blanket approval for other optimizations.
-`defer` implementation remains explicitly postponed until the user asks to resume.
+No further optimization is authorized as the next action.
+Separately, `defer` implementation remains explicitly postponed until the user asks to resume.
 
 Plain/generic acyclic struct array fields support reads, replacement, append and
 indexed replacement/integer compounds on nested mutable-local paths. Updates snapshot
@@ -41,6 +45,17 @@ captures snapshot recursively; mutable captures share a cell, not ordinary read
 results. See `examples/array-fields.nov`.
 
 ## Current delivered status
+
+Constructor-field shorthand is delivered **uncommitted**: `Type[.width, .height]`
+reads ordinary same-name scoped values with the field's exact expected type.
+It mixes with explicit fields in source order; omitted defaults follow supplied
+fields. Imported types and generic aliases work. Unknown/out-of-scope names
+reject even when a default exists; unknown/duplicate/missing/mistyped fields retain
+normal diagnostics. Array deep-copy/read-copy behavior, borrowed-value reads and
+closure capture rules are unchanged. Union/enum payload grammar is unchanged;
+no contextual/anonymous structs or new `use`/`pub` syntax are added.
+See `examples/constructor-shorthand.nov` (five tests). Focused CLI validation:
+**24/24 steps**; static review: no findings. Parent final gates remain pending.
 
 Runes and Unicode scalar string inspection are implemented. `rune` is distinct from integers: `0..=0x10FFFF` excluding `0xD800..=0xDFFF`.
 Single quotes hold exactly one scalar or escape (`'é'`, `'😀'`, `'\n'`, `'\xE9'`,
@@ -345,18 +360,6 @@ Keep ordinary function-body `=` syntax. Returning `.ok[]` would exit 0; returnin
 and exact error-output/flush details still need specification. Current executable
 main remains `() -> void`; neither proposal changes the implementation roadmap yet.
 
-## Same-name constructor fields (not implemented)
-
-```nov
-Rectangle[.width, .height]
-Rectangle[.width, .height = 10]
-```
-Shorthand `.width` means `.width = width`, resolved in the current scope with
-ordinary type and visibility checks. Allow mixing shorthand and explicit fields;
-preserve left-to-right evaluation, existing copy semantics, and duplicate/missing-
-field diagnostics. An unresolved shorthand name is an unknown-name error, even
-when that field has a default. This is not positional initialization or destructuring
-and does not change the implementation roadmap yet.
 
 ## Agreed text-storage design (future APIs)
 

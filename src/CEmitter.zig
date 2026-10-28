@@ -2052,6 +2052,79 @@ test "closures snapshots shared escaping cells nested functions and forced GC" {
     for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "/* separate translation unit */\nint nov_test_dummy;\n", 0, "6 4 5 6\n11\n12 13\n1 9 9\n7\n", "", mode);
 }
 
+const constructor_shorthand_program =
+    \\let Box:(T:type)->type=struct{value:T,}
+    \\let Alias=Box([]int)
+    \\let R=struct{value:[]int,label:string,n:int=9,}
+    \\let label="module"
+    \\let number:int=7
+    \\let N=struct{number:int,}
+    \\let M=struct{n:int,}
+    \\let borrow:(a:[]int)->R={let value=&a
+    \\ R[.value,.label]}
+    \\let factory:()->()->R={let value:[]int=[4]
+    \\ let text="captured"+"!"
+    \\ ()->R {if true {R[.value,.label=text]} else {R[.value,.label]}}}
+    \\let main:()={
+    \\ let mut value:[]int=[1]
+    \\ let change=()->string {value[0]=2
+    \\ "changed"+"!"}
+    \\ let first=R[.value,.label=change()]
+    \\ let second=R[.label=change(),.value]
+    \\ value[0]=3
+    \\ @println(first.value[0],second.value[0],value[0],first.n,first.label)
+    \\ let mut box:Alias=Box([]int)[.value]
+    \\ value[0]=8
+    \\ @println(box.value[0],value[0],N[.number].number)
+    \\ let f=factory()
+    \\ let r=f()
+    \\ @println(r.value[0],r.label,r.n)
+    \\ let b=borrow(value)
+    \\ value[0]=10
+    \\ @println(b.value[0],value[0],b.label)
+    \\ let mut n:int=1
+    \\ let nested=()->()->int {()->int {M[.n].n}}
+    \\ let inner=nested()
+    \\ n=5
+    \\ @println(inner())
+    \\}
+;
+
+test "constructor shorthand runtime snapshots captures generic aliases borrows order and GC" {
+    const c = try arrayTestProgram(constructor_shorthand_program);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "1 2 3 9 changed!\n3 8 7\n4 captured! 9\n8 10 module\n5\n", "", mode);
+    try testClosureOwnership(test_gpa, constructor_shorthand_program);
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testClosureOwnership, .{constructor_shorthand_program});
+}
+
+test "constructor shorthand keeps contextual and qualified union enum payload grammar" {
+    const c = try arrayTestProgram(
+        \\let K=enum{ready,}
+        \\let U=union{item:K,none,}
+        \\let main:()={
+        \\ let ready:int=7
+        \\ let factory=()->U {U.item[.ready]}
+        \\ let a:U=.item[.ready]
+        \\ let b=factory()
+        \\ @println(match a {.item=>|k|k==K.ready
+        \\ .none=>false}, match b {.item=>|k|k==K.ready
+        \\ .none=>false},ready)
+        \\}
+    );
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "true true 7\n", "", mode);
+}
+
+test "constructor shorthand runtime OOM uses ordinary array copy failure" {
+    const source = "let R=struct{value:[]int,}\nlet main:()={let value:[]int=[1]\n@println(\"before\")\nlet r=R[.value]\n@println(r.value[0])\n@println(value[0])}";
+    const program = try arrayTestProgram(source);
+    defer test_gpa.free(program);
+    const c = try std.mem.concat(test_gpa, u8, &.{ "#include <stdlib.h>\nstatic size_t count;\nstatic void *test_malloc(size_t n) {if(count++ >= 1)return NULL;return malloc(n);}\n#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n", program });
+    defer test_gpa.free(c);
+    try compileAndRunExpected(c, "typedef int nonempty_translation_unit;", 1, "before\n", "panic: GC allocation failed\n");
+}
+
 const closure_types_program =
     \\let K=enum{first,second,}
     \\let R=struct{s:string,n:int,}
@@ -2988,7 +3061,8 @@ fn testImportedGenericStructs(allocator: std.mem.Allocator) ![]u8 {
             \\let Kind=enum{wrong,}
             \\let prefix="WRONG"
             \\let helper:()->string="WRONG"
-            \\let main:()={let x:Alias=library.Box(int)[.value=3]
+            \\let main:()={let value:int=3
+            \\let x:Alias=library.Box(int)[.value]
             \\let y:api.Box(int)=B.make(x.value)
             \\let z=Box(string).make("a"+"b")
             \\@println(x,y,z,z.message(),x.kind==library.Kind.good)
@@ -3008,7 +3082,7 @@ fn testImportedGenericStructs(allocator: std.mem.Allocator) ![]u8 {
             \\let Box:(T:type)->type=struct{value:T,kind:Kind=.good,
             \\let Self=@This()
             \\@[public]
-            \\let make:(value:T)->Self=Self[.value=value]
+            \\let make:(value:T)->Self=Self[.value]
             \\@[public]
             \\let toString:(self:Self)->string="<{self.value}>"
             \\@[public]
@@ -3047,7 +3121,7 @@ fn testImportedGenericStructAllocations(allocator: std.mem.Allocator) !void {
     allocator.free(try testImportedGenericStructs(allocator));
 }
 
-test "generic structs imported aliases share canonical instances and defining free names after graph release" {
+test "constructor shorthand imported generic aliases retain canonical identity and defining scope after graph release" {
     const library = try testImportedGenericStructs(test_gpa);
     defer test_gpa.free(library);
     const c = try collectingTestProgram(library);

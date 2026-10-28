@@ -1,0 +1,112 @@
+; nov run examples/constructor-shorthand.nov
+; nov test examples/constructor-shorthand.nov
+; .field reads the same-named scoped value, just like .field = field.
+
+let Rectangle = struct {
+    width: int,
+    height: int,
+    label: string = "rectangle",
+}
+
+let Box: (T: type) -> type = struct {
+    value: T,
+}
+
+let Kind = enum {
+    ready,
+    waiting,
+}
+
+let Payload = union {
+    item: Kind,
+    none,
+}
+
+let Alias = Box(Kind)
+
+let main: () = {
+    let mut width: int = 6
+    let height: int = 4
+    let saved = Rectangle[ .width, .height ]
+    width = 9
+    let current = Rectangle[ .width, .height, .label = "resized" ]
+    @println(saved.label, saved.width, saved.height)
+    @println(current.label, current.width, current.height)
+}
+
+@[test]
+let scoped_values: () = {
+    let make: (width: int, height: int) -> Rectangle = Rectangle[ .width, .height ]
+    let value = make(3, 5)
+    @assert(value.width == 3 and value.height == 5)
+    @assert(value.label == "rectangle")
+}
+
+@[test]
+let mixed_order_and_defaults: () = {
+    let mut width: int = 2
+    let mut calls: int = 0
+    let next = () -> int {
+        calls += 1
+        width += 1
+        width
+    }
+    let value = Rectangle[
+        .height = next(),
+        .width,
+        .label = {
+            width = 99
+            "mixed"
+        }
+    ]
+    @assert(calls == 1 and width == 99)
+    @assert(value.height == 3 and value.width == 3)
+    @assert(value.label == "mixed")
+    let height: int = 7
+    let defaulted = Rectangle[ .width, .height ]
+    @assert(defaulted.label == "rectangle")
+}
+
+@[test]
+let source_snapshots: () = {
+    let mut value: []int = [2, 4]
+    let mut saved = Box([]int)[ .value ]
+    value[0] = 20
+    value += [6]
+    @assert(saved.value[0] == 2 and saved.value.len == 2)
+    saved.value[1] = 40
+    @assert(value[1] == 4)
+    let again = Box([]int)[ .value ]
+    @assert(again.value[0] == 20 and again.value.len == 3)
+}
+
+@[test]
+let closure_captures: () = {
+    let width: int = 8
+    let mut height: int = 3
+    let make = () -> Rectangle {
+        Rectangle[ .width, .height ]
+    }
+    let saved = make()
+    height = 9
+    let current = make()
+    @assert(saved.width == 8 and saved.height == 3)
+    @assert(current.width == 8 and current.height == 9)
+}
+
+@[test]
+let aliases_and_payloads: () = {
+    let value: Kind = .ready
+    let boxed = Alias[ .value ]
+    @assert(boxed.value == Kind.ready)
+    ; Union payload .ready remains an enum literal, not a shorthand value read.
+    let ready: int = 42
+    let payload: Payload = .item[ .ready ]
+    @assert(ready == 42)
+    @assert(
+        match payload {
+            .item => |kind| kind == Kind.ready
+            .none => false
+        }
+    )
+}

@@ -31,12 +31,8 @@ pub fn check(module: *Module, ir: *Ir, node: Ast.Node.Index, expected: Ir.TypeId
                 const qualified = if (ast.nodes.items(.tag)[current] == .field_access) try qualifiedEnum(module, ir, current) else null;
                 if (ast.nodes.items(.tag)[current] == .field_access and qualified == null) return .not_literal;
                 if (qualified != null and qualified.? != expected) return failLiteral(module, .literal_type_mismatch, span, annotation);
-                const ty = ir.getType(expected).?;
-                if (ty != .enumeration) return failLiteral(module, .literal_type_mismatch, span, annotation);
                 const token = if (qualified != null) ast.nodes.items(.data)[current].rhs else ast.nodes.items(.main_token)[current];
-                const name = ast.tokenSlice(token);
-                for (ty.enumeration.tags, 0..) |tag, i| if (std.mem.eql(u8, tag.name, name)) return internLiteral(module, ir, expected, .{ .enum_tag = @intCast(i) }, module.tokenSpan(token), annotation);
-                return failLiteral(module, .unknown_field, module.tokenSpan(token), null);
+                return checkEnumToken(module, ir, token, expected, span, annotation);
             },
             .number_literal => return checkNumber(module, ir, current, expected, false, span, annotation),
             .negation => {
@@ -95,6 +91,16 @@ pub fn check(module: *Module, ir: *Ir, node: Ast.Node.Index, expected: Ir.TypeId
             else => return .not_literal,
         }
     }
+}
+
+/// Also handles the syntactically ambiguous `.tag` in `U.variant[.tag]`.
+/// The union payload context, not lexical value lookup, determines this literal.
+pub fn checkEnumToken(module: *Module, ir: *Ir, token: Ast.TokenIndex, expected: Ir.TypeId, span: Module.Span, annotation: ?Module.Span) Error!Result {
+    const ty = ir.getType(expected).?;
+    if (ty != .enumeration) return failLiteral(module, .literal_type_mismatch, span, annotation);
+    const name = module.source.ast.tokenSlice(token);
+    for (ty.enumeration.tags, 0..) |tag, i| if (std.mem.eql(u8, tag.name, name)) return internLiteral(module, ir, expected, .{ .enum_tag = @intCast(i) }, module.tokenSpan(token), annotation);
+    return failLiteral(module, .unknown_field, module.tokenSpan(token), null);
 }
 
 pub fn qualifiedEnum(module: *Module, ir: *Ir, node: Ast.Node.Index) Error!?Ir.TypeId {

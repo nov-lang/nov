@@ -2001,6 +2001,49 @@ test "compilation imports lower across every allocation failure" {
     }.run, .{});
 }
 
+test "constructor shorthand does not expose private globals through imported field names" {
+    for ([_]bool{ true, false }) |named| {
+        var comp = Compilation.init(std.testing.allocator);
+        defer comp.deinit();
+        const root = try comp.addSource("/main.nov", "let api=@import(\"api.nov\")\nlet R=api.R\nlet main:()={let r=R[.value]\n}");
+        const api = try comp.addSource("/api.nov", "let value:int=1\n@[public]\nlet R=struct{value:int=2,}");
+        try testImport(&comp, root, "api", api, named);
+        comp.setRoot(root);
+        var result = try lowerCompilation(&comp);
+        defer result.deinit();
+        try std.testing.expect(comp.hasErrors());
+        const module = comp.getModule(root).?;
+        const diagnostic = module.diagnostics.items[0];
+        try std.testing.expectEqual(Module.Diagnostic.Tag.unknown_name, diagnostic.tag);
+        try std.testing.expectEqual(root, diagnostic.span.source);
+        try std.testing.expectEqualStrings("value", module.sourceSlice(diagnostic.span).?);
+        try std.testing.expectEqual(std.mem.indexOf(u8, module.source.ast.source, ".value").? + 1, diagnostic.span.start);
+    }
+}
+
+test "constructor shorthand lowers supplied operands before defaults in declaration order" {
+    var module = try Module.init(std.testing.allocator, "shorthand-order.nov", "let R=struct{a:int=10,b:int,c:int=30,d:int,}\nlet f:(b:int)->R=R[.d=4,.b]");
+    defer module.deinit();
+    var result = try lower(&module);
+    defer result.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(result.lowering_complete);
+    try result.ir.verify();
+    var found = false;
+    for (result.ir.functions.items) |function| {
+        const body = function.body orelse continue;
+        for (body.instructions) |instruction| if (instruction.op == .record_init) {
+            const fields = instruction.op.record_init;
+            try std.testing.expectEqual(@as(usize, 4), fields.len);
+            try std.testing.expect(@backingInt(fields[3]) < @backingInt(fields[1]));
+            try std.testing.expect(@backingInt(fields[1]) < @backingInt(fields[0]));
+            try std.testing.expect(@backingInt(fields[0]) < @backingInt(fields[2]));
+            found = true;
+        };
+    }
+    try std.testing.expect(found);
+}
+
 test "compilation diamond aliases canonicalize while colliding record and enum locals remain nominal" {
     var comp = Compilation.init(std.testing.allocator);
     defer comp.deinit();

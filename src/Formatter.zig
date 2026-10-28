@@ -517,6 +517,20 @@ test "extern formatting preserves bodyless declarations comments escapes and tra
     }
 }
 
+test "constructor shorthand formatting preserves tokens comments and structure" {
+    for ([_][:0]const u8{
+        "let f:()=R[.width,.height=height,.depth,]",
+        "let f:()=R[\n; start\n.width, ; supplied\n.height=height,\n.depth ; last\n]",
+        "let f:()=R[.width ; last without comma\n]",
+    }) |source| {
+        const result = try format(std.testing.allocator, source);
+        defer std.testing.allocator.free(result);
+        try expectFormatted(source, result);
+        try std.testing.expect(std.mem.indexOf(u8, result, ".width =") == null);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{source});
+    }
+}
+
 test "nominal struct formatting preserves public attributes fields defaults methods constructor comments and interpolation" {
     for ([_][:0]const u8{
         "let R=struct{lo:i128=-170141183460469231731687303715884105728,top:u128=340282366920938463463374607431768211455,}\nlet f:(r:R)={}",

@@ -142,6 +142,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const array_field_tests = b.step("test-cli-array-fields", "Run array-valued struct field CLI tests");
     addArrayFieldCliTests(b, exe, array_field_tests);
     test_step.dependOn(array_field_tests);
+    const constructor_shorthand_tests = b.step("test-cli-constructor-shorthand", "Run constructor field shorthand CLI tests");
+    addConstructorShorthandCliTests(b, exe, constructor_shorthand_tests);
+    test_step.dependOn(constructor_shorthand_tests);
     addFieldMutationCliTests(b, exe, test_step, fixtures);
     addGenericStructCliTests(b, exe, test_step, fixtures);
     addRangeValueCliTests(b, exe, test_step, fixtures);
@@ -1813,6 +1816,92 @@ fn addArrayFieldCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step:
         check.step.name = b.fmt("CLI array fields: reject {s}", .{case.name});
         check.setCwd(fixtures.getDirectory());
         check.addArgs(&.{ "check", "--semantic", source });
+        check.expectExitCode(1);
+        check.expectStdOutEqual("");
+        check.expectStdErrMatch(case.diagnostic);
+        test_step.dependOn(&check.step);
+    }
+}
+
+fn addConstructorShorthandCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    for ([_][]const u8{ "fmt", "semantic" }) |mode| {
+        const run = b.addRunArtifact(exe);
+        run.step.name = b.fmt("CLI constructor shorthand: {s}", .{mode});
+        run.addArgs(if (std.mem.eql(u8, mode, "fmt")) &.{ "fmt", "--check" } else &.{ "check", "--semantic" });
+        run.addFileArg(b.path("examples/constructor-shorthand.nov"));
+        run.expectExitCode(0);
+        run.expectStdOutEqual("");
+        run.expectStdErrEqual("");
+        test_step.dependOn(&run.step);
+    }
+    for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+        for ([_][]const u8{ "run", "test" }) |command| {
+            const run = b.addRunArtifact(exe);
+            run.step.name = b.fmt("CLI constructor shorthand: {s} ({s})", .{ command, mode });
+            run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+            run.setEnvironmentVariable("NOV_CC", "");
+            run.setEnvironmentVariable("CC", "");
+            run.addArg(command);
+            run.addFileArg(b.path("examples/constructor-shorthand.nov"));
+            if (mode.len != 0) run.addArg(mode);
+            run.expectExitCode(0);
+            run.expectStdOutEqual(if (std.mem.eql(u8, command, "test"))
+                "PASS scoped_values\nPASS mixed_order_and_defaults\nPASS source_snapshots\nPASS closure_captures\nPASS aliases_and_payloads\n5 passed; 0 failed; 5 total\n"
+            else
+                "rectangle 6 4\nresized 9 4\n");
+            run.expectStdErrEqual("");
+            test_step.dependOn(&run.step);
+        }
+    }
+    const fixtures = b.addWriteFiles();
+    _ = fixtures.add("constructor-order.nov",
+        \\let mark: (label: string, value: int) -> int = { @print(label)
+        \\    value }
+        \\let R = struct { first: int = 30, width: int, last: int = 40, height: int, }
+        \\let main: () = {
+        \\    let mut width: int = 1
+        \\    let r = R[.height = { width = mark("A", 2)
+        \\        width }, .width, .last = mark("B", 4)]
+        \\    @println(r.width, r.height, r.first, r.last)
+        \\    let height: int = 5
+        \\    let s = R[.width, .height]
+        \\    @println(s.first, s.last)
+        \\}
+        \\
+    );
+    for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+        const run = b.addRunArtifact(exe);
+        run.step.name = b.fmt("CLI constructor shorthand: operand and default order ({s})", .{mode});
+        run.setCwd(fixtures.getDirectory());
+        run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+        run.setEnvironmentVariable("NOV_CC", "");
+        run.setEnvironmentVariable("CC", "");
+        run.addArgs(&.{ "run", "constructor-order.nov" });
+        if (mode.len != 0) run.addArg(mode);
+        run.expectExitCode(0);
+        run.expectStdOutEqual("AB2 2 30 4\n30 40\n");
+        run.expectStdErrEqual("");
+        test_step.dependOn(&run.step);
+    }
+    for ([_]struct { name: []const u8, source: []const u8, diagnostic: []const u8 }{
+        .{ .name = "unknown-value", .source = "let R=struct{width:int=1,}\nlet main:()={let r=R[.width]\n}", .diagnostic = "unknown name 'width'" },
+        .{ .name = "out-of-scope", .source = "let R=struct{width:int,}\nlet main:()={if true {let width:int=1\n}\nlet r=R[.width]\n}", .diagnostic = "unknown name 'width'" },
+        .{ .name = "duplicate-explicit", .source = "let R=struct{width:int,}\nlet main:()={let width:int=1\nlet r=R[.width,.width=2]\n}", .diagnostic = "duplicate container field" },
+        .{ .name = "duplicate-shorthand", .source = "let R=struct{width:int,}\nlet main:()={let width:int=1\nlet r=R[.width=2,.width]\n}", .diagnostic = "duplicate container field" },
+        .{ .name = "unknown-field", .source = "let R=struct{height:int=1,}\nlet main:()={let width:int=1\nlet r=R[.width]\n}", .diagnostic = "unknown container field" },
+        .{ .name = "wrong-type", .source = "let R=struct{width:int,}\nlet main:()={let width=true\nlet r=R[.width]\n}", .diagnostic = "expression does not match the expected type" },
+        .{ .name = "integer-width", .source = "let R=struct{width:i8,}\nlet main:()={let width:i16=1\nlet r=R[.width]\n}", .diagnostic = "expression does not match the expected type" },
+        .{ .name = "field-path", .source = "let R=struct{width:int,}\nlet main:()={let r=R[.width.value]\n}", .diagnostic = "expected a runtime value, found a type alias" },
+        .{ .name = "contextual-struct", .source = "let R=struct{width:int,}\nlet main:()={let width:int=1\nlet r:R=[.width]\n}", .diagnostic = "expression does not match the expected type" },
+    }) |case| {
+        const source = b.fmt("invalid-constructor-shorthand-{s}.nov", .{case.name});
+        _ = fixtures.add(source, case.source);
+        const check = b.addRunArtifact(exe);
+        check.step.name = b.fmt("CLI constructor shorthand: reject {s}", .{case.name});
+        check.setCwd(fixtures.getDirectory());
+        check.addArg("check");
+        check.addArg("--semantic");
+        check.addArg(source);
         check.expectExitCode(1);
         check.expectStdOutEqual("");
         check.expectStdErrMatch(case.diagnostic);
