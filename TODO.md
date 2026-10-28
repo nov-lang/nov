@@ -47,10 +47,27 @@ results. See `examples/array-fields.nov`.
 
 ## Current delivered status
 
-HEAD is `da7838c` (constructor-field shorthand). The expanded storable-array work
-is in the working tree; parent validation gates remain pending. `PLAN2.md` is the
-current untracked handoff; `PLAN.md` is an unchanged archive. No new pass counts
-are claimed for this work.
+Bounded named direct-call generic functions are implemented. Final native build,
+Debug/ReleaseSafe full gates (969/969 steps), four-target release builds, formatting
+and diff checks pass; the unit suite has 932 passes and one existing skip.
+`PLAN2.md` is the current untracked handoff; `PLAN.md` is an unchanged archive.
+
+Backtick inference combines typed runtime arguments, expected call results and
+bounded body constraints, without implicit conversions or numeric defaults. Nested
+array/function signatures and nominal generic-container templates work, as do
+canonical top-level/imported/public aliases and namespace/generic-container
+static/sibling calls. Ordinary closures inside generic bodies capture substituted
+concrete types; this does not deliver generic closures or local generic templates.
+Unspecialized generic function values, contextual function-value specialization
+and generic instance-method inference remain explicitly unsupported. See the
+bounded inference section below and README.md for the precise solver boundary.
+
+Demand-driven canonical specialization is bounded to 64 expansion levels and
+1024 specializations per defining module; inference has 8192-term/128-depth limits.
+Unused generic bodies are not type-checked. Failed/OOM lowering rolls back partial
+specializations/demands; speculative probes must not publish specializations or
+body demands. GenericFunctionTests has been merged into `src/GenericFunctions.zig`;
+See `examples/generic-functions.nov` and its six language tests.
 
 Arrays now support all existing storable runtime types: bool, integer, rune,
 string, enums, finite acyclic records, existing tagged unions, functions/closures,
@@ -73,7 +90,8 @@ unsupported. Use a mutable element copy and assign it back, or existing scoped
 stable-owner element loans for supported nested-array updates/replacement. No new
 borrow forms or escaping references. Recursive layouts, including cycles through
 arrays, and aggregate depth beyond 128 remain rejected.
-`examples/storable-arrays.nov` is being added; parent gates are pending.
+See `examples/storable-arrays.nov`; its validation is historical, not a result
+for the current generic-function work.
 All optimization work stays paused; `defer` stays postponed. Namespace `use` syntax
 is undecided; unfinished work is stashed, not implemented or approved for execution.
 
@@ -87,7 +105,7 @@ closure capture rules are unchanged. Union/enum payload grammar is unchanged;
 no contextual/anonymous structs or new `use`/`pub` syntax are added.
 See `examples/constructor-shorthand.nov` (five tests). Historical focused CLI
 validation: **24/24 steps**; static review: no findings. These are not results for
-the current storable-array work; its parent final gates remain pending.
+the current generic-function work; its latest validation is recorded above.
 
 Runes and Unicode scalar string inspection are implemented. `rune` is distinct from integers: `0..=0x10FFFF` excluding `0xD800..=0xDFFF`.
 Single quotes hold exactly one scalar or escape (`'é'`, `'😀'`, `'\n'`, `'\xE9'`,
@@ -238,7 +256,8 @@ enums as sugar for Type.method(value,args). The explicit first parameter must ma
 the exact nominal receiver type. Receiver evaluates/snapshots once before explicit
 arguments left-to-right; direct noreturn methods remain terminal. Fields retain
 lookup precedence. No implicit mutation/borrowing, bound method references or
-general generic functions were added. structured-errors.nov uses Entry.describe().
+generic instance-method inference were added. Named generic static/direct calls
+are supported separately. structured-errors.nov uses Entry.describe().
 
 Nominal unnumbered enums are executable: qualified/contextual tags, aliases, exact
 ==/!=, exhaustive single-enum matches with qualified patterns/alternatives/catchall,
@@ -1096,23 +1115,42 @@ TODO add a good way to make code usable on multiple systems through attributes.
 TODO: add an attribute for signal handler and add a way to pass parameters to it
 via SA\_SIGINFO (see std.debug.attachSegfaultHandler) `@[signal_handler(signal, args)]`
 
-# Inferred generic functions (approved syntax, not implemented)
+# Inferred generic functions (bounded executable subset)
 
-Use backtick-prefixed type variables, not a separate argument that disappears
-from calls, an angle-bracket list, or `#`:
+Named direct-call functions use backtick-prefixed signature variables, not an
+extra explicit argument, angle-bracket list or `#`:
 
 ```nov
 let first: (items: []`T) -> `T = items[0]
 let add: (x: `a, y: `b) -> `c = x + y
-let identity = (value: `T) -> `T { value }
+let sum: uint = add(1, 2)
 ```
 
 Same-named variables agree; distinct names are related by body/operator constraints.
-For current builtin `+`, compatible means one exact supported integer type or
-string for both operands/result, not implicit conversion. No new integer defaults.
-Generic functions and closures remain unimplemented. Explicit specialization,
-contextual inference and higher-order generic values still need precise contracts;
-existing explicit generic-container parameters are unchanged.
+Typed runtime arguments and expected call results provide exact constraints. For
+current builtin `+`, both operands/result need the same supported integer type or
+string, without conversion. `let sum = add(1, 2)` remains ambiguous: no defaults.
+
+`GenericFunctions.Solver.expression` handles reads/typed globals, bool/string/rune
+literals, boolean operations, exact arithmetic/bitwise/comparison relationships,
+array indexing/literals and string indexing, known record fields and array/string
+lengths, block bindings, if/else, conditional/unconditional loops, scoped returns
+and breaks, `@as`, supported direct calls, concrete
+function-value calls and ordinary closures using enclosing substituted types.
+Numeric literals leave a type unknown; index operands add no inference constraints.
+Normal specialized-body checking still enforces supported operations. This is not
+a solver for arbitrary statements: needed constraints outside the subset diagnose
+unsupported inference; otherwise resolved bodies undergo ordinary checking.
+
+Remaining unsupported: generic closures, local generic templates, unspecialized
+generic function values, contextual function-value specialization and generic
+instance-method inference. No explicit function specialization syntax or general
+comptime evaluation is delivered. Existing explicit container parameters remain
+unchanged. `#` explicit compile-time arguments are still a separate proposal only.
+Terminal paths do not impose `void` merge constraints; bare return constrains its
+own function result to void. Fresh nominal result layouts materialize without
+publishing method demands during probes, so inference is independent of prior
+instantiation order. Final parent validation passed.
 
 # Comptime
 

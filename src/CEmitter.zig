@@ -2582,6 +2582,155 @@ test "closures capture supported local types ranges function cells and private b
     for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "01true é true 7 array!\nabu!\nold! new!\n2 1\nold! old!?\n", "", mode);
 }
 
+const backtick_program =
+    \\@[noreturn]
+    \\let halt:()=@panic("stop")
+    \\let forward:(x:`T)->`T=halt()
+    \\let choose:(flag:bool,x:`T)->`U=if flag {halt()} else {x}
+    \\let finish:()->`T=return
+    \\let loopValue:(x:`T)->`U=loop {break x}
+    \\let makeVoid:(x:`T)->()->`U=()->`U{return}
+    \\let makeBox:(x:`T)->Box(`T)=Box(`T)[.value=x]
+    \\let getBox:(x:Box(`T))->`T=x.value
+    \\let add:(x:`a,y:`b)->`c=x+y
+    \\let first:(items:[]`T)->`T=items[0]
+    \\let identity:(value:`T)->`T=value
+    \\let make:(value:`T)->()->`U=()->`U{return value}
+    \\let Box:(T:type)->type=struct{value:T,}
+    \\let unwrap:(x:Box(`T))->`U=x.value
+    \\let invert:(x:`T)->`U=!x
+    \\let size:(x:`T)->`U=x.len
+    \\let G:(T:type)->type=struct{let id:(x:`U)->`U=x
+    \\}
+    \\let wrap:(x:`T)->`U=G(uint).id(x)
+    \\let cell:(value:`T)->(`T)->`T={let mut saved:`T=value
+    \\(next:`T)->`T{saved=next
+    \\saved}}
+    \\let step:(x:uint)->uint={@println("arg",x)
+    \\x}
+    \\let main:()={
+    \\let fresh=getBox(makeBox(true))
+    \\let done=makeVoid(true)
+    \\done()
+    \\let n:uint=add(step(1),step(2))
+    \\@println(n,add("ab","cd"))
+    \\let mut a:[][]uint=[[1,2],[3]]
+    \\let b=identity(a)
+    \\let snapshot=make(a)
+    \\let mut row=a[0]
+    \\row[0]=9
+    \\a[0]=row
+    \\let c=snapshot()
+    \\@println(first(first(b)),first(first(c)),a[0][0])
+    \\let next=cell("old")
+    \\let alias=next
+    \\@println(next("new"),alias("last"))
+    \\let box=Box(string)[.value="field"]
+    \\@println(unwrap(box),invert(true),size("abc"),size([true,false]),wrap("ok"))
+    \\@println(fresh,if false {forward(true)} else {true},choose(false,"live"),loopValue("break"))
+    \\finish()}
+;
+
+fn emitBacktickSourceFree(allocator: std.mem.Allocator) ![]u8 {
+    var lowered = blk: {
+        var module = try Module.init(allocator, "backtick.nov", backtick_program);
+        defer module.deinit();
+        var result = try Lowering.lower(&module);
+        errdefer result.deinit();
+        if (module.hasErrors()) std.debug.print("backtick execution diagnostics: {any} {any}\n", .{ module.source.ast.errors, module.diagnostics.items });
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expect(result.lowering_complete);
+        break :blk result;
+    };
+    defer lowered.deinit();
+    try lowered.ir.verify();
+    return emit(allocator, &lowered.ir, null);
+}
+
+fn testBacktickSourceFree(allocator: std.mem.Allocator) !void {
+    const c = try emitBacktickSourceFree(allocator);
+    defer allocator.free(c);
+    try std.testing.expect(std.mem.indexOf(u8, c, "nov_env_element") != null);
+}
+
+test "backtick source free exact functions closures recursive copies LTR and forced GC C11" {
+    const library = try emitBacktickSourceFree(test_gpa);
+    defer test_gpa.free(library);
+    const c = try collectingTestProgram(library);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "arg 1\narg 2\n3 abcd\n1 1 9\nnew last\nfield false 3 2 ok\ntrue true live break\n", "", mode);
+}
+
+test "backtick source free compiler and emitter every allocation failure" {
+    try testBacktickSourceFree(test_gpa);
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testBacktickSourceFree, .{});
+}
+
+fn emitBacktickImportsSourceFree(allocator: std.mem.Allocator) ![]u8 {
+    var sema = blk: {
+        var comp = Compilation.init(allocator);
+        defer comp.deinit();
+        const root = try comp.addSource("/app/main.nov",
+            \\let api=@import("api.nov")
+            \\let alias=api.alias
+            \\let method=api.NS.id
+            \\let forward:(x:`T)->`T=api.stop()
+            \\let staticForward:(x:`T)->`T=api.NS.stop()
+            \\let main:()={let n:uint=alias(1,2)
+            \\@println(n,api.alias("a","b"),method("namespace"),api.decorate("ok"),if false {forward(true)} else {true},if false {staticForward(true)} else {true})}
+        );
+        const api = try comp.addSource("/app/api.nov",
+            \\let prefix="library:"
+            \\@[public]
+            \\@[noreturn]
+            \\let stop:()=@panic("stop")
+            \\@[public]
+            \\let add:(x:`a,y:`b)->`c=x+y
+            \\@[public]
+            \\let alias=add
+            \\@[public]
+            \\let decorate:(x:`T)->string=prefix+x
+            \\@[public]
+            \\let NS=struct{
+            \\@[public]
+            \\let id:(x:`T)->`T=x
+            \\@[public]
+            \\@[noreturn]
+            \\let stop:()=@panic("static")
+            \\}
+        );
+        const module = comp.getModule(root).?;
+        const local = module.lookup("api").?;
+        try comp.imports.append(allocator, .{ .declaration = comp.declaration_ids.get(.{ .source = root, .local = local }).?, .target = api, .named = false, .span = module.getDeclaration(local).?.name_span });
+        comp.setRoot(root);
+        var result = try Lowering.lowerCompilation(&comp);
+        errdefer result.deinit();
+        try std.testing.expect(!comp.hasErrors());
+        try std.testing.expect(result.lowering_complete);
+        break :blk result;
+    };
+    defer sema.deinit();
+    try sema.ir.verify();
+    return emit(allocator, &sema.ir, null);
+}
+
+fn testBacktickImportAllocations(allocator: std.mem.Allocator) !void {
+    allocator.free(try emitBacktickImportsSourceFree(allocator));
+}
+
+test "backtick imported aliases and namespace functions execute after graph release with forced GC" {
+    const library = try emitBacktickImportsSourceFree(test_gpa);
+    defer test_gpa.free(library);
+    const c = try collectingTestProgram(library);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "3 ab namespace library:ok true true\n", "", mode);
+}
+
+test "backtick imported functions own source free IR under every allocation failure" {
+    try testBacktickImportAllocations(test_gpa);
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testBacktickImportAllocations, .{});
+}
+
 fn testClosureOwnership(allocator: std.mem.Allocator, source: []const u8) !void {
     var lowered = blk: {
         var module = try Module.init(allocator, "closures.nov", source);

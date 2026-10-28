@@ -650,25 +650,64 @@ capabilities, function-valued fields, and function-valued C ABI
 boundaries remain unsupported. Shared captures are single-threaded; no concurrency
 semantics are introduced. See [`examples/closures.nov`](examples/closures.nov).
 
-### Inferred generic functions (approved syntax, not implemented)
+### Inferred generic functions (bounded executable subset)
 
-A backtick marks an inferred type variable, rather than a runtime or explicit
-compile-time argument. The same spelling can appear in parameters and results:
+Named generic functions support direct calls with backtick type variables in their
+signatures. A backtick marks an inferred type, not a runtime or explicit
+compile-time argument:
 
 ```nov
 let first: (items: []`T) -> `T = items[0]
 let add: (x: `a, y: `b) -> `c = x + y
 
-; The same signature notation applies to a generic closure.
-let identity = (value: `T) -> `T { value }
+let items: []uint = [1, 2]
+let head = first(items)       ; uint from a typed runtime argument
+let sum: uint = add(1, 2)    ; expected result and body constrain all three types
+let text = add("hel", "lo") ; string
 ```
 
-Different variable names introduce distinct inference variables; the body imposes
-constraints relating them. For the existing integer/string `+`, both operands and
-the result must have the same supported concrete type. This does not introduce
-implicit numeric conversions or general bare-integer defaults. Notation and
-constraint intent are agreed, but generic functions/closures are **not executable
-yet**. Explicit specialization and the full inference rules remain to be settled.
+Same-named variables agree; distinct names are related by exact body constraints.
+Inference combines typed runtime arguments, the expected call result and supported
+body constraints. Existing integer/string `+` requires one exact supported type
+for both operands and result. There are no implicit conversions or new numeric
+defaults: `let sum = add(1, 2)` is ambiguous.
+
+Signatures may contain nested arrays, function types and nominal generic-container
+templates such as ``Box(`T)``. Concrete function values can be passed to generic
+functions with function-typed parameters. Top-level functions, imported/public
+aliases, namespace static functions and generic-container static/sibling methods
+support direct calls; aliases share canonical specializations.
+
+Body inference is deliberately bounded. It gathers constraints from parameter/local
+reads and explicitly typed globals, string/rune/bool literals, boolean operations,
+exact operand relationships for arithmetic/bitwise/comparison operations, array
+indexing/literals, string indexing, known record fields and array/string `.len`,
+block bindings, `if/else`, conditional/unconditional loops, scoped returns and
+breaks, `@as`, supported direct calls and concrete function-value calls. Numeric literals do not select a type; index operands do not
+supply inference constraints. These relationships do not expand operator support:
+ordinary checking of the specialized body still validates every operation. Forms
+outside this solver subset are not general inference rules; if resolving a type
+requires an unsupported constraint, compilation gives an explicit unsupported-
+inference diagnostic. If types are otherwise resolved, ordinary body checking
+still applies. Terminating paths (including direct `noreturn` calls and `@panic`)
+do not contribute false `void` constraints; bare returns do constrain the enclosing
+result to `void`. This is internal control-flow tracking, not a new source type.
+
+Ordinary closures inside a generic body can capture values with substituted
+concrete types, including signatures referring to the enclosing type variables.
+They are **not generic closures**: local generic templates, closures introducing
+their own inferred type variables, unspecialized generic function values,
+contextual specialization of a generic function value, and generic **instance**
+method inference are unsupported. Explicit function specialization syntax is not
+provided.
+
+Specialization is demand-driven and canonical, bounded to 64 expansion levels and
+1024 specializations per defining module; inference is bounded to 8192 terms and
+128 levels. Unused generic bodies are not type-checked. Failed/OOM lowering rolls
+back partial specializations and demands; speculative result probes do not publish
+specializations or body demands. Fresh nominal result layouts can be inferred
+without depending on earlier instantiation order. See
+[`examples/generic-functions.nov`](examples/generic-functions.nov).
 
 `#` is separate: it denotes **proposed explicit compile-time arguments**, not
 inferred type variables. Compile-time argument handling is not implemented.
@@ -1101,7 +1140,8 @@ arguments produces the same nominal type. Distinct templates or different type
 arguments remain distinct, even with identical layouts. Expansion is bounded at
 64 levels, with alias traversal bounded at 128. Only plain named `type` parameters
 are supported in this slice, not value parameters, `#type`, general compile-time
-execution or generic functions returning runtime values. Generic container methods
+execution. Named runtime generic functions use the separate bounded backtick
+inference subset described above. Generic container methods
 specialize by canonical concrete container type; aliases share specializations and
 different type arguments remain isolated. `@This()` and immutable
 `let Self = @This()` container aliases refer to that concrete type. Static and

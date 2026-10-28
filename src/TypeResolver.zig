@@ -19,12 +19,27 @@ pub fn resolve(module: *Module, ir: *Ir, node: Ast.Node.Index) Error!?Ir.TypeId 
 }
 
 pub fn resolveInContainer(module: *Module, ir: *Ir, node: Ast.Node.Index, owner: ?Module.DeclId, concrete: ?u32) Error!?Ir.TypeId {
-    const container = owner orelse return resolve(module, ir, node);
+    return resolveInScope(module, ir, node, owner, concrete, &.{});
+}
+
+pub fn resolveInScope(module: *Module, ir: *Ir, node: Ast.Node.Index, owner: ?Module.DeclId, concrete: ?u32, function_bindings: []const Binding) Error!?Ir.TypeId {
+    return resolveScope(module, ir, node, owner, concrete, function_bindings, true);
+}
+
+/// Interns canonical type layouts without publishing container methods or IDs.
+/// A later non-speculative resolution completes method publication on demand.
+pub fn resolveInScopeReadOnly(module: *Module, ir: *Ir, node: Ast.Node.Index, owner: ?Module.DeclId, concrete: ?u32, function_bindings: []const Binding) Error!?Ir.TypeId {
+    return resolveScope(module, ir, node, owner, concrete, function_bindings, false);
+}
+
+fn resolveScope(module: *Module, ir: *Ir, node: Ast.Node.Index, owner: ?Module.DeclId, concrete: ?u32, function_bindings: []const Binding, publish_methods: bool) Error!?Ir.TypeId {
+    const container = owner orelse return resolveWithMode(module, ir, node, function_bindings, 0, publish_methods);
     var bindings: std.ArrayList(Binding) = .empty;
     defer bindings.deinit(module.allocator);
+    try bindings.appendSlice(module.allocator, function_bindings);
     const declaration = module.getDeclaration(container).?;
     const full = module.source.ast.decl(declaration.node).ast;
-    const this_type = if (concrete) |id| @as(Ir.TypeId, @fromBackingInt(@intCast(id))) else (try resolve(module, ir, full.init_node)) orelse return null;
+    const this_type = if (concrete) |id| @as(Ir.TypeId, @fromBackingInt(@intCast(id))) else (try resolveWithMode(module, ir, full.init_node, &.{}, 0, publish_methods)) orelse return null;
     try bindings.append(module.allocator, .{ .name = "@This", .ty = this_type });
     if (concrete != null) {
         const args = ir.getType(this_type).?.record.type_args;
@@ -43,7 +58,7 @@ pub fn resolveInContainer(module: *Module, ir: *Ir, node: Ast.Node.Index, owner:
             break;
         };
     }
-    return resolveWith(module, ir, node, bindings.items, expansions);
+    return resolveWithMode(module, ir, node, bindings.items, expansions, publish_methods);
 }
 
 pub fn isThisAlias(ast: *const Ast, node: Ast.Node.Index) bool {
@@ -53,11 +68,15 @@ pub fn isThisAlias(ast: *const Ast, node: Ast.Node.Index) bool {
     return call.ast.args.len == 0 and std.mem.eql(u8, ast.tokenSlice(ast.firstToken(call.ast.fn_expr)), "@This");
 }
 
-const Binding = struct { name: []const u8, ty: Ir.TypeId };
-const Environment = struct { bindings: []const Binding, expansions: usize };
+pub const Binding = Module.TypeBinding;
+const Environment = struct { bindings: []const Binding, expansions: usize, publish_methods: bool = true };
 pub const max_instantiation_depth = 64;
 
 fn resolveWith(module: *Module, ir: *Ir, node: Ast.Node.Index, bindings: []const Binding, expansions: usize) Error!?Ir.TypeId {
+    return resolveWithMode(module, ir, node, bindings, expansions, true);
+}
+
+fn resolveWithMode(module: *Module, ir: *Ir, node: Ast.Node.Index, bindings: []const Binding, expansions: usize, publish_methods: bool) Error!?Ir.TypeId {
     if (expansions >= max_instantiation_depth) return diagnose(module, node, .generic_limit);
     var aliases: AliasMap = .empty;
     defer aliases.deinit(module.allocator);
@@ -71,7 +90,7 @@ fn resolveWith(module: *Module, ir: *Ir, node: Ast.Node.Index, bindings: []const
     while (work.pop()) |task| switch (task) {
         .finish => |id| {
             const initializer = module.source.ast.decl(module.getDeclaration(id).?.node).ast.init_node;
-            const ty = try resolveDepth(module, ir, initializer, 0, &aliases, .{ .bindings = &.{}, .expansions = expansions });
+            const ty = try resolveDepth(module, ir, initializer, 0, &aliases, .{ .bindings = &.{}, .expansions = expansions, .publish_methods = publish_methods });
             try aliases.put(module.allocator, id, .{ .ty = ty });
         },
         .visit => |visit| {
@@ -108,7 +127,7 @@ fn resolveWith(module: *Module, ir: *Ir, node: Ast.Node.Index, bindings: []const
             }
         },
     };
-    return resolveDepth(module, ir, node, 0, &aliases, .{ .bindings = bindings, .expansions = expansions });
+    return resolveDepth(module, ir, node, 0, &aliases, .{ .bindings = bindings, .expansions = expansions, .publish_methods = publish_methods });
 }
 
 // Count all explicit type nodes on a path, including the root and leaf.
@@ -127,6 +146,10 @@ fn diagnose(module: *Module, node: Ast.Node.Index, tag: Module.Diagnostic.Tag) E
 fn resolveDepth(module: *Module, ir: *Ir, node: Ast.Node.Index, depth: usize, aliases: *const AliasMap, env: Environment) Error!?Ir.TypeId {
     if (depth >= max_type_depth) return diagnose(module, node, .type_nesting_limit);
     const ast = &module.source.ast;
+    if (ast.nodes.items(.tag)[node] == .type_variable) {
+        const name = ast.tokenSlice(ast.firstToken(node));
+        return lookupBinding(env.bindings, name) orelse diagnose(module, node, .unbound_type_variable);
+    }
     if (ast.fullFnProto(node)) |proto| {
         var params: std.ArrayList(Ir.TypeId) = .empty;
         defer params.deinit(module.allocator);
@@ -200,7 +223,7 @@ fn resolveDepth(module: *Module, ir: *Ir, node: Ast.Node.Index, depth: usize, al
         const declaration = owner.getDeclaration(ref.local).?;
         if (declaration.is_generic) return diagnose(module, node, .generic_needs_arguments);
         if (!declaration.is_type_alias) return diagnose(module, node, .not_a_type);
-        return resolveWith(owner, ir, owner.source.ast.decl(declaration.node).ast.init_node, &.{}, env.expansions + 1);
+        return resolveWithMode(owner, ir, owner.source.ast.decl(declaration.node).ast.init_node, &.{}, env.expansions + 1, env.publish_methods);
     }
     if (ast.nodes.items(.tag)[node] != .identifier) return diagnose(module, node, .unsupported_type);
     const name = ast.tokenSlice(ast.firstToken(node));
@@ -277,7 +300,7 @@ pub fn genericTarget(module: *const Module, node: Ast.Node.Index) ?Module.DeclId
     return (genericReference(module, node) orelse return null).local;
 }
 
-fn genericReference(module: *const Module, node: Ast.Node.Index) ?Compilation.DeclRef {
+pub fn genericReference(module: *const Module, node: Ast.Node.Index) ?Compilation.DeclRef {
     var owner = module;
     var current = node;
     for (0..max_alias_depth) |_| {
@@ -382,10 +405,18 @@ fn instantiate(module: *Module, ir: *Ir, call: Ast.full.Call, node: Ast.Node.Ind
     const args = try module.allocator.alloc(Ir.TypeId, call.ast.args.len);
     defer module.allocator.free(args);
     for (call.ast.args, args) |arg, *ty| ty.* = (try resolveDepth(module, ir, arg, depth + 1, aliases, env)) orelse return null;
-    return instantiateArguments(owner, ir, ref.local, args, env.expansions);
+    return instantiateArgumentsMode(owner, ir, ref.local, args, env.expansions, env.publish_methods);
 }
 
-fn instantiateArguments(module: *Module, ir: *Ir, id: Module.DeclId, args: []const Ir.TypeId, expansions: usize) Error!?Ir.TypeId {
+pub fn instantiateArguments(module: *Module, ir: *Ir, id: Module.DeclId, args: []const Ir.TypeId, expansions: usize) Error!?Ir.TypeId {
+    return instantiateArgumentsMode(module, ir, id, args, expansions, true);
+}
+
+pub fn instantiateArgumentsReadOnly(module: *Module, ir: *Ir, id: Module.DeclId, args: []const Ir.TypeId, expansions: usize) Error!?Ir.TypeId {
+    return instantiateArgumentsMode(module, ir, id, args, expansions, false);
+}
+
+fn instantiateArgumentsMode(module: *Module, ir: *Ir, id: Module.DeclId, args: []const Ir.TypeId, expansions: usize, publish_methods: bool) Error!?Ir.TypeId {
     const declaration = module.getDeclaration(id).?;
     const node = declaration.node;
     if (!try validateGeneric(module, id)) return null;
@@ -396,7 +427,10 @@ fn instantiateArguments(module: *Module, ir: *Ir, id: Module.DeclId, args: []con
     for (ir.types.items, 0..) |ty, i| {
         if (ty != .record or ty.record.source != module.source.id or ty.record.identity != @backingInt(id) or !std.mem.eql(Ir.TypeId, ty.record.type_args, args)) continue;
         switch (ty.record.instance_state) {
-            .complete => return @as(Ir.TypeId, @fromBackingInt(@intCast(i))),
+            .complete => {
+                if (!publish_methods or ty.record.methods_published) return @as(Ir.TypeId, @fromBackingInt(@intCast(i)));
+                existing = @fromBackingInt(@intCast(i));
+            },
             .building => return diagnose(module, node, .generic_cycle),
             // A speculative body probe may have rolled back its diagnostics.
             // Retry failed layouts so the real check reports the original cause.
@@ -425,7 +459,7 @@ fn instantiateArguments(module: *Module, ir: *Ir, id: Module.DeclId, args: []con
         if (ast.nodes.items(.tag)[member] != .container_field) continue;
         const data = ast.nodes.items(.data)[member];
         if (!tagged and data.lhs == 0) return diagnose(module, member, .unsupported_type);
-        const field_ty = if (data.lhs == 0) try ir.internType(.void) else (try resolveWith(module, ir, data.lhs, bindings.items, expansions + 1)) orelse return null;
+        const field_ty = if (data.lhs == 0) try ir.internType(.void) else (try resolveWithMode(module, ir, data.lhs, bindings.items, expansions + 1, publish_methods)) orelse return null;
         const ft = ir.getType(field_ty).?;
         if (ft == .record and ft.record.instance_state == .building) return diagnose(module, member, .generic_cycle);
         if (!(if (tagged) Ir.isUnionPayload(ft) else Ir.isRecordField(ft))) return diagnose(module, member, .unsupported_type);
@@ -445,12 +479,21 @@ fn instantiateArguments(module: *Module, ir: *Ir, id: Module.DeclId, args: []con
     try ir.setRecordFields(ty, fields.items);
     ir.types.items[@backingInt(ty)].record.instance_state = .complete;
     complete = true;
+    if (!publish_methods) return ty;
     // Specialized declarations retain source ASTs but have distinct stable IDs.
     // Publish all siblings together before any signature or body is checked.
     const count = module.declarations.items.len;
     for (0..count) |i| {
         var method = module.declarations.items[i];
         if (method.container != id or method.concrete_type != null) continue;
+        var published = false;
+        for (module.declarations.items) |other| {
+            if (other.node == method.node and other.concrete_type == @backingInt(ty) and other.function_template == null) {
+                published = true;
+                break;
+            }
+        }
+        if (published) continue;
         if (module.declarations.items.len == std.math.maxInt(u32)) return error.TooManyEntries;
         method.concrete_type = @backingInt(ty);
         method.specialization_depth = expansions + 1;
@@ -462,6 +505,7 @@ fn instantiateArguments(module: *Module, ir: *Ir, id: Module.DeclId, args: []con
             };
         }
     }
+    ir.types.items[@backingInt(ty)].record.methods_published = true;
     return ty;
 }
 

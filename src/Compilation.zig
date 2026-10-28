@@ -189,12 +189,8 @@ fn referenceDepth(self: *const Compilation, module: *const Module, node: Ast.Nod
     };
 }
 
-pub fn prepareSemantics(self: *Compilation) std.mem.Allocator.Error!void {
-    for (self.modules.items) |module| {
-        module.compilation = self;
-        module.clearSpecializations();
-        module.resetAliases();
-    }
+pub fn clearSpecializations(self: *Compilation) void {
+    for (self.modules.items) |module| module.clearSpecializations();
     // Drop only analysis-created suffix identities. Source declarations and
     // namespace edges keep their canonical IDs across repeated analyses.
     for (self.declarations.items, 0..) |ref, i| {
@@ -202,6 +198,14 @@ pub fn prepareSemantics(self: *Compilation) std.mem.Allocator.Error!void {
         for (self.declarations.items[i..]) |stale| _ = self.declaration_ids.remove(stale);
         self.declarations.shrinkRetainingCapacity(i);
         break;
+    }
+}
+
+pub fn prepareSemantics(self: *Compilation) std.mem.Allocator.Error!void {
+    self.clearSpecializations();
+    for (self.modules.items) |module| {
+        module.compilation = self;
+        module.resetAliases();
     }
     for (self.imports.items) |edge| {
         if (edge.node != null) continue;
@@ -233,6 +237,10 @@ pub fn prepareSemantics(self: *Compilation) std.mem.Allocator.Error!void {
                 }
                 if (target.is_type_alias and !decl.is_type_alias) {
                     decl.is_type_alias = true;
+                    changed = true;
+                }
+                if (target.is_generic_function and !decl.is_generic_function) {
+                    decl.is_generic_function = true;
                     changed = true;
                 }
                 if (target.is_generic and !decl.is_generic) {

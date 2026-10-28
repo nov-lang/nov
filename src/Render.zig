@@ -221,6 +221,7 @@ fn renderExpression(self: *Render, node: Ast.Node.Index, space: Space) RenderErr
             return self.renderIdentifier(token_index, space, .preserve_when_shadowing);
         },
 
+        .type_variable,
         .number_literal,
         .char_literal,
         .string_literal,

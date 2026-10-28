@@ -1,0 +1,88 @@
+; nov run examples/generic-functions.nov
+; nov test examples/generic-functions.nov
+; Backtick types are inferred exactly: literals need typed arguments or a result type.
+
+let first: (items: []`T) -> `T = items[0]
+let add: (x: `a, y: `b) -> `c = x + y
+let twice: (x: `T) -> `U = add(x, x)
+let apply: (f: (`T) -> `U, x: `T) -> `U = f(x)
+let increment: (x: uint) -> uint = x + 1
+let snapshot: (value: `T) -> () -> `T = () -> `T {
+    value
+}
+let namedSnapshot: (value: `T) -> (bool) -> `T = {
+    let captured: (ignored: bool) -> `T = value
+    captured
+}
+
+let Box: (T: type) -> type = struct {
+    value: T,
+}
+
+let unwrap: (box: Box(`T)) -> `U = box.value
+let invert: (value: `T) -> `U = !value
+let size: (value: `T) -> `U = value.len
+let looped: (value: `T) -> `U = loop {
+    break value
+}
+
+let main: () = {
+    let numbers: []uint = [7, 8]
+    let total: uint = add(1, 2)
+    let saved = snapshot("captured")
+    @println(first(numbers), add(@as(uint, 1), 2), total, add("hello", "!"))
+    @println(apply(increment, 4), unwrap(Box(string)[ .value = "boxed" ]), saved())
+}
+
+@[test]
+let first_and_nested_arrays: () = {
+    let values: [][]uint = [[7, 8], [9]]
+    @assert(first(first(values)) == 7)
+    @assert(first(["first", "second"]) == "first")
+}
+
+@[test]
+let exact_add_constraints: () = {
+    let total: uint = add(1, 2)
+    @assert(total == 3)
+    @assert(add(@as(uint, 1), 2) == 3)
+    @assert(add("hello", "!") == "hello!")
+    let doubled: uint = twice(4)
+    @assert(doubled == 8)
+}
+
+@[test]
+let ordinary_callback: () = {
+    @assert(apply(increment, 4) == 5)
+    let double = (x: uint) -> uint {
+        x + x
+    }
+    @assert(apply(double, 3) == 6)
+}
+
+@[test]
+let nominal_box: () = {
+    let nested = Box(Box(string))[ .value = Box(string)[ .value = "nested" ] ]
+    @assert(unwrap(unwrap(nested)) == "nested")
+}
+
+@[test]
+let returned_closures_and_array_copies: () = {
+    let mut values: []string = ["before"]
+    let saved = snapshot(values)
+    let copied = saved()
+    values[0] = "after"
+    @assert(first(copied) == "before")
+    @assert(first(saved()) == "before")
+    @assert(first(values) == "after")
+    let named = namedSnapshot("named")
+    @assert(named(false) == "named")
+}
+
+@[test]
+let body_constraints: () = {
+    @assert(invert(false))
+    @assert(looped(true))
+    @assert(size("abc") == 3)
+    @assert(size([true, false]) == 2)
+}

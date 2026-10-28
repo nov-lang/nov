@@ -11,6 +11,7 @@ const primitives = @import("primitives.zig");
 const Sema = @This();
 const Compilation = @import("Compilation.zig");
 const Dependencies = @import("Dependencies.zig");
+const GenericFunctions = @import("GenericFunctions.zig");
 
 allocator: std.mem.Allocator,
 ir: Ir,
@@ -41,6 +42,7 @@ pub fn analyzeAnnotations(module: *Module) Error!Sema {
     const diagnostics_start = module.diagnostics.items.len;
     errdefer module.diagnostics.shrinkRetainingCapacity(diagnostics_start);
     module.clearSpecializations();
+    errdefer module.clearSpecializations();
     module.resetAliases();
     try module.classifyAliases();
     var result: Sema = .{
@@ -68,7 +70,7 @@ fn analyzeModuleAnnotations(result: *Sema, module: *Module) Error!void {
             result.entries[result.entryIndex(module, @fromBackingInt(@intCast(i)))].status = .ignored;
             continue;
         }
-        if (declaration.is_generic) {
+        if (declaration.is_generic or declaration.is_generic_function) {
             if (declaration.is_record) _ = try TypeResolver.validateGeneric(module, @fromBackingInt(@intCast(i)));
             result.entries[result.entryIndex(module, @fromBackingInt(@intCast(i)))].status = .generic;
             continue;
@@ -93,7 +95,7 @@ fn analyzeModuleAnnotations(result: *Sema, module: *Module) Error!void {
             result.entries[result.entryIndex(module, @fromBackingInt(@intCast(i)))].status = .namespace;
             continue;
         }
-        if (declaration.is_record or declaration.is_generic) continue;
+        if (declaration.is_record or declaration.is_generic or declaration.is_generic_function) continue;
         if (declaration.container) |owner| if (module.getDeclaration(owner).?.is_generic and declaration.concrete_type == null) {
             result.entries[result.entryIndex(module, @fromBackingInt(@intCast(i)))].status = .generic;
             continue;
@@ -311,6 +313,7 @@ fn finalizeFieldDefaults(self: *Sema, module: *Module) Error!void {
 /// Checks the bounded expression-body subset after collecting all annotations.
 /// This does not resolve global initializers or produce executable operations.
 pub fn analyzeFunctions(module: *Module) Error!Sema {
+    errdefer module.clearSpecializations();
     const diagnostics_start = module.diagnostics.items.len;
     errdefer module.diagnostics.shrinkRetainingCapacity(diagnostics_start);
     var result = try analyzeAnnotations(module);
@@ -343,6 +346,7 @@ pub fn analyzeFunctions(module: *Module) Error!Sema {
 
 /// Owns one shared IR; entries are indexed by Compilation.DeclId.
 pub fn analyzeCompilation(comp: *Compilation) Error!Sema {
+    errdefer comp.clearSpecializations();
     if (comp.hasErrors()) return error.InvalidModule;
     const starts = try comp.allocator.alloc(usize, comp.modules.items.len);
     defer comp.allocator.free(starts);
@@ -442,6 +446,50 @@ pub fn requestType(self: *Sema, module: *Module, id: Module.DeclId) Ir.BuildErro
     }
     self.entries[self.entryIndex(module, @fromBackingInt(@intCast(index)))] = .{ .type_id = ty, .status = .signature_only, .noreturn = declaration.noreturn };
     return ty;
+}
+
+/// Cache by defining declaration and canonical, ordered variable bindings.
+/// Publish the signature before queuing the body, permitting mutual recursion.
+pub fn specializeFunction(self: *Sema, caller: *Module, ref: GenericFunctions.Ref, bindings: []const Module.TypeBinding, depth: usize, span: Module.Span) Ir.BuildError!?Module.DeclId {
+    const module = ref.module;
+    var count: usize = 0;
+    for (module.declarations.items, 0..) |decl, i| {
+        if (decl.function_template == null) continue;
+        count += 1;
+        if (decl.function_template != ref.id or decl.function_bindings.len != bindings.len) continue;
+        var equal = true;
+        for (decl.function_bindings, bindings) |a, b| if (a.ty != b.ty) {
+            equal = false;
+            break;
+        };
+        if (equal) return @fromBackingInt(@intCast(i));
+    }
+    if (depth >= GenericFunctions.max_specialization_depth or count >= GenericFunctions.max_specializations) {
+        try caller.diagnostics.append(caller.allocator, .{ .tag = .generic_function_limit, .span = span, .related = module.getDeclaration(ref.id).?.name_span });
+        return null;
+    }
+    var decl = module.getDeclaration(ref.id).?;
+    const function = module.source.ast.declFunction(decl.node).?;
+    const ty = (try TypeResolver.resolveInScope(module, &self.ir, function.proto_node, decl.container, decl.concrete_type, bindings)) orelse return null;
+    if (decl.noreturn and self.ir.getType(self.ir.getType(ty).?.function.result).? != .void) {
+        try module.diagnostics.append(module.allocator, .{ .tag = .noreturn_result, .span = decl.name_span });
+        return null;
+    }
+    decl.function_bindings = try module.allocator.dupe(Module.TypeBinding, bindings);
+    decl.function_template = ref.id;
+    decl.is_generic_function = false;
+    decl.specialization_depth = depth + 1;
+    decl.export_name = null;
+    decl.extern_name = null;
+    const id: Module.DeclId = @fromBackingInt(@intCast(module.declarations.items.len));
+    module.declarations.append(module.allocator, decl) catch |err| {
+        module.allocator.free(decl.function_bindings);
+        return err;
+    };
+    // Ownership transfers to Module even if syncing the graph fails.
+    try self.syncEntries(module);
+    self.entries[self.entryIndex(module, id)] = .{ .type_id = ty, .status = .signature_only, .noreturn = decl.noreturn };
+    return id;
 }
 
 pub fn deinit(self: *Sema) void {

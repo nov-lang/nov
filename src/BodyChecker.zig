@@ -9,6 +9,7 @@ const Module = @import("Module.zig");
 const Ir = @import("Ir.zig");
 const Literal = @import("Literal.zig");
 const TypeResolver = @import("TypeResolver.zig");
+const GenericFunctions = @import("GenericFunctions.zig");
 const isPrimitive = @import("primitives.zig").isPrimitive;
 
 pub const Error = Ir.BuildError;
@@ -119,7 +120,7 @@ fn checkInner(module: *Module, ir: *Ir, types: []const ?Ir.TypeId, id: Module.De
     const function = module.source.ast.declFunction(declaration.node) orelse return error.InvalidTypeId;
     const proto = module.source.ast.fullFnProto(function.proto_node) orelse return error.InvalidTypeId;
     if (proto.ast.params.len != ty.function.params.len) return error.InvalidTypeId;
-    var context: Context = .{ .module = module, .ir = ir, .types = types, .emitter = emitter, .container = declaration.container, .concrete_type = declaration.concrete_type, .sema = sema };
+    var context: Context = .{ .module = module, .ir = ir, .types = types, .emitter = emitter, .container = declaration.container, .concrete_type = declaration.concrete_type, .sema = sema, .function_bindings = declaration.function_bindings, .specialization_depth = declaration.specialization_depth };
     defer context.bindings.deinit(module.allocator);
     defer context.locals.deinit(module.allocator);
     var iterator = proto.iterate(&module.source.ast);
@@ -197,6 +198,9 @@ const Context = struct {
     emitter: ?*Emitter = null,
     container: ?Module.DeclId = null,
     concrete_type: ?u32 = null,
+    function_bindings: []const Module.TypeBinding = &.{},
+    specialization_depth: usize = 0,
+    probing: bool = false,
     return_type: Known = undefined,
     // Termination is independent of the contextual value type. A terminal
     // expression has no merge value, and enclosing expressions alias its exit.
@@ -212,6 +216,23 @@ const Context = struct {
     captures: std.ArrayList(Ir.Capture) = .empty,
     capture_names: std.ArrayList([]const u8) = .empty,
     capture_values: std.ArrayList(Ir.ValueId) = .empty,
+
+    fn resolveType(self: *Context, node: Ast.Node.Index) Error!?Ir.TypeId {
+        if (self.probing) return TypeResolver.resolveInScopeReadOnly(self.module, self.ir, node, self.container, self.concrete_type, self.function_bindings);
+        return TypeResolver.resolveInScope(self.module, self.ir, node, self.container, self.concrete_type, self.function_bindings);
+    }
+
+    fn hasUnboundSignatureVariables(self: *Context, node: Ast.Node.Index) bool {
+        const ast = &self.module.source.ast;
+        for (ast.tokens.items(.tag)[ast.firstToken(node) .. ast.lastToken(node) + 1], ast.firstToken(node)..) |tag, token| {
+            if (tag != .type_variable) continue;
+            const name = ast.tokenSlice(@intCast(token));
+            for (self.function_bindings) |binding| {
+                if (std.mem.eql(u8, binding.name, name)) break;
+            } else return true;
+        }
+        return false;
+    }
 
     fn lookupBinding(self: *Context, name: []const u8) ?Binding {
         return self.bindings.get(name) orelse if (self.parent) |parent| parent.lookupBinding(name) else null;
@@ -269,14 +290,15 @@ const Context = struct {
     fn functionBody(self: *Context, node: Ast.Node.Index, proto_node: Ast.Node.Index, body_node: Ast.Node.Index, expected: ?Known, depth: usize) Error!?Ir.TypeId {
         const ast = &self.module.source.ast;
         const function = .{ .proto = ast.fullFnProto(proto_node).?, .body = body_node };
-        const ty = (try TypeResolver.resolveInContainer(self.module, self.ir, function.proto.ast.proto_node, self.container, self.concrete_type)) orelse return null;
+        if (self.hasUnboundSignatureVariables(proto_node)) return self.fail(.generic_function_context, proto_node, null);
+        const ty = (try self.resolveType(function.proto.ast.proto_node)) orelse return null;
         if (try self.fit(ty, expected, node) == null) return null;
         // Pool growth while checking nested bodies must not invalidate signatures.
         const signature = self.ir.getType(ty).?.function;
         var arena = std.heap.ArenaAllocator.init(self.module.allocator);
         defer arena.deinit();
         var emitter: Emitter = .{ .allocator = arena.allocator(), .constants = if (self.emitter) |e| e.constants else &.{}, .functions = if (self.emitter) |e| e.functions else &.{} };
-        var child: Context = .{ .module = self.module, .ir = self.ir, .types = self.types, .sema = self.sema, .container = self.container, .concrete_type = self.concrete_type, .parent = self, .emitter = null, .return_type = .{ .ty = signature.result } };
+        var child: Context = .{ .module = self.module, .ir = self.ir, .types = self.types, .sema = self.sema, .container = self.container, .concrete_type = self.concrete_type, .parent = self, .emitter = null, .function_bindings = self.function_bindings, .specialization_depth = self.specialization_depth, .return_type = .{ .ty = signature.result } };
         defer child.bindings.deinit(self.module.allocator);
         defer child.locals.deinit(self.module.allocator);
         defer child.captures.deinit(self.module.allocator);
@@ -468,6 +490,10 @@ const Context = struct {
                 if (param.name_token != null) local_function = true;
             }
         }
+        if (local_function and self.hasUnboundSignatureVariables(decl.type_node)) {
+            _ = try self.fail(.generic_function_context, decl.type_node, null);
+            return false;
+        }
         if (decl.init_node == 0) {
             _ = try self.fail(.missing_initializer, node, null);
             return false;
@@ -475,7 +501,7 @@ const Context = struct {
         if (ast.nodes.items(.tag)[decl.init_node] == .ref_of)
             return self.borrowLocal(node, name, name_span, depth);
         const annotation: ?Known = if (decl.type_node != 0) .{
-            .ty = (try TypeResolver.resolveInContainer(self.module, self.ir, decl.type_node, self.container, self.concrete_type)) orelse return false,
+            .ty = (try self.resolveType(decl.type_node)) orelse return false,
             .annotation = self.module.tokenSpan(ast.firstToken(decl.type_node)),
         } else null;
         if (decl.is_mutable and annotation != null and self.ir.getType(annotation.?.ty).? == .void) {
@@ -596,7 +622,7 @@ const Context = struct {
                 const name = ast.tokenSlice(token);
                 if (self.conflict(name) != null or isPrimitive(name)) return null;
                 const known: Known = if (decl.type_node != 0)
-                    .{ .ty = (try TypeResolver.resolveInContainer(self.module, self.ir, decl.type_node, self.container, self.concrete_type)) orelse return null }
+                    .{ .ty = (try self.resolveType(decl.type_node)) orelse return null }
                 else if (decl.init_node != 0)
                     (try self.probe(decl.init_node, depth + 1)) orelse return null
                 else
@@ -643,7 +669,7 @@ const Context = struct {
                         const name = ast.tokenSlice(token);
                         if (self.conflict(name) != null or isPrimitive(name)) return null;
                         const known: ?Known = if (decl.type_node != 0)
-                            if (try TypeResolver.resolveInContainer(self.module, self.ir, decl.type_node, self.container, self.concrete_type)) |ty| .{ .ty = ty } else null
+                            if (try self.resolveType(decl.type_node)) |ty| .{ .ty = ty } else null
                         else if (decl.init_node != 0) try self.probe(decl.init_node, depth + 1) else null;
                         if (known) |value| try self.bindLocal(name, .{ .known = value, .name_span = self.module.tokenSpan(token) });
                     } else {
@@ -729,13 +755,125 @@ const Context = struct {
 
     fn globalType(self: *Context, id: Module.DeclId) Error!?Known {
         const owner = self.declarationModule(id);
+        if (self.getDeclaration(id).is_generic_function) return null;
         if (self.getDeclaration(id).is_test) {
             try self.module.diagnostics.append(self.module.allocator, .{ .tag = .test_not_callable, .span = self.getDeclaration(id).name_span });
             return null;
         }
-        const ty = (if (self.sema) |analysis| try analysis.requestType(owner, self.localId(id)) else if (@backingInt(id) < self.types.len) self.types[@backingInt(id)] else null) orelse return null;
+        const ty = (if (self.sema) |analysis| blk: {
+            if (!self.probing) break :blk try analysis.requestType(owner, self.localId(id));
+            const index = analysis.entryIndex(owner, self.localId(id));
+            if (index < analysis.entries.len) if (analysis.entries[index].type_id) |known| break :blk known;
+            const declaration = self.getDeclaration(id);
+            if (declaration.is_type_alias or declaration.is_generic or declaration.is_namespace) break :blk null;
+            const function = owner.source.ast.declFunction(declaration.node) orelse break :blk null;
+            break :blk try TypeResolver.resolveInScopeReadOnly(owner, self.ir, function.proto_node, declaration.container, declaration.concrete_type, declaration.function_bindings);
+        } else if (@backingInt(id) < self.types.len) self.types[@backingInt(id)] else null) orelse return null;
         const full = owner.source.ast.decl(self.getDeclaration(id).node);
         return .{ .ty = ty, .annotation = if (full.ast.type_node != 0) owner.tokenSpan(owner.source.ast.firstToken(full.ast.type_node)) else null };
+    }
+
+    fn genericTarget(self: *Context, node: Ast.Node.Index) Error!?GenericFunctions.Ref {
+        const ast = &self.module.source.ast;
+        if (ast.nodes.items(.tag)[node] == .identifier) {
+            const name = ast.tokenSlice(ast.firstToken(node));
+            if (self.lookupBinding(name) != null) return null;
+            if (self.container) |container| if (self.module.lookupConcreteMethod(container, self.concrete_type, name)) |id| {
+                if (!self.module.getDeclaration(id).?.is_generic_function) return null;
+                return .{ .module = self.module, .id = id };
+            };
+        }
+        if (GenericFunctions.target(self.module, node)) |ref| return ref;
+        if (self.probing) {
+            if (ast.nodes.items(.tag)[node] != .field_access) return null;
+            const data = ast.nodes.items(.data)[node];
+            const call = ast.fullCall(data.lhs) orelse return null;
+            if (TypeResolver.genericTarget(self.module, call.ast.fn_expr) == null and !std.mem.eql(u8, ast.tokenSlice(ast.firstToken(call.ast.fn_expr)), "@This")) return null;
+            const ty = (try self.resolveType(data.lhs)) orelse return null;
+            const nominal = self.ir.getType(ty).?;
+            if (nominal != .record) return null;
+            const owner = if (self.module.compilation) |comp| comp.getModule(nominal.record.source).? else self.module;
+            const id = owner.lookupMethod(@fromBackingInt(nominal.record.identity), ast.tokenSlice(data.rhs)) orelse return null;
+            const declaration = owner.getDeclaration(id).?;
+            if (!declaration.is_generic_function or (owner != self.module and !declaration.public)) return null;
+            return .{ .module = owner, .id = id, .container_type = ty };
+        }
+        const id = if (ast.nodes.items(.tag)[node] == .identifier)
+            self.valueDeclaration(ast.tokenSlice(ast.firstToken(node))) orelse return null
+        else
+            (try self.staticMethod(node)) orelse return null;
+        if (!self.getDeclaration(id).is_generic_function) return null;
+        return .{ .module = self.declarationModule(id), .id = self.localId(id) };
+    }
+
+    fn probeStaticMethod(self: *Context, node: Ast.Node.Index) Error!?struct { ty: Ir.TypeId, noreturn: bool, span: Module.Span } {
+        const ast = &self.module.source.ast;
+        if (ast.nodes.items(.tag)[node] != .field_access) return null;
+        const data = ast.nodes.items(.data)[node];
+        const call = ast.fullCall(data.lhs) orelse return null;
+        if (TypeResolver.genericTarget(self.module, call.ast.fn_expr) == null and !std.mem.eql(u8, ast.tokenSlice(ast.firstToken(call.ast.fn_expr)), "@This")) return null;
+        const ty = (try self.resolveType(data.lhs)) orelse return null;
+        const nominal = self.ir.getType(ty).?;
+        if (nominal != .record) return null;
+        const owner = if (self.module.compilation) |comp| comp.getModule(nominal.record.source).? else self.module;
+        const id = owner.lookupMethod(@fromBackingInt(nominal.record.identity), ast.tokenSlice(data.rhs)) orelse return null;
+        const declaration = owner.getDeclaration(id).?;
+        if (declaration.is_generic_function or (owner != self.module and !declaration.public)) return null;
+        const function = owner.source.ast.declFunction(declaration.node) orelse return null;
+        const start = owner.diagnostics.items.len;
+        defer owner.diagnostics.shrinkRetainingCapacity(start);
+        const signature = (try TypeResolver.resolveInScopeReadOnly(owner, self.ir, function.proto_node, declaration.container, @backingInt(ty), declaration.function_bindings)) orelse return null;
+        return .{ .ty = signature, .noreturn = declaration.noreturn, .span = declaration.name_span };
+    }
+
+    fn genericProbe(self: *Context, node: Ast.Node.Index, call: Ast.full.Call, ref: GenericFunctions.Ref, depth: usize) Error!?Ir.TypeId {
+        const args = try self.module.allocator.alloc(GenericFunctions.Argument, call.ast.args.len);
+        defer self.module.allocator.free(args);
+        for (call.ast.args, args) |arg, *out| {
+            const known = try self.probe(arg, depth + 1);
+            out.* = .{ .ty = if (known) |k| k.ty else null, .span = self.irSpan(arg) };
+        }
+        return GenericFunctions.probeResult(self.module, self.ir, ref, args, self.irSpan(node));
+    }
+
+    fn genericSignature(self: *Context, node: Ast.Node.Index, call: Ast.full.Call, ref: GenericFunctions.Ref, expected: ?Known, depth: usize) Error!?struct { id: Module.DeclId, ty: Ir.TypeId } {
+        const args = try self.module.allocator.alloc(GenericFunctions.Argument, call.ast.args.len);
+        defer self.module.allocator.free(args);
+        for (call.ast.args, args) |arg, *out| {
+            const known = try self.probe(arg, depth + 1);
+            out.* = .{ .ty = if (known) |k| k.ty else null, .span = self.irSpan(arg) };
+        }
+        const bindings = (try GenericFunctions.infer(self.module, self.ir, ref, args, if (expected) |want| .{ .ty = want.ty, .span = want.annotation orelse self.irSpan(node) } else null, self.irSpan(node))) orelse return null;
+        defer self.module.allocator.free(bindings);
+        const specialized_id = if (self.sema) |analysis|
+            (try analysis.specializeFunction(self.module, ref, bindings, self.specialization_depth, self.irSpan(node))) orelse return null
+        else blk: {
+            for (ref.module.declarations.items, 0..) |decl, i| {
+                if (decl.function_template != ref.id or decl.function_bindings.len != bindings.len) continue;
+                var equal = true;
+                for (decl.function_bindings, bindings) |a, b| if (a.ty != b.ty) {
+                    equal = false;
+                    break;
+                };
+                if (equal) break :blk @as(Module.DeclId, @fromBackingInt(@intCast(i)));
+            }
+            return null;
+        };
+        const id = self.qualify(ref.module, specialized_id);
+        const known = (try self.globalType(id)) orelse return null;
+        return .{ .id = id, .ty = known.ty };
+    }
+
+    fn genericCall(self: *Context, node: Ast.Node.Index, call: Ast.full.Call, ref: GenericFunctions.Ref, expected: ?Known, depth: usize) Error!?Ir.TypeId {
+        const selected = (try self.genericSignature(node, call, ref, expected, depth)) orelse return null;
+        const function = self.ir.getType(selected.ty).?.function;
+        if (self.emitter) |emitter| try emitter.record(call.ast.fn_expr, selected.ty, self.irSpan(call.ast.fn_expr), .{ .function_ref = emitter.functions[@backingInt(selected.id)].? });
+        for (call.ast.args, function.params) |arg, param| {
+            if (try self.expression(arg, .{ .ty = param, .annotation = ref.module.getDeclaration(ref.id).?.name_span }, depth + 1) == null) return null;
+            if (self.terminated) return if (expected) |want| want.ty else function.result;
+            try self.copyNode(arg, param);
+        }
+        return self.finishCall(node, call.ast.fn_expr, function.result, expected);
     }
 
     fn isAssertion(self: *Context, node: Ast.Node.Index) bool {
@@ -753,7 +891,7 @@ const Context = struct {
     fn ascribedType(self: *Context, call: Ast.full.Call) Error!?Known {
         if (call.ast.args.len != 2) return null;
         const node = call.ast.args[0];
-        const ty = (try TypeResolver.resolveInContainer(self.module, self.ir, node, self.container, self.concrete_type)) orelse return null;
+        const ty = (try self.resolveType(node)) orelse return null;
         return .{ .ty = ty, .annotation = self.span(node) };
     }
 
@@ -763,7 +901,7 @@ const Context = struct {
         const data = ast.nodes.items(.data)[node];
         if (self.module.compilation) |comp| if (comp.reference(self.module, node)) |ref| {
             const owner = comp.getModule(ref.source).?;
-            if (self.sema) |analysis| try analysis.syncEntries(owner);
+            if (!self.probing) if (self.sema) |analysis| try analysis.syncEntries(owner);
             return self.qualify(owner, ref.local);
         };
         if (ast.nodes.items(.tag)[data.lhs] == .identifier) {
@@ -778,8 +916,8 @@ const Context = struct {
             const ref = comp.reference(self.module, data.lhs) orelse return null;
             if (!comp.getModule(ref.source).?.getDeclaration(ref.local).?.is_type_alias) return null;
         }
-        const ty = (try TypeResolver.resolveInContainer(self.module, self.ir, data.lhs, self.container, self.concrete_type)) orelse return null;
-        if (self.sema) |analysis| try analysis.syncEntries(self.module);
+        const ty = (try self.resolveType(data.lhs)) orelse return null;
+        if (!self.probing) if (self.sema) |analysis| try analysis.syncEntries(self.module);
         return self.nominalMethod(ty, ast.tokenSlice(data.rhs));
     }
 
@@ -795,6 +933,9 @@ const Context = struct {
             if (self.bindings.contains(name)) return false;
             break :blk self.valueDeclaration(name) orelse return false;
         } else (try self.staticMethod(node)) orelse return false;
+        if (self.getDeclaration(id).is_generic_function) {
+            if (GenericFunctions.target(self.module, node)) |ref| return ref.module.getDeclaration(ref.id).?.noreturn;
+        }
         return self.getDeclaration(id).noreturn;
     }
 
@@ -885,7 +1026,7 @@ const Context = struct {
         } else {
             if (self.module.compilation) |comp| if (comp.reference(self.module, qualifier)) |ref| {
                 if (!comp.getModule(ref.source).?.getDeclaration(ref.local).?.is_type_alias) return null;
-                return try TypeResolver.resolveInContainer(self.module, self.ir, qualifier, self.container, self.concrete_type);
+                return try self.resolveType(qualifier);
             };
             if (ast.nodes.items(.tag)[qualifier] != .identifier) return null;
             const name = ast.tokenSlice(ast.firstToken(qualifier));
@@ -893,7 +1034,7 @@ const Context = struct {
             const id = self.valueDeclaration(name) orelse return null;
             if (!self.getDeclaration(id).is_type_alias and !TypeResolver.isThisAlias(&self.declarationModule(id).source.ast, self.getDeclaration(id).node)) return null;
         }
-        const ty = (try TypeResolver.resolveInContainer(self.module, self.ir, qualifier, self.container, self.concrete_type)) orelse return null;
+        const ty = (try self.resolveType(qualifier)) orelse return null;
         return if (self.tagged(ty)) ty else null;
     }
 
@@ -982,7 +1123,7 @@ const Context = struct {
     fn recordInit(self: *Context, node: Ast.Node.Index, expected: ?Known, depth: usize) Error!?Ir.TypeId {
         const ast = &self.module.source.ast;
         const init = ast.fullStructInit(node).?;
-        const ty = (try TypeResolver.resolveInContainer(self.module, self.ir, init.type_node, self.container, self.concrete_type)) orelse return null;
+        const ty = (try self.resolveType(init.type_node)) orelse return null;
         const record = self.ir.getType(ty).?;
         if (record != .record) return self.fail(.not_a_type, init.type_node, null);
         if (record.record.tagged) return self.fail(.invalid_union_constructor, node, null);
@@ -1029,11 +1170,15 @@ const Context = struct {
     // or diagnosing unbound names. The actual walk still checks both operands.
     fn probe(self: *Context, node: Ast.Node.Index, depth: usize) Error!?Known {
         if (depth >= max_recursive_depth) return null;
+        const was_probing = self.probing;
+        self.probing = true;
+        defer self.probing = was_probing;
         const ast = &self.module.source.ast;
         const data = ast.nodes.items(.data)[node];
         return switch (ast.nodes.items(.tag)[node]) {
             .function_expr => blk: {
-                const ty = (try TypeResolver.resolveInContainer(self.module, self.ir, ast.nodes.items(.data)[node].lhs, self.container, self.concrete_type)) orelse break :blk null;
+                if (self.hasUnboundSignatureVariables(ast.nodes.items(.data)[node].lhs)) break :blk null;
+                const ty = (try self.resolveType(ast.nodes.items(.data)[node].lhs)) orelse break :blk null;
                 break :blk .{ .ty = ty };
             },
             .identifier => blk: {
@@ -1065,10 +1210,11 @@ const Context = struct {
             .container_decl_arg => blk: {
                 if (ast.nodes.items(.tag)[data.lhs] == .enum_literal) break :blk null;
                 if (try self.qualifiedUnion(data.lhs)) |ty| break :blk .{ .ty = ty };
-                const ty = (try TypeResolver.resolveInContainer(self.module, self.ir, data.lhs, self.container, self.concrete_type)) orelse break :blk null;
+                const ty = (try self.resolveType(data.lhs)) orelse break :blk null;
                 break :blk .{ .ty = ty };
             },
             .field_access => blk: {
+                if (try self.probeStaticMethod(node)) |method| break :blk .{ .ty = method.ty, .annotation = method.span };
                 if (try Literal.qualifiedEnum(self.module, self.ir, node)) |ty| break :blk .{ .ty = ty };
                 if (try self.staticMethod(node)) |id| break :blk try self.globalType(id);
                 const base = (try self.probe(data.lhs, depth + 1)) orelse break :blk null;
@@ -1139,6 +1285,17 @@ const Context = struct {
             },
             .call, .call_one => blk: {
                 const call = ast.fullCall(node).?;
+                if (try self.genericTarget(call.ast.fn_expr)) |ref| {
+                    if (ref.module.getDeclaration(ref.id).?.noreturn) break :blk null;
+                    const start = self.module.diagnostics.items.len;
+                    defer self.module.diagnostics.shrinkRetainingCapacity(start);
+                    const result = (try self.genericProbe(node, call, ref, depth + 1)) orelse break :blk null;
+                    break :blk .{ .ty = result };
+                }
+                if (try self.probeStaticMethod(call.ast.fn_expr)) |method| {
+                    if (method.noreturn) break :blk null;
+                    break :blk .{ .ty = self.ir.getType(method.ty).?.function.result, .annotation = method.span };
+                }
                 if (try self.directNoreturn(call.ast.fn_expr)) break :blk null;
                 if (self.isAscription(call.ast.fn_expr)) {
                     const diagnostics_start = self.module.diagnostics.items.len;
@@ -2290,6 +2447,7 @@ const Context = struct {
             },
             .array_access, .field_access => {
                 if (try self.staticMethod(node)) |id| {
+                    if (self.getDeclaration(id).is_generic_function) return self.fail(.generic_function_context, node, self.getDeclaration(id).name_span);
                     const known = (try self.globalType(id)) orelse return self.fail(.unresolved_value_type, node, null);
                     return self.fit(known.ty, expected, node);
                 }
@@ -2329,6 +2487,7 @@ const Context = struct {
                 if (self.valueDeclaration(name)) |id| {
                     const declaration = self.getDeclaration(id);
                     if (isPrimitive(name)) return self.fail(.unsupported_shadowing, node, declaration.name_span);
+                    if (declaration.is_generic_function) return self.fail(.generic_function_context, node, declaration.name_span);
                     if (declaration.is_type_alias) return self.fail(.not_a_value, node, declaration.name_span);
                     const known = (try self.globalType(id)) orelse return self.fail(.unresolved_value_type, node, declaration.name_span);
                     return self.fit(known.ty, expected, node);
@@ -2626,6 +2785,7 @@ const Context = struct {
             },
             .call, .call_one => {
                 const call = ast.fullCall(node).?;
+                if (try self.genericTarget(call.ast.fn_expr)) |ref| return self.genericCall(node, call, ref, expected, depth);
                 if (self.isAscription(call.ast.fn_expr)) {
                     if (call.ast.args.len != 2) return self.fail(.argument_count_mismatch, node, null);
                     const ascribed = (try self.ascribedType(call)) orelse return null;
@@ -2690,6 +2850,7 @@ const Context = struct {
                     const receiver = (try self.expression(field.lhs, null, depth + 1)) orelse return null;
                     if (self.terminated) return if (expected) |want| want.ty else try self.ir.internType(.void);
                     if (self.receiverMethod(receiver, ast.tokenSlice(field.rhs))) |method| {
+                        if (self.getDeclaration(method).is_generic_function) return self.fail(.generic_function_context, call.ast.fn_expr, self.getDeclaration(method).name_span);
                         const signature = (try self.globalType(method)) orelse return self.fail(.unresolved_value_type, call.ast.fn_expr, null);
                         const function = self.ir.getType(signature.ty).?.function;
                         const related = self.getDeclaration(method).name_span;

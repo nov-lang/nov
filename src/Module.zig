@@ -7,6 +7,8 @@ const Compilation = @import("Compilation.zig");
 const Literal = @import("Literal.zig");
 const string_literal = @import("string_literal.zig");
 const ExportNames = @import("ExportNames.zig");
+const Ir = @import("Ir.zig");
+const GenericFunctions = @import("GenericFunctions.zig");
 const Module = @This();
 
 allocator: std.mem.Allocator,
@@ -22,6 +24,16 @@ pub const DeclId = enum(u32) { _ };
 /// Half-open, source-qualified byte range, not a clipped highlight.
 pub const Span = Source.Span;
 
+pub const TypeBinding = struct { name: []const u8, ty: Ir.TypeId };
+
+pub fn hasTypeVariables(ast: *const Ast, node: Ast.Node.Index) bool {
+    if (node == 0) return false;
+    for (ast.tokens.items(.tag)[ast.firstToken(node) .. ast.lastToken(node) + 1]) |tag| {
+        if (tag == .type_variable) return true;
+    }
+    return false;
+}
+
 pub const Declaration = struct {
     name: []const u8,
     name_span: Span,
@@ -30,6 +42,10 @@ pub const Declaration = struct {
     is_namespace: bool = false,
     is_record: bool = false,
     is_generic: bool = false,
+    is_generic_function: bool = false,
+    function_template: ?DeclId = null,
+    /// Owned slice on specializations only; names borrow the defining signature.
+    function_bindings: []const TypeBinding = &.{},
     is_test: bool = false,
     container: ?DeclId = null,
     public: bool = false,
@@ -71,6 +87,12 @@ pub const Diagnostic = struct {
         noreturn_result,
         noreturn_return,
         noreturn_completion,
+        unbound_type_variable,
+        generic_function_ambiguous,
+        generic_function_inference_unsupported,
+        generic_function_conflict,
+        generic_function_context,
+        generic_function_limit,
         invalid_generic_declaration,
         generic_needs_arguments,
         not_a_generic,
@@ -196,6 +218,7 @@ pub fn initSource(allocator: std.mem.Allocator, id: Source.Id, path: []const u8,
 pub fn deinit(self: *Module) void {
     self.names.deinit(self.allocator);
     for (self.declarations.items) |decl| {
+        if (decl.function_template != null) self.allocator.free(decl.function_bindings);
         if (decl.export_name) |name| self.allocator.free(name);
         if (decl.extern_name) |name| self.allocator.free(name);
     }
@@ -290,6 +313,7 @@ pub fn resetAliases(self: *Module) void {
             const call = self.source.ast.fullCall(full.init_node) orelse break :blk false;
             break :blk call.ast.args.len == 0 and std.mem.eql(u8, self.source.ast.tokenSlice(self.source.ast.firstToken(call.ast.fn_expr)), "@This");
         };
+        decl.is_generic_function = if (self.source.ast.declFunction(decl.node)) |f| hasTypeVariables(&self.source.ast, f.proto_node) else false;
         decl.is_type_alias = decl.is_record or this_alias;
         decl.is_generic = decl.is_record and full.type_node != 0 and (self.source.ast.isUnion(full.init_node) or self.source.ast.tokens.items(.tag)[self.source.ast.nodes.items(.main_token)[full.init_node]] == .keyword_struct);
     }
@@ -333,6 +357,18 @@ pub fn classifyAliases(self: *Module) std.mem.Allocator.Error!void {
         if (tags[init_node] != .identifier or (primitives.isPrimitive(name) and !std.mem.eql(u8, name, "true") and !std.mem.eql(u8, name, "false") and self.lookup(name) == null)) {
             declaration.is_type_alias = true;
             try work.append(self.allocator, init_node);
+        }
+    }
+    var function_changed = true;
+    while (function_changed) {
+        function_changed = false;
+        for (self.declarations.items, 0..) |*declaration, i| {
+            if (declaration.is_generic_function or !self.aliasCandidate(@fromBackingInt(@intCast(i)))) continue;
+            const init_node = self.source.ast.decl(declaration.node).ast.init_node;
+            if (GenericFunctions.target(self, init_node) == null) continue;
+            declaration.is_generic_function = true;
+            declaration.is_type_alias = false;
+            function_changed = true;
         }
     }
     // Generic function aliases must stabilize before classifying application aliases.
@@ -417,7 +453,10 @@ pub fn lookupConcreteMethod(self: *const Module, container: DeclId, concrete_typ
 
 /// TypeIds belong to one analysis IR; never reuse specializations in a fresh pass.
 pub fn clearSpecializations(self: *Module) void {
-    for (self.declarations.items, 0..) |decl, i| if (decl.concrete_type != null) {
+    for (self.declarations.items, 0..) |decl, i| if (decl.concrete_type != null or decl.function_template != null) {
+        for (self.declarations.items[i..]) |specialization| {
+            if (specialization.function_template != null) self.allocator.free(specialization.function_bindings);
+        }
         self.declarations.shrinkRetainingCapacity(i);
         return;
     };
@@ -465,6 +504,9 @@ fn collectDeclaration(self: *Module, node: Ast.Node.Index, container: ?DeclId) (
         const id: DeclId = @fromBackingInt(@intCast(self.declarations.items.len));
         if (container == null) try self.names.put(self.allocator, name, id);
         const is_record = declaration.ast.init_node != 0 and self.source.ast.fullStruct(declaration.ast.init_node) != null;
+        const is_generic_function = if (self.source.ast.declFunction(node)) |f| hasTypeVariables(&self.source.ast, f.proto_node) else false;
+        if (is_generic_function and declaration.ast.type_node == 0) try self.diagnostics.append(self.allocator, .{ .tag = .generic_function_context, .span = name_span });
+        if (is_generic_function and declaration.ast.is_mutable) try self.diagnostics.append(self.allocator, .{ .tag = .generic_function_context, .span = name_span });
         const is_generic = is_record and declaration.ast.type_node != 0 and (self.source.ast.isUnion(declaration.ast.init_node) or self.source.ast.tokens.items(.tag)[self.source.ast.nodes.items(.main_token)[declaration.ast.init_node]] == .keyword_struct);
         const is_this_alias = container != null and !declaration.ast.is_mutable and declaration.ast.type_node == 0 and declaration.ast.init_node != 0 and blk: {
             const call = self.source.ast.fullCall(declaration.ast.init_node) orelse break :blk false;
@@ -499,7 +541,7 @@ fn collectDeclaration(self: *Module, node: Ast.Node.Index, container: ?DeclId) (
                     try self.diagnostics.append(self.allocator, .{ .tag = invalid_attribute, .span = span });
                     continue;
                 }
-                if (container != null or declaration.ast.is_mutable or is_record or is_generic or (if (external) declaration.ast.init_node != 0 else declaration.ast.init_node == 0) or self.source.ast.declFunction(node) == null) {
+                if (container != null or declaration.ast.is_mutable or is_record or is_generic or is_generic_function or (if (external) declaration.ast.init_node != 0 else declaration.ast.init_node == 0) or self.source.ast.declFunction(node) == null) {
                     try self.diagnostics.append(self.allocator, .{ .tag = invalid_declaration, .span = span });
                     continue;
                 }
@@ -538,9 +580,9 @@ fn collectDeclaration(self: *Module, node: Ast.Node.Index, container: ?DeclId) (
                 noreturn_annotation = true;
             } else try self.diagnostics.append(self.allocator, .{ .tag = .unsupported_attribute, .span = self.tokenSpan(self.source.ast.firstToken(attribute)) });
         }
-        if (is_test and (container != null or declaration.ast.is_mutable or is_record or is_generic or declaration.ast.init_node == 0 or self.source.ast.declFunction(node) == null or export_seen or extern_seen or noreturn_annotation))
+        if (is_test and (container != null or declaration.ast.is_mutable or is_record or is_generic or is_generic_function or declaration.ast.init_node == 0 or self.source.ast.declFunction(node) == null or export_seen or extern_seen or noreturn_annotation))
             try self.diagnostics.append(self.allocator, .{ .tag = .invalid_test_declaration, .span = name_span });
-        try self.declarations.append(self.allocator, .{ .is_test = is_test, .name = name, .name_span = name_span, .node = node, .container = container, .is_record = is_record, .is_generic = is_generic, .is_type_alias = is_record or is_this_alias, .public = public, .noreturn = noreturn_annotation, .export_name = export_name, .extern_name = extern_name });
+        try self.declarations.append(self.allocator, .{ .is_test = is_test, .name = name, .name_span = name_span, .node = node, .container = container, .is_record = is_record, .is_generic = is_generic, .is_generic_function = is_generic_function, .is_type_alias = is_record or is_this_alias, .public = public, .noreturn = noreturn_annotation, .export_name = export_name, .extern_name = extern_name });
     }
 }
 

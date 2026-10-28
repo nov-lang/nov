@@ -392,6 +392,15 @@ fn parseExpr(self: *Parser) Error!Node.Index {
     return self.parseExprPrecedence(.assignment, false, true);
 }
 
+fn parseControlValue(self: *Parser) Error!Node.Index {
+    const start = self.tok_i;
+    const value = try self.parseExpr();
+    // Optional operands must not consume the declaration/statement separator
+    // when looking across a newline finds no expression.
+    if (value == null_node) self.tok_i = start;
+    return value;
+}
+
 fn expectExpr(self: *Parser) Error!Node.Index {
     const node = try self.parseExpr();
     if (node == null_node) {
@@ -628,7 +637,7 @@ fn parsePrimaryExpr(self: *Parser, allow_block_label: bool) Error!Node.Index {
             .main_token = self.nextToken(),
             .data = .{
                 .lhs = try self.parseBreakLabel(),
-                .rhs = try self.parseExpr(),
+                .rhs = try self.parseControlValue(),
             },
         }),
         .keyword_continue => return self.addNode(.{
@@ -644,7 +653,7 @@ fn parsePrimaryExpr(self: *Parser, allow_block_label: bool) Error!Node.Index {
             .main_token = self.nextToken(),
             .data = .{
                 .lhs = undefined,
-                .rhs = try self.parseExpr(),
+                .rhs = try self.parseControlValue(),
             },
         }),
         .keyword_defer => return self.addNode(.{
@@ -1263,6 +1272,11 @@ fn parseSuffixFrom(self: *Parser, primary: Node.Index) Error!Node.Index {
 // TODO: complete all cases
 fn parsePrimaryTypeExpr(self: *Parser) Error!Node.Index {
     switch (self.token_tags[self.tok_i]) {
+        .type_variable => return self.addNode(.{
+            .tag = .type_variable,
+            .main_token = self.nextToken(),
+            .data = .{ .lhs = 0, .rhs = 0 },
+        }),
         .number_literal => return self.addNode(.{
             .tag = .number_literal,
             .main_token = self.nextToken(),
@@ -2228,6 +2242,54 @@ test "inclusive range headers retain raw tokens and reject malformed ranges" {
         var result = try parse(std.testing.allocator, broken);
         defer result.deinit(std.testing.allocator);
         try std.testing.expect(result.errors.len != 0);
+    }
+}
+
+test "backtick bare return preserves declaration separator and multiline operands" {
+    const source = "let finish:()->`T=return\nlet main:()={finish()}";
+    var ast = try parse(std.testing.allocator, source);
+    defer ast.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    try std.testing.expectEqual(@as(usize, 2), ast.rootDecls().len);
+    const returned = ast.decl(ast.rootDecls()[0]).ast.init_node;
+    try std.testing.expectEqual(Node.Tag.@"return", ast.nodes.items(.tag)[returned]);
+    try std.testing.expectEqual(@as(Node.Index, 0), ast.nodes.items(.data)[returned].rhs);
+    try std.testing.expectEqualStrings("return", ast.tokenSlice(ast.lastToken(returned)));
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
+    var valued = try parse(std.testing.allocator, "let f:()->bool=return\ntrue\nlet main:()={}");
+    defer valued.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), valued.errors.len);
+    const operand = valued.nodes.items(.data)[valued.decl(valued.rootDecls()[0]).ast.init_node].rhs;
+    try std.testing.expectEqualStrings("true", valued.tokenSlice(valued.firstToken(operand)));
+}
+
+test "backtick signature nodes retain spans and malformed variables fail" {
+    const source = "let first: (items: []`T) -> `T = items[0]";
+    var ast = try parse(std.testing.allocator, source);
+    defer ast.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    var count: usize = 0;
+    for (ast.nodes.items(.tag), 0..) |tag, i| {
+        if (tag != .type_variable) continue;
+        const node: Node.Index = @intCast(i);
+        count += 1;
+        try std.testing.expectEqual(ast.firstToken(node), ast.lastToken(node));
+        try std.testing.expectEqualStrings("`T", ast.tokenSlice(ast.firstToken(node)));
+    }
+    try std.testing.expectEqual(@as(usize, 2), count);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
+    for ([_][:0]const u8{ "let f:(x:`)->`T=x", "let f:(x:`1)->`T=x", "let f:(x:``T)->`T=x", "let f:(x:` T)->`T=x" }) |broken| {
+        var result = try parse(std.testing.allocator, broken);
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expect(result.errors.len != 0);
+        try std.testing.expect(result.errors[0].token < result.tokens.len);
+        var invalid_found = false;
+        for (result.tokens.items(.tag), 0..) |tag, index| {
+            if (tag != .invalid) continue;
+            try std.testing.expectEqualStrings("`", result.tokenSlice(@intCast(index)));
+            invalid_found = true;
+        }
+        try std.testing.expect(invalid_found);
     }
 }
 

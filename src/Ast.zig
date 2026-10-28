@@ -601,6 +601,7 @@ pub fn firstToken(self: Ast, node: Node.Index) TokenIndex {
         .@"break",
         .@"return",
         .identifier,
+        .type_variable,
         .number_literal,
         .char_literal,
         .string_literal,
@@ -786,6 +787,7 @@ pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
         .number_literal,
         .char_literal,
         .identifier,
+        .type_variable,
         .string_literal,
         .enum_literal,
         .builtin_literal,
@@ -1669,6 +1671,8 @@ pub const Node = struct {
         /// which could be one of many different kinds of AST nodes, there will be an
         /// identifier AST node for it.
         identifier,
+        /// A backtick-prefixed signature type variable; both data fields unused.
+        type_variable,
         /// lhs is the dot token index, rhs unused.
         /// main_token is the identifier.
         enum_literal,

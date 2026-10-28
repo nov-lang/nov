@@ -19,6 +19,7 @@ pub const Token = struct {
         eof,
         invalid,
         identifier,
+        type_variable,
         builtin,
         string_literal,
         char_literal,
@@ -98,6 +99,7 @@ pub const Token = struct {
                 .eof,
                 .invalid,
                 .identifier,
+                .type_variable,
                 .builtin,
                 .string_literal,
                 .char_literal,
@@ -184,6 +186,7 @@ pub const Token = struct {
                 .eof => "EOF",
                 .invalid => "invalid bytes",
                 .identifier => "an identifier",
+                .type_variable => "a backtick type variable",
                 .builtin => "a builtin literal",
                 .string_literal => "a string literal",
                 .char_literal => "a character literal",
@@ -352,6 +355,21 @@ pub fn next(self: *Tokenizer) Token {
             '\'' => {
                 result.tag = .char_literal;
                 continue :state .char_literal;
+            },
+            '`' => {
+                // TODO: rewrite this block to use the state machine
+                self.index += 1;
+                switch (self.buffer[self.index]) {
+                    'A'...'Z', 'a'...'z', '_' => {
+                        self.index += 1;
+                        while (true) switch (self.buffer[self.index]) {
+                            'A'...'Z', 'a'...'z', '_', '0'...'9' => self.index += 1,
+                            else => break,
+                        };
+                        result.tag = .type_variable;
+                    },
+                    else => result.tag = .invalid,
+                }
             },
             'A'...'Z', 'a'...'z', '_' => {
                 result.tag = .identifier;

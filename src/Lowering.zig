@@ -15,6 +15,7 @@ pub const Error = Sema.Error;
 /// Whole-graph lowering uses one semantic table and one set of IR pools.
 /// The returned owner remains valid after the Compilation is destroyed.
 pub fn lowerCompilation(comp: *Compilation) Error!Sema {
+    errdefer comp.clearSpecializations();
     const starts = try comp.allocator.alloc(usize, comp.modules.items.len);
     defer comp.allocator.free(starts);
     for (comp.modules.items, starts) |module, *start| start.* = module.diagnostics.items.len;
@@ -44,7 +45,9 @@ pub fn lowerCompilation(comp: *Compilation) Error!Sema {
         ty.* = entry.type_id;
         constant.* = entry.constant;
         if (entry.status != .body_checked and entry.status != .external) continue;
-        const qualified = if (declaration.container) |owner| if (declaration.concrete_type) |concrete|
+        const qualified = if (declaration.function_template != null)
+            try std.fmt.allocPrint(comp.allocator, "{s}$generic{d}", .{ declaration.name, @backingInt(ref.local) })
+        else if (declaration.container) |owner| if (declaration.concrete_type) |concrete|
             try std.fmt.allocPrint(comp.allocator, "{s}[{d}].{s}", .{ module.getDeclaration(owner).?.name, concrete, declaration.name })
         else
             try std.fmt.allocPrint(comp.allocator, "{s}.{s}", .{ module.getDeclaration(owner).?.name, declaration.name }) else null;
@@ -79,6 +82,7 @@ pub fn lowerCompilation(comp: *Compilation) Error!Sema {
 /// expression-body functions. Owns the returned IR independently of the AST.
 /// Arithmetic is represented, not evaluated; backend numeric policy is pending.
 pub fn lower(module: *Module) Error!Sema {
+    errdefer module.clearSpecializations();
     const diagnostics_start = module.diagnostics.items.len;
     errdefer module.diagnostics.shrinkRetainingCapacity(diagnostics_start);
     var result = try Sema.analyzeFunctions(module);
@@ -104,7 +108,9 @@ pub fn lower(module: *Module) Error!Sema {
         constant.* = entry.constant;
         if (entry.status != .body_checked and entry.status != .external) continue;
         const span: Ir.Span = declaration.name_span;
-        const qualified = if (declaration.container) |owner| if (declaration.concrete_type) |concrete|
+        const qualified = if (declaration.function_template != null)
+            try std.fmt.allocPrint(result.allocator, "{s}$generic{d}", .{ declaration.name, i })
+        else if (declaration.container) |owner| if (declaration.concrete_type) |concrete|
             try std.fmt.allocPrint(result.allocator, "{s}[{d}].{s}", .{ module.getDeclaration(owner).?.name, concrete, declaration.name })
         else
             try std.fmt.allocPrint(result.allocator, "{s}.{s}", .{ module.getDeclaration(owner).?.name, declaration.name }) else null;

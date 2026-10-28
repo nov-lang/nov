@@ -158,6 +158,8 @@ pub const Record = struct {
     /// Empty for ordinary aggregates; canonical arguments distinguish nominal instances.
     type_args: []const TypeId = &.{},
     instance_state: enum { complete, building, failed } = .complete,
+    /// Frontend-only publication state; speculative layouts have no method IDs.
+    methods_published: bool = false,
 };
 pub const EnumTag = struct { name: []const u8, span: Span };
 pub const Enumeration = struct { source: Source.Id = @fromBackingInt(@intCast(0)), identity: u32, name: []const u8, tags: []const EnumTag, public: bool = false };
@@ -461,7 +463,7 @@ pub fn internType(self: *Ir, ty: Type) InternError!TypeId {
             if (record.fields.len != 0) return error.InvalidTypeId;
             const args = try self.allocator.dupe(TypeId, record.type_args);
             errdefer self.allocator.free(args);
-            break :blk .{ .record = .{ .source = record.source, .identity = record.identity, .fields = try self.allocator.alloc(Field, 0), .public = record.public, .tagged = record.tagged, .type_args = args, .instance_state = record.instance_state } };
+            break :blk .{ .record = .{ .source = record.source, .identity = record.identity, .fields = try self.allocator.alloc(Field, 0), .public = record.public, .tagged = record.tagged, .type_args = args, .instance_state = record.instance_state, .methods_published = record.methods_published } };
         },
         .function => |function| .{ .function = .{
             .params = try self.allocator.dupe(TypeId, function.params),

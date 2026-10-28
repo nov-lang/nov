@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const Ast = @import("Ast.zig");
 const Ir = @import("Ir.zig");
 const TypeResolver = @import("TypeResolver.zig");
+const GenericFunctions = @import("GenericFunctions.zig");
 const TypeAliases = @import("TypeAliases.zig");
 const Enums = @import("Enums.zig");
 const Visibility = @import("Visibility.zig");
@@ -1116,6 +1117,7 @@ test {
     _ = Module;
     _ = Dependencies;
     _ = TypeResolver;
+    _ = GenericFunctions;
     _ = TypeAliases;
     _ = Enums;
     _ = Visibility;
