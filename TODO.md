@@ -10,7 +10,12 @@ performance concern, especially repeated snapshots and updates. Targeted copy
 elision now transfers fresh temporaries rather than recloning at binding/call/return
 boundaries; readonly field/simple-index projections avoid enclosing aggregate copies.
 Effectful indices retain snapshots. Allocation-count regressions cover these paths.
-Insertion/replacement/append and indexed updates still need further optimization.
+Insertion/replacement now adopt proven-detached single-use temporaries. Append
+keeps its fresh outer buffer and recursively copies only unproven input portions.
+All IR references count against ownership; repeated operands and cross-loop-region
+reuse retain copies. Calls/merges/storage reads are not ownership evidence.
+Snapshot copies, conservative fallbacks and more general update paths still need
+further optimization.
 Broader elision, moves/consuming transfers and copy-on-write remain candidates,
 **not approved designs**. Preserve observable value independence, static borrowing and GC safety.
 This targeted high-priority follow-up is not blanket approval for other optimizations.

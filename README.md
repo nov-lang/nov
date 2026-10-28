@@ -843,7 +843,7 @@ The delivered subset is deliberately bounded:
   behavior follow the ordinary array rules below. Direct `items[index].field`
   mutation is still unsupported. Existing whole-record/record-element loans permit
   array-field replacement and append, but not indexed updates through such paths.
-  See `examples/array-fields.nov` (being added).
+  See [`examples/array-fields.nov`](examples/array-fields.nov).
 - Field mutation does not alter earlier value copies or immutable string backing.
   Immutable bindings/ordinary parameters (including `self`), union payloads/tags,
   temporary values and general pointer-based targets remain unsupported or
@@ -1391,8 +1391,11 @@ let main: () -> void = {
   being cloned again. Readonly field and simple-index projections avoid copying
   the enclosing aggregate; effectful indices retain pre-effect snapshots.
   Recursive copying remains a major performance concern: cost follows the copied
-  contents, not just outer array length. Insertion, replacement and append can
-  still perform redundant copies. Broader elision, moves/consuming transfers and
+  contents, not just outer array length. Insertion and replacement now transfer
+  proven-detached, single-use temporaries; append keeps its fresh outer buffer
+  and recursively copies only unproven input portions. Repeated operands and
+  transfers across loop execution regions retain safe copies. Calls, merges and
+  storage reads are not backend ownership evidence. Broader elision, moves/consuming transfers and
   copy-on-write remain candidates to investigate, **not approved designs**;
   any optimization must preserve value independence, static borrowing and GC safety.
   Append does not yet promise amortized constant time or preserve spare capacity

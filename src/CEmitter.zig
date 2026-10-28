@@ -344,7 +344,7 @@ fn write(allocator: std.mem.Allocator, ir: *const Ir, origins: []const ?Origin, 
     }
     const copy_types = try allocator.alloc(bool, ir.types.items.len);
     defer allocator.free(copy_types);
-    try markCopyTypes(ir, copy_types);
+    try markCopyTypes(allocator, ir, copy_types);
     for (ir.types.items, 0..) |_, t| {
         const element: Ir.TypeId = @fromBackingInt(@intCast(t));
         var copy_element = false;
@@ -967,6 +967,8 @@ fn usesArrayContains(ir: *const Ir, element: Ir.TypeId) bool {
 fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const usize, w: *std.Io.Writer, function: Ir.Function) (WriteError || std.mem.Allocator.Error)!void {
     const signature = ir.types.items[@backingInt(function.ty)].function;
     const body = function.body.?;
+    const transfers = try ArrayTransfers.init(allocator, ir, body);
+    defer transfers.deinit(allocator);
     const value_used = try allocator.alloc(bool, body.instructions.len);
     defer allocator.free(value_used);
     @memset(value_used, false);
@@ -1385,7 +1387,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
             continue;
         }
         if (ty == .array) {
-            try writeArrayValue(ir, w, body, instruction, i);
+            try writeArrayValue(ir, w, body, transfers, instruction, i);
             if (!value_used[i] or instruction.op == .local_slot) try w.print("    (void)v{d};\n", .{i});
             continue;
         }
@@ -1525,18 +1527,28 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
     };
 }
 
-fn markCopyTypes(ir: *const Ir, copied: []bool) std.mem.Allocator.Error!void {
+fn markCopyTypes(allocator: std.mem.Allocator, ir: *const Ir, copied: []bool) std.mem.Allocator.Error!void {
     @memset(copied, false);
     for (ir.functions.items) |function| {
         const body = function.body orelse continue;
-        for (body.instructions) |instruction| switch (instruction.op) {
-            .array_clone, .array_set => copied[@backingInt(instruction.ty)] = true,
-            .array_append => {
-                if (try ir.needsArrayCopy(ir.getType(instruction.ty).?.array)) copied[@backingInt(instruction.ty)] = true;
-            },
-            .array_literal => {
+        const transfers = try ArrayTransfers.init(allocator, ir, body);
+        defer transfers.deinit(allocator);
+        for (body.instructions, 0..) |instruction, i| switch (instruction.op) {
+            .array_clone => copied[@backingInt(instruction.ty)] = true,
+            .array_set => |update| {
+                if (!transfers.canTake(body, update.array, i)) copied[@backingInt(instruction.ty)] = true;
                 const element = ir.getType(instruction.ty).?.array;
-                if (try ir.needsArrayCopy(element)) copied[@backingInt(element)] = true;
+                if (try ir.needsArrayCopy(element) and !transfers.canTake(body, update.value, i)) copied[@backingInt(element)] = true;
+            },
+            .array_append => |append| {
+                const element = ir.getType(instruction.ty).?.array;
+                if (try ir.needsArrayCopy(element) and (!transfers.canTake(body, append.lhs, i) or !transfers.canTake(body, append.rhs, i))) copied[@backingInt(element)] = true;
+            },
+            .array_literal => |elements| {
+                const element = ir.getType(instruction.ty).?.array;
+                if (try ir.needsArrayCopy(element)) for (elements) |value| {
+                    if (!transfers.canTake(body, value, i)) copied[@backingInt(element)] = true;
+                };
             },
             else => {},
         };
@@ -1565,8 +1577,8 @@ fn markCopyTypes(ir: *const Ir, copied: []bool) std.mem.Allocator.Error!void {
     }
 }
 
-// Eager copies deliberately trade allocation cost for independent value storage.
-// Recursive-copy optimization is high-priority future work; do not substitute COW.
+// Unproven values retain eager recursive copies for independent value storage.
+// Fresh-temp transfers below do not introduce shared backing or COW.
 fn writeCopyHelpers(ir: *const Ir, copy_types: []const bool, counts: []const usize, w: *std.Io.Writer) WriteError!void {
     for (ir.types.items, 0..) |_, i| {
         const id: Ir.TypeId = @fromBackingInt(@intCast(i));
@@ -1624,7 +1636,87 @@ fn writeBorrowRead(ir: *const Ir, w: *std.Io.Writer, body: Ir.Body, borrow: Ir.V
     }
 }
 
-fn writeArrayValue(ir: *const Ir, w: *std.Io.Writer, body: Ir.Body, instruction: Ir.Instruction, i: usize) WriteError!void {
+// This is a backend proof, not a consuming convention imposed on arbitrary IR.
+// Count every reference (including projections, captures, region yields and the
+// body result), and recognize only constructors whose recursive backing is known.
+const ArrayTransfers = struct {
+    uses: []usize,
+    detached: []bool,
+
+    fn count(uses: []usize, value: anytype) void {
+        const T = @TypeOf(value);
+        if (T == Ir.ValueId) {
+            uses[@backingInt(value)] += 1;
+            return;
+        }
+        switch (@typeInfo(T)) {
+            .@"struct" => |info| inline for (info.field_names) |name| count(uses, @field(value, name)),
+            .@"union" => switch (value) {
+                inline else => |payload| count(uses, payload),
+            },
+            .optional => if (value) |payload| count(uses, payload),
+            .pointer => |info| if (info.size == .slice and info.child == Ir.ValueId) {
+                for (value) |operand| count(uses, operand);
+            },
+            else => {},
+        }
+    }
+
+    fn init(allocator: std.mem.Allocator, ir: *const Ir, body: Ir.Body) std.mem.Allocator.Error!ArrayTransfers {
+        const uses = try allocator.alloc(usize, body.instructions.len);
+        errdefer allocator.free(uses);
+        @memset(uses, 0);
+        const detached = try allocator.alloc(bool, body.instructions.len);
+        errdefer allocator.free(detached);
+        @memset(detached, false);
+        count(uses, body.result);
+        for (body.instructions) |instruction| count(uses, instruction.op);
+        const self: ArrayTransfers = .{ .uses = uses, .detached = detached };
+        for (body.instructions, 0..) |instruction, i| {
+            detached[i] = switch (instruction.op) {
+                // These operations either copy or use this same proof for inputs.
+                .array_clone, .array_literal, .array_set, .array_append => true,
+                .record_init => |fields| blk: {
+                    for (fields) |field| {
+                        if (try ir.needsArrayCopy(body.instructions[@backingInt(field)].ty) and !self.canTake(body, field, i)) break :blk false;
+                    }
+                    break :blk true;
+                },
+                .union_init => |init_value| if (init_value.payload) |payload|
+                    !try ir.needsArrayCopy(body.instructions[@backingInt(payload)].ty) or self.canTake(body, payload, i)
+                else
+                    true,
+                // Calls, merges, storage reads and projections are deliberately
+                // not ownership evidence, even if lowering normally detaches them.
+                else => false,
+            };
+        }
+        return self;
+    }
+
+    fn deinit(self: ArrayTransfers, allocator: std.mem.Allocator) void {
+        allocator.free(self.uses);
+        allocator.free(self.detached);
+    }
+
+    fn canTake(self: ArrayTransfers, body: Ir.Body, value: Ir.ValueId, consumer: usize) bool {
+        const producer = @backingInt(value);
+        if (producer >= consumer or self.uses[producer] != 1 or !self.detached[producer]) return false;
+        // A single static use can execute repeatedly. Never adopt an outer
+        // temporary inside a loop, or across its separately executed regions.
+        for (body.instructions, 0..) |instruction, end| {
+            if (instruction.op != .loop) continue;
+            const loop = instruction.op.loop;
+            const boundaries = [_]usize{ loop.condition_start, loop.body_start, loop.continuation_start orelse loop.else_start orelse @intCast(end), loop.else_start orelse @intCast(end), end };
+            for (boundaries[0 .. boundaries.len - 1], boundaries[1..]) |start, stop| {
+                if ((producer >= start and producer < stop) != (consumer >= start and consumer < stop)) return false;
+            }
+        }
+        return true;
+    }
+};
+
+fn writeArrayValue(ir: *const Ir, w: *std.Io.Writer, body: Ir.Body, transfers: ArrayTransfers, instruction: Ir.Instruction, i: usize) WriteError!void {
     const element = ir.getType(instruction.ty).?.array;
     try w.print("    v{d} = ", .{i});
     switch (instruction.op) {
@@ -1637,7 +1729,7 @@ fn writeArrayValue(ir: *const Ir, w: *std.Io.Writer, body: Ir.Body, instruction:
             for (elements, 0..) |value, index| {
                 try w.writeAll("    ((");
                 try writeType(ir, w, element);
-                if (try ir.needsArrayCopy(element)) {
+                if (try ir.needsArrayCopy(element) and !transfers.canTake(body, value, i)) {
                     try w.print(" *)v{d}.data)[{d}] = nov_copy_{d}(v{d});\n", .{ i, index, @backingInt(element), @backingInt(value) });
                 } else try w.print(" *)v{d}.data)[{d}] = v{d};\n", .{ i, index, @backingInt(value) });
             }
@@ -1647,10 +1739,11 @@ fn writeArrayValue(ir: *const Ir, w: *std.Io.Writer, body: Ir.Body, instruction:
             try w.print("nov_copy_{d}(v{d})", .{ @backingInt(instruction.ty), @backingInt(value) });
         },
         .array_set => |r| {
-            try w.print("nov_copy_{d}(v{d});\n    ((", .{ @backingInt(instruction.ty), @backingInt(r.array) });
+            if (transfers.canTake(body, r.array, i)) try w.print("v{d}", .{@backingInt(r.array)}) else try w.print("nov_copy_{d}(v{d})", .{ @backingInt(instruction.ty), @backingInt(r.array) });
+            try w.writeAll(";\n    ((");
             try writeType(ir, w, element);
             try w.print(" *)v{d}.data)[nov_array_index(v{d}, v{d})] = ", .{ i, i, @backingInt(r.index) });
-            if (try ir.needsArrayCopy(element)) try w.print("nov_copy_{d}(v{d});\n", .{ @backingInt(element), @backingInt(r.value) }) else try w.print("v{d};\n", .{@backingInt(r.value)});
+            if (try ir.needsArrayCopy(element) and !transfers.canTake(body, r.value, i)) try w.print("nov_copy_{d}(v{d});\n", .{ @backingInt(element), @backingInt(r.value) }) else try w.print("v{d};\n", .{@backingInt(r.value)});
             return;
         },
         .array_append => |r| {
@@ -1665,7 +1758,17 @@ fn writeArrayValue(ir: *const Ir, w: *std.Io.Writer, body: Ir.Body, instruction:
     }
     try w.writeAll(";\n");
     if (instruction.op == .array_append and try ir.needsArrayCopy(element)) {
-        try w.print("    v{d} = nov_copy_{d}(v{d});\n", .{ i, @backingInt(instruction.ty), i });
+        const append = instruction.op.array_append;
+        // The runtime has already allocated a fresh outer buffer. Detach only
+        // the portions whose inputs cannot transfer; never clone that buffer.
+        for ([_]Ir.ValueId{ append.lhs, append.rhs }, 0..) |value, side| {
+            if (transfers.canTake(body, value, i)) continue;
+            try w.print("    for (uintptr_t j = {s}", .{if (side == 0) "0" else ""});
+            if (side == 1) try w.print("v{d}.len", .{@backingInt(append.lhs)});
+            try w.print("; j < v{d}.len; ++j) {{\n        ", .{if (side == 0) @backingInt(append.lhs) else i});
+            try writeType(ir, w, element);
+            try w.print(" *data = v{d}.data;\n        data[j] = nov_copy_{d}(data[j]);\n    }}\n", .{ i, @backingInt(element) });
+        }
     }
 }
 
@@ -8682,7 +8785,44 @@ const copy_elision_cases = [_]struct { source: []const u8, allocations: usize, o
     },
     // Includes immutable capture backing and its box, both environments, the
     // shared mutable cell, and snapshots preceding argument/index/RHS effects.
-    .{ .source = copy_elision_effects, .allocations = 14, .output = "1 1 2\n2 3\n7 1 1\n" },
+    .{ .source = copy_elision_effects, .allocations = 13, .output = "1 1 2\n2 3\n7 1 1\n" },
+    // Targeted array transfers: one independent snapshot per storage read, no
+    // second recursive copy at insertion/replacement/append boundaries.
+    .{
+        .source = "let L=struct{a:[]int,}\nlet main:()={let a=[L[.a=[1]]]\n@println(a[0].a[0])}",
+        .allocations = 2,
+        .output = "1\n",
+    },
+    .{
+        .source = "let L=struct{a:[]int,}\nlet main:()={let seed=L[.a=[1]]\nlet a=[seed,seed]\n@println(a[0].a[0],a[1].a[0])}",
+        .allocations = 4,
+        .output = "1 1\n",
+    },
+    .{
+        .source = "let L=struct{a:[]int,}\nlet main:()={let mut a=[L[.a=[1]]]\na[-1]=L[.a=[2]]\n@println(a[0].a[0])}",
+        .allocations = 5,
+        .output = "2\n",
+    },
+    .{
+        .source = "let L=struct{a:[]int,}\nlet main:()={let mut a=[L[.a=[1]]]\na += [L[.a=[2]]]\n@println(a[0].a[0],a[1].a[0])}",
+        .allocations = 7,
+        .output = "1 2\n",
+    },
+    .{
+        .source = "let L=struct{a:[]int,}\nlet main:()={let mut a=[L[.a=[1]]]\na+=a\n@println(a[0].a[0],a[1].a[0])}",
+        .allocations = 7,
+        .output = "1 1\n",
+    },
+    .{
+        .source = "let L=struct{a:[]int,}\nlet T=struct{leaf:L,items:[]L,}\nlet main:()={let mut a=[T[.leaf=L[.a=[1]],.items=[L[.a=[2]]]]]\na+=a\n@println(a.len)}",
+        .allocations = 13,
+        .output = "2\n",
+    },
+    .{
+        .source = "let L=struct{a:[]int,}\nlet T=struct{leaf:L,items:[]L,}\nlet U=union{node:T,none,}\nlet main:()={let u=U.node[T[.leaf=L[.a=[1]],.items=[L[.a=[2]]]]]\nmatch u {\n.node=>|t|{let mut a=t.items\na+=a\n@println(a.len)}\n.none=>{}\n}}",
+        .allocations = 13,
+        .output = "2\n",
+    },
 };
 
 test "copy elision allocation counts retain snapshots under forced GC" {
@@ -8708,6 +8848,365 @@ test "copy elision allocation counts retain snapshots under forced GC" {
         defer test_gpa.free(expected);
         for ([_][]const u8{ "-O0", "-O3" }) |mode|
             try compileAndRunMode(counted, "typedef int nonempty_translation_unit;", 0, expected, "", mode);
+    }
+}
+
+test "copy elision forged reused and live storage operands keep independent backing" {
+    var module = try Module.init(test_gpa, "forged-transfers.nov", "let L=struct{a:[]int,}\nlet main:()={let seed=L[.a=[1]]\nlet mut a=[seed,seed]\na[-1]=seed\na+=a\n@println(a.len,seed.a[0],a[0].a[0])}");
+    defer module.deinit();
+    var sema = try Lowering.lower(&module);
+    defer sema.deinit();
+    try std.testing.expect(!module.hasErrors());
+    const body = sema.ir.functions.items[0].body.?;
+    for (@constCast(body.instructions)) |*instruction| switch (instruction.op) {
+        .array_literal => |elements| if (elements.len == 2) {
+            // Reusing the same detached record twice must clone both insertions.
+            @constCast(elements)[1] = elements[0];
+        },
+        .array_set => |*update| {
+            try std.testing.expect(body.instructions[@backingInt(update.array)].op == .array_clone);
+            try std.testing.expect(body.instructions[@backingInt(update.value)].op == .array_clone);
+            // Well-typed IR need not contain the snapshots lowering inserts.
+            update.array = body.instructions[@backingInt(update.array)].op.array_clone;
+            update.value = body.instructions[@backingInt(update.value)].op.array_clone;
+        },
+        .array_append => |*append| append.rhs = append.lhs,
+        else => {},
+    };
+    try sema.ir.verify();
+    const transfers = try ArrayTransfers.init(test_gpa, &sema.ir, body);
+    defer transfers.deinit(test_gpa);
+    const library = try emit(test_gpa, &sema.ir, null);
+    defer test_gpa.free(library);
+    var instrumented = try test_gpa.dupe(u8, library);
+    defer test_gpa.free(instrumented);
+    var checked: usize = 0;
+    for (body.instructions, 0..) |instruction, i| {
+        const ty = sema.ir.getType(instruction.ty).?;
+        if (ty != .array or sema.ir.getType(ty.array).? != .record) continue;
+        var operation = std.Io.Writer.Allocating.init(test_gpa);
+        defer operation.deinit();
+        try writeArrayValue(&sema.ir, &operation.writer, body, transfers, instruction, i);
+        var checks = std.Io.Writer.Allocating.init(test_gpa);
+        defer checks.deinit();
+        try checks.writer.writeAll(operation.written());
+        switch (instruction.op) {
+            .array_literal => |elements| {
+                try std.testing.expect(!transfers.canTake(body, elements[0], i));
+                for (elements, 0..) |value, j| try checks.writer.print("    assert(((nov_record_{d} *)v{d}.data)[{d}].f0.data != v{d}.f0.data);\n", .{ @backingInt(ty.array), i, j, @backingInt(value) });
+            },
+            .array_set => |update| {
+                try std.testing.expect(!transfers.canTake(body, update.array, i));
+                try std.testing.expect(!transfers.canTake(body, update.value, i));
+                try checks.writer.print("    assert(v{d}.data != v{d}.data);\n    assert(((nov_record_{d} *)v{d}.data)[1].f0.data != v{d}.f0.data);\n", .{ i, @backingInt(update.array), @backingInt(ty.array), i, @backingInt(update.value) });
+            },
+            .array_append => |append| {
+                try std.testing.expect(!transfers.canTake(body, append.lhs, i));
+                try checks.writer.print("    assert(v{d}.data != v{d}.data);\n    for (uintptr_t j=0; j<v{d}.len; ++j) assert(((nov_record_{d} *)v{d}.data)[j].f0.data != ((nov_record_{d} *)v{d}.data)[j % v{d}.len].f0.data);\n", .{ i, @backingInt(append.lhs), i, @backingInt(ty.array), i, @backingInt(ty.array), @backingInt(append.lhs), @backingInt(append.lhs) });
+            },
+            else => continue,
+        }
+        checked += 1;
+        try checks.writer.print("    for (uintptr_t j=0; j<v{d}.len; ++j) for (uintptr_t k=0; k<j; ++k) assert(((nov_record_{d} *)v{d}.data)[j].f0.data != ((nov_record_{d} *)v{d}.data)[k].f0.data);\n", .{ i, @backingInt(ty.array), i, @backingInt(ty.array), i });
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, instrumented, operation.written()));
+        const replaced = try std.mem.replaceOwned(u8, test_gpa, instrumented, operation.written(), checks.written());
+        test_gpa.free(instrumented);
+        instrumented = replaced;
+    }
+    try std.testing.expectEqual(@as(usize, 3), checked);
+    const prefixed = try std.mem.concat(test_gpa, u8, &.{ "#include <assert.h>\n", instrumented });
+    defer test_gpa.free(prefixed);
+    const c = try collectingTestProgram(prefixed);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "4 1 1\n", "", mode);
+}
+
+test "copy elision forged single static use inside loop cannot consume outer backing" {
+    var module = try Module.init(test_gpa, "forged-loop-transfer.nov", "let main:()={let mut a:[]uint=[1]\nlet snapshot=a\nloop i in 0..2 {a[0]=i}\n@println(snapshot[0],a[0])}");
+    defer module.deinit();
+    var sema = try Lowering.lower(&module);
+    defer sema.deinit();
+    try std.testing.expect(!module.hasErrors());
+    const body = sema.ir.functions.items[0].body.?;
+    var outer: ?Ir.ValueId = null;
+    var update_index: usize = 0;
+    for (@constCast(body.instructions), 0..) |*instruction, i| switch (instruction.op) {
+        .local_slot => |*value| if (body.instructions[@backingInt(value.*)].op == .array_clone and outer == null) {
+            outer = value.*;
+            // Leave the clone with only its use in the loop, not a slot use.
+            value.* = body.instructions[@backingInt(value.*)].op.array_clone;
+        },
+        .array_set => |*update| {
+            update.array = outer.?;
+            update_index = i;
+        },
+        else => {},
+    };
+    try sema.ir.verify();
+    const transfers = try ArrayTransfers.init(test_gpa, &sema.ir, body);
+    defer transfers.deinit(test_gpa);
+    try std.testing.expectEqual(@as(usize, 1), transfers.uses[@backingInt(outer.?)]);
+    try std.testing.expect(transfers.detached[@backingInt(outer.?)]);
+    try std.testing.expect(!transfers.canTake(body, outer.?, update_index));
+    var operation = std.Io.Writer.Allocating.init(test_gpa);
+    defer operation.deinit();
+    try writeArrayValue(&sema.ir, &operation.writer, body, transfers, body.instructions[update_index], update_index);
+    const replacement = try std.fmt.allocPrint(test_gpa, "{s}    assert(v{d}.data != v{d}.data);\n", .{ operation.written(), update_index, @backingInt(outer.?) });
+    defer test_gpa.free(replacement);
+    const library = try emit(test_gpa, &sema.ir, null);
+    defer test_gpa.free(library);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, library, operation.written()));
+    const instrumented = try std.mem.replaceOwned(u8, test_gpa, library, operation.written(), replacement);
+    defer test_gpa.free(instrumented);
+    const prefixed = try std.mem.concat(test_gpa, u8, &.{ "#include <assert.h>\n", instrumented });
+    defer test_gpa.free(prefixed);
+    const c = try collectingTestProgram(prefixed);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "1 1\n", "", mode);
+}
+
+// Instrument at the operation, not at a later language read which could hide
+// sharing behind another snapshot. Also check the live source of moved clones.
+fn testTransferTopologyRuntime(ir: *const Ir, take: bool, executions: usize, output: []const u8) !void {
+    try ir.verify();
+    const body = ir.functions.items[0].body.?;
+    const transfers = try ArrayTransfers.init(test_gpa, ir, body);
+    defer transfers.deinit(test_gpa);
+    var instrumented = try emit(test_gpa, ir, null);
+    defer test_gpa.free(instrumented);
+    var updates: usize = 0;
+    for (body.instructions, 0..) |instruction, i| {
+        if (instruction.op != .array_set) continue;
+        updates += 1;
+        const base = instruction.op.array_set.array;
+        try std.testing.expectEqual(take, transfers.canTake(body, base, i));
+        if (take) try std.testing.expectEqual(@as(usize, 1), transfers.uses[@backingInt(base)]);
+        var operation = std.Io.Writer.Allocating.init(test_gpa);
+        defer operation.deinit();
+        try writeArrayValue(ir, &operation.writer, body, transfers, instruction, i);
+        var checks = std.Io.Writer.Allocating.init(test_gpa);
+        defer checks.deinit();
+        const element = ir.getType(instruction.ty).?.array;
+        try checks.writer.writeAll("    {\n        ");
+        try writeType(ir, &checks.writer, element);
+        try checks.writer.writeAll(" before = ((");
+        try writeType(ir, &checks.writer, element);
+        try checks.writer.print(" *)v{d}.data)[0];\n", .{@backingInt(base)});
+        const source = if (take) body.instructions[@backingInt(base)].op.array_clone else base;
+        if (take) {
+            try checks.writer.writeAll("        ");
+            try writeType(ir, &checks.writer, element);
+            try checks.writer.writeAll(" source_before = ((");
+            try writeType(ir, &checks.writer, element);
+            try checks.writer.print(" *)v{d}.data)[0];\n", .{@backingInt(source)});
+        }
+        try checks.writer.writeAll(operation.written());
+        try checks.writer.print("        assert(v{d}.data {s} v{d}.data);\n        assert(v{d}.data != v{d}.data);\n        assert(((", .{ i, if (take) "==" else "!=", @backingInt(base), i, @backingInt(source) });
+        try writeType(ir, &checks.writer, element);
+        try checks.writer.print(" *)v{d}.data)[0] == {s});\n", .{ @backingInt(source), if (take) "source_before" else "before" });
+        if (take) {
+            // The detached producer can change, but its live upstream storage
+            // cannot. Its old value is still checked to make the write real.
+            try checks.writer.writeAll("        assert(before != ((");
+            try writeType(ir, &checks.writer, element);
+            try checks.writer.print(" *)v{d}.data)[0]);\n", .{i});
+        }
+        try checks.writer.writeAll("        ++test_transfer_updates;\n    }\n");
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, instrumented, operation.written()));
+        const replaced = try std.mem.replaceOwned(u8, test_gpa, instrumented, operation.written(), checks.written());
+        test_gpa.free(instrumented);
+        instrumented = replaced;
+    }
+    try std.testing.expect(updates != 0);
+    const driver = try std.fmt.allocPrint(test_gpa, "\nint main(void) {{ nov_rt_heap.collect_every_allocation = 1; nov_main(); assert(test_transfer_updates == {d}); " ++
+        "assert(!nov_rt_heap.frames); nov_gc_collect(&nov_rt_heap); assert(!nov_rt_heap.live_objects); nov_gc_shutdown(&nov_rt_heap); return 0; }}\n", .{executions});
+    defer test_gpa.free(driver);
+    const c = try std.mem.concat(test_gpa, u8, &.{ "#include <assert.h>\nstatic unsigned test_transfer_updates;\n", instrumented, driver });
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, output, "", mode);
+}
+
+test "copy elision topology rejects private sibling producers and keeps slot bridges independent" {
+    const cases = [_]struct { source: []const u8, runtime: bool }{
+        .{
+            // The condition is reconstructed on every check, including exhaustion.
+            .source = "let main:()={let owner:[]int=[1]\nlet mut bridge:[]int=[0]\nlet mut n:int=0\nloop {let snapshot=owner\nbridge=snapshot\nn<2} {bridge[0]=9\nn+=1}\n@println(owner[0],n)}",
+            .runtime = true,
+        },
+        .{
+            .source = "let main:()={let owner:[]int=[1]\nlet mut bridge:[]int=[0]\nlet mut n:int=0\nloop n<2 : {bridge[0]=9\nn+=1} {let snapshot=owner\nbridge=snapshot}\n@println(owner[0],n)}",
+            .runtime = true,
+        },
+        .{
+            .source = "let main:()={let mut a:[]int=[1]\nif true {let snapshot=a\n} else {a[0]=9}\n}",
+            .runtime = false,
+        },
+        .{
+            .source = "let main:()={let mut a:[]int=[1]\nlet ignored=true and {let snapshot=a\ntrue}\na[0]=9\n}",
+            .runtime = false,
+        },
+    };
+    for (cases) |case| {
+        var module = try Module.init(test_gpa, "private-transfer-topology.nov", case.source);
+        defer module.deinit();
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        try std.testing.expect(!module.hasErrors());
+        const body = sema.ir.functions.items[0].body.?;
+        var producer: ?Ir.ValueId = null;
+        var producer_slot: usize = 0;
+        var consumer: usize = 0;
+        for (body.instructions, 0..) |instruction, i| switch (instruction.op) {
+            .local_slot => |value| if (body.instructions[@backingInt(value)].op == .array_clone and producer == null) {
+                producer = value;
+                producer_slot = i;
+            },
+            .array_set => consumer = i,
+            else => {},
+        };
+        const instructions = @constCast(body.instructions);
+        const original_base = instructions[consumer].op.array_set.array;
+        // Give the private fresh producer exactly one static use in its sibling.
+        instructions[producer_slot].op.local_slot = instructions[@backingInt(producer.?)].op.array_clone;
+        instructions[consumer].op.array_set.array = producer.?;
+        const transfers = try ArrayTransfers.init(test_gpa, &sema.ir, body);
+        defer transfers.deinit(test_gpa);
+        try std.testing.expectEqual(@as(usize, 1), transfers.uses[@backingInt(producer.?)]);
+        try std.testing.expect(transfers.detached[@backingInt(producer.?)]);
+        if (case.runtime) try std.testing.expect(!transfers.canTake(body, producer.?, consumer));
+        try std.testing.expectError(error.InvalidValueId, sema.ir.verify());
+        try std.testing.expectError(error.InvalidValueId, emit(test_gpa, &sema.ir, null));
+        if (case.runtime) {
+            // Legal communication across siblings goes through storage. Forge
+            // away the usual read snapshot and require the operation to detach.
+            instructions[producer_slot].op.local_slot = producer.?;
+            instructions[consumer].op.array_set.array = instructions[@backingInt(original_base)].op.array_clone;
+            try testTransferTopologyRuntime(&sema.ir, false, 2, "1 2\n");
+        }
+    }
+}
+
+test "copy elision topology nested loop reuse and same region repeated execution" {
+    for ([_]bool{ false, true }) |same_region| {
+        const source = if (same_region)
+            "let main:()={loop _ in 0..3 {let mut a:[]int=[1]\na[0]=9\n@println(a[0])}}"
+        else
+            "let main:()={let mut a:[]int=[1]\nloop _ in 0..2 {let snapshot=a\nloop _ in 0..2 {a[0]=9}\n}\n@println(a[0])}";
+        var module = try Module.init(test_gpa, "loop-transfer-topology.nov", source);
+        defer module.deinit();
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        try std.testing.expect(!module.hasErrors());
+        const body = sema.ir.functions.items[0].body.?;
+        if (!same_region) {
+            var producer: ?Ir.ValueId = null;
+            for (@constCast(body.instructions)) |*instruction| switch (instruction.op) {
+                .local_slot => |*value| if (body.instructions[@backingInt(value.*)].op == .array_clone and producer == null) {
+                    producer = value.*;
+                    value.* = body.instructions[@backingInt(value.*)].op.array_clone;
+                },
+                .array_set => |*update| update.array = producer.?,
+                else => {},
+            };
+            const transfers = try ArrayTransfers.init(test_gpa, &sema.ir, body);
+            defer transfers.deinit(test_gpa);
+            try std.testing.expectEqual(@as(usize, 1), transfers.uses[@backingInt(producer.?)]);
+            try std.testing.expect(transfers.detached[@backingInt(producer.?)]);
+        }
+        try testTransferTopologyRuntime(&sema.ir, same_region, if (same_region) 3 else 4, if (same_region) "9\n9\n9\n" else "9\n");
+    }
+}
+
+test "copy elision topology branch and short circuit consumers retain static ownership" {
+    const cases = [_]struct { source: []const u8, take: bool, executions: usize, output: []const u8 }{
+        .{
+            .source = "let main:()={let mut a:[]int=[1]\nlet snapshot=a\nif true {a[0]=9}\n@println(a[0])}",
+            .take = true,
+            .executions = 1,
+            .output = "9\n",
+        },
+        .{
+            .source = "let main:()={let mut a:[]int=[1]\nlet snapshot=a\nlet ignored=true and {a[0]=9\ntrue}\n@println(a[0])}",
+            .take = true,
+            .executions = 1,
+            .output = "9\n",
+        },
+        .{
+            .source = "let main:()={let mut a:[]int=[1]\nlet snapshot=a\nif false {a[0]=9}\n@println(a[0])}",
+            .take = true,
+            .executions = 0,
+            .output = "1\n",
+        },
+        .{
+            .source = "let main:()={let mut a:[]int=[1]\nlet snapshot=a\nlet ignored=false and {a[0]=9\ntrue}\n@println(a[0])}",
+            .take = true,
+            .executions = 0,
+            .output = "1\n",
+        },
+        .{
+            .source = "let main:()={let mut a:[]int=[1]\nlet snapshot=a\nlet ignored=true or {a[0]=9\ntrue}\n@println(a[0])}",
+            .take = true,
+            .executions = 0,
+            .output = "1\n",
+        },
+        .{
+            .source = "let main:()={let mut a:[]int=[1]\nlet snapshot=a\nlet ignored=false or {if true {a[0]=9}\ntrue}\n@println(a[0])}",
+            .take = true,
+            .executions = 1,
+            .output = "9\n",
+        },
+        .{
+            // Both mutually exclusive references count. No path-sensitive move
+            // policy is inferred, and both prongs execute across the loop.
+            .source = "let main:()={loop flag in [true,false] {let mut a:[]int=[1]\nlet snapshot=a\nif flag {a[0]=9} else {a[0]=8}\n@println(a[0])}}",
+            .take = false,
+            .executions = 2,
+            .output = "9\n8\n",
+        },
+    };
+    for (cases) |case| {
+        var module = try Module.init(test_gpa, "branch-transfer-topology.nov", case.source);
+        defer module.deinit();
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        try std.testing.expect(!module.hasErrors());
+        const body = sema.ir.functions.items[0].body.?;
+        var producer: ?Ir.ValueId = null;
+        for (@constCast(body.instructions)) |*instruction| switch (instruction.op) {
+            .local_slot => |*value| if (body.instructions[@backingInt(value.*)].op == .array_clone and producer == null) {
+                producer = value.*;
+                value.* = body.instructions[@backingInt(value.*)].op.array_clone;
+            },
+            .array_set => |*update| update.array = producer.?,
+            else => {},
+        };
+        const transfers = try ArrayTransfers.init(test_gpa, &sema.ir, body);
+        defer transfers.deinit(test_gpa);
+        try std.testing.expectEqual(@as(usize, if (case.take) 1 else 2), transfers.uses[@backingInt(producer.?)]);
+        try std.testing.expect(transfers.detached[@backingInt(producer.?)]);
+        try testTransferTopologyRuntime(&sema.ir, case.take, case.executions, case.output);
+    }
+}
+
+test "copy elision targeted transfers exhaust exact runtime budgets" {
+    for (copy_elision_cases[6..]) |case| {
+        const program = try arrayTestProgram(case.source);
+        defer test_gpa.free(program);
+        // Every remaining allocation must still fail cleanly, including partial
+        // nested records and the final append buffer, with collection forced.
+        for (0..case.allocations + 1) |budget| {
+            const prefix = try std.fmt.allocPrint(test_gpa, "#include <stdlib.h>\nstatic unsigned allocations;\n" ++
+                "static void *test_malloc(size_t n) {{ return ++allocations > {d} ? NULL : malloc(n); }}\n" ++
+                "#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n", .{budget});
+            defer test_gpa.free(prefix);
+            const c = try std.mem.concat(test_gpa, u8, &.{ prefix, program });
+            defer test_gpa.free(c);
+            const success = budget == case.allocations;
+            try compileAndRunExpected(c, "typedef int nonempty_translation_unit;", if (success) 0 else 1, if (success) case.output else "", if (success) "" else "panic: GC allocation failed\n");
+        }
     }
 }
 
@@ -8965,13 +9464,20 @@ test "array fields insertion replacement and append backing pointers detach at o
     const source =
         \\let Leaf=struct{values:[]int,text:string,}
         \\let Tree=struct{leaf:Leaf,records:[]Leaf,}
+        \\let Wrapped=union{node:Tree,none,}
         \\let main:()={
         \\let seed=Leaf[.values=[1,2],.text="shared"+"!"]
         \\let tree=Tree[.leaf=seed,.records=[seed,seed]]
-        \\let mut inserted=[tree,tree]
+        \\let wrapped=Wrapped.node[tree]
+        \\match wrapped {.node=>|snapshot|{
+        \\let mut inserted=[snapshot,snapshot]
         \\inserted[-1]=tree
         \\inserted += [tree,tree]
+        \\inserted += inserted
         \\@println(inserted.len,inserted[0].leaf.values[0],inserted[-1].records[-1].text)
+        \\}
+        \\.none=>{}
+        \\}
         \\}
     ;
     var module = try Module.init(test_gpa, "array-insertion-pointers.nov", source);
@@ -8998,7 +9504,8 @@ test "array fields insertion replacement and append backing pointers detach at o
         "test_leaf_independent(a.f0, x[i]); test_leaf_independent(b.f0, y[i]);\n" ++
         "for (uintptr_t j = 0; j < b.f1.len; ++j) test_leaf_independent(x[i], y[j]);\n" ++
         "for (uintptr_t j = 0; j < i; ++j) {{test_leaf_independent(x[i], x[j]); test_leaf_independent(y[i], y[j]);}}\n" ++
-        "}}\n}}\nvoid nov_main(void);", .{ @backingInt(leaf), @backingInt(leaf), @backingInt(tree), @backingInt(tree), @backingInt(leaf) });
+        "}}\n}}\n" ++
+        "static void test_tree_transferred(nov_record_{d} a, nov_record_{d} b) {{ assert(a.f0.f0.data == b.f0.f0.data); assert(a.f1.data == b.f1.data); }}\nvoid nov_main(void);", .{ @backingInt(leaf), @backingInt(leaf), @backingInt(tree), @backingInt(tree), @backingInt(leaf), @backingInt(tree), @backingInt(tree) });
     defer test_gpa.free(checker);
     const library = try emit(test_gpa, &sema.ir, null);
     defer test_gpa.free(library);
@@ -9019,7 +9526,9 @@ test "array fields insertion replacement and append backing pointers detach at o
         // later boundary copy could conceal shared insertion backing.
         var operation = std.Io.Writer.Allocating.init(test_gpa);
         defer operation.deinit();
-        try writeArrayValue(&sema.ir, &operation.writer, body, instruction, i);
+        const transfers = try ArrayTransfers.init(test_gpa, &sema.ir, body);
+        defer transfers.deinit(test_gpa);
+        try writeArrayValue(&sema.ir, &operation.writer, body, transfers, instruction, i);
         var checks = std.Io.Writer.Allocating.init(test_gpa);
         defer checks.deinit();
         try checks.writer.writeAll(operation.written());
@@ -9027,18 +9536,24 @@ test "array fields insertion replacement and append backing pointers detach at o
             .array_literal => |elements| {
                 literals += 1;
                 for (elements, 0..) |value, index| {
-                    try checks.writer.print("    test_tree_independent(((nov_record_{d} *)v{d}.data)[{d}], v{d});\n", .{ @backingInt(tree), i, index, @backingInt(value) });
+                    try checks.writer.print("    test_tree_{s}(((nov_record_{d} *)v{d}.data)[{d}], v{d});\n", .{ if (transfers.canTake(body, value, i)) "transferred" else "independent", @backingInt(tree), i, index, @backingInt(value) });
                 }
             },
             .array_set => |update| {
                 replacements += 1;
-                try checks.writer.print("    assert(v{d}.data != v{d}.data);\n", .{ i, @backingInt(update.array) });
-                try checks.writer.print("    for (uintptr_t j = 0; j < v{d}.len; ++j) test_tree_independent(((nov_record_{d} *)v{d}.data)[j], j == nov_array_index(v{d}, v{d}) ? v{d} : ((nov_record_{d} *)v{d}.data)[j]);\n", .{ i, @backingInt(tree), i, i, @backingInt(update.index), @backingInt(update.value), @backingInt(tree), @backingInt(update.array) });
+                try checks.writer.print("    assert(v{d}.data {s} v{d}.data);\n", .{ i, if (transfers.canTake(body, update.array, i)) "==" else "!=", @backingInt(update.array) });
+                try checks.writer.print("    test_tree_{s}(((nov_record_{d} *)v{d}.data)[nov_array_index(v{d}, v{d})], v{d});\n", .{ if (transfers.canTake(body, update.value, i)) "transferred" else "independent", @backingInt(tree), i, i, @backingInt(update.index), @backingInt(update.value) });
+                // A transferred base is the output itself after the write.
+                if (!transfers.canTake(body, update.array, i)) try checks.writer.print("    for (uintptr_t j = 0; j < v{d}.len; ++j) if (j != nov_array_index(v{d}, v{d})) test_tree_independent(((nov_record_{d} *)v{d}.data)[j], ((nov_record_{d} *)v{d}.data)[j]);\n", .{ i, i, @backingInt(update.index), @backingInt(tree), i, @backingInt(tree), @backingInt(update.array) });
             },
             .array_append => |append| {
                 appends += 1;
                 try checks.writer.print("    assert(v{d}.data != v{d}.data && v{d}.data != v{d}.data);\n", .{ i, @backingInt(append.lhs), i, @backingInt(append.rhs) });
-                try checks.writer.print("    for (uintptr_t j = 0; j < v{d}.len; ++j) test_tree_independent(((nov_record_{d} *)v{d}.data)[j], j < v{d}.len ? ((nov_record_{d} *)v{d}.data)[j] : ((nov_record_{d} *)v{d}.data)[j - v{d}.len]);\n", .{ i, @backingInt(tree), i, @backingInt(append.lhs), @backingInt(tree), @backingInt(append.lhs), @backingInt(tree), @backingInt(append.rhs), @backingInt(append.lhs) });
+                for ([_]Ir.ValueId{ append.lhs, append.rhs }, 0..) |value, side| {
+                    try checks.writer.print("    for (uintptr_t j = 0; j < v{d}.len; ++j) test_tree_{s}(((nov_record_{d} *)v{d}.data)[j + ", .{ @backingInt(value), if (transfers.canTake(body, value, i)) "transferred" else "independent", @backingInt(tree), i });
+                    if (side == 0) try checks.writer.writeByte('0') else try checks.writer.print("v{d}.len", .{@backingInt(append.lhs)});
+                    try checks.writer.print("], ((nov_record_{d} *)v{d}.data)[j]);\n", .{ @backingInt(tree), @backingInt(value) });
+                }
             },
             else => unreachable,
         }
@@ -9050,13 +9565,13 @@ test "array fields insertion replacement and append backing pointers detach at o
     }
     try std.testing.expectEqual(@as(usize, 2), literals);
     try std.testing.expectEqual(@as(usize, 1), replacements);
-    try std.testing.expectEqual(@as(usize, 1), appends);
+    try std.testing.expectEqual(@as(usize, 2), appends);
     const prefixed = try std.mem.concat(test_gpa, u8, &.{ "#include <assert.h>\n", instrumented });
     defer test_gpa.free(prefixed);
     const c = try collectingTestProgram(prefixed);
     defer test_gpa.free(c);
     for ([_][]const u8{ "-O0", "-O3" }) |mode|
-        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "4 1 shared!\n", "", mode);
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "8 1 shared!\n", "", mode);
 }
 
 test "array fields backing pointers are recursively independent and strings share" {

@@ -186,8 +186,14 @@ Eager recursive backing copies are a major performance concern, not an optimized
 ownership strategy. Reads, snapshots and updates may copy entire reachable array
 contents repeatedly and keep temporary backing rooted until function exit/reuse.
 Targeted fresh-value and projection elision is implemented and allocation-count
-regressions cover it at O0/O3 with forced GC. Insertion, replacement, append and
-indexed updates still contain redundant recursive copies. Investigate broader
+regressions cover it at O0/O3 with forced GC. The backend additionally transfers
+proven-detached single-use elements/bases into insertion/replacement, and append
+retains its freshly allocated outer buffer while recursively copying only unproven
+input portions. The proof counts all IR references, checks recursive freshness,
+and rejects transfers across loop execution regions; repeated operands, calls,
+merges and storage reads cannot establish ownership. It does not trust lowering
+to have inserted copies in forged IR. Snapshot/conservative-fallback copies remain
+potentially expensive. Investigate broader
 elision, moves/consuming transfers and copy-on-write as candidates, **not approved
 designs**. Any optimization must preserve observable independence,
 static borrow exclusivity and precise GC/root/OOM safety. No aliasing or COW behavior
