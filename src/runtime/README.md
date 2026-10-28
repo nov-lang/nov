@@ -189,9 +189,11 @@ Targeted fresh-value and projection elision is implemented and allocation-count
 regressions cover it at O0/O3 with forced GC. The backend additionally transfers
 proven-detached single-use elements/bases into insertion/replacement, and append
 retains its freshly allocated outer buffer while recursively copying only unproven
-input portions. The proof counts all IR references, checks recursive freshness,
-and rejects transfers across loop execution regions; repeated operands, calls,
-merges and storage reads cannot establish ownership. It does not trust lowering
+input portions. The proof counts all IR references and checks recursive freshness.
+A detached indexed-update base may have earlier scalar/length observations before
+exactly one consuming array_set, provided all share conditional/loop execution
+regions. Later reads, escaping projections, repeated consuming operands and region
+crossings reject transfer. Calls, merges and storage reads cannot establish ownership. It does not trust lowering
 to have inserted copies in forged IR. Snapshot/conservative-fallback copies remain
 potentially expensive. Investigate broader
 elision, moves/consuming transfers and copy-on-write as candidates, **not approved

@@ -12,8 +12,11 @@ boundaries; readonly field/simple-index projections avoid enclosing aggregate co
 Effectful indices retain snapshots. Allocation-count regressions cover these paths.
 Insertion/replacement now adopt proven-detached single-use temporaries. Append
 keeps its fresh outer buffer and recursively copies only unproven input portions.
-All IR references count against ownership; repeated operands and cross-loop-region
-reuse retain copies. Calls/merges/storage reads are not ownership evidence.
+All IR references are counted. Indexed compounds may transfer a detached snapshot
+with one consuming update after earlier nonescaping scalar/length observations in
+the same conditional/loop region. Later reads, aggregate projections, repeated
+consumption and region crossings retain copies. Calls/merges/storage reads are not
+ownership evidence.
 Snapshot copies, conservative fallbacks and more general update paths still need
 further optimization.
 Broader elision, moves/consuming transfers and copy-on-write remain candidates,

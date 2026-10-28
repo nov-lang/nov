@@ -1640,6 +1640,7 @@ fn writeBorrowRead(ir: *const Ir, w: *std.Io.Writer, body: Ir.Body, borrow: Ir.V
 // Count every reference (including projections, captures, region yields and the
 // body result), and recognize only constructors whose recursive backing is known.
 const ArrayTransfers = struct {
+    ir: *const Ir,
     uses: []usize,
     detached: []bool,
 
@@ -1671,7 +1672,7 @@ const ArrayTransfers = struct {
         @memset(detached, false);
         count(uses, body.result);
         for (body.instructions) |instruction| count(uses, instruction.op);
-        const self: ArrayTransfers = .{ .uses = uses, .detached = detached };
+        const self: ArrayTransfers = .{ .ir = ir, .uses = uses, .detached = detached };
         for (body.instructions, 0..) |instruction, i| {
             detached[i] = switch (instruction.op) {
                 // These operations either copy or use this same proof for inputs.
@@ -1701,7 +1702,54 @@ const ArrayTransfers = struct {
 
     fn canTake(self: ArrayTransfers, body: Ir.Body, value: Ir.ValueId, consumer: usize) bool {
         const producer = @backingInt(value);
-        if (producer >= consumer or self.uses[producer] != 1 or !self.detached[producer]) return false;
+        if (producer >= consumer or !self.detached[producer]) return false;
+        if (self.uses[producer] != 1) {
+            // Only an indexed update may consume an observed temporary. Do not
+            // extend the consuming convention of constructors or append here.
+            const update = body.instructions[consumer].op;
+            if (update != .array_set or update.array_set.array != value) return false;
+            if (!sameConditionalRegion(body, producer, consumer)) return false;
+            var observations: usize = 0;
+            for (body.instructions, 0..) |instruction, observer| {
+                const observes = switch (instruction.op) {
+                    .array_len, .iteration_len => |base| base == value,
+                    .array_index => |read| read.array == value and switch (self.ir.getType(instruction.ty).?) {
+                        .integer, .boolean, .rune, .enumeration, .string => true,
+                        // In particular, never let a projection carry mutable
+                        // backing (or a closure environment) past the update.
+                        else => false,
+                    },
+                    else => false,
+                };
+                if (!observes) continue;
+                if (observer <= producer or observer >= consumer or
+                    !sameLoopRegion(body, producer, observer) or
+                    !sameConditionalRegion(body, producer, observer)) return false;
+                observations += 1;
+            }
+            // All other references, including aliases, captures, calls, yields
+            // and the body result, are still counted as consuming/escaping uses.
+            if (self.uses[producer] != observations + 1) return false;
+        }
+        return sameLoopRegion(body, producer, consumer);
+    }
+
+    fn sameConditionalRegion(body: Ir.Body, a: usize, b: usize) bool {
+        for (body.instructions, 0..) |instruction, end| switch (instruction.op) {
+            .branch => |branch| {
+                for ([_]usize{ branch.then_start, branch.else_start }, [_]usize{ branch.else_start, end }) |start, stop| {
+                    if ((a >= start and a < stop) != (b >= start and b < stop)) return false;
+                }
+            },
+            .short_circuit => |region| {
+                if ((a >= region.rhs_start and a < end) != (b >= region.rhs_start and b < end)) return false;
+            },
+            else => {},
+        };
+        return true;
+    }
+
+    fn sameLoopRegion(body: Ir.Body, producer: usize, consumer: usize) bool {
         // A single static use can execute repeatedly. Never adopt an outer
         // temporary inside a loop, or across its separately executed regions.
         for (body.instructions, 0..) |instruction, end| {
@@ -8783,6 +8831,41 @@ const copy_elision_cases = [_]struct { source: []const u8, allocations: usize, o
         .allocations = 1,
         .output = "1\n",
     },
+    .{
+        .source = "let main:()={let mut a:[]int=[2,3]\na[-1]+=4\n@println(a[0],a[1])}",
+        .allocations = 2,
+        .output = "2 7\n",
+    },
+    .{
+        .source = "let main:()={let mut a:[]i8=[127]\na[0]+=1\nlet mut b:[]u64=[8]\nb[0]*=3\n@println(a[0],b[0])}",
+        .allocations = 4,
+        .output = "-128 24\n",
+    },
+    .{
+        .source = "let L=struct{a:[]int,b:[]int,}\nlet T=struct{leaf:L,}\nlet main:()={let mut t=T[.leaf=L[.a=[1,2],.b=[3]]]\nt.leaf.a[-1]+={t.leaf.b=[9]\n4}\n@println(t.leaf.a[0],t.leaf.a[1],t.leaf.b[0])}",
+        .allocations = 4,
+        .output = "1 6 9\n",
+    },
+    .{
+        .source = "let main:()={let mut a:[]int=[1,2]\na[{a=[8]\n0}]+={a=[9]\n4}\n@println(a[0],a[1])}",
+        .allocations = 4,
+        .output = "5 2\n",
+    },
+    .{
+        .source = "let main:()={let mut a:[]u16=[12]\na[0]/=3\n@println(a[0])}",
+        .allocations = 2,
+        .output = "4\n",
+    },
+    .{
+        .source = "let main:()={let mut a:[]int=[1]\nlet r=&a[0]\nr+=2\n@println(a[0])}",
+        .allocations = 1,
+        .output = "3\n",
+    },
+    .{
+        .source = "let L=struct{a:[]int,}\nlet main:()={let mut a=L[.a=[1]]\nlet change=(){a.a=[9]}\na.a[0]+={change()\n2}\n@println(a.a[0])}",
+        .allocations = 5,
+        .output = "3\n",
+    },
     // Includes immutable capture backing and its box, both environments, the
     // shared mutable cell, and snapshots preceding argument/index/RHS effects.
     .{ .source = copy_elision_effects, .allocations = 13, .output = "1 1 2\n2 3\n7 1 1\n" },
@@ -8982,36 +9065,36 @@ fn testTransferTopologyRuntime(ir: *const Ir, take: bool, executions: usize, out
         updates += 1;
         const base = instruction.op.array_set.array;
         try std.testing.expectEqual(take, transfers.canTake(body, base, i));
-        if (take) try std.testing.expectEqual(@as(usize, 1), transfers.uses[@backingInt(base)]);
+        if (take) try std.testing.expect(transfers.uses[@backingInt(base)] >= 1);
         var operation = std.Io.Writer.Allocating.init(test_gpa);
         defer operation.deinit();
         try writeArrayValue(ir, &operation.writer, body, transfers, instruction, i);
         var checks = std.Io.Writer.Allocating.init(test_gpa);
         defer checks.deinit();
         const element = ir.getType(instruction.ty).?.array;
-        try checks.writer.writeAll("    {\n        ");
+        try checks.writer.print("    {{\n        uintptr_t selected = nov_array_index(v{d}, v{d});\n        ", .{ @backingInt(base), @backingInt(instruction.op.array_set.index) });
         try writeType(ir, &checks.writer, element);
         try checks.writer.writeAll(" before = ((");
         try writeType(ir, &checks.writer, element);
-        try checks.writer.print(" *)v{d}.data)[0];\n", .{@backingInt(base)});
+        try checks.writer.print(" *)v{d}.data)[selected];\n", .{@backingInt(base)});
         const source = if (take) body.instructions[@backingInt(base)].op.array_clone else base;
         if (take) {
             try checks.writer.writeAll("        ");
             try writeType(ir, &checks.writer, element);
             try checks.writer.writeAll(" source_before = ((");
             try writeType(ir, &checks.writer, element);
-            try checks.writer.print(" *)v{d}.data)[0];\n", .{@backingInt(source)});
+            try checks.writer.print(" *)v{d}.data)[selected];\n", .{@backingInt(source)});
         }
         try checks.writer.writeAll(operation.written());
         try checks.writer.print("        assert(v{d}.data {s} v{d}.data);\n        assert(v{d}.data != v{d}.data);\n        assert(((", .{ i, if (take) "==" else "!=", @backingInt(base), i, @backingInt(source) });
         try writeType(ir, &checks.writer, element);
-        try checks.writer.print(" *)v{d}.data)[0] == {s});\n", .{ @backingInt(source), if (take) "source_before" else "before" });
+        try checks.writer.print(" *)v{d}.data)[selected] == {s});\n", .{ @backingInt(source), if (take) "source_before" else "before" });
         if (take) {
             // The detached producer can change, but its live upstream storage
             // cannot. Its old value is still checked to make the write real.
             try checks.writer.writeAll("        assert(before != ((");
             try writeType(ir, &checks.writer, element);
-            try checks.writer.print(" *)v{d}.data)[0]);\n", .{i});
+            try checks.writer.print(" *)v{d}.data)[selected]);\n", .{i});
         }
         try checks.writer.writeAll("        ++test_transfer_updates;\n    }\n");
         try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, instrumented, operation.written()));
@@ -9027,6 +9110,133 @@ fn testTransferTopologyRuntime(ir: *const Ir, take: bool, executions: usize, out
     defer test_gpa.free(c);
     for ([_][]const u8{ "-O0", "-O3" }) |mode|
         try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, output, "", mode);
+}
+
+test "copy elision observed snapshots reject forged later reads and escaping projections" {
+    for ([_][]const u8{
+        "let main:()={let mut a:[]int=[1]\na[0]+=2\n@println(a[0],a.len)}",
+        "let L=struct{a:[]int,}\nlet main:()={let mut a:[]L=[L[.a=[1]]]\nlet before=a[0]\na[0]=L[.a=[2]]\n@println(before.a[0],a[0].a[0])}",
+    }, 0..) |source, case| {
+        var module = try Module.init(test_gpa, "forged-observation.nov", source);
+        defer module.deinit();
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        try std.testing.expect(!module.hasErrors());
+        const body = sema.ir.functions.items[0].body.?;
+        const instructions = @constCast(body.instructions);
+        var consumer: usize = 0;
+        for (instructions, 0..) |instruction, i| {
+            if (instruction.op == .array_set) consumer = i;
+        }
+        var base = instructions[consumer].op.array_set.array;
+        if (case == 0) {
+            // The old-element read is safe, but a later scalar read is not.
+            var changed = false;
+            for (instructions[consumer + 1 ..]) |*instruction| {
+                if (instruction.op == .array_index) {
+                    instruction.op.array_index.array = base;
+                    changed = true;
+                    break;
+                }
+            }
+            try std.testing.expect(changed);
+        } else {
+            // Reuse the earlier detached snapshot whose indexed projection
+            // carries array backing out to another value boundary.
+            for (instructions[0..consumer]) |instruction| {
+                if (instruction.op == .array_index) {
+                    base = instruction.op.array_index.array;
+                    const load = &instructions[@backingInt(base)];
+                    try std.testing.expect(load.op == .local_load);
+                    const slot = load.op.local_load;
+                    load.op = .{ .array_clone = instructions[@backingInt(slot)].op.local_slot };
+                    break;
+                }
+            }
+            instructions[consumer].op.array_set.array = base;
+        }
+        try sema.ir.verify();
+        const transfers = try ArrayTransfers.init(test_gpa, &sema.ir, body);
+        defer transfers.deinit(test_gpa);
+        try std.testing.expect(transfers.uses[@backingInt(base)] > 1);
+        try std.testing.expect(transfers.detached[@backingInt(base)]);
+        try std.testing.expect(!transfers.canTake(body, base, consumer));
+        try testCopyElisionEmissionRuntime(&sema.ir, if (case == 0) "1 1\n" else "1 2\n");
+    }
+}
+
+fn testCopyElisionEmissionRuntime(ir: *const Ir, output: []const u8) !void {
+    const library = try emit(test_gpa, ir, null);
+    defer test_gpa.free(library);
+    const c = try collectingTestProgram(library);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, output, "", mode);
+}
+
+test "copy elision observed snapshots respect branch short circuit and loop regions" {
+    for ([_][]const u8{
+        "if true {a[0]+=1}",
+        "let ok=true and {a[0]+=1\ntrue}",
+        "loop i in 0..2 {a[0]+=1}",
+    }) |region| {
+        const source = try std.fmt.allocPrint(test_gpa, "let main:()={{let mut a:[]uint=[1]\nlet mut snapshot=a\n{s}\n@println(snapshot[0],a[0])}}", .{region});
+        defer test_gpa.free(source);
+        var module = try Module.init(test_gpa, "observed-region.nov", source);
+        defer module.deinit();
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        try std.testing.expect(!module.hasErrors());
+        const body = sema.ir.functions.items[0].body.?;
+        var outer: ?Ir.ValueId = null;
+        var consumer: usize = 0;
+        for (@constCast(body.instructions), 0..) |*instruction, i| switch (instruction.op) {
+            .local_slot => |*value| if (body.instructions[@backingInt(value.*)].op == .array_clone and outer == null) {
+                outer = value.*;
+                value.* = body.instructions[@backingInt(value.*)].op.array_clone;
+            },
+            .array_index => |*read| if (outer != null and consumer == 0) {
+                read.array = outer.?;
+            },
+            .array_set => |*update| {
+                update.array = outer.?;
+                consumer = i;
+            },
+            else => {},
+        };
+        try sema.ir.verify();
+        const transfers = try ArrayTransfers.init(test_gpa, &sema.ir, body);
+        defer transfers.deinit(test_gpa);
+        try std.testing.expectEqual(@as(usize, 2), transfers.uses[@backingInt(outer.?)]);
+        try std.testing.expect(!transfers.canTake(body, outer.?, consumer));
+        try testTransferTopologyRuntime(&sema.ir, false, if (std.mem.startsWith(u8, region, "loop")) 2 else 1, "1 2\n");
+    }
+    for ([_][]const u8{
+        "let main:()=if true {let mut a:[]int=[1]\na[0]+=1\n@println(a[0])}",
+        "let main:()=loop i in 0..2 {let mut a:[]int=[1]\na[0]+=1\n@println(a[0])}",
+    }, [_][]const u8{ "2\n", "2\n2\n" }, [_]usize{ 1, 2 }) |source, output, executions| {
+        var module = try Module.init(test_gpa, "observed-local-region.nov", source);
+        defer module.deinit();
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        try std.testing.expect(!module.hasErrors());
+        try testTransferTopologyRuntime(&sema.ir, true, executions, output);
+    }
+}
+
+test "copy elision compound updates adopt observed snapshots immediately" {
+    for (copy_elision_cases[5..9], [_]usize{ 1, 2, 1, 1 }) |case, executions| {
+        var sema = blk: {
+            var module = try Module.init(test_gpa, "observed.nov", case.source);
+            defer module.deinit();
+            var result = try Lowering.lower(&module);
+            errdefer result.deinit();
+            try std.testing.expect(!module.hasErrors());
+            break :blk result;
+        };
+        defer sema.deinit();
+        try testTransferTopologyRuntime(&sema.ir, true, executions, case.output);
+    }
 }
 
 test "copy elision topology rejects private sibling producers and keeps slot bridges independent" {
@@ -9192,7 +9402,10 @@ test "copy elision topology branch and short circuit consumers retain static own
 }
 
 test "copy elision targeted transfers exhaust exact runtime budgets" {
-    for (copy_elision_cases[6..]) |case| {
+    for (copy_elision_cases[5..]) |case| {
+        // This fixture prints between allocations; its failure prefixes are
+        // checked separately below rather than assuming empty output.
+        if (std.mem.eql(u8, case.source, copy_elision_effects)) continue;
         const program = try arrayTestProgram(case.source);
         defer test_gpa.free(program);
         // Every remaining allocation must still fail cleanly, including partial

@@ -1393,9 +1393,11 @@ let main: () -> void = {
   Recursive copying remains a major performance concern: cost follows the copied
   contents, not just outer array length. Insertion and replacement now transfer
   proven-detached, single-use temporaries; append keeps its fresh outer buffer
-  and recursively copies only unproven input portions. Repeated operands and
-  transfers across loop execution regions retain safe copies. Calls, merges and
-  storage reads are not backend ownership evidence. Broader elision, moves/consuming transfers and
+  and recursively copies only unproven input portions. Indexed compounds can reuse
+  a detached snapshot after earlier scalar/length observations in the same execution
+  region, avoiding a second backing allocation. Multiple consuming uses, escaping
+  projections, later observations and region crossings retain safe copies. Calls,
+  merges and storage reads are not backend ownership evidence. Broader elision, moves/consuming transfers and
   copy-on-write remain candidates to investigate, **not approved designs**;
   any optimization must preserve value independence, static borrowing and GC safety.
   Append does not yet promise amortized constant time or preserve spare capacity
