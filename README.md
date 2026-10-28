@@ -650,7 +650,33 @@ capabilities, function-valued fields, and function-valued C ABI
 boundaries remain unsupported. Shared captures are single-threaded; no concurrency
 semantics are introduced. See [`examples/closures.nov`](examples/closures.nov).
 
+### Inferred generic functions (approved syntax, not implemented)
+
+A backtick marks an inferred type variable, rather than a runtime or explicit
+compile-time argument. The same spelling can appear in parameters and results:
+
+```nov
+let first: (items: []`T) -> `T = items[0]
+let add: (x: `a, y: `b) -> `c = x + y
+
+; The same signature notation applies to a generic closure.
+let identity = (value: `T) -> `T { value }
+```
+
+Different variable names introduce distinct inference variables; the body imposes
+constraints relating them. For the existing integer/string `+`, both operands and
+the result must have the same supported concrete type. This does not introduce
+implicit numeric conversions or general bare-integer defaults. Notation and
+constraint intent are agreed, but generic functions/closures are **not executable
+yet**. Explicit specialization and the full inference rules remain to be settled.
+
+`#` is separate: it denotes **proposed explicit compile-time arguments**, not
+inferred type variables. Compile-time argument handling is not implemented.
+
 ### Other function syntax
+
+The examples below mix implemented forms with older design sketches. Pointer
+parameters, tuples and explicit `#` compile-time arguments are proposals only.
 
 Parenthesis are specific to functions, whenever there is a parenthesis there is a function involved.
 ```nov
@@ -677,9 +703,10 @@ let div: (a: int, b: int) -> struct{ int, int } = {
     [a / b, a % b]
 }
 
-; generic functions
-; see #Comptime for more information about that #
-; signature: (#type, any, any) -> bool
+; PROPOSAL ONLY: explicit compile-time type arguments, not implemented.
+; # marks an explicit compile-time argument, not an inferred type variable.
+; See Comptime; inferred generics instead use backtick type variables.
+; proposed signature: (#type, any, any) -> bool
 let eql: (T: #type, x: T, y: T) -> bool = x == y
 eql(int, 1, 2) ; returns false
 eql(int, true, 0) ; compile error
@@ -1110,8 +1137,10 @@ recursively detach array backing; this copy-depth contract is settled. Recursive
 layouts (also through arrays), contextual constructors, general container constants,
 value parameters and general compile-time execution remain unsupported.
 
-The following broader stack example remains design-only: `#type`, aggregate defaults
-and pointer-based mutable receivers are not delivered. Array fields themselves work.
+The following broader stack example remains design-only: `#type` proposes an
+explicit compile-time type argument (not implemented), distinct from backtick
+inferred type variables. Aggregate defaults and pointer-based mutable receivers
+are not delivered. Array fields themselves work.
 
 We can generate a type with a function thus creating a generic type.
 ```nov
@@ -2615,9 +2644,15 @@ Migration: add `@[public]` to declarations and methods used across files; remove
 `@[private]` attributes. A public type does not automatically make its methods public.
 
 ## Comptime
-Works almost like zig except that we use `#` instead of `comptime`
+
+**Proposal only—not implemented.** `#` denotes explicit compile-time arguments;
+it is not the notation for inferred generic type variables (which use backticks).
+The exact argument spelling and compile-time evaluation rules remain unsettled.
+The broader Zig-inspired expression/block/variable/assertion forms below are also
+historical proposals, not executable features or newly approved syntax.
+
 ```nov
-; comptime expr
+; PROPOSAL ONLY: compile-time expression
 let x = #fibonacci(10)
 
 ; comptime block

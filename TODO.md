@@ -540,7 +540,8 @@ let myStruct = struct {}
 - **Rework Parser to remove newline if they are unnecessary**
   - idk about render but this will simplify other steps a lot
 - provide a way to duplicate a function based on parameters?
-  - useful when an argument can be comptime or runtime
+  - useful when an argument can be comptime or runtime (explicit compile-time
+    arguments and `#` evaluation are proposals, not implemented)
 - Add `unroll` keyword to `match` and `for`, works like `inline` in zig
 - Eliminate hidden pass-by-reference from the codebase, i.e. use \*const more ofth for params
 - Make type optional (default to `any`) for function param?
@@ -1095,9 +1096,34 @@ TODO add a good way to make code usable on multiple systems through attributes.
 TODO: add an attribute for signal handler and add a way to pass parameters to it
 via SA\_SIGINFO (see std.debug.attachSegfaultHandler) `@[signal_handler(signal, args)]`
 
-# Comptime
+# Inferred generic functions (approved syntax, not implemented)
+
+Use backtick-prefixed type variables, not a separate argument that disappears
+from calls, an angle-bracket list, or `#`:
+
 ```nov
-; comptime variable?
+let first: (items: []`T) -> `T = items[0]
+let add: (x: `a, y: `b) -> `c = x + y
+let identity = (value: `T) -> `T { value }
+```
+
+Same-named variables agree; distinct names are related by body/operator constraints.
+For current builtin `+`, compatible means one exact supported integer type or
+string for both operands/result, not implicit conversion. No new integer defaults.
+Generic functions and closures remain unimplemented. Explicit specialization,
+contextual inference and higher-order generic values still need precise contracts;
+existing explicit generic-container parameters are unchanged.
+
+# Comptime
+
+**PROPOSAL ONLY—not implemented.** `#` denotes explicit compile-time arguments,
+not inferred generic type variables. The alternative argument spellings below
+are unresolved. The accompanying compile-time variable/expression sketches are
+also proposals, not delivered behavior. Existing `(T: type)` container templates
+do not imply general `#` argument/evaluation support.
+
+```nov
+; PROPOSAL ONLY: comptime variable?
 let mut x = #0 ; no
 let mut x: #int = 0 ; probably the best, #int and #uint can be bigger than their runtime equivalent
 let mut #x = 0
@@ -1141,10 +1167,11 @@ let ArrayList: (T: #type) -> type = { ... }
   - require an initializer (need `undefined` keyword?)
 - since Nov has first-class functions, how can we return a function?
   - do just like zig aka comptime function generation is possible e.g. with a
-    generic or by making a function with comptime parameters and returning it
+    generic or by making a function with proposed explicit comptime parameters
+    (not implemented) and returning it
   - put it on the stack/heap? need executable memory which is bad, also idk how gc will handle that
   - look at how ocaml or rust does it
-- comptime assertion like `let _ = #{}`?
+- Proposal only, not implemented: comptime assertion like `let _ = #{}`?
 - move generic to attributes? `@[generic(T)]`
 
 # Stuff to check & links
