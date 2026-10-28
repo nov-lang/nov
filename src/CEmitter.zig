@@ -4663,6 +4663,119 @@ test "array membership compiler ownership survives every allocation failure" {
     try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{array_membership});
 }
 
+const append_rhs_cases = [_]struct { source: []const u8, allocations: usize, output: []const u8 }{
+    .{ .source = "let main:()={let mut a:[]int=[1]\na+=a\n@println(a[0],a[1])}", .allocations = 3, .output = "1 1\n" },
+    .{ .source = "let main:()={let mut a:[]int=[1]\nlet b:[]int=[2]\na+=b\n@println(a[0],a[1],b[0])}", .allocations = 4, .output = "1 2 2\n" },
+    .{ .source = "let L=struct{a:[]int,b:[]int,}\nlet T=struct{leaf:L,}\nlet main:()={let mut a=[T[.leaf=L[.a=[1],.b=[2]]]]\nlet b=[T[.leaf=L[.a=[3],.b=[4]]]]\na+=b\n@println(a[0].leaf.a[0],a[1].leaf.b[0],b[0].leaf.a[0])}", .allocations = 12, .output = "1 4 3\n" },
+    .{ .source = "let L=struct{a:[]int,}\nlet T=struct{leaf:L,}\nlet main:()={let mut a=T[.leaf=L[.a=[1]]]\nlet b=T[.leaf=L[.a=[2]]]\nlet r=&b\na.leaf.a+=r.leaf.a\n@println(a.leaf.a[0],a.leaf.a[1],r.leaf.a[0])}", .allocations = 4, .output = "1 2 2\n" },
+    .{ .source = "let L=struct{a:[]int,}\nlet main:()={let mut a=L[.a=[1]]\nlet r=&a\nr.a+=r.a\n@println(r.a.len,r.a[0],r.a[1])}", .allocations = 3, .output = "2 1 1\n" },
+    .{ .source = "let L=struct{a:[]int,}\nlet main:()={let mut a=[L[.a=[1]]]\nlet r=&a[0]\nr.a+=r.a\n@println(r.a.len,r.a[0],r.a[1])}", .allocations = 4, .output = "2 1 1\n" },
+    .{ .source = "let main:()={let a:[]int=[2]\nlet r=&a\nlet mut b:[]int=[1]\nb+=r\n@println(b[0],b[1],r[0])}", .allocations = 4, .output = "1 2 2\n" },
+    .{ .source = "let L=struct{a:[]int,}\nlet main:()={let mut rows=[L[.a=[2]]]\nlet mut a:[]int=[1]\na+=rows[{rows=[L[.a=[9]]]\n0}].a\n@println(a[0],a[1],rows[0].a[0])}", .allocations = 9, .output = "1 2 9\n" },
+    .{ .source = "let L=struct{a:[]int,}\nlet select:(a:[]L,n:int)->L=a[n]\nlet main:()={let mut rows=[L[.a=[2]]]\nlet mut a:[]int=[1]\na+=select(rows,{rows=[L[.a=[9]]]\n0}).a\n@println(a[0],a[1],rows[0].a[0])}", .allocations = 10, .output = "1 2 9\n" },
+    .{ .source = "let L=struct{a:[]int,}\nlet main:()={let mut rows=[L[.a=[2]]]\nlet change=(){rows=[L[.a=[9]]]}\nlet index=()->int {change()\n0}\nlet mut a:[]int=[1]\na+=rows[index()].a\n@println(a[0],a[1],rows[0].a[0])}", .allocations = 13, .output = "1 2 9\n" },
+    .{ .source = "let main:()={let mut a:[]int=[1]\nlet append=(){a+=a}\nlet same=append\nsame()\n@println(a[0],a[1])}", .allocations = 5, .output = "1 1\n" },
+};
+
+test "append RHS projection exact allocations and every runtime OOM under forced GC" {
+    for (append_rhs_cases, 0..) |case, case_index| {
+        errdefer std.debug.print("append RHS case {d}: {s}\n", .{ case_index, case.source });
+        const program = try arrayTestProgram(case.source);
+        defer test_gpa.free(program);
+        for (0..case.allocations + 1) |budget| {
+            const prefix = try std.fmt.allocPrint(test_gpa, "#include <stdlib.h>\n#include <assert.h>\nstatic unsigned allocations, outstanding;\n" ++
+                "static void *test_malloc(size_t n) {{ if (allocations == {d}) return NULL; void *p = malloc(n); if (p) {{ ++allocations; ++outstanding; }} return p; }}\n" ++
+                "static void test_free(void *p) {{ assert(outstanding); --outstanding; free(p); }}\n" ++
+                "#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE test_free\n#define main test_main\n", .{budget});
+            defer test_gpa.free(prefix);
+            const suffix = try std.fmt.allocPrint(test_gpa, "\n#undef main\nint main(void) {{ int result = test_main(); assert(!outstanding); assert(allocations == {d}); return result; }}\n", .{case.allocations});
+            defer test_gpa.free(suffix);
+            const counted = try std.mem.concat(test_gpa, u8, &.{ prefix, program, suffix });
+            defer test_gpa.free(counted);
+            const success = budget == case.allocations;
+            for ([_][]const u8{ "-O0", "-O3" }) |mode|
+                try compileAndRunMode(counted, "typedef int nonempty_translation_unit;", if (success) 0 else 1, if (success) case.output else "", if (success) "" else "panic: GC allocation failed\n", mode);
+        }
+    }
+}
+
+test "append RHS projection preserves lhs snapshots effects once and terminal evaluation" {
+    const program = try arrayTestProgram(
+        \\let L=struct{a:[]int,}
+        \\let stop:()->int={let mut a:[]int=[1]
+        \\a+={@print("R")
+        \\return 7}}
+        \\let main:()={let mut a=L[.a=[1]]
+        \\let change=()->[]int {a.a=[9]
+        \\@print("C")
+        \\a.a}
+        \\a.a+=change()
+        \\@println(a.a[0],a.a[1],stop())
+        \\let mut steps:int=0
+        \\loop steps<3 : steps+=1 {
+        \\let mut b:[]int=[2]
+        \\b+={if steps==0 {continue}
+        \\if steps==2 {break}
+        \\b}
+        \\@println(b[0],b[1])}
+        \\@println(steps)
+        \\let mut rows=[L[.a=[3]]]
+        \\let mut b:[]int=[1]
+        \\b+=rows[{@print("I")
+        \\rows=[L[.a=[8]]]
+        \\0}].a
+        \\@println(b[0],b[1],rows[0].a[0])}
+    );
+    defer test_gpa.free(program);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(program, "typedef int nonempty_translation_unit;", 0, "CR1 9 7\n2 2\n2\nI1 3 8\n", "", mode);
+}
+
+fn testAppendRhsOwnership(allocator: std.mem.Allocator, source: []const u8) !void {
+    var sema = blk: {
+        var module = try Module.init(allocator, "append-rhs.nov", source);
+        defer module.deinit();
+        var result = try Lowering.lower(&module);
+        errdefer result.deinit();
+        try std.testing.expect(!module.hasErrors());
+        break :blk result;
+    };
+    defer sema.deinit();
+    try sema.ir.verify();
+    const c = try emitProgram(allocator, &sema.ir, null);
+    defer allocator.free(c);
+}
+
+test "append RHS projection source free ownership and compiler allocation failures" {
+    for (append_rhs_cases) |case| {
+        try testAppendRhsOwnership(test_gpa, case.source);
+        try TestAllocations.checkAllAllocationFailures(test_gpa, testAppendRhsOwnership, .{case.source});
+    }
+}
+
+test "append RHS projection OOM preserves snapshot before index side effects" {
+    const program = try arrayTestProgram(
+        \\let L=struct{a:[]int,}
+        \\let main:()={let mut rows=[L[.a=[2]]]
+        \\let mut a:[]int=[1]
+        \\a+=rows[{@print("I")
+        \\rows=[L[.a=[9]]]
+        \\0}].a
+        \\@println(a[0],a[1],rows[0].a[0])}
+    );
+    defer test_gpa.free(program);
+    for ([_]usize{ 0, 3, 4, 5, 6, 8, 9 }, [_][]const u8{ "", "", "", "", "I", "I", "I1 2 9\n" }) |budget, output| {
+        const prefix = try std.fmt.allocPrint(test_gpa, "#include <stdlib.h>\nstatic unsigned allocations;\n" ++
+            "static void *test_malloc(size_t n) {{ return ++allocations > {d} ? NULL : malloc(n); }}\n" ++
+            "#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n", .{budget});
+        defer test_gpa.free(prefix);
+        const counted = try std.mem.concat(test_gpa, u8, &.{ prefix, program });
+        defer test_gpa.free(counted);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode|
+            try compileAndRunMode(counted, "typedef int nonempty_translation_unit;", if (budget == 9) 0 else 1, output, if (budget == 9) "" else "panic: GC allocation failed\n", mode);
+    }
+}
+
 const readonly_membership_cases = [_]struct { source: []const u8, allocations: usize, output: []const u8 }{
     .{
         .source = "let main:()={let a:[]i16=[-3,2,7]\nloop _ in 0..4 {@println(2 in a,9 in a)}}",
@@ -9252,8 +9365,8 @@ const copy_elision_cases = [_]struct { source: []const u8, allocations: usize, o
     // Includes immutable capture backing and its box, both environments, the
     // shared mutable cell, and snapshots preceding argument/index/RHS effects.
     .{ .source = copy_elision_effects, .allocations = 13, .output = "1 1 2\n2 3\n7 1 1\n" },
-    // Targeted array transfers: one independent snapshot per storage read, no
-    // second recursive copy at insertion/replacement/append boundaries.
+    // Targeted transfers retain value snapshots; append projects its final RHS
+    // read and detaches unproven nested storage in the fresh result.
     .{
         .source = "let L=struct{a:[]int,}\nlet main:()={let a=[L[.a=[1]]]\n@println(a[0].a[0])}",
         .allocations = 2,
@@ -9276,17 +9389,17 @@ const copy_elision_cases = [_]struct { source: []const u8, allocations: usize, o
     },
     .{
         .source = "let L=struct{a:[]int,}\nlet main:()={let mut a=[L[.a=[1]]]\na+=a\n@println(a[0].a[0],a[1].a[0])}",
-        .allocations = 7,
+        .allocations = 6,
         .output = "1 1\n",
     },
     .{
         .source = "let L=struct{a:[]int,}\nlet T=struct{leaf:L,items:[]L,}\nlet main:()={let mut a=[T[.leaf=L[.a=[1]],.items=[L[.a=[2]]]]]\na+=a\n@println(a.len)}",
-        .allocations = 13,
+        .allocations = 12,
         .output = "2\n",
     },
     .{
         .source = "let L=struct{a:[]int,}\nlet T=struct{leaf:L,items:[]L,}\nlet U=union{node:T,none,}\nlet main:()={let u=U.node[T[.leaf=L[.a=[1]],.items=[L[.a=[2]]]]]\nmatch u {\n.node=>|t|{let mut a=t.items\na+=a\n@println(a.len)}\n.none=>{}\n}}",
-        .allocations = 13,
+        .allocations = 12,
         .output = "2\n",
     },
 };
@@ -10069,6 +10182,8 @@ test "array fields insertion replacement and append backing pointers detach at o
         \\let mut inserted=[snapshot,snapshot]
         \\inserted[-1]=tree
         \\inserted += [tree,tree]
+        \\let rhs=inserted
+        \\inserted += rhs
         \\inserted += inserted
         \\@println(inserted.len,inserted[0].leaf.values[0],inserted[-1].records[-1].text)
         \\}
@@ -10144,6 +10259,9 @@ test "array fields insertion replacement and append backing pointers detach at o
             },
             .array_append => |append| {
                 appends += 1;
+                // Projected storage is not a detached temporary, even though
+                // the fresh append result is. Only the literal can transfer.
+                try std.testing.expectEqual(body.instructions[@backingInt(append.rhs)].op == .array_literal, transfers.canTake(body, append.rhs, i));
                 try checks.writer.print("    assert(v{d}.data != v{d}.data && v{d}.data != v{d}.data);\n", .{ i, @backingInt(append.lhs), i, @backingInt(append.rhs) });
                 for ([_]Ir.ValueId{ append.lhs, append.rhs }, 0..) |value, side| {
                     try checks.writer.print("    for (uintptr_t j = 0; j < v{d}.len; ++j) test_tree_{s}(((nov_record_{d} *)v{d}.data)[j + ", .{ @backingInt(value), if (transfers.canTake(body, value, i)) "transferred" else "independent", @backingInt(tree), i });
@@ -10161,13 +10279,13 @@ test "array fields insertion replacement and append backing pointers detach at o
     }
     try std.testing.expectEqual(@as(usize, 2), literals);
     try std.testing.expectEqual(@as(usize, 1), replacements);
-    try std.testing.expectEqual(@as(usize, 2), appends);
+    try std.testing.expectEqual(@as(usize, 3), appends);
     const prefixed = try std.mem.concat(test_gpa, u8, &.{ "#include <assert.h>\n", instrumented });
     defer test_gpa.free(prefixed);
     const c = try collectingTestProgram(prefixed);
     defer test_gpa.free(c);
     for ([_][]const u8{ "-O0", "-O3" }) |mode|
-        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "8 1 shared!\n", "", mode);
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "16 1 shared!\n", "", mode);
 }
 
 test "array fields backing pointers are recursively independent and strings share" {

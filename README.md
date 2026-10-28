@@ -1395,7 +1395,10 @@ let main: () -> void = {
   Recursive copying remains a major performance concern: cost follows the copied
   contents, not just outer array length. Insertion and replacement now transfer
   proven-detached, single-use temporaries; append keeps its fresh outer buffer
-  and recursively copies only unproven input portions. Indexed compounds can reuse
+  and recursively copies only unproven input portions. Its final RHS read uses a
+  readonly projection rather than another outer-buffer clone, while LHS pre-RHS
+  snapshots and internal snapshots of effectful RHS bases remain. Plain assignment
+  still copies normally. Indexed compounds can reuse
   a detached snapshot after earlier scalar/length observations in the same execution
   region, avoiding a second backing allocation. Multiple consuming uses, escaping
   projections, later observations and region crossings retain safe copies. Calls,

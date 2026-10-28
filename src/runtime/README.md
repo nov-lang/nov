@@ -192,7 +192,12 @@ and managed inputs stay rooted. Contextual literals/construction may still alloc
 The backend additionally transfers
 proven-detached single-use elements/bases into insertion/replacement, and append
 retains its freshly allocated outer buffer while recursively copying only unproven
-input portions. The proof counts all IR references and checks recursive freshness.
+input portions. Append's final RHS read is a rooted readonly projection, avoiding
+an extra outer-buffer clone. Projected backing is not ownership evidence: unproven
+nested portions still copy into the fresh result. The LHS remains a pre-RHS snapshot,
+as do computed RHS bases evaluated before effectful indices. Plain assignment and
+arbitrary RHS block/control-flow evaluation keep their existing copy rules.
+The proof counts all IR references and checks recursive freshness.
 A detached indexed-update base may have earlier scalar/length observations before
 exactly one consuming array_set, provided all share conditional/loop execution
 regions. Later reads, escaping projections, repeated consuming operands and region

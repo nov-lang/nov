@@ -1442,7 +1442,13 @@ const Context = struct {
         const ty = self.ir.getType(field.ty).?;
         if (compound and ty != .integer and !((ty == .string or ty == .array) and tag == .assign_add)) return self.fail(.operator_not_supported, node, null);
         if (compound and try self.expression(data.lhs, .{ .ty = field.ty }, depth + 1) == null) return null;
-        if (try self.expression(data.rhs, .{ .ty = field.ty }, depth + 1) == null) return null;
+        // Append consumes the RHS last without language callbacks. Only its
+        // final read may project storage; internal effectful bases still snapshot.
+        const rhs = if (compound and ty == .array)
+            try self.projection(data.rhs, .{ .ty = field.ty }, depth + 1)
+        else
+            try self.expression(data.rhs, .{ .ty = field.ty }, depth + 1);
+        if (rhs == null) return null;
         const unit = try self.ir.internType(.void);
         if (!self.terminated) {
             if (self.emitter) |emitter| {
@@ -2453,7 +2459,11 @@ const Context = struct {
                 // Capture the old value before RHS effects, just as for binary
                 // arithmetic. A returning RHS never performs the final store.
                 if (compound and try self.expression(data.lhs, binding.known, depth + 1) == null) return null;
-                if (try self.expression(data.rhs, binding.known, depth + 1) == null) return null;
+                const rhs = if (array_append)
+                    try self.projection(data.rhs, binding.known, depth + 1)
+                else
+                    try self.expression(data.rhs, binding.known, depth + 1);
+                if (rhs == null) return null;
                 const unit = try self.ir.internType(.void);
                 if (!self.terminated) {
                     if (self.emitter) |emitter| {
@@ -2472,7 +2482,8 @@ const Context = struct {
                             .lhs = try emitter.value(data.lhs),
                             .rhs = value,
                         } });
-                        // RHS reads already snapshot; append produces new storage.
+                        // Assignment RHS reads snapshot; append instead copies any
+                        // unproven nested RHS storage into its fresh outer buffer.
                         if (binding.borrowed) {
                             try emitter.record(node, unit, self.irSpan(node), .{ .borrow_store = .{ .borrow = binding.borrow.?, .value = value, .path = &.{} } });
                         } else try emitter.record(node, unit, self.irSpan(node), .{ .local_store = .{ .slot = binding.slot.?, .value = value } });

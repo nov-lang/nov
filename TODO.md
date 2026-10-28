@@ -15,6 +15,9 @@ work, and effectful computed bases retain required internal snapshots. Exact
 allocation-count regressions cover these paths.
 Insertion/replacement now adopt proven-detached single-use temporaries. Append
 keeps its fresh outer buffer and recursively copies only unproven input portions.
+Append's final RHS read projects existing storage without cloning its outer buffer;
+LHS/internal effect snapshots remain, and plain assignments still copy. This does
+not extend projection through arbitrary RHS blocks/control-flow expressions.
 All IR references are counted. Indexed compounds may transfer a detached snapshot
 with one consuming update after earlier nonescaping scalar/length observations in
 the same conditional/loop region. Later reads, aggregate projections, repeated

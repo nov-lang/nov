@@ -2740,6 +2740,38 @@ test "static borrowing verifier rejects well typed forged owner access and sibli
     try result.ir.verify();
 }
 
+test "append RHS projects only final reads and keeps assignment snapshots" {
+    for ([_][]const u8{
+        "let main:()={let mut a:[]int=[1]\na+=a\nlet b=a\na=b}",
+        "let L=struct{a:[]int,}\nlet T=struct{leaf:L,}\nlet main:()={let mut a=T[.leaf=L[.a=[1]]]\na.leaf.a+=a.leaf.a\nlet b=a.leaf.a\na.leaf.a=b}",
+        "let L=struct{a:[]int,}\nlet main:()={let mut a=L[.a=[1]]\nlet r=&a\nr.a+=r.a\nlet b=r.a\nr.a=b}",
+        "let L=struct{a:[]int,}\nlet main:()={let mut a=[L[.a=[1]]]\nlet r=&a[0]\nr.a+=r.a\nlet b=r.a\nr.a=b}",
+    }) |source| {
+        var module = try Module.init(std.testing.allocator, "append-rhs-ir.nov", source);
+        defer module.deinit();
+        var result = try lower(&module);
+        defer result.deinit();
+        try std.testing.expect(result.lowering_complete);
+        const body = result.ir.functions.items[0].body.?;
+        var appends: usize = 0;
+        var snapshots: usize = 0;
+        for (body.instructions) |instruction| switch (instruction.op) {
+            .array_append => |append| {
+                appends += 1;
+                try std.testing.expect(body.instructions[@backingInt(append.lhs)].op == .array_clone);
+                const rhs = body.instructions[@backingInt(append.rhs)].op;
+                try std.testing.expect(rhs == .local_load or rhs == .field_read or rhs == .borrow_read);
+            },
+            .array_clone => snapshots += 1,
+            else => {},
+        };
+        try std.testing.expectEqual(@as(usize, 1), appends);
+        // Pre-RHS LHS, ordinary value binding, and plain assignment each detach.
+        try std.testing.expectEqual(@as(usize, 3), snapshots);
+        try result.ir.verify();
+    }
+}
+
 test "static borrowing normal array loads clone immediately before later borrow effects" {
     var module = try Module.init(std.testing.allocator, "borrow-snapshot-ir.nov", "let R=struct{x:int=0,}\nlet main:()={let mut a=[R[],R[]]\nlet before=a\nlet value=a[{let r=&a[0]\nr.x=9\n0}]\na+={let r=&a[0]\nr.x=8\n[R[]]}\na[{let r=&a[0]\nr.x=7\n1}]={let r=&a[0]\nr.x=6\nR[]}\n@println(value.x,before[0].x,a[0].x)}");
     defer module.deinit();
