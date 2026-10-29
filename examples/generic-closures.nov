@@ -1,0 +1,165 @@
+; nov run examples/generic-closures.nov
+; nov test examples/generic-closures.nov
+; Local templates capture once; concrete specializations share their environment.
+
+let apply: (callback: (`T) -> `U, input: `T) -> `U = callback(input)
+let reverse: (input: `T, callback: (`T) -> `U) -> `U = callback(input)
+
+let makeCounter: (initial: int) -> (bool) -> int = {
+    let mut count = initial
+    let next: (ignored: `T) -> int = {
+        count += 1
+        count
+    }
+    @assert(next("before escape") == initial + 1)
+    let escaped: (bool) -> int = next
+    escaped
+}
+
+let nested: (input: `A) -> `A = {
+    let forward = (value: `B) -> `B {
+        value
+    }
+    let local: (value: `C) -> `A = {
+        let outer = (ignored: `D) -> `A {
+            let ordinary = () -> `A {
+                input
+            }
+            ordinary()
+        }
+        @assert(forward(value) == value)
+        outer(true)
+    }
+    local("independent inner type")
+}
+
+let verifyDirect: () = {
+    let identity = (value: `T) -> `T {
+        value
+    }
+    let local: (value: `U) -> `U = value
+    @assert(identity(true) and local(false) == false)
+    @assert(identity("text") == "text")
+    let number: uint = identity(42)
+    let callback: (string) -> string = local
+    @assert(number == 42 and callback("typed") == "typed")
+    @assert(@as((bool) -> bool, identity)(true))
+    @assert(
+        (value: `V) -> `V {
+            value
+        }(@as(int, 7)) == 7
+    )
+}
+
+let verifyCallbacks: () = {
+    let identity = (value: `T) -> `T {
+        value
+    }
+    let local: (value: `U) -> `U = value
+    @assert(apply(identity, "inferred") == "inferred")
+    let number: uint = apply(local, 42)
+    let reversed: int = reverse(43, identity)
+    @assert(number == 42 and reversed == 43)
+    @assert(
+        apply(
+            (value: `V) -> `V {
+                value
+            },
+            true
+        )
+    )
+}
+
+let verifyShared: () = {
+    let mut count: uint = 0
+    let next = (value: `T) -> `T {
+        count += 1
+        value
+    }
+    let boolean: (bool) -> bool = next
+    let again: (bool) -> bool = next
+    let text: (string) -> string = next
+    @assert(next(@as(int, 7)) == 7 and count == 1)
+    @assert(boolean(true) and count == 2)
+    @assert(text("shared") == "shared" and count == 3)
+    @assert(again(false) == false and count == 4)
+    count = 10
+    @assert(next(true) and count == 11)
+}
+
+let verifySnapshots: () = {
+    let frozen: [][]int = [[4, 5], [6]]
+    let read = (ignored: `T) -> int {
+        let copy = frozen
+        let mut row = copy[0]
+        row[0] = 99
+        frozen[0][0] + frozen[1][0]
+    }
+    let mutate = (items: [][]int) {
+        let mut row = items[0]
+        row[0] = 80
+    }
+    mutate(frozen)
+    let first: (bool) -> int = read
+    @assert(first(true) == 10)
+    @assert(read("another specialization") == 10)
+    @assert(first(false) == 10 and frozen[0][0] == 4)
+}
+
+let verifyInstances: () = {
+    let mut first: (bool) -> int = (ignored: bool) -> int {
+        0
+    }
+    let mut last: (bool) -> int = first
+    loop index in @as(int, 0)..2 {
+        let mut count = index * 10
+        let frozen: []int = [index]
+        let next = (ignored: `T) -> int {
+            count += 1
+            count + frozen[0]
+        }
+        @assert(next("warmup") == index * 10 + 1 + index)
+        let specialized: (bool) -> int = next
+        if index == 0 {
+            first = specialized
+        } else {
+            last = specialized
+        }
+    }
+    @assert(first(true) == 2 and first(false) == 3)
+    @assert(last(true) == 13 and last(false) == 14)
+    let escaped = makeCounter(20)
+    let copied = escaped
+    let separate = makeCounter(40)
+    @assert(escaped(true) == 22 and copied(false) == 23)
+    @assert(separate(true) == 42 and escaped(false) == 24)
+}
+
+let verifyNested: () = {
+    @assert(nested(true))
+    @assert(nested(@as(int, 9)) == 9)
+    @assert(nested("outer capture") == "outer capture")
+}
+
+@[test]
+let direct_and_contextual: () = verifyDirect()
+@[test]
+let callback_inference: () = verifyCallbacks()
+@[test]
+let shared_mutable_capture: () = verifyShared()
+@[test]
+let recursive_array_snapshots: () = verifySnapshots()
+@[test]
+let loop_instances_and_escape: () = verifyInstances()
+@[test]
+let nested_template_substitution: () = verifyNested()
+
+let main: () = {
+    verifyDirect()
+    verifyCallbacks()
+    verifyShared()
+    verifySnapshots()
+    verifyInstances()
+    verifyNested()
+    @println("generic closures: all six checks passed")
+}

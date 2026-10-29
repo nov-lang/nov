@@ -1938,6 +1938,24 @@ fn testParseAllocationFailures(allocator: Allocator, source: [:0]const u8) !void
     try std.testing.expectEqual(source.len, ast.tokens.items(.start)[ast.lastToken(0)]);
 }
 
+test "generic closures preserve structural signatures local functions and immediate calls under OOM" {
+    const source = "let main:()={let identity=(value:`T)->`T{value}\nlet local:(value:`U)->`U=value\n@print((item:`V)->`V{item}(true),local(false))\n}";
+    var ast = try parse(std.testing.allocator, source);
+    defer ast.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    const body = ast.declFunction(ast.rootDecls()[0]).?.body;
+    var buffer: [2]Node.Index = undefined;
+    const statements = ast.fullBlock(&buffer, body).?.ast.statements;
+    const closure = ast.functionExpr(ast.decl(statements[0]).ast.init_node).?;
+    const proto = closure.proto;
+    var params = proto.iterate(&ast);
+    const param = params.next().?;
+    try std.testing.expectEqual(Ast.Node.Tag.type_variable, ast.nodes.items(.tag)[param.type_expr]);
+    try std.testing.expectEqualStrings("`T", ast.tokenSlice(ast.firstToken(proto.ast.return_type.?)));
+    try std.testing.expect(ast.declFunction(statements[1]) != null);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
+}
+
 test "closures preserve function expression views delimiters comments and parser OOM" {
     const source = "let make=(base:int)->(int)->int {\n; capture\n(value:int)->int {base+value}\n}\nlet instant=()->int {7}()\n";
     var ast = try parse(std.testing.allocator, source);

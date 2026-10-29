@@ -12,7 +12,38 @@ pub const max_terms = 8192;
 pub const max_depth = 128;
 pub const max_specialization_depth = 64;
 pub const max_specializations = 1024;
-pub const Ref = struct { module: *Module, id: Module.DeclId, container_type: ?Ir.TypeId = null };
+pub const Capture = struct { name: []const u8, ty: Ir.TypeId, template: ?Ref = null };
+pub const LocalTemplate = struct {
+    proto: Ast.Node.Index,
+    body: Ast.Node.Index,
+    outer_bindings: []const Module.TypeBinding = &.{},
+    captures: []const Capture = &.{},
+    outer_variables: []const Variable = &.{},
+    lexical_locals: []const Local = &.{},
+    container: ?Module.DeclId = null,
+    concrete_type: ?u32 = null,
+};
+pub const Ref = struct {
+    module: *Module,
+    id: Module.DeclId = @fromBackingInt(0),
+    container_type: ?Ir.TypeId = null,
+    local: ?*const LocalTemplate = null,
+
+    pub fn function(self: Ref) struct { proto_node: Ast.Node.Index, body: Ast.Node.Index } {
+        if (self.local) |local| return .{ .proto_node = local.proto, .body = local.body };
+        const f = self.module.source.ast.declFunction(self.module.getDeclaration(self.id).?.node).?;
+        return .{ .proto_node = f.proto_node, .body = f.body };
+    }
+
+    pub fn span(self: Ref) Module.Span {
+        if (self.local) |local| return self.module.tokenSpan(self.module.source.ast.firstToken(local.proto));
+        return self.module.getDeclaration(self.id).?.name_span;
+    }
+
+    fn isNoreturn(self: Ref) bool {
+        return self.local == null and self.module.getDeclaration(self.id).?.noreturn;
+    }
+};
 
 fn staticReference(module: *Module, node: Ast.Node.Index) ?Ref {
     const ast = &module.source.ast;
@@ -93,7 +124,7 @@ const Term = struct {
 const Nominal = struct { module: *Module, id: Module.DeclId, args: []const *Term };
 const Function = struct { params: []const *Term, result: *Term };
 const Variable = struct { name: []const u8, term: *Term };
-const Local = struct { name: []const u8, term: *Term };
+const Local = struct { name: []const u8, term: *Term, template: ?Ref = null };
 const Loop = struct { result: *Term, has_break: bool = false, has_continue: bool = false, allows_value: bool };
 const Frame = struct {
     ref: Ref,
@@ -267,7 +298,7 @@ const Solver = struct {
         const signature_type = instance.function;
         self.parameters = signature_type.params;
         if (signature_type.params.len != arguments.len) {
-            try self.fail(.argument_count_mismatch, self.call_span, ref.module.getDeclaration(ref.id).?.name_span);
+            try self.fail(.argument_count_mismatch, self.call_span, ref.span());
             return null;
         }
         for (arguments, signature_type.params) |arg, param| {
@@ -284,7 +315,7 @@ const Solver = struct {
                 if (!resolved(param, 0)) try self.body(&callback_frame, 0);
             }
         }
-        if (!ref.module.getDeclaration(ref.id).?.noreturn) {
+        if (!ref.isNoreturn()) {
             if (expected) |arg| if (arg.ty) |ty| try self.unify(signature_type.result, try self.fromType(ty, arg.span, 0), arg.span, 0);
         }
         try self.body(&frame, 0);
@@ -480,13 +511,13 @@ const Solver = struct {
             },
             else => {},
         }
-        const decl = module.getDeclaration(frame.ref.id).?;
+        const decl = if (frame.ref.local == null) module.getDeclaration(frame.ref.id) else null;
         const start = module.diagnostics.items.len;
         defer if (self.read_only) module.diagnostics.shrinkRetainingCapacity(start);
         const ty = if (frame.container != null)
             try TypeResolver.resolveInScopeReadOnly(module, self.ir, node, null, null, &.{})
         else
-            try TypeResolver.resolveInScopeReadOnly(module, self.ir, node, decl.container, decl.concrete_type, decl.function_bindings);
+            try TypeResolver.resolveInScopeReadOnly(module, self.ir, node, if (frame.ref.local) |local| local.container else decl.?.container, if (frame.ref.local) |local| local.concrete_type else decl.?.concrete_type, if (frame.ref.local) |local| local.outer_bindings else decl.?.function_bindings);
         return if (ty) |known| self.fromType(known, span, depth + 1) else self.term(.unknown, span);
     }
 
@@ -494,8 +525,7 @@ const Solver = struct {
         if (depth >= max_depth or self.failed) return null;
         const module = ref.module;
         const ast = &module.source.ast;
-        const decl = module.getDeclaration(ref.id).?;
-        const function = ast.declFunction(decl.node) orelse return null;
+        const function = ref.function();
         var variables: std.ArrayList(Variable) = .empty;
         for (ast.tokens.items(.tag)[ast.firstToken(function.proto_node) .. ast.lastToken(function.proto_node) + 1], ast.firstToken(function.proto_node)..) |tag, token| {
             if (tag != .type_variable) continue;
@@ -505,9 +535,46 @@ const Solver = struct {
                 found = true;
                 break;
             };
-            if (!found) try variables.append(self.allocator, .{ .name = name, .term = try self.term(.unknown, module.tokenSpan(@intCast(token))) });
+            if (!found) {
+                var variable_term = try self.term(.unknown, module.tokenSpan(@intCast(token)));
+                if (ref.local) |local| {
+                    for (local.outer_variables) |variable| {
+                        if (std.mem.eql(u8, variable.name, name)) {
+                            variable_term = variable.term;
+                            break;
+                        }
+                    }
+                    for (local.outer_bindings) |binding| {
+                        if (std.mem.eql(u8, binding.name, name)) {
+                            variable_term = try self.fromType(binding.ty, module.tokenSpan(@intCast(token)), 0);
+                            break;
+                        }
+                    }
+                }
+                try variables.append(self.allocator, .{ .name = name, .term = variable_term });
+            }
         }
+        if (ref.local) |local| for (local.outer_bindings) |binding| {
+            var found = false;
+            for (variables.items) |v| if (std.mem.eql(u8, v.name, binding.name)) {
+                found = true;
+                break;
+            };
+            if (!found) try variables.append(self.allocator, .{ .name = binding.name, .term = try self.fromType(binding.ty, ref.span(), 0) });
+        };
+        if (ref.local) |local| for (local.outer_variables) |variable| {
+            var found = false;
+            for (variables.items) |v| if (std.mem.eql(u8, v.name, variable.name)) {
+                found = true;
+                break;
+            };
+            if (!found) try variables.append(self.allocator, variable);
+        };
         var frame: Frame = .{ .ref = ref, .variables = variables.items, .result = undefined, .container = container };
+        if (ref.local) |local| try frame.locals.appendSlice(self.allocator, local.lexical_locals);
+        if (ref.local) |local| for (local.captures) |capture| {
+            try frame.locals.append(self.allocator, .{ .name = capture.name, .term = try self.fromType(capture.ty, ref.span(), 0), .template = capture.template });
+        };
         const signature_term = try self.typeNode(&frame, function.proto_node, depth + 1);
         if (self.failed or signature_term.value != .function) return null;
         const f = signature_term.value.function;
@@ -522,12 +589,12 @@ const Solver = struct {
 
     fn body(self: *Solver, frame: *Frame, depth: usize) Ir.BuildError!void {
         if (self.failed) return;
-        for (self.active.items) |ref| if (ref.module == frame.ref.module and ref.id == frame.ref.id) return;
+        for (self.active.items) |ref| if (ref.module == frame.ref.module and ref.id == frame.ref.id and ref.local == frame.ref.local) return;
         if (depth >= max_specialization_depth) return self.fail(.generic_function_limit, self.call_span, null);
         try self.active.append(self.allocator, frame.ref);
         defer _ = self.active.pop();
         const ast = &frame.ref.module.source.ast;
-        const function = ast.declFunction(frame.ref.module.getDeclaration(frame.ref.id).?.node).?;
+        const function = frame.ref.function();
         if (function.body != 0) try self.unify(frame.result, try self.expression(frame, function.body, depth + 1), frame.ref.module.tokenSpan(ast.firstToken(function.body)), 0);
     }
 
@@ -538,9 +605,16 @@ const Solver = struct {
         const ast = &module.source.ast;
         if (ast.nodes.items(.tag)[node] == .identifier) {
             const name = ast.tokenSlice(ast.firstToken(node));
-            for (frame.locals.items) |local| if (std.mem.eql(u8, local.name, name)) return null;
-            const decl = module.getDeclaration(frame.ref.id).?;
-            if (decl.container) |container| if (module.lookupConcreteMethod(container, decl.concrete_type, name)) |id| {
+            var i = frame.locals.items.len;
+            while (i != 0) {
+                i -= 1;
+                const local = frame.locals.items[i];
+                if (std.mem.eql(u8, local.name, name)) return if (local.template) |ref| .{ .ref = ref, .container = frame.container } else null;
+            }
+            const decl = if (frame.ref.local == null) module.getDeclaration(frame.ref.id) else null;
+            const scope = if (frame.ref.local) |local| local.container else decl.?.container;
+            const concrete = if (frame.ref.local) |local| local.concrete_type else decl.?.concrete_type;
+            if (scope) |container| if (module.lookupConcreteMethod(container, concrete, name)) |id| {
                 if (ast.declFunction(module.getDeclaration(id).?.node) == null) return null;
                 return .{ .ref = .{ .module = module, .id = id }, .container = frame.container };
             };
@@ -611,13 +685,30 @@ const Solver = struct {
         return .{ .ref = .{ .module = owner, .id = id }, .container = container, .receiver = receiver };
     }
 
+    fn closureReference(self: *Solver, frame: *Frame, proto: Ast.Node.Index, body_node: Ast.Node.Index) Ir.BuildError!Ref {
+        const local = try self.allocator.create(LocalTemplate);
+        const declaration = if (frame.ref.local == null) frame.ref.module.getDeclaration(frame.ref.id) else null;
+        local.* = .{
+            .proto = proto,
+            .body = body_node,
+            .outer_variables = frame.variables,
+            .lexical_locals = try self.allocator.dupe(Local, frame.locals.items),
+            .container = if (frame.ref.local) |outer| outer.container else declaration.?.container,
+            .concrete_type = if (frame.ref.local) |outer| outer.concrete_type else declaration.?.concrete_type,
+        };
+        return .{ .module = frame.ref.module, .local = local };
+    }
+
     fn closure(self: *Solver, frame: *Frame, proto_node: Ast.Node.Index, body_node: Ast.Node.Index, depth: usize) Ir.BuildError!*Term {
         const module = frame.ref.module;
         const ast = &module.source.ast;
         const span = module.tokenSpan(ast.firstToken(proto_node));
         if (!signatureVariablesBound(frame, proto_node)) {
-            try self.fail(.generic_function_context, span, null);
-            return self.term(.unknown, span);
+            const ref = try self.closureReference(frame, proto_node, body_node);
+            const instance = (try self.signature(ref, frame.container, depth + 1)) orelse return self.term(.unknown, span);
+            var child = instance.frame;
+            try self.body(&child, depth + 1);
+            return self.term(.{ .function = instance.function }, span);
         }
         const signature_type = try self.typeNode(frame, proto_node, depth + 1);
         if (self.failed or signature_type.value != .function) return self.term(.unknown, span);
@@ -707,7 +798,7 @@ const Solver = struct {
         if (self.failed) return self.term(.unknown, span);
         const data = ast.nodes.items(.data)[node];
         if (try self.callTarget(frame, node, depth + 1)) |candidate| {
-            if (candidate.ref.module.getDeclaration(candidate.ref.id).?.is_generic_function) {
+            if (candidate.ref.local != null or candidate.ref.module.getDeclaration(candidate.ref.id).?.is_generic_function) {
                 const instance = (try self.signature(candidate.ref, candidate.container, depth + 1)) orelse return self.term(.unknown, span);
                 var callback_frame = instance.frame;
                 try self.body(&callback_frame, depth + 1);
@@ -805,6 +896,14 @@ const Solver = struct {
                                 named_function = true;
                             };
                         }
+                        const closure_proto = if (named_function) decl.ast.type_node else if (decl.ast.init_node != 0 and ast.nodes.items(.tag)[decl.ast.init_node] == .function_expr) ast.nodes.items(.data)[decl.ast.init_node].lhs else 0;
+                        if (closure_proto != 0 and !signatureVariablesBound(frame, closure_proto)) {
+                            const closure_body = if (named_function) decl.ast.init_node else ast.nodes.items(.data)[decl.ast.init_node].rhs;
+                            const ref = try self.closureReference(frame, closure_proto, closure_body);
+                            try frame.locals.append(self.allocator, .{ .name = ast.tokenSlice(decl.ast.let_token + 1 + @intFromBool(decl.ast.is_mutable)), .term = try self.term(.unknown, span), .template = ref });
+                            result = try self.fromType(try self.ir.internType(.void), span, 0);
+                            continue;
+                        }
                         const value = if (decl.ast.init_node == 0)
                             try self.term(.unknown, span)
                         else if (named_function)
@@ -892,8 +991,8 @@ const Solver = struct {
                                 if (root(value).value == .never) return value;
                                 try self.unify(param, value, module.tokenSpan(ast.firstToken(arg)), 0);
                             }
-                            if (callee_target.ref.module.getDeclaration(callee_target.ref.id).?.noreturn) return self.term(.never, span);
-                            if (callee_target.ref.module.getDeclaration(callee_target.ref.id).?.is_generic_function) try self.body(&child, depth + 1);
+                            if (callee_target.ref.isNoreturn()) return self.term(.never, span);
+                            if (callee_target.ref.local != null or callee_target.ref.module.getDeclaration(callee_target.ref.id).?.is_generic_function) try self.body(&child, depth + 1);
                             return f.result;
                         }
                     }
@@ -960,8 +1059,8 @@ test "backtick generic function rejects ambiguous conflicting unbound and unsupp
         .{ .source = "let apply:(f:(`T)->`U,x:`T)->`U=f(x)\nlet main:()={let x:int=apply(id,@as(uint,42))\n}", .tag = .generic_function_conflict },
         .{ .source = "let main:()={@println(id)}", .tag = .generic_function_ambiguous },
         .{ .source = "let main:()={id}", .tag = .generic_function_context },
-        .{ .source = "let main:()={let f:(x:`T)->`T=x\n}", .tag = .generic_function_context },
-        .{ .source = "let main:()={let f=(x:`T)->`T{x}\n}", .tag = .generic_function_context },
+        .{ .source = "let main:()={let mut f:(x:`T)->`T=x\n}", .tag = .generic_function_context },
+        .{ .source = "let main:()={let mut f=(x:`T)->`T{x}\n}", .tag = .generic_function_context },
         .{ .source = "let x:`T=true\nlet main:()={}", .tag = .unbound_type_variable },
         .{ .source = "let bad:(x:`T)->`T={let y:`U=x\ny}\nlet main:()={let x=bad(true)\n}", .tag = .unbound_type_variable },
         .{ .source = "let wrong:(x:`T)->`T=missing\nlet main:()={let x=wrong(true)\n}", .tag = .unknown_name },
@@ -1113,7 +1212,7 @@ test "backtick unresolved conflict and unbound diagnostics roll back under OOM" 
         .{ .source = "let f:(x:`T)->`U=1\nlet main:()={let a=f(true)\n}", .tag = .generic_function_ambiguous },
         .{ .source = "let f:(x:`T,y:`T)->`T=x\nlet main:()={let a=f(true,\"s\")\n}", .tag = .generic_function_conflict },
         .{ .source = "let f:(x:`T)->`T={let a:`U=x\na}\nlet main:()={let a=f(true)\n}", .tag = .unbound_type_variable },
-        .{ .source = "let f:(x:`T)->`T={let a=(v:`U)->`U{v}\nx}\nlet main:()={let a=f(true)\n}", .tag = .generic_function_context },
+        .{ .source = "let f:(x:`T)->`T={let mut a=(v:`U)->`U{v}\nx}\nlet main:()={let a=f(true)\n}", .tag = .generic_function_context },
     }) |case| {
         try testInferenceFailureAllocations(std.testing.allocator, case.source, case.tag);
         try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testInferenceFailureAllocations, .{ case.source, case.tag });
@@ -1144,6 +1243,135 @@ test "backtick specialization count is bounded per defining module" {
     for (0..max_specializations + 1) |i| try source.writer.print("let a{d}=id(R{d}[])\n", .{ i, i });
     try source.writer.writeAll("}");
     try testInferenceFailureAllocations(std.testing.allocator, source.written(), .generic_function_limit);
+}
+
+fn testLocalClosureProbe(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "closure-probe.nov", "let main:()={let f=(x:`T)->`T{let ordinary=(v:`T)->`T{v}\nif saved {ordinary(x)} else {x}}\n}");
+    defer module.deinit();
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    ir.source_len = @intCast(module.source.ast.source.len);
+    const ast = &module.source.ast;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const statement = ast.fullBlock(&buffer, ast.declFunction(ast.rootDecls()[0]).?.body).?.ast.statements[0];
+    const function = ast.functionExpr(ast.decl(statement).ast.init_node).?;
+    const boolean = try ir.internType(.boolean);
+    const local: LocalTemplate = .{ .proto = function.proto.ast.proto_node, .body = function.body, .captures = &.{.{ .name = "saved", .ty = boolean }} };
+    const ref: Ref = .{ .module = &module, .local = &local };
+    const declarations = module.declarations.items.len;
+    for (0..3) |_| {
+        try std.testing.expectEqual(boolean, (try probeResult(&module, &ir, ref, &.{.{ .ty = boolean, .span = ref.span() }}, ref.span())).?);
+        try std.testing.expectEqual(declarations, module.declarations.items.len);
+        try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+        try std.testing.expectEqual(@as(usize, 0), ir.functions.items.len);
+        try std.testing.expectEqual(@as(usize, 0), ir.local_generic_instances.items.len);
+    }
+}
+
+test "generic closures readonly probes never demand code IDs instances or environments under OOM" {
+    try testLocalClosureProbe(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testLocalClosureProbe, .{});
+}
+
+fn testClosureMethodScopeImports(allocator: std.mem.Allocator) !void {
+    var lowered = blk: {
+        var comp = Compilation.init(allocator);
+        defer comp.deinit();
+        const root = try comp.addSource("/review/main.nov",
+            \\let api=@import("api.nov")
+            \\let main:()={@println(api.Alias[].method(true),api.Alias.static(false),api.Generic(bool)[].method(true))}
+        );
+        const library = try comp.addSource("/review/api.nov",
+            \\let R=struct{
+            \\ let helper:(input:bool)->int=1
+            \\ @[public]
+            \\ let method:(self:R,input:`A)->`U={let f=(x:`B)->`C{helper(x)}
+            \\  f(input)}
+            \\ @[public]
+            \\ let static:(input:`A)->`U={let f=(x:`B)->`C{let nested=(other:`D)->`E{helper(other)}
+            \\  nested(x)}
+            \\  f(input)}
+            \\}
+            \\let Box:(Element:type)->type=struct{
+            \\ let Self=@This()
+            \\ let helper:(input:Element)->int=2
+            \\ @[public]
+            \\ let method:(self:Self,input:`A)->`U={let f=(x:`B)->`C{helper(x)}
+            \\  f(input)}
+            \\}
+            \\@[public]
+            \\let Alias=R
+            \\@[public]
+            \\let Generic=Box
+        );
+        const module = comp.getModule(root).?;
+        const local = module.lookup("api").?;
+        try comp.imports.append(allocator, .{ .declaration = comp.declaration_ids.get(.{ .source = root, .local = local }).?, .target = library, .named = false, .span = module.getDeclaration(local).?.name_span });
+        const count = comp.declarations.items.len;
+        var result = Lowering.lowerCompilation(&comp) catch |err| {
+            try std.testing.expectEqual(count, comp.declarations.items.len);
+            for (comp.modules.items) |owner| try std.testing.expectEqual(@as(usize, 0), owner.diagnostics.items.len);
+            return err;
+        };
+        errdefer result.deinit();
+        if (comp.hasErrors()) for (comp.modules.items) |owner| std.debug.print("closure method scope: {any} {any}\n", .{ owner.source.ast.errors, owner.diagnostics.items });
+        try std.testing.expect(!comp.hasErrors());
+        try std.testing.expect(result.lowering_complete);
+        break :blk result;
+    };
+    defer lowered.deinit();
+    try lowered.ir.verify();
+}
+
+test "generic closures review imported aliases retain transitive static generic method scope under OOM" {
+    try testClosureMethodScopeImports(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testClosureMethodScopeImports, .{});
+}
+
+test "generic closures block probes restore names and retain lexical errors under OOM" {
+    for ([_]struct { source: []const u8, tag: Module.Diagnostic.Tag }{
+        .{ .source = "let id:(x:`A)->`A=x\nlet main:()={@print(id({let f=(x:`T)->`T{x}\nf(true)}))\n@print(f)}", .tag = .unknown_name },
+        .{ .source = "let id:(x:`A)->`A=x\nlet main:()={let a:int=7\n@print(id({let f=(x:`T)->`T{let a:int=9\nx}\nf(true)}))}", .tag = .unsupported_shadowing },
+        .{ .source = "let id:(x:`A)->`A=x\nlet main:()={let a:int=7\n@print(id({let f=(a:`T)->`T{a}\nf(true)}))}", .tag = .unsupported_shadowing },
+        .{ .source = "let id:(x:`A)->`A=x\nlet main:()=@print(id({let f=(x:`T)->`T{f(x)}\nf(true)}))", .tag = .unknown_name },
+    }) |case| {
+        try testInferenceFailureAllocations(std.testing.allocator, case.source, case.tag);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testInferenceFailureAllocations, .{ case.source, case.tag });
+    }
+}
+
+test "generic closures review no shadowing is independent of captures and demand order under OOM" {
+    for ([_][]const u8{
+        "let main:()={let a:int=7\nlet f=(x:`T)->`T{let a:int=9\nx}\n@print(f(true))}",
+        "let main:()={let a:int=7\nlet f=(x:`T)->`T{@print(a)\nlet a:int=9\nx}\n@print(f(true))}",
+        "let main:()={let a:int=7\nlet f=(x:`T)->`T{let a:int=9\nx}\n@print(f(@as(int,1)),f(true))}",
+        "let main:()={let a:int=7\nlet f=(x:`T)->`T{let g=(a:bool)->bool{a}\nx}\n@print(f(true))}",
+        "let main:()={let a:int=7\nlet f=(x:`T)->`T{let g=(a:`U)->`U{a}\nx}\n@print(f(true))}",
+        "let main:()={let a:int=7\nlet f=(x:`T)->`T{let g=(v:`U)->`U{let a:int=9\nv}\ng(x)}\n@print(f(true))}",
+        "let a:int=7\nlet main:()={let f=(x:`T)->`T{let a:int=9\nx}\n@print(f(true))}",
+        "let outer:(input:`A)->`A={let f=(x:`B)->`B{let input:int=9\nx}\nf(input)}\nlet main:()=@print(outer(true))",
+        "let Box:(Element:type)->type=struct{let Self=@This()\nlet method:(self:Self,input:`A)->`A={let f=(x:`B)->`B{let Element:int=9\nx}\nf(input)}\n}\nlet main:()=@print(Box(bool)[].method(true))",
+        "let Box:(Element:type)->type=struct{let Self=@This()\nlet method:(self:Self,input:`A)->`A={let f=(x:`B)->`B{let Self:int=9\nx}\nf(input)}\n}\nlet main:()=@print(Box(bool)[].method(true))",
+    }) |source| {
+        try testInferenceFailureAllocations(std.testing.allocator, source, .unsupported_shadowing);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testInferenceFailureAllocations, .{ source, Module.Diagnostic.Tag.unsupported_shadowing });
+    }
+}
+
+test "generic closures diagnose exact constraints ambiguity locals and capture scopes under OOM" {
+    for ([_]struct { source: []const u8, tag: Module.Diagnostic.Tag }{
+        .{ .source = "let main:()={let f=(x:`T,y:`T)->`T{x}\nf(true,@as(int,1))}", .tag = .generic_function_conflict },
+        .{ .source = "let main:()={let f=(x:`T)->`T{x}\nlet g=f\n}", .tag = .generic_function_ambiguous },
+        .{ .source = "let main:()={let f:(x:`T)->`T=x\nf(1)\n@print()}", .tag = .generic_function_ambiguous },
+        .{ .source = "let main:()={let f:(x:`T)->`T=unknown\n@print(f(true))}", .tag = .unknown_name },
+        .{ .source = "let main:()={let f:(x:`T)->`T=f(x)\n@print(f(true))}", .tag = .unknown_name },
+        .{ .source = "let main:()={let x:int=1\nlet f=(x:`T)->`T{x}\nf(true)}", .tag = .unsupported_shadowing },
+        .{ .source = "let main:()={let f=(x:`T)->`T{{let hidden:int=1\n}\nx}\n@print(f(true))\n@print(hidden)}", .tag = .unknown_name },
+        .{ .source = "let main:()={let mut n:int=1\nlet loan=&n\nlet f=(x:`T)->`T{@print(loan)\nx}\nf(true)}", .tag = .unsupported_borrow },
+    }) |case| {
+        try testInferenceFailureAllocations(std.testing.allocator, case.source, case.tag);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testInferenceFailureAllocations, .{ case.source, case.tag });
+    }
 }
 
 test "backtick inferred generic closures are rejected at module scope" {

@@ -473,6 +473,9 @@ pub fn specializeFunction(self: *Sema, caller: *Module, reference: GenericFuncti
         };
         if (equal) return @fromBackingInt(@intCast(i));
     }
+    for (self.ir.local_generic_instances.items) |instance| if (instance.span.source == module.source.id) {
+        count += 1;
+    };
     if (depth >= GenericFunctions.max_specialization_depth or count >= GenericFunctions.max_specializations) {
         try caller.diagnostics.append(caller.allocator, .{ .tag = .generic_function_limit, .span = span, .related = module.getDeclaration(ref.id).?.name_span });
         return null;

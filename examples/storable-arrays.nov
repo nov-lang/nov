@@ -27,6 +27,10 @@ let counters = () -> []() -> int {
         () -> int {
             count += 1
             count
+        },
+        () -> int {
+            count += 2
+            count
         }
     ]
 }
@@ -39,9 +43,10 @@ let main: () = {
     @println("Rows:", saved[0][0], rows[0][0])
     let colors: []Color = [.red, .blue]
     @println("Blue:", Color.blue in colors)
-    let next = counters()
+    let next: []() -> int = counters()
     let same = next
-    @println("Shared:", next[0](), same[0]())
+    let other = counters()
+    @println("Shared:", next[0](), other[0](), same[1]())
 }
 
 @[test]
@@ -157,7 +162,7 @@ let escaping_closures_share_cells: () = {
     let copied = [saved]
     @assert(copied[0][0]() == 3)
     functions += counters()
-    @assert(functions[1]() == 1)
+    @assert(functions[2]() == 1)
     @assert(saved[0]() == 4)
     let first = &functions[0]
     @assert(first() == 5)

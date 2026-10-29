@@ -1052,6 +1052,9 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
             if (region.else_value) |value| value_used[@backingInt(value)] = true;
         },
         .capture_value, .capture_cell, .loop_continue, .constant, .function_ref => {},
+        .closure_specialize => |closure| {
+            value_used[@backingInt(closure.environment)] = true;
+        },
         .closure_init => |closure| for (closure.captures) |value| {
             value_used[@backingInt(value)] = true;
         },
@@ -1302,6 +1305,13 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
             try w.print(" *)((void **)nov_env)[{d}];\n    (void)v{d};\n", .{ instruction.op.capture_value, i });
             continue;
         }
+        if (instruction.op == .closure_specialize) {
+            const closure = instruction.op.closure_specialize;
+            try w.print("    v{d}.code = ", .{i});
+            try writeScopedFunctionName(w, ir.getFunction(closure.function).?);
+            try w.print(";\n    v{d}.env = v{d}.env;\n    (void)v{d};\n", .{ i, @backingInt(closure.environment), i });
+            continue;
+        }
         if (instruction.op == .closure_init) {
             const closure = instruction.op.closure_init;
             const target = ir.getFunction(closure.function).?;
@@ -1440,7 +1450,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
                     try w.print("(nov_fn_{d}){{nov_adapter_{d}, NULL}}", .{ @backingInt(instruction.ty), @backingInt(id) });
                 } else try writeScopedFunctionName(w, ir.functions.items[@backingInt(id)]);
             },
-            .capture_value, .capture_cell, .closure_init => unreachable,
+            .capture_value, .capture_cell, .closure_init, .closure_specialize => unreachable,
             .unary => |unary| switch (unary.op) {
                 .bool_not => try w.print("!v{d}", .{@backingInt(unary.operand)}),
                 .bit_not => {
@@ -2832,6 +2842,265 @@ fn testClosureOwnership(allocator: std.mem.Allocator, source: []const u8) !void 
     const c = try emitProgram(allocator, &lowered.ir, null);
     defer allocator.free(c);
     try std.testing.expect(std.mem.indexOf(u8, c, "nov_env_element") != null);
+}
+
+const generic_closure_block_probe_program =
+    \\let id:(x:`A)->`A=x
+    \\let alias=id
+    \\let apply:(callback:(`A)->`B,input:`A)->`B=callback(input)
+    \\let main:()={
+    \\ @println(id({let f=(x:`T)->`T{x}
+    \\  f(true)}))
+    \\ @println(alias({let f:(x:`T)->`T=x
+    \\  f(false)}))
+    \\ @println(id({let saved:[]bool=[true]
+    \\  let f=(x:`T)->`T{if saved[0] {x} else {x}}
+    \\  let g=(x:`U)->`U{f(x)}
+    \\  {g(true)}}))
+    \\ @println(apply({let f=(x:`T)->`T{x}
+    \\  f},true),apply({let f:(x:`T)->`T=x
+    \\  {f}},false))
+    \\ @println(id({let f=(x:`T)->`T{x}
+    \\  let bound:(bool)->bool=f
+    \\  let copied=bound
+    \\  copied})(true))
+    \\ @println(id(loop {let f=(x:`T)->`T{x}
+    \\  loop {break}
+    \\  break f(false)}))
+    \\ @println(id({let f=(x:bool)->bool{x}
+    \\  f(true)}))
+    \\ @println(id({let f=(x:`T)->`T{x}
+    \\  f(false)}))
+    \\ let f:int=9
+    \\ @println(f)
+    \\}
+;
+
+test "generic closures block probes infer temporary templates callbacks and loop results with source free GC" {
+    const c = try arrayTestProgram(generic_closure_block_probe_program);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "true\nfalse\ntrue\ntrue false\ntrue\nfalse\ntrue\nfalse\n9\n", "", mode);
+}
+
+test "generic closures block probes source free compiler allocation rollback" {
+    try testClosureOwnership(test_gpa, generic_closure_block_probe_program);
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testClosureOwnership, .{generic_closure_block_probe_program});
+}
+
+const generic_closure_review_program =
+    \\let id:(x:`A)->`A=x
+    \\let apply:(callback:(`A)->`A,input:`A)->`A=callback(input)
+    \\let R=struct{
+    \\ let helper:(x:bool)->int=1
+    \\ let method:(self:R,input:`A)->`U={
+    \\  let f=(x:`B)->`C{helper(x)}
+    \\  f(input)}
+    \\}
+    \\let Box:(Element:type)->type=struct{
+    \\ let Alias=@This()
+    \\ let helper:(x:Element)->int=2
+    \\ let method:(self:Alias,input:`A)->`U={
+    \\  let f=(x:`B)->`C{let nested=(value:`D)->`E{helper(value)}
+    \\   nested(x)}
+    \\  f(input)}
+    \\}
+    \\let main:()={
+    \\ @println(id({(x:`T)->`T{x}(true)}))
+    \\ @println(id({apply((x:`T)->`T{x},false)}))
+    \\ @println(R[].method(true),Box(bool)[].method(false))
+    \\ {let gone:int=7
+    \\  @print(gone)}
+    \\ let uncaptured:[][]int=[[7]]
+    \\ let f=(x:`T)->`T{let gone:int=9
+    \\  let later:int=10
+    \\  {let sibling:int=1
+    \\  }
+    \\  {let sibling:int=2
+    \\  }
+    \\  x}
+    \\ let later:int=11
+    \\ @println(f(true),f(@as(int,3)))
+    \\}
+;
+
+test "generic closures review argument blocks method scopes lexical definitions and source free GC" {
+    const c = try arrayTestProgram(generic_closure_review_program);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "true\nfalse\n1 2\n7true 3\n", "", mode);
+}
+
+test "generic closures review lexical conflicts do not become runtime captures" {
+    var module = try Module.init(test_gpa, "lexical-capture-separation.nov", generic_closure_review_program);
+    defer module.deinit();
+    var lowered = try Lowering.lower(&module);
+    defer lowered.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(lowered.lowering_complete);
+    var carriers: usize = 0;
+    for (lowered.ir.functions.items) |function| {
+        if (!std.mem.startsWith(u8, function.name, "$template")) continue;
+        carriers += 1;
+        try std.testing.expectEqual(@as(usize, 0), function.captures.len);
+    }
+    try std.testing.expect(carriers != 0);
+    try lowered.ir.verify();
+}
+
+test "generic closures review argument blocks and method scopes allocation rollback" {
+    try testClosureOwnership(test_gpa, generic_closure_review_program);
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testClosureOwnership, .{generic_closure_review_program});
+}
+
+const generic_closures_program =
+    \\let Receiver=struct{value:int,
+    \\ let through:(self:Receiver,callback:(`T)->`T,input:`T)->`T=callback(input)
+    \\}
+    \\let reverse:(input:`T,callback:(`T)->`T)->`T=callback(input)
+    \\let outer:(input:`A)->`A={
+    \\ let forward=(value:`B)->`B{value}
+    \\ let local:(value:`C)->`C={let ordinary=(item:`C)->`C{item}
+    \\  ordinary(forward(value))}
+    \\ local(input)
+    \\}
+    \\let apply:(callback:(`T)->`T,input:`T)->`T=callback(input)
+    \\let make:(initial:int)->(bool)->bool={
+    \\ let mut count=initial
+    \\ let frozen:[]int=[initial]
+    \\ let local:(value:`T)->`T={count+=1
+    \\  @print(count,frozen[0])
+    \\  value}
+    \\ let first:(bool)->bool=local
+    \\ let again:(bool)->bool=local
+    \\ @println(local(@as(int,7)),first(true),again(false))
+    \\ first
+    \\}
+    \\let main:()={
+    \\ let a=make(10)
+    \\ let b=make(20)
+    \\ let copy=a
+    \\ @println(copy(true),b(false),a(true))
+    \\ let identity=(value:`T)->`T{value}
+    \\ @println(identity(true),identity(@as(int,42)),apply(identity,false))
+    \\ @println(outer(true),outer(@as(int,9)))
+    \\ @println((item:`T)->`T{item}(false),apply((item:`T)->`T{item},true))
+    \\ @println(Receiver[.value=1].through(identity,true),reverse(false,identity))
+    \\ @println((left:`T,right:`U)->`T{left}({@print("L")
+    \\  true},{@print("R")
+    \\  @as(int,1)}))
+    \\}
+;
+
+test "generic closures canonical code shares one creation snapshot and verifies forged environments" {
+    var module = try Module.init(test_gpa, "generic-capture-ir.nov", "let main:()={let frozen:[]int=[1]\nlet mut n:int=0\nlet f=(x:`T)->`T{n+=frozen[0]\nx}\nlet a:(bool)->bool=f\nlet b:(bool)->bool=f\n@println(f(true),f(@as(int,1)),a(false),b(true))}");
+    defer module.deinit();
+    var lowered = try Lowering.lower(&module);
+    defer lowered.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(lowered.lowering_complete);
+    try lowered.ir.verify();
+    try std.testing.expectEqual(@as(usize, 2), lowered.ir.local_generic_instances.items.len);
+    var carriers: usize = 0;
+    var specialized: usize = 0;
+    for (lowered.ir.functions.items) |function| {
+        if (function.environment_layout != null) specialized += 1;
+        if (std.mem.startsWith(u8, function.name, "$template")) carriers += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), carriers);
+    try std.testing.expectEqual(@as(usize, 2), specialized);
+    var snapshots: usize = 0;
+    var forged: usize = 0;
+    for (lowered.ir.functions.items) |function| if (function.body) |body| {
+        for (@constCast(body.instructions), 0..) |*instruction, index| {
+            if (instruction.op == .array_clone and !function.is_closure) snapshots += 1;
+            if (instruction.op != .closure_specialize) continue;
+            const saved = instruction.*;
+            instruction.op.closure_specialize.environment = @fromBackingInt(@intCast(index));
+            try std.testing.expectError(error.InvalidValueId, lowered.ir.verify());
+            instruction.* = saved;
+            instruction.op.closure_specialize.function = @fromBackingInt(std.math.maxInt(u32));
+            try std.testing.expectError(error.InvalidFunctionId, lowered.ir.verify());
+            instruction.* = saved;
+            const target = &lowered.ir.functions.items[@backingInt(saved.op.closure_specialize.function)];
+            const layout = target.environment_layout;
+            target.environment_layout = null;
+            try std.testing.expectError(error.InvalidOperation, lowered.ir.verify());
+            target.environment_layout = layout;
+            const carrier = body.instructions[@backingInt(saved.op.closure_specialize.environment)].op.closure_init;
+            instruction.op = .{ .closure_init = .{ .function = saved.op.closure_specialize.function, .captures = carrier.captures } };
+            try std.testing.expectError(error.InvalidOperation, lowered.ir.verify());
+            instruction.* = saved;
+            forged += 1;
+        }
+    };
+    try std.testing.expectEqual(@as(usize, 1), snapshots);
+    try std.testing.expectEqual(@as(usize, 4), forged);
+    try lowered.ir.verify();
+}
+
+test "generic closures loop instances snapshots deep copies and transitive ordinary closures" {
+    const c = try arrayTestProgram(
+        \\let main:()={
+        \\ let mut first:(bool)->int=(b:bool)->int{0}
+        \\ let mut last:(bool)->int=(b:bool)->int{0}
+        \\ loop i in @as(int,0)..2 {
+        \\  let mut count=i
+        \\  let arrays:[][]int=[[i]]
+        \\  let generic=(x:`T)->int{count+=1
+        \\   let changed=arrays
+        \\   let mut row=changed[0]
+        \\   row[0]=99
+        \\   count+arrays[0][0]}
+        \\  let ordinary=(b:bool)->int{if b {generic(true)} else {generic(@as(int,3))}}
+        \\  if i==0 {first=ordinary} else {last=ordinary}
+        \\ }
+        \\ @println(first(true),first(false),last(true),last(false))
+        \\ let frozen:[]int=[4]
+        \\ let read=(x:`T)->int{frozen[0]}
+        \\ let mutate=(items:[]int){let mut copy=items
+        \\  copy[0]=9}
+        \\ mutate(frozen)
+        \\ @println(read(true),read(@as(int,0)))
+        \\ let mut calls:int=0
+        \\ let callback=(b:bool)->bool{calls+=1
+        \\  b}
+        \\ let invoke=(x:`T)->`T{let called=callback(true)
+        \\  x}
+        \\ @println(invoke(true),invoke(@as(int,1)),calls)
+        \\}
+    );
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "1 2 3 4\n4 4\ntrue 1 2\n", "", mode);
+}
+
+test "generic closures allocate at creation even unused and never recapture on specialization or copy" {
+    const cases = [_]struct { source: []const u8, limit: usize, output: []const u8, fails: bool }{
+        .{ .source = "let main:()={let frozen:int=1\nlet unused=(x:`T)->`T{@print(frozen)\nx}\n@println(@as(int,7))}", .limit = 1, .output = "", .fails = true },
+        .{ .source = "let main:()={let frozen:int=1\nlet unused=(x:`T)->`T{@print(frozen)\nx}\n@println(@as(int,7))}", .limit = 2, .output = "7\n", .fails = false },
+        .{ .source = "let main:()={let mut n:int=1\nlet frozen:int=1\nlet f=(x:`T)->`T{n+=frozen\nx}\nlet a:(bool)->bool=f\nlet b=a\n@println(b(true),f(@as(int,7)),n)}", .limit = 3, .output = "true 7 3\n", .fails = false },
+    };
+    for (cases) |case| {
+        const library = try emitSource(case.source, null);
+        defer test_gpa.free(library);
+        const prefix = try std.fmt.allocPrint(test_gpa, "#include <stdlib.h>\nstatic size_t count;\nstatic void *test_malloc(size_t n) {{if(count++ >= {d}) return NULL; return malloc(n);}}\n#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n", .{case.limit});
+        defer test_gpa.free(prefix);
+        const program = try collectingTestProgram(library);
+        defer test_gpa.free(program);
+        const c = try std.mem.concat(test_gpa, u8, &.{ prefix, program });
+        defer test_gpa.free(c);
+        try compileAndRunExpected(c, "typedef int nonempty_translation_unit;", if (case.fails) 1 else 0, case.output, if (case.fails) "panic: GC allocation failed\n" else "");
+    }
+}
+
+test "generic closures source free environment ownership and allocation rollback" {
+    const source = "let main:()={let mut n:int=1\nlet f=(x:`T)->`T{n+=1\nx}\nlet b:(bool)->bool=f\n@println(f(@as(int,2)),b(true))}";
+    try testClosureOwnership(test_gpa, source);
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testClosureOwnership, .{source});
+}
+
+test "generic closures creation environments direct calls contextual callbacks and GC" {
+    const c = try arrayTestProgram(generic_closures_program);
+    defer test_gpa.free(c);
+    try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "11 1012 1013 107 true false\n21 2022 2023 207 true false\n14 1024 2015 10true false true\ntrue 42 false\ntrue 9\nfalse true\ntrue false\nLRtrue\n", "", "-O0");
 }
 
 test "closures own source free metadata and survive every compiler allocation failure" {
@@ -5551,8 +5820,20 @@ const append_rhs_cases = [_]struct { source: []const u8, allocations: usize, out
     .{ .source = "let main:()={let mut a:[]int=[1]\nlet append=(){a+=a}\nlet same=append\nsame()\n@println(a[0],a[1])}", .allocations = 5, .output = "1 1\n" },
 };
 
-test "append RHS projection exact allocations and every runtime OOM under forced GC" {
-    for (append_rhs_cases, 0..) |case, case_index| {
+test "append RHS projection exact allocations and every runtime OOM under forced GC values and nested projections" {
+    try testAppendRhsRuntimeOom(0, 4);
+}
+
+test "append RHS projection exact allocations and every runtime OOM under forced GC references" {
+    try testAppendRhsRuntimeOom(4, 7);
+}
+
+test "append RHS projection exact allocations and every runtime OOM under forced GC effects and closures" {
+    try testAppendRhsRuntimeOom(7, 11);
+}
+
+fn testAppendRhsRuntimeOom(start: usize, end: usize) !void {
+    for (append_rhs_cases[start..end], start..) |case, case_index| {
         errdefer std.debug.print("append RHS case {d}: {s}\n", .{ case_index, case.source });
         const program = try arrayTestProgram(case.source);
         defer test_gpa.free(program);

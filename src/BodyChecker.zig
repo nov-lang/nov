@@ -14,8 +14,24 @@ const isPrimitive = @import("primitives.zig").isPrimitive;
 
 pub const Error = Ir.BuildError;
 const Known = struct { ty: Ir.TypeId, annotation: ?Module.Span = null };
+const LocalSpecialization = struct { bindings: []const Module.TypeBinding, ty: Ir.TypeId, function: ?Ir.FunctionId };
+const TemplateCapture = struct { name: []const u8, binding: Binding };
+const LexicalName = struct { name: []const u8, span: Module.Span };
+const Template = struct {
+    info: GenericFunctions.LocalTemplate,
+    captures: []const TemplateCapture,
+    // No-shadowing depends on the whole definition scope, not just free values.
+    lexical_names: []const LexicalName = &.{},
+    layout: ?Ir.FunctionId = null,
+    specializations: std.ArrayList(LocalSpecialization) = .empty,
+    environment: ?Ir.ValueId = null,
+    created: bool = false,
+    environment_type: Ir.TypeId,
+    name: ?[]const u8 = null,
+};
 const Binding = struct {
     known: Known,
+    template: ?*Template = null,
     index: u32 = 0,
     initializer: ?Ast.Node.Index = null,
     mutable: bool = false,
@@ -120,7 +136,9 @@ fn checkInner(module: *Module, ir: *Ir, types: []const ?Ir.TypeId, id: Module.De
     const function = module.source.ast.declFunction(declaration.node) orelse return error.InvalidTypeId;
     const proto = module.source.ast.fullFnProto(function.proto_node) orelse return error.InvalidTypeId;
     if (proto.ast.params.len != ty.function.params.len) return error.InvalidTypeId;
-    var context: Context = .{ .module = module, .ir = ir, .types = types, .emitter = emitter, .container = declaration.container, .concrete_type = declaration.concrete_type, .sema = sema, .function_bindings = declaration.function_bindings, .specialization_depth = declaration.specialization_depth };
+    var template_arena = std.heap.ArenaAllocator.init(module.allocator);
+    defer template_arena.deinit();
+    var context: Context = .{ .template_allocator = template_arena.allocator(), .module = module, .ir = ir, .types = types, .emitter = emitter, .container = declaration.container, .concrete_type = declaration.concrete_type, .sema = sema, .function_bindings = declaration.function_bindings, .specialization_depth = declaration.specialization_depth };
     defer context.bindings.deinit(module.allocator);
     defer context.locals.deinit(module.allocator);
     var iterator = proto.iterate(&module.source.ast);
@@ -213,6 +231,9 @@ const Context = struct {
     projection_base: ?Ast.Node.Index = null,
     reservation: ?*const Reservation = null,
     parent: ?*Context = null,
+    template_allocator: ?std.mem.Allocator = null,
+    specializing: ?*Template = null,
+    lexical_names: []const LexicalName = &.{},
     captures: std.ArrayList(Ir.Capture) = .empty,
     capture_names: std.ArrayList([]const u8) = .empty,
     capture_values: std.ArrayList(Ir.ValueId) = .empty,
@@ -251,9 +272,9 @@ const Context = struct {
             return null;
         }
         const index: u32 = @intCast(self.captures.items.len);
-        try self.captures.append(self.module.allocator, .{ .ty = outer.known.ty, .mutable = outer.mutable });
+        try self.captures.append(self.module.allocator, .{ .ty = outer.known.ty, .mutable = outer.mutable, .environment_layout = if (outer.template) |t| t.layout else null });
         try self.capture_names.append(self.module.allocator, name);
-        var binding: Binding = .{ .known = outer.known, .name_span = outer.name_span, .mutable = outer.mutable };
+        var binding: Binding = .{ .known = outer.known, .name_span = outer.name_span, .mutable = outer.mutable, .template = outer.template };
         if (self.emitter) |emitter| {
             const source = parent.emitter.?;
             const value = if (outer.mutable) blk: {
@@ -282,6 +303,198 @@ const Context = struct {
         return binding;
     }
 
+    fn templateDescriptor(self: *Context, proto: Ast.Node.Index, body: Ast.Node.Index) Error!*Template {
+        const allocator = self.template_allocator orelse return error.InvalidOperation;
+        const ast = &self.module.source.ast;
+        var captures: std.ArrayList(GenericFunctions.Capture) = .empty;
+        for (ast.nodes.items(.tag), 0..) |tag, index| {
+            if (tag != .identifier) continue;
+            const token = ast.firstToken(@intCast(index));
+            if (token < ast.firstToken(body) or token > ast.lastToken(body)) continue;
+            const name = ast.tokenSlice(token);
+            const binding = self.lookupBinding(name) orelse continue;
+            var found = false;
+            for (captures.items) |capture| if (std.mem.eql(u8, capture.name, name)) {
+                found = true;
+                break;
+            };
+            if (!found) try captures.append(allocator, .{ .name = name, .ty = binding.known.ty, .template = if (binding.template) |t| .{ .module = self.module, .local = &t.info } else null });
+        }
+        const template = try allocator.create(Template);
+        template.* = .{ .info = .{ .proto = proto, .body = body, .outer_bindings = self.function_bindings, .captures = captures.items, .container = self.container, .concrete_type = self.concrete_type }, .captures = &.{}, .environment_type = undefined };
+        return template;
+    }
+
+    fn lexicalNames(self: *Context, allocator: std.mem.Allocator) Error![]const LexicalName {
+        var names: std.ArrayList(LexicalName) = .empty;
+        var scope: ?*Context = self;
+        while (scope) |context| : (scope = context.parent) {
+            var bindings = context.bindings.iterator();
+            while (bindings.next()) |entry| {
+                try names.append(allocator, .{ .name = entry.key_ptr.*, .span = entry.value_ptr.name_span });
+            }
+            try names.appendSlice(allocator, context.lexical_names);
+        }
+        return names.items;
+    }
+
+    fn lexicalConflict(self: *Context, name: []const u8) ?Module.Span {
+        for (self.lexical_names) |binding| if (std.mem.eql(u8, binding.name, name)) return binding.span;
+        return if (self.parent) |parent| parent.lexicalConflict(name) else null;
+    }
+
+    fn createTemplate(self: *Context, node: Ast.Node.Index, proto: Ast.Node.Index, body: Ast.Node.Index) Error!?*Template {
+        const allocator = self.template_allocator orelse return error.InvalidOperation;
+        const ast = &self.module.source.ast;
+        var arena = std.heap.ArenaAllocator.init(self.module.allocator);
+        defer arena.deinit();
+        var emitter: Emitter = .{ .allocator = arena.allocator(), .constants = if (self.emitter) |e| e.constants else &.{}, .functions = if (self.emitter) |e| e.functions else &.{} };
+        var child: Context = .{ .module = self.module, .ir = self.ir, .types = self.types, .parent = self, .emitter = if (self.emitter != null) &emitter else null };
+        defer child.bindings.deinit(self.module.allocator);
+        defer child.captures.deinit(self.module.allocator);
+        defer child.capture_names.deinit(self.module.allocator);
+        defer child.capture_values.deinit(self.module.allocator);
+        // No-shadowing lets free names be discovered structurally without
+        // checking or instantiating the template body. Field labels are not
+        // identifier expression nodes; nested free uses must also be captured.
+        var params = ast.fullFnProto(proto).?.iterate(ast);
+        while (params.next()) |param| {
+            if (param.name_token) |token| {
+                const name = ast.tokenSlice(token);
+                if (self.conflict(name) != null or isPrimitive(name)) {
+                    _ = try self.fail(.unsupported_shadowing, proto, self.conflict(name));
+                    return null;
+                }
+            }
+        }
+        const first = ast.firstToken(body);
+        const last = ast.lastToken(body);
+        for (ast.nodes.items(.tag), 0..) |tag, index| {
+            const candidate: Ast.Node.Index = @intCast(index);
+            if (tag != .identifier) continue;
+            const token = ast.firstToken(candidate);
+            if (token < first or token > last) continue;
+            const name = ast.tokenSlice(token);
+            if (self.lookupBinding(name) == null) continue;
+            if (try child.captureBinding(name, candidate) == null) return null;
+        }
+        const template = try allocator.create(Template);
+        const captures = try allocator.alloc(TemplateCapture, child.capture_names.items.len);
+        const inference_captures = try allocator.alloc(GenericFunctions.Capture, captures.len);
+        for (child.capture_names.items, captures, inference_captures) |name, *capture, *inference| {
+            capture.* = .{ .name = name, .binding = self.lookupBinding(name).? };
+            inference.* = .{ .name = name, .ty = capture.binding.known.ty, .template = if (capture.binding.template) |t| .{ .module = self.module, .local = &t.info } else null };
+        }
+        const unit = try self.ir.internType(.void);
+        const carrier_type = try self.ir.internType(.{ .function = .{ .params = &.{}, .result = unit } });
+        template.* = .{ .created = true, .info = .{ .proto = proto, .body = body, .outer_bindings = try allocator.dupe(Module.TypeBinding, self.function_bindings), .captures = inference_captures, .container = self.container, .concrete_type = self.concrete_type }, .captures = captures, .lexical_names = try self.lexicalNames(allocator), .environment_type = carrier_type };
+        if (self.emitter) |outer| {
+            const name = try std.fmt.allocPrint(arena.allocator(), "$template{d}", .{self.ir.functions.items.len});
+            const id = try self.ir.addFunction(name, carrier_type, self.irSpan(node));
+            template.layout = id;
+            self.ir.functions.items[@backingInt(id)].is_closure = true;
+            self.ir.functions.items[@backingInt(id)].captures = try self.ir.allocator.dupe(Ir.Capture, child.captures.items);
+            const value = try emitter.append(unit, self.irSpan(node), .{ .constant = try self.ir.internConstant(.{ .ty = unit, .value = .void }) });
+            try self.ir.setFunctionBody(id, emitter.instructions.items, value);
+            try outer.record(node, carrier_type, self.irSpan(node), .{ .closure_init = .{ .function = id, .captures = try outer.allocator.dupe(Ir.ValueId, child.capture_values.items) } });
+            template.environment = try outer.value(node);
+        }
+        return template;
+    }
+
+    fn templateEnvironment(self: *Context, template: *Template, node: Ast.Node.Index) Error!?Ir.ValueId {
+        if (template.name) |name| {
+            const binding = (try self.captureBinding(name, node)) orelse return null;
+            const emitter = self.emitter orelse return null;
+            if (binding.slot) |slot| return try emitter.append(binding.known.ty, self.irSpan(node), .{ .local_load = slot });
+            if (binding.value) |value| return value;
+            if (binding.initializer) |initializer| return try emitter.value(initializer);
+            return null;
+        }
+        return template.environment;
+    }
+
+    fn registerLocalDemand(self: *Context, node: Ast.Node.Index, template: *Template, bindings: []const Module.TypeBinding) Error!bool {
+        const origin = self.module.tokenSpan(self.module.source.ast.firstToken(template.info.proto));
+        var count: usize = 0;
+        for (self.ir.local_generic_instances.items) |instance| {
+            if (instance.span.source != origin.source) continue;
+            count += 1;
+            if (instance.span.start != origin.start or instance.outer.len != template.info.outer_bindings.len or instance.arguments.len != bindings.len) continue;
+            var equal = true;
+            for (instance.outer, template.info.outer_bindings) |a, b| if (a != b.ty) {
+                equal = false;
+                break;
+            };
+            for (instance.arguments, bindings) |a, b| if (a != b.ty) {
+                equal = false;
+                break;
+            };
+            if (equal) return true;
+        }
+        for (self.module.declarations.items) |decl| if (decl.function_template != null) {
+            count += 1;
+        };
+        if (count >= GenericFunctions.max_specializations) {
+            _ = try self.fail(.generic_function_limit, node, origin);
+            return false;
+        }
+        const outer = try self.ir.allocator.alloc(Ir.TypeId, template.info.outer_bindings.len);
+        errdefer self.ir.allocator.free(outer);
+        const arguments = try self.ir.allocator.alloc(Ir.TypeId, bindings.len);
+        errdefer self.ir.allocator.free(arguments);
+        for (outer, template.info.outer_bindings) |*out, binding| out.* = binding.ty;
+        for (arguments, bindings) |*out, binding| out.* = binding.ty;
+        try self.ir.local_generic_instances.append(self.ir.allocator, .{ .span = origin, .outer = outer, .arguments = arguments });
+        return true;
+    }
+
+    fn specializeLocal(self: *Context, node: Ast.Node.Index, ref: GenericFunctions.Ref, bindings: []const Module.TypeBinding, expected: ?Known) Error!?Ir.TypeId {
+        if (self.specialization_depth >= GenericFunctions.max_specialization_depth) return self.fail(.generic_function_limit, node, ref.span());
+        const template: *Template = @constCast(@fieldParentPtr("info", ref.local.?));
+        if (template.name) |name| {
+            if (try self.captureBinding(name, node) == null) return null;
+        }
+        for (template.specializations.items) |entry| {
+            if (entry.bindings.len != bindings.len) continue;
+            var equal = true;
+            for (entry.bindings, bindings) |a, b| if (a.ty != b.ty) {
+                equal = false;
+                break;
+            };
+            if (!equal) continue;
+            if (try self.fit(entry.ty, expected, node) == null) return null;
+            if (self.emitter) |emitter| {
+                const env = (try self.templateEnvironment(template, node)) orelse return null;
+                try emitter.record(node, entry.ty, self.irSpan(node), .{ .closure_specialize = .{ .function = entry.function orelse return error.InvalidFunctionId, .environment = env } });
+            }
+            return entry.ty;
+        }
+        if (!try self.registerLocalDemand(node, template, bindings)) return null;
+        const old_bindings = self.function_bindings;
+        const old_specializing = self.specializing;
+        const old_container = self.container;
+        const old_concrete_type = self.concrete_type;
+        self.container = template.info.container;
+        self.concrete_type = template.info.concrete_type;
+        self.function_bindings = bindings;
+        self.specializing = template;
+        self.specialization_depth += 1;
+        defer {
+            self.function_bindings = old_bindings;
+            self.specializing = old_specializing;
+            self.container = old_container;
+            self.concrete_type = old_concrete_type;
+            self.specialization_depth -= 1;
+        }
+        const ty = (try self.functionBody(node, template.info.proto, template.info.body, expected, 0)) orelse return null;
+        const function = if (self.emitter) |emitter| emitter.instructions.items[@backingInt(try emitter.value(node))].op.closure_specialize.function else null;
+        if (self.emitter == null and template.environment != null) return ty;
+        const allocator = self.template_allocator.?;
+        try template.specializations.append(allocator, .{ .bindings = try allocator.dupe(Module.TypeBinding, bindings), .ty = ty, .function = function });
+        return ty;
+    }
+
     fn functionExpression(self: *Context, node: Ast.Node.Index, expected: ?Known, depth: usize) Error!?Ir.TypeId {
         const data = self.module.source.ast.nodes.items(.data)[node];
         return self.functionBody(node, data.lhs, data.rhs, expected, depth);
@@ -290,7 +503,10 @@ const Context = struct {
     fn functionBody(self: *Context, node: Ast.Node.Index, proto_node: Ast.Node.Index, body_node: Ast.Node.Index, expected: ?Known, depth: usize) Error!?Ir.TypeId {
         const ast = &self.module.source.ast;
         const function = .{ .proto = ast.fullFnProto(proto_node).?, .body = body_node };
-        if (self.hasUnboundSignatureVariables(proto_node)) return self.fail(.generic_function_context, proto_node, null);
+        if (self.hasUnboundSignatureVariables(proto_node)) {
+            const template = (try self.createTemplate(node, proto_node, body_node)) orelse return null;
+            return self.genericValue(node, .{ .module = self.module, .local = &template.info }, expected);
+        }
         const ty = (try self.resolveType(function.proto.ast.proto_node)) orelse return null;
         if (try self.fit(ty, expected, node) == null) return null;
         // Pool growth while checking nested bodies must not invalidate signatures.
@@ -298,7 +514,7 @@ const Context = struct {
         var arena = std.heap.ArenaAllocator.init(self.module.allocator);
         defer arena.deinit();
         var emitter: Emitter = .{ .allocator = arena.allocator(), .constants = if (self.emitter) |e| e.constants else &.{}, .functions = if (self.emitter) |e| e.functions else &.{} };
-        var child: Context = .{ .module = self.module, .ir = self.ir, .types = self.types, .sema = self.sema, .container = self.container, .concrete_type = self.concrete_type, .parent = self, .emitter = null, .function_bindings = self.function_bindings, .specialization_depth = self.specialization_depth, .return_type = .{ .ty = signature.result } };
+        var child: Context = .{ .template_allocator = self.template_allocator, .module = self.module, .ir = self.ir, .types = self.types, .sema = self.sema, .container = self.container, .concrete_type = self.concrete_type, .parent = if (self.specializing == null) self else null, .lexical_names = if (self.specializing) |template| template.lexical_names else &.{}, .emitter = null, .function_bindings = self.function_bindings, .specialization_depth = self.specialization_depth, .return_type = .{ .ty = signature.result } };
         defer child.bindings.deinit(self.module.allocator);
         defer child.locals.deinit(self.module.allocator);
         defer child.captures.deinit(self.module.allocator);
@@ -312,9 +528,33 @@ const Context = struct {
             };
             const name = ast.tokenSlice(token);
             if (child.conflict(name) != null or isPrimitive(name)) return self.fail(.unsupported_shadowing, node, child.conflict(name));
-            try child.bindings.put(self.module.allocator, name, .{ .known = .{ .ty = signature.params[index] }, .index = index, .name_span = self.module.tokenSpan(token) });
+            const param_span = self.module.tokenSpan(token);
+            const slot = if (self.specializing != null and self.emitter != null and child.borrowedName(name) and self.ir.getType(signature.params[index]).? != .void) blk: {
+                const value = try emitter.append(signature.params[index], param_span, .{ .parameter = index });
+                break :blk try emitter.append(signature.params[index], param_span, .{ .local_slot = value });
+            } else null;
+            try child.bindings.put(self.module.allocator, name, .{ .known = .{ .ty = signature.params[index] }, .index = index, .name_span = param_span, .slot = slot });
         }
-        if (self.emitter != null) {
+        if (self.specializing) |template| {
+            child.emitter = if (self.emitter != null) &emitter else null;
+            for (template.captures, 0..) |capture, capture_index| {
+                var binding = capture.binding;
+                binding.initializer = null;
+                binding.slot = null;
+                binding.value = null;
+                try child.captures.append(self.module.allocator, .{ .ty = binding.known.ty, .mutable = binding.mutable, .environment_layout = if (binding.template) |t| t.layout else null });
+                if (child.emitter != null) {
+                    const value = try emitter.append(binding.known.ty, binding.name_span, if (binding.mutable) .{ .capture_cell = @intCast(capture_index) } else .{ .capture_value = @intCast(capture_index) });
+                    if (binding.mutable) {
+                        emitter.instructions.items[@backingInt(value)].boxed = true;
+                        binding.slot = value;
+                    } else binding.value = value;
+                }
+                try child.bindings.put(self.module.allocator, capture.name, binding);
+            }
+            // Only the captured lexical scope is available to a specialization.
+            child.parent = null;
+        } else if (self.emitter != null) {
             // Discover lexical free bindings without emitting private-region reads.
             // Entry captures then dominate the entire body, including nested closures.
             child.emitter = null;
@@ -350,8 +590,13 @@ const Context = struct {
             const captures = try self.ir.allocator.dupe(Ir.Capture, child.captures.items);
             self.ir.functions.items[@backingInt(id)].captures = captures;
             self.ir.functions.items[@backingInt(id)].is_closure = true;
+            self.ir.functions.items[@backingInt(id)].environment_layout = if (self.specializing) |template| template.layout else null;
             try self.ir.setFunctionBody(id, emitter.instructions.items, try emitter.value(function.body));
-            try outer.record(node, ty, self.irSpan(node), .{ .closure_init = .{ .function = id, .captures = try outer.allocator.dupe(Ir.ValueId, child.capture_values.items) } });
+            if (self.specializing) |template| {
+                const env = (try self.templateEnvironment(template, node)) orelse return null;
+                _ = outer.values.remove(node);
+                try outer.record(node, ty, self.irSpan(node), .{ .closure_specialize = .{ .function = id, .environment = env } });
+            } else try outer.record(node, ty, self.irSpan(node), .{ .closure_init = .{ .function = id, .captures = try outer.allocator.dupe(Ir.ValueId, child.capture_values.items) } });
         }
         return ty;
     }
@@ -449,6 +694,7 @@ const Context = struct {
 
     fn conflict(self: *Context, name: []const u8) ?Module.Span {
         if (self.lookupBinding(name)) |binding| return binding.name_span;
+        if (self.lexicalConflict(name)) |origin| return origin;
         if (self.valueDeclaration(name)) |id| return self.getDeclaration(id).name_span;
         if (self.concrete_type != null) {
             const owner = self.module.getDeclaration(self.container.?).?;
@@ -490,9 +736,17 @@ const Context = struct {
                 if (param.name_token != null) local_function = true;
             }
         }
-        if (local_function and self.hasUnboundSignatureVariables(decl.type_node)) {
-            _ = try self.fail(.generic_function_context, decl.type_node, null);
-            return false;
+        const generic_proto = if (local_function and self.hasUnboundSignatureVariables(decl.type_node)) decl.type_node else if (decl.init_node != 0 and ast.nodes.items(.tag)[decl.init_node] == .function_expr and self.hasUnboundSignatureVariables(ast.nodes.items(.data)[decl.init_node].lhs)) ast.nodes.items(.data)[decl.init_node].lhs else 0;
+        if (generic_proto != 0 and decl.type_node == (if (local_function) generic_proto else @as(Ast.Node.Index, 0))) {
+            if (decl.is_mutable) {
+                _ = try self.fail(.generic_function_context, node, null);
+                return false;
+            }
+            const body = if (local_function) decl.init_node else ast.nodes.items(.data)[decl.init_node].rhs;
+            const template = (try self.createTemplate(decl.init_node, generic_proto, body)) orelse return false;
+            template.name = name;
+            try self.bindLocal(name, .{ .known = .{ .ty = template.environment_type }, .initializer = decl.init_node, .name_span = name_span, .template = template });
+            return true;
         }
         if (decl.init_node == 0) {
             _ = try self.fail(.missing_initializer, node, null);
@@ -604,7 +858,68 @@ const Context = struct {
         return self.fit(try self.ir.internType(.void), expected, node);
     }
 
+    fn probeLocalBinding(self: *Context, node: Ast.Node.Index, depth: usize) Error!?Binding {
+        const ast = &self.module.source.ast;
+        const decl = ast.decl(node).ast;
+        if (decl.init_node == 0) return null;
+        const token = decl.let_token + 1 + @as(u32, @intFromBool(decl.is_mutable));
+        var local_function = false;
+        if (if (decl.type_node != 0) ast.fullFnProto(decl.type_node) else null) |proto| {
+            var params = proto.iterate(ast);
+            while (params.next()) |param| if (param.name_token != null) {
+                local_function = true;
+            };
+        }
+        const generic_proto = if (local_function and self.hasUnboundSignatureVariables(decl.type_node)) decl.type_node else if (ast.nodes.items(.tag)[decl.init_node] == .function_expr and self.hasUnboundSignatureVariables(ast.nodes.items(.data)[decl.init_node].lhs)) ast.nodes.items(.data)[decl.init_node].lhs else 0;
+        if (generic_proto != 0 and decl.type_node == (if (local_function) generic_proto else @as(Ast.Node.Index, 0))) {
+            if (decl.is_mutable) return null;
+            const body = if (local_function) decl.init_node else ast.nodes.items(.data)[decl.init_node].rhs;
+            const template = try self.templateDescriptor(generic_proto, body);
+            template.lexical_names = try self.lexicalNames(self.template_allocator.?);
+            // Query templates have identity but no runtime value type or environment.
+            // Identifier probes never expose this placeholder as a concrete type.
+            return .{ .known = .{ .ty = try self.ir.internType(.void) }, .template = template, .name_span = self.module.tokenSpan(token) };
+        }
+        const known: Known = if (decl.type_node != 0)
+            .{ .ty = (try self.resolveType(decl.type_node)) orelse return null }
+        else
+            (try self.probe(decl.init_node, depth + 1)) orelse return null;
+        return .{ .known = known, .initializer = decl.init_node, .name_span = self.module.tokenSpan(token), .mutable = decl.is_mutable };
+    }
+
+    fn probeBlockTemplate(self: *Context, node: Ast.Node.Index, depth: usize) Error!?GenericFunctions.Ref {
+        if (depth >= max_recursive_depth) return null;
+        const ast = &self.module.source.ast;
+        var buffer: [2]Ast.Node.Index = undefined;
+        const block = ast.fullBlock(&buffer, node) orelse return null;
+        if (ast.firstToken(node) != block.ast.lbrace) return null;
+        const start = self.locals.items.len;
+        defer self.restoreScope(start);
+        const diagnostics_start = self.module.diagnostics.items.len;
+        defer self.module.diagnostics.shrinkRetainingCapacity(diagnostics_start);
+        for (block.ast.statements, 0..) |statement, i| {
+            if (ast.nodes.items(.tag)[statement] == .decl) {
+                const decl = ast.decl(statement).ast;
+                const token = decl.let_token + 1 + @as(u32, @intFromBool(decl.is_mutable));
+                const name = ast.tokenSlice(token);
+                if (self.conflict(name) != null or isPrimitive(name)) return null;
+                const binding = (try self.probeLocalBinding(statement, depth)) orelse return null;
+                try self.bindLocal(name, binding);
+            } else if (i + 1 == block.ast.statements.len) {
+                // Descriptors borrow the enclosing query arena, not this scope's
+                // temporary binding table, so nested callback queries can use them.
+                return (try self.genericTarget(statement)) orelse try self.probeBlockTemplate(statement, depth + 1);
+            }
+        }
+        return null;
+    }
+
     fn probeBlock(self: *Context, node: Ast.Node.Index, depth: usize) Error!?Known {
+        var arena = std.heap.ArenaAllocator.init(self.module.allocator);
+        defer arena.deinit();
+        const old_allocator = self.template_allocator;
+        self.template_allocator = arena.allocator();
+        defer self.template_allocator = old_allocator;
         const ast = &self.module.source.ast;
         var buffer: [2]Ast.Node.Index = undefined;
         const block = ast.fullBlock(&buffer, node).?;
@@ -621,13 +936,8 @@ const Context = struct {
                 const token = decl.let_token + 1 + @as(u32, @intFromBool(decl.is_mutable));
                 const name = ast.tokenSlice(token);
                 if (self.conflict(name) != null or isPrimitive(name)) return null;
-                const known: Known = if (decl.type_node != 0)
-                    .{ .ty = (try self.resolveType(decl.type_node)) orelse return null }
-                else if (decl.init_node != 0)
-                    (try self.probe(decl.init_node, depth + 1)) orelse return null
-                else
-                    return null;
-                try self.bindLocal(name, .{ .known = known, .initializer = decl.init_node, .name_span = self.module.tokenSpan(token) });
+                const binding = (try self.probeLocalBinding(statement, depth)) orelse return null;
+                try self.bindLocal(name, binding);
             } else if (i + 1 == block.ast.statements.len) {
                 return self.probe(statement, depth + 1);
             }
@@ -655,6 +965,11 @@ const Context = struct {
             else
                 null,
             .block, .block_two, .block_newline, .block_two_newline => {
+                var arena = std.heap.ArenaAllocator.init(self.module.allocator);
+                defer arena.deinit();
+                const old_allocator = self.template_allocator;
+                self.template_allocator = arena.allocator();
+                defer self.template_allocator = old_allocator;
                 const start = self.locals.items.len;
                 defer self.restoreScope(start);
                 const diagnostics_start = self.module.diagnostics.items.len;
@@ -668,10 +983,7 @@ const Context = struct {
                         const token = decl.let_token + 1 + @as(u32, @intFromBool(decl.is_mutable));
                         const name = ast.tokenSlice(token);
                         if (self.conflict(name) != null or isPrimitive(name)) return null;
-                        const known: ?Known = if (decl.type_node != 0)
-                            if (try self.resolveType(decl.type_node)) |ty| .{ .ty = ty } else null
-                        else if (decl.init_node != 0) try self.probe(decl.init_node, depth + 1) else null;
-                        if (known) |value| try self.bindLocal(name, .{ .known = value, .name_span = self.module.tokenSpan(token) });
+                        if (try self.probeLocalBinding(statement, depth)) |binding| try self.bindLocal(name, binding);
                     } else {
                         if (try self.probeBreaks(statement, depth + 1)) |known| return known;
                         if (tag == .@"return" or tag == .@"break" or tag == .@"continue") break;
@@ -780,13 +1092,19 @@ const Context = struct {
 
     fn genericTarget(self: *Context, node: Ast.Node.Index) Error!?GenericFunctions.Ref {
         const ast = &self.module.source.ast;
+        if (ast.nodes.items(.tag)[node] == .function_expr) {
+            const data = ast.nodes.items(.data)[node];
+            if (!self.hasUnboundSignatureVariables(data.lhs)) return null;
+            const template = try self.templateDescriptor(data.lhs, data.rhs);
+            return .{ .module = self.module, .local = &template.info };
+        }
         if (ast.nodes.items(.tag)[node] == .field_access) {
             const base = ast.nodes.items(.data)[node].lhs;
             if (ast.nodes.items(.tag)[base] == .identifier and self.lookupBinding(ast.tokenSlice(ast.firstToken(base))) != null) return null;
         }
         if (ast.nodes.items(.tag)[node] == .identifier) {
             const name = ast.tokenSlice(ast.firstToken(node));
-            if (self.lookupBinding(name) != null) return null;
+            if (self.lookupBinding(name)) |binding| return if (binding.template) |template| .{ .module = self.module, .local = &template.info } else null;
             if (self.container) |container| if (self.module.lookupConcreteMethod(container, self.concrete_type, name)) |id| {
                 if (!self.module.getDeclaration(id).?.is_generic_function) return null;
                 return .{ .module = self.module, .id = id };
@@ -936,13 +1254,14 @@ const Context = struct {
             const function = ast.declFunction(node);
             const flow = if (function != null) Flow{} else try q.expression(decl.init_node, depth + 1);
             if (flow.live) {
-                const known = if (decl.type_node != 0)
-                    if (try c.resolveType(decl.type_node)) |ty| Known{ .ty = ty } else null
-                else
-                    try q.typeOf(decl.init_node, depth + 1);
-                if (known) |ty| {
-                    const token = decl.let_token + 1 + @as(u32, @intFromBool(decl.is_mutable));
-                    try c.bindLocal(ast.tokenSlice(token), .{ .known = ty, .name_span = c.module.tokenSpan(token), .initializer = decl.init_node, .mutable = decl.is_mutable });
+                const token = decl.let_token + 1 + @as(u32, @intFromBool(decl.is_mutable));
+                const name = ast.tokenSlice(token);
+                if (c.conflict(name) == null and !isPrimitive(name)) {
+                    if (try c.probeLocalBinding(node, depth)) |binding| {
+                        try c.bindLocal(name, binding);
+                    } else if (decl.type_node == 0) {
+                        if (try q.typeOf(decl.init_node, depth + 1)) |known| try c.bindLocal(name, .{ .known = known, .name_span = c.module.tokenSpan(token), .initializer = decl.init_node, .mutable = decl.is_mutable });
+                    }
                 }
             }
             return flow;
@@ -1134,7 +1453,12 @@ const Context = struct {
 
     fn argumentTerminates(self: *Context, node: Ast.Node.Index, depth: usize) Error!bool {
         _ = depth;
+        // Query-local descriptors must neither require nor extend a checking
+        // context's template lifetime, and never create runtime environments.
+        var query_arena = std.heap.ArenaAllocator.init(self.module.allocator);
+        defer query_arena.deinit();
         var query: FlowQuery = .{ .context = .{
+            .template_allocator = query_arena.allocator(),
             .module = self.module,
             .ir = self.ir,
             .types = self.types,
@@ -1168,7 +1492,8 @@ const Context = struct {
         defer self.probing = was_probing;
         const terminal = try self.argumentTerminates(node, depth + 1);
         const known = if (terminal) null else try self.probe(node, depth + 1);
-        return .{ .ty = if (known) |k| k.ty else null, .span = self.irSpan(node), .template = try self.genericTarget(node), .terminal = terminal };
+        const template = if (terminal) null else (try self.genericTarget(node)) orelse (if (known == null) try self.probeBlockTemplate(node, depth + 1) else null);
+        return .{ .ty = if (known) |k| k.ty else null, .span = self.irSpan(node), .template = template, .terminal = terminal };
     }
 
     fn genericArguments(self: *Context, call: Ast.full.Call, receiver: ?GenericFunctions.Argument, depth: usize) Error![]GenericFunctions.Argument {
@@ -1226,7 +1551,7 @@ const Context = struct {
     }
 
     fn genericValue(self: *Context, node: Ast.Node.Index, ref: GenericFunctions.Ref, expected: ?Known) Error!?Ir.TypeId {
-        const want = expected orelse return self.fail(.generic_function_ambiguous, node, ref.module.getDeclaration(ref.id).?.name_span);
+        const want = expected orelse return self.fail(.generic_function_ambiguous, node, ref.span());
         const ty = self.ir.getType(want.ty).?;
         if (ty != .function) return self.fail(.generic_function_context, node, want.annotation);
         const args = try self.module.allocator.alloc(GenericFunctions.Argument, ty.function.params.len);
@@ -1234,6 +1559,7 @@ const Context = struct {
         for (args, ty.function.params) |*arg, param| arg.* = .{ .ty = param, .span = want.annotation orelse self.irSpan(node) };
         const bindings = (try GenericFunctions.infer(self.module, self.ir, ref, args, .{ .ty = ty.function.result, .span = want.annotation orelse self.irSpan(node) }, self.irSpan(node))) orelse return null;
         defer self.module.allocator.free(bindings);
+        if (ref.local != null) return self.specializeLocal(node, ref, bindings, expected);
         const selected = (try self.demandGeneric(node, ref, bindings)) orelse return null;
         if (try self.fit(selected.ty, expected, node) == null) return null;
         if (self.emitter) |emitter| try emitter.record(node, selected.ty, self.irSpan(node), .{ .function_ref = emitter.functions[@backingInt(selected.id)].? });
@@ -1255,7 +1581,7 @@ const Context = struct {
             const field = self.module.source.ast.nodes.items(.data)[call.ast.fn_expr];
             try self.copyNode(field.lhs, arg.ty.?);
         }
-        const related = ref.module.getDeclaration(ref.id).?.name_span;
+        const related = ref.span();
         for (call.ast.args, params[offset..]) |arg, param| {
             const ty = (try self.expression(arg, if (param) |p| .{ .ty = p, .annotation = related } else null, depth + 1)) orelse return .{ .checked = null };
             if (self.terminated) return .{ .checked = if (expected) |want| want.ty else try self.ir.internType(.void) };
@@ -1266,16 +1592,38 @@ const Context = struct {
         return .{ .checked = try self.fail(.generic_function_inference_unsupported, node, related) };
     }
 
-    fn genericCall(self: *Context, node: Ast.Node.Index, call: Ast.full.Call, ref: GenericFunctions.Ref, expected: ?Known, depth: usize) Error!?Ir.TypeId {
+    fn genericCall(self: *Context, node: Ast.Node.Index, call: Ast.full.Call, reference: GenericFunctions.Ref, expected: ?Known, depth: usize) Error!?Ir.TypeId {
+        var ref = reference;
+        if (ref.local) |info| {
+            const template: *Template = @constCast(@fieldParentPtr("info", info));
+            if (!template.created) {
+                const created = (try self.createTemplate(call.ast.fn_expr, info.proto, info.body)) orelse return null;
+                ref.local = &created.info;
+            }
+        }
         switch (try self.genericTerminalCall(node, call, ref, null, expected, depth)) {
             .live => {},
             .checked => |ty| return ty,
+        }
+        if (ref.local != null) {
+            const args = try self.genericArguments(call, null, depth);
+            defer self.module.allocator.free(args);
+            const bindings = (try GenericFunctions.infer(self.module, self.ir, ref, args, if (expected) |want| .{ .ty = want.ty, .span = want.annotation orelse self.irSpan(node) } else null, self.irSpan(node))) orelse return null;
+            defer self.module.allocator.free(bindings);
+            const ty = (try self.specializeLocal(call.ast.fn_expr, ref, bindings, null)) orelse return null;
+            const function = self.ir.getType(ty).?.function;
+            for (call.ast.args, function.params) |arg, param| {
+                if (try self.expression(arg, .{ .ty = param, .annotation = ref.span() }, depth + 1) == null) return null;
+                if (self.terminated) return if (expected) |want| want.ty else function.result;
+                try self.copyNode(arg, param);
+            }
+            return self.finishCall(node, call.ast.fn_expr, function.result, expected);
         }
         const selected = (try self.genericSignature(node, call, ref, null, expected, depth)) orelse return null;
         const function = self.ir.getType(selected.ty).?.function;
         if (self.emitter) |emitter| try emitter.record(call.ast.fn_expr, selected.ty, self.irSpan(call.ast.fn_expr), .{ .function_ref = emitter.functions[@backingInt(selected.id)].? });
         for (call.ast.args, function.params) |arg, param| {
-            if (try self.expression(arg, .{ .ty = param, .annotation = ref.module.getDeclaration(ref.id).?.name_span }, depth + 1) == null) return null;
+            if (try self.expression(arg, .{ .ty = param, .annotation = ref.span() }, depth + 1) == null) return null;
             if (self.terminated) return if (expected) |want| want.ty else function.result;
             try self.copyNode(arg, param);
         }
@@ -1622,7 +1970,7 @@ const Context = struct {
             },
             .identifier => blk: {
                 const name = self.module.sourceSlice(self.span(node)).?;
-                if (self.lookupBinding(name)) |binding| break :blk binding.known;
+                if (self.lookupBinding(name)) |binding| break :blk if (binding.template != null) null else binding.known;
                 if (self.valueDeclaration(name)) |id| break :blk try self.globalType(id);
                 if (std.mem.eql(u8, name, "true") or std.mem.eql(u8, name, "false")) break :blk .{ .ty = try self.ir.internType(.boolean) };
                 break :blk null;
@@ -1725,7 +2073,7 @@ const Context = struct {
             .call, .call_one => blk: {
                 const call = ast.fullCall(node).?;
                 if (try self.genericTarget(call.ast.fn_expr)) |ref| {
-                    if (ref.module.getDeclaration(ref.id).?.noreturn) break :blk null;
+                    if (ref.local == null and ref.module.getDeclaration(ref.id).?.noreturn) break :blk null;
                     const start = self.module.diagnostics.items.len;
                     defer self.module.diagnostics.shrinkRetainingCapacity(start);
                     const result = (try self.genericProbe(node, call, ref, null, depth + 1)) orelse break :blk null;
@@ -1746,7 +2094,7 @@ const Context = struct {
                     const field = ast.nodes.items(.data)[call.ast.fn_expr];
                     if (try self.probe(field.lhs, depth + 1)) |receiver| {
                         if (self.receiverGeneric(receiver.ty, ast.tokenSlice(field.rhs))) |ref| {
-                            if (ref.module.getDeclaration(ref.id).?.noreturn) break :blk null;
+                            if (ref.local == null and ref.module.getDeclaration(ref.id).?.noreturn) break :blk null;
                             const result = (try self.genericProbe(node, call, ref, .{ .ty = receiver.ty, .span = self.irSpan(field.lhs) }, depth + 1)) orelse break :blk null;
                             break :blk .{ .ty = result };
                         }
@@ -3363,6 +3711,126 @@ const Context = struct {
     }
 };
 
+fn testGenericClosureBlockProbe(allocator: std.mem.Allocator, expression: []const u8) !void {
+    const source = try std.mem.concat(allocator, u8, &.{
+        "let apply:(callback:(`A)->`B,input:`A)->`B=callback(input)\nlet factory:()={let actual=(value:`V)->`V{if saved[0] {value} else {value}}\n}\nlet sample:()->bool=",
+        expression,
+    });
+    defer allocator.free(source);
+    var module = try Module.init(allocator, "closure-block-probe.nov", source);
+    defer module.deinit();
+    var analysis = try Sema.analyzeAnnotations(&module);
+    defer analysis.deinit();
+    const entries = try allocator.dupe(Sema.Entry, analysis.entries);
+    defer allocator.free(entries);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var emitter: Emitter = .{ .allocator = arena.allocator(), .constants = &.{}, .functions = &.{} };
+    const boolean = try analysis.ir.internType(.boolean);
+    const array = try analysis.ir.internType(.{ .array = boolean });
+    const value = try emitter.append(array, .{ .start = 0, .end = 0 }, .{ .parameter = 0 });
+    var context: Context = .{ .template_allocator = arena.allocator(), .module = &module, .ir = &analysis.ir, .types = &.{}, .sema = &analysis, .emitter = &emitter, .return_type = .{ .ty = boolean } };
+    defer context.bindings.deinit(allocator);
+    defer context.locals.deinit(allocator);
+    try context.bindings.put(allocator, "saved", .{ .known = .{ .ty = array }, .value = value, .name_span = .{ .start = 0, .end = 0 } });
+    const ast = &module.source.ast;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const declaration = ast.fullBlock(&buffer, ast.declFunction(module.getDeclaration(module.lookup("factory").?).?.node).?.body).?.ast.statements[0];
+    const initializer = ast.decl(declaration).ast.init_node;
+    const function = ast.functionExpr(initializer).?;
+    const actual = (try context.createTemplate(initializer, function.proto.ast.proto_node, function.body)).?;
+    actual.name = "actual";
+    try context.bindLocal("actual", .{ .known = .{ .ty = actual.environment_type }, .template = actual, .initializer = initializer, .name_span = module.tokenSpan(ast.firstToken(declaration)) });
+    const environment = actual.environment;
+    const layout = actual.layout;
+    const instructions = emitter.instructions.items.len;
+    const declarations = module.declarations.items.len;
+    const node = ast.declFunction(module.getDeclaration(module.lookup("sample").?).?.node).?.body;
+    for (0..3) |_| {
+        const known = context.probe(node, 0) catch |err| {
+            try std.testing.expectEqualDeep(entries, analysis.entries);
+            try std.testing.expectEqual(declarations, module.declarations.items.len);
+            try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+            try std.testing.expectEqual(instructions, emitter.instructions.items.len);
+            try std.testing.expectEqual(@as(usize, 2), context.bindings.count());
+            return err;
+        };
+        try std.testing.expectEqual(boolean, known.?.ty);
+        try std.testing.expectEqualDeep(entries, analysis.entries);
+        try std.testing.expectEqual(declarations, module.declarations.items.len);
+        try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+        try std.testing.expectEqual(instructions, emitter.instructions.items.len);
+        try std.testing.expectEqual(@as(usize, 2), context.bindings.count());
+        try std.testing.expectEqual(@as(usize, 1), context.locals.items.len);
+        try std.testing.expectEqual(@as(usize, 1), analysis.ir.functions.items.len);
+        try std.testing.expectEqual(@as(usize, 0), analysis.ir.local_generic_instances.items.len);
+        try std.testing.expect(actual.created);
+        try std.testing.expectEqual(environment, actual.environment);
+        try std.testing.expectEqual(layout, actual.layout);
+        try std.testing.expectEqual(@as(usize, 0), actual.specializations.items.len);
+    }
+}
+
+test "generic closures block probes preserve real template state and temporary scopes under OOM" {
+    for ([_][]const u8{
+        "{let f=(x:`T)->`T{actual(x)}\nf(true)}",
+        "{let f:(x:`T)->`T=actual(x)\nf(true)}",
+        "{apply({let f=(x:`T)->`T{actual(x)}\nf},true)}",
+        "loop {let f=(x:`T)->`T{actual(x)}\nloop {break}\nbreak f(true)}",
+    }) |expression| {
+        try testGenericClosureBlockProbe(std.testing.allocator, expression);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testGenericClosureBlockProbe, .{expression});
+    }
+}
+
+fn testGenericClosureQueryScope(allocator: std.mem.Allocator, callback: bool) !void {
+    const expression = if (callback) "apply((x:`T)->`T{if saved {x} else {x}},true)" else "(x:`T)->`T{if saved {x} else {x}}(true)";
+    const source = try std.mem.concat(allocator, u8, &.{ "let apply:(f:(`A)->`A,input:`A)->`A=f(input)\nlet sample:()->bool={let result=", expression, "\nresult}" });
+    defer allocator.free(source);
+    var module = try Module.init(allocator, "closure-query-scope.nov", source);
+    defer module.deinit();
+    var analysis = try Sema.analyzeAnnotations(&module);
+    defer analysis.deinit();
+    const entries = try allocator.dupe(Sema.Entry, analysis.entries);
+    defer allocator.free(entries);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var emitter: Emitter = .{ .allocator = arena.allocator(), .constants = &.{}, .functions = &.{} };
+    const boolean = try analysis.ir.internType(.boolean);
+    const value = try emitter.append(boolean, .{ .start = 0, .end = 0 }, .{ .parameter = 0 });
+    var context: Context = .{ .module = &module, .ir = &analysis.ir, .types = &.{}, .sema = &analysis, .emitter = &emitter, .return_type = .{ .ty = boolean } };
+    defer context.bindings.deinit(allocator);
+    try context.bindings.put(allocator, "saved", .{ .known = .{ .ty = boolean }, .value = value, .name_span = .{ .start = 0, .end = 0 } });
+    const node = module.source.ast.declFunction(module.getDeclaration(module.lookup("sample").?).?.node).?.body;
+    const declarations = module.declarations.items.len;
+    for (0..3) |_| {
+        const terminal = context.argumentTerminates(node, 0) catch |err| {
+            try std.testing.expectEqualDeep(entries, analysis.entries);
+            try std.testing.expectEqual(declarations, module.declarations.items.len);
+            try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+            try std.testing.expectEqual(@as(usize, 1), emitter.instructions.items.len);
+            return err;
+        };
+        try std.testing.expect(!terminal);
+        try std.testing.expectEqualDeep(entries, analysis.entries);
+        try std.testing.expectEqual(declarations, module.declarations.items.len);
+        try std.testing.expectEqual(@as(usize, 1), context.bindings.count());
+        try std.testing.expectEqual(@as(usize, 0), context.captures.items.len);
+        try std.testing.expectEqual(@as(usize, 1), emitter.instructions.items.len);
+        try std.testing.expectEqual(@as(usize, 0), emitter.values.count());
+        try std.testing.expectEqual(@as(usize, 0), analysis.ir.functions.items.len);
+        try std.testing.expectEqual(@as(usize, 0), analysis.ir.local_generic_instances.items.len);
+        try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+    }
+}
+
+test "generic closures review isolated flow descriptors do not publish mutate or snapshot under OOM" {
+    for ([_]bool{ false, true }) |callback| {
+        try testGenericClosureQueryScope(std.testing.allocator, callback);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testGenericClosureQueryScope, .{callback});
+    }
+}
+
 const flow_query_prelude =
     \\let R=struct{@[noreturn]
     \\let stop:(object:R)=@panic("stop")
@@ -3555,16 +4023,37 @@ test "backtick instance flow depth unknown cannot prove the absence of owned loo
     }
 }
 
-test "backtick instance flow depth boundary OOM never becomes a terminal proof" {
+test "backtick instance flow depth shallow factory every allocation failure" {
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testFlowDepth, .{ @as(usize, 4), @as([]const u8, "Factory.make()") });
-    for ([_]usize{ 63, 64, 65, 128, 129 }) |depth| {
-        for ([_]usize{ 0, 1, 2, 8, 32, 128, 512, 1024 }) |index| {
-            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = index, .resize_fail_index = 0 });
-            testFlowDepth(failing.allocator(), depth, "R[]") catch |err| {
-                try std.testing.expectEqual(error.OutOfMemory, err);
-            };
-        }
+}
+
+fn testFlowDepthSampledOom(depth: usize) !void {
+    for ([_]usize{ 0, 1, 2, 8, 32, 128, 512, 1024 }) |index| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = index, .resize_fail_index = 0 });
+        testFlowDepth(failing.allocator(), depth, "R[]") catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+        };
     }
+}
+
+test "backtick instance flow depth 63 sampled OOM never proves terminal" {
+    try testFlowDepthSampledOom(63);
+}
+
+test "backtick instance flow depth 64 sampled OOM never proves terminal" {
+    try testFlowDepthSampledOom(64);
+}
+
+test "backtick instance flow depth 65 sampled OOM never proves terminal" {
+    try testFlowDepthSampledOom(65);
+}
+
+test "backtick instance flow depth 128 sampled OOM never proves terminal" {
+    try testFlowDepthSampledOom(128);
+}
+
+test "backtick instance flow depth 129 sampled OOM never proves terminal" {
+    try testFlowDepthSampledOom(129);
 }
 
 fn testFactorySignatureProbe(allocator: std.mem.Allocator, expression: []const u8, finalized: bool) !void {
@@ -3679,10 +4168,52 @@ test "backtick instance factory result imports preserve private diagnostics and 
     }
 }
 
-test "backtick instance flow depth uncertainty matches concrete method and factory chains without assertions" {
-    for ([_]usize{ 62, 63, 64, 65, 96, 124, 125, 126, 127, 128, 129 }) |depth| {
-        for ([_][]const u8{ "R[]", "make()", "Factory.make()" }) |root| try testFlowDepth(std.testing.allocator, depth, root);
-    }
+fn testFlowDepthRoots(depth: usize) !void {
+    for ([_][]const u8{ "R[]", "make()", "Factory.make()" }) |root| try testFlowDepth(std.testing.allocator, depth, root);
+}
+
+test "backtick instance flow depth concrete generic parity depth 62" {
+    try testFlowDepthRoots(62);
+}
+
+test "backtick instance flow depth concrete generic parity depth 63" {
+    try testFlowDepthRoots(63);
+}
+
+test "backtick instance flow depth concrete generic parity depth 64" {
+    try testFlowDepthRoots(64);
+}
+
+test "backtick instance flow depth concrete generic parity depth 65" {
+    try testFlowDepthRoots(65);
+}
+
+test "backtick instance flow depth concrete generic parity depth 96" {
+    try testFlowDepthRoots(96);
+}
+
+test "backtick instance flow depth concrete generic parity depth 124" {
+    try testFlowDepthRoots(124);
+}
+
+test "backtick instance flow depth concrete generic parity depth 125" {
+    try testFlowDepthRoots(125);
+}
+
+test "backtick instance flow depth concrete generic parity depth 126" {
+    try testFlowDepthRoots(126);
+}
+
+test "backtick instance flow depth concrete generic parity depth 127" {
+    try testFlowDepthRoots(127);
+}
+
+test "backtick instance flow depth concrete generic parity depth 128" {
+    try testFlowDepthRoots(128);
+}
+
+test "backtick instance flow depth concrete generic parity depth 129" {
+    try testFlowDepthRoots(129);
 }
 
 test "backtick instance abstract control flow matches concrete exits loops scopes matches and eager evaluation under OOM" {

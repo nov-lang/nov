@@ -652,9 +652,10 @@ semantics are introduced. See [`examples/closures.nov`](examples/closures.nov).
 
 ### Inferred generic functions (bounded executable subset)
 
-Named generic functions support direct calls and contextual specialization as
-function values, using backtick type variables in their signatures. A backtick
-marks an inferred type, not a runtime or explicit compile-time argument:
+Named generic functions and local generic closures support direct calls and
+contextual specialization as function values, using backtick type variables in
+their signatures. A backtick marks an inferred type, not a runtime or explicit
+compile-time argument:
 
 ```nov
 let first: (items: []`T) -> `T = items[0]
@@ -745,12 +746,47 @@ still applies. Terminating paths (including direct `noreturn` calls and `@panic`
 do not contribute false `void` constraints; bare returns do constrain the enclosing
 result to `void`. This is internal control-flow tracking, not a new source type.
 
-Ordinary closures inside a generic body can capture values with substituted
-concrete types, including signatures referring to the enclosing type variables.
-They are **not generic closures**: local generic templates, closures introducing
-their own inferred type variables, runtime-polymorphic unspecialized generic
-function values remain deferred.
-Explicit function specialization syntax is not provided.
+Local function expressions can introduce their own inferred type variables, as
+can typed local function declarations:
+
+```nov
+let apply: (callback: (`T) -> `T, value: `T) -> `T = callback(value)
+let main: () = {
+    let identity = (value: `T) -> `T { value }
+    let local: (value: `U) -> `U = { value }
+    let direct = identity(true)
+    let callback: (uint) -> uint = local
+    let contextual: uint = apply(identity, 42)
+    @println(direct, callback(7), contextual)
+}
+```
+
+Direct calls, exact expected function types and bidirectional callback inference
+use the same bounded constraints and ambiguity/conflict rules described above.
+Generic closures may also appear inline as callees or contextual callbacks.
+Inside a generic body, enclosing type variables retain their substituted types;
+a local signature may introduce additional inferred variables.
+
+Captures are evaluated **once at template creation**, not at specialization or
+call time, even if the template is never specialized. Immutable bindings and
+parameters snapshot recursively independent array backing; immutable strings
+share storage. Mutable bindings share the same GC-managed cells across every
+specialization and copied specialized function value. Specializing or copying
+does not recapture or clone the environment. Each runtime factory call or loop
+evaluation creates a distinct environment, even when specialization code is
+reused. Escaping specialized values keep their environments and captured contents
+reachable through GC, including transitive captures through ordinary closures.
+The existing borrowing and captured-shared-storage call restrictions still apply.
+
+A local template binding is immutable and is not itself a first-class runtime
+function value: an exact concrete context must select a specialization before it
+can be copied, passed or returned. For example, `let copy = identity` is ambiguous;
+`let copy: (bool) -> bool = identity` is supported. Module-scope inferred generic
+function expressions remain unsupported; use named generic declarations there.
+Local recursion, runtime-polymorphic unspecialized generic values and explicit
+function specialization syntax remain unsupported. See
+[`examples/generic-closures.nov`](examples/generic-closures.nov) for local generic
+calls, callbacks, shared captures and escaping specialized values.
 
 Specialization is demand-driven and canonical, bounded to 64 expansion levels and
 1024 specializations per defining module; inference is bounded to 8192 terms and

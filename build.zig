@@ -153,6 +153,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const generic_function_tests = b.step("test-cli-generic-functions", "Run direct generic function CLI tests");
     addGenericFunctionCliTests(b, exe, generic_function_tests);
     test_step.dependOn(generic_function_tests);
+    const generic_closure_tests = b.step("test-cli-generic-closures", "Run generic closure and local template CLI tests");
+    addGenericClosureCliTests(b, exe, generic_closure_tests);
+    test_step.dependOn(generic_closure_tests);
     const generic_method_tests = b.step("test-cli-generic-methods", "Run inferred generic instance method CLI tests");
     addGenericMethodCliTests(b, exe, generic_method_tests);
     test_step.dependOn(generic_method_tests);
@@ -1690,6 +1693,98 @@ fn addLanguageTestCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_ste
     }
 }
 
+fn addGenericClosureCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    const fixtures = b.addWriteFiles();
+    _ = fixtures.add("generic-closures.nov", @embedFile("examples/generic-closures.nov"));
+    _ = fixtures.add("factory.nov",
+        \\let secret: int = 10
+        \\@[public]
+        \\let make: (initial: int) -> (bool) -> int = {
+        \\    let mut count = initial
+        \\    let local: (ignored: `T) -> int = {
+        \\        count += 1
+        \\        count + secret
+        \\    }
+        \\    @assert(local("warmup") == initial + 1 + secret)
+        \\    let result: (bool) -> int = local
+        \\    result
+        \\}
+        \\
+    );
+    _ = fixtures.add("imported.nov",
+        \\let factory = @import("factory.nov")
+        \\let secret: int = 1000
+        \\let verify: () = {
+        \\    let first = factory.make(1)
+        \\    let second = factory.make(20)
+        \\    let copy = first
+        \\    @assert(first(true) == 13 and copy(false) == 14)
+        \\    @assert(second(true) == 32 and first(false) == 15)
+        \\}
+        \\@[test]
+        \\let imported_local_factory: () = verify()
+        \\let main: () = verify()
+        \\
+    );
+    for ([_][]const u8{ "generic-closures.nov", "factory.nov", "imported.nov" }) |source| {
+        for ([_][]const u8{ "fmt", "semantic" }) |command| {
+            const check = b.addRunArtifact(exe);
+            check.step.name = b.fmt("CLI generic closures {s}: {s}", .{ command, source });
+            check.setCwd(fixtures.getDirectory());
+            check.addArgs(if (std.mem.eql(u8, command, "fmt")) &.{ "fmt", "--check", source } else &.{ "check", "--semantic", source });
+            check.expectExitCode(0);
+            check.expectStdOutEqual("");
+            check.expectStdErrEqual("");
+            test_step.dependOn(&check.step);
+        }
+    }
+    for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+        for ([_][]const u8{ "generic-closures.nov", "imported.nov" }) |source| {
+            for ([_][]const u8{ "run", "test" }) |command| {
+                const run = b.addRunArtifact(exe);
+                run.step.name = b.fmt("CLI generic closures {s}: {s} ({s})", .{ command, source, mode });
+                run.setCwd(fixtures.getDirectory());
+                run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+                run.setEnvironmentVariable("NOV_CC", "");
+                run.setEnvironmentVariable("CC", "");
+                run.addArgs(&.{ command, source });
+                if (mode.len != 0) run.addArg(mode);
+                const imported = std.mem.eql(u8, source, "imported.nov");
+                const tests = std.mem.eql(u8, command, "test");
+                run.expectExitCode(0);
+                run.expectStdOutEqual(if (tests)
+                    (if (imported) "PASS imported_local_factory\n1 passed; 0 failed; 1 total\n" else "PASS direct_and_contextual\nPASS callback_inference\nPASS shared_mutable_capture\nPASS recursive_array_snapshots\nPASS loop_instances_and_escape\nPASS nested_template_substitution\n6 passed; 0 failed; 6 total\n")
+                else if (imported)
+                    ""
+                else
+                    "generic closures: all six checks passed\n");
+                run.expectStdErrEqual("");
+                test_step.dependOn(&run.step);
+            }
+        }
+    }
+    for ([_]struct { name: []const u8, source: []const u8, diagnostic: []const u8 }{
+        .{ .name = "unspecialized-escape", .source = "let main:()={let leaked={let f=(x:`T)->`T{x}\nf}\n}", .diagnostic = "cannot infer every generic function type variable" },
+        .{ .name = "local-recursion", .source = "let main:()={let f:(x:`T)->`T=f(x)\n@print(f(true))}", .diagnostic = "unknown name" },
+        .{ .name = "closure-recursion", .source = "let main:()={let f=(x:`T)->`T{f(x)}\n@print(f(true))}", .diagnostic = "unknown name" },
+        .{ .name = "ambiguous", .source = "let main:()={let f:(x:`T)->`T=x\nf(1)\n@print()}", .diagnostic = "cannot infer every generic function type variable" },
+        .{ .name = "conflict", .source = "let main:()={let f=(x:`T,y:`T)->`T{x}\n@print(f(true,@as(int,1)))}", .diagnostic = "constraints require exactly identical types" },
+        .{ .name = "callback-conflict", .source = "let main:()={let f=(x:`T)->`T{x}\nlet cb:(uint)->int=f\n}", .diagnostic = "constraints require exactly identical types" },
+        .{ .name = "scope", .source = "let main:()={let f=(x:`T)->`T{{let hidden:int=1\n}\nx}\n@print(f(true))\n@print(hidden)}", .diagnostic = "unknown name" },
+    }) |case| {
+        const source = b.fmt("reject-{s}.nov", .{case.name});
+        _ = fixtures.add(source, case.source);
+        const check = b.addRunArtifact(exe);
+        check.step.name = b.fmt("CLI generic closures reject: {s}", .{case.name});
+        check.setCwd(fixtures.getDirectory());
+        check.addArgs(&.{ "check", "--semantic", source });
+        check.expectExitCode(1);
+        check.expectStdOutEqual("");
+        check.expectStdErrMatch(case.diagnostic);
+        test_step.dependOn(&check.step);
+    }
+}
+
 fn addGenericFunctionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
     _ = fixtures.add("generic-functions.nov", @embedFile("examples/generic-functions.nov"));
@@ -1698,6 +1793,14 @@ fn addGenericFunctionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_
         \\let verify: () = {
         \\    let cb: (uint) -> uint = identity
         \\    @assert(cb(42) == 42)
+        \\    let local: (value: `T) -> `T = value
+        \\    let closure = (value: `U) -> `U {
+        \\        value
+        \\    }
+        \\    let typed: (bool) -> bool = local
+        \\    let captured: (string) -> string = closure
+        \\    @assert(local(true) and closure(false) == false and typed(true))
+        \\    @assert(captured("local") == "local")
         \\}
         \\@[test]
         \\let contextual_value: () = verify()
@@ -1883,8 +1986,6 @@ fn addGenericFunctionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_
         .{ .name = "callback-private-function", .source = "let lib=@import(\"library.nov\")\nlet main:()={let cb:(bool)->bool=lib.hidden\n}", .diagnostic = "declaration needs a resolved type before use here" },
         .{ .name = "callback-private-method", .source = "let lib=@import(\"library.nov\")\nlet main:()={let cb:(bool)->bool=lib.NS.private\n}", .diagnostic = "declaration needs a resolved type before use here" },
         .{ .name = "callback-private-sibling", .source = "let lib=@import(\"library.nov\")\nlet main:()={let cb:(bool,uint)->bool=lib.G(uint).sibling\n}", .diagnostic = "declaration needs a resolved type before use here" },
-        .{ .name = "local-template", .source = "let main:()={let f:(x:`T)->`T=x\n}", .diagnostic = "generic closures, local templates" },
-        .{ .name = "generic-closure", .source = "let main:()={let f=(x:`T)->`T{x}\n}", .diagnostic = "generic closures, local templates" },
         .{ .name = "module-generic-closure", .source = "let f=(x:`T)->`T{x}\nlet main:()={}", .diagnostic = "generic closures, local templates" },
         .{ .name = "unbound", .source = "let x:`T=true\nlet main:()={}", .diagnostic = "unbound backtick type variable" },
         .{ .name = "unbound-body", .source = "let f:(x:`T)->`T={let y:`U=x\ny}\nlet main:()={let x=f(true)\n}", .diagnostic = "unbound backtick type variable" },
@@ -2207,7 +2308,7 @@ fn addStorableArrayCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_st
             run.expectStdOutEqual(if (std.mem.eql(u8, command, "test"))
                 "PASS enum_membership_and_refs\nPASS nested_copies_and_iteration\nPASS union_active_payload_copies\nPASS ordinary_function_arrays\nPASS escaping_closures_share_cells\nPASS range_bounds_and_loops\n6 passed; 0 failed; 6 total\n"
             else
-                "Rows: Ada Ada!\nBlue: true\nShared: 1 2\n");
+                "Rows: Ada Ada!\nBlue: true\nShared: 1 1 3\n");
             run.expectStdErrEqual("");
             test_step.dependOn(&run.step);
         }

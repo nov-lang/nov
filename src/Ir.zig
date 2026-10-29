@@ -15,6 +15,9 @@ constants: std.ArrayList(Constant) = .empty,
 source_len: u32 = 0,
 source_lengths: std.ArrayList(u32) = .empty,
 functions: std.ArrayList(Function) = .empty,
+/// Compile-time canonical demand keys, independent of runtime environments.
+local_generic_instances: std.ArrayList(LocalGenericInstance) = .empty,
+pub const LocalGenericInstance = struct { span: Span, outer: []const TypeId, arguments: []const TypeId };
 
 /// The current pipeline targets the machine running Nov, not a separate target.
 /// Native aliases are canonical fixed-width integers once resolved.
@@ -38,11 +41,12 @@ pub const Function = struct {
     export_name: ?[]const u8 = null,
     extern_name: ?[]const u8 = null,
     is_closure: bool = false,
+    environment_layout: ?FunctionId = null,
     captures: []const Capture = &.{},
 };
 /// `result` is either a continuing value or the final terminal instruction.
 pub const Body = struct { instructions: []const Instruction, result: ValueId };
-pub const Capture = struct { ty: TypeId, mutable: bool };
+pub const Capture = struct { ty: TypeId, mutable: bool, environment_layout: ?FunctionId = null };
 pub const Instruction = struct { ty: TypeId, span: Span, op: Operation, boxed: bool = false };
 pub const UnaryOp = enum { negate, bit_not, bool_not };
 pub const BinaryOp = enum { add, sub, mul, div, mod, bit_and, bit_or, bit_xor, eq, ne, lt, le, gt, ge };
@@ -123,6 +127,7 @@ pub const Operation = union(enum) {
     },
     // Slot identities are instruction IDs, but are not expression values.
     closure_init: struct { function: FunctionId, captures: []const ValueId },
+    closure_specialize: struct { function: FunctionId, environment: ValueId },
     capture_value: u32,
     capture_cell: u32,
     local_slot: ValueId,
@@ -253,6 +258,11 @@ pub fn init(allocator: std.mem.Allocator) Ir {
 pub fn deinit(self: *Ir) void {
     self.clearFunctions();
     self.functions.deinit(self.allocator);
+    for (self.local_generic_instances.items) |instance| {
+        self.allocator.free(instance.outer);
+        self.allocator.free(instance.arguments);
+    }
+    self.local_generic_instances.deinit(self.allocator);
     for (self.types.items) |ty| {
         switch (ty) {
             .record => |record| {
@@ -599,11 +609,15 @@ fn validateFunction(self: *const Ir, function: Function) VerifyError!void {
     const ty = self.getType(function.ty) orelse return error.InvalidTypeId;
     if (ty != .function) return error.InvalidFunctionType;
     try self.validateType(ty, self.types.items.len);
-    if (!function.is_closure and function.captures.len != 0) return error.InvalidFunctionType;
+    if (!function.is_closure and (function.captures.len != 0 or function.environment_layout != null)) return error.InvalidFunctionType;
     if (function.is_closure and (function.export_name != null or function.extern_name != null or function.is_test)) return error.InvalidForeignFunction;
     for (function.captures) |capture| {
         const captured = self.getType(capture.ty) orelse return error.InvalidTypeId;
         if (capture.mutable and captured == .void) return error.InvalidOperation;
+        if (capture.environment_layout) |layout| {
+            const carrier = self.getFunction(layout) orelse return error.InvalidFunctionId;
+            if (capture.mutable or !carrier.is_closure or carrier.ty != capture.ty) return error.InvalidOperation;
+        }
     }
     if (function.is_test and (ty.function.params.len != 0 or self.getType(ty.function.result).? != .void or function.noreturn or function.export_name != null or function.extern_name != null)) return error.InvalidFunctionType;
     try self.validateSpan(function.span);
@@ -631,6 +645,23 @@ fn exportScalar(self: *const Ir, id: TypeId, result: bool) bool {
             else => false,
         },
         else => false,
+    };
+}
+
+fn environmentLayout(self: *const Ir, function: Function, body: Body, value: ValueId, before: usize, depth: usize) VerifyError!?FunctionId {
+    if (depth >= 128) return error.InvalidOperation;
+    _ = try regionOperandType(body, value, before, null);
+    return switch (body.instructions[@backingInt(value)].op) {
+        .closure_init => |closure| closure.function,
+        .local_slot => |source| blk: {
+            // Template carriers are immutable. A forged store must not change
+            // an environment's schema after its provenance was established.
+            for (body.instructions) |instruction| if (instruction.op == .local_store and instruction.op.local_store.slot == value) return error.InvalidOperation;
+            break :blk self.environmentLayout(function, body, source, @backingInt(value), depth + 1);
+        },
+        .local_load => |source| self.environmentLayout(function, body, source, @backingInt(value), depth + 1),
+        .capture_value => |index| if (index < function.captures.len) function.captures[index].environment_layout else error.InvalidOperation,
+        else => error.InvalidOperation,
     };
 }
 
@@ -819,13 +850,26 @@ fn validateBodyStructure(self: *const Ir, function: Function, body: Body) Verify
         }
         if (instruction.boxed and instruction.op != .local_slot and instruction.op != .capture_cell) return error.InvalidOperation;
         switch (instruction.op) {
+            .closure_specialize => |closure| {
+                const target = self.getFunction(closure.function) orelse return error.InvalidFunctionId;
+                if (!target.is_closure or target.ty != instruction.ty) return error.InvalidOperation;
+                _ = try operandType(body, closure.environment, i);
+                const layout = target.environment_layout orelse return error.InvalidOperation;
+                if (try self.environmentLayout(function, body, closure.environment, i, 0) != layout) return error.InvalidOperation;
+                const carrier = self.getFunction(layout) orelse return error.InvalidFunctionId;
+                if (target.captures.len != carrier.captures.len) return error.InvalidOperation;
+                for (target.captures, carrier.captures) |a, b| if (a.ty != b.ty or a.mutable != b.mutable or a.environment_layout != b.environment_layout) return error.InvalidOperation;
+            },
             .closure_init => |closure| {
                 const target = self.getFunction(closure.function) orelse return error.InvalidFunctionId;
-                if (!target.is_closure or target.ty != instruction.ty or closure.captures.len != target.captures.len) return error.InvalidOperation;
+                if (!target.is_closure or target.environment_layout != null or target.ty != instruction.ty or closure.captures.len != target.captures.len) return error.InvalidOperation;
                 for (closure.captures, target.captures) |value, capture| {
                     if (capture.mutable) {
                         if (try slotType(body, value, i) != capture.ty or !body.instructions[@backingInt(value)].boxed) return error.InvalidOperation;
-                    } else if (try operandType(body, value, i) != capture.ty) return error.OperandTypeMismatch;
+                    } else {
+                        if (try operandType(body, value, i) != capture.ty) return error.OperandTypeMismatch;
+                        if (capture.environment_layout) |layout| if (try self.environmentLayout(function, body, value, i, 0) != layout) return error.InvalidOperation;
+                    }
                 }
             },
             .capture_value, .capture_cell => |index| {

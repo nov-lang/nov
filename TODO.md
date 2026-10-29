@@ -47,9 +47,20 @@ results. See `examples/array-fields.nov`.
 
 ## Current delivered status
 
-Bounded named generic functions support direct calls, contextual specialization
-as function values under exact concrete signatures, and generic instance-method
-inference. Final parent validation: native build, full Debug and ReleaseSafe
+Generic closures and local generic functions are implemented. Both ``(value: `T) -> `T { ... }`` expressions and
+local ``let identity: (value: `T) -> `T = { value }`` declarations support direct
+inference, exact expected-function-type specialization and bidirectional generic
+callback inference within the existing bounded solver. Latest focused closure
+**32/32**, backtick **70/70**, and combined storable-array/generic-closure CLI
+**59/59 steps** passed. Earlier full Debug units passed 989/990 with one skip;
+subsequent review fixes passed focused regressions. Final full-suite attempts were
+user-interrupted, not passes; user authorized committing before completing them.
+Three tests previously over 20 seconds were split with all cases preserved into
+20 tests; the longest measured split was 17.524 seconds. No tests were disabled.
+
+Bounded named generic functions also support direct calls, contextual
+specialization and generic instance-method inference. Historical parent validation
+at **637114b**: native build, full Debug and ReleaseSafe
 **1034/1034 steps** each (unit suite **958 passes / 1 existing skip**, 959 total),
 Debug CLI **1019/1019 steps**, four-target release builds, formatting and diff
 checks pass. Focused generic **55/55** and instance **32/32** tests pass.
@@ -57,8 +68,11 @@ The initial 400-second Debug timeout was investigated using per-test timing: the
 full binary completed in 529 seconds, with no failures or infinite loop observed;
 the normal build gate subsequently passed in about nine minutes under the approved
 15-minute timeout. Most time is generated-C/allocation-budget testing; the slowest
-test exercises 33 method/factory depth-boundary cases against concrete/generic
-checking. Broader performance work remains paused.
+test exercised 33 method/factory depth-boundary cases against concrete/generic
+checking. Following the request to consider tests over 20 seconds, the parent is
+splitting the three slow tests into smaller coverage-preserving cases, not
+disabling them. This is test organization, not a new source optimization; current
+timings and final gates remain pending. Broader performance work remains paused.
 `PLAN2.md` is the current untracked handoff; `PLAN.md` is an unchanged archive.
 
 Backtick inference combines typed runtime arguments, expected call results and
@@ -72,7 +86,13 @@ Static and instance forms share canonical specializations. Receivers are exact
 nominal by-value snapshots evaluated once before explicit arguments; no mutable
 receiver or implicit borrow is added. Fields retain lookup precedence.
 Ordinary closures inside generic bodies capture substituted concrete types;
-this does not deliver generic closures or local generic templates.
+local generic signatures can also introduce their own inferred variables.
+Generic template captures happen once at creation: immutable values snapshot
+recursively independent arrays (strings share), while mutable cells are shared
+across all specializations and copied specialized functions. Specialization and
+copying never recapture. Runtime factory/loop evaluations have distinct
+environments; escaping specialized values retain them and their contents through
+GC. Borrowed captures and local recursion remain unsupported.
 Typed bindings, `@as` and callback contexts can demand ordinary canonical function
 references. Callback inference combines other arguments and expected results
 bidirectionally, without duplicating runtime evaluation. Aliases, imports/public
@@ -646,8 +666,13 @@ inferred function bindings, nonrecursive local definitions, higher-order calls a
 escaping automatic captures. Immutable bindings/parameters snapshot by value
 (independent arrays, shared immutable strings); mutable bindings share GC-managed
 cells. Function copies/arguments share environments, without recopying captures.
-Transitive captures, generic methods, source-free IR and forced-GC/OOM paths are
-covered. See README and examples/closures.nov.
+Transitive captures, generic methods, source-free IR and forced-GC/OOM paths have
+regression coverage. Local generic expressions and typed local declarations now
+follow the same capture rules: one creation-time snapshot/environment shared by
+all specializations, with distinct environments for runtime factory/loop
+instances. Specialized escaping values are retained by GC; unspecialized templates
+are not first-class runtime values. See README and examples/closures.nov.
+Final validation of the uncommitted generic-closure work remains pending.
 
 Borrowed binding captures, recursive local definitions, inferred parameter/result
 types, function fields and C callback ABI remain deferred. Calls
@@ -1188,19 +1213,34 @@ exact by-value receiver snapshots before argument evaluation.
 `let callback = identity` and `apply(identity, 42)` remain ambiguous; conflicts
 reject, with no numeric defaults or implicit conversions.
 
-Still deferred: generic closures, local generic templates, runtime-polymorphic
-unspecialized generic function values, bound method values and callable fields. No
-new parser syntax, explicit function specialization syntax or general comptime
-evaluation is delivered. Existing explicit container parameters remain unchanged.
+Local generic expressions ``(value: `T) -> `T { ... }`` and typed local declarations
+``let identity: (value: `T) -> `T = { value }`` support direct calls, concrete
+expected-function-type specialization and contextual generic callbacks. Captures
+happen once at creation, including for unused templates: independent immutable
+array snapshots/shared strings, and mutable cells shared across specializations
+and copied specialized values. Factory/loop evaluations create distinct
+environments; GC retains escaped specialized values and transitive captures.
+Existing inference limits, borrowing restrictions and exact-type rules still apply.
+
+Still deferred: local recursion, runtime-polymorphic unspecialized generic function
+values, bound method values and callable fields. Local template bindings must be
+immutable; copying/passing/returning requires a concrete specialization context.
+Module-scope inferred generic expressions remain rejected; named generic
+declarations remain supported. No explicit function specialization syntax or
+general comptime evaluation is delivered. Existing explicit container parameters
+remain unchanged.
 `#` explicit compile-time arguments are a separate proposal, not implemented.
 Terminal paths do not impose `void` merge constraints; bare return constrains its
 own function result to void. Fresh nominal result layouts materialize without
 publishing method demands during probes, so inference is independent of prior
 instantiation order; probes publish no methods, specializations, declaration IDs
-or body/worklist demands. Current agent-reported validation: focused **43/43** and
-instance **20/20**; full units timed out at **400 seconds, 781/947**, not a pass.
-Parent final gates remain pending. Committed **4a14d80** validation above is
-historical, not validation of the current uncommitted implementation.
+or body/worklist demands. Regression tests in `src/GenericFunctions.zig` and
+`src/CEmitter.zig` cover local generic inference/rejections, creation-time capture,
+specialization sharing, separate runtime instances, escaping GC retention,
+source-free IR, forged environments and OOM rollback. These are inspected test
+contracts, not a claim that current gates passed. Parent final gates remain
+pending; validation at **637114b** above is historical, not validation of the
+current uncommitted generic-closure implementation.
 
 # Comptime
 
