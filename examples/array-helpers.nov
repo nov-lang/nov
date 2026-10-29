@@ -1,0 +1,269 @@
+; nov run examples/array-helpers.nov
+; nov test examples/array-helpers.nov
+
+let std = @import("std")
+
+let Row = struct {
+    values: [][]int,
+}
+
+let Payload = union {
+    row: Row,
+    none,
+}
+
+@[test]
+let map_types_and_generic_callbacks: () = {
+    let items: []int = [1, 2, 3]
+    let mut calls: int = 0
+    let labels = std.array.map(
+        items,
+        (value: int) -> string {
+            calls += 1
+            "item {value}"
+        }
+    )
+    @assert(labels.len == 3 and labels[0] == "item 1" and labels[2] == "item 3")
+    @assert(calls == 3)
+    let identity = (value: `T) -> `T {
+        value
+    }
+    let local: (value: `U) -> `U = value
+    let numbers = std.array.map(items, identity)
+    let words = std.array.map(labels, local)
+    @assert(numbers[1] == 2 and words[1] == "item 2")
+    let booleans = std.array.map(
+        [true, false],
+        (value: `V) -> `V {
+            value
+        }
+    )
+    @assert(booleans[0] and booleans[1] == false)
+    let empty: []int = []
+    let mapped = std.array.map(
+        empty,
+        (value: int) -> string {
+            calls += 1
+            "unexpected"
+        }
+    )
+    @assert(mapped.len == 0 and calls == 3)
+}
+
+@[test]
+let filter_order_and_exact_calls: () = {
+    let mut calls: int = 0
+    let mut seen: int = 0
+    let selected = std.array.filter(
+        @as([]int, [3, 1, 4, 2]),
+        (value: int) -> bool {
+            calls += 1
+            seen = seen * 10 + value
+            value > 2
+        }
+    )
+    @assert(calls == 4 and seen == 3142)
+    @assert(selected.len == 2 and selected[0] == 3 and selected[1] == 4)
+    let rejected = std.array.filter(
+        @as([]int, [7, 8]),
+        (value: int) -> bool {
+            calls += 1
+            false
+        }
+    )
+    @assert(rejected.len == 0 and calls == 6)
+    let empty: []int = []
+    let none = std.array.filter(
+        empty,
+        (value: int) -> bool {
+            calls += 1
+            true
+        }
+    )
+    @assert(none.len == 0 and calls == 6)
+}
+
+@[test]
+let fold_left_seed_and_empty: () = {
+    let mut calls: int = 0
+    let subtract = (total: int, value: int) -> int {
+        calls += 1
+        total - value
+    }
+    @assert(std.array.fold(@as([]int, [1, 2, 3]), @as(int, 10), subtract) == 4)
+    @assert(calls == 3)
+    let empty: []int = []
+    @assert(std.array.fold(empty, @as(int, 17), subtract) == 17 and calls == 3)
+    let text = std.array.fold(
+        @as([]int, [1, 2, 3]),
+        "seed",
+        (total: string, value: int) -> string {
+            "({total}-{value})"
+        }
+    )
+    @assert(text == "(((seed-1)-2)-3)")
+}
+
+@[test]
+let recursive_array_record_and_union_copies: () = {
+    let identity: (value: `T) -> `T = value
+    let mut source = [Row[ .values = [[1, 2], [3]] ]]
+    let mut mapped = std.array.map(source, identity)
+    let selected = std.array.filter(
+        source,
+        (value: Row) -> bool {
+            true
+        }
+    )
+    let seed: []Row = []
+    let mut folded = std.array.fold(
+        source,
+        seed,
+        (rows: []Row, row: Row) -> []Row {
+            let mut result = rows
+            result += [row]
+            result
+        }
+    )
+    let mut row = source[0]
+    row.values = [[9]]
+    source[0] = row
+    let mut changed = mapped[0]
+    changed.values = [[8]]
+    mapped[0] = changed
+    folded += [row]
+    @assert(selected[0].values[0][0] == 1 and selected[0].values[0].len == 2)
+    @assert(mapped[0].values[0][0] == 8 and source[0].values[0][0] == 9)
+    @assert(folded[0].values[0][0] == 1 and seed.len == 0)
+    let mut nested: [][]int = [[4, 5]]
+    let copied = std.array.map(nested, identity)
+    nested[0] = [99]
+    @assert(copied[0][0] == 4 and copied[0].len == 2)
+    let payloads: []Payload = [.row[selected[0]], .none[]]
+    let mut unions = std.array.map(payloads, identity)
+    let kept = std.array.filter(
+        unions,
+        (value: Payload) -> bool {
+            true
+        }
+    )
+    unions[0] = .none[]
+    @assert(
+        match kept[0] {
+            .row => |value| value.values[0][0] == 1
+            .none => false
+        }
+    )
+    @assert(
+        match kept[1] {
+            .row => false
+            .none => true
+        }
+    )
+}
+
+@[test]
+let function_elements_share_environments: () = {
+    let mut count: int = 0
+    let next = () -> int {
+        count += 1
+        count
+    }
+    let functions: []() -> int = [next, next]
+    let identity: (value: `T) -> `T = value
+    let mapped = std.array.map(functions, identity)
+    let selected = std.array.filter(
+        mapped,
+        (value: () -> int) -> bool {
+            true
+        }
+    )
+    let folded = std.array.fold(
+        selected,
+        next,
+        (previous: () -> int, current: () -> int) -> () -> int {
+            current
+        }
+    )
+    @assert(count == 0)
+    @assert(functions[0]() == 1 and mapped[1]() == 2)
+    @assert(selected[0]() == 3 and folded() == 4 and next() == 5)
+}
+
+@[test]
+let argument_order_captures_and_snapshots: () = {
+    let mut events: int = 0
+    let mut source: []int = [1, 2]
+    let frozen = source
+    let getMap = () -> ([]int, (int) -> int) -> []int {
+        events = events * 10 + 1
+        std.array.map
+    }
+    let converted = getMap()(
+        {
+            events = events * 10 + 2
+            source
+        },
+        {
+            events = events * 10 + 3
+            source[0] = 9
+            (value: int) -> int {
+                events = events * 10 + value
+                source[1] = 8
+                value + frozen[0]
+            }
+        }
+    )
+    @assert(events == 12312)
+    @assert(converted[0] == 2 and converted[1] == 3)
+    @assert(source[0] == 9 and source[1] == 8 and frozen[1] == 2)
+    events = 0
+    let getFold = () -> ([]int, int, (int, int) -> int) -> int {
+        events = events * 10 + 1
+        std.array.fold
+    }
+    let total = getFold()(
+        {
+            events = events * 10 + 2
+            @as([]int, [4, 5])
+        },
+        {
+            events = events * 10 + 3
+            @as(int, 10)
+        },
+        {
+            events = events * 10 + 4
+            (accumulator: int, value: int) -> int {
+                events = events * 10 + value
+                accumulator - value
+            }
+        }
+    )
+    @assert(events == 123445 and total == 1)
+}
+
+let main: () = {
+    let numbers: []int = [1, 2, 3, 4]
+    let doubled = std.array.map(
+        numbers,
+        (value: int) -> int {
+            value * 2
+        }
+    )
+    let selected = std.array.filter(
+        doubled,
+        (value: int) -> bool {
+            value > 4
+        }
+    )
+    let total = std.array.fold(
+        selected,
+        @as(int, 0),
+        (sum: int, value: int) -> int {
+            sum + value
+        }
+    )
+    @println("Mapped:", doubled[0], doubled[1], doubled[2], doubled[3])
+    @println("Filtered:", selected[0], selected[1])
+    @println("Folded:", total)
+}

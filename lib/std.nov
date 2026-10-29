@@ -3,3 +3,6 @@ let Result = @import("result.nov").Result
 
 @[public]
 let Option = @import("option.nov").Option
+
+@[public]
+let array = @import("array.nov")

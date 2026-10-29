@@ -1367,8 +1367,9 @@ return bool based only on the active tag, including with void payloads.
 as an ordinary argument even on success. `unwrapOrElse` evaluates the callback
 value normally but calls its body only on error. Neither requires a Result builtin.
 
-[`lib/std.nov`](lib/std.nov) publicly re-exports Result from `result.nov` and Option
-from `option.nov`. Examples use real imports rather than copied definitions:
+[`lib/std.nov`](lib/std.nov) publicly re-exports Result from `result.nov`, Option
+from `option.nov`, and the `array` namespace from `array.nov`. Examples use real
+imports rather than copied definitions:
 
 ```nov
 let std = @import("std")
@@ -1382,6 +1383,68 @@ to its executable at `../lib/nov`; semantic check, emit-c, build and run accept
 search or developer-checkout path is used. Tests exercise real library imports,
 callbacks and void payloads, plus a relocated executable/library installation.
 See [`lib/README.md`](lib/README.md).
+
+#### Array helpers
+
+[`lib/array.nov`](lib/array.nov) provides public ordinary generic functions through
+`std.array`:
+
+```nov
+let std = @import("std")
+let array = std.array
+
+let main: () = {
+    let numbers: []int = [1, 2, 3, 4]
+    let doubled = array.map(numbers, (value: int) -> int { value * 2 })
+    let selected = array.filter(doubled, (value: int) -> bool { value > 4 })
+    let total = array.fold(
+        selected,
+        @as(int, 0),
+        (sum: int, value: int) -> int { sum + value }
+    )
+    @println("Mapped:", doubled[0], doubled[1], doubled[2], doubled[3])
+    @println("Filtered:", selected[0], selected[1])
+    @println("Folded:", total)
+}
+```
+
+Output:
+
+```text
+Mapped: 2 4 6 8
+Filtered: 6 8
+Folded: 14
+```
+
+Signatures below use `T`/`U` for inferred backtick type variables:
+
+- `map(items: []T, convert: (T) -> U) -> []U` converts each element.
+- `filter(items: []T, predicate: (T) -> bool) -> []T` retains matching elements
+  in their original order.
+- `fold(items: []T, initial: U, combine: (U, T) -> U) -> U` folds left from the
+  seed: `combine(combine(initial, items[0]), items[1])`, and so on.
+
+Callbacks run once per element, in source order, and never run for empty input.
+Empty map/filter results are empty arrays; empty fold returns the seed. Callee
+and argument expressions still evaluate eagerly in normal left-to-right call
+order, including the callback expression and fold seed on empty input.
+
+Ordinary functions, capturing closures and inferred generic closures/local generic
+functions are supported within the bounded inference rules. Supply exact typed
+inputs and seeds (as above, or with `@as`); there are no numeric defaults or
+implicit conversions, and ambiguous inference is an error.
+
+Normal by-value copies preserve recursively independent array backing through
+nested arrays, structs and active union payloads; immutable strings share storage.
+Function/closure copies share their capture environments and mutable cells, not
+recaptured values. These helpers add no aliasing pointer mutation. Callback
+failures and panics propagate normally; the helpers do not catch errors or panics.
+
+Map/filter currently build results by repeated append, which can be quadratic;
+normal by-value copying adds overhead. Further optimization remains **PAUSED**.
+[`examples/array-helpers.nov`](examples/array-helpers.nov) contains the runnable
+example and six tests covering callbacks, ordering, empty inputs, folds, recursive
+copies, shared closure environments and argument evaluation.
 
 #### Executable imports
 

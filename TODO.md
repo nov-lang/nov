@@ -28,7 +28,10 @@ the same conditional/loop region. Later reads, aggregate projections, repeated
 consumption and region crossings retain copies. Calls/merges/storage reads are not
 ownership evidence.
 Snapshot copies, conservative fallbacks and more general update paths remain
-potentially costly; further optimization is paused.
+potentially costly. The current `std.array.map`/`filter` implementations build
+results by repeated append, which can be quadratic; ordinary by-value argument,
+element and accumulator copies add overhead. Track these costs without changing
+the algorithms now; further optimization is **PAUSED**.
 Broader elision, moves/consuming transfers and copy-on-write remain candidates,
 **not approved designs**. Preserve observable value independence, static borrowing and GC safety.
 No further optimization is authorized as the next action.
@@ -46,6 +49,29 @@ captures snapshot recursively; mutable captures share a cell, not ordinary read
 results. See `examples/array-fields.nov`.
 
 ## Current delivered status
+
+`std.array.map`, `filter` and `fold` are implemented in `lib/array.nov`,
+publicly re-exported as the `std.array` namespace by
+`lib/std.nov`. With `T`/`U` denoting inferred backtick variables, the APIs are
+`map(items: []T, convert: (T) -> U) -> []U`,
+`filter(items: []T, predicate: (T) -> bool) -> []T`, and
+`fold(items: []T, initial: U, combine: (U, T) -> U) -> U`.
+Map converts every element; filter preserves source order; fold is left-associative
+from the seed. Callbacks run exactly once per element in source order and not at
+all for empty input. Empty fold returns the seed. Callee and argument expressions
+remain eager and left-to-right, even on empty input.
+Ordinary functions, capturing closures and inferred generic closures/local generic
+functions work within bounded inference; exact typed inputs/seeds must resolve
+all variables, with ambiguity diagnosed rather than defaulted/coerced. Ordinary
+recursive array independence remains intact through structs/union payloads;
+function/closure copies share environments and mutable cells. No aliasing pointer
+mutation or error/panic catching is added; callback failures propagate normally.
+`examples/array-helpers.nov` contains a runnable example and six tests; see README
+and `lib/README.md` for the `let array = std.array` alias and output. Native and
+four-target release builds, helper CLI **66/66 steps**, focused non-storable-result
+regressions, formatting and diff checks pass. Inferred []void and function void
+parameters now diagnose before IR interning; arrays of void-returning functions
+remain valid. Full Debug/ReleaseSafe suites were not rerun for this slice.
 
 Generic closures and local generic functions are implemented. Both ``(value: `T) -> `T { ... }`` expressions and
 local ``let identity: (value: `T) -> `T = { value }`` declarations support direct
@@ -855,7 +881,11 @@ See [1](https://docs.vlang.io/v-types.html#array-methods)
 ```
 
 # Higher-order functions
-Highly experimental syntax
+
+`std.array.map`, `std.array.filter` and seeded left-fold `std.array.fold` are
+implemented as ordinary library functions; see the current status above.
+The method-chain, `reduce` and lambda syntax below remains a highly experimental
+proposal, not the executable helper API.
 ```nov
 ; Traditional imperative loop
 let num_list = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]

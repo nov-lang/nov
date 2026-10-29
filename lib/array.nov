@@ -1,0 +1,28 @@
+@[public]
+let map: (items: []`T, convert: (`T) -> `U) -> []`U = {
+    let mut result: []`U = []
+    loop item in items {
+        result += [convert(item)]
+    }
+    result
+}
+
+@[public]
+let filter: (items: []`T, predicate: (`T) -> bool) -> []`T = {
+    let mut result: []`T = []
+    loop item in items {
+        if predicate(item) {
+            result += [item]
+        }
+    }
+    result
+}
+
+@[public]
+let fold: (items: []`T, initial: `U, combine: (`U, `T) -> `U) -> `U = {
+    let mut result: `U = initial
+    loop item in items {
+        result = combine(result, item)
+    }
+    result
+}

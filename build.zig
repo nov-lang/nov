@@ -145,6 +145,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const storable_array_tests = b.step("test-cli-storable-arrays", "Run storable array CLI tests");
     addStorableArrayCliTests(b, exe, storable_array_tests);
     test_step.dependOn(storable_array_tests);
+    const array_helper_tests = b.step("test-cli-array-helpers", "Run standard-library array helper CLI tests");
+    addArrayHelperCliTests(b, exe, array_helper_tests);
+    test_step.dependOn(array_helper_tests);
     const constructor_shorthand_tests = b.step("test-cli-constructor-shorthand", "Run constructor field shorthand CLI tests");
     addConstructorShorthandCliTests(b, exe, constructor_shorthand_tests);
     test_step.dependOn(constructor_shorthand_tests);
@@ -2350,6 +2353,177 @@ fn addStorableArrayCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_st
         check.expectStdErrMatch("error:");
         check.expectStdErrMatch(case.diagnostic);
         test_step.dependOn(&check.step);
+    }
+}
+
+fn addArrayHelperCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    const fixtures = b.addWriteFiles();
+    const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
+    _ = fixtures.add("array-helpers.nov", @embedFile("examples/array-helpers.nov"));
+    _ = fixtures.add("api.nov",
+        \\@[public]
+        \\let array = @import("std").array
+        \\@[public]
+        \\let map = array.map
+        \\@[public]
+        \\let filter = @import("lib/array.nov").filter
+        \\@[public]
+        \\let fold = array.fold
+        \\
+    );
+    _ = fixtures.add("aliases.nov",
+        \\let standard = @import("std")
+        \\let array = standard.array
+        \\let direct = @import("lib/array.nov")
+        \\let api = @import("api.nov")
+        \\let map = api.map
+        \\let filter = api.filter
+        \\let fold = api.fold
+        \\let identity: (value: `T) -> `T = value
+        \\let verify: () = {
+        \\    let items: []int = [1, 2, 3]
+        \\    let callable: ([]int, (int) -> int) -> []int = array.map
+        \\    let select: ([]int, (int) -> bool) -> []int = direct.filter
+        \\    let reduce: ([]int, int, (int, int) -> int) -> int = api.fold
+        \\    let mapped = map(items, identity)
+        \\    let copied = callable(mapped, identity)
+        \\    let keep = (value: int) -> bool { value > 1 }
+        \\    let selected = filter(copied, keep)
+        \\    let again = select(selected, keep)
+        \\    let subtract = (total: int, value: int) -> int { total - value }
+        \\    @assert(fold(again, @as(int, 10), subtract) == 5)
+        \\    @assert(reduce(items, @as(int, 10), subtract) == 4)
+        \\    @assert(direct.map([true, false], identity)[0])
+        \\    @assert(api.array.map(["public"], identity)[0] == "public")
+        \\    let mut events: int = 0
+        \\    let mut source: []int = [1, 2]
+        \\    let getFilter = () -> ([]int, (int) -> bool) -> []int {
+        \\        events = events * 10 + 1
+        \\        array.filter
+        \\    }
+        \\    let frozen = getFilter()(
+        \\        {
+        \\            events = events * 10 + 2
+        \\            source
+        \\        },
+        \\        {
+        \\            events = events * 10 + 3
+        \\            source[0] = 9
+        \\            (value: int) -> bool {
+        \\                events = events * 10 + value
+        \\                source[1] = 8
+        \\                true
+        \\            }
+        \\        }
+        \\    )
+        \\    @assert(events == 12312)
+        \\    @assert(frozen[0] == 1 and frozen[1] == 2)
+        \\    @assert(source[0] == 9 and source[1] == 8)
+        \\    @println(copied[0], again[0], again[1])
+        \\}
+        \\@[test]
+        \\let import_aliases_and_callable_generics: () = verify()
+        \\let main: () = verify()
+        \\
+    );
+    // Namespace-only modules need semantic checking, not output compilation.
+    for ([_][]const u8{ "array-helpers.nov", "lib/std.nov", "lib/array.nov", "api.nov", "aliases.nov" }) |source| {
+        for ([_]bool{ false, true }) |semantic| {
+            if (!semantic and (std.mem.eql(u8, source, "api.nov") or std.mem.eql(u8, source, "aliases.nov"))) continue;
+            const check = b.addRunArtifact(exe);
+            check.step.name = b.fmt("CLI array helpers: {s} {s}", .{ if (semantic) "semantic" else "fmt", source });
+            check.setCwd(fixtures.getDirectory());
+            check.addArgs(if (semantic) &.{ "check", "--semantic", source } else &.{ "fmt", "--check", source });
+            if (semantic) {
+                check.addArg("--lib-dir");
+                check.addDirectoryArg(library);
+            }
+            check.expectExitCode(0);
+            check.expectStdOutEqual("");
+            check.expectStdErrEqual("");
+            test_step.dependOn(&check.step);
+        }
+    }
+    const example_output = "Mapped: 2 4 6 8\nFiltered: 6 8\nFolded: 14\n";
+    const example_tests = "PASS map_types_and_generic_callbacks\nPASS filter_order_and_exact_calls\nPASS fold_left_seed_and_empty\nPASS recursive_array_record_and_union_copies\nPASS function_elements_share_environments\nPASS argument_order_captures_and_snapshots\n6 passed; 0 failed; 6 total\n";
+    const package = b.addWriteFiles();
+    const installed_exe = package.addCopyFile(exe.getEmittedBin(), b.fmt("bin/{s}", .{exe.out_filename}));
+    _ = package.addCopyDirectory(b.path("lib"), "lib/nov", .{});
+    for ([_]bool{ false, true }) |installed| {
+        for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+            for ([_][]const u8{ "run", "test" }) |command| {
+                for ([_][]const u8{ "array-helpers.nov", "aliases.nov" }) |source| {
+                    const run = if (installed) std.Build.Step.Run.create(b, "CLI array helpers: relocated install") else b.addRunArtifact(exe);
+                    run.step.name = b.fmt("CLI array helpers: {s} {s} {s} ({s}, installed={})", .{ command, source, mode, if (installed) "default library" else "explicit library", installed });
+                    if (installed) run.addFileArg(installed_exe);
+                    run.setCwd(fixtures.getDirectory());
+                    run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+                    run.setEnvironmentVariable("NOV_CC", "");
+                    run.setEnvironmentVariable("CC", "");
+                    run.addArgs(&.{ command, source });
+                    if (mode.len != 0) run.addArg(mode);
+                    if (!installed) {
+                        run.addArg("--lib-dir");
+                        run.addDirectoryArg(library);
+                    }
+                    const is_test = std.mem.eql(u8, command, "test");
+                    const example = std.mem.eql(u8, source, "array-helpers.nov");
+                    run.expectExitCode(0);
+                    run.expectStdOutEqual(if (example) (if (is_test) example_tests else example_output) else if (is_test) "1 2 3\nPASS import_aliases_and_callable_generics\n1 passed; 0 failed; 1 total\n" else "1 2 3\n");
+                    run.expectStdErrEqual("");
+                    test_step.dependOn(&run.step);
+                }
+            }
+        }
+    }
+    for ([_]struct { name: []const u8, source: []const u8, diagnostic: []const u8 }{
+        .{ .name = "map-parameter", .source = "std.array.map(@as([]int,[1]),(x:bool)->bool{x})", .diagnostic = "generic function constraints require exactly identical types" },
+        .{ .name = "map-arity", .source = "std.array.map(@as([]int,[1]),(x:int,y:int)->int{x+y})", .diagnostic = "generic function constraints require exactly identical types" },
+        .{ .name = "filter-result", .source = "std.array.filter(@as([]int,[1]),(x:int)->int{x})", .diagnostic = "generic function constraints require exactly identical types" },
+        .{ .name = "filter-parameter", .source = "std.array.filter(@as([]int,[1]),(x:bool)->bool{x})", .diagnostic = "generic function constraints require exactly identical types" },
+        .{ .name = "fold-result", .source = "std.array.fold(@as([]int,[1]),@as(int,0),(a:int,x:int)->bool{true})", .diagnostic = "generic function constraints require exactly identical types" },
+        .{ .name = "fold-arity", .source = "std.array.fold(@as([]int,[1]),@as(int,0),(x:int)->int{x})", .diagnostic = "generic function constraints require exactly identical types" },
+        .{ .name = "map-empty", .source = "std.array.map([],identity)", .diagnostic = "provide typed runtime arguments" },
+        .{ .name = "filter-empty", .source = "std.array.filter([],(x:`T)->bool{true})", .diagnostic = "provide typed runtime arguments" },
+        .{ .name = "fold-empty", .source = "std.array.fold([],@as(int,0),(a:int,x:`T)->int{a})", .diagnostic = "provide typed runtime arguments" },
+        .{ .name = "fold-untyped-initial", .source = "std.array.fold(@as([]int,[1]),0,(a:`U,x:int)->`U{a})", .diagnostic = "provide typed runtime arguments" },
+        .{ .name = "map-void", .source = "std.array.map(@as([]int,[1]),(x:int)->void{})", .diagnostic = "this type is not supported in semantic analysis yet" },
+    }) |case| {
+        const source = b.fmt("invalid-array-helper-{s}.nov", .{case.name});
+        _ = fixtures.add(source, b.fmt("let std=@import(\"std\")\nlet identity:(x:`T)->`T=x\nlet main:()={{let value={s}\n}}\n", .{case.source}));
+        const check = b.addRunArtifact(exe);
+        check.step.name = b.fmt("CLI array helpers: reject {s}", .{case.name});
+        check.setCwd(fixtures.getDirectory());
+        check.addArgs(&.{ "check", "--semantic", source, "--lib-dir" });
+        check.addDirectoryArg(library);
+        check.expectExitCode(1);
+        check.expectStdOutEqual("");
+        check.expectStdErrMatch(".nov:");
+        check.expectStdErrMatch("error:");
+        check.expectStdErrMatch(case.diagnostic);
+        test_step.dependOn(&check.step);
+    }
+    for ([_][]const u8{ "map", "filter", "fold" }) |helper| {
+        const source = b.fmt("panic-array-helper-{s}.nov", .{helper});
+        const callback = if (std.mem.eql(u8, helper, "fold")) "(total:int,value:int)->int" else if (std.mem.eql(u8, helper, "filter")) "(value:int)->bool" else "(value:int)->int";
+        _ = fixtures.add(source, b.fmt("let std=@import(\"std\")\nlet verify:()={{let value=std.array.{s}(@as([]int,[1,2]),{s}{s}{{@print(value)\n@panic(\"{s} callback\")}})\n@println(\"unreachable\")}}\n@[test]\nlet callback_panic:()=verify()\nlet main:()=verify()\n", .{ helper, if (std.mem.eql(u8, helper, "fold")) "@as(int,0)," else "", callback, helper }));
+        for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+            for ([_][]const u8{ "run", "test" }) |command| {
+                const run = b.addRunArtifact(exe);
+                run.step.name = b.fmt("CLI array helpers: {s} {s} panic ({s})", .{ command, helper, mode });
+                run.setCwd(fixtures.getDirectory());
+                run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+                run.setEnvironmentVariable("NOV_CC", "");
+                run.setEnvironmentVariable("CC", "");
+                run.addArgs(&.{ command, source, "--lib-dir" });
+                run.addDirectoryArg(library);
+                if (mode.len != 0) run.addArg(mode);
+                run.expectExitCode(1);
+                run.expectStdOutEqual(if (std.mem.eql(u8, command, "test")) "1FAIL callback_panic (exit 1)\n0 passed; 1 failed; 1 total\n" else "1");
+                run.expectStdErrEqual(b.fmt("panic: {s} callback\n", .{helper}));
+                test_step.dependOn(&run.step);
+            }
+        }
     }
 }
 

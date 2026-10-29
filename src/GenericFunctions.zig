@@ -1025,10 +1025,23 @@ const Solver = struct {
             .unknown, .never => null,
             .link => unreachable,
             .known => |ty| ty,
-            .array => |element| if (try self.materialize(element, depth + 1)) |ty| try self.ir.internType(.{ .array = ty }) else null,
+            .array => |element| blk: {
+                const ty = (try self.materialize(element, depth + 1)) orelse break :blk null;
+                if (!Ir.isArrayElement(self.ir.getType(ty).?)) {
+                    try self.fail(.unsupported_type, self.call_span, t.span);
+                    break :blk null;
+                }
+                break :blk try self.ir.internType(.{ .array = ty });
+            },
             .function => |f| blk: {
                 const params = try self.allocator.alloc(Ir.TypeId, f.params.len);
-                for (f.params, params) |param, *out| out.* = (try self.materialize(param, depth + 1)) orelse break :blk null;
+                for (f.params, params) |param, *out| {
+                    out.* = (try self.materialize(param, depth + 1)) orelse break :blk null;
+                    if (self.ir.getType(out.*).? == .void) {
+                        try self.fail(.invalid_parameter_type, self.call_span, param.span);
+                        break :blk null;
+                    }
+                }
                 const result = (try self.materialize(f.result, depth + 1)) orelse break :blk null;
                 break :blk try self.ir.internType(.{ .function = .{ .params = params, .result = result } });
             },
@@ -1041,6 +1054,158 @@ const Solver = struct {
         };
     }
 };
+
+fn testNonStorableInference(allocator: std.mem.Allocator, source: []const u8, tag: Module.Diagnostic.Tag) !void {
+    var module = try Module.init(allocator, "non-storable.nov", source);
+    defer module.deinit();
+    try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
+    const count = module.declarations.items.len;
+    var sema = Lowering.lower(&module) catch |err| {
+        try std.testing.expectEqual(error.OutOfMemory, err);
+        try std.testing.expectEqual(count, module.declarations.items.len);
+        try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+        return err;
+    };
+    defer sema.deinit();
+    try std.testing.expect(!sema.lowering_complete);
+    try std.testing.expectEqual(count, module.declarations.items.len);
+    var found = false;
+    for (module.diagnostics.items) |diagnostic| if (diagnostic.tag == tag) {
+        try std.testing.expect(diagnostic.span.end > diagnostic.span.start);
+        try std.testing.expect(module.sourceSlice(diagnostic.span) != null);
+        found = true;
+    };
+    if (!found) std.debug.print("non-storable {s}: {any}\n", .{ source, module.diagnostics.items });
+    try std.testing.expect(found);
+    try sema.ir.verify();
+}
+
+test "non-storable array inference diagnoses before publication and rolls back OOM" {
+    const map = "let map:(items:[]`T,convert:(`T)->`U)->[]`U=[]\n";
+    for ([_]struct { source: []const u8, tag: Module.Diagnostic.Tag }{
+        .{ .source = map ++ "let main:()={let result=map(@as([]int,[1]),(value:int)->void{})\n}", .tag = .unsupported_type },
+        .{ .source = "let make:(f:()->`T)->[]`T=[]\nlet main:()={let result=make(()->void{})\n}", .tag = .unsupported_type },
+        .{ .source = "let make:(f:()->`T)->[][]`T=[]\nlet main:()={let result=make(()->void{})\n}", .tag = .unsupported_type },
+        .{ .source = "let make:(f:()->`T)->`U=[f()]\nlet main:()={let result=make(()->void{})\n}", .tag = .unsupported_type },
+        .{ .source = "let make:(f:()->`T)->`U=[[f()]]\nlet main:()={let result=make(()->void{})\n}", .tag = .unsupported_type },
+        .{ .source = "let make:(f:()->`T)->`U=(value:`T)->void{}\nlet main:()={let result=make(()->void{})\n}", .tag = .invalid_parameter_type },
+        .{ .source = map ++ "let main:()={let result=map(@as([]int,[1]),(value:int)->type{int})\n}", .tag = .unsupported_type },
+        .{ .source = "let main:()={let result:[]void=[]\n}", .tag = .unsupported_type },
+    }) |case| {
+        try testNonStorableInference(std.testing.allocator, case.source, case.tag);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testNonStorableInference, .{ case.source, case.tag });
+    }
+}
+
+fn testNonStorableProbe(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "probe-array.nov",
+        \\let make:(f:()->`T)->[][]`T=[]
+    );
+    defer module.deinit();
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    ir.source_len = @intCast(module.source.ast.source.len);
+    const unit = try ir.internType(.void);
+    const callback = try ir.internType(.{ .function = .{ .params = &.{}, .result = unit } });
+    const id = module.lookup("make").?;
+    const ref: Ref = .{ .module = &module, .id = id };
+    const count = module.declarations.items.len;
+    for (0..2) |_| {
+        try std.testing.expectEqual(@as(?Ir.TypeId, null), try probeResult(&module, &ir, ref, &.{.{ .ty = callback, .span = ref.span() }}, ref.span()));
+        try std.testing.expectEqual(count, module.declarations.items.len);
+        try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+        try std.testing.expectEqual(@as(usize, 0), ir.functions.items.len);
+        try std.testing.expectEqual(@as(usize, 0), ir.local_generic_instances.items.len);
+        const proto = module.source.ast.declFunction(module.getDeclaration(id).?.node).?.proto_node;
+        try std.testing.expectEqual(@as(?Ir.TypeId, null), try TypeResolver.resolveInScopeReadOnly(&module, &ir, proto, null, null, &.{.{ .name = "`T", .ty = unit }}));
+        try std.testing.expectEqual(Module.Diagnostic.Tag.unsupported_type, module.diagnostics.items[0].tag);
+        module.diagnostics.clearRetainingCapacity();
+        try ir.verify();
+    }
+}
+
+test "non-storable array readonly probes do not publish under OOM" {
+    try testNonStorableProbe(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testNonStorableProbe, .{});
+}
+
+fn testNonStorableImport(allocator: std.mem.Allocator, path: []const u8, lib: []const u8, tag: ?Module.Diagnostic.Tag) !void {
+    var comp = try Compilation.load(allocator, std.testing.io, path, .{ .lib_dir = lib });
+    defer comp.deinit();
+    try std.testing.expect(!comp.hasErrors());
+    const count = comp.declarations.items.len;
+    var sema = Lowering.lowerCompilation(&comp) catch |err| {
+        try std.testing.expectEqual(error.OutOfMemory, err);
+        try std.testing.expectEqual(count, comp.declarations.items.len);
+        for (comp.modules.items) |module| {
+            try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+            for (module.declarations.items) |decl| try std.testing.expect(decl.function_template == null and decl.concrete_type == null);
+        }
+        return err;
+    };
+    defer sema.deinit();
+    if (tag) |expected| {
+        try std.testing.expect(!sema.lowering_complete);
+        try std.testing.expectEqual(count, comp.declarations.items.len);
+        var found = false;
+        for (comp.modules.items) |module| for (module.diagnostics.items) |diagnostic| {
+            if (diagnostic.tag != expected) continue;
+            const owner = comp.getModule(diagnostic.span.source).?;
+            try std.testing.expect(diagnostic.span.end > diagnostic.span.start);
+            try std.testing.expect(owner.sourceSlice(diagnostic.span) != null);
+            found = true;
+        };
+        try std.testing.expect(found);
+    } else {
+        if (comp.hasErrors()) for (comp.modules.items) |module| std.debug.print("array import {s}: {any}\n", .{ module.source.path, module.diagnostics.items });
+        try std.testing.expect(!comp.hasErrors());
+        try std.testing.expect(sema.lowering_complete);
+    }
+    try sema.ir.verify();
+}
+
+test "non-storable array real imports diagnose and preserve void returning function elements" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "producer.nov", .data =
+        \\@[public]
+        \\let make:(f:()->`T)->[]`T=[]
+        \\@[public]
+        \\let nested:(f:()->`T)->[][]`T=[]
+        \\@[public]
+        \\let inferred:(f:()->`T)->`U=[f()]
+        \\@[public]
+        \\let callback:(f:()->`T)->`U=(value:`T)->void{}
+    });
+    const lib = try std.Io.Dir.cwd().realPathFileAlloc(io, "lib", allocator);
+    defer allocator.free(lib);
+    for ([_]struct { source: []const u8, tag: ?Module.Diagnostic.Tag }{
+        .{ .source = "let std=@import(\"std\")\nlet main:()={let result=std.array.map(@as([]int,[1]),(value:int)->void{})\n}", .tag = .unsupported_type },
+        .{ .source = "let p=@import(\"producer.nov\")\nlet main:()={let result=p.make(()->void{})\n}", .tag = .unsupported_type },
+        .{ .source = "let p=@import(\"producer.nov\")\nlet main:()={let result=p.nested(()->void{})\n}", .tag = .unsupported_type },
+        .{ .source = "let p=@import(\"producer.nov\")\nlet main:()={let result=p.inferred(()->void{})\n}", .tag = .unsupported_type },
+        .{ .source = "let p=@import(\"producer.nov\")\nlet main:()={let result=p.callback(()->void{})\n}", .tag = .invalid_parameter_type },
+        .{ .source = "let std=@import(\"std\")\nlet main:()={let result=std.array.map(@as([]int,[1]),(value:int)->type{int})\n}", .tag = .unsupported_type },
+        .{ .source =
+        \\let std=@import("std")
+        \\let main:()={
+        \\let numbers=std.array.map(@as([]int,[1]),(value:int)->int{value+1})
+        \\let callbacks=std.array.map(numbers,(value:int)->()->void{()->void{}})
+        \\let recovered=std.array.map(callbacks,(f:()->void)->int{f()
+        \\1})
+        \\@println(recovered[0])
+        \\}
+        , .tag = null },
+    }) |case| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "main.nov", .data = case.source });
+        const path = try tmp.dir.realPathFileAlloc(io, "main.nov", allocator);
+        defer allocator.free(path);
+        try testNonStorableImport(allocator, path, lib, case.tag);
+        if (case.tag != null) try TestAllocations.checkAllAllocationFailures(allocator, testNonStorableImport, .{ path, lib, case.tag });
+    }
+}
 
 test "backtick generic function rejects ambiguous conflicting unbound and unsupported uses" {
     const prefix = "let add:(x:`a,y:`b)->`c=x+y\nlet id:(x:`T)->`T=x\n";
