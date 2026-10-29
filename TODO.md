@@ -522,6 +522,10 @@ implemented; grapheme operations remain deferred.
   - [x] `{expression}` interpolation (including nested calls) for bool/fixed/native integers/rune variables/strings;
     decimal boundaries, UTF-8/NUL, rooted temporaries and formatter preservation
   - blocks/control flow/quoted literals/formats/captures and global interpolation remain unsupported
+  - proposal (not accepted or implemented): escape literal interpolation braces with
+    `{{` → `{` and `}}` → `}`, instead of `\{` and `\}`; `"{{}}"` would produce `"{}"`.
+    Current backslash escapes remain supported behavior; compatibility/deprecation
+    rules are undecided.
   - [x] allocation-free O(n) scalar indexing returns exact rune, with int/negative indices and all-mode bounds panics
   - [x] allocation-free O(n) `.len` counts scalars, not UTF-8 bytes or graphemes
   - [x] half-open/inclusive scalar slicing with native int/negative bounds, all-mode panics and allocation-free shared-owner views
