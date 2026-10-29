@@ -760,21 +760,30 @@ const Context = struct {
             try self.module.diagnostics.append(self.module.allocator, .{ .tag = .test_not_callable, .span = self.getDeclaration(id).name_span });
             return null;
         }
-        const ty = (if (self.sema) |analysis| blk: {
-            if (!self.probing) break :blk try analysis.requestType(owner, self.localId(id));
-            const index = analysis.entryIndex(owner, self.localId(id));
-            if (index < analysis.entries.len) if (analysis.entries[index].type_id) |known| break :blk known;
+        const ty = (if (self.probing) blk: {
+            if (self.sema) |analysis| {
+                const index = analysis.entryIndex(owner, self.localId(id));
+                if (index < analysis.entries.len) if (analysis.entries[index].type_id) |known| break :blk known;
+            } else if (@backingInt(id) < self.types.len) {
+                if (self.types[@backingInt(id)]) |known| break :blk known;
+            }
+            // Isolated flow queries intentionally have no mutable Sema. A cold
+            // ordinary factory still has a readable signature in its source.
             const declaration = self.getDeclaration(id);
             if (declaration.is_type_alias or declaration.is_generic or declaration.is_namespace) break :blk null;
             const function = owner.source.ast.declFunction(declaration.node) orelse break :blk null;
             break :blk try TypeResolver.resolveInScopeReadOnly(owner, self.ir, function.proto_node, declaration.container, declaration.concrete_type, declaration.function_bindings);
-        } else if (@backingInt(id) < self.types.len) self.types[@backingInt(id)] else null) orelse return null;
+        } else if (self.sema) |analysis| try analysis.requestType(owner, self.localId(id)) else if (@backingInt(id) < self.types.len) self.types[@backingInt(id)] else null) orelse return null;
         const full = owner.source.ast.decl(self.getDeclaration(id).node);
         return .{ .ty = ty, .annotation = if (full.ast.type_node != 0) owner.tokenSpan(owner.source.ast.firstToken(full.ast.type_node)) else null };
     }
 
     fn genericTarget(self: *Context, node: Ast.Node.Index) Error!?GenericFunctions.Ref {
         const ast = &self.module.source.ast;
+        if (ast.nodes.items(.tag)[node] == .field_access) {
+            const base = ast.nodes.items(.data)[node].lhs;
+            if (ast.nodes.items(.tag)[base] == .identifier and self.lookupBinding(ast.tokenSlice(ast.firstToken(base))) != null) return null;
+        }
         if (ast.nodes.items(.tag)[node] == .identifier) {
             const name = ast.tokenSlice(ast.firstToken(node));
             if (self.lookupBinding(name) != null) return null;
@@ -826,27 +835,366 @@ const Context = struct {
         return .{ .ty = signature, .noreturn = declaration.noreturn, .span = declaration.name_span };
     }
 
+    // Abstract exits are relative to the nearest loop. Sequencing visits only
+    // live paths; alternatives retain every possible exit. A loop consumes its
+    // own controls, while its exhaustion expression remains in the parent scope.
+    const Flow = struct {
+        live: bool = true,
+        breaks: bool = false,
+        continues: bool = false,
+        unknown: bool = false,
+
+        fn then(a: Flow, b: Flow) Flow {
+            if (!a.live) return a;
+            return .{ .live = b.live, .breaks = a.breaks or b.breaks, .continues = a.continues or b.continues, .unknown = a.unknown or b.unknown };
+        }
+
+        fn either(a: Flow, b: Flow) Flow {
+            return .{ .live = a.live or b.live, .breaks = a.breaks or b.breaks, .continues = a.continues or b.continues, .unknown = a.unknown or b.unknown };
+        }
+    };
+
+    const FlowQuery = struct {
+        context: Context,
+        known: std.AutoHashMapUnmanaged(Ast.Node.Index, Known) = .empty,
+
+        fn typeOf(q: *FlowQuery, node: Ast.Node.Index, depth: usize) Error!?Known {
+            if (node == 0 or depth >= max_recursive_depth) return null;
+            if (q.known.get(node)) |known| return known;
+            const known = (try q.typeOfUncached(node, depth)) orelse return null;
+            try q.known.put(q.context.module.allocator, node, known);
+            return known;
+        }
+
+        fn typeOfUncached(q: *FlowQuery, node: Ast.Node.Index, depth: usize) Error!?Known {
+            const c = &q.context;
+            const ast = &c.module.source.ast;
+            const data = ast.nodes.items(.data)[node];
+            if (ast.nodes.items(.tag)[node] == .field_access) {
+                if (try q.typeOf(data.lhs, depth + 1)) |base| {
+                    if (try q.fieldType(base.ty, ast.tokenSlice(data.rhs))) |field| return field;
+                }
+            }
+            switch (ast.nodes.items(.tag)[node]) {
+                .call, .call_one => {
+                    const call = ast.fullCall(node).?;
+                    if (ast.nodes.items(.tag)[call.ast.fn_expr] == .field_access) {
+                        const field = ast.nodes.items(.data)[call.ast.fn_expr];
+                        if (try q.typeOf(field.lhs, depth + 1)) |receiver| {
+                            if (c.receiverGeneric(receiver.ty, ast.tokenSlice(field.rhs))) |ref| {
+                                if (try c.genericProbe(node, call, ref, .{ .ty = receiver.ty, .span = c.irSpan(field.lhs) }, depth + 1)) |result| return .{ .ty = result };
+                            } else if (try c.probeReceiverSignature(receiver.ty, ast.tokenSlice(field.rhs))) |signature| {
+                                return .{ .ty = c.ir.getType(signature.ty).?.function.result };
+                            }
+                        }
+                    } else if (try q.typeOf(call.ast.fn_expr, depth + 1)) |callee| {
+                        if (c.ir.getType(callee.ty).? == .function) return .{ .ty = c.ir.getType(callee.ty).?.function.result };
+                    }
+                },
+                .array_access => if (try q.typeOf(data.lhs, depth + 1)) |base| {
+                    if (c.ir.getType(base.ty).? == .array) return .{ .ty = c.ir.getType(base.ty).?.array };
+                },
+                .ref_of => return q.typeOf(data.rhs, depth + 1),
+                else => {},
+            }
+            return c.probe(node, depth);
+        }
+
+        fn fieldType(q: *FlowQuery, ty: Ir.TypeId, name: []const u8) Error!?Known {
+            const c = &q.context;
+            const nominal = c.ir.getType(ty).?;
+            if (nominal != .record) return null;
+            for (nominal.record.fields) |field| if (std.mem.eql(u8, field.name, name)) return .{ .ty = field.ty };
+            // Ordinary nominal layouts can still be cold. Read their field
+            // annotations in the defining scope without completing a layout.
+            const owner = if (c.module.compilation) |comp| comp.getModule(nominal.record.source).? else c.module;
+            const id: Module.DeclId = @fromBackingInt(@intCast(nominal.record.identity));
+            const ast = &owner.source.ast;
+            const container = owner.getDeclaration(id).?;
+            for (ast.fullStruct(ast.decl(container.node).ast.init_node).?) |member| {
+                if (ast.nodes.items(.tag)[member] != .container_field or !std.mem.eql(u8, ast.tokenSlice(ast.firstToken(member)), name)) continue;
+                const type_node = ast.nodes.items(.data)[member].lhs;
+                const field_ty = if (type_node == 0) try c.ir.internType(.void) else (try TypeResolver.resolveInScopeReadOnly(owner, c.ir, type_node, id, if (nominal.record.type_args.len == 0) null else @backingInt(ty), &.{})) orelse return null;
+                return .{ .ty = field_ty };
+            }
+            return null;
+        }
+
+        fn sequence(q: *FlowQuery, nodes: []const Ast.Node.Index, depth: usize) Error!Flow {
+            var result: Flow = .{};
+            for (nodes) |node| {
+                if (!result.live) break;
+                result = result.then(try q.expression(node, depth + 1));
+            }
+            return result;
+        }
+
+        fn declaration(q: *FlowQuery, node: Ast.Node.Index, depth: usize) Error!Flow {
+            const c = &q.context;
+            const ast = &c.module.source.ast;
+            const decl = ast.decl(node).ast;
+            const function = ast.declFunction(node);
+            const flow = if (function != null) Flow{} else try q.expression(decl.init_node, depth + 1);
+            if (flow.live) {
+                const known = if (decl.type_node != 0)
+                    if (try c.resolveType(decl.type_node)) |ty| Known{ .ty = ty } else null
+                else
+                    try q.typeOf(decl.init_node, depth + 1);
+                if (known) |ty| {
+                    const token = decl.let_token + 1 + @as(u32, @intFromBool(decl.is_mutable));
+                    try c.bindLocal(ast.tokenSlice(token), .{ .known = ty, .name_span = c.module.tokenSpan(token), .initializer = decl.init_node, .mutable = decl.is_mutable });
+                }
+            }
+            return flow;
+        }
+
+        fn loop(q: *FlowQuery, node: Ast.Node.Index, depth: usize) Error!Flow {
+            const ast = &q.context.module.source.ast;
+            const parts = ast.fullLoop(node).?;
+            const condition = try q.expression(parts.condition, depth + 1);
+            // These are independently checked regions in BodyChecker, even if
+            // an earlier region exits. Their breaks all belong to this loop.
+            const body = try q.expression(parts.body, depth + 1);
+            const continuation = try q.expression(parts.continuation, depth + 1);
+            const exhaustion = try q.expression(parts.else_expr, depth + 1);
+            const has_break = condition.breaks or body.breaks or continuation.breaks;
+            const unknown = condition.unknown or body.unknown or continuation.unknown or exhaustion.unknown;
+            return .{
+                .unknown = unknown,
+                .live = unknown or !loopTerminates(!condition.live and !condition.breaks, parts.condition == 0, parts.else_expr != 0 and !exhaustion.live, has_break),
+                .breaks = exhaustion.breaks,
+                .continues = exhaustion.continues,
+            };
+        }
+
+        fn rangeLoop(q: *FlowQuery, node: Ast.Node.Index, depth: usize) Error!Flow {
+            const c = &q.context;
+            const ast = &c.module.source.ast;
+            const parts = ast.fullRange(node).?;
+            const source = try q.expression(parts.source, depth + 1);
+            if (!source.live) return source;
+            const scope = c.locals.items.len;
+            const by_ref = ast.nodes.items(.tag)[parts.binding] == .ref_of;
+            const binding = if (by_ref) ast.nodes.items(.data)[parts.binding].rhs else parts.binding;
+            const token = ast.nodes.items(.main_token)[binding];
+            if (try q.typeOf(parts.source, depth + 1)) |known| {
+                const element: ?Ir.TypeId = switch (c.ir.getType(known.ty).?) {
+                    .array => |ty| ty,
+                    .range => |ty| ty,
+                    .string => try c.ir.internType(.rune),
+                    else => null,
+                };
+                if (element) |ty| try c.bindLocal(ast.tokenSlice(token), .{ .known = .{ .ty = ty }, .name_span = c.module.tokenSpan(token) });
+            }
+            const body = try q.expression(parts.body, depth + 1);
+            c.restoreScope(scope);
+            const exhaustion = try q.expression(parts.else_expr, depth + 1);
+            const unknown = body.unknown or exhaustion.unknown;
+            return source.then(.{ .live = unknown or !rangeLoopTerminates(parts.else_expr != 0 and !exhaustion.live, body.breaks), .breaks = exhaustion.breaks, .continues = exhaustion.continues, .unknown = unknown });
+        }
+
+        fn expression(q: *FlowQuery, node: Ast.Node.Index, depth: usize) Error!Flow {
+            if (node == 0) return .{};
+            // Query depth counts AST edges, not checker expression frames.
+            // Exhausting it proves nothing about control flow or owned breaks.
+            if (depth >= max_recursive_depth) return .{ .unknown = true };
+            const c = &q.context;
+            const ast = &c.module.source.ast;
+            const data = ast.nodes.items(.data)[node];
+            switch (ast.nodes.items(.tag)[node]) {
+                .@"return", .@"break", .@"continue" => {
+                    const is_continue = ast.nodes.items(.tag)[node] == .@"continue";
+                    const value = if (is_continue) Flow{} else try q.expression(data.rhs, depth + 1);
+                    return value.then(.{ .live = false, .breaks = ast.nodes.items(.tag)[node] == .@"break", .continues = is_continue });
+                },
+                .decl => return q.declaration(node, depth),
+                .function_expr, .fn_proto, .fn_proto_one => return .{},
+                .block, .block_two, .block_newline, .block_two_newline => {
+                    const scope = c.locals.items.len;
+                    defer c.restoreScope(scope);
+                    var buffer: [2]Ast.Node.Index = undefined;
+                    const statements = ast.fullBlock(&buffer, node).?.ast.statements;
+                    const flow = try q.sequence(statements, depth);
+                    if (flow.live and statements.len != 0) {
+                        if (try q.typeOf(statements[statements.len - 1], depth + 1)) |known| try q.known.put(c.module.allocator, node, known);
+                    }
+                    return flow;
+                },
+                .@"if", .if_else => {
+                    const branch = ast.fullIf(node).?.ast;
+                    const condition = try q.expression(branch.cond_expr, depth + 1);
+                    if (!condition.live) return condition;
+                    return condition.then((try q.expression(branch.then_expr, depth + 1)).either(try q.expression(branch.else_expr, depth + 1)));
+                },
+                .match => {
+                    const match = ast.fullMatch(node).?.ast;
+                    const subjects = try q.sequence(match.subjects, depth);
+                    if (!subjects.live) return subjects;
+                    var prongs: Flow = .{ .live = false };
+                    for (match.cases) |case| {
+                        const scope = c.locals.items.len;
+                        defer c.restoreScope(scope);
+                        const prong = ast.fullMatchCase(case).?.ast;
+                        if (prong.capture_token) |token| {
+                            if (match.subjects.len == 1 and prong.values.len == 1 and ast.nodes.items(.tag)[prong.values[0]] == .enum_literal) {
+                                if (try q.typeOf(match.subjects[0], depth + 1)) |known| {
+                                    const name = ast.tokenSlice(ast.nodes.items(.main_token)[prong.values[0]]);
+                                    if (try q.fieldType(known.ty, name)) |payload| try c.bindLocal(ast.tokenSlice(token), .{ .known = payload, .name_span = c.module.tokenSpan(token) });
+                                }
+                            }
+                        }
+                        prongs = prongs.either(try q.expression(prong.target_expr, depth + 1));
+                    }
+                    // Exhaustiveness and capture validity remain the ordinary
+                    // checker's responsibility, not speculative flow inference.
+                    return subjects.then(prongs);
+                },
+                .loop_condition, .loop_cont, .loop_else => return q.loop(node, depth),
+                .loop_range => return q.rangeLoop(node, depth),
+                .bool_and, .bool_or => {
+                    const lhs = try q.expression(data.lhs, depth + 1);
+                    if (!lhs.live) return lhs;
+                    return lhs.then((Flow{}).either(try q.expression(data.rhs, depth + 1)));
+                },
+                .call, .call_one => {
+                    const call = ast.fullCall(node).?;
+                    var flow = try q.expression(call.ast.fn_expr, depth + 1);
+                    if (!flow.live) return flow;
+                    flow = flow.then(try q.sequence(call.ast.args, depth));
+                    if (!flow.live) return flow;
+                    if (c.isPanic(call.ast.fn_expr) or try c.directNoreturn(call.ast.fn_expr)) return flow.then(.{ .live = false });
+                    if (ast.nodes.items(.tag)[call.ast.fn_expr] == .field_access) {
+                        const field = ast.nodes.items(.data)[call.ast.fn_expr];
+                        if (try q.typeOf(field.lhs, depth + 1)) |receiver| {
+                            if (c.receiverReference(receiver.ty, ast.tokenSlice(field.rhs))) |ref|
+                                if (ref.module.getDeclaration(ref.id).?.noreturn) return flow.then(.{ .live = false });
+                        }
+                    }
+                    return flow;
+                },
+                .container_decl_arg => {
+                    var flow: Flow = .{};
+                    for (ast.fullStructInit(node).?.fields) |field| {
+                        if (!flow.live) break;
+                        const rhs = ast.nodes.items(.data)[field].rhs;
+                        flow = flow.then(try q.expression(if (rhs == 0) field else rhs, depth + 1));
+                    }
+                    return flow;
+                },
+                .array_init, .array_init_comma, .string_literal => return q.sequence(ast.extra_data[data.lhs..data.rhs], depth),
+                .array_init_two, .array_init_two_comma => return q.sequence(&.{ data.lhs, data.rhs }, depth),
+                .slice => {
+                    const slice = ast.slice(node).ast;
+                    return q.sequence(&.{ slice.sliced, slice.start, slice.end }, depth);
+                },
+                .bool_not, .negation, .bit_not, .ref_of => return q.expression(data.rhs, depth + 1),
+                .field_access, .unwrap, .deref => return q.expression(data.lhs, depth + 1),
+                .add,
+                .sub,
+                .mul,
+                .div,
+                .mod,
+                .bit_and,
+                .bit_or,
+                .bit_xor,
+                .shl,
+                .shr,
+                .equal_equal,
+                .bang_equal,
+                .less_than,
+                .greater_than,
+                .less_or_equal,
+                .greater_or_equal,
+                .in,
+                .array_access,
+                .range,
+                .assign,
+                .assign_add,
+                .assign_sub,
+                .assign_mul,
+                .assign_div,
+                .assign_mod,
+                => return q.sequence(&.{ data.lhs, data.rhs }, depth),
+                .function_pipe => {
+                    const flow = try q.sequence(&.{ data.rhs, data.lhs }, depth);
+                    return if (flow.live and try c.directNoreturn(data.rhs)) flow.then(.{ .live = false }) else flow;
+                },
+                else => return .{},
+            }
+        }
+    };
+
+    fn loopTerminates(condition_terminal: bool, unconditional: bool, exhaustion_terminal: bool, has_break: bool) bool {
+        return condition_terminal or ((unconditional or exhaustion_terminal) and !has_break);
+    }
+
+    fn rangeLoopTerminates(exhaustion_terminal: bool, has_break: bool) bool {
+        return exhaustion_terminal and !has_break;
+    }
+
+    fn argumentTerminates(self: *Context, node: Ast.Node.Index, depth: usize) Error!bool {
+        _ = depth;
+        var query: FlowQuery = .{ .context = .{
+            .module = self.module,
+            .ir = self.ir,
+            .types = self.types,
+            .container = self.container,
+            .concrete_type = self.concrete_type,
+            .function_bindings = self.function_bindings,
+            .return_type = self.return_type,
+            .parent = self,
+            .probing = true,
+        } };
+        defer query.context.bindings.deinit(self.module.allocator);
+        defer query.context.locals.deinit(self.module.allocator);
+        defer query.known.deinit(self.module.allocator);
+        const start = self.module.diagnostics.items.len;
+        defer self.module.diagnostics.shrinkRetainingCapacity(start);
+        const starts: []usize = if (self.module.compilation) |comp| try self.module.allocator.alloc(usize, comp.modules.items.len) else &.{};
+        defer if (starts.len != 0) self.module.allocator.free(starts);
+        if (self.module.compilation) |comp| for (comp.modules.items, starts) |owner, *count| {
+            count.* = owner.diagnostics.items.len;
+        };
+        defer if (self.module.compilation) |comp| {
+            for (comp.modules.items, starts) |owner, count| owner.diagnostics.shrinkRetainingCapacity(count);
+        };
+        const flow = try query.expression(node, 0);
+        return !flow.unknown and !flow.live;
+    }
+
     fn genericArgument(self: *Context, node: Ast.Node.Index, depth: usize) Error!GenericFunctions.Argument {
         const was_probing = self.probing;
         self.probing = true;
         defer self.probing = was_probing;
-        const known = try self.probe(node, depth + 1);
-        return .{ .ty = if (known) |k| k.ty else null, .span = self.irSpan(node), .template = try self.genericTarget(node) };
+        const terminal = try self.argumentTerminates(node, depth + 1);
+        const known = if (terminal) null else try self.probe(node, depth + 1);
+        return .{ .ty = if (known) |k| k.ty else null, .span = self.irSpan(node), .template = try self.genericTarget(node), .terminal = terminal };
     }
 
-    fn genericProbe(self: *Context, node: Ast.Node.Index, call: Ast.full.Call, ref: GenericFunctions.Ref, depth: usize) Error!?Ir.TypeId {
-        const args = try self.module.allocator.alloc(GenericFunctions.Argument, call.ast.args.len);
+    fn genericArguments(self: *Context, call: Ast.full.Call, receiver: ?GenericFunctions.Argument, depth: usize) Error![]GenericFunctions.Argument {
+        const offset: usize = @intFromBool(receiver != null);
+        const args = try self.module.allocator.alloc(GenericFunctions.Argument, call.ast.args.len + offset);
+        errdefer self.module.allocator.free(args);
+        if (receiver) |arg| args[0] = arg;
+        var terminal = if (receiver) |arg| arg.terminal else false;
+        for (call.ast.args, args[offset..]) |arg, *out| {
+            out.* = if (terminal) .{ .ty = null, .span = self.irSpan(arg) } else try self.genericArgument(arg, depth);
+            terminal = terminal or out.terminal;
+        }
+        return args;
+    }
+
+    fn genericProbe(self: *Context, node: Ast.Node.Index, call: Ast.full.Call, ref: GenericFunctions.Ref, receiver: ?GenericFunctions.Argument, depth: usize) Error!?Ir.TypeId {
+        const args = try self.genericArguments(call, receiver, depth);
         defer self.module.allocator.free(args);
-        for (call.ast.args, args) |arg, *out| out.* = try self.genericArgument(arg, depth);
         return GenericFunctions.probeResult(self.module, self.ir, ref, args, self.irSpan(node));
     }
 
     const GenericSelection = struct { id: Module.DeclId, ty: Ir.TypeId };
 
-    fn genericSignature(self: *Context, node: Ast.Node.Index, call: Ast.full.Call, ref: GenericFunctions.Ref, expected: ?Known, depth: usize) Error!?GenericSelection {
-        const args = try self.module.allocator.alloc(GenericFunctions.Argument, call.ast.args.len);
+    fn genericSignature(self: *Context, node: Ast.Node.Index, call: Ast.full.Call, ref: GenericFunctions.Ref, receiver: ?GenericFunctions.Argument, expected: ?Known, depth: usize) Error!?GenericSelection {
+        const args = try self.genericArguments(call, receiver, depth);
         defer self.module.allocator.free(args);
-        for (call.ast.args, args) |arg, *out| out.* = try self.genericArgument(arg, depth);
         const bindings = (try GenericFunctions.infer(self.module, self.ir, ref, args, if (expected) |want| .{ .ty = want.ty, .span = want.annotation orelse self.irSpan(node) } else null, self.irSpan(node))) orelse return null;
         defer self.module.allocator.free(bindings);
         return self.demandGeneric(node, ref, bindings);
@@ -856,8 +1204,13 @@ const Context = struct {
         const specialized_id = if (self.sema) |analysis|
             (try analysis.specializeFunction(self.module, ref, bindings, self.specialization_depth, self.irSpan(node))) orelse return null
         else blk: {
+            const template = ref.module.getDeclaration(ref.id).?;
+            const template_id = if (ref.container_type) |ty|
+                ref.module.lookupConcreteMethod(template.container.?, @backingInt(ty), ref.module.sourceSlice(template.name_span).?) orelse return null
+            else
+                ref.id;
             for (ref.module.declarations.items, 0..) |decl, i| {
-                if (decl.function_template != ref.id or decl.function_bindings.len != bindings.len) continue;
+                if (decl.function_template != template_id or decl.function_bindings.len != bindings.len) continue;
                 var equal = true;
                 for (decl.function_bindings, bindings) |a, b| if (a.ty != b.ty) {
                     equal = false;
@@ -887,8 +1240,38 @@ const Context = struct {
         return selected.ty;
     }
 
+    const TerminalCall = union(enum) { live, checked: ?Ir.TypeId };
+
+    fn genericTerminalCall(self: *Context, node: Ast.Node.Index, call: Ast.full.Call, ref: GenericFunctions.Ref, receiver: ?GenericFunctions.Argument, expected: ?Known, depth: usize) Error!TerminalCall {
+        const args = try self.genericArguments(call, receiver, depth);
+        defer self.module.allocator.free(args);
+        var terminal = false;
+        for (args) |arg| terminal = terminal or arg.terminal;
+        if (!terminal) return .live;
+        const params = (try GenericFunctions.terminalParameters(self.module, self.ir, ref, args, self.irSpan(node))) orelse return .{ .checked = null };
+        defer self.module.allocator.free(params);
+        const offset: usize = @intFromBool(receiver != null);
+        if (receiver) |arg| {
+            const field = self.module.source.ast.nodes.items(.data)[call.ast.fn_expr];
+            try self.copyNode(field.lhs, arg.ty.?);
+        }
+        const related = ref.module.getDeclaration(ref.id).?.name_span;
+        for (call.ast.args, params[offset..]) |arg, param| {
+            const ty = (try self.expression(arg, if (param) |p| .{ .ty = p, .annotation = related } else null, depth + 1)) orelse return .{ .checked = null };
+            if (self.terminated) return .{ .checked = if (expected) |want| want.ty else try self.ir.internType(.void) };
+            try self.copyNode(arg, ty);
+        }
+        // A speculative proof must never turn source input into a compiler
+        // assertion if the query and checker disagree.
+        return .{ .checked = try self.fail(.generic_function_inference_unsupported, node, related) };
+    }
+
     fn genericCall(self: *Context, node: Ast.Node.Index, call: Ast.full.Call, ref: GenericFunctions.Ref, expected: ?Known, depth: usize) Error!?Ir.TypeId {
-        const selected = (try self.genericSignature(node, call, ref, expected, depth)) orelse return null;
+        switch (try self.genericTerminalCall(node, call, ref, null, expected, depth)) {
+            .live => {},
+            .checked => |ty| return ty,
+        }
+        const selected = (try self.genericSignature(node, call, ref, null, expected, depth)) orelse return null;
         const function = self.ir.getType(selected.ty).?.function;
         if (self.emitter) |emitter| try emitter.record(call.ast.fn_expr, selected.ty, self.irSpan(call.ast.fn_expr), .{ .function_ref = emitter.functions[@backingInt(selected.id)].? });
         for (call.ast.args, function.params) |arg, param| {
@@ -922,6 +1305,7 @@ const Context = struct {
         const ast = &self.module.source.ast;
         if (ast.nodes.items(.tag)[node] != .field_access) return null;
         const data = ast.nodes.items(.data)[node];
+        if (ast.nodes.items(.tag)[data.lhs] == .identifier and self.lookupBinding(ast.tokenSlice(ast.firstToken(data.lhs))) != null) return null;
         if (self.module.compilation) |comp| if (comp.reference(self.module, node)) |ref| {
             const owner = comp.getModule(ref.source).?;
             if (!self.probing) if (self.sema) |analysis| try analysis.syncEntries(owner);
@@ -942,6 +1326,38 @@ const Context = struct {
         const ty = (try self.resolveType(data.lhs)) orelse return null;
         if (!self.probing) if (self.sema) |analysis| try analysis.syncEntries(self.module);
         return self.nominalMethod(ty, ast.tokenSlice(data.rhs));
+    }
+
+    fn receiverReference(self: *Context, ty: Ir.TypeId, name: []const u8) ?GenericFunctions.Ref {
+        if (self.fieldIndex(ty, name) != null) return null;
+        const nominal = self.ir.getType(ty).?;
+        const source = switch (nominal) {
+            .record => |r| r.source,
+            .enumeration => |e| e.source,
+            else => return null,
+        };
+        const identity = if (nominal == .record) nominal.record.identity else nominal.enumeration.identity;
+        const owner = if (self.module.compilation) |comp| comp.getModule(source).? else self.module;
+        const id = owner.lookupMethod(@fromBackingInt(@intCast(identity)), name) orelse return null;
+        const decl = owner.getDeclaration(id).?;
+        if (owner.source.ast.declFunction(decl.node) == null or (owner != self.module and !decl.public)) return null;
+        return .{ .module = owner, .id = id, .container_type = if (nominal == .record and nominal.record.type_args.len != 0) ty else null };
+    }
+
+    fn receiverGeneric(self: *Context, ty: Ir.TypeId, name: []const u8) ?GenericFunctions.Ref {
+        const ref = self.receiverReference(ty, name) orelse return null;
+        return if (ref.module.getDeclaration(ref.id).?.is_generic_function) ref else null;
+    }
+
+    fn probeReceiverSignature(self: *Context, ty: Ir.TypeId, name: []const u8) Error!?Known {
+        const ref = self.receiverReference(ty, name) orelse return null;
+        const decl = ref.module.getDeclaration(ref.id).?;
+        if (decl.is_generic_function or decl.noreturn) return null;
+        const start = ref.module.diagnostics.items.len;
+        defer ref.module.diagnostics.shrinkRetainingCapacity(start);
+        const function = ref.module.source.ast.declFunction(decl.node).?;
+        const signature = (try TypeResolver.resolveInScopeReadOnly(ref.module, self.ir, function.proto_node, decl.container, if (ref.container_type) |concrete| @backingInt(concrete) else null, &.{})) orelse return null;
+        return .{ .ty = signature, .annotation = decl.name_span };
     }
 
     fn receiverMethod(self: *Context, ty: Ir.TypeId, name: []const u8) ?Module.DeclId {
@@ -1312,7 +1728,7 @@ const Context = struct {
                     if (ref.module.getDeclaration(ref.id).?.noreturn) break :blk null;
                     const start = self.module.diagnostics.items.len;
                     defer self.module.diagnostics.shrinkRetainingCapacity(start);
-                    const result = (try self.genericProbe(node, call, ref, depth + 1)) orelse break :blk null;
+                    const result = (try self.genericProbe(node, call, ref, null, depth + 1)) orelse break :blk null;
                     break :blk .{ .ty = result };
                 }
                 if (try self.probeStaticMethod(call.ast.fn_expr)) |method| {
@@ -1329,13 +1745,21 @@ const Context = struct {
                 if (ast.nodes.items(.tag)[call.ast.fn_expr] == .field_access and try self.staticMethod(call.ast.fn_expr) == null) {
                     const field = ast.nodes.items(.data)[call.ast.fn_expr];
                     if (try self.probe(field.lhs, depth + 1)) |receiver| {
-                        if (self.receiverMethod(receiver.ty, ast.tokenSlice(field.rhs))) |method| {
-                            if (self.getDeclaration(method).noreturn) break :blk null;
-                            const signature = (try self.globalType(method)) orelse break :blk null;
-                            const function = self.ir.getType(signature.ty).?;
-                            if (function == .function) break :blk .{ .ty = function.function.result };
+                        if (self.receiverGeneric(receiver.ty, ast.tokenSlice(field.rhs))) |ref| {
+                            if (ref.module.getDeclaration(ref.id).?.noreturn) break :blk null;
+                            const result = (try self.genericProbe(node, call, ref, .{ .ty = receiver.ty, .span = self.irSpan(field.lhs) }, depth + 1)) orelse break :blk null;
+                            break :blk .{ .ty = result };
+                        }
+                        if (try self.probeReceiverSignature(receiver.ty, ast.tokenSlice(field.rhs))) |signature| {
+                            const function = self.ir.getType(signature.ty).?.function;
+                            if (function.params.len == call.ast.args.len + 1 and function.params[0] == receiver.ty)
+                                break :blk .{ .ty = function.result };
                         }
                     }
+                    // Calling a value field is unsupported. Re-probing this
+                    // same receiver as a callee cannot recover a method type,
+                    // and doubles every failed step of a deep receiver chain.
+                    break :blk null;
                 }
                 const callee = (try self.probe(call.ast.fn_expr, depth + 1)) orelse break :blk null;
                 const ty = self.ir.getType(callee.ty).?;
@@ -2379,7 +2803,7 @@ const Context = struct {
             if (context.result == null) context.result = .{ .ty = exhaustion.? };
             try self.copyNode(loop.else_expr, exhaustion.?);
         }
-        self.terminated = loop.else_expr != 0 and else_terminal and !context.has_break;
+        self.terminated = rangeLoopTerminates(loop.else_expr != 0 and else_terminal, context.has_break);
         const result = if (self.terminated) unit else if (context.result) |value| value.ty else unit;
         if (self.emitter) |emitter| {
             try emitter.record(node, result, self.irSpan(node), .{ .loop = .{
@@ -2602,7 +3026,7 @@ const Context = struct {
                     if (context.result == null) context.result = .{ .ty = exhaustion.? };
                     try self.copyNode(loop.else_expr, exhaustion.?);
                 }
-                self.terminated = condition_terminal or ((loop.condition == 0 or (loop.else_expr != 0 and else_terminal)) and !context.has_break);
+                self.terminated = loopTerminates(condition_terminal, loop.condition == 0, loop.else_expr != 0 and else_terminal, context.has_break);
                 const result = if (self.terminated) unit else if (context.result) |known| known.ty else unit;
                 if (loop.else_expr == 0 and result != unit and !context.valued_break) return self.fail(.loop_missing_value_break, node, null);
                 if (self.emitter) |emitter| try emitter.record(node, result, self.irSpan(node), .{ .loop = .{
@@ -2875,9 +3299,14 @@ const Context = struct {
                     const field = ast.nodes.items(.data)[call.ast.fn_expr];
                     const receiver = (try self.expression(field.lhs, null, depth + 1)) orelse return null;
                     if (self.terminated) return if (expected) |want| want.ty else try self.ir.internType(.void);
-                    if (self.receiverMethod(receiver, ast.tokenSlice(field.rhs))) |method| {
-                        if (self.getDeclaration(method).is_generic_function) return self.fail(.generic_function_context, call.ast.fn_expr, self.getDeclaration(method).name_span);
-                        const signature = (try self.globalType(method)) orelse return self.fail(.unresolved_value_type, call.ast.fn_expr, null);
+                    const generic = self.receiverGeneric(receiver, ast.tokenSlice(field.rhs));
+                    if (generic) |ref| switch (try self.genericTerminalCall(node, call, ref, .{ .ty = receiver, .span = self.irSpan(field.lhs) }, expected, depth)) {
+                        .live => {},
+                        .checked => |ty| return ty,
+                    };
+                    const selected = if (generic) |ref| (try self.genericSignature(node, call, ref, .{ .ty = receiver, .span = self.irSpan(field.lhs) }, expected, depth)) orelse return null else null;
+                    if (if (selected) |s| s.id else self.receiverMethod(receiver, ast.tokenSlice(field.rhs))) |method| {
+                        const signature: Known = if (selected) |s| .{ .ty = s.ty } else (try self.globalType(method)) orelse return self.fail(.unresolved_value_type, call.ast.fn_expr, null);
                         const function = self.ir.getType(signature.ty).?.function;
                         const related = self.getDeclaration(method).name_span;
                         if (function.params.len == 0 or function.params[0] != receiver) return self.fail(.invalid_method_receiver, call.ast.fn_expr, related);
@@ -2933,6 +3362,339 @@ const Context = struct {
         }
     }
 };
+
+const flow_query_prelude =
+    \\let R=struct{@[noreturn]
+    \\let stop:(object:R)=@panic("stop")
+    \\}
+    \\let Box:(T:type)->type=struct{value:T,@[noreturn]
+    \\let stop:(object:Box(T))=@panic("box")
+    \\}
+    \\let S=struct{value:bool,other:bool,}
+    \\let Holder=struct{len:R,}
+    \\let make:()->R=R[]
+    \\let Factory=struct{let make:()->R=R[]
+    \\}
+    \\let U=union{ok:R,err,}
+    \\let take:(a:bool,b:bool)->bool=a
+    \\@[noreturn]
+    \\let stop:()=@panic("stop")
+;
+
+const flow_query_cases = [_]struct { expression: []const u8, terminal: bool, check_call: bool = true }{
+    .{ .expression = "loop{}", .terminal = true },
+    .{ .expression = "loop{loop{break}}", .terminal = true },
+    .{ .expression = "loop{let cb=()->bool{loop{break true}}\n}", .terminal = true },
+    .{ .expression = "loop{loop false{}else{continue}}", .terminal = true },
+    .{ .expression = "loop @as(bool,{continue}) {}", .terminal = true },
+    .{ .expression = "loop @as(bool,{return true}) {}", .terminal = true },
+    .{ .expression = "loop false{}else{return true}", .terminal = true },
+    .{ .expression = "match true{true=>{return true}\nfalse=>{return false}}", .terminal = true },
+    .{ .expression = "{let u:U=.ok[R[]]\nmatch u{.ok=>|r|r.stop()\n.err=>@panic(\"err\")}}", .terminal = true },
+    .{ .expression = "{let r=R[]\nr.stop()}", .terminal = true },
+    .{ .expression = "make().stop()", .terminal = true },
+    .{ .expression = "{let r=make()\nr.stop()}", .terminal = true },
+    .{ .expression = "Factory.make().stop()", .terminal = true },
+    .{ .expression = "{let r=Factory.make()\nr.stop()}", .terminal = true },
+    .{ .expression = "{let h=Holder[.len=R[]]\nh.len.stop()}", .terminal = true },
+    .{ .expression = "{let r={let made=R[]\nmade}\nr.stop()}", .terminal = true },
+    .{ .expression = "{let r=Box(bool)[.value=true]\nr.stop()}", .terminal = true },
+    .{ .expression = "!{return true}", .terminal = true },
+    .{ .expression = "@as(int,1)+{return true}", .terminal = true },
+    .{ .expression = "@as(R,{return true}).value", .terminal = true },
+    .{ .expression = "@as([]bool,{return true})[unknown]", .terminal = true },
+    .{ .expression = "@as([]bool,[true])[{return true}]", .terminal = true },
+    .{ .expression = "@as(string,\"x\")[{return true}..unknown]", .terminal = true },
+    .{ .expression = "@as([]bool,[{return true},unknown])", .terminal = true },
+    .{ .expression = "@as(S,S[.value={return true},.other=unknown])", .terminal = true },
+    .{ .expression = "@as(U,U.ok[{return true}])", .terminal = true },
+    .{ .expression = "take({return true},unknown)", .terminal = true },
+    .{ .expression = "@as((bool)->bool,{return true})(unknown)", .terminal = true },
+    .{ .expression = "!stop()", .terminal = true },
+    .{ .expression = "@as(string,\"{stop()}\")", .terminal = true },
+    .{ .expression = "loop item in @as([]R,[]) {item.stop()} else{return true}", .terminal = true },
+    .{ .expression = "loop{loop{break}\nbreak true}", .terminal = false },
+    .{ .expression = "loop{loop false{}else{break true}}", .terminal = false },
+    .{ .expression = "loop true{break true}else{false}", .terminal = false },
+    .{ .expression = "loop false{}else{true}", .terminal = false },
+    .{ .expression = "loop @as(bool,{break true}) {}else{false}", .terminal = false },
+    .{ .expression = "false and {return true}", .terminal = false },
+    .{ .expression = "true or {return false}", .terminal = false },
+    .{ .expression = "{let cb=()->bool{loop{}}\ntrue}", .terminal = false },
+    .{ .expression = "{let halt=R.stop\nhalt(R[])\ntrue}", .terminal = false },
+    .{ .expression = "{let r=R[]\nlet halt=R.stop\nhalt(r)\ntrue}", .terminal = false },
+    .{ .expression = "match true{true=>{return true}\nfalse=>false}", .terminal = false },
+    .{ .expression = "loop item in @as([]R,[]) {item.stop()}", .terminal = false, .check_call = false },
+};
+
+fn testArgumentFlow(allocator: std.mem.Allocator, expression: []const u8, terminal: bool) !void {
+    const source = try std.mem.concat(allocator, u8, &.{ flow_query_prelude, "\nlet sample:()->bool=", expression });
+    defer allocator.free(source);
+    var module = try Module.init(allocator, "flow-query.nov", source);
+    defer module.deinit();
+    if (module.source.ast.errors.len != 0) std.debug.print("flow parse {s}: {any}\n", .{ expression, module.source.ast.errors });
+    try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    ir.source_len = @intCast(module.source.ast.source.len);
+    var context: Context = .{ .module = &module, .ir = &ir, .types = &.{}, .return_type = .{ .ty = try ir.internType(.boolean) } };
+    const count = module.declarations.items.len;
+    const node = module.source.ast.declFunction(module.getDeclaration(module.lookup("sample").?).?.node).?.body;
+    const result = context.argumentTerminates(node, 0) catch |err| {
+        try std.testing.expectEqual(count, module.declarations.items.len);
+        try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+        return err;
+    };
+    if (result != terminal) std.debug.print("flow query {s}: expected {any}, got {any}\n", .{ expression, terminal, result });
+    try std.testing.expectEqual(terminal, result);
+    try std.testing.expectEqual(count, module.declarations.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ir.functions.items.len);
+    try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+    try std.testing.expectEqual(@as(usize, 0), context.bindings.count());
+    for (ir.types.items) |ty| if (ty == .record and ty.record.type_args.len != 0) try std.testing.expect(!ty.record.methods_published);
+}
+
+fn testFlowCall(allocator: std.mem.Allocator, expression: []const u8, terminal: bool, generic: bool) !void {
+    const method = if (generic)
+        if (terminal) "let W=struct{let f:(self:W,a:`T,b:`T,c:`T)->`T=missing\n}\n" else "let W=struct{let f:(self:W,a:`T,b:`T,c:`T)->`T=a\n}\n"
+    else
+        "let W=struct{let f:(self:W,a:bool,b:bool,c:bool)->bool=a\n}\n";
+    const source = try std.mem.concat(allocator, u8, &.{ flow_query_prelude, "\n", method, "let main:()->bool=W[].f(true,", expression, if (terminal) ",unknown)" else ",true)" });
+    defer allocator.free(source);
+    var module = try Module.init(allocator, "flow-call.nov", source);
+    defer module.deinit();
+    const count = module.declarations.items.len;
+    var sema = Lowering.lower(&module) catch |err| {
+        try std.testing.expectEqual(count, module.declarations.items.len);
+        try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+        return err;
+    };
+    defer sema.deinit();
+    if (module.hasErrors()) std.debug.print("flow call {s} generic {any}: {any} {any}\n", .{ expression, generic, module.source.ast.errors, module.diagnostics.items });
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+    var specializations: usize = 0;
+    for (module.declarations.items) |decl| if (decl.function_template != null and std.mem.eql(u8, module.sourceSlice(decl.name_span).?, "f")) {
+        specializations += 1;
+    };
+    try std.testing.expectEqual(@as(usize, @intFromBool(generic and !terminal)), specializations);
+    for (sema.ir.functions.items) |function| if (generic and terminal) try std.testing.expect(!std.mem.eql(u8, function.name, "f"));
+}
+
+fn lowerFlowDepth(allocator: std.mem.Allocator, chain: []const u8, generic: bool) !?Module.Diagnostic.Tag {
+    const method = if (generic) "let f:(object:R,a:`T,b:R,c:`T)->`T=a\n" else "let f:(object:R,a:bool,b:R,c:bool)->bool=a\n";
+    const source = try std.mem.concat(allocator, u8, &.{ "let R=struct{let same:(object:R)->R=object\n", method, "}\nlet make:()->R=R[]\nlet Factory=struct{let make:()->R=R[]\n}\nlet main:()->bool=R[].f(true,", chain, ",true)" });
+    defer allocator.free(source);
+    var module = try Module.init(allocator, "flow-depth.nov", source);
+    defer module.deinit();
+    try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
+    const count = module.declarations.items.len;
+    var sema = Lowering.lower(&module) catch |err| {
+        try std.testing.expectEqual(count, module.declarations.items.len);
+        try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+        return err;
+    };
+    defer sema.deinit();
+    if (module.hasErrors()) {
+        try std.testing.expect(!sema.lowering_complete);
+        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+        try std.testing.expectEqual(Module.Diagnostic.Tag.body_nesting_limit, module.diagnostics.items[0].tag);
+        return module.diagnostics.items[0].tag;
+    }
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+    return null;
+}
+
+fn testFlowDepth(allocator: std.mem.Allocator, depth: usize, root: []const u8) !void {
+    var chain: std.Io.Writer.Allocating = .init(allocator);
+    defer chain.deinit();
+    chain.writer.writeAll(root) catch return error.OutOfMemory;
+    for (0..depth) |_| chain.writer.writeAll(".same()") catch return error.OutOfMemory;
+    const source = try std.mem.concat(allocator, u8, &.{ "let R=struct{let same:(object:R)->R=object\n}\nlet make:()->R=R[]\nlet Factory=struct{let make:()->R=R[]\n}\nlet sample:()->R=", chain.written() });
+    defer allocator.free(source);
+    var module = try Module.init(allocator, "flow-depth-probe.nov", source);
+    defer module.deinit();
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    ir.source_len = @intCast(module.source.ast.source.len);
+    var context: Context = .{ .module = &module, .ir = &ir, .types = &.{}, .return_type = .{ .ty = try ir.internType(.void) } };
+    const count = module.declarations.items.len;
+    const node = module.source.ast.declFunction(module.getDeclaration(module.lookup("sample").?).?.node).?.body;
+    const terminal = context.argumentTerminates(node, 0) catch |err| {
+        try std.testing.expectEqual(count, module.declarations.items.len);
+        try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+        return err;
+    };
+    try std.testing.expect(!terminal);
+    try std.testing.expectEqual(count, module.declarations.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ir.functions.items.len);
+    try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+    const concrete = try lowerFlowDepth(allocator, chain.written(), false);
+    const generic = try lowerFlowDepth(allocator, chain.written(), true);
+    try std.testing.expectEqual(concrete, generic);
+    if (depth <= 96) try std.testing.expectEqual(@as(?Module.Diagnostic.Tag, null), generic);
+}
+
+test "backtick instance flow depth unknown cannot prove the absence of owned loop breaks" {
+    var module = try Module.init(std.testing.allocator, "loop-flow-limit.nov", "let sample:()=loop{break}");
+    defer module.deinit();
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    ir.source_len = @intCast(module.source.ast.source.len);
+    const node = module.source.ast.declFunction(module.getDeclaration(module.lookup("sample").?).?.node).?.body;
+    for (max_recursive_depth - 3..max_recursive_depth + 1) |depth| {
+        var query: Context.FlowQuery = .{ .context = .{ .module = &module, .ir = &ir, .types = &.{} } };
+        defer query.context.bindings.deinit(std.testing.allocator);
+        defer query.context.locals.deinit(std.testing.allocator);
+        defer query.known.deinit(std.testing.allocator);
+        const flow = try query.expression(node, depth);
+        try std.testing.expect(flow.live);
+        try std.testing.expectEqual(depth >= max_recursive_depth - 2, flow.unknown);
+    }
+}
+
+test "backtick instance flow depth boundary OOM never becomes a terminal proof" {
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testFlowDepth, .{ @as(usize, 4), @as([]const u8, "Factory.make()") });
+    for ([_]usize{ 63, 64, 65, 128, 129 }) |depth| {
+        for ([_]usize{ 0, 1, 2, 8, 32, 128, 512, 1024 }) |index| {
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = index, .resize_fail_index = 0 });
+            testFlowDepth(failing.allocator(), depth, "R[]") catch |err| {
+                try std.testing.expectEqual(error.OutOfMemory, err);
+            };
+        }
+    }
+}
+
+fn testFactorySignatureProbe(allocator: std.mem.Allocator, expression: []const u8, finalized: bool) !void {
+    const source = try std.mem.concat(allocator, u8, &.{
+        "let R=struct{@[noreturn]\nlet stop:(object:R)=@panic(\"stop\")\n}\nlet make:()->R=missing\nlet Factory=struct{let make:()->R=missing\n}\nlet G:(T:type)->type=struct{let make:()->R=missing\n}\nlet sample:()->bool=", expression,
+    });
+    defer allocator.free(source);
+    var module = try Module.init(allocator, "factory-signature-probe.nov", source);
+    defer module.deinit();
+    var analysis = if (finalized) try Sema.analyzeAnnotations(&module) else Sema{ .allocator = allocator, .ir = Ir.init(allocator), .entries = &.{} };
+    defer analysis.deinit();
+    analysis.ir.source_len = @intCast(module.source.ast.source.len);
+    const entries = try allocator.dupe(Sema.Entry, analysis.entries);
+    defer allocator.free(entries);
+    const count = module.declarations.items.len;
+    var context: Context = .{ .module = &module, .ir = &analysis.ir, .types = &.{}, .sema = if (finalized) &analysis else null, .return_type = .{ .ty = try analysis.ir.internType(.boolean) } };
+    const node = module.source.ast.declFunction(module.getDeclaration(module.lookup("sample").?).?.node).?.body;
+    const terminal = context.argumentTerminates(node, 0) catch |err| {
+        try std.testing.expectEqual(count, module.declarations.items.len);
+        try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+        try std.testing.expectEqualDeep(entries, analysis.entries);
+        return err;
+    };
+    try std.testing.expect(terminal);
+    try std.testing.expectEqual(count, module.declarations.items.len);
+    try std.testing.expectEqualDeep(entries, analysis.entries);
+    try std.testing.expectEqual(@as(usize, 0), analysis.ir.functions.items.len);
+    try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+    for (analysis.ir.types.items) |ty| if (ty == .record and ty.record.type_args.len != 0) try std.testing.expect(!ty.record.methods_published);
+}
+
+test "backtick instance factory signature flow queries are readonly with cold and finalized semantic entries under OOM" {
+    for ([_][]const u8{ "make().stop()", "{let r=make()\nr.stop()}", "Factory.make().stop()", "{let r=Factory.make()\nr.stop()}", "G(bool).make().stop()" }) |expression| {
+        for ([_]bool{ false, true }) |finalized| {
+            try testFactorySignatureProbe(std.testing.allocator, expression, finalized);
+            try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testFactorySignatureProbe, .{ expression, finalized });
+        }
+    }
+}
+
+fn testFactoryImports(allocator: std.mem.Allocator, expression: []const u8, public: bool) !void {
+    var comp = Compilation.init(allocator);
+    defer comp.deinit();
+    const text = try std.mem.concat(allocator, u8, &.{ "let lib=@import(\"lib.nov\")\nlet main:()=", expression });
+    defer allocator.free(text);
+    const root = try comp.addSource("/app/main.nov", text);
+    const library = try comp.addSource("/app/lib.nov",
+        \\let Hidden=struct{@[public]
+        \\@[noreturn]
+        \\let stop:(object:Hidden)=@panic("stop")
+        \\}
+        \\@[public]
+        \\let R=struct{@[public]
+        \\let f:(object:R,a:`T,b:`T,c:`T)->`T=missing
+        \\}
+        \\@[public]
+        \\let make:()->Hidden=Hidden[]
+        \\let privateMake:()->Hidden=Hidden[]
+        \\@[public]
+        \\let Factory=struct{@[public]
+        \\let make:()->Hidden=Hidden[]
+        \\}
+    );
+    const module = comp.getModule(root).?;
+    const local = module.lookup("lib").?;
+    try comp.imports.append(allocator, .{ .declaration = comp.declaration_ids.get(.{ .source = root, .local = local }).?, .target = library, .named = false, .span = module.getDeclaration(local).?.name_span });
+    try comp.prepareSemantics();
+    const count = comp.declarations.items.len;
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    ir.source_len = @intCast(module.source.ast.source.len);
+    var context: Context = .{ .module = module, .ir = &ir, .types = &.{}, .return_type = .{ .ty = try ir.internType(.void) } };
+    const node = module.source.ast.declFunction(module.getDeclaration(module.lookup("main").?).?.node).?.body;
+    const terminal = context.argumentTerminates(node, 0) catch |err| {
+        try std.testing.expectEqual(count, comp.declarations.items.len);
+        for (comp.modules.items) |owner| try std.testing.expectEqual(@as(usize, 0), owner.diagnostics.items.len);
+        return err;
+    };
+    if (public != terminal) std.debug.print("factory import flow {s}: expected {any}, got {any}\n", .{ expression, public, terminal });
+    try std.testing.expectEqual(public, terminal);
+    try std.testing.expectEqual(count, comp.declarations.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ir.functions.items.len);
+    for (comp.modules.items) |owner| try std.testing.expectEqual(@as(usize, 0), owner.diagnostics.items.len);
+    var sema = Lowering.lowerCompilation(&comp) catch |err| {
+        try std.testing.expectEqual(count, comp.declarations.items.len);
+        for (comp.modules.items) |owner| try std.testing.expectEqual(@as(usize, 0), owner.diagnostics.items.len);
+        return err;
+    };
+    defer sema.deinit();
+    try std.testing.expectEqual(!public, comp.hasErrors());
+    try std.testing.expectEqual(public, sema.lowering_complete);
+    try std.testing.expectEqual(count, comp.declarations.items.len);
+    for (comp.modules.items) |owner| for (owner.declarations.items) |decl| try std.testing.expect(decl.function_template == null);
+    if (public) {
+        try sema.ir.verify();
+    } else {
+        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+        try std.testing.expectEqual(Module.Diagnostic.Tag.unresolved_value_type, module.diagnostics.items[0].tag);
+        try std.testing.expectEqual(root, module.diagnostics.items[0].span.source);
+    }
+}
+
+test "backtick instance factory result imports preserve private diagnostics and demand only reachable bodies under OOM" {
+    for ([_][]const u8{
+        "lib.R[].f(true,lib.make().stop(),unknown)",
+        "lib.R[].f(true,{let r=lib.make()\nr.stop()},unknown)",
+        "lib.R[].f(true,lib.Factory.make().stop(),unknown)",
+        "lib.privateMake().stop()",
+    }, 0..) |expression, i| {
+        try testFactoryImports(std.testing.allocator, expression, i < 3);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testFactoryImports, .{ expression, i < 3 });
+    }
+}
+
+test "backtick instance flow depth uncertainty matches concrete method and factory chains without assertions" {
+    for ([_]usize{ 62, 63, 64, 65, 96, 124, 125, 126, 127, 128, 129 }) |depth| {
+        for ([_][]const u8{ "R[]", "make()", "Factory.make()" }) |root| try testFlowDepth(std.testing.allocator, depth, root);
+    }
+}
+
+test "backtick instance abstract control flow matches concrete exits loops scopes matches and eager evaluation under OOM" {
+    for (flow_query_cases) |case| {
+        try testArgumentFlow(std.testing.allocator, case.expression, case.terminal);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testArgumentFlow, .{ case.expression, case.terminal });
+        if (case.check_call) for ([_]bool{ false, true }) |generic| {
+            try testFlowCall(std.testing.allocator, case.expression, case.terminal, generic);
+            try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testFlowCall, .{ case.expression, case.terminal, generic });
+        };
+    }
+}
 
 test "instance calls diagnose signatures arity exact identity and preserve fields" {
     const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag };

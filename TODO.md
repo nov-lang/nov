@@ -47,33 +47,48 @@ results. See `examples/array-fields.nov`.
 
 ## Current delivered status
 
-Bounded named generic functions support direct calls and contextual specialization
-as function values when an exact concrete function type is expected. Final native
-build, Debug/ReleaseSafe gates (**988/988 steps**), four-target release builds,
-formatting and diff checks pass. The unit suite has **939 passes / 1 existing skip**
-(940 total); focused contextual tests passed **36/36**, generic CLI **60/60 steps**.
+Bounded named generic functions support direct calls, contextual specialization
+as function values under exact concrete signatures, and generic instance-method
+inference. Final parent validation: native build, full Debug and ReleaseSafe
+**1034/1034 steps** each (unit suite **958 passes / 1 existing skip**, 959 total),
+Debug CLI **1019/1019 steps**, four-target release builds, formatting and diff
+checks pass. Focused generic **55/55** and instance **32/32** tests pass.
+The initial 400-second Debug timeout was investigated using per-test timing: the
+full binary completed in 529 seconds, with no failures or infinite loop observed;
+the normal build gate subsequently passed in about nine minutes under the approved
+15-minute timeout. Most time is generated-C/allocation-budget testing; the slowest
+test exercises 33 method/factory depth-boundary cases against concrete/generic
+checking. Broader performance work remains paused.
 `PLAN2.md` is the current untracked handoff; `PLAN.md` is an unchanged archive.
 
 Backtick inference combines typed runtime arguments, expected call results and
 bounded body constraints, without implicit conversions or numeric defaults. Nested
 array/function signatures and nominal generic-container templates work, as do
 canonical top-level/imported/public aliases and namespace/generic-container
-static/sibling calls. Ordinary closures inside generic bodies capture substituted
-concrete types; this does not deliver generic closures or local generic templates.
+static/sibling and instance calls. The concrete receiver container binds its type
+parameters; method-local backtick variables infer from explicit arguments,
+contextual generic callbacks, expected results and supported body constraints.
+Static and instance forms share canonical specializations. Receivers are exact
+nominal by-value snapshots evaluated once before explicit arguments; no mutable
+receiver or implicit borrow is added. Fields retain lookup precedence.
+Ordinary closures inside generic bodies capture substituted concrete types;
+this does not deliver generic closures or local generic templates.
 Typed bindings, `@as` and callback contexts can demand ordinary canonical function
 references. Callback inference combines other arguments and expected results
 bidirectionally, without duplicating runtime evaluation. Aliases, imports/public
 reexports and static methods retain existing visibility rules. Runtime-polymorphic
-unspecialized values and generic instance-method inference remain deferred. See
+unspecialized values, bound method values and callable fields remain deferred. See
 the bounded inference section below and README.md for the precise solver boundary.
 
 Demand-driven canonical specialization is bounded to 64 expansion levels and
 1024 specializations per defining module; inference has 8192-term/128-depth limits.
 Unused generic bodies are not type-checked. Failed/OOM lowering rolls back partial
-specializations/demands; speculative probes must not publish specializations or
-body demands. GenericFunctionTests has been merged into `src/GenericFunctions.zig`;
-See `examples/generic-functions.nov`; the examples agent is updating that file and
-its build integration for contextual specialization.
+specializations/demands; speculative probes must not publish methods,
+specializations, declaration IDs or body/worklist demands. Fresh nominal results
+supply constraints without requiring prior instantiation. GenericFunctionTests has
+been merged into `src/GenericFunctions.zig`. See the `Box.map` example in README.md;
+`examples/generic-functions.nov` is being extended for generic methods. No new
+example-validation counts are claimed here.
 
 Arrays now support all existing storable runtime types: bool, integer, rune,
 string, enums, finite acyclic records, existing tagged unions, functions/closures,
@@ -261,9 +276,10 @@ Instance calls value.method(args) work on nominal structs, non-generic unions an
 enums as sugar for Type.method(value,args). The explicit first parameter must match
 the exact nominal receiver type. Receiver evaluates/snapshots once before explicit
 arguments left-to-right; direct noreturn methods remain terminal. Fields retain
-lookup precedence. No implicit mutation/borrowing, bound method references or
-generic instance-method inference were added. Named generic static/direct calls
-are supported separately. structured-errors.nov uses Entry.describe().
+lookup precedence. Generic instance methods now infer method-local backtick
+variables, sharing canonical specializations with static/direct calls. No implicit
+mutation/borrowing, bound method references or callable fields are supported.
+structured-errors.nov uses Entry.describe().
 
 Nominal unnumbered enums are executable: qualified/contextual tags, aliases, exact
 ==/!=, exhaustive single-enum matches with qualified patterns/alternatives/catchall,
@@ -1163,21 +1179,28 @@ Callback inference combines signature/body constraints, other arguments and the
 expected result bidirectionally. It yields an ordinary function reference to a
 demanded canonical specialization, with no duplicated runtime evaluation. Typed
 assignments, results, branches and arrays also supply exact contexts. Aliases,
-imports/public reexports and namespace/generic-container static methods obey
-existing visibility. `let callback = identity` and `apply(identity, 42)` remain
-ambiguous; conflicts reject, with no numeric defaults or implicit conversions.
+imports/public reexports and namespace/generic-container static and instance
+methods obey existing visibility. The concrete receiver binds container `T`;
+method-local `U` follows explicit arguments, contextual generic callbacks, expected
+results and bounded body constraints. See README.md for `Box.map`. Static and
+instance calls share canonical specializations, preserving field precedence and
+exact by-value receiver snapshots before argument evaluation.
+`let callback = identity` and `apply(identity, 42)` remain ambiguous; conflicts
+reject, with no numeric defaults or implicit conversions.
 
 Still deferred: generic closures, local generic templates, runtime-polymorphic
-unspecialized generic function values and generic instance-method inference. No
+unspecialized generic function values, bound method values and callable fields. No
 new parser syntax, explicit function specialization syntax or general comptime
 evaluation is delivered. Existing explicit container parameters remain unchanged.
 `#` explicit compile-time arguments are a separate proposal, not implemented.
 Terminal paths do not impose `void` merge constraints; bare return constrains its
 own function result to void. Fresh nominal result layouts materialize without
 publishing method demands during probes, so inference is independent of prior
-instantiation order. Final validation: 36 focused passes, unit suite 939 passes /
-1 existing skip, full Debug/ReleaseSafe 988/988 build steps; release builds and
-formatting/diff checks pass.
+instantiation order; probes publish no methods, specializations, declaration IDs
+or body/worklist demands. Current agent-reported validation: focused **43/43** and
+instance **20/20**; full units timed out at **400 seconds, 781/947**, not a pass.
+Parent final gates remain pending. Committed **4a14d80** validation above is
+historical, not validation of the current uncommitted implementation.
 
 # Comptime
 

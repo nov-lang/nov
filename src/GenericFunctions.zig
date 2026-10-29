@@ -77,7 +77,7 @@ fn targetWith(module: *Module, node: Ast.Node.Index, generic_only: bool) ?Ref {
     return null;
 }
 
-pub const Argument = struct { ty: ?Ir.TypeId, span: Module.Span, template: ?Ref = null };
+pub const Argument = struct { ty: ?Ir.TypeId, span: Module.Span, template: ?Ref = null, terminal: bool = false };
 const Term = struct {
     span: Module.Span,
     value: union(enum) {
@@ -138,6 +138,28 @@ fn inferInner(caller: *Module, ir: *Ir, ref: Ref, arguments: []const Argument, e
     return bindings;
 }
 
+/// A call with a terminal operand never demands its callee. Resolve only the
+/// reachable parameter contexts; unbound variables need no specialization.
+/// The caller owns the returned slice, which retains the full signature arity.
+pub fn terminalParameters(caller: *Module, ir: *Ir, ref: Ref, arguments: []const Argument, call_span: Module.Span) Ir.BuildError!?[]?Ir.TypeId {
+    var arena = std.heap.ArenaAllocator.init(caller.allocator);
+    defer arena.deinit();
+    var solver: Solver = .{ .allocator = arena.allocator(), .caller = caller, .ir = ir, .call_span = call_span };
+    _ = (solver.constrain(ref, arguments, null) catch |err| switch (err) {
+        error.TooManyEntries => return null,
+        else => return err,
+    }) orelse return null;
+    const params = try caller.allocator.alloc(?Ir.TypeId, solver.parameters.len);
+    errdefer caller.allocator.free(params);
+    solver.read_only = true;
+    var terminal = false;
+    for (arguments, solver.parameters, params) |arg, param, *ty| {
+        ty.* = if (!terminal and Solver.resolved(param, 0)) try solver.materialize(param, 0) else null;
+        terminal = terminal or arg.terminal;
+    }
+    return params;
+}
+
 /// A speculative result query may intern canonical structural and nominal
 /// layouts, but never publishes methods, function specializations, declaration
 /// IDs, or worklist requests.
@@ -161,6 +183,7 @@ pub fn probeResult(caller: *Module, ir: *Ir, ref: Ref, arguments: []const Argume
 }
 
 fn probeResultInner(caller: *Module, ir: *Ir, ref: Ref, arguments: []const Argument, call_span: Module.Span) Ir.BuildError!?Ir.TypeId {
+    for (arguments) |arg| if (arg.terminal) return null;
     var arena = std.heap.ArenaAllocator.init(caller.allocator);
     defer arena.deinit();
     var solver: Solver = .{ .allocator = arena.allocator(), .caller = caller, .ir = ir, .call_span = call_span, .read_only = true };
@@ -232,6 +255,7 @@ const Solver = struct {
     active: std.ArrayList(Ref) = .empty,
     read_only: bool = false,
     unsupported: ?Module.Span = null,
+    parameters: []const *Term = &.{},
 
     fn constrain(self: *Solver, ref: Ref, arguments: []const Argument, expected: ?Argument) Ir.BuildError!?Frame {
         const container: ?Nominal = if (ref.container_type) |ty| blk: {
@@ -241,11 +265,13 @@ const Solver = struct {
         const instance = (try self.signature(ref, container, 0)) orelse return null;
         var frame = instance.frame;
         const signature_type = instance.function;
+        self.parameters = signature_type.params;
         if (signature_type.params.len != arguments.len) {
             try self.fail(.argument_count_mismatch, self.call_span, ref.module.getDeclaration(ref.id).?.name_span);
             return null;
         }
         for (arguments, signature_type.params) |arg, param| {
+            if (arg.terminal) return if (self.failed) null else frame;
             if (arg.ty) |ty| try self.unify(param, try self.fromType(ty, arg.span, 0), arg.span, 0);
             if (arg.template) |callback| {
                 const callback_container: ?Nominal = if (callback.container_type) |ty| blk: {
@@ -505,7 +531,7 @@ const Solver = struct {
         if (function.body != 0) try self.unify(frame.result, try self.expression(frame, function.body, depth + 1), frame.ref.module.tokenSpan(ast.firstToken(function.body)), 0);
     }
 
-    const CallTarget = struct { ref: Ref, container: ?Nominal = null };
+    const CallTarget = struct { ref: Ref, container: ?Nominal = null, receiver: ?*Term = null };
 
     fn callTarget(self: *Solver, frame: *Frame, node: Ast.Node.Index, depth: usize) Ir.BuildError!?CallTarget {
         const module = frame.ref.module;
@@ -518,6 +544,13 @@ const Solver = struct {
                 if (ast.declFunction(module.getDeclaration(id).?.node) == null) return null;
                 return .{ .ref = .{ .module = module, .id = id }, .container = frame.container };
             };
+        }
+        if (ast.nodes.items(.tag)[node] == .field_access) {
+            const base = ast.nodes.items(.data)[node].lhs;
+            if (ast.nodes.items(.tag)[base] == .identifier) {
+                const name = ast.tokenSlice(ast.firstToken(base));
+                for (frame.locals.items) |local| if (std.mem.eql(u8, local.name, name)) return null;
+            }
         }
         if (targetWith(module, node, false)) |ref| return .{ .ref = ref };
         if (ast.nodes.items(.tag)[node] == .field_access) {
@@ -535,6 +568,47 @@ const Solver = struct {
             }
         }
         return null;
+    }
+
+    fn instanceCallTarget(self: *Solver, frame: *Frame, node: Ast.Node.Index, depth: usize) Ir.BuildError!?CallTarget {
+        const module = frame.ref.module;
+        const ast = &module.source.ast;
+        if (ast.nodes.items(.tag)[node] != .field_access) return null;
+        const data = ast.nodes.items(.data)[node];
+        const name = ast.tokenSlice(data.rhs);
+        const receiver = root(try self.expression(frame, data.lhs, depth + 1));
+        var container: ?Nominal = null;
+        var owner: *Module = undefined;
+        var identity: Module.DeclId = undefined;
+        switch (receiver.value) {
+            .nominal => |n| {
+                container = n;
+                owner = n.module;
+                identity = n.id;
+                const owner_ast = &owner.source.ast;
+                for (owner_ast.fullStruct(owner_ast.decl(owner.getDeclaration(identity).?.node).ast.init_node).?) |member| {
+                    if (owner_ast.nodes.items(.tag)[member] == .container_field and std.mem.eql(u8, owner_ast.tokenSlice(owner_ast.firstToken(member)), name)) return null;
+                }
+            },
+            .known => |ty| {
+                const nominal = self.ir.getType(ty).?;
+                const source = switch (nominal) {
+                    .record => |r| blk: {
+                        for (r.fields) |field_value| if (std.mem.eql(u8, field_value.name, name)) return null;
+                        break :blk r.source;
+                    },
+                    .enumeration => |e| e.source,
+                    else => return null,
+                };
+                owner = if (module.compilation) |comp| comp.getModule(source).? else module;
+                identity = @fromBackingInt(@intCast(if (nominal == .record) nominal.record.identity else nominal.enumeration.identity));
+            },
+            else => return null,
+        }
+        const id = owner.lookupMethod(identity, name) orelse return null;
+        const decl = owner.getDeclaration(id).?;
+        if (owner.source.ast.declFunction(decl.node) == null or (owner != module and !decl.public)) return null;
+        return .{ .ref = .{ .module = owner, .id = id }, .container = container, .receiver = receiver };
     }
 
     fn closure(self: *Solver, frame: *Frame, proto_node: Ast.Node.Index, body_node: Ast.Node.Index, depth: usize) Ir.BuildError!*Term {
@@ -806,12 +880,14 @@ const Solver = struct {
                     }
                     return if (std.mem.eql(u8, callee_name, "@panic")) self.term(.never, span) else self.fromType(try self.ir.internType(.void), span, 0);
                 }
-                if (try self.callTarget(frame, call.ast.fn_expr, depth)) |callee_target| {
+                if ((try self.callTarget(frame, call.ast.fn_expr, depth)) orelse (try self.instanceCallTarget(frame, call.ast.fn_expr, depth))) |callee_target| {
                     if (try self.signature(callee_target.ref, callee_target.container, depth + 1)) |instance| {
                         var child = instance.frame;
                         const f = instance.function;
-                        if (f.params.len == call.ast.args.len) {
-                            for (f.params, call.ast.args) |param, arg| {
+                        const offset: usize = @intFromBool(callee_target.receiver != null);
+                        if (f.params.len == call.ast.args.len + offset) {
+                            if (callee_target.receiver) |receiver| try self.unify(f.params[0], receiver, span, 0);
+                            for (f.params[offset..], call.ast.args) |param, arg| {
                                 const value = try self.expression(frame, arg, depth + 1);
                                 if (root(value).value == .never) return value;
                                 try self.unify(param, value, module.tokenSpan(ast.firstToken(arg)), 0);
@@ -1557,6 +1633,314 @@ fn testContextualVisibility(allocator: std.mem.Allocator, expression: []const u8
     };
     try std.testing.expectEqual(@as(usize, @intFromBool(public)), specializations);
     if (public) try sema.ir.verify();
+}
+
+fn testInstanceProbe(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "instance-probe.nov",
+        \\let Box:(T:type)->type=struct{value:T,
+        \\let map:(object:Box(T),f:(T)->`U)->Box(`U)=Box(`U)[.value=f(object.value)]
+        \\let get:(object:Box(T))->T=object.value
+        \\}
+        \\let id:(x:`U)->`U=x
+        \\let wrap:(x:Box(`T))->Box(`T)=x.map(id)
+        \\let get:(x:Box(`T))->`T=x.get()
+        \\let B=Box(bool)
+    );
+    defer module.deinit();
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    ir.source_len = @intCast(module.source.ast.source.len);
+    const count = module.declarations.items.len;
+    const alias = module.source.ast.decl(module.getDeclaration(module.lookup("B").?).?.node).ast.init_node;
+    const box = (try TypeResolver.resolveInScopeReadOnly(&module, &ir, alias, null, null, &.{})).?;
+    for ([_][]const u8{ "wrap", "get" }, [_]Ir.TypeId{ box, try ir.internType(.boolean) }) |name, expected| {
+        const result = (try probeResult(&module, &ir, .{ .module = &module, .id = module.lookup(name).? }, &.{.{ .ty = box, .span = module.getDeclaration(module.lookup(name).?).?.name_span }}, module.getDeclaration(module.lookup(name).?).?.name_span)).?;
+        try std.testing.expectEqual(expected, result);
+        try std.testing.expectEqual(count, module.declarations.items.len);
+        try std.testing.expectEqual(@as(usize, 0), ir.functions.items.len);
+        try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+        try std.testing.expect(!ir.getType(box).?.record.methods_published);
+    }
+}
+
+test "backtick instance cold readonly probes return nominal and ordinary method types without publication under OOM" {
+    try testInstanceProbe(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testInstanceProbe, .{});
+}
+
+fn testInstanceImports(allocator: std.mem.Allocator, public: bool) !void {
+    var comp = Compilation.init(allocator);
+    defer comp.deinit();
+    const source = if (public)
+        "let lib=@import(\"lib.nov\")\nlet A=lib.Alias\nlet main:()={let b=lib.make()\nlet x=b.map(lib.callback)\nlet y=A(bool).map(b,lib.callback)\nlet z=lib.plain().apply(true)\n@println(x.value,y.value,z)}"
+    else
+        "let lib=@import(\"lib.nov\")\nlet main:()={let x=lib.make().hidden(true)\n}";
+    const root = try comp.addSource("/app/main.nov", source);
+    const library = try comp.addSource("/app/lib.nov",
+        \\let Hidden:(T:type)->type=struct{value:T,
+        \\@[public]
+        \\let map:(object:Hidden(T),f:(T)->`U)->Hidden(`U)=Hidden(`U)[.value=f(object.value)]
+        \\let hidden:(object:Hidden(T),x:`U)->`U=x
+        \\}
+        \\let Plain=struct{@[public]
+        \\let apply:(object:Plain,x:`T)->`T=x
+        \\}
+        \\let identity:(x:`T)->`T=x
+        \\@[public]
+        \\let callback=identity
+        \\@[public]
+        \\let Alias=Hidden
+        \\@[public]
+        \\let make:()->Hidden(bool)=Hidden(bool)[.value=true]
+        \\@[public]
+        \\let plain:()->Plain=Plain[]
+    );
+    const module = comp.getModule(root).?;
+    const local = module.lookup("lib").?;
+    try comp.imports.append(allocator, .{ .declaration = comp.declaration_ids.get(.{ .source = root, .local = local }).?, .target = library, .named = false, .span = module.getDeclaration(local).?.name_span });
+    const count = comp.declarations.items.len;
+    var sema = Lowering.lowerCompilation(&comp) catch |err| {
+        try std.testing.expectEqual(count, comp.declarations.items.len);
+        for (comp.modules.items) |owner| try std.testing.expectEqual(@as(usize, 0), owner.diagnostics.items.len);
+        return err;
+    };
+    defer sema.deinit();
+    if (comp.hasErrors() == public) for (comp.modules.items) |owner| std.debug.print("instance imports: {any} {any}\n", .{ owner.source.ast.errors, owner.diagnostics.items });
+    try std.testing.expectEqual(!public, comp.hasErrors());
+    try std.testing.expectEqual(public, sema.lowering_complete);
+    var maps: usize = 0;
+    const owner = comp.getModule(library).?;
+    for (owner.declarations.items) |decl| if (decl.function_template != null and std.mem.eql(u8, owner.sourceSlice(decl.name_span).?, "map")) {
+        maps += 1;
+    };
+    try std.testing.expectEqual(@as(usize, @intFromBool(public)), maps);
+    if (public) try sema.ir.verify();
+}
+
+test "backtick instance imported aliases private result wrappers public methods and canonical IDs under OOM" {
+    for ([_]bool{ false, true }) |public| {
+        try testInstanceImports(std.testing.allocator, public);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testInstanceImports, .{public});
+    }
+}
+
+fn testInstanceInference(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "instance-inference.nov",
+        \\let Box:(T:type)->type=struct{value:T,
+        \\let map:(object:Box(T),convert:(T)->`U)->Box(`U)=Box(`U)[.value=convert(object.value)]
+        \\let choose:(object:Box(T),convert:(T)->`U,other:`U)->`U=convert(object.value)
+        \\}
+        \\let Plain=struct{let apply:(object:Plain,x:`T)->`T=x
+        \\}
+        \\let identity:(x:`V)->`V=x
+        \\let alias=identity
+        \\let toBool:(x:uint)->bool=x==7
+        \\let B=Box(bool)
+        \\let forward:(x:`T)->`T={let box=Box(`T)[.value=x]
+        \\box.choose(identity,x)}
+        \\let main:()={let b=B[.value=true]
+        \\let x:Box(bool)=b.map(alias)
+        \\let y:Box(bool)=B.map(b,identity)
+        \\let z=b.choose(identity,true)
+        \\let number=Box(uint)[.value=7]
+        \\let first=Box(uint).map(number,toBool)
+        \\let second=number.map(toBool)
+        \\let w=Plain[].apply(true)
+        \\let v=forward(true)
+        \\@println(x.value,y.value,z,w,v,first.value,second.value)}
+    );
+    defer module.deinit();
+    var sema = try Lowering.lower(&module);
+    defer sema.deinit();
+    if (module.hasErrors()) std.debug.print("instance errors: {any} {any}\n", .{ module.source.ast.errors, module.diagnostics.items });
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+    var maps: usize = 0;
+    for (module.declarations.items) |decl| {
+        if (decl.function_template != null and std.mem.eql(u8, module.sourceSlice(decl.name_span).?, "map")) maps += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), maps);
+}
+
+fn testTerminalOperands(allocator: std.mem.Allocator, source: []const u8, expected: ?Module.Diagnostic.Tag) !void {
+    var module = try Module.init(allocator, "terminal-operands.nov", source);
+    defer module.deinit();
+    const count = module.declarations.items.len;
+    var sema = Lowering.lower(&module) catch |err| {
+        try std.testing.expectEqual(count, module.declarations.items.len);
+        try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+        return err;
+    };
+    defer sema.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
+    if (expected) |tag| {
+        try std.testing.expect(!sema.lowering_complete);
+        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+        try std.testing.expectEqual(tag, module.diagnostics.items[0].tag);
+    } else {
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expect(sema.lowering_complete);
+        try sema.ir.verify();
+    }
+    for (module.declarations.items) |decl| if (decl.function_template != null)
+        try std.testing.expect(!std.mem.eql(u8, module.sourceSlice(decl.name_span).?, "f"));
+}
+
+fn testTerminalImports(allocator: std.mem.Allocator) !void {
+    var comp = Compilation.init(allocator);
+    defer comp.deinit();
+    const root = try comp.addSource("/app/main.nov",
+        \\let lib=@import("lib.nov")
+        \\let main:()->uint=lib.R[].f(true,if true{return 1}else{return 2},lib.hidden)
+    );
+    const library = try comp.addSource("/app/lib.nov",
+        \\let hidden:(x:`T)->`T=missing
+        \\@[public]
+        \\let R=struct{@[public]
+        \\let f:(object:R,a:`T,b:`T,cb:(`T)->`T)->`T=missing
+        \\}
+    );
+    const module = comp.getModule(root).?;
+    const local = module.lookup("lib").?;
+    try comp.imports.append(allocator, .{ .declaration = comp.declaration_ids.get(.{ .source = root, .local = local }).?, .target = library, .named = false, .span = module.getDeclaration(local).?.name_span });
+    const count = comp.declarations.items.len;
+    var sema = Lowering.lowerCompilation(&comp) catch |err| {
+        try std.testing.expectEqual(count, comp.declarations.items.len);
+        for (comp.modules.items) |owner| try std.testing.expectEqual(@as(usize, 0), owner.diagnostics.items.len);
+        return err;
+    };
+    defer sema.deinit();
+    try std.testing.expect(!comp.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try std.testing.expectEqual(count, comp.declarations.items.len);
+    for (comp.modules.items) |owner| for (owner.declarations.items) |decl|
+        try std.testing.expect(decl.function_template == null);
+    try sema.ir.verify();
+}
+
+test "backtick instance terminal operands ignore private suffix callbacks and roll back imported OOM" {
+    try testTerminalImports(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testTerminalImports, .{});
+}
+
+fn testTerminalProbe(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "terminal-probe.nov",
+        \\let Box:(T:type)->type=struct{value:T,
+        \\let f:(object:Box(T),a:`U,b:`U,c:`U)->`U=missing
+        \\}
+        \\let B=Box(bool)
+    );
+    defer module.deinit();
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    ir.source_len = @intCast(module.source.ast.source.len);
+    const count = module.declarations.items.len;
+    const alias = module.source.ast.decl(module.getDeclaration(module.lookup("B").?).?.node).ast.init_node;
+    const box = (try TypeResolver.resolveInScopeReadOnly(&module, &ir, alias, null, null, &.{})).?;
+    const id = module.lookupMethod(module.lookup("Box").?, "f").?;
+    const ref: Ref = .{ .module = &module, .id = id, .container_type = box };
+    const span = module.getDeclaration(id).?.name_span;
+    const boolean = try ir.internType(.boolean);
+    const string = try ir.internType(.string);
+    const args = [_]Argument{
+        .{ .ty = box, .span = span },
+        .{ .ty = boolean, .span = span },
+        .{ .ty = null, .span = span, .terminal = true },
+        .{ .ty = string, .span = span },
+    };
+    try std.testing.expectEqual(@as(?Ir.TypeId, null), try probeResult(&module, &ir, ref, &args, span));
+    const params = (try terminalParameters(&module, &ir, ref, &args, span)).?;
+    defer allocator.free(params);
+    try std.testing.expectEqualSlices(?Ir.TypeId, &.{ box, boolean, boolean, null }, params);
+    try std.testing.expectEqual(count, module.declarations.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ir.functions.items.len);
+    try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+    try std.testing.expect(!ir.getType(box).?.record.methods_published);
+}
+
+test "backtick instance terminal operands readonly prefix constraints publish no methods signatures or IDs under OOM" {
+    try testTerminalProbe(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testTerminalProbe, .{});
+}
+
+test "backtick instance terminal operands stop constraints and demand at first exit including both branches under OOM" {
+    const prelude = "let R=struct{let f:(object:R,a:`T,b:`T,c:`T)->`T=missing\n}\n";
+    for ([_][]const u8{
+        "let main:()=R[].f(true,@panic(\"stop\"),\"unreachable\")",
+        "let main:()=R[].f(true,@panic(\"stop\"),unknown)",
+        "let main:()=R[].f(true,loop{},unknown)",
+        "let main:()->bool=R[].f(true,loop{},\"wrong\")",
+        "let main:()->uint=R[].f(loop{},unknown,unknown)",
+        "let main:()->uint=R.f(R[],true,loop{},\"wrong\")",
+        "let main:()->uint=R[].f(if true{return 1}else{return 2},true,unknown)",
+        "let main:()->uint=R[].f(true,if false{return 1}else{return 2},\"wrong\")",
+        "let main:()->uint=R.f(R[],if true{return 1}else{return 2},true,unknown)",
+        "let main:()=R.f(R[],true,@panic(\"stop\"),unknown)",
+        "let main:()->uint=R[].f({return 1},true,unknown)",
+        "@[noreturn]\nlet main:()=R[].f(if true{@panic(\"left\")}else{@panic(\"right\")},true,unknown)",
+    }) |tail| {
+        const source = try std.mem.concat(std.testing.allocator, u8, &.{ prelude, tail });
+        defer std.testing.allocator.free(source);
+        try testTerminalOperands(std.testing.allocator, source, null);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testTerminalOperands, .{ source, @as(?Module.Diagnostic.Tag, null) });
+    }
+    for ([_]struct { tail: []const u8, tag: Module.Diagnostic.Tag }{
+        .{ .tail = "let main:()=R[].f(true,@panic(\"stop\"))", .tag = .argument_count_mismatch },
+        .{ .tail = "let main:()=R[].f(true,@panic(\"stop\"),unknown,unknown)", .tag = .argument_count_mismatch },
+        .{ .tail = "let main:()=R[].f(1,@panic(\"stop\"),true)", .tag = .literal_needs_type },
+        .{ .tail = "let main:()=R[].f(true,\"wrong\",@panic(\"stop\"))", .tag = .generic_function_conflict },
+        .{ .tail = "@[noreturn]\nlet main:()=R[].f(if true{return}else{return},true,unknown)", .tag = .noreturn_return },
+    }) |case| {
+        const source = try std.mem.concat(std.testing.allocator, u8, &.{ prelude, case.tail });
+        defer std.testing.allocator.free(source);
+        try testTerminalOperands(std.testing.allocator, source, case.tag);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testTerminalOperands, .{ source, @as(?Module.Diagnostic.Tag, case.tag) });
+    }
+    for ([_][]const u8{
+        "let f:(a:`T,b:`T,c:`T)->`T=missing\nlet main:()=f(true,@panic(\"stop\"),\"wrong\")",
+        "let f:(a:`T,b:`T)->`T=missing\nlet main:()->uint=f(if true{return 1}else{return 2},unknown)",
+        "let id:(x:`T)->`T=x\nlet R=struct{let f:(object:R,cb:(bool)->bool,x:`T,y:`T)->`T=missing\n}\nlet main:()->uint=R[].f(id,if true{return 1}else{return 2},unknown)",
+        "let id:(x:`T)->`T=missing\nlet f:(x:`T,cb:(`T)->`T)->`T=missing\nlet main:()->uint=f(if true{return 1}else{return 2},id)",
+        "let id:(x:`T)->`T=x\nlet R=struct{let f:(object:R,cb:(`T)->`T,a:`T,b:`T,c:`T)->`T=missing\n}\nlet main:()=R[].f(id,true,@panic(\"stop\"),\"wrong\")",
+        "let f:(x:uint,y:`T)->`T=missing\nlet main:()=f(1,@panic(\"stop\"))",
+        "let Box:(T:type)->type=struct{value:T,let f:(object:Box(T),a:`U,b:`U,c:`U)->`U=missing\n}\nlet main:()=Box(bool)[.value=true].f(true,@panic(\"stop\"),unknown)",
+    }) |source| {
+        try testTerminalOperands(std.testing.allocator, source, null);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testTerminalOperands, .{ source, @as(?Module.Diagnostic.Tag, null) });
+    }
+}
+
+test "backtick instance inference receiver callbacks nominal results static canonical IDs and OOM" {
+    try testInstanceInference(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testInstanceInference, .{});
+}
+
+test "backtick instance abandoned fresh nominal probes publish no methods signatures IDs or demand under OOM" {
+    for ([_][]const u8{
+        "let Box:(T:type)->type=struct{value:T,let map:(object:Box(T),f:(T)->`U)->Box(`U)=Box(`U)[.value=f(object.value)]\n}\nlet make:(x:`T)->Box(`T)=Box(`T)[.value=x]\nlet id:(x:`T)->`T=x\nlet first:(a:`A,b:`B)->`A=a\nlet main:()={let x=first(make(true).map(id),1)\n}",
+        "let Box:(T:type)->type=struct{value:T,let get:(object:Box(T))->T=object.value\n}\nlet make:(x:`T)->Box(`T)=Box(`T)[.value=x]\nlet first:(a:`A,b:`B)->`A=a\nlet main:()={let x=first(make(true).get(),1)\n}",
+    }) |source| {
+        try testSpeculativeFailure(std.testing.allocator, source);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testSpeculativeFailure, .{source});
+    }
+}
+
+test "backtick instance conflicts unbound variables unsupported values arity and noreturn diagnose under OOM" {
+    const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag };
+    for ([_]Case{
+        .{ .source = "let R=struct{let f:(object:R,x:`T,y:`T)->`T=x\n}\nlet main:()={let x=R[].f(true,\"s\")\n}", .tag = .generic_function_conflict },
+        .{ .source = "let R=struct{let f:(object:R)->`T=1\n}\nlet main:()={let x=R[].f()\n}", .tag = .generic_function_ambiguous },
+        .{ .source = "let R=struct{let f:(object:R,x:`T)->`T={let y:`U=x\ny}\n}\nlet main:()={let x=R[].f(true)\n}", .tag = .unbound_type_variable },
+        .{ .source = "let R=struct{let f:(object:R,x:`T)->`T=x\n}\nlet main:()={let x=R[].f()\n}", .tag = .argument_count_mismatch },
+        .{ .source = "let R=struct{let f:(object:R,x:`T)->`T=x\n}\nlet main:()={let f=R[].f\n}", .tag = .unknown_field },
+        .{ .source = "let R=struct{@[noreturn]\nlet stop:(object:R,x:`T)->`T=loop {}\n}\nlet main:()={R[].stop(true)}", .tag = .noreturn_result },
+        .{ .source = "let R=struct{@[noreturn]\nlet stop:(object:R,x:`T)=@panic(\"stop\")\n}\nlet main:()={R[].stop(true)\n@print()}", .tag = .unreachable_code },
+    }) |case| {
+        try testInferenceFailureAllocations(std.testing.allocator, case.source, case.tag);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testInferenceFailureAllocations, .{ case.source, case.tag });
+    }
 }
 
 test "backtick contextual imported public aliases retain private template provenance and visibility under OOM" {

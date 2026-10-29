@@ -1,0 +1,81 @@
+; nov run examples/generic-methods.nov
+; nov test examples/generic-methods.nov
+; Receiver, callback, argument and expected types must agree exactly.
+
+let identity: (value: `T) -> `T = value
+let identityAlias = identity
+let increment: (value: uint) -> uint = value + 1
+let text: (value: uint) -> string = "value:{value}"
+let answer: (value: uint) -> `U = 42
+
+let Box: (T: type) -> type = struct {
+    value: T,
+
+    let map: (self: Box(T), convert: (T) -> `U) -> Box(`U) = Box(`U)[ .value = convert(self.value) ]
+    let choose: (self: Box(T), convert: (T) -> `U, other: `U) -> `U = convert(self.value)
+}
+
+let Plain = struct {
+    let apply: (self: Plain, value: `T) -> `T = value
+}
+
+let B = Box(uint)
+
+let forward: (value: `T) -> Box(`T) = Box(`T)[ .value = value ].map(identity)
+
+let main: () = {
+    let box = Box(uint)[ .value = 41 ]
+    @println(box.map(increment).value, box.map(text).value)
+    @println(box.map(identity).value, Box(uint).map(box, identityAlias).value)
+    @println(Plain[].apply("plain"), forward(true).value)
+}
+
+@[test]
+let receiver_and_callback: () = {
+    let box = Box(uint)[ .value = 41 ]
+    @assert(box.map(increment).value == 42)
+    @assert(box.map(text).value == "value:41")
+    @assert(box.value == 41)
+}
+
+@[test]
+let expected_and_argument_constraints: () = {
+    let box = Box(uint)[ .value = 42 ]
+    let mapped: Box(string) = box.map(text)
+    let expected: Box(uint) = box.map(answer)
+    let selected: uint = box.choose(identity, 0)
+    @assert(mapped.value == "value:42" and selected == 42)
+    @assert(expected.value == 42)
+    @assert(box.choose(answer, @as(uint, 7)) == 42)
+    @assert(box.choose(identityAlias, @as(uint, 7)) == 42)
+}
+
+@[test]
+let contextual_identity: () = {
+    let box = Box(string)[ .value = "unchanged" ]
+    @assert(box.map(identity).value == "unchanged")
+    let mapped: Box(string) = box.map(identityAlias)
+    @assert(mapped.value == box.value)
+    @assert(forward(true).value)
+}
+
+@[test]
+let plain_nominal_and_static: () = {
+    let box = B[ .value = 41 ]
+    @assert(B.map(box, increment).value == box.map(increment).value)
+    @assert(Plain[].apply(true))
+    @assert(Plain.apply(Plain[], "static") == "static")
+}
+
+@[test]
+let byvalue_receiver_snapshot: () = {
+    let mut box = Box([]string)[ .value = ["before"] ]
+    let saved: Box([]string) = box.map(
+        {
+            box.value[0] = "after"
+            identity
+        }
+    )
+    @assert(saved.value[0] == "before")
+    @assert(box.value[0] == "after")
+}

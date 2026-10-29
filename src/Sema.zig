@@ -450,8 +450,17 @@ pub fn requestType(self: *Sema, module: *Module, id: Module.DeclId) Ir.BuildErro
 
 /// Cache by defining declaration and canonical, ordered variable bindings.
 /// Publish the signature before queuing the body, permitting mutual recursion.
-pub fn specializeFunction(self: *Sema, caller: *Module, ref: GenericFunctions.Ref, bindings: []const Module.TypeBinding, depth: usize, span: Module.Span) Ir.BuildError!?Module.DeclId {
+pub fn specializeFunction(self: *Sema, caller: *Module, reference: GenericFunctions.Ref, bindings: []const Module.TypeBinding, depth: usize, span: Module.Span) Ir.BuildError!?Module.DeclId {
+    var ref = reference;
     const module = ref.module;
+    if (ref.container_type) |ty| {
+        // Read-only receiver lookup retains the source template. Demand must
+        // use the concrete sibling so static and instance calls share a key.
+        const record = self.ir.getType(ty).?.record;
+        _ = (try TypeResolver.instantiateArguments(module, &self.ir, @fromBackingInt(record.identity), record.type_args, 0)) orelse return null;
+        const template = module.getDeclaration(ref.id).?;
+        ref.id = module.lookupConcreteMethod(template.container.?, @backingInt(ty), module.sourceSlice(template.name_span).?).?;
+    }
     var count: usize = 0;
     for (module.declarations.items, 0..) |decl, i| {
         if (decl.function_template == null) continue;

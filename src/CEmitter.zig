@@ -3173,6 +3173,155 @@ test "instance calls skip later effects on receiver return panic propagation and
     }
 }
 
+const generic_instance_program =
+    \\let Box:(T:type)->type=struct{value:T,
+    \\let map:(object:Box(T),convert:(T)->`U)->Box(`U)=Box(`U)[.value=convert(object.value)]
+    \\let keep:(object:Box(T),change:()->`U)->T={let ignored=change()
+    \\object.value}
+    \\}
+    \\let Plain=struct{
+    \\let apply:(object:Plain,x:`T)->`T=x
+    \\let produce:(object:Plain,f:()->`T)->`T=f()
+    \\}
+    \\let identity:(x:`T)->`T=x
+    \\let make:()->`T=7
+    \\let main:()={let mut r=Box([][]string)[.value=[["old"+"!"]]]
+    \\let mut count:int=0
+    \\let receiver=()->Box([][]string){count+=1
+    \\@println("receiver",count)
+    \\r}
+    \\let change=()->bool {@println("argument")
+    \\r.value[0]=["new"+"!"]
+    \\true}
+    \\let read=()->string {r.value[0][0]}
+    \\let saved=receiver().keep(change)
+    \\@println(saved[0][0],read(),count)
+    \\let mapped=Box(bool)[.value=true].map(identity)
+    \\let static=Box(bool).map(mapped,identity)
+    \\@println(mapped.value,static.value)
+    \\let plain=Plain[]
+    \\let n:uint=plain.produce(make)
+    \\@println(plain.apply(true),n)
+    \\}
+;
+
+test "backtick instance generated C receiver order recursive snapshots shared closure cells contextual callbacks source free OOM forced GC" {
+    const c = try arrayTestProgram(generic_instance_program);
+    defer test_gpa.free(c);
+    try testClosureOwnership(test_gpa, generic_instance_program);
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testClosureOwnership, .{generic_instance_program});
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "receiver 1\nargument\nold! new! 1\ntrue true\ntrue 7\n", "", mode);
+}
+
+test "backtick instance terminal operands generated C both branches return before unreachable constraints or specialization" {
+    const source =
+        \\let R=struct{
+        \\let f:(object:R,a:`T,b:`T,c:`T)->`T=missing
+        \\let first:(object:R,x:`T,y:`T)->`T=missing
+        \\}
+        \\let f:(a:`T,b:`T,c:`T)->`T=missing
+        \\let receiver:()->R={@print("receiver ")
+        \\R[]}
+        \\let prefix:()->bool={@print("prefix ")
+        \\true}
+        \\let choose:(flag:bool)->uint=receiver().f(prefix(),if flag{return 1}else{return 2},unknown)
+        \\let first:(flag:bool)->uint=receiver().first(if flag{return 3}else{return 4},true)
+        \\let static:(flag:bool)->uint=R.f(receiver(),prefix(),if flag{return 5}else{return 6},"wrong")
+        \\let direct:(flag:bool)->uint=f(prefix(),if flag{return 7}else{return 8},unknown)
+        \\let main:()={@println(choose(true),choose(false))
+        \\@println(first(true),first(false))
+        \\@println(static(true),static(false))
+        \\@println(direct(true),direct(false))}
+    ;
+    const c = try arrayTestProgram(source);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "receiver prefix receiver prefix 1 2\nreceiver receiver 3 4\nreceiver prefix receiver prefix 5 6\nprefix prefix 7 8\n", "", mode);
+}
+
+const generic_flow_program =
+    \\let W=struct{let f:(self:W,a:`T,b:`T,c:`T)->`T=missing
+    \\}
+    \\let C=struct{let f:(self:C,a:bool,b:bool,c:bool)->bool=a
+    \\}
+    \\let Normal=struct{let f:(self:Normal,a:`T,b:`T,c:`T)->`T=a
+    \\}
+    \\let matched:(flag:bool)->uint=W[].f(true,match flag{true=>{return 1}
+    \\false=>{return 2}},unknown)
+    \\let exhaustion:()->uint=W[].f(true,loop false{}else{return 3},unknown)
+    \\let concrete:(flag:bool)->uint=C[].f(true,match flag{true=>{return 4}
+    \\false=>{return 5}},unknown)
+    \\let parent:()->bool=Normal[].f(true,loop{loop false{}else{break true}},true)
+    \\let main:()={let a=matched(true)
+    \\let b=matched(false)
+    \\let c=exhaustion()
+    \\let saved=()->uint{a+b+c}
+    \\@println(a,b,c,saved(),concrete(true),concrete(false),parent())}
+;
+
+test "backtick instance abstract control flow matches exhaustion and parent loop scopes source free OOM forced GC" {
+    try testClosureOwnership(test_gpa, generic_flow_program);
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testClosureOwnership, .{generic_flow_program});
+    const c = try arrayTestProgram(generic_flow_program);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "1 2 3 6 4 5 true\n", "", mode);
+}
+
+test "backtick instance factory signatures preserve terminal execution source free OOM forced GC" {
+    const prelude =
+        \\let R=struct{
+        \\let f:(object:R,a:`T,b:`T,c:`T)->`T=missing
+        \\@[noreturn]
+        \\let stop:(object:R)=@panic("factory")
+        \\}
+        \\let make:()->R={@print("made ")
+        \\R[]}
+        \\let Factory=struct{let make:()->R={@print("made ")
+        \\R[]}
+        \\}
+        \\let main:()={let label="owned"
+        \\let keep=()->string{label}
+        \\R[].f(true,
+    ;
+    for ([_][]const u8{ "make().stop()", "{let r=make()\nr.stop()}", "Factory.make().stop()" }) |argument| {
+        const source = try std.mem.concat(test_gpa, u8, &.{ prelude, argument, ",unknown)}" });
+        defer test_gpa.free(source);
+        try testClosureOwnership(test_gpa, source);
+        try TestAllocations.checkAllAllocationFailures(test_gpa, testClosureOwnership, .{source});
+        const c = try arrayTestProgram(source);
+        defer test_gpa.free(c);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode|
+            try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 1, "made ", "panic: factory\n", mode);
+    }
+}
+
+test "backtick instance generated C terminal argument skips later effects and noreturn methods terminate" {
+    const prelude =
+        \\let R=struct{
+        \\let skip:(object:R,x:`T,y:`T)->`T=x
+        \\@[noreturn]
+        \\let stop:(object:R,x:`T)=@panic("stop")
+        \\}
+        \\let later:()->bool={@println("BAD")
+        \\true}
+    ;
+    for ([_]struct { tail: []const u8, message: []const u8 }{
+        .{ .tail = "let main:()={R[].skip(@panic(\"argument\"),later())\n}", .message = "panic: argument\n" },
+        .{ .tail = "@[noreturn]\nlet main:()=R[].stop(true)", .message = "panic: stop\n" },
+        .{ .tail = "@[noreturn]\nlet main:()=R[].skip(if true{@panic(\"branch\")}else{@panic(\"other\")},unknown)", .message = "panic: branch\n" },
+        .{ .tail = "@[noreturn]\nlet main:()=R[].skip({let r=R[]\nr.stop(true)},unknown)", .message = "panic: stop\n" },
+    }) |case| {
+        const source = try std.mem.concat(test_gpa, u8, &.{ prelude, "\n", case.tail });
+        defer test_gpa.free(source);
+        const c = try arrayTestProgram(source);
+        defer test_gpa.free(c);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode|
+            try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 1, "", case.message, mode);
+    }
+}
+
 test "instance receiver snapshots survive later binding replacement" {
     const source =
         \\let R=struct{s:string,

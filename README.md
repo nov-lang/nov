@@ -676,7 +676,31 @@ Signatures may contain nested arrays, function types and nominal generic-contain
 templates such as ``Box(`T)``. Concrete function values can be passed to generic
 functions with function-typed parameters. Top-level functions, imported/public
 aliases, namespace static functions and generic-container static/sibling methods
-support direct calls; aliases share canonical specializations.
+support direct calls; aliases share canonical specializations. Generic instance
+methods also infer method-local backtick variables:
+
+```nov
+let Box: (T: type) -> type = struct {
+    value: T,
+    let map: (self: Box(T), convert: (T) -> `U) -> Box(`U) =
+        Box(`U)[ .value = convert(self.value) ]
+}
+let identity: (x: `V) -> `V = x
+let toBool: (x: uint) -> bool = x == 7
+let number = Box(uint)[ .value = 7 ]
+let mapped = number.map(toBool)             ; Box(bool)
+let same: Box(uint) = number.map(identity)  ; contextual generic callback
+```
+
+The concrete receiver container binds `T`; explicit arguments, callback signatures,
+the expected result and supported body constraints infer method-local `U`. Static
+`Box(uint).map(number, toBool)` and instance `number.map(toBool)` calls share the
+same canonical specialization, including through imported/public aliases. Existing
+public/private access and field-before-method lookup rules still apply. The exact
+nominal receiver is passed by value: it evaluates and snapshots once **before**
+explicit arguments, which evaluate once left-to-right. No mutable receiver or
+implicit borrow is introduced. Bound method values (`number.map`) and callable
+fields are not supported.
 
 A named generic function also specializes as a value when an exact concrete
 function type is expected, using existing syntax:
@@ -725,15 +749,16 @@ Ordinary closures inside a generic body can capture values with substituted
 concrete types, including signatures referring to the enclosing type variables.
 They are **not generic closures**: local generic templates, closures introducing
 their own inferred type variables, runtime-polymorphic unspecialized generic
-function values, and generic **instance** method inference remain deferred.
+function values remain deferred.
 Explicit function specialization syntax is not provided.
 
 Specialization is demand-driven and canonical, bounded to 64 expansion levels and
 1024 specializations per defining module; inference is bounded to 8192 terms and
 128 levels. Unused generic bodies are not type-checked. Failed/OOM lowering rolls
 back partial specializations and demands; speculative result probes do not publish
-specializations or body demands. Fresh nominal result layouts can be inferred
-without depending on earlier instantiation order. See
+methods, specializations, declaration IDs or body/worklist demands. Fresh nominal
+result layouts can supply inference constraints without depending on earlier
+instantiation order. See
 [`examples/generic-functions.nov`](examples/generic-functions.nov).
 
 `#` is separate: it denotes **proposed explicit compile-time arguments**, not
@@ -975,7 +1000,9 @@ The delivered subset is deliberately bounded:
   Existing fields take precedence over method lookup; array/string `.len` is not
   a method. A bare `item.method` does not create a bound function or closure;
   explicit `Type.method` remains an ordinary unbound function value. Concrete
-  generic union instances support these same method calls.
+  generic union instances support these same method calls. Methods with their own
+  backtick variables use the bounded instance inference described above; callable
+  fields remain unsupported.
   Container constants, nested type declarations, general type values,
   struct global instances and C FFI are unsupported.
 - Printing requires exactly the container method `toString: (MyType) -> string`.

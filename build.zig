@@ -153,6 +153,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const generic_function_tests = b.step("test-cli-generic-functions", "Run direct generic function CLI tests");
     addGenericFunctionCliTests(b, exe, generic_function_tests);
     test_step.dependOn(generic_function_tests);
+    const generic_method_tests = b.step("test-cli-generic-methods", "Run inferred generic instance method CLI tests");
+    addGenericMethodCliTests(b, exe, generic_method_tests);
+    test_step.dependOn(generic_method_tests);
     addRangeValueCliTests(b, exe, test_step, fixtures);
     addBorrowCliTests(b, exe, test_step, fixtures);
     _ = fixtures.add("library-result-source.nov", @embedFile("lib/result.nov"));
@@ -1886,7 +1889,7 @@ fn addGenericFunctionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_
         .{ .name = "unbound", .source = "let x:`T=true\nlet main:()={}", .diagnostic = "unbound backtick type variable" },
         .{ .name = "unbound-body", .source = "let f:(x:`T)->`T={let y:`U=x\ny}\nlet main:()={let x=f(true)\n}", .diagnostic = "unbound backtick type variable" },
         .{ .name = "unsupported-inference", .source = "let f:(x:`T)->`U=match x{true=>\"yes\"\nfalse=>\"no\"}\nlet main:()={let x=f(true)\n}", .diagnostic = "type-constraint inference for this generic function body expression is not supported yet" },
-        .{ .name = "instance-call", .source = "let S=struct{let f:(self:S,x:`T)->`T=x\n}\nlet main:()={let s=S[]\nlet x=s.f(true)\n}", .diagnostic = "generic functions require a named module template" },
+        .{ .name = "bound-method", .source = "let S=struct{let f:(self:S,x:`T)->`T=x\n}\nlet main:()={let s=S[]\nlet f:(bool)->bool=s.f\n}", .diagnostic = "unknown container field, method, enum tag or union variant" },
         .{ .name = "private-function", .source = "let lib=@import(\"library.nov\")\nlet main:()={let x=lib.hidden(true)\n}", .diagnostic = "declaration needs a resolved type before use here" },
         .{ .name = "private-method", .source = "let lib=@import(\"library.nov\")\nlet main:()={let x=lib.NS.private(true)\n}", .diagnostic = "declaration needs a resolved type before use here" },
         .{ .name = "private-sibling", .source = "let lib=@import(\"library.nov\")\nlet main:()={let x=lib.G(uint).sibling(true,1)\n}", .diagnostic = "declaration needs a resolved type before use here" },
@@ -1896,6 +1899,194 @@ fn addGenericFunctionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_
         _ = fixtures.add(source, case.source);
         const check = b.addRunArtifact(exe);
         check.step.name = b.fmt("CLI generic functions reject: {s}", .{case.name});
+        check.setCwd(fixtures.getDirectory());
+        check.addArgs(&.{ "check", "--semantic", source });
+        check.expectExitCode(1);
+        check.expectStdOutEqual("");
+        check.expectStdErrMatch(case.diagnostic);
+        test_step.dependOn(&check.step);
+    }
+}
+
+fn addGenericMethodCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    const fixtures = b.addWriteFiles();
+    _ = fixtures.add("generic-methods.nov", @embedFile("examples/generic-methods.nov"));
+    _ = fixtures.add("library.nov",
+        \\let secret: uint = 42
+        \\let identity: (value: `T) -> `T = value
+        \\@[public]
+        \\let callback = identity
+        \\let Hidden: (T: type) -> type = struct {
+        \\    value: T,
+        \\    @[public]
+        \\    let map: (self: Hidden(T), convert: (T) -> `U) -> Hidden(`U) = Hidden(`U)[ .value = convert(self.value) ]
+        \\    let private: (self: Hidden(T), value: `U) -> `U = value
+        \\    @[public]
+        \\    let read: (self: Hidden(T), value: `U) -> uint = secret
+        \\}
+        \\@[public]
+        \\let Alias = Hidden
+        \\@[public]
+        \\let make: () -> Hidden(bool) = Hidden(bool)[ .value = true ]
+        \\let Plain = struct {
+        \\    @[public]
+        \\    let apply: (self: Plain, value: `T) -> `T = value
+        \\}
+        \\@[public]
+        \\let plain: () -> Plain = Plain[]
+        \\
+    );
+    _ = fixtures.add("api.nov", "let library = @import(\"library.nov\")\n@[public]\nlet Box = library.Alias\n@[public]\nlet callback = library.callback\n");
+    _ = fixtures.add("imported.nov",
+        \\let library = @import("library.nov")
+        \\let same = @import("./library.nov")
+        \\let api = @import("api.nov")
+        \\let B = api.Box(bool)
+        \\let secret: uint = 100
+        \\let verify: () = {
+        \\    let box = library.make()
+        \\    let instance: B = box.map(api.callback)
+        \\    let static: B = same.Alias(bool).map(box, library.callback)
+        \\    let alias: B = B.map(box, same.callback)
+        \\    @assert(instance.value and static.value and alias.value)
+        \\    @assert(box.read(true) == 42)
+        \\    @assert(library.plain().apply("plain") == "plain")
+        \\}
+        \\@[test]
+        \\let imported_aliases_and_visibility: () = verify()
+        \\let main: () = verify()
+        \\
+    );
+    _ = fixtures.add("order.nov",
+        \\let Box: (T: type) -> type = struct {
+        \\    value: T,
+        \\    let map: (self: Box(T), convert: (T) -> `U, other: `U) -> `U = convert(self.value)
+        \\}
+        \\let increment: (value: uint) -> uint = {
+        \\    @print("C")
+        \\    value + 1
+        \\}
+        \\let receiver: () -> Box(uint) = {
+        \\    @print("R")
+        \\    Box(uint)[ .value = 41 ]
+        \\}
+        \\let callback: () -> (uint) -> uint = {
+        \\    @print("A")
+        \\    increment
+        \\}
+        \\let argument: () -> uint = {
+        \\    @print("B")
+        \\    0
+        \\}
+        \\let verify: () = {
+        \\    @assert(receiver().map(callback(), argument()) == 42)
+        \\    @println("!")
+        \\    @assert(Box(uint).map(receiver(), callback(), argument()) == 42)
+        \\    @println("!")
+        \\}
+        \\@[test]
+        \\let receiver_once_before_arguments: () = verify()
+        \\let main: () = verify()
+        \\
+    );
+    for ([_][]const u8{ "generic-methods.nov", "library.nov", "api.nov", "imported.nov", "order.nov" }) |source| {
+        const fmt = b.addRunArtifact(exe);
+        fmt.step.name = b.fmt("CLI generic methods fmt: {s}", .{source});
+        fmt.setCwd(fixtures.getDirectory());
+        fmt.addArgs(&.{ "fmt", "--check", source });
+        fmt.expectExitCode(0);
+        fmt.expectStdOutEqual("");
+        fmt.expectStdErrEqual("");
+        test_step.dependOn(&fmt.step);
+    }
+    for ([_][]const u8{ "generic-methods.nov", "imported.nov", "order.nov" }) |source| {
+        const check = b.addRunArtifact(exe);
+        check.step.name = b.fmt("CLI generic methods semantic: {s}", .{source});
+        check.setCwd(fixtures.getDirectory());
+        check.addArgs(&.{ "check", "--semantic", source });
+        check.expectExitCode(0);
+        check.expectStdOutEqual("");
+        check.expectStdErrEqual("");
+        test_step.dependOn(&check.step);
+    }
+    for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+        for ([_][]const u8{ "generic-methods.nov", "imported.nov", "order.nov" }) |source| {
+            for ([_][]const u8{ "run", "test" }) |command| {
+                const run = b.addRunArtifact(exe);
+                run.step.name = b.fmt("CLI generic methods: {s} {s} ({s})", .{ command, source, mode });
+                run.setCwd(fixtures.getDirectory());
+                run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+                run.setEnvironmentVariable("NOV_CC", "");
+                run.setEnvironmentVariable("CC", "");
+                run.addArgs(&.{ command, source });
+                if (mode.len != 0) run.addArg(mode);
+                const tests = std.mem.eql(u8, command, "test");
+                const imported = std.mem.eql(u8, source, "imported.nov");
+                const order = std.mem.eql(u8, source, "order.nov");
+                run.expectExitCode(0);
+                run.expectStdOutEqual(if (order)
+                    (if (tests) "RABC!\nRABC!\nPASS receiver_once_before_arguments\n1 passed; 0 failed; 1 total\n" else "RABC!\nRABC!\n")
+                else if (imported)
+                    (if (tests) "PASS imported_aliases_and_visibility\n1 passed; 0 failed; 1 total\n" else "")
+                else if (tests)
+                    "PASS receiver_and_callback\nPASS expected_and_argument_constraints\nPASS contextual_identity\nPASS plain_nominal_and_static\nPASS byvalue_receiver_snapshot\n5 passed; 0 failed; 5 total\n"
+                else
+                    "42 value:41\n41 41\nplain true\n");
+                run.expectStdErrEqual("");
+                test_step.dependOn(&run.step);
+            }
+        }
+    }
+    const emit = b.addRunArtifact(exe);
+    emit.step.name = "CLI generic methods emit canonical specializations";
+    emit.setCwd(fixtures.getDirectory());
+    emit.addArgs(&.{ "emit-c", "imported.nov" });
+    emit.expectExitCode(0);
+    emit.expectStdErrEqual("");
+    const generated = b.addWriteFiles();
+    _ = generated.addCopyFile(emit.captureStdOut(.{}), "imported.c");
+    const canonical_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = generated.add("canonical.zig",
+            \\const std = @import("std");
+            \\const source = @embedFile("imported.c");
+            \\test "static instance and imported aliases share one map specialization" {
+            \\    var lines = std.mem.splitScalar(u8, source, '\n');
+            \\    var maps: usize = 0;
+            \\    while (lines.next()) |line| {
+            \\        if (std.mem.endsWith(u8, line, " {") and std.mem.indexOf(u8, line, "_nov_map_24generic") != null) maps += 1;
+            \\    }
+            \\    try std.testing.expectEqual(@as(usize, 1), maps);
+            \\}
+            \\
+        ),
+        .target = exe.root_module.resolved_target.?,
+        .optimize = .Debug,
+    }) });
+    const canonical = b.addRunArtifact(canonical_tests);
+    canonical.step.name = "CLI generic methods canonical identity";
+    test_step.dependOn(&canonical.step);
+
+    const box = "let Box:(T:type)->type=struct{value:T,let map:(self:Box(T),convert:(T)->`U)->Box(`U)=Box(`U)[.value=convert(self.value)]\nlet choose:(self:Box(T),convert:(T)->`U,other:`U)->`U=convert(self.value)\n}\nlet id:(x:`T)->`T=x\n";
+    for ([_]struct { name: []const u8, source: []const u8, diagnostic: []const u8 }{
+        .{ .name = "callback-input-conflict", .source = box ++ "let f:(x:int)->bool=true\nlet main:()={let x=Box(uint)[.value=1].map(f)\n}", .diagnostic = "constraints require exactly identical types" },
+        .{ .name = "expected-result-conflict", .source = box ++ "let main:()={let x:Box(int)=Box(uint)[.value=1].map(id)\n}", .diagnostic = "constraints require exactly identical types" },
+        .{ .name = "argument-result-conflict", .source = box ++ "let main:()={let x=Box(uint)[.value=1].choose(id,@as(int,2))\n}", .diagnostic = "constraints require exactly identical types" },
+        .{ .name = "ambiguous-result", .source = "let S=struct{let f:(self:S,x:`T)->`T=x\n}\nlet main:()={let x=S[].f(1)\n}", .diagnostic = "cannot infer every generic function type variable" },
+        .{ .name = "ambiguous-callback", .source = box ++ "let f:(x:uint)->`U=1\nlet main:()={let x=Box(uint)[.value=1].choose(f,1)\n}", .diagnostic = "integer literals have no default type" },
+        .{ .name = "private-instance", .source = "let lib=@import(\"library.nov\")\nlet main:()={let x=lib.make().private(true)\n}", .diagnostic = "unknown container field, method, enum tag or union variant" },
+        .{ .name = "private-static", .source = "let lib=@import(\"library.nov\")\nlet main:()={let x=lib.Alias(bool).private(lib.make(),true)\n}", .diagnostic = "declaration needs a resolved type before use here" },
+        .{ .name = "private-callback", .source = "let lib=@import(\"library.nov\")\nlet main:()={let x:lib.Alias(bool)=lib.make().map(lib.identity)\n}", .diagnostic = "declaration needs a resolved type before use here" },
+        .{ .name = "wrong-self-type", .source = "let S=struct{let f:(self:uint,x:`T)->`T=x\n}\nlet main:()={let x=S[].f(true)\n}", .diagnostic = "constraints require exactly identical types" },
+        .{ .name = "missing-self", .source = "let S=struct{let f:(x:`T)->`T=x\n}\nlet main:()={let x=S[].f(true)\n}", .diagnostic = "argument count does not match the function signature" },
+        .{ .name = "wrong-arity", .source = box ++ "let main:()={let x=Box(bool)[.value=true].map(id,true)\n}", .diagnostic = "argument count does not match the function signature" },
+        .{ .name = "callback-signature", .source = box ++ "let f:(x:uint,y:uint)->uint=x\nlet main:()={let x=Box(uint)[.value=1].map(f)\n}", .diagnostic = "constraints require exactly identical types" },
+        .{ .name = "bound-method", .source = box ++ "let main:()={let box=Box(bool)[.value=true]\nlet f:((bool)->bool)->Box(bool)=box.map\n}", .diagnostic = "unknown container field, method, enum tag or union variant" },
+        .{ .name = "callable-field", .source = "let S=struct{f:(bool)->bool,}\nlet id:(x:bool)->bool=x\nlet main:()={let s=S[.f=id]\nlet x=s.f(true)\n}", .diagnostic = "this type is not supported in semantic analysis yet" },
+    }) |case| {
+        const source = b.fmt("reject-{s}.nov", .{case.name});
+        _ = fixtures.add(source, case.source);
+        const check = b.addRunArtifact(exe);
+        check.step.name = b.fmt("CLI generic methods reject: {s}", .{case.name});
         check.setCwd(fixtures.getDirectory());
         check.addArgs(&.{ "check", "--semantic", source });
         check.expectExitCode(1);
