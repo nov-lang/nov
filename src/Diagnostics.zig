@@ -133,7 +133,7 @@ fn renderModuleWithSources(module: *const Module, compilation: ?*const Compilati
             .invalid_field_default => try writer.writeAll("struct field default must be a scalar literal of the exact field type; nested structs require explicit values"),
             .record_layout_cycle => try writer.writeAll("cyclic by-value struct layout"),
             .record_layout_limit => try writer.writeAll("by-value aggregate nesting exceeds the current limit of 128"),
-            .invalid_to_string => try writer.writeAll("printing a struct, enum or union requires its method toString: (MyType) -> string"),
+            .invalid_to_string => try writer.writeAll("toString must be an accessible ordinary function with signature (MyType) -> string"),
             .duplicate_name => try writer.print("duplicate declaration '{s}'", .{source.slice(diagnostic.span).?}),
             .unknown_name => try writer.print("unknown name '{s}'", .{source.slice(diagnostic.span).?}),
             .unsupported_declaration => try writer.writeAll("unsupported declaration; containers currently allow only function methods"),

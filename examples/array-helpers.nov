@@ -263,7 +263,8 @@ let main: () = {
             sum + value
         }
     )
-    @println("Mapped:", doubled[0], doubled[1], doubled[2], doubled[3])
-    @println("Filtered:", selected[0], selected[1])
+    @println("Numbers:", numbers)
+    @println("Mapped:", doubled)
+    @println("Filtered:", selected)
     @println("Folded:", total)
 }

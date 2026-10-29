@@ -15,9 +15,13 @@ constants: std.ArrayList(Constant) = .empty,
 source_len: u32 = 0,
 source_lengths: std.ArrayList(u32) = .empty,
 functions: std.ArrayList(Function) = .empty,
+/// Owned display names and optional ordinary nominal-to-string functions.
+formatting: std.ArrayList(TypeFormatting) = .empty,
+
 /// Compile-time canonical demand keys, independent of runtime environments.
 local_generic_instances: std.ArrayList(LocalGenericInstance) = .empty,
 pub const LocalGenericInstance = struct { span: Span, outer: []const TypeId, arguments: []const TypeId };
+pub const TypeFormatting = struct { ty: TypeId, display_name: []const u8, formatter: ?FunctionId = null };
 
 /// The current pipeline targets the machine running Nov, not a separate target.
 /// Native aliases are canonical fixed-width integers once resolved.
@@ -71,7 +75,7 @@ pub const Operation = union(enum) {
     field_read: FieldRead,
     /// Update only this field of the current mutable local, not a record snapshot.
     field_store: struct { slot: ValueId, index: u32, value: ValueId, path: []const u32 = &.{} },
-    /// Decimal integers, true/false booleans, UTF8 runes, or a shared immutable string.
+    /// Default structural formatting; strings and runes retain their raw UTF8 bytes.
     to_string: ValueId,
     array_literal: []const ValueId,
     /// Eager recursive array backing copy, including record fields/elements.
@@ -152,6 +156,92 @@ pub const Operation = union(enum) {
     branch: struct { condition: ValueId, then_start: u32, else_start: u32, then_value: ValueId, else_value: ?ValueId, returns: bool = false },
 };
 
+// Cache per body validation, never across metadata/type mutations. Each type
+// and field edge is visited at most once, including shared nominal DAGs. The
+// explicit stack also bounds traversal of forged cycles before layout checking.
+const DefaultPrintability = struct {
+    const State = enum { unknown, visiting, printable, unsupported };
+    const Frame = struct { id: TypeId, next: usize = 0 };
+    states: []State = &.{},
+    stack: []Frame = &.{},
+
+    fn deinit(self: *DefaultPrintability, allocator: std.mem.Allocator) void {
+        allocator.free(self.states);
+        allocator.free(self.stack);
+    }
+
+    fn check(self: *DefaultPrintability, ir: *const Ir, id: TypeId) std.mem.Allocator.Error!bool {
+        if (@backingInt(id) >= ir.types.items.len) return false;
+        if (self.states.len == 0) {
+            const states = try ir.allocator.alloc(State, ir.types.items.len);
+            errdefer ir.allocator.free(states);
+            const stack = try ir.allocator.alloc(Frame, ir.types.items.len);
+            for (ir.types.items, states) |ty, *state| state.* = switch (ty) {
+                .boolean, .integer, .rune, .string, .enumeration => .printable,
+                .array, .record => .unknown,
+                else => .unsupported,
+            };
+            // Hooks terminate structural traversal. verify() validates every
+            // metadata entry independently, even if no traversal reaches it.
+            for (ir.formatting.items) |entry| {
+                const ty = ir.getType(entry.ty) orelse continue;
+                if (entry.formatter != null and (ty == .record or ty == .enumeration)) states[@backingInt(entry.ty)] = .printable;
+            }
+            self.* = .{ .states = states, .stack = stack };
+        }
+        switch (self.states[@backingInt(id)]) {
+            .printable => return true,
+            .unsupported => return false,
+            .unknown => {},
+            .visiting => unreachable,
+        }
+        self.states[@backingInt(id)] = .visiting;
+        self.stack[0] = .{ .id = id };
+        var len: usize = 1;
+        while (len != 0) {
+            const frame = &self.stack[len - 1];
+            const ty = ir.getType(frame.id).?;
+            const child: ?TypeId = switch (ty) {
+                .array => |element| if (frame.next == 0) element else null,
+                .record => |record| blk: {
+                    while (frame.next < record.fields.len) {
+                        const field = record.fields[frame.next];
+                        const field_ty = ir.getType(field.ty);
+                        if (!record.tagged or field_ty == null or field_ty.? != .void) break :blk field.ty;
+                        frame.next += 1;
+                    }
+                    break :blk null;
+                },
+                else => unreachable,
+            };
+            if (child) |child_id| {
+                const index = @backingInt(child_id);
+                if (index >= self.states.len) {
+                    self.states[@backingInt(frame.id)] = .unsupported;
+                    len -= 1;
+                    continue;
+                }
+                switch (self.states[index]) {
+                    .printable => frame.next += 1,
+                    .unsupported, .visiting => {
+                        self.states[@backingInt(frame.id)] = .unsupported;
+                        len -= 1;
+                    },
+                    .unknown => {
+                        self.states[index] = .visiting;
+                        self.stack[len] = .{ .id = child_id };
+                        len += 1;
+                    },
+                }
+            } else {
+                self.states[@backingInt(frame.id)] = .printable;
+                len -= 1;
+            }
+        }
+        return self.states[@backingInt(id)] == .printable;
+    }
+};
+
 pub const Field = struct { name: []const u8, ty: TypeId, span: Span, default: ?ConstId = null };
 /// Nominal by-value layout. Tagged layouts have one active scalar or record payload.
 pub const Record = struct {
@@ -226,6 +316,7 @@ pub const VerifyError = ValidationError || error{
     NonCanonicalConstant,
     InvalidFunctionId,
     InvalidFunctionType,
+    InvalidTypeFormatting,
     InvalidFunctionName,
     DuplicateFunctionName,
     InvalidExportName,
@@ -263,6 +354,8 @@ pub fn deinit(self: *Ir) void {
         self.allocator.free(instance.arguments);
     }
     self.local_generic_instances.deinit(self.allocator);
+    for (self.formatting.items) |entry| self.allocator.free(entry.display_name);
+    self.formatting.deinit(self.allocator);
     for (self.types.items) |ty| {
         switch (ty) {
             .record => |record| {
@@ -285,6 +378,40 @@ pub fn deinit(self: *Ir) void {
     self.constants.deinit(self.allocator);
     self.source_lengths.deinit(self.allocator);
     self.* = undefined;
+}
+
+/// Names are copied; registration may precede formatter body publication.
+/// Replaces the complete entry for this canonical nominal type atomically.
+pub fn setTypeFormatting(self: *Ir, ty: TypeId, display_name: []const u8, formatter: ?FunctionId) BuildError!void {
+    const entry: TypeFormatting = .{ .ty = ty, .display_name = display_name, .formatter = formatter };
+    try self.validateTypeFormatting(entry);
+    const name = try self.allocator.dupe(u8, display_name);
+    errdefer self.allocator.free(name);
+    for (self.formatting.items) |*existing| {
+        if (existing.ty != ty) continue;
+        self.allocator.free(existing.display_name);
+        existing.* = .{ .ty = ty, .display_name = name, .formatter = formatter };
+        return;
+    }
+    try self.formatting.append(self.allocator, .{ .ty = ty, .display_name = name, .formatter = formatter });
+}
+
+/// The returned name borrows this IR, until replacement or deinitialization.
+pub fn getTypeFormatting(self: *const Ir, ty: TypeId) ?TypeFormatting {
+    for (self.formatting.items) |entry| if (entry.ty == ty) return entry;
+    return null;
+}
+
+fn validateTypeFormatting(self: *const Ir, entry: TypeFormatting) VerifyError!void {
+    const ty = self.getType(entry.ty) orelse return error.InvalidTypeId;
+    if (ty != .record and ty != .enumeration) return error.InvalidTypeFormatting;
+    if (entry.display_name.len == 0 or std.mem.indexOfScalar(u8, entry.display_name, 0) != null) return error.InvalidTypeFormatting;
+    if (entry.formatter) |id| {
+        const function = self.getFunction(id) orelse return error.InvalidFunctionId;
+        const signature = self.getType(function.ty) orelse return error.InvalidTypeId;
+        if (signature != .function or function.is_closure or function.noreturn) return error.InvalidTypeFormatting;
+        if (signature.function.params.len != 1 or signature.function.params[0] != entry.ty or (self.getType(signature.function.result) orelse return error.InvalidTypeId) != .string) return error.InvalidTypeFormatting;
+    }
 }
 
 /// Handles survive pool growth. Returned function parameter slices borrow this IR.
@@ -402,6 +529,7 @@ fn freeOperands(self: *Ir, op: Operation) void {
 
 /// Invalidates all function handles and borrowed function/body views, not pools.
 pub fn clearFunctions(self: *Ir) void {
+    for (self.formatting.items) |*entry| entry.formatter = null;
     for (self.functions.items) |function| {
         self.allocator.free(function.name);
         self.allocator.free(function.captures);
@@ -503,6 +631,10 @@ pub fn internConstant(self: *Ir, constant: Constant) InternError!ConstId {
 /// Checks references, resolved value ranges and canonical identities. Deliberately
 /// simple linear interning/quadratic duplicate checks suit the initial small pool.
 pub fn verify(self: *const Ir) VerifyError!void {
+    for (self.formatting.items, 0..) |entry, i| {
+        try self.validateTypeFormatting(entry);
+        for (self.formatting.items[0..i]) |previous| if (previous.ty == entry.ty) return error.InvalidTypeFormatting;
+    }
     for (self.types.items, 0..) |ty, i| {
         try self.validateType(ty, i);
         for (self.types.items[0..i]) |previous| {
@@ -780,6 +912,8 @@ fn borrowElement(self: *const Ir, body: Body, borrow: ValueId, before: usize) Ve
 }
 
 fn validateBodyStructure(self: *const Ir, function: Function, body: Body) VerifyError!void {
+    var printability: DefaultPrintability = .{};
+    defer printability.deinit(self.allocator);
     if (function.extern_name != null) return error.ExternFunctionBody;
     const signature = (self.getType(function.ty) orelse return error.InvalidTypeId).function;
     if (body.instructions.len > std.math.maxInt(u32)) return error.InvalidRegion;
@@ -947,8 +1081,8 @@ fn validateBodyStructure(self: *const Ir, function: Function, body: Body) Verify
             },
             .to_string => |value| {
                 if (ty != .string) return error.InvalidOperation;
-                const operand = self.getType(try operandType(body, value, i)).?;
-                if (operand != .boolean and operand != .integer and operand != .rune and operand != .string) return error.InvalidOperation;
+                const operand = try operandType(body, value, i);
+                if (!try printability.check(self, operand)) return error.InvalidOperation;
             },
             .array_literal => |elements| {
                 if (ty != .array) return error.InvalidOperation;
@@ -1166,8 +1300,8 @@ fn validateBodyStructure(self: *const Ir, function: Function, body: Body) Verify
             .print => |print| {
                 if (ty != .void) return error.InvalidOperation;
                 for (print.args) |arg| {
-                    const operand = self.getType(try operandType(body, arg, i)) orelse return error.InvalidTypeId;
-                    if (operand != .boolean and operand != .integer and operand != .rune and operand != .string) return error.InvalidOperation;
+                    const operand = try operandType(body, arg, i);
+                    if (!try printability.check(self, operand)) return error.InvalidOperation;
                 }
             },
             .call => |call| {
@@ -1826,7 +1960,122 @@ test "scalar array types operations and owned operands are verified" {
     }
 }
 
-test "to_string verifies scalar prior operands result types spans and slot isolation" {
+fn testTypeFormattingOwnership(allocator: std.mem.Allocator) !void {
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    const span: Span = .{ .start = 0, .end = 0 };
+    const record = try ir.internType(.{ .record = .{ .identity = 0, .fields = &.{} } });
+    const string = try ir.internType(.string);
+    const signature = try ir.internType(.{ .function = .{ .params = &.{record}, .result = string } });
+    const formatter = try ir.addFunction("format", signature, span);
+    const literal = try ir.internConstant(.{ .ty = string, .value = .{ .string = "custom" } });
+    try ir.setFunctionBody(formatter, &.{.{ .ty = string, .span = span, .op = .{ .constant = literal } }}, @fromBackingInt(0));
+    var name = [_]u8{ 'E', 'n', 't', 'r', 'y' };
+    try ir.setTypeFormatting(record, &name, null);
+    name[0] = 'X';
+    try std.testing.expectEqualStrings("Entry", ir.getTypeFormatting(record).?.display_name);
+    ir.setTypeFormatting(record, "Renamed", formatter) catch |err| {
+        try std.testing.expectEqualStrings("Entry", ir.getTypeFormatting(record).?.display_name);
+        try std.testing.expect(ir.getTypeFormatting(record).?.formatter == null);
+        return err;
+    };
+    try std.testing.expectEqualStrings("Renamed", ir.getTypeFormatting(record).?.display_name);
+    try std.testing.expectEqual(formatter, ir.getTypeFormatting(record).?.formatter.?);
+    try std.testing.expectEqual(@as(usize, 1), ir.formatting.items.len);
+    try ir.verify();
+    try std.testing.expectError(error.InvalidTypeFormatting, ir.setTypeFormatting(string, "string", null));
+    try std.testing.expectError(error.InvalidTypeFormatting, ir.setTypeFormatting(record, "", null));
+    try std.testing.expectError(error.InvalidFunctionId, ir.setTypeFormatting(record, "Entry", @fromBackingInt(99)));
+    ir.functions.items[@backingInt(formatter)].is_closure = true;
+    try std.testing.expectError(error.InvalidTypeFormatting, ir.verify());
+    ir.functions.items[@backingInt(formatter)].is_closure = false;
+    ir.formatting.items[0].formatter = @fromBackingInt(99);
+    try std.testing.expectError(error.InvalidFunctionId, ir.verify());
+    ir.formatting.items[0].formatter = formatter;
+    ir.clearFunctions();
+    try std.testing.expect(ir.getTypeFormatting(record).?.formatter == null);
+    try ir.verify();
+}
+
+test "type formatting metadata owns names validates hooks and replaces atomically under OOM" {
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testTypeFormattingOwnership, .{});
+}
+
+test "default printing memoizes shared type DAGs for empty arrays and respects hook changes" {
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    const span: Span = .{ .start = 0, .end = 0 };
+    const unit = try ir.internType(.void);
+    const string = try ir.internType(.string);
+    const integer = try ir.internType(.{ .integer = .{ .bits = 64, .signedness = .signed } });
+    var previous = integer;
+    var leaf: TypeId = undefined;
+    for (0..64) |i| {
+        const record = try ir.internType(.{ .record = .{ .identity = @intCast(i), .fields = &.{} } });
+        try ir.setRecordFields(record, &.{
+            .{ .name = "a", .ty = previous, .span = span },
+            .{ .name = "b", .ty = previous, .span = span },
+        });
+        if (i == 0) leaf = record;
+        previous = record;
+    }
+    const array = try ir.internType(.{ .array = previous });
+    const signature = try ir.internType(.{ .function = .{ .params = &.{}, .result = unit } });
+    const function = try ir.addFunction("print_empty", signature, span);
+    try ir.setFunctionBody(function, &.{
+        .{ .ty = array, .span = span, .op = .{ .array_literal = &.{} } },
+        .{ .ty = unit, .span = span, .op = .{ .print = .{ .args = &.{ @fromBackingInt(0), @fromBackingInt(0) }, .newline = true } } },
+        .{ .ty = string, .span = span, .op = .{ .to_string = @fromBackingInt(0) } },
+        .{ .ty = unit, .span = span, .op = .{ .print = .{ .args = &.{@fromBackingInt(2)}, .newline = true } } },
+    }, @fromBackingInt(3));
+    try ir.verify();
+
+    const callback_array = try ir.internType(.{ .array = signature });
+    try ir.setRecordFields(leaf, &.{.{ .name = "callbacks", .ty = callback_array, .span = span }});
+    try std.testing.expectError(error.InvalidOperation, ir.verify());
+    const hook_signature = try ir.internType(.{ .function = .{ .params = &.{previous}, .result = string } });
+    const hook = try ir.addFunction("hook", hook_signature, span);
+    const text = try ir.internConstant(.{ .ty = string, .value = .{ .string = "hook" } });
+    try ir.setFunctionBody(hook, &.{.{ .ty = string, .span = span, .op = .{ .constant = text } }}, @fromBackingInt(0));
+    try ir.setTypeFormatting(previous, "Root", hook);
+    try ir.verify();
+    try ir.setTypeFormatting(leaf, "Leaf", null);
+    ir.formatting.items[1].formatter = @fromBackingInt(99);
+    // Even metadata hidden beneath an overriding hook must be verified.
+    try std.testing.expectError(error.InvalidFunctionId, ir.verify());
+    ir.formatting.items[1].formatter = null;
+    try ir.verify();
+    try ir.setTypeFormatting(previous, "Root", null);
+    try std.testing.expectError(error.InvalidOperation, ir.verify());
+}
+
+test "default printing rejects nested functions ranges and void" {
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    const span: Span = .{ .start = 0, .end = 0 };
+    const unit = try ir.internType(.void);
+    const string = try ir.internType(.string);
+    const integer = try ir.internType(.{ .integer = .{ .bits = 64, .signedness = .signed } });
+    const function = try ir.internType(.{ .function = .{ .params = &.{}, .result = unit } });
+    const range = try ir.internType(.{ .range = integer });
+    const functions = try ir.internType(.{ .array = function });
+    const ranges = try ir.internType(.{ .array = range });
+    const nested_functions = try ir.internType(.{ .array = functions });
+    const nested_ranges = try ir.internType(.{ .array = ranges });
+    for ([_]TypeId{ function, range, functions, ranges, nested_functions, nested_ranges }) |id| {
+        ir.clearFunctions();
+        const signature = try ir.internType(.{ .function = .{ .params = &.{id}, .result = string } });
+        const f = try ir.addFunction("reject", signature, span);
+        const parameter: Instruction = .{ .ty = id, .span = span, .op = .{ .parameter = 0 } };
+        try std.testing.expectError(error.InvalidOperation, ir.setFunctionBody(f, &.{ parameter, .{ .ty = string, .span = span, .op = .{ .to_string = @fromBackingInt(0) } } }, @fromBackingInt(1)));
+        try std.testing.expectError(error.InvalidOperation, ir.setFunctionBody(f, &.{ parameter, .{ .ty = unit, .span = span, .op = .{ .print = .{ .args = &.{@fromBackingInt(0)}, .newline = true } } }, .{ .ty = string, .span = span, .op = .{ .constant = try ir.internConstant(.{ .ty = string, .value = .{ .string = "" } }) } } }, @fromBackingInt(2)));
+    }
+    var printability: DefaultPrintability = .{};
+    defer printability.deinit(ir.allocator);
+    try std.testing.expect(!try printability.check(&ir, unit));
+}
+
+test "to_string verifies printable prior operands result types spans and slot isolation" {
     const make = TestFunctions.instruction;
     var ir = Ir.init(std.testing.allocator);
     defer ir.deinit();
@@ -1853,8 +2102,9 @@ test "to_string verifies scalar prior operands result types spans and slot isola
     try ir.setFunctionBody(function, &body, @fromBackingInt(@intCast(9)));
     try ir.verify();
     const owned = @constCast(ir.functions.items[0].body.?.instructions);
+    owned[9].op.to_string = @fromBackingInt(3);
+    try ir.verify();
     for ([_]struct { value: u32, err: VerifyError }{
-        .{ .value = 3, .err = error.InvalidOperation },
         .{ .value = 4, .err = error.InvalidOperation },
         .{ .value = 5, .err = error.InvalidOperation },
         .{ .value = 6, .err = error.InvalidValueId },

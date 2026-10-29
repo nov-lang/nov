@@ -679,6 +679,12 @@ const Context = struct {
     }
 
     fn nominalMethod(self: *Context, ty: Ir.TypeId, name: []const u8) ?Module.DeclId {
+        const method = self.nominalMethodIncludingPrivate(ty, name) orelse return null;
+        if (self.declarationModule(method).source.id != self.module.source.id and !self.getDeclaration(method).public) return null;
+        return method;
+    }
+
+    fn nominalMethodIncludingPrivate(self: *Context, ty: Ir.TypeId, name: []const u8) ?Module.DeclId {
         const nominal = self.ir.getType(ty).?;
         const source = switch (nominal) {
             .record => nominal.record.source,
@@ -688,7 +694,6 @@ const Context = struct {
         const identity = if (nominal == .record) nominal.record.identity else nominal.enumeration.identity;
         const owner = if (self.module.compilation) |comp| comp.getModule(source).? else self.module;
         const method = owner.lookupConcreteMethod(@fromBackingInt(@intCast(identity)), if (nominal == .record and nominal.record.type_args.len != 0) @backingInt(ty) else null, name) orelse return null;
-        if (owner.source.id != self.module.source.id and !owner.getDeclaration(method).?.public) return null;
         return self.qualify(owner, method);
     }
 
@@ -1744,8 +1749,8 @@ const Context = struct {
         return null;
     }
 
-    fn emitCall(self: *Context, node: Ast.Node.Index, ty: Ir.TypeId, call: @FieldType(Ir.Operation, "call")) Error!bool {
-        const emitter = self.emitter.?;
+    fn checkCallEffects(self: *Context, node: Ast.Node.Index) Error!bool {
+        const emitter = self.emitter orelse return true;
         // Any call can invoke a closure that mutates a shared owner cell,
         // including receiver methods and implicit conversions. A later capture
         // can box the owner and feed an earlier call through a loop backedge:
@@ -1765,36 +1770,166 @@ const Context = struct {
                 }
             }
         }
+        return true;
+    }
+
+    fn emitCall(self: *Context, node: Ast.Node.Index, ty: Ir.TypeId, call: @FieldType(Ir.Operation, "call")) Error!bool {
+        if (!try self.checkCallEffects(node)) return false;
+        const emitter = self.emitter.?;
         const value = try emitter.append(ty, self.irSpan(node), .{ .call = call });
         try emitter.values.put(emitter.allocator, node, value);
         return true;
     }
 
-    fn convertPrintable(self: *Context, node: Ast.Node.Index, ty: Ir.TypeId) Error!bool {
-        const record = self.ir.getType(ty).?;
-        if (record == .boolean or record == .integer or record == .string or record == .rune) return true;
-        if (record != .record and record != .enumeration) {
-            _ = try self.fail(.unsupported_body_expression, node, null);
-            return false;
+    const PrintableHook = struct { method: Module.DeclId, signature: Ir.TypeId };
+    const PrintableTypes = std.AutoHashMapUnmanaged(Ir.TypeId, ?PrintableHook);
+
+    fn registerPrintable(self: *Context, node: Ast.Node.Index, ty: Ir.TypeId, visited: *PrintableTypes, top_level: bool) Error!bool {
+        if (visited.contains(ty)) return true;
+        try visited.put(self.module.allocator, ty, null);
+        const nominal = self.ir.getType(ty).?;
+        switch (nominal) {
+            .boolean, .integer, .rune, .string => return true,
+            .array => |element| return self.registerPrintable(node, element, visited, false),
+            .record, .enumeration => {},
+            else => {
+                _ = try self.fail(.unsupported_body_expression, node, null);
+                return false;
+            },
         }
-        const method = self.nominalMethod(ty, "toString") orelse {
-            _ = try self.fail(.invalid_to_string, node, null);
-            return false;
-        };
-        const signature_id = if (try self.globalType(method)) |known| known.ty else {
-            _ = try self.fail(.invalid_to_string, node, null);
-            return false;
-        };
-        const signature = self.ir.getType(signature_id).?;
-        if (signature != .function or signature.function.params.len != 1 or signature.function.params[0] != ty or self.ir.getType(signature.function.result).? != .string) {
-            _ = try self.fail(.invalid_to_string, node, self.getDeclaration(method).name_span);
-            return false;
+        // Even a private hook opts out of structural printing. Never bypass an
+        // owner's formatting policy, including for fields and union payloads.
+        if (self.nominalMethodIncludingPrivate(ty, "toString")) |method| {
+            const declaration = self.getDeclaration(method);
+            if (self.declarationModule(method).source.id != self.module.source.id and !declaration.public) {
+                _ = try self.fail(.invalid_to_string, node, null);
+                return false;
+            }
+            if (declaration.is_generic_function or declaration.noreturn or self.declarationModule(method).source.ast.declFunction(declaration.node) == null) {
+                _ = try self.fail(.invalid_to_string, node, declaration.name_span);
+                return false;
+            }
+            // Demand signatures even for backend-only calls, so Sema's work
+            // queue checks their bodies and Lowering allocates function IDs.
+            const signature_id = if (try self.globalType(method)) |known| known.ty else {
+                _ = try self.fail(.invalid_to_string, node, null);
+                return false;
+            };
+            const signature = self.ir.getType(signature_id).?;
+            if (signature != .function or signature.function.params.len != 1 or signature.function.params[0] != ty or self.ir.getType(signature.function.result).? != .string) {
+                _ = try self.fail(.invalid_to_string, node, self.getDeclaration(method).name_span);
+                return false;
+            }
+            try visited.put(self.module.allocator, ty, .{ .method = method, .signature = signature_id });
+            if (self.emitter) |emitter| {
+                // The root hook goes through emitCall below. Backend-only
+                // nested hooks need the same deferred final-boxing proof.
+                if (!top_level and !try self.checkCallEffects(node)) return false;
+                const function = emitter.functions[@backingInt(method)] orelse return error.InvalidFunctionId;
+                try self.ir.setTypeFormatting(ty, try self.printedTypeName(ty, max_recursive_depth), function);
+            }
+            return true;
         }
+        if (self.emitter != null) try self.ir.setTypeFormatting(ty, try self.printedTypeName(ty, max_recursive_depth), null);
+        if (nominal == .record) {
+            // Signature demands may grow the type pool, so reacquire the layout.
+            const record = self.ir.getType(ty).?.record;
+            for (record.fields) |field| {
+                if (record.tagged and self.ir.getType(field.ty).? == .void) continue;
+                if (!try self.registerPrintable(node, field.ty, visited, false)) return false;
+            }
+        }
+        return true;
+    }
+
+    // Classify syntax before resolving: speculative type resolution of ordinary
+    // values would both diagnose valid values and publish unrelated methods.
+    fn printableTypeSyntax(self: *Context, node: Ast.Node.Index, remaining: usize) bool {
+        if (remaining == 0) return false;
+        const ast = &self.module.source.ast;
+        const tag = ast.nodes.items(.tag)[node];
+        if (tag == .array_type or tag == .fn_proto or tag == .fn_proto_one) return true;
+        var root = node;
+        while (ast.nodes.items(.tag)[root] == .field_access) root = ast.nodes.items(.data)[root].lhs;
+        if (ast.nodes.items(.tag)[root] == .identifier) {
+            const name = ast.tokenSlice(ast.firstToken(root));
+            if (self.lookupBinding(name) != null) return false;
+        }
+        if (ast.fullCall(node)) |call| {
+            return (call.ast.args.len == 0 and self.container != null and std.mem.eql(u8, ast.tokenSlice(ast.firstToken(call.ast.fn_expr)), "@This")) or
+                (self.printableTypeSyntax(call.ast.fn_expr, remaining - 1) and TypeResolver.genericTarget(self.module, call.ast.fn_expr) != null);
+        }
+        if (tag == .field_access) {
+            const comp = self.module.compilation orelse return false;
+            const ref = comp.reference(self.module, node) orelse return false;
+            return comp.getModule(ref.source).?.getDeclaration(ref.local).?.is_type_alias;
+        }
+        if (tag != .identifier and tag != .type_variable) return false;
+        const name = ast.tokenSlice(ast.firstToken(node));
+        for (self.function_bindings) |binding| if (std.mem.eql(u8, name, binding.name)) return true;
+        if (self.concrete_type != null) {
+            const decl = ast.decl(self.module.getDeclaration(self.container.?).?.node).ast;
+            var params = ast.fullFnProto(decl.type_node).?.iterate(ast);
+            while (params.next()) |param| if (std.mem.eql(u8, name, ast.tokenSlice(param.name_token.?))) return true;
+        }
+        if (self.valueDeclaration(name)) |id| {
+            const decl = self.getDeclaration(id);
+            return decl.is_type_alias or TypeResolver.isThisAlias(&self.declarationModule(id).source.ast, decl.node);
+        }
+        return isPrimitive(name) and !std.mem.eql(u8, name, "true") and !std.mem.eql(u8, name, "false");
+    }
+
+    fn printedTypeName(self: *Context, ty: Ir.TypeId, remaining: usize) Error![]const u8 {
+        const a = self.emitter.?.allocator;
+        if (remaining == 0) return "...";
+        return switch (self.ir.getType(ty).?) {
+            .void => "void",
+            .boolean => "bool",
+            .rune => "rune",
+            .string => "string",
+            .integer => |integer| try std.fmt.allocPrint(a, "{s}{d}", .{ if (integer.signedness == .signed) "i" else "u", integer.bits }),
+            .array => |element| try std.fmt.allocPrint(a, "[]{s}", .{try self.printedTypeName(element, remaining - 1)}),
+            .range => |element| try std.fmt.allocPrint(a, "range({s})", .{try self.printedTypeName(element, remaining - 1)}),
+            .function => |function| blk: {
+                var text: []const u8 = "(";
+                for (function.params, 0..) |param, i| text = try std.fmt.allocPrint(a, "{s}{s}{s}", .{ text, if (i == 0) "" else ", ", try self.printedTypeName(param, remaining - 1) });
+                break :blk try std.fmt.allocPrint(a, "{s}) -> {s}", .{ text, try self.printedTypeName(function.result, remaining - 1) });
+            },
+            .enumeration => |enumeration| enumeration.name,
+            .record => |record| blk: {
+                const owner = if (self.module.compilation) |comp| comp.getModule(record.source).? else self.module;
+                const decl = owner.getDeclaration(@fromBackingInt(record.identity)).?;
+                var text = owner.sourceSlice(decl.name_span).?;
+                if (record.type_args.len == 0) break :blk text;
+                text = try std.fmt.allocPrint(a, "{s}(", .{text});
+                for (record.type_args, 0..) |arg, i| text = try std.fmt.allocPrint(a, "{s}{s}{s}", .{ text, if (i == 0) "" else ", ", try self.printedTypeName(arg, remaining - 1) });
+                break :blk try std.fmt.allocPrint(a, "{s})", .{text});
+            },
+        };
+    }
+
+    fn printExpression(self: *Context, node: Ast.Node.Index, depth: usize) Error!?Ir.TypeId {
+        if (!self.printableTypeSyntax(node, max_recursive_depth)) return self.expression(node, null, depth);
+        const ty = (try self.resolveType(node)) orelse return null;
+        const string = try self.ir.internType(.string);
         if (self.emitter) |emitter| {
-            const callee = try emitter.append(signature_id, self.irSpan(node), .{ .function_ref = emitter.functions[@backingInt(method)].? });
-            const args = try emitter.allocator.alloc(Ir.ValueId, 1);
-            args[0] = try emitter.value(node);
-            if (!try self.emitCall(node, signature.function.result, .{ .callee = callee, .args = args })) return false;
+            const constant = try self.ir.internConstant(.{ .ty = string, .value = .{ .string = try self.printedTypeName(ty, max_recursive_depth) } });
+            try emitter.record(node, string, self.irSpan(node), .{ .constant = constant });
+        }
+        return string;
+    }
+
+    fn convertPrintable(self: *Context, node: Ast.Node.Index, ty: Ir.TypeId) Error!bool {
+        var visited: PrintableTypes = .empty;
+        defer visited.deinit(self.module.allocator);
+        if (!try self.registerPrintable(node, ty, &visited, true)) return false;
+        if (visited.get(ty).?) |hook| {
+            if (self.emitter) |emitter| {
+                const callee = try emitter.append(hook.signature, self.irSpan(node), .{ .function_ref = emitter.functions[@backingInt(hook.method)].? });
+                const args = try emitter.allocator.alloc(Ir.ValueId, 1);
+                args[0] = try emitter.value(node);
+                if (!try self.emitCall(node, self.ir.getType(hook.signature).?.function.result, .{ .callee = callee, .args = args })) return false;
+            }
         }
         return true;
     }
@@ -2922,10 +3057,10 @@ const Context = struct {
                     return self.interpolationError(.invalid_interpolation, .{ .source = location.source, .start = location.start + @as(u32, @intCast(brace)), .end = location.start + @as(u32, @intCast(@min(offset + 1, bytes.len - 1))) });
                 const embedded = expressions[placeholder];
                 placeholder += 1;
-                const ty = (try self.expression(embedded, null, depth + 1)) orelse return null;
+                const ty = (try self.printExpression(embedded, depth + 1)) orelse return null;
                 if (self.terminated) return self.fit(string, expected, node);
                 const scalar = self.ir.getType(ty).?;
-                if (scalar != .boolean and scalar != .integer and scalar != .string and scalar != .rune and scalar != .record and scalar != .enumeration) return self.interpolationError(.unsupported_interpolation_type, .{ .source = location.source, .start = location.start + @as(u32, @intCast(start)), .end = location.start + @as(u32, @intCast(offset)) });
+                if (scalar != .boolean and scalar != .integer and scalar != .string and scalar != .rune and scalar != .array and scalar != .record and scalar != .enumeration) return self.interpolationError(.unsupported_interpolation_type, .{ .source = location.source, .start = location.start + @as(u32, @intCast(start)), .end = location.start + @as(u32, @intCast(offset)) });
                 if (!try self.convertPrintable(embedded, ty)) return null;
                 if (self.emitter) |emitter| {
                     const converted = try emitter.append(string, self.irSpan(node), .{ .to_string = try emitter.value(embedded) });
@@ -3219,7 +3354,7 @@ const Context = struct {
             .function_pipe => {
                 const unit = try self.ir.internType(.void);
                 if (self.printing(data.rhs) != null) {
-                    const arg = (try self.expression(data.lhs, null, depth + 1)) orelse return null;
+                    const arg = (try self.printExpression(data.lhs, depth + 1)) orelse return null;
                     if (!self.terminated and !try self.convertPrintable(data.lhs, arg)) return null;
                     return self.fit(unit, expected, node);
                 }
@@ -3634,7 +3769,7 @@ const Context = struct {
                 if (self.printing(call.ast.fn_expr) != null) {
                     var valid = true;
                     for (call.ast.args) |arg| {
-                        const arg_type = (try self.expression(arg, null, depth + 1)) orelse {
+                        const arg_type = (try self.printExpression(arg, depth + 1)) orelse {
                             valid = false;
                             continue;
                         };
@@ -4549,7 +4684,6 @@ test "interpolation diagnoses names grammar types scopes and exact source bytes"
         .{ .source = "let f: (n: int) -> string = \"{return n}\"", .tag = .invalid_interpolation, .token = "{return n}" },
         .{ .source = "let f: (n: int) -> string = \"{n}}\"", .tag = .invalid_interpolation, .token = "}" },
         .{ .source = "let unit: () = {}\nlet f: () -> string = \"{unit()}\"", .tag = .unsupported_interpolation_type, .token = "unit()" },
-        .{ .source = "let f: (n: []int) -> string = \"{n}\"", .tag = .unsupported_interpolation_type, .token = "n" },
         .{ .source = "let f: () -> string = \"{f}\"", .tag = .unsupported_interpolation_type, .token = "f" },
         .{ .source = "let f: (n: () -> int) -> string = \"{n}\"", .tag = .unsupported_interpolation_type, .token = "n" },
         .{ .source = "let f: (n: int) -> int = \"{n}\"", .tag = .expression_type_mismatch, .token = "\"{n}\"" },
@@ -4570,16 +4704,285 @@ test "interpolation diagnoses names grammar types scopes and exact source bytes"
     }
 }
 
+test "printing structural aggregates and explicit hooks lower" {
+    const source =
+        \\let E=enum{first,second,}
+        \\let R=struct{items:[][]int,kind:E,}
+        \\let U=union{none,some:R,}
+        \\let Hook=struct{value:int,
+        \\let toString:(h:Hook)->string="custom"
+        \\}
+        \\let HookEnum=enum{one,
+        \\let toString:(e:HookEnum)->string="enum hook"
+        \\}
+        \\let f:(r:R,u:U,h:Hook,a:[]Hook,e:HookEnum)={
+        \\@println(r,u,h,a,e)
+        \\@println("{r} {u} {h} {a} {e}")
+        \\}
+        \\let main:()={let a:[]int=[]
+        \\@println(a,[true],E.first)
+        \\[true] |> @println
+        \\int |> @println
+        \\}
+    ;
+    var module = try Module.init(std.testing.allocator, "printing.nov", source);
+    defer module.deinit();
+    var sema = try Lowering.lower(&module);
+    defer sema.deinit();
+    errdefer std.debug.print("printing diagnostics: {any}\n", .{module.diagnostics.items});
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+    var hooks: usize = 0;
+    for (sema.ir.functions.items) |function| if (function.body) |body| {
+        for (body.instructions) |instruction| {
+            if (instruction.op == .call) hooks += 1;
+        }
+    };
+    try std.testing.expectEqual(@as(usize, 4), hooks);
+}
+
+fn testNestedFormatting(allocator: std.mem.Allocator) !void {
+    const source =
+        \\let Color=enum{red,blue,}
+        \\let Skip=struct{callbacks:[]()->int,}
+        \\let Box:(T:type)->type=struct{value:T,skip:Skip,
+        \\let toString:(b:@This())->string="box:{b.value}"
+        \\}
+        \\let Alias=Box(bool)
+        \\let Entry=struct{name:string,boxes:[][]Alias,color:Color,}
+        \\let Message=union{entry:Entry,boxed:Alias,none,}
+        \\let show:(message:Message)={@println(message)
+        \\@println("{message}")}
+    ;
+    var module = try Module.init(allocator, "nested-formatting.nov", source);
+    defer module.deinit();
+    var sema = try Lowering.lower(&module);
+    defer sema.deinit();
+    if (module.hasErrors()) std.debug.print("nested formatting diagnostics: {any}\n", .{module.diagnostics.items});
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+    try std.testing.expectEqual(@as(usize, 4), sema.ir.formatting.items.len);
+    for ([_][]const u8{ "Color", "Box(bool)", "Entry", "Message" }) |name| {
+        var found = false;
+        for (sema.ir.formatting.items) |entry| {
+            if (!std.mem.eql(u8, name, entry.display_name)) continue;
+            found = true;
+            if (std.mem.eql(u8, name, "Box(bool)")) {
+                const hook = sema.ir.getFunction(entry.formatter.?).?;
+                try std.testing.expect(hook.body != null);
+                try std.testing.expect(!hook.is_closure);
+                try std.testing.expectEqual(entry.ty, sema.ir.getType(hook.ty).?.function.params[0]);
+            } else try std.testing.expect(entry.formatter == null);
+        }
+        try std.testing.expect(found);
+    }
+    for (sema.ir.functions.items) |function| if (function.body) |body| {
+        // The only calls are backend metadata references, never duplicate
+        // frontend calls on nested values.
+        for (body.instructions) |instruction| try std.testing.expect(instruction.op != .call);
+    };
+}
+
+test "printing nested generic hooks owns metadata and lowers bodies under every allocation failure" {
+    try testNestedFormatting(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testNestedFormatting, .{});
+}
+
+test "printing nested malformed hooks and backend only hook bodies diagnose" {
+    for ([_]struct { hook: []const u8, tag: Module.Diagnostic.Tag }{
+        .{ .hook = "let toString:()->string=\"bad\"", .tag = .invalid_to_string },
+        .{ .hook = "let toString:(r:R)->bool=true", .tag = .invalid_to_string },
+        .{ .hook = "let toString:(r:R)->string=missing", .tag = .unknown_name },
+    }) |case| {
+        for ([_][]const u8{ "@println(value)", "@println(\"{value}\")" }) |expression| {
+            const source = try std.mem.concat(std.testing.allocator, u8, &.{ "let R=struct{\n", case.hook, "\n}\nlet Outer=struct{items:[][]R,}\nlet f:(value:Outer)=", expression });
+            defer std.testing.allocator.free(source);
+            var module = try Module.init(std.testing.allocator, "nested-printing-error.nov", source);
+            defer module.deinit();
+            var sema = try Lowering.lower(&module);
+            defer sema.deinit();
+            try std.testing.expect(!sema.lowering_complete);
+            try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+            try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
+        }
+    }
+}
+
+test "printing compile time types produces canonical string constants" {
+    const source =
+        \\let S=struct{x:int,}
+        \\let Alias=S
+        \\let Ints=[]int
+        \\let E=enum{one,}
+        \\let Box:(T:type)->type=struct{value:T,
+        \\let show:(b:@This())={@println(T,@This())}
+        \\}
+        \\let show:(x:`T)={@println(`T,"{`T}")}
+        \\let B=Box(bool)
+        \\let main:()={
+        \\@println(int,uint,[]int,S,Alias,E,Box(bool),(int)->bool,void)
+        \\@println("{int} {S} {Ints} {Alias}")
+        \\show(true)
+        \\let b:B=B[.value=true]
+        \\b.show()
+        \\}
+    ;
+    var module = try Module.init(std.testing.allocator, "type-printing.nov", source);
+    defer module.deinit();
+    errdefer std.debug.print("type printing initial parse: {any}, diagnostics: {any}\n", .{ module.source.ast.errors, module.diagnostics.items });
+    var sema = try Lowering.lower(&module);
+    defer sema.deinit();
+    errdefer std.debug.print("type printing parse: {any}, diagnostics: {any}\n", .{ module.source.ast.errors, module.diagnostics.items });
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+    const integer = try std.fmt.allocPrint(std.testing.allocator, "i{d}", .{Ir.native_pointer_bits});
+    defer std.testing.allocator.free(integer);
+    const array = try std.fmt.allocPrint(std.testing.allocator, "[]{s}", .{integer});
+    defer std.testing.allocator.free(array);
+    for ([_][]const u8{ integer, array, "S", "E", "Box(bool)", "bool", "void" }) |expected| {
+        var found = false;
+        for (sema.ir.constants.items) |constant| {
+            if (constant.value == .string and std.mem.eql(u8, constant.value.string, expected)) found = true;
+        }
+        try std.testing.expect(found);
+    }
+}
+
+test "printing imported private hooks never falls back to structural fields" {
+    const Hook = struct { declaration: []const u8, printable: bool };
+    for ([_]bool{ false, true }) |generic| {
+        for ([_]Hook{
+            .{ .declaration = "", .printable = true },
+            .{ .declaration = "let toString:(r:@This())->string=\"redacted\"\n", .printable = false },
+            .{ .declaration = "let toString:()->string=\"malformed\"\n", .printable = false },
+            .{ .declaration = "@[public]\nlet toString:(r:@This())->string=\"redacted\"\n", .printable = true },
+            .{ .declaration = "@[public]\nlet toString:()->string=\"malformed\"\n", .printable = false },
+        }) |hook| {
+            const library_source = try std.mem.concat(std.testing.allocator, u8, &.{
+                "@[public]\n",                     if (generic) "let R:(T:type)->type=struct{secret:T,\n" else "let R=struct{secret:string,\n",
+                hook.declaration,                  "}\n@[public]\nlet make:()->",
+                if (generic) "R(string)" else "R", "=",
+                if (generic) "R(string)" else "R", "[.secret=\"secret\"]\n",
+            });
+            defer std.testing.allocator.free(library_source);
+            for ([_][]const u8{
+                "@println(lib.make())",
+                "@println(\"{lib.make()}\")",
+                "@println([lib.make()])",
+                "@println(\"{[lib.make()]}\")",
+                "@println(Outer[.items=[[lib.make()]]])",
+                "@println(@as(Message,.item[lib.make()]))",
+            }) |expression| {
+                const root_source = try std.mem.concat(std.testing.allocator, u8, &.{
+                    "let lib=@import(\"lib.nov\")\nlet Alias=",                                                if (generic) "lib.R(string)" else "lib.R",
+                    "\nlet Outer=struct{items:[][]Alias,}\nlet Message=union{item:Alias,none,}\nlet main:()=", expression,
+                });
+                defer std.testing.allocator.free(root_source);
+                var comp = Compilation.init(std.testing.allocator);
+                defer comp.deinit();
+                const root = try comp.addSource("main.nov", root_source);
+                const library = try comp.addSource("lib.nov", library_source);
+                const module = comp.getModule(root).?;
+                const local = module.lookup("lib").?;
+                try comp.imports.append(std.testing.allocator, .{ .declaration = comp.declaration_ids.get(.{ .source = root, .local = local }).?, .target = library, .named = false, .span = module.getDeclaration(local).?.name_span });
+                var sema = try Lowering.lowerCompilation(&comp);
+                defer sema.deinit();
+                errdefer std.debug.print("import printing generic={any}, hook={s}, expression={s}: {any}\n", .{ generic, hook.declaration, expression, module.diagnostics.items });
+                try std.testing.expectEqual(!hook.printable, comp.hasErrors());
+                try std.testing.expectEqual(hook.printable, sema.lowering_complete);
+                if (hook.printable) {
+                    try sema.ir.verify();
+                    var found = false;
+                    for (sema.ir.formatting.items) |entry| {
+                        if (!std.mem.eql(u8, entry.display_name, if (generic) "R(string)" else "R")) continue;
+                        found = true;
+                        try std.testing.expectEqual(library, sema.ir.getType(entry.ty).?.record.source);
+                        if (hook.declaration.len != 0) try std.testing.expect(sema.ir.getFunction(entry.formatter.?).?.body != null);
+                    }
+                    try std.testing.expect(found);
+                } else {
+                    try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+                    try std.testing.expectEqual(Module.Diagnostic.Tag.invalid_to_string, module.diagnostics.items[0].tag);
+                }
+            }
+        }
+    }
+}
+
+test "printing types respects imported namespace visibility" {
+    for ([_]bool{ false, true }) |public| {
+        var comp = Compilation.init(std.testing.allocator);
+        defer comp.deinit();
+        const root = try comp.addSource("main.nov", "let lib=@import(\"lib.nov\")\nlet main:()={@println(lib.S)\n@println(\"{lib.S}\")}\n");
+        const library = try comp.addSource("lib.nov", if (public) "@[public]\nlet S=struct{x:int,}" else "let S=struct{x:int,}");
+        const module = comp.getModule(root).?;
+        const local = module.lookup("lib").?;
+        try comp.imports.append(std.testing.allocator, .{ .declaration = comp.declaration_ids.get(.{ .source = root, .local = local }).?, .target = library, .named = false, .span = module.getDeclaration(local).?.name_span });
+        var sema = try Lowering.lowerCompilation(&comp);
+        defer sema.deinit();
+        try std.testing.expectEqual(!public, comp.hasErrors());
+        try std.testing.expectEqual(public, sema.lowering_complete);
+        if (public) try sema.ir.verify();
+    }
+}
+
+test "printing malformed explicit hooks never falls back" {
+    for ([_][]const u8{
+        "let toString:()->string=\"bad\"",
+        "let toString:(r:R)->bool=true",
+        "let toString:(r:R,extra:string)->string=extra",
+    }) |hook| {
+        const source = try std.mem.concat(std.testing.allocator, u8, &.{ "let R=struct{\n", hook, "\n}\nlet main:()=@println(R[])" });
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "bad-print-hook.nov", source);
+        defer module.deinit();
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        try std.testing.expect(!sema.lowering_complete);
+        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+        try std.testing.expectEqual(Module.Diagnostic.Tag.invalid_to_string, module.diagnostics.items[0].tag);
+    }
+}
+
+test "printing ordinary values is not speculative type resolution" {
+    for ([_][]const u8{
+        "let S=struct{x:int,}\nlet f:(value:S,items:[]int)={@println(value.x,items.len,true)\n@println(\"{value.x} {items.len}\")}",
+        "let value=true\nlet main:()=@println(value)",
+    }) |source| {
+        var module = try Module.init(std.testing.allocator, "value-printing.nov", source);
+        defer module.deinit();
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expect(sema.lowering_complete);
+        try sema.ir.verify();
+    }
+    for ([_][]const u8{
+        "let main:()=@println(missing)",
+        "let main:()={let x=int\n@println(x)}",
+        "let f:(a:[]()->int)=@println(a)",
+        "let f:(a:[]()->int)->string=\"{a}\"",
+        "let main:()=@println(@as(int,1)..@as(int,2))",
+        "let main:()=@println(@print())",
+    }) |source| {
+        var module = try Module.init(std.testing.allocator, "printing-error.nov", source);
+        defer module.deinit();
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        try std.testing.expect(module.hasErrors());
+        try std.testing.expect(!sema.lowering_complete);
+    }
+}
+
 test "record interpolation uses print signature diagnostics at the placeholder source" {
     for ([_]struct { declaration: []const u8, related: bool = false }{
-        .{ .declaration = "let R=struct{s:string,}" },
-        .{ .declaration = "let R=struct{s:string,}\nlet toString:(r:R)->string=r.s" },
         .{ .declaration = "let R=struct{s:string,\nlet toString:()->string=\"wrong\"\n}", .related = true },
         .{ .declaration = "let R=struct{s:string,\nlet toString:(r:R,extra:string)->string=r.s+extra\n}", .related = true },
         .{ .declaration = "let R=struct{s:string,\nlet toString:(r:R)->bool=true\n}", .related = true },
         .{ .declaration = "let Other=struct{s:string,}\nlet R=struct{s:string,\nlet toString:(r:Other)->string=r.s\n}", .related = true },
-        .{ .declaration = "let R=union{item:string,}" },
-        .{ .declaration = "let G:(T:type)->type=union{item:T,}\nlet R=G(string)" },
     }) |case| {
         const source = try std.mem.concat(std.testing.allocator, u8, &.{ case.declaration, "\nlet Alias=R\nlet f:(r:Alias)->string=\"prefix:{r}\"" });
         defer std.testing.allocator.free(source);
@@ -4775,7 +5178,6 @@ test "match and pipes reject unsupported patterns arity defaults and inexact typ
         .{ .source = "let f: (a: int, b: int) -> int = a\nlet g: () -> int = 1 |> f", .tag = .argument_count_mismatch },
         .{ .source = "let g: () -> int = true |> false", .tag = .not_callable },
         .{ .source = "let g: () -> void = 1 |> @println", .tag = .literal_needs_type },
-        .{ .source = "let g: () -> void = [true] |> @println", .tag = .unsupported_body_expression },
         .{ .source = "let f: (n: i8) -> i8 = n\nlet g: (n: i16) -> i8 = n |> f", .tag = .expression_type_mismatch },
     }) |case| {
         var module = try Module.init(std.testing.allocator, "match-error.nov", case.source);
@@ -5355,7 +5757,6 @@ test "managed arrays reject unsupported payloads nominal mismatches and record m
 test "scalar array deferred and ill typed forms fail closed" {
     for ([_][]const u8{
         "let main: () -> void = @println([])",
-        "let main: () -> void = {let a: []int = []\n@println(a)}",
         "let main: () -> void = {let a: []int = [1]\na[0] = 2}",
         "let main: () -> void = {let mut a: []int = [1]\na.len = 2}",
         "let main: () -> void = {let mut a: []int = [1]\na.len += 2}",
@@ -6543,6 +6944,8 @@ test "iteration call protection covers every call emission path and allocation f
         "mutate |> invoke",
         "@print(r)",
         "let text=\"{r}\"",
+        "@print([r])",
+        "let text=\"{[r]}\"",
         "r.stop(mutate)",
         "R.stop(r,mutate)",
         "let f=Alias.invoke\nf(r,mutate)",
@@ -6578,6 +6981,8 @@ test "iteration call protection uses final boxing across backedges and child bod
         .{ .call = "f()", .capture = "f=(){let change=(){let loan=&a[2]\nloan=9}\nchange()}" },
         .{ .call = "@print(r)", .capture = "f=(){let loan=&a[2]\nloan=9}" },
         .{ .call = "let text=\"{r}\"", .capture = "f=(){let loan=&a[2]\nloan=9}" },
+        .{ .call = "@print([r])", .capture = "f=(){let loan=&a[2]\nloan=9}" },
+        .{ .call = "let text=\"{[r]}\"", .capture = "f=(){let loan=&a[2]\nloan=9}" },
     }) |case| {
         const body = try std.fmt.allocPrint(
             std.testing.allocator,

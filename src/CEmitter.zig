@@ -367,6 +367,7 @@ fn write(allocator: std.mem.Allocator, ir: *const Ir, origins: []const ?Origin, 
         try writeSignature(ir, w, function);
         try w.writeAll(";\n");
     }
+    try writeAggregateFormatting(allocator, ir, root_counts, w);
     if (usesClosures(ir)) {
         try w.writeAll("static const size_t nov_env_offset[] = {0};\nstatic const nov_gc_descriptor nov_env_element = {sizeof(void *), _Alignof(void *), 1, nov_env_offset};\n");
         for (ir.functions.items, 0..) |function, f| {
@@ -748,7 +749,7 @@ fn usesStringConcat(ir: *const Ir) bool {
             if (instruction.op == .binary and ir.getType(instruction.ty).? == .string) return true;
             if (instruction.op == .to_string) {
                 const ty = ir.getType(body.instructions[@backingInt(instruction.op.to_string)].ty).?;
-                if (ty == .integer or ty == .rune) return true;
+                if (ty == .integer or ty == .rune or aggregateFormattingType(ty)) return true;
             }
         }
     }
@@ -1356,7 +1357,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
                     switch (ir.getType(source_ty).?) {
                         .string => try w.print("v{d}", .{@backingInt(value)}),
                         .boolean => try w.print("(v{d} ? (nov_string){{NULL, (const unsigned char *)\"true\", 4}} : (nov_string){{NULL, (const unsigned char *)\"false\", 5}})", .{@backingInt(value)}),
-                        .integer, .rune => try w.print("nov_to_string_{d}(v{d})", .{ @backingInt(source_ty), @backingInt(value) }),
+                        .integer, .rune, .array, .record, .enumeration => try w.print("nov_to_string_{d}(v{d})", .{ @backingInt(source_ty), @backingInt(value) }),
                         else => unreachable,
                     }
                 },
@@ -1545,6 +1546,15 @@ fn markCopyTypes(allocator: std.mem.Allocator, ir: *const Ir, copied: []bool) st
             },
             else => {},
         };
+    }
+    const formatted = try allocator.alloc(bool, ir.types.items.len);
+    defer allocator.free(formatted);
+    const converted = try allocator.alloc(bool, ir.types.items.len);
+    defer allocator.free(converted);
+    _ = markFormattingTypes(ir, formatted, converted);
+    for (formatted, 0..) |used, t| {
+        const id: Ir.TypeId = @fromBackingInt(@intCast(t));
+        if (used and formatHook(ir, id) != null and try ir.needsArrayCopy(id)) copied[t] = true;
     }
     var changed = true;
     while (changed) {
@@ -1814,6 +1824,551 @@ fn writeArrayValue(ir: *const Ir, w: *std.Io.Writer, body: Ir.Body, transfers: A
     }
 }
 
+test "default aggregate formatting direct IR nested GC C11 O0 O3 and invalid tags" {
+    var ir = Ir.init(test_gpa);
+    defer ir.deinit();
+    const span: Ir.Span = .{ .start = 0, .end = 0 };
+    const unit = try ir.internType(.void);
+    const string = try ir.internType(.string);
+    const integer = try ir.internType(.{ .integer = .{ .bits = 64, .signedness = .signed } });
+    const rune = try ir.internType(.rune);
+    const boolean = try ir.internType(.boolean);
+    const enumeration = try ir.internType(.{ .enumeration = .{ .identity = 0, .name = "Kind", .tags = &.{ .{ .name = "first", .span = span }, .{ .name = "second", .span = span } } } });
+    const leaf = try ir.internType(.{ .record = .{ .identity = 1, .fields = &.{} } });
+    try ir.setRecordFields(leaf, &.{
+        .{ .name = "text", .ty = string, .span = span },
+        .{ .name = "number", .ty = integer, .span = span },
+        .{ .name = "rune", .ty = rune, .span = span },
+        .{ .name = "kind", .ty = enumeration, .span = span },
+        .{ .name = "yes", .ty = boolean, .span = span },
+    });
+    const array = try ir.internType(.{ .array = leaf });
+    const nested = try ir.internType(.{ .array = array });
+    const payload = try ir.internType(.{ .record = .{ .identity = 2, .fields = &.{} } });
+    try ir.setRecordFields(payload, &.{
+        .{ .name = "items", .ty = nested, .span = span },
+        .{ .name = "empty", .ty = array, .span = span },
+    });
+    const root = try ir.internType(.{ .record = .{ .identity = 3, .tagged = true, .fields = &.{} } });
+    try ir.setRecordFields(root, &.{
+        .{ .name = "none", .ty = unit, .span = span },
+        .{ .name = "some", .ty = payload, .span = span },
+    });
+    try ir.setTypeFormatting(enumeration, "Kind", null);
+    try ir.setTypeFormatting(leaf, "Leaf", null);
+    try ir.setTypeFormatting(payload, "Payload", null);
+    try ir.setTypeFormatting(root, "Message", null);
+    const show_ty = try ir.internType(.{ .function = .{ .params = &.{root}, .result = unit } });
+    const convert_ty = try ir.internType(.{ .function = .{ .params = &.{root}, .result = string } });
+    const show = try ir.addFunction("show", show_ty, span);
+    const convert = try ir.addFunction("convert", convert_ty, span);
+    const parameter: Ir.Instruction = .{ .ty = root, .span = span, .op = .{ .parameter = 0 } };
+    try ir.setFunctionBody(show, &.{ parameter, .{ .ty = unit, .span = span, .op = .{ .print = .{ .args = &.{@fromBackingInt(0)}, .newline = true } } } }, @fromBackingInt(1));
+    const prefix = try ir.internConstant(.{ .ty = string, .value = .{ .string = "<" } });
+    const suffix = try ir.internConstant(.{ .ty = string, .value = .{ .string = ">" } });
+    // The same IR shape used by interpolation: the structural conversion must
+    // stay rooted through both subsequent concatenation allocations.
+    try ir.setFunctionBody(convert, &.{
+        parameter,
+        .{ .ty = string, .span = span, .op = .{ .to_string = @fromBackingInt(0) } },
+        .{ .ty = string, .span = span, .op = .{ .constant = prefix } },
+        .{ .ty = string, .span = span, .op = .{ .binary = .{ .op = .add, .lhs = @fromBackingInt(2), .rhs = @fromBackingInt(1) } } },
+        .{ .ty = string, .span = span, .op = .{ .constant = suffix } },
+        .{ .ty = string, .span = span, .op = .{ .binary = .{ .op = .add, .lhs = @fromBackingInt(3), .rhs = @fromBackingInt(4) } } },
+    }, @fromBackingInt(5));
+    const c = try emit(test_gpa, &ir, null);
+    defer test_gpa.free(c);
+    const setup = try std.fmt.allocPrint(test_gpa,
+        \\int main(void) {{
+        \\    nov_rt_heap.collect_every_allocation = 1;
+        \\    nov_string text = {{0}}; nov_array leaves = {{0}}, nested = {{0}};
+        \\    void **roots[] = {{&text.owner, &leaves.data, &nested.data}};
+        \\    nov_gc_roots frame = {{0}}; nov_gc_push(&nov_rt_heap, &frame, roots, 3);
+        \\    nov_gc_descriptor bytes = {{4, 1, 0, NULL}};
+        \\    text.owner = nov_gc_alloc(&nov_rt_heap, &bytes);
+        \\    memcpy(text.owner, "h\xc3\xa9\0", 4); text.data = text.owner; text.len = 4;
+        \\    size_t offsets[] = {{offsetof(nov_record_{d}, f0) + offsetof(nov_string, owner)}};
+        \\    nov_gc_descriptor element = {{sizeof(nov_record_{d}), _Alignof(nov_record_{d}), 1, offsets}};
+        \\    leaves = nov_array_new(1, 1, &element);
+        \\    ((nov_record_{d} *)leaves.data)[0] = (nov_record_{d}){{text, -7, 0x1f600, 1, true}};
+        \\    size_t nested_offsets[] = {{offsetof(nov_array, data)}};
+        \\    nov_gc_descriptor nested_element = {{sizeof(nov_array), _Alignof(nov_array), 1, nested_offsets}};
+        \\    nested = nov_array_new(1, 1, &nested_element);
+        \\    ((nov_array *)nested.data)[0] = leaves;
+        \\    nov_record_{d} value = {{0}};
+        \\    value.tag = 1; value.f1.f0 = nested;
+        \\
+    , .{ @backingInt(leaf), @backingInt(leaf), @backingInt(leaf), @backingInt(leaf), @backingInt(leaf), @backingInt(root) });
+    defer test_gpa.free(setup);
+    const expected = "Message.some[ items: [[Leaf[ text: hé\x00, number: -7, rune: 😀, kind: Kind.second, yes: true ]]], empty: [] ]\n";
+    const success = try std.mem.concat(test_gpa, u8, &.{
+        c, setup,
+        \\    size_t before_print = nov_rt_heap.live_objects;
+        \\    nov_show(value);
+        \\    if (nov_rt_heap.live_objects != before_print) return 4;
+        \\    nov_string result = nov_convert(value);
+        \\    if (fwrite(result.data, 1, (size_t)result.len, stdout) != result.len) return 2;
+        \\    putchar('\n');
+        \\    value.tag = 0;
+        \\    nov_show(value);
+        \\    nov_gc_pop(&nov_rt_heap, &frame); nov_gc_collect(&nov_rt_heap);
+        \\    if (nov_rt_heap.live_objects) return 3;
+        \\    nov_gc_shutdown(&nov_rt_heap); return 0;
+        \\}
+        \\
+    });
+    defer test_gpa.free(success);
+    const output = try std.mem.concat(test_gpa, u8, &.{ expected, "<", expected[0 .. expected.len - 1], ">\nMessage.none\n" });
+    defer test_gpa.free(output);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(success, "typedef int nonempty;", 0, output, "", mode);
+    const exhausted = try std.mem.concat(test_gpa, u8, &.{
+        "#include <stdlib.h>\nstatic int blocked;\nstatic void *limited_malloc(size_t n) { return blocked ? NULL : malloc(n); }\n#define NOV_GC_MALLOC limited_malloc\n#define NOV_GC_FREE free\n",
+        c,
+        setup,
+        "blocked = 1; nov_show(value); (void)nov_convert(value); return 0; }\n",
+    });
+    defer test_gpa.free(exhausted);
+    try compileAndRunExpected(exhausted, "typedef int nonempty;", 1, expected, "panic: GC allocation failed\n");
+    for ([_]bool{ false, true }) |bad_enum| {
+        const corrupt = if (bad_enum) try std.fmt.allocPrint(test_gpa, "((nov_record_{d} *)leaves.data)[0].f3 = 99;\n", .{@backingInt(leaf)}) else try test_gpa.dupe(u8, "value.tag = 99;\n");
+        defer test_gpa.free(corrupt);
+        const bad = try std.mem.concat(test_gpa, u8, &.{ c, setup, corrupt, "(void)nov_convert(value); return 0; }\n" });
+        defer test_gpa.free(bad);
+        try compileAndRunExpected(bad, "typedef int nonempty;", 1, "", if (bad_enum) "panic: invalid enum tag\n" else "panic: invalid union tag\n");
+    }
+
+    const observer_ty = try ir.internType(.{ .function = .{ .params = &.{integer}, .result = integer } });
+    const observer = try ir.addFunction("observe", observer_ty, span);
+    try ir.setExternName(observer, "observe");
+    const hook_ty = try ir.internType(.{ .function = .{ .params = &.{leaf}, .result = string } });
+    const hook = try ir.addFunction("leaf_hook", hook_ty, span);
+    const hook_prefix = try ir.internConstant(.{ .ty = string, .value = .{ .string = "hook" } });
+    try ir.setFunctionBody(hook, &.{
+        .{ .ty = leaf, .span = span, .op = .{ .parameter = 0 } },
+        .{ .ty = integer, .span = span, .op = .{ .field_read = .{ .base = @fromBackingInt(0), .index = 1 } } },
+        .{ .ty = observer_ty, .span = span, .op = .{ .function_ref = observer } },
+        .{ .ty = integer, .span = span, .op = .{ .call = .{ .callee = @fromBackingInt(2), .args = &.{@fromBackingInt(1)} } } },
+        .{ .ty = string, .span = span, .op = .{ .to_string = @fromBackingInt(3) } },
+        .{ .ty = string, .span = span, .op = .{ .constant = hook_prefix } },
+        .{ .ty = string, .span = span, .op = .{ .binary = .{ .op = .add, .lhs = @fromBackingInt(5), .rhs = @fromBackingInt(4) } } },
+    }, @fromBackingInt(6));
+    try ir.setTypeFormatting(leaf, "Leaf", hook);
+    const hooked = try emit(test_gpa, &ir, null);
+    defer test_gpa.free(hooked);
+    const more = try std.fmt.allocPrint(test_gpa,
+        \\nov_array more = nov_array_new(2, 2, &element);
+        \\((nov_record_{d} *)more.data)[0] = ((nov_record_{d} *)leaves.data)[0];
+        \\((nov_record_{d} *)more.data)[1] = ((nov_record_{d} *)leaves.data)[0];
+        \\((nov_record_{d} *)more.data)[1].f1 = 8;
+        \\leaves = more; ((nov_array *)nested.data)[0] = leaves;
+        \\
+    , .{ @backingInt(leaf), @backingInt(leaf), @backingInt(leaf), @backingInt(leaf), @backingInt(leaf) });
+    defer test_gpa.free(more);
+    const callbacks = try std.mem.concat(test_gpa, u8, &.{
+        hooked,
+        \\static int calls;
+        \\int64_t observe(int64_t n) { if (n != (calls % 2 ? 8 : -7)) abort(); return ++calls; }
+        \\
+        ,
+        setup,
+        more,
+        \\nov_show(value);
+        \\nov_string result = nov_convert(value);
+        \\if (calls != 4) return 5;
+        \\if (fwrite(result.data, 1, (size_t)result.len, stdout) != result.len) return 6;
+        \\putchar('\n');
+        \\nov_gc_pop(&nov_rt_heap, &frame); nov_gc_collect(&nov_rt_heap);
+        \\if (nov_rt_heap.live_objects) return 7;
+        \\nov_gc_shutdown(&nov_rt_heap); return 0; }
+        \\
+    });
+    defer test_gpa.free(callbacks);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(callbacks, "typedef int nonempty;", 0, "Message.some[ items: [[hook1, hook2]], empty: [] ]\n<Message.some[ items: [[hook3, hook4]], empty: [] ]>\n", "", mode);
+
+    const payload_hook_ty = try ir.internType(.{ .function = .{ .params = &.{payload}, .result = string } });
+    const payload_hook = try ir.addFunction("payload_hook", payload_hook_ty, span);
+    const payload_body = try test_gpa.dupe(Ir.Instruction, ir.getFunction(hook).?.body.?.instructions);
+    defer test_gpa.free(payload_body);
+    payload_body[0].ty = payload;
+    payload_body[1].op = .{ .constant = try ir.internConstant(.{ .ty = integer, .value = .{ .signed_integer = -7 } }) };
+    payload_body[5].op = .{ .constant = try ir.internConstant(.{ .ty = string, .value = .{ .string = "payload" } }) };
+    try ir.setFunctionBody(payload_hook, payload_body, @fromBackingInt(6));
+    try ir.setTypeFormatting(payload, "Payload", payload_hook);
+    const overridden = try emit(test_gpa, &ir, null);
+    defer test_gpa.free(overridden);
+    const payload_callbacks = try std.mem.concat(test_gpa, u8, &.{
+        overridden,
+        "static int calls;\nint64_t observe(int64_t n) { if (n != -7) abort(); return ++calls; }\n",
+        setup,
+        \\nov_show(value);
+        \\nov_string result = nov_convert(value);
+        \\if (calls != 2) return 8;
+        \\if (fwrite(result.data, 1, (size_t)result.len, stdout) != result.len) return 9;
+        \\putchar('\n');
+        \\nov_gc_pop(&nov_rt_heap, &frame); nov_gc_collect(&nov_rt_heap);
+        \\if (nov_rt_heap.live_objects) return 10;
+        \\nov_gc_shutdown(&nov_rt_heap); return 0; }
+        \\
+    });
+    defer test_gpa.free(payload_callbacks);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(payload_callbacks, "typedef int nonempty;", 0, "Message.some[ payload1 ]\n<Message.some[ payload2 ]>\n", "", mode);
+}
+
+test "default aggregate printing shared type DAG empty arrays validates without expanding values" {
+    var source = std.Io.Writer.Allocating.init(test_gpa);
+    defer source.deinit();
+    try source.writer.writeAll("let R0=struct{value:int,}\n");
+    for (1..48) |i| try source.writer.print("let R{d}=struct{{a:R{d},b:R{d},}}\n", .{ i, i - 1, i - 1 });
+    try source.writer.writeAll("let main:()={let empty:[]R47=[]\n@println(empty)\n@println(\"{empty}\")}\n");
+    // Exercise frontend registration, body publication, verification, and helper
+    // discovery without materializing or compiling the exponentially large C layout.
+    const c = try emitSource(source.written(), null);
+    defer test_gpa.free(c);
+    try std.testing.expect(std.mem.indexOf(u8, c, "nov_format_") != null);
+    try std.testing.expect(c.len < 100_000);
+}
+
+test "default aggregate formatting allocating hooks share mutable closure state source free GC" {
+    const source =
+        \\let Counter=struct{callbacks:[]()->int,}
+        \\let hook:(value:Counter)->string="C{value.callbacks[0]()}"
+        \\let show:(values:[]Counter)=@println(values.len)
+        \\let convert:(values:[]Counter)->string="{values.len}"
+        \\let main:()={
+        \\ let mut count:int=0
+        \\ let tick=()->int{count+=1
+        \\ count}
+        \\ let counter=Counter[.callbacks=[tick]]
+        \\ let values=[counter,counter]
+        \\ show(values)
+        \\ @println(convert(values))
+        \\ @println(count)
+        \\}
+    ;
+    var lowered = blk: {
+        var module = try Module.init(test_gpa, "default-hooks.nov", source);
+        defer module.deinit();
+        var result = try Lowering.lower(&module);
+        errdefer result.deinit();
+        if (module.hasErrors()) {
+            var out = std.Io.Writer.Allocating.init(test_gpa);
+            defer out.deinit();
+            try Diagnostics.renderModule(&module, &out.writer);
+            std.debug.print("{s}", .{out.written()});
+        }
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expect(result.lowering_complete);
+        break :blk result;
+    };
+    defer lowered.deinit();
+    const ir = &lowered.ir;
+    var hook: ?Ir.FunctionId = null;
+    for (ir.functions.items, 0..) |function, i| {
+        if (std.mem.eql(u8, function.name, "hook")) hook = @fromBackingInt(@intCast(i));
+    }
+    const nominal = ir.getType(ir.getFunction(hook.?).?.ty).?.function.params[0];
+    try ir.setTypeFormatting(nominal, "Counter", hook);
+    // Keep frontend registration out of this backend test. Publish aggregate
+    // print/interpolation operands only after installing the hook contract.
+    for (ir.functions.items) |function| {
+        const show = std.mem.eql(u8, function.name, "show");
+        const convert = std.mem.eql(u8, function.name, "convert");
+        if (!show and !convert) continue;
+        const body = function.body.?;
+        var parameter: ?Ir.ValueId = null;
+        for (body.instructions, 0..) |instruction, i| {
+            if (instruction.op == .parameter and instruction.op.parameter == 0) parameter = @fromBackingInt(@intCast(i));
+        }
+        var changed = false;
+        for (@constCast(body.instructions)) |*instruction| {
+            if (show and instruction.op == .print) {
+                @constCast(instruction.op.print.args)[0] = parameter.?;
+                changed = true;
+            }
+            if (convert and instruction.op == .to_string) {
+                instruction.op.to_string = parameter.?;
+                changed = true;
+            }
+        }
+        try std.testing.expect(changed);
+    }
+    const library = try emit(test_gpa, ir, null);
+    defer test_gpa.free(library);
+    const c = try collectingTestProgram(library);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty;", 0, "[C1, C2]\n[C3, C4]\n4\n", "", mode);
+}
+
+test "default aggregate formatting named empty scalar void enum and hook only demand" {
+    var ir = Ir.init(test_gpa);
+    defer ir.deinit();
+    const span: Ir.Span = .{ .start = 0, .end = 0 };
+    const unit = try ir.internType(.void);
+    const integer = try ir.internType(.{ .integer = .{ .bits = 64, .signedness = .signed } });
+    const empty = try ir.internType(.{ .record = .{ .identity = 0, .fields = &.{} } });
+    const message = try ir.internType(.{ .record = .{ .identity = 1, .tagged = true, .fields = &.{} } });
+    try ir.setRecordFields(message, &.{
+        .{ .name = "none", .ty = unit, .span = span },
+        .{ .name = "number", .ty = integer, .span = span },
+        .{ .name = "empty", .ty = empty, .span = span },
+    });
+    const color = try ir.internType(.{ .enumeration = .{ .identity = 2, .name = "Color", .tags = &.{.{ .name = "red", .span = span }} } });
+    try ir.setTypeFormatting(empty, "Empty", null);
+    try ir.setTypeFormatting(message, "Message", null);
+    try ir.setTypeFormatting(color, "Color", null);
+    const show_ty = try ir.internType(.{ .function = .{ .params = &.{ empty, message, color }, .result = unit } });
+    const show = try ir.addFunction("show", show_ty, span);
+    try ir.setFunctionBody(show, &.{
+        .{ .ty = empty, .span = span, .op = .{ .parameter = 0 } },
+        .{ .ty = message, .span = span, .op = .{ .parameter = 1 } },
+        .{ .ty = color, .span = span, .op = .{ .parameter = 2 } },
+        .{ .ty = unit, .span = span, .op = .{ .print = .{ .args = &.{ @fromBackingInt(0), @fromBackingInt(1), @fromBackingInt(2) }, .newline = true } } },
+    }, @fromBackingInt(3));
+    const c = try emit(test_gpa, &ir, null);
+    defer test_gpa.free(c);
+    const driver = try std.fmt.allocPrint(test_gpa, "int main(void) {{ nov_record_{d} empty = {{0}}; nov_record_{d} message = {{0}};\n" ++
+        "message.tag = 1; message.f1 = 7; nov_show(empty, message, 0);\n" ++
+        "message.tag = 0; nov_show(empty, message, 0);\n" ++
+        "message.tag = 2; nov_show(empty, message, 0); nov_gc_shutdown(&nov_rt_heap); return 0; }}\n", .{ @backingInt(empty), @backingInt(message) });
+    defer test_gpa.free(driver);
+    const executable = try std.mem.concat(test_gpa, u8, &.{ c, driver });
+    defer test_gpa.free(executable);
+    try compileAndRunExpected(executable, "typedef int nonempty;", 0, "Empty[] Message.number[7] Color.red\nEmpty[] Message.none Color.red\nEmpty[] Message.empty[] Color.red\n", "");
+
+    // No structural helper is demanded beneath this overriding root hook.
+    ir.clearFunctions();
+    const string = try ir.internType(.string);
+    const signature = try ir.internType(.{ .function = .{ .params = &.{empty}, .result = string } });
+    const hook = try ir.addFunction("hook", signature, span);
+    const text = try ir.internConstant(.{ .ty = string, .value = .{ .string = "custom" } });
+    try ir.setFunctionBody(hook, &.{.{ .ty = string, .span = span, .op = .{ .constant = text } }}, @fromBackingInt(0));
+    try ir.setTypeFormatting(empty, "Empty", hook);
+    const convert = try ir.addFunction("convert", signature, span);
+    try ir.setFunctionBody(convert, &.{
+        .{ .ty = empty, .span = span, .op = .{ .parameter = 0 } },
+        .{ .ty = string, .span = span, .op = .{ .to_string = @fromBackingInt(0) } },
+    }, @fromBackingInt(1));
+    const hooked = try emit(test_gpa, &ir, null);
+    defer test_gpa.free(hooked);
+    const hook_driver = try std.fmt.allocPrint(test_gpa, "int main(void) {{ nov_rt_heap.collect_every_allocation = 1; nov_string text = nov_convert((nov_record_{d}){{0}}); if (text.len != 6 || memcmp(text.data, \"custom\", 6)) return 1; nov_gc_shutdown(&nov_rt_heap); return 0; }}\n", .{@backingInt(empty)});
+    defer test_gpa.free(hook_driver);
+    const hook_executable = try std.mem.concat(test_gpa, u8, &.{ hooked, hook_driver });
+    defer test_gpa.free(hook_executable);
+    try compileAndRun(hook_executable, "typedef int nonempty;");
+}
+
+fn formatHook(ir: *const Ir, ty: Ir.TypeId) ?Ir.FunctionId {
+    return if (ir.getTypeFormatting(ty)) |entry| entry.formatter else null;
+}
+
+fn formatName(ir: *const Ir, ty: Ir.TypeId) []const u8 {
+    if (ir.getTypeFormatting(ty)) |entry| return entry.display_name;
+    const value = ir.getType(ty).?;
+    return if (value == .enumeration) value.enumeration.name else "anonymous";
+}
+
+fn aggregateFormattingType(ty: Ir.Type) bool {
+    return ty == .array or ty == .record or ty == .enumeration;
+}
+
+fn markFormatType(ir: *const Ir, used: []bool, id: Ir.TypeId) void {
+    const i = @backingInt(id);
+    if (used[i]) return;
+    used[i] = true;
+    if (formatHook(ir, id) != null) return;
+    switch (ir.getType(id).?) {
+        .array => |element| markFormatType(ir, used, element),
+        .record => |record| for (record.fields) |field| {
+            if (ir.getType(field.ty).? != .void) markFormatType(ir, used, field.ty);
+        },
+        else => {},
+    }
+}
+
+// Encode names as C byte escapes, including non-ASCII identifiers and NUL.
+fn writeFormatLiteral(w: *std.Io.Writer, bytes: []const u8) WriteError!void {
+    try w.writeAll("    nov_format_bytes(sink, (const unsigned char *)\"");
+    for (bytes) |byte| try w.print("\\{o:0>3}", .{byte});
+    try w.print("\", {d});\n", .{bytes.len});
+}
+
+fn markFormattingTypes(ir: *const Ir, used: []bool, converted: []bool) bool {
+    @memset(used, false);
+    @memset(converted, false);
+    var demanded = false;
+    for (ir.functions.items) |function| {
+        const body = function.body orelse continue;
+        for (body.instructions) |instruction| switch (instruction.op) {
+            .print => |p| for (p.args) |arg| {
+                const id = body.instructions[@backingInt(arg)].ty;
+                if (aggregateFormattingType(ir.getType(id).?)) {
+                    markFormatType(ir, used, id);
+                    demanded = true;
+                }
+            },
+            .to_string => |value| {
+                const id = body.instructions[@backingInt(value)].ty;
+                if (aggregateFormattingType(ir.getType(id).?)) {
+                    markFormatType(ir, used, id);
+                    converted[@backingInt(id)] = true;
+                    demanded = true;
+                }
+            },
+            else => {},
+        };
+    }
+    return demanded;
+}
+
+fn writeAggregateFormatting(allocator: std.mem.Allocator, ir: *const Ir, counts: []const usize, w: *std.Io.Writer) (WriteError || std.mem.Allocator.Error)!void {
+    const used = try allocator.alloc(bool, ir.types.items.len);
+    defer allocator.free(used);
+    const converted = try allocator.alloc(bool, ir.types.items.len);
+    defer allocator.free(converted);
+    if (!markFormattingTypes(ir, used, converted)) return;
+    const conversion = std.mem.indexOfScalar(bool, converted, true) != null;
+    try w.writeAll("#include <stdio.h>\n#include <inttypes.h>\n");
+    try w.writeAll(if (conversion) "typedef struct { bool streaming; nov_string output; } nov_format_sink;\n" else "typedef struct { bool streaming; } nov_format_sink;\n");
+    if (conversion) try w.writeAll(
+        \\static void nov_format_string(nov_format_sink *sink, nov_string chunk) {
+        \\    if (sink->streaming) {
+        \\        if (chunk.len && fwrite(chunk.data, 1, (size_t)chunk.len, stdout) != (size_t)chunk.len) nov_rt_panic("stdout write failed");
+        \\    } else {
+        \\        void **roots[] = {&chunk.owner};
+        \\        nov_gc_roots frame = {0};
+        \\        nov_gc_push(&nov_rt_heap, &frame, roots, 1);
+        \\        sink->output = nov_string_concat(sink->output, chunk);
+        \\        nov_gc_pop(&nov_rt_heap, &frame);
+        \\    }
+        \\}
+        \\
+    );
+    var bytes_needed = !conversion;
+    for (ir.types.items, used, 0..) |ty, needed, t| {
+        if (needed and ty != .string and formatHook(ir, @fromBackingInt(@intCast(t))) == null) bytes_needed = true;
+    }
+    if (bytes_needed) {
+        try w.writeAll("static void nov_format_bytes(nov_format_sink *sink, const unsigned char *data, uintptr_t len) {\n");
+        if (conversion) {
+            try w.writeAll("    nov_format_string(sink, (nov_string){NULL, data, len});\n");
+        } else {
+            try w.writeAll("    (void)sink;\n    if (len && fwrite(data, 1, (size_t)len, stdout) != (size_t)len) nov_rt_panic(\"stdout write failed\");\n");
+        }
+        try w.writeAll("}\n");
+    }
+    for (used, 0..) |needed, t| {
+        if (!needed) continue;
+        try w.print("static void nov_format_{d}(nov_format_sink *, ", .{t});
+        try writeType(ir, w, @fromBackingInt(@intCast(t)));
+        try w.writeAll(", bool);\n");
+    }
+    for (ir.types.items, used, 0..) |ty, needed, t| {
+        if (!needed) continue;
+        try w.print("static void nov_format_{d}(nov_format_sink *sink, ", .{t});
+        try writeType(ir, w, @fromBackingInt(@intCast(t)));
+        try w.writeAll(" value, bool named) {\n    (void)value; (void)named;\n");
+        const id: Ir.TypeId = @fromBackingInt(@intCast(t));
+        if (formatHook(ir, id)) |hook| {
+            // Validate tags before calling user code, including overriding hooks.
+            if (ty == .enumeration) try w.print("    if (value >= {d}) nov_rt_panic(\"invalid enum tag\");\n", .{ty.enumeration.tags.len});
+            if (ty == .record and ty.record.tagged) try w.print("    if (value.tag >= {d}) nov_rt_panic(\"invalid union tag\");\n", .{ty.record.fields.len});
+            const snapshot = try ir.needsArrayCopy(id);
+            if (snapshot) {
+                // Match frontend call value semantics, retaining the detached
+                // receiver while the hook and its callees allocate.
+                try w.writeAll("    ");
+                try writeType(ir, w, id);
+                try w.writeAll(" v0 = value;\n    void **roots[] = {");
+                try writeRoots(ir, counts, w, id, "v", 0);
+                try w.print(" }};\n    nov_gc_roots frame = {{0}};\n    nov_gc_push(&nov_rt_heap, &frame, roots, {d});\n    v0 = nov_copy_{d}(v0);\n", .{ counts[t], t });
+            }
+            try w.writeAll("    nov_string chunk = ");
+            try writeScopedFunctionName(w, ir.getFunction(hook).?);
+            try w.writeAll(if (snapshot) "(v0);\n" else "(value);\n");
+            try w.writeAll(if (conversion) "    nov_format_string(sink, chunk);\n" else "    nov_format_bytes(sink, chunk.data, chunk.len);\n");
+            if (snapshot) try w.writeAll("    nov_gc_pop(&nov_rt_heap, &frame);\n");
+        } else switch (ty) {
+            .string => try w.writeAll(if (conversion) "    nov_format_string(sink, value);\n" else "    nov_format_bytes(sink, value.data, value.len);\n"),
+            .boolean => try w.writeAll("    nov_format_bytes(sink, (const unsigned char *)(value ? \"true\" : \"false\"), value ? 4 : 5);\n"),
+            .integer => |integer| {
+                try w.print("    char bytes[32];\n    int len = snprintf(bytes, sizeof bytes, \"%\" PRI{s}MAX, ({s}intmax_t)value);\n", .{ if (integer.signedness == .signed) "d" else "u", if (integer.signedness == .signed) "" else "u" });
+                try w.writeAll("    if (len < 0 || (size_t)len >= sizeof bytes) nov_rt_panic(\"integer formatting failed\");\n    nov_format_bytes(sink, (const unsigned char *)bytes, (uintptr_t)len);\n");
+            },
+            .rune => try w.writeAll(
+                \\    unsigned char bytes[4];
+                \\    uintptr_t len;
+                \\    if (value <= 0x7f) { bytes[0] = (unsigned char)value; len = 1; }
+                \\    else if (value <= 0x7ff) { bytes[0] = (unsigned char)(0xc0u | (value >> 6)); bytes[1] = (unsigned char)(0x80u | (value & 63u)); len = 2; }
+                \\    else if (value <= 0xffff) { bytes[0] = (unsigned char)(0xe0u | (value >> 12)); bytes[1] = (unsigned char)(0x80u | ((value >> 6) & 63u)); bytes[2] = (unsigned char)(0x80u | (value & 63u)); len = 3; }
+                \\    else { bytes[0] = (unsigned char)(0xf0u | (value >> 18)); bytes[1] = (unsigned char)(0x80u | ((value >> 12) & 63u)); bytes[2] = (unsigned char)(0x80u | ((value >> 6) & 63u)); bytes[3] = (unsigned char)(0x80u | (value & 63u)); len = 4; }
+                \\    nov_format_bytes(sink, bytes, len);
+                \\
+            ),
+            .array => |element| {
+                try writeFormatLiteral(w, "[");
+                try w.writeAll("    for (uintptr_t i = 0; i < value.len; ++i) {\n    if (i) {\n");
+                try writeFormatLiteral(w, ", ");
+                try w.print("    }}\n    nov_format_{d}(sink, ((const ", .{@backingInt(element)});
+                try writeType(ir, w, element);
+                try w.writeAll(" *)value.data)[i], true);\n    }\n");
+                try writeFormatLiteral(w, "]");
+            },
+            .enumeration => |enumeration| {
+                try w.writeAll("    switch (value) {\n");
+                for (enumeration.tags, 0..) |tag, i| {
+                    try w.print("    case {d}:\n", .{i});
+                    try writeFormatLiteral(w, formatName(ir, id));
+                    try writeFormatLiteral(w, ".");
+                    try writeFormatLiteral(w, tag.name);
+                    try w.writeAll("    break;\n");
+                }
+                try w.writeAll("    default: nov_rt_panic(\"invalid enum tag\");\n    }\n");
+            },
+            .record => |record| {
+                if (record.tagged) {
+                    try w.writeAll("    switch (value.tag) {\n");
+                    for (record.fields, 0..) |field, f| {
+                        try w.print("    case {d}:\n", .{f});
+                        try writeFormatLiteral(w, formatName(ir, id));
+                        try writeFormatLiteral(w, ".");
+                        try writeFormatLiteral(w, field.name);
+                        const payload = ir.getType(field.ty).?;
+                        if (payload != .void) {
+                            const flatten = payload == .record and !payload.record.tagged and formatHook(ir, field.ty) == null;
+                            const hooked_record = payload == .record and !payload.record.tagged and !flatten;
+                            if (!flatten) try writeFormatLiteral(w, if (hooked_record) "[ " else "[");
+                            try w.print("    nov_format_{d}(sink, value.f{d}, {s});\n", .{ @backingInt(field.ty), f, if (flatten) "false" else "true" });
+                            if (!flatten) try writeFormatLiteral(w, if (hooked_record) " ]" else "]");
+                        }
+                        try w.writeAll("    break;\n");
+                    }
+                    try w.writeAll("    default: nov_rt_panic(\"invalid union tag\");\n    }\n");
+                } else {
+                    try w.writeAll("    if (named) {\n");
+                    try writeFormatLiteral(w, formatName(ir, id));
+                    try w.writeAll("    }\n");
+                    try writeFormatLiteral(w, if (record.fields.len == 0) "[" else "[ ");
+                    for (record.fields, 0..) |field, f| {
+                        if (f != 0) try writeFormatLiteral(w, ", ");
+                        try writeFormatLiteral(w, field.name);
+                        try writeFormatLiteral(w, ": ");
+                        try w.print("    nov_format_{d}(sink, value.f{d}, true);\n", .{ @backingInt(field.ty), f });
+                    }
+                    try writeFormatLiteral(w, if (record.fields.len == 0) "]" else " ]");
+                }
+            },
+            else => unreachable,
+        }
+        try w.writeAll("}\n");
+        if (converted[t]) {
+            try w.print("static nov_string nov_to_string_{d}(", .{t});
+            try writeType(ir, w, @fromBackingInt(@intCast(t)));
+            try w.print(" value) {{\n    nov_format_sink sink = {{0}};\n    void **roots[] = {{&sink.output.owner}};\n    nov_gc_roots frame = {{0}};\n    nov_gc_push(&nov_rt_heap, &frame, roots, 1);\n    nov_format_{d}(&sink, value, true);\n", .{t});
+            try w.writeAll("    nov_string result = sink.output;\n    nov_gc_pop(&nov_rt_heap, &frame);\n    return result;\n}\n");
+        }
+    }
+}
+
 fn writePrint(ir: *const Ir, w: *std.Io.Writer, body: Ir.Body, print: anytype) WriteError!void {
     // Single-string print uses fwrite directly, and library emission has no
     // final-flush wrapper to reference the shared scalar/flush check helper.
@@ -1823,6 +2378,7 @@ fn writePrint(ir: *const Ir, w: *std.Io.Writer, body: Ir.Body, print: anytype) W
         if (i != 0) try w.writeAll("    nov_rt_check(fputc(' ', stdout));\n");
         const ty = ir.types.items[@backingInt(body.instructions[@backingInt(arg)].ty)];
         switch (ty) {
+            .array, .record, .enumeration => try w.print("    {{ nov_format_sink sink = {{0}}; sink.streaming = true; nov_format_{d}(&sink, v{d}, true); }}\n", .{ @backingInt(body.instructions[@backingInt(arg)].ty), @backingInt(arg) }),
             .rune => try w.print("    nov_rt_print_rune(v{d});\n", .{@backingInt(arg)}),
             .string => try w.print("    if (v{d}.len && fwrite(v{d}.data, 1, (size_t)v{d}.len, stdout) != (size_t)v{d}.len) nov_rt_panic(\"stdout write failed\");\n", .{ @backingInt(arg), @backingInt(arg), @backingInt(arg), @backingInt(arg) }),
             .boolean => try w.print("    nov_rt_check(fputs(v{d} ? \"true\" : \"false\", stdout));\n", .{@backingInt(arg)}),

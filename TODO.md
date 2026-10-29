@@ -150,8 +150,12 @@ than deep-cloning closures; immutable capture snapshots and mutable shared cells
 retain their existing rules. Ranges copy bounds/inclusivity by value.
 
 Enum elements support exact nominal equality/membership. No equality or membership
-is added for functions, unions, records, arrays or ranges. Printing arrays remains
-unsupported; individual elements retain existing scalar/exact `toString` rules.
+is added for functions, unions, records, arrays or ranges. Arrays now support
+recursive printing/interpolation for printable elements; nested nominal values
+use exact `toString` hooks once in traversal order, overriding their value and
+stopping structural recursion. Functions/closures and ranges have no default
+representation; aggregates containing them need an enclosing valid hook that
+stops recursion. Malformed/inaccessible nested hooks reject.
 Direct chained indexed/computed writes and `items[i].field` mutation remain
 unsupported. Use a mutable element copy and assign it back, or existing scoped
 stable-owner element loans for supported nested-array updates/replacement. No new
@@ -331,7 +335,8 @@ Nominal unnumbered enums are executable: qualified/contextual tags, aliases, exa
 ==/!=, exhaustive single-enum matches with qualified patterns/alternatives/catchall,
 covered-pattern notes, literal globals, record fields and tag defaults, union
 payloads, generic arguments and .! error propagation. Static methods/public and
-exact toString printing/interpolation reuse container rules. Enum leaves add no GC
+default `Kind.tag` printing/interpolation and exact toString overrides at any depth
+reuse container rules. Nested enum hooks run once per encountered value. Enum leaves add no GC
 roots; internal uint32 ordinals expose no numeric/FFI policy. Numbered values,
 backing types and numeric conversions/arithmetic/ordering remain unsupported.
 Enum arrays support exact equality/membership. structured-errors.nov now handles
@@ -344,11 +349,46 @@ payload fields are zeroed. Nested union/array/function payloads and recursive
 layouts remain unsupported. Reachable wide scalar leaves
 still produce backend width diagnostics at the leaf field.
 
-Record interpolation now uses the same exact container toString method as print,
-once after each placeholder expression and before later chunks/placeholders.
-Non-generic unions with an exact converter also work. No derived formatting or
-global overload lookup was added. See examples/structured-errors.nov for record
-success/error payloads, propagation and captured error interpolation.
+Printing and interpolation now support recursive named default formatting:
+arrays `[a, b]`, structs `Entry[ name: Ada, scores: [1, 2, 3], color: Color.blue ]`,
+empty structs `Empty[]`, scalar union payloads `Message.number[7]`, void alternatives
+`Message.none`, and enums `Color.red`. Default record union payloads flatten to
+`Message.entry[ name: Ada, scores: [1, 2, 3], color: Color.blue ]`, omitting the
+payload's own type name. Strings/runes are raw UTF-8 without quoting or escaping;
+this is debugging output, not source-roundtrip serialization.
+
+Nominal values at every depth prefer an existing exact container
+`toString: (MyType) -> string`, once per encountered value in traversal order
+(array index order, struct declaration order, active union payload). A valid hook
+replaces the value's representation and stops structural recursion, so unsupported
+fields behind that hook are okay. A record payload's own hook overrides flattening:
+`Message.entry[ <custom output> ]` (spaces around custom payload). Top-level hooks
+run immediately after argument evaluation; nested hooks run during traversal and
+can allocate/call user code with side effects. Malformed/inaccessible explicit
+hooks reject even when nested; fallback is only for types with no hook.
+No global overload lookup is added.
+
+Default printability is recursive: functions/closures, ranges and void values have
+no default representation, including inside aggregates, unless a valid enclosing
+hook stops recursion before them (void union alternatives are payloadless and okay). Unspecialized generics and namespaces are not runtime
+printable; float remains unsupported by the language/runtime. Bare integer
+literals still need a type context. This adds no builtin, array equality or other
+aggregate operations.
+
+Print-context compile-time types work in `@println(int, []int, MyType, (int)->bool)`
+and interpolation such as `{int}`/`{MyType}`. They emit static name strings, not
+runtime type values. Aliases display canonical unqualified names, native int/uint
+display `iN`/`uN` at native width, and generic instances display `Box(bool)`.
+Inline `[]int` in interpolation remains outside the existing parser grammar;
+a type alias works.
+
+After ordinary evaluation/value copies, direct default aggregate printing streams
+without building a formatting string, but nested hooks can allocate, copy values
+and have user-code effects. Interpolation uses one-pass rooted string accumulation
+and concatenations, not measurement plus one allocation; hooks execute once, not
+once per pass. Outer chunk concatenations retain their existing costs. See `examples/printing.nov` and
+`examples/structured-errors.nov` for printing and record success/error payloads,
+propagation and captured error interpolation.
 
 Terminal `@panic(message)` and function annotation `@[noreturn]` are executable.
 `noreturn` is not a type: annotated functions return void, reject explicit returns
@@ -384,15 +424,18 @@ literal-only defaults and required-field diagnostics. Explicit `Type[.field=valu
 constructors evaluate supplied fields once left-to-right, then omitted literal defaults
 in declaration order. Record value boundaries copy fields; strings share immutable
 storage. Field reads work in interpolation. Container methods support scoped and
-static `Type.method(...)` calls; print calls exact `toString: (MyType) -> string` once
-immediately after each argument is evaluated, before the next argument. Only
+static `Type.method(...)` calls; direct print arguments with explicit exact
+`toString: (MyType) -> string` hooks call them once immediately after evaluation,
+before the next argument. Without a hook, printable records use named default
+structural formatting; nested fields/elements recursively invoke valid hooks once
+in traversal order, stopping recursion at each override. Only
 argument-free `@[public]` on immutable supported declarations is accepted;
 declarations and methods are otherwise file-private under both import forms.
 `@[private]` is unsupported. Explicit C export annotations are separate from Nov
 visibility. C value layouts/root frames retain every string owner in
 parameters, temporaries, local slots and control-flow merges. Contextual/anonymous
-constructors, union/function fields, record globals, container constants/types,
-derived printing and FFI remain deferred. Nested structs, array fields and record
+constructors, union/function fields, record globals, container constants/types
+and FFI remain deferred. Nested structs, array fields and record
 arrays are delivered under the recursive value-copy rules above. See README's executable struct
 contract; the older broader syntax examples below are not delivery claims.
 
@@ -519,8 +562,10 @@ implemented; grapheme operations remain deferred.
 - strings:
   - [x] immutable UTF-8 literals, sharing, concatenation, `+=`, scalar length and output
   - [x] allocation-free, byte-exact `==`/`!=` (including NUL; no normalization)
-  - [x] `{expression}` interpolation (including nested calls) for bool/fixed/native integers/rune variables/strings;
-    decimal boundaries, UTF-8/NUL, rooted temporaries and formatter preservation
+  - [x] `{expression}` interpolation (including nested calls) for bool/fixed/native integers/rune variables/strings,
+    recursive named arrays/structs/unions/enums with exact `toString` overrides at any depth
+    and compile-time type-name strings; decimal boundaries, raw UTF-8/NUL, rooted
+    temporaries and formatter preservation
   - blocks/control flow/quoted literals/formats/captures and global interpolation remain unsupported
   - proposal (not accepted or implemented): escape literal interpolation braces with
     `{{` → `{` and `}}` → `}`, instead of `\{` and `\}`; `"{{}}"` would produce `"{}"`.
@@ -1312,7 +1357,10 @@ let ArrayList: (T: #type) -> type = { ... }
     typed immutable literal globals are supported. Concatenation uses rooted GC
     backing; literals use static read-only bytes with a null traced owner.
   - Expression interpolation supports bool, fixed/native decimal integers, rune
-    variables and shared strings, preserving UTF-8/NUL with no normalization. Placeholders are
+    variables, shared strings, recursive default arrays/structs/unions/enums,
+    exact `toString` overrides at any depth and static compile-time type-name strings.
+    Nested hooks run once in traversal order and stop recursion at that value. Raw UTF-8/NUL is
+    preserved without quoting, escaping or normalization. Placeholders are
     evaluated left-to-right once, including nested calls and scalar expressions.
         Blocks/control flow/quoted literals/formats/captures remain unsupported.
     Global interpolation is nonliteral and rejected, not eagerly evaluated.

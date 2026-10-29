@@ -682,7 +682,7 @@ test "unsupported union declarations and rejected matches roll back under OOM" {
         .{ .source = "let U=union{ok:U,}", .tag = .unsupported_type },
         .{ .source = "let U=union{ok:()->int,}", .tag = .unsupported_type },
         .{ .source = "let U=union{ok:int,\nlet constant:int=1\n}", .tag = .unsupported_declaration },
-        .{ .source = "let U=union{ok:int,}\nlet f:()=@println(U.ok[1])", .tag = .invalid_to_string },
+
         .{ .source = "let U=union{ok:int,\nlet toString:(u:U)->bool=true\n}\nlet f:()=@println(U.ok[1])", .tag = .invalid_to_string },
         .{ .source = "let U=union{ok:int,none,}\nlet f:(u:U)->int=match u{.ok=>|n|n}", .tag = .match_missing_variants },
         .{ .source = "let U=union{ok:int,none,}\nlet f:(u:U)->int=match u{.ok=>0\n.ok=>1\n_=>2}", .tag = .match_covered_union_prong },
@@ -706,16 +706,31 @@ test "unsupported union declarations and rejected matches roll back under OOM" {
     }
 }
 
+test "default printing lowers without nominal hooks or global overload lookup" {
+    for ([_][]const u8{
+        "let U=union{ok:int,}\nlet f:()=@println(U.ok[1])",
+        "let A=struct{x:int,}\nlet f:(a:A)=@println(a)",
+        "let A=struct{x:int,}\nlet toString:(a:A)->string=\"not a method\"\nlet f:(a:A)=@println(a)",
+    }) |source| {
+        var module = try Module.init(std.testing.allocator, "default-print.nov", source);
+        defer module.deinit();
+        var result = try lower(&module);
+        defer result.deinit();
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expect(result.lowering_complete);
+        try result.ir.verify();
+    }
+}
+
 test "nominal records reject mismatches malformed constructors defaults fields and printing signatures" {
     const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag };
     for ([_]Case{
         .{ .source = "let A=struct{x:int,}\nlet B=struct{x:int,}\nlet f:(a:A)->B=a", .tag = .expression_type_mismatch },
-        .{ .source = "let A=struct{x:int,}\nlet f:(a:A)=@println(a)", .tag = .invalid_to_string },
-        .{ .source = "let A=struct{x:int,}\nlet toString:(a:A)->string=\"not a method\"\nlet f:(a:A)=@println(a)", .tag = .invalid_to_string },
+
         .{ .source = "let A=struct{x:int,\nlet toString:(b:B)->string=\"wrong nominal receiver\"\n}\nlet B=struct{x:int,}\nlet f:(a:A)=@println(a)", .tag = .invalid_to_string },
         .{ .source = "let A=struct{x:int,\nlet toString:(a:A)->bool=true\n}\nlet f:(a:A)=@println(a)", .tag = .invalid_to_string },
         .{ .source = "let A=struct{x:int,\nlet toString:()->string=\"bad\"\n}\nlet f:(a:A)=@println(a)", .tag = .invalid_to_string },
-        .{ .source = "let A=struct{x:int,}\nlet B=struct{x:int,}\nlet f:(a:B)=@println(a)\nlet main:()=f(A[.x=1])", .tag = .invalid_to_string },
+        .{ .source = "let A=struct{x:int,}\nlet B=struct{x:int,}\nlet f:(a:B)=@println(a)\nlet main:()=f(A[.x=1])", .tag = .expression_type_mismatch },
         .{ .source = "let A=struct{x:int,}\nlet f:()->A=A[]", .tag = .missing_field },
         .{ .source = "let A=struct{x:int,}\nlet f:()->A=A[.x=1,.x=2]", .tag = .duplicate_field },
         .{ .source = "let A=struct{x:int,}\nlet f:()->A=A[.y=1]", .tag = .unknown_field },
@@ -903,7 +918,7 @@ test "rejected matches and pipes roll back diagnostics on allocation failure" {
         "let f: (n: int) -> string = \"{missing}\"",
         "let f: (n: int) -> string = \"{n:02}\"",
         "let f: (n: int) -> string = \"{n}\\xFF\"",
-        "let f: (n: []int) -> string = \"{n}\"",
+        "let f: (n: []() -> int) -> string = \"{n}\"",
         "let f: (n: int) -> int = match n {capture => 1\n_ => 2}",
         "let f: (n: int) -> int = match n {0 => 1}",
         "let f: (n: int) -> int = match n {0 => {let private: int = 1\nprivate}\n_ => true}",

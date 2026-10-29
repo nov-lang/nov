@@ -1,0 +1,67 @@
+; nov run examples/printing.nov
+; nov test examples/printing.nov
+; Default aggregate formatting is human-readable, not round-trippable source.
+
+let Color = enum {
+    red,
+    blue,
+}
+
+let Entry = struct {
+    name: string,
+    scores: []uint,
+    color: Color,
+}
+
+let Message = union {
+    entry: Entry,
+    none,
+}
+
+let Label = struct {
+    value: string,
+
+    let toString: (label: Label) -> string = "Label({label.value})"
+}
+
+let Ints = []int
+
+let main: () = {
+    @println("Types:", bool, []rune, Entry, Message, (int) -> bool)
+    @println("Array type: {Ints}")
+    let values: []uint = [1, 2, 3]
+    @println("Array:", values)
+    let rows: [][]bool = [[true, false], []]
+    @println("Nested: {rows}")
+    let entry = Entry[ .name = "Ada", .scores = values, .color = .blue ]
+    @println("Struct:", entry)
+    let messages: []Message = [.entry[entry], .none[]]
+    @println("Unions: {messages}")
+    @println("Enum:", Color.red)
+    let label = Label[ .value = "custom" ]
+    @println("Custom:", label)
+    ; Nested values use their user-defined converters too.
+    @println("Nested custom:", [label])
+}
+
+@[test]
+let aggregate_interpolation: () = {
+    let values: []uint = [1, 2, 3]
+    @assert("{values}" == "[1, 2, 3]")
+    let rows: [][]bool = [[true, false], []]
+    @assert("{rows}" == "[[true, false], []]")
+    let entry = Entry[ .name = "Ada", .scores = values, .color = .blue ]
+    @assert("{entry}" == "Entry[ name: Ada, scores: [1, 2, 3], color: Color.blue ]")
+    let messages: []Message = [.entry[entry], .none[]]
+    @assert("{messages}" == "[Message.entry[ name: Ada, scores: [1, 2, 3], color: Color.blue ], Message.none]")
+}
+
+@[test]
+let hooks_and_types: () = {
+    let label = Label[ .value = "custom" ]
+    @assert("{label}" == "Label(custom)")
+    let labels = [label]
+    @assert("{labels}" == "[Label(custom)]")
+    @assert("{Entry}" == "Entry")
+    @assert("{bool}" == "bool")
+}

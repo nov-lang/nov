@@ -55,9 +55,11 @@ clauses, value-carrying breaks, and conditional/range-loop exhaustion (`else`) r
 It requires immutable literal globals; unit/global block initializers are
 not lowered yet. An internal C11 backend emits verified IR, including fixed-width
 integer arithmetic and program entrypoint emission through `emit-c`.
-`@print`/`@println` support booleans, runes, strings and explicitly typed integers,
-including `int`/`uint`, and [nominal value structs](#executable-nominal-value-structs)
-with an exact container `toString` method. Plain `check` remains syntax-only.
+`@print`/`@println` support booleans, runes, strings, explicitly typed integers
+(including `int`/`uint`), and default structural formatting for printable arrays,
+structs, unions and enums. Nominal values, including nested values, can override
+the default with an exact container `toString` method. Print contexts also accept compile-time type
+names as static strings, not runtime type values. Plain `check` remains syntax-only.
 
 Use `zig build run -- check --semantic file.nov` for the current bounded
 semantic/lowering subset. It runs declaration collection, initializer dependency
@@ -192,9 +194,62 @@ let main: () -> void = @println(true, answer())
 This outputs `true -42` followed by a newline. Bare integer literals such as
 `@println(42)` still require a type context: use `@as(int, 42)`, a typed global,
 local, parameter, or function result. Native aliases do not introduce bare-literal inference defaults.
-Interpolated strings can be printed like any string; function values and void
-arguments remain unsupported for printing. The C backend
-continues to reject widths other than 8/16/32/64.
+Interpolated strings can be printed like any string. Functions/closures, ranges
+and void values have no default representation; aggregates containing them also
+reject unless a valid enclosing hook overrides that value and stops structural
+recursion. A void union alternative is payloadless and printable. Unspecialized generic templates and namespaces are not
+runtime printable, and floats remain unsupported by the language/runtime. The C
+backend continues to reject integer widths other than 8/16/32/64.
+
+Default formatting recurses through nested aggregates:
+
+| Value | Representation |
+| --- | --- |
+| Array | `[a, b]` (empty: `[]`) |
+| Struct | `Entry[ name: Ada, scores: [1, 2, 3], color: Color.blue ]` |
+| Empty struct | `Empty[]` |
+| Union with record payload | `Message.entry[ name: Ada, scores: [1, 2, 3], color: Color.blue ]` |
+| Union with scalar payload | `Message.number[7]` |
+| Void union alternative | `Message.none` |
+| Enum | `Color.red` |
+
+Strings and runes are raw UTF-8, without quotes or escaping, even when nested.
+This is debugging output, not an unambiguous source-roundtrip format. Every nominal
+value, including nested fields, elements and union payloads, prefers its existing
+exact `toString` hook. Each encountered hook runs exactly once in traversal order:
+array index order, struct declaration order, and the active union payload. A valid
+hook replaces that value's entire representation and stops structural recursion,
+so unsupported fields behind it do not prevent printing. Malformed or inaccessible
+explicit hooks reject even when nested; only the absence of a hook enables the
+default. A default record payload is flattened into the union's brackets, omitting
+its own type name. If that payload has a hook, its output replaces the fields:
+`Message.entry[ <custom output> ]` (with spaces around the custom payload).
+
+After ordinary argument evaluation and value copies, direct default aggregate
+printing streams without building a formatting string. Nested hooks can still
+allocate, perform value copies and call user code with side effects during that
+traversal. Interpolation converts aggregates in one pass with rooted string
+accumulation and concatenations, not a measurement pass or one-allocation scheme;
+hooks are not repeated to calculate output size.
+See [`examples/printing.nov`](examples/printing.nov).
+
+Print contexts also recognize compile-time type syntax:
+
+```nov
+let MyType = struct { ready: bool, }
+let Ints = []int
+let main: () = {
+    @println(int, []int, MyType, (int)->bool)
+    @println("{int} {MyType} {Ints}")
+}
+```
+
+These emit static strings, not runtime type values. Aliases display canonical,
+unqualified names; native `int`/`uint` display `iN`/`uN` at the native width
+(for example `i64`/`u64` on a 64-bit target), function types display `(iN) -> bool`,
+and concrete generic instances display names such as `Box(bool)`. Inline `[]int`
+in interpolation is not accepted by the existing parser grammar; an alias such as
+`Ints` works. This adds no builtin or general runtime type-value support.
 
 `@as(T, value)` supplies an explicit expected type inside a function body:
 
@@ -897,8 +952,9 @@ names and tags match; module aliases preserve identity.
   work with exact nominal typing. `Result(uint, Kind)` supports ordinary `.!`
   propagation with exact error identity. Enum leaves need no GC roots.
 - Static container methods and `@[public]` metadata follow the existing bounded
-  container rules. Printing/interpolation require the exact container method
-  `toString: (Kind) -> string`; numeric or tag-name formatting is not derived.
+  container rules. Default printing/interpolation uses `Kind.tag`; an exact
+  container method `toString: (Kind) -> string` overrides it, including for nested
+  enum values, and runs once per encountered value.
 - Enum instance calls such as `kind.eql(other)` use the value-receiver rules below.
   Enum arrays support exact-type element equality and membership. Explicit numbered
   values/backing types remain unsupported.
@@ -1041,22 +1097,27 @@ The delivered subset is deliberately bounded:
   fields remain unsupported.
   Container constants, nested type declarations, general type values,
   struct global instances and C FFI are unsupported.
-- Printing requires exactly the container method `toString: (MyType) -> string`.
-  The parameter name is unrestricted, and aliases of the exact nominal type and
-  `string` are accepted. Missing/wrong signatures diagnose when the record is
-  printed. No global overload lookup or automatically derived representation is
-  provided. Interpolation reuses this exact converter. Explicit `MyType.toString(item)`
-  is also an ordinary call.
-- Each print argument is evaluated, then (if a record) converted by **one** call
-  to its `toString`, before moving to the next argument. Only after all arguments
-  and conversions finish does the final print operation write their values,
-  separated by spaces, with the existing checked-write/flush behavior. Thus a
-  method's own effects can precede later argument effects; conversions are not
-  repeated by the final write. Allocating methods return normal immutable strings.
+- Default printing/interpolation uses `MyType[ field: value, ... ]` (`MyType[]`
+  when empty), recursively applying converters to nested fields/elements.
+  An explicit container method `toString: (MyType) -> string` overrides the whole
+  value at any depth and stops recursion, allowing otherwise unprintable fields
+  behind that hook. The parameter name is unrestricted, and aliases of the exact
+  nominal type and `string` are accepted. Wrong signatures or inaccessible explicit
+  hooks diagnose even when nested; fallback applies only when no hook exists.
+  Each encountered hook runs once in traversal order. No global overload lookup is provided.
+  Explicit `MyType.toString(item)` is also an ordinary call.
+- Each print argument is evaluated, then (if it has an explicit hook) converted
+  by **one** call to its `toString`, before moving to the next argument. Only after
+  all arguments and top-level conversions finish does the final print operation
+  write their values, separated by spaces, with the existing checked-write/flush
+  behavior. Top-level hook effects can precede later argument effects; nested
+  hooks instead run once during structural traversal and can interleave their
+  effects with streamed output. Allocating methods return normal immutable strings.
 - Declarations and methods are file-private by default. One argument-free
   `@[public]` exposes a supported immutable declaration across files, including
   structs, methods and module re-exports. Both file and named imports require
-  public exports; cross-file printing also requires a public `toString` method.
+  public exports; cross-file printing requires a public `toString` if an explicit
+  hook exists. A private hook rejects rather than exposing structural fields.
   `@[private]` is unsupported. Duplicate, unknown or invalidly placed attributes
   diagnose. Visibility does not change C export policy.
 
@@ -1138,7 +1199,10 @@ checked semantically through 128 bits, while reachable C layouts require
   are rooted, including across allocations and early returns. Payload extraction
   checks the active tag in all build modes.
 - Non-generic union methods and `@[public]` use the same bounded container rules
-  as structs, including exact `toString` printing. Visibility is metadata only.
+  as structs, including default `Union.tag[payload]`/`Union.tag` printing and exact
+  `toString` overrides at any depth. Default record payloads flatten their fields
+  into `Union.tag[ field: value, ... ]`; a record payload hook instead produces
+  `Union.tag[ <custom output> ]`. Visibility is metadata only.
 - Record payloads, including nested structs, retain exact nominal identity and value-copy semantics;
   their string fields share immutable storage. Constructors, captures and `.!`
   work with records and aliases. C emits payload record layouts before containing
@@ -1678,14 +1742,16 @@ let main: () -> void = {
   capacity times managed owner fields; GC never traces static byte pointers.
   See [examples/managed-arrays.nov](examples/managed-arrays.nov).
 - `.len` writes are explicitly rejected: shrinking and especially initialization
-  on length growth remain undesigned. No array printing, equality, concatenation
+  on length growth remain undesigned. No array equality, concatenation
   with `+`, slices, pointer elements, general aliases,
   array globals, or capacity API is delivered. Bounded value/reference iteration is
   supported (see [Loop](#loop)). The formatter supports
   the array syntax described above without extending these semantics.
-  Individual elements retain their existing scalar or exact container `toString`
-  printing/interpolation rules; storage adds no printer for functions or ranges,
-  and array values themselves still cannot be printed.
+  Arrays print/interpolate as `[a, b]` when their elements are recursively
+  printable, honoring exact nominal `toString` hooks once in index/traversal order.
+  Functions/closures and ranges have no default representation; aggregates
+  containing them need a valid enclosing hook that stops recursion before them.
+  Malformed/inaccessible nested hooks reject rather than falling back.
   See [`examples/storable-arrays.nov`](examples/storable-arrays.nov) for the
   expanded element matrix.
 
@@ -1772,8 +1838,8 @@ changed.score += 1
   [examples/managed-arrays.nov](examples/managed-arrays.nov).
 
 The broader examples below describe future syntax as well as implemented syntax;
-printing arrays, defaulting bare integer elements and writable `.len` in them
-are **not** executable features of this subset.
+defaulting bare integer elements and writable `.len` in them are **not** executable
+features of this subset. Array printing is implemented for recursively printable elements.
 
 Array literals are comma-separated, may span multiple lines, and may have a
 trailing comma.
@@ -2251,9 +2317,10 @@ unknown names, not assumed to be function types. Identifier-only cycles with no
 type context remain value-dependency errors; a type annotation or `@as` demand
 classifies the same candidates as attempted aliases and reports type-alias cycles.
 
-Aliases work in annotations and `@as`, not runtime expressions:
-`@println(Count)` and `Count(1)` are errors. An alias of a nominal struct supports
-that struct's explicit `Alias[ .field = value ]` constructor and static methods;
+Aliases work in annotations and `@as`, and print contexts render their canonical
+type names as static strings (`@println(Count)` or `"{Count}"`). They are not
+general runtime values; `Count(1)` remains an error. An alias of a nominal struct
+supports that struct's explicit `Alias[ .field = value ]` constructor and static methods;
 this does not add numeric alias constructors, mutable/local aliases, general runtime type values, `@TypeOf`, generics or
 comptime functions. `@as` remains exact expected-type ascription, not a checked
 numeric cast. See [examples/type-aliases.nov](examples/type-aliases.nov).
@@ -2577,13 +2644,26 @@ an immutable `string`. Placeholders support `bool` (`true`/`false`), signed and
 unsigned fixed-width integers (`i8`/`u8` through `i64`/`u64`), native `int`/`uint`
 (exact decimal, including minimum/maximum values), runes (UTF-8 encoded scalars),
 and strings (unchanged bytes).
-Nominal enums, structs and concrete generic or non-generic unions also work when they define the exact
-container `toString: (SelfType) -> string` method already required by print.
+Arrays, nominal enums, structs and concrete generic or non-generic unions use the
+same recursive default representations as print: `[a, b]`, `Entry[ field: value, ... ]`
+(or `Empty[]`), `Message.tag[payload]` or payloadless `Message.tag`, and enum
+`Color.tag`. Default record union payloads flatten to `Message.entry[ field: value, ... ]`.
+Strings/runes remain raw, not quoted or escaped. Nominal values at every depth
+prefer an explicit exact container `toString: (SelfType) -> string`, invoked once
+in traversal order. A hook overrides the value and stops recursion; a record
+payload hook produces `Message.entry[ <custom output> ]` rather than flattened
+fields. Malformed/inaccessible hooks reject even when nested, and only a missing
+hook permits structural fallback. Functions/closures, ranges and void values
+(other than payloadless union alternatives) have no default representation;
+aggregates containing them require a valid enclosing hook that stops recursion.
 Each placeholder expression evaluates once, then converts once immediately before
-proceeding to the next chunk or placeholder. Aliases preserve the exact signature;
-allocating converters and managed payloads stay rooted. Missing/wrong converters
-diagnose; no derived formatting or global overload lookup is introduced. Terminal expressions skip conversion and later placeholder effects.
-No numeric defaults, widening or implicit fallback formatting are introduced.
+proceeding to the next chunk or placeholder. Aliases preserve exact hook signatures;
+allocating converters and managed payloads stay rooted. No global overload lookup
+is introduced. Terminal expressions skip conversion and later placeholder effects.
+No numeric defaults or widening are introduced. Compile-time types such as `{int}`
+and `{MyType}` emit canonical, unqualified static name strings, not runtime type
+values. Inline `[]int` is outside the existing interpolation parser grammar; use a
+type alias instead.
 
 ```nov
 let describe: (n: int, ready: bool) -> string = "n={n}, ready={ready}"
@@ -2607,8 +2687,13 @@ strings are never reinterpreted.
 
 Chunks and placeholders evaluate once, left to right. UTF-8 bytes and embedded NUL
 are preserved, with no Unicode normalization. String placeholders share storage;
-integer conversions and concatenations allocate rooted GC backing. Concatenation
-checks length overflow; allocation failure panics. This minimal implementation uses
+integer conversions and concatenations allocate rooted GC backing. Aggregate
+conversion is one-pass rooted string accumulation, invoking nested hooks exactly
+once rather than measuring and replaying traversal. It can allocate multiple
+strings; outer chunk concatenations retain their existing costs. Direct default
+aggregate printing streams after ordinary evaluation/copies without building a
+formatting string, but nested hooks can allocate and have user-code effects.
+Concatenation checks length overflow; allocation failure panics. This minimal implementation uses
 successive concatenations (potentially quadratic copied bytes for many chunks),
 not an optimized string builder. Interpolation works independently of printing,
 including equality, `.len`, branch results and returns; globals still require
@@ -2629,7 +2714,7 @@ TODO
 - `@TypeOf(...)`: Returns the type of a value.
 - `@typeInfo(...)`: Returns type information about a value.
 - `@This()`: Returns the type of the current container
-- `@print(...)`: Output bool, fixed/native integer, rune and string args separated with a space to stdout; returns void. Nominal structs require their exact `toString: (MyType) -> string` method, called once immediately after evaluating each record argument. Interpolated strings work like other strings.
+- `@print(...)`: Output args separated with a space to stdout; returns void. Supports bool, fixed/native integer, raw rune/string and recursive default array/struct/union/enum formatting. Nominal values at any depth prefer an explicit exact `toString: (MyType) -> string`, called once per encountered value in traversal order and stopping structural recursion. Top-level hooks run immediately after argument evaluation; nested hooks run during traversal. Malformed/inaccessible hooks reject even when nested. Compile-time types emit canonical static name strings. Interpolated strings work like other strings. See the printing contract above.
 - `@println(...)`: Same as print with a newline at the end, including with no args.
 - `@fprint(file: File, ...)`: Same as print but output to a specific file. Returns a Result<>.
 <!-- - `@eprint(...)`: Same as print but output to stderr. -->
@@ -2829,8 +2914,9 @@ Aliases and re-exports do not bypass access checks. Public wrappers can call pri
 helpers in their defining file, and a public type alias can intentionally expose a
 private local type without exposing its unmarked methods. Returning or passing a
 value does not grant access to its private methods. Checks cover static and receiver
-calls, function-value extraction, printing and interpolation (`toString` must be
-public for cross-file use). Fields and union variants do not support visibility
+calls, function-value extraction, printing and interpolation (an explicit
+`toString` must be public for cross-file use; a private hook prevents structural
+fallback). Fields and union variants do not support visibility
 attributes.
 
 Migration: add `@[public]` to declarations and methods used across files; remove any

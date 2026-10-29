@@ -55,7 +55,7 @@ test "type aliases canonicalize forward chains nested components and named signa
 
 const Failure = struct { source: []const u8, tag: Module.Diagnostic.Tag, text: ?[]const u8 = null };
 const failures = [_]Failure{
-    .{ .source = "let Count = uint\nlet main: () = @println(Count)", .tag = .not_a_value, .text = "Count" },
+    .{ .source = "let Count = uint\nlet f: (n: uint) = {}\nlet main: () = f(Count)", .tag = .not_a_value, .text = "Count" },
     .{ .source = "let Fn = (int) -> int\nlet main: () = Fn(1)", .tag = .not_a_value },
     .{ .source = "let Count = u8\nlet main: () = @println(@as(Count, 256))", .tag = .literal_out_of_range },
     .{ .source = "let Count = uint\nlet f: (x: int) -> Count = @as(Count, x)", .tag = .expression_type_mismatch },

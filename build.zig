@@ -145,6 +145,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const storable_array_tests = b.step("test-cli-storable-arrays", "Run storable array CLI tests");
     addStorableArrayCliTests(b, exe, storable_array_tests);
     test_step.dependOn(storable_array_tests);
+    const printing_tests = b.step("test-cli-printing", "Run type and aggregate printing CLI tests");
+    addPrintingCliTests(b, exe, printing_tests);
+    test_step.dependOn(printing_tests);
     const array_helper_tests = b.step("test-cli-array-helpers", "Run standard-library array helper CLI tests");
     addArrayHelperCliTests(b, exe, array_helper_tests);
     test_step.dependOn(array_helper_tests);
@@ -285,7 +288,7 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     _ = fixtures.add("global-nesting.nov", "let n = @as(int, @as(uint, 1))\n");
     _ = fixtures.add("global-block.nov", "let n = @as(int, {1})\n");
     _ = fixtures.add("global-interpolation.nov", "let n = @as(string, \"{true}\")\n");
-    _ = fixtures.add("alias-value.nov", "let Count = uint\nlet main: () = @println(Count)\n");
+    _ = fixtures.add("alias-value.nov", "let Count = uint\nlet f: (n: uint) = {}\nlet main: () = f(Count)\n");
     _ = fixtures.add("alias-cycle.nov", "let A = []B\nlet B = A\n");
     _ = fixtures.add("ascription.nov", "let main: () -> void = {\n    @println(\"{@as(int, 1)}\", @as(uint, 1))\n    let a = @as([]int, [2])\n    @println(a[0])\n}\n");
     _ = fixtures.add("interpolation-format.nov", "let main: () -> void = {let n: int = 1\n@println(\"{n:02}\")}\n");
@@ -349,7 +352,7 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         .{ .name = "enum numbered unsupported", .args = &.{ "check", "enum-numbered.nov", "--semantic" }, .exit_code = 1, .stderr_match = "explicit enum values" },
         .{ .name = "enum backing unsupported", .args = &.{ "check", "enum-backing.nov", "--semantic" }, .exit_code = 1, .stderr_match = "explicit enum backing types are unsupported" },
         .{ .name = "record interpolation semantic", .args = &.{ "check", "record-interpolation.nov", "--semantic" }, .exit_code = 0 },
-        .{ .name = "record interpolation missing method", .args = &.{ "check", "record-interpolation-missing.nov", "--semantic" }, .exit_code = 1, .stderr_match = "printing a struct, enum or union requires its method toString: (MyType) -> string" },
+        .{ .name = "record interpolation default formatting", .args = &.{ "check", "record-interpolation-missing.nov", "--semantic" }, .exit_code = 0 },
         .{ .name = "record payload semantic", .args = &.{ "check", "record-payloads.nov", "--semantic" }, .exit_code = 0 },
         .{ .name = "record payload 128 bit semantic", .args = &.{ "check", "wide-record-payload.nov", "--semantic" }, .exit_code = 0 },
         .{ .name = "record payload backend width", .args = &.{ "emit-c", "wide-record-payload.nov" }, .exit_code = 1, .stderr_match = "C backend only supports 8, 16, 32 and 64-bit integers" },
@@ -2356,6 +2359,35 @@ fn addStorableArrayCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_st
     }
 }
 
+fn addPrintingCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    const fixtures = b.addWriteFiles();
+    _ = fixtures.add("printing.nov", @embedFile("examples/printing.nov"));
+    const output = b.fmt(
+        "Types: bool []rune Entry Message (i{d}) -> bool\nArray type: []i{d}\n" ++
+            "Array: [1, 2, 3]\nNested: [[true, false], []]\n" ++
+            "Struct: Entry[ name: Ada, scores: [1, 2, 3], color: Color.blue ]\n" ++
+            "Unions: [Message.entry[ name: Ada, scores: [1, 2, 3], color: Color.blue ], Message.none]\n" ++
+            "Enum: Color.red\nCustom: Label(custom)\nNested custom: [Label(custom)]\n",
+        .{ @bitSizeOf(usize), @bitSizeOf(usize) },
+    );
+    for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+        for ([_][]const u8{ "run", "test" }) |command| {
+            const run = b.addRunArtifact(exe);
+            run.step.name = b.fmt("CLI printing: {s} {s}", .{ command, mode });
+            run.setCwd(fixtures.getDirectory());
+            run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+            run.setEnvironmentVariable("NOV_CC", "");
+            run.setEnvironmentVariable("CC", "");
+            run.addArgs(&.{ command, "printing.nov" });
+            if (mode.len != 0) run.addArg(mode);
+            run.expectExitCode(0);
+            run.expectStdOutEqual(if (std.mem.eql(u8, command, "run")) output else "PASS aggregate_interpolation\nPASS hooks_and_types\n2 passed; 0 failed; 2 total\n");
+            run.expectStdErrEqual("");
+            test_step.dependOn(&run.step);
+        }
+    }
+}
+
 fn addArrayHelperCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
     const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
@@ -2444,7 +2476,7 @@ fn addArrayHelperCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step
             test_step.dependOn(&check.step);
         }
     }
-    const example_output = "Mapped: 2 4 6 8\nFiltered: 6 8\nFolded: 14\n";
+    const example_output = "Numbers: [1, 2, 3, 4]\nMapped: [2, 4, 6, 8]\nFiltered: [6, 8]\nFolded: 14\n";
     const example_tests = "PASS map_types_and_generic_callbacks\nPASS filter_order_and_exact_calls\nPASS fold_left_seed_and_empty\nPASS recursive_array_record_and_union_copies\nPASS function_elements_share_environments\nPASS argument_order_captures_and_snapshots\n6 passed; 0 failed; 6 total\n";
     const package = b.addWriteFiles();
     const installed_exe = package.addCopyFile(exe.getEmittedBin(), b.fmt("bin/{s}", .{exe.out_filename}));
