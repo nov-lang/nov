@@ -697,6 +697,19 @@ const Context = struct {
         return self.qualify(owner, method);
     }
 
+    fn nominalStringifierIncludingPrivate(self: *Context, ty: Ir.TypeId) ?Module.DeclId {
+        const nominal = self.ir.getType(ty).?;
+        const source = switch (nominal) {
+            .record => nominal.record.source,
+            .enumeration => nominal.enumeration.source,
+            else => return null,
+        };
+        const identity = if (nominal == .record) nominal.record.identity else nominal.enumeration.identity;
+        const owner = if (self.module.compilation) |comp| comp.getModule(source).? else self.module;
+        const method = owner.lookupConcreteStringifier(@fromBackingInt(@intCast(identity)), if (nominal == .record and nominal.record.type_args.len != 0) @backingInt(ty) else null) orelse return null;
+        return self.qualify(owner, method);
+    }
+
     fn conflict(self: *Context, name: []const u8) ?Module.Span {
         if (self.lookupBinding(name)) |binding| return binding.name_span;
         if (self.lexicalConflict(name)) |origin| return origin;
@@ -1799,7 +1812,7 @@ const Context = struct {
         }
         // Even a private hook opts out of structural printing. Never bypass an
         // owner's formatting policy, including for fields and union payloads.
-        if (self.nominalMethodIncludingPrivate(ty, "toString")) |method| {
+        if (self.nominalStringifierIncludingPrivate(ty)) |method| {
             const declaration = self.getDeclaration(method);
             if (self.declarationModule(method).source.id != self.module.source.id and !declaration.public) {
                 _ = try self.fail(.invalid_to_string, node, null);
@@ -4704,15 +4717,82 @@ test "interpolation diagnoses names grammar types scopes and exact source bytes"
     }
 }
 
+test "printing ignores unannotated toString but ordinary calls still work" {
+    const source =
+        \\let R=struct{value:int,
+        \\let toString:(r:R)->string="ordinary"
+        \\}
+        \\let E=enum{one,
+        \\let toString:()->bool=true
+        \\}
+        \\let U=union{value:R,
+        \\let toString:()->bool=true
+        \\}
+        \\let f:(r:R,u:U,e:E)={
+        \\@println(r,[r],u,e)
+        \\@println("{r} {[r]} {u} {e}")
+        \\@println(r.toString())
+        \\}
+    ;
+    var module = try Module.init(std.testing.allocator, "ordinary-toString.nov", source);
+    defer module.deinit();
+    var sema = try Lowering.lower(&module);
+    defer sema.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+    try std.testing.expectEqual(@as(usize, 3), sema.ir.formatting.items.len);
+    for (sema.ir.formatting.items) |entry| try std.testing.expect(entry.formatter == null);
+    var calls: usize = 0;
+    for (sema.ir.functions.items) |function| if (function.body) |body| {
+        for (body.instructions) |instruction| if (instruction.op == .call) {
+            calls += 1;
+        };
+    };
+    try std.testing.expectEqual(@as(usize, 1), calls);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+}
+
+test "printing does not use unannotated toString to hide unprintable fields" {
+    for ([_][]const u8{ "@println(r)", "@println([r])", "@println(\"{r}\")" }) |expression| {
+        const source = try std.mem.concat(std.testing.allocator, u8, &.{ "let R=struct{callback:()->int,\nlet toString:(r:R)->string=\"ordinary\"\n}\nlet f:(r:R)=", expression });
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "no-hidden-hook.nov", source);
+        defer module.deinit();
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        try std.testing.expect(module.hasErrors());
+        try std.testing.expect(!sema.lowering_complete);
+    }
+}
+
+test "stringify rejects local and field annotations" {
+    for ([_][]const u8{
+        "let f:()={@[stringify]\nlet format:(x:int)->string=\"bad\"\n}",
+        "let S=struct{@[stringify]\nx:int,}",
+        "@[stringify()]\nlet f:()->string=\"bad\"",
+    }) |source| {
+        var module = try Module.init(std.testing.allocator, "misplaced-stringify.nov", source);
+        defer module.deinit();
+        if (module.hasErrors()) continue;
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        try std.testing.expect(module.hasErrors());
+        try std.testing.expect(!sema.lowering_complete);
+    }
+}
+
 test "printing structural aggregates and explicit hooks lower" {
     const source =
         \\let E=enum{first,second,}
         \\let R=struct{items:[][]int,kind:E,}
         \\let U=union{none,some:R,}
         \\let Hook=struct{value:int,
-        \\let toString:(h:Hook)->string="custom"
+        \\@[stringify]
+        \\let format:(h:Hook)->string="custom"
         \\}
         \\let HookEnum=enum{one,
+        \\@[stringify]
         \\let toString:(e:HookEnum)->string="enum hook"
         \\}
         \\let f:(r:R,u:U,h:Hook,a:[]Hook,e:HookEnum)={
@@ -4747,7 +4827,8 @@ fn testNestedFormatting(allocator: std.mem.Allocator) !void {
         \\let Color=enum{red,blue,}
         \\let Skip=struct{callbacks:[]()->int,}
         \\let Box:(T:type)->type=struct{value:T,skip:Skip,
-        \\let toString:(b:@This())->string="box:{b.value}"
+        \\@[stringify]
+        \\let format:(b:@This())->string="box:{b.value}"
         \\}
         \\let Alias=Box(bool)
         \\let Entry=struct{name:string,boxes:[][]Alias,color:Color,}
@@ -4770,6 +4851,10 @@ fn testNestedFormatting(allocator: std.mem.Allocator) !void {
             if (!std.mem.eql(u8, name, entry.display_name)) continue;
             found = true;
             if (std.mem.eql(u8, name, "Box(bool)")) {
+                const record = sema.ir.getType(entry.ty).?.record;
+                const method = module.lookupConcreteStringifier(@fromBackingInt(@intCast(record.identity)), @backingInt(entry.ty)).?;
+                try std.testing.expect(module.getDeclaration(method).?.stringify);
+                try std.testing.expectEqualStrings("format", module.getDeclaration(method).?.name);
                 const hook = sema.ir.getFunction(entry.formatter.?).?;
                 try std.testing.expect(hook.body != null);
                 try std.testing.expect(!hook.is_closure);
@@ -4792,9 +4877,9 @@ test "printing nested generic hooks owns metadata and lowers bodies under every 
 
 test "printing nested malformed hooks and backend only hook bodies diagnose" {
     for ([_]struct { hook: []const u8, tag: Module.Diagnostic.Tag }{
-        .{ .hook = "let toString:()->string=\"bad\"", .tag = .invalid_to_string },
-        .{ .hook = "let toString:(r:R)->bool=true", .tag = .invalid_to_string },
-        .{ .hook = "let toString:(r:R)->string=missing", .tag = .unknown_name },
+        .{ .hook = "@[stringify]\nlet toString:()->string=\"bad\"", .tag = .invalid_to_string },
+        .{ .hook = "@[stringify]\nlet toString:(r:R)->bool=true", .tag = .invalid_to_string },
+        .{ .hook = "@[stringify]\nlet toString:(r:R)->string=missing", .tag = .unknown_name },
     }) |case| {
         for ([_][]const u8{ "@println(value)", "@println(\"{value}\")" }) |expression| {
             const source = try std.mem.concat(std.testing.allocator, u8, &.{ "let R=struct{\n", case.hook, "\n}\nlet Outer=struct{items:[][]R,}\nlet f:(value:Outer)=", expression });
@@ -4856,10 +4941,11 @@ test "printing imported private hooks never falls back to structural fields" {
     for ([_]bool{ false, true }) |generic| {
         for ([_]Hook{
             .{ .declaration = "", .printable = true },
-            .{ .declaration = "let toString:(r:@This())->string=\"redacted\"\n", .printable = false },
-            .{ .declaration = "let toString:()->string=\"malformed\"\n", .printable = false },
-            .{ .declaration = "@[public]\nlet toString:(r:@This())->string=\"redacted\"\n", .printable = true },
-            .{ .declaration = "@[public]\nlet toString:()->string=\"malformed\"\n", .printable = false },
+            .{ .declaration = "let toString:()->bool=true\n", .printable = true },
+            .{ .declaration = "@[stringify]\nlet format:(r:@This())->string=\"redacted\"\n", .printable = false },
+            .{ .declaration = "@[stringify]\nlet toString:()->string=\"malformed\"\n", .printable = false },
+            .{ .declaration = "@[public]\n@[stringify]\nlet format:(r:@This())->string=\"redacted\"\n", .printable = true },
+            .{ .declaration = "@[public]\n@[stringify]\nlet toString:()->string=\"malformed\"\n", .printable = false },
         }) |hook| {
             const library_source = try std.mem.concat(std.testing.allocator, u8, &.{
                 "@[public]\n",                     if (generic) "let R:(T:type)->type=struct{secret:T,\n" else "let R=struct{secret:string,\n",
@@ -4900,7 +4986,9 @@ test "printing imported private hooks never falls back to structural fields" {
                         if (!std.mem.eql(u8, entry.display_name, if (generic) "R(string)" else "R")) continue;
                         found = true;
                         try std.testing.expectEqual(library, sema.ir.getType(entry.ty).?.record.source);
-                        if (hook.declaration.len != 0) try std.testing.expect(sema.ir.getFunction(entry.formatter.?).?.body != null);
+                        if (std.mem.indexOf(u8, hook.declaration, "@[stringify]") != null) {
+                            try std.testing.expect(sema.ir.getFunction(entry.formatter.?).?.body != null);
+                        } else try std.testing.expect(entry.formatter == null);
                     }
                     try std.testing.expect(found);
                 } else {
@@ -4931,9 +5019,9 @@ test "printing types respects imported namespace visibility" {
 
 test "printing malformed explicit hooks never falls back" {
     for ([_][]const u8{
-        "let toString:()->string=\"bad\"",
-        "let toString:(r:R)->bool=true",
-        "let toString:(r:R,extra:string)->string=extra",
+        "@[stringify]\nlet toString:()->string=\"bad\"",
+        "@[stringify]\nlet toString:(r:R)->bool=true",
+        "@[stringify]\nlet toString:(r:R,extra:string)->string=extra",
     }) |hook| {
         const source = try std.mem.concat(std.testing.allocator, u8, &.{ "let R=struct{\n", hook, "\n}\nlet main:()=@println(R[])" });
         defer std.testing.allocator.free(source);
@@ -4979,10 +5067,10 @@ test "printing ordinary values is not speculative type resolution" {
 
 test "record interpolation uses print signature diagnostics at the placeholder source" {
     for ([_]struct { declaration: []const u8, related: bool = false }{
-        .{ .declaration = "let R=struct{s:string,\nlet toString:()->string=\"wrong\"\n}", .related = true },
-        .{ .declaration = "let R=struct{s:string,\nlet toString:(r:R,extra:string)->string=r.s+extra\n}", .related = true },
-        .{ .declaration = "let R=struct{s:string,\nlet toString:(r:R)->bool=true\n}", .related = true },
-        .{ .declaration = "let Other=struct{s:string,}\nlet R=struct{s:string,\nlet toString:(r:Other)->string=r.s\n}", .related = true },
+        .{ .declaration = "let R=struct{s:string,\n@[stringify]\nlet toString:()->string=\"wrong\"\n}", .related = true },
+        .{ .declaration = "let R=struct{s:string,\n@[stringify]\nlet toString:(r:R,extra:string)->string=r.s+extra\n}", .related = true },
+        .{ .declaration = "let R=struct{s:string,\n@[stringify]\nlet toString:(r:R)->bool=true\n}", .related = true },
+        .{ .declaration = "let Other=struct{s:string,}\nlet R=struct{s:string,\n@[stringify]\nlet toString:(r:Other)->string=r.s\n}", .related = true },
     }) |case| {
         const source = try std.mem.concat(std.testing.allocator, u8, &.{ case.declaration, "\nlet Alias=R\nlet f:(r:Alias)->string=\"prefix:{r}\"" });
         defer std.testing.allocator.free(source);
@@ -6900,6 +6988,7 @@ const iteration_call_prelude =
     \\    let invoke:(self:R,cb:())=cb()
     \\    let nested:(self:R,cb:())={let run=(){cb()}
     \\        run()}
+    \\@[stringify]
     \\    let toString:(self:R)->string="R"
     \\    @[noreturn]
     \\    let stop:(self:R,cb:())={cb()
@@ -6963,6 +7052,7 @@ test "iteration call protection uses final boxing across backedges and child bod
     const prelude =
         \\let R=struct{let invoke:(self:R,cb:())={let run=(){cb()}
         \\    run()}
+        \\@[stringify]
         \\    let toString:(self:R)->string="R"
         \\}
         \\let G:(T:type)->type=struct{value:T,

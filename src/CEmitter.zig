@@ -2948,13 +2948,16 @@ test "storable arrays forged reused nested and active union payloads detach recu
 test "storable arrays individual elements retain nominal printing contracts" {
     const source =
         \\let E=enum{first,second,
+        \\ @[stringify]
         \\ let toString:(e:E)->string=if e==E.first {"first"} else {"second"}
         \\}
         \\let Alias=E
         \\let R=struct{s:string,
+        \\ @[stringify]
         \\ let toString:(r:R)->string=r.s+"!"
         \\}
         \\let U=union{some:R,none,
+        \\ @[stringify]
         \\ let toString:(u:U)->string=match u {.some=>|r|"{r}"
         \\ .none=>"none"}
         \\}
@@ -3877,6 +3880,7 @@ const enum_program =
     \\@[public]
     \\let Kind=enum{not_found,permission_denied,io,
     \\    @[public]
+    \\    @[stringify]
     \\    let toString:(self:Kind)->string=match self{Alias.not_found=>"not_found"
     \\        Kind.permission_denied | .io=>"other"}
     \\    let eql:(a:Kind,b:Kind)->bool=a==b
@@ -4488,14 +4492,41 @@ test "record payload IR owns source and emission survives every allocation failu
     try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{"let G:(T:type)->type=union{ok:T,}\nlet R=struct{s:string,}\nlet main:()={let u=G(R).ok[R[.s=\"a\"+\"b\"]]\n@println(match u{.ok=>|r|r.s})}"});
 }
 
+test "printing uses annotated format but ignores ordinary toString" {
+    const source =
+        \\let Custom=struct{value:int,
+        \\@[stringify]
+        \\let format:(self:Custom)->string="custom:{self.value}"
+        \\let toString:(self:Custom)->string="ordinary custom"
+        \\}
+        \\let Plain=struct{value:int,
+        \\let toString:(self:Plain)->string="ordinary plain"
+        \\}
+        \\let main:()={let custom=Custom[.value=7]
+        \\let plain=Plain[.value=8]
+        \\@println(custom,plain)
+        \\@println("{custom} {plain}")
+        \\@println([custom],[plain])
+        \\@println(custom.format(),custom.toString(),plain.toString())}
+    ;
+    const c = try arrayTestProgram(source);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "custom:7 Plain[ value: 8 ]\n" ++
+        "custom:7 Plain[ value: 8 ]\n" ++
+        "[custom:7] [Plain[ value: 8 ]]\n" ++
+        "custom:7 ordinary custom ordinary plain\n", "", mode);
+}
+
 const record_interpolation_program =
     \\let Alias=R
     \\let Text=string
     \\let Leaf=struct{s:string,
+    \\    @[stringify]
     \\    let toString:(l:Leaf)->string={@print("L")
     \\        "leaf:"+l.s}
     \\}
     \\let R=struct{s:string,t:string,
+    \\    @[stringify]
     \\    let toString:(r:Alias)->Text={@print("R")
     \\        let leaf=Leaf[.s=r.s+"!"]
     \\        "{leaf}/{r.t}"}
@@ -4505,6 +4536,7 @@ const record_interpolation_program =
     \\let scalar:()->bool={@print("S")
     \\    true}
     \\let U=union{item:string,none,
+    \\    @[stringify]
     \\    let toString:(u:U)->string={@print("U")
     \\        match u{.item=>|s|"union:"+s
     \\            .none=>"none"}}
@@ -4528,6 +4560,7 @@ test "record interpolation captures errors for panic and keeps nested payload ow
     const source =
         \\let G:(T:type,E:type)->type=union{ok:T,err:E,}
         \\let Error=struct{message:string,detail:string,
+        \\    @[stringify]
         \\    let toString:(err:Error)->string={@print("C")
         \\        "{err.message}: {err.detail}"}
         \\}
@@ -4544,6 +4577,7 @@ test "record interpolation skips converters and later placeholders on propagated
     const source =
         \\let G:(T:type,E:type)->type=union{ok:T,err:E,}
         \\let R=struct{s:string,
+        \\    @[stringify]
         \\    let toString:(r:R)->string={@print("BAD-CONVERT")
         \\        r.s}
         \\}
@@ -4585,7 +4619,7 @@ test "record interpolation survives source release and every compiler allocation
 
 test "record interpolation conversion allocations fail safely and skipped conversions allocate nothing" {
     for ([_]bool{ false, true }) |convert| {
-        const source = try std.fmt.allocPrint(test_gpa, "let R=struct{{s:string,\nlet toString:(r:R)->string=r.s+\"!\"\n}}\nlet main:()={{let r=R[.s=\"ok\"]\n@println(if {s} {{\"{{r}}\"}} else {{\"skip\"}})}}", .{if (convert) "true" else "false"});
+        const source = try std.fmt.allocPrint(test_gpa, "let R=struct{{s:string,\n@[stringify]\nlet toString:(r:R)->string=r.s+\"!\"\n}}\nlet main:()={{let r=R[.s=\"ok\"]\n@println(if {s} {{\"{{r}}\"}} else {{\"skip\"}})}}", .{if (convert) "true" else "false"});
         defer test_gpa.free(source);
         const library = try emitSource(source, null);
         defer test_gpa.free(library);
@@ -4605,6 +4639,7 @@ const generic_struct_program =
     \\let sibling:(self:Self)->T=self.get()
     \\let make:(value:T)->Self=Self[.value=value]
     \\let wrap:(self:Self)->Box(Self)=Box(Self)[.value=self]
+    \\@[stringify]
     \\let toString:(self:Self)->string="<{self.value}>"
     \\let unused:()->T=unknown
     \\}
@@ -4709,6 +4744,7 @@ fn testImportedGenericStructs(allocator: std.mem.Allocator) ![]u8 {
             \\@[public]
             \\let make:(value:T)->Self=Self[.value]
             \\@[public]
+            \\@[stringify]
             \\let toString:(self:Self)->string="<{self.value}>"
             \\@[public]
             \\let message:(self:Self)->string=prefix+helper()
@@ -4792,6 +4828,7 @@ const generic_method_program =
     \\let forward:(self:Self,fallback:T)->T=Self.sibling(self,fallback)
     \\let sibling:(self:Self,fallback:T)->T=unwrapOr(self,fallback)
     \\let recur:(self:Self,fallback:T,n:int)->T=if n == 0 {self.forward(fallback)} else {recur(self,fallback,n - 1)}
+    \\@[stringify]
     \\let toString:(self:Self)->string=match self{.ok=>"ok"
     \\.err=>"err"}
     \\}
@@ -4971,6 +5008,7 @@ test "demand generic method body worklist discovers new containers callbacks and
         \\let identity:(self:Self,fallback:T)->T=match self{.ok=>|v|v
         \\.err=>fallback}
         \\let get:(self:Self,fallback:T)->T=identity(self,fallback)
+        \\@[stringify]
         \\let toString:(self:Self)->string={
         \\let flag:G(bool,E)=.ok[true]
         \\let cb:(G(bool,E),bool)->bool=G(bool,E).get
@@ -5319,6 +5357,7 @@ const union_program =
     \\let U = union {
     \\    ok: int, err: string, none, flag: bool,
     \\    @[public]
+    \\    @[stringify]
     \\    let toString: (u: Alias) -> string = describe(u)
     \\    let describe: (u: U) -> string = match u {
     \\        .ok => |v| "n:{v}"
@@ -5561,6 +5600,7 @@ const record_program =
     \\    n: int = 0,
     \\    b: bool = false,
     \\    @[public]
+    \\    @[stringify]
     \\    let toString: (self: Alias) -> string = {
     \\        @print("T")
     \\        "{self.s}:{self.n}:{self.b}"
@@ -5676,6 +5716,7 @@ test "record scoped forward methods override module homonyms without global prin
         \\let Alias=R
         \\let first: (r: R) -> string = "wrong"
         \\let R=struct { s: Text="right",
+        \\ @[stringify]
         \\ let toString: (self: Alias) -> Text = first(self)
         \\ let first: (self: R) -> string = second(self)
         \\ let second: (self: R) -> string = self.s+"!"
@@ -5694,7 +5735,7 @@ test "record constructors and allocating toString report OOM while skipped const
         .{ .body = "let r=R[.s=\"a\"+\"b\"]\n@println(r.s)", .allocates = true },
         .{ .body = "@println(R[])", .allocates = true },
     }) |case| {
-        const source = try std.fmt.allocPrint(test_gpa, "let R=struct{{s:string=\"ok\",\nlet toString:(self:R)->string=self.s+\"!\"\n}}\nlet main:()={{{s}\n}}", .{case.body});
+        const source = try std.fmt.allocPrint(test_gpa, "let R=struct{{s:string=\"ok\",\n@[stringify]\nlet toString:(self:R)->string=self.s+\"!\"\n}}\nlet main:()={{{s}\n}}", .{case.body});
         defer test_gpa.free(source);
         const library = try emitSource(source, null);
         defer test_gpa.free(library);
@@ -5709,6 +5750,7 @@ test "record constructors and allocating toString report OOM while skipped const
 test "record string field roots cover branch and loop merges early returns and allocating arguments" {
     const source =
         \\let R = struct { s: string,
+        \\ @[stringify]
         \\ let toString: (self: R) -> string = self.s + "!"
         \\}
         \\let make: (r: R, text: string) -> R = { @println(text)
@@ -7369,6 +7411,7 @@ test "iteration call protection permits disjoint unboxed methods and completed l
         \\let R=struct{n:int=0,
         \\    let invoke:(self:R,cb:())={let run=(){cb()}
         \\        run()}
+        \\    @[stringify]
         \\    let toString:(self:R)->string="R"
         \\}
         \\let G:(T:type)->type=struct{value:T,
@@ -10738,6 +10781,7 @@ test "cross source generic reexports retain defining scope under forced GC after
 const nested_record_program =
     \\let Alias=Deep
     \\let Deep=struct{box:Box,
+    \\@[stringify]
     \\let toString:(r:Deep)->string="{r.box.inner.s}:{r.box.inner.n}:{r.box.other.s}"
     \\}
     \\let Box=struct{inner:Leaf,other:Leaf,}

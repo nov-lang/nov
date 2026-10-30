@@ -58,8 +58,9 @@ integer arithmetic and program entrypoint emission through `emit-c`.
 `@print`/`@println` support booleans, runes, strings, explicitly typed integers
 (including `int`/`uint`), and default structural formatting for printable arrays,
 structs, unions and enums. Nominal values, including nested values, can override
-the default with an exact container `toString` method. Print contexts also accept compile-time type
-names as static strings, not runtime type values. Plain `check` remains syntax-only.
+the default with an exact container method marked `@[stringify]`. Print contexts
+also accept compile-time type names as static strings, not runtime type values.
+Plain `check` remains syntax-only.
 
 Use `zig build run -- check --semantic file.nov` for the current bounded
 semantic/lowering subset. It runs declaration collection, initializer dependency
@@ -215,9 +216,10 @@ Default formatting recurses through nested aggregates:
 
 Strings and runes are raw UTF-8, without quotes or escaping, even when nested.
 This is debugging output, not an unambiguous source-roundtrip format. Every nominal
-value, including nested fields, elements and union payloads, prefers its existing
-exact `toString` hook. Each encountered hook runs exactly once in traversal order:
-array index order, struct declaration order, and the active union payload. A valid
+value, including nested fields, elements and union payloads, prefers its explicit
+`@[stringify]` converter with exact signature `(SelfType) -> string`. Each
+encountered hook runs exactly once in traversal order: array index order, struct
+declaration order, and the active union payload. A valid
 hook replaces that value's entire representation and stops structural recursion,
 so unsupported fields behind it do not prevent printing. Malformed or inaccessible
 explicit hooks reject even when nested; only the absence of a hook enables the
@@ -231,7 +233,52 @@ allocate, perform value copies and call user code with side effects during that
 traversal. Interpolation converts aggregates in one pass with rooted string
 accumulation and concatenations, not a measurement pass or one-allocation scheme;
 hooks are not repeated to calculate output size.
-See [`examples/printing.nov`](examples/printing.nov).
+See [`examples/printing.nov`](examples/printing.nov), whose marked converter is named
+`format`.
+
+### Explicit stringify converters
+
+Place argument-free `@[stringify]` on an ordinary immutable container method with
+a body. At most one method per struct, union or enum may be marked, and the
+annotation cannot be repeated on that method. Its name is arbitrary; its exact
+signature must be `(SelfType) -> string`, with one by-value parameter of the
+containing nominal type and an immutable string result. Parameter names are
+unrestricted, and aliases of the exact nominal type and `string` are accepted.
+An ordinary method in a generic container is allowed: its signature is checked
+against the concrete container instance. The converter cannot have its own generic
+function parameters or combine `@[stringify]` with `@[noreturn]`, `@[test]`,
+`@[export]` or `@[extern]`. Top-level/local functions, mutable declarations,
+bodyless functions, fields and type aliases cannot be marked.
+
+```nov
+let Entry = struct {
+    name: string,
+
+    @[stringify]
+    let format: (entry: Entry) -> string = "entry:{entry.name}"
+
+    let toString: (entry: Entry) -> string = "ordinary:{entry.name}"
+}
+
+let main: () = {
+    let entry = Entry[.name = "Ada"]
+    @println(entry, [entry], "{entry}")
+    @println(entry.toString())
+}
+```
+
+The first line is `entry:Ada [entry:Ada] entry:Ada`; the second is `ordinary:Ada`.
+There is no magic method name: an unmarked `toString` is an ordinary callable
+method and has no effect on printing or interpolation, even if its signature
+matches. Without a marked converter, recursive default formatting applies.
+Marked methods also remain ordinary callable methods (`entry.format()` or
+`Entry.format(entry)`). Cross-file implicit conversion requires `@[public]` on
+the marked method itself; a public container alone does not expose it. Private or
+malformed marked converters diagnose rather than enabling structural fallback,
+including when nested. Diagnostics refer to `@[stringify]`: invalid placement,
+arguments, repetition or incompatible annotations reject at declaration collection;
+a second marked method diagnoses with a note to the first; inaccessible or
+non-exact converters reject when conversion is requested.
 
 Print contexts also recognize compile-time type syntax:
 
@@ -953,8 +1000,8 @@ names and tags match; module aliases preserve identity.
   propagation with exact error identity. Enum leaves need no GC roots.
 - Static container methods and `@[public]` metadata follow the existing bounded
   container rules. Default printing/interpolation uses `Kind.tag`; an exact
-  container method `toString: (Kind) -> string` overrides it, including for nested
-  enum values, and runs once per encountered value.
+  container method marked `@[stringify]` with signature `(Kind) -> string`
+  overrides it, including for nested enum values, and runs once per encountered value.
 - Enum instance calls such as `kind.eql(other)` use the value-receiver rules below.
   Enum arrays support exact-type element equality and membership. Explicit numbered
   values/backing types remain unsupported.
@@ -1099,16 +1146,17 @@ The delivered subset is deliberately bounded:
   struct global instances and C FFI are unsupported.
 - Default printing/interpolation uses `MyType[ field: value, ... ]` (`MyType[]`
   when empty), recursively applying converters to nested fields/elements.
-  An explicit container method `toString: (MyType) -> string` overrides the whole
+  An explicit `@[stringify]` container method `(MyType) -> string` overrides the whole
   value at any depth and stops recursion, allowing otherwise unprintable fields
   behind that hook. The parameter name is unrestricted, and aliases of the exact
   nominal type and `string` are accepted. Wrong signatures or inaccessible explicit
   hooks diagnose even when nested; fallback applies only when no hook exists.
   Each encountered hook runs once in traversal order. No global overload lookup is provided.
-  Explicit `MyType.toString(item)` is also an ordinary call.
+  The method name is arbitrary; unmarked `toString` methods have no formatting effect.
+  Marked methods remain callable through ordinary static and instance syntax.
 - Each print argument is evaluated, then (if it has an explicit hook) converted
-  by **one** call to its `toString`, before moving to the next argument. Only after
-  all arguments and top-level conversions finish does the final print operation
+  by **one** call to its marked converter, before moving to the next argument.
+  Only after all arguments and top-level conversions finish does the final print operation
   write their values, separated by spaces, with the existing checked-write/flush
   behavior. Top-level hook effects can precede later argument effects; nested
   hooks instead run once during structural traversal and can interleave their
@@ -1116,8 +1164,9 @@ The delivered subset is deliberately bounded:
 - Declarations and methods are file-private by default. One argument-free
   `@[public]` exposes a supported immutable declaration across files, including
   structs, methods and module re-exports. Both file and named imports require
-  public exports; cross-file printing requires a public `toString` if an explicit
-  hook exists. A private hook rejects rather than exposing structural fields.
+  public exports; cross-file printing requires `@[public]` on the `@[stringify]`
+  method if an explicit hook exists. A private hook rejects rather than exposing
+  structural fields.
   `@[private]` is unsupported. Duplicate, unknown or invalidly placed attributes
   diagnose. Visibility does not change C export policy.
 
@@ -1200,8 +1249,9 @@ checked semantically through 128 bits, while reachable C layouts require
   checks the active tag in all build modes.
 - Non-generic union methods and `@[public]` use the same bounded container rules
   as structs, including default `Union.tag[payload]`/`Union.tag` printing and exact
-  `toString` overrides at any depth. Default record payloads flatten their fields
-  into `Union.tag[ field: value, ... ]`; a record payload hook instead produces
+  `@[stringify]` overrides with exact signature `(SelfType) -> string` at any depth.
+  Default record payloads flatten their fields into `Union.tag[ field: value, ... ]`;
+  a record payload hook instead produces
   `Union.tag[ <custom output> ]`. Visibility is metadata only.
 - Record payloads, including nested structs, retain exact nominal identity and value-copy semantics;
   their string fields share immutable storage. Constructors, captures and `.!`
@@ -1303,7 +1353,7 @@ instance calls, callback function values, and recursive/forward/sibling calls us
 the ordinary exact typing, evaluation-order, copy and rooting contracts.
 
 Signatures and bodies are checked on demand when a concrete method is referenced,
-called, or required for `toString` conversion. Unused methods do not invalidate an
+called, or required for `@[stringify]` conversion. Unused methods do not invalidate an
 otherwise valid type instance; requested methods still undergo full checking.
 This preserves void-payload Result construction/propagation without permitting
 void parameters. Method discovery and specialization are bounded; failed checking
@@ -1748,7 +1798,7 @@ let main: () -> void = {
   supported (see [Loop](#loop)). The formatter supports
   the array syntax described above without extending these semantics.
   Arrays print/interpolate as `[a, b]` when their elements are recursively
-  printable, honoring exact nominal `toString` hooks once in index/traversal order.
+  printable, honoring exact nominal `@[stringify]` converters once in index/traversal order.
   Functions/closures and ranges have no default representation; aggregates
   containing them need a valid enclosing hook that stops recursion before them.
   Malformed/inaccessible nested hooks reject rather than falling back.
@@ -2483,7 +2533,12 @@ or
 ```
 
 ## Operator Overloading
-Operator overloading is possible on the following operators:
+
+This is a historical proposal, not implemented operator-overloading behavior.
+The proposed operators and automatic derivations below are not delivery claims;
+the executable equality rules are described in their type-specific sections.
+Printing customization is implemented separately through `@[stringify]`, not a
+magic method name. In this proposal, overloading would cover these operators:
 - `+`: (T, T) -> T
 - `-`: (T, T) -> T
 - `*`: (T, T) -> T
@@ -2508,9 +2563,10 @@ let Complex = struct {
         .im = self.im + other.im,
     ]
 
-    ; used by print
-    ; signature must be `toString: (T) -> string` where T is the container type
-    let toString: (self: Complex) -> string = "{self.re} + i{self.im}"
+    ; explicit print converter; the name is arbitrary
+    ; exact signature must be (T) -> string where T is the container type
+    @[stringify]
+    let format: (self: Complex) -> string = "{self.re} + i{self.im}"
 }
 
 let x: Complex = [ .re = 5, .im = 3 ]
@@ -2649,8 +2705,9 @@ same recursive default representations as print: `[a, b]`, `Entry[ field: value,
 (or `Empty[]`), `Message.tag[payload]` or payloadless `Message.tag`, and enum
 `Color.tag`. Default record union payloads flatten to `Message.entry[ field: value, ... ]`.
 Strings/runes remain raw, not quoted or escaped. Nominal values at every depth
-prefer an explicit exact container `toString: (SelfType) -> string`, invoked once
-in traversal order. A hook overrides the value and stops recursion; a record
+prefer an explicit container method marked `@[stringify]` with exact signature
+`(SelfType) -> string`, invoked once in traversal order. A hook overrides the value
+and stops recursion; a record
 payload hook produces `Message.entry[ <custom output> ]` rather than flattened
 fields. Malformed/inaccessible hooks reject even when nested, and only a missing
 hook permits structural fallback. Functions/closures, ranges and void values
@@ -2714,7 +2771,7 @@ TODO
 - `@TypeOf(...)`: Returns the type of a value.
 - `@typeInfo(...)`: Returns type information about a value.
 - `@This()`: Returns the type of the current container
-- `@print(...)`: Output args separated with a space to stdout; returns void. Supports bool, fixed/native integer, raw rune/string and recursive default array/struct/union/enum formatting. Nominal values at any depth prefer an explicit exact `toString: (MyType) -> string`, called once per encountered value in traversal order and stopping structural recursion. Top-level hooks run immediately after argument evaluation; nested hooks run during traversal. Malformed/inaccessible hooks reject even when nested. Compile-time types emit canonical static name strings. Interpolated strings work like other strings. See the printing contract above.
+- `@print(...)`: Output args separated with a space to stdout; returns void. Supports bool, fixed/native integer, raw rune/string and recursive default array/struct/union/enum formatting. Nominal values at any depth prefer an explicit `@[stringify]` method with exact signature `(SelfType) -> string`, called once per encountered value in traversal order and stopping structural recursion. Top-level hooks run immediately after argument evaluation; nested hooks run during traversal. Malformed/inaccessible hooks reject even when nested. Compile-time types emit canonical static name strings. Interpolated strings work like other strings. See the printing contract above.
 - `@println(...)`: Same as print with a newline at the end, including with no args.
 - `@fprint(file: File, ...)`: Same as print but output to a specific file. Returns a Result<>.
 <!-- - `@eprint(...)`: Same as print but output to stderr. -->
@@ -2915,8 +2972,8 @@ helpers in their defining file, and a public type alias can intentionally expose
 private local type without exposing its unmarked methods. Returning or passing a
 value does not grant access to its private methods. Checks cover static and receiver
 calls, function-value extraction, printing and interpolation (an explicit
-`toString` must be public for cross-file use; a private hook prevents structural
-fallback). Fields and union variants do not support visibility
+`@[stringify]` converter must also be `@[public]` for cross-file use; a private hook
+prevents structural fallback). Fields and union variants do not support visibility
 attributes.
 
 Migration: add `@[public]` to declarations and methods used across files; remove any

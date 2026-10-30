@@ -214,7 +214,7 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     _ = fixtures.add("interpolation.nov", @embedFile("examples/interpolation.nov"));
     _ = fixtures.add("type-aliases.nov", @embedFile("examples/type-aliases.nov"));
     _ = fixtures.add("type.nov", @embedFile("examples/type.nov"));
-    _ = fixtures.add("enums.nov", "let Kind=enum{not_found,permission_denied,io,\nlet toString:(k:Kind)->string=match k{.not_found=>\"not_found\"\n.permission_denied | .io=>\"other\"}\n}\nlet Result:(T:type,E:type)->type=union{ok:T,err:E,}\nlet R=Result(uint,Kind)\nlet Error=struct{kind:Kind=.not_found,message:string,}\nlet fail:()->R=.err[.not_found]\nlet pass:()->R={let n=fail().!\n.ok[n]}\nlet main:()={let e=Error[.message=\"not \"+\"found\"]\n@println(e.kind,e.message,Kind.io!=.not_found,match pass(){.ok=>|n|\"{n}\"\n.err=>|k|\"{k}\"})}");
+    _ = fixtures.add("enums.nov", "let Kind=enum{not_found,permission_denied,io,\n@[stringify]\nlet toString:(k:Kind)->string=match k{.not_found=>\"not_found\"\n.permission_denied | .io=>\"other\"}\n}\nlet Result:(T:type,E:type)->type=union{ok:T,err:E,}\nlet R=Result(uint,Kind)\nlet Error=struct{kind:Kind=.not_found,message:string,}\nlet fail:()->R=.err[.not_found]\nlet pass:()->R={let n=fail().!\n.ok[n]}\nlet main:()={let e=Error[.message=\"not \"+\"found\"]\n@println(e.kind,e.message,Kind.io!=.not_found,match pass(){.ok=>|n|\"{n}\"\n.err=>|k|\"{k}\"})}");
     _ = fixtures.add("instance-methods.nov", "let K=enum{x,y,\nlet eql:(a:K,b:K)->bool=a==b\n}\nlet Alias=R\nlet R=struct{s:string,\nlet text:(r:Alias)->string=r.s\n}\nlet main:()={let k=K.x\n@println(Alias[.s=\"hel\"+\"lo\"].text(),k.eql(.x),K.y.eql(k))}");
     _ = fixtures.add("instance-signature.nov", "let R=struct{let bad:()->bool=true\n}\nlet main:()=R[].bad()");
     _ = fixtures.add("enum-missing.nov", "let K=enum{x,y,}\nlet f:(k:K)->bool=match k{.x=>true}");
@@ -226,7 +226,7 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     _ = fixtures.add("union-capture.nov", "let U=union{ok:int,none,}\nlet f:(u:U)->int=match u{.ok=>|n|n\n_=>n}");
     _ = fixtures.add("generic-unions.nov", "let G:(T:type,E:type)->type=union{err:E,ok:T,}\nlet R=G(int,string)\nlet Text=G(string,string)\nlet make:(b:bool)->R={@print(\"M\")\nif b{.ok[7]}else{.err[\"b\"+\"ad\"]}}\nlet wrap:(b:bool)->Text={let n=make(b).!\n.ok[\"{n}\"]}\nlet show:(r:Text)->string=match r{.ok=>|s|s\n.err=>|s|s}\nlet main:()=@println(show(wrap(true)),show(wrap(false)))");
     _ = fixtures.add("record-payloads.nov", "let G:(T:type,Failure:type)->type=union{ok:T,err:Failure,}\nlet U=union{ok:R,err:E,}\nlet R=struct{s:string,}\nlet E=struct{message:string,}\nlet make:(b:bool)->G(R,E)=if b{.ok[R[.s=\"o\"+\"k\"]]}else{.err[E[.message=\"e\"+\"rr\"]]}\nlet wrap:(b:bool)->G(bool,E)={let r=make(b).!\n.ok[r.s == \"ok\"]}\nlet show:(r:G(bool,E))->string=match r{.ok=>|b|\"{b}\"\n.err=>|e|e.message}\nlet main:()=@println(show(wrap(true)),show(wrap(false)),match U.ok[R[.s=\"record\"]]{.ok=>|r|r.s\n.err=>|e|e.message})");
-    _ = fixtures.add("record-interpolation.nov", "let G:(T:type,E:type)->type=union{ok:T,err:E,}\nlet Error=struct{s:string,\nlet toString:(err:Error)->string={@print(\"C\")\nerr.s+\"!\"}\n}\nlet fail:()->G(int,Error)=.err[Error[.s=\"not \"+\"found\"]]\nlet main:()=match fail(){.ok=>@panic(\"bad\")\n.err=>|err|@panic(\"Error: {err}\")}");
+    _ = fixtures.add("record-interpolation.nov", "let G:(T:type,E:type)->type=union{ok:T,err:E,}\nlet Error=struct{s:string,\n@[stringify]\nlet toString:(err:Error)->string={@print(\"C\")\nerr.s+\"!\"}\n}\nlet fail:()->G(int,Error)=.err[Error[.s=\"not \"+\"found\"]]\nlet main:()=match fail(){.ok=>@panic(\"bad\")\n.err=>|err|@panic(\"Error: {err}\")}");
     _ = fixtures.add("record-interpolation-missing.nov", "let R=struct{s:string,}\nlet f:(r:R)->string=\"{r}\"");
     _ = fixtures.add("wide-record-payload.nov", "let U=union{ok:R,}\nlet R=struct{wide:i128,}\nlet f:(u:U)={}\nlet main:()={}");
     _ = fixtures.add("generic-cycle.nov", "let G:(T:type)->type=union{ok:G(T),}\nlet R=G(int)");
@@ -2218,6 +2218,7 @@ fn addGenericStructCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_st
         \\    let get: (self: Self) -> T = self.value
         \\
         \\    @[public]
+        \\    @[stringify]
         \\    let toString: (self: Self) -> string = "<{self.value}>"
         \\}
         \\
@@ -3253,6 +3254,7 @@ fn addImportCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *st
         \\let secret:int=7
         \\@[public]
         \\let Thing=struct{name:string,
+        \\@[stringify]
         \\let toString:(self:Thing)->string=self.name
         \\let get:(self:Thing)->int=secret
         \\@[public]

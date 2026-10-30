@@ -242,7 +242,7 @@ fn methodLibrary(allocator: std.mem.Allocator, shape: Shape, public_methods: boo
         if (public_methods) "@[public]\n" else "",
         "let get:(self:Self)->int=helper()\n",
         if (public_methods) "@[public]\n" else "",
-        "let toString:(self:Self)->string=\"private\"\n",
+        "@[stringify]\nlet toString:(self:Self)->string=\"private\"\n",
         "@[public]\nlet wrapper:(self:Self)->int=Self.secret()+self.get()\n",
         if (public_methods) "@[public]\n" else "",
         "let unmarked:(self:Self)->int=self.get()\n}\n",
@@ -343,6 +343,7 @@ test "visibility returned private nominal values retain method visibility" {
     const library =
         \\let Hidden=struct{value:int,
         \\let get:(self:Hidden)->int=self.value
+        \\@[stringify]
         \\let toString:(self:Hidden)->string="hidden"
         \\@[public]
         \\let visible:(self:Hidden)->int=self.get()

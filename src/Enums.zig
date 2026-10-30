@@ -171,7 +171,7 @@ test "enums reject inexact types arithmetic ordering conversions captures and in
         .{ .source = "let Bad=struct{k:Kind=0,}", .tag = .literal_type_mismatch },
         .{ .source = "let Bad=struct{k:Kind=.unknown,}", .tag = .unknown_field },
         .{ .source = "let Bad=struct{k:Kind=Other.not_found,}", .tag = .literal_type_mismatch },
-        .{ .source = "let Bad=enum{x,\nlet toString:(x:Bad)->bool=true\n}\nlet f:(b:Bad)=@println(b)", .tag = .invalid_to_string },
+        .{ .source = "let Bad=enum{x,\n@[stringify]\nlet toString:(x:Bad)->bool=true\n}\nlet f:(b:Bad)=@println(b)", .tag = .invalid_to_string },
         .{ .source = "let G:(T:type,E:type)->type=union{ok:T,err:E,}\nlet f:(r:G(uint,Kind))->G(uint,Other)=.ok[r.!]", .tag = .propagation_error_mismatch },
     }) |case| {
         const source = try std.mem.concat(std.testing.allocator, u8, &.{ prefix, case.source });

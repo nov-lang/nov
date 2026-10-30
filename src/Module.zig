@@ -50,6 +50,7 @@ pub const Declaration = struct {
     container: ?DeclId = null,
     public: bool = false,
     noreturn: bool = false,
+    stringify: bool = false,
     /// Owned by this module; absent on generic templates and specializations.
     export_name: ?[]const u8 = null,
     /// Owned by this module; only validated top-level bodyless prototypes.
@@ -121,6 +122,8 @@ pub const Diagnostic = struct {
         record_layout_cycle,
         record_layout_limit,
         invalid_to_string,
+        invalid_stringify_declaration,
+        duplicate_stringifier,
         invalid_method_receiver,
         unknown_name,
         unsupported_declaration,
@@ -451,6 +454,15 @@ pub fn lookupConcreteMethod(self: *const Module, container: DeclId, concrete_typ
     return null;
 }
 
+pub fn lookupStringifier(self: *const Module, container: DeclId) ?DeclId {
+    return self.lookupConcreteStringifier(container, null);
+}
+
+pub fn lookupConcreteStringifier(self: *const Module, container: DeclId, concrete_type: ?u32) ?DeclId {
+    for (self.declarations.items, 0..) |decl, i| if (decl.container == container and decl.concrete_type == concrete_type and decl.stringify) return @fromBackingInt(@intCast(i));
+    return null;
+}
+
 /// TypeIds belong to one analysis IR; never reuse specializations in a fresh pass.
 pub fn clearSpecializations(self: *Module) void {
     for (self.declarations.items, 0..) |decl, i| if (decl.concrete_type != null or decl.function_template != null) {
@@ -515,6 +527,7 @@ fn collectDeclaration(self: *Module, node: Ast.Node.Index, container: ?DeclId) (
         var is_test = false;
         var public = false;
         var noreturn_annotation = false;
+        var stringify = false;
         var export_name: ?[]const u8 = null;
         errdefer if (export_name) |symbol| self.allocator.free(symbol);
         var extern_name: ?[]const u8 = null;
@@ -525,7 +538,11 @@ fn collectDeclaration(self: *Module, node: Ast.Node.Index, container: ?DeclId) (
             const data = self.source.ast.nodes.items(.data)[attribute];
             const attr_name = self.source.ast.tokenSlice(data.lhs);
             const external = std.mem.eql(u8, attr_name, "extern");
-            if (std.mem.eql(u8, attr_name, "test")) {
+            if (std.mem.eql(u8, attr_name, "stringify")) {
+                if (stringify or self.source.ast.nodes.items(.tag)[attribute] != .attr_one or data.rhs != 0)
+                    try self.diagnostics.append(self.allocator, .{ .tag = .invalid_stringify_declaration, .span = self.tokenSpan(self.source.ast.firstToken(attribute)) });
+                stringify = true;
+            } else if (std.mem.eql(u8, attr_name, "test")) {
                 if (is_test or self.source.ast.nodes.items(.tag)[attribute] != .attr_one or data.rhs != 0)
                     try self.diagnostics.append(self.allocator, .{ .tag = .invalid_test_declaration, .span = self.tokenSpan(self.source.ast.firstToken(attribute)) });
                 is_test = true;
@@ -582,8 +599,87 @@ fn collectDeclaration(self: *Module, node: Ast.Node.Index, container: ?DeclId) (
         }
         if (is_test and (container != null or declaration.ast.is_mutable or is_record or is_generic or is_generic_function or declaration.ast.init_node == 0 or self.source.ast.declFunction(node) == null or export_seen or extern_seen or noreturn_annotation))
             try self.diagnostics.append(self.allocator, .{ .tag = .invalid_test_declaration, .span = name_span });
-        try self.declarations.append(self.allocator, .{ .is_test = is_test, .name = name, .name_span = name_span, .node = node, .container = container, .is_record = is_record, .is_generic = is_generic, .is_generic_function = is_generic_function, .is_type_alias = is_record or is_this_alias, .public = public, .noreturn = noreturn_annotation, .export_name = export_name, .extern_name = extern_name });
+        if (stringify) {
+            if (container == null or declaration.ast.is_mutable or is_record or is_generic or is_generic_function or is_test or noreturn_annotation or export_seen or extern_seen or declaration.ast.init_node == 0 or self.source.ast.declFunction(node) == null) {
+                try self.diagnostics.append(self.allocator, .{ .tag = .invalid_stringify_declaration, .span = name_span });
+            } else if (self.lookupStringifier(container.?)) |previous| {
+                try self.diagnostics.append(self.allocator, .{ .tag = .duplicate_stringifier, .span = name_span, .related = self.getDeclaration(previous).?.name_span });
+            }
+        }
+        try self.declarations.append(self.allocator, .{ .stringify = stringify, .is_test = is_test, .name = name, .name_span = name_span, .node = node, .container = container, .is_record = is_record, .is_generic = is_generic, .is_generic_function = is_generic_function, .is_type_alias = is_record or is_this_alias, .public = public, .noreturn = noreturn_annotation, .export_name = export_name, .extern_name = extern_name });
     }
+}
+
+test "stringify metadata selects one arbitrary method per nominal container" {
+    const source =
+        \\let S=struct{
+        \\let toString:(s:S)->string="ordinary"
+        \\@[stringify]
+        \\let format:(s:S)->string="marked"
+        \\}
+        \\let U=union{none,
+        \\@[stringify]
+        \\let display:(u:U)->string="union"
+        \\}
+        \\let E=enum{one,
+        \\@[stringify]
+        \\let render:(e:E)->string="enum"
+        \\}
+        \\let Box:(T:type)->type=struct{value:T,
+        \\@[stringify]
+        \\let format:(b:@This())->string="box"
+        \\}
+    ;
+    var module = try Module.init(std.testing.allocator, "stringify.nov", source);
+    defer module.deinit();
+    try std.testing.expect(!module.hasErrors());
+    for ([_][]const u8{ "S", "U", "E", "Box" }, [_][]const u8{ "format", "display", "render", "format" }) |container, name| {
+        const method = module.lookupStringifier(module.lookup(container).?).?;
+        try std.testing.expectEqualStrings(name, module.getDeclaration(method).?.name);
+        try std.testing.expect(module.getDeclaration(method).?.stringify);
+    }
+    try std.testing.expect(!module.getDeclaration(module.lookupMethod(module.lookup("S").?, "toString").?).?.stringify);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+}
+
+test "stringify rejects arguments duplicates placement and nonordinary methods" {
+    for ([_][]const u8{
+        "@[stringify]\nlet format:(s:int)->string=\"bad\"",
+        "@[stringify]\nlet value=1",
+        "@[stringify]\nlet Alias=int",
+        "@[stringify]\nlet S=struct{}",
+        "let S=struct{\n@[stringify(1)]\nlet format:(s:S)->string=\"bad\"\n}",
+        "let S=struct{\n@[stringify(1,2)]\nlet format:(s:S)->string=\"bad\"\n}",
+        "let S=struct{\n@[stringify]\n@[stringify]\nlet format:(s:S)->string=\"bad\"\n}",
+        "let S=struct{\n@[stringify]\nlet mut format:(s:S)->string=\"bad\"\n}",
+        "let S=struct{\n@[stringify]\nlet format:(s:S)->string\n}",
+        "let S=struct{\n@[stringify]\nlet value=1\n}",
+        "let S=struct{\n@[stringify]\nlet Alias=int\n}",
+        "let S=struct{\n@[stringify]\nlet format:(s:`T)->string=\"bad\"\n}",
+        "let S=struct{\n@[noreturn]\n@[stringify]\nlet format:(s:S)=loop{}\n}",
+        "let S=struct{\n@[stringify]\n@[noreturn]\nlet format:(s:S)=loop{}\n}",
+        "let S=struct{\n@[test]\n@[stringify]\nlet format:()={}\n}",
+        "let S=struct{\n@[stringify]\n@[extern]\nlet format:(s:S)->string\n}",
+        "let S=struct{\n@[export]\n@[stringify]\nlet format:(s:S)->string=\"bad\"\n}",
+    }) |source| {
+        var module = try Module.init(std.testing.allocator, "bad-stringify.nov", source);
+        defer module.deinit();
+        try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
+        var diagnosed = false;
+        for (module.diagnostics.items) |diagnostic| if (diagnostic.tag == .invalid_stringify_declaration) {
+            diagnosed = true;
+        };
+        try std.testing.expect(diagnosed);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+    }
+    const duplicate = "let S=struct{\n@[stringify]\nlet first:(s:S)->string=\"first\"\n@[stringify]\nlet second:(s:S)->string=\"second\"\n}";
+    var module = try Module.init(std.testing.allocator, "duplicate-stringify.nov", duplicate);
+    defer module.deinit();
+    try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+    try std.testing.expectEqual(Diagnostic.Tag.duplicate_stringifier, module.diagnostics.items[0].tag);
+    try std.testing.expectEqualStrings("second", module.sourceSlice(module.diagnostics.items[0].span).?);
+    try std.testing.expectEqualStrings("first", module.sourceSlice(module.diagnostics.items[0].related.?).?);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{duplicate});
 }
 
 test "test declarations preserve metadata and reject placement and conflicts" {

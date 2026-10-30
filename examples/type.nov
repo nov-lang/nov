@@ -7,6 +7,7 @@ let MyType = struct {
     z: bool,
 
     @[public]
+    @[stringify]
     let toString: (self: MyType) -> string = {
         "x: {self.x}, y: {self.y}. z: {self.z}"
     }
@@ -14,5 +15,5 @@ let MyType = struct {
 
 let main: () = {
     let item = MyType[ .x = 5, .z = true ]
-    @println(item) ; @println will call the `toString` method
+    @println(item) ; @println will call the @[stringify] method
 }

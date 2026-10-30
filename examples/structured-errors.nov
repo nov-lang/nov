@@ -18,6 +18,7 @@ let LookupError = struct {
     name: string,
     kind: ErrorKind = .not_found,
 
+    @[stringify]
     let toString: (self: LookupError) -> string = {
         let message = match self.kind {
             .not_found => "entry not found"

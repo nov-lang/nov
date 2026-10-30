@@ -152,8 +152,8 @@ retain their existing rules. Ranges copy bounds/inclusivity by value.
 Enum elements support exact nominal equality/membership. No equality or membership
 is added for functions, unions, records, arrays or ranges. Arrays now support
 recursive printing/interpolation for printable elements; nested nominal values
-use exact `toString` hooks once in traversal order, overriding their value and
-stopping structural recursion. Functions/closures and ranges have no default
+use exact `@[stringify]` converters once in traversal order, overriding their value
+and stopping structural recursion. Functions/closures and ranges have no default
 representation; aggregates containing them need an enclosing valid hook that
 stops recursion. Malformed/inaccessible nested hooks reject.
 Direct chained indexed/computed writes and `items[i].field` mutation remain
@@ -301,7 +301,8 @@ on none; no builtin Option or implicit payload wrapping was introduced.
 Ordinary generic union methods now specialize on demand by canonical concrete
 container type, preserving aliases and independent type arguments. @This and
 let Self=@This aliases work in signatures/bodies, as do static/instance calls,
-callbacks, sibling/forward/recursive calls and exact concretized toString.
+callbacks, sibling/forward/recursive calls and exact concretized `@[stringify]`
+conversion.
 Unrequested signatures/bodies remain dormant; requested methods are fully checked.
 This keeps void Result payloads usable without changing void-parameter restrictions.
 
@@ -319,7 +320,7 @@ cannot overwrite any loaded source, including imported library/symlink targets.
 No source concatenation/name rewriting or builtin Result is used. Declarations and
 nominal methods are file-private by default; both file and named imports require
 explicit @[public] for cross-file access. Checks cover aliases/reexports, generic
-instances and implicit toString calls. @[private] is unsupported. Runtime module
+instances and implicit `@[stringify]` calls. @[private] is unsupported. Runtime module
 initialization, arbitrary package search and value generics/comptime remain deferred.
 
 Instance calls value.method(args) work on nominal structs, non-generic unions and
@@ -335,7 +336,7 @@ Nominal unnumbered enums are executable: qualified/contextual tags, aliases, exa
 ==/!=, exhaustive single-enum matches with qualified patterns/alternatives/catchall,
 covered-pattern notes, literal globals, record fields and tag defaults, union
 payloads, generic arguments and .! error propagation. Static methods/public and
-default `Kind.tag` printing/interpolation and exact toString overrides at any depth
+default `Kind.tag` printing/interpolation and exact `@[stringify]` overrides at any depth
 reuse container rules. Nested enum hooks run once per encountered value. Enum leaves add no GC
 roots; internal uint32 ordinals expose no numeric/FFI policy. Numbered values,
 backing types and numeric conversions/arithmetic/ordering remain unsupported.
@@ -357,9 +358,9 @@ empty structs `Empty[]`, scalar union payloads `Message.number[7]`, void alterna
 payload's own type name. Strings/runes are raw UTF-8 without quoting or escaping;
 this is debugging output, not source-roundtrip serialization.
 
-Nominal values at every depth prefer an existing exact container
-`toString: (MyType) -> string`, once per encountered value in traversal order
-(array index order, struct declaration order, active union payload). A valid hook
+Nominal values at every depth prefer an explicit container method marked
+`@[stringify]` with exact signature `(SelfType) -> string`, once per encountered
+value in traversal order (array index order, struct declaration order, active union payload). A valid hook
 replaces the value's representation and stops structural recursion, so unsupported
 fields behind that hook are okay. A record payload's own hook overrides flattening:
 `Message.entry[ <custom output> ]` (spaces around custom payload). Top-level hooks
@@ -367,6 +368,21 @@ run immediately after argument evaluation; nested hooks run during traversal and
 can allocate/call user code with side effects. Malformed/inaccessible explicit
 hooks reject even when nested; fallback is only for types with no hook.
 No global overload lookup is added.
+
+`@[stringify]` is argument-free and allowed once on an ordinary immutable method
+with a body, with at most one marked method per struct/union/enum. The function
+name is arbitrary; an unmarked `toString` remains an ordinary callable method and
+has no effect on print/interpolation. Ordinary methods of generic containers are
+allowed and must have the exact concrete `(SelfType) -> string` signature; the
+method's own generic function parameters are disallowed. Parameter names are
+unrestricted, and exact type aliases are accepted. Top-level/local functions,
+fields, mutable/bodyless declarations and aliases cannot be marked. It cannot
+combine with `@[noreturn]`, `@[test]`, `@[export]` or `@[extern]`.
+Cross-file conversion requires `@[public]` on the marked method, not just the
+container, including through aliases/re-exports and for nested values. Diagnostics
+now name `@[stringify]`: invalid annotation use and duplicate converters reject
+at collection; inaccessible or non-exact converters reject when requested.
+`examples/printing.nov` uses a marked `format` method, not a magic name.
 
 Default printability is recursive: functions/closures, ranges and void values have
 no default representation, including inside aggregates, unless a valid enclosing
@@ -424,9 +440,9 @@ literal-only defaults and required-field diagnostics. Explicit `Type[.field=valu
 constructors evaluate supplied fields once left-to-right, then omitted literal defaults
 in declaration order. Record value boundaries copy fields; strings share immutable
 storage. Field reads work in interpolation. Container methods support scoped and
-static `Type.method(...)` calls; direct print arguments with explicit exact
-`toString: (MyType) -> string` hooks call them once immediately after evaluation,
-before the next argument. Without a hook, printable records use named default
+static `Type.method(...)` calls; direct print arguments with explicit
+`@[stringify]` methods of exact signature `(MyType) -> string` call them once
+immediately after evaluation, before the next argument. Without a hook, printable records use named default
 structural formatting; nested fields/elements recursively invoke valid hooks once
 in traversal order, stopping recursion at each override. Only
 argument-free `@[public]` on immutable supported declarations is accepted;
@@ -563,7 +579,7 @@ implemented; grapheme operations remain deferred.
   - [x] immutable UTF-8 literals, sharing, concatenation, `+=`, scalar length and output
   - [x] allocation-free, byte-exact `==`/`!=` (including NUL; no normalization)
   - [x] `{expression}` interpolation (including nested calls) for bool/fixed/native integers/rune variables/strings,
-    recursive named arrays/structs/unions/enums with exact `toString` overrides at any depth
+    recursive named arrays/structs/unions/enums with exact `@[stringify]` overrides at any depth
     and compile-time type-name strings; decimal boundaries, raw UTF-8/NUL, rooted
     temporaries and formatter preservation
   - blocks/control flow/quoted literals/formats/captures and global interpolation remain unsupported
@@ -672,7 +688,7 @@ let myStruct = struct {}
 - Make `*` always `*mut`? What are the positives and negatives of this change?
 - Future format-option proposal (expression interpolation is implemented):
   `"{varname:[fill][alignment][width][.precision]:[custom options]}"`
-  and use format like zig instead of toString?
+  and use format like zig instead of the current `@[stringify]` converter?
 - **Rework Parser to remove newline if they are unnecessary**
   - idk about render but this will simplify other steps a lot
 - provide a way to duplicate a function based on parameters?
@@ -686,9 +702,10 @@ let myStruct = struct {}
   - overloadable functions: `str()` and `len()`, also `next()`...
 
 # proposal: add Traits or something similar
-Currently many proposals are about using arbitrary declaration for overloading
-behavior like `.toString()` overwrite the default format, `.len` override idk
-what, `.next()` implem an iterator, etc...
+Historical proposals considered name-based overloading, such as `.toString()`
+overriding the default format, `.len` overriding length and `.next()` implementing
+an iterator. These are not implemented name-based protocols: current printing
+requires explicit `@[stringify]`; an unmarked `.toString()` has no special effect.
 
 I think it's a better idea to uniformize all of that with specific description
 like traits which should make the language easier to understand and read.
@@ -1358,7 +1375,7 @@ let ArrayList: (T: #type) -> type = { ... }
     backing; literals use static read-only bytes with a null traced owner.
   - Expression interpolation supports bool, fixed/native decimal integers, rune
     variables, shared strings, recursive default arrays/structs/unions/enums,
-    exact `toString` overrides at any depth and static compile-time type-name strings.
+    exact `@[stringify]` overrides at any depth and static compile-time type-name strings.
     Nested hooks run once in traversal order and stop recursion at that value. Raw UTF-8/NUL is
     preserved without quoting, escaping or normalization. Placeholders are
     evaluated left-to-right once, including nested calls and scalar expressions.

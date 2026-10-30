@@ -1389,7 +1389,7 @@ test "constructor shorthand preserves structural operands and token ranges" {
 }
 
 test "struct AST owns ordered members constructors attributes interpolation and exact source ranges" {
-    const source = "@[public]\nlet A=struct {; fields\nx:int=0,\ny:string,\n@[public]\nlet toString:(self:A)->string=\"{self.x}:{self.y}\"\n}\nlet main:()={let a=A[\n.x=1, ; argument\n.y=\"hé\",\n]\n@println(a)}";
+    const source = "@[public]\nlet A=struct {; fields\nx:int=0,\ny:string,\n@[public]\n@[stringify]\nlet toString:(self:A)->string=\"{self.x}:{self.y}\"\n}\nlet main:()={let a=A[\n.x=1, ; argument\n.y=\"hé\",\n]\n@println(a)}";
     var ast = try parse(std.testing.allocator, source);
     defer ast.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
@@ -1397,7 +1397,7 @@ test "struct AST owns ordered members constructors attributes interpolation and 
     try std.testing.expectEqual(@as(usize, 1), declaration.attributes.len);
     const members = ast.fullStruct(declaration.ast.init_node).?;
     try std.testing.expectEqual(@as(usize, 3), members.len);
-    try std.testing.expectEqualStrings("struct {; fields\nx:int=0,\ny:string,\n@[public]\nlet toString:(self:A)->string=\"{self.x}:{self.y}\"\n}", ast.getNodeSource(declaration.ast.init_node));
+    try std.testing.expectEqualStrings("struct {; fields\nx:int=0,\ny:string,\n@[public]\n@[stringify]\nlet toString:(self:A)->string=\"{self.x}:{self.y}\"\n}", ast.getNodeSource(declaration.ast.init_node));
     for (ast.nodes.items(.tag), 0..) |tag, i| if (tag == .container_decl_arg) {
         const node: Node.Index = @intCast(i);
         const init = ast.fullStructInit(node).?;

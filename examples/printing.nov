@@ -21,7 +21,8 @@ let Message = union {
 let Label = struct {
     value: string,
 
-    let toString: (label: Label) -> string = "Label({label.value})"
+    @[stringify]
+    let format: (label: Label) -> string = "Label({label.value})"
 }
 
 let Ints = []int

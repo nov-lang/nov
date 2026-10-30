@@ -207,7 +207,7 @@ fn checkSupported(ast: Ast) !void {
                 const name = ast.tokenSlice(data.lhs);
                 if (std.mem.eql(u8, name, "export") or std.mem.eql(u8, name, "extern")) {
                     if (data.rhs != 0 and ast.nodes.items(.tag)[data.rhs] != .string_literal) return error.UnsupportedSyntax;
-                } else if (data.rhs != 0 or (!std.mem.eql(u8, name, "public") and !std.mem.eql(u8, name, "noreturn") and !std.mem.eql(u8, name, "test"))) return error.UnsupportedSyntax;
+                } else if (data.rhs != 0 or (!std.mem.eql(u8, name, "public") and !std.mem.eql(u8, name, "noreturn") and !std.mem.eql(u8, name, "test") and !std.mem.eql(u8, name, "stringify"))) return error.UnsupportedSyntax;
             },
             .builtin_literal => {
                 const name = ast.tokenSlice(main);
@@ -531,7 +531,7 @@ test "constructor shorthand formatting preserves tokens comments and structure" 
 test "nominal struct formatting preserves public attributes fields defaults methods constructor comments and interpolation" {
     for ([_][:0]const u8{
         "let R=struct{lo:i128=-170141183460469231731687303715884105728,top:u128=340282366920938463463374607431768211455,}\nlet f:(r:R)={}",
-        "@[public]\nlet R=struct{; open\nx:int=0, ; default\n; next field\ny:string,\n\n@[public]\nlet toString:(self:R)->string=\"{self.x}:{self.y}\"\n}\nlet main:()={let r=R[.x=1,.y=\"hello\"]\n@println(r)}",
+        "@[public]\nlet R=struct{; open\nx:int=0, ; default\n; next field\ny:string,\n\n@[public]\n@[stringify]\nlet toString:(self:R)->string=\"{self.x}:{self.y}\"\n}\nlet main:()={let r=R[.x=1,.y=\"hello\"]\n@println(r)}",
         "let R=struct{\n; empty\n}\nlet main:()={let r=R[\n; empty constructor\n]\n@println(true)}",
         "let R=struct{x:string,}\nlet main:()={let r=R[\n.x=\"hello\", ; value\n]\n@println(r.x)}",
     }) |source| {
@@ -789,8 +789,13 @@ test "array formatting survives every allocation failure" {
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testArrayAllocationFailures, .{});
 }
 
+test "stringify formatting preserves argument free attributes and arbitrary method names" {
+    try expectFormatted("let R=struct{x:int,\n@[public]\n@[stringify]\nlet format:(self:R)->string=\"{self.x}\"\n}", "let R = struct {\n    x: int,\n    @[public]\n    @[stringify]\n    let format: (self: R) -> string = \"{self.x}\"\n}\n");
+    try std.testing.expectError(error.UnsupportedSyntax, format(std.testing.allocator, "let R=struct{@[stringify(1)]\nlet format:(self:R)->string=\"R\"\n}"));
+}
+
 test "record interpolation formatting preserves captures aliases conversions and allocation cleanup" {
-    const source = "let Alias=Error\nlet Error=struct{s:string,\nlet toString:(e:Alias)->string=e.s\n}\nlet U=union{err:Error,}\nlet f:(u:U)=match u{.err=>|err|@panic(\"Error: {err}\")}\nlet g:(e:Alias)->string=\"{e} {Error.toString(e)} {e}\"";
+    const source = "let Alias=Error\nlet Error=struct{s:string,\n@[stringify]\nlet toString:(e:Alias)->string=e.s\n}\nlet U=union{err:Error,}\nlet f:(u:U)=match u{.err=>|err|@panic(\"Error: {err}\")}\nlet g:(e:Alias)->string=\"{e} {Error.toString(e)} {e}\"";
     const formatted = try format(std.testing.allocator, source);
     defer std.testing.allocator.free(formatted);
     try expectFormatted(source, formatted);

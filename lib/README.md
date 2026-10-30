@@ -136,8 +136,18 @@ Imports yield compile-time namespaces, never runtime values.
 Canonical paths share one source and nominal identity across repeated/diamond
 imports; cycles diagnose. Declarations and methods are file-private by default;
 both named and file imports expose only `@[public]` declarations. Public types do
-not automatically expose their methods. Aliases/re-exports and implicit `toString`
-calls preserve access checks. There is no `@[private]` attribute.
+not automatically expose their methods. Aliases/re-exports and implicit
+`@[stringify]` conversion preserve access checks: a marked converter must itself
+be `@[public]` for cross-file printing/interpolation, including nested values.
+Private or malformed marked converters reject rather than falling back to
+structural formatting. The converter may have any name and must be an ordinary
+immutable container method with a body and exact `(SelfType) -> string` signature.
+At most one argument-free `@[stringify]` is allowed per struct/union/enum; ordinary
+methods in generic containers are allowed, but the converter's own generic
+function parameters and `@[noreturn]`/`@[test]`/`@[export]`/`@[extern]` are not.
+Unmarked `toString` methods are ordinary callable methods with no print effect.
+See the root README's [converter contract](../README.md#explicit-stringify-converters).
+There is no `@[private]` attribute.
 
 The actual library is tested through real imports in semantic, emit-C, build/run,
 formatter, and relocated-install checks. `examples/results.nov` and

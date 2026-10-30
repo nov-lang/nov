@@ -391,7 +391,7 @@ test "generic methods reject inexact types leaked bindings and invalid concrete 
         .{ .source = "let Bad:(T:type)->type=union{ok:T,\nlet m:(T:int)={}\n}\nlet B=Bad(int)\nlet use:()=B.m(0)", .tag = .unsupported_shadowing },
         .{ .source = "let Bad:(T:type)->type=union{ok:T,\nlet m:()={let T:int=1\n}\n}\nlet B=Bad(int)\nlet use:()=B.m()", .tag = .unsupported_shadowing },
         .{ .source = "let Bad:(T:type)->type=union{ok:T,\n@[noreturn]\nlet m:()->T=@panic(\"bad\")\n}\nlet B=Bad(int)\nlet use:()=B.m()", .tag = .noreturn_result },
-        .{ .source = "let Bad:(T:type)->type=union{ok:T,\nlet toString:(self:@This())->T=match self{.ok=>|v|v}\n}\nlet B=Bad(int)\nlet f:(b:B)=@println(b)", .tag = .invalid_to_string },
+        .{ .source = "let Bad:(T:type)->type=union{ok:T,\n@[stringify]\nlet toString:(self:@This())->T=match self{.ok=>|v|v}\n}\nlet B=Bad(int)\nlet f:(b:B)=@println(b)", .tag = .invalid_to_string },
         .{ .source = "let A=struct{x:int,}\nlet B=struct{x:int,}\nlet f:(r:G(A,string),b:B)->A=r.unwrapOr(b)", .tag = .expression_type_mismatch },
     }) |case| {
         const source = try std.mem.concat(std.testing.allocator, u8, &.{ prefix, case.source });
@@ -683,7 +683,7 @@ test "unsupported union declarations and rejected matches roll back under OOM" {
         .{ .source = "let U=union{ok:()->int,}", .tag = .unsupported_type },
         .{ .source = "let U=union{ok:int,\nlet constant:int=1\n}", .tag = .unsupported_declaration },
 
-        .{ .source = "let U=union{ok:int,\nlet toString:(u:U)->bool=true\n}\nlet f:()=@println(U.ok[1])", .tag = .invalid_to_string },
+        .{ .source = "let U=union{ok:int,\n@[stringify]\nlet toString:(u:U)->bool=true\n}\nlet f:()=@println(U.ok[1])", .tag = .invalid_to_string },
         .{ .source = "let U=union{ok:int,none,}\nlet f:(u:U)->int=match u{.ok=>|n|n}", .tag = .match_missing_variants },
         .{ .source = "let U=union{ok:int,none,}\nlet f:(u:U)->int=match u{.ok=>0\n.ok=>1\n_=>2}", .tag = .match_covered_union_prong },
         .{ .source = "let U=union{ok:int,none,}\nlet f:(u:U)->int=match u{.ok=>|n|n\n_=>n}", .tag = .unknown_name },
@@ -727,9 +727,9 @@ test "nominal records reject mismatches malformed constructors defaults fields a
     for ([_]Case{
         .{ .source = "let A=struct{x:int,}\nlet B=struct{x:int,}\nlet f:(a:A)->B=a", .tag = .expression_type_mismatch },
 
-        .{ .source = "let A=struct{x:int,\nlet toString:(b:B)->string=\"wrong nominal receiver\"\n}\nlet B=struct{x:int,}\nlet f:(a:A)=@println(a)", .tag = .invalid_to_string },
-        .{ .source = "let A=struct{x:int,\nlet toString:(a:A)->bool=true\n}\nlet f:(a:A)=@println(a)", .tag = .invalid_to_string },
-        .{ .source = "let A=struct{x:int,\nlet toString:()->string=\"bad\"\n}\nlet f:(a:A)=@println(a)", .tag = .invalid_to_string },
+        .{ .source = "let A=struct{x:int,\n@[stringify]\nlet toString:(b:B)->string=\"wrong nominal receiver\"\n}\nlet B=struct{x:int,}\nlet f:(a:A)=@println(a)", .tag = .invalid_to_string },
+        .{ .source = "let A=struct{x:int,\n@[stringify]\nlet toString:(a:A)->bool=true\n}\nlet f:(a:A)=@println(a)", .tag = .invalid_to_string },
+        .{ .source = "let A=struct{x:int,\n@[stringify]\nlet toString:()->string=\"bad\"\n}\nlet f:(a:A)=@println(a)", .tag = .invalid_to_string },
         .{ .source = "let A=struct{x:int,}\nlet B=struct{x:int,}\nlet f:(a:B)=@println(a)\nlet main:()=f(A[.x=1])", .tag = .expression_type_mismatch },
         .{ .source = "let A=struct{x:int,}\nlet f:()->A=A[]", .tag = .missing_field },
         .{ .source = "let A=struct{x:int,}\nlet f:()->A=A[.x=1,.x=2]", .tag = .duplicate_field },

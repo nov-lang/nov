@@ -248,8 +248,12 @@ backend leaves and function signatures still require 8/16/32/64-bit widths; nati
 syntax. Storage support does not grant equality, membership or printing: enums
 retain exact nominal equality/membership alongside existing scalar/string support;
 functions, unions, records, arrays and ranges reject comparisons/membership. Arrays
-still cannot be printed; individual elements use their existing scalar or exact
-container `toString` rules.
+print recursively when their elements are printable, using scalar/default aggregate
+formatting or exact `(SelfType) -> string` container methods marked `@[stringify]`.
+Marked converters override a value at any depth and stop recursion; malformed or
+inaccessible marked methods reject rather than falling back. Cross-file converters
+require `@[public]`. An unmarked `toString` is an ordinary callable method, not a
+printing hook.
 
 The array representation uses `nov_array { void *data; uintptr_t len, cap; }`.
 The emitter declares this type for any transitively reachable array type, including
