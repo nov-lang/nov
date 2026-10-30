@@ -38,8 +38,8 @@ owned, canonical type/constant storage and verification. Internal module passes
 collect names and diagnose duplicate/unknown names and initializer dependency
 cycles for a bounded expression subset (type aliases are not runtime initializers).
 Internal annotation analysis resolves
-explicit `bool`, `void`, fixed-width integer, native `int`/`uint` and function
-types, and checks integer and boolean literals against annotations. Bounded function-body checking binds
+explicit `bool`, `void`, fixed-width integer, `f32`/`f64`, native `int`/`uint`/`float` and function
+types, and checks numeric and boolean literals against annotations. Bounded function-body checking binds
 parameters and checks integer arithmetic, boolean expressions, comparisons and
 calls against collected signatures, including recursive calls. Immutable and mutable
 locals (explicitly typed or inferred from their initializer) and blocks
@@ -56,7 +56,7 @@ It requires immutable literal globals; unit/global block initializers are
 not lowered yet. An internal C11 backend emits verified IR, including fixed-width
 integer arithmetic and program entrypoint emission through `emit-c`.
 `@print`/`@println` support booleans, runes, strings, inferred or explicitly typed integers
-(including `int`/`uint`), and default structural formatting for printable arrays,
+(including `int`/`uint`), `f32`/`f64`, and default structural formatting for printable arrays,
 structs, unions and enums. Nominal values, including nested values, can override
 the default with an exact container method marked `@[stringify]`. Print contexts
 also accept compile-time type names as static strings, not runtime type values.
@@ -68,7 +68,7 @@ analysis, annotation/literal and function-body checking, then typed lowering and
 IR verification. Source errors and unsupported/deferred forms fail with source
 diagnostics (including related notes where available); recovered syntax errors
 stop semantic analysis. Runtime globals must be immutable scalar constants: explicitly
-typed integer/boolean/rune/string literals, inferred integer (including literal
+typed integer/float/boolean/rune/string literals, inferred integer/float (including literal
 negation), boolean, rune or plain UTF-8 string literals, or scalar literals
 explicitly contextualized with `@as(T, literal)`.
 Immutable module-level type aliases are also supported. Functions need explicit supported signatures and bounded
@@ -200,7 +200,7 @@ Interpolated strings can be printed like any string. Functions/closures, ranges
 and void values have no default representation; aggregates containing them also
 reject unless a valid enclosing hook overrides that value and stops structural
 recursion. A void union alternative is payloadless and printable. Unspecialized generic templates and namespaces are not
-runtime printable, and floats remain unsupported by the language/runtime. The C
+runtime printable. Float leaves use the [float formatting contract](#floats). The C
 backend continues to reject integer widths other than 8/16/32/64.
 
 Default formatting recurses through nested aggregates:
@@ -312,7 +312,7 @@ let main: () -> void = {
 The first argument uses annotation type syntax, including supported array and
 function types; it is not evaluated as a value. The second argument is evaluated
 exactly once and checked against that canonical type. Boolean, string, function
-and void values are supported as well as contextual integer and array literals.
+and void values are supported as well as floats and contextual numeric/array literals.
 The enclosing context must still match exactly: `@as(int, @as(uint, 1))` is an
 error, not a signedness conversion. There is no widening, narrowing, numeric cast,
 type-alias evaluation or general type-value inference. Ascription adds no array
@@ -358,7 +358,7 @@ let main: () -> void = {
 This prints `42` on two lines. Locals require an initializer. The annotation may
 be omitted in `let name = expression` and `let mut name = expression` when the
 initializer already determines a supported `bool`, integer (fixed-width or native
-`int`/`uint`), rune, string, enum, record/union, range, function-value or array type. Examples include
+`int`/`uint`), float, rune, string, enum, record/union, range, function-value or array type. Examples include
 `let ready = true`, `let result = value + 1`, `let callback = twice`, and
 `let mut copy = values` for an already typed array. Calls, indexing, `.len`, and
 block/conditional results use the same bidirectional rules as other expressions.
@@ -381,12 +381,12 @@ Function expressions and nonrecursive local function definitions support automat
 captures, as described under [Functions](#functions). Inferred `void` locals,
 and labels remain unsupported. Mutable locals use `let mut` and support
 existing storable runtime values (not `void`). Direct
-identifier assignment (`n = value`) and integer-only `+=`, `-=`, `*=`, `/=`, `%=`
+identifier assignment (`n = value`), numeric `+=`, `-=`, `*=`, `/=`, and integer-only `%=`
 return `void`; a block ending in assignment therefore also returns `void`.
 Assignments require a mutable local, not a parameter or global. RHS types must
 match exactly, without implicit numeric conversions. Compound assignments read
-the old local value before evaluating the RHS, then apply the existing wrapping
-arithmetic/division rules and store once. RHS effects can update the same local;
+the old local value before evaluating the RHS, then apply the existing
+integer wrapping/division or IEEE float rules and store once. RHS effects can update the same local;
 the compound calculation still uses the captured old value. A returning RHS exits
 without performing the pending store. Mutable initializers execute exactly once,
 before the local is visible; each later read captures its current value. Updates
@@ -1059,7 +1059,7 @@ The delivered subset is deliberately bounded:
   aliases work in annotations, method signatures, constructors and static calls.
   Forward module type names and method signatures are supported.
 - Named fields require explicit `bool`, `rune`, integer (including `i128`/`u128` and native
-  `int`/`uint`), immutable `string`, nominal enum, acyclic nominal struct types,
+  `int`/`uint`), `f32`/`f64`, immutable `string`, nominal enum, acyclic nominal struct types,
   or arrays of supported element types (including aliases). Semantic checking
   uses the same integer-width and literal-bound rules as scalar values. The C
   backend still supports only 8/16/32/64-bit integers: a reachable record layout
@@ -1071,7 +1071,7 @@ The delivered subset is deliberately bounded:
   struct and array values must be supplied explicitly. Recursive layouts (including
   cycles through array element types) and layouts deeper than 128 aggregate levels
   diagnose, including aliases/imports and late generic instantiations.
-  Direct union/function/void/float fields remain unsupported; array fields may
+  `f32`/`f64` fields are supported. Direct union/function/void fields remain unsupported; array fields may
   contain any supported storable element type, including nested arrays. Arrays of
   supported records are described below.
 - Construct explicitly with `MyType[ .x = 5, .z = true ]` (or `Alias[...]`).
@@ -1101,9 +1101,10 @@ The delivered subset is deliberately bounded:
   reads, method receivers and ordinary reads through loans obey the same independence
   rule. Replacing or mutating a record binding does not change earlier copies.
 - Fields of a direct mutable local support `item.field = value` with exact bool,
-  integer, rune, string, enum, struct or array type. Nested paths such as `item.inner.count += 1`
+  integer, float, rune, string, enum, struct or array type. Nested paths such as `item.inner.count += 1`
   and exact-type subrecord replacements are supported. Integer fields support `+= -= *= /= %=`, with the
-  same wrapping/division/panic rules as scalar integers; string fields support `+=`.
+  same wrapping/division/panic rules as scalar integers; float fields support
+  `+= -= *= /=` with IEEE semantics; string fields support `+=`.
   These assignments yield void. A real struct field named `len` is writable;
   array/string lengths remain read-only.
 - A compound reads the old field **before** evaluating the RHS once. After the RHS,
@@ -1189,7 +1190,7 @@ this is implementation overhead, not heap allocation of the records themselves.
 #### Broader struct syntax (design, not fully executable)
 
 The following older examples describe future syntax outside the bounded subset
-above (including floats, container constants, contextual and anonymous values).
+above (including container constants, contextual and anonymous values).
 Struct is Nov's equivalent of [Product type](https://en.wikipedia.org/wiki/Product_type).
 ```nov
 let MyStruct = struct {
@@ -1236,7 +1237,7 @@ let z = [ 10, 20, 30 ]
 
 Ordinary module declarations such as `let Value = union { number: int, text: string, empty, }`
 introduce nominal tagged value types. Separate declarations remain distinct; aliases
-preserve identity. The current executable subset supports bool, integer, rune, string,
+preserve identity. The current executable subset supports bool, integer, float, rune, string,
 void, enum, and existing acyclic nominal struct payloads, with no payload defaults. As with structs, integer fields are
 checked semantically through 128 bits, while reachable C layouts require
 8/16/32/64-bit widths.
@@ -1688,7 +1689,7 @@ Growable `[]T` arrays support every existing storable runtime type: `bool`,
 `rune`, integers, immutable `string`, nominal enums, finite acyclic records and
 existing tagged unions, function values (including closures), nested arrays, and
 inferred integer range values. `void` and compile-time `type` are not storable;
-floats are not implemented. Semantic integer types extend through 128 bits, but
+`f32`/`f64` are storable. Semantic integer types extend through 128 bits, but
 reachable C layouts, including nested elements and function signatures, still
 require 8/16/32/64-bit widths (native `int/uint` retain their pointer-width rules).
 Existing annotation syntax applies in bodies and signatures; ranges have no
@@ -1792,7 +1793,9 @@ let main: () -> void = {
 - String membership compares exact UTF-8 bytes/length, including embedded NUL, not
   owner identity. Enum elements support exact nominal equality and membership.
   Storage support adds no other equality or membership: functions, unions, records,
-  arrays and ranges reject comparisons and membership as element values. Indexed compounds remain integer-only; string indexed `+=` is not added.
+  arrays and ranges reject comparisons and membership as element values. Float
+  elements support IEEE equality/membership and indexed `+= -= *= /=`;
+  `%=` remains integer-only and string indexed `+=` is not added.
 - Managed backing allocations own repeated element descriptors and expanded pointer
   maps, tracing actual string-owner and array-backing fields across the entire
   zero-initialized capacity. Record layout dependencies precede array descriptors. Map storage costs
@@ -1815,7 +1818,7 @@ let main: () -> void = {
 ### Local static borrowing
 
 Scoped borrows support every currently implemented non-void runtime value type:
-bool, integer, rune, string, enum, struct, union, array, range and function values. Borrow
+bool, integer, float, rune, string, enum, struct, union, array, range and function values. Borrow
 a local with `let view = &value`, or a supported array element with
 `let view = &items[index]`. Readonly locals and parameters can be borrowed for
 reading; writes require a mutable owner.
@@ -2266,7 +2269,8 @@ let nums: []int = [1, 2, 3]
 ```
 
 The executable subset supports membership in scalar `[]T` arrays: `bool`, `rune`,
-`string`, nominal enums, fixed 8/16/32/64-bit signed/unsigned integers, and native `int`/`uint`. Value and
+`string`, nominal enums, `f32`/`f64`, fixed 8/16/32/64-bit signed/unsigned integers,
+and native `int`/`uint`. Value and
 element types must match exactly; there is no widening or signedness conversion.
 A known array element type constrains the left literal; a known typed left value
 constrains an array literal, including `[]`. Boolean literals provide a known
@@ -2299,7 +2303,8 @@ let z += 3 ; compile error, expected `=`
 
 Immutable module bindings infer `bool` from `true`/`false`, `rune` from single-quoted
 scalar literals and `string` from plain UTF-8 string literals. Integer literals
-and literal negation default to `int` unless an annotation or `@as` supplies context:
+and literal negation default to `int`; float literals default to native `float`.
+Annotations or `@as` supply context before either fallback:
 
 ```nov
 let enabled = true
@@ -2348,7 +2353,7 @@ let main: () -> void = {
 
 Aliases are canonical synonyms, **not distinct newtypes**: `Count` and `uint`
 match exactly, with the same literal bounds, operations and backend restrictions.
-Supported RHS forms are `bool`, `void`, fixed-width integers, native `int`/`uint`,
+Supported RHS forms are `bool`, `void`, fixed-width integers, `f32`/`f64`, native `int`/`uint`/`float`,
 `rune`, `string`, nominal container types, supported array types and function types, including aliases in nested
 parameter/result/array-element positions. Bounded [`@TypeOf`](#type-queries)
 queries are also supported, including `let Count = @TypeOf(global)`.
@@ -2522,25 +2527,52 @@ Empty arrays still need an element type. There is no implicit numeric widening,
 signedness conversion or size-based fallback: a literal above native `int`'s
 maximum fails out of range unless given a fitting explicit type such as `u64` or
 `i128` (128-bit types remain semantic-only for the C backend). The dedicated direct
-range-literal rule is described in [Range](#range). Float literals remain
-unsupported and are never coerced to `int`. The wider type list below is a proposal.
+range-literal rule is described in [Range](#range). Integer literals may instead
+be checked directly in a float context; typed integer values are never implicitly
+converted to floats. Float literals use their own late `float` fallback below.
 
-TODO
-- c\_int, ...
-- u8, u16, u32, u64, u128, i8, i16, i32, i64, i128, f16, f32, f64, f80, f128
-  - float = f32 or f64 based on architecture
+C-specific integer aliases remain deferred.
 
 ## Floats
 
-Proposal only: floats are not executable, and float literals do not use integer fallback.
+`f32` (IEEE binary32) and `f64` (IEEE binary64) are executable types. `float`
+is a canonical alias of `f32` on 32-bit targets and `f64` on 64-bit targets, not
+C `float` on every target. These are accepted, implemented rules, not a proposal.
 
-- `float` - f32 or f64 depending on architecture
-- `f16` - IEEE-754-2008 binary16
-- `f32` - IEEE-754-2008 binary32
-- `f64` - IEEE-754-2008 binary64
-- `f80` - IEEE-754-2008 80-bit extended precision
-- `f128` - IEEE-754-2008 binary128
-- `c_longdouble` - matches long double for the target C ABI
+Float literals default to native `float` only after annotations, signatures,
+typed siblings/array elements/control branches and generic constraints have been
+tried. Integer literals are also allowed directly in float contexts. Already typed
+integer, `f32` and `f64` values require exact type matches: no implicit conversions,
+widening or narrowing. `@as(f32, 1)` supplies literal context;
+`@as(f32, typed_f64)` is not a conversion. No numeric cast feature exists yet.
+
+Decimal and hexadecimal float literals (for example `1.5`, `1e-3`, `0x1.8p1`)
+round directly to the selected target width. Finite literal overflow diagnoses;
+subnormals and underflow, including signed zero, are supported. Arrays, struct
+fields, union payloads, function parameters/results, closures, generic
+specializations and bounded `@TypeOf` queries all support `f32`/`f64`. Type queries
+report canonical fixed-width names, including for the native alias.
+
+`+ - * /`, unary negation, `+= -= *= /=`, `== !=` and ordering use IEEE semantics.
+Compounds work on mutable locals, supported fields and array elements. Division
+by zero produces infinity or NaN rather than an integer-style panic. NaN compares
+unequal to every value, including itself, and all ordered comparisons with NaN are
+false. Positive and negative zero compare equal. Array membership uses the same
+equality, so NaN is never found and either zero matches the other. `%`/`%=`, bitwise
+operations, ranges and indices remain integer-only; float match subjects are deferred.
+
+Printing, interpolation and nested default formatting use round-trip-safe `%.9g`
+for `f32` and `%.17g` for `f64`, with normalized `nan`, `inf`, `-inf` and `-0`.
+This is **not shortest-decimal formatting**. Existing `@[stringify]` hooks and
+recursive copy rules are unchanged; float leaves add no GC roots.
+
+The C backend maps `f32` to C `float` and `f64` to C `double`. Generated C guards
+IEEE widths, binary radix, subnormal support and `FLT_EVAL_METHOD == 0`, rejects
+fast-math, and disables FP contraction. Embedding code must preserve the C numeric
+locale and normal round-to-nearest rounding environment. The scalar `@[extern]` /
+`@[export]` ABI includes both widths. See `examples/floats.nov`.
+
+`f16`, `f80`, `f128` and `c_longdouble` remain deferred.
 
 ## Function Pipes
 
@@ -2549,8 +2581,8 @@ Proposal only: floats are not executable, and float literals do not use integer 
 not a new left-to-right pipeline effect order. Chaining is left-associative.
 Named functions and function values require exactly one parameter; its exact type
 constrains literals (`10 |> fibo`). `value |> @print` and `value |> @println`
-accept bool/integer/rune/string results and return void, including unconstrained
-integer expressions via the normal `int` fallback. No partial application or implicit conversions occur.
+accept printable values (including floats and aggregates) and return void,
+including unconstrained numeric expressions via the normal `int`/`float` fallbacks. No partial application or implicit conversions occur.
 
 The unchanged [`examples/fibo.nov`](examples/fibo.nov) now runs:
 
@@ -2812,8 +2844,8 @@ Placeholders use the normal expression parser and checker: identifiers, calls
 usual type contexts. For example, `"{describe(1, 5, 5)}\n{describe(5, 1, 3)}"`
 uses the callee's parameter types for the numeric arguments. Existing lexical
 scope, no-shadowing and declaration-before-use rules apply; spaces are allowed.
-Bare integer placeholders use `int` fallback (`"{1}"` works); float literals remain
-unsupported rather than being coerced to `int`.
+Bare integer placeholders use `int` fallback (`"{1}"` works); float placeholders
+use late native `float` fallback and the [float formatting contract](#floats).
 
 This bounded syntax excludes blocks/braces, control flow, comments, quotes and
 backslashes inside placeholders. String/character literals and quoted names
@@ -2853,7 +2885,7 @@ TODO
 - `@TypeOf(x)`: Implemented bounded compile-time query of a runtime binding's canonical type; see [Type Queries](#type-queries). Not arbitrary expressions or runtime type values.
 - `@typeInfo(...)`: Proposed type-information reflection; not implemented.
 - `@This()`: Returns the type of the current container
-- `@print(...)`: Output args separated with a space to stdout; returns void. Supports bool, fixed/native integer, raw rune/string and recursive default array/struct/union/enum formatting. Nominal values at any depth prefer an explicit `@[stringify]` method with exact signature `(SelfType) -> string`, called once per encountered value in traversal order and stopping structural recursion. Top-level hooks run immediately after argument evaluation; nested hooks run during traversal. Malformed/inaccessible hooks reject even when nested. Compile-time types emit canonical static name strings. Interpolated strings work like other strings. See the printing contract above.
+- `@print(...)`: Output args separated with a space to stdout; returns void. Supports bool, fixed/native integer, f32/f64, raw rune/string and recursive default array/struct/union/enum formatting. Nominal values at any depth prefer an explicit `@[stringify]` method with exact signature `(SelfType) -> string`, called once per encountered value in traversal order and stopping structural recursion. Top-level hooks run immediately after argument evaluation; nested hooks run during traversal. Malformed/inaccessible hooks reject even when nested. Compile-time types emit canonical static name strings. Interpolated strings work like other strings. See the printing contract above.
 - `@println(...)`: Same as print with a newline at the end, including with no args.
 - `@fprint(file: File, ...)`: Same as print but output to a specific file. Returns a Result<>.
 <!-- - `@eprint(...)`: Same as print but output to stderr. -->
@@ -2939,11 +2971,12 @@ loaded files diagnose with a note to the first declaration. Exact collisions wit
 other generated function names are rejected before any C is returned.
 
 Exports are limited to immutable, ordinary top-level function declarations with
-bodies. Parameters/results may be `bool` or 8/16/32/64-bit signed/unsigned integers;
+bodies. Parameters/results may be `bool`, `f32`, `f64` or 8/16/32/64-bit signed/unsigned integers;
 results may also be `void`. Canonical aliases are accepted, including pointer-sized
 `int`/`uint`. The C types are `bool` (include `<stdbool.h>`) and the corresponding
 `intN_t`/`uintN_t` (include `<stdint.h>`); native integers match `intptr_t`/`uintptr_t`
-on the native target. Calls use the C compiler's ordinary C calling convention.
+on the native target. `f32` and `f64` map to C `float` and `double` respectively;
+`float` follows its target-width alias. Calls use the C compiler's ordinary C calling convention.
 Runes, strings, arrays, ranges, enums, records/unions, function values, wider integers,
 methods and generic exports are not supported as foreign ABI declarations.
 
@@ -2982,7 +3015,8 @@ names are unsupported. Extern declarations must be immutable, ordinary top-level
 function prototypes **without a body**. They cannot also carry `@[export]`.
 
 The initial ABI is the same scalar subset as exports: bool and 8/16/32/64-bit
-signed/unsigned integers, pointer-sized int/uint, and void results. No variadics,
+signed/unsigned integers, pointer-sized int/uint, `f32`/`f64` (C `float`/`double`),
+and void results. The native `float` alias follows the target width. No variadics,
 C-specific integer aliases, strings, pointers, aggregates or function-valued ABI
 parameters/results are supported. Extern functions can still be called indirectly
 or passed as ordinary function values inside Nov. Standard C function names such

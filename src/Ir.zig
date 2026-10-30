@@ -26,6 +26,7 @@ pub const TypeFormatting = struct { ty: TypeId, display_name: []const u8, format
 /// The current pipeline targets the machine running Nov, not a separate target.
 /// Native aliases are canonical fixed-width integers once resolved.
 pub const native_pointer_bits = @bitSizeOf(usize);
+pub const native_float_bits: u16 = if (native_pointer_bits == 32) 32 else 64;
 
 pub const TypeId = enum(u32) { _ };
 pub const ConstId = enum(u32) { _ };
@@ -177,7 +178,7 @@ const DefaultPrintability = struct {
             errdefer ir.allocator.free(states);
             const stack = try ir.allocator.alloc(Frame, ir.types.items.len);
             for (ir.types.items, states) |ty, *state| state.* = switch (ty) {
-                .boolean, .integer, .rune, .string, .enumeration => .printable,
+                .boolean, .integer, .float, .rune, .string, .enumeration => .printable,
                 .array, .record => .unknown,
                 else => .unsupported,
             };
@@ -266,6 +267,7 @@ pub const Type = union(enum) {
     rune,
     string,
     integer: Integer,
+    float: u16,
     function: Type.Function,
     array: TypeId,
     /// Reusable integer bounds; inclusivity belongs to each value.
@@ -294,6 +296,10 @@ pub const Constant = struct {
         rune: u32,
         signed_integer: i128,
         unsigned_integer: u128,
+        /// IEEE bits for finite values, infinities or quiet NaNs. Signaling NaNs
+        /// cannot survive every supported C ABI unchanged. f32 uses the low 32
+        /// bits with zero upper bits.
+        float_bits: u64,
         string: []const u8,
     };
 };
@@ -301,6 +307,8 @@ pub const Constant = struct {
 pub const ValidationError = error{
     InvalidTypeId,
     InvalidIntegerWidth,
+    InvalidFloatWidth,
+    FloatOutOfRange,
     VoidParameter,
     NonConstantType,
     InvalidArrayElement,
@@ -772,6 +780,7 @@ fn exportScalar(self: *const Ir, id: TypeId, result: bool) bool {
     return switch (self.getType(id).?) {
         .void => result,
         .boolean => true,
+        .float => |bits| bits == 32 or bits == 64,
         .integer => |integer| switch (integer.bits) {
             8, 16, 32, 64 => true,
             else => false,
@@ -1149,7 +1158,7 @@ fn validateBodyStructure(self: *const Ir, function: Function, body: Body) Verify
                 if (try operandType(body, r.lhs, i) != instruction.ty or try operandType(body, r.rhs, i) != instruction.ty) return error.OperandTypeMismatch;
             },
             .local_slot => |value| {
-                if (ty != .boolean and ty != .integer and ty != .rune and ty != .function and ty != .array and ty != .string and ty != .record and ty != .enumeration and ty != .range) return error.InvalidOperation;
+                if (ty != .boolean and ty != .integer and ty != .float and ty != .rune and ty != .function and ty != .array and ty != .string and ty != .record and ty != .enumeration and ty != .range) return error.InvalidOperation;
                 if (try operandType(body, value, i) != instruction.ty) return error.OperandTypeMismatch;
             },
             .local_load => |slot| {
@@ -1248,7 +1257,7 @@ fn validateBodyStructure(self: *const Ir, function: Function, body: Body) Verify
                 const operand = try operandType(body, unary.operand, i);
                 if (operand != instruction.ty) return error.OperandTypeMismatch;
                 switch (unary.op) {
-                    .negate => if (ty != .integer or ty.integer.signedness != .signed) return error.InvalidOperation,
+                    .negate => if (ty != .float and (ty != .integer or ty.integer.signedness != .signed)) return error.InvalidOperation,
                     .bit_not => if (ty != .integer) return error.InvalidOperation,
                     .bool_not => if (ty != .boolean) return error.InvalidOperation,
                 }
@@ -1260,11 +1269,11 @@ fn validateBodyStructure(self: *const Ir, function: Function, body: Body) Verify
                 const operand = self.getType(lhs) orelse return error.InvalidTypeId;
                 switch (binary.op) {
                     .add, .sub, .mul, .div, .mod, .bit_and, .bit_or, .bit_xor => {
-                        if (operand != .integer and !(operand == .string and binary.op == .add)) return error.InvalidOperation;
+                        if (operand != .integer and !(operand == .float and (binary.op == .add or binary.op == .sub or binary.op == .mul or binary.op == .div)) and !(operand == .string and binary.op == .add)) return error.InvalidOperation;
                         if (instruction.ty != lhs) return error.OperandTypeMismatch;
                     },
                     .eq, .ne, .lt, .le, .gt, .ge => {
-                        if (operand != .integer and !((binary.op == .eq or binary.op == .ne) and (operand == .boolean or operand == .rune or operand == .string or operand == .enumeration))) return error.InvalidOperation;
+                        if (operand != .integer and operand != .float and !((binary.op == .eq or binary.op == .ne) and (operand == .boolean or operand == .rune or operand == .string or operand == .enumeration))) return error.InvalidOperation;
                         if (ty != .boolean) return error.OperandTypeMismatch;
                     },
                 }
@@ -1353,6 +1362,7 @@ fn validateType(self: *const Ir, ty: Type, before: usize) ValidationError!void {
             }
         },
         .void, .boolean, .rune, .string => {},
+        .float => |bits| if (bits != 32 and bits != 64) return error.InvalidFloatWidth,
         .integer => |integer| {
             if (integer.bits == 0 or integer.bits > 128) return error.InvalidIntegerWidth;
         },
@@ -1393,6 +1403,15 @@ fn validateConstant(self: *const Ir, constant: Constant) ValidationError!void {
         .string => {
             if (constant.value != .string) return error.ConstantTypeMismatch;
             if (!std.unicode.utf8ValidateSlice(constant.value.string)) return error.ConstantTypeMismatch;
+        },
+        .float => |bits| {
+            if (constant.value != .float_bits) return error.ConstantTypeMismatch;
+            const pattern = constant.value.float_bits;
+            if (bits == 32 and pattern > std.math.maxInt(u32)) return error.FloatOutOfRange;
+            const exponent_mask: u64 = if (bits == 32) 0x7f800000 else 0x7ff0000000000000;
+            const fraction_mask: u64 = if (bits == 32) 0x007fffff else 0x000fffffffffffff;
+            const quiet_mask: u64 = if (bits == 32) 0x00400000 else 0x0008000000000000;
+            if (pattern & exponent_mask == exponent_mask and pattern & fraction_mask != 0 and pattern & quiet_mask == 0) return error.FloatOutOfRange;
         },
         .function, .array, .record, .range => return error.NonConstantType,
         .integer => |integer| switch (integer.signedness) {
@@ -1475,13 +1494,14 @@ pub fn needsArrayCopy(self: *const Ir, id: TypeId) std.mem.Allocator.Error!bool 
 
 /// Record fields use semantic integer limits, not array/backend storage widths.
 pub fn isRecordField(ty: Type) bool {
-    return ty == .array or ty == .enumeration or ty == .boolean or ty == .rune or ty == .string or (ty == .record and !ty.record.tagged) or (ty == .integer and ty.integer.bits > 0 and ty.integer.bits <= 128);
+    return (ty == .float and (ty.float == 32 or ty.float == 64)) or ty == .array or ty == .enumeration or ty == .boolean or ty == .rune or ty == .string or (ty == .record and !ty.record.tagged) or (ty == .integer and ty.integer.bits > 0 and ty.integer.bits <= 128);
 }
 
 pub fn isArrayElement(ty: Type) bool {
     return switch (ty) {
         .void => false,
         .integer => |integer| integer.bits > 0 and integer.bits <= 128,
+        .float => |bits| bits == 32 or bits == 64,
         .boolean, .rune, .string, .enumeration, .record, .function, .array, .range => true,
     };
 }
@@ -1489,7 +1509,7 @@ pub fn isArrayElement(ty: Type) bool {
 /// Storage support does not imply equality (notably for closures and aggregates).
 pub fn hasEquality(ty: Type) bool {
     return switch (ty) {
-        .boolean, .integer, .rune, .string, .enumeration => true,
+        .boolean, .integer, .float, .rune, .string, .enumeration => true,
         else => false,
     };
 }
@@ -1500,6 +1520,7 @@ fn typeEql(a: Type, b: Type) bool {
         .void, .boolean, .rune, .string => true,
         .enumeration => |enumeration| enumeration.source == b.enumeration.source and enumeration.identity == b.enumeration.identity,
         .integer => |integer| std.meta.eql(integer, b.integer),
+        .float => |bits| bits == b.float,
         .record => |record| record.source == b.record.source and record.identity == b.record.identity and record.tagged == b.record.tagged and std.mem.eql(TypeId, record.type_args, b.record.type_args),
         .range => |element| element == b.range,
         .array => |element| element == b.array,
@@ -2314,6 +2335,112 @@ test "print verification checks result types scalar arguments and prior operands
     const owned = @constCast(ir.functions.items[0].body.?.instructions);
     owned[1].ty = boolean;
     try std.testing.expectError(error.InvalidOperation, ir.verify());
+}
+
+test "float pools preserve IEEE identities and reject signaling NaNs and noncanonical bits" {
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    for ([_]u16{ 0, 16, 80, 128 }) |bits| try std.testing.expectError(error.InvalidFloatWidth, ir.internType(.{ .float = bits }));
+    for ([_]u16{ 32, 64 }) |width| {
+        const ty = try ir.internType(.{ .float = width });
+        try std.testing.expectEqual(ty, try ir.internType(.{ .float = width }));
+        const patterns: []const u64 = if (width == 32)
+            &.{ 0, 0x80000000, 0x7f800000, 0xff800000, 0x7fc00001, 0x7fc00002, 0xffc00001 }
+        else
+            &.{ 0, 0x8000000000000000, 0x7ff0000000000000, 0xfff0000000000000, 0x7ff8000000000001, 0x7ff8000000000002, 0xfff8000000000001 };
+        var ids: [7]ConstId = undefined;
+        for (patterns, 0..) |bits, i| {
+            const constant: Constant = .{ .ty = ty, .value = .{ .float_bits = bits } };
+            ids[i] = try ir.internConstant(constant);
+            try std.testing.expectEqual(bits, ir.getConstant(ids[i]).?.value.float_bits);
+            try std.testing.expectEqual(ids[i], try ir.internConstant(constant));
+            for (ids[0..i]) |previous| try std.testing.expect(previous != ids[i]);
+        }
+        const signaling: []const u64 = if (width == 32)
+            &.{ 0x7f800001, 0xff800001, 0x7fbfffff, 0xffbfffff }
+        else
+            &.{ 0x7ff0000000000001, 0xfff0000000000001, 0x7ff7ffffffffffff, 0xfff7ffffffffffff };
+        for (signaling) |pattern| {
+            const count = ir.constants.items.len;
+            try std.testing.expectError(error.FloatOutOfRange, ir.internConstant(.{ .ty = ty, .value = .{ .float_bits = pattern } }));
+            try std.testing.expectEqual(count, ir.constants.items.len);
+            const index = @backingInt(ids[0]);
+            const saved = ir.constants.items[index];
+            ir.constants.items[index].value = .{ .float_bits = pattern };
+            try std.testing.expectError(error.FloatOutOfRange, ir.verify());
+            ir.constants.items[index] = saved;
+        }
+        try std.testing.expect(isArrayElement(ir.getType(ty).?));
+        try std.testing.expect(isRecordField(ir.getType(ty).?));
+        try std.testing.expect(isUnionPayload(ir.getType(ty).?));
+        try std.testing.expect(hasEquality(ir.getType(ty).?));
+        try std.testing.expect(!isManaged(ir.getType(ty).?));
+        try std.testing.expect(!try ir.needsArrayCopy(ty));
+        try std.testing.expectError(error.ConstantTypeMismatch, ir.internConstant(.{ .ty = ty, .value = .{ .signed_integer = 1 } }));
+    }
+    const narrow = try ir.internType(.{ .float = 32 });
+    try std.testing.expectError(error.FloatOutOfRange, ir.internConstant(.{ .ty = narrow, .value = .{ .float_bits = 0x100000000 } }));
+    try ir.verify();
+}
+
+test "float IR operations exact types storage printing membership and foreign ABI verify" {
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    ir.source_len = 1;
+    const boolean = try ir.internType(.boolean);
+    const unit = try ir.internType(.void);
+    const string = try ir.internType(.string);
+    for ([_]u16{ 32, 64 }) |width| {
+        const ty = try ir.internType(.{ .float = width });
+        for (std.enums.values(BinaryOp)) |op| {
+            ir.clearFunctions();
+            const arithmetic = op == .add or op == .sub or op == .mul or op == .div;
+            const integer_only = op == .mod or op == .bit_and or op == .bit_or or op == .bit_xor;
+            const result = if (arithmetic or integer_only) ty else boolean;
+            const signature = try ir.internType(.{ .function = .{ .params = &.{ty}, .result = result } });
+            const function = try ir.addFunction("float_binary", signature, test_span);
+            const instructions = [_]Instruction{
+                TestFunctions.instruction(ty, .{ .parameter = 0 }),
+                TestFunctions.instruction(result, .{ .binary = .{ .op = op, .lhs = @fromBackingInt(0), .rhs = @fromBackingInt(0) } }),
+            };
+            if (integer_only) {
+                try std.testing.expectError(error.InvalidOperation, ir.setFunctionBody(function, &instructions, @fromBackingInt(1)));
+            } else {
+                try ir.setFunctionBody(function, &instructions, @fromBackingInt(1));
+                try ir.verify();
+            }
+        }
+        ir.clearFunctions();
+        const array = try ir.internType(.{ .array = ty });
+        const record = try ir.internType(.{ .record = .{ .identity = width, .fields = &.{} } });
+        try ir.setRecordFields(record, &.{.{ .name = "value", .ty = ty, .span = test_span }});
+        const tagged = try ir.internType(.{ .record = .{ .identity = width + 1, .tagged = true, .fields = &.{} } });
+        try ir.setRecordFields(tagged, &.{.{ .name = "some", .ty = ty, .span = test_span }});
+        const signature = try ir.internType(.{ .function = .{ .params = &.{ty}, .result = string } });
+        const function = try ir.addFunction("float_storage", signature, test_span);
+        try ir.setFunctionBody(function, &.{
+            TestFunctions.instruction(ty, .{ .parameter = 0 }),
+            TestFunctions.instruction(ty, .{ .unary = .{ .op = .negate, .operand = @fromBackingInt(0) } }),
+            TestFunctions.instruction(ty, .{ .local_slot = @fromBackingInt(1) }),
+            TestFunctions.instruction(ty, .{ .local_load = @fromBackingInt(2) }),
+            TestFunctions.instruction(array, .{ .array_literal = &.{@fromBackingInt(3)} }),
+            TestFunctions.instruction(boolean, .{ .array_contains = .{ .value = @fromBackingInt(0), .array = @fromBackingInt(4) } }),
+            TestFunctions.instruction(record, .{ .record_init = &.{@fromBackingInt(0)} }),
+            TestFunctions.instruction(tagged, .{ .union_init = .{ .index = 0, .payload = @fromBackingInt(0) } }),
+            TestFunctions.instruction(unit, .{ .print = .{ .args = &.{ @fromBackingInt(0), @fromBackingInt(4), @fromBackingInt(6), @fromBackingInt(7) }, .newline = true } }),
+            TestFunctions.instruction(string, .{ .to_string = @fromBackingInt(0) }),
+        }, @fromBackingInt(9));
+        const foreign_signature = try ir.internType(.{ .function = .{ .params = &.{ty}, .result = ty } });
+        const foreign = try ir.addFunction("float_foreign", foreign_signature, test_span);
+        try ir.setExternName(foreign, "float_foreign_symbol");
+        try ir.verify();
+        ir.clearFunctions();
+        const exported = try ir.addFunction("float_export", foreign_signature, test_span);
+        try ir.setExportName(exported, "float_export_symbol");
+        try ir.setFunctionBody(exported, &.{TestFunctions.instruction(ty, .{ .parameter = 0 })}, @fromBackingInt(0));
+        try ir.verify();
+        try std.testing.expectError(error.InvalidTypeId, ir.internType(.{ .range = ty }));
+    }
 }
 
 test "types and constants have canonical typed identities" {

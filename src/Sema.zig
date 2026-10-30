@@ -204,6 +204,7 @@ fn foreignScalar(ty: Ir.Type, result: bool) bool {
     return switch (ty) {
         .void => result,
         .boolean => true,
+        .float => |bits| bits == 32 or bits == 64,
         .integer => |integer| switch (integer.bits) {
             8, 16, 32, 64 => true,
             else => false,
@@ -524,6 +525,7 @@ pub fn getEntry(self: *const Sema, id: Module.DeclId) ?Entry {
 fn checkScalarGlobal(self: *Sema, module: *Module, index: usize, initializer: Ast.Node.Index, declared_annotation: ?Module.Span) Error!void {
     const ast = &module.source.ast;
     var node = initializer;
+
     var expected = self.entries[self.entryIndex(module, @fromBackingInt(@intCast(index)))].type_id;
     var annotation = declared_annotation;
     while (ast.fullCall(node)) |call| {
@@ -579,9 +581,10 @@ fn checkScalarGlobal(self: *Sema, module: *Module, index: usize, initializer: As
                 const parsed = std.zig.parseNumberLiteral(ast.tokenSlice(ast.nodes.items(.main_token)[operand]));
                 switch (parsed) {
                     .int, .big_int => expected = try BodyChecker.defaultIntegerType(&self.ir),
-                    .float, .failure => {
+                    .float => expected = try self.ir.internType(.{ .float = Ir.native_float_bits }),
+                    .failure => {
                         try module.diagnostics.append(module.allocator, .{
-                            .tag = if (parsed == .float) .unsupported_literal else .invalid_literal,
+                            .tag = .invalid_literal,
                             .span = module.tokenSpan(ast.nodes.items(.main_token)[operand]),
                         });
                         self.entries[self.entryIndex(module, @fromBackingInt(@intCast(index)))].status = .failed;
@@ -618,6 +621,54 @@ fn checkLiteral(self: *Sema, module: *Module, index: usize, initializer: Ast.Nod
     }
 }
 
+test "float globals annotations ascriptions defaults and foreign signatures preserve exact types" {
+    var module = try Module.init(std.testing.allocator, "float-core.nov",
+        \\let Narrow = f32
+        \\let a: Narrow = -{0.0}
+        \\let b = @as(f32, 16777217)
+        \\let c = 1.5
+        \\let d: @TypeOf(c) = 2
+        \\let e: f64 = @as(f64, 0x1.8p1)
+        \\let Record = struct { value: f32 = -0.0, }
+        \\@[extern]
+        \\let imported: (f32) -> f64
+        \\@[export]
+        \\let exported: (x: f64) -> f32 = 1.0
+        \\let pending: f64 = 1.0 + 2.0
+    );
+    defer module.deinit();
+    var sema = try analyzeAnnotations(&module);
+    defer sema.deinit();
+    try std.testing.expect(!module.hasErrors());
+    const narrow = try sema.ir.internType(.{ .float = 32 });
+    const wide = try sema.ir.internType(.{ .float = 64 });
+    const native = try sema.ir.internType(.{ .float = Ir.native_float_bits });
+    const expected = [_]Ir.TypeId{ narrow, narrow, native, native, wide };
+    for ([_][]const u8{ "a", "b", "c", "d", "e" }, expected) |name, ty| {
+        const entry = sema.getEntry(module.lookup(name).?).?;
+        try std.testing.expectEqual(Status.constant_checked, entry.status);
+        try std.testing.expectEqual(ty, entry.type_id.?);
+        try std.testing.expect(sema.ir.getConstant(entry.constant.?).?.value == .float_bits);
+    }
+    const zero = sema.getEntry(module.lookup("a").?).?.constant.?;
+    try std.testing.expectEqual(@as(u64, 0x80000000), sema.ir.getConstant(zero).?.value.float_bits);
+    const record = sema.getEntry(module.lookup("Record").?).?.alias_type.?;
+    try std.testing.expectEqual(zero, sema.ir.getType(record).?.record.fields[0].default.?);
+    try std.testing.expectEqual(Status.external, sema.getEntry(module.lookup("imported").?).?.status);
+    try std.testing.expectEqual(Status.signature_only, sema.getEntry(module.lookup("exported").?).?.status);
+    try std.testing.expect(sema.getEntry(module.lookup("pending").?).?.constant == null);
+    try sema.ir.verify();
+}
+
+test "float globals defaults and diagnostics survive allocation failure" {
+    for ([_][]const u8{
+        "let x: f32 = 0b1_1000\nlet y = -0.0\nlet R = struct { value: f64 = 1.5, }",
+        "let x: f32 = 3.5e38",
+        "let x: f64 = 1e309",
+        "let x: f32 = @as(f64, 1.5)",
+    }) |source| try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+}
+
 test "export ABI integer widths are a finite allowlist for parameters and results" {
     for ([_]std.builtin.Signedness{ .signed, .unsigned }) |signedness| {
         for (0..130) |bits| {
@@ -626,6 +677,10 @@ test "export ABI integer widths are a finite allowlist for parameters and result
             try std.testing.expectEqual(allowed, foreignScalar(ty, false));
             try std.testing.expectEqual(allowed, foreignScalar(ty, true));
         }
+    }
+    for ([_]u16{ 16, 32, 64, 80, 128 }) |bits| {
+        try std.testing.expectEqual(bits == 32 or bits == 64, foreignScalar(.{ .float = bits }, false));
+        try std.testing.expectEqual(bits == 32 or bits == 64, foreignScalar(.{ .float = bits }, true));
     }
     try std.testing.expect(foreignScalar(.boolean, false));
     try std.testing.expect(foreignScalar(.boolean, true));
@@ -1013,10 +1068,10 @@ test "unconstrained float globals never acquire the default integer type" {
         defer module.deinit();
         var sema = try analyzeAnnotations(&module);
         defer sema.deinit();
-        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
-        try std.testing.expectEqual(Module.Diagnostic.Tag.unsupported_literal, module.diagnostics.items[0].tag);
-        try std.testing.expectEqual(Status.failed, sema.entries[0].status);
-        try std.testing.expect(sema.entries[0].type_id == null and sema.entries[0].constant == null);
+        try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+        try std.testing.expectEqual(Status.constant_checked, sema.entries[0].status);
+        try std.testing.expectEqual(Ir.native_float_bits, sema.ir.getType(sema.entries[0].type_id.?).?.float);
+        try std.testing.expect(sema.ir.getConstant(sema.entries[0].constant.?).?.value == .float_bits);
         try sema.ir.verify();
     }
 }
@@ -1207,7 +1262,7 @@ test "record 128 bit defaults retain literal bounds and arrays retain semantic w
 test "invalid annotations and unsupported literals never become checked constants" {
     for ([_][]const u8{
         "let x: Unknown = 1",
-        "let x: float = 1",
+        "let x: f16 = 1",
         "let f: (x: i32, x: i32) -> i32 = 1",
         "let x: i32 = 1e",
         "let x: i32 = 1.0",

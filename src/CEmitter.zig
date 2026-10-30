@@ -204,7 +204,7 @@ fn analyze(allocator: std.mem.Allocator, ir: *const Ir, origins: []?Origin, diag
         const id = pending[reachable.len];
         const origin = origins[@backingInt(id)].?;
         switch (ir.getType(id).?) {
-            .void, .boolean, .rune, .string, .enumeration => {},
+            .void, .boolean, .rune, .string, .enumeration, .float => {},
             .record => |record| for (record.fields) |field| {
                 reachable.mark(field.ty, .{ .function = origin.function, .span = field.span });
             },
@@ -239,6 +239,7 @@ fn write(allocator: std.mem.Allocator, ir: *const Ir, origins: []const ?Origin, 
         }
     }
     try writeRuntime(ir, w);
+    try writeFloatRuntime(allocator, ir, origins, w);
     try writeRuneRuntime(ir, w);
     if (usesManagedRuntime(ir)) {
         try w.writeAll("#define NOV_GC_PANIC nov_rt_panic\n");
@@ -720,7 +721,7 @@ fn writeRuneRuntime(ir: *const Ir, w: *std.Io.Writer) WriteError!void {
 
 fn writeStringConversions(ir: *const Ir, w: *std.Io.Writer) WriteError!void {
     for (ir.types.items, 0..) |ty, t| {
-        if (ty != .integer and ty != .rune) continue;
+        if (ty != .integer and ty != .rune and ty != .float) continue;
         var used = false;
         for (ir.functions.items) |function| {
             const body = function.body orelse continue;
@@ -732,6 +733,13 @@ fn writeStringConversions(ir: *const Ir, w: *std.Io.Writer) WriteError!void {
         if (ty == .rune) {
             try w.print("static nov_string nov_to_string_{d}(uint32_t value) {{\n", .{t});
             try w.writeAll("    unsigned char bytes[4];\n    uintptr_t len = nov_rt_encode_rune(value, bytes);\n    return nov_string_concat((nov_string){0}, (nov_string){NULL, bytes, len});\n}\n");
+            continue;
+        }
+        if (ty == .float) {
+            try w.print("static nov_string nov_to_string_{d}(", .{t});
+            try writeType(ir, w, @fromBackingInt(@intCast(t)));
+            try w.print(" value) {{\n    char bytes[32];\n    int len = nov_rt_float_format_{d}(bytes, value);\n", .{ty.float});
+            try w.writeAll("    return nov_string_concat((nov_string){0}, (nov_string){NULL, (const unsigned char *)bytes, (uintptr_t)len});\n}\n");
             continue;
         }
         try w.writeAll("#include <inttypes.h>\nstatic nov_string nov_to_string_");
@@ -749,7 +757,7 @@ fn usesStringConcat(ir: *const Ir) bool {
             if (instruction.op == .binary and ir.getType(instruction.ty).? == .string) return true;
             if (instruction.op == .to_string) {
                 const ty = ir.getType(body.instructions[@backingInt(instruction.op.to_string)].ty).?;
-                if (ty == .integer or ty == .rune or aggregateFormattingType(ty)) return true;
+                if (ty == .integer or ty == .rune or ty == .float or aggregateFormattingType(ty)) return true;
             }
         }
     }
@@ -774,7 +782,7 @@ fn writeRuntime(ir: *const Ir, w: *std.Io.Writer) WriteError!void {
     for (ir.functions.items) |function| {
         const body = function.body orelse continue;
         for (body.instructions) |instruction| {
-            if (instruction.op == .binary and (instruction.op.binary.op == .div or instruction.op.binary.op == .mod)) panic_used = true;
+            if (instruction.op == .binary and ir.getType(instruction.ty).? == .integer and (instruction.op.binary.op == .div or instruction.op.binary.op == .mod)) panic_used = true;
             if (instruction.op == .panic) source_panic = true;
             if (instruction.op == .assertion) assertion_used = true;
         }
@@ -800,6 +808,76 @@ fn writeRuntime(ir: *const Ir, w: *std.Io.Writer) WriteError!void {
             "static void nov_rt_check(int result) {\n" ++
             "    if (result < 0) nov_rt_panic(\"stdout write failed\");\n}\n",
     );
+}
+
+// Float constants cross the C parser as integers, preserving even NaN payloads.
+// Classification is bit-based so spelling is shared by every output path and
+// does not depend on libc's NaN sign/payload formatting or math.h macros.
+fn writeFloatRuntime(allocator: std.mem.Allocator, ir: *const Ir, origins: []const ?Origin, w: *std.Io.Writer) (WriteError || std.mem.Allocator.Error)!void {
+    var reachable = false;
+    for (origins, ir.types.items) |origin, ty| {
+        if (origin != null and ty == .float) reachable = true;
+    }
+    if (!reachable) return;
+    try w.writeAll(
+        \\#include <float.h>
+        \\#include <limits.h>
+        \\#if defined(__FAST_MATH__) || (defined(__FINITE_MATH_ONLY__) && __FINITE_MATH_ONLY__)
+        \\#error "Nov floats require IEEE semantics without fast-math"
+        \\#endif
+        \\_Static_assert(FLT_RADIX == 2 && FLT_EVAL_METHOD == 0, "Nov requires binary floats evaluated at their storage width");
+        \\_Static_assert(sizeof(float) * CHAR_BIT == 32 && FLT_MANT_DIG == 24 && FLT_MIN_EXP == -125 && FLT_MAX_EXP == 128, "Nov f32 requires IEEE binary32");
+        \\_Static_assert(sizeof(double) * CHAR_BIT == 64 && DBL_MANT_DIG == 53 && DBL_MIN_EXP == -1021 && DBL_MAX_EXP == 1024, "Nov f64 requires IEEE binary64");
+        \\_Static_assert(FLT_HAS_SUBNORM == 1 && DBL_HAS_SUBNORM == 1, "Nov floats require subnormals");
+        \\#if defined(__clang__)
+        \\#pragma clang fp contract(off)
+        \\#elif defined(__GNUC__)
+        \\#pragma GCC optimize ("fp-contract=off")
+        \\#else
+        \\#pragma STDC FP_CONTRACT OFF
+        \\#endif
+        \\
+    );
+    const formatted = try allocator.alloc(bool, ir.types.items.len);
+    defer allocator.free(formatted);
+    const converted = try allocator.alloc(bool, ir.types.items.len);
+    defer allocator.free(converted);
+    _ = markFormattingTypes(ir, formatted, converted);
+    for ([_]u16{ 32, 64 }) |bits| {
+        var constants = false;
+        var formatting = false;
+        for (ir.types.items, formatted) |ty, used| {
+            if (ty == .float and ty.float == bits and used) formatting = true;
+        }
+        for (ir.functions.items) |function| {
+            const body = function.body orelse continue;
+            for (body.instructions) |instruction| {
+                const ty = ir.getType(instruction.ty).?;
+                if (instruction.op == .constant and ty == .float and ty.float == bits) constants = true;
+                if (instruction.op == .to_string) {
+                    const source_ty = ir.getType(body.instructions[@backingInt(instruction.op.to_string)].ty).?;
+                    if (source_ty == .float and source_ty.float == bits) formatting = true;
+                }
+                if (instruction.op == .print) for (instruction.op.print.args) |arg| {
+                    const source_ty = ir.getType(body.instructions[@backingInt(arg)].ty).?;
+                    if (source_ty == .float and source_ty.float == bits) formatting = true;
+                };
+            }
+        }
+        if (!constants and !formatting) continue;
+        try w.writeAll("#include <string.h>\n");
+        const c_type = if (bits == 32) "float" else "double";
+        if (constants) try w.print("static {s} nov_rt_float_bits_{d}(uint{d}_t bits) {{ {s} value; memcpy(&value, &bits, sizeof value); return value; }}\n", .{ c_type, bits, bits, c_type });
+        if (formatting) {
+            try w.writeAll("#include <stdio.h>\n");
+            try w.print("static int nov_rt_float_format_{d}(char bytes[32], {s} value) {{\n    uint{d}_t bits; memcpy(&bits, &value, sizeof bits);\n", .{ bits, c_type, bits });
+            try w.print("    uint{d}_t magnitude = bits & UINT{d}_C({d});\n    const char *special = NULL;\n", .{ bits, bits, if (bits == 32) @as(u64, 0x7fffffff) else @as(u64, 0x7fffffffffffffff) });
+            const infinity: u64 = if (bits == 32) 0x7f800000 else 0x7ff0000000000000;
+            try w.print("    if (magnitude > UINT{d}_C({d})) special = \"nan\";\n    else if (magnitude == UINT{d}_C({d})) special = bits != magnitude ? \"-inf\" : \"inf\";\n    else if (!magnitude && bits) special = \"-0\";\n", .{ bits, infinity, bits, infinity });
+            try w.print("    int len = special ? snprintf(bytes, 32, \"%s\", special) : snprintf(bytes, 32, \"%.{d}g\", (double)value);\n", .{if (bits == 32) @as(u8, 9) else @as(u8, 17)});
+            try w.writeAll("    if (len < 0 || len >= 32) nov_rt_panic(\"float formatting failed\");\n    return len;\n}\n");
+        }
+    }
 }
 
 fn workingBits(ty: Ir.Type) u16 {
@@ -850,6 +928,7 @@ fn writeType(ir: *const Ir, w: *std.Io.Writer, id: Ir.TypeId) WriteError!void {
     switch (ir.types.items[@backingInt(id)]) {
         .void => try w.writeAll("void"),
         .boolean => try w.writeAll("bool"),
+        .float => |bits| try w.writeAll(if (bits == 32) "float" else "double"),
         .enumeration, .rune => try w.writeAll("uint32_t"),
         .integer => |integer| try w.print("{s}int{d}_t", .{ if (integer.signedness == .unsigned) "u" else "", integer.bits }),
         .function => try w.print("nov_fn_{d}", .{@backingInt(id)}),
@@ -921,6 +1000,7 @@ fn writeConstant(w: *std.Io.Writer, constant: Ir.Constant, ty: Ir.Type) WriteErr
         },
         .void => unreachable, // void values have no C object
         .boolean => |value| try w.writeAll(if (value) "true" else "false"),
+        .float_bits => |bits| try w.print("nov_rt_float_bits_{d}(UINT{d}_C({d}))", .{ ty.float, ty.float, bits }),
         .enum_tag, .rune => |value| try w.print("UINT32_C({d})", .{value}),
         .unsigned_integer => |value| try w.print("UINT{d}_C({d})", .{ ty.integer.bits, value }),
         .signed_integer => |value| {
@@ -1357,7 +1437,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
                     switch (ir.getType(source_ty).?) {
                         .string => try w.print("v{d}", .{@backingInt(value)}),
                         .boolean => try w.print("(v{d} ? (nov_string){{NULL, (const unsigned char *)\"true\", 4}} : (nov_string){{NULL, (const unsigned char *)\"false\", 5}})", .{@backingInt(value)}),
-                        .integer, .rune, .array, .record, .enumeration => try w.print("nov_to_string_{d}(v{d})", .{ @backingInt(source_ty), @backingInt(value) }),
+                        .integer, .float, .rune, .array, .record, .enumeration => try w.print("nov_to_string_{d}(v{d})", .{ @backingInt(source_ty), @backingInt(value) }),
                         else => unreachable,
                     }
                 },
@@ -1460,7 +1540,11 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
                     try writeType(ir, w, instruction.ty);
                     try w.print(")~v{d}", .{@backingInt(unary.operand)});
                 },
-                .negate => {
+                .negate => negate: {
+                    if (ty == .float) {
+                        try w.print("({s})(-v{d})", .{ if (ty.float == 32) "float" else "double", @backingInt(unary.operand) });
+                        break :negate;
+                    }
                     try w.writeByte('(');
                     try writeType(ir, w, instruction.ty);
                     try w.print(")(UINT{d}_C(0) - (uint{d}_t)v{d})", .{ workingBits(ty), workingBits(ty), @backingInt(unary.operand) });
@@ -1472,6 +1556,17 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
                 if (ir.getType(body.instructions[lhs].ty).? == .string) {
                     if (binary.op == .ne) try w.writeByte('!');
                     try w.print("nov_string_equal(v{d}, v{d})", .{ lhs, rhs });
+                    break :arithmetic;
+                }
+                if (ty == .float) {
+                    const operator = switch (binary.op) {
+                        .add => "+",
+                        .sub => "-",
+                        .mul => "*",
+                        .div => "/",
+                        else => unreachable,
+                    };
+                    try w.print("({s})(v{d} {s} v{d})", .{ if (ty.float == 32) "float" else "double", lhs, operator, rhs });
                     break :arithmetic;
                 }
                 switch (binary.op) {
@@ -1717,7 +1812,7 @@ const ArrayTransfers = struct {
                 const observes = switch (instruction.op) {
                     .array_len, .iteration_len => |base| base == value,
                     .array_index => |read| read.array == value and switch (self.ir.getType(instruction.ty).?) {
-                        .integer, .boolean, .rune, .enumeration, .string => true,
+                        .integer, .float, .boolean, .rune, .enumeration, .string => true,
                         // In particular, never let a projection carry mutable
                         // backing (or a closure environment) past the update.
                         else => false,
@@ -1821,6 +1916,397 @@ fn writeArrayValue(ir: *const Ir, w: *std.Io.Writer, body: Ir.Body, transfers: A
             try writeType(ir, w, element);
             try w.print(" *data = v{d}.data;\n        data[j] = nov_copy_{d}(data[j]);\n    }}\n", .{ i, @backingInt(element) });
         }
+    }
+}
+
+test "floats direct IR exact bits IEEE operations comparisons and separate C ABI O0 O3" {
+    var ir = Ir.init(test_gpa);
+    defer ir.deinit();
+    const span: Ir.Span = .{ .start = 0, .end = 0 };
+    const boolean = try ir.internType(.boolean);
+    var harness = std.Io.Writer.Allocating.init(test_gpa);
+    defer harness.deinit();
+    var checks = std.Io.Writer.Allocating.init(test_gpa);
+    defer checks.deinit();
+    try harness.writer.writeAll("#include <stdint.h>\n#include <string.h>\n#include <assert.h>\n#include <math.h>\n");
+    for ([_]u16{ 32, 64 }) |bits| {
+        const ty = try ir.internType(.{ .float = bits });
+        const c_type = if (bits == 32) "float" else "double";
+        const patterns: []const u64 = if (bits == 32)
+            &.{ 0, 0x80000000, 1, 0x007fffff, 0x00800000, 0x3f800001, 0x7f7fffff, 0x7f800000, 0xff800000, 0x7fc12345, 0xffc54321 }
+        else
+            &.{ 0, 0x8000000000000000, 1, 0x000fffffffffffff, 0x0010000000000000, 0x3ff0000000000001, 0x7fefffffffffffff, 0x7ff0000000000000, 0xfff0000000000000, 0x7ff8123456789abc, 0xfff8abcdef123456 };
+        const getter = try ir.internType(.{ .function = .{ .params = &.{}, .result = ty } });
+        for (patterns, 0..) |pattern, i| {
+            const name = try std.fmt.allocPrint(test_gpa, "float{d}constant{d}", .{ bits, i });
+            defer test_gpa.free(name);
+            const function = try ir.addFunction(name, getter, span);
+            try ir.setExportName(function, name);
+            const value = try ir.internConstant(.{ .ty = ty, .value = .{ .float_bits = pattern } });
+            try ir.setFunctionBody(function, &.{.{ .ty = ty, .span = span, .op = .{ .constant = value } }}, @fromBackingInt(0));
+            try harness.writer.print("extern {s} {s}(void);\n", .{ c_type, name });
+            try checks.writer.print("{{ {s} value = {s}(); uint{d}_t bits; memcpy(&bits, &value, sizeof bits); assert(bits == UINT{d}_C({d})); }}\n", .{ c_type, name, bits, bits, pattern });
+        }
+        const unary = try ir.internType(.{ .function = .{ .params = &.{ty}, .result = ty } });
+        const binary = try ir.internType(.{ .function = .{ .params = &.{ ty, ty }, .result = ty } });
+        const comparison = try ir.internType(.{ .function = .{ .params = &.{ ty, ty }, .result = boolean } });
+        const parameter: Ir.Instruction = .{ .ty = ty, .span = span, .op = .{ .parameter = 0 } };
+        const other: Ir.Instruction = .{ .ty = ty, .span = span, .op = .{ .parameter = 1 } };
+        for ([_]Ir.BinaryOp{ .add, .sub, .mul, .div, .eq, .ne, .lt, .le, .gt, .ge }) |op| {
+            const compare = switch (op) {
+                .eq, .ne, .lt, .le, .gt, .ge => true,
+                else => false,
+            };
+            const name = try std.fmt.allocPrint(test_gpa, "float{d}{s}", .{ bits, @tagName(op) });
+            defer test_gpa.free(name);
+            const function = try ir.addFunction(name, if (compare) comparison else binary, span);
+            try ir.setExportName(function, name);
+            try ir.setFunctionBody(function, &.{ parameter, other, .{ .ty = if (compare) boolean else ty, .span = span, .op = .{ .binary = .{ .op = op, .lhs = @fromBackingInt(0), .rhs = @fromBackingInt(1) } } } }, @fromBackingInt(2));
+            try harness.writer.print("extern {s} {s}({s}, {s});\n", .{ if (compare) "_Bool" else c_type, name, c_type, c_type });
+            if (compare) {
+                try checks.writer.print("assert({s}(({s})NAN, 1) == {d});\n", .{ name, c_type, @intFromBool(op == .ne) });
+                try checks.writer.print("assert({s}(0, -0.0) == {d});\n", .{ name, @intFromBool(op == .eq or op == .le or op == .ge) });
+            }
+        }
+        const negate_name = try std.fmt.allocPrint(test_gpa, "float{d}negate", .{bits});
+        defer test_gpa.free(negate_name);
+        const negate = try ir.addFunction(negate_name, unary, span);
+        try ir.setExportName(negate, negate_name);
+        try ir.setFunctionBody(negate, &.{ parameter, .{ .ty = ty, .span = span, .op = .{ .unary = .{ .op = .negate, .operand = @fromBackingInt(0) } } } }, @fromBackingInt(1));
+        try harness.writer.print("extern {s} {s}({s});\n", .{ c_type, negate_name, c_type });
+        const foreign_name = try std.fmt.allocPrint(test_gpa, "provider{d}", .{bits});
+        defer test_gpa.free(foreign_name);
+        const foreign = try ir.addFunction(foreign_name, unary, span);
+        try ir.setExternName(foreign, foreign_name);
+        try harness.writer.print("{s} {s}({s} value) {{ return value; }}\n", .{ c_type, foreign_name, c_type });
+        const forward_name = try std.fmt.allocPrint(test_gpa, "float{d}forward", .{bits});
+        defer test_gpa.free(forward_name);
+        const forward = try ir.addFunction(forward_name, unary, span);
+        try ir.setExportName(forward, forward_name);
+        try ir.setFunctionBody(forward, &.{ parameter, .{ .ty = unary, .span = span, .op = .{ .function_ref = foreign } }, .{ .ty = ty, .span = span, .op = .{ .call = .{ .callee = @fromBackingInt(1), .args = &.{@fromBackingInt(0)} } } } }, @fromBackingInt(2));
+        try harness.writer.print("extern {s} {s}({s});\n", .{ c_type, forward_name, c_type });
+        try checks.writer.print("assert(signbit({s}(0))); assert(!signbit({s}(-0.0)));\nassert(signbit({s}(-0.0)));\n", .{ negate_name, negate_name, forward_name });
+        try checks.writer.print("assert(isnan(float{d}div(0, 0))); assert(isinf(float{d}div(1, 0))); assert(float{d}div(-1, 0) < 0);\n", .{ bits, bits, bits });
+        try checks.writer.print("assert(float{d}add(1, 2) == 3); assert(float{d}sub(1, 2) == -1); assert(float{d}mul(2, 3) == 6);\n", .{ bits, bits, bits });
+        const large = if (bits == 32) "0x1p24f" else "0x1p53";
+        try checks.writer.print("assert(float{d}sub(float{d}add({s}, 1), {s}) == 0);\n", .{ bits, bits, large, large });
+    }
+    try harness.writer.writeAll("int main(void) {\n");
+    try harness.writer.writeAll(checks.written());
+    try harness.writer.writeAll("return 0; }\n");
+    const c = try emit(test_gpa, &ir, null);
+    defer test_gpa.free(c);
+    try std.testing.expect(std.mem.indexOf(u8, c, "nov_rt_panic") == null);
+    try std.testing.expect(std.mem.indexOf(u8, c, "nov_rt_div_") == null);
+    try std.testing.expect(std.mem.indexOf(u8, c, "nov_gc_") == null);
+    try std.testing.expect(std.mem.indexOf(u8, c, "nov_rt_float_format_") == null);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, harness.written(), 0, "", "", mode);
+}
+
+fn emitFloatFormatting(allocator: std.mem.Allocator) ![]u8 {
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    const span: Ir.Span = .{ .start = 0, .end = 0 };
+    const unit = try ir.internType(.void);
+    const string = try ir.internType(.string);
+    const signature = try ir.internType(.{ .function = .{ .params = &.{}, .result = unit } });
+    for ([_]u16{ 32, 64 }) |bits| {
+        const ty = try ir.internType(.{ .float = bits });
+        const array = try ir.internType(.{ .array = ty });
+        const record = try ir.internType(.{ .record = .{ .identity = bits, .fields = &.{} } });
+        try ir.setRecordFields(record, &.{.{ .name = "value", .ty = ty, .span = span }});
+        const tagged = try ir.internType(.{ .record = .{ .identity = bits + 1, .tagged = true, .fields = &.{} } });
+        try ir.setRecordFields(tagged, &.{.{ .name = "some", .ty = record, .span = span }});
+        try ir.setTypeFormatting(record, "R", null);
+        try ir.setTypeFormatting(tagged, "U", null);
+        const patterns: []const u64 = if (bits == 32) &.{ 0x3dcccccd, 0x80000000, 1, 0x7f800000, 0xff800000, 0xffc12345 } else &.{ 0x3fb999999999999a, 0x8000000000000000, 1, 0x7ff0000000000000, 0xfff0000000000000, 0xfff8123456789abc };
+        var instructions: std.ArrayList(Ir.Instruction) = .empty;
+        defer instructions.deinit(allocator);
+        var values: [6]Ir.ValueId = undefined;
+        for (patterns, 0..) |pattern, i| {
+            const constant = try ir.internConstant(.{ .ty = ty, .value = .{ .float_bits = pattern } });
+            values[i] = @fromBackingInt(@intCast(instructions.items.len));
+            try instructions.append(allocator, .{ .ty = ty, .span = span, .op = .{ .constant = constant } });
+        }
+        try instructions.append(allocator, .{ .ty = unit, .span = span, .op = .{ .print = .{ .args = &values, .newline = true } } });
+        const array_value: Ir.ValueId = @fromBackingInt(@intCast(instructions.items.len));
+        try instructions.append(allocator, .{ .ty = array, .span = span, .op = .{ .array_literal = &values } });
+        try instructions.append(allocator, .{ .ty = unit, .span = span, .op = .{ .print = .{ .args = &.{array_value}, .newline = true } } });
+        const record_value: Ir.ValueId = @fromBackingInt(@intCast(instructions.items.len));
+        try instructions.append(allocator, .{ .ty = record, .span = span, .op = .{ .record_init = &.{values[0]} } });
+        const union_value: Ir.ValueId = @fromBackingInt(@intCast(instructions.items.len));
+        try instructions.append(allocator, .{ .ty = tagged, .span = span, .op = .{ .union_init = .{ .index = 0, .payload = record_value } } });
+        try instructions.append(allocator, .{ .ty = unit, .span = span, .op = .{ .print = .{ .args = &.{union_value}, .newline = true } } });
+        var strings: [6]Ir.ValueId = undefined;
+        for (values, 0..) |value, i| {
+            strings[i] = @fromBackingInt(@intCast(instructions.items.len));
+            try instructions.append(allocator, .{ .ty = string, .span = span, .op = .{ .to_string = value } });
+        }
+        try instructions.append(allocator, .{ .ty = unit, .span = span, .op = .{ .print = .{ .args = &strings, .newline = true } } });
+        const converted: Ir.ValueId = @fromBackingInt(@intCast(instructions.items.len));
+        try instructions.append(allocator, .{ .ty = string, .span = span, .op = .{ .to_string = array_value } });
+        try instructions.append(allocator, .{ .ty = unit, .span = span, .op = .{ .print = .{ .args = &.{converted}, .newline = true } } });
+        const function = try ir.addFunction(if (bits == 32) "show32" else "show64", signature, span);
+        try ir.setFunctionBody(function, instructions.items, @fromBackingInt(@intCast(instructions.items.len - 1)));
+        const convert_ty = try ir.internType(.{ .function = .{ .params = &.{ty}, .result = string } });
+        const convert = try ir.addFunction(if (bits == 32) "convert32" else "convert64", convert_ty, span);
+        try ir.setFunctionBody(convert, &.{ .{ .ty = ty, .span = span, .op = .{ .parameter = 0 } }, .{ .ty = string, .span = span, .op = .{ .to_string = @fromBackingInt(0) } } }, @fromBackingInt(1));
+    }
+    return emit(allocator, &ir, null);
+}
+
+fn testFloatFormattingAllocations(allocator: std.mem.Allocator) !void {
+    const c = try emitFloatFormatting(allocator);
+    defer allocator.free(c);
+}
+
+test "floats direct IR formatting shared print interpolation aggregates source free forced GC O0 O3 OOM" {
+    // Every temporary input and the IR itself have been freed before C execution.
+    const library = try emitFloatFormatting(test_gpa);
+    defer test_gpa.free(library);
+    try std.testing.expect(std.mem.indexOf(u8, library, "_Alignof(float), 0, NULL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, library, "_Alignof(double), 0, NULL") != null);
+    const output32 = "0.100000001 -0 1.40129846e-45 inf -inf nan\n";
+    const array32 = "[0.100000001, -0, 1.40129846e-45, inf, -inf, nan]\n";
+    const output64 = "0.10000000000000001 -0 4.9406564584124654e-324 inf -inf nan\n";
+    const array64 = "[0.10000000000000001, -0, 4.9406564584124654e-324, inf, -inf, nan]\n";
+    const expected = output32 ++ array32 ++ "U.some[ value: 0.100000001 ]\n" ++ output32 ++ array32 ++ output64 ++ array64 ++ "U.some[ value: 0.10000000000000001 ]\n" ++ output64 ++ array64;
+    const c = try std.mem.concat(test_gpa, u8, &.{ library, "\nint main(void) { nov_rt_heap.collect_every_allocation = 1; nov_show32(); nov_show64(); if (nov_rt_heap.frames) return 70; nov_gc_collect(&nov_rt_heap); if (nov_rt_heap.live_objects) return 71; nov_gc_shutdown(&nov_rt_heap); return 0; }\n" });
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty;", 0, expected, "", mode);
+    const oom = try std.mem.concat(test_gpa, u8, &.{ "#include <stdlib.h>\nstatic void *test_malloc(size_t n) { (void)n; return NULL; }\n#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n", library, "\nint main(void) { nov_rt_heap.collect_every_allocation = 1; (void)nov_convert32(1); return 0; }\n" });
+    defer test_gpa.free(oom);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(oom, "typedef int nonempty;", 1, "", "panic: GC allocation failed\n", mode);
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testFloatFormattingAllocations, .{});
+}
+
+const float_program =
+    \\let divide32:(x:f32,y:f32)->f32=x/y
+    \\let divide64:(x:f64,y:f64)->f64=x/y
+    \\let R=struct{x:f32,y:f64,}
+    \\let U=union{none,some:R,}
+    \\let main:()={
+    \\    let zero:f32=0
+    \\    let nan=divide32(zero,zero)
+    \\    let inf=divide32(1,zero)
+    \\    let minus:f32=-0.0
+    \\    @println(nan,inf,-inf,minus,divide64(0,0),divide64(1,0),divide64(-1,0),@as(f64,-0.0))
+    \\    @println(nan==nan,nan!=nan,nan<zero,nan<=zero,nan>zero,nan>=zero,minus==zero)
+    \\    let mut a:[]f32=[nan,minus,0.1]
+    \\    @println(nan in a,zero in a,inf in a)
+    \\    a[1]+=1.5
+    \\    a[2]*=2
+    \\    a+=[inf]
+    \\    let mut r=R[.x=0.25,.y=0.5]
+    \\    loop i in 0..2 {loop j in 0..2 {r.x+=0.25
+    \\        r.y*=2.0}}
+    \\    @println(a,r,U.some[r])
+    \\    @println("{nan} {inf} {-inf} {minus} {a} {r}")
+    \\    let mut sum:f64=0
+    \\    loop x in a {if x==x {sum+=0.5}}
+    \\    @println(sum,if true {@as(f32,0.1)} else {@as(f32,0.2)},loop {break @as(f64,0.1)})
+    \\    let NAN:f32=0.1
+    \\    let INFINITY:f64=0.1
+    \\    let EOF:f32=2
+    \\    @println(NAN,INFINITY,EOF)
+    \\}
+;
+
+fn emitFloatSourceFree(allocator: std.mem.Allocator) ![]u8 {
+    var lowered = blk: {
+        const source = try allocator.dupe(u8, float_program);
+        defer allocator.free(source);
+        var module = try Module.init(allocator, "floats.nov", source);
+        defer module.deinit();
+        var result = try Lowering.lower(&module);
+        errdefer result.deinit();
+        if (module.hasErrors()) for (module.diagnostics.items) |diagnostic| {
+            std.debug.print("{s} at {d}: {s}\n", .{ @tagName(diagnostic.tag), diagnostic.span.start, module.sourceSlice(diagnostic.span) orelse "<invalid>" });
+        };
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expect(result.lowering_complete);
+        break :blk result;
+    };
+    defer lowered.deinit();
+    return emit(allocator, &lowered.ir, null);
+}
+
+fn testFloatSourceFreeAllocations(allocator: std.mem.Allocator) !void {
+    const c = try emitFloatSourceFree(allocator);
+    defer allocator.free(c);
+}
+
+test "floats source literals mutation loops membership nesting interpolation macros source free forced GC O0 O3" {
+    const library = try emitFloatSourceFree(test_gpa);
+    defer test_gpa.free(library);
+    const c = try collectingTestProgram(library);
+    defer test_gpa.free(c);
+    const expected = "nan inf -inf -0 nan inf -inf -0\n" ++
+        "false true false false false false true\nfalse true false\n" ++
+        "[nan, 1.5, 0.200000003, inf] R[ x: 1.25, y: 8 ] U.some[ x: 1.25, y: 8 ]\n" ++
+        "nan inf -inf -0 [nan, 1.5, 0.200000003, inf] R[ x: 1.25, y: 8 ]\n" ++
+        "1.5 0.100000001 0.10000000000000001\n0.100000001 0.10000000000000001 2\n";
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty;", 0, expected, "", mode);
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testFloatSourceFreeAllocations, .{});
+}
+
+test "floats source literal rounding exact bits native type and C extern export signatures O0 O3" {
+    const library = try emitSource(
+        \\@[extern("provider32")]
+        \\let provider32:(x:f32)->f32
+        \\@[extern("provider64")]
+        \\let provider64:(x:f64)->f64
+        \\@[export("round32")]
+        \\let round32:()->f32=provider32(16777217)
+        \\@[export("round64")]
+        \\let round64:()->f64=provider64(9007199254740993)
+        \\@[export("tie32")]
+        \\let tie32:()->f32=1.000000059604644775390625
+        \\@[export("above32")]
+        \\let above32:()->f32=1.000000059604644775390626
+        \\@[export("tie64")]
+        \\let tie64:()->f64=1.00000000000000011102230246251565404236316680908203125
+        \\@[export("sub32")]
+        \\let sub32:()->f32=1.401298464324817070923729583289916131280e-45
+        \\@[export("sub64")]
+        \\let sub64:()->f64=4.9406564584124654e-324
+        \\@[export("negative32")]
+        \\let negative32:()->f32=-0.0
+        \\@[export("negative64")]
+        \\let negative64:()->f64=-0.0
+        \\@[export("contract32")]
+        \\let contract32:(x:f32,y:f32)->f32=x*y-1
+        \\@[export("contract64")]
+        \\let contract64:(x:f64,y:f64)->f64=x*y-1
+        \\@[export("native")]
+        \\let native:(x:float)->float=x
+    , null);
+    defer test_gpa.free(library);
+    const harness =
+        \\#include <assert.h>
+        \\#include <stdint.h>
+        \\#include <string.h>
+        \\float provider32(float x) { return x; }
+        \\double provider64(double x) { return x; }
+        \\extern float round32(void), tie32(void), above32(void), sub32(void), negative32(void);
+        \\extern double round64(void), tie64(void), sub64(void), negative64(void);
+        \\extern float contract32(float, float);
+        \\extern double contract64(double, double);
+        \\static uint32_t bits32(float x) { uint32_t b; memcpy(&b, &x, sizeof b); return b; }
+        \\static uint64_t bits64(double x) { uint64_t b; memcpy(&b, &x, sizeof b); return b; }
+        \\int main(void) {
+        \\    assert(contract32(0x1.000002p0f, 0x1.fffffcp-1f) == 0);
+        \\    assert(contract64(0x1.0000000000001p0, 0x1.ffffffffffffep-1) == 0);
+        \\    assert(bits32(round32()) == UINT32_C(0x4b800000));
+        \\    assert(bits64(round64()) == UINT64_C(0x4340000000000000));
+        \\    assert(bits32(tie32()) == UINT32_C(0x3f800000));
+        \\    assert(bits32(above32()) == UINT32_C(0x3f800001));
+        \\    assert(bits64(tie64()) == UINT64_C(0x3ff0000000000000));
+        \\    assert(bits32(sub32()) == 1); assert(bits64(sub64()) == 1);
+        \\    assert(bits32(negative32()) == UINT32_C(0x80000000));
+        \\    assert(bits64(negative64()) == UINT64_C(0x8000000000000000));
+        \\    return 0;
+        \\}
+    ;
+    const native_signature = if (Ir.native_float_bits == 32) "float native(float p0)" else "double native(double p0)";
+    try std.testing.expect(std.mem.indexOf(u8, library, native_signature) != null);
+    try std.testing.expect(std.mem.indexOf(u8, library, "nov_rt_panic") == null);
+    try std.testing.expect(std.mem.indexOf(u8, library, "nov_rt_div_") == null);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(library, harness, 0, "", "", mode);
+}
+
+test "floats scalar print demand only and transitive metadata do not create GC roots O0 O3" {
+    const c = try emitSource(
+        \\let R=struct{x:f32,y:f64,}
+        \\let U=union{none,some:R,}
+        \\let ignore:(callback:([]U)->f64)={}
+        \\let show:(x:f32)=@println(x)
+    , null);
+    defer test_gpa.free(c);
+    try std.testing.expect(std.mem.indexOf(u8, c, "nov_rt_float_format_32") != null);
+    try std.testing.expect(std.mem.indexOf(u8, c, "nov_rt_float_format_64") == null);
+    try std.testing.expect(std.mem.indexOf(u8, c, "nov_rt_float_bits_") == null);
+    try std.testing.expect(std.mem.indexOf(u8, c, "nov_gc_") == null);
+    try std.testing.expect(std.mem.indexOf(u8, c, "nov_to_string_") == null);
+    try std.testing.expect(std.mem.indexOf(u8, c, "float f0;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, c, "double f1;") != null);
+    const harness = "void nov_show(float); int main(void) { nov_show(-0.0f); nov_show(0.1f); return 0; }\n";
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, harness, 0, "-0\n0.100000001\n", "", mode);
+}
+
+test "floats foreign signatures reject float header macros before C emission" {
+    var ir = Ir.init(test_gpa);
+    defer ir.deinit();
+    const ty = try ir.internType(.{ .float = 32 });
+    const signature = try ir.internType(.{ .function = .{ .params = &.{ty}, .result = ty } });
+    const function = try ir.addFunction("identity", signature, .{ .start = 0, .end = 0 });
+    for ([_][]const u8{ "FLT_RADIX", "FLT_MAX", "DBL_MANT_DIG", "LDBL_MAX", "DECIMAL_DIG", "FLT_DECIMAL_DIG", "DBL_DECIMAL_DIG", "LDBL_DECIMAL_DIG" }) |name| {
+        try std.testing.expectError(error.InvalidExternName, ir.setExternName(function, name));
+        try std.testing.expectError(error.InvalidExportName, ir.setExportName(function, name));
+    }
+}
+
+fn testFloatContraction(compiler: []const []const u8) !void {
+    var probe_argv: std.ArrayList([]const u8) = .empty;
+    defer probe_argv.deinit(test_gpa);
+    try probe_argv.appendSlice(test_gpa, compiler);
+    try probe_argv.append(test_gpa, "--version");
+    const probe = std.process.run(test_gpa, std.testing.io, .{ .argv = probe_argv.items, .timeout = .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } } }) catch |err| switch (err) {
+        error.FileNotFound => return error.SkipZigTest,
+        else => return err,
+    };
+    defer test_gpa.free(probe.stdout);
+    defer test_gpa.free(probe.stderr);
+    try expectSuccess(probe, "C compiler discovery");
+    const c = try emitSource(
+        \\@[export("contract32")]
+        \\let contract32:(x:f32,y:f32)->f32=x*y-1
+        \\@[export("contract64")]
+        \\let contract64:(x:f64,y:f64)->f64=x*y-1
+        \\let show:(x:f32,y:f64)=@println(x,y)
+    , null);
+    defer test_gpa.free(c);
+    const harness =
+        \\#include <assert.h>
+        \\extern float contract32(float, float);
+        \\extern double contract64(double, double);
+        \\extern void nov_show(float, double);
+        \\int main(void) {
+        \\    assert(contract32(0x1.000002p0f, 0x1.fffffcp-1f) == 0);
+        \\    assert(contract64(0x1.0000000000001p0, 0x1.ffffffffffffep-1) == 0);
+        \\    nov_show(-0.0f, 0.1);
+        \\    return 0;
+        \\}
+    ;
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| {
+        try compileAndRunCompiler(c, harness, 0, "-0 0.10000000000000001\n", "", mode, compiler, &.{});
+        if ((builtin.cpu.arch == .x86_64 or builtin.cpu.arch == .x86) and std.Target.x86.featureSetHas(builtin.cpu.features, .fma)) {
+            // Enable hardware fusion without overriding source pragmas:
+            // emitted library code must still round each operation.
+            try compileAndRunCompiler(c, harness, 0, "-0 0.10000000000000001\n", "", mode, compiler, &.{"-mfma"});
+        }
+    }
+}
+
+test "floats GCC strict library contraction and printing O0 O3 with FMA when available" {
+    try testFloatContraction(&.{"gcc"});
+}
+
+test "floats clang strict library contraction and printing O0 O3 with FMA when available" {
+    const zig_exe = std.testing.environ.getAlloc(test_gpa, "NOV_TEST_ZIG") catch null;
+    defer if (zig_exe) |path| test_gpa.free(path);
+    try testFloatContraction(if (zig_exe) |path| &.{ path, "cc" } else &.{"clang"});
+}
+
+test "floats foreign signatures preserve stdio macro collision rejection" {
+    var ir = Ir.init(test_gpa);
+    defer ir.deinit();
+    const ty = try ir.internType(.{ .float = 32 });
+    const signature = try ir.internType(.{ .function = .{ .params = &.{ty}, .result = ty } });
+    const function = try ir.addFunction("identity", signature, .{ .start = 0, .end = 0 });
+    for ([_][]const u8{ "stdin", "stdout", "stderr", "EOF", "FILE", "BUFSIZ", "FOPEN_MAX" }) |name| {
+        try std.testing.expectError(error.InvalidExternName, ir.setExternName(function, name));
+        try std.testing.expectError(error.InvalidExportName, ir.setExportName(function, name));
     }
 }
 
@@ -2294,6 +2780,10 @@ fn writeAggregateFormatting(allocator: std.mem.Allocator, ir: *const Ir, counts:
                 try w.print("    char bytes[32];\n    int len = snprintf(bytes, sizeof bytes, \"%\" PRI{s}MAX, ({s}intmax_t)value);\n", .{ if (integer.signedness == .signed) "d" else "u", if (integer.signedness == .signed) "" else "u" });
                 try w.writeAll("    if (len < 0 || (size_t)len >= sizeof bytes) nov_rt_panic(\"integer formatting failed\");\n    nov_format_bytes(sink, (const unsigned char *)bytes, (uintptr_t)len);\n");
             },
+            .float => |bits| {
+                try w.print("    char bytes[32];\n    int len = nov_rt_float_format_{d}(bytes, value);\n", .{bits});
+                try w.writeAll("    nov_format_bytes(sink, (const unsigned char *)bytes, (uintptr_t)len);\n");
+            },
             .rune => try w.writeAll(
                 \\    unsigned char bytes[4];
                 \\    uintptr_t len;
@@ -2379,6 +2869,7 @@ fn writePrint(ir: *const Ir, w: *std.Io.Writer, body: Ir.Body, print: anytype) W
         const ty = ir.types.items[@backingInt(body.instructions[@backingInt(arg)].ty)];
         switch (ty) {
             .array, .record, .enumeration => try w.print("    {{ nov_format_sink sink = {{0}}; sink.streaming = true; nov_format_{d}(&sink, v{d}, true); }}\n", .{ @backingInt(body.instructions[@backingInt(arg)].ty), @backingInt(arg) }),
+            .float => |bits| try w.print("    {{ char bytes[32]; int len = nov_rt_float_format_{d}(bytes, v{d}); if (fwrite(bytes, 1, (size_t)len, stdout) != (size_t)len) nov_rt_panic(\"stdout write failed\"); }}\n", .{ bits, @backingInt(arg) }),
             .rune => try w.print("    nov_rt_print_rune(v{d});\n", .{@backingInt(arg)}),
             .string => try w.print("    if (v{d}.len && fwrite(v{d}.data, 1, (size_t)v{d}.len, stdout) != (size_t)v{d}.len) nov_rt_panic(\"stdout write failed\");\n", .{ @backingInt(arg), @backingInt(arg), @backingInt(arg), @backingInt(arg) }),
             .boolean => try w.print("    nov_rt_check(fputs(v{d} ? \"true\" : \"false\", stdout));\n", .{@backingInt(arg)}),
@@ -10257,24 +10748,25 @@ fn compileAndRunExpected(c_source: []const u8, harness: []const u8, exit_code: u
 }
 
 fn compileAndRunMode(c_source: []const u8, harness: []const u8, exit_code: u8, stdout: []const u8, stderr: []const u8, mode: []const u8) !void {
+    // `zig build test` provides the pinned toolchain's `zig cc`; otherwise use `cc`.
+    const zig_exe = std.testing.environ.getAlloc(test_gpa, "NOV_TEST_ZIG") catch null;
+    defer if (zig_exe) |path| test_gpa.free(path);
+    return compileAndRunCompiler(c_source, harness, exit_code, stdout, stderr, mode, if (zig_exe) |path| &.{ path, "cc" } else &.{"cc"}, &.{});
+}
+
+fn compileAndRunCompiler(c_source: []const u8, harness: []const u8, exit_code: u8, stdout: []const u8, stderr: []const u8, mode: []const u8, compiler: []const []const u8, extra_flags: []const []const u8) !void {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "generated.c", .data = c_source });
     try tmp.dir.writeFile(io, .{ .sub_path = "harness.c", .data = harness });
 
-    // `zig build test` provides the pinned toolchain's `zig cc`; otherwise use `cc`.
-    const zig_exe = std.testing.environ.getAlloc(test_gpa, "NOV_TEST_ZIG") catch null;
-    defer if (zig_exe) |path| test_gpa.free(path);
     const program = "program" ++ (if (builtin.os.tag == .windows) ".exe" else "");
     const flags = [_][]const u8{ "-std=c11", mode, "-fsanitize=undefined", "-fno-sanitize-recover=all", "-Wall", "-Wextra", "-Wpedantic", "-Werror", "generated.c", "harness.c", "-o", program };
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(test_gpa);
-    if (zig_exe) |path| {
-        try argv.appendSlice(test_gpa, &.{ path, "cc" });
-    } else {
-        try argv.append(test_gpa, "cc");
-    }
+    try argv.appendSlice(test_gpa, compiler);
+    try argv.appendSlice(test_gpa, extra_flags);
     try argv.appendSlice(test_gpa, &flags);
 
     const compiled = try std.process.run(test_gpa, io, .{ .argv = argv.items, .cwd = .{ .dir = tmp.dir }, .timeout = .{ .duration = .{ .raw = .fromSeconds(60), .clock = .awake } } });

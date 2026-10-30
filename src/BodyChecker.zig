@@ -52,6 +52,10 @@ pub fn defaultIntegerType(ir: *Ir) Error!Ir.TypeId {
     return ir.internType(.{ .integer = .{ .signedness = .signed, .bits = Ir.native_pointer_bits } });
 }
 
+pub fn defaultFloatType(ir: *Ir) Error!Ir.TypeId {
+    return ir.internType(.{ .float = Ir.native_float_bits });
+}
+
 /// Checks one function against the complete annotation table. Does not evaluate
 /// operations, choose overflow behavior, or claim other declarations are checked.
 /// Requires the complete, valid annotation table produced by Sema/TypeResolver.
@@ -229,6 +233,8 @@ const Context = struct {
     specialization_depth: usize = 0,
     probing: bool = false,
     defaulting: bool = false,
+    float_defaults_only: bool = false,
+    default_probe_active: bool = false,
     return_type: Known = undefined,
     // Termination is independent of the contextual value type. A terminal
     // expression has no merge value, and enclosing expressions alias its exit.
@@ -1609,10 +1615,12 @@ const Context = struct {
     fn genericProbe(self: *Context, node: Ast.Node.Index, call: Ast.full.Call, ref: GenericFunctions.Ref, receiver: ?GenericFunctions.Argument, depth: usize) Error!?Ir.TypeId {
         const args = try self.genericArguments(call, receiver, self.defaulting, depth);
         defer self.module.allocator.free(args);
-        return if (self.defaulting)
-            GenericFunctions.probeDefaultResult(self.module, self.ir, self.inferenceReference(ref), args, self.irSpan(node))
+        const result = (if (self.defaulting)
+            try GenericFunctions.probeDefaultResult(self.module, self.ir, self.inferenceReference(ref), args, self.irSpan(node))
         else
-            GenericFunctions.probeResult(self.module, self.ir, self.inferenceReference(ref), args, self.irSpan(node));
+            try GenericFunctions.probeResult(self.module, self.ir, self.inferenceReference(ref), args, self.irSpan(node))) orelse return null;
+        if (self.defaulting and self.float_defaults_only and !self.hasFloatDefault(result, 0)) return null;
+        return result;
     }
 
     const GenericSelection = struct { id: Module.DeclId, ty: Ir.TypeId };
@@ -1884,7 +1892,7 @@ const Context = struct {
         try visited.put(self.module.allocator, ty, null);
         const nominal = self.ir.getType(ty).?;
         switch (nominal) {
-            .boolean, .integer, .rune, .string => return true,
+            .boolean, .integer, .float, .rune, .string => return true,
             .array => |element| return self.registerPrintable(node, element, visited, false),
             .record, .enumeration => {},
             else => {
@@ -1984,6 +1992,7 @@ const Context = struct {
             .rune => "rune",
             .string => "string",
             .integer => |integer| try std.fmt.allocPrint(a, "{s}{d}", .{ if (integer.signedness == .signed) "i" else "u", integer.bits }),
+            .float => |bits| try std.fmt.allocPrint(a, "f{d}", .{bits}),
             .array => |element| try std.fmt.allocPrint(a, "[]{s}", .{try self.printedTypeName(element, remaining - 1)}),
             .range => |element| try std.fmt.allocPrint(a, "range({s})", .{try self.printedTypeName(element, remaining - 1)}),
             .function => |function| blk: {
@@ -2185,10 +2194,73 @@ const Context = struct {
     }
 
     // Retry only after the entire sibling search found no concrete type.
+    fn probeSiblings(self: *Context, nodes: []const Ast.Node.Index, depth: usize) Error!?Known {
+        if (nodes.len == 0 or depth >= max_recursive_depth) return null;
+        var arena = std.heap.ArenaAllocator.init(self.module.allocator);
+        defer arena.deinit();
+        var captures: std.ArrayList(GenericFunctions.Capture) = .empty;
+        try self.appendTypeCaptures(&captures, arena.allocator());
+        const scope: GenericFunctions.LocalTemplate = .{
+            .proto = nodes[0],
+            .body = 0,
+            .outer_bindings = self.function_bindings,
+            .captures = captures.items,
+            .container = self.container,
+            .concrete_type = self.concrete_type,
+        };
+        const result = (try GenericFunctions.probeExpressions(self.module, self.ir, self.inferenceReference(.{ .module = self.module, .local = &scope }), nodes, self.return_type.ty, self.defaulting)) orelse return null;
+        if (self.defaulting and self.float_defaults_only and !self.hasFloatDefault(result, 0)) return null;
+        return .{ .ty = result };
+    }
+
+    fn hasFloatDefault(self: *Context, ty: Ir.TypeId, depth: usize) bool {
+        if (depth >= max_recursive_depth) return false;
+        return switch (self.ir.getType(ty).?) {
+            .float => true,
+            .array => |element| self.hasFloatDefault(element, depth + 1),
+            .record => |record| blk: {
+                for (record.type_args) |arg| if (self.hasFloatDefault(arg, depth + 1)) break :blk true;
+                break :blk false;
+            },
+            .function => |function| blk: {
+                for (function.params) |param| if (self.hasFloatDefault(param, depth + 1)) break :blk true;
+                break :blk self.hasFloatDefault(function.result, depth + 1);
+            },
+            else => false,
+        };
+    }
+
+    fn probeNumericPair(self: *Context, lhs: Ast.Node.Index, rhs: Ast.Node.Index, depth: usize) Error!?Known {
+        const active = self.default_probe_active;
+        self.default_probe_active = true;
+        defer self.default_probe_active = active;
+        const previous = self.float_defaults_only;
+        const defaulting = self.defaulting;
+        defer self.float_defaults_only = previous;
+        defer self.defaulting = defaulting;
+        self.defaulting = true;
+        self.float_defaults_only = true;
+        if ((try self.probe(lhs, depth)) orelse (try self.probe(rhs, depth))) |known| return known;
+        self.float_defaults_only = false;
+        return (try self.probe(lhs, depth)) orelse try self.probe(rhs, depth);
+    }
+
     fn probeDefault(self: *Context, node: Ast.Node.Index, depth: usize) Error!?Known {
         const previous = self.defaulting;
         self.defaulting = true;
         defer self.defaulting = previous;
+        // Nested generic argument probes share the enclosing pass. Restarting
+        // both passes at every identity call makes integer-only chains exponential.
+        if (self.default_probe_active) return self.probe(node, depth);
+        self.default_probe_active = true;
+        defer self.default_probe_active = false;
+        const previous_float_only = self.float_defaults_only;
+        defer self.float_defaults_only = previous_float_only;
+        // Exact constraints are probed first. Among soft defaults, floats win
+        // over integers across the entire expression, not just its first leaf.
+        self.float_defaults_only = true;
+        if (try self.probe(node, depth)) |known| return known;
+        self.float_defaults_only = false;
         return self.probe(node, depth);
     }
 
@@ -2230,7 +2302,8 @@ const Context = struct {
                 break :blk .{ .ty = self.ir.getType(operand.ty).?.record.fields[shape.ok].ty };
             },
             .number_literal => if (self.defaulting) switch (std.zig.parseNumberLiteral(self.module.sourceSlice(self.span(node)).?)) {
-                .int, .big_int => .{ .ty = try defaultIntegerType(self.ir) },
+                .int, .big_int => if (self.float_defaults_only) null else .{ .ty = try defaultIntegerType(self.ir) },
+                .float => .{ .ty = try defaultFloatType(self.ir) },
                 else => null,
             } else null,
             .string_literal, .slice => .{ .ty = try self.ir.internType(.string) },
@@ -2263,6 +2336,7 @@ const Context = struct {
             .block, .block_two, .block_newline, .block_two_newline => try self.probeBlock(node, depth),
             .loop_condition, .loop_cont, .loop_else => blk: {
                 const loop = ast.fullLoop(node).?;
+                if (try self.probeSiblings(&.{node}, depth)) |known| break :blk known;
                 if (loop.condition != 0 and loop.else_expr == 0) break :blk .{ .ty = try self.ir.internType(.void) };
                 break :blk (try self.probeBreaks(loop.condition, depth + 1)) orelse
                     (try self.probeBreaks(loop.body, depth + 1)) orelse
@@ -2290,6 +2364,7 @@ const Context = struct {
             .@"if", .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod => .{ .ty = try self.ir.internType(.void) },
             .if_else => blk: {
                 const branch = ast.fullIf(node).?.ast;
+                if (try self.probeSiblings(&.{ branch.then_expr, branch.else_expr }, depth)) |known| break :blk known;
                 break :blk (try self.probe(branch.then_expr, depth + 1)) orelse try self.probe(branch.else_expr, depth + 1);
             },
             .negation, .bit_not => try self.probe(data.rhs, depth + 1),
@@ -2390,11 +2465,7 @@ const Context = struct {
         const data = ast.nodes.items(.data)[node];
         switch (ast.nodes.items(.tag)[node]) {
             .number_literal => switch (std.zig.parseNumberLiteral(self.module.sourceSlice(self.span(node)).?)) {
-                .int, .big_int => return true,
-                .float => {
-                    _ = try self.fail(.unsupported_literal, node, null);
-                    return false;
-                },
+                .int, .big_int, .float => return true,
                 .failure => {
                     _ = try self.fail(.invalid_literal, node, null);
                     return false;
@@ -2478,6 +2549,9 @@ const Context = struct {
 
     fn probeArray(self: *Context, node: Ast.Node.Index, depth: usize) Error!?Known {
         var buffer: [2]Ast.Node.Index = undefined;
+        if (try self.probeSiblings(self.arrayElements(node, &buffer), depth)) |element| {
+            if (Ir.isArrayElement(self.ir.getType(element.ty).?)) return .{ .ty = try self.ir.internType(.{ .array = element.ty }) };
+        }
         // A later known scalar can constrain earlier literals. Never check or
         // emit elements here: the real walk validates conflicts in source order.
         for (self.arrayElements(node, &buffer)) |element| {
@@ -2672,7 +2746,7 @@ const Context = struct {
         const tag = ast.nodes.items(.tag)[node];
         const compound = tag != .assign;
         const ty = self.ir.getType(field.ty).?;
-        if (compound and ty != .integer and !((ty == .string or ty == .array) and tag == .assign_add)) return self.fail(.operator_not_supported, node, null);
+        if (compound and ty != .integer and !(ty == .float and tag != .assign_mod) and !((ty == .string or ty == .array) and tag == .assign_add)) return self.fail(.operator_not_supported, node, null);
         if (compound and try self.expression(data.lhs, .{ .ty = field.ty }, depth + 1) == null) return null;
         // Append consumes the RHS last without language callbacks. Only its
         // final read may project storage; internal effectful bases still snapshot.
@@ -2750,7 +2824,7 @@ const Context = struct {
         const array = self.ir.getType(array_id).?;
         if (array != .array) return self.fail(.unsupported_assignment_target, data.lhs, null);
         if (!binding.mutable) return self.fail(.immutable_assignment, target.lhs, binding.name_span);
-        if (compound and self.ir.getType(array.array).? != .integer) return self.fail(.operator_not_supported, node, binding.known.annotation);
+        if (compound and self.ir.getType(array.array).? != .integer and !(self.ir.getType(array.array).? == .float and tag != .assign_mod)) return self.fail(.operator_not_supported, node, binding.known.annotation);
         if (try self.expression(target.lhs, .{ .ty = array_id }, depth + 1) == null) return null;
         const index = try self.ir.internType(.{ .integer = .{ .signedness = .signed, .bits = Ir.native_pointer_bits } });
         if (try self.expression(target.rhs, .{ .ty = index }, depth + 1) == null) return null;
@@ -3186,7 +3260,7 @@ const Context = struct {
                 const ty = (try self.printExpression(embedded, depth + 1)) orelse return null;
                 if (self.terminated) return self.fit(string, expected, node);
                 const scalar = self.ir.getType(ty).?;
-                if (scalar != .boolean and scalar != .integer and scalar != .string and scalar != .rune and scalar != .array and scalar != .record and scalar != .enumeration) return self.interpolationError(.unsupported_interpolation_type, .{ .source = location.source, .start = location.start + @as(u32, @intCast(start)), .end = location.start + @as(u32, @intCast(offset)) });
+                if (scalar != .boolean and scalar != .integer and scalar != .float and scalar != .string and scalar != .rune and scalar != .array and scalar != .record and scalar != .enumeration) return self.interpolationError(.unsupported_interpolation_type, .{ .source = location.source, .start = location.start + @as(u32, @intCast(start)), .end = location.start + @as(u32, @intCast(offset)) });
                 if (!try self.convertPrintable(embedded, ty)) return null;
                 if (self.emitter) |emitter| {
                     const converted = try emitter.append(string, self.irSpan(node), .{ .to_string = try emitter.value(embedded) });
@@ -3324,7 +3398,7 @@ const Context = struct {
         defer self.restoreScope(scope);
         var context: LoopContext = .{
             .allows_value = loop.else_expr != 0,
-            .result = if (loop.else_expr != 0) expected orelse try self.probe(node, depth) else .{ .ty = unit },
+            .result = if (loop.else_expr != 0) expected orelse (try self.probe(node, depth)) orelse try self.probeDefault(node, depth) else .{ .ty = unit },
         };
         const parent = self.loop_context;
         self.loop_context = &context;
@@ -3702,7 +3776,7 @@ const Context = struct {
                 const ty = self.ir.getType(binding.known.ty).?;
                 const array_append = tag == .assign_add and ty == .array;
                 const string_concat = tag == .assign_add and ty == .string;
-                if (compound and !array_append and !string_concat and ty != .integer) return self.fail(.operator_not_supported, node, binding.known.annotation);
+                if (compound and !array_append and !string_concat and ty != .integer and !(ty == .float and tag != .assign_mod)) return self.fail(.operator_not_supported, node, binding.known.annotation);
                 // Capture the old value before RHS effects, just as for binary
                 // arithmetic. A returning RHS never performs the final store.
                 if (compound and try self.expression(data.lhs, binding.known, depth + 1) == null) return null;
@@ -3783,17 +3857,25 @@ const Context = struct {
                 return if (self.terminated) (if (expected) |want| want.ty else merged) else merged;
             },
             .add, .sub, .mul, .div, .mod, .bit_and, .bit_or, .bit_xor => {
-                const integer_context = if (hint) |want| (if (self.ir.getType(want.ty).? == .integer) hint else null) else null;
+                const integer_context = if (hint) |want| (if (self.ir.getType(want.ty).? == .integer or self.ir.getType(want.ty).? == .float) hint else null) else null;
                 const operand = (try self.probe(data.lhs, depth + 1)) orelse (try self.probe(data.rhs, depth + 1)) orelse integer_context orelse return self.missingOperandType(node, data.lhs, data.rhs, expected, depth);
-                if (self.ir.getType(operand.ty).? != .integer and !(self.ir.getType(operand.ty).? == .string and ast.nodes.items(.tag)[node] == .add)) return self.fail(.operator_not_supported, node, operand.annotation);
+                if (self.ir.getType(operand.ty).? != .integer and !(self.ir.getType(operand.ty).? == .float and switch (ast.nodes.items(.tag)[node]) {
+                    .add, .sub, .mul, .div => true,
+                    else => false,
+                }) and !(self.ir.getType(operand.ty).? == .string and ast.nodes.items(.tag)[node] == .add)) return self.fail(.operator_not_supported, node, operand.annotation);
                 const lhs = try self.expression(data.lhs, operand, depth + 1);
                 const rhs = try self.expression(data.rhs, operand, depth + 1);
                 if (lhs == null or rhs == null) return null;
                 return self.fit(operand.ty, expected, node);
             },
             .in => {
-                const right = (try self.probe(data.rhs, depth + 1)) orelse if (try self.probe(data.lhs, depth + 1) == null) try self.probeDefault(data.rhs, depth + 1) else null;
-                const left = (try self.probe(data.lhs, depth + 1)) orelse if (right == null) try self.probeDefault(data.lhs, depth + 1) else null;
+                var right = try self.probe(data.rhs, depth + 1);
+                var left = try self.probe(data.lhs, depth + 1);
+                if (right == null and left == null) {
+                    if (try self.probeNumericPair(data.lhs, data.rhs, depth + 1)) |fallback| {
+                        if (self.ir.getType(fallback.ty).? == .array) right = fallback else left = fallback;
+                    }
+                }
                 const element: Known = if (right) |known| blk: {
                     const array = self.ir.getType(known.ty).?;
                     if (array != .array) return self.fail(.operator_not_supported, node, known.annotation);
@@ -3817,10 +3899,10 @@ const Context = struct {
                 return self.fit(try self.ir.internType(.boolean), expected, node);
             },
             .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal => {
-                const operand = (try self.probe(data.lhs, depth + 1)) orelse (try self.probe(data.rhs, depth + 1)) orelse (try self.probeDefault(data.lhs, depth + 1)) orelse (try self.probeDefault(data.rhs, depth + 1)) orelse return self.missingOperandType(node, data.lhs, data.rhs, null, depth);
+                const operand = (try self.probe(data.lhs, depth + 1)) orelse (try self.probe(data.rhs, depth + 1)) orelse (try self.probeNumericPair(data.lhs, data.rhs, depth + 1)) orelse return self.missingOperandType(node, data.lhs, data.rhs, null, depth);
                 const ty = self.ir.getType(operand.ty).?;
                 const equality = ast.nodes.items(.tag)[node] == .equal_equal or ast.nodes.items(.tag)[node] == .bang_equal;
-                if (ty != .integer and !((ty == .boolean or ty == .string or ty == .rune or ty == .enumeration) and equality)) return self.fail(.operator_not_supported, node, operand.annotation);
+                if (ty != .integer and ty != .float and !((ty == .boolean or ty == .string or ty == .rune or ty == .enumeration) and equality)) return self.fail(.operator_not_supported, node, operand.annotation);
                 const lhs = try self.expression(data.lhs, operand, depth + 1);
                 const rhs = try self.expression(data.rhs, operand, depth + 1);
                 if (lhs == null or rhs == null) return null;
@@ -3847,11 +3929,11 @@ const Context = struct {
                 return self.fit(boolean, expected, node);
             },
             .negation, .bit_not => {
-                const integer_context = if (hint) |want| (if (self.ir.getType(want.ty).? == .integer) hint else null) else null;
+                const integer_context = if (hint) |want| (if (self.ir.getType(want.ty).? == .integer or self.ir.getType(want.ty).? == .float) hint else null) else null;
                 const operand = (try self.probe(data.rhs, depth + 1)) orelse integer_context orelse return self.missingOperandType(node, data.rhs, null, expected, depth);
                 const ty = self.ir.getType(operand.ty).?;
-                if (ty != .integer) return self.fail(.operator_not_supported, node, operand.annotation);
-                if (ast.nodes.items(.tag)[node] == .negation and ty.integer.signedness == .unsigned) return self.fail(.unsupported_body_expression, node, null);
+                if (ty != .integer and !(ty == .float and ast.nodes.items(.tag)[node] == .negation)) return self.fail(.operator_not_supported, node, operand.annotation);
+                if (ast.nodes.items(.tag)[node] == .negation and ty == .integer and ty.integer.signedness == .unsigned) return self.fail(.unsupported_body_expression, node, null);
                 if (try self.expression(data.rhs, operand, depth + 1) == null) return null;
                 return self.fit(operand.ty, expected, node);
             },
@@ -3988,6 +4070,154 @@ const Context = struct {
         }
     }
 };
+
+test "float bodies defaults contextual literals control flow mutations and printing" {
+    const source =
+        \\let Box:(T:type)->type=struct{value:T,}
+        \\let Record=struct{value:f32=1,}
+        \\let take:(x:f32)->f32=x
+        \\let main:()={
+        \\let native=1.5
+        \\let exact_native:float=native
+        \\let mixed=1+2.5
+        \\let exact_mixed:float=mixed
+        \\let narrow:f32=0.1
+        \\let round:f32=16777217
+        \\let hex:f64=0x1.8p+2
+        \\let integer:f32=0xff
+        \\let grouped:f32=-{0.0}
+        \\let arithmetic:f32=-{narrow+1}*2/3-4
+        \\let array=[1,2.5]
+        \\let exact_array:[]float=array
+        \\let reverse=[2.5,1]
+        \\let exact_reverse:[]float=reverse
+        \\let nested=[[1],[2.5]]
+        \\let exact_nested:[][]float=nested
+        \\let contextual=[1,2.5,narrow]
+        \\let exact_contextual:[]f32=contextual
+        \\let later=if true {1} else {2.5}
+        \\let exact_later:float=later
+        \\let looped=loop {if false {break 1}
+        \\break 2.5}
+        \\let exact_looped:float=looped
+        \\let exhausted=loop false {break 1} else {2.5}
+        \\let exact_exhausted:float=exhausted
+        \\let ranged=loop _ in 0..2 {break 1} else {2.5}
+        \\let exact_ranged:float=ranged
+        \\let returned:f32={if true {return}
+        \\take(1)}
+        \\let boxed=Box(f32)[.value=1]
+        \\let query:@TypeOf(narrow)=2
+        \\let mut local:f32=1
+        \\local+=2
+        \\local-=0.5
+        \\local*=2
+        \\local/=3
+        \\let loan=&local
+        \\loan+=1
+        \\let mut items:[]f32=[1,2]
+        \\items[0]+=2
+        \\items[0]-=1
+        \\items[0]*=2
+        \\items[0]/=3
+        \\loop &item in items {item+=0.5}
+        \\let mut record=Record[]
+        \\record.value+=2
+        \\record.value-=1
+        \\record.value*=2
+        \\record.value/=3
+        \\let r=&record
+        \\r.value+=1
+        \\@assert(narrow==1)
+        \\@assert(narrow!=1)
+        \\@assert(1<2.5)
+        \\@assert(narrow<=1)
+        \\@assert(narrow>1)
+        \\@assert(narrow>=1)
+        \\@assert(1.5 in [1,2])
+        \\@assert(1 in [1.5,2])
+        \\@assert(1.5 in [])
+        \\@println(native,narrow,array,boxed,f32,f64,float,@TypeOf(narrow),"{narrow} {1 + 2.5}")
+        \\}
+    ;
+    var module = try Module.init(std.testing.allocator, "float-bodies.nov", source);
+    defer module.deinit();
+    for (module.source.ast.errors) |issue| std.debug.print("float parse: {any} at {s}\n", .{ issue, module.source.ast.tokenSlice(issue.token) });
+    var sema = try Lowering.lower(&module);
+    defer sema.deinit();
+    if (module.hasErrors()) std.debug.print("float body diagnostics: {any}\n", .{module.diagnostics.items});
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+    var rounded = false;
+    var negative_zero = false;
+    for (sema.ir.constants.items) |constant| {
+        if (constant.value != .float_bits or sema.ir.getType(constant.ty).?.float != 32) continue;
+        rounded = rounded or constant.value.float_bits == @as(u32, @bitCast(@as(f32, 16777216)));
+        negative_zero = negative_zero or constant.value.float_bits == 0x80000000;
+    }
+    try std.testing.expect(rounded and negative_zero);
+}
+
+test "float bodies reject conversions integer only operations and deferred match subjects" {
+    for ([_][]const u8{
+        "let f:(x:f32)->f64=x",
+        "let f:(x:f64)->f32=x",
+        "let f:(x:int)->f32=x",
+        "let f:(x:f32)->int=x",
+        "let f:(x:f32,y:f64)->f32=x+y",
+        "let f:(x:int)->bool=x<2.5",
+        "let f:(x:f32)->f32=x%1",
+        "let f:(x:f32)->f32=~x",
+        "let f:(x:f32)->f32=x&1",
+        "let f:()={let mut x:f32=1\nx%=2}",
+        "let f:()={let mut x:[]f32=[1]\nx[0]%=2}",
+        "let R=struct{x:f32,}\nlet f:()={let mut r=R[.x=1]\nr.x%=2}",
+        "let f:(a:[]f32,x:f32)->f32=a[x]",
+        "let f:(x:f32)={loop i in x..2 {}}",
+        "let f:(x:f32)->int=match x {_=>1}",
+        "let f:(x:f32,a:[]f64)->bool=x in a",
+        "let f:()->f16=1.0",
+        "let f:()->f128=1.0",
+        "let f:()->bool=@as(f32,true)",
+        "let f:()->f32=@as(f32,1e100)",
+    }) |source| {
+        var module = try Module.init(std.testing.allocator, "float-errors.nov", source);
+        defer module.deinit();
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        errdefer std.debug.print("float negative: {s}\n", .{source});
+        try std.testing.expect(module.hasErrors());
+        try std.testing.expect(!sema.lowering_complete);
+    }
+}
+
+test "float aggregate siblings merge exact and soft nominal leaves before defaults" {
+    const source =
+        \\let Pair:(A:type,B:type)->type=struct{a:A,b:B,}
+        \\let pair:(a:`A,b:`B)->Pair(`A,`B)=Pair(`A,`B)[.a=a,.b=b]
+        \\let f:(a:f32,b:f64)={
+        \\let mixed=[pair(1.5,1),pair(1,1.5)]
+        \\let exact_mixed:[]Pair(float,float)=mixed
+        \\let typed=[pair(a,1),pair(1,b)]
+        \\let exact_typed:[]Pair(f32,f64)=typed
+        \\let reversed=[pair(1,b),pair(a,1)]
+        \\let exact_reversed:[]Pair(f32,f64)=reversed
+        \\let branch=if true {pair(a,1)} else {pair(1,b)}
+        \\let exact_branch:Pair(f32,f64)=branch
+        \\let nested=[[pair(a,1)],[pair(1,b)]]
+        \\let exact_nested:[][]Pair(f32,f64)=nested
+        \\}
+    ;
+    var module = try Module.init(std.testing.allocator, "float-siblings.nov", source);
+    defer module.deinit();
+    var sema = try Lowering.lower(&module);
+    defer sema.deinit();
+    if (module.hasErrors()) std.debug.print("float siblings: {any}\n", .{module.diagnostics.items});
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+}
 
 test "integer defaults cover bodies and preserve forward sibling constraints" {
     const source =
@@ -4905,7 +5135,7 @@ test "interpolation diagnoses names grammar types scopes and exact source bytes"
         .{ .source = "let f: (n: int) -> string = \"{n:02}\"", .tag = .invalid_interpolation, .token = "{n:02}" },
         .{ .source = "let f: (n: int) -> string = \"{n()}\"", .tag = .not_callable, .token = "(" },
         .{ .source = "let f: (n: int) -> string = \"{{n}}\"", .tag = .invalid_interpolation, .token = "{{n}" },
-        .{ .source = "let f: (n: int) -> string = \"{1.5}\"", .tag = .unsupported_literal, .token = "1.5" },
+        .{ .source = "let f: (n: int) -> string = \"{n + 1.5}\"", .tag = .literal_type_mismatch, .token = "1.5" },
         .{ .source = "let f: (n: int) -> string = \"{if}\"", .tag = .invalid_interpolation, .token = "{if}" },
         .{ .source = "let f: () -> string = \"{'a'}\"", .tag = .invalid_interpolation, .token = "{'a'}" },
         .{ .source = "let f: () -> string = \"{'é'}\"", .tag = .invalid_interpolation, .token = "{'é'}" },
@@ -5660,7 +5890,7 @@ test "match and pipes reject unsupported patterns arity defaults and inexact typ
         .{ .source = "let f: (n: int) -> int = match n {{0 | 1} => 1\n_ => 2}", .tag = .unsupported_match_pattern },
         .{ .source = "let f: (n: int) -> int = match n {n + 1 => 1\n_ => 2}", .tag = .unsupported_match_pattern },
         .{ .source = "let f: (n: []int) -> int = match n {_ => 2}", .tag = .unsupported_match_subject },
-        .{ .source = "let f: () -> int = match 1.5 {_ => 2}", .tag = .unsupported_literal },
+        .{ .source = "let f: () -> int = match 1.5 {_ => 2}", .tag = .unsupported_match_subject },
         .{ .source = "let f: (n: u8) -> int = match n {-1 => 1\n_ => 2}", .tag = .literal_out_of_range },
         .{ .source = "let f: (n: i8) -> int = match n {128 => 1\n_ => 2}", .tag = .literal_out_of_range },
         .{ .source = "let f: (n: bool) -> int = match n {1 => 1\n_ => 2}", .tag = .literal_type_mismatch },
@@ -5670,7 +5900,7 @@ test "match and pipes reject unsupported patterns arity defaults and inexact typ
         .{ .source = "let f: () -> int = 1\nlet g: () -> int = 1 |> f", .tag = .argument_count_mismatch },
         .{ .source = "let f: (a: int, b: int) -> int = a\nlet g: () -> int = 1 |> f", .tag = .argument_count_mismatch },
         .{ .source = "let g: () -> int = true |> false", .tag = .not_callable },
-        .{ .source = "let g: () -> void = 1.5 |> @println", .tag = .unsupported_literal },
+        .{ .source = "let g: () -> void = @as(int, 1.5) |> @println", .tag = .literal_type_mismatch },
         .{ .source = "let f: (n: i8) -> i8 = n\nlet g: (n: i16) -> i8 = n |> f", .tag = .expression_type_mismatch },
     }) |case| {
         var module = try Module.init(std.testing.allocator, "match-error.nov", case.source);
@@ -5716,7 +5946,7 @@ test "bitwise binaries infer exact integer operands through late result hints" {
 test "bitwise binaries reject floats nonintegers mismatches and literal bounds" {
     for ([_][]const u8{ "&", "|", "^" }) |op| {
         inline for ([_]struct { source: []const u8, tag: Module.Diagnostic.Tag }{
-            .{ .source = "let f: () -> void = {{let n = 1 {s} 2.5\n}}", .tag = .unsupported_literal },
+            .{ .source = "let f: () -> void = {{let n = 1 {s} 2.5\n}}", .tag = .operator_not_supported },
             .{ .source = "let f: () -> int = 1 {s} missing", .tag = .unknown_name },
             .{ .source = "let f: () -> void = {{let n = 1 {s} missing\n}}", .tag = .unknown_name },
             .{ .source = "let f: () -> i8 = 128 {s} 0", .tag = .literal_out_of_range },
@@ -5768,11 +5998,11 @@ test "membership infers exact scalar operands before numeric defaults" {
     }
 }
 
-test "membership rejects floats widening nonscalar elements and nonboolean results" {
+test "membership rejects inexact types widening nonscalar elements and nonboolean results" {
     const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag };
     for ([_]Case{
-        .{ .source = "let f: () -> bool = 1.5 in [1, 2]", .tag = .unsupported_literal },
-        .{ .source = "let f: () -> bool = 1.5 in []", .tag = .unsupported_literal },
+        .{ .source = "let f: (a: []int) -> bool = 1.5 in a", .tag = .literal_type_mismatch },
+        .{ .source = "let f: (x: f32, a: []f64) -> bool = x in a", .tag = .expression_type_mismatch },
         .{ .source = "let f: (a: []i8, n: i16) -> bool = n in a", .tag = .expression_type_mismatch },
         .{ .source = "let f: (a: []u8, n: i8) -> bool = n in a", .tag = .expression_type_mismatch },
         .{ .source = "let f: (a: []i8) -> bool = 128 in a", .tag = .literal_out_of_range },
@@ -6309,7 +6539,7 @@ test "range bounds require exact integer types and immutable lexical bindings" {
         .{ .body = "{let a: i8 = -1\nloop i in a..128 {}}", .tag = .literal_out_of_range },
         .{ .body = "{let a: u8 = 1\nloop i in -1..a {}}", .tag = .literal_out_of_range },
         .{ .body = "loop i in true..false {}", .tag = .operator_not_supported },
-        .{ .body = "loop i in 1 + 1.5..3 {}", .tag = .unsupported_literal },
+        .{ .body = "loop i in 1 + 1.5..3 {}", .tag = .literal_type_mismatch },
         .{ .body = "loop i in missing..3 {}", .tag = .unknown_name },
         .{ .body = "loop i in 0..2 {break 1}", .tag = .conditional_value_break },
         .{ .body = "{let value: uint = loop i in 0..2 {}\n}", .tag = .expression_type_mismatch },
@@ -6343,7 +6573,7 @@ test "range else rejects incompatible results missing context and escaped indice
         .{ .body = "loop _ in 0..2 {} else {continue}", .tag = .loop_control_outside_loop },
         .{ .body = "{let a = loop _ in 0..2 {break} else {true}\n}", .tag = .expression_type_mismatch },
         .{ .body = "{let a: int = loop _ in 0..2 {break} else {1}\n}", .tag = .expression_type_mismatch },
-        .{ .body = "{let a = loop _ in 0..2 {break 1.5} else {2}\n}", .tag = .unsupported_literal },
+        .{ .body = "{let a: int = loop _ in 0..2 {break 1.5} else {2}\n}", .tag = .literal_type_mismatch },
         .{ .body = "{let x: i8 = 1\nlet y: i16 = 2\nlet a = loop _ in 0..2 {break x} else {y}\n}", .tag = .expression_type_mismatch },
         .{ .body = "{let a = loop _ in 0..2 {break []} else {[]}\n}", .tag = .array_literal_needs_type },
         .{ .body = "loop _ in 0..2 {} else {return}\n@println(true)", .tag = .unreachable_code },
@@ -6548,7 +6778,7 @@ test "loop value and continuation diagnostics preserve exact types and lexical s
         .{ .source = "let f: () -> bool = loop true {break} else {false}", .tag = .expression_type_mismatch },
         .{ .source = "let f: () -> bool = loop true {break true} else {1}", .tag = .literal_type_mismatch },
         .{ .source = "let f: (a: i8, b: i16) -> i8 = loop true {break a} else {b}", .tag = .expression_type_mismatch },
-        .{ .source = "let f: () -> void = {let x = loop false {break 1.5} else {2}\n}", .tag = .unsupported_literal },
+        .{ .source = "let f: () -> void = {let x: int = loop false {break 1.5} else {2}\n}", .tag = .literal_type_mismatch },
         .{ .source = "let f: () -> void = {let x = loop false {break []} else {[]}\n}", .tag = .array_literal_needs_type },
         .{ .source = "let f: () -> void = loop false {let hidden = true\n} else {@println(hidden)}", .tag = .unknown_name },
         .{ .source = "let f: () -> void = loop {let hidden = true\nhidden} {} else {@println(hidden)}", .tag = .unknown_name },
@@ -6750,7 +6980,7 @@ test "if diagnostics check conditions both branches results and lexical visibili
         .{ .source = "let f: () -> void = if true {} else {missing}", .tag = .unknown_name, .token = "missing" },
         .{ .source = "let f: (n: int) -> void = if true {n}", .tag = .expression_type_mismatch, .token = "n" },
         .{ .source = "let f: () -> int = if true {}", .tag = .expression_type_mismatch, .token = "if" },
-        .{ .source = "let f: () -> void = @println(if true {1.5} else {2})", .tag = .unsupported_literal, .token = "1.5" },
+        .{ .source = "let f: () -> void = @println(if true {1.5} else {true})", .tag = .literal_type_mismatch, .token = "1.5" },
         .{ .source = "let f: () -> void = if true {let hidden: bool = true\n} else {@println(hidden)}", .tag = .unknown_name, .token = "hidden" },
         .{ .source = "let f: () -> bool = {if true {let hidden: bool = true\n}\nhidden}", .tag = .unknown_name, .token = "hidden" },
         .{ .source = "let f: (n: int, u: uint) -> void = @println(if true {n} else {u})", .tag = .expression_type_mismatch, .token = "u" },
@@ -6877,8 +7107,8 @@ test "array inference rejects conflicts unresolved elements and scope leaks with
         .{ .body = "let a: []i8 = [128, wide]", .tag = .literal_out_of_range, .token = "128" },
         .{ .body = "let a: []i8 = [0, wide]", .tag = .expression_type_mismatch, .token = "wide" },
         .{ .body = "let a = []", .tag = .array_literal_needs_type, .token = "[" },
-        .{ .body = "let a = [1, 2.5]", .tag = .unsupported_literal, .token = "2.5" },
-        .{ .body = "let a = [[1.5]]", .tag = .array_literal_needs_type, .token = "[" },
+        .{ .body = "let a: []int = [1, 2.5]", .tag = .literal_type_mismatch, .token = "2.5" },
+        .{ .body = "let a: [][]int = [[1.5]]", .tag = .literal_type_mismatch, .token = "1.5" },
         .{ .body = "let a = [[]]", .tag = .array_literal_needs_type, .token = "[" },
         .{ .body = "let a = [missing, p]", .tag = .unknown_name, .token = "missing" },
         .{ .body = "let a = [0, {let hidden = p\nhidden}]\n@println(hidden)", .tag = .unknown_name, .token = "hidden" },
@@ -6901,10 +7131,10 @@ test "array inference rejects conflicts unresolved elements and scope leaks with
 test "inferred local failures preserve typing and initializer scope" {
     const Case = struct { body: []const u8, tag: Module.Diagnostic.Tag, token: []const u8 };
     for ([_]Case{
-        .{ .body = "let n = 1.5", .tag = .unsupported_literal, .token = "1.5" },
-        .{ .body = "let mut n = 1 + 2.5", .tag = .unsupported_literal, .token = "2.5" },
+        .{ .body = "let n: int = 1.5", .tag = .literal_type_mismatch, .token = "1.5" },
+        .{ .body = "let mut n: int = 1 + 2.5", .tag = .literal_type_mismatch, .token = "2.5" },
         .{ .body = "let n = []", .tag = .array_literal_needs_type, .token = "[" },
-        .{ .body = "let n = [1, 2.5]", .tag = .unsupported_literal, .token = "2.5" },
+        .{ .body = "let n: []int = [1, 2.5]", .tag = .literal_type_mismatch, .token = "2.5" },
         .{ .body = "let n = n", .tag = .unknown_name, .token = "n" },
         .{ .body = "let n = later\nlet later = p", .tag = .unknown_name, .token = "later" },
         .{ .body = "let n = missing + p", .tag = .unknown_name, .token = "missing" },
@@ -7100,13 +7330,13 @@ test "printing accepts typed scalar arguments and returns void" {
     for (sema.entries) |entry| try std.testing.expectEqual(Sema.Status.body_checked, entry.status);
 }
 
-test "printing rejects floats non-scalars unsupported builtins and nonvoid results" {
+test "printing rejects inexact literals non-scalars unsupported builtins and nonvoid results" {
     const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag };
     for ([_]Case{
-        .{ .source = "let f: () -> void = @println(1.5)", .tag = .unsupported_literal },
-        .{ .source = "let n: int = 1\nlet f: () -> void = @println(2.5)", .tag = .unsupported_literal },
+        .{ .source = "let f: () -> void = @println(@as(int, 1.5))", .tag = .literal_type_mismatch },
+        .{ .source = "let n: int = 1\nlet f: () -> void = @println(@as(int, 2.5))", .tag = .literal_type_mismatch },
         .{ .source = "let n: uint = 1\nlet f: () -> int = n", .tag = .expression_type_mismatch },
-        .{ .source = "let f: () -> void = @println(-1.5)", .tag = .unsupported_literal },
+        .{ .source = "let f: () -> void = @println(@as(int, -1.5))", .tag = .literal_type_mismatch },
         .{ .source = "let f: () -> void = @println('ab')", .tag = .invalid_literal },
         .{ .source = "let f: () -> void = @println({})", .tag = .unsupported_body_expression },
         .{ .source = "let f: () -> void = @println(f)", .tag = .unsupported_body_expression },
@@ -7172,7 +7402,7 @@ test "body errors identify mismatched returns operands names and calls" {
         .{ .source = "let target: (x: i32) -> i32 = x\nlet f: () -> i32 = target()", .tag = .argument_count_mismatch },
         .{ .source = "let target: (x: bool) -> bool = x\nlet f: () -> bool = target(1)", .tag = .literal_type_mismatch },
         .{ .source = "let target: (x: u8) -> u8 = x\nlet f: () -> u8 = target(256)", .tag = .literal_out_of_range },
-        .{ .source = "let f: () -> bool = 1 < 2.5", .tag = .unsupported_literal },
+        .{ .source = "let f: (n: int) -> bool = n < 2.5", .tag = .literal_type_mismatch },
         .{ .source = "let value = []\nlet f: () -> i32 = value", .tag = .unresolved_value_type },
         .{ .source = "let f: () -> i32 = {}", .tag = .expression_type_mismatch },
     }) |case| {

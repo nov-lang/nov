@@ -248,6 +248,46 @@ fn probeResultInner(caller: *Module, ir: *Ir, ref: Ref, arguments: []const Argum
     return solver.materialize(frame.result, 0);
 }
 
+/// Probe sibling expressions in one constraint graph. Materializing each sibling
+/// separately loses exact/default provenance inside nominal and function types.
+/// The scope is a descriptor only; no signature or body is demanded for it.
+pub fn probeExpressions(caller: *Module, ir: *Ir, scope: Ref, nodes: []const Ast.Node.Index, result_type: Ir.TypeId, defaults: bool) Ir.BuildError!?Ir.TypeId {
+    const caller_start = caller.diagnostics.items.len;
+    defer caller.diagnostics.shrinkRetainingCapacity(caller_start);
+    const starts: []usize = if (caller.compilation) |comp| try caller.allocator.alloc(usize, comp.modules.items.len) else &.{};
+    defer if (starts.len != 0) caller.allocator.free(starts);
+    if (caller.compilation) |comp| for (comp.modules.items, starts) |module, *start| {
+        start.* = module.diagnostics.items.len;
+    };
+    defer if (caller.compilation) |comp| {
+        for (comp.modules.items, starts) |module, start| module.diagnostics.shrinkRetainingCapacity(start);
+    };
+    return probeExpressionsInner(caller, ir, scope, nodes, result_type, defaults) catch |err| switch (err) {
+        error.TooManyEntries => null,
+        else => return err,
+    };
+}
+
+fn probeExpressionsInner(caller: *Module, ir: *Ir, scope: Ref, nodes: []const Ast.Node.Index, result_type: Ir.TypeId, defaults: bool) Ir.BuildError!?Ir.TypeId {
+    var arena = std.heap.ArenaAllocator.init(caller.allocator);
+    defer arena.deinit();
+    var solver: Solver = .{ .allocator = arena.allocator(), .caller = caller, .ir = ir, .call_span = scope.span(), .read_only = true, .analysis = scope.analysis, .types = scope.types };
+    const local = scope.local.?;
+    const variables = try solver.allocator.alloc(Variable, local.outer_bindings.len);
+    for (local.outer_bindings, variables) |binding, *variable| variable.* = .{ .name = binding.name, .term = try solver.fromType(binding.ty, solver.call_span, 0) };
+    var frame: Frame = .{ .ref = scope, .variables = variables, .result = try solver.fromType(result_type, solver.call_span, 0) };
+    if (local.concrete_type) |ty| {
+        const concrete = Solver.root(try solver.fromType(@fromBackingInt(ty), solver.call_span, 0));
+        if (concrete.value == .nominal) frame.container = concrete.value.nominal;
+    }
+    for (local.captures) |capture| try frame.locals.append(solver.allocator, .{ .name = capture.name, .term = try solver.fromType(capture.ty, solver.call_span, 0), .template = capture.template });
+    const result = try solver.term(.unknown, solver.call_span);
+    for (nodes) |node| try solver.unify(result, try solver.expression(&frame, node, 0), caller.tokenSpan(caller.source.ast.firstToken(node)), 0);
+    if (solver.failed) return null;
+    if (defaults) try solver.applyDefaults();
+    return solver.materialize(result, 0);
+}
+
 fn testSpecialization(allocator: std.mem.Allocator) !void {
     var module = try Module.init(allocator, "generic-functions.nov",
         \\let first: (items: []`T) -> `T = items[0]
@@ -423,6 +463,124 @@ test "integer defaults consume established global types as exact generic constra
         try std.testing.expectEqual(Module.Diagnostic.Tag.generic_function_conflict, module.diagnostics.items[0].tag);
         try std.testing.expectEqualStrings("g", module.sourceSlice(module.diagnostics.items[0].span).?);
         try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testInferenceFailureAllocations, .{ source, Module.Diagnostic.Tag.generic_function_conflict });
+    }
+}
+
+test "float generic defaults shared independent contextual callbacks and nested containers" {
+    const source =
+        \\let id:(x:`T)->`T=x
+        \\let same:(x:`T,y:`T)->`T=x
+        \\let add:(x:`A,y:`B)->`C=x+y
+        \\let first:(x:`A,y:`B)->`A=x
+        \\let make:()->`T=2.5
+        \\let apply:(f:(`T)->`U,x:`T)->`U=f(x)
+        \\let body:(x:`T)->`T={let y:f32=x
+        \\y}
+        \\let Box:(T:type)->type=struct{value:T,let get:(self:Box(T))->T=self.value
+        \\}
+        \\let main:()={
+        \\let n:f32=1
+        \\let a=id(2.5)
+        \\let exact_a:float=a
+        \\let b:f32=id(2.5)
+        \\let c=same(1,2.5)
+        \\let exact_c:float=c
+        \\let d=same(2.5,1)
+        \\let exact_d:float=d
+        \\let e=add(1,2.5)
+        \\let exact_e:float=e
+        \\let f=add(2.5,1)
+        \\let exact_f:float=f
+        \\let g=first(1,2.5)
+        \\let exact_g:int=g
+        \\let h=first(2.5,1)
+        \\let exact_h:float=h
+        \\let i=same(2.5,n)
+        \\let exact_i:f32=i
+        \\let j:f32=add(1,2.5)
+        \\let k=make()
+        \\let exact_k:float=k
+        \\let l:f32=make()
+        \\let m=apply(id,2.5)
+        \\let exact_m:float=m
+        \\let callback:f32=apply(id,2.5)
+        \\let constrained=body(2.5)
+        \\let exact_constrained:f32=constrained
+        \\let nested=same([[1]],[[2.5]])
+        \\let exact_nested:[][]float=nested
+        \\let context_nested:[][]f32=id([[1,2.5]])
+        \\let closure=(x:`T)->`T{x+0.5}
+        \\let closed=closure(1)
+        \\let exact_closed:float=closed
+        \\let contextual_closed:f32=closure(1)
+        \\let piped:f32=2.5 |> id
+        \\let correlated=same(id(1),2.5)
+        \\let exact_correlated:float=correlated
+        \\let ordinary=id(1)+2.5
+        \\let exact_ordinary:float=ordinary
+        \\let array=[id(1),2.5]
+        \\let exact_array:[]float=array
+        \\let wrapped=id(Box(f32)[.value=1])
+        \\let field:f32=wrapped.get()
+        \\@println(a,b,nested,closed,wrapped)
+        \\}
+    ;
+    var module = try Module.init(std.testing.allocator, "float-generics.nov", source);
+    defer module.deinit();
+    var sema = try Lowering.lower(&module);
+    defer sema.deinit();
+    for (module.diagnostics.items) |diagnostic| std.debug.print("float generic: {any} at {d}: {s}\n", .{ diagnostic.tag, diagnostic.span.start, module.sourceSlice(diagnostic.span).? });
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+}
+
+fn testFloatDefaultsAllocationFailures(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "float-oom.nov",
+        \\let add:(x:`A,y:`B)->`C=x+y
+        \\let id:(x:`T)->`T=x
+        \\let main:()={let a=add(1,2.5)
+        \\let b:f32=add(1,2.5)
+        \\let c=id([[1,2.5]])
+        \\@println(a,b,c)}
+    );
+    defer module.deinit();
+    var sema = try Lowering.lower(&module);
+    defer sema.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+}
+
+test "float generic defaults roll back every allocation failure" {
+    try testFloatDefaultsAllocationFailures(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testFloatDefaultsAllocationFailures, .{});
+}
+
+test "float generic defaults never override exact variables or API constraints" {
+    const prelude = "let same:(x:`T,y:`T)->`T=x\nlet add:(x:`A,y:`B)->`C=x+y\nlet id:(x:`T)->`T=x\n";
+    for ([_][]const u8{
+        "let f:(x:int)->int=same(x,2.5)",
+        "let f:(x:int)->int=add(x,2.5)",
+        "let f:(x:f32,y:f64)->f32=same(x,y)",
+        "let f:(x:f32,y:f64)->f32=add(x,y)",
+        "let f:()->int=id(2.5)",
+        "let f:()->f32=id(true)",
+        "let f:(x:int)->f32=id(x)",
+        "let f:(x:[]int)->[]int=same(x,[2.5])",
+        "let f:()->bool=@assert(id(2.5))",
+        "let f:(a:[]int)->int=a[id(1.5)]",
+        "let f:()->f32={let a:f64=id(2.5)\na}",
+    }) |tail| {
+        const source = try std.mem.concat(std.testing.allocator, u8, &.{ prelude, tail });
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "float-generic-errors.nov", source);
+        defer module.deinit();
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        errdefer std.debug.print("float generic negative: {s}\n", .{tail});
+        try std.testing.expect(module.hasErrors());
+        try std.testing.expect(!sema.lowering_complete);
     }
 }
 
@@ -664,20 +822,56 @@ const Solver = struct {
     unsupported: ?Module.Span = null,
     parameters: []const *Term = &.{},
     defaults: std.ArrayList(struct { term: *Term, ty: Ir.TypeId }) = .empty,
+    float_defaults_only: bool = false,
 
     // Defaults fill only unresolved leaves after all exact constraints. A
     // candidate must never conflict with a contextual type that already won.
     fn applyDefaults(self: *Solver) Ir.BuildError!void {
+        // Apply floating leaves first, including inside containers. Shared soft
+        // integer candidates then yield without ever changing an exact type.
+        self.float_defaults_only = true;
         for (self.defaults.items) |candidate| try self.defaultTerm(candidate.term, candidate.ty, 0);
+        self.float_defaults_only = false;
+        for (self.defaults.items) |candidate| try self.defaultTerm(candidate.term, candidate.ty, 0);
+    }
+
+    fn retainFloatDefaults(self: *Solver, value: *Term, depth: usize) void {
+        if (depth >= max_depth) return;
+        switch (value.value) {
+            .known => |ty| if (self.ir.getType(ty).? != .float) {
+                value.value = .unknown;
+            },
+            .array => |element| self.retainFloatDefaults(element, depth + 1),
+            .nominal => |n| for (n.args) |arg| {
+                self.retainFloatDefaults(arg, depth + 1);
+            },
+            .function => |f| {
+                for (f.params) |param| self.retainFloatDefaults(param, depth + 1);
+                self.retainFloatDefaults(f.result, depth + 1);
+            },
+            else => {},
+        }
     }
 
     fn defaultTerm(self: *Solver, value: *Term, ty: Ir.TypeId, depth: usize) Ir.BuildError!void {
         if (depth >= max_depth) return;
         const t = root(value);
         switch (t.value) {
-            .unknown => t.value = .{ .link = try self.fromType(ty, t.span, depth + 1) },
+            .unknown => {
+                const fallback = try self.fromType(ty, t.span, depth + 1);
+                if (self.float_defaults_only) self.retainFloatDefaults(fallback, depth + 1);
+                t.value = .{ .link = fallback };
+            },
             .array => |element| switch (self.ir.getType(ty).?) {
                 .array => |fallback| try self.defaultTerm(element, fallback, depth + 1),
+                else => {},
+            },
+            .function => |function| switch (self.ir.getType(ty).?) {
+                .function => |fallback| {
+                    if (function.params.len != fallback.params.len) return;
+                    for (function.params, fallback.params) |param, candidate| try self.defaultTerm(param, candidate, depth + 1);
+                    try self.defaultTerm(function.result, fallback.result, depth + 1);
+                },
                 else => {},
             },
             .nominal => |nominal| switch (self.ir.getType(ty).?) {
@@ -1293,6 +1487,7 @@ const Solver = struct {
                 const value = try self.term(.unknown, span);
                 switch (std.zig.parseNumberLiteral(ast.tokenSlice(ast.firstToken(node)))) {
                     .int, .big_int => try self.defaults.append(self.allocator, .{ .term = value, .ty = try BodyChecker.defaultIntegerType(self.ir) }),
+                    .float => try self.defaults.append(self.allocator, .{ .term = value, .ty = try BodyChecker.defaultFloatType(self.ir) }),
                     else => {},
                 }
                 return value;
@@ -2750,7 +2945,7 @@ test "backtick instance terminal operands stop constraints and demand at first e
     for ([_]struct { tail: []const u8, tag: Module.Diagnostic.Tag }{
         .{ .tail = "let main:()=R[].f(true,@panic(\"stop\"))", .tag = .argument_count_mismatch },
         .{ .tail = "let main:()=R[].f(true,@panic(\"stop\"),unknown,unknown)", .tag = .argument_count_mismatch },
-        .{ .tail = "let main:()=R[].f(1.5,@panic(\"stop\"),true)", .tag = .unsupported_literal },
+        .{ .tail = "let main:()=R[].f(@as(int,1.5),@panic(\"stop\"),true)", .tag = .literal_type_mismatch },
         .{ .tail = "let main:()=R[].f(true,\"wrong\",@panic(\"stop\"))", .tag = .generic_function_conflict },
         .{ .tail = "@[noreturn]\nlet main:()=R[].f(if true{return}else{return},true,unknown)", .tag = .noreturn_return },
     }) |case| {

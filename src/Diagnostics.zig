@@ -71,6 +71,15 @@ fn spanSource(module: *const Module, compilation: ?*const Compilation, span: Sou
     return source;
 }
 
+fn numericLiteralKind(source: *const Source, span: Source.Span) []const u8 {
+    for (source.ast.tokens.items(.tag), source.ast.tokens.items(.start), 0..) |tag, start, i| {
+        if (start < span.start) continue;
+        if (start >= span.end) break;
+        if (tag == .number_literal) return if (std.zig.parseNumberLiteral(source.ast.tokenSlice(@intCast(i))) == .float) "float" else "integer";
+    }
+    return "numeric";
+}
+
 fn renderModuleWithSources(module: *const Module, compilation: ?*const Compilation, writer: *std.Io.Writer) !void {
     try render(module.source.ast, module.source.path, writer);
     for (module.diagnostics.items) |diagnostic| {
@@ -116,12 +125,12 @@ fn renderModuleWithSources(module: *const Module, compilation: ?*const Compilati
             .invalid_export_declaration => try writer.writeAll("@[export] requires an ordinary immutable top-level function with a body"),
             .invalid_export_attribute => try writer.writeAll("@[export] accepts no argument or one ordinary non-interpolated string literal, cannot be repeated, and cannot be combined with @[extern]"),
             .invalid_export_name => try writer.writeAll("export name must be a nonreserved ASCII C11 identifier outside the backend namespaces"),
-            .invalid_export_signature => try writer.writeAll("export ABI supports only bool and 8/16/32/64-bit integers, with void allowed only as the result"),
+            .invalid_export_signature => try writer.writeAll("export ABI supports only bool, f32/f64 and 8/16/32/64-bit integers, with void allowed only as the result"),
             .duplicate_export_name => try writer.writeAll("duplicate exported symbol"),
             .invalid_extern_declaration => try writer.writeAll("@[extern] requires an ordinary immutable top-level function prototype without a body"),
             .invalid_extern_attribute => try writer.writeAll("@[extern] accepts no argument or one ordinary non-interpolated string literal, cannot be repeated, and cannot be combined with @[export]"),
             .invalid_extern_name => try writer.writeAll("extern name must be a nonreserved ASCII C11 identifier outside the backend namespaces"),
-            .invalid_extern_signature => try writer.writeAll("extern ABI supports only bool and 8/16/32/64-bit integers, with void allowed only as the result"),
+            .invalid_extern_signature => try writer.writeAll("extern ABI supports only bool, f32/f64 and 8/16/32/64-bit integers, with void allowed only as the result"),
             .conflicting_foreign_signature => try writer.writeAll("foreign symbol declarations must have the same canonical signature and noreturn annotation"),
             .noreturn_result => try writer.writeAll("@[noreturn] function must return void"),
             .noreturn_return => try writer.writeAll("return is forbidden in an @[noreturn] function"),
@@ -157,10 +166,10 @@ fn renderModuleWithSources(module: *const Module, compilation: ?*const Compilati
             .invalid_literal => try writer.writeAll("invalid literal; rune literals require exactly one Unicode scalar"),
             .unsupported_literal => try writer.writeAll("this literal is not supported in semantic analysis yet"),
             .invalid_interpolation => try writer.writeAll("expected {expression}; blocks, control flow, quotes and format options are unsupported; escape literal braces as \\{ and \\}"),
-            .unsupported_interpolation_type => try writer.writeAll("interpolation requires a bool, integer, rune, string, printable array/struct/enum/union, or compile-time type; @[stringify] methods require signature (SelfType) -> string"),
+            .unsupported_interpolation_type => try writer.writeAll("interpolation requires a bool, integer, float, rune, string, printable array/struct/enum/union, or compile-time type; @[stringify] methods require signature (SelfType) -> string"),
             .unsupported_global_interpolation => try writer.writeAll("global strings require literal initializers; move interpolation into a function"),
             .literal_type_mismatch => try writer.writeAll("literal does not match the annotated type"),
-            .literal_out_of_range => try writer.writeAll("integer literal does not fit the annotated type"),
+            .literal_out_of_range => try writer.print("{s} literal does not fit the annotated type", .{numericLiteralKind(source, diagnostic.span)}),
             .unsupported_match_pattern => try writer.writeAll("match patterns support scalar literals, literal alternatives (|), union variants and wildcards (_) only"),
             .unsupported_match_subject => try writer.writeAll("match subjects must be bool, integer, rune or string values, or one enum or union value"),
             .match_missing_catchall => try writer.writeAll("match requires a final wildcard catchall (bounded exhaustiveness)"),
@@ -191,7 +200,7 @@ fn renderModuleWithSources(module: *const Module, compilation: ?*const Compilati
             .argument_count_mismatch => try writer.writeAll("argument count does not match the function signature"),
             .unresolved_value_type => try writer.writeAll("declaration needs a resolved type before use here"),
             .body_nesting_limit => try writer.writeAll("recursive body checking exceeds the current analysis limit of 128"),
-            .unsupported_global_initializer => try writer.writeAll("inferred globals require immutable bool/rune/string literals or @as(T, scalar literal); general global initialization is unsupported"),
+            .unsupported_global_initializer => try writer.writeAll("inferred globals require immutable integer/float/bool/rune/string literals or @as(T, scalar literal); general global initialization is unsupported"),
             .unsupported_lowering => try writer.writeAll("lowering this source form is not implemented yet"),
         }
         try location.renderExcerpt(source.ast.source, diagnostic.span.end - diagnostic.span.start, writer);
@@ -336,6 +345,21 @@ test "module duplicate parameter diagnostics include the first parameter" {
     );
 }
 
+test "float overflow diagnostics identify grouped negative literals and annotation locations" {
+    var module = try Module.init(std.testing.allocator, "float-range.nov", "let value: f32 = -{3.5e38}");
+    defer module.deinit();
+    try module.diagnostics.append(module.allocator, .{
+        .tag = .literal_out_of_range,
+        .span = .{ .start = 17, .end = 26 },
+        .related = .{ .start = 11, .end = 14 },
+    });
+    var output = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer output.deinit();
+    try renderModule(&module, &output.writer);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "float literal does not fit the annotated type") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "note: type annotation here") != null);
+}
+
 test "module literal diagnostics include the type annotation when present" {
     const Case = struct { tag: Module.Diagnostic.Tag, message: []const u8 };
     for ([_]Case{
@@ -380,7 +404,7 @@ test "module type and literal diagnostics render messages and source excerpts" {
         .{ .tag = .type_nesting_limit, .token = "i32", .underline = "^~~", .message = "type annotation nesting exceeds the current analysis limit of 128" },
         .{ .tag = .invalid_literal, .token = "123", .underline = "^~~", .message = "invalid literal; rune literals require exactly one Unicode scalar" },
         .{ .tag = .invalid_literal, .token = "'ab'", .underline = "^~~~", .message = "invalid literal; rune literals require exactly one Unicode scalar" },
-        .{ .tag = .unsupported_literal, .token = "1.5", .underline = "^~~", .message = "this literal is not supported in semantic analysis yet" },
+        .{ .tag = .literal_type_mismatch, .token = "1.5", .underline = "^~~", .message = "literal does not match the annotated type" },
     }) |case| {
         const source = try std.fmt.allocPrint(std.testing.allocator, "let value = {s}", .{case.token});
         defer std.testing.allocator.free(source);
@@ -431,7 +455,7 @@ test "module body diagnostics render messages and optional related notes" {
         .{ .tag = .not_callable, .message = "expression is not callable", .note = "type specified here" },
         .{ .tag = .unresolved_value_type, .message = "declaration needs a resolved type before use here", .note = "declaration here" },
         .{ .tag = .body_nesting_limit, .message = "recursive body checking exceeds the current analysis limit of 128" },
-        .{ .tag = .unsupported_global_initializer, .message = "inferred globals require immutable bool/rune/string literals or @as(T, scalar literal); general global initialization is unsupported" },
+        .{ .tag = .unsupported_global_initializer, .message = "inferred globals require immutable integer/float/bool/rune/string literals or @as(T, scalar literal); general global initialization is unsupported" },
         .{ .tag = .unsupported_lowering, .message = "lowering this source form is not implemented yet" },
     }) |case| {
         for ([_]bool{ true, false }) |with_related| {

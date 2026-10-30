@@ -50,6 +50,31 @@ results. See `examples/array-fields.nov`.
 
 ## Current delivered status
 
+Floats are implemented in the core/source pipeline and C backend. The accepted
+rules are `f32`/`f64`, with native `float` aliasing `f32` on 32-bit targets and
+`f64` on 64-bit targets. Float literals use late context-first native `float`
+fallback; integer literals may be checked directly in float contexts. Already
+typed integers, `f32` and `f64` require exact matches: no implicit conversions or
+numeric casts, and `@as` is only expected-type ascription.
+
+Decimal/hexadecimal literals round directly to the target width, diagnose finite
+overflow, and support underflow/subnormals and signed zero. Arrays, struct fields,
+union payloads, function signatures, closures/generics, bounded `@TypeOf` and
+scalar `@[extern]`/`@[export]` now support both widths (C `float`/`double`).
+`+ - * /`, unary negation, `+= -= *= /=`, equality, ordering and array membership
+use IEEE semantics. Division by zero yields infinity/NaN, not an integer panic;
+NaN is unequal and unordered, while signed zeroes compare equal. `%`/`%=`,
+bitwise operations, ranges and indices remain integer-only. Float match subjects,
+`f16`, `f80`, `f128`, numeric casts and shortest-decimal formatting remain deferred.
+
+Printing/interpolation and nested defaults use round-trip-safe `%.9g` for `f32`
+and `%.17g` for `f64`, normalizing `nan`, `inf`, `-inf`, `-0`, not shortest output.
+Generated C guards IEEE width/radix/subnormal support and `FLT_EVAL_METHOD == 0`,
+rejects fast-math and disables FP contraction. Embedding assumes the C numeric
+locale and normal round-to-nearest rounding. Float leaves add no GC roots;
+recursive copying and stringify hooks remain unchanged. See README's
+[float contract](README.md#floats) and `examples/floats.nov`.
+
 Bounded `@TypeOf(x)` is implemented in `TypeResolver`, `BodyChecker` and
 `GenericFunctions`. Exactly one operand must be a runtime binding identifier or
 an imported namespace value reference such as `lib.value` (with visibility
@@ -84,8 +109,8 @@ empty arrays still need an element type. `id(1)` infers `int` without other
 context, but a correlated typed sibling or expected result can infer `u8` first.
 There is no implicit numeric widening or size-based fallback: values outside
 native `int` bounds diagnose unless a fitting explicit type such as `u64`/`i128`
-is supplied (128-bit backend limits remain). Floats remain unsupported, not
-coerced to `int`. Direct nonnegative literal range bounds retain dedicated `uint`
+is supplied (128-bit backend limits remain). Float literals use their own late
+native `float` fallback, never `int`. Direct nonnegative literal range bounds retain dedicated `uint`
 defaulting; otherwise unconstrained numeric-expression bounds use `int`, with typed
 bounds taking precedence. Global initializers remain literal-only: no computation,
 value chains or array globals are added. Literal negation may group its operand
@@ -180,7 +205,7 @@ example-validation counts are claimed here.
 Arrays now support all existing storable runtime types: bool, integer, rune,
 string, enums, finite acyclic records, existing tagged unions, functions/closures,
 nested arrays and inferred integer ranges. `void` and compile-time `type` are not
-storable; floats are not implemented. Semantic integers extend through 128 bits;
+storable; `f32`/`f64` are supported. Semantic integers extend through 128 bits;
 reachable backend widths remain 8/16/32/64, including nested layouts and function
 signatures. No new range annotation syntax is added; integer fallback follows the
 context-first rules above.
@@ -256,7 +281,7 @@ parallel execution, test filters, timeout flags or automatic dependency-test dis
 See examples/tests.nov and README.
 
 Scoped borrowing now covers every supported non-void runtime value type: bool,
-integers, runes, strings, enums, structs/unions, arrays, ranges and functions. let ref=&local
+integers, floats, runes, strings, enums, structs/unions, arrays, ranges and functions. let ref=&local
 also supports readonly locals/parameters; mutability follows owner. Reads yield
 ordinary copied values, so copying/arguments/returns/methods do not escape references.
 Assignment writes the pointee, compounds/array updates use ordinary exact-type rules.
@@ -316,7 +341,7 @@ and recursively flattened string-owner roots preserve GC safety. Validation incl
 late generic layouts, forged cycles, deep graphs and zero-root diamond performance.
 See examples/nested-structs.nov. Array fields now work; union/function fields remain unsupported.
 
-Direct mutable-local struct fields support exact bool/integer/rune/string/enum assignment,
+Direct mutable-local struct fields support exact bool/integer/float/rune/string/enum assignment,
 integer +=/-=/*=//=/%= and string +=. Compounds snapshot the old field before RHS;
 final stores change only that field in the current local, preserving other-field
 and whole-record RHS changes. Terminal RHS skips the pending operation/store.
@@ -430,7 +455,7 @@ at collection; inaccessible or non-exact converters reject when requested.
 Default printability is recursive: functions/closures, ranges and void values have
 no default representation, including inside aggregates, unless a valid enclosing
 hook stops recursion before them (void union alternatives are payloadless and okay). Unspecialized generics and namespaces are not runtime
-printable; float remains unsupported by the language/runtime. Bare integer
+printable; floats use the round-trip-safe formatting contract above. Bare integer
 literals use ordinary context-first `int` fallback. This adds no builtin, array equality or other
 aggregate operations.
 
@@ -655,10 +680,11 @@ implemented; grapheme operations remain deferred.
   - `+` binary op is syntaxic sugar for Object.add, or iadd/fadd for int/float
   - How to handle string * int?
     - use String.repeat() (how to make it comptime?)
-  - How to handle int + float? or int + uint? or BigInt + int?
-    - have to cast variable e.g. `1.0 + @as(float, 3)`
-    - have seemless transition between numbers types, at least for int and uint
-    - for BigInt use addScalar
+  - Accepted numeric rule (implemented, not a proposal): typed operands must
+    match exactly; no implicit int/float, signedness or float-width conversions.
+    `1.0 + @as(float, 3)` supplies literal context, not a variable cast.
+    Numeric casts remain deferred; `@as` does not convert typed values.
+  - BigInt operations such as addScalar remain a separate future design.
 - optimize tail call recursion
 - tree shaking
 - constant folding
@@ -1235,8 +1261,9 @@ TODO:
 
 Implemented: `@[export]` (exact declaration name) and `@[export("symbol_name")]`
 (exact explicit C symbol) on ordinary immutable top-level functions. Export is
-independent of Nov `@[public]`. The initial ABI admits bool, 8/16/32/64-bit integers,
-native int/uint, and void results; unsupported names/signatures and duplicate symbols
+independent of Nov `@[public]`. The scalar ABI admits bool, 8/16/32/64-bit integers,
+native int/uint, `f32`/`f64` (including native `float`), and void results;
+unsupported names/signatures and duplicate symbols
 diagnose. `nov emit-c --library file.nov` emits a translation unit without a process
 main. Separate-TU C callers are tested with -O0/-O3 and strict warnings/UBSan. See
 README and examples/exports.nov for the supported contract.

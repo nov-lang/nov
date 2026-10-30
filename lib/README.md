@@ -80,11 +80,16 @@ in ordinary left-to-right order, including callback construction and the seed.
 Ordinary functions and capturing closures are supported, as are inferred generic
 closures/local generic functions within the bounded solver. Typed inputs, seeds,
 callback signatures, expected results and supported body constraints take precedence
-over integer fallback. Otherwise unconstrained integer literals default to signed
-pointer-sized `int`, including in nonempty and nested array arguments; empty arrays
-still need an element type. Remaining ambiguity is an error. There is no implicit
-numeric widening or size-based fallback, and floats remain unsupported rather than
-being coerced to `int`.
+over numeric literal fallback. Otherwise unconstrained integer literals default to
+signed pointer-sized `int` and float literals to native `float` (`f32` on 32-bit,
+`f64` on 64-bit targets), including in nonempty and nested array arguments; empty
+arrays still need an element type. `f32`/`f64` inputs, seeds, callback signatures
+and inferred generic specializations are supported. Integer literals can be checked
+directly in float contexts, but already typed integers and floats require exact
+matches: no implicit widening, signedness/float-width conversion or numeric casts.
+`@as` supplies context, not conversion. Remaining ambiguity is an error. See the
+root README's [float contract](../README.md#floats) and `examples/floats.nov` for
+IEEE arithmetic and round-trip-safe (not shortest) formatting.
 
 ```nov
 let std = @import("std")

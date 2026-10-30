@@ -156,6 +156,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     test_step.dependOn(constructor_shorthand_tests);
     addFieldMutationCliTests(b, exe, test_step, fixtures);
     addGenericStructCliTests(b, exe, test_step, fixtures);
+    const float_tests = b.step("test-cli-floats", "Run floating-point CLI tests");
+    addFloatCliTests(b, exe, float_tests);
+    test_step.dependOn(float_tests);
     const type_of_tests = b.step("test-cli-type-of", "Run bounded @TypeOf CLI tests");
     addTypeOfCliTests(b, exe, type_of_tests);
     test_step.dependOn(type_of_tests);
@@ -1797,6 +1800,69 @@ fn addGenericClosureCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_s
     }
 }
 
+fn addFloatCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    const fixtures = b.addWriteFiles();
+    const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
+    _ = fixtures.add("floats.nov", @embedFile("examples/floats.nov"));
+    for ([_][]const u8{ "fmt", "semantic" }) |mode| {
+        const check = b.addRunArtifact(exe);
+        check.step.name = b.fmt("CLI floats: {s}", .{mode});
+        check.setCwd(fixtures.getDirectory());
+        check.addArgs(if (std.mem.eql(u8, mode, "fmt")) &.{ "fmt", "--check", "floats.nov" } else &.{ "check", "--semantic", "floats.nov" });
+        if (!std.mem.eql(u8, mode, "fmt")) {
+            check.addArg("--lib-dir");
+            check.addDirectoryArg(library);
+        }
+        check.expectExitCode(0);
+        check.expectStdOutEqual("");
+        check.expectStdErrEqual("");
+        test_step.dependOn(&check.step);
+    }
+    for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+        for ([_][]const u8{ "run", "test" }) |command| {
+            const run = b.addRunArtifact(exe);
+            run.step.name = b.fmt("CLI floats: {s} {s}", .{ command, mode });
+            run.setCwd(fixtures.getDirectory());
+            run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+            run.setEnvironmentVariable("NOV_CC", "");
+            run.setEnvironmentVariable("CC", "");
+            run.addArgs(&.{ command, "floats.nov", "--lib-dir" });
+            run.addDirectoryArg(library);
+            if (mode.len != 0) run.addArg(mode);
+            run.expectExitCode(0);
+            run.expectStdOutEqual(if (std.mem.eql(u8, command, "run")) "Weighted mean: 2.5\nValues: [1, 0.25, 0.75]\nSpecial: inf -inf nan -0\n" else "PASS inference_and_target_rounding\nPASS ieee_comparisons_and_membership\nPASS mutation_copies_and_generic_containers\n3 passed; 0 failed; 3 total\n");
+            run.expectStdErrEqual("");
+            test_step.dependOn(&run.step);
+        }
+    }
+    for ([_]struct { name: []const u8, source: []const u8, diagnostic: []const u8 }{
+        .{ .name = "integer-variable", .source = "let main:()={let x=1\nlet y:f64=x\n}", .diagnostic = "expression does not match" },
+        .{ .name = "float-width", .source = "let main:()={let x:f32=1\nlet y:f64=x\n}", .diagnostic = "expression does not match" },
+        .{ .name = "integer-context", .source = "let x:int=1.5", .diagnostic = "literal does not match" },
+        .{ .name = "overflow", .source = "let x:f32=3.5e38", .diagnostic = "float literal does not fit" },
+        .{ .name = "default-overflow", .source = "let x=1e400", .diagnostic = "float literal does not fit" },
+        .{ .name = "modulo", .source = "let main:()={let x=1.5%1.0\n}", .diagnostic = "operator is not supported" },
+        .{ .name = "bitwise", .source = "let main:()={let x=1.5&1.0\n}", .diagnostic = "operator is not supported" },
+        .{ .name = "range", .source = "let main:()={let x=1.5..2.5\n}", .diagnostic = "literal does not match" },
+        .{ .name = "index", .source = "let main:()={let a=[1]\n@println(a[0.0])}", .diagnostic = "literal does not match" },
+        .{ .name = "f16", .source = "let x:f16=1.0", .diagnostic = "this type is not supported" },
+        .{ .name = "f80", .source = "let x:f80=1.0", .diagnostic = "this type is not supported" },
+        .{ .name = "f128", .source = "let x:f128=1.0", .diagnostic = "this type is not supported" },
+        .{ .name = "foreign-macro", .source = "@[export(\"FLT_RADIX\")]\nlet f:(x:f32)->f32=x", .diagnostic = "export name must" },
+    }) |case| {
+        const source = b.fmt("invalid-float-{s}.nov", .{case.name});
+        _ = fixtures.add(source, case.source);
+        const check = b.addRunArtifact(exe);
+        check.step.name = b.fmt("CLI floats reject: {s}", .{case.name});
+        check.setCwd(fixtures.getDirectory());
+        check.addArgs(&.{ "check", "--semantic", source });
+        check.expectExitCode(1);
+        check.expectStdOutEqual("");
+        check.expectStdErrMatch(case.diagnostic);
+        test_step.dependOn(&check.step);
+    }
+}
+
 fn addTypeOfCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     for ([_][]const u8{ "fmt", "semantic" }) |mode| {
         const check = b.addRunArtifact(exe);
@@ -1951,7 +2017,7 @@ fn addIntegerDefaultCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_s
         .{ .name = "nonliteral-narrowing", .source = "let main:()={let value=1\nlet narrow:u8=value\n}\n", .diagnostic = "expression does not match the expected type" },
         .{ .name = "local-overflow", .source = b.fmt("let main:()={{let value={s}\n}}\n", .{native_overflow}), .diagnostic = "integer literal does not fit" },
         .{ .name = "global-overflow", .source = b.fmt("let value={s}\n", .{native_overflow}), .diagnostic = "integer literal does not fit" },
-        .{ .name = "float", .source = "let main:()={let value=1.5\n}\n", .diagnostic = "this literal is not supported in semantic analysis yet" },
+        .{ .name = "float", .source = "let main:()={let value=1.5\n}\n", .diagnostic = "" },
         .{ .name = "empty-array", .source = "let main:()={let values=[]\n}\n", .diagnostic = "array literal needs an expected []T type" },
         .{ .name = "explicit-wide", .source = b.fmt("let value:u64={s}\nlet main:()={{let local:u64={s}\n}}\n", .{ native_overflow, native_overflow }), .diagnostic = "" },
     }) |case| {

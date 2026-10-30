@@ -190,7 +190,7 @@ fn failLiteral(module: *Module, tag: Module.Diagnostic.Tag, span: Module.Span, a
 
 fn internLiteral(module: *Module, ir: *Ir, expected: Ir.TypeId, value: Ir.Constant.Value, span: Module.Span, annotation: ?Module.Span) Error!Result {
     const constant = ir.internConstant(.{ .ty = expected, .value = value }) catch |err| switch (err) {
-        error.IntegerOutOfRange => return failLiteral(module, .literal_out_of_range, span, annotation),
+        error.IntegerOutOfRange, error.FloatOutOfRange => return failLiteral(module, .literal_out_of_range, span, annotation),
         error.ConstantTypeMismatch, error.NonConstantType => return failLiteral(module, .literal_type_mismatch, span, annotation),
         else => return err,
     };
@@ -199,13 +199,15 @@ fn internLiteral(module: *Module, ir: *Ir, expected: Ir.TypeId, value: Ir.Consta
 
 fn checkNumber(module: *Module, ir: *Ir, node: Ast.Node.Index, expected: Ir.TypeId, negative: bool, span: Module.Span, annotation: ?Module.Span) Error!Result {
     const bytes = module.source.ast.tokenSlice(module.source.ast.nodes.items(.main_token)[node]);
-    switch (std.zig.parseNumberLiteral(bytes)) {
-        .float => return failLiteral(module, .unsupported_literal, span, annotation),
-        .failure => return failLiteral(module, .invalid_literal, span, annotation),
-        else => {},
-    }
+    const parsed = std.zig.parseNumberLiteral(bytes);
+    if (parsed == .failure) return failLiteral(module, .invalid_literal, span, annotation);
     const ty = ir.getType(expected) orelse return error.InvalidTypeId;
-    if (ty != .integer) return failLiteral(module, .literal_type_mismatch, span, annotation);
+    if (ty == .float) return switch (ty.float) {
+        32 => checkFloat(f32, module, ir, bytes, expected, negative, span, annotation),
+        64 => checkFloat(f64, module, ir, bytes, expected, negative, span, annotation),
+        else => error.InvalidFloatWidth,
+    };
+    if (ty != .integer or parsed == .float) return failLiteral(module, .literal_type_mismatch, span, annotation);
     const magnitude = std.fmt.parseInt(u128, bytes, 0) catch |err| switch (err) {
         error.Overflow => return failLiteral(module, .literal_out_of_range, span, annotation),
         error.InvalidCharacter => return failLiteral(module, .invalid_literal, span, annotation),
@@ -229,6 +231,40 @@ fn checkNumber(module: *Module, ir: *Ir, node: Ast.Node.Index, expected: Ir.Type
     }
 }
 
+fn checkFloat(comptime F: type, module: *Module, ir: *Ir, bytes: []const u8, expected: Ir.TypeId, negative: bool, span: Module.Span, annotation: ?Module.Span) Error!Result {
+    var converted: std.ArrayList(u8) = .empty;
+    defer converted.deinit(module.allocator);
+    var spelling = bytes;
+    // parseFloat accepts decimal and hex. Repack binary/octal integers into
+    // exact hex digits before the single target-width rounding step.
+    if (bytes.len > 2 and bytes[0] == '0' and (bytes[1] == 'b' or bytes[1] == 'o')) {
+        try converted.appendSlice(module.allocator, "0x");
+        const digit_bits: u4 = if (bytes[1] == 'b') 1 else 3;
+        var pending: u16 = 0;
+        var count: u4 = 0;
+        var i = bytes.len;
+        while (i > 2) {
+            i -= 1;
+            if (bytes[i] == '_') continue;
+            pending |= @as(u16, bytes[i] - '0') << count;
+            count += digit_bits;
+            if (count >= 4) {
+                try converted.append(module.allocator, "0123456789abcdef"[pending & 15]);
+                pending >>= 4;
+                count -= 4;
+            }
+        }
+        if (count != 0) try converted.append(module.allocator, "0123456789abcdef"[pending]);
+        std.mem.reverse(u8, converted.items[2..]);
+        spelling = converted.items;
+    }
+    const magnitude = std.fmt.parseFloat(F, spelling) catch return failLiteral(module, .invalid_literal, span, annotation);
+    if (!std.math.isFinite(magnitude)) return failLiteral(module, .literal_out_of_range, span, annotation);
+    const value = if (negative) -magnitude else magnitude;
+    const bits: u64 = if (F == f32) @as(u32, @bitCast(value)) else @as(u64, @bitCast(value));
+    return internLiteral(module, ir, expected, .{ .float_bits = bits }, span, annotation);
+}
+
 fn testNode(module: *const Module, index: usize) Ast.Node.Index {
     return module.source.ast.decl(module.declarations.items[index].node).ast.init_node;
 }
@@ -237,6 +273,65 @@ const test_i8: Ir.Type = .{ .integer = .{ .signedness = .signed, .bits = 8 } };
 const test_u8: Ir.Type = .{ .integer = .{ .signedness = .unsigned, .bits = 8 } };
 const test_i128: Ir.Type = .{ .integer = .{ .signedness = .signed, .bits = 128 } };
 const test_u128: Ir.Type = .{ .integer = .{ .signedness = .unsigned, .bits = 128 } };
+
+test "float literals round once to target widths and preserve signed zero and underflow" {
+    const Case = struct { expression: []const u8, width: u16, bits: u64 };
+    for ([_]Case{
+        .{ .expression = "1.5", .width = 32, .bits = 0x3fc00000 },
+        .{ .expression = "{ -{0.0} }", .width = 32, .bits = 0x80000000 },
+        .{ .expression = "-0", .width = 32, .bits = 0x80000000 },
+        .{ .expression = "0x1.8p1", .width = 32, .bits = 0x40400000 },
+        .{ .expression = "0x1p-149", .width = 32, .bits = 1 },
+        .{ .expression = "1e-999", .width = 32, .bits = 0 },
+        .{ .expression = "-1e-999", .width = 32, .bits = 0x80000000 },
+        .{ .expression = "1.0000000596046447753906250000000001", .width = 32, .bits = 0x3f800001 },
+        .{ .expression = "16777217", .width = 32, .bits = 0x4b800000 },
+        .{ .expression = "0x1000001", .width = 32, .bits = 0x4b800000 },
+        .{ .expression = "0b1_1000", .width = 32, .bits = 0x41c00000 },
+        .{ .expression = "0o30", .width = 32, .bits = 0x41c00000 },
+        .{ .expression = "1_2.5", .width = 64, .bits = 0x4029000000000000 },
+        .{ .expression = "-0.0", .width = 64, .bits = 0x8000000000000000 },
+        .{ .expression = "0x1p-1074", .width = 64, .bits = 1 },
+        .{ .expression = "-1e-999", .width = 64, .bits = 0x8000000000000000 },
+        .{ .expression = "9007199254740993", .width = 64, .bits = 0x4340000000000000 },
+        .{ .expression = "340282366920938463463374607431768211456", .width = 64, .bits = 0x47f0000000000000 },
+    }) |case| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let value = {s}", .{case.expression});
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "float.nov", source);
+        defer module.deinit();
+        try std.testing.expect(!module.hasErrors());
+        var ir = Ir.init(std.testing.allocator);
+        defer ir.deinit();
+        const ty = try ir.internType(.{ .float = case.width });
+        const result = try check(&module, &ir, testNode(&module, 0), ty, null);
+        try std.testing.expect(result == .constant);
+        try std.testing.expectEqual(case.bits, ir.getConstant(result.constant).?.value.float_bits);
+        try std.testing.expect(!module.hasErrors());
+        try ir.verify();
+    }
+}
+
+test "float literal overflow and integer coercions diagnose without constants" {
+    const Case = struct { expression: []const u8, ty: Ir.Type, tag: Module.Diagnostic.Tag };
+    for ([_]Case{
+        .{ .expression = "3.5e38", .ty = .{ .float = 32 }, .tag = .literal_out_of_range },
+        .{ .expression = "-0x1p128", .ty = .{ .float = 32 }, .tag = .literal_out_of_range },
+        .{ .expression = "1e309", .ty = .{ .float = 64 }, .tag = .literal_out_of_range },
+        .{ .expression = "1.0", .ty = test_i8, .tag = .literal_type_mismatch },
+    }) |case| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let value = {s}", .{case.expression});
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "float-error.nov", source);
+        defer module.deinit();
+        var ir = Ir.init(std.testing.allocator);
+        defer ir.deinit();
+        const ty = try ir.internType(case.ty);
+        try std.testing.expectEqual(Result.failed, try check(&module, &ir, testNode(&module, 0), ty, null));
+        try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
+        try std.testing.expectEqual(@as(usize, 0), ir.constants.items.len);
+    }
+}
 
 test "rune constants are scalar codepoints with exact literal typing" {
     for ([_][]const u8{ "'é'", "'\\xE9'", "'\\u{e9}'" }) |text| {
@@ -348,8 +443,8 @@ test "invalid literals fail with source spans and only optional type notes" {
         .{ .expression = "false", .ty = .void, .tag = .literal_type_mismatch },
         .{ .expression = "1e", .ty = .boolean, .tag = .invalid_literal },
         .{ .expression = "0b102", .tag = .invalid_literal },
-        .{ .expression = "1.0", .tag = .unsupported_literal },
-        .{ .expression = "-1.0", .tag = .unsupported_literal },
+        .{ .expression = "1.0", .tag = .literal_type_mismatch },
+        .{ .expression = "-1.0", .tag = .literal_type_mismatch },
         .{ .expression = "'ab'", .tag = .invalid_literal },
         .{ .expression = "\"true\"", .tag = .literal_type_mismatch },
     }) |case| {
@@ -452,6 +547,22 @@ fn testStringAllocationFailures(allocator: std.mem.Allocator) !void {
     try std.testing.expectEqual(@as(usize, 1), ir.constants.items.len);
     try std.testing.expectEqual(@as(usize, 2), module.diagnostics.items.len);
     try ir.verify();
+}
+
+fn testFloatAllocationFailures(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "float-oom.nov", "let a = 0b1_1000\nlet b = 0o30\nlet c = -{0.0}\nlet d = 1e999");
+    defer module.deinit();
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    const ty = try ir.internType(.{ .float = 32 });
+    for (0..module.declarations.items.len) |i| _ = try check(&module, &ir, testNode(&module, i), ty, null);
+    try std.testing.expectEqual(@as(usize, 2), ir.constants.items.len);
+    try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+    try ir.verify();
+}
+
+test "float parsing and diagnostics clean up on every allocation failure" {
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testFloatAllocationFailures, .{});
 }
 
 test "string decoding and diagnostics clean up on every allocation failure" {

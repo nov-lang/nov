@@ -183,7 +183,7 @@ fn checkSupported(ast: Ast) !void {
                 }
                 const name = ast.tokenSlice(ast.firstToken(data.lhs));
                 if (field_tag == .identifier and primitives.isPrimitive(name)) {
-                    const allowed = [_][]const u8{ "void", "bool", "string", "rune", "int", "uint", "i8", "i16", "i32", "i64", "i128", "u8", "u16", "u32", "u64", "u128" };
+                    const allowed = [_][]const u8{ "void", "bool", "string", "rune", "float", "f32", "f64", "int", "uint", "i8", "i16", "i32", "i64", "i128", "u8", "u16", "u32", "u64", "u128" };
                     for (allowed) |scalar| {
                         if (std.mem.eql(u8, name, scalar)) break;
                     } else return error.UnsupportedSyntax;
@@ -197,7 +197,7 @@ fn checkSupported(ast: Ast) !void {
                     else => return error.UnsupportedSyntax,
                 }
                 const name = ast.tokenSlice(ast.nodes.items(.main_token)[data.rhs]);
-                const scalar_types = [_][]const u8{ "bool", "string", "rune", "i8", "i16", "i32", "i64", "i128", "u8", "u16", "u32", "u64", "u128", "int", "uint" };
+                const scalar_types = [_][]const u8{ "bool", "string", "rune", "float", "f32", "f64", "i8", "i16", "i32", "i64", "i128", "u8", "u16", "u32", "u64", "u128", "int", "uint" };
                 for (scalar_types) |scalar| {
                     if (std.mem.eql(u8, name, scalar)) break;
                 } else if (primitives.isPrimitive(name)) return error.UnsupportedSyntax;

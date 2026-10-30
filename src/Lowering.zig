@@ -1778,6 +1778,7 @@ test "inferred global boundary rejects computation blocks chains and runtime eff
         defer module.deinit();
         var sema = try lower(&module);
         defer sema.deinit();
+        if (!module.hasErrors()) std.debug.print("unexpected accepted global: {s}\n", .{source});
         try std.testing.expect(module.hasErrors());
         try std.testing.expect(!sema.lowering_complete);
         try std.testing.expectEqual(@as(usize, 0), sema.ir.functions.items.len);
@@ -2306,8 +2307,8 @@ fn testCompilationGlobalDiagnostic(allocator: std.mem.Allocator, source: []const
 
 test "compilation deferred globals preserve standalone diagnostics root and imported source spans under OOM" {
     const cases = [_]struct { source: []const u8, tag: Module.Diagnostic.Tag }{
-        .{ .source = "let n=1.5", .tag = .unsupported_literal },
-        .{ .source = "let n=-1.5", .tag = .unsupported_literal },
+        .{ .source = "let n=@as(int,1.5)", .tag = .literal_type_mismatch },
+        .{ .source = "let n=@as(int,-1.5)", .tag = .literal_type_mismatch },
         .{ .source = "let n=@as(int,missing)", .tag = .unknown_name },
         .{ .source = "let n=@as(int,missing())", .tag = .unsupported_dependency_expression },
         .{ .source = "let n=@as(int,{1})", .tag = .unsupported_global_initializer },

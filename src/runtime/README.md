@@ -142,10 +142,35 @@ compatible, fundamentally aligned and nonreentrant. No hook may reenter the heap
 checks. GCC can run the same harness with the identical flags. The harness counts
 outstanding host allocations to check deterministic cleanup.
 
+## Generated floats
+
+`f32`/`f64` are inline scalar C `float`/`double` values, including in arrays,
+record fields, active union payloads, function signatures and closure captures.
+Native `float` aliases `f32` on 32-bit targets and `f64` on 64-bit targets.
+Both widths are supported by the scalar extern/export ABI. They introduce no GC
+roots or managed pointer fields; existing recursive copy boundaries, closure
+sharing and stringify-hook behavior are unchanged.
+
+Generated C guards IEEE storage widths, binary radix, subnormal support and
+`FLT_EVAL_METHOD == 0`, rejects fast-math and disables FP contraction. Embedding
+assumes the C numeric locale and normal round-to-nearest rounding environment.
+Float arithmetic/comparisons and array membership use IEEE semantics: division by
+zero yields infinity/NaN rather than an integer panic; NaN is unequal and
+unordered, while positive/negative zero compare equal. Literals round directly to
+target width, diagnose finite overflow and support subnormals/underflow.
+
+Direct printing, interpolation and nested default formatting share round-trip-safe
+`%.9g` (`f32`) / `%.17g` (`f64`) output, normalizing `nan`, `inf`, `-inf`, `-0`.
+This is not shortest-decimal formatting. Float formatting may allocate strings
+through the existing managed string path, but float leaves themselves are untraced.
+`f16`/`f80`/`f128` and float match subjects remain deferred; remainder, bitwise
+operations, ranges and indices remain integer-only. See the root README's
+[float contract](../../README.md#floats) and `examples/floats.nov`.
+
 ## Generated nominal value structs
 
 Bounded plain/generic records use inline C value structs, not GC allocations for
-the records themselves. Fields support bool/integer/rune/enum scalars, immutable
+the records themselves. Fields support bool/integer/float/rune/enum scalars, immutable
 `nov_string`, acyclic nested records and arrays of supported elements. Record arrays
 and struct payloads of unions may contain these array-bearing records. Nested
 arrays are supported. Layout cycles (including through arrays), direct union/function
@@ -241,8 +266,8 @@ call checks across loop backedges. Without effect summaries this remains conserv
 
 Arrays support every existing storable runtime type: bool, integer, rune, string,
 enum, finite acyclic record, existing tagged union, function/closure, nested array
-and inferred integer range. `void` and compile-time `type` are not storable; floats
-are not implemented. Semantic integer widths extend through 128 bits, but reachable
+and inferred integer range, plus `f32`/`f64`. `void` and compile-time `type` are
+not storable. Semantic integer widths extend through 128 bits, but reachable
 backend leaves and function signatures still require 8/16/32/64-bit widths; native
 `int/uint` retain their pointer-width contract. There is no new range annotation
 syntax. Storage support does not grant equality, membership or printing: enums

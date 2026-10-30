@@ -39,6 +39,16 @@ pub fn validExternName(name: []const u8) bool {
     for ([_][]const u8{ "nov_rt_", "nov_gc_", "nov_fn_", "nov_record_", "nov_range_", "nov_string", "nov_array", "nov_M", "nov_element_", "nov_to_string_", "NOV_GC_" }) |prefix| {
         if (std.mem.startsWith(u8, name, prefix)) return false;
     }
+    // float.h is emitted for reachable floats, including signature-only uses.
+    // Reserve exact C11 macro names, not unrelated FLT_/DBL_/LDBL_ user names.
+    for ([_][]const u8{ "FLT_RADIX", "FLT_ROUNDS", "FLT_EVAL_METHOD", "DECIMAL_DIG" }) |macro| {
+        if (std.mem.eql(u8, name, macro)) return false;
+    }
+    inline for (.{ "FLT", "DBL", "LDBL" }) |prefix| {
+        inline for (.{ "MANT_DIG", "DIG", "MIN_EXP", "MIN_10_EXP", "MAX_EXP", "MAX_10_EXP", "MAX", "EPSILON", "MIN", "TRUE_MIN", "HAS_SUBNORM", "DECIMAL_DIG" }) |suffix| {
+            if (std.mem.eql(u8, name, prefix ++ "_" ++ suffix)) return false;
+        }
+    }
     // Integer limits, constructors and format macros from stdint/inttypes.
     // Do not reserve unrelated user names such as INTERFACE or PRIVATE.
     inline for (.{ "8", "16", "32", "64", "MAX", "PTR", "_LEAST8", "_LEAST16", "_LEAST32", "_LEAST64", "_FAST8", "_FAST16", "_FAST32", "_FAST64" }) |width| {
@@ -110,6 +120,23 @@ pub fn validName(name: []const u8) bool {
     var names = std.mem.tokenizeScalar(u8, reserved, ' ');
     while (names.next()) |word| if (std.mem.eql(u8, word, name)) return false;
     return true;
+}
+
+test "foreign names reject all C11 float header macros in every precision" {
+    const macros =
+        "FLT_RADIX FLT_ROUNDS FLT_EVAL_METHOD DECIMAL_DIG " ++
+        "FLT_MANT_DIG FLT_DIG FLT_MIN_EXP FLT_MIN_10_EXP FLT_MAX_EXP FLT_MAX_10_EXP FLT_MAX FLT_EPSILON FLT_MIN FLT_TRUE_MIN FLT_HAS_SUBNORM FLT_DECIMAL_DIG " ++
+        "DBL_MANT_DIG DBL_DIG DBL_MIN_EXP DBL_MIN_10_EXP DBL_MAX_EXP DBL_MAX_10_EXP DBL_MAX DBL_EPSILON DBL_MIN DBL_TRUE_MIN DBL_HAS_SUBNORM DBL_DECIMAL_DIG " ++
+        "LDBL_MANT_DIG LDBL_DIG LDBL_MIN_EXP LDBL_MIN_10_EXP LDBL_MAX_EXP LDBL_MAX_10_EXP LDBL_MAX LDBL_EPSILON LDBL_MIN LDBL_TRUE_MIN LDBL_HAS_SUBNORM LDBL_DECIMAL_DIG";
+    var names = std.mem.tokenizeScalar(u8, macros, ' ');
+    while (names.next()) |name| {
+        try std.testing.expect(!validExternName(name));
+        try std.testing.expect(!validName(name));
+    }
+    for ([_][]const u8{ "FLT", "DBL", "LDBL", "FLT_MAX_value", "DBL_MANT_DIG_value", "LDBL_custom", "DECIMAL_DIGITS" }) |name| {
+        try std.testing.expect(validExternName(name));
+        try std.testing.expect(validName(name));
+    }
 }
 
 test "foreign names reject integer least and fast limit macros in every width" {

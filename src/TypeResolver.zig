@@ -265,6 +265,9 @@ fn resolveDepth(module: *Module, ir: *Ir, node: Ast.Node.Index, depth: usize, al
     if (std.mem.eql(u8, name, "rune")) return try ir.internType(.rune);
     if (std.mem.eql(u8, name, "bool")) return try ir.internType(.boolean);
     if (std.mem.eql(u8, name, "void")) return try ir.internType(.void);
+    if (std.mem.eql(u8, name, "float")) return try ir.internType(.{ .float = Ir.native_float_bits });
+    if (std.mem.eql(u8, name, "f32")) return try ir.internType(.{ .float = 32 });
+    if (std.mem.eql(u8, name, "f64")) return try ir.internType(.{ .float = 64 });
     if (std.mem.eql(u8, name, "int") or std.mem.eql(u8, name, "uint")) {
         return try ir.internType(.{ .integer = .{
             .signedness = if (name[0] == 'i') .signed else .unsigned,
@@ -323,6 +326,11 @@ fn resolveValueType(module: *Module, ir: *Ir, node: Ast.Node.Index, env: Environ
     if (full.init_node == 0) return diagnose(module, node, .unresolved_value_type);
     const global_ast = &owner.source.ast;
     var initializer = full.init_node;
+    var group_buffer: [2]Ast.Node.Index = undefined;
+    while (global_ast.fullBlock(&group_buffer, initializer)) |block| {
+        if (global_ast.firstToken(initializer) != block.ast.lbrace or block.ast.statements.len != 1) return diagnose(module, node, .unresolved_value_type);
+        initializer = block.ast.statements[0];
+    }
     if (global_ast.fullCall(initializer)) |call| {
         if (global_ast.nodes.items(.tag)[call.ast.fn_expr] == .builtin_literal and std.mem.eql(u8, global_ast.tokenSlice(global_ast.firstToken(call.ast.fn_expr)), "@as")) {
             if (call.ast.args.len != 2) return diagnose(owner, initializer, .argument_count_mismatch);
@@ -349,6 +357,7 @@ fn resolveValueType(module: *Module, ir: *Ir, node: Ast.Node.Index, env: Environ
             }
             switch (std.zig.parseNumberLiteral(global_ast.tokenSlice(global_ast.firstToken(initializer)))) {
                 .int, .big_int => return try ir.internType(.{ .integer = .{ .signedness = .signed, .bits = Ir.native_pointer_bits } }),
+                .float => return try ir.internType(.{ .float = Ir.native_float_bits }),
                 else => return diagnose(module, node, .unresolved_value_type),
             }
         },
@@ -667,6 +676,40 @@ test "explicit primitive types have canonical identities and widths" {
     try ir.verify();
 }
 
+test "float types aliases and TypeOf globals resolve without evaluating constants" {
+    var module = try Module.init(std.testing.allocator, "float-types.nov",
+        \\let Narrow = f32
+        \\let Wide = f64
+        \\let a: Narrow
+        \\let b: Wide
+        \\let c: float
+        \\let fraction = -{0.5}
+        \\let grouped = {0x1.8p2}
+        \\let narrowed = @as(f32, 1)
+        \\let d: @TypeOf(fraction)
+        \\let e: @TypeOf(grouped)
+        \\let f: @TypeOf(narrowed)
+        \\let g: (f32, float) -> f64
+    );
+    defer module.deinit();
+    try module.classifyAliases();
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    const narrow = try ir.internType(.{ .float = 32 });
+    const wide = try ir.internType(.{ .float = 64 });
+    const native = try ir.internType(.{ .float = Ir.native_float_bits });
+    const expected = [_]Ir.TypeId{ narrow, wide, native, native, native, narrow };
+    for ([_][]const u8{ "a", "b", "c", "d", "e", "f" }, expected) |name, ty| {
+        try std.testing.expectEqual(ty, (try resolve(&module, &ir, testTypeNode(&module, name))).?);
+    }
+    const signature = (try resolve(&module, &ir, testTypeNode(&module, "g"))).?;
+    try std.testing.expectEqualSlices(Ir.TypeId, &.{ narrow, native }, ir.getType(signature).?.function.params);
+    try std.testing.expectEqual(wide, ir.getType(signature).?.function.result);
+    try std.testing.expectEqual(@as(usize, 0), ir.constants.items.len);
+    try std.testing.expect(!module.hasErrors());
+    try ir.verify();
+}
+
 test "native integer aliases canonicalize with fixed width types and signatures" {
     const source = try std.fmt.allocPrint(std.testing.allocator, "let a: int\nlet b: i{d}\nlet c: uint\nlet d: u{d}\nlet e: (int, (uint) -> int) -> uint\nlet f: (i{d}, (u{d}) -> i{d}) -> u{d}", .{ @bitSizeOf(usize), @bitSizeOf(usize), @bitSizeOf(usize), @bitSizeOf(usize), @bitSizeOf(usize), @bitSizeOf(usize) });
     defer std.testing.allocator.free(source);
@@ -755,7 +798,7 @@ test "unsupported unknown and non-type forms have source diagnostics" {
         try std.testing.expectEqualStrings(case.span, module.sourceSlice(diagnostic.span).?);
         try std.testing.expect(diagnostic.related == null);
     }
-    for ([_][]const u8{ "float", "f16", "f32", "f64", "f80", "f128", "type" }) |name| {
+    for ([_][]const u8{ "f16", "f80", "f128", "type" }) |name| {
         const source = try std.fmt.allocPrint(std.testing.allocator, "let value: {s}", .{name});
         defer std.testing.allocator.free(source);
         var module = try Module.init(std.testing.allocator, "unsupported.nov", source);
@@ -807,7 +850,7 @@ test "individual parameter and result failures never intern a successful signatu
         .{ .source = "let value: (x: void)", .tag = .invalid_parameter_type },
         .{ .source = "let value: (Missing)", .tag = .unknown_type },
         .{ .source = "let value: (i32) -> Missing", .tag = .unknown_type },
-        .{ .source = "let value: (i32) -> float", .tag = .unsupported_type },
+        .{ .source = "let value: (i32) -> f16", .tag = .unsupported_type },
         .{ .source = "let value: (true)", .tag = .not_a_type },
         .{ .source = "let value: ((void))", .tag = .invalid_parameter_type },
     }) |case| {
