@@ -156,6 +156,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     test_step.dependOn(constructor_shorthand_tests);
     addFieldMutationCliTests(b, exe, test_step, fixtures);
     addGenericStructCliTests(b, exe, test_step, fixtures);
+    const quoted_interpolation_tests = b.step("test-cli-quoted-interpolation", "Run quoted interpolation CLI tests");
+    addQuotedInterpolationCliTests(b, exe, quoted_interpolation_tests);
+    test_step.dependOn(quoted_interpolation_tests);
     const float_tests = b.step("test-cli-floats", "Run floating-point CLI tests");
     addFloatCliTests(b, exe, float_tests);
     test_step.dependOn(float_tests);
@@ -447,7 +450,7 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         .{ .name = "fmt ascription", .args = &.{ "fmt", "--check", "ascription.nov" }, .exit_code = 0 },
         .{ .name = "check interpolation", .args = &.{ "check", "--semantic", "interpolation.nov" }, .exit_code = 0 },
         .{ .name = "fmt interpolation", .args = &.{ "fmt", "--check", "interpolation.nov" }, .exit_code = 0 },
-        .{ .name = "reject interpolation formats", .args = &.{ "emit-c", "interpolation-format.nov" }, .exit_code = 1, .stderr_match = "expected {expression}; blocks, control flow, quotes and format options are unsupported" },
+        .{ .name = "reject interpolation formats", .args = &.{ "emit-c", "interpolation-format.nov" }, .exit_code = 1, .stderr_match = "expected {expression}; blocks, control flow, comments and format options are unsupported" },
         .{ .name = "reject interpolation unknown names", .args = &.{ "emit-c", "interpolation-name.nov" }, .exit_code = 1, .stderr_match = "unknown name 'missing'" },
         .{ .name = "reject global interpolation", .args = &.{ "check", "--semantic", "interpolation-global.nov" }, .exit_code = 1, .stderr_match = "global strings require literal initializers; move interpolation into a function" },
         .{ .name = "check unchanged fibo", .args = &.{ "check", "--semantic", "fibo.nov" }, .exit_code = 0 },
@@ -1464,7 +1467,7 @@ fn addRuneCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.
         .{ .name = "order", .source = "let main: () = @println('a' < 'b')\n" },
         .{ .name = "bitwise", .source = "let main: () = @println('a' | 'b')\n" },
         .{ .name = "range", .source = "let main: () = {loop r in 'a'..'z' {}}\n" },
-        .{ .name = "inline-interpolation", .source = "let main: () = @println(\"{'a'}\")\n" },
+        .{ .name = "invalid-inline-rune", .source = "let main: () = @println(\"{'ab'}\")\n" },
         .{ .name = "empty", .source = "let value = ''\n" },
         .{ .name = "multiple", .source = "let value = 'ab'\n" },
         .{ .name = "combining", .source = "let value = 'é'\n" },
@@ -1797,6 +1800,37 @@ fn addGenericClosureCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_s
         check.expectStdOutEqual("");
         if (case.diagnostic.len == 0) check.expectStdErrEqual("") else check.expectStdErrMatch(case.diagnostic);
         test_step.dependOn(&check.step);
+    }
+}
+
+fn addQuotedInterpolationCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    const fixtures = b.addWriteFiles();
+    _ = fixtures.add("quoted-interpolation.nov", @embedFile("examples/quoted-interpolation.nov"));
+    for ([_][]const u8{ "fmt", "semantic" }) |mode| {
+        const check = b.addRunArtifact(exe);
+        check.step.name = b.fmt("CLI quoted interpolation: {s}", .{mode});
+        check.setCwd(fixtures.getDirectory());
+        check.addArgs(if (std.mem.eql(u8, mode, "fmt")) &.{ "fmt", "--check", "quoted-interpolation.nov" } else &.{ "check", "--semantic", "quoted-interpolation.nov" });
+        check.expectExitCode(0);
+        check.expectStdOutEqual("");
+        check.expectStdErrEqual("");
+        test_step.dependOn(&check.step);
+    }
+    for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+        for ([_][]const u8{ "run", "test" }) |command| {
+            const run = b.addRunArtifact(exe);
+            run.step.name = b.fmt("CLI quoted interpolation: {s} {s}", .{ command, mode });
+            run.setCwd(fixtures.getDirectory());
+            run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+            run.setEnvironmentVariable("NOV_CC", "");
+            run.setEnvironmentVariable("CC", "");
+            run.addArgs(&.{ command, "quoted-interpolation.nov" });
+            if (mode.len != 0) run.addArg(mode);
+            run.expectExitCode(0);
+            run.expectStdOutEqual(if (std.mem.eql(u8, command, "run")) "a\nHello Ada!\nBraces: {} and é\nNested: hello world\nEscapes: \" \\\n" else "PASS quoted_literals_and_nested_interpolation\nPASS quoted_arguments_evaluate_once_in_order\n2 passed; 0 failed; 2 total\n");
+            run.expectStdErrEqual("");
+            test_step.dependOn(&run.step);
+        }
     }
 }
 

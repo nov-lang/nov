@@ -1,0 +1,37 @@
+; nov run examples/quoted-interpolation.nov
+; nov test examples/quoted-interpolation.nov
+; Inside a placeholder, quotes and escapes belong to the inner expression.
+
+let greet: (name: string) -> string = "Hello {name}!"
+
+let main: () = {
+    @println("{"a"}")
+    @println("{greet("Ada")}")
+    @println("Braces: {'{'}{'}'} and {'é'}")
+    @println("Nested: {"hello {"world"}"}")
+    @println("Escapes: {"\""} {"\\"}")
+}
+
+@[test]
+let quoted_literals_and_nested_interpolation: () = {
+    @assert("{"a"}" == "a")
+    @assert("{greet("Ada")}" == "Hello Ada!")
+    @assert("{'{'}{'}'}" == "\{\}")
+    @assert("{'é'}" == "é")
+    @assert("{1 in [1, 2]}" == "true")
+    @assert("{"hello {"world"}"}" == "hello world")
+    @assert("{"\u{1f600}\0"}" == "😀\0")
+    @assert("{"\""}{"\\"}" == "\"\\")
+}
+
+@[test]
+let quoted_arguments_evaluate_once_in_order: () = {
+    let mut calls = 0
+    let next = (text: string) -> string {
+        calls += 1
+        "{calls}:{text}"
+    }
+    let result = "{next("a")}/{next("nested {next("b")}")}"
+    @assert(result == "1:a/3:nested 2:b")
+    @assert(calls == 3)
+}

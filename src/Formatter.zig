@@ -789,6 +789,23 @@ test "array formatting survives every allocation failure" {
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testArrayAllocationFailures, .{});
 }
 
+test "quoted interpolation formatting preserves nested literal bytes and idempotence" {
+    const source: [:0]const u8 =
+        \\let greet:(name:string)->string="Hello {name}!"
+        \\let main:()={@println("{"a"}","{greet("Ada")}","{'é'}","{"nested {"value"}"}","{"\"\\\u{1f600}"}")}
+    ;
+    const formatted = try format(std.testing.allocator, source);
+    defer std.testing.allocator.free(formatted);
+    const terminated = try std.testing.allocator.dupeSentinel(u8, formatted, 0);
+    defer std.testing.allocator.free(terminated);
+    const again = try format(std.testing.allocator, terminated);
+    defer std.testing.allocator.free(again);
+    try std.testing.expectEqualStrings(formatted, again);
+    for ([_][]const u8{ "\"{\"a\"}\"", "\"{greet(\"Ada\")}\"", "\"{'é'}\"", "\"{\"nested {\"value\"}\"}\"" }) |literal| {
+        try std.testing.expect(std.mem.indexOf(u8, formatted, literal) != null);
+    }
+}
+
 test "TypeOf formatting preserves annotations type arguments and interpolation" {
     try expectFormatted(
         "let n=1\nlet T=@TypeOf(n)\nlet f:(x:int)->@TypeOf(x)={let y:[]@TypeOf(x)=[x]\n@println(@TypeOf(y),\"{@TypeOf(x)}\")\nx}",

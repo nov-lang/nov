@@ -30,6 +30,7 @@ const TestAllocations = @import("TestAllocations.zig");
 const string_literal = @import("string_literal.zig");
 const Formatter = @import("Formatter.zig");
 const Tokenizer = @import("Tokenizer.zig");
+const Interpolation = @import("Interpolation.zig");
 const Ast = @import("Ast.zig");
 const Token = Tokenizer.Token;
 const Node = Ast.Node;
@@ -112,8 +113,10 @@ pub fn parse(allocator: Allocator, source: [:0]const u8) Allocator.Error!Ast {
 /// The literal's data indexes an extra_data slice (zero denotes invalid syntax).
 fn parseInterpolations(self: *Parser, tokens: *Ast.TokenList) Allocator.Error!void {
     const original_tokens = tokens.len;
-    const original_nodes = self.nodes.len;
-    for (0..original_nodes) |index| {
+    // Fragment parsing can append strings with placeholders of their own.
+    // Visit the growing node list iteratively rather than recursing.
+    var index: usize = 0;
+    while (index < self.nodes.len) : (index += 1) {
         if (self.nodes.items(.tag)[index] != .string_literal) continue;
         const token = self.nodes.items(.main_token)[index];
         var lexer = Tokenizer.init(self.source);
@@ -135,9 +138,7 @@ fn parseInterpolations(self: *Parser, tokens: *Ast.TokenList) Allocator.Error!vo
                 continue;
             }
             const start = offset + 1;
-            offset = start;
-            while (offset < bytes.len - 1 and bytes[offset] != '}') : (offset += 1) {}
-            if (offset == bytes.len - 1) break;
+            offset = Interpolation.placeholderEnd(bytes, start) orelse break;
             const expression = try self.interpolationExpression(tokens, literal.start + start, literal.start + offset);
             try self.scratch.append(self.allocator, expression);
             offset += 1;
@@ -156,21 +157,40 @@ fn parseInterpolations(self: *Parser, tokens: *Ast.TokenList) Allocator.Error!vo
 }
 
 fn interpolationExpression(self: *Parser, tokens: *Ast.TokenList, start: usize, end: usize) Allocator.Error!Node.Index {
-    // Quoting/escaping a nested source language is deliberately not defined yet.
-    // Reject statement/control syntax as well, rather than inheriting terminal
-    // paths or allowing a trailing statement to escape the placeholder.
+    // Restrict syntax at token boundaries: quotes, braces and escapes inside
+    // literal/identifier tokens do not belong to the placeholder grammar.
     const raw = self.source[start..end];
-    if (std.mem.indexOfAny(u8, raw, "\"'{};\\") != null) return 0;
     const fragment = try self.allocator.dupeSentinel(u8, raw, 0);
     defer self.allocator.free(fragment);
     const first: TokenIndex = @intCast(tokens.len);
     var lexer = Tokenizer.init(fragment);
     var valid = true;
+    var previous_end: usize = 0;
     while (true) {
         const token = lexer.next();
+        // Ordinary comments are skipped by the tokenizer. Only whitespace may
+        // occur between tokens; this also rejects skipped shebangs/comments.
+        if (std.mem.trim(u8, raw[previous_end..token.start], " \t\r").len != 0) valid = false;
+        previous_end = token.end;
         switch (token.tag) {
             .invalid,
+            .doc_comment,
+            .newline,
+            .l_brace,
+            .r_brace,
             .colon,
+            .keyword_else,
+            .keyword_struct,
+            .keyword_enum,
+            .keyword_union,
+            .keyword_async,
+            .keyword_await,
+            .keyword_yield,
+            .keyword_resume,
+            .keyword_suspend,
+            .keyword_nosuspend,
+            .keyword_opaque,
+            .keyword_unroll,
             .keyword_return,
             .keyword_break,
             .keyword_continue,
@@ -2034,6 +2054,122 @@ test "ascription parses explicit array and function types in ordinary call views
     try std.testing.expectEqualStrings("@as", ast.tokenSlice(ast.firstToken(function.ast.fn_expr)));
     try std.testing.expectEqualStrings(")", ast.tokenSlice(ast.lastToken(ast.decl(ast.rootDecls()[1]).ast.init_node)));
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
+}
+
+test "quoted interpolation recursively populates nested strings with exact spans and OOM" {
+    const source = "let text=\"{\"a\"}:{greet(\"Ada\")}:{\"inner {greet(\"deep {name}\")}\"}:{f('{', '}', '\\'', '\\\\', '\\u{7d}')}:{\"\\\"\\u{7b}\\{\\}\"}:{@\"unbalanced { name\"}\"\nlet later=42";
+    var ast = try parse(std.testing.allocator, source);
+    defer ast.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    const outer = ast.decl(ast.rootDecls()[0]).ast.init_node;
+    const data = ast.nodes.items(.data)[outer];
+    const expressions = ast.extra_data[data.lhs..data.rhs];
+    try std.testing.expectEqual(@as(usize, 6), expressions.len);
+    for (expressions, [_][]const u8{
+        "\"a\"",                                 "greet(\"Ada\")",        "\"inner {greet(\"deep {name}\")}\"",
+        "f('{', '}', '\\'', '\\\\', '\\u{7d}')", "\"\\\"\\u{7b}\\{\\}\"", "@\"unbalanced { name\"",
+    }) |node, expected| {
+        try std.testing.expect(node != 0);
+        try std.testing.expectEqualStrings(expected, ast.getNodeSource(node));
+    }
+    const nested = ast.nodes.items(.data)[expressions[2]];
+    try std.testing.expectEqual(@as(u32, 1), nested.rhs - nested.lhs);
+    const call = ast.fullCall(ast.extra_data[nested.lhs]).?;
+    const deep = ast.nodes.items(.data)[call.ast.args[0]];
+    try std.testing.expectEqual(@as(u32, 1), deep.rhs - deep.lhs);
+    try std.testing.expectEqualStrings("name", ast.getNodeSource(ast.extra_data[deep.lhs]));
+    try std.testing.expectEqualStrings("let later=42", ast.getNodeSource(ast.rootDecls()[1]));
+    try std.testing.expectEqualStrings(source, ast.getNodeSource(0));
+    try std.testing.expectEqual(source.len, ast.tokens.items(.start)[ast.lastToken(0)]);
+    var lexer = Tokenizer.init(source);
+    var index: usize = 0;
+    while (true) : (index += 1) {
+        const token = lexer.next();
+        try std.testing.expectEqual(token.tag, ast.tokens.items(.tag)[index]);
+        try std.testing.expectEqual(token.start, ast.tokens.items(.start)[index]);
+        if (token.tag == .eof) break;
+    }
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
+}
+
+test "quoted interpolation rejects outside syntax but permits quoted punctuation" {
+    for ([_][:0]const u8{
+        "let text=\"{{1}}\"",                  "let text=\"{f({1})}\"",
+        "let text=\"{if true {1}}\"",          "let text=\"{return \"x\"}\"",
+        "let text=\"{f(\"x\"); comment}\"",    "let text=\"{f(\"x\");;; doc}\"",
+        "let text=\"{f(\"x\"):format}\"",      "let text=\"{f(\"x\")\\n}\"",
+        "let text=\"{greet(\"Ada\",)} {f(}\"",
+    }) |source| {
+        var ast = try parse(std.testing.allocator, source);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+        const node = ast.decl(ast.rootDecls()[0]).ast.init_node;
+        const data = ast.nodes.items(.data)[node];
+        try std.testing.expect(data.rhs > data.lhs);
+        try std.testing.expectEqual(@as(Node.Index, 0), ast.extra_data[data.rhs - 1]);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
+    }
+    for ([_][:0]const u8{
+        "let text=\"{\"; : \\\\ \\{ \\}\"}\"",
+        "let text=\"{f(';', ':', '{', '}', '\\\\')}\"",
+    }) |source| {
+        var ast = try parse(std.testing.allocator, source);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+        const data = ast.nodes.items(.data)[ast.decl(ast.rootDecls()[0]).ast.init_node];
+        try std.testing.expectEqual(@as(u32, 1), data.rhs - data.lhs);
+        try std.testing.expect(ast.extra_data[data.lhs] != 0);
+    }
+}
+
+test "quoted interpolation walks deeply nested strings without recursion" {
+    const levels = 60;
+    var source: ["let text=".len + levels * 4 + 3:0]u8 = undefined;
+    @memcpy(source[0.."let text=".len], "let text=");
+    var offset: usize = "let text=".len;
+    for (0..levels) |_| {
+        @memcpy(source[offset..][0..2], "\"{");
+        offset += 2;
+    }
+    @memcpy(source[offset..][0..3], "\"a\"");
+    offset += 3;
+    for (0..levels) |_| {
+        @memcpy(source[offset..][0..2], "}\"");
+        offset += 2;
+    }
+    source[offset] = 0;
+    var ast = try parse(std.testing.allocator, &source);
+    defer ast.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    var node = ast.decl(ast.rootDecls()[0]).ast.init_node;
+    for (0..levels) |_| {
+        try std.testing.expectEqual(Node.Tag.string_literal, ast.nodes.items(.tag)[node]);
+        const data = ast.nodes.items(.data)[node];
+        try std.testing.expectEqual(@as(u32, 1), data.rhs - data.lhs);
+        node = ast.extra_data[data.lhs];
+        try std.testing.expect(node != 0);
+    }
+    try std.testing.expectEqualStrings("\"a\"", ast.getNodeSource(node));
+    try std.testing.expectEqualStrings(&source, ast.getNodeSource(0));
+}
+
+test "quoted interpolation retains EOF diagnostics and malformed input ownership" {
+    const source = "let text=\"{\"nested {greet(\"Ada\")}\"}\"\nlet broken=";
+    var ast = try parse(std.testing.allocator, source);
+    defer ast.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), ast.errors.len);
+    var lexer = Tokenizer.init(source);
+    var original_eof: TokenIndex = 0;
+    while (lexer.next().tag != .eof) : (original_eof += 1) {}
+    try std.testing.expectEqual(original_eof, ast.errors[0].token);
+    try std.testing.expectEqual(source.len, ast.tokens.items(.start)[original_eof]);
+    try std.testing.expect(original_eof < ast.lastToken(0));
+    for ([_][:0]const u8{
+        source,                       "let text=\"{greet(\"Ada\")}", "let text=\"{\"unterminated",
+        "let text=\"{'unterminated}", "let text=\"{\"x\n\"}\"",      "let text=\"{\"x\x00\"}\"",
+    }) |raw| {
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{raw});
+    }
 }
 
 test "interpolation preserves root EOF and original token indices" {

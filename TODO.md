@@ -248,8 +248,8 @@ the current generic-function work; its latest validation is recorded above.
 Runes and Unicode scalar string inspection are implemented. `rune` is distinct from integers: `0..=0x10FFFF` excluding `0xD800..=0xDFFF`.
 Single quotes hold exactly one scalar or escape (`'é'`, `'😀'`, `'\n'`, `'\xE9'`,
 `'\u{1F600}'`); empty/multiple-scalar or invalid literals reject. Runes support
-UTF-8 printing/interpolation via variables, exact equality, arrays, fields, literal
-matches with catchalls, union payloads and scoped borrows. No numeric conversions,
+UTF-8 printing/interpolation via variables or inline rune literals, exact equality,
+arrays, fields, literal matches with catchalls, union payloads and scoped borrows. No numeric conversions,
 arithmetic, ordering, rune ranges or foreign ABI support.
 
 String indexing decodes `rune` with native `int` scalar offsets; negatives count
@@ -649,11 +649,20 @@ implemented; grapheme operations remain deferred.
 - strings:
   - [x] immutable UTF-8 literals, sharing, concatenation, `+=`, scalar length and output
   - [x] allocation-free, byte-exact `==`/`!=` (including NUL; no normalization)
-  - [x] `{expression}` interpolation (including nested calls) for bool/fixed/native integers/rune variables/strings,
+  - [x] `{expression}` interpolation (including nested calls) for bool/fixed/native integers/runes/strings,
     recursive named arrays/structs/unions/enums with exact `@[stringify]` overrides at any depth
-    and compile-time type-name strings; decimal boundaries, raw UTF-8/NUL, rooted
+    and compile-time type-name strings; decimal boundaries, raw UTF-8/NUL output, rooted
     temporaries and formatter preservation
-  - blocks/control flow/quoted literals/formats/captures and global interpolation remain unsupported
+  - [x] quoted literals inside placeholders: `@println("{"a"}")`, `"{greet("Ada")}"`,
+    `"{'é'}"` and nested interpolated strings such as `"{"hello {name}"}"`.
+    Inner literals use ordinary escaped-quote/backslash/Unicode-escape syntax with
+    no extra escaping layer. The shared scanner is bounded to 128 frames across
+    strings, placeholders, runes and quoted identifiers; this does not enable
+    otherwise unsupported quoted-name expressions. Raw source newline/NUL remains
+    rejected; UTF-8 and NUL decoded from escapes are preserved in output.
+  - each whole placeholder remains one bounded ordinary expression; outside literal
+    tokens, blocks/control flow/comments/backslashes remain unsupported, as do
+    formats/captures and global interpolation
   - proposal (not accepted or implemented): escape literal interpolation braces with
     `{{` → `{` and `}}` → `}`, instead of `\{` and `\}`; `"{{}}"` would produce `"{}"`.
     Current backslash escapes remain supported behavior; compatibility/deprecation
@@ -1450,13 +1459,19 @@ let ArrayList: (T: #type) -> type = { ... }
   - Literals, `+`, printing, locals, parameters/returns, conditionals and explicitly
     typed immutable literal globals are supported. Concatenation uses rooted GC
     backing; literals use static read-only bytes with a null traced owner.
-  - Expression interpolation supports bool, fixed/native decimal integers, rune
-    variables, shared strings, recursive default arrays/structs/unions/enums,
+  - Expression interpolation supports bool, fixed/native decimal integers, runes,
+    shared strings, recursive default arrays/structs/unions/enums,
     exact `@[stringify]` overrides at any depth and static compile-time type-name strings.
     Nested hooks run once in traversal order and stop recursion at that value. Raw UTF-8/NUL is
     preserved without quoting, escaping or normalization. Placeholders are
     evaluated left-to-right once, including nested calls and scalar expressions.
-        Blocks/control flow/quoted literals/formats/captures remain unsupported.
+    Inline strings/runes, quoted call arguments and nested interpolated strings
+    use ordinary inner literal syntax without another escaping layer. Shared
+    scanning has a fixed 128-frame bound; raw source newline/NUL is still rejected,
+    while escaped UTF-8/NUL output is preserved. Each whole placeholder must be
+    one bounded ordinary expression: blocks/control flow/comments/backslashes
+    outside literal tokens and formats/captures remain unsupported. `\{`/`\}`
+    still escape literal braces; doubled-brace escaping is not approved or implemented.
     Global interpolation is nonliteral and rejected, not eagerly evaluated.
   - Scalar indexing returns rune without allocation; negative indices count scalars
     from the end. Half-open/inclusive scalar slicing returns allocation-free views with shared

@@ -165,7 +165,7 @@ fn renderModuleWithSources(module: *const Module, compilation: ?*const Compilati
             .type_nesting_limit => try writer.writeAll("type annotation nesting exceeds the current analysis limit of 128"),
             .invalid_literal => try writer.writeAll("invalid literal; rune literals require exactly one Unicode scalar"),
             .unsupported_literal => try writer.writeAll("this literal is not supported in semantic analysis yet"),
-            .invalid_interpolation => try writer.writeAll("expected {expression}; blocks, control flow, quotes and format options are unsupported; escape literal braces as \\{ and \\}"),
+            .invalid_interpolation => try writer.writeAll("expected {expression}; blocks, control flow, comments and format options are unsupported; escape literal braces as \\{ and \\}"),
             .unsupported_interpolation_type => try writer.writeAll("interpolation requires a bool, integer, float, rune, string, printable array/struct/enum/union, or compile-time type; @[stringify] methods require signature (SelfType) -> string"),
             .unsupported_global_interpolation => try writer.writeAll("global strings require literal initializers; move interpolation into a function"),
             .literal_type_mismatch => try writer.writeAll("literal does not match the annotated type"),

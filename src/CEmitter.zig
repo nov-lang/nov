@@ -8675,6 +8675,51 @@ test "ascribed interpolation prints every supported integer boundary" {
     for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, output.written(), "", mode);
 }
 
+const quoted_interpolation_program =
+    \\let greet:(name:string)->string="Hello {name}!"
+    \\let main:()={
+    \\@println("{"a"}","{greet("Ada")}","{'{'}{'}'}", "{'é'}")
+    \\@println("Nested: {"hello {"world"}"}","{"\u{1f600}\0"}")
+    \\@println("Escapes: {"\""} {"\\"}")
+    \\let mut count=0
+    \\let next=(text:string)->string{count+=1
+    \\"{count}:{text}"}
+    \\@println("{next("a")}/{next("nested {next("b")}")}",count)
+    \\}
+;
+
+fn emitQuotedInterpolationSourceFree(allocator: std.mem.Allocator) ![]u8 {
+    var sema = blk: {
+        var module = try Module.init(allocator, "quoted-interpolation.nov", quoted_interpolation_program);
+        defer module.deinit();
+        var result = try Lowering.lower(&module);
+        errdefer result.deinit();
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expect(result.lowering_complete);
+        break :blk result;
+    };
+    defer sema.deinit();
+    return emit(allocator, &sema.ir, null);
+}
+
+fn testQuotedInterpolationOwnership(allocator: std.mem.Allocator) !void {
+    allocator.free(try emitQuotedInterpolationSourceFree(allocator));
+}
+
+test "quoted interpolation owns nested source and survives every compiler allocation failure" {
+    try testQuotedInterpolationOwnership(test_gpa);
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testQuotedInterpolationOwnership, .{});
+}
+
+test "quoted interpolation executes nested escapes runes and ordered calls with forced GC O0 O3" {
+    const library = try emitQuotedInterpolationSourceFree(test_gpa);
+    defer test_gpa.free(library);
+    const c = try collectingTestProgram(library);
+    defer test_gpa.free(c);
+    const output = "a Hello Ada! {} é\nNested: hello world 😀\x00\nEscapes: \" \\\n1:a/3:nested 2:b 3\n";
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty;", 0, output, "", mode);
+}
+
 test "expression interpolation reuses calls scopes ordering and rooted temporaries" {
     const c = try arrayTestProgram(
         \\let echo: (n: int) -> string = {@print(n)

@@ -318,8 +318,8 @@ error, not a signedness conversion. There is no widening, narrowing, numeric cas
 type-alias evaluation or general type-value inference. Ascription adds no array
 copy boundary; existing local, argument and return copy rules still apply.
 Interpolation accepts ascription within its existing bounded expression grammar
-(unnamed function parameter types work; quoted strings and named parameter colons
-inside interpolation remain unsupported).
+(quoted string literals and unnamed function parameter types work; named
+parameter colons inside interpolation remain unsupported).
 
 A runnable arithmetic example is [`examples/checkout.nov`](examples/checkout.nov):
 
@@ -2480,9 +2480,10 @@ let main: () = {
 }
 ```
 
-Bind rune literals to variables before interpolating: quoted literals inside
-placeholders remain unsupported. No numeric conversions, arithmetic, ordering,
-rune ranges or foreign ABI support are provided. See
+Rune literals can also appear directly in placeholders, for example `"{'é'}"`.
+Their escapes use ordinary rune literal syntax without an extra escaping layer.
+No numeric conversions, arithmetic, ordering, rune ranges or foreign ABI support
+are provided. See
 [`examples/runes.nov`](examples/runes.nov).
 
 ## Integers
@@ -2847,14 +2848,42 @@ scope, no-shadowing and declaration-before-use rules apply; spaces are allowed.
 Bare integer placeholders use `int` fallback (`"{1}"` works); float placeholders
 use late native `float` fallback and the [float formatting contract](#floats).
 
-This bounded syntax excludes blocks/braces, control flow, comments, quotes and
-backslashes inside placeholders. String/character literals and quoted names
-inside calls are therefore unsupported, even with source escapes: bind them to
-locals first. Captures and format options such as `"{n:02}"` remain unsupported.
-The entire placeholder must parse as one expression; trailing tokens and
-malformed/unescaped braces diagnose rather than silently printing text. Escaped
-braces and braces produced by `\xNN` or `\u{...}` remain literal, and inserted
-strings are never reinterpreted.
+Placeholders can contain double-quoted string literals, single-quoted rune
+literals and nested interpolated strings. Inner literals use their ordinary
+syntax: do not escape their delimiting quotes for the outer string or add an
+extra escaping layer for escaped quotes, backslashes or Unicode escapes.
+
+```nov
+let greet: (name: string) -> string = "Hello, {name}"
+let main: () = {
+    let name = "Ada"
+    @println("{"a"}")                 ; a
+    @println("{greet("Ada")}")        ; Hello, Ada
+    @println("{'é'}")                 ; é
+    @println("{"hello {name}"}")      ; hello Ada
+    @println("{"\""}")                ; one double quote
+    @println("{"\\"}")                ; one backslash
+    @println("{"\u{e9}"}")            ; é
+    @assert("{"\0\u{0}\x00"}" == "\0\0\0")
+}
+```
+
+The shared scanner balances strings, placeholders, runes and quoted identifiers
+with a fixed limit of **128 frames** (not 128 nested interpolations). Scanning
+quoted tokens does not broaden the expression grammar or enable otherwise
+unsupported quoted-name expressions. Raw newlines and raw NUL bytes in source
+literals remain rejected; escapes such as `\n`, `\0`, `\x00` and `\u{0}` retain
+their ordinary literal meaning. Decoded strings must still be valid UTF-8.
+
+Each whole placeholder must remain one expression in the bounded ordinary
+expression grammar. Outside literal tokens, blocks/braces, control flow,
+comments and backslashes remain unsupported, as do captures and format options
+such as `"{n:02}"`. Trailing tokens and malformed/unescaped braces diagnose
+rather than silently printing text; punctuation inside a literal belongs to that
+literal, not the surrounding placeholder grammar. Existing `\{` and `\}` escapes
+are unchanged, and braces produced by `\xNN` or `\u{...}` remain literal. Doubled
+braces (`{{` / `}}`) are **not** literal-brace escapes; that proposal is not
+approved or implemented. Inserted strings are never reinterpreted.
 
 Chunks and placeholders evaluate once, left to right. UTF-8 bytes and embedded NUL
 are preserved, with no Unicode normalization. String placeholders share storage;

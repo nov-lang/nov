@@ -1,6 +1,7 @@
 const std = @import("std");
 const TestAllocations = @import("TestAllocations.zig");
 const string_literal = @import("string_literal.zig");
+const Interpolation = @import("Interpolation.zig");
 const Lowering = @import("Lowering.zig");
 const Sema = @import("Sema.zig");
 const Ast = @import("Ast.zig");
@@ -3252,8 +3253,8 @@ const Context = struct {
                 const brace = offset;
                 offset += 1;
                 const start = offset;
-                while (offset < bytes.len - 1 and bytes[offset] != '}') : (offset += 1) {}
-                if (bytes[brace] != '{' or offset == bytes.len - 1 or placeholder >= expressions.len or expressions[placeholder] == 0)
+                offset = if (bytes[brace] == '{') Interpolation.placeholderEnd(bytes, start) orelse bytes.len - 1 else start;
+                if (bytes[brace] != '{' or offset >= bytes.len - 1 or placeholder >= expressions.len or expressions[placeholder] == 0)
                     return self.interpolationError(.invalid_interpolation, .{ .source = location.source, .start = location.start + @as(u32, @intCast(brace)), .end = location.start + @as(u32, @intCast(@min(offset + 1, bytes.len - 1))) });
                 const embedded = expressions[placeholder];
                 placeholder += 1;
@@ -5131,19 +5132,18 @@ test "interpolation diagnoses names grammar types scopes and exact source bytes"
         .{ .source = "let f: () -> string = {if true {let hidden = true\n}\n\"{hidden}\"}", .tag = .unknown_name, .token = "hidden" },
         .{ .source = "let f: (n: int) -> string = \"{}\"", .tag = .invalid_interpolation, .token = "{}" },
         .{ .source = "let f: (n: int) -> string = \"{n\"", .tag = .invalid_interpolation, .token = "{n" },
+
         .{ .source = "let f: (n: int) -> string = \"}\"", .tag = .invalid_interpolation, .token = "}" },
         .{ .source = "let f: (n: int) -> string = \"{n:02}\"", .tag = .invalid_interpolation, .token = "{n:02}" },
         .{ .source = "let f: (n: int) -> string = \"{n()}\"", .tag = .not_callable, .token = "(" },
-        .{ .source = "let f: (n: int) -> string = \"{{n}}\"", .tag = .invalid_interpolation, .token = "{{n}" },
+        .{ .source = "let f: (n: int) -> string = \"{{n}}\"", .tag = .invalid_interpolation, .token = "{{n}}" },
         .{ .source = "let f: (n: int) -> string = \"{n + 1.5}\"", .tag = .literal_type_mismatch, .token = "1.5" },
         .{ .source = "let f: (n: int) -> string = \"{if}\"", .tag = .invalid_interpolation, .token = "{if}" },
-        .{ .source = "let f: () -> string = \"{'a'}\"", .tag = .invalid_interpolation, .token = "{'a'}" },
-        .{ .source = "let f: () -> string = \"{'é'}\"", .tag = .invalid_interpolation, .token = "{'é'}" },
-        .{ .source = "let f: () -> string = \"{'\\n'}\"", .tag = .invalid_interpolation, .token = "{'\\n'}" },
+
         .{ .source = "let f: (n: int) -> string = \"{f(n, n)}\"", .tag = .argument_count_mismatch, .token = "(" },
         .{ .source = "let f: (n: int) -> string = \"é{n + missing}\"", .tag = .unknown_name, .token = "missing" },
         .{ .source = "let f: (n: int) -> string = \"{f(true)}\"", .tag = .literal_type_mismatch, .token = "true" },
-        .{ .source = "let f: (n: int) -> string = \"{f(\\\"text\\\")}\"", .tag = .invalid_interpolation, .token = "{f(\\\"text\\\")}" },
+        .{ .source = "let f: (n: int) -> string = \"{f(\"text\")}\"", .tag = .literal_type_mismatch, .token = "\"text\"" },
         .{ .source = "let f: (n: int) -> string = \"{f(n); n}\"", .tag = .invalid_interpolation, .token = "{f(n); n}" },
         .{ .source = "let f: (n: int) -> string = \"{n + (1}\"", .tag = .invalid_interpolation, .token = "{n + (1}" },
         .{ .source = "let f: (n: int) -> string = \"{f(n) n}\"", .tag = .invalid_interpolation, .token = "{f(n) n}" },

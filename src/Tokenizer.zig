@@ -2,6 +2,7 @@
 // See https://github.com/ziglang/zig/blob/master/LICENSE for additional LICENSE details
 
 const std = @import("std");
+const Interpolation = @import("Interpolation.zig");
 
 const Tokenizer = @This();
 
@@ -350,7 +351,13 @@ pub fn next(self: *Tokenizer) Token {
             },
             '"' => {
                 result.tag = .string_literal;
-                continue :state .string_literal;
+                if (Interpolation.stringEnd(self.buffer, self.index)) |end| {
+                    self.index = @intCast(end);
+                } else {
+                    // Preserve legacy recovery for malformed placeholders and
+                    // invalid literals, without interpreting quoted identifiers.
+                    continue :state .string_literal;
+                }
             },
             '\'' => {
                 result.tag = .char_literal;
@@ -741,6 +748,61 @@ pub fn next(self: *Tokenizer) Token {
 
     result.end = self.index;
     return result;
+}
+
+test "quoted placeholders remain a single exact literal token" {
+    for ([_][:0]const u8{
+        "\"{\"a\"}\"",
+        "\"{greet(\"Ada\")}\"",
+        "\"{\"nested {greet(\"Ada\")}\"}\"",
+        "\"{f('{', '}', '\\'', '\\\\', '\\u{7d}')}\"",
+        "\"{\"escaped \\\" \\u{7b} \\{ \\}\"}\"",
+        "\"{@\"unbalanced { name\"}\"",
+        "\"\\{literal\\} {\"a\"}\"",
+    }) |source| {
+        var lexer = Tokenizer.init(source);
+        const token = lexer.next();
+        try std.testing.expectEqual(Token.Tag.string_literal, token.tag);
+        try std.testing.expectEqual(@as(u32, 0), token.start);
+        try std.testing.expectEqual(source.len, token.end);
+        const eof = lexer.next();
+        try std.testing.expectEqual(Token.Tag.eof, eof.tag);
+        try std.testing.expectEqual(source.len, eof.start);
+        try std.testing.expectEqual(eof.start, eof.end);
+    }
+    try testTokenize("@\"{not interpolation\"", &.{.identifier});
+    try testTokenize("@println(\"{\"a\"}\")", &.{ .builtin, .l_paren, .string_literal, .r_paren });
+}
+
+test "quoted placeholder malformed input always advances to EOF" {
+    for ([_][:0]const u8{
+        "\"{greet(\"Ada\")}", "\"{\"unterminated", "\"{'unterminated}",
+        "\"{\"x\n\"}\"",      "\"{\"x\x00\"}\"",   "\"{\"x\\",
+        "\"{\"x\\\n\"}\"",
+    }) |source| {
+        var lexer = Tokenizer.init(source);
+        var previous_end: usize = 0;
+        while (true) {
+            const token = lexer.next();
+            try std.testing.expect(token.end <= source.len);
+            if (token.tag == .eof) {
+                try std.testing.expectEqual(source.len, token.start);
+                break;
+            }
+            try std.testing.expect(token.end > previous_end);
+            previous_end = token.end;
+        }
+    }
+    var deep: [1025:0]u8 = undefined;
+    for (0..256) |i| @memcpy(deep[i * 2 ..][0..2], "\"{");
+    deep[512] = '0';
+    for (0..256) |i| @memcpy(deep[513 + i * 2 ..][0..2], "}\"");
+    deep[1025] = 0;
+    var lexer = Tokenizer.init(&deep);
+    var count: usize = 0;
+    while (lexer.next().tag != .eof) : (count += 1) {
+        try std.testing.expect(count < deep.len);
+    }
 }
 
 test "rune literal token spans include multiple scalars and malformed UTF8" {

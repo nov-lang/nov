@@ -61,6 +61,7 @@ pub fn check(module: *Module, ir: *Ir, node: Ast.Node.Index, expected: Ir.TypeId
             },
             .string_literal => {
                 const bytes = module.sourceSlice(span).?;
+                if (hasInterpolation(bytes)) return .not_literal;
                 var decoded = std.Io.Writer.Allocating.init(module.allocator);
                 defer decoded.deinit();
                 const result = string_literal.parseWrite(&decoded.writer, bytes) catch return error.OutOfMemory;
@@ -74,7 +75,6 @@ pub fn check(module: *Module, ir: *Ir, node: Ast.Node.Index, expected: Ir.TypeId
                     },
                     .success => {},
                 }
-                if (hasInterpolation(bytes)) return .not_literal;
                 if (stringIssue(bytes, decoded.written())) |issue| {
                     const start = span.start + @as(u32, @intCast(issue.offset));
                     return failLiteral(module, issue.tag, .{ .source = span.source, .start = start, .end = start + 1 }, null);

@@ -1,4 +1,4 @@
-; Identifier-only interpolation; no expressions, calls or format options.
+; Expression interpolation; see quoted-interpolation.nov for nested quoted literals.
 let fizz: (n: int) -> string = match n % 3, n % 5 {
     0, 0 => "FizzBuzz"
     0, _ => "Fizz"
