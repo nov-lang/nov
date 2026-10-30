@@ -50,6 +50,30 @@ results. See `examples/array-fields.nov`.
 
 ## Current delivered status
 
+Bounded `@TypeOf(x)` is implemented in `TypeResolver`, `BodyChecker` and
+`GenericFunctions`. Exactly one operand must be a runtime binding identifier or
+an imported namespace value reference such as `lib.value` (with visibility
+checks). Globals, visible locals/parameters, mutable/borrowed bindings and bindings
+visible from enclosing closure scopes are queryable, including concrete
+specialized function variables. Types/type aliases, namespaces and unspecialized
+generic templates reject, even if a template has previously been specialized.
+Calls, literals, arithmetic, indexing and runtime field access are not supported:
+`@TypeOf(f())` diagnoses without running `f`.
+
+Queries inspect canonical types without runtime evaluation, value reads, mutation,
+runtime initializer dependencies, captures or mutable-capture boxing. They do not
+relax existing scope, borrowing or global-initializer restrictions. Results work
+in annotations (`[]@TypeOf(x)`), exact `@as(@TypeOf(x), value)`, generic type
+arguments (`Box(@TypeOf(x))`) and module-level aliases
+(`let Count = @TypeOf(global)`). Local type aliases and first-class runtime types
+remain unsupported. Direct `@println(@TypeOf(x))` / `"{@TypeOf(x)}"` render
+canonical static type names, without invoking the value's `@[stringify]` hook.
+Function signatures can query earlier named parameters, including inferred generic
+``(x: `T) -> @TypeOf(x)`` signatures sharing the parameter's constraints; integer
+context/defaulting rules are unchanged. See README's [type-query contract](README.md#type-queries)
+and `examples/type-of.nov`. Broader reflection (`@typeInfo`, member enumeration,
+arbitrary expression queries) remains a proposal, not delivered functionality.
+
 Integer literals now default to signed pointer-sized `int` only after contextual
 inference in `BodyChecker`/`GenericFunctions` and literal-only global `Sema`.
 Annotations, call signatures, typed sibling operands/array elements/control branches,
@@ -507,9 +531,10 @@ Aliases work in annotations and `@as`, never as runtime type values. Nominal str
 aliases additionally preserve explicit `Alias[...]` constructors and static methods;
 this does not introduce numeric constructors. Cycles have
 source-related diagnostics; alias expansion is iterative and bounded to 128 active
-expansions. Local/mutable aliases, newtypes, general type values, `@TypeOf`,
-general generics and comptime functions remain unsupported (bounded generic unions
-are delivered above). Numeric conversion design
+expansions. Module-level `@TypeOf` aliases are supported as described above.
+Local/mutable aliases, newtypes, general runtime type values, general generics and
+comptime functions remain unsupported (bounded generic containers are delivered
+above). Numeric conversion design
 remains deferred; aliases do not add casts or alter the integer fallback rules.
 
 Next step: add new IR that

@@ -20,6 +20,7 @@ const LexicalName = struct { name: []const u8, span: Module.Span };
 const Template = struct {
     info: GenericFunctions.LocalTemplate,
     captures: []const TemplateCapture,
+
     // No-shadowing depends on the whole definition scope, not just free values.
     lexical_names: []const LexicalName = &.{},
     layout: ?Ir.FunctionId = null,
@@ -223,6 +224,8 @@ const Context = struct {
     container: ?Module.DeclId = null,
     concrete_type: ?u32 = null,
     function_bindings: []const Module.TypeBinding = &.{},
+    // Type-query metadata retains template identity without runtime captures.
+    type_captures: []const GenericFunctions.Capture = &.{},
     specialization_depth: usize = 0,
     probing: bool = false,
     defaulting: bool = false,
@@ -245,9 +248,76 @@ const Context = struct {
     capture_names: std.ArrayList([]const u8) = .empty,
     capture_values: std.ArrayList(Ir.ValueId) = .empty,
 
+    fn appendTypeCaptures(self: *Context, captures: *std.ArrayList(GenericFunctions.Capture), allocator: std.mem.Allocator) Error!void {
+        if (self.parent) |parent| try parent.appendTypeCaptures(captures, allocator);
+        try captures.appendSlice(allocator, self.type_captures);
+        var iterator = self.bindings.iterator();
+        while (iterator.next()) |entry| try captures.append(allocator, .{
+            .name = entry.key_ptr.*,
+            .ty = entry.value_ptr.known.ty,
+            .template = if (entry.value_ptr.template) |template| .{ .module = self.module, .local = &template.info } else null,
+        });
+    }
+
     fn resolveType(self: *Context, node: Ast.Node.Index) Error!?Ir.TypeId {
-        if (self.probing) return TypeResolver.resolveInScopeReadOnly(self.module, self.ir, node, self.container, self.concrete_type, self.function_bindings);
-        return TypeResolver.resolveInScope(self.module, self.ir, node, self.container, self.concrete_type, self.function_bindings);
+        var values: std.ArrayList(TypeResolver.Binding) = .empty;
+        defer values.deinit(self.module.allocator);
+        // Frozen semantic tables contain the actual defaulted global types.
+        // Do not request values or run inference merely to answer a type query.
+        for (self.module.declarations.items, 0..) |decl, index| {
+            if (decl.is_type_alias or decl.is_generic or decl.is_namespace or decl.container != null) continue;
+            const id: Module.DeclId = @fromBackingInt(@intCast(index));
+            const ty = if (self.sema) |analysis| blk: {
+                const entry_index = analysis.entryIndex(self.module, id);
+                break :blk if (entry_index < analysis.entries.len) analysis.entries[entry_index].type_id else null;
+            } else blk: {
+                const entry_index = tableIndex(self.module, id);
+                break :blk if (entry_index < self.types.len) self.types[entry_index] else null;
+            };
+            if (ty) |known| try values.append(self.module.allocator, .{ .name = decl.name, .ty = known });
+        }
+        var captures: std.ArrayList(GenericFunctions.Capture) = .empty;
+        defer captures.deinit(self.module.allocator);
+        if (self.specializing) |template| {
+            try captures.appendSlice(self.module.allocator, template.info.captures);
+        } else try self.appendTypeCaptures(&captures, self.module.allocator);
+        // A template's carrier signature is an implementation detail, not its
+        // value type. Diagnose before filtering so lookup cannot fall through.
+        const ast = &self.module.source.ast;
+        for (ast.nodes.items(.tag), 0..) |tag, index| {
+            if (tag != .call and tag != .call_one) continue;
+            const query: Ast.Node.Index = @intCast(index);
+            if (ast.firstToken(query) < ast.firstToken(node) or ast.lastToken(query) > ast.lastToken(node)) continue;
+            const call = ast.fullCall(query).?;
+            if (ast.nodes.items(.tag)[call.ast.fn_expr] != .builtin_literal or
+                !std.mem.eql(u8, ast.tokenSlice(ast.firstToken(call.ast.fn_expr)), "@TypeOf") or call.ast.args.len != 1) continue;
+            const operand = call.ast.args[0];
+            if (ast.nodes.items(.tag)[operand] != .identifier) continue;
+            const name = ast.tokenSlice(ast.firstToken(operand));
+            var i = captures.items.len;
+            while (i != 0) {
+                i -= 1;
+                const capture = captures.items[i];
+                if (!std.mem.eql(u8, capture.name, name)) continue;
+                if (capture.template != null) return self.fail(.not_a_value, operand, null);
+                break;
+            }
+        }
+        for (captures.items) |capture| {
+            if (capture.template == null) try values.append(self.module.allocator, .{ .name = capture.name, .ty = capture.ty });
+        }
+        if (self.probing) return TypeResolver.resolveInScopeWithValuesReadOnly(self.module, self.ir, node, self.container, self.concrete_type, self.function_bindings, values.items);
+        return TypeResolver.resolveInScopeWithValues(self.module, self.ir, node, self.container, self.concrete_type, self.function_bindings, values.items);
+    }
+
+    fn inTypeQuery(ast: *const Ast, token: Ast.TokenIndex) bool {
+        for (ast.nodes.items(.tag), 0..) |tag, index| {
+            if (tag != .call and tag != .call_one) continue;
+            const call = ast.fullCall(@intCast(index)).?;
+            if (!std.mem.eql(u8, ast.tokenSlice(ast.firstToken(call.ast.fn_expr)), "@TypeOf")) continue;
+            for (call.ast.args) |arg| if (token >= ast.firstToken(arg) and token <= ast.lastToken(arg)) return true;
+        }
+        return false;
     }
 
     fn hasUnboundSignatureVariables(self: *Context, node: Ast.Node.Index) bool {
@@ -312,21 +382,8 @@ const Context = struct {
 
     fn templateDescriptor(self: *Context, proto: Ast.Node.Index, body: Ast.Node.Index) Error!*Template {
         const allocator = self.template_allocator orelse return error.InvalidOperation;
-        const ast = &self.module.source.ast;
         var captures: std.ArrayList(GenericFunctions.Capture) = .empty;
-        for (ast.nodes.items(.tag), 0..) |tag, index| {
-            if (tag != .identifier) continue;
-            const token = ast.firstToken(@intCast(index));
-            if (token < ast.firstToken(body) or token > ast.lastToken(body)) continue;
-            const name = ast.tokenSlice(token);
-            const binding = self.lookupBinding(name) orelse continue;
-            var found = false;
-            for (captures.items) |capture| if (std.mem.eql(u8, capture.name, name)) {
-                found = true;
-                break;
-            };
-            if (!found) try captures.append(allocator, .{ .name = name, .ty = binding.known.ty, .template = if (binding.template) |t| .{ .module = self.module, .local = &t.info } else null });
-        }
+        try self.appendTypeCaptures(&captures, allocator);
         const template = try allocator.create(Template);
         template.* = .{ .info = .{ .proto = proto, .body = body, .outer_bindings = self.function_bindings, .captures = captures.items, .container = self.container, .concrete_type = self.concrete_type }, .captures = &.{}, .environment_type = undefined };
         return template;
@@ -380,21 +437,21 @@ const Context = struct {
             const candidate: Ast.Node.Index = @intCast(index);
             if (tag != .identifier) continue;
             const token = ast.firstToken(candidate);
-            if (token < first or token > last) continue;
+            if (token < first or token > last or inTypeQuery(ast, token)) continue;
             const name = ast.tokenSlice(token);
             if (self.lookupBinding(name) == null) continue;
             if (try child.captureBinding(name, candidate) == null) return null;
         }
         const template = try allocator.create(Template);
         const captures = try allocator.alloc(TemplateCapture, child.capture_names.items.len);
-        const inference_captures = try allocator.alloc(GenericFunctions.Capture, captures.len);
-        for (child.capture_names.items, captures, inference_captures) |name, *capture, *inference| {
+        var inference_captures: std.ArrayList(GenericFunctions.Capture) = .empty;
+        try self.appendTypeCaptures(&inference_captures, allocator);
+        for (child.capture_names.items, captures) |name, *capture| {
             capture.* = .{ .name = name, .binding = self.lookupBinding(name).? };
-            inference.* = .{ .name = name, .ty = capture.binding.known.ty, .template = if (capture.binding.template) |t| .{ .module = self.module, .local = &t.info } else null };
         }
         const unit = try self.ir.internType(.void);
         const carrier_type = try self.ir.internType(.{ .function = .{ .params = &.{}, .result = unit } });
-        template.* = .{ .created = true, .info = .{ .proto = proto, .body = body, .outer_bindings = try allocator.dupe(Module.TypeBinding, self.function_bindings), .captures = inference_captures, .container = self.container, .concrete_type = self.concrete_type }, .captures = captures, .lexical_names = try self.lexicalNames(allocator), .environment_type = carrier_type };
+        template.* = .{ .created = true, .info = .{ .proto = proto, .body = body, .outer_bindings = try allocator.dupe(Module.TypeBinding, self.function_bindings), .captures = inference_captures.items, .container = self.container, .concrete_type = self.concrete_type }, .captures = captures, .lexical_names = try self.lexicalNames(allocator), .environment_type = carrier_type };
         if (self.emitter) |outer| {
             const name = try std.fmt.allocPrint(arena.allocator(), "$template{d}", .{self.ir.functions.items.len});
             const id = try self.ir.addFunction(name, carrier_type, self.irSpan(node));
@@ -543,6 +600,7 @@ const Context = struct {
             try child.bindings.put(self.module.allocator, name, .{ .known = .{ .ty = signature.params[index] }, .index = index, .name_span = param_span, .slot = slot });
         }
         if (self.specializing) |template| {
+            child.type_captures = template.info.captures;
             child.emitter = if (self.emitter != null) &emitter else null;
             for (template.captures, 0..) |capture, capture_index| {
                 var binding = capture.binding;
@@ -1893,7 +1951,8 @@ const Context = struct {
             if (self.lookupBinding(name) != null) return false;
         }
         if (ast.fullCall(node)) |call| {
-            return (call.ast.args.len == 0 and self.container != null and std.mem.eql(u8, ast.tokenSlice(ast.firstToken(call.ast.fn_expr)), "@This")) or
+            return std.mem.eql(u8, ast.tokenSlice(ast.firstToken(call.ast.fn_expr)), "@TypeOf") or
+                (call.ast.args.len == 0 and self.container != null and std.mem.eql(u8, ast.tokenSlice(ast.firstToken(call.ast.fn_expr)), "@This")) or
                 (self.printableTypeSyntax(call.ast.fn_expr, remaining - 1) and TypeResolver.genericTarget(self.module, call.ast.fn_expr) != null);
         }
         if (tag == .field_access) {
@@ -3798,6 +3857,10 @@ const Context = struct {
             },
             .call, .call_one => {
                 const call = ast.fullCall(node).?;
+                if (std.mem.eql(u8, ast.tokenSlice(ast.firstToken(call.ast.fn_expr)), "@TypeOf")) {
+                    _ = (try self.resolveType(node)) orelse return null;
+                    return self.fail(.not_a_value, node, null);
+                }
                 if (try self.genericTarget(call.ast.fn_expr)) |ref| return self.genericCall(node, call, ref, expected, depth);
                 if (self.isAscription(call.ast.fn_expr)) {
                     if (call.ast.args.len != 2) return self.fail(.argument_count_mismatch, node, null);
@@ -5052,6 +5115,188 @@ test "printing nested malformed hooks and backend only hook bodies diagnose" {
             try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
             try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
         }
+    }
+}
+
+fn testTypeOfLexicalValues(allocator: std.mem.Allocator) !void {
+    const source =
+        \\let global=42
+        \\let R=struct{n:int,}
+        \\let Box:(T:type)->type=struct{value:T,}
+        \\let main:(p:u8)={
+        \\let n=1
+        \\let mut m:u16=2
+        \\let a:[]@TypeOf(p)=[p]
+        \\let r:R=R[.n=n]
+        \\let f:(u8)->u8=(v:u8)->u8 {v}
+        \\let n2:@TypeOf(n)=n
+        \\let g:@TypeOf(global)=n2
+        \\let a2:@TypeOf(a)=a
+        \\let r2:@TypeOf(r)=r
+        \\let f2:@TypeOf(f)=f
+        \\let b:Box(@TypeOf(p))=Box(@TypeOf(p))[.value=p]
+        \\let borrowed=&m
+        \\let inspect=(){let x:@TypeOf(borrowed)=3
+        \\@println(@TypeOf(m),"{@TypeOf(borrowed)}")}
+        \\let generic:(v:`T)->`T={let x:@TypeOf(borrowed)=3
+        \\let same:@TypeOf(v)=v
+        \\same}
+        \\inspect()
+        \\let exact:u8=generic(p)
+        \\let cast=@as(@TypeOf(p),4)
+        \\@println(@TypeOf(p),@TypeOf(n),@TypeOf(a2),@TypeOf(r2),@TypeOf(f2),g,b,exact,cast)
+        \\}
+    ;
+    var module = try Module.init(allocator, "typeof-body.nov", source);
+    defer module.deinit();
+    if (module.hasErrors()) std.debug.print("typeof parse: {any} {any}\n", .{ module.source.ast.errors, module.diagnostics.items });
+    const count = module.declarations.items.len;
+    var sema = Lowering.lower(&module) catch |err| {
+        try std.testing.expectEqual(count, module.declarations.items.len);
+        try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+        return err;
+    };
+    defer sema.deinit();
+    if (module.hasErrors()) std.debug.print("typeof body: {any}\n", .{module.diagnostics.items});
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+    for ([_][]const u8{ "u8", "u16", "[]u8", "R" }) |expected| {
+        var found = false;
+        for (sema.ir.constants.items) |constant| {
+            if (constant.value == .string and std.mem.eql(u8, constant.value.string, expected)) found = true;
+        }
+        try std.testing.expect(found);
+    }
+    for (sema.ir.functions.items) |function| {
+        try std.testing.expectEqual(@as(usize, 0), function.captures.len);
+        if (function.body) |body| for (body.instructions) |instruction| {
+            try std.testing.expect(!instruction.boxed);
+            try std.testing.expect(instruction.op != .capture_value and instruction.op != .capture_cell);
+        };
+    }
+}
+
+test "TypeOf lexical values lower without runtime captures under OOM" {
+    try testTypeOfLexicalValues(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testTypeOfLexicalValues, .{});
+}
+
+fn testTypeOfTemplateRejection(allocator: std.mem.Allocator, body: []const u8) !void {
+    const source = try std.fmt.allocPrint(allocator, "let main:()={{let f:(v:`T)->`T=v\n{s}\n}}", .{body});
+    defer allocator.free(source);
+    var module = try Module.init(allocator, "typeof-template.nov", source);
+    defer module.deinit();
+    const count = module.declarations.items.len;
+    var sema = Lowering.lower(&module) catch |err| {
+        try std.testing.expectEqual(count, module.declarations.items.len);
+        try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+        return err;
+    };
+    defer sema.deinit();
+    errdefer std.debug.print("typeof template rejection: {s}: {any}\n", .{ body, module.diagnostics.items });
+    try std.testing.expect(!sema.lowering_complete);
+    try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+    const diagnostic = module.diagnostics.items[0];
+    try std.testing.expectEqual(Module.Diagnostic.Tag.not_a_value, diagnostic.tag);
+    try std.testing.expectEqualStrings("f", module.sourceSlice(diagnostic.span).?);
+}
+
+test "TypeOf rejects local templates after specialization and across lexical scopes" {
+    for ([_][]const u8{
+        "let x:u8=f(1)\n@println(@TypeOf(f),x)",
+        "@println(\"{@TypeOf(f)}\")",
+        "let invalid:@TypeOf(f)=()->void {}",
+        "let outer=(){@println(@TypeOf(f))}\nouter()",
+        "let outer:(v:`U)->`U={@println(@TypeOf(f))\nv}\nlet x:u8=outer(1)",
+        "let outer:(v:`U)->@TypeOf(f)=()->void {}\nlet x=outer(1)",
+        "let outer:(v:`U)->`U={let inner=(){@println(@TypeOf(f))}\ninner()\nv}\nlet x:u8=outer(1)",
+    }) |body| try testTypeOfTemplateRejection(std.testing.allocator, body);
+}
+
+test "TypeOf template rejection rolls back under OOM" {
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testTypeOfTemplateRejection, .{"let outer:(v:`U)->@TypeOf(f)=()->void {}\nlet x=outer(1)"});
+}
+
+fn testTypeOfSpecializedValue(allocator: std.mem.Allocator) !void {
+    const source =
+        \\let main:()={let f:(v:`T)->`T=v
+        \\let specialized:(u8)->u8=f
+        \\let same:@TypeOf(specialized)=specialized
+        \\let outer=(){@println(@TypeOf(specialized))}
+        \\let generic:(v:`U)->`U={@println(@TypeOf(specialized))
+        \\v}
+        \\let signature:(v:`U)->@TypeOf(specialized)=specialized
+        \\let callback:(u8)->u8=signature(true)
+        \\let x:u8=generic(same(1))
+        \\outer()
+        \\@println(@TypeOf(specialized),"{@TypeOf(specialized)}",callback(x))}
+    ;
+    var module = try Module.init(allocator, "typeof-specialized.nov", source);
+    defer module.deinit();
+    var sema = try Lowering.lower(&module);
+    defer sema.deinit();
+    if (module.hasErrors()) std.debug.print("typeof specialized: {any}\n", .{module.diagnostics.items});
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+}
+
+test "TypeOf concrete specialized variables remain queryable under OOM" {
+    try testTypeOfSpecializedValue(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testTypeOfSpecializedValue, .{});
+}
+
+test "TypeOf body rejects nonvalues expressions and invisible bindings" {
+    for ([_]struct { body: []const u8, tag: Module.Diagnostic.Tag }{
+        .{ .body = "let y:@TypeOf()=1", .tag = .argument_count_mismatch },
+        .{ .body = "let y:@TypeOf(x,x)=1", .tag = .argument_count_mismatch },
+        .{ .body = "let y:@TypeOf(missing)=1", .tag = .unknown_name },
+        .{ .body = "let y:@TypeOf(int)=1", .tag = .invalid_type_query_operand },
+        .{ .body = "let y:@TypeOf(x+1)=1", .tag = .invalid_type_query_operand },
+        .{ .body = "let y:@TypeOf(@panic(\"no\"))=1", .tag = .invalid_type_query_operand },
+        .{ .body = "let y:@TypeOf({x=2\nx})=1", .tag = .invalid_type_query_operand },
+        .{ .body = "let y=@TypeOf(x)", .tag = .not_a_value },
+        .{ .body = "if true {let hidden=1\n}\nlet y:@TypeOf(hidden)=1", .tag = .unknown_name },
+        .{ .body = "let inspect=(){let y:@TypeOf(later)=1\n}\nlet later=1", .tag = .unknown_name },
+        .{ .body = "let inspect:(v:`T)->`T={let y:@TypeOf(later)=1\nv}\nlet later=1\nlet result=inspect(true)", .tag = .unknown_name },
+        .{ .body = "let y:x=1", .tag = .unknown_type },
+    }) |case| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let main:(x:int)={{\n{s}\n}}", .{case.body});
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "typeof-error.nov", source);
+        defer module.deinit();
+        errdefer std.debug.print("typeof source: {s} parse: {any}\n", .{ source, module.source.ast.errors });
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        errdefer std.debug.print("typeof rejection: {s}: {any}\n", .{ case.body, module.diagnostics.items });
+        try std.testing.expect(!sema.lowering_complete);
+        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+        try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
+    }
+}
+
+test "TypeOf body imports require visible namespace values" {
+    for ([_]struct { operand: []const u8, public: bool = true, valid: bool = false }{
+        .{ .operand = "lib.value", .valid = true },
+        .{ .operand = "lib.value", .public = false },
+        .{ .operand = "lib" },
+        .{ .operand = "lib.Alias" },
+    }) |case| {
+        var comp = Compilation.init(std.testing.allocator);
+        defer comp.deinit();
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let lib=@import(\"lib.nov\")\nlet main:()={{let n:@TypeOf({s})=1\n@println(\"{{@TypeOf(n)}}\")}}", .{case.operand});
+        defer std.testing.allocator.free(source);
+        const root = try comp.addSource("main.nov", source);
+        const library = try comp.addSource("lib.nov", if (case.public) "@[public]\nlet value:u8=1\n@[public]\nlet Alias=u8" else "let value:u8=1\nlet Alias=u8");
+        const module = comp.getModule(root).?;
+        const local = module.lookup("lib").?;
+        try comp.imports.append(std.testing.allocator, .{ .declaration = comp.declaration_ids.get(.{ .source = root, .local = local }).?, .target = library, .named = false, .span = module.getDeclaration(local).?.name_span });
+        var sema = try Lowering.lowerCompilation(&comp);
+        defer sema.deinit();
+        try std.testing.expectEqual(!case.valid, comp.hasErrors());
+        try std.testing.expectEqual(case.valid, sema.lowering_complete);
+        if (case.valid) try sema.ir.verify();
     }
 }
 

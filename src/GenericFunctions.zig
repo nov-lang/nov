@@ -576,6 +576,72 @@ test "integer defaults generic argument fallback and pipes roll back under OOM" 
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testIntegerDefaultInference, .{});
 }
 
+fn testTypeOfSignatures(allocator: std.mem.Allocator) !void {
+    const source =
+        \\let id:(x:`T)->@TypeOf(x)={let copy:@TypeOf(x)=x
+        \\copy}
+        \\let same:(x:`T,y:@TypeOf(x))->@TypeOf(y)=y
+        \\let apply:(x:`T,f:(v:`T)->@TypeOf(v))->@TypeOf(x)=f(x)
+        \\let make:(x:`T)->()->@TypeOf(x)=()->`T {let copy:@TypeOf(x)=x
+        \\copy}
+        \\let main:()={
+        \\let n=id(1)
+        \\let exact:int=n
+        \\let narrow:u8=id(2)
+        \\let callback:(u16)->u16=id
+        \\let a:u8=same(narrow,3)
+        \\let b:u16=apply(4,id)
+        \\let closure=make(narrow)
+        \\let c:u8=closure()
+        \\let local:(x:`U)->@TypeOf(x)={let y:@TypeOf(x)=x
+        \\y}
+        \\let d:bool=local(true)
+        \\@println(exact,a,b,c,d,callback(5))
+        \\}
+    ;
+    var module = try Module.init(allocator, "typeof-generics.nov", source);
+    defer module.deinit();
+    const count = module.declarations.items.len;
+    var sema = Lowering.lower(&module) catch |err| {
+        try std.testing.expectEqual(count, module.declarations.items.len);
+        try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+        return err;
+    };
+    defer sema.deinit();
+    if (module.hasErrors()) std.debug.print("typeof generics: {any}\n", .{module.diagnostics.items});
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+}
+
+fn testTypeOfProbe(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "typeof-probe.nov", "let id:(x:`T)->@TypeOf(x)=x");
+    defer module.deinit();
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    const ref: Ref = .{ .module = &module, .id = module.lookup("id").? };
+    const span = ref.span();
+    const integer = try BodyChecker.defaultIntegerType(&ir);
+    const arguments = [_]Argument{.{ .ty = null, .span = span, .default_type = integer }};
+    const count = module.declarations.items.len;
+    try std.testing.expectEqual(@as(?Ir.TypeId, null), try probeResult(&module, &ir, ref, &arguments, span));
+    try std.testing.expectEqual(@as(?Ir.TypeId, integer), try probeDefaultResult(&module, &ir, ref, &arguments, span));
+    try std.testing.expectEqual(count, module.declarations.items.len);
+    try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ir.functions.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ir.local_generic_instances.items.len);
+}
+
+test "TypeOf readonly default queries preserve scopes and publication under OOM" {
+    try testTypeOfProbe(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testTypeOfProbe, .{});
+}
+
+test "TypeOf generic signatures share parameter constraints and preserve closure types under OOM" {
+    try testTypeOfSignatures(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testTypeOfSignatures, .{});
+}
+
 test "backtick generic function exact constraints demand and canonical aliases" {
     try testSpecialization(std.testing.allocator);
 }
@@ -826,13 +892,56 @@ const Solver = struct {
             .fn_proto, .fn_proto_one => {
                 const proto = ast.fullFnProto(node).?;
                 const params = try self.allocator.alloc(*Term, proto.ast.params.len);
+                const base = frame.locals.items.len;
+                defer frame.locals.shrinkRetainingCapacity(base);
                 var iterator = proto.iterate(ast);
-                for (params) |*param| param.* = try self.typeNode(frame, iterator.next().?.type_expr, depth + 1);
+                for (params) |*param| {
+                    const syntax = iterator.next().?;
+                    param.* = try self.typeNode(frame, syntax.type_expr, depth + 1);
+                    if (syntax.name_token) |token| try frame.locals.append(self.allocator, .{ .name = ast.tokenSlice(token), .term = param.* });
+                }
                 const result = if (proto.ast.return_type) |r| try self.typeNode(frame, r, depth + 1) else try self.fromType(try self.ir.internType(.void), span, depth + 1);
                 return self.term(.{ .function = .{ .params = params, .result = result } }, span);
             },
             .call, .call_one => {
                 const call = ast.fullCall(node).?;
+                if (std.mem.eql(u8, ast.tokenSlice(ast.firstToken(call.ast.fn_expr)), "@TypeOf")) {
+                    if (call.ast.args.len != 1) {
+                        try self.fail(.argument_count_mismatch, span, null);
+                        return self.term(.unknown, span);
+                    }
+                    const operand = call.ast.args[0];
+                    if (ast.nodes.items(.tag)[operand] == .identifier) {
+                        const name = ast.tokenSlice(ast.firstToken(operand));
+                        var i = frame.locals.items.len;
+                        while (i != 0) {
+                            i -= 1;
+                            const local = frame.locals.items[i];
+                            if (!std.mem.eql(u8, local.name, name)) continue;
+                            if (local.template != null) {
+                                try self.fail(.not_a_value, module.tokenSpan(ast.firstToken(operand)), null);
+                                return self.term(.unknown, span);
+                            }
+                            return local.term;
+                        }
+                        if (module.lookup(name)) |id| {
+                            const declaration = module.getDeclaration(id).?;
+                            if (!declaration.is_type_alias and !declaration.is_namespace and !declaration.is_generic and !declaration.is_generic_function) {
+                                if (self.analysis) |analysis| {
+                                    const index = analysis.entryIndex(module, id);
+                                    if (index < analysis.entries.len) if (analysis.entries[index].type_id) |ty| return self.fromType(ty, span, depth + 1);
+                                }
+                                const index = if (module.compilation) |comp|
+                                    @backingInt(comp.declaration_ids.get(.{ .source = module.source.id, .local = id }) orelse return self.term(.unknown, span))
+                                else
+                                    @backingInt(id);
+                                if (index < self.types.len) if (self.types[index]) |ty| return self.fromType(ty, span, depth + 1);
+                            }
+                        }
+                    }
+                    // Only the resolver's restricted value operands are valid;
+                    // never visit an operand as an executable expression.
+                }
                 if (frame.container != null and call.ast.args.len == 0 and std.mem.eql(u8, ast.tokenSlice(ast.firstToken(call.ast.fn_expr)), "@This")) return self.term(.{ .nominal = frame.container.? }, span);
                 if (TypeResolver.genericReference(module, call.ast.fn_expr)) |ref| {
                     const owner = if (module.compilation) |comp| comp.getModule(ref.source).? else module;
@@ -856,7 +965,9 @@ const Solver = struct {
             try TypeResolver.resolveInScopeReadOnly(module, self.ir, node, null, null, &.{})
         else
             try TypeResolver.resolveInScopeReadOnly(module, self.ir, node, if (frame.ref.local) |local| local.container else decl.?.container, if (frame.ref.local) |local| local.concrete_type else decl.?.concrete_type, if (frame.ref.local) |local| local.outer_bindings else decl.?.function_bindings);
-        return if (ty) |known| self.fromType(known, span, depth + 1) else self.term(.unknown, span);
+        if (ty) |known| return self.fromType(known, span, depth + 1);
+        self.failed = true;
+        return self.term(.unknown, span);
     }
 
     fn signature(self: *Solver, ref: Ref, container: ?Nominal, depth: usize) Ir.BuildError!?struct { frame: Frame, function: Function } {

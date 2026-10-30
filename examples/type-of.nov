@@ -1,0 +1,54 @@
+; nov run examples/type-of.nov
+; nov test examples/type-of.nov
+; @TypeOf inspects a binding without evaluating or reading its runtime value.
+
+let original = 42
+let Count = @TypeOf(original)
+
+let Box: (T: type) -> type = struct {
+    value: T,
+}
+
+let identity: (value: `T) -> @TypeOf(value) = value
+let copy: (items: []int) -> @TypeOf(items) = items
+
+let main: () = {
+    let mut value: Count = original
+    let loan = &value
+    ; Inspecting an owner or its loan does not access the borrowed storage.
+    let other: @TypeOf(value) = 7
+    let numbers: []@TypeOf(loan) = [1, 2]
+    loan += 1
+    let boxed = Box(@TypeOf(other))[ .value = 9 ]
+    let callback: (int) -> int = identity
+    @println("Types:", @TypeOf(value), @TypeOf(numbers), @TypeOf(boxed), @TypeOf(callback))
+    @println("Values:", original, other, copy(numbers), boxed.value)
+}
+
+@[test]
+let annotations_ascriptions_and_generic_results: () = {
+    let value: u8 = 7
+    let same_type: @TypeOf(value) = 8
+    let exact = @as(@TypeOf(value), 9)
+    let returned = identity(value)
+    let checked: u8 = returned
+    let boxed = Box(@TypeOf(value))[ .value = same_type ]
+    @assert(exact == 9 and checked == 7 and boxed.value == 8)
+    @assert("{@TypeOf(value)}" == "u8")
+    @assert("{@TypeOf(boxed)}" == "Box(u8)")
+}
+
+@[test]
+let mutable_bindings_and_type_only_outer_references: () = {
+    let mut value: u16 = 3
+    let loan = &value
+    let other: @TypeOf(value) = 4
+    let loan_type: @TypeOf(loan) = other
+    loan += loan_type
+    @assert(loan == 7)
+    let type_only = () -> u16 {
+        let result: @TypeOf(value) = 5
+        result
+    }
+    @assert(type_only() == 5)
+}

@@ -135,6 +135,8 @@ pub const Diagnostic = struct {
         unsupported_dependency_expression,
         missing_initializer,
         unknown_type,
+        invalid_type_query_operand,
+        type_query_limit,
         unsupported_type,
         not_a_type,
         duplicate_parameter,
@@ -352,6 +354,10 @@ pub fn classifyAliases(self: *Module) std.mem.Allocator.Error!void {
         const init_node = self.source.ast.decl(declaration.node).ast.init_node;
         const name = self.source.ast.tokenSlice(self.source.ast.firstToken(init_node));
         if (self.source.ast.fullCall(init_node)) |call| {
+            if (tags[call.ast.fn_expr] == .builtin_literal and std.mem.eql(u8, name, "@TypeOf")) {
+                declaration.is_type_alias = true;
+                continue;
+            }
             if (tags[call.ast.fn_expr] != .identifier) continue;
             const target = self.lookup(self.source.ast.tokenSlice(self.source.ast.firstToken(call.ast.fn_expr))) orelse continue;
             if (!self.getDeclaration(target).?.is_generic) continue;
@@ -407,6 +413,7 @@ pub fn classifyAliases(self: *Module) std.mem.Allocator.Error!void {
             } else if (tags[node] == .array_type) {
                 try work.append(self.allocator, data[node].rhs);
             } else if (self.source.ast.fullCall(node)) |call| {
+                if (tags[call.ast.fn_expr] == .builtin_literal and std.mem.eql(u8, self.source.ast.tokenSlice(self.source.ast.firstToken(call.ast.fn_expr)), "@TypeOf")) continue;
                 for (call.ast.args) |arg| try work.append(self.allocator, arg);
             } else if (tags[node] == .identifier) {
                 const name = self.source.ast.tokenSlice(self.source.ast.firstToken(node));

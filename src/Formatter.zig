@@ -211,7 +211,7 @@ fn checkSupported(ast: Ast) !void {
             },
             .builtin_literal => {
                 const name = ast.tokenSlice(main);
-                if (!std.mem.eql(u8, name, "@print") and !std.mem.eql(u8, name, "@println") and !std.mem.eql(u8, name, "@as") and !std.mem.eql(u8, name, "@panic") and !std.mem.eql(u8, name, "@assert") and !std.mem.eql(u8, name, "@This") and !std.mem.eql(u8, name, "@import"))
+                if (!std.mem.eql(u8, name, "@print") and !std.mem.eql(u8, name, "@println") and !std.mem.eql(u8, name, "@as") and !std.mem.eql(u8, name, "@panic") and !std.mem.eql(u8, name, "@assert") and !std.mem.eql(u8, name, "@This") and !std.mem.eql(u8, name, "@TypeOf") and !std.mem.eql(u8, name, "@import"))
                     return error.UnsupportedSyntax;
             },
             .@"break" => if (data.lhs != 0) return error.UnsupportedSyntax,
@@ -787,6 +787,13 @@ fn testArrayAllocationFailures(allocator: std.mem.Allocator) !void {
 
 test "array formatting survives every allocation failure" {
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testArrayAllocationFailures, .{});
+}
+
+test "TypeOf formatting preserves annotations type arguments and interpolation" {
+    try expectFormatted(
+        "let n=1\nlet T=@TypeOf(n)\nlet f:(x:int)->@TypeOf(x)={let y:[]@TypeOf(x)=[x]\n@println(@TypeOf(y),\"{@TypeOf(x)}\")\nx}",
+        "let n = 1\nlet T = @TypeOf(n)\nlet f: (x: int) -> @TypeOf(x) = {\n    let y: []@TypeOf(x) = [x]\n    @println(@TypeOf(y), \"{@TypeOf(x)}\")\n    x\n}\n",
+    );
 }
 
 test "stringify formatting preserves argument free attributes and arbitrary method names" {

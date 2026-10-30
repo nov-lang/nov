@@ -1895,8 +1895,9 @@ changed.score += 1
   [examples/managed-arrays.nov](examples/managed-arrays.nov).
 
 The broader examples below describe future syntax as well as implemented syntax;
-bare integer elements now default to `int`, but writable `.len`, `@TypeOf` and the
-broader pointer/functional forms shown there are **not** executable features of this subset. Array printing is implemented for recursively printable elements.
+bare integer elements now default to `int`, and bounded [`@TypeOf`](#type-queries) is
+implemented, but writable `.len` and the broader pointer/functional forms shown
+there are **not** executable features of this subset. Array printing is implemented for recursively printable elements.
 
 Array literals are comma-separated, may span multiple lines, and may have a
 trailing comma.
@@ -2349,7 +2350,9 @@ Aliases are canonical synonyms, **not distinct newtypes**: `Count` and `uint`
 match exactly, with the same literal bounds, operations and backend restrictions.
 Supported RHS forms are `bool`, `void`, fixed-width integers, native `int`/`uint`,
 `rune`, `string`, nominal container types, supported array types and function types, including aliases in nested
-parameter/result/array-element positions. Function-type parameters may be unnamed.
+parameter/result/array-element positions. Bounded [`@TypeOf`](#type-queries)
+queries are also supported, including `let Count = @TypeOf(global)`.
+Function-type parameters may be unnamed.
 `let Callback = (int) -> int` declares a type alias, not a function body.
 Function definitions still use explicit signature syntax, such as
 `let increment: (value: Count) -> Count = value + 1`; a function-type alias can
@@ -2379,9 +2382,64 @@ Aliases work in annotations and `@as`, and print contexts render their canonical
 type names as static strings (`@println(Count)` or `"{Count}"`). They are not
 general runtime values; `Count(1)` remains an error. An alias of a nominal struct
 supports that struct's explicit `Alias[ .field = value ]` constructor and static methods;
-this does not add numeric alias constructors, mutable/local aliases, general runtime type values, `@TypeOf`, generics or
-comptime functions. `@as` remains exact expected-type ascription, not a checked
+this does not add numeric alias constructors, mutable/local aliases, general runtime
+type values or comptime functions. Bounded `@TypeOf` queries and generic container
+arguments are supported as described below. `@as` remains exact expected-type ascription, not a checked
 numeric cast. See [examples/type-aliases.nov](examples/type-aliases.nov).
+
+## Type Queries
+
+`@TypeOf(x)` returns the existing canonical type of a runtime value binding at
+compile time. It takes exactly one operand: a binding identifier or an imported
+namespace value reference such as `lib.value`, subject to ordinary visibility
+checks. Globals, visible locals, parameters, mutable and borrowed bindings, and
+bindings visible from an enclosing closure scope can be inspected. Scalar,
+array, nominal container and concrete function/closure types are supported.
+A concrete function variable specialized from a generic function is queryable;
+the unspecialized template itself is not, even after another call specializes it.
+
+This is a bounded type query, not general expression reflection. Literals,
+arithmetic, calls, indexing and runtime field access (`@TypeOf(record.field)`)
+are rejected, as are types/type aliases, generic templates and namespaces as
+operands. In particular, `@TypeOf(f())` is rejected, **not executed**. Looking up
+a binding's type does not evaluate its initializer or read its runtime value,
+mutate it, add a runtime initializer dependency, or introduce closure captures
+or mutable-capture boxing. Querying a borrowed binding inspects its value type
+without a runtime read. Existing scope, borrowing and global-initializer
+restrictions remain unchanged.
+
+The result is a compile-time type, not a first-class runtime value. Use it in
+annotations (including `[]@TypeOf(x)`), exact ascription
+(`@as(@TypeOf(x), value)`), generic type arguments (`Box(@TypeOf(x))`), or an
+immutable module-level type alias (`let Count = @TypeOf(global)`). Local type
+aliases remain unsupported: `let T = @TypeOf(x)` inside a function is an error.
+Direct print/interpolation contexts are special: `@println(@TypeOf(x))` and
+`"{@TypeOf(x)}"` emit the canonical type name as a static string, without printing
+the value or invoking its `@[stringify]` converter.
+
+```nov
+let global = 42
+let Count = @TypeOf(global)
+let Box: (T: type) -> type = struct { value: T }
+let identity: (x: `T) -> @TypeOf(x) = x
+let same: (x: u8, y: @TypeOf(x)) -> @TypeOf(y) = y
+
+let main: () = {
+    let x: u8 = 7
+    let values: []@TypeOf(x) = [x]
+    let boxed: Box(@TypeOf(x)) = Box(@TypeOf(x))[.value = x]
+    let count: Count = 1
+    let copy = @as(@TypeOf(x), 8)
+    @println(@TypeOf(x), "{@TypeOf(values)}", identity(count), same(x, copy), boxed)
+}
+```
+
+Later function parameters and the return type may query earlier named parameters,
+including in function types. In inferred generic signatures such as
+``(x: `T) -> @TypeOf(x)``, the query shares the parameter's inferred type
+constraints; contextual types still take precedence over integer fallback.
+Broader reflection (`@typeInfo`, member enumeration and arbitrary expression
+queries) remains a proposal. See [examples/type-of.nov](examples/type-of.nov).
 
 ## Primitive Types
 TODO
@@ -2792,8 +2850,8 @@ TODO
 ## Builtins
 ### Functions
 - `@import(path: string)`: Import a nov file. See [Visibility](#Visibility) for which declarations gets imported.
-- `@TypeOf(...)`: Returns the type of a value.
-- `@typeInfo(...)`: Returns type information about a value.
+- `@TypeOf(x)`: Implemented bounded compile-time query of a runtime binding's canonical type; see [Type Queries](#type-queries). Not arbitrary expressions or runtime type values.
+- `@typeInfo(...)`: Proposed type-information reflection; not implemented.
 - `@This()`: Returns the type of the current container
 - `@print(...)`: Output args separated with a space to stdout; returns void. Supports bool, fixed/native integer, raw rune/string and recursive default array/struct/union/enum formatting. Nominal values at any depth prefer an explicit `@[stringify]` method with exact signature `(SelfType) -> string`, called once per encountered value in traversal order and stopping structural recursion. Top-level hooks run immediately after argument evaluation; nested hooks run during traversal. Malformed/inaccessible hooks reject even when nested. Compile-time types emit canonical static name strings. Interpolated strings work like other strings. See the printing contract above.
 - `@println(...)`: Same as print with a newline at the end, including with no args.

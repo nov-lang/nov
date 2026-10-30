@@ -136,7 +136,16 @@ working directory. For example, `@import("result.nov")` in `std.nov` refers to t
 directory's file. A re-export may select a member directly:
 `@[public] let Result = @import("result.nov").Result` (place the attribute on its
 own line). This has the same identity and visibility as a separate namespace binding.
-Imports yield compile-time namespaces, never runtime values.
+Imports yield compile-time namespaces, never runtime values. Bounded
+`@TypeOf(lib.value)` can query an imported runtime binding's canonical type while
+preserving visibility checks; `@TypeOf(lib)` and queries of imported types or
+unspecialized generic templates are rejected. Runtime field/index expressions and
+calls are not valid query operands. Queries do not evaluate/read values or add
+runtime dependencies, captures or boxing. Results are compile-time types usable in
+annotations, `@as`, generic type arguments and module-level aliases, not first-class
+runtime values or local type aliases. Direct print/interpolation renders their
+canonical names without calling value stringify hooks. See the root README's
+[type-query contract](../README.md#type-queries) and `examples/type-of.nov`.
 Canonical paths share one source and nominal identity across repeated/diamond
 imports; cycles diagnose. Declarations and methods are file-private by default;
 both named and file imports expose only `@[public]` declarations. Public types do

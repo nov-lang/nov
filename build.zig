@@ -156,6 +156,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     test_step.dependOn(constructor_shorthand_tests);
     addFieldMutationCliTests(b, exe, test_step, fixtures);
     addGenericStructCliTests(b, exe, test_step, fixtures);
+    const type_of_tests = b.step("test-cli-type-of", "Run bounded @TypeOf CLI tests");
+    addTypeOfCliTests(b, exe, type_of_tests);
+    test_step.dependOn(type_of_tests);
     const integer_default_tests = b.step("test-cli-integer-defaults", "Run integer default inference CLI tests");
     addIntegerDefaultCliTests(b, exe, integer_default_tests);
     test_step.dependOn(integer_default_tests);
@@ -1791,6 +1794,124 @@ fn addGenericClosureCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_s
         check.expectStdOutEqual("");
         if (case.diagnostic.len == 0) check.expectStdErrEqual("") else check.expectStdErrMatch(case.diagnostic);
         test_step.dependOn(&check.step);
+    }
+}
+
+fn addTypeOfCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    for ([_][]const u8{ "fmt", "semantic" }) |mode| {
+        const check = b.addRunArtifact(exe);
+        check.step.name = b.fmt("CLI TypeOf: {s}", .{mode});
+        check.addArgs(if (std.mem.eql(u8, mode, "fmt")) &.{ "fmt", "--check" } else &.{ "check", "--semantic" });
+        check.addFileArg(b.path("examples/type-of.nov"));
+        check.expectExitCode(0);
+        check.expectStdOutEqual("");
+        check.expectStdErrEqual("");
+        test_step.dependOn(&check.step);
+    }
+    const fixtures = b.addWriteFiles();
+    const library = fixtures.add("library/std.nov",
+        \\@[public]
+        \\let value: u8 = 7
+        \\@[public]
+        \\let identity: (item: u8) -> @TypeOf(item) = item
+        \\@[public]
+        \\let Alias = u8
+        \\let secret: u8 = 9
+        \\
+    );
+    _ = fixtures.add("imports.nov",
+        \\let file = @import("library/std.nov")
+        \\let named = @import("std")
+        \\let alias = file
+        \\let Count = @TypeOf(alias.value)
+        \\let verify: () = {
+        \\    let a: @TypeOf(file.value) = 1
+        \\    let b: @TypeOf(named.value) = 2
+        \\    let c: Count = 3
+        \\    let callback: @TypeOf(alias.identity) = named.identity
+        \\    @assert(a + b == c and callback(c) == 3)
+        \\    @assert("{@TypeOf(alias.value)}" == "u8")
+        \\}
+        \\@[test]
+        \\let imported_value_queries: () = verify()
+        \\let main: () = {
+        \\    verify()
+        \\    @println(@TypeOf(file.value), @TypeOf(named.value), @TypeOf(alias.identity))
+        \\}
+        \\
+    );
+    const imports_check = b.addRunArtifact(exe);
+    imports_check.step.name = "CLI TypeOf: file, named and module alias imports semantic";
+    imports_check.setCwd(fixtures.getDirectory());
+    imports_check.addArgs(&.{ "check", "--semantic", "imports.nov", "--lib-dir" });
+    imports_check.addDirectoryArg(library.dirname());
+    imports_check.expectExitCode(0);
+    imports_check.expectStdOutEqual("");
+    imports_check.expectStdErrEqual("");
+    test_step.dependOn(&imports_check.step);
+    for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+        for ([_][]const u8{ "run", "test" }) |command| {
+            for ([_]bool{ false, true }) |imports| {
+                const run = b.addRunArtifact(exe);
+                run.step.name = b.fmt("CLI TypeOf: {s} {s} ({s})", .{ if (imports) "imports" else "example", command, mode });
+                run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+                run.setEnvironmentVariable("NOV_CC", "");
+                run.setEnvironmentVariable("CC", "");
+                run.addArg(command);
+                if (imports) {
+                    run.setCwd(fixtures.getDirectory());
+                    run.addArgs(&.{ "imports.nov", "--lib-dir" });
+                    run.addDirectoryArg(library.dirname());
+                } else run.addFileArg(b.path("examples/type-of.nov"));
+                if (mode.len != 0) run.addArg(mode);
+                run.expectExitCode(0);
+                run.expectStdOutEqual(if (std.mem.eql(u8, command, "test"))
+                    (if (imports) "PASS imported_value_queries\n1 passed; 0 failed; 1 total\n" else "PASS annotations_ascriptions_and_generic_results\nPASS mutable_bindings_and_type_only_outer_references\n2 passed; 0 failed; 2 total\n")
+                else if (imports)
+                    "u8 u8 (u8) -> u8\n"
+                else
+                    b.fmt("Types: i{0d} []i{0d} Box(i{0d}) (i{0d}) -> i{0d}\nValues: 42 7 [1, 2] 9\n", .{@bitSizeOf(usize)}));
+                run.expectStdErrEqual("");
+                test_step.dependOn(&run.step);
+            }
+        }
+    }
+    const invalid_operand = "@TypeOf requires a variable, parameter or imported value reference; expressions and types are not operands";
+    const not_a_value = "expected a runtime value, found a type alias";
+    const wrong_arity = "argument count does not match the function signature";
+    for ([_]struct { name: []const u8, source: []const u8, diagnostic: []const u8 }{
+        .{ .name = "local-alias", .source = "let main:()={let x=1\nlet T=@TypeOf(x)\n}\n", .diagnostic = not_a_value },
+        .{ .name = "runtime-argument", .source = "let consume:(x:int)= {}\nlet main:()={let x=1\nconsume(@TypeOf(x))}\n", .diagnostic = not_a_value },
+        .{ .name = "call-operand", .source = "let f:()->int={@panic(\"must not execute\")}\nlet main:()={let x:@TypeOf(f())=1\n}\n", .diagnostic = invalid_operand },
+        .{ .name = "unknown", .source = "let main:()={let x:@TypeOf(missing)=1\n}\n", .diagnostic = "unknown name 'missing'" },
+        .{ .name = "primitive", .source = "let main:()={let x:@TypeOf(int)=1\n}\n", .diagnostic = invalid_operand },
+        .{ .name = "type-alias", .source = "let T=int\nlet main:()={let x:@TypeOf(T)=1\n}\n", .diagnostic = not_a_value },
+        .{ .name = "namespace", .source = "let lib=@import(\"library/std.nov\")\nlet main:()={let x:@TypeOf(lib)=1\n}\n", .diagnostic = not_a_value },
+        .{ .name = "imported-type", .source = "let lib=@import(\"library/std.nov\")\nlet main:()={let x:@TypeOf(lib.Alias)=1\n}\n", .diagnostic = not_a_value },
+        .{ .name = "zero-arguments", .source = "let main:()={let x:@TypeOf()=1\n}\n", .diagnostic = wrong_arity },
+        .{ .name = "two-arguments", .source = "let main:()={let x=1\nlet y:@TypeOf(x,x)=1\n}\n", .diagnostic = wrong_arity },
+        .{ .name = "private-file-value", .source = "let lib=@import(\"library/std.nov\")\nlet main:()={let x:@TypeOf(lib.secret)=1\n}\n", .diagnostic = "unknown name 'lib'" },
+        .{ .name = "private-named-value", .source = "let lib=@import(\"std\")\nlet main:()={let x:@TypeOf(lib.secret)=1\n}\n", .diagnostic = "unknown name 'lib'" },
+        .{ .name = "literal", .source = "let main:()={let x:@TypeOf(1)=1\n}\n", .diagnostic = invalid_operand },
+        .{ .name = "arithmetic", .source = "let main:()={let x=1\nlet y:@TypeOf(x+1)=1\n}\n", .diagnostic = invalid_operand },
+        .{ .name = "index", .source = "let main:()={let a=[1,2]\nlet x:@TypeOf(a[0])=1\n}\n", .diagnostic = invalid_operand },
+        .{ .name = "runtime-field", .source = "let R=struct{value:int,}\nlet main:()={let r=R[.value=1]\nlet x:@TypeOf(r.value)=1\n}\n", .diagnostic = invalid_operand },
+        .{ .name = "template", .source = "let identity:(x:`T)->`T=x\nlet main:()={let x:@TypeOf(identity)=1\n}\n", .diagnostic = not_a_value },
+    }) |case| {
+        const source = b.fmt("{s}.nov", .{case.name});
+        _ = fixtures.add(source, case.source);
+        for ([_]bool{ false, true }) |emit| {
+            const check = b.addRunArtifact(exe);
+            check.step.name = b.fmt("CLI TypeOf rejects: {s} ({s})", .{ case.name, if (emit) "emit-c" else "semantic" });
+            check.setCwd(fixtures.getDirectory());
+            check.addArgs(if (emit) &.{"emit-c"} else &.{ "check", "--semantic" });
+            check.addArgs(&.{ source, "--lib-dir" });
+            check.addDirectoryArg(library.dirname());
+            check.expectExitCode(1);
+            check.expectStdOutEqual("");
+            check.expectStdErrMatch(b.fmt("error: {s}", .{case.diagnostic}));
+            test_step.dependOn(&check.step);
+        }
     }
 }
 

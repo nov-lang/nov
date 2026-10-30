@@ -146,6 +146,8 @@ fn renderModuleWithSources(module: *const Module, compilation: ?*const Compilati
             .value_cycle => try writer.print("cyclic value dependency on '{s}'", .{source.slice(diagnostic.span).?}),
             .unsupported_dependency_expression => try writer.writeAll("dependency analysis for this expression is not implemented yet"),
             .missing_initializer => try writer.writeAll("dependency analysis requires an initializer"),
+            .invalid_type_query_operand => try writer.writeAll("@TypeOf requires a variable, parameter or imported value reference; expressions and types are not operands"),
+            .type_query_limit => try writer.writeAll("cyclic or excessively nested @TypeOf dependency (limit 128)"),
             .unknown_type => try writer.print("unknown type '{s}'", .{source.slice(diagnostic.span).?}),
             .unsupported_type => try writer.writeAll("this type is not supported in semantic analysis yet"),
             .not_a_type => try writer.writeAll("expected a type, found a value"),
