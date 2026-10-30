@@ -78,9 +78,13 @@ invokes no callback: map/filter return empty arrays and fold returns `initial`.
 This does not defer argument expressions: callee then arguments evaluate eagerly
 in ordinary left-to-right order, including callback construction and the seed.
 Ordinary functions and capturing closures are supported, as are inferred generic
-closures/local generic functions within the bounded solver. Exact typed inputs
-and seeds are required to resolve inference; ambiguity is an error, not a numeric
-default or implicit conversion.
+closures/local generic functions within the bounded solver. Typed inputs, seeds,
+callback signatures, expected results and supported body constraints take precedence
+over integer fallback. Otherwise unconstrained integer literals default to signed
+pointer-sized `int`, including in nonempty and nested array arguments; empty arrays
+still need an element type. Remaining ambiguity is an error. There is no implicit
+numeric widening or size-based fallback, and floats remain unsupported rather than
+being coerced to `int`.
 
 ```nov
 let std = @import("std")

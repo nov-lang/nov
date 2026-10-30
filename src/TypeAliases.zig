@@ -61,6 +61,7 @@ const failures = [_]Failure{
     .{ .source = "let Count = uint\nlet f: (x: int) -> Count = @as(Count, x)", .tag = .expression_type_mismatch },
     .{ .source = "let Value: int = 1\nlet Alias = Value\nlet x: Alias = 2", .tag = .not_a_type, .text = "Value" },
     .{ .source = "let Value = 1\nlet Alias = Value\nlet x: Alias = 2", .tag = .not_a_type },
+    .{ .source = "let Value = -{{1}}\nlet Alias = Value\nlet x: Alias = 2", .tag = .not_a_type },
     .{ .source = "let f: (x: int) -> int = x\nlet Alias = f\nlet x: Alias = 1", .tag = .not_a_type },
     .{ .source = "let A = Missing\nlet x: A = 1", .tag = .unknown_type, .text = "Missing" },
     .{ .source = "let A = []Missing", .tag = .unknown_type },
@@ -121,6 +122,10 @@ test "type alias classification preserves runtime globals functions and literal 
     defer sema.deinit();
     try std.testing.expect(!module.hasErrors());
     try std.testing.expectEqual(Sema.Status.deferred, sema.getEntry(module.lookup("N").?).?.status);
+    const other = sema.getEntry(module.lookup("Other").?).?;
+    try std.testing.expectEqual(Sema.Status.constant_checked, other.status);
+    try std.testing.expect(other.alias_type == null);
+    try std.testing.expectEqual(@as(i128, 1), sema.ir.getConstant(other.constant.?).?.value.signed_integer);
     try std.testing.expectEqual(Sema.Status.signature_only, sema.getEntry(module.lookup("f").?).?.status);
 }
 

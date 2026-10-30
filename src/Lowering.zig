@@ -146,9 +146,7 @@ pub fn lower(module: *Module) Error!Sema {
 fn deferredDiagnostic(module: *const Module, declaration: Module.Declaration) Module.Diagnostic.Tag {
     const full = module.source.ast.decl(declaration.node).ast;
     if (full.is_mutable or full.type_node != 0 or full.init_node == 0) return .unsupported_lowering;
-    const ast = &module.source.ast;
-    const tag = ast.nodes.items(.tag)[full.init_node];
-    return if (tag == .number_literal or (tag == .negation and ast.nodes.items(.tag)[ast.nodes.items(.data)[full.init_node].rhs] == .number_literal)) .literal_needs_type else .unsupported_global_initializer;
+    return .unsupported_global_initializer;
 }
 
 fn testExportOwnership(allocator: std.mem.Allocator) !void {
@@ -1725,6 +1723,24 @@ test "inferred global constants and inline uses outlive source storage" {
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
 }
 
+test "defaulted integer globals inline typed constants without runtime initialization" {
+    const source = "let positive = 42\nlet negative = -{{42}}\nlet read: () -> int = positive\nlet read_negative: () -> int = negative";
+    var module = try Module.init(std.testing.allocator, "defaulted-globals.nov", source);
+    defer module.deinit();
+    var sema = try lower(&module);
+    defer sema.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try std.testing.expectEqual(@as(usize, 2), sema.ir.functions.items.len);
+    for (sema.ir.functions.items, 0..) |function, i| {
+        try std.testing.expectEqual(@as(usize, 1), function.body.?.instructions.len);
+        try std.testing.expectEqual(sema.entries[i].constant.?, function.body.?.instructions[0].op.constant);
+        try std.testing.expectEqual(Ir.Type.Integer{ .signedness = .signed, .bits = Ir.native_pointer_bits }, sema.ir.getType(sema.entries[i].type_id.?).?.integer);
+    }
+    try sema.ir.verify();
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+}
+
 test "inferred global boundary rejects computation blocks chains and runtime effects" {
     for ([_][]const u8{
         "let value: int = @as(int, 1 + 2)",
@@ -1747,6 +1763,13 @@ test "inferred global boundary rejects computation blocks chains and runtime eff
         "let value = @as(int, {@println(true)\n1})",
         "let value = @as(int, {return 1})",
         "let value = other\nlet other = true",
+        "let value = other\nlet other = 1",
+        "let value = 1 + 2",
+        "let value = {1}",
+        "let value = [1]",
+        "let value = -{let n = 1\nn}",
+        "let value = -{1 + 2}",
+        "let value = 1\nlet read: () -> i8 = value",
         "let f: () -> int = 1\nlet value = @as(() -> int, f)",
         "let mut value = true",
         "let mut value = @as(int, 1)",
@@ -1762,14 +1785,15 @@ test "inferred global boundary rejects computation blocks chains and runtime eff
         try sema.ir.verify();
         try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
     }
-    for ([_][]const u8{ "let n = 1", "let n = -1" }) |source| {
+    for ([_][]const u8{ "let n = 1", "let n = -1", "let n = -{1}", "let n = -{{1}}" }) |source| {
         var module = try Module.init(std.testing.allocator, "untyped-global.nov", source);
         defer module.deinit();
         var sema = try lower(&module);
         defer sema.deinit();
-        try std.testing.expectEqual(Module.Diagnostic.Tag.literal_needs_type, module.diagnostics.items[0].tag);
-        try std.testing.expect(sema.entries[0].type_id == null and sema.entries[0].constant == null);
-        try std.testing.expect(!sema.lowering_complete);
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expect(sema.entries[0].type_id != null and sema.entries[0].constant != null);
+        try std.testing.expect(sema.lowering_complete);
+        try sema.ir.verify();
     }
 }
 
@@ -2282,8 +2306,8 @@ fn testCompilationGlobalDiagnostic(allocator: std.mem.Allocator, source: []const
 
 test "compilation deferred globals preserve standalone diagnostics root and imported source spans under OOM" {
     const cases = [_]struct { source: []const u8, tag: Module.Diagnostic.Tag }{
-        .{ .source = "let n=1", .tag = .literal_needs_type },
-        .{ .source = "let n=-1", .tag = .literal_needs_type },
+        .{ .source = "let n=1.5", .tag = .unsupported_literal },
+        .{ .source = "let n=-1.5", .tag = .unsupported_literal },
         .{ .source = "let n=@as(int,missing)", .tag = .unknown_name },
         .{ .source = "let n=@as(int,missing())", .tag = .unsupported_dependency_expression },
         .{ .source = "let n=@as(int,{1})", .tag = .unsupported_global_initializer },

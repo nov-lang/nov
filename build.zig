@@ -156,6 +156,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     test_step.dependOn(constructor_shorthand_tests);
     addFieldMutationCliTests(b, exe, test_step, fixtures);
     addGenericStructCliTests(b, exe, test_step, fixtures);
+    const integer_default_tests = b.step("test-cli-integer-defaults", "Run integer default inference CLI tests");
+    addIntegerDefaultCliTests(b, exe, integer_default_tests);
+    test_step.dependOn(integer_default_tests);
     const generic_function_tests = b.step("test-cli-generic-functions", "Run direct generic function CLI tests");
     addGenericFunctionCliTests(b, exe, generic_function_tests);
     test_step.dependOn(generic_function_tests);
@@ -410,7 +413,7 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         .{ .name = "annotated global exact nested types", .args = &.{ "check", "--semantic", "annotated-global-nesting.nov" }, .exit_code = 1, .stderr_match = "expression does not match the expected type" },
         .{ .name = "annotated global literal bounds", .args = &.{ "check", "--semantic", "annotated-global-bounds.nov" }, .exit_code = 1, .stderr_match = "integer literal does not fit" },
         .{ .name = "annotated global interpolation diagnostic", .args = &.{ "emit-c", "annotated-global-interpolation.nov" }, .exit_code = 1, .stderr_match = "move interpolation into a function" },
-        .{ .name = "global integer needs context", .args = &.{ "check", "--semantic", "global-untyped.nov" }, .exit_code = 1, .stderr_match = "integer literal needs an expected type" },
+        .{ .name = "global integer defaults to int", .args = &.{ "check", "--semantic", "global-untyped.nov" }, .exit_code = 0 },
         .{ .name = "global ascription bounds", .args = &.{ "check", "--semantic", "global-bounds.nov" }, .exit_code = 1, .stderr_match = "integer literal does not fit" },
         .{ .name = "global ascription rejects eager calls", .args = &.{ "check", "--semantic", "global-call.nov" }, .exit_code = 1, .stderr_match = "dependency analysis for this expression" },
         .{ .name = "global ascription unknown value", .args = &.{ "check", "--semantic", "global-unknown.nov" }, .exit_code = 1, .stderr_match = "unknown name 'missing'" },
@@ -447,13 +450,13 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         .{ .name = "fmt unchanged fibo", .args = &.{ "fmt", "--check", "fibo.nov" }, .exit_code = 0 },
         .{ .name = "check inferred locals", .args = &.{ "check", "--semantic", "inferred-locals.nov" }, .exit_code = 0 },
         .{ .name = "fmt inferred locals", .args = &.{ "fmt", "--check", "inferred-locals.nov" }, .exit_code = 0 },
-        .{ .name = "reject inferred integer default", .args = &.{ "emit-c", "inferred-integer.nov" }, .exit_code = 1, .stderr_match = "integer literal needs an expected type (no default chosen)" },
+        .{ .name = "check inferred integer default", .args = &.{ "check", "--semantic", "inferred-integer.nov" }, .exit_code = 0 },
         .{ .name = "reject inferred empty array", .args = &.{ "check", "--semantic", "inferred-empty-array.nov" }, .exit_code = 1, .stderr_match = "array literal needs an expected []T type" },
         .{ .name = "check array compounds", .args = &.{ "check", "--semantic", "array-compound.nov" }, .exit_code = 0 },
         .{ .name = "fmt array compounds", .args = &.{ "fmt", "--check", "array-compound.nov" }, .exit_code = 0 },
         .{ .name = "reject bool array compounds", .args = &.{ "emit-c", "array-bool-compound.nov" }, .exit_code = 1, .stderr_match = "operator is not supported" },
         .{ .name = "check scalar arrays", .args = &.{ "check", "--semantic", "scalar-arrays.nov" }, .exit_code = 0 },
-        .{ .name = "reject membership integer defaults", .args = &.{ "check", "--semantic", "membership-default.nov" }, .exit_code = 1, .stderr_match = "integer literal needs an expected type (no default chosen)" },
+        .{ .name = "check membership integer defaults", .args = &.{ "check", "--semantic", "membership-default.nov" }, .exit_code = 0 },
         .{ .name = "reject membership widening", .args = &.{ "emit-c", "membership-width.nov" }, .exit_code = 1, .stderr_match = "expression does not match the expected type" },
         .{ .name = "reject string membership", .args = &.{ "emit-c", "membership-string.nov" }, .exit_code = 1, .stderr_match = "operator is not supported for this operand type" },
         .{ .name = "reject array length writes", .args = &.{ "emit-c", "array-length-write.nov" }, .exit_code = 1, .stderr_match = "array .len is read-only" },
@@ -1773,7 +1776,7 @@ fn addGenericClosureCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_s
         .{ .name = "unspecialized-escape", .source = "let main:()={let leaked={let f=(x:`T)->`T{x}\nf}\n}", .diagnostic = "cannot infer every generic function type variable" },
         .{ .name = "local-recursion", .source = "let main:()={let f:(x:`T)->`T=f(x)\n@print(f(true))}", .diagnostic = "unknown name" },
         .{ .name = "closure-recursion", .source = "let main:()={let f=(x:`T)->`T{f(x)}\n@print(f(true))}", .diagnostic = "unknown name" },
-        .{ .name = "ambiguous", .source = "let main:()={let f:(x:`T)->`T=x\nf(1)\n@print()}", .diagnostic = "cannot infer every generic function type variable" },
+        .{ .name = "integer-default", .source = "let main:()={let f:(x:`T)->`T=x\nlet value=f(1)\n@print()}", .diagnostic = "" },
         .{ .name = "conflict", .source = "let main:()={let f=(x:`T,y:`T)->`T{x}\n@print(f(true,@as(int,1)))}", .diagnostic = "constraints require exactly identical types" },
         .{ .name = "callback-conflict", .source = "let main:()={let f=(x:`T)->`T{x}\nlet cb:(uint)->int=f\n}", .diagnostic = "constraints require exactly identical types" },
         .{ .name = "scope", .source = "let main:()={let f=(x:`T)->`T{{let hidden:int=1\n}\nx}\n@print(f(true))\n@print(hidden)}", .diagnostic = "unknown name" },
@@ -1781,12 +1784,65 @@ fn addGenericClosureCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_s
         const source = b.fmt("reject-{s}.nov", .{case.name});
         _ = fixtures.add(source, case.source);
         const check = b.addRunArtifact(exe);
-        check.step.name = b.fmt("CLI generic closures reject: {s}", .{case.name});
+        check.step.name = b.fmt("CLI generic closures check: {s}", .{case.name});
         check.setCwd(fixtures.getDirectory());
         check.addArgs(&.{ "check", "--semantic", source });
-        check.expectExitCode(1);
+        check.expectExitCode(if (case.diagnostic.len == 0) 0 else 1);
         check.expectStdOutEqual("");
-        check.expectStdErrMatch(case.diagnostic);
+        if (case.diagnostic.len == 0) check.expectStdErrEqual("") else check.expectStdErrMatch(case.diagnostic);
+        test_step.dependOn(&check.step);
+    }
+}
+
+fn addIntegerDefaultCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    for ([_][]const u8{ "fmt", "semantic" }) |mode| {
+        const check = b.addRunArtifact(exe);
+        check.step.name = b.fmt("CLI integer defaults: {s}", .{mode});
+        check.addArgs(if (std.mem.eql(u8, mode, "fmt")) &.{ "fmt", "--check" } else &.{ "check", "--semantic" });
+        check.addFileArg(b.path("examples/integer-defaults.nov"));
+        check.expectExitCode(0);
+        check.expectStdOutEqual("");
+        check.expectStdErrEqual("");
+        test_step.dependOn(&check.step);
+    }
+    for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+        for ([_][]const u8{ "run", "test" }) |command| {
+            const run = b.addRunArtifact(exe);
+            run.step.name = b.fmt("CLI integer defaults: {s} ({s})", .{ command, mode });
+            run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+            run.setEnvironmentVariable("NOV_CC", "");
+            run.setEnvironmentVariable("CC", "");
+            run.addArg(command);
+            run.addFileArg(b.path("examples/integer-defaults.nov"));
+            if (mode.len != 0) run.addArg(mode);
+            run.expectExitCode(0);
+            run.expectStdOutEqual(if (std.mem.eql(u8, command, "test"))
+                "PASS defaults_and_control_flow\nPASS constraints_precede_defaulting\n2 passed; 0 failed; 2 total\n"
+            else
+                "Defaults: 42 -2 3 42\nArray: [1, 2, 3]\nContext: [1, 7] 1\nGeneric: 42 3 3\n");
+            run.expectStdErrEqual("");
+            test_step.dependOn(&run.step);
+        }
+    }
+    const fixtures = b.addWriteFiles();
+    const native_overflow = b.fmt("{d}", .{@as(u128, 1) << (@bitSizeOf(usize) - 1)});
+    for ([_]struct { name: []const u8, source: []const u8, diagnostic: []const u8 }{
+        .{ .name = "nonliteral-narrowing", .source = "let main:()={let value=1\nlet narrow:u8=value\n}\n", .diagnostic = "expression does not match the expected type" },
+        .{ .name = "local-overflow", .source = b.fmt("let main:()={{let value={s}\n}}\n", .{native_overflow}), .diagnostic = "integer literal does not fit" },
+        .{ .name = "global-overflow", .source = b.fmt("let value={s}\n", .{native_overflow}), .diagnostic = "integer literal does not fit" },
+        .{ .name = "float", .source = "let main:()={let value=1.5\n}\n", .diagnostic = "this literal is not supported in semantic analysis yet" },
+        .{ .name = "empty-array", .source = "let main:()={let values=[]\n}\n", .diagnostic = "array literal needs an expected []T type" },
+        .{ .name = "explicit-wide", .source = b.fmt("let value:u64={s}\nlet main:()={{let local:u64={s}\n}}\n", .{ native_overflow, native_overflow }), .diagnostic = "" },
+    }) |case| {
+        const source = b.fmt("{s}.nov", .{case.name});
+        _ = fixtures.add(source, case.source);
+        const check = b.addRunArtifact(exe);
+        check.step.name = b.fmt("CLI integer defaults check: {s}", .{case.name});
+        check.setCwd(fixtures.getDirectory());
+        check.addArgs(&.{ "check", "--semantic", source });
+        check.expectExitCode(if (case.diagnostic.len == 0) 0 else 1);
+        check.expectStdOutEqual("");
+        if (case.diagnostic.len == 0) check.expectStdErrEqual("") else check.expectStdErrMatch(case.diagnostic);
         test_step.dependOn(&check.step);
     }
 }
@@ -1977,14 +2033,14 @@ fn addGenericFunctionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_
 
     const prefix = "let add:(x:`a,y:`b)->`c=x+y\nlet id:(x:`T)->`T=x\n";
     for ([_]struct { name: []const u8, source: []const u8, diagnostic: []const u8 }{
-        .{ .name = "ambiguous", .source = prefix ++ "let main:()={let x=add(1,2)\n}", .diagnostic = "cannot infer every generic function type variable" },
-        .{ .name = "result-only-ambiguous", .source = "let f:(x:`T)->`U=1\nlet main:()={let x=f(true)\n}", .diagnostic = "integer literals have no default type" },
+        .{ .name = "integer-default", .source = prefix ++ "let main:()={let x=add(1,2)\n}", .diagnostic = "" },
+        .{ .name = "result-only-default", .source = "let f:(x:`T)->`U=1\nlet main:()={let x=f(true)\n}", .diagnostic = "" },
         .{ .name = "conflict", .source = prefix ++ "let main:()={let x=add(@as(uint,1),@as(int,2))\n}", .diagnostic = "constraints require exactly identical types" },
         .{ .name = "result-conflict", .source = prefix ++ "let main:()={let x:int=add(@as(uint,1),2)\n}", .diagnostic = "no implicit conversions are available" },
         .{ .name = "string-conflict", .source = prefix ++ "let main:()={let x=add(\"s\",@as(uint,2))\n}", .diagnostic = "constraints require exactly identical types" },
         .{ .name = "function-value", .source = prefix ++ "let main:()={let f=id\n}", .diagnostic = "cannot infer every generic function type variable" },
-        .{ .name = "callback-ambiguous", .source = prefix ++ "let apply:(f:(`T)->`U,x:`T)->`U=f(x)\nlet main:()={let x=apply(id,42)\n}", .diagnostic = "cannot infer every generic function type variable" },
-        .{ .name = "callback-unbound", .source = "let f:(x:`T)->`U=1\nlet apply:(cb:(`T)->`U,x:`T)->`U=cb(x)\nlet main:()={let value=apply(f,true)\n}", .diagnostic = "integer literals have no default type" },
+        .{ .name = "callback-default", .source = prefix ++ "let apply:(f:(`T)->`U,x:`T)->`U=f(x)\nlet main:()={let x=apply(id,42)\n}", .diagnostic = "" },
+        .{ .name = "callback-result-default", .source = "let f:(x:`T)->`U=1\nlet apply:(cb:(`T)->`U,x:`T)->`U=cb(x)\nlet main:()={let value=apply(f,true)\n}", .diagnostic = "" },
         .{ .name = "callback-result-conflict", .source = prefix ++ "let main:()={let cb:(uint)->int=id\n}", .diagnostic = "constraints require exactly identical types" },
         .{ .name = "callback-argument-conflict", .source = prefix ++ "let apply:(f:(`T)->`T,x:`T)->`T=f(x)\nlet main:()={let x:int=apply(id,@as(uint,42))\n}", .diagnostic = "constraints require exactly identical types" },
         .{ .name = "callback-arity-conflict", .source = prefix ++ "let main:()={let cb:(uint,uint)->uint=id\n}", .diagnostic = "argument count does not match the function signature" },
@@ -2005,12 +2061,12 @@ fn addGenericFunctionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_
         const source = b.fmt("reject-{s}.nov", .{case.name});
         _ = fixtures.add(source, case.source);
         const check = b.addRunArtifact(exe);
-        check.step.name = b.fmt("CLI generic functions reject: {s}", .{case.name});
+        check.step.name = b.fmt("CLI generic functions check: {s}", .{case.name});
         check.setCwd(fixtures.getDirectory());
         check.addArgs(&.{ "check", "--semantic", source });
-        check.expectExitCode(1);
+        check.expectExitCode(if (case.diagnostic.len == 0) 0 else 1);
         check.expectStdOutEqual("");
-        check.expectStdErrMatch(case.diagnostic);
+        if (case.diagnostic.len == 0) check.expectStdErrEqual("") else check.expectStdErrMatch(case.diagnostic);
         test_step.dependOn(&check.step);
     }
 }
@@ -2178,8 +2234,8 @@ fn addGenericMethodCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_st
         .{ .name = "callback-input-conflict", .source = box ++ "let f:(x:int)->bool=true\nlet main:()={let x=Box(uint)[.value=1].map(f)\n}", .diagnostic = "constraints require exactly identical types" },
         .{ .name = "expected-result-conflict", .source = box ++ "let main:()={let x:Box(int)=Box(uint)[.value=1].map(id)\n}", .diagnostic = "constraints require exactly identical types" },
         .{ .name = "argument-result-conflict", .source = box ++ "let main:()={let x=Box(uint)[.value=1].choose(id,@as(int,2))\n}", .diagnostic = "constraints require exactly identical types" },
-        .{ .name = "ambiguous-result", .source = "let S=struct{let f:(self:S,x:`T)->`T=x\n}\nlet main:()={let x=S[].f(1)\n}", .diagnostic = "cannot infer every generic function type variable" },
-        .{ .name = "ambiguous-callback", .source = box ++ "let f:(x:uint)->`U=1\nlet main:()={let x=Box(uint)[.value=1].choose(f,1)\n}", .diagnostic = "integer literals have no default type" },
+        .{ .name = "integer-default", .source = "let S=struct{let f:(self:S,x:`T)->`T=x\n}\nlet main:()={let x=S[].f(1)\n}", .diagnostic = "" },
+        .{ .name = "callback-result-default", .source = box ++ "let f:(x:uint)->`U=1\nlet main:()={let x=Box(uint)[.value=1].choose(f,1)\n}", .diagnostic = "" },
         .{ .name = "private-instance", .source = "let lib=@import(\"library.nov\")\nlet main:()={let x=lib.make().private(true)\n}", .diagnostic = "unknown container field, method, enum tag or union variant" },
         .{ .name = "private-static", .source = "let lib=@import(\"library.nov\")\nlet main:()={let x=lib.Alias(bool).private(lib.make(),true)\n}", .diagnostic = "declaration needs a resolved type before use here" },
         .{ .name = "private-callback", .source = "let lib=@import(\"library.nov\")\nlet main:()={let x:lib.Alias(bool)=lib.make().map(lib.identity)\n}", .diagnostic = "declaration needs a resolved type before use here" },
@@ -2193,12 +2249,12 @@ fn addGenericMethodCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_st
         const source = b.fmt("reject-{s}.nov", .{case.name});
         _ = fixtures.add(source, case.source);
         const check = b.addRunArtifact(exe);
-        check.step.name = b.fmt("CLI generic methods reject: {s}", .{case.name});
+        check.step.name = b.fmt("CLI generic methods check: {s}", .{case.name});
         check.setCwd(fixtures.getDirectory());
         check.addArgs(&.{ "check", "--semantic", source });
-        check.expectExitCode(1);
+        check.expectExitCode(if (case.diagnostic.len == 0) 0 else 1);
         check.expectStdOutEqual("");
-        check.expectStdErrMatch(case.diagnostic);
+        if (case.diagnostic.len == 0) check.expectStdErrEqual("") else check.expectStdErrMatch(case.diagnostic);
         test_step.dependOn(&check.step);
     }
 }
@@ -2519,21 +2575,25 @@ fn addArrayHelperCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step
         .{ .name = "map-empty", .source = "std.array.map([],identity)", .diagnostic = "provide typed runtime arguments" },
         .{ .name = "filter-empty", .source = "std.array.filter([],(x:`T)->bool{true})", .diagnostic = "provide typed runtime arguments" },
         .{ .name = "fold-empty", .source = "std.array.fold([],@as(int,0),(a:int,x:`T)->int{a})", .diagnostic = "provide typed runtime arguments" },
-        .{ .name = "fold-untyped-initial", .source = "std.array.fold(@as([]int,[1]),0,(a:`U,x:int)->`U{a})", .diagnostic = "provide typed runtime arguments" },
+        .{ .name = "fold-defaulted-initial", .source = "std.array.fold(@as([]int,[1]),0,(a:`U,x:int)->`U{a})", .diagnostic = "" },
         .{ .name = "map-void", .source = "std.array.map(@as([]int,[1]),(x:int)->void{})", .diagnostic = "this type is not supported in semantic analysis yet" },
     }) |case| {
         const source = b.fmt("invalid-array-helper-{s}.nov", .{case.name});
         _ = fixtures.add(source, b.fmt("let std=@import(\"std\")\nlet identity:(x:`T)->`T=x\nlet main:()={{let value={s}\n}}\n", .{case.source}));
         const check = b.addRunArtifact(exe);
-        check.step.name = b.fmt("CLI array helpers: reject {s}", .{case.name});
+        check.step.name = b.fmt("CLI array helpers: {s} {s}", .{ if (case.diagnostic.len == 0) "accept" else "reject", case.name });
         check.setCwd(fixtures.getDirectory());
         check.addArgs(&.{ "check", "--semantic", source, "--lib-dir" });
         check.addDirectoryArg(library);
-        check.expectExitCode(1);
+        check.expectExitCode(if (case.diagnostic.len == 0) 0 else 1);
         check.expectStdOutEqual("");
-        check.expectStdErrMatch(".nov:");
-        check.expectStdErrMatch("error:");
-        check.expectStdErrMatch(case.diagnostic);
+        if (case.diagnostic.len == 0) {
+            check.expectStdErrEqual("");
+        } else {
+            check.expectStdErrMatch(".nov:");
+            check.expectStdErrMatch("error:");
+            check.expectStdErrMatch(case.diagnostic);
+        }
         test_step.dependOn(&check.step);
     }
     for ([_][]const u8{ "map", "filter", "fold" }) |helper| {

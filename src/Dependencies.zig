@@ -258,6 +258,25 @@ test "global ascriptions skip types but never hide runtime dependencies" {
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{module.source.ast.source});
 }
 
+test "defaultable integer globals remain values with literal-only dependencies" {
+    var module = try Module.init(std.testing.allocator, "integer-values.nov", "let Alias = Negative\nlet Positive = 42\nlet Negative = -{{42}}\nlet Typed = @as(int, 42)");
+    defer module.deinit();
+    var dependencies = try analyze(&module);
+    defer dependencies.deinit();
+    try std.testing.expect(!module.hasErrors());
+    for (module.declarations.items, 0..) |declaration, i| {
+        try std.testing.expect(!declaration.is_type_alias);
+        try std.testing.expectEqual(State.resolved, dependencies.entries[i].state);
+        const edges = dependencies.getEdges(@fromBackingInt(@intCast(i))).?;
+        if (i == 0) {
+            try std.testing.expectEqual(@as(usize, 1), edges.len);
+            try std.testing.expectEqual(module.lookup("Negative").?, edges[0].target);
+        } else {
+            try std.testing.expectEqual(@as(usize, 0), edges.len);
+        }
+    }
+}
+
 test "value dependencies resolve forward references in dependency-first order" {
     var module = try Module.init(std.testing.allocator, "forward.nov", "let a = {b + 1}\nlet b = c * 2\nlet c = 3");
     defer module.deinit();

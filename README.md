@@ -42,12 +42,12 @@ explicit `bool`, `void`, fixed-width integer, native `int`/`uint` and function
 types, and checks integer and boolean literals against annotations. Bounded function-body checking binds
 parameters and checks integer arithmetic, boolean expressions, comparisons and
 calls against collected signatures, including recursive calls. Immutable and mutable
-locals (explicitly typed or inferred from an already typed initializer) and blocks
+locals (explicitly typed or inferred from their initializer) and blocks
 with final-expression results are supported in function bodies. Immutable module-level
-[type aliases](#type-aliases) name existing canonical types. General literal defaults,
-shadowing and global mutation remain deferred or unsupported. Bounded range-loop
-literal bounds have a specific native `uint`/`int` default (see [Range](#range));
-this is not a general integer-literal default.
+[type aliases](#type-aliases) name existing canonical types. Unconstrained integer
+literals default to signed pointer-sized `int` after contextual inference;
+shadowing and global mutation remain deferred or unsupported. Direct range
+literal bounds retain their dedicated native `uint`/`int` rule (see [Range](#range)).
 Lowering produces typed operations with source spans, ordered operands/call
 arguments, explicit returns, and structured regions for boolean `and`/`or`,
 `if`/`else`, scalar `match`, and condition-based or unconditional loops with optional continuation
@@ -55,7 +55,7 @@ clauses, value-carrying breaks, and conditional/range-loop exhaustion (`else`) r
 It requires immutable literal globals; unit/global block initializers are
 not lowered yet. An internal C11 backend emits verified IR, including fixed-width
 integer arithmetic and program entrypoint emission through `emit-c`.
-`@print`/`@println` support booleans, runes, strings, explicitly typed integers
+`@print`/`@println` support booleans, runes, strings, inferred or explicitly typed integers
 (including `int`/`uint`), and default structural formatting for printable arrays,
 structs, unions and enums. Nominal values, including nested values, can override
 the default with an exact container method marked `@[stringify]`. Print contexts
@@ -68,15 +68,16 @@ analysis, annotation/literal and function-body checking, then typed lowering and
 IR verification. Source errors and unsupported/deferred forms fail with source
 diagnostics (including related notes where available); recovered syntax errors
 stop semantic analysis. Runtime globals must be immutable scalar constants: explicitly
-typed integer/boolean/rune/string literals, inferred boolean, rune or plain UTF-8
-string literals, or scalar literals explicitly contextualized with `@as(T, literal)`.
+typed integer/boolean/rune/string literals, inferred integer (including literal
+negation), boolean, rune or plain UTF-8 string literals, or scalar literals
+explicitly contextualized with `@as(T, literal)`.
 Immutable module-level type aliases are also supported. Functions need explicit supported signatures and bounded
 expression bodies (including forward/recursive calls, local declarations and
 assignments, nested blocks, boolean short-circuiting, `if`/`else`, explicit returns,
 bounded integer range loops, condition-based or unconditional loops with continuation clauses and unlabeled
 `break`/`continue`, value-producing unconditional, conditional-with-`else`, or range-with-`else` loops,
 and empty void bodies).
-Bare integer globals still need type context; no numeric default is chosen.
+Bare integer globals default to `int` when no explicit type context is supplied.
 Mutable globals, general nonliteral global initializers and global unit
 values are currently rejected, along with the other
 unsupported forms listed above. This is not a backend compatibility check: it
@@ -193,8 +194,8 @@ let main: () -> void = @println(true, answer())
 ```
 
 This outputs `true -42` followed by a newline. Bare integer literals such as
-`@println(42)` still require a type context: use `@as(int, 42)`, a typed global,
-local, parameter, or function result. Native aliases do not introduce bare-literal inference defaults.
+`@println(42)` default to signed pointer-sized `int`. Explicit annotations, `@as`,
+call signatures and typed sibling expressions take precedence over that fallback.
 Interpolated strings can be printed like any string. Functions/closures, ranges
 and void values have no default representation; aggregates containing them also
 reject unless a valid enclosing hook overrides that value and stops structural
@@ -362,13 +363,15 @@ initializer already determines a supported `bool`, integer (fixed-width or nativ
 `let mut copy = values` for an already typed array. Calls, indexing, `.len`, and
 block/conditional results use the same bidirectional rules as other expressions.
 No type is inferred from later uses or from the enclosing function result for a
-local initializer. `let n = 1` and `let n = 1 + 2` still need annotations; there
-are no general integer defaults or widening conversions. Array literals infer
+local initializer. `let n = 1`, `let n = -1` and `let n = 1 + 2` infer `int`
+when no stronger initializer context exists; there are no widening conversions. Array literals infer
 `[]T` from any already known storable element type, including nested arrays and ranges.
 A later element can supply context to earlier literals: `let values = [0, typed_value]`.
 Known element types must match exactly; no signedness or width widening occurs.
 An expected `[]T` takes precedence and checks every element against `T`, including
-literal bounds. `let values = []` and `let values = [1, 2]` still need context.
+literal bounds. Without stronger context, `[1, 2]` infers `[]int` and `[[1], [2]]`
+infers `[][]int`. Empty `[]` (including unresolved nested empty arrays) still needs
+an element type.
 Inferred arrays keep the same copy and GC-root semantics
 as annotated arrays. See [examples/inferred-locals.nov](examples/inferred-locals.nov).
 
@@ -408,8 +411,8 @@ executes, including its local initializers, calls, printing and arithmetic panic
 both branches are typechecked. Braces are mandatory, with `else if` chains allowed.
 An explicit `else` requires matching result types on paths that continue (including
 `void` and function values); returning paths do not contribute a merge value. A surrounding result/argument/annotation type or either branch
-can supply the type context; two bare integer branches still need an explicit
-context. There are no implicit numeric conversions. Without `else`, the expression
+can supply the type context before fallback; two otherwise unconstrained integer
+branches infer `int`. There are no implicit numeric conversions. Without `else`, the expression
 is `void`, and its then-branch must either produce `void` or return from the function. Each branch has its own lexical scope;
 branch locals cannot escape or become visible in the other branch. Conditional
 regions nest with `and`/`or`, and IR verification rejects cross-branch references
@@ -493,8 +496,8 @@ This prints `1`, `3`, and `4` on separate lines. Unconditional loops can produce
 value with `break expression`; the loop's expected type constrains the expression,
 or a known break-value type supplies inference. Break values must have exactly
 compatible types; bare `break` produces `void` and cannot mix with nonvoid breaks.
-There are no implicit numeric defaults: `loop {break 1}` needs integer context,
-while breaking with an explicitly typed `int` local can infer `int`. As with returns and
+Context and typed sibling break values win before fallback; `loop {break 1}`
+otherwise infers `int`. As with returns and
 assignments, array break values are independent copies; immutable strings share
 storage. Inner loops have independent break-value scopes.
 
@@ -528,8 +531,8 @@ let contains: (begin: int, end: int, needle: int) -> bool = {
 first iteration. Breaks from the condition, body, or continuation skip it; returns
 exit the function without running it. Continuing `else` results and break values
 must have exactly compatible types. Expected context, a known break type, or the
-`else` result can supply inference in either direction, without widening or integer
-defaults. Array results copy at both break and exhaustion value boundaries; strings
+`else` result can supply inference in either direction before integer fallback,
+without widening. Array results copy at both break and exhaustion value boundaries; strings
 share immutable storage. A terminal `else` (`return`, outer `break`, or outer
 `continue`) contributes no merge value. If it is terminal and no path breaks from
 the loop, the whole expression is terminal; this does not introduce a never type
@@ -772,8 +775,11 @@ let text = add("hel", "lo") ; string
 Same-named variables agree; distinct names are related by exact body constraints.
 Inference combines typed runtime arguments, the expected call result and supported
 body constraints. Existing integer/string `+` requires one exact supported type
-for both operands and result. There are no implicit conversions or new numeric
-defaults: `let sum = add(1, 2)` is ambiguous.
+for both operands and result. Exact argument, expected-result and body constraints
+win before integer fallback: `let sum = add(1, 2)` infers `int`. There are no
+implicit conversions. An identity call `id(1)` likewise infers `int` without other
+context; an expected `u8` result or a correlated typed `u8` sibling can select `u8`
+before fallback.
 
 Signatures may contain nested arrays, function types and nominal generic-container
 templates such as ``Box(`T)``. Concrete function values can be passed to generic
@@ -829,17 +835,18 @@ Aliases, imports/public reexports, namespace static functions and generic-contai
 static methods follow the same canonicalization and existing visibility rules;
 contextual specialization does not expose private members.
 
-Without enough context, `let callback = identity` and `apply(identity, 42)` are
-ambiguous. Conflicting signatures are errors; no implicit conversion or numeric
-default is introduced. No new parser or explicit specialization syntax is needed.
+Without enough context, `let callback = identity` remains ambiguous, while
+`apply(identity, 42)` resolves to `int` through integer fallback after exact
+constraints. Conflicting signatures are errors; no implicit conversion is introduced. No new parser or explicit specialization syntax is needed.
 
 Body inference is deliberately bounded. It gathers constraints from parameter/local
 reads and explicitly typed globals, string/rune/bool literals, boolean operations,
 exact operand relationships for arithmetic/bitwise/comparison operations, array
 indexing/literals, string indexing, known record fields and array/string `.len`,
 block bindings, `if/else`, conditional/unconditional loops, scoped returns and
-breaks, `@as`, supported direct calls and concrete function-value calls. Numeric literals do not select a type; index operands do not
-supply inference constraints. These relationships do not expand operator support:
+breaks, `@as`, supported direct calls and concrete function-value calls. Integer
+literals supply deferred `int` fallback candidates only after exact constraints;
+index operands do not supply inference constraints. These relationships do not expand operator support:
 ordinary checking of the specialized body still validates every operation. Forms
 outside this solver subset are not general inference rules; if resolving a type
 requires an unsupported constraint, compilation gives an explicit unsupported-
@@ -1544,9 +1551,9 @@ and argument expressions still evaluate eagerly in normal left-to-right call
 order, including the callback expression and fold seed on empty input.
 
 Ordinary functions, capturing closures and inferred generic closures/local generic
-functions are supported within the bounded inference rules. Supply exact typed
-inputs and seeds (as above, or with `@as`); there are no numeric defaults or
-implicit conversions, and ambiguous inference is an error.
+functions are supported within the bounded inference rules. Typed inputs and seeds
+(as above, or with `@as`) supply exact constraints before integer
+fallback; there are no implicit conversions, and remaining ambiguity is an error.
 
 Normal by-value copies preserve recursively independent array backing through
 nested arrays, structs and active union payloads; immutable strings share storage.
@@ -1689,9 +1696,9 @@ source-level annotation syntax and enter arrays through inference. Literals use 
 expected array type when available; otherwise, a known supported element type
 determines the exact element type for the whole literal, even when it
 appears after untyped integer literals. For example, `[true, false]` infers
-`[]bool`, and `[0, typed_integer]` infers that integer's array type. Empty `[]`
-and all-untyped `[1, 2]` still need an expected `[]T`; numeric defaults remain
-deferred. Type inference does not evaluate elements: evaluation remains once,
+`[]bool`, and `[0, typed_integer]` infers that integer's array type before fallback.
+Otherwise `[1, 2]` infers `[]int`, recursively including nested arrays such as
+`[[1], [2]]` as `[][]int`. Empty `[]` still needs an element type. Type inference does not evaluate elements: evaluation remains once,
 left-to-right. Array-valued parameters, locals, calls and other already typed
 expressions can initialize inferred locals without changing copy semantics. See [examples/arrays.nov](examples/arrays.nov):
 
@@ -1888,8 +1895,8 @@ changed.score += 1
   [examples/managed-arrays.nov](examples/managed-arrays.nov).
 
 The broader examples below describe future syntax as well as implemented syntax;
-defaulting bare integer elements and writable `.len` in them are **not** executable
-features of this subset. Array printing is implemented for recursively printable elements.
+bare integer elements now default to `int`, but writable `.len`, `@TypeOf` and the
+broader pointer/functional forms shown there are **not** executable features of this subset. Array printing is implemented for recursively printable elements.
 
 Array literals are comma-separated, may span multiple lines, and may have a
 trailing comma.
@@ -1993,7 +2000,7 @@ let main: () = {
   source-level range annotation syntax is provided yet, so range parameters/return
   signatures, fields, union payloads and globals remain unsupported. Arrays can
   infer range elements, for example `[0..3, 1..=2]`; their bounds and inclusivity
-  copy by value with exact endpoint typing and the existing range-only defaults.
+  copy by value with exact endpoint typing and the bound inference rules below.
   Range field access, equality, membership and direct printing are not introduced.
 - Ordinary range operators bind above assignment and below pipes/other binary
   operators; chaining `a..b..c` is rejected. Existing slice/match syntax is preserved.
@@ -2008,8 +2015,9 @@ let main: () = {
   brace grouping/negation), use native `uint` if both values are nonnegative,
   including zero; use native `int` if either is negative. Literal decoding checks
   that both fit the selected native type, including negative minima. This is a
-  **range-specific default**, not a default for ordinary literals, array elements,
-  or untyped arithmetic expressions. It does not involve constant folding.
+  **range-specific default**, distinct from ordinary `int` fallback. Otherwise
+  unconstrained numeric-expression bounds use `int`: `1 + 1..3` has `int`
+  endpoints. Typed bounds always win first; neither rule involves constant folding.
 - The index is immutable and fresh in the body's lexical scope each iteration.
   `_` discards it and creates no binding. Existing no-shadowing rules apply.
 - Without `else`, range loops yield `void` and reject value breaks. Continuing
@@ -2020,7 +2028,7 @@ let main: () = {
   inclusive endpoint completion, including `continue` at MAX, does not skip it.
   `break value` and continuing fallback results use the same exact contextual or
   bidirectional inference as conditional-loop results, including range values,
-  with no widening or general literal defaults.
+  with integer fallback only after those constraints and no widening.
   Arrays copy independently at break/fallback and result boundaries; immutable
   strings share rooted storage. Terminal fallback paths contribute no merge value.
 - Bounds use the enclosing control scope before the new loop starts. The fallback
@@ -2073,7 +2081,7 @@ let classify: (n: uint) -> string = match n % 3, n % 5 {
 }
 ```
 
-Literal patterns use the exact subject type (no integer defaults or conversions).
+Literal patterns use the exact subject type, not an independent default or conversion.
 String patterns compare exact UTF-8 bytes, including NUL. Each prong has private
 local scope; continuing results have one exact, bidirectionally inferred or
 contextual type. Return/break/continue paths do not contribute merge values.
@@ -2261,9 +2269,9 @@ The executable subset supports membership in scalar `[]T` arrays: `bool`, `rune`
 element types must match exactly; there is no widening or signedness conversion.
 A known array element type constrains the left literal; a known typed left value
 constrains an array literal, including `[]`. Boolean literals provide a known
-`bool` type (`true in [false, true]` works). Integer literals have no default:
-`1 in [1, 2]` is rejected even with an expected `bool` result. The result type
-does not choose an element type.
+`bool` type (`true in [false, true]` works). With no stronger operand context,
+`1 in [1, 2]` and `1 in []` use `int` elements. The expected `bool` result does
+not itself choose an element type.
 
 Operands evaluate once, left then right. Membership projects its RHS for a readonly
 scan rather than cloning existing array storage, including array-valued fields and
@@ -2289,8 +2297,8 @@ let z += 3 ; compile error, expected `=`
 ## Scalar Constant Globals
 
 Immutable module bindings infer `bool` from `true`/`false`, `rune` from single-quoted
-scalar literals and `string` from plain UTF-8 string literals. Numeric inference
-requires explicit type context:
+scalar literals and `string` from plain UTF-8 string literals. Integer literals
+and literal negation default to `int` unless an annotation or `@as` supplies context:
 
 ```nov
 let enabled = true
@@ -2308,10 +2316,10 @@ and `@as(int, @as(uint, 1))` are errors, not conversions. Literal
 bounds remain exact, including native `int`/`uint`; explicit 128-bit constants
 can type-check but retain the C backend's width rejection.
 
-There are no implicit integer defaults: `let count = 8` needs an annotation or
-`@as`. Inference does not evaluate expressions: identifier chains, arithmetic,
-blocks, calls, function values, arrays and void globals remain unsupported, even
-under `@as`. Existing explicitly annotated literal globals are unchanged.
+`let count = 8` and `let negative = -8` infer `int`; negation also accepts literal
+brace grouping, as in `-{{8}}`. This is still literal-only inference, not compile-time
+evaluation: identifier value chains, arithmetic, standalone blocks such as `{8}`,
+calls, function values, arrays and void globals remain unsupported, even under `@as`. Existing explicitly annotated literal globals are unchanged.
 Interpolated strings still require a function; plain literals support UTF-8,
 escaped braces and embedded NUL. Mutable globals remain unsupported. Type
 ascriptions inside function bodies retain their existing expression semantics.
@@ -2428,7 +2436,8 @@ Integer bitwise `&`, `|`, `^` and unary `~` are executable for signed/unsigned
 the same integer type; the result keeps that type and width, using two's-complement
 bit patterns without overflow panics. A known operand or expected result type can
 constrain literals, including through block, match and loop results. Literal bounds
-are checked; there are no defaults, widening or implicit signedness conversions.
+are checked; unconstrained integer operands fall back to `int` only after context
+and sibling inference. There is no widening or implicit signedness conversion.
 Booleans are not integers: use `and`/`or` for boolean operations. Binary operands
 execute once, left to right; terminal paths skip remaining operands. Match-pattern
 `0 | 1` remains a literal alternative, not a computed bitwise pattern. Computed
@@ -2444,9 +2453,19 @@ signed and unsigned aliases of the native target's pointer-sized fixed-width
 integers: `i64`/`u64` on 64-bit targets and `i32`/`u32` on 32-bit targets. They have
 identical type identity, literal bounds, wrapping arithmetic and printing behavior
 to those fixed-width types, including in nested function signatures. They are not
-C `int`/`unsigned int`. Bare literals still require type context; native aliases do
-not select an inference default or add implicit integer conversions. The wider
-type list below is a proposal.
+C `int`/`unsigned int`.
+
+If no type is inferred for an integer literal, it defaults to `int` only after
+annotations, call signatures, typed sibling operands/array elements/control
+branches, and generic expected-result/body/argument constraints have been tried.
+This covers bare locals/globals, negation, arithmetic, arrays, printing and
+interpolation: `let n = 1`, `let a = [1, 2]` and `@println(1, "{2}")` work.
+Empty arrays still need an element type. There is no implicit numeric widening,
+signedness conversion or size-based fallback: a literal above native `int`'s
+maximum fails out of range unless given a fitting explicit type such as `u64` or
+`i128` (128-bit types remain semantic-only for the C backend). The dedicated direct
+range-literal rule is described in [Range](#range). Float literals remain
+unsupported and are never coerced to `int`. The wider type list below is a proposal.
 
 TODO
 - c\_int, ...
@@ -2454,6 +2473,9 @@ TODO
   - float = f32 or f64 based on architecture
 
 ## Floats
+
+Proposal only: floats are not executable, and float literals do not use integer fallback.
+
 - `float` - f32 or f64 depending on architecture
 - `f16` - IEEE-754-2008 binary16
 - `f32` - IEEE-754-2008 binary32
@@ -2469,8 +2491,8 @@ TODO
 not a new left-to-right pipeline effect order. Chaining is left-associative.
 Named functions and function values require exactly one parameter; its exact type
 constrains literals (`10 |> fibo`). `value |> @print` and `value |> @println`
-accept an already typed bool/integer/rune/string result and return void. They do not
-supply an integer default. No partial application or implicit conversions occur.
+accept bool/integer/rune/string results and return void, including unconstrained
+integer expressions via the normal `int` fallback. No partial application or implicit conversions occur.
 
 The unchanged [`examples/fibo.nov`](examples/fibo.nov) now runs:
 
@@ -2717,7 +2739,8 @@ Each placeholder expression evaluates once, then converts once immediately befor
 proceeding to the next chunk or placeholder. Aliases preserve exact hook signatures;
 allocating converters and managed payloads stay rooted. No global overload lookup
 is introduced. Terminal expressions skip conversion and later placeholder effects.
-No numeric defaults or widening are introduced. Compile-time types such as `{int}`
+Ordinary integer fallback applies after contextual inference; no widening is introduced.
+Compile-time types such as `{int}`
 and `{MyType}` emit canonical, unqualified static name strings, not runtime type
 values. Inline `[]int` is outside the existing interpolation parser grammar; use a
 type alias instead.
@@ -2731,7 +2754,8 @@ Placeholders use the normal expression parser and checker: identifiers, calls
 usual type contexts. For example, `"{describe(1, 5, 5)}\n{describe(5, 1, 3)}"`
 uses the callee's parameter types for the numeric arguments. Existing lexical
 scope, no-shadowing and declaration-before-use rules apply; spaces are allowed.
-Bare numbers still need a type context (`"{1}"` is rejected).
+Bare integer placeholders use `int` fallback (`"{1}"` works); float literals remain
+unsupported rather than being coerced to `int`.
 
 This bounded syntax excludes blocks/braces, control flow, comments, quotes and
 backslashes inside placeholders. String/character literals and quoted names

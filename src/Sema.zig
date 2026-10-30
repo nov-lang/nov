@@ -564,9 +564,31 @@ fn checkScalarGlobal(self: *Sema, module: *Module, index: usize, initializer: As
         .char_literal => {
             if (expected == null) expected = try self.ir.internType(.rune);
         },
-        .number_literal => if (expected == null) return,
-        .negation => {
-            if (expected == null or ast.nodes.items(.tag)[ast.nodes.items(.data)[node].rhs] != .number_literal) return;
+        .number_literal, .negation => {
+            var operand = node;
+            if (ast.nodes.items(.tag)[node] == .negation) {
+                operand = ast.nodes.items(.data)[node].rhs;
+                var buffer: [2]Ast.Node.Index = undefined;
+                while (ast.fullBlock(&buffer, operand)) |block| {
+                    if (ast.firstToken(operand) != block.ast.lbrace or block.ast.statements.len != 1) return;
+                    operand = block.ast.statements[0];
+                }
+                if (ast.nodes.items(.tag)[operand] != .number_literal) return;
+            }
+            if (expected == null) {
+                const parsed = std.zig.parseNumberLiteral(ast.tokenSlice(ast.nodes.items(.main_token)[operand]));
+                switch (parsed) {
+                    .int, .big_int => expected = try BodyChecker.defaultIntegerType(&self.ir),
+                    .float, .failure => {
+                        try module.diagnostics.append(module.allocator, .{
+                            .tag = if (parsed == .float) .unsupported_literal else .invalid_literal,
+                            .span = module.tokenSpan(ast.nodes.items(.main_token)[operand]),
+                        });
+                        self.entries[self.entryIndex(module, @fromBackingInt(@intCast(index)))].status = .failed;
+                        return;
+                    },
+                }
+            }
         },
         else => return,
     }
@@ -886,7 +908,9 @@ test "inferred globals own canonical scalar constants and keep aliases distinct"
     try std.testing.expectEqual(@as(i128, -42), sema.ir.getConstant(sema.entries[4].constant.?).?.value.signed_integer);
     try std.testing.expectEqual(sema.entries[4].type_id, sema.entries[5].alias_type);
     try std.testing.expectEqual(Status.type_alias, sema.entries[5].status);
-    for (sema.entries[6..]) |entry| {
+    try std.testing.expectEqual(Status.constant_checked, sema.entries[6].status);
+    try std.testing.expectEqual(sema.entries[4].type_id, sema.entries[6].type_id);
+    for (sema.entries[7..]) |entry| {
         try std.testing.expectEqual(Status.deferred, entry.status);
         try std.testing.expect(entry.type_id == null and entry.constant == null);
     }
@@ -931,7 +955,73 @@ test "inferred global constants clean up on every allocation failure" {
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{"let yes = true\nlet text = @as(string, \"hé\\0\")\nlet n = @as(Count, @as(int, -42))\nlet Count = int"});
 }
 
-test "native aliases check literal boundaries without defaulting untyped globals" {
+test "defaulted global integers check native bounds without overriding explicit contexts" {
+    const minimum: i128 = -(@as(i128, 1) << (Ir.native_pointer_bits - 1));
+    const maximum: i128 = -minimum - 1;
+    for ([_]i128{ minimum, maximum, minimum - 1, maximum + 1 }) |value| {
+        const valid = value >= minimum and value <= maximum;
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let value = {d}", .{value});
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "default-global-bound.nov", source);
+        defer module.deinit();
+        var sema = try analyzeAnnotations(&module);
+        defer sema.deinit();
+        try std.testing.expectEqual(if (valid) Status.constant_checked else Status.failed, sema.entries[0].status);
+        try std.testing.expectEqual(Ir.Type.Integer{ .signedness = .signed, .bits = Ir.native_pointer_bits }, sema.ir.getType(sema.entries[0].type_id.?).?.integer);
+        if (valid) {
+            try std.testing.expect(!module.hasErrors());
+            try std.testing.expectEqual(value, sema.ir.getConstant(sema.entries[0].constant.?).?.value.signed_integer);
+        } else {
+            try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+            try std.testing.expectEqual(Module.Diagnostic.Tag.literal_out_of_range, module.diagnostics.items[0].tag);
+            const spelling = try std.fmt.allocPrint(std.testing.allocator, "{d}", .{value});
+            defer std.testing.allocator.free(spelling);
+            try std.testing.expectEqualStrings(spelling, module.sourceSlice(module.diagnostics.items[0].span).?);
+            try std.testing.expect(sema.entries[0].constant == null);
+        }
+        try sema.ir.verify();
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+    }
+    const source =
+        "let zero = 0\nlet hex = 0xff\nlet negative = -{{42}}\nlet tiny: i8 = 127\n" ++
+        "let byte = @as(u8, 255)\nlet huge: i128 = 170141183460469231731687303715884105727\n" ++
+        "let wide = @as(u128, 340282366920938463463374607431768211455)\n" ++
+        "let min = @as(i128, -{170141183460469231731687303715884105728})";
+    var module = try Module.init(std.testing.allocator, "global-contexts.nov", source);
+    defer module.deinit();
+    var sema = try analyzeAnnotations(&module);
+    defer sema.deinit();
+    try std.testing.expect(!module.hasErrors());
+    for (sema.entries) |entry| try std.testing.expectEqual(Status.constant_checked, entry.status);
+    try std.testing.expectEqual(sema.entries[0].type_id, sema.entries[1].type_id);
+    try std.testing.expectEqual(sema.entries[0].type_id, sema.entries[2].type_id);
+    try std.testing.expectEqual(@as(i128, -42), sema.ir.getConstant(sema.entries[2].constant.?).?.value.signed_integer);
+    try std.testing.expectEqual(@as(u16, 8), sema.ir.getType(sema.entries[3].type_id.?).?.integer.bits);
+    try std.testing.expectEqual(std.builtin.Signedness.unsigned, sema.ir.getType(sema.entries[4].type_id.?).?.integer.signedness);
+    try std.testing.expectEqual(@as(u16, 128), sema.ir.getType(sema.entries[5].type_id.?).?.integer.bits);
+    try std.testing.expectEqual(std.math.maxInt(u128), sema.ir.getConstant(sema.entries[6].constant.?).?.value.unsigned_integer);
+    try std.testing.expectEqual(std.math.minInt(i128), sema.ir.getConstant(sema.entries[7].constant.?).?.value.signed_integer);
+    try sema.ir.verify();
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+}
+
+test "unconstrained float globals never acquire the default integer type" {
+    for ([_][]const u8{ "1.5", "-1.5", "-{1.5}", "1e3", "0x1p2" }) |expression| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let value = {s}", .{expression});
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "float-global.nov", source);
+        defer module.deinit();
+        var sema = try analyzeAnnotations(&module);
+        defer sema.deinit();
+        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+        try std.testing.expectEqual(Module.Diagnostic.Tag.unsupported_literal, module.diagnostics.items[0].tag);
+        try std.testing.expectEqual(Status.failed, sema.entries[0].status);
+        try std.testing.expect(sema.entries[0].type_id == null and sema.entries[0].constant == null);
+        try sema.ir.verify();
+    }
+}
+
+test "native aliases check literal boundaries alongside defaulted globals" {
     const signed_min: i128 = std.math.minInt(isize);
     const signed_max: i128 = std.math.maxInt(isize);
     const unsigned_max: u128 = std.math.maxInt(usize);
@@ -953,8 +1043,8 @@ test "native aliases check literal boundaries without defaulting untyped globals
         var sema = try analyzeAnnotations(&module);
         defer sema.deinit();
         try std.testing.expectEqual(if (case.valid) Status.constant_checked else Status.failed, sema.entries[0].status);
-        try std.testing.expectEqual(Status.deferred, sema.entries[1].status);
-        try std.testing.expect(sema.entries[1].type_id == null);
+        try std.testing.expectEqual(Status.constant_checked, sema.entries[1].status);
+        try std.testing.expectEqual(Ir.Type.Integer{ .signedness = .signed, .bits = Ir.native_pointer_bits }, sema.ir.getType(sema.entries[1].type_id.?).?.integer);
         if (case.valid) {
             const constant = sema.ir.getConstant(sema.entries[0].constant.?).?;
             try std.testing.expectEqual(Ir.native_pointer_bits, sema.ir.getType(constant.ty).?.integer.bits);
@@ -1046,7 +1136,7 @@ test "large integer spellings canonicalize across bases and separators" {
     try sema.ir.verify();
 }
 
-test "signatures are resolved but bodies and unannotated expressions stay deferred" {
+test "signatures and literal globals resolve while bodies and computations stay deferred" {
     var module = try Module.init(std.testing.allocator, "deferred.nov", "let add: (a: i32, b: i32) -> i32 = missing(a, b)\nlet main: () = {}\nlet pending = 123\nlet expression: i32 = 1 + 2\nlet storage: i32");
     defer module.deinit();
     var sema = try analyzeAnnotations(&module);
@@ -1059,8 +1149,8 @@ test "signatures are resolved but bodies and unannotated expressions stay deferr
     try std.testing.expectEqual(signature.result, signature.params[0]);
     try std.testing.expectEqual(Status.signature_only, sema.getEntry(module.lookup("main").?).?.status);
     const pending = sema.getEntry(module.lookup("pending").?).?;
-    try std.testing.expectEqual(Status.deferred, pending.status);
-    try std.testing.expect(pending.type_id == null);
+    try std.testing.expectEqual(Status.constant_checked, pending.status);
+    try std.testing.expectEqual(@as(i128, 123), sema.ir.getConstant(pending.constant.?).?.value.signed_integer);
     try std.testing.expectEqual(Status.deferred, sema.getEntry(module.lookup("expression").?).?.status);
     try std.testing.expectEqual(Status.deferred, sema.getEntry(module.lookup("storage").?).?.status);
 }

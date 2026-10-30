@@ -50,6 +50,23 @@ results. See `examples/array-fields.nov`.
 
 ## Current delivered status
 
+Integer literals now default to signed pointer-sized `int` only after contextual
+inference in `BodyChecker`/`GenericFunctions` and literal-only global `Sema`.
+Annotations, call signatures, typed sibling operands/array elements/control branches,
+and generic expected-result/body/argument constraints win before fallback. Bare
+locals (`let n = 1`), negation, arithmetic, printing/interpolation
+(`@println(1, "{2}")`), arrays (`[1, 2]` as `[]int`) and nested arrays infer;
+empty arrays still need an element type. `id(1)` infers `int` without other
+context, but a correlated typed sibling or expected result can infer `u8` first.
+There is no implicit numeric widening or size-based fallback: values outside
+native `int` bounds diagnose unless a fitting explicit type such as `u64`/`i128`
+is supplied (128-bit backend limits remain). Floats remain unsupported, not
+coerced to `int`. Direct nonnegative literal range bounds retain dedicated `uint`
+defaulting; otherwise unconstrained numeric-expression bounds use `int`, with typed
+bounds taking precedence. Global initializers remain literal-only: no computation,
+value chains or array globals are added. Literal negation may group its operand
+(`-{{1}}`); standalone block initializers remain unsupported.
+
 `std.array.map`, `filter` and `fold` are implemented in `lib/array.nov`,
 publicly re-exported as the `std.array` namespace by
 `lib/std.nov`. With `T`/`U` denoting inferred backtick variables, the APIs are
@@ -61,8 +78,8 @@ from the seed. Callbacks run exactly once per element in source order and not at
 all for empty input. Empty fold returns the seed. Callee and argument expressions
 remain eager and left-to-right, even on empty input.
 Ordinary functions, capturing closures and inferred generic closures/local generic
-functions work within bounded inference; exact typed inputs/seeds must resolve
-all variables, with ambiguity diagnosed rather than defaulted/coerced. Ordinary
+functions work within bounded inference; typed inputs/seeds supply exact constraints
+before integer fallback, with remaining ambiguity diagnosed and no coercion. Ordinary
 recursive array independence remains intact through structs/union payloads;
 function/closure copies share environments and mutable cells. No aliasing pointer
 mutation or error/panic catching is added; callback failures propagate normally.
@@ -102,7 +119,7 @@ timings and final gates remain pending. Broader performance work remains paused.
 `PLAN2.md` is the current untracked handoff; `PLAN.md` is an unchanged archive.
 
 Backtick inference combines typed runtime arguments, expected call results and
-bounded body constraints, without implicit conversions or numeric defaults. Nested
+bounded body constraints before integer fallback, without implicit conversions. Nested
 array/function signatures and nominal generic-container templates work, as do
 canonical top-level/imported/public aliases and namespace/generic-container
 static/sibling and instance calls. The concrete receiver container binds its type
@@ -141,7 +158,8 @@ string, enums, finite acyclic records, existing tagged unions, functions/closure
 nested arrays and inferred integer ranges. `void` and compile-time `type` are not
 storable; floats are not implemented. Semantic integers extend through 128 bits;
 reachable backend widths remain 8/16/32/64, including nested layouts and function
-signatures. No new range annotation syntax or general numeric defaults are added.
+signatures. No new range annotation syntax is added; integer fallback follows the
+context-first rules above.
 Nested arrays copy recursively independently; tagged union copies detach only
 active payload array backing, including record payloads containing arrays. Existing
 union payload rules are unchanged: direct array/union/function payloads remain
@@ -238,8 +256,9 @@ Reusable range values are executable: start..end / start..=end construct integer
 bounds once left-to-right, and loop i in range snapshots the source once per loop.
 Reuse restarts at the beginning; source-binding replacement cannot affect an active
 loop. Locals/copies/assignment and inferred branch/block/loop results work. Inclusive
-state is per value, endpoint type exact; existing range-only int/uint defaults,
-empty reversed ranges and inclusive-MAX exhaustion remain unchanged. No allocation.
+state is per value, endpoint type exact; dedicated literal-bound int/uint rules,
+empty reversed ranges and inclusive-MAX exhaustion remain unchanged. Otherwise
+unconstrained numeric-expression bounds now use int after typed-bound inference. No allocation.
 Inferred arrays of ranges work, copying bounds/inclusivity by value. No new range
 annotation syntax, signatures, aggregate fields/payloads, globals, field attributes,
 printing/equality/membership or iterator protocol yet.
@@ -388,7 +407,7 @@ Default printability is recursive: functions/closures, ranges and void values ha
 no default representation, including inside aggregates, unless a valid enclosing
 hook stops recursion before them (void union alternatives are payloadless and okay). Unspecialized generics and namespaces are not runtime
 printable; float remains unsupported by the language/runtime. Bare integer
-literals still need a type context. This adds no builtin, array equality or other
+literals use ordinary context-first `int` fallback. This adds no builtin, array equality or other
 aggregate operations.
 
 Print-context compile-time types work in `@println(int, []int, MyType, (int)->bool)`
@@ -457,19 +476,21 @@ contract; the older broader syntax examples below are not delivery claims.
 
 Executable scalar status: integer binary `&`, `|`, `^` and unary `~` support
 exact matching fixed-width 8/16/32/64 and native `int`/`uint` types, with same-width
-two's-complement results, contextual literals, no widening/defaults and no overflow
+two's-complement results, contextual literals before `int` fallback, no widening and no overflow
 panic. Booleans use `and`/`or`; match-pattern `|` remains alternatives. Shifts,
 bitwise compound assignments and computed match patterns remain unsupported.
 See README's integer section for the executable contract; proposals below are
 not an implementation checklist.
 
 Bounded immutable global inference: bool, rune and plain UTF-8 string literals infer
-canonical types; numeric literals require explicit `@as(T, literal)` context.
+canonical types; integer literals and literal negation default to `int` unless an
+annotation or `@as(T, literal)` provides an explicit type.
 Nested scalar ascriptions require exact canonical types (including forward type
 aliases and any explicit declaration annotation), with checked literal bounds and
 no runtime conversion. Constants own
-string bytes and inline at use sites. Bare integer globals have no default;
-identifier chains, computation, blocks, eager calls, arrays, void/function values,
+string bytes and inline at use sites. Literal negation permits grouped operands
+such as `-{{42}}`; identifier value chains, computation, standalone blocks,
+eager calls, arrays, void/function values,
 mutable globals and global interpolation remain unsupported. Existing annotated
 globals and body/control-flow ascriptions are unchanged.
 
@@ -489,7 +510,7 @@ source-related diagnostics; alias expansion is iterative and bounded to 128 acti
 expansions. Local/mutable aliases, newtypes, general type values, `@TypeOf`,
 general generics and comptime functions remain unsupported (bounded generic unions
 are delivered above). Numeric conversion design
-remains deferred; this does not add casts or general literal defaults.
+remains deferred; aliases do not add casts or alter the integer fallback rules.
 
 Next step: add new IR that
 - forward declaration
@@ -895,8 +916,8 @@ remain proposals; writable length, array slices, pointer elements, general alias
 and capacity APIs are still deferred. All further optimizations remain paused.
 
 `value in array` membership is delivered for bool, rune, string, enums and supported
-fixed/native integers with exact element types, bidirectional literal context and
-no general numeric defaults. It returns bool, evaluates left then right once, uses
+fixed/native integers with exact element types and bidirectional literal context
+before integer fallback (`1 in [1, 2]` and `1 in []` use `int` elements). It returns bool, evaluates left then right once, uses
 readonly RHS projection with required effect snapshots, and scans with typed
 equality and early exit without allocating. Formatter support is syntactic only.
 Functions, unions, records, nested arrays and ranges are storable elements but
@@ -1057,10 +1078,12 @@ rejected. Bounded ascending `loop i in start..end { ... }` and
 once-only left-to-right endpoint snapshots, an immutable per-iteration index (or
 `_` discard), exact known integer bound types and overflow-free iteration.
 Inclusive iteration visits the endpoint once and exits before incrementing it,
-including on `continue` at the maximum integer. Only two untyped literal bounds
-default: native `uint` when both are nonnegative (including zero), otherwise native
-`int`, with checked native fits.
-This is not a general literal default or runtime signedness selection. Range loops
+including on `continue` at the maximum integer. Two untyped direct literal bounds
+(including literal brace grouping/negation) retain their dedicated rule: native
+`uint` when both are nonnegative (including zero), otherwise native `int`, with
+checked native fits. Other unconstrained numeric-expression bounds now fall back
+to `int`, as in `1 + 1..3`; existing typed bounds win first. Neither rule performs
+constant folding or runtime signedness selection. Range loops
 without `else` yield void and reject value breaks. Both range forms now support
 `else` and exact contextual/bidirectional break/fallback results using the approved
 generic loop semantics. Normal exhaustion (including empty/reversed ranges and
@@ -1272,7 +1295,8 @@ let sum: uint = add(1, 2)
 Same-named variables agree; distinct names are related by body/operator constraints.
 Typed runtime arguments and expected call results provide exact constraints. For
 current builtin `+`, both operands/result need the same supported integer type or
-string, without conversion. `let sum = add(1, 2)` remains ambiguous: no defaults.
+string, without conversion. Exact constraints win before fallback;
+`let sum = add(1, 2)` otherwise infers `int`.
 
 `GenericFunctions.Solver.expression` handles reads/typed globals, bool/string/rune
 literals, boolean operations, exact arithmetic/bitwise/comparison relationships,
@@ -1280,7 +1304,8 @@ array indexing/literals and string indexing, known record fields and array/strin
 lengths, block bindings, if/else, conditional/unconditional loops, scoped returns
 and breaks, `@as`, supported direct calls, concrete
 function-value calls and ordinary closures using enclosing substituted types.
-Numeric literals leave a type unknown; index operands add no inference constraints.
+Integer literals contribute deferred `int` fallback candidates, applied only after
+exact constraints; index operands add no inference constraints.
 Normal specialized-body checking still enforces supported operations. This is not
 a solver for arbitrary statements: needed constraints outside the subset diagnose
 unsupported inference; otherwise resolved bodies undergo ordinary checking.
@@ -1306,8 +1331,8 @@ method-local `U` follows explicit arguments, contextual generic callbacks, expec
 results and bounded body constraints. See README.md for `Box.map`. Static and
 instance calls share canonical specializations, preserving field precedence and
 exact by-value receiver snapshots before argument evaluation.
-`let callback = identity` and `apply(identity, 42)` remain ambiguous; conflicts
-reject, with no numeric defaults or implicit conversions.
+`let callback = identity` remains ambiguous; `apply(identity, 42)` can resolve via
+`int` fallback. Conflicts reject, with no implicit conversions.
 
 Local generic expressions ``(value: `T) -> `T { ... }`` and typed local declarations
 ``let identity: (value: `T) -> `T = { value }`` support direct calls, concrete

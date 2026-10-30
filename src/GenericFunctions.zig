@@ -7,6 +7,7 @@ const TypeResolver = @import("TypeResolver.zig");
 const Lowering = @import("Lowering.zig");
 const Sema = @import("Sema.zig");
 const TestAllocations = @import("TestAllocations.zig");
+const BodyChecker = @import("BodyChecker.zig");
 
 pub const max_terms = 8192;
 pub const max_depth = 128;
@@ -28,6 +29,10 @@ pub const Ref = struct {
     id: Module.DeclId = @fromBackingInt(0),
     container_type: ?Ir.TypeId = null,
     local: ?*const LocalTemplate = null,
+    // Borrowed semantic entries for exact established globals. Solver queries
+    // only read them; they never request types or demand declarations.
+    analysis: ?*const Sema = null,
+    types: []const ?Ir.TypeId = &.{},
 
     pub fn function(self: Ref) struct { proto_node: Ast.Node.Index, body: Ast.Node.Index } {
         if (self.local) |local| return .{ .proto_node = local.proto, .body = local.body };
@@ -108,7 +113,15 @@ fn targetWith(module: *Module, node: Ast.Node.Index, generic_only: bool) ?Ref {
     return null;
 }
 
-pub const Argument = struct { ty: ?Ir.TypeId, span: Module.Span, template: ?Ref = null, terminal: bool = false };
+pub const Argument = struct {
+    ty: ?Ir.TypeId,
+    span: Module.Span,
+    template: ?Ref = null,
+    terminal: bool = false,
+    // A fallback candidate, not an exact constraint. Structural defaults fill
+    // only unresolved leaves after other arguments, expected result, and body.
+    default_type: ?Ir.TypeId = null,
+};
 const Term = struct {
     span: Module.Span,
     value: union(enum) {
@@ -147,8 +160,9 @@ pub fn infer(caller: *Module, ir: *Ir, ref: Ref, arguments: []const Argument, ex
 fn inferInner(caller: *Module, ir: *Ir, ref: Ref, arguments: []const Argument, expected: ?Argument, call_span: Module.Span) Ir.BuildError!?[]const Module.TypeBinding {
     var arena = std.heap.ArenaAllocator.init(caller.allocator);
     defer arena.deinit();
-    var solver: Solver = .{ .allocator = arena.allocator(), .caller = caller, .ir = ir, .call_span = call_span };
+    var solver: Solver = .{ .allocator = arena.allocator(), .caller = caller, .ir = ir, .call_span = call_span, .analysis = ref.analysis, .types = ref.types };
     const frame = (try solver.constrain(ref, arguments, expected)) orelse return null;
+    try solver.applyDefaults();
     for (frame.variables) |variable| {
         if (!Solver.resolved(variable.term, 0)) {
             try solver.fail(if (solver.unsupported != null) .generic_function_inference_unsupported else .generic_function_ambiguous, solver.unsupported orelse call_span, variable.term.span);
@@ -175,7 +189,7 @@ fn inferInner(caller: *Module, ir: *Ir, ref: Ref, arguments: []const Argument, e
 pub fn terminalParameters(caller: *Module, ir: *Ir, ref: Ref, arguments: []const Argument, call_span: Module.Span) Ir.BuildError!?[]?Ir.TypeId {
     var arena = std.heap.ArenaAllocator.init(caller.allocator);
     defer arena.deinit();
-    var solver: Solver = .{ .allocator = arena.allocator(), .caller = caller, .ir = ir, .call_span = call_span };
+    var solver: Solver = .{ .allocator = arena.allocator(), .caller = caller, .ir = ir, .call_span = call_span, .analysis = ref.analysis, .types = ref.types };
     _ = (solver.constrain(ref, arguments, null) catch |err| switch (err) {
         error.TooManyEntries => return null,
         else => return err,
@@ -195,6 +209,16 @@ pub fn terminalParameters(caller: *Module, ir: *Ir, ref: Ref, arguments: []const
 /// layouts, but never publishes methods, function specializations, declaration
 /// IDs, or worklist requests.
 pub fn probeResult(caller: *Module, ir: *Ir, ref: Ref, arguments: []const Argument, call_span: Module.Span) Ir.BuildError!?Ir.TypeId {
+    return probeResultWithDefaults(caller, ir, ref, arguments, call_span, false);
+}
+
+/// Readonly fallback query, used only after nondefaulting sibling probes fail.
+/// Like probeResult, it never publishes or demands specializations.
+pub fn probeDefaultResult(caller: *Module, ir: *Ir, ref: Ref, arguments: []const Argument, call_span: Module.Span) Ir.BuildError!?Ir.TypeId {
+    return probeResultWithDefaults(caller, ir, ref, arguments, call_span, true);
+}
+
+fn probeResultWithDefaults(caller: *Module, ir: *Ir, ref: Ref, arguments: []const Argument, call_span: Module.Span, defaults: bool) Ir.BuildError!?Ir.TypeId {
     const caller_start = caller.diagnostics.items.len;
     defer caller.diagnostics.shrinkRetainingCapacity(caller_start);
     const owner_start = ref.module.diagnostics.items.len;
@@ -207,18 +231,19 @@ pub fn probeResult(caller: *Module, ir: *Ir, ref: Ref, arguments: []const Argume
     defer if (caller.compilation) |comp| {
         for (comp.modules.items, starts) |module, start| module.diagnostics.shrinkRetainingCapacity(start);
     };
-    return probeResultInner(caller, ir, ref, arguments, call_span) catch |err| switch (err) {
+    return probeResultInner(caller, ir, ref, arguments, call_span, defaults) catch |err| switch (err) {
         error.TooManyEntries => null,
         else => return err,
     };
 }
 
-fn probeResultInner(caller: *Module, ir: *Ir, ref: Ref, arguments: []const Argument, call_span: Module.Span) Ir.BuildError!?Ir.TypeId {
+fn probeResultInner(caller: *Module, ir: *Ir, ref: Ref, arguments: []const Argument, call_span: Module.Span, defaults: bool) Ir.BuildError!?Ir.TypeId {
     for (arguments) |arg| if (arg.terminal) return null;
     var arena = std.heap.ArenaAllocator.init(caller.allocator);
     defer arena.deinit();
-    var solver: Solver = .{ .allocator = arena.allocator(), .caller = caller, .ir = ir, .call_span = call_span, .read_only = true };
+    var solver: Solver = .{ .allocator = arena.allocator(), .caller = caller, .ir = ir, .call_span = call_span, .read_only = true, .analysis = ref.analysis, .types = ref.types };
     const frame = (try solver.constrain(ref, arguments, null)) orelse return null;
+    if (defaults) try solver.applyDefaults();
     for (frame.variables) |variable| if (!Solver.resolved(variable.term, 0)) return null;
     return solver.materialize(frame.result, 0);
 }
@@ -268,6 +293,289 @@ fn testSpecialization(allocator: std.mem.Allocator) !void {
     try repeated.ir.verify();
 }
 
+fn testNestedIntegerDefaults(allocator: std.mem.Allocator, depth: usize) !void {
+    const nested = try allocator.alloc(u8, depth * 4 + 1);
+    defer allocator.free(nested);
+    for (0..depth) |i| @memcpy(nested[i * 3 ..][0..3], "id(");
+    nested[depth * 3] = '1';
+    @memset(nested[depth * 3 + 1 ..], ')');
+    const source = try std.fmt.allocPrint(allocator, "let id:(x:`T)->`T=x\nlet main:()={{let n={s}\nlet exact:int=n\nlet x:u8=2\nlet narrow:u8={s}\nlet items=[{s},x]\nlet exact_items:[]u8=items\nlet branch=if true {{{s}}} else {{x}}\nlet exact_branch:u8=branch\n}}", .{ nested, nested, nested, nested });
+    defer allocator.free(source);
+    var module = try Module.init(allocator, "nested-integer-defaults.nov", source);
+    defer module.deinit();
+    const count = module.declarations.items.len;
+    var sema = Lowering.lower(&module) catch |err| {
+        try std.testing.expectEqual(count, module.declarations.items.len);
+        try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+        return err;
+    };
+    defer sema.deinit();
+    if (module.hasErrors()) std.debug.print("nested integer defaults: {any}\n", .{module.diagnostics.items});
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+}
+
+test "integer defaults bound nested identity probe work and preserve late siblings" {
+    try testNestedIntegerDefaults(std.testing.allocator, 20);
+}
+
+test "integer defaults nested query modes roll back under OOM" {
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testNestedIntegerDefaults, .{3});
+}
+
+fn testNominalIntegerDefaults(allocator: std.mem.Allocator) !void {
+    const source =
+        \\let Box:(T:type)->type=struct{value:T,}
+        \\let make:(x:`T)->Box(`T)=Box(`T)[.value=x]
+        \\let get:(x:Box(`T))->`T=x.value
+        \\let getArray:(xs:[]Box(`T))->`T=xs[0].value
+        \\let getNested:(xs:[][]Box(`T))->`T=xs[0][0].value
+        \\let choose:(box:Box(`T),other:`T)->`T=box.value
+        \\let main:()={
+        \\let n=get(make(1))
+        \\let exact:int=n
+        \\let a=getArray([make(1)])
+        \\let exact_a:int=a
+        \\let b=getNested([[make(1)]])
+        \\let exact_b:int=b
+        \\let narrow:u8=get(make(1))
+        \\let narrow_a:u8=getArray([make(1)])
+        \\let narrow_b:u8=getNested([[make(1)]])
+        \\let sibling=choose(make(1),narrow)
+        \\let exact_sibling:u8=sibling
+        \\}
+    ;
+    var module = try Module.init(allocator, "nominal-integer-defaults.nov", source);
+    defer module.deinit();
+    const count = module.declarations.items.len;
+    var sema = Lowering.lower(&module) catch |err| {
+        try std.testing.expectEqual(count, module.declarations.items.len);
+        try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+        return err;
+    };
+    defer sema.deinit();
+    if (module.hasErrors()) std.debug.print("nominal integer defaults: {any}\n", .{module.diagnostics.items});
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+}
+
+test "integer defaults descend matching nominal arguments and nested arrays under OOM" {
+    try testNominalIntegerDefaults(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testNominalIntegerDefaults, .{});
+}
+
+fn testGlobalIntegerDefaults(allocator: std.mem.Allocator) !void {
+    const source =
+        \\let g=1
+        \\let negative=-1
+        \\let Record=struct{g:int,}
+        \\let globalRecord:()->Record=Record[.g]
+        \\let small=@as(u8,1)
+        \\let make:()->`T=g
+        \\let getNegative:()->`T=negative
+        \\let getSmall:()->`T=small
+        \\let same:(x:`T)->`T=g
+        \\let main:()={
+        \\let n=make()
+        \\let exact:int=n
+        \\let neg=getNegative()
+        \\let exact_neg:int=neg
+        \\let narrowed=getSmall()
+        \\let exact_narrowed:u8=narrowed
+        \\let constrained=same(1)
+        \\let exact_constrained:int=constrained
+        \\let local=()->`T{g}
+        \\let closed=local()
+        \\let exact_closed:int=closed
+        \\}
+    ;
+    var module = try Module.init(allocator, "global-integer-defaults.nov", source);
+    defer module.deinit();
+    const count = module.declarations.items.len;
+    var sema = Lowering.lower(&module) catch |err| {
+        try std.testing.expectEqual(count, module.declarations.items.len);
+        try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+        return err;
+    };
+    defer sema.deinit();
+    if (module.hasErrors()) std.debug.print("global integer defaults: {any}\n", .{module.diagnostics.items});
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+}
+
+test "integer defaults consume established global types as exact generic constraints under OOM" {
+    try testGlobalIntegerDefaults(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testGlobalIntegerDefaults, .{});
+    for ([_][]const u8{
+        "let g=1\nlet make:()->`T=g\nlet main:()={let n:u8=make()\n}",
+        "let g=1\nlet make:(x:`T)->`T=g\nlet main:()={let n=make(@as(u8,1))\n}",
+        "let g=@as(u8,1)\nlet make:()->`T=g\nlet main:()={let n:int=make()\n}",
+    }) |source| {
+        var module = try Module.init(std.testing.allocator, "global-exact-conflict.nov", source);
+        defer module.deinit();
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        try std.testing.expect(!sema.lowering_complete);
+        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+        try std.testing.expectEqual(Module.Diagnostic.Tag.generic_function_conflict, module.diagnostics.items[0].tag);
+        try std.testing.expectEqualStrings("g", module.sourceSlice(module.diagnostics.items[0].span).?);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testInferenceFailureAllocations, .{ source, Module.Diagnostic.Tag.generic_function_conflict });
+    }
+}
+
+test "integer defaults defer generic variables until arguments results and bodies constrain them" {
+    const source =
+        \\let id: (x: `T) -> `T = x
+        \\let same: (x: `T, y: `T) -> `T = x
+        \\let add: (x: `A, y: `B) -> `C = x + y
+        \\let first: (x: `A, y: `B) -> `A = x
+        \\let make: () -> `T = 1
+        \\let apply: (f: (`T) -> `U, x: `T) -> `U = f(x)
+        \\let main: () = {
+        \\let x: u8 = 7
+        \\let a = id(1)
+        \\let exact_a: int = a
+        \\let b: u8 = id(1)
+        \\let c = same(1, x)
+        \\let exact_c: u8 = c
+        \\let d = same(x, 1)
+        \\let exact_d: u8 = d
+        \\let e = add(1, x)
+        \\let exact_e: u8 = e
+        \\let f: u8 = add(1, 2)
+        \\let g = add(1, 2)
+        \\let exact_g: int = g
+        \\let h = first(1, x)
+        \\let exact_h: int = h
+        \\let i: u8 = first(1, 2)
+        \\let j = id([1, 2])
+        \\let exact_j: []int = j
+        \\let k = same([[1]], [[x]])
+        \\let exact_k: [][]u8 = k
+        \\let l: [][]u8 = id([[1]])
+        \\let m = [id(1), x]
+        \\let exact_m: []u8 = m
+        \\let n = if true {id(1)} else {x}
+        \\let exact_n: u8 = n
+        \\let o = same(id(1), x)
+        \\let exact_o: u8 = o
+        \\let p: u8 = id(id(1))
+        \\let q = make()
+        \\let exact_q: int = q
+        \\let r: u8 = make()
+        \\let callback = apply(id, 1)
+        \\let exact_callback: int = callback
+        \\let narrow_callback: u8 = apply(id, 1)
+        \\let closure = (v: `T) -> `T {v}
+        \\let closed = closure(1)
+        \\let exact_closed: int = closed
+        \\let narrow_closed: u8 = closure(1)
+        \\let piped = 1 |> id
+        \\let exact_piped: int = piped
+        \\let narrow_pipe: u8 = 1 |> id
+        \\let piped_array = [1 |> id, x]
+        \\let exact_piped_array: []u8 = piped_array
+        \\let compared = id(1) == x
+        \\@println(id(1), id(-1), id(1 + 2), id(if true {1} else {2}), id(loop {break 1}))
+        \\}
+    ;
+    var module = try Module.init(std.testing.allocator, "generic-integer-defaults.nov", source);
+    defer module.deinit();
+    var sema = try Lowering.lower(&module);
+    defer sema.deinit();
+    if (module.hasErrors()) std.debug.print("generic integer defaults: {any}\n", .{module.diagnostics.items});
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+}
+
+test "integer defaults check generic native bounds only after contextual inference" {
+    const min: i128 = -(@as(i128, 1) << (Ir.native_pointer_bits - 1));
+    const max = -min - 1;
+    for ([_]i128{ min, min + 1, max, max + 1, min - 1, -min }) |value| {
+        const literal = try std.fmt.allocPrint(std.testing.allocator, "{d}", .{value});
+        defer std.testing.allocator.free(literal);
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let id:(x:`T)->`T=x\nlet main:()={{let n=id({s})\nlet exact:int=n\n}}", .{literal});
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "generic-default-bounds.nov", source);
+        defer module.deinit();
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        if (value >= min and value <= max) {
+            try std.testing.expect(sema.lowering_complete);
+            try std.testing.expect(!module.hasErrors());
+            try sema.ir.verify();
+        } else {
+            try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+            try std.testing.expectEqual(Module.Diagnostic.Tag.literal_out_of_range, module.diagnostics.items[0].tag);
+            try std.testing.expectEqualStrings(literal, module.sourceSlice(module.diagnostics.items[0].span).?);
+        }
+    }
+    const source = try std.fmt.allocPrint(std.testing.allocator, "let id:(x:`T)->`T=x\nlet same:(x:`T,y:`T)->`T=x\nlet main:()={{let wide:u128=id({d})\nlet sibling=same({d},wide)\nlet exact:u128=sibling\n}}", .{ max + 1, max + 1 });
+    defer std.testing.allocator.free(source);
+    var module = try Module.init(std.testing.allocator, "generic-context-bounds.nov", source);
+    defer module.deinit();
+    var sema = try Lowering.lower(&module);
+    defer sema.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+}
+
+fn testIntegerDefaultProbe(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "generic-default-probe.nov", "let id:(x:`T)->`T=x");
+    defer module.deinit();
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    const ref: Ref = .{ .module = &module, .id = module.lookup("id").? };
+    const span = ref.span();
+    const integer = try BodyChecker.defaultIntegerType(&ir);
+    const arguments = [_]Argument{.{ .ty = null, .span = span, .default_type = integer }};
+    const count = module.declarations.items.len;
+    try std.testing.expectEqual(@as(?Ir.TypeId, null), try probeResult(&module, &ir, ref, &arguments, span));
+    try std.testing.expectEqual(@as(?Ir.TypeId, integer), try probeDefaultResult(&module, &ir, ref, &arguments, span));
+    try std.testing.expectEqual(count, module.declarations.items.len);
+    try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+}
+
+test "integer defaults remain separate from readonly generic result probes under OOM" {
+    try testIntegerDefaultProbe(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testIntegerDefaultProbe, .{});
+}
+
+fn testIntegerDefaultInference(allocator: std.mem.Allocator) !void {
+    const source =
+        \\let id:(x:`T)->`T=x
+        \\let first:(x:`A,y:`B)->`A=x
+        \\let main:()={
+        \\let a=first(id(1),[2])
+        \\let exact:int=a
+        \\let b:u8=first(1,[2])
+        \\@println(b,1 |> id)
+        \\}
+    ;
+    var module = try Module.init(allocator, "generic-default-oom.nov", source);
+    defer module.deinit();
+    const count = module.declarations.items.len;
+    var sema = Lowering.lower(&module) catch |err| {
+        try std.testing.expectEqual(count, module.declarations.items.len);
+        try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+        return err;
+    };
+    defer sema.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+}
+
+test "integer defaults generic argument fallback and pipes roll back under OOM" {
+    try testIntegerDefaultInference(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testIntegerDefaultInference, .{});
+}
+
 test "backtick generic function exact constraints demand and canonical aliases" {
     try testSpecialization(std.testing.allocator);
 }
@@ -285,8 +593,37 @@ const Solver = struct {
     failed: bool = false,
     active: std.ArrayList(Ref) = .empty,
     read_only: bool = false,
+    analysis: ?*const Sema = null,
+    types: []const ?Ir.TypeId = &.{},
     unsupported: ?Module.Span = null,
     parameters: []const *Term = &.{},
+    defaults: std.ArrayList(struct { term: *Term, ty: Ir.TypeId }) = .empty,
+
+    // Defaults fill only unresolved leaves after all exact constraints. A
+    // candidate must never conflict with a contextual type that already won.
+    fn applyDefaults(self: *Solver) Ir.BuildError!void {
+        for (self.defaults.items) |candidate| try self.defaultTerm(candidate.term, candidate.ty, 0);
+    }
+
+    fn defaultTerm(self: *Solver, value: *Term, ty: Ir.TypeId, depth: usize) Ir.BuildError!void {
+        if (depth >= max_depth) return;
+        const t = root(value);
+        switch (t.value) {
+            .unknown => t.value = .{ .link = try self.fromType(ty, t.span, depth + 1) },
+            .array => |element| switch (self.ir.getType(ty).?) {
+                .array => |fallback| try self.defaultTerm(element, fallback, depth + 1),
+                else => {},
+            },
+            .nominal => |nominal| switch (self.ir.getType(ty).?) {
+                .record => |record| {
+                    if (record.source != nominal.module.source.id or record.identity != @backingInt(nominal.id) or record.type_args.len != nominal.args.len) return;
+                    for (nominal.args, record.type_args) |arg, fallback| try self.defaultTerm(arg, fallback, depth + 1);
+                },
+                else => {},
+            },
+            else => {},
+        }
+    }
 
     fn constrain(self: *Solver, ref: Ref, arguments: []const Argument, expected: ?Argument) Ir.BuildError!?Frame {
         const container: ?Nominal = if (ref.container_type) |ty| blk: {
@@ -304,6 +641,7 @@ const Solver = struct {
         for (arguments, signature_type.params) |arg, param| {
             if (arg.terminal) return if (self.failed) null else frame;
             if (arg.ty) |ty| try self.unify(param, try self.fromType(ty, arg.span, 0), arg.span, 0);
+            if (arg.default_type) |ty| try self.defaults.append(self.allocator, .{ .term = param, .ty = ty });
             if (arg.template) |callback| {
                 const callback_container: ?Nominal = if (callback.container_type) |ty| blk: {
                     const nominal = root(try self.fromType(ty, arg.span, 0));
@@ -823,12 +1161,31 @@ const Solver = struct {
                             global_frame.ref = .{ .module = module, .id = id };
                             return self.typeNode(&global_frame, full.type_node, depth + 1);
                         }
+                        if (self.analysis) |analysis| {
+                            const index = analysis.entryIndex(module, id);
+                            if (index < analysis.entries.len) {
+                                const entry = analysis.entries[index];
+                                if (entry.status == .constant_checked) if (entry.type_id) |ty| return self.fromType(ty, span, 0);
+                            }
+                        }
+                        const index = if (module.compilation) |comp|
+                            @backingInt(comp.declaration_ids.get(.{ .source = module.source.id, .local = id }) orelse return self.term(.unknown, span))
+                        else
+                            @backingInt(id);
+                        if (index < self.types.len) if (self.types[index]) |ty| return self.fromType(ty, span, 0);
                     }
                 }
             },
             .string_literal => return self.fromType(try self.ir.internType(.string), span, 0),
             .char_literal => return self.fromType(try self.ir.internType(.rune), span, 0),
-            .number_literal => return self.term(.unknown, span),
+            .number_literal => {
+                const value = try self.term(.unknown, span);
+                switch (std.zig.parseNumberLiteral(ast.tokenSlice(ast.firstToken(node)))) {
+                    .int, .big_int => try self.defaults.append(self.allocator, .{ .term = value, .ty = try BodyChecker.defaultIntegerType(self.ir) }),
+                    else => {},
+                }
+                return value;
+            },
             .field_access => return self.field(frame, node, depth + 1),
             .bool_not, .bool_and, .bool_or => {
                 const boolean = try self.fromType(try self.ir.internType(.boolean), span, 0);
@@ -1211,7 +1568,7 @@ test "backtick generic function rejects ambiguous conflicting unbound and unsupp
     const prefix = "let add:(x:`a,y:`b)->`c=x+y\nlet id:(x:`T)->`T=x\n";
     const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag };
     for ([_]Case{
-        .{ .source = "let main:()={let x=add(1,2)\n}", .tag = .generic_function_ambiguous },
+        .{ .source = "let main:()={let x=add([],[])\n}", .tag = .generic_function_ambiguous },
         .{ .source = "let main:()={let x=add(@as(uint,1),@as(int,2))\n}", .tag = .generic_function_conflict },
         .{ .source = "let main:()={let x=add(\"s\",@as(uint,2))\n}", .tag = .generic_function_conflict },
         .{ .source = "let main:()={let f=id\n}", .tag = .generic_function_ambiguous },
@@ -1220,7 +1577,7 @@ test "backtick generic function rejects ambiguous conflicting unbound and unsupp
         .{ .source = "let main:()={let f:uint=id\n}", .tag = .generic_function_context },
         .{ .source = "let main:()={let f=[id,id]\n}", .tag = .array_literal_needs_type },
         .{ .source = "let main:()={let f=if true {id} else {id}\n}", .tag = .generic_function_ambiguous },
-        .{ .source = "let apply:(f:(`T)->`U,x:`T)->`U=f(x)\nlet main:()={let x=apply(id,42)\n}", .tag = .generic_function_ambiguous },
+        .{ .source = "let apply:(f:(`T)->`U,x:`T)->`U=f(x)\nlet main:()={let x=apply(id,[])\n}", .tag = .generic_function_ambiguous },
         .{ .source = "let apply:(f:(`T)->`U,x:`T)->`U=f(x)\nlet main:()={let x:int=apply(id,@as(uint,42))\n}", .tag = .generic_function_conflict },
         .{ .source = "let main:()={@println(id)}", .tag = .generic_function_ambiguous },
         .{ .source = "let main:()={id}", .tag = .generic_function_context },
@@ -1374,7 +1731,7 @@ fn testInferenceFailureAllocations(allocator: std.mem.Allocator, source: []const
 test "backtick unresolved conflict and unbound diagnostics roll back under OOM" {
     const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag };
     for ([_]Case{
-        .{ .source = "let f:(x:`T)->`U=1\nlet main:()={let a=f(true)\n}", .tag = .generic_function_ambiguous },
+        .{ .source = "let f:(x:`T)->`U=[]\nlet main:()={let a=f(true)\n}", .tag = .generic_function_ambiguous },
         .{ .source = "let f:(x:`T,y:`T)->`T=x\nlet main:()={let a=f(true,\"s\")\n}", .tag = .generic_function_conflict },
         .{ .source = "let f:(x:`T)->`T={let a:`U=x\na}\nlet main:()={let a=f(true)\n}", .tag = .unbound_type_variable },
         .{ .source = "let f:(x:`T)->`T={let mut a=(v:`U)->`U{v}\nx}\nlet main:()={let a=f(true)\n}", .tag = .generic_function_context },
@@ -1527,7 +1884,7 @@ test "generic closures diagnose exact constraints ambiguity locals and capture s
     for ([_]struct { source: []const u8, tag: Module.Diagnostic.Tag }{
         .{ .source = "let main:()={let f=(x:`T,y:`T)->`T{x}\nf(true,@as(int,1))}", .tag = .generic_function_conflict },
         .{ .source = "let main:()={let f=(x:`T)->`T{x}\nlet g=f\n}", .tag = .generic_function_ambiguous },
-        .{ .source = "let main:()={let f:(x:`T)->`T=x\nf(1)\n@print()}", .tag = .generic_function_ambiguous },
+        .{ .source = "let main:()={let f:(x:`T)->`T=x\nf([])\n@print()}", .tag = .generic_function_ambiguous },
         .{ .source = "let main:()={let f:(x:`T)->`T=unknown\n@print(f(true))}", .tag = .unknown_name },
         .{ .source = "let main:()={let f:(x:`T)->`T=f(x)\n@print(f(true))}", .tag = .unknown_name },
         .{ .source = "let main:()={let x:int=1\nlet f=(x:`T)->`T{x}\nf(true)}", .tag = .unsupported_shadowing },
@@ -1625,15 +1982,15 @@ fn testSpeculativeFailure(allocator: std.mem.Allocator, source: []const u8) !voi
 
 test "backtick speculative nested calls do not publish or demand specializations under OOM" {
     for ([_][]const u8{
-        "let bad:(x:`T)->`T=missing\nlet first:(x:`A,y:`B)->`A=x\nlet main:()={let a=first(bad(true),1)\n}",
-        "let bad:(x:`T)->`T=missing\nlet first:(x:(bool)->bool,y:`B)->bool=x(true)\nlet main:()={let a=first(bad,1)\n}",
-        "let id:(x:`T)->`T=x\nlet apply:(f:(`T)->`U,x:`T)->`U=f(x)\nlet first:(x:`A,y:`B)->`A=x\nlet main:()={let a=first(apply(id,true),1)\n}",
-        "let id:(x:`T)->`T=x\nlet first:(x:`A,y:`B)->`A=x\nlet main:()={let a=first(@as((bool)->bool,id),1)\n}",
-        "let G:(T:type)->type=struct{let id:(x:`U,y:T)->`U=x\n}\nlet first:(x:(bool,uint)->bool,y:`B)->bool=x(true,1)\nlet main:()={let a=first(G(uint).id,1)\n}",
-        "let G:(T:type)->type=struct{let id:(x:`U)->`U=x\n}\nlet wrap:(x:`T)->`U=G(uint).id(x)\nlet first:(x:`A,y:`B)->`A=x\nlet main:()={let a=first(wrap(\"s\"),1)\n}",
-        "let G:(T:type)->type=struct{let id:(x:`U)->`U=x\n}\nlet first:(x:`A,y:`B)->`A=x\nlet main:()={let a=first(G(uint).id(\"s\"),1)\n}",
-        "let Box:(T:type)->type=struct{value:T,let id:(x:`U)->`U=x\n}\nlet id:(x:`T)->`T=x\nlet first:(x:`A,y:`B)->`A=x\nlet main:()={let a=first(id(Box(uint)[.value=1]),1)\n}",
-        "let Box:(T:type)->type=struct{value:T,let id:(x:`U)->`U=x\n}\nlet make:(x:`T)->Box(`T)=Box(`T)[.value=x]\nlet get:(x:Box(`T))->`T=x.value\nlet first:(x:`A,y:`B)->`A=x\nlet main:()={let a=first(get(make(true)),1)\n}",
+        "let bad:(x:`T)->`T=missing\nlet first:(x:`A,y:`B)->`A=x\nlet main:()={let a=first(bad(true),[])\n}",
+        "let bad:(x:`T)->`T=missing\nlet first:(x:(bool)->bool,y:`B)->bool=x(true)\nlet main:()={let a=first(bad,[])\n}",
+        "let id:(x:`T)->`T=x\nlet apply:(f:(`T)->`U,x:`T)->`U=f(x)\nlet first:(x:`A,y:`B)->`A=x\nlet main:()={let a=first(apply(id,true),[])\n}",
+        "let id:(x:`T)->`T=x\nlet first:(x:`A,y:`B)->`A=x\nlet main:()={let a=first(@as((bool)->bool,id),[])\n}",
+        "let G:(T:type)->type=struct{let id:(x:`U,y:T)->`U=x\n}\nlet first:(x:(bool,uint)->bool,y:`B)->bool=x(true,1)\nlet main:()={let a=first(G(uint).id,[])\n}",
+        "let G:(T:type)->type=struct{let id:(x:`U)->`U=x\n}\nlet wrap:(x:`T)->`U=G(uint).id(x)\nlet first:(x:`A,y:`B)->`A=x\nlet main:()={let a=first(wrap(\"s\"),[])\n}",
+        "let G:(T:type)->type=struct{let id:(x:`U)->`U=x\n}\nlet first:(x:`A,y:`B)->`A=x\nlet main:()={let a=first(G(uint).id(\"s\"),[])\n}",
+        "let Box:(T:type)->type=struct{value:T,let id:(x:`U)->`U=x\n}\nlet id:(x:`T)->`T=x\nlet first:(x:`A,y:`B)->`A=x\nlet main:()={let a=first(id(Box(uint)[.value=1]),[])\n}",
+        "let Box:(T:type)->type=struct{value:T,let id:(x:`U)->`U=x\n}\nlet make:(x:`T)->Box(`T)=Box(`T)[.value=x]\nlet get:(x:Box(`T))->`T=x.value\nlet first:(x:`A,y:`B)->`A=x\nlet main:()={let a=first(get(make(true)),[])\n}",
     }) |source| {
         try testSpeculativeFailure(std.testing.allocator, source);
         try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testSpeculativeFailure, .{source});
@@ -1666,14 +2023,14 @@ test "backtick abandoned probes do not consume the specialization count limit" {
     for (0..max_specializations + 1) |i| try source.writer.print("x{d}:`A{d},", .{ i, i });
     try source.writer.writeAll("last:`B)->`A0=x0\nlet main:()={let a=first(");
     for (0..max_specializations + 1) |i| try source.writer.print("id(R{d}[]),", .{i});
-    try source.writer.writeAll("1)\n}");
+    try source.writer.writeAll("[])\n}");
     try testSpeculativeFailure(std.testing.allocator, source.written());
 }
 
 fn testImportedSpeculativeFailure(allocator: std.mem.Allocator, invalid_layout: bool) !void {
     var comp = Compilation.init(allocator);
     defer comp.deinit();
-    const root = try comp.addSource("/app/probe.nov", "let lib=@import(\"lib.nov\")\nlet first:(x:`A,y:`B)->`A=x\nlet main:()={let a=first(lib.bad(true),1)\n}");
+    const root = try comp.addSource("/app/probe.nov", "let lib=@import(\"lib.nov\")\nlet first:(x:`A,y:`B)->`A=x\nlet main:()={let a=first(lib.bad(true),[])\n}");
     const library = try comp.addSource("/app/lib.nov", if (invalid_layout)
         "let Box:(T:type)->type=struct{value:Missing,}\n@[public]\nlet bad:(x:`T)->Box(`T)=Box(`T)[.value=x]"
     else
@@ -1981,7 +2338,7 @@ test "backtick contextual abandoned callback probes do not consume generic budge
     for (0..max_specializations + 1) |i| try source.writer.print("f{d}:(R{d})->R{d},", .{ i, i, i });
     try source.writer.writeAll("last:`B)->bool=true\nlet main:()={let a=first(");
     for (0..max_specializations + 1) |_| try source.writer.writeAll("id,");
-    try source.writer.writeAll("1)\n}");
+    try source.writer.writeAll("[])\n}");
     try testSpeculativeFailure(std.testing.allocator, source.written());
 }
 
@@ -2282,7 +2639,7 @@ test "backtick instance terminal operands stop constraints and demand at first e
     for ([_]struct { tail: []const u8, tag: Module.Diagnostic.Tag }{
         .{ .tail = "let main:()=R[].f(true,@panic(\"stop\"))", .tag = .argument_count_mismatch },
         .{ .tail = "let main:()=R[].f(true,@panic(\"stop\"),unknown,unknown)", .tag = .argument_count_mismatch },
-        .{ .tail = "let main:()=R[].f(1,@panic(\"stop\"),true)", .tag = .literal_needs_type },
+        .{ .tail = "let main:()=R[].f(1.5,@panic(\"stop\"),true)", .tag = .unsupported_literal },
         .{ .tail = "let main:()=R[].f(true,\"wrong\",@panic(\"stop\"))", .tag = .generic_function_conflict },
         .{ .tail = "@[noreturn]\nlet main:()=R[].f(if true{return}else{return},true,unknown)", .tag = .noreturn_return },
     }) |case| {
@@ -2312,8 +2669,8 @@ test "backtick instance inference receiver callbacks nominal results static cano
 
 test "backtick instance abandoned fresh nominal probes publish no methods signatures IDs or demand under OOM" {
     for ([_][]const u8{
-        "let Box:(T:type)->type=struct{value:T,let map:(object:Box(T),f:(T)->`U)->Box(`U)=Box(`U)[.value=f(object.value)]\n}\nlet make:(x:`T)->Box(`T)=Box(`T)[.value=x]\nlet id:(x:`T)->`T=x\nlet first:(a:`A,b:`B)->`A=a\nlet main:()={let x=first(make(true).map(id),1)\n}",
-        "let Box:(T:type)->type=struct{value:T,let get:(object:Box(T))->T=object.value\n}\nlet make:(x:`T)->Box(`T)=Box(`T)[.value=x]\nlet first:(a:`A,b:`B)->`A=a\nlet main:()={let x=first(make(true).get(),1)\n}",
+        "let Box:(T:type)->type=struct{value:T,let map:(object:Box(T),f:(T)->`U)->Box(`U)=Box(`U)[.value=f(object.value)]\n}\nlet make:(x:`T)->Box(`T)=Box(`T)[.value=x]\nlet id:(x:`T)->`T=x\nlet first:(a:`A,b:`B)->`A=a\nlet main:()={let x=first(make(true).map(id),[])\n}",
+        "let Box:(T:type)->type=struct{value:T,let get:(object:Box(T))->T=object.value\n}\nlet make:(x:`T)->Box(`T)=Box(`T)[.value=x]\nlet first:(a:`A,b:`B)->`A=a\nlet main:()={let x=first(make(true).get(),[])\n}",
     }) |source| {
         try testSpeculativeFailure(std.testing.allocator, source);
         try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testSpeculativeFailure, .{source});
@@ -2324,7 +2681,7 @@ test "backtick instance conflicts unbound variables unsupported values arity and
     const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag };
     for ([_]Case{
         .{ .source = "let R=struct{let f:(object:R,x:`T,y:`T)->`T=x\n}\nlet main:()={let x=R[].f(true,\"s\")\n}", .tag = .generic_function_conflict },
-        .{ .source = "let R=struct{let f:(object:R)->`T=1\n}\nlet main:()={let x=R[].f()\n}", .tag = .generic_function_ambiguous },
+        .{ .source = "let R=struct{let f:(object:R)->`T=[]\n}\nlet main:()={let x=R[].f()\n}", .tag = .generic_function_ambiguous },
         .{ .source = "let R=struct{let f:(object:R,x:`T)->`T={let y:`U=x\ny}\n}\nlet main:()={let x=R[].f(true)\n}", .tag = .unbound_type_variable },
         .{ .source = "let R=struct{let f:(object:R,x:`T)->`T=x\n}\nlet main:()={let x=R[].f()\n}", .tag = .argument_count_mismatch },
         .{ .source = "let R=struct{let f:(object:R,x:`T)->`T=x\n}\nlet main:()={let f=R[].f\n}", .tag = .unknown_field },
