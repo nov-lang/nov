@@ -765,6 +765,11 @@ implemented; grapheme operations remain deferred.
   Keep private-by-default and identical file/named import visibility; this is syntax
   only, not implemented or approved as a replacement. Foreign symbol export remains
   a separate `@[export("symbol_name")]` annotation, not Nov import visibility.
+- Proposal (not accepted or implemented): group annotations in one comma-separated
+  block, e.g. `@[public, stringify]` instead of separate `@[public]` and
+  `@[stringify]` blocks. Existing separate blocks remain the implemented syntax;
+  argument-bearing annotations, mixing grouped/separate blocks, trailing commas,
+  and duplicate/conflict rules still need specification.
 - change attributes as a special anonymous struct?
   - from
 ```nov
