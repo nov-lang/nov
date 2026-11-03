@@ -403,8 +403,11 @@ pub fn next(self: *Tokenizer) Token {
             else => continue :state .invalid,
         },
         .asterisk => {
+            const dereference = self.index > 0 and self.buffer[self.index - 1] == '.';
             self.index += 1;
-            switch (self.buffer[self.index]) {
+            if (dereference) {
+                result.tag = .asterisk;
+            } else switch (self.buffer[self.index]) {
                 '=' => {
                     result.tag = .asterisk_equal;
                     self.index += 1;
@@ -926,6 +929,12 @@ test "shebang line is recognized and skipped" {
         .identifier,
         .newline,
     });
+}
+
+test "dereference assignment keeps the following operator separate" {
+    try testTokenize("p.*=1", &.{ .identifier, .period, .asterisk, .equal, .number_literal });
+    try testTokenize("p.**=2", &.{ .identifier, .period, .asterisk, .asterisk_equal, .number_literal });
+    try testTokenize("p.*+=1", &.{ .identifier, .period, .asterisk, .plus_equal, .number_literal });
 }
 
 test "assignment operators" {

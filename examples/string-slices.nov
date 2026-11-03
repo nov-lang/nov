@@ -83,12 +83,12 @@ let immutable_snapshots: () = {
     let mut text = "hé😀llo"
     let whole = text[..]
     let alias = &text
-    let snapshot = alias[1..3]
-    alias += "!"
+    let snapshot = alias.*[1..3]
+    alias.* += "!"
     @assert(snapshot == "é😀")
     @assert(whole == "hé😀llo")
-    @assert(alias[-1..] == "!")
-    alias = "replacement"
+    @assert(alias.*[-1..] == "!")
+    alias.* = "replacement"
     @assert(snapshot[0] == 'é')
     @assert(whole[-1] == 'o')
     let mut copy = snapshot

@@ -270,6 +270,8 @@ pub const Type = union(enum) {
     float: u16,
     function: Type.Function,
     array: TypeId,
+    /// Compile-time local capability descriptor, never a runtime value or layout.
+    reference: struct { child: TypeId, mutable: bool },
     /// Reusable integer bounds; inclusivity belongs to each value.
     range: TypeId,
 
@@ -753,6 +755,7 @@ fn validateFunction(self: *const Ir, function: Function) VerifyError!void {
     if (function.is_closure and (function.export_name != null or function.extern_name != null or function.is_test)) return error.InvalidForeignFunction;
     for (function.captures) |capture| {
         const captured = self.getType(capture.ty) orelse return error.InvalidTypeId;
+        if (captured == .reference) return error.InvalidOperation;
         if (capture.mutable and captured == .void) return error.InvalidOperation;
         if (capture.environment_layout) |layout| {
             const carrier = self.getFunction(layout) orelse return error.InvalidFunctionId;
@@ -967,6 +970,7 @@ fn validateBodyStructure(self: *const Ir, function: Function, body: Body) Verify
     }
     for (body.instructions, 0..) |instruction, i| {
         const ty = self.getType(instruction.ty) orelse return error.InvalidTypeId;
+        if (ty == .reference) return error.InvalidOperation;
         try self.validateSpan(instruction.span);
         if (terminates(body, @fromBackingInt(@intCast(i)))) {
             var region_end = body.instructions.len;
@@ -1366,6 +1370,10 @@ fn validateType(self: *const Ir, ty: Type, before: usize) ValidationError!void {
         .integer => |integer| {
             if (integer.bits == 0 or integer.bits > 128) return error.InvalidIntegerWidth;
         },
+        .reference => |reference| {
+            if (@backingInt(reference.child) >= before) return error.InvalidTypeId;
+            if (!isArrayElement(self.getType(reference.child).?)) return error.InvalidTypeId;
+        },
         .range => |element| {
             if (@backingInt(element) >= before) return error.InvalidTypeId;
             if (self.getType(element).? != .integer) return error.InvalidTypeId;
@@ -1378,9 +1386,11 @@ fn validateType(self: *const Ir, ty: Type, before: usize) ValidationError!void {
             // Types form a DAG; recursive function values do not require cycles
             // in their signature types. Only refer to previously interned types.
             if (@backingInt(function.result) >= before) return error.InvalidTypeId;
+            if (self.getType(function.result).? == .reference) return error.InvalidTypeId;
             for (function.params) |param| {
                 if (@backingInt(param) >= before) return error.InvalidTypeId;
                 if (self.getType(param).? == .void) return error.VoidParameter;
+                if (self.getType(param).? == .reference) return error.InvalidTypeId;
             }
         },
     }
@@ -1413,7 +1423,7 @@ fn validateConstant(self: *const Ir, constant: Constant) ValidationError!void {
             const quiet_mask: u64 = if (bits == 32) 0x00400000 else 0x0008000000000000;
             if (pattern & exponent_mask == exponent_mask and pattern & fraction_mask != 0 and pattern & quiet_mask == 0) return error.FloatOutOfRange;
         },
-        .function, .array, .record, .range => return error.NonConstantType,
+        .function, .array, .record, .range, .reference => return error.NonConstantType,
         .integer => |integer| switch (integer.signedness) {
             .signed => {
                 const value = switch (constant.value) {
@@ -1499,7 +1509,7 @@ pub fn isRecordField(ty: Type) bool {
 
 pub fn isArrayElement(ty: Type) bool {
     return switch (ty) {
-        .void => false,
+        .void, .reference => false,
         .integer => |integer| integer.bits > 0 and integer.bits <= 128,
         .float => |bits| bits == 32 or bits == 64,
         .boolean, .rune, .string, .enumeration, .record, .function, .array, .range => true,
@@ -1524,9 +1534,59 @@ fn typeEql(a: Type, b: Type) bool {
         .record => |record| record.source == b.record.source and record.identity == b.record.identity and record.tagged == b.record.tagged and std.mem.eql(TypeId, record.type_args, b.record.type_args),
         .range => |element| element == b.range,
         .array => |element| element == b.array,
+        .reference => |reference| reference.child == b.reference.child and reference.mutable == b.reference.mutable,
         .function => |function| function.result == b.function.result and
             std.mem.eql(TypeId, function.params, b.function.params),
     };
+}
+
+fn testLocalReferenceDescriptors(allocator: std.mem.Allocator) !void {
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    ir.source_len = 1;
+    const unit = try ir.internType(.void);
+    const boolean = try ir.internType(.boolean);
+    const integer = try ir.internType(.{ .integer = .{ .bits = 32, .signedness = .signed } });
+    const float = try ir.internType(.{ .float = 64 });
+    const rune = try ir.internType(.rune);
+    const string = try ir.internType(.string);
+    const array = try ir.internType(.{ .array = boolean });
+    const record = try ir.internType(.{ .record = .{ .identity = 0, .fields = &.{} } });
+    const tagged = try ir.internType(.{ .record = .{ .identity = 1, .fields = &.{}, .tagged = true } });
+    const enumeration = try ir.internType(.{ .enumeration = .{ .identity = 2, .name = "E", .tags = &.{.{ .name = "a", .span = test_span }} } });
+    const range = try ir.internType(.{ .range = integer });
+    const signature = try ir.internType(.{ .function = .{ .params = &.{}, .result = unit } });
+    for ([_]TypeId{ boolean, integer, float, rune, string, array, record, tagged, enumeration, range, signature }) |child| {
+        const readonly = try ir.internType(.{ .reference = .{ .child = child, .mutable = false } });
+        const writable = try ir.internType(.{ .reference = .{ .child = child, .mutable = true } });
+        try std.testing.expect(readonly != writable);
+        try std.testing.expectEqual(readonly, try ir.internType(.{ .reference = .{ .child = child, .mutable = false } }));
+        const descriptor = ir.getType(readonly).?;
+        try std.testing.expect(!isArrayElement(descriptor) and !isRecordField(descriptor) and !isUnionPayload(descriptor));
+        try std.testing.expect(!isManaged(descriptor) and !hasEquality(descriptor));
+        try std.testing.expect(!try ir.needsArrayCopy(readonly));
+        try std.testing.expectError(error.InvalidTypeId, ir.internType(.{ .reference = .{ .child = readonly, .mutable = false } }));
+        try std.testing.expectError(error.InvalidArrayElement, ir.internType(.{ .array = readonly }));
+        try std.testing.expectError(error.InvalidTypeId, ir.internType(.{ .function = .{ .params = &.{readonly}, .result = unit } }));
+        try std.testing.expectError(error.InvalidTypeId, ir.internType(.{ .function = .{ .params = &.{}, .result = readonly } }));
+        try std.testing.expectError(error.NonConstantType, ir.internConstant(.{ .ty = readonly, .value = .void }));
+        const fields = &[_]Field{.{ .name = "ref", .ty = readonly, .span = test_span }};
+        try std.testing.expectError(error.InvalidArrayElement, ir.setRecordFields(record, fields));
+        try std.testing.expectError(error.InvalidArrayElement, ir.setRecordFields(tagged, fields));
+    }
+    try std.testing.expectError(error.InvalidTypeId, ir.internType(.{ .reference = .{ .child = unit, .mutable = true } }));
+    try std.testing.expectError(error.InvalidTypeId, ir.internType(.{ .reference = .{ .child = @fromBackingInt(9999), .mutable = false } }));
+    const function = try ir.addFunction("f", signature, test_span);
+    const reference = try ir.internType(.{ .reference = .{ .child = boolean, .mutable = false } });
+    try std.testing.expectError(error.InvalidOperation, ir.setFunctionBody(function, &.{TestFunctions.instruction(reference, .{ .borrow_reserve = @fromBackingInt(0) })}, @fromBackingInt(0)));
+    try std.testing.expect(ir.getFunction(function).?.body == null);
+    const nothing = try ir.internConstant(.{ .ty = unit, .value = .void });
+    try ir.setFunctionBody(function, &.{TestFunctions.instruction(unit, .{ .constant = nothing })}, @fromBackingInt(0));
+    try ir.verify();
+}
+
+test "local reference descriptors canonicalize reject runtime storage and survive OOM" {
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testLocalReferenceDescriptors, .{});
 }
 
 test "shared pools retain source-qualified nominal identities after AST release" {

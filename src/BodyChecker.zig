@@ -40,6 +40,7 @@ const Binding = struct {
     slot: ?Ir.ValueId = null,
     value: ?Ir.ValueId = null,
     name_span: Module.Span,
+    region: Ast.Node.Index = 0,
     borrowed: bool = false,
     borrow: ?Ir.ValueId = null,
     loan_owner: ?struct { owner: Module.Span, origin: Module.Span } = null,
@@ -244,6 +245,7 @@ const Context = struct {
     loop_context: ?*LoopContext = null,
     bindings: std.StringHashMapUnmanaged(Binding) = .empty,
     locals: std.ArrayList([]const u8) = .empty,
+    region: Ast.Node.Index = 0,
     borrow_base: ?Ast.Node.Index = null,
     projection_base: ?Ast.Node.Index = null,
     reservation: ?*const Reservation = null,
@@ -262,6 +264,7 @@ const Context = struct {
         while (iterator.next()) |entry| try captures.append(allocator, .{
             .name = entry.key_ptr.*,
             .ty = entry.value_ptr.known.ty,
+            .mutable = entry.value_ptr.mutable,
             .template = if (entry.value_ptr.template) |template| .{ .module = self.module, .local = &template.info } else null,
         });
     }
@@ -717,6 +720,7 @@ const Context = struct {
     fn bindLocal(self: *Context, name: []const u8, binding: Binding) Error!void {
         try self.locals.append(self.module.allocator, name);
         var stored = binding;
+        stored.region = self.region;
         if (self.borrowedName(name) and !stored.borrowed and stored.slot == null and stored.value != null and self.emitter != null and self.ir.getType(stored.known.ty).? != .void) {
             stored.slot = try self.emitter.?.append(stored.known.ty, stored.name_span, .{ .local_slot = stored.value.? });
             stored.value = null;
@@ -873,12 +877,61 @@ const Context = struct {
         return true;
     }
 
-    fn borrowLocal(self: *Context, node: Ast.Node.Index, name: []const u8, name_span: Module.Span, depth: usize) Error!bool {
+    fn probeReference(self: *Context, node: Ast.Node.Index, depth: usize) Error!?Known {
         const ast = &self.module.source.ast;
-        const decl = ast.decl(node).ast;
+        const operand = ast.nodes.items(.data)[node].rhs;
+        const root = if (ast.nodes.items(.tag)[operand] == .array_access) ast.nodes.items(.data)[operand].lhs else operand;
+        if (ast.nodes.items(.tag)[root] != .identifier) return null;
+        const owner = self.lookupBinding(ast.tokenSlice(ast.firstToken(root))) orelse return null;
+        if (owner.borrowed or owner.template != null) return null;
+        const child = (try self.probe(operand, depth + 1)) orelse return null;
+        if (!Ir.isArrayElement(self.ir.getType(child.ty).?)) return null;
+        return .{ .ty = try self.ir.internType(.{ .reference = .{ .child = child.ty, .mutable = owner.mutable } }) };
+    }
+
+    // A dereference exposes the child capability only for this operation; the
+    // lexical binding keeps its reference type and its independent rebind flag.
+    fn dereferenceBinding(self: *Context, node: Ast.Node.Index) Error!?Binding {
+        const ast = &self.module.source.ast;
+        const operand = ast.nodes.items(.data)[node].lhs;
+        if (ast.nodes.items(.tag)[operand] != .identifier) {
+            _ = try self.fail(.unsupported_borrow, node, null);
+            return null;
+        }
+        var binding = (try self.captureBinding(ast.tokenSlice(ast.firstToken(operand)), operand)) orelse {
+            _ = try self.fail(.unknown_name, operand, null);
+            return null;
+        };
+        const ty = self.ir.getType(binding.known.ty).?;
+        if (!binding.borrowed or ty != .reference) {
+            _ = try self.fail(.unsupported_borrow, node, binding.name_span);
+            return null;
+        }
+        binding.known.ty = ty.reference.child;
+        binding.mutable = ty.reference.mutable;
+        return binding;
+    }
+
+    fn publishBorrow(self: *Context, name: []const u8, binding: Binding) Error!void {
+        if (self.bindings.getPtr(name)) |existing| {
+            var updated = binding;
+            updated.region = existing.region;
+            existing.* = updated;
+        } else try self.bindLocal(name, binding);
+    }
+
+    fn borrowLocal(self: *Context, node: Ast.Node.Index, name: []const u8, name_span: Module.Span, depth: usize) Error!bool {
+        const decl = self.module.source.ast.decl(node).ast;
+        const annotation = if (decl.type_node != 0) (try self.resolveType(decl.type_node)) orelse return false else null;
+        return self.borrowNamed(decl.init_node, annotation, decl.is_mutable, name, name_span, depth);
+    }
+
+    fn borrowNamed(self: *Context, init_node: Ast.Node.Index, annotation: ?Ir.TypeId, mutable: bool, name: []const u8, name_span: Module.Span, depth: usize) Error!bool {
+        const ast = &self.module.source.ast;
+        const decl = .{ .init_node = init_node, .is_mutable = mutable };
         const operand = ast.nodes.items(.data)[decl.init_node].rhs;
         const scalar = ast.nodes.items(.tag)[operand] == .identifier;
-        if (decl.is_mutable or decl.type_node != 0 or (!scalar and ast.nodes.items(.tag)[operand] != .array_access)) {
+        if (!scalar and ast.nodes.items(.tag)[operand] != .array_access) {
             _ = try self.fail(.unsupported_borrow, decl.init_node, null);
             return false;
         }
@@ -897,16 +950,26 @@ const Context = struct {
             return false;
         }
         const owner_type = self.ir.getType(owner.known.ty).?;
-        const supported = if (scalar) owner_type != .void else owner_type == .array;
-        if (owner.borrowed or !supported) {
+        const supported = if (scalar) Ir.isArrayElement(owner_type) else owner_type == .array;
+        if (owner.borrowed or owner.template != null or !supported) {
             _ = try self.fail(.unsupported_borrow, operand, owner.name_span);
             return false;
+        }
+        const child = if (scalar) owner.known.ty else owner_type.array;
+        var reference = try self.ir.internType(.{ .reference = .{ .child = child, .mutable = owner.mutable } });
+        if (annotation) |type_id| {
+            const annotated = self.ir.getType(type_id).?;
+            if (annotated != .reference or annotated.reference.child != child or (annotated.reference.mutable and !owner.mutable)) {
+                _ = try self.fail(.expression_type_mismatch, decl.init_node, name_span);
+                return false;
+            }
+            reference = type_id;
         }
         const unit = try self.ir.internType(.void);
         const reservation = if (self.emitter) |emitter| try emitter.append(unit, self.irSpan(decl.init_node), .{ .borrow_reserve = owner.slot.? }) else null;
         if (scalar) {
             const borrow = if (self.emitter) |emitter| try emitter.append(unit, self.irSpan(decl.init_node), .{ .borrow_start = .{ .reservation = reservation.?, .index = null } }) else null;
-            try self.bindLocal(name, .{ .known = owner.known, .name_span = name_span, .mutable = owner.mutable, .borrowed = true, .borrow = borrow, .loan_owner = .{ .owner = owner.name_span, .origin = self.irSpan(decl.init_node) } });
+            try self.publishBorrow(name, .{ .known = .{ .ty = reference }, .name_span = name_span, .mutable = decl.is_mutable, .borrowed = true, .borrow = borrow, .loan_owner = .{ .owner = owner.name_span, .origin = self.irSpan(decl.init_node) } });
             return true;
         }
         const index_ty = try self.ir.internType(.{ .integer = .{ .signedness = .signed, .bits = Ir.native_pointer_bits } });
@@ -920,7 +983,7 @@ const Context = struct {
         if (try self.expression(access.rhs, .{ .ty = index_ty }, depth + 1) == null) return false;
         if (self.terminated) return true;
         const borrow = if (self.emitter) |emitter| try emitter.append(unit, self.irSpan(decl.init_node), .{ .borrow_start = .{ .reservation = reservation.?, .index = try emitter.value(access.rhs) } }) else null;
-        try self.bindLocal(name, .{ .known = .{ .ty = owner_type.array }, .name_span = name_span, .mutable = owner.mutable, .borrowed = true, .borrow = borrow, .loan_owner = .{ .owner = owner.name_span, .origin = self.irSpan(decl.init_node) } });
+        try self.publishBorrow(name, .{ .known = .{ .ty = reference }, .name_span = name_span, .mutable = decl.is_mutable, .borrowed = true, .borrow = borrow, .loan_owner = .{ .owner = owner.name_span, .origin = self.irSpan(decl.init_node) } });
         return true;
     }
 
@@ -974,7 +1037,7 @@ const Context = struct {
             .{ .ty = (try self.resolveType(decl.type_node)) orelse return null }
         else
             (try self.probe(decl.init_node, depth + 1)) orelse (try self.probeDefault(decl.init_node, depth + 1)) orelse return null;
-        return .{ .known = known, .initializer = decl.init_node, .name_span = self.module.tokenSpan(token), .mutable = decl.is_mutable };
+        return .{ .known = known, .initializer = decl.init_node, .name_span = self.module.tokenSpan(token), .mutable = decl.is_mutable, .borrowed = ast.nodes.items(.tag)[decl.init_node] == .ref_of };
     }
 
     fn probeBlockTemplate(self: *Context, node: Ast.Node.Index, depth: usize) Error!?GenericFunctions.Ref {
@@ -1109,6 +1172,12 @@ const Context = struct {
         return null;
     }
 
+    fn iterationReference(self: *Context, source: Ast.Node.Index, child: Ir.TypeId) Error!Known {
+        const ast = &self.module.source.ast;
+        const owner = if (ast.nodes.items(.tag)[source] == .identifier) self.lookupBinding(ast.tokenSlice(ast.firstToken(source))) else null;
+        return .{ .ty = try self.ir.internType(.{ .reference = .{ .child = child, .mutable = if (owner) |binding| binding.mutable else false } }) };
+    }
+
     fn probeRange(self: *Context, node: Ast.Node.Index, depth: usize) Error!?Known {
         const ast = &self.module.source.ast;
         const range = ast.fullRange(node).?;
@@ -1132,7 +1201,7 @@ const Context = struct {
         const name = ast.tokenSlice(token);
         if (index) |known| {
             if (!std.mem.eql(u8, name, "_") and self.conflict(name) == null and !isPrimitive(name))
-                try self.bindLocal(name, .{ .known = known, .name_span = self.module.tokenSpan(token) });
+                try self.bindLocal(name, .{ .known = if (ast.nodes.items(.tag)[range.binding] == .ref_of) try self.iterationReference(range.source, known.ty) else known, .name_span = self.module.tokenSpan(token) });
         }
         return (try self.probeBreaks(range.body, depth + 1)) orelse fallback;
     }
@@ -1302,7 +1371,11 @@ const Context = struct {
                 .array_access => if (try q.typeOf(data.lhs, depth + 1)) |base| {
                     if (c.ir.getType(base.ty).? == .array) return .{ .ty = c.ir.getType(base.ty).?.array };
                 },
-                .ref_of => return q.typeOf(data.rhs, depth + 1),
+                .ref_of => return c.probeReference(node, depth),
+                .deref => if (try q.typeOf(data.lhs, depth + 1)) |operand| {
+                    const reference = c.ir.getType(operand.ty).?;
+                    if (reference == .reference) return .{ .ty = reference.reference.child };
+                },
                 else => {},
             }
             return c.probe(node, depth);
@@ -1393,7 +1466,7 @@ const Context = struct {
                     .string => try c.ir.internType(.rune),
                     else => null,
                 };
-                if (element) |ty| try c.bindLocal(ast.tokenSlice(token), .{ .known = .{ .ty = ty }, .name_span = c.module.tokenSpan(token) });
+                if (element) |ty| try c.bindLocal(ast.tokenSlice(token), .{ .known = if (by_ref) try c.iterationReference(parts.source, ty) else .{ .ty = ty }, .name_span = c.module.tokenSpan(token) });
             }
             const body = try q.expression(parts.body, depth + 1);
             c.restoreScope(scope);
@@ -1995,6 +2068,7 @@ const Context = struct {
             .integer => |integer| try std.fmt.allocPrint(a, "{s}{d}", .{ if (integer.signedness == .signed) "i" else "u", integer.bits }),
             .float => |bits| try std.fmt.allocPrint(a, "f{d}", .{bits}),
             .array => |element| try std.fmt.allocPrint(a, "[]{s}", .{try self.printedTypeName(element, remaining - 1)}),
+            .reference => |reference| try std.fmt.allocPrint(a, "&{s}{s}", .{ if (reference.mutable) "mut " else "", try self.printedTypeName(reference.child, remaining - 1) }),
             .range => |element| try std.fmt.allocPrint(a, "range({s})", .{try self.printedTypeName(element, remaining - 1)}),
             .function => |function| blk: {
                 var text: []const u8 = "(";
@@ -2296,7 +2370,12 @@ const Context = struct {
                 if (std.mem.eql(u8, name, "true") or std.mem.eql(u8, name, "false")) break :blk .{ .ty = try self.ir.internType(.boolean) };
                 break :blk null;
             },
-            .ref_of => self.probe(data.rhs, depth + 1),
+            .ref_of => self.probeReference(node, depth),
+            .deref => blk: {
+                const operand = (try self.probe(data.lhs, depth + 1)) orelse break :blk null;
+                const reference = self.ir.getType(operand.ty).?;
+                break :blk if (reference == .reference) .{ .ty = reference.reference.child } else null;
+            },
             .unwrap => blk: {
                 const operand = (try self.probe(data.lhs, depth + 1)) orelse break :blk null;
                 const shape = self.propagationShape(operand.ty) orelse break :blk null;
@@ -2596,6 +2675,7 @@ const Context = struct {
                     .inclusive = ast.tokens.items(.tag)[ast.nodes.items(.main_token)[data.rhs]] == .period_period_equal,
                 } };
             },
+            .deref => .{ .borrow_read = (try self.dereferenceBinding(node)).?.borrow.? },
             .array_access => .{ .array_index = .{ .array = try emitter.value(data.lhs), .index = try emitter.value(data.rhs) } },
             .field_access => blk: {
                 if (try self.staticMethod(node)) |id| {
@@ -2611,7 +2691,7 @@ const Context = struct {
             .identifier, .container_field => blk: {
                 const name = self.module.sourceSlice(self.span(node)).?;
                 if (self.bindings.get(name)) |binding| {
-                    if (binding.borrowed) break :blk .{ .borrow_read = binding.borrow.? };
+                    if (binding.borrowed) return error.InvalidOperation;
                     if (binding.value) |value| {
                         try emitter.values.put(emitter.allocator, node, value);
                         try self.copyRead(node, ty);
@@ -2693,7 +2773,7 @@ const Context = struct {
         } else try emitter.record(node, ty, self.irSpan(node), op);
         // Storage reads snapshot immediately; projection bases only borrow the
         // aggregate until its selected value is read, without intervening effects.
-        if (tag == .identifier or tag == .container_field or tag == .field_access or tag == .array_access) try self.copyRead(node, ty);
+        if (tag == .identifier or tag == .container_field or tag == .field_access or tag == .array_access or tag == .deref) try self.copyRead(node, ty);
         return true;
     }
 
@@ -2717,12 +2797,14 @@ const Context = struct {
             path_len += 1;
             root = ast.nodes.items(.data)[root].lhs;
         }
-        if (ast.nodes.items(.tag)[root] != .identifier) return self.fail(.unsupported_assignment_target, data.lhs, null);
+        const dereferenced = ast.nodes.items(.tag)[root] == .deref;
+        if (!dereferenced and ast.nodes.items(.tag)[root] != .identifier) return self.fail(.unsupported_assignment_target, data.lhs, null);
         const binding_name = self.module.sourceSlice(self.span(root)).?;
-        const binding = (try self.captureBinding(binding_name, root)) orelse {
+        const binding = (if (dereferenced) try self.dereferenceBinding(root) else try self.captureBinding(binding_name, root)) orelse {
             if (self.module.lookup(binding_name)) |id| return self.fail(.immutable_assignment, target.lhs, self.module.getDeclaration(id).?.name_span);
             return self.fail(.unknown_name, target.lhs, null);
         };
+        if (binding.borrowed and !dereferenced) return self.fail(.unsupported_borrow, root, binding.name_span);
         if (self.mutationOrigin(binding)) |origin| return self.fail(.borrow_conflict, root, origin);
         var record_id = binding.known.ty;
         var path: [Ir.max_record_depth]u32 = undefined;
@@ -2799,12 +2881,14 @@ const Context = struct {
             path_len += 1;
             root = ast.nodes.items(.data)[root].lhs;
         }
-        if (ast.nodes.items(.tag)[root] != .identifier) return self.fail(.unsupported_assignment_target, data.lhs, null);
+        const dereferenced = ast.nodes.items(.tag)[root] == .deref;
+        if (!dereferenced and ast.nodes.items(.tag)[root] != .identifier) return self.fail(.unsupported_assignment_target, data.lhs, null);
         const name = self.module.sourceSlice(self.span(root)).?;
-        const binding = (try self.captureBinding(name, node)) orelse {
+        const binding = (if (dereferenced) try self.dereferenceBinding(root) else try self.captureBinding(name, node)) orelse {
             if (self.module.lookup(name)) |id| return self.fail(.immutable_assignment, target.lhs, self.module.getDeclaration(id).?.name_span);
             return self.fail(.unknown_name, target.lhs, null);
         };
+        if (binding.borrowed and !dereferenced) return self.fail(.unsupported_borrow, root, binding.name_span);
         const reservation: Reservation = .{ .owner = if (binding.loan_owner) |loan| loan.owner else binding.name_span, .origin = if (binding.loan_owner) |loan| loan.origin else self.irSpan(node), .parent = self.reservation };
         const parent = self.reservation;
         if (binding.borrowed) self.reservation = &reservation;
@@ -3445,7 +3529,7 @@ const Context = struct {
             else
                 index;
         }
-        if (!discard) try self.bindLocal(name, .{ .known = known.?, .name_span = self.module.tokenSpan(binding_token), .value = current, .mutable = by_ref and owner.?.mutable, .borrowed = by_ref, .borrow = element_loan, .loan_owner = if (by_ref) .{ .owner = owner.?.name_span, .origin = self.irSpan(node) } else null });
+        if (!discard) try self.bindLocal(name, .{ .known = if (by_ref) .{ .ty = try self.ir.internType(.{ .reference = .{ .child = element_type, .mutable = owner.?.mutable } }) } else known.?, .name_span = self.module.tokenSpan(binding_token), .value = current, .borrowed = by_ref, .borrow = element_loan, .loan_owner = if (by_ref) .{ .owner = owner.?.name_span, .origin = self.irSpan(node) } else null });
         if (source == .array and owner != null) self.reservation = &iteration_reservation;
         if (loop.else_expr != 0 and context.result == null) context.result = try self.probeBreaks(loop.body, depth + 1);
         if (try self.expression(loop.body, .{ .ty = unit }, depth + 1) == null) return null;
@@ -3512,6 +3596,12 @@ const Context = struct {
     }
 
     fn expression(self: *Context, node: Ast.Node.Index, expected: ?Known, depth: usize) Error!?Ir.TypeId {
+        const parent_region = self.region;
+        switch (self.module.source.ast.nodes.items(.tag)[node]) {
+            .block, .block_two, .block_newline, .block_two_newline, .@"if", .if_else, .match, .loop_range, .loop_condition, .loop_cont, .loop_else, .bool_and, .bool_or => self.region = node,
+            else => {},
+        }
+        defer self.region = parent_region;
         const ty = if (self.terminated)
             (if (expected) |want| want.ty else try self.ir.internType(.void))
         else
@@ -3554,6 +3644,10 @@ const Context = struct {
         const data = ast.nodes.items(.data)[node];
         switch (ast.nodes.items(.tag)[node]) {
             .ref_of => return self.fail(.unsupported_borrow, node, null),
+            .deref => {
+                const binding = (try self.dereferenceBinding(node)) orelse return null;
+                return self.fit(binding.known.ty, expected, node);
+            },
             .enum_literal => return self.fail(.enum_needs_type, node, null),
             .unwrap => return self.propagate(node, expected, depth),
             .match => return self.matchExpression(node, expected, hint, depth),
@@ -3580,7 +3674,16 @@ const Context = struct {
                 return self.finishCall(node, data.rhs, ty.function.result, expected);
             },
             .array_init, .array_init_comma, .array_init_two, .array_init_two_comma => {
-                const want = hint orelse return self.fail(.array_literal_needs_type, node, null);
+                const want = hint orelse {
+                    var buffer: [2]Ast.Node.Index = undefined;
+                    for (self.arrayElements(node, &buffer)) |element| {
+                        if (ast.nodes.items(.tag)[element] == .ref_of) return self.fail(.unsupported_borrow, element, null);
+                        if (try self.probe(element, depth + 1)) |known| {
+                            if (self.ir.getType(known.ty).? == .reference) return self.fail(.unsupported_borrow, element, null);
+                        }
+                    }
+                    return self.fail(.array_literal_needs_type, node, null);
+                };
                 const array = self.ir.getType(want.ty).?;
                 if (array != .array) return self.fail(.expression_type_mismatch, node, want.annotation);
                 var buffer: [2]Ast.Node.Index = undefined;
@@ -3624,6 +3727,7 @@ const Context = struct {
             .identifier, .container_field => {
                 const name = self.module.sourceSlice(self.span(node)).?;
                 if (try self.captureBinding(name, node)) |binding| {
+                    if (binding.borrowed) return self.fail(.unsupported_borrow, node, binding.name_span);
                     if (self.reservedOrigin(binding.name_span)) |origin| return self.fail(.borrow_conflict, node, origin);
 
                     return self.fit(binding.known.ty, expected, node);
@@ -3759,12 +3863,22 @@ const Context = struct {
             .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod => {
                 if (ast.nodes.items(.tag)[data.lhs] == .field_access) return self.fieldAssignment(node, expected, depth);
                 if (ast.nodes.items(.tag)[data.lhs] == .array_access) return self.elementAssignment(node, expected, depth);
-                if (ast.nodes.items(.tag)[data.lhs] != .identifier) return self.fail(.unsupported_assignment_target, data.lhs, null);
+                const dereferenced = ast.nodes.items(.tag)[data.lhs] == .deref;
+                if (!dereferenced and ast.nodes.items(.tag)[data.lhs] != .identifier) return self.fail(.unsupported_assignment_target, data.lhs, null);
                 const name = self.module.sourceSlice(self.span(data.lhs)).?;
-                const binding = (try self.captureBinding(name, node)) orelse {
+                const binding = (if (dereferenced) try self.dereferenceBinding(data.lhs) else try self.captureBinding(name, node)) orelse {
                     if (self.module.lookup(name)) |id| return self.fail(.immutable_assignment, data.lhs, self.module.getDeclaration(id).?.name_span);
                     return self.fail(.unknown_name, data.lhs, null);
                 };
+                if (binding.borrowed and !dereferenced) {
+                    if (!binding.mutable) return self.fail(.immutable_assignment, data.lhs, binding.name_span);
+                    if (binding.region != self.region or ast.nodes.items(.tag)[node] != .assign or ast.nodes.items(.tag)[data.rhs] != .ref_of)
+                        return self.fail(.unsupported_borrow, node, binding.name_span);
+                    if (!try self.borrowNamed(data.rhs, binding.known.ty, binding.mutable, name, binding.name_span, depth)) return null;
+                    const unit = try self.ir.internType(.void);
+                    if (!self.terminated) if (self.emitter) |emitter| try emitter.record(node, unit, self.irSpan(node), .{ .constant = try self.ir.internConstant(.{ .ty = unit, .value = .void }) });
+                    return self.fit(unit, expected, node);
+                }
                 if (self.mutationOrigin(binding)) |origin| return self.fail(.borrow_conflict, data.lhs, origin);
 
                 const reservation: Reservation = .{ .owner = if (binding.loan_owner) |loan| loan.owner else binding.name_span, .origin = if (binding.loan_owner) |loan| loan.origin else self.irSpan(node), .parent = self.reservation };
@@ -4115,20 +4229,20 @@ test "float bodies defaults contextual literals control flow mutations and print
         \\local*=2
         \\local/=3
         \\let loan=&local
-        \\loan+=1
+        \\loan.* +=1
         \\let mut items:[]f32=[1,2]
         \\items[0]+=2
         \\items[0]-=1
         \\items[0]*=2
         \\items[0]/=3
-        \\loop &item in items {item+=0.5}
+        \\loop &item in items {item.* +=0.5}
         \\let mut record=Record[]
         \\record.value+=2
         \\record.value-=1
         \\record.value*=2
         \\record.value/=3
         \\let r=&record
-        \\r.value+=1
+        \\r.*.value+=1
         \\@assert(narrow==1)
         \\@assert(narrow!=1)
         \\@assert(1<2.5)
@@ -5366,9 +5480,9 @@ fn testTypeOfLexicalValues(allocator: std.mem.Allocator) !void {
         \\let f2:@TypeOf(f)=f
         \\let b:Box(@TypeOf(p))=Box(@TypeOf(p))[.value=p]
         \\let borrowed=&m
-        \\let inspect=(){let x:@TypeOf(borrowed)=3
+        \\let inspect=(){let x:@TypeOf(m)=3
         \\@println(@TypeOf(m),"{@TypeOf(borrowed)}")}
-        \\let generic:(v:`T)->`T={let x:@TypeOf(borrowed)=3
+        \\let generic:(v:`T)->`T={let x:@TypeOf(m)=3
         \\let same:@TypeOf(v)=v
         \\same}
         \\inspect()
@@ -6018,8 +6132,8 @@ test "membership rejects inexact types widening nonscalar elements and nonboolea
         .{ .source = "let f: () -> bool = {} in []", .tag = .operator_not_supported },
         .{ .source = "let f: (a: []int) -> bool = missing in a", .tag = .unknown_name },
         .{ .source = "let f: (n: int) -> bool = n in missing", .tag = .unknown_name },
-        .{ .source = "let f: () = {let mut a:[]int=[1]\nlet r=&a\n@println(1 in a)\nr[0]=2}", .tag = .borrow_conflict },
-        .{ .source = "let f: () = {let mut a:[]int=[1]\nloop &x in a {@println(1 in a)\nx=2}}", .tag = .borrow_conflict },
+        .{ .source = "let f: () = {let mut a:[]int=[1]\nlet r=&a\n@println(1 in a)\nr.*[0]=2}", .tag = .borrow_conflict },
+        .{ .source = "let f: () = {let mut a:[]int=[1]\nloop &x in a {@println(1 in a)\nx.* =2}}", .tag = .borrow_conflict },
     }) |case| {
         var module = try Module.init(std.testing.allocator, "membership-error.nov", case.source);
         defer module.deinit();
@@ -6146,7 +6260,7 @@ test "string scalar indexing has exact rune inference through contexts construct
         \\        false=>'ÿ'}
         \\    let looped=loop {break s[0]}
         \\    let alias=&s
-        \\    @assert(b and alias[0]=='\0' or s[-1]=='ÿ')
+        \\    @assert(b and alias.*[0]=='\0' or s[-1]=='ÿ')
         \\    @assert(text()[0]=='é')
         \\    @assert(text()[1]=='\0')
         \\    @assert(text()[2]=='z')
@@ -6209,7 +6323,7 @@ test "string slicing semantic types inference and rejection" {
         \\}
         \\let U=union{text:string,}
         \\let f:(s:string,b:bool)->string={let alias=&s
-        \\    let view=alias[..=-1]
+        \\    let view=alias.*[..=-1]
         \\    let a=[view,s[1..]]
         \\    let u:U=.text[s[..1]]
         \\    let chosen=if b {s[..]}else{view}
@@ -6371,7 +6485,7 @@ test "string scalar indexing terminal base and index operands skip unreachable o
 fn testStringByteAllocationFailures(allocator: std.mem.Allocator) !void {
     var module = try Module.init(allocator, "string-byte-oom.nov",
         \\let f:(s:string,a:[]string)->rune={let alias=&s
-        \\    let values=['\0',alias[-1],a[0][1]]
+        \\    let values=['\0',alias.*[-1],a[0][1]]
         \\    values[0]}
     );
     defer module.deinit();
@@ -6389,7 +6503,7 @@ test "string scalar indexing cleans up every allocation failure" {
 test "string scalar elements remain immutable through mutable bindings and whole string borrows" {
     for ([_][]const u8{ "=", "+=", "-=", "*=", "/=", "%=" }) |op| {
         for ([_][]const u8{ "let s=\"a\"", "let mut s=\"a\"", "let mut owner=\"a\"\nlet s=&owner" }) |binding| {
-            const source = try std.fmt.allocPrint(std.testing.allocator, "let f:()={{{s}\ns[0]{s}1}}", .{ binding, op });
+            const source = try std.fmt.allocPrint(std.testing.allocator, "let f:()={{{s}\ns{s}[0]{s}1}}", .{ binding, if (std.mem.indexOf(u8, binding, "&owner") != null) ".*" else "", op });
             defer std.testing.allocator.free(source);
             var module = try Module.init(std.testing.allocator, "string-byte-mutation.nov", source);
             defer module.deinit();
@@ -6458,7 +6572,7 @@ test "managed arrays reject unsupported payloads nominal mismatches and record m
         "let f:(a:[]()->int)=@println(a[0])",
         "let f:()={let r=0..1\nlet a=[r]\n@println(a[0])}",
         "let f:(a:[]type)={}",
-        "let f:(a:[]*int)={}",
+        "let f:(a:[]&int)={}",
         "let f:(n:int)->bool={let a=n..n\na in [a]}",
         "let E=enum{a,b,}\nlet F=enum{a,b,}\nlet f:(a:E,b:F)->bool=a in [b]",
         "let E=enum{a,b,}\nlet F=enum{a,b,}\nlet f:(a:E,b:F)->bool=a==b",
@@ -7220,8 +7334,8 @@ test "rune frontend supports scalar boundaries matches printing and borrows" {
         "let Rune = rune\nlet identity: (x: Rune) -> Rune = x\nlet f: () -> rune = {let callback: (rune) -> rune = identity\nlet value = 'é'\ncallback(@as(Rune, value))}",
         "let R = struct{value: rune = 'é',}\nlet U = union{value: rune,}\nlet f: () -> rune = {let r = R[]\nlet u: U = .value[r.value]\nmatch u {.value => |v| v}}",
         "let f: (r: rune) -> rune = match r {'é' | '\\xE9' => '😀'\n_ => r}",
-        "let f: () -> bool = {let mut r = 'a'\nr = 'é'\nlet b = &r\nb = '😀'\nb == '😀'}",
-        "let f: () -> rune = {let mut xs: []rune = ['a', 'é']\nxs[0] = '😀'\nlet b = &xs[1]\nb = '\\0'\nb}",
+        "let f: () -> bool = {let mut r = 'a'\nr = 'é'\nlet b = &r\nb.* = '😀'\nb.* == '😀'}",
+        "let f: () -> rune = {let mut xs: []rune = ['a', 'é']\nxs[0] = '😀'\nlet b = &xs[1]\nb.* = '\\0'\nb.*}",
         "let f: () -> rune = {let xs = ['é', '😀']\nxs[0]}",
         "let f: (r: rune) -> string = {let value = '😀'\n@println(r, value, '\\xE9')\n\"{r}:{value}\"}",
         "let f: () -> bool = 'é' != '😀'",
@@ -7529,10 +7643,10 @@ test "body checking rolls back diagnostics and owned storage on allocation failu
 
 test "iteration record loans respect owner mutability and reject capability escapes" {
     for ([_]struct { body: []const u8, tag: ?Module.Diagnostic.Tag = null }{
-        .{ .body = "let mut a=[R[.inner=Cell[.n=1,.s=\"x\"]]]\nloop &r in a {r.inner.n+=2\nr.inner.s+=\"!\"\nr.inner=Cell[.n=3,.s=\"new\"]\nr=R[.inner=Cell[.n=4,.s=\"row\"]]}" },
-        .{ .body = "let a=[R[.inner=Cell[.n=1,.s=\"x\"]]]\nloop &r in a {r.inner.n+=2}", .tag = .immutable_assignment },
+        .{ .body = "let mut a=[R[.inner=Cell[.n=1,.s=\"x\"]]]\nloop &r in a {r.*.inner.n+=2\nr.*.inner.s+=\"!\"\nr.*.inner=Cell[.n=3,.s=\"new\"]\nr.* =R[.inner=Cell[.n=4,.s=\"row\"]]}" },
+        .{ .body = "let a=[R[.inner=Cell[.n=1,.s=\"x\"]]]\nloop &r in a {r.*.inner.n+=2}", .tag = .immutable_assignment },
         .{ .body = "let mut a=[R[.inner=Cell[.n=1,.s=\"x\"]]]\nloop r in a {r.inner.n=2}", .tag = .immutable_assignment },
-        .{ .body = "let a=[R[.inner=Cell[.n=1,.s=\"x\"]]]\nloop &r in a {let copy=r\n@println(copy.inner.n)}" },
+        .{ .body = "let a=[R[.inner=Cell[.n=1,.s=\"x\"]]]\nloop &r in a {let copy=r.*\n@println(copy.inner.n)}" },
         .{ .body = "let mut a=[R[.inner=Cell[.n=1,.s=\"x\"]]]\nloop &r in a {return &r}", .tag = .unsupported_borrow },
         .{ .body = "let mut a=[R[.inner=Cell[.n=1,.s=\"x\"]]]\nloop &r in a {let escaped=[&r]\n}", .tag = .unsupported_borrow },
     }) |case| {
@@ -7561,18 +7675,18 @@ test "iteration validates copies scoped loans source protection and unsupported 
         .{ .body = "let a:[]int=[1,2]\nloop x in a {loop y in a {@println(x,y)}}" },
         .{ .body = "let mut a:[]int=[1]\nlet b=a\nloop x in a {let mut copy=x\ncopy+=1\n@println(copy,b[0])}" },
         .{ .body = "let mut s=\"é😀\"\nloop r in s {let n:rune=r\ns=\"other\"\n@println(n)}" },
-        .{ .body = "let mut a:[]int=[1]\nloop &x in a {x+=1\nlet copy=x\n@println(copy)}\na+=[3]" },
-        .{ .body = "let a:[]int=[1]\nloop &x in a {@println(x)}" },
+        .{ .body = "let mut a:[]int=[1]\nloop &x in a {x.* +=1\nlet copy=x.*\n@println(copy)}\na+=[3]" },
+        .{ .body = "let a:[]int=[1]\nloop &x in a {@println(x.*)}" },
         .{ .body = "let a:[]int=[]\nloop _ in a {} else {}\nloop &x in a {} else {@println(a.len)}" },
-        .{ .body = "let mut a:[]int=[1]\nloop &x in a {x=loop _ in 0..1 {break x+1} else {x}}" },
-        .{ .body = "let mut a:[]int=[1]\nlet r=&a\nloop x in r {@println(x)}" },
+        .{ .body = "let mut a:[]int=[1]\nloop &x in a {x.* =loop _ in 0..1 {break x.*+1} else {x.*}}" },
+        .{ .body = "let mut a:[]int=[1]\nlet r=&a\nloop x in r.* {@println(x)}" },
         .{ .body = "let a:[]int=[1]\nloop x in a {x=2}", .tag = .immutable_assignment },
-        .{ .body = "let a:[]int=[1]\nloop &x in a {x+=2}", .tag = .immutable_assignment },
+        .{ .body = "let a:[]int=[1]\nloop &x in a {x.* +=2}", .tag = .immutable_assignment },
         .{ .body = "let mut a:[]int=[1]\nloop x in a {a[0]=2}", .tag = .borrow_conflict },
         .{ .body = "let mut a:[]int=[1]\nloop x in a {a[0]+=2}", .tag = .borrow_conflict },
         .{ .body = "let mut a:[]int=[1]\nloop x in a {a=[2]}", .tag = .borrow_conflict },
         .{ .body = "let mut a:[]int=[1]\nloop x in a {a+=[2]}", .tag = .borrow_conflict },
-        .{ .body = "let mut a:[]int=[1]\nloop x in a {let r=&a[0]\nr=2}", .tag = .borrow_conflict },
+        .{ .body = "let mut a:[]int=[1]\nloop x in a {let r=&a[0]\nr.* =2}", .tag = .borrow_conflict },
         .{ .body = "let mut a:[]int=[1]\nloop x in a {loop &y in a {}}", .tag = .borrow_conflict },
         .{ .body = "let mut a:[]int=[1]\nloop &x in a {@println(a[0])}", .tag = .borrow_conflict },
         .{ .body = "let mut a:[]int=[1]\nloop &x in a {@println(a.len)}", .tag = .borrow_conflict },
@@ -7581,25 +7695,25 @@ test "iteration validates copies scoped loans source protection and unsupported 
         .{ .body = "let mut a:[]int=[1]\nloop &x in a {let r=&a[0]\n}", .tag = .borrow_conflict },
         .{ .body = "let mut a:[]int=[1]\nloop &x in a {loop y in a {}}", .tag = .borrow_conflict },
         .{ .body = "let mut a:[]int=[1]\nloop &x in a {let r=&x\n}", .tag = .unsupported_borrow },
-        .{ .body = "let mut a:[]int=[1]\nloop &x in a {}\n@println(x)", .tag = .unknown_name },
-        .{ .body = "let mut a:[]int=[1]\nloop &x in a {} else {@println(x)}", .tag = .unknown_name },
+        .{ .body = "let mut a:[]int=[1]\nloop &x in a {}\n@println(x.*)", .tag = .unknown_name },
+        .{ .body = "let mut a:[]int=[1]\nloop &x in a {} else {@println(x.*)}", .tag = .unknown_name },
         .{ .body = "loop &x in [true] {}", .tag = .unsupported_iteration },
         .{ .body = "loop &x in \"é\" {}", .tag = .unsupported_iteration },
         .{ .body = "loop &x in 0..2 {}", .tag = .unsupported_iteration },
-        .{ .body = "let a:[]int=[1]\nlet r=&a\nloop &x in r {}", .tag = .unsupported_iteration },
+        .{ .body = "let a:[]int=[1]\nlet r=&a\nloop &x in r.* {}", .tag = .unsupported_iteration },
         .{ .body = "loop x in true {}", .tag = .unsupported_iteration },
         .{ .body = "loop x in f {}", .tag = .unsupported_iteration },
-        .{ .body = "let mut a:[]int=[1]\nlet r=&a[0]\nloop x in a {r+=1}", .tag = .borrow_conflict },
-        .{ .body = "let mut a:[]int=[1]\nlet r=&a\nloop &x in a {@println(r[0])}", .tag = .borrow_conflict },
-        .{ .body = "let mut a:[]int=[1]\nloop x in a {let r=&x\n@println(r)}" },
-        .{ .body = "let mut a:[]int=[1]\nloop &x in a {let copy=x\n@println(copy)}\nlet r=&a[0]\nr=3" },
-        .{ .body = "let mut a:[]int=[1]\nloop &x in a {x+=1\n@println(a)}", .tag = .borrow_conflict },
+        .{ .body = "let mut a:[]int=[1]\nlet r=&a[0]\nloop x in a {r.* +=1}", .tag = .borrow_conflict },
+        .{ .body = "let mut a:[]int=[1]\nlet r=&a\nloop &x in a {@println(r.*[0])}", .tag = .borrow_conflict },
+        .{ .body = "let mut a:[]int=[1]\nloop x in a {let r=&x\n@println(r.*)}" },
+        .{ .body = "let mut a:[]int=[1]\nloop &x in a {let copy=x.*\n@println(copy)}\nlet r=&a[0]\nr.* =3" },
+        .{ .body = "let mut a:[]int=[1]\nloop &x in a {x.* +=1\n@println(a)}", .tag = .borrow_conflict },
         .{ .body = "loop x in [true] {break true}", .tag = .conditional_value_break },
-        .{ .body = "let mut a:[]int=[1]\nloop x in a {let r=&a\n@println(r)}", .tag = .borrow_conflict },
+        .{ .body = "let mut a:[]int=[1]\nloop x in a {let r=&a\n@println(r.*)}", .tag = .borrow_conflict },
         .{ .body = "let mut a:[]int=[1]\nlet mutate=(){a[0]=2}\nloop x in a {mutate()}", .tag = .borrow_conflict },
         .{ .body = "let mut a:[]int=[1]\nloop x in a {let mutate=(){a=[2]}\nmutate()}", .tag = .borrow_conflict },
         .{ .body = "let mut a:[]int=[1]\nlet mutate=(){a+=[2]}\nlet hidden=(){mutate()}\nloop x in a {hidden()}", .tag = .borrow_conflict },
-        .{ .body = "let mut a:[]int=[1]\nlet r=&a[0]\nloop x in a {@println(x)}\nr=2", .tag = .borrow_conflict },
+        .{ .body = "let mut a:[]int=[1]\nlet r=&a[0]\nloop x in a {@println(x)}\nr.* =2", .tag = .borrow_conflict },
         .{ .body = "let mut a:[]int=[1]\nlet b=a\nloop x in a {let mut copy=b\ncopy[0]=2\n@println(a[0],x)}" },
         .{ .body = "let a:[]int=[1]\nloop x in a {let read=()->int {a[0]}\n@println(read(),x)}" },
     };
@@ -7643,7 +7757,7 @@ const iteration_call_prelude =
     \\let invoke:(cb:())=cb()
     \\let main:()={let mut a:[]int=[1,2,3]
     \\    let mutate=(){let loan=&a[1]
-    \\        loan=9}
+    \\        loan.* =9}
     \\    let r=R[]
     \\    let g=G(int)[.value=0]
     \\
@@ -7703,17 +7817,17 @@ test "iteration call protection uses final boxing across backedges and child bod
         \\
     ;
     for ([_]struct { call: []const u8, capture: []const u8 }{
-        .{ .call = "f()", .capture = "f=(){let loan=&a[2]\nloan=9}" },
-        .{ .call = "r.invoke(f)", .capture = "f=(){let loan=&a[2]\nloan=9}" },
-        .{ .call = "g.invoke(f)", .capture = "f=(){let loan=&a[2]\nloan=9}" },
-        .{ .call = "f |> invoke", .capture = "f=(){let loan=&a[2]\nloan=9}" },
-        .{ .call = "let call=R.invoke\ncall(r,f)", .capture = "f=(){let loan=&a[2]\nloan=9}" },
-        .{ .call = "loop _ in 0..1 {r.invoke(f)}", .capture = "loop _ in 0..1 {f=(){let loan=&a[2]\nloan=9}}" },
-        .{ .call = "f()", .capture = "f=(){let change=(){let loan=&a[2]\nloan=9}\nchange()}" },
-        .{ .call = "@print(r)", .capture = "f=(){let loan=&a[2]\nloan=9}" },
-        .{ .call = "let text=\"{r}\"", .capture = "f=(){let loan=&a[2]\nloan=9}" },
-        .{ .call = "@print([r])", .capture = "f=(){let loan=&a[2]\nloan=9}" },
-        .{ .call = "let text=\"{[r]}\"", .capture = "f=(){let loan=&a[2]\nloan=9}" },
+        .{ .call = "f()", .capture = "f=(){let loan=&a[2]\nloan.* =9}" },
+        .{ .call = "r.invoke(f)", .capture = "f=(){let loan=&a[2]\nloan.* =9}" },
+        .{ .call = "g.invoke(f)", .capture = "f=(){let loan=&a[2]\nloan.* =9}" },
+        .{ .call = "f |> invoke", .capture = "f=(){let loan=&a[2]\nloan.* =9}" },
+        .{ .call = "let call=R.invoke\ncall(r,f)", .capture = "f=(){let loan=&a[2]\nloan.* =9}" },
+        .{ .call = "loop _ in 0..1 {r.invoke(f)}", .capture = "loop _ in 0..1 {f=(){let loan=&a[2]\nloan.* =9}}" },
+        .{ .call = "f()", .capture = "f=(){let change=(){let loan=&a[2]\nloan.* =9}\nchange()}" },
+        .{ .call = "@print(r)", .capture = "f=(){let loan=&a[2]\nloan.* =9}" },
+        .{ .call = "let text=\"{r}\"", .capture = "f=(){let loan=&a[2]\nloan.* =9}" },
+        .{ .call = "@print([r])", .capture = "f=(){let loan=&a[2]\nloan.* =9}" },
+        .{ .call = "let text=\"{[r]}\"", .capture = "f=(){let loan=&a[2]\nloan.* =9}" },
     }) |case| {
         const body = try std.fmt.allocPrint(
             std.testing.allocator,
@@ -7740,7 +7854,7 @@ test "iteration call protection retains spans and slots after loop scope restora
         \\    loop _ in 0..2 {loop x in a {f()
         \\        @print(x)}
         \\        f=(){let loan=&a[2]
-        \\            loan=9}}
+        \\            loan.* =9}}
         \\}
     ;
     try testIterationCallProtection(std.testing.allocator, source);
@@ -7798,30 +7912,30 @@ test "reusable range values preserve exact inference and reject unsupported valu
 
 test "assert borrow CFG preserves branch loop continuation and fallback boundaries" {
     for ([_]struct { body: []const u8, conflict: bool = false }{
-        .{ .body = "loop {@println(r)\nn=1\n@assert(true)}", .conflict = true },
-        .{ .body = "loop {@println(r)\nn=1\n@assert(false)}", .conflict = true },
-        .{ .body = "if flag {n=1\n@assert(true)} else {@println(r)}" },
-        .{ .body = "if flag {@println(r)} else {n=1\n@assert(true)}" },
-        .{ .body = "if flag {n=1\n@assert(false)} else {@println(r)}" },
-        .{ .body = "if flag {n=1\n@assert(true)} else {@assert(true)}\n@println(r)", .conflict = true },
-        .{ .body = "loop flag {@println(r)\nn=1\n@assert(true)}", .conflict = true },
-        .{ .body = "loop flag : @assert(true) {@println(r)\nn=1}", .conflict = true },
-        .{ .body = "loop flag : @println(r) {n=1\n@assert(true)}", .conflict = true },
-        .{ .body = "loop {@println(r)\nif flag {n=1\n@assert(true)} else {continue}}", .conflict = true },
-        .{ .body = "loop {if flag {loop {break}\n@println(r)\nn=1\n@assert(true)} else {continue}}", .conflict = true },
-        .{ .body = "if flag {loop false {} else {n=1\n@assert(true)}} else {@println(r)}" },
-        .{ .body = "loop false {} else {n=1\n@assert(true)}\n@println(r)", .conflict = true },
-        .{ .body = "loop false {} else {@println(r)\n@assert(true)}\nn=1" },
-        .{ .body = "@assert(r==0,{n=1\n\"snapshot\"})" },
-        .{ .body = "@assert(false,{n=1\n\"{r}\"})", .conflict = true },
-        .{ .body = "@assert(true,{n=1\n\"{r}\"})", .conflict = true },
-        .{ .body = "@assert(false,\"{r}\")\nn=1" },
-        .{ .body = "@assert(true)\nn=1\n@println(r)", .conflict = true },
-        .{ .body = "@assert(false)\nn=1\n@println(r)", .conflict = true },
-        .{ .body = "if flag {n=1\n@assert(true,{return})} else {@println(r)}" },
+        .{ .body = "loop {@println(r.*)\nn=1\n@assert(true)}", .conflict = true },
+        .{ .body = "loop {@println(r.*)\nn=1\n@assert(false)}", .conflict = true },
+        .{ .body = "if flag {n=1\n@assert(true)} else {@println(r.*)}" },
+        .{ .body = "if flag {@println(r.*)} else {n=1\n@assert(true)}" },
+        .{ .body = "if flag {n=1\n@assert(false)} else {@println(r.*)}" },
+        .{ .body = "if flag {n=1\n@assert(true)} else {@assert(true)}\n@println(r.*)", .conflict = true },
+        .{ .body = "loop flag {@println(r.*)\nn=1\n@assert(true)}", .conflict = true },
+        .{ .body = "loop flag : @assert(true) {@println(r.*)\nn=1}", .conflict = true },
+        .{ .body = "loop flag : @println(r.*) {n=1\n@assert(true)}", .conflict = true },
+        .{ .body = "loop {@println(r.*)\nif flag {n=1\n@assert(true)} else {continue}}", .conflict = true },
+        .{ .body = "loop {if flag {loop {break}\n@println(r.*)\nn=1\n@assert(true)} else {continue}}", .conflict = true },
+        .{ .body = "if flag {loop false {} else {n=1\n@assert(true)}} else {@println(r.*)}" },
+        .{ .body = "loop false {} else {n=1\n@assert(true)}\n@println(r.*)", .conflict = true },
+        .{ .body = "loop false {} else {@println(r.*)\n@assert(true)}\nn=1" },
+        .{ .body = "@assert(r.* == 0,{n=1\n\"snapshot\"})" },
+        .{ .body = "@assert(false,{n=1\n\"{r.*}\"})", .conflict = true },
+        .{ .body = "@assert(true,{n=1\n\"{r.*}\"})", .conflict = true },
+        .{ .body = "@assert(false,\"{r.*}\")\nn=1" },
+        .{ .body = "@assert(true)\nn=1\n@println(r.*)", .conflict = true },
+        .{ .body = "@assert(false)\nn=1\n@println(r.*)", .conflict = true },
+        .{ .body = "if flag {n=1\n@assert(true,{return})} else {@println(r.*)}" },
     }) |case| try testAssertBorrowCfg(std.testing.allocator, case.body, case.conflict);
-    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAssertBorrowCfg, .{ "loop {@println(r)\nn=1\n@assert(true)}", true });
-    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAssertBorrowCfg, .{ "if flag {n=1\n@assert(true)} else {@println(r)}", false });
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAssertBorrowCfg, .{ "loop {@println(r.*)\nn=1\n@assert(true)}", true });
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAssertBorrowCfg, .{ "if flag {n=1\n@assert(true)} else {@println(r.*)}", false });
 }
 
 fn testAssertBorrowCfg(allocator: std.mem.Allocator, body: []const u8, conflict: bool) !void {
@@ -7848,48 +7962,48 @@ fn testAssertBorrowCfg(allocator: std.mem.Allocator, body: []const u8, conflict:
 test "static integer borrowing types CFG last use and bounded escapes" {
     const Case = struct { body: []const u8, diagnostic: ?Module.Diagnostic.Tag = null };
     for ([_]Case{
-        .{ .body = "let y=&x; y+=1; y-=1; y*=2; y/=2; y%=2; @println(x)" },
-        .{ .body = "let earlier=x; let y=&x; y+=1; @println(earlier,x); x=5" },
-        .{ .body = "let y=&x; if flag {y+=1} else {@println(x)}; x=3" },
-        .{ .body = "if flag {let y=&x; y+=1} else {let z=&x; z*=2}; @println(x)" },
-        .{ .body = "let y=&x; loop flag {y+=1}; @println(x)" },
-        .{ .body = "let y=&x; loop {y+=1; @println(x); break}; x=2" },
-        .{ .body = "loop i in @as(int,0)..3 {let y=&x; y+=i; @println(x)}" },
-        .{ .body = "let y=&x; loop {if flag {y+=1; break} else {@println(x); return}}; @println(x)" },
-        .{ .body = "let y=&x; let b=flag and {y+=1; true}; @println(x,b)" },
-        .{ .body = "let y=&x; let b=flag and {x=5; return}; y+=1; @println(b,x)" },
-        .{ .body = "let y=&x; y+={return}" },
-        .{ .body = "let y=&x; y+={@panic(\"stop\")}" },
-        .{ .body = "let r=&a[0]; let y=&x; y+=1; r.n+=2; @println(x,a[0].n)" },
-        .{ .body = "let y=&x; y+={let r=&a[0]; r.n+=1; 2}; @println(x,a[0].n)" },
-        .{ .body = "let y=&x; @println(x); y+=1", .diagnostic = .borrow_conflict },
-        .{ .body = "let y=&x; x=5; y+=1", .diagnostic = .borrow_conflict },
-        .{ .body = "let y=&x; let z=&x; z+=1; y+=1", .diagnostic = .borrow_conflict },
-        .{ .body = "let y=&x; y+={x=5; 1}", .diagnostic = .borrow_conflict },
-        .{ .body = "let y=&x; y+={x=5; return}", .diagnostic = .borrow_conflict },
-        .{ .body = "let y=&x; loop {y+={x=5; break}}", .diagnostic = .borrow_conflict },
-        .{ .body = "let y=&x; loop {y+={x=5; continue}}", .diagnostic = .borrow_conflict },
-        .{ .body = "let y=&x; y+={@println(x); @panic(\"stop\")}", .diagnostic = .borrow_conflict },
-        .{ .body = "let y=&x; loop {y+=1; @println(x); if flag {break}}", .diagnostic = .borrow_conflict },
-        .{ .body = "let y=&x; loop {if flag {@println(x); continue} else {y+=1; break}}", .diagnostic = .borrow_conflict },
-        .{ .body = "let y=&x; if flag {y+=1} else {@println(x)}; y+=1", .diagnostic = .borrow_conflict },
-        .{ .body = "let y=&x; let b=flag and {x=5; true}; y+=1; @println(b)", .diagnostic = .borrow_conflict },
-        .{ .body = "let y=&x; loop x==1 {y+=1}", .diagnostic = .borrow_conflict },
-        .{ .body = "let y=&x; loop flag : @println(x) {y+=1}", .diagnostic = .borrow_conflict },
-        .{ .body = "let y=&x; y+={let z=&x; z+=1; 1}", .diagnostic = .borrow_conflict },
-        .{ .body = "let y=&x; y+=y" },
-        .{ .body = "let y=&x; y=1" },
-        .{ .body = "let y=&x; let z=y" },
-        .{ .body = "let y=&x; @println(y)" },
-        .{ .body = "let y=&x; return y", .diagnostic = .expression_type_mismatch },
+        .{ .body = "let y=&x; y.* +=1; y.* -=1; y.* *=2; y.* /=2; y.* %=2; @println(x)" },
+        .{ .body = "let earlier=x; let y=&x; y.* +=1; @println(earlier,x); x=5" },
+        .{ .body = "let y=&x; if flag {y.* +=1} else {@println(x)}; x=3" },
+        .{ .body = "if flag {let y=&x; y.* +=1} else {let z=&x; z.* *=2}; @println(x)" },
+        .{ .body = "let y=&x; loop flag {y.* +=1}; @println(x)" },
+        .{ .body = "let y=&x; loop {y.* +=1; @println(x); break}; x=2" },
+        .{ .body = "loop i in @as(int,0)..3 {let y=&x; y.* +=i; @println(x)}" },
+        .{ .body = "let y=&x; loop {if flag {y.* +=1; break} else {@println(x); return}}; @println(x)" },
+        .{ .body = "let y=&x; let b=flag and {y.* +=1; true}; @println(x,b)" },
+        .{ .body = "let y=&x; let b=flag and {x=5; return}; y.* +=1; @println(b,x)" },
+        .{ .body = "let y=&x; y.* +={return}" },
+        .{ .body = "let y=&x; y.* +={@panic(\"stop\")}" },
+        .{ .body = "let r=&a[0]; let y=&x; y.* +=1; r.*.n+=2; @println(x,a[0].n)" },
+        .{ .body = "let y=&x; y.* +={let r=&a[0]; r.*.n+=1; 2}; @println(x,a[0].n)" },
+        .{ .body = "let y=&x; @println(x); y.* +=1", .diagnostic = .borrow_conflict },
+        .{ .body = "let y=&x; x=5; y.* +=1", .diagnostic = .borrow_conflict },
+        .{ .body = "let y=&x; let z=&x; z.* +=1; y.* +=1", .diagnostic = .borrow_conflict },
+        .{ .body = "let y=&x; y.* +={x=5; 1}", .diagnostic = .borrow_conflict },
+        .{ .body = "let y=&x; y.* +={x=5; return}", .diagnostic = .borrow_conflict },
+        .{ .body = "let y=&x; loop {y.* +={x=5; break}}", .diagnostic = .borrow_conflict },
+        .{ .body = "let y=&x; loop {y.* +={x=5; continue}}", .diagnostic = .borrow_conflict },
+        .{ .body = "let y=&x; y.* +={@println(x); @panic(\"stop\")}", .diagnostic = .borrow_conflict },
+        .{ .body = "let y=&x; loop {y.* +=1; @println(x); if flag {break}}", .diagnostic = .borrow_conflict },
+        .{ .body = "let y=&x; loop {if flag {@println(x); continue} else {y.* +=1; break}}", .diagnostic = .borrow_conflict },
+        .{ .body = "let y=&x; if flag {y.* +=1} else {@println(x)}; y.* +=1", .diagnostic = .borrow_conflict },
+        .{ .body = "let y=&x; let b=flag and {x=5; true}; y.* +=1; @println(b)", .diagnostic = .borrow_conflict },
+        .{ .body = "let y=&x; loop x==1 {y.* +=1}", .diagnostic = .borrow_conflict },
+        .{ .body = "let y=&x; loop flag : @println(x) {y.* +=1}", .diagnostic = .borrow_conflict },
+        .{ .body = "let y=&x; y.* +={let z=&x; z.* +=1; 1}", .diagnostic = .borrow_conflict },
+        .{ .body = "let y=&x; y.* +=y.*" },
+        .{ .body = "let y=&x; y.* =1" },
+        .{ .body = "let y=&x; let z=y.*" },
+        .{ .body = "let y=&x; @println(y.*)" },
+        .{ .body = "let y=&x; return y.*", .diagnostic = .expression_type_mismatch },
         .{ .body = "let y=&x; let z=&y", .diagnostic = .unsupported_borrow },
-        .{ .body = "let mut y=&x", .diagnostic = .unsupported_borrow },
-        .{ .body = "let y:int=&x", .diagnostic = .unsupported_borrow },
+        .{ .body = "let mut y=&x" },
+        .{ .body = "let y:int=&x", .diagnostic = .expression_type_mismatch },
         .{ .body = "let fixed:int=1; let y=&fixed" },
         .{ .body = "let mut b=true; let y=&b" },
         .{ .body = "let y=&a" },
-        .{ .body = "let y=&x; y.n+=1", .diagnostic = .unsupported_assignment_target },
-        .{ .body = "let y=&x; y+=@as(i8,1)", .diagnostic = .expression_type_mismatch },
+        .{ .body = "let y=&x; y.*.n+=1", .diagnostic = .unsupported_assignment_target },
+        .{ .body = "let y=&x; y.* +=@as(i8,1)", .diagnostic = .expression_type_mismatch },
     }) |case| {
         const text = try std.testing.allocator.dupe(u8, case.body);
         defer std.testing.allocator.free(text);
@@ -7918,7 +8032,7 @@ test "static integer borrowing types CFG last use and bounded escapes" {
         }
     }
     for ([_][]const u8{ "u8", "u16", "u32", "u64", "u128", "i8", "i16", "i32", "i64", "i128", "uint", "int" }) |name| {
-        const source = try std.fmt.allocPrint(std.testing.allocator, "let f:()={{let mut x:{s}=1\nlet y=&x\ny+=1\ny-=1\ny*=2\ny/=2\ny%=2\n@println(x)}}", .{name});
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let f:()={{let mut x:{s}=1\nlet y=&x\ny.* +=1\ny.* -=1\ny.* *=2\ny.* /=2\ny.* %=2\n@println(x)}}", .{name});
         defer std.testing.allocator.free(source);
         var module = try Module.init(std.testing.allocator, "integer-width-borrow.nov", source);
         defer module.deinit();
@@ -7934,50 +8048,50 @@ test "static integer borrowing types CFG last use and bounded escapes" {
 test "static borrowing structured last use conflicts and bounded escapes" {
     const Case = struct { body: []const u8, diagnostic: ?Module.Diagnostic.Tag = null };
     for ([_]Case{
-        .{ .body = "let r=&a[0]; r.x+=1; @println(a.len,a[0].x)" },
-        .{ .body = "let r=&a[0]; if flag {r.x+=1} else {@println(a.len)}; @println(a.len)" },
-        .{ .body = "if flag {let r=&a[0]; r.x=1} else {let s=&a[0]; s.x=2}; @println(a.len)" },
-        .{ .body = "loop i in 0..3 {let r=&a[0]; r.x+=1; @println(i,a.len)}" },
-        .{ .body = "let r=&a[0]; loop {r.x+=1; break}; @println(a.len)" },
-        .{ .body = "let r=&a[0]; loop {if flag {r.x+=1; break} else {@println(a.len); return}}; @println(a.len)" },
-        .{ .body = "let r=&a[0]; let independent=[R[]]; let copy=independent; r.x=copy[0].x" },
-        .{ .body = "let r=&a[0]; loop flag {r.x+=1; @println(a.len); break}; @println(a.len)" },
-        .{ .body = "let r=&a[0]; loop flag {if flag {r.x+=1; @println(a.len); break} else {return}}" },
-        .{ .body = "let r=&a[0]; loop flag {r.x+=1}; @println(a.len)" },
-        .{ .body = "let r=&a[0]; let n:int={loop {r.x+=1; break}; @println(a.len); 1}; @println(n)" },
-        .{ .body = "let r=&a[0]; loop {r.x+=1; loop {break}; @println(a.len); break}" },
-        .{ .body = "let r=&a[0]; if flag {r.x+=1} else {@println(a.len)}; r.x+=1", .diagnostic = .borrow_conflict },
-        .{ .body = "let r=&a[0]; loop {r.x+=1; loop {@println(a.len); break}; if flag {break}}", .diagnostic = .borrow_conflict },
-        .{ .body = "let r=&a[0]; loop {a.len==1} {r.x+=1}", .diagnostic = .borrow_conflict },
-        .{ .body = "let r=&a[0]; loop flag : @println(a.len) {r.x+=1}", .diagnostic = .borrow_conflict },
-        .{ .body = "let r=&a[0]; let b=flag and {a=[R[]]; return}; r.x=1; @println(b)" },
-        .{ .body = "let r=&a[0]; let b=flag and {r.x=1; true}; @println(a.len,b)" },
-        .{ .body = "let r=&a[0]; match flag {true=>r.x=1; false=>@println(a.len)}; @println(a.len)" },
-        .{ .body = "let r=&a[0]; match flag {true=>r.x=1; false=>@println(a.len)}; r.x=2", .diagnostic = .borrow_conflict },
-        .{ .body = "let r=&a[0]; return r", .diagnostic = .expression_type_mismatch },
-        .{ .body = "let r=&a[0]; @println(a.len); r.x=1", .diagnostic = .borrow_conflict },
-        .{ .body = "let r=&a[0]; let b=a; r.x=1", .diagnostic = .borrow_conflict },
-        .{ .body = "let r=&a[0]; a=[R[]]; r.x=1", .diagnostic = .borrow_conflict },
-        .{ .body = "let r=&a[0]; a+=[R[]]; r.x=1", .diagnostic = .borrow_conflict },
-        .{ .body = "let r=&a[0]; a[0]=R[]; r.x=1", .diagnostic = .borrow_conflict },
-        .{ .body = "let r=&a[0]; let s=&a[-1]; r.x=1; s.x=2", .diagnostic = .borrow_conflict },
-        .{ .body = "let r=&a[0]; r.x+={a=[R[]]; 1}", .diagnostic = .borrow_conflict },
-        .{ .body = "let r=&a[0]; r.x={a=[R[]]; 1}", .diagnostic = .borrow_conflict },
-        .{ .body = "let r=&a[{a=[R[]]; 0}]; r.x=1", .diagnostic = .borrow_conflict },
-        .{ .body = "let r=&a[{a=[R[]]; return}]; r.x=1", .diagnostic = .borrow_conflict },
-        .{ .body = "let r=&a[{@println(a.len); 0}]; r.x=1", .diagnostic = .borrow_conflict },
-        .{ .body = "let r=&a[0]; loop {r.x+=1; @println(a.len); if flag {break}}", .diagnostic = .borrow_conflict },
-        .{ .body = "let r=&a[0]; loop {r.x+=1; if flag {@println(a.len); continue} else {break}}", .diagnostic = .borrow_conflict },
-        .{ .body = "let r=&a[0]; loop {if flag {@println(a.len); continue} else {r.x+=1; break}}", .diagnostic = .borrow_conflict },
-        .{ .body = "let r=&a[0]; let b=flag and {a=[R[]]; true}; r.x=1; @println(b)", .diagnostic = .borrow_conflict },
-        .{ .body = "let r=&a[0]; let alias=r; alias.x=1", .diagnostic = .immutable_assignment },
-        .{ .body = "let r=&a[0]; consume(r)" },
-        .{ .body = "let r=&a[0]; let b:[]R=[r,r]" },
-        .{ .body = "let r=&a[0]; let b={r}" },
+        .{ .body = "let r=&a[0]; r.*.x+=1; @println(a.len,a[0].x)" },
+        .{ .body = "let r=&a[0]; if flag {r.*.x+=1} else {@println(a.len)}; @println(a.len)" },
+        .{ .body = "if flag {let r=&a[0]; r.*.x=1} else {let s=&a[0]; s.*.x=2}; @println(a.len)" },
+        .{ .body = "loop i in 0..3 {let r=&a[0]; r.*.x+=1; @println(i,a.len)}" },
+        .{ .body = "let r=&a[0]; loop {r.*.x+=1; break}; @println(a.len)" },
+        .{ .body = "let r=&a[0]; loop {if flag {r.*.x+=1; break} else {@println(a.len); return}}; @println(a.len)" },
+        .{ .body = "let r=&a[0]; let independent=[R[]]; let copy=independent; r.*.x=copy[0].x" },
+        .{ .body = "let r=&a[0]; loop flag {r.*.x+=1; @println(a.len); break}; @println(a.len)" },
+        .{ .body = "let r=&a[0]; loop flag {if flag {r.*.x+=1; @println(a.len); break} else {return}}" },
+        .{ .body = "let r=&a[0]; loop flag {r.*.x+=1}; @println(a.len)" },
+        .{ .body = "let r=&a[0]; let n:int={loop {r.*.x+=1; break}; @println(a.len); 1}; @println(n)" },
+        .{ .body = "let r=&a[0]; loop {r.*.x+=1; loop {break}; @println(a.len); break}" },
+        .{ .body = "let r=&a[0]; if flag {r.*.x+=1} else {@println(a.len)}; r.*.x+=1", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[0]; loop {r.*.x+=1; loop {@println(a.len); break}; if flag {break}}", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[0]; loop {a.len==1} {r.*.x+=1}", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[0]; loop flag : @println(a.len) {r.*.x+=1}", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[0]; let b=flag and {a=[R[]]; return}; r.*.x=1; @println(b)" },
+        .{ .body = "let r=&a[0]; let b=flag and {r.*.x=1; true}; @println(a.len,b)" },
+        .{ .body = "let r=&a[0]; match flag {true=>r.*.x=1; false=>@println(a.len)}; @println(a.len)" },
+        .{ .body = "let r=&a[0]; match flag {true=>r.*.x=1; false=>@println(a.len)}; r.*.x=2", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[0]; return r.*", .diagnostic = .expression_type_mismatch },
+        .{ .body = "let r=&a[0]; @println(a.len); r.*.x=1", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[0]; let b=a; r.*.x=1", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[0]; a=[R[]]; r.*.x=1", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[0]; a+=[R[]]; r.*.x=1", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[0]; a[0]=R[]; r.*.x=1", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[0]; let s=&a[-1]; r.*.x=1; s.*.x=2", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[0]; r.*.x+={a=[R[]]; 1}", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[0]; r.*.x={a=[R[]]; 1}", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[{a=[R[]]; 0}]; r.*.x=1", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[{a=[R[]]; return}]; r.*.x=1", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[{@println(a.len); 0}]; r.*.x=1", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[0]; loop {r.*.x+=1; @println(a.len); if flag {break}}", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[0]; loop {r.*.x+=1; if flag {@println(a.len); continue} else {break}}", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[0]; loop {if flag {@println(a.len); continue} else {r.*.x+=1; break}}", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[0]; let b=flag and {a=[R[]]; true}; r.*.x=1; @println(b)", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[0]; let alias=r.*; alias.x=1", .diagnostic = .immutable_assignment },
+        .{ .body = "let r=&a[0]; consume(r.*)" },
+        .{ .body = "let r=&a[0]; let b:[]R=[r.*,r.*]" },
+        .{ .body = "let r=&a[0]; let b={r.*}" },
         .{ .body = "let r=&a[0]; let s=&r.x", .diagnostic = .unsupported_borrow },
-        .{ .body = "let r=&a[0]; r=R[]" },
-        .{ .body = "let immutable=[R[]]; let r=&immutable[0]; @println(r.x)" },
-        .{ .body = "let immutable=[R[]]; let r=&immutable[0]; r.x=1", .diagnostic = .immutable_assignment },
+        .{ .body = "let r=&a[0]; r.* =R[]" },
+        .{ .body = "let immutable=[R[]]; let r=&immutable[0]; @println(r.*.x)" },
+        .{ .body = "let immutable=[R[]]; let r=&immutable[0]; r.*.x=1", .diagnostic = .immutable_assignment },
     }) |case| {
         const body_text = try std.testing.allocator.dupe(u8, case.body);
         defer std.testing.allocator.free(body_text);
@@ -8019,13 +8133,13 @@ test "general borrowing readonly parameters exact types conflicts and unsupporte
     }) |case| {
         inline for (0..7) |mode| {
             const body = try std.fmt.allocPrint(std.testing.allocator, switch (mode) {
-                0 => "let r=&x\nlet copy=r\nconsume(r)\nreturn copy",
-                1 => "let r=&x\nr={s}\nreturn x",
-                2 => "let r=&x\nlet copy=x\nconsume(r)\nreturn copy",
-                3 => "let r=&x\nlet s=&x\nconsume(r)\nreturn s",
-                4 => "let mut local=x\nlet r=&local\nr={s}\nreturn local",
-                5 => "let local=x\nlet r=&local\nr={s}\nreturn local",
-                else => "let local=x\nlet r=&local\nlet s=&r\nreturn s",
+                0 => "let r=&x\nlet copy=r.*\nconsume(r.*)\nreturn copy",
+                1 => "let r=&x\nr.* ={s}\nreturn x",
+                2 => "let r=&x\nlet copy=x\nconsume(r.*)\nreturn copy",
+                3 => "let r=&x\nlet s=&x\nconsume(r.*)\nreturn s.*",
+                4 => "let mut local=x\nlet r=&local\nr.* ={s}\nreturn local",
+                5 => "let local=x\nlet r=&local\nr.* ={s}\nreturn local",
+                else => "let local=x\nlet r=&local\nlet s=&r\nreturn s.*",
             }, if (mode == 1 or mode == 4 or mode == 5) .{case.replacement} else .{});
             defer std.testing.allocator.free(body);
             const source = try std.fmt.allocPrint(std.testing.allocator, "let E=enum{{a,b,}}\nlet R=struct{{s:string,}}\nlet U=union{{some:string,none,}}\nlet G:(T:type)->type=union{{some:T,none,}}\nlet inc:(x:int)->int=x+1\nlet consume:(v:{s})={{}}\nlet f:(x:{s})->{s}={{{s}\n}}\nlet entry:()={{let v:{s}={s}\nconsume(f(v))}}", .{ case.ty, case.ty, case.ty, body, case.ty, case.init });
@@ -8058,18 +8172,18 @@ test "general borrowing rejects void nonlocal capabilities wrong exact types and
         .{ .source = "let f:()={let x:void={}\nlet r=&x\n}", .diagnostic = .unsupported_borrow },
         .{ .source = "let f:(x:void)={let r=&x\n}", .diagnostic = .invalid_parameter_type },
         .{ .source = "let x=true\nlet f:()={let r=&x\n}", .diagnostic = .unsupported_borrow },
-        .{ .source = "let f:()={let mut x=true\nlet r=&x\nr=1}", .diagnostic = .literal_type_mismatch },
-        .{ .source = "let f:()={let mut x:int=1\nlet r=&x\nr=@as(i8,2)}", .diagnostic = .expression_type_mismatch },
-        .{ .source = "let R=struct{n:int,}\nlet S=struct{n:int,}\nlet f:()={let mut x=R[.n=1]\nlet r=&x\nr=S[.n=2]}", .diagnostic = .expression_type_mismatch },
-        .{ .source = "let f:()={let mut x=true\nlet r=&x\nr+=true}", .diagnostic = .operator_not_supported },
-        .{ .source = "let f:()={let mut x=\"a\"\nlet r=&x\nr-=\"b\"}", .diagnostic = .operator_not_supported },
-        .{ .source = "let f:()={let x=[true]\nlet r=&x[0]\nr=false}", .diagnostic = .immutable_assignment },
-        .{ .source = "let f:(x:[]string)={let r=&x[0]\nr+=\"b\"}", .diagnostic = .immutable_assignment },
-        .{ .source = "let R=struct{n:int=0,}\nlet f:(x:R)={let r=&x\nr.n=1}", .diagnostic = .immutable_assignment },
-        .{ .source = "let R=struct{n:int=0,}\nlet f:()={let mut x=R[]\nlet r=&x\nx.n=1\n@println(r.n)}", .diagnostic = .borrow_conflict },
-        .{ .source = "let f:(x:bool)={let r=&x\n@println(x)\n@println(r)}", .diagnostic = .borrow_conflict },
-        .{ .source = "let f:()={let x=true\nlet r=&x\n@println(x)\n@println(r)}", .diagnostic = .borrow_conflict },
-        .{ .source = "let f:()={let mut x=[true]\nlet r=&x\nr[0]={x=[false]\nreturn}}", .diagnostic = .borrow_conflict },
+        .{ .source = "let f:()={let mut x=true\nlet r=&x\nr.* =1}", .diagnostic = .literal_type_mismatch },
+        .{ .source = "let f:()={let mut x:int=1\nlet r=&x\nr.* =@as(i8,2)}", .diagnostic = .expression_type_mismatch },
+        .{ .source = "let R=struct{n:int,}\nlet S=struct{n:int,}\nlet f:()={let mut x=R[.n=1]\nlet r=&x\nr.* =S[.n=2]}", .diagnostic = .expression_type_mismatch },
+        .{ .source = "let f:()={let mut x=true\nlet r=&x\nr.* +=true}", .diagnostic = .operator_not_supported },
+        .{ .source = "let f:()={let mut x=\"a\"\nlet r=&x\nr.* -=\"b\"}", .diagnostic = .operator_not_supported },
+        .{ .source = "let f:()={let x=[true]\nlet r=&x[0]\nr.* =false}", .diagnostic = .immutable_assignment },
+        .{ .source = "let f:(x:[]string)={let r=&x[0]\nr.* +=\"b\"}", .diagnostic = .immutable_assignment },
+        .{ .source = "let R=struct{n:int=0,}\nlet f:(x:R)={let r=&x\nr.*.n=1}", .diagnostic = .immutable_assignment },
+        .{ .source = "let R=struct{n:int=0,}\nlet f:()={let mut x=R[]\nlet r=&x\nx.n=1\n@println(r.*.n)}", .diagnostic = .borrow_conflict },
+        .{ .source = "let f:(x:bool)={let r=&x\n@println(x)\n@println(r.*)}", .diagnostic = .borrow_conflict },
+        .{ .source = "let f:()={let x=true\nlet r=&x\n@println(x)\n@println(r.*)}", .diagnostic = .borrow_conflict },
+        .{ .source = "let f:()={let mut x=[true]\nlet r=&x\nr.*[0]={x=[false]\nreturn}}", .diagnostic = .borrow_conflict },
     }) |case| {
         var module = try Module.init(std.testing.allocator, "general-negative.nov", case.source);
         defer module.deinit();
@@ -8081,6 +8195,103 @@ test "general borrowing rejects void nonlocal capabilities wrong exact types and
     }
 }
 
+fn testExplicitLocalReferences(allocator: std.mem.Allocator) !void {
+    const source =
+        \\let R=struct{n:u8=0,let get:(self:R)->u8=self.n
+        \\}
+        \\let f:()={
+        \\let mut a:u8=0
+        \\let mut b:u8=0
+        \\let mut p:&mut u8=&a
+        \\p.* =1
+        \\p=&b
+        \\a=3
+        \\p.* =2
+        \\let readonly:&u8=&a
+        \\let typed:@TypeOf(p)=&b
+        \\@println(readonly.*,typed.*,@TypeOf(p),@TypeOf(readonly))
+        \\let mut record=R[]
+        \\let r=&record
+        \\r.*.n=4
+        \\@println(r.*.get())
+        \\let mut items:[]u8=[1]
+        \\let array=&items
+        \\array.*[0]=2
+        \\loop item in array.* {@println(item)}
+        \\loop &item in items {item.* +=1}
+        \\let callable=()->u8{1}
+        \\let function=&callable
+        \\@println(function.*())
+        \\loop _ in 0..2 {let mut local=&a
+        \\local.* =5
+        \\local=&b
+        \\local.* =6}
+        \\}
+    ;
+    var module = try Module.init(allocator, "explicit-local-references.nov", source);
+    defer module.deinit();
+    errdefer if (module.hasErrors()) std.debug.print("explicit reference parse: {any}\n{any}\n", .{ module.source.ast.errors, module.diagnostics.items });
+    var sema = try Lowering.lower(&module);
+    defer sema.deinit();
+    errdefer if (module.hasErrors()) std.debug.print("explicit references: {any}\n", .{module.diagnostics.items});
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+    var reference_reads: usize = 0;
+    for (sema.ir.functions.items) |function| if (function.body) |body| {
+        for (body.instructions) |instruction| {
+            try std.testing.expect(sema.ir.getType(instruction.ty).? != .reference);
+            if (instruction.op == .borrow_read) reference_reads += 1;
+        }
+    };
+    try std.testing.expect(reference_reads != 0);
+}
+
+test "explicit local references lower child values and rebind without pointer values under OOM" {
+    try testExplicitLocalReferences(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testExplicitLocalReferences, .{});
+}
+
+test "explicit local references reject implicit reads escapes and cross-region rebinding" {
+    for ([_]struct { body: []const u8, tag: Module.Diagnostic.Tag }{
+        .{ .body = "let p=&a; p=&b", .tag = .immutable_assignment },
+        .{ .body = "let p:&u8=&a; p.* =1", .tag = .immutable_assignment },
+        .{ .body = "let fixed:u8=0; let mut p=&fixed; p.* =1", .tag = .immutable_assignment },
+        .{ .body = "let mut p=&a; if flag {p=&b}; p.* =1", .tag = .unsupported_borrow },
+        .{ .body = "let mut p=&a; if flag {p=&b} else {p=&b}; p.* =1", .tag = .unsupported_borrow },
+        .{ .body = "let mut p=&a; loop flag {p=&b}; p.* =1", .tag = .unsupported_borrow },
+        .{ .body = "let mut p=&a; let test=flag and {p=&b; true}", .tag = .unsupported_borrow },
+        .{ .body = "let mut p=&a; {let mut inner:u8=0; p=&inner}; p.* =1", .tag = .unsupported_borrow },
+        .{ .body = "let p=&a; let q=p", .tag = .unsupported_borrow },
+        .{ .body = "let p=&a; consume(p)", .tag = .unsupported_borrow },
+        .{ .body = "let p=&a; return p", .tag = .unsupported_borrow },
+        .{ .body = "let p=&a; let values=[p]", .tag = .unsupported_borrow },
+        .{ .body = "let values:[]u8=[1]; let p=&values; @println(p[0])", .tag = .unsupported_borrow },
+        .{ .body = "let values:[]u8=[1]; let p=&values; loop item in p {@println(item)}", .tag = .unsupported_borrow },
+        .{ .body = "let mut p:&u8=&a; p=&b; p.* =1", .tag = .immutable_assignment },
+        .{ .body = "let fixed:u8=0; let p:&mut u8=&fixed", .tag = .expression_type_mismatch },
+        .{ .body = "let p=&a; @println(p)", .tag = .unsupported_borrow },
+        .{ .body = "let p=&a; let q=&p", .tag = .unsupported_borrow },
+        .{ .body = "let p=&a; let q=&p.*", .tag = .unsupported_borrow },
+        .{ .body = "let p=&a; let q=(){@println(p.*)}", .tag = .unsupported_borrow },
+        .{ .body = "let mut p=&a; p=&b; b=2; p.* =1", .tag = .borrow_conflict },
+    }) |case| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let consume:(v:u8)={{}}\nlet f:(flag:bool)={{let mut a:u8=0; let mut b:u8=0; {s}\n}}", .{case.body});
+        defer std.testing.allocator.free(source);
+        for (source) |*byte| if (byte.* == ';') {
+            byte.* = '\n';
+        };
+        var module = try Module.init(std.testing.allocator, "explicit-local-references-errors.nov", source);
+        defer module.deinit();
+        errdefer std.debug.print("explicit reference case {s}: {any}\n{any}\n", .{ source, module.source.ast.errors, module.diagnostics.items });
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        errdefer std.debug.print("{s}: {any}\n", .{ source, module.diagnostics.items });
+        try std.testing.expect(module.hasErrors());
+        try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
+    }
+}
+
 test "general borrowing reserves record owners through terminal field assignment RHS" {
     for ([_][]const u8{ "n", "inner.n" }) |field| {
         for ([_][]const u8{ "=", "+=" }) |outer_op| {
@@ -8088,7 +8299,7 @@ test "general borrowing reserves record owners through terminal field assignment
                 for ([_][]const u8{ "return .none[]", "break", "continue", "@panic(\"stop\")", "stop().!" }) |exit| {
                     for ([_]bool{ true, false }) |conflicts| {
                         const owner = if (conflicts) "x" else "independent";
-                        const source = try std.fmt.allocPrint(std.testing.allocator, "let I=struct{{n:int=0,}}\nlet R=struct{{n:int=0,inner:I,}}\nlet O:(T:type)->type=union{{some:T,none,}}\nlet stop:()->O(int)=.none[]\nlet f:(flag:bool)->O(int)={{let mut x=R[.inner=I[]]\nlet mut independent=R[.inner=I[]]\nlet r=&x\nloop {{if flag {{r.{s}{s}{{{s}.{s}{s}2\n{s}}}}} else {{break}}}}\n.some[0]}}", .{ field, outer_op, owner, field, inner_op, exit });
+                        const source = try std.fmt.allocPrint(std.testing.allocator, "let I=struct{{n:int=0,}}\nlet R=struct{{n:int=0,inner:I,}}\nlet O:(T:type)->type=union{{some:T,none,}}\nlet stop:()->O(int)=.none[]\nlet f:(flag:bool)->O(int)={{let mut x=R[.inner=I[]]\nlet mut independent=R[.inner=I[]]\nlet r=&x\nloop {{if flag {{r.*.{s}{s}{{{s}.{s}{s}2\n{s}}}}} else {{break}}}}\n.some[0]}}", .{ field, outer_op, owner, field, inner_op, exit });
                         defer std.testing.allocator.free(source);
                         var module = try Module.init(std.testing.allocator, "terminal-field-reservation.nov", source);
                         defer module.deinit();

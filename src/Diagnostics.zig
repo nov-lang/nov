@@ -89,8 +89,8 @@ fn renderModuleWithSources(module: *const Module, compilation: ?*const Compilati
         switch (diagnostic.tag) {
             .unsupported_iteration => try writer.writeAll("iteration requires an array, string or bounded integer range; reference iteration requires a local array owner (not a string, range, temporary or reborrow)"),
             .borrow_conflict => try writer.writeAll("owner access conflicts with a live borrow"),
-            .borrow_escape => try writer.writeAll("references cannot escape as capabilities; read the borrowed value instead"),
-            .unsupported_borrow => try writer.writeAll("borrow requires a fixed unannotated let binding to &local or &localArray[index]; void has no borrowable storage; nonlocal owners, reborrows and explicit reference types are unsupported"),
+            .borrow_escape => try writer.writeAll("local references cannot escape into arrays, fields, unions, parameters, results, constants or closures; use p.* to read the borrowed value instead"),
+            .unsupported_borrow => try writer.writeAll("local references require &local or &localArray[index] and explicit p.* access; owner mutability determines &T (readonly) or &mut T (mutable pointee), independently of let mut rebinding; void, references to references, nonlocal owners and reborrows are unsupported"),
             .unbound_type_variable => try writer.writeAll("unbound backtick type variable; bind it in the enclosing named function signature"),
             .generic_function_inference_unsupported => try writer.writeAll("type-constraint inference for this generic function body expression is not supported yet; provide typed runtime arguments or an expected result type to determine every signature variable"),
             .generic_function_ambiguous => try writer.writeAll("cannot infer every generic function type variable; provide typed runtime arguments, an expected result type or an exact concrete function signature"),

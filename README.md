@@ -21,8 +21,8 @@ runtime is emitted for managed values and closures; programs using only scalars
 and ordinary functions retain scalar-only emission.
 See the [runtime API and root discipline](src/runtime/README.md) for layout, C
 boundary, OOM, testing, and unsupported-reference contracts. Array slicing
-and general aliases remain deferred; bounded local array-element borrowing is
-supported below. Immutable UTF-8 strings are supported below.
+and general pointers remain deferred; bounded explicit local references and
+array-element borrowing are supported below. Immutable UTF-8 strings are supported below.
 
 ```sh
 zig build
@@ -623,8 +623,8 @@ formatting does not make those forms executable. Array formatting does not check
 expected literal types, scope, mutability, or whether a base is an array; it does
 not enable array globals or new language semantics. Other members, `.len` writes,
 indexed compound stores and stores through computed bases remain unsupported.
-Array slicing, pointers, other unsupported memory/container forms, labels,
-iterator/other unsupported loop forms, attributes, quoted identifiers,
+Array slicing, general pointers (beyond bounded local references), other unsupported
+memory/container forms, labels, iterator/other unsupported loop forms, attributes, quoted identifiers,
 BOMs and shebangs remain unsupported or invalid. Unsupported syntax is reported
 without modifying the file. Formatted output is reparsed and checked for structural,
 token, and comment preservation before atomic replacement; any failed preservation
@@ -912,14 +912,16 @@ inferred type variables. Compile-time argument handling is not implemented.
 ### Other function syntax
 
 The examples below mix implemented forms with older design sketches. Pointer
-parameters, tuples and explicit `#` compile-time arguments are proposals only.
+parameters using the old `*mut` spelling, tuples and explicit `#` compile-time
+arguments are design sketches only. Passing safe `&T` / `&mut T` references is an
+accepted but unimplemented roadmap; these old pointer sketches do not define it.
 
 Parenthesis are specific to functions, whenever there is a parenthesis there is a function involved.
 ```nov
 ; signature: () -> void
 let doNothing: () = {}
 
-; here x is passed as a reference and its value is mutable
+; historical pointer proposal only, not executable reference syntax
 ; signature: (*mut int) -> void
 let retNothing: (x: *mut int) = {
     x += 1
@@ -1278,6 +1280,10 @@ Thus we can match on an union to find its active field.
 
 See [Result and Option unions](#result-and-option-unions) for an example of generic unions.
 
+The recursive `Tree` below is a historical pointer sketch, not executable syntax
+or the accepted safe-reference roadmap. Its `*mut` types and implicit access do
+not apply to delivered `&T` / `&mut T` references.
+
 ```nov
 let NodeKind = enum { empty, node }
 let Tree = union(NodeKind) {
@@ -1392,7 +1398,9 @@ value parameters and general compile-time execution remain unsupported.
 The following broader stack example remains design-only: `#type` proposes an
 explicit compile-time type argument (not implemented), distinct from backtick
 inferred type variables. Aggregate defaults and pointer-based mutable receivers
-are not delivered. Array fields themselves work.
+are not delivered. Array fields themselves work. Its historical `*mut` spelling
+and implicit receiver accesses are separate from the explicit safe-reference
+contract and accepted passing/returning/storing roadmap.
 
 We can generate a type with a function thus creating a generic type.
 ```nov
@@ -1817,49 +1825,84 @@ let main: () -> void = {
 
 ### Local static borrowing
 
-Scoped borrows support every currently implemented non-void runtime value type:
-bool, integer, float, rune, string, enum, struct, union, array, range and function values. Borrow
-a local with `let view = &value`, or a supported array element with
-`let view = &items[index]`. Readonly locals and parameters can be borrowed for
-reading; writes require a mutable owner.
+Explicit local references support every currently implemented non-void runtime
+value type: bool, integer, float, rune, string, enum, struct, union, array, range
+and function values. Borrow a local with `let p = &a`, or a supported local-array
+element with `let p = &items[index]`.
+
+`&T` is a readonly reference; `&mut T` permits pointee mutation. The readonly
+spelling is **not** `&const T`. `&a` infers `&mut T` if and only if its owner `a`
+is mutable; otherwise it infers `&T`. An explicit `&T` annotation can downgrade
+a borrow of a mutable owner to readonly. It cannot upgrade an immutable owner
+to `&mut T`.
+
+Binding mutability is independent of pointee mutability. `let p = &a` fixes the
+reference binding, but `p.* = value` is allowed when its type is `&mut T`.
+`let mut p = &a` permits rebinding with `p = &b`; the reference type must remain
+exactly the same (same child type and readonly/mutable capability). An explicit
+readonly annotation continues to apply on rebinding.
 
 ```nov
-let mut x: uint = 1
-let y = &x
-y += 1
-@println(x) ; 2; access resumes after y's last use
+let mut a: u8 = 1
+let mut b: u8 = 2
+let p = &a                 ; inferred &mut u8; p cannot be rebound
+p.* += 1
+@println(a)               ; 2; access resumes after p's last use
+let readonly: &u8 = &a    ; explicit downgrade
+@println(readonly.*)      ; 2
+let mut selected = &a
+selected.* = 3
+selected = &b             ; same-region rebinding, still &mut u8
+selected.* = 4
+@println(a, b)            ; 3 4
 ```
 
-Assignment through a borrowed name replaces the **pointee**, not the fixed reference
-binding: `view = value` writes to its source. Supported operations are the ordinary
-ones for that type: integer arithmetic compounds, string `+=`, array append/index
-updates, record field updates, range replacement and function-value calls/replacement.
-Exact typing and arithmetic rules do not change. Compounds read the old value before
-RHS evaluation; a terminal RHS skips the pending operation/store.
+References never implicitly dereference. **All pointee reads and writes use
+`.*`**: `p.*`, `p.* = value`, `p.* += value`, `p.*[i]`, `p.*.field`, and
+`p.*()` for a function value. `p = value` does not write the pointee. Supported
+operations are the ordinary ones for the child type, including string `+=`, array
+append/index updates, record field updates, range replacement and function-value
+calls/replacement. Exact typing and arithmetic rules do not change. Compounds
+read the old value before RHS evaluation; a terminal RHS skips the pending store.
 
-Reading `view` yields an ordinary value. `let copy = view`, function arguments,
-returns and method receivers copy values according to existing rules: arrays have
-independent element storage, records copy by value and immutable strings share.
-These operations do **not** copy or escape a reference capability. In particular,
-passing a borrowed record to a by-value method does not give the method mutable
-access to the original. Reborrowing with `&view` remains unsupported.
+`let copy = p.*`, arguments such as `consume(p.*)`, returns of `p.*`, and explicit
+by-value method receivers such as `p.*.method()` use existing value-copy rules:
+arrays have recursively independent backing, records copy by value, immutable
+strings share, and function/closure copies share their environments. They do not
+copy or escape the reference capability or grant a method mutable receiver access.
+Bare `p` is not a value read: `let q = p`, `consume(p)`, `return p`, storing `p`
+in an aggregate and capturing `p` in a closure are currently rejected. Reborrows
+such as `&p` and `&p.*` are unsupported. `@TypeOf(p)` is the bounded compile-time
+exception: it inspects the reference descriptor and prints names such as `&u8`
+or `&mut u8`; `@TypeOf(p.*)` remains unsupported (see [Type Queries](#type-queries)).
 
-Borrow creation itself does not clone or allocate its target. Ordinary value reads
-and operations may allocate as usual. No runtime reference-validity check is added.
-See [examples/local-borrows.nov](examples/local-borrows.nov) for the type matrix.
+Rebinding is limited to straight-line code in the binding's same lexical/control
+region. Rebinding an outer reference inside a dynamic branch, short-circuit RHS,
+nested block or loop is rejected, even if both branches choose the same target.
+A reference declared inside a loop body can be rebound in straight-line code in
+that same body; no reference state is merged across branches or loop backedges.
 
-A direct local binding `let changed = &people[index]` borrows an element of a local
-array without copying it. All currently supported element types are borrowable.
-Nested record field reads/writes, subrecord replacement, integer compounds, string
-`+=` and whole-element replacement use the actual element. A mutable owner permits
-writes; an immutable owner permits reads only. The
-reference binding itself is fixed—`let changed` does not make a mutable owner’s
-pointee immutable. No explicit pointer annotation or `let mut` reference is supported.
+The checker reports `immutable_assignment` for rebinding a fixed binding or
+writing through a readonly reference, and `expression_type_mismatch` for an
+incompatible reference annotation. Unsupported access/rebinding forms use
+`unsupported_borrow`; forbidden reference types in storage/signatures use
+`borrow_escape`; conflicting owner access uses `borrow_conflict`.
+
+Borrow creation itself does not clone or allocate its target. These are local-only
+compile-time capabilities, not first-class runtime pointers or a reinterpretation
+of value storage. Ordinary pointee reads and operations may allocate as usual.
+No runtime reference-validity check is added. See
+[examples/references.nov](examples/references.nov) for explicit reference syntax.
+
+A direct local binding `let changed = &people[index]` borrows an element without
+copying it. All currently supported element types are borrowable. Supported nested
+record paths, subrecord replacement, compounds and whole-element replacement use
+the actual element, always through `.*`:
 
 ```nov
-let changed = &people[0]
-changed.name.text += " Lovelace"
-changed.score += 1
+let changed = &people[0]  ; people must be mutable for these writes
+changed.*.name.text += " Lovelace"
+changed.*.score += 1
 ; last use of changed ends the borrow
 @println(people[0].name.text, people[0].score)
 ```
@@ -1881,10 +1924,11 @@ changed.score += 1
   slot and optional normalized index, rooting managed owners and deriving addresses
   only when used. There are no runtime generation
   or reference-invalidation checks, and no interior pointer is traced by GC.
-- The reference capability cannot escape or be rebound; ordinary copied pointee
-  values may be returned, passed or stored. Void has no borrowable storage. Nonlocal
-  sources, explicit pointer annotations, reborrows, captures of borrowed bindings, temporary
-  owners and general pointer APIs remain unsupported. Array-valued struct fields
+- Reference capabilities currently cannot be copied, passed, returned, stored or
+  captured; only the bounded same-region rebinding above is supported. Ordinary
+  copied pointee values may be returned, passed or stored. Void has no borrowable
+  storage. Nonlocal sources, reborrows, temporary owners and general pointer APIs
+  remain unsupported. Array-valued struct fields
   add no new borrowing forms: `&record.field`, `&record.field[index]` and indexed
   array-field updates through a whole-record/record-element loan remain unsupported.
   Those existing loans still support array-field replacement/append and ordinary
@@ -1894,8 +1938,17 @@ changed.score += 1
   reborrows or direct/computed indexed-write forms.
 - Normal array snapshots/copies remain independent, including snapshots evaluated
   before a later borrow inside an index or RHS. In-place borrowed writes do not
-  alter earlier copies. See the unchanged borrowed-element form in
-  [examples/managed-arrays.nov](examples/managed-arrays.nov).
+  alter earlier copies. Element access follows the explicit `changed.*` form above.
+
+**Accepted roadmap, not implemented:** support passing, returning and storing
+references beyond this local-only slice. This requires lifetimes/referent tracking,
+GC retention of managed referents for the entire reference lifetime, and static
+prevention or safe invalidation of references when storage changes. No dangling
+references may be exposed. This is an accepted implementation direction, not just
+a speculative pointer proposal, and does not make reference escape executable
+today. Manual memory management, pointer arithmetic, null references and unsafe
+dereference are not part of this reference contract. Broader pointer proposals
+below remain distinct future design material.
 
 The broader examples below describe future syntax as well as implemented syntax;
 bare integer elements now default to `int`, and bounded [`@TypeOf`](#type-queries) is
@@ -1929,34 +1982,30 @@ my_array = []
 let my_array_of_array = [["Hello", "World!"], ["Bonjour", "Monde!"]]
 @TypeOf(my_array_of_array) ; returns [][]string
 
-; TODO:
-; proposal about copy/ref of variables
-; side note, it kinda sucks to hide through type if something is copied or not
-; we're trying to solve that btw https://jvns.ca/blog/2024/08/06/go-structs-copied-on-assignment/
-; ---
-; alias because it's long to type. we specify the type so it's passed by
-; reference and create an actual alias instead of copying the data
-let arr_arr: *[][]string = my_array_of_array
-arr_arr.len == 2 ; true
+; explicit local readonly reference; the immutable owner infers this same type
+let arr_arr: &[][]string = &my_array_of_array
+arr_arr.*.len == 2 ; true
 
-; this works like a pointer in C because it's mutable, note that the compiler
-; will emit an error if it is never mutated like here
-let mut ref_arr: *[][]string = my_array_of_array
+; this is an independent recursive value copy, not a reference copy
+let arr_copy = arr_arr.*
 
-; this is a copy
-let arr_copy = my_array_of_array
+; rejected: an immutable owner cannot provide a mutable pointee
+; let arr_error: &mut [][]string = &my_array_of_array
 
-; error type mismatch my_array_of_array is immutable
-let arr_error: *mut [][]string = my_array_of_array
-
-; imperative way of printing an array
-loop arr in arr_arr {
+; imperative way of printing an array through an explicit dereference
+loop arr in arr_arr.* {
     loop w in arr {
         @print(w + " ")
     }
     @println()
 }
 
+```
+
+The following functional/bind syntax is a separate future proposal, not executable
+reference syntax (use `std.array` helpers for delivered higher-order operations):
+
+```nov
 ; functional way, I think
 arr_arr.map(|arr| {
     arr.map(|word| word + " " |> @print)
@@ -2178,7 +2227,9 @@ and index, not a general pointer. A mutable local array permits element writes;
 an immutable local array permits only reads. The whole owner is exclusively
 borrowed and unavailable in the body, even for a readonly item. Reference
 iteration over strings, ranges, temporaries or references (reborrowing) is not
-supported. Ordinary reads of a reference still produce copied values.
+supported. The binding has type `&T` or `&mut T` according to owner mutability;
+read or write the element explicitly with `item.*` (for example `item.* += 1`).
+Bare `item` is not an implicit value read and cannot be copied or escape.
 
 Both forms preserve the existing loop control/result rules: normal exhaustion,
 including an empty source, runs `else`; `break`/`return` skip it, and `continue`
@@ -2211,7 +2262,7 @@ loop n in 0..=10 {}
 loop item, i in items, 0.. {}
 
 ; scoped reference iteration: items must be an unborrowed local array owner
-loop &item in items {}
+loop &item in items { @println(item.*) }
 
 ; use underscore to ignore a value
 loop _ in 0..10 {}
@@ -2409,8 +2460,11 @@ are rejected, as are types/type aliases, generic templates and namespaces as
 operands. In particular, `@TypeOf(f())` is rejected, **not executed**. Looking up
 a binding's type does not evaluate its initializer or read its runtime value,
 mutate it, add a runtime initializer dependency, or introduce closure captures
-or mutable-capture boxing. Querying a borrowed binding inspects its value type
-without a runtime read. Existing scope, borrowing and global-initializer
+or mutable-capture boxing. Querying a reference binding `p` inspects its reference
+descriptor (`&T` or `&mut T`), not its pointee type, without a runtime read.
+Canonical names include `&u8`, `&mut u8`, and `&mut []u8`; native aliases in the
+child type expand as usual. `@TypeOf(p.*)` is unsupported because dereference is
+not a binding operand. Existing scope, borrowing and global-initializer
 restrictions remain unchanged.
 
 The result is a compile-time type, not a first-class runtime value. Use it in
@@ -2625,15 +2679,15 @@ nov run examples/fibo.nov --release # 55
 | Member Search         | a **in** b         | [Arrays](#Arrays)                            | TODO                                                                |
 | Access                | a\[b]              | [Arrays](#Arrays)                            | Array elements and immutable string scalars supported          |
 | Field / Method Access | a.b                | All types                                    | TODO                                                                |
-| Reference Type        | \*T <br> \*mut T   | All types                                    | Create a reference type from `T`. Unless `mut` is specified the wrapped value is constant |
-| Reference Of          | &a                 | All types                                    | Returns a reference to `a`.                                         |
-| Dereference           | a.*                | Reference                                    | Unwrap a reference type, this is done automatically when using `.` or `[]`. |
+| Reference Type        | &T <br> &mut T     | Supported non-void runtime types              | Local readonly / mutable-pointee descriptor; independent of binding `mut` |
+| Reference Of          | &a                 | Local owner or supported local-array element  | Creates a local capability; infers mutable pointee iff owner is mutable |
+| Dereference           | p.*                | Local reference                              | Required for every pointee read/write, including `p.*.field`, `p.*[i]`, `p.*()`; never automatic |
 | Unwrap or Rethrow     | a.!                | Result <br> Option                           | Unwrap a value or return if it's wrong (`.err`, `.none`).           |
 
 ## Precedence
 ```
 x() x[] x.y x.! x.*
-!x -x ~x &x *T
+!x -x ~x &x
 * / %
 + -
 << >>

@@ -112,6 +112,7 @@ fn checkSupported(ast: Ast) !void {
         .assign_div,
         .assign_mod,
         .array_type,
+        .ref_type,
         .array_init_two,
         .array_init_two_comma,
         .array_init,
@@ -119,6 +120,7 @@ fn checkSupported(ast: Ast) !void {
         .array_access,
         .slice,
         .field_access,
+        .deref,
         .identifier,
         .type_variable,
         .number_literal,
@@ -160,6 +162,7 @@ fn checkSupported(ast: Ast) !void {
                 var binding = false;
                 for (ast.nodes.items(.tag), 0..) |parent_tag, parent| {
                     if ((parent_tag == .decl and ast.decl(@intCast(parent)).ast.init_node == i) or
+                        (parent_tag == .assign and ast.nodes.items(.data)[parent].rhs == i) or
                         (parent_tag == .loop_range and ast.fullRange(@intCast(parent)).?.binding == i))
                     {
                         binding = true;
@@ -178,7 +181,7 @@ fn checkSupported(ast: Ast) !void {
             .container_field => if (data.lhs != 0) {
                 const field_tag = ast.nodes.items(.tag)[data.lhs];
                 switch (field_tag) {
-                    .identifier, .type_variable, .field_access, .call, .call_one, .array_type => {},
+                    .identifier, .type_variable, .field_access, .call, .call_one, .array_type, .ref_type => {},
                     else => return error.UnsupportedSyntax,
                 }
                 const name = ast.tokenSlice(ast.firstToken(data.lhs));
@@ -192,7 +195,7 @@ fn checkSupported(ast: Ast) !void {
             },
             .array_type => {
                 switch (ast.nodes.items(.tag)[data.rhs]) {
-                    .type_variable, .field_access, .call, .call_one, .array_type, .fn_proto, .fn_proto_one => continue,
+                    .type_variable, .field_access, .call, .call_one, .array_type, .ref_type, .fn_proto, .fn_proto_one => continue,
                     .identifier => {},
                     else => return error.UnsupportedSyntax,
                 }
@@ -223,9 +226,9 @@ fn checkSupported(ast: Ast) !void {
             .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod => {
                 const lhs_tag = ast.nodes.items(.tag)[data.lhs];
                 if (lhs_tag == .identifier) continue;
-                if (lhs_tag != .array_access and lhs_tag != .field_access) return error.UnsupportedSyntax;
+                if (lhs_tag != .array_access and lhs_tag != .field_access and lhs_tag != .deref) return error.UnsupportedSyntax;
                 var base = ast.nodes.items(.data)[data.lhs].lhs;
-                while (ast.nodes.items(.tag)[base] == .field_access) base = ast.nodes.items(.data)[base].lhs;
+                while (ast.nodes.items(.tag)[base] == .field_access or ast.nodes.items(.tag)[base] == .deref) base = ast.nodes.items(.data)[base].lhs;
                 if (ast.nodes.items(.tag)[base] != .identifier) return error.UnsupportedSyntax;
             },
             else => {},
@@ -251,7 +254,8 @@ fn sameStructure(a: Ast, b: Ast) bool {
             .identifier, .type_variable, .number_literal, .char_literal, .string_literal, .builtin_literal, .enum_literal => {},
             // The parser leaves unused node data undefined; never read it.
             .ref_of, .negation, .bool_not, .bit_not, .@"return", .array_type => if (x.rhs != y.rhs) return false,
-            .field_access, .unwrap => if (x.lhs != y.lhs or !std.mem.eql(u8, a.tokenSlice(x.rhs), b.tokenSlice(y.rhs))) return false,
+            .ref_type => if ((x.lhs == 0) != (y.lhs == 0) or x.rhs != y.rhs) return false,
+            .field_access, .unwrap, .deref => if (x.lhs != y.lhs or !std.mem.eql(u8, a.tokenSlice(x.rhs), b.tokenSlice(y.rhs))) return false,
             .@"continue" => if ((x.lhs == 0) != (y.lhs == 0)) return false,
             else => if (x.lhs != y.lhs or x.rhs != y.rhs) return false,
         }
@@ -457,7 +461,7 @@ test "unsupported syntax fails closed including nested expressions" {
         "let x=@unknown(\"memory\")\n",
         "let x=call({&value})\n",
 
-        "let x:[]*int\n",
+        "let x:[]void\n",
 
         "let f:()->void={make().inner.len=1}\n",
         "let f:()->void={make()[0]+=1}\n",
@@ -592,6 +596,22 @@ test "executable local blocks round trip" {
     }
 }
 
+test "local reference annotations format independently of binding mutability and survive OOM" {
+    try expectFormatted("let f:()={let a:&int=&owner\nlet mut b:&mut []f64=&items\n}", "let f: () = {\n    let a: &int = &owner\n    let mut b: &mut []f64 = &items\n}\n");
+    for ([_][:0]const u8{
+        "let f:()={let mut p:&int=&x\nlet q:&mut int=&y\np=&z\nq.*+=1\n@println(p.*,q.*)}",
+        "let f:(p:&mut int)->&int=p",
+        "let R=struct{p:&mut int,}\nlet a:[]&int",
+        "let f:()={let p:& ; readonly\nint=&x\nlet q:&mut ; mutable\nint=&y\n}",
+    }) |source| {
+        errdefer std.debug.print("reference formatter fixture: {s}\n", .{source});
+        const result = try format(std.testing.allocator, source);
+        defer std.testing.allocator.free(result);
+        try expectFormatted(source, result);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{source});
+    }
+}
+
 test "every unsupported AST tag is rejected before rendering" {
     const supported = [_]Ast.Node.Tag{
         .type_variable,   .root,               .decl,              .identifier,           .number_literal, .char_literal,     .string_literal,
@@ -605,7 +625,7 @@ test "every unsupported AST tag is rejected before rendering" {
         .builtin_literal, .array_type,         .array_init_two,    .array_init_two_comma, .array_init,     .array_init_comma, .array_access,
         .slice,           .field_access,       .in,                .match,                .match_case_one, .match_case,       .function_pipe,
         .container_decl,  .container_decl_arg, .container_field,   .unwrap,               .enum_literal,   .attr_one,         .attr_decl_one,
-        .attr_decl,
+        .attr_decl,       .ref_type,           .deref,
     };
     var ast = try Parser.parse(std.testing.allocator, "let x=1\n");
     defer ast.deinit(std.testing.allocator);
@@ -619,7 +639,7 @@ test "every unsupported AST tag is rejected before rendering" {
                 tag == .assign_add or tag == .assign_sub or tag == .assign_mul or
                 tag == .assign_div or tag == .assign_mod or tag == .array_type or
                 tag == .array_init_two or tag == .array_init_two_comma or tag == .array_init or
-                tag == .array_init_comma or tag == .array_access or tag == .field_access) continue;
+                tag == .array_init_comma or tag == .array_access or tag == .field_access or tag == .deref) continue;
             try checkSupported(ast);
         } else {
             try std.testing.expectError(error.UnsupportedSyntax, checkSupported(ast));

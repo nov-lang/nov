@@ -143,14 +143,14 @@ let mutation_order_and_record_loans: () = {
     let snapshot = records[
         {
             let loan = &records[0]
-            loan.values = [9]
+            loan.*.values = [9]
             0
         }]
     @assert(snapshot.values[0] == 3 and records[0].values[0] == 9)
     let loan = &current
-    let mut detached = loan
-    loan.leaf.values += [5]
+    let mut detached = loan.*
+    loan.*.leaf.values += [5]
     detached.leaf.values[0] = 99
-    @assert(loan.leaf.values.len == 3 and detached.leaf.values.len == 2)
-    @assert(loan.leaf.values[0] == 1)
+    @assert(loan.*.leaf.values.len == 3 and detached.leaf.values.len == 2)
+    @assert(loan.*.leaf.values[0] == 1)
 }

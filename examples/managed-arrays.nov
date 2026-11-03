@@ -17,9 +17,9 @@ let main: () = {
     let mut people = [Person[ .name = Name[ .text = "Ada" ] ]]
     let originalPeople = people
     let changed = &people[0]
-    changed.name.text += " Lovelace"
-    changed.score += 1
-    ; people[0] = changed
+    changed.*.name.text += " Lovelace"
+    changed.*.score += 1
+    ; Use changed.* to copy the pointee; the reference itself cannot be copied.
     @println(people[0].name.text, people[0].score)
     @println(originalPeople[0].name.text, originalPeople[0].score)
 }

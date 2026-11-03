@@ -60,7 +60,7 @@ test "function prototype accessors expose parameters and return types" {
         .{ .source = "let f: () = {}", .names = &.{}, .types = &.{}, .return_type = null },
         .{ .source = "let f: (x: int) -> int = x", .names = &.{"x"}, .types = &.{"int"}, .return_type = "int" },
         .{ .source = "let f: (int) = {}", .names = &.{null}, .types = &.{"int"}, .return_type = null },
-        .{ .source = "let f: (a: int, bool, b: *mut int) -> bool = true", .names = &.{ "a", null, "b" }, .types = &.{ "int", "bool", "*" }, .return_type = "bool" },
+        .{ .source = "let f: (a: int, bool, b: &mut int) -> bool = true", .names = &.{ "a", null, "b" }, .types = &.{ "int", "bool", "&" }, .return_type = "bool" },
         .{ .source = "let f: (\n a: int,\n b: bool,\n) = {}", .names = &.{ "a", "b" }, .types = &.{ "int", "bool" }, .return_type = null },
         .{ .source = "let f: (callback: (x: int) -> int) = {}", .names = &.{"callback"}, .types = &.{"("}, .return_type = null },
     };
@@ -227,13 +227,13 @@ test "recovered blocks retain statement access and closing token spans" {
 }
 
 test "type-only declarations end at their annotated type" {
-    var tree = try Parser.parse(std.testing.allocator, "let value: *mut int\nlet next = 0");
+    var tree = try Parser.parse(std.testing.allocator, "let value: &mut int\nlet next = 0");
     defer tree.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
     const node = tree.rootDecls()[0];
     try std.testing.expectEqualStrings("int", tree.tokenSlice(tree.lastToken(node)));
     const span = tree.nodeToSpan(node);
-    try std.testing.expectEqualStrings("let value: *mut int", tree.source[span.start..span.end]);
+    try std.testing.expectEqualStrings("let value: &mut int", tree.source[span.start..span.end]);
 }
 
 test "render empty AST" {
@@ -1574,8 +1574,8 @@ pub const Node = struct {
         bit_not,
         /// `&rhs`. lhs unused. main_token is op.
         ref_of,
-        /// `*mut rhs`.
-        /// main_token is the `*`.
+        /// `&rhs` or `&mut rhs`: local reference type, not an expression borrow.
+        /// main_token is the `&`.
         /// lhs is the `mut` token index if any.
         ref_type,
         /// `[]rhs`. lhs is unused.

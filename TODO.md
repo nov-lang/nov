@@ -93,6 +93,9 @@ arguments (`Box(@TypeOf(x))`) and module-level aliases
 (`let Count = @TypeOf(global)`). Local type aliases and first-class runtime types
 remain unsupported. Direct `@println(@TypeOf(x))` / `"{@TypeOf(x)}"` render
 canonical static type names, without invoking the value's `@[stringify]` hook.
+For local reference `p`, `@TypeOf(p)` returns its reference descriptor (`&T` or
+`&mut T`), not the child value type; canonical output includes `&u8` / `&mut u8`.
+`@TypeOf(p.*)` is still unsupported: dereference is not a binding operand.
 Function signatures can query earlier named parameters, including inferred generic
 ``(x: `T) -> @TypeOf(x)`` signatures sharing the parameter's constraints; integer
 context/defaulting rules are unchanged. See README's [type-query contract](README.md#type-queries)
@@ -280,26 +283,41 @@ reports source locations, and remains active in all modes. No unwinding/recovery
 parallel execution, test filters, timeout flags or automatic dependency-test discovery.
 See examples/tests.nov and README.
 
-Scoped borrowing now covers every supported non-void runtime value type: bool,
-integers, floats, runes, strings, enums, structs/unions, arrays, ranges and functions. let ref=&local
-also supports readonly locals/parameters; mutability follows owner. Reads yield
-ordinary copied values, so copying/arguments/returns/methods do not escape references.
-Assignment writes the pointee, compounds/array updates use ordinary exact-type rules.
-No runtime validity checks. General pointer annotations, nonlocal/void sources,
-reborrows and escaping capabilities remain unsupported. See examples/local-borrows.nov.
+Explicit local references cover every supported non-void runtime value type:
+bool, integers, floats, runes, strings, enums, structs/unions, arrays, ranges and
+functions. `let p = &a` infers `&mut T` iff owner `a` is mutable, otherwise `&T`
+(readonly, not `&const T`). Readonly locals/parameters are borrowable. An explicit
+`let p: &T = &mutableOwner` safely downgrades to readonly; an immutable owner cannot
+provide `&mut T`. Binding `mut` is independent: `let p = &a` cannot rebind but
+`p.* = value` works for a mutable pointee; `let mut p = &a` allows `p = &b` with
+the same exact reference type, retaining any explicit readonly annotation.
 
-Local static array-element borrowing is executable: let ref=&localArray[index]
-for all supported array elements, with whole-element and nested record updates.
-Mutable owners permit writes; immutable owners permit reads. CFG fixed-point
-liveness ends the exclusive whole-array loan after its last use, tracking branches,
-loops/backedges, terminal controls and RHS stores. Conflicting owner access and
-reference-capability escape/rebind/reborrow use diagnose; value copies are allowed. Owner access
-during index evaluation is conservatively rejected too. References are bounded
-local capabilities, not general first-class pointers; readonly loans also remain
-exclusive. Index normalization/bounds happens once, owner base is rooted, and no
-runtime reference-validity checks or interior GC roots are introduced. Normal array
-copies and pre-borrow snapshots remain independent. User's managed-arrays.nov now
-works unchanged with &people[0]; explicit annotations/escaping refs remain deferred.
+No autodereference: all pointee reads/writes use `.*`, including `p.* += value`,
+`p.*[i]`, `p.*.field` and `p.*()`. `p = value` is not a pointee store. Reads such
+as `let copy = p.*`, arguments/returns of `p.*` and `p.*.method()` retain ordinary
+value-copy semantics, not reference escape. Bare reference copies (`let q = p`),
+passing, returning, storing in arrays/records/unions/constants, capturing and
+reborrowing (`&p` / `&p.*`) are currently rejected. Rebinding is straight-line only
+in the binding's same lexical/control region; outer-reference rebinding in dynamic
+branches, short-circuit RHSs, nested blocks and loops rejects. A loop-body-local
+reference may rebind within that same body region; no reference-state merges are
+implemented. `@TypeOf(p)` reports the reference descriptor with canonical names
+such as `&u8` / `&mut u8`; `@TypeOf(p.*)` remains unsupported under the bounded
+binding-operand rule. See `examples/references.nov` and README's delivered contract.
+
+Local static array-element borrowing uses `let p = &localArray[index]` for all
+supported elements, with whole-element and supported nested-record updates via
+`p.*`. Static NLL/CFG fixed-point liveness ends the exclusive whole-array loan
+after its last use, tracking branches, loop backedges, terminal controls and RHS
+stores. Conflicting owner access diagnoses, including owner access during index
+evaluation. Readonly loans remain exclusive. Index normalization/bounds happens
+once; stable owner slots root managed owners and addresses are derived only for
+immediate use. These are local-only compile-time capabilities, not reinterpreted
+runtime pointers. No runtime reference-validity checks or interior GC roots are
+introduced; ordinary copies and pre-borrow snapshots remain independent. Nonlocal,
+void and temporary sources, references to references and general pointers remain
+unsupported. No manual memory management, pointer arithmetic, null references or
+unsafe dereference is introduced.
 
 Reusable range values are executable: start..end / start..=end construct integer
 bounds once left-to-right, and loop i in range snapshots the source once per loop.
@@ -584,6 +602,23 @@ Keep to the main features aka:
 - interoperability with C unless it harms the features above
 Keep Nov away from:
 - Really low level stuff aka assembly, kernel or drivers. Use zig instead.
+
+## Accepted reference roadmap (not implemented)
+
+- **Implement passing, returning and storing references.** This is an accepted
+  implementation direction beyond the delivered local-only slice, not merely a
+  pointer proposal. Reference copying/capture/reborrowing are not thereby enabled
+  today; their rules still require design and implementation.
+- Track lifetimes and referents across calls, returns and aggregate storage. Retain
+  managed referents through GC for every live reference, including references
+  stored in managed objects or returned beyond a callee's frame.
+- Prevent invalidation statically or provide safe invalidation when owner storage
+  is replaced, resized or outlived. Never expose dangling references or permit
+  dereference of invalid storage. The present static NLL/CFG checks, bounds checks
+  and rooted stable-owner model remain the baseline, not proof that escape is safe.
+- This roadmap adds no manual memory management, pointer arithmetic, null or unsafe
+  dereference. Broader raw-pointer/FFI/iterator proposals below are distinct and
+  are not approved or implemented by this decision.
 
 # Proposals and stuff to add
 
@@ -972,8 +1007,10 @@ the old element before the RHS and replacing the local with the updated snapshot
 afterwards. Plain replacement retains its final-update bounds check; compounds
 check on the pre-RHS read. No new memory forms are introduced. See README's
 executable subset for precise limits and evaluation order. The proposals below
-remain proposals; writable length, array slices, pointer elements, general aliases
-and capacity APIs are still deferred. All further optimizations remain paused.
+remain proposals; writable length, array slices, general pointer elements/aliases
+and capacity APIs are still deferred. Safe reference passing/returning/storage is
+separately accepted but unimplemented; local `&T` / `&mut T` references are delivered.
+All further optimizations remain paused.
 
 `value in array` membership is delivered for bool, rune, string, enums and supported
 fixed/native integers with exact element types and bidirectional literal context
@@ -986,7 +1023,10 @@ protocols remain unsupported.
 
 Side note about mutability. A constant array cannot be modified in any way, its
 values are constant too. A mutable array can be reassigned/extanded and its
-values can be modified. TODO: talk about * and *mut array.
+values can be modified. Explicit local references to arrays use readonly `&[]T`
+or mutable-pointee `&mut []T`, with `p.*[i]` access and independent binding `mut`;
+see the delivered reference contract above. Older `*` / `*mut` sketches below
+remain separate proposals, not current reference syntax.
 
 Arrays don't have methods? (only a .len field)
 
@@ -1174,7 +1214,10 @@ nonescaping reference uses a stable owner/index; mutable locals permit element
 writes and immutable locals permit only reads. The exclusive whole-array loan
 makes the owner unavailable in the body, including readonly iteration. No
 reference iteration over strings, ranges, temporaries or references/reborrows.
-Normal reference reads still copy values. Both forms preserve exhaustion `else`
+Reference bindings have owner-derived `&T` / `&mut T` types; all element reads
+and writes use `item.*` (for example `item.* += 1`). Bare `item` cannot be copied,
+passed, returned, stored or captured. Explicit pointee reads copy values normally.
+Both forms preserve exhaustion `else`
 (including empty sources), exact valued-break/fallback typing and `continue`
 advancement. Break/return skip `else`; without `else`, value breaks reject.
 See examples/iteration.nov. Multiple/zip iteration and general

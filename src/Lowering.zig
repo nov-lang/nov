@@ -1891,7 +1891,7 @@ fn testClosureRejection(allocator: std.mem.Allocator, source: []const u8) !void 
 
 test "closures reject borrowed captures recursion inferred parameters foreign ABI and unsupported containers under OOM" {
     for ([_][]const u8{
-        "let main:()={let mut n:int=1\nlet b=&n\nlet f=()->int {b}\n}",
+        "let main:()={let mut n:int=1\nlet b=&n\nlet f=()->int {b.*}\n}",
         "let main:()={let f=(n:int)->int {f(n)}\n}",
         "let main:()={let f:(n:int)->int=f(n)\n}",
         "let main:()={let f=(int)->int {1}\n}",
@@ -1902,13 +1902,13 @@ test "closures reject borrowed captures recursion inferred parameters foreign AB
         "@[export]\nlet foreign:(f:()->int)->int=f()",
         "let R=struct{f:()->int,}\nlet main:()={}",
         "let main:()={let a:[]()->int=[]\n@println(a)}",
-        "let main:()={let mut n:int=0\nlet f=()->int {n}\nlet b=&n\n@println(f(),b)}",
-        "let main:()={let mut n:int=0\nlet b=&n\nlet f=()->int {n}\n@println(b)}",
+        "let main:()={let mut n:int=0\nlet f=()->int {n}\nlet b=&n\n@println(f(),b.*)}",
+        "let main:()={let mut n:int=0\nlet b=&n\nlet f=()->int {n}\n@println(b.*)}",
         "let main=(){let n:int=1\nlet f=(n:int)->int {n}\n}",
         "let main=(){let n:int=1\nlet f=()->int {let n:int=2\nn}\n}",
         "let main=(){let mut values:[]int=[1]\nlet change=(){values[0]+=1}\nloop item in values {change()}}",
-        "let main=(){let mut values:[]int=[1]\nlet change=(){values[0]+=1}\nloop &item in values {change()\nitem+=1}}",
-        "let main=(){let mut values:[]int=[1]\nloop &item in values {let read=()->int {item}\n}}",
+        "let main=(){let mut values:[]int=[1]\nlet change=(){values[0]+=1}\nloop &item in values {change()\nitem.*+=1}}",
+        "let main=(){let mut values:[]int=[1]\nloop &item in values {let read=()->int {item.*}\n}}",
     }) |source| {
         try testClosureRejection(std.testing.allocator, source);
         try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testClosureRejection, .{source});
@@ -2643,7 +2643,7 @@ test "nested records late body recursive generic instances retain source diagnos
 
 test "static integer borrowing forged IR owner kinds exact types paths and source release" {
     var result = blk: {
-        var module = try Module.init(std.testing.allocator, "integer-borrow-ir.nov", "let R=struct{n:int=0,}\nlet f:()={let mut a=[R[]]\nlet mut flag=true\nlet mut x:int=1\nlet y=&x\ny+=1\n@println(x,a.len,flag)}");
+        var module = try Module.init(std.testing.allocator, "integer-borrow-ir.nov", "let R=struct{n:int=0,}\nlet f:()={let mut a=[R[]]\nlet mut flag=true\nlet mut x:int=1\nlet y=&x\ny.*+=1\n@println(x,a.len,flag)}");
         defer module.deinit();
         const result = try lower(&module);
         try std.testing.expect(result.lowering_complete);
@@ -2704,7 +2704,7 @@ test "static integer borrowing forged IR owner kinds exact types paths and sourc
 
 test "static borrowing verified capability types owner paths index and regions survive source release" {
     var result = blk: {
-        var module = try Module.init(std.testing.allocator, "borrow-ir.nov", "let A=struct{b:B,}\nlet B=struct{x:int=0,}\nlet f:()={let mut a=[A[.b=B[]]]\nlet r=&a[0]\nr.b.x+=1\n@println(a.len)}");
+        var module = try Module.init(std.testing.allocator, "borrow-ir.nov", "let A=struct{b:B,}\nlet B=struct{x:int=0,}\nlet f:()={let mut a=[A[.b=B[]]]\nlet r=&a[0]\nr.*.b.x+=1\n@println(a.len)}");
         defer module.deinit();
         const result = try lower(&module);
         try std.testing.expect(result.lowering_complete);
@@ -2766,7 +2766,7 @@ test "static borrowing verified capability types owner paths index and regions s
 test "static borrowing imported generic nominal owners preserve exact identities" {
     var comp = Compilation.init(std.testing.allocator);
     defer comp.deinit();
-    const root = try comp.addSource("/main.nov", "let types=@import(\"types.nov\")\nlet Alias=types.R(int)\nlet main:()={let mut a=[Alias[.x=1]]\nlet r=&a[0]\nr.x+=1\n@println(a[0].x)}");
+    const root = try comp.addSource("/main.nov", "let types=@import(\"types.nov\")\nlet Alias=types.R(int)\nlet main:()={let mut a=[Alias[.x=1]]\nlet r=&a[0]\nr.*.x+=1\n@println(a[0].x)}");
     const types = try comp.addSource("/types.nov", "@[public]\nlet R:(T:type)->type=struct{x:T,}");
     try testImport(&comp, root, "types", types, true);
     comp.setRoot(root);
@@ -2791,14 +2791,14 @@ fn testBorrowRejectionAllocations(allocator: std.mem.Allocator, source: []const 
 
 test "static borrowing rejected conflicts and escapes roll back every allocation failure" {
     for ([_][]const u8{
-        "let R=struct{x:int=0,}\nlet f:()={let mut a=[R[]]\nlet r=&a[0]\nr.x+={a=[R[]]\n1}}",
-        "let R=struct{x:int=0,}\nlet f:()={let mut a=[R[]]\nlet r=&a[0]\nlet alias=&r\n@println(alias.x)}",
-        "let R=struct{x:int=0,}\nlet f:()={let mut a=[R[]]\nlet r=&a[{a=[R[]]\n0}]\nr.x=1}",
+        "let R=struct{x:int=0,}\nlet f:()={let mut a=[R[]]\nlet r=&a[0]\nr.*.x+={a=[R[]]\n1}}",
+        "let R=struct{x:int=0,}\nlet f:()={let mut a=[R[]]\nlet r=&a[0]\nlet alias=&r\n@println(alias.*.x)}",
+        "let R=struct{x:int=0,}\nlet f:()={let mut a=[R[]]\nlet r=&a[{a=[R[]]\n0}]\nr.*.x=1}",
     }) |source| try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testBorrowRejectionAllocations, .{source});
 }
 
 test "static borrowing verifier rejects well typed forged owner access and sibling capabilities" {
-    var module = try Module.init(std.testing.allocator, "borrow-proof.nov", "let R=struct{x:int=0,}\nlet f:(flag:bool)={let mut a=[R[]]\nlet r=&a[0]\nr.x=1\n@println(a[0].x)\nif flag {let s=&a[0]\ns.x+=1} else {let t=&a[0]\nt.x+=1}}");
+    var module = try Module.init(std.testing.allocator, "borrow-proof.nov", "let R=struct{x:int=0,}\nlet f:(flag:bool)={let mut a=[R[]]\nlet r=&a[0]\nr.*.x=1\n@println(a[0].x)\nif flag {let s=&a[0]\ns.*.x+=1} else {let t=&a[0]\nt.*.x+=1}}");
     defer module.deinit();
     var result = try lower(&module);
     defer result.deinit();
@@ -2832,8 +2832,8 @@ test "append RHS projects only final reads and keeps assignment snapshots" {
     for ([_][]const u8{
         "let main:()={let mut a:[]int=[1]\na+=a\nlet b=a\na=b}",
         "let L=struct{a:[]int,}\nlet T=struct{leaf:L,}\nlet main:()={let mut a=T[.leaf=L[.a=[1]]]\na.leaf.a+=a.leaf.a\nlet b=a.leaf.a\na.leaf.a=b}",
-        "let L=struct{a:[]int,}\nlet main:()={let mut a=L[.a=[1]]\nlet r=&a\nr.a+=r.a\nlet b=r.a\nr.a=b}",
-        "let L=struct{a:[]int,}\nlet main:()={let mut a=[L[.a=[1]]]\nlet r=&a[0]\nr.a+=r.a\nlet b=r.a\nr.a=b}",
+        "let L=struct{a:[]int,}\nlet main:()={let mut a=L[.a=[1]]\nlet r=&a\nr.*.a+=r.*.a\nlet b=r.*.a\nr.*.a=b}",
+        "let L=struct{a:[]int,}\nlet main:()={let mut a=[L[.a=[1]]]\nlet r=&a[0]\nr.*.a+=r.*.a\nlet b=r.*.a\nr.*.a=b}",
     }) |source| {
         var module = try Module.init(std.testing.allocator, "append-rhs-ir.nov", source);
         defer module.deinit();
@@ -2861,7 +2861,7 @@ test "append RHS projects only final reads and keeps assignment snapshots" {
 }
 
 test "static borrowing normal array loads clone immediately before later borrow effects" {
-    var module = try Module.init(std.testing.allocator, "borrow-snapshot-ir.nov", "let R=struct{x:int=0,}\nlet main:()={let mut a=[R[],R[]]\nlet before=a\nlet value=a[{let r=&a[0]\nr.x=9\n0}]\na+={let r=&a[0]\nr.x=8\n[R[]]}\na[{let r=&a[0]\nr.x=7\n1}]={let r=&a[0]\nr.x=6\nR[]}\n@println(value.x,before[0].x,a[0].x)}");
+    var module = try Module.init(std.testing.allocator, "borrow-snapshot-ir.nov", "let R=struct{x:int=0,}\nlet main:()={let mut a=[R[],R[]]\nlet before=a\nlet value=a[{let r=&a[0]\nr.*.x=9\n0}]\na+={let r=&a[0]\nr.*.x=8\n[R[]]}\na[{let r=&a[0]\nr.*.x=7\n1}]={let r=&a[0]\nr.*.x=6\nR[]}\n@println(value.x,before[0].x,a[0].x)}");
     defer module.deinit();
     var result = try lower(&module);
     defer result.deinit();

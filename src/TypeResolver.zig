@@ -114,7 +114,7 @@ fn resolveEnvironment(module: *Module, ir: *Ir, node: Ast.Node.Index, env: Envir
                 var iterator = proto.iterate(ast);
                 while (iterator.next()) |param| try work.append(module.allocator, .{ .visit = .{ .node = param.type_expr, .depth = visit.depth + 1, .alias_depth = visit.alias_depth, .local = visit.local } });
                 if (proto.ast.return_type) |result| try work.append(module.allocator, .{ .visit = .{ .node = result, .depth = visit.depth + 1, .alias_depth = visit.alias_depth, .local = visit.local } });
-            } else if (ast.nodes.items(.tag)[visit.node] == .array_type) {
+            } else if (ast.nodes.items(.tag)[visit.node] == .array_type or ast.nodes.items(.tag)[visit.node] == .ref_type) {
                 try work.append(module.allocator, .{ .visit = .{ .node = ast.nodes.items(.data)[visit.node].rhs, .depth = visit.depth + 1, .alias_depth = visit.alias_depth, .local = visit.local } });
             } else if (ast.fullCall(visit.node)) |call| {
                 if (isTypeOf(ast, call)) continue;
@@ -199,7 +199,10 @@ fn resolveDepth(module: *Module, ir: *Ir, node: Ast.Node.Index, depth: usize, al
             }
             signature_env.values = values.items;
             if (try resolveDepth(module, ir, param.type_expr, depth + 1, aliases, signature_env)) |ty| {
-                if (ir.getType(ty).? == .void) {
+                if (ir.getType(ty).? == .reference) {
+                    _ = try diagnose(module, param.type_expr, .borrow_escape);
+                    valid = false;
+                } else if (ir.getType(ty).? == .void) {
                     _ = try diagnose(module, param.type_expr, .invalid_parameter_type);
                     valid = false;
                 } else {
@@ -215,11 +218,22 @@ fn resolveDepth(module: *Module, ir: *Ir, node: Ast.Node.Index, depth: usize, al
             try resolveDepth(module, ir, return_node, depth + 1, aliases, signature_env)
         else
             try ir.internType(.void);
+        if (result != null and ir.getType(result.?).? == .reference) {
+            _ = try diagnose(module, proto.ast.return_type.?, .borrow_escape);
+            valid = false;
+        }
         if (!valid or result == null) return null;
         return try ir.internType(.{ .function = .{ .params = params.items, .result = result.? } });
     }
+    if (ast.nodes.items(.tag)[node] == .ref_type) {
+        const data = ast.nodes.items(.data)[node];
+        const child = (try resolveDepth(module, ir, data.rhs, depth + 1, aliases, env)) orelse return null;
+        if (!Ir.isArrayElement(ir.getType(child).?)) return diagnose(module, node, .unsupported_borrow);
+        return try ir.internType(.{ .reference = .{ .child = child, .mutable = data.lhs != 0 } });
+    }
     if (ast.nodes.items(.tag)[node] == .array_type) {
         const element = (try resolveDepth(module, ir, ast.nodes.items(.data)[node].rhs, depth + 1, aliases, env)) orelse return null;
+        if (ir.getType(element).? == .reference) return diagnose(module, node, .borrow_escape);
         if (!Ir.isArrayElement(ir.getType(element).?)) return diagnose(module, node, .unsupported_type);
         return try ir.internType(.{ .array = element });
     }
@@ -572,6 +586,7 @@ fn instantiateArgumentsMode(module: *Module, ir: *Ir, id: Module.DeclId, args: [
         if (!tagged and data.lhs == 0) return diagnose(module, member, .unsupported_type);
         const field_ty = if (data.lhs == 0) try ir.internType(.void) else (try resolveWithMode(module, ir, data.lhs, bindings.items, expansions + 1, publish_methods)) orelse return null;
         const ft = ir.getType(field_ty).?;
+        if (ft == .reference) return diagnose(module, member, .borrow_escape);
         if (ft == .record and ft.record.instance_state == .building) return diagnose(module, member, .generic_cycle);
         if (!(if (tagged) Ir.isUnionPayload(ft) else Ir.isRecordField(ft))) return diagnose(module, member, .unsupported_type);
         const token = ast.nodes.items(.main_token)[member];
@@ -779,7 +794,7 @@ test "unsupported unknown and non-type forms have source diagnostics" {
         .{ .spelling = "alias", .tag = .not_a_type, .span = "alias" },
         .{ .spelling = "true", .tag = .not_a_type, .span = "true" },
         .{ .spelling = "false", .tag = .not_a_type, .span = "false" },
-        .{ .spelling = "*i32", .tag = .unsupported_type, .span = "*" },
+        .{ .spelling = "&void", .tag = .unsupported_borrow, .span = "&" },
         .{ .spelling = "42", .tag = .unsupported_type, .span = "42" },
         .{ .spelling = "i7", .tag = .unknown_type, .span = "i7" },
     };
@@ -1013,6 +1028,80 @@ test "TypeOf imported values respect visibility and reject namespaces and types"
         const before = module.diagnostics.items.len;
         try std.testing.expectEqual(@as(?Ir.TypeId, null), try resolve(module, &ir, testTypeNode(module, name)));
         try std.testing.expect(module.diagnostics.items.len > before);
+    }
+}
+
+fn testLocalReferenceTypes(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "references.nov", "let a: &int\nlet b: &mut int\nlet c: &f64\nlet d: &[]int\nlet e: &(() -> void)\nlet query: @TypeOf(p)\nlet Alias = int\nlet alias_ref: &Alias");
+    defer module.deinit();
+    try module.classifyAliases();
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
+    const readonly = (try resolve(&module, &ir, testTypeNode(&module, "a"))).?;
+    const writable = (try resolve(&module, &ir, testTypeNode(&module, "b"))).?;
+    try std.testing.expect(readonly != writable);
+    try std.testing.expect(!ir.getType(readonly).?.reference.mutable);
+    try std.testing.expect(ir.getType(writable).?.reference.mutable);
+    try std.testing.expectEqual(ir.getType(readonly).?.reference.child, ir.getType(writable).?.reference.child);
+    for ([_][]const u8{ "c", "d", "e" }) |name| {
+        const ty = (try resolve(&module, &ir, testTypeNode(&module, name))).?;
+        try std.testing.expect(ir.getType(ty).? == .reference);
+    }
+    try std.testing.expectEqual(readonly, (try resolve(&module, &ir, testTypeNode(&module, "alias_ref"))).?);
+    const values = &[_]Binding{.{ .name = "p", .ty = writable }};
+    try std.testing.expectEqual(writable, (try resolveInScopeWithValuesReadOnly(&module, &ir, testTypeNode(&module, "query"), null, null, &.{}, values)).?);
+    try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+    try ir.verify();
+}
+
+test "local reference type resolution and TypeOf value bindings survive OOM" {
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testLocalReferenceTypes, .{});
+}
+
+test "local reference types reject void reborrows and signature or array escapes" {
+    for ([_]struct { source: []const u8, tag: Module.Diagnostic.Tag }{
+        .{ .source = "let value: &void", .tag = .unsupported_borrow },
+        .{ .source = "let value: &mut void", .tag = .unsupported_borrow },
+        .{ .source = "let value: & &int", .tag = .unsupported_borrow },
+        .{ .source = "let value: &mut &int", .tag = .unsupported_borrow },
+        .{ .source = "let value: []&int", .tag = .borrow_escape },
+        .{ .source = "let value: (p: &mut int) -> void", .tag = .borrow_escape },
+        .{ .source = "let value: () -> &int", .tag = .borrow_escape },
+        .{ .source = "let value: &(() -> &int)", .tag = .borrow_escape },
+    }) |case| {
+        var module = try Module.init(std.testing.allocator, "escape.nov", case.source);
+        defer module.deinit();
+        var ir = Ir.init(std.testing.allocator);
+        defer ir.deinit();
+        try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
+        try std.testing.expectEqual(@as(?Ir.TypeId, null), try resolve(&module, &ir, testTypeNode(&module, "value")));
+        try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
+        for (ir.types.items) |ty| try std.testing.expect(ty != .function and ty != .array);
+        try ir.verify();
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testResolve, .{case.source});
+    }
+}
+
+test "local reference TypeOf descriptors cannot escape indirectly into signatures arrays or nominal fields" {
+    for ([_][]const u8{
+        "let value: (x: @TypeOf(p)) -> void",
+        "let value: () -> @TypeOf(p)",
+        "let value: []@TypeOf(p)",
+        "let G: (T: type) -> type = struct { item: T, }\nlet value: G(@TypeOf(p))",
+        "let G: (T: type) -> type = union { item: T, }\nlet value: G(@TypeOf(p))",
+    }) |source| {
+        var module = try Module.init(std.testing.allocator, "indirect.nov", source);
+        defer module.deinit();
+        try module.classifyAliases();
+        var ir = Ir.init(std.testing.allocator);
+        defer ir.deinit();
+        const integer = try ir.internType(.{ .integer = .{ .bits = 32, .signedness = .signed } });
+        const reference = try ir.internType(.{ .reference = .{ .child = integer, .mutable = false } });
+        const values = &[_]Binding{.{ .name = "p", .ty = reference }};
+        try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
+        try std.testing.expectEqual(@as(?Ir.TypeId, null), try resolveInScopeWithValues(&module, &ir, testTypeNode(&module, "value"), null, null, &.{}, values));
+        try std.testing.expectEqual(Module.Diagnostic.Tag.borrow_escape, module.diagnostics.items[0].tag);
     }
 }
 

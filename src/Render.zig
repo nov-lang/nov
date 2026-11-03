@@ -386,7 +386,7 @@ fn renderExpression(self: *Render, node: Ast.Node.Index, space: Space) RenderErr
         },
 
         .ref_type => {
-            try self.renderToken(main_tokens[node], .none); // *
+            try self.renderToken(main_tokens[node], .none); // &
             if (datas[node].lhs != 0) {
                 try self.renderToken(datas[node].lhs, .space); // mut
             }

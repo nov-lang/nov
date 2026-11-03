@@ -13,7 +13,7 @@ pub const max_terms = 8192;
 pub const max_depth = 128;
 pub const max_specialization_depth = 64;
 pub const max_specializations = 1024;
-pub const Capture = struct { name: []const u8, ty: Ir.TypeId, template: ?Ref = null };
+pub const Capture = struct { name: []const u8, ty: Ir.TypeId, template: ?Ref = null, mutable: bool = false };
 pub const LocalTemplate = struct {
     proto: Ast.Node.Index,
     body: Ast.Node.Index,
@@ -130,6 +130,7 @@ const Term = struct {
         link: *Term,
         known: Ir.TypeId,
         array: *Term,
+        reference: struct { child: *Term, mutable: bool },
         function: Function,
         nominal: Nominal,
     },
@@ -137,7 +138,7 @@ const Term = struct {
 const Nominal = struct { module: *Module, id: Module.DeclId, args: []const *Term };
 const Function = struct { params: []const *Term, result: *Term };
 const Variable = struct { name: []const u8, term: *Term };
-const Local = struct { name: []const u8, term: *Term, template: ?Ref = null };
+const Local = struct { name: []const u8, term: *Term, template: ?Ref = null, mutable: bool = false };
 const Loop = struct { result: *Term, has_break: bool = false, has_continue: bool = false, allows_value: bool };
 const Frame = struct {
     ref: Ref,
@@ -280,7 +281,7 @@ fn probeExpressionsInner(caller: *Module, ir: *Ir, scope: Ref, nodes: []const As
         const concrete = Solver.root(try solver.fromType(@fromBackingInt(ty), solver.call_span, 0));
         if (concrete.value == .nominal) frame.container = concrete.value.nominal;
     }
-    for (local.captures) |capture| try frame.locals.append(solver.allocator, .{ .name = capture.name, .term = try solver.fromType(capture.ty, solver.call_span, 0), .template = capture.template });
+    for (local.captures) |capture| try frame.locals.append(solver.allocator, .{ .name = capture.name, .term = try solver.fromType(capture.ty, solver.call_span, 0), .template = capture.template, .mutable = capture.mutable });
     const result = try solver.term(.unknown, solver.call_span);
     for (nodes) |node| try solver.unify(result, try solver.expression(&frame, node, 0), caller.tokenSpan(caller.source.ast.firstToken(node)), 0);
     if (solver.failed) return null;
@@ -354,6 +355,47 @@ fn testNestedIntegerDefaults(allocator: std.mem.Allocator, depth: usize) !void {
     try std.testing.expect(!module.hasErrors());
     try std.testing.expect(sema.lowering_complete);
     try sema.ir.verify();
+}
+
+fn testGenericLocalReferences(allocator: std.mem.Allocator) !void {
+    const source =
+        \\let read:(x:`T)->`T={let p=&x
+        \\p.*}
+        \\let annotated:(x:`T)->`T={let p:&`T=&x
+        \\p.*}
+        \\let downgrade:(x:`T)->`T={let mut local=x
+        \\let p:&`T=&local
+        \\p.*}
+        \\let change:(x:`T,y:`T)->`T={let mut first=x
+        \\let mut second=y
+        \\let mut p=&first
+        \\p.* =x
+        \\p=&second
+        \\p.*}
+        \\let main:()={
+        \\let a:u8=read(1)
+        \\let b:u8=annotated(a)
+        \\let c:u8=downgrade(b)
+        \\let d:u8=change(a,c)
+        \\let closure=(v:`T)->`T{let p=&v
+        \\p.*}
+        \\let e:u8=closure(d)
+        \\@println(e)
+        \\}
+    ;
+    var module = try Module.init(allocator, "generic-local-references.nov", source);
+    defer module.deinit();
+    var sema = try Lowering.lower(&module);
+    defer sema.deinit();
+    errdefer if (module.hasErrors()) std.debug.print("generic local references: {any}\n", .{module.diagnostics.items});
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+}
+
+test "generic explicit local references retain child constraints under OOM" {
+    try testGenericLocalReferences(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testGenericLocalReferences, .{});
 }
 
 test "integer defaults bound nested identity probe work and preserve late siblings" {
@@ -842,6 +884,7 @@ const Solver = struct {
                 value.value = .unknown;
             },
             .array => |element| self.retainFloatDefaults(element, depth + 1),
+            .reference => |reference| self.retainFloatDefaults(reference.child, depth + 1),
             .nominal => |n| for (n.args) |arg| {
                 self.retainFloatDefaults(arg, depth + 1);
             },
@@ -927,6 +970,7 @@ const Solver = struct {
             .link => unreachable,
             .known => true,
             .array => |element| resolved(element, depth + 1),
+            .reference => |reference| resolved(reference.child, depth + 1),
             .function => |f| blk: {
                 for (f.params) |param| if (!resolved(param, depth + 1)) break :blk false;
                 break :blk resolved(f.result, depth + 1);
@@ -970,6 +1014,7 @@ const Solver = struct {
         }
         return switch (self.ir.getType(ty).?) {
             .array => |element| self.term(.{ .array = try self.fromType(element, span, depth + 1) }, span),
+            .reference => |reference| self.term(.{ .reference = .{ .child = try self.fromType(reference.child, span, depth + 1), .mutable = reference.mutable } }, span),
             .function => |f| blk: {
                 const params = try self.allocator.alloc(*Term, f.params.len);
                 for (f.params, params) |param, *out| out.* = try self.fromType(param, span, depth + 1);
@@ -991,6 +1036,7 @@ const Solver = struct {
         if (t == r or depth >= max_depth) return true;
         return switch (r.value) {
             .array => |element| occurs(t, element, depth + 1),
+            .reference => |reference| occurs(t, reference.child, depth + 1),
             .function => |f| blk: {
                 for (f.params) |p| if (occurs(t, p, depth + 1)) break :blk true;
                 break :blk occurs(t, f.result, depth + 1);
@@ -1019,6 +1065,9 @@ const Solver = struct {
         if (std.meta.activeTag(x.value) == std.meta.activeTag(y.value)) switch (x.value) {
             .known => |ty| if (ty == y.value.known) return,
             .array => |element| return self.unify(element, y.value.array, span, depth + 1),
+            .reference => |reference| {
+                if (reference.mutable == y.value.reference.mutable) return self.unify(reference.child, y.value.reference.child, span, depth + 1);
+            },
             .function => |f| {
                 const g = y.value.function;
                 if (f.params.len == g.params.len) {
@@ -1083,6 +1132,10 @@ const Solver = struct {
                 return self.term(.unknown, span);
             },
             .array_type => return self.term(.{ .array = try self.typeNode(frame, ast.nodes.items(.data)[node].rhs, depth + 1) }, span),
+            .ref_type => {
+                const data = ast.nodes.items(.data)[node];
+                return self.term(.{ .reference = .{ .child = try self.typeNode(frame, data.rhs, depth + 1), .mutable = data.lhs != 0 } }, span);
+            },
             .fn_proto, .fn_proto_one => {
                 const proto = ast.fullFnProto(node).?;
                 const params = try self.allocator.alloc(*Term, proto.ast.params.len);
@@ -1216,7 +1269,7 @@ const Solver = struct {
         var frame: Frame = .{ .ref = ref, .variables = variables.items, .result = undefined, .container = container };
         if (ref.local) |local| try frame.locals.appendSlice(self.allocator, local.lexical_locals);
         if (ref.local) |local| for (local.captures) |capture| {
-            try frame.locals.append(self.allocator, .{ .name = capture.name, .term = try self.fromType(capture.ty, ref.span(), 0), .template = capture.template });
+            try frame.locals.append(self.allocator, .{ .name = capture.name, .term = try self.fromType(capture.ty, ref.span(), 0), .template = capture.template, .mutable = capture.mutable });
         };
         const signature_term = try self.typeNode(&frame, function.proto_node, depth + 1);
         if (self.failed or signature_term.value != .function) return null;
@@ -1492,6 +1545,23 @@ const Solver = struct {
                 }
                 return value;
             },
+            .ref_of => {
+                const operand = data.rhs;
+                const owner = if (ast.nodes.items(.tag)[operand] == .array_access) ast.nodes.items(.data)[operand].lhs else operand;
+                var mutable = false;
+                if (ast.nodes.items(.tag)[owner] == .identifier) {
+                    const name = ast.tokenSlice(ast.firstToken(owner));
+                    for (frame.locals.items) |local| {
+                        if (std.mem.eql(u8, local.name, name)) mutable = local.mutable;
+                    }
+                }
+                return self.term(.{ .reference = .{ .child = try self.expression(frame, operand, depth + 1), .mutable = mutable } }, span);
+            },
+            .deref => {
+                const operand = root(try self.expression(frame, data.lhs, depth + 1));
+                if (operand.value == .reference) return operand.value.reference.child;
+                return self.term(.unknown, span);
+            },
             .field_access => return self.field(frame, node, depth + 1),
             .bool_not, .bool_and, .bool_or => {
                 const boolean = try self.fromType(try self.ir.internType(.boolean), span, 0);
@@ -1577,9 +1647,17 @@ const Solver = struct {
                         if (decl.ast.type_node != 0) {
                             if (ast.fullFnProto(decl.ast.type_node) != null and !signatureVariablesBound(frame, decl.ast.type_node)) {
                                 try self.fail(.generic_function_context, module.tokenSpan(ast.firstToken(decl.ast.type_node)), null);
-                            } else try self.unify(value, try self.typeNode(frame, decl.ast.type_node, depth + 1), module.tokenSpan(ast.firstToken(statement)), 0);
+                            } else {
+                                const annotation = try self.typeNode(frame, decl.ast.type_node, depth + 1);
+                                const inferred = root(value);
+                                const annotated = root(annotation);
+                                if (ast.nodes.items(.tag)[decl.ast.init_node] == .ref_of and inferred.value == .reference and annotated.value == .reference and inferred.value.reference.mutable and !annotated.value.reference.mutable) {
+                                    try self.unify(inferred.value.reference.child, annotated.value.reference.child, span, 0);
+                                    inferred.value = annotated.value;
+                                } else try self.unify(value, annotation, module.tokenSpan(ast.firstToken(statement)), 0);
+                            }
                         }
-                        try frame.locals.append(self.allocator, .{ .name = ast.tokenSlice(decl.ast.let_token + 1 + @intFromBool(decl.ast.is_mutable)), .term = value });
+                        try frame.locals.append(self.allocator, .{ .name = ast.tokenSlice(decl.ast.let_token + 1 + @intFromBool(decl.ast.is_mutable)), .term = value, .mutable = decl.ast.is_mutable });
                         result = try self.fromType(try self.ir.internType(.void), span, 0);
                     } else result = try self.expression(frame, statement, depth + 1);
                     if (root(result).value == .never) return result;
@@ -1688,6 +1766,11 @@ const Solver = struct {
             .unknown, .never => null,
             .link => unreachable,
             .known => |ty| ty,
+            .reference => |reference| blk: {
+                const child = (try self.materialize(reference.child, depth + 1)) orelse break :blk null;
+                if (!Ir.isArrayElement(self.ir.getType(child).?)) break :blk null;
+                break :blk try self.ir.internType(.{ .reference = .{ .child = child, .mutable = reference.mutable } });
+            },
             .array => |element| blk: {
                 const ty = (try self.materialize(element, depth + 1)) orelse break :blk null;
                 if (!Ir.isArrayElement(self.ir.getType(ty).?)) {
@@ -1700,12 +1783,20 @@ const Solver = struct {
                 const params = try self.allocator.alloc(Ir.TypeId, f.params.len);
                 for (f.params, params) |param, *out| {
                     out.* = (try self.materialize(param, depth + 1)) orelse break :blk null;
+                    if (self.ir.getType(out.*).? == .reference) {
+                        try self.fail(.borrow_escape, self.call_span, param.span);
+                        break :blk null;
+                    }
                     if (self.ir.getType(out.*).? == .void) {
                         try self.fail(.invalid_parameter_type, self.call_span, param.span);
                         break :blk null;
                     }
                 }
                 const result = (try self.materialize(f.result, depth + 1)) orelse break :blk null;
+                if (self.ir.getType(result).? == .reference) {
+                    try self.fail(.borrow_escape, self.call_span, f.result.span);
+                    break :blk null;
+                }
                 break :blk try self.ir.internType(.{ .function = .{ .params = params, .result = result } });
             },
             .nominal => |n| blk: {
@@ -2195,7 +2286,7 @@ test "generic closures diagnose exact constraints ambiguity locals and capture s
         .{ .source = "let main:()={let f:(x:`T)->`T=f(x)\n@print(f(true))}", .tag = .unknown_name },
         .{ .source = "let main:()={let x:int=1\nlet f=(x:`T)->`T{x}\nf(true)}", .tag = .unsupported_shadowing },
         .{ .source = "let main:()={let f=(x:`T)->`T{{let hidden:int=1\n}\nx}\n@print(f(true))\n@print(hidden)}", .tag = .unknown_name },
-        .{ .source = "let main:()={let mut n:int=1\nlet loan=&n\nlet f=(x:`T)->`T{@print(loan)\nx}\nf(true)}", .tag = .unsupported_borrow },
+        .{ .source = "let main:()={let mut n:int=1\nlet loan=&n\nlet f=(x:`T)->`T{@print(loan.*)\nx}\nf(true)}", .tag = .unsupported_borrow },
     }) |case| {
         try testInferenceFailureAllocations(std.testing.allocator, case.source, case.tag);
         try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testInferenceFailureAllocations, .{ case.source, case.tag });

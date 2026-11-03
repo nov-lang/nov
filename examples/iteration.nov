@@ -1,6 +1,7 @@
 ; nov run examples/iteration.nov
 ; nov test examples/iteration.nov
 ; Ordinary elements are immutable copies; &item borrows local array storage.
+; Reference elements require item.* for reads and writes.
 
 let Cell = struct {
     count: int,
@@ -14,7 +15,7 @@ let main: () = {
     let mut scores: []int = [2, 4, 6]
     let original = scores
     loop &score in scores {
-        score += 1
+        score.* += 1
     }
     loop score in scores {
         @println(score)
@@ -61,8 +62,8 @@ let writable_references: () = {
     let mut numbers: []int = [1, 2]
     let snapshot = numbers
     loop &number in numbers {
-        number = number + 2
-        number *= 3
+        number.* = number.* + 2
+        number.* *= 3
     }
     @assert(numbers[0] == 9)
     @assert(numbers[1] == 12)
@@ -70,17 +71,17 @@ let writable_references: () = {
     let mut rows = [Row[ .cell = Cell[ .count = 1, .label = "old" ] ]]
     let before = rows
     loop &row in rows {
-        row = Row[ .cell = Cell[ .count = 2, .label = "new" ] ]
-        row.cell = Cell[ .count = 3, .label = "nested" ]
-        row.cell.count += 4
-        row.cell.label += "!"
+        row.* = Row[ .cell = Cell[ .count = 2, .label = "new" ] ]
+        row.*.cell = Cell[ .count = 3, .label = "nested" ]
+        row.*.cell.count += 4
+        row.*.cell.label += "!"
     }
     @assert(rows[0].cell.count == 7)
     @assert(rows[0].cell.label == "nested!")
     @assert(before[0].cell.label == "old")
     numbers += [5]
     let last = &numbers[2]
-    last = 8
+    last.* = 8
     @assert(numbers[2] == 8)
 }
 
@@ -89,7 +90,7 @@ let readonly_references: () = {
     let numbers: []int = [2, 3]
     let mut total: int = 0
     loop &number in numbers {
-        let copy = number
+        let copy = number.*
         total += copy
     }
     @assert(total == 5)
@@ -160,8 +161,8 @@ let exhaustion_and_breaks: () = {
     @assert(scalar == '😀')
     let mut numbers: []int = [1, 2, 3]
     loop &number in numbers {
-        number += 10
-        if number == 11 {
+        number.* += 10
+        if number.* == 11 {
             continue
         }
         break

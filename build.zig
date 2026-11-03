@@ -178,7 +178,10 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     addGenericMethodCliTests(b, exe, generic_method_tests);
     test_step.dependOn(generic_method_tests);
     addRangeValueCliTests(b, exe, test_step, fixtures);
-    addBorrowCliTests(b, exe, test_step, fixtures);
+    const reference_tests = b.step("test-cli-references", "Run explicit local reference CLI tests");
+    addReferenceCliTests(b, exe, reference_tests);
+    addBorrowCliTests(b, exe, reference_tests, fixtures);
+    test_step.dependOn(reference_tests);
     _ = fixtures.add("library-result-source.nov", @embedFile("lib/result.nov"));
     const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
     _ = fixtures.add("library-result.nov",
@@ -563,7 +566,7 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         .{ .source = "let x:[]int=[1]", .output = "let x: []int = [1]\n" },
         .{ .source = "let x = [1]\n", .check = true },
         .{ .source = "let x=[1]", .check = true, .diagnostic = "<stdin>: error: input is not formatted", .code = 1 },
-        .{ .source = "let x:[]*int=[]", .diagnostic = "<stdin>: error: formatting this syntax is not supported yet", .code = 1 },
+        .{ .source = "let x:[]f16=[]", .diagnostic = "<stdin>: error: formatting this syntax is not supported yet", .code = 1 },
     };
     for (stdin_cases, 0..) |case, index| {
         const run = b.addRunArtifact(exe);
@@ -1188,11 +1191,11 @@ fn addClosureCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *s
         }
     }
     for ([_]struct { name: []const u8, source: []const u8, diagnostic: []const u8 }{
-        .{ .name = "borrow", .source = "let main=(){let mut n:int=1\nlet view=&n\nlet f=()->int {view}\n}\n", .diagnostic = "borrow requires" },
+        .{ .name = "borrow", .source = "let main=(){let mut n:int=1\nlet view=&n\nlet f=()->int {view.*}\n}\n", .diagnostic = "local references require" },
         .{ .name = "recursion", .source = "let main=(){let f=(n:int)->int {f(n)}\n}\n", .diagnostic = "unknown name 'f'" },
         .{ .name = "parameter", .source = "let main=(){let f=(int)->int {1}\n}\n", .diagnostic = "function parameters need names and types" },
         .{ .name = "foreign", .source = "@[export]\nlet callback=(f:()->int)->int {f()}\n", .diagnostic = "export ABI supports only" },
-        .{ .name = "loan-call", .source = "let main=(){let mut n:int=0\nlet f=()->int {n}\nlet view=&n\n@println(f(),view)}\n", .diagnostic = "owner access conflicts with a live borrow" },
+        .{ .name = "loan-call", .source = "let main=(){let mut n:int=0\nlet f=()->int {n}\nlet view=&n\n@println(f(),view.*)}\n", .diagnostic = "owner access conflicts with a live borrow" },
     }) |case| {
         const source = b.fmt("invalid-{s}.nov", .{case.name});
         _ = fixtures.add(source, case.source);
@@ -1211,7 +1214,7 @@ fn addStringByteCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step:
     const fixtures = b.addWriteFiles();
     _ = fixtures.add("string-bytes.nov", @embedFile("examples/string-bytes.nov"));
     _ = fixtures.add("excluded.nov", "@[test]\nlet excluded: () = @panic(\"test body ran\")\n" ++
-        "let main: () = {let mut text = \"é😀\\0\"\nlet alias = &text\n@assert(alias[0] == 'é')\n@assert(alias[-2] == '😀')\n@assert(alias[-1] == '\\0')\n@assert(alias.len == 3)}\n");
+        "let main: () = {let mut text = \"é😀\\0\"\nlet alias = &text\n@assert(alias.*[0] == 'é')\n@assert(alias.*[-2] == '😀')\n@assert(alias.*[-1] == '\\0')\n@assert(alias.*.len == 3)}\n");
     for ([_][]const u8{ "fmt", "semantic" }) |mode| {
         const run = b.addRunArtifact(exe);
         run.step.name = b.fmt("CLI string bytes: example {s}", .{mode});
@@ -1265,7 +1268,7 @@ fn addStringByteCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step:
     }
     const mismatch = "expression does not match the expected type";
     const assignment = "assignment target must be a mutable local, its struct field path, or its scalar-array element";
-    const borrow = "borrow requires a fixed unannotated let binding to &local or &localArray[index]; void has no borrowable storage; nonlocal owners, reborrows and explicit reference types are unsupported";
+    const borrow = "local references require &local or &localArray[index] and explicit p.* access";
     for ([_]struct { name: []const u8, source: []const u8, diagnostic: []const u8 }{
         .{ .name = "result-uint", .source = "let byte: (text: string) -> uint = text[0]\n", .diagnostic = mismatch },
         .{ .name = "result-u8", .source = "let byte: (text: string) -> u8 = text[0]\n", .diagnostic = mismatch },
@@ -1273,10 +1276,10 @@ fn addStringByteCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step:
         .{ .name = "equality-integer", .source = "let main: () = @assert(\"a\"[0] == 97)\n", .diagnostic = "literal does not match the annotated type" },
         .{ .name = "write", .source = "let main: () = {let mut text = \"a\"\ntext[0] = 'b'}\n", .diagnostic = assignment },
         .{ .name = "compound", .source = "let main: () = {let mut text = \"a\"\ntext[0] += 1}\n", .diagnostic = assignment },
-        .{ .name = "alias-write", .source = "let main: () = {let mut text = \"a\"\nlet alias = &text\nalias[0] = 'b'}\n", .diagnostic = assignment },
+        .{ .name = "alias-write", .source = "let main: () = {let mut text = \"a\"\nlet alias = &text\nalias.*[0] = 'b'}\n", .diagnostic = assignment },
         .{ .name = "borrow", .source = "let main: () = {let text = \"a\"\nlet byte = &text[0]\n}\n", .diagnostic = borrow },
         .{ .name = "mutable-borrow", .source = "let main: () = {let mut text = \"a\"\nlet byte = &text[0]\n}\n", .diagnostic = borrow },
-        .{ .name = "alias-borrow", .source = "let main: () = {let mut text = \"a\"\nlet alias = &text\nlet byte = &alias[0]\n}\n", .diagnostic = borrow },
+        .{ .name = "alias-borrow", .source = "let main: () = {let mut text = \"a\"\nlet alias = &text\nlet byte = &alias.*[0]\n}\n", .diagnostic = borrow },
     }) |case| {
         const source = b.fmt("invalid-{s}.nov", .{case.name});
         _ = fixtures.add(source, case.source);
@@ -1295,7 +1298,7 @@ fn addStringSliceCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step
     const fixtures = b.addWriteFiles();
     _ = fixtures.add("string-slices.nov", @embedFile("examples/string-slices.nov"));
     _ = fixtures.add("excluded.nov", "@[test]\nlet excluded: () = @panic(\"test body ran\")\n" ++
-        "let main: () = {let mut text = \"é😀\\0\"\nlet alias = &text\n@assert(alias[1..-1] == \"😀\")\n@assert(alias[..].len == 3)}\n");
+        "let main: () = {let mut text = \"é😀\\0\"\nlet alias = &text\n@assert(alias.*[1..-1] == \"😀\")\n@assert(alias.*[..].len == 3)}\n");
     for ([_][]const u8{ "fmt", "semantic" }) |mode| {
         const run = b.addRunArtifact(exe);
         run.step.name = b.fmt("CLI string slices: example {s}", .{mode});
@@ -2874,7 +2877,7 @@ fn addArrayFieldCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step:
         }
     }
     const unsupported_type = "this type is not supported in semantic analysis yet";
-    const unsupported_borrow = "borrow requires a fixed unannotated let binding to &local or &localArray[index]";
+    const unsupported_borrow = "local references require &local or &localArray[index]";
     const unsupported_assignment = "assignment target must be a mutable local, its struct field path, or its scalar-array element";
     for ([_]struct { name: []const u8, source: []const u8, diagnostic: []const u8 }{
         .{ .name = "nonstorable-field", .source = "let A=struct{a:[][]void,}\nlet main:()={}", .diagnostic = unsupported_type },
@@ -2885,7 +2888,7 @@ fn addArrayFieldCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step:
         .{ .name = "recursive-generic", .source = "let A:(T:type)->type=struct{a:[]A(T),}\nlet main:(a:A(int))={}", .diagnostic = "cyclic generic container instantiation" },
         .{ .name = "borrow-field", .source = "let A=struct{a:[]int,}\nlet main:()={let mut a=A[.a=[1]]\nlet r=&a.a\n}", .diagnostic = unsupported_borrow },
         .{ .name = "borrow-field-element", .source = "let A=struct{a:[]int,}\nlet main:()={let mut a=A[.a=[1]]\nlet r=&a.a[0]\n}", .diagnostic = unsupported_borrow },
-        .{ .name = "borrowed-field-index", .source = "let A=struct{a:[]int,}\nlet main:()={let mut a=A[.a=[1]]\nlet r=&a\nr.a[0]=2}", .diagnostic = unsupported_assignment },
+        .{ .name = "borrowed-field-index", .source = "let A=struct{a:[]int,}\nlet main:()={let mut a=A[.a=[1]]\nlet r=&a\nr.*.a[0] = 2}", .diagnostic = unsupported_assignment },
     }) |case| {
         const source = b.fmt("invalid-array-field-{s}.nov", .{case.name});
         _ = fixtures.add(source, case.source);
@@ -3763,6 +3766,78 @@ fn makeExe(b: *std.Build, options: ExecutableOptions) *std.Build.Step.Compile {
     return exe;
 }
 
+fn addReferenceCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    for ([_][]const u8{ "fmt", "semantic" }) |mode| {
+        const check = b.addRunArtifact(exe);
+        check.step.name = b.fmt("CLI references: {s}", .{mode});
+        check.addArgs(if (std.mem.eql(u8, mode, "fmt")) &.{ "fmt", "--check" } else &.{ "check", "--semantic" });
+        check.addFileArg(b.path("examples/references.nov"));
+        check.expectExitCode(0);
+        check.expectStdOutEqual("");
+        check.expectStdErrEqual("");
+        test_step.dependOn(&check.step);
+    }
+    for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+        for ([_][]const u8{ "run", "test" }) |command| {
+            const run = b.addRunArtifact(exe);
+            run.step.name = b.fmt("CLI references: {s} ({s})", .{ command, mode });
+            run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+            run.setEnvironmentVariable("NOV_CC", "");
+            run.setEnvironmentVariable("CC", "");
+            run.addArg(command);
+            run.addFileArg(b.path("examples/references.nov"));
+            if (mode.len != 0) run.addArg(mode);
+            run.expectExitCode(0);
+            run.expectStdOutEqual(if (std.mem.eql(u8, command, "run"))
+                "Rebound: 1 2\nReference: &mut u8\nArrays: [3, 4] [3, 5]\nReadonly: &[]u8 5\n"
+            else
+                "PASS readonly_and_downgrade\nPASS mutable_and_straightline_rebind\nPASS scalar_and_struct_pointees\nPASS arrays_indices_and_iteration\nPASS functions_ranges_and_unions\n5 passed; 0 failed; 5 total\n");
+            run.expectStdErrEqual("");
+            test_step.dependOn(&run.step);
+        }
+    }
+    const fixtures = b.addWriteFiles();
+    const unsupported = "local references require";
+    const immutable = "assignment requires a mutable local";
+    for ([_]struct { name: []const u8, body: []const u8, diagnostic: []const u8 }{
+        .{ .name = "immutable-binding-rebind", .body = "let p=&a\np=&b", .diagnostic = immutable },
+        .{ .name = "readonly-owner-write", .body = "let fixed:u8=0\nlet mut p=&fixed\np.* = 1", .diagnostic = immutable },
+        .{ .name = "downgraded-write", .body = "let p:&u8=&a\np.* = 1", .diagnostic = immutable },
+        .{ .name = "readonly-rebound-write", .body = "let mut p:&u8=&a\np=&b\np.* = 1", .diagnostic = immutable },
+        .{ .name = "mutable-upgrade", .body = "let fixed:u8=0\nlet p:&mut u8=&fixed", .diagnostic = "expression does not match the expected type" },
+        .{ .name = "dynamic-branch-rebind", .body = "let mut p=&a\nif flag {p=&b}\np.* = 1", .diagnostic = unsupported },
+        .{ .name = "both-branches-rebind", .body = "let mut p=&a\nif flag {p=&b} else {p=&b}\np.* = 1", .diagnostic = unsupported },
+        .{ .name = "loop-rebind", .body = "let mut p=&a\nloop flag {p=&b}\np.* = 1", .diagnostic = unsupported },
+        .{ .name = "short-circuit-rebind", .body = "let mut p=&a\nlet result=flag and {p=&b\ntrue}", .diagnostic = unsupported },
+        .{ .name = "nested-scope-rebind", .body = "let mut p=&a\n{let mut inner:u8=0\np=&inner}\np.* = 1", .diagnostic = unsupported },
+        .{ .name = "implicit-read", .body = "let p=&a\n@println(p)", .diagnostic = unsupported },
+        .{ .name = "implicit-index", .body = "let values:[]u8=[1]\nlet p=&values\n@println(p[0])", .diagnostic = unsupported },
+        .{ .name = "implicit-field", .body = "let value=Cell[.value=1]\nlet p=&value\n@println(p.value)", .diagnostic = unsupported },
+        .{ .name = "implicit-call", .body = "let f=()->u8 {1}\nlet p=&f\n@println(p())", .diagnostic = unsupported },
+        .{ .name = "copy-reference", .body = "let p=&a\nlet q=p", .diagnostic = unsupported },
+        .{ .name = "pass-reference", .body = "let p=&a\nconsume(p)", .diagnostic = unsupported },
+        .{ .name = "return-reference", .body = "let p=&a\nreturn p", .diagnostic = unsupported },
+        .{ .name = "store-reference", .body = "let p=&a\nlet values=[p]", .diagnostic = unsupported },
+        .{ .name = "capture-reference", .body = "let p=&a\nlet f=(){@println(p.*)}", .diagnostic = unsupported },
+        .{ .name = "reborrow", .body = "let p=&a\nlet q=&p.*", .diagnostic = unsupported },
+        .{ .name = "reference-to-reference", .body = "let p=&a\nlet q=&p", .diagnostic = unsupported },
+        .{ .name = "typeof-dereference", .body = "let p=&a\nlet x:@TypeOf(p.*)=1", .diagnostic = "@TypeOf requires a variable, parameter or imported value reference" },
+        .{ .name = "rebound-owner-conflict", .body = "let mut p=&a\np=&b\nb=2\np.* = 1", .diagnostic = "owner access conflicts with a live borrow" },
+    }) |case| {
+        const source = fixtures.add(b.fmt("reference-{s}.nov", .{case.name}), b.fmt("let Cell=struct{{value:u8,}}\nlet consume:(v:u8)={{}}\nlet verify:(flag:bool)={{let mut a:u8=0\nlet mut b:u8=0\n{s}\n}}\nlet main:()=verify(true)\n", .{case.body}));
+        for ([_]bool{ false, true }) |emit| {
+            const check = b.addRunArtifact(exe);
+            check.step.name = b.fmt("CLI references reject: {s} ({s})", .{ case.name, if (emit) "emit-c" else "semantic" });
+            check.addArgs(if (emit) &.{"emit-c"} else &.{ "check", "--semantic" });
+            check.addFileArg(source);
+            check.expectExitCode(1);
+            check.expectStdOutEqual("");
+            check.expectStdErrMatch(b.fmt("error: {s}", .{case.diagnostic}));
+            test_step.dependOn(&check.step);
+        }
+    }
+}
+
 fn addBorrowCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step, fixtures: *std.Build.Step.WriteFile) void {
     _ = fixtures.add("borrowed-elements.nov", @embedFile("examples/managed-arrays.nov"));
     _ = fixtures.add("borrowed-integer.nov",
@@ -3770,7 +3845,7 @@ fn addBorrowCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *st
         \\    let mut x: uint = 1
         \\    let earlierx = x
         \\    let y = &x
-        \\    y += 1
+        \\    y.* += 1
         \\    @println(x, earlierx)
         \\}
         \\
@@ -3802,7 +3877,7 @@ fn addBorrowCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *st
         run.expectStdErrEqual("");
         test_step.dependOn(&run.step);
     };
-    _ = fixtures.add("borrow-conflict.nov", "let R = struct { n: uint = 0, }\nlet main: () = {\nlet mut items = [R[]]\nlet item = &items[0]\nitems += [R[]]\nitem.n += 1\n}\n");
+    _ = fixtures.add("borrow-conflict.nov", "let R = struct { n: uint = 0, }\nlet main: () = {\nlet mut items = [R[]]\nlet item = &items[0]\nitems += [R[]]\nitem.*.n += 1\n}\n");
     for ([_][]const u8{ "semantic", "fmt", "default", "--debug", "--release" }) |mode| {
         const run = b.addRunArtifact(exe);
         run.step.name = b.fmt("CLI static borrowing: {s}", .{mode});
@@ -3870,7 +3945,7 @@ fn addIterationCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: 
     const conflict = "owner access conflicts with a live borrow";
     const immutable = "assignment requires a mutable local";
     const unsupported = "reference iteration requires a local array owner";
-    const reborrow = "borrow requires a fixed unannotated let binding";
+    const reborrow = "local references require";
     for ([_]struct { name: []const u8, body: []const u8, diagnostic: []const u8 }{
         .{ .name = "copy-assignment", .body = "let a:[]int=[1]\nloop x in a {x=2}", .diagnostic = immutable },
         .{ .name = "copy-field", .body = "let a=[R[.n=1]]\nloop x in a {x.n+=1}", .diagnostic = immutable },
@@ -3878,9 +3953,9 @@ fn addIterationCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: 
         .{ .name = "source-compound", .body = "let mut a:[]int=[1]\nloop x in a {a[0]+=2}", .diagnostic = conflict },
         .{ .name = "source-replacement", .body = "let mut a:[]int=[1]\nloop x in a {a=[2]}", .diagnostic = conflict },
         .{ .name = "source-growth", .body = "let mut a:[]int=[1]\nloop x in a {a+=[2]}", .diagnostic = conflict },
-        .{ .name = "new-loan", .body = "let mut a:[]int=[1]\nloop x in a {let r=&a[0]\nr=2}", .diagnostic = conflict },
+        .{ .name = "new-loan", .body = "let mut a:[]int=[1]\nloop x in a {let r=&a[0]\nr.* = 2}", .diagnostic = conflict },
         .{ .name = "nested-exclusive", .body = "let mut a:[]int=[1]\nloop x in a {loop &y in a {}}", .diagnostic = conflict },
-        .{ .name = "prior-loan", .body = "let mut a:[]int=[1]\nlet r=&a\nloop &x in a {@println(r[0])}", .diagnostic = conflict },
+        .{ .name = "prior-loan", .body = "let mut a:[]int=[1]\nlet r=&a\nloop &x in a {@println(r.*[0])}", .diagnostic = conflict },
         .{ .name = "loan-source-read", .body = "let mut a:[]int=[1]\nloop &x in a {@println(a[0])}", .diagnostic = conflict },
         .{ .name = "loan-source-growth", .body = "let mut a:[]int=[1]\nloop &x in a {a+=[2]}", .diagnostic = conflict },
         .{ .name = "loan-new-loan", .body = "let mut a:[]int=[1]\nloop &x in a {let r=&a[0]\n}", .diagnostic = conflict },
@@ -3888,12 +3963,12 @@ fn addIterationCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: 
         .{ .name = "reference-range", .body = "loop &x in 0..2 {}", .diagnostic = unsupported },
         .{ .name = "reference-temporary", .body = "loop &x in [true] {}", .diagnostic = unsupported },
         .{ .name = "reference-reborrow", .body = "let a:[]int=[1]\nlet r=&a\nloop &x in r {}", .diagnostic = unsupported },
-        .{ .name = "readonly-assignment", .body = "let a:[]int=[1]\nloop &x in a {x=2}", .diagnostic = immutable },
-        .{ .name = "readonly-compound", .body = "let a:[]int=[1]\nloop &x in a {x+=2}", .diagnostic = immutable },
-        .{ .name = "readonly-field", .body = "let a=[R[.n=1]]\nloop &x in a {x.n+=1}", .diagnostic = immutable },
-        .{ .name = "escape-return", .body = "let mut a:[]int=[1]\nloop &x in a {return &x}", .diagnostic = reborrow },
-        .{ .name = "escape-array", .body = "let mut a:[]int=[1]\nloop &x in a {let escaped=[&x]\n}", .diagnostic = reborrow },
-        .{ .name = "escape-binding", .body = "let mut a:[]int=[1]\nloop &x in a {let r=&x\n}", .diagnostic = reborrow },
+        .{ .name = "readonly-assignment", .body = "let a:[]int=[1]\nloop &x in a {x.* = 2}", .diagnostic = immutable },
+        .{ .name = "readonly-compound", .body = "let a:[]int=[1]\nloop &x in a {x.* += 2}", .diagnostic = immutable },
+        .{ .name = "readonly-field", .body = "let a=[R[.n=1]]\nloop &x in a {x.*.n += 1}", .diagnostic = immutable },
+        .{ .name = "escape-return", .body = "let mut a:[]int=[1]\nloop &x in a {return &x.*}", .diagnostic = reborrow },
+        .{ .name = "escape-array", .body = "let mut a:[]int=[1]\nloop &x in a {let escaped=[&x.*]\n}", .diagnostic = reborrow },
+        .{ .name = "escape-binding", .body = "let mut a:[]int=[1]\nloop &x in a {let r=&x.*\n}", .diagnostic = reborrow },
         .{ .name = "escape-scope", .body = "let a:[]int=[1]\nloop &x in a {}\n@println(x)", .diagnostic = "unknown name" },
     }) |case| {
         const source = b.fmt("invalid-{s}.nov", .{case.name});

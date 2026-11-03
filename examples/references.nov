@@ -1,0 +1,165 @@
+; nov run examples/references.nov
+; nov test examples/references.nov
+; &owner infers pointee mutability; let mut independently permits rebinding.
+; Always use p.* to read, write, project, index or call the pointee.
+; References stay local: copy p.* instead of copying or escaping p.
+
+let Mode = enum {
+    idle,
+    active,
+}
+let Cell = struct {
+    value: u8,
+}
+let Value = union {
+    count: u8,
+    empty,
+}
+let double: (n: u8) -> u8 = n * 2
+let triple: (n: u8) -> u8 = n * 3
+
+let main: () = {
+    let mut a: u8 = 0
+    let mut b: u8 = 0
+    let mut p = &a
+    p.* = 1
+    p = &b
+    p.* = 2
+    @println("Rebound:", a, p.*)
+    @println("Reference:", @TypeOf(p))
+    let mut numbers: []u8 = [3, 4]
+    let saved = numbers
+    let items = &numbers
+    items.*[-1] += 1
+    @println("Arrays:", saved, items.*)
+    let readonly: &[]u8 = &numbers
+    @println("Readonly:", @TypeOf(readonly), readonly.*[-1])
+}
+
+@[test]
+let readonly_and_downgrade: () = {
+    let a: u8 = 3
+    let b: u8 = 4
+    let fixed = &a
+    @assert(fixed.* == 3 and "{@TypeOf(fixed)}" == "&u8")
+    ; A mutable reference binding can still have a readonly pointee.
+    let mut view = &a
+    view = &b
+    @assert(view.* == 4 and "{@TypeOf(view)}" == "&u8")
+    let mut owner: u8 = 5
+    let readonly: &u8 = &owner
+    let copy = readonly.*
+    @assert(copy == 5 and "{@TypeOf(readonly)}" == "&u8")
+    owner = 6
+    @assert(owner == 6 and copy == 5)
+}
+
+@[test]
+let mutable_and_straightline_rebind: () = {
+    let mut a: u8 = 0
+    let mut b: u8 = 0
+    let mut p: &mut u8 = &a
+    p.* = 1
+    p = &b
+    a += 2
+    p.* = 2
+    @assert(a == 3 and p.* == 2)
+    @assert("{@TypeOf(p)}" == "&mut u8")
+    p = &a
+    p.* += 4
+    @assert(p.* == 7 and b == 2)
+    ; An immutable binding can mutate its mutable pointee without rebinding.
+    let fixed = &b
+    fixed.* += 1
+    @assert(fixed.* == 3)
+}
+
+@[test]
+let scalar_and_struct_pointees: () = {
+    let mut enabled = false
+    let flag = &enabled
+    flag.* = true
+    @assert(flag.* and "{@TypeOf(flag)}" == "&mut bool")
+    let mut scalar = 'a'
+    let letter = &scalar
+    letter.* = '😀'
+    @assert(letter.* == '😀' and "{@TypeOf(letter)}" == "&mut rune")
+    let mut number: f32 = 1.5
+    let real = &number
+    real.* *= 2
+    @assert(real.* == 3 and "{@TypeOf(real)}" == "&mut f32")
+    let mut text = "hello"
+    let message = &text
+    message.* += "!"
+    @assert(message.*[-1] == '!' and "{@TypeOf(message)}" == "&mut string")
+    let mut mode = Mode.idle
+    let state = &mode
+    state.* = .active
+    @assert(state.* == .active and "{@TypeOf(state)}" == "&mut Mode")
+    let mut cell = Cell[ .value = 1 ]
+    let record = &cell
+    let snapshot = record.*
+    record.*.value += 1
+    @assert(record.*.value == 2 and snapshot.value == 1)
+    @assert("{@TypeOf(record)}" == "&mut Cell")
+}
+
+@[test]
+let arrays_indices_and_iteration: () = {
+    let mut numbers: []u8 = [1, 2, 3]
+    let saved = numbers
+    let items = &numbers
+    items.*[-1] = 4
+    items.* += [5]
+    @assert(items.*.len == 4 and items.*[-1] == 5)
+    @assert("{@TypeOf(items)}" == "&mut []u8")
+    let mut index: int = -2
+    let element = &numbers[index]
+    index = 0
+    element.* += 2
+    @assert(element.* == 6 and index == 0)
+    loop &item in numbers {
+        item.* += 1
+    }
+    @assert(numbers[2] == 7 and saved[2] == 3)
+    let readonly: &[]u8 = &numbers
+    let detached = readonly.*
+    @assert(detached[-1] == 6 and "{@TypeOf(readonly)}" == "&[]u8")
+    let mut total: u8 = 0
+    loop &item in saved {
+        @assert("{@TypeOf(item)}" == "&u8")
+        total += item.*
+    }
+    @assert(total == 6)
+    let mut rows: [][]u8 = [[1], [2]]
+    let row = &rows[-1]
+    row.*[0] += 3
+    @assert(row.*[0] == 5)
+}
+
+@[test]
+let functions_ranges_and_unions: () = {
+    let mut operation = double
+    let callback = &operation
+    callback.* = triple
+    @assert(callback.*(3) == 9)
+    @assert("{@TypeOf(callback)}" == "&mut (u8) -> u8")
+    let mut range = 0..2
+    let bounds = &range
+    bounds.* = 1..=3
+    let mut total: uint = 0
+    loop n in bounds.* {
+        total += n
+    }
+    @assert(total == 6)
+    let mut result: Value = .empty[]
+    let payload = &result
+    payload.* = .count[7]
+    @assert(
+        match payload.* {
+            .count => |n| n == 7
+            .empty => false
+        }
+    )
+    @assert("{@TypeOf(payload)}" == "&mut Value")
+}

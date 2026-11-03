@@ -1194,18 +1194,21 @@ fn parseCurlySuffixExpr(self: *Parser) Error!Node.Index {
 }
 
 /// TypeExpr <- PrefixTypeOp* SuffixExpr
-/// PrefixTypeOp <- AMPERSAND / ArrayTypeStart
+/// PrefixTypeOp <- AMPERSAND KEYWORD_mut? / ArrayTypeStart
 /// ArrayTypeStart <- LBRACKET RBRACKET
 fn parseTypeExpr(self: *Parser) Error!Node.Index {
     switch (self.token_tags[self.tok_i]) {
-        .asterisk => return self.addNode(.{
-            .tag = .ref_type,
-            .main_token = self.nextToken(),
-            .data = .{
-                .lhs = self.eatToken(.keyword_mut) orelse 0,
-                .rhs = try self.expectTypeExpr(),
-            },
-        }),
+        .ampersand => {
+            const token = self.nextToken();
+            self.eatNewLines();
+            const mutable = self.eatToken(.keyword_mut) orelse 0;
+            self.eatNewLines();
+            return self.addNode(.{
+                .tag = .ref_type,
+                .main_token = token,
+                .data = .{ .lhs = mutable, .rhs = try self.expectTypeExpr() },
+            });
+        },
         .l_bracket => {
             // TODO: probably try to have []T and if it's fail fallback to parseSuffixExpr
             const lbracket = self.nextToken();
@@ -2286,6 +2289,34 @@ test "parser ownership survives allocation failures" {
     }
 }
 
+test "local reference type parser distinguishes readonly mutable and expression borrows" {
+    const source = "let f:()={let a:&i32 = &owner\nlet mut b:&mut []f64 = &items\nlet c:& &mut i32 = &owner\n}";
+    var ast = try parse(std.testing.allocator, source);
+    defer ast.deinit(std.testing.allocator);
+    errdefer for (ast.errors) |parse_error| {
+        std.debug.print("reference parser: {s} at {s}\n", .{ @tagName(parse_error.tag), ast.tokenSlice(parse_error.token) });
+    };
+    try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    var types: usize = 0;
+    var mutable: usize = 0;
+    var expressions: usize = 0;
+    for (ast.nodes.items(.tag), ast.nodes.items(.data), 0..) |tag, data, i| {
+        if (tag == .ref_type) {
+            types += 1;
+            try std.testing.expectEqualStrings("&", ast.tokenSlice(ast.firstToken(@intCast(i))));
+            if (data.lhs != 0) {
+                mutable += 1;
+                try std.testing.expectEqualStrings("mut", ast.tokenSlice(data.lhs));
+            }
+            try std.testing.expectEqual(ast.lastToken(data.rhs), ast.lastToken(@intCast(i)));
+        } else if (tag == .ref_of) expressions += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 4), types);
+    try std.testing.expectEqual(@as(usize, 2), mutable);
+    try std.testing.expectEqual(@as(usize, 3), expressions);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
+}
+
 test "iteration parser accessors retain reference captures sources spans and exhaustion" {
     for ([_][:0]const u8{
         "let f:()=loop item in items {} else {}",
@@ -2847,7 +2878,7 @@ test "parse multiline and typed declarations" {
         \\let x =
         \\    #3 + 1
         \\    + 1
-        \\let y: *mut int = 1 + 1
+        \\let y: &mut int = &x
         \\
     ;
     var ast = try parse(std.testing.allocator, source);

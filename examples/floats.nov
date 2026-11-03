@@ -72,14 +72,14 @@ let mutation_copies_and_generic_containers: () = {
     let mut samples = [Measurement[ .value = 1.5, .weight = 2 ]]
     let saved = samples
     loop &sample in samples {
-        sample.value *= 2
+        sample.*.value *= 2
     }
     @assert(saved[0].value == 1.5 and samples[0].value == 3)
     let mut numbers: []f32 = [1, 2]
     let first = &numbers[0]
-    first += step
-    first /= 2
-    @assert(first == 0.625)
+    first.* += step
+    first.* /= 2
+    @assert(first.* == 0.625)
 
     let result: Result(f64, string) = .ok[weighted_mean(samples)]
     @assert(result.unwrapOr(0) == 3)

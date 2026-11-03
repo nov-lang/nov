@@ -39,7 +39,7 @@ let main: () = {
     let mut rows = [["Ada"], ["Grace"]]
     let saved = rows
     let first = &rows[0]
-    first[0] = first[0] + "!"
+    first.*[0] = first.*[0] + "!"
     @println("Rows:", saved[0][0], rows[0][0])
     let colors: []Color = [.red, .blue]
     @println("Blue:", Color.blue in colors)
@@ -55,7 +55,7 @@ let enum_membership_and_refs: () = {
     let saved = colors
     colors += [.blue]
     let first = &colors[0]
-    first = .blue
+    first.* = .blue
     @assert(Color.red in saved)
     let savedBlue = Color.blue in saved
     @assert(savedBlue == false)
@@ -63,7 +63,7 @@ let enum_membership_and_refs: () = {
     let currentRed = Color.red in colors
     @assert(currentRed == false)
     loop &color in colors {
-        color = .red
+        color.* = .red
     }
     let currentBlue = Color.blue in colors
     @assert(currentBlue == false)
@@ -76,8 +76,8 @@ let nested_copies_and_iteration: () = {
     let mut assigned: [][]string = []
     assigned = rows
     let first = &rows[0]
-    first[0] = first[0] + "!"
-    first += ["d"]
+    first.*[0] = first.*[0] + "!"
+    first.* += ["d"]
     @assert(saved[0][0] == "ab" and saved[0].len == 1)
     @assert(assigned[0][0] == "ab")
     loop row in rows {
@@ -85,7 +85,7 @@ let nested_copies_and_iteration: () = {
         detached[0] = "copy"
     }
     loop &row in rows {
-        row += ["tail"]
+        row.* += ["tail"]
     }
     @assert(rows[0][0] == "ab!" and rows[0].len == 3)
     @assert(rows[1].len == 2 and saved[1].len == 1)
@@ -165,7 +165,7 @@ let escaping_closures_share_cells: () = {
     @assert(functions[2]() == 1)
     @assert(saved[0]() == 4)
     let first = &functions[0]
-    @assert(first() == 5)
+    @assert(first.*() == 5)
 }
 
 @[test]
@@ -192,9 +192,9 @@ let range_bounds_and_loops: () = {
     let first = &ranges[0]
     start = 4
     end = 5
-    first = start..=end
+    first.* = start..=end
     let mut borrowed: int = 0
-    loop n in first {
+    loop n in first.* {
         borrowed += n
     }
     @assert(borrowed == 9)

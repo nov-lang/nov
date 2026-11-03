@@ -53,15 +53,15 @@ let copies_and_borrows: () = {
     let mut value = 'a'
     let original = value
     let view = &value
-    view = letter
+    view.* = letter
     @assert(value == letter)
     @assert(original == 'a')
     let mut letters: []rune = ['a', letter]
     let snapshot = letters
     let whole = &letters
-    whole[0] = '😀'
+    whole.*[0] = '😀'
     let element = &letters[1]
-    element = 'z'
+    element.* = 'z'
     @assert(letters[0] == '😀')
     @assert(letters[1] == 'z')
     @assert(snapshot[0] == 'a')

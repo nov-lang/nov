@@ -93,6 +93,51 @@ roots, malformed metadata, cross-heap root record reuse and use-after-free outsi
 tracing remain caller/compiler errors. A stale pointer whose address has been
 reused cannot be distinguished from a current allocation.
 
+## Explicit local reference capabilities
+
+The source contract uses readonly `&T` and mutable-pointee `&mut T`, not `&const T`.
+`&a` infers the mutable-pointee form iff owner `a` is mutable. An explicit
+`let p: &T = &mutableOwner` downgrades to readonly. Binding mutability is separate:
+`let p = &a` cannot rebind, but `p.* = value` is valid for `&mut T`; `let mut p`
+permits `p = &b` with the same exact reference type (including any explicit
+readonly annotation). Rebinding is straight-line in the same lexical/control
+region only. Rebinding an outer reference from dynamic branches, nested blocks,
+short-circuit RHSs or loops is rejected; loop-body-local straight-line rebinding
+does not merge reference state across backedges.
+
+All pointee reads/writes are explicit: `p.*`, `p.*[i]`, `p.*.field`, `p.*()` and
+`p.* = value`. No autodereference exists. `loop &item in items` yields a scoped
+reference accessed via `item.*`. `@TypeOf(p)` inspects the compile-time reference
+descriptor and renders canonical names such as `&u8` / `&mut u8`; it does not
+read the target. `@TypeOf(p.*)` remains unsupported by the bounded binding query.
+
+These are local-only compile-time capabilities over existing borrow IR, not
+first-class runtime pointer values or reinterpretations of value storage.
+Explicit reads lower to child values; they retain normal recursive-copy semantics
+and may allocate. Borrow creation itself does not clone/allocate its target.
+Static NLL/CFG checks protect loans through branches, loop backedges and compound
+RHS evaluation. Stable owner slots and optional normalized indices retain managed
+owners under the existing root discipline; bounds checks are unchanged. Derived
+addresses are used only immediately, never traced as interior GC roots. There are
+no runtime generation/reference-validity checks.
+
+Copying (`let q = p`), passing, returning, storing, capturing and reborrowing
+references are currently rejected. Reference types are not storable array elements,
+aggregate fields/payloads, constants, parameters or results. Nonlocal/temporary/void
+owners and references to references remain unsupported. Passing or returning `p.*`
+is an ordinary child-value operation, not reference escape. No manual memory
+management, pointer arithmetic, null references or unsafe dereference is added.
+
+**Accepted roadmap, not implemented:** implement passing, returning and storing
+references with lifetime/referent tracking across frames and managed aggregates.
+Managed referents must stay GC-retained for every live reference; owner replacement,
+resizing or lifetime end must be statically prevented or safely invalidate affected
+references, never expose dangling storage. The current local owner-slot scheme
+alone does not implement escaping-reference lifetimes. Future representations,
+tracing and invalidation checks must satisfy that contract before escape is enabled.
+Broader raw-pointer and managed-FFI proposals remain separate. See
+`examples/references.nov` and the root README for the source-facing contract.
+
 ## Closure environments and shared cells
 
 When a program contains closures, internal function values carry a
@@ -323,7 +368,9 @@ on **every** allocation, injected allocation failures/retries, strict C11/UBSan,
 -O0 and -O3 bounds checks, argument-order effects, nested loops and early returns.
 
 Writable length (especially growth initialization), array slices/invalidation,
-pointer elements, general explicit aliases and managed FFI remain deferred.
+general pointer elements and managed FFI remain deferred. Passing, returning and
+storing safe references is an accepted, unimplemented roadmap as described above;
+bounded explicit local references are delivered, not general storable aliases.
 Direct chained indexed writes, record-field writes through computed elements and
 arbitrary computed-base writes remain unsupported. Existing scoped stable-owner
 loans allow supported nested-array element updates and replacement; no new borrow
