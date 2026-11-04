@@ -50,6 +50,15 @@ results. See `examples/array-fields.nov`.
 
 ## Current delivered status
 
+Stdlib `std.string` provides startsWith, endsWith, contains and find as ordinary
+Nov functions. Searches are exact/case-sensitive Unicode scalar matches, including
+NUL and immutable views; no normalization/grapheme matching. find returns first
+zero-based scalar Option(uint), absence none; empty pattern matches zero and empty
+prefix/suffix match. Arguments retain eager left-to-right evaluation and shared
+immutable owners. Initial scalar indexing/slicing may rescan UTF-8; optimization
+remains paused. No compiler feature, mutable-string or conversion API is added.
+See examples/string-search.nov (five tests) and lib/README.md.
+
 Option.andThen and Result.andThen chain container-returning callbacks without
 nesting. They invoke next once for some/ok and propagate none/errors unchanged;
 Result error types match exactly. Existing eager receiver/callback construction,

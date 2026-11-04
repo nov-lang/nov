@@ -1,17 +1,19 @@
 # Nov standard library foundation
 
-Import the standard namespace and alias its ordinary union templates and array
-helper namespace:
+Import the standard namespace and alias its ordinary union templates and helper
+namespaces:
 
 ```nov
 let std = @import("std")
 let Result = std.Result
 let Option = std.Option
 let array = std.array
+let text = std.string
 ```
 
 `std.nov` is the entry module. It publicly re-exports `Result` from `result.nov`,
-`Option` from `option.nov`, and the `array` namespace from `array.nov`. These are
+`Option` from `option.nov`, the `array` namespace from `array.nov`, and the
+`string` namespace from `string.nov`. These are
 ordinary library declarations, not compiler builtins or automatically injected
 bare names.
 
@@ -198,6 +200,35 @@ substantial overhead. Further optimization remains **PAUSED**. See
 `examples/array-helpers.nov` for the runnable example and six tests covering typed
 and generic callbacks, stable order, empty inputs, left folds, recursive copies,
 shared closure environments and eager argument order.
+
+## String search
+
+- `std.string.startsWith(text: string, prefix: string) -> bool`
+- `std.string.endsWith(text: string, suffix: string) -> bool`
+- `std.string.find(text: string, pattern: string) -> Option(uint)`
+- `std.string.contains(text: string, pattern: string) -> bool`
+
+Matching is exact and case-sensitive, with no Unicode normalization or grapheme
+matching. `find` returns the first match's zero-based **Unicode scalar index**,
+not a byte offset; absence returns none. Empty patterns match at index zero,
+including an empty input, and empty prefixes/suffixes always match. Oversized
+patterns do not match. Embedded NUL is an ordinary scalar. Canonically equivalent
+spellings such as precomposed `é` and `e` followed by a combining accent remain
+distinct. Pattern and input expressions evaluate once in normal left-to-right
+argument order; immutable views retain their existing GC owners.
+
+```nov
+let index = std.string.find("é😀z", "z")
+@assert(index.unwrapOr(99) == 2)
+@assert(std.string.startsWith("é😀z", "é"))
+@assert(std.string.contains("a\0b", "\0"))
+```
+
+These are ordinary Nov functions implemented using existing scalar indexing,
+slices and zip loops. They may repeatedly scan UTF-8; no efficient-search
+complexity is promised yet, and optimization remains paused. They do not add
+mutable strings, byte conversions, normalization or case folding. See
+`examples/string-search.nov` for a runnable example and five tests.
 
 ## References and library boundaries
 

@@ -1,0 +1,137 @@
+; nov run examples/string-search.nov
+; nov test examples/string-search.nov
+; Matching is exact: indices count Unicode scalars, not bytes or graphemes.
+
+let std = @import("std")
+
+let owned_view: () -> string = {
+    let payload = "é😀\0e\u{301}"
+    let text = "prefix:{payload}:suffix"
+    text[7..-7]
+}
+
+@[test]
+let ascii_prefix_suffix_and_first_match: () = {
+    @assert(std.string.startsWith("banana", "ban"))
+    @assert(std.string.endsWith("banana", "ana"))
+    @assert(std.string.startsWith("banana", "ana") == false)
+    @assert(std.string.endsWith("banana", "ban") == false)
+    @assert(std.string.startsWith("banana", "banana"))
+    @assert(std.string.endsWith("banana", "banana"))
+    let index: std.Option(uint) = std.string.find("banana", "ana")
+    @assert(index.unwrapOr(99) == 1)
+    @assert(std.string.find("aaaa", "aa").unwrapOr(99) == 0)
+    @assert(std.string.find("aaab", "aab").unwrapOr(99) == 1)
+    @assert(std.string.find("banana", "banana").unwrapOr(99) == 0)
+    @assert(std.string.find("banana", "na").unwrapOr(99) == 2)
+    @assert(std.string.find("banana", "z").isNone())
+    @assert(std.string.contains("banana", "ana"))
+    @assert(std.string.contains("banana", "BAN") == false)
+}
+
+@[test]
+let empty_and_oversized_patterns: () = {
+    @assert(std.string.startsWith("", ""))
+    @assert(std.string.endsWith("", ""))
+    @assert(std.string.startsWith("abc", ""))
+    @assert(std.string.endsWith("abc", ""))
+    @assert(std.string.find("", "").unwrapOr(99) == 0)
+    @assert(std.string.find("abc", "").unwrapOr(99) == 0)
+    @assert(std.string.contains("", ""))
+    @assert(std.string.contains("abc", ""))
+    @assert(std.string.startsWith("", "a") == false)
+    @assert(std.string.endsWith("", "a") == false)
+    @assert(std.string.find("", "a").isNone())
+    @assert(std.string.contains("", "a") == false)
+    @assert(std.string.startsWith("ab", "abc") == false)
+    @assert(std.string.endsWith("ab", "abc") == false)
+    @assert(std.string.find("ab", "abc").isNone())
+    @assert(std.string.contains("ab", "abc") == false)
+}
+
+@[test]
+let unicode_scalars_nul_and_exact_matching: () = {
+    let text = "é😀\0e\u{301}z😀"
+    @assert(std.string.startsWith(text, "é😀\0"))
+    @assert(std.string.endsWith(text, "\u{301}z😀"))
+    @assert(std.string.find(text, "😀").unwrapOr(99) == 1)
+    @assert(std.string.find(text, "\0e").unwrapOr(99) == 2)
+    @assert(std.string.find(text, "e\u{301}").unwrapOr(99) == 3)
+    @assert(std.string.find(text, "\u{301}").unwrapOr(99) == 4)
+    @assert(std.string.find(text, "z😀").unwrapOr(99) == 5)
+    @assert(std.string.contains(text, "\0"))
+    @assert(std.string.startsWith("\0x", "\0"))
+    @assert(std.string.endsWith("x\0", "\0"))
+    @assert(std.string.find("a\0b", "\0c").isNone())
+    @assert(std.string.find("é", "e").isNone())
+    @assert(std.string.find("é", "\u{a9}").isNone())
+    @assert(std.string.find("😀", "\u{1f601}").isNone())
+    @assert(std.string.find("e\u{301}", "é").isNone())
+    @assert(std.string.find("é", "e\u{301}").isNone())
+    @assert(std.string.startsWith("é", "e") == false)
+    @assert(std.string.endsWith("é", "\u{a9}") == false)
+    @assert(std.string.contains("Straße", "STRASSE") == false)
+}
+
+@[test]
+let views_and_managed_owner_lifetimes: () = {
+    let mut source = owned_view()
+    let view = source[1..-1]
+    let pattern = source[..2][1..]
+    let stored: []string = [view, pattern]
+    source += "replacement"
+    source = "different"
+    loop i in 0..2000 {
+        let temporary = "allocation:{i}:é😀"
+        @assert(temporary.len > 0)
+    }
+    @assert(std.string.startsWith(stored[0], stored[1]))
+    @assert(std.string.endsWith(view, "\0e"))
+    @assert(std.string.find(view, "\0").unwrapOr(99) == 1)
+    @assert(std.string.find(view[1..], "e").unwrapOr(99) == 1)
+    @assert(std.string.contains(view, "replacement") == false)
+    @assert(std.string.find(owned_view(), "e\u{301}").unwrapOr(99) == 3)
+    @assert(std.string.find("a{pattern}b", "{pattern}b").unwrapOr(99) == 1)
+    @assert(view == "😀\0e" and pattern == "😀")
+}
+
+@[test]
+let callable_and_argument_source_order: () = {
+    let mut events: int = 0
+    let mut source = "a😀b"
+    let getFind = () -> (string, string) -> std.Option(uint) {
+        events = events * 10 + 1
+        std.string.find
+    }
+    let result = getFind()(
+        {
+            events = events * 10 + 2
+            source
+        },
+        {
+            events = events * 10 + 3
+            source = "replacement"
+            "😀"
+        }
+    )
+    @assert(events == 123 and result.unwrapOr(99) == 1)
+    @assert(source == "replacement")
+    events = 0
+    let text = () -> string {
+        events = events * 10 + 1
+        ""
+    }
+    let pattern = () -> string {
+        events = events * 10 + 2
+        ""
+    }
+    @assert(std.string.contains(text(), pattern()) and events == 12)
+}
+
+let main: () = {
+    @println("Prefix:", std.string.startsWith("banana", "ban"))
+    @println("Suffix:", std.string.endsWith("banana", "ana"))
+    @println("First:", std.string.find("banana", "ana").unwrapOr(99))
+    @println("Scalar index:", std.string.find("é😀z", "z").unwrapOr(99))
+    @println("Contains:", std.string.contains("banana", "apple"))
+}

@@ -6,3 +6,6 @@ let Option = @import("option.nov").Option
 
 @[public]
 let array = @import("array.nov")
+
+@[public]
+let string = @import("string.nov")

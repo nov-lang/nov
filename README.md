@@ -3073,6 +3073,28 @@ Literals use static read-only bytes with a null GC owner; concatenation results
 have an exact scalar GC backing descriptor. Only managed owner fields are traced,
 never static byte pointers. Temporaries use the same precise root frames as arrays.
 
+### Standard-library string search
+
+Import `std` and use its `string` namespace:
+
+```nov
+let std = @import("std")
+let found = std.string.find("é😀z", "z") ; Option(uint).some[2]
+let starts = std.string.startsWith("é😀z", "é")
+let ends = std.string.endsWith("é😀z", "😀z")
+let contains = std.string.contains("a\0b", "\0")
+```
+
+`find` returns the first match's zero-based Unicode scalar index as `Option(uint)`;
+no match yields none. Matching is exact and case-sensitive, including embedded
+NUL, without normalization or grapheme processing. An empty pattern matches at
+zero, even in an empty string; empty prefixes and suffixes always match.
+These ordinary library functions work with immutable views and use normal eager
+argument evaluation. Their initial scalar-indexing/slicing implementations may
+rescan UTF-8; optimization remains deferred. See
+[`examples/string-search.nov`](examples/string-search.nov) and
+[`lib/README.md`](lib/README.md#string-search).
+
 ## String Interpolation
 
 `"{expression}"` evaluates an expression in the current lexical scope and produces

@@ -130,6 +130,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const string_slice_tests = b.step("test-cli-string-slices", "Run immutable scalar string slicing CLI tests");
     addStringSliceCliTests(b, exe, string_slice_tests);
     test_step.dependOn(string_slice_tests);
+    const string_search_tests = b.step("test-cli-string-search", "Run standard-library string search CLI tests");
+    addStringSearchCliTests(b, exe, string_search_tests);
+    test_step.dependOn(string_search_tests);
     const rune_tests = b.step("test-cli-runes", "Run Unicode rune CLI tests");
     addRuneCliTests(b, exe, rune_tests);
     test_step.dependOn(rune_tests);
@@ -2895,6 +2898,110 @@ fn addArrayHelperCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step
                 test_step.dependOn(&run.step);
             }
         }
+    }
+}
+
+fn addStringSearchCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    const fixtures = b.addWriteFiles();
+    const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
+    _ = fixtures.add("string-search.nov", @embedFile("examples/string-search.nov"));
+    const aliases_source =
+        \\let standard = @import("std")
+        \\let direct = @import("lib/string.nov")
+        \\let option = @import("lib/option.nov")
+        \\let alternate = @import("lib/./option.nov")
+        \\let other = @import("lib/./string.nov")
+        \\let verify: () = {
+        \\    let startsWith = direct.startsWith
+        \\    let endsWith = other.endsWith
+        \\    let find = other.find
+        \\    let contains = direct.contains
+        \\    let search: (string, string) -> option.Option(uint) = find
+        \\    let locate: (string, string) -> alternate.Option(uint) = standard.string.find
+        \\    let found: standard.Option(uint) = search("é😀z", "😀")
+        \\    let index: standard.Option(uint) = locate("banana", "ana")
+        \\    @assert(found.unwrapOr(99) == 1 and index.unwrapOr(99) == 1)
+        \\    @assert(startsWith("é😀", "é") and endsWith("é😀", "😀"))
+        \\    @assert(standard.string.startsWith("abc", "a") and other.contains("abc", "b"))
+        \\    @assert(contains("a\0b", "\0") and direct.endsWith("abc", "c"))
+        \\    @assert(direct.find("abc", "z").isNone())
+        \\    @assert(search("", "").unwrapOr(99) == 0)
+        \\}
+        \\@[test]
+        \\let aliases_and_canonical_option: () = verify()
+        \\let main: () = verify()
+        \\
+    ;
+    _ = fixtures.add("aliases.nov", aliases_source);
+    for ([_][]const u8{ "string-search.nov", "lib/std.nov", "lib/string.nov", "aliases.nov" }) |source| {
+        for ([_]bool{ false, true }) |semantic| {
+            if (!semantic and std.mem.eql(u8, source, "aliases.nov")) continue;
+            const check = b.addRunArtifact(exe);
+            check.step.name = b.fmt("CLI string search: {s} {s}", .{ if (semantic) "semantic" else "fmt", source });
+            check.setCwd(fixtures.getDirectory());
+            check.addArgs(if (semantic) &.{ "check", "--semantic", source } else &.{ "fmt", "--check", source });
+            if (semantic) {
+                check.addArg("--lib-dir");
+                check.addDirectoryArg(library);
+            }
+            check.expectExitCode(0);
+            check.expectStdOutEqual("");
+            check.expectStdErrEqual("");
+            test_step.dependOn(&check.step);
+        }
+    }
+    const example_output = "Prefix: true\nSuffix: true\nFirst: 1\nScalar index: 2\nContains: false\n";
+    const example_tests = "PASS ascii_prefix_suffix_and_first_match\nPASS empty_and_oversized_patterns\nPASS unicode_scalars_nul_and_exact_matching\nPASS views_and_managed_owner_lifetimes\nPASS callable_and_argument_source_order\n5 passed; 0 failed; 5 total\n";
+    const package = b.addWriteFiles();
+    const installed_exe = package.addCopyFile(exe.getEmittedBin(), b.fmt("bin/{s}", .{exe.out_filename}));
+    _ = package.addCopyDirectory(b.path("lib"), "lib/nov", .{});
+    _ = package.add("string-search.nov", @embedFile("examples/string-search.nov"));
+    _ = package.add("aliases.nov", std.mem.replaceOwned(u8, b.allocator, aliases_source, "lib/", "lib/nov/") catch @panic("OOM"));
+    for ([_]bool{ false, true }) |installed| {
+        for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+            for ([_][]const u8{ "run", "test" }) |command| {
+                for ([_][]const u8{ "string-search.nov", "aliases.nov" }) |source| {
+                    const run = if (installed) std.Build.Step.Run.create(b, "CLI string search: relocated install") else b.addRunArtifact(exe);
+                    run.step.name = b.fmt("CLI string search: {s} {s} {s} (installed={})", .{ command, source, mode, installed });
+                    if (installed) run.addFileArg(installed_exe);
+                    run.setCwd(if (installed) package.getDirectory() else fixtures.getDirectory());
+                    run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+                    run.setEnvironmentVariable("NOV_CC", "");
+                    run.setEnvironmentVariable("CC", "");
+                    run.addArgs(&.{ command, source });
+                    if (mode.len != 0) run.addArg(mode);
+                    if (!installed) {
+                        run.addArg("--lib-dir");
+                        run.addDirectoryArg(library);
+                    }
+                    const is_test = std.mem.eql(u8, command, "test");
+                    const example = std.mem.eql(u8, source, "string-search.nov");
+                    run.expectExitCode(0);
+                    run.expectStdOutEqual(if (example) (if (is_test) example_tests else example_output) else if (is_test) "PASS aliases_and_canonical_option\n1 passed; 0 failed; 1 total\n" else "");
+                    run.expectStdErrEqual("");
+                    test_step.dependOn(&run.step);
+                }
+            }
+        }
+    }
+    for ([_]struct { name: []const u8, expression: []const u8 }{
+        .{ .name = "prefix-text", .expression = "std.string.startsWith(1,\"a\")" },
+        .{ .name = "suffix-pattern", .expression = "std.string.endsWith(\"abc\",true)" },
+        .{ .name = "find-pattern", .expression = "std.string.find(\"abc\",'a')" },
+        .{ .name = "contains-text", .expression = "std.string.contains([1],\"a\")" },
+    }) |case| {
+        const source = b.fmt("invalid-string-search-{s}.nov", .{case.name});
+        _ = fixtures.add(source, b.fmt("let std=@import(\"std\")\nlet main:()={{let result={s}\n}}\n", .{case.expression}));
+        const check = b.addRunArtifact(exe);
+        check.step.name = b.fmt("CLI string search: reject {s}", .{case.name});
+        check.setCwd(fixtures.getDirectory());
+        check.addArgs(&.{ "check", "--semantic", source, "--lib-dir" });
+        check.addDirectoryArg(library);
+        check.expectExitCode(1);
+        check.expectStdOutEqual("");
+        check.expectStdErrMatch(".nov:");
+        check.expectStdErrMatch("error:");
+        test_step.dependOn(&check.step);
     }
 }
 

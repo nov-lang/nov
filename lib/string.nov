@@ -1,0 +1,45 @@
+let std = @import("std.nov")
+let Option = std.Option
+
+@[public]
+let startsWith: (text: string, prefix: string) -> bool = {
+    if prefix.len > text.len {
+        return false
+    }
+    loop scalar, index in prefix, @as(int, 0).. {
+        if text[index] != scalar {
+            return false
+        }
+    }
+    true
+}
+
+@[public]
+let endsWith: (text: string, suffix: string) -> bool = {
+    if suffix.len > text.len {
+        return false
+    }
+    loop _, index in suffix, @as(int, 0).. {
+        let offset = -1 - index
+        if text[offset] != suffix[offset] {
+            return false
+        }
+    }
+    true
+}
+
+@[public]
+let find: (text: string, pattern: string) -> Option(uint) = {
+    if pattern.len == 0 {
+        return .some[0]
+    }
+    loop _, offset, index in text, @as(int, 0).., 0.. {
+        if startsWith(text[offset..], pattern) {
+            return .some[index]
+        }
+    }
+    .none[]
+}
+
+@[public]
+let contains: (text: string, pattern: string) -> bool = find(text, pattern).isSome()
