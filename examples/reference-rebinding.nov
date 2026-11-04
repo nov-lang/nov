@@ -2,7 +2,9 @@
 ; nov test examples/reference-rebinding.nov
 ; Rebinding selects a runtime target across structured control flow.
 ; New owners must live in the reference binding's scope or an outer scope.
-; Types/capabilities stay exact; references cannot be copied or escape.
+; Rebinding keeps types/capabilities exact; references cannot be copied or escape.
+; Safe calls accept reference arguments, including readonly weakening; see
+; reference-parameters.nov. Parameter bindings themselves cannot be rebound.
 
 let choose: (flag: bool) -> int = {
     let mut a: int = 1

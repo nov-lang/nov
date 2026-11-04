@@ -163,10 +163,20 @@ fn checkSupported(ast: Ast) !void {
                 for (ast.nodes.items(.tag), 0..) |parent_tag, parent| {
                     if ((parent_tag == .decl and ast.decl(@intCast(parent)).ast.init_node == i) or
                         (parent_tag == .assign and ast.nodes.items(.data)[parent].rhs == i) or
+                        (parent_tag == .function_pipe and ast.nodes.items(.data)[parent].lhs == i) or
                         (parent_tag == .loop_range and ast.fullRange(@intCast(parent)).?.binding == i))
                     {
                         binding = true;
                         break;
+                    }
+                    if (parent_tag == .call or parent_tag == .call_one) {
+                        for (ast.fullCall(@intCast(parent)).?.ast.args) |arg| {
+                            if (arg == i) {
+                                binding = true;
+                                break;
+                            }
+                        }
+                        if (binding) break;
                     }
                 }
                 if (!binding) return error.UnsupportedSyntax;
@@ -890,6 +900,13 @@ test "loop continuations and value breaks are idempotent" {
         defer std.testing.allocator.free(formatted);
         try expectFormatted(source, formatted);
     }
+}
+
+test "reference arguments format direct borrows indexed owners and pipes" {
+    try expectFormatted(
+        "let f:(p:&mut int)={p.*+=1}\nlet main:()={let mut n=1\nf(&n)\nlet mut a=[1]\nf(&a[-1])\nlet done:void=&n |> f\n}",
+        "let f: (p: &mut int) = {\n    p.* += 1\n}\nlet main: () = {\n    let mut n = 1\n    f(&n)\n    let mut a = [1]\n    f(&a[-1])\n    let done: void = &n |> f\n}\n",
+    );
 }
 
 test "iteration formatting preserves copied and borrowed captures comments and nesting" {

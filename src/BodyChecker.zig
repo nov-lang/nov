@@ -174,14 +174,10 @@ fn checkInner(module: *Module, ir: *Ir, types: []const ?Ir.TypeId, id: Module.De
                 valid = false;
                 continue;
             }
-            const slot = if (emitter != null and context.borrowedName(name) and ir.getType(ty.function.params[i]).? != .void) blk: {
-                const value = try emitter.?.append(ty.function.params[i], span, .{ .parameter = @intCast(i) });
-                break :blk try emitter.?.append(ty.function.params[i], span, .{ .local_slot = value });
-            } else null;
-            try context.bindings.put(module.allocator, name, .{ .slot = slot, .index = @intCast(i), .name_span = span, .known = .{
+            try context.bindParameter(name, @intCast(i), .{
                 .ty = ty.function.params[i],
                 .annotation = module.tokenSpan(module.source.ast.firstToken(param.type_expr)),
-            } });
+            }, span);
         }
     }
     if (!valid) return false;
@@ -610,11 +606,8 @@ const Context = struct {
             const name = ast.tokenSlice(token);
             if (child.conflict(name) != null or isPrimitive(name)) return self.fail(.unsupported_shadowing, node, child.conflict(name));
             const param_span = self.module.tokenSpan(token);
-            const slot = if (self.specializing != null and self.emitter != null and child.borrowedName(name) and self.ir.getType(signature.params[index]).? != .void) blk: {
-                const value = try emitter.append(signature.params[index], param_span, .{ .parameter = index });
-                break :blk try emitter.append(signature.params[index], param_span, .{ .local_slot = value });
-            } else null;
-            try child.bindings.put(self.module.allocator, name, .{ .known = .{ .ty = signature.params[index] }, .index = index, .name_span = param_span, .slot = slot });
+            child.emitter = if (self.specializing != null and self.emitter != null) &emitter else null;
+            try child.bindParameter(name, index, .{ .ty = signature.params[index] }, param_span);
         }
         if (self.specializing) |template| {
             child.type_captures = template.info.captures;
@@ -655,11 +648,7 @@ const Context = struct {
                 const token = param.name_token.?;
                 const name = ast.tokenSlice(token);
                 const param_span = self.module.tokenSpan(token);
-                const slot = if (child.borrowedName(name) and self.ir.getType(signature.params[index]).? != .void) blk: {
-                    const value = try emitter.append(signature.params[index], param_span, .{ .parameter = index });
-                    break :blk try emitter.append(signature.params[index], param_span, .{ .local_slot = value });
-                } else null;
-                try child.bindings.put(self.module.allocator, name, .{ .known = .{ .ty = signature.params[index] }, .index = index, .name_span = param_span, .slot = slot });
+                try child.bindParameter(name, index, .{ .ty = signature.params[index] }, param_span);
             }
             for (names) |name| if (try child.captureBinding(name, node) == null) return null;
         }
@@ -754,6 +743,20 @@ const Context = struct {
             if (ast.nodes.items(.tag)[owner] == .identifier and std.mem.eql(u8, name, ast.tokenSlice(ast.nodes.items(.main_token)[owner]))) return true;
         }
         return false;
+    }
+
+    fn bindParameter(self: *Context, name: []const u8, index: u32, known: Known, name_span: Module.Span) Error!void {
+        const ty = self.ir.getType(known.ty).?;
+        var binding: Binding = .{ .known = known, .index = index, .name_span = name_span, .borrowed = ty == .reference };
+        if (self.emitter) |emitter| {
+            if (binding.borrowed) {
+                binding.borrow = try emitter.append(try self.ir.internType(.void), name_span, .{ .reference_parameter = .{ .index = index, .ty = known.ty } });
+            } else if (self.borrowedName(name) and ty != .void) {
+                const value = try emitter.append(known.ty, name_span, .{ .parameter = index });
+                binding.slot = try emitter.append(known.ty, name_span, .{ .local_slot = value });
+            }
+        }
+        try self.bindings.put(self.module.allocator, name, binding);
     }
 
     fn bindLocal(self: *Context, name: []const u8, binding: Binding) Error!void {
@@ -989,41 +992,48 @@ const Context = struct {
     }
 
     fn borrowNamed(self: *Context, init_node: Ast.Node.Index, annotation: ?Ir.TypeId, mutable: bool, name: []const u8, name_span: Module.Span, depth: usize) Error!bool {
+        const binding = (try self.createBorrow(init_node, annotation, mutable, name, name_span, depth)) orelse return self.terminated;
+        try self.publishBorrow(name, binding);
+        return true;
+    }
+
+    // Call temporaries never enter the lexical binding table or escape the call.
+    fn createBorrow(self: *Context, init_node: Ast.Node.Index, annotation: ?Ir.TypeId, mutable: bool, name: ?[]const u8, name_span: Module.Span, depth: usize) Error!?Binding {
         const ast = &self.module.source.ast;
         const decl = .{ .init_node = init_node, .is_mutable = mutable };
         const operand = ast.nodes.items(.data)[decl.init_node].rhs;
         const scalar = ast.nodes.items(.tag)[operand] == .identifier;
         if (!scalar and ast.nodes.items(.tag)[operand] != .array_access) {
             _ = try self.fail(.unsupported_borrow, decl.init_node, null);
-            return false;
+            return null;
         }
         const access = ast.nodes.items(.data)[operand];
         const owner_node = if (scalar) operand else access.lhs;
         if (ast.nodes.items(.tag)[owner_node] != .identifier) {
             _ = try self.fail(.unsupported_borrow, operand, null);
-            return false;
+            return null;
         }
         const owner = (try self.captureBinding(ast.tokenSlice(ast.nodes.items(.main_token)[owner_node]), owner_node)) orelse {
             _ = try self.fail(.unsupported_borrow, owner_node, null);
-            return false;
+            return null;
         };
         // Taking another target does not invalidate an in-flight dereference
         // snapshot. Iteration and index reservations still protect their owners.
         if (self.accessOrigin(owner, true)) |origin| {
             _ = try self.fail(.borrow_conflict, owner_node, origin);
-            return false;
+            return null;
         }
-        if (self.bindings.get(name)) |reference_binding| {
+        if (name) |binding_name| if (self.bindings.get(binding_name)) |reference_binding| {
             if (!self.ownerOutlivesReference(owner, reference_binding)) {
                 _ = try self.fail(.unsupported_borrow, init_node, reference_binding.name_span);
-                return false;
+                return null;
             }
-        }
+        };
         const owner_type = self.ir.getType(owner.known.ty).?;
         const supported = if (scalar) Ir.isArrayElement(owner_type) else owner_type == .array;
         if (owner.borrowed or owner.template != null or !supported) {
             _ = try self.fail(.unsupported_borrow, operand, owner.name_span);
-            return false;
+            return null;
         }
         const child = if (scalar) owner.known.ty else owner_type.array;
         var reference = try self.ir.internType(.{ .reference = .{ .child = child, .mutable = owner.mutable } });
@@ -1031,7 +1041,7 @@ const Context = struct {
             const annotated = self.ir.getType(type_id).?;
             if (annotated != .reference or annotated.reference.child != child or (annotated.reference.mutable and !owner.mutable)) {
                 _ = try self.fail(.expression_type_mismatch, decl.init_node, name_span);
-                return false;
+                return null;
             }
             reference = type_id;
         }
@@ -1039,8 +1049,7 @@ const Context = struct {
         const reservation = if (self.emitter) |emitter| try emitter.append(unit, self.irSpan(decl.init_node), .{ .borrow_reserve = owner.slot.? }) else null;
         if (scalar) {
             const borrow = if (self.emitter) |emitter| try emitter.append(unit, self.irSpan(decl.init_node), .{ .borrow_start = .{ .reservation = reservation.?, .index = null } }) else null;
-            try self.publishBorrow(name, .{ .known = .{ .ty = reference }, .name_span = name_span, .mutable = decl.is_mutable, .borrowed = true, .borrow = borrow, .loan_owner = .{ .owner = owner.name_span, .origin = self.irSpan(decl.init_node) } });
-            return true;
+            return .{ .known = .{ .ty = reference }, .name_span = name_span, .mutable = decl.is_mutable, .borrowed = true, .borrow = borrow, .loan_owner = .{ .owner = owner.name_span, .origin = self.irSpan(decl.init_node) } };
         }
         const index_ty = try self.ir.internType(.{ .integer = .{ .signedness = .signed, .bits = Ir.native_pointer_bits } });
         // Reserve the source throughout index evaluation, including terminal
@@ -1050,11 +1059,10 @@ const Context = struct {
         const parent_reservation = self.reservation;
         self.reservation = &index_reservation;
         defer self.reservation = parent_reservation;
-        if (try self.expression(access.rhs, .{ .ty = index_ty }, depth + 1) == null) return false;
-        if (self.terminated) return true;
+        if (try self.expression(access.rhs, .{ .ty = index_ty }, depth + 1) == null) return null;
+        if (self.terminated) return null;
         const borrow = if (self.emitter) |emitter| try emitter.append(unit, self.irSpan(decl.init_node), .{ .borrow_start = .{ .reservation = reservation.?, .index = try emitter.value(access.rhs) } }) else null;
-        try self.publishBorrow(name, .{ .known = .{ .ty = reference }, .name_span = name_span, .mutable = decl.is_mutable, .borrowed = true, .borrow = borrow, .loan_owner = .{ .owner = owner.name_span, .origin = self.irSpan(decl.init_node) } });
-        return true;
+        return .{ .known = .{ .ty = reference }, .name_span = name_span, .mutable = decl.is_mutable, .borrowed = true, .borrow = borrow, .loan_owner = .{ .owner = owner.name_span, .origin = self.irSpan(decl.init_node) } };
     }
 
     fn blockExpression(self: *Context, node: Ast.Node.Index, expected: ?Known, depth: usize) Error!?Ir.TypeId {
@@ -1835,13 +1843,55 @@ const Context = struct {
         }
         const related = ref.span();
         for (call.ast.args, params[offset..]) |arg, param| {
-            const ty = (try self.expression(arg, if (param) |p| .{ .ty = p, .annotation = related } else null, depth + 1)) orelse return .{ .checked = null };
+            _ = (try self.callArgument(arg, if (param) |p| .{ .ty = p, .annotation = related } else null, depth + 1)) orelse return .{ .checked = null };
             if (self.terminated) return .{ .checked = if (expected) |want| want.ty else try self.ir.internType(.void) };
-            try self.copyNode(arg, ty);
         }
         // A speculative proof must never turn source input into a compiler
         // assertion if the query and checker disagree.
         return .{ .checked = try self.fail(.generic_function_inference_unsupported, node, related) };
+    }
+
+    fn callArgument(self: *Context, node: Ast.Node.Index, expected: ?Known, depth: usize) Error!?Ir.TypeId {
+        const want = expected orelse return self.valueArgument(node, expected, depth);
+        const formal = self.ir.getType(want.ty).?;
+        if (formal != .reference) return self.valueArgument(node, expected, depth);
+        const ast = &self.module.source.ast;
+        const binding: Binding = switch (ast.nodes.items(.tag)[node]) {
+            .ref_of => (try self.createBorrow(node, want.ty, false, null, self.span(node), depth)) orelse return if (self.terminated) want.ty else null,
+            .identifier => blk: {
+                const name = ast.tokenSlice(ast.firstToken(node));
+                const binding = (try self.captureBinding(name, node)) orelse return self.fail(.unknown_name, node, null);
+                if (!binding.borrowed) return self.fail(.expression_type_mismatch, node, want.annotation);
+                const actual = self.ir.getType(binding.known.ty).?;
+                if (actual != .reference or actual.reference.child != formal.reference.child or (formal.reference.mutable and !actual.reference.mutable))
+                    return self.fail(.expression_type_mismatch, node, want.annotation);
+                break :blk binding;
+            },
+            else => return self.valueArgument(node, expected, depth),
+        };
+        if (self.emitter) |emitter| {
+            const unit = try self.ir.internType(.void);
+            // Freeze a rebindable reference before any later argument executes.
+            const borrow = if (binding.reference_slot) try emitter.append(unit, self.irSpan(node), .{ .reference_load = binding.borrow.? }) else binding.borrow.?;
+            try emitter.record(node, unit, self.irSpan(node), .{ .reference_argument = .{ .borrow = borrow, .ty = want.ty } });
+        }
+        // Keep captured-owner call protection until the enclosing call has
+        // emitted, including calls made while evaluating subsequent arguments.
+        for (binding.loan_owners) |loan| try self.reserveCallOwner(loan);
+        if (binding.loan_owner) |loan| try self.reserveCallOwner(loan);
+        return want.ty;
+    }
+
+    fn reserveCallOwner(self: *Context, loan: LoanOwner) Error!void {
+        const reservation = try self.template_allocator.?.create(Reservation);
+        reservation.* = .{ .owner = loan.owner, .origin = loan.origin, .parent = self.reservation, .reads_allowed = true, .snapshot = true };
+        self.reservation = reservation;
+    }
+
+    fn valueArgument(self: *Context, node: Ast.Node.Index, expected: ?Known, depth: usize) Error!?Ir.TypeId {
+        const ty = (try self.expression(node, expected, depth)) orelse return null;
+        if (!self.terminated) try self.copyNode(node, ty);
+        return ty;
     }
 
     fn genericCall(self: *Context, node: Ast.Node.Index, call: Ast.full.Call, reference: GenericFunctions.Ref, expected: ?Known, depth: usize) Error!?Ir.TypeId {
@@ -1865,9 +1915,8 @@ const Context = struct {
             const ty = (try self.specializeLocal(call.ast.fn_expr, ref, bindings, null)) orelse return null;
             const function = self.ir.getType(ty).?.function;
             for (call.ast.args, function.params) |arg, param| {
-                if (try self.expression(arg, .{ .ty = param, .annotation = ref.span() }, depth + 1) == null) return null;
+                if (try self.callArgument(arg, .{ .ty = param, .annotation = ref.span() }, depth + 1) == null) return null;
                 if (self.terminated) return if (expected) |want| want.ty else function.result;
-                try self.copyNode(arg, param);
             }
             return self.finishCall(node, call.ast.fn_expr, function.result, expected);
         }
@@ -1875,9 +1924,8 @@ const Context = struct {
         const function = self.ir.getType(selected.ty).?.function;
         if (self.emitter) |emitter| try emitter.record(call.ast.fn_expr, selected.ty, self.irSpan(call.ast.fn_expr), .{ .function_ref = emitter.functions[@backingInt(selected.id)].? });
         for (call.ast.args, function.params) |arg, param| {
-            if (try self.expression(arg, .{ .ty = param, .annotation = ref.span() }, depth + 1) == null) return null;
+            if (try self.callArgument(arg, .{ .ty = param, .annotation = ref.span() }, depth + 1) == null) return null;
             if (self.terminated) return if (expected) |want| want.ty else function.result;
-            try self.copyNode(arg, param);
         }
         return self.finishCall(node, call.ast.fn_expr, function.result, expected);
     }
@@ -3666,6 +3714,8 @@ const Context = struct {
     }
 
     fn expression(self: *Context, node: Ast.Node.Index, expected: ?Known, depth: usize) Error!?Ir.TypeId {
+        const parent_reservation = self.reservation;
+        defer self.reservation = parent_reservation;
         const parent_region = self.region;
         switch (self.module.source.ast.nodes.items(.tag)[node]) {
             .block, .block_two, .block_newline, .block_two_newline, .@"if", .if_else, .match, .loop_range, .loop_condition, .loop_cont, .loop_else, .bool_and, .bool_or => self.region = node,
@@ -3739,8 +3789,7 @@ const Context = struct {
                 const ty = self.ir.getType(callee).?;
                 if (ty != .function) return self.fail(.not_callable, data.rhs, null);
                 if (ty.function.params.len != 1) return self.fail(.argument_count_mismatch, node, null);
-                if (try self.expression(data.lhs, .{ .ty = ty.function.params[0] }, depth + 1) == null) return null;
-                if (!self.terminated) try self.copyNode(data.lhs, ty.function.params[0]);
+                if (try self.callArgument(data.lhs, .{ .ty = ty.function.params[0] }, depth + 1) == null) return null;
                 return self.finishCall(node, data.rhs, ty.function.result, expected);
             },
             .array_init, .array_init_comma, .array_init_two, .array_init_two_comma => {
@@ -4207,9 +4256,8 @@ const Context = struct {
                         try self.copyNode(field.lhs, receiver);
                         var valid = true;
                         for (call.ast.args, function.params[1..]) |arg, param| {
-                            if (try self.expression(arg, .{ .ty = param, .annotation = related }, depth + 1) == null) {
-                                valid = false;
-                            } else if (!self.terminated) try self.copyNode(arg, param);
+                            if (try self.callArgument(arg, .{ .ty = param, .annotation = related }, depth + 1) == null) valid = false;
+                            if (self.terminated) break;
                         }
                         if (!valid) return null;
                         if (!self.terminated) {
@@ -4244,9 +4292,8 @@ const Context = struct {
                 if (call.ast.args.len != ty.function.params.len) return self.fail(.argument_count_mismatch, node, annotation);
                 var valid = true;
                 for (call.ast.args, ty.function.params) |arg, param| {
-                    if (try self.expression(arg, .{ .ty = param, .annotation = annotation }, depth + 1) == null) {
-                        valid = false;
-                    } else if (!self.terminated) try self.copyNode(arg, param);
+                    if (try self.callArgument(arg, .{ .ty = param, .annotation = annotation }, depth + 1) == null) valid = false;
+                    if (self.terminated) break;
                 }
                 if (!valid) return null;
                 return self.finishCall(node, call.ast.fn_expr, ty.function.result, expected);
@@ -8513,6 +8560,127 @@ test "explicit local references reject implicit reads and lifetime escapes" {
         errdefer std.debug.print("{s}: {any}\n", .{ source, module.diagnostics.items });
         try std.testing.expect(module.hasErrors());
         try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
+    }
+}
+
+fn testReferenceParameters(allocator: std.mem.Allocator) !void {
+    const source =
+        \\let read:(p:&int)->int=p.*
+        \\let set:(p:&mut int,v:int)={p.* =v}
+        \\let forward:(p:&mut int)={let n=read(p)
+        \\set(p,n)}
+        \\let recurse:(p:&mut int,n:int)={if n>0 {set(p,n)
+        \\recurse(p,n-1)}}
+        \\let indirect:(f:(&mut int,int)->void,p:&mut int)={f(p,3)}
+        \\let query:(p:&int)->int={let n:int=p.*
+        \\let only_types=()->int{let q:@TypeOf(p)=&n
+        \\q.*}
+        \\only_types()}
+        \\let snapshot:(p:&int,n:int)->int=p.*+n
+        \\let main:()={
+        \\let mut a:int=1
+        \\let mut b:int=2
+        \\let mut p=&a
+        \\set(p,4)
+        \\forward(p)
+        \\recurse(p,2)
+        \\indirect(set,p)
+        \\let closure=(q:&mut int){set(q,5)}
+        \\closure(p)
+        \\let f:(&int)->int=read
+        \\@println(f(p),query(p))
+        \\let result=snapshot(p,{p=&b
+        \\0})
+        \\let mut values:[]int=[1,2]
+        \\set(&values[0],result)
+        \\@println(values[0],&b |> read)
+        \\}
+    ;
+    var module = try Module.init(allocator, "reference-parameters.nov", source);
+    defer module.deinit();
+    var analysis = try Lowering.lower(&module);
+    defer analysis.deinit();
+    errdefer if (module.hasErrors()) std.debug.print("reference parameters: {any}\n", .{module.diagnostics.items});
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(analysis.lowering_complete);
+    try analysis.ir.verify();
+    var parameters: usize = 0;
+    var arguments: usize = 0;
+    var snapshots: usize = 0;
+    var ordered_snapshot_call = false;
+    for (analysis.ir.functions.items) |function| {
+        const body = function.body orelse continue;
+        for (body.instructions, 0..) |instruction, instruction_index| switch (instruction.op) {
+            .call => |call| {
+                const signature = analysis.ir.getType(body.instructions[@backingInt(call.callee)].ty).?.function;
+                for (call.args, signature.params) |arg, param| {
+                    if (analysis.ir.getType(param).? != .reference) continue;
+                    const capability = body.instructions[@backingInt(arg)];
+                    try std.testing.expect(capability.op == .reference_argument);
+                    try std.testing.expectEqual(param, capability.op.reference_argument.ty);
+                    try std.testing.expect(@backingInt(arg) < instruction_index);
+                    for (body.instructions[@backingInt(arg) + 1 .. instruction_index]) |later| {
+                        if (later.op == .reference_rebind) ordered_snapshot_call = true;
+                    }
+                }
+            },
+            .reference_parameter => |param| {
+                parameters += 1;
+                try std.testing.expect(analysis.ir.getType(instruction.ty).? == .void);
+                try std.testing.expect(analysis.ir.getType(param.ty).? == .reference);
+                try std.testing.expectEqual(analysis.ir.getType(function.ty).?.function.params[param.index], param.ty);
+            },
+            .reference_argument => |arg| {
+                arguments += 1;
+                try std.testing.expect(analysis.ir.getType(instruction.ty).? == .void);
+                try std.testing.expect(analysis.ir.getType(arg.ty).? == .reference);
+                const origin = body.instructions[@backingInt(arg.borrow)].op;
+                try std.testing.expect(origin == .reference_load or origin == .reference_parameter or origin == .borrow_start);
+                if (origin == .reference_load) snapshots += 1;
+            },
+            else => {},
+        };
+    }
+    try std.testing.expect(parameters >= 7);
+    try std.testing.expect(arguments >= 15);
+    try std.testing.expect(snapshots >= 3);
+    try std.testing.expect(ordered_snapshot_call);
+}
+
+test "reference parameters source capabilities snapshots forwarding and closures under OOM" {
+    try testReferenceParameters(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testReferenceParameters, .{});
+}
+
+fn testReferenceParameterError(allocator: std.mem.Allocator, source: []const u8, tag: Module.Diagnostic.Tag) !void {
+    var module = try Module.init(allocator, "reference-parameter-errors.nov", source);
+    defer module.deinit();
+    if (module.source.ast.errors.len != 0) std.debug.print("reference parameter parse: {s}\n", .{source});
+    try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
+    var analysis = try Lowering.lower(&module);
+    defer analysis.deinit();
+    try std.testing.expect(module.hasErrors());
+    try std.testing.expectEqual(tag, module.diagnostics.items[0].tag);
+}
+
+test "reference parameters reject aliasing replacement qualifiers and escapes under OOM" {
+    for ([_]struct { source: []const u8, tag: Module.Diagnostic.Tag }{
+        .{ .source = "let f:(p:&mut int)={p=&p}\n", .tag = .immutable_assignment },
+        .{ .source = "let f:(p:&int)={p.* =1}\n", .tag = .immutable_assignment },
+        .{ .source = "let f:(p:&int)={let q=p\n}\n", .tag = .unsupported_borrow },
+        .{ .source = "let f:(p:&int)={let q=&p\n}\n", .tag = .unsupported_borrow },
+        .{ .source = "let f:(p:&int)->int=p\n", .tag = .unsupported_borrow },
+        .{ .source = "let f:(p:&int)={@println(p)}\n", .tag = .unsupported_borrow },
+        .{ .source = "let f:(p:&int)->()->int=()->int{p.*}\n", .tag = .unsupported_borrow },
+        .{ .source = "let f:(p:&int)={let xs=[p]\n}\n", .tag = .unsupported_borrow },
+        .{ .source = "let set:(p:&mut int)={}\nlet f:(p:&int)={set(p)}", .tag = .expression_type_mismatch },
+        .{ .source = "let set:(p:&mut int)={}\nlet f:()={let n:int=0\nset(&n)}", .tag = .expression_type_mismatch },
+        .{ .source = "let use:(p:&int,q:&int)={}\nlet f:()={let mut n:int=0\nlet p=&n\nuse(p,p)}", .tag = .borrow_conflict },
+        .{ .source = "let use:(p:&int,n:int)={}\nlet f:()={let mut n:int=0\nlet p=&n\nuse(p,{n=2\n0})}", .tag = .borrow_conflict },
+        .{ .source = "let use:(p:&int,n:int)={}\nlet f:()={let mut ns:[]int=[0]\nuse(&ns[0],{ns=[2]\n0})}", .tag = .borrow_conflict },
+    }) |case| {
+        try testReferenceParameterError(std.testing.allocator, case.source, case.tag);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testReferenceParameterError, .{ case.source, case.tag });
     }
 }
 

@@ -296,7 +296,7 @@ No autodereference: all pointee reads/writes use `.*`, including `p.* += value`,
 `p.*[i]`, `p.*.field` and `p.*()`. `p = value` is not a pointee store. Reads such
 as `let copy = p.*`, arguments/returns of `p.*` and `p.*.method()` retain ordinary
 value-copy semantics, not reference escape. Bare reference copies (`let q = p`),
-passing, returning, storing in arrays/records/unions/constants, capturing and
+returning, storing in arrays/records/unions/constants, capturing and
 reborrowing (`&p` / `&p.*`) are currently rejected. CFG reference rebinding is
 implemented across `if`, `match`, short-circuit expressions, nested blocks and
 loops, including conditions, continuation and exhaustion paths. The static proof
@@ -309,7 +309,27 @@ owner-set frontend checks may overreject target-sensitive iteration.
 `@TypeOf(p)` reports the reference descriptor with canonical names
 such as `&u8` / `&mut u8`; `@TypeOf(p.*)` remains unsupported under the bounded
 binding-operand rule. See `examples/references.nov`,
-`examples/reference-rebinding.nov` and README's delivered contract.
+`examples/reference-rebinding.nov`, `examples/reference-parameters.nov` and README's
+delivered contract.
+
+Reference parameter passing is delivered for functions, callbacks, closures,
+inferred generic functions, methods and pipes. Use `f(p)`, `f(&local)` or
+`f(&array[index])`; `f(p.*)` passes an ordinary child value instead. Mutable
+arguments may weaken to readonly for the same child type, never the reverse;
+this rule applies only to arguments, while function/callback types stay invariant.
+Formal reference bindings cannot rebind, but mutable-pointee `.*` writes work.
+Callees may forward reference parameters, not ordinarily copy/alias, capture,
+reborrow, return or store them. Method receivers remain by value.
+
+Each reference argument snapshots its target before later argument effects:
+`call(p, later)` still passes the old target if `later` rebinds `p` to `&b`.
+Caller loans and managed-owner
+roots span remaining argument evaluation and the entire call, including forwarding.
+Multiple reference arguments must not possibly alias even when readonly:
+`f(p, p)` / `f(&a, &a)` reject, as do unsafe later-argument owner changes. Array
+loans remain whole-owner, without element disjointness. Existing conservative
+boxed/captured-owner call protection may reject safe calls; no interprocedural
+effect analysis is promised.
 
 Runtime target loads capture the current handle before dereference RHS effects:
 rebinding `p` to `b` inside `p.* += ...` still updates the old pointee. The captured
@@ -323,9 +343,11 @@ supported elements, with whole-element and supported nested-record updates via
 after its last use, tracking branches, loop backedges, terminal controls and RHS
 stores. Conflicting owner access diagnoses, including owner access during index
 evaluation. Readonly loans remain exclusive. Index normalization/bounds happens
-once; local runtime handles now lower to typed C pointers, but remain internal,
-unit-local IR capabilities, not source-level first-class references or a reference
-ABI. Stable owner roots retain managed backing for handles and captured target
+once; runtime handles lower to typed C pointers. Unit-typed IR
+`reference_parameter` / `reference_argument` capabilities carry descriptors, not
+ordinary first-class reference values. Internal Nov C prototypes use typed pointers,
+but source `@[extern]` / `@[export]` reference parameters/results remain forbidden.
+Stable owner roots retain managed backing for handles and captured target
 snapshots. No runtime reference-validity checks or interior GC roots are
 introduced; ordinary copies and pre-borrow snapshots remain independent. Nonlocal,
 void and temporary sources, references to references and general pointers remain
@@ -616,13 +638,14 @@ Keep to the main features aka:
 Keep Nov away from:
 - Really low level stuff aka assembly, kernel or drivers. Use zig instead.
 
-## Accepted reference roadmap (not implemented)
+## Accepted reference roadmap (partially delivered)
 
-- **Implement passing, returning and storing references.** This is an accepted
-  implementation direction beyond the delivered local-only slice, not merely a
-  pointer proposal. Reference copying/capture/reborrowing are not thereby enabled
-  today; their rules still require design and implementation.
-- Track lifetimes and referents across calls, returns and aggregate storage. Retain
+- **Passing references: delivered** with call-scoped loans, target snapshots,
+  forwarding and caller-held managed-owner roots under the rules above.
+- **Returning and storing references: accepted, not implemented.** Ordinary
+  reference copying/capture/reborrowing remain unimplemented too; parameter passing
+  does not enable escape. This is an accepted direction, not merely a pointer proposal.
+- Extend lifetime/referent tracking to returns and aggregate storage. Retain
   managed referents through GC for every live reference, including references
   stored in managed objects or returned beyond a callee's frame.
 - Prevent invalidation statically or provide safe invalidation when owner storage

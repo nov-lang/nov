@@ -94,7 +94,7 @@ roots, malformed metadata, cross-heap root record reuse and use-after-free outsi
 tracing remain caller/compiler errors. A stale pointer whose address has been
 reused cannot be distinguished from a current allocation.
 
-## Explicit local reference capabilities
+## Explicit local and parameter reference capabilities
 
 The source contract uses readonly `&T` and mutable-pointee `&mut T`, not `&const T`.
 `&a` infers the mutable-pointee form iff owner `a` is mutable. An explicit
@@ -119,10 +119,13 @@ reference accessed via `item.*`. `@TypeOf(p)` inspects the compile-time referenc
 descriptor and renders canonical names such as `&u8` / `&mut u8`; it does not
 read the target. `@TypeOf(p.*)` remains unsupported by the bounded binding query.
 
-Local runtime reference handles now lower to typed C pointers, but remain
-internal, unit-local IR capabilities, not source-level first-class reference
-values or a reference ABI. A load snapshots the current target before dereference
-RHS effects. Thus rebinding `p` inside the RHS of `p.* += ...` does not redirect
+Runtime reference handles lower to typed C pointers. Unit-typed IR
+`reference_parameter` and `reference_argument` capabilities carry reference
+descriptors without becoming ordinary first-class reference values. Internal Nov
+C prototypes use `const T *` for readonly and `T *` for mutable references; these
+prototypes are not a source-level foreign ABI. `@[extern]` / `@[export]` reference
+parameters and results remain forbidden. A load snapshots the current target
+before dereference RHS effects. Thus rebinding `p` inside the RHS of `p.* += ...` does not redirect
 the pending store: it updates the old pointee. Explicit reads still yield child
 values with normal recursive-copy semantics and may allocate; borrow creation
 itself does not clone/allocate its target.
@@ -137,22 +140,46 @@ snapshots under the existing root discipline. Bounds checks are unchanged.
 Interior pointers are never traced as GC roots. There are no runtime
 generation/reference-validity checks.
 
-Copying (`let q = p`), passing, returning, storing, capturing and reborrowing
-references are currently rejected. Reference types are not storable array elements,
-aggregate fields/payloads, constants, parameters or results. Nonlocal/temporary/void
+Functions, callbacks, closures, inferred generic functions, methods and pipes may
+accept reference parameters. Calls use `f(p)`, `f(&local)` or `f(&array[index])`;
+`f(p.*)` passes an ordinary child value instead. Mutable arguments may weaken to
+readonly for the same child type, never the reverse. Function/callback types
+remain invariant. Formal reference bindings cannot rebind, but mutable-pointee
+`.*` writes and forwarding to compatible reference parameters work. Method
+receivers retain existing by-value semantics.
+
+A `reference_argument` snapshots a typed pointer before later arguments execute;
+`call(p, later)` still receives the old target if `later` rebinds `p` to `&b`.
+The caller retains that
+snapshot's loan and stable owner roots throughout remaining argument evaluation
+and the entire call, including nested forwarding. Managed backing is retained by
+caller owner roots, not by tracing the interior argument pointer; reference
+parameters are not themselves managed roots. Callee mutation updates rooted owner
+storage under the existing root discipline. Multiple reference arguments must not
+possibly alias, even when readonly: `f(p, p)` / `f(&a, &a)` reject. Whole-array
+loans do not infer element disjointness. Unsafe owner changes in later arguments
+reject. Conservative boxed/captured-owner call protection may also reject safe
+calls; no interprocedural effect analysis is promised.
+
+Copying (`let q = p`), returning, storing, capturing and reborrowing references
+remain rejected. Reference types are not storable array elements, aggregate
+fields/payloads, constants or results. Nonlocal/temporary/void
 owners and references to references remain unsupported. Passing or returning `p.*`
 is an ordinary child-value operation, not reference escape. No manual memory
 management, pointer arithmetic, null references or unsafe dereference is added.
 
-**Accepted roadmap, not implemented:** implement passing, returning and storing
-references with lifetime/referent tracking across frames and managed aggregates.
+**Accepted roadmap:** passing references is delivered with call-scoped loans and
+caller-held owner roots. Returning and storing references, ordinary copying,
+capture and reborrowing remain **not implemented**. Escape requires extended
+lifetime/referent tracking across frames and managed aggregates.
 Managed referents must stay GC-retained for every live reference; owner replacement,
 resizing or lifetime end must be statically prevented or safely invalidate affected
 references, never expose dangling storage. The current local owner-slot scheme
 alone does not implement escaping-reference lifetimes. Future representations,
 tracing and invalidation checks must satisfy that contract before escape is enabled.
 Broader raw-pointer and managed-FFI proposals remain separate. See
-`examples/references.nov`, `examples/reference-rebinding.nov` and the root README
+`examples/references.nov`, `examples/reference-rebinding.nov`,
+`examples/reference-parameters.nov` and the root README
 for the source-facing contract.
 
 ## Closure environments and shared cells
@@ -385,9 +412,10 @@ on **every** allocation, injected allocation failures/retries, strict C11/UBSan,
 -O0 and -O3 bounds checks, argument-order effects, nested loops and early returns.
 
 Writable length (especially growth initialization), array slices/invalidation,
-general pointer elements and managed FFI remain deferred. Passing, returning and
-storing safe references is an accepted, unimplemented roadmap as described above;
-bounded explicit local references are delivered, not general storable aliases.
+general pointer elements and managed FFI remain deferred. Local references and
+call-scoped reference parameters are delivered; returning and storing references
+remain accepted but unimplemented, as described above. These are not general
+storable aliases.
 Direct chained indexed writes, record-field writes through computed elements and
 arbitrary computed-base writes remain unsupported. Existing scoped stable-owner
 loans allow supported nested-array element updates and replacement; no new borrow

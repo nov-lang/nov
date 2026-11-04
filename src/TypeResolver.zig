@@ -199,10 +199,7 @@ fn resolveDepth(module: *Module, ir: *Ir, node: Ast.Node.Index, depth: usize, al
             }
             signature_env.values = values.items;
             if (try resolveDepth(module, ir, param.type_expr, depth + 1, aliases, signature_env)) |ty| {
-                if (ir.getType(ty).? == .reference) {
-                    _ = try diagnose(module, param.type_expr, .borrow_escape);
-                    valid = false;
-                } else if (ir.getType(ty).? == .void) {
+                if (ir.getType(ty).? == .void) {
                     _ = try diagnose(module, param.type_expr, .invalid_parameter_type);
                     valid = false;
                 } else {
@@ -1032,7 +1029,7 @@ test "TypeOf imported values respect visibility and reject namespaces and types"
 }
 
 fn testLocalReferenceTypes(allocator: std.mem.Allocator) !void {
-    var module = try Module.init(allocator, "references.nov", "let a: &int\nlet b: &mut int\nlet c: &f64\nlet d: &[]int\nlet e: &(() -> void)\nlet query: @TypeOf(p)\nlet Alias = int\nlet alias_ref: &Alias");
+    var module = try Module.init(allocator, "references.nov", "let a: &int\nlet b: &mut int\nlet c: &f64\nlet d: &[]int\nlet e: &(() -> void)\nlet query: @TypeOf(p)\nlet Alias = int\nlet alias_ref: &Alias\nlet signature: (p: &mut int, q: @TypeOf(p)) -> void\nlet callbacks: [](p: &int) -> void\nlet indirect: (p: @TypeOf(query)) -> void");
     defer module.deinit();
     try module.classifyAliases();
     var ir = Ir.init(allocator);
@@ -1051,6 +1048,12 @@ fn testLocalReferenceTypes(allocator: std.mem.Allocator) !void {
     try std.testing.expectEqual(readonly, (try resolve(&module, &ir, testTypeNode(&module, "alias_ref"))).?);
     const values = &[_]Binding{.{ .name = "p", .ty = writable }};
     try std.testing.expectEqual(writable, (try resolveInScopeWithValuesReadOnly(&module, &ir, testTypeNode(&module, "query"), null, null, &.{}, values)).?);
+    const signature = (try resolve(&module, &ir, testTypeNode(&module, "signature"))).?;
+    try std.testing.expectEqualSlices(Ir.TypeId, &.{ writable, writable }, ir.getType(signature).?.function.params);
+    const callbacks = (try resolve(&module, &ir, testTypeNode(&module, "callbacks"))).?;
+    try std.testing.expect(ir.getType(ir.getType(callbacks).?.array).? == .function);
+    const indirect = (try resolveInScopeWithValuesReadOnly(&module, &ir, testTypeNode(&module, "indirect"), null, null, &.{}, &.{.{ .name = "query", .ty = readonly }})).?;
+    try std.testing.expectEqual(readonly, ir.getType(indirect).?.function.params[0]);
     try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
     try ir.verify();
 }
@@ -1059,14 +1062,13 @@ test "local reference type resolution and TypeOf value bindings survive OOM" {
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testLocalReferenceTypes, .{});
 }
 
-test "local reference types reject void reborrows and signature or array escapes" {
+test "local reference types reject void reborrows and result or array escapes" {
     for ([_]struct { source: []const u8, tag: Module.Diagnostic.Tag }{
         .{ .source = "let value: &void", .tag = .unsupported_borrow },
         .{ .source = "let value: &mut void", .tag = .unsupported_borrow },
         .{ .source = "let value: & &int", .tag = .unsupported_borrow },
         .{ .source = "let value: &mut &int", .tag = .unsupported_borrow },
         .{ .source = "let value: []&int", .tag = .borrow_escape },
-        .{ .source = "let value: (p: &mut int) -> void", .tag = .borrow_escape },
         .{ .source = "let value: () -> &int", .tag = .borrow_escape },
         .{ .source = "let value: &(() -> &int)", .tag = .borrow_escape },
     }) |case| {
@@ -1083,9 +1085,8 @@ test "local reference types reject void reborrows and signature or array escapes
     }
 }
 
-test "local reference TypeOf descriptors cannot escape indirectly into signatures arrays or nominal fields" {
+test "local reference TypeOf descriptors cannot escape indirectly into results arrays or nominal fields" {
     for ([_][]const u8{
-        "let value: (x: @TypeOf(p)) -> void",
         "let value: () -> @TypeOf(p)",
         "let value: []@TypeOf(p)",
         "let G: (T: type) -> type = struct { item: T, }\nlet value: G(@TypeOf(p))",

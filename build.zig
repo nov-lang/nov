@@ -182,6 +182,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     addReferenceCliTests(b, exe, reference_tests);
     const reference_rebinding_tests = b.step("test-cli-reference-rebinding", "Run CFG reference rebinding CLI tests");
     addReferenceRebindingCliTests(b, exe, reference_rebinding_tests);
+    const reference_parameter_tests = b.step("test-cli-reference-parameters", "Run safe reference parameter CLI tests");
+    addReferenceParameterCliTests(b, exe, reference_parameter_tests);
+    test_step.dependOn(reference_parameter_tests);
     test_step.dependOn(reference_rebinding_tests);
     addBorrowCliTests(b, exe, reference_tests, fixtures);
     test_step.dependOn(reference_tests);
@@ -1198,7 +1201,7 @@ fn addClosureCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *s
         .{ .name = "recursion", .source = "let main=(){let f=(n:int)->int {f(n)}\n}\n", .diagnostic = "unknown name 'f'" },
         .{ .name = "parameter", .source = "let main=(){let f=(int)->int {1}\n}\n", .diagnostic = "function parameters need names and types" },
         .{ .name = "foreign", .source = "@[export]\nlet callback=(f:()->int)->int {f()}\n", .diagnostic = "export ABI supports only" },
-        .{ .name = "loan-call", .source = "let main=(){let mut n:int=0\nlet f=()->int {n}\nlet view=&n\n@println(f(),view.*)}\n", .diagnostic = "owner access conflicts with a live borrow" },
+        .{ .name = "loan-call", .source = "let main=(){let mut n:int=0\nlet f=()->int {n}\nlet view=&n\n@println(f(),view.*)}\n", .diagnostic = "owner access or aliased reference arguments conflict with a live borrow" },
     }) |case| {
         const source = b.fmt("invalid-{s}.nov", .{case.name});
         _ = fixtures.add(source, case.source);
@@ -3818,19 +3821,115 @@ fn addReferenceCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: 
         .{ .name = "implicit-field", .body = "let value=Cell[.value=1]\nlet p=&value\n@println(p.value)", .diagnostic = unsupported },
         .{ .name = "implicit-call", .body = "let f=()->u8 {1}\nlet p=&f\n@println(p())", .diagnostic = unsupported },
         .{ .name = "copy-reference", .body = "let p=&a\nlet q=p", .diagnostic = unsupported },
-        .{ .name = "pass-reference", .body = "let p=&a\nconsume(p)", .diagnostic = unsupported },
+        .{ .name = "pass-reference-to-value", .body = "let p=&a\nconsume(p)", .diagnostic = unsupported },
         .{ .name = "return-reference", .body = "let p=&a\nreturn p", .diagnostic = unsupported },
         .{ .name = "store-reference", .body = "let p=&a\nlet values=[p]", .diagnostic = unsupported },
         .{ .name = "capture-reference", .body = "let p=&a\nlet f=(){@println(p.*)}", .diagnostic = unsupported },
         .{ .name = "reborrow", .body = "let p=&a\nlet q=&p.*", .diagnostic = unsupported },
         .{ .name = "reference-to-reference", .body = "let p=&a\nlet q=&p", .diagnostic = unsupported },
         .{ .name = "typeof-dereference", .body = "let p=&a\nlet x:@TypeOf(p.*)=1", .diagnostic = "@TypeOf requires a variable, parameter or imported value reference" },
-        .{ .name = "rebound-owner-conflict", .body = "let mut p=&a\np=&b\nb=2\np.* = 1", .diagnostic = "owner access conflicts with a live borrow" },
+        .{ .name = "rebound-owner-conflict", .body = "let mut p=&a\np=&b\nb=2\np.* = 1", .diagnostic = "owner access or aliased reference arguments conflict with a live borrow" },
     }) |case| {
         const source = fixtures.add(b.fmt("reference-{s}.nov", .{case.name}), b.fmt("let Cell=struct{{value:u8,}}\nlet consume:(v:u8)={{}}\nlet verify:(flag:bool)={{let mut a:u8=0\nlet mut b:u8=0\n{s}\n}}\nlet main:()=verify(true)\n", .{case.body}));
         for ([_]bool{ false, true }) |emit| {
             const check = b.addRunArtifact(exe);
             check.step.name = b.fmt("CLI references reject: {s} ({s})", .{ case.name, if (emit) "emit-c" else "semantic" });
+            check.addArgs(if (emit) &.{"emit-c"} else &.{ "check", "--semantic" });
+            check.addFileArg(source);
+            check.expectExitCode(1);
+            check.expectStdOutEqual("");
+            check.expectStdErrMatch(b.fmt("error: {s}", .{case.diagnostic}));
+            test_step.dependOn(&check.step);
+        }
+    }
+}
+
+fn addReferenceParameterCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    for ([_][]const u8{ "fmt", "semantic", "", "--debug", "--release" }) |mode| {
+        const format = std.mem.eql(u8, mode, "fmt");
+        const semantic = std.mem.eql(u8, mode, "semantic");
+        for ([_][]const u8{ "run", "test" }) |command| {
+            if ((format or semantic) and std.mem.eql(u8, command, "test")) continue;
+            const run = b.addRunArtifact(exe);
+            run.step.name = b.fmt("CLI reference parameters: {s} ({s})", .{ command, mode });
+            run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+            run.setEnvironmentVariable("NOV_CC", "");
+            run.setEnvironmentVariable("CC", "");
+            if (format) {
+                run.addArgs(&.{ "fmt", "--check" });
+            } else if (semantic) {
+                run.addArgs(&.{ "check", "--semantic" });
+            } else {
+                run.addArg(command);
+            }
+            run.addFileArg(b.path("examples/reference-parameters.nov"));
+            if (!format and !semantic and mode.len != 0) run.addArg(mode);
+
+            run.expectExitCode(0);
+            run.expectStdOutEqual(if (format or semantic) "" else if (std.mem.eql(u8, command, "run"))
+                "Swapped: 7 5 Sum: 12\nWords: [hello!, world]\n"
+            else
+                "PASS mutation_readonly_and_direct_borrows\nPASS generic_swap_and_methods\nPASS callbacks_closures_forwarding_recursion_and_pipes\nPASS managed_arrays_records_and_strings\nPASS argument_order_snapshots_actual_target\n5 passed; 0 failed; 5 total\n");
+            run.expectStdErrEqual("");
+            test_step.dependOn(&run.step);
+        }
+    }
+    const fixtures = b.addWriteFiles();
+    const formatted = fixtures.add("reference-parameter-binding-call.nov",
+        \\let increment: (p: &mut int) = {
+        \\    p.* += 1
+        \\}
+        \\let main: () = {
+        \\    let mut value: int = 1
+        \\    let p = &value
+        \\    increment(p)
+        \\    @assert(value == 2)
+        \\}
+        \\
+    );
+    for ([_][]const u8{ "fmt", "semantic" }) |mode| {
+        const check = b.addRunArtifact(exe);
+        check.step.name = b.fmt("CLI reference parameters: binding call {s}", .{mode});
+        check.addArgs(if (std.mem.eql(u8, mode, "fmt")) &.{ "fmt", "--check" } else &.{ "check", "--semantic" });
+        check.addFileArg(formatted);
+        check.expectExitCode(0);
+        check.expectStdOutEqual("");
+        check.expectStdErrEqual("");
+        test_step.dependOn(&check.step);
+    }
+    const conflict = "owner access or aliased reference arguments conflict with a live borrow";
+    const unsupported = "local references require";
+    const escape = "references cannot escape";
+    const mismatch = "expression does not match the expected type";
+    const prefix = "let write:(p:&mut int,n:int)={p.* += n}\nlet pair:(p:&int,q:&int)->int=p.*+q.*\n";
+    for ([_]struct { name: []const u8, source: []const u8, diagnostic: []const u8 }{
+        .{ .name = "alias-binding", .source = "let main:()={let mut a:int=1\nlet p=&a\nlet result=pair(p,p)\n}", .diagnostic = conflict },
+        .{ .name = "alias-direct", .source = "let main:()={let a:int=1\nlet result=pair(&a,&a)\n}", .diagnostic = conflict },
+        .{ .name = "alias-forwarding", .source = "let bad:(p:&int)->int=pair(p,p)\nlet main:()={}", .diagnostic = conflict },
+        .{ .name = "alias-possible-owner", .source = "let bad:(flag:bool)={let a:int=1\nlet b:int=2\nlet mut p=&a\nif flag {p=&b}\nlet result=pair(p,&b)\n}\nlet main:()=bad(true)", .diagnostic = conflict },
+        .{ .name = "alias-array-elements", .source = "let main:()={let a:[]int=[1,2]\nlet result=pair(&a[0],&a[1])\n}", .diagnostic = conflict },
+        .{ .name = "mutable-alias", .source = "let two:(p:&mut int,q:&mut int)={p.* += q.*}\nlet main:()={let mut a:int=1\nlet p=&a\ntwo(p,p)}", .diagnostic = conflict },
+        .{ .name = "indirect-alias", .source = "let main:()={let a:int=1\nlet f:(&int,&int)->int=pair\nlet result=f(&a,&a)\n}", .diagnostic = conflict },
+        .{ .name = "boxed-captured-owner", .source = "let main:()={let mut a:int=1\nlet get=()->int {a}\nwrite(&a,1)\n@println(get())}", .diagnostic = conflict },
+        .{ .name = "late-argument-mutation", .source = "let main:()={let mut a:int=1\nwrite(&a,{a=3\n2})}", .diagnostic = conflict },
+        .{ .name = "late-after-rebind", .source = "let main:()={let mut a:int=1\nlet mut b:int=2\nlet mut p=&a\nwrite(p,{p=&b\na=3\n2})}", .diagnostic = conflict },
+        .{ .name = "readonly-to-mutable", .source = "let main:()={let mut a:int=1\nlet p:&int=&a\nwrite(p,1)}", .diagnostic = mismatch },
+        .{ .name = "different-pointee", .source = "let main:()={let mut a:u8=1\nwrite(&a,1)}", .diagnostic = mismatch },
+        .{ .name = "signature-invariant", .source = "let main:()={let f:(&int,int)=write\n}", .diagnostic = mismatch },
+        .{ .name = "parameter-rebind", .source = "let bad:(p:&mut int,q:&mut int)={p=q}\nlet main:()={}", .diagnostic = "assignment requires a mutable local" },
+        .{ .name = "parameter-copy", .source = "let bad:(p:&int)={let q=p\n}\nlet main:()={}", .diagnostic = unsupported },
+        .{ .name = "parameter-capture", .source = "let bad:(p:&int)={let f=()->int {p.*}\n}\nlet main:()={}", .diagnostic = unsupported },
+        .{ .name = "parameter-return", .source = "let bad:(p:&int)->&int=p\nlet main:()={}", .diagnostic = escape },
+        .{ .name = "parameter-array-storage", .source = "let bad:(p:&int)={let xs=[p]\n}\nlet main:()={}", .diagnostic = unsupported },
+        .{ .name = "reference-field", .source = "let Bad=struct{p:&int,}\nlet main:()={}", .diagnostic = "this type is not supported in semantic analysis yet" },
+        .{ .name = "parameter-reborrow", .source = "let bad:(p:&int)={let q=&p.*\n}\nlet main:()={}", .diagnostic = unsupported },
+        .{ .name = "export", .source = "@[export]\nlet bad:(p:&int)={}\nlet main:()={}", .diagnostic = "export ABI supports only" },
+        .{ .name = "extern", .source = "@[extern]\nlet bad:(p:&int)\nlet main:()={}", .diagnostic = "extern ABI supports only" },
+    }) |case| {
+        const source = fixtures.add(b.fmt("reference-parameter-{s}.nov", .{case.name}), b.fmt("{s}\n{s}\n", .{ prefix, case.source }));
+        for ([_]bool{ false, true }) |emit| {
+            const check = b.addRunArtifact(exe);
+            check.step.name = b.fmt("CLI reference parameters reject: {s} ({s})", .{ case.name, if (emit) "emit-c" else "semantic" });
             check.addArgs(if (emit) &.{"emit-c"} else &.{ "check", "--semantic" });
             check.addFileArg(source);
             check.expectExitCode(1);
@@ -3872,7 +3971,7 @@ fn addReferenceRebindingCliTests(b: *std.Build, exe: *std.Build.Step.Compile, te
     }
     const fixtures = b.addWriteFiles();
     const unsupported = "local references require";
-    const conflict = "owner access conflicts with a live borrow";
+    const conflict = "owner access or aliased reference arguments conflict with a live borrow";
     const mismatch = "expression does not match the expected type";
     for ([_]struct { name: []const u8, body: []const u8, diagnostic: []const u8 }{
         .{ .name = "unused-inner-owner", .body = "let mut p=&a\n{let mut inner:int=0\np=&inner}", .diagnostic = unsupported },
@@ -3973,7 +4072,7 @@ fn addBorrowCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *st
     reject.addArgs(&.{ "check", "--semantic", "borrow-conflict.nov" });
     reject.expectExitCode(1);
     reject.expectStdOutEqual("");
-    reject.expectStdErrMatch("owner access conflicts with a live borrow");
+    reject.expectStdErrMatch("owner access or aliased reference arguments conflict with a live borrow");
     test_step.dependOn(&reject.step);
 }
 
@@ -4009,7 +4108,7 @@ fn addIterationCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: 
             test_step.dependOn(&run.step);
         }
     }
-    const conflict = "owner access conflicts with a live borrow";
+    const conflict = "owner access or aliased reference arguments conflict with a live borrow";
     const immutable = "assignment requires a mutable local";
     const unsupported = "reference iteration requires a local array owner";
     const reborrow = "local references require";

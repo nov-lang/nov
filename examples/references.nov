@@ -2,7 +2,8 @@
 ; nov test examples/references.nov
 ; &owner infers pointee mutability; let mut independently permits rebinding.
 ; Always use p.* to read, write, project, index or call the pointee.
-; References stay local: copy p.* instead of copying or escaping p.
+; References may be passed to reference parameters; see reference-parameters.nov.
+; Copy p.* for an owned value; p itself cannot be copied, stored or returned.
 ; Rebinding also works through branches, match, blocks and loops; see
 ; reference-rebinding.nov for runtime selection and old-target evaluation.
 ; The new owner must be in the binding's lexical scope or an outer scope.

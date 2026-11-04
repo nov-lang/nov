@@ -918,6 +918,12 @@ const Solver = struct {
                 .array => |fallback| try self.defaultTerm(element, fallback, depth + 1),
                 else => {},
             },
+            .reference => |reference| switch (self.ir.getType(ty).?) {
+                .reference => |fallback| if (reference.mutable == fallback.mutable or !reference.mutable) {
+                    try self.defaultTerm(reference.child, fallback.child, depth + 1);
+                },
+                else => {},
+            },
             .function => |function| switch (self.ir.getType(ty).?) {
                 .function => |fallback| {
                     if (function.params.len != fallback.params.len) return;
@@ -952,7 +958,7 @@ const Solver = struct {
         }
         for (arguments, signature_type.params) |arg, param| {
             if (arg.terminal) return if (self.failed) null else frame;
-            if (arg.ty) |ty| try self.unify(param, try self.fromType(ty, arg.span, 0), arg.span, 0);
+            if (arg.ty) |ty| try self.unifyArgument(param, try self.fromType(ty, arg.span, 0), arg.span);
             if (arg.default_type) |ty| try self.defaults.append(self.allocator, .{ .term = param, .ty = ty });
             if (arg.template) |callback| {
                 const callback_container: ?Nominal = if (callback.container_type) |ty| blk: {
@@ -1056,6 +1062,16 @@ const Solver = struct {
             },
             else => false,
         };
+    }
+
+    // Qualifier weakening is local to an argument position, never a general
+    // unification rule (function types and substitutions remain invariant).
+    fn unifyArgument(self: *Solver, param: *Term, argument: *Term, span: Module.Span) Ir.BuildError!void {
+        const formal = root(param);
+        const actual = root(argument);
+        if (formal.value == .reference and actual.value == .reference and !formal.value.reference.mutable and actual.value.reference.mutable)
+            return self.unify(formal.value.reference.child, actual.value.reference.child, span, 0);
+        return self.unify(param, argument, span, 0);
     }
 
     fn unify(self: *Solver, a: *Term, b: *Term, span: Module.Span, depth: usize) Ir.BuildError!void {
@@ -1706,8 +1722,12 @@ const Solver = struct {
             },
             .loop_condition, .loop_cont, .loop_else => return self.loopExpression(frame, node, depth + 1),
             .function_expr => return self.closure(frame, data.lhs, data.rhs, depth + 1),
-            .call, .call_one => {
-                const call = ast.fullCall(node).?;
+            .call, .call_one, .function_pipe => {
+                const pipe_args = [_]Ast.Node.Index{data.lhs};
+                const call: Ast.full.Call = if (ast.nodes.items(.tag)[node] == .function_pipe)
+                    .{ .ast = .{ .fn_expr = data.rhs, .args = &pipe_args, .lparen = ast.nodes.items(.main_token)[node] } }
+                else
+                    ast.fullCall(node).?;
                 if (std.mem.eql(u8, ast.tokenSlice(ast.firstToken(call.ast.fn_expr)), "@as") and call.ast.args.len == 2) {
                     const ty = try self.typeNode(frame, call.ast.args[0], depth + 1);
                     const value = try self.expression(frame, call.ast.args[1], depth + 1);
@@ -1739,7 +1759,7 @@ const Solver = struct {
                             for (f.params[offset..], call.ast.args) |param, arg| {
                                 const value = try self.expression(frame, arg, depth + 1);
                                 if (root(value).value == .never) return value;
-                                try self.unify(param, value, module.tokenSpan(ast.firstToken(arg)), 0);
+                                try self.unifyArgument(param, value, module.tokenSpan(ast.firstToken(arg)));
                             }
                             if (callee_target.ref.isNoreturn()) return self.term(.never, span);
                             if (callee_target.ref.local != null or callee_target.ref.module.getDeclaration(callee_target.ref.id).?.is_generic_function) try self.body(&child, depth + 1);
@@ -1754,7 +1774,7 @@ const Solver = struct {
                     for (f.params, call.ast.args) |param, arg| {
                         const value = try self.expression(frame, arg, depth + 1);
                         if (root(value).value == .never) return value;
-                        try self.unify(param, value, span, 0);
+                        try self.unifyArgument(param, value, span);
                     }
                     return f.result;
                 }
@@ -1792,10 +1812,6 @@ const Solver = struct {
                 const params = try self.allocator.alloc(Ir.TypeId, f.params.len);
                 for (f.params, params) |param, *out| {
                     out.* = (try self.materialize(param, depth + 1)) orelse break :blk null;
-                    if (self.ir.getType(out.*).? == .reference) {
-                        try self.fail(.borrow_escape, self.call_span, param.span);
-                        break :blk null;
-                    }
                     if (self.ir.getType(out.*).? == .void) {
                         try self.fail(.invalid_parameter_type, self.call_span, param.span);
                         break :blk null;
@@ -1817,6 +1833,78 @@ const Solver = struct {
         };
     }
 };
+
+fn testReferenceParameterInference(allocator: std.mem.Allocator) !void {
+    const source =
+        \\let set:(p:&mut`T,v:`T)={p.* =v}
+        \\let gets:(p:&`T)->`T=p.*
+        \\let forward:(p:&mut`T,v:`T)={set(p,v)}
+        \\let via:(p:&`T)->`T=gets(p)
+        \\let R=struct{n:int=0,let put:(p:&mut`T,v:`T)={set(p,v)}
+        \\let get:(self:R,p:&`T)->`T=gets(p)
+        \\}
+        \\let main:()={
+        \\let mut n:u8=1
+        \\let p=&n
+        \\set(p,2)
+        \\forward(p,3)
+        \\let a:u8=gets(p)
+        \\let fixed:u8=9
+        \\let b:u8=via(&fixed)
+        \\let c:u8=p |> gets
+        \\let d:u8=&fixed |> gets
+        \\let setter:(&mut u8,u8)->void=set
+        \\setter(p,4)
+        \\let read:(&u8)->u8=gets
+        \\let local=(q:&mut`T,v:`T){set(q,v)}
+        \\local(p,5)
+        \\R.put(p,6)
+        \\let receiver=R[]
+        \\let e:u8=receiver.get(p)
+        \\let mut items:[]u8=[0]
+        \\set(&items[0],7)
+        \\@println(a,b,c,d,e,read(p),gets(&items[0]))
+        \\}
+    ;
+    var module = try Module.init(allocator, "generic-reference-parameters.nov", source);
+    defer module.deinit();
+    errdefer if (module.hasErrors()) std.debug.print("generic reference source: {any} {any}\n", .{ module.source.ast.errors, module.diagnostics.items });
+    var analysis = try Lowering.lower(&module);
+    defer analysis.deinit();
+    errdefer if (module.hasErrors()) std.debug.print("generic reference parameters: {any}\n", .{module.diagnostics.items});
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(analysis.lowering_complete);
+    try analysis.ir.verify();
+}
+
+test "reference parameters generic structural inference methods pipes and substitutions under OOM" {
+    try testReferenceParameterInference(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testReferenceParameterInference, .{});
+}
+
+fn testReferenceParameterInferenceError(allocator: std.mem.Allocator, source: []const u8) !void {
+    var module = try Module.init(allocator, "generic-reference-parameter-errors.nov", source);
+    defer module.deinit();
+    try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
+    var analysis = try Lowering.lower(&module);
+    defer analysis.deinit();
+    try std.testing.expect(module.hasErrors());
+    try std.testing.expect(!analysis.lowering_complete);
+}
+
+test "reference parameters generic qualifiers invariant callbacks and escapes under OOM" {
+    for ([_][]const u8{
+        "let set:(p:&mut`T,v:`T)={p.* =v}\nlet f:(p:&int)={set(p,1)}",
+        "let set:(p:&mut`T,v:`T)={p.* =v}\nlet f:()={let n:int=0\nset(&n,1)}",
+        "let take:(f:(&`T)->`T)->`T={loop {}}\nlet write:(p:&mut int)->int=p.*\nlet f:()->int=take(write)",
+        "let escape:(p:&`T)->&`T=p\nlet f:()={let n:int=1\nlet result=escape(&n)\n}",
+        "let copy:(p:&`T)->`T={let q=p\nq.*}\nlet f:()={let n:int=1\nlet result=copy(&n)\n}",
+        "let capture:(p:&`T)->()->`T=()->`T{p.*}\nlet f:()={let n:int=1\nlet result=capture(&n)\n}",
+    }) |source| {
+        try testReferenceParameterInferenceError(std.testing.allocator, source);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testReferenceParameterInferenceError, .{source});
+    }
+}
 
 fn testNonStorableInference(allocator: std.mem.Allocator, source: []const u8, tag: Module.Diagnostic.Tag) !void {
     var module = try Module.init(allocator, "non-storable.nov", source);

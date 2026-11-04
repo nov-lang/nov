@@ -88,8 +88,8 @@ fn renderModuleWithSources(module: *const Module, compilation: ?*const Compilati
         try location.renderPrefix(source.path, "error", writer);
         switch (diagnostic.tag) {
             .unsupported_iteration => try writer.writeAll("iteration requires an array, string or bounded integer range; reference iteration requires a local array owner (not a string, range, temporary or reborrow)"),
-            .borrow_conflict => try writer.writeAll("owner access conflicts with a live borrow"),
-            .borrow_escape => try writer.writeAll("local references cannot escape into arrays, fields, unions, parameters, results, constants or closures; use p.* to read the borrowed value instead"),
+            .borrow_conflict => try writer.writeAll("owner access or aliased reference arguments conflict with a live borrow"),
+            .borrow_escape => try writer.writeAll("references cannot escape into arrays, fields, unions, results, constants or closures; references are allowed only as local bindings and safe function parameters; use p.* to read the borrowed value instead"),
             .unsupported_borrow => try writer.writeAll("local references require &local or &localArray[index] and explicit p.* access; owner mutability determines &T (readonly) or &mut T (mutable pointee), independently of let mut rebinding; void, references to references, nonlocal owners and reborrows are unsupported"),
             .unbound_type_variable => try writer.writeAll("unbound backtick type variable; bind it in the enclosing named function signature"),
             .generic_function_inference_unsupported => try writer.writeAll("type-constraint inference for this generic function body expression is not supported yet; provide typed runtime arguments or an expected result type to determine every signature variable"),

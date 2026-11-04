@@ -58,6 +58,8 @@ pub const BinaryOp = enum { add, sub, mul, div, mod, bit_and, bit_or, bit_xor, e
 pub const FieldRead = struct { base: ValueId, index: u32 };
 pub const StringCursor = struct { array: ValueId, index: ValueId };
 pub const Operation = union(enum) {
+    reference_parameter: struct { index: u32, ty: TypeId },
+    reference_argument: struct { borrow: ValueId, ty: TypeId },
     // Capabilities are unit-typed, never ordinary runtime values.
     borrow_reserve: ValueId,
     // Null index denotes the whole owner; a nonnull index selects an array element.
@@ -817,7 +819,7 @@ fn operandType(body: Body, id: ValueId, before: usize) VerifyError!TypeId {
     const ty = try regionOperandType(body, id, before, null);
     if (isSlot(body.instructions[@backingInt(id)])) return error.InvalidValueId;
     const op = body.instructions[@backingInt(id)].op;
-    if (op == .reference_slot or op == .reference_load) return error.InvalidOperation;
+    if (op == .reference_slot or op == .reference_load or op == .reference_parameter or op == .reference_argument) return error.InvalidOperation;
     return ty;
 }
 
@@ -923,7 +925,7 @@ pub fn borrowOwner(body: Body, borrow: ValueId) ValueId {
 
 fn isCapability(instruction: Instruction) bool {
     return switch (instruction.op) {
-        .borrow_reserve, .borrow_start, .reference_slot, .reference_load => true,
+        .borrow_reserve, .borrow_start, .reference_slot, .reference_load, .reference_parameter, .reference_argument => true,
         else => false,
     };
 }
@@ -937,6 +939,11 @@ pub fn borrowElement(self: *const Ir, body: Body, borrow: ValueId, before: usize
         _ = try regionOperandType(body, slot, @backingInt(raw), null);
         if (body.instructions[@backingInt(slot)].op != .reference_slot) return error.InvalidOperation;
         raw = body.instructions[@backingInt(slot)].op.reference_slot;
+    }
+    if (body.instructions[@backingInt(raw)].op == .reference_parameter) {
+        const descriptor = self.getType(body.instructions[@backingInt(raw)].op.reference_parameter.ty) orelse return error.InvalidTypeId;
+        if (descriptor != .reference) return error.InvalidOperation;
+        return descriptor.reference.child;
     }
     if (body.instructions[@backingInt(raw)].op != .borrow_start) return error.InvalidOperation;
     const slot = borrowOwner(body, raw);
@@ -1046,6 +1053,8 @@ fn validateBodyStructure(self: *const Ir, function: Function, body: Body) Verify
                 const target = self.getFunction(closure.function) orelse return error.InvalidFunctionId;
                 if (!target.is_closure or target.environment_layout != null or target.ty != instruction.ty or closure.captures.len != target.captures.len) return error.InvalidOperation;
                 for (closure.captures, target.captures) |value, capture| {
+                    _ = try regionOperandType(body, value, i, null);
+                    if (isCapability(body.instructions[@backingInt(value)])) return error.InvalidOperation;
                     if (capture.mutable) {
                         if (try slotType(body, value, i) != capture.ty or !body.instructions[@backingInt(value)].boxed) return error.InvalidOperation;
                     } else {
@@ -1058,6 +1067,24 @@ fn validateBodyStructure(self: *const Ir, function: Function, body: Body) Verify
                 if (!function.is_closure or index >= function.captures.len) return error.InvalidOperation;
                 const capture = function.captures[index];
                 if (capture.ty != instruction.ty or capture.mutable != (instruction.op == .capture_cell) or capture.mutable != instruction.boxed) return error.InvalidOperation;
+            },
+            .reference_parameter => |parameter| {
+                if (ty != .void) return error.InvalidOperation;
+                if (parameter.index >= signature.params.len) return error.InvalidParameter;
+                const descriptor = self.getType(parameter.ty) orelse return error.InvalidTypeId;
+                if (descriptor != .reference) return error.InvalidOperation;
+                if (signature.params[parameter.index] != parameter.ty) return error.OperandTypeMismatch;
+                for (body.instructions[0..i]) |previous| {
+                    if (previous.op == .reference_parameter and previous.op.reference_parameter.index == parameter.index) return error.InvalidParameter;
+                }
+            },
+            .reference_argument => |argument| {
+                if (ty != .void) return error.InvalidOperation;
+                const descriptor = self.getType(argument.ty) orelse return error.InvalidTypeId;
+                if (descriptor != .reference) return error.InvalidOperation;
+                if (descriptor.reference.child != try self.borrowElement(body, argument.borrow, i)) return error.OperandTypeMismatch;
+                const source = body.instructions[@backingInt(argument.borrow)].op;
+                if (source == .reference_parameter and descriptor.reference.mutable and !self.getType(source.reference_parameter.ty).?.reference.mutable) return error.InvalidOperation;
             },
             .borrow_reserve => |slot| {
                 if (ty != .void) return error.InvalidOperation;
@@ -1107,6 +1134,8 @@ fn validateBodyStructure(self: *const Ir, function: Function, body: Body) Verify
             .borrow_store => |store| {
                 if (ty != .void or store.path.len > max_record_depth) return error.InvalidOperation;
                 var field_ty = try self.borrowElement(body, store.borrow, i);
+                const source = body.instructions[@backingInt(store.borrow)].op;
+                if (source == .reference_parameter and !self.getType(source.reference_parameter.ty).?.reference.mutable) return error.InvalidOperation;
 
                 for (store.path) |index| {
                     const record = self.getType(field_ty).?;
@@ -1296,6 +1325,8 @@ fn validateBodyStructure(self: *const Ir, function: Function, body: Body) Verify
                 if (function.noreturn) return error.InvalidReturn;
                 if (ty != .void) return error.InvalidReturn;
                 if (value) |v| {
+                    _ = try regionOperandType(body, v, i, null);
+                    if (isCapability(body.instructions[@backingInt(v)])) return error.InvalidOperation;
                     if (try operandType(body, v, i) != signature.result) return error.InvalidReturn;
                 } else if (self.getType(signature.result).? != .void) return error.InvalidReturn;
             },
@@ -1305,6 +1336,7 @@ fn validateBodyStructure(self: *const Ir, function: Function, body: Body) Verify
                 if (constant.ty != instruction.ty) return error.OperandTypeMismatch;
             },
             .parameter => |index| {
+                if (ty == .reference) return error.InvalidOperation;
                 if (index >= signature.params.len) return error.InvalidParameter;
                 if (signature.params[index] != instruction.ty) return error.OperandTypeMismatch;
             },
@@ -1381,7 +1413,12 @@ fn validateBodyStructure(self: *const Ir, function: Function, body: Body) Verify
                 try self.validateType(callee, self.types.items.len);
                 if (call.args.len != callee.function.params.len) return error.InvalidCall;
                 for (call.args, callee.function.params) |arg, param| {
-                    if (try operandType(body, arg, i) != param) return error.OperandTypeMismatch;
+                    if (self.getType(param).? == .reference) {
+                        _ = try regionOperandType(body, arg, i, null);
+                        const argument = body.instructions[@backingInt(arg)].op;
+                        if (argument != .reference_argument) return error.InvalidOperation;
+                        if (argument.reference_argument.ty != param) return error.OperandTypeMismatch;
+                    } else if (try operandType(body, arg, i) != param) return error.OperandTypeMismatch;
                 }
                 if (instruction.ty != callee.function.result) return error.InvalidCall;
                 const reference = body.instructions[@backingInt(call.callee)].op;
@@ -1447,7 +1484,6 @@ fn validateType(self: *const Ir, ty: Type, before: usize) ValidationError!void {
             for (function.params) |param| {
                 if (@backingInt(param) >= before) return error.InvalidTypeId;
                 if (self.getType(param).? == .void) return error.VoidParameter;
-                if (self.getType(param).? == .reference) return error.InvalidTypeId;
             }
         },
     }
@@ -1624,7 +1660,7 @@ fn testLocalReferenceDescriptors(allocator: std.mem.Allocator) !void {
         try std.testing.expect(!try ir.needsArrayCopy(readonly));
         try std.testing.expectError(error.InvalidTypeId, ir.internType(.{ .reference = .{ .child = readonly, .mutable = false } }));
         try std.testing.expectError(error.InvalidArrayElement, ir.internType(.{ .array = readonly }));
-        try std.testing.expectError(error.InvalidTypeId, ir.internType(.{ .function = .{ .params = &.{readonly}, .result = unit } }));
+        _ = try ir.internType(.{ .function = .{ .params = &.{readonly}, .result = unit } });
         try std.testing.expectError(error.InvalidTypeId, ir.internType(.{ .function = .{ .params = &.{}, .result = readonly } }));
         try std.testing.expectError(error.NonConstantType, ir.internConstant(.{ .ty = readonly, .value = .void }));
         const fields = &[_]Field{.{ .name = "ref", .ty = readonly, .span = test_span }};
@@ -5191,6 +5227,117 @@ test "reference rebinding array element children snapshots and index reservation
         ins(t.unit, .{ .constant = t.empty }),
     };
     try t.check(&index_access, true);
+}
+
+fn testReferenceParameters(allocator: std.mem.Allocator) !void {
+    var t = try ReferenceTests.init(allocator);
+    defer t.ir.deinit();
+    const ins = ReferenceTests.ins;
+    const id = ReferenceTests.id;
+    const readonly = try t.ir.internType(.{ .reference = .{ .child = t.integer, .mutable = false } });
+    const writable = try t.ir.internType(.{ .reference = .{ .child = t.integer, .mutable = true } });
+    const signature = try t.ir.internType(.{ .function = .{ .params = &.{ writable, readonly }, .result = t.unit } });
+    const callee = try t.ir.addFunction("callee", signature, .{ .start = 0, .end = 0 });
+    const forward = try t.ir.addFunction("forward", signature, .{ .start = 0, .end = 0 });
+    var code = [_]Instruction{
+        ins(t.unit, .{ .reference_parameter = .{ .index = 0, .ty = writable } }),
+        ins(t.unit, .{ .reference_parameter = .{ .index = 1, .ty = readonly } }),
+        ins(signature, .{ .function_ref = callee }),
+        ins(t.unit, .{ .reference_argument = .{ .borrow = id(0), .ty = writable } }),
+        ins(t.unit, .{ .reference_argument = .{ .borrow = id(1), .ty = readonly } }),
+        ins(t.unit, .{ .call = .{ .callee = id(2), .args = &.{ id(3), id(4) } } }),
+        ins(t.integer, .{ .borrow_read = id(1) }),
+        ins(t.unit, .{ .borrow_store = .{ .borrow = id(0), .value = id(6), .path = &.{} } }),
+        ins(t.unit, .{ .constant = t.empty }),
+    };
+    const body: Body = .{ .instructions = &code, .result = id(8) };
+    try t.ir.verifyBodyStructure(forward, body);
+    try std.testing.expect(try t.ir.borrowConflict(body) == null);
+    code[4].op.reference_argument.borrow = id(0);
+    try t.ir.verifyBodyStructure(forward, body);
+    try std.testing.expect(try t.ir.borrowConflict(body) != null);
+    code[4].op.reference_argument.borrow = id(1);
+    code[3].op.reference_argument.borrow = id(1);
+    try std.testing.expectError(error.InvalidOperation, t.ir.verifyBodyStructure(forward, body));
+    code[3].op.reference_argument.borrow = id(0);
+    code[7].op.borrow_store.borrow = id(1);
+    try std.testing.expectError(error.InvalidOperation, t.ir.verifyBodyStructure(forward, body));
+    code[7].op.borrow_store.borrow = id(0);
+    code[0].op = .{ .parameter = 0 };
+    try std.testing.expectError(error.OperandTypeMismatch, t.ir.verifyBodyStructure(forward, body));
+    code[0].op = .{ .reference_parameter = .{ .index = 0, .ty = writable } };
+    code[8].op = .{ .return_value = id(0) };
+    try std.testing.expectError(error.InvalidOperation, t.ir.verifyBodyStructure(forward, body));
+    code[8].op = .{ .constant = t.empty };
+    try std.testing.expectError(error.InvalidValueId, t.ir.verifyBodyStructure(forward, .{ .instructions = &code, .result = id(4) }));
+    try std.testing.expectError(error.InvalidExportSignature, t.ir.setExportName(forward, "forward"));
+    try std.testing.expectError(error.InvalidExternSignature, t.ir.setExternName(callee, "callee"));
+    try t.ir.setFunctionBody(forward, &code, id(8));
+    try t.ir.setFunctionBody(callee, &.{ins(t.unit, .{ .constant = t.empty })}, id(0));
+    try t.ir.setFunctionBody(t.function, &.{ins(t.unit, .{ .constant = t.empty })}, id(0));
+    try t.ir.verify();
+}
+
+test "reference parameters enforce forwarding permissions nonescape foreign ABI and OOM" {
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testReferenceParameters, .{});
+}
+
+fn testReferenceArgumentLiveness(allocator: std.mem.Allocator) !void {
+    var t = try ReferenceTests.init(allocator);
+    defer t.ir.deinit();
+    const ins = ReferenceTests.ins;
+    const id = ReferenceTests.id;
+    const reference = try t.ir.internType(.{ .reference = .{ .child = t.integer, .mutable = false } });
+    const signature = try t.ir.internType(.{ .function = .{ .params = &.{ reference, t.integer }, .result = t.unit } });
+    const callee = try t.ir.addFunction("callee", signature, .{ .start = 0, .end = 0 });
+    var code = [_]Instruction{
+        ins(t.integer, .{ .constant = t.zero }),
+        ins(t.integer, .{ .local_slot = id(0) }),
+        ins(t.unit, .{ .borrow_reserve = id(1) }),
+        ins(t.unit, .{ .borrow_start = .{ .reservation = id(2), .index = null } }),
+        ins(t.unit, .{ .reference_argument = .{ .borrow = id(3), .ty = reference } }),
+        ins(t.integer, .{ .local_load = id(1) }),
+        ins(signature, .{ .function_ref = callee }),
+        ins(t.unit, .{ .call = .{ .callee = id(6), .args = &.{ id(4), id(5) } } }),
+    };
+    const body: Body = .{ .instructions = &code, .result = id(7) };
+    try t.ir.verifyBodyStructure(t.function, body);
+    try std.testing.expect(try t.ir.borrowConflict(body) != null);
+    code[5].op = .{ .constant = t.zero };
+    try std.testing.expect(try t.ir.borrowConflict(body) == null);
+    code[1].boxed = true;
+    try std.testing.expect(try t.ir.borrowConflict(body) != null);
+    code[1].boxed = false;
+    code[7].op.call.args = &.{ id(3), id(5) };
+    try std.testing.expectError(error.InvalidOperation, t.ir.verifyBodyStructure(t.function, body));
+    code[7].op.call.args = &.{ id(4), id(5) };
+    const pair_signature = try t.ir.internType(.{ .function = .{ .params = &.{ reference, reference }, .result = t.unit } });
+    const pair = try t.ir.addFunction("pair", pair_signature, .{ .start = 0, .end = 0 });
+    var snapshots = t.prefix() ++ [_]Instruction{
+        ins(t.unit, .{ .reference_load = id(6) }), // 8: snapshot of a
+        ins(t.unit, .{ .reference_argument = .{ .borrow = id(8), .ty = reference } }),
+        ins(t.unit, .{ .borrow_reserve = id(2) }),
+        ins(t.unit, .{ .borrow_start = .{ .reservation = id(10), .index = null } }),
+        ins(t.unit, .{ .reference_rebind = .{ .slot = id(6), .borrow = id(11) } }),
+        ins(t.unit, .{ .reference_load = id(6) }), // 13: snapshot of b
+        ins(t.unit, .{ .reference_argument = .{ .borrow = id(13), .ty = reference } }),
+        ins(pair_signature, .{ .function_ref = pair }),
+        ins(t.unit, .{ .call = .{ .callee = id(15), .args = &.{ id(9), id(14) } } }),
+    };
+    try t.check(&snapshots, false);
+    snapshots[14].op.reference_argument.borrow = id(8);
+    try t.check(&snapshots, true); // Readonly arguments are exclusive too.
+    snapshots[14].op.reference_argument.borrow = id(13);
+    snapshots[7] = ins(t.integer, .{ .local_load = id(1) });
+    try t.check(&snapshots, true); // Snapshot loan already active before wrapping.
+    try t.ir.setFunctionBody(pair, &.{ins(t.unit, .{ .constant = t.empty })}, id(0));
+    try t.ir.setFunctionBody(t.function, &code, body.result);
+    try t.ir.setFunctionBody(callee, &.{ins(t.unit, .{ .constant = t.empty })}, id(0));
+    try t.ir.verify();
+}
+
+test "reference arguments retain owner loans through all argument evaluation and calls with OOM" {
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testReferenceArgumentLiveness, .{});
 }
 
 test "reference rebinding preserves boxed owner call and closure capture conflicts" {

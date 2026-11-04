@@ -913,8 +913,9 @@ inferred type variables. Compile-time argument handling is not implemented.
 
 The examples below mix implemented forms with older design sketches. Pointer
 parameters using the old `*mut` spelling, tuples and explicit `#` compile-time
-arguments are design sketches only. Passing safe `&T` / `&mut T` references is an
-accepted but unimplemented roadmap; these old pointer sketches do not define it.
+arguments are design sketches only. Safe `&T` / `&mut T` reference parameters
+are implemented under the [reference contract](#local-static-borrowing); these old
+pointer sketches do not define them.
 
 Parenthesis are specific to functions, whenever there is a parenthesis there is a function involved.
 ```nov
@@ -1880,11 +1881,66 @@ by-value method receivers such as `p.*.method()` use existing value-copy rules:
 arrays have recursively independent backing, records copy by value, immutable
 strings share, and function/closure copies share their environments. They do not
 copy or escape the reference capability or grant a method mutable receiver access.
-Bare `p` is not a value read: `let q = p`, `consume(p)`, `return p`, storing `p`
+Bare `p` is not an ordinary value read: `consume(p)` is supported only when the
+formal parameter is a compatible reference. `let q = p`, `return p`, storing `p`
 in an aggregate and capturing `p` in a closure are currently rejected. Reborrows
 such as `&p` and `&p.*` are unsupported. `@TypeOf(p)` is the bounded compile-time
 exception: it inspects the reference descriptor and prints names such as `&u8`
 or `&mut u8`; `@TypeOf(p.*)` remains unsupported (see [Type Queries](#type-queries)).
+
+#### Reference parameters
+
+Functions, callbacks, closures, inferred generic functions and methods may accept
+`&T` / `&mut T` parameters; function pipes support reference arguments too. Pass an
+existing reference as `f(p)`, or borrow directly with `f(&local)` or
+`f(&array[index])`. No explicit dereference is needed to pass the reference;
+`f(p.*)` instead passes a child value under the ordinary copy rules.
+
+```nov
+let read: (p: &int) -> int = p.*
+let add: (p: &mut int, amount: int) = { p.* += amount }
+let forward: (p: &mut int) = { add(p, 1) }
+
+let main: () = {
+    let mut a: int = 1
+    let mut b: int = 10
+    let mut p = &a
+    add(p, {
+        p = &b
+        4
+    })                    ; snapshots &a before rebinding; a becomes 5
+    forward(p)            ; b becomes 11
+    @println(read(p))     ; mutable argument weakens to readonly
+    let mut items: []int = [2, 3]
+    add(&items[0], 1)
+    @println(&items[0] |> read)
+}
+```
+
+A mutable reference argument may weaken to readonly for the same exact child
+type, never the reverse. This is an argument-position rule only: function types
+remain invariant, including callback types. Formal reference bindings are
+immutable and cannot rebind (`p = &other` rejects), but `p.*` writes work for
+`&mut T`. A callee may forward its parameter to another compatible reference
+parameter; it cannot copy/alias it into an ordinary binding, capture, reborrow,
+return or store it. Methods retain their existing by-value receivers; this adds
+no implicit mutable receiver or automatic borrowing.
+
+Callee and argument expressions retain ordinary eager evaluation order. Each
+reference argument snapshots its target before later arguments execute. Thus
+the `add` call above updates the old target, not `b`. The caller keeps the
+captured target's loan and managed-owner roots live throughout the remaining
+argument evaluation and the call, including nested forwarding. Unsafe owner
+replacement, resizing or other conflicting access in later arguments rejects.
+Multiple reference arguments must not possibly alias, **even when readonly**:
+`f(p, p)` and `f(&a, &a)` reject. Array-element loans protect the whole array;
+different indices do not establish disjointness. Existing conservative
+boxed/captured-owner call protection may reject safe calls; no interprocedural
+effect analysis or acceptance of every safe call is promised.
+
+See [examples/reference-parameters.nov](examples/reference-parameters.nov).
+
+#### Local rebinding and lifetime checks
 
 Mutable reference bindings can rebind across `if`, `match`, short-circuit
 expressions, nested blocks and loops, including loop conditions, continuation and
@@ -1903,12 +1959,16 @@ between a loop path and a reference's current target.
 The checker reports `immutable_assignment` for rebinding a fixed binding or
 writing through a readonly reference, and `expression_type_mismatch` for an
 incompatible reference annotation. Unsupported access/rebinding forms use
-`unsupported_borrow`; forbidden reference types in storage/signatures use
+`unsupported_borrow`; forbidden reference types in storage/results use
 `borrow_escape`; conflicting owner access uses `borrow_conflict`.
 
 Borrow creation itself does not clone or allocate its target. Local reference
-handles now lower to typed C pointers, but remain internal, unit-local IR
-capabilities, not source-level first-class references or a reference ABI. A load
+handles lower to typed C pointers. Unit-typed IR `reference_parameter` and
+`reference_argument` capabilities carry reference descriptors without becoming
+ordinary first-class reference values. Generated internal Nov C function
+prototypes use typed pointers (`const T *` for readonly, `T *` for mutable);
+this is not a source-level foreign ABI. `@[extern]` / `@[export]` reference
+parameters and results remain forbidden. A load
 captures the current runtime target before dereference RHS effects. Ordinary
 pointee reads and operations may allocate as usual; no runtime reference-validity
 check is added. See [examples/references.nov](examples/references.nov) for explicit
@@ -1949,8 +2009,9 @@ changed.*.score += 1
   indices support typed runtime target handles; owner roots keep managed backing
   alive, including for captured target snapshots. There are no runtime generation
   or reference-invalidation checks, and no interior pointer is traced by GC.
-- Reference capabilities currently cannot be copied, passed, returned, stored or
-  captured; CFG rebinding does not enable reference escape. Ordinary
+- Reference capabilities may be passed to compatible reference parameters, but
+  cannot be ordinarily copied, returned, stored or captured; CFG rebinding and
+  call-scoped forwarding do not enable reference escape. Ordinary
   copied pointee values may be returned, passed or stored. Void has no borrowable
   storage. Nonlocal sources, reborrows, temporary owners and general pointer APIs
   remain unsupported. Array-valued struct fields
@@ -1965,9 +2026,10 @@ changed.*.score += 1
   before a later borrow inside an index or RHS. In-place borrowed writes do not
   alter earlier copies. Element access follows the explicit `changed.*` form above.
 
-**Accepted roadmap, not implemented:** support passing, returning and storing
-references beyond this local-only slice. This requires lifetimes/referent tracking,
-GC retention of managed referents for the entire reference lifetime, and static
+**Accepted roadmap:** passing references is delivered under the call-scoped
+parameter rules above. Returning and storing references remain **not implemented**,
+as do ordinary reference copying, capture and reborrowing. Escaping references
+require lifetimes/referent tracking, GC retention of managed referents for the entire reference lifetime, and static
 prevention or safe invalidation of references when storage changes. No dangling
 references may be exposed. This is an accepted implementation direction, not just
 a speculative pointer proposal, and does not make reference escape executable
@@ -3085,7 +3147,7 @@ results may also be `void`. Canonical aliases are accepted, including pointer-si
 `intN_t`/`uintN_t` (include `<stdint.h>`); native integers match `intptr_t`/`uintptr_t`
 on the native target. `f32` and `f64` map to C `float` and `double` respectively;
 `float` follows its target-width alias. Calls use the C compiler's ordinary C calling convention.
-Runes, strings, arrays, ranges, enums, records/unions, function values, wider integers,
+References, runes, strings, arrays, ranges, enums, records/unions, function values, wider integers,
 methods and generic exports are not supported as foreign ABI declarations.
 
 `@[public]` controls **Nov import visibility**; export controls the **foreign symbol**.
@@ -3125,7 +3187,7 @@ function prototypes **without a body**. They cannot also carry `@[export]`.
 The initial ABI is the same scalar subset as exports: bool and 8/16/32/64-bit
 signed/unsigned integers, pointer-sized int/uint, `f32`/`f64` (C `float`/`double`),
 and void results. The native `float` alias follows the target width. No variadics,
-C-specific integer aliases, strings, pointers, aggregates or function-valued ABI
+C-specific integer aliases, strings, references, pointers, aggregates or function-valued ABI
 parameters/results are supported. Extern functions can still be called indirectly
 or passed as ordinary function values inside Nov. Standard C function names such
 as `abs` and `putchar` are accepted; C keywords, emitted-header macros/types and

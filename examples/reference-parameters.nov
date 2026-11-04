@@ -1,0 +1,178 @@
+; nov run examples/reference-parameters.nov
+; nov test examples/reference-parameters.nov
+; References are contextual call arguments, not ordinary copyable values.
+; Parameter bindings are immutable; &mut T permits writes through p.*.
+; Calls may weaken &mut T to &T, but function signatures remain invariant.
+; Even readonly simultaneous arguments require distinct possible owners.
+; No returning, storing, capturing, copying or reborrowing references.
+
+let add: (p: &mut int, amount: int) = {
+    p.* += amount
+}
+let sum: (a: &int, b: &int) -> int = a.* + b.*
+let swap: (a: &mut `T, b: &mut `T) = {
+    let saved = a.*
+    a.* = b.*
+    b.* = saved
+}
+let forward: (p: &mut int, amount: int) = add(p, amount)
+let add_four: (p: &mut int) = add(p, 4)
+let recurse: (p: &mut int, count: int) = {
+    if count > 0 {
+        add(p, 1)
+        recurse(p, count - 1)
+    }
+}
+let apply: (f: (&mut int, int), p: &mut int, amount: int) = f(p, amount)
+let total: (values: &[]int) -> int = {
+    let mut result: int = 0
+    loop value in values.* {
+        result += value
+    }
+    result
+}
+let append: (values: &mut []string, value: string) = {
+    values.* += [value]
+}
+let Record = struct {
+    name: string,
+    values: []string,
+}
+let update: (record: &mut Record) = {
+    record.*.name += "!"
+    record.*.values += ["new"]
+}
+let suffix: (text: &mut string, ending: string) = {
+    text.* += ending
+}
+let Tools = struct {
+    let exchange: (self: Tools, a: &mut `T, b: &mut `T) = swap(a, b)
+}
+
+let main: () = {
+    let mut a: int = 3
+    let mut b: int = 7
+    add(&a, 2)
+    swap(&a, &b)
+    @println("Swapped:", a, b, "Sum:", sum(&a, &b))
+    let mut words: []string = ["hello"]
+    append(&words, "world")
+    suffix(&words[0], "!")
+    @println("Words:", words)
+}
+
+@[test]
+let mutation_readonly_and_direct_borrows: () = {
+    let mut a: int = 1
+    let fixed: int = 4
+    let p = &a
+    add(p, 2)
+    @assert(sum(p, &fixed) == 7)
+    let mut values: []int = [1, 2, 3]
+    add(&values[-1], 5)
+    @assert(total(&values) == 11)
+    loop &item in values {
+        add(item, 1)
+    }
+    @assert(total(&values) == 14)
+}
+
+@[test]
+let generic_swap_and_methods: () = {
+    let mut a: int = 3
+    let mut b: int = 9
+    swap(&a, &b)
+    @assert(a == 9 and b == 3)
+    let mut first = "one"
+    let mut second = "two"
+    Tools[].exchange(&first, &second)
+    @assert(first == "two" and second == "one")
+    let f: (&mut int, &mut int) = swap
+    f(&a, &b)
+    @assert(a == 3 and b == 9)
+}
+
+@[test]
+let callbacks_closures_forwarding_recursion_and_pipes: () = {
+    let mut value: int = 0
+    let callback: (&mut int, int) = add
+    apply(callback, &value, 2)
+    let amount: int = 3
+    ; Capture only the amount, never the actual borrowed owner.
+    let closure = (p: &mut int, extra: int) {
+        add(p, amount + extra)
+    }
+    apply(closure, &value, 1)
+    forward(&value, 2)
+    recurse(&value, 3)
+    let p = &value
+    p |> add_four
+    @assert(value == 15)
+}
+
+@[test]
+let managed_arrays_records_and_strings: () = {
+    let mut words: []string = ["old"]
+    let saved = words
+    append(&words, "tail")
+    suffix(&words[0], "!")
+    @assert(words[0] == "old!" and words[1] == "tail")
+    @assert(saved.len == 1 and saved[0] == "old")
+    let mut record = Record[ .name = "record", .values = ["original"] ]
+    let snapshot = record
+    update(&record)
+    @assert(record.name == "record!" and record.values.len == 2)
+    @assert(snapshot.name == "record" and snapshot.values.len == 1)
+    let mut other: []string = ["other"]
+    swap(&words, &other)
+    @assert(words[0] == "other" and other[0] == "old!")
+}
+
+@[test]
+let argument_order_snapshots_actual_target: () = {
+    let mut a: int = 1
+    let mut b: int = 10
+    let mut p = &a
+    add(
+        p,
+        {
+            p = &b
+            5
+        }
+    )
+    @assert(p.* == 10 and a == 6)
+    let mut index: int = 0
+    let mut values: []int = [2, 20]
+    add(
+        &values[index],
+        {
+            index = 1
+            3
+        }
+    )
+    @assert(values[0] == 5 and values[1] == 20 and index == 1)
+    let mut left = "left"
+    let mut right = "right"
+    let mut text = &left
+    suffix(
+        text,
+        {
+            text = &right
+            "!"
+        }
+    )
+    @assert(text.* == "right" and left == "left!")
+    let mut first: []string = ["first"]
+    let mut second: []string = ["second"]
+    let snapshot = first
+    let mut items = &first
+    append(
+        items,
+        {
+            items = &second
+            "tail"
+        }
+    )
+    @assert(items.*.len == 1 and items.*[0] == "second")
+    @assert(first.len == 2 and first[1] == "tail" and snapshot.len == 1)
+}

@@ -204,7 +204,7 @@ fn analyze(allocator: std.mem.Allocator, ir: *const Ir, origins: []?Origin, diag
         const id = pending[reachable.len];
         const origin = origins[@backingInt(id)].?;
         switch (ir.getType(id).?) {
-            .reference => unreachable,
+            .reference => |reference| reachable.mark(reference.child, origin),
             .void, .boolean, .rune, .string, .enumeration, .float => {},
             .record => |record| for (record.fields) |field| {
                 reachable.mark(field.ty, .{ .function = origin.function, .span = field.span });
@@ -496,6 +496,8 @@ fn usesClosures(ir: *const Ir) bool {
 }
 
 fn managedType(ir: *const Ir, ty: Ir.Type) bool {
+    // The caller roots the owner for the entire call, never the borrowed pointer.
+    if (ty == .reference) return false;
     return Ir.isManaged(ty) or (ty == .function and usesClosures(ir));
 }
 
@@ -927,7 +929,11 @@ fn writeArithmeticRuntime(ir: *const Ir, w: *std.Io.Writer) WriteError!void {
 /// Only called for types accepted by `analyze`.
 fn writeType(ir: *const Ir, w: *std.Io.Writer, id: Ir.TypeId) WriteError!void {
     switch (ir.types.items[@backingInt(id)]) {
-        .reference => unreachable,
+        .reference => |reference| {
+            if (!reference.mutable) try w.writeAll("const ");
+            try writeType(ir, w, reference.child);
+            try w.writeAll(" *");
+        },
         .void => try w.writeAll("void"),
         .boolean => try w.writeAll("bool"),
         .float => |bits| try w.writeAll(if (bits == 32) "float" else "double"),
@@ -1092,6 +1098,8 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
             value_used[@backingInt(rebind.borrow)] = true;
         },
         .reference_load => |slot| value_used[@backingInt(slot)] = true,
+        .reference_parameter => |param| param_used[param.index] = true,
+        .reference_argument => |arg| value_used[@backingInt(arg.borrow)] = true,
         .borrow_read => |borrow| value_used[@backingInt(borrow)] = true,
         .borrow_store => |store| {
             value_used[@backingInt(store.borrow)] = true;
@@ -1294,7 +1302,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
                 if (usesClosures(ir)) try w.print(" volatile nov_target = v{d};\n    nov_target.code(nov_target.env", .{@backingInt(call.callee)}) else try w.print(" volatile nov_target = v{d};\n    nov_target(", .{@backingInt(call.callee)});
                 for (call.args, 0..) |arg, index| {
                     if (index != 0 or (usesClosures(ir) and sameFunction(ir.functions.items[@backingInt(target)], function))) try w.writeAll(", ");
-                    try w.print("v{d}", .{@backingInt(arg)});
+                    try writeCallArgument(ir, w, body, call, arg, index);
                 }
                 try w.writeAll(");\n    for (;;) {}\n    }\n");
             } else {
@@ -1302,7 +1310,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
                 try w.writeByte('(');
                 for (call.args, 0..) |arg, index| {
                     if (index != 0 or (usesClosures(ir) and sameFunction(ir.functions.items[@backingInt(target)], function))) try w.writeAll(", ");
-                    try w.print("v{d}", .{@backingInt(arg)});
+                    try writeCallArgument(ir, w, body, call, arg, index);
                 }
                 try w.writeAll(");\n");
             }
@@ -1335,6 +1343,19 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
             continue;
         }
         if (instruction.op == .borrow_reserve) continue;
+        if (instruction.op == .reference_parameter) {
+            try w.print("    (void)p{d};\n", .{instruction.op.reference_parameter.index});
+            continue;
+        }
+        if (instruction.op == .reference_argument) {
+            const arg = instruction.op.reference_argument;
+            try w.writeAll("    ");
+            try writeType(ir, w, arg.ty);
+            try w.print("const nov_reference_argument_{d} = ", .{i});
+            try writeBorrowAddress(ir, w, body, arg.borrow);
+            try w.print(";\n    (void)nov_reference_argument_{d};\n", .{i});
+            continue;
+        }
         if (instruction.op == .borrow_start) {
             const start = instruction.op.borrow_start;
             const slot = body.instructions[@backingInt(start.reservation)].op.borrow_reserve;
@@ -1447,7 +1468,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
             if (instruction.op == .print) try writePrint(ir, w, body, instruction.op.print);
             if (instruction.op == .call) {
                 try w.writeAll("    ");
-                try writeCall(ir, w, instruction.op.call);
+                try writeCall(ir, w, body, instruction.op.call);
                 try w.writeAll(";\n");
             }
             continue;
@@ -1481,7 +1502,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
                     try w.writeAll("((nov_string *)");
                     try w.print("v{d}.data)[nov_array_index(v{d}, v{d})]", .{ @backingInt(r.array), @backingInt(r.array), @backingInt(r.index) });
                 },
-                .call => |call| try writeCall(ir, w, call),
+                .call => |call| try writeCall(ir, w, body, call),
                 else => unreachable,
             }
             try w.writeAll(";\n");
@@ -1530,7 +1551,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
                 try w.writeAll(" }");
             },
             .borrow_read => |borrow| try writeBorrowRead(ir, w, body, borrow),
-            .borrow_reserve, .borrow_start, .reference_slot, .reference_rebind, .reference_load, .borrow_store => unreachable,
+            .borrow_reserve, .borrow_start, .reference_slot, .reference_rebind, .reference_load, .reference_parameter, .reference_argument, .borrow_store => unreachable,
             .field_read => |read| try w.print("v{d}.f{d}", .{ @backingInt(read.base), read.index }),
             .iteration_len => |value| try w.print("(v{d}.len > INTPTR_MAX ? (nov_rt_panic(\"iterable too long\"), (intptr_t)0) : (intptr_t)v{d}.len)", .{ @backingInt(value), @backingInt(value) }),
             .string_decode, .string_next => |r| try w.print("nov_string_cursor_{s}(v{d}, v{d})", .{ if (instruction.op == .string_decode) "rune" else "next", @backingInt(r.array), @backingInt(r.index) }),
@@ -1630,7 +1651,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
                 };
                 try w.print("v{d} {s} v{d}", .{ @backingInt(binary.lhs), operator, @backingInt(binary.rhs) });
             },
-            .call => |call| try writeCall(ir, w, call),
+            .call => |call| try writeCall(ir, w, body, call),
             .string_slice, .assertion, .panic, .loop, .loop_break, .loop_continue, .return_value, .print, .short_circuit, .branch, .local_store => unreachable,
         }
         try w.writeAll(";\n");
@@ -1760,11 +1781,19 @@ fn rawBorrowChild(ir: *const Ir, body: Ir.Body, borrow: Ir.ValueId) Ir.TypeId {
 }
 
 fn writeBorrowAddress(ir: *const Ir, w: *std.Io.Writer, body: Ir.Body, borrow: Ir.ValueId) WriteError!void {
+    if (body.instructions[@backingInt(borrow)].op == .reference_parameter) {
+        try w.print("p{d}", .{body.instructions[@backingInt(borrow)].op.reference_parameter.index});
+        return;
+    }
     try w.writeByte('&');
     try writeBorrowRead(ir, w, body, borrow);
 }
 
 fn writeBorrowRead(ir: *const Ir, w: *std.Io.Writer, body: Ir.Body, borrow: Ir.ValueId) WriteError!void {
+    if (body.instructions[@backingInt(borrow)].op == .reference_parameter) {
+        try w.print("(*p{d})", .{body.instructions[@backingInt(borrow)].op.reference_parameter.index});
+        return;
+    }
     if (body.instructions[@backingInt(borrow)].op == .reference_load) {
         try w.print("(*nov_reference_{d})", .{@backingInt(borrow)});
         return;
@@ -1945,7 +1974,7 @@ fn writeArrayValue(ir: *const Ir, w: *std.Io.Writer, body: Ir.Body, transfers: A
         },
         .parameter => |index| try w.print("p{d}", .{index}),
         .local_slot, .local_load => |value| try w.print("v{d}", .{@backingInt(value)}),
-        .call => |call| try writeCall(ir, w, call),
+        .call => |call| try writeCall(ir, w, body, call),
         else => unreachable,
     }
     try w.writeAll(";\n");
@@ -2925,13 +2954,21 @@ fn writePrint(ir: *const Ir, w: *std.Io.Writer, body: Ir.Body, print: anytype) W
     if (print.newline) try w.writeAll("    nov_rt_check(fputc('\\n', stdout));\n");
 }
 
-fn writeCall(ir: *const Ir, w: *std.Io.Writer, call: anytype) WriteError!void {
+fn writeCall(ir: *const Ir, w: *std.Io.Writer, body: Ir.Body, call: anytype) WriteError!void {
     if (usesClosures(ir)) try w.print("v{d}.code(v{d}.env", .{ @backingInt(call.callee), @backingInt(call.callee) }) else try w.print("v{d}(", .{@backingInt(call.callee)});
     for (call.args, 0..) |arg, i| {
         if (i != 0 or usesClosures(ir)) try w.writeAll(", ");
-        try w.print("v{d}", .{@backingInt(arg)});
+        try writeCallArgument(ir, w, body, call, arg, i);
     }
     try w.writeByte(')');
+}
+
+fn writeCallArgument(ir: *const Ir, w: *std.Io.Writer, body: Ir.Body, call: anytype, arg: Ir.ValueId, index: usize) WriteError!void {
+    const signature = ir.getType(body.instructions[@backingInt(call.callee)].ty).?.function;
+    if (ir.getType(signature.params[index]).? == .reference) {
+        std.debug.assert(body.instructions[@backingInt(arg)].op == .reference_argument);
+        try w.print("nov_reference_argument_{d}", .{@backingInt(arg)});
+    } else try w.print("v{d}", .{@backingInt(arg)});
 }
 
 // ---------------------------------------------------------------------------
@@ -6331,6 +6368,171 @@ fn emitReferenceRebinding(allocator: std.mem.Allocator, source: []const u8) ![]u
     };
     defer lowered.deinit();
     return emit(allocator, &lowered.ir, null);
+}
+
+const reference_parameter_scalars =
+    \\let add:(p:&mut int,n:int)={p.* +=n}
+    \\let read:(p:&int)->int=p.*
+    \\let forward:(p:&mut int)={add(p,2)
+    \\@println(read(p))}
+    \\let recurse:(p:&mut int,n:int)={if n>0 {add(p,1)
+    \\recurse(p,n-1)}}
+    \\let callback:(f:(&mut int,int)->void,p:&mut int)={f(p,3)}
+    \\let immutable:(n:int)->int=read(&n)
+    \\let main:()={
+    \\let mut a:int=1
+    \\let mut b:int=10
+    \\let mut p=&a
+    \\add(p,{p=&b
+    \\4})
+    \\@println(p.*)
+    \\forward(p)
+    \\recurse(p,2)
+    \\callback(add,p)
+    \\@println(a,b,immutable(9))
+    \\let mut values:[]int=[20,30]
+    \\add(&values[-1],5)
+    \\@println(values[0],values[1])
+    \\}
+;
+
+test "reference parameters scalar forwarding recursion callbacks argument snapshots C11 O0 O3" {
+    const library = try emitReferenceRebinding(test_gpa, reference_parameter_scalars);
+    defer test_gpa.free(library);
+    try std.testing.expect(std.mem.indexOf(u8, library, "nov_reference_argument_") != null);
+    try std.testing.expect(std.mem.indexOf(u8, library, "(*p0)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, library, "&nov_reference_") == null);
+    const program = try collectingTestProgram(library);
+    defer test_gpa.free(program);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(program, "typedef int nonempty;", 0, "10\n12\n5 17 9\n20 35\n", "", mode);
+}
+
+const reference_parameter_managed =
+    \\let R=struct{s:string,values:[][]int,}
+    \\let update:(p:&mut R)={let frozen=p.*
+    \\p.*.s +="x"+"y"
+    \\p.*.values=[[9]]
+    \\@println(frozen.s,frozen.values[0][0],p.*.s,p.*.values[0][0])}
+    \\let arrays:(p:&mut [][]int)={let frozen=p.*
+    \\p.* =[[8]]
+    \\@println(frozen[0][0],p.*[0][0])}
+    \\let text:(p:&mut string)={p.* +="!"+"!"}
+    \\let invoke:(p:&()->int)->int=p.*()
+    \\let main:()={
+    \\let mut record=R[.s="a"+"!",.values=[[1]]]
+    \\update(&record)
+    \\let mut rows:[][]int=[[2]]
+    \\arrays(&rows)
+    \\let mut strings:[]string=["c"+"!","d"+"!"]
+    \\text(&strings[-1])
+    \\@println(strings[0],strings[1])
+    \\let captured:int=7
+    \\let f=()->int{captured}
+    \\@println(invoke(&f))
+    \\let suffix="z"+"!"
+    \\let closure=(p:&mut string){p.* +=suffix}
+    \\let mut s="e"+"!"
+    \\closure(&s)
+    \\@println(s)
+    \\}
+;
+
+test "reference parameters managed children closure signatures source free forced GC O0 O3 OOM" {
+    const library = try emitReferenceRebinding(test_gpa, reference_parameter_managed);
+    defer test_gpa.free(library);
+    try std.testing.expect(std.mem.indexOf(u8, library, "&nov_reference_") == null);
+    const program = try collectingTestProgram(library);
+    defer test_gpa.free(program);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(program, "typedef int nonempty;", 0, "a! 1 a!xy 9\n2 8\nc! d!!!\n7\ne!z!\n", "", mode);
+    const oom = try std.mem.concat(test_gpa, u8, &.{ "#include <stdlib.h>\nstatic void *test_malloc(size_t n) { (void)n; return NULL; }\n#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n", program });
+    defer test_gpa.free(oom);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(oom, "typedef int nonempty;", 1, "", "panic: GC allocation failed\n", mode);
+}
+
+test "reference parameters generated internal C pointer prototypes are not source foreign ABI" {
+    const library = try emitReferenceRebinding(test_gpa, "let add:(p:&mut int,n:int)={p.* +=n}\nlet read:(p:&int)->int=p.*");
+    defer test_gpa.free(library);
+    const harness =
+        \\#include <stdint.h>
+        \\void nov_add(intptr_t *, intptr_t);
+        \\intptr_t nov_read(const intptr_t *);
+        \\int main(void) { intptr_t n = 4; nov_add(&n, 3); return nov_read(&n) == 7 ? 0 : 1; }
+    ;
+    try std.testing.expect(std.mem.indexOf(u8, library, "nov_gc_roots") == null);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(library, harness, 0, "", "", mode);
+}
+
+test "reference parameters generic nested forwarding and function value deep copies C11 O0 O3" {
+    const source =
+        \\let read:(p:&`T)->`T=p.*
+        \\let forward:(p:&`T)->`T=read(p)
+        \\let add:(p:&mut int)={p.* +=1}
+        \\let apply:(fs:[](&mut int)->void,p:&mut int)={fs[0](p)}
+        \\let main:()={
+        \\let mut n:int=6
+        \\let nested:(p:&mut int)={add(p)}
+        \\nested(&n)
+        \\let fs:[](&mut int)->void=[add]
+        \\let copy=fs
+        \\apply(copy,&n)
+        \\@println(forward(&n))
+        \\let rows:[][]int=[[3]]
+        \\let mut snapshot=forward(&rows)
+        \\snapshot[0]=[9]
+        \\@println(rows[0][0],snapshot[0][0])
+        \\}
+    ;
+    const library = try emitReferenceRebinding(test_gpa, source);
+    defer test_gpa.free(library);
+    const program = try collectingTestProgram(library);
+    defer test_gpa.free(program);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(program, "typedef int nonempty;", 0, "8\n3 9\n", "", mode);
+}
+
+test "reference parameters snapshot raw element pointer before later argument allocation and readonly wrap" {
+    const source =
+        \\let effect:()->string={@println("later")
+        \\"x"+"y"}
+        \\let append:(p:&mut string,s:string)={p.* +=s}
+        \\let read:(p:&string)->string=p.*
+        \\let forward:(p:&mut string)->string=read(p)
+        \\let fromValue:(s:string)->string=read(&s)
+        \\let main:()={
+        \\let mut strings:[]string=["a"+"!","b"+"!"]
+        \\append(&strings[-1],effect())
+        \\@println(forward(&strings[-1]),strings[0])
+        \\@println(fromValue("c"+"!"))
+        \\}
+    ;
+    const library = try emitReferenceRebinding(test_gpa, source);
+    defer test_gpa.free(library);
+    try std.testing.expect(std.mem.indexOf(u8, library, "const nov_string *const nov_reference_argument_") != null);
+    const program = try collectingTestProgram(library);
+    defer test_gpa.free(program);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(program, "typedef int nonempty;", 0, "later\nb!xy a!\nc!\n", "", mode);
+}
+
+test "reference parameters signature only children emit layouts and float guards without roots" {
+    const library = try emitReferenceRebinding(test_gpa,
+        \\let R=struct{value:f64,}
+        \\let unused:(p:&R)={}
+        \\let floats:(p:&mut f32)={}
+    );
+    defer test_gpa.free(library);
+    try std.testing.expect(std.mem.indexOf(u8, library, "nov_record_") != null);
+    try std.testing.expect(std.mem.indexOf(u8, library, "FLT_MANT_DIG") != null);
+    try std.testing.expect(std.mem.indexOf(u8, library, "DBL_MANT_DIG") != null);
+    try std.testing.expect(std.mem.indexOf(u8, library, "nov_gc_roots") == null);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(library, "int main(void) { return 0; }", 0, "", "", mode);
+}
+
+test "reference parameters emission handles every compiler allocation failure" {
+    try TestAllocations.checkAllAllocationFailures(test_gpa, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const c = try emitReferenceRebinding(allocator, "let read:(p:&int)->int=p.*\nlet forward:(p:&mut int)->int=read(p)");
+            defer allocator.free(c);
+        }
+    }.run, .{});
 }
 
 const reference_rebinding_cfg =

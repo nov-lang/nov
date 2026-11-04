@@ -128,11 +128,13 @@ substantial overhead. Further optimization remains **PAUSED**. See
 and generic callbacks, stable order, empty inputs, left folds, recursive copies,
 shared closure environments and eager argument order.
 
-## Local references and library boundaries
+## References and library boundaries
 
-The current explicit references are local-only capabilities. Their runtime
-handles lower to typed C pointers internal to a compilation unit's IR; this does
-not enable source-level first-class references or a reference ABI.
+Explicit references are local and call-scoped capabilities, not ordinary
+first-class values. Runtime handles lower to typed C pointers; unit-typed IR
+`reference_parameter` / `reference_argument` capabilities carry their descriptors.
+Internal Nov C prototypes use typed pointers, not a source-level foreign ABI:
+`@[extern]` / `@[export]` reference parameters and results remain forbidden.
 `let p = &a` infers `&mut T` iff owner `a` is mutable;
 otherwise it infers readonly `&T` (not `&const T`). An explicit `let p: &T = &a`
 can downgrade a mutable owner's borrow. Binding `mut` is independent: `let p`
@@ -155,21 +157,41 @@ target-sensitive iteration.
 
 There is no autodereference: use `p.*`, `p.*[i]`, `p.*.field`, or `p.*()` to
 access the pointee. Library calls such as `array.map(p.*, convert)` pass ordinary
-array values under the existing copy rules, not references. `let q = p`, passing,
-returning, storing, capturing and reborrowing references are currently rejected;
+array values under the existing copy rules, not references. Functions, callbacks,
+closures, inferred generic functions, methods and pipes may accept `&T` / `&mut T`.
+Pass `f(p)`, `f(&local)` or `f(&array[index])` to a compatible reference parameter;
+`f(p.*)` passes a value instead. Mutable arguments may weaken to readonly for the
+same child type, never the reverse; function/callback types remain invariant.
+Formal reference bindings cannot rebind, but mutable-pointee `.*` writes and
+forwarding to other compatible reference parameters work. Existing method
+receivers remain by value; the array helper signatures above are unchanged.
+
+Each reference argument snapshots its target before later argument effects:
+`call(p, later)` passes the old target if `later` rebinds `p` to `&b`.
+Caller loans and managed-owner roots
+remain live throughout the remaining argument evaluation and call, including
+forwarding. Possibly aliased reference arguments reject even when readonly:
+`f(p, p)` / `f(&a, &a)` are invalid, and different array indices do not establish
+disjointness. Unsafe owner changes in later arguments reject. Conservative
+boxed/captured-owner call protection may reject safe calls; this is not
+interprocedural effect analysis.
+
+`let q = p`, returning, storing, capturing and reborrowing references remain rejected;
 `Result(&T, E)`, `Option(&T)` and arrays/fields of references are not supported.
 `loop &item in items` yields a local reference accessed with `item.*`.
 Existing bounds checks and rooted stable owners remain in force. Owner roots
 retain managed backing for runtime handles and snapshots; interior pointers are
 not GC roots. No runtime reference-validity checks are added.
 
-**Accepted roadmap, not implemented:** passing, returning and storing references
-will require lifetime/referent tracking, GC retention of managed referents and
-static prevention or safe invalidation of references when storage changes. No
+**Accepted roadmap:** passing references is delivered under the call-scoped rules
+above. Returning and storing references, ordinary copying, capture and reborrowing
+remain **not implemented**. Escape will require lifetime/referent tracking,
+GC retention of managed referents and static prevention or safe invalidation of references when storage changes. No
 dangling references may be exposed. This does not change today's by-value library
 signatures or introduce manual memory management, pointer arithmetic, null or
 unsafe dereference. See the root README's [reference contract](../README.md#local-static-borrowing)
-and `examples/references.nov` / `examples/reference-rebinding.nov`; broader pointer
+and `examples/references.nov`, `examples/reference-rebinding.nov` /
+`examples/reference-parameters.nov`; broader pointer
 proposals remain separate.
 
 ## Loading and installation

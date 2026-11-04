@@ -5,7 +5,7 @@ const Ir = @import("Ir.zig");
 
 pub fn check(allocator: std.mem.Allocator, body: Ir.Body) Ir.VerifyError!?Ir.BorrowConflict {
     var has_borrows = false;
-    for (body.instructions) |instruction| if (instruction.op == .borrow_reserve) {
+    for (body.instructions) |instruction| if (instruction.op == .borrow_reserve or instruction.op == .reference_parameter) {
         has_borrows = true;
         break;
     };
@@ -57,7 +57,7 @@ pub fn check(allocator: std.mem.Allocator, body: Ir.Body) Ir.VerifyError!?Ir.Bor
             else => {},
         }
     }
-    for (body.instructions) |instruction| if (instruction.op == .reference_slot)
+    for (body.instructions) |instruction| if (instruction.op == .reference_slot or instruction.op == .reference_parameter or instruction.op == .reference_argument)
         return checkReferences(allocator, body, edges);
     const live = try allocator.alloc(bool, n + 1);
     defer allocator.free(live);
@@ -187,7 +187,7 @@ fn checkReferences(allocator: std.mem.Allocator, body: Ir.Body, edges: []const [
             slot_ids[i] = slot_count;
             slot_count += 1;
         },
-        .borrow_reserve => {
+        .borrow_reserve, .reference_parameter => {
             origin_ids[i] = origin_count;
             origin_count += 1;
         },
@@ -199,7 +199,7 @@ fn checkReferences(allocator: std.mem.Allocator, body: Ir.Body, edges: []const [
     const origins = try BitRows.init(allocator, n, origin_count);
     defer allocator.free(origins.data);
     for (body.instructions, 0..) |instruction, i| switch (instruction.op) {
-        .borrow_reserve => origins.row(i).set(origin_ids[i]),
+        .borrow_reserve, .reference_parameter => origins.row(i).set(origin_ids[i]),
         .borrow_start => |b| origins.row(i).set(origin_ids[@backingInt(b.reservation)]),
         else => {},
     };
@@ -217,6 +217,9 @@ fn checkReferences(allocator: std.mem.Allocator, body: Ir.Body, edges: []const [
                 .reference_rebind => |b| .{ .slot = slot_ids[@backingInt(b.slot)], .borrow = b.borrow },
                 else => null,
             };
+            if (instruction.op == .reference_argument) {
+                changed = origins.row(i).merge(origins.row(@backingInt(instruction.op.reference_argument.borrow))) or changed;
+            }
             if (instruction.op == .reference_load) {
                 const slot = slot_ids[@backingInt(instruction.op.reference_load)];
                 changed = origins.row(i).merge(reaching.row(i * slot_count + slot)) or changed;
@@ -265,9 +268,31 @@ fn checkReferences(allocator: std.mem.Allocator, body: Ir.Body, edges: []const [
                 .reference_load => |slot| bits.set(@backingInt(slot)),
                 .borrow_read => |b| bits.set(@backingInt(b)),
                 .borrow_store => |b| bits.set(@backingInt(b.borrow)),
+                .reference_argument => |b| bits.set(@backingInt(b.borrow)),
+                .call => |call| for (call.args) |arg| {
+                    if (body.instructions[@backingInt(arg)].op == .reference_argument) bits.set(@backingInt(arg));
+                },
                 else => {},
             }
             changed = live.row(i).merge(bits) or changed;
+        }
+    }
+
+    // Formal parameters have distinct external origins. Forwarding the same
+    // parameter or overlapping dynamic snapshots twice still aliases.
+    for (body.instructions, 0..) |instruction, i| {
+        if (!reachable[i] or instruction.op != .call) continue;
+        const args = instruction.op.call.args;
+        for (args, 0..) |arg, a| {
+            if (body.instructions[@backingInt(arg)].op != .reference_argument) continue;
+            const left = origins.row(@backingInt(arg));
+            for (args[0..a]) |other| {
+                if (body.instructions[@backingInt(other)].op != .reference_argument) continue;
+                const right = origins.row(@backingInt(other));
+                for (left.words, right.words) |l, r| {
+                    if (l & r != 0) return .{ .access = instruction.span, .origin = body.instructions[@backingInt(other)].span };
+                }
+            }
         }
     }
 

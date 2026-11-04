@@ -154,7 +154,7 @@ test "foreign names reject integer least and fast limit macros in every width" {
 }
 
 test "foreign names reject reference slots and snapshots without reserving nov" {
-    for ([_][]const u8{ "nov_reference_slot_0", "nov_reference_42", "nov_reference_future" }) |name| {
+    for ([_][]const u8{ "nov_reference_slot_0", "nov_reference_42", "nov_reference_argument_7", "nov_reference_future" }) |name| {
         try std.testing.expect(!validExternName(name));
         try std.testing.expect(!validName(name));
     }
