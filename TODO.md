@@ -645,6 +645,11 @@ Keep Nov away from:
 - **Returning and storing references: accepted, not implemented.** Ordinary
   reference copying/capture/reborrowing remain unimplemented too; parameter passing
   does not enable escape. This is an accepted direction, not merely a pointer proposal.
+- **Reference returns are explicitly deferred at the user's request.** The escape
+  lifetime policy is undecided: neither automatic GC promotion of escaping locals
+  nor parameter-only reference returns is approved. Do not implement either rule
+  or routinely reopen this decision until the user asks to resume it. Reference
+  storage must not assume an unapproved escape policy either.
 - Extend lifetime/referent tracking to returns and aggregate storage. Retain
   managed referents through GC for every live reference, including references
   stored in managed objects or returned beyond a callee's frame.
@@ -1049,8 +1054,9 @@ afterwards. Plain replacement retains its final-update bounds check; compounds
 check on the pre-RHS read. No new memory forms are introduced. See README's
 executable subset for precise limits and evaluation order. The proposals below
 remain proposals; writable length, array slices, general pointer elements/aliases
-and capacity APIs are still deferred. Safe reference passing/returning/storage is
-separately accepted but unimplemented; local `&T` / `&mut T` references are delivered.
+and capacity APIs are still deferred. Safe reference passing is delivered alongside
+local `&T` / `&mut T` references. Returning/storage remain accepted future work;
+reference returns are explicitly postponed pending an escape-lifetime decision.
 All further optimizations remain paused.
 
 `value in array` membership is delivered for bool, rune, string, enums and supported
