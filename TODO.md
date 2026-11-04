@@ -50,6 +50,18 @@ results. See `examples/array-fields.nov`.
 
 ## Current delivered status
 
+Stdlib container transformations are implemented as ordinary generic methods:
+Option.map transforms some; Result.map transforms ok and mapErr transforms err.
+Only the active matching variant invokes its callback, once; other payloads
+propagate unchanged. Receiver snapshots precede eager callback construction.
+Inferred closures, static/instance calls, canonical imported aliases, shared cells
+and recursively independent array-bearing record payloads retain current rules.
+No catching/aliasing or optimizer changes are introduced. Callback parameters and
+mapped outputs must be nonvoid supported payload types. Result.map preserves void
+errors via .!; mapErr cannot yet reconstruct a void success payload with existing
+payload-expression syntax. Methods remain demand-specialized. See
+examples/container-map.nov (five tests) and lib/README.md.
+
 Cyclic source imports are supported, including self-imports, mutually importing
 modules and the stdlib's `std -> array -> std` re-export graph. Canonical sources
 are loaded once and backedges are retained without recursive rediscovery. Named

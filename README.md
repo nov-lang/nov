@@ -1513,7 +1513,7 @@ Missing: 0
 #### Standard-library foundation
 
 [`lib/result.nov`](lib/result.nov) provides the ordinary generic `Result` definition
-with public `isOk`, `isErr`, `unwrapOr` and `unwrapOrElse` methods. The predicates
+with public `isOk`, `isErr`, `map`, `mapErr`, `unwrapOr` and `unwrapOrElse` methods. The predicates
 return bool based only on the active tag, including with void payloads.
 `unwrapOr` evaluates its fallback
 as an ordinary argument even on success. `unwrapOrElse` evaluates the callback
@@ -1535,6 +1535,35 @@ to its executable at `../lib/nov`; semantic check, emit-c, build and run accept
 search or developer-checkout path is used. Tests exercise real library imports,
 callbacks and void payloads, plus a relocated executable/library installation.
 See [`lib/README.md`](lib/README.md).
+
+#### Container mapping
+
+`Option(T).map` converts a present payload with `(T) -> U`, returning `Option(U)`;
+none stays none. `Result(T, E).map` converts only success with `(T) -> U`, returning
+`Result(U, E)`. Its `mapErr` converts only error with `(E) -> F`, returning
+`Result(T, F)`. The selected callback runs exactly once; the other variant skips
+its body and propagates unchanged.
+
+```nov
+let std = @import("std")
+let number: std.Option(int) = .some[21]
+let doubled = number.map((value) { value * 2 })
+let result: std.Result(int, string) = .ok[21]
+let text = result.map((value) { "value:{value}" })
+```
+
+Receiver evaluation precedes eager callback construction, even for a variant that
+skips invocation. Ordinary copy semantics and shared capture cells are unchanged;
+callback panics are not caught. These are ordinary generic library methods with
+inferred callbacks/results, also callable through their container type.
+
+Mapped types must be existing supported union payloads. Current methods require
+nonvoid callback parameters and mapped results. `Result.map` can preserve void
+errors; `mapErr` currently requires nonvoid success payloads because void variant
+reconstruction requires `[]`, not a payload expression. Other void-container
+operations remain available through demand specialization. See
+[`examples/container-map.nov`](examples/container-map.nov) and
+[`lib/README.md`](lib/README.md#container-mapping) for examples and details.
 
 #### Array helpers
 

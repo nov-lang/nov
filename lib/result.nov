@@ -18,6 +18,18 @@ let Result: (T: type, E: type) -> type = union {
     }
 
     @[public]
+    let map: (self: Self, convert: (T) -> `U) -> Result(`U, E) = {
+        let value = self.!
+        .ok[convert(value)]
+    }
+
+    @[public]
+    let mapErr: (self: Self, convert: (E) -> `F) -> Result(T, `F) = match self {
+        .ok => |value| .ok[value]
+        .err => |error| .err[convert(error)]
+    }
+
+    @[public]
     let unwrapOr: (self: Self, fallback: T) -> T = match self {
         .ok => |value| value
         .err => fallback

@@ -22,6 +22,10 @@ bare names.
 - `value.isOk()` / `value.isErr()` report the active variant as a bool, without
   inspecting or unwrapping its payload. They also work with void payloads.
 
+- `value.map(convert)` takes `(T) -> U` and returns `Result(U, E)`, invoking the
+  converter exactly once on success and preserving errors unchanged, including
+  void errors. `value.mapErr(convert)` takes `(E) -> F` and returns `Result(T, F)`,
+  converting only errors and preserving successes.
 - `value.unwrapOr(fallback)` returns the success payload or the supplied fallback.
   The fallback expression is an ordinary argument and always evaluates.
 - `value.unwrapOrElse(callback)` returns the success payload or calls the callback
@@ -46,6 +50,8 @@ Option type. Exhaustive matches can capture the `some` payload or handle `none`.
   inspecting or unwrapping its payload. `some[false]` is still present; these methods
   work with void and record payloads too.
 
+- `value.map(convert)` takes `(T) -> U` and returns `Option(U)`: some invokes the
+  converter exactly once, while none stays none without invoking it.
 - `value.unwrapOr(fallback)` returns the payload or the supplied fallback. As an
   ordinary argument, the fallback expression always evaluates.
 - `value.unwrapOrElse(callback)` returns the payload or invokes a zero-argument
@@ -61,6 +67,34 @@ Option type. Exhaustive matches can capture the `some` payload or handle `none`.
 See `examples/options.nov`: division by zero yields `none` rather than panicking,
 `.!` propagates it from `Option(uint)` into `Option(string)`, and the fallback runs
 only for the absent quotient.
+
+## Container mapping
+
+```nov
+let number: std.Option(int) = .some[21]
+let doubled = number.map((value) { value * 2 })
+let result: std.Result(int, string) = .ok[21]
+let text = result.map((value) { "value:{value}" })
+let error = result.mapErr((message) { "error:{message}" })
+```
+
+These are ordinary generic methods, also callable statically as
+`Option(int).map(number, callback)` and `Result(int, string).map(result, callback)`.
+The receiver is evaluated/snapshotted before the callback expression; callback
+construction is eager even when its body will be skipped. Inferred closures,
+ordinary functions, exact expected results and supported generic callbacks use
+the existing bounded solver. No implicit conversion, reference escape or catching
+of callback panics/errors is introduced. Normal recursive copies preserve array
+independence through record payloads; copied closures share their captured cells.
+
+Mapped types must be supported union payloads. Currently these methods require
+nonvoid callback parameters and nonvoid mapped results; use a match when the
+mapped result is void. `Result.mapErr` also requires nonvoid success payloads,
+because its ordinary reconstruction uses a payload expression while void variants
+require `[]`. `Result.map` can preserve a void error using existing propagation.
+Unused methods remain demand-specialized, so other methods on containers with
+void payloads still work as documented above. See `examples/container-map.nov`
+for a runnable example and five tests.
 
 ## Array helpers
 

@@ -18,6 +18,12 @@ let Option: (T: type) -> type = union {
     }
 
     @[public]
+    let map: (self: Self, convert: (T) -> `U) -> Option(`U) = match self {
+        .some => |value| .some[convert(value)]
+        .none => .none[]
+    }
+
+    @[public]
     let unwrapOr: (self: Self, fallback: T) -> T = match self {
         .some => |value| value
         .none => fallback

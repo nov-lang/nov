@@ -160,6 +160,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const array_search_tests = b.step("test-cli-array-search", "Run standard-library array search and traversal CLI tests");
     addArraySearchCliTests(b, exe, array_search_tests);
     test_step.dependOn(array_search_tests);
+    const container_map_tests = b.step("test-cli-container-map", "Run standard-library container mapping CLI tests");
+    addContainerMapCliTests(b, exe, container_map_tests);
+    test_step.dependOn(container_map_tests);
     const constructor_shorthand_tests = b.step("test-cli-constructor-shorthand", "Run constructor field shorthand CLI tests");
     addConstructorShorthandCliTests(b, exe, constructor_shorthand_tests);
     test_step.dependOn(constructor_shorthand_tests);
@@ -3043,6 +3046,169 @@ fn addArraySearchCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step
                 run.expectExitCode(1);
                 run.expectStdOutEqual(if (std.mem.eql(u8, command, "test")) "1FAIL callback_panic (exit 1)\n0 passed; 1 failed; 1 total\n" else "1");
                 run.expectStdErrEqual(b.fmt("panic: {s} callback\n", .{helper}));
+                test_step.dependOn(&run.step);
+            }
+        }
+    }
+}
+
+fn addContainerMapCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    const fixtures = b.addWriteFiles();
+    const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
+    _ = fixtures.add("container-map.nov", @embedFile("examples/container-map.nov"));
+    const aliases_source =
+        \\let standard = @import("std")
+        \\let directOption = @import("lib/option.nov")
+        \\let directResult = @import("lib/./result.nov")
+        \\let api = @import("api.nov")
+        \\let Option = directOption.Option
+        \\let Result = standard.Result
+        \\let verify: () = {
+        \\    let some: api.IntOption = .some[4]
+        \\    let mapped: standard.Option(string) = Option(int).map(some, (x) { "value:{x}" })
+        \\    @assert(mapped.unwrapOr("") == "value:4")
+        \\    @assert(some.map((x) { x + 1 }).unwrapOr(0) == 5)
+        \\    let good: directResult.Result(int, string) = .ok[4]
+        \\    let bad: api.IntResult = .err["bad"]
+        \\    let text: standard.Result(string, string) = Result(int, string).map(good, (x) { "ok:{x}" })
+        \\    @assert(text.unwrapOr("") == "ok:4")
+        \\    let error: directResult.Result(int, int) = bad.mapErr((message) { 7 })
+        \\    @assert(match error {
+        \\        .ok => false
+        \\        .err => |value| value == 7
+        \\    })
+        \\    let untouched: standard.Result(int, int) = Result(int, string).mapErr(good, (message) { 9 })
+        \\    @assert(untouched.unwrapOr(0) == 4)
+        \\}
+        \\@[test]
+        \\let imported_aliases_are_canonical: () = verify()
+        \\let main: () = verify()
+        \\
+    ;
+    const api_source =
+        \\let option = @import("lib/./option.nov")
+        \\let standard = @import("std")
+        \\let Option = option.Option
+        \\let Result = standard.Result
+        \\@[public]
+        \\let IntOption = Option(int)
+        \\@[public]
+        \\let IntResult = Result(int, string)
+        \\
+    ;
+    _ = fixtures.add("aliases.nov", aliases_source);
+    _ = fixtures.add("api.nov", api_source);
+    for ([_][]const u8{ "container-map.nov", "aliases.nov", "api.nov", "lib/std.nov" }) |source| {
+        const check = b.addRunArtifact(exe);
+        check.step.name = b.fmt("CLI container map: semantic {s}", .{source});
+        check.setCwd(fixtures.getDirectory());
+        check.addArgs(&.{ "check", "--semantic", source, "--lib-dir" });
+        check.addDirectoryArg(library);
+        check.expectExitCode(0);
+        check.expectStdOutEqual("");
+        check.expectStdErrEqual("");
+        test_step.dependOn(&check.step);
+    }
+    const format = b.addRunArtifact(exe);
+    format.step.name = "CLI container map: fmt example";
+    format.setCwd(fixtures.getDirectory());
+    format.addArgs(&.{ "fmt", "--check", "container-map.nov" });
+    format.expectExitCode(0);
+    format.expectStdOutEqual("");
+    format.expectStdErrEqual("");
+    test_step.dependOn(&format.step);
+
+    const package = b.addWriteFiles();
+    const installed_exe = package.addCopyFile(exe.getEmittedBin(), b.fmt("bin/{s}", .{exe.out_filename}));
+    _ = package.addCopyDirectory(b.path("lib"), "lib/nov", .{});
+    _ = package.add("container-map.nov", @embedFile("examples/container-map.nov"));
+    _ = package.add("api.nov", std.mem.replaceOwned(u8, b.allocator, api_source, "lib/", "lib/nov/") catch @panic("OOM"));
+    _ = package.add("aliases.nov", std.mem.replaceOwned(u8, b.allocator, aliases_source, "lib/", "lib/nov/") catch @panic("OOM"));
+    const example_tests = "PASS option_variants_and_inferred_results\nPASS result_variants_and_shared_captures\nPASS eager_receiver_and_callback_construction\nPASS record_payloads_and_recursive_array_copies\nPASS inactive_callbacks_and_chained_maps\n5 passed; 0 failed; 5 total\n";
+    for ([_]bool{ false, true }) |installed| {
+        for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+            for ([_][]const u8{ "run", "test" }) |command| {
+                for ([_][]const u8{ "container-map.nov", "aliases.nov" }) |source| {
+                    const run = if (installed) std.Build.Step.Run.create(b, "CLI container map: relocated install") else b.addRunArtifact(exe);
+                    run.step.name = b.fmt("CLI container map: {s} {s} {s} (installed={})", .{ command, source, mode, installed });
+                    if (installed) run.addFileArg(installed_exe);
+                    run.setCwd(if (installed) package.getDirectory() else fixtures.getDirectory());
+                    run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+                    run.setEnvironmentVariable("NOV_CC", "");
+                    run.setEnvironmentVariable("CC", "");
+                    run.addArgs(&.{ command, source });
+                    if (mode.len != 0) run.addArg(mode);
+                    if (!installed) {
+                        run.addArg("--lib-dir");
+                        run.addDirectoryArg(library);
+                    }
+                    const example = std.mem.eql(u8, source, "container-map.nov");
+                    const is_test = std.mem.eql(u8, command, "test");
+                    run.expectExitCode(0);
+                    run.expectStdOutEqual(if (example) (if (is_test) example_tests else "Option: 42\nNone: true\nResult: value:21\nerror:missing\n") else if (is_test) "PASS imported_aliases_are_canonical\n1 passed; 0 failed; 1 total\n" else "");
+                    run.expectStdErrEqual("");
+                    test_step.dependOn(&run.step);
+                }
+            }
+        }
+    }
+    for ([_]struct { name: []const u8, source: []const u8, diagnostic: []const u8 }{
+        .{ .name = "option-parameter", .source = "let x:std.Option(int)=.some[1]\nlet y=x.map((v:bool)->int{1})", .diagnostic = "constraints require exactly identical types" },
+        .{ .name = "result-parameter", .source = "let x:std.Result(int,string)=.ok[1]\nlet y=x.map((v:bool)->int{1})", .diagnostic = "constraints require exactly identical types" },
+        .{ .name = "error-parameter", .source = "let x:std.Result(int,string)=.err[\"bad\"]\nlet y=x.mapErr((v:bool)->int{1})", .diagnostic = "constraints require exactly identical types" },
+        .{ .name = "option-output-conflict", .source = "let x:std.Option(int)=.some[1]\nlet y:std.Option(bool)=x.map((v){v+1})", .diagnostic = "error:" },
+        .{ .name = "result-output-conflict", .source = "let x:std.Result(int,string)=.ok[1]\nlet y:std.Result(bool,string)=x.map((v){v+1})", .diagnostic = "error:" },
+        .{ .name = "error-output-conflict", .source = "let x:std.Result(int,string)=.err[\"bad\"]\nlet y:std.Result(int,bool)=x.mapErr((v){7})", .diagnostic = "error:" },
+        .{ .name = "option-void-input", .source = "let x:std.Option(void)=.some[]\nlet y=x.map(()->int{1})", .diagnostic = "constraints require exactly identical types" },
+        .{ .name = "result-void-input", .source = "let x:std.Result(void,string)=.ok[]\nlet y=x.map(()->int{1})", .diagnostic = "constraints require exactly identical types" },
+        .{ .name = "error-void-input", .source = "let x:std.Result(int,void)=.err[]\nlet y=x.mapErr(()->int{1})", .diagnostic = "constraints require exactly identical types" },
+        .{ .name = "option-void-parameter", .source = "let x:std.Option(void)=.some[]\nlet y=x.map((v:void)->int{1})", .diagnostic = "void is not a parameter type" },
+        .{ .name = "result-void-parameter", .source = "let x:std.Result(void,string)=.ok[]\nlet y=x.map((v:void)->int{1})", .diagnostic = "void is not a parameter type" },
+        .{ .name = "error-void-parameter", .source = "let x:std.Result(int,void)=.err[]\nlet y=x.mapErr((v:void)->int{1})", .diagnostic = "void is not a parameter type" },
+
+        .{ .name = "error-void-success-propagation", .source = "let x:std.Result(void,string)=.ok[]\nlet y=x.mapErr((v){7})", .diagnostic = "[] for void" },
+        .{ .name = "option-void-output", .source = "let x:std.Option(int)=.some[1]\nlet y=x.map((v)->void{})", .diagnostic = "[] for void" },
+        .{ .name = "result-void-output", .source = "let x:std.Result(int,string)=.ok[1]\nlet y=x.map((v)->void{})", .diagnostic = "[] for void" },
+        .{ .name = "error-void-output", .source = "let x:std.Result(int,string)=.err[\"bad\"]\nlet y=x.mapErr((v)->void{})", .diagnostic = "[] for void" },
+        .{ .name = "option-array-output", .source = "let x:std.Option(int)=.some[1]\nlet y=x.map((v){[v]})", .diagnostic = "not supported" },
+        .{ .name = "result-function-output", .source = "let x:std.Result(int,string)=.ok[1]\nlet y=x.map((v){()->int{v}})", .diagnostic = "not supported" },
+        .{ .name = "error-union-output", .source = "let x:std.Result(int,string)=.err[\"bad\"]\nlet y=x.mapErr((v){std.Option(int).some[1]})", .diagnostic = "not supported" },
+    }) |case| {
+        const source = b.fmt("invalid-container-map-{s}.nov", .{case.name});
+        _ = fixtures.add(source, b.fmt("let std=@import(\"std\")\nlet main:()={{\n{s}\n}}\n", .{case.source}));
+        const check = b.addRunArtifact(exe);
+        check.step.name = b.fmt("CLI container map: reject {s}", .{case.name});
+        check.setCwd(fixtures.getDirectory());
+        check.addArgs(&.{ "check", "--semantic", source, "--lib-dir" });
+        check.addDirectoryArg(library);
+        check.expectExitCode(1);
+        check.expectStdOutEqual("");
+        check.expectStdErrMatch(".nov:");
+        check.expectStdErrMatch("error:");
+        check.expectStdErrMatch(case.diagnostic);
+        test_step.dependOn(&check.step);
+    }
+    for ([_]struct { name: []const u8, receiver: []const u8, method: []const u8, parameter: []const u8 }{
+        .{ .name = "option", .receiver = "std.Option(int).some[1]", .method = "map", .parameter = "int" },
+        .{ .name = "result", .receiver = "std.Result(int,string).ok[1]", .method = "map", .parameter = "int" },
+        .{ .name = "error", .receiver = "std.Result(int,int).err[1]", .method = "mapErr", .parameter = "int" },
+    }) |case| {
+        const source = b.fmt("panic-container-map-{s}.nov", .{case.name});
+        _ = fixtures.add(source, b.fmt("let std=@import(\"std\")\nlet verify:()={{let result={s}.{s}((value:{s})->int{{@print(value)\n@panic(\"{s} callback\")}})\n@println(\"unreachable\")}}\n@[test]\nlet callback_panic:()=verify()\nlet main:()=verify()\n", .{ case.receiver, case.method, case.parameter, case.name }));
+        for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+            for ([_][]const u8{ "run", "test" }) |command| {
+                const run = b.addRunArtifact(exe);
+                run.step.name = b.fmt("CLI container map: {s} {s} panic ({s})", .{ command, case.name, mode });
+                run.setCwd(fixtures.getDirectory());
+                run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+                run.setEnvironmentVariable("NOV_CC", "");
+                run.setEnvironmentVariable("CC", "");
+                run.addArgs(&.{ command, source, "--lib-dir" });
+                run.addDirectoryArg(library);
+                if (mode.len != 0) run.addArg(mode);
+                run.expectExitCode(1);
+                run.expectStdOutEqual(if (std.mem.eql(u8, command, "test")) "1FAIL callback_panic (exit 1)\n0 passed; 1 failed; 1 total\n" else "1");
+                run.expectStdErrEqual(b.fmt("panic: {s} callback\n", .{case.name}));
                 test_step.dependOn(&run.step);
             }
         }
