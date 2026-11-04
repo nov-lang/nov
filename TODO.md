@@ -50,6 +50,20 @@ results. See `examples/array-fields.nov`.
 
 ## Current delivered status
 
+Zip iteration is implemented: `loop item, index in items, 0.. { ... }` and
+arbitrary positional arrays/strings/bounded ranges. Binding/source counts must
+match; finite cardinalities must match before the first body execution, otherwise
+all modes panic (no shortest-source truncation). Strings count Unicode scalars
+with independent byte cursors. Inclusive/reversed/full-width ranges compare
+exactly without count overflow. Open `start..` followers require a bounded source;
+nonnegative literal starts default uint, negative starts int, typed starts retain
+their type. Increment overflow only panics when another value is needed, including
+on continue; completing at MAX is valid. Sources evaluate once left-to-right in
+outer scope. Existing copy/capture/control/result and owner-loan contracts apply,
+including disjoint-owner reference pairs and conservative later-source/captured
+owner checks. Open ranges remain loop-header-only. General iterators and stepped/
+descending ranges remain deferred. See `examples/zip-iteration.nov` (six tests).
+
 `std.array` now also provides `any`, `all`, `find`, `findIndex` and `each`.
 Predicates short-circuit at the first decisive element in source order; empty
 `any` is false and empty `all` is true. Searches return canonical `std.Option(T)`
@@ -1265,8 +1279,9 @@ The fallback is outside the completed loop's control scope and cannot see its
 index; bounds retain the parent scope. Arrays copy, strings share rooted storage,
 and terminal fallback paths contribute no merge value. See
 `examples/range-search.nov`. Explicit range continuations,
-unbounded/stepped/descending ranges, general iterators, reference iteration over
-ranges, multiple/zip bindings and labels remain rejected.
+stored unbounded ranges, stepped/descending ranges, general iterators, reference
+iteration over ranges and labels remain rejected. Zip and loop-only open range
+followers are implemented under the contract above.
 Reusable bounded range values are implemented (see above); ranges are not
 membership containers. See README for syntax.
 
@@ -1293,7 +1308,7 @@ passed, returned, stored or captured. Explicit pointee reads copy values normall
 Both forms preserve exhaustion `else`
 (including empty sources), exact valued-break/fallback typing and `continue`
 advancement. Break/return skip `else`; without `else`, value breaks reject.
-See examples/iteration.nov. Multiple/zip iteration and general
+See examples/iteration.nov and examples/zip-iteration.nov. General
 iterator protocols/library-container iteration remain deferred.
 `examples/fibo.nov` (unchanged) and `examples/fizzbuzz.nov` now pass semantic and
 format checks and execute in default/debug/release modes.
@@ -1316,8 +1331,8 @@ for x: int in arr {
 ```
 
 ## Iterators
-Future proposals only: the bounded array/string loops above do not implement a
-general iterator protocol or multiple/zip iteration.
+Future proposals only: array/string/zip loops do not implement a general iterator
+protocol.
 
 - an iterator is any object with a public .next() method that returns an
   Option(T) e.g. `next: (*T) -> ?U` (yes)

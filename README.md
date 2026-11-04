@@ -2368,13 +2368,53 @@ advances to the next element. With `else`, value breaks and exhaustion results
 must match exactly; without `else`, these loops yield `void` and reject value
 breaks. The item is scoped to the body, and `else` is outside the completed
 loop's control scope. See [`examples/iteration.nov`](examples/iteration.nov).
-Multiple/zip bindings, general iterator protocols, array slices and labels remain
-unsupported; this does not enable arbitrary library-container iteration.
+General iterator protocols, array slices and labels remain unsupported; this
+does not enable arbitrary library-container iteration.
+
+### Zip iteration and indices
+
+Pair bindings and sources positionally to iterate together:
+
+```nov
+loop item, index in items, 0.. {
+    @println("{index}: {item}")
+}
+loop left, right in first, second {
+    @println(left, right)
+}
+```
+
+- Binding and source counts must match. `_` discards a corresponding value.
+- Every bounded source must have the **same length**. All sources evaluate once,
+  left-to-right, then lengths are checked before the body. Unequal lengths panic
+  in every build mode, even if the body would immediately break. Zip never
+  silently truncates to the shorter source.
+- Arrays count elements, strings count Unicode scalars, and bounded ranges count
+  yielded integers (including `..=` endpoints). Reversed ranges are empty.
+  Strings keep independent byte cursors, so equal scalar counts need not mean
+  equal byte lengths.
+- An open `start..` range follows the bounded sources and does not participate in
+  length checks. At least one bounded source is required. Open ranges are only
+  supported directly in loop headers, not as stored or passed values.
+- `0..` produces pointer-sized `uint` indices. Nonnegative literal starts default
+  to `uint`, negative literal starts to `int`; typed starts retain their exact
+  integer type. Overflow panics if a further value is needed, but completing at
+  `MAX` or breaking before another value is needed is valid.
+- Sources evaluate outside the new bindings' scope. Bindings are body-local;
+  `else` uses the surrounding scope. Existing `break`, `continue`, value-result,
+  capture and exhaustion behavior applies to the whole zipped loop.
+- Value bindings retain ordinary copy semantics. `&item` may be paired with an
+  unborrowed local array owner under existing reference-iteration rules. Multiple
+  reference sources require disjoint owners, including readonly ones. Active
+  owner reservations also reject conflicting mutations in later source expressions
+  and conservatively reject calls that could access captured owner storage.
+
+See [`examples/zip-iteration.nov`](examples/zip-iteration.nov) for mixed sources,
+Unicode iteration, references, range boundaries and control-flow examples.
 
 The condition/unconditional forms, continuation clauses, conditional `else`,
-array/string iteration and bounded integer range examples below are executable
-within these limits (see also [Range](#range)). The multiple-binding example is
-future syntax only.
+array/string/zip iteration and integer range examples below are executable within
+these limits (see also [Range](#range)).
 
 ```nov
 ; items can be a supported array or a string; type is inferred
@@ -2389,7 +2429,7 @@ loop n in 0..10 {}
 ; n takes values [0;10]
 loop n in 0..=10 {}
 
-; future proposal only: multiple/zip iteration is not implemented
+; zip an array/string with a zero-based uint index
 loop item, i in items, 0.. {}
 
 ; scoped reference iteration: items must be an unborrowed local array owner

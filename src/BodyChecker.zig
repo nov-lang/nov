@@ -797,10 +797,11 @@ const Context = struct {
     // cannot shadow, and this syntax scan does not change value/type policy.
     fn borrowedName(self: *const Context, name: []const u8) bool {
         const ast = &self.module.source.ast;
-        for (ast.nodes.items(.tag), ast.nodes.items(.data)) |tag, data| {
+        for (ast.nodes.items(.tag), ast.nodes.items(.data), 0..) |tag, data, node| {
             if (tag == .loop_range) {
-                const loop = ast.extraData(data.lhs, Ast.Node.RangeLoop);
-                if (ast.nodes.items(.tag)[loop.binding] == .ref_of and ast.nodes.items(.tag)[loop.source] == .identifier and std.mem.eql(u8, name, ast.tokenSlice(ast.nodes.items(.main_token)[loop.source]))) return true;
+                for (ast.iterationBindings(@intCast(node)), ast.iterationSources(@intCast(node))) |binding, source| {
+                    if (ast.nodes.items(.tag)[binding] == .ref_of and ast.nodes.items(.tag)[source] == .identifier and std.mem.eql(u8, name, ast.tokenSlice(ast.nodes.items(.main_token)[source]))) return true;
+                }
             }
             if (tag != .ref_of) continue;
             var owner = data.rhs;
@@ -1250,8 +1251,8 @@ const Context = struct {
         switch (ast.nodes.items(.tag)[node]) {
             .loop_range => {
                 const range = ast.fullRange(node).?;
-                return (try self.probeBreaks(range.source, depth + 1)) orelse
-                    try self.probeBreaks(range.else_expr, depth + 1);
+                for (ast.iterationSources(node)) |source| if (try self.probeBreaks(source, depth + 1)) |known| return known;
+                return self.probeBreaks(range.else_expr, depth + 1);
             },
             .loop_condition, .loop_cont, .loop_else => return self.probeBreaks(ast.fullLoop(node).?.else_expr, depth + 1),
             // The operand runs before this break. Its own controls may exit
@@ -1330,21 +1331,22 @@ const Context = struct {
         // Probe fallback in the parent scope, then make the index available only
         // while looking for owned break hints. Neither walk evaluates bounds.
         const fallback = try self.probe(range.else_expr, depth + 1);
-        const source = try self.probe(range.source, depth + 1);
-        const index: ?Known = if (source) |known| switch (self.ir.getType(known.ty).?) {
-            .range => |ty| .{ .ty = ty },
-            .array => |ty| .{ .ty = ty },
-            .string => .{ .ty = try self.ir.internType(.rune) },
-            else => null,
-        } else null;
+        const sources = ast.iterationSources(node);
+        const indices = try self.module.allocator.alloc(?Known, sources.len);
+        defer self.module.allocator.free(indices);
+        // All source queries run in the outer scope, before publishing bindings.
+        for (sources, indices) |source, *index| index.* = try self.iterationElement(source, depth + 1);
         const scope = self.locals.items.len;
         defer self.restoreScope(scope);
-        const capture = if (ast.nodes.items(.tag)[range.binding] == .ref_of) ast.nodes.items(.data)[range.binding].rhs else range.binding;
-        const token = ast.nodes.items(.main_token)[capture];
-        const name = ast.tokenSlice(token);
-        if (index) |known| {
-            if (!std.mem.eql(u8, name, "_") and self.conflict(name) == null and !isPrimitive(name))
-                try self.bindLocal(name, .{ .known = if (ast.nodes.items(.tag)[range.binding] == .ref_of) try self.iterationReference(range.source, known.ty) else known, .name_span = self.module.tokenSpan(token) });
+        for (ast.iterationBindings(node), sources, indices) |binding, source, index| {
+            const by_ref = ast.nodes.items(.tag)[binding] == .ref_of;
+            const capture = if (by_ref) ast.nodes.items(.data)[binding].rhs else binding;
+            const token = ast.nodes.items(.main_token)[capture];
+            const name = ast.tokenSlice(token);
+            if (index) |known| {
+                if (!std.mem.eql(u8, name, "_") and self.conflict(name) == null and !isPrimitive(name))
+                    try self.bindLocal(name, .{ .known = if (by_ref) try self.iterationReference(source, known.ty) else known, .name_span = self.module.tokenSpan(token) });
+            }
         }
         return (try self.probeBreaks(range.body, depth + 1)) orelse fallback;
     }
@@ -1597,20 +1599,29 @@ const Context = struct {
             const c = &q.context;
             const ast = &c.module.source.ast;
             const parts = ast.fullRange(node).?;
-            const source = try q.expression(parts.source, depth + 1);
-            if (!source.live) return source;
-            const scope = c.locals.items.len;
-            const by_ref = ast.nodes.items(.tag)[parts.binding] == .ref_of;
-            const binding = if (by_ref) ast.nodes.items(.data)[parts.binding].rhs else parts.binding;
-            const token = ast.nodes.items(.main_token)[binding];
-            if (try q.typeOf(parts.source, depth + 1)) |known| {
-                const element: ?Ir.TypeId = switch (c.ir.getType(known.ty).?) {
-                    .array => |ty| ty,
-                    .range => |ty| ty,
-                    .string => try c.ir.internType(.rune),
+            var source: Flow = .{};
+            const sources = ast.iterationSources(node);
+            const elements = try c.module.allocator.alloc(?Known, sources.len);
+            defer c.module.allocator.free(elements);
+            for (sources, elements) |item, *element| {
+                source = source.then(try q.expression(item, depth + 1));
+                if (!source.live) return source;
+                element.* = if (try q.typeOf(item, depth + 1)) |known| switch (c.ir.getType(known.ty).?) {
+                    .array, .range => |ty| .{ .ty = ty },
+                    .string => .{ .ty = try c.ir.internType(.rune) },
                     else => null,
+                } else null;
+            }
+            const scope = c.locals.items.len;
+            defer c.restoreScope(scope);
+            for (ast.iterationBindings(node), sources, elements) |capture, item, element| {
+                const by_ref = ast.nodes.items(.tag)[capture] == .ref_of;
+                const binding = if (by_ref) ast.nodes.items(.data)[capture].rhs else capture;
+                const token = ast.nodes.items(.main_token)[binding];
+                const name = ast.tokenSlice(token);
+                if (element) |known| if (!std.mem.eql(u8, name, "_") and c.conflict(name) == null and !isPrimitive(name)) {
+                    try c.bindLocal(name, .{ .known = if (by_ref) try c.iterationReference(item, known.ty) else known, .name_span = c.module.tokenSpan(token) });
                 };
-                if (element) |ty| try c.bindLocal(ast.tokenSlice(token), .{ .known = if (by_ref) try c.iterationReference(parts.source, ty) else .{ .ty = ty }, .name_span = c.module.tokenSpan(token) });
             }
             const body = try q.expression(parts.body, depth + 1);
             c.restoreScope(scope);
@@ -2642,7 +2653,7 @@ const Context = struct {
                     const diagnostics_start = self.module.diagnostics.items.len;
                     defer self.module.diagnostics.shrinkRetainingCapacity(diagnostics_start);
                     var negative = false;
-                    for ([_]Ast.Node.Index{ data.lhs, data.rhs }) |bound| switch (try Literal.check(self.module, self.ir, bound, wide, null)) {
+                    for (([_]Ast.Node.Index{ data.lhs, data.rhs })[0..if (data.rhs == 0) @as(usize, 1) else 2]) |bound| switch (try Literal.check(self.module, self.ir, bound, wide, null)) {
                         .constant => |id| negative = negative or self.ir.getConstant(id).?.value.signed_integer < 0,
                         else => break :infer,
                     };
@@ -3575,6 +3586,7 @@ const Context = struct {
         const ast = &self.module.source.ast;
         const data = ast.nodes.items(.data)[node];
         const unit = try self.ir.internType(.void);
+        if (data.rhs == 0) return self.fail(.unsupported_iteration, node, null);
         var known = (try self.probe(data.lhs, depth + 1)) orelse try self.probe(data.rhs, depth + 1);
         if (known == null) {
             if (try self.probeDefault(node, depth + 1)) |range| {
@@ -3617,7 +3629,282 @@ const Context = struct {
         return self.fit(ty, expected, node);
     }
 
+    fn iterationElement(self: *Context, node: Ast.Node.Index, depth: usize) Error!?Known {
+        const known = (try self.probe(node, depth)) orelse return null;
+        return switch (self.ir.getType(known.ty).?) {
+            .array, .range => |ty| .{ .ty = ty },
+            .string => .{ .ty = try self.ir.internType(.rune) },
+            else => null,
+        };
+    }
+
+    const ZipSource = struct {
+        node: Ast.Node.Index,
+        binding: Ast.Node.Index,
+        ty: Ir.TypeId,
+        element: Ir.TypeId,
+        index_type: Ir.TypeId,
+        open: bool,
+        by_ref: bool,
+        owner: ?Binding,
+        counter: Ir.ValueId = undefined,
+        end: Ir.ValueId = undefined,
+        inclusive: Ir.ValueId = undefined,
+        done: ?Ir.ValueId = null,
+        loan: ?Ir.ValueId = null,
+    };
+
+    fn zipCondition(self: *Context, source: ZipSource, node: Ast.Node.Index) Error!Ir.ValueId {
+        const emitter = self.emitter.?;
+        const boolean = try self.ir.internType(.boolean);
+        const location_span = self.irSpan(node);
+        const active = if (source.done) |slot| active: {
+            const loaded = try emitter.append(boolean, location_span, .{ .local_load = slot });
+            break :active try emitter.append(boolean, location_span, .{ .unary = .{ .op = .bool_not, .operand = loaded } });
+        } else null;
+        const rhs_start: u32 = @intCast(emitter.instructions.items.len);
+        const loaded = try emitter.append(source.index_type, location_span, .{ .local_load = source.counter });
+        const less = try emitter.append(boolean, location_span, .{ .binary = .{ .op = .lt, .lhs = loaded, .rhs = source.end } });
+        var condition = less;
+        if (self.ir.getType(source.ty).? == .range) {
+            const equal = try emitter.append(boolean, location_span, .{ .binary = .{ .op = .eq, .lhs = loaded, .rhs = source.end } });
+            const equal_inclusive = try emitter.append(boolean, location_span, .{ .branch = .{ .condition = equal, .then_start = @intCast(emitter.instructions.items.len), .else_start = @intCast(emitter.instructions.items.len), .then_value = source.inclusive, .else_value = equal } });
+            condition = try emitter.append(boolean, location_span, .{ .branch = .{ .condition = less, .then_start = @intCast(emitter.instructions.items.len), .else_start = @intCast(emitter.instructions.items.len), .then_value = less, .else_value = equal_inclusive } });
+        }
+        if (active) |lhs| condition = try emitter.append(boolean, location_span, .{ .short_circuit = .{ .kind = .@"and", .lhs = lhs, .rhs_start = rhs_start, .rhs = condition } });
+        return condition;
+    }
+
+    fn iterationAssertion(self: *Context, node: Ast.Node.Index, condition: Ir.ValueId, text: []const u8) Error!void {
+        const emitter = self.emitter.?;
+        const unit = try self.ir.internType(.void);
+        const string = try self.ir.internType(.string);
+        const message = try emitter.append(string, self.irSpan(node), .{ .constant = try self.ir.internConstant(.{ .ty = string, .value = .{ .string = text } }) });
+        const start = self.span(node).start;
+        var line: usize = 1;
+        var line_start: usize = 0;
+        for (self.module.source.ast.source[0..start], 0..) |byte, index| {
+            if (byte == '\n') {
+                line += 1;
+                line_start = index + 1;
+            }
+        }
+        const location = try std.fmt.allocPrint(emitter.allocator, "{s}:{d}:{d}", .{ self.module.source.path, line, start - line_start + 1 });
+        _ = try emitter.append(unit, self.irSpan(node), .{ .assertion = .{ .condition = condition, .message = message, .location = location } });
+    }
+
+    fn zipIncrement(self: *Context, source: ZipSource, node: Ast.Node.Index) Error!Ir.ValueId {
+        const emitter = self.emitter.?;
+        const location_span = self.irSpan(node);
+        const unit = try self.ir.internType(.void);
+        const old = try emitter.append(source.index_type, location_span, .{ .local_load = source.counter });
+        if (source.open) {
+            const integer = self.ir.getType(source.index_type).?.integer;
+            const signed = integer.signedness == .signed;
+            const max = @as(u128, std.math.maxInt(u128)) >> @as(u7, @intCast(128 - integer.bits + @intFromBool(signed)));
+            const limit = try emitter.append(source.index_type, location_span, .{ .constant = try self.ir.internConstant(.{ .ty = source.index_type, .value = if (signed) .{ .signed_integer = @intCast(max) } else .{ .unsigned_integer = max } }) });
+            const safe = try emitter.append(try self.ir.internType(.boolean), location_span, .{ .binary = .{ .op = .lt, .lhs = old, .rhs = limit } });
+            try self.iterationAssertion(node, safe, "open range iteration overflow");
+        }
+        const one = try emitter.append(source.index_type, location_span, .{ .constant = try self.ir.internConstant(.{ .ty = source.index_type, .value = if (self.ir.getType(source.index_type).?.integer.signedness == .signed) .{ .signed_integer = 1 } else .{ .unsigned_integer = 1 } }) });
+        const next = if (self.ir.getType(source.ty).? == .string)
+            try emitter.append(source.index_type, location_span, .{ .string_next = .{ .array = try emitter.value(source.node), .index = old } })
+        else
+            try emitter.append(source.index_type, location_span, .{ .binary = .{ .op = .add, .lhs = old, .rhs = one } });
+        return emitter.append(unit, location_span, .{ .local_store = .{ .slot = source.counter, .value = next } });
+    }
+
     fn rangeExpression(self: *Context, node: Ast.Node.Index, expected: ?Known, depth: usize) Error!?Ir.TypeId {
+        const ast = &self.module.source.ast;
+        const sources = ast.iterationSources(node);
+        const bindings = ast.iterationBindings(node);
+        const loop = ast.fullRange(node).?;
+        if (sources.len == 1 and !(ast.nodes.items(.tag)[sources[0]] == .range and ast.nodes.items(.data)[sources[0]].rhs == 0))
+            return self.singleRangeExpression(node, expected, depth);
+        const unit = try self.ir.internType(.void);
+        const boolean = try self.ir.internType(.boolean);
+        const location_span = self.irSpan(node);
+        const states = try self.module.allocator.alloc(ZipSource, sources.len);
+        defer self.module.allocator.free(states);
+        // Stable storage is required because reservations form a linked stack.
+        const reservations = try self.module.allocator.alloc(Reservation, sources.len);
+        defer self.module.allocator.free(reservations);
+        const parent_reservation = self.reservation;
+        defer self.reservation = parent_reservation;
+        var driver: ?usize = null;
+        for (sources, bindings, states, reservations, 0..) |source_node, binding_node, *state, *reservation, i| {
+            const by_ref = ast.nodes.items(.tag)[binding_node] == .ref_of;
+            const open = ast.nodes.items(.tag)[source_node] == .range and ast.nodes.items(.data)[source_node].rhs == 0;
+            var owner: ?Binding = null;
+            const ty = if (open) open_source: {
+                if (by_ref) return self.fail(.unsupported_iteration, source_node, null);
+                const start = ast.nodes.items(.data)[source_node].lhs;
+                const element = (try self.iterationElement(source_node, depth + 1)) orelse {
+                    if (try self.expression(start, null, depth + 1) == null) return null;
+                    if (self.terminated) return if (expected) |want| want.ty else unit;
+                    return self.fail(.literal_needs_type, start, null);
+                };
+                if (try self.expression(start, element, depth + 1) == null) return null;
+                break :open_source try self.ir.internType(.{ .range = element.ty });
+            } else bounded: {
+                if (ast.nodes.items(.tag)[source_node] == .identifier) {
+                    owner = try self.captureBinding(ast.tokenSlice(ast.nodes.items(.main_token)[source_node]), source_node);
+                }
+                if (by_ref) {
+                    const binding = owner orelse return self.fail(.unsupported_iteration, source_node, null);
+                    if (binding.borrowed or self.ir.getType(binding.known.ty).? != .array) return self.fail(.unsupported_iteration, source_node, null);
+                    if (self.reservedOrigin(binding.name_span)) |origin| return self.fail(.borrow_conflict, source_node, origin);
+                    if (self.mutationOrigin(binding)) |origin| return self.fail(.borrow_conflict, source_node, origin);
+                    if (self.emitter) |emitter| try emitter.record(source_node, binding.known.ty, self.irSpan(source_node), .{ .local_load = binding.slot.? });
+                    break :bounded binding.known.ty;
+                }
+                if (owner) |binding| {
+                    if (!binding.borrowed and self.ir.getType(binding.known.ty).? == .array)
+                        break :bounded (try self.projection(source_node, null, depth + 1)) orelse return null;
+                }
+                break :bounded (try self.expression(source_node, null, depth + 1)) orelse return null;
+            };
+            if (self.terminated) return if (expected) |want| want.ty else unit;
+            const source = self.ir.getType(ty).?;
+            const element = switch (source) {
+                .array, .range => |element| element,
+                .string => try self.ir.internType(.rune),
+                else => return self.fail(.unsupported_iteration, source_node, null),
+            };
+            state.* = .{ .node = source_node, .binding = binding_node, .ty = ty, .element = element, .index_type = if (source == .range) element else try self.ir.internType(.{ .integer = .{ .signedness = .signed, .bits = Ir.native_pointer_bits } }), .open = open, .by_ref = by_ref, .owner = owner };
+            if (!open and driver == null) driver = i;
+            if (source == .array and owner != null) {
+                const binding = owner.?;
+                reservation.* = .{ .owner = if (binding.loan_owner) |loan| loan.owner else binding.name_span, .origin = location_span, .parent = self.reservation, .reads_allowed = !by_ref, .iteration = true };
+                self.reservation = reservation;
+                if (by_ref) if (self.emitter) |emitter| {
+                    state.loan = try emitter.append(unit, location_span, .{ .borrow_reserve = binding.slot.? });
+                };
+            }
+        }
+        const driver_index = driver orelse return self.fail(.unsupported_iteration, node, null);
+        if (self.emitter) |emitter| {
+            for (states, 0..) |state, i| {
+                if (state.open or i == driver_index) continue;
+                const equal = try emitter.append(boolean, location_span, .{ .iteration_equal_length = .{ .lhs = try emitter.value(states[driver_index].node), .rhs = try emitter.value(state.node) } });
+                try self.iterationAssertion(node, equal, "zip iteration length mismatch");
+            }
+            for (states, 0..) |*state, i| {
+                const source = self.ir.getType(state.ty).?;
+                const start = if (state.open)
+                    try emitter.value(ast.nodes.items(.data)[state.node].lhs)
+                else if (source == .range)
+                    try emitter.append(state.index_type, location_span, .{ .range_start = try emitter.value(state.node) })
+                else
+                    try emitter.append(state.index_type, location_span, .{ .constant = try self.ir.internConstant(.{ .ty = state.index_type, .value = .{ .signed_integer = 0 } }) });
+                state.counter = try emitter.append(state.index_type, location_span, .{ .local_slot = start });
+                if (i == driver_index) {
+                    state.end = try emitter.append(state.index_type, location_span, if (source == .range) .{ .range_end = try emitter.value(state.node) } else .{ .iteration_len = try emitter.value(state.node) });
+                    if (source == .range) {
+                        state.inclusive = try emitter.append(boolean, location_span, .{ .range_inclusive = try emitter.value(state.node) });
+                        const no = try emitter.append(boolean, location_span, .{ .constant = try self.ir.internConstant(.{ .ty = boolean, .value = .{ .boolean = false } }) });
+                        state.done = try emitter.append(boolean, location_span, .{ .local_slot = no });
+                    }
+                }
+            }
+        }
+        const scope = self.locals.items.len;
+        defer self.restoreScope(scope);
+        var context: LoopContext = .{
+            .allows_value = loop.else_expr != 0,
+            .result = if (loop.else_expr != 0) expected orelse (try self.probe(node, depth)) orelse try self.probeDefault(node, depth) else .{ .ty = unit },
+        };
+        const parent = self.loop_context;
+        self.loop_context = &context;
+        defer self.loop_context = parent;
+        const condition_start: u32 = if (self.emitter) |emitter| @intCast(emitter.instructions.items.len) else 0;
+        const condition: Ir.ValueId = if (self.emitter != null) try self.zipCondition(states[driver_index], node) else undefined;
+        const body_start: u32 = if (self.emitter) |emitter| @intCast(emitter.instructions.items.len) else 0;
+        for (states) |state| {
+            const capture = if (state.by_ref) ast.nodes.items(.data)[state.binding].rhs else state.binding;
+            const token = ast.nodes.items(.main_token)[capture];
+            const name = ast.tokenSlice(token);
+            if (std.mem.startsWith(u8, name, "@\"")) return self.fail(.unsupported_name, capture, null);
+            const discard = std.mem.eql(u8, name, "_");
+            const related = self.conflict(name);
+            if (!discard and (related != null or isPrimitive(name))) {
+                try self.module.diagnostics.append(self.module.allocator, .{ .tag = .unsupported_shadowing, .span = self.module.tokenSpan(token), .related = related });
+                return null;
+            }
+            var value: ?Ir.ValueId = null;
+            var loan: ?Ir.ValueId = null;
+            if (self.emitter) |emitter| {
+                const index = try emitter.append(state.index_type, location_span, .{ .local_load = state.counter });
+                if (state.by_ref) {
+                    loan = try emitter.append(unit, location_span, .{ .borrow_start = .{ .reservation = state.loan.?, .index = index } });
+                } else value = switch (self.ir.getType(state.ty).?) {
+                    .array => try emitter.append(state.element, location_span, .{ .array_index = .{ .array = try emitter.value(state.node), .index = index } }),
+                    .string => try emitter.append(state.element, location_span, .{ .string_decode = .{ .array = try emitter.value(state.node), .index = index } }),
+                    .range => index,
+                    else => unreachable,
+                };
+            }
+            if (!discard) try self.bindLocal(name, .{ .known = if (state.by_ref) try self.iterationReference(state.node, state.element) else .{ .ty = state.element }, .name_span = self.module.tokenSpan(token), .value = value, .borrowed = state.by_ref, .borrow = loan, .loan_owner = if (state.by_ref) .{ .owner = state.owner.?.name_span, .origin = location_span } else null });
+        }
+        if (loop.else_expr != 0 and context.result == null) context.result = try self.probeBreaks(loop.body, depth + 1);
+        if (try self.expression(loop.body, .{ .ty = unit }, depth + 1) == null) return null;
+        self.terminated = false;
+        var continuation_start: ?u32 = null;
+        var continuation: ?Ir.ValueId = null;
+        if (self.emitter) |emitter| {
+            continuation_start = @intCast(emitter.instructions.items.len);
+            const primary = states[driver_index];
+            if (primary.done) |slot| {
+                const old = try emitter.append(primary.index_type, location_span, .{ .local_load = primary.counter });
+                const at_end = try emitter.append(boolean, location_span, .{ .binary = .{ .op = .eq, .lhs = old, .rhs = primary.end } });
+                const then_start: u32 = @intCast(emitter.instructions.items.len);
+                const yes = try emitter.append(boolean, location_span, .{ .constant = try self.ir.internConstant(.{ .ty = boolean, .value = .{ .boolean = true } }) });
+                const exhausted = try emitter.append(unit, location_span, .{ .local_store = .{ .slot = slot, .value = yes } });
+                const else_start: u32 = @intCast(emitter.instructions.items.len);
+                const increment = try self.zipIncrement(primary, node);
+                continuation = try emitter.append(unit, location_span, .{ .branch = .{ .condition = at_end, .then_start = then_start, .else_start = else_start, .then_value = exhausted, .else_value = increment } });
+            } else continuation = try self.zipIncrement(primary, node);
+            // Advance followers only if another element will actually be used.
+            // This also handles continue without overflowing an open MAX.. tail.
+            const more = try self.zipCondition(primary, node);
+            const then_start: u32 = @intCast(emitter.instructions.items.len);
+            var increment: ?Ir.ValueId = null;
+            for (states, 0..) |state, i| if (i != driver_index) {
+                increment = try self.zipIncrement(state, node);
+            };
+            continuation = try emitter.append(unit, location_span, .{ .branch = .{ .condition = more, .then_start = then_start, .else_start = @intCast(emitter.instructions.items.len), .then_value = increment.?, .else_value = null } });
+        }
+        self.restoreScope(scope);
+        self.loop_context = parent;
+        self.reservation = parent_reservation;
+        const else_start: ?u32 = if (loop.else_expr != 0 and self.emitter != null) @intCast(self.emitter.?.instructions.items.len) else null;
+        const exhaustion = if (loop.else_expr != 0) try self.expression(loop.else_expr, context.result, depth + 1) else unit;
+        if (exhaustion == null) return null;
+        const else_terminal = self.terminated;
+        if (loop.else_expr != 0 and !else_terminal) {
+            if (context.result == null) context.result = .{ .ty = exhaustion.? };
+            try self.copyNode(loop.else_expr, exhaustion.?);
+        }
+        self.terminated = rangeLoopTerminates(loop.else_expr != 0 and else_terminal, context.has_break);
+        const result = if (self.terminated) unit else if (context.result) |value| value.ty else unit;
+        if (self.emitter) |emitter| {
+            try emitter.record(node, result, location_span, .{ .loop = .{
+                .condition_start = condition_start,
+                .body_start = body_start,
+                .continuation_start = continuation_start,
+                .else_start = else_start,
+                .else_value = if (loop.else_expr != 0) try emitter.value(loop.else_expr) else null,
+                .returns = self.terminated,
+                .condition = condition,
+                .body = try emitter.value(loop.body),
+                .continuation = continuation,
+            } });
+            if (self.terminated) self.terminal = try emitter.value(node);
+        }
+        return self.fit(result, expected, node);
+    }
+
+    fn singleRangeExpression(self: *Context, node: Ast.Node.Index, expected: ?Known, depth: usize) Error!?Ir.TypeId {
         const ast = &self.module.source.ast;
         const loop = ast.fullRange(node).?;
         const unit = try self.ir.internType(.void);
@@ -8954,6 +9241,117 @@ test "reference parameters reject aliasing replacement qualifiers and escapes un
         try testReferenceParameterError(std.testing.allocator, case.source, case.tag);
         try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testReferenceParameterError, .{ case.source, case.tag });
     }
+}
+
+fn testZipBody(allocator: std.mem.Allocator, body: []const u8, diagnostic: ?Module.Diagnostic.Tag) !void {
+    const source = try std.fmt.allocPrint(allocator, "let f:()={{\n{s}\n}}", .{body});
+    defer allocator.free(source);
+    var module = try Module.init(allocator, "zip.nov", source);
+    defer module.deinit();
+    errdefer if (module.diagnostics.items.len != 0) std.debug.print("zip fixture: {s}\n{any}\n", .{ body, module.diagnostics.items });
+    try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
+    var result = try Lowering.lower(&module);
+    defer result.deinit();
+    if (diagnostic) |tag| {
+        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+        try std.testing.expectEqual(tag, module.diagnostics.items[0].tag);
+        try std.testing.expect(!result.lowering_complete);
+    } else {
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expect(result.lowering_complete);
+        try result.ir.verify();
+    }
+}
+
+test "zip iteration mixed bounded sources open indices and independent Unicode cursors" {
+    for ([_][]const u8{
+        "loop v,i in [1,2],0.. {@println(v,i)}",
+        "loop i,v in -2..,[true,false] {@println(i,v)}",
+        "loop a,b,c,d in [true,false],\"é😀\",0..2,4..=5 {@println(a,b,c,d)}",
+        "loop a,b,i in \"éa\",\"a😀\",0.. {if i==0 {continue}\n@println(a,b,i)} else {}",
+        "loop a,b in 0..=1,10..=11 {@println(a,b)}",
+        "loop a,b in 0..0,\"\" {} else {}",
+        "loop a,b in [1],[2,3] {break}",
+        "loop a,i in [1],18446744073709551615.. {continue}",
+        "loop a,i in [1],@as(i8,127).. {continue}",
+        "loop i,a in @as(i8,127)..,[1] {continue}",
+        "loop a,b in @as(u8,255)..=255,@as(i8,127)..=127 {continue}",
+        "let mut a=[1]\nlet mut b=[2]\nloop &x,&y,i in a,b,0.. {x.* +=y.*\ny.* +=1\n@println(i)}\na+=[3]\nb+=[4]",
+        "let a=[1]\nloop x,y in a,a {@println(x,y)}",
+        "let s=loop x,y in [1],[2] {break y} else {0}\n@println(s)",
+        "let sink:(value:int)={}\nsink(loop a,b in [true],[1] {break b} else {0})",
+        "let s=loop x,y in [1],[2] {break y} else {@as(int,0)}\n@println(s)",
+        "let mut a=[1]\nlet copy=a\nloop x,y in copy,{a[0]=2\na} {@println(x,y)}",
+        "let mut s=\"é\"\nloop x,y in s,{s=\"😀\"\ns} {@println(x,y)}",
+    }) |body| try testZipBody(std.testing.allocator, body, null);
+}
+
+test "zip iteration rejects unbounded only sources alias loans source effects and binding leaks" {
+    const Case = struct { body: []const u8, tag: Module.Diagnostic.Tag };
+    for ([_]Case{
+        .{ .body = "loop x in 0.. {}", .tag = .unsupported_iteration },
+        .{ .body = "loop x,y in 0..,1.. {}", .tag = .unsupported_iteration },
+
+        .{ .body = "loop x,y in [1],x.. {}", .tag = .unknown_name },
+        .{ .body = "loop x,y in [1],[2] {} else {@println(y)}", .tag = .unknown_name },
+        .{ .body = "loop x,y in [1],[2] {}\n@println(y)", .tag = .unknown_name },
+        .{ .body = "loop x,x in [1],[2] {}", .tag = .unsupported_shadowing },
+        .{ .body = "loop x,&y in [1],[2] {}", .tag = .unsupported_iteration },
+        .{ .body = "let mut a=[1]\nloop &x,&y in a,a {}", .tag = .borrow_conflict },
+        .{ .body = "let mut a=[1]\nloop x,&y in a,a {}", .tag = .borrow_conflict },
+        .{ .body = "let mut a=[1]\nloop &x,y in a,a {}", .tag = .borrow_conflict },
+        .{ .body = "let mut a=[1]\nloop x,y in a,{a[0]=2\n[3]} {}", .tag = .borrow_conflict },
+        .{ .body = "let mut a=[1]\nlet mutate=()->[]int{a=[2]\na}\nloop x,y in a,mutate() {}", .tag = .borrow_conflict },
+        .{ .body = "let mut a=[1]\nlet mut b=[2]\nloop &x,&y in a,b {b=[3]}", .tag = .borrow_conflict },
+        .{ .body = "loop a,i in [1],true.. {}", .tag = .literal_needs_type },
+    }) |case| try testZipBody(std.testing.allocator, case.body, case.tag);
+}
+
+test "zip iteration asserts cardinalities before the body and open overflow only in continuation" {
+    var module = try Module.init(std.testing.allocator, "zip-order.nov", "let f:()={loop a,b,c,i in [1],\"é\",0..1,@as(i8,127).. {continue}}");
+    defer module.deinit();
+    var result = try Lowering.lower(&module);
+    defer result.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(result.lowering_complete);
+    try result.ir.verify();
+    var comparisons: usize = 0;
+    var overflow_guards: usize = 0;
+    for (result.ir.functions.items) |function| {
+        const body = function.body orelse continue;
+        for (body.instructions) |instruction| {
+            if (instruction.op != .loop) continue;
+            const loop = instruction.op.loop;
+            for (body.instructions, 0..) |operation, i| {
+                if (operation.op == .iteration_equal_length) {
+                    comparisons += 1;
+                    try std.testing.expect(i < loop.condition_start);
+                }
+                if (operation.op != .assertion) continue;
+                const message = operation.op.assertion.message.?;
+                const constant = body.instructions[@backingInt(message)].op.constant;
+                const text = result.ir.getConstant(constant).?.value.string;
+                if (std.mem.eql(u8, text, "zip iteration length mismatch")) {
+                    try std.testing.expect(i < loop.condition_start);
+                } else {
+                    try std.testing.expectEqualStrings("open range iteration overflow", text);
+                    try std.testing.expect(i >= loop.continuation_start.?);
+                    overflow_guards += 1;
+                }
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), comparisons);
+    try std.testing.expectEqual(@as(usize, 1), overflow_guards);
+}
+
+test "zip iteration source reservations probes and lowering clean up under OOM" {
+    for ([_][]const u8{
+        "let mut a=[1]\nlet mut b=[2]\nloop &x,&y,r,i in a,b,\"é\",0.. {x.* +=y.*\n@println(r,i)} else {}",
+        "let n=loop a,b,i in [1],[2],-1.. {break b} else {0}\n@println(n)",
+        "let sink:(value:int)={}\nsink(loop a,b in [true],[1] {break b} else {0})",
+    }) |body| try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testZipBody, .{ body, @as(?Module.Diagnostic.Tag, null) });
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testZipBody, .{ "let mut a=[1]\nloop &x,&y in a,a {}", @as(?Module.Diagnostic.Tag, .borrow_conflict) });
 }
 
 test "general borrowing reserves record owners through terminal field assignment RHS" {

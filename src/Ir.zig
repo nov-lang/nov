@@ -92,6 +92,9 @@ pub const Operation = union(enum) {
     array_len: ValueId,
     /// Internal nonnegative signed cursor limit: array elements or string bytes.
     iteration_len: ValueId,
+    /// Compare finite iteration cardinalities (Unicode scalars for strings).
+    /// Operands independently accept arrays, strings, or ranges; result is bool.
+    iteration_equal_length: struct { lhs: ValueId, rhs: ValueId },
     /// Forward UTF8 cursor operations (byte offsets, not language scalar indices).
     string_decode: StringCursor,
     string_next: StringCursor,
@@ -1197,6 +1200,13 @@ fn validateBodyStructure(self: *const Ir, function: Function, body: Body) Verify
                 if (!isNativeInteger(ty, .unsigned)) return error.OperandTypeMismatch;
                 const base = self.getType(try operandType(body, value, i)).?;
                 if (base != .array and base != .string) return error.InvalidOperation;
+            },
+            .iteration_equal_length => |values| {
+                if (ty != .boolean) return error.OperandTypeMismatch;
+                for ([_]ValueId{ values.lhs, values.rhs }) |value| {
+                    const base = self.getType(try operandType(body, value, i)).?;
+                    if (base != .array and base != .string and base != .range) return error.InvalidOperation;
+                }
             },
             .iteration_len => |value| {
                 if (!isNativeInteger(ty, .signed)) return error.OperandTypeMismatch;
@@ -4865,6 +4875,45 @@ test "range values require integer elements exact visible operands and immutable
     try t.ir.verify();
 }
 
+test "iteration equal length source free verifier accepts mixed finite sources and rejects forged operands" {
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    const boolean = try ir.internType(.boolean);
+    const integer = try ir.internType(.{ .integer = .{ .signedness = .signed, .bits = 64 } });
+    const string = try ir.internType(.string);
+    const array = try ir.internType(.{ .array = integer });
+    const range = try ir.internType(.{ .range = integer });
+    const unit = try ir.internType(.void);
+    const params = [_]TypeId{ array, string, range, integer };
+    const signature = try ir.internType(.{ .function = .{ .params = &params, .result = boolean } });
+    const function = try ir.addFunction("equal", signature, .{ .start = 0, .end = 0 });
+    var instructions: [9]Instruction = undefined;
+    for (params, 0..) |ty, i| instructions[i] = .{ .ty = ty, .span = .{ .start = 0, .end = 0 }, .op = .{ .parameter = @intCast(i) } };
+    instructions[4] = .{ .ty = array, .span = .{ .start = 0, .end = 0 }, .op = .{ .local_slot = @fromBackingInt(0) } };
+    instructions[5] = .{ .ty = unit, .span = .{ .start = 0, .end = 0 }, .op = .{ .borrow_reserve = @fromBackingInt(4) } };
+    instructions[6] = .{ .ty = unit, .span = .{ .start = 0, .end = 0 }, .op = .{ .borrow_start = .{ .reservation = @fromBackingInt(5), .index = null } } };
+    instructions[7] = .{ .ty = array, .span = .{ .start = 0, .end = 0 }, .op = .{ .borrow_read = @fromBackingInt(6) } };
+    instructions[8] = .{ .ty = boolean, .span = .{ .start = 0, .end = 0 }, .op = .{ .iteration_equal_length = .{ .lhs = @fromBackingInt(0), .rhs = @fromBackingInt(1) } } };
+    try ir.setFunctionBody(function, &instructions, @fromBackingInt(8));
+    const owned = @constCast(ir.getFunction(function).?.body.?.instructions);
+    for ([_]u32{ 0, 1, 2, 7 }) |lhs| for ([_]u32{ 0, 1, 2, 7 }) |rhs| {
+        owned[8].op.iteration_equal_length = .{ .lhs = @fromBackingInt(lhs), .rhs = @fromBackingInt(rhs) };
+        try ir.verify();
+    };
+    for (0..2) |side| {
+        for ([_]u32{ 3, 4, 5, 6, 8, 99 }) |bad| {
+            owned[8] = instructions[8];
+            if (side == 0) owned[8].op.iteration_equal_length.lhs = @fromBackingInt(bad) else owned[8].op.iteration_equal_length.rhs = @fromBackingInt(bad);
+            try std.testing.expectError(if (bad == 4 or bad >= 8) error.InvalidValueId else error.InvalidOperation, ir.verify());
+        }
+    }
+    owned[8] = instructions[8];
+    owned[8].ty = integer;
+    try std.testing.expectError(error.OperandTypeMismatch, ir.verify());
+    owned[8] = instructions[8];
+    try ir.verify();
+}
+
 test "iteration IR verifies cursor types limits visible values and nonescaping capabilities" {
     var ir = Ir.init(std.testing.allocator);
     defer ir.deinit();
@@ -4941,9 +4990,11 @@ test "range operands and projections cannot escape private branch regions" {
         .{ .range_start = @fromBackingInt(@intCast(2)) },
         .{ .range_end = @fromBackingInt(@intCast(3)) },
         .{ .range_inclusive = @fromBackingInt(@intCast(2)) },
+        .{ .iteration_equal_length = .{ .lhs = @fromBackingInt(2), .rhs = @fromBackingInt(4) } },
+        .{ .iteration_equal_length = .{ .lhs = @fromBackingInt(4), .rhs = @fromBackingInt(3) } },
         .{ .range_init = .{ .start = @fromBackingInt(@intCast(2)), .end = @fromBackingInt(@intCast(1)), .inclusive = false } },
     }) |op| {
-        owned[5] = make(if (op == .range_init) range else t.integer, op);
+        owned[5] = make(if (op == .range_init) range else if (op == .iteration_equal_length) t.boolean else t.integer, op);
         try std.testing.expectError(error.InvalidValueId, t.ir.verify());
     }
     owned[5] = good[5];

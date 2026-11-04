@@ -136,6 +136,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const iteration_tests = b.step("test-cli-iteration", "Run array and Unicode string iteration CLI tests");
     addIterationCliTests(b, exe, iteration_tests);
     test_step.dependOn(iteration_tests);
+    const zip_iteration_tests = b.step("test-cli-zip-iteration", "Run zip iteration CLI and strict generated-C tests");
+    addZipIterationCliTests(b, exe, zip_iteration_tests);
+    test_step.dependOn(zip_iteration_tests);
     const closure_tests = b.step("test-cli-closures", "Run function expression and closure CLI tests");
     addClosureCliTests(b, exe, closure_tests);
     test_step.dependOn(closure_tests);
@@ -4342,6 +4345,130 @@ fn addIterationCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: 
         run.expectExitCode(1);
         run.expectStdOutEqual("");
         run.expectStdErrMatch(b.fmt("{s}:", .{source}));
+        run.expectStdErrMatch("error:");
+        run.expectStdErrMatch(case.diagnostic);
+        if (std.mem.eql(u8, case.diagnostic, conflict)) run.expectStdErrMatch("borrow originates here");
+        test_step.dependOn(&run.step);
+    }
+}
+
+fn addZipIterationCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    const fixtures = b.addWriteFiles();
+    _ = fixtures.add("zip-iteration.nov", @embedFile("examples/zip-iteration.nov"));
+    const output = "0 10\n1 20\n2 30\né a\na 😀\n";
+    for ([_][]const u8{ "fmt", "semantic" }) |mode| {
+        const run = b.addRunArtifact(exe);
+        run.step.name = b.fmt("CLI zip iteration: {s}", .{mode});
+        run.setCwd(fixtures.getDirectory());
+        run.addArgs(if (std.mem.eql(u8, mode, "fmt")) &.{ "fmt", "--check", "zip-iteration.nov" } else &.{ "check", "--semantic", "zip-iteration.nov" });
+        run.expectExitCode(0);
+        run.expectStdOutEqual("");
+        run.expectStdErrEqual("");
+        test_step.dependOn(&run.step);
+    }
+    for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+        for ([_][]const u8{ "run", "test" }) |command| {
+            const run = b.addRunArtifact(exe);
+            run.step.name = b.fmt("CLI zip iteration: {s} ({s})", .{ command, mode });
+            run.setCwd(fixtures.getDirectory());
+            run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+            run.setEnvironmentVariable("NOV_CC", "");
+            run.setEnvironmentVariable("CC", "");
+            run.addArgs(&.{ command, "zip-iteration.nov" });
+            if (mode.len != 0) run.addArg(mode);
+            run.expectExitCode(0);
+            run.expectStdOutEqual(if (std.mem.eql(u8, command, "run")) output else "PASS mixed_and_unicode\nPASS source_order\nPASS range_cardinalities\nPASS open_indices\nPASS reference_pairs\nPASS control_and_captures\n6 passed; 0 failed; 6 total\n");
+            run.expectStdErrEqual("");
+            test_step.dependOn(&run.step);
+        }
+    }
+    // Reach the test bodies in ordinary emitted C as well as through `nov test`.
+    const unannotated = std.mem.replaceOwned(u8, b.allocator, @embedFile("examples/zip-iteration.nov"), "@[test]\n", "") catch @panic("OOM");
+    const demo = std.mem.replaceOwned(u8, b.allocator, unannotated, "let main:", "let demo:") catch @panic("OOM");
+    _ = fixtures.add("zip-strict.nov", b.fmt("{s}\nlet main:()={{demo()\nmixed_and_unicode()\nsource_order()\nrange_cardinalities()\nopen_indices()\nreference_pairs()\ncontrol_and_captures()}}\n", .{demo}));
+    const emit = b.addRunArtifact(exe);
+    emit.step.name = "CLI zip iteration: emit C";
+    emit.setCwd(fixtures.getDirectory());
+    emit.addArgs(&.{ "emit-c", "zip-strict.nov" });
+    emit.expectExitCode(0);
+    emit.expectStdErrEqual("");
+    const generated = emit.captureStdOut(.{});
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| {
+        const compile = b.addSystemCommand(&.{ b.graph.zig_exe, "cc", "-x", "c", "-std=c11", mode, "-fsanitize=undefined", "-fno-sanitize-recover=all", "-Wall", "-Wextra", "-Wpedantic", "-Wunused-function", "-Wunused-variable", "-Wunused-but-set-variable", "-Werror" });
+        compile.step.name = b.fmt("CLI zip iteration: strict C ({s})", .{mode});
+        compile.addFileArg(generated);
+        compile.addArg("-o");
+        const binary = compile.addOutputFileArg(if (exe.root_module.resolved_target.?.result.os.tag == .windows) "zip.exe" else "zip");
+        const run = std.Build.Step.Run.create(b, b.fmt("CLI zip iteration: strict C execution ({s})", .{mode}));
+        run.addFileArg(binary);
+        run.expectExitCode(0);
+        run.expectStdOutEqual(output);
+        run.expectStdErrEqual("");
+        test_step.dependOn(&run.step);
+    }
+    // Exact output proves preflight precedes both the body and exhaustion branch.
+    for ([_]struct { name: []const u8, body: []const u8, stdout: []const u8 = "", panic: []const u8 = "zip iteration length mismatch" }{
+        .{ .name = "arrays", .body = "loop a,b in [1],[2,3] {@println(\"BODY\")} else {@println(\"ELSE\")}" },
+        .{ .name = "break", .body = "loop a,b in [1,2],[3] {@println(\"BODY\")\nbreak}" },
+        .{ .name = "empty-first", .body = "let empty:[]int=[]\nloop a,b in empty,[1] {@println(\"BODY\")} else {@println(\"ELSE\")}" },
+        .{ .name = "empty-last", .body = "loop a,b in [1],\"\" {break} else {@println(\"ELSE\")}" },
+        .{ .name = "same-bytes-different-scalars", .body = "loop a,b in \"é\",\"ab\" {break}" },
+        .{ .name = "scalar-not-byte-length", .body = "loop a,b in \"😀\",[1,2,3,4] {break}" },
+        .{ .name = "later-source", .body = "loop a,b,c,i in [1],[2],[3,4],0.. {break}" },
+        .{ .name = "effects-before-preflight", .body = "loop a,b,c in {@println(\"first\")\n[1]}, {@println(\"second\")\n[2,3]}, {@println(\"third\")\n0..1} {@println(\"BODY\")\nbreak}", .stdout = "first\nsecond\nthird\n" },
+        .{ .name = "exclusive-range", .body = "loop a,b in 0..2,4..=6 {break}" },
+        .{ .name = "reversed-range", .body = "loop a,b in 5..=3,0..=0 {break}" },
+        .{ .name = "full-u64", .body = "loop a,b in @as(u64,0)..=18446744073709551615,0..0 {break}" },
+        .{ .name = "full-i64", .body = "let minimum:i64=-9223372036854775807-1\nloop a,b in minimum..=9223372036854775807,\"\" {break}" },
+        .{ .name = "full-versus-exclusive", .body = "loop a,b in @as(u64,0)..=18446744073709551615,@as(u64,0)..18446744073709551615 {break}" },
+        .{ .name = "signed-exclusive-extremes", .body = "let minimum:i64=-9223372036854775807-1\nloop a,b in minimum..9223372036854775807,@as(u64,0)..=18446744073709551615 {break}" },
+        .{ .name = "open-uint-overflow", .body = "loop a,i in [1,2],18446744073709551615.. {@println(a)\ncontinue}", .stdout = "1\n", .panic = "open range iteration overflow" },
+        .{ .name = "open-signed-overflow", .body = "loop i,a in @as(i8,127)..,[1,2] {@println(a)\ncontinue}", .stdout = "1\n", .panic = "open range iteration overflow" },
+    }) |case| {
+        const source = b.fmt("runtime-{s}.nov", .{case.name});
+        _ = fixtures.add(source, b.fmt("let main:()={{\n{s}\n}}\n", .{case.body}));
+        for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+            const run = b.addRunArtifact(exe);
+            run.step.name = b.fmt("CLI zip iteration: panic {s} ({s})", .{ case.name, mode });
+            run.setCwd(fixtures.getDirectory());
+            run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+            run.setEnvironmentVariable("NOV_CC", "");
+            run.setEnvironmentVariable("CC", "");
+            run.addArgs(&.{ "run", source });
+            if (mode.len != 0) run.addArg(mode);
+            run.expectExitCode(1);
+            run.expectStdOutEqual(case.stdout);
+            run.expectStdErrMatch(b.fmt("assertion failed: {s}\n", .{case.panic}));
+            test_step.dependOn(&run.step);
+        }
+    }
+    const conflict = "owner access or aliased reference arguments conflict with a live borrow";
+    for ([_]struct { name: []const u8, body: []const u8, diagnostic: []const u8 }{
+        .{ .name = "few-sources", .body = "loop a,b in [1] {}", .diagnostic = "equal binding/source counts" },
+        .{ .name = "few-bindings", .body = "loop a in [1],[2] {}", .diagnostic = "equal binding/source counts" },
+        .{ .name = "all-open", .body = "loop a,b in 0..,-1.. {}", .diagnostic = "at least one bounded source" },
+        .{ .name = "single-open", .body = "loop a in 0.. {}", .diagnostic = "at least one bounded source" },
+        .{ .name = "alias-references", .body = "let mut a=[1]\nloop &x,&y in a,a {}", .diagnostic = conflict },
+        .{ .name = "alias-copy-reference", .body = "let mut a=[1]\nloop x,&y in a,a {}", .diagnostic = conflict },
+        .{ .name = "alias-reference-copy", .body = "let mut a=[1]\nloop &x,y in a,a {}", .diagnostic = conflict },
+        .{ .name = "source-mutation", .body = "let mut a=[1]\nloop x,y in a,{a[0]=2\n[3]} {}", .diagnostic = conflict },
+        .{ .name = "captured-source-mutation", .body = "let mut a=[1]\nlet mutate=()->[]int{a=[2]\na}\nloop x,y in a,mutate() {}", .diagnostic = conflict },
+        .{ .name = "captured-owner", .body = "let mut a=[1]\nloop &x,i in a,0.. {let read=()->int{a[0]}\n@println(read())}", .diagnostic = conflict },
+        .{ .name = "readonly", .body = "let a=[1]\nlet b=[2]\nloop &x,&y in a,b {x.*=3}", .diagnostic = "assignment requires a mutable local" },
+        .{ .name = "reference-string", .body = "loop a,&b in [1],\"é\" {}", .diagnostic = "reference iteration requires a local array owner" },
+        .{ .name = "reference-escape", .body = "let mut a=[1]\nloop &x,i in a,0.. {let escaped=&x.*\n}", .diagnostic = "local references require" },
+        .{ .name = "binding-in-source", .body = "loop x,y in [1],x.. {}", .diagnostic = "unknown name" },
+        .{ .name = "binding-in-else", .body = "loop x,y in [1],[2] {} else {@println(y)}", .diagnostic = "unknown name" },
+        .{ .name = "binding-after-loop", .body = "loop x,y in [1],[2] {}\n@println(y)", .diagnostic = "unknown name" },
+    }) |case| {
+        const source = b.fmt("invalid-{s}.nov", .{case.name});
+        _ = fixtures.add(source, b.fmt("let main:()={{\n{s}\n}}\n", .{case.body}));
+        const run = b.addRunArtifact(exe);
+        run.step.name = b.fmt("CLI zip iteration: reject {s}", .{case.name});
+        run.setCwd(fixtures.getDirectory());
+        run.addArgs(&.{ "check", "--semantic", source });
+        run.expectExitCode(1);
+        run.expectStdOutEqual("");
         run.expectStdErrMatch("error:");
         run.expectStdErrMatch(case.diagnostic);
         if (std.mem.eql(u8, case.diagnostic, conflict)) run.expectStdErrMatch("borrow originates here");

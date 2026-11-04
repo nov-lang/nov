@@ -251,6 +251,7 @@ fn write(allocator: std.mem.Allocator, ir: *const Ir, origins: []const ?Origin, 
         try writeStringConversions(ir, w);
     }
     try writeStringScalarRuntime(ir, w);
+    try writeIterationLengthRuntime(ir, w);
     if (usesStringEquality(ir)) try w.writeAll(
         "#include <string.h>\n" ++
             "static bool nov_string_equal(nov_string a, nov_string b) {\n" ++
@@ -516,6 +517,172 @@ fn usesManagedRuntime(ir: *const Ir) bool {
     return false;
 }
 
+fn writeIterationLengthRuntime(ir: *const Ir, w: *std.Io.Writer) WriteError!void {
+    var used = false;
+    var ranges = false;
+    for (ir.functions.items) |function| {
+        const body = function.body orelse continue;
+        for (body.instructions) |instruction| {
+            if (instruction.op != .iteration_equal_length) continue;
+            used = true;
+            const values = instruction.op.iteration_equal_length;
+            for ([_]Ir.ValueId{ values.lhs, values.rhs }) |value| {
+                if (ir.getType(body.instructions[@backingInt(value)].ty).? == .range) ranges = true;
+            }
+        }
+    }
+    if (!used) return;
+    try w.writeAll(
+        \\typedef struct { uint64_t low; bool full; } nov_iteration_count;
+        \\static bool nov_iteration_count_equal(nov_iteration_count lhs, nov_iteration_count rhs) {
+        \\    return lhs.low == rhs.low && lhs.full == rhs.full;
+        \\}
+        \\
+    );
+    if (ranges) try w.writeAll(
+        \\static nov_iteration_count nov_range_count(uint64_t start, uint64_t end, bool ordered, bool inclusive) {
+        \\    if (!ordered) return (nov_iteration_count){0, false};
+        \\    const uint64_t difference = end - start;
+        \\    const bool full = inclusive && difference == UINT64_MAX;
+        \\    return (nov_iteration_count){full ? 0 : difference + (uint64_t)inclusive, full};
+        \\}
+        \\
+    );
+}
+
+fn writeIterationCount(ir: *const Ir, w: *std.Io.Writer, body: Ir.Body, value: Ir.ValueId) WriteError!void {
+    const id = @backingInt(value);
+    switch (ir.getType(body.instructions[id].ty).?) {
+        .array => try w.print("(nov_iteration_count){{(uint64_t)v{d}.len, false}}", .{id}),
+        .string => try w.print("(nov_iteration_count){{(uint64_t)nov_string_scalar_len(v{d}), false}}", .{id}),
+        // Cast before subtraction: unsigned modular subtraction gives the exact
+        // ordered distance even across signed zero and at both signed extremes.
+        .range => try w.print("nov_range_count((uint64_t)v{d}.start, (uint64_t)v{d}.end, v{d}.start <= v{d}.end, v{d}.inclusive)", .{ id, id, id, id, id }),
+        else => unreachable,
+    }
+}
+
+const IterationLengthTest = struct {
+    ir: *Ir,
+    instructions: std.ArrayList(Ir.Instruction) = .empty,
+
+    fn append(self: *@This(), ty: Ir.TypeId, op: Ir.Operation) !Ir.ValueId {
+        const id: Ir.ValueId = @fromBackingInt(@intCast(self.instructions.items.len));
+        try self.instructions.append(test_gpa, .{ .ty = ty, .span = .{ .start = 0, .end = 0 }, .op = op });
+        return id;
+    }
+
+    fn integer(self: *@This(), ty: Ir.TypeId, value: i128) !Ir.ValueId {
+        const signed = self.ir.getType(ty).?.integer.signedness == .signed;
+        return self.append(ty, .{ .constant = try self.ir.internConstant(.{ .ty = ty, .value = if (signed) .{ .signed_integer = value } else .{ .unsigned_integer = @intCast(value) } }) });
+    }
+
+    fn range(self: *@This(), ty: Ir.TypeId, start: i128, end: i128, inclusive: bool) !Ir.ValueId {
+        const first = try self.integer(ty, start);
+        const last = try self.integer(ty, end);
+        return self.append(try self.ir.internType(.{ .range = ty }), .{ .range_init = .{ .start = first, .end = last, .inclusive = inclusive } });
+    }
+
+    fn check(self: *@This(), lhs: Ir.ValueId, rhs: Ir.ValueId, expected: bool) !void {
+        const boolean = try self.ir.internType(.boolean);
+        var condition = try self.append(boolean, .{ .iteration_equal_length = .{ .lhs = lhs, .rhs = rhs } });
+        if (!expected) condition = try self.append(boolean, .{ .unary = .{ .op = .bool_not, .operand = condition } });
+        _ = try self.append(try self.ir.internType(.void), .{ .assertion = .{ .condition = condition, .message = null, .location = "iteration cardinality" } });
+    }
+};
+
+fn emitIterationLengthTest() ![]u8 {
+    var ir = Ir.init(test_gpa);
+    defer ir.deinit();
+    var t: IterationLengthTest = .{ .ir = &ir };
+    defer t.instructions.deinit(test_gpa);
+    const unit = try ir.internType(.void);
+    const u64_type = try ir.internType(.{ .integer = .{ .signedness = .unsigned, .bits = 64 } });
+    const i64_type = try ir.internType(.{ .integer = .{ .signedness = .signed, .bits = 64 } });
+    const empty = try t.range(u64_type, 0, 0, false);
+    const full = try t.range(u64_type, 0, std.math.maxInt(u64), true);
+    const signed_full = try t.range(i64_type, std.math.minInt(i64), std.math.maxInt(i64), true);
+    try t.check(full, signed_full, true);
+    try t.check(full, empty, false);
+    for ([_]u16{ 8, 16, 32, 64 }) |bits| {
+        for ([_]std.builtin.Signedness{ .signed, .unsigned }) |signedness| {
+            const ty = try ir.internType(.{ .integer = .{ .signedness = signedness, .bits = bits } });
+            const minimum: i128 = if (signedness == .signed) -(@as(i128, 1) << @intCast(bits - 1)) else 0;
+            const maximum: i128 = (@as(i128, 1) << @intCast(bits - @intFromBool(signedness == .signed))) - 1;
+            const endpoints = [_]i128{ minimum, minimum + 1, 0, maximum - 1, maximum };
+            for (endpoints) |start| for (endpoints) |end| for ([_]bool{ false, true }) |inclusive| {
+                const source = try t.range(ty, start, end, inclusive);
+                const count: i128 = if (start > end) 0 else end - start + @intFromBool(inclusive);
+                const reference = if (count == (@as(i128, 1) << 64)) full else try t.range(u64_type, 0, count, false);
+                try t.check(source, reference, true);
+                try t.check(reference, source, true);
+                try t.check(source, if (count == 0) full else empty, false);
+            };
+        }
+    }
+    const string = try ir.internType(.string);
+    const array = try ir.internType(.{ .array = u64_type });
+    const text = try t.append(string, .{ .constant = try ir.internConstant(.{ .ty = string, .value = .{ .string = "é😀\x00" } }) });
+    const blank = try t.append(string, .{ .constant = try ir.internConstant(.{ .ty = string, .value = .{ .string = "" } }) });
+    const dynamic = try t.append(string, .{ .binary = .{ .op = .add, .lhs = text, .rhs = blank } });
+    const one = try t.integer(u64_type, 1);
+    const elements = try t.append(array, .{ .array_literal = &.{ one, one, one } });
+    // A subsequent allocation collects while the earlier string and array must
+    // remain precise roots until their cardinalities are read below.
+    const short = try t.append(array, .{ .array_literal = &.{one} });
+    const three = try t.range(u64_type, 1, 3, true);
+    try t.check(dynamic, elements, true);
+    try t.check(elements, three, true);
+    try t.check(three, dynamic, true);
+    try t.check(dynamic, short, false);
+    try t.check(blank, empty, true);
+    try t.check(dynamic, full, false);
+    const result = try t.append(unit, .{ .constant = try ir.internConstant(.{ .ty = unit, .value = .void }) });
+    const signature = try ir.internType(.{ .function = .{ .params = &.{}, .result = unit } });
+    const main = try ir.addFunction("main", signature, .{ .start = 0, .end = 0 });
+    try ir.setFunctionBody(main, t.instructions.items, result);
+    return emit(test_gpa, &ir, null);
+}
+
+test "iteration equal length source free mixed Unicode arrays ranges all widths signed extremes full spans forced GC O0 O3" {
+    const library = try emitIterationLengthTest();
+    defer test_gpa.free(library);
+    const c = try std.mem.concat(test_gpa, u8, &.{
+        "#include <stdlib.h>\nstatic size_t allocations;\nstatic void *limited_malloc(size_t n) { if (allocations++ >= 3) return NULL; return malloc(n); }\n#define NOV_GC_MALLOC limited_malloc\n#define NOV_GC_FREE free\n",
+        library,
+        "\nint main(void) { nov_rt_heap.collect_every_allocation=1; nov_main(); if(allocations!=3 || nov_rt_heap.frames)return 70; nov_gc_collect(&nov_rt_heap); if(nov_rt_heap.live_objects)return 71; nov_gc_shutdown(&nov_rt_heap); return 0; }\n",
+    });
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "", "", mode);
+}
+
+test "iteration equal length source free unequal ranges assert upfront without GC runtime O0 O3" {
+    var ir = Ir.init(test_gpa);
+    defer ir.deinit();
+    var t: IterationLengthTest = .{ .ir = &ir };
+    defer t.instructions.deinit(test_gpa);
+    const ty = try ir.internType(.{ .integer = .{ .signedness = .signed, .bits = 64 } });
+    const lhs = try t.range(ty, -2, 1, false);
+    const rhs = try t.range(ty, -2, 1, true);
+    try t.check(lhs, rhs, true);
+    const unit = try ir.internType(.void);
+    // Division by zero stands in for a body effect that must never be reached.
+    const one = try t.integer(ty, 1);
+    const zero = try t.integer(ty, 0);
+    _ = try t.append(ty, .{ .binary = .{ .op = .div, .lhs = one, .rhs = zero } });
+    const result = try t.append(unit, .{ .constant = try ir.internConstant(.{ .ty = unit, .value = .void }) });
+    const signature = try ir.internType(.{ .function = .{ .params = &.{}, .result = unit } });
+    const main = try ir.addFunction("main", signature, .{ .start = 0, .end = 0 });
+    try ir.setFunctionBody(main, t.instructions.items, result);
+    const c = try emitProgram(test_gpa, &ir, null);
+    defer test_gpa.free(c);
+    try std.testing.expect(std.mem.indexOf(u8, c, "nov_gc_push") == null);
+    try std.testing.expect(std.mem.indexOf(u8, c, "nov_string_scalar_len") == null);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 1, "", "iteration cardinality: assertion failed\n", mode);
+}
+
 fn usesStringIndex(ir: *const Ir) bool {
     for (ir.functions.items) |function| {
         const body = function.body orelse continue;
@@ -539,6 +706,12 @@ fn usesStringLength(ir: *const Ir) bool {
         const body = function.body orelse continue;
         for (body.instructions) |instruction| {
             if (instruction.op == .array_len and ir.getType(body.instructions[@backingInt(instruction.op.array_len)].ty).? == .string) return true;
+            if (instruction.op == .iteration_equal_length) {
+                const values = instruction.op.iteration_equal_length;
+                for ([_]Ir.ValueId{ values.lhs, values.rhs }) |value| {
+                    if (ir.getType(body.instructions[@backingInt(value)].ty).? == .string) return true;
+                }
+            }
         }
     }
     return false;
@@ -1057,6 +1230,10 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
         },
         .union_tag, .union_payload => |read| value_used[@backingInt(read.base)] = true,
         .field_read => |read| value_used[@backingInt(read.base)] = true,
+        .iteration_equal_length => |r| {
+            value_used[@backingInt(r.lhs)] = true;
+            value_used[@backingInt(r.rhs)] = true;
+        },
         .range_init => |r| {
             value_used[@backingInt(r.start)] = true;
             value_used[@backingInt(r.end)] = true;
@@ -1553,6 +1730,13 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
             .borrow_read => |borrow| try writeBorrowRead(ir, w, body, borrow),
             .borrow_reserve, .borrow_start, .reference_slot, .reference_rebind, .reference_load, .reference_parameter, .reference_argument, .borrow_store => unreachable,
             .field_read => |read| try w.print("v{d}.f{d}", .{ @backingInt(read.base), read.index }),
+            .iteration_equal_length => |values| {
+                try w.writeAll("nov_iteration_count_equal(");
+                try writeIterationCount(ir, w, body, values.lhs);
+                try w.writeAll(", ");
+                try writeIterationCount(ir, w, body, values.rhs);
+                try w.writeByte(')');
+            },
             .iteration_len => |value| try w.print("(v{d}.len > INTPTR_MAX ? (nov_rt_panic(\"iterable too long\"), (intptr_t)0) : (intptr_t)v{d}.len)", .{ @backingInt(value), @backingInt(value) }),
             .string_decode, .string_next => |r| try w.print("nov_string_cursor_{s}(v{d}, v{d})", .{ if (instruction.op == .string_decode) "rune" else "next", @backingInt(r.array), @backingInt(r.index) }),
             .array_len => |value| {

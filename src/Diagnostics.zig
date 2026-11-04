@@ -87,7 +87,7 @@ fn renderModuleWithSources(module: *const Module, compilation: ?*const Compilati
         const location = Location.init(source.ast.source, diagnostic.span.start);
         try location.renderPrefix(source.path, "error", writer);
         switch (diagnostic.tag) {
-            .unsupported_iteration => try writer.writeAll("iteration requires an array, string or bounded integer range; reference iteration requires a local array owner (not a string, range, temporary or reborrow)"),
+            .unsupported_iteration => try writer.writeAll("iteration requires arrays, strings or integer ranges, with at least one bounded source; an open range is allowed only as a direct loop source; reference iteration requires a local array owner (not a string, range, temporary or reborrow)"),
             .borrow_conflict => try writer.writeAll("owner access or aliased reference arguments conflict with a live borrow"),
             .borrow_escape => try writer.writeAll("references cannot escape into arrays, fields, unions, results, constants or closures; references are allowed only as local bindings and safe function parameters; use p.* to read the borrowed value instead"),
             .unsupported_borrow => try writer.writeAll("local references require &local or &localArray[index] and explicit p.* access; owner mutability determines &T (readonly) or &mut T (mutable pointee), independently of let mut rebinding; void, references to references, nonlocal owners and reborrows are unsupported"),

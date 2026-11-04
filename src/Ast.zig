@@ -236,6 +236,35 @@ test "type-only declarations end at their annotated type" {
     try std.testing.expectEqualStrings("let value: &mut int", tree.source[span.start..span.end]);
 }
 
+test "iteration accessors expose AST-owned positional lists for single and zip loops" {
+    for ([_][:0]const u8{
+        "let f=loop item in items {}",
+        "let f=loop item,&other,index in items,others,0.. {} else {false}",
+    }, [_]usize{ 1, 3 }) |source, count| {
+        var ast = try Parser.parse(std.testing.allocator, source);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+        const node = ast.decl(ast.rootDecls()[0]).ast.init_node;
+        const loop = ast.fullRange(node).?;
+        const bindings = ast.iterationBindings(node);
+        const sources = ast.iterationSources(node);
+        try std.testing.expectEqual(count, bindings.len);
+        try std.testing.expectEqual(count, sources.len);
+        try std.testing.expectEqual(loop.binding, bindings[0]);
+        try std.testing.expectEqual(loop.source, sources[0]);
+        try std.testing.expect(bindings.ptr == ast.extra_data[loop.bindings_start..].ptr);
+        try std.testing.expect(sources.ptr == ast.extra_data[loop.sources_start..].ptr);
+        if (count == 3) {
+            try std.testing.expectEqual(Node.Tag.ref_of, ast.nodes.items(.tag)[bindings[1]]);
+            const range = sources[2];
+            try std.testing.expectEqual(Node.Tag.range, ast.nodes.items(.tag)[range]);
+            try std.testing.expectEqual(@as(Node.Index, 0), ast.nodes.items(.data)[range].rhs);
+            try std.testing.expectEqualStrings("0", ast.tokenSlice(ast.firstToken(range)));
+            try std.testing.expectEqualStrings("..", ast.tokenSlice(ast.lastToken(range)));
+        }
+    }
+}
+
 test "render empty AST" {
     const allocator = std.testing.allocator;
     var ast = try Parser.parse(allocator, "");
@@ -400,7 +429,7 @@ pub fn renderError(self: Ast, parse_error: Error, writer: anytype) !void {
         //     });
         // },
         .unsupported_loop => return writer.writeAll("unsupported loop form; expected 'loop condition { ... }'"),
-        .unsupported_range_loop => return writer.writeAll("unsupported iteration loop; expected 'loop name in iterable { ... }' or 'loop &name in local_array { ... }'; multiple/zip bindings, steps and continuations are unsupported"),
+        .unsupported_range_loop => return writer.writeAll("invalid iteration loop; expected 'loop name, &name in source, source { ... }' with equal binding/source counts; steps and continuations are unsupported"),
         .expected_decl => {
             return writer.print("expected declaration, found '{s}'", .{
                 token_tags[parse_error.token + @intFromBool(parse_error.token_is_prev)].symbol(),
@@ -1157,6 +1186,20 @@ pub fn fullRange(self: Ast, node: Node.Index) ?Node.RangeLoop {
     return self.extraData(self.nodes.items(.data)[node].lhs, Node.RangeLoop);
 }
 
+/// All iteration bindings in source order, including the single-binding case.
+/// Each is an identifier or ref_of(identifier), paired with iterationSources.
+pub fn iterationBindings(self: Ast, node: Node.Index) []const Node.Index {
+    const loop = self.fullRange(node).?;
+    return self.extra_data[loop.bindings_start..loop.bindings_end];
+}
+
+/// All iteration sources in source order; the parser guarantees equal counts.
+/// An open range is `.range` with rhs=0 and a `..` main token, only here.
+pub fn iterationSources(self: Ast, node: Node.Index) []const Node.Index {
+    const loop = self.fullRange(node).?;
+    return self.extra_data[loop.sources_start..loop.sources_end];
+}
+
 pub fn fullLoop(self: Ast, node: Node.Index) ?struct { condition: Node.Index, continuation: Node.Index, body: Node.Index, else_expr: Node.Index = 0 } {
     return switch (self.nodes.items(.tag)[node]) {
         .loop_condition => blk: {
@@ -1639,7 +1682,8 @@ pub const Node = struct {
         /// `lhs..rhs`.
         /// `lhs..=rhs`.
         /// rhs can be omitted.
-        /// main_token is the `..` or `..=`.
+        /// main_token is the `..` or `..=`. lhs is the start expression.
+        /// rhs is the end expression, or 0 for `start..` only as a direct loop source.
         range,
         /// Iteration over a range, array or string. `RangeLoop[lhs]`, rhs is the final body/else.
         loop_range,
@@ -1743,11 +1787,17 @@ pub const Node = struct {
     };
 
     pub const RangeLoop = struct {
-        /// Identifier, or ref_of(identifier) for a scoped element loan.
+        /// First identifier or ref_of(identifier); retained for single-loop clients.
         binding: Index,
+        /// First source; zip-aware clients must use iterationSources.
         source: Index,
         body: Index,
         else_expr: Index,
+        /// Nonempty, equal-length Node.Index lists in Ast.extra_data, even for singles.
+        bindings_start: Index,
+        bindings_end: Index,
+        sources_start: Index,
+        sources_end: Index,
     };
 
     pub const SubRange = struct {

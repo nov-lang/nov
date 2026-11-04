@@ -11,7 +11,7 @@ const TypeResolver = @import("TypeResolver.zig");
 /// local blocks, if/else, loops with optional conditions/continuations, returns,
 /// unlabeled loop controls (including value-bearing breaks),
 /// direct identifier assignments, scalar array types/literals/indexing/.len,
-/// membership, bounded integer range loops, scalar match/prongs, unary pipes,
+/// membership, positional zip iteration (including open range sources), scalar match/prongs, unary pipes,
 /// and indexed assignments to direct identifiers.
 /// Formatting is syntactic,
 /// not a scope, mutability, or type check. Preserves line/doc comments and tokens.
@@ -164,11 +164,19 @@ fn checkSupported(ast: Ast) !void {
                 for (ast.nodes.items(.tag), 0..) |parent_tag, parent| {
                     if ((parent_tag == .decl and ast.decl(@intCast(parent)).ast.init_node == i) or
                         (parent_tag == .assign and ast.nodes.items(.data)[parent].rhs == i) or
-                        (parent_tag == .function_pipe and ast.nodes.items(.data)[parent].lhs == i) or
-                        (parent_tag == .loop_range and ast.fullRange(@intCast(parent)).?.binding == i))
+                        (parent_tag == .function_pipe and ast.nodes.items(.data)[parent].lhs == i))
                     {
                         binding = true;
                         break;
+                    }
+                    if (parent_tag == .loop_range) {
+                        for (ast.iterationBindings(@intCast(parent))) |capture| {
+                            if (capture == i) {
+                                binding = true;
+                                break;
+                            }
+                        }
+                        if (binding) break;
                     }
                     if (parent_tag == .call or parent_tag == .call_one) {
                         for (ast.fullCall(@intCast(parent)).?.ast.args) |arg| {
@@ -581,6 +589,28 @@ test "ascription preserves type syntax comments nested calls interpolation and a
         "let a=@as(\n[]int, ; type\n[1,2],)\nlet f=@as((n:int)->int,id)\nlet s=\"{@as(int, 1)}\"",
         "let n=@as(int,@as(int,1))\nlet f=@as(()->void,unit)",
     }) |source| {
+        const result = try format(std.testing.allocator, source);
+        defer std.testing.allocator.free(result);
+        try expectFormatted(source, result);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{source});
+    }
+}
+
+test "zip iteration formatting preserves comments interpolation and allocation cleanup" {
+    try expectFormatted("let f=loop item,index in items,0.. {item} else {false}", "let f = loop item, index in items, 0.. {\n    item\n} else {\n    false\n}\n");
+    for ([_][:0]const u8{
+        "let f=loop &item,&other,index in items,others,0.. {continue} else {}",
+        "let f=loop x,y in [1,2],\"ab\" {}",
+        "let f=loop x,y in 0..2,0..=1 {}",
+        "let f=loop index in 0.. {}",
+        "let f=[loop index in 0.. {break index},1]\nlet g=call(loop index in 0.. {break index},2)",
+        "let f=loop x,y in 0..{limit()},items {}",
+        "let f=loop x,y in items,0..{limit()} {}",
+        "let f=loop & ; loan\nitem, ; capture\nindex in ; source\nitems, ; counter\n0.. ; body\n{continue} else {}",
+        "let f=loop x,y in 0.. ; comma\n,items {}",
+        "let f=loop item,index in items,0.. {@println(\"{item}:{index}\")} else {}",
+    }) |source| {
+        errdefer std.debug.print("zip formatter fixture: {s}\n", .{source});
         const result = try format(std.testing.allocator, source);
         defer std.testing.allocator.free(result);
         try expectFormatted(source, result);

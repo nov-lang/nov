@@ -1,0 +1,205 @@
+; nov run examples/zip-iteration.nov
+; nov test examples/zip-iteration.nov
+; Bounded sources must have equal lengths before the body can run.
+; Open ranges follow the finite sources; strings count Unicode scalars.
+
+let main: () = {
+    loop item, index in [10, 20, 30], 0.. {
+        @println(index, item)
+    }
+    loop left, right in "éa", "a😀" {
+        @println(left, right)
+    }
+}
+
+@[test]
+let mixed_and_unicode: () = {
+    let left: []rune = ['é', 'a', '\0', '\u{10FFFF}']
+    let right: []rune = ['a', '😀', '\0', 'é']
+    let mut count: uint = 0
+    loop a, b, c, d, index in "éa\0\u{10FFFF}", "a😀\0é", left, @as(int, 5)..=8, @as(int, 0).. {
+        @assert(a == c)
+        @assert(b == right[index])
+        @assert(d == index + 5)
+        count += 1
+    }
+    @assert(count == 4)
+    let same = [true, false]
+    loop a, b in same, same {
+        @assert(a == b)
+    }
+}
+
+@[test]
+let source_order: () = {
+    let mut order: int = 0
+    let mut count: int = 0
+    loop a, b, c, index in {
+        order = order * 10 + 1
+        @as([]int, [7, 8])
+    }, {
+        order = order * 10 + 2
+        "é😀"
+    }, {
+        order = order * 10 + 3
+        @as(int, 7)..9
+    }, {
+        order = order * 10 + 4
+        @as(uint, 0)
+    }.. {
+        @assert(order == 1234)
+        @assert(a == c)
+        @assert(
+            b == if index == 0 {
+                'é'
+            } else {
+                '😀'
+            }
+        )
+        count += 1
+    }
+    @assert(order == 1234)
+    @assert(count == 2)
+    let mut text = "éa"
+    loop a, b, index in text, {
+        text = "a😀"
+        text
+    }, 0.. {
+        @assert(
+            a == if index == 0 {
+                'é'
+            } else {
+                'a'
+            }
+        )
+        @assert(
+            b == if index == 0 {
+                'a'
+            } else {
+                '😀'
+            }
+        )
+    }
+}
+
+@[test]
+let range_cardinalities: () = {
+    let mut count: int = 0
+    loop a, b, c in -2..1, @as(int, 4)..=6, [1, 2, 3] {
+        @assert(a + 6 == b)
+        @assert(a + 3 == c)
+        count += 1
+    }
+    @assert(count == 3)
+    let empty: []int = []
+    loop a, b, c, d in 8..3, 8..=3, empty, "" {
+        @panic("empty body ran")
+    } else {
+        count += 1
+    }
+    @assert(count == 4)
+    loop a, b in @as(u64, 18446744073709551615)..=18446744073709551615, @as(i64, 9223372036854775807)..=9223372036854775807 {
+        @assert(a == 18446744073709551615)
+        @assert(b == 9223372036854775807)
+        continue
+    }
+    ; Both full-width inclusive ranges have 2^64 elements, not zero.
+    let minimum: i64 = -9223372036854775807 - 1
+    loop a, b in @as(u64, 0)..=18446744073709551615, minimum..=9223372036854775807 {
+        @assert(a == 0)
+        @assert(b == minimum)
+        break
+    } else {
+        @panic("full range appeared empty")
+    }
+}
+
+@[test]
+let open_indices: () = {
+    let mut expected: int = -2
+    loop index, value, negative in 0.., @as([]uint, [4, 5, 6]), -2.. {
+        let unsigned: uint = index
+        let signed: int = negative
+        @assert(unsigned + 4 == value)
+        @assert(signed == expected)
+        expected += 1
+    }
+    loop value, index in [1], 18446744073709551615.. {
+        @assert(index == 18446744073709551615)
+        continue
+    }
+    loop index, value in @as(i8, 127).., [1] {
+        @assert(index == 127)
+        continue
+    }
+    loop value, index in [1, 2], @as(u8, 255).. {
+        @assert(index == 255)
+        break
+    }
+    let empty: []int = []
+    loop index, value in @as(u8, 255).., empty {
+        @panic("empty body ran")
+    }
+}
+
+@[test]
+let reference_pairs: () = {
+    let mut left: []int = [1, 2, 3]
+    let mut right: []int = [4, 5, 6]
+    let snapshot = left
+    loop &a, &b, index in left, right, @as(int, 0).. {
+        a.* += b.*
+        b.* = index
+        if index == 0 {
+            continue
+        }
+        break
+    } else {
+        @panic("break must skip else")
+    }
+    @assert(left[0] == 5)
+    @assert(left[1] == 7)
+    @assert(left[2] == 3)
+    @assert(right[0] == 0)
+    @assert(right[1] == 1)
+    @assert(snapshot[0] == 1)
+    left += [9]
+    right += [8]
+    let readonly: []int = [5, 7, 3, 9]
+    loop &a, &b in left, readonly {
+        @assert(a.* == b.*)
+    }
+}
+
+@[test]
+let control_and_captures: () = {
+    let mut exhausted: int = 0
+    let found = loop value, index in [2, 4, 6], @as(int, 0).. {
+        let read = () -> int {
+            value + index
+        }
+        if index == 0 {
+            @assert(read() == 2)
+            continue
+        }
+        break read()
+    } else {
+        exhausted += 100
+        @as(int, -1)
+    }
+    @assert(found == 5)
+    let empty: []int = []
+    let fallback = loop value, index in empty, 0.. {
+        break value
+    } else {
+        exhausted += 1
+        9
+    }
+    @assert(fallback == 9)
+    loop value, index in [2, 4], 0.. {
+        continue
+    } else {
+        exhausted += 1
+    }
+    @assert(exhausted == 2)
+}

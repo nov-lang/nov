@@ -130,6 +130,7 @@ const Term = struct {
         link: *Term,
         known: Ir.TypeId,
         array: *Term,
+        range: *Term,
         reference: struct { child: *Term, mutable: bool },
         function: Function,
         nominal: Nominal,
@@ -933,7 +934,7 @@ const Solver = struct {
     types: []const ?Ir.TypeId = &.{},
     unsupported: ?Module.Span = null,
     pending_bodies: std.ArrayList(struct { frame: Frame, depth: usize }) = .empty,
-    projections: std.ArrayList(struct { base: *Term, result: *Term, name: ?[]const u8, span: Module.Span }) = .empty,
+    projections: std.ArrayList(struct { base: *Term, result: *Term, name: ?[]const u8, span: Module.Span, iteration: bool = false }) = .empty,
     parameters: []const *Term = &.{},
     defaults: std.ArrayList(struct { term: *Term, ty: Ir.TypeId }) = .empty,
     float_defaults_only: bool = false,
@@ -964,7 +965,9 @@ const Solver = struct {
                     i += 1;
                     continue;
                 }
-                const value = if (projection.name) |name|
+                const value = if (projection.iteration)
+                    try self.iterationElement(projection.base, projection.span)
+                else if (projection.name) |name|
                     try self.fieldType(projection.base, name, projection.span, 0)
                 else if (root(projection.base).value == .reference)
                     root(projection.base).value.reference.child
@@ -1015,7 +1018,7 @@ const Solver = struct {
             .known => |ty| if (self.ir.getType(ty).? != .float) {
                 value.value = .unknown;
             },
-            .array => |element| self.retainFloatDefaults(element, depth + 1),
+            .array, .range => |element| self.retainFloatDefaults(element, depth + 1),
             .reference => |reference| self.retainFloatDefaults(reference.child, depth + 1),
             .nominal => |n| for (n.args) |arg| {
                 self.retainFloatDefaults(arg, depth + 1);
@@ -1039,6 +1042,10 @@ const Solver = struct {
             },
             .array => |element| switch (self.ir.getType(ty).?) {
                 .array => |fallback| try self.defaultTerm(element, fallback, depth + 1),
+                else => {},
+            },
+            .range => |element| switch (self.ir.getType(ty).?) {
+                .range => |fallback| try self.defaultTerm(element, fallback, depth + 1),
                 else => {},
             },
             .reference => |reference| switch (self.ir.getType(ty).?) {
@@ -1105,7 +1112,7 @@ const Solver = struct {
             .unknown, .never => false,
             .link => unreachable,
             .known => true,
-            .array => |element| resolved(element, depth + 1),
+            .array, .range => |element| resolved(element, depth + 1),
             .reference => |reference| resolved(reference.child, depth + 1),
             .function => |f| blk: {
                 for (f.params) |param| if (!resolved(param, depth + 1)) break :blk false;
@@ -1150,6 +1157,7 @@ const Solver = struct {
         }
         return switch (self.ir.getType(ty).?) {
             .array => |element| self.term(.{ .array = try self.fromType(element, span, depth + 1) }, span),
+            .range => |element| self.term(.{ .range = try self.fromType(element, span, depth + 1) }, span),
             .reference => |reference| self.term(.{ .reference = .{ .child = try self.fromType(reference.child, span, depth + 1), .mutable = reference.mutable } }, span),
             .function => |f| blk: {
                 const params = try self.allocator.alloc(*Term, f.params.len);
@@ -1171,7 +1179,7 @@ const Solver = struct {
         const r = root(in);
         if (t == r or depth >= max_depth) return true;
         return switch (r.value) {
-            .array => |element| occurs(t, element, depth + 1),
+            .array, .range => |element| occurs(t, element, depth + 1),
             .reference => |reference| occurs(t, reference.child, depth + 1),
             .function => |f| blk: {
                 for (f.params) |p| if (occurs(t, p, depth + 1)) break :blk true;
@@ -1211,6 +1219,7 @@ const Solver = struct {
         if (std.meta.activeTag(x.value) == std.meta.activeTag(y.value)) switch (x.value) {
             .known => |ty| if (ty == y.value.known) return,
             .array => |element| return self.unify(element, y.value.array, span, depth + 1),
+            .range => |element| return self.unify(element, y.value.range, span, depth + 1),
             .reference => |reference| {
                 if (reference.mutable == y.value.reference.mutable) return self.unify(reference.child, y.value.reference.child, span, depth + 1);
             },
@@ -1599,6 +1608,112 @@ const Solver = struct {
         return self.term(.unknown, span);
     }
 
+    fn rangeSource(self: *Solver, frame: *Frame, node: Ast.Node.Index, depth: usize) Ir.BuildError!*Term {
+        const module = frame.ref.module;
+        const ast = &module.source.ast;
+        const data = ast.nodes.items(.data)[node];
+        const span = module.tokenSpan(ast.firstToken(node));
+        const element = try self.term(.unknown, span);
+        var literals = true;
+        var negative = false;
+        for ([_]Ast.Node.Index{ data.lhs, data.rhs }) |bound| {
+            if (bound == 0) continue;
+            const negated = ast.nodes.items(.tag)[bound] == .negation;
+            const literal = if (negated) ast.nodes.items(.data)[bound].rhs else bound;
+            if (ast.nodes.items(.tag)[literal] != .number_literal) {
+                literals = false;
+                continue;
+            }
+            switch (std.zig.parseNumberLiteral(ast.tokenSlice(ast.firstToken(literal)))) {
+                .int => |value| negative = negative or (negated and value != 0),
+                .big_int => negative = negative or negated,
+                else => literals = false,
+            }
+        }
+        // Range literal fallback precedes ordinary integer literal defaults,
+        // but still yields to every exact body or signature constraint.
+        if (literals) try self.defaults.append(self.allocator, .{ .term = element, .ty = try self.ir.internType(.{ .integer = .{ .signedness = if (negative) .signed else .unsigned, .bits = Ir.native_pointer_bits } }) });
+        const start = try self.expression(frame, data.lhs, depth + 1);
+        if (root(start).value == .never) return start;
+        try self.unify(element, start, span, 0);
+        if (data.rhs != 0) {
+            const end = try self.expression(frame, data.rhs, depth + 1);
+            if (root(end).value == .never) return end;
+            try self.unify(element, end, span, 0);
+        }
+        return self.term(.{ .range = element }, span);
+    }
+
+    fn iterationElement(self: *Solver, value: *Term, span: Module.Span) Ir.BuildError!*Term {
+        return switch (root(value).value) {
+            .array, .range => |element| element,
+            .known => |ty| if (self.ir.getType(ty).? == .string)
+                self.fromType(try self.ir.internType(.rune), span, 0)
+            else
+                self.term(.unknown, span),
+            .unknown => element: {
+                const element = try self.term(.unknown, span);
+                try self.projections.append(self.allocator, .{ .base = value, .result = element, .name = null, .span = span, .iteration = true });
+                break :element element;
+            },
+            else => self.term(.unknown, span),
+        };
+    }
+
+    fn iterationExpression(self: *Solver, frame: *Frame, node: Ast.Node.Index, depth: usize) Ir.BuildError!*Term {
+        const module = frame.ref.module;
+        const ast = &module.source.ast;
+        const span = module.tokenSpan(ast.firstToken(node));
+        const loop = ast.fullRange(node).?;
+        const sources = ast.iterationSources(node);
+        const bindings = ast.iterationBindings(node);
+        const values = try self.allocator.alloc(*Term, sources.len);
+        // Sources execute in the enclosing lexical and control scopes. In
+        // particular, a terminal prefix must not constrain later sources.
+        for (sources, values) |source, *value| {
+            value.* = if (ast.nodes.items(.tag)[source] == .range)
+                try self.rangeSource(frame, source, depth + 1)
+            else
+                try self.expression(frame, source, depth + 1);
+            if (root(value.*).value == .never) return value.*;
+        }
+        const scope = frame.locals.items.len;
+        defer frame.locals.shrinkRetainingCapacity(scope);
+        const unit = try self.fromType(try self.ir.internType(.void), span, 0);
+        var context: Loop = .{ .result = try self.term(.unknown, span), .allows_value = loop.else_expr != 0 };
+        if (!context.allows_value) try self.unify(context.result, unit, span, 0);
+        const parent = frame.loop;
+        frame.loop = &context;
+        defer frame.loop = parent;
+        for (bindings, sources, values) |binding, source, value| {
+            const by_ref = ast.nodes.items(.tag)[binding] == .ref_of;
+            const capture = if (by_ref) ast.nodes.items(.data)[binding].rhs else binding;
+            const element = try self.iterationElement(value, span);
+            var mutable = false;
+            if (by_ref and ast.nodes.items(.tag)[source] == .identifier) {
+                const name = ast.tokenSlice(ast.firstToken(source));
+                // Consult only owners, never bindings introduced by this zip.
+                for (frame.locals.items[0..scope]) |local| {
+                    if (std.mem.eql(u8, local.name, name)) mutable = local.mutable;
+                }
+            }
+            const term_value = if (by_ref)
+                try self.term(.{ .reference = .{ .child = element, .mutable = mutable } }, span)
+            else
+                element;
+            try frame.locals.append(self.allocator, .{ .name = ast.tokenSlice(ast.firstToken(capture)), .term = term_value });
+        }
+        try self.unify(try self.expression(frame, loop.body, depth + 1), unit, span, 0);
+        frame.locals.shrinkRetainingCapacity(scope);
+        frame.loop = parent;
+        if (loop.else_expr != 0) {
+            const exhaustion = try self.expression(frame, loop.else_expr, depth + 1);
+            try self.unify(context.result, exhaustion, span, 0);
+            if (root(exhaustion).value == .never and !context.has_break) return exhaustion;
+        }
+        return context.result;
+    }
+
     fn loopExpression(self: *Solver, frame: *Frame, node: Ast.Node.Index, depth: usize) Ir.BuildError!*Term {
         const module = frame.ref.module;
         const ast = &module.source.ast;
@@ -1858,6 +1973,14 @@ const Solver = struct {
                 return self.term(.never, span);
             },
             .loop_condition, .loop_cont, .loop_else => return self.loopExpression(frame, node, depth + 1),
+            .loop_range => return self.iterationExpression(frame, node, depth + 1),
+            .range => {
+                if (data.rhs == 0) {
+                    self.unsupported = self.unsupported orelse span;
+                    return self.term(.unknown, span);
+                }
+                return self.rangeSource(frame, node, depth + 1);
+            },
             .function_expr => return self.closure(frame, data.lhs, data.rhs, depth + 1),
             .call, .call_one, .function_pipe => {
                 const pipe_args = [_]Ast.Node.Index{data.lhs};
@@ -1945,6 +2068,11 @@ const Solver = struct {
                     break :blk null;
                 }
                 break :blk try self.ir.internType(.{ .array = ty });
+            },
+            .range => |element| blk: {
+                const ty = (try self.materialize(element, depth + 1)) orelse break :blk null;
+                if (self.ir.getType(ty).? != .integer) break :blk null;
+                break :blk try self.ir.internType(.{ .range = ty });
             },
             .function => |f| blk: {
                 const params = try self.allocator.alloc(Ir.TypeId, f.params.len);
@@ -3527,6 +3655,80 @@ test "inferred closures infer mutable capture assignments without callback conte
 test "inferred closures concrete signatures callback-first references defaults captures and OOM" {
     try testInferredClosureSignatures(std.testing.allocator);
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testInferredClosureSignatures, .{});
+}
+
+fn testZipInference(allocator: std.mem.Allocator, source: []const u8, result_type: Ir.Type) !void {
+    var module = try Module.init(allocator, "zip-inference.nov", source);
+    defer module.deinit();
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    ir.source_len = @intCast(source.len);
+    const declarations = module.declarations.items.len;
+    defer std.debug.assert(module.declarations.items.len == declarations);
+    defer std.debug.assert(ir.functions.items.len == 0);
+    defer std.debug.assert(ir.local_generic_instances.items.len == 0);
+    if (module.source.ast.errors.len != 0) std.debug.print("zip parse: {s}\n{any}\n", .{ source, module.source.ast.errors });
+    try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
+    const ref: Ref = .{ .module = &module, .id = module.lookup("f").? };
+    const inferred = (try inferClosure(&module, &ir, ref, null, ref.span())).?;
+    try std.testing.expectEqual(try ir.internType(result_type), ir.getType(inferred).?.function.result);
+    try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+    const apply: Ref = .{ .module = &module, .id = module.lookup("apply").? };
+    const args = [_]Argument{.{ .ty = null, .span = ref.span(), .template = ref }};
+    const diagnostics = module.diagnostics.items.len;
+    _ = try probeResult(&module, &ir, apply, &args, apply.span());
+    try std.testing.expectEqual(try ir.internType(result_type), (try probeDefaultResult(&module, &ir, apply, &args, apply.span())).?);
+    try std.testing.expectEqual(diagnostics, module.diagnostics.items.len);
+}
+
+test "zip solver inferred closure returns sources references indices and readonly OOM" {
+    const uint: Ir.Type = .{ .integer = .{ .signedness = .unsigned, .bits = Ir.native_pointer_bits } };
+    const int: Ir.Type = .{ .integer = .{ .signedness = .signed, .bits = Ir.native_pointer_bits } };
+    for ([_]struct { source: []const u8, result: Ir.Type }{
+        .{ .source = "let f=(){loop a,b in [true],[false] {return b}\ntrue}", .result = .boolean },
+        .{ .source = "let f=(){loop a,b,i in \"é\",\"😀\",0.. {break b} else {'x'}}", .result = .rune },
+        .{ .source = "let f=(){loop a,i in [true],0.. {break i} else {0}}", .result = uint },
+        .{ .source = "let f=(){loop i,a in -1..,[true] {break i} else {0}}", .result = int },
+        .{ .source = "let f=(){let r=0..=2\nloop a,i in [true],r {break i} else {0}}", .result = uint },
+        .{ .source = "let f=(){let mut a=[true]\nlet b=[false]\nloop &x,&y,i in a,b,0.. {let write:(p:&mut bool)={}\nwrite(x)\nlet read:(p:&bool)->bool=p.*\nbreak read(y)} else {true}}", .result = .boolean },
+        .{ .source = "let f=(){loop {loop a,b in [true],[false] {} else {break true}}}", .result = .boolean },
+        .{ .source = "let f=(){loop a,b in {return true\n[false]},missing {let bad:bool=1\n}\nfalse}", .result = .boolean },
+        .{ .source = "let f=(){loop a,b in [true],[false] {return true} else {return false}\nmissing}", .result = .boolean },
+        .{ .source = "let f=(){let a=true\nloop a,b in [false],[true] {} else {a}}", .result = .boolean },
+        .{ .source = "let f=(){let source=(){\"é\"}\nloop a,b in source(),[true] {break a} else {'x'}}", .result = .rune },
+        .{ .source = "let f=(){loop {loop a,b in {break true},missing {}}}", .result = .boolean },
+        .{ .source = "let f=(){loop a in \"é\" {break a} else {'x'}}", .result = .rune },
+        .{ .source = "let f=(){loop a,b in 0..2,0..=1 {break a} else {0}}", .result = uint },
+        .{ .source = "let f=(){let start:u8=1\nloop a,i in [true],start.. {break i} else {0}}", .result = .{ .integer = .{ .signedness = .unsigned, .bits = 8 } } },
+        .{ .source = "let both:(f:(`T)->`U,g:()->`T)->`U=f(g())\nlet f=(){both((s){loop r,b in s,[true] {break r} else {'x'}},(){\"é\"})}", .result = .rune },
+    }) |case| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let apply:(f:()->`T)->`T=f()\n{s}", .{case.source});
+        defer std.testing.allocator.free(source);
+        try testZipInference(std.testing.allocator, source, case.result);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testZipInference, .{ source, case.result });
+    }
+}
+
+fn testZipGenericArrays(allocator: std.mem.Allocator) !void {
+    const source =
+        \\let first:(a:[]`T,b:[]`U,f:(`T,`U)->`V,fallback:`V)->`V=loop x,y,i in a,b,0.. {break f(x,y)} else {fallback}
+        \\let main:()={let result=first([true],["é"],(x,y){loop r,i in y,0.. {return x}
+        \\false},false)
+        \\let exact:bool=result
+        \\}
+    ;
+    var module = try Module.init(allocator, "zip-generic.nov", source);
+    defer module.deinit();
+    var sema = try Lowering.lower(&module);
+    defer sema.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+}
+
+test "zip solver generic arrays and callback body results under OOM" {
+    try testZipGenericArrays(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testZipGenericArrays, .{});
 }
 
 test "backtick contextual imported public aliases retain private template provenance and visibility under OOM" {
