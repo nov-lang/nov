@@ -105,6 +105,67 @@ fn tableIndex(module: *const Module, id: Module.DeclId) usize {
     return @backingInt(id);
 }
 
+/// Reuse concrete read-only result probes before asking the constraint solver
+/// to inspect a body. The checked lowering walk still validates every operation.
+pub fn inferClosureType(module: *Module, ir: *Ir, ref: GenericFunctions.Ref, expected: ?Ir.TypeId, span: Module.Span) Error!?Ir.TypeId {
+    if (module.closure_inference_depth >= max_recursive_depth) {
+        try module.diagnostics.append(module.allocator, .{ .tag = .generic_function_limit, .span = span });
+        return null;
+    }
+    for (module.closure_inference_stack[0..module.closure_inference_depth]) |proto| if (proto == ref.local.?.proto) {
+        try module.diagnostics.append(module.allocator, .{ .tag = .generic_function_ambiguous, .span = span });
+        return null;
+    };
+    module.closure_inference_stack[module.closure_inference_depth] = ref.local.?.proto;
+    module.closure_inference_depth += 1;
+    defer module.closure_inference_depth -= 1;
+    var descriptor = ref.local.?.*;
+    var query_ref = ref;
+    query_ref.local = &descriptor;
+    var concrete = expected;
+    if (concrete == null) probe_result: {
+        const ast = &module.source.ast;
+        const proto = ast.fullFnProto(descriptor.proto).?;
+        if (!proto.ast.infer_result) break :probe_result;
+        var iterator = proto.iterate(ast);
+        while (iterator.next()) |param| if (param.inferred) break :probe_result;
+        // Explicit returns contribute constraints independently of the final
+        // expression, so leave those signatures to the solver.
+        if (descriptor.body == 0) break :probe_result;
+        for (ast.tokens.items(.tag)[ast.firstToken(descriptor.body) .. ast.lastToken(descriptor.body) + 1]) |tag| if (tag == .keyword_return) break :probe_result;
+        var arena = std.heap.ArenaAllocator.init(module.allocator);
+        defer arena.deinit();
+        var context: Context = .{ .module = module, .ir = ir, .types = ref.types, .template_allocator = arena.allocator(), .container = descriptor.container, .concrete_type = descriptor.concrete_type, .function_bindings = descriptor.outer_bindings, .type_captures = descriptor.captures, .probing = true, .return_type = .{ .ty = try ir.internType(.void) } };
+        defer context.bindings.deinit(module.allocator);
+        defer context.locals.deinit(module.allocator);
+        const start = module.diagnostics.items.len;
+        defer module.diagnostics.shrinkRetainingCapacity(start);
+        var params: std.ArrayList(Ir.TypeId) = .empty;
+        defer params.deinit(module.allocator);
+        iterator = proto.iterate(ast);
+        while (iterator.next()) |param| {
+            const ty = (try context.resolveType(param.type_expr)) orelse break :probe_result;
+            if (ir.getType(ty).? == .void) break :probe_result;
+            try params.append(module.allocator, ty);
+            if (param.name_token) |token| try context.bindParameter(ast.tokenSlice(token), @intCast(params.items.len - 1), .{ .ty = ty }, module.tokenSpan(token));
+        }
+        for (descriptor.captures) |capture| {
+            var template: ?*Template = null;
+            if (capture.template) |captured| if (captured.local) |local| {
+                const copy = try arena.allocator().create(Template);
+                copy.* = .{ .info = local.*, .captures = &.{}, .environment_type = try ir.internType(.void) };
+                template = copy;
+            };
+            try context.bindings.put(module.allocator, capture.name, .{ .known = .{ .ty = capture.ty }, .name_span = span, .mutable = capture.mutable, .template = template });
+        }
+        const result = (try context.probe(descriptor.body, 0)) orelse (try context.probeDefault(descriptor.body, 0)) orelse break :probe_result;
+        if (ir.getType(result.ty).? == .reference) break :probe_result;
+        concrete = try ir.internType(.{ .function = .{ .params = params.items, .result = result.ty } });
+    }
+    if (concrete != null) descriptor.body = 0;
+    return GenericFunctions.inferClosure(module, ir, query_ref, concrete, span);
+}
+
 const Emitter = struct {
     const IterationCall = struct { owner_slot: Ir.ValueId, call_span: Ir.Span, origin: Ir.Span };
 
@@ -584,7 +645,11 @@ const Context = struct {
             const template = (try self.createTemplate(node, proto_node, body_node)) orelse return null;
             return self.genericValue(node, .{ .module = self.module, .local = &template.info }, expected);
         }
-        const ty = (try self.resolveType(function.proto.ast.proto_node)) orelse return null;
+        const ty = (if (TypeResolver.hasInferredSignature(ast, proto_node)) blk: {
+            const template = try self.templateDescriptor(proto_node, body_node);
+            break :blk try inferClosureType(self.module, self.ir, self.inferenceReference(.{ .module = self.module, .local = &template.info }), if (expected) |want| want.ty else null, self.span(node));
+        } else try self.resolveType(function.proto.ast.proto_node)) orelse return null;
+        if (self.ir.getType(self.ir.getType(ty).?.function.result).? == .reference) return self.fail(.borrow_escape, node, null);
         if (try self.fit(ty, expected, node) == null) return null;
         // Pool growth while checking nested bodies must not invalidate signatures.
         const signature = self.ir.getType(ty).?.function;
@@ -1139,7 +1204,7 @@ const Context = struct {
             } else if (i + 1 == block.ast.statements.len) {
                 // Descriptors borrow the enclosing query arena, not this scope's
                 // temporary binding table, so nested callback queries can use them.
-                return (try self.genericTarget(statement)) orelse try self.probeBlockTemplate(statement, depth + 1);
+                return (try self.genericTarget(statement)) orelse (try self.inferredClosureTarget(statement)) orelse try self.probeBlockTemplate(statement, depth + 1);
             }
         }
         return null;
@@ -1321,6 +1386,7 @@ const Context = struct {
             const declaration = self.getDeclaration(id);
             if (declaration.is_type_alias or declaration.is_generic or declaration.is_namespace) break :blk null;
             const function = owner.source.ast.declFunction(declaration.node) orelse break :blk null;
+            if (TypeResolver.hasInferredSignature(&owner.source.ast, function.proto_node)) break :blk try TypeResolver.resolveFunction(owner, self.ir, self.inferenceReference(.{ .module = owner, .id = self.localId(id) }));
             break :blk try TypeResolver.resolveInScopeReadOnly(owner, self.ir, function.proto_node, declaration.container, declaration.concrete_type, declaration.function_bindings);
         } else if (self.sema) |analysis| try analysis.requestType(owner, self.localId(id)) else if (@backingInt(id) < self.types.len) self.types[@backingInt(id)] else null) orelse return null;
         const full = owner.source.ast.decl(self.getDeclaration(id).node);
@@ -1727,6 +1793,15 @@ const Context = struct {
         return !flow.unknown and !flow.live;
     }
 
+    fn inferredClosureTarget(self: *Context, node: Ast.Node.Index) Error!?GenericFunctions.Ref {
+        const ast = &self.module.source.ast;
+        if (ast.nodes.items(.tag)[node] != .function_expr) return null;
+        const data = ast.nodes.items(.data)[node];
+        if (!TypeResolver.hasInferredSignature(ast, data.lhs)) return null;
+        const descriptor = try self.templateDescriptor(data.lhs, data.rhs);
+        return self.inferenceReference(.{ .module = self.module, .local = &descriptor.info });
+    }
+
     fn genericArgument(self: *Context, node: Ast.Node.Index, defaults: bool, depth: usize) Error!GenericFunctions.Argument {
         const was_probing = self.probing;
         const was_defaulting = self.defaulting;
@@ -1735,8 +1810,9 @@ const Context = struct {
         defer self.probing = was_probing;
         defer self.defaulting = was_defaulting;
         const terminal = try self.argumentTerminates(node, depth + 1);
-        const known = if (terminal) null else try self.probe(node, depth + 1);
-        const template = if (terminal) null else (try self.genericTarget(node)) orelse (if (known == null) try self.probeBlockTemplate(node, depth + 1) else null);
+        const inferred = if (terminal) null else (try self.inferredClosureTarget(node)) orelse try self.probeBlockTemplate(node, depth + 1);
+        const known = if (terminal or inferred != null) null else try self.probe(node, depth + 1);
+        const template = inferred orelse if (terminal) null else try self.genericTarget(node);
         // Nondefaulting queries cannot use this candidate. Recursively building
         // it anyway makes nested generic calls repeat both query modes at every
         // level, turning an otherwise linear concrete probe into exponential work.
@@ -1892,6 +1968,21 @@ const Context = struct {
         const ty = (try self.expression(node, expected, depth)) orelse return null;
         if (!self.terminated) try self.copyNode(node, ty);
         return ty;
+    }
+
+    fn inferredClosureCall(self: *Context, node: Ast.Node.Index, call: Ast.full.Call, ref: GenericFunctions.Ref, expected: ?Known, depth: usize) Error!?Ir.TypeId {
+        const args = try self.genericArguments(call, null, true, depth);
+        defer self.module.allocator.free(args);
+        const ty = (try GenericFunctions.inferClosureCall(self.module, self.ir, self.inferenceReference(ref), args, if (expected) |want| .{ .ty = want.ty, .span = want.annotation orelse self.irSpan(node) } else null, self.irSpan(node))) orelse return null;
+        // Inference is read-only; ordinary closure checking captures and emits
+        // the callee before evaluating any runtime argument.
+        if (try self.expression(call.ast.fn_expr, .{ .ty = ty }, depth + 1) == null) return null;
+        const function = self.ir.getType(ty).?.function;
+        for (call.ast.args, function.params) |arg, param| {
+            if (try self.callArgument(arg, .{ .ty = param, .annotation = ref.span() }, depth + 1) == null) return null;
+            if (self.terminated) return if (expected) |want| want.ty else function.result;
+        }
+        return self.finishCall(node, call.ast.fn_expr, function.result, expected);
     }
 
     fn genericCall(self: *Context, node: Ast.Node.Index, call: Ast.full.Call, reference: GenericFunctions.Ref, expected: ?Known, depth: usize) Error!?Ir.TypeId {
@@ -2477,8 +2568,11 @@ const Context = struct {
         const data = ast.nodes.items(.data)[node];
         return switch (ast.nodes.items(.tag)[node]) {
             .function_expr => blk: {
-                if (self.hasUnboundSignatureVariables(ast.nodes.items(.data)[node].lhs)) break :blk null;
-                const ty = (try self.resolveType(ast.nodes.items(.data)[node].lhs)) orelse break :blk null;
+                if (self.hasUnboundSignatureVariables(data.lhs)) break :blk null;
+                const ty = (if (TypeResolver.hasInferredSignature(ast, data.lhs)) inner: {
+                    const template = try self.templateDescriptor(data.lhs, data.rhs);
+                    break :inner try inferClosureType(self.module, self.ir, self.inferenceReference(.{ .module = self.module, .local = &template.info }), null, self.span(node));
+                } else try self.resolveType(data.lhs)) orelse break :blk null;
                 break :blk .{ .ty = ty };
             },
             .identifier => blk: {
@@ -2589,7 +2683,7 @@ const Context = struct {
                 break :blk null;
             },
             .function_pipe => blk: {
-                if (try self.genericTarget(data.rhs)) |ref| {
+                if ((try self.genericTarget(data.rhs)) orelse (try self.inferredClosureTarget(data.rhs))) |ref| {
                     if (ref.local == null and ref.module.getDeclaration(ref.id).?.noreturn) break :blk null;
                     const args = [_]Ast.Node.Index{data.lhs};
                     const call: Ast.full.Call = .{ .ast = .{ .fn_expr = data.rhs, .args = &args, .lparen = ast.nodes.items(.main_token)[node] } };
@@ -2606,7 +2700,7 @@ const Context = struct {
             },
             .call, .call_one => blk: {
                 const call = ast.fullCall(node).?;
-                if (try self.genericTarget(call.ast.fn_expr)) |ref| {
+                if ((try self.genericTarget(call.ast.fn_expr)) orelse (try self.inferredClosureTarget(call.ast.fn_expr))) |ref| {
                     if (ref.local == null and ref.module.getDeclaration(ref.id).?.noreturn) break :blk null;
                     const start = self.module.diagnostics.items.len;
                     defer self.module.diagnostics.shrinkRetainingCapacity(start);
@@ -3777,6 +3871,11 @@ const Context = struct {
                     const call: Ast.full.Call = .{ .ast = .{ .fn_expr = data.rhs, .args = &args, .lparen = ast.nodes.items(.main_token)[node] } };
                     return self.genericCall(node, call, ref, expected, depth);
                 }
+                if (try self.inferredClosureTarget(data.rhs)) |ref| {
+                    const args = [_]Ast.Node.Index{data.lhs};
+                    const call: Ast.full.Call = .{ .ast = .{ .fn_expr = data.rhs, .args = &args, .lparen = ast.nodes.items(.main_token)[node] } };
+                    return self.inferredClosureCall(node, call, ref, expected, depth);
+                }
                 const unit = try self.ir.internType(.void);
                 if (self.printing(data.rhs) != null) {
                     const arg = (try self.printExpression(data.lhs, depth + 1)) orelse return null;
@@ -4178,6 +4277,7 @@ const Context = struct {
                     return self.fail(.not_a_value, node, null);
                 }
                 if (try self.genericTarget(call.ast.fn_expr)) |ref| return self.genericCall(node, call, ref, expected, depth);
+                if (try self.inferredClosureTarget(call.ast.fn_expr)) |ref| return self.inferredClosureCall(node, call, ref, expected, depth);
                 if (self.isAscription(call.ast.fn_expr)) {
                     if (call.ast.args.len != 2) return self.fail(.argument_count_mismatch, node, null);
                     const ascribed = (try self.ascribedType(call)) orelse return null;
@@ -4389,6 +4489,178 @@ test "float bodies defaults contextual literals control flow mutations and print
         negative_zero = negative_zero or constant.value.float_bits == 0x80000000;
     }
     try std.testing.expect(rounded and negative_zero);
+}
+
+test "inferred closure callees connect arguments and result before lowering" {
+    const source =
+        \\let main:()={
+        \\let n:int=(x){x}(1)
+        \\let narrow:u8=(x){x}(1)
+        \\let inferred=(x){x}(1)
+        \\let exact:int=inferred
+        \\let sum:int=(left,right){left+right}(1,2)
+        \\let piped:u8=1 |> (x){x}
+        \\let mut source:int=4
+        \\let read:int=(view){view.*}(&source)
+        \\let offset:int=5
+        \\let captured:int=(x){x+offset}(read)
+        \\let piped_capture:int=read |> (x){x+offset}
+        \\let piped_reference:int=&source |> (view){view.*}
+        \\let nested=(x){x}((y){y}(read))
+        \\let nested_exact:int=nested
+        \\let callback:int=(value,f){f(value)}(read,(x){x+offset})
+        \\let mut base:int=1
+        \\let ordered:int=(x){base+x}({base=2
+        \\1})
+        \\}
+    ;
+    var module = try Module.init(std.testing.allocator, "inferred-callees.nov", source);
+    defer module.deinit();
+    for (module.source.ast.errors) |issue| std.debug.print("inferred callee parse: {any} at {s}\n", .{ issue, module.source.ast.tokenSlice(issue.token) });
+    if (module.hasErrors()) std.debug.print("inferred callee initial diagnostics: {any}\n", .{module.diagnostics.items});
+    var sema = try Lowering.lower(&module);
+    defer sema.deinit();
+    if (module.hasErrors()) std.debug.print("inferred callee diagnostics: {any}\n", .{module.diagnostics.items});
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+    try std.testing.expectEqual(@as(usize, 0), sema.ir.local_generic_instances.items.len);
+    try std.testing.expectEqual(@as(usize, 1), module.declarations.items.len);
+    for (sema.ir.functions.items) |function| {
+        try std.testing.expect(function.environment_layout == null);
+        for (function.body.?.instructions) |instruction| switch (instruction.op) {
+            .closure_specialize => return error.TestUnexpectedResult,
+            else => {},
+        };
+    }
+    const main = sema.entries[@backingInt(module.lookup("main").?)].function.?;
+    const instructions = sema.ir.getFunction(main).?.body.?.instructions;
+    var closure_before_write = false;
+    var saw_write = false;
+    var saw_ordered_call = false;
+    for (instructions) |instruction| switch (instruction.op) {
+        .closure_init => closure_before_write = true,
+        .local_store => if (closure_before_write) {
+            saw_write = true;
+        },
+        .call => if (saw_write) {
+            saw_ordered_call = true;
+        },
+        else => {},
+    };
+    try std.testing.expect(saw_ordered_call);
+}
+
+test "inferred closure callees preserve reference capture restrictions" {
+    var module = try Module.init(std.testing.allocator, "inferred-callee-reference.nov", "let main:()={let mut source:int=1\nlet view=&source\nlet n:int=(x){view.*+x}(1)\n}");
+    defer module.deinit();
+    var sema = try Lowering.lower(&module);
+    defer sema.deinit();
+    try std.testing.expect(module.hasErrors());
+    try std.testing.expect(!sema.lowering_complete);
+    try std.testing.expectEqual(Module.Diagnostic.Tag.unsupported_borrow, module.diagnostics.items[0].tag);
+}
+
+test "inferred closures lower concrete signatures captures and generic callbacks" {
+    const source =
+        \\let apply:(x:`T,f:(`T)->`U)->`U=f(x)
+        \\let literal=(){42}
+        \\let twice=(x:int){x*2}
+        \\let outer:(seed:`T)->()->`T=(){seed}
+        \\let Literal=@TypeOf(literal)
+        \\let main:()={
+        \\let base:int=4
+        \\let captured=(){base+1}
+        \\let a:int=captured()
+        \\let identity:(int)->int=(x){x}
+        \\let b:int=identity(a)
+        \\let c:int=apply(b,(value){value*2})
+        \\let d:int=apply(b,(value:int){value*2})
+        \\let grouped:int=apply(b,{let amount:int=2
+        \\(value){value*amount}})
+        \\let e:int=literal()
+        \\let f:int=twice(e)
+        \\let nested=outer(f)
+        \\let g:int=nested()
+        \\}
+    ;
+    var module = try Module.init(std.testing.allocator, "inferred-closures.nov", source);
+    defer module.deinit();
+    var sema = try Lowering.lower(&module);
+    defer sema.deinit();
+    if (module.hasErrors()) std.debug.print("inferred closures: {any}\n", .{module.diagnostics.items});
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+    const literal = sema.entries[@backingInt(module.lookup("literal").?)].type_id.?;
+    try std.testing.expectEqual(literal, sema.entries[@backingInt(module.lookup("Literal").?)].alias_type.?);
+    try std.testing.expectEqual(try defaultIntegerType(&sema.ir), sema.ir.getType(literal).?.function.result);
+}
+
+test "inferred closures query borrowed captures and outer bindings without publication" {
+    var module = try Module.init(std.testing.allocator, "inferred-query.nov", "let sample:()={let f=(x:`T){x+offset}\n}");
+    defer module.deinit();
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    const integer = try defaultIntegerType(&ir);
+    const ast = &module.source.ast;
+    var expression: Ast.Node.Index = 0;
+    for (ast.nodes.items(.tag), 0..) |tag, index| if (tag == .function_expr) {
+        expression = @intCast(index);
+        break;
+    };
+    try std.testing.expect(expression != 0);
+    const data = ast.nodes.items(.data)[expression];
+    const captures = [_]GenericFunctions.Capture{.{ .name = "offset", .ty = integer, .mutable = true }};
+    const bindings = [_]Module.TypeBinding{.{ .name = "`T", .ty = integer }};
+    const descriptor: GenericFunctions.LocalTemplate = .{ .proto = data.lhs, .body = data.rhs, .captures = &captures, .outer_bindings = &bindings };
+    const declarations = module.declarations.items.len;
+    const signature = (try inferClosureType(&module, &ir, .{ .module = &module, .local = &descriptor }, null, module.tokenSpan(ast.firstToken(expression)))).?;
+    try std.testing.expectEqual(integer, ir.getType(signature).?.function.params[0]);
+    try std.testing.expectEqual(integer, ir.getType(signature).?.function.result);
+    try std.testing.expectEqual(data.rhs, descriptor.body);
+    try std.testing.expect(captures[0].mutable);
+    try std.testing.expectEqual(declarations, module.declarations.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ir.functions.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ir.local_generic_instances.items.len);
+    try std.testing.expectEqual(@as(usize, 0), module.closure_inference_depth);
+    try std.testing.expect(!module.hasErrors());
+}
+
+fn testInferredClosureAllocations(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "inferred-oom.nov", "let apply:(x:`T,f:(`T)->`U)->`U=f(x)\nlet main:()={let offset:int=2\nlet f=(x:int){x+offset}\nlet y:int=apply(f(1),(v){v*2})\nlet direct=(x){x+offset}(y)\nlet piped:int=direct |> (x){x+offset}\n}");
+    defer module.deinit();
+    var sema = try Lowering.lower(&module);
+    defer sema.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try std.testing.expectEqual(@as(usize, 0), module.closure_inference_depth);
+    try sema.ir.verify();
+}
+
+test "inferred closures clean up read only queries and lowering under OOM" {
+    try testInferredClosureAllocations(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testInferredClosureAllocations, .{});
+}
+
+test "inferred closures reject ambiguity recursion and reference escape" {
+    for ([_][]const u8{
+        "let main:()={let identity=(x){x}\n}",
+        "let identity=(x){x}\nlet main:()={}",
+        "let recursive=(){recursive()}\nlet main:()={}",
+        "let main:()={let mut x:int=1\nlet f=(){&x}\n}",
+        "let main:()={let mut x:int=1\nlet r=&x\nlet f=(){r.*}\n}",
+        "let declared:()={42}",
+    }) |source| {
+        var module = try Module.init(std.testing.allocator, "inferred-errors.nov", source);
+        defer module.deinit();
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        errdefer std.debug.print("inferred negative: {s}\n", .{source});
+        try std.testing.expect(module.hasErrors());
+        try std.testing.expect(!sema.lowering_complete);
+        try std.testing.expect(module.diagnostics.items.len < 16);
+    }
 }
 
 test "float bodies reject conversions integer only operations and deferred match subjects" {

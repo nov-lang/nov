@@ -639,6 +639,32 @@ fn parsePrimaryExpr(self: *Parser, allow_block_label: bool) Error!Node.Index {
         .l_paren => {
             const proto = try self.parseFnProto();
             if (self.token_tags[self.tok_i] != .l_brace) return proto;
+            // Only a body makes bare identifiers parameter names rather than types.
+            const proto_data = self.nodes.items(.data)[proto];
+            const one = [_]Node.Index{proto_data.lhs};
+            const params = if (self.nodes.items(.tag)[proto] == .fn_proto_one)
+                one[0..@intFromBool(proto_data.lhs != 0)]
+            else blk: {
+                const span = self.extra_data.items[proto_data.lhs..][0..2];
+                break :blk self.extra_data.items[span[0]..span[1]];
+            };
+            for (params) |param| {
+                const token = self.nodes.items(.main_token)[param];
+                if (self.nodes.items(.tag)[param] == .identifier and
+                    self.token_tags[token - 1] != .colon)
+                {
+                    self.nodes.items(.tag)[param] = .inferred_type;
+                    self.nodes.items(.data)[param] = .{ .lhs = 0, .rhs = 0 };
+                }
+            }
+            if (proto_data.rhs == 0) {
+                const result = try self.addNode(.{
+                    .tag = .inferred_type,
+                    .main_token = self.tok_i - 1,
+                    .data = .{ .lhs = 0, .rhs = 0 },
+                });
+                self.nodes.items(.data)[proto].rhs = result;
+            }
             const body = try self.parseBlock();
             const function = try self.addNode(.{ .tag = .function_expr, .main_token = self.nodes.items(.main_token)[proto], .data = .{ .lhs = proto, .rhs = body } });
             return self.parseSuffixFrom(function);
@@ -1959,6 +1985,68 @@ fn testParseAllocationFailures(allocator: Allocator, source: [:0]const u8) !void
     defer ast.deinit(allocator);
     try std.testing.expectEqual(Token.Tag.eof, ast.tokens.items(.tag)[ast.tokens.len - 1]);
     try std.testing.expectEqual(source.len, ast.tokens.items(.start)[ast.lastToken(0)]);
+}
+
+test "inferred closures preserve markers grammar source bounds and OOM" {
+    const source = "let f=(x, y:int){x+y}\nlet g=(x)->int{x*2}\nlet h=(x:&int){x}\nlet z=(){@print(1)\n}\nlet t=(Name)->Name\nlet d:(x:int)={}\nlet nested=(x){(y){x+y}}\nlet text=\"{map((x){\"{x}\"})}\"";
+    var ast = try parse(std.testing.allocator, source);
+    defer ast.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    const roots = ast.rootDecls();
+    for (roots[0..4], 0..) |root, i| {
+        const node = ast.decl(root).ast.init_node;
+        const closure = ast.functionExpr(node).?;
+        try std.testing.expectEqual(i != 1, closure.proto.ast.infer_result);
+        const result = ast.nodes.items(.data)[closure.proto.ast.proto_node].rhs;
+        try std.testing.expect(result != 0);
+        if (i != 1) {
+            try std.testing.expect(closure.proto.ast.return_type == null);
+            try std.testing.expectEqual(Node.Tag.inferred_type, ast.nodes.items(.tag)[result]);
+            try std.testing.expectEqualStrings(")", ast.tokenSlice(ast.firstToken(result)));
+            try std.testing.expectEqual(ast.firstToken(result), ast.lastToken(result));
+            try std.testing.expect(ast.lastToken(closure.proto.ast.proto_node) < ast.firstToken(closure.body));
+        }
+        try std.testing.expectEqualStrings("(", ast.tokenSlice(ast.firstToken(node)));
+        try std.testing.expectEqualStrings("}", ast.tokenSlice(ast.lastToken(node)));
+        var iterator = closure.proto.iterate(&ast);
+        if (i != 3) {
+            const param = iterator.next().?;
+            try std.testing.expectEqual(i < 2, param.inferred);
+            try std.testing.expectEqualStrings("x", ast.tokenSlice(param.name_token.?));
+            try std.testing.expect(param.type_expr != 0);
+            if (param.inferred) {
+                try std.testing.expectEqual(Node.Tag.inferred_type, ast.nodes.items(.tag)[param.type_expr]);
+                try std.testing.expectEqual(param.name_token.?, ast.firstToken(param.type_expr));
+                try std.testing.expectEqual(param.name_token.?, ast.lastToken(param.type_expr));
+            }
+        }
+        if (i == 0) try std.testing.expect(!iterator.next().?.inferred);
+        try std.testing.expect(iterator.next() == null);
+    }
+    const type_proto = ast.fullFnProto(ast.decl(roots[4]).ast.init_node).?;
+    try std.testing.expect(!type_proto.ast.infer_result);
+    var types = type_proto.iterate(&ast);
+    const type_param = types.next().?;
+    try std.testing.expect(!type_param.inferred);
+    try std.testing.expect(type_param.name_token == null);
+    try std.testing.expectEqual(Node.Tag.identifier, ast.nodes.items(.tag)[type_param.type_expr]);
+    try std.testing.expect(!ast.fullFnProto(ast.decl(roots[5]).ast.type_node).?.ast.infer_result);
+    for (ast.nodes.items(.tag), 0..) |tag, index| {
+        if (tag == .inferred_type) {
+            const data = ast.nodes.items(.data)[index];
+            try std.testing.expectEqual(@as(Node.Index, 0), data.lhs);
+            try std.testing.expectEqual(@as(Node.Index, 0), data.rhs);
+        }
+        try std.testing.expect(ast.firstToken(@intCast(index)) < ast.tokens.len);
+        try std.testing.expect(ast.lastToken(@intCast(index)) < ast.tokens.len);
+    }
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
+    for ([_][:0]const u8{ "let f=(x){", "let f=(x,y:){x}", "let f=(x){(y){", "let f=(x) x*2" }) |broken| {
+        var recovered = try parse(std.testing.allocator, broken);
+        defer recovered.deinit(std.testing.allocator);
+        try std.testing.expect(recovered.errors.len != 0);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{broken});
+    }
 }
 
 test "generic closures preserve structural signatures local functions and immediate calls under OOM" {

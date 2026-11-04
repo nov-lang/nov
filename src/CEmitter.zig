@@ -3610,6 +3610,127 @@ test "closures snapshots shared escaping cells nested functions and forced GC" {
     for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "/* separate translation unit */\nint nov_test_dummy;\n", 0, "6 4 5 6\n11\n12 13\n1 9 9\n7\n", "", mode);
 }
 
+test "inferred closure generic map filter fold callback first forced GC all modes" {
+    const c = try arrayTestProgram(
+        \\let map:(items:[]`T,f:(`T)->`U)->[]`U={let mut out:[]`U=[]
+        \\ loop item in items {out+=[f(item)]}
+        \\ out}
+        \\let filter:(items:[]`T,f:(`T)->bool)->[]`T={let mut out:[]`T=[]
+        \\ loop item in items {if f(item) {out+=[item]}}
+        \\ out}
+        \\let fold:(items:[]`T,initial:`U,f:(`U,`T)->`U)->`U={let mut acc=initial
+        \\ loop item in items {acc=f(acc,item)}
+        \\ acc}
+        \\let first:(f:(`T)->`U,items:[]`T)->[]`U=map(items,f)
+        \\let main:()={
+        \\ let values:[]int=[1,2,3,4]
+        \\ let doubled=map(values,(x){x*2})
+        \\ let kept=filter(doubled,(x){x>4})
+        \\ @println(doubled,kept,fold(kept,0,(acc,x){acc+x}))
+        \\ @println(first((x){x+1},values))
+        \\ @println(map(values,(x:int){x*3}))
+        \\ @println(map(values,{let offset:int=10
+        \\  (x){x+offset}}))
+        \\}
+    );
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O1", "-O2", "-O3", "-Os" }) |mode|
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "[2, 4, 6, 8] [6, 8] 14\n[2, 3, 4, 5]\n[3, 6, 9, 12]\n[11, 12, 13, 14]\n", "", mode);
+}
+
+test "inferred closure expected signatures mixed parameters default floats results and return all modes" {
+    const c = try arrayTestProgram(
+        \\let apply:(x:`T,f:(`T)->`U)->`U=f(x)
+        \\let literal=(){42}
+        \\let twice=(x:int){x*2}
+        \\let make:()->(int)->int={(x){return x+3}}
+        \\let main:()={
+        \\ let identity:(int)->int=(x){x}
+        \\ let explicit=(x)->int {x+1}
+        \\ let mixed=(x:int,y){x+y}
+        \\ let decimal=(x){x+0.5}
+        \\ let single:(f32)->f32=(x){x*2.0}
+        \\ let early=(x:int){if x>0 {return x*2}
+        \\  return 7}
+        \\ @println(literal(),twice(3),identity(4),explicit(5),mixed(3,4))
+        \\ @println(decimal(1.5),single(1.25),apply(2.5,(x){x*2.0}))
+        \\ @println(make()(4),early(2),early(0))
+        \\ let nothing=(){return}
+        \\ let effect:(int)->void=(x){@println(x)}
+        \\ nothing()
+        \\ effect(9)
+        \\ apply(10,(x){@println(x)})
+        \\}
+    );
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O1", "-O2", "-O3", "-Os" }) |mode|
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "42 6 4 6 7\n2 2.5 5\n7 4 7\n9\n10\n", "", mode);
+}
+
+const inferred_closure_captures_program =
+    \\let apply:(f:(`T)->`U,x:`T)->`U=f(x)
+    \\let invoke:(f:&(int)->int,x:int)->int=f.*(x)
+    \\let make:(seed:int)->(int)->int={let mut count=seed
+    \\ (x){count+=x
+    \\  count}}
+    \\let main:()={
+    \\ let mut values:[]int=[2]
+    \\ let snapshot=values
+    \\ let frozen=(x){snapshot[0]+x}
+    \\ let mut count:int=10
+    \\ let shared:(int)->int=(x){count+=x
+    \\  count}
+    \\ let alias=shared
+    \\ values[0]=10
+    \\ @println(frozen(1),shared(3),alias(4),count,values[0])
+    \\ let counter=make(20)
+    \\ let copy=counter
+    \\ @println(counter(1),copy(2),invoke(&counter,3))
+    \\ let label="old"+"!"
+    \\ let nested=(){(){label}}
+    \\ let inner=nested()
+    \\ @println(inner(),apply((x){label+x},"?"))
+    \\}
+;
+
+test "inferred closure snapshot shared escaping cells reference calls source free GC all modes" {
+    const c = try arrayTestProgram(inferred_closure_captures_program);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O1", "-O2", "-O3", "-Os" }) |mode|
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "3 13 17 17 10\n21 23 26\nold! old!?\n", "", mode);
+    try testClosureOwnership(test_gpa, inferred_closure_captures_program);
+}
+
+test "inferred closure immediate calls pipes references and evaluation order forced GC" {
+    const c = try arrayTestProgram(
+        \\let main:()={
+        \\ let narrow:u8=(x){x}(1)
+        \\ let piped:u8=2 |> (x){x+1}
+        \\ let mut source:int=4
+        \\ let read:int=(view){view.*}(&source)
+        \\ let offset:int=5
+        \\ let callback:int=(value,f){f(value)}(read,(x){x+offset})
+        \\ let mut base:int=1
+        \\ let ordered:int=(x){base+x}({base=2
+        \\ 1})
+        \\ @println(narrow,piped,read,callback,ordered)
+        \\}
+    );
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "1 3 4 9 3\n", "", mode);
+}
+
+test "inferred closure small source free compiler allocation rollback" {
+    const source =
+        \\let apply:(f:(`T)->`U,x:`T)->`U=f(x)
+        \\let main:()={let n:int=3
+        \\ @println(apply((x){x+n},4))}
+    ;
+    try testClosureOwnership(test_gpa, source);
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testClosureOwnership, .{source});
+}
+
 const constructor_shorthand_program =
     \\let Box:(T:type)->type=struct{value:T,}
     \\let Alias=Box([]int)

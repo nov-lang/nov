@@ -14,6 +14,9 @@ const Module = @This();
 allocator: std.mem.Allocator,
 compilation: ?*Compilation = null,
 tests_enabled: bool = false,
+/// Query-local recursion guard; inference never publishes partial signatures.
+closure_inference_depth: usize = 0,
+closure_inference_stack: [128]Ast.Node.Index = @splat(0),
 source: Source,
 declarations: std.ArrayList(Declaration) = .empty,
 diagnostics: std.ArrayList(Diagnostic) = .empty,
@@ -408,7 +411,9 @@ pub fn classifyAliases(self: *Module) std.mem.Allocator.Error!void {
         while (work.pop()) |node| {
             if (self.source.ast.fullFnProto(node)) |proto| {
                 var iterator = proto.iterate(&self.source.ast);
-                while (iterator.next()) |param| try work.append(self.allocator, param.type_expr);
+                while (iterator.next()) |param| {
+                    if (!param.inferred) try work.append(self.allocator, param.type_expr);
+                }
                 if (proto.ast.return_type) |result| try work.append(self.allocator, result);
             } else if (tags[node] == .array_type) {
                 try work.append(self.allocator, data[node].rhs);

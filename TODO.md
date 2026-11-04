@@ -50,6 +50,20 @@ results. See `examples/array-fields.nov`.
 
 ## Current delivered status
 
+Function expressions support inferred parameters and results: `(x) { x * 2 }`
+works in `std.array.map([1, 2, 3], ...)`, with equivalent multi-parameter
+`fold` and expected-function-type contexts. Braces remain mandatory and no `=`
+appears before the body. Typed parameters, mixed signatures and explicit results
+remain supported. Omitted expression results infer from final expressions and
+returns; statement-ended/terminal-only bodies infer `void`. Declaration annotations
+without a result still mean `void`. Immediately invoked closures and pipes combine
+argument and expected-result constraints before numeric fallback. Inference queries
+borrow lexical type metadata without creating capture environments or publishing
+generic methods/specializations. Captures and reference parameters retain their
+existing safety rules. Ambiguous standalone identity closures require annotations
+or explicit backtick generics; recursive inferred results may need annotations.
+Brace-free shorthand is deferred. See `examples/inferred-closures.nov`.
+
 Floats are implemented in the core/source pipeline and C backend. The accepted
 rules are `f32`/`f64`, with native `float` aliasing `f32` on 32-bit targets and
 `f64` on 64-bit targets. Float literals use late context-first native `float`

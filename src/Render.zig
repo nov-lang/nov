@@ -216,6 +216,7 @@ fn renderExpression(self: *Render, node: Ast.Node.Index, space: Space) RenderErr
         return self.renderExpression(replacement, space);
     }
     switch (node_tags[node]) {
+        .inferred_type => return self.renderIdentifier(main_tokens[node], space, .preserve_when_shadowing),
         .identifier => {
             const token_index = main_tokens[node];
             return self.renderIdentifier(token_index, space, .preserve_when_shadowing);

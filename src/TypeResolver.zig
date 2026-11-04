@@ -6,8 +6,31 @@ const Ir = @import("Ir.zig");
 const Compilation = @import("Compilation.zig");
 const primitives = @import("primitives.zig");
 const Literal = @import("Literal.zig");
+const GenericFunctions = @import("GenericFunctions.zig");
 
 pub const Error = Ir.InternError;
+
+pub fn hasInferredSignature(ast: *const Ast, node: Ast.Node.Index) bool {
+    const proto = ast.fullFnProto(node) orelse return false;
+    if (proto.ast.infer_result) return true;
+    var iterator = proto.iterate(ast);
+    while (iterator.next()) |param| if (param.inferred) return true;
+    return false;
+}
+
+/// Resolve expression signatures from their bodies; declaration annotations
+/// without an arrow retain their explicit void result.
+pub fn resolveFunction(module: *Module, ir: *Ir, ref: GenericFunctions.Ref) Error!?Ir.TypeId {
+    const function = ref.function();
+    const declaration = module.getDeclaration(ref.id).?;
+    if (!hasInferredSignature(&module.source.ast, function.proto_node)) return resolveInScope(module, ir, function.proto_node, declaration.container, declaration.concrete_type, declaration.function_bindings);
+    const descriptor: GenericFunctions.LocalTemplate = .{ .proto = function.proto_node, .body = function.body, .outer_bindings = declaration.function_bindings, .container = declaration.container, .concrete_type = declaration.concrete_type };
+    var query = ref;
+    query.local = &descriptor;
+    // This read-only query interns types; body/IR construction errors cannot
+    // arise here. Preserve the resolver's narrower public error contract.
+    return @import("BodyChecker.zig").inferClosureType(module, ir, query, null, declaration.name_span) catch |err| return @errorCast(err);
+}
 
 /// Resolves an explicit, nonzero type node in a syntax-valid AST, without
 /// evaluating runtime values or bodies. Aliases have canonical identity.
@@ -112,7 +135,9 @@ fn resolveEnvironment(module: *Module, ir: *Ir, node: Ast.Node.Index, env: Envir
             const ast = &module.source.ast;
             if (ast.fullFnProto(visit.node)) |proto| {
                 var iterator = proto.iterate(ast);
-                while (iterator.next()) |param| try work.append(module.allocator, .{ .visit = .{ .node = param.type_expr, .depth = visit.depth + 1, .alias_depth = visit.alias_depth, .local = visit.local } });
+                while (iterator.next()) |param| {
+                    if (!param.inferred) try work.append(module.allocator, .{ .visit = .{ .node = param.type_expr, .depth = visit.depth + 1, .alias_depth = visit.alias_depth, .local = visit.local } });
+                }
                 if (proto.ast.return_type) |result| try work.append(module.allocator, .{ .visit = .{ .node = result, .depth = visit.depth + 1, .alias_depth = visit.alias_depth, .local = visit.local } });
             } else if (ast.nodes.items(.tag)[visit.node] == .array_type or ast.nodes.items(.tag)[visit.node] == .ref_type) {
                 try work.append(module.allocator, .{ .visit = .{ .node = ast.nodes.items(.data)[visit.node].rhs, .depth = visit.depth + 1, .alias_depth = visit.alias_depth, .local = visit.local } });
@@ -166,6 +191,7 @@ fn resolveDepth(module: *Module, ir: *Ir, node: Ast.Node.Index, depth: usize, al
         return lookupBinding(env.bindings, name) orelse diagnose(module, node, .unbound_type_variable);
     }
     if (ast.fullFnProto(node)) |proto| {
+        if (hasInferredSignature(ast, node)) return diagnose(module, node, .generic_function_ambiguous);
         var params: std.ArrayList(Ir.TypeId) = .empty;
         defer params.deinit(module.allocator);
         var names: std.StringHashMapUnmanaged(Module.Span) = .empty;
@@ -331,6 +357,9 @@ fn resolveValueType(module: *Module, ir: *Ir, node: Ast.Node.Index, env: Environ
     const declaration = owner.getDeclaration(id).?;
     if (declaration.is_type_alias or declaration.is_namespace or declaration.is_generic or declaration.is_generic_function or (declaration.is_test and !owner.testEnabled())) return diagnose(module, node, .not_a_value);
     const full = owner.source.ast.decl(declaration.node).ast;
+    if (owner.source.ast.declFunction(declaration.node)) |function| {
+        if (hasInferredSignature(&owner.source.ast, function.proto_node)) return resolveFunction(owner, ir, .{ .module = owner, .id = id });
+    }
     const type_node = if (owner.source.ast.declFunction(declaration.node)) |function| function.proto_node else full.type_node;
     const global_env: Environment = .{ .bindings = &.{}, .expansions = env.expansions, .publish_methods = env.publish_methods, .query_depth = env.query_depth + 1 };
     if (type_node != 0) return resolveEnvironment(owner, ir, type_node, global_env);

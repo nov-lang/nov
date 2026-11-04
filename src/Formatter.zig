@@ -83,6 +83,7 @@ fn checkSupported(ast: Ast) !void {
         .fn_proto_one,
         .fn_proto,
         .function_expr,
+        .inferred_type,
         .call_one,
         .call_one_comma,
         .call,
@@ -261,7 +262,7 @@ fn sameStructure(a: Ast, b: Ast) bool {
     for (tags, a.nodes.items(.data), b.nodes.items(.data)) |tag, x, y| {
         switch (tag) {
             .attr_one => if (!std.mem.eql(u8, a.tokenSlice(x.lhs), b.tokenSlice(y.lhs)) or x.rhs != y.rhs) return false,
-            .identifier, .type_variable, .number_literal, .char_literal, .string_literal, .builtin_literal, .enum_literal => {},
+            .identifier, .inferred_type, .type_variable, .number_literal, .char_literal, .string_literal, .builtin_literal, .enum_literal => {},
             // The parser leaves unused node data undefined; never read it.
             .ref_of, .negation, .bool_not, .bit_not, .@"return", .array_type => if (x.rhs != y.rhs) return false,
             .ref_type => if ((x.lhs == 0) != (y.lhs == 0) or x.rhs != y.rhs) return false,
@@ -334,6 +335,25 @@ fn expectFormatted(source: [:0]const u8, expected: []const u8) !void {
     const again = try format(allocator, terminated);
     defer allocator.free(again);
     try std.testing.expectEqualStrings(formatted, again);
+}
+
+test "inferred closures format bare parameters callbacks results and comments" {
+    try expectFormatted("let f=(x){x*2}", "let f = (x) {\n    x * 2\n}\n");
+    try expectFormatted("let ys=xs.map((x){x*2})", "let ys = xs.map(\n    (x) {\n        x * 2\n    }\n)\n");
+    try expectFormatted("let f=(x,y:int)->int{x+y}", "let f = (x, y: int) -> int {\n    x + y\n}\n");
+    try expectFormatted("let f=(x:&int){x}\nlet g=(){@print(1)\n}", "let f = (x: &int) {\n    x\n}\nlet g = () {\n    @print(1)\n}\n");
+    try expectFormatted("let f=(x){return (y){x+y}}", "let f = (x) {\n    return (y) {\n        x + y\n    }\n}\n");
+    try expectFormatted("let T=(int)->int\nlet f:(x:int)={}", "let T = (int) -> int\nlet f: (x: int) = {}\n");
+    for ([_][:0]const u8{
+        "let f=(\n; first\nx,\n; typed\ny:&int,\n){\n; body\nreturn (z){x+z}\n}",
+        "let text=\"{map((x){\"{x}\"})}\"",
+        "let f=(x,y:int){x+y}\nlet g=(){@print(1)\n}",
+    }) |source| {
+        const rendered = try format(std.testing.allocator, source);
+        defer std.testing.allocator.free(rendered);
+        try expectFormatted(source, rendered);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{source});
+    }
 }
 
 test "generic union signatures instantiations and propagation format idempotently" {
@@ -624,18 +644,18 @@ test "local reference annotations format independently of binding mutability and
 
 test "every unsupported AST tag is rejected before rendering" {
     const supported = [_]Ast.Node.Tag{
-        .type_variable,   .root,               .decl,              .identifier,           .number_literal, .char_literal,     .string_literal,
-        .add,             .sub,                .mul,               .div,                  .mod,            .shl,              .shr,
-        .bit_and,         .bit_or,             .bit_xor,           .equal_equal,          .bang_equal,     .less_than,        .less_or_equal,
-        .greater_than,    .greater_or_equal,   .bool_and,          .bool_or,              .ref_of,         .negation,         .bool_not,
-        .bit_not,         .fn_proto_one,       .fn_proto,          .function_expr,        .call_one,       .call_one_comma,   .call,
-        .call_comma,      .block_two,          .block_two_newline, .block,                .block_newline,  .@"if",            .if_else,
-        .range,           .loop_range,         .loop_condition,    .loop_cont,            .loop_else,      .@"return",        .@"break",
-        .@"continue",     .assign,             .assign_add,        .assign_sub,           .assign_mul,     .assign_div,       .assign_mod,
-        .builtin_literal, .array_type,         .array_init_two,    .array_init_two_comma, .array_init,     .array_init_comma, .array_access,
-        .slice,           .field_access,       .in,                .match,                .match_case_one, .match_case,       .function_pipe,
-        .container_decl,  .container_decl_arg, .container_field,   .unwrap,               .enum_literal,   .attr_one,         .attr_decl_one,
-        .attr_decl,       .ref_type,           .deref,
+        .type_variable, .root,             .decl,               .identifier,        .number_literal,       .char_literal,   .string_literal,
+        .add,           .sub,              .mul,                .div,               .mod,                  .shl,            .shr,
+        .bit_and,       .bit_or,           .bit_xor,            .equal_equal,       .bang_equal,           .less_than,      .less_or_equal,
+        .greater_than,  .greater_or_equal, .bool_and,           .bool_or,           .ref_of,               .negation,       .bool_not,
+        .inferred_type, .bit_not,          .fn_proto_one,       .fn_proto,          .function_expr,        .call_one,       .call_one_comma,
+        .call,          .call_comma,       .block_two,          .block_two_newline, .block,                .block_newline,  .@"if",
+        .if_else,       .range,            .loop_range,         .loop_condition,    .loop_cont,            .loop_else,      .@"return",
+        .@"break",      .@"continue",      .assign,             .assign_add,        .assign_sub,           .assign_mul,     .assign_div,
+        .assign_mod,    .builtin_literal,  .array_type,         .array_init_two,    .array_init_two_comma, .array_init,     .array_init_comma,
+        .array_access,  .slice,            .field_access,       .in,                .match,                .match_case_one, .match_case,
+        .function_pipe, .container_decl,   .container_decl_arg, .container_field,   .unwrap,               .enum_literal,   .attr_one,
+        .attr_decl_one, .attr_decl,        .ref_type,           .deref,
     };
     var ast = try Parser.parse(std.testing.allocator, "let x=1\n");
     defer ast.deinit(std.testing.allocator);

@@ -1,0 +1,80 @@
+; nov run examples/inferred-closures.nov
+; nov test examples/inferred-closures.nov
+
+let std = @import("std")
+
+let double = (value: int) {
+    value * 2
+}
+
+@[test]
+let inferred_callbacks = () {
+    let doubled = std.array.map(
+        [1, 2, 3],
+        (x) {
+            x * 2
+        }
+    )
+    let selected = std.array.filter(
+        doubled,
+        (x) {
+            x > 2
+        }
+    )
+    let total = std.array.fold(
+        selected,
+        0,
+        (sum, x) {
+            sum + x
+        }
+    )
+    @assert(total == 10)
+    @assert(double(4) == 8)
+
+    let offset = 5
+    let shifted = std.array.map(
+        [1, 2],
+        (x) {
+            x + offset
+        }
+    )
+    @assert(shifted[0] == 6 and shifted[1] == 7)
+
+    let mut count = 0
+    let next = () {
+        count += 1
+        count
+    }
+    @assert(next() == 1 and next() == 2)
+
+    let mut value = 10
+    let update: (&mut int) -> void = (p) {
+        p.* += 1
+    }
+    update(&value)
+    @assert(value == 11)
+}
+
+let main = () {
+    let doubled = std.array.map(
+        [1, 2, 3],
+        (x) {
+            x * 2
+        }
+    )
+    let selected = std.array.filter(
+        doubled,
+        (x) {
+            x > 2
+        }
+    )
+    let total = std.array.fold(
+        selected,
+        0,
+        (sum, x) {
+            sum + x
+        }
+    )
+    @println("Doubled: {doubled}")
+    @println("Selected: {selected}; total: {total}")
+}

@@ -71,7 +71,7 @@ stop semantic analysis. Runtime globals must be immutable scalar constants: expl
 typed integer/float/boolean/rune/string literals, inferred integer/float (including literal
 negation), boolean, rune or plain UTF-8 string literals, or scalar literals
 explicitly contextualized with `@as(T, literal)`.
-Immutable module-level type aliases are also supported. Functions need explicit supported signatures and bounded
+Immutable module-level type aliases are also supported. Functions need supported signatures (explicit or inferable) and bounded
 expression bodies (including forward/recursive calls, local declarations and
 assignments, nested blocks, boolean short-circuiting, `if`/`else`, explicit returns,
 bounded integer range loops, condition-based or unconditional loops with continuation clauses and unlabeled
@@ -706,11 +706,32 @@ let addFive = makeAdder(5)
 @println(addFive(3)) ; 8
 ```
 
-The binding infers the function type. Parameters still need names and explicit
-types; omitting the return annotation means `void`, not inferred return typing.
-`let printHello = () { @println("hello") }` is therefore a void function.
-Existing `let double: (value: int) -> int = value * 2` declarations remain valid.
-The new form also works for module functions, methods and `@[test]` functions.
+The binding infers the function type. Parameter names are required, but their
+types can be omitted when an expected function type, call arguments or body
+constraints determine them. Braces are mandatory; there is no `=` before the body.
+
+```nov
+let std = @import("std")
+let doubled = std.array.map([1, 2, 3], (x) { x * 2 })
+let total = std.array.fold(doubled, 0, (sum, x) { sum + x })
+let increment = (value: int) { value + 1 }
+let callback: (int) -> int = (value) { value + 1 }
+```
+
+Omitting a function expression's result annotation infers its result from the
+final expression and explicit returns. A statement-ended body produces `void`;
+terminal-only bodies also infer `void`. For example, `() { @println("hello") }`
+is a void function, while `() { 42 }` returns `int`. Mixed inferred/typed parameters
+and explicit results such as `(x, y: int) -> int { x + y }` are supported.
+Inference is bounded and does not create implicit generic functions: standalone
+`(x) { x }` is ambiguous without context. Use backtick variables for reusable
+generic functions; recursive inferred signatures may require an explicit result.
+No type is inferred from a binding's later uses.
+
+Existing `let double: (value: int) -> int = value * 2` declarations remain valid;
+omitting the result in a declaration annotation still means `void`. The expression
+form also works for module functions, methods and `@[test]` functions. See
+[`examples/inferred-closures.nov`](examples/inferred-closures.nov).
 
 Referenced outer bindings are captured automatically when the function expression
 is evaluated:

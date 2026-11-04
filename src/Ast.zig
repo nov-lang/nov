@@ -600,6 +600,7 @@ pub fn firstToken(self: Ast, node: Node.Index) TokenIndex {
         .@"continue",
         .@"break",
         .@"return",
+        .inferred_type,
         .identifier,
         .type_variable,
         .number_literal,
@@ -786,6 +787,7 @@ pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
 
         .number_literal,
         .char_literal,
+        .inferred_type,
         .identifier,
         .type_variable,
         .string_literal,
@@ -1129,7 +1131,16 @@ fn fullFnProtoComponents(self: Ast, info: full.FnProto.Components) full.FnProto 
     const token_tags = self.tokens.items(.tag);
     assert(token_tags[info.fn_token] == .l_paren);
     return .{
-        .ast = info,
+        .ast = blk: {
+            var components = info;
+            if (info.return_type) |result| {
+                if (self.nodes.items(.tag)[result] == .inferred_type) {
+                    components.infer_result = true;
+                    components.return_type = null;
+                }
+            }
+            break :blk components;
+        },
         .lparen = info.fn_token,
     };
 }
@@ -1320,6 +1331,8 @@ pub const full = struct {
             proto_node: Node.Index,
             fn_token: TokenIndex,
             return_type: ?Node.Index,
+            /// Function expression result omitted; raw prototype rhs is an inferred_type marker.
+            infer_result: bool = false,
             /// Borrows AST storage; valid until the AST is mutated or deinitialized.
             params: []const Node.Index,
         };
@@ -1330,6 +1343,7 @@ pub const full = struct {
             comptime_noalias: ?TokenIndex,
             anytype_ellipsis3: ?TokenIndex,
             type_expr: Node.Index,
+            inferred: bool = false,
         };
 
         pub fn iterate(proto: FnProto, tree: *const Ast) Iterator {
@@ -1347,7 +1361,8 @@ pub const full = struct {
                 it.index += 1;
                 const first_token = it.tree.firstToken(type_expr);
                 const token_tags = it.tree.tokens.items(.tag);
-                const name_token = if (first_token >= 2 and
+                const inferred = it.tree.nodes.items(.tag)[type_expr] == .inferred_type;
+                const name_token = if (inferred) first_token else if (first_token >= 2 and
                     token_tags[first_token - 1] == .colon and
                     token_tags[first_token - 2] == .identifier)
                     first_token - 2
@@ -1359,6 +1374,7 @@ pub const full = struct {
                     .comptime_noalias = null,
                     .anytype_ellipsis3 = null,
                     .type_expr = type_expr,
+                    .inferred = inferred,
                 };
             }
         };
@@ -1656,6 +1672,9 @@ pub const Node = struct {
         fn_proto_one,
         /// Anonymous function: lhs prototype, rhs block body.
         function_expr,
+        /// Contextually inferred parameter or result type. Both data fields are zero.
+        /// main_token is the parameter identifier or the result's closing `)`.
+        inferred_type,
         /// `(a: b, c: d) -> rhs`. `SubRange[lhs]`.
         /// rhs can be omitted.
         /// main_token is the `(`

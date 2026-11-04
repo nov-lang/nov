@@ -147,6 +147,7 @@ const Frame = struct {
     result: *Term,
     container: ?Nominal = null,
     loop: ?*Loop = null,
+    returns_value: bool = false,
 };
 
 /// Generates only type constraints. It never evaluates arguments, checks a body
@@ -182,6 +183,64 @@ fn inferInner(caller: *Module, ir: *Ir, ref: Ref, arguments: []const Argument, e
     }
     transferred = true;
     return bindings;
+}
+
+/// Infer a closure's entire concrete function type without emitting code or
+/// capturing values. The descriptor borrows the caller's lexical captures and
+/// bindings; the returned canonical type remains valid after this query.
+pub fn inferClosure(caller: *Module, ir: *Ir, ref: Ref, expected: ?Ir.TypeId, span: Module.Span) Ir.BuildError!?Ir.TypeId {
+    return inferClosureInner(caller, ir, ref, expected, span) catch |err| switch (err) {
+        error.TooManyEntries => null,
+        else => return err,
+    };
+}
+
+fn inferClosureInner(caller: *Module, ir: *Ir, ref: Ref, expected: ?Ir.TypeId, span: Module.Span) Ir.BuildError!?Ir.TypeId {
+    var arena = std.heap.ArenaAllocator.init(caller.allocator);
+    defer arena.deinit();
+    var solver: Solver = .{ .allocator = arena.allocator(), .caller = caller, .ir = ir, .call_span = span, .analysis = ref.analysis, .types = ref.types };
+    solver.readonly_layouts = true;
+    const container = try solver.referenceContainer(ref);
+    const instance = (try solver.signature(ref, container, 0)) orelse return null;
+    const signature = try solver.term(.{ .function = instance.function }, ref.span());
+    if (expected) |ty| try solver.unify(signature, try solver.fromType(ty, span, 0), span, 0);
+    var frame = instance.frame;
+    try solver.body(&frame, 0);
+    try solver.finishBodies();
+    if (solver.failed) return null;
+    try solver.applyDefaults();
+    if (!Solver.resolved(signature, 0)) {
+        try solver.fail(if (solver.unsupported != null) .generic_function_inference_unsupported else .generic_function_ambiguous, solver.unsupported orelse span, ref.span());
+        return null;
+    }
+    const ty = try solver.materialize(signature, 0);
+    if (ty == null and !solver.failed) try solver.fail(.generic_function_ambiguous, span, ref.span());
+    return ty;
+}
+
+/// Infer a concrete closure callee from all arguments and its expected result
+/// together, without publishing a runtime generic specialization.
+pub fn inferClosureCall(caller: *Module, ir: *Ir, ref: Ref, arguments: []const Argument, expected: ?Argument, span: Module.Span) Ir.BuildError!?Ir.TypeId {
+    return inferClosureCallInner(caller, ir, ref, arguments, expected, span) catch |err| switch (err) {
+        error.TooManyEntries => null,
+        else => return err,
+    };
+}
+
+fn inferClosureCallInner(caller: *Module, ir: *Ir, ref: Ref, arguments: []const Argument, expected: ?Argument, span: Module.Span) Ir.BuildError!?Ir.TypeId {
+    var arena = std.heap.ArenaAllocator.init(caller.allocator);
+    defer arena.deinit();
+    var solver: Solver = .{ .allocator = arena.allocator(), .caller = caller, .ir = ir, .call_span = span, .analysis = ref.analysis, .types = ref.types, .readonly_layouts = true };
+    const frame = (try solver.constrain(ref, arguments, expected)) orelse return null;
+    try solver.applyDefaults();
+    const signature = try solver.term(.{ .function = .{ .params = solver.parameters, .result = frame.result } }, ref.span());
+    if (!Solver.resolved(signature, 0)) {
+        try solver.fail(if (solver.unsupported != null) .generic_function_inference_unsupported else .generic_function_ambiguous, solver.unsupported orelse span, ref.span());
+        return null;
+    }
+    const ty = try solver.materialize(signature, 0);
+    if (ty == null and !solver.failed) try solver.fail(.generic_function_ambiguous, span, ref.span());
+    return ty;
 }
 
 /// A call with a terminal operand never demands its callee. Resolve only the
@@ -284,6 +343,7 @@ fn probeExpressionsInner(caller: *Module, ir: *Ir, scope: Ref, nodes: []const As
     for (local.captures) |capture| try frame.locals.append(solver.allocator, .{ .name = capture.name, .term = try solver.fromType(capture.ty, solver.call_span, 0), .template = capture.template, .mutable = capture.mutable });
     const result = try solver.term(.unknown, solver.call_span);
     for (nodes) |node| try solver.unify(result, try solver.expression(&frame, node, 0), caller.tokenSpan(caller.source.ast.firstToken(node)), 0);
+    try solver.finishBodies();
     if (solver.failed) return null;
     if (defaults) try solver.applyDefaults();
     return solver.materialize(result, 0);
@@ -868,12 +928,75 @@ const Solver = struct {
     failed: bool = false,
     active: std.ArrayList(Ref) = .empty,
     read_only: bool = false,
+    readonly_layouts: bool = false,
     analysis: ?*const Sema = null,
     types: []const ?Ir.TypeId = &.{},
     unsupported: ?Module.Span = null,
+    pending_bodies: std.ArrayList(struct { frame: Frame, depth: usize }) = .empty,
+    projections: std.ArrayList(struct { base: *Term, result: *Term, name: ?[]const u8, span: Module.Span }) = .empty,
     parameters: []const *Term = &.{},
     defaults: std.ArrayList(struct { term: *Term, ty: Ir.TypeId }) = .empty,
     float_defaults_only: bool = false,
+
+    // Connect signatures before inspecting operations that need concrete operand
+    // types. In particular, callback-first arguments must see later siblings.
+    fn deferBody(self: *Solver, frame: Frame, depth: usize) Ir.BuildError!void {
+        try self.pending_bodies.append(self.allocator, .{ .frame = frame, .depth = depth });
+    }
+
+    fn finishBodies(self: *Solver) Ir.BuildError!void {
+        var index: usize = 0;
+        while (index < self.pending_bodies.items.len and !self.failed) : (index += 1) {
+            // body() can append more work and relocate pending_bodies.
+            var pending = self.pending_bodies.items[index];
+            try self.body(&pending.frame, pending.depth);
+        }
+        self.pending_bodies.clearRetainingCapacity();
+        // Projections may depend on another callback's result or on another
+        // projection. Revisit only these operations, not bodies or defaults.
+        var progress = true;
+        while (progress and !self.failed) {
+            progress = false;
+            var i: usize = 0;
+            while (i < self.projections.items.len) {
+                const projection = self.projections.items[i];
+                if (root(projection.base).value == .unknown) {
+                    i += 1;
+                    continue;
+                }
+                const value = if (projection.name) |name|
+                    try self.fieldType(projection.base, name, projection.span, 0)
+                else if (root(projection.base).value == .reference)
+                    root(projection.base).value.reference.child
+                else
+                    try self.term(.unknown, projection.span);
+                try self.unify(projection.result, value, projection.span, 0);
+                _ = self.projections.swapRemove(i);
+                progress = true;
+            }
+        }
+    }
+
+    fn establishedType(self: *Solver, ref: Ref) ?Ir.TypeId {
+        if (ref.local != null) return null;
+        if (self.analysis) |analysis| {
+            const index = analysis.entryIndex(ref.module, ref.id);
+            if (index < analysis.entries.len) if (analysis.entries[index].type_id) |ty| return ty;
+        }
+        const index = if (ref.module.compilation) |comp|
+            @backingInt(comp.declaration_ids.get(.{ .source = ref.module.source.id, .local = ref.id }) orelse return null)
+        else
+            @backingInt(ref.id);
+        return if (index < self.types.len) self.types[index] else null;
+    }
+
+    fn referenceContainer(self: *Solver, ref: Ref) Ir.BuildError!?Nominal {
+        const ty = ref.container_type orelse if (ref.local) |local| blk: {
+            break :blk if (local.concrete_type) |concrete| @as(Ir.TypeId, @fromBackingInt(concrete)) else return null;
+        } else return null;
+        const nominal = root(try self.fromType(ty, ref.span(), 0));
+        return if (nominal.value == .nominal) nominal.value.nominal else null;
+    }
 
     // Defaults fill only unresolved leaves after all exact constraints. A
     // candidate must never conflict with a contextual type that already won.
@@ -944,10 +1067,7 @@ const Solver = struct {
     }
 
     fn constrain(self: *Solver, ref: Ref, arguments: []const Argument, expected: ?Argument) Ir.BuildError!?Frame {
-        const container: ?Nominal = if (ref.container_type) |ty| blk: {
-            const nominal = root(try self.fromType(ty, self.call_span, 0));
-            break :blk if (nominal.value == .nominal) nominal.value.nominal else null;
-        } else null;
+        const container = try self.referenceContainer(ref);
         const instance = (try self.signature(ref, container, 0)) orelse return null;
         var frame = instance.frame;
         const signature_type = instance.function;
@@ -961,20 +1081,21 @@ const Solver = struct {
             if (arg.ty) |ty| try self.unifyArgument(param, try self.fromType(ty, arg.span, 0), arg.span);
             if (arg.default_type) |ty| try self.defaults.append(self.allocator, .{ .term = param, .ty = ty });
             if (arg.template) |callback| {
-                const callback_container: ?Nominal = if (callback.container_type) |ty| blk: {
-                    const nominal = root(try self.fromType(ty, arg.span, 0));
-                    break :blk if (nominal.value == .nominal) nominal.value.nominal else null;
-                } else null;
+                const callback_container = try self.referenceContainer(callback);
                 const candidate = (try self.signature(callback, callback_container, 0)) orelse return null;
-                var callback_frame = candidate.frame;
                 try self.unify(param, try self.term(.{ .function = candidate.function }, arg.span), arg.span, 0);
-                if (!resolved(param, 0)) try self.body(&callback_frame, 0);
+                const proto = callback.module.source.ast.fullFnProto(callback.function().proto_node).?;
+                var iterator = proto.iterate(&callback.module.source.ast);
+                var inferred = proto.ast.infer_result;
+                while (iterator.next()) |p| inferred = inferred or p.inferred;
+                if (inferred or !resolved(param, 0)) try self.deferBody(candidate.frame, 0);
             }
         }
         if (!ref.isNoreturn()) {
             if (expected) |arg| if (arg.ty) |ty| try self.unify(signature_type.result, try self.fromType(ty, arg.span, 0), arg.span, 0);
         }
         try self.body(&frame, 0);
+        try self.finishBodies();
         return if (self.failed) null else frame;
     }
 
@@ -1133,6 +1254,7 @@ const Solver = struct {
             return self.term(.unknown, span);
         }
         switch (ast.nodes.items(.tag)[node]) {
+            .inferred_type => return self.term(.unknown, span),
             .identifier => if (frame.container) |container| {
                 const name = ast.tokenSlice(ast.firstToken(node));
                 const owner_ast = &container.module.source.ast;
@@ -1172,7 +1294,7 @@ const Solver = struct {
                     param.* = try self.typeNode(frame, syntax.type_expr, depth + 1);
                     if (syntax.name_token) |token| try frame.locals.append(self.allocator, .{ .name = ast.tokenSlice(token), .term = param.* });
                 }
-                const result = if (proto.ast.return_type) |r| try self.typeNode(frame, r, depth + 1) else try self.fromType(try self.ir.internType(.void), span, depth + 1);
+                const result = if (proto.ast.return_type) |r| try self.typeNode(frame, r, depth + 1) else if (proto.ast.infer_result) try self.term(.unknown, span) else try self.fromType(try self.ir.internType(.void), span, depth + 1);
                 return self.term(.{ .function = .{ .params = params, .result = result } }, span);
             },
             .call, .call_one => {
@@ -1296,7 +1418,8 @@ const Solver = struct {
         if (ref.local) |local| for (local.captures) |capture| {
             try frame.locals.append(self.allocator, .{ .name = capture.name, .term = try self.fromType(capture.ty, ref.span(), 0), .template = capture.template, .mutable = capture.mutable });
         };
-        const signature_term = try self.typeNode(&frame, function.proto_node, depth + 1);
+        const established = self.establishedType(ref);
+        const signature_term = if (established) |ty| try self.fromType(ty, ref.span(), depth + 1) else try self.typeNode(&frame, function.proto_node, depth + 1);
         if (self.failed or signature_term.value != .function) return null;
         const f = signature_term.value.function;
         frame.result = f.result;
@@ -1316,7 +1439,13 @@ const Solver = struct {
         defer _ = self.active.pop();
         const ast = &frame.ref.module.source.ast;
         const function = frame.ref.function();
-        if (function.body != 0) try self.unify(frame.result, try self.expression(frame, function.body, depth + 1), frame.ref.module.tokenSpan(ast.firstToken(function.body)), 0);
+        if (function.body != 0) {
+            const value = try self.expression(frame, function.body, depth + 1);
+            try self.unify(frame.result, value, frame.ref.module.tokenSpan(ast.firstToken(function.body)), 0);
+            const proto = ast.fullFnProto(function.proto_node).?;
+            if (proto.ast.infer_result and root(value).value == .never and !frame.returns_value and root(frame.result).value == .unknown)
+                try self.unify(frame.result, try self.fromType(try self.ir.internType(.void), frame.ref.span(), 0), frame.ref.span(), 0);
+        }
     }
 
     const CallTarget = struct { ref: Ref, container: ?Nominal = null, receiver: ?*Term = null };
@@ -1421,27 +1550,11 @@ const Solver = struct {
     }
 
     fn closure(self: *Solver, frame: *Frame, proto_node: Ast.Node.Index, body_node: Ast.Node.Index, depth: usize) Ir.BuildError!*Term {
-        const module = frame.ref.module;
-        const ast = &module.source.ast;
-        const span = module.tokenSpan(ast.firstToken(proto_node));
-        if (!signatureVariablesBound(frame, proto_node)) {
-            const ref = try self.closureReference(frame, proto_node, body_node);
-            const instance = (try self.signature(ref, frame.container, depth + 1)) orelse return self.term(.unknown, span);
-            var child = instance.frame;
-            try self.body(&child, depth + 1);
-            return self.term(.{ .function = instance.function }, span);
-        }
-        const signature_type = try self.typeNode(frame, proto_node, depth + 1);
-        if (self.failed or signature_type.value != .function) return self.term(.unknown, span);
-        const function = signature_type.value.function;
-        var child: Frame = .{ .ref = frame.ref, .variables = frame.variables, .result = function.result, .container = frame.container };
-        try child.locals.appendSlice(self.allocator, frame.locals.items);
-        var iterator = ast.fullFnProto(proto_node).?.iterate(ast);
-        for (function.params) |param| {
-            if (iterator.next().?.name_token) |token| try child.locals.append(self.allocator, .{ .name = ast.tokenSlice(token), .term = param });
-        }
-        try self.unify(function.result, try self.expression(&child, body_node, depth + 1), module.tokenSpan(ast.firstToken(body_node)), 0);
-        return signature_type;
+        const span = frame.ref.module.tokenSpan(frame.ref.module.source.ast.firstToken(proto_node));
+        const ref = try self.closureReference(frame, proto_node, body_node);
+        const instance = (try self.signature(ref, frame.container, depth + 1)) orelse return self.term(.unknown, span);
+        try self.deferBody(instance.frame, depth + 1);
+        return self.term(.{ .function = instance.function }, span);
     }
 
     fn field(self: *Solver, frame: *Frame, node: Ast.Node.Index, depth: usize) Ir.BuildError!*Term {
@@ -1451,6 +1564,16 @@ const Solver = struct {
         const span = module.tokenSpan(ast.firstToken(node));
         const name = ast.tokenSlice(data.rhs);
         const base = root(try self.expression(frame, data.lhs, depth + 1));
+        return self.fieldType(base, name, span, depth);
+    }
+
+    fn fieldType(self: *Solver, base_value: *Term, name: []const u8, span: Module.Span, depth: usize) Ir.BuildError!*Term {
+        const base = root(base_value);
+        if (base.value == .unknown) {
+            const result = try self.term(.unknown, span);
+            try self.projections.append(self.allocator, .{ .base = base, .result = result, .name = name, .span = span });
+            return result;
+        }
         if (base.value == .never) return base;
         if (base.value == .nominal) {
             const nominal = base.value.nominal;
@@ -1519,10 +1642,11 @@ const Solver = struct {
         if (self.failed) return self.term(.unknown, span);
         const data = ast.nodes.items(.data)[node];
         if (try self.callTarget(frame, node, depth + 1)) |candidate| {
-            if (candidate.ref.local != null or candidate.ref.module.getDeclaration(candidate.ref.id).?.is_generic_function) {
+            if (candidate.ref.local != null or candidate.ref.module.getDeclaration(candidate.ref.id).?.is_generic_function or
+                candidate.ref.module.source.ast.fullFnProto(candidate.ref.function().proto_node).?.ast.infer_result)
+            {
                 const instance = (try self.signature(candidate.ref, candidate.container, depth + 1)) orelse return self.term(.unknown, span);
-                var callback_frame = instance.frame;
-                try self.body(&callback_frame, depth + 1);
+                try self.deferBody(instance.frame, depth + 1);
                 return self.term(.{ .function = instance.function }, span);
             }
         }
@@ -1585,7 +1709,9 @@ const Solver = struct {
             .deref => {
                 const operand = root(try self.expression(frame, data.lhs, depth + 1));
                 if (operand.value == .reference) return operand.value.reference.child;
-                return self.term(.unknown, span);
+                const result = try self.term(.unknown, span);
+                if (operand.value == .unknown) try self.projections.append(self.allocator, .{ .base = operand, .result = result, .name = null, .span = span });
+                return result;
             },
             .field_access => return self.field(frame, node, depth + 1),
             .bool_not, .bool_and, .bool_or => {
@@ -1601,6 +1727,16 @@ const Solver = struct {
                 try self.unify(boolean, rhs, span, 0);
                 // A short-circuit's other path remains live even if its RHS exits.
                 return boolean;
+            },
+            .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod => {
+                const lhs = try self.expression(frame, data.lhs, depth + 1);
+                if (root(lhs).value == .never) return lhs;
+                const rhs = try self.expression(frame, data.rhs, depth + 1);
+                if (root(rhs).value == .never) return rhs;
+                // Mutation constrains the stored value, not the expression's
+                // result. BodyChecker validates the target and operator.
+                try self.unifyArgument(lhs, rhs, span);
+                return self.fromType(try self.ir.internType(.void), span, 0);
             },
             .negation, .bit_not => return self.expression(frame, data.rhs, depth + 1),
             .add, .sub, .mul, .div, .mod, .bit_and, .bit_or, .bit_xor, .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal => {
@@ -1701,6 +1837,7 @@ const Solver = struct {
             },
             .@"return" => {
                 const value = if (data.rhs == 0) try self.fromType(try self.ir.internType(.void), span, 0) else try self.expression(frame, data.rhs, depth + 1);
+                if (data.rhs != 0 and root(value).value != .never) frame.returns_value = true;
                 try self.unify(frame.result, value, span, 0);
                 return self.term(.never, span);
             },
@@ -1762,7 +1899,8 @@ const Solver = struct {
                                 try self.unifyArgument(param, value, module.tokenSpan(ast.firstToken(arg)));
                             }
                             if (callee_target.ref.isNoreturn()) return self.term(.never, span);
-                            if (callee_target.ref.local != null or callee_target.ref.module.getDeclaration(callee_target.ref.id).?.is_generic_function) try self.body(&child, depth + 1);
+                            if (callee_target.ref.local != null or callee_target.ref.module.getDeclaration(callee_target.ref.id).?.is_generic_function or
+                                (self.establishedType(callee_target.ref) == null and callee_target.ref.module.source.ast.fullFnProto(callee_target.ref.function().proto_node).?.ast.infer_result)) try self.body(&child, depth + 1);
                             return f.result;
                         }
                     }
@@ -1827,7 +1965,7 @@ const Solver = struct {
             .nominal => |n| blk: {
                 const args = try self.allocator.alloc(Ir.TypeId, n.args.len);
                 for (n.args, args) |arg, *out| out.* = (try self.materialize(arg, depth + 1)) orelse break :blk null;
-                if (self.read_only) break :blk try TypeResolver.instantiateArgumentsReadOnly(n.module, self.ir, n.id, args, 0);
+                if (self.read_only or self.readonly_layouts) break :blk try TypeResolver.instantiateArgumentsReadOnly(n.module, self.ir, n.id, args, 0);
                 break :blk try TypeResolver.instantiateArguments(n.module, self.ir, n.id, args, 0);
             },
         };
@@ -3185,6 +3323,210 @@ test "backtick instance conflicts unbound variables unsupported values arity and
         try testInferenceFailureAllocations(std.testing.allocator, case.source, case.tag);
         try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testInferenceFailureAllocations, .{ case.source, case.tag });
     }
+}
+
+fn testInferredClosureSignatures(allocator: std.mem.Allocator) !void {
+    const source =
+        \\let apply:(f:(`T)->`U,x:`T)->`U=f(x)
+        \\let main:()={
+        \\let identity=(x){x}
+        \\let length=(x){x.len}
+        \\let load=(x){x.*}
+        \\let number=(){1}
+        \\let captured=(){saved}
+        \\let nested=(x){let read=(y){y.len}
+        \\read(x)}
+        \\let separate=(x,y){y}
+        \\let unused=(x){true}
+        \\let calculated=(x){x+1}
+        \\let unit=(){@print(1)
+        \\}
+        \\}
+        \\let get:(f:()->`T)->`T=f()
+    ;
+    var module = try Module.init(allocator, "inferred-closures.nov", source);
+    defer module.deinit();
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    ir.source_len = @intCast(source.len);
+    const ast = &module.source.ast;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const statements = ast.fullBlock(&buffer, ast.declFunction(ast.rootDecls()[1]).?.body).?.ast.statements;
+    const boolean = try ir.internType(.boolean);
+    const string = try ir.internType(.string);
+    const uint = try ir.internType(.{ .integer = .{ .signedness = .unsigned, .bits = Ir.native_pointer_bits } });
+    const reference = try ir.internType(.{ .reference = .{ .child = boolean, .mutable = false } });
+    const integer = try BodyChecker.defaultIntegerType(&ir);
+    const float = try BodyChecker.defaultFloatType(&ir);
+    for (statements, 0..) |statement, index| {
+        const expression = ast.functionExpr(ast.decl(statement).ast.init_node).?;
+        const local: LocalTemplate = .{ .proto = expression.proto.ast.proto_node, .body = expression.body, .captures = &.{.{ .name = "saved", .ty = boolean }} };
+        const ref: Ref = .{ .module = &module, .local = &local };
+        const params: []const Ir.TypeId = switch (index) {
+            0, 7 => &.{boolean},
+            1, 5 => &.{string},
+            2 => &.{reference},
+            6 => &.{ string, boolean },
+            8 => &.{float},
+            else => &.{},
+        };
+        const result = switch (index) {
+            1, 5 => uint,
+            3, 8 => float,
+            9 => try ir.internType(.void),
+            else => boolean,
+        };
+        const expected = try ir.internType(.{ .function = .{ .params = params, .result = result } });
+        try std.testing.expectEqual(expected, (try inferClosure(&module, &ir, ref, expected, ref.span())).?);
+        if (index == 3) {
+            const inferred = (try inferClosure(&module, &ir, ref, null, ref.span())).?;
+            try std.testing.expectEqual(integer, ir.getType(inferred).?.function.result);
+        }
+        if (index == 8) {
+            const inferred = (try inferClosure(&module, &ir, ref, null, ref.span())).?;
+            const function = ir.getType(inferred).?.function;
+            try std.testing.expectEqual(integer, function.params[0]);
+            try std.testing.expectEqual(integer, function.result);
+        }
+        if (index == 0 or index == 7) {
+            try std.testing.expect(try inferClosure(&module, &ir, ref, null, ref.span()) == null);
+            try std.testing.expectEqual(Module.Diagnostic.Tag.generic_function_ambiguous, module.diagnostics.items[0].tag);
+            module.diagnostics.clearRetainingCapacity();
+        }
+        if (index == 0) {
+            const wrong = try ir.internType(.{ .function = .{ .params = &.{boolean}, .result = string } });
+            try std.testing.expect(try inferClosure(&module, &ir, ref, wrong, ref.span()) == null);
+            try std.testing.expectEqual(Module.Diagnostic.Tag.generic_function_conflict, module.diagnostics.items[0].tag);
+            module.diagnostics.clearRetainingCapacity();
+        }
+        if (index == 3) {
+            const args = [_]Argument{.{ .ty = null, .span = ref.span(), .template = ref }};
+            // No-argument callback results remain soft in readonly probes.
+            const get: Ref = .{ .module = &module, .id = module.lookup("get").? };
+            try std.testing.expect(try probeResult(&module, &ir, get, &args, ref.span()) == null);
+            try std.testing.expectEqual(integer, (try probeDefaultResult(&module, &ir, get, &args, ref.span())).?);
+            try std.testing.expect(try probeResult(&module, &ir, get, &args, ref.span()) == null);
+        }
+        if (index == 1 or index == 2) {
+            const apply: Ref = .{ .module = &module, .id = module.lookup("apply").? };
+            const args = [_]Argument{
+                .{ .ty = null, .span = ref.span(), .template = ref },
+                .{ .ty = params[0], .span = ref.span() },
+            };
+            // The readonly probe must constrain the callback from the later
+            // argument, but must not apply numeric fallback candidates.
+            try std.testing.expectEqual(result, (try probeResult(&module, &ir, apply, &args, apply.span())).?);
+            const bindings = (try infer(&module, &ir, apply, &args, null, apply.span())).?;
+            defer allocator.free(bindings);
+            try std.testing.expectEqual(params[0], bindings[0].ty);
+            try std.testing.expectEqual(result, bindings[1].ty);
+        }
+        try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+        try std.testing.expectEqual(@as(usize, 0), ir.functions.items.len);
+        try std.testing.expectEqual(@as(usize, 0), ir.local_generic_instances.items.len);
+    }
+}
+
+const InferredReviewResult = enum { integer, uint, unit, nominal, ambiguous, invalid_parameter, established };
+
+fn testInferredClosureReview(allocator: std.mem.Allocator, source: []const u8, result: InferredReviewResult) !void {
+    var module = try Module.init(allocator, "inferred-review.nov", source);
+    defer module.deinit();
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    ir.source_len = @intCast(source.len);
+    const declarations = module.declarations.items.len;
+    // These invariants also hold when an injected allocation failure abandons
+    // materialization after an earlier nominal layout was interned.
+    defer std.debug.assert(module.declarations.items.len == declarations);
+    defer std.debug.assert(ir.functions.items.len == 0);
+    defer std.debug.assert(ir.local_generic_instances.items.len == 0);
+    const types = try allocator.alloc(?Ir.TypeId, declarations);
+    defer allocator.free(types);
+    @memset(types, null);
+    if (result == .established) types[@backingInt(module.lookup("g").?)] = try ir.internType(.{ .function = .{ .params = &.{}, .result = try BodyChecker.defaultIntegerType(&ir) } });
+    const ref: Ref = .{ .module = &module, .id = module.lookup("f").?, .types = types };
+    const inferred = try inferClosure(&module, &ir, ref, null, ref.span());
+    if (result == .ambiguous or result == .invalid_parameter) {
+        try std.testing.expect(inferred == null);
+        try std.testing.expectEqual(if (result == .ambiguous) Module.Diagnostic.Tag.generic_function_ambiguous else Module.Diagnostic.Tag.invalid_parameter_type, module.diagnostics.items[0].tag);
+        return;
+    }
+    try std.testing.expect(inferred != null);
+    const function = ir.getType(inferred.?).?.function;
+    switch (result) {
+        .integer, .established => try std.testing.expectEqual(try BodyChecker.defaultIntegerType(&ir), function.result),
+        .uint => try std.testing.expectEqual(try ir.internType(.{ .integer = .{ .signedness = .unsigned, .bits = Ir.native_pointer_bits } }), function.result),
+        .unit => try std.testing.expectEqual(try ir.internType(.void), function.result),
+        .nominal => {
+            try std.testing.expectEqual(function.params[0], function.result);
+            try std.testing.expect(ir.getType(function.result).? == .record);
+        },
+        .ambiguous, .invalid_parameter => unreachable,
+    }
+    try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+}
+
+test "inferred closures review readonly layouts forward calls deferred projections and terminal void under OOM" {
+    for ([_]struct { source: []const u8, result: InferredReviewResult }{
+        .{ .source = "let Box:(T:type)->type=struct{value:T,let method:(x:T)->T=x\n}\nlet f=(x:Box(int)){x}", .result = .nominal },
+        .{ .source = "let g=(x:int){x+1}\nlet f=(x:int){return g(x)}", .result = .integer },
+        .{ .source = "let f=(x:int){return g(x)}\nlet g=(x:int){x+1}", .result = .integer },
+        .{ .source = "let g=(){}\nlet f=(){return g()}", .result = .unit },
+        .{ .source = "let f=(){return g()}\nlet g=(){}", .result = .unit },
+        .{ .source = "let both:(f:(`T)->`U,g:()->`T)->`U=f(g())\nlet f=(){both((x){x.len},(){\"abc\"})}", .result = .uint },
+        .{ .source = "let both:(g:()->`T,f:(`T)->`U)->`U=f(g())\nlet f=(){both((){\"abc\"},(x){x.len})}", .result = .uint },
+        .{ .source = "@[noreturn]\nlet f=(){@panic(\"bad\")}", .result = .unit },
+        .{ .source = "let f=(){loop{}}", .result = .unit },
+        .{ .source = "let f=(){return f()}", .result = .ambiguous },
+        .{ .source = "let f=(){return g()}\nlet g=(){return f()}", .result = .ambiguous },
+        .{ .source = "let f=(x:void){x}", .result = .invalid_parameter },
+        .{ .source = "let f=(){return g()}\nlet g=(){missing}", .result = .established },
+    }) |case| {
+        try testInferredClosureReview(std.testing.allocator, case.source, case.result);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testInferredClosureReview, .{ case.source, case.result });
+    }
+}
+
+fn testInferredClosureMutation(allocator: std.mem.Allocator, source: []const u8, unit_result: bool) !void {
+    var module = try Module.init(allocator, "inferred-mutation.nov", source);
+    defer module.deinit();
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    ir.source_len = @intCast(source.len);
+    const ast = &module.source.ast;
+    var buffer: [2]Ast.Node.Index = undefined;
+    const statements = ast.fullBlock(&buffer, ast.declFunction(ast.rootDecls()[0]).?.body).?.ast.statements;
+    const expression = ast.functionExpr(ast.decl(statements[1]).ast.init_node).?;
+    const integer = try BodyChecker.defaultIntegerType(&ir);
+    const local: LocalTemplate = .{ .proto = expression.proto.ast.proto_node, .body = expression.body, .captures = &.{.{ .name = "n", .ty = integer, .mutable = true }} };
+    const ref: Ref = .{ .module = &module, .local = &local };
+    const ty = (try inferClosure(&module, &ir, ref, null, ref.span())).?;
+    try std.testing.expectEqual(if (unit_result) try ir.internType(.void) else integer, ir.getType(ty).?.function.result);
+    for (ir.getType(ty).?.function.params) |param| try std.testing.expectEqual(integer, param);
+    try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+    var sema = try Lowering.lower(&module);
+    defer sema.deinit();
+    try std.testing.expect(sema.lowering_complete);
+    try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+}
+
+test "inferred closures infer mutable capture assignments without callback context under OOM" {
+    for ([_]struct { source: []const u8, unit_result: bool = false }{
+        .{ .source = "let main:()={let mut n:int=0\nlet next=(){n+=1\nn}\n@println(next())\n}" },
+        .{ .source = "let main:()={let mut n:int=0\nlet next=(x:int){n+=x\nn}\n@println(next(1))\n}" },
+        .{ .source = "let main:()={let mut n:int=0\nlet next=(x){n+=x\nn}\n@println(next(1))\n}" },
+        .{ .source = "let main:()={let mut n:int=0\nlet next=(){n+=1}\nnext()\n}", .unit_result = true },
+        .{ .source = "let main:()={let mut n:int=0\nlet next=(x){n=x}\nnext(1)\n}", .unit_result = true },
+    }) |case| {
+        try testInferredClosureMutation(std.testing.allocator, case.source, case.unit_result);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testInferredClosureMutation, .{ case.source, case.unit_result });
+    }
+}
+
+test "inferred closures concrete signatures callback-first references defaults captures and OOM" {
+    try testInferredClosureSignatures(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testInferredClosureSignatures, .{});
 }
 
 test "backtick contextual imported public aliases retain private template provenance and visibility under OOM" {

@@ -124,7 +124,7 @@ fn analyzeModuleAnnotations(result: *Sema, module: *Module) Error!void {
             if (!full.ast.is_mutable and full.ast.init_node != 0) try result.checkScalarGlobal(module, i, full.ast.init_node, null);
             continue;
         }
-        const type_id = (try TypeResolver.resolveInContainer(module, &result.ir, type_node, declaration.container, declaration.concrete_type)) orelse {
+        const type_id = (if (function != null) try TypeResolver.resolveFunction(module, &result.ir, .{ .module = module, .id = @fromBackingInt(@intCast(i)), .analysis = result }) else try TypeResolver.resolveInContainer(module, &result.ir, type_node, declaration.container, declaration.concrete_type)) orelse {
             result.entries[result.entryIndex(module, @fromBackingInt(@intCast(i)))].status = .failed;
             continue;
         };
@@ -438,8 +438,8 @@ pub fn requestType(self: *Sema, module: *Module, id: Module.DeclId) Ir.BuildErro
     // Failed speculative requests must be retried: probes may discard their
     // diagnostics. The worklist performs a final, non-speculative request too.
     self.entries[self.entryIndex(module, @fromBackingInt(@intCast(index)))].status = .requested;
-    const function = module.source.ast.declFunction(declaration.node) orelse return null;
-    const ty = (try TypeResolver.resolveInContainer(module, &self.ir, function.proto_node, declaration.container, declaration.concrete_type)) orelse return null;
+    if (module.source.ast.declFunction(declaration.node) == null) return null;
+    const ty = (try TypeResolver.resolveFunction(module, &self.ir, .{ .module = module, .id = id, .analysis = self })) orelse return null;
     try self.syncEntries(module);
     if (declaration.noreturn and self.ir.getType(self.ir.getType(ty).?.function.result).? != .void) {
         try module.diagnostics.append(module.allocator, .{ .tag = .noreturn_result, .span = declaration.name_span });
@@ -483,7 +483,8 @@ pub fn specializeFunction(self: *Sema, caller: *Module, reference: GenericFuncti
     }
     var decl = module.getDeclaration(ref.id).?;
     const function = module.source.ast.declFunction(decl.node).?;
-    const ty = (try TypeResolver.resolveInScope(module, &self.ir, function.proto_node, decl.container, decl.concrete_type, bindings)) orelse return null;
+    const descriptor: GenericFunctions.LocalTemplate = .{ .proto = function.proto_node, .body = function.body, .outer_bindings = bindings, .container = decl.container, .concrete_type = decl.concrete_type };
+    const ty = (if (TypeResolver.hasInferredSignature(&module.source.ast, function.proto_node)) try BodyChecker.inferClosureType(module, &self.ir, .{ .module = module, .local = &descriptor, .analysis = self }, null, decl.name_span) else try TypeResolver.resolveInScope(module, &self.ir, function.proto_node, decl.container, decl.concrete_type, bindings)) orelse return null;
     if (decl.noreturn and self.ir.getType(self.ir.getType(ty).?.function.result).? != .void) {
         try module.diagnostics.append(module.allocator, .{ .tag = .noreturn_result, .span = decl.name_span });
         return null;

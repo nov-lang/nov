@@ -139,6 +139,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const closure_tests = b.step("test-cli-closures", "Run function expression and closure CLI tests");
     addClosureCliTests(b, exe, closure_tests);
     test_step.dependOn(closure_tests);
+    const inferred_closure_tests = b.step("test-cli-inferred-closures", "Run inferred closure CLI tests");
+    addInferredClosureCliTests(b, exe, inferred_closure_tests);
+    test_step.dependOn(inferred_closure_tests);
     const array_field_tests = b.step("test-cli-array-fields", "Run array-valued struct field CLI tests");
     addArrayFieldCliTests(b, exe, array_field_tests);
     test_step.dependOn(array_field_tests);
@@ -1158,6 +1161,42 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     }
 }
 
+fn addInferredClosureCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    const fixtures = b.addWriteFiles();
+    const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
+    _ = fixtures.add("inferred-closures.nov", @embedFile("examples/inferred-closures.nov"));
+    for ([_][]const u8{ "fmt", "check" }) |command| {
+        const check = b.addRunArtifact(exe);
+        check.setCwd(fixtures.getDirectory());
+        check.addArgs(&.{ command, if (std.mem.eql(u8, command, "fmt")) "--check" else "--semantic", "inferred-closures.nov" });
+        if (!std.mem.eql(u8, command, "fmt")) {
+            check.addArg("--lib-dir");
+            check.addDirectoryArg(library);
+        }
+        check.expectExitCode(0);
+        check.expectStdOutEqual("");
+        check.expectStdErrEqual("");
+        test_step.dependOn(&check.step);
+    }
+    for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+        for ([_][]const u8{ "run", "test" }) |command| {
+            const run = b.addRunArtifact(exe);
+            run.setCwd(fixtures.getDirectory());
+            run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+            run.setEnvironmentVariable("NOV_CC", "");
+            run.setEnvironmentVariable("CC", "");
+            run.addArgs(&.{ command, "inferred-closures.nov" });
+            if (mode.len != 0) run.addArg(mode);
+            run.addArg("--lib-dir");
+            run.addDirectoryArg(library);
+            run.expectExitCode(0);
+            run.expectStdOutEqual(if (std.mem.eql(u8, command, "test")) "PASS inferred_callbacks\n1 passed; 0 failed; 1 total\n" else "Doubled: [2, 4, 6]\nSelected: [4, 6]; total: 10\n");
+            run.expectStdErrEqual("");
+            test_step.dependOn(&run.step);
+        }
+    }
+}
+
 fn addClosureCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
     _ = fixtures.add("closures.nov", @embedFile("examples/closures.nov"));
@@ -1199,7 +1238,7 @@ fn addClosureCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *s
     for ([_]struct { name: []const u8, source: []const u8, diagnostic: []const u8 }{
         .{ .name = "borrow", .source = "let main=(){let mut n:int=1\nlet view=&n\nlet f=()->int {view.*}\n}\n", .diagnostic = "local references require" },
         .{ .name = "recursion", .source = "let main=(){let f=(n:int)->int {f(n)}\n}\n", .diagnostic = "unknown name 'f'" },
-        .{ .name = "parameter", .source = "let main=(){let f=(int)->int {1}\n}\n", .diagnostic = "function parameters need names and types" },
+        .{ .name = "parameter", .source = "let main=(){let f=(x){x}\n}\n", .diagnostic = "cannot infer every generic function type variable or inferred closure signature" },
         .{ .name = "foreign", .source = "@[export]\nlet callback=(f:()->int)->int {f()}\n", .diagnostic = "export ABI supports only" },
         .{ .name = "loan-call", .source = "let main=(){let mut n:int=0\nlet f=()->int {n}\nlet view=&n\n@println(f(),view.*)}\n", .diagnostic = "owner access or aliased reference arguments conflict with a live borrow" },
     }) |case| {
@@ -2281,7 +2320,7 @@ fn addGenericFunctionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_
         .{ .name = "module-generic-closure", .source = "let f=(x:`T)->`T{x}\nlet main:()={}", .diagnostic = "generic closures, local templates" },
         .{ .name = "unbound", .source = "let x:`T=true\nlet main:()={}", .diagnostic = "unbound backtick type variable" },
         .{ .name = "unbound-body", .source = "let f:(x:`T)->`T={let y:`U=x\ny}\nlet main:()={let x=f(true)\n}", .diagnostic = "unbound backtick type variable" },
-        .{ .name = "unsupported-inference", .source = "let f:(x:`T)->`U=match x{true=>\"yes\"\nfalse=>\"no\"}\nlet main:()={let x=f(true)\n}", .diagnostic = "type-constraint inference for this generic function body expression is not supported yet" },
+        .{ .name = "unsupported-inference", .source = "let f:(x:`T)->`U=match x{true=>\"yes\"\nfalse=>\"no\"}\nlet main:()={let x=f(true)\n}", .diagnostic = "type-constraint inference for this generic function or inferred closure body expression is not supported yet" },
         .{ .name = "bound-method", .source = "let S=struct{let f:(self:S,x:`T)->`T=x\n}\nlet main:()={let s=S[]\nlet f:(bool)->bool=s.f\n}", .diagnostic = "unknown container field, method, enum tag or union variant" },
         .{ .name = "private-function", .source = "let lib=@import(\"library.nov\")\nlet main:()={let x=lib.hidden(true)\n}", .diagnostic = "declaration needs a resolved type before use here" },
         .{ .name = "private-method", .source = "let lib=@import(\"library.nov\")\nlet main:()={let x=lib.NS.private(true)\n}", .diagnostic = "declaration needs a resolved type before use here" },
@@ -2796,12 +2835,12 @@ fn addArrayHelperCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step
         }
     }
     for ([_]struct { name: []const u8, source: []const u8, diagnostic: []const u8 }{
-        .{ .name = "map-parameter", .source = "std.array.map(@as([]int,[1]),(x:bool)->bool{x})", .diagnostic = "generic function constraints require exactly identical types" },
-        .{ .name = "map-arity", .source = "std.array.map(@as([]int,[1]),(x:int,y:int)->int{x+y})", .diagnostic = "generic function constraints require exactly identical types" },
-        .{ .name = "filter-result", .source = "std.array.filter(@as([]int,[1]),(x:int)->int{x})", .diagnostic = "generic function constraints require exactly identical types" },
-        .{ .name = "filter-parameter", .source = "std.array.filter(@as([]int,[1]),(x:bool)->bool{x})", .diagnostic = "generic function constraints require exactly identical types" },
-        .{ .name = "fold-result", .source = "std.array.fold(@as([]int,[1]),@as(int,0),(a:int,x:int)->bool{true})", .diagnostic = "generic function constraints require exactly identical types" },
-        .{ .name = "fold-arity", .source = "std.array.fold(@as([]int,[1]),@as(int,0),(x:int)->int{x})", .diagnostic = "generic function constraints require exactly identical types" },
+        .{ .name = "map-parameter", .source = "std.array.map(@as([]int,[1]),(x:bool)->bool{x})", .diagnostic = "constraints require exactly identical types" },
+        .{ .name = "map-arity", .source = "std.array.map(@as([]int,[1]),(x:int,y:int)->int{x+y})", .diagnostic = "constraints require exactly identical types" },
+        .{ .name = "filter-result", .source = "std.array.filter(@as([]int,[1]),(x:int)->int{x})", .diagnostic = "constraints require exactly identical types" },
+        .{ .name = "filter-parameter", .source = "std.array.filter(@as([]int,[1]),(x:bool)->bool{x})", .diagnostic = "constraints require exactly identical types" },
+        .{ .name = "fold-result", .source = "std.array.fold(@as([]int,[1]),@as(int,0),(a:int,x:int)->bool{true})", .diagnostic = "constraints require exactly identical types" },
+        .{ .name = "fold-arity", .source = "std.array.fold(@as([]int,[1]),@as(int,0),(x:int)->int{x})", .diagnostic = "constraints require exactly identical types" },
         .{ .name = "map-empty", .source = "std.array.map([],identity)", .diagnostic = "provide typed runtime arguments" },
         .{ .name = "filter-empty", .source = "std.array.filter([],(x:`T)->bool{true})", .diagnostic = "provide typed runtime arguments" },
         .{ .name = "fold-empty", .source = "std.array.fold([],@as(int,0),(a:int,x:`T)->int{a})", .diagnostic = "provide typed runtime arguments" },
