@@ -50,6 +50,18 @@ results. See `examples/array-fields.nov`.
 
 ## Current delivered status
 
+`std.array` now also provides `any`, `all`, `find`, `findIndex` and `each`.
+Predicates short-circuit at the first decisive element in source order; empty
+`any` is false and empty `all` is true. Searches return canonical `std.Option(T)`
+and `std.Option(uint)` respectively, with a zero-based pointer-sized unsigned
+index; absence yields none. `each` requires a void callback and constructs no
+result array. Empty input invokes no callback, but argument expressions remain
+eager and left-to-right. Existing recursive-copy/shared-capture contracts apply.
+`find` is limited by current union payload support (no direct array, union,
+function or range payload); `findIndex` and the other helpers support all current
+array element types. No new borrowing or optimization is introduced. See
+`examples/array-search.nov` and `lib/README.md`.
+
 Function expressions support inferred parameters and results: `(x) { x * 2 }`
 works in `std.array.map([1, 2, 3], ...)`, with equivalent multi-parameter
 `fold` and expected-function-type contexts. Braces remain mandatory and no `=`

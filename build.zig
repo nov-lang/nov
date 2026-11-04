@@ -154,6 +154,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const array_helper_tests = b.step("test-cli-array-helpers", "Run standard-library array helper CLI tests");
     addArrayHelperCliTests(b, exe, array_helper_tests);
     test_step.dependOn(array_helper_tests);
+    const array_search_tests = b.step("test-cli-array-search", "Run standard-library array search and traversal CLI tests");
+    addArraySearchCliTests(b, exe, array_search_tests);
+    test_step.dependOn(array_search_tests);
     const constructor_shorthand_tests = b.step("test-cli-constructor-shorthand", "Run constructor field shorthand CLI tests");
     addConstructorShorthandCliTests(b, exe, constructor_shorthand_tests);
     test_step.dependOn(constructor_shorthand_tests);
@@ -2873,6 +2876,160 @@ fn addArrayHelperCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step
             for ([_][]const u8{ "run", "test" }) |command| {
                 const run = b.addRunArtifact(exe);
                 run.step.name = b.fmt("CLI array helpers: {s} {s} panic ({s})", .{ command, helper, mode });
+                run.setCwd(fixtures.getDirectory());
+                run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+                run.setEnvironmentVariable("NOV_CC", "");
+                run.setEnvironmentVariable("CC", "");
+                run.addArgs(&.{ command, source, "--lib-dir" });
+                run.addDirectoryArg(library);
+                if (mode.len != 0) run.addArg(mode);
+                run.expectExitCode(1);
+                run.expectStdOutEqual(if (std.mem.eql(u8, command, "test")) "1FAIL callback_panic (exit 1)\n0 passed; 1 failed; 1 total\n" else "1");
+                run.expectStdErrEqual(b.fmt("panic: {s} callback\n", .{helper}));
+                test_step.dependOn(&run.step);
+            }
+        }
+    }
+}
+
+fn addArraySearchCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    const fixtures = b.addWriteFiles();
+    const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
+    _ = fixtures.add("array-search.nov", @embedFile("examples/array-search.nov"));
+    const api_source =
+        \\@[public]
+        \\let any = @import("std").array.any
+        \\@[public]
+        \\let all = @import("lib/array.nov").all
+        \\@[public]
+        \\let find = @import("std").array.find
+        \\@[public]
+        \\let findIndex = @import("lib/array.nov").findIndex
+        \\@[public]
+        \\let each = @import("std").array.each
+        \\
+    ;
+    _ = fixtures.add("api.nov", api_source);
+    const aliases_source =
+        \\let standard = @import("std")
+        \\let direct = @import("lib/array.nov")
+        \\let option = @import("lib/option.nov")
+        \\let alternate = @import("lib/./option.nov")
+        \\let api = @import("api.nov")
+        \\let find = api.find
+        \\let verify: () = {
+        \\    let items: []int = [1, 2, 3]
+        \\    let predicate = (value: int) -> bool { value > 1 }
+        \\    let search: ([]int, (int) -> bool) -> option.Option(int) = find
+        \\    let locate: ([]int, (int) -> bool) -> alternate.Option(uint) = api.findIndex
+        \\    let found: standard.Option(int) = search(items, predicate)
+        \\    let index: standard.Option(uint) = locate(items, predicate)
+        \\    @assert(found.unwrapOr(0) == 2 and index.unwrapOr(99) == 1)
+        \\    @assert(api.any(items, predicate) and api.all(items, predicate) == false)
+        \\    @assert(direct.find(items, predicate).unwrapOr(0) == 2)
+        \\    @assert(direct.findIndex(items, predicate).unwrapOr(99) == 1)
+        \\    let mut sum: int = 0
+        \\    let visit: ([]int, (int) -> void) -> void = api.each
+        \\    visit(items, (value: int) -> void { sum += value })
+        \\    @assert(sum == 6)
+        \\}
+        \\@[test]
+        \\let aliases_and_canonical_option: () = verify()
+        \\let main: () = verify()
+        \\
+    ;
+    _ = fixtures.add("aliases.nov", aliases_source);
+    for ([_][]const u8{ "array-search.nov", "lib/std.nov", "lib/array.nov", "api.nov", "aliases.nov" }) |source| {
+        for ([_]bool{ false, true }) |semantic| {
+            if (!semantic and (std.mem.eql(u8, source, "api.nov") or std.mem.eql(u8, source, "aliases.nov"))) continue;
+            const check = b.addRunArtifact(exe);
+            check.step.name = b.fmt("CLI array search: {s} {s}", .{ if (semantic) "semantic" else "fmt", source });
+            check.setCwd(fixtures.getDirectory());
+            check.addArgs(if (semantic) &.{ "check", "--semantic", source } else &.{ "fmt", "--check", source });
+            if (semantic) {
+                check.addArg("--lib-dir");
+                check.addDirectoryArg(library);
+            }
+            check.expectExitCode(0);
+            check.expectStdOutEqual("");
+            check.expectStdErrEqual("");
+            test_step.dependOn(&check.step);
+        }
+    }
+    const example_output = "Any: true\nAll: false\nFirst: 3\nIndex: 0\nEach: 3 1 4 2\n";
+    const example_tests = "PASS any_all_shortcircuit_order\nPASS first_match_index_and_none\nPASS empty_identities_and_each_order\nPASS find_payload_types_and_recursive_copies\nPASS function_elements_and_other_index_types\nPASS eager_arguments_and_mutation_snapshots\nPASS empty_arguments_are_still_eager\n7 passed; 0 failed; 7 total\n";
+    const package = b.addWriteFiles();
+    const installed_exe = package.addCopyFile(exe.getEmittedBin(), b.fmt("bin/{s}", .{exe.out_filename}));
+    _ = package.addCopyDirectory(b.path("lib"), "lib/nov", .{});
+    // Direct imports must resolve to the same library as the relocated executable.
+    _ = package.add("array-search.nov", @embedFile("examples/array-search.nov"));
+    _ = package.add("api.nov", std.mem.replaceOwned(u8, b.allocator, api_source, "lib/", "lib/nov/") catch @panic("OOM"));
+    _ = package.add("aliases.nov", std.mem.replaceOwned(u8, b.allocator, aliases_source, "lib/", "lib/nov/") catch @panic("OOM"));
+    for ([_]bool{ false, true }) |installed| {
+        for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+            for ([_][]const u8{ "run", "test" }) |command| {
+                for ([_][]const u8{ "array-search.nov", "aliases.nov" }) |source| {
+                    const run = if (installed) std.Build.Step.Run.create(b, "CLI array search: relocated install") else b.addRunArtifact(exe);
+                    run.step.name = b.fmt("CLI array search: {s} {s} {s} (installed={})", .{ command, source, mode, installed });
+                    if (installed) run.addFileArg(installed_exe);
+                    run.setCwd(if (installed) package.getDirectory() else fixtures.getDirectory());
+                    run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+                    run.setEnvironmentVariable("NOV_CC", "");
+                    run.setEnvironmentVariable("CC", "");
+                    run.addArgs(&.{ command, source });
+                    if (mode.len != 0) run.addArg(mode);
+                    if (!installed) {
+                        run.addArg("--lib-dir");
+                        run.addDirectoryArg(library);
+                    }
+                    const is_test = std.mem.eql(u8, command, "test");
+                    const example = std.mem.eql(u8, source, "array-search.nov");
+                    run.expectExitCode(0);
+                    run.expectStdOutEqual(if (example) (if (is_test) example_tests else example_output) else if (is_test) "PASS aliases_and_canonical_option\n1 passed; 0 failed; 1 total\n" else "");
+                    run.expectStdErrEqual("");
+                    test_step.dependOn(&run.step);
+                }
+            }
+        }
+    }
+    for ([_]struct { name: []const u8, expression: []const u8, diagnostic: []const u8 }{
+        .{ .name = "any-parameter", .expression = "std.array.any(@as([]int,[1]),(x:bool)->bool{x})", .diagnostic = "constraints require exactly identical types" },
+        .{ .name = "all-result", .expression = "std.array.all(@as([]int,[1]),(x:int)->int{x})", .diagnostic = "constraints require exactly identical types" },
+        .{ .name = "find-parameter", .expression = "std.array.find(@as([]int,[1]),(x:bool)->bool{x})", .diagnostic = "constraints require exactly identical types" },
+        .{ .name = "index-result", .expression = "std.array.findIndex(@as([]int,[1]),(x:int)->int{x})", .diagnostic = "constraints require exactly identical types" },
+        .{ .name = "each-nonvoid", .expression = "std.array.each(@as([]int,[1]),(x:int)->int{x})", .diagnostic = "constraints require exactly identical types" },
+        .{ .name = "find-array", .expression = "std.array.find(@as([][]int,[[1]]),yes)", .diagnostic = "not supported" },
+        .{ .name = "find-union", .expression = "std.array.find(@as([]Payload,[.none[]]),yes)", .diagnostic = "not supported" },
+        .{ .name = "find-function", .expression = "std.array.find([()->int{1}],yes)", .diagnostic = "not supported" },
+        .{ .name = "find-range", .expression = "std.array.find([1..3],yes)", .diagnostic = "not supported" },
+        .{ .name = "any-empty", .expression = "std.array.any([],yes)", .diagnostic = "provide typed runtime arguments" },
+        .{ .name = "all-empty", .expression = "std.array.all([],yes)", .diagnostic = "provide typed runtime arguments" },
+        .{ .name = "find-empty", .expression = "std.array.find([],yes)", .diagnostic = "provide typed runtime arguments" },
+        .{ .name = "index-empty", .expression = "std.array.findIndex([],yes)", .diagnostic = "provide typed runtime arguments" },
+        .{ .name = "each-empty", .expression = "std.array.each([],(x:`T)->void{})", .diagnostic = "provide typed runtime arguments" },
+    }) |case| {
+        const source = b.fmt("invalid-array-search-{s}.nov", .{case.name});
+        _ = fixtures.add(source, b.fmt("let std=@import(\"std\")\nlet Payload=union{{none,}}\nlet yes:(x:`T)->bool=true\nlet main:()={{let result={s}\n}}\n", .{case.expression}));
+        const check = b.addRunArtifact(exe);
+        check.step.name = b.fmt("CLI array search: reject {s}", .{case.name});
+        check.setCwd(fixtures.getDirectory());
+        check.addArgs(&.{ "check", "--semantic", source, "--lib-dir" });
+        check.addDirectoryArg(library);
+        check.expectExitCode(1);
+        check.expectStdOutEqual("");
+        check.expectStdErrMatch(".nov:");
+        check.expectStdErrMatch("error:");
+        check.expectStdErrMatch(case.diagnostic);
+        test_step.dependOn(&check.step);
+    }
+    for ([_][]const u8{ "any", "all", "find", "findIndex", "each" }) |helper| {
+        const source = b.fmt("panic-array-search-{s}.nov", .{helper});
+        const result_type = if (std.mem.eql(u8, helper, "each")) "void" else "bool";
+        _ = fixtures.add(source, b.fmt("let std=@import(\"std\")\nlet verify:()={{{s}std.array.{s}(@as([]int,[1,2]),(value:int)->{s}{{@print(value)\n@panic(\"{s} callback\")}})\n@println(\"unreachable\")}}\n@[test]\nlet callback_panic:()=verify()\nlet main:()=verify()\n", .{ if (std.mem.eql(u8, helper, "each")) "" else "let result=", helper, result_type, helper }));
+        for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+            for ([_][]const u8{ "run", "test" }) |command| {
+                const run = b.addRunArtifact(exe);
+                run.step.name = b.fmt("CLI array search: {s} {s} panic ({s})", .{ command, helper, mode });
                 run.setCwd(fixtures.getDirectory());
                 run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
                 run.setEnvironmentVariable("NOV_CC", "");

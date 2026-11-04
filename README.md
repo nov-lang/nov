@@ -1576,10 +1576,33 @@ Signatures below use `T`/`U` for inferred backtick type variables:
 - `fold(items: []T, initial: U, combine: (U, T) -> U) -> U` folds left from the
   seed: `combine(combine(initial, items[0]), items[1])`, and so on.
 
-Callbacks run once per element, in source order, and never run for empty input.
-Empty map/filter results are empty arrays; empty fold returns the seed. Callee
-and argument expressions still evaluate eagerly in normal left-to-right call
-order, including the callback expression and fold seed on empty input.
+- `any(items: []T, predicate: (T) -> bool) -> bool` stops at the first true result.
+- `all(items: []T, predicate: (T) -> bool) -> bool` stops at the first false result.
+- `find(items: []T, predicate: (T) -> bool) -> Option(T)` returns the first match.
+- `findIndex(items: []T, predicate: (T) -> bool) -> Option(uint)` returns the first
+  matching zero-based index; indices use pointer-sized unsigned `uint`.
+- `each(items: []T, action: (T) -> void) -> void` visits every element without
+  building a result array. A nonvoid callback is an error, not silently discarded.
+
+Callbacks run once per visited element in source order, and never run for empty
+input. Empty map/filter results are empty arrays; empty fold returns the seed;
+empty `any` is false and empty `all` is true. Both searches return `.none[]` when
+nothing matches. Callee and argument expressions still evaluate eagerly in normal
+left-to-right call order, including callback construction on empty input.
+
+```nov
+let found = array.find([1, 2, 3], (x) { x > 1 })
+let hasEven = array.any([1, 2, 3], (x) { x % 2 == 0 })
+array.each([1, 2, 3], (x) { @println(x) })
+```
+
+`find` requires an element type supported as an `Option` payload: bool, integers,
+floats, runes, strings, enums and supported acyclic records (including array
+fields). Bare arrays, unions, functions and ranges are not yet union payloads;
+use `findIndex` for those element types. The other helpers accept all supported
+array element types. `find` returns a value, not a reference to source storage.
+See [`examples/array-search.nov`](examples/array-search.nov) for a runnable example
+and seven tests.
 
 Ordinary functions, capturing closures and inferred generic closures/local generic
 functions are supported within the bounded inference rules. Typed inputs and seeds

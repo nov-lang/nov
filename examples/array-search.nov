@@ -1,0 +1,250 @@
+; nov run examples/array-search.nov
+; nov test examples/array-search.nov
+
+let std = @import("std")
+
+let Row = struct {
+    values: [][]int,
+}
+
+let Color = enum {
+    red,
+    blue,
+}
+
+let Payload = union {
+    value: int,
+    none,
+}
+
+@[test]
+let any_all_shortcircuit_order: () = {
+    let items: []int = [3, 1, 4, 2]
+    let mut calls: int = 0
+    let mut seen: int = 0
+    let large = (value: int) -> bool {
+        calls += 1
+        seen = seen * 10 + value
+        value > 3
+    }
+    @assert(std.array.any(items, large))
+    @assert(calls == 3 and seen == 314)
+    calls = 0
+    seen = 0
+    @assert(std.array.all(items, large) == false)
+    @assert(calls == 1 and seen == 3)
+    calls = 0
+    seen = 0
+    @assert(std.array.any(@as([]int, [3, 1, 2]), large) == false)
+    @assert(calls == 3 and seen == 312)
+    calls = 0
+    seen = 0
+    @assert(std.array.all(@as([]int, [4, 5]), large))
+    @assert(calls == 2 and seen == 45)
+}
+
+@[test]
+let first_match_index_and_none: () = {
+    let items: []int = [3, 1, 4, 4, 2]
+    let mut calls: int = 0
+    let mut seen: int = 0
+    let matches = (value: int) -> bool {
+        calls += 1
+        seen = seen * 10 + value
+        value == 4
+    }
+    @assert(std.array.find(items, matches).unwrapOr(0) == 4)
+    @assert(calls == 3 and seen == 314)
+    calls = 0
+    seen = 0
+    let index: std.Option(uint) = std.array.findIndex(items, matches)
+    @assert(index.unwrapOr(99) == 2 and calls == 3 and seen == 314)
+    @assert(std.array.findIndex(@as([]int, [4]), matches).unwrapOr(99) == 0)
+    let never = (value: int) -> bool {
+        calls += 1
+        false
+    }
+    calls = 0
+    @assert(std.array.find(items, never).isNone())
+    @assert(calls == 5)
+    @assert(std.array.findIndex(items, never).isNone())
+    @assert(calls == 10)
+}
+
+@[test]
+let empty_identities_and_each_order: () = {
+    let empty: []int = []
+    let mut calls: int = 0
+    let predicate = (value: int) -> bool {
+        calls += 1
+        true
+    }
+    @assert(std.array.any(empty, predicate) == false)
+    @assert(std.array.all(empty, predicate))
+    @assert(std.array.find(empty, predicate).isNone())
+    @assert(std.array.findIndex(empty, predicate).isNone())
+    let mut seen: int = 0
+    let visit = (value: int) -> void {
+        calls += 1
+        seen = seen * 10 + value
+    }
+    std.array.each(empty, visit)
+    @assert(calls == 0 and seen == 0)
+    std.array.each(@as([]int, [3, 1, 4, 2]), visit)
+    @assert(calls == 4 and seen == 3142)
+}
+
+@[test]
+let find_payload_types_and_recursive_copies: () = {
+    let yes = (value: `T) -> bool {
+        true
+    }
+    @assert(std.array.find([false, true], yes).unwrapOr(true) == false)
+    @assert(std.array.find(@as([]i32, [7]), yes).unwrapOr(0) == 7)
+    @assert(std.array.find(@as([]f64, [1.5]), yes).unwrapOr(0.0) == 1.5)
+    @assert(std.array.find(['λ'], yes).unwrapOr('x') == 'λ')
+    @assert(std.array.find(["first", "second"], yes).unwrapOr("") == "first")
+    let colors: []Color = [.blue, .red]
+    @assert(std.array.find(colors, yes).unwrapOr(.red) == .blue)
+    let mut source = [Row[ .values = [[1, 2], [3]] ]]
+    let found = std.array.find(
+        source,
+        (value: Row) -> bool {
+            let mut copy = value
+            copy.values = [[8]]
+            source[0] = Row[ .values = [[9]] ]
+            true
+        }
+    )
+    let mut row = found.unwrapOr(Row[ .values = [] ])
+    @assert(row.values[0][0] == 1 and row.values[0].len == 2)
+    row.values = [[7]]
+    @assert(found.unwrapOr(Row[ .values = [] ]).values[0][0] == 1)
+    @assert(source[0].values[0][0] == 9)
+}
+
+@[test]
+let function_elements_and_other_index_types: () = {
+    let mut count: int = 0
+    let next = () -> int {
+        count += 1
+        count
+    }
+    let functions: []() -> int = [next, next, next]
+    let index = std.array.findIndex(
+        functions,
+        (value: () -> int) -> bool {
+            value() == 2
+        }
+    )
+    @assert(index.unwrapOr(99) == 1 and count == 2)
+    std.array.each(
+        functions,
+        (value: () -> int) -> void {
+            let result = value()
+        }
+    )
+    @assert(count == 5 and next() == 6)
+    let yes = (value: `T) -> bool {
+        true
+    }
+    @assert(std.array.findIndex(@as([][]int, [[1], [2]]), yes).unwrapOr(99) == 0)
+    let payloads: []Payload = [.none[], .value[3]]
+    @assert(std.array.findIndex(payloads, yes).unwrapOr(99) == 0)
+    @assert(std.array.findIndex([1..3, 4..6], yes).unwrapOr(99) == 0)
+}
+
+@[test]
+let eager_arguments_and_mutation_snapshots: () = {
+    let mut events: int = 0
+    let mut source: []int = [1, 2]
+    let getIndex = () -> ([]int, (int) -> bool) -> std.Option(uint) {
+        events = events * 10 + 1
+        std.array.findIndex
+    }
+    let index = getIndex()(
+        {
+            events = events * 10 + 2
+            source
+        },
+        {
+            events = events * 10 + 3
+            source[0] = 9
+            (value: int) -> bool {
+                events = events * 10 + value
+                source[1] = 8
+                value == 2
+            }
+        }
+    )
+    @assert(events == 12312 and index.unwrapOr(99) == 1)
+    @assert(source[0] == 9 and source[1] == 8)
+    events = 0
+    std.array.each(
+        {
+            events = events * 10 + 1
+            source
+        },
+        {
+            events = events * 10 + 2
+            source[0] = 7
+            (value: int) -> void {
+                events = events * 10 + value
+                source[1] = 6
+            }
+        }
+    )
+    @assert(events == 1298 and source[0] == 7 and source[1] == 6)
+}
+
+@[test]
+let empty_arguments_are_still_eager: () = {
+    let mut events: int = 0
+    let items = () -> []int {
+        events = events * 10 + 1
+        []
+    }
+    let predicate = () -> (int) -> bool {
+        events = events * 10 + 2
+        (value: int) -> bool {
+            @panic("empty callback")
+        }
+    }
+    @assert(std.array.any(items(), predicate()) == false and events == 12)
+    events = 0
+    @assert(std.array.all(items(), predicate()) and events == 12)
+    events = 0
+    @assert(std.array.find(items(), predicate()).isNone() and events == 12)
+    events = 0
+    @assert(std.array.findIndex(items(), predicate()).isNone() and events == 12)
+    events = 0
+    std.array.each(
+        items(),
+        {
+            events = events * 10 + 2
+            (value: int) -> void {
+                @panic("empty callback")
+            }
+        }
+    )
+    @assert(events == 12)
+}
+
+let main: () = {
+    let numbers: []int = [3, 1, 4, 2]
+    let large = (value: int) {
+        value > 2
+    }
+    @println("Any:", std.array.any(numbers, large))
+    @println("All:", std.array.all(numbers, large))
+    @println("First:", std.array.find(numbers, large))
+    @println("Index:", std.array.findIndex(numbers, large))
+    @print("Each:")
+    std.array.each(
+        numbers,
+        (value) {
+            @print(" {value}")
+        }
+    )
+    @println("")
+}

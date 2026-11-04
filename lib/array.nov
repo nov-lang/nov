@@ -1,3 +1,6 @@
+let std = @import("std.nov")
+let Option = std.Option
+
 @[public]
 let map: (items: []`T, convert: (`T) -> `U) -> []`U = {
     let mut result: []`U = []
@@ -25,4 +28,53 @@ let fold: (items: []`T, initial: `U, combine: (`U, `T) -> `U) -> `U = {
         result = combine(result, item)
     }
     result
+}
+
+@[public]
+let any: (items: []`T, predicate: (`T) -> bool) -> bool = {
+    loop item in items {
+        if predicate(item) {
+            return true
+        }
+    }
+    false
+}
+
+@[public]
+let all: (items: []`T, predicate: (`T) -> bool) -> bool = {
+    loop item in items {
+        if predicate(item) == false {
+            return false
+        }
+    }
+    true
+}
+
+@[public]
+let find: (items: []`T, predicate: (`T) -> bool) -> Option(`T) = {
+    loop item in items {
+        if predicate(item) {
+            return .some[item]
+        }
+    }
+    .none[]
+}
+
+@[public]
+let findIndex: (items: []`T, predicate: (`T) -> bool) -> Option(uint) = {
+    let mut index: uint = 0
+    loop item in items {
+        if predicate(item) {
+            return .some[index]
+        }
+        index += 1
+    }
+    .none[]
+}
+
+@[public]
+let each: (items: []`T, action: (`T)) = {
+    loop item in items {
+        action(item)
+    }
 }

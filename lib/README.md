@@ -64,7 +64,7 @@ only for the absent quotient.
 
 ## Array helpers
 
-`array.nov` implements three public generic functions.
+`array.nov` implements eight public generic functions.
 Signatures here use `T`/`U` for inferred backtick type variables:
 
 - `array.map(items: []T, convert: (T) -> U) -> []U` converts every element.
@@ -73,10 +73,35 @@ Signatures here use `T`/`U` for inferred backtick type variables:
 - `array.fold(items: []T, initial: U, combine: (U, T) -> U) -> U` is a left fold
   starting with `initial`, passing the accumulator before the element.
 
-Each callback runs exactly once per input element, in source order. Empty input
-invokes no callback: map/filter return empty arrays and fold returns `initial`.
-This does not defer argument expressions: callee then arguments evaluate eagerly
-in ordinary left-to-right order, including callback construction and the seed.
+- `array.any(items: []T, predicate: (T) -> bool) -> bool` stops at the first true
+  predicate; `array.all` has the same signature and stops at the first false one.
+- `array.find(items: []T, predicate: (T) -> bool) -> Option(T)` returns the first
+  matching element by value.
+- `array.findIndex(items: []T, predicate: (T) -> bool) -> Option(uint)` returns its
+  zero-based, pointer-sized unsigned index.
+- `array.each(items: []T, action: (T) -> void) -> void` visits all elements without
+  constructing an output array. Callbacks must return void.
+
+Callbacks run once per visited element in source order. Empty input invokes no
+callback: map/filter return empty arrays, fold returns `initial`, any returns
+false, all returns true, and both searches return `.none[]`. Searches also return
+none if every predicate is false. Short-circuiting skips later callback bodies,
+not argument expressions: callee then arguments evaluate eagerly in ordinary
+left-to-right order, including callback construction and the seed.
+
+`find` supports the existing `Option` payload types: bool, integers, floats,
+runes, strings, enums and supported acyclic records, including array fields.
+Bare arrays, unions, functions and ranges cannot be union payloads yet; use
+`findIndex` to search those arrays. Other helpers accept all supported element
+types. The returned `Option` is the same canonical type as `std.Option`.
+
+```nov
+let found = array.find([1, 2, 3], (x) { x > 1 })
+let hasEven = array.any([1, 2, 3], (x) { x % 2 == 0 })
+array.each([1, 2, 3], (x) { @println(x) })
+```
+
+See `examples/array-search.nov` for a runnable example and seven tests.
 Ordinary functions and capturing closures are supported, as are inferred generic
 closures/local generic functions within the bounded solver. Typed inputs, seeds,
 callback signatures, expected results and supported body constraints take precedence
