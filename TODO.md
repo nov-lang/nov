@@ -50,6 +50,18 @@ results. See `examples/array-fields.nov`.
 
 ## Current delivered status
 
+Cyclic source imports are supported, including self-imports, mutually importing
+modules and the stdlib's `std -> array -> std` re-export graph. Canonical sources
+are loaded once and backedges are retained without recursive rediscovery. Named
+`std` and relative imports share identity when they resolve to the same file;
+visibility and library-root lookup rules are unchanged. Actual circular value,
+type-alias, generic-alias and by-value layout dependencies still diagnose.
+Cross-source type aliases use one identity-keyed worklist and active global type
+queries are bounded. Tests cover cycles, visibility, repeated lowering, canonical
+Option identity, source-free emission and OOM. Zip body inference also correctly
+distinguishes union constructors such as `.some[index]` from array indexing,
+preserving unsigned payload types in `std.array.findIndex`.
+
 Zip iteration is implemented: `loop item, index in items, 0.. { ... }` and
 arbitrary positional arrays/strings/bounded ranges. Binding/source counts must
 match; finite cardinalities must match before the first body execution, otherwise

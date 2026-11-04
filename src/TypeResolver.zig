@@ -101,7 +101,8 @@ pub fn isThisAlias(ast: *const Ast, node: Ast.Node.Index) bool {
 }
 
 pub const Binding = Module.TypeBinding;
-const Environment = struct { bindings: []const Binding, values: []const Binding = &.{}, expansions: usize, publish_methods: bool = true, query_depth: usize = 0 };
+const ValueQueryMap = std.AutoHashMapUnmanaged(Compilation.DeclRef, union(enum) { visiting, complete: ?Ir.TypeId });
+const Environment = struct { bindings: []const Binding, values: []const Binding = &.{}, expansions: usize, publish_methods: bool = true, query_depth: usize = 0, value_queries: ?*ValueQueryMap = null };
 pub const max_instantiation_depth = 64;
 
 fn resolveWith(module: *Module, ir: *Ir, node: Ast.Node.Index, bindings: []const Binding, expansions: usize) Error!?Ir.TypeId {
@@ -113,57 +114,73 @@ fn resolveWithMode(module: *Module, ir: *Ir, node: Ast.Node.Index, bindings: []c
 }
 
 fn resolveEnvironment(module: *Module, ir: *Ir, node: Ast.Node.Index, env: Environment) Error!?Ir.TypeId {
+    if (env.value_queries != null) return resolveEnvironmentInner(module, ir, node, env);
+    var queries: ValueQueryMap = .empty;
+    defer queries.deinit(module.allocator);
+    var shared = env;
+    shared.value_queries = &queries;
+    return resolveEnvironmentInner(module, ir, node, shared);
+}
+
+fn resolveEnvironmentInner(module: *Module, ir: *Ir, node: Ast.Node.Index, env: Environment) Error!?Ir.TypeId {
     if (env.query_depth >= max_alias_depth) return diagnose(module, node, .type_query_limit);
     if (env.expansions >= max_instantiation_depth) return diagnose(module, node, .generic_limit);
     var aliases: AliasMap = .empty;
     defer aliases.deinit(module.allocator);
     const Task = union(enum) {
-        visit: struct { node: Ast.Node.Index, depth: usize = 0, alias_depth: usize = 0, local: bool = true },
-        finish: Module.DeclId,
+        visit: struct { module: *Module, node: Ast.Node.Index, depth: usize = 0, alias_depth: usize = 0, local: bool = true },
+        finish: Compilation.DeclRef,
     };
     var work: std.ArrayList(Task) = .empty;
     defer work.deinit(module.allocator);
-    try work.append(module.allocator, .{ .visit = .{ .node = node } });
+    try work.append(module.allocator, .{ .visit = .{ .module = module, .node = node } });
     while (work.pop()) |task| switch (task) {
-        .finish => |id| {
-            const initializer = module.source.ast.decl(module.getDeclaration(id).?.node).ast.init_node;
-            const ty = try resolveDepth(module, ir, initializer, 0, &aliases, .{ .bindings = &.{}, .expansions = env.expansions, .publish_methods = env.publish_methods, .query_depth = env.query_depth });
-            try aliases.put(module.allocator, id, .{ .ty = ty });
+        .finish => |ref| {
+            const owner = if (module.compilation) |comp| comp.getModule(ref.source).? else module;
+            const initializer = owner.source.ast.decl(owner.getDeclaration(ref.local).?.node).ast.init_node;
+            const ty = try resolveDepth(owner, ir, initializer, 0, &aliases, .{ .bindings = &.{}, .expansions = env.expansions, .publish_methods = env.publish_methods, .query_depth = env.query_depth, .value_queries = env.value_queries });
+            try aliases.put(module.allocator, ref, .{ .ty = ty });
         },
         .visit => |visit| {
             if (visit.depth >= max_type_depth) continue; // resolveDepth diagnoses this path.
-            const ast = &module.source.ast;
+            const owner = visit.module;
+            const ast = &owner.source.ast;
             if (ast.fullFnProto(visit.node)) |proto| {
                 var iterator = proto.iterate(ast);
                 while (iterator.next()) |param| {
-                    if (!param.inferred) try work.append(module.allocator, .{ .visit = .{ .node = param.type_expr, .depth = visit.depth + 1, .alias_depth = visit.alias_depth, .local = visit.local } });
+                    if (!param.inferred) try work.append(module.allocator, .{ .visit = .{ .module = owner, .node = param.type_expr, .depth = visit.depth + 1, .alias_depth = visit.alias_depth, .local = visit.local } });
                 }
-                if (proto.ast.return_type) |result| try work.append(module.allocator, .{ .visit = .{ .node = result, .depth = visit.depth + 1, .alias_depth = visit.alias_depth, .local = visit.local } });
+                if (proto.ast.return_type) |result| try work.append(module.allocator, .{ .visit = .{ .module = owner, .node = result, .depth = visit.depth + 1, .alias_depth = visit.alias_depth, .local = visit.local } });
             } else if (ast.nodes.items(.tag)[visit.node] == .array_type or ast.nodes.items(.tag)[visit.node] == .ref_type) {
-                try work.append(module.allocator, .{ .visit = .{ .node = ast.nodes.items(.data)[visit.node].rhs, .depth = visit.depth + 1, .alias_depth = visit.alias_depth, .local = visit.local } });
+                try work.append(module.allocator, .{ .visit = .{ .module = owner, .node = ast.nodes.items(.data)[visit.node].rhs, .depth = visit.depth + 1, .alias_depth = visit.alias_depth, .local = visit.local } });
             } else if (ast.fullCall(visit.node)) |call| {
                 if (isTypeOf(ast, call)) continue;
-                for (call.ast.args) |arg| try work.append(module.allocator, .{ .visit = .{ .node = arg, .depth = visit.depth + 1, .alias_depth = visit.alias_depth, .local = visit.local } });
-            } else if (ast.nodes.items(.tag)[visit.node] == .identifier) {
+                for (call.ast.args) |arg| try work.append(module.allocator, .{ .visit = .{ .module = owner, .node = arg, .depth = visit.depth + 1, .alias_depth = visit.alias_depth, .local = visit.local } });
+            } else if (ast.nodes.items(.tag)[visit.node] == .identifier or ast.nodes.items(.tag)[visit.node] == .field_access) {
                 const name = ast.tokenSlice(ast.firstToken(visit.node));
-                if (visit.local and lookupBinding(env.bindings, name) != null) continue;
-                const id = module.lookup(ast.tokenSlice(ast.firstToken(visit.node))) orelse continue;
-                const declaration = module.getDeclaration(id).?;
+                if (visit.local and ast.nodes.items(.tag)[visit.node] == .identifier and lookupBinding(env.bindings, name) != null) continue;
+                // Resolve each edge in its defining scope, retaining namespace visibility.
+                const ref: Compilation.DeclRef = if (owner.compilation) |comp| comp.reference(owner, visit.node) orelse continue else .{
+                    .source = owner.source.id,
+                    .local = if (ast.nodes.items(.tag)[visit.node] == .identifier) owner.lookup(name) orelse continue else continue,
+                };
+                const target = if (owner.compilation) |comp| comp.getModule(ref.source).? else owner;
+                const declaration = target.getDeclaration(ref.local).?;
                 if (!declaration.is_type_alias or declaration.is_generic) continue;
-                if (aliases.get(id)) |entry| {
+                if (aliases.get(ref)) |entry| {
                     if (entry.visiting) {
-                        try module.diagnostics.append(module.allocator, .{ .tag = .type_alias_cycle, .span = module.tokenSpan(ast.firstToken(visit.node)), .related = declaration.name_span });
+                        try owner.diagnostics.append(owner.allocator, .{ .tag = .type_alias_cycle, .span = owner.tokenSpan(ast.firstToken(visit.node)), .related = declaration.name_span });
                     }
                     continue;
                 }
                 if (visit.alias_depth >= max_alias_depth) {
-                    try module.diagnostics.append(module.allocator, .{ .tag = .type_alias_limit, .span = module.tokenSpan(ast.firstToken(visit.node)), .related = declaration.name_span });
-                    try aliases.put(module.allocator, id, .{});
+                    try owner.diagnostics.append(owner.allocator, .{ .tag = .type_alias_limit, .span = owner.tokenSpan(ast.firstToken(visit.node)), .related = declaration.name_span });
+                    try aliases.put(module.allocator, ref, .{});
                     continue;
                 }
-                try aliases.put(module.allocator, id, .{ .visiting = true });
-                try work.append(module.allocator, .{ .finish = id });
-                try work.append(module.allocator, .{ .visit = .{ .node = ast.decl(declaration.node).ast.init_node, .alias_depth = visit.alias_depth + 1, .local = false } });
+                try aliases.put(module.allocator, ref, .{ .visiting = true });
+                try work.append(module.allocator, .{ .finish = ref });
+                try work.append(module.allocator, .{ .visit = .{ .module = target, .node = target.source.ast.decl(declaration.node).ast.init_node, .alias_depth = visit.alias_depth + 1, .local = false } });
             }
         },
     };
@@ -173,7 +190,9 @@ fn resolveEnvironment(module: *Module, ir: *Ir, node: Ast.Node.Index, env: Envir
 // Count all explicit type nodes on a path, including the root and leaf.
 const max_type_depth = 128;
 pub const max_alias_depth = 128;
-const AliasMap = std.AutoHashMapUnmanaged(Module.DeclId, struct { visiting: bool = false, ty: ?Ir.TypeId = null });
+// Share visiting/completed state across namespace edges. Restarting resolution
+// at each imported alias makes branching cycles exponential despite depth limits.
+const AliasMap = std.AutoHashMapUnmanaged(Compilation.DeclRef, struct { visiting: bool = false, ty: ?Ir.TypeId = null });
 
 fn diagnose(module: *Module, node: Ast.Node.Index, tag: Module.Diagnostic.Tag) Error!?Ir.TypeId {
     try module.diagnostics.append(module.allocator, .{
@@ -286,7 +305,7 @@ fn resolveDepth(module: *Module, ir: *Ir, node: Ast.Node.Index, depth: usize, al
         const declaration = owner.getDeclaration(ref.local).?;
         if (declaration.is_generic) return diagnose(module, node, .generic_needs_arguments);
         if (!declaration.is_type_alias) return diagnose(module, node, .not_a_type);
-        return resolveEnvironment(owner, ir, owner.source.ast.decl(declaration.node).ast.init_node, .{ .bindings = &.{}, .expansions = env.expansions + 1, .publish_methods = env.publish_methods, .query_depth = env.query_depth });
+        return if (aliases.get(ref)) |entry| entry.ty else null;
     }
     if (ast.nodes.items(.tag)[node] != .identifier) return diagnose(module, node, .unsupported_type);
     const name = ast.tokenSlice(ast.firstToken(node));
@@ -294,7 +313,7 @@ fn resolveDepth(module: *Module, ir: *Ir, node: Ast.Node.Index, depth: usize, al
     if (module.lookup(name)) |id| {
         if (primitives.isPrimitive(name)) return diagnose(module, node, .unsupported_type);
         if (module.getDeclaration(id).?.is_generic) return diagnose(module, node, .generic_needs_arguments);
-        if (module.getDeclaration(id).?.is_type_alias) return if (aliases.get(id)) |entry| entry.ty else null;
+        if (module.getDeclaration(id).?.is_type_alias) return if (aliases.get(.{ .source = module.source.id, .local = id })) |entry| entry.ty else null;
         return diagnose(module, node, .not_a_type);
     }
     if (std.mem.eql(u8, name, "true") or std.mem.eql(u8, name, "false")) return diagnose(module, node, .not_a_type);
@@ -356,12 +375,28 @@ fn resolveValueType(module: *Module, ir: *Ir, node: Ast.Node.Index, env: Environ
     };
     const declaration = owner.getDeclaration(id).?;
     if (declaration.is_type_alias or declaration.is_namespace or declaration.is_generic or declaration.is_generic_function or (declaration.is_test and !owner.testEnabled())) return diagnose(module, node, .not_a_value);
+    // Retain failures as well as successes across sibling queries. An active-path
+    // guard alone re-expands a branching cyclic signature exponentially.
+    const ref: Compilation.DeclRef = .{ .source = owner.source.id, .local = id };
+    const queries = env.value_queries.?;
+    if (queries.get(ref)) |query| return switch (query) {
+        .visiting => diagnose(module, node, .type_query_limit),
+        .complete => |ty| ty,
+    };
+    try queries.put(module.allocator, ref, .visiting);
+    const ty = try resolveGlobalValueType(module, ir, node, owner, id, env);
+    queries.getPtr(ref).?.* = .{ .complete = ty };
+    return ty;
+}
+
+fn resolveGlobalValueType(module: *Module, ir: *Ir, node: Ast.Node.Index, owner: *Module, id: Module.DeclId, env: Environment) Error!?Ir.TypeId {
+    const declaration = owner.getDeclaration(id).?;
     const full = owner.source.ast.decl(declaration.node).ast;
     if (owner.source.ast.declFunction(declaration.node)) |function| {
         if (hasInferredSignature(&owner.source.ast, function.proto_node)) return resolveFunction(owner, ir, .{ .module = owner, .id = id });
     }
     const type_node = if (owner.source.ast.declFunction(declaration.node)) |function| function.proto_node else full.type_node;
-    const global_env: Environment = .{ .bindings = &.{}, .expansions = env.expansions, .publish_methods = env.publish_methods, .query_depth = env.query_depth + 1 };
+    const global_env: Environment = .{ .bindings = &.{}, .expansions = env.expansions, .publish_methods = env.publish_methods, .query_depth = env.query_depth + 1, .value_queries = env.value_queries };
     if (type_node != 0) return resolveEnvironment(owner, ir, type_node, global_env);
     if (full.init_node == 0) return diagnose(module, node, .unresolved_value_type);
     const global_ast = &owner.source.ast;

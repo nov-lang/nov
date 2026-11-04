@@ -1449,7 +1449,7 @@ const Solver = struct {
         const ast = &frame.ref.module.source.ast;
         const function = frame.ref.function();
         if (function.body != 0) {
-            const value = try self.expression(frame, function.body, depth + 1);
+            const value = try self.expressionExpected(frame, function.body, frame.result, depth + 1);
             try self.unify(frame.result, value, frame.ref.module.tokenSpan(ast.firstToken(function.body)), 0);
             const proto = ast.fullFnProto(function.proto_node).?;
             if (proto.ast.infer_result and root(value).value == .never and !frame.returns_value and root(frame.result).value == .unknown)
@@ -1749,7 +1749,67 @@ const Solver = struct {
         return context.result;
     }
 
+    fn tagged(self: *Solver, value: *Term) bool {
+        return switch (root(value).value) {
+            .nominal => |n| n.module.source.ast.isUnion(n.module.source.ast.decl(n.module.getDeclaration(n.id).?.node).ast.init_node),
+            .known => |ty| self.ir.getType(ty).? == .record and self.ir.getType(ty).?.record.tagged,
+            else => false,
+        };
+    }
+
+    fn constructorType(self: *Solver, frame: *Frame, base: Ast.Node.Index, expected: ?*Term, depth: usize) Ir.BuildError!?*Term {
+        const module = frame.ref.module;
+        const ast = &module.source.ast;
+        if (ast.nodes.items(.tag)[base] == .enum_literal) return expected;
+        if (ast.nodes.items(.tag)[base] != .field_access) return null;
+        const qualifier = ast.nodes.items(.data)[base].lhs;
+        if (ast.fullCall(qualifier)) |call| {
+            if (TypeResolver.genericReference(module, call.ast.fn_expr) == null and !std.mem.eql(u8, ast.tokenSlice(ast.firstToken(call.ast.fn_expr)), "@This")) return null;
+        } else {
+            if (ast.nodes.items(.tag)[qualifier] == .identifier) {
+                const name = ast.tokenSlice(ast.firstToken(qualifier));
+                for (frame.locals.items) |local| if (std.mem.eql(u8, local.name, name)) return null;
+            }
+            if (module.compilation) |comp| {
+                const ref = comp.reference(module, qualifier) orelse return null;
+                if (!comp.getModule(ref.source).?.getDeclaration(ref.local).?.is_type_alias) return null;
+            } else {
+                if (ast.nodes.items(.tag)[qualifier] != .identifier) return null;
+                const id = module.lookup(ast.tokenSlice(ast.firstToken(qualifier))) orelse return null;
+                if (!module.getDeclaration(id).?.is_type_alias and !TypeResolver.isThisAlias(ast, module.getDeclaration(id).?.node)) return null;
+            }
+        }
+        const ty = try self.typeNode(frame, qualifier, depth + 1);
+        return if (self.tagged(ty)) ty else null;
+    }
+
+    fn unionConstructor(self: *Solver, frame: *Frame, node: Ast.Node.Index, ty: *Term, depth: usize) Ir.BuildError!*Term {
+        const module = frame.ref.module;
+        const ast = &module.source.ast;
+        const data = ast.nodes.items(.data)[node];
+        const span = module.tokenSpan(ast.firstToken(node));
+        if (!self.tagged(ty)) {
+            self.unsupported = self.unsupported orelse span;
+            return self.term(.unknown, span);
+        }
+        const base = data.lhs;
+        const name = ast.tokenSlice(if (ast.nodes.items(.tag)[base] == .enum_literal) ast.nodes.items(.main_token)[base] else ast.nodes.items(.data)[base].rhs);
+        const payload_type = try self.fieldType(ty, name, span, depth + 1);
+        if (ast.nodes.items(.tag)[node] == .array_access) {
+            const payload = try self.expressionExpected(frame, data.rhs, payload_type, depth + 1);
+            if (root(payload).value == .never) return payload;
+            try self.unify(payload_type, payload, span, 0);
+        }
+        // Container syntax has no executable payload: its lone `.tag` is an
+        // enum literal. BodyChecker validates that literal and constructor arity.
+        return ty;
+    }
+
     fn expression(self: *Solver, frame: *Frame, node: Ast.Node.Index, depth: usize) Ir.BuildError!*Term {
+        return self.expressionExpected(frame, node, null, depth);
+    }
+
+    fn expressionExpected(self: *Solver, frame: *Frame, node: Ast.Node.Index, expected: ?*Term, depth: usize) Ir.BuildError!*Term {
         const module = frame.ref.module;
         const ast = &module.source.ast;
         const span = module.tokenSpan(ast.firstToken(node));
@@ -1866,6 +1926,13 @@ const Solver = struct {
                 };
             },
             .array_access => {
+                if (try self.constructorType(frame, data.lhs, expected, depth + 1)) |ty|
+                    return self.unionConstructor(frame, node, ty, depth + 1);
+                // Context-free union syntax is still not ordinary indexing.
+                if (ast.nodes.items(.tag)[data.lhs] == .enum_literal) {
+                    self.unsupported = self.unsupported orelse span;
+                    return self.term(.unknown, span);
+                }
                 const base = try self.expression(frame, data.lhs, depth + 1);
                 const known = root(base);
                 if (known.value == .never) return base;
@@ -1876,6 +1943,10 @@ const Solver = struct {
                 const element = try self.term(.unknown, span);
                 try self.unify(base, try self.term(.{ .array = element }, span), span, 0);
                 return element;
+            },
+            .container_decl_arg => {
+                if (try self.constructorType(frame, data.lhs, expected, depth + 1)) |ty|
+                    return self.unionConstructor(frame, node, ty, depth + 1);
             },
             .array_init, .array_init_comma, .array_init_two, .array_init_two_comma => {
                 const element = try self.term(.unknown, span);
@@ -1913,18 +1984,19 @@ const Solver = struct {
                             result = try self.fromType(try self.ir.internType(.void), span, 0);
                             continue;
                         }
+                        const context = if (decl.ast.type_node != 0 and signatureVariablesBound(frame, decl.ast.type_node)) try self.typeNode(frame, decl.ast.type_node, depth + 1) else null;
                         const value = if (decl.ast.init_node == 0)
                             try self.term(.unknown, span)
                         else if (named_function)
                             try self.closure(frame, decl.ast.type_node, decl.ast.init_node, depth + 1)
                         else
-                            try self.expression(frame, decl.ast.init_node, depth + 1);
+                            try self.expressionExpected(frame, decl.ast.init_node, context, depth + 1);
                         if (root(value).value == .never) return value;
                         if (decl.ast.type_node != 0) {
                             if (ast.fullFnProto(decl.ast.type_node) != null and !signatureVariablesBound(frame, decl.ast.type_node)) {
                                 try self.fail(.generic_function_context, module.tokenSpan(ast.firstToken(decl.ast.type_node)), null);
                             } else {
-                                const annotation = try self.typeNode(frame, decl.ast.type_node, depth + 1);
+                                const annotation = context orelse try self.typeNode(frame, decl.ast.type_node, depth + 1);
                                 const inferred = root(value);
                                 const annotated = root(annotation);
                                 if (ast.nodes.items(.tag)[decl.ast.init_node] == .ref_of and inferred.value == .reference and annotated.value == .reference and inferred.value.reference.mutable and !annotated.value.reference.mutable) {
@@ -1935,7 +2007,7 @@ const Solver = struct {
                         }
                         try frame.locals.append(self.allocator, .{ .name = ast.tokenSlice(decl.ast.let_token + 1 + @intFromBool(decl.ast.is_mutable)), .term = value, .mutable = decl.ast.is_mutable });
                         result = try self.fromType(try self.ir.internType(.void), span, 0);
-                    } else result = try self.expression(frame, statement, depth + 1);
+                    } else result = try self.expressionExpected(frame, statement, expected, depth + 1);
                     if (root(result).value == .never) return result;
                 }
                 return result;
@@ -1945,13 +2017,13 @@ const Solver = struct {
                 const condition = try self.expression(frame, branch.cond_expr, depth + 1);
                 if (root(condition).value == .never) return condition;
                 try self.unify(condition, try self.fromType(try self.ir.internType(.boolean), span, 0), span, 0);
-                const then = try self.expression(frame, branch.then_expr, depth + 1);
-                const otherwise = if (branch.else_expr == 0) try self.fromType(try self.ir.internType(.void), span, 0) else try self.expression(frame, branch.else_expr, depth + 1);
+                const then = try self.expressionExpected(frame, branch.then_expr, expected, depth + 1);
+                const otherwise = if (branch.else_expr == 0) try self.fromType(try self.ir.internType(.void), span, 0) else try self.expressionExpected(frame, branch.else_expr, expected, depth + 1);
                 try self.unify(then, otherwise, span, 0);
                 return if (root(then).value == .never) otherwise else then;
             },
             .@"return" => {
-                const value = if (data.rhs == 0) try self.fromType(try self.ir.internType(.void), span, 0) else try self.expression(frame, data.rhs, depth + 1);
+                const value = if (data.rhs == 0) try self.fromType(try self.ir.internType(.void), span, 0) else try self.expressionExpected(frame, data.rhs, frame.result, depth + 1);
                 if (data.rhs != 0 and root(value).value != .never) frame.returns_value = true;
                 try self.unify(frame.result, value, span, 0);
                 return self.term(.never, span);
@@ -1990,7 +2062,7 @@ const Solver = struct {
                     ast.fullCall(node).?;
                 if (std.mem.eql(u8, ast.tokenSlice(ast.firstToken(call.ast.fn_expr)), "@as") and call.ast.args.len == 2) {
                     const ty = try self.typeNode(frame, call.ast.args[0], depth + 1);
-                    const value = try self.expression(frame, call.ast.args[1], depth + 1);
+                    const value = try self.expressionExpected(frame, call.ast.args[1], ty, depth + 1);
                     if (root(value).value == .never) return value;
                     try self.unify(ty, value, span, 0);
                     return ty;
@@ -2017,7 +2089,7 @@ const Solver = struct {
                         if (f.params.len == call.ast.args.len + offset) {
                             if (callee_target.receiver) |receiver| try self.unify(f.params[0], receiver, span, 0);
                             for (f.params[offset..], call.ast.args) |param, arg| {
-                                const value = try self.expression(frame, arg, depth + 1);
+                                const value = try self.expressionExpected(frame, arg, param, depth + 1);
                                 if (root(value).value == .never) return value;
                                 try self.unifyArgument(param, value, module.tokenSpan(ast.firstToken(arg)));
                             }
@@ -2033,7 +2105,7 @@ const Solver = struct {
                 if (callee.value == .function and callee.value.function.params.len == call.ast.args.len) {
                     const f = callee.value.function;
                     for (f.params, call.ast.args) |param, arg| {
-                        const value = try self.expression(frame, arg, depth + 1);
+                        const value = try self.expressionExpected(frame, arg, param, depth + 1);
                         if (root(value).value == .never) return value;
                         try self.unifyArgument(param, value, span);
                     }
@@ -2244,6 +2316,76 @@ fn testNonStorableProbe(allocator: std.mem.Allocator) !void {
 test "non-storable array readonly probes do not publish under OOM" {
     try testNonStorableProbe(std.testing.allocator);
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testNonStorableProbe, .{});
+}
+
+fn testUnionIndexInference(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "union-index.nov",
+        \\let Option:(T:type)->type=union{some:T,none,}
+        \\let Color=enum{red,blue,}
+        \\let Box=struct{value:uint,}
+        \\let findIndex:(items:[]`T,predicate:(`T)->bool)->Option(uint)={
+        \\let mut index:uint=0
+        \\loop item in items{if predicate(item){return .some[index]}
+        \\index+=1}
+        \\.none[]}
+        \\let find:(items:[]`T)->Option(`T)={loop item in items{return .some[item]}
+        \\.none[]}
+        \\let qualified:(x:`T)->Option(`T)=Option(`T).some[x]
+        \\let color:(x:`T)->Option(Color)=.some[.red]
+        \\let boxed:(x:`T)->Option(Box)=.some[Box[.value=7]]
+        \\let first:(items:[]`T,index:int)->`T=items[index]
+        \\let main:()={
+        \\let found:Option(uint)=findIndex(@as([]int,[1,2]),(x:int)->bool{x==2})
+        \\let value:Option(uint)=find(@as([]uint,[7]))
+        \\let q:Option(uint)=qualified(@as(uint,7))
+        \\let c:Option(Color)=color(true)
+        \\let b:Option(Box)=boxed(true)
+        \\let n:uint=first(@as([]uint,[7]),0)
+        \\}
+    );
+    defer module.deinit();
+    const count = module.declarations.items.len;
+    if (module.hasErrors()) std.debug.print("union index parse: {any} {any}\n", .{ module.source.ast.errors, module.diagnostics.items });
+    var sema = Lowering.lower(&module) catch |err| {
+        try std.testing.expectEqual(count, module.declarations.items.len);
+        try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+        return err;
+    };
+    defer sema.deinit();
+    if (module.hasErrors()) std.debug.print("union index: {any} {any}\n", .{ module.source.ast.errors, module.diagnostics.items });
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+}
+
+test "union constructors preserve uint payloads independently of ordinary int indexing under OOM" {
+    try testUnionIndexInference(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testUnionIndexInference, .{});
+    const source = "let at:(items:[]`T,index:uint)->`T=items[index]\nlet main:()->bool=at([true],0)";
+    try testInferenceFailureAllocations(std.testing.allocator, source, .generic_function_conflict);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testInferenceFailureAllocations, .{ source, Module.Diagnostic.Tag.generic_function_conflict });
+}
+
+test "real std array findIndex preserves uint constructor payloads under OOM" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "main.nov", .data =
+        \\let std=@import("std")
+        \\let main:()={
+        \\let found:std.Option(uint)=std.array.findIndex(@as([]int,[1,2]),(x:int)->bool{x==2})
+        \\let missing:std.Option(uint)=std.array.findIndex(@as([]uint,[]),(x:uint)->bool{true})
+        \\let value:std.Option(uint)=std.array.find(@as([]uint,[7]),(x:uint)->bool{true})
+        \\@println(found,missing,value)
+        \\}
+    });
+    const path = try tmp.dir.realPathFileAlloc(io, "main.nov", allocator);
+    defer allocator.free(path);
+    const lib = try std.Io.Dir.cwd().realPathFileAlloc(io, "lib", allocator);
+    defer allocator.free(lib);
+    try testNonStorableImport(allocator, path, lib, null);
+    try TestAllocations.checkAllAllocationFailures(allocator, testNonStorableImport, .{ path, lib, @as(?Module.Diagnostic.Tag, null) });
 }
 
 fn testNonStorableImport(allocator: std.mem.Allocator, path: []const u8, lib: []const u8, tag: ?Module.Diagnostic.Tag) !void {

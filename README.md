@@ -1635,7 +1635,12 @@ copies, shared closure environments and argument evaluation.
 - Canonical paths cache each source once, including repeated/diamond imports.
   Independently declared types in different files remain nominally distinct;
   aliases and generic arguments preserve canonical identity across import paths.
-  Import cycles and excessive import depth diagnose rather than partially compile.
+  Cyclic module imports, including self-imports, are supported: importing a
+  namespace does not initialize or evaluate its declarations. Internal stdlib
+  modules may import `"std"` through the configured library root or `"std.nov"`
+  relatively, even when that entry module re-exports them. Actual circular value,
+  type-alias and by-value layout dependencies still diagnose, as does excessive
+  import depth along newly discovered sources.
 - Each file retains its own AST and source-qualified locations. One semantic
   worklist and shared IR pools cover the compilation; diagnostics and related
   notes can refer to different files. IR owns names/layouts/body storage and source

@@ -2959,7 +2959,7 @@ fn addArraySearchCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step
             test_step.dependOn(&check.step);
         }
     }
-    const example_output = "Any: true\nAll: false\nFirst: 3\nIndex: 0\nEach: 3 1 4 2\n";
+    const example_output = b.fmt("Any: true\nAll: false\nFirst: Option(i{d}).some[3]\nIndex: Option(u{d}).some[0]\nEach: 3 1 4 2\n", .{ @bitSizeOf(usize), @bitSizeOf(usize) });
     const example_tests = "PASS any_all_shortcircuit_order\nPASS first_match_index_and_none\nPASS empty_identities_and_each_order\nPASS find_payload_types_and_recursive_copies\nPASS function_elements_and_other_index_types\nPASS eager_arguments_and_mutation_snapshots\nPASS empty_arguments_are_still_eager\n7 passed; 0 failed; 7 total\n";
     const package = b.addWriteFiles();
     const installed_exe = package.addCopyFile(exe.getEmittedBin(), b.fmt("bin/{s}", .{exe.out_filename}));
@@ -3731,6 +3731,74 @@ fn addImportCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *st
     _ = fixtures.add("missing.nov", "let absent = @import(\"not-found.nov\")\nlet main: () = {}\n");
     _ = fixtures.add("cycle/a.nov", "let b = @import(\"b.nov\")\n");
     _ = fixtures.add("cycle/b.nov", "let a = @import(\"a.nov\")\n");
+    _ = fixtures.add("self.nov",
+        \\let self = @import("./self.nov")
+        \\@[public]
+        \\let value: () -> int = 7
+        \\let main: () = @println(self.value())
+        \\@[test]
+        \\let self_import: () = @assert(self.value() == 7)
+        \\
+    );
+    _ = fixtures.add("mutual/main.nov",
+        \\let peer = @import("peer.nov")
+        \\let standard = @import("std")
+        \\let relative = @import("../library/./std.nov")
+        \\@[public]
+        \\let Option = standard.Option
+        \\@[public]
+        \\let base: () -> int = 7
+        \\let verify: () -> int = {
+        \\    let from_peer: Option(int) = peer.value()
+        \\    let canonical: relative.Option(int) = from_peer
+        \\    let reexported: peer.Option(int) = canonical
+        \\    @assert(reexported.unwrapOr(0) == 8)
+        \\    reexported.unwrapOr(0)
+        \\}
+        \\let main: () = @println(verify())
+        \\@[test]
+        \\let mutual_import: () = @assert(verify() == 8)
+        \\
+    );
+    _ = fixtures.add("mutual/peer.nov",
+        \\let root = @import("./main.nov")
+        \\@[public]
+        \\let Option = root.Option
+        \\@[public]
+        \\let value: () -> Option(int) = .some[root.base() + 1]
+        \\let secret = 42
+        \\let Hidden = int
+        \\
+    );
+    _ = fixtures.add("mutual/private-value.nov", "let peer = @import(\"peer.nov\")\nlet main: () = @println(peer.secret)\n");
+    _ = fixtures.add("mutual/private-type.nov", "let peer = @import(\"peer.nov\")\nlet use: (value: peer.Hidden) = {}\nlet main: () = {}\n");
+    _ = fixtures.add("value-cycle/a.nov", "let peer = @import(\"b.nov\")\n@[public]\nlet value = peer.value\nlet main: () = @println(value)\n");
+    _ = fixtures.add("value-cycle/b.nov", "let peer = @import(\"a.nov\")\n@[public]\nlet value = peer.value\n");
+    _ = fixtures.add("type-cycle/a.nov", "let peer = @import(\"b.nov\")\n@[public]\nlet Alias = peer.Alias\nlet use: (value: Alias) = {}\nlet main: () = {}\n");
+    _ = fixtures.add("type-cycle/b.nov", "let peer = @import(\"a.nov\")\n@[public]\nlet Alias = peer.Alias\n");
+    for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+        for ([_][]const u8{ "self.nov", "mutual/main.nov" }) |source| {
+            for ([_][]const u8{ "run", "test" }) |command| {
+                const run = b.addRunArtifact(exe);
+                run.step.name = b.fmt("CLI imports: {s} {s} {s}", .{ command, source, mode });
+                run.setCwd(fixtures.getDirectory());
+                run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+                run.setEnvironmentVariable("NOV_CC", "");
+                run.setEnvironmentVariable("CC", "");
+                run.addArgs(&.{ command, source });
+                if (mode.len != 0) run.addArg(mode);
+                run.addArg("--lib-dir");
+                run.addDirectoryArg(library);
+                run.expectExitCode(0);
+                const self = std.mem.eql(u8, source, "self.nov");
+                run.expectStdOutEqual(if (std.mem.eql(u8, command, "test"))
+                    (if (self) "PASS self_import\n1 passed; 0 failed; 1 total\n" else "PASS mutual_import\n1 passed; 0 failed; 1 total\n")
+                else if (self) "7\n" else "8\n");
+                run.expectStdErrEqual("");
+                test_step.dependOn(&run.step);
+            }
+        }
+    }
     _ = fixtures.add("no-entry.nov", "let imported = @import(\"app/shared.nov\")\n");
     _ = fixtures.add("bad-entry.nov", "let imported = @import(\"app/shared.nov\")\nlet main = true\n");
     _ = fixtures.add("bad-import.nov", "let imported = @import(\"errors/body.nov\")\nlet main: () = {}\n");
@@ -3778,7 +3846,11 @@ fn addImportCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *st
         .{ .name = "missing imports stay syntax only", .args = &.{ "check", "missing.nov" }, .code = 0 },
         .{ .name = "missing import", .args = &.{ "check", "--semantic", "missing.nov" }, .code = 1, .diagnostic = "cannot load imported source: FileNotFound" },
         .{ .name = "missing import buffers C", .args = &.{ "emit-c", "missing.nov" }, .code = 1, .diagnostic = "cannot load imported source" },
-        .{ .name = "cycle with source note", .args = &.{ "emit-c", "cycle/a.nov" }, .code = 1, .diagnostic = "a.nov:1:9: note: earlier import in this cycle" },
+        .{ .name = "legal namespace cycle", .args = &.{ "check", "--semantic", "cycle/a.nov" }, .code = 0 },
+        .{ .name = "cross-module value cycle", .args = &.{ "emit-c", "value-cycle/a.nov" }, .code = 1, .diagnostic = "dependency analysis for this expression is not implemented yet" },
+        .{ .name = "cross-module type alias cycle", .args = &.{ "emit-c", "type-cycle/a.nov" }, .code = 1, .diagnostic = "cyclic type alias dependency" },
+        .{ .name = "cyclic module private value", .args = &.{ "emit-c", "mutual/private-value.nov" }, .code = 1, .diagnostic = "private-value.nov:2:" },
+        .{ .name = "cyclic module private type", .args = &.{ "emit-c", "mutual/private-type.nov" }, .code = 1, .diagnostic = "private-type.nov:2:" },
         .{ .name = "imported main is not entry", .args = &.{ "emit-c", "no-entry.nov" }, .code = 1, .diagnostic = "no-entry.nov:1:1: error:" },
         .{ .name = "root entry signature", .args = &.{ "emit-c", "bad-entry.nov" }, .code = 1, .diagnostic = "bad-entry.nov:2:5: error:" },
         .{ .name = "imported body diagnostic", .args = &.{ "emit-c", "bad-import.nov" }, .code = 1, .diagnostic = "body.nov:1:23: error: unknown name 'absent'" },
@@ -3787,6 +3859,7 @@ fn addImportCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *st
     for (cases) |case| {
         const run = b.addRunArtifact(exe);
         run.step.name = b.fmt("CLI imports: {s}", .{case.name});
+        run.stdio_limit = .limited(8192);
         run.setCwd(fixtures.getDirectory());
         run.addArgs(case.args);
         if (!(case.args.len == 2 and std.mem.eql(u8, case.args[0], "check"))) {

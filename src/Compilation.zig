@@ -212,7 +212,7 @@ pub fn prepareSemantics(self: *Compilation) std.mem.Allocator.Error!void {
         const ref = self.getDeclaration(edge.declaration).?;
         self.getModule(ref.source).?.declarations.items[@backingInt(ref.local)].is_namespace = true;
     }
-    try self.validateImportGraph();
+
     // Public reexports and generic aliases can cross several namespace edges.
     for (0..self.declarations.items.len + 1) |_| {
         var changed = false;
@@ -251,48 +251,6 @@ pub fn prepareSemantics(self: *Compilation) std.mem.Allocator.Error!void {
             try module.classifyAliases();
         }
         if (!changed) break;
-    }
-}
-
-fn validateImportGraph(self: *Compilation) std.mem.Allocator.Error!void {
-    const colors = try self.allocator.alloc(enum { unseen, active, done }, self.modules.items.len);
-    defer self.allocator.free(colors);
-    @memset(colors, .unseen);
-    const Frame = struct { source: Source.Id, next: usize = 0 };
-    var stack: std.ArrayList(Frame) = .empty;
-    defer stack.deinit(self.allocator);
-    for (self.modules.items, 0..) |_, start| {
-        if (colors[start] != .unseen) continue;
-        try stack.append(self.allocator, .{ .source = @fromBackingInt(@intCast(start)) });
-        colors[start] = .active;
-        while (stack.items.len != 0) {
-            const frame = &stack.items[stack.items.len - 1];
-            var child: ?Source.Id = null;
-            while (frame.next < self.imports.items.len) {
-                const edge = self.imports.items[frame.next];
-                frame.next += 1;
-                const ref = self.getDeclaration(edge.declaration).?;
-                if (ref.source != frame.source) continue;
-                switch (colors[@backingInt(edge.target)]) {
-                    .done => {},
-                    .active => {
-                        try self.diagnostics.append(self.allocator, .{ .tag = .import_cycle, .span = edge.span });
-                        return;
-                    },
-                    .unseen => {
-                        child = edge.target;
-                        break;
-                    },
-                }
-            }
-            if (child) |source| {
-                colors[@backingInt(source)] = .active;
-                try stack.append(self.allocator, .{ .source = source });
-            } else {
-                colors[@backingInt(frame.source)] = .done;
-                _ = stack.pop();
-            }
-        }
     }
 }
 
@@ -389,21 +347,13 @@ fn discover(self: *Compilation, io: std.Io, id: Source.Id, options: Options, act
             },
         };
         const global = self.declaration_ids.get(.{ .source = id, .local = declaration.? }).?;
-        var cycle = false;
+        // Namespace backedges are legal; only new DFS entries consume depth.
+        var visited = completed.contains(target);
         for (active.items) |ancestor| if (ancestor == target) {
-            cycle = true;
+            visited = true;
             break;
         };
-        if (cycle) {
-            var related: ?Source.Span = null;
-            for (self.imports.items) |edge| if (edge.target == target or edge.span.source == target) {
-                related = edge.span;
-                break;
-            };
-            try self.diagnostics.append(self.allocator, .{ .tag = .import_cycle, .span = span, .related = related });
-            continue;
-        }
-        if (active.items.len >= 256) {
+        if (!visited and active.items.len >= 256) {
             try self.diagnostics.append(self.allocator, .{ .tag = .import_depth, .span = span });
             continue;
         }
@@ -414,7 +364,7 @@ fn discover(self: *Compilation, io: std.Io, id: Source.Id, options: Options, act
             .named = named,
             .span = span,
         });
-        try self.discover(io, target, options, active, completed);
+        if (!visited) try self.discover(io, target, options, active, completed);
     }
     try completed.put(self.allocator, id, {});
 }
@@ -700,7 +650,6 @@ fn inlineErrorAllocationTest(allocator: std.mem.Allocator, path: []const u8) !vo
     defer compilation.deinit();
 
     var invalid: usize = 0;
-    var cycles: usize = 0;
     var missing: usize = 0;
     var library: usize = 0;
     var paths: usize = 0;
@@ -708,10 +657,7 @@ fn inlineErrorAllocationTest(allocator: std.mem.Allocator, path: []const u8) !vo
         try std.testing.expectEqualStrings("@import", compilation.sourceSlice(diagnostic.span).?);
         switch (diagnostic.tag) {
             .invalid_import => invalid += 1,
-            .import_cycle => {
-                cycles += 1;
-                try std.testing.expect(diagnostic.related.?.source != diagnostic.span.source);
-            },
+
             .load_failed => {
                 missing += 1;
                 try std.testing.expect(diagnostic.cause != null);
@@ -722,7 +668,7 @@ fn inlineErrorAllocationTest(allocator: std.mem.Allocator, path: []const u8) !vo
         }
     }
     try std.testing.expectEqual(@as(usize, 8), invalid);
-    try std.testing.expectEqual(@as(usize, 1), cycles);
+    try std.testing.expectEqual(@as(usize, 3), compilation.imports.items.len);
     try std.testing.expectEqual(@as(usize, 1), missing);
     try std.testing.expectEqual(@as(usize, 1), library);
     try std.testing.expectEqual(@as(usize, 1), paths);
@@ -765,6 +711,36 @@ test "inline imports reject runtime local computed mutable annotated forms and p
     defer allocator.free(path);
     try inlineErrorAllocationTest(allocator, path);
     try TestAllocations.checkAllAllocationFailures(allocator, inlineErrorAllocationTest, .{path});
+}
+
+test "backedges and completed targets at the DFS depth limit retain import edges" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "shared.nov", .data = "let value = true" });
+    for (0..256) |index| {
+        const name = try std.fmt.allocPrint(allocator, "{d}.nov", .{index});
+        defer allocator.free(name);
+        const text = if (index == 255)
+            try allocator.dupe(u8, "let root = @import(\"0.nov\")\nlet self = @import(\"255.nov\")\nlet shared = @import(\"shared.nov\")")
+        else
+            try std.fmt.allocPrint(allocator, "{s}let next = @import(\"{d}.nov\")", .{ if (index == 0) "let shared = @import(\"shared.nov\")\n" else "", index + 1 });
+        defer allocator.free(text);
+        try tmp.dir.writeFile(io, .{ .sub_path = name, .data = text });
+    }
+    const path = try tmp.dir.realPathFileAlloc(io, "0.nov", allocator);
+    defer allocator.free(path);
+    var compilation = try Compilation.load(allocator, io, path, .{});
+    defer compilation.deinit();
+    try std.testing.expect(!compilation.hasErrors());
+    try std.testing.expectEqual(@as(usize, 257), compilation.modules.items.len);
+    try std.testing.expectEqual(@as(usize, 259), compilation.imports.items.len);
+    try std.testing.expectEqual(compilation.root.?, compilation.imports.items[256].target);
+    try std.testing.expectEqual(compilation.imports.items[255].target, compilation.imports.items[257].target);
+    try std.testing.expectEqual(compilation.imports.items[0].target, compilation.imports.items[258].target);
+    try compilation.prepareSemantics();
+    try std.testing.expect(!compilation.hasErrors());
 }
 
 test "inline imports retain loader and reference depth limits" {
@@ -841,7 +817,138 @@ test "test body imports never load sources or diagnose during graph discovery un
     try TestAllocations.checkAllAllocationFailures(allocator, testIgnoredBodyImports, .{path});
 }
 
-test "loader rejects cycles missing files mutable computed and local imports" {
+const cyclic_root_source =
+    \\let standard = @import("std")
+    \\let relative = @import("lib/./array.nov")
+    \\let self = @import("./main.nov")
+    \\let Array = standard.array.Array
+    \\let visible = standard.array.standard.visible
+;
+const cyclic_std_source =
+    \\@[public]
+    \\let array = @import("array.nov")
+    \\let shared = @import("shared.nov")
+    \\@[public]
+    \\let visible = true
+;
+const cyclic_array_source =
+    \\@[public]
+    \\let standard = @import("std")
+    \\let file = @import("./std.nov")
+    \\let self = @import("./array.nov")
+    \\let shared = @import("shared.nov")
+    \\@[public]
+    \\let Array = struct { value: bool, }
+    \\let hidden = false
+;
+
+fn checkCyclicNamespaces(compilation: *Compilation) !void {
+    try std.testing.expect(!compilation.hasErrors());
+    try std.testing.expectEqual(@as(usize, 4), compilation.modules.items.len);
+    try std.testing.expectEqual(@as(usize, 9), compilation.imports.items.len);
+    const root = compilation.getModule(compilation.root.?).?;
+    const standard = compilation.namespace(compilation.declaration_ids.get(.{ .source = root.source.id, .local = root.lookup("standard").? }).?).?.target;
+    const array = compilation.namespace(compilation.declaration_ids.get(.{ .source = root.source.id, .local = root.lookup("relative").? }).?).?.target;
+    const array_module = compilation.getModule(array).?;
+    const declarations = compilation.declarations.items.len;
+    for (0..3) |_| {
+        try compilation.prepareSemantics();
+        try std.testing.expect(!compilation.hasErrors());
+        try std.testing.expectEqual(declarations, compilation.declarations.items.len);
+        try std.testing.expectEqual(@as(usize, 9), compilation.imports.items.len);
+        const array_ref = initializerReference(compilation, root, "Array").?;
+        try std.testing.expectEqual(array, array_ref.source);
+        try std.testing.expectEqual(array_module.lookup("Array").?, array_ref.local);
+        const visible = initializerReference(compilation, root, "visible").?;
+        try std.testing.expectEqual(standard, visible.source);
+        var shared: ?Source.Id = null;
+        for (compilation.imports.items) |edge| {
+            const ref = compilation.getDeclaration(edge.declaration).?;
+            const owner = compilation.getModule(ref.source).?;
+            const decl = owner.getDeclaration(ref.local).?;
+            const name = compilation.sourceSlice(decl.name_span).?;
+            try std.testing.expect(decl.is_namespace);
+            try std.testing.expectEqual(ref.source, edge.span.source);
+            try std.testing.expectEqual(edge.target, compilation.namespace(edge.declaration).?.target);
+            if (std.mem.eql(u8, name, "self")) try std.testing.expectEqual(ref.source, edge.target);
+            if (std.mem.eql(u8, name, "standard") or std.mem.eql(u8, name, "file")) {
+                try std.testing.expectEqual(standard, edge.target);
+                try std.testing.expectEqual(std.mem.eql(u8, name, "standard"), edge.named);
+            }
+            if (std.mem.eql(u8, name, "shared")) {
+                if (shared) |id| try std.testing.expectEqual(id, edge.target);
+                shared = edge.target;
+            }
+            if (edge.target == array) {
+                try std.testing.expect(compilation.lookupNamespace(root.source.id, edge.declaration, "hidden") == null);
+                try std.testing.expect(compilation.lookupNamespace(array, edge.declaration, "hidden") != null);
+            }
+        }
+        try std.testing.expect(shared != null);
+    }
+}
+
+fn cyclicLoaderAllocationTest(allocator: std.mem.Allocator, path: []const u8, lib: []const u8) !void {
+    var compilation = try Compilation.load(allocator, std.testing.io, path, .{ .lib_dir = lib });
+    defer compilation.deinit();
+    try checkCyclicNamespaces(&compilation);
+}
+
+test "cyclic std reexports self and mutual imports share canonical filesystem sources with OOM" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "lib");
+    try tmp.dir.writeFile(io, .{ .sub_path = "main.nov", .data = cyclic_root_source });
+    try tmp.dir.writeFile(io, .{ .sub_path = "lib/std.nov", .data = cyclic_std_source });
+    try tmp.dir.writeFile(io, .{ .sub_path = "lib/array.nov", .data = cyclic_array_source });
+    try tmp.dir.writeFile(io, .{ .sub_path = "lib/shared.nov", .data = "@[public]\nlet value = true" });
+    const path = try tmp.dir.realPathFileAlloc(io, "main.nov", allocator);
+    defer allocator.free(path);
+    const lib = try tmp.dir.realPathFileAlloc(io, "lib", allocator);
+    defer allocator.free(lib);
+    try cyclicLoaderAllocationTest(allocator, path, lib);
+    try TestAllocations.checkAllAllocationFailures(allocator, cyclicLoaderAllocationTest, .{ path, lib });
+}
+
+fn cyclicMemoryAllocationTest(allocator: std.mem.Allocator) !void {
+    var compilation = Compilation.init(allocator);
+    defer compilation.deinit();
+    const root = try compilation.addSource("/cyclic/main.nov", cyclic_root_source);
+    const standard = try compilation.addSource("/cyclic/lib/std.nov", cyclic_std_source);
+    const array = try compilation.addSource("/cyclic/lib/array.nov", cyclic_array_source);
+    const shared = try compilation.addSource("/cyclic/lib/shared.nov", "@[public]\nlet value = true");
+    compilation.setRoot(root);
+    for ([_]struct { source: Source.Id, name: []const u8, target: Source.Id, named: bool = false }{
+        .{ .source = root, .name = "standard", .target = standard, .named = true },
+        .{ .source = root, .name = "relative", .target = array },
+        .{ .source = root, .name = "self", .target = root },
+        .{ .source = standard, .name = "array", .target = array },
+        .{ .source = standard, .name = "shared", .target = shared },
+        .{ .source = array, .name = "standard", .target = standard, .named = true },
+        .{ .source = array, .name = "file", .target = standard },
+        .{ .source = array, .name = "self", .target = array },
+        .{ .source = array, .name = "shared", .target = shared },
+    }) |entry| {
+        const owner = compilation.getModule(entry.source).?;
+        const local = owner.lookup(entry.name).?;
+        try compilation.imports.append(allocator, .{
+            .declaration = compilation.declaration_ids.get(.{ .source = entry.source, .local = local }).?,
+            .target = entry.target,
+            .named = entry.named,
+            .span = owner.getDeclaration(local).?.name_span,
+        });
+    }
+    try checkCyclicNamespaces(&compilation);
+}
+
+test "cyclic in-memory namespace graphs prepare repeatedly with OOM" {
+    try cyclicMemoryAllocationTest(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, cyclicMemoryAllocationTest, .{});
+}
+
+test "loader allows cycles but rejects missing files mutable computed and local imports" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -853,19 +960,14 @@ test "loader rejects cycles missing files mutable computed and local imports" {
     var compilation = try Compilation.load(allocator, io, path, .{});
     defer compilation.deinit();
     try std.testing.expect(compilation.hasErrors());
-    var cycles: usize = 0;
+    try std.testing.expectEqual(@as(usize, 2), compilation.imports.items.len);
     var missing: usize = 0;
     var invalid: usize = 0;
     for (compilation.diagnostics.items) |diagnostic| switch (diagnostic.tag) {
-        .import_cycle => {
-            cycles += 1;
-            try std.testing.expect(diagnostic.related.?.source != diagnostic.span.source);
-        },
         .load_failed => missing += 1,
         .invalid_import => invalid += 1,
         else => return error.UnexpectedDiagnostic,
     };
-    try std.testing.expectEqual(@as(usize, 1), cycles);
     try std.testing.expectEqual(@as(usize, 1), missing);
     try std.testing.expectEqual(@as(usize, 3), invalid);
 }

@@ -1455,3 +1455,276 @@ test "extern shared symbols compare canonical signatures and noreturn across bot
         }
     }
 }
+
+fn testCyclicDeclarations(allocator: std.mem.Allocator, first: []const u8, second: []const u8, expected: Module.Diagnostic.Tag) !void {
+    var comp = Compilation.init(allocator);
+    defer comp.deinit();
+    const first_source = try std.mem.concat(allocator, u8, &.{ "let peer=@import(\"peer.nov\")\nlet self=@import(\"root.nov\")\n", first });
+    defer allocator.free(first_source);
+    const second_source = try std.mem.concat(allocator, u8, &.{ "let peer=@import(\"root.nov\")\n", second });
+    defer allocator.free(second_source);
+    const root = try comp.addSource("/cycles/root.nov", first_source);
+    const peer = try comp.addSource("/cycles/peer.nov", second_source);
+    comp.setRoot(root);
+    if (comp.hasErrors()) {
+        var diagnostics = std.Io.Writer.Allocating.init(allocator);
+        defer diagnostics.deinit();
+        try Diagnostics.renderCompilation(&comp, &diagnostics.writer);
+        std.debug.print("{s}", .{diagnostics.written()});
+    }
+    try std.testing.expect(!comp.hasErrors());
+    for ([_]struct { source: @import("Source.zig").Id, name: []const u8, target: @import("Source.zig").Id }{
+        .{ .source = root, .name = "peer", .target = peer },
+        .{ .source = root, .name = "self", .target = root },
+        .{ .source = peer, .name = "peer", .target = root },
+    }) |edge| {
+        const owner = comp.getModule(edge.source).?;
+        const local = owner.lookup(edge.name).?;
+        try comp.imports.append(allocator, .{ .declaration = comp.declaration_ids.get(.{ .source = edge.source, .local = local }).?, .target = edge.target, .named = false, .span = owner.getDeclaration(local).?.name_span });
+    }
+    const count = comp.declarations.items.len;
+    var sema = @import("Lowering.zig").lowerCompilation(&comp) catch |err| {
+        try std.testing.expectEqual(error.OutOfMemory, err);
+        try std.testing.expectEqual(count, comp.declarations.items.len);
+        for (comp.modules.items) |owner| try std.testing.expectEqual(@as(usize, 0), owner.diagnostics.items.len);
+        return err;
+    };
+    defer sema.deinit();
+    try std.testing.expect(comp.hasErrors());
+    try std.testing.expect(!sema.lowering_complete);
+    var found = false;
+    var diagnostics: usize = 0;
+    for (comp.modules.items) |owner| for (owner.diagnostics.items) |diagnostic| {
+        diagnostics += 1;
+        try std.testing.expect(comp.sourceSlice(diagnostic.span) != null);
+        if (diagnostic.related) |related| try std.testing.expect(comp.sourceSlice(related) != null);
+        if (diagnostic.tag == expected) found = true;
+    };
+    if (!found) {
+        std.debug.print("expected {t} for {s}\n", .{ expected, first });
+        for (comp.modules.items) |owner| std.debug.print("{any}\n", .{owner.diagnostics.items});
+    }
+    try std.testing.expect(found);
+    try std.testing.expect(diagnostics <= 16);
+    if (expected == .record_layout_cycle) {
+        sema.ir.verify() catch |err| {
+            if (err == error.OutOfMemory) return err;
+            try std.testing.expectEqual(error.CyclicRecordLayout, err);
+            return;
+        };
+        return error.TestExpectedError;
+    } else try sema.ir.verify();
+}
+
+test "cyclic imports reject self mutual branching type value and generic cycles with bounded diagnostics and OOM" {
+    for ([_]struct { first: []const u8, second: []const u8 = "", tag: Module.Diagnostic.Tag }{
+        .{ .first = "@[public]\nlet A=self.A", .tag = .unsupported_dependency_expression },
+        .{ .first = "@[public]\nlet A=peer.A", .second = "@[public]\nlet A=peer.A", .tag = .unsupported_dependency_expression },
+        .{ .first = "@[public]\nlet A=self.A\nlet use:(A)={}", .tag = .type_alias_cycle },
+        .{ .first = "@[public]\nlet A=peer.A\nlet use:(A)={}", .second = "@[public]\nlet A=peer.A", .tag = .type_alias_cycle },
+        .{ .first = "@[public]\nlet A=(self.A)->self.A", .tag = .type_alias_cycle },
+        .{ .first = "@[public]\nlet A=(peer.A)->peer.A", .second = "@[public]\nlet A=(peer.A)->peer.A", .tag = .type_alias_cycle },
+        .{ .first = "@[public]\nlet A:(T:type)->type=struct{next:self.A(T),}\nlet use:(A(int))={}", .tag = .generic_cycle },
+        .{ .first = "@[public]\nlet A:(T:type)->type=struct{next:peer.A(T),}\nlet use:(A(int))={}", .second = "@[public]\nlet A:(T:type)->type=struct{next:peer.A(T),}", .tag = .generic_cycle },
+        .{ .first = "@[public]\nlet A=self.A\nlet main:()={A(1)}", .tag = .unsupported_dependency_expression },
+        .{ .first = "@[public]\nlet A=peer.A\nlet main:()={A(1)}", .second = "@[public]\nlet A=peer.A", .tag = .unsupported_dependency_expression },
+        .{ .first = "@[public]\nlet A=self.A\nlet use:(A(int))={}", .tag = .unsupported_dependency_expression },
+        .{ .first = "@[public]\nlet A=peer.A\nlet use:(A(int))={}", .second = "@[public]\nlet A=peer.A", .tag = .unsupported_dependency_expression },
+        .{ .first = "@[public]\nlet A=@TypeOf(self.f)\n@[public]\nlet f:(x:A)->A=x", .tag = .type_query_limit },
+        .{ .first = "@[public]\nlet A=@TypeOf(peer.f)", .second = "@[public]\nlet f:(x:peer.A)->peer.A=x", .tag = .type_query_limit },
+        .{ .first = "@[public]\nlet A=struct{next:self.A,}", .tag = .record_layout_cycle },
+        .{ .first = "@[public]\nlet A=struct{next:peer.A,}", .second = "@[public]\nlet A=struct{next:peer.A,}", .tag = .record_layout_cycle },
+        .{ .first = "let A=peer.Hidden\nlet use:(A)={}", .second = "let Hidden=int", .tag = .unknown_type },
+        .{ .first = "let A=peer.hidden\nlet main:()={let x:int=A(1)\n}", .second = "let hidden:(x:`T)->`T=x", .tag = .unsupported_dependency_expression },
+    }) |case| {
+        try testCyclicDeclarations(std.testing.allocator, case.first, case.second, case.tag);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testCyclicDeclarations, .{ case.first, case.second, case.tag });
+    }
+}
+
+fn testBranchingTypeQueries(allocator: std.mem.Allocator, source: []const u8, count: usize, cyclic: bool) !void {
+    var comp = Compilation.init(allocator);
+    defer comp.deinit();
+    const root = try comp.addSource("/queries/cycle.nov", source);
+    comp.setRoot(root);
+    const module = comp.getModule(root).?;
+    const self = module.lookup("self").?;
+    try comp.imports.append(allocator, .{ .declaration = comp.declaration_ids.get(.{ .source = root, .local = self }).?, .target = root, .named = false, .span = module.getDeclaration(self).?.name_span });
+    const declarations = comp.declarations.items.len;
+    var sema = analyzeCompilation(&comp) catch |err| {
+        try std.testing.expectEqual(error.OutOfMemory, err);
+        try std.testing.expectEqual(declarations, comp.declarations.items.len);
+        try std.testing.expectEqual(@as(usize, 0), comp.diagnostics.items.len);
+        try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+        return err;
+    };
+    defer sema.deinit();
+    try std.testing.expectEqual(declarations, comp.declarations.items.len);
+    if (cyclic) {
+        try std.testing.expect(comp.hasErrors());
+        try std.testing.expect(module.diagnostics.items.len > 0);
+        try std.testing.expect(module.diagnostics.items.len <= count * 2);
+        for (module.diagnostics.items) |diagnostic| {
+            try std.testing.expectEqual(Module.Diagnostic.Tag.type_query_limit, diagnostic.tag);
+            try std.testing.expect(module.sourceSlice(diagnostic.span) != null);
+        }
+        var rendered = std.Io.Writer.Allocating.init(allocator);
+        defer rendered.deinit();
+        Diagnostics.renderCompilation(&comp, &rendered.writer) catch return error.OutOfMemory;
+        try std.testing.expect(rendered.written().len < count * 1024);
+        for (sema.entries) |entry| try std.testing.expect(entry.type_id == null);
+    } else {
+        try std.testing.expect(!comp.hasErrors());
+        var repeated = try analyzeCompilation(&comp);
+        defer repeated.deinit();
+        try std.testing.expect(!comp.hasErrors());
+        try std.testing.expectEqual(sema.ir.types.items.len, repeated.ir.types.items.len);
+        for (module.declarations.items, 0..) |decl, i| {
+            if (decl.is_namespace) continue;
+            const index = sema.entryIndex(module, @fromBackingInt(@intCast(i)));
+            const ty = sema.entries[index].type_id.?;
+            try std.testing.expectEqual(ty, repeated.entries[index].type_id.?);
+            const signature = sema.ir.getType(ty).?.function;
+            try std.testing.expectEqual(signature.params[0], signature.result);
+        }
+        try repeated.ir.verify();
+    }
+    try sema.ir.verify();
+}
+
+test "cyclic imports branching TypeOf rings share failed sibling queries with bounded diagnostics and OOM" {
+    const allocator = std.testing.allocator;
+    for ([_]usize{ 16, 32 }) |count| {
+        for ([_]bool{ true, false }) |cyclic| {
+            var source = std.Io.Writer.Allocating.init(allocator);
+            defer source.deinit();
+            try source.writer.writeAll("let self=@import(\"cycle.nov\")\n");
+            for (0..count) |i| {
+                if (!cyclic and i + 1 == count) {
+                    try source.writer.print("@[public]\nlet f{d}:(x:int)->int=x\n", .{i});
+                } else {
+                    const next = (i + 1) % count;
+                    try source.writer.print("@[public]\nlet f{d}:(x:@TypeOf(self.f{d}))->@TypeOf(self.f{d})=x\n", .{ i, next, next });
+                }
+            }
+            try testBranchingTypeQueries(allocator, source.written(), count, cyclic);
+            try TestAllocations.checkAllAllocationFailures(allocator, testBranchingTypeQueries, .{ source.written(), count, cyclic });
+        }
+    }
+}
+
+fn lowerCyclicStandard(allocator: std.mem.Allocator, path: []const u8, lib: []const u8) !Sema {
+    var comp = try Compilation.load(allocator, std.testing.io, path, .{ .lib_dir = lib });
+    defer comp.deinit();
+    try std.testing.expect(!comp.hasErrors());
+    const count = comp.declarations.items.len;
+    var result = @import("Lowering.zig").lowerCompilation(&comp) catch |err| {
+        try std.testing.expectEqual(error.OutOfMemory, err);
+        try std.testing.expectEqual(count, comp.declarations.items.len);
+        for (comp.modules.items) |owner| try std.testing.expectEqual(@as(usize, 0), owner.diagnostics.items.len);
+        return err;
+    };
+    errdefer result.deinit();
+    if (comp.hasErrors()) {
+        var diagnostics = std.Io.Writer.Allocating.init(allocator);
+        defer diagnostics.deinit();
+        try Diagnostics.renderCompilation(&comp, &diagnostics.writer);
+        std.debug.print("{s}", .{diagnostics.written()});
+    }
+    try std.testing.expect(!comp.hasErrors());
+    try std.testing.expect(result.lowering_complete);
+    const root = comp.getModule(comp.root.?).?;
+    const alias = result.entries[result.entryIndex(root, root.lookup("Canonical").?)].alias_type.?;
+    try std.testing.expectEqual(alias, result.entries[result.entryIndex(root, root.lookup("Relative").?)].alias_type.?);
+    const option = result.ir.getType(alias).?.record;
+    var instances: usize = 0;
+    for (result.ir.types.items) |ty| {
+        if (ty == .record and ty.record.source == option.source and ty.record.identity == option.identity and std.mem.eql(Ir.TypeId, ty.record.type_args, option.type_args)) instances += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), instances);
+    const declarations = comp.declarations.items.len;
+    var repeated = try @import("Lowering.zig").lowerCompilation(&comp);
+    defer repeated.deinit();
+    try std.testing.expect(!comp.hasErrors());
+    try std.testing.expect(repeated.lowering_complete);
+    try std.testing.expectEqual(declarations, comp.declarations.items.len);
+    try std.testing.expectEqual(alias, repeated.entries[repeated.entryIndex(root, root.lookup("Canonical").?)].alias_type.?);
+    try std.testing.expectEqual(result.ir.functions.items.len, repeated.ir.functions.items.len);
+    try result.ir.verify();
+    try repeated.ir.verify();
+    return result;
+}
+
+fn testCyclicStandardAllocations(allocator: std.mem.Allocator, path: []const u8, lib: []const u8) !void {
+    var sema = try lowerCyclicStandard(allocator, path, lib);
+    defer sema.deinit();
+}
+
+test "cyclic imports real std array Option canonical identities repeated lowering OOM and source free execution" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const lib = try std.Io.Dir.cwd().realPathFileAlloc(io, "lib", allocator);
+    defer allocator.free(lib);
+    const standard_path = try std.fs.path.join(allocator, &.{ lib, "std.nov" });
+    defer allocator.free(standard_path);
+    const directory = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(directory);
+    const standard = try std.fs.path.relativeAlloc(allocator, directory, null, directory, standard_path);
+    defer allocator.free(standard);
+    const source = try std.fmt.allocPrint(allocator,
+        \\let std=@import("std")
+        \\let relative=@import("{s}")
+        \\let Canonical=std.Option(int)
+        \\let Relative=relative.Option(int)
+        \\let find=std.array.find
+        \\let main:()={{
+        \\let values=std.array.map(@as([]int,[1,2,3]),(x:int)->int{{x+1}})
+        \\let found:Relative=find(values,(x:int)->bool{{x==3}})
+        \\let absent:Canonical=relative.array.find(values,(x:int)->bool{{x==8}})
+        \\@println(found.unwrapOr(0),absent.unwrapOr(9))
+        \\}}
+    , .{standard});
+    defer allocator.free(source);
+    try tmp.dir.writeFile(io, .{ .sub_path = "main.nov", .data = source });
+    const path = try tmp.dir.realPathFileAlloc(io, "main.nov", allocator);
+    defer allocator.free(path);
+    var sema = try lowerCyclicStandard(allocator, path, lib);
+    defer sema.deinit();
+    // The Compilation and all ASTs are gone before verification and emission.
+    try sema.ir.verify();
+    const c = try @import("CEmitter.zig").emitProgram(allocator, &sema.ir, null);
+    defer allocator.free(c);
+    const exhausted = try std.mem.concat(allocator, u8, &.{ "#include <stdlib.h>\nstatic void *test_malloc(size_t n) { (void)n; return NULL; }\n#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n", c });
+    defer allocator.free(exhausted);
+    const zig = std.testing.environ.getAlloc(allocator, "NOV_TEST_ZIG") catch null;
+    defer if (zig) |exe| allocator.free(exe);
+    const program = "cyclic" ++ (if (@import("builtin").os.tag == .windows) ".exe" else "");
+    const executable = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(executable);
+    const executable_path = try std.fs.path.join(allocator, &.{ executable, program });
+    defer allocator.free(executable_path);
+    for ([_]bool{ false, true }) |exhaust| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "generated.c", .data = if (exhaust) exhausted else c });
+        for ([_][]const u8{ "-O0", "-O3" }) |mode| {
+            const flags = &.{ "-std=c11", mode, "-fsanitize=undefined", "-fno-sanitize-recover=all", "generated.c", "-o", program };
+            var argv: std.ArrayList([]const u8) = .empty;
+            defer argv.deinit(allocator);
+            try argv.appendSlice(allocator, if (zig) |exe| &.{ exe, "cc" } else &.{"cc"});
+            try argv.appendSlice(allocator, flags);
+            const compiled = try std.process.run(allocator, io, .{ .argv = argv.items, .cwd = .{ .dir = tmp.dir }, .timeout = .{ .duration = .{ .raw = .fromSeconds(60), .clock = .awake } } });
+            defer allocator.free(compiled.stdout);
+            defer allocator.free(compiled.stderr);
+            if (compiled.term != .exited or compiled.term.exited != 0) std.debug.print("{s}", .{compiled.stderr});
+            try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, compiled.term);
+            const ran = try std.process.run(allocator, io, .{ .argv = &.{executable_path}, .timeout = .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } } });
+            defer allocator.free(ran.stdout);
+            defer allocator.free(ran.stderr);
+            try std.testing.expectEqual(std.process.Child.Term{ .exited = if (exhaust) 1 else 0 }, ran.term);
+            try std.testing.expectEqualStrings(if (exhaust) "" else "3 9\n", ran.stdout);
+            try std.testing.expectEqualStrings(if (exhaust) "panic: GC allocation failed\n" else "", ran.stderr);
+        }
+    }
+    try TestAllocations.checkAllAllocationFailures(allocator, testCyclicStandardAllocations, .{ path, lib });
+}
