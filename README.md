@@ -1557,7 +1557,15 @@ skips invocation. Ordinary copy semantics and shared capture cells are unchanged
 callback panics are not caught. These are ordinary generic library methods with
 inferred callbacks/results, also callable through their container type.
 
-Mapped types must be existing supported union payloads. Current methods require
+For operations that already return a container, use `andThen` instead of `map`:
+`Option(T).andThen` accepts `(T) -> Option(U)` and returns `Option(U)`;
+`Result(T, E).andThen` accepts `(T) -> Result(U, E)` and returns `Result(U, E)`.
+None/errors propagate without invoking the next operation. Result error types
+must match exactly. Unlike mapping, chaining can produce a void success payload
+because the callback constructs the whole container. Input `T` remains nonvoid.
+Receiver/callback evaluation, copying and panic behavior are otherwise identical.
+
+Mapped types must be existing supported union payloads. Current mapping methods require
 nonvoid callback parameters and mapped results. `Result.map` can preserve void
 errors; `mapErr` currently requires nonvoid success payloads because void variant
 reconstruction requires `[]`, not a payload expression. Other void-container

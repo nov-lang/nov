@@ -294,6 +294,100 @@ let inactive_callbacks_and_chained_maps: () = {
     )
 }
 
+@[test]
+let chained_container_operations: () = {
+    let mut calls = 0
+    let present: Option(int) = .some[2]
+    let absent: Option(int) = .none[]
+    let next = (value: int) -> Option(string) {
+        calls += 1
+        if value > 0 {
+            .some["value:{value}"]
+        } else {
+            .none[]
+        }
+    }
+    @assert(present.andThen(next).unwrapOr("") == "value:2")
+    @assert(absent.andThen(next).isNone() and calls == 1)
+    let zero: Option(int) = .some[0]
+    @assert(Option(int).andThen(zero, next).isNone() and calls == 2)
+
+    let good: Result(int, string) = .ok[2]
+    let bad: Result(int, string) = .err["original"]
+    let step = (value: int) -> Result(string, string) {
+        calls += 1
+        if value > 0 {
+            .ok["value:{value}"]
+        } else {
+            .err["nonpositive"]
+        }
+    }
+    @assert(good.andThen(step).unwrapOr("") == "value:2")
+    let original = bad.andThen(step)
+    @assert(calls == 3)
+    @assert(
+        match original {
+            .ok => false
+            .err => |error| error == "original"
+        }
+    )
+    let failure: Result(int, string) = .ok[0]
+    let changed = Result(int, string).andThen(failure, step)
+    @assert(
+        match changed {
+            .ok => false
+            .err => |error| error == "nonpositive"
+        }
+    )
+    @assert(calls == 4)
+
+    let checked: Option(void) = present.andThen(
+        (value) -> Option(void) {
+            @assert(value == 2)
+            .some[]
+        }
+    )
+    @assert(checked.isSome())
+    let voidError: Result(int, void) = .err[]
+    let skipped: Result(void, void) = voidError.andThen(
+        (value) -> Result(void, void) {
+            @panic("failed result must skip next operation")
+        }
+    )
+    @assert(skipped.isErr())
+    let finished: Result(void, string) = good.andThen(
+        (value) -> Result(void, string) {
+            @assert(value == 2)
+            .ok[]
+        }
+    )
+    @assert(finished.isOk())
+
+    let mut events = 0
+    let receiver = () -> Option(int) {
+        events = events * 10 + 1
+        .none[]
+    }
+    let callback = () -> (int) -> Option(int) {
+        events = events * 10 + 2
+        (value) -> Option(int) {
+            @panic("none must skip next operation")
+        }
+    }
+    @assert(receiver().andThen(callback()).isNone() and events == 12)
+
+    let source: Option(Row) = .some[Row[ .values = [[1]] ]]
+    let snapshot = source.andThen(
+        (row) {
+            Option(Row).some[row]
+        }
+    )
+    let mut copy = snapshot.unwrapOr(Row[ .values = [] ])
+    copy.values = [[9]]
+    @assert(source.unwrapOr(Row[ .values = [] ]).values[0][0] == 1)
+    @assert(snapshot.unwrapOr(Row[ .values = [] ]).values[0][0] == 1)
+}
+
 let main: () = {
     let some: Option(int) = .some[21]
     let none: Option(int) = .none[]

@@ -87,14 +87,26 @@ the existing bounded solver. No implicit conversion, reference escape or catchin
 of callback panics/errors is introduced. Normal recursive copies preserve array
 independence through record payloads; copied closures share their captured cells.
 
-Mapped types must be supported union payloads. Currently these methods require
+### Chaining fallible operations
+
+`Option(T).andThen(next: (T) -> Option(U)) -> Option(U)` calls `next` only for
+some, otherwise returning none. `Result(T, E).andThen(next: (T) -> Result(U, E))`
+returns `Result(U, E)`, forwarding an existing error unchanged or returning the
+callback's success/error. This flattens a container-returning callback rather
+than wrapping it again. The Result error type must be identical, without implicit
+conversion. Callbacks may return void success payloads, including `Option(void)`
+and `Result(void, E)`; a void Result error is also preserved. Input `T` cannot be
+void under the existing function-parameter rules. Eager callback construction,
+receiver snapshot order, independent copies and uncaught panics match `map`.
+
+Mapped types must be supported union payloads. Currently the mapping methods require
 nonvoid callback parameters and nonvoid mapped results; use a match when the
 mapped result is void. `Result.mapErr` also requires nonvoid success payloads,
 because its ordinary reconstruction uses a payload expression while void variants
 require `[]`. `Result.map` can preserve a void error using existing propagation.
 Unused methods remain demand-specialized, so other methods on containers with
 void payloads still work as documented above. See `examples/container-map.nov`
-for a runnable example and five tests.
+for a runnable example and six tests, including chaining and void outputs.
 
 ## Array helpers
 

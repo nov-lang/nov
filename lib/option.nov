@@ -24,6 +24,12 @@ let Option: (T: type) -> type = union {
     }
 
     @[public]
+    let andThen: (self: Self, next: (T) -> Option(`U)) -> Option(`U) = {
+        let value = self.!
+        next(value)
+    }
+
+    @[public]
     let unwrapOr: (self: Self, fallback: T) -> T = match self {
         .some => |value| value
         .none => fallback

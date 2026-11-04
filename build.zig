@@ -3124,7 +3124,7 @@ fn addContainerMapCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_ste
     _ = package.add("container-map.nov", @embedFile("examples/container-map.nov"));
     _ = package.add("api.nov", std.mem.replaceOwned(u8, b.allocator, api_source, "lib/", "lib/nov/") catch @panic("OOM"));
     _ = package.add("aliases.nov", std.mem.replaceOwned(u8, b.allocator, aliases_source, "lib/", "lib/nov/") catch @panic("OOM"));
-    const example_tests = "PASS option_variants_and_inferred_results\nPASS result_variants_and_shared_captures\nPASS eager_receiver_and_callback_construction\nPASS record_payloads_and_recursive_array_copies\nPASS inactive_callbacks_and_chained_maps\n5 passed; 0 failed; 5 total\n";
+    const example_tests = "PASS option_variants_and_inferred_results\nPASS result_variants_and_shared_captures\nPASS eager_receiver_and_callback_construction\nPASS record_payloads_and_recursive_array_copies\nPASS inactive_callbacks_and_chained_maps\nPASS chained_container_operations\n6 passed; 0 failed; 6 total\n";
     for ([_]bool{ false, true }) |installed| {
         for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
             for ([_][]const u8{ "run", "test" }) |command| {
@@ -3167,6 +3167,9 @@ fn addContainerMapCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_ste
         .{ .name = "error-void-parameter", .source = "let x:std.Result(int,void)=.err[]\nlet y=x.mapErr((v:void)->int{1})", .diagnostic = "void is not a parameter type" },
 
         .{ .name = "error-void-success-propagation", .source = "let x:std.Result(void,string)=.ok[]\nlet y=x.mapErr((v){7})", .diagnostic = "[] for void" },
+        .{ .name = "option-chain-value", .source = "let x:std.Option(int)=.some[1]\nlet y=x.andThen((v){v+1})", .diagnostic = "constraints require exactly identical types" },
+        .{ .name = "result-chain-error", .source = "let x:std.Result(int,string)=.ok[1]\nlet y=x.andThen((v)->std.Result(int,bool){.ok[v]})", .diagnostic = "constraints require exactly identical types" },
+        .{ .name = "result-chain-option", .source = "let x:std.Result(int,string)=.ok[1]\nlet y=x.andThen((v)->std.Option(int){.some[v]})", .diagnostic = "constraints require exactly identical types" },
         .{ .name = "option-void-output", .source = "let x:std.Option(int)=.some[1]\nlet y=x.map((v)->void{})", .diagnostic = "[] for void" },
         .{ .name = "result-void-output", .source = "let x:std.Result(int,string)=.ok[1]\nlet y=x.map((v)->void{})", .diagnostic = "[] for void" },
         .{ .name = "error-void-output", .source = "let x:std.Result(int,string)=.err[\"bad\"]\nlet y=x.mapErr((v)->void{})", .diagnostic = "[] for void" },
@@ -3188,13 +3191,15 @@ fn addContainerMapCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_ste
         check.expectStdErrMatch(case.diagnostic);
         test_step.dependOn(&check.step);
     }
-    for ([_]struct { name: []const u8, receiver: []const u8, method: []const u8, parameter: []const u8 }{
+    for ([_]struct { name: []const u8, receiver: []const u8, method: []const u8, parameter: []const u8, result: []const u8 = "int" }{
         .{ .name = "option", .receiver = "std.Option(int).some[1]", .method = "map", .parameter = "int" },
         .{ .name = "result", .receiver = "std.Result(int,string).ok[1]", .method = "map", .parameter = "int" },
         .{ .name = "error", .receiver = "std.Result(int,int).err[1]", .method = "mapErr", .parameter = "int" },
+        .{ .name = "option-chain", .receiver = "std.Option(int).some[1]", .method = "andThen", .parameter = "int", .result = "std.Option(int)" },
+        .{ .name = "result-chain", .receiver = "std.Result(int,string).ok[1]", .method = "andThen", .parameter = "int", .result = "std.Result(int,string)" },
     }) |case| {
         const source = b.fmt("panic-container-map-{s}.nov", .{case.name});
-        _ = fixtures.add(source, b.fmt("let std=@import(\"std\")\nlet verify:()={{let result={s}.{s}((value:{s})->int{{@print(value)\n@panic(\"{s} callback\")}})\n@println(\"unreachable\")}}\n@[test]\nlet callback_panic:()=verify()\nlet main:()=verify()\n", .{ case.receiver, case.method, case.parameter, case.name }));
+        _ = fixtures.add(source, b.fmt("let std=@import(\"std\")\nlet verify:()={{let result={s}.{s}((value:{s})->{s}{{@print(value)\n@panic(\"{s} callback\")}})\n@println(\"unreachable\")}}\n@[test]\nlet callback_panic:()=verify()\nlet main:()=verify()\n", .{ case.receiver, case.method, case.parameter, case.result, case.name }));
         for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
             for ([_][]const u8{ "run", "test" }) |command| {
                 const run = b.addRunArtifact(exe);

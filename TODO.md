@@ -50,6 +50,16 @@ results. See `examples/array-fields.nov`.
 
 ## Current delivered status
 
+Option.andThen and Result.andThen chain container-returning callbacks without
+nesting. They invoke next once for some/ok and propagate none/errors unchanged;
+Result error types match exactly. Existing eager receiver/callback construction,
+copy/capture and panic behavior apply. Both can return void success payloads;
+Result can preserve void errors, while the callback input must be nonvoid. No
+compiler or optimizer changes. examples/container-map.nov now has six tests,
+including chained operations, static calls, skipped callbacks, eager construction,
+void outputs and recursive record copies; CLI negatives enforce exact callback
+container/error types and active callback panics propagate in every mode.
+
 Stdlib container transformations are implemented as ordinary generic methods:
 Option.map transforms some; Result.map transforms ok and mapErr transforms err.
 Only the active matching variant invokes its callback, once; other payloads
