@@ -82,13 +82,14 @@ registrations spanning their entire retention period. `longjmp`, exceptions and
 foreign unwinding across active frames are unsupported.
 
 Only NULL and exact payload-base pointers owned by the same heap are valid in
-managed slots/fields. Interior references, tagged pointers, foreign pointers and
-stale references are unsupported. Local array-element borrowing retains a rooted
-owner slot and normalized integer index, derives addresses only for immediate
-reads/stores, and statically excludes conflicting owner access until last use.
-Borrowed references cannot escape; there are no runtime generation checks. Do not
-keep a derived interior address across a safepoint or put it in a root table. Invalid pointers encountered during tracing panic before
-being dereferenced. This is not a memory-safety boundary: unregistered dangling
+managed root slots/traced fields. Interior pointers, tagged pointers, foreign
+pointers and stale pointers are unsupported there. Local array-element borrowing
+uses typed C pointer handles and target snapshots, backed by rooted stable owners
+and normalized indices. Static checks exclude conflicting owner access until the
+last live use. These internal handles may survive a safepoint only with the
+managed backing retained by owner roots; never put an interior pointer in a root
+table. Borrowed references cannot escape; there are no runtime generation checks.
+Invalid pointers encountered during tracing panic before being dereferenced. This is not a memory-safety boundary: unregistered dangling
 roots, malformed metadata, cross-heap root record reuse and use-after-free outside
 tracing remain caller/compiler errors. A stale pointer whose address has been
 reused cannot be distinguished from a current allocation.
@@ -100,10 +101,17 @@ The source contract uses readonly `&T` and mutable-pointee `&mut T`, not `&const
 `let p: &T = &mutableOwner` downgrades to readonly. Binding mutability is separate:
 `let p = &a` cannot rebind, but `p.* = value` is valid for `&mut T`; `let mut p`
 permits `p = &b` with the same exact reference type (including any explicit
-readonly annotation). Rebinding is straight-line in the same lexical/control
-region only. Rebinding an outer reference from dynamic branches, nested blocks,
-short-circuit RHSs or loops is rejected; loop-body-local straight-line rebinding
-does not merge reference state across backedges.
+readonly annotation). Rebinding works across `if`, `match`, short-circuit
+expressions, nested blocks and loops, including conditions, continuation and
+exhaustion paths. The static proof merges possible targets per CFG, with slot
+kills and NLL snapshot liveness. Conflicting owner reads, writes or storage
+invalidation are blocked if any possible live alias targets that owner; readonly
+loans remain exclusive. Conservative frontend owner sets may overreject
+target-sensitive iteration.
+
+Newly borrowed owner storage must be in the same or an outer lexical scope
+relative to the reference binding. An outer reference cannot bind to an inner
+owner, even if that reference is unused afterward.
 
 All pointee reads/writes are explicit: `p.*`, `p.*[i]`, `p.*.field`, `p.*()` and
 `p.* = value`. No autodereference exists. `loop &item in items` yields a scoped
@@ -111,15 +119,23 @@ reference accessed via `item.*`. `@TypeOf(p)` inspects the compile-time referenc
 descriptor and renders canonical names such as `&u8` / `&mut u8`; it does not
 read the target. `@TypeOf(p.*)` remains unsupported by the bounded binding query.
 
-These are local-only compile-time capabilities over existing borrow IR, not
-first-class runtime pointer values or reinterpretations of value storage.
-Explicit reads lower to child values; they retain normal recursive-copy semantics
-and may allocate. Borrow creation itself does not clone/allocate its target.
-Static NLL/CFG checks protect loans through branches, loop backedges and compound
-RHS evaluation. Stable owner slots and optional normalized indices retain managed
-owners under the existing root discipline; bounds checks are unchanged. Derived
-addresses are used only immediately, never traced as interior GC roots. There are
-no runtime generation/reference-validity checks.
+Local runtime reference handles now lower to typed C pointers, but remain
+internal, unit-local IR capabilities, not source-level first-class reference
+values or a reference ABI. A load snapshots the current target before dereference
+RHS effects. Thus rebinding `p` inside the RHS of `p.* += ...` does not redirect
+the pending store: it updates the old pointee. Explicit reads still yield child
+values with normal recursive-copy semantics and may allocate; borrow creation
+itself does not clone/allocate its target.
+
+Static NLL/CFG checks keep the captured target loan live through compound RHS
+evaluation and the final store. Rebinding to a different owner can work, but a
+new borrow of another element of the same array still conflicts with the live
+compound's whole-owner loan; no element disjointness is inferred. Ordinary
+rebinding after the last use works. Stable owner slots and normalized indices
+support the handles, while owner roots retain managed backing for all live target
+snapshots under the existing root discipline. Bounds checks are unchanged.
+Interior pointers are never traced as GC roots. There are no runtime
+generation/reference-validity checks.
 
 Copying (`let q = p`), passing, returning, storing, capturing and reborrowing
 references are currently rejected. Reference types are not storable array elements,
@@ -136,7 +152,8 @@ references, never expose dangling storage. The current local owner-slot scheme
 alone does not implement escaping-reference lifetimes. Future representations,
 tracing and invalidation checks must satisfy that contract before escape is enabled.
 Broader raw-pointer and managed-FFI proposals remain separate. See
-`examples/references.nov` and the root README for the source-facing contract.
+`examples/references.nov`, `examples/reference-rebinding.nov` and the root README
+for the source-facing contract.
 
 ## Closure environments and shared cells
 

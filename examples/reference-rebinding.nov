@@ -1,0 +1,314 @@
+; nov run examples/reference-rebinding.nov
+; nov test examples/reference-rebinding.nov
+; Rebinding selects a runtime target across structured control flow.
+; New owners must live in the reference binding's scope or an outer scope.
+; Types/capabilities stay exact; references cannot be copied or escape.
+
+let choose: (flag: bool) -> int = {
+    let mut a: int = 1
+    let mut b: int = 10
+    let mut p = &a
+    if flag {
+        p = &b
+    }
+    p.* += 2
+    p.*
+}
+
+let main: () = {
+    @println("Chosen:", choose(false), choose(true))
+}
+
+@[test]
+let branches_match_and_block: () = {
+    @assert(choose(false) == 3 and choose(true) == 12)
+    loop flag in [false, true] {
+        let mut a: int = 1
+        let mut b: int = 10
+        let mut p = &a
+        if flag {
+            p = &b
+        } else {
+            p = &a
+        }
+        @assert(
+            p.* == if flag {
+                10
+            } else {
+                1
+            }
+        )
+        match flag {
+            true => {
+                p = &a
+            }
+            false => {
+                p = &b
+            }
+        }
+        @assert(
+            p.* == if flag {
+                1
+            } else {
+                10
+            }
+        )
+        {
+            p = &b
+        }
+        ; The unconditional rebind kills all previous possible targets.
+        a += 1
+        p.* += 2
+        @assert(p.* == 12 and a == 2)
+        p = &a
+        if flag {
+            p = &b
+            a += 1
+        } else {
+            p = &b
+            a += 2
+        }
+        ; Both branches release a, including accesses inside each branch.
+        a += 1
+        @assert(p.* == 12)
+        @assert(
+            a == if flag {
+                4
+            } else {
+                5
+            }
+        )
+        ; A reference declared inside a block may select an outer owner.
+        {
+            let mut q = &a
+            q = &b
+            q.* += 1
+            @assert(q.* == 13)
+        }
+    }
+}
+
+@[test]
+let short_circuit_selection: () = {
+    loop flag in [false, true] {
+        let mut a: int = 1
+        let mut b: int = 10
+        let mut p = &a
+        let both = flag and {
+            p = &b
+            true
+        }
+        @assert(both == flag)
+        @assert(
+            p.* == if flag {
+                10
+            } else {
+                1
+            }
+        )
+        p = &a
+        let either = flag or {
+            p = &b
+            false
+        }
+        @assert(either == flag)
+        @assert(
+            p.* == if flag {
+                1
+            } else {
+                10
+            }
+        )
+    }
+}
+
+@[test]
+let zero_one_many_iterations: () = {
+    loop count in [0, 1, 3] {
+        let mut a: int = 1
+        let mut b: int = 10
+        let mut p = &a
+        loop _ in 0..count {
+            p = &b
+            p.* += 1
+        }
+        @assert(
+            p.* == if count == 0 {
+                1
+            } else {
+                10 + count
+            }
+        )
+        p = &a
+        let mut i: int = 0
+        loop i < count : i += 1 {
+            p = &b
+        }
+        @assert(
+            p.* == if count == 0 {
+                1
+            } else {
+                10 + count
+            }
+        )
+    }
+}
+
+@[test]
+let condition_continuation_and_exhaustion: () = {
+    loop count in [0, 1, 3] {
+        let mut a: int = 1
+        let mut b: int = 10
+        let mut c: int = 100
+        let mut p = &a
+        let mut i: int = 0
+        loop {
+            p = &b
+            i < count
+        } : {
+            p = &c
+            i += 1
+        } {
+            @assert(p.* == 10)
+            continue
+        }
+        ; Even the final false condition executes its rebind.
+        @assert(p.* == 10)
+        p = &a
+        i = 0
+        loop i < count : {
+            p = &b
+            i += 1
+        } {
+            continue
+        }
+        @assert(
+            p.* == if count == 0 {
+                1
+            } else {
+                10
+            }
+        )
+        loop false {
+            p = &a
+        } else {
+            p = &c
+        }
+        @assert(p.* == 100)
+    }
+}
+
+@[test]
+let break_and_continue_paths: () = {
+    loop flag in [false, true] {
+        let mut a: int = 1
+        let mut b: int = 10
+        let mut p = &a
+        let mut i: int = 0
+        loop i < 2 : i += 1 {
+            if flag {
+                p = &b
+                break
+            }
+            p = &a
+            continue
+        } else {
+            p = &a
+        }
+        @assert(
+            p.* == if flag {
+                10
+            } else {
+                1
+            }
+        )
+    }
+}
+
+@[test]
+let readonly_targets: () = {
+    let a: u8 = 3
+    let b: u8 = 7
+    loop flag in [false, true] {
+        let mut view: &u8 = &a
+        if flag {
+            view = &b
+        }
+        @assert(
+            view.* == if flag {
+                7
+            } else {
+                3
+            }
+        )
+        @assert("{@TypeOf(view)}" == "&u8")
+    }
+    let mut writable: u8 = 9
+    let mut downgraded: &u8 = &writable
+    {
+        downgraded = &a
+    }
+    writable += 1
+    @assert(downgraded.* == 3 and writable == 10)
+}
+
+@[test]
+let array_elements_different_owners: () = {
+    loop flag in [false, true] {
+        let mut a: []int = [1, 2, 3]
+        let mut b: []int = [10, 20, 30]
+        let mut index: int = -1
+        let mut p = &a[index]
+        index = 0
+        p.* += {
+            p = &b[index]
+            index = 1
+            4
+        }
+        @assert(p.* == 10 and index == 1)
+        p.* = {
+            p = &a[0]
+            8
+        }
+        p.* += 1
+        if flag {
+            p = &a[1]
+        } else {
+            p = &b[-1]
+        }
+        @assert(
+            p.* == if flag {
+                2
+            } else {
+                30
+            }
+        )
+        p = &a[0]
+        @assert(p.* == 2)
+        p = &b[0]
+        @assert(p.* == 8 and a[2] == 7)
+    }
+}
+
+@[test]
+let old_target_before_rhs_rebind: () = {
+    let mut a: int = 1
+    let mut b: int = 10
+    let mut c: int = 100
+    let mut p = &a
+    p.* += {
+        p = &b
+        5
+    }
+    @assert(p.* == 10 and a == 6)
+    p.* = {
+        p = &c
+        20
+    }
+    @assert(p.* == 100 and b == 20)
+    p.* += {
+        p = &a
+        p.* + 1
+    }
+    @assert(p.* == 6 and c == 107)
+}

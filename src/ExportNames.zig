@@ -36,7 +36,7 @@ pub fn validExternName(name: []const u8) bool {
         };
         if (numbered) return false;
     }
-    for ([_][]const u8{ "nov_rt_", "nov_gc_", "nov_fn_", "nov_record_", "nov_range_", "nov_string", "nov_array", "nov_M", "nov_element_", "nov_to_string_", "NOV_GC_" }) |prefix| {
+    for ([_][]const u8{ "nov_rt_", "nov_gc_", "nov_fn_", "nov_record_", "nov_range_", "nov_reference_", "nov_string", "nov_array", "nov_M", "nov_element_", "nov_to_string_", "NOV_GC_" }) |prefix| {
         if (std.mem.startsWith(u8, name, prefix)) return false;
     }
     // float.h is emitted for reachable floats, including signature-only uses.
@@ -150,6 +150,17 @@ test "foreign names reject integer least and fast limit macros in every width" {
                 }
             }
         }
+    }
+}
+
+test "foreign names reject reference slots and snapshots without reserving nov" {
+    for ([_][]const u8{ "nov_reference_slot_0", "nov_reference_42", "nov_reference_future" }) |name| {
+        try std.testing.expect(!validExternName(name));
+        try std.testing.expect(!validName(name));
+    }
+    for ([_][]const u8{ "nov_reference", "nov_references", "nov_referenceValue" }) |name| {
+        try std.testing.expect(validExternName(name));
+        try std.testing.expect(validName(name));
     }
 }
 

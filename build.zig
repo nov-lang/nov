@@ -180,6 +180,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     addRangeValueCliTests(b, exe, test_step, fixtures);
     const reference_tests = b.step("test-cli-references", "Run explicit local reference CLI tests");
     addReferenceCliTests(b, exe, reference_tests);
+    const reference_rebinding_tests = b.step("test-cli-reference-rebinding", "Run CFG reference rebinding CLI tests");
+    addReferenceRebindingCliTests(b, exe, reference_rebinding_tests);
+    test_step.dependOn(reference_rebinding_tests);
     addBorrowCliTests(b, exe, reference_tests, fixtures);
     test_step.dependOn(reference_tests);
     _ = fixtures.add("library-result-source.nov", @embedFile("lib/result.nov"));
@@ -3805,10 +3808,10 @@ fn addReferenceCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: 
         .{ .name = "downgraded-write", .body = "let p:&u8=&a\np.* = 1", .diagnostic = immutable },
         .{ .name = "readonly-rebound-write", .body = "let mut p:&u8=&a\np=&b\np.* = 1", .diagnostic = immutable },
         .{ .name = "mutable-upgrade", .body = "let fixed:u8=0\nlet p:&mut u8=&fixed", .diagnostic = "expression does not match the expected type" },
-        .{ .name = "dynamic-branch-rebind", .body = "let mut p=&a\nif flag {p=&b}\np.* = 1", .diagnostic = unsupported },
-        .{ .name = "both-branches-rebind", .body = "let mut p=&a\nif flag {p=&b} else {p=&b}\np.* = 1", .diagnostic = unsupported },
-        .{ .name = "loop-rebind", .body = "let mut p=&a\nloop flag {p=&b}\np.* = 1", .diagnostic = unsupported },
-        .{ .name = "short-circuit-rebind", .body = "let mut p=&a\nlet result=flag and {p=&b\ntrue}", .diagnostic = unsupported },
+        .{ .name = "branch-inner-owner-escape", .body = "let mut p=&a\nif flag {let mut inner:u8=0\np=&inner}", .diagnostic = unsupported },
+        .{ .name = "both-branches-inner-owner-escape", .body = "let mut p=&a\nif flag {let mut inner:u8=0\np=&inner} else {p=&b}", .diagnostic = unsupported },
+        .{ .name = "loop-inner-owner-escape", .body = "let mut p=&a\nloop flag {let mut inner:u8=0\np=&inner}", .diagnostic = unsupported },
+        .{ .name = "short-circuit-inner-owner-escape", .body = "let mut p=&a\nlet result=flag and {let mut inner:u8=0\np=&inner\ntrue}", .diagnostic = unsupported },
         .{ .name = "nested-scope-rebind", .body = "let mut p=&a\n{let mut inner:u8=0\np=&inner}\np.* = 1", .diagnostic = unsupported },
         .{ .name = "implicit-read", .body = "let p=&a\n@println(p)", .diagnostic = unsupported },
         .{ .name = "implicit-index", .body = "let values:[]u8=[1]\nlet p=&values\n@println(p[0])", .diagnostic = unsupported },
@@ -3828,6 +3831,70 @@ fn addReferenceCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: 
         for ([_]bool{ false, true }) |emit| {
             const check = b.addRunArtifact(exe);
             check.step.name = b.fmt("CLI references reject: {s} ({s})", .{ case.name, if (emit) "emit-c" else "semantic" });
+            check.addArgs(if (emit) &.{"emit-c"} else &.{ "check", "--semantic" });
+            check.addFileArg(source);
+            check.expectExitCode(1);
+            check.expectStdOutEqual("");
+            check.expectStdErrMatch(b.fmt("error: {s}", .{case.diagnostic}));
+            test_step.dependOn(&check.step);
+        }
+    }
+}
+
+fn addReferenceRebindingCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    for ([_][]const u8{ "fmt", "semantic", "", "--debug", "--release" }) |mode| {
+        const format = std.mem.eql(u8, mode, "fmt");
+        const semantic = std.mem.eql(u8, mode, "semantic");
+        for ([_][]const u8{ "run", "test" }) |command| {
+            if ((format or semantic) and std.mem.eql(u8, command, "test")) continue;
+            const run = b.addRunArtifact(exe);
+            run.step.name = b.fmt("CLI reference rebinding: {s} ({s})", .{ command, mode });
+            run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+            run.setEnvironmentVariable("NOV_CC", "");
+            run.setEnvironmentVariable("CC", "");
+            if (format) {
+                run.addArgs(&.{ "fmt", "--check" });
+            } else if (semantic) {
+                run.addArgs(&.{ "check", "--semantic" });
+            } else {
+                run.addArg(command);
+            }
+            run.addFileArg(b.path("examples/reference-rebinding.nov"));
+            if (!format and !semantic and mode.len != 0) run.addArg(mode);
+            run.expectExitCode(0);
+            run.expectStdOutEqual(if (format or semantic) "" else if (std.mem.eql(u8, command, "run"))
+                "Chosen: 3 12\n"
+            else
+                "PASS branches_match_and_block\nPASS short_circuit_selection\nPASS zero_one_many_iterations\nPASS condition_continuation_and_exhaustion\nPASS break_and_continue_paths\nPASS readonly_targets\nPASS array_elements_different_owners\nPASS old_target_before_rhs_rebind\n8 passed; 0 failed; 8 total\n");
+            run.expectStdErrEqual("");
+            test_step.dependOn(&run.step);
+        }
+    }
+    const fixtures = b.addWriteFiles();
+    const unsupported = "local references require";
+    const conflict = "owner access conflicts with a live borrow";
+    const mismatch = "expression does not match the expected type";
+    for ([_]struct { name: []const u8, body: []const u8, diagnostic: []const u8 }{
+        .{ .name = "unused-inner-owner", .body = "let mut p=&a\n{let mut inner:int=0\np=&inner}", .diagnostic = unsupported },
+        .{ .name = "inner-array-owner", .body = "let mut xs:[]int=[1]\nlet mut p=&xs[0]\nif flag {let mut ys:[]int=[2]\np=&ys[0]}", .diagnostic = unsupported },
+        .{ .name = "match-inner-owner", .body = "let mut p=&a\nmatch flag {true=>{let mut inner:int=0\np=&inner}\nfalse=>{p=&b}}", .diagnostic = unsupported },
+        .{ .name = "possible-initial-owner", .body = "let mut p=&a\nif flag {p=&b}\na=3\np.* += 1", .diagnostic = conflict },
+        .{ .name = "possible-new-owner", .body = "let mut p=&a\nif flag {p=&b}\nb=3\np.* += 1", .diagnostic = conflict },
+        .{ .name = "zero-loop-initial-owner", .body = "let mut p=&a\nloop _ in 0..count {p=&b}\na=3\np.* += 1", .diagnostic = conflict },
+        .{ .name = "short-circuit-possible-owner", .body = "let mut p=&a\nlet selected=flag and {p=&b\ntrue}\nb=3\np.* += 1", .diagnostic = conflict },
+        .{ .name = "second-live-borrow", .body = "let q=&b\nlet mut p=&a\nif flag {p=&b}\np.* += 1\n@println(q.*)", .diagnostic = conflict },
+        .{ .name = "compound-old-owner-access", .body = "let mut p=&a\np.* += {p=&b\na=3\n1}", .diagnostic = conflict },
+        .{ .name = "mutable-to-readonly-owner", .body = "let fixed:int=0\nlet mut p=&a\nif flag {p=&fixed}", .diagnostic = mismatch },
+        .{ .name = "different-child-type", .body = "let mut other:u8=0\nlet mut p=&a\nif flag {p=&other}", .diagnostic = mismatch },
+        .{ .name = "readonly-stays-readonly", .body = "let mut p:&int=&a\nif flag {p=&b}\np.* = 3", .diagnostic = "assignment requires a mutable local" },
+        .{ .name = "immutable-binding", .body = "let p=&a\nif flag {p=&b}", .diagnostic = "assignment requires a mutable local" },
+        .{ .name = "exclusive-array-elements", .body = "let mut xs:[]int=[1,2]\nlet mut p=&xs[0]\np.* += {p=&xs[1]\n1}", .diagnostic = conflict },
+        .{ .name = "conditional-exclusive-array", .body = "let mut xs:[]int=[1,2]\nlet mut ys:[]int=[3,4]\nlet mut p=&xs[0]\nif flag {p=&ys[0]}\nlet q=&xs[1]\np.* += 1\n@println(q.*)", .diagnostic = conflict },
+    }) |case| {
+        const source = fixtures.add(b.fmt("reference-rebinding-{s}.nov", .{case.name}), b.fmt("let verify:(flag:bool,count:int)={{let mut a:int=0\nlet mut b:int=0\n{s}\n}}\nlet main:()=verify(true,1)\n", .{case.body}));
+        for ([_]bool{ false, true }) |emit| {
+            const check = b.addRunArtifact(exe);
+            check.step.name = b.fmt("CLI reference rebinding reject: {s} ({s})", .{ case.name, if (emit) "emit-c" else "semantic" });
             check.addArgs(if (emit) &.{"emit-c"} else &.{ "check", "--semantic" });
             check.addFileArg(source);
             check.expectExitCode(1);

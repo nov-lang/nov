@@ -62,6 +62,10 @@ pub const Operation = union(enum) {
     borrow_reserve: ValueId,
     // Null index denotes the whole owner; a nonnull index selects an array element.
     borrow_start: struct { reservation: ValueId, index: ?ValueId },
+    // Reference slots hold raw loans; loads snapshot the target before RHS evaluation.
+    reference_slot: ValueId,
+    reference_rebind: struct { slot: ValueId, borrow: ValueId },
+    reference_load: ValueId,
     borrow_read: ValueId,
     borrow_store: struct { borrow: ValueId, value: ValueId, path: []const u32 },
     range_init: struct { start: ValueId, end: ValueId, inclusive: bool },
@@ -812,6 +816,8 @@ fn environmentLayout(self: *const Ir, function: Function, body: Body, value: Val
 fn operandType(body: Body, id: ValueId, before: usize) VerifyError!TypeId {
     const ty = try regionOperandType(body, id, before, null);
     if (isSlot(body.instructions[@backingInt(id)])) return error.InvalidValueId;
+    const op = body.instructions[@backingInt(id)].op;
+    if (op == .reference_slot or op == .reference_load) return error.InvalidOperation;
     return ty;
 }
 
@@ -822,7 +828,7 @@ const Yield = struct { owner: usize, start: usize };
 fn regionOperandType(body: Body, id: ValueId, before: usize, yielding: ?Yield) VerifyError!TypeId {
     const index = @backingInt(id);
     if (index >= before or index >= body.instructions.len) return error.InvalidValueId;
-    if (yielding != null and isSlot(body.instructions[index])) return error.InvalidValueId;
+    if (yielding != null and (isSlot(body.instructions[index]) or isCapability(body.instructions[index]))) return error.InvalidValueId;
     for (body.instructions, 0..) |instruction, owner| {
         var buffer: [4]Region = undefined;
         for (regions(instruction.op, owner, &buffer)) |region| {
@@ -909,18 +915,47 @@ pub fn borrowConflict(self: *const Ir, body: Body) VerifyError!?BorrowConflict {
     return BorrowCheck.check(self.allocator, body);
 }
 
+/// Raw borrow_start only. Dynamic snapshots do not have a single static owner.
 pub fn borrowOwner(body: Body, borrow: ValueId) ValueId {
     const reservation = body.instructions[@backingInt(borrow)].op.borrow_start.reservation;
     return body.instructions[@backingInt(reservation)].op.borrow_reserve;
 }
 
-fn borrowElement(self: *const Ir, body: Body, borrow: ValueId, before: usize) VerifyError!TypeId {
+fn isCapability(instruction: Instruction) bool {
+    return switch (instruction.op) {
+        .borrow_reserve, .borrow_start, .reference_slot, .reference_load => true,
+        else => false,
+    };
+}
+
+/// Resolves raw loans and immutable snapshots, never a dynamic reference slot.
+pub fn borrowElement(self: *const Ir, body: Body, borrow: ValueId, before: usize) VerifyError!TypeId {
     _ = try regionOperandType(body, borrow, before, null);
-    if (body.instructions[@backingInt(borrow)].op != .borrow_start) return error.InvalidOperation;
-    const slot = borrowOwner(body, borrow);
+    var raw = borrow;
+    if (body.instructions[@backingInt(raw)].op == .reference_load) {
+        const slot = body.instructions[@backingInt(raw)].op.reference_load;
+        _ = try regionOperandType(body, slot, @backingInt(raw), null);
+        if (body.instructions[@backingInt(slot)].op != .reference_slot) return error.InvalidOperation;
+        raw = body.instructions[@backingInt(slot)].op.reference_slot;
+    }
+    if (body.instructions[@backingInt(raw)].op != .borrow_start) return error.InvalidOperation;
+    const slot = borrowOwner(body, raw);
     const owner_ty = body.instructions[@backingInt(slot)].ty;
     const owner = self.getType(owner_ty).?;
-    return if (body.instructions[@backingInt(borrow)].op.borrow_start.index == null) owner_ty else owner.array;
+    return if (body.instructions[@backingInt(raw)].op.borrow_start.index == null) owner_ty else owner.array;
+}
+
+// Storage must exist throughout the reference slot's region, not just at the
+// rebind. Deliberately no instruction-order check: later same-region owners work.
+fn referenceOwnerScope(body: Body, slot: usize, borrow: ValueId) VerifyError!void {
+    const owner = @backingInt(borrowOwner(body, borrow));
+    for (body.instructions, 0..) |instruction, end| {
+        var buffer: [4]Region = undefined;
+        for (regions(instruction.op, end, &buffer)) |region| {
+            if (owner >= region.start and owner < region.end and
+                !(slot >= region.start and slot < region.end)) return error.InvalidRegion;
+        }
+    }
 }
 
 fn validateBodyStructure(self: *const Ir, function: Function, body: Body) VerifyError!void {
@@ -1043,6 +1078,28 @@ fn validateBodyStructure(self: *const Ir, function: Function, body: Body) Verify
                 for (body.instructions[0..i]) |previous| {
                     if (previous.op == .borrow_start and previous.op.borrow_start.reservation == start.reservation) return error.InvalidOperation;
                 }
+            },
+            .reference_slot => |borrow| {
+                if (ty != .void) return error.InvalidOperation;
+                _ = try regionOperandType(body, borrow, i, null);
+                if (body.instructions[@backingInt(borrow)].op != .borrow_start) return error.InvalidOperation;
+                _ = try self.borrowElement(body, borrow, i);
+                try referenceOwnerScope(body, i, borrow);
+            },
+            .reference_rebind => |rebind| {
+                if (ty != .void) return error.InvalidOperation;
+                _ = try regionOperandType(body, rebind.slot, i, null);
+                if (body.instructions[@backingInt(rebind.slot)].op != .reference_slot) return error.InvalidOperation;
+                _ = try regionOperandType(body, rebind.borrow, i, null);
+                if (body.instructions[@backingInt(rebind.borrow)].op != .borrow_start) return error.InvalidOperation;
+                const initial = body.instructions[@backingInt(rebind.slot)].op.reference_slot;
+                if (try self.borrowElement(body, initial, @backingInt(rebind.slot)) != try self.borrowElement(body, rebind.borrow, i)) return error.OperandTypeMismatch;
+                try referenceOwnerScope(body, @backingInt(rebind.slot), rebind.borrow);
+            },
+            .reference_load => |slot| {
+                if (ty != .void) return error.InvalidOperation;
+                _ = try regionOperandType(body, slot, i, null);
+                if (body.instructions[@backingInt(slot)].op != .reference_slot) return error.InvalidOperation;
             },
             .borrow_read => |borrow| {
                 if (instruction.ty != try self.borrowElement(body, borrow, i)) return error.OperandTypeMismatch;
@@ -4855,4 +4912,313 @@ test "range operands and projections cannot escape private branch regions" {
     }
     owned[5] = good[5];
     try t.ir.verify();
+}
+
+const ReferenceTests = struct {
+    ir: Ir,
+    unit: TypeId,
+    boolean: TypeId,
+    integer: TypeId,
+    function: FunctionId,
+    zero: ConstId,
+    empty: ConstId,
+
+    fn init(allocator: std.mem.Allocator) !ReferenceTests {
+        var ir = Ir.init(allocator);
+        errdefer ir.deinit();
+        const unit = try ir.internType(.void);
+        const boolean = try ir.internType(.boolean);
+        const integer = try ir.internType(.{ .integer = .{ .signedness = .signed, .bits = native_pointer_bits } });
+        const signature = try ir.internType(.{ .function = .{ .params = &.{boolean}, .result = unit } });
+        const function = try ir.addFunction("references", signature, .{ .start = 0, .end = 0 });
+        const zero = try ir.internConstant(.{ .ty = integer, .value = .{ .signed_integer = 0 } });
+        const empty = try ir.internConstant(.{ .ty = unit, .value = .void });
+        return .{ .ir = ir, .unit = unit, .boolean = boolean, .integer = integer, .function = function, .zero = zero, .empty = empty };
+    }
+
+    fn id(index: u32) ValueId {
+        return @fromBackingInt(index);
+    }
+
+    fn ins(ty: TypeId, op: Operation) Instruction {
+        return .{ .ty = ty, .span = .{ .start = 0, .end = 0 }, .op = op };
+    }
+
+    fn prefix(t: ReferenceTests) [8]Instruction {
+        return .{
+            ins(t.integer, .{ .constant = t.zero }), // 0
+            ins(t.integer, .{ .local_slot = id(0) }), // 1: a
+            ins(t.integer, .{ .local_slot = id(0) }), // 2: b
+            ins(t.boolean, .{ .parameter = 0 }), // 3
+            ins(t.unit, .{ .borrow_reserve = id(1) }), // 4
+            ins(t.unit, .{ .borrow_start = .{ .reservation = id(4), .index = null } }), // 5
+            ins(t.unit, .{ .reference_slot = id(5) }), // 6: p
+            ins(t.unit, .{ .constant = t.empty }), // 7
+        };
+    }
+
+    fn check(t: *ReferenceTests, instructions: []const Instruction, conflict: bool) !void {
+        const body: Body = .{ .instructions = instructions, .result = id(@intCast(instructions.len - 1)) };
+        try t.ir.verifyBodyStructure(t.function, body);
+        try std.testing.expectEqual(conflict, try t.ir.borrowConflict(body) != null);
+    }
+};
+
+fn testReferenceRebinding(allocator: std.mem.Allocator) !void {
+    var t = try ReferenceTests.init(allocator);
+    defer t.ir.deinit();
+    const ins = ReferenceTests.ins;
+    const id = ReferenceTests.id;
+    var branch = t.prefix() ++ [_]Instruction{
+        ins(t.unit, .{ .borrow_reserve = id(2) }), // 8
+        ins(t.unit, .{ .borrow_start = .{ .reservation = id(8), .index = null } }),
+        ins(t.unit, .{ .reference_rebind = .{ .slot = id(6), .borrow = id(9) } }),
+        ins(t.unit, .{ .local_store = .{ .slot = id(1), .value = id(0) } }), // killed a in then
+        ins(t.unit, .{ .constant = t.empty }),
+        ins(t.unit, .{ .constant = t.empty }), // 13: else
+        ins(t.unit, .{ .branch = .{ .condition = id(3), .then_start = 8, .else_start = 13, .then_value = id(12), .else_value = id(13) } }),
+        ins(t.unit, .{ .reference_load = id(6) }),
+        ins(t.integer, .{ .borrow_read = id(15) }),
+        ins(t.unit, .{ .constant = t.empty }),
+    };
+    try t.check(&branch, false);
+    branch[11].op.local_store.slot = id(2);
+    try t.check(&branch, true);
+    branch[11].op.local_store.slot = id(1);
+    for ([_]ValueId{ id(1), id(2) }) |owner| {
+        const after = branch[0..15].* ++ [_]Instruction{
+            ins(t.unit, .{ .local_store = .{ .slot = owner, .value = id(0) } }),
+            ins(t.unit, .{ .reference_load = id(6) }),
+            ins(t.integer, .{ .borrow_read = id(16) }),
+            ins(t.unit, .{ .constant = t.empty }),
+        };
+        try t.check(&after, true);
+    }
+    var snapshot = t.prefix() ++ [_]Instruction{
+        ins(t.unit, .{ .reference_load = id(6) }), // 8: old target
+        ins(t.unit, .{ .borrow_reserve = id(2) }),
+        ins(t.unit, .{ .borrow_start = .{ .reservation = id(9), .index = null } }),
+        ins(t.unit, .{ .reference_rebind = .{ .slot = id(6), .borrow = id(10) } }),
+        ins(t.unit, .{ .local_store = .{ .slot = id(1), .value = id(0) } }),
+        ins(t.unit, .{ .borrow_store = .{ .borrow = id(8), .value = id(0), .path = &.{} } }),
+        ins(t.unit, .{ .reference_load = id(6) }),
+        ins(t.integer, .{ .borrow_read = id(14) }),
+        ins(t.unit, .{ .constant = t.empty }),
+    };
+    try t.check(&snapshot, true);
+    snapshot[13] = ins(t.unit, .{ .constant = t.empty });
+    try t.check(&snapshot, false);
+    // Rebinding to the same owner is legal only after the old snapshot dies.
+    var same_owner = snapshot;
+    same_owner[9].op.borrow_reserve = id(1);
+    same_owner[12] = ins(t.unit, .{ .constant = t.empty });
+    try t.check(&same_owner, false);
+    same_owner[13] = ins(t.unit, .{ .borrow_store = .{ .borrow = id(8), .value = id(0), .path = &.{} } });
+    try t.check(&same_owner, true);
+    // Publication and operand ownership must roll back at every allocation.
+    try t.ir.setFunctionBody(t.function, &snapshot, id(16));
+    try t.ir.verify();
+}
+
+test "reference rebinding CFG conditional targets kills snapshots and publication OOM" {
+    try testReferenceRebinding(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testReferenceRebinding, .{});
+}
+
+test "reference rebinding loop zero iterations backedges break continue and exhaustion" {
+    var t = try ReferenceTests.init(std.testing.allocator);
+    defer t.ir.deinit();
+    const ins = ReferenceTests.ins;
+    const id = ReferenceTests.id;
+    var loop = t.prefix() ++ [_]Instruction{
+        ins(t.boolean, .{ .parameter = 0 }), // 8
+        ins(t.unit, .{ .borrow_reserve = id(2) }),
+        ins(t.unit, .{ .borrow_start = .{ .reservation = id(9), .index = null } }),
+        ins(t.unit, .{ .reference_rebind = .{ .slot = id(6), .borrow = id(10) } }),
+        ins(t.unit, .{ .local_store = .{ .slot = id(1), .value = id(0) } }),
+        ins(t.unit, .{ .constant = t.empty }), // 13
+        ins(t.unit, .{ .loop = .{ .condition_start = 8, .body_start = 9, .condition = id(8), .body = id(13) } }),
+        ins(t.unit, .{ .reference_load = id(6) }),
+        ins(t.integer, .{ .borrow_read = id(15) }),
+        ins(t.unit, .{ .constant = t.empty }),
+    };
+    // Each iteration replaces the slot before its old target is touched.
+    try t.check(&loop, false);
+    loop[13] = ins(t.unit, .loop_continue);
+    try t.check(&loop, false);
+    loop[13] = ins(t.unit, .{ .loop_break = null });
+    try t.check(&loop, false);
+    loop[13] = ins(t.unit, .{ .constant = t.empty });
+    const zero = loop[0..15].* ++ [_]Instruction{
+        ins(t.unit, .{ .local_store = .{ .slot = id(1), .value = id(0) } }),
+        ins(t.unit, .{ .reference_load = id(6) }),
+        ins(t.integer, .{ .borrow_read = id(16) }),
+        ins(t.unit, .{ .constant = t.empty }),
+    };
+    try t.check(&zero, true);
+    // Reading p in the condition carries b to the next iteration's reservation.
+    const backedge = loop[0..8].* ++ [_]Instruction{
+        ins(t.unit, .{ .reference_load = id(6) }),
+        ins(t.integer, .{ .borrow_read = id(8) }),
+        ins(t.boolean, .{ .parameter = 0 }),
+        ins(t.unit, .{ .borrow_reserve = id(2) }),
+        ins(t.unit, .{ .borrow_start = .{ .reservation = id(11), .index = null } }),
+        ins(t.unit, .{ .reference_rebind = .{ .slot = id(6), .borrow = id(12) } }),
+        ins(t.unit, .{ .constant = t.empty }),
+        ins(t.unit, .{ .loop = .{ .condition_start = 8, .body_start = 11, .condition = id(10), .body = id(14) } }),
+        ins(t.unit, .{ .constant = t.empty }),
+    };
+    // The condition snapshot dies before rebind, so reserving b again is legal.
+    try t.check(&backedge, false);
+    const exhaustion = loop[0..14].* ++ [_]Instruction{
+        ins(t.unit, .{ .local_store = .{ .slot = id(1), .value = id(0) } }),
+        ins(t.unit, .{ .loop = .{ .condition_start = 8, .body_start = 9, .condition = id(8), .body = id(13), .else_start = 14, .else_value = id(14) } }),
+        ins(t.unit, .{ .reference_load = id(6) }),
+        ins(t.integer, .{ .borrow_read = id(16) }),
+        ins(t.unit, .{ .constant = t.empty }),
+    };
+    try t.check(&exhaustion, true);
+    var condition = t.prefix() ++ [_]Instruction{
+        ins(t.unit, .{ .reference_load = id(6) }),
+        ins(t.integer, .{ .borrow_read = id(8) }),
+        ins(t.boolean, .{ .parameter = 0 }),
+        ins(t.unit, .{ .local_store = .{ .slot = id(1), .value = id(0) } }),
+        ins(t.unit, .{ .constant = t.empty }),
+        ins(t.unit, .{ .loop = .{ .condition_start = 8, .body_start = 11, .condition = id(10), .body = id(12) } }),
+        ins(t.unit, .{ .constant = t.empty }),
+    };
+    try t.check(&condition, true); // Next iteration's condition keeps a borrowed.
+    condition[12] = ins(t.unit, .loop_continue);
+    try t.check(&condition, true);
+    condition[12] = ins(t.unit, .{ .loop_break = null });
+    try t.check(&condition, false); // Break skips both the condition and exhaustion.
+}
+
+test "reference rebinding source free verifier rejects copies escapes and short lived owners" {
+    var t = try ReferenceTests.init(std.testing.allocator);
+    defer t.ir.deinit();
+    const ins = ReferenceTests.ins;
+    const id = ReferenceTests.id;
+    const prefix = t.prefix();
+    for ([_]struct { instruction: Instruction, err: VerifyError }{
+        .{ .instruction = ins(t.integer, .{ .reference_slot = id(5) }), .err = error.InvalidOperation },
+        .{ .instruction = ins(t.unit, .{ .reference_slot = id(6) }), .err = error.InvalidOperation },
+        .{ .instruction = ins(t.unit, .{ .reference_slot = id(9) }), .err = error.InvalidValueId },
+        .{ .instruction = ins(t.integer, .{ .reference_load = id(6) }), .err = error.InvalidOperation },
+        .{ .instruction = ins(t.unit, .{ .reference_load = id(5) }), .err = error.InvalidOperation },
+        .{ .instruction = ins(t.unit, .{ .reference_rebind = .{ .slot = id(5), .borrow = id(5) } }), .err = error.InvalidOperation },
+        .{ .instruction = ins(t.unit, .{ .reference_rebind = .{ .slot = id(6), .borrow = id(6) } }), .err = error.InvalidOperation },
+        .{ .instruction = ins(t.integer, .{ .borrow_read = id(6) }), .err = error.InvalidOperation },
+        .{ .instruction = ins(t.unit, .{ .borrow_store = .{ .borrow = id(6), .value = id(0), .path = &.{} } }), .err = error.InvalidOperation },
+        .{ .instruction = ins(t.unit, .{ .local_load = id(6) }), .err = error.InvalidOperation },
+        .{ .instruction = ins(t.unit, .{ .return_value = id(6) }), .err = error.InvalidOperation },
+    }) |case| {
+        const instructions = prefix ++ .{case.instruction};
+        try std.testing.expectError(case.err, t.ir.verifyBodyStructure(t.function, .{ .instructions = &instructions, .result = id(8) }));
+    }
+    // Even unit-typed capabilities are not function or region yield values.
+    try std.testing.expectError(error.InvalidValueId, t.ir.verifyBodyStructure(t.function, .{ .instructions = prefix[0..7], .result = id(6) }));
+    const loaded = prefix ++ [_]Instruction{
+        ins(t.unit, .{ .reference_load = id(6) }),
+        ins(t.unit, .{ .reference_rebind = .{ .slot = id(6), .borrow = id(8) } }),
+        ins(t.unit, .{ .constant = t.empty }),
+    };
+    try std.testing.expectError(error.InvalidOperation, t.ir.verifyBodyStructure(t.function, .{ .instructions = &loaded, .result = id(10) }));
+    try std.testing.expectError(error.InvalidValueId, t.ir.verifyBodyStructure(t.function, .{ .instructions = loaded[0..9], .result = id(8) }));
+    const mismatch = prefix ++ [_]Instruction{
+        ins(t.boolean, .{ .local_slot = id(3) }),
+        ins(t.unit, .{ .borrow_reserve = id(8) }),
+        ins(t.unit, .{ .borrow_start = .{ .reservation = id(9), .index = null } }),
+        ins(t.unit, .{ .reference_rebind = .{ .slot = id(6), .borrow = id(10) } }),
+        ins(t.unit, .{ .constant = t.empty }),
+    };
+    try std.testing.expectError(error.OperandTypeMismatch, t.ir.verifyBodyStructure(t.function, .{ .instructions = &mismatch, .result = id(12) }));
+    const nested = prefix ++ [_]Instruction{
+        ins(t.integer, .{ .local_slot = id(0) }),
+        ins(t.unit, .{ .borrow_reserve = id(8) }),
+        ins(t.unit, .{ .borrow_start = .{ .reservation = id(9), .index = null } }),
+        ins(t.unit, .{ .reference_rebind = .{ .slot = id(6), .borrow = id(10) } }),
+        ins(t.unit, .{ .constant = t.empty }),
+        ins(t.unit, .{ .constant = t.empty }),
+        ins(t.unit, .{ .branch = .{ .condition = id(3), .then_start = 8, .else_start = 13, .then_value = id(12), .else_value = id(13) } }),
+        ins(t.unit, .{ .constant = t.empty }),
+    };
+    try std.testing.expectError(error.InvalidRegion, t.ir.verifyBodyStructure(t.function, .{ .instructions = &nested, .result = id(15) }));
+    // Remove the branch: a later-defined owner in the same region is legal.
+    const same_region = nested[0..13].* ++ [_]Instruction{
+        ins(t.unit, .{ .reference_load = id(6) }),
+        ins(t.integer, .{ .borrow_read = id(13) }),
+        ins(t.unit, .{ .constant = t.empty }),
+    };
+    try t.check(&same_region, false);
+    const sibling = prefix ++ [_]Instruction{
+        ins(t.unit, .{ .reference_slot = id(5) }),
+        ins(t.unit, .{ .constant = t.empty }),
+        ins(t.unit, .{ .reference_load = id(8) }),
+        ins(t.unit, .{ .constant = t.empty }),
+        ins(t.unit, .{ .branch = .{ .condition = id(3), .then_start = 8, .else_start = 10, .then_value = id(9), .else_value = id(11) } }),
+        ins(t.unit, .{ .constant = t.empty }),
+    };
+    try std.testing.expectError(error.InvalidValueId, t.ir.verifyBodyStructure(t.function, .{ .instructions = &sibling, .result = id(13) }));
+}
+
+test "reference rebinding array element children snapshots and index reservation activation" {
+    var t = try ReferenceTests.init(std.testing.allocator);
+    defer t.ir.deinit();
+    const ins = ReferenceTests.ins;
+    const id = ReferenceTests.id;
+    const array = try t.ir.internType(.{ .array = t.integer });
+    var instructions = t.prefix() ++ [_]Instruction{
+        ins(array, .{ .array_literal = &.{id(0)} }), // 8
+        ins(array, .{ .local_slot = id(8) }),
+        ins(t.unit, .{ .borrow_reserve = id(9) }),
+        ins(t.unit, .{ .borrow_start = .{ .reservation = id(10), .index = id(0) } }),
+        ins(t.unit, .{ .reference_rebind = .{ .slot = id(6), .borrow = id(11) } }),
+        ins(t.unit, .{ .reference_load = id(6) }),
+        ins(t.integer, .{ .borrow_read = id(13) }),
+        ins(t.unit, .{ .constant = t.empty }),
+    };
+    try t.check(&instructions, false);
+    try std.testing.expectEqual(t.integer, try t.ir.borrowElement(.{ .instructions = &instructions, .result = id(15) }, id(13), 14));
+    instructions[11].op.borrow_start.index = null;
+    try std.testing.expectError(error.OperandTypeMismatch, t.ir.verifyBodyStructure(t.function, .{ .instructions = &instructions, .result = id(15) }));
+    // A reservation remains live while its index expression executes, even
+    // when it will only be consumed by a later reference-slot definition.
+    const index_access = instructions[0..11].* ++ [_]Instruction{
+        ins(array, .{ .local_load = id(9) }),
+        ins(t.unit, .{ .borrow_start = .{ .reservation = id(10), .index = id(0) } }),
+        ins(t.unit, .{ .reference_rebind = .{ .slot = id(6), .borrow = id(12) } }),
+        ins(t.unit, .{ .constant = t.empty }),
+    };
+    try t.check(&index_access, true);
+}
+
+test "reference rebinding preserves boxed owner call and closure capture conflicts" {
+    var t = try ReferenceTests.init(std.testing.allocator);
+    defer t.ir.deinit();
+    const ins = ReferenceTests.ins;
+    const id = ReferenceTests.id;
+    const signature = t.ir.getFunction(t.function).?.ty;
+    const callee = try t.ir.addFunction("callee", signature, .{ .start = 0, .end = 0 });
+    var call = t.prefix() ++ [_]Instruction{
+        ins(signature, .{ .function_ref = callee }),
+        ins(t.unit, .{ .call = .{ .callee = id(8), .args = &.{id(3)} } }),
+        ins(t.unit, .{ .reference_load = id(6) }),
+        ins(t.integer, .{ .borrow_read = id(10) }),
+        ins(t.unit, .{ .constant = t.empty }),
+    };
+    try t.check(&call, false);
+    call[1].boxed = true;
+    try t.check(&call, true);
+    call[10] = ins(t.unit, .{ .constant = t.empty });
+    call[11] = ins(t.unit, .{ .constant = t.empty });
+    try t.check(&call, false); // NLL also ends boxed loans before opaque calls.
+    const closure = try t.ir.addFunction("closure", signature, .{ .start = 0, .end = 0 });
+    t.ir.functions.items[@backingInt(closure)].is_closure = true;
+    t.ir.functions.items[@backingInt(closure)].captures = try t.ir.allocator.dupe(Capture, &.{.{ .ty = t.integer, .mutable = true }});
+    call[8] = ins(signature, .{ .closure_init = .{ .function = closure, .captures = &.{id(1)} } });
+    call[9] = ins(t.unit, .{ .constant = t.empty });
+    call[10] = ins(t.unit, .{ .reference_load = id(6) });
+    call[11] = ins(t.integer, .{ .borrow_read = id(10) });
+    try t.check(&call, true);
 }

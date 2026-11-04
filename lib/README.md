@@ -130,14 +130,28 @@ shared closure environments and eager argument order.
 
 ## Local references and library boundaries
 
-The current explicit references are local-only compile-time capabilities, not
-first-class runtime pointers. `let p = &a` infers `&mut T` iff owner `a` is mutable;
+The current explicit references are local-only capabilities. Their runtime
+handles lower to typed C pointers internal to a compilation unit's IR; this does
+not enable source-level first-class references or a reference ABI.
+`let p = &a` infers `&mut T` iff owner `a` is mutable;
 otherwise it infers readonly `&T` (not `&const T`). An explicit `let p: &T = &a`
 can downgrade a mutable owner's borrow. Binding `mut` is independent: `let p`
 cannot rebind but permits `p.*` writes for `&mut T`; `let mut p` allows `p = &b`
 with the same exact reference type, retaining any explicit readonly annotation.
-Rebinding is straight-line within the same lexical/control region only, not
-outer-reference rebinding from dynamic branches, nested blocks or loops.
+Rebinding works across `if`, `match`, short-circuit expressions, nested blocks
+and loops, including conditions, continuation and exhaustion paths. CFG proofs
+merge possible targets with slot kills and NLL snapshot liveness; conflicting
+owner reads, writes or invalidation are blocked for any possible live alias.
+Readonly loans remain exclusive. Newly borrowed owner storage must be in the
+same or an outer lexical scope relative to the reference binding: rebinding an
+outer `p` to an inner owner rejects even when `p` is unused afterward.
+
+A load captures the current runtime target before dereference RHS effects:
+rebinding `p` to `b` inside the RHS of `p.* += ...` still updates the old pointee.
+The compound keeps that snapshot live; another element of the same array still
+conflicts with its whole-owner loan (no element disjointness). Ordinary rebinding
+after the last use works. Conservative owner-set checks may overreject
+target-sensitive iteration.
 
 There is no autodereference: use `p.*`, `p.*[i]`, `p.*.field`, or `p.*()` to
 access the pointee. Library calls such as `array.map(p.*, convert)` pass ordinary
@@ -145,8 +159,9 @@ array values under the existing copy rules, not references. `let q = p`, passing
 returning, storing, capturing and reborrowing references are currently rejected;
 `Result(&T, E)`, `Option(&T)` and arrays/fields of references are not supported.
 `loop &item in items` yields a local reference accessed with `item.*`.
-Existing static NLL/CFG borrowing, bounds checks and rooted stable owners remain
-in force; no runtime pointer reinterpretation or validity checks are added.
+Existing bounds checks and rooted stable owners remain in force. Owner roots
+retain managed backing for runtime handles and snapshots; interior pointers are
+not GC roots. No runtime reference-validity checks are added.
 
 **Accepted roadmap, not implemented:** passing, returning and storing references
 will require lifetime/referent tracking, GC retention of managed referents and
@@ -154,7 +169,8 @@ static prevention or safe invalidation of references when storage changes. No
 dangling references may be exposed. This does not change today's by-value library
 signatures or introduce manual memory management, pointer arithmetic, null or
 unsafe dereference. See the root README's [reference contract](../README.md#local-static-borrowing)
-and `examples/references.nov`; broader pointer proposals remain separate.
+and `examples/references.nov` / `examples/reference-rebinding.nov`; broader pointer
+proposals remain separate.
 
 ## Loading and installation
 

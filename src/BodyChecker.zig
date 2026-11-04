@@ -31,6 +31,7 @@ const Template = struct {
     environment_type: Ir.TypeId,
     name: ?[]const u8 = null,
 };
+const LoanOwner = struct { owner: Module.Span, origin: Module.Span };
 const Binding = struct {
     known: Known,
     template: ?*Template = null,
@@ -42,8 +43,13 @@ const Binding = struct {
     name_span: Module.Span,
     region: Ast.Node.Index = 0,
     borrowed: bool = false,
+    // Stable slot identity for normal references; a raw capability for iterators.
     borrow: ?Ir.ValueId = null,
-    loan_owner: ?struct { owner: Module.Span, origin: Module.Span } = null,
+    // Only raw iterator loans have one fixed owner. Reference slots may select
+    // any of these candidates; the IR proof tracks their actual CFG targets.
+    loan_owner: ?LoanOwner = null,
+    loan_owners: []const LoanOwner = &.{},
+    reference_slot: bool = false,
 };
 // Bounds recursive checking/probing, not the iterative literal-grouping walk.
 const max_recursive_depth = 128;
@@ -107,6 +113,7 @@ const Emitter = struct {
     functions: []const ?Ir.FunctionId,
     instructions: std.ArrayList(Ir.Instruction) = .empty,
     values: std.AutoHashMapUnmanaged(Ast.Node.Index, Ir.ValueId) = .empty,
+    dereferences: std.AutoHashMapUnmanaged(Ast.Node.Index, Ir.ValueId) = .empty,
     iteration_calls: std.ArrayList(IterationCall) = .empty,
 
     fn validateIterationCalls(self: *const Emitter, module: *Module) Error!bool {
@@ -219,7 +226,7 @@ fn checkInner(module: *Module, ir: *Ir, types: []const ?Ir.TypeId, id: Module.De
 }
 
 const Context = struct {
-    const Reservation = struct { owner: Module.Span, origin: Module.Span, parent: ?*const Reservation, reads_allowed: bool = false };
+    const Reservation = struct { owner: Module.Span, origin: Module.Span, parent: ?*const Reservation, reads_allowed: bool = false, iteration: bool = false, snapshot: bool = false };
     const LoopContext = struct { allows_value: bool, result: ?Known, valued_break: bool = false, has_break: bool = false };
 
     module: *Module,
@@ -685,13 +692,45 @@ const Context = struct {
     }
 
     fn mutationOrigin(self: *const Context, binding: Binding) ?Module.Span {
+        return self.accessOrigin(binding, false);
+    }
+
+    fn accessOrigin(self: *const Context, binding: Binding, borrowing: bool) ?Module.Span {
+        for (binding.loan_owners) |loan| {
+            var cursor = self.reservation;
+            while (cursor) |current| : (cursor = current.parent) {
+                if (borrowing and current.snapshot) continue;
+                if (std.meta.eql(loan.owner, current.owner) and (!binding.borrowed or current.reads_allowed or current.iteration)) return current.origin;
+            }
+        }
         const owner = if (binding.loan_owner) |loan| loan.owner else binding.name_span;
         var cursor = self.reservation;
         while (cursor) |current| : (cursor = current.parent) {
+            if (borrowing and current.snapshot) continue;
             // The iteration element itself may write through its exclusive loan.
             if (std.meta.eql(owner, current.owner) and (!binding.borrowed or current.reads_allowed)) return current.origin;
         }
         return null;
+    }
+
+    fn borrowReservations(self: *Context, binding: Binding, fallback: *const Reservation) Error!*const Reservation {
+        var parent = fallback;
+        for (binding.loan_owners) |loan| {
+            const reservation = try self.template_allocator.?.create(Reservation);
+            reservation.* = .{ .owner = loan.owner, .origin = loan.origin, .parent = parent, .snapshot = true };
+            parent = reservation;
+        }
+        return parent;
+    }
+
+    // Regions are source subtrees, not a liveness approximation. A later owner
+    // in the same block is safe, but inner storage cannot escape to an outer slot.
+    fn ownerOutlivesReference(self: *const Context, owner: Binding, reference: Binding) bool {
+        if (owner.region == 0 or owner.region == reference.region) return true;
+        if (reference.region == 0) return false;
+        const ast = &self.module.source.ast;
+        return ast.firstToken(owner.region) <= ast.firstToken(reference.region) and
+            ast.lastToken(owner.region) >= ast.lastToken(reference.region);
     }
 
     fn restoreScope(self: *Context, start: usize) void {
@@ -907,17 +946,40 @@ const Context = struct {
             _ = try self.fail(.unsupported_borrow, node, binding.name_span);
             return null;
         }
+        if (!self.probing and binding.reference_slot) if (self.emitter) |emitter| {
+            const capability = emitter.dereferences.get(node) orelse blk: {
+                const capability = try emitter.append(try self.ir.internType(.void), self.irSpan(node), .{ .reference_load = binding.borrow.? });
+                try emitter.dereferences.put(emitter.allocator, node, capability);
+                break :blk capability;
+            };
+            binding.borrow = capability;
+        };
         binding.known.ty = ty.reference.child;
         binding.mutable = ty.reference.mutable;
         return binding;
     }
 
     fn publishBorrow(self: *Context, name: []const u8, binding: Binding) Error!void {
+        const unit = try self.ir.internType(.void);
         if (self.bindings.getPtr(name)) |existing| {
-            var updated = binding;
-            updated.region = existing.region;
-            existing.* = updated;
-        } else try self.bindLocal(name, binding);
+            if (self.emitter) |emitter| {
+                _ = try emitter.append(unit, binding.loan_owner.?.origin, .{ .reference_rebind = .{ .slot = existing.borrow.?, .borrow = binding.borrow.? } });
+            }
+            for (existing.loan_owners) |candidate| {
+                if (std.meta.eql(candidate.owner, binding.loan_owner.?.owner)) return;
+            }
+            const candidates = try self.template_allocator.?.alloc(LoanOwner, existing.loan_owners.len + 1);
+            @memcpy(candidates[0..existing.loan_owners.len], existing.loan_owners);
+            candidates[existing.loan_owners.len] = binding.loan_owner.?;
+            existing.loan_owners = candidates;
+        } else {
+            var stored = binding;
+            if (self.emitter) |emitter| stored.borrow = try emitter.append(unit, binding.loan_owner.?.origin, .{ .reference_slot = binding.borrow.? });
+            stored.reference_slot = true;
+            stored.loan_owners = try self.template_allocator.?.dupe(LoanOwner, &.{binding.loan_owner.?});
+            stored.loan_owner = null;
+            try self.bindLocal(name, stored);
+        }
     }
 
     fn borrowLocal(self: *Context, node: Ast.Node.Index, name: []const u8, name_span: Module.Span, depth: usize) Error!bool {
@@ -945,9 +1007,17 @@ const Context = struct {
             _ = try self.fail(.unsupported_borrow, owner_node, null);
             return false;
         };
-        if (self.mutationOrigin(owner)) |origin| {
+        // Taking another target does not invalidate an in-flight dereference
+        // snapshot. Iteration and index reservations still protect their owners.
+        if (self.accessOrigin(owner, true)) |origin| {
             _ = try self.fail(.borrow_conflict, owner_node, origin);
             return false;
+        }
+        if (self.bindings.get(name)) |reference_binding| {
+            if (!self.ownerOutlivesReference(owner, reference_binding)) {
+                _ = try self.fail(.unsupported_borrow, init_node, reference_binding.name_span);
+                return false;
+            }
         }
         const owner_type = self.ir.getType(owner.known.ty).?;
         const supported = if (scalar) Ir.isArrayElement(owner_type) else owner_type == .array;
@@ -2824,7 +2894,7 @@ const Context = struct {
         const field = record.record.fields[index];
         const reservation: Reservation = .{ .owner = if (binding.loan_owner) |loan| loan.owner else binding.name_span, .origin = if (binding.loan_owner) |loan| loan.origin else self.irSpan(node), .parent = self.reservation };
         const parent = self.reservation;
-        if (binding.borrowed) self.reservation = &reservation;
+        if (binding.borrowed) self.reservation = try self.borrowReservations(binding, &reservation);
         defer self.reservation = parent;
         const tag = ast.nodes.items(.tag)[node];
         const compound = tag != .assign;
@@ -2891,7 +2961,7 @@ const Context = struct {
         if (binding.borrowed and !dereferenced) return self.fail(.unsupported_borrow, root, binding.name_span);
         const reservation: Reservation = .{ .owner = if (binding.loan_owner) |loan| loan.owner else binding.name_span, .origin = if (binding.loan_owner) |loan| loan.origin else self.irSpan(node), .parent = self.reservation };
         const parent = self.reservation;
-        if (binding.borrowed) self.reservation = &reservation;
+        if (binding.borrowed) self.reservation = try self.borrowReservations(binding, &reservation);
         defer self.reservation = parent;
         if (self.mutationOrigin(binding)) |origin| return self.fail(.borrow_conflict, target.lhs, origin);
         var array_id = binding.known.ty;
@@ -3447,7 +3517,7 @@ const Context = struct {
         if (by_ref) {
             if (self.mutationOrigin(owner.?)) |origin| return self.fail(.borrow_conflict, loop.source, origin);
         }
-        var iteration_reservation: Reservation = .{ .owner = if (owner) |binding| if (binding.loan_owner) |loan| loan.owner else binding.name_span else self.irSpan(node), .origin = self.irSpan(node), .parent = self.reservation, .reads_allowed = !by_ref };
+        var iteration_reservation: Reservation = .{ .owner = if (owner) |binding| if (binding.loan_owner) |loan| loan.owner else binding.name_span else self.irSpan(node), .origin = self.irSpan(node), .parent = self.reservation, .reads_allowed = !by_ref, .iteration = true };
         const parent_reservation = self.reservation;
         defer self.reservation = parent_reservation;
         var loan: ?Ir.ValueId = null;
@@ -3872,7 +3942,7 @@ const Context = struct {
                 };
                 if (binding.borrowed and !dereferenced) {
                     if (!binding.mutable) return self.fail(.immutable_assignment, data.lhs, binding.name_span);
-                    if (binding.region != self.region or ast.nodes.items(.tag)[node] != .assign or ast.nodes.items(.tag)[data.rhs] != .ref_of)
+                    if (ast.nodes.items(.tag)[node] != .assign or ast.nodes.items(.tag)[data.rhs] != .ref_of)
                         return self.fail(.unsupported_borrow, node, binding.name_span);
                     if (!try self.borrowNamed(data.rhs, binding.known.ty, binding.mutable, name, binding.name_span, depth)) return null;
                     const unit = try self.ir.internType(.void);
@@ -3883,7 +3953,7 @@ const Context = struct {
 
                 const reservation: Reservation = .{ .owner = if (binding.loan_owner) |loan| loan.owner else binding.name_span, .origin = if (binding.loan_owner) |loan| loan.origin else self.irSpan(node), .parent = self.reservation };
                 const parent = self.reservation;
-                if (binding.borrowed) self.reservation = &reservation;
+                if (binding.borrowed) self.reservation = try self.borrowReservations(binding, &reservation);
                 defer self.reservation = parent;
                 if (!binding.mutable) return self.fail(.immutable_assignment, data.lhs, binding.name_span);
                 const tag = ast.nodes.items(.tag)[node];
@@ -8252,15 +8322,167 @@ test "explicit local references lower child values and rebind without pointer va
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testExplicitLocalReferences, .{});
 }
 
-test "explicit local references reject implicit reads escapes and cross-region rebinding" {
+test "CFG reference rebinding preserves slots across structured control flow" {
+    for ([_][]const u8{
+        "if flag {p=&b}",
+        "if flag {p=&b} else {p=&a}",
+        "match flag {true=>{p=&b}; false=>{p=&a}}",
+        "let selected=flag and {p=&b; true}; @println(selected)",
+        "let selected=flag or {p=&b; false}; @println(selected)",
+        "{{p=&b}}",
+        "loop flag {p=&b; break}",
+        "loop _ in 0..0 {p=&b}",
+        "loop _ in 0..2 {p=&b; continue}",
+        "loop {p=&b; flag} {break}",
+        "loop flag : {p=&b; break} {continue}",
+        "loop false {} else {p=&b}",
+        "let mut later:u8=0; p=&later",
+        "if flag {let mut local=&b; local.* =1; local=&b; local.* =2}",
+        "p.* ={p=&b; 3}",
+        "p.* +={p=&b; 3}",
+    }) |body| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let f:(flag:bool)={{let mut a:u8=0; let mut b:u8=0; let mut p=&a; {s}; p.* =4; @println(p.*,@TypeOf(p))}}", .{body});
+        defer std.testing.allocator.free(source);
+        for (source) |*byte| if (byte.* == ';') {
+            byte.* = '\n';
+        };
+        inline for (.{ false, true }) |emit| {
+            var module = try Module.init(std.testing.allocator, "cfg-reference.nov", source);
+            defer module.deinit();
+            var analysis = if (emit) try Lowering.lower(&module) else try Sema.analyzeFunctions(&module);
+            defer analysis.deinit();
+            errdefer std.debug.print("CFG reference {s}: {any}\n{any}\n", .{ source, module.source.ast.errors, module.diagnostics.items });
+            try std.testing.expect(!module.hasErrors());
+            if (emit) {
+                try std.testing.expect(analysis.lowering_complete);
+                try analysis.ir.verify();
+                var slots: usize = 0;
+                var rebinds: usize = 0;
+                var loads: usize = 0;
+                for (analysis.ir.functions.items) |function| if (function.body) |ir_body| {
+                    for (ir_body.instructions) |instruction| switch (instruction.op) {
+                        .reference_slot => {
+                            slots += 1;
+                            try std.testing.expect(analysis.ir.getType(instruction.ty).? == .void);
+                        },
+                        .reference_rebind => |rebind| {
+                            rebinds += 1;
+                            try std.testing.expect(ir_body.instructions[@backingInt(rebind.slot)].op == .reference_slot);
+                        },
+                        .reference_load => {
+                            loads += 1;
+                        },
+                        .borrow_read => |cap| try std.testing.expect(ir_body.instructions[@backingInt(cap)].op == .reference_load),
+                        .borrow_store => |store| try std.testing.expect(ir_body.instructions[@backingInt(store.borrow)].op == .reference_load),
+                        else => {},
+                    };
+                };
+                try std.testing.expect(slots != 0 and rebinds != 0 and loads != 0);
+            }
+        }
+    }
+}
+
+test "CFG reference parameter owners outlive branch local bindings" {
+    const source = "let f:(x:u8,y:u8,flag:bool)->u8={let mut p=&x\nif flag {p=&y}\np.*}\nlet g:(x:u8,y:u8,flag:bool)={if flag {let mut local=&x\nlocal=&y\n@println(local.*)}}";
+    inline for (.{ false, true }) |emit| {
+        var module = try Module.init(std.testing.allocator, "reference-parameters.nov", source);
+        defer module.deinit();
+        var analysis = if (emit) try Lowering.lower(&module) else try Sema.analyzeFunctions(&module);
+        defer analysis.deinit();
+        errdefer std.debug.print("parameter references: {any}\n", .{module.diagnostics.items});
+        try std.testing.expect(!module.hasErrors());
+        if (emit) try analysis.ir.verify();
+    }
+}
+
+test "CFG reference snapshots precede RHS and exclude type queries" {
+    const source = "let f:()={let mut a:u8=1\nlet mut b:u8=2\nlet mut p=&a\np.* +={p=&b\n3}\nlet typed:@TypeOf(p)=&b\n@println(typed.*)}";
+    var module = try Module.init(std.testing.allocator, "reference-snapshot.nov", source);
+    defer module.deinit();
+    errdefer std.debug.print("snapshot: {any}\n", .{module.diagnostics.items});
+    var analysis = try Lowering.lower(&module);
+    defer analysis.deinit();
+    try std.testing.expect(!module.hasErrors());
+    var loads: usize = 0;
+    var snapshot: ?Ir.ValueId = null;
+    var rebound = false;
+    for (analysis.ir.functions.items) |function| if (function.body) |body| {
+        for (body.instructions, 0..) |instruction, index| switch (instruction.op) {
+            .reference_load => {
+                loads += 1;
+                if (snapshot == null) snapshot = @fromBackingInt(@intCast(index));
+            },
+            .reference_rebind => {
+                try std.testing.expect(snapshot != null);
+                rebound = true;
+            },
+            .borrow_store => |store| {
+                try std.testing.expect(rebound);
+                try std.testing.expectEqual(snapshot.?, store.borrow);
+            },
+            else => {},
+        };
+    };
+    // One LHS snapshot despite the checking/read/store passes, and one final read.
+    try std.testing.expectEqual(@as(usize, 2), loads);
+}
+
+test "CFG reference candidate owners retain active iteration protections" {
+    for ([_][]const u8{
+        "loop item in b {p=&b; @println(item)}",
+        "if flag {p=&b}; loop item in b {p.* =[2]; @println(item)}",
+        "if flag {p=&b} else {p=&a}; loop item in b {p.*[0]=2; @println(item)}",
+        "loop &item in b {p=&b; item.* =2}",
+    }) |body| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let f:(flag:bool)={{let mut a:[]u8=[0]; let mut b:[]u8=[1]; let mut p=&a; {s}}}", .{body});
+        defer std.testing.allocator.free(source);
+        for (source) |*byte| if (byte.* == ';') {
+            byte.* = '\n';
+        };
+        inline for (.{ false, true }) |emit| {
+            var module = try Module.init(std.testing.allocator, "reference-iteration.nov", source);
+            defer module.deinit();
+            var analysis = if (emit) try Lowering.lower(&module) else try Sema.analyzeFunctions(&module);
+            defer analysis.deinit();
+            errdefer std.debug.print("{s}: {any}\n", .{ source, module.diagnostics.items });
+            try std.testing.expect(module.hasErrors());
+            try std.testing.expectEqual(Module.Diagnostic.Tag.borrow_conflict, module.diagnostics.items[0].tag);
+        }
+    }
+}
+
+test "CFG reference lifetimes reject inner storage even without later uses" {
+    for ([_][]const u8{
+        "{let mut inner:u8=0; p=&inner}",
+        "if flag {let mut inner:u8=0; p=&inner}",
+        "loop flag {let mut inner:u8=0; p=&inner; break}",
+        "loop flag {let mut inner:u8=0; p=&inner; continue}",
+        "let selected=flag and {let mut inner:u8=0; p=&inner; true}; @println(selected)",
+    }) |body| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let f:(flag:bool)={{let mut a:u8=0; let mut p=&a; {s}}}", .{body});
+        defer std.testing.allocator.free(source);
+        for (source) |*byte| if (byte.* == ';') {
+            byte.* = '\n';
+        };
+        inline for (.{ false, true }) |emit| {
+            var module = try Module.init(std.testing.allocator, "reference-lifetime.nov", source);
+            defer module.deinit();
+            var analysis = if (emit) try Lowering.lower(&module) else try Sema.analyzeFunctions(&module);
+            defer analysis.deinit();
+            try std.testing.expect(module.hasErrors());
+            try std.testing.expectEqual(Module.Diagnostic.Tag.unsupported_borrow, module.diagnostics.items[0].tag);
+        }
+    }
+}
+
+test "explicit local references reject implicit reads and lifetime escapes" {
     for ([_]struct { body: []const u8, tag: Module.Diagnostic.Tag }{
         .{ .body = "let p=&a; p=&b", .tag = .immutable_assignment },
         .{ .body = "let p:&u8=&a; p.* =1", .tag = .immutable_assignment },
         .{ .body = "let fixed:u8=0; let mut p=&fixed; p.* =1", .tag = .immutable_assignment },
-        .{ .body = "let mut p=&a; if flag {p=&b}; p.* =1", .tag = .unsupported_borrow },
-        .{ .body = "let mut p=&a; if flag {p=&b} else {p=&b}; p.* =1", .tag = .unsupported_borrow },
-        .{ .body = "let mut p=&a; loop flag {p=&b}; p.* =1", .tag = .unsupported_borrow },
-        .{ .body = "let mut p=&a; let test=flag and {p=&b; true}", .tag = .unsupported_borrow },
+        .{ .body = "let mut p=&a; if flag {let mut inner:u8=0; p=&inner}; p.* =1", .tag = .unsupported_borrow },
+        .{ .body = "let mut p=&a; loop flag {let mut inner:u8=0; p=&inner}", .tag = .unsupported_borrow },
         .{ .body = "let mut p=&a; {let mut inner:u8=0; p=&inner}; p.* =1", .tag = .unsupported_borrow },
         .{ .body = "let p=&a; let q=p", .tag = .unsupported_borrow },
         .{ .body = "let p=&a; consume(p)", .tag = .unsupported_borrow },
@@ -8270,6 +8492,8 @@ test "explicit local references reject implicit reads escapes and cross-region r
         .{ .body = "let values:[]u8=[1]; let p=&values; loop item in p {@println(item)}", .tag = .unsupported_borrow },
         .{ .body = "let mut p:&u8=&a; p=&b; p.* =1", .tag = .immutable_assignment },
         .{ .body = "let fixed:u8=0; let p:&mut u8=&fixed", .tag = .expression_type_mismatch },
+        .{ .body = "let fixed:u8=0; let mut p=&a; if flag {p=&fixed}", .tag = .expression_type_mismatch },
+        .{ .body = "let mut different:i8=0; let mut p=&a; if flag {p=&different}", .tag = .expression_type_mismatch },
         .{ .body = "let p=&a; @println(p)", .tag = .unsupported_borrow },
         .{ .body = "let p=&a; let q=&p", .tag = .unsupported_borrow },
         .{ .body = "let p=&a; let q=&p.*", .tag = .unsupported_borrow },

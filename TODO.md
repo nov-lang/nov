@@ -297,13 +297,25 @@ No autodereference: all pointee reads/writes use `.*`, including `p.* += value`,
 as `let copy = p.*`, arguments/returns of `p.*` and `p.*.method()` retain ordinary
 value-copy semantics, not reference escape. Bare reference copies (`let q = p`),
 passing, returning, storing in arrays/records/unions/constants, capturing and
-reborrowing (`&p` / `&p.*`) are currently rejected. Rebinding is straight-line only
-in the binding's same lexical/control region; outer-reference rebinding in dynamic
-branches, short-circuit RHSs, nested blocks and loops rejects. A loop-body-local
-reference may rebind within that same body region; no reference-state merges are
-implemented. `@TypeOf(p)` reports the reference descriptor with canonical names
+reborrowing (`&p` / `&p.*`) are currently rejected. CFG reference rebinding is
+implemented across `if`, `match`, short-circuit expressions, nested blocks and
+loops, including conditions, continuation and exhaustion paths. The static proof
+merges possible targets per CFG with slot kills and NLL snapshot liveness;
+conflicting owner reads, writes or invalidation are blocked for any possible live
+alias. Readonly loans remain exclusive. Newly borrowed owner storage must be in
+the same or an outer lexical scope relative to the reference binding; an outer
+reference cannot bind to an inner owner even if unused afterward. Conservative
+owner-set frontend checks may overreject target-sensitive iteration.
+`@TypeOf(p)` reports the reference descriptor with canonical names
 such as `&u8` / `&mut u8`; `@TypeOf(p.*)` remains unsupported under the bounded
-binding-operand rule. See `examples/references.nov` and README's delivered contract.
+binding-operand rule. See `examples/references.nov`,
+`examples/reference-rebinding.nov` and README's delivered contract.
+
+Runtime target loads capture the current handle before dereference RHS effects:
+rebinding `p` to `b` inside `p.* += ...` still updates the old pointee. The captured
+loan stays live through the final store. A new borrow of another element of the
+same array still conflicts with a live compound's whole-owner loan; there is no
+element disjointness. Ordinary rebinding after the last use works.
 
 Local static array-element borrowing uses `let p = &localArray[index]` for all
 supported elements, with whole-element and supported nested-record updates via
@@ -311,9 +323,10 @@ supported elements, with whole-element and supported nested-record updates via
 after its last use, tracking branches, loop backedges, terminal controls and RHS
 stores. Conflicting owner access diagnoses, including owner access during index
 evaluation. Readonly loans remain exclusive. Index normalization/bounds happens
-once; stable owner slots root managed owners and addresses are derived only for
-immediate use. These are local-only compile-time capabilities, not reinterpreted
-runtime pointers. No runtime reference-validity checks or interior GC roots are
+once; local runtime handles now lower to typed C pointers, but remain internal,
+unit-local IR capabilities, not source-level first-class references or a reference
+ABI. Stable owner roots retain managed backing for handles and captured target
+snapshots. No runtime reference-validity checks or interior GC roots are
 introduced; ordinary copies and pre-borrow snapshots remain independent. Nonlocal,
 void and temporary sources, references to references and general pointers remain
 unsupported. No manual memory management, pointer arithmetic, null references or

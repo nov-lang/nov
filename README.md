@@ -1852,7 +1852,7 @@ let readonly: &u8 = &a    ; explicit downgrade
 @println(readonly.*)      ; 2
 let mut selected = &a
 selected.* = 3
-selected = &b             ; same-region rebinding, still &mut u8
+selected = &b             ; rebinding, still &mut u8
 selected.* = 4
 @println(a, b)            ; 3 4
 ```
@@ -1863,7 +1863,17 @@ References never implicitly dereference. **All pointee reads and writes use
 operations are the ordinary ones for the child type, including string `+=`, array
 append/index updates, record field updates, range replacement and function-value
 calls/replacement. Exact typing and arithmetic rules do not change. Compounds
-read the old value before RHS evaluation; a terminal RHS skips the pending store.
+capture the current target and read its old value before RHS evaluation; a
+terminal RHS skips the pending store. For example:
+
+```nov
+p.* += {
+    p = &b
+    1
+}
+```
+
+This updates the old pointee, not `b`, and leaves `p` bound to `b` afterward.
 
 `let copy = p.*`, arguments such as `consume(p.*)`, returns of `p.*`, and explicit
 by-value method receivers such as `p.*.method()` use existing value-copy rules:
@@ -1876,11 +1886,19 @@ such as `&p` and `&p.*` are unsupported. `@TypeOf(p)` is the bounded compile-tim
 exception: it inspects the reference descriptor and prints names such as `&u8`
 or `&mut u8`; `@TypeOf(p.*)` remains unsupported (see [Type Queries](#type-queries)).
 
-Rebinding is limited to straight-line code in the binding's same lexical/control
-region. Rebinding an outer reference inside a dynamic branch, short-circuit RHS,
-nested block or loop is rejected, even if both branches choose the same target.
-A reference declared inside a loop body can be rebound in straight-line code in
-that same body; no reference state is merged across branches or loop backedges.
+Mutable reference bindings can rebind across `if`, `match`, short-circuit
+expressions, nested blocks and loops, including loop conditions, continuation and
+exhaustion paths. At CFG joins the static proof merges possible targets; slot
+kills and non-lexical (NLL) snapshot liveness track which loans remain live.
+Conflicting owner reads, writes or storage invalidation are blocked if any
+possible live alias targets that owner. Readonly loans remain exclusive.
+
+Every newly borrowed owner's storage must be in the same or an outer lexical
+scope relative to the reference binding. Assigning `pOuter = &inner` from an
+inner scope is rejected even if `pOuter` is unused afterward. This storage-lifetime
+rule is independent of last-use liveness. The conservative owner-set frontend may
+also overreject target-sensitive iteration; it does not prove every correlation
+between a loop path and a reference's current target.
 
 The checker reports `immutable_assignment` for rebinding a fixed binding or
 writing through a readonly reference, and `expression_type_mismatch` for an
@@ -1888,11 +1906,14 @@ incompatible reference annotation. Unsupported access/rebinding forms use
 `unsupported_borrow`; forbidden reference types in storage/signatures use
 `borrow_escape`; conflicting owner access uses `borrow_conflict`.
 
-Borrow creation itself does not clone or allocate its target. These are local-only
-compile-time capabilities, not first-class runtime pointers or a reinterpretation
-of value storage. Ordinary pointee reads and operations may allocate as usual.
-No runtime reference-validity check is added. See
-[examples/references.nov](examples/references.nov) for explicit reference syntax.
+Borrow creation itself does not clone or allocate its target. Local reference
+handles now lower to typed C pointers, but remain internal, unit-local IR
+capabilities, not source-level first-class references or a reference ABI. A load
+captures the current runtime target before dereference RHS effects. Ordinary
+pointee reads and operations may allocate as usual; no runtime reference-validity
+check is added. See [examples/references.nov](examples/references.nov) for explicit
+reference syntax and [examples/reference-rebinding.nov](examples/reference-rebinding.nov)
+for CFG rebinding.
 
 A direct local binding `let changed = &people[index]` borrows an element without
 copying it. All currently supported element types are borrowable. Supported nested
@@ -1915,17 +1936,21 @@ changed.*.score += 1
   resumes after the last possible reference use on the current path. This first
   implementation is conservatively exclusive even for readonly owners; it does
   not implement shared-borrow splitting.
-- A compound keeps the loan live through RHS evaluation and final store.
-  The compiler rejects owner replacement inside that RHS. It also reserves the
+- A compound keeps its captured target's loan live through RHS evaluation and
+  final store, even if its reference binding is rebound. Rebinding to a different
+  owner can work, but borrowing another element of the same array still conflicts
+  with the live compound's whole-owner loan; there is no element disjointness.
+  Ordinary rebinding after the last use works. The compiler rejects owner
+  replacement inside that RHS. It also reserves the
   owner during borrow-index evaluation: accessing the owner from the index
   expression is conservatively rejected, including read-only access.
 - For element borrows, the index evaluates once with native-int negative-index
-  rules and ordinary runtime bounds checking. The compiler retains a stable owner
-  slot and optional normalized index, rooting managed owners and deriving addresses
-  only when used. There are no runtime generation
+  rules and ordinary runtime bounds checking. Stable owner slots and normalized
+  indices support typed runtime target handles; owner roots keep managed backing
+  alive, including for captured target snapshots. There are no runtime generation
   or reference-invalidation checks, and no interior pointer is traced by GC.
 - Reference capabilities currently cannot be copied, passed, returned, stored or
-  captured; only the bounded same-region rebinding above is supported. Ordinary
+  captured; CFG rebinding does not enable reference escape. Ordinary
   copied pointee values may be returned, passed or stored. Void has no borrowable
   storage. Nonlocal sources, reborrows, temporary owners and general pointer APIs
   remain unsupported. Array-valued struct fields

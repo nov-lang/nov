@@ -1086,8 +1086,17 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
             value_used[@backingInt(r.array)] = true;
             value_used[@backingInt(r.index)] = true;
         },
-        .borrow_read => {},
-        .borrow_store => |store| value_used[@backingInt(store.value)] = true,
+        .reference_slot => |borrow| value_used[@backingInt(borrow)] = true,
+        .reference_rebind => |rebind| {
+            value_used[@backingInt(rebind.slot)] = true;
+            value_used[@backingInt(rebind.borrow)] = true;
+        },
+        .reference_load => |slot| value_used[@backingInt(slot)] = true,
+        .borrow_read => |borrow| value_used[@backingInt(borrow)] = true,
+        .borrow_store => |store| {
+            value_used[@backingInt(store.borrow)] = true;
+            value_used[@backingInt(store.value)] = true;
+        },
         .parameter => |index| param_used[index] = true,
         .local_slot => |value| value_used[@backingInt(value)] = true,
         .local_load => |slot| value_used[@backingInt(slot)] = true,
@@ -1332,17 +1341,34 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
             if (start.index) |index| try w.print("    const uintptr_t b{d} = nov_array_index(v{d}, v{d});\n    (void)b{d};\n", .{ i, @backingInt(slot), @backingInt(index), i });
             continue;
         }
+        if (instruction.op == .reference_slot) {
+            const borrow = instruction.op.reference_slot;
+            try w.writeAll("    ");
+            try writeType(ir, w, rawBorrowChild(ir, body, borrow));
+            try w.print(" *nov_reference_slot_{d} = ", .{i});
+            try writeBorrowAddress(ir, w, body, borrow);
+            try w.print(";\n    (void)nov_reference_slot_{d};\n", .{i});
+            continue;
+        }
+        if (instruction.op == .reference_rebind) {
+            const rebind = instruction.op.reference_rebind;
+            try w.print("    nov_reference_slot_{d} = ", .{@backingInt(rebind.slot)});
+            try writeBorrowAddress(ir, w, body, rebind.borrow);
+            try w.writeAll(";\n");
+            continue;
+        }
+        if (instruction.op == .reference_load) {
+            const slot = instruction.op.reference_load;
+            const borrow = body.instructions[@backingInt(slot)].op.reference_slot;
+            try w.writeAll("    ");
+            try writeType(ir, w, rawBorrowChild(ir, body, borrow));
+            try w.print(" *const nov_reference_{d} = nov_reference_slot_{d};\n    (void)nov_reference_{d};\n", .{ i, @backingInt(slot), i });
+            continue;
+        }
         if (instruction.op == .borrow_store) {
             const store = instruction.op.borrow_store;
-            const slot = Ir.borrowOwner(body, store.borrow);
-            const owner = ir.getType(body.instructions[@backingInt(slot)].ty).?;
-            if (body.instructions[@backingInt(store.borrow)].op.borrow_start.index == null) {
-                try w.print("    v{d}", .{@backingInt(slot)});
-            } else {
-                try w.writeAll("    ((");
-                try writeType(ir, w, owner.array);
-                try w.print(" *)v{d}.data)[b{d}]", .{ @backingInt(slot), @backingInt(store.borrow) });
-            }
+            try w.writeAll("    ");
+            try writeBorrowRead(ir, w, body, store.borrow);
             for (store.path) |index| try w.print(".f{d}", .{index});
             try w.print(" = v{d};\n", .{@backingInt(store.value)});
             continue;
@@ -1430,7 +1456,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
             try w.print("    v{d} = ", .{i});
             switch (instruction.op) {
                 .field_read, .union_payload => |read| try w.print("v{d}.f{d}", .{ @backingInt(read.base), read.index }),
-                .borrow_read => |borrow| try writeBorrowRead(ir, w, body, borrow, instruction.ty),
+                .borrow_read => |borrow| try writeBorrowRead(ir, w, body, borrow),
                 .constant => |id| try writeConstant(w, ir.getConstant(id).?, ty),
                 .parameter => |index| try w.print("p{d}", .{index}),
                 .local_slot, .local_load => |value| try w.print("v{d}", .{@backingInt(value)}),
@@ -1503,8 +1529,8 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
                 if (values.len == 0) try w.writeByte('0');
                 try w.writeAll(" }");
             },
-            .borrow_read => |borrow| try writeBorrowRead(ir, w, body, borrow, instruction.ty),
-            .borrow_reserve, .borrow_start, .borrow_store => unreachable,
+            .borrow_read => |borrow| try writeBorrowRead(ir, w, body, borrow),
+            .borrow_reserve, .borrow_start, .reference_slot, .reference_rebind, .reference_load, .borrow_store => unreachable,
             .field_read => |read| try w.print("v{d}.f{d}", .{ @backingInt(read.base), read.index }),
             .iteration_len => |value| try w.print("(v{d}.len > INTPTR_MAX ? (nov_rt_panic(\"iterable too long\"), (intptr_t)0) : (intptr_t)v{d}.len)", .{ @backingInt(value), @backingInt(value) }),
             .string_decode, .string_next => |r| try w.print("nov_string_cursor_{s}(v{d}, v{d})", .{ if (instruction.op == .string_decode) "rune" else "next", @backingInt(r.array), @backingInt(r.index) }),
@@ -1725,13 +1751,30 @@ fn writeElementLayout(_: *const Ir, w: *std.Io.Writer, element: Ir.TypeId) Write
     try w.print("&nov_element_{d}", .{@backingInt(element)});
 }
 
-fn writeBorrowRead(ir: *const Ir, w: *std.Io.Writer, body: Ir.Body, borrow: Ir.ValueId, ty: Ir.TypeId) WriteError!void {
+// Only raw starts have a single static owner. A loaded capability instead
+// snapshots the slot's pointer, including across an RHS that rebinds the slot.
+fn rawBorrowChild(ir: *const Ir, body: Ir.Body, borrow: Ir.ValueId) Ir.TypeId {
+    const slot = Ir.borrowOwner(body, borrow);
+    const owner = body.instructions[@backingInt(slot)].ty;
+    return if (body.instructions[@backingInt(borrow)].op.borrow_start.index == null) owner else ir.getType(owner).?.array;
+}
+
+fn writeBorrowAddress(ir: *const Ir, w: *std.Io.Writer, body: Ir.Body, borrow: Ir.ValueId) WriteError!void {
+    try w.writeByte('&');
+    try writeBorrowRead(ir, w, body, borrow);
+}
+
+fn writeBorrowRead(ir: *const Ir, w: *std.Io.Writer, body: Ir.Body, borrow: Ir.ValueId) WriteError!void {
+    if (body.instructions[@backingInt(borrow)].op == .reference_load) {
+        try w.print("(*nov_reference_{d})", .{@backingInt(borrow)});
+        return;
+    }
     const slot = Ir.borrowOwner(body, borrow);
     if (body.instructions[@backingInt(borrow)].op.borrow_start.index == null) {
         try w.print("v{d}", .{@backingInt(slot)});
     } else {
         try w.writeAll("((");
-        try writeType(ir, w, ty);
+        try writeType(ir, w, rawBorrowChild(ir, body, borrow));
         try w.print(" *)v{d}.data)[b{d}]", .{ @backingInt(slot), @backingInt(borrow) });
     }
 }
@@ -1870,7 +1913,7 @@ fn writeArrayValue(ir: *const Ir, w: *std.Io.Writer, body: Ir.Body, transfers: A
     switch (instruction.op) {
         .array_index => |r| try w.print("((nov_array *)v{d}.data)[nov_array_index(v{d}, v{d})]", .{ @backingInt(r.array), @backingInt(r.array), @backingInt(r.index) }),
         .field_read, .union_payload => |read| try w.print("v{d}.f{d}", .{ @backingInt(read.base), read.index }),
-        .borrow_read => |borrow| try writeBorrowRead(ir, w, body, borrow, instruction.ty),
+        .borrow_read => |borrow| try writeBorrowRead(ir, w, body, borrow),
         .array_literal => |elements| {
             try w.print("nov_array_new({d}, {d}, ", .{ elements.len, elements.len });
             try writeElementLayout(ir, w, element);
@@ -6272,6 +6315,155 @@ fn emitSource(source: []const u8, diagnostic: ?*Diagnostic) ![]u8 {
     try std.testing.expect(!module.hasErrors());
     try std.testing.expect(sema.lowering_complete);
     return emit(test_gpa, &sema.ir, diagnostic);
+}
+
+// Destroy the source before emission as well as before running generated C.
+fn emitReferenceRebinding(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
+    var lowered = blk: {
+        var module = try Module.init(allocator, "reference-rebinding.nov", source);
+        defer module.deinit();
+        var result = try Lowering.lower(&module);
+        errdefer result.deinit();
+        if (module.hasErrors()) std.debug.print("reference rebinding: {any}\n", .{module.diagnostics.items});
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expect(result.lowering_complete);
+        break :blk result;
+    };
+    defer lowered.deinit();
+    return emit(allocator, &lowered.ir, null);
+}
+
+const reference_rebinding_cfg =
+    \\let exercise:(flag:bool,count:int)={
+    \\let mut a:int=1
+    \\let mut b:int=10
+    \\let mut c:int=100
+    \\let mut p:&mut int=&a
+    \\if flag {p=&b} else {p=&c}
+    \\p.* +=1
+    \\loop _ in 0..count {p=&a
+    \\p.* +=2}
+    \\@println(p.*)
+    \\@println(a,b,c)
+    \\}
+    \\let oldtarget:()={
+    \\let mut a:int=1
+    \\let mut b:int=10
+    \\let mut c:int=100
+    \\let mut p=&a
+    \\p.* +={p=&b
+    \\5}
+    \\@println(p.*)
+    \\p.* ={p=&c
+    \\20}
+    \\@println(p.*)
+    \\@println(a,b,c)
+    \\}
+;
+
+test "reference rebinding CFG runtime flags zero one multiple loops and RHS old target C11 O0 O3" {
+    const library = try emitReferenceRebinding(test_gpa, reference_rebinding_cfg);
+    defer test_gpa.free(library);
+    try std.testing.expect(std.mem.indexOf(u8, library, "*nov_reference_slot_") != null);
+    try std.testing.expect(std.mem.indexOf(u8, library, "*const nov_reference_") != null);
+    try std.testing.expect(std.mem.indexOf(u8, library, "(*nov_reference_") != null);
+    const harness =
+        \\#include <stdbool.h>
+        \\#include <stdint.h>
+        \\void nov_exercise(bool, intptr_t);
+        \\void nov_oldtarget(void);
+        \\int main(void) {
+        \\    volatile int flag = 0;
+        \\    nov_exercise(flag != 0, 0); nov_exercise(flag == 0, 0);
+        \\    nov_exercise(flag != 0, 1); nov_exercise(flag == 0, 1);
+        \\    nov_exercise(flag != 0, 2); nov_oldtarget(); return 0;
+        \\}
+    ;
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(library, harness, 0, "101\n1 10 101\n11\n1 11 100\n3\n3 10 101\n3\n3 11 100\n5\n5 10 101\n10\n100\n6 20 100\n", "", mode);
+}
+
+const reference_rebinding_elements =
+    \\let exercise:(flag:bool,index:int)={
+    \\let mut a:[]int=[1,2,3]
+    \\let mut b:[]int=[10,20,30]
+    \\let mut p=&a[index]
+    \\p.* +={p=&b[0]
+    \\4}
+    \\p.* ={p=&a[0]
+    \\8}
+    \\p.* +=1
+    \\if flag {p=&a[1]} else {p=&b[-1]}
+    \\p.* +=2
+    \\@println(p.*)
+    \\@println(a[0],a[1],a[2],b[0],b[1],b[2])
+    \\}
+    \\let main:()={exercise(true,-1)
+    \\exercise(false,2)}
+;
+
+test "reference rebinding array elements normalize signed indices once and preserve old targets O0 O3" {
+    const library = try emitReferenceRebinding(test_gpa, reference_rebinding_elements);
+    defer test_gpa.free(library);
+    const program = try collectingTestProgram(library);
+    defer test_gpa.free(program);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(program, "typedef int nonempty;", 0, "4\n2 4 7 8 20 30\n32\n2 2 7 8 20 32\n", "", mode);
+}
+
+const reference_rebinding_managed =
+    \\let R=struct{s:string,values:[][]int,}
+    \\let main:()={
+    \\let mut a=R[.s="a"+"!",.values=[[1]]]
+    \\let mut b=R[.s="b"+"!",.values=[[2]]]
+    \\let mut p=&a
+    \\p.*.s +={p=&b
+    \\"x"+"y"}
+    \\let snapshot=p.*
+    \\p.*.values=[[9]]
+    \\@println(p.*.s,p.*.values[0][0],snapshot.values[0][0])
+    \\@println(a.s,a.values[0][0],b.s,b.values[0][0])
+    \\let mut x:[][]int=[[3]]
+    \\let mut y:[][]int=[[4]]
+    \\let mut array=&x
+    \\array=&y
+    \\let frozen=array.*
+    \\array.* =[[5]]
+    \\@println(array.*[0][0],frozen[0][0])
+    \\let mut strings:[]string=["c"+"!","d"+"!"]
+    \\let mut other_strings:[]string=["other"+"!"]
+    \\let mut text=&strings[-1]
+    \\text.* +={text=&other_strings[0]
+    \\"e"+"!"}
+    \\@println(text.*)
+    \\@println(strings[0],strings[1])
+    \\let one=()->int{1}
+    \\let two=()->int{2}
+    \\let mut function=&one
+    \\@println(function.*())
+    \\function=&two
+    \\@println(function.*())
+    \\}
+;
+
+test "reference rebinding managed record array string function children source free forced GC O0 O3 OOM" {
+    const library = try emitReferenceRebinding(test_gpa, reference_rebinding_managed);
+    defer test_gpa.free(library);
+    // Only owners and ordinary value copies are roots, never typed interior pointers.
+    try std.testing.expect(std.mem.indexOf(u8, library, "&nov_reference_") == null);
+    const program = try collectingTestProgram(library);
+    defer test_gpa.free(program);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(program, "typedef int nonempty;", 0, "b! 9 2\na!xy 1 b! 9\n5 4\nother!\nc! d!e!\n1\n2\n", "", mode);
+    const oom = try std.mem.concat(test_gpa, u8, &.{ "#include <stdlib.h>\nstatic void *test_malloc(size_t n) { (void)n; return NULL; }\n#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n", program });
+    defer test_gpa.free(oom);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(oom, "typedef int nonempty;", 1, "", "panic: GC allocation failed\n", mode);
+}
+
+test "reference rebinding emission handles every compiler allocation failure" {
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testReferenceRebindingAllocations, .{});
+}
+
+fn testReferenceRebindingAllocations(allocator: std.mem.Allocator) !void {
+    const c = try emitReferenceRebinding(allocator, "let f:(flag:bool)={let mut a:int=1\nlet mut b:int=2\nlet mut p=&a\nif flag {p=&b}\np.* +=1}");
+    defer allocator.free(c);
 }
 
 test "nested callback signatures declare array types without managed runtime" {
@@ -10809,7 +11001,7 @@ fn compileAndRunCompiler(c_source: []const u8, harness: []const u8, exit_code: u
     try tmp.dir.writeFile(io, .{ .sub_path = "harness.c", .data = harness });
 
     const program = "program" ++ (if (builtin.os.tag == .windows) ".exe" else "");
-    const flags = [_][]const u8{ "-std=c11", mode, "-fsanitize=undefined", "-fno-sanitize-recover=all", "-Wall", "-Wextra", "-Wpedantic", "-Werror", "generated.c", "harness.c", "-o", program };
+    const flags = [_][]const u8{ "-std=c11", mode, "-fsanitize=undefined", "-fno-sanitize-recover=all", "-Wall", "-Wextra", "-Wpedantic", "-Wunused-function", "-Wunused-variable", "-Wunused-but-set-variable", "-Werror", "generated.c", "harness.c", "-o", program };
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(test_gpa);
     try argv.appendSlice(test_gpa, compiler);

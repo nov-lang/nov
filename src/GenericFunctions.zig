@@ -370,13 +370,22 @@ fn testGenericLocalReferences(allocator: std.mem.Allocator) !void {
         \\let mut second=y
         \\let mut p=&first
         \\p.* =x
-        \\p=&second
+        \\if true {p=&second} else {p=&first}
+        \\loop _ in 0..1 {p=&second}
+        \\p.*}
+        \\let choose:(x:`T,y:`T,flag:bool)->`T={let mut first=x
+        \\let mut second=y
+        \\let mut p:&`T=&first
+        \\let selected=flag and {p=&second
+        \\true}
+        \\@println(selected,@TypeOf(p))
         \\p.*}
         \\let main:()={
         \\let a:u8=read(1)
         \\let b:u8=annotated(a)
         \\let c:u8=downgrade(b)
         \\let d:u8=change(a,c)
+        \\let chosen:u8=choose(a,d,true)
         \\let closure=(v:`T)->`T{let p=&v
         \\p.*}
         \\let e:u8=closure(d)
