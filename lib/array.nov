@@ -62,12 +62,10 @@ let find: (items: []`T, predicate: (`T) -> bool) -> Option(`T) = {
 
 @[public]
 let findIndex: (items: []`T, predicate: (`T) -> bool) -> Option(uint) = {
-    let mut index: uint = 0
-    loop item in items {
+    loop item, index in items, 0.. {
         if predicate(item) {
             return .some[index]
         }
-        index += 1
     }
     .none[]
 }
