@@ -177,9 +177,12 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const float_tests = b.step("test-cli-floats", "Run floating-point CLI tests");
     addFloatCliTests(b, exe, float_tests);
     test_step.dependOn(float_tests);
-    const type_of_tests = b.step("test-cli-type-of", "Run bounded @TypeOf CLI tests");
+    const type_of_tests = b.step("test-cli-type-of", "Run @TypeOf CLI tests");
     addTypeOfCliTests(b, exe, type_of_tests);
     test_step.dependOn(type_of_tests);
+    const type_of_expression_tests = b.step("test-cli-type-of-expressions", "Run unevaluated @TypeOf expression CLI tests");
+    addTypeOfExpressionCliTests(b, exe, type_of_expression_tests);
+    test_step.dependOn(type_of_expression_tests);
     const integer_default_tests = b.step("test-cli-integer-defaults", "Run integer default inference CLI tests");
     addIntegerDefaultCliTests(b, exe, integer_default_tests);
     test_step.dependOn(integer_default_tests);
@@ -1957,6 +1960,54 @@ fn addFloatCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std
     }
 }
 
+fn addTypeOfExpressionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    for ([_][]const u8{ "fmt", "semantic" }) |mode| {
+        const check = b.addRunArtifact(exe);
+        check.step.name = b.fmt("CLI TypeOf expressions: {s}", .{mode});
+        check.addArgs(if (std.mem.eql(u8, mode, "fmt")) &.{ "fmt", "--check" } else &.{ "check", "--semantic" });
+        check.addFileArg(b.path("examples/type-of-expressions.nov"));
+        if (!std.mem.eql(u8, mode, "fmt")) {
+            check.addArg("--lib-dir");
+            check.addDirectoryArg(b.path("lib"));
+        }
+        check.expectExitCode(0);
+        check.expectStdOutEqual("");
+        check.expectStdErrEqual("");
+        test_step.dependOn(&check.step);
+    }
+    const package = b.addWriteFiles();
+    const installed_exe = package.addCopyFile(exe.getEmittedBin(), b.fmt("bin/{s}", .{exe.out_filename}));
+    _ = package.addCopyDirectory(b.path("lib"), "lib/nov", .{});
+    const source = package.add("type-of-expressions.nov", @embedFile("examples/type-of-expressions.nov"));
+    for ([_]bool{ false, true }) |installed| {
+        for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+            for ([_][]const u8{ "run", "test" }) |command| {
+                const run = if (installed) std.Build.Step.Run.create(b, "CLI TypeOf expressions: relocated install") else b.addRunArtifact(exe);
+                run.step.name = b.fmt("CLI TypeOf expressions: {s} ({s}, installed={})", .{ command, mode, installed });
+                if (installed) run.addFileArg(installed_exe);
+                run.setCwd(package.getDirectory());
+                run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+                run.setEnvironmentVariable("NOV_CC", "");
+                run.setEnvironmentVariable("CC", "");
+                run.addArg(command);
+                run.addFileArg(source);
+                if (mode.len != 0) run.addArg(mode);
+                if (!installed) {
+                    run.addArg("--lib-dir");
+                    run.addDirectoryArg(b.path("lib"));
+                }
+                run.expectExitCode(0);
+                run.expectStdOutEqual(if (std.mem.eql(u8, command, "test"))
+                    "PASS literals_calls_fields_and_indices\nPASS arrays_slices_blocks_if_and_match\nPASS operands_do_not_execute_or_store\nPASS references_borrows_and_type_only_captures\nPASS closures_and_inferred_generic_calls\n5 passed; 0 failed; 5 total\n"
+                else
+                    b.fmt("Literals: i{0d} f64 rune\nExpressions: i{0d} i{0d} string\nGeneric: []string\n", .{@bitSizeOf(usize)}));
+                run.expectStdErrEqual("");
+                test_step.dependOn(&run.step);
+            }
+        }
+    }
+}
+
 fn addTypeOfCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     for ([_][]const u8{ "fmt", "semantic" }) |mode| {
         const check = b.addRunArtifact(exe);
@@ -2036,13 +2087,13 @@ fn addTypeOfCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *st
             }
         }
     }
-    const invalid_operand = "@TypeOf requires a variable, parameter or imported value reference; expressions and types are not operands";
+    const invalid_operand = "@TypeOf requires a supported value expression; types, namespaces and unspecialized templates are not value operands";
     const not_a_value = "expected a runtime value, found a type alias";
     const wrong_arity = "argument count does not match the function signature";
     for ([_]struct { name: []const u8, source: []const u8, diagnostic: []const u8 }{
         .{ .name = "local-alias", .source = "let main:()={let x=1\nlet T=@TypeOf(x)\n}\n", .diagnostic = not_a_value },
         .{ .name = "runtime-argument", .source = "let consume:(x:int)= {}\nlet main:()={let x=1\nconsume(@TypeOf(x))}\n", .diagnostic = not_a_value },
-        .{ .name = "call-operand", .source = "let f:()->int={@panic(\"must not execute\")}\nlet main:()={let x:@TypeOf(f())=1\n}\n", .diagnostic = invalid_operand },
+        .{ .name = "call-operand", .source = "let f:(value:int)->int=value\nlet main:()={let x:@TypeOf(f())=1\n}\n", .diagnostic = wrong_arity },
         .{ .name = "unknown", .source = "let main:()={let x:@TypeOf(missing)=1\n}\n", .diagnostic = "unknown name 'missing'" },
         .{ .name = "primitive", .source = "let main:()={let x:@TypeOf(int)=1\n}\n", .diagnostic = invalid_operand },
         .{ .name = "type-alias", .source = "let T=int\nlet main:()={let x:@TypeOf(T)=1\n}\n", .diagnostic = not_a_value },
@@ -2050,12 +2101,9 @@ fn addTypeOfCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *st
         .{ .name = "imported-type", .source = "let lib=@import(\"library/std.nov\")\nlet main:()={let x:@TypeOf(lib.Alias)=1\n}\n", .diagnostic = not_a_value },
         .{ .name = "zero-arguments", .source = "let main:()={let x:@TypeOf()=1\n}\n", .diagnostic = wrong_arity },
         .{ .name = "two-arguments", .source = "let main:()={let x=1\nlet y:@TypeOf(x,x)=1\n}\n", .diagnostic = wrong_arity },
-        .{ .name = "private-file-value", .source = "let lib=@import(\"library/std.nov\")\nlet main:()={let x:@TypeOf(lib.secret)=1\n}\n", .diagnostic = "unknown name 'lib'" },
-        .{ .name = "private-named-value", .source = "let lib=@import(\"std\")\nlet main:()={let x:@TypeOf(lib.secret)=1\n}\n", .diagnostic = "unknown name 'lib'" },
-        .{ .name = "literal", .source = "let main:()={let x:@TypeOf(1)=1\n}\n", .diagnostic = invalid_operand },
-        .{ .name = "arithmetic", .source = "let main:()={let x=1\nlet y:@TypeOf(x+1)=1\n}\n", .diagnostic = invalid_operand },
-        .{ .name = "index", .source = "let main:()={let a=[1,2]\nlet x:@TypeOf(a[0])=1\n}\n", .diagnostic = invalid_operand },
-        .{ .name = "runtime-field", .source = "let R=struct{value:int,}\nlet main:()={let r=R[.value=1]\nlet x:@TypeOf(r.value)=1\n}\n", .diagnostic = invalid_operand },
+        .{ .name = "private-file-value", .source = "let lib=@import(\"library/std.nov\")\nlet main:()={let x:@TypeOf(lib.secret)=1\n}\n", .diagnostic = not_a_value },
+        .{ .name = "private-named-value", .source = "let lib=@import(\"std\")\nlet main:()={let x:@TypeOf(lib.secret)=1\n}\n", .diagnostic = not_a_value },
+        .{ .name = "expression-unknown", .source = "let main:()={let x:@TypeOf(1+missing)=1\n}\n", .diagnostic = "unknown name 'missing'" },
         .{ .name = "template", .source = "let identity:(x:`T)->`T=x\nlet main:()={let x:@TypeOf(identity)=1\n}\n", .diagnostic = not_a_value },
     }) |case| {
         const source = b.fmt("{s}.nov", .{case.name});
@@ -4377,7 +4425,7 @@ fn addReferenceCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: 
         .{ .name = "capture-reference", .body = "let p=&a\nlet f=(){@println(p.*)}", .diagnostic = unsupported },
         .{ .name = "reborrow", .body = "let p=&a\nlet q=&p.*", .diagnostic = unsupported },
         .{ .name = "reference-to-reference", .body = "let p=&a\nlet q=&p", .diagnostic = unsupported },
-        .{ .name = "typeof-dereference", .body = "let p=&a\nlet x:@TypeOf(p.*)=1", .diagnostic = "@TypeOf requires a variable, parameter or imported value reference" },
+        .{ .name = "typeof-dereference-mismatch", .body = "let p=&a\nlet x:@TypeOf(p.*)=true", .diagnostic = "literal does not match the annotated type" },
         .{ .name = "rebound-owner-conflict", .body = "let mut p=&a\np=&b\nb=2\np.* = 1", .diagnostic = "owner access or aliased reference arguments conflict with a live borrow" },
     }) |case| {
         const source = fixtures.add(b.fmt("reference-{s}.nov", .{case.name}), b.fmt("let Cell=struct{{value:u8,}}\nlet consume:(v:u8)={{}}\nlet verify:(flag:bool)={{let mut a:u8=0\nlet mut b:u8=0\n{s}\n}}\nlet main:()=verify(true)\n", .{case.body}));

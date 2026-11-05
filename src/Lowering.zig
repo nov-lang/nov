@@ -15,7 +15,10 @@ pub const Error = Sema.Error;
 /// Whole-graph lowering uses one semantic table and one set of IR pools.
 /// The returned owner remains valid after the Compilation is destroyed.
 pub fn lowerCompilation(comp: *Compilation) Error!Sema {
-    errdefer comp.clearSpecializations();
+    // Source diagnostics return a partial Sema, not an error, but must roll back
+    // signature-created methods and earlier successful generic demands as well.
+    var complete = false;
+    defer if (!complete) comp.clearSpecializations();
     const starts = try comp.allocator.alloc(usize, comp.modules.items.len);
     defer comp.allocator.free(starts);
     for (comp.modules.items, starts) |module, *start| start.* = module.diagnostics.items.len;
@@ -74,6 +77,7 @@ pub fn lowerCompilation(comp: *Compilation) Error!Sema {
     } else {
         try result.ir.verify();
         result.lowering_complete = true;
+        complete = true;
     }
     return result;
 }
@@ -82,7 +86,8 @@ pub fn lowerCompilation(comp: *Compilation) Error!Sema {
 /// expression-body functions. Owns the returned IR independently of the AST.
 /// Arithmetic is represented, not evaluated; backend numeric policy is pending.
 pub fn lower(module: *Module) Error!Sema {
-    errdefer module.clearSpecializations();
+    var complete = false;
+    defer if (!complete) module.clearSpecializations();
     const diagnostics_start = module.diagnostics.items.len;
     errdefer module.diagnostics.shrinkRetainingCapacity(diagnostics_start);
     var result = try Sema.analyzeFunctions(module);
@@ -139,6 +144,7 @@ pub fn lower(module: *Module) Error!Sema {
     } else {
         try result.ir.verify();
         result.lowering_complete = true;
+        complete = true;
     }
     return result;
 }
@@ -2250,7 +2256,7 @@ test "compilation namespace aliases direct generic applications and repeated dia
     }
 }
 
-test "compilation in memory cycles reject before semantic analysis without namespace injection" {
+test "compilation in memory cycles lower without namespace injection" {
     var comp = Compilation.init(std.testing.allocator);
     defer comp.deinit();
     const root = try comp.addSource("/main.nov", "let other=@import(\"other.nov\")");
@@ -2260,9 +2266,10 @@ test "compilation in memory cycles reject before semantic analysis without names
     comp.setRoot(root);
     var sema = try lowerCompilation(&comp);
     defer sema.deinit();
-    try std.testing.expect(comp.hasErrors());
-    try std.testing.expectEqual(.import_cycle, comp.diagnostics.items[0].tag);
-    try std.testing.expect(!sema.lowering_complete);
+    try std.testing.expect(!comp.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try std.testing.expect(comp.getModule(root).?.lookup("root") == null);
+    try std.testing.expect(comp.getModule(other).?.lookup("other") == null);
     try std.testing.expectEqual(@as(usize, 0), sema.ir.functions.items.len);
 }
 

@@ -17,7 +17,7 @@ pub const Error = Ir.BuildError;
 const Known = struct { ty: Ir.TypeId, annotation: ?Module.Span = null };
 const LocalSpecialization = struct { bindings: []const Module.TypeBinding, ty: Ir.TypeId, function: ?Ir.FunctionId };
 const TemplateCapture = struct { name: []const u8, binding: Binding };
-const LexicalName = struct { name: []const u8, span: Module.Span };
+pub const LexicalName = struct { name: []const u8, span: Module.Span };
 const Template = struct {
     info: GenericFunctions.LocalTemplate,
     captures: []const TemplateCapture,
@@ -282,6 +282,184 @@ fn checkInner(module: *Module, ir: *Ir, types: []const ?Ir.TypeId, id: Module.De
     return checked;
 }
 
+/// Declaration restrictions independent of runtime storage and inference.
+pub fn validateLocalSyntax(module: *Module, node: Ast.Node.Index, related: ?Module.Span) Error!bool {
+    const ast = &module.source.ast;
+    const decl = ast.decl(node).ast;
+    const token = decl.let_token + 1 + @as(u32, @intFromBool(decl.is_mutable));
+    const name = ast.tokenSlice(token);
+    const tag: ?Module.Diagnostic.Tag = if (std.mem.startsWith(u8, name, "@\"")) .unsupported_name else if (related != null or isPrimitive(name)) .unsupported_shadowing else if (std.mem.eql(u8, name, "_")) .unsupported_local_declaration else if (decl.init_node == 0) .missing_initializer else null;
+    if (tag) |failure| {
+        try module.diagnostics.append(module.allocator, .{ .tag = failure, .span = if (failure == .unsupported_shadowing) module.tokenSpan(token) else module.tokenSpan(ast.nodes.items(.main_token)[node]), .related = related });
+        return false;
+    }
+    return true;
+}
+
+pub fn validateLocalType(module: *Module, ir: *const Ir, node: Ast.Node.Index, ty: Ir.TypeId) Error!bool {
+    const ast = &module.source.ast;
+    const decl = ast.decl(node).ast;
+    if (ir.getType(ty).? == .reference and ast.nodes.items(.tag)[decl.init_node] != .ref_of) {
+        try module.diagnostics.append(module.allocator, .{ .tag = .unsupported_borrow, .span = module.tokenSpan(ast.firstToken(decl.init_node)) });
+        return false;
+    }
+    if (ir.getType(ty).? == .void and (decl.is_mutable or decl.type_node == 0)) {
+        try module.diagnostics.append(module.allocator, .{ .tag = .unsupported_local_declaration, .span = module.tokenSpan(ast.nodes.items(.main_token)[node]) });
+        return false;
+    }
+    return true;
+}
+
+pub fn isReferenceRebind(ast: *const Ast, node: Ast.Node.Index) bool {
+    return ast.nodes.items(.tag)[node] == .assign and ast.nodes.items(.tag)[ast.nodes.items(.data)[node].rhs] == .ref_of;
+}
+
+/// Closure/template parameter names inhabit the definition's lexical scope.
+/// This checks names only, without resolving types or inspecting the body.
+pub fn validateClosureParameterNames(module: *Module, proto_node: Ast.Node.Index, lexical_names: []const LexicalName) Error!bool {
+    const ast = &module.source.ast;
+    var names: std.StringHashMapUnmanaged(Module.Span) = .empty;
+    defer names.deinit(module.allocator);
+    var params = ast.fullFnProto(proto_node).?.iterate(ast);
+    while (params.next()) |param| {
+        const token = param.name_token orelse {
+            try module.diagnostics.append(module.allocator, .{ .tag = .unsupported_local_declaration, .span = module.tokenSpan(ast.firstToken(proto_node)) });
+            return false;
+        };
+        const name = ast.tokenSlice(token);
+        const span = module.tokenSpan(token);
+        const entry = try names.getOrPut(module.allocator, name);
+        if (entry.found_existing) {
+            try module.diagnostics.append(module.allocator, .{ .tag = .duplicate_parameter, .span = span, .related = entry.value_ptr.* });
+            return false;
+        }
+        entry.value_ptr.* = span;
+        var related: ?Module.Span = null;
+        if (module.lookup(name)) |id| related = module.getDeclaration(id).?.name_span;
+        for (lexical_names) |binding| if (std.mem.eql(u8, binding.name, name)) {
+            related = binding.span;
+            break;
+        };
+        const issue: ?Module.Diagnostic.Tag = if (std.mem.startsWith(u8, name, "@\"")) .unsupported_name else if (related != null or isPrimitive(name)) .unsupported_shadowing else null;
+        if (issue) |tag| {
+            try module.diagnostics.append(module.allocator, .{ .tag = tag, .span = span, .related = related });
+            return false;
+        }
+    }
+    return true;
+}
+
+pub fn unaryTypeIssue(ty: Ir.Type, tag: Ast.Node.Tag) ?Module.Diagnostic.Tag {
+    if (ty != .integer and !(ty == .float and tag == .negation)) return .operator_not_supported;
+    if (tag == .negation and ty == .integer and ty.integer.signedness == .unsigned) return .unsupported_body_expression;
+    return null;
+}
+
+/// Shared union operand grammar. A single `.tag` is an enum payload, not a
+/// named initializer. Type/payload compatibility is checked after inference.
+pub fn unionOperand(module: *Module, node: Ast.Node.Index) Error!?Ast.Node.Index {
+    const ast = &module.source.ast;
+    const data = ast.nodes.items(.data)[node];
+    if (ast.nodes.items(.tag)[node] == .array_access) return data.rhs;
+    const fields = ast.fullStructInit(node).?.fields;
+    if (fields.len == 0) return 0;
+    if (fields.len == 1 and ast.nodes.items(.data)[fields[0]].rhs == 0 and ast.tokens.items(.tag)[ast.lastToken(fields[0]) + 1] != .comma) return fields[0];
+    try module.diagnostics.append(module.allocator, .{ .tag = .invalid_union_constructor, .span = module.tokenSpan(ast.nodes.items(.main_token)[node]) });
+    return null;
+}
+
+/// Reuse literal decoding and match rules without interning validation constants
+/// in the real IR. Canonical type IDs are preserved in this disposable pool.
+/// No expression bodies, converters, captures, or borrow operations run here.
+pub const QueryValidation = struct {
+    ir: Ir,
+
+    pub fn init(source: *const Ir) Error!QueryValidation {
+        var scratch = Ir.init(source.allocator);
+        errdefer scratch.deinit();
+        scratch.source_len = source.source_len;
+        try scratch.source_lengths.appendSlice(scratch.allocator, source.source_lengths.items);
+        for (source.types.items, 0..) |original, index| {
+            var ty = original;
+            if (ty == .record) ty.record.fields = &.{};
+            const id = try scratch.internType(ty);
+            std.debug.assert(@backingInt(id) == index);
+        }
+        for (source.types.items, 0..) |ty, index| {
+            if (ty != .record or ty.record.fields.len == 0) continue;
+            const fields = try scratch.allocator.dupe(Ir.Field, ty.record.fields);
+            defer scratch.allocator.free(fields);
+            for (fields) |*field| field.default = null;
+            try scratch.setRecordFields(@fromBackingInt(@intCast(index)), fields);
+        }
+        return .{ .ir = scratch };
+    }
+
+    pub fn deinit(self: *QueryValidation) void {
+        self.ir.deinit();
+    }
+
+    pub fn literal(self: *QueryValidation, module: *Module, node: Ast.Node.Index, ty: Ir.TypeId) Error!bool {
+        return switch (try Literal.check(module, &self.ir, node, ty, null)) {
+            .constant => true,
+            .failed => false,
+            .not_literal => false,
+        };
+    }
+
+    pub fn stringSyntax(self: *QueryValidation, module: *Module, node: Ast.Node.Index) Error!bool {
+        var context: Context = .{ .module = module, .ir = &self.ir, .types = &.{}, .probing = true, .string_syntax_only = true };
+        return try context.stringInterpolation(node, null, 0) != null;
+    }
+
+    pub fn printArgument(self: *QueryValidation, module: *Module, node: Ast.Node.Index, ty: Ir.TypeId) Error!bool {
+        var context: Context = .{ .module = module, .ir = &self.ir, .types = &.{}, .probing = true };
+        var visited: Context.PrintableTypes = .empty;
+        defer visited.deinit(module.allocator);
+        return context.registerPrintable(node, ty, &visited, true);
+    }
+
+    pub fn enumOperand(self: *QueryValidation, module: *Module, node: Ast.Node.Index, ty: Ir.TypeId) Error!bool {
+        return switch (try Literal.checkEnumToken(module, &self.ir, module.source.ast.nodes.items(.main_token)[node], ty, module.tokenSpan(module.source.ast.firstToken(node)), null)) {
+            .constant => true,
+            .failed => false,
+            .not_literal => unreachable,
+        };
+    }
+
+    pub fn printable(self: *QueryValidation, module: *Module, node: Ast.Node.Index, ty: Ir.TypeId) Error!bool {
+        const scalar = self.ir.getType(ty).?;
+        var context: Context = .{ .module = module, .ir = &self.ir, .types = &.{}, .probing = true };
+        if (scalar != .boolean and scalar != .integer and scalar != .float and scalar != .string and scalar != .rune and scalar != .array and scalar != .record and scalar != .enumeration) {
+            _ = try context.fail(.unsupported_interpolation_type, node, null);
+            return false;
+        }
+        return self.printArgument(module, node, ty);
+    }
+
+    pub fn matchPatterns(self: *QueryValidation, module: *Module, node: Ast.Node.Index, types: []const Ir.TypeId) Error!bool {
+        var context: Context = .{ .module = module, .ir = &self.ir, .types = &.{}, .probing = true };
+        defer context.bindings.deinit(module.allocator);
+        defer context.locals.deinit(module.allocator);
+        const subjects = try module.allocator.alloc(Context.MatchSubject, types.len);
+        defer module.allocator.free(subjects);
+        for (types, subjects) |ty, *subject| subject.* = .{ .ty = ty, .value = null };
+        if (try context.validateMatchPatterns(node, subjects, 0) == null) return false;
+        const ast = &module.source.ast;
+        for (ast.fullMatch(node).?.ast.cases) |case| {
+            const prong = ast.fullMatchCase(case).?.ast;
+            const scope = context.locals.items.len;
+            defer context.restoreScope(scope);
+            if (!try context.bindMatchCapture(prong, subjects)) return false;
+            if (prong.values.len == 1 and context.wildcard(prong.values[0])) continue;
+            for (prong.values, subjects) |pattern, subject| {
+                if (try context.matchPattern(pattern, subject, 0) == null) return false;
+            }
+        }
+        return true;
+    }
+};
+
 const Context = struct {
     const Reservation = struct { owner: Module.Span, origin: Module.Span, parent: ?*const Reservation, reads_allowed: bool = false, iteration: bool = false, snapshot: bool = false };
     const LoopContext = struct { allows_value: bool, result: ?Known, valued_break: bool = false, has_break: bool = false };
@@ -298,6 +476,7 @@ const Context = struct {
     type_captures: []const GenericFunctions.Capture = &.{},
     specialization_depth: usize = 0,
     probing: bool = false,
+    string_syntax_only: bool = false,
     defaulting: bool = false,
     float_defaults_only: bool = false,
     default_probe_active: bool = false,
@@ -380,8 +559,7 @@ const Context = struct {
         for (captures.items) |capture| {
             if (capture.template == null) try values.append(self.module.allocator, .{ .name = capture.name, .ty = capture.ty });
         }
-        if (self.probing) return TypeResolver.resolveInScopeWithValuesReadOnly(self.module, self.ir, node, self.container, self.concrete_type, self.function_bindings, values.items);
-        return TypeResolver.resolveInScopeWithValues(self.module, self.ir, node, self.container, self.concrete_type, self.function_bindings, values.items);
+        return TypeResolver.resolveInScopeWithCaptures(self.module, self.ir, node, self.container, self.concrete_type, self.function_bindings, values.items, captures.items, !self.probing);
     }
 
     fn inTypeQuery(ast: *const Ast, token: Ast.TokenIndex) bool {
@@ -505,6 +683,7 @@ const Context = struct {
                 }
             }
         }
+        if (!try validateClosureParameterNames(self.module, proto, &.{})) return null;
         const first = ast.firstToken(body);
         const last = ast.lastToken(body);
         for (ast.nodes.items(.tag), 0..) |tag, index| {
@@ -662,6 +841,8 @@ const Context = struct {
         defer child.captures.deinit(self.module.allocator);
         defer child.capture_names.deinit(self.module.allocator);
         defer child.capture_values.deinit(self.module.allocator);
+        const parameter_scope = if (self.specializing) |template| template.lexical_names else try self.lexicalNames(arena.allocator());
+        if (!try validateClosureParameterNames(self.module, proto_node, parameter_scope)) return null;
         var iterator = function.proto.iterate(ast);
         var index: u32 = 0;
         while (iterator.next()) |param| : (index += 1) {
@@ -916,19 +1097,7 @@ const Context = struct {
         const token = decl.let_token + 1 + @as(u32, @intFromBool(decl.is_mutable));
         const name = ast.tokenSlice(token);
         const name_span = self.module.tokenSpan(token);
-        if (std.mem.startsWith(u8, name, "@\"")) {
-            _ = try self.fail(.unsupported_name, node, null);
-            return false;
-        }
-        const related = self.conflict(name);
-        if (related != null or isPrimitive(name)) {
-            try self.module.diagnostics.append(self.module.allocator, .{ .tag = .unsupported_shadowing, .span = name_span, .related = related });
-            return false;
-        }
-        if (std.mem.eql(u8, name, "_")) {
-            _ = try self.fail(.unsupported_local_declaration, node, null);
-            return false;
-        }
+        if (!try validateLocalSyntax(self.module, node, self.conflict(name))) return false;
         // Named parameter annotations retain the declaration form. Initializers
         // are still checked before publication, so local recursion is rejected.
         var local_function = false;
@@ -950,20 +1119,13 @@ const Context = struct {
             try self.bindLocal(name, .{ .known = .{ .ty = template.environment_type }, .initializer = decl.init_node, .name_span = name_span, .template = template });
             return true;
         }
-        if (decl.init_node == 0) {
-            _ = try self.fail(.missing_initializer, node, null);
-            return false;
-        }
         if (ast.nodes.items(.tag)[decl.init_node] == .ref_of)
             return self.borrowLocal(node, name, name_span, depth);
         const annotation: ?Known = if (decl.type_node != 0) .{
             .ty = (try self.resolveType(decl.type_node)) orelse return false,
             .annotation = self.module.tokenSpan(ast.firstToken(decl.type_node)),
         } else null;
-        if (decl.is_mutable and annotation != null and self.ir.getType(annotation.?.ty).? == .void) {
-            _ = try self.fail(.unsupported_local_declaration, node, null);
-            return false;
-        }
+        if (annotation) |known| if (!try validateLocalType(self.module, self.ir, node, known.ty)) return false;
         // Publish only after checking/evaluating the initializer: no self or
         // forward local references, and initialization happens exactly once.
         const ty = (if (local_function)
@@ -971,10 +1133,7 @@ const Context = struct {
         else
             try self.expression(decl.init_node, annotation, depth + 1)) orelse return false;
         if (self.terminated) return true;
-        if (annotation == null and self.ir.getType(ty).? == .void) {
-            _ = try self.fail(.unsupported_local_declaration, node, null);
-            return false;
-        }
+        if (!try validateLocalType(self.module, self.ir, node, ty)) return false;
         const known = annotation orelse Known{ .ty = ty };
         try self.copyNode(decl.init_node, ty);
         const slot = if ((decl.is_mutable or self.ir.getType(ty).? == .array or self.borrowedName(name)) and self.ir.getType(ty).? != .void and self.emitter != null)
@@ -2412,19 +2571,8 @@ const Context = struct {
         const name = ast.tokenSlice(if (contextual) ast.nodes.items(.main_token)[base] else ast.nodes.items(.data)[base].rhs);
         const index = self.fieldIndex(ty, name) orelse return self.fail(.unknown_field, base, null);
         const payload_ty = self.ir.getType(ty).?.record.fields[index].ty;
-        var enum_payload = false;
-        const payload = if (ast.nodes.items(.tag)[node] == .array_access) data.rhs else blk: {
-            const fields = ast.fullStructInit(node).?.fields;
-            if (fields.len == 0) break :blk @as(Ast.Node.Index, 0);
-            // A single `.tag` was already an enum payload expression, not a
-            // named union operand. Preserve that grammar, without allowing
-            // named fields, multiple operands, or a new trailing comma form.
-            if (fields.len != 1 or ast.nodes.items(.data)[fields[0]].rhs != 0 or
-                ast.tokens.items(.tag)[ast.lastToken(fields[0]) + 1] == .comma)
-                return self.fail(.invalid_union_constructor, node, null);
-            enum_payload = true;
-            break :blk fields[0];
-        };
+        const payload = (try unionOperand(self.module, node)) orelse return null;
+        const enum_payload = ast.nodes.items(.tag)[node] != .array_access and payload != 0;
         const unit = self.ir.getType(payload_ty).? == .void;
         if ((payload == 0) != unit) return self.fail(.invalid_union_constructor, node, null);
         if (enum_payload) {
@@ -3408,7 +3556,7 @@ const Context = struct {
         return .{ .ty = merged, .value = value };
     }
 
-    fn matchExpression(self: *Context, node: Ast.Node.Index, expected: ?Known, hint: ?Known, depth: usize) Error!?Ir.TypeId {
+    fn validateMatchPatterns(self: *Context, node: Ast.Node.Index, subjects: []const MatchSubject, depth: usize) Error!?Ir.TypeId {
         const ast = &self.module.source.ast;
         const match = ast.fullMatch(node).?.ast;
         for (match.cases) |case| {
@@ -3417,14 +3565,9 @@ const Context = struct {
             if (!fallback and patterns.len != match.subjects.len) return self.fail(.match_pattern_count, case, null);
             for (patterns) |pattern| if (!try self.patternShape(pattern, depth + 1)) return null;
         }
-        const subjects = try self.module.allocator.alloc(MatchSubject, match.subjects.len);
-        defer self.module.allocator.free(subjects);
-        for (match.subjects, subjects) |subject, *snapshot| {
-            const ty = (try self.expression(subject, null, depth + 1)) orelse return null;
-            if (self.terminated) return if (expected) |want| want.ty else ty;
-            const scalar = self.ir.getType(ty).?;
-            if (scalar != .boolean and scalar != .integer and scalar != .string and scalar != .rune and !(subjects.len == 1 and (self.tagged(ty) or scalar == .enumeration))) return self.fail(.unsupported_match_subject, subject, null);
-            snapshot.* = .{ .ty = ty, .value = if (self.emitter) |emitter| try emitter.value(subject) else null };
+        for (match.subjects, subjects) |subject, snapshot| {
+            const scalar = self.ir.getType(snapshot.ty).?;
+            if (scalar != .boolean and scalar != .integer and scalar != .string and scalar != .rune and !(subjects.len == 1 and (self.tagged(snapshot.ty) or scalar == .enumeration))) return self.fail(.unsupported_match_subject, subject, null);
         }
         const union_match = subjects.len == 1 and self.tagged(subjects[0].ty);
         if (!union_match) for (match.cases) |case| {
@@ -3496,6 +3639,20 @@ const Context = struct {
                 if (!all and i + 1 == match.cases.len) return self.fail(.match_missing_catchall, case, null);
             }
         }
+        return try self.ir.internType(.void);
+    }
+
+    fn matchExpression(self: *Context, node: Ast.Node.Index, expected: ?Known, hint: ?Known, depth: usize) Error!?Ir.TypeId {
+        const ast = &self.module.source.ast;
+        const match = ast.fullMatch(node).?.ast;
+        const subjects = try self.module.allocator.alloc(MatchSubject, match.subjects.len);
+        defer self.module.allocator.free(subjects);
+        for (match.subjects, subjects) |subject, *snapshot| {
+            const ty = (try self.expression(subject, null, depth + 1)) orelse return null;
+            if (self.terminated) return if (expected) |want| want.ty else ty;
+            snapshot.* = .{ .ty = ty, .value = if (self.emitter) |emitter| try emitter.value(subject) else null };
+        }
+        if (try self.validateMatchPatterns(node, subjects, depth) == null) return null;
         const result = (try self.matchProngs(node, match.cases, subjects, hint, depth + 1)) orelse return null;
         if (self.emitter) |emitter| try emitter.values.put(emitter.allocator, node, result.value.?);
         return self.fit(result.ty, expected, node);
@@ -3565,6 +3722,11 @@ const Context = struct {
                     return self.interpolationError(.invalid_interpolation, .{ .source = location.source, .start = location.start + @as(u32, @intCast(brace)), .end = location.start + @as(u32, @intCast(@min(offset + 1, bytes.len - 1))) });
                 const embedded = expressions[placeholder];
                 placeholder += 1;
+                if (self.string_syntax_only) {
+                    offset += 1;
+                    chunk = offset;
+                    continue;
+                }
                 const ty = (try self.printExpression(embedded, depth + 1)) orelse return null;
                 if (self.terminated) return self.fit(string, expected, node);
                 const scalar = self.ir.getType(ty).?;
@@ -4377,8 +4539,7 @@ const Context = struct {
                 };
                 if (binding.borrowed and !dereferenced) {
                     if (!binding.mutable) return self.fail(.immutable_assignment, data.lhs, binding.name_span);
-                    if (ast.nodes.items(.tag)[node] != .assign or ast.nodes.items(.tag)[data.rhs] != .ref_of)
-                        return self.fail(.unsupported_borrow, node, binding.name_span);
+                    if (!isReferenceRebind(ast, node)) return self.fail(.unsupported_borrow, node, binding.name_span);
                     if (!try self.borrowNamed(data.rhs, binding.known.ty, binding.mutable, name, binding.name_span, depth)) return null;
                     const unit = try self.ir.internType(.void);
                     if (!self.terminated) if (self.emitter) |emitter| try emitter.record(node, unit, self.irSpan(node), .{ .constant = try self.ir.internConstant(.{ .ty = unit, .value = .void }) });
@@ -4552,8 +4713,7 @@ const Context = struct {
                 const integer_context = if (hint) |want| (if (self.ir.getType(want.ty).? == .integer or self.ir.getType(want.ty).? == .float) hint else null) else null;
                 const operand = (try self.probe(data.rhs, depth + 1)) orelse integer_context orelse return self.missingOperandType(node, data.rhs, null, expected, depth);
                 const ty = self.ir.getType(operand.ty).?;
-                if (ty != .integer and !(ty == .float and ast.nodes.items(.tag)[node] == .negation)) return self.fail(.operator_not_supported, node, operand.annotation);
-                if (ast.nodes.items(.tag)[node] == .negation and ty == .integer and ty.integer.signedness == .unsigned) return self.fail(.unsupported_body_expression, node, null);
+                if (unaryTypeIssue(ty, ast.nodes.items(.tag)[node])) |issue| return self.fail(issue, node, if (issue == .operator_not_supported) operand.annotation else null);
                 if (try self.expression(data.rhs, operand, depth + 1) == null) return null;
                 return self.fit(operand.ty, expected, node);
             },
@@ -6267,15 +6427,102 @@ test "TypeOf concrete specialized variables remain queryable under OOM" {
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testTypeOfSpecializedValue, .{});
 }
 
+fn testTypeOfExpressionIsolation(allocator: std.mem.Allocator) !void {
+    var comp = Compilation.init(allocator);
+    defer comp.deinit();
+    const root = try comp.addSource("/typeof-isolation.nov",
+        \\let lib=@import("lib.nov")
+        \\let main:()={let mut x:u8=1
+        \\let p=&x
+        \\let inspect=(){@println(@TypeOf(&x),@TypeOf(p.*),@TypeOf({x+=1
+        \\x}),@TypeOf(lib.generic(x)),@TypeOf(lib.effect()))}
+        \\let y:@TypeOf(x+1)=2
+        \\let result:@TypeOf(lib.generic(x))=y
+        \\inspect()
+        \\@println(result,p.*)}
+    );
+    const library = try comp.addSource("/lib.nov", "@[public]\nlet effect:()->int=1\n@[public]\nlet generic:(x:`T)->`T=missing");
+    comp.setRoot(root);
+    const module = comp.getModule(root).?;
+    const import_id = module.lookup("lib").?;
+    try comp.imports.append(allocator, .{ .declaration = comp.declaration_ids.get(.{ .source = root, .local = import_id }).?, .target = library, .named = false, .span = module.getDeclaration(import_id).?.name_span });
+    var sema = try Lowering.lowerCompilation(&comp);
+    defer sema.deinit();
+    errdefer if (comp.hasErrors()) {
+        for (comp.modules.items) |owner| std.debug.print("TypeOf isolation: {any} {any}\n", .{ owner.source.ast.errors, owner.diagnostics.items });
+    };
+    try std.testing.expect(!comp.hasErrors());
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+    for (module.declarations.items) |decl| try std.testing.expect(decl.function_template == null);
+    for (sema.ir.functions.items) |function| {
+        try std.testing.expectEqual(@as(usize, 0), function.captures.len);
+        if (function.body) |body| for (body.instructions) |instruction| {
+            try std.testing.expect(!instruction.boxed);
+            try std.testing.expect(instruction.op != .capture_value and instruction.op != .capture_cell);
+        };
+    }
+}
+
+test "TypeOf expressions snapshot borrowed lexical metadata without captures demands or specializations under OOM" {
+    try testTypeOfExpressionIsolation(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testTypeOfExpressionIsolation, .{});
+}
+
+fn testTypeOfLexicalValidation(allocator: std.mem.Allocator, body: []const u8, expected: ?Module.Diagnostic.Tag) !void {
+    const source = try std.fmt.allocPrint(allocator, "let g:int=1\nlet main:()={{let mut a:int=1\nlet p:&int=&a\nlet mut s=\"a\"\nlet mut items=[1]\n{s}\n}}", .{body});
+    defer allocator.free(source);
+    var module = try Module.init(allocator, "typeof-lexical-validation.nov", source);
+    defer module.deinit();
+    const count = module.declarations.items.len;
+    var sema = Lowering.lower(&module) catch |err| {
+        try std.testing.expectEqual(count, module.declarations.items.len);
+        try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+        return err;
+    };
+    defer sema.deinit();
+    errdefer if (module.hasErrors()) {
+        std.debug.print("TypeOf lexical validation: {s}: {any} {any}\n", .{ body, module.source.ast.errors, module.diagnostics.items });
+    };
+    if (expected) |tag| {
+        try std.testing.expect(!sema.lowering_complete);
+        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+        try std.testing.expectEqual(tag, module.diagnostics.items[0].tag);
+    } else {
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expect(sema.lowering_complete);
+        try sema.ir.verify();
+        for (sema.ir.functions.items) |function| try std.testing.expectEqual(@as(usize, 0), function.captures.len);
+    }
+    try std.testing.expectEqual(count, module.declarations.items.len);
+    try std.testing.expectEqual(@as(usize, 0), module.expression_query_depth);
+}
+
+test "TypeOf validation preserves readonly lexical capabilities and converter isolation under OOM" {
+    for ([_]struct { body: []const u8, tag: ?Module.Diagnostic.Tag }{
+        .{ .body = "@println(@TypeOf({p.*=2}))", .tag = .immutable_assignment },
+        .{ .body = "@println(@TypeOf(&g))", .tag = .unsupported_borrow },
+        .{ .body = "@println(@TypeOf(&s[0]))", .tag = .unsupported_borrow },
+        .{ .body = "@println(@TypeOf({let q=p\nq.*}))", .tag = .unsupported_borrow },
+        .{ .body = "@println(@TypeOf((a:int)->int{a}))", .tag = .unsupported_shadowing },
+        .{ .body = "let inspect=(){@println(@TypeOf({let q=&a\nq.*}))}\ninspect()\n@println(p.*)", .tag = null },
+        .{ .body = "let inspect=(){@println(@TypeOf(\"{a} {p.*} {items[999]}\"))}\ninspect()\n@println(p.*,s,items)", .tag = null },
+    }) |case| {
+        try testTypeOfLexicalValidation(std.testing.allocator, case.body, case.tag);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testTypeOfLexicalValidation, .{ case.body, case.tag });
+    }
+}
+
 test "TypeOf body rejects nonvalues expressions and invisible bindings" {
     for ([_]struct { body: []const u8, tag: Module.Diagnostic.Tag }{
         .{ .body = "let y:@TypeOf()=1", .tag = .argument_count_mismatch },
         .{ .body = "let y:@TypeOf(x,x)=1", .tag = .argument_count_mismatch },
         .{ .body = "let y:@TypeOf(missing)=1", .tag = .unknown_name },
         .{ .body = "let y:@TypeOf(int)=1", .tag = .invalid_type_query_operand },
-        .{ .body = "let y:@TypeOf(x+1)=1", .tag = .invalid_type_query_operand },
-        .{ .body = "let y:@TypeOf(@panic(\"no\"))=1", .tag = .invalid_type_query_operand },
-        .{ .body = "let y:@TypeOf({x=2\nx})=1", .tag = .invalid_type_query_operand },
+        .{ .body = "let y:@TypeOf(true+false)=1", .tag = .operator_not_supported },
+        .{ .body = "let y:@TypeOf(@panic(\"no\"))=1", .tag = .literal_type_mismatch },
+        .{ .body = "let y:@TypeOf({x=2\nx})=1", .tag = .immutable_assignment },
         .{ .body = "let y=@TypeOf(x)", .tag = .not_a_value },
         .{ .body = "if true {let hidden=1\n}\nlet y:@TypeOf(hidden)=1", .tag = .unknown_name },
         .{ .body = "let inspect=(){let y:@TypeOf(later)=1\n}\nlet later=1", .tag = .unknown_name },

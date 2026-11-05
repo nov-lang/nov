@@ -50,6 +50,16 @@ results. See `examples/array-fields.nov`.
 
 ## Current delivered status
 
+Expression-based @TypeOf queries are unevaluated and typechecked using frozen
+lexical metadata. Normal numeric defaults and generic constraints apply without
+runtime instructions, mutations, bounds/arithmetic checks, loans, captures, boxing,
+specializations, converter execution or callee-body demands. Literals/interpolation,
+match patterns/coverage, constructors, assignments, local declarations, parameter
+scopes and reference uses retain ordinary static rules. Intermediate types are
+validated even when absent from the final result. Readonly validation shares
+ordinary checker rules and disposable IR pools; OOM tests verify no publication.
+See examples/type-of-expressions.nov (five tests).
+
 Stdlib `std.string` provides startsWith, endsWith, contains and find as ordinary
 Nov functions. Searches are exact/case-sensitive Unicode scalar matches, including
 NUL and immutable views; no normalization/grapheme matching. find returns first
@@ -159,14 +169,15 @@ recursive copying and stringify hooks remain unchanged. See README's
 [float contract](README.md#floats) and `examples/floats.nov`.
 
 Bounded `@TypeOf(x)` is implemented in `TypeResolver`, `BodyChecker` and
-`GenericFunctions`. Exactly one operand must be a runtime binding identifier or
-an imported namespace value reference such as `lib.value` (with visibility
-checks). Globals, visible locals/parameters, mutable/borrowed bindings and bindings
+`GenericFunctions`. Exactly one operand may be a supported value expression,
+including a runtime binding or imported value reference with visibility checks. Globals, visible locals/parameters, mutable/borrowed bindings and bindings
 visible from enclosing closure scopes are queryable, including concrete
 specialized function variables. Types/type aliases, namespaces and unspecialized
 generic templates reject, even if a template has previously been specialized.
-Calls, literals, arithmetic, indexing and runtime field access are not supported:
-`@TypeOf(f())` diagnoses without running `f`.
+Calls, literals, arithmetic, fields, indexing, string slices, constructors, arrays,
+blocks, conditions, matches, loops and inferable closures are supported without
+execution. Queries validate operators, arguments, literal ranges, declarations,
+match coverage, reference-use rules and intermediate constructed types.
 
 Queries inspect canonical types without runtime evaluation, value reads, mutation,
 runtime initializer dependencies, captures or mutable-capture boxing. They do not
@@ -178,12 +189,13 @@ remain unsupported. Direct `@println(@TypeOf(x))` / `"{@TypeOf(x)}"` render
 canonical static type names, without invoking the value's `@[stringify]` hook.
 For local reference `p`, `@TypeOf(p)` returns its reference descriptor (`&T` or
 `&mut T`), not the child value type; canonical output includes `&u8` / `&mut u8`.
-`@TypeOf(p.*)` is still unsupported: dereference is not a binding operand.
+`@TypeOf(p.*)` returns the pointee type without a runtime dereference; `@TypeOf(&x)`
+inspects reference type metadata without creating a loan.
 Function signatures can query earlier named parameters, including inferred generic
 ``(x: `T) -> @TypeOf(x)`` signatures sharing the parameter's constraints; integer
 context/defaulting rules are unchanged. See README's [type-query contract](README.md#type-queries)
-and `examples/type-of.nov`. Broader reflection (`@typeInfo`, member enumeration,
-arbitrary expression queries) remains a proposal, not delivered functionality.
+and `examples/type-of.nov` / `examples/type-of-expressions.nov`. Broader reflection
+(`@typeInfo`, member enumeration) remains a proposal, not delivered functionality.
 
 Integer literals now default to signed pointer-sized `int` only after contextual
 inference in `BodyChecker`/`GenericFunctions` and literal-only global `Sema`.
@@ -390,8 +402,8 @@ the same or an outer lexical scope relative to the reference binding; an outer
 reference cannot bind to an inner owner even if unused afterward. Conservative
 owner-set frontend checks may overreject target-sensitive iteration.
 `@TypeOf(p)` reports the reference descriptor with canonical names
-such as `&u8` / `&mut u8`; `@TypeOf(p.*)` remains unsupported under the bounded
-binding-operand rule. See `examples/references.nov`,
+such as `&u8` / `&mut u8`; `@TypeOf(p.*)` reports the pointee type without a runtime
+read. See `examples/references.nov`,
 `examples/reference-rebinding.nov`, `examples/reference-parameters.nov` and README's
 delivered contract.
 

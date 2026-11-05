@@ -8,6 +8,7 @@ const Lowering = @import("Lowering.zig");
 const Sema = @import("Sema.zig");
 const TestAllocations = @import("TestAllocations.zig");
 const BodyChecker = @import("BodyChecker.zig");
+const primitives = @import("primitives.zig");
 
 pub const max_terms = 8192;
 pub const max_depth = 128;
@@ -139,7 +140,7 @@ const Term = struct {
 const Nominal = struct { module: *Module, id: Module.DeclId, args: []const *Term };
 const Function = struct { params: []const *Term, result: *Term };
 const Variable = struct { name: []const u8, term: *Term };
-const Local = struct { name: []const u8, term: *Term, template: ?Ref = null, mutable: bool = false };
+const Local = struct { name: []const u8, term: *Term, template: ?Ref = null, mutable: bool = false, query_global: bool = false };
 const Loop = struct { result: *Term, has_break: bool = false, has_continue: bool = false, allows_value: bool };
 const Frame = struct {
     ref: Ref,
@@ -166,6 +167,7 @@ fn inferInner(caller: *Module, ir: *Ir, ref: Ref, arguments: []const Argument, e
     var solver: Solver = .{ .allocator = arena.allocator(), .caller = caller, .ir = ir, .call_span = call_span, .analysis = ref.analysis, .types = ref.types };
     const frame = (try solver.constrain(ref, arguments, expected)) orelse return null;
     try solver.applyDefaults();
+    if (solver.failed) return null;
     for (frame.variables) |variable| {
         if (!Solver.resolved(variable.term, 0)) {
             try solver.fail(if (solver.unsupported != null) .generic_function_inference_unsupported else .generic_function_ambiguous, solver.unsupported orelse call_span, variable.term.span);
@@ -190,17 +192,25 @@ fn inferInner(caller: *Module, ir: *Ir, ref: Ref, arguments: []const Argument, e
 /// capturing values. The descriptor borrows the caller's lexical captures and
 /// bindings; the returned canonical type remains valid after this query.
 pub fn inferClosure(caller: *Module, ir: *Ir, ref: Ref, expected: ?Ir.TypeId, span: Module.Span) Ir.BuildError!?Ir.TypeId {
-    return inferClosureInner(caller, ir, ref, expected, span) catch |err| switch (err) {
+    return inferClosureInner(caller, ir, ref, expected, span, false) catch |err| switch (err) {
         error.TooManyEntries => null,
         else => return err,
     };
 }
 
-fn inferClosureInner(caller: *Module, ir: *Ir, ref: Ref, expected: ?Ir.TypeId, span: Module.Span) Ir.BuildError!?Ir.TypeId {
+pub fn queryFunction(caller: *Module, ir: *Ir, ref: Ref, span: Module.Span) Ir.BuildError!?Ir.TypeId {
+    return inferClosureInner(caller, ir, ref, null, span, true) catch |err| switch (err) {
+        error.TooManyEntries => null,
+        else => return err,
+    };
+}
+
+fn inferClosureInner(caller: *Module, ir: *Ir, ref: Ref, expected: ?Ir.TypeId, span: Module.Span, querying: bool) Ir.BuildError!?Ir.TypeId {
     var arena = std.heap.ArenaAllocator.init(caller.allocator);
     defer arena.deinit();
     var solver: Solver = .{ .allocator = arena.allocator(), .caller = caller, .ir = ir, .call_span = span, .analysis = ref.analysis, .types = ref.types };
     solver.readonly_layouts = true;
+    solver.querying = querying;
     const container = try solver.referenceContainer(ref);
     const instance = (try solver.signature(ref, container, 0)) orelse return null;
     const signature = try solver.term(.{ .function = instance.function }, ref.span());
@@ -210,6 +220,7 @@ fn inferClosureInner(caller: *Module, ir: *Ir, ref: Ref, expected: ?Ir.TypeId, s
     try solver.finishBodies();
     if (solver.failed) return null;
     try solver.applyDefaults();
+    if (solver.failed) return null;
     if (!Solver.resolved(signature, 0)) {
         try solver.fail(if (solver.unsupported != null) .generic_function_inference_unsupported else .generic_function_ambiguous, solver.unsupported orelse span, ref.span());
         return null;
@@ -234,6 +245,7 @@ fn inferClosureCallInner(caller: *Module, ir: *Ir, ref: Ref, arguments: []const 
     var solver: Solver = .{ .allocator = arena.allocator(), .caller = caller, .ir = ir, .call_span = span, .analysis = ref.analysis, .types = ref.types, .readonly_layouts = true };
     const frame = (try solver.constrain(ref, arguments, expected)) orelse return null;
     try solver.applyDefaults();
+    if (solver.failed) return null;
     const signature = try solver.term(.{ .function = .{ .params = solver.parameters, .result = frame.result } }, ref.span());
     if (!Solver.resolved(signature, 0)) {
         try solver.fail(if (solver.unsupported != null) .generic_function_inference_unsupported else .generic_function_ambiguous, solver.unsupported orelse span, ref.span());
@@ -305,6 +317,7 @@ fn probeResultInner(caller: *Module, ir: *Ir, ref: Ref, arguments: []const Argum
     var solver: Solver = .{ .allocator = arena.allocator(), .caller = caller, .ir = ir, .call_span = call_span, .read_only = true, .analysis = ref.analysis, .types = ref.types };
     const frame = (try solver.constrain(ref, arguments, null)) orelse return null;
     if (defaults) try solver.applyDefaults();
+    if (solver.failed) return null;
     for (frame.variables) |variable| if (!Solver.resolved(variable.term, 0)) return null;
     return solver.materialize(frame.result, 0);
 }
@@ -347,6 +360,7 @@ fn probeExpressionsInner(caller: *Module, ir: *Ir, scope: Ref, nodes: []const As
     try solver.finishBodies();
     if (solver.failed) return null;
     if (defaults) try solver.applyDefaults();
+    if (solver.failed) return null;
     return solver.materialize(result, 0);
 }
 
@@ -850,6 +864,7 @@ fn testTypeOfSignatures(allocator: std.mem.Allocator) !void {
     const source =
         \\let id:(x:`T)->@TypeOf(x)={let copy:@TypeOf(x)=x
         \\copy}
+        \\let expression:(x:`T,y:@TypeOf(x+1))->@TypeOf(y+1)=y
         \\let same:(x:`T,y:@TypeOf(x))->@TypeOf(y)=y
         \\let apply:(x:`T,f:(v:`T)->@TypeOf(v))->@TypeOf(x)=f(x)
         \\let make:(x:`T)->()->@TypeOf(x)=()->`T {let copy:@TypeOf(x)=x
@@ -858,6 +873,7 @@ fn testTypeOfSignatures(allocator: std.mem.Allocator) !void {
         \\let n=id(1)
         \\let exact:int=n
         \\let narrow:u8=id(2)
+        \\let expression_result:u8=expression(1,narrow)
         \\let callback:(u16)->u16=id
         \\let a:u8=same(narrow,3)
         \\let b:u16=apply(4,id)
@@ -920,6 +936,46 @@ test "backtick generic function specialization allocation failures" {
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testSpecialization, .{});
 }
 
+/// Check an expression using only a snapshot of lexical type metadata. No
+/// semantic demands, runtime captures, loans, stores, or specializations occur.
+pub fn queryExpression(module: *Module, ir: *Ir, node: Ast.Node.Index, bindings: []const Module.TypeBinding, values: []const Module.TypeBinding, captures: []const Capture) Ir.BuildError!?Ir.TypeId {
+    const span = module.tokenSpan(module.source.ast.firstToken(node));
+    if (module.expression_query_depth == max_depth) {
+        try module.diagnostics.append(module.allocator, .{ .tag = .type_query_limit, .span = span });
+        return null;
+    }
+    for (module.expression_query_stack[0..module.expression_query_depth]) |active| if (active == node) {
+        try module.diagnostics.append(module.allocator, .{ .tag = .type_query_limit, .span = span });
+        return null;
+    };
+    module.expression_query_stack[module.expression_query_depth] = node;
+    module.expression_query_depth += 1;
+    defer module.expression_query_depth -= 1;
+    var arena = std.heap.ArenaAllocator.init(module.allocator);
+    defer arena.deinit();
+    var solver: Solver = .{ .allocator = arena.allocator(), .caller = module, .ir = ir, .call_span = span, .readonly_layouts = true, .querying = true };
+    const descriptor: LocalTemplate = .{ .proto = 0, .body = node, .outer_bindings = bindings };
+    var frame: Frame = .{ .ref = .{ .module = module, .local = &descriptor }, .variables = &.{}, .result = try solver.term(.unknown, span) };
+    for (bindings) |binding| {
+        const variable = try solver.fromType(binding.ty, span, 0);
+        const variables = try solver.allocator.alloc(Variable, frame.variables.len + 1);
+        @memcpy(variables[0..frame.variables.len], frame.variables);
+        variables[frame.variables.len] = .{ .name = binding.name, .term = variable };
+        frame.variables = variables;
+    }
+    for (values) |value| try frame.locals.append(solver.allocator, .{ .name = value.name, .term = try solver.fromType(value.ty, span, 0), .query_global = module.lookup(value.name) != null });
+    for (captures) |capture| try frame.locals.append(solver.allocator, .{ .name = capture.name, .term = try solver.fromType(capture.ty, span, 0), .template = capture.template, .mutable = capture.mutable });
+    const result = try solver.expression(&frame, node, 0);
+    try solver.finishBodies();
+    try solver.applyDefaults();
+    if (solver.failed) return null;
+    if (!Solver.resolved(result, 0) or solver.unsupported != null) {
+        try solver.fail(.unresolved_value_type, solver.unsupported orelse span, null);
+        return null;
+    }
+    return solver.materialize(result, 0);
+}
+
 const Solver = struct {
     allocator: std.mem.Allocator,
     caller: *Module,
@@ -930,10 +986,22 @@ const Solver = struct {
     active: std.ArrayList(Ref) = .empty,
     read_only: bool = false,
     readonly_layouts: bool = false,
+    querying: bool = false,
+    query_operations: std.ArrayList(struct { tag: Ast.Node.Tag, operand: *Term, span: Module.Span }) = .empty,
+    query_literals: std.ArrayList(struct { operand: *Term, module: *Module, node: Ast.Node.Index }) = .empty,
+    query_strings: std.ArrayList(struct { module: *Module, node: Ast.Node.Index }) = .empty,
+    query_printables: std.ArrayList(struct { operand: *Term, module: *Module, node: Ast.Node.Index, interpolation: bool = true }) = .empty,
+    query_types: std.ArrayList(*Term) = .empty,
+    query_locals: std.ArrayList(struct { operand: *Term, module: *Module, node: Ast.Node.Index }) = .empty,
+    query_assignments: std.ArrayList(struct { operand: *Term, module: *Module, node: Ast.Node.Index }) = .empty,
+    query_unions: std.ArrayList(struct { payload_type: *Term, module: *Module, node: Ast.Node.Index, payload: Ast.Node.Index, enum_payload: bool }) = .empty,
+    query_matches: std.ArrayList(struct { module: *Module, node: Ast.Node.Index, subjects: []const *Term }) = .empty,
+    query_statements: std.ArrayList(struct { operand: *Term, span: Module.Span }) = .empty,
+    query_places: std.ArrayList(struct { operand: *Term, kind: enum { array, record, mutable_reference, borrow_array }, span: Module.Span, length: bool = false }) = .empty,
     analysis: ?*const Sema = null,
     types: []const ?Ir.TypeId = &.{},
     unsupported: ?Module.Span = null,
-    pending_bodies: std.ArrayList(struct { frame: Frame, depth: usize }) = .empty,
+    pending_bodies: std.ArrayList(struct { frame: Frame, depth: usize, querying: bool }) = .empty,
     projections: std.ArrayList(struct { base: *Term, result: *Term, name: ?[]const u8, span: Module.Span, iteration: bool = false }) = .empty,
     parameters: []const *Term = &.{},
     defaults: std.ArrayList(struct { term: *Term, ty: Ir.TypeId }) = .empty,
@@ -942,7 +1010,7 @@ const Solver = struct {
     // Connect signatures before inspecting operations that need concrete operand
     // types. In particular, callback-first arguments must see later siblings.
     fn deferBody(self: *Solver, frame: Frame, depth: usize) Ir.BuildError!void {
-        try self.pending_bodies.append(self.allocator, .{ .frame = frame, .depth = depth });
+        try self.pending_bodies.append(self.allocator, .{ .frame = frame, .depth = depth, .querying = self.querying });
     }
 
     fn finishBodies(self: *Solver) Ir.BuildError!void {
@@ -950,6 +1018,9 @@ const Solver = struct {
         while (index < self.pending_bodies.items.len and !self.failed) : (index += 1) {
             // body() can append more work and relocate pending_bodies.
             var pending = self.pending_bodies.items[index];
+            const was_querying = self.querying;
+            self.querying = pending.querying;
+            defer self.querying = was_querying;
             try self.body(&pending.frame, pending.depth);
         }
         self.pending_bodies.clearRetainingCapacity();
@@ -1010,6 +1081,130 @@ const Solver = struct {
         for (self.defaults.items) |candidate| try self.defaultTerm(candidate.term, candidate.ty, 0);
         self.float_defaults_only = false;
         for (self.defaults.items) |candidate| try self.defaultTerm(candidate.term, candidate.ty, 0);
+        if (self.failed) return;
+        const was_readonly_layouts = self.readonly_layouts;
+        self.readonly_layouts = true;
+        defer self.readonly_layouts = was_readonly_layouts;
+        {
+            const was_querying = self.querying;
+            self.querying = true;
+            defer self.querying = was_querying;
+            for (self.query_types.items) |intermediate| {
+                if (try self.materialize(intermediate, 0) == null) {
+                    if (!self.failed) try self.fail(switch (root(intermediate).value) {
+                        .array => .array_literal_needs_type,
+                        .function => .generic_function_ambiguous,
+                        else => .unresolved_value_type,
+                    }, intermediate.span, null);
+                    return;
+                }
+            }
+        }
+        for (self.query_locals.items) |local| {
+            const ty = (try self.materialize(local.operand, 0)) orelse {
+                try self.fail(.unresolved_value_type, local.operand.span, null);
+                return;
+            };
+            if (!try BodyChecker.validateLocalType(local.module, self.ir, local.node, ty)) {
+                self.failed = true;
+                return;
+            }
+        }
+        for (self.query_assignments.items) |assignment| {
+            if (root(assignment.operand).value == .reference and !BodyChecker.isReferenceRebind(&assignment.module.source.ast, assignment.node)) {
+                try self.fail(.unsupported_borrow, assignment.module.tokenSpan(assignment.module.source.ast.firstToken(assignment.node)), null);
+                return;
+            }
+        }
+        for (self.query_unions.items) |constructor| {
+            const ty = (try self.materialize(constructor.payload_type, 0)) orelse {
+                try self.fail(.unresolved_value_type, constructor.payload_type.span, null);
+                return;
+            };
+            if ((constructor.payload == 0) != (self.ir.getType(ty).? == .void)) {
+                try self.fail(.invalid_union_constructor, constructor.module.tokenSpan(constructor.module.source.ast.firstToken(constructor.node)), null);
+                return;
+            }
+        }
+        for (self.query_places.items) |place| {
+            const operand = root(place.operand);
+            const valid = switch (place.kind) {
+                .array, .borrow_array => operand.value == .array,
+                .record => (operand.value == .nominal and !self.tagged(operand)) or (operand.value == .known and self.ir.getType(operand.value.known).? == .record and !self.ir.getType(operand.value.known).?.record.tagged),
+                .mutable_reference => operand.value == .reference and operand.value.reference.mutable,
+            };
+            if (!valid) try self.fail(switch (place.kind) {
+                .borrow_array => .unsupported_borrow,
+                .mutable_reference => .immutable_assignment,
+                .array => .unsupported_assignment_target,
+                .record => if (place.length and (operand.value == .array or (operand.value == .known and self.ir.getType(operand.value.known).? == .string))) .unsupported_array_length_write else .unsupported_assignment_target,
+            }, place.span, null);
+        }
+        for (self.query_statements.items) |statement| {
+            const operand = root(statement.operand);
+            if (operand.value != .never and (operand.value != .known or self.ir.getType(operand.value.known).? != .void)) try self.fail(.unused_block_value, statement.span, null);
+        }
+        if (self.failed) return;
+        if (self.query_literals.items.len != 0 or self.query_strings.items.len != 0 or self.query_matches.items.len != 0 or self.query_printables.items.len != 0 or self.query_unions.items.len != 0) {
+            // Resolve all type metadata before copying the pool. Literal decoding
+            // and shared pattern validation then own only disposable constants.
+            for (self.query_matches.items) |match| for (match.subjects) |subject| {
+                _ = try self.materialize(subject, 0);
+            };
+            for (self.query_printables.items) |printable| {
+                _ = try self.materialize(printable.operand, 0);
+            }
+            var validation = try BodyChecker.QueryValidation.init(self.ir);
+            defer validation.deinit();
+            for (self.query_unions.items) |constructor| if (constructor.enum_payload) {
+                const ty = (try self.materialize(constructor.payload_type, 0)) orelse return;
+                if (!try validation.enumOperand(constructor.module, constructor.payload, ty)) self.failed = true;
+            };
+            for (self.query_literals.items) |literal| {
+                const operand = root(literal.operand);
+                if (operand.value != .known) continue;
+                if (!try validation.literal(literal.module, literal.node, operand.value.known)) self.failed = true;
+            }
+            for (self.query_strings.items) |string| if (!try validation.stringSyntax(string.module, string.node)) {
+                self.failed = true;
+            };
+            for (self.query_matches.items) |match| {
+                const types = try self.allocator.alloc(Ir.TypeId, match.subjects.len);
+                for (match.subjects, types) |subject, *ty| ty.* = (try self.materialize(subject, 0)) orelse {
+                    try self.fail(.unresolved_value_type, subject.span, null);
+                    return;
+                };
+                if (!try validation.matchPatterns(match.module, match.node, types)) self.failed = true;
+            }
+            for (self.query_printables.items) |printable| {
+                const ty = (try self.materialize(printable.operand, 0)) orelse {
+                    try self.fail(.unresolved_value_type, printable.operand.span, null);
+                    return;
+                };
+                const valid = if (printable.interpolation) try validation.printable(printable.module, printable.node, ty) else try validation.printArgument(printable.module, printable.node, ty);
+                if (!valid) self.failed = true;
+            }
+        }
+        for (self.query_operations.items) |operation| {
+            const operand = root(operation.operand);
+            if (operand.value != .known) {
+                try self.fail(.operator_not_supported, operation.span, null);
+                continue;
+            }
+            const ty = self.ir.getType(operand.value.known).?;
+            if (operation.tag == .negation or operation.tag == .bit_not) {
+                if (BodyChecker.unaryTypeIssue(ty, operation.tag)) |issue| try self.fail(issue, operation.span, null);
+                continue;
+            }
+            const valid = switch (operation.tag) {
+                .equal_equal, .bang_equal => ty == .integer or ty == .float or ty == .boolean or ty == .rune or ty == .string or ty == .enumeration,
+                .less_than, .greater_than, .less_or_equal, .greater_or_equal => ty == .integer or ty == .float,
+                .bit_not, .bit_and, .bit_or, .bit_xor, .mod, .assign_mod => ty == .integer,
+                .add, .assign_add => ty == .integer or ty == .float or ty == .string,
+                else => ty == .integer or ty == .float,
+            };
+            if (!valid) try self.fail(.operator_not_supported, operation.span, null);
+        }
     }
 
     fn retainFloatDefaults(self: *Solver, value: *Term, depth: usize) void {
@@ -1141,6 +1336,10 @@ const Solver = struct {
         self.count += 1;
         const result = try self.allocator.create(Term);
         result.* = .{ .value = value, .span = span };
+        if (self.querying) switch (value) {
+            .array, .range, .reference, .function, .nominal => try self.query_types.append(self.allocator, result),
+            else => {},
+        };
         return result;
     }
 
@@ -1151,6 +1350,10 @@ const Solver = struct {
     }
 
     fn fromType(self: *Solver, ty: Ir.TypeId, span: Module.Span, depth: usize) Ir.BuildError!*Term {
+        if (self.querying and self.ir.getType(ty).? == .record and !try TypeResolver.completeRecordReadOnly(self.caller, self.ir, ty)) {
+            self.failed = true;
+            return self.term(.unknown, span);
+        }
         if (depth >= max_depth) {
             try self.fail(.generic_function_limit, self.call_span, span);
             return self.term(.unknown, span);
@@ -1342,8 +1545,10 @@ const Solver = struct {
                             }
                         }
                     }
-                    // Only the resolver's restricted value operands are valid;
-                    // never visit an operand as an executable expression.
+                    const was_querying = self.querying;
+                    self.querying = true;
+                    defer self.querying = was_querying;
+                    return self.expression(frame, operand, depth + 1);
                 }
                 if (frame.container != null and call.ast.args.len == 0 and std.mem.eql(u8, ast.tokenSlice(ast.firstToken(call.ast.fn_expr)), "@This")) return self.term(.{ .nominal = frame.container.? }, span);
                 if (TypeResolver.genericReference(module, call.ast.fn_expr)) |ref| {
@@ -1545,6 +1750,11 @@ const Solver = struct {
     }
 
     fn closureReference(self: *Solver, frame: *Frame, proto: Ast.Node.Index, body_node: Ast.Node.Index) Ir.BuildError!Ref {
+        if (self.querying) {
+            const names = try self.allocator.alloc(BodyChecker.LexicalName, frame.locals.items.len);
+            for (frame.locals.items, names) |binding, *name| name.* = .{ .name = binding.name, .span = binding.term.span };
+            if (!try BodyChecker.validateClosureParameterNames(frame.ref.module, proto, names)) self.failed = true;
+        }
         const local = try self.allocator.create(LocalTemplate);
         const declaration = if (frame.ref.local == null) frame.ref.module.getDeclaration(frame.ref.id) else null;
         local.* = .{
@@ -1566,12 +1776,52 @@ const Solver = struct {
         return self.term(.{ .function = instance.function }, span);
     }
 
+    fn enumTag(self: *Solver, value: *Term, name: []const u8, span: Module.Span) Ir.BuildError!bool {
+        const base = root(value);
+        if (base.value != .known or self.ir.getType(base.value.known).? != .enumeration) return false;
+        for (self.ir.getType(base.value.known).?.enumeration.tags) |tag| if (std.mem.eql(u8, tag.name, name)) return true;
+        try self.fail(.unknown_field, span, null);
+        return true;
+    }
+
     fn field(self: *Solver, frame: *Frame, node: Ast.Node.Index, depth: usize) Ir.BuildError!*Term {
         const module = frame.ref.module;
         const ast = &module.source.ast;
         const data = ast.nodes.items(.data)[node];
         const span = module.tokenSpan(ast.firstToken(node));
         const name = ast.tokenSlice(data.rhs);
+        if (self.querying) {
+            var type_qualifier = false;
+            if (ast.nodes.items(.tag)[data.lhs] == .identifier) {
+                const qualifier_name = ast.tokenSlice(ast.firstToken(data.lhs));
+                if (module.lookup(qualifier_name)) |id| type_qualifier = module.getDeclaration(id).?.is_type_alias;
+                for (frame.locals.items) |local| if (std.mem.eql(u8, local.name, qualifier_name)) {
+                    type_qualifier = false;
+                };
+            } else if (module.compilation) |comp| {
+                if (comp.reference(module, data.lhs)) |ref| type_qualifier = comp.getModule(ref.source).?.getDeclaration(ref.local).?.is_type_alias;
+            }
+            if (type_qualifier) {
+                const qualifier = try self.typeNode(frame, data.lhs, depth + 1);
+                if (try self.enumTag(qualifier, name, span)) return qualifier;
+            }
+        }
+        if (self.querying and module.compilation != null) {
+            var lexical = false;
+            var base_node = data.lhs;
+            while (ast.nodes.items(.tag)[base_node] == .field_access) base_node = ast.nodes.items(.data)[base_node].lhs;
+            if (ast.nodes.items(.tag)[base_node] == .identifier) {
+                const base_name = ast.tokenSlice(ast.firstToken(base_node));
+                for (frame.locals.items) |local| if (std.mem.eql(u8, local.name, base_name)) {
+                    lexical = true;
+                };
+            }
+            if (!lexical and module.compilation.?.reference(module, node) != null) {
+                if (try TypeResolver.queryValue(module, self.ir, node)) |ty| return self.fromType(ty, span, depth);
+                self.failed = true;
+                return self.term(.unknown, span);
+            }
+        }
         const base = root(try self.expression(frame, data.lhs, depth + 1));
         return self.fieldType(base, name, span, depth);
     }
@@ -1604,6 +1854,7 @@ const Solver = struct {
             if (ty == .string and std.mem.eql(u8, name, "len")) return self.fromType(try self.ir.internType(.{ .integer = .{ .signedness = .unsigned, .bits = Ir.native_pointer_bits } }), span, 0);
         }
         if (base.value == .array and std.mem.eql(u8, name, "len")) return self.fromType(try self.ir.internType(.{ .integer = .{ .signedness = .unsigned, .bits = Ir.native_pointer_bits } }), span, 0);
+        if (self.querying) try self.fail(.unknown_field, span, null);
         self.unsupported = self.unsupported orelse span;
         return self.term(.unknown, span);
     }
@@ -1795,6 +2046,19 @@ const Solver = struct {
         const base = data.lhs;
         const name = ast.tokenSlice(if (ast.nodes.items(.tag)[base] == .enum_literal) ast.nodes.items(.main_token)[base] else ast.nodes.items(.data)[base].rhs);
         const payload_type = try self.fieldType(ty, name, span, depth + 1);
+        if (self.querying) {
+            const payload = (try BodyChecker.unionOperand(module, node)) orelse {
+                self.failed = true;
+                return ty;
+            };
+            const enum_payload = ast.nodes.items(.tag)[node] != .array_access and payload != 0;
+            try self.query_unions.append(self.allocator, .{ .payload_type = payload_type, .module = module, .node = node, .payload = payload, .enum_payload = enum_payload });
+            if (payload != 0 and !enum_payload) {
+                const value = try self.expressionExpected(frame, payload, payload_type, depth + 1);
+                try self.unify(payload_type, value, span, 0);
+            }
+            return ty;
+        }
         if (ast.nodes.items(.tag)[node] == .array_access) {
             const payload = try self.expressionExpected(frame, data.rhs, payload_type, depth + 1);
             if (root(payload).value == .never) return payload;
@@ -1803,6 +2067,76 @@ const Solver = struct {
         // Container syntax has no executable payload: its lone `.tag` is an
         // enum literal. BodyChecker validates that literal and constructor arity.
         return ty;
+    }
+
+    fn writablePlace(self: *Solver, frame: *Frame, node: Ast.Node.Index, depth: usize) Ir.BuildError!void {
+        const module = frame.ref.module;
+        const ast = &module.source.ast;
+        const span = module.tokenSpan(ast.firstToken(node));
+        if (depth >= max_depth) return self.fail(.generic_function_limit, span, null);
+        const data = ast.nodes.items(.data)[node];
+        switch (ast.nodes.items(.tag)[node]) {
+            .identifier => {
+                const name = ast.tokenSlice(ast.firstToken(node));
+                var i = frame.locals.items.len;
+                while (i != 0) {
+                    i -= 1;
+                    const local = frame.locals.items[i];
+                    if (!std.mem.eql(u8, local.name, name)) continue;
+                    if (!local.mutable or local.query_global) try self.fail(.immutable_assignment, span, null);
+                    return;
+                }
+                try self.fail(.immutable_assignment, span, null);
+            },
+            .deref => {
+                if (ast.nodes.items(.tag)[data.lhs] != .identifier) return self.fail(.unsupported_assignment_target, span, null);
+                const reference = root(try self.expression(frame, data.lhs, depth + 1));
+                if (reference.value == .reference and !reference.value.reference.mutable) return self.fail(.immutable_assignment, span, null);
+                try self.query_places.append(self.allocator, .{ .operand = reference, .kind = .mutable_reference, .span = span });
+            },
+            .field_access, .array_access => {
+                const base_tag = ast.nodes.items(.tag)[data.lhs];
+                if (base_tag != .identifier and base_tag != .field_access and base_tag != .deref) return self.fail(.unsupported_assignment_target, span, null);
+                const base = root(try self.expression(frame, data.lhs, depth + 1));
+                if (base.value != .unknown) {
+                    if (ast.nodes.items(.tag)[node] == .array_access and base.value != .array) return self.fail(.unsupported_assignment_target, span, null);
+                    if (ast.nodes.items(.tag)[node] == .field_access and base.value != .nominal and !(base.value == .known and self.ir.getType(base.value.known).? == .record)) {
+                        const length = std.mem.eql(u8, ast.tokenSlice(data.rhs), "len") and (base.value == .array or (base.value == .known and self.ir.getType(base.value.known).? == .string));
+                        return self.fail(if (length) .unsupported_array_length_write else .unsupported_assignment_target, span, null);
+                    }
+                }
+                try self.query_places.append(self.allocator, .{ .operand = base, .kind = if (ast.nodes.items(.tag)[node] == .field_access) .record else .array, .span = span, .length = ast.nodes.items(.tag)[node] == .field_access and std.mem.eql(u8, ast.tokenSlice(data.rhs), "len") });
+                try self.writablePlace(frame, data.lhs, depth + 1);
+            },
+            else => try self.fail(.unsupported_assignment_target, span, null),
+        }
+    }
+
+    fn printExpression(self: *Solver, frame: *Frame, node: Ast.Node.Index, depth: usize) Ir.BuildError!*Term {
+        const module = frame.ref.module;
+        const ast = &module.source.ast;
+        const tag = ast.nodes.items(.tag)[node];
+        var type_syntax = tag == .array_type or tag == .fn_proto or tag == .fn_proto_one or tag == .type_variable;
+        if (tag == .identifier) {
+            const name = ast.tokenSlice(ast.firstToken(node));
+            type_syntax = primitives.isPrimitive(name);
+            if (module.lookup(name)) |id| type_syntax = module.getDeclaration(id).?.is_type_alias;
+            for (frame.locals.items) |local| if (std.mem.eql(u8, local.name, name)) {
+                type_syntax = false;
+            };
+        } else if (tag == .field_access) {
+            if (module.compilation) |comp| if (comp.reference(module, node)) |ref| {
+                type_syntax = comp.getModule(ref.source).?.getDeclaration(ref.local).?.is_type_alias;
+            };
+        } else if (ast.fullCall(node)) |call| {
+            const name = ast.tokenSlice(ast.firstToken(call.ast.fn_expr));
+            type_syntax = std.mem.eql(u8, name, "@TypeOf") or std.mem.eql(u8, name, "@This") or TypeResolver.genericReference(module, call.ast.fn_expr) != null;
+        }
+        if (type_syntax) {
+            _ = try self.typeNode(frame, node, depth + 1);
+            return self.fromType(try self.ir.internType(.string), module.tokenSpan(ast.firstToken(node)), 0);
+        }
+        return self.expression(frame, node, depth);
     }
 
     fn expression(self: *Solver, frame: *Frame, node: Ast.Node.Index, depth: usize) Ir.BuildError!*Term {
@@ -1816,13 +2150,38 @@ const Solver = struct {
         if (depth >= max_depth) try self.fail(.generic_function_limit, self.call_span, span);
         if (self.failed) return self.term(.unknown, span);
         const data = ast.nodes.items(.data)[node];
+        if (self.querying and ast.nodes.items(.tag)[node] == .identifier) {
+            const name = ast.tokenSlice(ast.firstToken(node));
+            var i = frame.locals.items.len;
+            while (i != 0) {
+                i -= 1;
+                const local = frame.locals.items[i];
+                if (!std.mem.eql(u8, local.name, name)) continue;
+                if (local.template != null) {
+                    if (expected) |context| if (root(context).value == .function) break;
+                    try self.fail(.not_a_value, span, null);
+                    return self.term(.unknown, span);
+                }
+                return local.term;
+            }
+            if (module.lookup(name)) |id| {
+                const declaration = module.getDeclaration(id).?;
+                const callback_context = if (expected) |context| root(context).value == .function else false;
+                if ((declaration.is_generic_function and !callback_context) or declaration.is_type_alias or declaration.is_namespace or declaration.is_generic) {
+                    try self.fail(.not_a_value, span, null);
+                    return self.term(.unknown, span);
+                }
+            }
+        }
         if (try self.callTarget(frame, node, depth + 1)) |candidate| {
             if (candidate.ref.local != null or candidate.ref.module.getDeclaration(candidate.ref.id).?.is_generic_function or
                 candidate.ref.module.source.ast.fullFnProto(candidate.ref.function().proto_node).?.ast.infer_result)
             {
                 const instance = (try self.signature(candidate.ref, candidate.container, depth + 1)) orelse return self.term(.unknown, span);
-                try self.deferBody(instance.frame, depth + 1);
-                return self.term(.{ .function = instance.function }, span);
+                const signature_term = try self.term(.{ .function = instance.function }, span);
+                if (self.querying and expected != null) try self.unify(signature_term, expected.?, span, 0);
+                if (!self.querying or TypeResolver.hasInferredSignature(&candidate.ref.module.source.ast, candidate.ref.function().proto_node)) try self.deferBody(instance.frame, depth + 1);
+                return signature_term;
             }
         }
         switch (ast.nodes.items(.tag)[node]) {
@@ -1834,6 +2193,11 @@ const Solver = struct {
                     if (std.mem.eql(u8, frame.locals.items[i].name, name)) return frame.locals.items[i].term;
                 }
                 if (std.mem.eql(u8, name, "true") or std.mem.eql(u8, name, "false")) return self.fromType(try self.ir.internType(.boolean), span, 0);
+                if (self.querying) {
+                    if (try TypeResolver.queryValue(module, self.ir, node)) |ty| return self.fromType(ty, span, 0);
+                    self.failed = true;
+                    return self.term(.unknown, span);
+                }
                 if (module.lookup(name)) |id| {
                     const decl = module.getDeclaration(id).?;
                     if (!decl.is_generic_function and !decl.is_type_alias) {
@@ -1858,10 +2222,38 @@ const Solver = struct {
                     }
                 }
             },
-            .string_literal => return self.fromType(try self.ir.internType(.string), span, 0),
-            .char_literal => return self.fromType(try self.ir.internType(.rune), span, 0),
+            .enum_literal => if (self.querying) {
+                if (expected) |context| {
+                    const name = ast.tokenSlice(ast.nodes.items(.main_token)[node]);
+                    if (try self.enumTag(context, name, span)) return context;
+                    if (self.tagged(context)) {
+                        const payload = root(try self.fieldType(context, name, span, depth + 1));
+                        if (payload.value != .known or self.ir.getType(payload.value.known).? != .void) try self.fail(.invalid_union_constructor, span, null);
+                        return context;
+                    }
+                }
+                try self.fail(.enum_needs_type, span, null);
+                return self.term(.unknown, span);
+            },
+            .string_literal => {
+                if (self.querying) {
+                    try self.query_strings.append(self.allocator, .{ .module = module, .node = node });
+                    for (ast.extra_data[data.lhs..data.rhs]) |embedded| {
+                        if (embedded == 0) continue; // The shared syntax validator diagnoses malformed placeholders.
+                        const value = try self.printExpression(frame, embedded, depth + 1);
+                        try self.query_printables.append(self.allocator, .{ .operand = value, .module = module, .node = embedded });
+                    }
+                }
+                return self.fromType(try self.ir.internType(.string), span, 0);
+            },
+            .char_literal => {
+                const value = try self.fromType(try self.ir.internType(.rune), span, 0);
+                if (self.querying) try self.query_literals.append(self.allocator, .{ .operand = value, .module = module, .node = node });
+                return value;
+            },
             .number_literal => {
                 const value = try self.term(.unknown, span);
+                if (self.querying) try self.query_literals.append(self.allocator, .{ .operand = value, .module = module, .node = node });
                 switch (std.zig.parseNumberLiteral(ast.tokenSlice(ast.firstToken(node)))) {
                     .int, .big_int => try self.defaults.append(self.allocator, .{ .term = value, .ty = try BodyChecker.defaultIntegerType(self.ir) }),
                     .float => try self.defaults.append(self.allocator, .{ .term = value, .ty = try BodyChecker.defaultFloatType(self.ir) }),
@@ -1871,19 +2263,34 @@ const Solver = struct {
             },
             .ref_of => {
                 const operand = data.rhs;
+                if (self.querying and ast.nodes.items(.tag)[operand] != .identifier and ast.nodes.items(.tag)[operand] != .array_access) {
+                    try self.fail(.unsupported_borrow, span, null);
+                    return self.term(.unknown, span);
+                }
                 const owner = if (ast.nodes.items(.tag)[operand] == .array_access) ast.nodes.items(.data)[operand].lhs else operand;
                 var mutable = false;
+                var lexical = false;
                 if (ast.nodes.items(.tag)[owner] == .identifier) {
                     const name = ast.tokenSlice(ast.firstToken(owner));
                     for (frame.locals.items) |local| {
-                        if (std.mem.eql(u8, local.name, name)) mutable = local.mutable;
+                        if (!std.mem.eql(u8, local.name, name)) continue;
+                        mutable = local.mutable;
+                        lexical = !local.query_global and local.template == null;
                     }
+                }
+                if (self.querying) {
+                    if (!lexical) {
+                        try self.fail(.unsupported_borrow, span, null);
+                        return self.term(.unknown, span);
+                    }
+                    if (ast.nodes.items(.tag)[operand] == .array_access) try self.query_places.append(self.allocator, .{ .operand = try self.expression(frame, owner, depth + 1), .kind = .borrow_array, .span = span });
                 }
                 return self.term(.{ .reference = .{ .child = try self.expression(frame, operand, depth + 1), .mutable = mutable } }, span);
             },
             .deref => {
                 const operand = root(try self.expression(frame, data.lhs, depth + 1));
                 if (operand.value == .reference) return operand.value.reference.child;
+                if (self.querying and operand.value != .unknown) try self.fail(.unsupported_borrow, span, null);
                 const result = try self.term(.unknown, span);
                 if (operand.value == .unknown) try self.projections.append(self.allocator, .{ .base = operand, .result = result, .name = null, .span = span });
                 return result;
@@ -1906,20 +2313,38 @@ const Solver = struct {
             .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod => {
                 const lhs = try self.expression(frame, data.lhs, depth + 1);
                 if (root(lhs).value == .never) return lhs;
+                if (self.querying) {
+                    try self.writablePlace(frame, data.lhs, depth + 1);
+                    try self.query_assignments.append(self.allocator, .{ .operand = lhs, .module = module, .node = node });
+                }
                 const rhs = try self.expression(frame, data.rhs, depth + 1);
                 if (root(rhs).value == .never) return rhs;
-                // Mutation constrains the stored value, not the expression's
-                // result. BodyChecker validates the target and operator.
+                if (self.querying) {
+                    if (ast.nodes.items(.tag)[node] != .assign) try self.query_operations.append(self.allocator, .{ .tag = ast.nodes.items(.tag)[node], .operand = lhs, .span = span });
+                }
                 try self.unifyArgument(lhs, rhs, span);
                 return self.fromType(try self.ir.internType(.void), span, 0);
             },
-            .negation, .bit_not => return self.expression(frame, data.rhs, depth + 1),
+            .negation, .bit_not => {
+                const numbers = self.query_literals.items.len;
+                const operand = try self.expression(frame, data.rhs, depth + 1);
+                var literal_node = data.rhs;
+                var buffer: [2]Ast.Node.Index = undefined;
+                while (ast.fullBlock(&buffer, literal_node)) |block| {
+                    if (ast.firstToken(literal_node) != block.ast.lbrace or block.ast.statements.len != 1) break;
+                    literal_node = block.ast.statements[0];
+                }
+                if (self.querying and ast.nodes.items(.tag)[node] == .negation and ast.nodes.items(.tag)[literal_node] == .number_literal and self.query_literals.items.len == numbers + 1) self.query_literals.items[numbers].node = node;
+                if (self.querying) try self.query_operations.append(self.allocator, .{ .tag = ast.nodes.items(.tag)[node], .operand = operand, .span = span });
+                return operand;
+            },
             .add, .sub, .mul, .div, .mod, .bit_and, .bit_or, .bit_xor, .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal => {
                 const lhs = try self.expression(frame, data.lhs, depth + 1);
                 if (root(lhs).value == .never) return lhs;
                 const rhs = try self.expression(frame, data.rhs, depth + 1);
                 if (root(rhs).value == .never) return rhs;
                 try self.unify(lhs, rhs, span, 0);
+                if (self.querying) try self.query_operations.append(self.allocator, .{ .tag = ast.nodes.items(.tag)[node], .operand = lhs, .span = span });
                 return switch (ast.nodes.items(.tag)[node]) {
                     .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal => self.fromType(try self.ir.internType(.boolean), span, 0),
                     else => lhs,
@@ -1944,9 +2369,75 @@ const Solver = struct {
                 try self.unify(base, try self.term(.{ .array = element }, span), span, 0);
                 return element;
             },
+            .slice => {
+                const slice = ast.slice(node).ast;
+                const string = try self.fromType(try self.ir.internType(.string), span, 0);
+                try self.unify(string, try self.expression(frame, slice.sliced, depth + 1), span, 0);
+                const index = try self.fromType(try BodyChecker.defaultIntegerType(self.ir), span, 0);
+                for ([_]Ast.Node.Index{ slice.start, slice.end }) |bound| if (bound != 0) {
+                    try self.unify(index, try self.expressionExpected(frame, bound, index, depth + 1), span, 0);
+                };
+                return string;
+            },
             .container_decl_arg => {
                 if (try self.constructorType(frame, data.lhs, expected, depth + 1)) |ty|
                     return self.unionConstructor(frame, node, ty, depth + 1);
+                const init = ast.fullStructInit(node).?;
+                const record = try self.typeNode(frame, init.type_node, depth + 1);
+                const concrete = (try self.materialize(record, 0)) orelse return self.term(.unknown, span);
+                const ty = self.ir.getType(concrete).?;
+                if (ty != .record or ty.record.tagged) {
+                    try self.fail(.invalid_union_constructor, span, null);
+                    return record;
+                }
+                const seen = try self.allocator.alloc(bool, ty.record.fields.len);
+                @memset(seen, false);
+                for (init.fields) |field_node| {
+                    const name = ast.tokenSlice(ast.nodes.items(.main_token)[field_node]);
+                    for (ty.record.fields, 0..) |field_value, i| {
+                        if (!std.mem.eql(u8, field_value.name, name)) continue;
+                        if (seen[i]) try self.fail(.duplicate_field, span, null);
+                        seen[i] = true;
+                        const rhs = ast.nodes.items(.data)[field_node].rhs;
+                        const field_term = try self.fromType(field_value.ty, span, 0);
+                        try self.unifyArgument(field_term, try self.expressionExpected(frame, if (rhs == 0) field_node else rhs, field_term, depth + 1), span);
+                        break;
+                    } else try self.fail(.unknown_field, span, null);
+                }
+                for (seen, ty.record.fields) |supplied, field_value| if (!supplied and field_value.default == null) {
+                    try self.fail(.missing_field, span, field_value.span);
+                };
+                return record;
+            },
+            .match => {
+                if (!self.querying) {
+                    self.unsupported = self.unsupported orelse span;
+                    return self.term(.unknown, span);
+                }
+                const match = ast.fullMatch(node).?.ast;
+                const subjects = try self.allocator.alloc(*Term, match.subjects.len);
+                for (subjects, match.subjects) |*subject, syntax| subject.* = try self.expression(frame, syntax, depth + 1);
+                const result = expected orelse try self.term(.unknown, span);
+                try self.query_matches.append(self.allocator, .{ .module = module, .node = node, .subjects = subjects });
+                for (match.cases) |case| {
+                    const prong = ast.fullMatchCase(case).?.ast;
+                    const scope = frame.locals.items.len;
+                    defer frame.locals.shrinkRetainingCapacity(scope);
+                    if (prong.capture_token) |token| {
+                        const name = ast.tokenSlice(token);
+                        if (subjects.len != 1 or prong.values.len != 1 or ast.nodes.items(.tag)[prong.values[0]] != .enum_literal or std.mem.eql(u8, name, "_") or std.mem.startsWith(u8, name, "@\"")) {
+                            try self.fail(.invalid_match_capture, module.tokenSpan(token), null);
+                            return result;
+                        }
+                        for (frame.locals.items) |local| if (std.mem.eql(u8, local.name, name)) {
+                            try self.fail(.unsupported_shadowing, module.tokenSpan(token), null);
+                        };
+                        const payload = try self.fieldType(subjects[0], ast.tokenSlice(ast.nodes.items(.main_token)[prong.values[0]]), span, depth + 1);
+                        try frame.locals.append(self.allocator, .{ .name = name, .term = payload });
+                    }
+                    try self.unify(result, try self.expressionExpected(frame, prong.target_expr, result, depth + 1), span, 0);
+                }
+                return result;
             },
             .array_init, .array_init_comma, .array_init_two, .array_init_two_comma => {
                 const element = try self.term(.unknown, span);
@@ -1967,8 +2458,21 @@ const Solver = struct {
                 defer frame.locals.shrinkRetainingCapacity(scope);
                 var buffer: [2]Ast.Node.Index = undefined;
                 var result = try self.fromType(try self.ir.internType(.void), span, 0);
-                for (ast.fullBlock(&buffer, node).?.ast.statements) |statement| {
+                const statements = ast.fullBlock(&buffer, node).?.ast.statements;
+                for (statements, 0..) |statement, statement_index| {
                     if (ast.fullDecl(statement)) |decl| {
+                        if (self.querying) {
+                            const name = ast.tokenSlice(decl.ast.let_token + 1 + @intFromBool(decl.ast.is_mutable));
+                            var related: ?Module.Span = null;
+                            if (module.lookup(name)) |id| related = module.getDeclaration(id).?.name_span;
+                            for (frame.locals.items) |local| if (std.mem.eql(u8, local.name, name)) {
+                                related = local.term.span;
+                            };
+                            if (!try BodyChecker.validateLocalSyntax(module, statement, related)) {
+                                self.failed = true;
+                                return self.term(.unknown, span);
+                            }
+                        }
                         var named_function = false;
                         if (ast.fullFnProto(decl.ast.type_node)) |proto| {
                             var iterator = proto.iterate(ast);
@@ -1978,6 +2482,10 @@ const Solver = struct {
                         }
                         const closure_proto = if (named_function) decl.ast.type_node else if (decl.ast.init_node != 0 and ast.nodes.items(.tag)[decl.ast.init_node] == .function_expr) ast.nodes.items(.data)[decl.ast.init_node].lhs else 0;
                         if (closure_proto != 0 and !signatureVariablesBound(frame, closure_proto)) {
+                            if (self.querying and decl.ast.is_mutable) {
+                                try self.fail(.generic_function_context, module.tokenSpan(ast.firstToken(statement)), null);
+                                return self.term(.unknown, span);
+                            }
                             const closure_body = if (named_function) decl.ast.init_node else ast.nodes.items(.data)[decl.ast.init_node].rhs;
                             const ref = try self.closureReference(frame, closure_proto, closure_body);
                             try frame.locals.append(self.allocator, .{ .name = ast.tokenSlice(decl.ast.let_token + 1 + @intFromBool(decl.ast.is_mutable)), .term = try self.term(.unknown, span), .template = ref });
@@ -1991,7 +2499,10 @@ const Solver = struct {
                             try self.closure(frame, decl.ast.type_node, decl.ast.init_node, depth + 1)
                         else
                             try self.expressionExpected(frame, decl.ast.init_node, context, depth + 1);
-                        if (root(value).value == .never) return value;
+                        if (root(value).value == .never) {
+                            if (self.querying and statement_index + 1 < statements.len) try self.fail(.unreachable_code, module.tokenSpan(ast.firstToken(statements[statement_index + 1])), null);
+                            return value;
+                        }
                         if (decl.ast.type_node != 0) {
                             if (ast.fullFnProto(decl.ast.type_node) != null and !signatureVariablesBound(frame, decl.ast.type_node)) {
                                 try self.fail(.generic_function_context, module.tokenSpan(ast.firstToken(decl.ast.type_node)), null);
@@ -2005,10 +2516,17 @@ const Solver = struct {
                                 } else try self.unify(value, annotation, module.tokenSpan(ast.firstToken(statement)), 0);
                             }
                         }
+                        if (self.querying) try self.query_locals.append(self.allocator, .{ .operand = value, .module = module, .node = statement });
                         try frame.locals.append(self.allocator, .{ .name = ast.tokenSlice(decl.ast.let_token + 1 + @intFromBool(decl.ast.is_mutable)), .term = value, .mutable = decl.ast.is_mutable });
                         result = try self.fromType(try self.ir.internType(.void), span, 0);
-                    } else result = try self.expressionExpected(frame, statement, expected, depth + 1);
-                    if (root(result).value == .never) return result;
+                    } else {
+                        result = try self.expressionExpected(frame, statement, if (!self.querying or statement_index + 1 == statements.len) expected else null, depth + 1);
+                        if (self.querying and statement_index + 1 < statements.len) try self.query_statements.append(self.allocator, .{ .operand = result, .span = module.tokenSpan(ast.firstToken(statement)) });
+                    }
+                    if (root(result).value == .never) {
+                        if (self.querying and statement_index + 1 < statements.len) try self.fail(.unreachable_code, module.tokenSpan(ast.firstToken(statements[statement_index + 1])), null);
+                        return result;
+                    }
                 }
                 return result;
             },
@@ -2068,18 +2586,24 @@ const Solver = struct {
                     return ty;
                 }
                 const callee_name = ast.tokenSlice(ast.firstToken(call.ast.fn_expr));
+                if (self.querying and ((std.mem.eql(u8, callee_name, "@panic") and call.ast.args.len != 1) or (std.mem.eql(u8, callee_name, "@assert") and (call.ast.args.len == 0 or call.ast.args.len > 2)))) {
+                    try self.fail(.argument_count_mismatch, span, null);
+                    return self.term(.unknown, span);
+                }
                 if (ast.nodes.items(.tag)[call.ast.fn_expr] == .builtin_literal and
                     (std.mem.eql(u8, callee_name, "@panic") or std.mem.eql(u8, callee_name, "@print") or std.mem.eql(u8, callee_name, "@println") or std.mem.eql(u8, callee_name, "@assert")))
                 {
                     for (call.ast.args, 0..) |arg, index| {
-                        const value = try self.expression(frame, arg, depth + 1);
+                        const printing = self.querying and (std.mem.eql(u8, callee_name, "@print") or std.mem.eql(u8, callee_name, "@println"));
+                        const value = if (printing) try self.printExpression(frame, arg, depth + 1) else try self.expression(frame, arg, depth + 1);
+                        if (printing) try self.query_printables.append(self.allocator, .{ .operand = value, .module = module, .node = arg, .interpolation = false });
                         if (root(value).value == .never) return value;
                         if (std.mem.eql(u8, callee_name, "@panic") or std.mem.eql(u8, callee_name, "@assert")) {
                             const ty = try self.ir.internType(if (std.mem.eql(u8, callee_name, "@assert") and index == 0) .boolean else .string);
                             try self.unify(value, try self.fromType(ty, span, 0), span, 0);
                         }
                     }
-                    return if (std.mem.eql(u8, callee_name, "@panic")) self.term(.never, span) else self.fromType(try self.ir.internType(.void), span, 0);
+                    return if (!self.querying and std.mem.eql(u8, callee_name, "@panic")) self.term(.never, span) else self.fromType(try self.ir.internType(.void), span, 0);
                 }
                 if ((try self.callTarget(frame, call.ast.fn_expr, depth)) orelse (try self.instanceCallTarget(frame, call.ast.fn_expr, depth))) |callee_target| {
                     if (try self.signature(callee_target.ref, callee_target.container, depth + 1)) |instance| {
@@ -2093,10 +2617,18 @@ const Solver = struct {
                                 if (root(value).value == .never) return value;
                                 try self.unifyArgument(param, value, module.tokenSpan(ast.firstToken(arg)));
                             }
-                            if (callee_target.ref.isNoreturn()) return self.term(.never, span);
-                            if (callee_target.ref.local != null or callee_target.ref.module.getDeclaration(callee_target.ref.id).?.is_generic_function or
-                                (self.establishedType(callee_target.ref) == null and callee_target.ref.module.source.ast.fullFnProto(callee_target.ref.function().proto_node).?.ast.infer_result)) try self.body(&child, depth + 1);
+                            if (!self.querying and callee_target.ref.isNoreturn()) return self.term(.never, span);
+                            const needs_body = if (self.querying)
+                                TypeResolver.hasInferredSignature(&callee_target.ref.module.source.ast, callee_target.ref.function().proto_node)
+                            else
+                                callee_target.ref.local != null or callee_target.ref.module.getDeclaration(callee_target.ref.id).?.is_generic_function or
+                                    (self.establishedType(callee_target.ref) == null and callee_target.ref.module.source.ast.fullFnProto(callee_target.ref.function().proto_node).?.ast.infer_result);
+                            if (needs_body) try self.body(&child, depth + 1);
                             return f.result;
+                        }
+                        if (self.querying) {
+                            try self.fail(.argument_count_mismatch, span, null);
+                            return self.term(.unknown, span);
                         }
                     }
                 }
@@ -2111,9 +2643,11 @@ const Solver = struct {
                     }
                     return f.result;
                 }
+                if (self.querying) try self.fail(if (callee.value == .function) .argument_count_mismatch else .not_callable, span, null);
             },
             else => {},
         }
+        if (self.querying) try self.fail(.unsupported_body_expression, span, null);
         self.unsupported = self.unsupported orelse span;
         return self.term(.unknown, span);
     }
@@ -2130,7 +2664,10 @@ const Solver = struct {
             .known => |ty| ty,
             .reference => |reference| blk: {
                 const child = (try self.materialize(reference.child, depth + 1)) orelse break :blk null;
-                if (!Ir.isArrayElement(self.ir.getType(child).?)) break :blk null;
+                if (!Ir.isArrayElement(self.ir.getType(child).?)) {
+                    if (self.querying) try self.fail(.unsupported_borrow, t.span, null);
+                    break :blk null;
+                }
                 break :blk try self.ir.internType(.{ .reference = .{ .child = child, .mutable = reference.mutable } });
             },
             .array => |element| blk: {
@@ -2388,6 +2925,17 @@ test "real std array findIndex preserves uint constructor payloads under OOM" {
     try TestAllocations.checkAllAllocationFailures(allocator, testNonStorableImport, .{ path, lib, @as(?Module.Diagnostic.Tag, null) });
 }
 
+fn expectNoImportSpecializations(comp: *const Compilation, count: usize) !void {
+    try std.testing.expectEqual(count, comp.declarations.items.len);
+    try std.testing.expectEqual(count, comp.declaration_ids.count());
+    for (comp.declarations.items, 0..) |ref, i| {
+        try std.testing.expectEqual(@as(Compilation.DeclId, @fromBackingInt(@intCast(i))), comp.declaration_ids.get(ref).?);
+    }
+    for (comp.modules.items) |module| {
+        for (module.declarations.items) |decl| try std.testing.expect(decl.function_template == null and decl.concrete_type == null);
+    }
+}
+
 fn testNonStorableImport(allocator: std.mem.Allocator, path: []const u8, lib: []const u8, tag: ?Module.Diagnostic.Tag) !void {
     var comp = try Compilation.load(allocator, std.testing.io, path, .{ .lib_dir = lib });
     defer comp.deinit();
@@ -2395,17 +2943,14 @@ fn testNonStorableImport(allocator: std.mem.Allocator, path: []const u8, lib: []
     const count = comp.declarations.items.len;
     var sema = Lowering.lowerCompilation(&comp) catch |err| {
         try std.testing.expectEqual(error.OutOfMemory, err);
-        try std.testing.expectEqual(count, comp.declarations.items.len);
-        for (comp.modules.items) |module| {
-            try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
-            for (module.declarations.items) |decl| try std.testing.expect(decl.function_template == null and decl.concrete_type == null);
-        }
+        try expectNoImportSpecializations(&comp, count);
+        for (comp.modules.items) |module| try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
         return err;
     };
     defer sema.deinit();
     if (tag) |expected| {
         try std.testing.expect(!sema.lowering_complete);
-        try std.testing.expectEqual(count, comp.declarations.items.len);
+        try expectNoImportSpecializations(&comp, count);
         var found = false;
         for (comp.modules.items) |module| for (module.diagnostics.items) |diagnostic| {
             if (diagnostic.tag != expected) continue;
@@ -2414,6 +2959,7 @@ fn testNonStorableImport(allocator: std.mem.Allocator, path: []const u8, lib: []
             try std.testing.expect(owner.sourceSlice(diagnostic.span) != null);
             found = true;
         };
+        if (!found) for (comp.modules.items) |module| std.debug.print("array import {s}: {any}\n", .{ module.source.path, module.diagnostics.items });
         try std.testing.expect(found);
     } else {
         if (comp.hasErrors()) for (comp.modules.items) |module| std.debug.print("array import {s}: {any}\n", .{ module.source.path, module.diagnostics.items });
@@ -2421,6 +2967,40 @@ fn testNonStorableImport(allocator: std.mem.Allocator, path: []const u8, lib: []
         try std.testing.expect(sema.lowering_complete);
     }
     try sema.ir.verify();
+}
+
+test "failed lowering rolls back imported signature methods and earlier generic demands under OOM" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "producer.nov", .data =
+        \\@[public]
+        \\let Box:(T:type)->type=struct{
+        \\ value:T,
+        \\ let get:(self:Self)->T=self.value
+        \\}
+        \\@[public]
+        \\let ordinary:(value:Box(int))->int=value.get()
+        \\@[public]
+        \\let id:(value:`T)->`T=value
+        \\@[public]
+        \\let make:(f:()->`T)->[]`T=[]
+    });
+    const lib = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(lib);
+    for ([_][]const u8{
+        // Annotation failure after an ordinary imported signature publishes Box methods.
+        "let p=@import(\"producer.nov\")\nlet invalid:(x:[]void)={}\nlet main:()={}\n",
+        // Body failure after both signature publication and a successful generic call.
+        "let p=@import(\"producer.nov\")\nlet main:()={let good=p.id(1)\nlet bad=p.make(()->void{})\n}\n",
+    }) |source| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "main.nov", .data = source });
+        const path = try tmp.dir.realPathFileAlloc(io, "main.nov", allocator);
+        defer allocator.free(path);
+        try testNonStorableImport(allocator, path, lib, .unsupported_type);
+        try TestAllocations.checkAllAllocationFailures(allocator, testNonStorableImport, .{ path, lib, @as(?Module.Diagnostic.Tag, .unsupported_type) });
+    }
 }
 
 test "non-storable array real imports diagnose and preserve void returning function elements" {

@@ -312,18 +312,23 @@ own line). This has the same identity and visibility as a separate namespace bin
 Imports yield compile-time namespaces, never runtime values. Bounded
 `@TypeOf(lib.value)` can query an imported runtime binding's canonical type while
 preserving visibility checks; `@TypeOf(lib)` and queries of imported types or
-unspecialized generic templates are rejected. Runtime field/index expressions and
-calls are not valid query operands. For a local reference binding `p`,
-`@TypeOf(p)` reports the reference descriptor, with canonical names such as `&u8`
-or `&mut u8`, not its child value type. `@TypeOf(p.*)` remains unsupported because
-dereference is not a binding operand. Queries do not evaluate/read values or add
-runtime dependencies, captures or boxing. Results are compile-time types usable in
+unspecialized generic templates are rejected. Expressions are supported, including
+literals, calls, arithmetic, fields, indexing, string slices, blocks and inferred
+generic calls. The operand is typechecked without execution: calls, mutations,
+bounds checks, converter invocation and arithmetic panics do not occur. Invalid
+operands still diagnose, and unsupported language features remain unsupported.
+For a local reference `p`, `@TypeOf(p)` reports its descriptor (`&u8` or `&mut u8`),
+while `@TypeOf(p.*)` reports its child type without dereferencing. Queries inspect
+lexical metadata without creating loans or introducing runtime dependencies,
+captures, boxing, specializations or callee-body demands. Results are compile-time types usable in
 annotations, `@as`, generic type arguments and module-level aliases, not first-class
 runtime values or local type aliases. Direct print/interpolation renders their
 canonical names without calling value stringify hooks. See the root README's
-[type-query contract](../README.md#type-queries) and `examples/type-of.nov`.
+[type-query contract](../README.md#type-queries), `examples/type-of.nov` and
+`examples/type-of-expressions.nov`.
 Canonical paths share one source and nominal identity across repeated/diamond
-imports; cycles diagnose. Declarations and methods are file-private by default;
+imports, including cyclic module imports; actual declaration/type dependency
+cycles still diagnose. Declarations and methods are file-private by default;
 both named and file imports expose only `@[public]` declarations. Public types do
 not automatically expose their methods. Aliases/re-exports and implicit
 `@[stringify]` conversion preserve access checks: a marked converter must itself

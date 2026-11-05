@@ -3388,6 +3388,104 @@ fn testTypeReachabilityAllocationFailures(allocator: std.mem.Allocator, source: 
     allocator.free(try emitSourceFreeTypeReachability(allocator, source));
 }
 
+const type_of_expressions_program =
+    \\let fail:()->int={@panic("TypeOf operand executed")}
+    \\let id:(x:`T)->`T=x
+    \\let map:(items:[]`T,f:(`T)->`U)->[]`U={let mut out:[]`U=[]
+    \\ loop item in items {out+=[f(item)]}
+    \\ out}
+    \\let R=struct{value:int=0,
+    \\ @[stringify]
+    \\ let format:(r:R)->string={@panic("TypeOf converter executed")}
+    \\}
+    \\let result:()->@TypeOf(1+2)=7
+    \\let update:(owner:&mut int,value:int)={owner.*+=value}
+    \\let main:()={
+    \\ let mut effects=0
+    \\ let values=[1,2]
+    \\ let indexed:@TypeOf(values[999])=3
+    \\ let divided:@TypeOf(1/0)=4
+    \\ let called:@TypeOf(fail())=5
+    \\ let mutated:@TypeOf({effects+=1
+    \\ effects=fail()
+    \\ effects})=6
+    \\ let constructed:@TypeOf(R[.value=fail()])=R[]
+    \\ let converted:@TypeOf("{R[]}")="safe"
+    \\ let sliced:@TypeOf("λ"[99..100])="slice"
+    \\ let branch:@TypeOf(if true {1} else {fail()})=8
+    \\ let matched:@TypeOf(match true {true=>1
+    \\ false=>fail()})=9
+    \\ let mapped:@TypeOf(map(values,(x){effects+=1
+    \\ "item:{x}"}))=["mapped"]
+    \\ let generic:@TypeOf(id(@as(u8,1)))=10
+    \\ let mut owner=1
+    \\ let p=&owner
+    \\ let dereferenced:@TypeOf(p.*)=2
+    \\ let read:@TypeOf(owner+1)=3
+    \\ let only_types=()->int{let value:@TypeOf(p.*+owner)=4
+    \\ value}
+    \\ let callback:@TypeOf(()->int{owner})=()->int{5}
+    \\ p.*+=dereferenced
+    \\ @println(indexed,divided,called,mutated,constructed.value,converted,sliced,branch,matched,mapped[0],generic,effects)
+    \\ @println(p.*,read,only_types(),callback(),@TypeOf(p.*),@TypeOf(result()),@TypeOf(1.5),@TypeOf('λ'))
+    \\ let mut reserved=10
+    \\ update(&reserved,{let value:@TypeOf(reserved+1)=2
+    \\ value})
+    \\ let no_loan:@TypeOf({let q=&reserved
+    \\ q.*})=3
+    \\ reserved+=no_loan
+    \\ @println(reserved)
+    \\}
+;
+
+fn emitTypeOfExpressionsSourceFree(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
+    var lowered = blk: {
+        const owned = try allocator.dupe(u8, source);
+        defer allocator.free(owned);
+        var module = try Module.init(allocator, "typeof-expressions.nov", owned);
+        defer module.deinit();
+        var result = try Lowering.lower(&module);
+        errdefer result.deinit();
+        if (module.hasErrors()) std.debug.print("TypeOf expression diagnostics: {any} {any}\n", .{ module.source.ast.errors, module.diagnostics.items });
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expect(result.lowering_complete);
+        break :blk result;
+    };
+    defer lowered.deinit();
+    try lowered.ir.verify();
+    return emit(allocator, &lowered.ir, null);
+}
+
+test "TypeOf expressions unevaluated calls fields indices slices closures generics borrows source free forced GC O0 O3" {
+    const library = try emitTypeOfExpressionsSourceFree(test_gpa, type_of_expressions_program);
+    defer test_gpa.free(library);
+    const c = try collectingTestProgram(library);
+    defer test_gpa.free(c);
+    const expected = try std.fmt.allocPrint(test_gpa, "3 4 5 6 0 safe slice 8 9 mapped 10 0\n3 3 4 5 i{0d} i{0d} f64 rune\n15\n", .{@bitSizeOf(usize)});
+    defer test_gpa.free(expected);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, expected, "", mode);
+}
+
+fn testTypeOfExpressionAllocationFailures(allocator: std.mem.Allocator) !void {
+    const c = try emitTypeOfExpressionsSourceFree(allocator,
+        \\let id:(x:`T)->`T=x
+        \\let main:()={let mut owner:int=1
+        \\ let p=&owner
+        \\ let value:@TypeOf(id(p.*+owner))=2
+        \\ let skipped:@TypeOf({owner=1/0
+        \\ owner})=3
+        \\ p.*+=value
+        \\ @println(p.*,skipped)}
+    );
+    defer allocator.free(c);
+}
+
+test "TypeOf expressions small source free compiler emitter allocation rollback" {
+    try testTypeOfExpressionAllocationFailures(test_gpa);
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testTypeOfExpressionAllocationFailures, .{});
+}
+
 test "type reachability completes nested nominal signature generic and closure edges source free C11 O0 O3 forced GC" {
     for (type_reachability_cases) |case| {
         const library = try emitSourceFreeTypeReachability(test_gpa, case.source);

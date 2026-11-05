@@ -1,0 +1,170 @@
+; nov run examples/type-of-expressions.nov
+; nov test examples/type-of-expressions.nov
+
+let std = @import("std")
+
+let fail: () -> int = {
+    @panic("TypeOf operand executed")
+}
+let identity: (value: `T) -> `T = value
+let result: () -> @TypeOf(1 + 2) = 7
+let update: (owner: &mut int, value: int) = {
+    owner.* += value
+}
+
+let Record = struct {
+    value: int = 0,
+
+    @[stringify]
+    let format: (value: Record) -> string = {
+        @panic("TypeOf converter executed")
+    }
+}
+
+@[test]
+let literals_calls_fields_and_indices: () = {
+    let values = [1, 2]
+    let record = Record[ .value = 3 ]
+    let integer: @TypeOf(1) = 4
+    let fraction: @TypeOf(1.5) = 2.5
+    let character: @TypeOf('λ') = '世'
+    let called: @TypeOf(result()) = result()
+    let field: @TypeOf(record.value) = 5
+    let indexed: @TypeOf(values[999]) = 6
+    let arithmetic: @TypeOf(integer + indexed) = 10
+    @assert(integer == 4 and fraction == 2.5 and character == '世')
+    @assert(called == 7 and field == 5 and indexed == 6 and arithmetic == 10)
+}
+
+@[test]
+let arrays_slices_blocks_if_and_match: () = {
+    let source = "λ世"
+    let array: @TypeOf([1, 2]) = [3, 4]
+    let slice: @TypeOf(source[99..100]) = "safe"
+    let text: @TypeOf("λ"[99..100]) = "safe"
+    let block: @TypeOf(
+        {
+            let unused = fail()
+            1
+        }
+    ) = 6
+    let branch: @TypeOf(
+        if true {
+            1
+        } else {
+            fail()
+        }
+    ) = 7
+    let matched: @TypeOf(
+        match true {
+            true => 1
+            false => fail()
+        }
+    ) = 8
+    @assert(array[0] == 3 and slice == "safe" and text == "safe")
+    @assert(block == 6 and branch == 7 and matched == 8)
+}
+
+@[test]
+let operands_do_not_execute_or_store: () = {
+    let mut count = 0
+    let called: @TypeOf(fail()) = 1
+    let divided: @TypeOf(1 / 0) = 2
+    let mutated: @TypeOf(
+        {
+            count += 1
+            count = fail()
+            count
+        }
+    ) = 3
+    let defaulted: @TypeOf(Record[]) = Record[ .value = 4 ]
+    let constructed: @TypeOf(Record[ .value = fail() ]) = Record[]
+    let converted: @TypeOf("{Record[]}") = "safe"
+    @assert(count == 0 and called == 1 and divided == 2 and mutated == 3)
+    @assert(defaulted.value == 4 and constructed.value == 0 and converted == "safe")
+}
+
+@[test]
+let references_borrows_and_type_only_captures: () = {
+    let mut owner = 1
+    let p = &owner
+    let value: @TypeOf(p.*) = 2
+    let mut read: @TypeOf(owner + 1) = 3
+    let reference: @TypeOf(&owner) = &read
+    let type_only = () -> int {
+        let queried: @TypeOf(p.* + owner) = 4
+        queried
+    }
+    p.* += value
+    @assert(p.* == 3 and reference.* == 3 and type_only() == 4)
+    let mut other = 5
+    let q = &other
+    let callback: @TypeOf(
+        () -> int {
+            other
+        }
+    ) = () -> int {
+        6
+    }
+    q.* += 1
+    @assert(q.* == 6 and callback() == 6)
+    let mut reserved = 10
+    update(
+        &reserved,
+        {
+            let queried: @TypeOf(reserved + 1) = 2
+            queried
+        }
+    )
+    @assert(reserved == 12)
+    let no_loan: @TypeOf(
+        {
+            let borrowed = &reserved
+            borrowed.*
+        }
+    ) = 3
+    reserved += no_loan
+    @assert(reserved == 15)
+}
+
+@[test]
+let closures_and_inferred_generic_calls: () = {
+    let mut calls = 0
+    let items: @TypeOf(
+        std.array.map(
+            [1, 2],
+            (value) {
+                calls += 1
+                "item:{value}"
+            }
+        )
+    ) = ["safe"]
+    let generic: @TypeOf(identity(@as(u8, 1))) = 7
+    let closure: @TypeOf(
+        (value: int) -> int {
+            value + 1
+        }
+    ) = (value) {
+        value + 2
+    }
+    @assert(calls == 0 and items[0] == "safe" and generic == 7 and closure(3) == 5)
+}
+
+let main: () = {
+    let mut value = 1
+    let p = &value
+    @println("Literals:", @TypeOf(1), @TypeOf(1.5), @TypeOf('λ'))
+    let text = "λ世"
+    @println("Expressions:", @TypeOf(p.*), @TypeOf(result()), @TypeOf(text[0..1]))
+    @println(
+        "Generic:",
+        @TypeOf(
+            std.array.map(
+                [1, 2],
+                (item) {
+                    "{item}"
+                }
+            )
+        )
+    )
+}

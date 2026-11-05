@@ -1972,7 +1972,8 @@ formal parameter is a compatible reference. `let q = p`, `return p`, storing `p`
 in an aggregate and capturing `p` in a closure are currently rejected. Reborrows
 such as `&p` and `&p.*` are unsupported. `@TypeOf(p)` is the bounded compile-time
 exception: it inspects the reference descriptor and prints names such as `&u8`
-or `&mut u8`; `@TypeOf(p.*)` remains unsupported (see [Type Queries](#type-queries)).
+or `&mut u8`; `@TypeOf(p.*)` reports the pointee type without dereferencing it
+(see [Type Queries](#type-queries)).
 
 #### Reference parameters
 
@@ -2658,27 +2659,36 @@ numeric cast. See [examples/type-aliases.nov](examples/type-aliases.nov).
 
 ## Type Queries
 
-`@TypeOf(x)` returns the existing canonical type of a runtime value binding at
-compile time. It takes exactly one operand: a binding identifier or an imported
-namespace value reference such as `lib.value`, subject to ordinary visibility
-checks. Globals, visible locals, parameters, mutable and borrowed bindings, and
-bindings visible from an enclosing closure scope can be inspected. Scalar,
-array, nominal container and concrete function/closure types are supported.
-A concrete function variable specialized from a generic function is queryable;
-the unspecialized template itself is not, even after another call specializes it.
+`@TypeOf(expression)` returns an expression's canonical type at compile time,
+without evaluating it. It takes exactly one operand and supports existing value
+expressions: bindings, literals, arithmetic, calls (including inferred generic
+calls), fields, indexing, string slices, constructors, arrays, blocks, conditions,
+matches, loops and inferable closures. Ordinary scope and imported visibility
+rules apply. Literals follow normal inference and defaults: `@TypeOf(1)` is `int`,
+while `@TypeOf(@as(u8, 1))` is `u8`.
 
-This is a bounded type query, not general expression reflection. Literals,
-arithmetic, calls, indexing and runtime field access (`@TypeOf(record.field)`)
-are rejected, as are types/type aliases, generic templates and namespaces as
-operands. In particular, `@TypeOf(f())` is rejected, **not executed**. Looking up
-a binding's type does not evaluate its initializer or read its runtime value,
-mutate it, add a runtime initializer dependency, or introduce closure captures
-or mutable-capture boxing. Querying a reference binding `p` inspects its reference
-descriptor (`&T` or `&mut T`), not its pointee type, without a runtime read.
-Canonical names include `&u8`, `&mut u8`, and `&mut []u8`; native aliases in the
-child type expand as usual. `@TypeOf(p.*)` is unsupported because dereference is
-not a binding operand. Existing scope, borrowing and global-initializer
-restrictions remain unchanged.
+The operand is typechecked, not executed. Calls do not run, assignment does not
+mutate storage, indexing does not perform runtime bounds checks, and arithmetic
+does not perform runtime overflow/division checks. Thus `@TypeOf(f())` reports
+the call result without calling `f`, `@TypeOf(values[999])` can report the element
+type without indexing, and `@TypeOf(1 / 0)` is `int`. Invalid names, operators,
+arguments, literals, match patterns, declarations and reference uses still diagnose.
+Unsupported language features, such as array slicing, do not become available
+inside a query.
+
+Queries do not emit runtime instructions, create loans, capture values, box mutable
+bindings or demand callee bodies/converters. They inspect lexical type metadata,
+so a query may mention an exclusively borrowed owner or a reference from an outer
+closure scope without reading or capturing it. Query-local checks do not change
+the surrounding mutation, control-flow or borrow state. Unspecialized generic
+templates, namespaces and types/type aliases are not value operands; querying a
+generic call with enough constraints is supported. No implicit polymorphism or
+type equality operator is introduced.
+
+For a reference `p`, `@TypeOf(p)` is its descriptor (`&T` or `&mut T`), while
+`@TypeOf(p.*)` is the pointee type. `@TypeOf(&local)` can inspect an inferred
+reference type without borrowing the local. Existing restrictions on actual
+reference copying, rebinding, storage and escape remain unchanged.
 
 The result is a compile-time type, not a first-class runtime value. Use it in
 annotations (including `[]@TypeOf(x)`), exact ascription
@@ -2710,8 +2720,11 @@ Later function parameters and the return type may query earlier named parameters
 including in function types. In inferred generic signatures such as
 ``(x: `T) -> @TypeOf(x)``, the query shares the parameter's inferred type
 constraints; contextual types still take precedence over integer fallback.
-Broader reflection (`@typeInfo`, member enumeration and arbitrary expression
-queries) remains a proposal. See [examples/type-of.nov](examples/type-of.nov).
+Expressions such as ``(x: `T) -> @TypeOf(x + 1)`` share the generic parameter's
+constraints rather than defaulting it prematurely. Broader reflection (`@typeInfo`
+and member enumeration) remains a proposal. See
+[examples/type-of.nov](examples/type-of.nov) and
+[examples/type-of-expressions.nov](examples/type-of-expressions.nov).
 
 ## Primitive Types
 TODO
@@ -3200,7 +3213,7 @@ TODO
 ## Builtins
 ### Functions
 - `@import(path: string)`: Import a nov file. See [Visibility](#Visibility) for which declarations gets imported.
-- `@TypeOf(x)`: Implemented bounded compile-time query of a runtime binding's canonical type; see [Type Queries](#type-queries). Not arbitrary expressions or runtime type values.
+- `@TypeOf(expression)`: Implemented unevaluated compile-time query of an expression's canonical type; see [Type Queries](#type-queries). The operand is typechecked, not executed; the result is not a runtime type value.
 - `@typeInfo(...)`: Proposed type-information reflection; not implemented.
 - `@This()`: Returns the type of the current container
 - `@print(...)`: Output args separated with a space to stdout; returns void. Supports bool, fixed/native integer, f32/f64, raw rune/string and recursive default array/struct/union/enum formatting. Nominal values at any depth prefer an explicit `@[stringify]` method with exact signature `(SelfType) -> string`, called once per encountered value in traversal order and stopping structural recursion. Top-level hooks run immediately after argument evaluation; nested hooks run during traversal. Malformed/inaccessible hooks reject even when nested. Compile-time types emit canonical static name strings. Interpolated strings work like other strings. See the printing contract above.

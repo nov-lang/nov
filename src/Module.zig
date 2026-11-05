@@ -17,6 +17,8 @@ tests_enabled: bool = false,
 /// Query-local recursion guard; inference never publishes partial signatures.
 closure_inference_depth: usize = 0,
 closure_inference_stack: [128]Ast.Node.Index = @splat(0),
+expression_query_depth: usize = 0,
+expression_query_stack: [128]Ast.Node.Index = @splat(0),
 source: Source,
 declarations: std.ArrayList(Declaration) = .empty,
 diagnostics: std.ArrayList(Diagnostic) = .empty,
