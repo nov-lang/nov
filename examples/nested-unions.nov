@@ -1,0 +1,239 @@
+; nov run examples/nested-unions.nov
+; nov test examples/nested-unions.nov
+; Match one layer at a time; .! propagates only the current Option or Result.
+
+let std = @import("std")
+let Option = std.Option
+let Result = std.Result
+
+let Inner = union {
+    some: [][]string,
+    none,
+}
+
+let Outer = union {
+    inner: Inner,
+    none,
+}
+
+let Label = struct {
+    value: string,
+
+    @[stringify]
+    let format: (label: Label) -> string = "Label({label.value})"
+}
+
+let Custom = union {
+    label: Label,
+    none,
+}
+
+let Envelope = union {
+    custom: Custom,
+    none,
+}
+
+let echo: (value: Outer) -> Outer = value
+
+let words: (value: Outer) -> [][]string = match value {
+    .inner => |inner| match inner {
+        .some => |rows| rows
+        .none => @as([][]string, [])
+    }
+    .none => @as([][]string, [])
+}
+
+let optionLayer: (value: Option(Result(int, string))) -> Option(Result(int, string)) = {
+    let inner = value.!
+    .some[inner]
+}
+
+let resultLayer: (value: Result(Option(int), string)) -> Result(Option(int), string) = {
+    let inner = value.!
+    .ok[inner]
+}
+
+let twoOptions: (value: Option(Option(int))) -> Option(int) = {
+    let inner = value.!
+    .some[inner.! + 1]
+}
+
+let twoResults: (value: Result(Result(int, string), string)) -> Result(int, string) = {
+    let inner = value.!
+    .ok[inner.! + 1]
+}
+
+@[test]
+let contextual_constructors_and_single_layer_matches: () = {
+    let value: Outer = .inner[.some[[["hello"], []]]]
+    let bound: Inner = match value {
+        .inner => |inner| inner
+        .none => .none[]
+    }
+    @assert(
+        match bound {
+            .some => |rows| rows[0][0] == "hello" and rows[1].len == 0
+            .none => false
+        }
+    )
+    let optional: Option(Result(int, string)) = .some[.ok[7]]
+    let result: Result(Option(int), string) = .ok[.some[8]]
+    @assert(optional.unwrapOr(.err["missing"]).unwrapOr(0) == 7)
+    @assert(result.unwrapOr(.none[]).unwrapOr(0) == 8)
+    let innerNone: Outer = .inner[.none[]]
+    @assert(words(innerNone).len == 0)
+}
+
+@[test]
+let propagation_preserves_each_family_layer: () = {
+    let good: Option(Result(int, string)) = .some[.ok[3]]
+    let bad: Option(Result(int, string)) = .some[.err["bad"]]
+    let absent: Option(Result(int, string)) = .none[]
+    @assert(optionLayer(good).unwrapOr(.err["missing"]).unwrapOr(0) == 3)
+    @assert(optionLayer(bad).unwrapOr(.ok[0]).isErr())
+    @assert(optionLayer(absent).isNone())
+    let empty: Result(Option(int), string) = .ok[.none[]]
+    let failed: Result(Option(int), string) = .err["failed"]
+    @assert(resultLayer(empty).unwrapOr(.some[9]).isNone())
+    @assert(resultLayer(failed).isErr())
+    @assert(twoOptions(.some[.some[4]]).unwrapOr(0) == 5)
+    @assert(twoOptions(.some[.none[]]).isNone())
+    @assert(twoOptions(.none[]).isNone())
+    @assert(twoResults(.ok[.ok[4]]).unwrapOr(0) == 5)
+    @assert(
+        match twoResults(.ok[.err["inner"]]) {
+            .ok => false
+            .err => |error| error == "inner"
+        }
+    )
+    @assert(
+        match twoResults(.err["outer"]) {
+            .ok => false
+            .err => |error| error == "outer"
+        }
+    )
+}
+
+@[test]
+let recursive_array_storage_is_independent: () = {
+    let mut source: [][]string = [["hel" + "lo"], []]
+    let original: Outer = .inner[.some[source]]
+    let bound = original
+    let mut assigned: Outer = .none[]
+    assigned = original
+    let returned = echo(original)
+    let containers: []Outer = [original, .inner[.none[]], .none[]]
+    source[0] = ["changed"]
+    let mut detached = words(returned)
+    let row = &detached[0]
+    row.*[0] = row.*[0] + "!"
+    @assert(words(original)[0][0] == "hello")
+    @assert(words(bound)[0][0] == "hello")
+    @assert(words(assigned)[0][0] == "hello")
+    @assert(words(returned)[0][0] == "hello")
+    @assert(words(containers[0])[0][0] == "hello")
+    @assert(detached[0][0] == "hello!")
+    let wrapped: Option(Result([][]string, [][]string)) = .some[.err[source]]
+    let saved = wrapped
+    source[0] = ["again"]
+    let mut errors = match saved.unwrapOr(.ok[[]]) {
+        .ok => |rows| rows
+        .err => |rows| rows
+    }
+    errors[0] = ["detached"]
+    @assert(
+        match wrapped.unwrapOr(.ok[[]]) {
+            .ok => false
+            .err => |rows| rows[0][0] == "changed"
+        }
+    )
+}
+
+@[test]
+let closure_snapshots_and_shared_cells: () = {
+    let mut current: Outer = .inner[.some[[["first"]]]]
+    let saved = current
+    let snapshot = () -> Outer {
+        saved
+    }
+    let read = () -> Outer {
+        current
+    }
+    let update = () {
+        let mut rows = words(current)
+        rows[0] = [rows[0][0] + "!"]
+        current = .inner[.some[rows]]
+    }
+    let sameUpdate = update
+    update()
+    sameUpdate()
+    @assert(words(read())[0][0] == "first!!")
+    @assert(words(snapshot())[0][0] == "first")
+    let mut detached = words(snapshot())
+    detached[0] = ["changed"]
+    @assert(words(snapshot())[0][0] == "first")
+    current = .none[]
+    @assert(words(read()).len == 0)
+    @assert(words(snapshot())[0][0] == "first")
+}
+
+@[test]
+let mapping_and_search_produce_nested_unions: () = {
+    let bad: Result(int, string) = .err["bad"]
+    let mapped: Result(int, Option(int)) = bad.mapErr(
+        (error) {
+            @assert(error == "bad")
+            Option(int).some[3]
+        }
+    )
+    @assert(
+        match mapped {
+            .ok => false
+            .err => |inner| inner.unwrapOr(0) == 3
+        }
+    )
+    let present: Option(int) = .some[4]
+    let nested: Option(Result(int, string)) = present.map(
+        (value) {
+            Result(int, string).ok[value]
+        }
+    )
+    @assert(nested.unwrapOr(.err["missing"]).unwrapOr(0) == 4)
+    let items: []Outer = [.none[], .inner[.some[[["found"]]]]]
+    let found: Option(Outer) = std.array.find(
+        items,
+        (value) {
+            words(value).len != 0
+        }
+    )
+    @assert(words(found.unwrapOr(.none[]))[0][0] == "found")
+}
+
+@[test]
+let nested_stringify_and_inactive_payloads: () = {
+    let value: Outer = .inner[.some[[["hello"], []]]]
+    @assert("{value}" == "Outer.inner[Inner.some[[[hello], []]]]")
+    let custom: Envelope = .custom[.label[Label[ .value = "nested" ]]]
+    @assert("{custom}" == "Envelope.custom[Custom.label[ Label(nested) ]]")
+    let absent: Outer = .none[]
+    let innerAbsent: Outer = .inner[.none[]]
+    let copied = echo(absent)
+    let inactive: Envelope = .none[]
+    @assert("{copied}" == "Outer.none")
+    @assert("{innerAbsent}" == "Outer.inner[Inner.none]")
+    @assert("{inactive}" == "Envelope.none")
+    let missing: Option(Result([][]string, [][]string)) = .none[]
+    let snapshot = () -> Option(Result([][]string, [][]string)) {
+        missing
+    }
+    @assert(snapshot().isNone())
+}
+
+let main: () = {
+    let value: Outer = .inner[.some[[["hello"], []]]]
+    let none: Outer = .none[]
+    let custom: Envelope = .custom[.label[Label[ .value = "nested" ]]]
+    @println(value)
+    @println(none)
+    @println(custom)
+}

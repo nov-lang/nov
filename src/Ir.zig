@@ -1570,10 +1570,10 @@ pub fn isManaged(ty: Type) bool {
     return ty == .array or ty == .string or ty == .record;
 }
 
-/// Untagged records retain nominal identity as union payloads. Layout graph
-/// validation independently rejects cycles and excessive by-value depth.
+/// Direct nested unions retain nominal identity. Layout graph validation
+/// independently rejects cycles and excessive by-value depth.
 pub fn isUnionPayload(ty: Type) bool {
-    return isRecordField(ty) or ty == .void;
+    return isRecordField(ty) or ty == .void or ty == .record;
 }
 
 /// Query the layout DAG, visiting scalar diamonds only once. Closure values
@@ -1815,7 +1815,9 @@ test "record payload layouts reject tagged fields and forged nominal operands" {
     try ir.setRecordFields(u, &.{.{ .name = "nested", .ty = array, .span = span }});
     try std.testing.expect(try ir.needsArrayCopy(u));
     try ir.setRecordFields(u, &.{.{ .name = "ok", .ty = r, .span = span }});
-    try std.testing.expectError(error.InvalidArrayElement, ir.setRecordFields(u, &.{.{ .name = "nested", .ty = u, .span = span }}));
+    try ir.setRecordFields(u, &.{.{ .name = "nested", .ty = u, .span = span }});
+    try std.testing.expectError(error.CyclicRecordLayout, ir.verify());
+    try ir.setRecordFields(u, &.{.{ .name = "ok", .ty = r, .span = span }});
     const sig = try ir.internType(.{ .function = .{ .params = &.{other}, .result = u } });
     const f = try ir.addFunction("f", sig, span);
     const body = [_]Instruction{
@@ -1830,7 +1832,7 @@ test "record payload layouts reject tagged fields and forged nominal operands" {
     try std.testing.expectError(error.InvalidArrayElement, ir.verify());
     fields[0].ty = text;
     ir.types.items[@backingInt(r)].record.tagged = true;
-    try std.testing.expectError(error.InvalidArrayElement, ir.verify());
+    try ir.verify();
     ir.types.items[@backingInt(r)].record.tagged = false;
     try ir.verify();
 }
@@ -1855,7 +1857,7 @@ test "array union payload IR accepts storable elements and rejects forged cycles
     }
     const fields = @constCast(ir.types.items[@backingInt(u)].record.fields);
     const saved = fields[0].ty;
-    for ([_]TypeId{ reference, signature, range, u }) |unsupported| {
+    for ([_]TypeId{ reference, signature, range }) |unsupported| {
         fields[0].ty = unsupported;
         try std.testing.expectError(error.InvalidArrayElement, ir.verify());
     }
@@ -1865,6 +1867,32 @@ test "array union payload IR accepts storable elements and rejects forged cycles
     ir.types.items[@backingInt(inner)] = .{ .array = reference };
     try std.testing.expectError(error.InvalidArrayElement, ir.verify());
     ir.types.items[@backingInt(inner)] = original;
+    try ir.verify();
+}
+
+test "nestedunion IR membership finite layouts and forged recursive graphs" {
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    const span: Span = .{ .start = 0, .end = 0 };
+    const unit = try ir.internType(.void);
+    const text = try ir.internType(.string);
+    const outer = try ir.internType(.{ .record = .{ .identity = 901, .tagged = true, .fields = &.{} } });
+    const inner = try ir.internType(.{ .record = .{ .identity = 902, .tagged = true, .fields = &.{} } });
+    const array = try ir.internType(.{ .array = text });
+    try ir.setRecordFields(inner, &.{ .{ .name = "some", .ty = array, .span = span }, .{ .name = "none", .ty = unit, .span = span } });
+    try ir.setRecordFields(outer, &.{.{ .name = "inner", .ty = inner, .span = span }});
+    try std.testing.expect(isUnionPayload(ir.getType(inner).?));
+    try std.testing.expect(!isRecordField(ir.getType(inner).?));
+    try std.testing.expect(try ir.needsArrayCopy(outer));
+    try ir.verify();
+    const fields = @constCast(ir.types.items[@backingInt(inner)].record.fields);
+    fields[0].ty = outer;
+    try std.testing.expectError(error.CyclicRecordLayout, ir.verify());
+    fields[0].ty = inner;
+    try std.testing.expectError(error.CyclicRecordLayout, ir.verify());
+    fields[0].ty = try ir.internType(.{ .array = outer });
+    try std.testing.expectError(error.CyclicRecordLayout, ir.verify());
+    fields[0].ty = array;
     try ir.verify();
 }
 

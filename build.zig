@@ -157,6 +157,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const union_array_tests = b.step("test-cli-union-arrays", "Run direct union array payload CLI tests");
     addUnionArrayCliTests(b, exe, union_array_tests);
     test_step.dependOn(union_array_tests);
+    const nested_union_tests = b.step("test-cli-nested-unions", "Run finite acyclic nested union CLI tests");
+    addNestedUnionCliTests(b, exe, nested_union_tests);
+    test_step.dependOn(nested_union_tests);
     const printing_tests = b.step("test-cli-printing", "Run type and aggregate printing CLI tests");
     addPrintingCliTests(b, exe, printing_tests);
     test_step.dependOn(printing_tests);
@@ -2721,7 +2724,7 @@ fn addUnionArrayCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step:
         .{ .name = "mutually-recursive", .source = "let U=union{items:[]R,none,}\nlet R=struct{values:[]U,}\nlet main:()={}", .diagnostic = "cyclic" },
         .{ .name = "recursive-nested-array", .source = "let U=union{items:[][]U,none,}\nlet main:()={}", .diagnostic = "cyclic" },
         .{ .name = "recursive-generic", .source = "let G:(T:type)->type=union{items:[]G(T),none,}\nlet f:(x:G(int))={}", .diagnostic = "cyclic" },
-        .{ .name = "direct-nested-union", .source = "let Inner=union{none,}\nlet U=union{value:Inner,}\nlet f:(x:U)={}", .diagnostic = "not supported" },
+        .{ .name = "nested-function", .source = "let Inner=union{value:()->int,none,}\nlet U=union{value:Inner,}\nlet f:(x:U)={}", .diagnostic = "not supported" },
         .{ .name = "direct-function", .source = "let U=union{value:()->int,}\nlet f:(x:U)={}", .diagnostic = "not supported" },
         .{ .name = "direct-range", .source = "let U=union{value:@TypeOf(1..3),}\nlet f:(x:U)={}", .diagnostic = "not supported" },
         .{ .name = "array-void", .source = "let U=union{items:[]void,}\nlet f:(x:U)={}", .diagnostic = "not supported" },
@@ -2736,6 +2739,116 @@ fn addUnionArrayCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step:
         _ = fixtures.add(source, case.source);
         const check = b.addRunArtifact(exe);
         check.step.name = b.fmt("CLI union arrays: reject {s}", .{case.name});
+        check.setCwd(fixtures.getDirectory());
+        check.addArgs(&.{ "check", "--semantic", source, "--lib-dir" });
+        check.addDirectoryArg(library);
+        check.expectExitCode(1);
+        check.expectStdOutEqual("");
+        check.expectStdErrMatch(".nov:");
+        check.expectStdErrMatch("error:");
+        check.expectStdErrMatch(case.diagnostic);
+        test_step.dependOn(&check.step);
+    }
+}
+
+fn addNestedUnionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    const fixtures = b.addWriteFiles();
+    const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
+    const aliases_source =
+        \\let standard = @import("std")
+        \\let option = @import("lib/./option.nov")
+        \\let result = @import("lib/result.nov")
+        \\let api = @import("api.nov")
+        \\let verify: () = {
+        \\    let value: api.Nested = .some[.ok[7]]
+        \\    let canonical: standard.Option(result.Result(int, string)) = value
+        \\    let direct: option.Option(standard.Result(int, string)) = canonical
+        \\    @assert(direct.unwrapOr(.err["missing"]).unwrapOr(0) == 7)
+        \\    let reverse: api.Reverse = .ok[.some[8]]
+        \\    let same: result.Result(option.Option(int), string) = reverse
+        \\    @assert(same.unwrapOr(.none[]).unwrapOr(0) == 8)
+        \\}
+        \\@[test]
+        \\let imported_nested_aliases_are_canonical: () = verify()
+        \\let main: () = verify()
+        \\
+    ;
+    const api_source =
+        \\let standard = @import("std")
+        \\let option = @import("lib/option.nov")
+        \\let result = @import("lib/./result.nov")
+        \\@[public]
+        \\let Nested = option.Option(standard.Result(int, string))
+        \\@[public]
+        \\let Reverse = result.Result(standard.Option(int), string)
+        \\
+    ;
+    _ = fixtures.add("nested-unions.nov", @embedFile("examples/nested-unions.nov"));
+    _ = fixtures.add("aliases.nov", aliases_source);
+    _ = fixtures.add("api.nov", api_source);
+    const package = b.addWriteFiles();
+    const installed_exe = package.addCopyFile(exe.getEmittedBin(), b.fmt("bin/{s}", .{exe.out_filename}));
+    _ = package.addCopyDirectory(b.path("lib"), "lib/nov", .{});
+    _ = package.add("nested-unions.nov", @embedFile("examples/nested-unions.nov"));
+    _ = package.add("aliases.nov", std.mem.replaceOwned(u8, b.allocator, aliases_source, "lib/", "lib/nov/") catch @panic("OOM"));
+    _ = package.add("api.nov", std.mem.replaceOwned(u8, b.allocator, api_source, "lib/", "lib/nov/") catch @panic("OOM"));
+    const expected_tests = "PASS contextual_constructors_and_single_layer_matches\nPASS propagation_preserves_each_family_layer\nPASS recursive_array_storage_is_independent\nPASS closure_snapshots_and_shared_cells\nPASS mapping_and_search_produce_nested_unions\nPASS nested_stringify_and_inactive_payloads\n6 passed; 0 failed; 6 total\n";
+    for ([_]bool{ false, true }) |installed| {
+        for ([_][]const u8{ "nested-unions.nov", "aliases.nov", "api.nov" }) |source| {
+            for ([_][]const u8{ "fmt", "semantic", "run", "test" }) |command| {
+                const execute = std.mem.eql(u8, command, "run") or std.mem.eql(u8, command, "test");
+                if (execute and std.mem.eql(u8, source, "api.nov")) continue;
+                const modes: []const []const u8 = if (execute) &.{ "", "--debug", "--release" } else &.{""};
+                for (modes) |mode| {
+                    const run = if (installed) std.Build.Step.Run.create(b, "CLI nested unions: relocated install") else b.addRunArtifact(exe);
+                    run.step.name = b.fmt("CLI nested unions: {s} {s} {s} (installed={})", .{ command, source, mode, installed });
+                    if (installed) run.addFileArg(installed_exe);
+                    run.setCwd(if (installed) package.getDirectory() else fixtures.getDirectory());
+                    run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+                    run.setEnvironmentVariable("NOV_CC", "");
+                    run.setEnvironmentVariable("CC", "");
+                    if (std.mem.eql(u8, command, "fmt")) {
+                        run.addArgs(&.{ "fmt", "--check", source });
+                    } else if (std.mem.eql(u8, command, "semantic")) {
+                        run.addArgs(&.{ "check", "--semantic", source });
+                    } else {
+                        run.addArgs(&.{ command, source });
+                        if (mode.len != 0) run.addArg(mode);
+                    }
+                    if (!installed and !std.mem.eql(u8, command, "fmt")) {
+                        run.addArg("--lib-dir");
+                        run.addDirectoryArg(library);
+                    }
+                    const example = std.mem.eql(u8, source, "nested-unions.nov");
+                    const is_test = std.mem.eql(u8, command, "test");
+                    run.expectExitCode(0);
+                    run.expectStdOutEqual(if (execute) (if (example) (if (is_test) expected_tests else "Outer.inner[Inner.some[[[hello], []]]]\nOuter.none\nEnvelope.custom[Custom.label[ Label(nested) ]]\n") else if (is_test) "PASS imported_nested_aliases_are_canonical\n1 passed; 0 failed; 1 total\n" else "") else "");
+                    run.expectStdErrEqual("");
+                    test_step.dependOn(&run.step);
+                }
+            }
+        }
+    }
+    for ([_]struct { name: []const u8, source: []const u8, diagnostic: []const u8 }{
+        .{ .name = "direct-cycle", .source = "let U=union{inner:U,none,}\nlet f:(x:U)={}", .diagnostic = "cyclic" },
+        .{ .name = "nested-array-cycle", .source = "let U=union{inner:V,none,}\nlet V=union{items:[]U,none,}\nlet f:(x:U)={}", .diagnostic = "cyclic" },
+        .{ .name = "generic-array-cycle", .source = "let U=union{inner:std.Option([]U),none,}\nlet f:(x:U)={}", .diagnostic = "cyclic" },
+        .{ .name = "nominal-inner", .source = "let A=union{some:int,none,}\nlet B=union{some:int,none,}\nlet U=union{inner:A,}\nlet b:B=.some[1]\nlet f:()->U=.inner[b]", .diagnostic = "error:" },
+        .{ .name = "nested-error-exact", .source = "let A=union{bad:int,}\nlet B=union{bad:int,}\nlet f:(x:std.Result(int,std.Option(A)))->std.Result(int,std.Option(B))=.ok[x.!]", .diagnostic = "error:" },
+        .{ .name = "nested-error-element", .source = "let f:(x:std.Result(int,std.Option(int)))->std.Result(int,std.Option(bool))=.ok[x.!]", .diagnostic = "error:" },
+        .{ .name = "option-to-result", .source = "let f:(x:std.Option(std.Result(int,string)))->std.Result(int,string)=x.!", .diagnostic = "error:" },
+        .{ .name = "result-to-option", .source = "let f:(x:std.Result(std.Option(int),string))->std.Option(int)=x.!", .diagnostic = "error:" },
+        .{ .name = "struct-union-field", .source = "let Inner=union{some:int,none,}\nlet S=struct{inner:Inner,}\nlet U=union{record:S,none,}\nlet f:(x:U)={}", .diagnostic = "not supported" },
+        .{ .name = "nested-function", .source = "let Inner=union{value:()->int,none,}\nlet U=union{inner:Inner,none,}\nlet f:(x:U)={}", .diagnostic = "not supported" },
+        .{ .name = "nested-range", .source = "let Inner=union{value:@TypeOf(1..3),none,}\nlet U=union{inner:Inner,none,}\nlet f:(x:U)={}", .diagnostic = "not supported" },
+        .{ .name = "nested-reference", .source = "let Inner=union{value:&int,none,}\nlet U=union{inner:Inner,none,}\nlet f:(x:U)={}", .diagnostic = "not supported" },
+        .{ .name = "nested-reference-array", .source = "let Inner=union{items:[]&int,none,}\nlet U=union{inner:Inner,none,}\nlet f:(x:U)={}", .diagnostic = "references cannot escape" },
+        .{ .name = "reference-escape", .source = "let bad:()->&int={let mut value=1\n&value}\nlet main:()={}", .diagnostic = "reference" },
+    }) |case| {
+        const source = b.fmt("invalid-nested-union-{s}.nov", .{case.name});
+        _ = fixtures.add(source, b.fmt("let std=@import(\"std\")\n{s}\n", .{case.source}));
+        const check = b.addRunArtifact(exe);
+        check.step.name = b.fmt("CLI nested unions: reject {s}", .{case.name});
         check.setCwd(fixtures.getDirectory());
         check.addArgs(&.{ "check", "--semantic", source, "--lib-dir" });
         check.addDirectoryArg(library);
@@ -3235,7 +3348,7 @@ fn addArraySearchCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step
         .{ .name = "index-result", .expression = "std.array.findIndex(@as([]int,[1]),(x:int)->int{x})", .diagnostic = "constraints require exactly identical types" },
         .{ .name = "each-nonvoid", .expression = "std.array.each(@as([]int,[1]),(x:int)->int{x})", .diagnostic = "constraints require exactly identical types" },
         .{ .name = "find-array-parameter", .expression = "std.array.find(@as([][]int,[[1]]),(x:int)->bool{true})", .diagnostic = "constraints require exactly identical types" },
-        .{ .name = "find-union", .expression = "std.array.find(@as([]Payload,[.none[]]),yes)", .diagnostic = "not supported" },
+        .{ .name = "find-union-function-payload", .expression = "std.array.find(@as([]Payload,[.none[]]),yes)", .diagnostic = "not supported" },
         .{ .name = "find-function", .expression = "std.array.find([()->int{1}],yes)", .diagnostic = "not supported" },
         .{ .name = "find-range", .expression = "std.array.find([1..3],yes)", .diagnostic = "not supported" },
         .{ .name = "any-empty", .expression = "std.array.any([],yes)", .diagnostic = "provide typed runtime arguments" },
@@ -3245,7 +3358,7 @@ fn addArraySearchCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step
         .{ .name = "each-empty", .expression = "std.array.each([],(x:`T)->void{})", .diagnostic = "provide typed runtime arguments" },
     }) |case| {
         const source = b.fmt("invalid-array-search-{s}.nov", .{case.name});
-        _ = fixtures.add(source, b.fmt("let std=@import(\"std\")\nlet Payload=union{{none,}}\nlet yes:(x:`T)->bool=true\nlet main:()={{let result={s}\n}}\n", .{case.expression}));
+        _ = fixtures.add(source, b.fmt("let std=@import(\"std\")\nlet Payload=union{{{s}none,}}\nlet yes:(x:`T)->bool=true\nlet main:()={{let result={s}\n}}\n", .{ if (std.mem.eql(u8, case.name, "find-union-function-payload")) "callback:()->int," else "", case.expression }));
         const check = b.addRunArtifact(exe);
         check.step.name = b.fmt("CLI array search: reject {s}", .{case.name});
         check.setCwd(fixtures.getDirectory());
@@ -3405,7 +3518,7 @@ fn addContainerMapCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_ste
         .{ .name = "error-void-output", .source = "let x:std.Result(int,string)=.err[\"bad\"]\nlet y=x.mapErr((v)->void{})", .diagnostic = "[] for void" },
         .{ .name = "option-array-output-conflict", .source = "let x:std.Option(int)=.some[1]\nlet y:std.Option([]bool)=x.map((v){[v]})", .diagnostic = "error:" },
         .{ .name = "result-function-output", .source = "let x:std.Result(int,string)=.ok[1]\nlet y=x.map((v){()->int{v}})", .diagnostic = "not supported" },
-        .{ .name = "error-union-output", .source = "let x:std.Result(int,string)=.err[\"bad\"]\nlet y=x.mapErr((v){std.Option(int).some[1]})", .diagnostic = "not supported" },
+        .{ .name = "error-function-output", .source = "let x:std.Result(int,string)=.err[\"bad\"]\nlet y=x.mapErr((v){()->string{v}})", .diagnostic = "not supported" },
     }) |case| {
         const source = b.fmt("invalid-container-map-{s}.nov", .{case.name});
         _ = fixtures.add(source, b.fmt("let std=@import(\"std\")\nlet main:()={{\n{s}\n}}\n", .{case.source}));

@@ -1262,7 +1262,7 @@ let z = [ 10, 20, 30 ]
 Ordinary module declarations such as `let Value = union { number: int, text: string, empty, }`
 introduce nominal tagged value types. Separate declarations remain distinct; aliases
 preserve identity. The current executable subset supports bool, integer, float, rune, string,
-void, enum, array, and existing acyclic nominal struct payloads, with no payload defaults. As with structs, integer fields are
+void, enum, array, nested union, and existing acyclic nominal struct payloads, with no payload defaults. As with structs, integer fields are
 checked semantically through 128 bits, while reachable C layouts require
 8/16/32/64-bit widths.
 
@@ -1297,7 +1297,18 @@ checked semantically through 128 bits, while reachable C layouts require
   closure elements share existing environments. Recursive layouts, including
   cycles through array elements, remain rejected. See
   [`examples/union-arrays.nov`](examples/union-arrays.nov).
-- Explicit tag enums, direct nested-union/function/range/reference payloads, variant-pattern
+- Nested union payloads retain exact nominal types, including `Option(Result(T, E))`
+  and `Result(Option(T), E)`. Contextual constructors nest, for example
+  `.some[.ok[[1, 2]]]` under an expected `Option(Result([]int, string))`.
+  Match or propagate one layer at a time; `.!` does not recursively unwrap or
+  convert between Option and Result. Copies recursively detach array backing
+  through active tags only. Active tag chains are validated before allocating
+  copies or running formatters, and inactive by-value fields are zeroed.
+  Default formatting retains inner union tags (`Outer.inner[Inner.some[...]]`),
+  honoring nested `@[stringify]` hooks. Direct unions in struct fields and recursive
+  layouts are still unsupported. See
+  [`examples/nested-unions.nov`](examples/nested-unions.nov).
+- Explicit tag enums, direct function/range/reference payloads, variant-pattern
   alternatives, nested destructuring, direct payload field access, union equality
   and union globals remain unsupported.
 
@@ -1643,8 +1654,8 @@ array.each([1, 2, 3], (x) { @println(x) })
 
 `find` requires an element type supported as an `Option` payload: bool, integers,
 floats, runes, strings, enums and supported acyclic records (including array
-fields), and arrays (including nested arrays). Direct unions, functions and
-ranges are not yet union payloads; use `findIndex` for those element types. The other helpers accept all supported
+fields), arrays (including nested arrays), and unions. Direct function and range
+payloads remain unsupported; use `findIndex` for those element types. The other helpers accept all supported
 array element types. `find` returns a value, not a reference to source storage.
 See [`examples/array-search.nov`](examples/array-search.nov) for a runnable example
 and seven tests.
@@ -1824,7 +1835,7 @@ let main: () -> void = {
   closure environment/captured cells, not a deep-cloned closure; immutable capture
   snapshots and mutable shared-cell capture rules are unchanged. Range elements
   copy bounds and inclusivity by value. Union payloads may be arrays, but direct
-  union/function/range/reference payloads remain unsupported.
+  function/range/reference payloads remain unsupported; nested union payloads work.
   Immutable arrays
   cannot have their elements changed. Parameters are immutable; copy into a
   mutable local to edit them.

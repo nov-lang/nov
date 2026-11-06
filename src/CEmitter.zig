@@ -363,6 +363,7 @@ fn write(allocator: std.mem.Allocator, ir: *const Ir, origins: []const ?Origin, 
         if (count == 0) try w.writeAll("NULL") else try w.print("nov_element_offsets_{d}", .{t});
         try w.writeAll(" };\n");
     }
+    try writePayloadChecks(allocator, ir, copy_types, w);
     try writeCopyHelpers(ir, copy_types, root_counts, w);
     if (ir.functions.items.len == 0) return;
     try w.writeByte('\n');
@@ -1211,6 +1212,9 @@ fn usesArrayContains(ir: *const Ir, element: Ir.TypeId) bool {
 
 fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const usize, w: *std.Io.Writer, function: Ir.Function) (WriteError || std.mem.Allocator.Error)!void {
     const signature = ir.types.items[@backingInt(function.ty)].function;
+    for (signature.params, 0..) |param, p| {
+        if (ir.getType(param).? == .record) try w.print("    p{d} = nov_check_{d}(p{d});\n", .{ p, @backingInt(param), p });
+    }
     const body = function.body.?;
     const transfers = try ArrayTransfers.init(allocator, ir, body);
     defer transfers.deinit(allocator);
@@ -1908,6 +1912,87 @@ fn markCopyTypes(allocator: std.mem.Allocator, ir: *const Ir, copied: []bool) st
     }
 }
 
+// Check only active payloads, before any allocating copy or formatting walk.
+// Normalized by-value records keep every inactive descriptor slot zero.
+fn writePayloadChecks(allocator: std.mem.Allocator, ir: *const Ir, copy_types: []const bool, w: *std.Io.Writer) (WriteError || std.mem.Allocator.Error)!void {
+    const checked = try allocator.alloc(bool, ir.types.items.len);
+    defer allocator.free(checked);
+    const converted = try allocator.alloc(bool, ir.types.items.len);
+    defer allocator.free(converted);
+    _ = markFormattingTypes(ir, checked, converted);
+    for (checked, copy_types) |*check, copy| check.* = check.* or copy;
+    for (ir.functions.items) |function| {
+        if (function.body == null) continue;
+        for (ir.getType(function.ty).?.function.params) |param| {
+            if (ir.getType(param).? == .record) checked[@backingInt(param)] = true;
+        }
+    }
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (ir.types.items, checked) |ty, check| {
+            if (!check) continue;
+            if (ty == .array) {
+                if (!checked[@backingInt(ty.array)]) {
+                    checked[@backingInt(ty.array)] = true;
+                    changed = true;
+                }
+            } else if (ty == .record) {
+                for (ty.record.fields) |field| {
+                    if (!checked[@backingInt(field.ty)]) {
+                        checked[@backingInt(field.ty)] = true;
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+    for (ir.types.items, checked, 0..) |ty, check, t| {
+        if (!check or (ty != .record and ty != .array)) continue;
+        const id: Ir.TypeId = @fromBackingInt(@intCast(t));
+        try w.writeAll("static inline ");
+        try writeType(ir, w, id);
+        try w.print(" nov_check_{d}(", .{t});
+        try writeType(ir, w, id);
+        try w.writeAll(" value);\n");
+    }
+    for (ir.types.items, checked, 0..) |ty, check, t| {
+        if (!check or (ty != .record and ty != .array)) continue;
+        const id: Ir.TypeId = @fromBackingInt(@intCast(t));
+        try w.writeAll("static inline ");
+        try writeType(ir, w, id);
+        try w.print(" nov_check_{d}(", .{t});
+        try writeType(ir, w, id);
+        try w.writeAll(" value) {\n");
+        if (ty == .array) {
+            const element = ir.getType(ty.array).?;
+            if (element == .record or element == .array) {
+                try w.writeAll("    for (uintptr_t i = 0; i < value.len; ++i) (void)nov_check_");
+                try w.print("{d}(((const ", .{@backingInt(ty.array)});
+                try writeType(ir, w, ty.array);
+                try w.writeAll(" *)value.data)[i]);\n");
+            }
+            try w.writeAll("    return value;\n}\n");
+            continue;
+        }
+        try w.writeAll("    ");
+        try writeType(ir, w, id);
+        try w.writeAll(" result = {0};\n");
+        if (ty.record.tagged) try w.writeAll("    result.tag = value.tag;\n    switch (value.tag) {\n");
+        for (ty.record.fields, 0..) |field, f| {
+            if (ty.record.tagged) try w.print("    case {d}:\n", .{f});
+            const ft = ir.getType(field.ty).?;
+            if (ft != .void) {
+                try w.print("    result.f{d} = ", .{f});
+                if (ft == .record or ft == .array) try w.print("nov_check_{d}(value.f{d});\n", .{ @backingInt(field.ty), f }) else try w.print("value.f{d};\n", .{f});
+            }
+            if (ty.record.tagged) try w.writeAll("    break;\n");
+        }
+        if (ty.record.tagged) try w.writeAll("    default: nov_rt_panic(\"invalid union tag\");\n    }\n");
+        try w.writeAll("    (void)value;\n    return result;\n}\n");
+    }
+}
+
 // Unproven values retain eager recursive copies for independent value storage.
 // Fresh-temp transfers below do not introduce shared backing or COW.
 fn writeCopyHelpers(ir: *const Ir, copy_types: []const bool, counts: []const usize, w: *std.Io.Writer) WriteError!void {
@@ -1927,7 +2012,7 @@ fn writeCopyHelpers(ir: *const Ir, copy_types: []const bool, counts: []const usi
         try writeType(ir, w, id);
         try w.print(" nov_copy_{d}(", .{i});
         try writeType(ir, w, id);
-        try w.writeAll(" p0) {\n    ");
+        try w.print(" p0) {{\n    p0 = nov_check_{d}(p0);\n    ", .{i});
         try writeType(ir, w, id);
         try w.writeAll(" v0 = p0;\n    void **roots[] = {");
         try writeRoots(ir, counts, w, id, "p", 0);
@@ -1935,6 +2020,13 @@ fn writeCopyHelpers(ir: *const Ir, copy_types: []const bool, counts: []const usi
         try w.print(" }};\n    nov_gc_roots frame = {{0}};\n    nov_gc_push(&nov_rt_heap, &frame, roots, {d});\n", .{counts[i] * 2});
         if (ty == .array) {
             try w.print("    v0 = nov_array_clone(p0, &nov_element_{d});\n", .{@backingInt(ty.array)});
+            if (ir.getType(ty.array).? == .record) {
+                try w.writeAll("    for (uintptr_t j = 0; j < v0.len; ++j) ((");
+                try writeType(ir, w, ty.array);
+                try w.print(" *)v0.data)[j] = nov_check_{d}(((", .{@backingInt(ty.array)});
+                try writeType(ir, w, ty.array);
+                try w.writeAll(" *)v0.data)[j]);\n");
+            }
             if (try ir.needsArrayCopy(ty.array)) {
                 try w.writeAll("    for (uintptr_t j = 0; j < v0.len; ++j) {\n        ");
                 try writeType(ir, w, ty.array);
@@ -3011,6 +3103,7 @@ fn writeAggregateFormatting(allocator: std.mem.Allocator, ir: *const Ir, counts:
         try w.print("static void nov_format_{d}(nov_format_sink *sink, ", .{t});
         try writeType(ir, w, @fromBackingInt(@intCast(t)));
         try w.writeAll(" value, bool named) {\n    (void)value; (void)named;\n");
+        if (ty == .record or ty == .array) try w.print("    value = nov_check_{d}(value);\n", .{t});
         const id: Ir.TypeId = @fromBackingInt(@intCast(t));
         if (formatHook(ir, id)) |hook| {
             // Validate tags before calling user code, including overriding hooks.
@@ -6466,6 +6559,153 @@ fn arrayPayloadTestLibrary() ![]u8 {
     const library = try emit(test_gpa, &ir, null);
     defer test_gpa.free(library);
     return std.mem.concat(test_gpa, u8, &.{ library, aliases.written() });
+}
+
+fn nestedUnionTestLibrary() ![]u8 {
+    var ir = Ir.init(test_gpa);
+    defer ir.deinit();
+    const span: Ir.Span = .{ .start = 0, .end = 0 };
+    const unit = try ir.internType(.void);
+    const text = try ir.internType(.string);
+    // Deliberately reserve the parent first to exercise topological layouts.
+    const outer = try ir.internType(.{ .record = .{ .identity = 910, .tagged = true, .fields = &.{} } });
+    const inner = try ir.internType(.{ .record = .{ .identity = 911, .tagged = true, .fields = &.{} } });
+    const strings = try ir.internType(.{ .array = text });
+    const rows = try ir.internType(.{ .array = strings });
+    try ir.setRecordFields(inner, &.{ .{ .name = "some", .ty = rows, .span = span }, .{ .name = "none", .ty = unit, .span = span } });
+    try ir.setRecordFields(outer, &.{ .{ .name = "inner", .ty = inner, .span = span }, .{ .name = "other", .ty = inner, .span = span }, .{ .name = "none", .ty = unit, .span = span } });
+    try ir.setTypeFormatting(outer, "Outer", null);
+    try ir.setTypeFormatting(inner, "Inner", null);
+    const outers = try ir.internType(.{ .array = outer });
+    const p: Ir.ValueId = @fromBackingInt(@intCast(0));
+    for ([_]Ir.TypeId{ outer, outers }, [_][]const u8{ "nestedcopy", "nestedarraycopy" }) |ty, name| {
+        const sig = try ir.internType(.{ .function = .{ .params = &.{ty}, .result = ty } });
+        const f = try ir.addFunction(name, sig, span);
+        try ir.setFunctionBody(f, &.{ .{ .ty = ty, .span = span, .op = .{ .parameter = 0 } }, .{ .ty = ty, .span = span, .op = .{ .array_clone = p } } }, @fromBackingInt(@intCast(1)));
+    }
+    const show_sig = try ir.internType(.{ .function = .{ .params = &.{outer}, .result = unit } });
+    const show = try ir.addFunction("nestedshow", show_sig, span);
+    try ir.setFunctionBody(show, &.{ .{ .ty = outer, .span = span, .op = .{ .parameter = 0 } }, .{ .ty = unit, .span = span, .op = .{ .print = .{ .args = &.{p}, .newline = true } } } }, @fromBackingInt(@intCast(1)));
+    const concat_sig = try ir.internType(.{ .function = .{ .params = &.{ text, text }, .result = text } });
+    const concat = try ir.addFunction("nestedconcat", concat_sig, span);
+    try ir.setFunctionBody(concat, &.{
+        .{ .ty = text, .span = span, .op = .{ .parameter = 0 } },
+        .{ .ty = text, .span = span, .op = .{ .parameter = 1 } },
+        .{ .ty = text, .span = span, .op = .{ .binary = .{ .op = .add, .lhs = p, .rhs = @fromBackingInt(@intCast(1)) } } },
+    }, @fromBackingInt(@intCast(2)));
+    var aliases = std.Io.Writer.Allocating.init(test_gpa);
+    defer aliases.deinit();
+    try aliases.writer.writeAll("typedef ");
+    try writeType(&ir, &aliases.writer, outer);
+    try aliases.writer.writeAll(" Outer;\ntypedef ");
+    try writeType(&ir, &aliases.writer, inner);
+    try aliases.writer.print(" Inner;\n#define NESTED_TEXT nov_element_{d}\n#define NESTED_ROW nov_element_{d}\n#define NESTED_OUTER nov_element_{d}\n", .{ @backingInt(text), @backingInt(strings), @backingInt(outer) });
+    const library = try emit(test_gpa, &ir, null);
+    defer test_gpa.free(library);
+    return std.mem.concat(test_gpa, u8, &.{ library, aliases.written() });
+}
+
+test "nestedunion source free active deep copies precise descriptors forced GC O0 O3" {
+    const library = try nestedUnionTestLibrary();
+    defer test_gpa.free(library);
+    const driver =
+        \\int main(void) {
+        \\ nov_rt_heap.collect_every_allocation=1;
+        \\ Outer a={0}, b={0}; nov_array values={0}, copied={0};
+        \\ void **roots[]={&a.f0.f0.data,&b.f0.f0.data,&values.data,&copied.data};
+        \\ nov_gc_roots frame={0};nov_gc_push(&nov_rt_heap,&frame,roots,4);
+        \\ if(NESTED_OUTER.pointer_count!=2 || NESTED_OUTER.pointer_offsets[0]!=offsetof(Outer,f0.f0.data) || NESTED_OUTER.pointer_offsets[1]!=offsetof(Outer,f1.f0.data)) return 10;
+        \\ a.f0.f0=nov_array_new(1,1,&NESTED_ROW);
+        \\ ((nov_array*)a.f0.f0.data)[0]=nov_array_new(1,1,&NESTED_TEXT);
+        \\ ((nov_string*)((nov_array*)a.f0.f0.data)[0].data)[0]=nov_nestedconcat((nov_string){NULL,(const unsigned char*)"a",1},(nov_string){NULL,(const unsigned char*)"b",1});
+        \\ a.f1.tag=99;
+        \\ b=nov_nestedcopy(a);
+        \\ if(a.f0.f0.data==b.f0.f0.data || ((nov_array*)a.f0.f0.data)[0].data==((nov_array*)b.f0.f0.data)[0].data || b.f1.tag || b.f1.f0.data) return 11;
+        \\ values=nov_array_new(2,2,&NESTED_OUTER);
+        \\ ((Outer*)values.data)[0]=b;((Outer*)values.data)[1].tag=2;((Outer*)values.data)[1].f0.tag=99;
+        \\ copied=nov_nestedarraycopy(values);
+        \\ if(copied.data==values.data || ((Outer*)copied.data)[0].f0.f0.data==b.f0.f0.data || ((Outer*)copied.data)[1].f0.tag) return 12;
+        \\ a=(Outer){.tag=2}; b=(Outer){.tag=2}; values=(nov_array){0}; nov_gc_collect(&nov_rt_heap);
+        \\ nov_nestedshow(((Outer*)copied.data)[0]);
+        \\ nov_gc_pop(&nov_rt_heap,&frame);nov_gc_collect(&nov_rt_heap);
+        \\ if(nov_rt_heap.live_objects || nov_rt_heap.frames) return 13;
+        \\ nov_gc_shutdown(&nov_rt_heap);return 0;
+        \\}
+    ;
+    const c = try std.mem.concat(test_gpa, u8, &.{ library, "\n", driver });
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "Outer.inner[Inner.some[[[ab]]]]\n", "", mode);
+}
+
+test "nestedunion Option Result captures source free managed arrays forced GC O0 O3" {
+    const source =
+        \\let Option:(T:type)->type=union{none,some:T,}
+        \\let Result:(T:type,E:type)->type=union{ok:T,err:E,}
+        \\let OR=Option(Result([][]string,string))
+        \\let RO=Result(Option([][]string),string)
+        \\let main:()={
+        \\ let mut value:OR=.some[.ok[[["a"+"b"]]]]
+        \\ let saved=value
+        \\ let capture=()->OR {saved}
+        \\ let replace=(){value=.none[]}
+        \\ let mut rows=match value {.some=>|r|match r {.ok=>|a|a
+        \\ .err=>@as([][]string,[])}
+        \\ .none=>@as([][]string,[])}
+        \\ let row=&rows[0]
+        \\ row.*[0]="changed"
+        \\ replace()
+        \\ @assert(match value {.none=>true
+        \\ .some=>false})
+        \\ @assert(match capture() {.some=>|r|match r {.ok=>|a|a[0][0]=="ab"
+        \\ .err=>false}
+        \\ .none=>false})
+        \\ let reversed:RO=.ok[.some[[["c"+"d"]]]]
+        \\ let mut array:[]OR=[capture(),.none[]]
+        \\ let copy=array
+        \\ array[0]=.none[]
+        \\ @println(copy,reversed)
+        \\}
+    ;
+    var sema = blk: {
+        var module = try Module.init(test_gpa, "nestedunion.nov", source);
+        defer module.deinit();
+        var result = try Lowering.lower(&module);
+        errdefer result.deinit();
+        if (module.hasErrors()) for (module.diagnostics.items) |diagnostic| {
+            std.debug.print("{s} at {d}: {s}\n", .{ @tagName(diagnostic.tag), diagnostic.span.start, module.sourceSlice(diagnostic.span) orelse "<invalid>" });
+        };
+        try std.testing.expect(!module.hasErrors());
+        break :blk result;
+    };
+    defer sema.deinit();
+    const library = try emit(test_gpa, &sema.ir, null);
+    defer test_gpa.free(library);
+    const c = try collectingTestProgram(library);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "[Option(Result([][]string, string)).some[Result([][]string, string).ok[[[ab]]]], Option(Result([][]string, string)).none] Result(Option([][]string), string).ok[Option([][]string).some[[[cd]]]]\n", "", mode);
+}
+
+test "nestedunion source free inactive poison no allocation OOM malformed tags O0 O3" {
+    const library = try nestedUnionTestLibrary();
+    defer test_gpa.free(library);
+    for ([_]struct { driver: []const u8, code: u8, message: []const u8 }{
+        .{ .driver = "int main(void){Outer a={.tag=2};a.f0.tag=99;a.f0.f0=(nov_array){(void*)1,99,99};a.f1.tag=99;Outer b=nov_nestedcopy(a);return b.tag!=2 || b.f0.tag || b.f0.f0.data || b.f1.tag;}", .code = 0, .message = "" },
+        .{ .driver = "int main(void){Outer a={0};a.f0.tag=1;a.f0.f0=(nov_array){(void*)1,99,99};Outer b=nov_nestedcopy(a);return b.f0.tag!=1 || b.f0.f0.data;}", .code = 0, .message = "" },
+        .{ .driver = "int main(void){Outer a={.tag=99};a.f0.f0=(nov_array){(void*)1,99,99};(void)nov_nestedcopy(a);return 0;}", .code = 1, .message = "panic: invalid union tag\n" },
+        .{ .driver = "int main(void){Outer a={0};a.f0.tag=99;a.f0.f0=(nov_array){(void*)1,99,99};(void)nov_nestedcopy(a);return 0;}", .code = 1, .message = "panic: invalid union tag\n" },
+        .{ .driver = "int main(void){Outer a={.tag=99};nov_nestedshow(a);return 0;}", .code = 1, .message = "panic: invalid union tag\n" },
+        .{ .driver = "int main(void){Outer a={0};a.f0.tag=99;nov_nestedshow(a);return 0;}", .code = 1, .message = "panic: invalid union tag\n" },
+        .{ .driver = "int main(void){budget=2;Outer a={0};a.f0.f0=nov_array_new(1,1,&NESTED_ROW);budget=0;(void)nov_nestedcopy(a);return 0;}", .code = 1, .message = "panic: GC allocation failed\n" },
+        .{ .driver = "int main(void){Outer a={.tag=99};nov_array v={&a,1,1};(void)nov_nestedarraycopy(v);return 0;}", .code = 1, .message = "panic: invalid union tag\n" },
+        .{ .driver = "int main(void){Outer a={0};a.f0.tag=99;nov_array v={&a,1,1};(void)nov_nestedarraycopy(v);return 0;}", .code = 1, .message = "panic: invalid union tag\n" },
+    }) |case| {
+        const c = try std.mem.concat(test_gpa, u8, &.{ "#include <stdlib.h>\nstatic size_t budget;\nstatic void *deny_malloc(size_t n){if(!budget)return NULL;--budget;return malloc(n);}\n#define NOV_GC_MALLOC deny_malloc\n#define NOV_GC_FREE free\n", library, "\n", case.driver });
+        defer test_gpa.free(c);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode|
+            try compileAndRunMode(c, "typedef int nonempty_translation_unit;", case.code, "", case.message, mode);
+    }
 }
 
 test "array union payload source free recursive copies precise roots printing forced GC O0 O3" {

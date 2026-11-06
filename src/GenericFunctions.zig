@@ -3002,6 +3002,82 @@ test "union array payloads real std map andThen find and readonly calls under OO
     try TestAllocations.checkAllAllocationFailures(allocator, testNonStorableImport, .{ path, lib, @as(?Module.Diagnostic.Tag, null) });
 }
 
+test "nested unions std Option map union outputs and readonly under OOM" {
+    try testNestedUnionImport(
+        \\let std=@import("std")
+        \\let O=std.Option
+        \\let R=std.Result
+        \\let convert:(x:int)->R(int,string)=.ok[x]
+        \\let make:()->O(int)=.some[1]
+        \\let quoted:(x:@TypeOf(make().map(convert)))->O(R(int,string))=x
+        \\let main:()={@println(quoted(make().map(convert)))}
+    );
+}
+
+test "nested unions std Result map union outputs under OOM" {
+    try testNestedUnionImport(
+        \\let std=@import("std")
+        \\let O=std.Option
+        \\let R=std.Result
+        \\let convert:(x:int)->O(int)=.some[x]
+        \\let main:()={let x:R(int,string)=.ok[1]
+        \\let nested:R(O(int),string)=x.map(convert)
+        \\@println(nested)}
+    );
+}
+
+test "nested unions std Option andThen union outputs under OOM" {
+    try testNestedUnionImport(
+        \\let std=@import("std")
+        \\let O=std.Option
+        \\let R=std.Result
+        \\let next:(x:int)->O(R(int,string))=.some[.ok[x]]
+        \\let make:()->O(int)=.some[1]
+        \\let quoted:(x:@TypeOf(make().andThen(next)))->O(R(int,string))=x
+        \\let main:()={let nested:O(R(int,string))=make().andThen(next)
+        \\@println(quoted(nested))}
+    );
+}
+
+test "nested unions std Result andThen union outputs under OOM" {
+    try testNestedUnionImport(
+        \\let std=@import("std")
+        \\let O=std.Option
+        \\let R=std.Result
+        \\let next:(x:int)->R(O(int),string)=.ok[.some[x]]
+        \\let make:()->R(int,string)=.ok[1]
+        \\let quoted:(x:@TypeOf(make().andThen(next)))->R(O(int),string)=x
+        \\let main:()={let nested:R(O(int),string)=make().andThen(next)
+        \\@println(quoted(nested))}
+    );
+}
+
+test "nested unions std Result mapErr union outputs and readonly under OOM" {
+    try testNestedUnionImport(
+        \\let std=@import("std")
+        \\let O=std.Option
+        \\let R=std.Result
+        \\let convert:(s:string)->O(string)=.some[s]
+        \\let make:()->R(int,string)=.err["bad"]
+        \\let quoted:(x:@TypeOf(make().mapErr(convert)))->R(int,O(string))=x
+        \\let main:()={@println(quoted(make().mapErr(convert)))}
+    );
+}
+
+fn testNestedUnionImport(source: []const u8) !void {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "main.nov", .data = source });
+    const path = try tmp.dir.realPathFileAlloc(io, "main.nov", allocator);
+    defer allocator.free(path);
+    const lib = try std.Io.Dir.cwd().realPathFileAlloc(io, "lib", allocator);
+    defer allocator.free(lib);
+    try testNonStorableImport(allocator, path, lib, null);
+    try TestAllocations.checkAllAllocationFailures(allocator, testNonStorableImport, .{ path, lib, @as(?Module.Diagnostic.Tag, null) });
+}
+
 test "failed lowering rolls back imported signature methods and earlier generic demands under OOM" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

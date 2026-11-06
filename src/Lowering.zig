@@ -608,6 +608,242 @@ test "union array payloads value and type printing under OOM" {
     );
 }
 
+test "nested unions contextual constructors and enum payloads under OOM" {
+    try testUnionArrayPayloadsOom(
+        \\let O:(T:type)->type=union{some:T,none,}
+        \\let R:(T:type,E:type)->type=union{ok:T,err:E,}
+        \\let Kind=enum{first,last,}
+        \\let make:()->O(R(Kind,string))=.some[.ok[.last]]
+        \\let other:()->R(O(u8),string)=.ok[.some[255]]
+        \\let empty:()->O(O(int))=.some[.none[]]
+    );
+}
+
+test "nested unions plain nominal aliases and explicit constructors under OOM" {
+    try testUnionArrayPayloadsOom(
+        \\let Inner=union{value:int,empty,}
+        \\let Alias=Inner
+        \\let Outer=union{inner:Alias,empty,}
+        \\let make:()->Outer=Outer.inner[Alias.value[1]]
+        \\let read:(x:Outer)->int=match x{.inner=>|inner|match inner{.value=>|n|n
+        \\.empty=>0}
+        \\.empty=>0}
+    );
+}
+
+test "nested unions generic aliases preserve canonical identities under OOM" {
+    try testUnionArrayPayloadsOom(
+        \\let O:(T:type)->type=union{some:T,none,}
+        \\let R:(T:type,E:type)->type=union{ok:T,err:E,}
+        \\let OptionAlias=O
+        \\let ResultAlias=R
+        \\let Inner=ResultAlias(u8,string)
+        \\let InnerAlias=Inner
+        \\let Outer=OptionAlias(InnerAlias)
+        \\let same:(x:Outer)->O(R(u8,string))=x
+        \\let make:()->Outer=Outer.some[InnerAlias.ok[255]]
+    );
+}
+
+test "nested unions propagation removes exactly one layer under OOM" {
+    try testUnionArrayPayloadsOom(
+        \\let O:(T:type)->type=union{some:T,none,}
+        \\let R:(T:type,E:type)->type=union{ok:T,err:E,}
+        \\let once:(x:O(O(int)))->O(O(int))=.some[x.!]
+        \\let twice:(x:O(O(int)))->O(int)=.some[x.!.!]
+        \\let onceResult:(x:R(R(int,string),string))->R(R(int,string),string)=.ok[x.!]
+        \\let twiceResult:(x:R(R(int,string),string))->R(int,string)=.ok[x.!.!]
+        \\let outerResult:(x:R(O(int),string))->R(O(int),string)=.ok[x.!]
+        \\let outerOption:(x:O(R(int,string)))->O(R(int,string))=.some[x.!]
+        \\let error:(x:R(int,O(string)))->R(bool,O(string))=.ok[x.! == 0]
+    );
+}
+
+test "nested unions array payload capture and value copies under OOM" {
+    try testUnionArrayPayloadsOom(
+        \\let I=union{values:[][]int,empty,}
+        \\let U=union{inner:I,empty,}
+        \\let make:()->U=.inner[.values[[[1],[2]]]]
+        \\let read:(u:U)->int=match u{.inner=>|inner|match inner{.values=>|xs|{let mut copy=xs
+        \\copy[0]=[9]
+        \\copy[0][0]}
+        \\.empty=>0}
+        \\.empty=>0}
+        \\let copies:()={let seed=make()
+        \\let mut xs=[seed,seed]
+        \\xs[0]=U.empty[]
+        \\@println(seed,xs,read(seed))}
+    );
+}
+
+test "nested unions readonly constructors and contextual calls under OOM" {
+    try testUnionArrayPayloadsOom(
+        \\let O:(T:type)->type=union{some:T,none,}
+        \\let R:(T:type,E:type)->type=union{ok:T,err:E,}
+        \\let Kind=enum{first,last,}
+        \\let take:(x:O(R(Kind,string)))->O(R(Kind,string))=x
+        \\let id:(x:@TypeOf(take(.some[.ok[.last]])))->O(R(Kind,string))=x
+        \\let explicit:(x:@TypeOf(O(R(Kind,string)).some[R(Kind,string).ok[.first]]))->O(R(Kind,string))=x
+    );
+}
+
+test "nested unions generic constructor inference and tag contexts under OOM" {
+    try testUnionArrayPayloadsOom(
+        \\let O:(T:type)->type=union{some:T,none,}
+        \\let R:(T:type,E:type)->type=union{ok:T,err:E,}
+        \\let Kind=enum{first,last,}
+        \\let wrap:(x:`T)->O(R(`T,string))=.some[.ok[x]]
+        \\let tags:(x:`T)->O(R(Kind,string))=.some[.ok[.last]]
+        \\let explicit:(x:`T)->O(R(`T,string))=O(R(`T,string)).some[R(`T,string).ok[x]]
+        \\let take:(x:O(R(Kind,string)),n:`T)->`T=n
+        \\let main:()={let a:O(R(u8,string))=wrap(@as(u8,255))
+        \\let b=tags(true)
+        \\let c=explicit(true)
+        \\let n=take(.some[.ok[.first]],1)
+        \\@println(a,b,c,n)}
+    );
+}
+
+test "nested unions readonly rejects missing inner payload" {
+    try testNestedUnionRejected(
+        \\let O:(T:type)->type=union{some:T,none,}
+        \\let R:(T:type,E:type)->type=union{ok:T,err:E,}
+        \\let take:(x:O(R(int,string)))->int=0
+        \\let invalid:(x:@TypeOf(take(.some[.ok[]])))={}
+    , .invalid_union_constructor);
+}
+
+test "nested unions reject nominal and scalar payload mismatches under OOM" {
+    try testNestedUnionRejected(
+        \\let A=union{value:int,}
+        \\let B=union{value:int,}
+        \\let Outer=union{inner:A,}
+        \\let f:()->Outer=.inner[B.value[1]]
+    , .expression_type_mismatch);
+    try testNestedUnionRejected(
+        \\let O:(T:type)->type=union{some:T,none,}
+        \\let f:()->O(O(u8))=.some[.some[256]]
+    , .literal_out_of_range);
+}
+
+test "nested unions reject implicit recursive propagation under OOM" {
+    try testNestedUnionRejected(
+        \\let O:(T:type)->type=union{some:T,none,}
+        \\let f:(x:O(O(int)))->O(int)=.some[x.!]
+    , .expression_type_mismatch);
+    try testNestedUnionRejected(
+        \\let R:(T:type,E:type)->type=union{ok:T,err:E,}
+        \\let A=union{value:string,}
+        \\let B=union{value:string,}
+        \\let f:(x:R(int,A))->R(bool,B)=.ok[x.! == 0]
+    , .propagation_error_mismatch);
+}
+
+test "nested unions reject capture mutation and inner unknown tags under OOM" {
+    try testNestedUnionRejected(
+        \\let I=union{values:[]int,}
+        \\let U=union{inner:I,}
+        \\let f:(u:U)=match u{.inner=>|inner|match inner{.values=>|xs|{xs[0]=1}}}
+    , .immutable_assignment);
+    try testNestedUnionRejected(
+        \\let O:(T:type)->type=union{some:T,none,}
+        \\let f:()->O(O(int))=.some[.missing[1]]
+    , .unknown_field);
+}
+
+test "nested unions keep direct functions ranges references and struct union fields unsupported under OOM" {
+    try testNestedUnionRejected("let U=union{value:()->int,}", .unsupported_type);
+    try testNestedUnionRejected("let U=union{value:@TypeOf(0..1),}", .unsupported_type);
+    try testNestedUnionRejected("let U=union{value:&int,}", .unsupported_type);
+    try testNestedUnionRejected("let U=union{value:int,}\nlet S=struct{value:U,}", .unsupported_type);
+}
+
+test "nested unions reject direct mutual and array layout cycles under OOM" {
+    try testNestedUnionRejected("let U=union{inner:U,}", .record_layout_cycle);
+    try testNestedUnionRejected("let U=union{inner:V,}\nlet V=union{back:U,}", .record_layout_cycle);
+    try testNestedUnionRejected("let U=union{inner:V,}\nlet V=union{back:[][]U,}", .record_layout_cycle);
+    try testNestedUnionRejected("let O:(T:type)->type=union{some:T,none,}\nlet U=union{inner:O(U),}", .record_layout_cycle);
+}
+
+test "nested unions shared child graph is acyclic under OOM" {
+    try testUnionArrayPayloadsOom(
+        \\let Leaf=union{value:[]int,none,}
+        \\let Left=union{first:Leaf,second:Leaf,}
+        \\let Right=union{first:Leaf,second:[]Left,}
+        \\let Root=union{left:Left,right:Right,}
+        \\let f:()->Root=.right[.second[[Left.first[Leaf.value[[1]]]]]]
+    );
+}
+
+test "nested unions shared child graph exact depth boundary" {
+    try testNestedUnionLayoutDepth(Ir.max_record_depth - 1, false);
+    try testNestedUnionLayoutDepth(Ir.max_record_depth, false);
+}
+
+test "nested unions shared array child graph exact depth boundary" {
+    try testNestedUnionLayoutDepth(Ir.max_record_depth / 2 - 1, true);
+    try testNestedUnionLayoutDepth(Ir.max_record_depth / 2, true);
+}
+
+fn testNestedUnionLayoutDepth(depth: usize, arrays: bool) !void {
+    var source = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer source.deinit();
+    // Resolve shared children before parents to exercise cached subtree heights.
+    try source.writer.print("let U{d}=union{{some:int,none,}}\n", .{depth});
+    var i = depth;
+    while (i != 0) {
+        i -= 1;
+        try source.writer.print("let U{d}=union{{left:{s}U{d},right:{s}U{d},}}\n", .{ i, if (arrays) "[]" else "", i + 1, if (arrays) "[]" else "", i + 1 });
+    }
+    var module = try Module.init(std.testing.allocator, "nested-union-depth.nov", source.written());
+    defer module.deinit();
+    var result = try lower(&module);
+    defer result.deinit();
+    const accepted = depth * @as(usize, if (arrays) 2 else 1) + 1 <= Ir.max_record_depth;
+    try std.testing.expectEqual(accepted, result.lowering_complete);
+    if (accepted) {
+        try std.testing.expect(!module.hasErrors());
+        try result.ir.verify();
+    } else {
+        try std.testing.expectEqual(Module.Diagnostic.Tag.record_layout_limit, module.diagnostics.items[0].tag);
+        try std.testing.expect(module.sourceSlice(module.diagnostics.items[0].span) != null);
+        try std.testing.expect(module.sourceSlice(module.diagnostics.items[0].related.?) != null);
+    }
+}
+
+test "nested unions readonly rejects inner enum tag and unexpected payload under OOM" {
+    try testNestedUnionRejected(
+        \\let O:(T:type)->type=union{some:T,none,}
+        \\let R:(T:type,E:type)->type=union{ok:T,err:E,}
+        \\let Kind=enum{first,last,}
+        \\let take:(x:O(R(Kind,string)))->int=0
+        \\let invalid:(x:@TypeOf(take(.some[.ok[.missing]])))={}
+    , .unknown_field);
+    try testNestedUnionRejected(
+        \\let O:(T:type)->type=union{some:T,none,}
+        \\let take:(x:O(O(int)))->int=0
+        \\let invalid:(x:@TypeOf(take(.some[.none[1]])))={}
+    , .invalid_union_constructor);
+}
+
+fn testNestedUnionRejected(source: []const u8, tag: Module.Diagnostic.Tag) !void {
+    var module = try Module.init(std.testing.allocator, "nested-union-errors.nov", source);
+    defer module.deinit();
+    var result = try lower(&module);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
+    var found = false;
+    for (module.diagnostics.items) |diagnostic| if (diagnostic.tag == tag) {
+        try std.testing.expect(diagnostic.span.end > diagnostic.span.start);
+        try std.testing.expect(module.sourceSlice(diagnostic.span) != null);
+        found = true;
+    };
+    if (!found) std.debug.print("nested union diagnostic {s}: {any}\n", .{ source, module.diagnostics.items });
+    try std.testing.expect(found);
+    try std.testing.expect(!result.lowering_complete);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testRejectedMatchAllocations, .{source});
+}
+
 fn testUnionArrayPayloadsOom(source: []const u8) !void {
     try testUnionArrayPayloads(std.testing.allocator, source);
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testUnionArrayPayloads, .{source});
@@ -788,7 +1024,7 @@ test "generic unions and propagation diagnose exact types unsupported forms and 
         .{ .source = "let Bad:(T:type)->type=union{ok:T,ok:T,}", .tag = .duplicate_field },
         .{ .source = "let Bad:(T:type)->type=union{ok:T=1,}", .tag = .unsupported_union_default },
         .{ .source = "let A=G((int)->int,string)", .tag = .unsupported_type },
-        .{ .source = "let V=union{value:int,}\nlet A=G(V,string)", .tag = .unsupported_type },
+        .{ .source = "let A=G(@TypeOf(0..1),string)", .tag = .unsupported_type },
         .{ .source = "let f:()={let x={let bad:G((int)->int,string)=R.ok[1]\nbad}\n}", .tag = .unsupported_type },
         .{ .source = "let U=union{ok:int,err:bool,}\nlet f:(u:U)->R=.ok[u.!]", .tag = .propagation_error_mismatch },
         .{ .source = "let int:(T:type)->type=union{ok:T,}", .tag = .unsupported_shadowing },
@@ -823,11 +1059,11 @@ test "unsupported union declarations and rejected matches roll back under OOM" {
         .{ .source = "let R=struct{n:U,}\nlet U=union{ok:R,}", .tag = .unsupported_type },
         .{ .source = "let R=struct{n:R,}\nlet U=union{ok:R,}", .tag = .record_layout_cycle },
 
-        .{ .source = "let V=union{n:int,}\nlet U=union{ok:V,}", .tag = .unsupported_type },
-        .{ .source = "let G:(T:type)->type=union{ok:T,}\nlet V=union{n:int,}\nlet U=G(V)", .tag = .unsupported_type },
+        .{ .source = "let U=union{ok:@TypeOf(0..1),}", .tag = .unsupported_type },
+        .{ .source = "let G:(T:type)->type=union{ok:T,}\nlet U=G(()->int)", .tag = .unsupported_type },
         .{ .source = "let A=struct{n:int,}\nlet B=struct{n:int,}\nlet U=union{ok:A,}\nlet f:()->U=.ok[B[.n=1]]", .tag = .expression_type_mismatch },
         .{ .source = "let A=struct{n:int,}\nlet B=struct{n:int,}\nlet G:(T:type,E:type)->type=union{ok:T,err:E,}\nlet f:(r:G(int,A))->G(bool,B)=.ok[r.! == 0]", .tag = .propagation_error_mismatch },
-        .{ .source = "let U=union{ok:U,}", .tag = .unsupported_type },
+        .{ .source = "let U=union{ok:U,}", .tag = .record_layout_cycle },
         .{ .source = "let U=union{ok:()->int,}", .tag = .unsupported_type },
         .{ .source = "let U=union{ok:int,\nlet constant:int=1\n}", .tag = .unsupported_declaration },
 

@@ -86,9 +86,33 @@ Normal assignments, calls, returns, match captures and `.!` preserve recursively
 independent array backing. Only the active payload is cloned; inactive payload
 fields remain zeroed. Immutable strings share backing, and closure elements share
 their capture environments. Arrays do not grant aliases to the union's storage.
-Direct nested-union, function, range and reference payloads remain unsupported;
-recursive layouts, including cycles through arrays, reject. See
+Direct function, range and reference payloads remain unsupported. Nested union
+payloads are supported under the same acyclic-layout rule; recursive layouts,
+including cycles through arrays, reject. See
 `examples/union-arrays.nov` for a runnable example and six tests.
+
+## Nested union payloads
+
+Union payloads may themselves be unions, retaining each container's nominal type:
+
+```nov
+let wrapped: std.Option(std.Result([]int, string)) = .some[.ok[[1, 2]]]
+let nested: std.Result(std.Option(int), string) = .ok[.some[7]]
+```
+
+Match captures yield the inner union as an ordinary value. `.!` processes one
+layer only, preserving its existing exact error/Option propagation rules. It does
+not flatten nested containers or bridge Option and Result automatically. Use
+`map` to wrap a container-returning callback in another container, or `andThen`
+when the callback already returns the same container family with the required
+error type. `std.array.find` now also supports union elements via `Option(Union)`.
+
+Only active tag chains are inspected, copied and formatted; arrays inside them
+retain recursively independent backing. Inactive by-value fields remain zeroed.
+Malformed active tags panic before allocating copies or invoking formatters.
+Default output retains nested union tags and uses exact nested stringify hooks.
+Direct union fields in structs, recursive layouts and reference payloads remain
+unsupported. See `examples/nested-unions.nov` for a runnable example and six tests.
 
 ## Container mapping
 
@@ -159,8 +183,8 @@ left-to-right order, including callback construction and the seed.
 
 `find` supports the existing `Option` payload types: bool, integers, floats,
 runes, strings, enums, arrays (including nested arrays), and supported acyclic
-records, including array fields. Direct unions, functions and ranges cannot be
-union payloads yet; use
+records, including array fields, as well as nested union payloads. Direct function
+and range payloads remain unsupported; use
 `findIndex` to search those arrays. Other helpers accept all supported element
 types. The returned `Option` is the same canonical type as `std.Option`.
 

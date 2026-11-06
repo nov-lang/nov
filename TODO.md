@@ -50,6 +50,20 @@ results. See `examples/array-fields.nov`.
 
 ## Current delivered status
 
+Direct nested union payloads are supported, including Option(Result(T,E)),
+Result(Option(T),E), plain nested tags and std.array.find on union elements.
+Existing exact nominal constructor/capture types and one-layer .! rules apply;
+no automatic flattening, Option/Result conversion or nested pattern syntax.
+Recursive active-payload copies detach nested array backing; inactive by-value
+fields are zeroed and inactive tags are not inspected. Nonallocating active-tag
+validation precedes allocating copies and formatting; detached array-element
+normalization preserves source backing. Static GC descriptors retain the existing
+zero-inactive-pointer-slot invariant in rooted backing (not arbitrary foreign
+poisoned GC pointers). Default printing retains nested tags and user hooks.
+Finite acyclic layout/depth rules remain; direct union struct fields, function/
+range/reference payloads and recursive layouts are unsupported. See
+examples/nested-unions.nov (six tests).
+
 Direct array union payloads are implemented, including Option([]T), Result([]T,E),
 array-valued errors and nested arrays. Arrays may contain any currently storable
 element within finite acyclic layouts. Existing independent recursive copies,
@@ -57,8 +71,8 @@ active-payload-only cloning, zeroed inactive fields, precise managed-owner roots
 matching, .!, type queries, captures and structural printing apply. Immutable
 strings share backing and closure elements share environments. No optimizer or
 alias changes were needed; one shared IR payload gate enables existing machinery.
-Direct nested unions/functions/ranges/references and recursive array-layout cycles
-remain unsupported. See examples/union-arrays.nov (six tests).
+Nested union payloads now work. Direct function/range/reference payloads and
+recursive array-layout cycles remain unsupported. See examples/union-arrays.nov (six tests).
 
 Expression-based @TypeOf queries are unevaluated and typechecked using frozen
 lexical metadata. Normal numeric defaults and generic constraints apply without
@@ -135,7 +149,7 @@ index; absence yields none. `each` requires a void callback and constructs no
 result array. Empty input invokes no callback, but argument expressions remain
 eager and left-to-right. Existing recursive-copy/shared-capture contracts apply.
 `find` supports array elements, including nested arrays, but is limited by current
-union payload support (no direct union, function or range payload); `findIndex` and the other helpers support all current
+union payload support (no direct function or range payload); `findIndex` and the other helpers support all current
 array element types. No new borrowing or optimization is introduced. See
 `examples/array-search.nov` and `lib/README.md`.
 
@@ -319,8 +333,8 @@ signatures. No new range annotation syntax is added; integer fallback follows th
 context-first rules above.
 Nested arrays copy recursively independently; tagged union copies detach only
 active payload array backing, including record payloads containing arrays. Existing
-union payloads now include direct arrays; direct union/function/range/reference
-payloads remain unsupported. Function copies share existing environments/captured cells rather
+union payloads now include direct arrays and nested unions; direct function/range/
+reference payloads remain unsupported. Function copies share existing environments/captured cells rather
 than deep-cloning closures; immutable capture snapshots and mutable shared cells
 retain their existing rules. Ranges copy bounds/inclusivity by value.
 
@@ -572,7 +586,7 @@ an enum .not_found kind.
 Acyclic nominal records now work as ordinary/generic union payloads, retaining exact
 identity through aliases, constructors, captures, copies and .! propagation. C
 layouts are dependency-ordered and every nested string owner is rooted; inactive
-payload fields are zeroed. Direct array payloads now work. Direct nested unions,
+payload fields are zeroed. Direct arrays and nested unions now work. Direct
 functions, ranges, references and recursive layouts remain unsupported. Reachable wide scalar leaves
 still produce backend width diagnostics at the leaf field.
 
