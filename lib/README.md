@@ -70,6 +70,26 @@ See `examples/options.nov`: division by zero yields `none` rather than panicking
 `.!` propagates it from `Option(uint)` into `Option(string)`, and the fallback runs
 only for the absent quotient.
 
+## Array payloads
+
+`Option([]T)` and `Result([]T, E)` are supported, as are array-valued error
+payloads. Nested arrays and arrays of any existing storable element type are
+valid within finite acyclic layouts. Constructors supply an ordinary array value:
+
+```nov
+let values: std.Option([]int) = .some[[1, 2]]
+let doubled = values.map((items) { std.array.map(items, (x) { x * 2 }) })
+let found: std.Option([]int) = std.array.find([[1], [2]], (items) { items[0] == 2 })
+```
+
+Normal assignments, calls, returns, match captures and `.!` preserve recursively
+independent array backing. Only the active payload is cloned; inactive payload
+fields remain zeroed. Immutable strings share backing, and closure elements share
+their capture environments. Arrays do not grant aliases to the union's storage.
+Direct nested-union, function, range and reference payloads remain unsupported;
+recursive layouts, including cycles through arrays, reject. See
+`examples/union-arrays.nov` for a runnable example and six tests.
+
 ## Container mapping
 
 ```nov
@@ -138,8 +158,9 @@ not argument expressions: callee then arguments evaluate eagerly in ordinary
 left-to-right order, including callback construction and the seed.
 
 `find` supports the existing `Option` payload types: bool, integers, floats,
-runes, strings, enums and supported acyclic records, including array fields.
-Bare arrays, unions, functions and ranges cannot be union payloads yet; use
+runes, strings, enums, arrays (including nested arrays), and supported acyclic
+records, including array fields. Direct unions, functions and ranges cannot be
+union payloads yet; use
 `findIndex` to search those arrays. Other helpers accept all supported element
 types. The returned `Option` is the same canonical type as `std.Option`.
 

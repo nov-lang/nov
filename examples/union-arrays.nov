@@ -1,0 +1,244 @@
+; nov run examples/union-arrays.nov
+; nov test examples/union-arrays.nov
+; Only the active payload is copied; arrays detach recursively, closures share cells.
+; Array layouts must be finite and acyclic, including paths through union payloads.
+
+let std = @import("std")
+let Option = std.Option
+let Result = std.Result
+
+let Payload = union {
+    numbers: []int,
+    words: [][]string,
+    none,
+}
+
+let Color = enum {
+    red,
+    blue,
+}
+
+let Row = struct {
+    values: []int,
+}
+
+let echo: (value: Option([]int)) -> Option([]int) = value
+
+let advance: (value: Option([]int)) -> Option([]int) = {
+    let mut items = value.!
+    items[0] += 1
+    .some[items]
+}
+
+let forward: (value: Result([]int, []string)) -> Result([]int, []string) = {
+    let mut items = value.!
+    items[0] += 1
+    .ok[items]
+}
+
+@[test]
+let binding_assignment_arguments_and_returns: () = {
+    let mut source: []int = [1, 2]
+    let wrapped: Option([]int) = .some[source]
+    let bound = wrapped
+    let mut assigned: Option([]int) = .none[]
+    assigned = wrapped
+    let returned = echo(wrapped)
+    source[0] = 9
+    let mut detached = returned.unwrapOr([])
+    detached[0] = 8
+    @assert(wrapped.unwrapOr([])[0] == 1)
+    @assert(bound.unwrapOr([])[0] == 1)
+    @assert(assigned.unwrapOr([])[0] == 1)
+    @assert(returned.unwrapOr([])[0] == 1)
+    @assert(advance(wrapped).unwrapOr([])[0] == 2)
+    @assert(wrapped.unwrapOr([])[0] == 1)
+}
+
+@[test]
+let match_and_success_error_propagation: () = {
+    let present: Option([]int) = .some[[3]]
+    let absent: Option([]int) = .none[]
+    @assert(advance(present).unwrapOr([])[0] == 4)
+    @assert(advance(absent).isNone())
+    let good: Result([]int, []string) = .ok[[5]]
+    let bad: Result([]int, []string) = .err[["bad" + "!"]]
+    @assert(forward(good).unwrapOr([])[0] == 6)
+    @assert(good.unwrapOr([])[0] == 5)
+    let propagated = forward(bad)
+    let mut errors = match propagated {
+        .ok => @as([]string, [])
+        .err => |items| items
+    }
+    errors[0] = "changed"
+    @assert(
+        match bad {
+            .ok => false
+            .err => |items| items[0] == "bad!"
+        }
+    )
+    @assert(
+        match propagated {
+            .ok => false
+            .err => |items| items[0] == "bad!"
+        }
+    )
+}
+
+@[test]
+let nested_strings_and_arrays_of_unions: () = {
+    let mut words: [][]string = [["hel" + "lo"], []]
+    let mut payload: Payload = .words[words]
+    let saved = payload
+    let items: []Payload = [payload, .numbers[[1, 2]], .none[]]
+    words[0] = ["source"]
+    let mut extracted = match payload {
+        .words => |rows| rows
+        .numbers => @as([][]string, [])
+        .none => @as([][]string, [])
+    }
+    let first = &extracted[0]
+    first.*[0] = first.*[0] + "!"
+    payload = .words[extracted]
+    @assert("{saved}" == "Payload.words[[[hello], []]]")
+    @assert("{payload}" == "Payload.words[[[hello!], []]]")
+    @assert("{items}" == "[Payload.words[[[hello], []]], Payload.numbers[[1, 2]], Payload.none]")
+    let containers: Option([]Payload) = .some[items]
+    let copy = containers.unwrapOr([])
+    @assert("{copy}" == "{items}")
+}
+
+@[test]
+let closure_snapshots_and_shared_cells: () = {
+    let mut current: Option([]int) = .some[[1]]
+    let saved = current
+    let snapshot = () -> Option([]int) {
+        saved
+    }
+    let update = () {
+        current = advance(current)
+    }
+    let read = () -> int {
+        current.unwrapOr([])[0]
+    }
+    update()
+    update()
+    @assert(read() == 3)
+    let mut detached = snapshot().unwrapOr([])
+    detached[0] = 9
+    @assert(snapshot().unwrapOr([])[0] == 1)
+    @assert(read() == 3)
+    let mut count = 0
+    let functions: Option([]() -> int) = .some[
+        [
+            () -> int {
+                count += 1
+                count
+            }
+        ]]
+    let copied = functions
+    let mut first = functions.unwrapOr([])
+    let second = copied.unwrapOr([])
+    @assert(first[0]() == 1 and second[0]() == 2 and count == 2)
+    first[0] = () -> int {
+        99
+    }
+    @assert(first[0]() == 99 and second[0]() == 3)
+}
+
+@[test]
+let mapping_and_finding_arrays: () = {
+    let some: Option(int) = .some[7]
+    let none: Option(int) = .none[]
+    let mapped: Option([]int) = some.map(
+        (value) {
+            [value, value + 1]
+        }
+    )
+    @assert(mapped.unwrapOr([])[1] == 8)
+    @assert(
+        none.map(
+            (value) -> []int {
+                @panic("none must skip array callback")
+            }
+        ).isNone()
+    )
+    let good: Result(int, []string) = .ok[4]
+    let bad: Result(int, []string) = .err[["missing"]]
+    let result: Result([]int, []string) = good.map(
+        (value) {
+            [value]
+        }
+    )
+    @assert(result.unwrapOr([])[0] == 4)
+    @assert(
+        bad.map(
+            (value) -> []int {
+                @panic("error must skip array callback")
+            }
+        ).isErr()
+    )
+    let mut rows: [][]int = [[1], [2, 3]]
+    let found: Option([]int) = std.array.find(
+        rows,
+        (row) {
+            row.len == 2
+        }
+    )
+    rows[1] = [9]
+    let mut detached = found.unwrapOr([])
+    detached[0] = 8
+    @assert(found.unwrapOr([])[0] == 2)
+    let missing = std.array.find(
+        rows,
+        (row) {
+            row.len == 0
+        }
+    )
+    @assert(missing.isNone())
+}
+
+@[test]
+let inactive_payloads_and_storable_elements: () = {
+    let empty: Option([][]string) = .none[]
+    let copy = empty
+    @assert(copy.isNone())
+    let good: Result([]int, [][]string) = .ok[[1]]
+    let bad: Result([]int, [][]string) = .err[[["error"]]]
+    @assert(good.unwrapOr([])[0] == 1 and bad.isErr())
+
+    let colors: Option([]Color) = .some[[.red, .blue]]
+    @assert(Color.blue in colors.unwrapOr([]))
+    let records: Option([]Row) = .some[[Row[ .values = [2] ]]]
+    let mut rows = records.unwrapOr([])
+    rows[0] = Row[ .values = [9] ]
+    @assert(records.unwrapOr([])[0].values[0] == 2)
+    let start: int = 1
+    let end: int = 3
+    let ranges = [start..end, start..=end]
+    let wrapped = Option(@TypeOf(ranges)).some[ranges]
+    let mut total = 0
+    loop range in wrapped.unwrapOr([]) {
+        loop value in range {
+            total += value
+        }
+    }
+    @assert(total == 9)
+}
+
+let main: () = {
+    let numbers: Payload = .numbers[[1, 2]]
+    let words: Payload = .words[[["hello"], []]]
+    let none: Payload = .none[]
+    @println("Payloads:", [numbers, words, none])
+    let present: Option([]int) = .some[[3]]
+    @println("Advanced:", advance(present).unwrapOr([]))
+    let bad: Result([]int, []string) = .err[["missing"]]
+    @println(
+        "Error:",
+        match forward(bad) {
+            .ok => @as([]string, [])
+            .err => |items| items
+        }
+    )
+}

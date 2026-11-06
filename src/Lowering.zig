@@ -548,6 +548,150 @@ test "generic union expansion and template alias traversal have explicit limits"
     }
 }
 
+test "union array payloads typed element layouts under OOM" {
+    try testUnionArrayPayloadsOom(
+        \\let O:(T:type)->type=union{some:T,none,}
+        \\let Kind=enum{first,last,}
+        \\let S=struct{values:[]int,}
+        \\let U=union{ints:[]int,bools:[]bool,floats:[]f32,runes:[]rune,strings:[]string,nested:[][]int,records:[]S,unions:[]O(int),enums:[]Kind,functions:[]()->int,ranges:[]@TypeOf(0..1),}
+    );
+}
+
+test "union array payloads contextual and empty constructors under OOM" {
+    try testUnionArrayPayloadsOom(
+        \\let O:(T:type)->type=union{some:T,none,}
+        \\let make:()->O([]u8)=.some[[1,2]]
+        \\let empty:()->O([]int)=.some[[]]
+    );
+}
+
+test "union array payloads match value copies under OOM" {
+    try testUnionArrayPayloadsOom(
+        \\let O:(T:type)->type=union{some:T,none,}
+        \\let matched:(o:O([]u8))->u8=match o{.some=>|xs|{let mut copy=xs
+        \\copy[0]=9
+        \\copy[0]}
+        \\.none=>0}
+    );
+}
+
+test "union array payloads Option and Result propagation under OOM" {
+    try testUnionArrayPayloadsOom(
+        \\let O:(T:type)->type=union{some:T,none,}
+        \\let R:(T:type,E:type)->type=union{ok:T,err:E,}
+        \\let option:(o:O([]u8))->O([]u8)=.some[o.!]
+        \\let result:(r:R([]int,[]string))->R([]int,[]string)=.ok[r.!]
+        \\let failure:()->R([]int,[]string)=.err[["bad"]]
+    );
+}
+
+test "union array payloads readonly TypeOf constructors and calls under OOM" {
+    try testUnionArrayPayloadsOom(
+        \\let O:(T:type)->type=union{some:T,none,}
+        \\let make:()->O([]u8)=.some[[1,2]]
+        \\let quoted:(x:@TypeOf(make()))->@TypeOf(make())=x
+        \\let typed:(x:@TypeOf(O([]u8).some[[1,2]]))->O([]u8)=x
+    );
+}
+
+test "union array payloads value and type printing under OOM" {
+    try testUnionArrayPayloadsOom(
+        \\let O:(T:type)->type=union{some:T,none,}
+        \\let R:(T:type,E:type)->type=union{ok:T,err:E,}
+        \\let Kind=enum{first,last,}
+        \\let S=struct{values:[]int,}
+        \\let U=union{ints:[]int,bools:[]bool,floats:[]f32,runes:[]rune,strings:[]string,nested:[][]int,records:[]S,unions:[]O(int),enums:[]Kind,functions:[]()->int,ranges:[]@TypeOf(0..1),}
+        \\let make:()->O([]u8)=.some[[1,2]]
+        \\let empty:()->O([]int)=.some[[]]
+        \\let failure:()->R([]int,[]string)=.err[["bad"]]
+        \\let show:()={@println(make(),empty(),failure(),U)}
+    );
+}
+
+fn testUnionArrayPayloadsOom(source: []const u8) !void {
+    try testUnionArrayPayloads(std.testing.allocator, source);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testUnionArrayPayloads, .{source});
+}
+
+fn testUnionArrayPayloads(allocator: std.mem.Allocator, source: []const u8) !void {
+    var module = try Module.init(allocator, "union-arrays.nov", source);
+    defer module.deinit();
+    var result = try lower(&module);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
+    if (module.hasErrors()) std.debug.print("union array errors: {any}\n", .{module.diagnostics.items});
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(result.lowering_complete);
+    try result.ir.verify();
+}
+
+test "union array payloads reject cyclic layouts exact mismatches and mutable captures under OOM" {
+    for ([_]struct { source: []const u8, tag: Module.Diagnostic.Tag }{
+        .{ .source = "let U=union{some:[]U,none,}", .tag = .record_layout_cycle },
+        .{ .source = "let G:(T:type)->type=union{some:[]@This(),none,}\nlet f:(x:G(int))={}", .tag = .record_layout_cycle },
+        .{ .source = "let G:(T:type)->type=union{some:[]G(T),none,}\nlet f:(x:G(int))={}", .tag = .generic_cycle },
+        .{ .source = "let U=union{some:[][]S,none,}\nlet S=struct{back:[]U,}", .tag = .record_layout_cycle },
+        .{ .source = "let O:(T:type)->type=union{some:T,none,}\nlet U=O([]S)\nlet S=struct{back:[]U,}", .tag = .record_layout_cycle },
+        .{ .source = "let U=union{some:[]u8,}\nlet f:()->U=.some[[256]]", .tag = .literal_out_of_range },
+        .{ .source = "let U=union{some:[]u8,}\nlet f:(xs:[]int)->U=.some[xs]", .tag = .expression_type_mismatch },
+        .{ .source = "let R:(T:type,E:type)->type=union{ok:T,err:E,}\nlet f:(r:R(int,[]u8))->R(int,[]int)=.ok[r.!]", .tag = .propagation_error_mismatch },
+        .{ .source = "let U=union{some:[]int,}\nlet f:(u:U)=match u{.some=>|xs|{xs[0]=1}}", .tag = .immutable_assignment },
+    }) |case| {
+        var module = try Module.init(std.testing.allocator, "union-array-errors.nov", case.source);
+        defer module.deinit();
+        var result = try lower(&module);
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
+        if (!module.hasErrors()) std.debug.print("expected union array diagnostic for {s}\n", .{case.source});
+        try std.testing.expect(module.hasErrors());
+        const diagnostic = module.diagnostics.items[0];
+        try std.testing.expectEqual(case.tag, diagnostic.tag);
+        try std.testing.expect(diagnostic.span.end > diagnostic.span.start);
+        try std.testing.expect(module.sourceSlice(diagnostic.span) != null);
+        if (case.tag == .record_layout_cycle) {
+            const related = diagnostic.related.?;
+            try std.testing.expect(related.end > related.start);
+            try std.testing.expect(module.sourceSlice(related) != null);
+        }
+        try std.testing.expect(!result.lowering_complete);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testRejectedMatchAllocations, .{case.source});
+    }
+}
+
+test "union array layout depth accepts cached children at boundary under OOM" {
+    try testUnionArrayLayoutDepth(Ir.max_record_depth / 2 - 1);
+}
+
+test "union array layout depth rejects cached children above boundary under OOM" {
+    try testUnionArrayLayoutDepth(Ir.max_record_depth / 2);
+}
+
+fn testUnionArrayLayoutDepth(depth: usize) !void {
+    var source = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer source.deinit();
+    // Declare children first so the graph must account for cached heights.
+    try source.writer.print("let U{d}=union{{some:int,none,}}\n", .{depth});
+    var i = depth;
+    while (i != 0) {
+        i -= 1;
+        try source.writer.print("let U{d}=union{{some:[]U{d},none,}}\n", .{ i, i + 1 });
+    }
+    try source.writer.writeAll("let f:(u:U0)->U0=u\n");
+    if (depth * 2 + 1 <= Ir.max_record_depth) {
+        try testUnionArrayPayloads(std.testing.allocator, source.written());
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testUnionArrayPayloads, .{source.written()});
+    } else {
+        var module = try Module.init(std.testing.allocator, "union-array-depth.nov", source.written());
+        defer module.deinit();
+        var result = try lower(&module);
+        defer result.deinit();
+        try std.testing.expect(!result.lowering_complete);
+        try std.testing.expectEqual(Module.Diagnostic.Tag.record_layout_limit, module.diagnostics.items[0].tag);
+        try std.testing.expectEqualStrings("some", module.sourceSlice(module.diagnostics.items[0].span).?);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testRejectedMatchAllocations, .{source.written()});
+    }
+}
+
 test "Option propagation accepts structural families exact contexts inference and void under OOM" {
     const source =
         \\let O:(T:type)->type=union{none,some:T,}
@@ -644,7 +788,7 @@ test "generic unions and propagation diagnose exact types unsupported forms and 
         .{ .source = "let Bad:(T:type)->type=union{ok:T,ok:T,}", .tag = .duplicate_field },
         .{ .source = "let Bad:(T:type)->type=union{ok:T=1,}", .tag = .unsupported_union_default },
         .{ .source = "let A=G((int)->int,string)", .tag = .unsupported_type },
-        .{ .source = "let A=G([]int,string)", .tag = .unsupported_type },
+        .{ .source = "let V=union{value:int,}\nlet A=G(V,string)", .tag = .unsupported_type },
         .{ .source = "let f:()={let x={let bad:G((int)->int,string)=R.ok[1]\nbad}\n}", .tag = .unsupported_type },
         .{ .source = "let U=union{ok:int,err:bool,}\nlet f:(u:U)->R=.ok[u.!]", .tag = .propagation_error_mismatch },
         .{ .source = "let int:(T:type)->type=union{ok:T,}", .tag = .unsupported_shadowing },
@@ -674,7 +818,7 @@ test "unsupported union declarations and rejected matches roll back under OOM" {
         .{ .source = "let U=union{}", .tag = .empty_union },
         .{ .source = "let U=union{ok:int=0,}", .tag = .unsupported_union_default },
         .{ .source = "let U=union{ok:int,ok:string,}", .tag = .duplicate_field },
-        .{ .source = "let U=union{ok:[]int,}", .tag = .unsupported_type },
+        .{ .source = "let U=union{ok:(int)->int,}", .tag = .unsupported_type },
         .{ .source = "let R=struct{n:[][]U,}\nlet U=union{ok:R,}", .tag = .record_layout_cycle },
         .{ .source = "let R=struct{n:U,}\nlet U=union{ok:R,}", .tag = .unsupported_type },
         .{ .source = "let R=struct{n:R,}\nlet U=union{ok:R,}", .tag = .record_layout_cycle },

@@ -2969,6 +2969,39 @@ fn testNonStorableImport(allocator: std.mem.Allocator, path: []const u8, lib: []
     try sema.ir.verify();
 }
 
+test "union array payloads real std map andThen find and readonly calls under OOM" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "main.nov", .data =
+        \\let std=@import("std")
+        \\let O=std.Option
+        \\let R=std.Result
+        \\let expand:(x:int)->[]int=[x,x+1]
+        \\let next:(x:int)->O([]int)=.some[[x]]
+        \\let nextResult:(x:int)->R([]int,[]string)=.ok[[x]]
+        \\let original:()->O(int)=.some[1]
+        \\let inferred:(x:@TypeOf(original().map(expand)))->O([]int)=x
+        \\let main:()={
+        \\let option=original().map(expand)
+        \\let chained=original().andThen(next)
+        \\let result:R(int,[]string)=.ok[1]
+        \\let mapped=result.map(expand)
+        \\let bound=result.andThen(nextResult)
+        \\let remapped=R(int,string).err["bad"].mapErr((s:string)->[]string{[s]})
+        \\let found=std.array.find(@as([][]int,[[1],[2]]),(xs:[]int)->bool{xs[0]==2})
+        \\@println(option,chained,mapped,bound,remapped,found,inferred(option))
+        \\}
+    });
+    const path = try tmp.dir.realPathFileAlloc(io, "main.nov", allocator);
+    defer allocator.free(path);
+    const lib = try std.Io.Dir.cwd().realPathFileAlloc(io, "lib", allocator);
+    defer allocator.free(lib);
+    try testNonStorableImport(allocator, path, lib, null);
+    try TestAllocations.checkAllAllocationFailures(allocator, testNonStorableImport, .{ path, lib, @as(?Module.Diagnostic.Tag, null) });
+}
+
 test "failed lowering rolls back imported signature methods and earlier generic demands under OOM" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

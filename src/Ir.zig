@@ -253,7 +253,7 @@ const DefaultPrintability = struct {
 };
 
 pub const Field = struct { name: []const u8, ty: TypeId, span: Span, default: ?ConstId = null };
-/// Nominal by-value layout. Tagged layouts have one active scalar or record payload.
+/// Nominal by-value layout. Tagged layouts have one active scalar, array or record payload.
 pub const Record = struct {
     source: Source.Id = @fromBackingInt(@intCast(0)),
     identity: u32,
@@ -1573,7 +1573,7 @@ pub fn isManaged(ty: Type) bool {
 /// Untagged records retain nominal identity as union payloads. Layout graph
 /// validation independently rejects cycles and excessive by-value depth.
 pub fn isUnionPayload(ty: Type) bool {
-    return (ty != .array and isRecordField(ty)) or ty == .void or (ty == .record and !ty.record.tagged);
+    return isRecordField(ty) or ty == .void;
 }
 
 /// Query the layout DAG, visiting scalar diamonds only once. Closure values
@@ -1812,7 +1812,9 @@ test "record payload layouts reject tagged fields and forged nominal operands" {
     try ir.setRecordFields(other, &.{.{ .name = "s", .ty = text, .span = span }});
     try ir.setRecordFields(u, &.{.{ .name = "ok", .ty = r, .span = span }});
     try std.testing.expectError(error.InvalidArrayElement, ir.setRecordFields(r, &.{.{ .name = "nested", .ty = u, .span = span }}));
-    try std.testing.expectError(error.InvalidArrayElement, ir.setRecordFields(u, &.{.{ .name = "nested", .ty = array, .span = span }}));
+    try ir.setRecordFields(u, &.{.{ .name = "nested", .ty = array, .span = span }});
+    try std.testing.expect(try ir.needsArrayCopy(u));
+    try ir.setRecordFields(u, &.{.{ .name = "ok", .ty = r, .span = span }});
     try std.testing.expectError(error.InvalidArrayElement, ir.setRecordFields(u, &.{.{ .name = "nested", .ty = u, .span = span }}));
     const sig = try ir.internType(.{ .function = .{ .params = &.{other}, .result = u } });
     const f = try ir.addFunction("f", sig, span);
@@ -1830,6 +1832,39 @@ test "record payload layouts reject tagged fields and forged nominal operands" {
     ir.types.items[@backingInt(r)].record.tagged = true;
     try std.testing.expectError(error.InvalidArrayElement, ir.verify());
     ir.types.items[@backingInt(r)].record.tagged = false;
+    try ir.verify();
+}
+
+test "array union payload IR accepts storable elements and rejects forged cycles and references" {
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    const span: Span = .{ .start = 0, .end = 0 };
+    const integer = try ir.internType(.{ .integer = .{ .bits = 32, .signedness = .signed } });
+    const unit = try ir.internType(.void);
+    const u = try ir.internType(.{ .record = .{ .identity = 90, .fields = &.{}, .tagged = true } });
+    const reference = try ir.internType(.{ .reference = .{ .child = integer, .mutable = false } });
+    const signature = try ir.internType(.{ .function = .{ .params = &.{}, .result = integer } });
+    const range = try ir.internType(.{ .range = integer });
+    for ([_]TypeId{ integer, try ir.internType(.string), u, signature, range, try ir.internType(.{ .array = integer }) }) |element| {
+        const array = try ir.internType(.{ .array = element });
+        try ir.setRecordFields(u, &.{ .{ .name = "some", .ty = array, .span = span }, .{ .name = "none", .ty = unit, .span = span } });
+        try std.testing.expect(try ir.needsArrayCopy(u));
+        if (element == u) {
+            try std.testing.expectError(error.CyclicRecordLayout, ir.verify());
+        } else try ir.verify();
+    }
+    const fields = @constCast(ir.types.items[@backingInt(u)].record.fields);
+    const saved = fields[0].ty;
+    for ([_]TypeId{ reference, signature, range, u }) |unsupported| {
+        fields[0].ty = unsupported;
+        try std.testing.expectError(error.InvalidArrayElement, ir.verify());
+    }
+    fields[0].ty = saved;
+    const inner = ir.getType(saved).?.array;
+    const original = ir.types.items[@backingInt(inner)];
+    ir.types.items[@backingInt(inner)] = .{ .array = reference };
+    try std.testing.expectError(error.InvalidArrayElement, ir.verify());
+    ir.types.items[@backingInt(inner)] = original;
     try ir.verify();
 }
 

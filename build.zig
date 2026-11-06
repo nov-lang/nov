@@ -154,6 +154,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const storable_array_tests = b.step("test-cli-storable-arrays", "Run storable array CLI tests");
     addStorableArrayCliTests(b, exe, storable_array_tests);
     test_step.dependOn(storable_array_tests);
+    const union_array_tests = b.step("test-cli-union-arrays", "Run direct union array payload CLI tests");
+    addUnionArrayCliTests(b, exe, union_array_tests);
+    test_step.dependOn(union_array_tests);
     const printing_tests = b.step("test-cli-printing", "Run type and aggregate printing CLI tests");
     addPrintingCliTests(b, exe, printing_tests);
     test_step.dependOn(printing_tests);
@@ -2673,6 +2676,78 @@ fn addGenericStructCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_st
     }
 }
 
+fn addUnionArrayCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    const fixtures = b.addWriteFiles();
+    const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
+    _ = fixtures.add("union-arrays.nov", @embedFile("examples/union-arrays.nov"));
+    const package = b.addWriteFiles();
+    const installed_exe = package.addCopyFile(exe.getEmittedBin(), b.fmt("bin/{s}", .{exe.out_filename}));
+    _ = package.addCopyDirectory(b.path("lib"), "lib/nov", .{});
+    _ = package.add("union-arrays.nov", @embedFile("examples/union-arrays.nov"));
+    const expected_tests = "PASS binding_assignment_arguments_and_returns\nPASS match_and_success_error_propagation\nPASS nested_strings_and_arrays_of_unions\nPASS closure_snapshots_and_shared_cells\nPASS mapping_and_finding_arrays\nPASS inactive_payloads_and_storable_elements\n6 passed; 0 failed; 6 total\n";
+    for ([_]bool{ false, true }) |installed| {
+        for ([_][]const u8{ "fmt", "semantic", "run", "test" }) |command| {
+            const execute = std.mem.eql(u8, command, "run") or std.mem.eql(u8, command, "test");
+            const modes: []const []const u8 = if (execute) &.{ "", "--debug", "--release" } else &.{""};
+            for (modes) |mode| {
+                const run = if (installed) std.Build.Step.Run.create(b, "CLI union arrays: relocated install") else b.addRunArtifact(exe);
+                run.step.name = b.fmt("CLI union arrays: {s} {s} (installed={})", .{ command, mode, installed });
+                if (installed) run.addFileArg(installed_exe);
+                run.setCwd(if (installed) package.getDirectory() else fixtures.getDirectory());
+                run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+                run.setEnvironmentVariable("NOV_CC", "");
+                run.setEnvironmentVariable("CC", "");
+                if (std.mem.eql(u8, command, "fmt")) {
+                    run.addArgs(&.{ "fmt", "--check", "union-arrays.nov" });
+                } else if (std.mem.eql(u8, command, "semantic")) {
+                    run.addArgs(&.{ "check", "--semantic", "union-arrays.nov" });
+                } else {
+                    run.addArgs(&.{ command, "union-arrays.nov" });
+                    if (mode.len != 0) run.addArg(mode);
+                }
+                if (!installed and !std.mem.eql(u8, command, "fmt")) {
+                    run.addArg("--lib-dir");
+                    run.addDirectoryArg(library);
+                }
+                run.expectExitCode(0);
+                run.expectStdOutEqual(if (std.mem.eql(u8, command, "test")) expected_tests else if (std.mem.eql(u8, command, "run")) "Payloads: [Payload.numbers[[1, 2]], Payload.words[[[hello], []]], Payload.none]\nAdvanced: [4]\nError: [missing]\n" else "");
+                run.expectStdErrEqual("");
+                test_step.dependOn(&run.step);
+            }
+        }
+    }
+    for ([_]struct { name: []const u8, source: []const u8, diagnostic: []const u8 }{
+        .{ .name = "recursive", .source = "let U=union{items:[]U,none,}\nlet main:()={}", .diagnostic = "cyclic" },
+        .{ .name = "mutually-recursive", .source = "let U=union{items:[]R,none,}\nlet R=struct{values:[]U,}\nlet main:()={}", .diagnostic = "cyclic" },
+        .{ .name = "recursive-nested-array", .source = "let U=union{items:[][]U,none,}\nlet main:()={}", .diagnostic = "cyclic" },
+        .{ .name = "recursive-generic", .source = "let G:(T:type)->type=union{items:[]G(T),none,}\nlet f:(x:G(int))={}", .diagnostic = "cyclic" },
+        .{ .name = "direct-nested-union", .source = "let Inner=union{none,}\nlet U=union{value:Inner,}\nlet f:(x:U)={}", .diagnostic = "not supported" },
+        .{ .name = "direct-function", .source = "let U=union{value:()->int,}\nlet f:(x:U)={}", .diagnostic = "not supported" },
+        .{ .name = "direct-range", .source = "let U=union{value:@TypeOf(1..3),}\nlet f:(x:U)={}", .diagnostic = "not supported" },
+        .{ .name = "array-void", .source = "let U=union{items:[]void,}\nlet f:(x:U)={}", .diagnostic = "not supported" },
+        .{ .name = "array-type", .source = "let U=union{items:[]type,}\nlet f:(x:U)={}", .diagnostic = "not supported" },
+        .{ .name = "array-reference", .source = "let U=union{items:[]&int,}\nlet f:(x:U)={}", .diagnostic = "references cannot escape" },
+        .{ .name = "reference-payload", .source = "let U=union{value:&int,}\nlet f:(x:U)={}", .diagnostic = "not supported" },
+        .{ .name = "reference-escape", .source = "let bad:()->&int={let mut value=1\n&value}\nlet main:()={}", .diagnostic = "reference" },
+        .{ .name = "wrong-array-payload", .source = "let U=union{items:[]int,}\nlet f:()->U=.items[[true]]", .diagnostic = "error:" },
+        .{ .name = "propagation-error-type", .source = "let std=@import(\"std\")\nlet f:(x:std.Result([]int,[]string))->std.Result([]int,[]bool)=.ok[x.!]", .diagnostic = "error:" },
+    }) |case| {
+        const source = b.fmt("invalid-union-array-{s}.nov", .{case.name});
+        _ = fixtures.add(source, case.source);
+        const check = b.addRunArtifact(exe);
+        check.step.name = b.fmt("CLI union arrays: reject {s}", .{case.name});
+        check.setCwd(fixtures.getDirectory());
+        check.addArgs(&.{ "check", "--semantic", source, "--lib-dir" });
+        check.addDirectoryArg(library);
+        check.expectExitCode(1);
+        check.expectStdOutEqual("");
+        check.expectStdErrMatch(".nov:");
+        check.expectStdErrMatch("error:");
+        check.expectStdErrMatch(case.diagnostic);
+        test_step.dependOn(&check.step);
+    }
+}
+
 fn addStorableArrayCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
     _ = fixtures.add("storable-arrays.nov", @embedFile("examples/storable-arrays.nov"));
@@ -2727,7 +2802,7 @@ fn addStorableArrayCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_st
         .{ .name = "union-nominal", .source = "let U=union{none,}\nlet V=union{none,}\nlet f:(a:U,b:V)={let x:[]U=[a,b]\n}", .diagnostic = mismatch },
         .{ .name = "record-nominal", .source = "let R=struct{n:int,}\nlet S=struct{n:int,}\nlet f:(a:R,b:S)={let x:[]R=[a,b]\n}", .diagnostic = mismatch },
         .{ .name = "recursive-record", .source = "let R=struct{items:[][]R,}\nlet main:()={}", .diagnostic = "cyclic by-value struct layout" },
-        .{ .name = "recursive-union", .source = "let U=union{items:[]U,none,}\nlet main:()={}", .diagnostic = unsupported_type },
+        .{ .name = "recursive-union", .source = "let U=union{items:[]U,none,}\nlet main:()={}", .diagnostic = "cyclic" },
         .{ .name = "recursive-generic", .source = "let G:(T:type)->type=struct{items:[]G(T),}\nlet f:(a:G(int))={}", .diagnostic = "cyclic generic container instantiation" },
     }) |case| {
         const source = b.fmt("invalid-storable-array-{s}.nov", .{case.name});
@@ -3159,7 +3234,7 @@ fn addArraySearchCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step
         .{ .name = "find-parameter", .expression = "std.array.find(@as([]int,[1]),(x:bool)->bool{x})", .diagnostic = "constraints require exactly identical types" },
         .{ .name = "index-result", .expression = "std.array.findIndex(@as([]int,[1]),(x:int)->int{x})", .diagnostic = "constraints require exactly identical types" },
         .{ .name = "each-nonvoid", .expression = "std.array.each(@as([]int,[1]),(x:int)->int{x})", .diagnostic = "constraints require exactly identical types" },
-        .{ .name = "find-array", .expression = "std.array.find(@as([][]int,[[1]]),yes)", .diagnostic = "not supported" },
+        .{ .name = "find-array-parameter", .expression = "std.array.find(@as([][]int,[[1]]),(x:int)->bool{true})", .diagnostic = "constraints require exactly identical types" },
         .{ .name = "find-union", .expression = "std.array.find(@as([]Payload,[.none[]]),yes)", .diagnostic = "not supported" },
         .{ .name = "find-function", .expression = "std.array.find([()->int{1}],yes)", .diagnostic = "not supported" },
         .{ .name = "find-range", .expression = "std.array.find([1..3],yes)", .diagnostic = "not supported" },
@@ -3328,7 +3403,7 @@ fn addContainerMapCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_ste
         .{ .name = "option-void-output", .source = "let x:std.Option(int)=.some[1]\nlet y=x.map((v)->void{})", .diagnostic = "[] for void" },
         .{ .name = "result-void-output", .source = "let x:std.Result(int,string)=.ok[1]\nlet y=x.map((v)->void{})", .diagnostic = "[] for void" },
         .{ .name = "error-void-output", .source = "let x:std.Result(int,string)=.err[\"bad\"]\nlet y=x.mapErr((v)->void{})", .diagnostic = "[] for void" },
-        .{ .name = "option-array-output", .source = "let x:std.Option(int)=.some[1]\nlet y=x.map((v){[v]})", .diagnostic = "not supported" },
+        .{ .name = "option-array-output-conflict", .source = "let x:std.Option(int)=.some[1]\nlet y:std.Option([]bool)=x.map((v){[v]})", .diagnostic = "error:" },
         .{ .name = "result-function-output", .source = "let x:std.Result(int,string)=.ok[1]\nlet y=x.map((v){()->int{v}})", .diagnostic = "not supported" },
         .{ .name = "error-union-output", .source = "let x:std.Result(int,string)=.err[\"bad\"]\nlet y=x.mapErr((v){std.Option(int).some[1]})", .diagnostic = "not supported" },
     }) |case| {

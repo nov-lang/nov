@@ -1262,7 +1262,7 @@ let z = [ 10, 20, 30 ]
 Ordinary module declarations such as `let Value = union { number: int, text: string, empty, }`
 introduce nominal tagged value types. Separate declarations remain distinct; aliases
 preserve identity. The current executable subset supports bool, integer, float, rune, string,
-void, enum, and existing acyclic nominal struct payloads, with no payload defaults. As with structs, integer fields are
+void, enum, array, and existing acyclic nominal struct payloads, with no payload defaults. As with structs, integer fields are
 checked semantically through 128 bits, while reachable C layouts require
 8/16/32/64-bit widths.
 
@@ -1274,7 +1274,7 @@ checked semantically through 128 bits, while reachable C layouts require
   capture when unused. Every variant must be covered, or use a final `_`.
   Unknown variants, repeated/covered prongs and missing variants diagnose.
 - Assignment, arguments, returns and control-flow results copy the tag and active
-  payload, recursively detaching array backing in record payloads;
+  payload, recursively detaching direct array payloads and arrays in record payloads;
   strings share immutable backing storage. C emission uses a tag and separate
   zero-initialized payload fields, not an overlapping C union. String owner fields
   are rooted, including across allocations and early returns. Payload extraction
@@ -1289,7 +1289,15 @@ checked semantically through 128 bits, while reachable C layouts require
   their string fields share immutable storage. Constructors, captures and `.!`
   work with records and aliases. C emits payload record layouts before containing
   unions and roots each nested string owner, with inactive payload fields zeroed.
-- Explicit tag enums, nested union/array/function payloads, variant-pattern
+- Array payloads include nested arrays and arrays of any existing storable element
+  type. `Option([]int)`, `Result([]string, E)` and `union { values: [][]int, none, }`
+  use ordinary constructors, matches, captures, printing and `.!`. Arrays nested
+  inside the active payload copy independently; inactive payload fields remain
+  zeroed and their arrays are not cloned. Immutable strings share backing and
+  closure elements share existing environments. Recursive layouts, including
+  cycles through array elements, remain rejected. See
+  [`examples/union-arrays.nov`](examples/union-arrays.nov).
+- Explicit tag enums, direct nested-union/function/range/reference payloads, variant-pattern
   alternatives, nested destructuring, direct payload field access, union equality
   and union globals remain unsupported.
 
@@ -1635,8 +1643,8 @@ array.each([1, 2, 3], (x) { @println(x) })
 
 `find` requires an element type supported as an `Option` payload: bool, integers,
 floats, runes, strings, enums and supported acyclic records (including array
-fields). Bare arrays, unions, functions and ranges are not yet union payloads;
-use `findIndex` for those element types. The other helpers accept all supported
+fields), and arrays (including nested arrays). Direct unions, functions and
+ranges are not yet union payloads; use `findIndex` for those element types. The other helpers accept all supported
 array element types. `find` returns a value, not a reference to source storage.
 See [`examples/array-search.nov`](examples/array-search.nov) for a runnable example
 and seven tests.
@@ -1815,8 +1823,8 @@ let main: () -> void = {
   share backing. Function elements copy their function value and share the existing
   closure environment/captured cells, not a deep-cloned closure; immutable capture
   snapshots and mutable shared-cell capture rules are unchanged. Range elements
-  copy bounds and inclusivity by value. Union arrays do not expand the supported
-  payload types: direct array/union/function payloads remain unsupported.
+  copy bounds and inclusivity by value. Union payloads may be arrays, but direct
+  union/function/range/reference payloads remain unsupported.
   Immutable arrays
   cannot have their elements changed. Parameters are immutable; copy into a
   mutable local to edit them.

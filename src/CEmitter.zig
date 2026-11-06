@@ -6406,6 +6406,164 @@ test "union extraction checks the active tag even in forged well typed IR" {
     for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 1, "", "panic: inactive union payload\n", mode);
 }
 
+// Construct canonical IR directly: backend coverage must not depend on source
+// lifetime or frontend admission of array payload syntax.
+fn arrayPayloadTestLibrary() ![]u8 {
+    var ir = Ir.init(test_gpa);
+    defer ir.deinit();
+    const span: Ir.Span = .{ .start = 0, .end = 0 };
+    const unit = try ir.internType(.void);
+    const integer = try ir.internType(.{ .integer = .{ .bits = 32, .signedness = .signed } });
+    const text = try ir.internType(.string);
+    const concat_sig = try ir.internType(.{ .function = .{ .params = &.{ text, text }, .result = text } });
+    const concat = try ir.addFunction("concat", concat_sig, span);
+    try ir.setFunctionBody(concat, &.{
+        .{ .ty = text, .span = span, .op = .{ .parameter = 0 } },
+        .{ .ty = text, .span = span, .op = .{ .parameter = 1 } },
+        .{ .ty = text, .span = span, .op = .{ .binary = .{ .op = .add, .lhs = @fromBackingInt(@intCast(0)), .rhs = @fromBackingInt(@intCast(1)) } } },
+    }, @fromBackingInt(@intCast(2)));
+    const leaf = try ir.internType(.{ .record = .{ .identity = 100, .tagged = true, .fields = &.{} } });
+    const strings = try ir.internType(.{ .array = text });
+    try ir.setRecordFields(leaf, &.{ .{ .name = "text", .ty = text, .span = span }, .{ .name = "none", .ty = unit, .span = span }, .{ .name = "items", .ty = strings, .span = span } });
+    const fn_ty = try ir.internType(.{ .function = .{ .params = &.{}, .result = integer } });
+    const closure = try ir.addFunction("closure", fn_ty, span);
+    ir.functions.items[@backingInt(closure)].is_closure = true;
+    const value = try ir.internConstant(.{ .ty = integer, .value = .{ .signed_integer = 7 } });
+    try ir.setFunctionBody(closure, &.{.{ .ty = integer, .span = span, .op = .{ .constant = value } }}, @fromBackingInt(@intCast(0)));
+    const range = try ir.internType(.{ .range = integer });
+    const elements = [_]Ir.TypeId{ strings, leaf, fn_ty, range };
+    var aliases = std.Io.Writer.Allocating.init(test_gpa);
+    defer aliases.deinit();
+    for (elements, 0..) |element, i| {
+        const array = try ir.internType(.{ .array = element });
+        const payload = try ir.internType(.{ .record = .{ .identity = @intCast(101 + i), .tagged = true, .fields = &.{} } });
+        try ir.setRecordFields(payload, &.{ .{ .name = "some", .ty = array, .span = span }, .{ .name = "other", .ty = array, .span = span }, .{ .name = "none", .ty = unit, .span = span } });
+        const signature = try ir.internType(.{ .function = .{ .params = &.{payload}, .result = payload } });
+        const name = try std.fmt.allocPrint(test_gpa, "copypayload{d}", .{i});
+        defer test_gpa.free(name);
+        const f = try ir.addFunction(name, signature, span);
+        const p: Ir.ValueId = @fromBackingInt(@intCast(0));
+        try ir.setFunctionBody(f, &.{ .{ .ty = payload, .span = span, .op = .{ .parameter = 0 } }, .{ .ty = payload, .span = span, .op = .{ .array_clone = p } } }, @fromBackingInt(@intCast(1)));
+        try aliases.writer.writeAll("typedef ");
+        try writeType(&ir, &aliases.writer, payload);
+        try aliases.writer.print(" Payload{d};\n#define ELEMENT{d} nov_element_{d}\n", .{ i, i, @backingInt(element) });
+        if (i == 0) {
+            const read_sig = try ir.internType(.{ .function = .{ .params = &.{payload}, .result = array } });
+            const read = try ir.addFunction("readpayload", read_sig, span);
+            try ir.setFunctionBody(read, &.{ .{ .ty = payload, .span = span, .op = .{ .parameter = 0 } }, .{ .ty = array, .span = span, .op = .{ .union_payload = .{ .base = p, .index = 0 } } } }, @fromBackingInt(@intCast(1)));
+            const show_sig = try ir.internType(.{ .function = .{ .params = &.{payload}, .result = unit } });
+            const show = try ir.addFunction("showpayload", show_sig, span);
+            try ir.setFunctionBody(show, &.{ .{ .ty = payload, .span = span, .op = .{ .parameter = 0 } }, .{ .ty = unit, .span = span, .op = .{ .print = .{ .args = &.{p}, .newline = true } } } }, @fromBackingInt(@intCast(1)));
+        }
+    }
+    try aliases.writer.writeAll("typedef ");
+    try writeType(&ir, &aliases.writer, leaf);
+    try aliases.writer.writeAll(" Leaf;\ntypedef ");
+    try writeType(&ir, &aliases.writer, fn_ty);
+    try aliases.writer.writeAll(" Closure;\ntypedef ");
+    try writeType(&ir, &aliases.writer, range);
+    try aliases.writer.print(" Range;\n#define TEXT_ELEMENT nov_element_{d}\n", .{@backingInt(text)});
+    const library = try emit(test_gpa, &ir, null);
+    defer test_gpa.free(library);
+    return std.mem.concat(test_gpa, u8, &.{ library, aliases.written() });
+}
+
+test "array union payload source free recursive copies precise roots printing forced GC O0 O3" {
+    const library = try arrayPayloadTestLibrary();
+    defer test_gpa.free(library);
+    const driver =
+        \\int main(void) {
+        \\ nov_rt_heap.collect_every_allocation=1;
+        \\ Payload0 a={0}, b={0}; Payload1 u={0}, v={0}; Payload2 f={0}, g={0}; Payload3 r={0}, s={0};
+        \\ void **roots[]={&a.f0.data,&b.f0.data,&u.f0.data,&v.f0.data,&f.f0.data,&g.f0.data,&r.f0.data,&s.f0.data};
+        \\ nov_gc_roots frame={0}; nov_gc_push(&nov_rt_heap,&frame,roots,8);
+        \\ if(ELEMENT0.pointer_count!=1 || ELEMENT0.pointer_offsets[0]!=offsetof(nov_array,data) || ELEMENT1.pointer_count!=2 || ELEMENT1.pointer_offsets[0]!=offsetof(Leaf,f0.owner) || ELEMENT1.pointer_offsets[1]!=offsetof(Leaf,f2.data) || ELEMENT2.pointer_count!=1 || ELEMENT2.pointer_offsets[0]!=offsetof(Closure,env) || ELEMENT3.pointer_count) return 10;
+        \\ a.f0=nov_array_new(1,1,&ELEMENT0);
+        \\ ((nov_array*)a.f0.data)[0]=nov_array_new(1,1,&TEXT_ELEMENT);
+        \\ ((nov_string*)((nov_array*)a.f0.data)[0].data)[0]=nov_concat((nov_string){NULL,(const unsigned char*)"a",1},(nov_string){NULL,(const unsigned char*)"b",1});
+        \\ b=nov_copypayload0(a);
+        \\ if(a.f0.data==b.f0.data || ((nov_array*)a.f0.data)[0].data==((nov_array*)b.f0.data)[0].data || b.f1.data) return 11;
+        \\ ((nov_string*)((nov_array*)a.f0.data)[0].data)[0]=(nov_string){NULL,(const unsigned char*)"changed",7};
+        \\ a.f0=(nov_array){0}; nov_gc_collect(&nov_rt_heap); nov_showpayload(b);
+        \\ if(nov_readpayload(b).data!=b.f0.data) return 12;
+        \\ u.f0=nov_array_new(3,3,&ELEMENT1);
+        \\ ((Leaf*)u.f0.data)[0].f0=((nov_string*)((nov_array*)b.f0.data)[0].data)[0]; ((Leaf*)u.f0.data)[1].tag=1;
+        \\ ((Leaf*)u.f0.data)[2].tag=2; ((Leaf*)u.f0.data)[2].f2=((nov_array*)b.f0.data)[0];
+        \\ v=nov_copypayload1(u);
+        \\ if(u.f0.data==v.f0.data || ((Leaf*)u.f0.data)[2].f2.data==((Leaf*)v.f0.data)[2].f2.data) return 18;
+        \\ u.f0=(nov_array){0}; nov_gc_collect(&nov_rt_heap);
+        \\ if(((Leaf*)v.f0.data)[0].f0.len!=2 || ((Leaf*)v.f0.data)[1].f0.owner) return 13;
+        \\ f.f0=nov_array_new(1,1,&ELEMENT2);
+        \\ ((Closure*)f.f0.data)[0].code=nov_closure;
+        \\ ((Closure*)f.f0.data)[0].env=nov_gc_alloc_repeated(&nov_rt_heap,&ELEMENT3,1);
+        \\ g=nov_copypayload2(f);
+        \\ if(f.f0.data==g.f0.data || ((Closure*)f.f0.data)[0].env!=((Closure*)g.f0.data)[0].env) return 14;
+        \\ f.f0=(nov_array){0}; nov_gc_collect(&nov_rt_heap);
+        \\ if(((Closure*)g.f0.data)[0].code(((Closure*)g.f0.data)[0].env)!=7) return 15;
+        \\ r.f0=nov_array_new(1,1,&ELEMENT3); ((Range*)r.f0.data)[0]=(Range){1,4,true}; s=nov_copypayload3(r);
+        \\ if(r.f0.data==s.f0.data || ((Range*)s.f0.data)[0].end!=4) return 16;
+        \\ nov_gc_pop(&nov_rt_heap,&frame); nov_gc_collect(&nov_rt_heap); if(nov_rt_heap.live_objects || nov_rt_heap.frames) return 17;
+        \\ nov_gc_shutdown(&nov_rt_heap); return 0;
+        \\}
+    ;
+    const c = try std.mem.concat(test_gpa, u8, &.{ library, "\n", driver });
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "anonymous.some[[[ab]]]\n", "", mode);
+}
+
+test "array union payload captures references and shared closure environments forced GC O0 O3" {
+    const source =
+        \\let U=union{some:[][]string,none,}
+        \\let F=union{some:[]()->int,none,}
+        \\let main:()={
+        \\ let mut value:U=.some[[["a"+"b"]]]
+        \\ let saved=value
+        \\ let snapshot=()->U {saved}
+        \\ let replace=(){value=.none[]}
+        \\ let mut rows=match value {.some=>|a|a
+        \\ .none=>@as([][]string,[])}
+        \\ let row=&rows[0]
+        \\ row.*[0]="changed"
+        \\ replace()
+        \\ @assert("{value}"=="U.none" and "{snapshot()}"=="U.some[[[ab]]]")
+        \\ let mut count=0
+        \\ let f=()->int {count+=1
+        \\ count}
+        \\ let functions:F=.some[[f]]
+        \\ let copied=functions
+        \\ let first=match functions {.some=>|a|a
+        \\ .none=>@as([]()->int,[])}
+        \\ let second=match copied {.some=>|a|a
+        \\ .none=>@as([]()->int,[])}
+        \\ @assert(first[0]()==1 and second[0]()==2 and count==2)
+        \\ @println(snapshot())
+        \\}
+    ;
+    const library = try emitSource(source, null);
+    defer test_gpa.free(library);
+    const c = try collectingTestProgram(library);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "U.some[[[ab]]]\n", "", mode);
+}
+
+test "array union payload source free inactive copies OOM and invalid runtime tags" {
+    const library = try arrayPayloadTestLibrary();
+    defer test_gpa.free(library);
+    for ([_]struct { driver: []const u8, code: u8, message: []const u8 }{
+        .{ .driver = "int main(void){Payload0 n={.tag=2}; n=nov_copypayload0(n); return n.tag!=2 || n.f0.data || n.f1.data;}", .code = 0, .message = "" },
+        .{ .driver = "int main(void){budget=2;Payload0 n={0};void **roots[]={&n.f0.data};nov_gc_roots frame={0};nov_gc_push(&nov_rt_heap,&frame,roots,1);n.f0=nov_array_new(1,1,&ELEMENT0);((nov_array*)n.f0.data)[0]=nov_array_new(1,1,&TEXT_ELEMENT);budget=1;nov_rt_heap.collect_every_allocation=1;(void)nov_copypayload0(n);return 0;}", .code = 1, .message = "panic: GC allocation failed\n" },
+        .{ .driver = "int main(void){Payload0 n={.tag=2}; (void)nov_readpayload(n); return 0;}", .code = 1, .message = "panic: inactive union payload\n" },
+        .{ .driver = "int main(void){Payload0 n={.tag=99}; nov_showpayload(n); return 0;}", .code = 1, .message = "panic: invalid union tag\n" },
+    }) |case| {
+        const c = try std.mem.concat(test_gpa, u8, &.{ "#include <stdlib.h>\nstatic size_t budget;\nstatic void *deny_malloc(size_t n){if(!budget)return NULL;--budget;return malloc(n);}\n#define NOV_GC_MALLOC deny_malloc\n#define NOV_GC_FREE free\n", library, "\n", case.driver });
+        defer test_gpa.free(c);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode|
+            try compileAndRunMode(c, "typedef int nonempty_translation_unit;", case.code, "", case.message, mode);
+    }
+}
+
 test "union payload integer storage preserves every backend width and boundary" {
     const source = "let U=union{a:i8,b:u8,c:i16,d:u16,e:i32,f:u32,g:i64,h:u64,}\n" ++
         "let show:(u:U)=match u{.a=>|v|@print(v)\n.b=>|v|@print(v)\n.c=>|v|@print(v)\n.d=>|v|@print(v)\n.e=>|v|@print(v)\n.f=>|v|@print(v)\n.g=>|v|@print(v)\n.h=>|v|@print(v)}\n" ++
