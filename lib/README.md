@@ -17,6 +17,43 @@ let text = std.string
 ordinary library declarations, not compiler builtins or automatically injected
 bare names.
 
+## Storable struct fields
+
+Struct fields may hold every ordinary storable runtime value, including the
+standard library's unions, callbacks and ranges:
+
+```nov
+let Processor = struct {
+    run: (int) -> int,
+    outcome: std.Result([]int, string),
+    interval: @TypeOf(0..10),
+}
+
+let main: () = {
+    let processor = Processor[
+        .run = (value) { value + 1 },
+        .outcome = .ok[[1, 2]],
+        .interval = 0..10,
+    ]
+    @println(processor.run(4), processor.outcome)
+}
+```
+
+Ordinary record copies recursively detach arrays, including those in active union
+fields. Function fields share their existing closure environments/captured cells;
+range fields copy typed bounds and inclusivity. Exact-type field replacement and
+existing mutable nested paths apply to these fields too. A field call selects its
+callee once before argument expressions and does not insert a receiver parameter;
+fields take lookup precedence over methods. Reference-parameter callbacks retain
+ordinary explicit borrowing/forwarding rules, without permitting reference fields.
+
+Union-valued fields print recursively with existing converters. Function/range
+fields require an enclosing valid stringify hook to print the whole record.
+Defaults remain restricted to the existing scalar literals—no runtime callbacks,
+aggregate defaults, or deferred `#` compile-time arguments are enabled. Void/type/
+namespace/reference fields and recursive type/signature graphs remain unsupported.
+See `examples/storable-fields.nov` for a runnable example and six tests.
+
 ## Result
 
 `Result(T, E)` has variants `ok: T` and `err: E`.
@@ -111,8 +148,8 @@ Only active tag chains are inspected, copied and formatted; arrays inside them
 retain recursively independent backing. Inactive by-value fields remain zeroed.
 Malformed active tags panic before allocating copies or invoking formatters.
 Default output retains nested union tags and uses exact nested stringify hooks.
-Direct union fields in structs, recursive type/layout graphs and reference
-payloads remain unsupported. See `examples/nested-unions.nov` for a runnable example and six tests.
+Struct fields may hold these unions directly; recursive type/layout graphs and
+reference payloads remain unsupported. See `examples/nested-unions.nov` for a runnable example and six tests.
 
 ## Function and range payloads
 
@@ -135,7 +172,7 @@ not storable payloads, and closures cannot capture them.
 Functions and ranges remain unprintable by default, including inside a union or
 array. An enclosing valid `@[stringify]` hook can provide a representation and stop
 structural recursion. Even an empty Option of a callable type needs such a hook
-for printing. Direct function/range/union struct fields and recursive structural
+for printing. Struct fields may also hold these values directly; recursive structural
 signature graphs remain unsupported. See `examples/value-payloads.nov` for a
 runnable example and six tests.
 

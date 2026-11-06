@@ -50,6 +50,20 @@ results. See `examples/array-fields.nov`.
 
 ## Current delivered status
 
+Struct fields support all ordinary storable runtime types, including unions,
+functions/closures and ranges. References, void/type/namespaces and unspecialized
+generic templates remain non-storable, and recursive structural type graphs
+remain rejected. Existing scalar literal defaults are unchanged; no deferred #
+arguments or new compile-time/default evaluation is implemented. Direct callable
+fields evaluate receiver/callee once before argument effects with no injected
+receiver, taking precedence over method lookup. Noncallable fields do not fall
+back to methods. Aliases, pipes, explicit dereferences, generic expected callbacks
+and reference-parameter forwarding preserve ordinary call rules. Copies recurse
+through active union arrays, share closure environments/cells, and copy range
+bounds/inclusivity; exact field replacement and supported nested paths work.
+Formatting accepts direct function-type fields; default printability still requires
+an enclosing hook for functions/ranges. See examples/storable-fields.nov (six tests).
+
 Function/closure and range union payloads are supported, completing ordinary
 storable value payload coverage. Callable copies share environments/captured cells;
 range copies carry typed bounds/inclusivity without allocation. Match/.! extract
@@ -58,7 +72,7 @@ inline range constructors are disambiguated from slicing using the variant base;
 omitted endpoints remain invalid. Contextual generic function specialization,
 container maps/chains/find, exact types, active roots/zeroed inactive slots and
 copy behavior are covered. Functions/ranges remain unprintable unless an enclosing
-stringify hook stops recursion. Direct struct fields of function/union/range type,
+stringify hook stops recursion. Direct struct fields now support those types;
 reference payloads/escape, recursive layouts and structural signature cycles remain
 unsupported. Function/reference edges do not consume inline-layout depth. See
 examples/value-payloads.nov (six tests).
@@ -73,8 +87,8 @@ validation precedes allocating copies and formatting; detached array-element
 normalization preserves source backing. Static GC descriptors retain the existing
 zero-inactive-pointer-slot invariant in rooted backing (not arbitrary foreign
 poisoned GC pointers). Default printing retains nested tags and user hooks.
-Finite acyclic layout/depth rules remain; direct union struct fields, reference
-payloads and recursive structural type/layout graphs are unsupported. See
+Finite acyclic layout/depth rules remain; direct union struct fields work, while
+reference payloads and recursive structural type/layout graphs are unsupported. See
 examples/nested-unions.nov (six tests).
 
 Direct array union payloads are implemented, including Option([]T), Result([]T,E),
@@ -323,7 +337,7 @@ Typed bindings, `@as` and callback contexts can demand ordinary canonical functi
 references. Callback inference combines other arguments and expected results
 bidirectionally, without duplicating runtime evaluation. Aliases, imports/public
 reexports and static methods retain existing visibility rules. Runtime-polymorphic
-unspecialized values, bound method values and callable fields remain deferred. See
+unspecialized values and bound method values remain deferred; callable fields work. See
 the bounded inference section below and README.md for the precise solver boundary.
 
 Demand-driven canonical specialization is bounded to 64 expansion levels and
@@ -494,7 +508,7 @@ empty reversed ranges and inclusive-MAX exhaustion remain unchanged. Otherwise
 unconstrained numeric-expression bounds now use int after typed-bound inference. No allocation.
 Inferred arrays of ranges work, copying bounds/inclusivity by value. No new range
 annotation syntax is added, but @TypeOf(0..1) can name an exact range type for
-signatures and union payloads. Direct struct fields, globals, field attributes,
+signatures, struct fields and union payloads. Globals, field attributes,
 printing/equality/membership and general iterator protocols remain unsupported.
 See examples/range-values.nov. Chained ranges diagnose; slice/match syntax preserved.
 
@@ -524,7 +538,8 @@ Recursive layouts or depth over 128 aggregate levels diagnose; nested values mus
 be supplied explicitly (scalar literal defaults unchanged). C topological layouts
 and recursively flattened string-owner roots preserve GC safety. Validation includes
 late generic layouts, forged cycles, deep graphs and zero-root diamond performance.
-See examples/nested-structs.nov. Array fields now work; union/function fields remain unsupported.
+See examples/nested-structs.nov and examples/storable-fields.nov. Array, union,
+function/closure and range fields are supported.
 
 Direct mutable-local struct fields support exact bool/integer/float/rune/string/enum assignment,
 integer +=/-=/*=//=/%= and string +=. Compounds snapshot the old field before RHS;
@@ -582,7 +597,8 @@ the exact nominal receiver type. Receiver evaluates/snapshots once before explic
 arguments left-to-right; direct noreturn methods remain terminal. Fields retain
 lookup precedence. Generic instance methods now infer method-local backtick
 variables, sharing canonical specializations with static/direct calls. No implicit
-mutation/borrowing, bound method references or callable fields are supported.
+mutation/borrowing or bound method references are supported. Callable fields use
+ordinary function calls, not method receiver insertion.
 structured-errors.nov uses Entry.describe().
 
 Nominal unnumbered enums are executable: qualified/contextual tags, aliases, exact
@@ -1629,7 +1645,7 @@ environments; GC retains escaped specialized values and transitive captures.
 Existing inference limits, borrowing restrictions and exact-type rules still apply.
 
 Still deferred: local recursion, runtime-polymorphic unspecialized generic function
-values, bound method values and callable fields. Local template bindings must be
+values and bound method values. Callable struct fields are supported. Local template bindings must be
 immutable; copying/passing/returning requires a concrete specialization context.
 Module-scope inferred generic expressions remain rejected; named generic
 declarations remain supported. No explicit function specialization syntax or

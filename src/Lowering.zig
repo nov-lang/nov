@@ -295,8 +295,8 @@ test "generic structs reject unsupported fields inexact defaults constructors an
     const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag };
     for ([_]Case{
         .{ .source = "let Bad=Box(void)", .tag = .unsupported_type },
-        .{ .source = "let Bad=Box(()->int)", .tag = .unsupported_type },
-        .{ .source = "let U=union{ok:int,}\nlet Bad=Box(U)", .tag = .unsupported_type },
+        .{ .source = "let Bad=Box(&int)", .tag = .unsupported_type },
+        .{ .source = "let U=union{ok:Box(U),}\nlet Bad=Box(U)", .tag = .record_layout_cycle },
         .{ .source = "let G:(T:type)->type=struct{items:[]T,}\nlet Bad=G(void)", .tag = .unsupported_type },
         .{ .source = "let G:(T:type)->type=struct{value:T=true,}\nlet Bad=G(int)", .tag = .literal_type_mismatch },
         .{ .source = "let G:(T:type)->type=struct{value:T=256,}\nlet Bad=G(u8)", .tag = .literal_out_of_range },
@@ -861,12 +861,128 @@ test "nested unions reject capture mutation and inner unknown tags under OOM" {
     , .unknown_field);
 }
 
-test "nested unions keep invalid signatures references and struct fields unsupported under OOM" {
+fn testStorableFieldSelection(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "field-selection.nov",
+        \\let R=struct{callback:(int)->int,}
+        \\let main:()={let mut count:int=0
+        \\let mut r=R[.callback=(n){n+10}]
+        \\let receiver=()->R {count+=1
+        \\r}
+        \\let replace=()->int {r.callback=(n){n+100}
+        \\7}
+        \\let result=receiver().callback(replace())
+        \\@assert(result==17 and count==1)
+        \\@assert(r.callback(7)==107)}
+    );
+    defer module.deinit();
+    var result = try lower(&module);
+    defer result.deinit();
+    if (module.hasErrors()) std.debug.print("field selection: {any}\n", .{module.diagnostics.items});
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(result.lowering_complete);
+    try result.ir.verify();
+    const body = result.ir.functions.items[0].body.?;
+    var calls: [4]usize = undefined;
+    var count: usize = 0;
+    for (body.instructions, 0..) |instruction, i| {
+        if (instruction.op != .call) continue;
+        try std.testing.expect(count < calls.len);
+        calls[count] = i;
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 4), count);
+    const selected = @backingInt(body.instructions[calls[2]].op.call.callee);
+    try std.testing.expect(body.instructions[selected].op == .field_read);
+    try std.testing.expect(calls[0] < selected and selected < calls[1]);
+    try std.testing.expectEqual(calls[0], @backingInt(body.instructions[selected].op.field_read.base));
+    try std.testing.expectEqual(calls[1], @backingInt(body.instructions[calls[2]].op.call.args[0]));
+    try std.testing.expectEqual(@as(usize, 1), body.instructions[calls[2]].op.call.args.len);
+}
+
+test "storable fields select computed receivers once before captured argument mutation under OOM" {
+    try testStorableFieldSelection(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testStorableFieldSelection, .{});
+}
+
+test "storable fields callbacks aliases pipes generics references and readonly queries under OOM" {
+    try testUnionArrayPayloadsOom(
+        \\let Box:(T:type)->type=struct{value:T,}
+        \\let R=struct{callback:(int)->int,forward:(&mut int,int)->int,}
+        \\let id:(x:`T)->`T=x
+        \\let set:(p:&mut int,n:int)->int={p.* =n
+        \\p.*}
+        \\let invoke:(r:`T,n:int)->int=r.callback(n)
+        \\let query:(r:R)->@TypeOf(r.callback(1))=r.callback(2)
+        \\let main:()={let mut r=R[.callback=id,.forward=set]
+        \\let cb=r.callback
+        \\let a=cb(1)
+        \\let b=2 |> r.callback
+        \\let c=invoke(r,3)+r.callback(0)
+        \\let d=query(r)
+        \\r.callback=(x){x+1}
+        \\let boxed=Box((int)->int)[.value=(x){x+2}]
+        \\let e=boxed.value(4)
+        \\let p=&r
+        \\p.*.callback=(x){x+3}
+        \\let f=p.*.callback(5)
+        \\let mut n:int=0
+        \\let q=&n
+        \\let g=p.*.forward(q,6)
+        \\@assert(a==1 and b==2 and c==3 and d==2 and e==6 and f==8 and g==6)}
+    );
+}
+
+test "storable fields closure snapshots shared cells union copies and exact replacements under OOM" {
+    try testUnionArrayPayloadsOom(
+        \\let U=union{values:[][]int,none,}
+        \\let Range=@TypeOf(0..1)
+        \\let R=struct{callback:()->int,payload:U,bounds:Range,}
+        \\let main:()={let mut n:int=1
+        \\let mut xs:[]int=[1]
+        \\let mut r=R[.callback=()->int {n+=1
+        \\n+xs[0]},.payload=.values[[[1]]],.bounds=0..3]
+        \\xs[0]=9
+        \\let copy=r
+        \\let cb=r.callback
+        \\let a=cb()
+        \\let b=copy.callback()
+        \\let saved=r.payload
+        \\r.payload=.none[]
+        \\r.payload=.values[[[2]]]
+        \\r.bounds=1..=3
+        \\let mut total:uint=0
+        \\loop i in r.bounds {total+=i}
+        \\@assert(a==3 and b==4 and total==6)
+        \\match saved{.values=>|v|@assert(v[0][0]==1)
+        \\.none=>@assert(false)}}
+    );
+}
+
+test "storable fields reject inexact calls replacements defaults and capability escapes under OOM" {
+    for ([_]struct { source: []const u8, tag: Module.Diagnostic.Tag }{
+        .{ .source = "let R=struct{callback:(int)->int,}\nlet f:(r:R)=r.callback()", .tag = .argument_count_mismatch },
+        .{ .source = "let R=struct{callback:(int)->int,}\nlet f:(r:R)=r.callback(true)", .tag = .literal_type_mismatch },
+        .{ .source = "let R=struct{callback:(int)->int,}\nlet f:(r:R,x:(uint)->uint)->R=R[.callback=x]", .tag = .expression_type_mismatch },
+        .{ .source = "let R=struct{callback:(int)->int,}\nlet f:(r:R,x:(uint)->uint)={let mut v=r\nv.callback=x}", .tag = .expression_type_mismatch },
+        .{ .source = "let R=struct{callback:()->int=()->int {1},}", .tag = .invalid_field_default },
+        .{ .source = "let R=struct{bounds:@TypeOf(0..1)=0..1,}", .tag = .invalid_field_default },
+        .{ .source = "let U=union{x:int,}\nlet R=struct{payload:U=.x[1],}", .tag = .invalid_field_default },
+        .{ .source = "let U=union{x:int,}\nlet R=struct{payload:U,}\nlet f:(r:R)->int=r.payload.x", .tag = .unsupported_body_expression },
+        .{ .source = "let R=struct{callback:()->int,}\nlet f:(n:int)->R={let p=&n\nR[.callback=()->int {p.*}]}", .tag = .unsupported_borrow },
+        .{ .source = "let R=struct{callback:bool,}\nlet f:(r:R)->@TypeOf(r.callback())=1", .tag = .not_callable },
+        .{ .source = "let R=struct{callback:(int)->int,}\nlet f:(r:R)->@TypeOf(r.callback(true))=1", .tag = .generic_function_conflict },
+        .{ .source = "let R=struct{callback:(int)->int,}\nlet f:(r:R)->@TypeOf(r.callback())=1", .tag = .argument_count_mismatch },
+        .{ .source = "let U=union{x:int,}\nlet R=struct{payload:U,}\nlet f:(r:R)->@TypeOf(r.payload.x)=1", .tag = .unsupported_body_expression },
+        .{ .source = "let R=struct{callback:(&mut int,&mut int)->int,}\nlet f:(r:R)->int={let mut n:int=0\nr.callback(&n,&n)}", .tag = .borrow_conflict },
+    }) |case| try testNestedUnionRejected(case.source, case.tag);
+}
+
+test "nested unions and struct fields reject invalid signatures references void and cycles under OOM" {
     try testNestedUnionRejected("let U=union{value:(void)->int,}", .invalid_parameter_type);
-    try testNestedUnionRejected("let S=struct{value:()->int,}", .unsupported_type);
-    try testNestedUnionRejected("let S=struct{value:@TypeOf(0..1),}", .unsupported_type);
+    try testNestedUnionRejected("let S=struct{value:(void)->int,}", .invalid_parameter_type);
+    try testNestedUnionRejected("let S=struct{value:void,}", .unsupported_type);
     try testNestedUnionRejected("let U=union{value:&int,}", .unsupported_type);
-    try testNestedUnionRejected("let U=union{value:int,}\nlet S=struct{value:U,}", .unsupported_type);
+    try testNestedUnionRejected("let U=union{value:S,}\nlet S=struct{value:U,}", .record_layout_cycle);
 }
 
 test "nested unions reject direct mutual and array layout cycles under OOM" {
@@ -1167,7 +1283,7 @@ test "unsupported union declarations and rejected matches roll back under OOM" {
         .{ .source = "let U=union{ok:int,ok:string,}", .tag = .duplicate_field },
         .{ .source = "let U=union{ok:(void)->int,}", .tag = .invalid_parameter_type },
         .{ .source = "let R=struct{n:[][]U,}\nlet U=union{ok:R,}", .tag = .record_layout_cycle },
-        .{ .source = "let R=struct{n:U,}\nlet U=union{ok:R,}", .tag = .unsupported_type },
+        .{ .source = "let R=struct{n:U,}\nlet U=union{ok:R,}", .tag = .record_layout_cycle },
         .{ .source = "let R=struct{n:R,}\nlet U=union{ok:R,}", .tag = .record_layout_cycle },
 
         .{ .source = "let U=union{ok:&int,}", .tag = .unsupported_type },
@@ -1235,7 +1351,7 @@ test "nominal records reject mismatches malformed constructors defaults fields a
         .{ .source = "let A=struct{x:string=\"{true}\",}", .tag = .invalid_field_default },
         .{ .source = "let A=struct{x:int,x:int,}", .tag = .duplicate_field },
         .{ .source = "let A=struct{x:[][]A,}", .tag = .record_layout_cycle },
-        .{ .source = "let A=struct{x:()->int,}", .tag = .unsupported_type },
+        .{ .source = "let A=struct{x:&int,}", .tag = .unsupported_type },
         .{ .source = "let A=struct{x:A,}", .tag = .record_layout_cycle },
         .{ .source = "let A=struct{x:B,}\nlet B=struct{x:A,}", .tag = .record_layout_cycle },
         .{ .source = "let A=struct{x:int,}\nlet f:(a:A)={a.x=1}", .tag = .immutable_assignment },
@@ -2397,7 +2513,7 @@ test "closures reject borrowed captures recursion inferred parameters foreign AB
         "let main:()={let f=()->int {unknown}\n}",
         "@[extern(\"callback\")]\nlet foreign:(f:()->int)->int\nlet main:()={let f=()->int {1}\n@println(foreign(f))}",
         "@[export]\nlet foreign:(f:()->int)->int=f()",
-        "let R=struct{f:()->int,}\nlet main:()={}",
+        "let R=struct{f:()->int,}\nlet main:()={let r=R[.f=()->bool {true}]\n}",
         "let main:()={let a:[]()->int=[]\n@println(a)}",
         "let main:()={let mut n:int=0\nlet f=()->int {n}\nlet b=&n\n@println(f(),b.*)}",
         "let main:()={let mut n:int=0\nlet b=&n\nlet f=()->int {n}\n@println(b.*)}",

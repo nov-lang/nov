@@ -918,6 +918,37 @@ fn testTypeOfProbe(allocator: std.mem.Allocator) !void {
     try std.testing.expectEqual(@as(usize, 0), ir.local_generic_instances.items.len);
 }
 
+fn testStorableFieldProbe(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "field-probe.nov",
+        \\let R=struct{callback:(int)->int,}
+        \\let query:(r:R)->@TypeOf(r.callback(1))=missing
+        \\let invoke:(r:`T)->int=r.callback(1)+1
+    );
+    defer module.deinit();
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    ir.source_len = @intCast(module.source.ast.source.len);
+    const count = module.declarations.items.len;
+    const query = module.getDeclaration(module.lookup("query").?).?;
+    const signature = (try TypeResolver.resolveInScopeReadOnly(&module, &ir, module.source.ast.declFunction(query.node).?.proto_node, null, null, &.{})).?;
+    const function = ir.getType(signature).?.function;
+    const integer = try BodyChecker.defaultIntegerType(&ir);
+    try std.testing.expectEqual(integer, function.result);
+    const ref: Ref = .{ .module = &module, .id = module.lookup("invoke").? };
+    const result = try probeResult(&module, &ir, ref, &.{.{ .ty = function.params[0], .span = ref.span() }}, ref.span());
+    try std.testing.expectEqual(@as(?Ir.TypeId, integer), result);
+    try std.testing.expectEqual(count, module.declarations.items.len);
+    try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ir.functions.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ir.local_generic_instances.items.len);
+    try std.testing.expect(!ir.getType(function.params[0]).?.record.methods_published);
+}
+
+test "storable fields strict readonly signatures and generic probes publish no code under OOM" {
+    try testStorableFieldProbe(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testStorableFieldProbe, .{});
+}
+
 test "TypeOf readonly default queries preserve scopes and publication under OOM" {
     try testTypeOfProbe(std.testing.allocator);
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testTypeOfProbe, .{});
@@ -1823,6 +1854,11 @@ const Solver = struct {
             }
         }
         const base = root(try self.expression(frame, data.lhs, depth + 1));
+        if (self.tagged(base)) {
+            if (self.querying) try self.fail(.unsupported_body_expression, span, null);
+            self.unsupported = self.unsupported orelse span;
+            return self.term(.unknown, span);
+        }
         return self.fieldType(base, name, span, depth);
     }
 

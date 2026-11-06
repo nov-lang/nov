@@ -1585,7 +1585,7 @@ pub fn isManaged(ty: Type) bool {
 /// Direct nested unions retain nominal identity. Layout graph validation
 /// independently rejects cycles and excessive by-value depth.
 pub fn isUnionPayload(ty: Type) bool {
-    return isRecordField(ty) or ty == .void or ty == .record or ty == .function or ty == .range;
+    return isRecordField(ty) or ty == .void;
 }
 
 /// Query the layout DAG, visiting scalar diamonds only once. Closure values
@@ -1617,9 +1617,10 @@ pub fn needsArrayCopy(self: *const Ir, id: TypeId) std.mem.Allocator.Error!bool 
     return false;
 }
 
-/// Record fields use semantic integer limits, not array/backend storage widths.
+/// Ordinary fields have the same storable values and semantic widths as arrays.
+/// References and void are not field storage; defaults remain scalar constants.
 pub fn isRecordField(ty: Type) bool {
-    return (ty == .float and (ty.float == 32 or ty.float == 64)) or ty == .array or ty == .enumeration or ty == .boolean or ty == .rune or ty == .string or (ty == .record and !ty.record.tagged) or (ty == .integer and ty.integer.bits > 0 and ty.integer.bits <= 128);
+    return isArrayElement(ty);
 }
 
 pub fn isArrayElement(ty: Type) bool {
@@ -1811,7 +1812,7 @@ test "generic structs IR owns nominal arguments accepts array fields and rejects
     try ir.verify();
 }
 
-test "record payload layouts reject tagged fields and forged nominal operands" {
+test "record payload layouts reject references void cycles and forged nominal operands" {
     var ir = Ir.init(std.testing.allocator);
     defer ir.deinit();
     const span: Span = .{ .start = 0, .end = 0 };
@@ -1823,7 +1824,11 @@ test "record payload layouts reject tagged fields and forged nominal operands" {
     try ir.setRecordFields(r, &.{.{ .name = "s", .ty = text, .span = span }});
     try ir.setRecordFields(other, &.{.{ .name = "s", .ty = text, .span = span }});
     try ir.setRecordFields(u, &.{.{ .name = "ok", .ty = r, .span = span }});
-    try std.testing.expectError(error.InvalidArrayElement, ir.setRecordFields(r, &.{.{ .name = "nested", .ty = u, .span = span }}));
+    const unit = try ir.internType(.void);
+    const reference = try ir.internType(.{ .reference = .{ .child = text, .mutable = false } });
+    for ([_]TypeId{ unit, reference }) |invalid| {
+        try std.testing.expectError(error.InvalidArrayElement, ir.setRecordFields(r, &.{.{ .name = "nested", .ty = invalid, .span = span }}));
+    }
     try ir.setRecordFields(u, &.{.{ .name = "nested", .ty = array, .span = span }});
     try std.testing.expect(try ir.needsArrayCopy(u));
     try ir.setRecordFields(u, &.{.{ .name = "ok", .ty = r, .span = span }});
@@ -1840,8 +1845,12 @@ test "record payload layouts reject tagged fields and forged nominal operands" {
     ir.clearFunctions();
     try ir.verify();
     const fields = @constCast(ir.types.items[@backingInt(r)].record.fields);
+    for ([_]TypeId{ unit, reference }) |invalid| {
+        fields[0].ty = invalid;
+        try std.testing.expectError(error.InvalidArrayElement, ir.verify());
+    }
     fields[0].ty = u;
-    try std.testing.expectError(error.InvalidArrayElement, ir.verify());
+    try std.testing.expectError(error.CyclicRecordLayout, ir.verify());
     fields[0].ty = text;
     ir.types.items[@backingInt(r)].record.tagged = true;
     try ir.verify();
@@ -1875,7 +1884,7 @@ test "array union payload IR accepts storable elements and rejects forged cycles
         fields[0].ty = payload;
         try ir.verify();
         try std.testing.expect(!try ir.needsArrayCopy(u));
-        try std.testing.expect(!isRecordField(ir.getType(payload).?));
+        try std.testing.expect(isRecordField(ir.getType(payload).?));
     }
     fields[0].ty = saved;
     const inner = ir.getType(saved).?.array;
@@ -1902,7 +1911,7 @@ fn testValuePayloadLayouts(allocator: std.mem.Allocator) !void {
     try std.testing.expect(!try ir.needsArrayCopy(payload));
     for ([_]TypeId{ signature, range }) |ty| {
         try std.testing.expect(isUnionPayload(ir.getType(ty).?));
-        try std.testing.expect(!isRecordField(ir.getType(ty).?));
+        try std.testing.expect(isRecordField(ir.getType(ty).?));
     }
     const fields = @constCast(ir.types.items[@backingInt(payload)].record.fields);
     const recursive = try ir.internType(.{ .function = .{ .params = &.{payload}, .result = integer } });
@@ -1941,7 +1950,7 @@ test "nestedunion IR membership finite layouts and forged recursive graphs" {
     try ir.setRecordFields(inner, &.{ .{ .name = "some", .ty = array, .span = span }, .{ .name = "none", .ty = unit, .span = span } });
     try ir.setRecordFields(outer, &.{.{ .name = "inner", .ty = inner, .span = span }});
     try std.testing.expect(isUnionPayload(ir.getType(inner).?));
-    try std.testing.expect(!isRecordField(ir.getType(inner).?));
+    try std.testing.expect(isRecordField(ir.getType(inner).?));
     try std.testing.expect(try ir.needsArrayCopy(outer));
     try ir.verify();
     const fields = @constCast(ir.types.items[@backingInt(inner)].record.fields);
@@ -2355,6 +2364,63 @@ test "default printing memoizes shared type DAGs for empty arrays and respects h
     try std.testing.expectError(error.InvalidOperation, ir.verify());
 }
 
+test "storable fields exact constructors signatures cycles depth and scalar only defaults" {
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    const span: Span = .{ .start = 0, .end = 0 };
+    const unit = try ir.internType(.void);
+    const integer = try ir.internType(.{ .integer = .{ .bits = 32, .signedness = .signed } });
+    const text = try ir.internType(.string);
+    const record = try ir.internType(.{ .record = .{ .identity = 950, .fields = &.{} } });
+    const tagged = try ir.internType(.{ .record = .{ .identity = 951, .tagged = true, .fields = &.{} } });
+    const range = try ir.internType(.{ .range = integer });
+    const signature = try ir.internType(.{ .function = .{ .params = &.{integer}, .result = text } });
+    const reference = try ir.internType(.{ .reference = .{ .child = integer, .mutable = false } });
+    const array = try ir.internType(.{ .array = tagged });
+    const ins = struct {
+        fn make(ty: TypeId, op: Operation) Instruction {
+            return .{ .ty = ty, .span = .{ .start = 0, .end = 0 }, .op = op };
+        }
+    }.make;
+    for ([_]TypeId{ tagged, signature, range, array }) |field| {
+        try std.testing.expect(isRecordField(ir.getType(field).?));
+        try ir.setRecordFields(record, &.{.{ .name = "value", .ty = field, .span = span }});
+        const sig = try ir.internType(.{ .function = .{ .params = &.{field}, .result = record } });
+        const f = try ir.addFunction("construct", sig, span);
+        try std.testing.expectError(error.InvalidOperation, ir.setFunctionBody(f, &.{ins(record, .{ .record_init = &.{} })}, @fromBackingInt(0)));
+        try ir.setFunctionBody(f, &.{ ins(field, .{ .parameter = 0 }), ins(record, .{ .record_init = &.{@fromBackingInt(0)} }) }, @fromBackingInt(1));
+        try ir.verify();
+        try std.testing.expectError(error.NonConstantType, ir.internConstant(.{ .ty = field, .value = .void }));
+        const fields = @constCast(ir.types.items[@backingInt(record)].record.fields);
+        fields[0].default = try ir.internConstant(.{ .ty = integer, .value = .{ .signed_integer = 0 } });
+        try std.testing.expectError(error.ConstantTypeMismatch, ir.verify());
+        fields[0].default = null;
+        ir.clearFunctions();
+    }
+    for ([_]TypeId{ unit, reference }) |invalid| {
+        try std.testing.expectError(error.InvalidArrayElement, ir.setRecordFields(record, &.{.{ .name = "bad", .ty = invalid, .span = span }}));
+    }
+    try ir.setRecordFields(record, &.{});
+    const recursive = try ir.internType(.{ .function = .{ .params = &.{record}, .result = integer } });
+    const loan = try ir.internType(.{ .reference = .{ .child = record, .mutable = false } });
+    const recursive_loan = try ir.internType(.{ .function = .{ .params = &.{loan}, .result = integer } });
+    for ([_]TypeId{ recursive, recursive_loan, record }) |cycle| {
+        try ir.setRecordFields(record, &.{.{ .name = "cycle", .ty = cycle, .span = span }});
+        try std.testing.expectError(error.CyclicRecordLayout, ir.verify());
+    }
+    try ir.setRecordFields(record, &.{});
+    // Signature/reference edges remain structural, not inline depth, even
+    // when alternating with more records than the by-value depth limit.
+    var child = record;
+    for (0..max_record_depth + 1) |i| {
+        const ref = try ir.internType(.{ .reference = .{ .child = child, .mutable = false } });
+        const fn_ty = try ir.internType(.{ .function = .{ .params = &.{ref}, .result = child } });
+        child = try ir.internType(.{ .record = .{ .identity = @intCast(960 + i), .fields = &.{} } });
+        try ir.setRecordFields(child, &.{.{ .name = "callable", .ty = fn_ty, .span = span }});
+    }
+    try ir.verify();
+}
+
 test "default printing rejects nested functions ranges and void" {
     var ir = Ir.init(std.testing.allocator);
     defer ir.deinit();
@@ -2368,7 +2434,11 @@ test "default printing rejects nested functions ranges and void" {
     const ranges = try ir.internType(.{ .array = range });
     const nested_functions = try ir.internType(.{ .array = functions });
     const nested_ranges = try ir.internType(.{ .array = ranges });
-    for ([_]TypeId{ function, range, functions, ranges, nested_functions, nested_ranges }) |id| {
+    const function_record = try ir.internType(.{ .record = .{ .identity = 970, .fields = &.{} } });
+    const range_record = try ir.internType(.{ .record = .{ .identity = 971, .fields = &.{} } });
+    try ir.setRecordFields(function_record, &.{.{ .name = "callable", .ty = function, .span = span }});
+    try ir.setRecordFields(range_record, &.{.{ .name = "bounds", .ty = range, .span = span }});
+    for ([_]TypeId{ function, range, functions, ranges, nested_functions, nested_ranges, function_record, range_record }) |id| {
         ir.clearFunctions();
         const signature = try ir.internType(.{ .function = .{ .params = &.{id}, .result = string } });
         const f = try ir.addFunction("reject", signature, span);
@@ -4946,7 +5016,7 @@ test "range values require integer elements exact visible operands and immutable
     _ = try t.ir.internType(.{ .array = range });
     try std.testing.expectError(error.NonConstantType, t.ir.internConstant(.{ .ty = range, .value = .void }));
     try std.testing.expect(!isManaged(t.ir.getType(range).?));
-    try std.testing.expect(!isRecordField(t.ir.getType(range).?));
+    try std.testing.expect(isRecordField(t.ir.getType(range).?));
     try std.testing.expect(isUnionPayload(t.ir.getType(range).?));
     const make = TestFunctions.instruction;
     const good = [_]Instruction{

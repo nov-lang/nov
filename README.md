@@ -772,8 +772,8 @@ unsafe on a backedge. These conservative restrictions await effect analysis.
 
 Functions may be returned, passed, assigned, and selected by control flow using
 exact existing function types. Recursive local definitions, escaping reference
-capabilities, function-valued fields, and function-valued C ABI
-boundaries remain unsupported. Shared captures are single-threaded; no concurrency
+capabilities and function-valued C ABI boundaries remain unsupported. Struct
+function fields are supported as described under [Struct](#struct). Shared captures are single-threaded; no concurrency
 semantics are introduced. See [`examples/closures.nov`](examples/closures.nov).
 
 ### Inferred generic functions (bounded executable subset)
@@ -1082,9 +1082,10 @@ The delivered subset is deliberately bounded:
   fields. `let Alias = MyType` preserves the original identity, fields and methods;
   aliases work in annotations, method signatures, constructors and static calls.
   Forward module type names and method signatures are supported.
-- Named fields require explicit `bool`, `rune`, integer (including `i128`/`u128` and native
-  `int`/`uint`), `f32`/`f64`, immutable `string`, nominal enum, acyclic nominal struct types,
-  or arrays of supported element types (including aliases). Semantic checking
+- Named fields support every ordinary storable runtime type: `bool`, `rune`, integers
+  (including `i128`/`u128` and native `int`/`uint`), floats, immutable `string`, enums,
+  structs, unions (including Option/Result), arrays, functions/closures and ranges.
+  Use existing explicit types or aliases, including `@TypeOf(0..10)` for a range. Semantic checking
   uses the same integer-width and literal-bound rules as scalar values. The C
   backend still supports only 8/16/32/64-bit integers: a reachable record layout
   containing a 128-bit field fails C emission with a backend width diagnostic;
@@ -1095,9 +1096,11 @@ The delivered subset is deliberately bounded:
   struct and array values must be supplied explicitly. Recursive layouts (including
   cycles through array element types) and layouts deeper than 128 aggregate levels
   diagnose, including aliases/imports and late generic instantiations.
-  `f32`/`f64` fields are supported. Direct union/function/void fields remain unsupported; array fields may
-  contain any supported storable element type, including nested arrays. Arrays of
-  supported records are described below.
+  `void`, compile-time `type`, namespaces, unspecialized generic templates and
+  reference capabilities are not storable fields. Structural type/signature cycles
+  remain rejected; function/reference edges do not consume inline-storage depth.
+  No compile-time argument or new field-default evaluation is implemented: union,
+  callback and range values must be supplied in constructors under existing rules.
 - Construct explicitly with `MyType[ .x = 5, .z = true ]` (or `Alias[...]`).
   Empty `MyType[]` works only when every field has a default. Unknown, duplicate,
   missing required and mistyped fields diagnose. Supplied expressions evaluate
@@ -1121,11 +1124,14 @@ The delivered subset is deliberately bounded:
   does not change array/string `.len`. Assignment, locals, parameters, returns,
   branches and loop results copy record field values. Array backing is copied
   recursively through nested structs, record-array elements and union record
-  payloads; immutable strings share their backing storage. Constructors, field/index
+  payloads, including arrays inside union-valued fields; immutable strings share
+  backing, functions share closure environments/captured cells, and ranges copy
+  typed bounds/inclusivity by value. Constructors, field/index
   reads, method receivers and ordinary reads through loans obey the same independence
   rule. Replacing or mutating a record binding does not change earlier copies.
 - Fields of a direct mutable local support `item.field = value` with exact bool,
-  integer, float, rune, string, enum, struct or array type. Nested paths such as `item.inner.count += 1`
+  integer, float, rune, string, enum, struct, union, array, function or range type.
+  Nested paths such as `item.inner.count += 1`
   and exact-type subrecord replacements are supported. Integer fields support `+= -= *= /= %=`, with the
   same wrapping/division/panic rules as scalar integers; float fields support
   `+= -= *= /=` with IEEE semantics; string fields support `+=`.
@@ -1172,10 +1178,19 @@ The delivered subset is deliberately bounded:
   a method. A bare `item.method` does not create a bound function or closure;
   explicit `Type.method` remains an ordinary unbound function value. Concrete
   generic union instances support these same method calls. Methods with their own
-  backtick variables use the bounded instance inference described above; callable
-  fields remain unsupported.
+  backtick variables use the bounded instance inference described above.
   Container constants, nested type declarations, general type values,
   struct global instances and C FFI are unsupported.
+- Function fields use ordinary call syntax: `item.callback(args...)`, with no
+  implicit receiver argument. The receiver expression and selected function value
+  evaluate once before arguments; replacing that field while evaluating an
+  argument does not change the pending callee. Fields take precedence over methods,
+  and calling a non-function field is an error rather than a method fallback.
+  `let callback = item.callback` reads an ordinary function value; pipes and
+  explicit `reference.*.callback(...)` follow existing call/reference rules.
+  Method calls still pass a by-value receiver. Field calls do not grant implicit
+  borrowing, mutable receivers or bound method values. See
+  [`examples/storable-fields.nov`](examples/storable-fields.nov).
 - Default printing/interpolation uses `MyType[ field: value, ... ]` (`MyType[]`
   when empty), recursively applying converters to nested fields/elements.
   An explicit `@[stringify]` container method `(MyType) -> string` overrides the whole
@@ -1306,8 +1321,8 @@ checked semantically through 128 bits, while reachable C layouts require
   through active tags only. Active tag chains are validated before allocating
   copies or running formatters, and inactive by-value fields are zeroed.
   Default formatting retains inner union tags (`Outer.inner[Inner.some[...]]`),
-  honoring nested `@[stringify]` hooks. Direct unions in struct fields and recursive
-  layouts are still unsupported. See
+  honoring nested `@[stringify]` hooks. Unions may also be stored directly in
+  structs; recursive structural type/layout graphs remain unsupported. See
   [`examples/nested-unions.nov`](examples/nested-unions.nov).
 - Function and closure payloads retain their exact signatures, including
   `Option((int) -> int)`. Extract with a match or `.!`, then call the resulting
@@ -1323,8 +1338,8 @@ checked semantically through 128 bits, while reachable C layouts require
 - Functions and ranges have no default printed representation. A union containing
   them needs an enclosing valid `@[stringify]` hook, including when its active
   variant is payloadless. Recursive type/signature graphs remain unsupported;
-  function-pointer edges do not count as inline storage depth. Direct function,
-  union and range fields in structs remain unsupported. See
+  function-pointer edges do not count as inline storage depth. Structs may also
+  hold functions, unions and ranges under the same storage/copy rules. See
   [`examples/value-payloads.nov`](examples/value-payloads.nov).
 - Explicit tag enums, reference payloads, variant-pattern
   alternatives, nested destructuring, direct payload field access, union equality
@@ -2262,8 +2277,7 @@ let main: () = {
   results can carry ranges, including mixed inclusive/exclusive branches. No new
   dedicated range type syntax is provided; use a type query such as
   `let Interval = @TypeOf(0..1)` for exact range annotations in parameters, returns
-  and union payloads. Direct struct range fields and range globals remain
-  unsupported. Arrays can
+  and struct fields or union payloads. Range globals remain unsupported. Arrays can
   infer range elements, for example `[0..3, 1..=2]`; their bounds and inclusivity
   copy by value with exact endpoint typing and the bound inference rules below.
   Range field access, equality, membership and direct printing are not introduced.

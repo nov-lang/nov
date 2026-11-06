@@ -200,7 +200,7 @@ fn checkSupported(ast: Ast) !void {
             .container_field => if (data.lhs != 0) {
                 const field_tag = ast.nodes.items(.tag)[data.lhs];
                 switch (field_tag) {
-                    .identifier, .type_variable, .field_access, .call, .call_one, .array_type, .ref_type => {},
+                    .identifier, .type_variable, .field_access, .call, .call_one, .array_type, .ref_type, .fn_proto, .fn_proto_one => {},
                     else => return error.UnsupportedSyntax,
                 }
                 const name = ast.tokenSlice(ast.firstToken(data.lhs));
@@ -576,6 +576,19 @@ test "nominal struct formatting preserves public attributes fields defaults meth
         "@[public]\nlet R=struct{; open\nx:int=0, ; default\n; next field\ny:string,\n\n@[public]\n@[stringify]\nlet toString:(self:R)->string=\"{self.x}:{self.y}\"\n}\nlet main:()={let r=R[.x=1,.y=\"hello\"]\n@println(r)}",
         "let R=struct{\n; empty\n}\nlet main:()={let r=R[\n; empty constructor\n]\n@println(true)}",
         "let R=struct{x:string,}\nlet main:()={let r=R[\n.x=\"hello\", ; value\n]\n@println(r.x)}",
+    }) |source| {
+        const result = try format(std.testing.allocator, source);
+        defer std.testing.allocator.free(result);
+        try expectFormatted(source, result);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{source});
+    }
+}
+
+test "storable struct fields preserve direct function types and callable projections under OOM" {
+    for ([_][:0]const u8{
+        "let S=struct{callback:(int)->int,combine:(int,int)->int,}\nlet f:(s:S)->int=s.callback(s.combine(1,2))",
+        "let S=struct{factory:()->(int)->int,update:(&mut int,int),}\nlet f:(s:S)->int=s.factory()(1)",
+        "let S=struct{\n; callback signature\ncallback:(int)->int, ; field\nrange:@TypeOf(0..1),\n}\nlet f:(s:S)->int={let callback=s.callback\ncallback(1)}",
     }) |source| {
         const result = try format(std.testing.allocator, source);
         defer std.testing.allocator.free(result);

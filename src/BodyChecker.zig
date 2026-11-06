@@ -1671,6 +1671,11 @@ const Context = struct {
                     if (ast.nodes.items(.tag)[call.ast.fn_expr] == .field_access) {
                         const field = ast.nodes.items(.data)[call.ast.fn_expr];
                         if (try q.typeOf(field.lhs, depth + 1)) |receiver| {
+                            if (try q.fieldType(receiver.ty, ast.tokenSlice(field.rhs))) |selected| {
+                                const signature = c.ir.getType(selected.ty).?;
+                                if (signature == .function) return .{ .ty = signature.function.result };
+                                return null;
+                            }
                             if (c.receiverGeneric(receiver.ty, ast.tokenSlice(field.rhs))) |ref| {
                                 if (try c.genericProbe(node, call, ref, .{ .ty = receiver.ty, .span = c.irSpan(field.lhs) }, depth + 1)) |result| return .{ .ty = result };
                             } else if (try c.probeReceiverSignature(receiver.ty, ast.tokenSlice(field.rhs))) |signature| {
@@ -2893,6 +2898,12 @@ const Context = struct {
                 if (ast.nodes.items(.tag)[call.ast.fn_expr] == .field_access and try self.staticMethod(call.ast.fn_expr) == null) {
                     const field = ast.nodes.items(.data)[call.ast.fn_expr];
                     if (try self.probe(field.lhs, depth + 1)) |receiver| {
+                        if (self.fieldIndex(receiver.ty, ast.tokenSlice(field.rhs))) |index| {
+                            const record = self.ir.getType(receiver.ty).?.record;
+                            if (record.tagged) break :blk null;
+                            const signature = self.ir.getType(record.fields[index].ty).?;
+                            break :blk if (signature == .function) .{ .ty = signature.function.result } else null;
+                        }
                         if (self.receiverGeneric(receiver.ty, ast.tokenSlice(field.rhs))) |ref| {
                             if (ref.local == null and ref.module.getDeclaration(ref.id).?.noreturn) break :blk null;
                             const result = (try self.genericProbe(node, call, ref, .{ .ty = receiver.ty, .span = self.irSpan(field.lhs) }, depth + 1)) orelse break :blk null;
@@ -2904,9 +2915,8 @@ const Context = struct {
                                 break :blk .{ .ty = function.result };
                         }
                     }
-                    // Calling a value field is unsupported. Re-probing this
-                    // same receiver as a callee cannot recover a method type,
-                    // and doubles every failed step of a deep receiver chain.
+                    // Re-probing this receiver as a callee cannot recover a
+                    // missing field/method, and doubles failed deep chains.
                     break :blk null;
                 }
                 const callee = (try self.probe(call.ast.fn_expr, depth + 1)) orelse break :blk null;
@@ -4799,8 +4809,31 @@ const Context = struct {
                 }
                 if (ast.nodes.items(.tag)[call.ast.fn_expr] == .field_access and try self.staticMethod(call.ast.fn_expr) == null) {
                     const field = ast.nodes.items(.data)[call.ast.fn_expr];
-                    const receiver = (try self.expression(field.lhs, null, depth + 1)) orelse return null;
+                    const previous_base = self.borrow_base;
+                    self.borrow_base = field.lhs;
+                    const receiver = blk: {
+                        defer self.borrow_base = previous_base;
+                        break :blk (try self.projection(field.lhs, null, depth + 1)) orelse return null;
+                    };
                     if (self.terminated) return if (expected) |want| want.ty else try self.ir.internType(.void);
+                    const container = self.ir.getType(receiver).?;
+                    if (self.fieldIndex(receiver, ast.tokenSlice(field.rhs))) |index| {
+                        if (container.record.tagged) return self.fail(.unsupported_body_expression, call.ast.fn_expr, null);
+                        const field_type = container.record.fields[index].ty;
+                        const signature = self.ir.getType(field_type).?;
+                        if (signature != .function) return self.fail(.not_callable, node, null);
+                        if (call.ast.args.len != signature.function.params.len) return self.fail(.argument_count_mismatch, node, null);
+                        // Select the function value before argument effects. Reuse
+                        // the evaluated receiver; closure copies share their cells.
+                        if (self.emitter != null and !try self.emitNode(call.ast.fn_expr, field_type)) return null;
+                        var valid = true;
+                        for (call.ast.args, signature.function.params) |arg, param| {
+                            if (try self.callArgument(arg, .{ .ty = param }, depth + 1) == null) valid = false;
+                            if (self.terminated) break;
+                        }
+                        if (!valid) return null;
+                        return self.finishCall(node, call.ast.fn_expr, signature.function.result, expected);
+                    }
                     const generic = self.receiverGeneric(receiver, ast.tokenSlice(field.rhs));
                     if (generic) |ref| switch (try self.genericTerminalCall(node, call, ref, .{ .ty = receiver, .span = self.irSpan(field.lhs) }, expected, depth)) {
                         .live => {},
@@ -4834,11 +4867,8 @@ const Context = struct {
                         }
                         return self.fit(function.result, expected, node);
                     }
-                    // All supported fields are non-callable. Do not reinterpret a
-                    // matching field (including array/string len) as a method.
-                    const container = self.ir.getType(receiver).?;
-                    if (self.fieldIndex(receiver, ast.tokenSlice(field.rhs)) != null or
-                        ((container == .array or container == .string) and std.mem.eql(u8, ast.tokenSlice(field.rhs), "len")))
+                    // Array/string len also shadows method lookup.
+                    if ((container == .array or container == .string) and std.mem.eql(u8, ast.tokenSlice(field.rhs), "len"))
                         return self.fail(.not_callable, node, null);
                     if (container == .record or container == .enumeration) return self.fail(.unknown_field, call.ast.fn_expr, null);
                     return self.fail(.unsupported_body_expression, call.ast.fn_expr, null);
@@ -7564,8 +7594,8 @@ test "managed arrays reject unsupported payloads nominal mismatches and record m
         "let f:(n:int)->bool={let a=n..n\na in [a]}",
         "let E=enum{a,b,}\nlet F=enum{a,b,}\nlet f:(a:E,b:F)->bool=a in [b]",
         "let E=enum{a,b,}\nlet F=enum{a,b,}\nlet f:(a:E,b:F)->bool=a==b",
-        "let O:(T:type)->type=union{some:T,none,}\nlet f:(a:O([]string))={}",
-        "let R:(T:type,E:type)->type=union{ok:T,err:E,}\nlet f:(a:R([]string,string))={}",
+        "let O:(T:type)->type=union{some:T,none,}\nlet f:(a:O(&string))={}",
+        "let R:(T:type,E:type)->type=union{ok:T,err:E,}\nlet f:(a:R([]void,string))={}",
         "let f:()={let a:[]string=[]\nlet b:[]bool=[]\nlet c:[]string=b\n}",
         "let f:()={let a=[\"a\",true]\n}",
     }) |source| {
@@ -7576,6 +7606,21 @@ test "managed arrays reject unsupported payloads nominal mismatches and record m
         defer sema.deinit();
         try std.testing.expect(module.hasErrors());
         try std.testing.expect(!sema.lowering_complete);
+    }
+}
+
+test "managed arrays in Option and Result payloads are ordinary runtime values" {
+    for ([_][]const u8{
+        "let O:(T:type)->type=union{some:T,none,}\nlet f:(a:O([]string))={}",
+        "let R:(T:type,E:type)->type=union{ok:T,err:E,}\nlet f:(a:R([]string,string))={}",
+    }) |source| {
+        var module = try Module.init(std.testing.allocator, "managed-array-payload.nov", source);
+        defer module.deinit();
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expect(sema.lowering_complete);
+        try sema.ir.verify();
     }
 }
 

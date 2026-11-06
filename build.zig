@@ -154,6 +154,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const storable_array_tests = b.step("test-cli-storable-arrays", "Run storable array CLI tests");
     addStorableArrayCliTests(b, exe, storable_array_tests);
     test_step.dependOn(storable_array_tests);
+    const storable_field_tests = b.step("test-cli-storable-fields", "Run finite storable struct field CLI tests");
+    addStorableFieldCliTests(b, exe, storable_field_tests);
+    test_step.dependOn(storable_field_tests);
     const union_array_tests = b.step("test-cli-union-arrays", "Run direct union array payload CLI tests");
     addUnionArrayCliTests(b, exe, union_array_tests);
     test_step.dependOn(union_array_tests);
@@ -2582,7 +2585,7 @@ fn addGenericMethodCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_st
         .{ .name = "wrong-arity", .source = box ++ "let main:()={let x=Box(bool)[.value=true].map(id,true)\n}", .diagnostic = "argument count does not match the function signature" },
         .{ .name = "callback-signature", .source = box ++ "let f:(x:uint,y:uint)->uint=x\nlet main:()={let x=Box(uint)[.value=1].map(f)\n}", .diagnostic = "constraints require exactly identical types" },
         .{ .name = "bound-method", .source = box ++ "let main:()={let box=Box(bool)[.value=true]\nlet f:((bool)->bool)->Box(bool)=box.map\n}", .diagnostic = "unknown container field, method, enum tag or union variant" },
-        .{ .name = "callable-field", .source = "let S=struct{f:(bool)->bool,}\nlet id:(x:bool)->bool=x\nlet main:()={let s=S[.f=id]\nlet x=s.f(true)\n}", .diagnostic = "this type is not supported in semantic analysis yet" },
+        .{ .name = "callable-field", .source = "let S=struct{f:(bool)->bool,}\nlet id:(x:bool)->bool=x\nlet main:()={let s=S[.f=id]\nlet x=s.f(true)\n}", .diagnostic = "" },
     }) |case| {
         const source = b.fmt("reject-{s}.nov", .{case.name});
         _ = fixtures.add(source, case.source);
@@ -2841,7 +2844,7 @@ fn addNestedUnionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step
         .{ .name = "nested-error-element", .source = "let f:(x:std.Result(int,std.Option(int)))->std.Result(int,std.Option(bool))=.ok[x.!]", .diagnostic = "error:" },
         .{ .name = "option-to-result", .source = "let f:(x:std.Option(std.Result(int,string)))->std.Result(int,string)=x.!", .diagnostic = "error:" },
         .{ .name = "result-to-option", .source = "let f:(x:std.Result(std.Option(int),string))->std.Option(int)=x.!", .diagnostic = "error:" },
-        .{ .name = "struct-union-field", .source = "let Inner=union{some:int,none,}\nlet S=struct{inner:Inner,}\nlet U=union{record:S,none,}\nlet f:(x:U)={}", .diagnostic = "not supported" },
+        .{ .name = "struct-union-cycle", .source = "let Inner=union{some:S,none,}\nlet S=struct{inner:Inner,}\nlet U=union{record:S,none,}\nlet f:(x:U)={}", .diagnostic = "cyclic" },
         .{ .name = "nested-function-reference", .source = "let Inner=union{value:&()->int,none,}\nlet U=union{inner:Inner,none,}\nlet f:(x:U)={}", .diagnostic = "not supported" },
         .{ .name = "nested-range-reference", .source = "let Inner=union{value:&@TypeOf(1..3),none,}\nlet U=union{inner:Inner,none,}\nlet f:(x:U)={}", .diagnostic = "not supported" },
         .{ .name = "nested-reference", .source = "let Inner=union{value:&int,none,}\nlet U=union{inner:Inner,none,}\nlet f:(x:U)={}", .diagnostic = "not supported" },
@@ -5178,8 +5181,8 @@ fn addValuePayloadCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_ste
         .{ .name = "function-equality", .source = "let f:(a:()->int)->bool=a==a", .diagnostic = "operator is not supported" },
         .{ .name = "function-nominal", .source = "let A=union{f:()->int,}\nlet B=union{f:()->int,}\nlet f:(x:A)->B=x", .diagnostic = "expected type" },
         .{ .name = "range-exact", .source = "let U=union{r:@TypeOf(0..1),}\nlet f:(n:int)->U={let bounds=n..n\n.r[bounds]}", .diagnostic = "expected type" },
-        .{ .name = "struct-function", .source = "let S=struct{f:()->int,}\nlet f:(x:S)={}", .diagnostic = "not supported" },
-        .{ .name = "struct-range", .source = "let S=struct{r:@TypeOf(0..1),}\nlet f:(x:S)={}", .diagnostic = "not supported" },
+        .{ .name = "struct-function-exact", .source = "let S=struct{f:(int)->int,}\nlet bad:(f:(uint)->uint)->S=S[.f=f]", .diagnostic = "expected type" },
+        .{ .name = "struct-range-exact", .source = "let S=struct{r:@TypeOf(0..1),}\nlet bad:(n:int)->S=S[.r=n..n]", .diagnostic = "expected type" },
         .{ .name = "recursive-array-union", .source = "let U=union{items:[][]U,function:()->int,none,}\nlet main:()={}", .diagnostic = "cyclic" },
         .{ .name = "wide-function", .source = "let U=union{f:(i128)->i128,none,}\nlet f:(x:U)={}\nlet main:()={}", .diagnostic = "C backend only supports", .command = "emit-c" },
         .{ .name = "wide-range", .source = "let U=union{r:@TypeOf(@as(i128,0)..@as(i128,1)),none,}\nlet f:(x:U)={}\nlet main:()={}", .diagnostic = "C backend only supports", .command = "emit-c" },
@@ -5192,6 +5195,82 @@ fn addValuePayloadCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_ste
         check.addArg(case.command);
         if (std.mem.eql(u8, case.command, "check")) check.addArg("--semantic");
         check.addArgs(&.{ source, "--lib-dir" });
+        check.addDirectoryArg(library);
+        check.expectExitCode(1);
+        check.expectStdOutEqual("");
+        check.expectStdErrMatch(".nov:");
+        check.expectStdErrMatch("error:");
+        check.expectStdErrMatch(case.diagnostic);
+        test_step.dependOn(&check.step);
+    }
+}
+
+fn addStorableFieldCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    const fixtures = b.addWriteFiles();
+    const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
+    _ = fixtures.add("storable-fields.nov", @embedFile("examples/storable-fields.nov"));
+    const package = b.addWriteFiles();
+    const installed_exe = package.addCopyFile(exe.getEmittedBin(), b.fmt("bin/{s}", .{exe.out_filename}));
+    _ = package.addCopyDirectory(b.path("lib"), "lib/nov", .{});
+    _ = package.add("storable-fields.nov", @embedFile("examples/storable-fields.nov"));
+    const expected_tests = "PASS constructors_updates_and_nested_paths\nPASS union_field_arrays_copy_across_calls\nPASS escaping_closures_aliases_and_snapshots\nPASS direct_computed_pipe_and_callee_order\nPASS range_fields_reloop_and_inclusive_max\nPASS generic_fields_methods_and_printing\n6 passed; 0 failed; 6 total\n";
+    for ([_]bool{ false, true }) |installed| {
+        for ([_][]const u8{ "fmt", "semantic", "run", "test" }) |command| {
+            const execute = std.mem.eql(u8, command, "run") or std.mem.eql(u8, command, "test");
+            const modes: []const []const u8 = if (execute) &.{ "", "--debug", "--release" } else &.{""};
+            for (modes) |mode| {
+                const run = if (installed) std.Build.Step.Run.create(b, "CLI storable fields: relocated install") else b.addRunArtifact(exe);
+                run.step.name = b.fmt("CLI storable fields: {s} {s} (installed={})", .{ command, mode, installed });
+                if (installed) run.addFileArg(installed_exe);
+                run.setCwd(if (installed) package.getDirectory() else fixtures.getDirectory());
+                run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+                run.setEnvironmentVariable("NOV_CC", "");
+                run.setEnvironmentVariable("CC", "");
+                if (std.mem.eql(u8, command, "fmt")) {
+                    run.addArgs(&.{ "fmt", "--check", "storable-fields.nov" });
+                } else if (std.mem.eql(u8, command, "semantic")) {
+                    run.addArgs(&.{ "check", "--semantic", "storable-fields.nov" });
+                } else {
+                    run.addArgs(&.{ command, "storable-fields.nov" });
+                    if (mode.len != 0) run.addArg(mode);
+                }
+                if (!installed and !std.mem.eql(u8, command, "fmt")) {
+                    run.addArg("--lib-dir");
+                    run.addDirectoryArg(library);
+                }
+                run.expectExitCode(0);
+                run.expectStdOutEqual(if (execute) (if (std.mem.eql(u8, command, "test")) expected_tests else "Called: 5 5\nCustom: Processor(4)\nReport: Report[ outcome: Result([]i64, string).ok[[1, 2]] ]\n") else "");
+                run.expectStdErrEqual("");
+                test_step.dependOn(&run.step);
+            }
+        }
+    }
+    for ([_]struct { name: []const u8, source: []const u8, diagnostic: []const u8 }{
+        .{ .name = "void", .source = "let S=struct{value:void,}\nlet f:(s:S)={}", .diagnostic = "not supported" },
+        .{ .name = "type", .source = "let S=struct{value:type,}\nlet f:(s:S)={}", .diagnostic = "not supported" },
+        .{ .name = "reference", .source = "let S=struct{value:&int,}\nlet f:(s:S)={}", .diagnostic = "not supported" },
+        .{ .name = "reference-array", .source = "let S=struct{value:[]&int,}\nlet f:(s:S)={}", .diagnostic = "references cannot escape" },
+        .{ .name = "reference-capture", .source = "let S=struct{run:()->int,}\nlet main:()={let mut n:int=1\nlet view=&n\nlet s=S[.run=()->int{view.*}]\n}", .diagnostic = "local references require" },
+        .{ .name = "direct-cycle", .source = "let S=struct{value:S,}\nlet f:(s:S)={}", .diagnostic = "cyclic" },
+        .{ .name = "array-cycle", .source = "let S=struct{value:[][]S,}\nlet f:(s:S)={}", .diagnostic = "cyclic" },
+        .{ .name = "union-cycle", .source = "let S=struct{value:U,}\nlet U=union{record:S,none,}\nlet f:(s:S)={}", .diagnostic = "cyclic" },
+        .{ .name = "generic-cycle", .source = "let S:(T:type)->type=struct{value:S(T),}\nlet f:(s:S(int))={}", .diagnostic = "cyclic" },
+        .{ .name = "callback-constructor", .source = "let S=struct{run:(int)->int,}\nlet f:(run:(uint)->uint)->S=S[.run]", .diagnostic = "expected type" },
+        .{ .name = "callback-update", .source = "let S=struct{run:(int)->int,}\nlet f:(s:S,run:(uint)->uint)={let mut copy=s\ncopy.run=run}", .diagnostic = "expected type" },
+        .{ .name = "callback-reference-exact", .source = "let S=struct{run:(&int),}\nlet f:(run:(&mut int))->S=S[.run]", .diagnostic = "expected type" },
+        .{ .name = "range-update", .source = "let S=struct{interval:@TypeOf(0..1),}\nlet f:(s:S,n:int)={let mut copy=s\ncopy.interval=n..n}", .diagnostic = "expected type" },
+        .{ .name = "method-field-conflict", .source = "let S=struct{run:(int)->int,let run:(self:S,n:int)->int=n\n}\nlet f:(s:S)->int=s.run(1)", .diagnostic = "duplicate" },
+        .{ .name = "print-function", .source = "let S=struct{run:()->int,}\nlet f:(s:S)=@println(s)", .diagnostic = "not implemented yet" },
+        .{ .name = "print-range", .source = "let S=struct{interval:@TypeOf(0..1),}\nlet f:(s:S)=@println(s)", .diagnostic = "not implemented yet" },
+        .{ .name = "extern-record", .source = "let S=struct{run:()->int,}\n@[extern]\nlet foreign:(s:S)\nlet main:()={}", .diagnostic = "extern ABI supports only bool" },
+        .{ .name = "export-record", .source = "let S=struct{value:std.Result([]int,string),}\n@[export]\nlet foreign:(s:S)={}\nlet main:()={}", .diagnostic = "export ABI supports only bool" },
+    }) |case| {
+        const source = b.fmt("invalid-storable-field-{s}.nov", .{case.name});
+        _ = fixtures.add(source, b.fmt("let std=@import(\"std\")\n{s}\n", .{case.source}));
+        const check = b.addRunArtifact(exe);
+        check.step.name = b.fmt("CLI storable fields: reject {s}", .{case.name});
+        check.setCwd(fixtures.getDirectory());
+        check.addArgs(&.{ "check", "--semantic", source, "--lib-dir" });
         check.addDirectoryArg(library);
         check.expectExitCode(1);
         check.expectStdOutEqual("");

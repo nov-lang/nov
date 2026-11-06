@@ -6704,6 +6704,225 @@ test "value payloads source free function range normalization shared environment
     }
 }
 
+fn storableFieldTestLibrary(allocator: std.mem.Allocator, closures: bool) ![]u8 {
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    const span: Ir.Span = .{ .start = 0, .end = 0 };
+    const V = struct {
+        fn id(i: u32) Ir.ValueId {
+            return @fromBackingInt(i);
+        }
+        fn ins(ty: Ir.TypeId, op: Ir.Operation) Ir.Instruction {
+            return .{ .ty = ty, .span = .{ .start = 0, .end = 0 }, .op = op };
+        }
+    };
+    const unit = try ir.internType(.void);
+    const integer = try ir.internType(.{ .integer = .{ .bits = 64, .signedness = .signed } });
+    const text = try ir.internType(.string);
+    // Parents precede dependencies, including function signature dependencies.
+    const record = try ir.internType(.{ .record = .{ .identity = 940, .fields = &.{} } });
+    const payload = try ir.internType(.{ .record = .{ .identity = 941, .tagged = true, .fields = &.{} } });
+    const strings = try ir.internType(.{ .array = text });
+    const signature = try ir.internType(.{ .function = .{ .params = &.{integer}, .result = integer } });
+    const range = try ir.internType(.{ .range = integer });
+    try ir.setRecordFields(payload, &.{ .{ .name = "items", .ty = strings, .span = span }, .{ .name = "callable", .ty = signature, .span = span }, .{ .name = "none", .ty = unit, .span = span } });
+    try ir.setRecordFields(record, &.{ .{ .name = "value", .ty = payload, .span = span }, .{ .name = "callable", .ty = signature, .span = span }, .{ .name = "bounds", .ty = range, .span = span } });
+    const callable = try ir.addFunction("fieldfn", signature, span);
+    if (closures) {
+        ir.functions.items[@backingInt(callable)].is_closure = true;
+        ir.functions.items[@backingInt(callable)].captures = try allocator.dupe(Ir.Capture, &.{.{ .ty = integer, .mutable = true }});
+        var cell = V.ins(integer, .{ .capture_cell = 0 });
+        cell.boxed = true;
+        try ir.setFunctionBody(callable, &.{ cell, V.ins(integer, .{ .local_load = V.id(0) }), V.ins(integer, .{ .parameter = 0 }), V.ins(integer, .{ .binary = .{ .op = .add, .lhs = V.id(1), .rhs = V.id(2) } }), V.ins(unit, .{ .local_store = .{ .slot = V.id(0), .value = V.id(3) } }), V.ins(integer, .{ .local_load = V.id(0) }) }, V.id(5));
+    } else try ir.setFunctionBody(callable, &.{V.ins(integer, .{ .parameter = 0 })}, V.id(0));
+    const maker_sig = try ir.internType(.{ .function = .{ .params = &.{integer}, .result = signature } });
+    const maker = try ir.addFunction("makefieldfn", maker_sig, span);
+    if (closures) {
+        var slot = V.ins(integer, .{ .local_slot = V.id(0) });
+        slot.boxed = true;
+        try ir.setFunctionBody(maker, &.{ V.ins(integer, .{ .parameter = 0 }), slot, V.ins(signature, .{ .closure_init = .{ .function = callable, .captures = &.{V.id(1)} } }) }, V.id(2));
+    } else try ir.setFunctionBody(maker, &.{V.ins(signature, .{ .function_ref = callable })}, V.id(0));
+    const init_sig = try ir.internType(.{ .function = .{ .params = &.{ payload, signature, range }, .result = record } });
+    const init = try ir.addFunction("initfields", init_sig, span);
+    try ir.setFunctionBody(init, &.{ V.ins(payload, .{ .parameter = 0 }), V.ins(signature, .{ .parameter = 1 }), V.ins(range, .{ .parameter = 2 }), V.ins(record, .{ .record_init = &.{ V.id(0), V.id(1), V.id(2) } }) }, V.id(3));
+    const records = try ir.internType(.{ .array = record });
+    const wrapper = try ir.internType(.{ .record = .{ .identity = 942, .tagged = true, .fields = &.{} } });
+    try ir.setRecordFields(wrapper, &.{ .{ .name = "record", .ty = record, .span = span }, .{ .name = "none", .ty = unit, .span = span } });
+    for ([_]Ir.TypeId{ record, records, wrapper }, [_][]const u8{ "copyfields", "copyfieldarray", "copyfieldunion" }) |ty, name| {
+        const sig = try ir.internType(.{ .function = .{ .params = &.{ty}, .result = ty } });
+        const f = try ir.addFunction(name, sig, span);
+        try ir.setFunctionBody(f, &.{ V.ins(ty, .{ .parameter = 0 }), V.ins(ty, .{ .array_clone = V.id(0) }) }, V.id(1));
+    }
+    const pack_sig = try ir.internType(.{ .function = .{ .params = &.{record}, .result = records } });
+    const pack = try ir.addFunction("packfields", pack_sig, span);
+    try ir.setFunctionBody(pack, &.{ V.ins(record, .{ .parameter = 0 }), V.ins(records, .{ .array_literal = &.{V.id(0)} }) }, V.id(1));
+    const replace_sig = try ir.internType(.{ .function = .{ .params = &.{ record, payload, signature, range }, .result = record } });
+    const replace = try ir.addFunction("replacefields", replace_sig, span);
+    try ir.setFunctionBody(replace, &.{
+        V.ins(record, .{ .parameter = 0 }),        V.ins(payload, .{ .parameter = 1 }),                                                               V.ins(signature, .{ .parameter = 2 }),                                                             V.ins(range, .{ .parameter = 3 }),
+        V.ins(record, .{ .local_slot = V.id(0) }), V.ins(unit, .{ .field_store = .{ .slot = V.id(4), .path = &.{}, .index = 0, .value = V.id(1) } }), V.ins(unit, .{ .field_store = .{ .slot = V.id(4), .path = &.{}, .index = 1, .value = V.id(2) } }), V.ins(unit, .{ .field_store = .{ .slot = V.id(4), .path = &.{}, .index = 2, .value = V.id(3) } }),
+        V.ins(record, .{ .local_load = V.id(4) }),
+    }, V.id(8));
+    const invoke_sig = try ir.internType(.{ .function = .{ .params = &.{ record, integer }, .result = integer } });
+    const invoke = try ir.addFunction("invokefield", invoke_sig, span);
+    try ir.setFunctionBody(invoke, &.{ V.ins(record, .{ .parameter = 0 }), V.ins(integer, .{ .parameter = 1 }), V.ins(signature, .{ .field_read = .{ .base = V.id(0), .index = 1 } }), V.ins(integer, .{ .call = .{ .callee = V.id(2), .args = &.{V.id(1)} } }) }, V.id(3));
+    var aliases = std.Io.Writer.Allocating.init(allocator);
+    defer aliases.deinit();
+    for ([_]Ir.TypeId{ record, payload, range, wrapper }, [_][]const u8{ "Fields", "FieldPayload", "FieldRange", "FieldUnion" }) |ty, name| {
+        try aliases.writer.writeAll("typedef ");
+        try writeType(&ir, &aliases.writer, ty);
+        try aliases.writer.print(" {s};\n", .{name});
+    }
+    try aliases.writer.print("#define FIELD_ELEMENT nov_element_{d}\n#define FIELD_TEXT nov_element_{d}\n", .{ @backingInt(record), @backingInt(text) });
+    try aliases.writer.writeAll(if (closures) "#define FIELD_CLOSURES 1\n" else "");
+    const library = try emit(allocator, &ir, null);
+    defer allocator.free(library);
+    return std.mem.concat(allocator, u8, &.{ library, aliases.written() });
+}
+
+test "storable fields source free emission allocation failures" {
+    try TestAllocations.checkAllAllocationFailures(test_gpa, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const c = storableFieldTestLibrary(allocator, true) catch |err| switch (err) {
+                error.WriteFailed => return error.OutOfMemory,
+                else => return err,
+            };
+            defer allocator.free(c);
+        }
+    }.run, .{});
+}
+
+test "storable fields source free structural union printing and enclosing hooks forced GC O0 O3" {
+    var ir = Ir.init(test_gpa);
+    defer ir.deinit();
+    const span: Ir.Span = .{ .start = 0, .end = 0 };
+    const unit = try ir.internType(.void);
+    const text = try ir.internType(.string);
+    const integer = try ir.internType(.{ .integer = .{ .bits = 64, .signedness = .signed } });
+    const record = try ir.internType(.{ .record = .{ .identity = 980, .fields = &.{} } });
+    const payload = try ir.internType(.{ .record = .{ .identity = 981, .tagged = true, .fields = &.{} } });
+    try ir.setRecordFields(payload, &.{ .{ .name = "text", .ty = text, .span = span }, .{ .name = "none", .ty = unit, .span = span } });
+    try ir.setRecordFields(record, &.{.{ .name = "value", .ty = payload, .span = span }});
+    try ir.setTypeFormatting(record, "Record", null);
+    try ir.setTypeFormatting(payload, "Choice", null);
+    const show_sig = try ir.internType(.{ .function = .{ .params = &.{record}, .result = unit } });
+    const show = try ir.addFunction("showfields", show_sig, span);
+    try ir.setFunctionBody(show, &.{ .{ .ty = record, .span = span, .op = .{ .parameter = 0 } }, .{ .ty = unit, .span = span, .op = .{ .print = .{ .args = &.{@fromBackingInt(0)}, .newline = true } } } }, @fromBackingInt(1));
+    const driver = try std.fmt.allocPrint(test_gpa, "\nint main(void){{nov_rt_heap.collect_every_allocation=1;nov_record_{d} a={{0}};a.f0.f0=(nov_string){{NULL,(const unsigned char*)\"ok\",2}};nov_showfields(a);nov_gc_collect(&nov_rt_heap);nov_gc_shutdown(&nov_rt_heap);return 0;}}\n", .{@backingInt(record)});
+    defer test_gpa.free(driver);
+    for ([_]bool{ false, true }) |hooked| {
+        if (hooked) {
+            const hook_sig = try ir.internType(.{ .function = .{ .params = &.{payload}, .result = text } });
+            const hook = try ir.addFunction("choicehook", hook_sig, span);
+            const literal = try ir.internConstant(.{ .ty = text, .value = .{ .string = "custom" } });
+            try ir.setFunctionBody(hook, &.{.{ .ty = text, .span = span, .op = .{ .constant = literal } }}, @fromBackingInt(0));
+            try ir.setTypeFormatting(payload, "Choice", hook);
+        }
+        const library = try emit(test_gpa, &ir, null);
+        defer test_gpa.free(library);
+        const c = try std.mem.concat(test_gpa, u8, &.{ library, driver });
+        defer test_gpa.free(c);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, if (hooked) "Record[ value: custom ]\n" else "Record[ value: Choice.text[ok] ]\n", "", mode);
+    }
+    // Direct callable/range fields have no structural formatting. An enclosing
+    // hook, rather than a leaf formatter or a representation fallback, is needed.
+    const fn_ty = try ir.internType(.{ .function = .{ .params = &.{}, .result = unit } });
+    const range = try ir.internType(.{ .range = integer });
+    ir.clearFunctions();
+    try ir.setTypeFormatting(payload, "Choice", null);
+    try ir.setRecordFields(record, &.{ .{ .name = "callable", .ty = fn_ty, .span = span }, .{ .name = "bounds", .ty = range, .span = span } });
+    const hook_sig = try ir.internType(.{ .function = .{ .params = &.{record}, .result = text } });
+    const hook = try ir.addFunction("recordhook", hook_sig, span);
+    const literal = try ir.internConstant(.{ .ty = text, .value = .{ .string = "enclosing" } });
+    try ir.setFunctionBody(hook, &.{.{ .ty = text, .span = span, .op = .{ .constant = literal } }}, @fromBackingInt(0));
+    try ir.setTypeFormatting(record, "Record", hook);
+    const hooked_show = try ir.addFunction("showfields", show_sig, span);
+    try ir.setFunctionBody(hooked_show, &.{ .{ .ty = record, .span = span, .op = .{ .parameter = 0 } }, .{ .ty = unit, .span = span, .op = .{ .print = .{ .args = &.{@fromBackingInt(0)}, .newline = true } } } }, @fromBackingInt(1));
+    const library = try emit(test_gpa, &ir, null);
+    defer test_gpa.free(library);
+    const hooked_driver = try std.fmt.allocPrint(test_gpa, "\nint main(void){{nov_rt_heap.collect_every_allocation=1;nov_record_{d} a={{0}};nov_showfields(a);nov_gc_collect(&nov_rt_heap);nov_gc_shutdown(&nov_rt_heap);return 0;}}\n", .{@backingInt(record)});
+    defer test_gpa.free(hooked_driver);
+    const c = try std.mem.concat(test_gpa, u8, &.{ library, hooked_driver });
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "enclosing\n", "", mode);
+}
+
+test "storable fields source free copies replacement arrays union properties precise roots forced GC O0 O3" {
+    for ([_]bool{ false, true }) |closures| {
+        const library = try storableFieldTestLibrary(test_gpa, closures);
+        defer test_gpa.free(library);
+        const driver =
+            \\int main(void) {
+            \\ nov_rt_heap.collect_every_allocation=1;
+            \\ Fields a={0},b={0}; nov_array values={0},copied={0}; FieldUnion u={0};
+            \\ void **roots[]={&a.f0.f0.data,&b.f0.f0.data,&values.data,&copied.data,&u.f0.f0.f0.data,
+            \\#ifdef FIELD_CLOSURES
+            \\ &a.f1.env,&b.f1.env,&u.f0.f1.env,
+            \\#endif
+            \\ };
+            \\ nov_gc_roots frame={0};nov_gc_push(&nov_rt_heap,&frame,roots,sizeof(roots)/sizeof(roots[0]));
+            \\ a.f0.tag=2;a.f1=nov_makefieldfn(10);
+            \\ a=nov_initfields((FieldPayload){.tag=2},a.f1,(FieldRange){INT64_MIN,INT64_MAX,true});
+            \\ a.f0.tag=0;a.f0.f0=nov_array_new(1,1,&FIELD_TEXT);
+            \\ ((nov_string*)a.f0.f0.data)[0]=(nov_string){NULL,(const unsigned char*)"saved",5};
+            \\ a.f0.f1=a.f1;
+            \\#ifdef FIELD_CLOSURES
+            \\ a.f0.f1.env=(void*)(uintptr_t)1;
+            \\#endif
+            \\ b=nov_copyfields(a);if(a.f0.f0.data==b.f0.f0.data) return 10;
+            \\ if(b.f2.start!=INT64_MIN || b.f2.end!=INT64_MAX || !b.f2.inclusive) return 11;
+            \\#ifdef FIELD_CLOSURES
+            \\ if(FIELD_ELEMENT.pointer_count!=3 || FIELD_ELEMENT.pointer_offsets[1]!=offsetof(Fields,f0.f1.env) || FIELD_ELEMENT.pointer_offsets[2]!=offsetof(Fields,f1.env) || a.f1.env!=b.f1.env) return 12;
+            \\ if(nov_invokefield(a,1)!=11 || nov_invokefield(b,2)!=13 || b.f0.f1.code || b.f0.f1.env) return 13;
+            \\#else
+            \\ if(FIELD_ELEMENT.pointer_count!=1 || nov_invokefield(b,7)!=7 || b.f0.f1) return 14;
+            \\#endif
+            \\ b.f0.tag=1;b.f0.f1=b.f1;b=nov_copyfields(b);
+            \\ if(b.f0.f0.data) return 20;
+            \\#ifdef FIELD_CLOSURES
+            \\ if(b.f0.f1.env!=b.f1.env || b.f0.f1.code!=b.f1.code) return 21;
+            \\#else
+            \\ if(b.f0.f1!=b.f1) return 22;
+            \\#endif
+            \\ b=nov_copyfields(a);
+            \\ values=nov_packfields(b);copied=nov_copyfieldarray(values);u.f0=b;u=nov_copyfieldunion(u);
+            \\ if(((Fields*)copied.data)[0].f0.f0.data==b.f0.f0.data || u.f0.f0.f0.data==b.f0.f0.data) return 15;
+            \\ a=nov_replacefields(a,(FieldPayload){.tag=2},b.f1,(FieldRange){2,4,false});
+            \\ if(a.f0.tag!=2 || a.f0.f0.data || a.f2.start!=2 || a.f2.inclusive || b.f0.tag) return 16;
+            \\ a=(Fields){0};b=(Fields){0};u=(FieldUnion){.tag=1};values=(nov_array){0};nov_gc_collect(&nov_rt_heap);
+            \\ if(((nov_string*)((Fields*)copied.data)[0].f0.f0.data)[0].len!=5) return 17;
+            \\#ifdef FIELD_CLOSURES
+            \\ if(nov_invokefield(((Fields*)copied.data)[0],3)!=16) return 18;
+            \\#endif
+            \\ nov_gc_pop(&nov_rt_heap,&frame);nov_gc_collect(&nov_rt_heap);
+            \\ if(nov_rt_heap.live_objects || nov_rt_heap.frames) return 19;
+            \\ nov_gc_shutdown(&nov_rt_heap);return 0;
+            \\}
+        ;
+        const c = try std.mem.concat(test_gpa, u8, &.{ library, "\n", driver });
+        defer test_gpa.free(c);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "", "", mode);
+    }
+}
+
+test "storable fields source free inactive slots OOM and invalid tags O0 O3" {
+    for ([_]bool{ false, true }) |closures| {
+        const library = try storableFieldTestLibrary(test_gpa, closures);
+        defer test_gpa.free(library);
+        for ([_]struct { driver: []const u8, code: u8 = 1, message: []const u8 = "panic: invalid union tag\n" }{
+            .{ .driver = "int main(void){Fields a={0};a.f0.tag=99;(void)nov_copyfields(a);return 0;}" },
+            .{ .driver = "int main(void){Fields a={0};a.f0.tag=99;nov_array v={&a,1,1};(void)nov_copyfieldarray(v);return 0;}" },
+            .{ .driver = "int main(void){FieldUnion a={0};a.f0.f0.tag=99;(void)nov_copyfieldunion(a);return 0;}" },
+            .{ .driver = "int main(void){Fields a={0};a.f0.tag=2;a.f0.f0=(nov_array){(void*)1,99,99};Fields b=nov_copyfields(a);return b.f0.f0.data!=NULL;}", .code = 0, .message = "" },
+            .{ .driver = "int main(void){Fields a={0};budget=2;a.f0.f0=nov_array_new(1,1,&FIELD_TEXT);budget=0;(void)nov_copyfields(a);return 0;}", .message = "panic: GC allocation failed\n" },
+        }) |case| {
+            const c = try std.mem.concat(test_gpa, u8, &.{ "#include <stdlib.h>\nstatic size_t budget;\nstatic void *deny_malloc(size_t n){if(!budget)return NULL;--budget;return malloc(n);}\n#define NOV_GC_MALLOC deny_malloc\n#define NOV_GC_FREE free\n", library, "\n", case.driver });
+            defer test_gpa.free(c);
+            for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", case.code, "", case.message, mode);
+        }
+    }
+}
+
 fn nestedUnionTestLibrary() ![]u8 {
     var ir = Ir.init(test_gpa);
     defer ir.deinit();
