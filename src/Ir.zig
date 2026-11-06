@@ -253,7 +253,7 @@ const DefaultPrintability = struct {
 };
 
 pub const Field = struct { name: []const u8, ty: TypeId, span: Span, default: ?ConstId = null };
-/// Nominal by-value layout. Tagged layouts have one active scalar, array or record payload.
+/// Nominal by-value layout. Tagged layouts have one active ordinary value payload.
 pub const Record = struct {
     source: Source.Id = @fromBackingInt(@intCast(0)),
     identity: u32,
@@ -695,7 +695,7 @@ pub const LayoutIssue = struct { span: Span, related: Span, cycle: bool };
 pub fn recordLayoutIssue(self: *const Ir) (std.mem.Allocator.Error || error{InvalidTypeId})!?LayoutIssue {
     var has_record = false;
     for (self.types.items) |ty| {
-        if (ty == .record or ty == .array) has_record = true;
+        if (ty == .record or ty == .array or ty == .function) has_record = true;
     }
     if (!has_record) return null;
     const State = struct { color: enum { white, gray, black } = .white, height: usize = 1 };
@@ -703,9 +703,12 @@ pub fn recordLayoutIssue(self: *const Ir) (std.mem.Allocator.Error || error{Inva
     defer self.allocator.free(states);
     @memset(states, .{});
     const Frame = struct { id: TypeId, next: usize = 0, span: Span = .{ .start = 0, .end = 0 } };
-    var stack: [max_record_depth]Frame = undefined;
+    // Signature edges participate in structural cycle checks, but are not
+    // inline storage and must not increase the by-value nesting height.
+    const stack = try self.allocator.alloc(Frame, self.types.items.len);
+    defer self.allocator.free(stack);
     for (self.types.items, 0..) |ty, root| {
-        if ((ty != .record and ty != .array) or states[root].color != .white) continue;
+        if ((ty != .record and ty != .array and ty != .function and ty != .reference) or states[root].color != .white) continue;
         stack[0] = .{ .id = @fromBackingInt(@intCast(root)) };
         states[root].color = .gray;
         var len: usize = 1;
@@ -713,7 +716,12 @@ pub fn recordLayoutIssue(self: *const Ir) (std.mem.Allocator.Error || error{Inva
             const frame = &stack[len - 1];
             const index = @backingInt(frame.id);
             const current = self.types.items[index];
-            const count = if (current == .array) @as(usize, 1) else current.record.fields.len;
+            const count = switch (current) {
+                .array, .reference => @as(usize, 1),
+                .function => |signature| signature.params.len + 1,
+                .record => |record| record.fields.len,
+                else => unreachable,
+            };
             if (frame.next == count) {
                 states[index].color = .black;
                 len -= 1;
@@ -721,25 +729,29 @@ pub fn recordLayoutIssue(self: *const Ir) (std.mem.Allocator.Error || error{Inva
             }
             const field: Field = if (current == .array)
                 .{ .name = "", .ty = current.array, .span = frame.span }
+            else if (current == .reference)
+                .{ .name = "", .ty = current.reference.child, .span = frame.span }
+            else if (current == .function)
+                .{ .name = "", .ty = if (frame.next == current.function.params.len) current.function.result else current.function.params[frame.next], .span = frame.span }
             else
                 current.record.fields[frame.next];
             const child_id = field.ty;
             const ft = self.getType(child_id) orelse return error.InvalidTypeId;
             const child = @backingInt(child_id);
-            if (ft != .record and ft != .array) {
+            if (ft != .record and ft != .array and ft != .function and ft != .reference) {
                 frame.next += 1;
                 continue;
             }
             const related = if (ft == .record and ft.record.fields.len != 0) ft.record.fields[0].span else field.span;
             if (states[child].color == .gray) return .{ .span = field.span, .related = related, .cycle = true };
             if (states[child].color == .white) {
-                if (len == stack.len) return .{ .span = field.span, .related = related, .cycle = false };
                 states[child].color = .gray;
                 stack[len] = .{ .id = child_id, .span = field.span };
                 len += 1;
                 continue;
             }
-            states[index].height = @max(states[index].height, states[child].height + 1);
+            if (current != .function and current != .reference and ft != .function and ft != .reference)
+                states[index].height = @max(states[index].height, states[child].height + 1);
             if (states[index].height > max_record_depth) return .{ .span = field.span, .related = related, .cycle = false };
             frame.next += 1;
         }
@@ -1573,7 +1585,7 @@ pub fn isManaged(ty: Type) bool {
 /// Direct nested unions retain nominal identity. Layout graph validation
 /// independently rejects cycles and excessive by-value depth.
 pub fn isUnionPayload(ty: Type) bool {
-    return isRecordField(ty) or ty == .void or ty == .record;
+    return isRecordField(ty) or ty == .void or ty == .record or ty == .function or ty == .range;
 }
 
 /// Query the layout DAG, visiting scalar diamonds only once. Closure values
@@ -1857,9 +1869,13 @@ test "array union payload IR accepts storable elements and rejects forged cycles
     }
     const fields = @constCast(ir.types.items[@backingInt(u)].record.fields);
     const saved = fields[0].ty;
-    for ([_]TypeId{ reference, signature, range }) |unsupported| {
-        fields[0].ty = unsupported;
-        try std.testing.expectError(error.InvalidArrayElement, ir.verify());
+    fields[0].ty = reference;
+    try std.testing.expectError(error.InvalidArrayElement, ir.verify());
+    for ([_]TypeId{ signature, range }) |payload| {
+        fields[0].ty = payload;
+        try ir.verify();
+        try std.testing.expect(!try ir.needsArrayCopy(u));
+        try std.testing.expect(!isRecordField(ir.getType(payload).?));
     }
     fields[0].ty = saved;
     const inner = ir.getType(saved).?.array;
@@ -1868,6 +1884,49 @@ test "array union payload IR accepts storable elements and rejects forged cycles
     try std.testing.expectError(error.InvalidArrayElement, ir.verify());
     ir.types.items[@backingInt(inner)] = original;
     try ir.verify();
+}
+
+fn testValuePayloadLayouts(allocator: std.mem.Allocator) !void {
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    const span: Span = .{ .start = 0, .end = 0 };
+    const integer = try ir.internType(.{ .integer = .{ .bits = 64, .signedness = .signed } });
+    const unit = try ir.internType(.void);
+    const payload = try ir.internType(.{ .record = .{ .identity = 930, .tagged = true, .fields = &.{} } });
+    const record = try ir.internType(.{ .record = .{ .identity = 931, .fields = &.{} } });
+    try ir.setRecordFields(record, &.{.{ .name = "n", .ty = integer, .span = span }});
+    const signature = try ir.internType(.{ .function = .{ .params = &.{record}, .result = integer } });
+    const range = try ir.internType(.{ .range = integer });
+    try ir.setRecordFields(payload, &.{ .{ .name = "callable", .ty = signature, .span = span }, .{ .name = "bounds", .ty = range, .span = span }, .{ .name = "none", .ty = unit, .span = span } });
+    try ir.verify();
+    try std.testing.expect(!try ir.needsArrayCopy(payload));
+    for ([_]TypeId{ signature, range }) |ty| {
+        try std.testing.expect(isUnionPayload(ir.getType(ty).?));
+        try std.testing.expect(!isRecordField(ir.getType(ty).?));
+    }
+    const fields = @constCast(ir.types.items[@backingInt(payload)].record.fields);
+    const recursive = try ir.internType(.{ .function = .{ .params = &.{payload}, .result = integer } });
+    fields[0].ty = recursive;
+    if (ir.verify()) |_| return error.TestExpectedError else |err| switch (err) {
+        error.CyclicRecordLayout => {},
+        else => return err,
+    }
+    fields[0].ty = signature;
+    try ir.verify();
+    const reference = try ir.internType(.{ .reference = .{ .child = payload, .mutable = false } });
+    const loan_signature = try ir.internType(.{ .function = .{ .params = &.{reference}, .result = integer } });
+    fields[0].ty = loan_signature;
+    if (ir.verify()) |_| return error.TestExpectedError else |err| switch (err) {
+        error.CyclicRecordLayout => {},
+        else => return err,
+    }
+    fields[0].ty = signature;
+    try ir.verify();
+}
+
+test "value payloads IR finite signatures record parameters structural cycles and OOM" {
+    try testValuePayloadLayouts(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testValuePayloadLayouts, .{});
 }
 
 test "nestedunion IR membership finite layouts and forged recursive graphs" {
@@ -4888,7 +4947,7 @@ test "range values require integer elements exact visible operands and immutable
     try std.testing.expectError(error.NonConstantType, t.ir.internConstant(.{ .ty = range, .value = .void }));
     try std.testing.expect(!isManaged(t.ir.getType(range).?));
     try std.testing.expect(!isRecordField(t.ir.getType(range).?));
-    try std.testing.expect(!isUnionPayload(t.ir.getType(range).?));
+    try std.testing.expect(isUnionPayload(t.ir.getType(range).?));
     const make = TestFunctions.instruction;
     const good = [_]Instruction{
         make(t.integer, .{ .parameter = 0 }),

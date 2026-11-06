@@ -86,8 +86,8 @@ Normal assignments, calls, returns, match captures and `.!` preserve recursively
 independent array backing. Only the active payload is cloned; inactive payload
 fields remain zeroed. Immutable strings share backing, and closure elements share
 their capture environments. Arrays do not grant aliases to the union's storage.
-Direct function, range and reference payloads remain unsupported. Nested union
-payloads are supported under the same acyclic-layout rule; recursive layouts,
+Function, range and nested union payloads are supported under the same acyclic
+rules; references cannot be payloads. Recursive layouts,
 including cycles through arrays, reject. See
 `examples/union-arrays.nov` for a runnable example and six tests.
 
@@ -111,8 +111,33 @@ Only active tag chains are inspected, copied and formatted; arrays inside them
 retain recursively independent backing. Inactive by-value fields remain zeroed.
 Malformed active tags panic before allocating copies or invoking formatters.
 Default output retains nested union tags and uses exact nested stringify hooks.
-Direct union fields in structs, recursive layouts and reference payloads remain
-unsupported. See `examples/nested-unions.nov` for a runnable example and six tests.
+Direct union fields in structs, recursive type/layout graphs and reference
+payloads remain unsupported. See `examples/nested-unions.nov` for a runnable example and six tests.
+
+## Function and range payloads
+
+Containers may hold callable values and ranges:
+
+```nov
+let Callback = (int) -> int
+let Interval = @TypeOf(0..1)
+let function: std.Option(Callback) = .some[(value: int) { value + 1 }]
+let range: std.Option(Interval) = .some[0..=3]
+```
+
+Extract a payload with a match or `.!`, then call the function or iterate the
+range. Function copies share the existing closure environment and captured cells;
+immutable capture snapshots are not recreated. Ranges copy exact typed bounds and
+inclusivity by value without allocation. Both work as container `map`/`andThen`
+results and `std.array.find` payloads. References are still call-scoped capabilities,
+not storable payloads, and closures cannot capture them.
+
+Functions and ranges remain unprintable by default, including inside a union or
+array. An enclosing valid `@[stringify]` hook can provide a representation and stop
+structural recursion. Even an empty Option of a callable type needs such a hook
+for printing. Direct function/range/union struct fields and recursive structural
+signature graphs remain unsupported. See `examples/value-payloads.nov` for a
+runnable example and six tests.
 
 ## Container mapping
 
@@ -183,10 +208,8 @@ left-to-right order, including callback construction and the seed.
 
 `find` supports the existing `Option` payload types: bool, integers, floats,
 runes, strings, enums, arrays (including nested arrays), and supported acyclic
-records, including array fields, as well as nested union payloads. Direct function
-and range payloads remain unsupported; use
-`findIndex` to search those arrays. Other helpers accept all supported element
-types. The returned `Option` is the same canonical type as `std.Option`.
+records, including array fields, as well as nested unions, functions/closures
+and ranges. All helpers accept every currently supported array element type. The returned `Option` is the same canonical type as `std.Option`.
 
 ```nov
 let found = array.find([1, 2, 3], (x) { x > 1 })

@@ -277,67 +277,79 @@ fn write(allocator: std.mem.Allocator, ir: *const Ir, origins: []const ?Origin, 
     const root_counts = try allocator.alloc(usize, ir.types.items.len);
     defer allocator.free(root_counts);
     for (ir.types.items, root_counts) |ty, *count| count.* = @intFromBool(ty == .string or ty == .array or (ty == .function and usesClosures(ir)));
-    var remaining: usize = 0;
-    for (origins, ir.types.items) |origin, ty| {
-        if (origin != null and ty == .record) remaining += 1;
-    }
-    while (remaining != 0) {
+    const closures = usesClosures(ir);
+    if (closures) {
         for (origins, ir.types.items, 0..) |origin, ty, i| {
-            if (origin == null or ty != .record or declared[i]) continue;
+            if (origin != null and ty == .function) try w.print("typedef struct nov_fn_{d} nov_fn_{d};\n", .{ i, i });
+        }
+    }
+    var remaining: usize = 0;
+    for (origins, ir.types.items, declared) |origin, ty, *done| {
+        done.* = origin == null or (ty != .record and ty != .function and ty != .range);
+        if (!done.*) remaining += 1;
+    }
+    // Verification rejects structural cycles, including signature edges. Emit
+    // complete dependencies first regardless of nominal placeholder pool order.
+    while (remaining != 0) {
+        for (ir.types.items, 0..) |ty, i| {
+            if (declared[i]) continue;
             var ready = true;
-            for (ty.record.fields) |field| {
-                if (ir.getType(field.ty).? == .record and !declared[@backingInt(field.ty)]) ready = false;
+            switch (ty) {
+                .record => |record| for (record.fields) |field| {
+                    if (!declared[@backingInt(field.ty)]) ready = false;
+                },
+                .function => |signature| {
+                    if (!declared[@backingInt(signature.result)]) ready = false;
+                    for (signature.params) |param| {
+                        const pt = ir.getType(param).?;
+                        const dependency = if (pt == .reference) pt.reference.child else param;
+                        if (!declared[@backingInt(dependency)]) ready = false;
+                    }
+                },
+                .range => {},
+                else => unreachable,
             }
             if (!ready) continue;
             declared[i] = true;
             remaining -= 1;
-            for (ty.record.fields) |field| root_counts[i] = std.math.add(usize, root_counts[i], root_counts[@backingInt(field.ty)]) catch return error.OutOfMemory;
-            try w.print("typedef struct {{\n", .{});
-            if (ty.record.tagged) try w.writeAll("    uint32_t tag;\n");
-            for (ty.record.fields, 0..) |field, f| {
-                if (ir.getType(field.ty).? == .void) continue;
-                try w.writeAll("    ");
-                try writeType(ir, w, field.ty);
-                try w.print(" f{d};\n", .{f});
+            switch (ty) {
+                .record => |record| {
+                    for (record.fields) |field| root_counts[i] = std.math.add(usize, root_counts[i], root_counts[@backingInt(field.ty)]) catch return error.OutOfMemory;
+                    try w.writeAll("typedef struct {\n");
+                    if (record.tagged) try w.writeAll("    uint32_t tag;\n");
+                    for (record.fields, 0..) |field, f| {
+                        if (ir.getType(field.ty).? == .void) continue;
+                        try w.writeAll("    ");
+                        try writeType(ir, w, field.ty);
+                        try w.print(" f{d};\n", .{f});
+                    }
+                    if (record.fields.len == 0) try w.writeAll("    unsigned char empty;\n");
+                    try w.print("}} nov_record_{d};\n", .{i});
+                },
+                .range => |element| {
+                    try w.writeAll("typedef struct { ");
+                    try writeType(ir, w, element);
+                    try w.print(" start, end; bool inclusive; }} nov_range_{d};\n", .{i});
+                },
+                .function => |signature| {
+                    if (closures) try w.print("struct nov_fn_{d} {{ ", .{i}) else try w.writeAll("typedef ");
+                    try writeType(ir, w, signature.result);
+                    if (closures) {
+                        try w.writeAll(" (*code)(void *");
+                        for (signature.params) |param| {
+                            try w.writeAll(", ");
+                            try writeType(ir, w, param);
+                        }
+                        try w.writeAll("); void *env; };\n");
+                    } else {
+                        try w.print(" (*nov_fn_{d})(", .{i});
+                        try writeParamTypes(ir, w, signature.params);
+                        try w.writeAll(");\n");
+                    }
+                },
+                else => unreachable,
             }
-            if (ty.record.fields.len == 0) try w.writeAll("    unsigned char empty;\n");
-            try w.print("}} nov_record_{d};\n", .{i});
         }
-    }
-    for (origins, ir.types.items, 0..) |origin, ty, i| {
-        if (origin == null or ty != .range) continue;
-        try w.writeAll("typedef struct { ");
-        try writeType(ir, w, ty.range);
-        try w.print(" start, end; bool inclusive; }} nov_range_{d};\n", .{i});
-    }
-    // Forward declarations permit higher-order signatures without recursive C typedefs.
-    if (usesClosures(ir)) {
-        for (origins, ir.types.items, 0..) |origin, ty, i| {
-            if (origin != null and ty == .function) try w.print("typedef struct nov_fn_{d} nov_fn_{d};\n", .{ i, i });
-        }
-        for (origins, ir.types.items, 0..) |origin, ty, i| {
-            if (origin == null or ty != .function) continue;
-            try w.print("struct nov_fn_{d} {{ ", .{i});
-            try writeType(ir, w, ty.function.result);
-            try w.writeAll(" (*code)(void *");
-            for (ty.function.params) |param| {
-                try w.writeAll(", ");
-                try writeType(ir, w, param);
-            }
-            try w.writeAll("); void *env; };\n");
-        }
-    }
-    // Array element descriptors can refer to ordinary function-pointer types.
-    var first_typedef = true;
-    for (origins, ir.types.items, 0..) |origin, ty, i| {
-        if (origin == null or ty != .function or usesClosures(ir)) continue;
-        if (first_typedef) try w.writeByte('\n');
-        first_typedef = false;
-        try w.writeAll("typedef ");
-        try writeType(ir, w, ty.function.result);
-        try w.print(" (*nov_fn_{d})(", .{i});
-        try writeParamTypes(ir, w, ty.function.params);
-        try w.writeAll(");\n");
     }
     const copy_types = try allocator.alloc(bool, ir.types.items.len);
     defer allocator.free(copy_types);
@@ -6559,6 +6571,137 @@ fn arrayPayloadTestLibrary() ![]u8 {
     const library = try emit(test_gpa, &ir, null);
     defer test_gpa.free(library);
     return std.mem.concat(test_gpa, u8, &.{ library, aliases.written() });
+}
+
+fn valuePayloadTestLibrary(closures: bool) ![]u8 {
+    var ir = Ir.init(test_gpa);
+    defer ir.deinit();
+    const span: Ir.Span = .{ .start = 0, .end = 0 };
+    const V = struct {
+        fn id(i: u32) Ir.ValueId {
+            return @fromBackingInt(i);
+        }
+        fn ins(ty: Ir.TypeId, op: Ir.Operation) Ir.Instruction {
+            return .{ .ty = ty, .span = .{ .start = 0, .end = 0 }, .op = op };
+        }
+    };
+    const unit = try ir.internType(.void);
+    const integer = try ir.internType(.{ .integer = .{ .bits = 64, .signedness = .signed } });
+    const text = try ir.internType(.string);
+    // Reserve the union before its function/range dependencies.
+    const payload = try ir.internType(.{ .record = .{ .identity = 920, .tagged = true, .fields = &.{} } });
+    const signature = try ir.internType(.{ .function = .{ .params = &.{integer}, .result = integer } });
+    const range = try ir.internType(.{ .range = integer });
+    const strings = try ir.internType(.{ .array = text });
+    const record = try ir.internType(.{ .record = .{ .identity = 921, .fields = &.{} } });
+    try ir.setRecordFields(record, &.{.{ .name = "n", .ty = integer, .span = span }});
+    const higher_order = try ir.internType(.{ .function = .{ .params = &.{ record, signature }, .result = record } });
+    const reference = try ir.internType(.{ .reference = .{ .child = record, .mutable = false } });
+    const loan_signature = try ir.internType(.{ .function = .{ .params = &.{reference}, .result = integer } });
+    try ir.setRecordFields(payload, &.{ .{ .name = "callable", .ty = signature, .span = span }, .{ .name = "bounds", .ty = range, .span = span }, .{ .name = "items", .ty = strings, .span = span }, .{ .name = "none", .ty = unit, .span = span }, .{ .name = "higher", .ty = higher_order, .span = span }, .{ .name = "loan", .ty = loan_signature, .span = span } });
+    const callable = try ir.addFunction("payloadfn", signature, span);
+    if (closures) {
+        ir.functions.items[@backingInt(callable)].is_closure = true;
+        ir.functions.items[@backingInt(callable)].captures = try test_gpa.dupe(Ir.Capture, &.{.{ .ty = integer, .mutable = true }});
+        var cell = V.ins(integer, .{ .capture_cell = 0 });
+        cell.boxed = true;
+        try ir.setFunctionBody(callable, &.{
+            cell,
+            V.ins(integer, .{ .local_load = V.id(0) }),
+            V.ins(integer, .{ .parameter = 0 }),
+            V.ins(integer, .{ .binary = .{ .op = .add, .lhs = V.id(1), .rhs = V.id(2) } }),
+            V.ins(unit, .{ .local_store = .{ .slot = V.id(0), .value = V.id(3) } }),
+            V.ins(integer, .{ .local_load = V.id(0) }),
+        }, V.id(5));
+    } else try ir.setFunctionBody(callable, &.{V.ins(integer, .{ .parameter = 0 })}, V.id(0));
+    const maker_sig = try ir.internType(.{ .function = .{ .params = &.{integer}, .result = payload } });
+    const maker = try ir.addFunction("makevaluepayload", maker_sig, span);
+    if (closures) {
+        var slot = V.ins(integer, .{ .local_slot = V.id(0) });
+        slot.boxed = true;
+        try ir.setFunctionBody(maker, &.{
+            V.ins(integer, .{ .parameter = 0 }),
+            slot,
+            V.ins(signature, .{ .closure_init = .{ .function = callable, .captures = &.{V.id(1)} } }),
+            V.ins(payload, .{ .union_init = .{ .index = 0, .payload = V.id(2) } }),
+        }, V.id(3));
+    } else try ir.setFunctionBody(maker, &.{
+        V.ins(signature, .{ .function_ref = callable }),
+        V.ins(payload, .{ .union_init = .{ .index = 0, .payload = V.id(0) } }),
+    }, V.id(1));
+    const copy_sig = try ir.internType(.{ .function = .{ .params = &.{payload}, .result = payload } });
+    const copy = try ir.addFunction("copyvaluepayload", copy_sig, span);
+    try ir.setFunctionBody(copy, &.{ V.ins(payload, .{ .parameter = 0 }), V.ins(payload, .{ .array_clone = V.id(0) }) }, V.id(1));
+    const read_sig = try ir.internType(.{ .function = .{ .params = &.{payload}, .result = signature } });
+    const read = try ir.addFunction("readvaluepayload", read_sig, span);
+    try ir.setFunctionBody(read, &.{ V.ins(payload, .{ .parameter = 0 }), V.ins(signature, .{ .union_payload = .{ .base = V.id(0), .index = 0 } }) }, V.id(1));
+    const array = try ir.internType(.{ .array = payload });
+    const pack_sig = try ir.internType(.{ .function = .{ .params = &.{payload}, .result = array } });
+    const pack = try ir.addFunction("packvaluepayload", pack_sig, span);
+    try ir.setFunctionBody(pack, &.{ V.ins(payload, .{ .parameter = 0 }), V.ins(array, .{ .array_literal = &.{V.id(0)} }) }, V.id(1));
+    var aliases = std.Io.Writer.Allocating.init(test_gpa);
+    defer aliases.deinit();
+    try aliases.writer.writeAll("typedef ");
+    try writeType(&ir, &aliases.writer, payload);
+    try aliases.writer.print(" ValuePayload;\n#define VALUE_ELEMENT nov_element_{d}\n", .{@backingInt(payload)});
+    try aliases.writer.writeAll(if (closures) "#define VALUE_CALL(f,n) ((f).code((f).env,(n)))\n#define VALUE_ROOT(p) &(p).f0.env\n" else "#define VALUE_CALL(f,n) ((f)(n))\n");
+    const library = try emit(test_gpa, &ir, null);
+    defer test_gpa.free(library);
+    return std.mem.concat(test_gpa, u8, &.{ library, aliases.written() });
+}
+
+test "value payloads source free function range normalization shared environments forced GC O0 O3" {
+    for ([_]bool{ false, true }) |closures| {
+        const library = try valuePayloadTestLibrary(closures);
+        defer test_gpa.free(library);
+        const driver =
+            \\int main(void) {
+            \\ nov_rt_heap.collect_every_allocation=1;
+            \\ ValuePayload a={0}, b={0}; nov_array values={0};
+            \\ void **roots[]={&values.data,
+            \\#ifdef VALUE_ROOT
+            \\ VALUE_ROOT(a),VALUE_ROOT(b),
+            \\#endif
+            \\ &a.f2.data,&b.f2.data};
+            \\ nov_gc_roots frame={0};nov_gc_push(&nov_rt_heap,&frame,roots,sizeof(roots)/sizeof(roots[0]));
+            \\ a=nov_makevaluepayload(10);b=nov_copyvaluepayload(a);
+            \\#ifdef VALUE_ROOT
+            \\ if(a.f0.env!=b.f0.env || VALUE_ELEMENT.pointer_count!=4 || VALUE_ELEMENT.pointer_offsets[0]!=offsetof(ValuePayload,f0.env)) return 10;
+            \\ if(VALUE_CALL(nov_readvaluepayload(a),1)!=11 || VALUE_CALL(nov_readvaluepayload(b),2)!=13) return 11;
+            \\#else
+            \\ if(VALUE_ELEMENT.pointer_count!=1 || VALUE_CALL(nov_readvaluepayload(a),7)!=7) return 12;
+            \\#endif
+            \\ values=nov_packvaluepayload(a);a=(ValuePayload){.tag=3};b=(ValuePayload){.tag=3};nov_gc_collect(&nov_rt_heap);
+            \\#ifdef VALUE_ROOT
+            \\ if(VALUE_CALL(nov_readvaluepayload(((ValuePayload*)values.data)[0]),3)!=16) return 13;
+            \\#else
+            \\ if(VALUE_CALL(nov_readvaluepayload(((ValuePayload*)values.data)[0]),3)!=3) return 14;
+            \\#endif
+            \\ a.tag=1;a.f1.start=INT64_MIN;a.f1.end=INT64_MAX;a.f1.inclusive=true;
+            \\#ifdef VALUE_ROOT
+            \\ a.f0.env=(void*)(uintptr_t)1;
+            \\#endif
+            \\ a.f2.data=(void*)(uintptr_t)1;
+            \\ b=nov_copyvaluepayload(a);a=(ValuePayload){.tag=3};nov_gc_collect(&nov_rt_heap);
+            \\ if(b.f1.start!=INT64_MIN || b.f1.end!=INT64_MAX || !b.f1.inclusive || b.f2.data) return 15;
+            \\#ifdef VALUE_ROOT
+            \\ if(b.f0.env || b.f0.code) return 16;
+            \\#else
+            \\ if(b.f0) return 17;
+            \\#endif
+            \\ nov_gc_pop(&nov_rt_heap,&frame);nov_gc_collect(&nov_rt_heap);
+            \\ if(nov_rt_heap.live_objects || nov_rt_heap.frames) return 18;
+            \\ nov_gc_shutdown(&nov_rt_heap);return 0;
+            \\}
+        ;
+        const c = try std.mem.concat(test_gpa, u8, &.{ library, "\n", driver });
+        defer test_gpa.free(c);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode|
+            try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "", "", mode);
+        const malformed = try std.mem.concat(test_gpa, u8, &.{ library, "\nint main(void){ValuePayload p={.tag=99};(void)nov_copyvaluepayload(p);return 0;}\n" });
+        defer test_gpa.free(malformed);
+        try compileAndRunMode(malformed, "typedef int nonempty_translation_unit;", 1, "", "panic: invalid union tag\n", "-O3");
+    }
 }
 
 fn nestedUnionTestLibrary() ![]u8 {

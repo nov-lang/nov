@@ -1,0 +1,325 @@
+; nov run examples/value-payloads.nov
+; nov test examples/value-payloads.nov
+; Extract one union layer before calling a function or iterating a range.
+
+let std = @import("std")
+let Option = std.Option
+let Result = std.Result
+let Callback = (int) -> int
+let IntRange = @TypeOf(@as(int, 0)..@as(int, 1))
+let UintRange = @TypeOf(0..1)
+
+let PlainFnUnion = union {
+    function: Callback,
+    none,
+}
+
+let Ranges = union {
+    signed: IntRange,
+    unsigned: UintRange,
+    none,
+}
+
+let Custom = union {
+    function: Callback,
+    range: IntRange,
+    none,
+
+    @[stringify]
+    let format: (value: Custom) -> string = match value {
+        .function => |callback| "callback:{callback(4)}"
+        .range => |range| {
+            let mut count = 0
+            loop n in range {
+                count += 1
+            }
+            "range:{count}"
+        }
+        .none => "empty"
+    }
+}
+
+let Envelope = union {
+    value: Custom,
+    none,
+}
+
+let increment: (value: int) -> int = value + 1
+let echo: (value: PlainFnUnion) -> PlainFnUnion = value
+let echoRange: (value: Ranges) -> Ranges = value
+
+let counter: () -> Option(Callback) = {
+    let mut count = 0
+    .some[
+        (step: int) -> int {
+            count += step
+            count
+        }]
+}
+
+let callOption: (value: Option(Callback)) -> Option(int) = {
+    let callback = value.!
+    .some[callback(3)]
+}
+
+let callResult: (value: Result(Callback, string)) -> Result(int, string) = {
+    let callback = value.!
+    .ok[callback(4)]
+}
+
+let sumOption: (value: Option(IntRange)) -> Option(int) = {
+    let range = value.!
+    let mut sum = 0
+    loop n in range {
+        sum += n
+    }
+    .some[sum]
+}
+
+let nestedLayer: (value: Option(Result(Callback, string))) -> Option(Result(Callback, string)) = {
+    let inner = value.!
+    .some[inner]
+}
+
+@[test]
+let callable_constructors_match_and_propagation: () = {
+    let some: Option((int) -> int) = .some[increment]
+    let good: Result(Callback, string) = .ok[increment]
+    let bad: Result(Callback, string) = .err["missing"]
+    let plain: PlainFnUnion = .function[increment]
+    let copy = echo(plain)
+    @assert(
+        match copy {
+            .function => |callback| callback(5) == 6
+            .none => false
+        }
+    )
+    @assert(callOption(some).unwrapOr(0) == 4)
+    @assert(callOption(.none[]).isNone())
+    @assert(callResult(good).unwrapOr(0) == 5)
+    @assert(
+        match callResult(bad) {
+            .ok => false
+            .err => |message| message == "missing"
+        }
+    )
+    let nested = nestedLayer(.some[good])
+    @assert(
+        match nested {
+            .some => |inner| match inner {
+                .ok => |callback| callback(8) == 9
+                .err => false
+            }
+            .none => false
+        }
+    )
+}
+
+@[test]
+let escaping_shared_cells_and_overwritten_owner: () = {
+    let mut owner = counter()
+    let copy = owner
+    owner = .none[]
+    let mut pressure: [][]int = []
+    loop n in @as(int, 0)..256 {
+        pressure += [[n, n + 1]]
+    }
+    @assert(owner.isNone() and pressure.len == 256)
+    let callback = match copy {
+        .some => |function| function
+        .none => increment
+    }
+    @assert(callback(1) == 1)
+    @assert(callOption(copy).unwrapOr(0) == 4)
+    let later = copy
+    @assert(callOption(later).unwrapOr(0) == 7)
+    let other = counter()
+    @assert(callOption(other).unwrapOr(0) == 3)
+    let inactive: []Option(Callback) = [.none[], copy, .none[]]
+    @assert(callOption(inactive[1]).unwrapOr(0) == 10)
+}
+
+@[test]
+let creation_snapshots_and_later_copies: () = {
+    let mut values: []int = [2]
+    let saved = values
+    let first: Option(Callback) = .some[
+        (n: int) -> int {
+            saved[0] + n
+        }]
+    values[0] = 9
+    let newer = values
+    let second: Option(Callback) = .some[
+        (n: int) -> int {
+            newer[0] + n
+        }]
+    let later = first
+    values[0] = 20
+    @assert(callOption(first).unwrapOr(0) == 5)
+    @assert(callOption(later).unwrapOr(0) == 5)
+    @assert(callOption(second).unwrapOr(0) == 12)
+    let rows: [][]PlainFnUnion = [[.function[increment]], [.none[]]]
+    let copied = rows
+    @assert(
+        match copied[0][0] {
+            .function => |callback| callback(2) == 3
+            .none => false
+        }
+    )
+}
+
+@[test]
+let range_copies_exact_bounds_and_inclusive_max: () = {
+    let mut start: int = 1
+    let mut end: int = 4
+    let originalRange = start..end
+    let mut owner: Ranges = .signed[originalRange]
+    let saved = echoRange(owner)
+    start = 8
+    end = 9
+    owner = .signed[start..=end]
+    let range = match saved {
+        .signed => |value| value
+        .unsigned => @as(int, 0)..0
+        .none => @as(int, 0)..0
+    }
+    let mut count = 0
+    let mut sum = 0
+    loop n in range {
+        count += 1
+        sum += n
+        owner = .none[]
+    }
+    @assert(count == 3 and sum == 6)
+    @assert(sumOption(.some[range]).unwrapOr(0) == 6)
+    @assert(sumOption(.none[]).isNone())
+    let signedMax: int = 9223372036854775807
+    let unsignedMax: uint = 18446744073709551615
+    let edges: []Ranges = [.signed[signedMax..=signedMax], .unsigned[unsignedMax..=unsignedMax], .none[]]
+    let mut signedCount = 0
+    let mut unsignedCount = 0
+    loop edge in edges {
+        match edge {
+            .signed => |value| {
+                loop n in value {
+                    @assert(n == signedMax)
+                    signedCount += 1
+                }
+            }
+            .unsigned => |value| {
+                loop n in value {
+                    @assert(n == unsignedMax)
+                    unsignedCount += 1
+                }
+            }
+            .none => {}
+        }
+    }
+    @assert(signedCount == 1 and unsignedCount == 1)
+    let descending = @as(int, 4)..2
+    let empty: Option(IntRange) = .some[descending]
+    @assert(sumOption(empty).unwrapOr(-1) == 0)
+}
+
+@[test]
+let find_and_map_function_and_range_results: () = {
+    let found: Option(Callback) = std.array.find(
+        [increment],
+        (callback: Callback) -> bool {
+            callback(2) == 3
+        }
+    )
+    @assert(callOption(found).unwrapOr(0) == 4)
+    let missing: Option(Callback) = std.array.find(
+        @as([]Callback, []),
+        (callback: Callback) -> bool {
+            true
+        }
+    )
+    @assert(missing.isNone())
+    let ranges: []IntRange = [@as(int, 1)..4, @as(int, 5)..=6]
+    let selected: Option(IntRange) = std.array.find(
+        ranges,
+        (range: IntRange) -> bool {
+            true
+        }
+    )
+    @assert(sumOption(selected).unwrapOr(0) == 6)
+    let plain: []PlainFnUnion = [.none[], .function[increment]]
+    let nested = std.array.find(
+        plain,
+        (value: PlainFnUnion) -> bool {
+            match value {
+                .function => true
+                .none => false
+            }
+        }
+    )
+    @assert(nested.isSome())
+    let source: Option(int) = .some[7]
+    let mapped: Option(Callback) = source.map(
+        (base) {
+            (n: int) -> int {
+                base + n
+            }
+        }
+    )
+    @assert(callOption(mapped).unwrapOr(0) == 10)
+    let mappedRange: Option(IntRange) = source.map(
+        (base) {
+            base..=base
+        }
+    )
+    @assert(sumOption(mappedRange).unwrapOr(0) == 7)
+    let result: Result(int, string) = .ok[8]
+    let resultFunction = result.map(
+        (base) {
+            (n: int) -> int {
+                base + n
+            }
+        }
+    )
+    @assert(callResult(resultFunction).unwrapOr(0) == 12)
+    let error: Result(int, string) = .err["saved"]
+    let errorFunction = error.mapErr(
+        (message) {
+            () -> string {
+                message
+            }
+        }
+    )
+    @assert(
+        match errorFunction {
+            .ok => false
+            .err => |callback| callback() == "saved"
+        }
+    )
+    let none: Option(int) = .none[]
+    let skipped: Option(Callback) = none.map(
+        (base) -> Callback {
+            @panic("inactive map")
+        }
+    )
+    @assert(skipped.isNone())
+}
+
+@[test]
+let custom_hooks_nested_helpers_and_inactive_values: () = {
+    let function: Custom = .function[increment]
+    let range: Custom = .range[@as(int, 1)..4]
+    let inactive: Custom = .none[]
+    @assert("{function}" == "callback:5")
+    @assert("{range}" == "range:3")
+    @assert("{inactive}" == "empty")
+    let nested: []Envelope = [.value[function], .value[range], .value[inactive], .none[]]
+    @assert("{nested}" == "[Envelope.value[callback:5], Envelope.value[range:3], Envelope.value[empty], Envelope.none]")
+}
+
+let main: () = {
+    let function: Custom = .function[increment]
+    let interval = @as(int, 1)..4
+    let range: Custom = .range[interval]
+    @println("Custom:", function, range)
+    @println("Called:", callOption(.some[increment]).unwrapOr(0))
+    @println("Sum:", sumOption(.some[interval]).unwrapOr(0))
+}

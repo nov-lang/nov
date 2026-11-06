@@ -608,6 +608,116 @@ test "union array payloads value and type printing under OOM" {
     );
 }
 
+test "value payloads functions contextual templates captures propagation and explicit references under OOM" {
+    try testUnionArrayPayloadsOom(
+        \\let O:(T:type)->type=union{some:T,none,}
+        \\let F=(int)->int
+        \\let U=union{callback:F,empty,}
+        \\let id:(x:`T)->`T=x
+        \\let wrap:(x:`T)->O(`T)=.some[x]
+        \\let make:(seed:int)->O(F)=.some[(n){seed+n}]
+        \\let generic:()->O(F)=.some[id]
+        \\let plain:()->U=.callback[id]
+        \\let apply:(o:O(F))->O(int)={let f=o.!
+        \\.some[f(2)]}
+        \\let read:(u:U)->int=match u{.callback=>|f|f(3)
+        \\.empty=>0}
+        \\let main:()={let mut o=make(4)
+        \\let r=&o
+        \\let copy:O(F)=r.*
+        \\let f:F=id
+        \\let fr=&f
+        \\let forwarded=wrap(fr.*)
+        \\@println(apply(copy),apply(forwarded),apply(generic()),read(plain()))}
+    );
+}
+
+test "value payloads ranges aliases exact unsigned inclusive propagation and reuse under OOM" {
+    try testUnionArrayPayloadsOom(
+        \\let O:(T:type)->type=union{some:T,none,}
+        \\let Range=@TypeOf(@as(int,0)..1)
+        \\let Unsigned=@TypeOf(@as(uint,0)..=@as(uint,1))
+        \\let U=union{range:Range,unsigned:Unsigned,empty,}
+        \\let wrap:(x:`T)->O(`T)=.some[x]
+        \\let make:()->O(Range)=.some[@as(int,0)..=3]
+        \\let sum:(o:O(Range))->O(int)={let range=o.!
+        \\let mut n=0
+        \\loop v in range {n+=v}
+        \\loop v in range {n+=v}
+        \\.some[n]}
+        \\let main:()={let a:Range=@as(int,0)..3
+        \\let b:Unsigned=@as(uint,0)..=@as(uint,3)
+        \\let u:U=.unsigned[b]
+        \\let copy=u
+        \\let n=match copy{.unsigned=>|r|{let mut total:uint=0
+        \\loop v in r {total+=v}
+        \\total}
+        \\_=>@as(uint,0)}
+        \\@println(sum(make()),sum(wrap(a)),n)}
+    );
+}
+
+test "inline range payloads explicit contextual aliases and generic inference under OOM" {
+    try testUnionArrayPayloadsOom(
+        \\let O:(T:type)->type=union{some:T,none,}
+        \\let U=union{range:@TypeOf(0..1),signed:@TypeOf(-1..1),number:int,}
+        \\let Alias=U
+        \\let id:(x:`T)->`T=x
+        \\let take:(x:`T,u:O(@TypeOf(0..1)))->`T=x
+        \\let make:()->U=.range[0..=3]
+        \\let main:()={let a=Alias.range[0..3]
+        \\let b:U=.signed[-1..=3]
+        \\let c=id(O(@TypeOf(0..1)).some[0..=2])
+        \\let d=take(true,.some[0..3])
+        \\let e=[U.range[0..1],.range[0..=2]]
+        \\let s="abc"[0..2]
+        \\@println(d,s)}
+    );
+}
+
+test "inline range payloads reject omitted bounds and nonrange payloads under OOM" {
+    const prefix = "let U=union{range:@TypeOf(0..1),number:int,}\n";
+    for ([_]struct { body: []const u8, tag: Module.Diagnostic.Tag }{
+        .{ .body = "let f:()->U=U.range[..3]", .tag = .invalid_union_constructor },
+        .{ .body = "let f:()->U=U.range[0..]", .tag = .invalid_union_constructor },
+        .{ .body = "let f:()->U=U.range[..]", .tag = .invalid_union_constructor },
+        .{ .body = "let f:()->U=.range[..=3]", .tag = .invalid_union_constructor },
+        .{ .body = "let f:()->U=.range[0..=]", .tag = .invalid_union_constructor },
+        .{ .body = "let f:()->U=.range[..]", .tag = .invalid_union_constructor },
+        .{ .body = "let f:()->U=U.number[0..2]", .tag = .expression_type_mismatch },
+        .{ .body = "let f:()->U=.number[0..=2]", .tag = .expression_type_mismatch },
+        .{ .body = "let f:()->U=.range[-1..2]", .tag = .expression_type_mismatch },
+        .{ .body = "let f:()->U=.range[true..false]", .tag = .operator_not_supported },
+        .{ .body = "let f:()->U={let xs=[0,1,2]\n.range[xs[0..2]]}", .tag = .string_slice_requires_string },
+    }) |case| {
+        const source = try std.mem.concat(std.testing.allocator, u8, &.{ prefix, case.body });
+        defer std.testing.allocator.free(source);
+        try testNestedUnionRejected(source, case.tag);
+    }
+}
+
+test "value payloads reject exact mismatches printing references and escaping captures under OOM" {
+    for ([_]struct { source: []const u8, tag: Module.Diagnostic.Tag }{
+        .{ .source = "let U=union{f:(int)->int,}\nlet bad:(f:(uint)->uint)->U=.f[f]", .tag = .expression_type_mismatch },
+        .{ .source = "let U=union{r:@TypeOf(0..1),}\nlet bad:()->U=.r[{@as(int,0)..@as(int,1)}]", .tag = .expression_type_mismatch },
+        .{ .source = "let U=union{f:()->int,}\nlet bad:(u:U)=@println(u)", .tag = .unsupported_body_expression },
+        .{ .source = "let U=union{r:@TypeOf(0..1),}\nlet bad:(u:U)=@println(u)", .tag = .unsupported_body_expression },
+        .{ .source = "let U=union{f:(int)->int,}\nlet bad:(f:(int)->int)->U={let r=&f\n.f[r]}", .tag = .unsupported_borrow },
+        .{ .source = "let U=union{r:@TypeOf(0..1),}\nlet bad:()->U={let range=0..1\n.r[&range]}", .tag = .unsupported_borrow },
+        .{ .source = "let U=union{f:()->int,}\nlet bad:(n:int)->U={let r=&n\n.f[()->int {r.*}]}", .tag = .unsupported_borrow },
+    }) |case| try testNestedUnionRejected(case.source, case.tag);
+}
+
+test "value payloads enclosing stringify hooks opt out of structural printing under OOM" {
+    try testUnionArrayPayloadsOom(
+        \\let U=union{f:()->int,r:@TypeOf(0..1),
+        \\@[stringify]
+        \\let toString:(self:@This())->string="opaque"
+        \\}
+        \\let main:()={@println(U.f[()->int {1}],U.r[0..=2])}
+    );
+}
+
 test "nested unions contextual constructors and enum payloads under OOM" {
     try testUnionArrayPayloadsOom(
         \\let O:(T:type)->type=union{some:T,none,}
@@ -751,9 +861,10 @@ test "nested unions reject capture mutation and inner unknown tags under OOM" {
     , .unknown_field);
 }
 
-test "nested unions keep direct functions ranges references and struct union fields unsupported under OOM" {
-    try testNestedUnionRejected("let U=union{value:()->int,}", .unsupported_type);
-    try testNestedUnionRejected("let U=union{value:@TypeOf(0..1),}", .unsupported_type);
+test "nested unions keep invalid signatures references and struct fields unsupported under OOM" {
+    try testNestedUnionRejected("let U=union{value:(void)->int,}", .invalid_parameter_type);
+    try testNestedUnionRejected("let S=struct{value:()->int,}", .unsupported_type);
+    try testNestedUnionRejected("let S=struct{value:@TypeOf(0..1),}", .unsupported_type);
     try testNestedUnionRejected("let U=union{value:&int,}", .unsupported_type);
     try testNestedUnionRejected("let U=union{value:int,}\nlet S=struct{value:U,}", .unsupported_type);
 }
@@ -1023,9 +1134,9 @@ test "generic unions and propagation diagnose exact types unsupported forms and 
         .{ .source = "let Bad:(T:type)->type=union{ok:T,\nlet m=1\n}", .tag = .unsupported_generic_method },
         .{ .source = "let Bad:(T:type)->type=union{ok:T,ok:T,}", .tag = .duplicate_field },
         .{ .source = "let Bad:(T:type)->type=union{ok:T=1,}", .tag = .unsupported_union_default },
-        .{ .source = "let A=G((int)->int,string)", .tag = .unsupported_type },
-        .{ .source = "let A=G(@TypeOf(0..1),string)", .tag = .unsupported_type },
-        .{ .source = "let f:()={let x={let bad:G((int)->int,string)=R.ok[1]\nbad}\n}", .tag = .unsupported_type },
+        .{ .source = "let A=G((void)->int,string)", .tag = .invalid_parameter_type },
+        .{ .source = "let A=G(&int,string)", .tag = .unsupported_type },
+        .{ .source = "let f:()={let x={let bad:G((int)->int,string)=R.ok[1]\nbad}\n}", .tag = .expression_type_mismatch },
         .{ .source = "let U=union{ok:int,err:bool,}\nlet f:(u:U)->R=.ok[u.!]", .tag = .propagation_error_mismatch },
         .{ .source = "let int:(T:type)->type=union{ok:T,}", .tag = .unsupported_shadowing },
     }) |case| {
@@ -1054,17 +1165,17 @@ test "unsupported union declarations and rejected matches roll back under OOM" {
         .{ .source = "let U=union{}", .tag = .empty_union },
         .{ .source = "let U=union{ok:int=0,}", .tag = .unsupported_union_default },
         .{ .source = "let U=union{ok:int,ok:string,}", .tag = .duplicate_field },
-        .{ .source = "let U=union{ok:(int)->int,}", .tag = .unsupported_type },
+        .{ .source = "let U=union{ok:(void)->int,}", .tag = .invalid_parameter_type },
         .{ .source = "let R=struct{n:[][]U,}\nlet U=union{ok:R,}", .tag = .record_layout_cycle },
         .{ .source = "let R=struct{n:U,}\nlet U=union{ok:R,}", .tag = .unsupported_type },
         .{ .source = "let R=struct{n:R,}\nlet U=union{ok:R,}", .tag = .record_layout_cycle },
 
-        .{ .source = "let U=union{ok:@TypeOf(0..1),}", .tag = .unsupported_type },
-        .{ .source = "let G:(T:type)->type=union{ok:T,}\nlet U=G(()->int)", .tag = .unsupported_type },
+        .{ .source = "let U=union{ok:&int,}", .tag = .unsupported_type },
+        .{ .source = "let G:(T:type)->type=union{ok:T,}\nlet U=G(&int)", .tag = .unsupported_type },
         .{ .source = "let A=struct{n:int,}\nlet B=struct{n:int,}\nlet U=union{ok:A,}\nlet f:()->U=.ok[B[.n=1]]", .tag = .expression_type_mismatch },
         .{ .source = "let A=struct{n:int,}\nlet B=struct{n:int,}\nlet G:(T:type,E:type)->type=union{ok:T,err:E,}\nlet f:(r:G(int,A))->G(bool,B)=.ok[r.! == 0]", .tag = .propagation_error_mismatch },
         .{ .source = "let U=union{ok:U,}", .tag = .record_layout_cycle },
-        .{ .source = "let U=union{ok:()->int,}", .tag = .unsupported_type },
+        .{ .source = "let U=union{ok:U,none,}", .tag = .record_layout_cycle },
         .{ .source = "let U=union{ok:int,\nlet constant:int=1\n}", .tag = .unsupported_declaration },
 
         .{ .source = "let U=union{ok:int,\n@[stringify]\nlet toString:(u:U)->bool=true\n}\nlet f:()=@println(U.ok[1])", .tag = .invalid_to_string },

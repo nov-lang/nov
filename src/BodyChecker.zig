@@ -361,6 +361,14 @@ pub fn unionOperand(module: *Module, node: Ast.Node.Index) Error!?Ast.Node.Index
     const ast = &module.source.ast;
     const data = ast.nodes.items(.data)[node];
     if (ast.nodes.items(.tag)[node] == .array_access) return data.rhs;
+    if (ast.nodes.items(.tag)[node] == .slice) {
+        // Brackets parse ranges as slices even when the base is a variant.
+        // Reuse the range expression, but never admit open range payloads.
+        const range = ast.nodes.items(.data)[data.rhs];
+        if (range.lhs != 0 and range.rhs != 0) return data.rhs;
+        try module.diagnostics.append(module.allocator, .{ .tag = .invalid_union_constructor, .span = module.tokenSpan(ast.nodes.items(.main_token)[node]) });
+        return null;
+    }
     const fields = ast.fullStructInit(node).?.fields;
     if (fields.len == 0) return 0;
     if (fields.len == 1 and ast.nodes.items(.data)[fields[0]].rhs == 0 and ast.tokens.items(.tag)[ast.lastToken(fields[0]) + 1] != .comma) return fields[0];
@@ -2572,7 +2580,7 @@ const Context = struct {
         const index = self.fieldIndex(ty, name) orelse return self.fail(.unknown_field, base, null);
         const payload_ty = self.ir.getType(ty).?.record.fields[index].ty;
         const payload = (try unionOperand(self.module, node)) orelse return null;
-        const enum_payload = ast.nodes.items(.tag)[node] != .array_access and payload != 0;
+        const enum_payload = ast.nodes.items(.tag)[node] == .container_decl_arg and payload != 0;
         const unit = self.ir.getType(payload_ty).? == .void;
         if ((payload == 0) != unit) return self.fail(.invalid_union_constructor, node, null);
         if (enum_payload) {
@@ -2757,7 +2765,12 @@ const Context = struct {
                 .float => .{ .ty = try defaultFloatType(self.ir) },
                 else => null,
             } else null,
-            .string_literal, .slice => .{ .ty = try self.ir.internType(.string) },
+            .string_literal => .{ .ty = try self.ir.internType(.string) },
+            .slice => blk: {
+                if (try self.qualifiedUnion(data.lhs)) |ty| break :blk .{ .ty = ty };
+                if (ast.nodes.items(.tag)[data.lhs] == .enum_literal) break :blk null;
+                break :blk .{ .ty = try self.ir.internType(.string) };
+            },
             .char_literal => .{ .ty = try self.ir.internType(.rune) },
             .array_init, .array_init_comma, .array_init_two, .array_init_two_comma => try self.probeArray(node, depth),
             .array_access => blk: {
@@ -4282,7 +4295,7 @@ const Context = struct {
         const ast_early = &self.module.source.ast;
         const tag_early = ast_early.nodes.items(.tag)[node];
         const base_early = ast_early.nodes.items(.data)[node].lhs;
-        if ((tag_early == .array_access or tag_early == .container_decl_arg) and
+        if ((tag_early == .array_access or tag_early == .slice or tag_early == .container_decl_arg) and
             (ast_early.nodes.items(.tag)[base_early] == .enum_literal or try self.qualifiedUnion(base_early) != null))
             return self.unionInit(node, expected, depth);
         // Explicit record constructors already carry their type. Resolve it once,
@@ -7216,6 +7229,58 @@ test "string scalar indexing has exact rune inference through contexts construct
         }
     }
     try std.testing.expect(indexed >= 15);
+}
+
+fn testInlineRangeEvaluation(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "inline-range-evaluation.nov",
+        \\let U=union{range:@TypeOf(0..1),}
+        \\let bound:(n:uint)->uint=n
+        \\let main:()={let u=U.range[bound(0)..=bound(3)]
+        \\let s="abc"[0..2]
+        \\}
+    );
+    defer module.deinit();
+    if (module.source.ast.errors.len != 0) std.debug.print("inline range parse: {any}\n", .{module.source.ast.errors});
+    try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
+    var sema = try Lowering.lower(&module);
+    defer sema.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+    var calls: usize = 0;
+    var ranges: usize = 0;
+    var unions: usize = 0;
+    var slices: usize = 0;
+    for (sema.ir.functions.items) |function| {
+        const instructions = function.body.?.instructions;
+        for (instructions, 0..) |instruction, i| switch (instruction.op) {
+            .call => calls += 1,
+            .range_init => |range| {
+                ranges += 1;
+                try std.testing.expect(range.inclusive);
+                try std.testing.expect(@backingInt(range.start) < @backingInt(range.end));
+                try std.testing.expect(@backingInt(range.end) < i);
+                try std.testing.expect(instructions[@backingInt(range.start)].op == .call);
+                try std.testing.expect(instructions[@backingInt(range.end)].op == .call);
+            },
+            .union_init => |init| {
+                unions += 1;
+                try std.testing.expect(@backingInt(init.payload.?) < i);
+                try std.testing.expect(instructions[@backingInt(init.payload.?)].op == .range_init);
+            },
+            .string_slice => slices += 1,
+            else => {},
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 2), calls);
+    try std.testing.expectEqual(@as(usize, 1), ranges);
+    try std.testing.expectEqual(@as(usize, 1), unions);
+    try std.testing.expectEqual(@as(usize, 1), slices);
+}
+
+test "inline range payloads evaluate bounds once in order before construction under OOM" {
+    try testInlineRangeEvaluation(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testInlineRangeEvaluation, .{});
 }
 
 test "string slicing semantic types inference and rejection" {

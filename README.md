@@ -1262,7 +1262,8 @@ let z = [ 10, 20, 30 ]
 Ordinary module declarations such as `let Value = union { number: int, text: string, empty, }`
 introduce nominal tagged value types. Separate declarations remain distinct; aliases
 preserve identity. The current executable subset supports bool, integer, float, rune, string,
-void, enum, array, nested union, and existing acyclic nominal struct payloads, with no payload defaults. As with structs, integer fields are
+void, enum, array, nested union, function/closure, range, and existing acyclic nominal
+struct payloads, with no payload defaults. As with structs, integer fields are
 checked semantically through 128 bits, while reachable C layouts require
 8/16/32/64-bit widths.
 
@@ -1308,7 +1309,24 @@ checked semantically through 128 bits, while reachable C layouts require
   honoring nested `@[stringify]` hooks. Direct unions in struct fields and recursive
   layouts are still unsupported. See
   [`examples/nested-unions.nov`](examples/nested-unions.nov).
-- Explicit tag enums, direct function/range/reference payloads, variant-pattern
+- Function and closure payloads retain their exact signatures, including
+  `Option((int) -> int)`. Extract with a match or `.!`, then call the resulting
+  function. Copies share the closure's environment and mutable cells rather than
+  recreating captures; inactive environment slots remain zero. Reference capture
+  and escape restrictions are unchanged.
+- Range payloads copy start/end/inclusivity by value without allocation. An existing
+  type query can name their exact endpoint type: `let Interval = @TypeOf(0..1)`
+  followed by `Option(Interval)` or `union { interval: Interval, none, }`.
+  Inline constructors such as `.interval[0..=3]` are distinguished from string
+  slices by the union-variant base; both range endpoints are required.
+  Extracted ranges are reusable loop sources under the existing range rules.
+- Functions and ranges have no default printed representation. A union containing
+  them needs an enclosing valid `@[stringify]` hook, including when its active
+  variant is payloadless. Recursive type/signature graphs remain unsupported;
+  function-pointer edges do not count as inline storage depth. Direct function,
+  union and range fields in structs remain unsupported. See
+  [`examples/value-payloads.nov`](examples/value-payloads.nov).
+- Explicit tag enums, reference payloads, variant-pattern
   alternatives, nested destructuring, direct payload field access, union equality
   and union globals remain unsupported.
 
@@ -1654,9 +1672,8 @@ array.each([1, 2, 3], (x) { @println(x) })
 
 `find` requires an element type supported as an `Option` payload: bool, integers,
 floats, runes, strings, enums and supported acyclic records (including array
-fields), arrays (including nested arrays), and unions. Direct function and range
-payloads remain unsupported; use `findIndex` for those element types. The other helpers accept all supported
-array element types. `find` returns a value, not a reference to source storage.
+fields), arrays (including nested arrays), unions, functions/closures and ranges.
+Thus `find` and the other helpers accept all supported array element types. `find` returns a value, not a reference to source storage.
 See [`examples/array-search.nov`](examples/array-search.nov) for a runnable example
 and seven tests.
 
@@ -1834,8 +1851,8 @@ let main: () -> void = {
   share backing. Function elements copy their function value and share the existing
   closure environment/captured cells, not a deep-cloned closure; immutable capture
   snapshots and mutable shared-cell capture rules are unchanged. Range elements
-  copy bounds and inclusivity by value. Union payloads may be arrays, but direct
-  function/range/reference payloads remain unsupported; nested union payloads work.
+  copy bounds and inclusivity by value. Union payloads may be arrays, nested
+  unions, functions/closures and ranges; reference payloads remain unsupported.
   Immutable arrays
   cannot have their elements changed. Parameters are immutable; copy into a
   mutable local to edit them.
@@ -2243,8 +2260,10 @@ let main: () = {
 - Range type identity depends on the exact integer endpoint type; inclusivity is
   part of the value. Inferred locals, assignment/copies, and branch/block/loop
   results can carry ranges, including mixed inclusive/exclusive branches. No new
-  source-level range annotation syntax is provided yet, so range parameters/return
-  signatures, fields, union payloads and globals remain unsupported. Arrays can
+  dedicated range type syntax is provided; use a type query such as
+  `let Interval = @TypeOf(0..1)` for exact range annotations in parameters, returns
+  and union payloads. Direct struct range fields and range globals remain
+  unsupported. Arrays can
   infer range elements, for example `[0..3, 1..=2]`; their bounds and inclusivity
   copy by value with exact endpoint typing and the bound inference rules below.
   Range field access, equality, membership and direct printing are not introduced.

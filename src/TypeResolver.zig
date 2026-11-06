@@ -644,7 +644,11 @@ pub fn instantiateArguments(module: *Module, ir: *Ir, id: Module.DeclId, args: [
 /// bodies. Nested nominal identities remain lazy, avoiding recursive layout walks.
 pub fn completeRecordReadOnly(module: *Module, ir: *Ir, ty: Ir.TypeId) Error!bool {
     const record = ir.getType(ty).?.record;
-    if (record.type_args.len != 0 or record.fields.len != 0) return true;
+    if (record.type_args.len != 0 or record.fields.len != 0 or record.instance_state == .building) return true;
+    // A field's type query carries @This in its bindings. Converting that
+    // binding must not re-enter completion of the layout being queried.
+    ir.types.items[@backingInt(ty)].record.instance_state = .building;
+    defer ir.types.items[@backingInt(ty)].record.instance_state = record.instance_state;
     const owner = if (module.compilation) |comp| comp.getModule(record.source).? else module;
     const id: Module.DeclId = @fromBackingInt(record.identity);
     const declaration = owner.getDeclaration(id).?;
@@ -1124,6 +1128,114 @@ fn testTypeOfExpressions(allocator: std.mem.Allocator) !void {
     try std.testing.expectEqual(@as(usize, 0), ir.functions.items.len);
     try std.testing.expectEqual(@as(usize, 0), module.expression_query_depth);
     try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+}
+
+fn testValuePayloadQueries(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "value-payload-queries.nov",
+        \\let O:(T:type)->type=union{some:T,none,
+        \\let unused:()->Missing=missing
+        \\}
+        \\let F=(int)->int
+        \\let Range=@TypeOf(0..1)
+        \\let id:(x:`T)->`T=x
+        \\let wrap:(x:`T)->O(`T)=missing
+        \\let callback:()->F=missing
+        \\let a:@TypeOf(O(F).some[id])
+        \\let b:@TypeOf(wrap(callback()))
+        \\let c:@TypeOf(O(Range).some[0..=2])
+        \\let d:@TypeOf(wrap(0..1))
+    );
+    defer module.deinit();
+    try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
+    try module.classifyAliases();
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    ir.source_len = @intCast(module.source.ast.source.len);
+    const count = module.declarations.items.len;
+    var function_option: ?Ir.TypeId = null;
+    var range_option: ?Ir.TypeId = null;
+    for ([_][]const u8{ "a", "b", "c", "d" }, 0..) |name, i| {
+        const ty = (try resolveInScopeReadOnly(&module, &ir, testTypeNode(&module, name), null, null, &.{})) orelse {
+            std.debug.print("value payload query {s}: {any}\n", .{ name, module.diagnostics.items });
+            return error.TestUnexpectedResult;
+        };
+        const record = ir.getType(ty).?.record;
+        try std.testing.expect(record.tagged and !record.methods_published);
+        try std.testing.expect(record.instance_state == .complete);
+        if (i < 2) {
+            try std.testing.expect(ir.getType(record.fields[0].ty).? == .function);
+            if (function_option) |expected| try std.testing.expectEqual(expected, ty);
+            function_option = ty;
+        } else {
+            try std.testing.expect(ir.getType(record.fields[0].ty).? == .range);
+            if (range_option) |expected| try std.testing.expectEqual(expected, ty);
+            range_option = ty;
+        }
+    }
+    try std.testing.expectEqual(count, module.declarations.items.len);
+    for (module.declarations.items) |decl| try std.testing.expect(decl.function_template == null and decl.concrete_type == null);
+    try std.testing.expectEqual(@as(usize, 0), ir.functions.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ir.constants.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ir.local_generic_instances.items.len);
+    try std.testing.expectEqual(@as(usize, 0), module.expression_query_depth);
+    try std.testing.expect(!module.hasErrors());
+}
+
+fn testInlineRangeQuery(allocator: std.mem.Allocator, expression: []const u8, expected: ?Module.Diagnostic.Tag) !void {
+    const source = try std.fmt.allocPrint(allocator, "let U=union{{range:@TypeOf(0..1),number:int,}}\nlet Alias=U\n" ++
+        "let O:(T:type)->type=union{{some:T,none,}}\n" ++
+        "let take:(u:U)->U=missing\nlet id:(x:`T)->`T=missing\nlet query:@TypeOf({s})", .{expression});
+    defer allocator.free(source);
+    var module = try Module.init(allocator, "inline-range-query.nov", source);
+    defer module.deinit();
+    try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
+    try module.classifyAliases();
+    const count = module.declarations.items.len;
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    ir.source_len = @intCast(source.len);
+    const result = try resolveInScopeReadOnly(&module, &ir, testTypeNode(&module, "query"), null, null, &.{});
+    errdefer std.debug.print("inline range query {s}: {any}\n", .{ expression, module.diagnostics.items });
+    if (expected) |tag| {
+        try std.testing.expect(result == null);
+        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+        try std.testing.expectEqual(tag, module.diagnostics.items[0].tag);
+    } else {
+        try std.testing.expect(result != null);
+        try std.testing.expect(!module.hasErrors());
+    }
+    try std.testing.expectEqual(count, module.declarations.items.len);
+    for (module.declarations.items) |decl| try std.testing.expect(decl.function_template == null and decl.concrete_type == null);
+    for (ir.types.items) |ty| if (ty == .record) try std.testing.expect(!ty.record.methods_published);
+    try std.testing.expectEqual(@as(usize, 0), ir.functions.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ir.constants.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ir.local_generic_instances.items.len);
+    try std.testing.expectEqual(@as(usize, 0), module.expression_query_depth);
+}
+
+test "inline range payloads TypeOf validates constructors without publication under OOM" {
+    for ([_]struct { expression: []const u8, tag: ?Module.Diagnostic.Tag = null }{
+        .{ .expression = "Alias.range[0..=3]" },
+        .{ .expression = "take(.range[0..3])" },
+        .{ .expression = "id(O(@TypeOf(0..1)).some[0..=3])" },
+        .{ .expression = "\"abc\"[0..2]" },
+        .{ .expression = "U.range[..3]", .tag = .invalid_union_constructor },
+        .{ .expression = "U.range[0..]", .tag = .invalid_union_constructor },
+        .{ .expression = "take(.range[..])", .tag = .invalid_union_constructor },
+        .{ .expression = "id(O(@TypeOf(0..1)).some[..=3])", .tag = .invalid_union_constructor },
+        .{ .expression = "U.number[0..2]", .tag = .generic_function_conflict },
+        .{ .expression = "U.range[-1..2]", .tag = .literal_out_of_range },
+        .{ .expression = "U.range[0..missing]", .tag = .unknown_name },
+        .{ .expression = "U.range[0..true]", .tag = .generic_function_conflict },
+    }) |case| {
+        try testInlineRangeQuery(std.testing.allocator, case.expression, case.tag);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testInlineRangeQuery, .{ case.expression, case.tag });
+    }
+}
+
+test "value payloads TypeOf inference is strictly readonly under OOM" {
+    try testValuePayloadQueries(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testValuePayloadQueries, .{});
 }
 
 test "TypeOf expressions check constraints without evaluation or method publication under OOM" {

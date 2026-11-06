@@ -2051,7 +2051,7 @@ const Solver = struct {
                 self.failed = true;
                 return ty;
             };
-            const enum_payload = ast.nodes.items(.tag)[node] != .array_access and payload != 0;
+            const enum_payload = ast.nodes.items(.tag)[node] == .container_decl_arg and payload != 0;
             try self.query_unions.append(self.allocator, .{ .payload_type = payload_type, .module = module, .node = node, .payload = payload, .enum_payload = enum_payload });
             if (payload != 0 and !enum_payload) {
                 const value = try self.expressionExpected(frame, payload, payload_type, depth + 1);
@@ -2059,8 +2059,12 @@ const Solver = struct {
             }
             return ty;
         }
-        if (ast.nodes.items(.tag)[node] == .array_access) {
-            const payload = try self.expressionExpected(frame, data.rhs, payload_type, depth + 1);
+        if (ast.nodes.items(.tag)[node] == .array_access or ast.nodes.items(.tag)[node] == .slice) {
+            const operand = (try BodyChecker.unionOperand(module, node)) orelse {
+                self.failed = true;
+                return ty;
+            };
+            const payload = try self.expressionExpected(frame, operand, payload_type, depth + 1);
             if (root(payload).value == .never) return payload;
             try self.unify(payload_type, payload, span, 0);
         }
@@ -2370,6 +2374,8 @@ const Solver = struct {
                 return element;
             },
             .slice => {
+                if (try self.constructorType(frame, data.lhs, expected, depth + 1)) |ty|
+                    return self.unionConstructor(frame, node, ty, depth + 1);
                 const slice = ast.slice(node).ast;
                 const string = try self.fromType(try self.ir.internType(.string), span, 0);
                 try self.unify(string, try self.expression(frame, slice.sliced, depth + 1), span, 0);
@@ -3000,6 +3006,51 @@ test "union array payloads real std map andThen find and readonly calls under OO
     defer allocator.free(lib);
     try testNonStorableImport(allocator, path, lib, null);
     try TestAllocations.checkAllAllocationFailures(allocator, testNonStorableImport, .{ path, lib, @as(?Module.Diagnostic.Tag, null) });
+}
+
+test "value payloads std map andThen find function elements and readonly under OOM" {
+    try testNestedUnionImport(
+        \\let std=@import("std")
+        \\let O=std.Option
+        \\let F=(int)->int
+        \\let id:(x:`T)->`T=x
+        \\let make:(seed:int)->F=(n){seed+n}
+        \\let next:(seed:int)->O(F)=.some[make(seed)]
+        \\let original:()->O(int)=.some[1]
+        \\let quoted:(x:@TypeOf(original().map(make)))->O(F)=x
+        \\let use:(o:O(F))->O(int)={let f=o.!
+        \\.some[f(2)]}
+        \\let main:()={let a=original().map(make)
+        \\let b=original().andThen(next)
+        \\let fs:[]F=[id,make(3)]
+        \\let found=std.array.find(fs,(f:F)->bool{f(0)==3})
+        \\@println(use(quoted(a)),use(b),use(found))}
+    );
+}
+
+test "value payloads std range map andThen find and readonly under OOM" {
+    try testNestedUnionImport(
+        \\let std=@import("std")
+        \\let O=std.Option
+        \\let Range=@TypeOf(0..1)
+        \\let make:(n:uint)->Range=0..=n
+        \\let next:(n:uint)->O(Range)=.some[0..=n]
+        \\let inferred:(n:`T)->O(@TypeOf(0..1))=.some[0..=n]
+        \\let original:()->O(uint)=.some[3]
+        \\let quoted:(x:@TypeOf(original().andThen(next)))->O(Range)=x
+        \\let use:(o:O(Range))->O(uint)={let r=o.!
+        \\let mut n:uint=0
+        \\loop v in r {n+=v}
+        \\.some[n]}
+        \\let main:()={let a=original().map(make)
+        \\let b=original().andThen(next)
+        \\let c=original().andThen(inferred)
+        \\let mapped=original().map((n){O(Range).some[0..=n]})
+        \\let rs:[]Range=[0..1,0..=2]
+        \\let found=std.array.find(rs,(r:Range)->bool{loop _ in r {return true}
+        \\false})
+        \\@println(use(a),use(quoted(b)),use(c),use(found))}
+    );
 }
 
 test "nested unions std Option map union outputs and readonly under OOM" {

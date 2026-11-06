@@ -160,6 +160,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const nested_union_tests = b.step("test-cli-nested-unions", "Run finite acyclic nested union CLI tests");
     addNestedUnionCliTests(b, exe, nested_union_tests);
     test_step.dependOn(nested_union_tests);
+    const value_payload_tests = b.step("test-cli-value-payloads", "Run function and range union payload CLI tests");
+    addValuePayloadCliTests(b, exe, value_payload_tests);
+    test_step.dependOn(value_payload_tests);
     const printing_tests = b.step("test-cli-printing", "Run type and aggregate printing CLI tests");
     addPrintingCliTests(b, exe, printing_tests);
     test_step.dependOn(printing_tests);
@@ -2724,9 +2727,9 @@ fn addUnionArrayCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step:
         .{ .name = "mutually-recursive", .source = "let U=union{items:[]R,none,}\nlet R=struct{values:[]U,}\nlet main:()={}", .diagnostic = "cyclic" },
         .{ .name = "recursive-nested-array", .source = "let U=union{items:[][]U,none,}\nlet main:()={}", .diagnostic = "cyclic" },
         .{ .name = "recursive-generic", .source = "let G:(T:type)->type=union{items:[]G(T),none,}\nlet f:(x:G(int))={}", .diagnostic = "cyclic" },
-        .{ .name = "nested-function", .source = "let Inner=union{value:()->int,none,}\nlet U=union{value:Inner,}\nlet f:(x:U)={}", .diagnostic = "not supported" },
-        .{ .name = "direct-function", .source = "let U=union{value:()->int,}\nlet f:(x:U)={}", .diagnostic = "not supported" },
-        .{ .name = "direct-range", .source = "let U=union{value:@TypeOf(1..3),}\nlet f:(x:U)={}", .diagnostic = "not supported" },
+        .{ .name = "nested-function-reference", .source = "let Inner=union{value:&()->int,none,}\nlet U=union{value:Inner,}\nlet f:(x:U)={}", .diagnostic = "not supported" },
+        .{ .name = "direct-function-reference", .source = "let U=union{value:&()->int,}\nlet f:(x:U)={}", .diagnostic = "not supported" },
+        .{ .name = "direct-range-reference", .source = "let U=union{value:&@TypeOf(1..3),}\nlet f:(x:U)={}", .diagnostic = "not supported" },
         .{ .name = "array-void", .source = "let U=union{items:[]void,}\nlet f:(x:U)={}", .diagnostic = "not supported" },
         .{ .name = "array-type", .source = "let U=union{items:[]type,}\nlet f:(x:U)={}", .diagnostic = "not supported" },
         .{ .name = "array-reference", .source = "let U=union{items:[]&int,}\nlet f:(x:U)={}", .diagnostic = "references cannot escape" },
@@ -2839,8 +2842,8 @@ fn addNestedUnionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step
         .{ .name = "option-to-result", .source = "let f:(x:std.Option(std.Result(int,string)))->std.Result(int,string)=x.!", .diagnostic = "error:" },
         .{ .name = "result-to-option", .source = "let f:(x:std.Result(std.Option(int),string))->std.Option(int)=x.!", .diagnostic = "error:" },
         .{ .name = "struct-union-field", .source = "let Inner=union{some:int,none,}\nlet S=struct{inner:Inner,}\nlet U=union{record:S,none,}\nlet f:(x:U)={}", .diagnostic = "not supported" },
-        .{ .name = "nested-function", .source = "let Inner=union{value:()->int,none,}\nlet U=union{inner:Inner,none,}\nlet f:(x:U)={}", .diagnostic = "not supported" },
-        .{ .name = "nested-range", .source = "let Inner=union{value:@TypeOf(1..3),none,}\nlet U=union{inner:Inner,none,}\nlet f:(x:U)={}", .diagnostic = "not supported" },
+        .{ .name = "nested-function-reference", .source = "let Inner=union{value:&()->int,none,}\nlet U=union{inner:Inner,none,}\nlet f:(x:U)={}", .diagnostic = "not supported" },
+        .{ .name = "nested-range-reference", .source = "let Inner=union{value:&@TypeOf(1..3),none,}\nlet U=union{inner:Inner,none,}\nlet f:(x:U)={}", .diagnostic = "not supported" },
         .{ .name = "nested-reference", .source = "let Inner=union{value:&int,none,}\nlet U=union{inner:Inner,none,}\nlet f:(x:U)={}", .diagnostic = "not supported" },
         .{ .name = "nested-reference-array", .source = "let Inner=union{items:[]&int,none,}\nlet U=union{inner:Inner,none,}\nlet f:(x:U)={}", .diagnostic = "references cannot escape" },
         .{ .name = "reference-escape", .source = "let bad:()->&int={let mut value=1\n&value}\nlet main:()={}", .diagnostic = "reference" },
@@ -3348,9 +3351,9 @@ fn addArraySearchCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step
         .{ .name = "index-result", .expression = "std.array.findIndex(@as([]int,[1]),(x:int)->int{x})", .diagnostic = "constraints require exactly identical types" },
         .{ .name = "each-nonvoid", .expression = "std.array.each(@as([]int,[1]),(x:int)->int{x})", .diagnostic = "constraints require exactly identical types" },
         .{ .name = "find-array-parameter", .expression = "std.array.find(@as([][]int,[[1]]),(x:int)->bool{true})", .diagnostic = "constraints require exactly identical types" },
-        .{ .name = "find-union-function-payload", .expression = "std.array.find(@as([]Payload,[.none[]]),yes)", .diagnostic = "not supported" },
-        .{ .name = "find-function", .expression = "std.array.find([()->int{1}],yes)", .diagnostic = "not supported" },
-        .{ .name = "find-range", .expression = "std.array.find([1..3],yes)", .diagnostic = "not supported" },
+        .{ .name = "find-union-reference-payload", .expression = "std.array.find(@as([]Payload,[.none[]]),yes)", .diagnostic = "not supported" },
+        .{ .name = "find-function-parameter", .expression = "std.array.find([()->int{1}],(x:int)->bool{true})", .diagnostic = "constraints require exactly identical types" },
+        .{ .name = "find-range-parameter", .expression = "std.array.find([1..3],(x:int)->bool{true})", .diagnostic = "constraints require exactly identical types" },
         .{ .name = "any-empty", .expression = "std.array.any([],yes)", .diagnostic = "provide typed runtime arguments" },
         .{ .name = "all-empty", .expression = "std.array.all([],yes)", .diagnostic = "provide typed runtime arguments" },
         .{ .name = "find-empty", .expression = "std.array.find([],yes)", .diagnostic = "provide typed runtime arguments" },
@@ -3358,7 +3361,7 @@ fn addArraySearchCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step
         .{ .name = "each-empty", .expression = "std.array.each([],(x:`T)->void{})", .diagnostic = "provide typed runtime arguments" },
     }) |case| {
         const source = b.fmt("invalid-array-search-{s}.nov", .{case.name});
-        _ = fixtures.add(source, b.fmt("let std=@import(\"std\")\nlet Payload=union{{{s}none,}}\nlet yes:(x:`T)->bool=true\nlet main:()={{let result={s}\n}}\n", .{ if (std.mem.eql(u8, case.name, "find-union-function-payload")) "callback:()->int," else "", case.expression }));
+        _ = fixtures.add(source, b.fmt("let std=@import(\"std\")\nlet Payload=union{{{s}none,}}\nlet yes:(x:`T)->bool=true\nlet main:()={{let result={s}\n}}\n", .{ if (std.mem.eql(u8, case.name, "find-union-reference-payload")) "callback:&()->int," else "", case.expression }));
         const check = b.addRunArtifact(exe);
         check.step.name = b.fmt("CLI array search: reject {s}", .{case.name});
         check.setCwd(fixtures.getDirectory());
@@ -3517,8 +3520,8 @@ fn addContainerMapCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_ste
         .{ .name = "result-void-output", .source = "let x:std.Result(int,string)=.ok[1]\nlet y=x.map((v)->void{})", .diagnostic = "[] for void" },
         .{ .name = "error-void-output", .source = "let x:std.Result(int,string)=.err[\"bad\"]\nlet y=x.mapErr((v)->void{})", .diagnostic = "[] for void" },
         .{ .name = "option-array-output-conflict", .source = "let x:std.Option(int)=.some[1]\nlet y:std.Option([]bool)=x.map((v){[v]})", .diagnostic = "error:" },
-        .{ .name = "result-function-output", .source = "let x:std.Result(int,string)=.ok[1]\nlet y=x.map((v){()->int{v}})", .diagnostic = "not supported" },
-        .{ .name = "error-function-output", .source = "let x:std.Result(int,string)=.err[\"bad\"]\nlet y=x.mapErr((v){()->string{v}})", .diagnostic = "not supported" },
+        .{ .name = "result-reference-output", .source = "let x:std.Result(int,string)=.ok[1]\nlet y=x.map((v)->&int{&v})", .diagnostic = "reference" },
+        .{ .name = "error-reference-output", .source = "let x:std.Result(int,string)=.err[\"bad\"]\nlet y=x.mapErr((v)->&string{&v})", .diagnostic = "reference" },
     }) |case| {
         const source = b.fmt("invalid-container-map-{s}.nov", .{case.name});
         _ = fixtures.add(source, b.fmt("let std=@import(\"std\")\nlet main:()={{\n{s}\n}}\n", .{case.source}));
@@ -5060,6 +5063,142 @@ fn addZipIterationCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_ste
         run.expectStdErrMatch(case.diagnostic);
         if (std.mem.eql(u8, case.diagnostic, conflict)) run.expectStdErrMatch("borrow originates here");
         test_step.dependOn(&run.step);
+    }
+}
+
+fn addValuePayloadCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    const fixtures = b.addWriteFiles();
+    const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
+    const aliases_source =
+        \\let standard = @import("std")
+        \\let option = @import("lib/./option.nov")
+        \\let result = @import("lib/result.nov")
+        \\let api = @import("api.nov")
+        \\let verify: () = {
+        \\    let callback: api.Callback = (n) {
+        \\        n + 1
+        \\    }
+        \\    let original: api.FunctionOption = .some[callback]
+        \\    let canonical: standard.Option((int) -> int) = original
+        \\    let direct: option.Option(api.Callback) = canonical
+        \\    let extracted = option.Option(api.Callback).unwrapOr(direct, callback)
+        \\    @assert(extracted(3) == 4)
+        \\    let good: api.FunctionResult = .ok[callback]
+        \\    let same: result.Result((int) -> int, string) = good
+        \\    let function = standard.Result(api.Callback, string).unwrapOr(same, callback)
+        \\    @assert(function(4) == 5)
+        \\    let bounds = 1..4
+        \\    let interval: api.RangeOption = .some[bounds]
+        \\    let rangeCanonical: standard.Option(@TypeOf(0..1)) = interval
+        \\    let range = rangeCanonical.unwrapOr(0..0)
+        \\    let mut count = 0
+        \\    loop n in range {
+        \\        count += 1
+        \\    }
+        \\    @assert(count == 3)
+        \\}
+        \\@[test]
+        \\let imported_value_aliases_are_canonical: () = verify()
+        \\let main: () = verify()
+        \\
+    ;
+    const api_source =
+        \\let standard = @import("std")
+        \\let option = @import("lib/option.nov")
+        \\let result = @import("lib/./result.nov")
+        \\@[public]
+        \\let Callback = (int) -> int
+        \\@[public]
+        \\let Range = @TypeOf(0..1)
+        \\@[public]
+        \\let FunctionOption = option.Option(Callback)
+        \\@[public]
+        \\let FunctionResult = result.Result(Callback, string)
+        \\@[public]
+        \\let RangeOption = standard.Option(Range)
+        \\
+    ;
+    _ = fixtures.add("value-payloads.nov", @embedFile("examples/value-payloads.nov"));
+    _ = fixtures.add("aliases.nov", aliases_source);
+    _ = fixtures.add("api.nov", api_source);
+    const package = b.addWriteFiles();
+    const installed_exe = package.addCopyFile(exe.getEmittedBin(), b.fmt("bin/{s}", .{exe.out_filename}));
+    _ = package.addCopyDirectory(b.path("lib"), "lib/nov", .{});
+    _ = package.add("value-payloads.nov", @embedFile("examples/value-payloads.nov"));
+    _ = package.add("aliases.nov", std.mem.replaceOwned(u8, b.allocator, aliases_source, "lib/", "lib/nov/") catch @panic("OOM"));
+    _ = package.add("api.nov", std.mem.replaceOwned(u8, b.allocator, api_source, "lib/", "lib/nov/") catch @panic("OOM"));
+    const expected_tests = "PASS callable_constructors_match_and_propagation\nPASS escaping_shared_cells_and_overwritten_owner\nPASS creation_snapshots_and_later_copies\nPASS range_copies_exact_bounds_and_inclusive_max\nPASS find_and_map_function_and_range_results\nPASS custom_hooks_nested_helpers_and_inactive_values\n6 passed; 0 failed; 6 total\n";
+    for ([_]bool{ false, true }) |installed| {
+        for ([_][]const u8{ "value-payloads.nov", "aliases.nov", "api.nov" }) |source| {
+            for ([_][]const u8{ "fmt", "semantic", "run", "test" }) |command| {
+                const execute = std.mem.eql(u8, command, "run") or std.mem.eql(u8, command, "test");
+                if (execute and std.mem.eql(u8, source, "api.nov")) continue;
+                const modes: []const []const u8 = if (execute) &.{ "", "--debug", "--release" } else &.{""};
+                for (modes) |mode| {
+                    const run = if (installed) std.Build.Step.Run.create(b, "CLI value payloads: relocated install") else b.addRunArtifact(exe);
+                    run.step.name = b.fmt("CLI value payloads: {s} {s} {s} (installed={})", .{ command, source, mode, installed });
+                    if (installed) run.addFileArg(installed_exe);
+                    run.setCwd(if (installed) package.getDirectory() else fixtures.getDirectory());
+                    run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+                    run.setEnvironmentVariable("NOV_CC", "");
+                    run.setEnvironmentVariable("CC", "");
+                    if (std.mem.eql(u8, command, "fmt")) {
+                        run.addArgs(&.{ "fmt", "--check", source });
+                    } else if (std.mem.eql(u8, command, "semantic")) {
+                        run.addArgs(&.{ "check", "--semantic", source });
+                    } else {
+                        run.addArgs(&.{ command, source });
+                        if (mode.len != 0) run.addArg(mode);
+                    }
+                    if (!installed and !std.mem.eql(u8, command, "fmt")) {
+                        run.addArg("--lib-dir");
+                        run.addDirectoryArg(library);
+                    }
+                    const example = std.mem.eql(u8, source, "value-payloads.nov");
+                    const is_test = std.mem.eql(u8, command, "test");
+                    run.expectExitCode(0);
+                    run.expectStdOutEqual(if (execute) (if (example) (if (is_test) expected_tests else "Custom: callback:5 range:3\nCalled: 4\nSum: 6\n") else if (is_test) "PASS imported_value_aliases_are_canonical\n1 passed; 0 failed; 1 total\n" else "") else "");
+                    run.expectStdErrEqual("");
+                    test_step.dependOn(&run.step);
+                }
+            }
+        }
+    }
+    for ([_]struct { name: []const u8, source: []const u8, diagnostic: []const u8, command: []const u8 = "check" }{
+        .{ .name = "reference", .source = "let U=union{value:&int,none,}\nlet f:(x:U)={}", .diagnostic = "not supported" },
+        .{ .name = "reference-array", .source = "let U=union{value:[]&int,none,}\nlet f:(x:U)={}", .diagnostic = "references cannot escape" },
+        .{ .name = "reference-capture", .source = "let main:()={let mut n=1\nlet view=&n\nlet f:std.Option(()->int)=.some[()->int{view.*}]\n}", .diagnostic = "local references require" },
+        .{ .name = "borrow-escape", .source = "let bad:()->std.Option(&int)={let mut n=1\n.some[&n]}", .diagnostic = "not supported" },
+        .{ .name = "print-function", .source = "let main:()={let x:std.Option(()->int)=.none[]\n@println(x)}", .diagnostic = "not implemented yet" },
+        .{ .name = "print-range", .source = "let main:()={let bounds=0..1\nlet x:std.Option(@TypeOf(0..1))=.some[bounds]\n@println(x)}", .diagnostic = "not implemented yet" },
+        .{ .name = "print-nested", .source = "let U=union{value:()->int,none,}\nlet main:()={let x:std.Option(U)=.some[.none[]]\n@println(x)}", .diagnostic = "not implemented yet" },
+        .{ .name = "function-reference-value", .source = "let U=union{f:(int)->int,}\nlet bad:(f:(int)->int)->U={let view=&f\n.f[view]}", .diagnostic = "local references require" },
+        .{ .name = "range-reference-value", .source = "let U=union{r:@TypeOf(0..1),}\nlet bad:()->U={let range=0..1\n.r[&range]}", .diagnostic = "local references require" },
+        .{ .name = "function-exact", .source = "let U=union{f:(int)->int,}\nlet bad:(f:(uint)->uint)->U=.f[f]", .diagnostic = "expected type" },
+        .{ .name = "function-equality", .source = "let f:(a:()->int)->bool=a==a", .diagnostic = "operator is not supported" },
+        .{ .name = "function-nominal", .source = "let A=union{f:()->int,}\nlet B=union{f:()->int,}\nlet f:(x:A)->B=x", .diagnostic = "expected type" },
+        .{ .name = "range-exact", .source = "let U=union{r:@TypeOf(0..1),}\nlet f:(n:int)->U={let bounds=n..n\n.r[bounds]}", .diagnostic = "expected type" },
+        .{ .name = "struct-function", .source = "let S=struct{f:()->int,}\nlet f:(x:S)={}", .diagnostic = "not supported" },
+        .{ .name = "struct-range", .source = "let S=struct{r:@TypeOf(0..1),}\nlet f:(x:S)={}", .diagnostic = "not supported" },
+        .{ .name = "recursive-array-union", .source = "let U=union{items:[][]U,function:()->int,none,}\nlet main:()={}", .diagnostic = "cyclic" },
+        .{ .name = "wide-function", .source = "let U=union{f:(i128)->i128,none,}\nlet f:(x:U)={}\nlet main:()={}", .diagnostic = "C backend only supports", .command = "emit-c" },
+        .{ .name = "wide-range", .source = "let U=union{r:@TypeOf(@as(i128,0)..@as(i128,1)),none,}\nlet f:(x:U)={}\nlet main:()={}", .diagnostic = "C backend only supports", .command = "emit-c" },
+    }) |case| {
+        const source = b.fmt("invalid-value-payload-{s}.nov", .{case.name});
+        _ = fixtures.add(source, b.fmt("let std=@import(\"std\")\n{s}\n", .{case.source}));
+        const check = b.addRunArtifact(exe);
+        check.step.name = b.fmt("CLI value payloads: reject {s}", .{case.name});
+        check.setCwd(fixtures.getDirectory());
+        check.addArg(case.command);
+        if (std.mem.eql(u8, case.command, "check")) check.addArg("--semantic");
+        check.addArgs(&.{ source, "--lib-dir" });
+        check.addDirectoryArg(library);
+        check.expectExitCode(1);
+        check.expectStdOutEqual("");
+        check.expectStdErrMatch(".nov:");
+        check.expectStdErrMatch("error:");
+        check.expectStdErrMatch(case.diagnostic);
+        test_step.dependOn(&check.step);
     }
 }
 

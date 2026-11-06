@@ -50,6 +50,19 @@ results. See `examples/array-fields.nov`.
 
 ## Current delivered status
 
+Function/closure and range union payloads are supported, completing ordinary
+storable value payload coverage. Callable copies share environments/captured cells;
+range copies carry typed bounds/inclusivity without allocation. Match/.! extract
+one layer before call/iteration. Existing @TypeOf can name a range type, and direct
+inline range constructors are disambiguated from slicing using the variant base;
+omitted endpoints remain invalid. Contextual generic function specialization,
+container maps/chains/find, exact types, active roots/zeroed inactive slots and
+copy behavior are covered. Functions/ranges remain unprintable unless an enclosing
+stringify hook stops recursion. Direct struct fields of function/union/range type,
+reference payloads/escape, recursive layouts and structural signature cycles remain
+unsupported. Function/reference edges do not consume inline-layout depth. See
+examples/value-payloads.nov (six tests).
+
 Direct nested union payloads are supported, including Option(Result(T,E)),
 Result(Option(T),E), plain nested tags and std.array.find on union elements.
 Existing exact nominal constructor/capture types and one-layer .! rules apply;
@@ -60,8 +73,8 @@ validation precedes allocating copies and formatting; detached array-element
 normalization preserves source backing. Static GC descriptors retain the existing
 zero-inactive-pointer-slot invariant in rooted backing (not arbitrary foreign
 poisoned GC pointers). Default printing retains nested tags and user hooks.
-Finite acyclic layout/depth rules remain; direct union struct fields, function/
-range/reference payloads and recursive layouts are unsupported. See
+Finite acyclic layout/depth rules remain; direct union struct fields, reference
+payloads and recursive structural type/layout graphs are unsupported. See
 examples/nested-unions.nov (six tests).
 
 Direct array union payloads are implemented, including Option([]T), Result([]T,E),
@@ -71,8 +84,8 @@ active-payload-only cloning, zeroed inactive fields, precise managed-owner roots
 matching, .!, type queries, captures and structural printing apply. Immutable
 strings share backing and closure elements share environments. No optimizer or
 alias changes were needed; one shared IR payload gate enables existing machinery.
-Nested union payloads now work. Direct function/range/reference payloads and
-recursive array-layout cycles remain unsupported. See examples/union-arrays.nov (six tests).
+Nested unions, functions/closures and ranges now work as payloads. Reference
+payloads and recursive array-layout cycles remain unsupported. See examples/union-arrays.nov (six tests).
 
 Expression-based @TypeOf queries are unevaluated and typechecked using frozen
 lexical metadata. Normal numeric defaults and generic constraints apply without
@@ -148,9 +161,8 @@ and `std.Option(uint)` respectively, with a zero-based pointer-sized unsigned
 index; absence yields none. `each` requires a void callback and constructs no
 result array. Empty input invokes no callback, but argument expressions remain
 eager and left-to-right. Existing recursive-copy/shared-capture contracts apply.
-`find` supports array elements, including nested arrays, but is limited by current
-union payload support (no direct function or range payload); `findIndex` and the other helpers support all current
-array element types. No new borrowing or optimization is introduced. See
+`find`, `findIndex` and the other helpers support all current array element types,
+including nested arrays, unions, functions/closures and ranges. No new borrowing or optimization is introduced. See
 `examples/array-search.nov` and `lib/README.md`.
 
 Function expressions support inferred parameters and results: `(x) { x * 2 }`
@@ -333,7 +345,7 @@ signatures. No new range annotation syntax is added; integer fallback follows th
 context-first rules above.
 Nested arrays copy recursively independently; tagged union copies detach only
 active payload array backing, including record payloads containing arrays. Existing
-union payloads now include direct arrays and nested unions; direct function/range/
+union payloads now include arrays, nested unions, functions/closures and ranges;
 reference payloads remain unsupported. Function copies share existing environments/captured cells rather
 than deep-cloning closures; immutable capture snapshots and mutable shared cells
 retain their existing rules. Ranges copy bounds/inclusivity by value.
@@ -481,8 +493,9 @@ state is per value, endpoint type exact; dedicated literal-bound int/uint rules,
 empty reversed ranges and inclusive-MAX exhaustion remain unchanged. Otherwise
 unconstrained numeric-expression bounds now use int after typed-bound inference. No allocation.
 Inferred arrays of ranges work, copying bounds/inclusivity by value. No new range
-annotation syntax, signatures, aggregate fields/payloads, globals, field attributes,
-printing/equality/membership or iterator protocol yet.
+annotation syntax is added, but @TypeOf(0..1) can name an exact range type for
+signatures and union payloads. Direct struct fields, globals, field attributes,
+printing/equality/membership and general iterator protocols remain unsupported.
 See examples/range-values.nov. Chained ranges diagnose; slice/match syntax preserved.
 
 Ordinary generic structs are executable alongside generic unions: named type
@@ -587,7 +600,8 @@ Acyclic nominal records now work as ordinary/generic union payloads, retaining e
 identity through aliases, constructors, captures, copies and .! propagation. C
 layouts are dependency-ordered and every nested string owner is rooted; inactive
 payload fields are zeroed. Direct arrays and nested unions now work. Direct
-functions, ranges, references and recursive layouts remain unsupported. Reachable wide scalar leaves
+function and range payloads now work; references and recursive layouts remain
+unsupported. Reachable wide scalar leaves
 still produce backend width diagnostics at the leaf field.
 
 Printing and interpolation now support recursive named default formatting:
