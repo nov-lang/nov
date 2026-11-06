@@ -987,8 +987,8 @@ let myStruct = struct {}
 - **Rework Parser to remove newline if they are unnecessary**
   - idk about render but this will simplify other steps a lot
 - provide a way to duplicate a function based on parameters?
-  - useful when an argument can be comptime or runtime (explicit compile-time
-    arguments and `#` evaluation are proposals, not implemented)
+  - useful when an argument can be comptime or runtime (explicit `#` compile-time
+    arguments are accepted but deferred; general `#` evaluation remains a proposal)
 - Add `unroll` keyword to `match` and `for`, works like `inline` in zig
 - Eliminate hidden pass-by-reference from the codebase, i.e. use \*const more ofth for params
 - Make type optional (default to `any`) for function param?
@@ -1635,7 +1635,8 @@ Module-scope inferred generic expressions remain rejected; named generic
 declarations remain supported. No explicit function specialization syntax or
 general comptime evaluation is delivered. Existing explicit container parameters
 remain unchanged.
-`#` explicit compile-time arguments are a separate proposal, not implemented.
+`#` explicit compile-time arguments are accepted separately from backtick inference;
+implementation is explicitly deferred.
 Terminal paths do not impose `void` merge constraints; bare return constrains its
 own function result to void. Fresh nominal result layouts materialize without
 publishing method demands during probes, so inference is independent of prior
@@ -1650,11 +1651,37 @@ current uncommitted generic-closure implementation.
 
 # Comptime
 
-**PROPOSAL ONLY—not implemented.** `#` denotes explicit compile-time arguments,
-not inferred generic type variables. The alternative argument spellings below
-are unresolved. The accompanying compile-time variable/expression sketches are
-also proposals, not delivered behavior. Existing `(T: type)` container templates
-do not imply general `#` argument/evaluation support.
+**Accepted design; implementation explicitly deferred by the user.** `#` denotes
+explicit compile-time arguments, not inferred generic type variables. Parameter
+examples currently use `name: #Type`; the alternative `#name: Type` spelling and
+general evaluation rules remain unsettled. Type-producing declarations are
+conceptually functions returning `type`; current generic container templates are
+a restricted implementation of that model, not general compile-time execution.
+
+Keep this user example as a required distinction:
+
+```nov
+; Invalid: default is runtime, but the field default must be compile-time.
+let Box: (T: type, default: T) -> type = struct {
+    value: T = default,
+}
+```
+
+Returning `type` must not implicitly promote all value parameters to compile-time.
+With an explicitly compile-time default, the intended future form can construct
+the type and its field default (using the documented marker spelling):
+
+```nov
+; Accepted design only; implementation deferred.
+let Box: (T: #type, default: #T) -> type = struct {
+    value: T = default,
+}
+```
+
+Type construction depends on both type and compile-time value arguments. Current
+`(T: type)` support is unchanged; do not implement this until the user resumes it.
+The accompanying compile-time variable/expression/block/assertion sketches remain
+unaccepted proposals, not delivered behavior.
 
 ```nov
 ; PROPOSAL ONLY: comptime variable?
@@ -1663,7 +1690,7 @@ let mut x: #int = 0 ; probably the best, #int and #uint can be bigger than their
 let mut #x = 0
 let #mut x = 0
 
-; change the last two change param to this to match with comptime var
+; Alternative parameter placement proposal only; not accepted:
 let ArrayList: (#T: type) -> type = { ... }
 ; instead of
 let ArrayList: (T: #type) -> type = { ... }

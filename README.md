@@ -927,14 +927,14 @@ result layouts can supply inference constraints without depending on earlier
 instantiation order. See
 [`examples/generic-functions.nov`](examples/generic-functions.nov).
 
-`#` is separate: it denotes **proposed explicit compile-time arguments**, not
-inferred type variables. Compile-time argument handling is not implemented.
+`#` is separate: it denotes **accepted explicit compile-time arguments**, not
+inferred type variables. Implementation is explicitly deferred; see [Comptime](#comptime).
 
 ### Other function syntax
 
 The examples below mix implemented forms with older design sketches. Pointer
-parameters using the old `*mut` spelling, tuples and explicit `#` compile-time
-arguments are design sketches only. Safe `&T` / `&mut T` reference parameters
+parameters using the old `*mut` spelling and tuples are historical sketches.
+Explicit `#` compile-time arguments are accepted design, with implementation deferred. Safe `&T` / `&mut T` reference parameters
 are implemented under the [reference contract](#local-static-borrowing); these old
 pointer sketches do not define them.
 
@@ -963,10 +963,10 @@ let div: (a: int, b: int) -> struct{ int, int } = {
     [a / b, a % b]
 }
 
-; PROPOSAL ONLY: explicit compile-time type arguments, not implemented.
+; Accepted design: explicit compile-time type arguments; implementation deferred.
 ; # marks an explicit compile-time argument, not an inferred type variable.
 ; See Comptime; inferred generics instead use backtick type variables.
-; proposed signature: (#type, any, any) -> bool
+; design signature: (#type, any, any) -> bool
 let eql: (T: #type, x: T, y: T) -> bool = x == y
 eql(int, 1, 2) ; returns false
 eql(int, true, 0) ; compile error
@@ -1454,8 +1454,8 @@ recursively detach array backing; this copy-depth contract is settled. Recursive
 layouts (also through arrays), contextual constructors, general container constants,
 value parameters and general compile-time execution remain unsupported.
 
-The following broader stack example remains design-only: `#type` proposes an
-explicit compile-time type argument (not implemented), distinct from backtick
+The following broader stack example remains design-only: `#type` denotes an
+accepted explicit compile-time type argument (implementation deferred), distinct from backtick
 inferred type variables. Aggregate defaults and pointer-based mutable receivers
 are not delivered. Array fields themselves work. Its historical `*mut` spelling
 and implicit receiver accesses are separate from the explicit safe-reference
@@ -3466,10 +3466,41 @@ Migration: add `@[public]` to declarations and methods used across files; remove
 
 ## Comptime
 
-**Proposal only—not implemented.** `#` denotes explicit compile-time arguments;
-it is not the notation for inferred generic type variables (which use backticks).
-The exact argument spelling and compile-time evaluation rules remain unsettled.
-The broader Zig-inspired expression/block/variable/assertion forms below are also
+**Accepted design; implementation explicitly deferred.** `#` denotes explicit
+compile-time arguments, not inferred generic type variables (which use backticks).
+The parameter examples use the existing documented `name: #Type` spelling; the
+alternative `#name: Type` spelling and general evaluation rules are not settled.
+
+Type-producing declarations are conceptually functions returning `type`, not a
+separate kind of generic. The compiler currently implements a restricted
+container-template subset. Returning `type` does not automatically make ordinary
+value parameters compile-time.
+
+This example is invalid because `default` is a runtime parameter, while a field
+default must be known when the type is constructed:
+
+```nov
+let Box: (T: type, default: T) -> type = struct {
+    value: T = default,
+}
+```
+
+With an explicitly compile-time `default`, this is intended to work. Using the
+documented marker spelling, the future form is:
+
+```nov
+; Accepted design only; not implemented.
+let Box: (T: #type, default: #T) -> type = struct {
+    value: T = default,
+}
+```
+
+Both the type and compile-time default contribute to constructing the returned
+type. This does not add executable compile-time value parameters, nonliteral
+field defaults or general type-producing function evaluation to the current
+compiler. Existing `(T: type)` container-template support remains unchanged.
+
+The broader Zig-inspired expression/block/variable/assertion forms below remain
 historical proposals, not executable features or newly approved syntax.
 
 ```nov
@@ -3482,7 +3513,7 @@ let x = #{}
 ; comptime variable
 let mut x: #int = 0
 
-; comptime parameter
+; Accepted compile-time parameter design; implementation deferred.
 let intList: (len: #uint) -> []int = ...
 
 ; comptime assertion
