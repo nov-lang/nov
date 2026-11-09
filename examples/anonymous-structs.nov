@@ -1,0 +1,91 @@
+; nov run examples/anonymous-structs.nov
+; nov test examples/anonymous-structs.nov
+
+let std = @import("std")
+let Rectangle = struct {
+    width: int,
+    height: int = 4,
+}
+let Empty = struct {
+}
+let identity: (value: `T) -> `T = value
+let named: () -> @TypeOf(.[ a = 1, label = "a" ]) = .[ a = 2, label = "b" ]
+let positional: (value: @TypeOf(.[ 1, "a" ])) -> @TypeOf(.[ 1, "a" ]) = value
+
+let main: () = {
+    @println(.[ a = 1 ], .[ 1, "a" ], .[ 1, 2 ])
+    @println(@TypeOf(.[ a = 1, label = "a" ]), @TypeOf(.[ 1, "a" ]))
+    let rectangle: Rectangle = .[ width = 3 ]
+    @println(rectangle, Empty.[])
+}
+
+@[test]
+let named_contextual_defaults: () = {
+    let width: int = 3
+    let explicit = Rectangle.[ width ]
+    let contextual: Rectangle = .[ width ]
+    let supplied: Rectangle = .[ height = 6, width ]
+    let empty: Empty = .[]
+    @assert(explicit.width == 3 and explicit.height == 4)
+    @assert(contextual.width == 3 and contextual.height == 4)
+    @assert(supplied.width == 3 and supplied.height == 6)
+    @assert("{empty}" == "Empty[]")
+}
+
+@[test]
+let structural_shapes_across_scopes: () = {
+    let value = .[ a = 1, label = "a" ]
+    let same: @TypeOf(value) = named()
+    let other: @TypeOf(named()) = .[ label = "c", a = 3 ]
+    let a: int = 4
+    let mixed = .[ label = "mixed", a ]
+    @assert(same.a == 2 and same.label == "b")
+    @assert(other.a == 3 and other.label == "c")
+    @assert(mixed.a == 4 and mixed.label == "mixed")
+    @assert("{@TypeOf(value)}" == "{@TypeOf(same)}")
+}
+
+@[test]
+let inferred_positional_values: () = {
+    let pair = .[ 1, "a" ]
+    let passed: @TypeOf(pair) = positional(identity(pair))
+    let first: int = 1
+    let second: int = 2
+    let homogeneous = identity(.[ first, second ])
+    @assert("{passed}" == ".[1, a]")
+    @assert("{homogeneous}" == ".[1, 2]")
+    @assert("{.[a = 1]}" == ".[ a: 1 ]")
+}
+
+@[test]
+let snapshots_and_closure_fields: () = {
+    let mut values = [1, 2]
+    let mut count: int = 0
+    let record = .[
+        values = values,
+        next = () -> int {
+            count += 1
+            count
+        }
+    ]
+    values[0] = 9
+    let mut copy = record
+    copy.values[1] = 8
+    @assert(record.values[0] == 1 and record.values[1] == 2)
+    @assert(copy.values[0] == 1 and copy.values[1] == 8)
+    @assert(record.next() == 1 and copy.next() == 2)
+}
+
+@[test]
+let generic_mapping: () = {
+    let mapped = std.array.map(
+        [1, 2],
+        (value) {
+            .[ value = value, label = "item:{value}" ]
+        }
+    )
+    let copied = std.array.map(mapped, identity)
+    @assert(copied[0].value == 1 and copied[1].label == "item:2")
+    let pair = identity(.[ true, "ok" ])
+    @assert("{pair}" == ".[true, ok]")
+}

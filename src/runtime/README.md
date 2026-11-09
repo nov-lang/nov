@@ -283,14 +283,27 @@ output across allocations; nested allocations can trigger collection/retry. The
 scalar array helper's one-backing-per-call property does not bound allocations of a
 recursive generated copy.
 
-Constructor-field shorthand `Type[.width, .height]` is an ordinary same-name
-scoped read at the exact expected field type, not an ownership transfer. Mixing
+Constructor-field shorthand `Type.[width, height]` is an ordinary same-name
+scoped read at the exact expected field type, not an ownership transfer.
+Contextual `let p: Type = .[width, height]` uses the same bare-name rule; old dotted
+shorthand `Type.[.width]` is rejected. Inferred all-bare `.[x, y]` is positional,
+while an explicit assignment plus bare names is named. Contextual named entries
+map to the expected layout regardless of source order. Mixing
 explicit fields preserves source order; omitted defaults follow supplied fields.
 Imported types and generic aliases use the same path. Array backing still copies
 recursively on ordinary reads, borrowed values produce normal read copies, and
 immutable/mutable closure captures retain their existing snapshot/shared-cell
-rules. Union/enum payload grammar is unchanged; no contextual/anonymous structs
-or new `use`/`pub` syntax are introduced. See `examples/constructor-shorthand.nov`.
+rules. Explicit constructors use `Type.[field = value]`; contextual named
+`.[field = value]` keeps the expected type and existing scalar-only defaults.
+Anonymous named `.[a = 1]` and positional `.[1, "a"]` values use the same recursive
+copy/rooting and closure-field sharing rules. Structural identity is ordered names
+and canonical exact types, distinct from nominal types. Even homogeneous `.[1, 2]`
+is a struct, not an array. No tuple access/destructuring, mixed entries, anonymous
+unions/enums or new `use`/`pub` syntax are introduced. Union/enum payload grammar,
+array indexing and slicing are unchanged. Nominal debug output stays `Type[ ... ]`
+/ `Empty[]`; anonymous output is `.[ a: 1 ]` / `.[1, a]`, independent of source
+constructor spelling. See `examples/constructor-shorthand.nov` and
+`examples/anonymous-structs.nov`.
 
 The emitter predeclares instruction/slot/merge storage at function scope,
 zero-initializes it, and roots actual `void *owner` and `void *data` fields, flattened

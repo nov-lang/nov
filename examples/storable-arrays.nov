@@ -96,14 +96,14 @@ let nested_copies_and_iteration: () = {
 
 @[test]
 let union_active_payload_copies: () = {
-    let mut source = Row[ .values = ["old" + "!"] ]
+    let mut source = Row.[ values = ["old" + "!"] ]
     let mut items: []Payload = [.row[source], .text["hel" + "lo"], .none[]]
     let saved = items
     source.values[0] = "source"
     let mut extracted = match items[0] {
         .row => |row| row
-        .text => Row[ .values = [] ]
-        .none => Row[ .values = [] ]
+        .text => Row.[ values = [] ]
+        .none => Row.[ values = [] ]
     }
     extracted.values[0] = "new"
     items[0] = .row[extracted]

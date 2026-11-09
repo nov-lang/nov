@@ -13,7 +13,7 @@ let Box: (T: type) -> type = struct {
     value: T,
 }
 
-let box: (value: `T) -> Box(`T) = Box(`T)[ .value = value ]
+let box: (value: `T) -> Box(`T) = Box(`T).[ value = value ]
 let unbox: (value: Box(`T)) -> `T = value.value
 
 let main: () = {

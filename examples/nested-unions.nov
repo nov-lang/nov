@@ -213,7 +213,7 @@ let mapping_and_search_produce_nested_unions: () = {
 let nested_stringify_and_inactive_payloads: () = {
     let value: Outer = .inner[.some[[["hello"], []]]]
     @assert("{value}" == "Outer.inner[Inner.some[[[hello], []]]]")
-    let custom: Envelope = .custom[.label[Label[ .value = "nested" ]]]
+    let custom: Envelope = .custom[.label[Label.[ value = "nested" ]]]
     @assert("{custom}" == "Envelope.custom[Custom.label[ Label(nested) ]]")
     let absent: Outer = .none[]
     let innerAbsent: Outer = .inner[.none[]]
@@ -232,7 +232,7 @@ let nested_stringify_and_inactive_payloads: () = {
 let main: () = {
     let value: Outer = .inner[.some[[["hello"], []]]]
     let none: Outer = .none[]
-    let custom: Envelope = .custom[.label[Label[ .value = "nested" ]]]
+    let custom: Envelope = .custom[.label[Label.[ value = "nested" ]]]
     @println(value)
     @println(none)
     @println(custom)

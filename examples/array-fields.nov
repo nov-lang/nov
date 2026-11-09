@@ -21,12 +21,12 @@ let Payload = union {
     none,
 }
 
-let leaf: (n: int) -> Leaf = Leaf[ .values = [n, n + 1] ]
-let tree: () -> Tree = Tree[ .leaf = leaf(1), .records = [leaf(3)] ]
+let leaf: (n: int) -> Leaf = Leaf.[ values = [n, n + 1] ]
+let tree: () -> Tree = Tree.[ leaf = leaf(1), records = [leaf(3)] ]
 let identity: (value: Tree) -> Tree = value
 
 let main: () = {
-    let mut batch = Batch(int)[ .items = [2, 4] ]
+    let mut batch = Batch(int).[ items = [2, 4] ]
     let saved = batch
     batch.items[0] += 10
     batch.items += [6]
@@ -36,7 +36,7 @@ let main: () = {
 
 @[test]
 let field_mutations: () = {
-    let mut batch = Batch(int)[ .items = [] ]
+    let mut batch = Batch(int).[ items = [] ]
     batch.items = [2, 4]
     let saved = batch
     batch.items += [6]
@@ -67,7 +67,7 @@ let recursive_copies: () = {
     @assert(saved.records[0].values[0] == 3 and saved.records.len == 1)
     @assert(assigned.leaf.values[0] == 1 and assigned.records[0].values[0] == 3)
     @assert(current.records[0].values[0] == 30 and current.records.len == 2)
-    let mut boxed = Batch(Tree)[ .items = [current] ]
+    let mut boxed = Batch(Tree).[ items = [current] ]
     current.leaf.values[0] = 20
     let mut item = boxed.items[0]
     item.leaf.values[0] = 40

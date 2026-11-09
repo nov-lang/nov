@@ -50,6 +50,19 @@ results. See `examples/array-fields.nov`.
 
 ## Current delivered status
 
+Struct construction uses `Name.[field = value]` or contextual `.[field = value]`;
+old `Name[...]` constructors are rejected outright. Same-name shorthand is bare:
+`Name.[width, height]`, or `.[width, height]` with a named expected type. Without
+named context, `.[x, y]` is positional; explicit named entries can mix with bare
+shorthand, not positional expressions. Inferred `.[a = 1]` and `.[1, "a"]` create
+canonical anonymous named/positional structs, distinct from nominal declarations.
+Identity is ordered names/types (ordered types for positional values), independent
+of values and source files. Contextual named construction maps source-order entries
+into the expected layout; it is not conversion of an existing anonymous value.
+Normal field storage, copies, captures, type queries and GC rules apply. Positional
+access/destructuring and anonymous unions/enums are not introduced. See
+examples/anonymous-structs.nov (five tests). Named debug output is unchanged.
+
 Struct fields support all ordinary storable runtime types, including unions,
 functions/closures and ranges. References, void/type/namespaces and unspecialized
 generic templates remain non-storable, and recursive structural type graphs
@@ -381,14 +394,15 @@ for the current generic-function work.
 All optimization work stays paused; `defer` stays postponed. Namespace `use` syntax
 is undecided; unfinished work is stashed, not implemented or approved for execution.
 
-Constructor-field shorthand is delivered in `da7838c`: `Type[.width, .height]`
+Constructor-field shorthand is delivered in `da7838c`: `Type.[width, height]`
 reads ordinary same-name scoped values with the field's exact expected type.
 It mixes with explicit fields in source order; omitted defaults follow supplied
 fields. Imported types and generic aliases work. Unknown/out-of-scope names
 reject even when a default exists; unknown/duplicate/missing/mistyped fields retain
 normal diagnostics. Array deep-copy/read-copy behavior, borrowed-value reads and
 closure capture rules are unchanged. Union/enum payload grammar is unchanged;
-no contextual/anonymous structs or new `use`/`pub` syntax are added.
+no new `use`/`pub` syntax is added. Contextual and anonymous structs are now
+supported under the breaking constructor contract below.
 See `examples/constructor-shorthand.nov` (five tests). Historical focused CLI
 validation: **24/24 steps**; static review: no findings. These are not results for
 the current generic-function work; its latest validation is recorded above.
@@ -514,11 +528,12 @@ See examples/range-values.nov. Chained ranges diagnose; slice/match syntax prese
 
 Ordinary generic structs are executable alongside generic unions: named type
 parameters, canonical declaration+argument identity through aliases/imports,
-concrete fields/defaults, finite nested instances, direct Box(T)[...] constructors,
+concrete fields/defaults, finite nested instances, direct Box(T).[...] constructors,
 @This/Self and demand-specialized methods. They work in arrays and Option/Result
 payloads with existing value-copy/GC rules. See examples/generic-structs.nov.
 Array-valued fields now use recursive independent copies, including concrete array
-type arguments; contextual constructors, value generics and general comptime remain deferred.
+type arguments; contextual named constructors are supported. Value generics and
+general comptime remain deferred.
 
 Growable []string and acyclic nested-record arrays are executable with independent
 element storage and shared immutable string backing. Index values and replacements,
@@ -703,10 +718,27 @@ array/function payloads and explicit tag enums remain deferred.
 The filesystem error example remains design-only: filesystem APIs and file-resource
 semantics are missing and intentionally deprioritized; imports are implemented.
 
+Breaking struct constructors use `Name.[field = value]`, contextual
+`.[field = value]`, and bare same-name shorthand `Name.[width]` /
+`let p: Name = .[width]`. Inferred all-bare `.[x, y]` is positional; an explicit
+assignment plus bare names is named. Contextual named entries map to the expected
+layout regardless of source order; ordered identity applies to inferred shapes.
+Old dotted shorthand `Name.[.width]` is rejected. Old
+`Name[.field = value]` and `Name[]` are rejected. Anonymous named `.[a = 1]`
+and positional `.[1, "a"]` values support storage, passing, printing and `@TypeOf`;
+even homogeneous `.[1, 2]` is not an array. Structural identity uses ordered names
+and canonical exact types across scopes/modules, and remains distinct from nominal
+types. Named/positional mixing is rejected; no tuple access/destructuring is added.
+Contextual named constructors retain existing scalar-only defaults. Anonymous
+unions/enums remain deferred; union payloads, indexing and slicing are unchanged.
+Nominal debug-print output remains `Name[ field: value ]` / `Empty[]`; anonymous
+output is `.[ a: 1 ]` / `.[1, a]`. See `examples/anonymous-structs.nov` (five tests)
+and `zig build test-cli-anonymous-structs`, included in the full CLI suite.
+
 Bounded nominal value structs are executable; `examples/type.nov` is unchanged
 and runs/checks/formats successfully. Separate declarations have distinct identities;
 module aliases preserve identity. Flat bool/integer/rune/string/enum fields have exact types,
-literal-only defaults and required-field diagnostics. Explicit `Type[.field=value]`
+literal-only defaults and required-field diagnostics. Explicit `Type.[field=value]`
 constructors evaluate supplied fields once left-to-right, then omitted literal defaults
 in declaration order. Record value boundaries copy fields; strings share immutable
 storage. Field reads work in interpolation. Container methods support scoped and
@@ -719,9 +751,8 @@ argument-free `@[public]` on immutable supported declarations is accepted;
 declarations and methods are otherwise file-private under both import forms.
 `@[private]` is unsupported. Explicit C export annotations are separate from Nov
 visibility. C value layouts/root frames retain every string owner in
-parameters, temporaries, local slots and control-flow merges. Contextual/anonymous
-constructors, union/function fields, record globals, container constants/types
-and FFI remain deferred. Nested structs, array fields and record
+parameters, temporaries, local slots and control-flow merges. Record globals,
+container constants/types and FFI remain deferred. Nested structs, array fields and record
 arrays are delivered under the recursive value-copy rules above. See README's executable struct
 contract; the older broader syntax examples below are not delivery claims.
 
@@ -755,7 +786,7 @@ Canonical type aliases: plain immutable module `let Name = typeExpression` is
 implemented for existing supported scalar, array and function types,
 including nominal structs, forward chains and aliases in nested type components.
 Aliases work in annotations and `@as`, never as runtime type values. Nominal struct
-aliases additionally preserve explicit `Alias[...]` constructors and static methods;
+aliases additionally preserve explicit `Alias.[...]` constructors and static methods;
 this does not introduce numeric constructors. Cycles have
 source-related diagnostics; alias expansion is iterative and bounded to 128 active
 expansions. Module-level `@TypeOf` aliases are supported as described above.
@@ -1162,9 +1193,9 @@ let main: () -> !void = {
         s: string,
         n: uint,
     }
-    let mut value = Value[ .n = 42 ]
+    let mut value = Value.[ n = 42 ]
     let number = &value.n
-    value = Value[ .s = "hello world" ]
+    value = Value.[ s = "hello world" ]
     number.* -= 42
     ; outputs memory garbage
     @println(value.s)

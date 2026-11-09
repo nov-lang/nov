@@ -14,6 +14,6 @@ let MyType = struct {
 }
 
 let main: () = {
-    let item = MyType[ .x = 5, .z = true ]
+    let item = MyType.[ x = 5, z = true ]
     @println(item) ; @println will call the @[stringify] method
 }

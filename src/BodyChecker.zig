@@ -387,18 +387,30 @@ pub const QueryValidation = struct {
         errdefer scratch.deinit();
         scratch.source_len = source.source_len;
         try scratch.source_lengths.appendSlice(scratch.allocator, source.source_lengths.items);
+        // Preserve IDs even when nominal fields point forward. Anonymous layouts
+        // use private nominal placeholders until every referenced ID exists.
         for (source.types.items, 0..) |original, index| {
             var ty = original;
-            if (ty == .record) ty.record.fields = &.{};
+            if (ty == .record) {
+                ty.record.fields = &.{};
+                if (ty.record.anonymous != .none) {
+                    ty.record.anonymous = .none;
+                    ty.record.identity = @intCast(index);
+                    ty.record.source = @fromBackingInt(std.math.maxInt(u32));
+                }
+            }
             const id = try scratch.internType(ty);
             std.debug.assert(@backingInt(id) == index);
         }
         for (source.types.items, 0..) |ty, index| {
-            if (ty != .record or ty.record.fields.len == 0) continue;
+            if (ty != .record) continue;
             const fields = try scratch.allocator.dupe(Ir.Field, ty.record.fields);
             defer scratch.allocator.free(fields);
             for (fields) |*field| field.default = null;
             try scratch.setRecordFields(@fromBackingInt(@intCast(index)), fields);
+            scratch.types.items[index].record.anonymous = ty.record.anonymous;
+            scratch.types.items[index].record.identity = ty.record.identity;
+            scratch.types.items[index].record.source = ty.record.source;
         }
         return .{ .ir = scratch };
     }
@@ -520,9 +532,7 @@ const Context = struct {
         });
     }
 
-    fn resolveType(self: *Context, node: Ast.Node.Index) Error!?Ir.TypeId {
-        var values: std.ArrayList(TypeResolver.Binding) = .empty;
-        defer values.deinit(self.module.allocator);
+    fn appendGlobalTypes(self: *Context, values: *std.ArrayList(TypeResolver.Binding)) Error!void {
         // Frozen semantic tables contain the actual defaulted global types.
         // Do not request values or run inference merely to answer a type query.
         for (self.module.declarations.items, 0..) |decl, index| {
@@ -537,6 +547,12 @@ const Context = struct {
             };
             if (ty) |known| try values.append(self.module.allocator, .{ .name = decl.name, .ty = known });
         }
+    }
+
+    fn resolveType(self: *Context, node: Ast.Node.Index) Error!?Ir.TypeId {
+        var values: std.ArrayList(TypeResolver.Binding) = .empty;
+        defer values.deinit(self.module.allocator);
+        try self.appendGlobalTypes(&values);
         var captures: std.ArrayList(GenericFunctions.Capture) = .empty;
         defer captures.deinit(self.module.allocator);
         if (self.specializing) |template| {
@@ -1059,6 +1075,7 @@ const Context = struct {
 
     fn nominalMethodIncludingPrivate(self: *Context, ty: Ir.TypeId, name: []const u8) ?Module.DeclId {
         const nominal = self.ir.getType(ty).?;
+        if (nominal == .record and nominal.record.anonymous != .none) return null;
         const source = switch (nominal) {
             .record => nominal.record.source,
             .enumeration => nominal.enumeration.source,
@@ -1072,6 +1089,7 @@ const Context = struct {
 
     fn nominalStringifierIncludingPrivate(self: *Context, ty: Ir.TypeId) ?Module.DeclId {
         const nominal = self.ir.getType(ty).?;
+        if (nominal == .record and nominal.record.anonymous != .none) return null;
         const source = switch (nominal) {
             .record => nominal.record.source,
             .enumeration => nominal.enumeration.source,
@@ -1590,7 +1608,7 @@ const Context = struct {
             if (TypeResolver.genericTarget(self.module, call.ast.fn_expr) == null and !std.mem.eql(u8, ast.tokenSlice(ast.firstToken(call.ast.fn_expr)), "@This")) return null;
             const ty = (try self.resolveType(data.lhs)) orelse return null;
             const nominal = self.ir.getType(ty).?;
-            if (nominal != .record) return null;
+            if (nominal != .record or nominal.record.anonymous != .none) return null;
             const owner = if (self.module.compilation) |comp| comp.getModule(nominal.record.source).? else self.module;
             const id = owner.lookupMethod(@fromBackingInt(nominal.record.identity), ast.tokenSlice(data.rhs)) orelse return null;
             const declaration = owner.getDeclaration(id).?;
@@ -1613,7 +1631,7 @@ const Context = struct {
         if (TypeResolver.genericTarget(self.module, call.ast.fn_expr) == null and !std.mem.eql(u8, ast.tokenSlice(ast.firstToken(call.ast.fn_expr)), "@This")) return null;
         const ty = (try self.resolveType(data.lhs)) orelse return null;
         const nominal = self.ir.getType(ty).?;
-        if (nominal != .record) return null;
+        if (nominal != .record or nominal.record.anonymous != .none) return null;
         const owner = if (self.module.compilation) |comp| comp.getModule(nominal.record.source).? else self.module;
         const id = owner.lookupMethod(@fromBackingInt(nominal.record.identity), ast.tokenSlice(data.rhs)) orelse return null;
         const declaration = owner.getDeclaration(id).?;
@@ -1704,6 +1722,7 @@ const Context = struct {
             const nominal = c.ir.getType(ty).?;
             if (nominal != .record) return null;
             for (nominal.record.fields) |field| if (std.mem.eql(u8, field.name, name)) return .{ .ty = field.ty };
+            if (nominal.record.anonymous != .none) return null;
             // Ordinary nominal layouts can still be cold. Read their field
             // annotations in the defining scope without completing a layout.
             const owner = if (c.module.compilation) |comp| comp.getModule(nominal.record.source).? else c.module;
@@ -1881,11 +1900,11 @@ const Context = struct {
                     }
                     return flow;
                 },
-                .container_decl_arg => {
+                .struct_init, .container_decl_arg => {
                     var flow: Flow = .{};
                     for (ast.fullStructInit(node).?.fields) |field| {
                         if (!flow.live) break;
-                        const rhs = ast.nodes.items(.data)[field].rhs;
+                        const rhs = if (ast.nodes.items(.tag)[field] == .container_field) ast.nodes.items(.data)[field].rhs else 0;
                         flow = flow.then(try q.expression(if (rhs == 0) field else rhs, depth + 1));
                     }
                     return flow;
@@ -2253,6 +2272,7 @@ const Context = struct {
     fn receiverReference(self: *Context, ty: Ir.TypeId, name: []const u8) ?GenericFunctions.Ref {
         if (self.fieldIndex(ty, name) != null) return null;
         const nominal = self.ir.getType(ty).?;
+        if (nominal == .record and nominal.record.anonymous != .none) return null;
         const source = switch (nominal) {
             .record => |r| r.source,
             .enumeration => |e| e.source,
@@ -2399,7 +2419,7 @@ const Context = struct {
             }
             return true;
         }
-        if (self.emitter != null) try self.ir.setTypeFormatting(ty, try self.printedTypeName(ty, max_recursive_depth), null);
+        if (self.emitter != null and !(nominal == .record and nominal.record.anonymous != .none)) try self.ir.setTypeFormatting(ty, try self.printedTypeName(ty, max_recursive_depth), null);
         if (nominal == .record) {
             // Signature demands may grow the type pool, so reacquire the layout.
             const record = self.ir.getType(ty).?.record;
@@ -2469,6 +2489,13 @@ const Context = struct {
             },
             .enumeration => |enumeration| enumeration.name,
             .record => |record| blk: {
+                if (record.anonymous != .none) {
+                    var text: []const u8 = "struct{ ";
+                    for (record.fields, 0..) |field, i| {
+                        text = try std.fmt.allocPrint(a, "{s}{s}{s}{s}{s}", .{ text, if (i == 0) "" else ", ", if (record.anonymous == .named) field.name else "", if (record.anonymous == .named) ": " else "", try self.printedTypeName(field.ty, remaining - 1) });
+                    }
+                    break :blk try std.fmt.allocPrint(a, "{s} }}", .{text});
+                }
                 const owner = if (self.module.compilation) |comp| comp.getModule(record.source).? else self.module;
                 const decl = owner.getDeclaration(@fromBackingInt(record.identity)).?;
                 var text = owner.sourceSlice(decl.name_span).?;
@@ -2606,21 +2633,33 @@ const Context = struct {
     fn recordInit(self: *Context, node: Ast.Node.Index, expected: ?Known, depth: usize) Error!?Ir.TypeId {
         const ast = &self.module.source.ast;
         const init = ast.fullStructInit(node).?;
-        const ty = (try self.resolveType(init.type_node)) orelse return null;
+        const ty = if (init.type_node != 0)
+            (try self.resolveType(init.type_node)) orelse return null
+        else if (expected) |want|
+            want.ty
+        else blk: {
+            if (try self.probeDefault(node, depth + 1)) |known| break :blk known.ty;
+            try self.diagnoseInitializer(node);
+            return null;
+        };
         const record = self.ir.getType(ty).?;
-        if (record != .record) return self.fail(.not_a_type, init.type_node, null);
+        if (record != .record) return self.fail(if (init.type_node != 0) .not_a_type else .expression_type_mismatch, if (init.type_node != 0) init.type_node else node, null);
+        const positional = record.record.anonymous == .positional;
+        if (positional and init.fields.len != record.record.fields.len) return self.fail(.missing_field, node, null);
         if (record.record.tagged) return self.fail(.invalid_union_constructor, node, null);
         if (try self.fit(ty, expected, node) == null) return null;
         const seen = try self.module.allocator.alloc(bool, record.record.fields.len);
         defer self.module.allocator.free(seen);
         @memset(seen, false);
         const values = if (self.emitter) |emitter| try emitter.allocator.alloc(Ir.ValueId, seen.len) else null;
-        for (init.fields) |field_node| {
+        for (init.fields, 0..) |field_node, position| {
+            const tag = ast.nodes.items(.tag)[field_node];
+            if (if (positional) tag == .container_field else tag != .container_field and tag != .identifier) return self.fail(.expression_type_mismatch, field_node, null);
             const name = ast.tokenSlice(ast.nodes.items(.main_token)[field_node]);
-            const index = self.fieldIndex(ty, name) orelse return self.fail(.unknown_field, field_node, null);
+            const index = if (positional) position else self.fieldIndex(ty, name) orelse return self.fail(.unknown_field, field_node, null);
             if (seen[index]) return self.fail(.duplicate_field, field_node, null);
             seen[index] = true;
-            const rhs = ast.nodes.items(.data)[field_node].rhs;
+            const rhs = if (tag == .container_field) ast.nodes.items(.data)[field_node].rhs else 0;
             const value_node = if (rhs == 0) field_node else rhs;
             if (try self.expression(value_node, .{ .ty = record.record.fields[index].ty }, depth + 1) == null) return null;
             if (self.terminated) return ty;
@@ -2633,6 +2672,28 @@ const Context = struct {
         }
         if (self.emitter) |emitter| try emitter.record(node, ty, self.irSpan(node), .{ .record_init = values.? });
         return ty;
+    }
+
+    fn diagnoseInitializer(self: *Context, node: Ast.Node.Index) Error!void {
+        var values: std.ArrayList(TypeResolver.Binding) = .empty;
+        defer values.deinit(self.module.allocator);
+        try self.appendGlobalTypes(&values);
+        var captures: std.ArrayList(GenericFunctions.Capture) = .empty;
+        defer captures.deinit(self.module.allocator);
+        try self.appendTypeCaptures(&captures, self.module.allocator);
+        const scope: GenericFunctions.LocalTemplate = .{
+            .proto = node,
+            .body = 0,
+            .outer_bindings = self.function_bindings,
+            .captures = captures.items,
+            .container = self.container,
+            .concrete_type = self.concrete_type,
+        };
+        var validation = try QueryValidation.init(self.ir);
+        defer validation.deinit();
+        const start = self.module.diagnostics.items.len;
+        _ = try GenericFunctions.queryExpressionInScope(self.module, &validation.ir, node, self.function_bindings, values.items, captures.items, self.inferenceReference(.{ .module = self.module, .local = &scope }));
+        if (self.module.diagnostics.items.len == start) _ = try self.fail(.unsupported_body_expression, node, null);
     }
 
     fn isPanic(self: *Context, node: Ast.Node.Index) bool {
@@ -2676,6 +2737,9 @@ const Context = struct {
             .array => |element| self.hasFloatDefault(element, depth + 1),
             .record => |record| blk: {
                 for (record.type_args) |arg| if (self.hasFloatDefault(arg, depth + 1)) break :blk true;
+                if (record.anonymous != .none) for (record.fields) |field| {
+                    if (self.hasFloatDefault(field.ty, depth + 1)) break :blk true;
+                };
                 break :blk false;
             },
             .function => |function| blk: {
@@ -2787,6 +2851,10 @@ const Context = struct {
                     .string => .{ .ty = try self.ir.internType(.rune) },
                     else => null,
                 };
+            },
+            .struct_init => blk: {
+                if (data.lhs != 0) break :blk if (try self.resolveType(data.lhs)) |ty| .{ .ty = ty } else null;
+                break :blk try self.probeSiblings(&.{node}, depth + 1);
             },
             .container_decl_arg => blk: {
                 if (ast.nodes.items(.tag)[data.lhs] == .enum_literal) break :blk null;
@@ -4310,7 +4378,8 @@ const Context = struct {
             return self.unionInit(node, expected, depth);
         // Explicit record constructors already carry their type. Resolve it once,
         // rather than probing and then retrying a failed concrete specialization.
-        if (tag_early == .container_decl_arg) return self.recordInit(node, expected, depth);
+        if (tag_early == .struct_init) return self.recordInit(node, expected, depth);
+        if (tag_early == .container_decl_arg) return self.fail(.invalid_union_constructor, node, null);
         if (tag_early == .function_expr) return self.functionExpression(node, expected, depth);
         if (tag_early == .identifier or tag_early == .field_access) {
             if (try self.genericTarget(node)) |ref| return self.genericValue(node, ref, expected);
@@ -4928,7 +4997,7 @@ test "float bodies defaults contextual literals control flow mutations and print
         \\let exact_ranged:float=ranged
         \\let returned:f32={if true {return}
         \\take(1)}
-        \\let boxed=Box(f32)[.value=1]
+        \\let boxed=Box(f32).[value=1]
         \\let query:@TypeOf(narrow)=2
         \\let mut local:f32=1
         \\local+=2
@@ -4943,7 +5012,7 @@ test "float bodies defaults contextual literals control flow mutations and print
         \\items[0]*=2
         \\items[0]/=3
         \\loop &item in items {item.* +=0.5}
-        \\let mut record=Record[]
+        \\let mut record=Record.[]
         \\record.value+=2
         \\record.value-=1
         \\record.value*=2
@@ -5166,7 +5235,7 @@ test "float bodies reject conversions integer only operations and deferred match
         "let f:(x:f32)->f32=x&1",
         "let f:()={let mut x:f32=1\nx%=2}",
         "let f:()={let mut x:[]f32=[1]\nx[0]%=2}",
-        "let R=struct{x:f32,}\nlet f:()={let mut r=R[.x=1]\nr.x%=2}",
+        "let R=struct{x:f32,}\nlet f:()={let mut r=R.[x=1]\nr.x%=2}",
         "let f:(a:[]f32,x:f32)->f32=a[x]",
         "let f:(x:f32)={loop i in x..2 {}}",
         "let f:(x:f32)->int=match x {_=>1}",
@@ -5189,7 +5258,7 @@ test "float bodies reject conversions integer only operations and deferred match
 test "float aggregate siblings merge exact and soft nominal leaves before defaults" {
     const source =
         \\let Pair:(A:type,B:type)->type=struct{a:A,b:B,}
-        \\let pair:(a:`A,b:`B)->Pair(`A,`B)=Pair(`A,`B)[.a=a,.b=b]
+        \\let pair:(a:`A,b:`B)->Pair(`A,`B)=Pair(`A,`B).[a=a,b=b]
         \\let f:(a:f32,b:f64)={
         \\let mixed=[pair(1.5,1),pair(1,1.5)]
         \\let exact_mixed:[]Pair(float,float)=mixed
@@ -5435,8 +5504,8 @@ const flow_query_prelude =
     \\}
     \\let S=struct{value:bool,other:bool,}
     \\let Holder=struct{len:R,}
-    \\let make:()->R=R[]
-    \\let Factory=struct{let make:()->R=R[]
+    \\let make:()->R=R.[]
+    \\let Factory=struct{let make:()->R=R.[]
     \\}
     \\let U=union{ok:R,err,}
     \\let take:(a:bool,b:bool)->bool=a
@@ -5453,15 +5522,15 @@ const flow_query_cases = [_]struct { expression: []const u8, terminal: bool, che
     .{ .expression = "loop @as(bool,{return true}) {}", .terminal = true },
     .{ .expression = "loop false{}else{return true}", .terminal = true },
     .{ .expression = "match true{true=>{return true}\nfalse=>{return false}}", .terminal = true },
-    .{ .expression = "{let u:U=.ok[R[]]\nmatch u{.ok=>|r|r.stop()\n.err=>@panic(\"err\")}}", .terminal = true },
-    .{ .expression = "{let r=R[]\nr.stop()}", .terminal = true },
+    .{ .expression = "{let u:U=.ok[R.[]]\nmatch u{.ok=>|r|r.stop()\n.err=>@panic(\"err\")}}", .terminal = true },
+    .{ .expression = "{let r=R.[]\nr.stop()}", .terminal = true },
     .{ .expression = "make().stop()", .terminal = true },
     .{ .expression = "{let r=make()\nr.stop()}", .terminal = true },
     .{ .expression = "Factory.make().stop()", .terminal = true },
     .{ .expression = "{let r=Factory.make()\nr.stop()}", .terminal = true },
-    .{ .expression = "{let h=Holder[.len=R[]]\nh.len.stop()}", .terminal = true },
-    .{ .expression = "{let r={let made=R[]\nmade}\nr.stop()}", .terminal = true },
-    .{ .expression = "{let r=Box(bool)[.value=true]\nr.stop()}", .terminal = true },
+    .{ .expression = "{let h=Holder.[len=R.[]]\nh.len.stop()}", .terminal = true },
+    .{ .expression = "{let r={let made=R.[]\nmade}\nr.stop()}", .terminal = true },
+    .{ .expression = "{let r=Box(bool).[value=true]\nr.stop()}", .terminal = true },
     .{ .expression = "!{return true}", .terminal = true },
     .{ .expression = "@as(int,1)+{return true}", .terminal = true },
     .{ .expression = "@as(R,{return true}).value", .terminal = true },
@@ -5469,7 +5538,7 @@ const flow_query_cases = [_]struct { expression: []const u8, terminal: bool, che
     .{ .expression = "@as([]bool,[true])[{return true}]", .terminal = true },
     .{ .expression = "@as(string,\"x\")[{return true}..unknown]", .terminal = true },
     .{ .expression = "@as([]bool,[{return true},unknown])", .terminal = true },
-    .{ .expression = "@as(S,S[.value={return true},.other=unknown])", .terminal = true },
+    .{ .expression = "@as(S,S.[value={return true},other=unknown])", .terminal = true },
     .{ .expression = "@as(U,U.ok[{return true}])", .terminal = true },
     .{ .expression = "take({return true},unknown)", .terminal = true },
     .{ .expression = "@as((bool)->bool,{return true})(unknown)", .terminal = true },
@@ -5484,8 +5553,8 @@ const flow_query_cases = [_]struct { expression: []const u8, terminal: bool, che
     .{ .expression = "false and {return true}", .terminal = false },
     .{ .expression = "true or {return false}", .terminal = false },
     .{ .expression = "{let cb=()->bool{loop{}}\ntrue}", .terminal = false },
-    .{ .expression = "{let halt=R.stop\nhalt(R[])\ntrue}", .terminal = false },
-    .{ .expression = "{let r=R[]\nlet halt=R.stop\nhalt(r)\ntrue}", .terminal = false },
+    .{ .expression = "{let halt=R.stop\nhalt(R.[])\ntrue}", .terminal = false },
+    .{ .expression = "{let r=R.[]\nlet halt=R.stop\nhalt(r)\ntrue}", .terminal = false },
     .{ .expression = "match true{true=>{return true}\nfalse=>false}", .terminal = false },
     .{ .expression = "loop item in @as([]R,[]) {item.stop()}", .terminal = false, .check_call = false },
 };
@@ -5522,7 +5591,7 @@ fn testFlowCall(allocator: std.mem.Allocator, expression: []const u8, terminal: 
         if (terminal) "let W=struct{let f:(self:W,a:`T,b:`T,c:`T)->`T=missing\n}\n" else "let W=struct{let f:(self:W,a:`T,b:`T,c:`T)->`T=a\n}\n"
     else
         "let W=struct{let f:(self:W,a:bool,b:bool,c:bool)->bool=a\n}\n";
-    const source = try std.mem.concat(allocator, u8, &.{ flow_query_prelude, "\n", method, "let main:()->bool=W[].f(true,", expression, if (terminal) ",unknown)" else ",true)" });
+    const source = try std.mem.concat(allocator, u8, &.{ flow_query_prelude, "\n", method, "let main:()->bool=W.[].f(true,", expression, if (terminal) ",unknown)" else ",true)" });
     defer allocator.free(source);
     var module = try Module.init(allocator, "flow-call.nov", source);
     defer module.deinit();
@@ -5547,7 +5616,7 @@ fn testFlowCall(allocator: std.mem.Allocator, expression: []const u8, terminal: 
 
 fn lowerFlowDepth(allocator: std.mem.Allocator, chain: []const u8, generic: bool) !?Module.Diagnostic.Tag {
     const method = if (generic) "let f:(object:R,a:`T,b:R,c:`T)->`T=a\n" else "let f:(object:R,a:bool,b:R,c:bool)->bool=a\n";
-    const source = try std.mem.concat(allocator, u8, &.{ "let R=struct{let same:(object:R)->R=object\n", method, "}\nlet make:()->R=R[]\nlet Factory=struct{let make:()->R=R[]\n}\nlet main:()->bool=R[].f(true,", chain, ",true)" });
+    const source = try std.mem.concat(allocator, u8, &.{ "let R=struct{let same:(object:R)->R=object\n", method, "}\nlet make:()->R=R.[]\nlet Factory=struct{let make:()->R=R.[]\n}\nlet main:()->bool=R.[].f(true,", chain, ",true)" });
     defer allocator.free(source);
     var module = try Module.init(allocator, "flow-depth.nov", source);
     defer module.deinit();
@@ -5575,7 +5644,7 @@ fn testFlowDepth(allocator: std.mem.Allocator, depth: usize, root: []const u8) !
     defer chain.deinit();
     chain.writer.writeAll(root) catch return error.OutOfMemory;
     for (0..depth) |_| chain.writer.writeAll(".same()") catch return error.OutOfMemory;
-    const source = try std.mem.concat(allocator, u8, &.{ "let R=struct{let same:(object:R)->R=object\n}\nlet make:()->R=R[]\nlet Factory=struct{let make:()->R=R[]\n}\nlet sample:()->R=", chain.written() });
+    const source = try std.mem.concat(allocator, u8, &.{ "let R=struct{let same:(object:R)->R=object\n}\nlet make:()->R=R.[]\nlet Factory=struct{let make:()->R=R.[]\n}\nlet sample:()->R=", chain.written() });
     defer allocator.free(source);
     var module = try Module.init(allocator, "flow-depth-probe.nov", source);
     defer module.deinit();
@@ -5625,7 +5694,7 @@ test "backtick instance flow depth shallow factory every allocation failure" {
 fn testFlowDepthSampledOom(depth: usize) !void {
     for ([_]usize{ 0, 1, 2, 8, 32, 128, 512, 1024 }) |index| {
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = index, .resize_fail_index = 0 });
-        testFlowDepth(failing.allocator(), depth, "R[]") catch |err| {
+        testFlowDepth(failing.allocator(), depth, "R.[]") catch |err| {
             try std.testing.expectEqual(error.OutOfMemory, err);
         };
     }
@@ -5705,11 +5774,11 @@ fn testFactoryImports(allocator: std.mem.Allocator, expression: []const u8, publ
         \\let f:(object:R,a:`T,b:`T,c:`T)->`T=missing
         \\}
         \\@[public]
-        \\let make:()->Hidden=Hidden[]
-        \\let privateMake:()->Hidden=Hidden[]
+        \\let make:()->Hidden=Hidden.[]
+        \\let privateMake:()->Hidden=Hidden.[]
         \\@[public]
         \\let Factory=struct{@[public]
-        \\let make:()->Hidden=Hidden[]
+        \\let make:()->Hidden=Hidden.[]
         \\}
     );
     const module = comp.getModule(root).?;
@@ -5753,9 +5822,9 @@ fn testFactoryImports(allocator: std.mem.Allocator, expression: []const u8, publ
 
 test "backtick instance factory result imports preserve private diagnostics and demand only reachable bodies under OOM" {
     for ([_][]const u8{
-        "lib.R[].f(true,lib.make().stop(),unknown)",
-        "lib.R[].f(true,{let r=lib.make()\nr.stop()},unknown)",
-        "lib.R[].f(true,lib.Factory.make().stop(),unknown)",
+        "lib.R.[].f(true,lib.make().stop(),unknown)",
+        "lib.R.[].f(true,{let r=lib.make()\nr.stop()},unknown)",
+        "lib.R.[].f(true,lib.Factory.make().stop(),unknown)",
         "lib.privateMake().stop()",
     }, 0..) |expression, i| {
         try testFactoryImports(std.testing.allocator, expression, i < 3);
@@ -5764,7 +5833,7 @@ test "backtick instance factory result imports preserve private diagnostics and 
 }
 
 fn testFlowDepthRoots(depth: usize) !void {
-    for ([_][]const u8{ "R[]", "make()", "Factory.make()" }) |root| try testFlowDepth(std.testing.allocator, depth, root);
+    for ([_][]const u8{ "R.[]", "make()", "Factory.make()" }) |root| try testFlowDepth(std.testing.allocator, depth, root);
 }
 
 test "backtick instance flow depth concrete generic parity depth 62" {
@@ -5825,22 +5894,22 @@ test "backtick instance abstract control flow matches concrete exits loops scope
 test "instance calls diagnose signatures arity exact identity and preserve fields" {
     const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag };
     for ([_]Case{
-        .{ .source = "let R=struct{let f:()->bool=true\n}\nlet main:()={let r=R[]\nr.f()}", .tag = .invalid_method_receiver },
-        .{ .source = "let R=struct{let f:(n:int)->bool=true\n}\nlet main:()={let r=R[]\nr.f()}", .tag = .invalid_method_receiver },
-        .{ .source = "let S=struct{}\nlet R=struct{let f:(s:S)->bool=true\n}\nlet main:()={let r=R[]\nr.f()}", .tag = .invalid_method_receiver },
-        .{ .source = "let R=struct{let f:(r:R,n:int)->bool=true\n}\nlet main:()={let r=R[]\nr.f()}", .tag = .argument_count_mismatch },
-        .{ .source = "let R=struct{let f:(r:R,n:int)->bool=true\n}\nlet main:()={let r=R[]\nr.f(true)}", .tag = .literal_type_mismatch },
-        .{ .source = "let R=struct{}\nlet f:(r:R)->bool=true\nlet main:()={let r=R[]\nr.f()}", .tag = .unknown_field },
-        .{ .source = "let R=struct{f:bool=true,}\nlet main:()={let r=R[]\nr.f()}", .tag = .not_callable },
+        .{ .source = "let R=struct{let f:()->bool=true\n}\nlet main:()={let r=R.[]\nr.f()}", .tag = .invalid_method_receiver },
+        .{ .source = "let R=struct{let f:(n:int)->bool=true\n}\nlet main:()={let r=R.[]\nr.f()}", .tag = .invalid_method_receiver },
+        .{ .source = "let S=struct{}\nlet R=struct{let f:(s:S)->bool=true\n}\nlet main:()={let r=R.[]\nr.f()}", .tag = .invalid_method_receiver },
+        .{ .source = "let R=struct{let f:(r:R,n:int)->bool=true\n}\nlet main:()={let r=R.[]\nr.f()}", .tag = .argument_count_mismatch },
+        .{ .source = "let R=struct{let f:(r:R,n:int)->bool=true\n}\nlet main:()={let r=R.[]\nr.f(true)}", .tag = .literal_type_mismatch },
+        .{ .source = "let R=struct{}\nlet f:(r:R)->bool=true\nlet main:()={let r=R.[]\nr.f()}", .tag = .unknown_field },
+        .{ .source = "let R=struct{f:bool=true,}\nlet main:()={let r=R.[]\nr.f()}", .tag = .not_callable },
         .{ .source = "let main:()={let s=\"hi\"\ns.len()}", .tag = .not_callable },
         .{ .source = "let main:()={let a:[]int=[1]\na.len()}", .tag = .not_callable },
         .{ .source = "let main:()={let s=\"hi\"\ns.close()}", .tag = .unsupported_body_expression },
         .{ .source = "let main:()={let a:[]int=[1]\na.close()}", .tag = .unsupported_body_expression },
-        .{ .source = "let R=struct{let f:(r:R)->bool=true\n}\nlet main:()={let r=R[]\nlet f=r.f\n}", .tag = .unknown_field },
+        .{ .source = "let R=struct{let f:(r:R)->bool=true\n}\nlet main:()={let r=R.[]\nlet f=r.f\n}", .tag = .unknown_field },
         .{ .source = "let K=enum{x,let f:(k:K)->bool=true\n}\nlet main:()={let k=K.x\nlet f=k.f\n}", .tag = .unsupported_body_expression },
         .{ .source = "let K=enum{x,let eql:(a:K,b:K)->bool=a==b\n}\nlet S=enum{x,}\nlet main:()={let k=K.x\nk.eql(S.x)}", .tag = .literal_type_mismatch },
-        .{ .source = "let R=struct{@[noreturn]\nlet stop:(r:R)=@panic(\"x\")\n}\nlet main:()={R[].stop()\n@print()}", .tag = .unreachable_code },
-        .{ .source = "let R=struct{@[noreturn]\nlet stop:(r:R)=@panic(\"x\")\n}\n@[noreturn]\nlet main:()={let f=R.stop\nf(R[])}", .tag = .noreturn_completion },
+        .{ .source = "let R=struct{@[noreturn]\nlet stop:(r:R)=@panic(\"x\")\n}\nlet main:()={R.[].stop()\n@print()}", .tag = .unreachable_code },
+        .{ .source = "let R=struct{@[noreturn]\nlet stop:(r:R)=@panic(\"x\")\n}\n@[noreturn]\nlet main:()={let f=R.stop\nf(R.[])}", .tag = .noreturn_completion },
     }) |case| {
         var module = try Module.init(std.testing.allocator, "methods.nov", case.source);
         defer module.deinit();
@@ -6350,14 +6419,14 @@ fn testTypeOfLexicalValues(allocator: std.mem.Allocator) !void {
         \\let n=1
         \\let mut m:u16=2
         \\let a:[]@TypeOf(p)=[p]
-        \\let r:R=R[.n=n]
+        \\let r:R=R.[n=n]
         \\let f:(u8)->u8=(v:u8)->u8 {v}
         \\let n2:@TypeOf(n)=n
         \\let g:@TypeOf(global)=n2
         \\let a2:@TypeOf(a)=a
         \\let r2:@TypeOf(r)=r
         \\let f2:@TypeOf(f)=f
-        \\let b:Box(@TypeOf(p))=Box(@TypeOf(p))[.value=p]
+        \\let b:Box(@TypeOf(p))=Box(@TypeOf(p)).[value=p]
         \\let borrowed=&m
         \\let inspect=(){let x:@TypeOf(m)=3
         \\@println(@TypeOf(m),"{@TypeOf(borrowed)}")}
@@ -6625,7 +6694,7 @@ test "printing compile time types produces canonical string constants" {
         \\@println(int,uint,[]int,S,Alias,E,Box(bool),(int)->bool,void)
         \\@println("{int} {S} {Ints} {Alias}")
         \\show(true)
-        \\let b:B=B[.value=true]
+        \\let b:B=B.[value=true]
         \\b.show()
         \\}
     ;
@@ -6666,7 +6735,7 @@ test "printing imported private hooks never falls back to structural fields" {
                 "@[public]\n",                     if (generic) "let R:(T:type)->type=struct{secret:T,\n" else "let R=struct{secret:string,\n",
                 hook.declaration,                  "}\n@[public]\nlet make:()->",
                 if (generic) "R(string)" else "R", "=",
-                if (generic) "R(string)" else "R", "[.secret=\"secret\"]\n",
+                if (generic) "R(string)" else "R", ".[secret=\"secret\"]\n",
             });
             defer std.testing.allocator.free(library_source);
             for ([_][]const u8{
@@ -6674,7 +6743,7 @@ test "printing imported private hooks never falls back to structural fields" {
                 "@println(\"{lib.make()}\")",
                 "@println([lib.make()])",
                 "@println(\"{[lib.make()]}\")",
-                "@println(Outer[.items=[[lib.make()]]])",
+                "@println(Outer.[items=[[lib.make()]]])",
                 "@println(@as(Message,.item[lib.make()]))",
             }) |expression| {
                 const root_source = try std.mem.concat(std.testing.allocator, u8, &.{
@@ -6738,7 +6807,7 @@ test "printing malformed explicit hooks never falls back" {
         "@[stringify]\nlet toString:(r:R)->bool=true",
         "@[stringify]\nlet toString:(r:R,extra:string)->string=extra",
     }) |hook| {
-        const source = try std.mem.concat(std.testing.allocator, u8, &.{ "let R=struct{\n", hook, "\n}\nlet main:()=@println(R[])" });
+        const source = try std.mem.concat(std.testing.allocator, u8, &.{ "let R=struct{\n", hook, "\n}\nlet main:()=@println(R.[])" });
         defer std.testing.allocator.free(source);
         var module = try Module.init(std.testing.allocator, "bad-print-hook.nov", source);
         defer module.deinit();
@@ -7234,7 +7303,7 @@ test "string scalar indexing has exact rune inference through contexts construct
         \\    @println(sum,bytes[0],branch,matched,looped,a[0][1],s.len)
         \\    let wrapped:U=U.text[s]
         \\    @println(match wrapped {.text=>|v|v[0]})
-        \\    take(inferred)==G(string)[.value=s].byte(i)
+        \\    take(inferred)==G(string).[value=s].byte(i)
         \\}
     ;
     var module = try Module.init(std.testing.allocator, "string-byte.nov", source);
@@ -7349,7 +7418,7 @@ test "string slicing semantic types inference and rejection" {
         \\        false=>view}
         \\    let looped=loop {break s[..]}
         \\    @println(a[0],chosen,matched,looped,match u {.text=>|v|v[..]})
-        \\    G(string)[.value=s].cut()}
+        \\    G(string).[value=s].cut()}
     );
     defer module.deinit();
     errdefer std.debug.print("slice parse: {any}\n", .{module.source.ast.errors});
@@ -8084,25 +8153,25 @@ test "if branches infer bidirectionally and keep separate lexical scopes" {
 test "constructor shorthand diagnoses ordinary names exact types and field spans" {
     const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag, token: []const u8 = "x" };
     for ([_]Case{
-        .{ .source = "let R=struct{x:int=1,}\nlet f:()->R=R[.x]", .tag = .unknown_name },
-        .{ .source = "let R=struct{x:int,}\nlet f:(x:bool)->R=R[.x]", .tag = .expression_type_mismatch },
-        .{ .source = "let R=struct{x:i8,}\nlet f:(x:i16)->R=R[.x]", .tag = .expression_type_mismatch },
-        .{ .source = "let R=struct{y:int,}\nlet f:(x:int)->R=R[.x]", .tag = .unknown_field },
-        .{ .source = "let R=struct{x:int,}\nlet f:(x:int)->R=R[.x,.x=2]", .tag = .duplicate_field },
-        .{ .source = "let R=struct{x:int,}\nlet f:(x:int)->R=R[.x=2,.x]", .tag = .duplicate_field },
-        .{ .source = "let R=struct{x:int,}\nlet x=[]\nlet f:()->R=R[.x]", .tag = .unresolved_value_type },
-        .{ .source = "let R=struct{x:int,}\nlet f:()->R={if true {let x:int=1\n}\nR[.x]}", .tag = .unknown_name },
-        .{ .source = "let R=struct{x:int,let make:(self:@This())->R=R[.x]\n}\n", .tag = .unknown_name },
-        .{ .source = "let R=struct{x:int,}\nlet f:(x:int)->R={let x:int=2\nR[.x]}", .tag = .unsupported_shadowing },
-        .{ .source = "let R=struct{x:int,y:int,}\nlet f:(x:int)->R=R[.x]", .tag = .missing_field, .token = "[" },
-        .{ .source = "let R=struct{x:int,}\nlet f:(a:int)->()->R={let x=&a\n()->R {R[.x]}}", .tag = .unsupported_borrow },
-        .{ .source = "let A=struct{n:int,}\nlet B=struct{n:int,}\nlet R=struct{x:A,}\nlet f:(x:B)->R=R[.x]", .tag = .expression_type_mismatch },
+        .{ .source = "let R=struct{x:int=1,}\nlet f:()->R=R.[x]", .tag = .unknown_name },
+        .{ .source = "let R=struct{x:int,}\nlet f:(x:bool)->R=R.[x]", .tag = .expression_type_mismatch },
+        .{ .source = "let R=struct{x:i8,}\nlet f:(x:i16)->R=R.[x]", .tag = .expression_type_mismatch },
+        .{ .source = "let R=struct{y:int,}\nlet f:(x:int)->R=R.[x]", .tag = .unknown_field },
+        .{ .source = "let R=struct{x:int,}\nlet f:(x:int)->R=R.[x,x=2]", .tag = .duplicate_field },
+        .{ .source = "let R=struct{x:int,}\nlet f:(x:int)->R=R.[x=2,x]", .tag = .duplicate_field },
+        .{ .source = "let R=struct{x:int,}\nlet x=[]\nlet f:()->R=R.[x]", .tag = .unresolved_value_type },
+        .{ .source = "let R=struct{x:int,}\nlet f:()->R={if true {let x:int=1\n}\nR.[x]}", .tag = .unknown_name },
+        .{ .source = "let R=struct{x:int,let make:(self:@This())->R=R.[x]\n}\n", .tag = .unknown_name },
+        .{ .source = "let R=struct{x:int,}\nlet f:(x:int)->R={let x:int=2\nR.[x]}", .tag = .unsupported_shadowing },
+        .{ .source = "let R=struct{x:int,y:int,}\nlet f:(x:int)->R=R.[x]", .tag = .missing_field, .token = "[" },
+        .{ .source = "let R=struct{x:int,}\nlet f:(a:int)->()->R={let x=&a\n()->R {R.[x]}}", .tag = .unsupported_borrow },
+        .{ .source = "let A=struct{n:int,}\nlet B=struct{n:int,}\nlet R=struct{x:A,}\nlet f:(x:B)->R=R.[x]", .tag = .expression_type_mismatch },
         .{ .source = "let K=enum{x,}\nlet U=union{some:K,}\nlet f:()->U=U.some[.x,]", .tag = .invalid_union_constructor, .token = "[" },
         .{ .source = "let K=enum{x,}\nlet U=union{some:K,}\nlet f:()->U=.some[.x=1]", .tag = .invalid_union_constructor, .token = "[" },
         .{ .source = "let K=enum{x,}\nlet U=union{some:K,}\nlet f:()->U=U.some[.x,.x]", .tag = .invalid_union_constructor, .token = "[" },
         .{ .source = "let R=struct{x:int,}\nlet f:(x:int)->R=.x[]", .tag = .invalid_union_constructor, .token = "[" },
-        .{ .source = "let K=enum{x,}\nlet f:()->K=K[.x]", .tag = .not_a_type, .token = "K" },
-        .{ .source = "let R=struct{_:int,}\nlet f:()->R=R[._]", .tag = .unknown_name, .token = "_" },
+        .{ .source = "let K=enum{x,}\nlet f:()->K=K.[x]", .tag = .not_a_type, .token = "K" },
+        .{ .source = "let R=struct{_:int,}\nlet f:()->R=R.[_]", .tag = .unknown_name, .token = "_" },
     }) |case| {
         var module = try Module.init(std.testing.allocator, "shorthand.nov", case.source);
         defer module.deinit();
@@ -8365,7 +8434,7 @@ test "local shadowing reports both declarations and locals do not leak to other 
 test "rune frontend supports scalar boundaries matches printing and borrows" {
     for ([_][]const u8{
         "let Rune = rune\nlet identity: (x: Rune) -> Rune = x\nlet f: () -> rune = {let callback: (rune) -> rune = identity\nlet value = 'é'\ncallback(@as(Rune, value))}",
-        "let R = struct{value: rune = 'é',}\nlet U = union{value: rune,}\nlet f: () -> rune = {let r = R[]\nlet u: U = .value[r.value]\nmatch u {.value => |v| v}}",
+        "let R = struct{value: rune = 'é',}\nlet U = union{value: rune,}\nlet f: () -> rune = {let r = R.[]\nlet u: U = .value[r.value]\nmatch u {.value => |v| v}}",
         "let f: (r: rune) -> rune = match r {'é' | '\\xE9' => '😀'\n_ => r}",
         "let f: () -> bool = {let mut r = 'a'\nr = 'é'\nlet b = &r\nb.* = '😀'\nb.* == '😀'}",
         "let f: () -> rune = {let mut xs: []rune = ['a', 'é']\nxs[0] = '😀'\nlet b = &xs[1]\nb.* = '\\0'\nb.*}",
@@ -8397,7 +8466,7 @@ test "rune frontend specializes standard Option Result and generic struct fields
         \\let fallback: () -> rune = '😀'
         \\let recover: (error: rune) -> rune = error
         \\let run: () -> rune = {
-        \\    let box = Box(rune)[.value = 'é']
+        \\    let box = Box(rune).[value = 'é']
         \\    let option: Option(rune) = .some[box.value]
         \\    let result: Result(rune, rune) = .ok[option.unwrapOr('a')]
         \\    let empty: Option(rune) = .none[]
@@ -8676,12 +8745,12 @@ test "body checking rolls back diagnostics and owned storage on allocation failu
 
 test "iteration record loans respect owner mutability and reject capability escapes" {
     for ([_]struct { body: []const u8, tag: ?Module.Diagnostic.Tag = null }{
-        .{ .body = "let mut a=[R[.inner=Cell[.n=1,.s=\"x\"]]]\nloop &r in a {r.*.inner.n+=2\nr.*.inner.s+=\"!\"\nr.*.inner=Cell[.n=3,.s=\"new\"]\nr.* =R[.inner=Cell[.n=4,.s=\"row\"]]}" },
-        .{ .body = "let a=[R[.inner=Cell[.n=1,.s=\"x\"]]]\nloop &r in a {r.*.inner.n+=2}", .tag = .immutable_assignment },
-        .{ .body = "let mut a=[R[.inner=Cell[.n=1,.s=\"x\"]]]\nloop r in a {r.inner.n=2}", .tag = .immutable_assignment },
-        .{ .body = "let a=[R[.inner=Cell[.n=1,.s=\"x\"]]]\nloop &r in a {let copy=r.*\n@println(copy.inner.n)}" },
-        .{ .body = "let mut a=[R[.inner=Cell[.n=1,.s=\"x\"]]]\nloop &r in a {return &r}", .tag = .unsupported_borrow },
-        .{ .body = "let mut a=[R[.inner=Cell[.n=1,.s=\"x\"]]]\nloop &r in a {let escaped=[&r]\n}", .tag = .unsupported_borrow },
+        .{ .body = "let mut a=[R.[inner=Cell.[n=1,s=\"x\"]]]\nloop &r in a {r.*.inner.n+=2\nr.*.inner.s+=\"!\"\nr.*.inner=Cell.[n=3,s=\"new\"]\nr.* =R.[inner=Cell.[n=4,s=\"row\"]]}" },
+        .{ .body = "let a=[R.[inner=Cell.[n=1,s=\"x\"]]]\nloop &r in a {r.*.inner.n+=2}", .tag = .immutable_assignment },
+        .{ .body = "let mut a=[R.[inner=Cell.[n=1,s=\"x\"]]]\nloop r in a {r.inner.n=2}", .tag = .immutable_assignment },
+        .{ .body = "let a=[R.[inner=Cell.[n=1,s=\"x\"]]]\nloop &r in a {let copy=r.*\n@println(copy.inner.n)}" },
+        .{ .body = "let mut a=[R.[inner=Cell.[n=1,s=\"x\"]]]\nloop &r in a {return &r}", .tag = .unsupported_borrow },
+        .{ .body = "let mut a=[R.[inner=Cell.[n=1,s=\"x\"]]]\nloop &r in a {let escaped=[&r]\n}", .tag = .unsupported_borrow },
     }) |case| {
         const source = try std.fmt.allocPrint(std.testing.allocator, "let Cell=struct{{n:int,s:string,}}\nlet R=struct{{inner:Cell,}}\nlet f:()={{\n{s}\n}}", .{case.body});
         defer std.testing.allocator.free(source);
@@ -8791,8 +8860,8 @@ const iteration_call_prelude =
     \\let main:()={let mut a:[]int=[1,2,3]
     \\    let mutate=(){let loan=&a[1]
     \\        loan.* =9}
-    \\    let r=R[]
-    \\    let g=G(int)[.value=0]
+    \\    let r=R.[]
+    \\    let g=G(int).[value=0]
     \\
 ;
 
@@ -8864,7 +8933,7 @@ test "iteration call protection uses final boxing across backedges and child bod
     }) |case| {
         const body = try std.fmt.allocPrint(
             std.testing.allocator,
-            "let mut a:[]int=[1,2,3]\nlet mut f:()=(){{}}\nlet r=R[]\nlet g=G(int)[.value=0]\nloop x in a {{{s}\n{s}\n@print(x)}}",
+            "let mut a:[]int=[1,2,3]\nlet mut f:()=(){{}}\nlet r=R.[]\nlet g=G(int).[value=0]\nloop x in a {{{s}\n{s}\n@print(x)}}",
             .{ case.call, case.capture },
         );
         defer std.testing.allocator.free(body);
@@ -9043,7 +9112,7 @@ test "static integer borrowing types CFG last use and bounded escapes" {
         for (text) |*byte| if (byte.* == ';') {
             byte.* = '\n';
         };
-        const source = try std.fmt.allocPrint(std.testing.allocator, "let R=struct{{n:int=0,}}\nlet f:(flag:bool)={{let mut x:int=1\nlet mut a=[R[]]\n{s}\n}}", .{text});
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let R=struct{{n:int=0,}}\nlet f:(flag:bool)={{let mut x:int=1\nlet mut a=[R.[]]\n{s}\n}}", .{text});
         defer std.testing.allocator.free(source);
         var module = try Module.init(std.testing.allocator, "integer-borrow.nov", source);
         defer module.deinit();
@@ -9087,7 +9156,7 @@ test "static borrowing structured last use conflicts and bounded escapes" {
         .{ .body = "loop i in 0..3 {let r=&a[0]; r.*.x+=1; @println(i,a.len)}" },
         .{ .body = "let r=&a[0]; loop {r.*.x+=1; break}; @println(a.len)" },
         .{ .body = "let r=&a[0]; loop {if flag {r.*.x+=1; break} else {@println(a.len); return}}; @println(a.len)" },
-        .{ .body = "let r=&a[0]; let independent=[R[]]; let copy=independent; r.*.x=copy[0].x" },
+        .{ .body = "let r=&a[0]; let independent=[R.[]]; let copy=independent; r.*.x=copy[0].x" },
         .{ .body = "let r=&a[0]; loop flag {r.*.x+=1; @println(a.len); break}; @println(a.len)" },
         .{ .body = "let r=&a[0]; loop flag {if flag {r.*.x+=1; @println(a.len); break} else {return}}" },
         .{ .body = "let r=&a[0]; loop flag {r.*.x+=1}; @println(a.len)" },
@@ -9097,41 +9166,41 @@ test "static borrowing structured last use conflicts and bounded escapes" {
         .{ .body = "let r=&a[0]; loop {r.*.x+=1; loop {@println(a.len); break}; if flag {break}}", .diagnostic = .borrow_conflict },
         .{ .body = "let r=&a[0]; loop {a.len==1} {r.*.x+=1}", .diagnostic = .borrow_conflict },
         .{ .body = "let r=&a[0]; loop flag : @println(a.len) {r.*.x+=1}", .diagnostic = .borrow_conflict },
-        .{ .body = "let r=&a[0]; let b=flag and {a=[R[]]; return}; r.*.x=1; @println(b)" },
+        .{ .body = "let r=&a[0]; let b=flag and {a=[R.[]]; return}; r.*.x=1; @println(b)" },
         .{ .body = "let r=&a[0]; let b=flag and {r.*.x=1; true}; @println(a.len,b)" },
         .{ .body = "let r=&a[0]; match flag {true=>r.*.x=1; false=>@println(a.len)}; @println(a.len)" },
         .{ .body = "let r=&a[0]; match flag {true=>r.*.x=1; false=>@println(a.len)}; r.*.x=2", .diagnostic = .borrow_conflict },
         .{ .body = "let r=&a[0]; return r.*", .diagnostic = .expression_type_mismatch },
         .{ .body = "let r=&a[0]; @println(a.len); r.*.x=1", .diagnostic = .borrow_conflict },
         .{ .body = "let r=&a[0]; let b=a; r.*.x=1", .diagnostic = .borrow_conflict },
-        .{ .body = "let r=&a[0]; a=[R[]]; r.*.x=1", .diagnostic = .borrow_conflict },
-        .{ .body = "let r=&a[0]; a+=[R[]]; r.*.x=1", .diagnostic = .borrow_conflict },
-        .{ .body = "let r=&a[0]; a[0]=R[]; r.*.x=1", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[0]; a=[R.[]]; r.*.x=1", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[0]; a+=[R.[]]; r.*.x=1", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[0]; a[0]=R.[]; r.*.x=1", .diagnostic = .borrow_conflict },
         .{ .body = "let r=&a[0]; let s=&a[-1]; r.*.x=1; s.*.x=2", .diagnostic = .borrow_conflict },
-        .{ .body = "let r=&a[0]; r.*.x+={a=[R[]]; 1}", .diagnostic = .borrow_conflict },
-        .{ .body = "let r=&a[0]; r.*.x={a=[R[]]; 1}", .diagnostic = .borrow_conflict },
-        .{ .body = "let r=&a[{a=[R[]]; 0}]; r.*.x=1", .diagnostic = .borrow_conflict },
-        .{ .body = "let r=&a[{a=[R[]]; return}]; r.*.x=1", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[0]; r.*.x+={a=[R.[]]; 1}", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[0]; r.*.x={a=[R.[]]; 1}", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[{a=[R.[]]; 0}]; r.*.x=1", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[{a=[R.[]]; return}]; r.*.x=1", .diagnostic = .borrow_conflict },
         .{ .body = "let r=&a[{@println(a.len); 0}]; r.*.x=1", .diagnostic = .borrow_conflict },
         .{ .body = "let r=&a[0]; loop {r.*.x+=1; @println(a.len); if flag {break}}", .diagnostic = .borrow_conflict },
         .{ .body = "let r=&a[0]; loop {r.*.x+=1; if flag {@println(a.len); continue} else {break}}", .diagnostic = .borrow_conflict },
         .{ .body = "let r=&a[0]; loop {if flag {@println(a.len); continue} else {r.*.x+=1; break}}", .diagnostic = .borrow_conflict },
-        .{ .body = "let r=&a[0]; let b=flag and {a=[R[]]; true}; r.*.x=1; @println(b)", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[0]; let b=flag and {a=[R.[]]; true}; r.*.x=1; @println(b)", .diagnostic = .borrow_conflict },
         .{ .body = "let r=&a[0]; let alias=r.*; alias.x=1", .diagnostic = .immutable_assignment },
         .{ .body = "let r=&a[0]; consume(r.*)" },
         .{ .body = "let r=&a[0]; let b:[]R=[r.*,r.*]" },
         .{ .body = "let r=&a[0]; let b={r.*}" },
         .{ .body = "let r=&a[0]; let s=&r.x", .diagnostic = .unsupported_borrow },
-        .{ .body = "let r=&a[0]; r.* =R[]" },
-        .{ .body = "let immutable=[R[]]; let r=&immutable[0]; @println(r.*.x)" },
-        .{ .body = "let immutable=[R[]]; let r=&immutable[0]; r.*.x=1", .diagnostic = .immutable_assignment },
+        .{ .body = "let r=&a[0]; r.* =R.[]" },
+        .{ .body = "let immutable=[R.[]]; let r=&immutable[0]; @println(r.*.x)" },
+        .{ .body = "let immutable=[R.[]]; let r=&immutable[0]; r.*.x=1", .diagnostic = .immutable_assignment },
     }) |case| {
         const body_text = try std.testing.allocator.dupe(u8, case.body);
         defer std.testing.allocator.free(body_text);
         for (body_text) |*byte| if (byte.* == 59) {
             byte.* = 10;
         };
-        const source = try std.fmt.allocPrint(std.testing.allocator, "let R=struct{{x:int=0,}}\nlet consume:(r:R)={{}}\nlet f:(flag:bool)={{let mut a=[R[]]\n{s}\n}}", .{body_text});
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let R=struct{{x:int=0,}}\nlet consume:(r:R)={{}}\nlet f:(flag:bool)={{let mut a=[R.[]]\n{s}\n}}", .{body_text});
         defer std.testing.allocator.free(source);
         var module = try Module.init(std.testing.allocator, "borrow.nov", source);
         defer module.deinit();
@@ -9158,7 +9227,7 @@ test "general borrowing readonly parameters exact types conflicts and unsupporte
         .{ .ty = "int", .init = "@as(int,1)", .replacement = "2" },
         .{ .ty = "string", .init = "\"a\"+\"b\"", .replacement = "\"c\"" },
         .{ .ty = "E", .init = "E.a", .replacement = ".b" },
-        .{ .ty = "R", .init = "R[.s=\"a\"]", .replacement = "R[.s=\"b\"]" },
+        .{ .ty = "R", .init = "R.[s=\"a\"]", .replacement = "R.[s=\"b\"]" },
         .{ .ty = "U", .init = "U.some[\"a\"]", .replacement = ".none[]" },
         .{ .ty = "G(string)", .init = "G(string).some[\"a\"]", .replacement = ".none[]" },
         .{ .ty = "[]int", .init = "[@as(int,1)]", .replacement = "[2]" },
@@ -9207,13 +9276,13 @@ test "general borrowing rejects void nonlocal capabilities wrong exact types and
         .{ .source = "let x=true\nlet f:()={let r=&x\n}", .diagnostic = .unsupported_borrow },
         .{ .source = "let f:()={let mut x=true\nlet r=&x\nr.* =1}", .diagnostic = .literal_type_mismatch },
         .{ .source = "let f:()={let mut x:int=1\nlet r=&x\nr.* =@as(i8,2)}", .diagnostic = .expression_type_mismatch },
-        .{ .source = "let R=struct{n:int,}\nlet S=struct{n:int,}\nlet f:()={let mut x=R[.n=1]\nlet r=&x\nr.* =S[.n=2]}", .diagnostic = .expression_type_mismatch },
+        .{ .source = "let R=struct{n:int,}\nlet S=struct{n:int,}\nlet f:()={let mut x=R.[n=1]\nlet r=&x\nr.* =S.[n=2]}", .diagnostic = .expression_type_mismatch },
         .{ .source = "let f:()={let mut x=true\nlet r=&x\nr.* +=true}", .diagnostic = .operator_not_supported },
         .{ .source = "let f:()={let mut x=\"a\"\nlet r=&x\nr.* -=\"b\"}", .diagnostic = .operator_not_supported },
         .{ .source = "let f:()={let x=[true]\nlet r=&x[0]\nr.* =false}", .diagnostic = .immutable_assignment },
         .{ .source = "let f:(x:[]string)={let r=&x[0]\nr.* +=\"b\"}", .diagnostic = .immutable_assignment },
         .{ .source = "let R=struct{n:int=0,}\nlet f:(x:R)={let r=&x\nr.*.n=1}", .diagnostic = .immutable_assignment },
-        .{ .source = "let R=struct{n:int=0,}\nlet f:()={let mut x=R[]\nlet r=&x\nx.n=1\n@println(r.*.n)}", .diagnostic = .borrow_conflict },
+        .{ .source = "let R=struct{n:int=0,}\nlet f:()={let mut x=R.[]\nlet r=&x\nx.n=1\n@println(r.*.n)}", .diagnostic = .borrow_conflict },
         .{ .source = "let f:(x:bool)={let r=&x\n@println(x)\n@println(r.*)}", .diagnostic = .borrow_conflict },
         .{ .source = "let f:()={let x=true\nlet r=&x\n@println(x)\n@println(r.*)}", .diagnostic = .borrow_conflict },
         .{ .source = "let f:()={let mut x=[true]\nlet r=&x\nr.*[0]={x=[false]\nreturn}}", .diagnostic = .borrow_conflict },
@@ -9243,7 +9312,7 @@ fn testExplicitLocalReferences(allocator: std.mem.Allocator) !void {
         \\let readonly:&u8=&a
         \\let typed:@TypeOf(p)=&b
         \\@println(readonly.*,typed.*,@TypeOf(p),@TypeOf(readonly))
-        \\let mut record=R[]
+        \\let mut record=R.[]
         \\let r=&record
         \\r.*.n=4
         \\@println(r.*.get())
@@ -9718,7 +9787,7 @@ test "general borrowing reserves record owners through terminal field assignment
                 for ([_][]const u8{ "return .none[]", "break", "continue", "@panic(\"stop\")", "stop().!" }) |exit| {
                     for ([_]bool{ true, false }) |conflicts| {
                         const owner = if (conflicts) "x" else "independent";
-                        const source = try std.fmt.allocPrint(std.testing.allocator, "let I=struct{{n:int=0,}}\nlet R=struct{{n:int=0,inner:I,}}\nlet O:(T:type)->type=union{{some:T,none,}}\nlet stop:()->O(int)=.none[]\nlet f:(flag:bool)->O(int)={{let mut x=R[.inner=I[]]\nlet mut independent=R[.inner=I[]]\nlet r=&x\nloop {{if flag {{r.*.{s}{s}{{{s}.{s}{s}2\n{s}}}}} else {{break}}}}\n.some[0]}}", .{ field, outer_op, owner, field, inner_op, exit });
+                        const source = try std.fmt.allocPrint(std.testing.allocator, "let I=struct{{n:int=0,}}\nlet R=struct{{n:int=0,inner:I,}}\nlet O:(T:type)->type=union{{some:T,none,}}\nlet stop:()->O(int)=.none[]\nlet f:(flag:bool)->O(int)={{let mut x=R.[inner=I.[]]\nlet mut independent=R.[inner=I.[]]\nlet r=&x\nloop {{if flag {{r.*.{s}{s}{{{s}.{s}{s}2\n{s}}}}} else {{break}}}}\n.some[0]}}", .{ field, outer_op, owner, field, inner_op, exit });
                         defer std.testing.allocator.free(source);
                         var module = try Module.init(std.testing.allocator, "terminal-field-reservation.nov", source);
                         defer module.deinit();

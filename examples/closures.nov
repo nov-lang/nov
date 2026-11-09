@@ -96,7 +96,7 @@ let array_copies = () {
 
 @[test]
 let generic_method = () {
-    let box = Box(string)[ .value = "captured" ]
+    let box = Box(string).[ value = "captured" ]
     let get = box.bind()
     @assert(get() == "captured")
 }

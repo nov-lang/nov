@@ -253,11 +253,13 @@ const DefaultPrintability = struct {
 };
 
 pub const Field = struct { name: []const u8, ty: TypeId, span: Span, default: ?ConstId = null };
-/// Nominal by-value layout. Tagged layouts have one active ordinary value payload.
+/// By-value layout. Tagged layouts have one active ordinary value payload.
 pub const Record = struct {
     source: Source.Id = @fromBackingInt(@intCast(0)),
     identity: u32,
     fields: []const Field,
+    /// Anonymous keys are ordered field names/types, independent of source identity.
+    anonymous: enum { none, named, positional } = .none,
     public: bool = false,
     tagged: bool = false,
     /// Empty for ordinary aggregates; canonical arguments distinguish nominal instances.
@@ -424,6 +426,7 @@ pub fn getTypeFormatting(self: *const Ir, ty: TypeId) ?TypeFormatting {
 fn validateTypeFormatting(self: *const Ir, entry: TypeFormatting) VerifyError!void {
     const ty = self.getType(entry.ty) orelse return error.InvalidTypeId;
     if (ty != .record and ty != .enumeration) return error.InvalidTypeFormatting;
+    if (ty == .record and ty.record.anonymous != .none) return error.InvalidTypeFormatting;
     if (entry.display_name.len == 0 or std.mem.indexOfScalar(u8, entry.display_name, 0) != null) return error.InvalidTypeFormatting;
     if (entry.formatter) |id| {
         const function = self.getFunction(id) orelse return error.InvalidFunctionId;
@@ -571,7 +574,7 @@ fn freeFields(self: *Ir, fields: []const Field) void {
 
 pub fn setRecordFields(self: *Ir, id: TypeId, fields: []const Field) InternError!void {
     const ty = self.getType(id) orelse return error.InvalidTypeId;
-    if (ty != .record) return error.InvalidTypeId;
+    if (ty != .record or ty.record.anonymous != .none) return error.InvalidTypeId;
     try self.validateType(.{ .record = .{ .source = ty.record.source, .identity = ty.record.identity, .tagged = ty.record.tagged, .type_args = ty.record.type_args, .fields = fields } }, self.types.items.len);
     const owned = try self.allocator.dupe(Field, fields);
     var copied: usize = 0;
@@ -587,7 +590,48 @@ pub fn setRecordFields(self: *Ir, id: TypeId, fields: []const Field) InternError
     self.types.items[@backingInt(id)].record.fields = owned;
 }
 
+/// Intern a complete structural layout. Names are owned; spans are validated but
+/// not retained. Positional input names are ignored and replaced by decimal indices.
+/// No pool entry is published on validation or allocation failure.
+pub fn internAnonymousRecord(self: *Ir, fields: []const Field, positional: bool) BuildError!TypeId {
+    const owned = try self.allocator.dupe(Field, fields);
+    var copied: usize = 0;
+    errdefer {
+        for (owned[0..copied]) |field| self.allocator.free(field.name);
+        self.allocator.free(owned);
+    }
+    for (owned, 0..) |*field, i| {
+        try self.validateSpan(field.span);
+        field.name = if (positional)
+            try std.fmt.allocPrint(self.allocator, "{d}", .{i})
+        else
+            try self.allocator.dupe(u8, field.name);
+        copied += 1;
+        field.span = .{ .start = 0, .end = 0 };
+    }
+    const ty: Type = .{ .record = .{
+        .identity = 0,
+        .fields = owned,
+        .anonymous = if (positional) .positional else .named,
+    } };
+    try self.validateType(ty, self.types.items.len);
+    for (self.types.items, 0..) |existing, i| {
+        if (!typeEql(existing, ty)) continue;
+        self.freeFields(owned);
+        return @fromBackingInt(@intCast(i));
+    }
+    if (self.types.items.len == std.math.maxInt(u32)) return error.TooManyEntries;
+    try self.types.ensureUnusedCapacity(self.allocator, 1);
+    const id: TypeId = @fromBackingInt(@intCast(self.types.items.len));
+    self.types.appendAssumeCapacity(ty);
+    errdefer self.types.items.len -= 1;
+    if (try self.recordLayoutIssue()) |issue| return if (issue.cycle) error.CyclicRecordLayout else error.RecordNestingLimit;
+    return id;
+}
+
 pub fn internType(self: *Ir, ty: Type) InternError!TypeId {
+    // Anonymous records must be published complete, never as nominal placeholders.
+    if (ty == .record and ty.record.anonymous != .none) return error.InvalidTypeId;
     try self.validateType(ty, self.types.items.len);
     for (self.types.items, 0..) |existing, i| {
         if (typeEql(existing, ty)) {
@@ -1466,9 +1510,18 @@ fn validateType(self: *const Ir, ty: Type, before: usize) ValidationError!void {
             }
         },
         .record => |record| {
+            if (record.anonymous != .none and (record.tagged or record.public or record.type_args.len != 0 or record.instance_state != .complete or record.methods_published)) return error.InvalidTypeId;
             for (record.type_args) |arg| if (@backingInt(arg) >= before) return error.InvalidTypeId;
             for (record.fields, 0..) |field, i| {
                 if (@backingInt(field.ty) >= self.types.items.len) return error.InvalidTypeId;
+                if (record.anonymous != .none) {
+                    if (@backingInt(field.ty) >= before or field.default != null) return error.InvalidTypeId;
+                    if (record.anonymous == .positional) {
+                        var buffer: [20]u8 = undefined;
+                        const name = std.fmt.bufPrint(&buffer, "{d}", .{i}) catch unreachable;
+                        if (!std.mem.eql(u8, field.name, name)) return error.InvalidTypeId;
+                    }
+                }
                 const ft = self.getType(field.ty).?;
                 if (!(if (record.tagged) isUnionPayload(ft) else isRecordField(ft))) return error.InvalidArrayElement;
                 if (record.tagged and field.default != null) return error.InvalidTypeId;
@@ -1647,13 +1700,168 @@ fn typeEql(a: Type, b: Type) bool {
         .enumeration => |enumeration| enumeration.source == b.enumeration.source and enumeration.identity == b.enumeration.identity,
         .integer => |integer| std.meta.eql(integer, b.integer),
         .float => |bits| bits == b.float,
-        .record => |record| record.source == b.record.source and record.identity == b.record.identity and record.tagged == b.record.tagged and std.mem.eql(TypeId, record.type_args, b.record.type_args),
+        .record => |record| blk: {
+            if (record.anonymous != b.record.anonymous) break :blk false;
+            if (record.anonymous != .none) {
+                if (record.fields.len != b.record.fields.len) break :blk false;
+                for (record.fields, b.record.fields) |left, right| {
+                    if (left.ty != right.ty or !std.mem.eql(u8, left.name, right.name)) break :blk false;
+                }
+                break :blk true;
+            }
+            break :blk record.source == b.record.source and record.identity == b.record.identity and record.tagged == b.record.tagged and std.mem.eql(TypeId, record.type_args, b.record.type_args);
+        },
         .range => |element| element == b.range,
         .array => |element| element == b.array,
         .reference => |reference| reference.child == b.reference.child and reference.mutable == b.reference.mutable,
         .function => |function| function.result == b.function.result and
             std.mem.eql(TypeId, function.params, b.function.params),
     };
+}
+
+fn testAnonymousRecordOwnership(allocator: std.mem.Allocator) !void {
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    try ir.source_lengths.appendSlice(allocator, &.{ 10, 20 });
+    const integer = try ir.internType(.{ .integer = .{ .bits = 64, .signedness = .signed } });
+    const boolean = try ir.internType(.boolean);
+    const name = try allocator.dupe(u8, "arbitrary .[]\x00\"\\ name");
+    defer allocator.free(name);
+    const count = ir.types.items.len;
+    const named = ir.internAnonymousRecord(&.{.{ .name = name, .ty = integer, .span = .{ .start = 1, .end = 2 } }}, false) catch |err| {
+        try std.testing.expectEqual(count, ir.types.items.len);
+        try std.testing.expectEqual(Type.boolean, ir.getType(boolean).?);
+        return err;
+    };
+    try std.testing.expect(ir.getType(named).?.record.fields[0].name.ptr != name.ptr);
+    try std.testing.expectEqual(named, try ir.internAnonymousRecord(&.{.{ .name = name, .ty = integer, .span = .{ .source = @fromBackingInt(1), .start = 10, .end = 20 } }}, false));
+    try std.testing.expect(std.meta.eql(ir.getType(named).?.record.fields[0].span, Span{ .start = 0, .end = 0 }));
+    const nominal = try ir.internType(.{ .record = .{ .identity = 0, .fields = &.{} } });
+    try ir.setRecordFields(nominal, &.{.{ .name = name, .ty = integer, .span = .{ .start = 0, .end = 0 } }});
+    try std.testing.expect(nominal != named);
+    const positional = try ir.internAnonymousRecord(&.{ .{ .name = name, .ty = integer, .span = .{ .start = 0, .end = 0 } }, .{ .name = name, .ty = boolean, .span = .{ .start = 0, .end = 0 } } }, true);
+    try std.testing.expectEqualStrings("0", ir.getType(positional).?.record.fields[0].name);
+    try std.testing.expectEqualStrings("1", ir.getType(positional).?.record.fields[1].name);
+    const numeric_named = try ir.internAnonymousRecord(ir.getType(positional).?.record.fields, false);
+    try std.testing.expect(numeric_named != positional);
+    const reordered = try ir.internAnonymousRecord(&.{ ir.getType(numeric_named).?.record.fields[1], ir.getType(numeric_named).?.record.fields[0] }, false);
+    try std.testing.expect(reordered != numeric_named);
+    const changed = try ir.internAnonymousRecord(&.{.{ .name = name, .ty = boolean, .span = .{ .start = 0, .end = 0 } }}, false);
+    try std.testing.expect(changed != named);
+    const nested = try ir.internAnonymousRecord(&.{.{ .name = "child", .ty = positional, .span = .{ .start = 0, .end = 0 } }}, false);
+    _ = try ir.internType(.{ .array = nested });
+    try std.testing.expect(try ir.internAnonymousRecord(&.{}, false) != try ir.internAnonymousRecord(&.{}, true));
+    try ir.verify();
+}
+
+test "anonymous record canonical ordered source free shapes owned names and every OOM" {
+    try testAnonymousRecordOwnership(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testAnonymousRecordOwnership, .{});
+}
+
+test "anonymous records reject placeholders defaults bad spans metadata and forged graphs" {
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    const span: Span = .{ .start = 0, .end = 0 };
+    const integer = try ir.internType(.{ .integer = .{ .bits = 64, .signedness = .signed } });
+    const unit = try ir.internType(.void);
+    const reference = try ir.internType(.{ .reference = .{ .child = integer, .mutable = false } });
+    const one = try ir.internConstant(.{ .ty = integer, .value = .{ .signed_integer = 1 } });
+    const count = ir.types.items.len;
+    try std.testing.expectError(error.InvalidTypeId, ir.internType(.{ .record = .{ .identity = 0, .fields = &.{}, .anonymous = .named } }));
+    for ([_]TypeId{ unit, reference }) |ty| try std.testing.expectError(error.InvalidArrayElement, ir.internAnonymousRecord(&.{.{ .name = "a", .ty = ty, .span = span }}, false));
+    try std.testing.expectError(error.InvalidTypeId, ir.internAnonymousRecord(&.{.{ .name = "a", .ty = integer, .span = span, .default = one }}, false));
+    try std.testing.expectError(error.InvalidTypeId, ir.internAnonymousRecord(&.{ .{ .name = "a", .ty = integer, .span = span }, .{ .name = "a", .ty = integer, .span = span } }, false));
+    try std.testing.expectError(error.InvalidTypeId, ir.internAnonymousRecord(&.{.{ .name = "", .ty = integer, .span = span }}, false));
+    for ([_]Span{ .{ .start = 1, .end = 0 }, .{ .start = 0, .end = 1 }, .{ .source = @fromBackingInt(1), .start = 0, .end = 0 } }) |bad| {
+        try std.testing.expectError(error.InvalidSourceSpan, ir.internAnonymousRecord(&.{.{ .name = "a", .ty = integer, .span = bad }}, false));
+    }
+    try std.testing.expectEqual(count, ir.types.items.len);
+    const id = try ir.internAnonymousRecord(&.{.{ .name = "a", .ty = integer, .span = span }}, false);
+    try std.testing.expectError(error.InvalidTypeId, ir.setRecordFields(id, &.{}));
+    try std.testing.expectError(error.InvalidTypeFormatting, ir.setTypeFormatting(id, "A", null));
+    const record = &ir.types.items[@backingInt(id)].record;
+    record.tagged = true;
+    try std.testing.expectError(error.InvalidTypeId, ir.verify());
+    record.tagged = false;
+    record.methods_published = true;
+    try std.testing.expectError(error.InvalidTypeId, ir.verify());
+    record.methods_published = false;
+    record.anonymous = .positional;
+    try std.testing.expectError(error.InvalidTypeId, ir.verify());
+    record.anonymous = .named;
+    const field = &@constCast(record.fields)[0];
+    field.span.end = 1;
+    try std.testing.expectError(error.InvalidTypeId, ir.verify());
+    field.span = span;
+    field.ty = id;
+    try std.testing.expectError(error.InvalidTypeId, ir.verify());
+    field.ty = integer;
+    try ir.verify();
+    const duplicate = try ir.internType(.{ .record = .{ .identity = 99, .fields = &.{} } });
+    try ir.setRecordFields(duplicate, ir.getType(id).?.record.fields);
+    ir.types.items[@backingInt(duplicate)].record.anonymous = .named;
+    try std.testing.expectError(error.NonCanonicalType, ir.verify());
+    ir.types.items[@backingInt(duplicate)].record.anonymous = .none;
+    const signature = try ir.internType(.{ .function = .{ .params = &.{}, .result = id } });
+    const function = try ir.addFunction("bad", signature, span);
+    try std.testing.expectError(error.InvalidOperation, ir.setFunctionBody(function, &.{.{ .ty = id, .span = span, .op = .{ .record_init = &.{} } }}, @fromBackingInt(0)));
+    const void_constant = try ir.internConstant(.{ .ty = unit, .value = .void });
+    try std.testing.expectError(error.OperandTypeMismatch, ir.setFunctionBody(function, &.{ .{ .ty = unit, .span = span, .op = .{ .constant = void_constant } }, .{ .ty = id, .span = span, .op = .{ .record_init = &.{@fromBackingInt(0)} } } }, @fromBackingInt(1)));
+}
+
+test "anonymous record fields accept every storable type without adding equality or printing" {
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    const span: Span = .{ .start = 0, .end = 0 };
+    const unit = try ir.internType(.void);
+    const integer = try ir.internType(.{ .integer = .{ .bits = 64, .signedness = .signed } });
+    const boolean = try ir.internType(.boolean);
+    const rune = try ir.internType(.rune);
+    const float = try ir.internType(.{ .float = 64 });
+    const string = try ir.internType(.string);
+    const enumeration = try ir.internType(.{ .enumeration = .{ .identity = 1, .name = "E", .tags = &.{.{ .name = "tag", .span = span }} } });
+    const nominal = try ir.internType(.{ .record = .{ .identity = 2, .fields = &.{} } });
+    const tagged = try ir.internType(.{ .record = .{ .identity = 3, .tagged = true, .fields = &.{} } });
+    try ir.setRecordFields(tagged, &.{.{ .name = "none", .ty = unit, .span = span }});
+    const function = try ir.internType(.{ .function = .{ .params = &.{integer}, .result = boolean } });
+    const array = try ir.internType(.{ .array = string });
+    const range = try ir.internType(.{ .range = integer });
+    const anonymous = try ir.internAnonymousRecord(&.{}, false);
+    const storables = [_]TypeId{ integer, boolean, rune, float, string, enumeration, nominal, tagged, function, array, range, anonymous };
+    var fields: [storables.len]Field = undefined;
+    for (&fields, storables) |*field, ty| field.* = .{ .name = "", .ty = ty, .span = span };
+    const positional = try ir.internAnonymousRecord(&fields, true);
+    try std.testing.expectEqualStrings("10", ir.getType(positional).?.record.fields[10].name);
+    try std.testing.expectEqualStrings("11", ir.getType(positional).?.record.fields[11].name);
+    const named = try ir.internAnonymousRecord(ir.getType(positional).?.record.fields, false);
+    var printability: DefaultPrintability = .{};
+    defer printability.deinit(ir.allocator);
+    for ([_]TypeId{ named, positional }) |ty| {
+        try std.testing.expect(isManaged(ir.getType(ty).?));
+        try std.testing.expect(!hasEquality(ir.getType(ty).?));
+        try std.testing.expect(!try printability.check(&ir, ty));
+        try std.testing.expect(try ir.needsArrayCopy(ty));
+        _ = try ir.internType(.{ .array = ty });
+    }
+    try ir.verify();
+}
+
+test "anonymous record layout publication rejects excessive depth and later nominal cycles" {
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    const span: Span = .{ .start = 0, .end = 0 };
+    const nominal = try ir.internType(.{ .record = .{ .identity = 123, .fields = &.{} } });
+    const anonymous = try ir.internAnonymousRecord(&.{.{ .name = "n", .ty = nominal, .span = span }}, false);
+    try ir.setRecordFields(nominal, &.{.{ .name = "a", .ty = anonymous, .span = span }});
+    try std.testing.expectError(error.CyclicRecordLayout, ir.verify());
+    try ir.setRecordFields(nominal, &.{});
+    var child = nominal;
+    for (1..max_record_depth) |_| child = try ir.internAnonymousRecord(&.{.{ .name = "child", .ty = child, .span = span }}, false);
+    const count = ir.types.items.len;
+    try std.testing.expectError(error.RecordNestingLimit, ir.internAnonymousRecord(&.{.{ .name = "child", .ty = child, .span = span }}, false));
+    try std.testing.expectEqual(count, ir.types.items.len);
+    try ir.verify();
 }
 
 fn testLocalReferenceDescriptors(allocator: std.mem.Allocator) !void {

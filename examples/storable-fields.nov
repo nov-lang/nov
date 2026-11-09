@@ -43,17 +43,17 @@ let make: () -> Processor = {
     let run = increment
     let outcome: std.Result([]int, string) = .ok[[1, 2]]
     let interval = 1..4
-    Processor[ .run, .outcome, .interval ]
+    Processor.[ run, outcome, interval ]
 }
 let counter: () -> Processor = {
     let mut count: int = 0
-    Processor[
-        .run = (step: int) -> int {
+    Processor.[
+        run = (step: int) -> int {
             count += step
             count
         },
-        .outcome = .err["counter"],
-        .interval = 0..0
+        outcome = .err["counter"],
+        interval = 0..0
     ]
 }
 let values: (report: Report) -> []int = report.outcome.unwrapOr([])
@@ -62,20 +62,20 @@ let main: () = {
     let processor = make()
     @println("Called:", processor.run(4), processor.apply(4))
     @println("Custom:", processor)
-    let report = Report[ .outcome = .ok[[1, 2]] ]
+    let report = Report.[ outcome = .ok[[1, 2]] ]
     @println("Report:", report)
 }
 
 @[test]
 let constructors_updates_and_nested_paths: () = {
-    let mut box = Box(Processor)[ .value = make() ]
+    let mut box = Box(Processor).[ value = make() ]
     let saved = box
     box.value.run = double
     box.value.outcome = .err["changed"]
     box.value.interval = 8..=9
     @assert(box.value.run(3) == 6 and saved.value.run(3) == 4)
     @assert(box.get().outcome.isErr() and saved.get().outcome.isOk())
-    box.value = Processor[ .run = increment, .outcome = .ok[[7]], .interval = 0..1 ]
+    box.value = Processor.[ run = increment, outcome = .ok[[7]], interval = 0..1 ]
     @assert(box.value.apply(7) == 8)
     @assert(saved.value.outcome.unwrapOr([])[0] == 1)
 }
@@ -83,7 +83,7 @@ let constructors_updates_and_nested_paths: () = {
 @[test]
 let union_field_arrays_copy_across_calls: () = {
     let mut source: []int = [1, 2]
-    let mut report = Report[ .outcome = .ok[source] ]
+    let mut report = Report.[ outcome = .ok[source] ]
     let saved = report
     let returned = reportEcho(report)
     source[0] = 90
@@ -107,7 +107,7 @@ let escaping_closures_aliases_and_snapshots: () = {
     let mut owner = counter()
     let saved = owner
     let alias = saved.run
-    let roots = [Box(Processor)[ .value = echo(saved) ]]
+    let roots = [Box(Processor).[ value = echo(saved) ]]
     owner = make()
     let mut pressure: [][]int = []
     loop n in @as(int, 0)..256 {
@@ -118,12 +118,12 @@ let escaping_closures_aliases_and_snapshots: () = {
     @assert(counter().run(1) == 1)
     let mut items: []int = [2]
     let snapshot = items
-    let captured = Processor[
-        .run = (n: int) -> int {
+    let captured = Processor.[
+        run = (n: int) -> int {
             snapshot[0] + n
         },
-        .outcome = .ok[items],
-        .interval = 0..0
+        outcome = .ok[items],
+        interval = 0..0
     ]
     items[0] = 20
     let later = echo(captured)
@@ -160,7 +160,7 @@ let direct_computed_pipe_and_callee_order: () = {
     let add: (p: &mut int, amount: int) = {
         p.* += amount
     }
-    let tools = Tools[ .callback = add ]
+    let tools = Tools.[ callback = add ]
     let forward: (p: &mut int) = tools.callback(p, 2)
     let mut number: int = 1
     tools.callback(&number, 3)
@@ -194,7 +194,7 @@ let range_fields_reloop_and_inclusive_max: () = {
     }
 
     let signedMax: int = 9223372036854775807
-    let edge = Signed[ .interval = signedMax..=signedMax ]
+    let edge = Signed.[ interval = signedMax..=signedMax ]
     loop n in edge.interval {
         @assert(n == signedMax)
         count += 1
@@ -204,11 +204,11 @@ let range_fields_reloop_and_inclusive_max: () = {
 
 @[test]
 let generic_fields_methods_and_printing: () = {
-    let result = Box(std.Result([]int, string))[ .value = .ok[[4]] ]
+    let result = Box(std.Result([]int, string)).[ value = .ok[[4]] ]
     @assert(result.get().unwrapOr([])[0] == 4)
-    let function = Box((int) -> int)[ .value = increment ]
+    let function = Box((int) -> int).[ value = increment ]
     @assert(function.get()(5) == 6 and function.value(6) == 7)
-    let ranges = Box(@TypeOf(0..10))[ .value = 2..4 ]
+    let ranges = Box(@TypeOf(0..10)).[ value = 2..4 ]
     let mut sum: uint = 0
     loop n in ranges.get() {
         sum += n
@@ -216,6 +216,6 @@ let generic_fields_methods_and_printing: () = {
     @assert(sum == 5)
     let processor = make()
     @assert("{processor}" == "Processor(4)")
-    let report = Report[ .outcome = .ok[[1, 2]] ]
+    let report = Report.[ outcome = .ok[[1, 2]] ]
     @assert("{report}" == "Report[ outcome: Result([]i64, string).ok[[1, 2]] ]")
 }

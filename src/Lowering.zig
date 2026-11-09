@@ -300,17 +300,17 @@ test "generic structs reject unsupported fields inexact defaults constructors an
         .{ .source = "let G:(T:type)->type=struct{items:[]T,}\nlet Bad=G(void)", .tag = .unsupported_type },
         .{ .source = "let G:(T:type)->type=struct{value:T=true,}\nlet Bad=G(int)", .tag = .literal_type_mismatch },
         .{ .source = "let G:(T:type)->type=struct{value:T=256,}\nlet Bad=G(u8)", .tag = .literal_out_of_range },
-        .{ .source = "let G:(T:type)->type=struct{value:T=Box(int)[.value=1],}\nlet Bad=G(Box(int))", .tag = .invalid_field_default },
+        .{ .source = "let G:(T:type)->type=struct{value:T=Box(int).[value=1],}\nlet Bad=G(Box(int))", .tag = .invalid_field_default },
         .{ .source = "let G:(T:type)->type=struct{value:T=unknown,}\nlet Bad=G(int)", .tag = .invalid_field_default },
-        .{ .source = "let f:()={let x=Box(int)[.value=true]\n}", .tag = .literal_type_mismatch },
-        .{ .source = "let f:()={let x=Box(int)[]\n}", .tag = .missing_field },
-        .{ .source = "let f:()={let x=Box(int)[.other=1]\n}", .tag = .unknown_field },
-        .{ .source = "let f:()={let x=Box(int)[.value=1,.value=2]\n}", .tag = .duplicate_field },
+        .{ .source = "let f:()={let x=Box(int).[value=true]\n}", .tag = .literal_type_mismatch },
+        .{ .source = "let f:()={let x=Box(int).[]\n}", .tag = .missing_field },
+        .{ .source = "let f:()={let x=Box(int).[other=1]\n}", .tag = .unknown_field },
+        .{ .source = "let f:()={let x=Box(int).[value=1,value=2]\n}", .tag = .duplicate_field },
         .{ .source = "let f:(x:Box(int))->Box(bool)=x", .tag = .expression_type_mismatch },
         .{ .source = "let Other:(T:type)->type=struct{value:T,}\nlet f:(x:Box(int))->Other(int)=x", .tag = .expression_type_mismatch },
         .{ .source = "let f:(x:Box(bool))->int=Box(int).get(x)", .tag = .expression_type_mismatch },
         .{ .source = "let f:(x:Box(int))={x.value=2\n}", .tag = .immutable_assignment },
-        .{ .source = "let f:()={let x=Box(int)[.value=1]\nx.value=2\n}", .tag = .immutable_assignment },
+        .{ .source = "let f:()={let x=Box(int).[value=1]\nx.value=2\n}", .tag = .immutable_assignment },
         .{ .source = "let G:(T:type)->type=struct{value:T,\nlet bad:()->T={let x:T=true\nx}\n}\nlet f:()->int=G(int).bad()", .tag = .literal_type_mismatch },
         .{ .source = "let G:(T:type)->type=struct{value:T,\nlet bad:()->T=true\n}\nlet f:()->int=G(int).bad()", .tag = .literal_type_mismatch },
         .{ .source = "let x:Box", .tag = .generic_needs_arguments },
@@ -338,15 +338,15 @@ test "generic structs reject unsupported fields inexact defaults constructors an
 
 test "generic structs check defaults only for used concrete types including late body instances" {
     for ([_][]const u8{
-        "let G:(T:type)->type=struct{value:T=1,}\nlet run:()={let x=G(bool)[]\n}",
-        "let G:(T:type)->type=struct{value:T=1,}\nlet run:()={let x=G(bool)[.value=true]\n}",
+        "let G:(T:type)->type=struct{value:T=1,}\nlet run:()={let x=G(bool).[]\n}",
+        "let G:(T:type)->type=struct{value:T=1,}\nlet run:()={let x=G(bool).[value=true]\n}",
     }) |source| {
         for ([_]bool{ false, true }) |imported| {
             try testLateGenericLayout(std.testing.allocator, source, .literal_type_mismatch, imported);
             try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testLateGenericLayout, .{ source, @as(?Module.Diagnostic.Tag, .literal_type_mismatch), imported });
         }
     }
-    const source = "let Unused:(T:type)->type=struct{value:T=unknown,}\nlet G:(T:type)->type=struct{value:T=true,\nlet typed:(x:T)->T={let y:T=x\ny}\n}\nlet run:()={let x=G(bool)[]\nlet y=G(bool).typed(x.value)\n}";
+    const source = "let Unused:(T:type)->type=struct{value:T=unknown,}\nlet G:(T:type)->type=struct{value:T=true,\nlet typed:(x:T)->T={let y:T=x\ny}\n}\nlet run:()={let x=G(bool).[]\nlet y=G(bool).typed(x.value)\n}";
     try testLateGenericLayout(std.testing.allocator, source, null, false);
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testLateGenericLayout, .{ source, @as(?Module.Diagnostic.Tag, null), false });
 }
@@ -354,12 +354,12 @@ test "generic structs check defaults only for used concrete types including late
 test "generic structs late cycles expanding type arguments and layout depth retain source diagnostics" {
     const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag };
     for ([_]Case{
-        .{ .source = "let G:(T:type)->type=struct{value:G(T),}\nlet run:()={let x=G(int)[]\n}", .tag = .generic_cycle },
-        .{ .source = "let G:(T:type)->type=struct{value:H(T),}\nlet H:(T:type)->type=struct{value:G(T),}\nlet run:()={let x=G(int)[]\n}", .tag = .generic_cycle },
-        .{ .source = "let G:(T:type)->type=struct{value:@This(),}\nlet run:()={let x=G(int)[]\n}", .tag = .generic_cycle },
-        .{ .source = "let G:(T:type)->type=struct{value:Self,\nlet Self=@This()\n}\nlet run:()={let x=G(int)[]\n}", .tag = .generic_cycle },
-        .{ .source = "let G:(T:type)->type=struct{value:H(G(T)),}\nlet H:(T:type)->type=struct{value:T,}\nlet run:()={let x=G(int)[]\n}", .tag = .generic_cycle },
-        .{ .source = "let G:(T:type)->type=struct{value:G((T)->T),}\nlet run:()={let x=G(int)[]\n}", .tag = .generic_limit },
+        .{ .source = "let G:(T:type)->type=struct{value:G(T),}\nlet run:()={let x=G(int).[]\n}", .tag = .generic_cycle },
+        .{ .source = "let G:(T:type)->type=struct{value:H(T),}\nlet H:(T:type)->type=struct{value:G(T),}\nlet run:()={let x=G(int).[]\n}", .tag = .generic_cycle },
+        .{ .source = "let G:(T:type)->type=struct{value:@This(),}\nlet run:()={let x=G(int).[]\n}", .tag = .generic_cycle },
+        .{ .source = "let G:(T:type)->type=struct{value:Self,\nlet Self=@This()\n}\nlet run:()={let x=G(int).[]\n}", .tag = .generic_cycle },
+        .{ .source = "let G:(T:type)->type=struct{value:H(G(T)),}\nlet H:(T:type)->type=struct{value:T,}\nlet run:()={let x=G(int).[]\n}", .tag = .generic_cycle },
+        .{ .source = "let G:(T:type)->type=struct{value:G((T)->T),}\nlet run:()={let x=G(int).[]\n}", .tag = .generic_limit },
     }) |case| {
         for ([_]bool{ false, true }) |imported| {
             try testLateGenericLayout(std.testing.allocator, case.source, case.tag, imported);
@@ -371,7 +371,7 @@ test "generic structs late cycles expanding type arguments and layout depth reta
         defer source.deinit();
         for (0..depth - 1) |i| try source.writer.print("let R{d}=struct{{next:R{d},}}\n", .{ i, i + 1 });
         try source.writer.print("let R{d}=struct{{n:int=1,}}\n", .{depth - 1});
-        try source.writer.writeAll("let G:(T:type)->type=struct{some:T,}\n@[public]\nlet run:()={let x=G(R0)[.some={return}]\n}");
+        try source.writer.writeAll("let G:(T:type)->type=struct{some:T,}\n@[public]\nlet run:()={let x=G(R0).[some={return}]\n}");
         const expected: ?Module.Diagnostic.Tag = if (depth == Ir.max_record_depth) .record_layout_limit else null;
         for ([_]bool{ false, true }) |imported| {
             try testLateGenericLayout(std.testing.allocator, source.written(), expected, imported);
@@ -504,7 +504,7 @@ test "record payload generic identities canonicalize aliases but preserve nomina
     const source = "let G:(T:type,E:type)->type=union{ok:T,err:E,}\nlet Factory=G\n" ++
         "let A=Factory(Alias,ErrorAlias)\nlet B=G(File,Error)\nlet C=G(Other,Error)\nlet D=G(File,Other)\n" ++
         "let Alias=File\nlet ErrorAlias=Error\nlet File=struct{s:string,}\nlet Other=struct{s:string,}\nlet Error=struct{s:string,}\n" ++
-        "let id:(a:A)->B=a\nlet make:()->A=.ok[Alias[.s=\"value\"]]";
+        "let id:(a:A)->B=a\nlet make:()->A=.ok[Alias.[s=\"value\"]]";
     var module = try Module.init(std.testing.allocator, "record-identities.nov", source);
     defer module.deinit();
     var sema = try lower(&module);
@@ -865,7 +865,7 @@ fn testStorableFieldSelection(allocator: std.mem.Allocator) !void {
     var module = try Module.init(allocator, "field-selection.nov",
         \\let R=struct{callback:(int)->int,}
         \\let main:()={let mut count:int=0
-        \\let mut r=R[.callback=(n){n+10}]
+        \\let mut r=R.[callback=(n){n+10}]
         \\let receiver=()->R {count+=1
         \\r}
         \\let replace=()->int {r.callback=(n){n+100}
@@ -913,14 +913,14 @@ test "storable fields callbacks aliases pipes generics references and readonly q
         \\p.*}
         \\let invoke:(r:`T,n:int)->int=r.callback(n)
         \\let query:(r:R)->@TypeOf(r.callback(1))=r.callback(2)
-        \\let main:()={let mut r=R[.callback=id,.forward=set]
+        \\let main:()={let mut r=R.[callback=id,forward=set]
         \\let cb=r.callback
         \\let a=cb(1)
         \\let b=2 |> r.callback
         \\let c=invoke(r,3)+r.callback(0)
         \\let d=query(r)
         \\r.callback=(x){x+1}
-        \\let boxed=Box((int)->int)[.value=(x){x+2}]
+        \\let boxed=Box((int)->int).[value=(x){x+2}]
         \\let e=boxed.value(4)
         \\let p=&r
         \\p.*.callback=(x){x+3}
@@ -939,8 +939,8 @@ test "storable fields closure snapshots shared cells union copies and exact repl
         \\let R=struct{callback:()->int,payload:U,bounds:Range,}
         \\let main:()={let mut n:int=1
         \\let mut xs:[]int=[1]
-        \\let mut r=R[.callback=()->int {n+=1
-        \\n+xs[0]},.payload=.values[[[1]]],.bounds=0..3]
+        \\let mut r=R.[callback=()->int {n+=1
+        \\n+xs[0]},payload=.values[[[1]]],bounds=0..3]
         \\xs[0]=9
         \\let copy=r
         \\let cb=r.callback
@@ -962,13 +962,13 @@ test "storable fields reject inexact calls replacements defaults and capability 
     for ([_]struct { source: []const u8, tag: Module.Diagnostic.Tag }{
         .{ .source = "let R=struct{callback:(int)->int,}\nlet f:(r:R)=r.callback()", .tag = .argument_count_mismatch },
         .{ .source = "let R=struct{callback:(int)->int,}\nlet f:(r:R)=r.callback(true)", .tag = .literal_type_mismatch },
-        .{ .source = "let R=struct{callback:(int)->int,}\nlet f:(r:R,x:(uint)->uint)->R=R[.callback=x]", .tag = .expression_type_mismatch },
+        .{ .source = "let R=struct{callback:(int)->int,}\nlet f:(r:R,x:(uint)->uint)->R=R.[callback=x]", .tag = .expression_type_mismatch },
         .{ .source = "let R=struct{callback:(int)->int,}\nlet f:(r:R,x:(uint)->uint)={let mut v=r\nv.callback=x}", .tag = .expression_type_mismatch },
         .{ .source = "let R=struct{callback:()->int=()->int {1},}", .tag = .invalid_field_default },
         .{ .source = "let R=struct{bounds:@TypeOf(0..1)=0..1,}", .tag = .invalid_field_default },
         .{ .source = "let U=union{x:int,}\nlet R=struct{payload:U=.x[1],}", .tag = .invalid_field_default },
         .{ .source = "let U=union{x:int,}\nlet R=struct{payload:U,}\nlet f:(r:R)->int=r.payload.x", .tag = .unsupported_body_expression },
-        .{ .source = "let R=struct{callback:()->int,}\nlet f:(n:int)->R={let p=&n\nR[.callback=()->int {p.*}]}", .tag = .unsupported_borrow },
+        .{ .source = "let R=struct{callback:()->int,}\nlet f:(n:int)->R={let p=&n\nR.[callback=()->int {p.*}]}", .tag = .unsupported_borrow },
         .{ .source = "let R=struct{callback:bool,}\nlet f:(r:R)->@TypeOf(r.callback())=1", .tag = .not_callable },
         .{ .source = "let R=struct{callback:(int)->int,}\nlet f:(r:R)->@TypeOf(r.callback(true))=1", .tag = .generic_function_conflict },
         .{ .source = "let R=struct{callback:(int)->int,}\nlet f:(r:R)->@TypeOf(r.callback())=1", .tag = .argument_count_mismatch },
@@ -1069,6 +1069,362 @@ fn testNestedUnionRejected(source: []const u8, tag: Module.Diagnostic.Tag) !void
     try std.testing.expect(found);
     try std.testing.expect(!result.lowering_complete);
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testRejectedMatchAllocations, .{source});
+}
+
+fn testAnonymousCanonicalCompilation(allocator: std.mem.Allocator) !void {
+    var comp = Compilation.init(allocator);
+    defer comp.deinit();
+    const root = try comp.addSource("/anonymous/main.nov",
+        \\let lib=@import("lib.nov")
+        \\let A=@TypeOf(.[a=@as(u8,1),b=true])
+        \\let B=lib.Shape
+        \\let C=@TypeOf(.[b=true,a=@as(u8,1)])
+        \\let D=@TypeOf(.[a=@as(u16,1),b=true])
+        \\let P=@TypeOf(.[@as(u8,1),true])
+        \\let X=lib.Box(A)
+        \\let Y=lib.Box(B)
+        \\let N=struct{a:u8,b:bool,}
+        \\let main:()={let a:A=lib.make()
+        \\let x:X=Y.[value=a]
+        \\let empty=.[]
+        \\let mut v=.[values=[1,2]]
+        \\let copy=v
+        \\v.values[0]=3
+        \\let n=a.a
+        \\let shorthand=.[n=n]
+        \\@println(x.value.a,empty,copy.values,v.values,shorthand)}
+    );
+    const lib = try comp.addSource("/anonymous/lib.nov",
+        \\@[public]
+        \\let Shape=@TypeOf(.[a=@as(u8,99),b=false])
+        \\@[public]
+        \\let Box:(T:type)->type=struct{value:T,}
+        \\@[public]
+        \\let make:()->Shape=.[a=2,b=true]
+    );
+    try testImport(&comp, root, "lib", lib, false);
+    comp.setRoot(root);
+    var sema = try lowerCompilation(&comp);
+    defer sema.deinit();
+    if (comp.hasErrors()) for (comp.modules.items) |module| {
+        for (module.diagnostics.items) |diagnostic| std.debug.print("anonymous compilation: {s}: {s}\n", .{ @tagName(diagnostic.tag), module.sourceSlice(diagnostic.span) orelse "?" });
+    };
+    try std.testing.expect(!comp.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    const module = comp.getModule(root).?;
+    var aliases: [8]Ir.TypeId = undefined;
+    for ([_][]const u8{ "A", "B", "C", "D", "P", "X", "Y", "N" }, &aliases) |name, *ty| {
+        ty.* = sema.entries[sema.entryIndex(module, module.lookup(name).?)].alias_type.?;
+    }
+    try std.testing.expectEqual(aliases[0], aliases[1]);
+    for ([_]usize{ 2, 3, 4, 7 }) |i| try std.testing.expect(aliases[0] != aliases[i]);
+    try std.testing.expectEqual(aliases[5], aliases[6]);
+    try sema.ir.verify();
+}
+
+test "anonymous structs canonical ordered shape across modules and generic type arguments under OOM" {
+    try testAnonymousCanonicalCompilation(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAnonymousCanonicalCompilation, .{});
+}
+
+test "anonymous structs contextual nominal defaults structural values and readonly aliases under OOM" {
+    try testUnionArrayPayloadsOom(
+        \\let N=struct{a:u8,b:bool=true,}
+        \\let Shape=@TypeOf(.[a=@as(u8,1),values=@as([]int,[])])
+        \\let Position=@TypeOf(.[@as(u8,1),"a"])
+        \\let id:(x:`T)->`T=x
+        \\let take:(x:Shape)->Shape=x
+        \\let nominal:()->N=.[a=1]
+        \\let positional:(x:Position)->Position=x
+        \\let main:()={let a=.[a=@as(u8,2),values=@as([]int,[])]
+        \\let b:Shape=.[a=3,values=[]]
+        \\let c=take(.[a=4,values=[]])
+        \\let d=id(a)
+        \\let p=positional(.[5,"b"])
+        \\let q=id(.[6,"c"])
+        \\let n=N.[a=7]
+        \\@println(a,b,c,d,p,q,n,nominal(),@TypeOf(a),@TypeOf(p))}
+    );
+}
+
+fn testAnonymousReadOnly(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "anonymous-query.nov",
+        \\let count:u8=7
+        \\let A=@TypeOf(.[count=count])
+        \\let id:(x:`T)->`T=x
+        \\let main:()={@println(@TypeOf(.[value=id(1)]),@TypeOf(.[id(2),"x"]))}
+    );
+    defer module.deinit();
+    const declarations = module.declarations.items.len;
+    var sema = try lower(&module);
+    defer sema.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try std.testing.expectEqual(declarations, module.declarations.items.len);
+    for (sema.ir.functions.items) |function| if (function.body) |body| {
+        for (body.instructions) |instruction| try std.testing.expect(instruction.op != .call);
+    };
+    try sema.ir.verify();
+}
+
+test "anonymous structs readonly TypeOf has no emitted calls or generic demands under OOM" {
+    try testAnonymousReadOnly(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAnonymousReadOnly, .{});
+}
+
+fn testLegacyStructRejected(allocator: std.mem.Allocator, source: []const u8) !void {
+    var module = try Module.init(allocator, "legacy-struct.nov", source);
+    defer module.deinit();
+    if (module.hasErrors()) return;
+    var sema = try lower(&module);
+    defer sema.deinit();
+    try std.testing.expect(module.hasErrors());
+    try std.testing.expect(!sema.lowering_complete);
+}
+
+test "anonymous structs legacy nominal constructors are rejected without compatibility under OOM" {
+    for ([_][]const u8{
+        \\let N=struct{a:int=1,}
+        \\let f:()->N=N[.a=1]
+        ,
+        \\let N=struct{a:int=1,}
+        \\let f:()->N=N[]
+        ,
+        \\let N=struct{a:int,}
+        \\let f:(a:int)->N=N.[.a]
+        ,
+        \\let N=struct{a:int,}
+        \\let f:(a:int)->N=.[.a]
+        ,
+        \\let S=@TypeOf(.[a=1])
+        \\let f:(a:int)->S=.[.a]
+        ,
+    }) |source| {
+        try testLegacyStructRejected(std.testing.allocator, source);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testLegacyStructRejected, .{source});
+    }
+}
+
+test "anonymous structs storable callbacks ranges unions nested arrays and copies under OOM" {
+    try testUnionArrayPayloadsOom(
+        \\let U=union{some:[]int,none,}
+        \\let main:()={let mut state=.[callback=(x:int)->int {x+1},bounds=0..3,payload=U.some[[1,2]],nested=.[values=[[1,2]]]]
+        \\let copy=state
+        \\state.nested.values=[[9,2]]
+        \\let x=state.callback(1)
+        \\let y=match copy.payload{.some=>|values|values[0]
+        \\.none=>0}
+        \\@println(x,y,copy.nested.values)
+        \\let mut total:uint=0
+        \\loop i in state.bounds {total+=i}
+        \\@println(total)}
+    );
+}
+
+test "anonymous structs reject references implicit callback polymorphism and positional indexing under OOM" {
+    for ([_][]const u8{
+        \\let f:(n:int)={let p=&n
+        \\let x=.[value=p]}
+        ,
+        \\let f:(n:int)={let p=&n
+        \\let x=.[callback=()->int {p.*}]}
+        ,
+        \\let id:(x:`T)->`T=x
+        \\let f:()={let x=.[callback=id]}
+        ,
+        \\let f:()->int={let x=.[1,"a"]
+        \\x[0]}
+        ,
+    }) |source| {
+        try testLegacyStructRejected(std.testing.allocator, source);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testLegacyStructRejected, .{source});
+    }
+}
+
+test "anonymous structs bare identifiers contextual names mixed fields and reordered expected shape under OOM" {
+    try testUnionArrayPayloadsOom(
+        \\let N=struct{width:u8,height:int,enabled:bool=true,}
+        \\let S=@TypeOf(.[width=@as(u8,1),height=2])
+        \\let P=@TypeOf(.[@as(u8,1),2])
+        \\let Color=enum{red,blue,}
+        \\let E=@TypeOf(.[Color.red,1])
+        \\let take:(value:S)->S=value
+        \\let nominal:(width:u8,height:int)->N=N.[width,height]
+        \\let contextual:(width:u8,height:int)->N=.[height,width]
+        \\let shaped:(width:u8,height:int)->S=.[height,width]
+        \\let Query=@TypeOf(take(.[height=2,width=@as(u8,1)]))
+        \\let queried:(width:u8,height:int)->Query=.[height,width]
+        \\let main:()={let width:u8=3
+        \\let height:int=4
+        \\let inferred=.[width,height=height]
+        \\let reversed:S=.[height,width]
+        \\let forced=.[width=width,height=height]
+        \\let positional:P=.[width,height]
+        \\let raw=.[width,height]
+        \\let enums:E=.[.blue,2]
+        \\let passed=take(.[height=5,width])
+        \\@println(inferred.width,reversed.height,forced,raw,positional,enums,passed,nominal(width,height),contextual(width,height),shaped(width,height),queried(width,height))}
+    );
+}
+
+fn testAnonymousNamedOperandOrder(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "anonymous-order.nov",
+        \\let S=@TypeOf(.[a=1,b=2])
+        \\let f:(a:int,b:int)->S=.[b,a]
+    );
+    defer module.deinit();
+    var sema = try lower(&module);
+    defer sema.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    var found = false;
+    for (sema.ir.functions.items) |function| if (function.body) |body| {
+        for (body.instructions) |instruction| if (instruction.op == .record_init) {
+            const values = instruction.op.record_init;
+            try std.testing.expectEqual(@as(usize, 2), values.len);
+            try std.testing.expect(@backingInt(values[1]) < @backingInt(values[0]));
+            found = true;
+        };
+    };
+    try std.testing.expect(found);
+    try sema.ir.verify();
+}
+
+test "anonymous structs TypeOf writable fields nested arrays and mutable references under OOM" {
+    try testUnionArrayPayloadsOom(
+        \\let A=@TypeOf({let mut r=.[a=1]
+        \\r.a=2
+        \\r})
+        \\let B=@TypeOf({let mut r=.[inner=.[a=1],values=[1]]
+        \\r.inner.a=2
+        \\r.values[0]=3
+        \\r})
+        \\let C=@TypeOf({let mut r=.[a=1]
+        \\let p=&r
+        \\p.*.a=2
+        \\r})
+        \\let main:()={let mut a:A=.[a=1]
+        \\a.a=2
+        \\let mut b:B=.[inner=.[a=1],values=[1]]
+        \\b.inner.a=2
+        \\b.values[0]=3
+        \\let mut c:C=.[a=1]
+        \\let p=&c
+        \\p.*.a=2
+        \\@println(a,b,c)}
+    );
+}
+
+fn testAnonymousFirstDiagnostic(allocator: std.mem.Allocator, source: []const u8, tag: Module.Diagnostic.Tag, operand: []const u8) !void {
+    var module = try Module.init(allocator, "anonymous-diagnostic.nov", source);
+    defer module.deinit();
+    if (module.source.ast.errors.len != 0) std.debug.print("anonymous parse: {s}: {any}\n", .{ source, module.source.ast.errors });
+    try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
+    const declarations = module.declarations.items.len;
+    var sema = try lower(&module);
+    defer sema.deinit();
+    try std.testing.expect(module.hasErrors());
+    try std.testing.expect(!sema.lowering_complete);
+    try std.testing.expectEqual(declarations, module.declarations.items.len);
+    const diagnostic = module.diagnostics.items[0];
+    if (diagnostic.tag != tag) std.debug.print("anonymous diagnostic: {s}: {any}\n", .{ source, module.diagnostics.items });
+    try std.testing.expectEqual(tag, diagnostic.tag);
+    try std.testing.expectEqual(std.mem.lastIndexOf(u8, source, operand).?, diagnostic.span.start);
+    try std.testing.expect(diagnostic.span.end > diagnostic.span.start);
+    try std.testing.expect(module.sourceSlice(diagnostic.span) != null);
+}
+
+test "anonymous structs final inference reports unknown names and duplicates under OOM" {
+    for ([_]struct { source: []const u8, tag: Module.Diagnostic.Tag, operand: []const u8 }{
+        .{ .source = "let main:()={let x=.[a=unknown]\n}", .tag = .unknown_name, .operand = "unknown" },
+        .{ .source = "let main:()={let x=.[a=1,a=2]\n}", .tag = .duplicate_field, .operand = "a=2" },
+        .{ .source = "let main:()={let x=.[unknown]\n}", .tag = .unknown_name, .operand = "unknown" },
+        .{ .source = "let main:()={let known=1\nlet x=.[known,a=unknown]\n}", .tag = .unknown_name, .operand = "unknown" },
+    }) |case| {
+        try testAnonymousFirstDiagnostic(std.testing.allocator, case.source, case.tag, case.operand);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAnonymousFirstDiagnostic, .{ case.source, case.tag, case.operand });
+    }
+}
+
+test "anonymous structs TypeOf contextual fields diagnose source order with nominal parity under OOM" {
+    for ([_][]const u8{ "let S=@TypeOf(.[a=1,b=true])\n", "let S=struct{a:int,b:bool,}\n" }) |prefix| {
+        for ([_][]const u8{
+            \\let take:(s:S)->S=s
+            \\let f:(q:@TypeOf(take(.[b="wrong",a=unknown])))={}
+            ,
+            \\let wrong:string="wrong"
+            \\let take:(s:S)->S=s
+            \\let f:(q:@TypeOf(take(.[b=wrong,a=unknown])))={}
+            ,
+        }, [_][]const u8{ "\"wrong\"", "wrong" }) |body, operand| {
+            const source = try std.mem.concat(std.testing.allocator, u8, &.{ prefix, body });
+            defer std.testing.allocator.free(source);
+            try testAnonymousFirstDiagnostic(std.testing.allocator, source, .generic_function_conflict, operand);
+            try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAnonymousFirstDiagnostic, .{ source, Module.Diagnostic.Tag.generic_function_conflict, operand });
+        }
+    }
+}
+
+test "anonymous structs TypeOf writes retain immutable and exact type restrictions under OOM" {
+    for ([_]struct { source: []const u8, tag: Module.Diagnostic.Tag }{
+        .{ .source = "let A=@TypeOf({let r=.[a=1]\nr.a=2\nr})", .tag = .immutable_assignment },
+        .{ .source = "let A=@TypeOf({let r=.[a=1]\nlet p=&r\np.*.a=2\nr})", .tag = .immutable_assignment },
+        .{ .source = "let A=@TypeOf({let mut r=.[a=1]\nr.a=true\nr})", .tag = .literal_type_mismatch },
+        .{ .source = "let A=@TypeOf({let r=.[inner=.[a=1]]\nr.inner.a=2\nr})", .tag = .immutable_assignment },
+        .{ .source = "let A=@TypeOf({let r=.[values=[1]]\nr.values[0]=2\nr})", .tag = .immutable_assignment },
+    }) |case| try testNestedUnionRejected(case.source, case.tag);
+}
+
+test "anonymous structs contextual named layout preserves initializer operand order under OOM" {
+    try testAnonymousNamedOperandOrder(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAnonymousNamedOperandOrder, .{});
+}
+
+test "anonymous structs named shorthand validates duplicates unknown names and exact field types under OOM" {
+    for ([_]struct { source: []const u8, tag: Module.Diagnostic.Tag }{
+        .{ .source = "let N=struct{x:int,}\nlet f:(x:int)->N=N.[x,x]", .tag = .duplicate_field },
+        .{ .source = "let N=struct{x:int,}\nlet f:(y:int)->N=N.[y]", .tag = .unknown_field },
+        .{ .source = "let N=struct{x:int,}\nlet f:(x:bool)->N=N.[x]", .tag = .expression_type_mismatch },
+        .{ .source = "let S=@TypeOf(.[x=1])\nlet f:(y:int)->S=.[y]", .tag = .unknown_field },
+        .{ .source = "let S=@TypeOf(.[x=1,y=2])\nlet f:(x:int)->S=.[x,x]", .tag = .duplicate_field },
+    }) |case| try testNestedUnionRejected(case.source, case.tag);
+}
+
+test "anonymous structs correlated sibling context and concrete callbacks under OOM" {
+    try testUnionArrayPayloadsOom(
+        \\let Callback=@TypeOf(.[values=@as([]u8,[]),callback=@as((u8)->u8,(n:u8)->u8 {n})])
+        \\let id:(x:`T)->`T=x
+        \\let take:(x:Callback)->Callback=x
+        \\let main:()={let siblings=[.[a=1],.[a=@as(u8,2)]]
+        \\let arrays=[.[values=[]],.[values=[@as(u8,1)]]]
+        \\let c=take(.[values=[],callback=(n){n}])
+        \\let d:Callback=.[values=[],callback=id]
+        \\@println(siblings,arrays,c.callback(1),d.callback(2))}
+    );
+}
+
+test "anonymous structs reject nominal conversion positional nominal and shape differences under OOM" {
+    for ([_][]const u8{
+        \\let N=struct{a:int,}
+        \\let f:()->N={let x=.[a=1]
+        \\x}
+        ,
+        \\let N=struct{a:int,}
+        \\let f:()->N=.[1]
+        ,
+        \\let N=struct{a:int,}
+        \\let f:()->N=N.[1]
+        ,
+
+        \\let S=@TypeOf(.[a=1])
+        \\let f:()->S={let x=.[a=true]
+        \\x}
+        ,
+        \\let S=@TypeOf(.[1])
+        \\let f:()->S={let x=.[a=1]
+        \\x}
+        ,
+    }) |source| try testNestedUnionRejected(source, .expression_type_mismatch);
 }
 
 fn testUnionArrayPayloadsOom(source: []const u8) !void {
@@ -1288,7 +1644,7 @@ test "unsupported union declarations and rejected matches roll back under OOM" {
 
         .{ .source = "let U=union{ok:&int,}", .tag = .unsupported_type },
         .{ .source = "let G:(T:type)->type=union{ok:T,}\nlet U=G(&int)", .tag = .unsupported_type },
-        .{ .source = "let A=struct{n:int,}\nlet B=struct{n:int,}\nlet U=union{ok:A,}\nlet f:()->U=.ok[B[.n=1]]", .tag = .expression_type_mismatch },
+        .{ .source = "let A=struct{n:int,}\nlet B=struct{n:int,}\nlet U=union{ok:A,}\nlet f:()->U=.ok[B.[n=1]]", .tag = .expression_type_mismatch },
         .{ .source = "let A=struct{n:int,}\nlet B=struct{n:int,}\nlet G:(T:type,E:type)->type=union{ok:T,err:E,}\nlet f:(r:G(int,A))->G(bool,B)=.ok[r.! == 0]", .tag = .propagation_error_mismatch },
         .{ .source = "let U=union{ok:U,}", .tag = .record_layout_cycle },
         .{ .source = "let U=union{ok:U,none,}", .tag = .record_layout_cycle },
@@ -1341,11 +1697,11 @@ test "nominal records reject mismatches malformed constructors defaults fields a
         .{ .source = "let A=struct{x:int,\n@[stringify]\nlet toString:(b:B)->string=\"wrong nominal receiver\"\n}\nlet B=struct{x:int,}\nlet f:(a:A)=@println(a)", .tag = .invalid_to_string },
         .{ .source = "let A=struct{x:int,\n@[stringify]\nlet toString:(a:A)->bool=true\n}\nlet f:(a:A)=@println(a)", .tag = .invalid_to_string },
         .{ .source = "let A=struct{x:int,\n@[stringify]\nlet toString:()->string=\"bad\"\n}\nlet f:(a:A)=@println(a)", .tag = .invalid_to_string },
-        .{ .source = "let A=struct{x:int,}\nlet B=struct{x:int,}\nlet f:(a:B)=@println(a)\nlet main:()=f(A[.x=1])", .tag = .expression_type_mismatch },
-        .{ .source = "let A=struct{x:int,}\nlet f:()->A=A[]", .tag = .missing_field },
-        .{ .source = "let A=struct{x:int,}\nlet f:()->A=A[.x=1,.x=2]", .tag = .duplicate_field },
-        .{ .source = "let A=struct{x:int,}\nlet f:()->A=A[.y=1]", .tag = .unknown_field },
-        .{ .source = "let A=struct{x:int,}\nlet f:()->A=A[.x=true]", .tag = .literal_type_mismatch },
+        .{ .source = "let A=struct{x:int,}\nlet B=struct{x:int,}\nlet f:(a:B)=@println(a)\nlet main:()=f(A.[x=1])", .tag = .expression_type_mismatch },
+        .{ .source = "let A=struct{x:int,}\nlet f:()->A=A.[]", .tag = .missing_field },
+        .{ .source = "let A=struct{x:int,}\nlet f:()->A=A.[x=1,x=2]", .tag = .duplicate_field },
+        .{ .source = "let A=struct{x:int,}\nlet f:()->A=A.[y=1]", .tag = .unknown_field },
+        .{ .source = "let A=struct{x:int,}\nlet f:()->A=A.[x=true]", .tag = .literal_type_mismatch },
         .{ .source = "let A=struct{x:i8=128,}", .tag = .literal_out_of_range },
         .{ .source = "let A=struct{x:int=1+2,}", .tag = .invalid_field_default },
         .{ .source = "let A=struct{x:string=\"{true}\",}", .tag = .invalid_field_default },
@@ -1357,13 +1713,13 @@ test "nominal records reject mismatches malformed constructors defaults fields a
         .{ .source = "let A=struct{x:int,}\nlet f:(a:A)={a.x=1}", .tag = .immutable_assignment },
         .{ .source = "let A=struct{x:int,}\nlet f:(a:A)->int=a.y", .tag = .unknown_field },
         .{ .source = "let A=struct{x:int,}\nlet f:(a:[][]A)->bool=a in [a]", .tag = .operator_not_supported },
-        .{ .source = "let A=struct{x:int=0,}\nlet a=A[]", .tag = .unsupported_global_initializer },
+        .{ .source = "let A=struct{x:int=0,}\nlet a=A.[]", .tag = .unsupported_global_initializer },
         .{ .source = "let A=struct{\nlet B=struct{x:int,}\n}", .tag = .unsupported_declaration },
         .{ .source = "let int=struct{}", .tag = .unsupported_shadowing },
         .{ .source = "let A=struct{\nlet constant:int=1\n}", .tag = .unsupported_declaration },
         .{ .source = "let A=struct{\nlet Alias=int\n}", .tag = .unsupported_declaration },
         .{ .source = "let A=struct{x:Cycle,}\nlet Cycle=Other\nlet Other=Cycle", .tag = .type_alias_cycle },
-        .{ .source = "let A=struct{x:int=0,}\nlet B=struct{x:int=0,}\nlet f:(a:B)={}\nlet main:()=f(A[])", .tag = .expression_type_mismatch },
+        .{ .source = "let A=struct{x:int=0,}\nlet B=struct{x:int=0,}\nlet f:(a:B)={}\nlet main:()=f(A.[])", .tag = .expression_type_mismatch },
     }) |case| {
         var module = try Module.init(std.testing.allocator, "record-error.nov", case.source);
         defer module.deinit();
@@ -1387,20 +1743,20 @@ test "field mutation rejects nonlocals immutable bindings unsupported operators 
     const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag };
     for ([_]Case{
         .{ .source = "let f:(r:R)={r.x=1}", .tag = .immutable_assignment },
-        .{ .source = "let f:()={let r=R[]\nr.x=1}", .tag = .immutable_assignment },
-        .{ .source = "let f:()={R[].x=1}", .tag = .unsupported_assignment_target },
-        .{ .source = "let f:()={let mut r=R[]\nr.s.len=1}", .tag = .unsupported_array_length_write },
-        .{ .source = "let f:()={let mut r=R[]\nr.x.missing=1}", .tag = .unsupported_assignment_target },
+        .{ .source = "let f:()={let r=R.[]\nr.x=1}", .tag = .immutable_assignment },
+        .{ .source = "let f:()={R.[].x=1}", .tag = .unsupported_assignment_target },
+        .{ .source = "let f:()={let mut r=R.[]\nr.s.len=1}", .tag = .unsupported_array_length_write },
+        .{ .source = "let f:()={let mut r=R.[]\nr.x.missing=1}", .tag = .unsupported_assignment_target },
         .{ .source = "let f:()={let mut u:U=.x[1]\nu.x=2}", .tag = .unsupported_assignment_target },
-        .{ .source = "let f:()={let mut r=R[]\nr.missing=1}", .tag = .unknown_field },
-        .{ .source = "let f:()={let mut r=R[]\nr.x=128}", .tag = .literal_out_of_range },
-        .{ .source = "let f:()={let mut r=R[]\nr.x=true}", .tag = .literal_type_mismatch },
-        .{ .source = "let f:(n:i16)={let mut r=R[]\nr.x=n}", .tag = .expression_type_mismatch },
-        .{ .source = "let f:()={let mut r=R[]\nr.k=Other.a}", .tag = .literal_type_mismatch },
-        .{ .source = "let f:()={let mut r=R[]\nr.b+=true}", .tag = .operator_not_supported },
-        .{ .source = "let f:()={let mut r=R[]\nr.k+=.a}", .tag = .operator_not_supported },
-        .{ .source = "let f:()={let mut r=R[]\nr.s-=\"x\"}", .tag = .operator_not_supported },
-        .{ .source = "let f:()->i8={let mut r=R[]\nr.x=1}", .tag = .expression_type_mismatch },
+        .{ .source = "let f:()={let mut r=R.[]\nr.missing=1}", .tag = .unknown_field },
+        .{ .source = "let f:()={let mut r=R.[]\nr.x=128}", .tag = .literal_out_of_range },
+        .{ .source = "let f:()={let mut r=R.[]\nr.x=true}", .tag = .literal_type_mismatch },
+        .{ .source = "let f:(n:i16)={let mut r=R.[]\nr.x=n}", .tag = .expression_type_mismatch },
+        .{ .source = "let f:()={let mut r=R.[]\nr.k=Other.a}", .tag = .literal_type_mismatch },
+        .{ .source = "let f:()={let mut r=R.[]\nr.b+=true}", .tag = .operator_not_supported },
+        .{ .source = "let f:()={let mut r=R.[]\nr.k+=.a}", .tag = .operator_not_supported },
+        .{ .source = "let f:()={let mut r=R.[]\nr.s-=\"x\"}", .tag = .operator_not_supported },
+        .{ .source = "let f:()->i8={let mut r=R.[]\nr.x=1}", .tag = .expression_type_mismatch },
     }) |case| {
         const source = try std.mem.concat(std.testing.allocator, u8, &.{ prefix, case.source });
         defer std.testing.allocator.free(source);
@@ -1418,10 +1774,10 @@ test "field stores verify slot identity field bounds exact types prior operands 
     var module = try Module.init(std.testing.allocator, "field-ir.nov",
         \\let R=struct{x:int=0,s:string="",}
         \\let U=union{x:int,}
-        \\let f:()={let mut r=R[]
+        \\let f:()={let mut r=R.[]
         \\    let mut u:U=.x[1]
         \\    let mut scalar:int=1
-        \\    if true {let mut private=R[]
+        \\    if true {let mut private=R.[]
         \\        private.x=23}
         \\    r.x=7}
     );
@@ -1473,7 +1829,7 @@ test "field stores verify slot identity field bounds exact types prior operands 
 }
 
 test "record verifier rejects corrupt field counts indices types defaults spans and nominal identities" {
-    var module = try Module.init(std.testing.allocator, "record-ir.nov", "let A=struct{x:int=0,}\nlet B=struct{x:int=0,}\nlet f:(a:A)->int=a.x\nlet g:()->B=B[]");
+    var module = try Module.init(std.testing.allocator, "record-ir.nov", "let A=struct{x:int=0,}\nlet B=struct{x:int=0,}\nlet f:(a:A)->int=a.x\nlet g:()->B=B.[]");
     defer module.deinit();
     var result = try lower(&module);
     defer result.deinit();
@@ -2513,7 +2869,7 @@ test "closures reject borrowed captures recursion inferred parameters foreign AB
         "let main:()={let f=()->int {unknown}\n}",
         "@[extern(\"callback\")]\nlet foreign:(f:()->int)->int\nlet main:()={let f=()->int {1}\n@println(foreign(f))}",
         "@[export]\nlet foreign:(f:()->int)->int=f()",
-        "let R=struct{f:()->int,}\nlet main:()={let r=R[.f=()->bool {true}]\n}",
+        "let R=struct{f:()->int,}\nlet main:()={let r=R.[f=()->bool {true}]\n}",
         "let main:()={let a:[]()->int=[]\n@println(a)}",
         "let main:()={let mut n:int=0\nlet f=()->int {n}\nlet b=&n\n@println(f(),b.*)}",
         "let main:()={let mut n:int=0\nlet b=&n\nlet f=()->int {n}\n@println(b.*)}",
@@ -2663,7 +3019,7 @@ test "constructor shorthand does not expose private globals through imported fie
     for ([_]bool{ true, false }) |named| {
         var comp = Compilation.init(std.testing.allocator);
         defer comp.deinit();
-        const root = try comp.addSource("/main.nov", "let api=@import(\"api.nov\")\nlet R=api.R\nlet main:()={let r=R[.value]\n}");
+        const root = try comp.addSource("/main.nov", "let api=@import(\"api.nov\")\nlet R=api.R\nlet main:()={let r=R.[value]\n}");
         const api = try comp.addSource("/api.nov", "let value:int=1\n@[public]\nlet R=struct{value:int=2,}");
         try testImport(&comp, root, "api", api, named);
         comp.setRoot(root);
@@ -2675,12 +3031,12 @@ test "constructor shorthand does not expose private globals through imported fie
         try std.testing.expectEqual(Module.Diagnostic.Tag.unknown_name, diagnostic.tag);
         try std.testing.expectEqual(root, diagnostic.span.source);
         try std.testing.expectEqualStrings("value", module.sourceSlice(diagnostic.span).?);
-        try std.testing.expectEqual(std.mem.indexOf(u8, module.source.ast.source, ".value").? + 1, diagnostic.span.start);
+        try std.testing.expectEqual(std.mem.indexOf(u8, module.source.ast.source, "[value").? + 1, diagnostic.span.start);
     }
 }
 
 test "constructor shorthand lowers supplied operands before defaults in declaration order" {
-    var module = try Module.init(std.testing.allocator, "shorthand-order.nov", "let R=struct{a:int=10,b:int,c:int=30,d:int,}\nlet f:(b:int)->R=R[.d=4,.b]");
+    var module = try Module.init(std.testing.allocator, "shorthand-order.nov", "let R=struct{a:int=10,b:int,c:int=30,d:int,}\nlet f:(b:int)->R=R.[d=4,b]");
     defer module.deinit();
     var result = try lower(&module);
     defer result.deinit();
@@ -2714,7 +3070,7 @@ test "compilation diamond aliases canonicalize while colliding record and enum l
         \\let C=other.Shared
         \\let E=left.Kind
         \\let F=other.Kind
-        \\let main:()={let a:A=A[.value=true]
+        \\let main:()={let a:A=A.[value=true]
         \\    let b:B=a
         \\    @println(b.get(),left.answer(),other.answer())}
     );
@@ -3078,12 +3434,12 @@ test "nested records diagnose cycles defaults nominal replacements and invalid p
     for ([_]struct { source: []const u8, tag: Module.Diagnostic.Tag }{
         .{ .source = "let A=struct{edge:Alias,}\nlet Alias=A", .tag = .record_layout_cycle },
         .{ .source = "let A=struct{to_b:Alias,}\nlet Alias=B\nlet B=struct{to_a:A,}", .tag = .record_layout_cycle },
-        .{ .source = "let A=struct{b:B=B[],}\nlet B=struct{x:int=1,}", .tag = .invalid_field_default },
-        .{ .source = "let A=struct{b:B,}\nlet B=struct{x:int=1,}\nlet f:()->A=A[]", .tag = .missing_field },
-        .{ .source = "let A=struct{b:B,}\nlet B=struct{x:int=1,}\nlet C=struct{x:int=1,}\nlet f:()={let mut a=A[.b=B[]]\na.b=C[]}", .tag = .expression_type_mismatch },
+        .{ .source = "let A=struct{b:B=B.[],}\nlet B=struct{x:int=1,}", .tag = .invalid_field_default },
+        .{ .source = "let A=struct{b:B,}\nlet B=struct{x:int=1,}\nlet f:()->A=A.[]", .tag = .missing_field },
+        .{ .source = "let A=struct{b:B,}\nlet B=struct{x:int=1,}\nlet C=struct{x:int=1,}\nlet f:()={let mut a=A.[b=B.[]]\na.b=C.[]}", .tag = .expression_type_mismatch },
         .{ .source = "let A=struct{b:B,}\nlet B=struct{x:int=1,}\nlet f:(a:A)={a.b.x=3}", .tag = .immutable_assignment },
-        .{ .source = "let A=struct{b:B,}\nlet B=struct{x:int=1,}\nlet f:()={A[.b=B[]].b.x=3}", .tag = .unsupported_assignment_target },
-        .{ .source = "let A=struct{b:B,}\nlet B=struct{x:int=1,}\nlet f:()={let mut a=A[.b=B[]]\na.b.missing=3}", .tag = .unknown_field },
+        .{ .source = "let A=struct{b:B,}\nlet B=struct{x:int=1,}\nlet f:()={A.[b=B.[]].b.x=3}", .tag = .unsupported_assignment_target },
+        .{ .source = "let A=struct{b:B,}\nlet B=struct{x:int=1,}\nlet f:()={let mut a=A.[b=B.[]]\na.b.missing=3}", .tag = .unknown_field },
     }) |case| {
         var module = try Module.init(std.testing.allocator, "nested-invalid.nov", case.source);
         defer module.deinit();
@@ -3101,7 +3457,7 @@ test "nested records diagnose cycles defaults nominal replacements and invalid p
 
 test "nested records field store paths are owned and verified after source release" {
     var result = blk: {
-        var module = try Module.init(std.testing.allocator, "path.nov", "let A=struct{b:B,}\nlet B=struct{c:C,}\nlet C=struct{x:int=1,}\nlet f:()={let mut a=A[.b=B[.c=C[]]]\na.b.c.x=2}");
+        var module = try Module.init(std.testing.allocator, "path.nov", "let A=struct{b:B,}\nlet B=struct{c:C,}\nlet C=struct{x:int=1,}\nlet f:()={let mut a=A.[b=B.[c=C.[]]]\na.b.c.x=2}");
         defer module.deinit();
         const result = try lower(&module);
         try std.testing.expect(result.lowering_complete);
@@ -3257,7 +3613,7 @@ test "nested records late body recursive generic instances retain source diagnos
 
 test "static integer borrowing forged IR owner kinds exact types paths and source release" {
     var result = blk: {
-        var module = try Module.init(std.testing.allocator, "integer-borrow-ir.nov", "let R=struct{n:int=0,}\nlet f:()={let mut a=[R[]]\nlet mut flag=true\nlet mut x:int=1\nlet y=&x\ny.*+=1\n@println(x,a.len,flag)}");
+        var module = try Module.init(std.testing.allocator, "integer-borrow-ir.nov", "let R=struct{n:int=0,}\nlet f:()={let mut a=[R.[]]\nlet mut flag=true\nlet mut x:int=1\nlet y=&x\ny.*+=1\n@println(x,a.len,flag)}");
         defer module.deinit();
         const result = try lower(&module);
         try std.testing.expect(result.lowering_complete);
@@ -3318,7 +3674,7 @@ test "static integer borrowing forged IR owner kinds exact types paths and sourc
 
 test "static borrowing verified capability types owner paths index and regions survive source release" {
     var result = blk: {
-        var module = try Module.init(std.testing.allocator, "borrow-ir.nov", "let A=struct{b:B,}\nlet B=struct{x:int=0,}\nlet f:()={let mut a=[A[.b=B[]]]\nlet r=&a[0]\nr.*.b.x+=1\n@println(a.len)}");
+        var module = try Module.init(std.testing.allocator, "borrow-ir.nov", "let A=struct{b:B,}\nlet B=struct{x:int=0,}\nlet f:()={let mut a=[A.[b=B.[]]]\nlet r=&a[0]\nr.*.b.x+=1\n@println(a.len)}");
         defer module.deinit();
         const result = try lower(&module);
         try std.testing.expect(result.lowering_complete);
@@ -3380,7 +3736,7 @@ test "static borrowing verified capability types owner paths index and regions s
 test "static borrowing imported generic nominal owners preserve exact identities" {
     var comp = Compilation.init(std.testing.allocator);
     defer comp.deinit();
-    const root = try comp.addSource("/main.nov", "let types=@import(\"types.nov\")\nlet Alias=types.R(int)\nlet main:()={let mut a=[Alias[.x=1]]\nlet r=&a[0]\nr.*.x+=1\n@println(a[0].x)}");
+    const root = try comp.addSource("/main.nov", "let types=@import(\"types.nov\")\nlet Alias=types.R(int)\nlet main:()={let mut a=[Alias.[x=1]]\nlet r=&a[0]\nr.*.x+=1\n@println(a[0].x)}");
     const types = try comp.addSource("/types.nov", "@[public]\nlet R:(T:type)->type=struct{x:T,}");
     try testImport(&comp, root, "types", types, true);
     comp.setRoot(root);
@@ -3405,14 +3761,14 @@ fn testBorrowRejectionAllocations(allocator: std.mem.Allocator, source: []const 
 
 test "static borrowing rejected conflicts and escapes roll back every allocation failure" {
     for ([_][]const u8{
-        "let R=struct{x:int=0,}\nlet f:()={let mut a=[R[]]\nlet r=&a[0]\nr.*.x+={a=[R[]]\n1}}",
-        "let R=struct{x:int=0,}\nlet f:()={let mut a=[R[]]\nlet r=&a[0]\nlet alias=&r\n@println(alias.*.x)}",
-        "let R=struct{x:int=0,}\nlet f:()={let mut a=[R[]]\nlet r=&a[{a=[R[]]\n0}]\nr.*.x=1}",
+        "let R=struct{x:int=0,}\nlet f:()={let mut a=[R.[]]\nlet r=&a[0]\nr.*.x+={a=[R.[]]\n1}}",
+        "let R=struct{x:int=0,}\nlet f:()={let mut a=[R.[]]\nlet r=&a[0]\nlet alias=&r\n@println(alias.*.x)}",
+        "let R=struct{x:int=0,}\nlet f:()={let mut a=[R.[]]\nlet r=&a[{a=[R.[]]\n0}]\nr.*.x=1}",
     }) |source| try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testBorrowRejectionAllocations, .{source});
 }
 
 test "static borrowing verifier rejects well typed forged owner access and sibling capabilities" {
-    var module = try Module.init(std.testing.allocator, "borrow-proof.nov", "let R=struct{x:int=0,}\nlet f:(flag:bool)={let mut a=[R[]]\nlet r=&a[0]\nr.*.x=1\n@println(a[0].x)\nif flag {let s=&a[0]\ns.*.x+=1} else {let t=&a[0]\nt.*.x+=1}}");
+    var module = try Module.init(std.testing.allocator, "borrow-proof.nov", "let R=struct{x:int=0,}\nlet f:(flag:bool)={let mut a=[R.[]]\nlet r=&a[0]\nr.*.x=1\n@println(a[0].x)\nif flag {let s=&a[0]\ns.*.x+=1} else {let t=&a[0]\nt.*.x+=1}}");
     defer module.deinit();
     var result = try lower(&module);
     defer result.deinit();
@@ -3445,9 +3801,9 @@ test "static borrowing verifier rejects well typed forged owner access and sibli
 test "append RHS projects only final reads and keeps assignment snapshots" {
     for ([_][]const u8{
         "let main:()={let mut a:[]int=[1]\na+=a\nlet b=a\na=b}",
-        "let L=struct{a:[]int,}\nlet T=struct{leaf:L,}\nlet main:()={let mut a=T[.leaf=L[.a=[1]]]\na.leaf.a+=a.leaf.a\nlet b=a.leaf.a\na.leaf.a=b}",
-        "let L=struct{a:[]int,}\nlet main:()={let mut a=L[.a=[1]]\nlet r=&a\nr.*.a+=r.*.a\nlet b=r.*.a\nr.*.a=b}",
-        "let L=struct{a:[]int,}\nlet main:()={let mut a=[L[.a=[1]]]\nlet r=&a[0]\nr.*.a+=r.*.a\nlet b=r.*.a\nr.*.a=b}",
+        "let L=struct{a:[]int,}\nlet T=struct{leaf:L,}\nlet main:()={let mut a=T.[leaf=L.[a=[1]]]\na.leaf.a+=a.leaf.a\nlet b=a.leaf.a\na.leaf.a=b}",
+        "let L=struct{a:[]int,}\nlet main:()={let mut a=L.[a=[1]]\nlet r=&a\nr.*.a+=r.*.a\nlet b=r.*.a\nr.*.a=b}",
+        "let L=struct{a:[]int,}\nlet main:()={let mut a=[L.[a=[1]]]\nlet r=&a[0]\nr.*.a+=r.*.a\nlet b=r.*.a\nr.*.a=b}",
     }) |source| {
         var module = try Module.init(std.testing.allocator, "append-rhs-ir.nov", source);
         defer module.deinit();
@@ -3475,7 +3831,7 @@ test "append RHS projects only final reads and keeps assignment snapshots" {
 }
 
 test "static borrowing normal array loads clone immediately before later borrow effects" {
-    var module = try Module.init(std.testing.allocator, "borrow-snapshot-ir.nov", "let R=struct{x:int=0,}\nlet main:()={let mut a=[R[],R[]]\nlet before=a\nlet value=a[{let r=&a[0]\nr.*.x=9\n0}]\na+={let r=&a[0]\nr.*.x=8\n[R[]]}\na[{let r=&a[0]\nr.*.x=7\n1}]={let r=&a[0]\nr.*.x=6\nR[]}\n@println(value.x,before[0].x,a[0].x)}");
+    var module = try Module.init(std.testing.allocator, "borrow-snapshot-ir.nov", "let R=struct{x:int=0,}\nlet main:()={let mut a=[R.[],R.[]]\nlet before=a\nlet value=a[{let r=&a[0]\nr.*.x=9\n0}]\na+={let r=&a[0]\nr.*.x=8\n[R.[]]}\na[{let r=&a[0]\nr.*.x=7\n1}]={let r=&a[0]\nr.*.x=6\nR.[]}\n@println(value.x,before[0].x,a[0].x)}");
     defer module.deinit();
     var result = try lower(&module);
     defer result.deinit();

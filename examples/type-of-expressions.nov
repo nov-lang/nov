@@ -24,7 +24,7 @@ let Record = struct {
 @[test]
 let literals_calls_fields_and_indices: () = {
     let values = [1, 2]
-    let record = Record[ .value = 3 ]
+    let record = Record.[ value = 3 ]
     let integer: @TypeOf(1) = 4
     let fraction: @TypeOf(1.5) = 2.5
     let character: @TypeOf('λ') = '世'
@@ -77,9 +77,9 @@ let operands_do_not_execute_or_store: () = {
             count
         }
     ) = 3
-    let defaulted: @TypeOf(Record[]) = Record[ .value = 4 ]
-    let constructed: @TypeOf(Record[ .value = fail() ]) = Record[]
-    let converted: @TypeOf("{Record[]}") = "safe"
+    let defaulted: @TypeOf(Record.[]) = Record.[ value = 4 ]
+    let constructed: @TypeOf(Record.[ value = fail() ]) = Record.[]
+    let converted: @TypeOf("{Record.[]}") = "safe"
     @assert(count == 0 and called == 1 and divided == 2 and mutated == 3)
     @assert(defaulted.value == 4 and constructed.value == 0 and converted == "safe")
 }

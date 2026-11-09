@@ -73,6 +73,7 @@ fn checkSupported(ast: Ast) !void {
         .root,
         .container_decl,
         .container_decl_arg,
+        .struct_init,
         .container_field,
         .unwrap,
         .enum_literal,
@@ -556,16 +557,48 @@ test "extern formatting preserves bodyless declarations comments escapes and tra
     }
 }
 
-test "constructor shorthand formatting preserves tokens comments and structure" {
+test "anonymous constructors format named positional contextual comments interpolation and OOM" {
+    try expectFormatted("let a=.[x=1,y=2]", "let a = .[ x = 1, y = 2 ]\n");
+    try expectFormatted("let a=.[1,2]", "let a = .[ 1, 2 ]\n");
+    try expectFormatted("let a=R.[]", "let a = R.[]\n");
     for ([_][:0]const u8{
-        "let f:()=R[.width,.height=height,.depth,]",
-        "let f:()=R[\n; start\n.width, ; supplied\n.height=height,\n.depth ; last\n]",
-        "let f:()=R[.width ; last without comma\n]",
+        "let a=.[1,\"a\"]\nlet b=[1,2]",
+        "let a=.[; open\na=1, ; first\nb=.[2,3],\n]",
+        "let a=R.[; open\nwidth,\nheight=2 ; last\n]",
+        "let a=.[; empty\n]",
+        "let a=\"{.[a=1]}:{.[1,2]}\"",
+        "let a=U.tag[1]\nlet b=.tag[2]\nlet c=U.none[]\nlet d=.none[]",
     }) |source| {
         const result = try format(std.testing.allocator, source);
         defer std.testing.allocator.free(result);
         try expectFormatted(source, result);
-        try std.testing.expect(std.mem.indexOf(u8, result, ".width =") == null);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{source});
+    }
+}
+
+test "constructor shorthand formatting preserves tokens comments and structure" {
+    try expectFormatted("let value=Name.[width,height]", "let value = Name.[ width, height ]\n");
+    try expectFormatted("let value:Name=.[width,height]", "let value: Name = .[ width, height ]\n");
+    try expectFormatted("let value=.[x,y]", "let value = .[ x, y ]\n");
+    try expectFormatted("let value=.[x=x,y=y]", "let value = .[ x = x, y = y ]\n");
+    try expectFormatted("let value=Name.[.width]", "let value = Name.[ .width ]\n");
+    try expectFormatted("let value=.[.red]", "let value = .[ .red ]\n");
+    for ([_][:0]const u8{
+        "let f:()=R.[width,height=height,depth,]",
+        "let f:()=R.[\n; start\nwidth, ; supplied\nheight=height,\ndepth ; last\n]",
+        "let f:()=R.[width ; last without comma\n]",
+        "let value:Name=.[; open\nwidth, ; first\nheight ; last\n]",
+        "let value=.[; inferred positional\nx, ; first\ny,\n]",
+        "let value=.[height=2, ; explicit first\nwidth]",
+        "let value=.[width, ; identifier first\nheight=2]",
+        "let value=\"{Name.[width,height]}:{.[width,height=2]}\"",
+        "let value=Name.[; enum operand, not shorthand\n.red,\n]",
+    }) |source| {
+        const result = try format(std.testing.allocator, source);
+        defer std.testing.allocator.free(result);
+        try expectFormatted(source, result);
+        try std.testing.expect(std.mem.indexOf(u8, result, ".width") == null);
+        try std.testing.expect(std.mem.indexOf(u8, result, "width =") == null);
         try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{source});
     }
 }
@@ -573,9 +606,9 @@ test "constructor shorthand formatting preserves tokens comments and structure" 
 test "nominal struct formatting preserves public attributes fields defaults methods constructor comments and interpolation" {
     for ([_][:0]const u8{
         "let R=struct{lo:i128=-170141183460469231731687303715884105728,top:u128=340282366920938463463374607431768211455,}\nlet f:(r:R)={}",
-        "@[public]\nlet R=struct{; open\nx:int=0, ; default\n; next field\ny:string,\n\n@[public]\n@[stringify]\nlet toString:(self:R)->string=\"{self.x}:{self.y}\"\n}\nlet main:()={let r=R[.x=1,.y=\"hello\"]\n@println(r)}",
-        "let R=struct{\n; empty\n}\nlet main:()={let r=R[\n; empty constructor\n]\n@println(true)}",
-        "let R=struct{x:string,}\nlet main:()={let r=R[\n.x=\"hello\", ; value\n]\n@println(r.x)}",
+        "@[public]\nlet R=struct{; open\nx:int=0, ; default\n; next field\ny:string,\n\n@[public]\n@[stringify]\nlet toString:(self:R)->string=\"{self.x}:{self.y}\"\n}\nlet main:()={let r=R.[x=1,y=\"hello\"]\n@println(r)}",
+        "let R=struct{\n; empty\n}\nlet main:()={let r=R.[\n; empty constructor\n]\n@println(true)}",
+        "let R=struct{x:string,}\nlet main:()={let r=R.[\nx=\"hello\", ; value\n]\n@println(r.x)}",
     }) |source| {
         const result = try format(std.testing.allocator, source);
         defer std.testing.allocator.free(result);
@@ -697,8 +730,8 @@ test "every unsupported AST tag is rejected before rendering" {
         .@"break",      .@"continue",      .assign,             .assign_add,        .assign_sub,           .assign_mul,     .assign_div,
         .assign_mod,    .builtin_literal,  .array_type,         .array_init_two,    .array_init_two_comma, .array_init,     .array_init_comma,
         .array_access,  .slice,            .field_access,       .in,                .match,                .match_case_one, .match_case,
-        .function_pipe, .container_decl,   .container_decl_arg, .container_field,   .unwrap,               .enum_literal,   .attr_one,
-        .attr_decl_one, .attr_decl,        .ref_type,           .deref,
+        .function_pipe, .container_decl,   .container_decl_arg, .struct_init,       .container_field,      .unwrap,         .enum_literal,
+        .attr_one,      .attr_decl_one,    .attr_decl,          .ref_type,          .deref,
     };
     var ast = try Parser.parse(std.testing.allocator, "let x=1\n");
     defer ast.deinit(std.testing.allocator);

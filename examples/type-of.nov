@@ -20,7 +20,7 @@ let main: () = {
     let numbers: []@TypeOf(value) = [1, 2]
     @assert("{@TypeOf(loan)}" == "&mut {@TypeOf(value)}")
     loan.* += 1
-    let boxed = Box(@TypeOf(other))[ .value = 9 ]
+    let boxed = Box(@TypeOf(other)).[ value = 9 ]
     let callback: (int) -> int = identity
     @println("Types:", @TypeOf(value), @TypeOf(numbers), @TypeOf(boxed), @TypeOf(callback))
     @println("Values:", original, other, copy(numbers), boxed.value)
@@ -33,7 +33,7 @@ let annotations_ascriptions_and_generic_results: () = {
     let exact = @as(@TypeOf(value), 9)
     let returned = identity(value)
     let checked: u8 = returned
-    let boxed = Box(@TypeOf(value))[ .value = same_type ]
+    let boxed = Box(@TypeOf(value)).[ value = same_type ]
     @assert(exact == 9 and checked == 7 and boxed.value == 8)
     @assert("{@TypeOf(value)}" == "u8")
     @assert("{@TypeOf(boxed)}" == "Box(u8)")

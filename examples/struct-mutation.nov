@@ -11,7 +11,7 @@ let Counter = struct {
 }
 
 let main: () = {
-    let mut counter = Counter[]
+    let mut counter = Counter.[]
     let original = counter
     loop _ in 0..3 {
         counter.count += 1

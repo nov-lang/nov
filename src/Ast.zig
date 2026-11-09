@@ -148,11 +148,12 @@ test "nested call views retain independent argument slices" {
 
 test "expression token boundaries follow delimiters rather than newline counts" {
     const expressions = [_][:0]const u8{
-        "[]",                "[1]",    "[1, 2,]",  "[1, 2, 3,\n]",    "[[1], [2, 3],]",       "a[0]",                              "a[-1]",                         "make()[0]",               "a[call(0)]",
-        "{}",                "{\n\n}", "{1}",      "{1\n}",           "{\n1\n\n; tail\n}",    "{1\n2}",                            "{1\n2\n3\n\n}",                 "{{1}\n{2}\n3}",           "named: {1}",
-        "{\r\n\t1\r\n\r\n}", "f()",    "f(\n\n)",  "f(1)",            "f(1,)",                "f(\n1\n)",                          "f(1, 2)",                       "f(1, 2,\n\n)",            "f(g(1), h(2, 3))",
-        "()",                "(\n\n)", "(x: int)", "(x: int,\n\n)",   "(x: int, y: bool,\n)", "(callback: (x: int) -> int,\n)",    "() -> int",                     "(x: int, y: int) -> int", "1 + f(2, 3)",
-        "{1} * 3",           "-f(1)",  "#f(1)",    "f(\"(\", \")\")", "{\"}\"}",              "f(1, ; ) ignored in comment\n2\n)", "{; } ignored in comment\n1\n}",
+        "[]",                "[1]",        "[1, 2,]",         "[1, 2, 3,\n]",    "[[1], [2, 3],]",         "a[0]",                              "a[-1]",                         "make()[0]",               "a[call(0)]",
+        "{}",                "{\n\n}",     "{1}",             "{1\n}",           "{\n1\n\n; tail\n}",      "{1\n2}",                            "{1\n2\n3\n\n}",                 "{{1}\n{2}\n3}",           "named: {1}",
+        "{\r\n\t1\r\n\r\n}", "f()",        "f(\n\n)",         "f(1)",            "f(1,)",                  "f(\n1\n)",                          "f(1, 2)",                       "f(1, 2,\n\n)",            "f(g(1), h(2, 3))",
+        "()",                "(\n\n)",     "(x: int)",        "(x: int,\n\n)",   "(x: int, y: bool,\n)",   "(callback: (x: int) -> int,\n)",    "() -> int",                     "(x: int, y: int) -> int", "1 + f(2, 3)",
+        "{1} * 3",           "-f(1)",      "#f(1)",           "f(\"(\", \")\")", "{\"}\"}",                "f(1, ; ) ignored in comment\n2\n)", "{; } ignored in comment\n1\n}", ".[]",                     ".[a=1]",
+        ".[1,2]",            ".[1,\"a\"]", "Name.[a=.[1,2]]", "Name.[width]",    ".[; ] ignored\na=1,\n]", "make().[a=1]",                      ".[1,2][0]",
     };
     for (expressions) |expression| {
         errdefer std.debug.print("expression span case: {s}\n", .{expression});
@@ -435,6 +436,7 @@ pub fn renderError(self: Ast, parse_error: Error, writer: anytype) !void {
                 token_tags[parse_error.token + @intFromBool(parse_error.token_is_prev)].symbol(),
             });
         },
+        .mixed_initializer_operands => return writer.writeAll("cannot mix named and positional initializer operands"),
         .expected_expr => {
             return writer.print("expected expression, found '{s}'", .{
                 token_tags[parse_error.token + @intFromBool(parse_error.token_is_prev)].symbol(),
@@ -659,6 +661,10 @@ pub fn firstToken(self: Ast, node: Node.Index) TokenIndex {
         .enum_literal,
         => return main_tokens[n] - 1 - end_offset,
 
+        .struct_init => {
+            if (datas[n].lhs == 0) return main_tokens[n] - 1 - end_offset;
+            n = datas[n].lhs;
+        },
         .container_decl_arg,
         .field_access,
         .unwrap,
@@ -869,7 +875,7 @@ pub fn lastToken(self: Ast, node: Node.Index) TokenIndex {
         => return self.matchingDelimiter(main_tokens[n]) + end_offset,
 
         .container_decl => return self.matchingDelimiter(main_tokens[n] + 1) + end_offset,
-        .container_decl_arg, .array_access, .slice => return self.matchingDelimiter(main_tokens[n]) + end_offset,
+        .struct_init, .container_decl_arg, .array_access, .slice => return self.matchingDelimiter(main_tokens[n]) + end_offset,
         .container_field => {
             if (datas[n].lhs == 0 and datas[n].rhs == 0) return main_tokens[n] + end_offset;
             n = if (datas[n].rhs != 0) datas[n].rhs else datas[n].lhs;
@@ -944,9 +950,17 @@ pub fn fullStruct(self: Ast, node: Node.Index) ?[]const Node.Index {
 }
 
 /// Constructor operands remain in source order, not layout order.
+/// For struct_init, type_node=0 means contextual/inferred. Explicit named
+/// operands are container_field nodes (lhs=0, rhs=value). Bare identifiers stay
+/// raw expressions: explicit named entries or an expected named struct make
+/// them same-name fields; otherwise they remain positional. Explicit named
+/// entries cannot mix with non-identifier positional expressions. Enum literals
+/// such as `.red` are always raw expressions, never same-name fields.
+/// Legacy container_decl_arg is retained for union/enum constructors.
 pub const StructInit = struct { type_node: Node.Index, fields: []const Node.Index };
 pub fn fullStructInit(self: Ast, node: Node.Index) ?StructInit {
-    if (self.nodes.items(.tag)[node] != .container_decl_arg) return null;
+    const tag = self.nodes.items(.tag)[node];
+    if (tag != .struct_init and tag != .container_decl_arg) return null;
     const data = self.nodes.items(.data)[node];
     const range = self.extraData(data.rhs, Node.SubRange);
     return .{ .type_node = data.lhs, .fields = self.extra_data[range.start..range.end] };
@@ -1502,6 +1516,7 @@ pub const Error = struct {
         unsupported_enum_backing,
         unsupported_range_loop,
         expected_decl,
+        mixed_initializer_operands,
         expected_expr,
         expected_expr_or_assignment,
         expected_expr_or_decl,
@@ -1766,15 +1781,24 @@ pub const Node = struct {
         /// Same as container_decl_two except there is known to be a trailing comma
         /// or newline before the rbrace.
         container_decl_two_trailing,
-        /// Explicit `lhs[ .field = value, .same_name, ... ]` constructor.
+        /// `lhs.[name = value]` or `.[expr, ...]`. lhs is the optional type
+        /// node (0 for contextual/inferred); SubRange[rhs] owns ordered operands.
+        /// Explicit named operands are container_field nodes; other operands
+        /// are expressions. Bare identifier expressions defer same-name field
+        /// versus positional interpretation to named context in the frontend.
+        /// main_token is `[`, immediately preceded by `.`.
+        struct_init,
+        /// Legacy `lhs[ .field = value, .same_name, ... ]` constructor.
+        /// Only union/enum construction is semantically valid.
         /// `SubRange[rhs]` contains container_field nodes with lhs=0;
         /// main_token is the `[`. Shorthand fields have rhs=0.
         container_decl_arg,
         /// Same as container_decl_arg but there is known to be a trailing
         /// comma or newline before the rbrace.
         container_decl_arg_trailing,
-        /// Declaration `a: lhs = rhs,` (rhs optional), or constructor `.a = rhs`
-        /// (lhs=0), or shorthand `.a` (lhs=rhs=0).
+        /// Declaration `a: lhs = rhs,` (rhs optional), or initializer `a = rhs`
+        /// (lhs=0, rhs nonzero). Legacy container_decl_arg also uses `.a = rhs`
+        /// or `.a` shorthand (lhs=rhs=0); struct_init never does.
         /// Constructor punctuation belongs to the surrounding initializer.
         /// main_token is the field name identifier.
         /// lastToken() does not include the possible trailing comma.

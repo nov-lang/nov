@@ -32,12 +32,12 @@ let Rectangle = struct {
 
 @[export]
 let rectangle_area: (width: u32, height: u32) -> u32 = {
-    let rectangle = Rectangle[ .width = width, .height = height ]
+    let rectangle = Rectangle.[ width = width, height = height ]
     rectangle.area()
 }
 
 @[export("rectangle_perimeter")]
 let perimeter: (width: u32, height: u32) -> u32 = {
-    let rectangle = Rectangle[ .width = width, .height = height ]
+    let rectangle = Rectangle.[ width = width, height = height ]
     rectangle.perimeter()
 }

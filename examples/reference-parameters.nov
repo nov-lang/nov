@@ -85,7 +85,7 @@ let generic_swap_and_methods: () = {
     @assert(a == 9 and b == 3)
     let mut first = "one"
     let mut second = "two"
-    Tools[].exchange(&first, &second)
+    Tools.[].exchange(&first, &second)
     @assert(first == "two" and second == "one")
     let f: (&mut int, &mut int) = swap
     f(&a, &b)
@@ -118,7 +118,7 @@ let managed_arrays_records_and_strings: () = {
     suffix(&words[0], "!")
     @assert(words[0] == "old!" and words[1] == "tail")
     @assert(saved.len == 1 and saved[0] == "old")
-    let mut record = Record[ .name = "record", .values = ["original"] ]
+    let mut record = Record.[ name = "record", values = ["original"] ]
     let snapshot = record
     update(&record)
     @assert(record.name == "record!" and record.values.len == 2)

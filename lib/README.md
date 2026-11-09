@@ -19,6 +19,23 @@ bare names.
 
 ## Storable struct fields
 
+Struct constructors use `Processor.[run = callback, outcome = .ok[[1]], interval = 0..10]`
+or contextual `.[field = value]` under an expected struct type. Nominal shorthand
+`Type.[field]` and contextual `let p: Type = .[field]` read same-named scoped
+values without dots; old dotted shorthand `Type.[.field]` is rejected.
+Inferred all-bare `.[x, y]` is positional, while an explicit assignment plus bare
+names is named. Contextual named entries map to the expected layout independent
+of source order. Old `Type[.field = value]` / `Type[]` source
+constructors are rejected. Anonymous named `.[a = 1]` and positional `.[1, "a"]`
+values work with inferred generic helpers such as `std.array.map`. Their structural
+identity uses ordered names and exact canonical types, including public module
+aliases, and is distinct from nominal structs. `.[1, 2]` is not an array; `[1, 2]`
+is. No positional access/destructuring or mixed named/positional syntax is added.
+Existing scalar-only defaults, recursive array snapshots and closure-field sharing
+remain unchanged. Anonymous unions/enums remain deferred; `.some[value]`, `.none[]`,
+array indexing and slicing keep their existing syntax. See
+`examples/anonymous-structs.nov` and `zig build test-cli-anonymous-structs`.
+
 Struct fields may hold every ordinary storable runtime value, including the
 standard library's unions, callbacks and ranges:
 
@@ -30,10 +47,10 @@ let Processor = struct {
 }
 
 let main: () = {
-    let processor = Processor[
-        .run = (value) { value + 1 },
-        .outcome = .ok[[1, 2]],
-        .interval = 0..10,
+    let processor = Processor.[
+        run = (value) { value + 1 },
+        outcome = .ok[[1, 2]],
+        interval = 0..10,
     ]
     @println(processor.run(4), processor.outcome)
 }

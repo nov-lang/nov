@@ -344,7 +344,7 @@ pub fn classifyAliases(self: *Module) std.mem.Allocator.Error!void {
                 if (full.type_node != 0) try work.append(self.allocator, full.type_node);
             },
             .container_field => if (data[node].lhs != 0) try work.append(self.allocator, data[node].lhs),
-            .container_decl_arg => try work.append(self.allocator, data[node].lhs),
+            .struct_init => if (data[node].lhs != 0) try work.append(self.allocator, data[node].lhs),
             .fn_proto, .fn_proto_one, .array_type => try work.append(self.allocator, node),
             .call, .call_one, .call_comma, .call_one_comma => {
                 const call = self.source.ast.fullCall(node).?;

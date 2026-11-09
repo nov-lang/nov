@@ -14,7 +14,7 @@ let Profile = struct {
 }
 
 let main: () = {
-    let mut profile = Profile[ .name = "Ada", .location = Location[ .city = "Paris" ] ]
+    let mut profile = Profile.[ name = "Ada", location = Location.[ city = "Paris" ] ]
     let original = profile
     profile.location.city += " updated"
     profile.location.visits += 2

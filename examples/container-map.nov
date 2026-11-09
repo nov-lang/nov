@@ -173,7 +173,7 @@ let eager_receiver_and_callback_construction: () = {
 
 @[test]
 let record_payloads_and_recursive_array_copies: () = {
-    let mut row = Row[ .values = [[1, 2], [3]] ]
+    let mut row = Row.[ values = [[1, 2], [3]] ]
     let some: Option(Row) = .some[row]
     let good: Result(Row, Row) = .ok[row]
     let bad: Result(Row, Row) = .err[row]
@@ -185,7 +185,7 @@ let record_payloads_and_recursive_array_copies: () = {
             copy
         }
     )
-    let fallback = Row[ .values = [] ]
+    let fallback = Row.[ values = [] ]
     @assert(changed.unwrapOr(fallback).values[0][0] == 8)
     @assert(some.unwrapOr(fallback).values[0][0] == 1)
     let mapped = good.map(
@@ -376,16 +376,16 @@ let chained_container_operations: () = {
     }
     @assert(receiver().andThen(callback()).isNone() and events == 12)
 
-    let source: Option(Row) = .some[Row[ .values = [[1]] ]]
+    let source: Option(Row) = .some[Row.[ values = [[1]] ]]
     let snapshot = source.andThen(
         (row) {
             Option(Row).some[row]
         }
     )
-    let mut copy = snapshot.unwrapOr(Row[ .values = [] ])
+    let mut copy = snapshot.unwrapOr(Row.[ values = [] ])
     copy.values = [[9]]
-    @assert(source.unwrapOr(Row[ .values = [] ]).values[0][0] == 1)
-    @assert(snapshot.unwrapOr(Row[ .values = [] ]).values[0][0] == 1)
+    @assert(source.unwrapOr(Row.[ values = [] ]).values[0][0] == 1)
+    @assert(snapshot.unwrapOr(Row.[ values = [] ]).values[0][0] == 1)
 }
 
 let main: () = {

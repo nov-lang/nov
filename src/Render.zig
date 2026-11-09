@@ -420,8 +420,6 @@ fn renderExpression(self: *Render, node: Ast.Node.Index, space: Space) RenderErr
             return self.renderToken(ast.lastToken(node), space);
         },
 
-        // TODO: struct_init
-
         .call_one, .call_one_comma, .call, .call_comma => {
             const call = ast.fullCall(node).?;
             try self.renderExpression(call.ast.fn_expr, .none);
@@ -507,24 +505,27 @@ fn renderExpression(self: *Render, node: Ast.Node.Index, space: Space) RenderErr
             ais.popIndent();
             return self.renderToken(ast.lastToken(node), space);
         },
-        .container_decl_arg => {
+        .struct_init, .container_decl_arg => {
             const init = ast.fullStructInit(node).?;
-            try self.renderExpression(init.type_node, .none);
+            if (init.type_node != 0) try self.renderExpression(init.type_node, .none);
+            const is_struct = node_tags[node] == .struct_init;
+            if (is_struct) try self.renderToken(main_tokens[node] - 1, .none);
             const multiline = self.listIsMultiline(main_tokens[node], ast.lastToken(node));
             if (multiline) try ais.pushIndent(.normal);
             try self.renderToken(main_tokens[node], if (multiline) .newline else if (init.fields.len != 0) .space else .none);
             for (init.fields) |field| {
+                const named = node_tags[field] == .container_field;
                 const token = main_tokens[field];
-                const value = datas[field].rhs;
-                try self.renderToken(token - 1, .none);
+                const value = if (named) datas[field].rhs else field;
+                if (named and !is_struct) try self.renderToken(token - 1, .none);
                 const last = if (value == 0) token else ast.lastToken(value);
                 const comma = token_tags[last + 1] == .comma;
                 const ending: Space = if (comma) .none else if (multiline) .newline else .space;
-                try self.renderToken(token, if (value == 0) ending else .space);
-                if (value != 0) {
-                    try self.renderToken(token + 1, .space);
-                    try self.renderExpression(value, ending);
+                if (named) {
+                    try self.renderToken(token, if (value == 0) ending else .space);
+                    if (value != 0) try self.renderToken(token + 1, .space);
                 }
+                if (value != 0) try self.renderExpression(value, ending);
                 if (comma) try self.renderToken(last + 1, if (multiline) .newline else .space);
             }
             if (multiline) ais.popIndent();

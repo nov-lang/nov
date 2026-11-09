@@ -106,20 +106,20 @@ let find_payload_types_and_recursive_copies: () = {
     @assert(std.array.find(["first", "second"], yes).unwrapOr("") == "first")
     let colors: []Color = [.blue, .red]
     @assert(std.array.find(colors, yes).unwrapOr(.red) == .blue)
-    let mut source = [Row[ .values = [[1, 2], [3]] ]]
+    let mut source = [Row.[ values = [[1, 2], [3]] ]]
     let found = std.array.find(
         source,
         (value: Row) -> bool {
             let mut copy = value
             copy.values = [[8]]
-            source[0] = Row[ .values = [[9]] ]
+            source[0] = Row.[ values = [[9]] ]
             true
         }
     )
-    let mut row = found.unwrapOr(Row[ .values = [] ])
+    let mut row = found.unwrapOr(Row.[ values = [] ])
     @assert(row.values[0][0] == 1 and row.values[0].len == 2)
     row.values = [[7]]
-    @assert(found.unwrapOr(Row[ .values = [] ]).values[0][0] == 1)
+    @assert(found.unwrapOr(Row.[ values = [] ]).values[0][0] == 1)
     @assert(source[0].values[0][0] == 9)
 }
 

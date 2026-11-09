@@ -1448,6 +1448,7 @@ fn parsePrimaryTypeExpr(self: *Parser) Error!Node.Index {
         },
         // TODO: see README proposal
         .period => switch (self.token_tags[self.tok_i + 1]) {
+            .l_bracket => return self.parseStructInit(0),
             .identifier => return self.addNode(.{
                 .tag = .enum_literal,
                 .data = .{
@@ -1462,23 +1463,85 @@ fn parsePrimaryTypeExpr(self: *Parser) Error!Node.Index {
     }
 }
 
+test "anonymous constructors own named and positional operands with exact spans and OOM" {
+    for ([_][:0]const u8{ ".[a=1,b=\"x\"]", ".[1,\"a\"]", ".[1,2]", ".[]", "Name.[a=.[1,2]]", "Name.[width]", ".[x,y]", ".[x=x,y=y]", ".[.red]", "Name.[.width]", ".[.red,1]" }) |expression| {
+        const source = try std.fmt.allocPrintSentinel(std.testing.allocator, "let value={s}", .{expression}, 0);
+        defer std.testing.allocator.free(source);
+        var ast = try parse(std.testing.allocator, source);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+        const node = ast.decl(ast.rootDecls()[0]).ast.init_node;
+        try std.testing.expectEqual(.struct_init, ast.nodes.items(.tag)[node]);
+        const init = ast.fullStructInit(node).?;
+        const range = ast.extraData(ast.nodes.items(.data)[node].rhs, Node.SubRange);
+        try std.testing.expect(init.fields.ptr == ast.extra_data[range.start..range.end].ptr);
+        try std.testing.expectEqual(std.mem.startsWith(u8, expression, "."), init.type_node == 0);
+        try std.testing.expectEqualStrings(expression, ast.getNodeSource(node));
+        if (std.mem.startsWith(u8, expression, ".[1")) {
+            try std.testing.expectEqual(@as(usize, 2), init.fields.len);
+            try std.testing.expectEqual(.number_literal, ast.nodes.items(.tag)[init.fields[0]]);
+        }
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
+    }
+    var ast = try parse(std.testing.allocator, "let a=[1,2]\nlet b=U.tag[1]\nlet c=.tag[1]\nlet d=U.none[]\nlet e=a[0]\nlet f=a[..]");
+    defer ast.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    const expected = [_]Node.Tag{ .array_init_two, .array_access, .array_access, .container_decl_arg, .array_access, .slice };
+    for (ast.rootDecls(), expected) |decl, tag| try std.testing.expectEqual(tag, ast.nodes.items(.tag)[ast.decl(decl).ast.init_node]);
+}
+
+test "anonymous constructors reject mixed malformed and dotted assignments without panicking" {
+    for ([_][:0]const u8{ "let a=.[a=1,2]", "let a=.[1,a=2]", "let a=Name.[.a=1]", "let a=.[", "let a=.[a=]", "let a=.[1,", "let a=.[a=1 b=2]", "let a=.[.a,b=1]", "let a=.[a=1,.b]", "let a=.[a=1,f()]", "let a=.[f(),a=1]" }) |source| {
+        var ast = try parse(std.testing.allocator, source);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expect(ast.errors.len != 0);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
+    }
+}
+
+test "constructor shorthand defers bare identifiers and preserves enum operands under OOM" {
+    const cases = [_]struct { source: [:0]const u8, tags: []const Node.Tag }{
+        .{ .source = "let value=Name.[width,height]", .tags = &.{ .identifier, .identifier } },
+        .{ .source = "let value:Name=.[width,height]", .tags = &.{ .identifier, .identifier } },
+        .{ .source = "let value=.[x,y]", .tags = &.{ .identifier, .identifier } },
+        .{ .source = "let value=.[x=x,y=y]", .tags = &.{ .container_field, .container_field } },
+        .{ .source = "let value=.[width,height=2,depth]", .tags = &.{ .identifier, .container_field, .identifier } },
+        .{ .source = "let value=.[height=2,width]", .tags = &.{ .container_field, .identifier } },
+        .{ .source = "let value=.[x,1]", .tags = &.{ .identifier, .number_literal } },
+        .{ .source = "let value=Name.[.width]", .tags = &.{.enum_literal} },
+        .{ .source = "let value=.[.red]", .tags = &.{.enum_literal} },
+        .{ .source = "let value=.[.red,1]", .tags = &.{ .enum_literal, .number_literal } },
+    };
+    for (cases) |case| {
+        var ast = try parse(std.testing.allocator, case.source);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+        const node = ast.decl(ast.rootDecls()[0]).ast.init_node;
+        const init = ast.fullStructInit(node).?;
+        try std.testing.expectEqual(case.tags.len, init.fields.len);
+        for (init.fields, case.tags) |operand, expected| try std.testing.expectEqual(expected, ast.nodes.items(.tag)[operand]);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{case.source});
+    }
+}
+
 test "constructor shorthand preserves structural operands and token ranges" {
-    const source = "let f:()=Rectangle[.width,.height=2,.depth,]";
+    const source = "let f:()=Rectangle.[width,height=2,depth,]";
     var ast = try parse(std.testing.allocator, source);
     defer ast.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
 
-    for (ast.nodes.items(.tag), 0..) |tag, i| if (tag == .container_decl_arg) {
+    for (ast.nodes.items(.tag), 0..) |tag, i| if (tag == .struct_init) {
         const node: Node.Index = @intCast(i);
         const init = ast.fullStructInit(node).?;
         try std.testing.expectEqual(@as(usize, 3), init.fields.len);
         for (init.fields, [_][]const u8{ "width", "height=2", "depth" }, 0..) |field, text, index| {
             try std.testing.expectEqualStrings(text, ast.getNodeSource(field));
-            try std.testing.expectEqual(index != 1, ast.nodes.items(.data)[field].rhs == 0);
+            try std.testing.expectEqual(if (index == 1) Node.Tag.container_field else Node.Tag.identifier, ast.nodes.items(.tag)[field]);
+            if (index == 1) try std.testing.expect(ast.nodes.items(.data)[field].rhs != 0);
         }
-        try std.testing.expectEqualStrings("Rectangle[.width,.height=2,.depth,]", ast.getNodeSource(node));
+        try std.testing.expectEqualStrings("Rectangle.[width,height=2,depth,]", ast.getNodeSource(node));
     };
-    for ([_][:0]const u8{ "let f:()=R[.a,.b.c]", "let f:()=R[.*]" }) |invalid| {
+    for ([_][:0]const u8{ "let f:()=R.[a=1,.b.c]", "let f:()=R.[.*]" }) |invalid| {
         var bad = try parse(std.testing.allocator, invalid);
         defer bad.deinit(std.testing.allocator);
         try std.testing.expect(bad.errors.len != 0);
@@ -1486,7 +1549,7 @@ test "constructor shorthand preserves structural operands and token ranges" {
 }
 
 test "struct AST owns ordered members constructors attributes interpolation and exact source ranges" {
-    const source = "@[public]\nlet A=struct {; fields\nx:int=0,\ny:string,\n@[public]\n@[stringify]\nlet toString:(self:A)->string=\"{self.x}:{self.y}\"\n}\nlet main:()={let a=A[\n.x=1, ; argument\n.y=\"hé\",\n]\n@println(a)}";
+    const source = "@[public]\nlet A=struct {; fields\nx:int=0,\ny:string,\n@[public]\n@[stringify]\nlet toString:(self:A)->string=\"{self.x}:{self.y}\"\n}\nlet main:()={let a=A.[\nx=1, ; argument\ny=\"hé\",\n]\n@println(a)}";
     var ast = try parse(std.testing.allocator, source);
     defer ast.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
@@ -1495,11 +1558,11 @@ test "struct AST owns ordered members constructors attributes interpolation and 
     const members = ast.fullStruct(declaration.ast.init_node).?;
     try std.testing.expectEqual(@as(usize, 3), members.len);
     try std.testing.expectEqualStrings("struct {; fields\nx:int=0,\ny:string,\n@[public]\n@[stringify]\nlet toString:(self:A)->string=\"{self.x}:{self.y}\"\n}", ast.getNodeSource(declaration.ast.init_node));
-    for (ast.nodes.items(.tag), 0..) |tag, i| if (tag == .container_decl_arg) {
+    for (ast.nodes.items(.tag), 0..) |tag, i| if (tag == .struct_init) {
         const node: Node.Index = @intCast(i);
         const init = ast.fullStructInit(node).?;
         try std.testing.expectEqual(@as(usize, 2), init.fields.len);
-        try std.testing.expectEqualStrings("A[\n.x=1, ; argument\n.y=\"hé\",\n]", ast.getNodeSource(node));
+        try std.testing.expectEqualStrings("A.[\nx=1, ; argument\ny=\"hé\",\n]", ast.getNodeSource(node));
     };
 }
 
@@ -1507,13 +1570,48 @@ test "malformed structs constructors and attributes recover without panicking" {
     for ([_][:0]const u8{
         "let A=struct",               "let A=struct {x}",           "let A=struct {x:int}",
         "let A=struct {x:int=,}",     "let A=struct {@[public]\n}", "let A=struct {var x:int,}",
-        "let a=A[.x=,]",              "let a=A[.x=]",               "let a=A[.x=1,.x.y]",
+        "let a=A.[x=,]",              "let a=A.[x=]",               "let a=A.[x=1,.x.y]",
         "let A=struct {let f:()=\n}",
     }) |source| {
         var ast = try parse(std.testing.allocator, source);
         defer ast.deinit(std.testing.allocator);
         try std.testing.expect(ast.errors.len != 0);
     }
+}
+
+fn parseStructInit(self: *Parser, type_node: Node.Index) Error!Node.Index {
+    _ = self.assertToken(.period);
+    const lbracket = self.assertToken(.l_bracket);
+    const top = self.scratch.items.len;
+    defer self.scratch.shrinkRetainingCapacity(top);
+    var has_named = false;
+    var has_positional = false;
+    self.eatNewLines();
+    while (self.token_tags[self.tok_i] != .r_bracket) {
+        const assignment = self.token_tags[self.tok_i] == .identifier and self.token_tags[self.tok_i + 1] == .equal;
+        const operand = if (assignment) blk: {
+            if (has_positional) return self.fail(.mixed_initializer_operands);
+            has_named = true;
+            const name = self.assertToken(.identifier);
+            _ = self.assertToken(.equal);
+            self.eatNewLines();
+            const value = try self.expectExpr();
+            break :blk try self.addNode(.{ .tag = .container_field, .main_token = name, .data = .{ .lhs = 0, .rhs = value } });
+        } else try self.expectExpr();
+        // Bare identifiers stay raw: named context makes them same-name fields,
+        // while an uncontextualized list of identifiers remains positional.
+        if (!assignment and self.nodes.items(.tag)[operand] != .identifier) {
+            if (has_named) return self.fail(.mixed_initializer_operands);
+            has_positional = true;
+        }
+        try self.scratch.append(self.allocator, operand);
+        self.eatNewLines();
+        if (self.eatToken(.comma) == null) break;
+        self.eatNewLines();
+    }
+    _ = try self.expectToken(.r_bracket);
+    const range = try self.listToSpan(self.scratch.items[top..]);
+    return self.addNode(.{ .tag = .struct_init, .main_token = lbracket, .data = .{ .lhs = type_node, .rhs = try self.addExtra(range) } });
 }
 
 fn parseStruct(self: *Parser) Error!Node.Index {
@@ -1628,6 +1726,7 @@ fn parseSuffixOp(self: *Parser, lhs: Node.Index) Error!Node.Index {
             }
         },
         .period => switch (self.token_tags[self.tok_i + 1]) {
+            .l_bracket => return self.parseStructInit(lhs),
             .identifier => return self.addNode(.{
                 .tag = .field_access,
                 .main_token = self.nextToken(),

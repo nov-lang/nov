@@ -31,9 +31,9 @@ let LookupError = struct {
 
 let lookup: (name: string) -> Result(Entry, LookupError) = {
     if name == "readme" {
-        .ok[Entry[ .name = name, .size = 42 ]]
+        .ok[Entry.[ name = name, size = 42 ]]
     } else {
-        .err[LookupError[ .name = name ]]
+        .err[LookupError.[ name = name ]]
     }
 }
 

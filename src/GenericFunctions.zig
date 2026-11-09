@@ -135,8 +135,10 @@ const Term = struct {
         reference: struct { child: *Term, mutable: bool },
         function: Function,
         nominal: Nominal,
+        structural: Structural,
     },
 };
+const Structural = struct { names: []const []const u8, fields: []const *Term, positional: bool };
 const Nominal = struct { module: *Module, id: Module.DeclId, args: []const *Term };
 const Function = struct { params: []const *Term, result: *Term };
 const Variable = struct { name: []const u8, term: *Term };
@@ -493,7 +495,7 @@ test "integer defaults nested query modes roll back under OOM" {
 fn testNominalIntegerDefaults(allocator: std.mem.Allocator) !void {
     const source =
         \\let Box:(T:type)->type=struct{value:T,}
-        \\let make:(x:`T)->Box(`T)=Box(`T)[.value=x]
+        \\let make:(x:`T)->Box(`T)=Box(`T).[value=x]
         \\let get:(x:Box(`T))->`T=x.value
         \\let getArray:(xs:[]Box(`T))->`T=xs[0].value
         \\let getNested:(xs:[][]Box(`T))->`T=xs[0][0].value
@@ -537,7 +539,7 @@ fn testGlobalIntegerDefaults(allocator: std.mem.Allocator) !void {
         \\let g=1
         \\let negative=-1
         \\let Record=struct{g:int,}
-        \\let globalRecord:()->Record=Record[.g]
+        \\let globalRecord:()->Record=Record.[g]
         \\let small=@as(u8,1)
         \\let make:()->`T=g
         \\let getNegative:()->`T=negative
@@ -646,7 +648,7 @@ test "float generic defaults shared independent contextual callbacks and nested 
         \\let exact_ordinary:float=ordinary
         \\let array=[id(1),2.5]
         \\let exact_array:[]float=array
-        \\let wrapped=id(Box(f32)[.value=1])
+        \\let wrapped=id(Box(f32).[value=1])
         \\let field:f32=wrapped.get()
         \\@println(a,b,nested,closed,wrapped)
         \\}
@@ -970,6 +972,10 @@ test "backtick generic function specialization allocation failures" {
 /// Check an expression using only a snapshot of lexical type metadata. No
 /// semantic demands, runtime captures, loans, stores, or specializations occur.
 pub fn queryExpression(module: *Module, ir: *Ir, node: Ast.Node.Index, bindings: []const Module.TypeBinding, values: []const Module.TypeBinding, captures: []const Capture) Ir.BuildError!?Ir.TypeId {
+    return queryExpressionInScope(module, ir, node, bindings, values, captures, null);
+}
+
+pub fn queryExpressionInScope(module: *Module, ir: *Ir, node: Ast.Node.Index, bindings: []const Module.TypeBinding, values: []const Module.TypeBinding, captures: []const Capture, scope: ?Ref) Ir.BuildError!?Ir.TypeId {
     const span = module.tokenSpan(module.source.ast.firstToken(node));
     if (module.expression_query_depth == max_depth) {
         try module.diagnostics.append(module.allocator, .{ .tag = .type_query_limit, .span = span });
@@ -984,9 +990,10 @@ pub fn queryExpression(module: *Module, ir: *Ir, node: Ast.Node.Index, bindings:
     defer module.expression_query_depth -= 1;
     var arena = std.heap.ArenaAllocator.init(module.allocator);
     defer arena.deinit();
-    var solver: Solver = .{ .allocator = arena.allocator(), .caller = module, .ir = ir, .call_span = span, .readonly_layouts = true, .querying = true };
+    var solver: Solver = .{ .allocator = arena.allocator(), .caller = module, .ir = ir, .call_span = span, .readonly_layouts = true, .querying = true, .analysis = if (scope) |ref| ref.analysis else null, .types = if (scope) |ref| ref.types else &.{} };
     const descriptor: LocalTemplate = .{ .proto = 0, .body = node, .outer_bindings = bindings };
-    var frame: Frame = .{ .ref = .{ .module = module, .local = &descriptor }, .variables = &.{}, .result = try solver.term(.unknown, span) };
+    var frame: Frame = .{ .ref = scope orelse .{ .module = module, .local = &descriptor }, .variables = &.{}, .result = try solver.term(.unknown, span) };
+    frame.container = try solver.referenceContainer(frame.ref);
     for (bindings) |binding| {
         const variable = try solver.fromType(binding.ty, span, 0);
         const variables = try solver.allocator.alloc(Variable, frame.variables.len + 1);
@@ -1161,7 +1168,7 @@ const Solver = struct {
             const operand = root(place.operand);
             const valid = switch (place.kind) {
                 .array, .borrow_array => operand.value == .array,
-                .record => (operand.value == .nominal and !self.tagged(operand)) or (operand.value == .known and self.ir.getType(operand.value.known).? == .record and !self.ir.getType(operand.value.known).?.record.tagged),
+                .record => operand.value == .structural or (operand.value == .nominal and !self.tagged(operand)) or (operand.value == .known and self.ir.getType(operand.value.known).? == .record and !self.ir.getType(operand.value.known).?.record.tagged),
                 .mutable_reference => operand.value == .reference and operand.value.reference.mutable,
             };
             if (!valid) try self.fail(switch (place.kind) {
@@ -1246,6 +1253,9 @@ const Solver = struct {
             },
             .array, .range => |element| self.retainFloatDefaults(element, depth + 1),
             .reference => |reference| self.retainFloatDefaults(reference.child, depth + 1),
+            .structural => |s| for (s.fields) |member| {
+                self.retainFloatDefaults(member, depth + 1);
+            },
             .nominal => |n| for (n.args) |arg| {
                 self.retainFloatDefaults(arg, depth + 1);
             },
@@ -1288,9 +1298,19 @@ const Solver = struct {
                 },
                 else => {},
             },
+            .structural => |s| switch (self.ir.getType(ty).?) {
+                .record => |r| {
+                    if (r.anonymous == .none or (r.anonymous == .positional) != s.positional or r.fields.len != s.fields.len) return;
+                    for (s.names, s.fields, r.fields) |name, member, fallback| {
+                        if (!s.positional and !std.mem.eql(u8, name, fallback.name)) return;
+                        try self.defaultTerm(member, fallback.ty, depth + 1);
+                    }
+                },
+                else => {},
+            },
             .nominal => |nominal| switch (self.ir.getType(ty).?) {
                 .record => |record| {
-                    if (record.source != nominal.module.source.id or record.identity != @backingInt(nominal.id) or record.type_args.len != nominal.args.len) return;
+                    if (record.anonymous != .none or record.source != nominal.module.source.id or record.identity != @backingInt(nominal.id) or record.type_args.len != nominal.args.len) return;
                     for (nominal.args, record.type_args) |arg, fallback| try self.defaultTerm(arg, fallback, depth + 1);
                 },
                 else => {},
@@ -1344,6 +1364,10 @@ const Solver = struct {
                 for (f.params) |param| if (!resolved(param, depth + 1)) break :blk false;
                 break :blk resolved(f.result, depth + 1);
             },
+            .structural => |s| blk: {
+                for (s.fields) |member| if (!resolved(member, depth + 1)) break :blk false;
+                break :blk true;
+            },
             .nominal => |n| blk: {
                 for (n.args) |arg| if (!resolved(arg, depth + 1)) break :blk false;
                 break :blk true;
@@ -1368,7 +1392,7 @@ const Solver = struct {
         const result = try self.allocator.create(Term);
         result.* = .{ .value = value, .span = span };
         if (self.querying) switch (value) {
-            .array, .range, .reference, .function, .nominal => try self.query_types.append(self.allocator, result),
+            .array, .range, .reference, .function, .nominal, .structural => try self.query_types.append(self.allocator, result),
             else => {},
         };
         return result;
@@ -1399,6 +1423,15 @@ const Solver = struct {
                 break :blk self.term(.{ .function = .{ .params = params, .result = try self.fromType(f.result, span, depth + 1) } }, span);
             },
             .record => |r| blk: {
+                if (r.anonymous != .none) {
+                    const names = try self.allocator.alloc([]const u8, r.fields.len);
+                    const fields = try self.allocator.alloc(*Term, r.fields.len);
+                    for (r.fields, names, fields) |member, *name, *out| {
+                        name.* = member.name;
+                        out.* = try self.fromType(member.ty, span, depth + 1);
+                    }
+                    break :blk self.term(.{ .structural = .{ .names = names, .fields = fields, .positional = r.anonymous == .positional } }, span);
+                }
                 if (r.type_args.len == 0) break :blk self.term(.{ .known = ty }, span);
                 const owner = if (self.caller.compilation) |comp| comp.getModule(r.source).? else self.caller;
                 const args = try self.allocator.alloc(*Term, r.type_args.len);
@@ -1419,6 +1452,10 @@ const Solver = struct {
                 for (f.params) |p| if (occurs(t, p, depth + 1)) break :blk true;
                 break :blk occurs(t, f.result, depth + 1);
             },
+            .structural => |s| blk: {
+                for (s.fields) |member| if (occurs(t, member, depth + 1)) break :blk true;
+                break :blk false;
+            },
             .nominal => |n| blk: {
                 for (n.args) |arg| if (occurs(t, arg, depth + 1)) break :blk true;
                 break :blk false;
@@ -1435,6 +1472,16 @@ const Solver = struct {
         if (formal.value == .reference and actual.value == .reference and !formal.value.reference.mutable and actual.value.reference.mutable)
             return self.unify(formal.value.reference.child, actual.value.reference.child, span, 0);
         return self.unify(param, argument, span, 0);
+    }
+
+    fn unifyField(self: *Solver, expected: *Term, actual: *Term, span: Module.Span) Ir.BuildError!void {
+        if (self.failed) return;
+        const start = self.caller.diagnostics.items.len;
+        try self.unifyArgument(expected, actual, span);
+        // Shared terms may originate at a declaration, but this conflict belongs
+        // to the initializer operand currently being checked.
+        if (self.caller.diagnostics.items.len > start and self.caller.diagnostics.items[start].tag == .generic_function_conflict)
+            self.caller.diagnostics.items[start].span = span;
     }
 
     fn unify(self: *Solver, a: *Term, b: *Term, span: Module.Span, depth: usize) Ir.BuildError!void {
@@ -1462,6 +1509,14 @@ const Solver = struct {
                 if (f.params.len == g.params.len) {
                     for (f.params, g.params) |p, q| try self.unify(p, q, span, depth + 1);
                     return self.unify(f.result, g.result, span, depth + 1);
+                }
+            },
+            .structural => |s| {
+                const other = y.value.structural;
+                if (s.positional == other.positional and s.fields.len == other.fields.len) {
+                    for (s.names, other.names) |p, q| if (!s.positional and !std.mem.eql(u8, p, q)) return self.fail(.generic_function_conflict, y.span, x.span);
+                    for (s.fields, other.fields) |p, q| try self.unify(p, q, span, depth + 1);
+                    return;
                 }
             },
             .nominal => |n| {
@@ -1763,6 +1818,7 @@ const Solver = struct {
                 const nominal = self.ir.getType(ty).?;
                 const source = switch (nominal) {
                     .record => |r| blk: {
+                        if (r.anonymous != .none) return null;
                         for (r.fields) |field_value| if (std.mem.eql(u8, field_value.name, name)) return null;
                         break :blk r.source;
                     },
@@ -1870,6 +1926,10 @@ const Solver = struct {
             return result;
         }
         if (base.value == .never) return base;
+        if (base.value == .structural and !base.value.structural.positional) {
+            const s = base.value.structural;
+            for (s.names, s.fields) |field_name, member| if (std.mem.eql(u8, field_name, name)) return member;
+        }
         if (base.value == .nominal) {
             const nominal = base.value.nominal;
             const owner_ast = &nominal.module.source.ast;
@@ -2140,7 +2200,7 @@ const Solver = struct {
                 const base = root(try self.expression(frame, data.lhs, depth + 1));
                 if (base.value != .unknown) {
                     if (ast.nodes.items(.tag)[node] == .array_access and base.value != .array) return self.fail(.unsupported_assignment_target, span, null);
-                    if (ast.nodes.items(.tag)[node] == .field_access and base.value != .nominal and !(base.value == .known and self.ir.getType(base.value.known).? == .record)) {
+                    if (ast.nodes.items(.tag)[node] == .field_access and base.value != .structural and base.value != .nominal and !(base.value == .known and self.ir.getType(base.value.known).? == .record)) {
                         const length = std.mem.eql(u8, ast.tokenSlice(data.rhs), "len") and (base.value == .array or (base.value == .known and self.ir.getType(base.value.known).? == .string));
                         return self.fail(if (length) .unsupported_array_length_write else .unsupported_assignment_target, span, null);
                     }
@@ -2225,8 +2285,8 @@ const Solver = struct {
             }
         }
         switch (ast.nodes.items(.tag)[node]) {
-            .identifier => {
-                const name = ast.tokenSlice(ast.firstToken(node));
+            .identifier, .container_field => {
+                const name = ast.tokenSlice(ast.nodes.items(.main_token)[node]);
                 var i = frame.locals.items.len;
                 while (i != 0) {
                     i -= 1;
@@ -2424,25 +2484,102 @@ const Solver = struct {
             .container_decl_arg => {
                 if (try self.constructorType(frame, data.lhs, expected, depth + 1)) |ty|
                     return self.unionConstructor(frame, node, ty, depth + 1);
+                try self.fail(.unsupported_body_expression, span, null);
+                return self.term(.unknown, span);
+            },
+            .struct_init => {
                 const init = ast.fullStructInit(node).?;
-                const record = try self.typeNode(frame, init.type_node, depth + 1);
+                const context = if (init.type_node != 0) try self.typeNode(frame, init.type_node, depth + 1) else expected;
+                const shape = if (context) |value| if (root(value).value == .structural) root(value).value.structural else null else null;
+                var named = if (shape) |s| !s.positional else if (context) |value| switch (root(value).value) {
+                    .nominal => true,
+                    .known => |ty| self.ir.getType(ty).? == .record and self.ir.getType(ty).?.record.anonymous != .positional,
+                    else => false,
+                } else false;
+                for (init.fields) |member| if (ast.nodes.items(.tag)[member] == .container_field) {
+                    named = true;
+                };
+                const positional = !named;
+                if (context == null or root(context.?).value == .unknown or root(context.?).value == .structural) {
+                    const count = if (shape) |s| s.fields.len else init.fields.len;
+                    const names = if (shape) |s| try self.allocator.dupe([]const u8, s.names) else try self.allocator.alloc([]const u8, count);
+                    const fields = try self.allocator.alloc(*Term, count);
+                    const seen = try self.allocator.alloc(bool, count);
+                    @memset(seen, false);
+                    if (shape) |s| {
+                        if (s.positional != positional) {
+                            try self.fail(.expression_type_mismatch, span, null);
+                            return context.?;
+                        }
+                    }
+                    for (init.fields, 0..) |member, i| {
+                        const tag = ast.nodes.items(.tag)[member];
+                        if (named and tag != .container_field and tag != .identifier) {
+                            try self.fail(.expression_type_mismatch, module.tokenSpan(ast.nodes.items(.main_token)[member]), null);
+                            return self.term(.unknown, span);
+                        }
+                        const name = if (positional) "" else ast.tokenSlice(ast.nodes.items(.main_token)[member]);
+                        const index = if (shape) |s| blk: {
+                            if (positional) {
+                                if (i < count) break :blk i;
+                            } else for (s.names, 0..) |candidate, index| {
+                                if (std.mem.eql(u8, name, candidate)) break :blk index;
+                            }
+                            try self.fail(if (positional) .expression_type_mismatch else .unknown_field, module.tokenSpan(ast.nodes.items(.main_token)[member]), null);
+                            return context.?;
+                        } else i;
+                        if (seen[index]) {
+                            try self.fail(.duplicate_field, module.tokenSpan(ast.nodes.items(.main_token)[member]), null);
+                            return self.term(.unknown, span);
+                        }
+                        if (shape == null) {
+                            names[index] = name;
+                            if (named) for (names[0..i]) |previous| {
+                                if (std.mem.eql(u8, previous, name)) {
+                                    try self.fail(.duplicate_field, module.tokenSpan(ast.nodes.items(.main_token)[member]), null);
+                                    return self.term(.unknown, span);
+                                }
+                            };
+                        }
+                        seen[index] = true;
+                        const rhs = if (tag == .container_field) ast.nodes.items(.data)[member].rhs else 0;
+                        const value_node = if (rhs == 0) member else rhs;
+                        const want = if (shape) |s| s.fields[index] else null;
+                        fields[index] = try self.expressionExpected(frame, value_node, want, depth + 1);
+                        if (want) |field_term| try self.unifyField(field_term, fields[index], module.tokenSpan(ast.firstToken(value_node)));
+                    }
+                    for (seen) |supplied| if (!supplied) {
+                        try self.fail(.missing_field, span, null);
+                        return context.?;
+                    };
+                    const record = try self.term(.{ .structural = .{ .names = names, .fields = fields, .positional = positional } }, span);
+                    if (context) |want| try self.unify(record, want, span, 0);
+                    return record;
+                }
+                const record = context.?;
                 const concrete = (try self.materialize(record, 0)) orelse return self.term(.unknown, span);
                 const ty = self.ir.getType(concrete).?;
-                if (ty != .record or ty.record.tagged) {
-                    try self.fail(.invalid_union_constructor, span, null);
+                if (ty != .record or ty.record.tagged or positional) {
+                    try self.fail(.expression_type_mismatch, span, null);
                     return record;
                 }
                 const seen = try self.allocator.alloc(bool, ty.record.fields.len);
                 @memset(seen, false);
                 for (init.fields) |field_node| {
+                    const tag = ast.nodes.items(.tag)[field_node];
+                    if (tag != .container_field and tag != .identifier) {
+                        try self.fail(.expression_type_mismatch, module.tokenSpan(ast.nodes.items(.main_token)[field_node]), null);
+                        return record;
+                    }
                     const name = ast.tokenSlice(ast.nodes.items(.main_token)[field_node]);
                     for (ty.record.fields, 0..) |field_value, i| {
                         if (!std.mem.eql(u8, field_value.name, name)) continue;
                         if (seen[i]) try self.fail(.duplicate_field, span, null);
                         seen[i] = true;
-                        const rhs = ast.nodes.items(.data)[field_node].rhs;
+                        const rhs = if (tag == .container_field) ast.nodes.items(.data)[field_node].rhs else 0;
                         const field_term = try self.fromType(field_value.ty, span, 0);
-                        try self.unifyArgument(field_term, try self.expressionExpected(frame, if (rhs == 0) field_node else rhs, field_term, depth + 1), span);
+                        const value_node = if (rhs == 0) field_node else rhs;
+                        try self.unifyField(field_term, try self.expressionExpected(frame, value_node, field_term, depth + 1), module.tokenSpan(ast.firstToken(value_node)));
                         break;
                     } else try self.fail(.unknown_field, span, null);
                 }
@@ -2741,6 +2878,18 @@ const Solver = struct {
                 }
                 break :blk try self.ir.internType(.{ .function = .{ .params = params, .result = result } });
             },
+            .structural => |s| blk: {
+                const fields = try self.allocator.alloc(Ir.Field, s.fields.len);
+                for (s.fields, s.names, fields) |member, name, *out| {
+                    const ty = (try self.materialize(member, depth + 1)) orelse break :blk null;
+                    if (!Ir.isRecordField(self.ir.getType(ty).?)) {
+                        try self.fail(.unsupported_type, member.span, null);
+                        break :blk null;
+                    }
+                    out.* = .{ .name = name, .ty = ty, .span = .{ .start = 0, .end = 0 } };
+                }
+                break :blk try self.ir.internAnonymousRecord(fields, s.positional);
+            },
             .nominal => |n| blk: {
                 const args = try self.allocator.alloc(Ir.TypeId, n.args.len);
                 for (n.args, args) |arg, *out| out.* = (try self.materialize(arg, depth + 1)) orelse break :blk null;
@@ -2776,7 +2925,7 @@ fn testReferenceParameterInference(allocator: std.mem.Allocator) !void {
         \\let local=(q:&mut`T,v:`T){set(q,v)}
         \\local(p,5)
         \\R.put(p,6)
-        \\let receiver=R[]
+        \\let receiver=R.[]
         \\let e:u8=receiver.get(p)
         \\let mut items:[]u8=[0]
         \\set(&items[0],7)
@@ -2911,7 +3060,7 @@ fn testUnionIndexInference(allocator: std.mem.Allocator) !void {
         \\.none[]}
         \\let qualified:(x:`T)->Option(`T)=Option(`T).some[x]
         \\let color:(x:`T)->Option(Color)=.some[.red]
-        \\let boxed:(x:`T)->Option(Box)=.some[Box[.value=7]]
+        \\let boxed:(x:`T)->Option(Box)=.some[Box.[value=7]]
         \\let first:(items:[]`T,index:int)->`T=items[index]
         \\let main:()={
         \\let found:Option(uint)=findIndex(@as([]int,[1,2]),(x:int)->bool{x==2})
@@ -3308,7 +3457,7 @@ test "backtick generic function nested arrays functions nominal containers recur
         \\let a:uint=first(first(nested))
         \\let b:uint=twice(2)
         \\let c=apply(inc,3)
-        \\let d=unwrap(Box(uint)[.value=4])
+        \\let d=unwrap(Box(uint).[value=4])
         \\let e=even(3,"ok")
         \\let f=alias(true)
         \\@print(a,b,c,d,e,f,NS.id(false),G(uint).call("container",1))
@@ -3440,7 +3589,7 @@ test "backtick specialization count is bounded per defining module" {
     try source.writer.writeAll("let id:(x:`T)->`T=x\n");
     for (0..max_specializations + 1) |i| try source.writer.print("let R{d}=struct{{}}\n", .{i});
     try source.writer.writeAll("let main:()={\n");
-    for (0..max_specializations + 1) |i| try source.writer.print("let a{d}=id(R{d}[])\n", .{ i, i });
+    for (0..max_specializations + 1) |i| try source.writer.print("let a{d}=id(R{d}.[])\n", .{ i, i });
     try source.writer.writeAll("}");
     try testInferenceFailureAllocations(std.testing.allocator, source.written(), .generic_function_limit);
 }
@@ -3479,7 +3628,7 @@ fn testClosureMethodScopeImports(allocator: std.mem.Allocator) !void {
         defer comp.deinit();
         const root = try comp.addSource("/review/main.nov",
             \\let api=@import("api.nov")
-            \\let main:()={@println(api.Alias[].method(true),api.Alias.static(false),api.Generic(bool)[].method(true))}
+            \\let main:()={@println(api.Alias.[].method(true),api.Alias.static(false),api.Generic(bool).[].method(true))}
         );
         const library = try comp.addSource("/review/api.nov",
             \\let R=struct{
@@ -3550,8 +3699,8 @@ test "generic closures review no shadowing is independent of captures and demand
         "let main:()={let a:int=7\nlet f=(x:`T)->`T{let g=(v:`U)->`U{let a:int=9\nv}\ng(x)}\n@print(f(true))}",
         "let a:int=7\nlet main:()={let f=(x:`T)->`T{let a:int=9\nx}\n@print(f(true))}",
         "let outer:(input:`A)->`A={let f=(x:`B)->`B{let input:int=9\nx}\nf(input)}\nlet main:()=@print(outer(true))",
-        "let Box:(Element:type)->type=struct{let Self=@This()\nlet method:(self:Self,input:`A)->`A={let f=(x:`B)->`B{let Element:int=9\nx}\nf(input)}\n}\nlet main:()=@print(Box(bool)[].method(true))",
-        "let Box:(Element:type)->type=struct{let Self=@This()\nlet method:(self:Self,input:`A)->`A={let f=(x:`B)->`B{let Self:int=9\nx}\nf(input)}\n}\nlet main:()=@print(Box(bool)[].method(true))",
+        "let Box:(Element:type)->type=struct{let Self=@This()\nlet method:(self:Self,input:`A)->`A={let f=(x:`B)->`B{let Element:int=9\nx}\nf(input)}\n}\nlet main:()=@print(Box(bool).[].method(true))",
+        "let Box:(Element:type)->type=struct{let Self=@This()\nlet method:(self:Self,input:`A)->`A={let f=(x:`B)->`B{let Self:int=9\nx}\nf(input)}\n}\nlet main:()=@print(Box(bool).[].method(true))",
     }) |source| {
         try testInferenceFailureAllocations(std.testing.allocator, source, .unsupported_shadowing);
         try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testInferenceFailureAllocations, .{ source, Module.Diagnostic.Tag.unsupported_shadowing });
@@ -3610,7 +3759,7 @@ fn testReviewConstraints(allocator: std.mem.Allocator) !void {
         \\let wrap:(x:`T)->`U=G(uint).id(x)
         \\let passthrough:(x:`T)->`T=x
         \\let wrapPlain:(x:`T)->`U=G(uint).plain(1)
-        \\let main:()={let box=Box(string)[.value="field"]
+        \\let main:()={let box=Box(string).[value="field"]
         \\let closure=make("captured")
         \\let named=makeNamed("named")
         \\@println(unwrap(box),invert(true),size("abc"),size([true,false]),closure(),wrap("ok"),passthrough(G(uint).plain(7)),wrapPlain("s"),named(false))}
@@ -3667,8 +3816,8 @@ test "backtick speculative nested calls do not publish or demand specializations
         "let G:(T:type)->type=struct{let id:(x:`U,y:T)->`U=x\n}\nlet first:(x:(bool,uint)->bool,y:`B)->bool=x(true,1)\nlet main:()={let a=first(G(uint).id,[])\n}",
         "let G:(T:type)->type=struct{let id:(x:`U)->`U=x\n}\nlet wrap:(x:`T)->`U=G(uint).id(x)\nlet first:(x:`A,y:`B)->`A=x\nlet main:()={let a=first(wrap(\"s\"),[])\n}",
         "let G:(T:type)->type=struct{let id:(x:`U)->`U=x\n}\nlet first:(x:`A,y:`B)->`A=x\nlet main:()={let a=first(G(uint).id(\"s\"),[])\n}",
-        "let Box:(T:type)->type=struct{value:T,let id:(x:`U)->`U=x\n}\nlet id:(x:`T)->`T=x\nlet first:(x:`A,y:`B)->`A=x\nlet main:()={let a=first(id(Box(uint)[.value=1]),[])\n}",
-        "let Box:(T:type)->type=struct{value:T,let id:(x:`U)->`U=x\n}\nlet make:(x:`T)->Box(`T)=Box(`T)[.value=x]\nlet get:(x:Box(`T))->`T=x.value\nlet first:(x:`A,y:`B)->`A=x\nlet main:()={let a=first(get(make(true)),[])\n}",
+        "let Box:(T:type)->type=struct{value:T,let id:(x:`U)->`U=x\n}\nlet id:(x:`T)->`T=x\nlet first:(x:`A,y:`B)->`A=x\nlet main:()={let a=first(id(Box(uint).[value=1]),[])\n}",
+        "let Box:(T:type)->type=struct{value:T,let id:(x:`U)->`U=x\n}\nlet make:(x:`T)->Box(`T)=Box(`T).[value=x]\nlet get:(x:Box(`T))->`T=x.value\nlet first:(x:`A,y:`B)->`A=x\nlet main:()={let a=first(get(make(true)),[])\n}",
     }) |source| {
         try testSpeculativeFailure(std.testing.allocator, source);
         try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testSpeculativeFailure, .{source});
@@ -3700,7 +3849,7 @@ test "backtick abandoned probes do not consume the specialization count limit" {
     try source.writer.writeAll("let first:(");
     for (0..max_specializations + 1) |i| try source.writer.print("x{d}:`A{d},", .{ i, i });
     try source.writer.writeAll("last:`B)->`A0=x0\nlet main:()={let a=first(");
-    for (0..max_specializations + 1) |i| try source.writer.print("id(R{d}[]),", .{i});
+    for (0..max_specializations + 1) |i| try source.writer.print("id(R{d}.[]),", .{i});
     try source.writer.writeAll("[])\n}");
     try testSpeculativeFailure(std.testing.allocator, source.written());
 }
@@ -3710,7 +3859,7 @@ fn testImportedSpeculativeFailure(allocator: std.mem.Allocator, invalid_layout: 
     defer comp.deinit();
     const root = try comp.addSource("/app/probe.nov", "let lib=@import(\"lib.nov\")\nlet first:(x:`A,y:`B)->`A=x\nlet main:()={let a=first(lib.bad(true),[])\n}");
     const library = try comp.addSource("/app/lib.nov", if (invalid_layout)
-        "let Box:(T:type)->type=struct{value:Missing,}\n@[public]\nlet bad:(x:`T)->Box(`T)=Box(`T)[.value=x]"
+        "let Box:(T:type)->type=struct{value:Missing,}\n@[public]\nlet bad:(x:`T)->Box(`T)=Box(`T).[value=x]"
     else
         "@[public]\nlet bad:(x:`T)->`T=missing");
     const module = comp.getModule(root).?;
@@ -3773,7 +3922,7 @@ test "backtick probe layouts defer nested container methods and publish canonica
 
 fn testFreshNominal(allocator: std.mem.Allocator, warm: bool) !void {
     const source = try std.mem.concat(allocator, u8, &.{
-        "let Box:(T:type)->type=struct{value:T,}\nlet make:(x:`T)->Box(`T)=Box(`T)[.value=x]\nlet get:(x:Box(`T))->`T=x.value\n",
+        "let Box:(T:type)->type=struct{value:T,}\nlet make:(x:`T)->Box(`T)=Box(`T).[value=x]\nlet get:(x:Box(`T))->`T=x.value\n",
         if (warm) "let Seed=Box(bool)\n" else "",
         "let main:()={let result=get(make(true))\n@println(result)}",
     });
@@ -4066,7 +4215,7 @@ fn testContextualVisibility(allocator: std.mem.Allocator, expression: []const u8
 fn testInstanceProbe(allocator: std.mem.Allocator) !void {
     var module = try Module.init(allocator, "instance-probe.nov",
         \\let Box:(T:type)->type=struct{value:T,
-        \\let map:(object:Box(T),f:(T)->`U)->Box(`U)=Box(`U)[.value=f(object.value)]
+        \\let map:(object:Box(T),f:(T)->`U)->Box(`U)=Box(`U).[value=f(object.value)]
         \\let get:(object:Box(T))->T=object.value
         \\}
         \\let id:(x:`U)->`U=x
@@ -4107,7 +4256,7 @@ fn testInstanceImports(allocator: std.mem.Allocator, public: bool) !void {
     const library = try comp.addSource("/app/lib.nov",
         \\let Hidden:(T:type)->type=struct{value:T,
         \\@[public]
-        \\let map:(object:Hidden(T),f:(T)->`U)->Hidden(`U)=Hidden(`U)[.value=f(object.value)]
+        \\let map:(object:Hidden(T),f:(T)->`U)->Hidden(`U)=Hidden(`U).[value=f(object.value)]
         \\let hidden:(object:Hidden(T),x:`U)->`U=x
         \\}
         \\let Plain=struct{@[public]
@@ -4119,9 +4268,9 @@ fn testInstanceImports(allocator: std.mem.Allocator, public: bool) !void {
         \\@[public]
         \\let Alias=Hidden
         \\@[public]
-        \\let make:()->Hidden(bool)=Hidden(bool)[.value=true]
+        \\let make:()->Hidden(bool)=Hidden(bool).[value=true]
         \\@[public]
-        \\let plain:()->Plain=Plain[]
+        \\let plain:()->Plain=Plain.[]
     );
     const module = comp.getModule(root).?;
     const local = module.lookup("lib").?;
@@ -4155,7 +4304,7 @@ test "backtick instance imported aliases private result wrappers public methods 
 fn testInstanceInference(allocator: std.mem.Allocator) !void {
     var module = try Module.init(allocator, "instance-inference.nov",
         \\let Box:(T:type)->type=struct{value:T,
-        \\let map:(object:Box(T),convert:(T)->`U)->Box(`U)=Box(`U)[.value=convert(object.value)]
+        \\let map:(object:Box(T),convert:(T)->`U)->Box(`U)=Box(`U).[value=convert(object.value)]
         \\let choose:(object:Box(T),convert:(T)->`U,other:`U)->`U=convert(object.value)
         \\}
         \\let Plain=struct{let apply:(object:Plain,x:`T)->`T=x
@@ -4164,16 +4313,16 @@ fn testInstanceInference(allocator: std.mem.Allocator) !void {
         \\let alias=identity
         \\let toBool:(x:uint)->bool=x==7
         \\let B=Box(bool)
-        \\let forward:(x:`T)->`T={let box=Box(`T)[.value=x]
+        \\let forward:(x:`T)->`T={let box=Box(`T).[value=x]
         \\box.choose(identity,x)}
-        \\let main:()={let b=B[.value=true]
+        \\let main:()={let b=B.[value=true]
         \\let x:Box(bool)=b.map(alias)
         \\let y:Box(bool)=B.map(b,identity)
         \\let z=b.choose(identity,true)
-        \\let number=Box(uint)[.value=7]
+        \\let number=Box(uint).[value=7]
         \\let first=Box(uint).map(number,toBool)
         \\let second=number.map(toBool)
-        \\let w=Plain[].apply(true)
+        \\let w=Plain.[].apply(true)
         \\let v=forward(true)
         \\@println(x.value,y.value,z,w,v,first.value,second.value)}
     );
@@ -4221,7 +4370,7 @@ fn testTerminalImports(allocator: std.mem.Allocator) !void {
     defer comp.deinit();
     const root = try comp.addSource("/app/main.nov",
         \\let lib=@import("lib.nov")
-        \\let main:()->uint=lib.R[].f(true,if true{return 1}else{return 2},lib.hidden)
+        \\let main:()->uint=lib.R.[].f(true,if true{return 1}else{return 2},lib.hidden)
     );
     const library = try comp.addSource("/app/lib.nov",
         \\let hidden:(x:`T)->`T=missing
@@ -4296,18 +4445,18 @@ test "backtick instance terminal operands readonly prefix constraints publish no
 test "backtick instance terminal operands stop constraints and demand at first exit including both branches under OOM" {
     const prelude = "let R=struct{let f:(object:R,a:`T,b:`T,c:`T)->`T=missing\n}\n";
     for ([_][]const u8{
-        "let main:()=R[].f(true,@panic(\"stop\"),\"unreachable\")",
-        "let main:()=R[].f(true,@panic(\"stop\"),unknown)",
-        "let main:()=R[].f(true,loop{},unknown)",
-        "let main:()->bool=R[].f(true,loop{},\"wrong\")",
-        "let main:()->uint=R[].f(loop{},unknown,unknown)",
-        "let main:()->uint=R.f(R[],true,loop{},\"wrong\")",
-        "let main:()->uint=R[].f(if true{return 1}else{return 2},true,unknown)",
-        "let main:()->uint=R[].f(true,if false{return 1}else{return 2},\"wrong\")",
-        "let main:()->uint=R.f(R[],if true{return 1}else{return 2},true,unknown)",
-        "let main:()=R.f(R[],true,@panic(\"stop\"),unknown)",
-        "let main:()->uint=R[].f({return 1},true,unknown)",
-        "@[noreturn]\nlet main:()=R[].f(if true{@panic(\"left\")}else{@panic(\"right\")},true,unknown)",
+        "let main:()=R.[].f(true,@panic(\"stop\"),\"unreachable\")",
+        "let main:()=R.[].f(true,@panic(\"stop\"),unknown)",
+        "let main:()=R.[].f(true,loop{},unknown)",
+        "let main:()->bool=R.[].f(true,loop{},\"wrong\")",
+        "let main:()->uint=R.[].f(loop{},unknown,unknown)",
+        "let main:()->uint=R.f(R.[],true,loop{},\"wrong\")",
+        "let main:()->uint=R.[].f(if true{return 1}else{return 2},true,unknown)",
+        "let main:()->uint=R.[].f(true,if false{return 1}else{return 2},\"wrong\")",
+        "let main:()->uint=R.f(R.[],if true{return 1}else{return 2},true,unknown)",
+        "let main:()=R.f(R.[],true,@panic(\"stop\"),unknown)",
+        "let main:()->uint=R.[].f({return 1},true,unknown)",
+        "@[noreturn]\nlet main:()=R.[].f(if true{@panic(\"left\")}else{@panic(\"right\")},true,unknown)",
     }) |tail| {
         const source = try std.mem.concat(std.testing.allocator, u8, &.{ prelude, tail });
         defer std.testing.allocator.free(source);
@@ -4315,11 +4464,11 @@ test "backtick instance terminal operands stop constraints and demand at first e
         try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testTerminalOperands, .{ source, @as(?Module.Diagnostic.Tag, null) });
     }
     for ([_]struct { tail: []const u8, tag: Module.Diagnostic.Tag }{
-        .{ .tail = "let main:()=R[].f(true,@panic(\"stop\"))", .tag = .argument_count_mismatch },
-        .{ .tail = "let main:()=R[].f(true,@panic(\"stop\"),unknown,unknown)", .tag = .argument_count_mismatch },
-        .{ .tail = "let main:()=R[].f(@as(int,1.5),@panic(\"stop\"),true)", .tag = .literal_type_mismatch },
-        .{ .tail = "let main:()=R[].f(true,\"wrong\",@panic(\"stop\"))", .tag = .generic_function_conflict },
-        .{ .tail = "@[noreturn]\nlet main:()=R[].f(if true{return}else{return},true,unknown)", .tag = .noreturn_return },
+        .{ .tail = "let main:()=R.[].f(true,@panic(\"stop\"))", .tag = .argument_count_mismatch },
+        .{ .tail = "let main:()=R.[].f(true,@panic(\"stop\"),unknown,unknown)", .tag = .argument_count_mismatch },
+        .{ .tail = "let main:()=R.[].f(@as(int,1.5),@panic(\"stop\"),true)", .tag = .literal_type_mismatch },
+        .{ .tail = "let main:()=R.[].f(true,\"wrong\",@panic(\"stop\"))", .tag = .generic_function_conflict },
+        .{ .tail = "@[noreturn]\nlet main:()=R.[].f(if true{return}else{return},true,unknown)", .tag = .noreturn_return },
     }) |case| {
         const source = try std.mem.concat(std.testing.allocator, u8, &.{ prelude, case.tail });
         defer std.testing.allocator.free(source);
@@ -4329,11 +4478,11 @@ test "backtick instance terminal operands stop constraints and demand at first e
     for ([_][]const u8{
         "let f:(a:`T,b:`T,c:`T)->`T=missing\nlet main:()=f(true,@panic(\"stop\"),\"wrong\")",
         "let f:(a:`T,b:`T)->`T=missing\nlet main:()->uint=f(if true{return 1}else{return 2},unknown)",
-        "let id:(x:`T)->`T=x\nlet R=struct{let f:(object:R,cb:(bool)->bool,x:`T,y:`T)->`T=missing\n}\nlet main:()->uint=R[].f(id,if true{return 1}else{return 2},unknown)",
+        "let id:(x:`T)->`T=x\nlet R=struct{let f:(object:R,cb:(bool)->bool,x:`T,y:`T)->`T=missing\n}\nlet main:()->uint=R.[].f(id,if true{return 1}else{return 2},unknown)",
         "let id:(x:`T)->`T=missing\nlet f:(x:`T,cb:(`T)->`T)->`T=missing\nlet main:()->uint=f(if true{return 1}else{return 2},id)",
-        "let id:(x:`T)->`T=x\nlet R=struct{let f:(object:R,cb:(`T)->`T,a:`T,b:`T,c:`T)->`T=missing\n}\nlet main:()=R[].f(id,true,@panic(\"stop\"),\"wrong\")",
+        "let id:(x:`T)->`T=x\nlet R=struct{let f:(object:R,cb:(`T)->`T,a:`T,b:`T,c:`T)->`T=missing\n}\nlet main:()=R.[].f(id,true,@panic(\"stop\"),\"wrong\")",
         "let f:(x:uint,y:`T)->`T=missing\nlet main:()=f(1,@panic(\"stop\"))",
-        "let Box:(T:type)->type=struct{value:T,let f:(object:Box(T),a:`U,b:`U,c:`U)->`U=missing\n}\nlet main:()=Box(bool)[.value=true].f(true,@panic(\"stop\"),unknown)",
+        "let Box:(T:type)->type=struct{value:T,let f:(object:Box(T),a:`U,b:`U,c:`U)->`U=missing\n}\nlet main:()=Box(bool).[value=true].f(true,@panic(\"stop\"),unknown)",
     }) |source| {
         try testTerminalOperands(std.testing.allocator, source, null);
         try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testTerminalOperands, .{ source, @as(?Module.Diagnostic.Tag, null) });
@@ -4347,8 +4496,8 @@ test "backtick instance inference receiver callbacks nominal results static cano
 
 test "backtick instance abandoned fresh nominal probes publish no methods signatures IDs or demand under OOM" {
     for ([_][]const u8{
-        "let Box:(T:type)->type=struct{value:T,let map:(object:Box(T),f:(T)->`U)->Box(`U)=Box(`U)[.value=f(object.value)]\n}\nlet make:(x:`T)->Box(`T)=Box(`T)[.value=x]\nlet id:(x:`T)->`T=x\nlet first:(a:`A,b:`B)->`A=a\nlet main:()={let x=first(make(true).map(id),[])\n}",
-        "let Box:(T:type)->type=struct{value:T,let get:(object:Box(T))->T=object.value\n}\nlet make:(x:`T)->Box(`T)=Box(`T)[.value=x]\nlet first:(a:`A,b:`B)->`A=a\nlet main:()={let x=first(make(true).get(),[])\n}",
+        "let Box:(T:type)->type=struct{value:T,let map:(object:Box(T),f:(T)->`U)->Box(`U)=Box(`U).[value=f(object.value)]\n}\nlet make:(x:`T)->Box(`T)=Box(`T).[value=x]\nlet id:(x:`T)->`T=x\nlet first:(a:`A,b:`B)->`A=a\nlet main:()={let x=first(make(true).map(id),[])\n}",
+        "let Box:(T:type)->type=struct{value:T,let get:(object:Box(T))->T=object.value\n}\nlet make:(x:`T)->Box(`T)=Box(`T).[value=x]\nlet first:(a:`A,b:`B)->`A=a\nlet main:()={let x=first(make(true).get(),[])\n}",
     }) |source| {
         try testSpeculativeFailure(std.testing.allocator, source);
         try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testSpeculativeFailure, .{source});
@@ -4358,13 +4507,13 @@ test "backtick instance abandoned fresh nominal probes publish no methods signat
 test "backtick instance conflicts unbound variables unsupported values arity and noreturn diagnose under OOM" {
     const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag };
     for ([_]Case{
-        .{ .source = "let R=struct{let f:(object:R,x:`T,y:`T)->`T=x\n}\nlet main:()={let x=R[].f(true,\"s\")\n}", .tag = .generic_function_conflict },
-        .{ .source = "let R=struct{let f:(object:R)->`T=[]\n}\nlet main:()={let x=R[].f()\n}", .tag = .generic_function_ambiguous },
-        .{ .source = "let R=struct{let f:(object:R,x:`T)->`T={let y:`U=x\ny}\n}\nlet main:()={let x=R[].f(true)\n}", .tag = .unbound_type_variable },
-        .{ .source = "let R=struct{let f:(object:R,x:`T)->`T=x\n}\nlet main:()={let x=R[].f()\n}", .tag = .argument_count_mismatch },
-        .{ .source = "let R=struct{let f:(object:R,x:`T)->`T=x\n}\nlet main:()={let f=R[].f\n}", .tag = .unknown_field },
-        .{ .source = "let R=struct{@[noreturn]\nlet stop:(object:R,x:`T)->`T=loop {}\n}\nlet main:()={R[].stop(true)}", .tag = .noreturn_result },
-        .{ .source = "let R=struct{@[noreturn]\nlet stop:(object:R,x:`T)=@panic(\"stop\")\n}\nlet main:()={R[].stop(true)\n@print()}", .tag = .unreachable_code },
+        .{ .source = "let R=struct{let f:(object:R,x:`T,y:`T)->`T=x\n}\nlet main:()={let x=R.[].f(true,\"s\")\n}", .tag = .generic_function_conflict },
+        .{ .source = "let R=struct{let f:(object:R)->`T=[]\n}\nlet main:()={let x=R.[].f()\n}", .tag = .generic_function_ambiguous },
+        .{ .source = "let R=struct{let f:(object:R,x:`T)->`T={let y:`U=x\ny}\n}\nlet main:()={let x=R.[].f(true)\n}", .tag = .unbound_type_variable },
+        .{ .source = "let R=struct{let f:(object:R,x:`T)->`T=x\n}\nlet main:()={let x=R.[].f()\n}", .tag = .argument_count_mismatch },
+        .{ .source = "let R=struct{let f:(object:R,x:`T)->`T=x\n}\nlet main:()={let f=R.[].f\n}", .tag = .unknown_field },
+        .{ .source = "let R=struct{@[noreturn]\nlet stop:(object:R,x:`T)->`T=loop {}\n}\nlet main:()={R.[].stop(true)}", .tag = .noreturn_result },
+        .{ .source = "let R=struct{@[noreturn]\nlet stop:(object:R,x:`T)=@panic(\"stop\")\n}\nlet main:()={R.[].stop(true)\n@print()}", .tag = .unreachable_code },
     }) |case| {
         try testInferenceFailureAllocations(std.testing.allocator, case.source, case.tag);
         try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testInferenceFailureAllocations, .{ case.source, case.tag });

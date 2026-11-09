@@ -209,9 +209,9 @@ let inactive_payloads_and_storable_elements: () = {
 
     let colors: Option([]Color) = .some[[.red, .blue]]
     @assert(Color.blue in colors.unwrapOr([]))
-    let records: Option([]Row) = .some[[Row[ .values = [2] ]]]
+    let records: Option([]Row) = .some[[Row.[ values = [2] ]]]
     let mut rows = records.unwrapOr([])
-    rows[0] = Row[ .values = [9] ]
+    rows[0] = Row.[ values = [9] ]
     @assert(records.unwrapOr([])[0].values[0] == 2)
     let start: int = 1
     let end: int = 3

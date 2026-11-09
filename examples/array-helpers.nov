@@ -107,7 +107,7 @@ let fold_left_seed_and_empty: () = {
 @[test]
 let recursive_array_record_and_union_copies: () = {
     let identity: (value: `T) -> `T = value
-    let mut source = [Row[ .values = [[1, 2], [3]] ]]
+    let mut source = [Row.[ values = [[1, 2], [3]] ]]
     let mut mapped = std.array.map(source, identity)
     let selected = std.array.filter(
         source,

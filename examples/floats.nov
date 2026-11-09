@@ -26,8 +26,8 @@ let weighted_mean: (samples: []Measurement) -> f64 = {
 
 let main: () = {
     let samples = [
-        Measurement[ .value = 1.5, .weight = 1 ],
-        Measurement[ .value = 3, .weight = 2 ]
+        Measurement.[ value = 1.5, weight = 1 ],
+        Measurement.[ value = 3, weight = 2 ]
     ]
     @println("Weighted mean:", weighted_mean(samples))
     let values: []f32 = [1, step, add(step, 0.5)]
@@ -69,7 +69,7 @@ let ieee_comparisons_and_membership: () = {
 
 @[test]
 let mutation_copies_and_generic_containers: () = {
-    let mut samples = [Measurement[ .value = 1.5, .weight = 2 ]]
+    let mut samples = [Measurement.[ value = 1.5, weight = 2 ]]
     let saved = samples
     loop &sample in samples {
         sample.*.value *= 2

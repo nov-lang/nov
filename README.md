@@ -262,7 +262,7 @@ let Entry = struct {
 }
 
 let main: () = {
-    let entry = Entry[.name = "Ada"]
+    let entry = Entry.[name = "Ada"]
     @println(entry, [entry], "{entry}")
     @println(entry.toString())
 }
@@ -813,11 +813,11 @@ methods also infer method-local backtick variables:
 let Box: (T: type) -> type = struct {
     value: T,
     let map: (self: Box(T), convert: (T) -> `U) -> Box(`U) =
-        Box(`U)[ .value = convert(self.value) ]
+        Box(`U).[ value = convert(self.value) ]
 }
 let identity: (x: `V) -> `V = x
 let toBool: (x: uint) -> bool = x == 7
-let number = Box(uint)[ .value = 7 ]
+let number = Box(uint).[ value = 7 ]
 let mapped = number.map(toBool)             ; Box(bool)
 let same: Box(uint) = number.map(identity)  ; contextual generic callback
 ```
@@ -933,7 +933,7 @@ inferred type variables. Implementation is explicitly deferred; see [Comptime](#
 ### Other function syntax
 
 The examples below mix implemented forms with older design sketches. Pointer
-parameters using the old `*mut` spelling and tuples are historical sketches.
+parameters using the old `*mut` spelling are historical sketches.
 Explicit `#` compile-time arguments are accepted design, with implementation deferred. Safe `&T` / `&mut T` reference parameters
 are implemented under the [reference contract](#local-static-borrowing); these old
 pointer sketches do not define them.
@@ -956,11 +956,9 @@ let ret2: () -> int = 2
 ; signature: (int, int) -> int
 let add: (a: int, b: int) -> int = a + b
 
-; return a tuple
-; see #Struct for more information about tuples and structs
-; signature: (int, int) -> struct{ int, int }
-let div: (a: int, b: int) -> struct{ int, int } = {
-    [a / b, a % b]
+; return a positional anonymous struct (no tuple accessor syntax)
+let div: (a: int, b: int) -> @TypeOf(.[0, 0]) = {
+    .[a / b, a % b]
 }
 
 ; Accepted design: explicit compile-time type arguments; implementation deferred.
@@ -1101,13 +1099,13 @@ The delivered subset is deliberately bounded:
   remain rejected; function/reference edges do not consume inline-storage depth.
   No compile-time argument or new field-default evaluation is implemented: union,
   callback and range values must be supplied in constructors under existing rules.
-- Construct explicitly with `MyType[ .x = 5, .z = true ]` (or `Alias[...]`).
-  Empty `MyType[]` works only when every field has a default. Unknown, duplicate,
+- Construct explicitly with `MyType.[ x = 5, z = true ]` (or `Alias.[...]`).
+  Empty `MyType.[]` works only when every field has a default. Unknown, duplicate,
   missing required and mistyped fields diagnose. Supplied expressions evaluate
   **once, left to right in source order**, independent of field declaration order.
   Omitted literal defaults are then inserted in declaration order and have no
-  effects. Same-name shorthand `Type[.width, .height]` means
-  `Type[.width = width, .height = height]`: each name is an ordinary scoped read
+  effects. Same-name shorthand `Type.[width, height]` means
+  `Type.[width = width, height = height]`: each name is an ordinary scoped read
   checked against the field's exact expected type, with no implicit conversion.
   Shorthand and explicit fields may mix in source order; defaults follow all
   supplied fields. Imported types and generic aliases support the same syntax.
@@ -1117,8 +1115,10 @@ The delivered subset is deliberately bounded:
   Union/enum payload grammar is unchanged (for example, `.item[.ready]` still
   supplies an enum literal). No new `use`/`pub` syntax is introduced.
   See [examples/constructor-shorthand.nov](examples/constructor-shorthand.nov).
-  Contextual `[ .x = ... ]`/`[.width]`, anonymous records and tuples are not part
-  of this slice.
+  Contextual `.[ x = ... ]` uses an expected struct type and its existing scalar
+  defaults. Without an expected nominal type, named and positional anonymous
+  constructors infer structural types as described below. Old `MyType[.x = 5]`
+  and `MyType[]` constructor spellings are rejected, not compatibility aliases.
 - Read fields with `item.x`, including inside interpolation (`"{self.x}"`). Field
   lookup is type-directed: a record field named `len` is an ordinary field and
   does not change array/string `.len`. Assignment, locals, parameters, returns,
@@ -1226,10 +1226,48 @@ String byte-data pointers (including static literals) are never traced. The
 current uniform record path installs a GC frame even for scalar-only records;
 this is implementation overhead, not heap allocation of the records themselves.
 
+#### Executable anonymous structs
+
+`.[a = 1, label = "a"]` constructs an anonymous named struct; `.[1, "a"]`
+constructs an anonymous positional struct. `.[1, 2]` is also a positional struct,
+not an array: arrays retain `[1, 2]`. Named and positional entries cannot mix.
+Bare same-name fields have no dot: `Rectangle.[width, height]` and
+`let p: Rectangle = .[width, height]` read scoped values. Without a named expected
+type, all-bare `.[x, y]` is positional; an explicit assignment makes bare entries
+named shorthand, as in `.[a = 1, width]`. Old `Rectangle.[.width]` is rejected.
+Enum literals in positional values and union payloads keep their dots.
+Named fields use `value.a`; no positional field accessor or destructuring syntax
+is introduced. Positional values can be stored, passed, returned, printed and
+queried with `@TypeOf`.
+
+Anonymous identity uses the ordered field names and exact canonical field types
+(or ordered types for positional values), including across scopes and public
+module aliases. Separately inferred values with different field order or widths
+have distinct types. A contextual named constructor instead maps entries to the
+expected layout regardless of source order (while evaluating in source order); nominal
+structs remain distinct from anonymous shapes and from other nominal declarations.
+Use `@TypeOf(.[a = 1])` or `@TypeOf(.[1, "a"])` in annotations and module aliases.
+Existing recursive array-copy and closure-sharing rules apply to anonymous fields,
+including values produced by generic functions and `std.array.map`.
+
+Contextual named constructors such as `let value: Rectangle = .[width = 3]`
+retain the expected nominal type and fill only its existing scalar literal defaults;
+this does not enable aggregate/computed defaults. Same-name nominal shorthand
+`Rectangle.[width]` uses the same bare-name rule. Anonymous unions and enums remain deferred;
+union constructors `U.tag[payload]` and `.tag[]`, array indexing and slicing are
+unchanged.
+
+Default output is `.[ a: 1, label: a ]` for named values and `.[1, a]` for positional
+values. Canonical type output is `struct{ a: i64, label: string }` and
+`struct{ i64, string }` on the 64-bit target. Nominal default output remains
+`Rectangle[ width: 3, height: 4 ]` and `Empty[]`, not constructor source syntax.
+See [examples/anonymous-structs.nov](examples/anonymous-structs.nov) and
+`zig build test-cli-anonymous-structs` for five language tests and CLI coverage
+in default/debug/release modes, including public aliases across modules.
+
 #### Broader struct syntax (design, not fully executable)
 
-The following older examples describe future syntax outside the bounded subset
-above (including container constants, contextual and anonymous values).
+The following example still includes deferred container constants.
 Struct is Nov's equivalent of [Product type](https://en.wikipedia.org/wiki/Product_type).
 ```nov
 let MyStruct = struct {
@@ -1243,7 +1281,7 @@ let MyStruct = struct {
         if x > max or y > max {
             @panic()
         }
-        return [ .name = name, .x = x, .y = y ]
+        return .[ name = name, x = x, y = y ]
     }
 }
 
@@ -1252,21 +1290,16 @@ let a = MyStruct.init("", 0, 0)
 
 ; create a new MyStruct with the container syntax
 ; here x and y use the default value specified i.e. 1.0
-let b = MyStruct[ .name = "" ]
+let b = MyStruct.[ name = "" ]
 
 ; same as above except that the type of the initializer is inferred from the type of c
-let c: MyStruct = [ .name = "", .x = 0, .y = 0 ]
+let c: MyStruct = .[ name = "", x = 0, y = 0 ]
 
-;;; Tuples
-; tuples are simply anonymous structs
+; positional anonymous structs, even when all values have the same type
+let x = .[ 0, "test" ]
+let y = .[ 10, 20, 30 ]
 
-; is a tuple of type struct{ int, string }
-let x = [ 0, "test" ]
-
-; this is also a tuple
-let y = [ .name = "", .x = 0, .y = 0 ]
-
-; this is not a tuple because all values are of the same type, see #Arrays for more information
+; an array still uses brackets without the leading dot
 let z = [ 10, 20, 30 ]
 ```
 
@@ -1455,7 +1488,7 @@ let Box: (T: type) -> type = struct {
     let get: (self: @This()) -> T = self.value
 }
 let main: () = {
-    let boxed = Box(uint)[ .value = 42 ]
+    let boxed = Box(uint).[ value = 42 ]
     @println(boxed.get())
 }
 ```
@@ -1466,7 +1499,7 @@ the existing copy/rooting rules. See [examples/generic-structs.nov](examples/gen
 Array-valued fields work in plain and generic acyclic structs, including `value: T`
 with an array type argument or `items: []T` with a supported element type. Copies
 recursively detach array backing; this copy-depth contract is settled. Recursive
-layouts (also through arrays), contextual constructors, general container constants,
+layouts (also through arrays), general container constants,
 value parameters and general compile-time execution remain unsupported.
 
 The following broader stack example remains design-only: `#type` denotes an
@@ -2703,7 +2736,7 @@ classifies the same candidates as attempted aliases and reports type-alias cycle
 Aliases work in annotations and `@as`, and print contexts render their canonical
 type names as static strings (`@println(Count)` or `"{Count}"`). They are not
 general runtime values; `Count(1)` remains an error. An alias of a nominal struct
-supports that struct's explicit `Alias[ .field = value ]` constructor and static methods;
+supports that struct's explicit `Alias.[ field = value ]` constructor and static methods;
 this does not add numeric alias constructors, mutable/local aliases, general runtime
 type values or comptime functions. Bounded `@TypeOf` queries and generic container
 arguments are supported as described below. `@as` remains exact expected-type ascription, not a checked
@@ -2761,7 +2794,7 @@ let same: (x: u8, y: @TypeOf(x)) -> @TypeOf(y) = y
 let main: () = {
     let x: u8 = 7
     let values: []@TypeOf(x) = [x]
-    let boxed: Box(@TypeOf(x)) = Box(@TypeOf(x))[.value = x]
+    let boxed: Box(@TypeOf(x)) = Box(@TypeOf(x)).[value = x]
     let count: Count = 1
     let copy = @as(@TypeOf(x), 8)
     @println(@TypeOf(x), "{@TypeOf(values)}", identity(count), same(x, copy), boxed)
@@ -3003,9 +3036,9 @@ let Complex = struct {
     im: float
 
     @[operator(.@"+")]
-    let add: (self: Complex, other: Complex) -> Complex = [
-        .re = self.re + other.re,
-        .im = self.im + other.im,
+    let add: (self: Complex, other: Complex) -> Complex = .[
+        re = self.re + other.re,
+        im = self.im + other.im,
     ]
 
     ; explicit print converter; the name is arbitrary
@@ -3014,9 +3047,9 @@ let Complex = struct {
     let format: (self: Complex) -> string = "{self.re} + i{self.im}"
 }
 
-let x: Complex = [ .re = 5, .im = 3 ]
-let y: Complex = [ .re = 2, .im = 7 ]
-x + y ; returns Complex[ .re = 7, .im = 10 ]
+let x: Complex = .[ re = 5, im = 3 ]
+let y: Complex = .[ re = 2, im = 7 ]
+x + y ; equivalent value: Complex.[ re = 7, im = 10 ]
 ```
 
 ## Strings

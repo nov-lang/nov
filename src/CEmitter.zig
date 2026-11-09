@@ -2365,6 +2365,82 @@ test "floats direct IR exact bits IEEE operations comparisons and separate C ABI
     for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, harness.written(), 0, "", "", mode);
 }
 
+fn emitAnonymousRecords(allocator: std.mem.Allocator) ![]u8 {
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    const span: Ir.Span = .{ .start = 0, .end = 0 };
+    const unit = try ir.internType(.void);
+    const integer = try ir.internType(.{ .integer = .{ .bits = 64, .signedness = .signed } });
+    const string = try ir.internType(.string);
+    const array = try ir.internType(.{ .array = integer });
+    const named = try ir.internAnonymousRecord(&.{ .{ .name = "a", .ty = integer, .span = span }, .{ .name = "items", .ty = array, .span = span } }, false);
+    const positional = try ir.internAnonymousRecord(&.{ .{ .name = "ignored", .ty = string, .span = span }, .{ .name = "ignored", .ty = named, .span = span } }, true);
+    const records = try ir.internType(.{ .array = positional });
+    const empty_named = try ir.internAnonymousRecord(&.{}, false);
+    const empty_positional = try ir.internAnonymousRecord(&.{}, true);
+    const nominal = try ir.internType(.{ .record = .{ .identity = 0, .fields = &.{} } });
+    try ir.setRecordFields(nominal, &.{.{ .name = "a", .ty = integer, .span = span }});
+    try ir.setTypeFormatting(nominal, "Name", null);
+    const tagged = try ir.internType(.{ .record = .{ .identity = 1, .fields = &.{}, .tagged = true } });
+    try ir.setRecordFields(tagged, &.{.{ .name = "some", .ty = named, .span = span }});
+    try ir.setTypeFormatting(tagged, "U", null);
+    const pass_type = try ir.internType(.{ .function = .{ .params = &.{positional}, .result = positional } });
+    const pass = try ir.addFunction("pass", pass_type, span);
+    try ir.setFunctionBody(pass, &.{.{ .ty = positional, .span = span, .op = .{ .parameter = 0 } }}, @fromBackingInt(0));
+    const signature = try ir.internType(.{ .function = .{ .params = &.{}, .result = unit } });
+    const main = try ir.addFunction("main", signature, span);
+    const one = try ir.internConstant(.{ .ty = integer, .value = .{ .signed_integer = 1 } });
+    const text = try ir.internConstant(.{ .ty = string, .value = .{ .string = "a" } });
+    try ir.setFunctionBody(main, &.{
+        .{ .ty = integer, .span = span, .op = .{ .constant = one } }, // 0
+        .{ .ty = string, .span = span, .op = .{ .constant = text } }, // 1
+        .{ .ty = array, .span = span, .op = .{ .array_literal = &.{@fromBackingInt(0)} } }, // 2
+        .{ .ty = named, .span = span, .op = .{ .record_init = &.{ @fromBackingInt(0), @fromBackingInt(2) } } }, // 3
+        .{ .ty = positional, .span = span, .op = .{ .record_init = &.{ @fromBackingInt(1), @fromBackingInt(3) } } }, // 4
+        .{ .ty = positional, .span = span, .op = .{ .array_clone = @fromBackingInt(4) } }, // 5
+        .{ .ty = pass_type, .span = span, .op = .{ .function_ref = pass } }, // 6
+        .{ .ty = positional, .span = span, .op = .{ .call = .{ .callee = @fromBackingInt(6), .args = &.{@fromBackingInt(5)} } } }, // 7
+        .{ .ty = records, .span = span, .op = .{ .array_literal = &.{@fromBackingInt(7)} } }, // 8
+        .{ .ty = string, .span = span, .op = .{ .to_string = @fromBackingInt(8) } }, // 9
+        .{ .ty = nominal, .span = span, .op = .{ .record_init = &.{@fromBackingInt(0)} } }, // 10
+        .{ .ty = tagged, .span = span, .op = .{ .union_init = .{ .index = 0, .payload = @fromBackingInt(3) } } }, // 11
+        .{ .ty = empty_named, .span = span, .op = .{ .record_init = &.{} } }, // 12
+        .{ .ty = empty_positional, .span = span, .op = .{ .record_init = &.{} } }, // 13
+        .{ .ty = integer, .span = span, .op = .{ .field_read = .{ .base = @fromBackingInt(3), .index = 0 } } }, // 14
+        .{ .ty = unit, .span = span, .op = .{ .print = .{ .args = &.{ @fromBackingInt(3), @fromBackingInt(4), @fromBackingInt(7), @fromBackingInt(9), @fromBackingInt(10), @fromBackingInt(11), @fromBackingInt(12), @fromBackingInt(13), @fromBackingInt(14) }, .newline = true } } },
+    }, @fromBackingInt(15));
+    return emit(allocator, &ir, null);
+}
+
+fn testAnonymousRecordEmission(allocator: std.mem.Allocator) !void {
+    const c = try emitAnonymousRecords(allocator);
+    defer allocator.free(c);
+}
+
+test "anonymous records direct source free IR copies pass arrays printing forced GC O0 O3 OOM" {
+    const library = try emitAnonymousRecords(test_gpa);
+    defer test_gpa.free(library);
+    const c = try std.mem.concat(test_gpa, u8, &.{ library, "\nint main(void) { nov_rt_heap.collect_every_allocation=1; nov_main(); if(nov_rt_heap.frames)return 70; nov_gc_collect(&nov_rt_heap); if(nov_rt_heap.live_objects)return 71; nov_gc_shutdown(&nov_rt_heap); return 0; }\n" });
+    defer test_gpa.free(c);
+    const named = ".[ a: 1, items: [1] ]";
+    const positional = ".[a, " ++ named ++ "]";
+    const expected = named ++ " " ++ positional ++ " " ++ positional ++ " [" ++ positional ++ "] Name[ a: 1 ] U.some[ " ++ named ++ " ] .[] .[] 1\n";
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty;", 0, expected, "", mode);
+    const oom = try std.mem.concat(test_gpa, u8, &.{ "#include <stdlib.h>\nstatic void *test_malloc(size_t n) { (void)n; return NULL; }\n#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n", library, "\nint main(void) { nov_main(); return 0; }\n" });
+    defer test_gpa.free(oom);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(oom, "typedef int nonempty;", 1, "", "panic: GC allocation failed\n", mode);
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testAnonymousRecordEmission, .{});
+}
+
+test "anonymous record rework owned nominal constructor fixture syntax" {
+    for ([_][]const u8{ float_program, rune_program, type_of_expressions_program, constructor_shorthand_program, generic_struct_program, generic_instance_program, record_program, storable_arrays_program, field_mutation, closure_types_program }, 0..) |text, index| {
+        var source = try Source.init(test_gpa, @fromBackingInt(0), "constructors.nov", text);
+        defer source.deinit();
+        for (source.ast.errors) |err| std.debug.print("fixture {d}: {s} at {s}\n", .{ index, @tagName(err.tag), source.ast.tokenSlice(err.token) });
+        try std.testing.expectEqual(@as(usize, 0), source.ast.errors.len);
+    }
+}
+
 fn emitFloatFormatting(allocator: std.mem.Allocator) ![]u8 {
     var ir = Ir.init(allocator);
     defer ir.deinit();
@@ -2459,7 +2535,7 @@ const float_program =
     \\    a[1]+=1.5
     \\    a[2]*=2
     \\    a+=[inf]
-    \\    let mut r=R[.x=0.25,.y=0.5]
+    \\    let mut r=R.[x=0.25,y=0.5]
     \\    loop i in 0..2 {loop j in 0..2 {r.x+=0.25
     \\        r.y*=2.0}}
     \\    @println(a,r,U.some[r])
@@ -2886,7 +2962,7 @@ test "default aggregate formatting allocating hooks share mutable closure state 
         \\ let mut count:int=0
         \\ let tick=()->int{count+=1
         \\ count}
-        \\ let counter=Counter[.callbacks=[tick]]
+        \\ let counter=Counter.[callbacks=[tick]]
         \\ let values=[counter,counter]
         \\ show(values)
         \\ @println(convert(values))
@@ -3187,7 +3263,7 @@ fn writeAggregateFormatting(allocator: std.mem.Allocator, ir: *const Ir, counts:
                         try writeFormatLiteral(w, field.name);
                         const payload = ir.getType(field.ty).?;
                         if (payload != .void) {
-                            const flatten = payload == .record and !payload.record.tagged and formatHook(ir, field.ty) == null;
+                            const flatten = payload == .record and !payload.record.tagged and payload.record.anonymous == .none and formatHook(ir, field.ty) == null;
                             const hooked_record = payload == .record and !payload.record.tagged and !flatten;
                             if (!flatten) try writeFormatLiteral(w, if (hooked_record) "[ " else "[");
                             try w.print("    nov_format_{d}(sink, value.f{d}, {s});\n", .{ @backingInt(field.ty), f, if (flatten) "false" else "true" });
@@ -3197,17 +3273,23 @@ fn writeAggregateFormatting(allocator: std.mem.Allocator, ir: *const Ir, counts:
                     }
                     try w.writeAll("    default: nov_rt_panic(\"invalid union tag\");\n    }\n");
                 } else {
-                    try w.writeAll("    if (named) {\n");
-                    try writeFormatLiteral(w, formatName(ir, id));
-                    try w.writeAll("    }\n");
-                    try writeFormatLiteral(w, if (record.fields.len == 0) "[" else "[ ");
+                    if (record.anonymous == .none) {
+                        try w.writeAll("    if (named) {\n");
+                        try writeFormatLiteral(w, formatName(ir, id));
+                        try w.writeAll("    }\n");
+                    } else {
+                        try writeFormatLiteral(w, ".");
+                    }
+                    try writeFormatLiteral(w, if (record.fields.len == 0 or record.anonymous == .positional) "[" else "[ ");
                     for (record.fields, 0..) |field, f| {
                         if (f != 0) try writeFormatLiteral(w, ", ");
-                        try writeFormatLiteral(w, field.name);
-                        try writeFormatLiteral(w, ": ");
+                        if (record.anonymous != .positional) {
+                            try writeFormatLiteral(w, field.name);
+                            try writeFormatLiteral(w, ": ");
+                        }
                         try w.print("    nov_format_{d}(sink, value.f{d}, true);\n", .{ @backingInt(field.ty), f });
                     }
-                    try writeFormatLiteral(w, if (record.fields.len == 0) "]" else " ]");
+                    try writeFormatLiteral(w, if (record.fields.len == 0 or record.anonymous == .positional) "]" else " ]");
                 }
             },
             else => unreachable,
@@ -3278,7 +3360,7 @@ const rune_program =
     \\@println('A',seed,'😀','\u{10ffff}','\0','\n','\t','\'','\\')
     \\let call=identity
     \\@println(call(seed), seed=='é', seed!='😀', "hello"[0])
-    \\let mut r=R[.value=seed]
+    \\let mut r=R.[value=seed]
     \\let saved=r
     \\r.value='😀'
     \\let opt:Option(rune)=.some[r.value]
@@ -3461,7 +3543,7 @@ const type_reachability_cases = [_]struct { source: []const u8, output: []const 
     \\let Box:(T:type)->type=struct{values:[]T,}
     \\let snapshot:(row:Outer)->Outer=row
     \\let make:(row:Outer)->()->Outer=()->Outer {snapshot(row)}
-    \\let main:()={let mut row=Outer[.rows=[[Box(Box(string))[.values=[Box(string)[.values=["reachable"+"!"]]]]]]]
+    \\let main:()={let mut row=Outer.[rows=[[Box(Box(string)).[values=[Box(string).[values=["reachable"+"!"]]]]]]]
     \\ let captured=make(row)
     \\ row.rows=[]
     \\ let copy=captured()
@@ -3514,8 +3596,8 @@ const type_of_expressions_program =
     \\ let mutated:@TypeOf({effects+=1
     \\ effects=fail()
     \\ effects})=6
-    \\ let constructed:@TypeOf(R[.value=fail()])=R[]
-    \\ let converted:@TypeOf("{R[]}")="safe"
+    \\ let constructed:@TypeOf(R.[value=fail()])=R.[]
+    \\ let converted:@TypeOf("{R.[]}")="safe"
     \\ let sliced:@TypeOf("λ"[99..100])="slice"
     \\ let branch:@TypeOf(if true {1} else {fail()})=8
     \\ let matched:@TypeOf(match true {true=>1
@@ -3701,13 +3783,13 @@ const storable_arrays_program =
     \\ let mut projected=rows[1]
     \\ projected[0]="changed"
     \\ if rows[1][0]!="ab" {@panic("projection copy")}
-    \\ let boxed=Box([][]string)[.value=rows]
+    \\ let boxed=Box([][]string).[value=rows]
     \\ rows+=[["third"]]
     \\ if boxed.value.len!=2 or empty[0].len!=0 {@panic("generic array field")}
-    \\ let mut unions:[]U=[.row[Row[.values=rows]],.text["text"+"!"],.none[]]
+    \\ let mut unions:[]U=[.row[Row.[values=rows]],.text["text"+"!"],.none[]]
     \\ let saved=unions
     \\ unions[0]=.none[]
-    \\ unions+=[.row[Row[.values=old]]]
+    \\ unions+=[.row[Row.[values=old]]]
     \\ loop &u in unions {u.* =.none[]}
     \\ let mut extracted=match saved[0] {.row=>|r|r.values
     \\ _=>[]}
@@ -3812,7 +3894,7 @@ test "storable arrays precise backing descriptors survive source release" {
 test "storable arrays recursive runtime allocation failures" {
     for ([_][]const u8{
         "let main:()={let a:[][]int=[[1]]\nlet b=a\n@println(b[0][0],a[0][0])}",
-        "let R=struct{a:[][]int,}\nlet U=union{some:R,none,}\nlet main:()={let a:[]U=[.some[R[.a=[[1]]]],.none[]]\nlet b=a\n@println(match b[0] {.some=>|r|r.a[0][0]\n.none=>0},a.len)}",
+        "let R=struct{a:[][]int,}\nlet U=union{some:R,none,}\nlet main:()={let a:[]U=[.some[R.[a=[[1]]]],.none[]]\nlet b=a\n@println(match b[0] {.some=>|r|r.a[0][0]\n.none=>0},a.len)}",
         "let main:()={let mut n:int=1\nlet f=()->int {n+=1\nn}\nlet a=[f]\nlet b=a\n@println(b[0](),a[0]())}",
     }) |source| {
         const library = try emitSource(source, null);
@@ -3831,7 +3913,7 @@ test "storable arrays recursive runtime allocation failures" {
 test "storable arrays forged reused nested and active union payloads detach recursive backing" {
     for ([_]struct { source: []const u8, path: []const u8 }{
         .{ .source = "let main:()={let seed:[]int=[1]\nlet mut a=[seed,seed]\na[-1]=seed\na+=a\n@println(a.len,seed[0],a[0][0])}", .path = "data" },
-        .{ .source = "let R=struct{a:[]int,}\nlet U=union{some:R,none,}\nlet main:()={let seed:U=.some[R[.a=[1]]]\nlet mut a=[seed,seed]\na[-1]=seed\na+=a\n@println(a.len,match seed {.some=>|r|r.a[0]\n.none=>0},match a[0] {.some=>|r|r.a[0]\n.none=>0})}", .path = "f0.f0.data" },
+        .{ .source = "let R=struct{a:[]int,}\nlet U=union{some:R,none,}\nlet main:()={let seed:U=.some[R.[a=[1]]]\nlet mut a=[seed,seed]\na[-1]=seed\na+=a\n@println(a.len,match seed {.some=>|r|r.a[0]\n.none=>0},match a[0] {.some=>|r|r.a[0]\n.none=>0})}", .path = "f0.f0.data" },
     }) |case| {
         var module = try Module.init(test_gpa, "forged-storable.nov", case.source);
         defer module.deinit();
@@ -3922,7 +4004,7 @@ test "storable arrays individual elements retain nominal printing contracts" {
         \\ .none=>"none"}
         \\}
         \\let main:()={let a:[]Alias=[.first,.second]
-        \\ let r=[R[.s="record"]]
+        \\ let r=[R.[s="record"]]
         \\ let u:[]U=[.some[r[0]],.none[]]
         \\ @println(a[0],r[0],u[0],u[1],a[0]==E.first,Alias.second in a)}
     ;
@@ -4127,21 +4209,21 @@ const constructor_shorthand_program =
     \\let N=struct{number:int,}
     \\let M=struct{n:int,}
     \\let borrow:(a:[]int)->R={let value=&a
-    \\ R[.value=value.*,.label]}
+    \\ R.[value=value.*,label=label]}
     \\let factory:()->()->R={let value:[]int=[4]
     \\ let text="captured"+"!"
-    \\ ()->R {if true {R[.value,.label=text]} else {R[.value,.label]}}}
+    \\ ()->R {if true {R.[value=value,label=text]} else {R.[value=value,label=label]}}}
     \\let main:()={
     \\ let mut value:[]int=[1]
     \\ let change=()->string {value[0]=2
     \\ "changed"+"!"}
-    \\ let first=R[.value,.label=change()]
-    \\ let second=R[.label=change(),.value]
+    \\ let first=R.[value=value,label=change()]
+    \\ let second=R.[label=change(),value=value]
     \\ value[0]=3
     \\ @println(first.value[0],second.value[0],value[0],first.n,first.label)
-    \\ let mut box:Alias=Box([]int)[.value]
+    \\ let mut box:Alias=Box([]int).[value=value]
     \\ value[0]=8
-    \\ @println(box.value[0],value[0],N[.number].number)
+    \\ @println(box.value[0],value[0],N.[number=number].number)
     \\ let f=factory()
     \\ let r=f()
     \\ @println(r.value[0],r.label,r.n)
@@ -4149,7 +4231,7 @@ const constructor_shorthand_program =
     \\ value[0]=10
     \\ @println(b.value[0],value[0],b.label)
     \\ let mut n:int=1
-    \\ let nested=()->()->int {()->int {M[.n].n}}
+    \\ let nested=()->()->int {()->int {M.[n=n].n}}
     \\ let inner=nested()
     \\ n=5
     \\ @println(inner())
@@ -4183,7 +4265,7 @@ test "constructor shorthand keeps contextual and qualified union enum payload gr
 }
 
 test "constructor shorthand runtime OOM uses ordinary array copy failure" {
-    const source = "let R=struct{value:[]int,}\nlet main:()={let value:[]int=[1]\n@println(\"before\")\nlet r=R[.value]\n@println(r.value[0])\n@println(value[0])}";
+    const source = "let R=struct{value:[]int,}\nlet main:()={let value:[]int=[1]\n@println(\"before\")\nlet r=R.[value=value]\n@println(r.value[0])\n@println(value[0])}";
     const program = try arrayTestProgram(source);
     defer test_gpa.free(program);
     const c = try std.mem.concat(test_gpa, u8, &.{ "#include <stdlib.h>\nstatic size_t count;\nstatic void *test_malloc(size_t n) {if(count++ >= 1)return NULL;return malloc(n);}\n#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n", program });
@@ -4208,7 +4290,7 @@ const closure_types_program =
     \\ }
     \\}
     \\let main=(){
-    \\ let f=factory("a"+"b", R[.s="r"+"!",.n=7], .some[R[.s="u"+"!",.n=8]], [R[.s="array"+"!",.n=9]], true, 'é', K.second, identity)
+    \\ let f=factory("a"+"b", R.[s="r"+"!",n=7], .some[R.[s="u"+"!",n=8]], [R.[s="array"+"!",n=9]], true, 'é', K.second, identity)
     \\ @println(f())
     \\ let mut s="old"+"!"
     \\ let snapshot=s
@@ -4240,7 +4322,7 @@ const backtick_program =
     \\let finish:()->`T=return
     \\let loopValue:(x:`T)->`U=loop {break x}
     \\let makeVoid:(x:`T)->()->`U=()->`U{return}
-    \\let makeBox:(x:`T)->Box(`T)=Box(`T)[.value=x]
+    \\let makeBox:(x:`T)->Box(`T)=Box(`T).[value=x]
     \\let getBox:(x:Box(`T))->`T=x.value
     \\let add:(x:`a,y:`b)->`c=x+y
     \\let first:(items:[]`T)->`T=items[0]
@@ -4275,7 +4357,7 @@ const backtick_program =
     \\let next=cell("old")
     \\let alias=next
     \\@println(next("new"),alias("last"))
-    \\let box=Box(string)[.value="field"]
+    \\let box=Box(string).[value="field"]
     \\@println(unwrap(box),invert(true),size("abc"),size([true,false]),wrap("ok"))
     \\@println(fresh,if false {forward(true)} else {true},choose(false,"live"),loopValue("break"))
     \\finish()}
@@ -4547,7 +4629,7 @@ const generic_closure_review_program =
     \\let main:()={
     \\ @println(id({(x:`T)->`T{x}(true)}))
     \\ @println(id({apply((x:`T)->`T{x},false)}))
-    \\ @println(R[].method(true),Box(bool)[].method(false))
+    \\ @println(R.[].method(true),Box(bool).[].method(false))
     \\ {let gone:int=7
     \\  @print(gone)}
     \\ let uncaptured:[][]int=[[7]]
@@ -4623,7 +4705,7 @@ const generic_closures_program =
     \\ @println(identity(true),identity(@as(int,42)),apply(identity,false))
     \\ @println(outer(true),outer(@as(int,9)))
     \\ @println((item:`T)->`T{item}(false),apply((item:`T)->`T{item},true))
-    \\ @println(Receiver[.value=1].through(identity,true),reverse(false,identity))
+    \\ @println(Receiver.[value=1].through(identity,true),reverse(false,identity))
     \\ @println((left:`T,right:`U)->`T{left}({@print("L")
     \\  true},{@print("R")
     \\  @as(int,1)}))
@@ -4975,13 +5057,13 @@ const enum_program =
     \\let make:()->R=.err[.not_found]
     \\let pass:()->R={let n=make().!
     \\    .ok[n]}
-    \\let structured:()->S=.err[Error[.message="de"+"tail"]]
+    \\let structured:()->S=.err[Error.[message="de"+"tail"]]
     \\let copy:(e:Error)->Error=e
     \\let main:()={
     \\    let mut k:Kind=.io
     \\    let saved=k
     \\    k=initial
-    \\    let e=copy(Error[.message="hel"+"lo"])
+    \\    let e=copy(Error.[message="hel"+"lo"])
     \\    @println(k,"{saved}",Kind.eql(k,.not_found),saved!=k,e.kind,e.message,e.valid,e.code)
     \\    @println(match pass(){.ok=>|n|"{n}"
     \\        .err=>|kind|"{kind}"})
@@ -4995,10 +5077,10 @@ const instance_program =
     \\let Alias=R
     \\let R=struct{s:string,
     \\    let next:(value:Alias,n:int,other:R)->R={@println("method",value.s,n,other.s)
-    \\        R[.s=value.s+other.s]}
+    \\        R.[s=value.s+other.s]}
     \\    let text:(value:R)->string=value.s
     \\    let replace:(value:R)->R={let mut copy=value
-    \\        copy=R[.s="changed"]
+    \\        copy=R.[s="changed"]
     \\        copy}
     \\}
     \\let K=enum{x,y,
@@ -5009,7 +5091,7 @@ const instance_program =
     \\        .empty=>"empty"}
     \\}
     \\let make:(label:string)->R={@println(label)
-    \\    R[.s=label+"!"]}
+    \\    R.[s=label+"!"]}
     \\let number:()->int={@println("arg")
     \\    7}
     \\let main:()={
@@ -5049,7 +5131,7 @@ test "instance calls skip later effects on receiver return panic propagation and
         \\let arg:()->int={@print("BAD")
         \\    1}
         \\let receiver:()->R={@print("receiver")
-        \\    R[]}
+        \\    R.[]}
         \\let propagated:()->RS=.ok[failed().!.use(arg())]
         \\let pass:(r:R)->R=r
         \\let returned:()->string=pass({return "returned"}).use(arg())
@@ -5062,7 +5144,7 @@ test "instance calls skip later effects on receiver return panic propagation and
     ;
     const Case = struct { tail: []const u8, output: []const u8, message: []const u8 };
     for ([_]Case{
-        .{ .tail = "R[.s=\"st\"+\"op\"].stop()\n}", .output = "returned\nreceiverargument\nerror\n", .message = "panic: stop!\n" },
+        .{ .tail = "R.[s=\"st\"+\"op\"].stop()\n}", .output = "returned\nreceiverargument\nerror\n", .message = "panic: stop!\n" },
         .{ .tail = "pass({@print(\"panic\")\n@panic(\"receiver\")}).use(arg())\n}", .output = "returned\nreceiverargument\nerror\npanic", .message = "panic: receiver\n" },
         .{ .tail = "receiver().skip(@panic(\"argument\"),arg())\n}", .output = "returned\nreceiverargument\nerror\nreceiver", .message = "panic: argument\n" },
     }) |case| {
@@ -5085,7 +5167,7 @@ test "instance calls skip later effects on receiver return panic propagation and
 
 const generic_instance_program =
     \\let Box:(T:type)->type=struct{value:T,
-    \\let map:(object:Box(T),convert:(T)->`U)->Box(`U)=Box(`U)[.value=convert(object.value)]
+    \\let map:(object:Box(T),convert:(T)->`U)->Box(`U)=Box(`U).[value=convert(object.value)]
     \\let keep:(object:Box(T),change:()->`U)->T={let ignored=change()
     \\object.value}
     \\}
@@ -5095,7 +5177,7 @@ const generic_instance_program =
     \\}
     \\let identity:(x:`T)->`T=x
     \\let make:()->`T=7
-    \\let main:()={let mut r=Box([][]string)[.value=[["old"+"!"]]]
+    \\let main:()={let mut r=Box([][]string).[value=[["old"+"!"]]]
     \\let mut count:int=0
     \\let receiver=()->Box([][]string){count+=1
     \\@println("receiver",count)
@@ -5106,10 +5188,10 @@ const generic_instance_program =
     \\let read=()->string {r.value[0][0]}
     \\let saved=receiver().keep(change)
     \\@println(saved[0][0],read(),count)
-    \\let mapped=Box(bool)[.value=true].map(identity)
+    \\let mapped=Box(bool).[value=true].map(identity)
     \\let static=Box(bool).map(mapped,identity)
     \\@println(mapped.value,static.value)
-    \\let plain=Plain[]
+    \\let plain=Plain.[]
     \\let n:uint=plain.produce(make)
     \\@println(plain.apply(true),n)
     \\}
@@ -5132,7 +5214,7 @@ test "backtick instance terminal operands generated C both branches return befor
         \\}
         \\let f:(a:`T,b:`T,c:`T)->`T=missing
         \\let receiver:()->R={@print("receiver ")
-        \\R[]}
+        \\R.[]}
         \\let prefix:()->bool={@print("prefix ")
         \\true}
         \\let choose:(flag:bool)->uint=receiver().f(prefix(),if flag{return 1}else{return 2},unknown)
@@ -5157,12 +5239,12 @@ const generic_flow_program =
     \\}
     \\let Normal=struct{let f:(self:Normal,a:`T,b:`T,c:`T)->`T=a
     \\}
-    \\let matched:(flag:bool)->uint=W[].f(true,match flag{true=>{return 1}
+    \\let matched:(flag:bool)->uint=W.[].f(true,match flag{true=>{return 1}
     \\false=>{return 2}},unknown)
-    \\let exhaustion:()->uint=W[].f(true,loop false{}else{return 3},unknown)
-    \\let concrete:(flag:bool)->uint=C[].f(true,match flag{true=>{return 4}
+    \\let exhaustion:()->uint=W.[].f(true,loop false{}else{return 3},unknown)
+    \\let concrete:(flag:bool)->uint=C.[].f(true,match flag{true=>{return 4}
     \\false=>{return 5}},unknown)
-    \\let parent:()->bool=Normal[].f(true,loop{loop false{}else{break true}},true)
+    \\let parent:()->bool=Normal.[].f(true,loop{loop false{}else{break true}},true)
     \\let main:()={let a=matched(true)
     \\let b=matched(false)
     \\let c=exhaustion()
@@ -5187,13 +5269,13 @@ test "backtick instance factory signatures preserve terminal execution source fr
         \\let stop:(object:R)=@panic("factory")
         \\}
         \\let make:()->R={@print("made ")
-        \\R[]}
+        \\R.[]}
         \\let Factory=struct{let make:()->R={@print("made ")
-        \\R[]}
+        \\R.[]}
         \\}
         \\let main:()={let label="owned"
         \\let keep=()->string{label}
-        \\R[].f(true,
+        \\R.[].f(true,
     ;
     for ([_][]const u8{ "make().stop()", "{let r=make()\nr.stop()}", "Factory.make().stop()" }) |argument| {
         const source = try std.mem.concat(test_gpa, u8, &.{ prelude, argument, ",unknown)}" });
@@ -5218,10 +5300,10 @@ test "backtick instance generated C terminal argument skips later effects and no
         \\true}
     ;
     for ([_]struct { tail: []const u8, message: []const u8 }{
-        .{ .tail = "let main:()={R[].skip(@panic(\"argument\"),later())\n}", .message = "panic: argument\n" },
-        .{ .tail = "@[noreturn]\nlet main:()=R[].stop(true)", .message = "panic: stop\n" },
-        .{ .tail = "@[noreturn]\nlet main:()=R[].skip(if true{@panic(\"branch\")}else{@panic(\"other\")},unknown)", .message = "panic: branch\n" },
-        .{ .tail = "@[noreturn]\nlet main:()=R[].skip({let r=R[]\nr.stop(true)},unknown)", .message = "panic: stop\n" },
+        .{ .tail = "let main:()={R.[].skip(@panic(\"argument\"),later())\n}", .message = "panic: argument\n" },
+        .{ .tail = "@[noreturn]\nlet main:()=R.[].stop(true)", .message = "panic: stop\n" },
+        .{ .tail = "@[noreturn]\nlet main:()=R.[].skip(if true{@panic(\"branch\")}else{@panic(\"other\")},unknown)", .message = "panic: branch\n" },
+        .{ .tail = "@[noreturn]\nlet main:()=R.[].skip({let r=R.[]\nr.stop(true)},unknown)", .message = "panic: stop\n" },
     }) |case| {
         const source = try std.mem.concat(test_gpa, u8, &.{ prelude, "\n", case.tail });
         defer test_gpa.free(source);
@@ -5237,8 +5319,8 @@ test "instance receiver snapshots survive later binding replacement" {
         \\let R=struct{s:string,
         \\    let join:(r:R,other:R)->string=r.s+other.s
         \\}
-        \\let main:()={let mut r=R[.s="old"+"!"]
-        \\    @println(r.join({r=R[.s="new"+"!"]
+        \\let main:()={let mut r=R.[s="old"+"!"]
+        \\    @println(r.join({r=R.[s="new"+"!"]
         \\        r}),r.s)}
     ;
     const c = try arrayTestProgram(source);
@@ -5248,9 +5330,9 @@ test "instance receiver snapshots survive later binding replacement" {
 
 test "instance calls runtime allocation failures occur at receiver args and method in order" {
     for ([_][]const u8{
-        "let main:()=@println(R[.s=\"a\"+\"b\"].join(arg()))",
-        "let main:()=@println(R[.s=\"ab\"].join(\"c\"+\"d\"))",
-        "let main:()=@println(R[.s=\"ab\"].join(\"cd\"))",
+        "let main:()=@println(R.[s=\"a\"+\"b\"].join(arg()))",
+        "let main:()=@println(R.[s=\"ab\"].join(\"c\"+\"d\"))",
+        "let main:()=@println(R.[s=\"ab\"].join(\"cd\"))",
     }) |body| {
         const source = try std.mem.concat(test_gpa, u8, &.{
             "let R=struct{s:string,\nlet join:(r:R,s:string)->string=r.s+s\n}\nlet arg:()->string={@print(\"BAD\")\n\"cd\"}\n", body,
@@ -5372,7 +5454,7 @@ const record_payload_program =
     \\let text:(s:string)->string={@print(s)
     \\    s+"!"}
     \\let make:(good:bool)->Input={@print("M")
-    \\    if good {.ok[Alias[.extra=text("b"),.name=text("a"),.n=7]]} else {.err[Error[.message="er"+"ror",.detail="de"+"tail",.code=-8]]}}
+    \\    if good {.ok[Alias.[extra=text("b"),name=text("a"),n=7]]} else {.err[Error.[message="er"+"ror",detail="de"+"tail",code=-8]]}}
     \\let use:(r:Alias,later:string)->string="{r.name}:{r.extra}:{r.n}:{r.valid}:"+later
     \\let run:(good:bool)->Output={let file=make(good).!
     \\    @println(use(file,"x"+"y"))
@@ -5381,9 +5463,9 @@ const record_payload_program =
     \\    .err=>|e|"{e.message}:{e.detail}:{e.code}"}
     \\let copy:(u:U)->U=u
     \\let main:()={@println(show(run(true)),show(run(false)))
-    \\    let mut u=U.ok[File[.name="c"+"d",.extra="e"+"f",.n=9]]
+    \\    let mut u=U.ok[File.[name="c"+"d",extra="e"+"f",n=9]]
     \\    let saved=copy(u)
-    \\    loop i in 0..4 {u=if i == 0 {saved} else if i == 1 {.err[Error[.message="g"+"h",.detail="i"+"j",.code=2]]} else {.none[]}
+    \\    loop i in 0..4 {u=if i == 0 {saved} else if i == 1 {.err[Error.[message="g"+"h",detail="i"+"j",code=2]]} else {.none[]}
     \\        let value:U=loop{break u}
     \\        @println(match value{.ok=>|f|use(f,"k"+"l")
     \\            .err=>|e|e.message+e.detail
@@ -5403,7 +5485,7 @@ test "record payloads preserve layout order copies effects propagation captures 
 test "record payload inactive storage stays zero when loop temporaries change variants" {
     const library = try emitSource(
         "let U=union{ok:R,err:R,none,}\nlet R=struct{s:string,t:string,n:int,}\n" ++
-            "let make:(which:uint)->U={let mut result:U=.none[]\nloop i in 0..which {result=if i == 0 {.ok[R[.s=\"a\"+\"b\",.t=\"c\"+\"d\",.n=1]]} else if i == 1 {.err[R[.s=\"e\"+\"f\",.t=\"g\"+\"h\",.n=2]]} else {.none[]}}\nresult}\nlet copy:(u:U)->U=u",
+            "let make:(which:uint)->U={let mut result:U=.none[]\nloop i in 0..which {result=if i == 0 {.ok[R.[s=\"a\"+\"b\",t=\"c\"+\"d\",n=1]]} else if i == 1 {.err[R.[s=\"e\"+\"f\",t=\"g\"+\"h\",n=2]]} else {.none[]}}\nresult}\nlet copy:(u:U)->U=u",
         null,
     );
     defer test_gpa.free(library);
@@ -5463,8 +5545,8 @@ const option_propagation_program =
     \\.some["unit"]}
     \\let records:(o:O(Item))->Items={let mut item=o.!
     \\let copy=item
-    \\item=Item[.s="new"+"!"]
-    \\.some[Item[.s=copy.s+item.s]]}
+    \\item=Item.[s="new"+"!"]
+    \\.some[Item.[s=copy.s+item.s]]}
     \\let show:(o:Text)=@println(match o{.some=>|s|s
     \\.none=>"none"})
     \\let main:()={show(rhs())
@@ -5473,7 +5555,7 @@ const option_propagation_program =
     \\show(nested())
     \\show(unit(O(void).some[]))
     \\show(unit(O(void).none[]))
-    \\let item=records(O(Item).some[Item[.s="old"+"!"]])
+    \\let item=records(O(Item).some[Item.[s="old"+"!"]])
     \\let noise="collect"+"!"
     \\@println(match item{.some=>|r|r.s
     \\.none=>"BAD"},noise)
@@ -5521,7 +5603,7 @@ test "Option propagation none skips allocations and some reports runtime OOM" {
 
 test "record payload propagation allocates only evaluated strings and handles OOM" {
     for ([_]bool{ false, true }) |allocate| {
-        const source = try std.fmt.allocPrint(test_gpa, "let G:(T:type,E:type)->type=union{{ok:T,err:E,}}\nlet R=struct{{s:string,}}\nlet make:()->G(int,R)=.err[R[.s={s}]]\nlet run:()->G(bool,R)=.ok[make().! == 0]\nlet main:()=@println(match run(){{.ok=>@panic(\"bad\")\n.err=>|r|r.s}})", .{if (allocate) "\"e\"+\"rr\"" else "\"err\""});
+        const source = try std.fmt.allocPrint(test_gpa, "let G:(T:type,E:type)->type=union{{ok:T,err:E,}}\nlet R=struct{{s:string,}}\nlet make:()->G(int,R)=.err[R.[s={s}]]\nlet run:()->G(bool,R)=.ok[make().! == 0]\nlet main:()=@println(match run(){{.ok=>@panic(\"bad\")\n.err=>|r|r.s}})", .{if (allocate) "\"e\"+\"rr\"" else "\"err\""});
         defer test_gpa.free(source);
         const library = try emitSource(source, null);
         defer test_gpa.free(library);
@@ -5538,7 +5620,7 @@ test "record payload captures stay rooted through terminal panic and skip later 
         \\let G:(T:type,E:type)->type=union{ok:T,err:E,}
         \\let R=struct{s:string,t:string,}
         \\let fail:()->G(R,R)={@print("F")
-        \\    return .err[R[.s="pa"+"nic",.t="mes"+"sage"]]}
+        \\    return .err[R.[s="pa"+"nic",t="mes"+"sage"]]}
         \\let later:()->string={@print("BAD")
         \\    "later"}
         \\let use:(r:R,s:string)->bool=r.s == s
@@ -5570,7 +5652,7 @@ test "record payload IR owns source and emission survives every allocation failu
     const c = try collectingTestProgram(library);
     defer test_gpa.free(c);
     try compileAndRunExpected(c, "typedef int nonempty_translation_unit;", 0, record_payload_output, "");
-    try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{"let G:(T:type)->type=union{ok:T,}\nlet R=struct{s:string,}\nlet main:()={let u=G(R).ok[R[.s=\"a\"+\"b\"]]\n@println(match u{.ok=>|r|r.s})}"});
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{"let G:(T:type)->type=union{ok:T,}\nlet R=struct{s:string,}\nlet main:()={let u=G(R).ok[R.[s=\"a\"+\"b\"]]\n@println(match u{.ok=>|r|r.s})}"});
 }
 
 test "printing uses annotated format but ignores ordinary toString" {
@@ -5583,8 +5665,8 @@ test "printing uses annotated format but ignores ordinary toString" {
         \\let Plain=struct{value:int,
         \\let toString:(self:Plain)->string="ordinary plain"
         \\}
-        \\let main:()={let custom=Custom[.value=7]
-        \\let plain=Plain[.value=8]
+        \\let main:()={let custom=Custom.[value=7]
+        \\let plain=Plain.[value=8]
         \\@println(custom,plain)
         \\@println("{custom} {plain}")
         \\@println([custom],[plain])
@@ -5609,11 +5691,11 @@ const record_interpolation_program =
     \\let R=struct{s:string,t:string,
     \\    @[stringify]
     \\    let toString:(r:Alias)->Text={@print("R")
-    \\        let leaf=Leaf[.s=r.s+"!"]
+    \\        let leaf=Leaf.[s=r.s+"!"]
     \\        "{leaf}/{r.t}"}
     \\}
     \\let make:()->Alias={@print("M")
-    \\    R[.s="a"+"b",.t="c"+"d"]}
+    \\    R.[s="a"+"b",t="c"+"d"]}
     \\let scalar:()->bool={@print("S")
     \\    true}
     \\let U=union{item:string,none,
@@ -5645,7 +5727,7 @@ test "record interpolation captures errors for panic and keeps nested payload ow
         \\    let toString:(err:Error)->string={@print("C")
         \\        "{err.message}: {err.detail}"}
         \\}
-        \\let fail:()->G(int,Error)=.err[Error[.message="not "+"found",.detail="fi"+"le"]]
+        \\let fail:()->G(int,Error)=.err[Error.[message="not "+"found",detail="fi"+"le"]]
         \\let main:()=match fail(){.ok=>@panic("unexpected")
         \\    .err=>|err|@panic("Error: {err}")}
     ;
@@ -5700,7 +5782,7 @@ test "record interpolation survives source release and every compiler allocation
 
 test "record interpolation conversion allocations fail safely and skipped conversions allocate nothing" {
     for ([_]bool{ false, true }) |convert| {
-        const source = try std.fmt.allocPrint(test_gpa, "let R=struct{{s:string,\n@[stringify]\nlet toString:(r:R)->string=r.s+\"!\"\n}}\nlet main:()={{let r=R[.s=\"ok\"]\n@println(if {s} {{\"{{r}}\"}} else {{\"skip\"}})}}", .{if (convert) "true" else "false"});
+        const source = try std.fmt.allocPrint(test_gpa, "let R=struct{{s:string,\n@[stringify]\nlet toString:(r:R)->string=r.s+\"!\"\n}}\nlet main:()={{let r=R.[s=\"ok\"]\n@println(if {s} {{\"{{r}}\"}} else {{\"skip\"}})}}", .{if (convert) "true" else "false"});
         defer test_gpa.free(source);
         const library = try emitSource(source, null);
         defer test_gpa.free(library);
@@ -5718,8 +5800,8 @@ const generic_struct_program =
     \\let get:(self:Self)->T=self.value
     \\let forward:(self:Self)->T=sibling(self)
     \\let sibling:(self:Self)->T=self.get()
-    \\let make:(value:T)->Self=Self[.value=value]
-    \\let wrap:(self:Self)->Box(Self)=Box(Self)[.value=self]
+    \\let make:(value:T)->Self=Self.[value=value]
+    \\let wrap:(self:Self)->Box(Self)=Box(Self).[value=self]
     \\@[stringify]
     \\let toString:(self:Self)->string="<{self.value}>"
     \\let unused:()->T=unknown
@@ -5735,26 +5817,26 @@ const generic_struct_program =
     \\let Alias=IntBox
     \\let Nested=struct{box:Box(Box(string)),}
     \\let option:(x:O(Box(string)))->O(Box(int))={let value=x.!
-    \\.some[Box(int)[.value=4]]}
+    \\.some[Box(int).[value=4]]}
     \\let result:(x:R(Box(string),Box(string)))->R(Box(int),Box(string))={let value=x.!
-    \\.ok[Box(int)[.value=5]]}
+    \\.ok[Box(int).[value=5]]}
     \\let main:()={
-    \\let mut a=Box(int)[.value=1]
+    \\let mut a=Box(int).[value=1]
     \\let saved:Alias=a
     \\a.value+=2
     \\let wrapped=a.wrap()
-    \\let mut nested=Nested[.box=Box(Box(string))[.value=Box(string)[.value="a"+"b"]]]
+    \\let mut nested=Nested.[box=Box(Box(string)).[value=Box(string).[value="a"+"b"]]]
     \\let original=nested
     \\nested.box.value.value+="!"
     \\nested.box.value=Box(string).make("new"+"!")
-    \\let pair=Pair(string,int)[.second=wrapped.value.forward(),.first=nested.box.value.get()]
-    \\let reverse=Pair(int,string)[.first=pair.second,.second=pair.first]
-    \\let flags=Flags(Kind)[]
-    \\@println(saved.value,a.get(),pair.first,reverse.first,original.box,Default(int)[].value,flags.value==Kind.second,flags.enabled,flags.text)
-    \\let mut arr:[]Box(string)=[Box(string)[.value="x"+"y"],nested.box.value]
+    \\let pair=Pair(string,int).[second=wrapped.value.forward(),first=nested.box.value.get()]
+    \\let reverse=Pair(int,string).[first=pair.second,second=pair.first]
+    \\let flags=Flags(Kind).[]
+    \\@println(saved.value,a.get(),pair.first,reverse.first,original.box,Default(int).[].value,flags.value==Kind.second,flags.enabled,flags.text)
+    \\let mut arr:[]Box(string)=[Box(string).[value="x"+"y"],nested.box.value]
     \\let copy=arr
-    \\arr[0]=Box(string)[.value="z"+"!"]
-    \\arr += [Box(string)[.value="tail"+"!"]]
+    \\arr[0]=Box(string).[value="z"+"!"]
+    \\arr += [Box(string).[value="tail"+"!"]]
     \\let ok:O(Box(string))=.some[copy[0]]
     \\let err:R(Box(string),Box(string))=.err[copy[1]]
     \\@println(copy[0],arr[0],arr[-1],match option(ok){.some=>|v|v.value
@@ -5803,7 +5885,7 @@ fn testImportedGenericStructs(allocator: std.mem.Allocator) ![]u8 {
             \\let prefix="WRONG"
             \\let helper:()->string="WRONG"
             \\let main:()={let value:int=3
-            \\let x:Alias=library.Box(int)[.value]
+            \\let x:Alias=library.Box(int).[value=value]
             \\let y:api.Box(int)=B.make(x.value)
             \\let z=Box(string).make("a"+"b")
             \\@println(x,y,z,z.message(),x.kind==library.Kind.good)
@@ -5823,7 +5905,7 @@ fn testImportedGenericStructs(allocator: std.mem.Allocator) ![]u8 {
             \\let Box:(T:type)->type=struct{value:T,kind:Kind=.good,
             \\let Self=@This()
             \\@[public]
-            \\let make:(value:T)->Self=Self[.value]
+            \\let make:(value:T)->Self=Self.[value=value]
             \\@[public]
             \\@[stringify]
             \\let toString:(self:Self)->string="<{self.value}>"
@@ -5880,7 +5962,7 @@ test "generic structs method worklist handles concrete typed locals void and nor
         \\let earlier:(value:T)->T={let x:T=value
         \\x}
         \\let next:(self:Self)->Box(bool)=Box(bool).make(true)
-        \\let make:(value:T)->Self=Self[.value=earlier(value)]
+        \\let make:(value:T)->Self=Self.[value=earlier(value)]
         \\let touch:(self:Self)->void=@print(self.value)
         \\@[noreturn]
         \\let stop:()->void=@panic("stop")
@@ -5975,8 +6057,8 @@ test "generic methods root allocated record payload copies across later argument
         \\let Pair=struct{s:string,n:int,}
         \\let R=G(Pair,string)
         \\let S=G(string,bool)
-        \\let make:()->R=.ok[Pair[.s="a"+"b",.n=7]]
-        \\let later:()->Pair=Pair[.s="c"+"d",.n=9]
+        \\let make:()->R=.ok[Pair.[s="a"+"b",n=7]]
+        \\let later:()->Pair=Pair.[s="c"+"d",n=9]
         \\let consume:(p:Pair,s:string)=@println(p.s,p.n,s)
         \\let main:()={
         \\let mut original=make()
@@ -7240,22 +7322,22 @@ const field_mutation =
     \\    local.x = 99
     \\    local.s += "copy"
     \\    local}
-    \\let early: () -> R = {let mut r = R[]
+    \\let early: () -> R = {let mut r = R.[]
     \\    r.x += {r.y = 7
     \\        return r}}
     \\let O = union { some: i8, none, }
-    \\let propagate: (o: O) -> O = {let mut r = R[]
+    \\let propagate: (o: O) -> O = {let mut r = R.[]
     \\    r.x += o.!
     \\    .some[r.x]}
     \\let main: () = {
-    \\    let mut r: Alias = R[]
+    \\    let mut r: Alias = R.[]
     \\    let saved = r
     \\    r.x += {r.y = 7
     \\        r.x = 90
     \\        @print("A")
     \\        3}
     \\    @println(r.x, r.y, saved.x)
-    \\    r.x *= {r = R[.x = 100, .y = 8, .s = "new" + "!"]
+    \\    r.x *= {r = R.[x = 100, y = 8, s = "new" + "!"]
     \\        2}
     \\    r.x -= 1
     \\    r.x /= 5
@@ -7270,7 +7352,7 @@ const field_mutation =
     \\        r.y = 9
     \\        "tail" + "\0"}
     \\    @println(r.s, old.s, r.y, copy(r).x, r.x)
-    \\    r.s += {r = R[.s = "whole" + "record", .y = 11]
+    \\    r.s += {r = R.[s = "whole" + "record", y = 11]
     \\        "!" + "!"}
     \\    @println(r.s, r.y)
     \\    let mut n: int = 0
@@ -7295,7 +7377,7 @@ test "field mutation snapshots old fields but stores into current slots in stric
 test "field mutation terminal RHS panics before pending arithmetic or stores" {
     for ([_][]const u8{ "=", "+=", "-=", "*=", "/=", "%=" }) |op| {
         for ([_][]const u8{ "@panic(\"stop\")", "die()", "{let a:[]i8=[]\na[0]}" }) |rhs| {
-            const source = try std.fmt.allocPrint(test_gpa, "let R=struct{{x:i8=7,}}\n@[noreturn]\nlet die:()=@panic(\"stop\")\nlet main:()={{let mut r=R[]\nr.x {s} {{@print(\"R\")\n{s}}}}}", .{ op, rhs });
+            const source = try std.fmt.allocPrint(test_gpa, "let R=struct{{x:i8=7,}}\n@[noreturn]\nlet die:()=@panic(\"stop\")\nlet main:()={{let mut r=R.[]\nr.x {s} {{@print(\"R\")\n{s}}}}}", .{ op, rhs });
             defer test_gpa.free(source);
             const c = try arrayTestProgram(source);
             defer test_gpa.free(c);
@@ -7303,7 +7385,7 @@ test "field mutation terminal RHS panics before pending arithmetic or stores" {
         }
     }
     for ([_][]const u8{ "/=", "%=" }) |op| {
-        const source = try std.fmt.allocPrint(test_gpa, "let R=struct{{x:i8=7,}}\nlet main:()={{let mut r=R[]\nr.x {s} {{r=R[.x=99]\n@print(\"R\")\n0}}}}", .{op});
+        const source = try std.fmt.allocPrint(test_gpa, "let R=struct{{x:i8=7,}}\nlet main:()={{let mut r=R.[]\nr.x {s} {{r=R.[x=99]\n@print(\"R\")\n0}}}}", .{op});
         defer test_gpa.free(source);
         const c = try arrayTestProgram(source);
         defer test_gpa.free(c);
@@ -7348,13 +7430,13 @@ const record_program =
     \\let text: () -> string = {@print("S")
     \\    "hé\0" + "!"}
     \\let main: () = {
-    \\    let mut item = Alias[ .n = num(), .s = text(), .b = true ]
+    \\    let mut item = Alias.[ n = num(), s = text(), b = true ]
     \\    let copy = item
-    \\    item = R[ .s = "replacement" ]
-    \\    @println(copy, R[ .s = text() ], item)
-    \\    let chosen = if false { R[ .s = text() ] } else { R.switch(copy) }
+    \\    item = R.[ s = "replacement" ]
+    \\    @println(copy, R.[ s = text() ], item)
+    \\    let chosen = if false { R.[ s = text() ] } else { R.switch(copy) }
     \\    @println(chosen)
-    \\    @println(R.toString(R[]))
+    \\    @println(R.toString(R.[]))
     \\}
 ;
 const record_output = "NSTSTThé\x00!:5:true hé\x00!:0:false replacement:0:false\nThé\x00!:5:true\nThé\x00:0:false\n";
@@ -7384,7 +7466,7 @@ test "record fields defaults methods and C output survive source release and eve
 }
 
 test "record parameters returns and assignments share immutable string backing" {
-    const library = try emitSource("let R = struct { s: string, n: int = 7, }\nlet make: () -> R = R[.s=\"a\"+\"b\"]\nlet share: (r: R) -> R = {let mut copy=r\ncopy=r\ncopy}\n", null);
+    const library = try emitSource("let R = struct { s: string, n: int = 7, }\nlet make: () -> R = R.[s=\"a\"+\"b\"]\nlet share: (r: R) -> R = {let mut copy=r\ncopy=r\ncopy}\n", null);
     defer test_gpa.free(library);
     const c = try std.mem.concat(test_gpa, u8, &.{ library, "\nint main(void) { nov_rt_heap.collect_every_allocation = 1; " ++
         "nov_record_0 a = nov_make(); nov_record_0 b = nov_share(a); " ++
@@ -7438,7 +7520,7 @@ test "record scalar fields cover every supported integer width and literal limit
         \\ g: i64 = -9223372036854775808, h: u64 = 18446744073709551615,
         \\ i: int = -1, j: uint = 1,
         \\}
-        \\let main: () = { let r = R[]
+        \\let main: () = { let r = R.[]
         \\ @println(r.a, r.b, r.c, r.d, r.e, r.f, r.g, r.h, r.i, r.j)
         \\}
     ;
@@ -7458,7 +7540,7 @@ test "record scoped forward methods override module homonyms without global prin
         \\ let second: (self: R) -> string = self.s+"!"
         \\}
         \\let Text=string
-        \\let main:()={ @println(Alias[], Alias.first(R[])) }
+        \\let main:()={ @println(Alias.[], Alias.first(R.[])) }
     ;
     const c = try arrayTestProgram(source);
     defer test_gpa.free(c);
@@ -7467,9 +7549,9 @@ test "record scoped forward methods override module homonyms without global prin
 
 test "record constructors and allocating toString report OOM while skipped constructors allocate nothing" {
     for ([_]struct { body: []const u8, allocates: bool }{
-        .{ .body = "let r = if true { R[] } else { R[.s=\"a\"+\"b\"] }\n@println(r.s)", .allocates = false },
-        .{ .body = "let r=R[.s=\"a\"+\"b\"]\n@println(r.s)", .allocates = true },
-        .{ .body = "@println(R[])", .allocates = true },
+        .{ .body = "let r = if true { R.[] } else { R.[s=\"a\"+\"b\"] }\n@println(r.s)", .allocates = false },
+        .{ .body = "let r=R.[s=\"a\"+\"b\"]\n@println(r.s)", .allocates = true },
+        .{ .body = "@println(R.[])", .allocates = true },
     }) |case| {
         const source = try std.fmt.allocPrint(test_gpa, "let R=struct{{s:string=\"ok\",\n@[stringify]\nlet toString:(self:R)->string=self.s+\"!\"\n}}\nlet main:()={{{s}\n}}", .{case.body});
         defer test_gpa.free(source);
@@ -7492,9 +7574,9 @@ test "record string field roots cover branch and loop merges early returns and a
         \\let make: (r: R, text: string) -> R = { @println(text)
         \\ return r }
         \\let main: () = {
-        \\ let a = if true { R[.s="a"+"b"] } else { R[.s="unused"+"x"] }
+        \\ let a = if true { R.[s="a"+"b"] } else { R.[s="unused"+"x"] }
         \\ let b: R = loop { break a }
-        \\ @println(make(b, "allocate"+"!"), R[.s="c"+"d"])
+        \\ @println(make(b, "allocate"+"!"), R.[s="c"+"d"])
         \\}
     ;
     const c = try arrayTestProgram(source);
@@ -7582,7 +7664,7 @@ const reference_parameter_managed =
     \\let text:(p:&mut string)={p.* +="!"+"!"}
     \\let invoke:(p:&()->int)->int=p.*()
     \\let main:()={
-    \\let mut record=R[.s="a"+"!",.values=[[1]]]
+    \\let mut record=R.[s="a"+"!",values=[[1]]]
     \\update(&record)
     \\let mut rows:[][]int=[[2]]
     \\arrays(&rows)
@@ -7777,8 +7859,8 @@ test "reference rebinding array elements normalize signed indices once and prese
 const reference_rebinding_managed =
     \\let R=struct{s:string,values:[][]int,}
     \\let main:()={
-    \\let mut a=R[.s="a"+"!",.values=[[1]]]
-    \\let mut b=R[.s="b"+"!",.values=[[2]]]
+    \\let mut a=R.[s="a"+"!",values=[[1]]]
+    \\let mut b=R.[s="b"+"!",values=[[2]]]
     \\let mut p=&a
     \\p.*.s +={p=&b
     \\"x"+"y"}
@@ -8457,14 +8539,14 @@ test "array membership compiler ownership survives every allocation failure" {
 const append_rhs_cases = [_]struct { source: []const u8, allocations: usize, output: []const u8 }{
     .{ .source = "let main:()={let mut a:[]int=[1]\na+=a\n@println(a[0],a[1])}", .allocations = 3, .output = "1 1\n" },
     .{ .source = "let main:()={let mut a:[]int=[1]\nlet b:[]int=[2]\na+=b\n@println(a[0],a[1],b[0])}", .allocations = 4, .output = "1 2 2\n" },
-    .{ .source = "let L=struct{a:[]int,b:[]int,}\nlet T=struct{leaf:L,}\nlet main:()={let mut a=[T[.leaf=L[.a=[1],.b=[2]]]]\nlet b=[T[.leaf=L[.a=[3],.b=[4]]]]\na+=b\n@println(a[0].leaf.a[0],a[1].leaf.b[0],b[0].leaf.a[0])}", .allocations = 12, .output = "1 4 3\n" },
-    .{ .source = "let L=struct{a:[]int,}\nlet T=struct{leaf:L,}\nlet main:()={let mut a=T[.leaf=L[.a=[1]]]\nlet b=T[.leaf=L[.a=[2]]]\nlet r=&b\na.leaf.a+=r.*.leaf.a\n@println(a.leaf.a[0],a.leaf.a[1],r.*.leaf.a[0])}", .allocations = 4, .output = "1 2 2\n" },
-    .{ .source = "let L=struct{a:[]int,}\nlet main:()={let mut a=L[.a=[1]]\nlet r=&a\nr.*.a+=r.*.a\n@println(r.*.a.len,r.*.a[0],r.*.a[1])}", .allocations = 3, .output = "2 1 1\n" },
-    .{ .source = "let L=struct{a:[]int,}\nlet main:()={let mut a=[L[.a=[1]]]\nlet r=&a[0]\nr.*.a+=r.*.a\n@println(r.*.a.len,r.*.a[0],r.*.a[1])}", .allocations = 4, .output = "2 1 1\n" },
+    .{ .source = "let L=struct{a:[]int,b:[]int,}\nlet T=struct{leaf:L,}\nlet main:()={let mut a=[T.[leaf=L.[a=[1],b=[2]]]]\nlet b=[T.[leaf=L.[a=[3],b=[4]]]]\na+=b\n@println(a[0].leaf.a[0],a[1].leaf.b[0],b[0].leaf.a[0])}", .allocations = 12, .output = "1 4 3\n" },
+    .{ .source = "let L=struct{a:[]int,}\nlet T=struct{leaf:L,}\nlet main:()={let mut a=T.[leaf=L.[a=[1]]]\nlet b=T.[leaf=L.[a=[2]]]\nlet r=&b\na.leaf.a+=r.*.leaf.a\n@println(a.leaf.a[0],a.leaf.a[1],r.*.leaf.a[0])}", .allocations = 4, .output = "1 2 2\n" },
+    .{ .source = "let L=struct{a:[]int,}\nlet main:()={let mut a=L.[a=[1]]\nlet r=&a\nr.*.a+=r.*.a\n@println(r.*.a.len,r.*.a[0],r.*.a[1])}", .allocations = 3, .output = "2 1 1\n" },
+    .{ .source = "let L=struct{a:[]int,}\nlet main:()={let mut a=[L.[a=[1]]]\nlet r=&a[0]\nr.*.a+=r.*.a\n@println(r.*.a.len,r.*.a[0],r.*.a[1])}", .allocations = 4, .output = "2 1 1\n" },
     .{ .source = "let main:()={let a:[]int=[2]\nlet r=&a\nlet mut b:[]int=[1]\nb+=r.*\n@println(b[0],b[1],r.*[0])}", .allocations = 4, .output = "1 2 2\n" },
-    .{ .source = "let L=struct{a:[]int,}\nlet main:()={let mut rows=[L[.a=[2]]]\nlet mut a:[]int=[1]\na+=rows[{rows=[L[.a=[9]]]\n0}].a\n@println(a[0],a[1],rows[0].a[0])}", .allocations = 9, .output = "1 2 9\n" },
-    .{ .source = "let L=struct{a:[]int,}\nlet select:(a:[]L,n:int)->L=a[n]\nlet main:()={let mut rows=[L[.a=[2]]]\nlet mut a:[]int=[1]\na+=select(rows,{rows=[L[.a=[9]]]\n0}).a\n@println(a[0],a[1],rows[0].a[0])}", .allocations = 10, .output = "1 2 9\n" },
-    .{ .source = "let L=struct{a:[]int,}\nlet main:()={let mut rows=[L[.a=[2]]]\nlet change=(){rows=[L[.a=[9]]]}\nlet index=()->int {change()\n0}\nlet mut a:[]int=[1]\na+=rows[index()].a\n@println(a[0],a[1],rows[0].a[0])}", .allocations = 13, .output = "1 2 9\n" },
+    .{ .source = "let L=struct{a:[]int,}\nlet main:()={let mut rows=[L.[a=[2]]]\nlet mut a:[]int=[1]\na+=rows[{rows=[L.[a=[9]]]\n0}].a\n@println(a[0],a[1],rows[0].a[0])}", .allocations = 9, .output = "1 2 9\n" },
+    .{ .source = "let L=struct{a:[]int,}\nlet select:(a:[]L,n:int)->L=a[n]\nlet main:()={let mut rows=[L.[a=[2]]]\nlet mut a:[]int=[1]\na+=select(rows,{rows=[L.[a=[9]]]\n0}).a\n@println(a[0],a[1],rows[0].a[0])}", .allocations = 10, .output = "1 2 9\n" },
+    .{ .source = "let L=struct{a:[]int,}\nlet main:()={let mut rows=[L.[a=[2]]]\nlet change=(){rows=[L.[a=[9]]]}\nlet index=()->int {change()\n0}\nlet mut a:[]int=[1]\na+=rows[index()].a\n@println(a[0],a[1],rows[0].a[0])}", .allocations = 13, .output = "1 2 9\n" },
     .{ .source = "let main:()={let mut a:[]int=[1]\nlet append=(){a+=a}\nlet same=append\nsame()\n@println(a[0],a[1])}", .allocations = 5, .output = "1 1\n" },
 };
 
@@ -8508,7 +8590,7 @@ test "append RHS projection preserves lhs snapshots effects once and terminal ev
         \\let stop:()->int={let mut a:[]int=[1]
         \\a+={@print("R")
         \\return 7}}
-        \\let main:()={let mut a=L[.a=[1]]
+        \\let main:()={let mut a=L.[a=[1]]
         \\let change=()->[]int {a.a=[9]
         \\@print("C")
         \\a.a}
@@ -8522,10 +8604,10 @@ test "append RHS projection preserves lhs snapshots effects once and terminal ev
         \\b}
         \\@println(b[0],b[1])}
         \\@println(steps)
-        \\let mut rows=[L[.a=[3]]]
+        \\let mut rows=[L.[a=[3]]]
         \\let mut b:[]int=[1]
         \\b+=rows[{@print("I")
-        \\rows=[L[.a=[8]]]
+        \\rows=[L.[a=[8]]]
         \\0}].a
         \\@println(b[0],b[1],rows[0].a[0])}
     );
@@ -8559,10 +8641,10 @@ test "append RHS projection source free ownership and compiler allocation failur
 test "append RHS projection OOM preserves snapshot before index side effects" {
     const program = try arrayTestProgram(
         \\let L=struct{a:[]int,}
-        \\let main:()={let mut rows=[L[.a=[2]]]
+        \\let main:()={let mut rows=[L.[a=[2]]]
         \\let mut a:[]int=[1]
         \\a+=rows[{@print("I")
-        \\rows=[L[.a=[9]]]
+        \\rows=[L.[a=[9]]]
         \\0}].a
         \\@println(a[0],a[1],rows[0].a[0])}
     );
@@ -8586,12 +8668,12 @@ const readonly_membership_cases = [_]struct { source: []const u8, allocations: u
         .output = "true false\ntrue false\ntrue false\ntrue false\n",
     },
     .{
-        .source = "let L=struct{a:[]int,b:[]int,}\nlet T=struct{leaf:L,}\nlet main:()={let t=T[.leaf=L[.a=[1],.b=[2]]]\nloop _ in 0..4 {@println(1 in t.leaf.a,3 in t.leaf.b)}}",
+        .source = "let L=struct{a:[]int,b:[]int,}\nlet T=struct{leaf:L,}\nlet main:()={let t=T.[leaf=L.[a=[1],b=[2]]]\nloop _ in 0..4 {@println(1 in t.leaf.a,3 in t.leaf.b)}}",
         .allocations = 2,
         .output = "true false\ntrue false\ntrue false\ntrue false\n",
     },
     .{
-        .source = "let L=struct{a:[]int,}\nlet main:()={let t=L[.a=[1]]\nlet r=&t\nloop _ in 0..4 {@println(1 in r.*.a,2 in r.*.a)}}",
+        .source = "let L=struct{a:[]int,}\nlet main:()={let t=L.[a=[1]]\nlet r=&t\nloop _ in 0..4 {@println(1 in r.*.a,2 in r.*.a)}}",
         .allocations = 1,
         .output = "true false\ntrue false\ntrue false\ntrue false\n",
     },
@@ -8612,19 +8694,19 @@ const readonly_membership_cases = [_]struct { source: []const u8, allocations: u
     },
     .{
         // The entire record array is detached before the index replaces it.
-        .source = "let L=struct{a:[]int,b:[]int,}\nlet main:()={let mut rows=[L[.a=[1],.b=[2]]]\nlet found=1 in rows[{rows=[L[.a=[9],.b=[8]]]\n0}].a\n@println(found,9 in rows[0].a)}",
+        .source = "let L=struct{a:[]int,b:[]int,}\nlet main:()={let mut rows=[L.[a=[1],b=[2]]]\nlet found=1 in rows[{rows=[L.[a=[9],b=[8]]]\n0}].a\n@println(found,9 in rows[0].a)}",
         .allocations = 9,
         .output = "true true\n",
     },
     .{
         // Both closures share the mutable cell. The index must use the old base.
-        .source = "let L=struct{a:[]int,}\nlet main:()={let mut rows=[L[.a=[1]]]\nlet change=(){rows=[L[.a=[9]]]}\nlet index=()->int {change()\n0}\nlet found=1 in rows[index()].a\n@println(found,9 in rows[0].a)}",
+        .source = "let L=struct{a:[]int,}\nlet main:()={let mut rows=[L.[a=[1]]]\nlet change=(){rows=[L.[a=[9]]]}\nlet index=()->int {change()\n0}\nlet found=1 in rows[index()].a\n@println(found,9 in rows[0].a)}",
         .allocations = 10,
         .output = "true true\n",
     },
     .{
         // A computed base must still snapshot its argument before later effects.
-        .source = "let L=struct{a:[]int,}\nlet select:(a:[]L,n:int)->L=a[n]\nlet main:()={let mut rows=[L[.a=[1]]]\nlet found=1 in select(rows,{rows=[L[.a=[9]]]\n0}).a\n@println(found,9 in rows[0].a)}",
+        .source = "let L=struct{a:[]int,}\nlet select:(a:[]L,n:int)->L=a[n]\nlet main:()={let mut rows=[L.[a=[1]]]\nlet found=1 in select(rows,{rows=[L.[a=[9]]]\n0}).a\n@println(found,9 in rows[0].a)}",
         .allocations = 7,
         .output = "true true\n",
     },
@@ -8634,7 +8716,7 @@ const readonly_membership_cases = [_]struct { source: []const u8, allocations: u
         .output = "true false\ntrue false\ntrue false\ntrue false\n",
     },
     .{
-        .source = "let L=struct{a:[]int,}\nlet stop:()->bool={let rows=[L[.a=[1]]]\n1 in rows[{return true}].a}\nlet main:()=@println(stop())",
+        .source = "let L=struct{a:[]int,}\nlet stop:()->bool={let rows=[L.[a=[1]]]\n1 in rows[{return true}].a}\nlet main:()=@println(stop())",
         .allocations = 4,
         .output = "true\n",
     },
@@ -8709,10 +8791,10 @@ test "readonly membership snapshots keep recursively independent backing" {
 test "readonly membership orders lhs snapshot index effects and runtime OOM" {
     const program = try arrayTestProgram(
         \\let L=struct{a:[]int,b:[]int,}
-        \\let main:()={let mut rows=[L[.a=[1],.b=[2]]]
+        \\let main:()={let mut rows=[L.[a=[1],b=[2]]]
         \\let found={@print("L")
         \\1} in rows[{@print("I")
-        \\rows=[L[.a=[9],.b=[8]]]
+        \\rows=[L.[a=[9],b=[8]]]
         \\0}].a
         \\@println(found,9 in rows[0].a)}
     );
@@ -8761,7 +8843,7 @@ const string_byte_program =
     \\        let garbage="collect"+" now"
     \\        0}],owner)
     \\    let array=["a"+"b","c"+"d"]
-    \\    let box=Box(string)[.value="e"+"f"]
+    \\    let box=Box(string).[value="e"+"f"]
     \\    let chosen=if true {"i"+"j"}else{"k"+"l"}
     \\    @println(array[-1][gcIndex(-1)],box.value[gcIndex(0)],identity("g"+"h")[gcIndex(1)],chosen[gcIndex(-2)])
     \\    let r=&owner
@@ -9246,19 +9328,19 @@ const iteration_program =
     \\    let mut runes=['é','😀']
     \\    loop &r in runes {r.* ='€'}
     \\    loop r in runes {if r!='€' {@panic("rune iteration")}}
-    \\    let mut nested=[Nested[.inner=R[.n=1,.s="nested"+"!"]]]
+    \\    let mut nested=[Nested.[inner=R.[n=1,s="nested"+"!"]]]
     \\    loop &r in nested {r.*.inner.n+=2
     \\        r.*.inner.s+="?"
     \\        let copy=r.*.inner
-    \\        r.*.inner=R[.n=copy.n*2,.s=copy.s+"."]}
+    \\        r.*.inner=R.[n=copy.n*2,s=copy.s+"."]}
     \\    if nested[0].inner.n!=6 {@panic("nested integer write")}
     \\    if nested[0].inner.s!="nested!?." {@panic("nested string write")}
-    \\    let mut records=[R[.n=1,.s="a"+"!"],R[.n=2,.s="b"+"!"]]
+    \\    let mut records=[R.[n=1,s="a"+"!"],R.[n=2,s="b"+"!"]]
     \\    let originals=records
     \\    loop &r in records {r.*.n+=3
     \\        r.*.s+="?"}
     \\    loop &r in records {let old=r.*
-    \\        r.* =R[.n=old.n*2,.s=old.s+"."]}
+    \\        r.* =R.[n=old.n*2,s=old.s+"."]}
     \\    loop r in records {let mut copy=r
     \\        copy.n=99
     \\        @println(r.n,r.s,copy.n)}
@@ -9339,7 +9421,7 @@ const iteration_source_cases = [_]struct { source: []const u8, allocations: usiz
         .output = "121 1",
     },
     .{
-        .source = "let R=struct{n:int,a:[]int,b:[]int,}\nlet main:()={let rows=[R[.n=1,.a=[2],.b=[3]]]\nloop _ in 0..3 {loop r in rows {@print(r.n)}}}",
+        .source = "let R=struct{n:int,a:[]int,b:[]int,}\nlet main:()={let rows=[R.[n=1,a=[2],b=[3]]]\nloop _ in 0..3 {loop r in rows {@print(r.n)}}}",
         .allocations = 3,
         .output = "111",
     },
@@ -9384,17 +9466,17 @@ const iteration_source_values =
     \\    copy.a[0]=8
     \\    copy}
     \\let make:()->[]R={@print("S")
-    \\    [R[.a=[4]]]}
+    \\    [R.[a=[4]]]}
     \\let early:()->int=loop x in {return 7} {}
-    \\let main:()={let mut rows=[R[.a=[1]],R[.a=[2]]]
-    \\    let mut saved=R[.a=[]]
-    \\    let mut stored=R[.a=[]]
+    \\let main:()={let mut rows=[R.[a=[1]],R.[a=[2]]]
+    \\    let mut saved=R.[a=[]]
+    \\    let mut stored=R.[a=[]]
     \\    let mut captured:()->int=()->int {0}
     \\    loop r in rows {saved=change(r)
     \\        stored=r
     \\        captured=()->int {r.a[0]}
     \\        @println(r.a[0],saved.a[0])}
-    \\    rows[1]=R[.a=[9]]
+    \\    rows[1]=R.[a=[9]]
     \\    saved.a[0]=6
     \\    stored.a[0]=5
     \\    @println(rows[0].a[0],rows[1].a[0],saved.a[0],stored.a[0],captured())
@@ -9471,8 +9553,8 @@ test "iteration call protection permits disjoint unboxed methods and completed l
         \\    let mut b:[]int=[0]
         \\    let changeB=(){let loan=&b[0]
         \\        loan.*+=1}
-        \\    let r=R[]
-        \\    let g=G(int)[.value=0]
+        \\    let r=R.[]
+        \\    let g=G(int).[value=0]
         \\    loop x in a {r.invoke(changeB)
         \\        g.invoke((){@print(x)})
         \\        let text="{r}"
@@ -12886,8 +12968,8 @@ const nested_record_program =
     \\let O:(T:type)->type=union{some:T,none,}
     \\let text:(s:string)->string={@print(s)
     \\s+"!"}
-    \\let leaf:(s:string)->Leaf=Leaf[.s=s+"!"]
-    \\let deep:(s:string)->Alias=Alias[.box=Box[.inner=leaf(s),.other=leaf("other")]]
+    \\let leaf:(s:string)->Leaf=Leaf.[s=s+"!"]
+    \\let deep:(s:string)->Alias=Alias.[box=Box.[inner=leaf(s),other=leaf("other")]]
     \\let identity:(r:Deep)->Deep=r
     \\let invoke:(cb:(Deep)->Deep,r:Deep)->Deep=cb(r)
     \\let result:(ok:bool)->R(Deep,Deep)=if ok{.ok[deep("ok")]}else{.err[deep("err")]}
@@ -12897,10 +12979,10 @@ const nested_record_program =
     \\let option:(o:O(Deep))->O(Deep)={let mut r=o.!
     \\r.box.inner.n=8
     \\.some[r]}
-    \\let terminal:()={let ignored=Deep[.box={return}]
+    \\let terminal:()={let ignored=Deep.[box={return}]
     \\}
     \\let main:()={
-    \\let mut r=Deep[.box=Box[.other=Leaf[.s=text("b")],.inner=Leaf[.s=text("a")]]]
+    \\let mut r=Deep.[box=Box.[other=Leaf.[s=text("b")],inner=Leaf.[s=text("a")]]]
     \\let saved=r
     \\let called=invoke(identity,r)
     \\let merged=if true{r}else{deep("BAD")}
@@ -12972,11 +13054,11 @@ test "nested records imported forward diamond identities survive graph release a
         defer comp.deinit();
         const root = try comp.addSource("/main.nov", "let left=@import(\"left.nov\")\nlet right=@import(\"right.nov\")\n" ++
             "let Root=struct{left:left.Box,right:right.Box,}\n" ++
-            "let main:()={let mut r=Root[.left=left.make(),.right=right.make()]\nlet saved=r\nr.left.inner.s=\"changed\"+\"!\"\n@println(r.left.inner.s,saved.left.inner.s,r.right.inner.s)\n" ++
+            "let main:()={let mut r=Root.[left=left.make(),right=right.make()]\nlet saved=r\nr.left.inner.s=\"changed\"+\"!\"\n@println(r.left.inner.s,saved.left.inner.s,r.right.inner.s)\n" ++
             "let mut a=[left.make(),right.make()]\nlet old=a\nlet mut v=a[0]\nv.inner.s=\"array\"+\"!\"\na[-1]=v\n@println(old[-1].inner.s,a[-1].inner.s)}");
         const left = try comp.addSource("/left.nov", "let shared=@import(\"shared.nov\")\n@[public]\nlet Box=shared.Box\n@[public]\nlet make:()->Box=shared.make()");
         const right = try comp.addSource("/right.nov", "let shared=@import(\"shared.nov\")\n@[public]\nlet Box=shared.Box\n@[public]\nlet make:()->Box=shared.make()");
-        const shared = try comp.addSource("/shared.nov", "@[public]\nlet Box=struct{inner:Alias,}\nlet Alias=Leaf\nlet Leaf=struct{s:string,}\n@[public]\nlet make:()->Box=Box[.inner=Alias[.s=\"sha\"+\"red\"]]");
+        const shared = try comp.addSource("/shared.nov", "@[public]\nlet Box=struct{inner:Alias,}\nlet Alias=Leaf\nlet Leaf=struct{s:string,}\n@[public]\nlet make:()->Box=Box.[inner=Alias.[s=\"sha\"+\"red\"]]");
         for ([_]struct { source: Source.Id, name: []const u8, target: Source.Id }{
             .{ .source = root, .name = "left", .target = left },
             .{ .source = root, .name = "right", .target = right },
@@ -13026,7 +13108,7 @@ test "nested records deepest supported declarations compile in dependency order"
 test "nested records propagation shares immutable strings and skips allocations on terminal paths" {
     for ([_]bool{ false, true }) |allocate| {
         const source = try std.fmt.allocPrint(test_gpa, "let R:(T:type,E:type)->type=union{{ok:T,err:E,}}\nlet Outer=struct{{middle:Middle,}}\nlet Middle=struct{{leaf:Leaf,}}\nlet Leaf=struct{{s:string,}}\n" ++
-            "let make:()->R(int,Outer)=.err[Outer[.middle=Middle[.leaf=Leaf[.s={s}]]]]\n" ++
+            "let make:()->R(int,Outer)=.err[Outer.[middle=Middle.[leaf=Leaf.[s={s}]]]]\n" ++
             "let run:()->R(bool,Outer)=.ok[make().! == 0]\nlet main:()=@println(match run(){{.ok=>\"BAD\"\n.err=>|r|r.middle.leaf.s}})", .{if (allocate) "\"e\"+\"rr\"" else "\"err\""});
         defer test_gpa.free(source);
         const library = try emitSource(source, null);
@@ -13047,7 +13129,7 @@ const managed_array_program =
     \\let Inner=struct{s:string,n:int=1,}
     \\let O:(T:type)->type=union{some:T,none,}
     \\let R:(T:type,E:type)->type=union{ok:T,err:E,}
-    \\let make:(s:string)->Alias=Alias[.inner=Inner[.s=s+"!"],.other="other"+"!"]
+    \\let make:(s:string)->Alias=Alias.[inner=Inner.[s=s+"!"],other="other"+"!"]
     \\let strings:()->[]string=["hé\0"+"😀","later"+"!","", "static"]
     \\let records:()->[]Outer=[make("a"),make("b")]
     \\let copy:(a:[]Outer)->[]Outer=a
@@ -13104,7 +13186,7 @@ test "managed array literal and indexed stores preserve ordered effects snapshot
         \\let A=struct{s:string,}
         \\let mark:(s:string)->string={@print(s)
         \\s+"!"}
-        \\let record:(s:string)->A=A[.s=mark(s)]
+        \\let record:(s:string)->A=A.[s=mark(s)]
         \\let main:()={
         \\let mut a=[mark("A"),mark("B")]
         \\a[{a=["discard"+"!"]
@@ -13136,7 +13218,7 @@ const copy_elision_effects =
     \\let A=struct{a:[]int,}
     \\let use:(a:A,n:int)->int=a.a[0]+n
     \\let main:()={
-    \\let mut a=A[.a=[1]]
+    \\let mut a=A.[a=[1]]
     \\let frozen=a
     \\let snap=()->int {frozen.a[0]}
     \\let change=() {let r=&a
@@ -13164,12 +13246,12 @@ const copy_elision_cases = [_]struct { source: []const u8, allocations: usize, o
         .output = "1 1\n",
     },
     .{
-        .source = "let A=struct{a:[]int,b:[]int,}\nlet make:()->A=A[.a=[1],.b=[2]]\nlet use:(a:A)->int=a.a[0]+a.b[0]\nlet main:()=@println(use(make()))",
+        .source = "let A=struct{a:[]int,b:[]int,}\nlet make:()->A=A.[a=[1],b=[2]]\nlet use:(a:A)->int=a.a[0]+a.b[0]\nlet main:()=@println(use(make()))",
         .allocations = 2,
         .output = "3\n",
     },
     .{
-        .source = "let A=struct{a:[]int,b:[]int,}\nlet main:()={let a=A[.a=[1],.b=[2]]\nlet n=a.a[0]\n@println(n,a.b.len,a.b[-1])}",
+        .source = "let A=struct{a:[]int,b:[]int,}\nlet main:()={let a=A.[a=[1],b=[2]]\nlet n=a.a[0]\n@println(n,a.b.len,a.b[-1])}",
         .allocations = 2,
         .output = "1 1 2\n",
     },
@@ -13189,7 +13271,7 @@ const copy_elision_cases = [_]struct { source: []const u8, allocations: usize, o
         .output = "-128 24\n",
     },
     .{
-        .source = "let L=struct{a:[]int,b:[]int,}\nlet T=struct{leaf:L,}\nlet main:()={let mut t=T[.leaf=L[.a=[1,2],.b=[3]]]\nt.leaf.a[-1]+={t.leaf.b=[9]\n4}\n@println(t.leaf.a[0],t.leaf.a[1],t.leaf.b[0])}",
+        .source = "let L=struct{a:[]int,b:[]int,}\nlet T=struct{leaf:L,}\nlet main:()={let mut t=T.[leaf=L.[a=[1,2],b=[3]]]\nt.leaf.a[-1]+={t.leaf.b=[9]\n4}\n@println(t.leaf.a[0],t.leaf.a[1],t.leaf.b[0])}",
         .allocations = 4,
         .output = "1 6 9\n",
     },
@@ -13209,7 +13291,7 @@ const copy_elision_cases = [_]struct { source: []const u8, allocations: usize, o
         .output = "3\n",
     },
     .{
-        .source = "let L=struct{a:[]int,}\nlet main:()={let mut a=L[.a=[1]]\nlet change=(){a.a=[9]}\na.a[0]+={change()\n2}\n@println(a.a[0])}",
+        .source = "let L=struct{a:[]int,}\nlet main:()={let mut a=L.[a=[1]]\nlet change=(){a.a=[9]}\na.a[0]+={change()\n2}\n@println(a.a[0])}",
         .allocations = 5,
         .output = "3\n",
     },
@@ -13219,37 +13301,37 @@ const copy_elision_cases = [_]struct { source: []const u8, allocations: usize, o
     // Targeted transfers retain value snapshots; append projects its final RHS
     // read and detaches unproven nested storage in the fresh result.
     .{
-        .source = "let L=struct{a:[]int,}\nlet main:()={let a=[L[.a=[1]]]\n@println(a[0].a[0])}",
+        .source = "let L=struct{a:[]int,}\nlet main:()={let a=[L.[a=[1]]]\n@println(a[0].a[0])}",
         .allocations = 2,
         .output = "1\n",
     },
     .{
-        .source = "let L=struct{a:[]int,}\nlet main:()={let seed=L[.a=[1]]\nlet a=[seed,seed]\n@println(a[0].a[0],a[1].a[0])}",
+        .source = "let L=struct{a:[]int,}\nlet main:()={let seed=L.[a=[1]]\nlet a=[seed,seed]\n@println(a[0].a[0],a[1].a[0])}",
         .allocations = 4,
         .output = "1 1\n",
     },
     .{
-        .source = "let L=struct{a:[]int,}\nlet main:()={let mut a=[L[.a=[1]]]\na[-1]=L[.a=[2]]\n@println(a[0].a[0])}",
+        .source = "let L=struct{a:[]int,}\nlet main:()={let mut a=[L.[a=[1]]]\na[-1]=L.[a=[2]]\n@println(a[0].a[0])}",
         .allocations = 5,
         .output = "2\n",
     },
     .{
-        .source = "let L=struct{a:[]int,}\nlet main:()={let mut a=[L[.a=[1]]]\na += [L[.a=[2]]]\n@println(a[0].a[0],a[1].a[0])}",
+        .source = "let L=struct{a:[]int,}\nlet main:()={let mut a=[L.[a=[1]]]\na += [L.[a=[2]]]\n@println(a[0].a[0],a[1].a[0])}",
         .allocations = 7,
         .output = "1 2\n",
     },
     .{
-        .source = "let L=struct{a:[]int,}\nlet main:()={let mut a=[L[.a=[1]]]\na+=a\n@println(a[0].a[0],a[1].a[0])}",
+        .source = "let L=struct{a:[]int,}\nlet main:()={let mut a=[L.[a=[1]]]\na+=a\n@println(a[0].a[0],a[1].a[0])}",
         .allocations = 6,
         .output = "1 1\n",
     },
     .{
-        .source = "let L=struct{a:[]int,}\nlet T=struct{leaf:L,items:[]L,}\nlet main:()={let mut a=[T[.leaf=L[.a=[1]],.items=[L[.a=[2]]]]]\na+=a\n@println(a.len)}",
+        .source = "let L=struct{a:[]int,}\nlet T=struct{leaf:L,items:[]L,}\nlet main:()={let mut a=[T.[leaf=L.[a=[1]],items=[L.[a=[2]]]]]\na+=a\n@println(a.len)}",
         .allocations = 12,
         .output = "2\n",
     },
     .{
-        .source = "let L=struct{a:[]int,}\nlet T=struct{leaf:L,items:[]L,}\nlet U=union{node:T,none,}\nlet main:()={let u=U.node[T[.leaf=L[.a=[1]],.items=[L[.a=[2]]]]]\nmatch u {\n.node=>|t|{let mut a=t.items\na+=a\n@println(a.len)}\n.none=>{}\n}}",
+        .source = "let L=struct{a:[]int,}\nlet T=struct{leaf:L,items:[]L,}\nlet U=union{node:T,none,}\nlet main:()={let u=U.node[T.[leaf=L.[a=[1]],items=[L.[a=[2]]]]]\nmatch u {\n.node=>|t|{let mut a=t.items\na+=a\n@println(a.len)}\n.none=>{}\n}}",
         .allocations = 12,
         .output = "2\n",
     },
@@ -13282,7 +13364,7 @@ test "copy elision allocation counts retain snapshots under forced GC" {
 }
 
 test "copy elision forged reused and live storage operands keep independent backing" {
-    var module = try Module.init(test_gpa, "forged-transfers.nov", "let L=struct{a:[]int,}\nlet main:()={let seed=L[.a=[1]]\nlet mut a=[seed,seed]\na[-1]=seed\na+=a\n@println(a.len,seed.a[0],a[0].a[0])}");
+    var module = try Module.init(test_gpa, "forged-transfers.nov", "let L=struct{a:[]int,}\nlet main:()={let seed=L.[a=[1]]\nlet mut a=[seed,seed]\na[-1]=seed\na+=a\n@println(a.len,seed.a[0],a[0].a[0])}");
     defer module.deinit();
     var sema = try Lowering.lower(&module);
     defer sema.deinit();
@@ -13462,7 +13544,7 @@ fn testTransferTopologyRuntime(ir: *const Ir, take: bool, executions: usize, out
 test "copy elision observed snapshots reject forged later reads and escaping projections" {
     for ([_][]const u8{
         "let main:()={let mut a:[]int=[1]\na[0]+=2\n@println(a[0],a.len)}",
-        "let L=struct{a:[]int,}\nlet main:()={let mut a:[]L=[L[.a=[1]]]\nlet before=a[0]\na[0]=L[.a=[2]]\n@println(before.a[0],a[0].a[0])}",
+        "let L=struct{a:[]int,}\nlet main:()={let mut a:[]L=[L.[a=[1]]]\nlet before=a[0]\na[0]=L.[a=[2]]\n@println(before.a[0],a[0].a[0])}",
     }, 0..) |source, case| {
         var module = try Module.init(test_gpa, "forged-observation.nov", source);
         defer module.deinit();
@@ -13821,8 +13903,8 @@ const array_fields_program =
     \\let Leaf=struct{values:[]int,text:string,}
     \\let Tree=struct{leaf:Leaf,records:[]Leaf,}
     \\let U=union{some:Tree,none,}
-    \\let leaf:(n:int)->Leaf=Leaf[.values=[n,n+1],.text="shared"+"!"]
-    \\let tree:()->Tree=Tree[.leaf=leaf(1),.records=[leaf(3),leaf(5)]]
+    \\let leaf:(n:int)->Leaf=Leaf.[values=[n,n+1],text="shared"+"!"]
+    \\let tree:()->Tree=Tree.[leaf=leaf(1),records=[leaf(3),leaf(5)]]
     \\let identity:(t:Tree)->Tree=t
     \\let main:()={
     \\let mut a=tree()
@@ -13845,7 +13927,7 @@ const array_fields_program =
     \\records[0]=first
     \\records += [leaf(9)]
     \\a.records=records
-    \\let boxed=Box(Tree)[.value=a]
+    \\let boxed=Box(Tree).[value=a]
     \\let mut branch=if true {boxed.value} else {tree()}
     \\branch.leaf.values[0]=40
     \\let mut looped=loop {break saved}
@@ -13874,8 +13956,8 @@ test "array fields two managed union alternatives copy capture and match under f
         \\let U=union{left:Left,right:Right,none,}
         \\let identity:(u:U)->U={let copy=u
         \\return copy}
-        \\let make:(which:uint)->U=if which==0 {.left[Left[.values=[1,2],.text="left"+"!"]]} else if which==1 {
-        \\.right[Right[.items=[Left[.values=[3,4],.text="right"+"!"]],.extra=["extra"+"!"]]]
+        \\let make:(which:uint)->U=if which==0 {.left[Left.[values=[1,2],text="left"+"!"]]} else if which==1 {
+        \\.right[Right.[items=[Left.[values=[3,4],text="right"+"!"]],extra=["extra"+"!"]]]
         \\} else {.none[]}
         \\let capture:(u:U)->()->U={let frozen=identity(u)
         \\()->U {frozen}}
@@ -13910,7 +13992,7 @@ test "array fields negative indexed nested store snapshots array but keeps lates
     const c = try arrayTestProgram(
         \\let Inner=struct{values:[]int,sibling:string,}
         \\let Outer=struct{inner:Inner,sibling:string,}
-        \\let make:(n:int,s:string)->Outer=Outer[.inner=Inner[.values=[n,n+1,n+2],.sibling=s+" inner"],.sibling=s+" outer"]
+        \\let make:(n:int,s:string)->Outer=Outer.[inner=Inner.[values=[n,n+1,n+2],sibling=s+" inner"],sibling=s+" outer"]
         \\let main:()={let mut owner=make(1,"old")
         \\let saved=owner
         \\owner.inner.values[{owner=make(10,"index")
@@ -13937,7 +14019,7 @@ test "array fields transitive escaping immutable snapshots and shared mutable ce
     const c = try arrayTestProgram(
         \\let Leaf=struct{values:[]int,text:string,}
         \\let Record=struct{leaf:Leaf,items:[]Leaf,}
-        \\let make:(n:int)->Record=Record[.leaf=Leaf[.values=[n,n+1],.text="leaf"+"!"],.items=[Leaf[.values=[n+2],.text="item"+"!"]]]
+        \\let make:(n:int)->Record=Record.[leaf=Leaf.[values=[n,n+1],text="leaf"+"!"],items=[Leaf.[values=[n+2],text="item"+"!"]]]
         \\let factory:(seed:int)->()->()->Record={
         \\let immutable=make(seed)
         \\let mut mutable=immutable
@@ -13981,14 +14063,14 @@ test "array fields record element snapshots precede index and append effects" {
     const c = try arrayTestProgram(
         \\let A=struct{a:[]int,}
         \\let main:()={
-        \\let mut records=[A[.a=[1]]]
+        \\let mut records=[A.[a=[1]]]
         \\let snapshot=records[{let loan=&records[0]
         \\loan.*.a=[9]
         \\0}]
         \\@println(snapshot.a[0],records[0].a[0])
         \\records += [{let loan=&records[0]
         \\loan.*.a=[8]
-        \\A[.a=[2]]}]
+        \\A.[a=[2]]}]
         \\@println(records[0].a[0],records[1].a[0])
         \\}
     );
@@ -14001,13 +14083,13 @@ test "array fields whole record and record element loans preserve ordinary copie
     const c = try arrayTestProgram(
         \\let A=struct{a:[]int,}
         \\let main:()={
-        \\let mut owner=A[.a=[1]]
+        \\let mut owner=A.[a=[1]]
         \\let loan=&owner
         \\let mut detached=loan.*
         \\loan.*.a += [2]
         \\detached.a[0]=9
         \\@println(loan.*.a[0],loan.*.a.len,detached.a[0],detached.a.len)
-        \\let mut records=[A[.a=[3]]]
+        \\let mut records=[A.[a=[3]]]
         \\let element=&records[0]
         \\let mut old=element.*
         \\element.*.a += [4]
@@ -14026,8 +14108,8 @@ test "array fields insertion replacement and append backing pointers detach at o
         \\let Tree=struct{leaf:Leaf,records:[]Leaf,}
         \\let Wrapped=union{node:Tree,none,}
         \\let main:()={
-        \\let seed=Leaf[.values=[1,2],.text="shared"+"!"]
-        \\let tree=Tree[.leaf=seed,.records=[seed,seed]]
+        \\let seed=Leaf.[values=[1,2],text="shared"+"!"]
+        \\let tree=Tree.[leaf=seed,records=[seed,seed]]
         \\let wrapped=Wrapped.node[tree]
         \\match wrapped {.node=>|snapshot|{
         \\let mut inserted=[snapshot,snapshot]
@@ -14177,8 +14259,8 @@ test "array fields reject recursive layouts and unstable borrowed paths" {
         "let A=struct{b:[]B,}\nlet B=struct{a:A,}\nlet main:()={}",
         "let A:(T:type)->type=struct{a:[]A(T),}\nlet main:(a:A(int))={}",
         "let A=struct{a:[][]A,}\nlet main:()={}",
-        "let A=struct{a:[]int,}\nlet main:()={let mut a=A[.a=[1]]\nlet r=&a.a\n}",
-        "let A=struct{a:[]int,}\nlet main:()={let mut a=A[.a=[1]]\nlet r=&a\nr.*.a[0]=2}",
+        "let A=struct{a:[]int,}\nlet main:()={let mut a=A.[a=[1]]\nlet r=&a.a\n}",
+        "let A=struct{a:[]int,}\nlet main:()={let mut a=A.[a=[1]]\nlet r=&a\nr.*.a[0]=2}",
     }) |source| {
         var module = try Module.init(test_gpa, "rejected-array-fields.nov", source);
         defer module.deinit();
@@ -14243,7 +14325,7 @@ const integer_borrow_program =
     \\y.*/=2
     \\y.*%=3
     \\@println(x,earlierx)
-    \\let mut a=[R[]]
+    \\let mut a=[R.[]]
     \\let r=&a[0]
     \\let z=&x
     \\z.*+={r.*.n+=3
@@ -14409,7 +14491,7 @@ const static_borrow_program =
     \\let pick:()->int={@print("I")
     \\@as(int,-1)}
     \\let main:()={
-    \\    let mut people=[Person[.name=Name[.text="A"+"da"]]]
+    \\    let mut people=[Person.[name=Name.[text="A"+"da"]]]
     \\    let original=people
     \\    let changed=&people[pick()]
     \\    let saved=changed.*.name
@@ -14421,7 +14503,7 @@ const static_borrow_program =
     \\    @println(changed.*.name.text,changed.*.score,changed.*.enabled,changed.*.small,saved.text,noise)
     \\    @println(people[0].name.text,people[0].score,original[0].name.text,original[0].score)
     \\    let again=&people[0]
-    \\    again.*.name=Name[.text="new"+"!"]
+    \\    again.*.name=Name.[text="new"+"!"]
     \\    @println(people[0].name.text)
     \\    loop i in 0..3 {let each=&people[0]
     \\        each.*.score+=1
@@ -14458,7 +14540,7 @@ test "static borrowing owner indexed updates copies once index source free GC C1
 test "static borrowing checks bounds once before subsequent effects" {
     const source =
         \\let R=struct{x:int=0,}
-        \\let main:()={let mut a=[R[]]
+        \\let main:()={let mut a=[R.[]]
         \\let r=&a[{@print("index")
         \\@as(int,-2)}]
         \\@print("BAD")
@@ -14470,7 +14552,7 @@ test "static borrowing checks bounds once before subsequent effects" {
 }
 
 test "static borrowing string RHS runtime allocation failure follows activation" {
-    const library = try emitSource("let R=struct{s:string,}\nlet main:()={let mut a=[R[.s=\"old\"]]\nlet r=&a[0]\n@print(\"borrowed\")\nr.*.s+=\"!\"}", null);
+    const library = try emitSource("let R=struct{s:string,}\nlet main:()={let mut a=[R.[s=\"old\"]]\nlet r=&a[0]\n@print(\"borrowed\")\nr.*.s+=\"!\"}", null);
     defer test_gpa.free(library);
     const c = try collectingTestProgram(library);
     defer test_gpa.free(c);
@@ -14484,7 +14566,7 @@ test "static borrowing string RHS runtime allocation failure follows activation"
 const borrow_snapshot_program =
     \\let R=struct{x:int=0,s:string="old",}
     \\let main:()={
-    \\    let mut a=[R[],R[.x=1]]
+    \\    let mut a=[R.[],R.[x=1]]
     \\    let before=a
     \\    let value=a[{let r=&a[0]
     \\        r.*.x=9
@@ -14492,26 +14574,26 @@ const borrow_snapshot_program =
     \\        @print("I")
     \\        0}]
     \\    @println(value.x,value.s,a[0].x,a[0].s,before[0].x,before[0].s)
-    \\    a=[R[],R[.x=1]]
+    \\    a=[R.[],R.[x=1]]
     \\    a+={let r=&a[0]
     \\        r.*.x=9
     \\        @print("A")
-    \\        [R[.x=2]]}
+    \\        [R.[x=2]]}
     \\    @println(a[0].x,a[1].x,a[2].x)
-    \\    a=[R[],R[.x=1]]
+    \\    a=[R.[],R.[x=1]]
     \\    a[{let r=&a[0]
     \\        r.*.x=9
     \\        @print("J")
     \\        1}]={let r=&a[0]
     \\        r.*.x=8
     \\        @print("S")
-    \\        R[.x=2]}
+    \\        R.[x=2]}
     \\    @println(a[0].x,a[1].x)
-    \\    a=[R[],R[.x=1]]
+    \\    a=[R.[],R.[x=1]]
     \\    a[1]={let r=&a[0]
     \\        r.*.x=9
     \\        @print("R")
-    \\        R[.x=2]}
+    \\        R.[x=2]}
     \\    @println(a[0].x,a[1].x)
     \\}
 ;
@@ -14526,7 +14608,7 @@ test "static borrowing normal array snapshots precede index update and append ef
 
 const borrow_snapshot_terminal_program =
     \\let R=struct{x:int=0,}
-    \\let read:(stop:bool)={let mut a=[R[]]
+    \\let read:(stop:bool)={let mut a=[R.[]]
     \\    let value=a[{if stop {let r=&a[0]
     \\        r.*.x=9
     \\        @println("exit-index",a[0].x)
@@ -14535,21 +14617,21 @@ const borrow_snapshot_terminal_program =
     \\        r.*.x=7
     \\        0}]
     \\    @println("read",value.x,a[0].x)}
-    \\let append:(stop:bool)={let mut a=[R[]]
+    \\let append:(stop:bool)={let mut a=[R.[]]
     \\    a+=if stop {let r=&a[0]
     \\        r.*.x=9
     \\        @println("exit-append",a[0].x)
     \\        return} else {let r=&a[0]
     \\        r.*.x=7
-    \\        [R[]]}
+    \\        [R.[]]}
     \\    @println("append",a[0].x,a.len)}
-    \\let update:(stop:bool)={let mut a=[R[],R[]]
+    \\let update:(stop:bool)={let mut a=[R.[],R.[]]
     \\    a[1]=if stop {let r=&a[0]
     \\        r.*.x=9
     \\        @println("exit-update",a[0].x)
     \\        return} else {let r=&a[0]
     \\        r.*.x=7
-    \\        R[.x=2]}
+    \\        R.[x=2]}
     \\    @println("update",a[0].x,a[1].x)}
     \\let main:()={read(true)
     \\    read(false)
@@ -14568,7 +14650,7 @@ test "static borrowing snapshots preserve terminal index append and update branc
 }
 
 test "static borrowing normal snapshot OOM precedes index and RHS effects" {
-    const source = "let R=struct{x:int=0,}\nlet main:()={let mut a=[R[]]\n@print(\"base\")\nlet value=a[{let r=&a[0]\nr.*.x=9\n@print(\"BAD\")\n0}]\n@println(value.x)}";
+    const source = "let R=struct{x:int=0,}\nlet main:()={let mut a=[R.[]]\n@print(\"base\")\nlet value=a[{let r=&a[0]\nr.*.x=9\n@print(\"BAD\")\n0}]\n@println(value.x)}";
     const library = try emitSource(source, null);
     defer test_gpa.free(library);
     const c = try collectingTestProgram(library);
@@ -14656,13 +14738,13 @@ const general_borrow_program =
     \\let old=rs.*
     \\rs.*+="c"
     \\@println(read(rs.*),old,s)
-    \\let mut r=R[.s="old"+"!"]
+    \\let mut r=R.[s="old"+"!"]
     \\let rr=&r
     \\let saved=rr.*
     \\rr.*.s+="!"
     \\rr.*.n+=2
     \\@println(rr.*.change().n,rr.*.n,saved.s)
-    \\rr.* =R[.s="new"+"!"]
+    \\rr.* =R.[s="new"+"!"]
     \\@println(r.s,r.n)
     \\let mut o:O(string)=.none[]
     \\let ro=&o
@@ -14689,10 +14771,10 @@ const general_borrow_program =
     \\let before=rt.*
     \\rt.*+="!"
     \\@println(rt.*,before,strings[0])
-    \\let mut records=[R[.s="one"]]
+    \\let mut records=[R.[s="one"]]
     \\let item=&records[0]
     \\let snapshot=item.*
-    \\item.* =R[.s="two"]
+    \\item.* =R.[s="two"]
     \\@println(snapshot.s,records[0].s)
     \\let mut range=@as(int,0)..2
     \\let rg=&range

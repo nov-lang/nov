@@ -356,8 +356,8 @@ fn isTypeOf(ast: *const Ast, call: Ast.full.Call) bool {
 fn resolveValueType(module: *Module, ir: *Ir, node: Ast.Node.Index, env: Environment) Error!?Ir.TypeId {
     if (env.query_depth >= max_alias_depth) return diagnose(module, node, .type_query_limit);
     const ast = &module.source.ast;
-    if (ast.nodes.items(.tag)[node] == .identifier) {
-        const name = ast.tokenSlice(ast.firstToken(node));
+    if (ast.nodes.items(.tag)[node] == .identifier or ast.nodes.items(.tag)[node] == .container_field) {
+        const name = ast.tokenSlice(ast.nodes.items(.main_token)[node]);
         var i = env.captures.len;
         while (i != 0) {
             i -= 1;
@@ -372,8 +372,8 @@ fn resolveValueType(module: *Module, ir: *Ir, node: Ast.Node.Index, env: Environ
     }
     var owner = module;
     const id = switch (ast.nodes.items(.tag)[node]) {
-        .identifier => blk: {
-            const name = ast.tokenSlice(ast.firstToken(node));
+        .identifier, .container_field => blk: {
+            const name = ast.tokenSlice(ast.nodes.items(.main_token)[node]);
             // Last binding wins, so parameter and lexical scopes can shadow globals.
             var i = env.values.len;
             while (i > 0) {
@@ -644,6 +644,7 @@ pub fn instantiateArguments(module: *Module, ir: *Ir, id: Module.DeclId, args: [
 /// bodies. Nested nominal identities remain lazy, avoiding recursive layout walks.
 pub fn completeRecordReadOnly(module: *Module, ir: *Ir, ty: Ir.TypeId) Error!bool {
     const record = ir.getType(ty).?.record;
+    if (record.anonymous != .none) return true;
     if (record.type_args.len != 0 or record.fields.len != 0 or record.instance_state == .building) return true;
     // A field's type query carries @This in its bindings. Converting that
     // binding must not re-enter completion of the layout being queried.
@@ -1095,7 +1096,7 @@ fn testTypeOfExpressions(allocator: std.mem.Allocator) !void {
         \\let b:@TypeOf(1+2.0)
         \\let c:@TypeOf(effect())
         \\let d:@TypeOf(arr[999])
-        \\let e:@TypeOf(R[.x=1].x)
+        \\let e:@TypeOf(R.[x=1].x)
         \\let f:@TypeOf("abc"[999..1000])
         \\let g:@TypeOf(if true {1} else {2})
         \\let h:@TypeOf(match true {true=>1
@@ -1104,7 +1105,7 @@ fn testTypeOfExpressions(allocator: std.mem.Allocator) !void {
         \\let j:@TypeOf(id(@as(u16,1)))
         \\let k:@TypeOf([1,2.0])
         \\let l:@TypeOf(@panic("never evaluated"))
-        \\let m:@TypeOf(Box(u16)[.x=1])
+        \\let m:@TypeOf(Box(u16).[x=1])
         \\let n:@TypeOf(apply(@as(u8,1),id))
         \\let o:@TypeOf(apply(@as(u8,1),(v){v+1}))
     );
@@ -1313,7 +1314,7 @@ test "TypeOf validation interpolation and literal decoding are readonly under OO
         .{ .expression = "\"{}\"", .tag = .invalid_interpolation },
         .{ .expression = "'ab'", .tag = .invalid_literal },
         .{ .expression = "@as(f32,1e100)", .tag = .literal_out_of_range },
-        .{ .expression = "\"{1/0} {R[]} {int}\"", .tag = null },
+        .{ .expression = "\"{1/0} {R.[]} {int}\"", .tag = null },
         .{ .expression = "@as(i8,-128)", .tag = null },
     }) |case| {
         try testTypeOfValidationCase(std.testing.allocator, case.expression, case.tag);
@@ -1411,7 +1412,7 @@ test "TypeOf validation checks print arguments and unsigned negation without con
         .{ .expression = "@print([fn_value])", .tag = .unsupported_body_expression },
         .{ .expression = "-@as(u8,1)", .tag = .unsupported_body_expression },
         .{ .expression = "-@as(u8,0)", .tag = .unsupported_body_expression },
-        .{ .expression = "@println(R[],1,int)", .tag = null },
+        .{ .expression = "@println(R.[],1,int)", .tag = null },
         .{ .expression = "-@as(i8,1)", .tag = null },
     }) |case| {
         try testTypeOfValidationCase(std.testing.allocator, case.expression, case.tag);

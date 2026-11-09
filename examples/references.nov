@@ -103,7 +103,7 @@ let scalar_and_struct_pointees: () = {
     let state = &mode
     state.* = .active
     @assert(state.* == .active and "{@TypeOf(state)}" == "&mut Mode")
-    let mut cell = Cell[ .value = 1 ]
+    let mut cell = Cell.[ value = 1 ]
     let record = &cell
     let snapshot = record.*
     record.*.value += 1

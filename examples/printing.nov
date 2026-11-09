@@ -34,12 +34,12 @@ let main: () = {
     @println("Array:", values)
     let rows: [][]bool = [[true, false], []]
     @println("Nested: {rows}")
-    let entry = Entry[ .name = "Ada", .scores = values, .color = .blue ]
+    let entry = Entry.[ name = "Ada", scores = values, color = .blue ]
     @println("Struct:", entry)
     let messages: []Message = [.entry[entry], .none[]]
     @println("Unions: {messages}")
     @println("Enum:", Color.red)
-    let label = Label[ .value = "custom" ]
+    let label = Label.[ value = "custom" ]
     @println("Custom:", label)
     ; Nested values use their user-defined converters too.
     @println("Nested custom:", [label])
@@ -51,7 +51,7 @@ let aggregate_interpolation: () = {
     @assert("{values}" == "[1, 2, 3]")
     let rows: [][]bool = [[true, false], []]
     @assert("{rows}" == "[[true, false], []]")
-    let entry = Entry[ .name = "Ada", .scores = values, .color = .blue ]
+    let entry = Entry.[ name = "Ada", scores = values, color = .blue ]
     @assert("{entry}" == "Entry[ name: Ada, scores: [1, 2, 3], color: Color.blue ]")
     let messages: []Message = [.entry[entry], .none[]]
     @assert("{messages}" == "[Message.entry[ name: Ada, scores: [1, 2, 3], color: Color.blue ], Message.none]")
@@ -59,7 +59,7 @@ let aggregate_interpolation: () = {
 
 @[test]
 let hooks_and_types: () = {
-    let label = Label[ .value = "custom" ]
+    let label = Label.[ value = "custom" ]
     @assert("{label}" == "Label(custom)")
     let labels = [label]
     @assert("{labels}" == "[Label(custom)]")

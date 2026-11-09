@@ -38,7 +38,7 @@ let main: () = {
     modeView.* = .active
     @println(mode == .active)
 
-    let mut counter = Counter[]
+    let mut counter = Counter.[]
     let counterView = &counter
     counterView.*.count = 5
     @println(counter.count)

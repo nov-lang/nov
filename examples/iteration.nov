@@ -38,7 +38,7 @@ let main: () = {
 
 @[test]
 let copied_elements: () = {
-    let rows = [Row[ .cell = Cell[ .count = 2, .label = "old" ] ]]
+    let rows = [Row.[ cell = Cell.[ count = 2, label = "old" ] ]]
     loop row in rows {
         let mut copy = row
         copy.cell.count += 10
@@ -68,11 +68,11 @@ let writable_references: () = {
     @assert(numbers[0] == 9)
     @assert(numbers[1] == 12)
     @assert(snapshot[0] == 1)
-    let mut rows = [Row[ .cell = Cell[ .count = 1, .label = "old" ] ]]
+    let mut rows = [Row.[ cell = Cell.[ count = 1, label = "old" ] ]]
     let before = rows
     loop &row in rows {
-        row.* = Row[ .cell = Cell[ .count = 2, .label = "new" ] ]
-        row.*.cell = Cell[ .count = 3, .label = "nested" ]
+        row.* = Row.[ cell = Cell.[ count = 2, label = "new" ] ]
+        row.*.cell = Cell.[ count = 3, label = "nested" ]
         row.*.cell.count += 4
         row.*.cell.label += "!"
     }
