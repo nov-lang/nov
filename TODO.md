@@ -50,6 +50,16 @@ results. See `examples/array-fields.nov`.
 
 ## Current delivered status
 
+`std.string.split(text, separator) -> []string` is implemented in Nov. Exact,
+case-sensitive, non-overlapping Unicode-scalar separator matching preserves
+leading/trailing/adjacent empty fields. Empty input with nonempty separator gives
+one empty field; no match gives the whole input. Empty separator panics in every
+mode. Arguments remain eager and left-to-right. Field contents are zero-copy
+immutable views with retained owners; output arrays allocate/copy independently.
+Source-free generated-C tests check owner/data identity, forced-GC retention,
+independent array copies and runtime OOM at O0/O3. No compiler semantics, join,
+normalization or optimization changes. See examples/string-split.nov (five tests).
+
 Positional anonymous structs support zero-based `.0`, `.1`, etc. for reads,
 exact-type writes through mutable owners, nested paths, callable fields and
 explicit reference projections. Numeric selectors are compile-time canonical

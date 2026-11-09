@@ -1,0 +1,128 @@
+; nov run examples/string-split.nov
+; nov test examples/string-split.nov
+; Separators match exact Unicode scalars, without normalization or case folding.
+; Fields are immutable shared-owner views; copying the result copies the array.
+
+let std = @import("std")
+
+let expect: (text: string, separator: string, wanted: []string) = {
+    let fields = std.string.split(text, separator)
+    @assert(fields.len == wanted.len)
+    loop field, expected in fields, wanted {
+        @assert(field == expected)
+    }
+}
+
+@[test]
+let normal_and_preserved_empty_fields: () = {
+    expect("red,green,blue", ",", ["red", "green", "blue"])
+    expect(",red,,blue,", ",", ["", "red", "", "blue", ""])
+    expect(",,", ",", ["", "", ""])
+    expect("word", "word", ["", ""])
+    expect("left::middle::::right::", "::", ["left", "middle", "", "right", ""])
+}
+
+@[test]
+let empty_text_no_match_and_oversized_separator: () = {
+    expect("", ",", [""])
+    expect("", "😀x", [""])
+    expect("abc", ",", ["abc"])
+    expect("ab", "abc", ["ab"])
+    expect("😀", "😀x", ["😀"])
+    expect("é", "\u{a9}", ["é"])
+    expect("Straße", "STRASSE", ["Straße"])
+}
+
+@[test]
+let nonoverlap_unicode_nul_and_exact_matching: () = {
+    expect("aaaaa", "aa", ["", "", "a"])
+    expect("banana", "ana", ["b", "na"])
+    expect("aaab", "aab", ["a", ""])
+    expect("ababa", "aba", ["", "ba"])
+    expect("é😀x😀x\0e\u{301}😀x", "😀x", ["é", "", "\0e\u{301}", ""])
+    expect("\0a\0\0b\0", "\0", ["", "a", "", "b", ""])
+    expect("a\0😀b\0😀", "\0😀", ["a", "b", ""])
+    expect("e\u{301}é", "é", ["e\u{301}", ""])
+    expect("ée\u{301}", "e\u{301}", ["é", ""])
+    expect("e\u{301}z", "\u{301}", ["e", "z"])
+    let fields = std.string.split("é😀\0e\u{301}", "\0")
+    @assert(fields[0].len == 2 and fields[1].len == 2)
+    @assert(fields[0][1..] == "😀" and fields[1][1] == '\u{301}')
+}
+
+let retained_fields: () -> []string = {
+    let payload = "é😀::\0e\u{301}::"
+    let mut source = "prefix:{payload}:suffix"
+    let view = source[7..-7]
+    let separator = view[2..4]
+    let fields = std.string.split(view, separator)
+    source += "replacement"
+    source = "different"
+    fields
+}
+
+@[test]
+let retained_managed_views_and_array_copies: () = {
+    let original = retained_fields()
+    let mut copy = original
+    let snapshot = copy[0]
+    copy[0] = "changed"
+    copy += ["extra"]
+    let mut field = original[1]
+    field += "!"
+    loop i in 0..2000 {
+        let temporary = "allocation:{i}:é😀"
+        @assert(temporary.len > 0)
+    }
+    @assert(original.len == 3 and original[0] == "é😀")
+    @assert(original[1] == "\0e\u{301}" and original[2] == "")
+    @assert(copy.len == 4 and copy[0] == "changed" and copy[1] == original[1])
+    @assert(snapshot == "é😀" and snapshot[1..] == "😀")
+    @assert(field == "\0e\u{301}!" and original[1].len == 3)
+    let temporary = std.string.split("a{snapshot}b{snapshot}", snapshot)
+    @assert(temporary.len == 3 and temporary[0] == "a" and temporary[1] == "b" and temporary[2] == "")
+}
+
+@[test]
+let callee_and_arguments_once_left_to_right: () = {
+    let mut events: int = 0
+    let mut source = "a😀b"
+    let getSplit = () -> (string, string) -> []string {
+        events = events * 10 + 1
+        std.string.split
+    }
+    let fields = getSplit()(
+        {
+            events = events * 10 + 2
+            source
+        },
+        {
+            events = events * 10 + 3
+            source = "replacement"
+            "😀"
+        }
+    )
+    @assert(events == 123 and source == "replacement")
+    @assert(fields.len == 2 and fields[0] == "a" and fields[1] == "b")
+    events = 0
+    let text = () -> string {
+        events = events * 10 + 1
+        ""
+    }
+    let separator = () -> string {
+        events = events * 10 + 2
+        ","
+    }
+    let empty = std.string.split(text(), separator())
+    @assert(events == 12 and empty.len == 1 and empty[0] == "")
+}
+
+let main: () = {
+    let fields = std.string.split(",red,,blue,", ",")
+    @println("Fields:", fields.len)
+    loop field in fields {
+        @println("[{field}]")
+    }
+    let unicode = std.string.split("é😀x\0e\u{301}", "😀x")
+    @println("Scalar lengths:", unicode[0].len, unicode[1].len)
+}

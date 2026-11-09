@@ -9115,6 +9115,90 @@ test "string slicing rejects private region values slots and borrow capabilities
     try sema.ir.verify();
 }
 
+fn emitStringSplitSourceFree(allocator: std.mem.Allocator) ![]u8 {
+    const io = std.testing.io;
+    const lib = std.testing.environ.getAlloc(allocator, "NOV_TEST_LIB_DIR") catch return error.SkipZigTest;
+    defer allocator.free(lib);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "split.nov", .data =
+        \\let std = @import("std")
+        \\let make: () -> string = "prefix:" + "::é😀::\0e\u{301}:::::suffix"
+        \\let cut: (text: string) -> []string = std.string.split(text[7..-7], "::")
+        \\let copy: (fields: []string) -> []string = fields
+        \\let absent: (text: string) -> []string = std.string.split(text, "missing")
+        \\let oversized: (text: string) -> []string = std.string.split(text, "a much longer separator")
+        \\
+    });
+    const path = try tmp.dir.realPathFileAlloc(io, "split.nov", allocator);
+    defer allocator.free(path);
+    var lowered = blk: {
+        var compilation = try Compilation.load(allocator, io, path, .{ .lib_dir = lib });
+        defer compilation.deinit();
+        var result = try Lowering.lowerCompilation(&compilation);
+        errdefer result.deinit();
+        try std.testing.expect(!compilation.hasErrors());
+        try std.testing.expect(result.lowering_complete);
+        break :blk result;
+    };
+    defer lowered.deinit();
+    try lowered.ir.verify();
+    return emit(allocator, &lowered.ir, null);
+}
+
+test "string split actual stdlib source free owner identity copies forced GC O0 O3 runtime OOM" {
+    const library = try emitStringSplitSourceFree(test_gpa);
+    defer test_gpa.free(library);
+    const harness =
+        \\int main(void) {
+        \\    nov_rt_heap.collect_every_allocation = 1;
+        \\    nov_string text = {0}; nov_array fields = {0}, copy = {0}, absent = {0}, oversized = {0};
+        \\    void **roots[] = {&text.owner, &fields.data, &copy.data, &absent.data, &oversized.data};
+        \\    nov_gc_roots frame = {0}; nov_gc_push(&nov_rt_heap, &frame, roots, 5);
+        \\    text = nov_make();
+        \\    fields = nov_cut(text);
+        \\    if (!text.owner || fields.len != 5) return 1;
+        \\    nov_string *items = fields.data;
+        \\    const uintptr_t offsets[] = {7, 9, 17, 23, 25}, lengths[] = {0, 6, 4, 0, 0};
+        \\    for (uintptr_t i = 0; i < 5; ++i) {
+        \\        if (items[i].owner != text.owner || items[i].data != text.data + offsets[i] || items[i].len != lengths[i]) return 2;
+        \\    }
+        \\    absent = nov_absent(items[1]); oversized = nov_oversized(items[1]);
+        \\    if (absent.len != 1 || oversized.len != 1) return 3;
+        \\    nov_string a = ((nov_string *)absent.data)[0], b = ((nov_string *)oversized.data)[0];
+        \\    if (a.owner != text.owner || a.data != items[1].data || a.len != 6 || b.owner != a.owner || b.data != a.data || b.len != a.len) return 4;
+        \\    copy = nov_copy(fields);
+        \\    if (copy.data == fields.data || copy.len != fields.len) return 5;
+        \\    for (uintptr_t i = 0; i < 5; ++i) {
+        \\        nov_string c = ((nov_string *)copy.data)[i];
+        \\        if (c.owner != items[i].owner || c.data != items[i].data || c.len != items[i].len) return 6;
+        \\    }
+        \\    ((nov_string *)copy.data)[1] = (nov_string){0};
+        \\    if (items[1].len != 6) return 7;
+        \\    text = (nov_string){0}; copy = absent = oversized = (nov_array){0};
+        \\    nov_gc_collect(&nov_rt_heap);
+        \\    items = fields.data;
+        \\    if (items[1].data[0] != 0xc3 || items[1].data[2] != 0xf0 || items[2].data[0] != 0 || items[2].data[2] != 0xcc) return 8;
+        \\    nov_gc_pop(&nov_rt_heap, &frame); nov_gc_collect(&nov_rt_heap);
+        \\    if (nov_rt_heap.frames || nov_rt_heap.live_objects) return 9;
+        \\    nov_gc_shutdown(&nov_rt_heap); return 0;
+        \\}
+        \\
+    ;
+    const c = try std.mem.concat(test_gpa, u8, &.{ library, harness });
+    defer test_gpa.free(c);
+    const oom = try std.mem.concat(test_gpa, u8, &.{
+        "#include <stdlib.h>\nstatic void *test_malloc(size_t n) { (void)n; return NULL; }\n#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n",
+        library,
+        "\nint main(void) { nov_string text = {NULL, (const unsigned char *)\"a::b\", 4}; (void)nov_absent(text); return 0; }\n",
+    });
+    defer test_gpa.free(oom);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| {
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "", "", mode);
+        try compileAndRunMode(oom, "typedef int nonempty_translation_unit;", 1, "", "panic: GC allocation failed\n", mode);
+    }
+}
+
 test "string slicing managed subviews retain original owner across frame release and GC" {
     const c = try emitSource("let make:()->string={let s=\"aé\"+\"€😀z\"\ns[1..-1]}\nlet cut:(s:string)->string=s[1..]\nlet empty:(s:string)->string=s[0..0]", null);
     defer test_gpa.free(c);

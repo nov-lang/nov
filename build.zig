@@ -72,6 +72,8 @@ pub fn build(b: *std.Build) void {
     unit_step.dependOn(&run_tests.step);
     // Generated-C tests compile with the pinned toolchain's `zig cc`.
     run_tests.setEnvironmentVariable("NOV_TEST_ZIG", b.graph.zig_exe);
+    run_tests.setCwd(b.path("."));
+    run_tests.setEnvironmentVariable("NOV_TEST_LIB_DIR", "lib");
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_tests.step);
     const cli_step = b.step("test-cli", "Run CLI integration tests");
@@ -139,6 +141,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const string_search_tests = b.step("test-cli-string-search", "Run standard-library string search CLI tests");
     addStringSearchCliTests(b, exe, string_search_tests);
     test_step.dependOn(string_search_tests);
+    const string_split_tests = b.step("test-cli-string-split", "Run standard-library string split CLI tests");
+    addStringSplitCliTests(b, exe, string_split_tests);
+    test_step.dependOn(string_split_tests);
     const rune_tests = b.step("test-cli-runes", "Run Unicode rune CLI tests");
     addRuneCliTests(b, exe, rune_tests);
     test_step.dependOn(rune_tests);
@@ -3242,6 +3247,143 @@ fn addStringSearchCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_ste
         _ = fixtures.add(source, b.fmt("let std=@import(\"std\")\nlet main:()={{let result={s}\n}}\n", .{case.expression}));
         const check = b.addRunArtifact(exe);
         check.step.name = b.fmt("CLI string search: reject {s}", .{case.name});
+        check.setCwd(fixtures.getDirectory());
+        check.addArgs(&.{ "check", "--semantic", source, "--lib-dir" });
+        check.addDirectoryArg(library);
+        check.expectExitCode(1);
+        check.expectStdOutEqual("");
+        check.expectStdErrMatch(".nov:");
+        check.expectStdErrMatch("error:");
+        test_step.dependOn(&check.step);
+    }
+}
+
+fn addStringSplitCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    const fixtures = b.addWriteFiles();
+    const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
+    _ = fixtures.add("string-split.nov", @embedFile("examples/string-split.nov"));
+    const aliases_source =
+        \\let standard = @import("std")
+        \\let direct = @import("lib/string.nov")
+        \\let alternate = @import("lib/./string.nov")
+        \\let verify: () = {
+        \\    let split: (string, string) -> []string = direct.split
+        \\    let other = alternate.split
+        \\    let fields = split("é😀x\0e\u{301}😀x", "😀x")
+        \\    @assert(fields.len == 3 and fields[0] == "é" and fields[1] == "\0e\u{301}" and fields[2] == "")
+        \\    @assert(other("aaaaa", "aa")[2] == "a")
+        \\    @assert(standard.string.split("", ",")[0] == "")
+        \\    @assert(direct.split("a::b", "::")[1] == "b")
+        \\}
+        \\@[test]
+        \\let imported_and_local_aliases: () = verify()
+        \\let main: () = verify()
+        \\
+    ;
+    _ = fixtures.add("aliases.nov", aliases_source);
+    for ([_][]const u8{ "string-split.nov", "aliases.nov", "lib/string.nov", "lib/std.nov" }) |source| {
+        for ([_]bool{ false, true }) |semantic| {
+            if (!semantic and std.mem.eql(u8, source, "aliases.nov")) continue;
+            const check = b.addRunArtifact(exe);
+            check.step.name = b.fmt("CLI string split: {s} {s}", .{ if (semantic) "semantic" else "fmt", source });
+            check.setCwd(fixtures.getDirectory());
+            check.addArgs(if (semantic) &.{ "check", "--semantic", source } else &.{ "fmt", "--check", source });
+            if (semantic) {
+                check.addArg("--lib-dir");
+                check.addDirectoryArg(library);
+            }
+            check.expectExitCode(0);
+            check.expectStdOutEqual("");
+            check.expectStdErrEqual("");
+            test_step.dependOn(&check.step);
+        }
+    }
+    const package = b.addWriteFiles();
+    const installed_exe = package.addCopyFile(exe.getEmittedBin(), b.fmt("bin/{s}", .{exe.out_filename}));
+    _ = package.addCopyDirectory(b.path("lib"), "lib/nov", .{});
+    _ = package.add("string-split.nov", @embedFile("examples/string-split.nov"));
+    _ = package.add("aliases.nov", std.mem.replaceOwned(u8, b.allocator, aliases_source, "lib/", "lib/nov/") catch @panic("OOM"));
+    for ([_]bool{ false, true }) |installed| {
+        for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+            for ([_][]const u8{ "run", "test" }) |command| {
+                for ([_][]const u8{ "string-split.nov", "aliases.nov" }) |source| {
+                    const run = if (installed) std.Build.Step.Run.create(b, "CLI string split: relocated install") else b.addRunArtifact(exe);
+                    run.step.name = b.fmt("CLI string split: {s} {s} {s} (installed={})", .{ command, source, mode, installed });
+                    if (installed) run.addFileArg(installed_exe);
+                    run.setCwd(if (installed) package.getDirectory() else fixtures.getDirectory());
+                    run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+                    run.setEnvironmentVariable("NOV_CC", "");
+                    run.setEnvironmentVariable("CC", "");
+                    run.addArgs(&.{ command, source });
+                    if (mode.len != 0) run.addArg(mode);
+                    if (!installed) {
+                        run.addArg("--lib-dir");
+                        run.addDirectoryArg(library);
+                    }
+                    const is_test = std.mem.eql(u8, command, "test");
+                    const example = std.mem.eql(u8, source, "string-split.nov");
+                    run.expectExitCode(0);
+                    run.expectStdOutEqual(if (example) (if (is_test)
+                        "PASS normal_and_preserved_empty_fields\nPASS empty_text_no_match_and_oversized_separator\nPASS nonoverlap_unicode_nul_and_exact_matching\nPASS retained_managed_views_and_array_copies\nPASS callee_and_arguments_once_left_to_right\n5 passed; 0 failed; 5 total\n"
+                    else
+                        "Fields: 5\n[]\n[red]\n[]\n[blue]\n[]\nScalar lengths: 1 3\n") else if (is_test) "PASS imported_and_local_aliases\n1 passed; 0 failed; 1 total\n" else "");
+                    run.expectStdErrEqual("");
+                    test_step.dependOn(&run.step);
+                }
+            }
+        }
+    }
+    for ([_][]const u8{ "nonempty", "empty" }) |name| {
+        const source = b.fmt("panic-{s}.nov", .{name});
+        _ = fixtures.add(source, b.fmt(
+            \\let std = @import("std")
+            \\let main: () = {{
+            \\    let callee = () -> (string, string) -> []string {{
+            \\        @println("callee")
+            \\        std.string.split
+            \\    }}
+            \\    let text = () -> string {{
+            \\        @println("text")
+            \\        "{s}"
+            \\    }}
+            \\    let separator = () -> string {{
+            \\        @println("separator")
+            \\        ""
+            \\    }}
+            \\    let fields = callee()(text(), separator())
+            \\    @println("unreachable", fields.len)
+            \\}}
+            \\
+        , .{if (std.mem.eql(u8, name, "empty")) "" else "abc"}));
+        for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+            const run = b.addRunArtifact(exe);
+            run.step.name = b.fmt("CLI string split: empty separator {s} {s}", .{ name, mode });
+            run.setCwd(fixtures.getDirectory());
+            run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+            run.setEnvironmentVariable("NOV_CC", "");
+            run.setEnvironmentVariable("CC", "");
+            run.addArgs(&.{ "run", source, "--lib-dir" });
+            run.addDirectoryArg(library);
+            if (mode.len != 0) run.addArg(mode);
+            run.expectExitCode(1);
+            run.expectStdOutEqual("callee\ntext\nseparator\n");
+            run.expectStdErrEqual("panic: string split separator must not be empty\n");
+            test_step.dependOn(&run.step);
+        }
+    }
+    for ([_]struct { name: []const u8, expression: []const u8 }{
+        .{ .name = "text-int", .expression = "std.string.split(1,\",\")" },
+        .{ .name = "text-array", .expression = "std.string.split([1],\",\")" },
+        .{ .name = "separator-bool", .expression = "std.string.split(\"abc\",true)" },
+        .{ .name = "separator-rune", .expression = "std.string.split(\"abc\",',')" },
+        .{ .name = "no-args", .expression = "std.string.split()" },
+        .{ .name = "missing-separator", .expression = "std.string.split(\"abc\")" },
+        .{ .name = "extra-arg", .expression = "std.string.split(\"abc\",\",\",\"extra\")" },
+    }) |case| {
+        const source = b.fmt("invalid-string-split-{s}.nov", .{case.name});
+        _ = fixtures.add(source, b.fmt("let std=@import(\"std\")\nlet main:()={{let result={s}\n}}\n", .{case.expression}));
+        const check = b.addRunArtifact(exe);
+        check.step.name = b.fmt("CLI string split: reject {s}", .{case.name});
         check.setCwd(fixtures.getDirectory());
         check.addArgs(&.{ "check", "--semantic", source, "--lib-dir" });
         check.addDirectoryArg(library);

@@ -3211,6 +3211,29 @@ rescan UTF-8; optimization remains deferred. See
 [`examples/string-search.nov`](examples/string-search.nov) and
 [`lib/README.md`](lib/README.md#string-search).
 
+### Standard-library string splitting
+
+`std.string.split(text, separator)` returns `[]string`, preserving empty fields:
+
+```nov
+let parts = std.string.split("one::three", ":")
+@assert(parts.len == 3)
+@assert(parts[0] == "one" and parts[1] == "" and parts[2] == "three")
+```
+
+Separators match exactly and non-overlappingly from left to right, including
+Unicode and embedded NUL, without normalization or case folding. Leading,
+trailing and adjacent separators produce empty fields. Empty input with a
+nonempty separator returns `[""]`; no match returns the whole input as one field.
+An empty separator panics in every build mode, even for empty input.
+
+The fields are immutable shared-owner slices, not copies of the source bytes;
+the output array allocates and copies independently under normal array semantics.
+Returned views retain the source owner after the input binding is dropped or
+replaced. Existing allocation-failure behavior applies, and performance work stays
+deferred. See [examples/string-split.nov](examples/string-split.nov) and
+[lib/README.md](lib/README.md#string-splitting).
+
 ## String Interpolation
 
 `"{expression}"` evaluates an expression in the current lexical scope and produces

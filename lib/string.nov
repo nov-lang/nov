@@ -43,3 +43,28 @@ let find: (text: string, pattern: string) -> Option(uint) = {
 
 @[public]
 let contains: (text: string, pattern: string) -> bool = find(text, pattern).isSome()
+
+@[public]
+let split: (text: string, separator: string) -> []string = {
+    if separator.len == 0 {
+        @panic("string split separator must not be empty")
+    }
+    ; String slices require native int bounds.
+    let mut width: int = 0
+    loop _ in separator {
+        width += 1
+    }
+    let mut result: []string = []
+    let mut start: int = 0
+    loop _, index in text, @as(int, 0).. {
+        if index < start {
+            continue
+        }
+        if startsWith(text[index..], separator) {
+            result += [text[start..index]]
+            start = index + width
+        }
+    }
+    result += [text[start..]]
+    result
+}

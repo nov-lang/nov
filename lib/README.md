@@ -355,6 +355,36 @@ complexity is promised yet, and optimization remains paused. They do not add
 mutable strings, byte conversions, normalization or case folding. See
 `examples/string-search.nov` for a runnable example and five tests.
 
+## String splitting
+
+`std.string.split(text: string, separator: string) -> []string` splits at exact,
+non-overlapping occurrences of a nonempty string separator, from left to right.
+Matching is case-sensitive and Unicode-scalar aware, without normalization or
+case folding; embedded NUL and multi-scalar separators are supported.
+
+```nov
+let parts = std.string.split("one::three", ":")
+@assert(parts.len == 3)
+@assert(parts[0] == "one" and parts[1] == "" and parts[2] == "three")
+```
+
+Leading, trailing and adjacent separators preserve empty fields. Empty input with
+a nonempty separator returns `[""]`; no match or an oversized separator returns
+one field containing the whole input. Matches do not overlap: splitting `"aaaaa"`
+by `"aa"` yields `["", "", "a"]`.
+
+An empty separator panics with `string split separator must not be empty` in every
+build mode, including when the input is empty. Argument expressions still evaluate
+once in normal left-to-right order before the function checks the separator.
+
+Fields are immutable, zero-copy string views retaining their original GC owner;
+they remain valid after rebinding or dropping the input binding. The result array
+allocates storage and follows ordinary independent array-copy semantics, while
+its string elements continue sharing immutable content. Allocation failure panics
+normally. This initial implementation uses existing scalar indexing/slicing and
+repeated append; efficient-search/growth optimization remains deferred. See
+`examples/string-split.nov` for a runnable example and five tests.
+
 ## References and library boundaries
 
 Explicit references are local and call-scoped capabilities, not ordinary
