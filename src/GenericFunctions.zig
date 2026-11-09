@@ -105,6 +105,7 @@ fn targetWith(module: *Module, node: Ast.Node.Index, generic_only: bool) ?Ref {
             break :blk .{ .module = owner, .id = owner.lookup(ast.tokenSlice(ast.firstToken(current))) orelse return null };
         };
         const declaration = ref.module.getDeclaration(ref.id).?;
+        if (ref.module.source.ast.decl(declaration.node).ast.is_mutable) return null;
         if ((declaration.is_generic_function or (!generic_only and !declaration.is_generic and !declaration.is_type_alias)) and ref.module.source.ast.declFunction(declaration.node) != null) return ref;
         const full = ref.module.source.ast.decl(declaration.node).ast;
         if (full.is_mutable or full.type_node != 0 or full.init_node == 0) return null;
@@ -532,6 +533,58 @@ fn testNominalIntegerDefaults(allocator: std.mem.Allocator) !void {
 test "integer defaults descend matching nominal arguments and nested arrays under OOM" {
     try testNominalIntegerDefaults(std.testing.allocator);
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testNominalIntegerDefaults, .{});
+}
+
+fn testMutableGlobalConstraints(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "mutable-global-constraints.nov",
+        \\let R=struct{value:int,}
+        \\let mut count=1
+        \\let mut values=[1]
+        \\let mut record=R.[value=1]
+        \\let named:()->int=1
+        \\let mut callback:()->int=named
+        \\let get:()->`T=count
+        \\let element:()->`T=values[0]
+        \\let field:()->`T=record.value
+        \\let invoke:()->`T=callback()
+        \\let update:(value:`T)->`T={count=value
+        \\count}
+        \\let main:()={
+        \\let a:int=get()
+        \\let b:int=element()
+        \\let c:int=field()
+        \\let d:int=invoke()
+        \\let e:int=update(2)
+        \\let read=()->`T{count+callback()}
+        \\let f:int=read()
+        \\let inferred=(){count}
+        \\let g:int=inferred()
+        \\let query:@TypeOf({count=3
+        \\values[0]=4
+        \\record.value=5})={}
+        \\}
+    );
+    defer module.deinit();
+    var result = try Lowering.lower(&module);
+    defer result.deinit();
+    if (module.hasErrors()) std.debug.print("mutable global inference: {any}\n", .{module.diagnostics.items});
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(result.lowering_complete);
+    try result.ir.verify();
+    var stores: usize = 0;
+    for (result.ir.functions.items) |function| {
+        for ((function.body orelse continue).instructions) |instruction| switch (instruction.op) {
+            .capture_cell, .capture_value => return error.UnexpectedGlobalCapture,
+            .local_store, .field_store => stores += 1,
+            else => {},
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 1), stores);
+}
+
+test "global storage constrains generic results mutable callbacks and inferred closures under OOM" {
+    try testMutableGlobalConstraints(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMutableGlobalConstraints, .{});
 }
 
 fn testGlobalIntegerDefaults(allocator: std.mem.Allocator) !void {
@@ -1001,7 +1054,10 @@ pub fn queryExpressionInScope(module: *Module, ir: *Ir, node: Ast.Node.Index, bi
         variables[frame.variables.len] = .{ .name = binding.name, .term = variable };
         frame.variables = variables;
     }
-    for (values) |value| try frame.locals.append(solver.allocator, .{ .name = value.name, .term = try solver.fromType(value.ty, span, 0), .query_global = module.lookup(value.name) != null });
+    for (values) |value| {
+        const declaration = if (module.lookup(value.name)) |id| module.getDeclaration(id) else null;
+        try frame.locals.append(solver.allocator, .{ .name = value.name, .term = try solver.fromType(value.ty, span, 0), .query_global = declaration != null, .mutable = if (declaration) |decl| module.source.ast.decl(decl.node).ast.is_mutable else false });
+    }
     for (captures) |capture| try frame.locals.append(solver.allocator, .{ .name = capture.name, .term = try solver.fromType(capture.ty, span, 0), .template = capture.template, .mutable = capture.mutable });
     const result = try solver.expression(&frame, node, 0);
     try solver.finishBodies();
@@ -1087,6 +1143,22 @@ const Solver = struct {
                 progress = true;
             }
         }
+    }
+
+    fn globalReference(frame: *Frame, node: Ast.Node.Index) ?Ref {
+        const module = frame.ref.module;
+        const ast = &module.source.ast;
+        var base = node;
+        while (ast.nodes.items(.tag)[base] == .field_access) base = ast.nodes.items(.data)[base].lhs;
+        if (ast.nodes.items(.tag)[base] != .identifier) return null;
+        const name = ast.tokenSlice(ast.firstToken(base));
+        for (frame.locals.items) |local| if (!local.query_global and std.mem.eql(u8, local.name, name)) return null;
+        if (module.compilation) |comp| {
+            const ref = comp.reference(module, node) orelse return null;
+            return .{ .module = comp.getModule(ref.source).?, .id = ref.local };
+        }
+        if (base != node) return null;
+        return .{ .module = module, .id = module.lookup(name) orelse return null };
     }
 
     fn establishedType(self: *Solver, ref: Ref) ?Ir.TypeId {
@@ -2181,6 +2253,11 @@ const Solver = struct {
         const span = module.tokenSpan(ast.firstToken(node));
         if (depth >= max_depth) return self.fail(.generic_function_limit, span, null);
         const data = ast.nodes.items(.data)[node];
+        if (globalReference(frame, node)) |ref| {
+            const decl = ref.module.getDeclaration(ref.id).?;
+            if (!ref.module.source.ast.decl(decl.node).ast.is_mutable) try self.fail(.immutable_assignment, span, decl.name_span);
+            return;
+        }
         switch (ast.nodes.items(.tag)[node]) {
             .identifier => {
                 const name = ast.tokenSlice(ast.firstToken(node));
@@ -2189,7 +2266,7 @@ const Solver = struct {
                     i -= 1;
                     const local = frame.locals.items[i];
                     if (!std.mem.eql(u8, local.name, name)) continue;
-                    if (!local.mutable or local.query_global) try self.fail(.immutable_assignment, span, null);
+                    if (!local.mutable) try self.fail(.immutable_assignment, span, null);
                     return;
                 }
                 try self.fail(.immutable_assignment, span, null);
@@ -2256,6 +2333,13 @@ const Solver = struct {
         if (depth >= max_depth) try self.fail(.generic_function_limit, self.call_span, span);
         if (self.failed) return self.term(.unknown, span);
         const data = ast.nodes.items(.data)[node];
+        if (globalReference(frame, node)) |ref| {
+            const decl = ref.module.getDeclaration(ref.id).?;
+            const data_value = ref.module.source.ast.decl(decl.node).ast.is_mutable or ref.module.source.ast.declFunction(decl.node) == null;
+            if (data_value and !decl.is_type_alias and !decl.is_generic and !decl.is_namespace and !decl.is_generic_function and !decl.is_test) {
+                if (self.establishedType(ref)) |ty| return self.fromType(ty, span, depth + 1);
+            }
+        }
         if (self.querying and ast.nodes.items(.tag)[node] == .identifier) {
             const name = ast.tokenSlice(ast.firstToken(node));
             var i = frame.locals.items.len;
@@ -2317,7 +2401,7 @@ const Solver = struct {
                             const index = analysis.entryIndex(module, id);
                             if (index < analysis.entries.len) {
                                 const entry = analysis.entries[index];
-                                if (entry.status == .constant_checked) if (entry.type_id) |ty| return self.fromType(ty, span, 0);
+                                if (entry.status == .constant_checked or entry.status == .global_checked) if (entry.type_id) |ty| return self.fromType(ty, span, 0);
                             }
                         }
                         const index = if (module.compilation) |comp|

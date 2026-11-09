@@ -12,6 +12,7 @@ const Sema = @This();
 const Compilation = @import("Compilation.zig");
 const Dependencies = @import("Dependencies.zig");
 const GenericFunctions = @import("GenericFunctions.zig");
+const GlobalInitializers = @import("GlobalInitializers.zig");
 
 allocator: std.mem.Allocator,
 ir: Ir,
@@ -20,8 +21,10 @@ compilation: ?*Compilation = null,
 /// True only after whole-module lowering and structural verification succeed.
 /// Entry-point/backend/runtime configuration is still a separate obligation.
 lowering_complete: bool = false,
+/// Semantic entry indices in dependency-first global initialization order.
+global_order: std.ArrayList(usize) = .empty,
 
-pub const Status = enum { ignored, deferred, generic, unrequested, requested, namespace, type_alias, signature_only, external, constant_checked, body_checked, lowered, failed };
+pub const Status = enum { ignored, deferred, generic, unrequested, requested, namespace, type_alias, signature_only, external, constant_checked, global_checked, body_checked, lowered, failed };
 pub const Entry = struct {
     type_id: ?Ir.TypeId = null,
     /// Represented type, never the runtime type of this declaration.
@@ -89,7 +92,7 @@ fn analyzeModuleAnnotations(result: *Sema, module: *Module) Error!void {
         const declaration = module.declarations.items[i];
         if (declaration.concrete_type != null or (declaration.is_test and !module.testEnabled())) continue;
         const full = module.source.ast.decl(declaration.node);
-        const function = module.source.ast.declFunction(declaration.node);
+        const function = if (!full.ast.is_mutable) module.source.ast.declFunction(declaration.node) else null;
         const type_node = if (function) |f| f.proto_node else full.ast.type_node;
         if (declaration.is_namespace) {
             result.entries[result.entryIndex(module, @fromBackingInt(@intCast(i)))].status = .namespace;
@@ -121,7 +124,7 @@ fn analyzeModuleAnnotations(result: *Sema, module: *Module) Error!void {
             continue;
         }
         if (type_node == 0) {
-            if (!full.ast.is_mutable and full.ast.init_node != 0) try result.checkScalarGlobal(module, i, full.ast.init_node, null);
+            if (full.ast.init_node != 0) try result.checkScalarGlobal(module, i, full.ast.init_node, null);
             continue;
         }
         const type_id = (if (function != null) try TypeResolver.resolveFunction(module, &result.ir, .{ .module = module, .id = @fromBackingInt(@intCast(i)), .analysis = result }) else try TypeResolver.resolveInContainer(module, &result.ir, type_node, declaration.container, declaration.concrete_type)) orelse {
@@ -147,7 +150,7 @@ fn analyzeModuleAnnotations(result: *Sema, module: *Module) Error!void {
             result.entries[result.entryIndex(module, @fromBackingInt(@intCast(i)))].status = if (declaration.extern_name != null) .external else .signature_only;
         } else if (full.ast.init_node != 0) {
             const annotation = module.tokenSpan(module.source.ast.firstToken(full.ast.type_node));
-            if (!full.ast.is_mutable and module.source.ast.fullCall(full.ast.init_node) != null) {
+            if (module.source.ast.fullCall(full.ast.init_node) != null) {
                 try result.checkScalarGlobal(module, i, full.ast.init_node, annotation);
             } else {
                 try result.checkLiteral(module, i, full.ast.init_node, annotation);
@@ -320,6 +323,8 @@ pub fn analyzeFunctions(module: *Module) Error!Sema {
     var result = try analyzeAnnotations(module);
     errdefer result.deinit();
     if (module.hasErrors()) return result;
+    try GlobalInitializers.analyze(module, &result);
+    if (module.hasErrors()) return result;
     while (true) {
         try result.syncEntries(module);
         var next: ?usize = null;
@@ -370,6 +375,8 @@ pub fn analyzeCompilation(comp: *Compilation) Error!Sema {
     var exports: std.StringHashMapUnmanaged(ForeignSymbol) = .empty;
     defer exports.deinit(result.allocator);
     for (comp.modules.items) |module| try result.validateExports(module, &exports);
+    if (comp.hasErrors()) return result;
+    try GlobalInitializers.analyze(comp.modules.items[0], &result);
     if (comp.hasErrors()) return result;
     while (true) {
         try result.syncEntries(comp.modules.items[0]);
@@ -509,6 +516,7 @@ pub fn specializeFunction(self: *Sema, caller: *Module, reference: GenericFuncti
 pub fn deinit(self: *Sema) void {
     self.ir.deinit();
     self.allocator.free(self.entries);
+    self.global_order.deinit(self.allocator);
     self.* = undefined;
 }
 
@@ -616,6 +624,7 @@ fn checkLiteral(self: *Sema, module: *Module, index: usize, initializer: Ast.Nod
         },
         .failed => self.entries[self.entryIndex(module, @fromBackingInt(@intCast(index)))].status = .failed,
         .constant => |constant| {
+            if (module.source.ast.decl(module.declarations.items[index].node).ast.is_mutable) return;
             self.entries[self.entryIndex(module, @fromBackingInt(@intCast(index)))].constant = constant;
             self.entries[self.entryIndex(module, @fromBackingInt(@intCast(index)))].status = .constant_checked;
         },
@@ -966,10 +975,14 @@ test "inferred globals own canonical scalar constants and keep aliases distinct"
     try std.testing.expectEqual(Status.type_alias, sema.entries[5].status);
     try std.testing.expectEqual(Status.constant_checked, sema.entries[6].status);
     try std.testing.expectEqual(sema.entries[4].type_id, sema.entries[6].type_id);
-    for (sema.entries[7..]) |entry| {
+    for (sema.entries[7..9]) |entry| {
         try std.testing.expectEqual(Status.deferred, entry.status);
         try std.testing.expect(entry.type_id == null and entry.constant == null);
     }
+    const mutable = sema.entries[9];
+    try std.testing.expectEqual(Status.deferred, mutable.status);
+    try std.testing.expect(sema.ir.getType(mutable.type_id.?).? == .boolean);
+    try std.testing.expect(mutable.constant == null);
     try sema.ir.verify();
 }
 
@@ -1518,24 +1531,24 @@ fn testCyclicDeclarations(allocator: std.mem.Allocator, first: []const u8, secon
 
 test "cyclic imports reject self mutual branching type value and generic cycles with bounded diagnostics and OOM" {
     for ([_]struct { first: []const u8, second: []const u8 = "", tag: Module.Diagnostic.Tag }{
-        .{ .first = "@[public]\nlet A=self.A", .tag = .unsupported_dependency_expression },
-        .{ .first = "@[public]\nlet A=peer.A", .second = "@[public]\nlet A=peer.A", .tag = .unsupported_dependency_expression },
+        .{ .first = "@[public]\nlet A=self.A", .tag = .value_cycle },
+        .{ .first = "@[public]\nlet A=peer.A", .second = "@[public]\nlet A=peer.A", .tag = .value_cycle },
         .{ .first = "@[public]\nlet A=self.A\nlet use:(A)={}", .tag = .type_alias_cycle },
         .{ .first = "@[public]\nlet A=peer.A\nlet use:(A)={}", .second = "@[public]\nlet A=peer.A", .tag = .type_alias_cycle },
         .{ .first = "@[public]\nlet A=(self.A)->self.A", .tag = .type_alias_cycle },
         .{ .first = "@[public]\nlet A=(peer.A)->peer.A", .second = "@[public]\nlet A=(peer.A)->peer.A", .tag = .type_alias_cycle },
         .{ .first = "@[public]\nlet A:(T:type)->type=struct{next:self.A(T),}\nlet use:(A(int))={}", .tag = .generic_cycle },
         .{ .first = "@[public]\nlet A:(T:type)->type=struct{next:peer.A(T),}\nlet use:(A(int))={}", .second = "@[public]\nlet A:(T:type)->type=struct{next:peer.A(T),}", .tag = .generic_cycle },
-        .{ .first = "@[public]\nlet A=self.A\nlet main:()={A(1)}", .tag = .unsupported_dependency_expression },
-        .{ .first = "@[public]\nlet A=peer.A\nlet main:()={A(1)}", .second = "@[public]\nlet A=peer.A", .tag = .unsupported_dependency_expression },
-        .{ .first = "@[public]\nlet A=self.A\nlet use:(A(int))={}", .tag = .unsupported_dependency_expression },
-        .{ .first = "@[public]\nlet A=peer.A\nlet use:(A(int))={}", .second = "@[public]\nlet A=peer.A", .tag = .unsupported_dependency_expression },
+        .{ .first = "@[public]\nlet A=self.A\nlet main:()={A(1)}", .tag = .value_cycle },
+        .{ .first = "@[public]\nlet A=peer.A\nlet main:()={A(1)}", .second = "@[public]\nlet A=peer.A", .tag = .value_cycle },
+        .{ .first = "@[public]\nlet A=self.A\nlet use:(A(int))={}", .tag = .value_cycle },
+        .{ .first = "@[public]\nlet A=peer.A\nlet use:(A(int))={}", .second = "@[public]\nlet A=peer.A", .tag = .not_a_generic },
         .{ .first = "@[public]\nlet A=@TypeOf(self.f)\n@[public]\nlet f:(x:A)->A=x", .tag = .type_query_limit },
         .{ .first = "@[public]\nlet A=@TypeOf(peer.f)", .second = "@[public]\nlet f:(x:peer.A)->peer.A=x", .tag = .type_query_limit },
         .{ .first = "@[public]\nlet A=struct{next:self.A,}", .tag = .record_layout_cycle },
         .{ .first = "@[public]\nlet A=struct{next:peer.A,}", .second = "@[public]\nlet A=struct{next:peer.A,}", .tag = .record_layout_cycle },
         .{ .first = "let A=peer.Hidden\nlet use:(A)={}", .second = "let Hidden=int", .tag = .unknown_type },
-        .{ .first = "let A=peer.hidden\nlet main:()={let x:int=A(1)\n}", .second = "let hidden:(x:`T)->`T=x", .tag = .unsupported_dependency_expression },
+        .{ .first = "let A=peer.hidden\nlet main:()={let x:int=A(1)\n}", .second = "let hidden:(x:`T)->`T=x", .tag = .unresolved_value_type },
     }) |case| {
         try testCyclicDeclarations(std.testing.allocator, case.first, case.second, case.tag);
         try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testCyclicDeclarations, .{ case.first, case.second, case.tag });

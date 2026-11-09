@@ -117,6 +117,9 @@ fn addGcTests(b: *std.Build, test_step: *std.Build.Step) void {
 
 fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
+    const global_tests = b.step("test-cli-globals", "Run global storage and data-only initializer CLI tests");
+    addGlobalCliTests(b, exe, global_tests);
+    test_step.dependOn(global_tests);
     const positional_field_tests = b.step("test-cli-positional-fields", "Run positional anonymous struct field CLI tests");
     addPositionalFieldCliTests(b, exe, positional_field_tests);
     test_step.dependOn(positional_field_tests);
@@ -478,7 +481,7 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         .{ .name = "global ascription unknown value", .args = &.{ "check", "--semantic", "global-unknown.nov" }, .exit_code = 1, .stderr_match = "unknown name 'missing'" },
         .{ .name = "global ascription unknown type", .args = &.{ "check", "--semantic", "global-type.nov" }, .exit_code = 1, .stderr_match = "unknown type 'Missing'" },
         .{ .name = "global ascription exact nesting", .args = &.{ "emit-c", "global-nesting.nov" }, .exit_code = 1, .stderr_match = "expression does not match the expected type" },
-        .{ .name = "global ascription rejects blocks", .args = &.{ "emit-c", "global-block.nov" }, .exit_code = 1, .stderr_match = "inferred globals require immutable" },
+        .{ .name = "global ascription accepts known-data blocks", .args = &.{ "check", "--semantic", "global-block.nov" }, .exit_code = 0 },
         .{ .name = "global ascription rejects interpolation", .args = &.{ "check", "--semantic", "global-interpolation.nov" }, .exit_code = 1, .stderr_match = "move interpolation into a function" },
         .{ .name = "check wide record", .args = &.{ "check", "--semantic", "wide-record.nov" }, .exit_code = 0 },
         .{ .name = "reject reachable wide record backend", .args = &.{ "emit-c", "wide-record.nov" }, .exit_code = 1, .stderr_match = "C backend only supports 8, 16, 32 and 64-bit integers" },
@@ -2950,6 +2953,75 @@ fn addStorableArrayCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_st
     }
 }
 
+fn addGlobalCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    const fixtures = b.addWriteFiles();
+    _ = fixtures.add("globals.nov", @embedFile("examples/globals.nov"));
+    _ = fixtures.add("globals-state.nov", @embedFile("examples/globals-state.nov"));
+    _ = fixtures.add("constants.nov", "@[public]\nlet fixed = 1\nlet hidden = 2\n");
+    for ([_][]const u8{ "syntax", "semantic" }) |mode| {
+        const check = b.addRunArtifact(exe);
+        check.step.name = b.fmt("CLI globals: {s}", .{mode});
+        check.setCwd(fixtures.getDirectory());
+        check.addArgs(if (std.mem.eql(u8, mode, "syntax")) &.{ "check", "globals.nov", "globals-state.nov" } else &.{ "check", "--semantic", "globals.nov" });
+        check.expectExitCode(0);
+        check.expectStdOutEqual("");
+        check.expectStdErrEqual("");
+        test_step.dependOn(&check.step);
+    }
+    for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+        for ([_][]const u8{ "run", "test" }) |command| {
+            const run = b.addRunArtifact(exe);
+            run.step.name = b.fmt("CLI globals: {s} {s}", .{ command, mode });
+            run.setCwd(fixtures.getDirectory());
+            run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+            run.setEnvironmentVariable("NOV_CC", "");
+            run.setEnvironmentVariable("CC", "");
+            run.addArgs(&.{ command, "globals.nov" });
+            if (mode.len != 0) run.addArg(mode);
+            run.expectExitCode(0);
+            run.expectStdOutEqual(if (std.mem.eql(u8, command, "test"))
+                "PASS live_global_reads\nPASS aggregate_copies_and_replacement\nPASS imported_storage_identity\n3 passed; 0 failed; 3 total\n"
+            else
+                "Initial: 8 true λ 1.5 Color.red\n" ++
+                    "Live: 22 22 Snapshot: 20\n" ++
+                    "Record: updated [1, 9, 3] Saved: [1, 2, 3]\n" ++
+                    "Union: Message.values[[8, 9]]\n" ++
+                    "Imported: 12 12 11 [12, 5] 7\n" ++
+                    "Range: 6 Callback: 10\n" ++
+                    "Replaced callback: 35\n");
+            run.expectStdErrEqual("");
+            test_step.dependOn(&run.step);
+        }
+    }
+    for ([_]struct { name: []const u8, source: []const u8, diagnostic: []const u8 }{
+        .{ .name = "runtime-call", .source = "let f:()->int=7\nlet mut n=f()\nlet main:()={}", .diagnostic = "dependency analysis for this expression is not implemented yet" },
+        .{ .name = "mutable-read", .source = "let mut n=1\nlet saved=n\nlet main:()={}", .diagnostic = "global initialization is unsupported" },
+        .{ .name = "mutable-field-read", .source = "let s=@import(\"globals-state.nov\")\nlet saved=s.counter.value\nlet main:()={}", .diagnostic = "global initialization is unsupported" },
+        .{ .name = "immutable-write", .source = "let n=1\nlet main:()={n=2}", .diagnostic = "assignment requires a mutable" },
+        .{ .name = "imported-immutable-write", .source = "let s=@import(\"constants.nov\")\nlet main:()={s.fixed=2}", .diagnostic = "assignment requires a mutable" },
+        .{ .name = "private-read", .source = "let s=@import(\"globals-state.nov\")\nlet main:()=@println(s.secret)", .diagnostic = "error:" },
+        .{ .name = "private-write", .source = "let s=@import(\"globals-state.nov\")\nlet main:()={s.secret=2}", .diagnostic = "error:" },
+        .{ .name = "borrow", .source = "let mut n=1\nlet main:()={let p=&n\n@println(p.*)}", .diagnostic = "nonlocal owners" },
+        .{ .name = "borrow-array", .source = "let mut items=[1,2]\nlet main:()={let p=&items[0]\n@println(p.*)}", .diagnostic = "nonlocal owners" },
+        .{ .name = "borrow-import", .source = "let s=@import(\"globals-state.nov\")\nlet main:()={let p=&s.count\n@println(p.*)}", .diagnostic = "nonlocal owners" },
+    }) |case| {
+        const source = b.fmt("invalid-global-{s}.nov", .{case.name});
+        _ = fixtures.add(source, case.source);
+        for ([_][]const u8{ "semantic", "emit-c" }) |command| {
+            const check = b.addRunArtifact(exe);
+            check.step.name = b.fmt("CLI globals: reject {s} ({s})", .{ case.name, command });
+            check.setCwd(fixtures.getDirectory());
+            if (std.mem.eql(u8, command, "semantic")) check.addArgs(&.{ "check", "--semantic" }) else check.addArg("emit-c");
+            check.addArg(source);
+            check.expectExitCode(1);
+            check.expectStdOutEqual("");
+            check.expectStdErrMatch(b.fmt("{s}:", .{source}));
+            check.expectStdErrMatch(case.diagnostic);
+            test_step.dependOn(&check.step);
+        }
+    }
+}
+
 fn addPrintingCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
     _ = fixtures.add("printing.nov", @embedFile("examples/printing.nov"));
@@ -4724,7 +4796,7 @@ fn addImportCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *st
         .{ .name = "missing import", .args = &.{ "check", "--semantic", "missing.nov" }, .code = 1, .diagnostic = "cannot load imported source: FileNotFound" },
         .{ .name = "missing import buffers C", .args = &.{ "emit-c", "missing.nov" }, .code = 1, .diagnostic = "cannot load imported source" },
         .{ .name = "legal namespace cycle", .args = &.{ "check", "--semantic", "cycle/a.nov" }, .code = 0 },
-        .{ .name = "cross-module value cycle", .args = &.{ "emit-c", "value-cycle/a.nov" }, .code = 1, .diagnostic = "dependency analysis for this expression is not implemented yet" },
+        .{ .name = "cross-module value cycle", .args = &.{ "emit-c", "value-cycle/a.nov" }, .code = 1, .diagnostic = "cyclic value dependency" },
         .{ .name = "cross-module type alias cycle", .args = &.{ "emit-c", "type-cycle/a.nov" }, .code = 1, .diagnostic = "cyclic type alias dependency" },
         .{ .name = "cyclic module private value", .args = &.{ "emit-c", "mutual/private-value.nov" }, .code = 1, .diagnostic = "private-value.nov:2:" },
         .{ .name = "cyclic module private type", .args = &.{ "emit-c", "mutual/private-type.nov" }, .code = 1, .diagnostic = "private-type.nov:2:" },

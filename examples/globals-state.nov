@@ -1,0 +1,18 @@
+; Shared module storage; declarations are private unless marked public.
+
+@[public]
+let Counter = struct {
+    value: int,
+    samples: []int,
+}
+
+@[public]
+let mut count: int = 2
+
+@[public]
+let mut counter = Counter.[ value = 3, samples = [4, 5] ]
+
+let mut secret: int = 7
+
+@[public]
+let readSecret: () -> int = secret

@@ -3,6 +3,7 @@ const TestAllocations = @import("TestAllocations.zig");
 const Diagnostics = @import("Diagnostics.zig");
 const Module = @import("Module.zig");
 const Ast = @import("Ast.zig");
+const Literal = @import("Literal.zig");
 const isPrimitive = @import("primitives.zig").isPrimitive;
 const Dependencies = @This();
 
@@ -83,7 +84,7 @@ fn scanInitializer(self: *Dependencies, module: *Module, id: Module.DeclId, work
     }
     // A named function declaration creates a function value; its body is not
     // evaluated while creating it. Signatures and bodies are checked later.
-    if (ast.declFunction(declaration.node) != null) return;
+    if (!full.ast.is_mutable and ast.declFunction(declaration.node) != null) return;
     work.clearRetainingCapacity();
     try work.append(self.allocator, full.ast.init_node);
     while (work.pop()) |node| {
@@ -91,7 +92,30 @@ fn scanInitializer(self: *Dependencies, module: *Module, id: Module.DeclId, work
         const data = ast.nodes.items(.data)[node];
         const span = module.tokenSpan(ast.nodes.items(.main_token)[node]);
         switch (tag) {
-            .number_literal, .char_literal, .string_literal, .enum_literal => {},
+            .number_literal, .char_literal, .enum_literal, .function_expr => {},
+            .string_literal => {
+                if (Literal.hasInterpolation(ast.tokenSlice(ast.nodes.items(.main_token)[node]))) {
+                    try module.diagnostics.append(self.allocator, .{ .tag = .unsupported_global_interpolation, .span = span });
+                    entry.state = .failed;
+                }
+            },
+            .struct_init, .container_decl_arg => {
+                for (ast.fullStructInit(node).?.fields) |field| {
+                    const value = if (ast.nodes.items(.tag)[field] == .container_field) ast.nodes.items(.data)[field].rhs else field;
+                    if (value != 0) try work.append(self.allocator, value);
+                }
+            },
+            .array_init, .array_init_comma => try work.appendSlice(self.allocator, ast.extra_data[data.lhs..data.rhs]),
+            .slice => {
+                const slice = ast.slice(node).ast;
+                try work.append(self.allocator, slice.sliced);
+                if (slice.start != 0) try work.append(self.allocator, slice.start);
+                if (slice.end != 0) try work.append(self.allocator, slice.end);
+            },
+            .array_init_two, .array_init_two_comma => {
+                if (data.lhs != 0) try work.append(self.allocator, data.lhs);
+                if (data.rhs != 0) try work.append(self.allocator, data.rhs);
+            },
             .field_access => {
                 const base = data.lhs;
                 // A qualified type names an enum literal without reading a
@@ -104,10 +128,20 @@ fn scanInitializer(self: *Dependencies, module: *Module, id: Module.DeclId, work
                     const target = module.lookup(ast.tokenSlice(ast.nodes.items(.main_token)[base])) orelse break :blk null;
                     break :blk module.getDeclaration(target);
                 } else null;
-                if (qualifier == null or !qualifier.?.is_type_alias or qualifier.?.is_namespace) {
-                    try module.diagnostics.append(self.allocator, .{ .tag = .unsupported_dependency_expression, .span = span });
-                    entry.state = .failed;
+                if (module.compilation) |comp| {
+                    if (comp.reference(module, node)) |ref| {
+                        const owner = comp.getModule(ref.source).?;
+                        const target = owner.getDeclaration(ref.local).?;
+                        if (owner.source.ast.decl(target.node).ast.is_mutable) {
+                            try module.diagnostics.append(self.allocator, .{ .tag = .unsupported_global_initializer, .span = span, .related = target.name_span });
+                            entry.state = .failed;
+                        } else if (ref.source == module.source.id) {
+                            try self.edges.append(self.allocator, .{ .target = ref.local, .span = span });
+                        }
+                        continue;
+                    }
                 }
+                if (qualifier == null or !qualifier.?.is_type_alias or qualifier.?.is_namespace) try work.append(self.allocator, base);
             },
             .call, .call_one, .call_comma, .call_one_comma => {
                 const call = ast.fullCall(node).?;
@@ -128,7 +162,11 @@ fn scanInitializer(self: *Dependencies, module: *Module, id: Module.DeclId, work
                     try module.diagnostics.append(self.allocator, .{ .tag = .unsupported_name, .span = span });
                     entry.state = .failed;
                 } else if (module.lookup(name)) |target| {
-                    try self.edges.append(self.allocator, .{ .target = target, .span = span });
+                    const target_decl = module.getDeclaration(target).?;
+                    if (ast.decl(target_decl.node).ast.is_mutable) {
+                        try module.diagnostics.append(self.allocator, .{ .tag = .unsupported_global_initializer, .span = span, .related = target_decl.name_span });
+                        entry.state = .failed;
+                    } else try self.edges.append(self.allocator, .{ .target = target, .span = span });
                 } else if (!isPrimitive(name)) {
                     try module.diagnostics.append(self.allocator, .{ .tag = .unknown_name, .span = span });
                     entry.state = .failed;
@@ -151,9 +189,13 @@ fn scanInitializer(self: *Dependencies, module: *Module, id: Module.DeclId, work
             .bit_and,
             .bit_xor,
             .bit_or,
+            .bool_and,
+            .bool_or,
+            .range,
+            .array_access,
             => {
-                try work.append(self.allocator, data.rhs);
-                try work.append(self.allocator, data.lhs);
+                if (data.rhs != 0) try work.append(self.allocator, data.rhs);
+                if (data.lhs != 0) try work.append(self.allocator, data.lhs);
             },
             .block, .block_two, .block_newline, .block_two_newline => {
                 var buffer: [2]Ast.Node.Index = undefined;
@@ -162,7 +204,7 @@ fn scanInitializer(self: *Dependencies, module: *Module, id: Module.DeclId, work
                 for (block.ast.statements) |statement| {
                     if (ast.nodes.items(.tag)[statement] == .decl) has_declarations = true;
                 }
-                if (has_declarations) {
+                if (has_declarations or block.ast.statements.len != 1 or ast.firstToken(node) != block.ast.lbrace) {
                     // Do not resolve local names as module names before lexical
                     // scope rules are implemented.
                     try module.diagnostics.append(self.allocator, .{ .tag = .unsupported_dependency_expression, .span = span });
@@ -341,9 +383,8 @@ test "function bodies are not eager value dependencies" {
 test "unsupported eager expressions are diagnosed rather than hiding dependencies" {
     for ([_][]const u8{
         "let value = f()\nlet f: () -> i32 = value",
-        "let value = [value]",
         "let value = {\nlet local = 1\nlocal\n}",
-        "let value = false and value",
+        "let value = {1\n2}",
     }) |source| {
         var module = try Module.init(std.testing.allocator, "unsupported.nov", source);
         defer module.deinit();
@@ -358,6 +399,43 @@ test "unsupported eager expressions are diagnosed rather than hiding dependencie
     var result = try analyze(&module);
     defer result.deinit();
     try std.testing.expectEqual(Module.Diagnostic.Tag.missing_initializer, module.diagnostics.items[0].tag);
+}
+
+test "aggregate constructors and mutable function literals collect only eager operands" {
+    const source =
+        "let R=struct{values:[]int,callback:()->int,}\n" ++
+        "let U=union{some:R,none,}\n" ++
+        "let named:()->int=7\n" ++
+        "let mut callback:()->int=()->int{named()}\n" ++
+        "let record:R=R.[values=[1,2],callback=named]\n" ++
+        "let wrapped:U=U.some[record]\n" ++
+        "let bounds=0..3\n" ++
+        "let pair=.[record,wrapped]";
+    var module = try Module.init(std.testing.allocator, "global-constructors.nov", source);
+    defer module.deinit();
+    var result = try analyze(&module);
+    defer result.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expectEqual(@as(usize, 0), result.getEdges(module.lookup("callback").?).?.len);
+    try std.testing.expectEqual(@as(usize, 2), result.getEdges(module.lookup("pair").?).?.len);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+}
+
+test "global aggregate and short circuit dependencies retain cycles and reject mutable data" {
+    for ([_][]const u8{ "let value = [value]", "let value = false and value", "let value = .[item = value]" }) |source| {
+        var module = try Module.init(std.testing.allocator, "global-cycle.nov", source);
+        defer module.deinit();
+        var result = try analyze(&module);
+        defer result.deinit();
+        try std.testing.expectEqual(Module.Diagnostic.Tag.value_cycle, module.diagnostics.items[0].tag);
+    }
+    const source = "let mut source = 1\nlet aggregate = .[item = source]";
+    var module = try Module.init(std.testing.allocator, "global-read.nov", source);
+    defer module.deinit();
+    var result = try analyze(&module);
+    defer result.deinit();
+    try std.testing.expectEqual(Module.Diagnostic.Tag.unsupported_global_initializer, module.diagnostics.items[0].tag);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
 }
 
 test "dependency cycle diagnostics render the use and declaration locations" {

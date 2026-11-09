@@ -46,14 +46,14 @@ locals (explicitly typed or inferred from their initializer) and blocks
 with final-expression results are supported in function bodies. Immutable module-level
 [type aliases](#type-aliases) name existing canonical types. Unconstrained integer
 literals default to signed pointer-sized `int` after contextual inference;
-shadowing and global mutation remain deferred or unsupported. Direct range
+shadowing remains unsupported. Mutable globals support ordinary storable types. Direct range
 literal bounds retain their dedicated native `uint`/`int` rule (see [Range](#range)).
 Lowering produces typed operations with source spans, ordered operands/call
 arguments, explicit returns, and structured regions for boolean `and`/`or`,
 `if`/`else`, scalar `match`, and condition-based or unconditional loops with optional continuation
 clauses, value-carrying breaks, and conditional/range-loop exhaustion (`else`) results.
-It requires immutable literal globals; unit/global block initializers are
-not lowered yet. An internal C11 backend emits verified IR, including fixed-width
+Global initializers must be compile-time-known data; runtime calls and reads of
+mutable globals are forbidden. Global `void` values remain unsupported. An internal C11 backend emits verified IR, including fixed-width
 integer arithmetic and program entrypoint emission through `emit-c`.
 `@print`/`@println` support booleans, runes, strings, inferred or explicitly typed integers
 (including `int`/`uint`), `f32`/`f64`, and default structural formatting for printable arrays,
@@ -67,10 +67,10 @@ semantic/lowering subset. It runs declaration collection, initializer dependency
 analysis, annotation/literal and function-body checking, then typed lowering and
 IR verification. Source errors and unsupported/deferred forms fail with source
 diagnostics (including related notes where available); recovered syntax errors
-stop semantic analysis. Runtime globals must be immutable scalar constants: explicitly
-typed integer/float/boolean/rune/string literals, inferred integer/float (including literal
-negation), boolean, rune or plain UTF-8 string literals, or scalar literals
-explicitly contextualized with `@as(T, literal)`.
+stop semantic analysis. Immutable and mutable globals support ordinary storable
+types with compile-time-known data initializers (see [Globals](#globals)).
+Initializers may construct aggregates and use immutable data dependencies, but
+cannot call user code or read mutable global storage.
 Immutable module-level type aliases are also supported. Functions need supported signatures (explicit or inferable) and bounded
 expression bodies (including forward/recursive calls, local declarations and
 assignments, nested blocks, boolean short-circuiting, `if`/`else`, explicit returns,
@@ -78,9 +78,8 @@ bounded integer range loops, condition-based or unconditional loops with continu
 `break`/`continue`, value-producing unconditional, conditional-with-`else`, or range-with-`else` loops,
 and empty void bodies).
 Bare integer globals default to `int` when no explicit type context is supplied.
-Mutable globals, general nonliteral global initializers and global unit
-values are currently rejected, along with the other
-unsupported forms listed above. This is not a backend compatibility check: it
+Runtime global initialization, global references/borrows and global unit values
+are rejected, along with the other unsupported forms listed above. This is not a backend compatibility check: it
 does not emit C, validate C integer widths, require `main`, build, or execute a
 program. Each input file is checked independently; any failed/unreadable input
 makes the command fail, without modifying files.
@@ -383,7 +382,7 @@ and labels remain unsupported. Mutable locals use `let mut` and support
 existing storable runtime values (not `void`). Direct
 identifier assignment (`n = value`), numeric `+=`, `-=`, `*=`, `/=`, and integer-only `%=`
 return `void`; a block ending in assignment therefore also returns `void`.
-Assignments require a mutable local, not a parameter or global. RHS types must
+Assignments require a mutable local or global, not a parameter. RHS types must
 match exactly, without implicit numeric conversions. Compound assignments read
 the old local value before evaluating the RHS, then apply the existing
 integer wrapping/division or IEEE float rules and store once. RHS effects can update the same local;
@@ -393,7 +392,7 @@ before the local is visible; each later read captures its current value. Updates
 to outer locals persist across selected conditional branches and short-circuit
 RHS regions; skipped regions do not read or write their locals. Slots remain
 lexically scoped and separate sibling blocks may reuse names.
-Global block initializers remain unsupported by lowering.
+Global initializers are restricted to compile-time-known data, not arbitrary blocks of runtime code.
 
 Boolean `and`/`or` evaluate the left operand exactly once, then evaluate the right
 operand only when needed (`and`: left is true; `or`: left is false). Both operands
@@ -621,7 +620,7 @@ continuations are preserved; no grouping parentheses are invented.
 This is syntax formatting, not semantic validation: existing literal/bitwise/shift
 formatting does not make those forms executable. Array formatting does not check
 expected literal types, scope, mutability, or whether a base is an array; it does
-not enable array globals or new language semantics. Other members, `.len` writes,
+not extend global initialization rules or add new language semantics. Other members, `.len` writes,
 indexed compound stores and stores through computed bases remain unsupported.
 Array slicing, general pointers (beyond bounded local references), other unsupported
 memory/container forms, labels, iterator/other unsupported loop forms, attributes, quoted identifiers,
@@ -1179,8 +1178,8 @@ The delivered subset is deliberately bounded:
   explicit `Type.method` remains an ordinary unbound function value. Concrete
   generic union instances support these same method calls. Methods with their own
   backtick variables use the bounded instance inference described above.
-  Container constants, nested type declarations, general type values,
-  struct global instances and C FFI are unsupported.
+  Container constants, nested type declarations, general type values
+  and general C FFI layouts are unsupported. Struct globals support data-only initialization.
 - Function fields use ordinary call syntax: `item.callback(args...)`, with no
   implicit receiver argument. The receiver expression and selected function value
   evaluate once before arguments; replacing that field while evaluating an
@@ -1393,8 +1392,8 @@ checked semantically through 128 bits, while reachable C layouts require
   hold functions, unions and ranges under the same storage/copy rules. See
   [`examples/value-payloads.nov`](examples/value-payloads.nov).
 - Explicit tag enums, reference payloads, variant-pattern
-  alternatives, nested destructuring, direct payload field access, union equality
-  and union globals remain unsupported.
+  alternatives, nested destructuring, direct payload field access and union equality
+  remain unsupported. Union globals support data-only initialization.
 
 The examples below describe broader design, not additional implemented features.
 
@@ -2001,7 +2000,7 @@ let main: () -> void = {
 - `.len` writes are explicitly rejected: shrinking and especially initialization
   on length growth remain undesigned. No array equality, concatenation
   with `+`, slices, pointer elements, general aliases,
-  array globals, or capacity API is delivered. Bounded value/reference iteration is
+  or capacity API is delivered. Array globals support data-only initialization. Bounded value/reference iteration is
   supported (see [Loop](#loop)). The formatter supports
   the array syntax described above without extending these semantics.
   Arrays print/interpolate as `[a, b]` when their elements are recursively
@@ -2328,7 +2327,7 @@ let main: () = {
   results can carry ranges, including mixed inclusive/exclusive branches. No new
   dedicated range type syntax is provided; use a type query such as
   `let Interval = @TypeOf(0..1)` for exact range annotations in parameters, returns
-  and struct fields or union payloads. Range globals remain unsupported. Arrays can
+  and struct fields or union payloads. Range globals support data-only initialization. Arrays can
   infer range elements, for example `[0..3, 1..=2]`; their bounds and inclusivity
   copy by value with exact endpoint typing and the bound inference rules below.
   Range field access, equality, membership and direct printing are not introduced.
@@ -2667,7 +2666,7 @@ let x = {y = 3} ; should be fine, @TypeOf(x) == void
 let z += 3 ; compile error, expected `=`
 ```
 
-## Scalar Constant Globals
+## Globals
 
 Immutable module bindings infer `bool` from `true`/`false`, `rune` from single-quoted
 scalar literals and `string` from plain UTF-8 string literals. Integer literals
@@ -2682,7 +2681,7 @@ let Count = uint
 let main: () -> void = @println("{label} {count}", enabled)
 ```
 
-These are owned constants, inlined at use sites, not runtime initialization code.
+Immutable scalar literals are owned constants, inlined at use sites, not user runtime initialization code.
 Forward type aliases work in `@as`; nested ascriptions must have exactly the same
 canonical type, including an explicit declaration annotation when present:
 `let count: Count = @as(uint, 8)` works, while `let n: uint = @as(int, 1)`
@@ -2690,16 +2689,54 @@ and `@as(int, @as(uint, 1))` are errors, not conversions. Literal
 bounds remain exact, including native `int`/`uint`; explicit 128-bit constants
 can type-check but retain the C backend's width rejection.
 
-`let count = 8` and `let negative = -8` infer `int`; negation also accepts literal
-brace grouping, as in `-{{8}}`. This is still literal-only inference, not compile-time
-evaluation: identifier value chains, arithmetic, standalone blocks such as `{8}`,
-calls, function values, arrays and void globals remain unsupported, even under `@as`. Existing explicitly annotated literal globals are unchanged.
-Interpolated strings still require a function; plain literals support UTF-8,
-escaped braces and embedded NUL. Mutable globals remain unsupported. Type
-ascriptions inside function bodies retain their existing expression semantics.
+`let count = 8` and `let negative = -8` infer `int`; float literals default to
+`float`. Both immutable `let` and mutable `let mut` globals support ordinary
+storable types: booleans, runes, integers, floats, strings, enums, structs,
+unions (including Option/Result), arrays, concrete functions/closures and ranges.
+Existing exact typing, recursive value-copy rules and C backend width limits apply.
+Global `void`, reference storage and borrowing globals are not supported: neither
+`&global` nor `&globalArray[index]` is a local borrow, including through imports.
 
-See [examples/type-aliases.nov](examples/type-aliases.nov) for globals together
-with aliases, array locals and an exhaustive boolean match.
+Source initializers must be **compile-time-known data**. Literals, immutable data
+dependencies, supported constant operations and aggregate constructors can build
+that data. A function value may be stored without calling it; a closure body may
+read mutable globals when invoked later. Initializers cannot call user/runtime
+functions or read mutable globals, even if those globals have literal initializers.
+This is not arbitrary compile-time execution. Compiler-generated startup code may
+allocate and recursively copy known aggregates; it does not run user initialization
+logic. Put runtime initialization in `main` or a function called from it.
+Interpolated strings still require a function; plain literals support UTF-8,
+escaped braces and embedded NUL.
+
+```nov
+let seed = 4
+let mut count = seed * 2
+let mut values: []int = [1, 2]
+let read: () -> int = count
+let main: () = {
+    count += 1
+    values[0] = count
+    @println(read(), values)
+}
+```
+
+Globals are file-private by default. Mark a binding `@[public]` to expose it to
+importers; a public mutable binding permits qualified writes such as
+`state.count = 10` and `state.count += 1`. Struct field paths and supported array
+element mutation work on mutable globals, including public imported storage.
+Imports resolving to the same source share that storage. Immutable bindings remain
+nonassignable. Closures read global storage live at call time, rather than
+capturing a snapshot; copy a global into an immutable local first if a snapshot is
+wanted. None of this enables borrowing globals or extends the existing supported
+field/index assignment forms.
+
+See [examples/globals.nov](examples/globals.nov) and its imported
+[globals-state.nov](examples/globals-state.nov) for mutation, aggregate copies,
+closure live reads and runtime initialization in `main`.
+Run `zig build test-cli-globals` for exact-output CLI checks in default, debug and
+release modes, plus initializer, visibility, mutability and no-borrow rejection tests.
+[examples/type-aliases.nov](examples/type-aliases.nov) also combines scalar constants
+with aliases and an exhaustive boolean match.
 
 ## Type Aliases
 
@@ -2745,8 +2782,8 @@ Only plain immutable module declarations `let Name = typeExpression` define
 aliases. They share the existing module namespace: duplicates and implicit
 shadowing are rejected. An identifier RHS names a type only when its target is a
 type (or a type position demands resolution and reports a type error); aliases
-of runtime values do not become types. Scalar literal globals infer independently;
-identifier-chain global initialization remains unsupported. Unknown identifier RHSs without type context are diagnosed as
+of runtime values do not become types. Value globals infer independently;
+immutable data dependencies can initialize other globals, but mutable-global reads cannot. Unknown identifier RHSs without type context are diagnosed as
 unknown names, not assumed to be function types. Identifier-only cycles with no
 type context remain value-dependency errors; a type annotation or `@as` demand
 classifies the same candidates as attempted aliases and reports type-alias cycles.
@@ -3166,10 +3203,10 @@ scalar value, including function calls; use `\{` and `\}` for literal braces.
 NUL, with the same spaces, buffering, checked writes/final flush and panic behavior
 as scalars. Windows stdout is switched to binary mode on the first print to avoid
 newline translation; this is UTF-8 byte output, not UTF-16 console conversion.
-Literal-only immutable globals with explicit `string` annotations are supported
-without eager initialization calls; inferred plain string globals also work. Mutable
-globals and global concatenation or calls remain unsupported. Global interpolation is also rejected as nonliteral;
-move it into a function.
+Immutable and mutable string globals support explicit `string` annotations or
+inference from plain literals, under the same compile-time-known data rules as
+other globals. Initializers cannot call runtime functions or read mutable globals.
+Global interpolation remains rejected; move it into a function.
 
 ```nov
 let prefix: string = "Hello"

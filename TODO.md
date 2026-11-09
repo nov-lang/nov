@@ -281,7 +281,7 @@ and `examples/type-of.nov` / `examples/type-of-expressions.nov`. Broader reflect
 (`@typeInfo`, member enumeration) remains a proposal, not delivered functionality.
 
 Integer literals now default to signed pointer-sized `int` only after contextual
-inference in `BodyChecker`/`GenericFunctions` and literal-only global `Sema`.
+inference in function bodies and global data initializers.
 Annotations, call signatures, typed sibling operands/array elements/control branches,
 and generic expected-result/body/argument constraints win before fallback. Bare
 locals (`let n = 1`), negation, arithmetic, printing/interpolation
@@ -293,9 +293,10 @@ native `int` bounds diagnose unless a fitting explicit type such as `u64`/`i128`
 is supplied (128-bit backend limits remain). Float literals use their own late
 native `float` fallback, never `int`. Direct nonnegative literal range bounds retain dedicated `uint`
 defaulting; otherwise unconstrained numeric-expression bounds use `int`, with typed
-bounds taking precedence. Global initializers remain literal-only: no computation,
-value chains or array globals are added. Literal negation may group its operand
-(`-{{1}}`); standalone block initializers remain unsupported.
+bounds taking precedence. Globals now accept compile-time-known data, including
+immutable value dependencies, supported constant operations and aggregates.
+Literal negation may group its operand (`-{{1}}`); arbitrary runtime initialization
+remains unsupported.
 
 `std.array.map`, `filter` and `fold` are implemented in `lib/array.nov`,
 publicly re-exported as the `std.array` namespace by
@@ -542,7 +543,7 @@ empty reversed ranges and inclusive-MAX exhaustion remain unchanged. Otherwise
 unconstrained numeric-expression bounds now use int after typed-bound inference. No allocation.
 Inferred arrays of ranges work, copying bounds/inclusivity by value. No new range
 annotation syntax is added, but @TypeOf(0..1) can name an exact range type for
-signatures, struct fields and union payloads. Globals, field attributes,
+signatures, struct fields, union payloads and data-only globals. Field attributes,
 printing/equality/membership and general iterator protocols remain unsupported.
 See examples/range-values.nov. Chained ranges diagnose; slice/match syntax preserved.
 
@@ -772,8 +773,9 @@ argument-free `@[public]` on immutable supported declarations is accepted;
 declarations and methods are otherwise file-private under both import forms.
 `@[private]` is unsupported. Explicit C export annotations are separate from Nov
 visibility. C value layouts/root frames retain every string owner in
-parameters, temporaries, local slots and control-flow merges. Record globals,
-container constants/types and FFI remain deferred. Nested structs, array fields and record
+parameters, temporaries, local slots, global storage and control-flow merges.
+Record globals support data-only initialization; container constants/types and
+general C FFI layouts remain deferred. Nested structs, array fields and record
 arrays are delivered under the recursive value-copy rules above. See README's executable struct
 contract; the older broader syntax examples below are not delivery claims.
 
@@ -785,20 +787,28 @@ bitwise compound assignments and computed match patterns remain unsupported.
 See README's integer section for the executable contract; proposals below are
 not an implementation checklist.
 
-Bounded immutable global inference: bool, rune and plain UTF-8 string literals infer
-canonical types; integer literals and literal negation default to `int` unless an
-annotation or `@as(T, literal)` provides an explicit type.
-Nested scalar ascriptions require exact canonical types (including forward type
-aliases and any explicit declaration annotation), with checked literal bounds and
-no runtime conversion. Constants own
-string bytes and inline at use sites. Literal negation permits grouped operands
-such as `-{{42}}`; identifier value chains, computation, standalone blocks,
-eager calls, arrays, void/function values,
-mutable globals and global interpolation remain unsupported. Existing annotated
-globals and body/control-flow ascriptions are unchanged.
+Immutable and mutable globals support all ordinary storable types: scalars,
+strings, enums, structs, unions/Option/Result, arrays, concrete functions/closures
+and ranges. Initializers are compile-time-known data only, including immutable
+value dependencies, supported constant operations and aggregate construction.
+Runtime/user calls and mutable-global reads in initializers are forbidden.
+Compiler-generated startup allocation/copying of known aggregates is acceptable;
+user runtime initialization belongs in `main`. Global void/reference storage and
+borrowing globals (including imported globals and array elements) remain unsupported.
+
+Globals remain file-private by default; `@[public]` mutable storage supports
+qualified assignment/compound assignment and the existing field/array mutation
+forms. Canonical imports share storage. Closures read globals live rather than
+capturing snapshots; ordinary local copies retain value-copy semantics.
+Literal inference, exact `@as` typing and backend integer-width restrictions are
+unchanged; immutable scalar literals can still inline at use sites.
+`examples/globals.nov` and `examples/globals-state.nov` demonstrate the contract.
+`zig build test-cli-globals` checks exact run/test output in default/debug/release
+modes, syntax/semantic checking, and rejection of runtime initialization,
+mutable-global initializer reads, private/immutable writes and global borrows.
 
 Explicit expression type context: `@as(T, value)` is implemented in function
-bodies, including interpolation, and for the bounded scalar globals above. It checks exact canonical types and contextual
+bodies, including interpolation, and for supported global data initializers. It checks exact canonical types and contextual
 literal bounds without a runtime conversion or additional array-copy boundary.
 Numeric conversions, widening, signedness changes and general type values still
 need language-design decisions; `@as` does not choose those semantics.

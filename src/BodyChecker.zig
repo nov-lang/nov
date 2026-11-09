@@ -38,6 +38,7 @@ const Binding = struct {
     index: u32 = 0,
     initializer: ?Ast.Node.Index = null,
     mutable: bool = false,
+    global: bool = false,
     slot: ?Ir.ValueId = null,
     value: ?Ir.ValueId = null,
     name_span: Module.Span,
@@ -98,6 +99,42 @@ pub fn lower(module: *Module, ir: *Ir, types: []const ?Ir.TypeId, constants: []c
     }
     try ir.setFunctionBody(function, emitter.instructions.items, result);
     return true;
+}
+
+pub fn checkGlobalInitializer(module: *Module, sema: *Sema, id: Module.DeclId) Error!?Ir.TypeId {
+    return globalInitializer(module, &sema.ir, &.{}, id, null, sema);
+}
+
+pub fn lowerGlobalInitializer(module: *Module, ir: *Ir, types: []const ?Ir.TypeId, constants: []const ?Ir.ConstId, functions: []const ?Ir.FunctionId, id: Module.DeclId, initializer: Ir.FunctionId) Error!bool {
+    if (constants.len != types.len or functions.len != types.len) return error.InvalidFunctionId;
+    var arena = std.heap.ArenaAllocator.init(module.allocator);
+    defer arena.deinit();
+    var emitter: Emitter = .{ .allocator = arena.allocator(), .constants = constants, .functions = functions };
+    if (try globalInitializer(module, ir, types, id, &emitter, null) == null) return false;
+    const node = module.source.ast.decl(module.getDeclaration(id).?.node).ast.init_node;
+    try ir.setFunctionBody(initializer, emitter.instructions.items, try emitter.value(node));
+    return true;
+}
+
+// GlobalInitializers validates and orders the data-only initializer graph before
+// this walk. Reuse ordinary expression typing and value-copy semantics here.
+fn globalInitializer(module: *Module, ir: *Ir, types: []const ?Ir.TypeId, id: Module.DeclId, emitter: ?*Emitter, sema: ?*Sema) Error!?Ir.TypeId {
+    const declaration = module.getDeclaration(id) orelse return error.InvalidGlobal;
+    const full = module.source.ast.decl(declaration.node).ast;
+    var arena = std.heap.ArenaAllocator.init(module.allocator);
+    defer arena.deinit();
+    var context: Context = .{ .module = module, .ir = ir, .types = types, .emitter = emitter, .sema = sema, .template_allocator = arena.allocator(), .return_type = .{ .ty = try ir.internType(.void) } };
+    defer context.bindings.deinit(module.allocator);
+    defer context.locals.deinit(module.allocator);
+    if (full.init_node == 0) return context.fail(.missing_initializer, declaration.node, null);
+    const expected: ?Known = if (emitter != null) .{ .ty = types[tableIndex(module, id)].? } else if (full.type_node != 0) .{
+        .ty = (try context.resolveType(full.type_node)) orelse return null,
+        .annotation = module.tokenSpan(module.source.ast.firstToken(full.type_node)),
+    } else null;
+    const ty = (try context.expression(full.init_node, expected, 0)) orelse return null;
+    if (!Ir.isArrayElement(ir.getType(ty).?)) return context.fail(.unsupported_global_initializer, full.init_node, null);
+    try context.copyNode(full.init_node, ty);
+    return ty;
 }
 
 fn tableIndex(module: *const Module, id: Module.DeclId) usize {
@@ -1552,6 +1589,33 @@ const Context = struct {
             if (ty != want.ty) return self.fail(.expression_type_mismatch, node, want.annotation);
         }
         return ty;
+    }
+
+    fn globalId(self: *Context, id: Module.DeclId) ?Ir.GlobalId {
+        const name_span = self.getDeclaration(id).name_span;
+        for (self.ir.globals.items, 0..) |global, index| {
+            if (global.span.source == name_span.source and global.span.start == name_span.start) return @fromBackingInt(@intCast(index));
+        }
+        return null;
+    }
+
+    fn storageBinding(self: *Context, node: Ast.Node.Index) Error!?Binding {
+        const ast = &self.module.source.ast;
+        const tag = ast.nodes.items(.tag)[node];
+        if (tag == .deref) return self.dereferenceBinding(node);
+        const id = if (tag == .identifier) blk: {
+            const name = ast.tokenSlice(ast.firstToken(node));
+            if (try self.captureBinding(name, node)) |binding| return binding;
+            break :blk self.valueDeclaration(name) orelse return null;
+        } else if (tag == .field_access) (try self.staticMethod(node)) orelse return null else return null;
+        const declaration = self.getDeclaration(id);
+        const owner = self.declarationModule(id);
+        const known = (try self.globalType(id)) orelse return null;
+        var binding: Binding = .{ .known = known, .name_span = declaration.name_span, .mutable = owner.source.ast.decl(declaration.node).ast.is_mutable, .global = true };
+        if (self.emitter) |emitter| {
+            if (self.globalId(id)) |global| binding.slot = try emitter.append(known.ty, self.irSpan(node), .{ .global_slot = global });
+        }
+        return binding;
     }
 
     fn globalType(self: *Context, id: Module.DeclId) Error!?Known {
@@ -3141,6 +3205,7 @@ const Context = struct {
             .array_access => .{ .array_index = .{ .array = try emitter.value(data.lhs), .index = try emitter.value(data.rhs) } },
             .field_access => blk: {
                 if (try self.staticMethod(node)) |id| {
+                    if (self.globalId(id)) |global| break :blk .{ .local_load = try emitter.append(ty, self.irSpan(node), .{ .global_slot = global }) };
                     if (emitter.functions[@backingInt(id)]) |function| break :blk .{ .function_ref = function };
                     if (emitter.constants[@backingInt(id)]) |constant| break :blk .{ .constant = constant };
                     return error.InvalidFunctionId;
@@ -3168,6 +3233,7 @@ const Context = struct {
                     break :blk .{ .parameter = binding.index };
                 }
                 const id = self.valueDeclaration(name) orelse return error.InvalidFunctionId;
+                if (self.globalId(id)) |global| break :blk .{ .local_load = try emitter.append(ty, self.irSpan(node), .{ .global_slot = global }) };
                 if (emitter.functions[@backingInt(id)]) |function| break :blk .{ .function_ref = function };
                 if (emitter.constants[@backingInt(id)]) |constant| break :blk .{ .constant = constant };
                 _ = try self.fail(.unsupported_lowering, node, null);
@@ -3253,21 +3319,17 @@ const Context = struct {
         var path_nodes: [Ir.max_record_depth]Ast.Node.Index = undefined;
         var path_len: usize = 0;
         var root = target.lhs;
-        while (ast.nodes.items(.tag)[root] == .field_access) {
+        while (ast.nodes.items(.tag)[root] == .field_access and try self.staticMethod(root) == null) {
             if (path_len == path_nodes.len) return self.fail(.record_layout_limit, data.lhs, null);
             path_nodes[path_len] = root;
             path_len += 1;
             root = ast.nodes.items(.data)[root].lhs;
         }
         const dereferenced = ast.nodes.items(.tag)[root] == .deref;
-        if (!dereferenced and ast.nodes.items(.tag)[root] != .identifier) return self.fail(.unsupported_assignment_target, data.lhs, null);
-        const binding_name = self.module.sourceSlice(self.span(root)).?;
-        const binding = (if (dereferenced) try self.dereferenceBinding(root) else try self.captureBinding(binding_name, root)) orelse {
-            if (self.module.lookup(binding_name)) |id| return self.fail(.immutable_assignment, target.lhs, self.module.getDeclaration(id).?.name_span);
-            return self.fail(.unknown_name, target.lhs, null);
-        };
+        const binding = (try self.storageBinding(root)) orelse return self.fail(if (ast.nodes.items(.tag)[root] == .identifier) .unknown_name else .unsupported_assignment_target, if (ast.nodes.items(.tag)[root] == .identifier) target.lhs else data.lhs, null);
         if (binding.borrowed and !dereferenced) return self.fail(.unsupported_borrow, root, binding.name_span);
         if (self.mutationOrigin(binding)) |origin| return self.fail(.borrow_conflict, root, origin);
+        if (binding.global and !binding.mutable) return self.fail(.immutable_assignment, target.lhs, binding.name_span);
         var record_id = binding.known.ty;
         var path: [Ir.max_record_depth]u32 = undefined;
         for (0..path_len) |p| {
@@ -3337,25 +3399,21 @@ const Context = struct {
         var root = target.lhs;
         var nodes: [Ir.max_record_depth]Ast.Node.Index = undefined;
         var path_len: usize = 0;
-        while (ast.nodes.items(.tag)[root] == .field_access) {
+        while (ast.nodes.items(.tag)[root] == .field_access and try self.staticMethod(root) == null) {
             if (path_len == nodes.len) return self.fail(.record_layout_limit, data.lhs, null);
             nodes[path_len] = root;
             path_len += 1;
             root = ast.nodes.items(.data)[root].lhs;
         }
         const dereferenced = ast.nodes.items(.tag)[root] == .deref;
-        if (!dereferenced and ast.nodes.items(.tag)[root] != .identifier) return self.fail(.unsupported_assignment_target, data.lhs, null);
-        const name = self.module.sourceSlice(self.span(root)).?;
-        const binding = (if (dereferenced) try self.dereferenceBinding(root) else try self.captureBinding(name, node)) orelse {
-            if (self.module.lookup(name)) |id| return self.fail(.immutable_assignment, target.lhs, self.module.getDeclaration(id).?.name_span);
-            return self.fail(.unknown_name, target.lhs, null);
-        };
+        const binding = (try self.storageBinding(root)) orelse return self.fail(if (ast.nodes.items(.tag)[root] == .identifier) .unknown_name else .unsupported_assignment_target, if (ast.nodes.items(.tag)[root] == .identifier) target.lhs else data.lhs, null);
         if (binding.borrowed and !dereferenced) return self.fail(.unsupported_borrow, root, binding.name_span);
         const reservation: Reservation = .{ .owner = if (binding.loan_owner) |loan| loan.owner else binding.name_span, .origin = if (binding.loan_owner) |loan| loan.origin else self.irSpan(node), .parent = self.reservation };
         const parent = self.reservation;
         if (binding.borrowed) self.reservation = try self.borrowReservations(binding, &reservation);
         defer self.reservation = parent;
         if (self.mutationOrigin(binding)) |origin| return self.fail(.borrow_conflict, target.lhs, origin);
+        if (binding.global and !binding.mutable) return self.fail(.immutable_assignment, target.lhs, binding.name_span);
         var array_id = binding.known.ty;
         var path: [Ir.max_record_depth]u32 = undefined;
         for (0..path_len) |p| {
@@ -4622,12 +4680,12 @@ const Context = struct {
                 return if (expected) |want| want.ty else unit;
             },
             .assign, .assign_add, .assign_sub, .assign_mul, .assign_div, .assign_mod => {
-                if (ast.nodes.items(.tag)[data.lhs] == .field_access) return self.fieldAssignment(node, expected, depth);
+                if (ast.nodes.items(.tag)[data.lhs] == .field_access and try self.staticMethod(data.lhs) == null) return self.fieldAssignment(node, expected, depth);
                 if (ast.nodes.items(.tag)[data.lhs] == .array_access) return self.elementAssignment(node, expected, depth);
                 const dereferenced = ast.nodes.items(.tag)[data.lhs] == .deref;
-                if (!dereferenced and ast.nodes.items(.tag)[data.lhs] != .identifier) return self.fail(.unsupported_assignment_target, data.lhs, null);
+                if (!dereferenced and ast.nodes.items(.tag)[data.lhs] != .identifier and ast.nodes.items(.tag)[data.lhs] != .field_access) return self.fail(.unsupported_assignment_target, data.lhs, null);
                 const name = self.module.sourceSlice(self.span(data.lhs)).?;
-                const binding = (if (dereferenced) try self.dereferenceBinding(data.lhs) else try self.captureBinding(name, node)) orelse {
+                const binding = (try self.storageBinding(data.lhs)) orelse {
                     if (self.module.lookup(name)) |id| return self.fail(.immutable_assignment, data.lhs, self.module.getDeclaration(id).?.name_span);
                     return self.fail(.unknown_name, data.lhs, null);
                 };
@@ -4963,6 +5021,131 @@ const Context = struct {
         }
     }
 };
+
+fn testGlobalStorage(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "global-storage.nov",
+        \\let R=struct{items:[]int,n:int,}
+        \\let mut count=1
+        \\let mut items=[1,2]
+        \\let mut record=R.[items=[3],n=4]
+        \\let one:()->int=1
+        \\let two:()->int=2
+        \\let mut callback:()->int=one
+        \\let mut text:string="a"+"b"
+        \\let main:()->int={
+        \\let read=()->int{count+callback()+items[0]+record.n}
+        \\count+=1
+        \\items[0]+=count
+        \\items+=[3]
+        \\record.n+=1
+        \\record.items[0]=2
+        \\callback=two
+        \\text+="c"
+        \\let query:@TypeOf({count=99
+        \\items[0]=99
+        \\record.n=99
+        \\callback=one})={}
+        \\read()}
+    );
+    defer module.deinit();
+    var result = try Lowering.lower(&module);
+    defer result.deinit();
+    if (module.hasErrors()) std.debug.print("global storage: {any}\n", .{module.diagnostics.items});
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(result.lowering_complete);
+    try result.ir.verify();
+    var globals: usize = 0;
+    var stores: usize = 0;
+    for (result.ir.functions.items) |function| {
+        const body = function.body orelse continue;
+        for (body.instructions) |instruction| switch (instruction.op) {
+            .global_slot => globals += 1,
+            .local_store, .field_store => stores += 1,
+            .capture_value, .capture_cell => return error.UnexpectedGlobalCapture,
+            else => {},
+        };
+    }
+    try std.testing.expect(globals >= 6);
+    try std.testing.expectEqual(@as(usize, 7), stores);
+}
+
+test "global storage mutations callbacks live closures and readonly TypeOf under OOM" {
+    try testGlobalStorage(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testGlobalStorage, .{});
+}
+
+fn testQualifiedGlobalStorage(allocator: std.mem.Allocator) !void {
+    var comp = Compilation.init(allocator);
+    defer comp.deinit();
+    const root = try comp.addSource("/globals/main.nov",
+        \\let lib=@import("lib.nov")
+        \\let main:()->int={
+        \\lib.count+=1
+        \\lib.items[0]=2
+        \\lib.record.n+=1
+        \\lib.record.items[0]+=1
+        \\lib.callback=lib.two
+        \\let query:@TypeOf({lib.count=99
+        \\lib.record.n=99
+        \\lib.items[0]=99})={}
+        \\let read=()->int{lib.count+lib.callback()+lib.record.items[0]}
+        \\read()}
+    );
+    const library = try comp.addSource("/globals/lib.nov",
+        \\let R=struct{n:int,items:[]int,}
+        \\@[public]
+        \\let mut count=1
+        \\@[public]
+        \\let mut items=[1]
+        \\@[public]
+        \\let mut record=R.[n=1,items=[1]]
+        \\@[public]
+        \\let two:()->int=2
+        \\@[public]
+        \\let mut callback:()->int=two
+    );
+    const module = comp.getModule(root).?;
+    const local = module.lookup("lib").?;
+    try comp.imports.append(allocator, .{ .declaration = comp.declaration_ids.get(.{ .source = root, .local = local }).?, .target = library, .named = false, .span = module.getDeclaration(local).?.name_span });
+
+    var result = try Lowering.lowerCompilation(&comp);
+    defer result.deinit();
+    if (comp.hasErrors()) for (comp.modules.items) |failed_module| std.debug.print("qualified globals: {any}\n", .{failed_module.diagnostics.items});
+    try std.testing.expect(!comp.hasErrors());
+    try std.testing.expect(result.lowering_complete);
+    try result.ir.verify();
+    var stores: usize = 0;
+    for (result.ir.functions.items) |function| {
+        for ((function.body orelse continue).instructions) |instruction| switch (instruction.op) {
+            .local_store, .field_store => stores += 1,
+            .capture_value, .capture_cell => return error.UnexpectedGlobalCapture,
+            else => {},
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 5), stores);
+}
+
+test "global storage qualified public mutations fields callbacks and TypeOf under OOM" {
+    try testQualifiedGlobalStorage(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testQualifiedGlobalStorage, .{});
+}
+
+test "global storage cannot be borrowed or assigned through immutable declarations" {
+    for ([_][]const u8{
+        "let mut g=1\nlet f:()={let r=&g\n}",
+        "let mut g=[1]\nlet f:()={let r=&g\n}",
+        "let g=[1]\nlet f:()={g[0]=2}",
+        "let g=1\nlet f:()={let v:@TypeOf({g=2})={}\n}",
+    }) |source| {
+        var module = try Module.init(std.testing.allocator, "global-storage-invalid.nov", source);
+        defer module.deinit();
+
+        var result = try Lowering.lower(&module);
+        defer result.deinit();
+        try std.testing.expect(module.hasErrors());
+        try std.testing.expect(!result.lowering_complete);
+    }
+}
 
 test "float bodies defaults contextual literals control flow mutations and printing" {
     const source =
@@ -7620,7 +7803,7 @@ test "string scalar elements remain immutable through mutable bindings and whole
     }
 }
 
-test "strings reject byte mutation ordering and eager globals" {
+test "strings reject byte mutation ordering and inexact operands" {
     for ([_][]const u8{
         "let f: () -> void = {let mut x = [\"a\"]\nx[0] += \"b\"}",
         "let f: () -> void = {let mut x = \"a\"\nx[0] = \"b\"}",
@@ -7630,9 +7813,6 @@ test "strings reject byte mutation ordering and eager globals" {
         "let f: () -> string = \"a\" - \"b\"",
         "let f: () -> string = 1 + \"b\"",
         "let f: () -> string = \"a\" + 1",
-        "let x: string = \"a\" + \"b\"",
-        "let mut x: string = \"a\"",
-        "let x = @as(string, \"a\" + \"b\")",
     }) |source| {
         var module = try Module.init(std.testing.allocator, "unsupported-string.nov", source);
         defer module.deinit();
@@ -8161,7 +8341,7 @@ test "constructor shorthand diagnoses ordinary names exact types and field spans
         .{ .source = "let R=struct{y:int,}\nlet f:(x:int)->R=R.[x]", .tag = .unknown_field },
         .{ .source = "let R=struct{x:int,}\nlet f:(x:int)->R=R.[x,x=2]", .tag = .duplicate_field },
         .{ .source = "let R=struct{x:int,}\nlet f:(x:int)->R=R.[x=2,x]", .tag = .duplicate_field },
-        .{ .source = "let R=struct{x:int,}\nlet x=[]\nlet f:()->R=R.[x]", .tag = .unresolved_value_type },
+        .{ .source = "let R=struct{x:int,}\nlet x=[]\nlet f:()->R=R.[x]", .tag = .array_literal_needs_type, .token = "[" },
         .{ .source = "let R=struct{x:int,}\nlet f:()->R={if true {let x:int=1\n}\nR.[x]}", .tag = .unknown_name },
         .{ .source = "let R=struct{x:int,let make:(self:@This())->R=R.[x]\n}\n", .tag = .unknown_name },
         .{ .source = "let R=struct{x:int,}\nlet f:(x:int)->R={let x:int=2\nR.[x]}", .tag = .unsupported_shadowing },
@@ -8606,7 +8786,7 @@ test "boolean expressions and comparisons infer operand literals from parameters
 }
 
 test "body errors identify mismatched returns operands names and calls" {
-    const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag };
+    const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag, status: Sema.Status = .failed };
     for ([_]Case{
         .{ .source = "let f: (value: bool) -> i32 = value", .tag = .expression_type_mismatch },
         .{ .source = "let f: () -> i32 = true", .tag = .literal_type_mismatch },
@@ -8621,7 +8801,7 @@ test "body errors identify mismatched returns operands names and calls" {
         .{ .source = "let target: (x: bool) -> bool = x\nlet f: () -> bool = target(1)", .tag = .literal_type_mismatch },
         .{ .source = "let target: (x: u8) -> u8 = x\nlet f: () -> u8 = target(256)", .tag = .literal_out_of_range },
         .{ .source = "let f: (n: int) -> bool = n < 2.5", .tag = .literal_type_mismatch },
-        .{ .source = "let value = []\nlet f: () -> i32 = value", .tag = .unresolved_value_type },
+        .{ .source = "let value = []\nlet f: () -> i32 = value", .tag = .array_literal_needs_type, .status = .signature_only },
         .{ .source = "let f: () -> i32 = {}", .tag = .expression_type_mismatch },
     }) |case| {
         var module = try Module.init(std.testing.allocator, "invalid.nov", case.source);
@@ -8630,7 +8810,12 @@ test "body errors identify mismatched returns operands names and calls" {
         defer sema.deinit();
         try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
         try std.testing.expectEqual(case.tag, module.diagnostics.items[0].tag);
-        try std.testing.expectEqual(Sema.Status.failed, sema.entries[sema.entries.len - 1].status);
+        try std.testing.expectEqual(case.status, sema.entries[sema.entries.len - 1].status);
+        if (case.status == .signature_only) {
+            // Global checking fails before the function body is requested.
+            try std.testing.expectEqual(Sema.Status.failed, sema.entries[0].status);
+            try std.testing.expectEqualStrings("[", module.sourceSlice(module.diagnostics.items[0].span).?);
+        }
         try sema.ir.verify();
     }
 }

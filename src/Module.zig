@@ -642,7 +642,7 @@ fn collectDeclaration(self: *Module, node: Ast.Node.Index, container: ?DeclId) (
                     symbol_name.* = null;
                     try self.diagnostics.append(self.allocator, .{ .tag = invalid_name, .span = span });
                 }
-            } else if (self.source.ast.nodes.items(.tag)[attribute] == .attr_one and data.rhs == 0 and std.mem.eql(u8, self.source.ast.tokenSlice(data.lhs), "public") and !declaration.ast.is_mutable and !public) {
+            } else if (self.source.ast.nodes.items(.tag)[attribute] == .attr_one and data.rhs == 0 and std.mem.eql(u8, self.source.ast.tokenSlice(data.lhs), "public") and !public) {
                 public = true;
             } else if (self.source.ast.nodes.items(.tag)[attribute] == .attr_one and data.rhs == 0 and std.mem.eql(u8, self.source.ast.tokenSlice(data.lhs), "noreturn") and self.source.ast.declFunction(node) != null and !declaration.ast.is_mutable and !noreturn_annotation) {
                 noreturn_annotation = true;
@@ -1020,10 +1020,20 @@ test "repeated private attributes are each unsupported" {
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
 }
 
+test "public mutable globals preserve visibility metadata under OOM" {
+    const source = "@[public]\nlet mut value:bool=true\nlet mut hidden:uint=0";
+    var module = try Module.init(std.testing.allocator, "public-globals.nov", source);
+    defer module.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(module.getDeclaration(module.lookup("value").?).?.public);
+    try std.testing.expect(!module.getDeclaration(module.lookup("hidden").?).?.public);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+}
+
 test "struct attributes and duplicate method names diagnose without leaking declarations" {
     for ([_][]const u8{
         "@[unknown]\nlet A=struct{}",                   "@[public(1)]\nlet A=struct{}",
-        "@[public]\n@[public]\nlet A=struct{}",         "@[public]\nlet mut value:bool=true",
+        "@[public]\n@[public]\nlet A=struct{}",         "@[public]\n@[public]\nlet mut value:bool=true",
         "let A=struct{\n@[private(1)]\nlet f:()={}\n}", "let A=struct{\nlet f:()={}\nlet f:()={}\n}",
     }) |source| {
         var module = try Module.init(std.testing.allocator, "bad-scope.nov", source);

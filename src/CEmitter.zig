@@ -383,6 +383,7 @@ fn write(allocator: std.mem.Allocator, ir: *const Ir, origins: []const ?Origin, 
         try writeSignature(ir, w, function);
         try w.writeAll(";\n");
     }
+    try writeGlobals(ir, root_counts, w);
     try writeAggregateFormatting(allocator, ir, root_counts, w);
     if (usesClosures(ir)) {
         try w.writeAll("static const size_t nov_env_offset[] = {0};\nstatic const nov_gc_descriptor nov_env_element = {sizeof(void *), _Alignof(void *), 1, nov_env_offset};\n");
@@ -504,6 +505,73 @@ fn writeRoots(ir: *const Ir, root_counts: []const usize, w: *std.Io.Writer, id: 
     }
 }
 
+fn isGlobalInitializer(ir: *const Ir, function: Ir.Function) bool {
+    for (ir.globals.items) |global| {
+        if (sameFunction(ir.getFunction(global.initializer).?, function)) return true;
+    }
+    return false;
+}
+
+fn writeGlobals(ir: *const Ir, root_counts: []const usize, w: *std.Io.Writer) WriteError!void {
+    if (ir.globals.items.len == 0) return;
+    var roots: usize = 0;
+    for (ir.globals.items, 0..) |global, i| {
+        try w.writeAll("static ");
+        try writeType(ir, w, global.ty);
+        try w.print(" nov_global_{d} = {{0}};\n", .{i});
+        roots = std.math.add(usize, roots, root_counts[@backingInt(global.ty)]) catch return error.OutOfMemory;
+    }
+    try w.writeAll("static unsigned nov_globals_state;\n");
+    if (usesManagedRuntime(ir)) {
+        try w.writeAll("static bool nov_globals_registered, nov_globals_exit_registered;\nstatic nov_gc_roots nov_global_roots;\n");
+        if (roots != 0) {
+            try w.writeAll("static void **nov_global_slots[] = {");
+            for (ir.globals.items, 0..) |global, i| try writeRoots(ir, root_counts, w, global.ty, "nov_global_", i);
+            try w.writeAll(" };\n");
+        }
+        // Keep the embedded shutdown API usable by direct C library harnesses.
+        // Define the macro only after this helper's call to the real runtime API.
+        // exit() on panic leaves frames registered: unregister globals there,
+        // but let the process reclaim memory rather than panic again at shutdown.
+        try w.writeAll(
+            "static inline void nov_globals_shutdown(nov_gc_heap *heap) {\n" ++
+                "    if (heap->frames) nov_rt_panic(\"GC shutdown with registered roots\");\n" ++
+                "    if (heap == &nov_rt_heap && nov_globals_registered) {\n" ++
+                "        nov_gc_unregister_globals(heap, &nov_global_roots);\n" ++
+                "        nov_globals_registered = false;\n    }\n" ++
+                "    nov_gc_shutdown(heap);\n" ++
+                "    if (heap == &nov_rt_heap) {\n",
+        );
+        for (ir.globals.items, 0..) |global, i| {
+            try w.print("        nov_global_{d} = (", .{i});
+            try writeType(ir, w, global.ty);
+            try w.writeAll("){0};\n");
+        }
+        try w.writeAll(
+            "        nov_globals_state = 0;\n    }\n}\n" ++
+                "#define nov_gc_shutdown nov_globals_shutdown\n" ++
+                "static void nov_globals_exit(void) {\n" ++
+                "    if (!nov_globals_registered) return;\n" ++
+                "    if (!nov_rt_heap.frames) {\n" ++
+                "        nov_globals_shutdown(&nov_rt_heap);\n" ++
+                "    } else {\n" ++
+                "        nov_gc_unregister_globals(&nov_rt_heap, &nov_global_roots);\n" ++
+                "        nov_globals_registered = false;\n    }\n}\n",
+        );
+    }
+    try w.writeAll("static void nov_globals_init(void) {\n    if (nov_globals_state) return;\n    nov_globals_state = 1;\n");
+    if (usesManagedRuntime(ir)) {
+        try w.print("    nov_gc_register_globals(&nov_rt_heap, &nov_global_roots, {s}, {d});\n", .{ if (roots == 0) "NULL" else "nov_global_slots", roots });
+        try w.writeAll("    nov_globals_registered = true;\n    if (!nov_globals_exit_registered) {\n        if (atexit(nov_globals_exit)) nov_rt_panic(\"global cleanup registration failed\");\n        nov_globals_exit_registered = true;\n    }\n");
+    }
+    for (ir.globals.items, 0..) |global, i| {
+        try w.print("    nov_global_{d} = ", .{i});
+        try writeScopedFunctionName(w, ir.getFunction(global.initializer).?);
+        try w.writeAll("();\n");
+    }
+    try w.writeAll("    nov_globals_state = 2;\n}\n");
+}
+
 fn usesClosures(ir: *const Ir) bool {
     for (ir.functions.items) |function| if (function.is_closure) return true;
     return false;
@@ -526,6 +594,7 @@ fn needsRootFrame(ir: *const Ir, function: Ir.Function) bool {
 }
 
 fn usesManagedRuntime(ir: *const Ir) bool {
+    for (ir.globals.items) |global| if (managedType(ir, ir.getType(global.ty).?)) return true;
     for (ir.functions.items) |function| if (needsRootFrame(ir, function)) return true;
     return false;
 }
@@ -1344,7 +1413,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
             if (region.continuation) |value| value_used[@backingInt(value)] = true;
             if (region.else_value) |value| value_used[@backingInt(value)] = true;
         },
-        .capture_value, .capture_cell, .loop_continue, .constant, .function_ref => {},
+        .global_slot, .capture_value, .capture_cell, .loop_continue, .constant, .function_ref => {},
         .closure_specialize => |closure| {
             value_used[@backingInt(closure.environment)] = true;
         },
@@ -1372,7 +1441,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
             roots = std.math.add(usize, roots, root_counts[@backingInt(param)]) catch return error.OutOfMemory;
         };
         for (body.instructions, 0..) |instruction, i| {
-            if (instruction.boxed or !managedType(ir, ir.getType(instruction.ty).?)) continue;
+            if (instruction.op == .global_slot or instruction.boxed or !managedType(ir, ir.getType(instruction.ty).?)) continue;
             try w.writeAll("    ");
             try writeType(ir, w, instruction.ty);
             try w.print(" v{d} = {{0}};\n", .{i});
@@ -1388,13 +1457,22 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
             for (signature.params, 0..) |param, p| if (managedType(ir, ir.getType(param).?)) {
                 try writeRoots(ir, root_counts, w, param, "p", p);
             };
-            for (body.instructions, 0..) |instruction, i| if (!instruction.boxed and managedType(ir, ir.getType(instruction.ty).?)) {
+            for (body.instructions, 0..) |instruction, i| if (instruction.op != .global_slot and !instruction.boxed and managedType(ir, ir.getType(instruction.ty).?)) {
                 try writeRoots(ir, root_counts, w, instruction.ty, "v", i);
             };
             try w.print(" }};\n    nov_gc_roots nov_frame = {{0}};\n    nov_gc_push(&nov_rt_heap, &nov_frame, nov_roots, {d});\n", .{roots});
         } else {
             try w.writeAll("    nov_gc_roots nov_frame = {0};\n    nov_gc_push(&nov_rt_heap, &nov_frame, NULL, 0);\n");
         }
+    }
+
+    if (ir.globals.items.len != 0) {
+        // Initializers must not re-enter initialization, but a declarations-only
+        // library still needs a use of the helper for strict C unused warnings.
+        try w.writeAll(if (isGlobalInitializer(ir, function)) "    (void)nov_globals_init;\n" else "    nov_globals_init();\n");
+    }
+    for (body.instructions, 0..) |instruction, i| {
+        if (instruction.op == .global_slot) try w.print("#define v{d} nov_global_{d}\n", .{ i, @backingInt(instruction.op.global_slot) });
     }
 
     // Silence unused diagnostics instead of requiring non-standard attributes.
@@ -1606,6 +1684,10 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
         if (instruction.op == .union_payload) {
             const read = instruction.op.union_payload;
             try w.print("    if (v{d}.tag != {d}) nov_rt_panic(\"inactive union payload\");\n", .{ @backingInt(read.base), read.index });
+        }
+        if (instruction.op == .global_slot) {
+            try w.print("    (void)v{d};\n", .{i});
+            continue;
         }
         if (instruction.boxed) {
             if (instruction.op == .local_slot) {
@@ -1852,7 +1934,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
                 try w.print("v{d} {s} v{d}", .{ @backingInt(binary.lhs), operator, @backingInt(binary.rhs) });
             },
             .call => |call| try writeCall(ir, w, body, call),
-            .string_slice, .assertion, .panic, .loop, .loop_break, .loop_continue, .return_value, .print, .short_circuit, .branch, .local_store => unreachable,
+            .global_slot, .string_slice, .assertion, .panic, .loop, .loop_break, .loop_continue, .return_value, .print, .short_circuit, .branch, .local_store => unreachable,
         }
         try w.writeAll(";\n");
         if (!value_used[i] or instruction.op == .local_slot) try w.print("    (void)v{d};\n", .{i});
@@ -1860,7 +1942,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
     const result_type = ir.types.items[@backingInt(signature.result)];
     if (managed and !Ir.terminates(body, body.result)) try w.writeAll("    nov_gc_pop(&nov_rt_heap, &nov_frame);\n");
     if (result_type != .void and !Ir.terminates(body, body.result)) try w.print("    return v{d};\n", .{@backingInt(body.result)});
-    for (body.instructions, 0..) |instruction, i| if (instruction.boxed) {
+    for (body.instructions, 0..) |instruction, i| if (instruction.boxed or instruction.op == .global_slot) {
         try w.print("#undef v{d}\n", .{i});
     };
 }
@@ -3649,6 +3731,329 @@ test "rune stdout write and final flush failures use the existing panic contract
 }
 
 const test_gpa = std.testing.allocator;
+
+fn emitGlobalTestLibrary(allocator: std.mem.Allocator) ![]u8 {
+    var lowered = blk: {
+        var module = try Module.init(allocator, "globals.nov",
+            \\let E=enum{a,b,}
+            \\let R=struct{s:string,a:[][]int,}
+            \\let U=union{none,some:R,}
+            \\let helper:()->[]int={@print("H")
+            \\[3,4]}
+            \\let initnumber:()->int={@print("I")
+            \\7}
+            \\let initarray:()->[]int=helper()
+            \\let initstring:()->string="a"+"b"
+            \\let initrecord:()->R=R.[s="c"+"d",a=[[5],[6]]]
+            \\let initunion:()->U=U.some[R.[s="e"+"f",a=[[8]]]]
+            \\let initfunction:()->()->int={let mut n=10
+            \\let f=()->int {n+=1
+            \\n}
+            \\f}
+            \\let initrange:()->@TypeOf(1..=3)=1..=3
+            \\let initbool:()->bool=true
+            \\let initrune:()->rune='é'
+            \\let initenum:()->E=E.b
+            \\let initfloat:()->f32=1.5
+        );
+        defer module.deinit();
+        for (module.source.ast.errors) |err| std.debug.print("global fixture parse error: {any}\n", .{err});
+        var lowered = try Lowering.lower(&module);
+        errdefer lowered.deinit();
+        for (module.diagnostics.items) |err| std.debug.print("{s} at {d}: {s}\n", .{ @tagName(err.tag), err.span.start, module.sourceSlice(err.span) orelse "<invalid span>" });
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expect(lowered.lowering_complete);
+        break :blk lowered;
+    };
+    defer lowered.deinit();
+    const ir = &lowered.ir;
+    const names = [_][]const u8{ "initnumber", "initarray", "initstring", "initrecord", "initunion", "initfunction", "initrange", "initbool", "initrune", "initenum", "initfloat" };
+    for (names) |name| {
+        var found = false;
+        for (ir.functions.items, 0..) |function, i| {
+            if (!std.mem.eql(u8, function.name, name)) continue;
+            _ = try ir.addGlobal(name, ir.getType(function.ty).?.function.result, function.span, @fromBackingInt(@intCast(i)));
+            found = true;
+            break;
+        }
+        try std.testing.expect(found);
+    }
+    const integer = ir.globals.items[0].ty;
+    const signature = try ir.internType(.{ .function = .{ .params = &.{}, .result = integer } });
+    const unit = try ir.internType(.void);
+    const one = try ir.internConstant(.{ .ty = integer, .value = .{ .signed_integer = 1 } });
+    const span = ir.globals.items[0].span;
+    const tick = try ir.addFunction("tick", signature, span);
+    try ir.setExportName(tick, "global_tick");
+    const V = struct {
+        fn id(i: u32) Ir.ValueId {
+            return @fromBackingInt(i);
+        }
+        fn ins(ty: Ir.TypeId, s: Ir.Span, op: Ir.Operation) Ir.Instruction {
+            return .{ .ty = ty, .span = s, .op = op };
+        }
+    };
+    try ir.setFunctionBody(tick, &.{
+        V.ins(integer, span, .{ .global_slot = @fromBackingInt(0) }),
+        V.ins(integer, span, .{ .local_load = V.id(0) }),
+        V.ins(integer, span, .{ .constant = one }),
+        V.ins(integer, span, .{ .binary = .{ .op = .add, .lhs = V.id(1), .rhs = V.id(2) } }),
+        V.ins(unit, span, .{ .local_store = .{ .slot = V.id(0), .value = V.id(3) } }),
+        V.ins(integer, span, .{ .global_slot = @fromBackingInt(0) }),
+        V.ins(integer, span, .{ .local_load = V.id(5) }),
+    }, V.id(6));
+    for (ir.globals.items, 0..) |global, i| {
+        const name = try std.fmt.allocPrint(allocator, "roundtrip{d}", .{i});
+        defer allocator.free(name);
+        const ty = global.ty;
+        const sig = try ir.internType(.{ .function = .{ .params = &.{}, .result = ty } });
+        const function = try ir.addFunction(name, sig, span);
+        const copy = try ir.needsArrayCopy(ty);
+        const instructions = [_]Ir.Instruction{
+            V.ins(ty, span, .{ .global_slot = @fromBackingInt(@intCast(i)) }),
+            V.ins(ty, span, .{ .local_load = V.id(0) }),
+            V.ins(ty, span, if (copy) .{ .array_clone = V.id(1) } else .{ .local_load = V.id(0) }),
+            V.ins(unit, span, .{ .local_store = .{ .slot = V.id(0), .value = V.id(2) } }),
+            V.ins(ty, span, .{ .local_load = V.id(0) }),
+        };
+        try ir.setFunctionBody(function, &instructions, V.id(4));
+    }
+    // Field writes must target the current static record, not a copied local.
+    const record_ty = ir.globals.items[3].ty;
+    const string_ty = ir.globals.items[2].ty;
+    const setter_sig = try ir.internType(.{ .function = .{ .params = &.{string_ty}, .result = unit } });
+    const setter = try ir.addFunction("setglobalfield", setter_sig, span);
+    try ir.setFunctionBody(setter, &.{
+        V.ins(record_ty, span, .{ .global_slot = @fromBackingInt(3) }),
+        V.ins(string_ty, span, .{ .parameter = 0 }),
+        V.ins(unit, span, .{ .field_store = .{ .slot = V.id(0), .index = 0, .value = V.id(1) } }),
+    }, V.id(2));
+    return emit(allocator, ir, null);
+}
+
+test "global storage all storable types exported entry once roots shutdown and forced GC O0 O3" {
+    const library = try emitGlobalTestLibrary(test_gpa);
+    defer test_gpa.free(library);
+    const driver =
+        \\int main(void) {
+        \\ nov_rt_heap.collect_every_allocation=1;
+        \\ if(global_tick()!=8 || global_tick()!=9) return 10;
+        \\ if(!nov_rt_heap.globals || nov_rt_heap.frames) return 11;
+        \\ nov_gc_collect(&nov_rt_heap);
+        \\ if(nov_roundtrip0()!=9) return 20;
+        \\ void *old_array=nov_global_1.data;
+        \\ if(nov_roundtrip1().data==old_array) return 21;
+        \\ if(nov_roundtrip2().len!=2) return 22;
+        \\ void *old_nested=nov_global_3.f1.data;
+        \\ if(nov_roundtrip3().f1.data==old_nested) return 23;
+        \\ if(nov_roundtrip4().tag!=1 || !nov_roundtrip5().env) return 24;
+        \\ if(nov_roundtrip6().end!=3 || !nov_roundtrip7() || nov_roundtrip8()!=233 || nov_roundtrip9()!=1 || nov_roundtrip10()!=1.5f) return 25;
+        \\ nov_setglobalfield(nov_global_2);
+        \\ if(nov_global_3.f0.data!=nov_global_2.data) return 26;
+        \\ nov_gc_collect(&nov_rt_heap);
+        \\ if(((int64_t*)nov_global_1.data)[0]!=3 || nov_global_2.len!=2) return 12;
+        \\ if(((int64_t*)((nov_array*)nov_global_3.f1.data)[1].data)[0]!=6) return 13;
+        \\ if(nov_global_4.tag!=1 || nov_global_4.f1.f0.len!=2) return 14;
+        \\ if(nov_global_5.code(nov_global_5.env)!=11) return 15;
+        \\ nov_gc_collect(&nov_rt_heap);
+        \\ if(nov_global_5.code(nov_global_5.env)!=12) return 16;
+        \\ if(nov_global_6.start!=1 || nov_global_6.end!=3 || !nov_global_6.inclusive) return 17;
+        \\ if(!nov_global_7 || nov_global_8!=233 || nov_global_9!=1 || nov_global_10!=1.5f) return 18;
+        \\ nov_gc_heap other; nov_gc_init(&other); nov_gc_shutdown(&other);
+        \\ if(nov_globals_state!=2 || !nov_globals_registered || nov_global_0!=9) return 27;
+        \\ nov_gc_shutdown(&nov_rt_heap);
+        \\ if(nov_rt_heap.globals || nov_rt_heap.live_objects) return 19;
+        \\ for(int cycle=0;cycle<2;++cycle) {
+        \\  if(nov_globals_state || nov_globals_registered || nov_global_0 || nov_global_1.data || nov_global_2.owner || nov_global_2.data || nov_global_2.len) return 28;
+        \\  if(nov_global_3.f0.owner || nov_global_3.f1.data || nov_global_4.f1.f1.data || nov_global_5.env || nov_global_5.code) return 29;
+        \\  if(nov_global_6.start || nov_global_6.end || nov_global_6.inclusive || nov_global_7 || nov_global_8 || nov_global_9 || nov_global_10) return 30;
+        \\  nov_rt_heap.collect_every_allocation=1;
+        \\  if(global_tick()!=8 || nov_global_5.code(nov_global_5.env)!=11) return 31;
+        \\  nov_gc_collect(&nov_rt_heap);
+        \\  if(((int64_t*)nov_global_1.data)[0]!=3) return 32;
+        \\  nov_gc_shutdown(&nov_rt_heap);
+        \\ }
+        \\ if(exit_registrations!=1) return 33;
+        \\ return 0;
+        \\}
+    ;
+    const c = try std.mem.concat(test_gpa, u8, &.{
+        "#include <stdlib.h>\nstatic int exit_registrations;\nstatic int count_atexit(void (*f)(void)) { ++exit_registrations; return atexit(f); }\n#define atexit count_atexit\n",
+        library,
+        driver,
+    });
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty;", 0, "IHIHIH", "", mode);
+    const automatic_cleanup = try std.mem.concat(test_gpa, u8, &.{
+        library,
+        "static void check_exit(void) { if(nov_rt_heap.globals || nov_rt_heap.live_objects) _Exit(77); }\n" ++
+            "int main(void) { if(atexit(check_exit)) return 70; return global_tick()==8 ? 0 : 71; }\n",
+    });
+    defer test_gpa.free(automatic_cleanup);
+    try compileAndRunMode(automatic_cleanup, "typedef int nonempty;", 0, "IH", "", "-O3");
+    const oom = try std.mem.concat(test_gpa, u8, &.{
+        "#include <stdlib.h>\nstatic void *fail_malloc(size_t n) { (void)n; return NULL; }\n#define NOV_GC_MALLOC fail_malloc\n#define NOV_GC_FREE free\n",
+        library,
+        "int main(void) { (void)global_tick(); return 70; }\n",
+    });
+    defer test_gpa.free(oom);
+    try compileAndRunMode(oom, "typedef int nonempty;", 1, "IH", "panic: GC allocation failed\n", "-O3");
+    const active_frame = try std.mem.concat(test_gpa, u8, &.{
+        library,
+        "static void check_rejected_shutdown(void) { if(!nov_rt_heap.frames || !nov_rt_heap.globals || !nov_globals_registered || nov_globals_state!=2 || !nov_global_1.data) _Exit(77); }\n" ++
+            "int main(void) { (void)global_tick(); if(atexit(check_rejected_shutdown)) return 70; nov_gc_roots frame={0}; nov_gc_push(&nov_rt_heap,&frame,NULL,0); nov_gc_shutdown(&nov_rt_heap); return 71; }\n",
+    });
+    defer test_gpa.free(active_frame);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(active_frame, "typedef int nonempty;", 1, "IH", "panic: GC shutdown with registered roots\n", mode);
+}
+
+test "global storage scalar only direct entry needs no GC runtime" {
+    var ir = Ir.init(test_gpa);
+    defer ir.deinit();
+    const span: Ir.Span = .{ .start = 0, .end = 0 };
+    const integer = try ir.internType(.{ .integer = .{ .signedness = .signed, .bits = 64 } });
+    const signature = try ir.internType(.{ .function = .{ .params = &.{}, .result = integer } });
+    const initializer = try ir.addFunction("init", signature, span);
+    const global = try ir.addGlobal("number", integer, span, initializer);
+    const number = try ir.internConstant(.{ .ty = integer, .value = .{ .signed_integer = 42 } });
+    try ir.setFunctionBody(initializer, &.{.{ .ty = integer, .span = span, .op = .{ .constant = number } }}, @fromBackingInt(0));
+    const read = try ir.addFunction("read", signature, span);
+    try ir.setFunctionBody(read, &.{
+        .{ .ty = integer, .span = span, .op = .{ .global_slot = global } },
+        .{ .ty = integer, .span = span, .op = .{ .local_load = @fromBackingInt(0) } },
+    }, @fromBackingInt(1));
+    const library = try emit(test_gpa, &ir, null);
+    defer test_gpa.free(library);
+    try std.testing.expect(std.mem.indexOf(u8, library, "nov_gc_") == null);
+    const c = try std.mem.concat(test_gpa, u8, &.{ library, "int main(void) { if(nov_read()!=42) return 1; nov_global_0=9; return nov_read()==9 ? 0 : 2; }\n" });
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty;", 0, "", "", mode);
+}
+
+test "global storage source integration nested initializers rooted entry parameters returns and heap reuse" {
+    const library = try emitSource(
+        \\let Row=struct{label:string,rows:[][]string,}
+        \\let U=union{none,row:Row,}
+        \\let mut count=4
+        \\let mut state=Row.[label="record",rows=[["a","b"],["c"]]]
+        \\let mut variant:U=.row[Row.[label="union",rows=[["d"],["e","f"]]]]
+        \\let mut callback:()->int=()->int {count}
+        \\@[export("global_step")]
+        \\let step:()->int={count+=1
+        \\callback()}
+        \\let echo:(argument:string)->string={@assert(state.rows[0][1]=="b" and state.rows[1][0]=="c")
+        \\@assert(match variant {.row=>|r|r.label=="union" and r.rows[0][0]=="d" and r.rows[1][1]=="f"
+        \\.none=>false})
+        \\argument}
+        \\let value:()->string={let saved=state
+        \\state.rows=[["replaced"]]
+        \\saved.rows[1][0]+"!"}
+    , null);
+    defer test_gpa.free(library);
+    const driver =
+        \\static const nov_gc_descriptor bytes = {3,1,0,NULL};
+        \\int main(void) {
+        \\ for(int cycle=0;cycle<3;++cycle) {
+        \\  nov_rt_heap.collect_every_allocation=1;
+        \\  nov_string input={0};
+        \\  input.owner=nov_gc_alloc(&nov_rt_heap,&bytes);
+        \\  memcpy(input.owner,"arg",3); input.data=input.owner; input.len=3;
+        \\  /* First ordinary entry must root its argument before globals allocate. */
+        \\  nov_string result=nov_echo(input);
+        \\  if(result.owner!=input.owner || result.len!=3 || memcmp(result.data,"arg",3)) return 10;
+        \\  void **slots[]={&result.owner}; nov_gc_roots frame={0};
+        \\  nov_gc_push(&nov_rt_heap,&frame,slots,1);
+        \\  nov_gc_collect(&nov_rt_heap);
+        \\  if(memcmp(result.data,"arg",3) || global_step()!=5 || global_step()!=6) return 11;
+        \\  /* Returned owners must be rooted by C before the next allocation. */
+        \\  result=nov_value();
+        \\  nov_gc_collect(&nov_rt_heap);
+        \\  if(result.len!=2 || memcmp(result.data,"c!",2)) return 12;
+        \\  nov_gc_pop(&nov_rt_heap,&frame);
+        \\  nov_gc_shutdown(&nov_rt_heap);
+        \\  if(nov_rt_heap.frames || nov_rt_heap.globals || nov_rt_heap.live_objects || nov_globals_state) return 13;
+        \\ }
+        \\ return 0;
+        \\}
+    ;
+    const c = try std.mem.concat(test_gpa, u8, &.{ library, driver });
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty;", 0, "", "", mode);
+    const partial_oom = try std.mem.concat(test_gpa, u8, &.{
+        "#include <stdlib.h>\nstatic unsigned budget=3;\nstatic void *limited_malloc(size_t n) { if(!budget) return NULL; --budget; return malloc(n); }\n#define NOV_GC_MALLOC limited_malloc\n#define NOV_GC_FREE free\n",
+        c,
+    });
+    defer test_gpa.free(partial_oom);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(partial_oom, "typedef int nonempty;", 1, "", "panic: GC allocation failed\n", mode);
+}
+
+test "global storage source integration scalar only strict C11" {
+    const library = try emitSource(
+        \\let mut count:int=41
+        \\let mut enabled:bool=true
+        \\let mut marker:rune='é'
+        \\let mut scale:f32=1.5
+        \\let identity:(n:int)->int=n
+        \\let mut callback:(int)->int=identity
+        \\@[export("global_scalar")]
+        \\let step:()->int={count+=1
+        \\if enabled and marker=='é' and scale==1.5 {callback(count)} else {0}}
+    , null);
+    defer test_gpa.free(library);
+    try std.testing.expect(std.mem.indexOf(u8, library, "nov_gc_") == null);
+    const c = try std.mem.concat(test_gpa, u8, &.{ library, "int main(void) { return global_scalar()==42 && global_scalar()==43 ? 0 : 1; }\n" });
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty;", 0, "", "", mode);
+}
+
+test "global storage source integration declarations only strict C11 library" {
+    for ([_][]const u8{ "let mut count:int=41", "let values:[]int=[1,2]" }) |source| {
+        const library = try emitSource(source, null);
+        defer test_gpa.free(library);
+        const c = try std.mem.concat(test_gpa, u8, &.{ library, "int main(void) { return 0; }\n" });
+        defer test_gpa.free(c);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty;", 0, "", "", mode);
+    }
+}
+
+test "global storage source integration zero root scalar slots reset with managed heap" {
+    const library = try emitSource(
+        \\let mut count:int=41
+        \\let identity:(n:int)->int=n
+        \\let mut callback:(int)->int=identity
+        \\@[export("global_scalar")]
+        \\let step:()->int={count+=1
+        \\callback(count)}
+        \\let allocate:()->[]int=[1,2]
+    , null);
+    defer test_gpa.free(library);
+    const driver =
+        \\int main(void) {
+        \\ for(int cycle=0;cycle<3;++cycle) {
+        \\  nov_rt_heap.collect_every_allocation=1;
+        \\  if(global_scalar()!=42 || global_scalar()!=43) return 10;
+        \\  if(!nov_globals_registered || nov_global_roots.count || nov_global_roots.slots) return 11;
+        \\  nov_array result=nov_allocate();
+        \\  if(result.len!=2 || ((int64_t*)result.data)[1]!=2) return 12;
+        \\  nov_gc_shutdown(&nov_rt_heap);
+        \\  if(nov_globals_state || nov_rt_heap.live_objects || nov_rt_heap.globals) return 13;
+        \\ }
+        \\ return 0;
+        \\}
+    ;
+    const c = try std.mem.concat(test_gpa, u8, &.{ library, driver });
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty;", 0, "", "", mode);
+}
+
+test "global storage compiler and emitter every allocation failure" {
+    try TestAllocations.checkAllAllocationFailures(test_gpa, emitGlobalTestLibraryAllocation, .{});
+}
+
+fn emitGlobalTestLibraryAllocation(allocator: std.mem.Allocator) !void {
+    const library = try emitGlobalTestLibrary(allocator);
+    defer allocator.free(library);
+}
 
 const type_reachability_cases = [_]struct { source: []const u8, output: []const u8 = "" }{
     .{ .source =
@@ -12696,6 +13101,8 @@ fn compileAndRunCompiler(c_source: []const u8, harness: []const u8, exit_code: u
     defer test_gpa.free(ran.stdout);
     defer test_gpa.free(ran.stderr);
     // Check panic termination and both streams as well as successful harnesses.
+    if (!std.meta.eql(std.process.Child.Term{ .exited = exit_code }, ran.term))
+        std.debug.print("generated C terminated with {any}\n{s}\n{s}\n", .{ ran.term, ran.stdout, ran.stderr });
     try std.testing.expectEqual(std.process.Child.Term{ .exited = exit_code }, ran.term);
     try std.testing.expectEqualStrings(stdout, ran.stdout);
     try std.testing.expectEqualStrings(stderr, ran.stderr);

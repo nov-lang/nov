@@ -15,6 +15,7 @@ constants: std.ArrayList(Constant) = .empty,
 source_len: u32 = 0,
 source_lengths: std.ArrayList(u32) = .empty,
 functions: std.ArrayList(Function) = .empty,
+globals: std.ArrayList(Global) = .empty,
 /// Owned display names and optional ordinary nominal-to-string functions.
 formatting: std.ArrayList(TypeFormatting) = .empty,
 
@@ -31,6 +32,8 @@ pub const native_float_bits: u16 = if (native_pointer_bits == 32) 32 else 64;
 pub const TypeId = enum(u32) { _ };
 pub const ConstId = enum(u32) { _ };
 pub const FunctionId = enum(u32) { _ };
+pub const GlobalId = enum(u32) { _ };
+pub const Global = struct { name: []const u8, ty: TypeId, span: Span, initializer: FunctionId };
 /// Zero-based instruction index, local to a single body. Region-private values
 /// are visible only within that region (or as its explicit result).
 pub const ValueId = enum(u32) { _ };
@@ -144,6 +147,8 @@ pub const Operation = union(enum) {
     closure_specialize: struct { function: FunctionId, environment: ValueId },
     capture_value: u32,
     capture_cell: u32,
+    /// Mutable storage identity; reads and writes use the existing slot operations.
+    global_slot: GlobalId,
     local_slot: ValueId,
     local_load: ValueId,
     local_store: struct { slot: ValueId, value: ValueId },
@@ -336,6 +341,9 @@ pub const VerifyError = ValidationError || error{
     NonCanonicalType,
     NonCanonicalConstant,
     InvalidFunctionId,
+    InvalidGlobalId,
+    InvalidGlobal,
+    DuplicateGlobalName,
     InvalidFunctionType,
     InvalidTypeFormatting,
     InvalidFunctionName,
@@ -370,6 +378,7 @@ pub fn init(allocator: std.mem.Allocator) Ir {
 pub fn deinit(self: *Ir) void {
     self.clearFunctions();
     self.functions.deinit(self.allocator);
+    self.globals.deinit(self.allocator);
     for (self.local_generic_instances.items) |instance| {
         self.allocator.free(instance.outer);
         self.allocator.free(instance.arguments);
@@ -454,6 +463,38 @@ pub fn getFunction(self: *const Ir, id: FunctionId) ?Function {
     const index = @backingInt(id);
     if (index >= self.functions.items.len) return null;
     return self.functions.items[index];
+}
+
+pub fn getGlobal(self: *const Ir, id: GlobalId) ?Global {
+    const index = @backingInt(id);
+    if (index >= self.globals.items.len) return null;
+    return self.globals.items[index];
+}
+
+/// Owns the name. Initializer declaration may precede body publication.
+pub fn addGlobal(self: *Ir, name: []const u8, ty: TypeId, span: Span, initializer: FunctionId) BuildError!GlobalId {
+    const global: Global = .{ .name = name, .ty = ty, .span = span, .initializer = initializer };
+    try self.validateGlobal(global);
+    for (self.globals.items) |previous| {
+        if (previous.span.source == span.source and std.mem.eql(u8, previous.name, name)) return error.DuplicateGlobalName;
+    }
+    if (self.globals.items.len == std.math.maxInt(u32)) return error.TooManyEntries;
+    const owned_name = try self.allocator.dupe(u8, name);
+    errdefer self.allocator.free(owned_name);
+    const id: GlobalId = @fromBackingInt(@intCast(self.globals.items.len));
+    try self.globals.append(self.allocator, .{ .name = owned_name, .ty = ty, .span = span, .initializer = initializer });
+    return id;
+}
+
+fn validateGlobal(self: *const Ir, global: Global) VerifyError!void {
+    try self.validateSpan(global.span);
+    if (global.name.len == 0 or std.mem.indexOfScalar(u8, global.name, 0) != null) return error.InvalidGlobal;
+    if (!isArrayElement(self.getType(global.ty) orelse return error.InvalidTypeId)) return error.InvalidGlobal;
+    const initializer = self.getFunction(global.initializer) orelse return error.InvalidFunctionId;
+    const signature = self.getType(initializer.ty) orelse return error.InvalidTypeId;
+    if (signature != .function or signature.function.params.len != 0 or signature.function.result != global.ty or
+        initializer.is_closure or initializer.noreturn or initializer.is_test or initializer.public or
+        initializer.export_name != null or initializer.extern_name != null) return error.InvalidGlobal;
 }
 
 pub fn addFunction(self: *Ir, name: []const u8, ty: TypeId, span: Span) BuildError!FunctionId {
@@ -551,6 +592,8 @@ fn freeOperands(self: *Ir, op: Operation) void {
 
 /// Invalidates all function handles and borrowed function/body views, not pools.
 pub fn clearFunctions(self: *Ir) void {
+    for (self.globals.items) |global| self.allocator.free(global.name);
+    self.globals.clearRetainingCapacity();
     for (self.formatting.items) |*entry| entry.formatter = null;
     for (self.functions.items) |function| {
         self.allocator.free(function.name);
@@ -721,6 +764,12 @@ pub fn verify(self: *const Ir) VerifyError!void {
                 if (previous.export_name != null and function.export_name != null) return error.DuplicateExportName;
                 if (previous.ty != function.ty or previous.noreturn != function.noreturn) return error.ConflictingForeignSignature;
             }
+        }
+    }
+    for (self.globals.items, 0..) |global, i| {
+        try self.validateGlobal(global);
+        for (self.globals.items[0..i]) |previous| {
+            if (previous.span.source == global.span.source and std.mem.eql(u8, previous.name, global.name)) return error.DuplicateGlobalName;
         }
     }
     for (self.functions.items) |function| {
@@ -953,7 +1002,7 @@ fn regions(op: Operation, end: usize, buffer: *[4]Region) []const Region {
 }
 
 pub fn isSlot(instruction: Instruction) bool {
-    return instruction.op == .local_slot or instruction.op == .capture_cell;
+    return instruction.op == .local_slot or instruction.op == .capture_cell or instruction.op == .global_slot;
 }
 
 fn slotType(body: Body, id: ValueId, before: usize) VerifyError!TypeId {
@@ -973,7 +1022,36 @@ fn validateBody(self: *const Ir, function: Function, body: Body) VerifyError!voi
 
 pub const BorrowConflict = struct { access: Span, origin: Span };
 pub fn borrowConflict(self: *const Ir, body: Body) VerifyError!?BorrowConflict {
-    return BorrowCheck.check(self.allocator, body);
+    var global_borrow = false;
+    for (body.instructions) |instruction| {
+        if (instruction.op == .borrow_reserve and body.instructions[@backingInt(instruction.op.borrow_reserve)].op == .global_slot) global_borrow = true;
+    }
+    if (!global_borrow) return BorrowCheck.check(self.allocator, body);
+    // Global identities may be materialized repeatedly. Canonicalize storage
+    // operands for the CFG checker, and conservatively treat calls as accesses
+    // to globals just as they are accesses to hidden captured cells.
+    const instructions = try self.allocator.dupe(Instruction, body.instructions);
+    defer self.allocator.free(instructions);
+    for (instructions) |*instruction| {
+        if (instruction.op == .global_slot) instruction.boxed = true;
+        const slot: ?*ValueId = switch (instruction.op) {
+            .local_load, .borrow_reserve => |*slot| slot,
+            .local_store => |*store| &store.slot,
+            .field_store => |*store| &store.slot,
+            else => null,
+        };
+        if (slot) |operand| {
+            const owner = body.instructions[@backingInt(operand.*)];
+            if (owner.op != .global_slot) continue;
+            for (body.instructions, 0..) |candidate, i| {
+                if (candidate.op == .global_slot and candidate.op.global_slot == owner.op.global_slot) {
+                    operand.* = @fromBackingInt(@intCast(i));
+                    break;
+                }
+            }
+        }
+    }
+    return BorrowCheck.check(self.allocator, .{ .instructions = instructions, .result = body.result });
 }
 
 /// Raw borrow_start only. Dynamic snapshots do not have a single static owner.
@@ -1015,6 +1093,7 @@ pub fn borrowElement(self: *const Ir, body: Body, borrow: ValueId, before: usize
 // rebind. Deliberately no instruction-order check: later same-region owners work.
 fn referenceOwnerScope(body: Body, slot: usize, borrow: ValueId) VerifyError!void {
     const owner = @backingInt(borrowOwner(body, borrow));
+    if (body.instructions[owner].op == .global_slot) return;
     for (body.instructions, 0..) |instruction, end| {
         var buffer: [4]Region = undefined;
         for (regions(instruction.op, end, &buffer)) |region| {
@@ -1312,6 +1391,11 @@ fn validateBodyStructure(self: *const Ir, function: Function, body: Body) Verify
             .array_append => |r| {
                 if (ty != .array) return error.InvalidOperation;
                 if (try operandType(body, r.lhs, i) != instruction.ty or try operandType(body, r.rhs, i) != instruction.ty) return error.OperandTypeMismatch;
+            },
+            .global_slot => |id| {
+                const global = self.getGlobal(id) orelse return error.InvalidGlobalId;
+                if (global.ty != instruction.ty) return error.OperandTypeMismatch;
+                if (!isArrayElement(ty)) return error.InvalidOperation;
             },
             .local_slot => |value| {
                 if (ty != .boolean and ty != .integer and ty != .float and ty != .rune and ty != .function and ty != .array and ty != .string and ty != .record and ty != .enumeration and ty != .range) return error.InvalidOperation;
@@ -3253,6 +3337,77 @@ test "rune operations verify exact types equality only and foreign exclusion wit
     owned[0] = body[0];
     ir.functions.items[0].export_name = try ir.allocator.dupe(u8, "equal");
     try std.testing.expectError(error.InvalidExportSignature, ir.verify());
+}
+
+fn testGlobalOwnership(allocator: std.mem.Allocator) !void {
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    ir.source_len = 1;
+    const integer = try ir.internType(.{ .integer = .{ .signedness = .signed, .bits = 64 } });
+    const unit = try ir.internType(.void);
+    const signature = try ir.internType(.{ .function = .{ .params = &.{}, .result = integer } });
+    const initializer = try ir.addFunction("init", signature, test_span);
+    const global = try ir.addGlobal("counter", integer, test_span, initializer);
+    const number = try ir.internConstant(.{ .ty = integer, .value = .{ .signed_integer = 7 } });
+    const make = TestFunctions.instruction;
+    try ir.setFunctionBody(initializer, &.{make(integer, .{ .constant = number })}, @fromBackingInt(0));
+    const function = try ir.addFunction("read", signature, test_span);
+    const body = [_]Instruction{
+        make(integer, .{ .global_slot = global }),
+        make(integer, .{ .local_load = @fromBackingInt(0) }),
+        make(unit, .{ .local_store = .{ .slot = @fromBackingInt(0), .value = @fromBackingInt(1) } }),
+        make(integer, .{ .local_load = @fromBackingInt(0) }),
+    };
+    try ir.setFunctionBody(function, &body, @fromBackingInt(3));
+    try ir.verify();
+    try std.testing.expectEqualStrings("counter", ir.getGlobal(global).?.name);
+    try std.testing.expectError(error.DuplicateGlobalName, ir.addGlobal("counter", integer, test_span, initializer));
+    try std.testing.expectError(error.InvalidGlobal, ir.addGlobal("bad", unit, test_span, initializer));
+    try std.testing.expectError(error.InvalidFunctionId, ir.addGlobal("bad", integer, test_span, @fromBackingInt(999)));
+    var bad = body;
+    bad[0].op.global_slot = @fromBackingInt(999);
+    try std.testing.expectError(error.InvalidGlobalId, ir.verifyBodyStructure(function, .{ .instructions = &bad, .result = @fromBackingInt(3) }));
+    bad = body;
+    bad[0].ty = unit;
+    try std.testing.expectError(error.OperandTypeMismatch, ir.verifyBodyStructure(function, .{ .instructions = &bad, .result = @fromBackingInt(3) }));
+    bad = body;
+    bad[1].op = .{ .unary = .{ .op = .negate, .operand = @fromBackingInt(0) } };
+    try std.testing.expectError(error.InvalidValueId, ir.verifyBodyStructure(function, .{ .instructions = &bad, .result = @fromBackingInt(3) }));
+    ir.functions.items[@backingInt(initializer)].public = true;
+    try std.testing.expectError(error.InvalidGlobal, ir.verify());
+    ir.functions.items[@backingInt(initializer)].public = false;
+    ir.clearFunctions();
+    try std.testing.expectEqual(@as(usize, 0), ir.globals.items.len);
+}
+
+test "global metadata slot identity validation ownership and every OOM" {
+    try testGlobalOwnership(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testGlobalOwnership, .{});
+}
+
+test "global slots canonicalize borrow aliases and protect calls" {
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    ir.source_len = 1;
+    const integer = try ir.internType(.{ .integer = .{ .signedness = .signed, .bits = 64 } });
+    const unit = try ir.internType(.void);
+    const signature = try ir.internType(.{ .function = .{ .params = &.{}, .result = integer } });
+    const initializer = try ir.addFunction("init", signature, test_span);
+    const global = try ir.addGlobal("counter", integer, test_span, initializer);
+    const make = TestFunctions.instruction;
+    const body = [_]Instruction{
+        make(integer, .{ .global_slot = global }),
+        make(unit, .{ .borrow_reserve = @fromBackingInt(0) }),
+        make(unit, .{ .borrow_start = .{ .reservation = @fromBackingInt(1), .index = null } }),
+        make(integer, .{ .global_slot = global }),
+        make(integer, .{ .local_load = @fromBackingInt(3) }),
+        make(integer, .{ .borrow_read = @fromBackingInt(2) }),
+    };
+    try std.testing.expectError(error.BorrowConflict, ir.setFunctionBody(initializer, &body, @fromBackingInt(5)));
+    var call = body;
+    call[3] = make(signature, .{ .function_ref = initializer });
+    call[4] = make(integer, .{ .call = .{ .callee = @fromBackingInt(3), .args = &.{} } });
+    try std.testing.expectError(error.BorrowConflict, ir.setFunctionBody(initializer, &call, @fromBackingInt(5)));
 }
 
 const test_span: Span = .{ .start = 0, .end = 1 };

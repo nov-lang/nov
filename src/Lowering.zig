@@ -9,6 +9,7 @@ const BodyChecker = @import("BodyChecker.zig");
 const Compilation = @import("Compilation.zig");
 const Source = @import("Source.zig");
 const Dependencies = @import("Dependencies.zig");
+const GlobalInitializers = @import("GlobalInitializers.zig");
 
 pub const Error = Sema.Error;
 
@@ -30,7 +31,7 @@ pub fn lowerCompilation(comp: *Compilation) Error!Sema {
         const module = comp.getModule(ref.source).?;
         const declaration = module.getDeclaration(ref.local).?;
         if (entry.status == .ignored or entry.status == .namespace or entry.status == .type_alias or entry.status == .generic or entry.status == .unrequested) continue;
-        if (module.source.ast.decl(declaration.node).ast.is_mutable or (entry.status != .body_checked and entry.status != .constant_checked and entry.status != .external)) {
+        if (entry.status != .body_checked and entry.status != .constant_checked and entry.status != .global_checked and entry.status != .external) {
             try module.diagnostics.append(comp.allocator, .{ .tag = deferredDiagnostic(module, declaration), .span = declaration.name_span });
         }
     }
@@ -64,7 +65,17 @@ pub fn lowerCompilation(comp: *Compilation) Error!Sema {
         entry.function = function;
         functions[i] = function;
     }
+    for (result.global_order.items) |index| {
+        const ref = comp.declarations.items[index];
+        try GlobalInitializers.allocate(comp.getModule(ref.source).?, &result, ref.local);
+    }
+    for (comp.declarations.items) |ref| {
+        const index = result.entryIndex(comp.getModule(ref.source).?, ref.local);
+        if (result.entries[index].status == .global_checked and !try GlobalInitializers.lower(comp.getModule(ref.source).?, &result, types, constants, functions, ref.local)) result.entries[index].status = .failed;
+    }
+    try GlobalInitializers.validateData(comp.modules.items[0], &result);
     for (comp.declarations.items, result.entries) |ref, *entry| {
+        if (comp.hasErrors()) break;
         if (entry.status != .body_checked) continue;
         entry.status = if (try BodyChecker.lower(comp.getModule(ref.source).?, &result.ir, types, constants, functions, ref.local)) .lowered else .failed;
     }
@@ -82,9 +93,9 @@ pub fn lowerCompilation(comp: *Compilation) Error!Sema {
     return result;
 }
 
-/// Lowers a closed, bounded module: immutable literal globals and supported
-/// expression-body functions. Owns the returned IR independently of the AST.
-/// Arithmetic is represented, not evaluated; backend numeric policy is pending.
+/// Lowers a closed, bounded module: compile-time-known global data and
+/// supported functions. Owns the returned IR independently of the AST.
+/// Global scalar computations are folded; ordinary body arithmetic stays in IR.
 pub fn lower(module: *Module) Error!Sema {
     var complete = false;
     defer if (!complete) module.clearSpecializations();
@@ -96,7 +107,7 @@ pub fn lower(module: *Module) Error!Sema {
     result.ir.source_len = @intCast(module.source.ast.source.len);
     for (module.declarations.items, result.entries) |declaration, entry| {
         if (entry.status == .ignored or entry.status == .namespace or entry.status == .type_alias or entry.status == .generic or entry.status == .unrequested) continue;
-        if (module.source.ast.decl(declaration.node).ast.is_mutable or (entry.status != .body_checked and entry.status != .constant_checked and entry.status != .external)) {
+        if (entry.status != .body_checked and entry.status != .constant_checked and entry.status != .global_checked and entry.status != .external) {
             try module.diagnostics.append(module.allocator, .{ .tag = deferredDiagnostic(module, declaration), .span = declaration.name_span });
         }
     }
@@ -129,8 +140,15 @@ pub fn lower(module: *Module) Error!Sema {
         entry.function = function;
         functions[i] = function;
     }
+    // Global identities also precede every body, including initializers.
+    for (result.global_order.items) |i| try GlobalInitializers.allocate(module, &result, @fromBackingInt(@intCast(i)));
+    for (module.declarations.items, 0..) |_, i| {
+        if (result.entries[i].status == .global_checked and !try GlobalInitializers.lower(module, &result, types, constants, functions, @fromBackingInt(@intCast(i)))) result.entries[i].status = .failed;
+    }
+    try GlobalInitializers.validateData(module, &result);
     // Function identities exist before bodies, so calls may be forward/recursive.
     for (result.entries, 0..) |*entry, i| {
+        if (module.hasErrors()) break;
         if (entry.status != .body_checked) continue;
         entry.status = if (try BodyChecker.lower(module, &result.ir, types, constants, functions, @fromBackingInt(@intCast(i)))) .lowered else .failed;
     }
@@ -147,6 +165,245 @@ pub fn lower(module: *Module) Error!Sema {
         complete = true;
     }
     return result;
+}
+
+test "global data initialization allocates storage before bodies and owns its metadata" {
+    const source = "let mut count: int = 1 + 2\nlet values: []int = [count_const, 4]\nlet count_const = 3\nlet read: () -> int = count + values[0]";
+    var module = try Module.init(std.testing.allocator, "global-data.nov", source);
+    var sema = lower(&module) catch |err| {
+        module.deinit();
+        return err;
+    };
+    module.deinit();
+    defer sema.deinit();
+    try std.testing.expect(sema.lowering_complete);
+    try std.testing.expectEqual(@as(usize, 2), sema.ir.globals.items.len);
+    try std.testing.expectEqualStrings("count", sema.ir.globals.items[0].name);
+    for (sema.ir.globals.items) |global| {
+        const initializer = sema.ir.getFunction(global.initializer).?;
+        try std.testing.expect(initializer.body != null);
+        try std.testing.expect(!initializer.public);
+        try std.testing.expectEqual(global.ty, sema.ir.getType(initializer.ty).?.function.result);
+    }
+    try sema.ir.verify();
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+}
+
+test "global data initializers preserve storable aggregate and callback types" {
+    const source =
+        "let R=struct{values:[]int,callback:()->int,}\n" ++
+        "let U=union{some:R,none,}\n" ++
+        "let named:()->int=7\n" ++
+        "let mut callback:()->int=()->int{named()}\n" ++
+        "let record:R=R.[values=[1,2],callback=named]\n" ++
+        "let wrapped:U=U.some[record]\n" ++
+        "let bounds=0..3\n" ++
+        "let pair=.[record,wrapped]\n" ++
+        "let read:()->int=callback()+record.values[0]";
+    var module = try Module.init(std.testing.allocator, "global-types.nov", source);
+    defer module.deinit();
+    var sema = try lower(&module);
+    defer sema.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try std.testing.expectEqual(@as(usize, 5), sema.ir.globals.items.len);
+    try std.testing.expect(sema.entries[@backingInt(module.lookup("callback").?)].function == null);
+    try sema.ir.verify();
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+}
+
+fn testGlobalDataCompilation(allocator: std.mem.Allocator) !void {
+    var sema = blk: {
+        var comp = Compilation.init(allocator);
+        defer comp.deinit();
+        const root = try comp.addSource("/globals/main.nov", "let lib=@import(\"lib.nov\")\nlet mut state:[]int=lib.values\nlet read:()->int=state[0]");
+        const lib = try comp.addSource("/globals/lib.nov", "@[public]\nlet values:[]int=[next,2]\nlet next=1+2");
+        try testImport(&comp, root, "lib", lib, false);
+        comp.setRoot(root);
+        var result = try lowerCompilation(&comp);
+        errdefer result.deinit();
+        try std.testing.expect(!comp.hasErrors());
+        break :blk result;
+    };
+    defer sema.deinit();
+    try std.testing.expect(sema.lowering_complete);
+    try std.testing.expectEqual(@as(usize, 3), sema.ir.globals.items.len);
+    try std.testing.expectEqualStrings("next", sema.ir.globals.items[0].name);
+    try std.testing.expectEqualStrings("values", sema.ir.globals.items[1].name);
+    try std.testing.expectEqualStrings("state", sema.ir.globals.items[2].name);
+    const body = sema.ir.getFunction(sema.ir.globals.items[0].initializer).?.body.?;
+    const result = body.instructions[@backingInt(body.result)];
+    try std.testing.expectEqual(@as(i128, 3), sema.ir.getConstant(result.op.constant).?.value.signed_integer);
+    try sema.ir.verify();
+}
+
+test "global data compilation resolves imported forward dependencies and owns sources under OOM" {
+    try testGlobalDataCompilation(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testGlobalDataCompilation, .{});
+}
+
+test "global data initialization rejects startup calls mutable reads and nested interpolation" {
+    for ([_][]const u8{
+        "let f: () -> int = 1\nlet mut value: int = f()",
+        "let mut source: int = 1\nlet value: []int = [source]",
+        "let value: []string = [\"{true}\"]",
+        "let mut value = { @println(1)\n1 }",
+    }) |source| {
+        var module = try Module.init(std.testing.allocator, "global-effects.nov", source);
+        defer module.deinit();
+        var sema = try lower(&module);
+        defer sema.deinit();
+        try std.testing.expect(module.hasErrors());
+        try std.testing.expect(!sema.lowering_complete);
+        try std.testing.expectEqual(@as(usize, 0), sema.ir.globals.items.len);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+    }
+}
+
+test "global data forward aggregates materialize known projections and function values" {
+    const source =
+        "let mut answer:int=record.values[1]+1\n" ++
+        "let copy:[]int=record.values\n" ++
+        "let record=.[values=values,callback=named]\n" ++
+        "let values:[]int=[1,41]\n" ++
+        "let named:()->int=7\n" ++
+        "let mut callback:()->int=()->int{named()}\n" ++
+        "let alias=named\n" ++
+        "let skipped=false and {1/0==0}\n" ++
+        "let text=\"aé🙂z\"[1..3]\n" ++
+        "let main:()->int=callback()+alias()+answer";
+    var module = try Module.init(std.testing.allocator, "global-forward.nov", source);
+    defer module.deinit();
+    var sema = try lower(&module);
+    defer sema.deinit();
+
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    var found = false;
+    for (sema.ir.globals.items) |global| {
+        const body = sema.ir.getFunction(global.initializer).?.body.?;
+        const result = body.instructions[@backingInt(body.result)];
+        if (std.mem.eql(u8, global.name, "text")) {
+            try std.testing.expectEqualStrings("é🙂", sema.ir.getConstant(result.op.constant).?.value.string);
+        }
+        if (std.mem.eql(u8, global.name, "answer")) {
+            try std.testing.expectEqual(@as(i128, 42), sema.ir.getConstant(result.op.constant).?.value.signed_integer);
+            found = true;
+        }
+    }
+    try std.testing.expect(found);
+    const c = try CEmitter.emit(std.testing.allocator, &sema.ir, null);
+    defer std.testing.allocator.free(c);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+}
+
+test "global data indices slices and lengths match runtime scalar semantics" {
+    const prefix = "let values:[]int=[10,20,30]\nlet empty:[]int=[]\nlet text=\"aé🙂z\"\nlet n=";
+    for ([_]struct { expression: []const u8, expected: Ir.Constant.Value }{
+        .{ .expression = "values[-1]", .expected = .{ .signed_integer = 30 } },
+        .{ .expression = "values[-3]", .expected = .{ .signed_integer = 10 } },
+        .{ .expression = "text[-1]", .expected = .{ .rune = 'z' } },
+        .{ .expression = "text[-2]", .expected = .{ .rune = '🙂' } },
+        .{ .expression = "text[-4]", .expected = .{ .rune = 'a' } },
+        .{ .expression = "text[-3..-1]", .expected = .{ .string = "é🙂" } },
+        .{ .expression = "text[-3..=-1]", .expected = .{ .string = "é🙂z" } },
+        .{ .expression = "text[..-1]", .expected = .{ .string = "aé🙂" } },
+        .{ .expression = "text[-2..]", .expected = .{ .string = "🙂z" } },
+        .{ .expression = "text[-4..-4]", .expected = .{ .string = "" } },
+        .{ .expression = "text[-1..=-1]", .expected = .{ .string = "z" } },
+        .{ .expression = "text[4..]", .expected = .{ .string = "" } },
+        .{ .expression = "\"\"[..]", .expected = .{ .string = "" } },
+        .{ .expression = "values.len", .expected = .{ .unsigned_integer = 3 } },
+        .{ .expression = "empty.len", .expected = .{ .unsigned_integer = 0 } },
+        .{ .expression = "text.len", .expected = .{ .unsigned_integer = 4 } },
+        .{ .expression = "\"\".len", .expected = .{ .unsigned_integer = 0 } },
+        .{ .expression = "text[-3..-1].len", .expected = .{ .unsigned_integer = 2 } },
+    }) |case| {
+        const source = try std.mem.concat(std.testing.allocator, u8, &.{ prefix, case.expression });
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "global-indices.nov", source);
+        defer module.deinit();
+        var sema = try lower(&module);
+        defer sema.deinit();
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expect(sema.lowering_complete);
+        var found = false;
+        for (sema.ir.globals.items) |global| {
+            if (!std.mem.eql(u8, global.name, "n")) continue;
+            const body = sema.ir.getFunction(global.initializer).?.body.?;
+            const result = body.instructions[@backingInt(body.result)];
+            const constant = sema.ir.getConstant(result.op.constant).?;
+            try std.testing.expectEqualDeep(case.expected, constant.value);
+            if (case.expected == .unsigned_integer) {
+                try std.testing.expectEqual(std.builtin.Signedness.unsigned, sema.ir.getType(constant.ty).?.integer.signedness);
+            }
+            found = true;
+        }
+        try std.testing.expect(found);
+        try sema.ir.verify();
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+    }
+}
+
+test "global data struct construction materializes default fields" {
+    const source = "let A=struct{x:int=0,}\nlet a=A.[]\nlet n=a.x";
+    var module = try Module.init(std.testing.allocator, "global-defaults.nov", source);
+    defer module.deinit();
+    var sema = try lower(&module);
+    defer sema.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try std.testing.expectEqual(@as(usize, 2), sema.ir.globals.items.len);
+    const aggregate = sema.ir.getFunction(sema.ir.globals.items[0].initializer).?.body.?;
+    const fields = aggregate.instructions[@backingInt(aggregate.result)].op.record_init;
+    try std.testing.expectEqual(@as(usize, 1), fields.len);
+    const field = aggregate.instructions[@backingInt(fields[0])];
+    try std.testing.expectEqualDeep(Ir.Constant.Value{ .signed_integer = 0 }, sema.ir.getConstant(field.op.constant).?.value);
+    const projection = sema.ir.getFunction(sema.ir.globals.items[1].initializer).?.body.?;
+    const result = projection.instructions[@backingInt(projection.result)];
+    try std.testing.expectEqualDeep(Ir.Constant.Value{ .signed_integer = 0 }, sema.ir.getConstant(result.op.constant).?.value);
+    try sema.ir.verify();
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+}
+
+test "global data invalid constant arithmetic and unsupported syntax never reach startup" {
+    for ([_][]const u8{
+        "let mut n:int=1/0",
+        "let n:int=1%0",
+        "let n:i8=@as(i8,127)+1",
+        "let n:u8=@as(u8,0)-1",
+        "let n:i128=@as(i128,170141183460469231731687303715884105727)+1",
+        "let n:u128=@as(u128,340282366920938463463374607431768211455)*2",
+        "let n:i8=@as(i8,-128)/@as(i8,-1)",
+        "let n:int=values[0]/0\nlet values:[]int=[1]",
+        "let n:int=values[2]\nlet values:[]int=[1]",
+        "let n=\"é\"[0..3]",
+        "let values:[]int=[1]\nlet n=values[-2]",
+        if (Ir.native_pointer_bits == 64) "let values:[]int=[1]\nlet n=values[-9223372036854775807-1]" else "let values:[]int=[1]\nlet n=values[-2147483647-1]",
+        "let n=\"é🙂\"[-3]",
+        "let n=\"\"[-1]",
+        "let n=\"é🙂\"[-3..]",
+        "let n=\"é🙂\"[..-3]",
+        "let n=\"é🙂\"[-1..-2]",
+        "let n=\"é🙂\"[..=2]",
+        "let n=\"\"[..=0]",
+        "let n=true and {1/0==0}",
+        "let n:f64=@as(f64,1.0)/0.0",
+        "let n=if true {1} else {2}",
+        "let n=loop {break 1}",
+        "let n={return 1}",
+        "let n=&value\nlet value=1",
+    }) |source| {
+        var module = try Module.init(std.testing.allocator, "global-invalid-data.nov", source);
+        defer module.deinit();
+
+        var sema = try lower(&module);
+        defer sema.deinit();
+        try std.testing.expect(module.hasErrors());
+        try std.testing.expect(!sema.lowering_complete);
+        try std.testing.expectEqual(@as(usize, 0), sema.ir.functions.items.len);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+    }
 }
 
 fn deferredDiagnostic(module: *const Module, declaration: Module.Declaration) Module.Diagnostic.Tag {
@@ -1881,7 +2138,7 @@ test "nominal records reject mismatches malformed constructors defaults fields a
         .{ .source = "let A=struct{x:int,}\nlet f:(a:A)={a.x=1}", .tag = .immutable_assignment },
         .{ .source = "let A=struct{x:int,}\nlet f:(a:A)->int=a.y", .tag = .unknown_field },
         .{ .source = "let A=struct{x:int,}\nlet f:(a:[][]A)->bool=a in [a]", .tag = .operator_not_supported },
-        .{ .source = "let A=struct{x:int=0,}\nlet a=A.[]", .tag = .unsupported_global_initializer },
+
         .{ .source = "let A=struct{\nlet B=struct{x:int,}\n}", .tag = .unsupported_declaration },
         .{ .source = "let int=struct{}", .tag = .unsupported_shadowing },
         .{ .source = "let A=struct{\nlet constant:int=1\n}", .tag = .unsupported_declaration },
@@ -2878,38 +3135,26 @@ test "defaulted integer globals inline typed constants without runtime initializ
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
 }
 
-test "inferred global boundary rejects computation blocks chains and runtime effects" {
+test "global initializer boundary rejects runtime effects inexact types and nonstorable values" {
     for ([_][]const u8{
-        "let value: int = @as(int, 1 + 2)",
-        "let value: int = @as(int, {1})",
         "let value: int = @as(int, missing())",
         "let value: int = @as(int, {@println(true)\n1})",
-        "let value: int = @as(int, other)\nlet other: int = 1",
-        "let value: []int = @as([]int, [1])",
+
         "let value: void = @as(void, {})",
-        "let value: Fn = @as(Fn, f)\nlet Fn = () -> int\nlet f: () -> int = 1",
+
         "let value: uint = @as(int, 1)",
         "let value: uint = @as(uint, @as(int, 1))",
         "let value: string = @as(string, \"{true}\")",
-        "let value = @as(int, 1 + 2)",
-        "let value = @as(int, {1})",
-        "let value = {true}",
+
         "let value = @as(void, {})",
-        "let value = @as([]int, [1])",
+
         "let value = @as(int, missing())",
         "let value = @as(int, {@println(true)\n1})",
         "let value = @as(int, {return 1})",
-        "let value = other\nlet other = true",
-        "let value = other\nlet other = 1",
-        "let value = 1 + 2",
-        "let value = {1}",
-        "let value = [1]",
+
         "let value = -{let n = 1\nn}",
-        "let value = -{1 + 2}",
+
         "let value = 1\nlet read: () -> i8 = value",
-        "let f: () -> int = 1\nlet value = @as(() -> int, f)",
-        "let mut value = true",
-        "let mut value = @as(int, 1)",
     }) |source| {
         var module = try Module.init(std.testing.allocator, "global-boundary.nov", source);
         defer module.deinit();
@@ -2935,10 +3180,8 @@ test "inferred global boundary rejects computation blocks chains and runtime eff
     }
 }
 
-test "deferred and mutable globals cannot silently become executable constants" {
+test "nonstorable and inexact mutable globals never become executable constants" {
     for ([_][]const u8{
-        "let value: i32 = 1 + 2\nlet f: () -> i32 = 1",
-        "let mut value: i32 = 1\nlet f: () -> i32 = value",
         "let mut f: () -> i32 = 1",
         "let unit: void = {}\nlet f: () -> void = unit",
     }) |source| {
@@ -2946,8 +3189,7 @@ test "deferred and mutable globals cannot silently become executable constants" 
         defer module.deinit();
         var sema = try lower(&module);
         defer sema.deinit();
-        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
-        try std.testing.expectEqual(Module.Diagnostic.Tag.unsupported_lowering, module.diagnostics.items[0].tag);
+        try std.testing.expect(module.hasErrors());
         try std.testing.expect(!sema.lowering_complete);
         try std.testing.expectEqual(@as(usize, 0), sema.ir.functions.items.len);
     }
@@ -3449,10 +3691,10 @@ test "compilation deferred globals preserve standalone diagnostics root and impo
         .{ .source = "let n=@as(int,-1.5)", .tag = .literal_type_mismatch },
         .{ .source = "let n=@as(int,missing)", .tag = .unknown_name },
         .{ .source = "let n=@as(int,missing())", .tag = .unsupported_dependency_expression },
-        .{ .source = "let n=@as(int,{1})", .tag = .unsupported_global_initializer },
+
         .{ .source = "let n=absent", .tag = .unknown_name },
         .{ .source = "let x=y\nlet y=x", .tag = .value_cycle },
-        .{ .source = "let mut n:int=1", .tag = .unsupported_lowering },
+        .{ .source = "let mut n:int=1\nlet value=[n]", .tag = .unsupported_global_initializer },
         .{ .source = "let n={let x=1\nx}", .tag = .unsupported_dependency_expression },
     };
     for (cases) |case| for ([_]bool{ false, true }) |imported| {
@@ -3565,11 +3807,11 @@ test "namespace qualified enum globals support annotations inference aliases ree
         .{ .source =
         \\let lib=@import("api")
         \\let x=lib.value.flag
-        , .expected = .unsupported_dependency_expression },
+        , .expected = .unsupported_body_expression },
         .{ .source =
         \\let lib=@import("api")
         \\let x=lib.E.unmarked
-        , .expected = .unsupported_global_initializer },
+        , .expected = .unresolved_value_type },
     };
     for (cases) |case| {
         try testQualifiedEnumGlobal(std.testing.allocator, case.source, case.expected, true);
