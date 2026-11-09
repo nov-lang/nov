@@ -1800,6 +1800,7 @@ const Solver = struct {
         if (ast.nodes.items(.tag)[node] != .field_access) return null;
         const data = ast.nodes.items(.data)[node];
         const name = ast.tokenSlice(data.rhs);
+        if (Module.numericField(name)) return null;
         const receiver = root(try self.expression(frame, data.lhs, depth + 1));
         var container: ?Nominal = null;
         var owner: *Module = undefined;
@@ -1875,8 +1876,8 @@ const Solver = struct {
         const module = frame.ref.module;
         const ast = &module.source.ast;
         const data = ast.nodes.items(.data)[node];
-        const span = module.tokenSpan(ast.firstToken(node));
         const name = ast.tokenSlice(data.rhs);
+        const span = module.tokenSpan(if (Module.numericField(name)) data.rhs else ast.firstToken(node));
         if (self.querying) {
             var type_qualifier = false;
             if (ast.nodes.items(.tag)[data.lhs] == .identifier) {
@@ -1926,11 +1927,16 @@ const Solver = struct {
             return result;
         }
         if (base.value == .never) return base;
-        if (base.value == .structural and !base.value.structural.positional) {
+        const numeric = Module.numericField(name);
+        if (base.value == .structural) {
             const s = base.value.structural;
-            for (s.names, s.fields) |field_name, member| if (std.mem.eql(u8, field_name, name)) return member;
+            if (numeric and s.positional) {
+                if (Module.positionalIndex(name, s.fields.len)) |index| return s.fields[index];
+            } else if (!numeric and !s.positional) {
+                for (s.names, s.fields) |field_name, member| if (std.mem.eql(u8, field_name, name)) return member;
+            }
         }
-        if (base.value == .nominal) {
+        if (base.value == .nominal and !numeric) {
             const nominal = base.value.nominal;
             const owner_ast = &nominal.module.source.ast;
             const decl = nominal.module.getDeclaration(nominal.id).?;
@@ -1945,12 +1951,12 @@ const Solver = struct {
         if (base.value == .known) {
             const ty = self.ir.getType(base.value.known).?;
             if (ty == .record) {
-                for (ty.record.fields) |member| if (std.mem.eql(u8, member.name, name)) return self.fromType(member.ty, span, 0);
+                if (Module.recordFieldIndex(ty.record, name)) |index| return self.fromType(ty.record.fields[index].ty, span, 0);
             }
             if (ty == .string and std.mem.eql(u8, name, "len")) return self.fromType(try self.ir.internType(.{ .integer = .{ .signedness = .unsigned, .bits = Ir.native_pointer_bits } }), span, 0);
         }
         if (base.value == .array and std.mem.eql(u8, name, "len")) return self.fromType(try self.ir.internType(.{ .integer = .{ .signedness = .unsigned, .bits = Ir.native_pointer_bits } }), span, 0);
-        if (self.querying) try self.fail(.unknown_field, span, null);
+        if (self.querying or numeric) try self.fail(.unknown_field, span, null);
         self.unsupported = self.unsupported orelse span;
         return self.term(.unknown, span);
     }

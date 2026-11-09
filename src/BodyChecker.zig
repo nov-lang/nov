@@ -1721,7 +1721,8 @@ const Context = struct {
             const c = &q.context;
             const nominal = c.ir.getType(ty).?;
             if (nominal != .record) return null;
-            for (nominal.record.fields) |field| if (std.mem.eql(u8, field.name, name)) return .{ .ty = field.ty };
+            if (c.fieldIndex(ty, name)) |index| return .{ .ty = nominal.record.fields[index].ty };
+            if (Module.numericField(name)) return null;
             if (nominal.record.anonymous != .none) return null;
             // Ordinary nominal layouts can still be cold. Read their field
             // annotations in the defining scope without completing a layout.
@@ -2334,8 +2335,7 @@ const Context = struct {
     fn fieldIndex(self: *Context, ty: Ir.TypeId, name: []const u8) ?u32 {
         const record = self.ir.getType(ty).?;
         if (record != .record) return null;
-        for (record.record.fields, 0..) |field, i| if (std.mem.eql(u8, field.name, name)) return @intCast(i);
-        return null;
+        return Module.recordFieldIndex(record.record, name);
     }
 
     fn checkCallEffects(self: *Context, node: Ast.Node.Index) Error!bool {
@@ -4467,6 +4467,8 @@ const Context = struct {
                 self.borrow_base = previous_base;
                 if (self.terminated) return if (expected) |want| want.ty else base;
                 const array = self.ir.getType(base).?;
+                if (ast.nodes.items(.tag)[node] == .field_access and Module.numericField(ast.tokenSlice(data.rhs)) and self.fieldIndex(base, ast.tokenSlice(data.rhs)) == null)
+                    return self.fail(.unknown_field, node, null);
                 if (array == .record and ast.nodes.items(.tag)[node] == .field_access) {
                     if (array.record.tagged) return self.fail(.unsupported_body_expression, node, null);
                     const index = self.fieldIndex(base, ast.tokenSlice(data.rhs)) orelse return self.fail(.unknown_field, node, null);
@@ -4939,7 +4941,7 @@ const Context = struct {
                     // Array/string len also shadows method lookup.
                     if ((container == .array or container == .string) and std.mem.eql(u8, ast.tokenSlice(field.rhs), "len"))
                         return self.fail(.not_callable, node, null);
-                    if (container == .record or container == .enumeration) return self.fail(.unknown_field, call.ast.fn_expr, null);
+                    if (container == .record or container == .enumeration or Module.numericField(ast.tokenSlice(field.rhs))) return self.fail(.unknown_field, call.ast.fn_expr, null);
                     return self.fail(.unsupported_body_expression, call.ast.fn_expr, null);
                 }
                 const callee = (try self.expression(call.ast.fn_expr, null, depth + 1)) orelse return null;

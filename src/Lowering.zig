@@ -861,8 +861,19 @@ test "nested unions reject capture mutation and inner unknown tags under OOM" {
     , .unknown_field);
 }
 
-fn testStorableFieldSelection(allocator: std.mem.Allocator) !void {
-    var module = try Module.init(allocator, "field-selection.nov",
+fn testStorableFieldSelection(allocator: std.mem.Allocator, positional: bool) !void {
+    var module = try Module.init(allocator, "field-selection.nov", if (positional)
+        \\let R=@TypeOf(.[@as((int)->int,(n:int)->int {n})])
+        \\let main:()={let mut count:int=0
+        \\let mut r:R=.[(n){n+10}]
+        \\let receiver=()->R {count+=1
+        \\r}
+        \\let replace=()->int {r.0=(n){n+100}
+        \\7}
+        \\let result=receiver().0(replace())
+        \\@assert(result==17 and count==1)
+        \\@assert(r.0(7)==107)}
+    else
         \\let R=struct{callback:(int)->int,}
         \\let main:()={let mut count:int=0
         \\let mut r=R.[callback=(n){n+10}]
@@ -900,8 +911,8 @@ fn testStorableFieldSelection(allocator: std.mem.Allocator) !void {
 }
 
 test "storable fields select computed receivers once before captured argument mutation under OOM" {
-    try testStorableFieldSelection(std.testing.allocator);
-    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testStorableFieldSelection, .{});
+    try testStorableFieldSelection(std.testing.allocator, false);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testStorableFieldSelection, .{false});
 }
 
 test "storable fields callbacks aliases pipes generics references and readonly queries under OOM" {
@@ -1056,6 +1067,7 @@ test "nested unions readonly rejects inner enum tag and unexpected payload under
 fn testNestedUnionRejected(source: []const u8, tag: Module.Diagnostic.Tag) !void {
     var module = try Module.init(std.testing.allocator, "nested-union-errors.nov", source);
     defer module.deinit();
+
     var result = try lower(&module);
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
@@ -1425,6 +1437,162 @@ test "anonymous structs reject nominal conversion positional nominal and shape d
         \\x}
         ,
     }) |source| try testNestedUnionRejected(source, .expression_type_mismatch);
+}
+
+test "numbered fields select computed callbacks before captured argument mutation under OOM" {
+    try testStorableFieldSelection(std.testing.allocator, true);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testStorableFieldSelection, .{true});
+}
+
+test "numbered fields reads writes nested arrays references copies and callbacks under OOM" {
+    try testUnionArrayPayloadsOom(
+        \\let P=@TypeOf(.[@as(u8,1),.[2,[3]]])
+        \\let Alias=P
+        \\let first:(pair:`T)->u8=pair.0
+        \\let main:()={let mut r:Alias=.[1,.[2,[3]]]
+        \\let copy=r
+        \\r.0=4
+        \\r.1.0+=5
+        \\r.1.1[0]=6
+        \\let p=&r
+        \\p.*.0=7
+        \\let selected=p.*.1.0
+        \\let callbacks=.[(x:int)->int {x+1},(x:int)->int {x+2}]
+        \\let callback=callbacks.0
+        \\let called=callbacks.1(2)
+        \\let piped=3 |> callbacks.0
+        \\@println(first(r),copy.0,copy.1.1,selected,called,callback(4),piped)}
+    );
+}
+
+test "numbered fields structural generic callbacks deferred projections and contextual defaults under OOM" {
+    try testUnionArrayPayloadsOom(
+        \\let apply:(pair:`T,f:(`T)->`U)->`U=f(pair)
+        \\let both:(f:(`T)->`U,g:()->`T)->`U=f(g())
+        \\let P=@TypeOf(.[@as(u8,1),.[@as(u16,2)]])
+        \\let take:(p:P)->u16=p.1.0
+        \\let main:()={let a=apply(.[@as(u8,1),true],(pair){pair.0})
+        \\let b=both((pair){pair.0.1},(){.[.[false,@as(u16,2)]]})
+        \\let c=take(.[1,.[2]])
+        \\let exact_a:u8=a
+        \\let exact_b:u16=b
+        \\@println(exact_a,exact_b,c)}
+    );
+}
+
+fn testNumberedReadOnly(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "numbered-query.nov",
+        \\let effect:()->u8=1
+        \\let id:(x:`T)->`T=x
+        \\let A=@TypeOf(.[effect(),true].0)
+        \\let B=@TypeOf({let mut r=.[@as(u8,1),.[[2]]]
+        \\r.0=2
+        \\r.1.0[0]=3
+        \\let p=&r
+        \\p.*.0=4
+        \\r.0})
+        \\let main:()={let a:A=1
+        \\let b:B=2
+        \\@println(a,b,@TypeOf(.[id(1)].0),@TypeOf(.[effect].0()))}
+    );
+    defer module.deinit();
+    const declarations = module.declarations.items.len;
+    var sema = try lower(&module);
+    defer sema.deinit();
+    if (module.hasErrors()) std.debug.print("numbered query errors: {any}\n", .{module.diagnostics.items});
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try std.testing.expectEqual(declarations, module.declarations.items.len);
+    for (sema.ir.functions.items) |function| if (function.body) |body| {
+        for (body.instructions) |instruction| try std.testing.expect(instruction.op != .call);
+    };
+    try sema.ir.verify();
+}
+
+test "numbered fields readonly TypeOf projections and writes have no runtime effects under OOM" {
+    try testNumberedReadOnly(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testNumberedReadOnly, .{});
+}
+
+test "numbered fields reject nonpositional owners and out of range selectors at selector span under OOM" {
+    for ([_][]const u8{
+        "let main:()={let r=.[1,true]\n@println(r.2)}",
+        "let main:()={let mut r=.[1,true]\nr.2=3}",
+        "let main:()={let r=.[1]\n@println(r.99999999999999999999999999999999999999999999999999999999)}",
+        "let main:()={let r=.[value=1]\n@println(r.0)}",
+        "let R=struct{value:int,}\nlet main:(r:R)=@println(r.0)",
+        "let E=enum{a,b,}\nlet main:(r:E)=@println(r.0)",
+        "let main:()={let r=[1]\n@println(r.0)}",
+        "let main:()={let r=\"abc\"\n@println(r.0)}",
+        "let A=@TypeOf(.[1].2)",
+        "let A=@TypeOf(.[value=1].0)",
+        "let A=@TypeOf({let r=[1]\nr.0})",
+        "let A=@TypeOf(\"abc\".0)",
+        "let main:()={let r=.[(x:int)->int {x}]\nr.2(unknown)}",
+        "let A=@TypeOf({let r=.[(x:int)->int {x}]\nr.2(unknown)})",
+        "let apply:(pair:`T,f:(`T)->`U)->`U=f(pair)\nlet main:()=@println(apply(.[true],(pair){pair.2}))",
+    }) |source| {
+        const dot = std.mem.lastIndexOfScalar(u8, source, '.').?;
+        var end = dot + 1;
+        while (end < source.len and std.ascii.isDigit(source[end])) : (end += 1) {}
+        const operand = source[dot + 1 .. end];
+        try testAnonymousFirstDiagnostic(std.testing.allocator, source, .unknown_field, operand);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAnonymousFirstDiagnostic, .{ source, Module.Diagnostic.Tag.unknown_field, operand });
+    }
+}
+
+fn testNumberedCopies(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "numbered-copies.nov",
+        \\let main:()={let mut r=.[[1],.[2]]
+        \\let copy=r
+        \\let values=r.0
+        \\r.0[0]=3
+        \\r.1.0=4
+        \\@println(copy,values,r)}
+    );
+    defer module.deinit();
+    var sema = try lower(&module);
+    defer sema.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+    var copies: usize = 0;
+    var stores: usize = 0;
+    for (sema.ir.functions.items[0].body.?.instructions) |instruction| switch (instruction.op) {
+        .array_clone => copies += 1,
+        .field_store => stores += 1,
+        .array_index => return error.TestUnexpectedResult,
+        else => {},
+    };
+    // Whole-owner copies and selected array values retain the normal copy path.
+    try std.testing.expect(copies >= 2);
+    try std.testing.expectEqual(@as(usize, 2), stores);
+}
+
+test "numbered fields preserve aggregate and selected array copy operations under OOM" {
+    try testNumberedCopies(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testNumberedCopies, .{});
+}
+
+test "numbered fields retain exact writes immutable captures loans and unsupported field borrows" {
+    for ([_]struct { source: []const u8, tag: Module.Diagnostic.Tag }{
+        .{ .source = "let main:()={let r=.[1]\nr.0=2}", .tag = .immutable_assignment },
+        .{ .source = "let main:()={let mut r=.[@as(u8,1)]\nr.0=true}", .tag = .literal_type_mismatch },
+        .{ .source = "let main:(n:u16)={let mut r=.[@as(u8,1)]\nr.0=n}", .tag = .expression_type_mismatch },
+        .{ .source = "let main:()={let mut r=.[1]\nlet p=&r.0\n}", .tag = .unsupported_borrow },
+        .{ .source = "let A=@TypeOf({let r=.[1]\nr.0=2\nr})", .tag = .immutable_assignment },
+        .{ .source = "let A=@TypeOf({let mut r=.[1]\nr.0=true\nr})", .tag = .literal_type_mismatch },
+        .{ .source = "let main:()={let r=.[1]\nlet write=(){r.0=2}\nwrite()}", .tag = .immutable_assignment },
+        .{ .source = "let main:()->int={let r=.[1]\nr[0]}", .tag = .unsupported_body_expression },
+        .{ .source = "let P=@TypeOf(.[1])\nlet main:(p:&P)={p.*.0=2}", .tag = .immutable_assignment },
+        .{ .source = "let main:()={let mut r=.[1,2]\nlet p=&r\nr.1=3\n@println(p.*.0)}", .tag = .borrow_conflict },
+        .{ .source = "let main:()={let mut r=.[1,2]\nlet p=&r\n@println(r.1,p.*.0)}", .tag = .borrow_conflict },
+        .{ .source = "let main:()={let mut r=.[1]\nlet p=&r\nlet capture=(){@println(p.*.0)}\ncapture()}", .tag = .unsupported_borrow },
+        .{ .source = "let f=(pair){pair.0}", .tag = .generic_function_ambiguous },
+    }) |case| {
+        try testNestedUnionRejected(case.source, case.tag);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testRejectedMatchAllocations, .{case.source});
+    }
 }
 
 fn testUnionArrayPayloadsOom(source: []const u8) !void {

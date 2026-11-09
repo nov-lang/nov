@@ -31,6 +31,43 @@ pub const Span = Source.Span;
 
 pub const TypeBinding = struct { name: []const u8, ty: Ir.TypeId };
 
+pub fn numericField(name: []const u8) bool {
+    return name.len != 0 and std.ascii.isDigit(name[0]);
+}
+
+/// Parse a canonical decimal selector without truncation or runtime indexing.
+pub fn positionalIndex(name: []const u8, count: usize) ?u32 {
+    if (!numericField(name) or (name.len > 1 and name[0] == '0')) return null;
+    for (name) |byte| if (!std.ascii.isDigit(byte)) return null;
+    const index = std.fmt.parseInt(u32, name, 10) catch return null;
+    return if (index < count) index else null;
+}
+
+pub fn recordFieldIndex(record: Ir.Record, name: []const u8) ?u32 {
+    if (numericField(name)) return if (record.anonymous == .positional) positionalIndex(name, record.fields.len) else null;
+    if (record.anonymous == .positional) return null;
+    for (record.fields, 0..) |field, i| if (std.mem.eql(u8, field.name, name)) return @intCast(i);
+    return null;
+}
+
+test "numbered fields require canonical decimal positions and positional record identity" {
+    for ([_][]const u8{ "", "00", "01", "0x1", "1_0", "1.0", "+1", "-1", "4294967296", "99999999999999999999999999999999999" }) |name| {
+        try std.testing.expectEqual(@as(?u32, null), positionalIndex(name, 2));
+    }
+    try std.testing.expectEqual(@as(?u32, 0), positionalIndex("0", 2));
+    try std.testing.expectEqual(@as(?u32, 1), positionalIndex("1", 2));
+    try std.testing.expectEqual(@as(?u32, null), positionalIndex("2", 2));
+    const fields = [_]Ir.Field{
+        .{ .name = "1", .ty = @fromBackingInt(0), .span = .{ .start = 0, .end = 0 } },
+        .{ .name = "0", .ty = @fromBackingInt(0), .span = .{ .start = 0, .end = 0 } },
+    };
+    for ([_]@FieldType(Ir.Record, "anonymous"){ .none, .named, .positional }) |kind| {
+        const record: Ir.Record = .{ .identity = 0, .fields = &fields, .anonymous = kind };
+        try std.testing.expectEqual(if (kind == .positional) @as(?u32, 0) else null, recordFieldIndex(record, "0"));
+        try std.testing.expectEqual(if (kind == .positional) @as(?u32, 1) else null, recordFieldIndex(record, "1"));
+    }
+}
+
 pub fn hasTypeVariables(ast: *const Ast, node: Ast.Node.Index) bool {
     if (node == 0) return false;
     for (ast.tokens.items(.tag)[ast.firstToken(node) .. ast.lastToken(node) + 1]) |tag| {
