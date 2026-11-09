@@ -956,7 +956,7 @@ let ret2: () -> int = 2
 ; signature: (int, int) -> int
 let add: (a: int, b: int) -> int = a + b
 
-; return a positional anonymous struct (no tuple accessor syntax)
+; return a positional anonymous struct (fields use .0 and .1)
 let div: (a: int, b: int) -> @TypeOf(.[0, 0]) = {
     .[a / b, a % b]
 }
@@ -1236,9 +1236,27 @@ Bare same-name fields have no dot: `Rectangle.[width, height]` and
 type, all-bare `.[x, y]` is positional; an explicit assignment makes bare entries
 named shorthand, as in `.[a = 1, width]`. Old `Rectangle.[.width]` is rejected.
 Enum literals in positional values and union payloads keep their dots.
-Named fields use `value.a`; no positional field accessor or destructuring syntax
-is introduced. Positional values can be stored, passed, returned, printed and
-queried with `@TypeOf`.
+Named fields use `value.a`; positional fields use zero-based numbered access:
+
+```nov
+let pair = .[1, "a"]
+@println(pair.0, pair.1)
+let mut value = .[1, "a"]
+value.0 = 2
+```
+
+Selectors must be canonical nonnegative decimal positions (`.0`, `.1`, etc.),
+not expressions, signed values, alternate bases or numbers with separators.
+Invalid or out-of-range positions are compile errors in every mode. Numbered
+access is only for positional anonymous structs, not named structs, enums,
+arrays or strings. `[index]` remains array/string indexing, not tuple indexing.
+Nested selectors such as `value.0.1`, callable fields such as `value.0(args)`,
+and explicit reference access `reference.*.0` use existing field/call rules.
+Writes require a mutable owner and exactly matching field type; nested paths and
+array-valued fields retain the current mutation, copy and borrowing contracts.
+This adds no field borrowing (`&value.0`), implicit dereference or destructuring.
+`@TypeOf(value.0)` is unevaluated and reports that field's exact type. See
+[examples/positional-fields.nov](examples/positional-fields.nov).
 
 Anonymous identity uses the ordered field names and exact canonical field types
 (or ordered types for positional values), including across scopes and public

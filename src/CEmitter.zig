@@ -2365,6 +2365,150 @@ test "floats direct IR exact bits IEEE operations comparisons and separate C ABI
     for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, harness.written(), 0, "", "", mode);
 }
 
+const positional_fields_program =
+    \\let Pair=@TypeOf(.[1,"a"])
+    \\let U=union{some:[][]int,none,}
+    \\let id:(value:`T)->`T=value
+    \\let first:(value:`T)->@TypeOf(value.0)=value.0
+    \\let factory:()->@TypeOf(.[(x:string)->string{x},0])={
+    \\ let prefix="root"+"!"
+    \\ .[(x:string)->string{prefix+x},0]}
+    \\let main:()={
+    \\ let mut pair:Pair=.[1,"a"]
+    \\ pair.0+=2
+    \\ pair.1="b"
+    \\ @assert(pair.0==3 and pair.1=="b")
+    \\ let mut nested=.[.[4,5],true]
+    \\ nested.0.1=6
+    \\ @assert(nested.0.0==4 and nested.0.1==6 and nested.1)
+    \\ let p=&nested
+    \\ p.*.0.1+=1
+    \\ @assert(p.*.0.1==7)
+    \\ @assert(first(id(.[7,"generic"]))==7)
+    \\ let mut source=[[1,2],[3]]
+    \\ let mut record=.[source,U.some[source]]
+    \\ let saved=id(record)
+    \\ source[0]=[9]
+    \\ let mut row=record.0[0]
+    \\ row[0]=8
+    \\ record.0[0]=row
+    \\ record.0+=[[4]]
+    \\ @assert(saved.0[0][0]==1 and saved.0.len==2)
+    \\ @assert(record.0[0][0]==8 and record.0.len==3)
+    \\ let mut extracted=match record.1{.some=>|value|value
+    \\ .none=>[[0]]}
+    \\ extracted[0]=[7]
+    \\ let again=match saved.1{.some=>|value|value
+    \\ .none=>[[0]]}
+    \\ @assert(again[0][0]==1 and again[0][1]==2)
+    \\ @assert(extracted[0][0]==7 and source[0][0]==9)
+    \\ let mut count:int=0
+    \\ let mut r=.[(x:int)->int{count+=x
+    \\ count},1]
+    \\ let copy=r
+    \\ let result=r.0({r.0=(x:int)->int{100+x}
+    \\ r.1=9
+    \\ 2})
+    \\ @assert(result==2 and count==2 and r.1==9)
+    \\ @assert(copy.0(3)==5 and count==5)
+    \\ @assert(r.0(4)==104 and count==5)
+    \\ let mut rooted=factory()
+    \\ let text=rooted.0({rooted.0=(x:string)->string{"wrong"+x}
+    \\ "arg"+"!"})
+    \\ @assert(text=="root!arg!")
+    \\ let mut ranges=.[0..3,7]
+    \\ let old=ranges
+    \\ let mut sum:uint=0
+    \\ loop i in ranges.0{sum+=i
+    \\ ranges.0=8..10}
+    \\ loop i in old.0{sum+=i}
+    \\ loop i in ranges.0{sum+=i}
+    \\ @assert(sum==23 and ranges.1==7)
+    \\ let mut numbers=.[10,20]
+    \\ numbers.0+={numbers=.[100,99]
+    \\ 3}
+    \\ @assert(numbers.0==13 and numbers.1==99)
+    \\ numbers.0={numbers.1=88
+    \\ numbers.0+2}
+    \\ @assert(numbers.0==15 and numbers.1==88)
+    \\ let readonly=numbers
+    \\ let mut effects:int=0
+    \\ let queried:@TypeOf({effects+=1
+    \\ readonly.0})=7
+    \\ @assert(queried==7 and effects==0 and readonly.0==15)
+    \\ let mut arrays=.[[1,2],3]
+    \\ arrays.0[0]+={arrays.1=9
+    \\ 4}
+    \\ @assert(arrays.0[0]==5 and arrays.0[1]==2 and arrays.1==9)
+    \\ @println("Positional fields: ok")}
+;
+
+fn emitPositionalFieldsSourceFree(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    var lowered = blk: {
+        const source = try allocator.dupe(u8, text);
+        defer allocator.free(source);
+        var module = try Module.init(allocator, "positional-fields.nov", source);
+        defer module.deinit();
+        var result = try Lowering.lower(&module);
+        errdefer result.deinit();
+        if (module.hasErrors()) std.debug.print("positional field diagnostics: {any} {any}\n", .{ module.source.ast.errors, module.diagnostics.items });
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expect(result.lowering_complete);
+        break :blk result;
+    };
+    defer lowered.deinit();
+    try lowered.ir.verify();
+    return emit(allocator, &lowered.ir, null);
+}
+
+test "positional fields source free projections snapshots unions callable roots ranges mutation TypeOf forced GC O0 O3" {
+    const library = try emitPositionalFieldsSourceFree(test_gpa, positional_fields_program);
+    defer test_gpa.free(library);
+    const c = try collectingTestProgram(library);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "Positional fields: ok\n", "", mode);
+}
+
+fn testPositionalFieldAllocations(allocator: std.mem.Allocator) !void {
+    // Keep the exhaustive compiler OOM sweep small; runtime coverage uses the full fixture.
+    const c = try emitPositionalFieldsSourceFree(allocator,
+        \\let id:(x:`T)->`T=x
+        \\let main:()={let mut r=.[.[1,"a"],[2]]
+        \\ let saved=id(r)
+        \\ r.0.0+={r.0.1="b"
+        \\ 3}
+        \\ r.1[0]=5
+        \\ let q:@TypeOf(saved.0.0)=4
+        \\ @assert(r.0.0==q and r.0.1=="b" and saved.1[0]==2)}
+    );
+    defer allocator.free(c);
+}
+
+test "positional fields source free compiler emitter allocation rollback" {
+    try testPositionalFieldAllocations(test_gpa);
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testPositionalFieldAllocations, .{});
+}
+
+test "positional fields allocating argument OOM skips call after earlier argument effects O0 O3" {
+    const library = try emitPositionalFieldsSourceFree(test_gpa,
+        \\let main:()={let mut r=.[(x:string)->string{@print("C")
+        \\ x},0]
+        \\ @println(r.0({@print("A")
+        \\ r.0=(x:string)->string{x}
+        \\ "arg"+"!"}))}
+    );
+    defer test_gpa.free(library);
+    const c = try std.mem.concat(test_gpa, u8, &.{
+        "#include <stdlib.h>\nstatic void *test_malloc(size_t n) { (void)n; return NULL; }\n#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n",
+        library,
+        "\nint main(void) { nov_rt_heap.collect_every_allocation=1; nov_main(); return 0; }\n",
+    });
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 1, "A", "panic: GC allocation failed\n", mode);
+}
+
 fn emitAnonymousRecords(allocator: std.mem.Allocator) ![]u8 {
     var ir = Ir.init(allocator);
     defer ir.deinit();

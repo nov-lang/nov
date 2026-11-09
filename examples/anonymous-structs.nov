@@ -52,6 +52,8 @@ let inferred_positional_values: () = {
     let first: int = 1
     let second: int = 2
     let homogeneous = identity(.[ first, second ])
+    @assert(pair.0 == 1 and pair.1 == "a")
+    @assert(passed.0 == 1 and passed.1 == "a")
     @assert("{passed}" == ".[1, a]")
     @assert("{homogeneous}" == ".[1, 2]")
     @assert("{.[a = 1]}" == ".[ a: 1 ]")

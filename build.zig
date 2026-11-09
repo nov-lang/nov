@@ -115,6 +115,9 @@ fn addGcTests(b: *std.Build, test_step: *std.Build.Step) void {
 
 fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
+    const positional_field_tests = b.step("test-cli-positional-fields", "Run positional anonymous struct field CLI tests");
+    addPositionalFieldCliTests(b, exe, positional_field_tests);
+    test_step.dependOn(positional_field_tests);
     const anonymous_struct_tests = b.step("test-cli-anonymous-structs", "Run breaking struct constructor and anonymous value CLI tests");
     addAnonymousStructCliTests(b, exe, anonymous_struct_tests);
     test_step.dependOn(anonymous_struct_tests);
@@ -3622,6 +3625,113 @@ fn addArrayFieldCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step:
         _ = fixtures.add(source, case.source);
         const check = b.addRunArtifact(exe);
         check.step.name = b.fmt("CLI array fields: reject {s}", .{case.name});
+        check.setCwd(fixtures.getDirectory());
+        check.addArgs(&.{ "check", "--semantic", source });
+        check.expectExitCode(1);
+        check.expectStdOutEqual("");
+        check.expectStdErrMatch(case.diagnostic);
+        test_step.dependOn(&check.step);
+    }
+}
+
+fn addPositionalFieldCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    const fixtures = b.addWriteFiles();
+    _ = fixtures.add("positional-fields.nov", @embedFile("examples/positional-fields.nov"));
+    _ = fixtures.add("shapes.nov",
+        \\@[public]
+        \\let Pair = @TypeOf(.[1, "a"])
+        \\@[public]
+        \\let make: () -> Pair = .[7, "imported"]
+        \\
+    );
+    _ = fixtures.add("aliases.nov",
+        \\let shapes = @import("./shapes.nov")
+        \\@[public]
+        \\let Pair = shapes.Pair
+        \\
+    );
+    _ = fixtures.add("imported.nov",
+        \\let shapes = @import("./shapes.nov")
+        \\let aliases = @import("./aliases.nov")
+        \\let exercise: () = {
+        \\    let mut pair: aliases.Pair = shapes.make()
+        \\    pair.0 += 1
+        \\    @assert(pair.0 == 8 and pair.1 == "imported")
+        \\    let local: @TypeOf(.[ 1, "a" ]) = pair
+        \\    @assert(local.0 == 8 and local.1 == "imported")
+        \\}
+        \\let main: () = {
+        \\    exercise()
+        \\}
+        \\@[test]
+        \\let imported_projection: () = {
+        \\    exercise()
+        \\}
+        \\
+    );
+    for ([_][]const u8{ "positional-fields.nov", "imported.nov" }) |source| {
+        for ([_][]const u8{ "fmt", "semantic" }) |mode| {
+            const run = b.addRunArtifact(exe);
+            run.step.name = b.fmt("CLI positional fields: {s} {s}", .{ source, mode });
+            run.setCwd(fixtures.getDirectory());
+            run.addArgs(&.{ if (std.mem.eql(u8, mode, "fmt")) "fmt" else "check", if (std.mem.eql(u8, mode, "fmt")) "--check" else "--semantic", source });
+            if (std.mem.eql(u8, mode, "semantic")) {
+                run.addArg("--lib-dir");
+                run.addDirectoryArg(b.path("lib"));
+            }
+            run.expectExitCode(0);
+            run.expectStdOutEqual("");
+            run.expectStdErrEqual("");
+            test_step.dependOn(&run.step);
+        }
+        for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+            for ([_][]const u8{ "run", "test" }) |command| {
+                // Exercise executable-relative installed stdlib discovery as well as imports.
+                const run = b.addRunFile(.{ .relative = .{ .base = .install_bin, .sub_path = exe.out_filename } });
+                run.step.dependOn(b.getInstallStep());
+                run.step.name = b.fmt("CLI positional fields: {s} {s} ({s})", .{ source, command, mode });
+                run.setCwd(fixtures.getDirectory());
+                run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+                run.setEnvironmentVariable("NOV_CC", "");
+                run.setEnvironmentVariable("CC", "");
+                run.addArgs(&.{ command, source });
+                if (mode.len != 0) run.addArg(mode);
+                run.expectExitCode(0);
+                run.expectStdOutEqual(if (std.mem.eql(u8, source, "imported.nov"))
+                    (if (std.mem.eql(u8, command, "test")) "PASS imported_projection\n1 passed; 0 failed; 1 total\n" else "")
+                else if (std.mem.eql(u8, command, "test"))
+                    "PASS projection_and_generic_map\nPASS independent_nested_snapshots\nPASS callable_snapshot_and_shared_environment\nPASS reusable_range_field\nPASS numeric_mutation_and_unevaluated_type\n5 passed; 0 failed; 5 total\n"
+                else
+                    "Positional fields: ok\n");
+                run.expectStdErrEqual("");
+                test_step.dependOn(&run.step);
+            }
+        }
+    }
+    for ([_]struct { name: []const u8, source: []const u8, diagnostic: []const u8 = "error:" }{
+        .{ .name = "out-of-range", .source = "let main:()={let r=.[1,2]\n@println(r.2)}" },
+        .{ .name = "huge", .source = "let main:()={let r=.[1,2]\n@println(r.999999999999999999999999999999999999999999999999999999999999999999)}" },
+        .{ .name = "leading-zero", .source = "let main:()={let r=.[1,2]\n@println(r.01)}" },
+        .{ .name = "hexadecimal", .source = "let main:()={let r=.[1,2]\n@println(r.0x1)}" },
+        .{ .name = "separator", .source = "let main:()={let r=.[1,2]\n@println(r.0_1)}" },
+        .{ .name = "readonly", .source = "let main:()={let r=.[1,2]\nr.0=3}", .diagnostic = "assignment requires a mutable local" },
+        .{ .name = "readonly-reference", .source = "let main:()={let r=.[1,2]\nlet p=&r\np.*.0=3}" },
+        .{ .name = "type-conflict", .source = "let main:()={let mut r=.[1,2]\nr.0=true}", .diagnostic = "literal does not match the annotated type" },
+        .{ .name = "named-anonymous", .source = "let main:()={let r=.[a=1,b=2]\n@println(r.0)}" },
+        .{ .name = "nominal", .source = "let R=struct{a:int,}\nlet main:()={let r=R.[a=1]\n@println(r.0)}" },
+        .{ .name = "enum", .source = "let E=enum{a,b,}\nlet main:()={let r:E=.a\n@println(r.0)}" },
+        .{ .name = "array", .source = "let main:()={let r=[1,2]\n@println(r.0)}" },
+        .{ .name = "string", .source = "let main:()={let r=\"ab\"\n@println(r.0)}" },
+        .{ .name = "tuple-bracket", .source = "let main:()={let r=.[1,2]\n@println(r[0])}" },
+        .{ .name = "dynamic-index", .source = "let main:()={let r=.[1,2]\nlet i:int=0\n@println(r[i])}" },
+        .{ .name = "field-borrow", .source = "let main:()={let mut r=.[1,2]\nlet p=&r.0\n}", .diagnostic = "local references require &local or &localArray[index]" },
+        .{ .name = "element-borrow", .source = "let main:()={let mut r=.[[1],2]\nlet p=&r.0[0]\n}", .diagnostic = "local references require &local or &localArray[index]" },
+        .{ .name = "implicit-reference", .source = "let main:()={let mut r=.[1,2]\nlet p=&r\n@println(p.0)}" },
+    }) |case| {
+        const source = b.fmt("invalid-positional-{s}.nov", .{case.name});
+        _ = fixtures.add(source, case.source);
+        const check = b.addRunArtifact(exe);
+        check.step.name = b.fmt("CLI positional fields: reject {s}", .{case.name});
         check.setCwd(fixtures.getDirectory());
         check.addArgs(&.{ "check", "--semantic", source });
         check.expectExitCode(1);

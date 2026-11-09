@@ -8,6 +8,7 @@ const Tokenizer = @This();
 
 buffer: [:0]const u8,
 index: ByteOffset,
+previous_tag: Token.Tag = .eof,
 
 pub const ByteOffset = u32;
 
@@ -686,7 +687,8 @@ pub fn next(self: *Tokenizer) Token {
             }
         },
         .int => switch (self.buffer[self.index]) {
-            '.' => continue :state .int_period,
+            // A selector's next dot starts another suffix, not a float.
+            '.' => if (self.previous_tag != .period) continue :state .int_period,
             '_', 'a'...'d', 'f'...'o', 'q'...'z', 'A'...'D', 'F'...'O', 'Q'...'Z', '0'...'9' => {
                 self.index += 1;
                 continue :state .int;
@@ -750,7 +752,27 @@ pub fn next(self: *Tokenizer) Token {
     }
 
     result.end = self.index;
+    self.previous_tag = result.tag;
     return result;
+}
+
+test "positional selectors split chained dots without changing floats or ranges" {
+    const source = "pair.0.1 p.*.0 make().0 pair.0(0.1,1e-2) pair.0..1 pair.1..=2 0.1 1.2e+3 0..1 0..=1";
+    const slices = [_][]const u8{
+        "pair", ".",   "0", ".",   "1",      "p", ".",    "*", ".",    "0",   "make", "(",  ")", ".",    "0",
+        "pair", ".",   "0", "(",   "0.1",    ",", "1e-2", ")", "pair", ".",   "0",    "..", "1", "pair", ".",
+        "1",    "..=", "2", "0.1", "1.2e+3", "0", "..",   "1", "0",    "..=", "1",
+    };
+    var lexer = Tokenizer.init(source);
+    for (slices) |expected| {
+        const token = lexer.next();
+        try std.testing.expectEqualStrings(expected, source[token.start..token.end]);
+    }
+    try std.testing.expectEqual(Token.Tag.eof, lexer.next().tag);
+    for ([_][:0]const u8{ "pair.00", "pair.01", "pair.0x1", "pair.0b1", "pair.1_0", "pair.1e2", "pair.1e+2", "pair.1p-2", "pair.1abc" }) |invalid| {
+        try testTokenize(invalid, &.{ .identifier, .period, .number_literal });
+    }
+    try testTokenize("pair.0 ; selector\n0.1", &.{ .identifier, .period, .number_literal, .newline, .number_literal });
 }
 
 test "quoted placeholders remain a single exact literal token" {

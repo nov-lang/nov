@@ -346,6 +346,43 @@ fn expectFormatted(source: [:0]const u8, expected: []const u8) !void {
     try std.testing.expectEqualStrings(formatted, again);
 }
 
+test "positional selectors preserve chains floats ranges comments interpolation writes and OOM" {
+    try expectFormatted("let x=pair.0.1\nlet y=p.*.0\nlet z=make().0\nlet f=pair.0(0.1,1e-2)", "let x = pair.0.1\nlet y = p.*.0\nlet z = make().0\nlet f = pair.0(0.1, 1e-2)\n");
+    for ([_][:0]const u8{
+        "let pair=.[1,2]\nlet x=pair.0 ; first\n; next\nlet y=pair.1",
+        "let x=pair.0..pair.1\nlet y=pair.0..=2\nlet z=pair.0+0.1\nlet a=pair[0]",
+        "let main:()={pair.0=1\npair.1+=2\npair.0-=1\npair.1*=2\npair.0/=2\npair.1%=2\npair.0.1=3\np.*.0=4}",
+        "let f:(x:`T)->`T=pair.0(x)\nlet F=(pair.0)->pair.1",
+        "let text=\"{pair.0.1}:{pair.0(0.1)}:{\"{make().0}\"}\"",
+        "let huge=pair.999999999999999999999999999999999999999999",
+    }) |source| {
+        const rendered = try format(std.testing.allocator, source);
+        defer std.testing.allocator.free(rendered);
+        try expectFormatted(source, rendered);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{source});
+    }
+}
+
+test "positional selectors reject invalid decimal spelling during formatting under OOM" {
+    for ([_][:0]const u8{
+        "let x=pair.00",  "let x=pair.01",  "let x=pair.0x1",  "let x=pair.0b1",  "let x=pair.0o1",
+        "let x=pair.1_0", "let x=pair.1e2", "let x=pair.1e+2", "let x=pair.1p-2", "let x=pair.1abc",
+        "let x=pair.-1",  "let x=pair.+1",  "let x=pair.",     "let x=pair.0.01", "let x=pair.0.1e2",
+    }) |source| {
+        try std.testing.expectError(error.InvalidSource, format(std.testing.allocator, source));
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testInvalidPositionalFormatAllocationFailures, .{source});
+    }
+}
+
+fn testInvalidPositionalFormatAllocationFailures(allocator: std.mem.Allocator, source: [:0]const u8) !void {
+    const result = format(allocator, source) catch |err| switch (err) {
+        error.InvalidSource => return,
+        else => return err,
+    };
+    defer allocator.free(result);
+    return error.ExpectedInvalidSource;
+}
+
 test "inferred closures format bare parameters callbacks results and comments" {
     try expectFormatted("let f=(x){x*2}", "let f = (x) {\n    x * 2\n}\n");
     try expectFormatted("let ys=xs.map((x){x*2})", "let ys = xs.map(\n    (x) {\n        x * 2\n    }\n)\n");

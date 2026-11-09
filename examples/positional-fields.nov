@@ -1,0 +1,164 @@
+; nov run examples/positional-fields.nov
+; nov test examples/positional-fields.nov
+
+let std = @import("std")
+let Pair = @TypeOf(.[ 1, "a" ])
+let Payload = union {
+    some: [][]int,
+    none,
+}
+let identity: (value: `T) -> `T = value
+let first: (value: `T) -> @TypeOf(value.0) = value.0
+
+let projections: () = {
+    let mut pair: Pair = .[ 1, "a" ]
+    pair.0 += 2
+    pair.1 = "b"
+    @assert(pair.0 == 3 and pair.1 == "b")
+    let mut nested = .[ .[ 4, 5 ], true ]
+    nested.0.1 = 6
+    @assert(nested.0.0 == 4 and nested.0.1 == 6 and nested.1)
+    let p = &nested
+    p.*.0.1 += 1
+    @assert(p.*.0.1 == 7)
+    let pairs = std.array.map(
+        [1, 2],
+        (value) {
+            .[ value, "item:{value}" ]
+        }
+    )
+    let projected = std.array.map(pairs, first)
+    @assert(projected[0] == 1 and projected[1] == 2)
+    @assert(identity(pairs[1]).1 == "item:2")
+}
+
+let snapshots: () = {
+    let mut source = [[1, 2], [3]]
+    let mut record = .[ source, Payload.some[source] ]
+    let saved = identity(record)
+    source[0] = [9]
+    let mut row = record.0[0]
+    row[0] = 8
+    record.0[0] = row
+    record.0 += [[4]]
+    @assert(saved.0[0][0] == 1 and saved.0.len == 2)
+    @assert(record.0[0][0] == 8 and record.0.len == 3)
+    let mut extracted = match record.1 {
+        .some => |value| value
+        .none => [[0]]
+    }
+    extracted[0] = [7]
+    let again = match saved.1 {
+        .some => |value| value
+        .none => [[0]]
+    }
+    @assert(again[0][0] == 1 and again[0][1] == 2)
+    @assert(extracted[0][0] == 7 and source[0][0] == 9)
+}
+
+let call_order: () = {
+    let mut count: int = 0
+    let prefix = "saved" + "!"
+    let mut r = .[
+        (suffix: string) -> string {
+            count += 1
+            prefix + suffix
+        },
+        1
+    ]
+    let copy = r
+    let result = r.0(
+        {
+            r.0 = (suffix: string) -> string {
+                "replacement" + suffix
+            }
+            r.1 = 9
+            "?" + "!"
+        }
+    )
+    @assert(result == "saved!?!" and count == 1 and r.1 == 9)
+    @assert(copy.0("x") == "saved!x" and count == 2)
+    @assert(r.0("y") == "replacementy" and count == 2)
+}
+
+let range_reuse: () = {
+    let mut r = .[ 0..3, 7 ]
+    let saved = r
+    let mut sum: uint = 0
+    loop i in r.0 {
+        sum += i
+        r.0 = 8..10
+    }
+    @assert(sum == 3 and r.1 == 7)
+    loop i in saved.0 {
+        sum += i
+    }
+    @assert(sum == 6)
+    loop i in r.0 {
+        sum += i
+    }
+    @assert(sum == 23)
+}
+
+let mutation_and_type_queries: () = {
+    let mut pair = .[ 10, 20 ]
+    pair.0 += {
+        pair = .[ 100, 99 ]
+        3
+    }
+    @assert(pair.0 == 13 and pair.1 == 99)
+    pair.0 = {
+        pair.1 = 88
+        pair.0 + 2
+    }
+    @assert(pair.0 == 15 and pair.1 == 88)
+    let mut effects: int = 0
+    let readonly = pair
+    let queried: @TypeOf(
+        {
+            effects += 1
+            readonly.0
+        }
+    ) = 7
+    @assert(queried == 7 and effects == 0 and readonly.0 == 15)
+    let mut arrays = .[ [1, 2], 3 ]
+    arrays.0[0] += {
+        arrays.1 = 9
+        4
+    }
+    @assert(arrays.0[0] == 5 and arrays.0[1] == 2 and arrays.1 == 9)
+}
+
+let main: () = {
+    projections()
+    snapshots()
+    call_order()
+    range_reuse()
+    mutation_and_type_queries()
+    @println("Positional fields: ok")
+}
+
+@[test]
+let projection_and_generic_map: () = {
+    projections()
+}
+
+@[test]
+let independent_nested_snapshots: () = {
+    snapshots()
+}
+
+@[test]
+let callable_snapshot_and_shared_environment: () = {
+    call_order()
+}
+
+@[test]
+let reusable_range_field: () = {
+    range_reuse()
+}
+
+@[test]
+let numeric_mutation_and_unevaluated_type: () = {
+    mutation_and_type_queries()
+}

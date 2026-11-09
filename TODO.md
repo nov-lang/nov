@@ -50,6 +50,16 @@ results. See `examples/array-fields.nov`.
 
 ## Current delivered status
 
+Positional anonymous structs support zero-based `.0`, `.1`, etc. for reads,
+exact-type writes through mutable owners, nested paths, callable fields and
+explicit reference projections. Numeric selectors are compile-time canonical
+decimal positions; invalid owners, huge selectors and out-of-range positions
+produce compile errors. Ordinary floats/ranges remain intact and chained `.0.1`
+is tokenized as two selectors. Generic inference and unevaluated type queries use
+the existing structural field types. Arrays still use `[index]`; tuples do not
+support bracket/dynamic indexing, field borrowing or destructuring. See
+examples/positional-fields.nov (five tests).
+
 Struct construction uses `Name.[field = value]` or contextual `.[field = value]`;
 old `Name[...]` constructors are rejected outright. Same-name shorthand is bare:
 `Name.[width, height]`, or `.[width, height]` with a named expected type. Without
@@ -728,7 +738,8 @@ Old dotted shorthand `Name.[.width]` is rejected. Old
 and positional `.[1, "a"]` values support storage, passing, printing and `@TypeOf`;
 even homogeneous `.[1, 2]` is not an array. Structural identity uses ordered names
 and canonical exact types across scopes/modules, and remains distinct from nominal
-types. Named/positional mixing is rejected; no tuple access/destructuring is added.
+types. Named/positional mixing is rejected. Numbered `.0`/`.1` access is supported;
+destructuring remains deferred.
 Contextual named constructors retain existing scalar-only defaults. Anonymous
 unions/enums remain deferred; union payloads, indexing and slicing are unchanged.
 Nominal debug-print output remains `Name[ field: value ]` / `Empty[]`; anonymous

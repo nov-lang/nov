@@ -313,6 +313,8 @@ fn renderExpression(self: *Render, node: Ast.Node.Index, space: Space) RenderErr
         .field_access => {
             try self.renderExpression(datas[node].lhs, .none);
             try self.renderToken(main_tokens[node], .none);
+            if (token_tags[datas[node].rhs] == .number_literal)
+                return self.renderToken(datas[node].rhs, space);
             return self.renderIdentifier(datas[node].rhs, space, .preserve_when_shadowing);
         },
 

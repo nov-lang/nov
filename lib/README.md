@@ -30,7 +30,10 @@ constructors are rejected. Anonymous named `.[a = 1]` and positional `.[1, "a"]`
 values work with inferred generic helpers such as `std.array.map`. Their structural
 identity uses ordered names and exact canonical types, including public module
 aliases, and is distinct from nominal structs. `.[1, 2]` is not an array; `[1, 2]`
-is. No positional access/destructuring or mixed named/positional syntax is added.
+is. Positional fields use `.0`, `.1`, etc., with compile-time position checks and
+exact-type writes through mutable owners. Nested paths, callable fields and
+explicit `reference.*.0` follow the ordinary field rules. Bracket/dynamic tuple
+indexing, destructuring and mixed named/positional construction remain unsupported.
 Existing scalar-only defaults, recursive array snapshots and closure-field sharing
 remain unchanged. Anonymous unions/enums remain deferred; `.some[value]`, `.none[]`,
 array indexing and slicing keep their existing syntax. See

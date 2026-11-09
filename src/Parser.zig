@@ -1463,6 +1463,37 @@ fn parsePrimaryTypeExpr(self: *Parser) Error!Node.Index {
     }
 }
 
+test "positional selectors reuse field access through chains calls annotations writes and OOM" {
+    const source = "let pair=.[1,2]\nlet a=pair.0.1\nlet b=p.*.0\nlet c=make().0\nlet d=pair.0(0.1,1e-2)\nlet r=pair.0..pair.1\nlet s=pair.0..=2\nlet huge=pair.999999999999999999999999999999999999999999\nlet f:(x:`T)->`T=pair.0(x)\nlet main:()={pair.0=1\npair.1+=2\npair.0-=1\npair.1*=2\npair.0/=2\npair.1%=2\npair.0.1=3\np.*.0=4}\nlet text=\"{pair.0.1}:{pair.0(0.1)}\"";
+    var ast = try parse(std.testing.allocator, source);
+    defer ast.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    var count: usize = 0;
+    for (ast.nodes.items(.tag), ast.nodes.items(.main_token), ast.nodes.items(.data)) |tag, main, data| {
+        if (tag != .field_access) continue;
+        count += 1;
+        try std.testing.expectEqual(Token.Tag.period, ast.tokens.items(.tag)[main]);
+        try std.testing.expectEqual(Token.Tag.number_literal, ast.tokens.items(.tag)[data.rhs]);
+        for (ast.tokenSlice(data.rhs)) |byte| try std.testing.expect(std.ascii.isDigit(byte));
+    }
+    try std.testing.expect(count >= 20);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
+}
+
+test "positional selectors reject noncanonical digits and malformed suffixes under OOM" {
+    for ([_][:0]const u8{
+        "let x=pair.00",  "let x=pair.01",  "let x=pair.0x1",  "let x=pair.0b1",  "let x=pair.0o1",
+        "let x=pair.1_0", "let x=pair.1e2", "let x=pair.1e+2", "let x=pair.1p-2", "let x=pair.1abc",
+        "let x=pair.-1",  "let x=pair.+1",  "let x=pair.",     "let x=pair.0.01", "let x=pair.0.1e2",
+        "let x=.[0=1]",   "let x=.[.0=1]",
+    }) |source| {
+        var ast = try parse(std.testing.allocator, source);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expect(ast.errors.len != 0);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
+    }
+}
+
 test "anonymous constructors own named and positional operands with exact spans and OOM" {
     for ([_][:0]const u8{ ".[a=1,b=\"x\"]", ".[1,\"a\"]", ".[1,2]", ".[]", "Name.[a=.[1,2]]", "Name.[width]", ".[x,y]", ".[x=x,y=y]", ".[.red]", "Name.[.width]", ".[.red,1]" }) |expression| {
         const source = try std.fmt.allocPrintSentinel(std.testing.allocator, "let value={s}", .{expression}, 0);
@@ -1727,14 +1758,31 @@ fn parseSuffixOp(self: *Parser, lhs: Node.Index) Error!Node.Index {
         },
         .period => switch (self.token_tags[self.tok_i + 1]) {
             .l_bracket => return self.parseStructInit(lhs),
-            .identifier => return self.addNode(.{
-                .tag = .field_access,
-                .main_token = self.nextToken(),
-                .data = .{
-                    .lhs = lhs,
-                    .rhs = self.nextToken(),
-                },
-            }),
+            .identifier, .number_literal => {
+                if (self.token_tags[self.tok_i + 1] == .number_literal) {
+                    var lexer: Tokenizer = .{
+                        .buffer = self.source,
+                        .index = self.token_starts[self.tok_i + 1],
+                        .previous_tag = .period,
+                    };
+                    const token = lexer.next();
+                    const selector = self.source[token.start..token.end];
+                    // Validate spelling only: even an overflowing index is a
+                    // syntactically valid selector for semantic lookup to reject.
+                    if (selector.len > 1 and selector[0] == '0') return self.fail(.expected_suffix_op);
+                    for (selector) |byte| {
+                        if (!std.ascii.isDigit(byte)) return self.fail(.expected_suffix_op);
+                    }
+                }
+                return self.addNode(.{
+                    .tag = .field_access,
+                    .main_token = self.nextToken(),
+                    .data = .{
+                        .lhs = lhs,
+                        .rhs = self.nextToken(),
+                    },
+                });
+            },
             .bang => return self.addNode(.{
                 .tag = .unwrap,
                 .main_token = self.nextToken(),

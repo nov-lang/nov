@@ -146,14 +146,34 @@ test "nested call views retain independent argument slices" {
     try std.testing.expectEqualStrings("1", tree.tokenSlice(tree.firstToken(inner.ast.args[0])));
 }
 
+test "positional selector AST owns numeric token indices and exact chain spans" {
+    var tree = try Parser.parse(std.testing.allocator, "let value = pair.0.1");
+    defer tree.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+    const outer = tree.decl(tree.rootDecls()[0]).ast.init_node;
+    const inner = tree.nodes.items(.data)[outer].lhs;
+    for ([_]Node.Index{ inner, outer }, [_][]const u8{ "0", "1" }) |node, selector| {
+        try std.testing.expectEqual(Node.Tag.field_access, tree.nodes.items(.tag)[node]);
+        const rhs = tree.nodes.items(.data)[node].rhs;
+        try std.testing.expectEqual(Token.Tag.number_literal, tree.tokens.items(.tag)[rhs]);
+        try std.testing.expectEqualStrings(selector, tree.tokenSlice(rhs));
+        try std.testing.expectEqual(rhs, tree.lastToken(node));
+        try std.testing.expectEqualStrings(".", tree.tokenSlice(tree.nodes.items(.main_token)[node]));
+        try std.testing.expectEqualStrings("pair", tree.tokenSlice(tree.firstToken(node)));
+    }
+    const span = tree.nodeToSpan(outer);
+    try std.testing.expectEqualStrings("pair.0.1", tree.source[span.start..span.end]);
+}
+
 test "expression token boundaries follow delimiters rather than newline counts" {
     const expressions = [_][:0]const u8{
-        "[]",                "[1]",        "[1, 2,]",         "[1, 2, 3,\n]",    "[[1], [2, 3],]",         "a[0]",                              "a[-1]",                         "make()[0]",               "a[call(0)]",
-        "{}",                "{\n\n}",     "{1}",             "{1\n}",           "{\n1\n\n; tail\n}",      "{1\n2}",                            "{1\n2\n3\n\n}",                 "{{1}\n{2}\n3}",           "named: {1}",
-        "{\r\n\t1\r\n\r\n}", "f()",        "f(\n\n)",         "f(1)",            "f(1,)",                  "f(\n1\n)",                          "f(1, 2)",                       "f(1, 2,\n\n)",            "f(g(1), h(2, 3))",
-        "()",                "(\n\n)",     "(x: int)",        "(x: int,\n\n)",   "(x: int, y: bool,\n)",   "(callback: (x: int) -> int,\n)",    "() -> int",                     "(x: int, y: int) -> int", "1 + f(2, 3)",
-        "{1} * 3",           "-f(1)",      "#f(1)",           "f(\"(\", \")\")", "{\"}\"}",                "f(1, ; ) ignored in comment\n2\n)", "{; } ignored in comment\n1\n}", ".[]",                     ".[a=1]",
-        ".[1,2]",            ".[1,\"a\"]", "Name.[a=.[1,2]]", "Name.[width]",    ".[; ] ignored\na=1,\n]", "make().[a=1]",                      ".[1,2][0]",
+        "[]",                "[1]",             "[1, 2,]",      "[1, 2, 3,\n]",           "[[1], [2, 3],]",       "a[0]",                              "a[-1]",                         "make()[0]",               "a[call(0)]",
+        "{}",                "{\n\n}",          "{1}",          "{1\n}",                  "{\n1\n\n; tail\n}",    "{1\n2}",                            "{1\n2\n3\n\n}",                 "{{1}\n{2}\n3}",           "named: {1}",
+        "{\r\n\t1\r\n\r\n}", "f()",             "f(\n\n)",      "f(1)",                   "f(1,)",                "f(\n1\n)",                          "f(1, 2)",                       "f(1, 2,\n\n)",            "f(g(1), h(2, 3))",
+        "()",                "(\n\n)",          "(x: int)",     "(x: int,\n\n)",          "(x: int, y: bool,\n)", "(callback: (x: int) -> int,\n)",    "() -> int",                     "(x: int, y: int) -> int", "1 + f(2, 3)",
+        "{1} * 3",           "-f(1)",           "#f(1)",        "f(\"(\", \")\")",        "{\"}\"}",              "f(1, ; ) ignored in comment\n2\n)", "{; } ignored in comment\n1\n}", ".[]",                     ".[a=1]",
+        "pair.0",            "pair.0.1",        "p.*.0",        "make().0",               "pair.0(args)",         "pair.0..pair.1",                    "pair.0 + 0.1",                  "pair[0]",                 ".[1,2]",
+        ".[1,\"a\"]",        "Name.[a=.[1,2]]", "Name.[width]", ".[; ] ignored\na=1,\n]", "make().[a=1]",         ".[1,2][0]",
     };
     for (expressions) |expression| {
         errdefer std.debug.print("expression span case: {s}\n", .{expression});
@@ -359,6 +379,7 @@ pub fn tokenSlice(self: Ast, token_index: TokenIndex) []const u8 {
     var tokenizer: Tokenizer = .{
         .buffer = self.source,
         .index = token_starts[token_index],
+        .previous_tag = if (token_index > 0) token_tags[token_index - 1] else .eof,
     };
     const token = tokenizer.next();
     assert(token.tag == token_tag);
@@ -1572,7 +1593,8 @@ pub const Node = struct {
         attr_decl,
         /// `lhs.a`.
         /// main_token is the dot.
-        /// rhs is the identifier token index.
+        /// rhs is an identifier or canonical decimal number_literal token index.
+        /// Numeric selectors are not converted to integers by the parser.
         field_access,
         /// `lhs.!`.
         /// main_token is the dot.
