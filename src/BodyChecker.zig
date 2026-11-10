@@ -1223,7 +1223,11 @@ const Context = struct {
     // lexical binding keeps its reference type and its independent rebind flag.
     fn dereferenceBinding(self: *Context, node: Ast.Node.Index) Error!?Binding {
         const ast = &self.module.source.ast;
-        const operand = ast.nodes.items(.data)[node].lhs;
+        return self.dereferenceOperand(node, ast.nodes.items(.data)[node].lhs);
+    }
+
+    fn dereferenceOperand(self: *Context, node: Ast.Node.Index, operand: Ast.Node.Index) Error!?Binding {
+        const ast = &self.module.source.ast;
         if (ast.nodes.items(.tag)[operand] != .identifier) {
             _ = try self.fail(.unsupported_borrow, node, null);
             return null;
@@ -2198,7 +2202,7 @@ const Context = struct {
                     .terminal => return .{ .checked = if (expected) |want| want.ty else try self.ir.internType(.void) },
                     .failed => return .{ .checked = null },
                 }
-            } else try self.copyNode(field.lhs, arg.ty.?);
+            } else if (!try self.receiverValue(field.lhs, arg.ty.?, depth + 1)) return .{ .checked = null };
         }
         const related = ref.span();
         for (call.ast.args, params[offset..]) |arg, param| {
@@ -2350,7 +2354,15 @@ const Context = struct {
         return self.nominalMethod(ty, ast.tokenSlice(data.rhs));
     }
 
-    fn receiverReference(self: *Context, ty: Ir.TypeId, name: []const u8) ?GenericFunctions.Ref {
+    // Method lookup alone sees through a reference; field lookup keeps the
+    // original type so callable fields still require an explicit dereference.
+    fn receiverType(self: *Context, ty: Ir.TypeId) Ir.TypeId {
+        const value = self.ir.getType(ty).?;
+        return if (value == .reference) value.reference.child else ty;
+    }
+
+    fn receiverReference(self: *Context, source_ty: Ir.TypeId, name: []const u8) ?GenericFunctions.Ref {
+        const ty = self.receiverType(source_ty);
         if (self.fieldIndex(ty, name) != null) return null;
         const nominal = self.ir.getType(ty).?;
         if (nominal == .record and nominal.record.anonymous != .none) return null;
@@ -2367,8 +2379,9 @@ const Context = struct {
         return .{ .module = owner, .id = id, .container_type = if (nominal == .record and nominal.record.type_args.len != 0) ty else null };
     }
 
-    fn receiverArgumentType(self: *Context, ty: Ir.TypeId, name: []const u8) Error!Ir.TypeId {
-        const ref = self.receiverReference(ty, name) orelse return ty;
+    fn receiverArgumentType(self: *Context, source_ty: Ir.TypeId, name: []const u8) Error!Ir.TypeId {
+        const ref = self.receiverReference(source_ty, name) orelse return source_ty;
+        const ty = self.receiverType(source_ty);
         const ast = &ref.module.source.ast;
         const function = ast.declFunction(ref.module.getDeclaration(ref.id).?.node).?;
         var params = ast.fullFnProto(function.proto_node).?.iterate(ast);
@@ -2382,8 +2395,9 @@ const Context = struct {
     fn receiverArgument(self: *Context, node: Ast.Node.Index, ty: Ir.TypeId, depth: usize) Error!ReceiverArgument {
         const reference = self.ir.getType(ty).?.reference;
         const ast = &self.module.source.ast;
-        const binding = if (ast.nodes.items(.tag)[node] == .deref) blk: {
-            const binding = (try self.dereferenceBinding(node)) orelse return .failed;
+        const implicit = if (try self.probe(node, depth + 1)) |known| self.ir.getType(known.ty).? == .reference else false;
+        const binding = if (ast.nodes.items(.tag)[node] == .deref or implicit) blk: {
+            const binding = (if (implicit) try self.dereferenceOperand(node, node) else try self.dereferenceBinding(node)) orelse return .failed;
             if (reference.mutable and !binding.mutable) {
                 _ = try self.fail(.immutable_assignment, node, binding.name_span);
                 return .failed;
@@ -2440,9 +2454,22 @@ const Context = struct {
         return .{ .ty = signature, .annotation = decl.name_span };
     }
 
-    fn receiverMethod(self: *Context, ty: Ir.TypeId, name: []const u8) ?Module.DeclId {
+    fn receiverMethod(self: *Context, source_ty: Ir.TypeId, name: []const u8) ?Module.DeclId {
+        const ty = self.receiverType(source_ty);
         if (self.fieldIndex(ty, name) != null) return null;
         return self.nominalMethod(ty, name);
+    }
+
+    fn receiverValue(self: *Context, node: Ast.Node.Index, ty: Ir.TypeId, depth: usize) Error!bool {
+        if (try self.probe(node, depth + 1)) |known| {
+            if (self.ir.getType(known.ty).? == .reference) {
+                // Snapshot the pointee, not its capability, before later args.
+                const binding = (try self.dereferenceOperand(node, node)) orelse return false;
+                if (self.emitter) |emitter| try emitter.record(node, ty, self.irSpan(node), .{ .borrow_read = binding.borrow.? });
+            }
+        }
+        try self.copyNode(node, ty);
+        return true;
     }
 
     fn directNoreturn(self: *Context, node: Ast.Node.Index) Error!bool {
@@ -5112,7 +5139,8 @@ const Context = struct {
                         defer self.borrow_base = previous_base;
                         if (try self.probe(field.lhs, depth + 1)) |known| {
                             const argument = try self.receiverArgumentType(known.ty, ast.tokenSlice(field.rhs));
-                            if (self.ir.getType(argument).? == .reference) break :blk known.ty;
+                            if (self.ir.getType(argument).? == .reference or
+                                (self.ir.getType(known.ty).? == .reference and self.receiverReference(known.ty, ast.tokenSlice(field.rhs)) != null)) break :blk known.ty;
                         }
                         break :blk (try self.projection(field.lhs, null, depth + 1)) orelse return null;
                     };
@@ -5154,7 +5182,7 @@ const Context = struct {
                                 .terminal => return if (expected) |want| want.ty else function.result,
                                 .failed => return null,
                             }
-                        } else try self.copyNode(field.lhs, receiver);
+                        } else if (!try self.receiverValue(field.lhs, receiver_argument, depth + 1)) return null;
                         var valid = true;
                         for (call.ast.args, function.params[1..]) |arg, param| {
                             if (try self.callArgument(arg, .{ .ty = param, .annotation = related }, depth + 1) == null) valid = false;
@@ -10206,6 +10234,125 @@ fn testMutableMethodReceivers(allocator: std.mem.Allocator) !void {
     }
     // The type-only echo call must not emit an argument or call.
     try std.testing.expectEqual(@as(usize, 10), arguments);
+}
+
+fn testAutomaticMethodDereference(allocator: std.mem.Allocator, explicit: bool) !void {
+    const source = try std.mem.replaceOwned(u8, allocator,
+        \\let C=struct{value:int,items:[]int,
+        \\let add:(self:&mut C,n:int)={self.*.value+=n}
+        \\let read:(self:&C)->int=self.*.value
+        \\let take:(self:C,n:int)->int=self.items[0]+n
+        \\let echo:(self:&mut C,x:`T)->`T=x
+        \\let reflect:(self:&C,x:`T)->`T=x
+        \\let map:(self:C,x:`T)->`T=x
+        \\}
+        \\let E=enum{a,b,let flip:(self:&mut E)={self.* =.b}
+        \\let read:(self:E)->int=1
+        \\}
+        \\let U=union{none,some:int,let set:(self:&mut U)={self.* =.some[2]}
+        \\let read:(self:&U)->int=2
+        \\}
+        \\let Callable=struct{callback:(int)->int,}
+        \\let identity:(n:int)->int=n
+        \\let forward:(p:&mut C,n:int)={RECEIVER.add(n)}
+        \\let readonly:(p:&C)->int=RECEIVER.read()+RECEIVER.take(1)
+        \\let generic:(p:&mut C,x:`T)->`T=RECEIVER.echo(x)
+        \\let terminal:(p:&mut C)={RECEIVER.echo({return})}
+        \\let terminal_readonly:(p:&C)={RECEIVER.reflect({return})}
+        \\let terminal_value:(p:&C)={RECEIVER.map({return})}
+        \\let main:()={let mut c=C.[value=0,items=[1]]
+        \\let mut other=C.[value=10,items=[2]]
+        \\let mut p=&c
+        \\RECEIVER.add({p=&other
+        \\1})
+        \\let snapshot:int=RECEIVER.take({p.* =C.[value=9,items=[9]]
+        \\p=&c
+        \\2})
+        \\let n:u8=generic(p,@as(u8,3))
+        \\forward(p,4)
+        \\let fixed=C.[value=5,items=[6]]
+        \\let r=&fixed
+        \\let read:int=r.read()
+        \\let value:int=r.take(7)
+        \\let reflected:u8=r.reflect(@as(u8,8))
+        \\let mapped:u8=r.map(reflected)
+        \\let mut e=E.a
+        \\let pe=&e
+        \\pe.flip()
+        \\let ev:int=pe.read()
+        \\let mut u=U.none[]
+        \\let pu=&u
+        \\pu.set()
+        \\let uv:int=pu.read()
+        \\let callable=Callable.[callback=identity]
+        \\let pc=&callable
+        \\let invoked:int=pc.*.callback(3)
+        \\let callback=(){let query:@TypeOf(RECEIVER.echo(@as(u8,8)))=8
+        \\let mutation:@TypeOf(RECEIVER.add(1))={}
+        \\let copy:@TypeOf(RECEIVER.take(2))=2
+        \\}
+        \\@println(snapshot,read,value,readonly(&fixed))
+        \\}
+    , "RECEIVER", if (explicit) "p.*" else "p");
+    defer allocator.free(source);
+    var module = try Module.init(allocator, "automatic-method-dereference.nov", source);
+    defer module.deinit();
+    var analysis = try Lowering.lower(&module);
+    defer analysis.deinit();
+    errdefer if (module.hasErrors()) std.debug.print("automatic method dereference: {any} {any}\n", .{ module.source.ast.errors, module.diagnostics.items });
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(analysis.lowering_complete);
+    try analysis.ir.verify();
+    var snapshots: usize = 0;
+    var closures: usize = 0;
+    for (analysis.ir.functions.items) |function| {
+        const body = function.body orelse continue;
+        if (function.is_closure) {
+            closures += 1;
+            try std.testing.expectEqual(@as(usize, 0), function.captures.len);
+            for (body.instructions) |instruction| switch (instruction.op) {
+                .reference_load, .borrow_read, .borrow_reserve, .borrow_start, .reference_argument, .call, .array_clone, .capture_cell, .capture_value => return error.UnexpectedQueryEffect,
+                else => {},
+            };
+        }
+        for (body.instructions) |instruction| {
+            if (instruction.op != .array_clone) continue;
+            const read = body.instructions[@backingInt(instruction.op.array_clone)];
+            if (read.op != .borrow_read) continue;
+            snapshots += 1;
+            try std.testing.expect(analysis.ir.getType(instruction.ty).? == .record);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), closures);
+    try std.testing.expect(snapshots >= 3);
+}
+
+test "automatic method dereference snapshots generic forwarding and queries under OOM" {
+    inline for (.{ false, true }) |explicit| {
+        try testAutomaticMethodDereference(std.testing.allocator, explicit);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAutomaticMethodDereference, .{explicit});
+    }
+}
+
+test "automatic method dereference rejects readonly conflicts fields and escapes under OOM" {
+    const prelude = "let C=struct{value:int,let add:(self:&mut C,n:int)={}\nlet read:(self:&C)->int=self.*.value\n}\n";
+    for ([_]struct { source: []const u8, tag: Module.Diagnostic.Tag }{
+        .{ .source = prelude ++ "let f:(p:&C)={p.add(1)}", .tag = .immutable_assignment },
+        .{ .source = prelude ++ "let f:()={let c=C.[value=0]\nlet p=&c\np.add(1)}", .tag = .immutable_assignment },
+        .{ .source = prelude ++ "let f:()={let c=C.[value=0]\nlet p=&c\nlet q:@TypeOf(p.add(1))={}\n}", .tag = .immutable_assignment },
+        .{ .source = prelude ++ "let f:(p:&C)={let q:@TypeOf(p.add(1))={}\n}", .tag = .immutable_assignment },
+        .{ .source = prelude ++ "let f:(p:&mut C)={p.add(p.*.value)}", .tag = .borrow_conflict },
+        .{ .source = prelude ++ "let f:(p:&mut C)={p.add({p.*.value=2\n1})}", .tag = .borrow_conflict },
+        .{ .source = "let C=struct{let add:(self:&mut C,n:`T)={}\n}\nlet f:(p:&C)={let q:@TypeOf(p.add(1))={}\n}", .tag = .immutable_assignment },
+        .{ .source = prelude ++ "let f:(p:&C)->int=p.value", .tag = .unsupported_borrow },
+        .{ .source = prelude ++ "let f:(p:&mut C)->()->int=()->int{p.read()}", .tag = .unsupported_borrow },
+        .{ .source = "let C=struct{callback:()->int,}\nlet f:(p:&C)->int=p.callback()", .tag = .unsupported_body_expression },
+        .{ .source = "let C=struct{value:int,let add:(self:&mut int)={}\n}\nlet f:(p:&mut C)={p.add()}", .tag = .invalid_method_receiver },
+    }) |case| {
+        errdefer std.debug.print("automatic method rejection: {s}\n", .{case.source});
+        try testReferenceParameterError(std.testing.allocator, case.source, case.tag);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testReferenceParameterError, .{ case.source, case.tag });
+    }
 }
 
 test "mutable method receivers exact capabilities snapshots and queries under OOM" {

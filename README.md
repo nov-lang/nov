@@ -1250,8 +1250,11 @@ let main: () = {
 ```
 
 Instance calls implicitly supply a call-scoped reference for supported existing
-local owners, array elements, or explicit `p.*` receivers (including reference
-parameters). There is no autodereference: use `p.*.add(2)`, not `p.add(2)`.
+local owners, array elements, or reference receivers (including reference
+parameters). Method lookup automatically dereferences a named reference:
+`p.add(2)` is equivalent to `p.*.add(2)`. This also works for readonly and
+by-value methods; by-value methods snapshot the pointee before explicit arguments.
+Ordinary fields and callable fields still require `p.*.field` / `p.*.callback()`.
 `&mut SelfType` requires mutable storage; `&SelfType` also permits immutable local
 owners. Nested field receivers such as `outer.counter.add(2)`, globals,
 temporaries and mutation through readonly references remain rejected. This does

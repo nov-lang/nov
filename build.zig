@@ -2446,15 +2446,32 @@ fn addGenericFunctionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_
 
 fn addMutableMethodCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
-    const counter = "let C=struct{value:int,let add:(self:&mut C,n:int)={self.*.value+=n}\nlet echo:(self:&mut C,x:`T)->`T=x\nlet read:(self:&C)->int=self.*.value\n}\n";
+    const counter = "let C=struct{value:int,let add:(self:&mut C,n:int)={self.*.value+=n}\nlet echo:(self:&mut C,x:`T)->`T=x\nlet read:(self:&C)->int=self.*.value\nlet take:(self:C)->int=self.value\n}\n";
     _ = fixtures.add("mutable-methods.nov", @embedFile("examples/mutable-methods.nov"));
     _ = fixtures.add("receiver-order.nov", counter ++
+        \\let Callable=struct{call:(int)->int,}
+        \\let forward:(p:&mut C,n:int)={p.add(n)}
+        \\let readonly:(p:&C)->int=p.take()
+        \\let generic:(p:&mut C,x:`T)->`T=p.echo(x)
         \\let verify:()={let mut c=C.[value=1]
         \\c.add(2)
         \\C.add(&c,3)
         \\let exact:u8=c.echo(@as(u8,7))
         \\let query:@TypeOf(c.echo(exact))=exact
         \\@assert(c.read()==6 and query==7)
+        \\{let p=&c
+        \\p.add(0)
+        \\forward(p,0)
+        \\@assert(p.read()==6 and p.take()==6 and generic(p,exact)==7)
+        \\let unused:@TypeOf(p.add({@print("BAD")
+        \\1}))={}
+        \\}
+        \\let fixed=C.[value=6]
+        \\let r=&fixed
+        \\@assert(r.read()==6 and r.take()==6 and readonly(r)==6)
+        \\let f=Callable.[call=(n:int)->int{n+1}]
+        \\let pf=&f
+        \\@assert(pf.*.call(41)==42)
         \\let mut items=[C.[value=10]]
         \\let mut count:int=0
         \\items[{count+=1
@@ -2487,11 +2504,20 @@ fn addMutableMethodCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_st
     _ = fixtures.add("imported.nov",
         \\let api=@import("api.nov")
         \\let same=@import("./library.nov")
-        \\let verify:()={let mut b=api.Box(u8).[value=1]
+        \\let Alias=api.Box(u8)
+        \\let forward:(p:&mut Alias,value:`T)->`T={p.set(3)
+        \\p.echo(value)}
+        \\let readonly:(p:&Alias)->int=p.read()
+        \\let verify:()={let mut b=Alias.[value=1]
         \\b.set(2)
         \\same.Box(u8).set(&b,3)
-        \\let result:string=b.echo("generic")
-        \\@assert(b.value==3 and result=="generic" and b.read()==4)}
+        \\let p=&b
+        \\p.set(3)
+        \\let result:string=forward(p,"generic")
+        \\@assert(p.echo(result)=="generic" and p.read()==4 and readonly(p)==4)
+        \\let fixed=Alias.[value=7]
+        \\let r=&fixed
+        \\@assert(r.read()==4 and readonly(r)==4)}
         \\@[test]
         \\let imported_public_generic_receivers:()=verify()
         \\let main:()=verify()
@@ -2548,7 +2574,13 @@ fn addMutableMethodCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_st
         .{ .name = "temporary", .source = counter ++ "let main:()={C.[value=0].add(1)}", .diagnostic = unsupported },
         .{ .name = "global", .source = counter ++ "let mut c=C.[value=0]\nlet main:()={c.add(1)}", .diagnostic = unsupported },
         .{ .name = "field-place", .source = counter ++ "let H=struct{c:C,}\nlet main:()={let mut h=H.[c=C.[value=0]]\nh.c.add(1)}", .diagnostic = unsupported },
-        .{ .name = "readonly", .source = counter ++ "let f:(p:&C)={p.*.add(1)}\nlet main:()={}", .diagnostic = immutable },
+        .{ .name = "readonly", .source = counter ++ "let f:(p:&C)={p.add(1)}\nlet main:()={}", .diagnostic = immutable },
+        .{ .name = "readonly-local", .source = counter ++ "let main:()={let c=C.[value=0]\nlet p=&c\np.add(1)}", .diagnostic = immutable },
+        .{ .name = "readonly-generic", .source = counter ++ "let f:(p:&C)={let result:int=p.echo(@as(int,1))\n}\nlet main:()={}", .diagnostic = immutable },
+        .{ .name = "readonly-query", .source = counter ++ "let f:(p:&C)={let q:@TypeOf(p.add(1))={}\n}\nlet main:()={}", .diagnostic = immutable },
+        .{ .name = "reference-field", .source = counter ++ "let f:(p:&C)->int=p.value\nlet main:()={}", .diagnostic = unsupported },
+        .{ .name = "reference-callable-field", .source = "let C=struct{call:(int)->int,}\nlet f:(p:&C)->int=p.call(1)\nlet main:()={}", .diagnostic = "body checking for this expression is not implemented yet" },
+        .{ .name = "private-reference", .source = "let api=@import(\"api.nov\")\nlet Alias=api.Box(u8)\nlet f:(p:&mut Alias)={p.hidden()}\nlet main:()={}", .diagnostic = "body checking for this expression is not implemented yet" },
         .{ .name = "argument-read", .source = counter ++ "let main:()={let mut c=C.[value=0]\nc.add(c.value)}", .diagnostic = conflict },
         .{ .name = "argument-write", .source = counter ++ "let main:()={let mut c=C.[value=0]\nc.add({c.value=3\n1})}", .diagnostic = conflict },
         .{ .name = "live-borrow", .source = counter ++ "let main:()={let mut c=C.[value=0]\nlet p=&c\nc.add(1)\n@println(p.*.value)}", .diagnostic = conflict },

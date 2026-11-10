@@ -568,8 +568,8 @@ conflicts with its whole-owner loan (no element disjointness). Ordinary rebindin
 after the last use works. Conservative owner-set checks may overreject
 target-sensitive iteration.
 
-There is no autodereference: use `p.*`, `p.*[i]`, `p.*.field`, or `p.*()` to
-access the pointee. Library calls such as `array.map(p.*, convert)` pass ordinary
+Ordinary pointee access requires `p.*`, `p.*[i]`, `p.*.field`, or `p.*()`.
+Method lookup is the exception: `p.method()` also works. Library calls such as `array.map(p.*, convert)` pass ordinary
 array values under the existing copy rules, not references. Functions, callbacks,
 closures, inferred generic functions, methods and pipes may accept `&T` / `&mut T`.
 Pass `f(p)`, `f(&local)` or `f(&array[index])` to a compatible reference parameter;
@@ -582,10 +582,13 @@ by value and unchanged.
 
 Instance calls such as `counter.add(2)` supply a call-scoped reference when the
 method declares `self: &mut Counter`; its body mutates through `self.*`.
-Supported receivers are existing local owners, array elements and explicit `p.*`
-(including reference parameters). Mutable receivers require mutable storage;
-readonly `&Self` receivers also accept immutable local owners. There is no
-autodereference: write `p.*.add(2)`, not `p.add(2)`. Nested field receivers,
+Supported receivers are existing local owners, array elements and named
+references (including reference parameters). Method lookup automatically
+dereferences references: `p.add(2)` and `p.*.add(2)` are equivalent. This works
+for reference and by-value receivers; by-value methods snapshot the pointee.
+Mutable receivers require mutable storage; readonly `&Self` receivers also
+accept immutable local owners. Fields and callable fields still need explicit
+`p.*` access. Nested field receivers,
 global/temporary borrowing and readonly mutation remain rejected. This is not
 general reborrowing or reference escape support. Static `Counter.add(&counter, 2)`
 and compatible reference forwarding still work.

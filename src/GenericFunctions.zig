@@ -1872,7 +1872,7 @@ const Solver = struct {
         }
     }
 
-    const CallTarget = struct { ref: Ref, container: ?Nominal = null, receiver: ?*Term = null };
+    const CallTarget = struct { ref: Ref, container: ?Nominal = null, receiver: ?*Term = null, receiver_reference: ?*Term = null };
 
     fn callTarget(self: *Solver, frame: *Frame, node: Ast.Node.Index, depth: usize) Ir.BuildError!?CallTarget {
         const module = frame.ref.module;
@@ -1925,7 +1925,9 @@ const Solver = struct {
         const data = ast.nodes.items(.data)[node];
         const name = ast.tokenSlice(data.rhs);
         if (Module.numericField(name)) return null;
-        const receiver = root(try self.expression(frame, data.lhs, depth + 1));
+        const source_receiver = root(try self.expression(frame, data.lhs, depth + 1));
+        const implicit = source_receiver.value == .reference;
+        const receiver = if (implicit) root(source_receiver.value.reference.child) else source_receiver;
         var container: ?Nominal = null;
         var owner: *Module = undefined;
         var identity: Module.DeclId = undefined;
@@ -1958,7 +1960,11 @@ const Solver = struct {
         const id = owner.lookupMethod(identity, name) orelse return null;
         const decl = owner.getDeclaration(id).?;
         if (owner.source.ast.declFunction(decl.node) == null or (owner != module and !decl.public)) return null;
-        return .{ .ref = .{ .module = owner, .id = id }, .container = container, .receiver = receiver };
+        if (implicit and (ast.nodes.items(.tag)[data.lhs] != .identifier or globalReference(frame, data.lhs) != null)) {
+            try self.fail(.unsupported_borrow, module.tokenSpan(ast.firstToken(data.lhs)), null);
+            return null;
+        }
+        return .{ .ref = .{ .module = owner, .id = id }, .container = container, .receiver = receiver, .receiver_reference = if (implicit) source_receiver else null };
     }
 
     fn closureReference(self: *Solver, frame: *Frame, proto: Ast.Node.Index, body_node: Ast.Node.Index) Ir.BuildError!Ref {
@@ -2962,7 +2968,13 @@ const Solver = struct {
                                         (tag == .deref and ast.nodes.items(.tag)[place_data.lhs] != .identifier) or
                                         globalReference(frame, owner) != null)
                                         try self.fail(.unsupported_borrow, span, null);
-                                    if (formal.value.reference.mutable) try self.writablePlace(frame, place, depth + 1);
+                                    if (callee_target.receiver_reference) |reference| {
+                                        if (tag != .identifier) try self.fail(.unsupported_borrow, span, null);
+                                        if (formal.value.reference.mutable) {
+                                            if (!reference.value.reference.mutable) try self.fail(.immutable_assignment, span, null);
+                                            if (self.querying) try self.query_places.append(self.allocator, .{ .operand = reference, .kind = .mutable_reference, .span = span });
+                                        }
+                                    } else if (formal.value.reference.mutable) try self.writablePlace(frame, place, depth + 1);
                                     try self.unify(formal.value.reference.child, receiver, span, 0);
                                 } else try self.unify(f.params[0], receiver, span, 0);
                             }
@@ -3802,13 +3814,21 @@ fn testMutableReceiverImports(allocator: std.mem.Allocator) !void {
     defer comp.deinit();
     const root = try comp.addSource("/receivers/main.nov",
         \\let api=@import("api.nov")
+        \\let forward:(p:&mut api.Box(u8),x:`T)->`T={p.set(2)
+        \\p.echo(x)}
+        \\let inspect:(p:&api.Box(u8))->u8=p.read()
         \\let main:()={let mut b=api.Box(u8).[value=1]
         \\b.set(2)
-        \\let result:u8=b.echo(@as(u8,3))
-        \\let query:@TypeOf(b.echo(result))=result
-        \\let only_types=()->u8{let q:@TypeOf(b.echo(result))=4
-        \\q}
-        \\@println(b.value,query,only_types())}
+        \\let p=&b
+        \\p.set(3)
+        \\let result:u8=forward(p,@as(u8,3))
+        \\let query:@TypeOf(p.echo(result))=result
+        \\let only_types=()->u8{let q:@TypeOf(p.query_only(result))=4
+        \\let r:@TypeOf(p.cold())=5
+        \\q+r}
+        \\let fixed=api.Box(u8).[value=7]
+        \\let r=&fixed
+        \\@println(b.value,query,only_types(),r.read(),r.take(),inspect(r))}
     );
     const library = try comp.addSource("/receivers/api.nov",
         \\@[public]
@@ -3819,6 +3839,14 @@ fn testMutableReceiverImports(allocator: std.mem.Allocator) !void {
         \\let set:(self:&mut Self,value:Element)={self.*.value=value}
         \\@[public]
         \\let echo:(self:&mut Self,input:`T)->`T=input
+        \\@[public]
+        \\let read:(self:&Self)->Element=self.*.value
+        \\@[public]
+        \\let take:(self:Self)->Element=self.value
+        \\@[public]
+        \\let query_only:(self:&mut Self,input:`T)->`T=unknown
+        \\@[public]
+        \\let cold:(self:Self)->Element=unknown
         \\}
     );
     const module = comp.getModule(root).?;
@@ -3845,9 +3873,46 @@ fn testMutableReceiverImports(allocator: std.mem.Allocator) !void {
     try std.testing.expectEqual(@as(usize, 1), closures);
 }
 
-test "mutable method receivers imported public Self generic queries remain capture free under OOM" {
+test "automatic method dereference mutable method receivers imported public Self generic queries remain capture free under OOM" {
     try testMutableReceiverImports(std.testing.allocator);
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMutableReceiverImports, .{});
+}
+
+fn testAutomaticReceiverVisibility(allocator: std.mem.Allocator, public: bool, query: bool) !void {
+    var comp = Compilation.init(allocator);
+    defer comp.deinit();
+    const source = try std.mem.concat(allocator, u8, &.{
+        "let api=@import(\"api.nov\")\nlet f:(p:&api.Box(int))->int=",
+        if (query) "{let q:@TypeOf(p.method(1))=2\nq}" else "p.method(1)",
+    });
+    defer allocator.free(source);
+    const root_source = try comp.addSource("/reference-visibility/main.nov", source);
+    const library_text = try std.mem.concat(allocator, u8, &.{
+        "@[public]\nlet Box:(T:type)->type=struct{let Self=@This()\n",
+        if (public) "@[public]\n" else "",
+        "let method:(self:&Self,x:`U)->`U=x\n}",
+    });
+    defer allocator.free(library_text);
+    const library = try comp.addSource("/reference-visibility/api.nov", library_text);
+    const module = comp.getModule(root_source).?;
+    const local = module.lookup("api").?;
+    try comp.imports.append(allocator, .{ .declaration = comp.declaration_ids.get(.{ .source = root_source, .local = local }).?, .target = library, .named = false, .span = module.getDeclaration(local).?.name_span });
+    var lowered = try Lowering.lowerCompilation(&comp);
+    defer lowered.deinit();
+    try std.testing.expectEqual(!public, comp.hasErrors());
+    if (public) {
+        try std.testing.expect(lowered.lowering_complete);
+        try lowered.ir.verify();
+    }
+}
+
+test "automatic method dereference imported generic visibility during calls and TypeOf under OOM" {
+    inline for (.{ false, true }) |public| {
+        inline for (.{ false, true }) |query| {
+            try testAutomaticReceiverVisibility(std.testing.allocator, public, query);
+            try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAutomaticReceiverVisibility, .{ public, query });
+        }
+    }
 }
 
 fn testClosureMethodScopeImports(allocator: std.mem.Allocator) !void {

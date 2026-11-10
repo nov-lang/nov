@@ -29,7 +29,7 @@ let Box: (Element: type) -> type = struct {
 }
 
 let forward: (counter: &mut Counter, amount: int) = {
-    counter.*.add(amount)
+    counter.add(amount)
 }
 let Callable = struct {
     call: (int) -> int,
@@ -43,8 +43,8 @@ let main: () = {
     forward(&counter, 4)
     @println("Counter:", counter.get())
     let p = &counter
-    p.*.add(1)
-    @println("Through reference:", p.*.read())
+    p.add(1)
+    @println("Through reference:", p.read())
     let mut counters = [Counter.[ value = 10 ], Counter.[ value = 20 ]]
     counters[-1].add(5)
     @println("Array elements:", counters[0].value, counters[1].value)
@@ -104,14 +104,14 @@ let receiver_target_precedes_argument_rebinding: () = {
     let mut first = Counter.[ value = 1 ]
     let mut second = Counter.[ value = 10 ]
     let mut p = &first
-    p.*.add(
+    p.add(
         {
             p = &second
             5
         }
     )
     @assert(p.*.value == 10)
-    p.*.add(2)
+    p.add(2)
     @assert(first.value == 6 and second.value == 12)
 }
 

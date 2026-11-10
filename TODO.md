@@ -60,9 +60,10 @@ share these rules. See `zig build test-cli-iteration-continuations`.
 
 Step 3 complete: nominal methods accept exact `&Self` / `&mut Self` receivers.
 Instance calls borrow supported existing local owners and array elements, or
-forward an explicit `p.*` receiver, including reference parameters. Mutable
+forward a named reference receiver, including reference parameters. Mutable
 receivers require mutable storage; readonly receivers also accept immutable local
-owners. Method bodies use explicit `self.*`; no autodereference is added.
+owners. Method bodies use explicit `self.*`. Method lookup accepts both `p.method()`
+and `p.*.method()`; fields and callable fields still require explicit dereferencing.
 Nested field borrows, global/temporary receivers, readonly mutation, escaping
 references and bound method values remain rejected. Static `Counter.add(&c, n)`
 and by-value receiver snapshots remain unchanged. Callable fields keep precedence
@@ -564,7 +565,7 @@ provide `&mut T`. Binding `mut` is independent: `let p = &a` cannot rebind but
 `p.* = value` works for a mutable pointee; `let mut p = &a` allows `p = &b` with
 the same exact reference type, retaining any explicit readonly annotation.
 
-No autodereference: all pointee reads/writes use `.*`, including `p.* += value`,
+Except for method lookup, pointee reads/writes use `.*`, including `p.* += value`,
 `p.*[i]`, `p.*.field` and `p.*()`. `p = value` is not a pointee store. Reads such
 as `let copy = p.*`, arguments/returns of `p.*` and `p.*.method()` retain ordinary
 value-copy semantics, not reference escape. Bare reference copies (`let q = p`),
@@ -592,7 +593,7 @@ this rule applies only to arguments, while function/callback types stay invarian
 Formal reference bindings cannot rebind, but mutable-pointee `.*` writes work.
 Callees may forward reference parameters, not ordinarily copy/alias, capture,
 reborrow, return or store them. Exact reference receivers now support bounded
-instance borrowing and forwarding through explicit `p.*`.
+instance borrowing and forwarding through either `p.method()` or `p.*.method()`.
 
 Each reference argument snapshots its target before later argument effects:
 `call(p, later)` still passes the old target if `later` rebinds `p` to `&b`.

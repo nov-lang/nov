@@ -8295,21 +8295,26 @@ const mutable_method_managed =
     \\}
     \\let make:(text:string)->R={let captured=text+"!"
     \\R.[inner=Inner.[rows=[[text+"?"]],callback=()->string{captured}]]}
-    \\let forward:(p:&mut R,s:string)={p.*.change(s)}
+    \\let forward:(p:&mut R,s:string)={p.change(s)}
     \\let effect:()->string={@println("argument")
     \\"x"+"y"}
     \\let main:()={let mut root=make("root")
     \\let frozen=root.snapshot()
-    \\root.change(effect())
+    \\{let p=&root
+    \\p.change(effect())
+    \\@assert(p.echo(@as(u8,7))==7)
+    \\}
     \\let mut copy=root
     \\copy.change("z"+"!")
     \\@println(frozen.inner.rows[0][0],root.inner.rows[0][0],copy.inner.rows[0][0],frozen.inner.callback())
     \\let mut owners=[make("a"),make("b")]
     \\let independent=owners
     \\let mut count:int=0
-    \\owners[{count+=1
+    \\{let p=&owners[{count+=1
     \\@println("index",count)
-    \\@as(int,-1)}].change(effect())
+    \\@as(int,-1)}]
+    \\p.change(effect())
+    \\}
     \\@println(count,owners[0].inner.rows[0][0],owners[1].inner.rows[0][0],independent[1].inner.rows[0][0],owners[1].inner.callback())
     \\forward(&root,"f"+"!")
     \\R.change(&copy,"s"+"!")
@@ -8340,11 +8345,11 @@ const mutable_method_order =
     \\self.*.value+=n}
     \\let read:(self:&C)->int=self.*.value
     \\}
-    \\let forward:(p:&mut C)={p.*.add(2)}
+    \\let forward:(p:&mut C)={p.add(2)}
     \\let main:()={let mut a=C.[value=1]
     \\let mut b=C.[value=10]
     \\let mut p=&a
-    \\p.*.add({@print("A")
+    \\p.add({@print("A")
     \\p=&b
     \\4})
     \\@println(a.value,p.*.value)
@@ -8359,7 +8364,8 @@ const mutable_method_order =
     \\3})
     \\@println(index,xs[0].value,xs[1].value)
     \\let f=Callable.[call=(n:int)->int{n+1}]
-    \\@println(f.call(41))
+    \\let pf=&f
+    \\@println(pf.*.call(41))
     \\}
 ;
 
@@ -8370,6 +8376,54 @@ test "mutable method receivers source free receiver index once before arguments 
     defer test_gpa.free(program);
     for ([_][]const u8{ "-O0", "-O3" }) |mode|
         try compileAndRunMode(program, "typedef int nonempty;", 0, "AC5 10\nC5 12\nRAC9 20 33\n42\n", "", mode);
+}
+
+const automatic_method_snapshots =
+    \\let R=struct{rows:[][]string,
+    \\let take:(self:R,n:int)->string=self.rows[0][0]
+    \\let generic:(self:R,n:`T)->string=self.rows[0][0]
+    \\let read:(self:&R)->string=self.*.rows[0][0]
+    \\let set:(self:&mut R,text:string)={self.*.rows=[[text]]}
+    \\}
+    \\let forward:(p:&R)->string=p.take(0)
+    \\let main:()={let mut a=R.[rows=[["old"+"!"]]]
+    \\let mut b=R.[rows=[["other"+"!"]]]
+    \\let mut p=&a
+    \\@println(p.take({p.* =R.[rows=[["changed"+"!"]]]
+    \\p=&b
+    \\0}),p.read())
+    \\@println(p.generic({p.* =R.[rows=[["new"+"!"]]]
+    \\p=&a
+    \\true}),p.read())
+    \\let mut c=R.[rows=[["start"+"!"]]]
+    \\let mut d=R.[rows=[["new"+"!"]]]
+    \\let mut q=&c
+    \\q.set({q=&d
+    \\"target"+"!"})
+    \\@println(c.rows[0][0],q.read())
+    \\let query:@TypeOf(p.set({@print("BAD")
+    \\"unused"}))={}
+    \\let value:@TypeOf(p.take({@print("BAD")
+    \\0}))="unused"
+    \\let generic:@TypeOf(p.generic({@print("BAD")
+    \\true}))="unused"
+    \\let fixed=R.[rows=[["fixed"+"!"]]]
+    \\let r=&fixed
+    \\@println(r.read(),r.take(0),r.generic(false),forward(r))
+    \\let mut owners=[R.[rows=[["element"+"!"]]]]
+    \\let ep=&owners[0]
+    \\@println(ep.take({ep.* =R.[rows=[["replacement"+"!"]]]
+    \\0}),ep.read())
+    \\}
+;
+
+test "mutable method receivers automatic dereference source free managed snapshots before mutation rebinding queries forced GC O0 O3" {
+    const library = try emitBacktickProgramSourceFree(test_gpa, automatic_method_snapshots);
+    defer test_gpa.free(library);
+    const program = try collectingTestProgram(library);
+    defer test_gpa.free(program);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(program, "typedef int nonempty;", 0, "old! other!\nother! changed!\ntarget! new!\nfixed! fixed! fixed! fixed!\nelement! replacement!\n", "", mode);
 }
 
 const reference_parameter_scalars =
