@@ -825,11 +825,12 @@ The concrete receiver container binds `T`; explicit arguments, callback signatur
 the expected result and supported body constraints infer method-local `U`. Static
 `Box(uint).map(number, toBool)` and instance `number.map(toBool)` calls share the
 same canonical specialization, including through imported/public aliases. Existing
-public/private access and field-before-method lookup rules still apply. The exact
-nominal receiver is passed by value: it evaluates and snapshots once **before**
-explicit arguments, which evaluate once left-to-right. No mutable receiver or
-implicit borrow is introduced. Bound method values (`number.map`) and callable
-fields are not supported.
+public/private access and field-before-method lookup rules still apply. A by-value
+nominal receiver evaluates and snapshots once **before** explicit arguments,
+which evaluate once left-to-right. Methods may instead declare `&Self` or
+`&mut Self` receivers under the [mutable receiver contract](#mutable-method-receivers).
+Bound method values (`number.map`) are unsupported; callable fields use ordinary
+function calls without receiver insertion.
 
 A named generic function also specializes as a value when an exact concrete
 function type is expected, using existing syntax:
@@ -1126,7 +1127,7 @@ The delivered subset is deliberately bounded:
   payloads, including arrays inside union-valued fields; immutable strings share
   backing, functions share closure environments/captured cells, and ranges copy
   typed bounds/inclusivity by value. Constructors, field/index
-  reads, method receivers and ordinary reads through loans obey the same independence
+  reads, by-value method receivers and ordinary reads through loans obey the same independence
   rule. Replacing or mutating a record binding does not change earlier copies.
 - Fields of a direct mutable local support `item.field = value` with exact bool,
   integer, float, rune, string, enum, struct, union, array, function or range type.
@@ -1156,7 +1157,8 @@ The delivered subset is deliberately bounded:
   Immutable bindings/ordinary parameters (including `self`), union payloads/tags,
   temporary values and general pointer-based targets remain unsupported or
   diagnose immutable assignment. Bounded local element borrows support field updates
-  as described under arrays. No implicit mutable receiver or borrowing is added.
+  as described under arrays. Reference-receiver methods use the bounded borrowing
+  rules below; this does not permit borrowing individual nested fields.
   See [examples/struct-mutation.nov](examples/struct-mutation.nov) and
   [examples/nested-structs.nov](examples/nested-structs.nov). Nested record copies
   have independent value storage and recursively independent array backing at every
@@ -1166,11 +1168,12 @@ The delivered subset is deliberately bounded:
   initializers. Methods have their own container scope; they can call sibling or
   recursive methods by name. Outside that scope use `MyType.method(args...)` (an
   alias works too). Parameters, including a parameter named `self`, are ordinary
-  by-value parameters. Instance syntax `item.method(args...)` inserts `item` as the
-  explicit first argument; that parameter must have the exact nominal container
-  type (its name need not be `self`). The receiver evaluates once before explicit
-  arguments, which evaluate left-to-right. Value copies and string sharing remain
-  unchanged; there is no implicit mutation or borrowing. Instance calls also work
+  by-value parameters unless explicitly annotated as references. Instance syntax
+  `item.method(args...)` supplies the explicit first argument; that parameter must
+  be the exact nominal container type, `&Container` or `&mut Container` (its name
+  need not be `self`). The receiver evaluates once before explicit arguments,
+  which evaluate left-to-right. By-value copies and string sharing remain
+  unchanged; reference receivers follow the rules below. Instance calls also work
   for non-generic unions and enums. Direct `@[noreturn]` method calls terminate
   control flow, including through instance syntax.
   Existing fields take precedence over method lookup; array/string `.len` is not
@@ -1187,8 +1190,8 @@ The delivered subset is deliberately bounded:
   and calling a non-function field is an error rather than a method fallback.
   `let callback = item.callback` reads an ordinary function value; pipes and
   explicit `reference.*.callback(...)` follow existing call/reference rules.
-  Method calls still pass a by-value receiver. Field calls do not grant implicit
-  borrowing, mutable receivers or bound method values. See
+  Field calls do not grant implicit borrowing, receiver insertion or bound method
+  values. See
   [`examples/storable-fields.nov`](examples/storable-fields.nov).
 - Default printing/interpolation uses `MyType[ field: value, ... ]` (`MyType[]`
   when empty), recursively applying converters to nested fields/elements.
@@ -1224,6 +1227,54 @@ allocations, recursively through inline records.
 String byte-data pointers (including static literals) are never traced. The
 current uniform record path installs a GC frame even for scalar-only records;
 this is implementation overhead, not heap allocation of the records themselves.
+
+#### Mutable method receivers
+
+A nominal struct, union or enum method can declare an exact `&mut SelfType`
+receiver and mutate it through explicit `self.*` access:
+
+```nov
+let Counter = struct {
+    value: int,
+    @[public]
+    let add: (self: &mut Counter, amount: int) = {
+        self.*.value += amount
+    }
+}
+let main: () = {
+    let mut c = Counter.[ value = 0 ]
+    c.add(2)
+    Counter.add(&c, 3)
+    @assert(c.value == 5)
+}
+```
+
+Instance calls implicitly supply a call-scoped reference for supported existing
+local owners, array elements, or explicit `p.*` receivers (including reference
+parameters). There is no autodereference: use `p.*.add(2)`, not `p.add(2)`.
+`&mut SelfType` requires mutable storage; `&SelfType` also permits immutable local
+owners. Nested field receivers such as `outer.counter.add(2)`, globals,
+temporaries and mutation through readonly references remain rejected. This does
+not introduce field-specific loans, general reborrowing or escaping references.
+Static `Counter.add(&c, 2)` and forwarding compatible references remain supported.
+
+The receiver target is selected once **before** explicit arguments, left to right.
+Rebinding a reference during a later argument does not redirect the pending call;
+array indices also evaluate once. The loan stays live through arguments and the
+call: conflicting reads, writes, aliases or invalidation reject, including
+`c.add(c.value)`. Read the amount into an independent local before the call instead.
+By-value methods retain their prior snapshot semantics. Callable fields keep
+precedence and receive no implicit receiver. Bare `c.add` is not a bound method.
+
+Generic containers can use `let Self = @This()` with `self: &mut Self`; method-local
+backtick inference and static/instance specialization retain exact types. Imported
+calls require public declarations **and** public methods; aliases do not bypass
+visibility. `@TypeOf(c.add(...))` validates receiver type, mutability and place,
+but creates no runtime loan, call, mutation or capture.
+See [examples/mutable-methods.nov](examples/mutable-methods.nov) for a runnable
+example and seven tests covering snapshots, forwarding, array elements, generic
+inference, type queries and callable fields. Run with `nov run` or `nov test`,
+using `--debug` or `--release`.
 
 #### Executable anonymous structs
 
@@ -1521,9 +1572,10 @@ value parameters and general compile-time execution remain unsupported.
 
 The following broader stack example remains design-only: `#type` denotes an
 accepted explicit compile-time type argument (implementation deferred), distinct from backtick
-inferred type variables. Aggregate defaults and pointer-based mutable receivers
-are not delivered. Array fields themselves work. Its historical `*mut` spelling
-and implicit receiver accesses are separate from the explicit safe-reference
+inferred type variables. Aggregate defaults and the proposed general-pointer
+receiver syntax are not delivered; bounded `&mut Self` methods are supported above.
+Array fields themselves work. Its historical `*mut` spelling and implicit receiver
+accesses are separate from the explicit safe-reference
 contract and accepted passing/returning/storing roadmap.
 
 We can generate a type with a function thus creating a generic type.
@@ -1834,7 +1886,7 @@ copies, shared closure environments and argument evaluation.
 `examples/error.nov` now uses `.!` and explicit Result returns, with its alternative
 implementations commented out. It is still a filesystem design example, not an
 executable program: the filesystem library and its resource semantics remain future
-work. Imports are implemented. Instance calls support explicit by-value receivers. Nominal enum error kinds and exhaustive enum matches are implemented. Record payloads and record interpolation are implemented;
+work. Imports are implemented. Instance calls support exact by-value and bounded reference receivers. Nominal enum error kinds and exhaustive enum matches are implemented. Record payloads and record interpolation are implemented;
 terminal `@panic` follows the `@[noreturn]` void-function contract described below.
 
 [examples/structured-errors.nov](examples/structured-errors.nov) is a runnable
@@ -2101,7 +2153,8 @@ This updates the old pointee, not `b`, and leaves `p` bound to `b` afterward.
 by-value method receivers such as `p.*.method()` use existing value-copy rules:
 arrays have recursively independent backing, records copy by value, immutable
 strings share, and function/closure copies share their environments. They do not
-copy or escape the reference capability or grant a method mutable receiver access.
+copy or escape the reference capability. Reference-receiver calls through `p.*`
+use the call-scoped rules above.
 Bare `p` is not an ordinary value read: `consume(p)` is supported only when the
 formal parameter is a compatible reference. `let q = p`, `return p`, storing `p`
 in an aggregate and capturing `p` in a closure are currently rejected. Reborrows
@@ -2145,8 +2198,9 @@ remain invariant, including callback types. Formal reference bindings are
 immutable and cannot rebind (`p = &other` rejects), but `p.*` writes work for
 `&mut T`. A callee may forward its parameter to another compatible reference
 parameter; it cannot copy/alias it into an ordinary binding, capture, reborrow,
-return or store it. Methods retain their existing by-value receivers; this adds
-no implicit mutable receiver or automatic borrowing.
+return or store it. Methods may declare exact reference receivers; instance calls
+supply a bounded call-scoped borrow as described under
+[mutable method receivers](#mutable-method-receivers).
 
 Callee and argument expressions retain ordinary eager evaluation order. Each
 reference argument snapshots its target before later arguments execute. Thus

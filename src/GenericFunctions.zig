@@ -2948,7 +2948,22 @@ const Solver = struct {
                         const f = instance.function;
                         const offset: usize = @intFromBool(callee_target.receiver != null);
                         if (f.params.len == call.ast.args.len + offset) {
-                            if (callee_target.receiver) |receiver| try self.unify(f.params[0], receiver, span, 0);
+                            if (callee_target.receiver) |receiver| {
+                                const formal = root(f.params[0]);
+                                if (formal.value == .reference) {
+                                    const place = ast.nodes.items(.data)[call.ast.fn_expr].lhs;
+                                    const tag = ast.nodes.items(.tag)[place];
+                                    const place_data = ast.nodes.items(.data)[place];
+                                    const owner = if (tag == .array_access) place_data.lhs else place;
+                                    if ((tag != .identifier and tag != .array_access and tag != .deref) or
+                                        (tag == .array_access and ast.nodes.items(.tag)[owner] != .identifier) or
+                                        (tag == .deref and ast.nodes.items(.tag)[place_data.lhs] != .identifier) or
+                                        globalReference(frame, owner) != null)
+                                        try self.fail(.unsupported_borrow, span, null);
+                                    if (formal.value.reference.mutable) try self.writablePlace(frame, place, depth + 1);
+                                    try self.unify(formal.value.reference.child, receiver, span, 0);
+                                } else try self.unify(f.params[0], receiver, span, 0);
+                            }
                             for (f.params[offset..], call.ast.args) |param, arg| {
                                 const value = try self.expressionExpected(frame, arg, param, depth + 1);
                                 if (root(value).value == .never) return value;
@@ -3778,6 +3793,59 @@ fn testLocalClosureProbe(allocator: std.mem.Allocator) !void {
 test "generic closures readonly probes never demand code IDs instances or environments under OOM" {
     try testLocalClosureProbe(std.testing.allocator);
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testLocalClosureProbe, .{});
+}
+
+fn testMutableReceiverImports(allocator: std.mem.Allocator) !void {
+    var comp = Compilation.init(allocator);
+    defer comp.deinit();
+    const root = try comp.addSource("/receivers/main.nov",
+        \\let api=@import("api.nov")
+        \\let main:()={let mut b=api.Box(u8).[value=1]
+        \\b.set(2)
+        \\let result:u8=b.echo(@as(u8,3))
+        \\let query:@TypeOf(b.echo(result))=result
+        \\let only_types=()->u8{let q:@TypeOf(b.echo(result))=4
+        \\q}
+        \\@println(b.value,query,only_types())}
+    );
+    const library = try comp.addSource("/receivers/api.nov",
+        \\@[public]
+        \\let Box:(Element:type)->type=struct{
+        \\let Self=@This()
+        \\value:Element,
+        \\@[public]
+        \\let set:(self:&mut Self,value:Element)={self.*.value=value}
+        \\@[public]
+        \\let echo:(self:&mut Self,input:`T)->`T=input
+        \\}
+    );
+    const module = comp.getModule(root).?;
+    const local = module.lookup("api").?;
+    try comp.imports.append(allocator, .{ .declaration = comp.declaration_ids.get(.{ .source = root, .local = local }).?, .target = library, .named = false, .span = module.getDeclaration(local).?.name_span });
+    var lowered = try Lowering.lowerCompilation(&comp);
+    defer lowered.deinit();
+    errdefer if (comp.hasErrors()) for (comp.modules.items) |owner| {
+        std.debug.print("mutable receiver imports: {any} {any}\n", .{ owner.source.ast.errors, owner.diagnostics.items });
+    };
+    try std.testing.expect(!comp.hasErrors());
+    try std.testing.expect(lowered.lowering_complete);
+    try lowered.ir.verify();
+    var closures: usize = 0;
+    for (lowered.ir.functions.items) |function| {
+        if (!function.is_closure) continue;
+        closures += 1;
+        try std.testing.expectEqual(@as(usize, 0), function.captures.len);
+        for (function.body.?.instructions) |instruction| switch (instruction.op) {
+            .borrow_reserve, .borrow_start, .reference_argument, .call => return error.UnexpectedQueryEffect,
+            else => {},
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 1), closures);
+}
+
+test "mutable method receivers imported public Self generic queries remain capture free under OOM" {
+    try testMutableReceiverImports(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMutableReceiverImports, .{});
 }
 
 fn testClosureMethodScopeImports(allocator: std.mem.Allocator) !void {

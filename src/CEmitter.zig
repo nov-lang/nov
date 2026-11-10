@@ -8279,6 +8279,99 @@ fn emitReferenceRebinding(allocator: std.mem.Allocator, source: []const u8) ![]u
     return emit(allocator, &lowered.ir, null);
 }
 
+const mutable_method_managed =
+    \\let Inner=struct{rows:[][]string,callback:()->string,}
+    \\let R=struct{inner:Inner,
+    \\let change:(self:&mut R,suffix:string)={let saved=self.*
+    \\self.*.inner.rows=[[self.*.inner.rows[0][0]+suffix]]
+    \\@println(saved.inner.rows[0][0],self.*.inner.rows[0][0],saved.inner.callback(),self.*.inner.callback())}
+    \\let snapshot:(self:R)->R=self
+    \\let rewrite:(self:R)->R={let mut local=self
+    \\let mut rows=local.inner.rows
+    \\rows[0]=["by"+"value"]
+    \\local.inner.rows=rows
+    \\local}
+    \\let echo:(self:&mut R,value:`T)->`T=value
+    \\}
+    \\let make:(text:string)->R={let captured=text+"!"
+    \\R.[inner=Inner.[rows=[[text+"?"]],callback=()->string{captured}]]}
+    \\let forward:(p:&mut R,s:string)={p.*.change(s)}
+    \\let effect:()->string={@println("argument")
+    \\"x"+"y"}
+    \\let main:()={let mut root=make("root")
+    \\let frozen=root.snapshot()
+    \\root.change(effect())
+    \\let mut copy=root
+    \\copy.change("z"+"!")
+    \\@println(frozen.inner.rows[0][0],root.inner.rows[0][0],copy.inner.rows[0][0],frozen.inner.callback())
+    \\let mut owners=[make("a"),make("b")]
+    \\let independent=owners
+    \\let mut count:int=0
+    \\owners[{count+=1
+    \\@println("index",count)
+    \\@as(int,-1)}].change(effect())
+    \\@println(count,owners[0].inner.rows[0][0],owners[1].inner.rows[0][0],independent[1].inner.rows[0][0],owners[1].inner.callback())
+    \\forward(&root,"f"+"!")
+    \\R.change(&copy,"s"+"!")
+    \\@println(root.echo("generic"),root.inner.rows[0][0],copy.inner.rows[0][0])
+    \\let rewritten=root.rewrite()
+    \\@println(root.inner.rows[0][0],rewritten.inner.rows[0][0],rewritten.inner.callback())
+    \\}
+;
+
+test "mutable method receivers source free nested managed fields closure roots element owners independent copies forced GC O0 O3" {
+    // This helper destroys the source before emission and the IR before execution.
+    const library = try emitBacktickProgramSourceFree(test_gpa, mutable_method_managed);
+    defer test_gpa.free(library);
+    try std.testing.expect(std.mem.indexOf(u8, library, "nov_reference_argument_") != null);
+    try std.testing.expect(std.mem.indexOf(u8, library, "(*p0)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, library, "&nov_reference_") == null);
+    const program = try collectingTestProgram(library);
+    defer test_gpa.free(program);
+    const expected = "argument\nroot? root?xy root! root!\nroot?xy root?xyz! root! root!\nroot? root?xy root?xyz! root!\nindex 1\nargument\nb? b?xy b! b!\n1 a? b?xy b? b!\nroot?xy root?xyf! root! root!\nroot?xyz! root?xyz!s! root! root!\ngeneric root?xyf! root?xyz!s!\nroot?xyf! byvalue root!\n";
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(program, "typedef int nonempty;", 0, expected, "", mode);
+}
+
+const mutable_method_order =
+    \\let Callable=struct{call:(int)->int,}
+    \\let C=struct{value:int,
+    \\let add:(self:&mut C,n:int)={@print("C")
+    \\self.*.value+=n}
+    \\let read:(self:&C)->int=self.*.value
+    \\}
+    \\let forward:(p:&mut C)={p.*.add(2)}
+    \\let main:()={let mut a=C.[value=1]
+    \\let mut b=C.[value=10]
+    \\let mut p=&a
+    \\p.*.add({@print("A")
+    \\p=&b
+    \\4})
+    \\@println(a.value,p.*.value)
+    \\forward(p)
+    \\@println(a.read(),b.read())
+    \\let mut xs=[C.[value=20],C.[value=30]]
+    \\let mut index:int=0
+    \\xs[{index+=1
+    \\@print("R")
+    \\@as(int,-1)}].add({@print("A")
+    \\index=9
+    \\3})
+    \\@println(index,xs[0].value,xs[1].value)
+    \\let f=Callable.[call=(n:int)->int{n+1}]
+    \\@println(f.call(41))
+    \\}
+;
+
+test "mutable method receivers source free receiver index once before arguments old target forwarding callback field precedence O0 O3" {
+    const library = try emitBacktickProgramSourceFree(test_gpa, mutable_method_order);
+    defer test_gpa.free(library);
+    const program = try collectingTestProgram(library);
+    defer test_gpa.free(program);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(program, "typedef int nonempty;", 0, "AC5 10\nC5 12\nRAC9 20 33\n42\n", "", mode);
+}
+
 const reference_parameter_scalars =
     \\let add:(p:&mut int,n:int)={p.* +=n}
     \\let read:(p:&int)->int=p.*

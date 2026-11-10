@@ -117,6 +117,9 @@ fn addGcTests(b: *std.Build, test_step: *std.Build.Step) void {
 
 fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
+    const mutable_method_tests = b.step("test-cli-mutable-methods", "Run mutable method receiver CLI tests");
+    addMutableMethodCliTests(b, exe, mutable_method_tests);
+    test_step.dependOn(mutable_method_tests);
     const global_tests = b.step("test-cli-globals", "Run global storage and data-only initializer CLI tests");
     addGlobalCliTests(b, exe, global_tests);
     test_step.dependOn(global_tests);
@@ -2435,6 +2438,137 @@ fn addGenericFunctionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_
         check.expectStdOutEqual("");
         if (case.diagnostic.len == 0) check.expectStdErrEqual("") else check.expectStdErrMatch(case.diagnostic);
         test_step.dependOn(&check.step);
+    }
+}
+
+fn addMutableMethodCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    const fixtures = b.addWriteFiles();
+    const counter = "let C=struct{value:int,let add:(self:&mut C,n:int)={self.*.value+=n}\nlet echo:(self:&mut C,x:`T)->`T=x\nlet read:(self:&C)->int=self.*.value\n}\n";
+    _ = fixtures.add("mutable-methods.nov", @embedFile("examples/mutable-methods.nov"));
+    _ = fixtures.add("receiver-order.nov", counter ++
+        \\let verify:()={let mut c=C.[value=1]
+        \\c.add(2)
+        \\C.add(&c,3)
+        \\let exact:u8=c.echo(@as(u8,7))
+        \\let query:@TypeOf(c.echo(exact))=exact
+        \\@assert(c.read()==6 and query==7)
+        \\let mut items=[C.[value=10]]
+        \\let mut count:int=0
+        \\items[{count+=1
+        \\@print("R")
+        \\0}].add({@print("A")
+        \\5})
+        \\@assert(count==1 and items[0].value==15)
+        \\@println(c.value,exact,items[0].value)}
+        \\@[test]
+        \\let mutable_receivers_and_order:()=verify()
+        \\let main:()=verify()
+        \\
+    );
+    _ = fixtures.add("library.nov",
+        \\let secret:int=4
+        \\@[public]
+        \\let Box:(T:type)->type=struct{let Self=@This()
+        \\value:T,
+        \\@[public]
+        \\let set:(self:&mut Self,value:T)={self.*.value=value}
+        \\@[public]
+        \\let echo:(self:&mut Self,value:`U)->`U=value
+        \\@[public]
+        \\let read:(self:&Self)->int=secret
+        \\let hidden:(self:&mut Self)={}
+        \\}
+        \\
+    );
+    _ = fixtures.add("api.nov", "let lib=@import(\"library.nov\")\n@[public]\nlet Box=lib.Box\n");
+    _ = fixtures.add("imported.nov",
+        \\let api=@import("api.nov")
+        \\let same=@import("./library.nov")
+        \\let verify:()={let mut b=api.Box(u8).[value=1]
+        \\b.set(2)
+        \\same.Box(u8).set(&b,3)
+        \\let result:string=b.echo("generic")
+        \\@assert(b.value==3 and result=="generic" and b.read()==4)}
+        \\@[test]
+        \\let imported_public_generic_receivers:()=verify()
+        \\let main:()=verify()
+        \\
+    );
+    const fmt = b.addRunArtifact(exe);
+    fmt.setCwd(fixtures.getDirectory());
+    fmt.addArgs(&.{ "fmt", "--check", "mutable-methods.nov" });
+    fmt.expectExitCode(0);
+    fmt.expectStdOutEqual("");
+    fmt.expectStdErrEqual("");
+    test_step.dependOn(&fmt.step);
+    for ([_][]const u8{ "mutable-methods.nov", "receiver-order.nov", "imported.nov" }) |source| {
+        const check = b.addRunArtifact(exe);
+        check.step.name = b.fmt("CLI mutable methods semantic: {s}", .{source});
+        check.setCwd(fixtures.getDirectory());
+        check.addArgs(&.{ "check", "--semantic", source });
+        check.expectExitCode(0);
+        check.expectStdOutEqual("");
+        check.expectStdErrEqual("");
+        test_step.dependOn(&check.step);
+        for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+            for ([_][]const u8{ "run", "test" }) |command| {
+                const run = b.addRunArtifact(exe);
+                run.step.name = b.fmt("CLI mutable methods: {s} {s} ({s})", .{ command, source, mode });
+                run.setCwd(fixtures.getDirectory());
+                run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+                run.setEnvironmentVariable("NOV_CC", "");
+                run.setEnvironmentVariable("CC", "");
+                run.addArgs(&.{ command, source });
+                if (mode.len != 0) run.addArg(mode);
+                const tests = std.mem.eql(u8, command, "test");
+                const imported = std.mem.eql(u8, source, "imported.nov");
+                const example = std.mem.eql(u8, source, "mutable-methods.nov");
+                run.expectExitCode(0);
+                run.expectStdOutEqual(if (example)
+                    (if (tests) "PASS local_static_and_value_receivers\nPASS explicit_dereference_and_reference_parameter\nPASS array_element_receiver_evaluates_once\nPASS receiver_target_precedes_argument_rebinding\nPASS generic_self_and_method_inference\nPASS type_queries_do_not_borrow_or_execute\nPASS callable_fields_have_no_implicit_receiver\n7 passed; 0 failed; 7 total\n" else "Counter: 9\nThrough reference: 10\nArray elements: 10 25\nGeneric: after 7\n")
+                else if (imported)
+                    (if (tests) "PASS imported_public_generic_receivers\n1 passed; 0 failed; 1 total\n" else "")
+                else if (tests)
+                    "RA6 7 15\nPASS mutable_receivers_and_order\n1 passed; 0 failed; 1 total\n"
+                else
+                    "RA6 7 15\n");
+                run.expectStdErrEqual("");
+                test_step.dependOn(&run.step);
+            }
+        }
+    }
+    const conflict = "owner access or aliased reference arguments conflict with a live borrow";
+    const immutable = "assignment requires a mutable local";
+    const unsupported = "local references require";
+    for ([_]struct { name: []const u8, source: []const u8, diagnostic: []const u8 }{
+        .{ .name = "immutable", .source = counter ++ "let main:()={let c=C.[value=0]\nc.add(1)}", .diagnostic = immutable },
+        .{ .name = "temporary", .source = counter ++ "let main:()={C.[value=0].add(1)}", .diagnostic = unsupported },
+        .{ .name = "global", .source = counter ++ "let mut c=C.[value=0]\nlet main:()={c.add(1)}", .diagnostic = unsupported },
+        .{ .name = "field-place", .source = counter ++ "let H=struct{c:C,}\nlet main:()={let mut h=H.[c=C.[value=0]]\nh.c.add(1)}", .diagnostic = unsupported },
+        .{ .name = "readonly", .source = counter ++ "let f:(p:&C)={p.*.add(1)}\nlet main:()={}", .diagnostic = immutable },
+        .{ .name = "argument-read", .source = counter ++ "let main:()={let mut c=C.[value=0]\nc.add(c.value)}", .diagnostic = conflict },
+        .{ .name = "argument-write", .source = counter ++ "let main:()={let mut c=C.[value=0]\nc.add({c.value=3\n1})}", .diagnostic = conflict },
+        .{ .name = "live-borrow", .source = counter ++ "let main:()={let mut c=C.[value=0]\nlet p=&c\nc.add(1)\n@println(p.*.value)}", .diagnostic = conflict },
+        .{ .name = "element-owner", .source = counter ++ "let main:()={let mut cs=[C.[value=0]]\ncs[0].add({cs=[C.[value=2]]\n1})}", .diagnostic = conflict },
+        .{ .name = "captured-owner", .source = counter ++ "let main:()={let mut c=C.[value=0]\nlet run=()->int{c.value=3\n1}\nc.add(run())}", .diagnostic = conflict },
+        .{ .name = "aliased-arguments", .source = "let S=struct{let pair:(self:&mut S,other:&mut S)={}\n}\nlet main:()={let mut s=S.[]\ns.pair(&s)}", .diagnostic = conflict },
+        .{ .name = "private-instance", .source = "let lib=@import(\"library.nov\")\nlet main:()={let mut b=lib.Box(u8).[value=1]\nb.hidden()}", .diagnostic = "unknown container field, method, enum tag or union variant" },
+        .{ .name = "private-static", .source = "let lib=@import(\"library.nov\")\nlet main:()={let mut b=lib.Box(u8).[value=1]\nlib.Box(u8).hidden(&b)}", .diagnostic = "declaration needs a resolved type before use here" },
+        .{ .name = "callback-field-arity", .source = "let S=struct{call:(int)->int,}\nlet id:(n:int)->int=n\nlet main:()={let mut s=S.[call=id]\ns.call()}", .diagnostic = "argument count does not match the function signature" },
+        .{ .name = "callback-field-type", .source = "let S=struct{call:(int)->int,}\nlet id:(n:int)->int=n\nlet main:()={let mut s=S.[call=id]\ns.call(true)}", .diagnostic = "literal does not match the annotated type" },
+    }) |case| {
+        _ = fixtures.add(b.fmt("reject-{s}.nov", .{case.name}), case.source);
+        for ([_]bool{ false, true }) |emit_c| {
+            const check = b.addRunArtifact(exe);
+            check.step.name = b.fmt("CLI mutable methods reject: {s} ({s})", .{ case.name, if (emit_c) "emit-c" else "semantic" });
+            check.setCwd(fixtures.getDirectory());
+            check.addArgs(if (emit_c) &.{"emit-c"} else &.{ "check", "--semantic" });
+            check.addArg(b.fmt("reject-{s}.nov", .{case.name}));
+            check.expectExitCode(1);
+            check.expectStdOutEqual("");
+            check.expectStdErrMatch(b.fmt("error: {s}", .{case.diagnostic}));
+            test_step.dependOn(&check.step);
+        }
     }
 }
 

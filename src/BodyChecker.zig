@@ -1287,9 +1287,12 @@ const Context = struct {
 
     // Call temporaries never enter the lexical binding table or escape the call.
     fn createBorrow(self: *Context, init_node: Ast.Node.Index, annotation: ?Ir.TypeId, mutable: bool, name: ?[]const u8, name_span: Module.Span, depth: usize) Error!?Binding {
+        return self.createBorrowPlace(self.module.source.ast.nodes.items(.data)[init_node].rhs, init_node, annotation, mutable, name, name_span, depth);
+    }
+
+    fn createBorrowPlace(self: *Context, operand: Ast.Node.Index, init_node: Ast.Node.Index, annotation: ?Ir.TypeId, mutable: bool, name: ?[]const u8, name_span: Module.Span, depth: usize) Error!?Binding {
         const ast = &self.module.source.ast;
         const decl = .{ .init_node = init_node, .is_mutable = mutable };
-        const operand = ast.nodes.items(.data)[decl.init_node].rhs;
         const scalar = ast.nodes.items(.tag)[operand] == .identifier;
         if (!scalar and ast.nodes.items(.tag)[operand] != .array_access) {
             _ = try self.fail(.unsupported_borrow, decl.init_node, null);
@@ -1319,7 +1322,7 @@ const Context = struct {
         };
         const owner_type = self.ir.getType(owner.known.ty).?;
         const supported = if (scalar) Ir.isArrayElement(owner_type) else owner_type == .array;
-        if (owner.borrowed or owner.template != null or !supported) {
+        if (owner.global or owner.borrowed or owner.template != null or !supported) {
             _ = try self.fail(.unsupported_borrow, operand, owner.name_span);
             return null;
         }
@@ -1334,7 +1337,10 @@ const Context = struct {
             reference = type_id;
         }
         const unit = try self.ir.internType(.void);
-        const reservation = if (self.emitter) |emitter| try emitter.append(unit, self.irSpan(decl.init_node), .{ .borrow_reserve = owner.slot.? }) else null;
+        const reservation = if (self.emitter) |emitter| blk: {
+            const slot = owner.slot orelse try emitter.append(owner.known.ty, owner.name_span, .{ .local_slot = owner.value orelse try emitter.value(owner.initializer.?) });
+            break :blk try emitter.append(unit, self.irSpan(decl.init_node), .{ .borrow_reserve = slot });
+        } else null;
         if (scalar) {
             const borrow = if (self.emitter) |emitter| try emitter.append(unit, self.irSpan(decl.init_node), .{ .borrow_start = .{ .reservation = reservation.?, .index = null } }) else null;
             return .{ .known = .{ .ty = reference }, .name_span = name_span, .mutable = decl.is_mutable, .borrowed = true, .borrow = borrow, .loan_owner = .{ .owner = owner.name_span, .origin = self.irSpan(decl.init_node) } };
@@ -1759,7 +1765,7 @@ const Context = struct {
                                 return null;
                             }
                             if (c.receiverGeneric(receiver.ty, ast.tokenSlice(field.rhs))) |ref| {
-                                if (try c.genericProbe(node, call, ref, .{ .ty = receiver.ty, .span = c.irSpan(field.lhs) }, depth + 1)) |result| return .{ .ty = result };
+                                if (try c.genericProbe(node, call, ref, .{ .ty = try c.receiverArgumentType(receiver.ty, ast.tokenSlice(field.rhs)), .span = c.irSpan(field.lhs) }, depth + 1)) |result| return .{ .ty = result };
                             } else if (try c.probeReceiverSignature(receiver.ty, ast.tokenSlice(field.rhs))) |signature| {
                                 return .{ .ty = c.ir.getType(signature.ty).?.function.result };
                             }
@@ -2182,7 +2188,13 @@ const Context = struct {
         const offset: usize = @intFromBool(receiver != null);
         if (receiver) |arg| {
             const field = self.module.source.ast.nodes.items(.data)[call.ast.fn_expr];
-            try self.copyNode(field.lhs, arg.ty.?);
+            if (self.ir.getType(arg.ty.?).? == .reference) {
+                switch (try self.receiverArgument(field.lhs, arg.ty.?, depth + 1)) {
+                    .ready => {},
+                    .terminal => return .{ .checked = if (expected) |want| want.ty else try self.ir.internType(.void) },
+                    .failed => return .{ .checked = null },
+                }
+            } else try self.copyNode(field.lhs, arg.ty.?);
         }
         const related = ref.span();
         for (call.ast.args, params[offset..]) |arg, param| {
@@ -2349,6 +2361,63 @@ const Context = struct {
         const decl = owner.getDeclaration(id).?;
         if (owner.source.ast.declFunction(decl.node) == null or (owner != self.module and !decl.public)) return null;
         return .{ .module = owner, .id = id, .container_type = if (nominal == .record and nominal.record.type_args.len != 0) ty else null };
+    }
+
+    fn receiverArgumentType(self: *Context, ty: Ir.TypeId, name: []const u8) Error!Ir.TypeId {
+        const ref = self.receiverReference(ty, name) orelse return ty;
+        const ast = &ref.module.source.ast;
+        const function = ast.declFunction(ref.module.getDeclaration(ref.id).?.node).?;
+        var params = ast.fullFnProto(function.proto_node).?.iterate(ast);
+        const first = params.next() orelse return ty;
+        if (ast.nodes.items(.tag)[first.type_expr] != .ref_type) return ty;
+        return self.ir.internType(.{ .reference = .{ .child = ty, .mutable = ast.nodes.items(.data)[first.type_expr].lhs != 0 } });
+    }
+
+    const ReceiverArgument = enum { ready, terminal, failed };
+
+    fn receiverArgument(self: *Context, node: Ast.Node.Index, ty: Ir.TypeId, depth: usize) Error!ReceiverArgument {
+        const reference = self.ir.getType(ty).?.reference;
+        const ast = &self.module.source.ast;
+        const binding = if (ast.nodes.items(.tag)[node] == .deref) blk: {
+            const binding = (try self.dereferenceBinding(node)) orelse return .failed;
+            if (reference.mutable and !binding.mutable) {
+                _ = try self.fail(.immutable_assignment, node, binding.name_span);
+                return .failed;
+            }
+            if (self.mutationOrigin(binding)) |origin| {
+                _ = try self.fail(.borrow_conflict, node, origin);
+                return .failed;
+            }
+            break :blk binding;
+        } else blk: {
+            // Check writability before constructing the ordinary owner loan.
+            var owner_node = node;
+            if (ast.nodes.items(.tag)[node] == .array_access) owner_node = ast.nodes.items(.data)[node].lhs;
+            if (ast.nodes.items(.tag)[owner_node] == .identifier) {
+                if (self.lookupBinding(ast.tokenSlice(ast.firstToken(owner_node)))) |owner| {
+                    if (reference.mutable and !owner.mutable) {
+                        _ = try self.fail(.immutable_assignment, node, owner.name_span);
+                        return .failed;
+                    }
+                }
+            }
+            break :blk (try self.createBorrowPlace(node, node, ty, false, null, self.span(node), depth)) orelse return if (self.terminated) .terminal else .failed;
+        };
+        if (self.emitter) |emitter| {
+            try emitter.record(node, try self.ir.internType(.void), self.irSpan(node), .{ .reference_argument = .{ .borrow = binding.borrow.?, .ty = ty } });
+        }
+        for (binding.loan_owners) |loan| try self.reserveReceiverOwner(loan);
+        try self.reserveReceiverOwner(binding.loan_owner orelse .{ .owner = binding.name_span, .origin = self.irSpan(node) });
+        return .ready;
+    }
+
+    fn reserveReceiverOwner(self: *Context, loan: LoanOwner) Error!void {
+        // Keep deferred captured-call protection as well as exclusive source
+        // access protection; no two-phase activation window is introduced.
+        try self.reserveCallOwner(loan);
+        const reservation = try self.template_allocator.?.create(Reservation);
+        reservation.* = .{ .owner = loan.owner, .origin = loan.origin, .parent = self.reservation };
+        self.reservation = reservation;
     }
 
     fn receiverGeneric(self: *Context, ty: Ir.TypeId, name: []const u8) ?GenericFunctions.Ref {
@@ -3055,12 +3124,12 @@ const Context = struct {
                         }
                         if (self.receiverGeneric(receiver.ty, ast.tokenSlice(field.rhs))) |ref| {
                             if (ref.local == null and ref.module.getDeclaration(ref.id).?.noreturn) break :blk null;
-                            const result = (try self.genericProbe(node, call, ref, .{ .ty = receiver.ty, .span = self.irSpan(field.lhs) }, depth + 1)) orelse break :blk null;
+                            const result = (try self.genericProbe(node, call, ref, .{ .ty = try self.receiverArgumentType(receiver.ty, ast.tokenSlice(field.rhs)), .span = self.irSpan(field.lhs) }, depth + 1)) orelse break :blk null;
                             break :blk .{ .ty = result };
                         }
                         if (try self.probeReceiverSignature(receiver.ty, ast.tokenSlice(field.rhs))) |signature| {
                             const function = self.ir.getType(signature.ty).?.function;
-                            if (function.params.len == call.ast.args.len + 1 and function.params[0] == receiver.ty)
+                            if (function.params.len == call.ast.args.len + 1 and function.params[0] == try self.receiverArgumentType(receiver.ty, ast.tokenSlice(field.rhs)))
                                 break :blk .{ .ty = function.result };
                         }
                     }
@@ -4972,6 +5041,10 @@ const Context = struct {
                     self.borrow_base = field.lhs;
                     const receiver = blk: {
                         defer self.borrow_base = previous_base;
+                        if (try self.probe(field.lhs, depth + 1)) |known| {
+                            const argument = try self.receiverArgumentType(known.ty, ast.tokenSlice(field.rhs));
+                            if (self.ir.getType(argument).? == .reference) break :blk known.ty;
+                        }
                         break :blk (try self.projection(field.lhs, null, depth + 1)) orelse return null;
                     };
                     if (self.terminated) return if (expected) |want| want.ty else try self.ir.internType(.void);
@@ -4993,19 +5066,26 @@ const Context = struct {
                         if (!valid) return null;
                         return self.finishCall(node, call.ast.fn_expr, signature.function.result, expected);
                     }
+                    const receiver_argument = try self.receiverArgumentType(receiver, ast.tokenSlice(field.rhs));
                     const generic = self.receiverGeneric(receiver, ast.tokenSlice(field.rhs));
-                    if (generic) |ref| switch (try self.genericTerminalCall(node, call, ref, .{ .ty = receiver, .span = self.irSpan(field.lhs) }, expected, depth)) {
+                    if (generic) |ref| switch (try self.genericTerminalCall(node, call, ref, .{ .ty = receiver_argument, .span = self.irSpan(field.lhs), .terminal = try self.argumentTerminates(field.lhs, depth + 1) }, expected, depth)) {
                         .live => {},
                         .checked => |ty| return ty,
                     };
-                    const selected = if (generic) |ref| (try self.genericSignature(node, call, ref, .{ .ty = receiver, .span = self.irSpan(field.lhs) }, expected, depth)) orelse return null else null;
+                    const selected = if (generic) |ref| (try self.genericSignature(node, call, ref, .{ .ty = receiver_argument, .span = self.irSpan(field.lhs) }, expected, depth)) orelse return null else null;
                     if (if (selected) |s| s.id else self.receiverMethod(receiver, ast.tokenSlice(field.rhs))) |method| {
                         const signature: Known = if (selected) |s| .{ .ty = s.ty } else (try self.globalType(method)) orelse return self.fail(.unresolved_value_type, call.ast.fn_expr, null);
                         const function = self.ir.getType(signature.ty).?.function;
                         const related = self.getDeclaration(method).name_span;
-                        if (function.params.len == 0 or function.params[0] != receiver) return self.fail(.invalid_method_receiver, call.ast.fn_expr, related);
+                        if (function.params.len == 0 or function.params[0] != receiver_argument) return self.fail(.invalid_method_receiver, call.ast.fn_expr, related);
                         if (call.ast.args.len != function.params.len - 1) return self.fail(.argument_count_mismatch, node, related);
-                        try self.copyNode(field.lhs, receiver);
+                        if (self.ir.getType(receiver_argument).? == .reference) {
+                            switch (try self.receiverArgument(field.lhs, receiver_argument, depth + 1)) {
+                                .ready => {},
+                                .terminal => return if (expected) |want| want.ty else function.result,
+                                .failed => return null,
+                            }
+                        } else try self.copyNode(field.lhs, receiver);
                         var valid = true;
                         for (call.ast.args, function.params[1..]) |arg, param| {
                             if (try self.callArgument(arg, .{ .ty = param, .annotation = related }, depth + 1) == null) valid = false;
@@ -9988,6 +10068,201 @@ fn testReferenceParameters(allocator: std.mem.Allocator) !void {
 test "reference parameters source capabilities snapshots forwarding and closures under OOM" {
     try testReferenceParameters(std.testing.allocator);
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testReferenceParameters, .{});
+}
+
+fn testMutableMethodReceivers(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "mutable-receivers.nov",
+        \\let Counter=struct{value:int,let add:(self:&mut Counter,delta:int)={self.*.value+=delta}
+        \\let get:(self:Counter)->int=self.value
+        \\let echo:(self:&mut Counter,x:`T)->`T=x
+        \\let read:(self:&Counter)->int=self.*.value
+        \\}
+        \\let E=enum{a,b,let flip:(self:&mut E)={self.* =.b}
+        \\}
+        \\let U=union{none,some:int,let set:(self:&mut U,n:int)={self.* =.some[n]}
+        \\}
+        \\let Callable=struct{call:(int)->int,}
+        \\let identity:(n:int)->int=n
+        \\let forward:(p:&mut Counter)={p.*.add(3)}
+        \\let main:()={let mut c=Counter.[value=0]
+        \\c.add(2)
+        \\Counter.add(&c,4)
+        \\forward(&c)
+        \\let exact:u8=c.echo(@as(u8,7))
+        \\let query:@TypeOf(c.echo(@as(u8,8)))=exact
+        \\let no_effect:@TypeOf(c.add({c.value=99
+        \\1}))={}
+        \\let fixed=Counter.[value=8]
+        \\let readonly:int=fixed.read()
+        \\let mut e=E.a
+        \\e.flip()
+        \\let mut u=U.none[]
+        \\u.set(6)
+        \\let callable=Callable.[call=identity]
+        \\let field:int=callable.call(readonly)
+        \\let mut items=[Counter.[value=1]]
+        \\let mut index:int=0
+        \\items[{index+=1
+        \\0}].add({index=0
+        \\5})
+        \\let mut other=Counter.[value=10]
+        \\let mut p=&c
+        \\p.*.add({p=&other
+        \\1})
+        \\@println(c.get(),query,items[0].value,index)
+        \\}
+    );
+    defer module.deinit();
+    var analysis = try Lowering.lower(&module);
+    defer analysis.deinit();
+    errdefer if (module.hasErrors()) std.debug.print("mutable receiver: {any} {any}\n", .{ module.source.ast.errors, module.diagnostics.items });
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(analysis.lowering_complete);
+    try analysis.ir.verify();
+    var arguments: usize = 0;
+    for (analysis.ir.functions.items) |function| {
+        const body = function.body orelse continue;
+        for (body.instructions) |instruction| {
+            if (instruction.op != .call) continue;
+            const call = instruction.op.call;
+            const signature = analysis.ir.getType(body.instructions[@backingInt(call.callee)].ty).?.function;
+            for (call.args, signature.params) |arg, param| {
+                if (analysis.ir.getType(param).? != .reference) continue;
+                const capability = body.instructions[@backingInt(arg)].op;
+                try std.testing.expect(capability == .reference_argument);
+                try std.testing.expectEqual(param, capability.reference_argument.ty);
+                arguments += 1;
+            }
+        }
+    }
+    // The type-only echo call must not emit an argument or call.
+    try std.testing.expectEqual(@as(usize, 10), arguments);
+}
+
+test "mutable method receivers exact capabilities snapshots and queries under OOM" {
+    try testMutableMethodReceivers(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMutableMethodReceivers, .{});
+}
+
+fn testTerminalMutableReceiver(allocator: std.mem.Allocator, signature: []const u8, index: []const u8, prefix: []const u8, suffix: []const u8, generic: bool, explicit: bool) !void {
+    const invocation = if (explicit)
+        try std.fmt.allocPrint(allocator, "C.add(&cs[{{{s}}}],unknown)", .{index})
+    else
+        try std.fmt.allocPrint(allocator, "cs[{{{s}}}].add(unknown)", .{index});
+    defer allocator.free(invocation);
+    const source = try std.fmt.allocPrint(
+        allocator,
+        "let C=struct{{value:int,let add:(self:&mut C,n:{s})={{self.*.value+=1}}\n}}\nlet f:{s}={{let mut cs=[C.[value=0]]\n{s}{s}{s}\n}}",
+        .{ if (generic) "`T" else "int", signature, prefix, invocation, suffix },
+    );
+    defer allocator.free(source);
+    var module = try Module.init(allocator, "terminal-mutable-receiver.nov", source);
+    defer module.deinit();
+    var analysis = try Lowering.lower(&module);
+    defer analysis.deinit();
+    errdefer if (module.hasErrors()) std.debug.print("terminal receiver: {s}\n{any} {any}\n", .{ source, module.source.ast.errors, module.diagnostics.items });
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(analysis.lowering_complete);
+    try analysis.ir.verify();
+    var reservations: usize = 0;
+    for (analysis.ir.functions.items) |function| {
+        const body = function.body orelse continue;
+        for (body.instructions) |instruction| switch (instruction.op) {
+            .borrow_reserve => reservations += 1,
+            .borrow_start, .reference_argument, .call => return error.UnexpectedTerminalReceiverEffect,
+            else => {},
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 1), reservations);
+}
+
+test "mutable method receivers terminal indexes match explicit calls under OOM" {
+    for ([_]struct { signature: []const u8 = "()", index: []const u8, prefix: []const u8 = "", suffix: []const u8 = "" }{
+        .{ .index = "return" },
+        .{ .signature = "()->int", .index = "return 7" },
+        .{ .index = "break", .prefix = "loop {\n", .suffix = "\n}" },
+        .{ .index = "continue", .prefix = "loop true {\n", .suffix = "\n}" },
+        .{ .index = "@panic(\"index\")" },
+    }) |case| {
+        inline for (.{ false, true }) |generic| {
+            inline for (.{ false, true }) |explicit| {
+                try testTerminalMutableReceiver(std.testing.allocator, case.signature, case.index, case.prefix, case.suffix, generic, explicit);
+                try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testTerminalMutableReceiver, .{ case.signature, case.index, case.prefix, case.suffix, generic, explicit });
+            }
+        }
+    }
+}
+
+fn testTerminalReceiverQuery(allocator: std.mem.Allocator, generic: bool, explicit: bool) !void {
+    const invocation = if (explicit)
+        "C.add(&cs[{@panic(\"query only\")\n0}],1)"
+    else
+        "cs[{@panic(\"query only\")\n0}].add(1)";
+    const source = try std.fmt.allocPrint(
+        allocator,
+        "let C=struct{{value:int,let add:(self:&mut C,n:{s})={{self.*.value+=1}}\n}}\nlet f:()={{let q:@TypeOf({{let mut cs=[C.[value=0]]\n{s}}})={{}}\n}}",
+        .{ if (generic) "`T" else "int", invocation },
+    );
+    defer allocator.free(source);
+    var module = try Module.init(allocator, "terminal-receiver-query.nov", source);
+    defer module.deinit();
+    var analysis = try Lowering.lower(&module);
+    defer analysis.deinit();
+    errdefer if (module.hasErrors()) std.debug.print("terminal receiver query: {s}\n{any} {any}\n", .{ source, module.source.ast.errors, module.diagnostics.items });
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(analysis.lowering_complete);
+    try analysis.ir.verify();
+    for (analysis.ir.functions.items) |function| {
+        const body = function.body orelse continue;
+        for (body.instructions) |instruction| switch (instruction.op) {
+            .borrow_reserve, .borrow_start, .reference_argument, .call, .panic => return error.UnexpectedQueryEffect,
+            else => {},
+        };
+    }
+}
+
+test "mutable method receivers TypeOf terminal index validation stays effect free under OOM" {
+    inline for (.{ false, true }) |generic| {
+        inline for (.{ false, true }) |explicit| {
+            try testTerminalReceiverQuery(std.testing.allocator, generic, explicit);
+            try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testTerminalReceiverQuery, .{ generic, explicit });
+        }
+    }
+    try testReferenceParameterError(
+        std.testing.allocator,
+        "let C=struct{value:int,let add:(self:&mut C,n:int)={self.*.value+=n}\n}\nlet f:()={let q:@TypeOf({let cs=[C.[value=0]]\ncs[{@panic(\"query only\")\n0}].add(1)})={}\n}",
+        .immutable_assignment,
+    );
+    try testReferenceParameterError(
+        std.testing.allocator,
+        "let C=struct{value:int,let add:(self:&mut C,n:int)={self.*.value+=n}\n}\nlet f:()={let q:@TypeOf({let mut cs=[C.[value=0]]\ncs[{@panic(123)\n0}].add(1)})={}\n}",
+        .literal_type_mismatch,
+    );
+}
+
+test "mutable method receivers reject unsafe places and argument effects under OOM" {
+    const prelude = "let C=struct{value:int,let add:(self:&mut C,n:int)={self.*.value+=n}\n}\n";
+    for ([_]struct { source: []const u8, tag: Module.Diagnostic.Tag }{
+        .{ .source = prelude ++ "let f:()={let c=C.[value=0]\nc.add(1)}", .tag = .immutable_assignment },
+        .{ .source = prelude ++ "let f:()={C.[value=0].add(1)}", .tag = .unsupported_borrow },
+        .{ .source = prelude ++ "let f:(p:&C)={p.*.add(1)}", .tag = .immutable_assignment },
+        .{ .source = prelude ++ "let f:()={let mut c=C.[value=0]\nc.add(c.value)}", .tag = .borrow_conflict },
+        .{ .source = prelude ++ "let f:()={let mut c=C.[value=0]\nc.add({c.value=4\n1})}", .tag = .borrow_conflict },
+        .{ .source = prelude ++ "let f:(p:&mut C)={p.*.add(p.*.value)}", .tag = .borrow_conflict },
+        .{ .source = prelude ++ "let f:(p:&mut C)={p.*.add({p.*.value=4\n1})}", .tag = .borrow_conflict },
+        .{ .source = prelude ++ "let f:()={let mut cs=[C.[value=0]]\ncs[0].add({cs=[C.[value=2]]\n1})}", .tag = .borrow_conflict },
+        .{ .source = prelude ++ "let f:()={let mut c=C.[value=0]\nlet run=()->int{c.value=3\n1}\nc.add(run())}", .tag = .borrow_conflict },
+        .{ .source = prelude ++ "let f:()={let c=C.[value=0]\nlet q:@TypeOf(c.add(1))={}\n}", .tag = .immutable_assignment },
+        .{ .source = prelude ++ "let f:()={let q:@TypeOf(C.[value=0].add(1))={}\n}", .tag = .unsupported_borrow },
+        .{ .source = "let C=struct{value:int,let add:(self:&mut C,n:`T)={}\n}\nlet f:()={let c=C.[value=0]\nlet q:@TypeOf(c.add(1))={}\n}", .tag = .immutable_assignment },
+        .{ .source = prelude ++ "let Holder=struct{c:C,}\nlet f:()={let mut h=Holder.[c=C.[value=0]]\nh.c.add(1)}", .tag = .unsupported_borrow },
+        .{ .source = prelude ++ "let mut c=C.[value=0]\nlet f:()={c.add(1)}", .tag = .unsupported_borrow },
+        .{ .source = "let C=struct{value:int,let add:(self:&mut int)={}\n}\nlet f:()={let mut c=C.[value=0]\nc.add()}", .tag = .invalid_method_receiver },
+    }) |case| {
+        errdefer std.debug.print("mutable receiver rejection: {s}\n", .{case.source});
+        try testReferenceParameterError(std.testing.allocator, case.source, case.tag);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testReferenceParameterError, .{ case.source, case.tag });
+    }
 }
 
 fn testReferenceParameterError(allocator: std.mem.Allocator, source: []const u8, tag: Module.Diagnostic.Tag) !void {

@@ -278,6 +278,27 @@ fn checkReferences(allocator: std.mem.Allocator, body: Ir.Body, edges: []const [
         }
     }
 
+    // An evaluated reference argument is an exclusive snapshot until its
+    // call consumes it. This also protects external parameter origins, which
+    // have no local owner slot for the owner-access pass below.
+    for (body.instructions, 0..) |instruction, i| {
+        if (!reachable[i]) continue;
+        const accessed = switch (instruction.op) {
+            .borrow_read => |borrow| borrow,
+            .borrow_store => |store| store.borrow,
+            .reference_argument => |arg| arg.borrow,
+            else => continue,
+        };
+        for (body.instructions, 0..) |pending, p| {
+            if (pending.op != .reference_argument or !live.row(i).has(p)) continue;
+            const left = origins.row(@backingInt(accessed));
+            const right = origins.row(p);
+            for (left.words, right.words) |l, r| {
+                if (l & r != 0) return .{ .access = instruction.span, .origin = pending.span };
+            }
+        }
+    }
+
     // Formal parameters have distinct external origins. Forwarding the same
     // parameter or overlapping dynamic snapshots twice still aliases.
     for (body.instructions, 0..) |instruction, i| {

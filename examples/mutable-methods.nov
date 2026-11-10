@@ -1,0 +1,151 @@
+; nov run examples/mutable-methods.nov --debug
+; nov test examples/mutable-methods.nov --release
+
+@[public]
+let Counter = struct {
+    value: int,
+
+    @[public]
+    let add: (self: &mut Counter, amount: int) = {
+        self.*.value += amount
+    }
+    @[public]
+    let get: (self: Counter) -> int = self.value
+    @[public]
+    let read: (self: &Counter) -> int = self.*.value
+}
+
+@[public]
+let Box: (Element: type) -> type = struct {
+    let Self = @This()
+    value: Element,
+
+    @[public]
+    let set: (self: &mut Self, value: Element) = {
+        self.*.value = value
+    }
+    @[public]
+    let echo: (self: &mut Self, input: `T) -> `T = input
+}
+
+let forward: (counter: &mut Counter, amount: int) = {
+    counter.*.add(amount)
+}
+let Callable = struct {
+    call: (int) -> int,
+}
+let twice: (value: int) -> int = value * 2
+
+let main: () = {
+    let mut counter = Counter.[ value = 0 ]
+    counter.add(2)
+    Counter.add(&counter, 3)
+    forward(&counter, 4)
+    @println("Counter:", counter.get())
+    let p = &counter
+    p.*.add(1)
+    @println("Through reference:", p.*.read())
+    let mut counters = [Counter.[ value = 10 ], Counter.[ value = 20 ]]
+    counters[-1].add(5)
+    @println("Array elements:", counters[0].value, counters[1].value)
+    let mut box = Box(string).[ value = "before" ]
+    box.set("after")
+    @println("Generic:", box.value, box.echo(@as(u8, 7)))
+}
+
+@[test]
+let local_static_and_value_receivers: () = {
+    let mut counter = Counter.[ value = 0 ]
+    let saved = counter
+    counter.add(2)
+    Counter.add(&counter, 3)
+    @assert(counter.get() == 5 and saved.get() == 0)
+    let fixed = Counter.[ value = 8 ]
+    @assert(fixed.read() == 8 and fixed.get() == 8)
+}
+
+@[test]
+let explicit_dereference_and_reference_parameter: () = {
+    let mut counter = Counter.[ value = 1 ]
+    forward(&counter, 2)
+    let p = &counter
+    p.*.add(3)
+    forward(p, 4)
+    @assert(p.*.read() == 10)
+    @assert(counter.value == 10)
+}
+
+@[test]
+let array_element_receiver_evaluates_once: () = {
+    let mut counters = [Counter.[ value = 1 ], Counter.[ value = 10 ]]
+    let saved = counters
+    let mut index: int = 0
+    let mut events: int = 0
+    counters[
+        {
+            events = events * 10 + 1
+            index += 1
+            0
+        }].add(
+        {
+            events = events * 10 + 2
+            index = 0
+            5
+        }
+    )
+    counters[-1].add(2)
+    @assert(events == 12 and index == 0)
+    @assert(counters[0].value == 6 and counters[1].value == 12)
+    @assert(saved[0].value == 1 and saved[1].value == 10)
+}
+
+@[test]
+let receiver_target_precedes_argument_rebinding: () = {
+    let mut first = Counter.[ value = 1 ]
+    let mut second = Counter.[ value = 10 ]
+    let mut p = &first
+    p.*.add(
+        {
+            p = &second
+            5
+        }
+    )
+    @assert(p.*.value == 10)
+    p.*.add(2)
+    @assert(first.value == 6 and second.value == 12)
+}
+
+@[test]
+let generic_self_and_method_inference: () = {
+    let mut box = Box([]string).[ value = ["before"] ]
+    let saved = box
+    box.set(["after", "tail"])
+    let exact: u8 = box.echo(@as(u8, 7))
+    @assert(exact == 7 and box.echo(true))
+    @assert(box.value.len == 2 and box.value[0] == "after")
+    @assert(saved.value.len == 1 and saved.value[0] == "before")
+}
+
+@[test]
+let type_queries_do_not_borrow_or_execute: () = {
+    let mut counter = Counter.[ value = 0 ]
+    let query: @TypeOf(
+        counter.add(
+            {
+                counter.value = 99
+                1
+            }
+        )
+    ) = {}
+    let mut box = Box(u8).[ value = 1 ]
+    let exact: @TypeOf(box.echo(@as(u8, 8))) = 7
+    @assert(counter.value == 0 and box.value == 1 and exact == 7)
+}
+
+@[test]
+let callable_fields_have_no_implicit_receiver: () = {
+    let callable = Callable.[ call = twice ]
+    @assert(callable.call(3) == 6)
+    let call = callable.call
+    @assert(call(4) == 8)
+}

@@ -42,13 +42,34 @@ indexed replacement/integer compounds on nested mutable-local paths. Updates sna
 the array before index/RHS effects, then replace only the target field in the current
 record; sibling changes survive. Existing whole-record/record-element stable loans
 support array-field replacement/append and ordinary recursively copied reads, but
-not indexed field updates. No field-specific loans or implicit mutable receivers
-are added. Nested arrays are supported; recursive layouts through arrays still
-reject, and every nested array edge counts toward the aggregate depth bound. Immutable closure
+not indexed field updates. No field-specific loans are added; bounded method
+receiver borrowing is described in the delivered status below. Nested arrays are
+supported; recursive layouts through arrays still reject, and every nested array edge counts toward the aggregate depth bound. Immutable closure
 captures snapshot recursively; mutable captures share a cell, not ordinary read
 results. See `examples/array-fields.nov`.
 
 ## Current delivered status
+
+Step 3 complete: nominal methods accept exact `&Self` / `&mut Self` receivers.
+Instance calls borrow supported existing local owners and array elements, or
+forward an explicit `p.*` receiver, including reference parameters. Mutable
+receivers require mutable storage; readonly receivers also accept immutable local
+owners. Method bodies use explicit `self.*`; no autodereference is added.
+Nested field borrows, global/temporary receivers, readonly mutation, escaping
+references and bound method values remain rejected. Static `Counter.add(&c, n)`
+and by-value receiver snapshots remain unchanged. Callable fields keep precedence
+and ordinary argument lists, with no implicit receiver.
+
+Targets/indices evaluate once before explicit arguments, left to right. Receiver
+loans protect storage throughout argument evaluation and the call; conflicting
+reads/writes/aliases/invalidation reject. Later reference rebinding does not
+redirect a pending call. Generic containers (`Self = @This()`), method-local
+backtick inference and imported public methods preserve exact types and visibility.
+Type queries check receiver places/mutability without runtime borrows, calls,
+mutation or captures. See `examples/mutable-methods.nov` (seven tests), README.md
+and lib/README.md. Library helper signatures are unchanged; no builder, array
+clear/truncate, new defaults or performance work is introduced. Optimization
+remains **PAUSED**.
 
 Step 2 complete: `std.string.trim(text: string) -> string`,
 `replace(text: string, pattern: string, replacement: string) -> string` and
@@ -65,7 +86,7 @@ text skips the loop even for maximum `uint`. All arguments remain eager, once,
 left to right; no callbacks or compiler changes. Current concatenation can copy
 quadratically; performance work remains **PAUSED**. See
 `examples/string-transform.nov` (seven tests and exact stdout), README.md and
-lib/README.md. Mutable receivers remain a separate, unimplemented step.
+lib/README.md. Mutable receivers are delivered separately in step 3 above.
 
 Step 1 complete: `std.array.sort(items: []T, less: (T, T) -> bool) -> []T`
 is an ordinary Nov stable insertion sort returning an independent copy. Required
@@ -419,9 +440,9 @@ canonical top-level/imported/public aliases and namespace/generic-container
 static/sibling and instance calls. The concrete receiver container binds its type
 parameters; method-local backtick variables infer from explicit arguments,
 contextual generic callbacks, expected results and supported body constraints.
-Static and instance forms share canonical specializations. Receivers are exact
-nominal by-value snapshots evaluated once before explicit arguments; no mutable
-receiver or implicit borrow is added. Fields retain lookup precedence.
+Static and instance forms share canonical specializations. By-value receivers are
+exact nominal snapshots evaluated once before explicit arguments; reference
+receivers use the step 3 call-scoped borrowing rules. Fields retain lookup precedence.
 Ordinary closures inside generic bodies capture substituted concrete types;
 local generic signatures can also introduce their own inferred variables.
 Generic template captures happen once at creation: immutable values snapshot
@@ -562,7 +583,8 @@ arguments may weaken to readonly for the same child type, never the reverse;
 this rule applies only to arguments, while function/callback types stay invariant.
 Formal reference bindings cannot rebind, but mutable-pointee `.*` writes work.
 Callees may forward reference parameters, not ordinarily copy/alias, capture,
-reborrow, return or store them. Method receivers remain by value.
+reborrow, return or store them. Exact reference receivers now support bounded
+instance borrowing and forwarding through explicit `p.*`.
 
 Each reference argument snapshots its target before later argument effects:
 `call(p, later)` still passes the old target if `later` rebinds `p` to `&b`.
@@ -645,8 +667,9 @@ integer +=/-=/*=//=/%= and string +=. Compounds snapshot the old field before RH
 final stores change only that field in the current local, preserving other-field
 and whole-record RHS changes. Terminal RHS skips the pending operation/store.
 Copies remain independent, strings share immutable storage, and string owners stay
-rooted. Bounded local element borrows also mutate fields; general temporary/union/
-parameter/pointer mutation and implicit borrowing remain unsupported.
+rooted. Bounded local element borrows also mutate fields; ordinary immutable
+parameters and general temporary/pointer mutation remain unsupported. Exact
+reference-receiver methods use the bounded step 3 borrowing rules.
 See examples/struct-mutation.nov; generic structs now use the same mutation rules;
 prioritized roadmap is in local untracked PLAN2.md; PLAN.md is archived.
 
@@ -690,14 +713,14 @@ explicit @[public] for cross-file access. Checks cover aliases/reexports, generi
 instances and implicit `@[stringify]` calls. @[private] is unsupported. Runtime module
 initialization, arbitrary package search and value generics/comptime remain deferred.
 
-Instance calls value.method(args) work on nominal structs, non-generic unions and
-enums as sugar for Type.method(value,args). The explicit first parameter must match
-the exact nominal receiver type. Receiver evaluates/snapshots once before explicit
-arguments left-to-right; direct noreturn methods remain terminal. Fields retain
-lookup precedence. Generic instance methods now infer method-local backtick
-variables, sharing canonical specializations with static/direct calls. No implicit
-mutation/borrowing or bound method references are supported. Callable fields use
-ordinary function calls, not method receiver insertion.
+Instance calls value.method(args) work on nominal structs, unions and enums.
+The explicit first parameter must match the exact nominal receiver type or an
+exact readonly/mutable reference to it. By-value receivers snapshot once; reference
+receivers select and protect their target once before explicit arguments, left to
+right. Direct noreturn methods remain terminal. Fields retain lookup precedence.
+Generic instance methods infer method-local backtick variables, sharing canonical
+specializations with static/direct calls. Bound method references remain unsupported.
+Callable fields use ordinary function calls, not method receiver insertion.
 structured-errors.nov uses Entry.describe().
 
 Nominal unnumbered enums are executable: qualified/contextual tags, aliases, exact
@@ -977,8 +1000,9 @@ panics on invalid UTF-8.
 A separate stdlib builder (tentatively `StringBuilder`) should preserve UTF-8 for
 string/rune appends and require valid UTF-8 boundaries for text edits. Producing a
 string initially makes an independent snapshot so later builder edits cannot change
-it. Ownership-transfer optimizations, exact APIs and array-field/mutable-receiver
-contracts remain deferred. Do not add a second built-in mutable-string type.
+it. Ownership-transfer optimizations, exact builder APIs and builder-specific
+contracts remain deferred; bounded mutable method receivers are delivered.
+Do not add a second built-in mutable-string type.
 
 `rune`, scalar string indexing and half-open/inclusive scalar slicing are implemented (see
 above). String views share the original GC owner without copying UTF-8 bytes;
@@ -1758,7 +1782,8 @@ methods obey existing visibility. The concrete receiver binds container `T`;
 method-local `U` follows explicit arguments, contextual generic callbacks, expected
 results and bounded body constraints. See README.md for `Box.map`. Static and
 instance calls share canonical specializations, preserving field precedence and
-exact by-value receiver snapshots before argument evaluation.
+exact by-value receiver snapshots before argument evaluation. Reference receivers
+use the delivered call-scoped borrowing rules above.
 `let callback = identity` remains ambiguous; `apply(identity, 42)` can resolve via
 `int` fallback. Conflicts reject, with no implicit conversions.
 

@@ -576,8 +576,52 @@ Pass `f(p)`, `f(&local)` or `f(&array[index])` to a compatible reference paramet
 `f(p.*)` passes a value instead. Mutable arguments may weaken to readonly for the
 same child type, never the reverse; function/callback types remain invariant.
 Formal reference bindings cannot rebind, but mutable-pointee `.*` writes and
-forwarding to other compatible reference parameters work. Existing method
-receivers remain by value; the array helper signatures above are unchanged.
+forwarding to other compatible reference parameters work. Methods can declare
+exact `&Self` / `&mut Self` receivers; the array helper signatures above remain
+by value and unchanged.
+
+Instance calls such as `counter.add(2)` supply a call-scoped reference when the
+method declares `self: &mut Counter`; its body mutates through `self.*`.
+Supported receivers are existing local owners, array elements and explicit `p.*`
+(including reference parameters). Mutable receivers require mutable storage;
+readonly `&Self` receivers also accept immutable local owners. There is no
+autodereference: write `p.*.add(2)`, not `p.add(2)`. Nested field receivers,
+global/temporary borrowing and readonly mutation remain rejected. This is not
+general reborrowing or reference escape support. Static `Counter.add(&counter, 2)`
+and compatible reference forwarding still work.
+
+Receiver targets and indices evaluate once before explicit arguments, left to
+right. Loans stay live throughout arguments and calls; conflicting owner access
+or invalidation rejects (including `counter.add(counter.value)`). Later reference
+rebinding cannot redirect a pending call. By-value methods retain their independent
+snapshots. Callable fields keep lookup precedence and ordinary calls, without
+implicit receiver insertion; bound method values remain unsupported.
+Generic containers may declare `let Self = @This()` and use `&mut Self`; inferred
+method type parameters retain exact constraints. Imported calls require public
+types/aliases and public methods independently. `@TypeOf` validates receiver places
+and mutability without runtime borrows, calls, effects or captures. See
+[`examples/mutable-methods.nov`](../examples/mutable-methods.nov) for seven tests:
+
+```sh
+nov check --semantic examples/mutable-methods.nov
+nov fmt --check examples/mutable-methods.nov
+nov run examples/mutable-methods.nov --debug
+nov test examples/mutable-methods.nov --debug
+nov run examples/mutable-methods.nov --release
+nov test examples/mutable-methods.nov --release
+```
+
+The example prints:
+
+```text
+Counter: 9
+Through reference: 10
+Array elements: 10 25
+Generic: after 7
+```
+
+This adds no builder API, array clear/truncate or new aggregate defaults; deferred
+builder and optimization work remains paused.
 
 Each reference argument snapshots its target before later argument effects:
 `call(p, later)` passes the old target if `later` rebinds `p` to `&b`.
