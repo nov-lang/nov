@@ -238,7 +238,9 @@ for a runnable example and six tests, including chaining and void outputs.
 
 ## Array helpers
 
-`array.nov` implements eight public generic functions.
+`array.nov` implements eleven public generic functions.
+Run `zig build test-cli-collection-helpers` for join/selection examples, imported
+aliases, invalid arguments and relocated-install checks.
 Signatures here use `T`/`U` for inferred backtick type variables:
 
 - `array.map(items: []T, convert: (T) -> U) -> []U` converts every element.
@@ -251,19 +253,27 @@ Signatures here use `T`/`U` for inferred backtick type variables:
   predicate; `array.all` has the same signature and stops at the first false one.
 - `array.find(items: []T, predicate: (T) -> bool) -> Option(T)` returns the first
   matching element by value.
+- `array.findLast(items: []T, predicate: (T) -> bool) -> Option(T)` visits elements
+  from the end and stops at the first match, returning the last matching value.
+- `array.take(items: []T, count: uint) -> []T` returns the first `min(count, items.len)`
+  elements in source order.
+- `array.drop(items: []T, count: uint) -> []T` discards the first `min(count, items.len)`
+  elements and returns the remainder in source order.
 - `array.findIndex(items: []T, predicate: (T) -> bool) -> Option(uint)` returns its
   zero-based, pointer-sized unsigned index.
 - `array.each(items: []T, action: (T) -> void) -> void` visits all elements without
   constructing an output array. Callbacks must return void.
 
-Callbacks run once per visited element in source order. Empty input invokes no
-callback: map/filter return empty arrays, fold returns `initial`, any returns
-false, all returns true, and both searches return `.none[]`. Searches also return
+Callbacks run once per visited element in source order, except `findLast`, whose
+predicate runs in reverse source order and stops immediately on a match.
+Empty input invokes no callback: map/filter/take/drop return empty arrays, fold
+returns `initial`, any returns false, all returns true, and all searches return
+`.none[]`. Searches also return
 none if every predicate is false. Short-circuiting skips later callback bodies,
 not argument expressions: callee then arguments evaluate eagerly in ordinary
 left-to-right order, including callback construction and the seed.
 
-`find` supports the existing `Option` payload types: bool, integers, floats,
+`find` and `findLast` support the existing `Option` payload types: bool, integers, floats,
 runes, strings, enums, arrays (including nested arrays), and supported acyclic
 records, including array fields, as well as nested unions, functions/closures
 and ranges. All helpers accept every currently supported array element type. The returned `Option` is the same canonical type as `std.Option`.
@@ -273,6 +283,15 @@ let found = array.find([1, 2, 3], (x) { x > 1 })
 let hasEven = array.any([1, 2, 3], (x) { x % 2 == 0 })
 array.each([1, 2, 3], (x) { @println(x) })
 ```
+
+Zero count makes `take` empty and `drop` a full independent copy. Counts at or
+above the input length make `take` a full independent copy and `drop` empty;
+even maximum `uint` is accepted without signed conversion or count arithmetic.
+Neither helper mutates the source. Returned arrays use ordinary recursive copy
+semantics, not shared mutable views; closure environments remain shared.
+See `examples/array-selection.nov` for a runnable example and eight tests covering
+selection, reverse visitation/short-circuiting, typed empties, maximum counts,
+generic storable families, recursive copies and shared captures.
 
 See `examples/array-search.nov` for a runnable example and seven tests.
 Ordinary functions and capturing closures are supported, as are inferred generic
@@ -320,7 +339,7 @@ function/closure values share their existing environments and mutable capture
 cells. No aliasing pointer mutation is introduced. Callback failures and panics
 propagate normally; these helpers do not catch errors or panics.
 
-Map/filter use repeated append and can be quadratic; by-value copies can add
+Map/filter/take/drop use repeated append and can be quadratic; by-value copies can add
 substantial overhead. Further optimization remains **PAUSED**. See
 `examples/array-helpers.nov` for the runnable example and six tests covering typed
 and generic callbacks, stable order, empty inputs, left folds, recursive copies,
@@ -384,6 +403,29 @@ its string elements continue sharing immutable content. Allocation failure panic
 normally. This initial implementation uses existing scalar indexing/slicing and
 repeated append; efficient-search/growth optimization remains deferred. See
 `examples/string-split.nov` for a runnable example and five tests.
+
+## String joining
+
+`std.string.join(parts: []string, separator: string) -> string` inserts the
+separator between parts, never before the first or after the last part. Empty
+input returns `""`; a singleton returns its content unchanged. An empty separator
+concatenates all parts. Empty parts are preserved, so joining `["", "a", ""]` with
+`"|"` produces `"|a|"`.
+
+```nov
+@assert(std.string.join(["red", "green", "blue"], ", ") == "red, green, blue")
+@assert(std.string.join(["e", "\u{301}"], "") == "e\u{301}")
+```
+
+Existing string `+` preserves the exact UTF-8 bytes of parts and separator,
+including embedded NUL; no normalization, case folding or grapheme processing is
+performed. Parts and separator evaluate once in normal left-to-right argument
+order. Inputs remain unchanged and the immutable result remains valid after input
+bindings are replaced or leave scope. Allocation failures panic normally.
+
+This is an ordinary Nov loop using existing string `+`, not a compiler builtin
+or optimized builder. Repeated concatenation can be quadratic; optimization stays
+paused. See `examples/string-join.nov` for a runnable example and five tests.
 
 ## References and library boundaries
 

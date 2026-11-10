@@ -45,6 +45,20 @@ let find: (text: string, pattern: string) -> Option(uint) = {
 let contains: (text: string, pattern: string) -> bool = find(text, pattern).isSome()
 
 @[public]
+let join: (parts: []string, separator: string) -> string = {
+    let mut result = ""
+    let mut first = true
+    loop part in parts {
+        if first == false {
+            result = result + separator
+        }
+        result = result + part
+        first = false
+    }
+    result
+}
+
+@[public]
 let split: (text: string, separator: string) -> []string = {
     if separator.len == 0 {
         @panic("string split separator must not be empty")

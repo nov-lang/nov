@@ -50,6 +50,25 @@ results. See `examples/array-fields.nov`.
 
 ## Current delivered status
 
+`std.string.join(parts: []string, separator: string) -> string` is implemented as
+an ordinary Nov loop using existing string `+`. Empty parts arrays return `""`,
+singletons preserve their content, and empty separators concatenate. Separators
+appear only between parts, including empty parts. Exact UTF-8 bytes and embedded
+NUL are preserved without normalization. Inputs remain unchanged and results
+retain valid immutable content. See `examples/string-join.nov` (five tests).
+
+`std.array.findLast`, `take` and `drop` are implemented for all supported storable
+element types. `findLast` evaluates predicates from the end, stopping immediately
+at the first reverse-order match, and returns canonical `std.Option(T)` or none.
+Empty input invokes no predicate. `take` keeps the first `min(count, len)` elements;
+`drop` discards them. Counts are `uint`, clamped even at maximum `uint`; zero count
+and empty input follow those rules. Results preserve source order and existing
+recursive independent array backing; closure copies still share environments.
+Inputs are not mutated, and arguments remain eager and left-to-right. See
+`examples/array-selection.nov` (eight tests). These helpers add no compiler
+builtins, reverse iterator, borrowing, extra APIs or optimizations. Repeated string
+concatenation/array append can be quadratic; performance work remains **PAUSED**.
+
 `std.string.split(text, separator) -> []string` is implemented in Nov. Exact,
 case-sensitive, non-overlapping Unicode-scalar separator matching preserves
 leading/trailing/adjacent empty fields. Empty input with nonempty separator gives
@@ -57,8 +76,8 @@ one empty field; no match gives the whole input. Empty separator panics in every
 mode. Arguments remain eager and left-to-right. Field contents are zero-copy
 immutable views with retained owners; output arrays allocate/copy independently.
 Source-free generated-C tests check owner/data identity, forced-GC retention,
-independent array copies and runtime OOM at O0/O3. No compiler semantics, join,
-normalization or optimization changes. See examples/string-split.nov (five tests).
+independent array copies and runtime OOM at O0/O3. No compiler semantics,
+normalization or optimization changes were needed for split. See examples/string-split.nov (five tests).
 
 Positional anonymous structs support zero-based `.0`, `.1`, etc. for reads,
 exact-type writes through mutable owners, nested paths, callable fields and

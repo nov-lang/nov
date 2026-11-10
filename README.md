@@ -1718,14 +1718,19 @@ Signatures below use `T`/`U` for inferred backtick type variables:
 - `any(items: []T, predicate: (T) -> bool) -> bool` stops at the first true result.
 - `all(items: []T, predicate: (T) -> bool) -> bool` stops at the first false result.
 - `find(items: []T, predicate: (T) -> bool) -> Option(T)` returns the first match.
+- `findLast(items: []T, predicate: (T) -> bool) -> Option(T)` visits from the end,
+  stopping immediately at the last matching element and returning it by value.
+- `take(items: []T, count: uint) -> []T` keeps the first `min(count, items.len)` elements.
+- `drop(items: []T, count: uint) -> []T` discards those elements, keeping the remainder.
 - `findIndex(items: []T, predicate: (T) -> bool) -> Option(uint)` returns the first
   matching zero-based index; indices use pointer-sized unsigned `uint`.
 - `each(items: []T, action: (T) -> void) -> void` visits every element without
   building a result array. A nonvoid callback is an error, not silently discarded.
 
-Callbacks run once per visited element in source order, and never run for empty
-input. Empty map/filter results are empty arrays; empty fold returns the seed;
-empty `any` is false and empty `all` is true. Both searches return `.none[]` when
+Callbacks run once per visited element in source order (reverse source order for
+`findLast`), and never run for empty input. Empty map/filter/take/drop results are
+empty arrays; empty fold returns the seed; empty `any` is false and empty `all` is
+true. All searches return `.none[]` when
 nothing matches. Callee and argument expressions still evaluate eagerly in normal
 left-to-right call order, including callback construction on empty input.
 
@@ -1735,10 +1740,11 @@ let hasEven = array.any([1, 2, 3], (x) { x % 2 == 0 })
 array.each([1, 2, 3], (x) { @println(x) })
 ```
 
-`find` requires an element type supported as an `Option` payload: bool, integers,
+`find` and `findLast` require an element type supported as an `Option` payload: bool, integers,
 floats, runes, strings, enums and supported acyclic records (including array
 fields), arrays (including nested arrays), unions, functions/closures and ranges.
-Thus `find` and the other helpers accept all supported array element types. `find` returns a value, not a reference to source storage.
+Thus all helpers accept all supported storable array element types. `find` and
+`findLast` return values, not references to source storage.
 See [`examples/array-search.nov`](examples/array-search.nov) for a runnable example
 and seven tests.
 
@@ -1753,7 +1759,16 @@ Function/closure copies share their capture environments and mutable cells, not
 recaptured values. These helpers add no aliasing pointer mutation. Callback
 failures and panics propagate normally; the helpers do not catch errors or panics.
 
-Map/filter currently build results by repeated append, which can be quadratic;
+`take` and `drop` preserve source order without mutating the source. Zero count
+returns an empty `take` and a full independent `drop` copy; counts at or above the
+length return a full independent `take` copy and an empty `drop`. Empty input
+always returns empty arrays. Counts accept the full `uint` range, including its
+maximum, without signed conversion. Copies follow the recursive backing/shared
+closure semantics above. See
+[`examples/array-selection.nov`](examples/array-selection.nov) for a runnable
+example and eight tests.
+
+Map/filter/take/drop currently build results by repeated append, which can be quadratic;
 normal by-value copying adds overhead. Further optimization remains **PAUSED**.
 [`examples/array-helpers.nov`](examples/array-helpers.nov) contains the runnable
 example and six tests covering callbacks, ordering, empty inputs, folds, recursive
@@ -3270,6 +3285,26 @@ Returned views retain the source owner after the input binding is dropped or
 replaced. Existing allocation-failure behavior applies, and performance work stays
 deferred. See [examples/string-split.nov](examples/string-split.nov) and
 [lib/README.md](lib/README.md#string-splitting).
+
+### Standard-library string joining
+
+`std.string.join(parts: []string, separator: string) -> string` inserts a separator
+between consecutive parts. Empty input returns `""`, a singleton returns its
+content, and an empty separator concatenates the parts. Empty parts still delimit
+separators: joining `["", "a", ""]` with `"|"` yields `"|a|"`.
+
+```nov
+@assert(std.string.join(["red", "green", "blue"], ", ") == "red, green, blue")
+```
+
+The exact UTF-8 bytes, including NUL and combining scalars, are preserved without
+normalization or case folding. Arguments evaluate once, left to right; inputs
+remain unchanged and results survive input rebinding or scope exit. This ordinary
+Nov helper uses existing string `+`, with potentially quadratic repeated copying,
+not a compiler builtin or optimized builder. Allocation failure panics normally;
+optimization remains paused. See [examples/string-join.nov](examples/string-join.nov)
+for the runnable example and five tests, and
+[lib/README.md](lib/README.md#string-joining).
 
 ## String Interpolation
 

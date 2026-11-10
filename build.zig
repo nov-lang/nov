@@ -147,6 +147,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const string_split_tests = b.step("test-cli-string-split", "Run standard-library string split CLI tests");
     addStringSplitCliTests(b, exe, string_split_tests);
     test_step.dependOn(string_split_tests);
+    const collection_helper_tests = b.step("test-cli-collection-helpers", "Run string join and array selection CLI tests");
+    addCollectionHelperCliTests(b, exe, collection_helper_tests);
+    test_step.dependOn(collection_helper_tests);
     const rune_tests = b.step("test-cli-runes", "Run Unicode rune CLI tests");
     addRuneCliTests(b, exe, rune_tests);
     test_step.dependOn(rune_tests);
@@ -3319,6 +3322,119 @@ fn addStringSearchCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_ste
         _ = fixtures.add(source, b.fmt("let std=@import(\"std\")\nlet main:()={{let result={s}\n}}\n", .{case.expression}));
         const check = b.addRunArtifact(exe);
         check.step.name = b.fmt("CLI string search: reject {s}", .{case.name});
+        check.setCwd(fixtures.getDirectory());
+        check.addArgs(&.{ "check", "--semantic", source, "--lib-dir" });
+        check.addDirectoryArg(library);
+        check.expectExitCode(1);
+        check.expectStdOutEqual("");
+        check.expectStdErrMatch(".nov:");
+        check.expectStdErrMatch("error:");
+        test_step.dependOn(&check.step);
+    }
+}
+
+fn addCollectionHelperCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    const fixtures = b.addWriteFiles();
+    const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
+    const aliases_source =
+        \\let std = @import("std")
+        \\let strings = @import("lib/string.nov")
+        \\let arrays = @import("lib/array.nov")
+        \\let alternate = @import("lib/./array.nov")
+        \\let verify: () = {
+        \\    let join: ([]string, string) -> string = strings.join
+        \\    let take: ([]int, uint) -> []int = arrays.take
+        \\    let drop: ([]int, uint) -> []int = alternate.drop
+        \\    let findLast: ([]int, (int) -> bool) -> std.Option(int) = arrays.findLast
+        \\    @assert(join(["é", "😀"], "\0") == "é\0😀")
+        \\    @assert(take([1, 2, 3], 2)[-1] == 2)
+        \\    @assert(drop([1, 2, 3], 2)[0] == 3)
+        \\    @assert(findLast([1, 2, 3], (x) { x < 3 }).unwrapOr(0) == 2)
+        \\}
+        \\@[test]
+        \\let imported_aliases: () = verify()
+        \\let main: () = verify()
+        \\
+    ;
+    const cases = [_]struct { source: []const u8, contents: []const u8, stdout: []const u8, tests: []const u8 }{
+        .{
+            .source = "string-join.nov",
+            .contents = @embedFile("examples/string-join.nov"),
+            .stdout = "Joined: red, green, blue\nEmpty fields: |red||blue|\nConcatenated: é😀é\nEmpty: []\n",
+            .tests = "PASS empty_singleton_and_empty_separator\nPASS separators_and_empty_parts\nPASS exact_utf8_nul_and_no_normalization\nPASS retained_result_and_source_unaffected\nPASS eager_arguments_once_left_to_right\n5 passed; 0 failed; 5 total\n",
+        },
+        .{
+            .source = "array-selection.nov",
+            .contents = @embedFile("examples/array-selection.nov"),
+            .stdout = "Numbers: [3, 1, 4, 2]\nLast above two: 4\nTake two: [3, 1]\nDrop two: [4, 2]\nTake oversized: [3, 1, 4, 2]\nDrop oversized: []\n",
+            .tests = "PASS reverse_visit_order_and_shortcircuit\nPASS typed_empty_no_predicate_calls\nPASS take_drop_boundaries_and_order\nPASS generic_storable_families\nPASS recursive_copies_in_both_directions\nPASS predicate_mutations_preserve_snapshot\nPASS closures_share_capture_environments\nPASS eager_arguments_once_left_to_right\n8 passed; 0 failed; 8 total\n",
+        },
+        .{ .source = "aliases.nov", .contents = aliases_source, .stdout = "", .tests = "PASS imported_aliases\n1 passed; 0 failed; 1 total\n" },
+    };
+    const package = b.addWriteFiles();
+    const installed_exe = package.addCopyFile(exe.getEmittedBin(), b.fmt("bin/{s}", .{exe.out_filename}));
+    _ = package.addCopyDirectory(b.path("lib"), "lib/nov", .{});
+    for (cases) |case| {
+        _ = fixtures.add(case.source, case.contents);
+        _ = package.add(case.source, std.mem.replaceOwned(u8, b.allocator, case.contents, "lib/", "lib/nov/") catch @panic("OOM"));
+        for ([_]bool{ false, true }) |semantic| {
+            if (!semantic and std.mem.eql(u8, case.source, "aliases.nov")) continue;
+            const check = b.addRunArtifact(exe);
+            check.step.name = b.fmt("CLI collection helpers: {s} {s}", .{ if (semantic) "semantic" else "fmt", case.source });
+            check.setCwd(fixtures.getDirectory());
+            check.addArgs(if (semantic) &.{ "check", "--semantic", case.source } else &.{ "fmt", "--check", case.source });
+            if (semantic) {
+                check.addArg("--lib-dir");
+                check.addDirectoryArg(library);
+            }
+            check.expectExitCode(0);
+            check.expectStdOutEqual("");
+            check.expectStdErrEqual("");
+            test_step.dependOn(&check.step);
+        }
+        for ([_]bool{ false, true }) |installed| {
+            for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+                for ([_][]const u8{ "run", "test" }) |command| {
+                    const run = if (installed) std.Build.Step.Run.create(b, "CLI collection helpers: relocated install") else b.addRunArtifact(exe);
+                    run.step.name = b.fmt("CLI collection helpers: {s} {s} {s} (installed={})", .{ command, case.source, mode, installed });
+                    if (installed) run.addFileArg(installed_exe);
+                    run.setCwd(if (installed) package.getDirectory() else fixtures.getDirectory());
+                    run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+                    run.setEnvironmentVariable("NOV_CC", "");
+                    run.setEnvironmentVariable("CC", "");
+                    run.addArgs(&.{ command, case.source });
+                    if (mode.len != 0) run.addArg(mode);
+                    if (!installed) {
+                        run.addArg("--lib-dir");
+                        run.addDirectoryArg(library);
+                    }
+                    run.expectExitCode(0);
+                    run.expectStdOutEqual(if (std.mem.eql(u8, command, "test")) case.tests else case.stdout);
+                    run.expectStdErrEqual("");
+                    test_step.dependOn(&run.step);
+                }
+            }
+        }
+    }
+    for ([_]struct { name: []const u8, expression: []const u8 }{
+        .{ .name = "join-element", .expression = "std.string.join([1],\",\")" },
+        .{ .name = "join-separator", .expression = "std.string.join([\"a\"],',')" },
+        .{ .name = "join-arity", .expression = "std.string.join([\"a\"])" },
+        .{ .name = "last-predicate", .expression = "std.array.findLast([1],(x:int)->int{x})" },
+        .{ .name = "last-parameter", .expression = "std.array.findLast([1],(x:bool)->bool{x})" },
+        .{ .name = "last-array", .expression = "std.array.findLast(1,(x:int)->bool{true})" },
+        .{ .name = "take-negative", .expression = "std.array.take([1],-1)" },
+        .{ .name = "take-signed", .expression = "std.array.take([1],@as(int,1))" },
+        .{ .name = "take-array", .expression = "std.array.take(\"abc\",1)" },
+        .{ .name = "take-arity", .expression = "std.array.take([1])" },
+        .{ .name = "drop-negative", .expression = "std.array.drop([1],-1)" },
+        .{ .name = "drop-bool", .expression = "std.array.drop([1],true)" },
+        .{ .name = "drop-extra", .expression = "std.array.drop([1],1,2)" },
+    }) |case| {
+        const source = b.fmt("invalid-collection-{s}.nov", .{case.name});
+        _ = fixtures.add(source, b.fmt("let std=@import(\"std\")\nlet main:()={{let value={s}\n}}\n", .{case.expression}));
+        const check = b.addRunArtifact(exe);
+        check.step.name = b.fmt("CLI collection helpers: reject {s}", .{case.name});
         check.setCwd(fixtures.getDirectory());
         check.addArgs(&.{ "check", "--semantic", source, "--lib-dir" });
         check.addDirectoryArg(library);

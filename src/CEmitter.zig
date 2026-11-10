@@ -9604,6 +9604,244 @@ test "string split actual stdlib source free owner identity copies forced GC O0 
     }
 }
 
+fn emitApprovedHelperSourceFree(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
+    const io = std.testing.io;
+    const lib = std.testing.environ.getAlloc(allocator, "NOV_TEST_LIB_DIR") catch return error.SkipZigTest;
+    defer allocator.free(lib);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "helpers.nov", .data = source });
+    const path = try tmp.dir.realPathFileAlloc(io, "helpers.nov", allocator);
+    defer allocator.free(path);
+    var lowered = blk: {
+        var compilation = try Compilation.load(allocator, io, path, .{ .lib_dir = lib });
+        defer compilation.deinit();
+        defer if (compilation.hasErrors()) {
+            var output = std.Io.Writer.Allocating.init(allocator);
+            defer output.deinit();
+            Diagnostics.renderCompilation(&compilation, &output.writer) catch {};
+            std.debug.print("{s}", .{output.written()});
+        };
+        var result = try Lowering.lowerCompilation(&compilation);
+        errdefer result.deinit();
+        try std.testing.expect(!compilation.hasErrors());
+        try std.testing.expect(result.lowering_complete);
+        break :blk result;
+    };
+    defer lowered.deinit();
+    try lowered.ir.verify();
+    return emit(allocator, &lowered.ir, null);
+}
+
+const approved_helper_allocator =
+    \\#include <stdlib.h>
+    \\static int fail_allocations;
+    \\static void *test_malloc(size_t n) { return fail_allocations ? NULL : malloc(n); }
+    \\#define NOV_GC_MALLOC test_malloc
+    \\#define NOV_GC_FREE free
+    \\
+;
+
+fn runApprovedHelperHarness(library: []const u8, harness: []const u8, oom: bool) !void {
+    const c = try std.mem.concat(test_gpa, u8, &.{ approved_helper_allocator, library, harness });
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", if (oom) 1 else 0, "", if (oom) "panic: GC allocation failed\n" else "", mode);
+}
+
+const string_join_source_free =
+    \\let std = @import("std")
+    \\let make: () -> string = "prefix:" + "é\0😀:suffix"
+    \\let separator: () -> string = "x" + "€\0y"
+    \\let inputs: (text: string) -> []string = [text[7..-7], text[8..9], ""]
+    \\let join: (parts: []string, sep: string) -> string = std.string.join(parts, sep)
+;
+
+test "approved helpers join actual stdlib source free managed subviews UTF8 NUL forced GC O0 O3" {
+    const library = try emitApprovedHelperSourceFree(test_gpa, string_join_source_free);
+    defer test_gpa.free(library);
+    try runApprovedHelperHarness(library,
+        \\int main(void) {
+        \\    nov_rt_heap.collect_every_allocation = 1;
+        \\    nov_string text = {0}, separator = {0}, result = {0};
+        \\    nov_array parts = {0};
+        \\    void **roots[] = {&text.owner, &separator.owner, &result.owner, &parts.data};
+        \\    nov_gc_roots frame = {0}; nov_gc_push(&nov_rt_heap, &frame, roots, 4);
+        \\    text = nov_make(); separator = nov_separator(); parts = nov_inputs(text);
+        \\    nov_string sep = {separator.owner, separator.data + 1, 4};
+        \\    result = nov_join((nov_array){0}, sep);
+        \\    if (result.len) return 1;
+        \\    result = nov_join((nov_array){.data = parts.data, .len = 1, .cap = parts.cap}, (nov_string){0});
+        \\    if (result.len != 7 || memcmp(result.data, text.data + 7, 7)) return 2;
+        \\    result = nov_join(parts, (nov_string){0});
+        \\    if (result.len != 8 || memcmp(result.data, text.data + 7, 7) || result.data[7] != 0) return 6;
+        \\    result = nov_join(parts, sep);
+        \\    static const unsigned char expected[] = {0xc3,0xa9,0,0xf0,0x9f,0x98,0x80,0xe2,0x82,0xac,0,0,0xe2,0x82,0xac,0};
+        \\    if (!result.owner || result.len != sizeof expected || memcmp(result.data, expected, sizeof expected)) return 3;
+        \\    text = separator = (nov_string){0}; parts = (nov_array){0};
+        \\    nov_gc_collect(&nov_rt_heap);
+        \\    if (memcmp(result.data, expected, sizeof expected)) return 4;
+        \\    nov_gc_pop(&nov_rt_heap, &frame); nov_gc_collect(&nov_rt_heap);
+        \\    if (nov_rt_heap.frames || nov_rt_heap.live_objects) return 5;
+        \\    nov_gc_shutdown(&nov_rt_heap); return 0;
+        \\}
+    , false);
+}
+
+test "approved helpers join actual stdlib source free runtime OOM O0 O3" {
+    const library = try emitApprovedHelperSourceFree(test_gpa, string_join_source_free);
+    defer test_gpa.free(library);
+    try runApprovedHelperHarness(library,
+        \\int main(void) {
+        \\    nov_array parts = nov_inputs(nov_make());
+        \\    void **roots[] = {&parts.data}; nov_gc_roots frame = {0};
+        \\    nov_gc_push(&nov_rt_heap, &frame, roots, 1);
+        \\    fail_allocations = 1;
+        \\    if (nov_join((nov_array){0}, (nov_string){0}).len) return 2;
+        \\    (void)nov_join(parts, (nov_string){NULL, (const unsigned char *)":", 1});
+        \\    return 3;
+        \\}
+    , true);
+}
+
+const array_selection_source_free =
+    \\let std = @import("std")
+    \\let make: () -> [][][]string = [[["é" + "\0😀"]], [["other" + "!"]]]
+    \\let take: (items: [][][]string, count: uint) -> [][][]string = std.array.take(items, count)
+    \\let drop: (items: [][][]string, count: uint) -> [][][]string = std.array.drop(items, count)
+;
+
+fn testApprovedArraySelection(operation: []const u8) !void {
+    const library = try emitApprovedHelperSourceFree(test_gpa, array_selection_source_free);
+    defer test_gpa.free(library);
+    const harness = try std.fmt.allocPrint(test_gpa,
+        \\int main(void) {{
+        \\    nov_rt_heap.collect_every_allocation = 1;
+        \\    nov_array source = {{0}}, take = {{0}}, drop = {{0}}, selected = {{0}};
+        \\    void **roots[] = {{&source.data, &take.data, &drop.data, &selected.data}};
+        \\    nov_gc_roots frame = {{0}}; nov_gc_push(&nov_rt_heap, &frame, roots, 4);
+        \\    source = nov_make();
+        \\    if (nov_take(source, 0).len || nov_drop(source, UINTPTR_MAX).len || nov_drop(source, 2).len) return 1;
+        \\    take = nov_take(source, UINTPTR_MAX); drop = nov_drop(source, 0);
+        \\    selected = nov_{s}(source, 1);
+        \\    if (take.len != 2 || drop.len != 2 || selected.len != 1) return 2;
+        \\    if (source.data == take.data || source.data == drop.data || take.data == drop.data) return 3;
+        \\    for (uintptr_t i = 0; i < 2; ++i) {{
+        \\        nov_array s = ((nov_array *)source.data)[i], t = ((nov_array *)take.data)[i], d = ((nov_array *)drop.data)[i];
+        \\        if (s.data == t.data || s.data == d.data || t.data == d.data) return 4;
+        \\        nov_array ss = ((nov_array *)s.data)[0], tt = ((nov_array *)t.data)[0], dd = ((nov_array *)d.data)[0];
+        \\        if (ss.data == tt.data || ss.data == dd.data || tt.data == dd.data) return 5;
+        \\        ((nov_string *)ss.data)[0] = (nov_string){{0}};
+        \\        if (!((nov_string *)tt.data)[0].len || !((nov_string *)dd.data)[0].len) return 6;
+        \\        ((nov_string *)tt.data)[0] = (nov_string){{0}};
+        \\        if (!((nov_string *)dd.data)[0].len) return 7;
+        \\    }}
+        \\    nov_array selected_row = ((nov_array *)selected.data)[0];
+        \\    for (uintptr_t i = 0; i < 2; ++i) {{
+        \\        nov_array other_row = ((nov_array *)drop.data)[i];
+        \\        if (selected.data == drop.data || selected_row.data == other_row.data || ((nov_array *)selected_row.data)[0].data == ((nov_array *)other_row.data)[0].data) return 11;
+        \\    }}
+        \\    source = take = (nov_array){{0}}; nov_gc_collect(&nov_rt_heap);
+        \\    nov_string retained = ((nov_string *)((nov_array *)((nov_array *)drop.data)[0].data)[0].data)[0];
+        \\    static const unsigned char expected[] = {{0xc3,0xa9,0,0xf0,0x9f,0x98,0x80}};
+        \\    if (!retained.owner || retained.len != sizeof expected || memcmp(retained.data, expected, sizeof expected)) return 8;
+        \\    nov_string chosen = ((nov_string *)((nov_array *)((nov_array *)selected.data)[0].data)[0].data)[0];
+        \\    if (chosen.len != {d} || memcmp(chosen.data, {s}, chosen.len)) return 9;
+        \\    nov_gc_pop(&nov_rt_heap, &frame); nov_gc_collect(&nov_rt_heap);
+        \\    if (nov_rt_heap.frames || nov_rt_heap.live_objects) return 10;
+        \\    nov_gc_shutdown(&nov_rt_heap); return 0;
+        \\}}
+    , .{ operation, if (std.mem.eql(u8, operation, "take")) @as(usize, 7) else 6, if (std.mem.eql(u8, operation, "take")) "expected" else "\"other!\"" });
+    defer test_gpa.free(harness);
+    try runApprovedHelperHarness(library, harness, false);
+}
+
+test "approved helpers take actual stdlib source free recursive independent storage forced GC O0 O3" {
+    try testApprovedArraySelection("take");
+}
+
+test "approved helpers drop actual stdlib source free recursive independent storage forced GC O0 O3" {
+    try testApprovedArraySelection("drop");
+}
+
+fn testApprovedArraySelectionOom(operation: []const u8) !void {
+    const library = try emitApprovedHelperSourceFree(test_gpa, array_selection_source_free);
+    defer test_gpa.free(library);
+    const harness = try std.fmt.allocPrint(test_gpa,
+        \\int main(void) {{
+        \\    nov_rt_heap.collect_every_allocation = 1;
+        \\    nov_array source = nov_make();
+        \\    void **roots[] = {{&source.data}}; nov_gc_roots frame = {{0}};
+        \\    nov_gc_push(&nov_rt_heap, &frame, roots, 1);
+        \\    fail_allocations = 1;
+        \\    if (nov_{s}((nov_array){{0}}, 0).len) return 2;
+        \\    (void)nov_{s}(source, {d}); return 3;
+        \\}}
+    , .{ operation, operation, if (std.mem.eql(u8, operation, "take")) @as(usize, 1) else 0 });
+    defer test_gpa.free(harness);
+    try runApprovedHelperHarness(library, harness, true);
+}
+
+test "approved helpers take actual stdlib source free runtime OOM O0 O3" {
+    try testApprovedArraySelectionOom("take");
+}
+
+test "approved helpers drop actual stdlib source free runtime OOM O0 O3" {
+    try testApprovedArraySelectionOom("drop");
+}
+
+const array_find_last_source_free =
+    \\let std = @import("std")
+    \\let make: () -> [][]string = [["first" + "!"], ["é" + "\0😀"], ["skip" + "!"]]
+    \\let skipped: () -> [][]string = [["skip" + "!"]]
+    \\let choose: (items: [][]string) -> []string = {
+    \\    let found = std.array.findLast(items, (row: []string) -> bool {row[0] != "skip!"})
+    \\    let garbage = "force" + " collection"
+    \\    match found {.some => |row| row
+    \\        .none => []}
+    \\}
+;
+
+test "approved helpers findLast actual stdlib source free managed payload survives source forced GC O0 O3" {
+    const library = try emitApprovedHelperSourceFree(test_gpa, array_find_last_source_free);
+    defer test_gpa.free(library);
+    try runApprovedHelperHarness(library,
+        \\int main(void) {
+        \\    nov_rt_heap.collect_every_allocation = 1;
+        \\    nov_array source = {0}, result = {0};
+        \\    void **roots[] = {&source.data, &result.data}; nov_gc_roots frame = {0};
+        \\    nov_gc_push(&nov_rt_heap, &frame, roots, 2);
+        \\    if (nov_choose((nov_array){0}).len) return 1;
+        \\    source = nov_skipped();
+        \\    if (nov_choose(source).len) return 5;
+        \\    source = nov_make(); result = nov_choose(source);
+        \\    if (result.len != 1 || result.data == ((nov_array *)source.data)[1].data) return 2;
+        \\    ((nov_string *)((nov_array *)source.data)[1].data)[0] = (nov_string){0};
+        \\    source = (nov_array){0}; nov_gc_collect(&nov_rt_heap);
+        \\    nov_string text = ((nov_string *)result.data)[0];
+        \\    static const unsigned char expected[] = {0xc3,0xa9,0,0xf0,0x9f,0x98,0x80};
+        \\    if (!text.owner || text.len != sizeof expected || memcmp(text.data, expected, sizeof expected)) return 3;
+        \\    nov_gc_pop(&nov_rt_heap, &frame); nov_gc_collect(&nov_rt_heap);
+        \\    if (nov_rt_heap.frames || nov_rt_heap.live_objects) return 4;
+        \\    nov_gc_shutdown(&nov_rt_heap); return 0;
+        \\}
+    , false);
+}
+
+test "approved helpers findLast actual stdlib source free payload copy runtime OOM O0 O3" {
+    const library = try emitApprovedHelperSourceFree(test_gpa, array_find_last_source_free);
+    defer test_gpa.free(library);
+    try runApprovedHelperHarness(library,
+        \\int main(void) {
+        \\    nov_array source = nov_make();
+        \\    void **roots[] = {&source.data}; nov_gc_roots frame = {0};
+        \\    nov_gc_push(&nov_rt_heap, &frame, roots, 1);
+        \\    fail_allocations = 1;
+        \\    (void)nov_choose(source); return 2;
+        \\}
+    , true);
+}
+
 test "string slicing managed subviews retain original owner across frame release and GC" {
     const c = try emitSource("let make:()->string={let s=\"aé\"+\"€😀z\"\ns[1..-1]}\nlet cut:(s:string)->string=s[1..]\nlet empty:(s:string)->string=s[0..0]", null);
     defer test_gpa.free(c);

@@ -61,6 +61,42 @@ let find: (items: []`T, predicate: (`T) -> bool) -> Option(`T) = {
 }
 
 @[public]
+let findLast: (items: []`T, predicate: (`T) -> bool) -> Option(`T) = {
+    let mut index: int = -1
+    loop _ in items {
+        let item = items[index]
+        if predicate(item) {
+            return .some[item]
+        }
+        index -= 1
+    }
+    .none[]
+}
+
+@[public]
+let take: (items: []`T, count: uint) -> []`T = {
+    let mut result: []`T = []
+    loop item, index in items, 0.. {
+        if index >= count {
+            break
+        }
+        result += [item]
+    }
+    result
+}
+
+@[public]
+let drop: (items: []`T, count: uint) -> []`T = {
+    let mut result: []`T = []
+    loop item, index in items, 0.. {
+        if index >= count {
+            result += [item]
+        }
+    }
+    result
+}
+
+@[public]
 let findIndex: (items: []`T, predicate: (`T) -> bool) -> Option(uint) = {
     loop item, index in items, 0.. {
         if predicate(item) {
