@@ -50,6 +50,14 @@ results. See `examples/array-fields.nov`.
 
 ## Current delivered status
 
+Iteration loops now accept `: continuation`, including arrays, strings, ranges,
+zip and reference iteration. The unit-typed continuation can use current iteration
+bindings, runs after normal body completion or body-side `continue`, and skips on
+`break`/`return`. Continuing from the continuation advances once. Body locals stay
+private, owner loans remain protected, and inclusive/open MAX boundaries remain
+safe. Parser, formatting, generic inference, unevaluated type queries and lowering
+share these rules. See `zig build test-cli-iteration-continuations`.
+
 Step 3 complete: nominal methods accept exact `&Self` / `&mut Self` receivers.
 Instance calls borrow supported existing local owners and array elements, or
 forward an explicit `p.*` receiver, including reference parameters. Mutable

@@ -10803,6 +10803,225 @@ const range_program =
 ;
 const range_output = "0\n1\n2\n-2\n-1\n0\n4 0 0\nSE0123 1 0\niteration=0!  iteration=0!  0iteration=1!  iteration=1!  iteration=2!  iteration=2!  2 6 return\n";
 
+const iteration_continuation_managed =
+    \\let Row = struct { values: []int, text: string, }
+    \\let exercise: () = {
+    \\    let rows = [Row.[values=[1], text="a"+"!"], Row.[values=[2], text="b"+"!"]]
+    \\    let mut seen: []string = []
+    \\    let mut saved: () -> int = () -> int { 0 }
+    \\    let mut count: int = 0
+    \\    loop row in rows : {
+    \\        @assert(row.values[0] == count + 1)
+    \\        @assert(row.text == if count == 0 {"a!"} else {"b!"})
+    \\        let mut copy = row
+    \\        copy.values[0] = 99
+    \\        @assert(row.values[0] == count + 1)
+    \\        saved = () -> int { row.values[0] }
+    \\        seen += [row.text + " continuation"]
+    \\        count += 1
+    \\        continue
+    \\    } {
+    \\        let mut copy = row
+    \\        copy.values[0] = 88
+    \\        @assert(row.values[0] == count + 1)
+    \\        continue
+    \\    }
+    \\    @assert(count == 2 and saved() == 2)
+    \\    @assert(rows[0].values[0] == 1 and rows[1].values[0] == 2)
+    \\    @assert(seen[0] == "a! continuation" and seen[1] == "b! continuation")
+    \\    let mut words = ["a"+"!", "b"+"!"]
+    \\    loop &word in words : word.* += "C" { word.* += "B" }
+    \\    @assert(words[0] == "a!BC" and words[1] == "b!BC")
+    \\    loop &word, i in words, 0.. : {
+    \\        word.* += "{i}"
+    \\        continue
+    \\    } { word.* += "Z" }
+    \\    @assert(words[0] == "a!BCZ0" and words[1] == "b!BCZ1")
+    \\    let mut text = "Aé" + "😀\0Z"
+    \\    let mut body = ""
+    \\    let mut tail = ""
+    \\    loop r in text : {
+    \\        tail += "{r}"
+    \\        continue
+    \\    } {
+    \\        text = "rebound" + "!"
+    \\        body += "{r}"
+    \\        continue
+    \\    }
+    \\    @assert(body == "Aé😀\0Z" and tail == body)
+    \\    body = ""
+    \\    tail = ""
+    \\    loop r, i in "é😀\0" + "Z", 0.. : { tail += "{r}{i}" } { body += "{r}{i}" }
+    \\    @assert(body == "é0😀1\02Z3" and tail == body)
+    \\}
+;
+
+fn testIterationContinuationAllocations(allocator: std.mem.Allocator) !void {
+    const library = try emitReferenceRebinding(allocator,
+        \\let f: () = {
+        \\    let mut a = [1, 2]
+        \\    loop &x in a : { x.* += 1
+        \\        continue
+        \\    } { x.* *= 2 }
+        \\    loop r in "é😀" : @assert(r != 'x') { continue }
+        \\}
+    );
+    defer allocator.free(library);
+}
+
+test "iteration continuations source free sibling bindings copies captures mutable loans Unicode forced GC O0 O3" {
+    const library = try emitReferenceRebinding(test_gpa, iteration_continuation_managed);
+    defer test_gpa.free(library);
+    try runApprovedHelperHarness(library,
+        \\int main(void) {
+        \\    nov_rt_heap.collect_every_allocation = 1;
+        \\    nov_exercise();
+        \\    if (nov_rt_heap.frames) return 1;
+        \\    nov_gc_collect(&nov_rt_heap);
+        \\    if (nov_rt_heap.live_objects) return 2;
+        \\    nov_gc_shutdown(&nov_rt_heap);
+        \\    return 0;
+        \\}
+    , false);
+}
+
+test "iteration continuations source free allocating continuation OOM O0 O3" {
+    const library = try emitReferenceRebinding(test_gpa,
+        \\@[extern("continuation_fail")]
+        \\let fail: () -> void
+        \\let exercise: () = {
+        \\    loop r in "é😀" : {
+        \\        fail()
+        \\        let allocated = "{r}!"
+        \\        @println(allocated)
+        \\    } {}
+        \\    @println("BAD reached exhaustion")
+        \\}
+    );
+    defer test_gpa.free(library);
+    try runApprovedHelperHarness(library,
+        \\void continuation_fail(void) { fail_allocations = 1; }
+        \\int main(void) {
+        \\    nov_rt_heap.collect_every_allocation = 1;
+        \\    nov_exercise();
+        \\    return 2;
+        \\}
+    , true);
+}
+
+test "iteration continuations source free controls terminal else propagation MAX boundaries O0 O3" {
+    const library = try emitReferenceRebinding(test_gpa,
+        \\let R = union { ok: int, err: string, }
+        \\let fail: () -> R = .err["error"]
+        \\let propagate: () -> R = {
+        \\    loop x in [1] : { let n = fail().!
+        \\        @assert(n == 0)
+        \\    } {}
+        \\    .ok[0]
+        \\}
+        \\let fromBody: () -> int = {
+        \\    loop x in [4] : @panic("BAD continuation") { return x }
+        \\    0
+        \\}
+        \\let fromContinuation: () -> int = loop x in @as(int, 7)..=7 : {
+        \\    return x
+        \\} { continue } else { @panic("BAD else") }
+        \\let main: () = {
+        \\    @assert(fromBody() == 4 and fromContinuation() == 7)
+        \\    loop x in [1] : @panic("BAD break continuation") { break } else { @panic("BAD break else") }
+        \\    let picked: int = loop x in [3] : { break x } {} else { @panic("BAD terminal else") }
+        \\    @assert(picked == 3)
+        \\    match propagate() { .ok => @panic("BAD result")
+        \\        .err => |e| @assert(e == "error")
+        \\    }
+        \\    let mut count: int = 0
+        \\    loop x in @as(u64, 18446744073709551615)..=18446744073709551615 : {
+        \\        @assert(x == 18446744073709551615)
+        \\        count += 1
+        \\        continue
+        \\    } { continue }
+        \\    loop x in @as(i64, 9223372036854775807)..=9223372036854775807 : {
+        \\        @assert(x == 9223372036854775807)
+        \\        count += 1
+        \\    } {}
+        \\    loop x, i in [5], @as(u64, 18446744073709551615).. : {
+        \\        @assert(x == 5 and i == 18446744073709551615)
+        \\        count += 1
+        \\        continue
+        \\    } { continue }
+        \\    loop i, x in @as(i64, 9223372036854775807).., [6] : {
+        \\        @assert(x == 6 and i == 9223372036854775807)
+        \\        count += 1
+        \\        continue
+        \\    } { continue }
+        \\    @assert(count == 4)
+        \\}
+    );
+    defer test_gpa.free(library);
+    const program = try collectingTestProgram(library);
+    defer test_gpa.free(program);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(program, "typedef int nonempty_translation_unit;", 0, "", "", mode);
+}
+
+test "iteration continuations source free pending overflow bypassed by break return Option none and final MAX O0 O3" {
+    const library = try emitReferenceRebinding(test_gpa,
+        \\let Option: (T: type) -> type = union { some: T, none, }
+        \\let stop: () -> Option(int) = .none[]
+        \\let returning: () -> int = {
+        \\    loop x, i in [1, 2], @as(i8, 127).. : { return 9 } {}
+        \\    0
+        \\}
+        \\let propagating: () -> Option(int) = {
+        \\    loop x, i in [1, 2], @as(i8, 127).. : {
+        \\        let n = stop().!
+        \\        @assert(n == 0)
+        \\    } {}
+        \\    .some[0]
+        \\}
+        \\let main: () = {
+        \\    loop x, i in [1, 2], @as(i8, 127).. : { break } {} else { @panic("BAD break else") }
+        \\    @println("done")
+        \\    @assert(returning() == 9)
+        \\    match propagating() { .some => @panic("BAD some")
+        \\        .none => @println("none")
+        \\    }
+        \\    loop x, i in [1, 2], @as(i8, 126).. : {
+        \\        @println("final", x, i)
+        \\        continue
+        \\    } {} else { @println("exhausted") }
+        \\    loop i, x in @as(i8, 127).., [1] : @println("first", i, x) {} else { @println("first exhausted") }
+        \\}
+    );
+    defer test_gpa.free(library);
+    const program = try collectingTestProgram(library);
+    defer test_gpa.free(program);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(program, "typedef int nonempty_translation_unit;", 0, "done\nnone\nfinal 1 126\nfinal 2 127\nexhausted\nfirst 127 1\nfirst exhausted\n", "", mode);
+}
+
+test "iteration continuations source free pending overflow follows user print fallthrough and continue O0 O3" {
+    for ([_]bool{ false, true }) |open_first| {
+        for ([_]bool{ false, true }) |continues| {
+            const source = try std.fmt.allocPrint(test_gpa, "let main:()={{\nloop {s} : {{\n@println(\"cont\", x, i)\n{s}\n}} {{@println(\"body\", x, i)}} else {{@println(\"BAD else\")}}\n}}\n", .{
+                if (open_first) "i,x in @as(i8,127)..,[1,2]" else "x,i in [1,2],@as(i8,127)..",
+                if (continues) "continue" else "",
+            });
+            defer test_gpa.free(source);
+            const library = try emitReferenceRebinding(test_gpa, source);
+            defer test_gpa.free(library);
+            const program = try collectingTestProgram(library);
+            defer test_gpa.free(program);
+            for ([_][]const u8{ "-O0", "-O3" }) |mode|
+                try compileAndRunMode(program, "typedef int nonempty_translation_unit;", 1, "body 1 127\ncont 1 127\n", "reference-rebinding.nov:2:1: assertion failed: open range iteration overflow\n", mode);
+        }
+    }
+}
+
+test "iteration continuations source free compiler emitter allocation rollback" {
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testIterationContinuationAllocations, .{});
+}
+
 const iteration_program =
     \\let R=struct{n:int,s:string,}
     \\let Nested=struct{inner:R,}

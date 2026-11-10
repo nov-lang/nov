@@ -2435,8 +2435,9 @@ let main: () = {
   **range-specific default**, distinct from ordinary `int` fallback. Otherwise
   unconstrained numeric-expression bounds use `int`: `1 + 1..3` has `int`
   endpoints. Typed bounds always win first; neither rule involves constant folding.
-- The index is immutable and fresh in the body's lexical scope each iteration.
-  `_` discards it and creates no binding. Existing no-shadowing rules apply.
+- The index is immutable and fresh each iteration, and is visible in the body
+  and optional continuation. `_` discards it and creates no binding. Existing
+  no-shadowing rules apply.
 - Without `else`, range loops yield `void` and reject value breaks. Continuing
   bodies always yield `void`. Body-side `continue` advances (or exhausts at an
   inclusive endpoint); `break` and `return` skip the increment.
@@ -2450,8 +2451,9 @@ let main: () = {
   strings share rooted storage. Terminal fallback paths contribute no merge value.
 - Bounds use the enclosing control scope before the new loop starts. The fallback
   is also outside the completed range's control scope: its `break`/`continue`
-  targets an outer loop or diagnoses if none exists. The index is visible only in
-  the body, never in either bound or the fallback; body locals do not escape.
+  targets an outer loop or diagnoses if none exists. The index is visible in
+  the body and continuation, never in either bound or the fallback; body locals
+  do not escape into the continuation.
 
 ```nov
 let contains: (start: uint, end: uint, target: uint) -> bool = loop i in start..end {
@@ -2465,10 +2467,29 @@ exclusive/inclusive searches and overflow-free MAX exhaustion.
 See [`examples/range-values.nov`](examples/range-values.nov) for stored bounds
 iterated twice, first to print 0 through 9 and then to compute a sum of 45.
 
+Iteration loops accept an optional `: continuation` before the body:
+
+```nov
+let mut index: int = 0
+loop item in items : index += 1 {
+    @println(index, item)
+}
+```
+
+The continuation must yield `void`. It runs after each completed body, including
+on body-side `continue` and the final iteration, but not on `break` or `return`.
+A `continue` inside the continuation advances to the next iteration rather than
+repeating the continuation. The current iteration bindings remain accessible;
+body-local declarations do not. Array-owner borrow restrictions also apply in
+continuations. These rules cover arrays, Unicode strings, bounded ranges and zip
+iteration; empty inputs do not execute the continuation. Open-range overflow is
+checked only when another iteration is requested, so an exiting continuation
+can stop at the maximum value without overflowing.
+
 Ranges are not membership containers or implementations of a general iterator
-protocol. Missing bounds, steps/descending iteration, general iterators, multiple
-bindings, reference iteration over ranges, labels, user continuation clauses, and
-value breaks without `else` are explicitly unsupported. Array/string iteration is
+protocol. Standalone unbounded ranges, steps/descending iteration, general
+iterators, reference iteration over ranges, labels, and value breaks without
+`else` remain unsupported. Array/string iteration is
 supported separately (see [Loop](#loop)). There is no `for` keyword alias. Header expressions
 retain the existing single-newline continuation rules, including after `in` and
 `..`/`..=`; the body follows the completed upper-bound expression without a newline.

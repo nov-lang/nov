@@ -567,7 +567,7 @@ fn parseExprPrecedenceMode(self: *Parser, min_prec: Precedence, strict: bool, al
         };
         if (remaining_sources != 0 and tok_tag == .period_period) {
             _ = self.eatToken(.newline);
-            var open = self.token_tags[self.tok_i] == .comma;
+            var open = self.token_tags[self.tok_i] == .comma or self.token_tags[self.tok_i] == .colon;
             if (self.token_tags[self.tok_i] == .l_brace) {
                 // Preserve block-valued bounds when another body follows. A
                 // comma is a source separator only while more pairs are due;
@@ -582,7 +582,7 @@ fn parseExprPrecedenceMode(self: *Parser, min_prec: Precedence, strict: bool, al
                     }
                 }
                 const after = self.token_tags[end];
-                open = after != .l_brace and !(after == .comma and remaining_sources > 1) and
+                open = after != .l_brace and after != .colon and !(after == .comma and remaining_sources > 1) and
                     @backingInt(rules[@backingInt(after)].prec) < @backingInt(Precedence.piped_call);
             }
             if (open) {
@@ -820,7 +820,7 @@ fn parseElseExpr(self: *Parser) Error!Node.Index {
 
 /// LoopExpr <- KEYWORD_loop LoopInput? Block ElseExpr?
 /// LoopInput
-///     <- (AMPERSAND? IDENTIFIER)+ KEYWORD_in (Expr (DOT2 Expr?)?)+
+///     <- (AMPERSAND? IDENTIFIER)+ KEYWORD_in (Expr (DOT2 Expr?)?)+ (COLON AssignExpr)?
 ///      / Expr (COLON AssignExpr)?
 /// Condition-and-block and unconditional block forms, with optional continuations,
 /// and conditional exhaustion branches are enabled. Iteration bindings and sources
@@ -858,7 +858,10 @@ fn parseLoopExpr(self: *Parser) Error!Node.Index {
             if (self.eatToken(.comma) == null) break;
             self.eatNewLines();
         }
-        if (bindings.items.len != sources.items.len or self.token_tags[self.tok_i] != .l_brace)
+        if (bindings.items.len != sources.items.len)
+            return self.failMsg(.{ .tag = .unsupported_range_loop, .token = loop_token });
+        const continuation = if (self.eatToken(.colon) != null) try self.expectSingleAssignExprStrict() else null_node;
+        if (self.token_tags[self.tok_i] != .l_brace)
             return self.failMsg(.{ .tag = .unsupported_range_loop, .token = loop_token });
         const body = try self.expectBlock();
         if (self.token_tags[self.tok_i] == .colon)
@@ -872,6 +875,7 @@ fn parseLoopExpr(self: *Parser) Error!Node.Index {
             .data = .{ .lhs = try self.addExtra(Node.RangeLoop{
                 .binding = bindings.items[0],
                 .source = sources.items[0],
+                .continuation = continuation,
                 .body = body,
                 .else_expr = else_expr,
                 .bindings_start = binding_span.start,
@@ -2641,6 +2645,77 @@ test "zip iteration AST contract comments interpolation and allocation failures"
     }
 }
 
+test "iteration continuations preserve fields lists spans interpolation and allocation cleanup" {
+    for ([_][:0]const u8{
+        "let f=loop item in items : index += 1 {}",
+        "let f=loop item in [1,2] : index += 1 {continue} else {false}",
+        "let f=loop rune in \"é😀\" : tick() {break rune} else {'?'}",
+        "let f=loop i in 0..2 : tick() {}",
+        "let f=loop i in 0..=2 : tick() {} else {}",
+        "let f=loop &item in items : tick() {}",
+        "let f=loop item,index in items,0.. : tick() {}",
+        "let f=loop &item,&other in items,others : {index += 1} {continue} else {}",
+        "let f=loop item in items : {} {} else if ready {false} else {true}",
+        "let f=loop i in 0..{limit()} : {tick()} {}",
+        "let f=loop item,index in items,0.. : {tick()} + 1 {}",
+        "let f=loop item in ; source\nitems : {; step\nindex += 1} {continue} else {}",
+        "let f=[loop item in items : tick() {},1]\nlet g=call(loop i in 0.. : {} {},2)",
+        "let f=loop item in items : {tick()} {break \"{item}\"} else {\"\"}",
+    }) |source| {
+        errdefer std.debug.print("iteration continuation fixture: {s}\n", .{source});
+        var ast = try parse(std.testing.allocator, source);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+        var found = false;
+        for (ast.nodes.items(.tag), 0..) |tag, i| {
+            if (tag != .loop_range) continue;
+            found = true;
+            const node: Node.Index = @intCast(i);
+            const loop = ast.fullRange(node).?;
+            try std.testing.expect(loop.continuation != 0);
+            try std.testing.expectEqual(loop, ast.extraData(ast.nodes.items(.data)[node].lhs, Node.RangeLoop));
+            const bindings = ast.iterationBindings(node);
+            const sources = ast.iterationSources(node);
+            try std.testing.expectEqual(bindings.len, sources.len);
+            try std.testing.expectEqual(loop.binding, bindings[0]);
+            try std.testing.expectEqual(loop.source, sources[0]);
+            try std.testing.expectEqualStrings(":", ast.tokenSlice(ast.firstToken(loop.continuation) - 1));
+            try std.testing.expectEqualStrings("loop", ast.tokenSlice(ast.firstToken(node)));
+            try std.testing.expectEqualStrings("}", ast.tokenSlice(ast.lastToken(node)));
+            const span = ast.nodeToSpan(node);
+            try std.testing.expectEqualStrings("loop", ast.source[span.start..][0..4]);
+            try std.testing.expect(ast.lastToken(loop.continuation) < ast.firstToken(loop.body));
+            try std.testing.expect(span.start < span.end and span.end <= source.len);
+        }
+        try std.testing.expect(found);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
+    }
+}
+
+test "iteration continuation errors preserve recovery and allocation cleanup" {
+    for ([_][:0]const u8{
+        "loop item in items :",
+        "loop item in items : index +=",
+        "loop item in items : tick(",
+        "loop item in items : {}",
+        "loop item in items : tick()",
+        "loop item in items : index += 1, other += 1 {}",
+        "loop item in items :\ntick() {}",
+        "loop item in items : tick()\n{}",
+        "loop item in items {} : tick()",
+        "loop item,index in items,0.. by 2 : tick() {}",
+    }) |expression| {
+        const source = try std.fmt.allocPrintSentinel(std.testing.allocator, "let f={s}\nlet valid=42", .{expression}, 0);
+        defer std.testing.allocator.free(source);
+        var ast = try parse(std.testing.allocator, source);
+        defer ast.deinit(std.testing.allocator);
+        try std.testing.expect(ast.errors.len != 0);
+        for (ast.errors) |err| try std.testing.expect(ast.tokens.items(.start)[err.token] <= source.len);
+        try std.testing.expectEqualStrings("42", ast.tokenSlice(ast.lastToken(ast.rootDecls()[ast.rootDecls().len - 1])));
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
+    }
+}
+
 test "zip iteration rejects malformed headers and non-source open ranges" {
     for ([_][:0]const u8{
         "loop x,y in items {}",          "loop x in items,0.. {}",
@@ -2648,7 +2723,7 @@ test "zip iteration rejects malformed headers and non-source open ranges" {
         "loop x,y in items, {}",         "loop x,y in ,items {}",
         "loop x,y in items,0..= {}",     "loop x,y in items,.. {}",
         "loop x,y in items,0..1..2 {}",  "loop x,y in items,0..",
-        "loop x,y in items,0.. {} else", "loop x,y in items,0.. : tick() {}",
+        "loop x,y in items,0.. {} else", "loop x,y in items,0.. by 2 {}",
         "0..",                           "[0..]",
         "make(0..)",                     "loop x in make(0..) {}",
     }) |header| {
@@ -2695,8 +2770,8 @@ test "iteration parser accessors retain reference captures sources spans and exh
         "let f:()=loop x,y in items {}",
         "let f:()=loop &x,y in items {}",
         "let f:()=loop x in items,other {}",
-        "let f:()=loop x in items : tick() {}",
-        "let f:()=loop &x in items : tick() {}",
+        "let f:()=loop x in items by 2 {}",
+        "let f:()=loop &x in items by 2 {}",
     }) |source| {
         var ast = try parse(std.testing.allocator, source);
         defer ast.deinit(std.testing.allocator);
@@ -2723,7 +2798,7 @@ test "range headers preserve dedicated fields spans delimiters and recovery" {
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
     for ([_][:0]const u8{
         "loop i in ..2 {}",        "loop i in 0..= {}",
-        "loop i in 0..2 {} else",  "loop i in 0..2 : tick() {}",
+        "loop i in 0..2 {} else",  "loop i in 0..2 by 2 {}",
         "loop i, j in 0..2 {}",    "loop & in 0..2 {}",
         "loop i in 0..2, 0..3 {}", "loop i in 0..2",
         "loop i in 0..",           "loop i in 0..2 += 1 {}",
@@ -2769,7 +2844,7 @@ test "inclusive range headers retain raw tokens and reject malformed ranges" {
     for ([_][:0]const u8{
         "let f: () = loop i in ..=2 {}",
         "let f: () = loop i in 0..=2 {} else",
-        "let f: () = loop i in 0..=2 : tick() {}",
+        "let f: () = loop i in 0..=2 by 2 {}",
         "let f: () = loop i in 0..=2\n\n{}",
     }) |broken| {
         var result = try parse(std.testing.allocator, broken);

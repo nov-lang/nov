@@ -276,6 +276,10 @@ fn renderExpression(self: *Render, node: Ast.Node.Index, space: Space) RenderErr
                     try self.renderToken(comma, .space);
                 }
             }
+            if (loop.continuation != 0) {
+                try self.renderToken(ast.firstToken(loop.continuation) - 1, .space);
+                try self.renderExpression(loop.continuation, .space);
+            }
             if (loop.else_expr != 0) {
                 try self.renderExpression(loop.body, .space);
                 try self.renderToken(ast.lastToken(loop.body) + 1, .space);

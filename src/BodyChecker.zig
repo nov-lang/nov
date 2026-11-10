@@ -1529,6 +1529,7 @@ const Context = struct {
             .function_pipe => return (try self.probeBreaks(data.rhs, depth + 1)) orelse try self.probeBreaks(data.lhs, depth + 1),
             .call, .call_one => {
                 const call = ast.fullCall(node).?;
+                if (std.mem.eql(u8, ast.tokenSlice(ast.firstToken(call.ast.fn_expr)), "@TypeOf")) return null;
                 if (try self.probeBreaks(call.ast.fn_expr, depth + 1)) |known| return known;
                 for (call.ast.args) |arg| if (try self.probeBreaks(arg, depth + 1)) |known| return known;
             },
@@ -1576,7 +1577,8 @@ const Context = struct {
                     try self.bindLocal(name, .{ .known = if (by_ref) try self.iterationReference(source, known.ty) else known, .name_span = self.module.tokenSpan(token) });
             }
         }
-        return (try self.probeBreaks(range.body, depth + 1)) orelse fallback;
+        return (try self.probeBreaks(range.body, depth + 1)) orelse
+            (try self.probeBreaks(range.continuation, depth + 1)) orelse fallback;
     }
 
     fn span(self: *Context, node: Ast.Node.Index) Module.Span {
@@ -1886,10 +1888,11 @@ const Context = struct {
                 };
             }
             const body = try q.expression(parts.body, depth + 1);
+            const continuation = try q.expression(parts.continuation, depth + 1);
             c.restoreScope(scope);
             const exhaustion = try q.expression(parts.else_expr, depth + 1);
-            const unknown = body.unknown or exhaustion.unknown;
-            return source.then(.{ .live = unknown or !rangeLoopTerminates(parts.else_expr != 0 and !exhaustion.live, body.breaks), .breaks = exhaustion.breaks, .continues = exhaustion.continues, .unknown = unknown });
+            const unknown = body.unknown or continuation.unknown or exhaustion.unknown;
+            return source.then(.{ .live = unknown or !rangeLoopTerminates(parts.else_expr != 0 and !exhaustion.live, body.breaks or continuation.breaks), .breaks = exhaustion.breaks, .continues = exhaustion.continues, .unknown = unknown });
         }
 
         fn expression(q: *FlowQuery, node: Ast.Node.Index, depth: usize) Error!Flow {
@@ -1957,6 +1960,7 @@ const Context = struct {
                 },
                 .call, .call_one => {
                     const call = ast.fullCall(node).?;
+                    if (std.mem.eql(u8, ast.tokenSlice(ast.firstToken(call.ast.fn_expr)), "@TypeOf")) return .{};
                     var flow = try q.expression(call.ast.fn_expr, depth + 1);
                     if (!flow.live) return flow;
                     flow = flow.then(try q.sequence(call.ast.args, depth));
@@ -4052,6 +4056,7 @@ const Context = struct {
         end: Ir.ValueId = undefined,
         inclusive: Ir.ValueId = undefined,
         done: ?Ir.ValueId = null,
+        pending_overflow: ?Ir.ValueId = null,
         loan: ?Ir.ValueId = null,
     };
 
@@ -4099,20 +4104,57 @@ const Context = struct {
         const location_span = self.irSpan(node);
         const unit = try self.ir.internType(.void);
         const old = try emitter.append(source.index_type, location_span, .{ .local_load = source.counter });
+        var can_increment: ?Ir.ValueId = null;
         if (source.open) {
             const integer = self.ir.getType(source.index_type).?.integer;
             const signed = integer.signedness == .signed;
             const max = @as(u128, std.math.maxInt(u128)) >> @as(u7, @intCast(128 - integer.bits + @intFromBool(signed)));
             const limit = try emitter.append(source.index_type, location_span, .{ .constant = try self.ir.internConstant(.{ .ty = source.index_type, .value = if (signed) .{ .signed_integer = @intCast(max) } else .{ .unsigned_integer = max } }) });
             const safe = try emitter.append(try self.ir.internType(.boolean), location_span, .{ .binary = .{ .op = .lt, .lhs = old, .rhs = limit } });
-            try self.iterationAssertion(node, safe, "open range iteration overflow");
+            if (source.pending_overflow != null) can_increment = safe else try self.iterationAssertion(node, safe, "open range iteration overflow");
         }
+        const increment_start: u32 = @intCast(emitter.instructions.items.len);
         const one = try emitter.append(source.index_type, location_span, .{ .constant = try self.ir.internConstant(.{ .ty = source.index_type, .value = if (self.ir.getType(source.index_type).?.integer.signedness == .signed) .{ .signed_integer = 1 } else .{ .unsigned_integer = 1 } }) });
         const next = if (self.ir.getType(source.ty).? == .string)
             try emitter.append(source.index_type, location_span, .{ .string_next = .{ .array = try emitter.value(source.node), .index = old } })
         else
             try emitter.append(source.index_type, location_span, .{ .binary = .{ .op = .add, .lhs = old, .rhs = one } });
-        return emitter.append(unit, location_span, .{ .local_store = .{ .slot = source.counter, .value = next } });
+        const increment = try emitter.append(unit, location_span, .{ .local_store = .{ .slot = source.counter, .value = next } });
+        if (can_increment) |safe| {
+            const overflow_start: u32 = @intCast(emitter.instructions.items.len);
+            const boolean = try self.ir.internType(.boolean);
+            const yes = try emitter.append(boolean, location_span, .{ .constant = try self.ir.internConstant(.{ .ty = boolean, .value = .{ .boolean = true } }) });
+            const pending = try emitter.append(unit, location_span, .{ .local_store = .{ .slot = source.pending_overflow.?, .value = yes } });
+            return emitter.append(unit, location_span, .{ .branch = .{ .condition = safe, .then_start = increment_start, .else_start = overflow_start, .then_value = increment, .else_value = pending } });
+        }
+        return increment;
+    }
+
+    // Body and continuation are private sibling regions. Recreate the current
+    // element in the continuation before advancing any cursor, rather than
+    // leaking a body-local SSA value (or element capability) into its sibling.
+    fn continuationBinding(self: *Context, source: ZipSource, node: Ast.Node.Index) Error!void {
+        const emitter = self.emitter orelse return;
+        const ast = &self.module.source.ast;
+        const capture = if (source.by_ref) ast.nodes.items(.data)[source.binding].rhs else source.binding;
+        const name = ast.tokenSlice(ast.nodes.items(.main_token)[capture]);
+        if (std.mem.eql(u8, name, "_")) return;
+        const index = try emitter.append(source.index_type, self.irSpan(node), .{ .local_load = source.counter });
+        const binding = self.bindings.getPtr(name).?;
+        if (source.by_ref) {
+            const unit = try self.ir.internType(.void);
+            const reservation = try emitter.append(unit, self.irSpan(node), .{ .borrow_reserve = source.owner.?.slot.? });
+            binding.borrow = try emitter.append(unit, self.irSpan(node), .{ .borrow_start = .{ .reservation = reservation, .index = index } });
+        } else binding.value = switch (self.ir.getType(source.ty).?) {
+            .array => try emitter.append(source.element, self.irSpan(node), .{ .array_index = .{ .array = try emitter.value(source.node), .index = index } }),
+            .string => try emitter.append(source.element, self.irSpan(node), .{ .string_decode = .{ .array = try emitter.value(source.node), .index = index } }),
+            .range => index,
+            else => unreachable,
+        };
+        if (!source.by_ref and binding.slot != null) {
+            binding.slot = try emitter.append(source.element, self.irSpan(node), .{ .local_slot = binding.value.? });
+            binding.value = null;
+        }
     }
 
     fn rangeExpression(self: *Context, node: Ast.Node.Index, expected: ?Known, depth: usize) Error!?Ir.TypeId {
@@ -4178,7 +4220,7 @@ const Context = struct {
                 const binding = owner.?;
                 reservation.* = .{ .owner = if (binding.loan_owner) |loan| loan.owner else binding.name_span, .origin = location_span, .parent = self.reservation, .reads_allowed = !by_ref, .iteration = true };
                 self.reservation = reservation;
-                if (by_ref) if (self.emitter) |emitter| {
+                if (by_ref and loop.continuation == 0) if (self.emitter) |emitter| {
                     state.loan = try emitter.append(unit, location_span, .{ .borrow_reserve = binding.slot.? });
                 };
             }
@@ -4199,6 +4241,10 @@ const Context = struct {
                 else
                     try emitter.append(state.index_type, location_span, .{ .constant = try self.ir.internConstant(.{ .ty = state.index_type, .value = .{ .signed_integer = 0 } }) });
                 state.counter = try emitter.append(state.index_type, location_span, .{ .local_slot = start });
+                if (state.open and loop.continuation != 0) {
+                    const no = try emitter.append(boolean, location_span, .{ .constant = try self.ir.internConstant(.{ .ty = boolean, .value = .{ .boolean = false } }) });
+                    state.pending_overflow = try emitter.append(boolean, location_span, .{ .local_slot = no });
+                }
                 if (i == driver_index) {
                     state.end = try emitter.append(state.index_type, location_span, if (source == .range) .{ .range_end = try emitter.value(state.node) } else .{ .iteration_len = try emitter.value(state.node) });
                     if (source == .range) {
@@ -4219,6 +4265,15 @@ const Context = struct {
         self.loop_context = &context;
         defer self.loop_context = parent;
         const condition_start: u32 = if (self.emitter) |emitter| @intCast(emitter.instructions.items.len) else 0;
+        // A terminal user continuation does not request another element. Keep
+        // MAX intact and diagnose its pending successor only on the next test.
+        if (self.emitter) |emitter| for (states) |state| {
+            if (state.pending_overflow) |slot| {
+                const pending = try emitter.append(boolean, location_span, .{ .local_load = slot });
+                const safe = try emitter.append(boolean, location_span, .{ .unary = .{ .op = .bool_not, .operand = pending } });
+                try self.iterationAssertion(node, safe, "open range iteration overflow");
+            }
+        };
         const condition: Ir.ValueId = if (self.emitter != null) try self.zipCondition(states[driver_index], node) else undefined;
         const body_start: u32 = if (self.emitter) |emitter| @intCast(emitter.instructions.items.len) else 0;
         for (states) |state| {
@@ -4237,7 +4292,8 @@ const Context = struct {
             if (self.emitter) |emitter| {
                 const index = try emitter.append(state.index_type, location_span, .{ .local_load = state.counter });
                 if (state.by_ref) {
-                    loan = try emitter.append(unit, location_span, .{ .borrow_start = .{ .reservation = state.loan.?, .index = index } });
+                    const reservation = if (loop.continuation != 0) try emitter.append(unit, location_span, .{ .borrow_reserve = state.owner.?.slot.? }) else state.loan.?;
+                    loan = try emitter.append(unit, location_span, .{ .borrow_start = .{ .reservation = reservation, .index = index } });
                 } else value = switch (self.ir.getType(state.ty).?) {
                     .array => try emitter.append(state.element, location_span, .{ .array_index = .{ .array = try emitter.value(state.node), .index = index } }),
                     .string => try emitter.append(state.element, location_span, .{ .string_decode = .{ .array = try emitter.value(state.node), .index = index } }),
@@ -4247,13 +4303,14 @@ const Context = struct {
             }
             if (!discard) try self.bindLocal(name, .{ .known = if (state.by_ref) try self.iterationReference(state.node, state.element) else .{ .ty = state.element }, .name_span = self.module.tokenSpan(token), .value = value, .borrowed = state.by_ref, .borrow = loan, .loan_owner = if (state.by_ref) .{ .owner = state.owner.?.name_span, .origin = location_span } else null });
         }
-        if (loop.else_expr != 0 and context.result == null) context.result = try self.probeBreaks(loop.body, depth + 1);
+        if (loop.else_expr != 0 and context.result == null) context.result = (try self.probeBreaks(loop.body, depth + 1)) orelse try self.probeBreaks(loop.continuation, depth + 1);
         if (try self.expression(loop.body, .{ .ty = unit }, depth + 1) == null) return null;
         self.terminated = false;
         var continuation_start: ?u32 = null;
         var continuation: ?Ir.ValueId = null;
         if (self.emitter) |emitter| {
             continuation_start = @intCast(emitter.instructions.items.len);
+            if (loop.continuation != 0) for (states) |state| try self.continuationBinding(state, node);
             const primary = states[driver_index];
             if (primary.done) |slot| {
                 const old = try emitter.append(primary.index_type, location_span, .{ .local_load = primary.counter });
@@ -4274,6 +4331,11 @@ const Context = struct {
                 increment = try self.zipIncrement(state, node);
             };
             continuation = try emitter.append(unit, location_span, .{ .branch = .{ .condition = more, .then_start = then_start, .else_start = @intCast(emitter.instructions.items.len), .then_value = increment.?, .else_value = null } });
+        }
+        if (loop.continuation != 0) {
+            if (try self.expression(loop.continuation, .{ .ty = unit }, depth + 1) == null) return null;
+            if (self.emitter) |emitter| continuation = try emitter.value(loop.continuation);
+            self.terminated = false;
         }
         self.restoreScope(scope);
         self.loop_context = parent;
@@ -4351,7 +4413,7 @@ const Context = struct {
         const parent_reservation = self.reservation;
         defer self.reservation = parent_reservation;
         var loan: ?Ir.ValueId = null;
-        if (by_ref) if (self.emitter) |emitter| {
+        if (by_ref and loop.continuation == 0) if (self.emitter) |emitter| {
             loan = try emitter.append(unit, self.irSpan(node), .{ .borrow_reserve = owner.?.slot.? });
         };
         var start_value: Ir.ValueId = undefined;
@@ -4421,7 +4483,8 @@ const Context = struct {
         if (self.emitter) |emitter| {
             const index = try emitter.append(index_type, self.irSpan(node), .{ .local_load = counter });
             if (by_ref) {
-                element_loan = try emitter.append(unit, self.irSpan(node), .{ .borrow_start = .{ .reservation = loan.?, .index = index } });
+                const reservation = if (loop.continuation != 0) try emitter.append(unit, self.irSpan(node), .{ .borrow_reserve = owner.?.slot.? }) else loan.?;
+                element_loan = try emitter.append(unit, self.irSpan(node), .{ .borrow_start = .{ .reservation = reservation, .index = index } });
             } else current = if (source == .array)
                 try emitter.append(element_type, self.irSpan(node), .{ .array_index = .{ .array = try emitter.value(loop.source), .index = index } })
             else if (source == .string)
@@ -4431,13 +4494,14 @@ const Context = struct {
         }
         if (!discard) try self.bindLocal(name, .{ .known = if (by_ref) .{ .ty = try self.ir.internType(.{ .reference = .{ .child = element_type, .mutable = owner.?.mutable } }) } else known.?, .name_span = self.module.tokenSpan(binding_token), .value = current, .borrowed = by_ref, .borrow = element_loan, .loan_owner = if (by_ref) .{ .owner = owner.?.name_span, .origin = self.irSpan(node) } else null });
         if (source == .array and owner != null) self.reservation = &iteration_reservation;
-        if (loop.else_expr != 0 and context.result == null) context.result = try self.probeBreaks(loop.body, depth + 1);
+        if (loop.else_expr != 0 and context.result == null) context.result = (try self.probeBreaks(loop.body, depth + 1)) orelse try self.probeBreaks(loop.continuation, depth + 1);
         if (try self.expression(loop.body, .{ .ty = unit }, depth + 1) == null) return null;
         self.terminated = false;
         var continuation_start: ?u32 = null;
         var continuation: ?Ir.ValueId = null;
         if (self.emitter) |emitter| {
             continuation_start = @intCast(emitter.instructions.items.len);
+            if (loop.continuation != 0) try self.continuationBinding(.{ .node = loop.source, .binding = loop.binding, .ty = source_type, .element = element_type, .index_type = index_type, .open = false, .by_ref = by_ref, .owner = owner, .counter = counter, .loan = loan }, node);
             const old = try emitter.append(index_type, self.irSpan(node), .{ .local_load = counter });
             var at_end: ?Ir.ValueId = null;
             var then_start: u32 = 0;
@@ -4464,6 +4528,11 @@ const Context = struct {
                 .then_value = exhausted.?,
                 .else_value = continuation,
             } });
+        }
+        if (loop.continuation != 0) {
+            if (try self.expression(loop.continuation, .{ .ty = unit }, depth + 1) == null) return null;
+            if (self.emitter) |emitter| continuation = try emitter.value(loop.continuation);
+            self.terminated = false;
         }
         self.restoreScope(scope);
         self.loop_context = parent;
@@ -10302,7 +10371,7 @@ fn testZipBody(allocator: std.mem.Allocator, body: []const u8, diagnostic: ?Modu
     defer allocator.free(source);
     var module = try Module.init(allocator, "zip.nov", source);
     defer module.deinit();
-    errdefer if (module.diagnostics.items.len != 0) std.debug.print("zip fixture: {s}\n{any}\n", .{ body, module.diagnostics.items });
+    errdefer if (module.diagnostics.items.len != 0 or module.source.ast.errors.len != 0) std.debug.print("zip fixture: {s}\n{any}\n", .{ body, module.diagnostics.items });
     try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
     var result = try Lowering.lower(&module);
     defer result.deinit();
@@ -10406,6 +10475,136 @@ test "zip iteration source reservations probes and lowering clean up under OOM" 
         "let sink:(value:int)={}\nsink(loop a,b in [true],[1] {break b} else {0})",
     }) |body| try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testZipBody, .{ body, @as(?Module.Diagnostic.Tag, null) });
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testZipBody, .{ "let mut a=[1]\nloop &x,&y in a,a {}", @as(?Module.Diagnostic.Tag, .borrow_conflict) });
+}
+
+test "iteration continuation bindings controls loans and generic inference" {
+    for ([_][]const u8{
+        "let mut n=0\nloop x in [1,2] : n+=x {continue}",
+        "loop x in \"é😀\" : @println(x) {}",
+        "loop x in @as(u8,255)..=255 : @println(x) {continue}",
+        "loop x,i in [1],@as(i8,127).. : @println(x,i) {continue}",
+        "loop x,y in \"é\",\"😀\" : {if x==y {continue}\n@println(x,y)} {}",
+        "let mut a=[1]\nloop &x in a : x.* +=1 {x.* +=1}\na+=[2]",
+        "let mut a=[1]\nlet mut b=[2]\nloop &x,&y,i in a,b,0.. : {x.* += y.*\n@println(i)} {continue}",
+        "let n=loop x in [1] : {break x} {} else {0}\n@println(n)",
+        "let n=loop x,y in [1],[2] : {break y} {continue} else {0}\n@println(n)",
+        "loop x in [1] : {continue} {}",
+        "loop x in [1] : {return} {}",
+        "loop x in [1] : {let p=&x\n@println(p.*)} {let p=&x\n@println(p.*)}",
+        "let generic:(a:`T)->`T={let mut n=a\nloop x in [1] : n+=x {}\nn}\nlet output:int=generic(0)",
+        "let generic:(a:`T)->`T=loop x in [a] : {break x} {} else {a}\nlet n:int=generic(0)",
+        "let value:@TypeOf(loop x in [1] : @println(x) {})={}",
+    }) |body| try testZipBody(std.testing.allocator, body, null);
+}
+
+const iteration_continuation_runtime =
+    \\let O:(T:type)->type=union{some:T,none,}
+    \\let stop:()->O(int)=.none[]
+    \\let propagate:()->O(int)={loop x,i in [1,2],@as(i8,127).. : {let ignored=stop().!
+    \\    } {} else {return .some[2]}}
+    \\let terminal:()->int={loop x,i in [1,2],@as(i8,127).. : {return x} {} else {return 2}}
+    \\let main:()={let mut seen=0
+    \\    let mut count=0
+    \\    loop x in [1,2,3] : {seen+=x
+    \\        count+=1
+    \\        continue} {continue}
+    \\    @assert(seen==6 and count==3)
+    \\    loop x in @as(u8,255)..=255 : {count+=1
+    \\        @assert(x==255)} {continue}
+    \\    loop x,i in [1],@as(i8,127).. : {@assert(x==1 and i==127)
+    \\        count+=1} {continue}
+    \\    loop x in 0..0 : {count+=100} {}
+    \\    loop x in [1] : {count+=100} {break}
+    \\    @assert(count==5)
+    \\    loop x,i in [1,2],@as(i8,127).. : {@assert(x==1 and i==127)
+    \\        break} {} else {@panic("break exhausted")}
+    \\    loop i,x in @as(i8,127)..,[1] : {count+=1} {} else {count+=1}
+    \\    @assert(count==7)
+    \\    let mut calls=0
+    \\    let source=()->[]int{calls+=1
+    \\        [1,2]}
+    \\    loop x in source() : {seen+=x} {}
+    \\    @assert(calls==1 and seen==9)
+    \\    let mut text=""
+    \\    loop r in "é😀" : {text+="{r}"} {continue}
+    \\    @assert(text=="é😀")
+    \\    let mut items=[1,2]
+    \\    loop &x in items : {x.* +=1} {x.* +=1
+    \\        continue}
+    \\    @assert(items[0]==3 and items[1]==4)
+    \\    let value=loop x in [7] : {break x} {} else {0}
+    \\    @assert(value==7 and terminal()==1)
+    \\    let result=propagate()
+    \\    match result {.some=>{@panic("unexpected success")}
+    \\        .none=>{}}
+    \\    let query:@TypeOf(loop &x in items : {x.* +=1} {})={}
+    \\    @assert(items[0]==3)
+    \\}
+;
+
+test "iteration continuation runtime fixture verifies terminal flow and generated C" {
+    var module = try Module.init(std.testing.allocator, "iteration-continuation.nov", iteration_continuation_runtime);
+    defer module.deinit();
+    errdefer std.debug.print("continuation runtime diagnostics: {any}\n", .{module.diagnostics.items});
+    var result = try Lowering.lower(&module);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(result.lowering_complete);
+    try result.ir.verify();
+    const c = try @import("CEmitter.zig").emitProgram(std.testing.allocator, &result.ir, null);
+    defer std.testing.allocator.free(c);
+}
+
+test "iteration continuation open overflow is checked only in the next condition" {
+    for ([_][]const u8{ "@println(i)", "{@println(i)\ncontinue}", "{break}", "{return}" }) |continuation| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let f:()={{loop x,i in [1,2],@as(i8,127).. : {s} {{}}}}", .{continuation});
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "pending-overflow.nov", source);
+        defer module.deinit();
+        var result = try Lowering.lower(&module);
+        defer result.deinit();
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expect(result.lowering_complete);
+        try result.ir.verify();
+        var guards: usize = 0;
+        for (result.ir.functions.items) |function| {
+            const body = function.body orelse continue;
+            for (body.instructions, 0..) |instruction, i| {
+                if (instruction.op != .loop) continue;
+                const loop = instruction.op.loop;
+                for (body.instructions[loop.condition_start..i], loop.condition_start..) |operation, index| {
+                    if (operation.op != .assertion) continue;
+                    try std.testing.expect(index < loop.body_start);
+                    guards += 1;
+                }
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 1), guards);
+    }
+}
+
+test "iteration continuation rejects nonunit body locals and owner effects" {
+    for ([_]struct { body: []const u8, tag: Module.Diagnostic.Tag }{
+        .{ .body = "loop x in [1] : {x} {}", .tag = .expression_type_mismatch },
+        .{ .body = "loop x in [1] : @println(y) {let y=2\n}", .tag = .unknown_name },
+        .{ .body = "let mut a=[1]\nloop x in a : a+=[2] {}", .tag = .borrow_conflict },
+        .{ .body = "let mut a=[1]\nloop &x in a : {a[0]=2} {}", .tag = .borrow_conflict },
+        .{ .body = "let mut a=[1]\nlet mutate=(){a=[2]}\nloop x in a : mutate() {}", .tag = .borrow_conflict },
+    }) |case| try testZipBody(std.testing.allocator, case.body, case.tag);
+}
+
+test "iteration continuation allocation failures restore scopes and loans" {
+    for ([_][]const u8{
+        "let mut a=[1]\nloop &x in a : x.* +=1 {continue}",
+        "let mut a=[1]\nloop &x,r,i in a,\"é\",0.. : {x.* +=1\n@println(r,i)} {continue}",
+        "loop x,i in [1,2],@as(i8,127).. : {break} {}",
+        "loop x,i in [1,2],@as(i8,127).. : {@println(i)\ncontinue} {}",
+        "loop x,i in [1],@as(i8,127).. : {} {} else {}",
+        "let n=loop x,y in [1],[2] : {break y} {} else {0}\n@println(n)",
+        "let generic:(a:`T)->`T=loop x in [a] : {break x} {} else {a}\nlet n:int=generic(0)",
+        "let value:@TypeOf(loop x in [1] : @println(x) {})={}",
+    }) |body| try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testZipBody, .{ body, @as(?Module.Diagnostic.Tag, null) });
 }
 
 test "general borrowing reserves record owners through terminal field assignment RHS" {

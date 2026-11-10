@@ -261,7 +261,9 @@ test "iteration accessors expose AST-owned positional lists for single and zip l
     for ([_][:0]const u8{
         "let f=loop item in items {}",
         "let f=loop item,&other,index in items,others,0.. {} else {false}",
-    }, [_]usize{ 1, 3 }) |source, count| {
+        "let f=loop item in items : {tick()} {}",
+        "let f=loop item,&other,index in items,others,0.. : index += 1 {} else {false}",
+    }, [_]usize{ 1, 3, 1, 3 }, [_]bool{ false, false, true, true }) |source, count, continuation| {
         var ast = try Parser.parse(std.testing.allocator, source);
         defer ast.deinit(std.testing.allocator);
         try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
@@ -273,6 +275,10 @@ test "iteration accessors expose AST-owned positional lists for single and zip l
         try std.testing.expectEqual(count, sources.len);
         try std.testing.expectEqual(loop.binding, bindings[0]);
         try std.testing.expectEqual(loop.source, sources[0]);
+        try std.testing.expectEqual(continuation, loop.continuation != 0);
+        if (continuation) {
+            try std.testing.expectEqualStrings(":", ast.tokenSlice(ast.firstToken(loop.continuation) - 1));
+        }
         try std.testing.expect(bindings.ptr == ast.extra_data[loop.bindings_start..].ptr);
         try std.testing.expect(sources.ptr == ast.extra_data[loop.sources_start..].ptr);
         if (count == 3) {
@@ -451,7 +457,7 @@ pub fn renderError(self: Ast, parse_error: Error, writer: anytype) !void {
         //     });
         // },
         .unsupported_loop => return writer.writeAll("unsupported loop form; expected 'loop condition { ... }'"),
-        .unsupported_range_loop => return writer.writeAll("invalid iteration loop; expected 'loop name, &name in source, source { ... }' with equal binding/source counts; steps and continuations are unsupported"),
+        .unsupported_range_loop => return writer.writeAll("invalid iteration loop; expected 'loop name, &name in source, source { ... }' with equal binding/source counts; steps are unsupported; an optional ': continuation' may precede the body"),
         .expected_decl => {
             return writer.print("expected declaration, found '{s}'", .{
                 token_tags[parse_error.token + @intFromBool(parse_error.token_is_prev)].symbol(),
@@ -748,10 +754,16 @@ pub fn firstToken(self: Ast, node: Node.Index) TokenIndex {
                 // A bare block continuation also follows `identifier :`, but
                 // that colon belongs to the loop header, not a block label.
                 const separator = for (tags, 0..) |tag, i| {
-                    if (tag != .loop_cont and tag != .loop_else) continue;
-                    const loop = self.fullLoop(@intCast(i)).?;
-
-                    const header_end = if (loop.condition == 0) main_tokens[i] else self.lastToken(loop.condition);
+                    const header_end = if (tag == .loop_range) range: {
+                        const loop = self.fullRange(@intCast(i)).?;
+                        if (loop.continuation == 0) continue;
+                        const sources = self.iterationSources(@intCast(i));
+                        break :range self.lastToken(sources[sources.len - 1]);
+                    } else condition: {
+                        if (tag != .loop_cont and tag != .loop_else) continue;
+                        const loop = self.fullLoop(@intCast(i)).?;
+                        break :condition if (loop.condition == 0) main_tokens[i] else self.lastToken(loop.condition);
+                    };
                     if (header_end + 1 == lbrace - 1) break true;
                 } else false;
                 if (!separator) end_offset += 2;
@@ -1837,6 +1849,7 @@ pub const Node = struct {
         binding: Index,
         /// First source; zip-aware clients must use iterationSources.
         source: Index,
+        continuation: Index = 0,
         body: Index,
         else_expr: Index,
         /// Nonempty, equal-length Node.Index lists in Ast.extra_data, even for singles.

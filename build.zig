@@ -165,6 +165,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const iteration_tests = b.step("test-cli-iteration", "Run array and Unicode string iteration CLI tests");
     addIterationCliTests(b, exe, iteration_tests);
     test_step.dependOn(iteration_tests);
+    const continuation_tests = b.step("test-cli-iteration-continuations", "Run iteration continuation CLI tests");
+    addIterationContinuationCliTests(b, exe, continuation_tests);
+    test_step.dependOn(continuation_tests);
     const zip_iteration_tests = b.step("test-cli-zip-iteration", "Run zip iteration CLI and strict generated-C tests");
     addZipIterationCliTests(b, exe, zip_iteration_tests);
     test_step.dependOn(zip_iteration_tests);
@@ -6060,6 +6063,199 @@ fn addIterationCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: 
         run.expectExitCode(1);
         run.expectStdOutEqual("");
         run.expectStdErrMatch(b.fmt("{s}:", .{source}));
+        run.expectStdErrMatch("error:");
+        run.expectStdErrMatch(case.diagnostic);
+        if (std.mem.eql(u8, case.diagnostic, conflict)) run.expectStdErrMatch("borrow originates here");
+        test_step.dependOn(&run.step);
+    }
+}
+
+fn addIterationContinuationCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    const fixtures = b.addWriteFiles();
+    const source = "iteration-continuations.nov";
+    _ = fixtures.add(source,
+        \\let R = union { ok: int, err: string, }
+        \\let fail: () -> R = .err["continuation error"]
+        \\let propagate: () -> R = {
+        \\    loop x in [1] : { let n = fail().!
+        \\        @println("BAD propagation", n)
+        \\    } {}
+        \\    .ok[0]
+        \\}
+        \\let early: () -> int = {
+        \\    loop x in [1, 2] : @println("BAD return continuation") { return x }
+        \\    0
+        \\}
+        \\let tailReturn: () -> int = loop x in [9] : { return x } {} else { @panic("BAD return else") }
+        \\let main: () = {
+        \\    let mut index: int = 0
+        \\    loop item in [10, 20, 30] : index += 1 {
+        \\        @println(index, item)
+        \\        if item == 20 { continue }
+        \\    } else { @println("array", index) }
+        \\    loop r in "Aé😀\0Z" : @print(r) { continue }
+        \\    @println("")
+        \\    loop n in 2..=4 : @print(n) {} else { @println(" range") }
+        \\    loop x, r, i in [7, 8], "é😀", 9.. : @println(x, r, i) { continue }
+        \\    let mut a: []int = [1, 2]
+        \\    loop &x in a : x.* += 10 { x.* *= 2 }
+        \\    @println(a[0], a[1])
+        \\    loop &x, i in a, @as(int, 0).. : {
+        \\        x.* += i
+        \\        continue
+        \\    } { x.* += 1 }
+        \\    @println(a[0], a[1])
+        \\    let mut visits: int = 0
+        \\    loop x in [1, 2, 3] : {
+        \\        visits += 1
+        \\        @print(x)
+        \\        continue
+        \\    } {
+        \\        if visits > 3 { @panic("continuation repeated") }
+        \\        continue
+        \\    } else { @println(" continued", visits) }
+        \\    loop x in [1, 2] : @println("BAD break continuation") { break } else { @println("BAD break else") }
+        \\    @println("return", early(), tailReturn())
+        \\    let picked: int = loop x in [4, 5] : { break x } {} else { 99 }
+        \\    @println("picked", picked)
+        \\    let terminal: int = loop x in [1] : { break 7 } {} else { @panic("not called") }
+        \\    @println("terminal", terminal)
+        \\    match propagate() { .ok => @panic("BAD success")
+        \\        .err => |e| @println(e)
+        \\    }
+        \\    let empty: []int = []
+        \\    loop x in empty : @println("BAD empty continuation") {} else { @println("empty") }
+        \\    let mut last: int = 0
+        \\    loop x in @as(u8, 255)..=255 : {
+        \\        @println("max", x)
+        \\        last += 1
+        \\    } { continue }
+        \\    loop x in @as(u64, 18446744073709551615)..=18446744073709551615 : {
+        \\        @println("wide max", x)
+        \\        continue
+        \\    } { continue }
+        \\    loop x, i in [6], @as(u64, 18446744073709551615).. : {
+        \\        @println("open", x, i)
+        \\        last += 1
+        \\        continue
+        \\    } { continue }
+        \\    loop i, x in @as(i8, 127).., [8] : @println("signed", i, x) { continue }
+        \\    @println("last", last)
+        \\}
+        \\@[test]
+        \\let iteration_continuations: () = main()
+        \\
+    );
+    const output = "0 10\n1 20\n2 30\narray 3\nAé😀\x00Z\n234 range\n7 é 9\n8 😀 10\n12 14\n13 16\n123 continued 3\nreturn 1 9\npicked 4\nterminal 7\ncontinuation error\nempty\nmax 255\nwide max 18446744073709551615\nopen 6 18446744073709551615\nsigned 127 8\nlast 2\n";
+    const check = b.addRunArtifact(exe);
+    check.setCwd(fixtures.getDirectory());
+    check.addArgs(&.{ "check", "--semantic", source });
+    check.expectExitCode(0);
+    check.expectStdOutEqual("");
+    check.expectStdErrEqual("");
+    test_step.dependOn(&check.step);
+    for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+        for ([_][]const u8{ "run", "test" }) |command| {
+            const run = b.addRunArtifact(exe);
+            run.step.name = b.fmt("CLI iteration continuations: {s} {s}", .{ command, mode });
+            run.setCwd(fixtures.getDirectory());
+            run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+            run.setEnvironmentVariable("NOV_CC", "");
+            run.setEnvironmentVariable("CC", "");
+            run.addArgs(&.{ command, source });
+            if (mode.len != 0) run.addArg(mode);
+            run.expectExitCode(0);
+            run.expectStdOutEqual(if (std.mem.eql(u8, command, "run")) output else output ++ "PASS iteration_continuations\n1 passed; 0 failed; 1 total\n");
+            run.expectStdErrEqual("");
+            test_step.dependOn(&run.step);
+        }
+    }
+    _ = fixtures.add("continuation-overflow-exits.nov",
+        \\let Option: (T: type) -> type = union { some: T, none, }
+        \\let stop: () -> Option(int) = .none[]
+        \\let returning: () -> int = {
+        \\    loop x, i in [1, 2], @as(i8, 127).. : { return 9 } {}
+        \\    0
+        \\}
+        \\let propagating: () -> Option(int) = {
+        \\    loop x, i in [1, 2], @as(i8, 127).. : {
+        \\        let n = stop().!
+        \\        @println("BAD some", n)
+        \\    } {}
+        \\    .some[0]
+        \\}
+        \\let main: () = {
+        \\    loop x, i in [1, 2], @as(i8, 127).. : { break } {} else { @panic("BAD break else") }
+        \\    @println("done")
+        \\    @println("return", returning())
+        \\    match propagating() { .some => @panic("BAD some")
+        \\        .none => @println("none")
+        \\    }
+        \\    loop x, i in [1, 2], @as(i8, 126).. : {
+        \\        @println("final", x, i)
+        \\        continue
+        \\    } {} else { @println("exhausted") }
+        \\}
+        \\
+    );
+    for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+        const run = b.addRunArtifact(exe);
+        run.step.name = b.fmt("CLI iteration continuations: overflow exits {s}", .{mode});
+        run.setCwd(fixtures.getDirectory());
+        run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+        run.setEnvironmentVariable("NOV_CC", "");
+        run.setEnvironmentVariable("CC", "");
+        run.addArgs(&.{ "run", "continuation-overflow-exits.nov" });
+        if (mode.len != 0) run.addArg(mode);
+        run.expectExitCode(0);
+        run.expectStdOutEqual("done\nreturn 9\nnone\nfinal 1 126\nfinal 2 127\nexhausted\n");
+        run.expectStdErrEqual("");
+        test_step.dependOn(&run.step);
+    }
+    for ([_]bool{ false, true }) |open_first| {
+        for ([_]bool{ false, true }) |continues| {
+            const invalid = b.fmt("continuation-overflow-{s}-{s}.nov", .{ if (open_first) "first" else "last", if (continues) "continue" else "fallthrough" });
+            _ = fixtures.add(invalid, b.fmt("let main:()={{\nloop {s} : {{\n@println(\"cont\", x, i)\n{s}\n}} {{@println(\"body\", x, i)}} else {{@println(\"BAD else\")}}\n}}\n", .{
+                if (open_first) "i,x in @as(i8,127)..,[1,2]" else "x,i in [1,2],@as(i8,127)..",
+                if (continues) "continue" else "",
+            }));
+            for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+                const run = b.addRunArtifact(exe);
+                run.step.name = b.fmt("CLI iteration continuations: delayed overflow {s} {s}", .{ invalid, mode });
+                run.setCwd(fixtures.getDirectory());
+                run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+                run.setEnvironmentVariable("NOV_CC", "");
+                run.setEnvironmentVariable("CC", "");
+                run.addArgs(&.{ "run", invalid });
+                if (mode.len != 0) run.addArg(mode);
+                run.expectExitCode(1);
+                run.expectStdOutEqual("body 1 127\ncont 1 127\n");
+                run.expectStdErrMatch(b.fmt("{s}:2:1: assertion failed: open range iteration overflow\n", .{invalid}));
+                test_step.dependOn(&run.step);
+            }
+        }
+    }
+    const conflict = "owner access or aliased reference arguments conflict with a live borrow";
+    for ([_]struct { name: []const u8, body: []const u8, diagnostic: []const u8 }{
+        .{ .name = "nonvoid", .body = "loop x in [1] : x {}", .diagnostic = "expression does not match the expected type" },
+        .{ .name = "readonly", .body = "loop x in [1] : x = 2 {}", .diagnostic = "assignment requires a mutable local" },
+        .{ .name = "body-local", .body = "loop x in [1] : @println(hidden) {let hidden=1\n}", .diagnostic = "unknown name" },
+        .{ .name = "binding-in-else", .body = "loop x in [1] : @println(x) {} else {@println(x)}", .diagnostic = "unknown name" },
+        .{ .name = "owner-mutation", .body = "let mut a=[1]\nloop x in a : a[0]=2 {}", .diagnostic = conflict },
+        .{ .name = "owner-growth", .body = "let mut a=[1]\nloop x in a : a+=[2] {}", .diagnostic = conflict },
+        .{ .name = "ref-conflict", .body = "let mut a=[1]\nloop &x in a : @println(a[0]) {}", .diagnostic = conflict },
+        .{ .name = "new-loan", .body = "let mut a=[1]\nloop &x in a : {let r=&a[0]\nr.*=2} {}", .diagnostic = conflict },
+        .{ .name = "readonly-ref", .body = "let a=[1]\nloop &x in a : x.*+=1 {}", .diagnostic = "assignment requires a mutable local" },
+        .{ .name = "propagation-error", .body = "let f:(r:R)->S={loop x in [1] : {let n=r.!\n} {}\n.ok[0]}\n", .diagnostic = ".! error payload must exactly match" },
+    }) |case| {
+        const invalid = b.fmt("invalid-continuation-{s}.nov", .{case.name});
+        _ = fixtures.add(invalid, b.fmt("let R=union{{ok:int,err:string,}}\nlet S=union{{ok:int,err:bool,}}\nlet main:()={{\n{s}\n}}\n", .{case.body}));
+        const run = b.addRunArtifact(exe);
+        run.step.name = b.fmt("CLI iteration continuations: reject {s}", .{case.name});
+        run.setCwd(fixtures.getDirectory());
+        run.addArgs(&.{ "check", "--semantic", invalid });
+        run.expectExitCode(1);
+        run.expectStdOutEqual("");
         run.expectStdErrMatch("error:");
         run.expectStdErrMatch(case.diagnostic);
         if (std.mem.eql(u8, case.diagnostic, conflict)) run.expectStdErrMatch("borrow originates here");

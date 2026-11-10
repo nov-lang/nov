@@ -2181,6 +2181,8 @@ const Solver = struct {
             try frame.locals.append(self.allocator, .{ .name = ast.tokenSlice(ast.firstToken(capture)), .term = term_value });
         }
         try self.unify(try self.expression(frame, loop.body, depth + 1), unit, span, 0);
+        if (loop.continuation != 0)
+            try self.unify(try self.expression(frame, loop.continuation, depth + 1), unit, span, 0);
         frame.locals.shrinkRetainingCapacity(scope);
         frame.loop = parent;
         if (loop.else_expr != 0) {
@@ -4994,6 +4996,20 @@ test "zip solver inferred closure returns sources references indices and readonl
         .{ .source = "let f=(){loop a,b in 0..2,0..=1 {break a} else {0}}", .result = uint },
         .{ .source = "let f=(){let start:u8=1\nloop a,i in [true],start.. {break i} else {0}}", .result = .{ .integer = .{ .signedness = .unsigned, .bits = 8 } } },
         .{ .source = "let both:(f:(`T)->`U,g:()->`T)->`U=f(g())\nlet f=(){both((s){loop r,b in s,[true] {break r} else {'x'}},(){\"é\"})}", .result = .rune },
+    }) |case| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let apply:(f:()->`T)->`T=f()\n{s}", .{case.source});
+        defer std.testing.allocator.free(source);
+        try testZipInference(std.testing.allocator, source, case.result);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testZipInference, .{ source, case.result });
+    }
+}
+
+test "iteration continuation solver preserves bindings terminal exits and readonly OOM" {
+    for ([_]struct { source: []const u8, result: Ir.Type }{
+        .{ .source = "let f=(){loop x in [true] : {break x} {} else {false}}", .result = .boolean },
+        .{ .source = "let f=(){loop r,i in \"é\",0.. : {break r} {continue} else {'x'}}", .result = .rune },
+        .{ .source = "let f=(){loop x in [true] : {return x} {} else {return false}\nmissing}", .result = .boolean },
+        .{ .source = "let f=(){let mut a=[true]\nloop &x,i in a,0.. : {break x.*} {} else {false}}", .result = .boolean },
     }) |case| {
         const source = try std.fmt.allocPrint(std.testing.allocator, "let apply:(f:()->`T)->`T=f()\n{s}", .{case.source});
         defer std.testing.allocator.free(source);

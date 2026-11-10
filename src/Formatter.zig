@@ -679,6 +679,33 @@ test "ascription preserves type syntax comments nested calls interpolation and a
     }
 }
 
+test "iteration continuations format before bodies with stable tokens structure and allocation cleanup" {
+    try expectFormatted("let f=loop item in items:index+=1{continue}else{false}", "let f = loop item in items : index += 1 {\n    continue\n} else {\n    false\n}\n");
+    try expectFormatted("let f=loop item in items:{tick()}{break item}", "let f = loop item in items : {\n    tick()\n} {\n    break item\n}\n");
+    for ([_][:0]const u8{
+        "let f=loop item in [1,2] : index += 1 {continue} else {}",
+        "let f=loop rune in \"é😀\" : index += 1 {break rune} else {'?'}",
+        "let f=loop i in 0..2 : tick() {}",
+        "let f=loop i in 0..=2 : {tick()} {} else {}",
+        "let f=loop &item in items : index += 1 {item+=1} else {}",
+        "let f=loop item,index in items,0.. : tick() {}",
+        "let f=loop &item,&other in items,others : {index += 1} {} else {}",
+        "let f=loop item in items : {} {} else if ready {false} else {true}",
+        "let f=loop i in 0..{limit()} : {tick()} {}",
+        "let f=loop item,index in items,0.. : {tick()} + 1 {}",
+        "let f=loop & ; capture\nitem in ; source\nitems : {; step\nindex += ; increment\n1} {continue} else {; exhaustion\n}",
+        "let f=[loop item in items : tick() {},1]\nlet g=call(loop i in 0.. : {} {},2)",
+        "let text=\"{loop item in items : {tick()} {break item} else {0}}\"",
+        "let f=loop item in items : {loop other in others : {tick()} {continue}} {continue}",
+    }) |source| {
+        errdefer std.debug.print("iteration continuation formatter fixture: {s}\n", .{source});
+        const result = try format(std.testing.allocator, source);
+        defer std.testing.allocator.free(result);
+        try expectFormatted(source, result);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{source});
+    }
+}
+
 test "zip iteration formatting preserves comments interpolation and allocation cleanup" {
     try expectFormatted("let f=loop item,index in items,0.. {item} else {false}", "let f = loop item, index in items, 0.. {\n    item\n} else {\n    false\n}\n");
     for ([_][:0]const u8{

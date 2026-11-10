@@ -127,6 +127,52 @@ pub fn check(allocator: std.mem.Allocator, body: Ir.Body) Ir.VerifyError!?Ir.Bor
     return null;
 }
 
+fn testIterationContinuationLoans(allocator: std.mem.Allocator) !void {
+    const Module = @import("Module.zig");
+    const Lowering = @import("Lowering.zig");
+    var module = try Module.init(allocator, "continuation-loans.nov",
+        \\let f:()={let mut items=[1,2]
+        \\let mut other=0
+        \\let p=&other
+        \\loop &item in items : {item.* +=p.*
+        \\    continue} {item.* +=1
+        \\    continue}
+        \\@println(p.*)
+        \\items+=[3]}
+    );
+    defer module.deinit();
+    var result = try Lowering.lower(&module);
+    defer result.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(result.lowering_complete);
+    try result.ir.verify();
+    var regions: usize = 0;
+    for (result.ir.functions.items) |function| {
+        const body = function.body orelse continue;
+        try std.testing.expectEqual(@as(?Ir.BorrowConflict, null), try check(allocator, body));
+        for (body.instructions, 0..) |instruction, i| {
+            if (instruction.op != .loop) continue;
+            const loop = instruction.op.loop;
+            const continuation = loop.continuation_start.?;
+            var body_loans: usize = 0;
+            var continuation_loans: usize = 0;
+            for (body.instructions[loop.body_start..i], loop.body_start..) |operation, index| {
+                if (operation.op != .borrow_start) continue;
+                if (index < continuation) body_loans += 1 else continuation_loans += 1;
+            }
+            try std.testing.expectEqual(@as(usize, 1), body_loans);
+            try std.testing.expectEqual(@as(usize, 1), continuation_loans);
+            regions += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), regions);
+}
+
+test "iteration continuation loans follow body and continuation continue edges under OOM" {
+    try testIterationContinuationLoans(std.testing.allocator);
+    try @import("TestAllocations.zig").checkAllAllocationFailures(std.testing.allocator, testIterationContinuationLoans, .{});
+}
+
 const Bits = struct {
     words: []u64,
 

@@ -118,7 +118,7 @@ let join: (parts: []string, separator: string) -> string = {
 @[public]
 let split: (text: string, separator: string) -> []string = {
     if separator.len == 0 {
-        @panic("string split separator must not be empty")
+        return [text]
     }
     ; String slices require native int bounds.
     let mut width: int = 0
@@ -194,9 +194,6 @@ let trim: (text: string) -> string = {
 
 @[public]
 let replace: (text: string, pattern: string, replacement: string) -> string = {
-    if pattern.len == 0 {
-        @panic("string replace pattern must not be empty")
-    }
     join(split(text, pattern), replacement)
 }
 
@@ -207,7 +204,7 @@ let repeat: (text: string, count: uint) -> string = {
     }
     let mut result = ""
     loop _ in 0..count {
-        result = result + text
+        result += text
     }
     result
 }

@@ -37,7 +37,7 @@ let Callable = struct {
 let twice: (value: int) -> int = value * 2
 
 let main: () = {
-    let mut counter = Counter.[ value = 0 ]
+    let mut counter: Counter = .[ value = 0 ]
     counter.add(2)
     Counter.add(&counter, 3)
     forward(&counter, 4)
