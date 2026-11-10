@@ -3361,6 +3361,37 @@ optimization remains paused. See [examples/string-join.nov](examples/string-join
 for the runnable example and five tests, and
 [lib/README.md](lib/README.md#string-joining).
 
+### Standard-library string transforms
+
+- `std.string.trim(text: string) -> string` removes leading/trailing Unicode
+  `White_Space`, returning an immutable shared-owner slice. The exact property is
+  U+0009–000D, U+0020, U+0085, U+00A0, U+1680, U+2000–200A, U+2028,
+  U+2029, U+202F, U+205F and U+3000. Interior whitespace, BOM, zero-width
+  characters, NUL and combining marks are preserved.
+- `std.string.replace(text: string, pattern: string, replacement: string) -> string`
+  replaces exact, case-sensitive, non-overlapping matches left to right. UTF-8
+  bytes and embedded NUL are preserved, without normalization. An empty replacement
+  deletes matches; an empty pattern panics with
+  `string replace pattern must not be empty`, even for empty input.
+- `std.string.repeat(text: string, count: uint) -> string` concatenates `count`
+  copies. Zero count or empty text returns `""`; empty text skips the loop even
+  at maximum `uint`.
+
+```nov
+@assert(std.string.trim("\u{3000} é😀\t") == "é😀")
+@assert(std.string.replace("banana", "ana", "X") == "bXna")
+@assert(std.string.repeat("é", 3) == "ééé")
+```
+
+These are ordinary Nov functions with eager, once-only, left-to-right argument
+evaluation and no callbacks. Inputs stay unchanged; results survive source scope
+exit/rebinding. `trim` uses scalar-aware native `int` slice offsets without casts;
+`replace` reuses `split`/`join`, and `repeat` uses existing string `+`. Repeated
+concatenation can copy quadratically; no builder or optimization is introduced.
+Allocation failures panic normally. See
+[examples/string-transform.nov](examples/string-transform.nov) for the runnable
+example and seven tests, and [lib/README.md](lib/README.md#string-transforms).
+
 ## String Interpolation
 
 `"{expression}"` evaluates an expression in the current lexical scope and produces

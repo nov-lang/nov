@@ -9764,6 +9764,132 @@ fn runApprovedHelperHarness(library: []const u8, harness: []const u8, oom: bool)
         try compileAndRunMode(c, "typedef int nonempty_translation_unit;", if (oom) 1 else 0, "", if (oom) "panic: GC allocation failed\n" else "", mode);
 }
 
+const string_transform_stdlib_source_free =
+    \\let std = @import("std")
+    \\let trim: (text: string) -> string = std.string.trim(text)
+    \\let replace: (text: string, pattern: string, replacement: string) -> string = std.string.replace(text, pattern, replacement)
+    \\let repeat: (text: string, count: uint) -> string = std.string.repeat(text, count)
+    \\let make: () -> string = "prefix:" + " \u{3000}é😀\0e\u{301}\t:suffix"
+    \\let white: () -> string = " " + "\u{3000}\t"
+    \\let retained: () -> []string = {
+    \\    let mut source = make()
+    \\    let view = trim(source[7..-7])
+    \\    let replaced = replace(view, view[1..2], view[3..])
+    \\    let repeated = repeat(view, 2)
+    \\    source += "changed"
+    \\    source = "different"
+    \\    @assert(source == "different")
+    \\    [view, replaced, repeated]
+    \\}
+;
+
+test "string transform actual stdlib source free trim exact owner offset no allocation O0 O3" {
+    const library = try emitApprovedHelperSourceFree(test_gpa, string_transform_stdlib_source_free);
+    defer test_gpa.free(library);
+    try runApprovedHelperHarness(library,
+        \\int main(void) {
+        \\    nov_rt_heap.collect_every_allocation = 1;
+        \\    nov_string text = {0}, trimmed = {0}, white = {0};
+        \\    void **roots[] = {&text.owner, &trimmed.owner, &white.owner};
+        \\    nov_gc_roots frame = {0}; nov_gc_push(&nov_rt_heap, &frame, roots, 3);
+        \\    text = nov_make(); white = nov_white();
+        \\    nov_string view = {text.owner, text.data + 7, text.len - 14};
+        \\    fail_allocations = 1;
+        \\    trimmed = nov_trim(view);
+        \\    if (trimmed.owner != text.owner || trimmed.data != view.data + 4 || trimmed.len != 10) return 1;
+        \\    nov_string same = nov_trim(trimmed);
+        \\    if (same.owner != trimmed.owner || same.data != trimmed.data || same.len != trimmed.len) return 2;
+        \\    nov_string empty = nov_trim(white);
+        \\    if (empty.owner != white.owner || empty.data != white.data + white.len || empty.len) return 3;
+        \\    nov_string end = {text.owner, text.data + text.len, 0};
+        \\    empty = nov_trim(end);
+        \\    if (empty.owner != end.owner || empty.data != end.data || empty.len) return 4;
+        \\    if (nov_repeat((nov_string){0}, UINTPTR_MAX).len) return 5;
+        \\    if (nov_repeat(trimmed, 0).len) return 6;
+        \\    text = white = (nov_string){0}; nov_gc_collect(&nov_rt_heap);
+        \\    static const unsigned char expected[] = {0xc3,0xa9,0xf0,0x9f,0x98,0x80,0,'e',0xcc,0x81};
+        \\    if (memcmp(trimmed.data, expected, sizeof expected)) return 7;
+        \\    nov_gc_pop(&nov_rt_heap, &frame); nov_gc_collect(&nov_rt_heap);
+        \\    if (nov_rt_heap.frames || nov_rt_heap.live_objects) return 8;
+        \\    nov_gc_shutdown(&nov_rt_heap); return 0;
+        \\}
+    , false);
+}
+
+test "string transform actual stdlib source free retained Unicode NUL subviews forced GC O0 O3" {
+    const library = try emitApprovedHelperSourceFree(test_gpa, string_transform_stdlib_source_free);
+    defer test_gpa.free(library);
+    try runApprovedHelperHarness(library,
+        \\int main(void) {
+        \\    nov_rt_heap.collect_every_allocation = 1;
+        \\    nov_array results = {0}; nov_string churn = {0}, repeated = {0};
+        \\    void **roots[] = {&results.data, &churn.owner, &repeated.owner};
+        \\    nov_gc_roots frame = {0}; nov_gc_push(&nov_rt_heap, &frame, roots, 3);
+        \\    results = nov_retained();
+        \\    for (int i = 0; i < 32; ++i) churn = nov_make();
+        \\    churn = (nov_string){0}; nov_gc_collect(&nov_rt_heap);
+        \\    nov_string *items = results.data;
+        \\    static const unsigned char original[] = {0xc3,0xa9,0xf0,0x9f,0x98,0x80,0,'e',0xcc,0x81};
+        \\    static const unsigned char replaced[] = {0xc3,0xa9,'e',0xcc,0x81,0,'e',0xcc,0x81};
+        \\    if (results.len != 3 || items[0].len != sizeof original || memcmp(items[0].data, original, sizeof original)) return 1;
+        \\    if (items[1].len != sizeof replaced || memcmp(items[1].data, replaced, sizeof replaced)) return 2;
+        \\    if (items[2].len != 2*sizeof original || memcmp(items[2].data, original, sizeof original) || memcmp(items[2].data+sizeof original, original, sizeof original)) return 3;
+        \\    repeated = items[2]; results = (nov_array){0}; nov_gc_collect(&nov_rt_heap);
+        \\    if (memcmp(repeated.data+sizeof original, original, sizeof original)) return 4;
+        \\    repeated = nov_repeat((nov_string){NULL,(const unsigned char *)"x",1}, 256);
+        \\    if (repeated.len != 256) return 5;
+        \\    for (size_t i = 0; i < repeated.len; ++i) if (repeated.data[i] != 'x') return 6;
+        \\    nov_gc_pop(&nov_rt_heap, &frame); nov_gc_collect(&nov_rt_heap);
+        \\    if (nov_rt_heap.frames || nov_rt_heap.live_objects) return 7;
+        \\    nov_gc_shutdown(&nov_rt_heap); return 0;
+        \\}
+    , false);
+}
+
+test "string transform actual stdlib source free empty pattern panic callee arguments order O0 O3" {
+    for ([_][]const u8{ "\"text\"", "\"\"" }) |text| {
+        const source = try std.fmt.allocPrint(
+            test_gpa,
+            "let std=@import(\"std\")\n" ++
+                "let callee:()->(string,string,string)->string={{@print(\"C\")\nstd.string.replace}}\n" ++
+                "let main:()={{let value=callee()({{@print(\"T\")\n{s}}},{{@print(\"P\")\n\"\"}},{{@print(\"R\")\n\"replacement\"}})\n@println(\"unreachable\",value)}}\n",
+            .{text},
+        );
+        defer test_gpa.free(source);
+        const library = try emitApprovedHelperSourceFree(test_gpa, source);
+        defer test_gpa.free(library);
+        const c = try collectingTestProgram(library);
+        defer test_gpa.free(c);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode|
+            try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 1, "CTPR", "panic: string replace pattern must not be empty\n", mode);
+    }
+}
+
+test "string transform actual stdlib source free replace repeat runtime OOM O0 O3" {
+    const library = try emitApprovedHelperSourceFree(test_gpa, string_transform_stdlib_source_free);
+    defer test_gpa.free(library);
+    for ([_][]const u8{
+        "int main(void) { fail_allocations=1; nov_string x={NULL,(const unsigned char *)\"x\",1}; (void)nov_replace(x,x,x); return 0; }",
+        "int main(void) { fail_allocations=1; nov_string x={NULL,(const unsigned char *)\"x\",1}; (void)nov_repeat(x,2); return 0; }",
+    }) |harness| try runApprovedHelperHarness(library, harness, true);
+    // A small budget reaches partial split construction and later repeat growth.
+    for ([_][]const u8{
+        "(void)nov_replace((nov_string){NULL,(const unsigned char *)\"a:a:a\",5},(nov_string){NULL,(const unsigned char *)\":\",1},(nov_string){NULL,(const unsigned char *)\"LONG\",4});",
+        "(void)nov_repeat((nov_string){NULL,(const unsigned char *)\"x\",1},8);",
+    }) |call| {
+        const c = try std.mem.concat(test_gpa, u8, &.{
+            "#include <stdlib.h>\nstatic unsigned budget=2;\nstatic void *test_malloc(size_t n) { if (!budget) return NULL; --budget; return malloc(n); }\n#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n",
+            library,
+            "\nint main(void) { nov_rt_heap.collect_every_allocation=1; ",
+            call,
+            " return 0; }\n",
+        });
+        defer test_gpa.free(c);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode|
+            try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 1, "", "panic: GC allocation failed\n", mode);
+    }
+}
+
 const string_byte_stdlib_source_free =
     \\let std = @import("std")
     \\let encode: (text: string) -> []u8 = std.string.toBytes(text)

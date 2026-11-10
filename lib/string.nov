@@ -139,3 +139,75 @@ let split: (text: string, separator: string) -> []string = {
     result += [text[start..]]
     result
 }
+
+let isWhiteSpace: (scalar: rune) -> bool = {
+    match scalar {
+        '\u{9}' => true
+        '\u{A}' => true
+        '\u{B}' => true
+        '\u{C}' => true
+        '\u{D}' => true
+        ' ' => true
+        '\u{85}' => true
+        '\u{A0}' => true
+        '\u{1680}' => true
+        '\u{2000}' => true
+        '\u{2001}' => true
+        '\u{2002}' => true
+        '\u{2003}' => true
+        '\u{2004}' => true
+        '\u{2005}' => true
+        '\u{2006}' => true
+        '\u{2007}' => true
+        '\u{2008}' => true
+        '\u{2009}' => true
+        '\u{200A}' => true
+        '\u{2028}' => true
+        '\u{2029}' => true
+        '\u{202F}' => true
+        '\u{205F}' => true
+        '\u{3000}' => true
+        _ => false
+    }
+}
+
+@[public]
+let trim: (text: string) -> string = {
+    let mut start: int = 0
+    let mut end: int = 0
+    let mut leading = true
+    loop scalar, index in text, @as(int, 0).. {
+        if isWhiteSpace(scalar) {
+            if leading {
+                start = index + 1
+            }
+        } else {
+            leading = false
+            end = index + 1
+        }
+    }
+    if leading {
+        return text[start..]
+    }
+    text[start..end]
+}
+
+@[public]
+let replace: (text: string, pattern: string, replacement: string) -> string = {
+    if pattern.len == 0 {
+        @panic("string replace pattern must not be empty")
+    }
+    join(split(text, pattern), replacement)
+}
+
+@[public]
+let repeat: (text: string, count: uint) -> string = {
+    if text.len == 0 {
+        return ""
+    }
+    let mut result = ""
+    loop _ in 0..count {
+        result = result + text
+    }
+    result
+}

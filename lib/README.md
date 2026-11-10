@@ -499,6 +499,48 @@ This is an ordinary Nov loop using existing string `+`, not a compiler builtin
 or optimized builder. Repeated concatenation can be quadratic; optimization stays
 paused. See `examples/string-join.nov` for a runnable example and five tests.
 
+## String transforms
+
+- `std.string.trim(text: string) -> string`
+- `std.string.replace(text: string, pattern: string, replacement: string) -> string`
+- `std.string.repeat(text: string, count: uint) -> string`
+
+`trim` removes only leading/trailing Unicode `White_Space`: U+0009–000D,
+U+0020, U+0085, U+00A0, U+1680, U+2000–200A, U+2028, U+2029, U+202F,
+U+205F and U+3000. Empty/all-whitespace input returns an empty view. Interior
+whitespace, BOM (U+FEFF), zero-width characters, NUL and combining marks are not
+removed. The result is a zero-copy immutable slice retaining the source owner;
+scalar-aware native `int` bounds are computed without casts.
+
+`replace` substitutes exact, case-sensitive, non-overlapping occurrences from left
+to right, preserving UTF-8 bytes including NUL without normalization or grapheme
+processing. Replacing `"aaaaa"` / `"aa"` with `"X"` yields `"XXa"`; newly inserted
+text is not searched again. An empty replacement deletes matches. No match or an
+oversized pattern preserves the input content; empty text yields `""` with a
+nonempty pattern. An empty pattern always panics with
+`string replace pattern must not be empty`, even for empty text, consistently with
+`split`'s empty-separator policy.
+
+`repeat` concatenates exactly `count` copies, preserving bytes without
+normalization. Count zero or empty text returns `""`; empty text returns before
+entering any loop, including for maximum `uint`.
+
+```nov
+@assert(std.string.trim("\u{3000} é😀\t") == "é😀")
+@assert(std.string.replace("banana", "ana", "X") == "bXna")
+@assert(std.string.repeat("é", 3) == "ééé")
+```
+
+All arguments evaluate eagerly, once, left to right, including empty/zero cases
+and before pattern validation; there are no callbacks. Inputs remain unchanged,
+and results stay valid after source rebinding or scope exit. Allocation failure
+panics normally. These are ordinary Nov helpers: `replace` reuses `split`/`join`,
+and `repeat` loops with existing string `+`. Repeated concatenation can be
+quadratic under current copying; no efficient builder/search or other optimization
+is added. Optimization remains paused. See `examples/string-transform.nov` for
+exact main stdout and seven tests covering property boundaries, exact matching,
+count boundaries, effects and scope/GC retention.
+
 ## References and library boundaries
 
 Explicit references are local and call-scoped capabilities, not ordinary

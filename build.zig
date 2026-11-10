@@ -150,6 +150,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const string_conversion_tests = b.step("test-cli-string-conversions", "Run UTF-8 string and byte conversion CLI tests");
     addStringConversionCliTests(b, exe, string_conversion_tests);
     test_step.dependOn(string_conversion_tests);
+    const string_transform_tests = b.step("test-cli-string-transform", "Run standard-library string trim, replace and repeat CLI tests");
+    addStringTransformCliTests(b, exe, string_transform_tests);
+    test_step.dependOn(string_transform_tests);
     const collection_helper_tests = b.step("test-cli-collection-helpers", "Run string join and array selection CLI tests");
     addCollectionHelperCliTests(b, exe, collection_helper_tests);
     test_step.dependOn(collection_helper_tests);
@@ -3476,6 +3479,159 @@ fn addStringConversionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test
             check.expectStdErrMatch(".nov:");
             check.expectStdErrMatch("error:");
             test_step.dependOn(&check.step);
+        }
+    }
+}
+
+fn addStringTransformCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    const fixtures = b.addWriteFiles();
+    const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
+    const aliases_source =
+        \\let standard = @import("std")
+        \\let direct = @import("lib/string.nov")
+        \\let alternate = @import("lib/./string.nov")
+        \\let api = @import("api.nov")
+        \\let verify: () = {
+        \\    let trim: (string) -> string = direct.trim
+        \\    let replace: (string, string, string) -> string = alternate.replace
+        \\    let repeat: (string, uint) -> string = api.repeat
+        \\    @assert(trim(" \u{3000}é😀\0\t") == "é😀\0")
+        \\    @assert(replace("é\0é", "é", "😀") == "😀\0😀")
+        \\    @assert(repeat("é\0", 2) == "é\0é\0")
+        \\    @assert(standard.string.trim(" x ") == alternate.trim(" x "))
+        \\    @assert(direct.replace("aaaaa", "aa", "X") == "XXa")
+        \\    let maximum: uint = 0 - @as(uint, 1)
+        \\    @assert(standard.string.repeat("", maximum) == "")
+        \\}
+        \\@[test]
+        \\let imported_aliases_and_exact_types: () = verify()
+        \\let main: () = verify()
+        \\
+    ;
+    const api_source =
+        \\let strings = @import("lib/string.nov")
+        \\@[public]
+        \\let repeat = strings.repeat
+        \\
+    ;
+    const package = b.addWriteFiles();
+    const installed_exe = package.addCopyFile(exe.getEmittedBin(), b.fmt("bin/{s}", .{exe.out_filename}));
+    _ = package.addCopyDirectory(b.path("lib"), "lib/nov", .{});
+    for ([_]struct { source: []const u8, contents: []const u8, stdout: []const u8, tests: []const u8 }{
+        .{
+            .source = "string-transform.nov",
+            .contents = @embedFile("examples/string-transform.nov"),
+            .stdout = "Trimmed: [é😀]\nReplaced: bXna\nRepeated: é😀é😀é😀\nNUL scalars: 3\n",
+            .tests = "PASS trim_every_white_space_scalar\nPASS trim_property_boundaries_and_preserved_content\nPASS replace_nonoverlap_growth_deletion_and_boundaries\nPASS replace_exact_utf8_nul_case_and_normalization\nPASS repeat_count_boundaries_and_exact_content\nPASS eager_callee_and_arguments_once_left_to_right\nPASS retained_views_and_results_after_scope_and_gc_churn\n7 passed; 0 failed; 7 total\n",
+        },
+        .{ .source = "aliases.nov", .contents = aliases_source, .stdout = "", .tests = "PASS imported_aliases_and_exact_types\n1 passed; 0 failed; 1 total\n" },
+    }) |case| {
+        _ = fixtures.add(case.source, case.contents);
+        _ = package.add(case.source, std.mem.replaceOwned(u8, b.allocator, case.contents, "lib/", "lib/nov/") catch @panic("OOM"));
+        for ([_]bool{ false, true }) |installed| {
+            for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+                for ([_][]const u8{ "run", "test" }) |command| {
+                    const run = if (installed) std.Build.Step.Run.create(b, "CLI string transform: relocated install") else b.addRunArtifact(exe);
+                    run.step.name = b.fmt("CLI string transform: {s} {s} {s} (installed={})", .{ command, case.source, mode, installed });
+                    if (installed) run.addFileArg(installed_exe);
+                    run.setCwd(if (installed) package.getDirectory() else fixtures.getDirectory());
+                    run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+                    run.setEnvironmentVariable("NOV_CC", "");
+                    run.setEnvironmentVariable("CC", "");
+                    run.addArgs(&.{ command, case.source });
+                    if (mode.len != 0) run.addArg(mode);
+                    if (!installed) {
+                        run.addArg("--lib-dir");
+                        run.addDirectoryArg(library);
+                    }
+                    run.expectExitCode(0);
+                    run.expectStdOutEqual(if (std.mem.eql(u8, command, "test")) case.tests else case.stdout);
+                    run.expectStdErrEqual("");
+                    test_step.dependOn(&run.step);
+                }
+            }
+        }
+    }
+    _ = fixtures.add("api.nov", api_source);
+    _ = package.add("api.nov", std.mem.replaceOwned(u8, b.allocator, api_source, "lib/", "lib/nov/") catch @panic("OOM"));
+    for ([_][]const u8{ "string-transform.nov", "aliases.nov", "api.nov", "lib/string.nov", "lib/std.nov" }) |source| {
+        const check = b.addRunArtifact(exe);
+        check.setCwd(fixtures.getDirectory());
+        check.addArgs(&.{ "check", "--semantic", source, "--lib-dir" });
+        check.addDirectoryArg(library);
+        check.expectExitCode(0);
+        check.expectStdOutEqual("");
+        check.expectStdErrEqual("");
+        test_step.dependOn(&check.step);
+    }
+    for ([_][]const u8{ "string-transform.nov", "lib/string.nov", "lib/std.nov" }) |source| {
+        const check = b.addRunArtifact(exe);
+        check.setCwd(fixtures.getDirectory());
+        check.addArgs(&.{ "fmt", "--check", source });
+        check.expectExitCode(0);
+        check.expectStdOutEqual("");
+        check.expectStdErrEqual("");
+        test_step.dependOn(&check.step);
+    }
+    for ([_]struct { name: []const u8, expression: []const u8 }{
+        .{ .name = "trim-rune", .expression = "std.string.trim('x')" },
+        .{ .name = "trim-bytes", .expression = "std.string.trim(@as([]u8,[120]))" },
+        .{ .name = "trim-missing", .expression = "std.string.trim()" },
+        .{ .name = "trim-extra", .expression = "std.string.trim(\"x\",\"y\")" },
+        .{ .name = "replace-text", .expression = "std.string.replace(1,\"a\",\"b\")" },
+        .{ .name = "replace-pattern", .expression = "std.string.replace(\"a\",'a',\"b\")" },
+        .{ .name = "replace-replacement", .expression = "std.string.replace(\"a\",\"a\",true)" },
+        .{ .name = "replace-missing", .expression = "std.string.replace(\"a\",\"a\")" },
+        .{ .name = "replace-extra", .expression = "std.string.replace(\"a\",\"a\",\"b\",\"c\")" },
+        .{ .name = "repeat-text", .expression = "std.string.repeat('x',2)" },
+        .{ .name = "repeat-int", .expression = "std.string.repeat(\"x\",@as(int,2))" },
+        .{ .name = "repeat-u8", .expression = "std.string.repeat(\"x\",@as(u8,2))" },
+        .{ .name = "repeat-float", .expression = "std.string.repeat(\"x\",2.0)" },
+        .{ .name = "repeat-negative", .expression = "std.string.repeat(\"x\",-1)" },
+        .{ .name = "repeat-missing", .expression = "std.string.repeat(\"x\")" },
+        .{ .name = "repeat-extra", .expression = "std.string.repeat(\"x\",2,3)" },
+        .{ .name = "trim-function", .expression = "@as((string)->uint,std.string.trim)" },
+        .{ .name = "replace-function", .expression = "@as((string,string,rune)->string,std.string.replace)" },
+        .{ .name = "repeat-function", .expression = "@as((string,int)->string,std.string.repeat)" },
+    }) |case| {
+        const source = b.fmt("invalid-transform-{s}.nov", .{case.name});
+        _ = fixtures.add(source, b.fmt("let std=@import(\"std\")\nlet main:()={{let value={s}\n}}\n", .{case.expression}));
+        const check = b.addRunArtifact(exe);
+        check.step.name = b.fmt("CLI string transform: reject {s}", .{case.name});
+        check.setCwd(fixtures.getDirectory());
+        check.addArgs(&.{ "check", "--semantic", source, "--lib-dir" });
+        check.addDirectoryArg(library);
+        check.expectExitCode(1);
+        check.expectStdOutEqual("");
+        check.expectStdErrMatch(".nov:");
+        check.expectStdErrMatch("error:");
+        test_step.dependOn(&check.step);
+    }
+    for ([_][]const u8{ "\"text\"", "\"\"" }, 0..) |text, index| {
+        const source = b.fmt("panic-replace-{d}.nov", .{index});
+        _ = fixtures.add(source, b.fmt(
+            "let std=@import(\"std\")\n" ++
+                "let callee:()->(string,string,string)->string={{@print(\"C\")\nstd.string.replace}}\n" ++
+                "let verify:()={{let value=callee()({{@print(\"T\")\n{s}}},{{@print(\"P\")\n\"\"}},{{@print(\"R\")\n\"replacement\"}})\n@println(\"unreachable\",value)}}\n" ++
+                "@[test]\nlet empty_pattern:()=verify()\nlet main:()=verify()\n",
+            .{text},
+        ));
+        for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+            for ([_][]const u8{ "run", "test" }) |command| {
+                const run = b.addRunArtifact(exe);
+                run.step.name = b.fmt("CLI string transform: empty pattern {d} {s} {s}", .{ index, command, mode });
+                run.setCwd(fixtures.getDirectory());
+                run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+                run.setEnvironmentVariable("NOV_CC", "");
+                run.setEnvironmentVariable("CC", "");
+                run.addArgs(&.{ command, source, "--lib-dir" });
+                run.addDirectoryArg(library);
+                if (mode.len != 0) run.addArg(mode);
+                run.expectExitCode(1);
+                run.expectStdOutEqual(if (std.mem.eql(u8, command, "test")) "CTPRFAIL empty_pattern (exit 1)\n0 passed; 1 failed; 1 total\n" else "CTPR");
+                run.expectStdErrEqual("panic: string replace pattern must not be empty\n");
+                test_step.dependOn(&run.step);
+            }
         }
     }
 }

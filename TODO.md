@@ -50,6 +50,23 @@ results. See `examples/array-fields.nov`.
 
 ## Current delivered status
 
+Step 2 complete: `std.string.trim(text: string) -> string`,
+`replace(text: string, pattern: string, replacement: string) -> string` and
+`repeat(text: string, count: uint) -> string` are ordinary Nov functions.
+`trim` shares the source slice owner and uses scalar-aware native `int` offsets
+without casts. It removes exactly Unicode `White_Space` (U+0009–000D, U+0020,
+U+0085, U+00A0, U+1680, U+2000–200A, U+2028, U+2029, U+202F, U+205F,
+U+3000), not BOM, zero-width characters, NUL or combining marks. `replace`
+reuses split/join for exact case-sensitive, non-overlapping left-to-right matches,
+including NUL, without normalization; empty patterns always panic with
+`string replace pattern must not be empty`, even for empty text. `repeat` uses
+existing string concatenation; zero count/empty input returns `""`, and empty
+text skips the loop even for maximum `uint`. All arguments remain eager, once,
+left to right; no callbacks or compiler changes. Current concatenation can copy
+quadratically; performance work remains **PAUSED**. See
+`examples/string-transform.nov` (seven tests and exact stdout), README.md and
+lib/README.md. Mutable receivers remain a separate, unimplemented step.
+
 Step 1 complete: `std.array.sort(items: []T, less: (T, T) -> bool) -> []T`
 is an ordinary Nov stable insertion sort returning an independent copy. Required
 `less(a, b)` orders a before b (`a < b` ascending, `a > b` descending); ties
