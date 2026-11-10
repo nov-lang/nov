@@ -238,7 +238,7 @@ for a runnable example and six tests, including chaining and void outputs.
 
 ## Array helpers
 
-`array.nov` implements eleven public generic functions.
+`array.nov` implements twelve public generic functions.
 Run `zig build test-cli-collection-helpers` for join/selection examples, imported
 aliases, invalid arguments and relocated-install checks.
 Signatures here use `T`/`U` for inferred backtick type variables:
@@ -264,7 +264,36 @@ Signatures here use `T`/`U` for inferred backtick type variables:
 - `array.each(items: []T, action: (T) -> void) -> void` visits all elements without
   constructing an output array. Callbacks must return void.
 
-Callbacks run once per visited element in source order, except `findLast`, whose
+`array.sort(items: []T, less: (T, T) -> bool) -> []T` returns an independent,
+stably sorted copy without mutating the source. `less(a, b)` means that `a`
+belongs before `b`: use `a < b` for ascending numeric order or `a > b` for
+descending order. The comparator is required; there is no default ordering.
+Equivalent elements (false in both directions) retain their original order;
+provide a consistent strict ordering. All ordinary storable element types work,
+including records, nested arrays, unions, functions and ranges, using suitable
+comparisons of fields, lengths, computed keys or callback results. Rune ordering
+can be supplied with equality-based keys; rune `<` is not currently supported.
+
+Sort is ordinary Nov insertion sort, with O(n²) worst-case comparisons/shifts
+and O(n) comparisons on already sorted input; ordinary recursive copies can add
+substantial overhead. It visits input left-to-right, comparing the current item
+against preceding items from right-to-left until the first false result. Empty
+and singleton inputs invoke no comparator. Arguments evaluate once, left-to-right;
+the input snapshot is taken before comparator construction or invocation can
+mutate captured source storage. Recursive backing is independent, while copied
+closure environments remain shared. Comparator failures/panics propagate normally.
+No builtin, optimization or mutable receiver is introduced. See
+`examples/array-sort.nov` for a runnable example and nine tests. Run:
+
+```sh
+nov check --semantic examples/array-sort.nov --lib-dir lib
+nov run examples/array-sort.nov --debug --lib-dir lib
+nov run examples/array-sort.nov --release --lib-dir lib
+nov test examples/array-sort.nov --debug --lib-dir lib
+nov test examples/array-sort.nov --release --lib-dir lib
+```
+
+For the other helpers, callbacks run once per visited element in source order, except `findLast`, whose
 predicate runs in reverse source order and stops immediately on a match.
 Empty input invokes no callback: map/filter/take/drop return empty arrays, fold
 returns `initial`, any returns false, all returns true, and all searches return

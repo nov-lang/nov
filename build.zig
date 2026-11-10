@@ -192,6 +192,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const array_helper_tests = b.step("test-cli-array-helpers", "Run standard-library array helper CLI tests");
     addArrayHelperCliTests(b, exe, array_helper_tests);
     test_step.dependOn(array_helper_tests);
+    const array_sort_tests = b.step("test-cli-array-sort", "Run standard-library stable array sort CLI tests");
+    addArraySortCliTests(b, exe, array_sort_tests);
+    test_step.dependOn(array_sort_tests);
     const array_search_tests = b.step("test-cli-array-search", "Run standard-library array search and traversal CLI tests");
     addArraySearchCliTests(b, exe, array_search_tests);
     test_step.dependOn(array_search_tests);
@@ -3724,6 +3727,146 @@ fn addStringSplitCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step
         check.expectStdErrMatch(".nov:");
         check.expectStdErrMatch("error:");
         test_step.dependOn(&check.step);
+    }
+}
+
+fn addArraySortCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    const fixtures = b.addWriteFiles();
+    const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
+    const aliases_source =
+        \\let std = @import("std")
+        \\let direct = @import("lib/array.nov")
+        \\let alternate = @import("lib/./array.nov")
+        \\let api = @import("api.nov")
+        \\let sort = api.sort
+        \\let less: (a: `T, b: `T) -> bool = a < b
+        \\let verify: () = {
+        \\    let concrete: ([]int, (int, int) -> bool) -> []int = sort
+        \\    let items: []int = [3, 1, 2]
+        \\    @assert(concrete(items, less)[0] == 1)
+        \\    @assert(sort(items, less)[1] == 2)
+        \\    @assert(direct.sort(items, less)[2] == 3)
+        \\    @assert(alternate.sort(items, less)[0] == 1)
+        \\    @assert(std.array.sort(@as([]i8, [2, 1]), less)[0] == 1)
+        \\    @assert(items[0] == 3)
+        \\}
+        \\@[test]
+        \\let imported_aliases: () = verify()
+        \\let main: () = verify()
+        \\
+    ;
+    const api_source =
+        \\let arrays = @import("lib/array.nov")
+        \\@[public]
+        \\let sort = arrays.sort
+        \\
+    ;
+    _ = fixtures.add("api.nov", api_source);
+    const package = b.addWriteFiles();
+    const installed_exe = package.addCopyFile(exe.getEmittedBin(), b.fmt("bin/{s}", .{exe.out_filename}));
+    _ = package.addCopyDirectory(b.path("lib"), "lib/nov", .{});
+    _ = package.add("api.nov", std.mem.replaceOwned(u8, b.allocator, api_source, "lib/", "lib/nov/") catch @panic("OOM"));
+    for ([_]struct { source: []const u8, contents: []const u8, stdout: []const u8, tests: []const u8 }{
+        .{
+            .source = "array-sort.nov",
+            .contents = @embedFile("examples/array-sort.nov"),
+            .stdout = "Source: [3, 1, 2, 1]\nAscending: [1, 1, 2, 3]\nDescending: [3, 2, 1, 1]\nStable keys: Bo Ada Cy\nSource unchanged: [3, 1, 2, 1]\n",
+            .tests = "PASS empty_and_singleton_no_comparisons\nPASS sorted_reverse_duplicates_and_descending\nPASS stable_struct_keys_and_all_equal\nPASS strings_runes_and_finite_floats\nPASS bool_integer_enum_union_and_range_elements\nPASS nested_arrays_and_records_copy_independently\nPASS function_elements_share_closure_captures\nPASS comparator_capture_and_comparison_order\nPASS arguments_once_left_to_right_and_source_snapshot\n9 passed; 0 failed; 9 total\n",
+        },
+        .{ .source = "aliases.nov", .contents = aliases_source, .stdout = "", .tests = "PASS imported_aliases\n1 passed; 0 failed; 1 total\n" },
+    }) |case| {
+        _ = fixtures.add(case.source, case.contents);
+        _ = package.add(case.source, std.mem.replaceOwned(u8, b.allocator, case.contents, "lib/", "lib/nov/") catch @panic("OOM"));
+        for ([_]bool{ false, true }) |installed| {
+            for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+                for ([_][]const u8{ "run", "test" }) |command| {
+                    const run = if (installed) std.Build.Step.Run.create(b, "CLI array sort: relocated install") else b.addRunArtifact(exe);
+                    run.step.name = b.fmt("CLI array sort: {s} {s} {s} (installed={})", .{ command, case.source, mode, installed });
+                    if (installed) run.addFileArg(installed_exe);
+                    run.setCwd(if (installed) package.getDirectory() else fixtures.getDirectory());
+                    run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+                    run.setEnvironmentVariable("NOV_CC", "");
+                    run.setEnvironmentVariable("CC", "");
+                    run.addArgs(&.{ command, case.source });
+                    if (mode.len != 0) run.addArg(mode);
+                    if (!installed) {
+                        run.addArg("--lib-dir");
+                        run.addDirectoryArg(library);
+                    }
+                    run.expectExitCode(0);
+                    run.expectStdOutEqual(if (std.mem.eql(u8, command, "test")) case.tests else case.stdout);
+                    run.expectStdErrEqual("");
+                    test_step.dependOn(&run.step);
+                }
+            }
+        }
+    }
+    // Check both entry points into the std <-> array import cycle.
+    for ([_][]const u8{ "array-sort.nov", "aliases.nov", "api.nov", "lib/std.nov", "lib/array.nov" }) |source| {
+        const check = b.addRunArtifact(exe);
+        check.setCwd(fixtures.getDirectory());
+        check.addArgs(&.{ "check", "--semantic", source, "--lib-dir" });
+        check.addDirectoryArg(library);
+        check.expectExitCode(0);
+        check.expectStdOutEqual("");
+        check.expectStdErrEqual("");
+        test_step.dependOn(&check.step);
+    }
+    for ([_]struct { name: []const u8, expression: []const u8, diagnostic: []const u8 }{
+        .{ .name = "result", .expression = "std.array.sort(@as([]int,[1]),(a:int,b:int)->int{a})", .diagnostic = "constraints require exactly identical types" },
+        .{ .name = "first-parameter", .expression = "std.array.sort(@as([]int,[1]),(a:bool,b:int)->bool{a})", .diagnostic = "constraints require exactly identical types" },
+        .{ .name = "second-parameter", .expression = "std.array.sort(@as([]int,[1]),(a:int,b:bool)->bool{b})", .diagnostic = "constraints require exactly identical types" },
+        .{ .name = "integer-width", .expression = "std.array.sort(@as([]i8,[1]),(a:i16,b:i16)->bool{a<b})", .diagnostic = "constraints require exactly identical types" },
+        .{ .name = "float-width", .expression = "std.array.sort(@as([]f32,[1.0]),(a:f64,b:f64)->bool{a<b})", .diagnostic = "constraints require exactly identical types" },
+        .{ .name = "nominal", .expression = "std.array.sort(@as([]A,[A.[1]]),(a:B,b:B)->bool{false})", .diagnostic = "constraints require exactly identical types" },
+        .{ .name = "callback-arity", .expression = "std.array.sort(@as([]int,[1]),(a:int)->bool{true})", .diagnostic = "constraints require exactly identical types" },
+        .{ .name = "missing", .expression = "std.array.sort(@as([]int,[1]))", .diagnostic = "argument" },
+        .{ .name = "extra", .expression = "std.array.sort(@as([]int,[1]),less,less)", .diagnostic = "argument" },
+        .{ .name = "not-array", .expression = "std.array.sort(1,less)", .diagnostic = "type" },
+        .{ .name = "not-function", .expression = "std.array.sort(@as([]int,[1]),true)", .diagnostic = "type" },
+    }) |case| {
+        const source = b.fmt("invalid-sort-{s}.nov", .{case.name});
+        _ = fixtures.add(source, b.fmt("let std=@import(\"std\")\nlet A=struct{{n:int,}}\nlet B=struct{{n:int,}}\nlet less:(a:int,b:int)->bool=a<b\nlet main:()={{let result={s}\n}}\n", .{case.expression}));
+        const check = b.addRunArtifact(exe);
+        check.step.name = b.fmt("CLI array sort: reject {s}", .{case.name});
+        check.setCwd(fixtures.getDirectory());
+        check.addArgs(&.{ "check", "--semantic", source, "--lib-dir" });
+        check.addDirectoryArg(library);
+        check.expectExitCode(1);
+        check.expectStdOutEqual("");
+        check.expectStdErrMatch(".nov:");
+        check.expectStdErrMatch("error:");
+        check.expectStdErrMatch(case.diagnostic);
+        test_step.dependOn(&check.step);
+    }
+    _ = fixtures.add("panic-sort.nov",
+        \\let std = @import("std")
+        \\let verify: () = {
+        \\    let result = std.array.sort(@as([]int, [2, 1]), (a: int, b: int) -> bool {
+        \\        @print(a, b)
+        \\        @panic("sort comparator")
+        \\    })
+        \\    @println("unreachable")
+        \\}
+        \\@[test]
+        \\let comparator_panic: () = verify()
+        \\let main: () = verify()
+    );
+    for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+        for ([_][]const u8{ "run", "test" }) |command| {
+            const run = b.addRunArtifact(exe);
+            run.setCwd(fixtures.getDirectory());
+            run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+            run.setEnvironmentVariable("NOV_CC", "");
+            run.setEnvironmentVariable("CC", "");
+            run.addArgs(&.{ command, "panic-sort.nov", "--lib-dir" });
+            run.addDirectoryArg(library);
+            if (mode.len != 0) run.addArg(mode);
+            run.expectExitCode(1);
+            run.expectStdOutEqual(if (std.mem.eql(u8, command, "test")) "1 2FAIL comparator_panic (exit 1)\n0 passed; 1 failed; 1 total\n" else "1 2");
+            run.expectStdErrEqual("panic: sort comparator\n");
+            test_step.dependOn(&run.step);
+        }
     }
 }
 

@@ -9979,6 +9979,150 @@ test "approved helpers join actual stdlib source free runtime OOM O0 O3" {
     , true);
 }
 
+const array_sort_source_free =
+    \\let std = @import("std")
+    \\let Row = struct {key: int, name: string, values: [][]int,}
+    \\let row: () -> Row = Row.[key = 2, name = "a" + "!", values = [[20]]]
+    \\let make: () -> []Row = [row(), Row.[key = 1, name = "b" + "!", values = [[10]]], Row.[key = 2, name = "c" + "!", values = [[21]]], Row.[key = 1, name = "d" + "!", values = [[11]]]]
+    \\let sort: (items: []Row) -> []Row = {
+    \\    let captured = "retained" + " comparator"
+    \\    let mut seen: []string = []
+    \\    let sorted = std.array.sort(items, (a: Row, b: Row) -> bool {
+    \\        seen += [a.name + b.name]
+    \\        @assert(captured == "retained comparator" and seen[-1].len == 4)
+    \\        a.key < b.key
+    \\    })
+    \\    @assert(seen.len == 5)
+    \\    sorted
+    \\}
+    \\let nested: (items: [][]int) -> [][]int = std.array.sort(items, (a: []int, b: []int) -> bool {a[0] < b[0]})
+;
+
+fn emitArraySortSourceFree(allocator: std.mem.Allocator, row_type: *Ir.TypeId) ![]u8 {
+    const io = std.testing.io;
+    const lib = std.testing.environ.getAlloc(allocator, "NOV_TEST_LIB_DIR") catch return error.SkipZigTest;
+    defer allocator.free(lib);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "sort.nov", .data = array_sort_source_free });
+    const path = try tmp.dir.realPathFileAlloc(io, "sort.nov", allocator);
+    defer allocator.free(path);
+    var lowered = blk: {
+        var compilation = try Compilation.load(allocator, io, path, .{ .lib_dir = lib });
+        defer compilation.deinit();
+        defer if (compilation.hasErrors()) {
+            var output = std.Io.Writer.Allocating.init(allocator);
+            defer output.deinit();
+            Diagnostics.renderCompilation(&compilation, &output.writer) catch {};
+            std.debug.print("{s}", .{output.written()});
+        };
+        var result = try Lowering.lowerCompilation(&compilation);
+        errdefer result.deinit();
+        try std.testing.expect(!compilation.hasErrors());
+        try std.testing.expect(result.lowering_complete);
+        break :blk result;
+    };
+    defer lowered.deinit();
+    try lowered.ir.verify();
+    var found = false;
+    for (lowered.ir.functions.items) |function| {
+        if (std.mem.eql(u8, function.name, "row")) {
+            row_type.* = lowered.ir.getType(function.ty).?.function.result;
+            found = true;
+        }
+    }
+    try std.testing.expect(found);
+    return emit(allocator, &lowered.ir, null);
+}
+
+test "array sort actual stdlib source free nested records arrays stable allocating captures forced GC O0 O3" {
+    var row_type: Ir.TypeId = undefined;
+    const library = try emitArraySortSourceFree(test_gpa, &row_type);
+    defer test_gpa.free(library);
+    const harness = try std.fmt.allocPrint(test_gpa,
+        \\typedef nov_record_{d} test_row;
+        \\int main(void) {{
+        \\    nov_rt_heap.collect_every_allocation = 1;
+        \\    nov_array source = {{0}}, sorted = {{0}}, nested = {{0}}, result = {{0}};
+        \\    void **roots[] = {{&source.data, &sorted.data, &nested.data, &result.data}};
+        \\    nov_gc_roots frame = {{0}}; nov_gc_push(&nov_rt_heap, &frame, roots, 4);
+        \\    source = nov_make(); sorted = nov_sort(source);
+        \\    if (source.len != 4 || sorted.len != 4 || source.data == sorted.data) return 1;
+        \\    test_row *s = source.data, *r = sorted.data;
+        \\    const uintptr_t order[] = {{1, 3, 0, 2}};
+        \\    for (uintptr_t i = 0; i < 4; ++i) {{
+        \\        test_row *original = &s[order[i]];
+        \\        if (s[i].f1.data[0] != (unsigned char)('a' + i)) return 2;
+        \\        if (r[i].f0 != (i < 2 ? 1 : 2) || r[i].f1.data[0] != original->f1.data[0]) return 3;
+        \\        if (!r[i].f1.owner || r[i].f1.owner != original->f1.owner || r[i].f2.data == original->f2.data) return 4;
+        \\        nov_array a = ((nov_array *)original->f2.data)[0], b = ((nov_array *)r[i].f2.data)[0];
+        \\        if (a.data == b.data || ((intptr_t *)a.data)[0] != ((intptr_t *)b.data)[0]) return 5;
+        \\        ((intptr_t *)b.data)[0] = 99;
+        \\        if (((intptr_t *)a.data)[0] == 99) return 6;
+        \\    }}
+        \\    nested = s[0].f2; result = nov_nested(nested);
+        \\    if (nested.data == result.data || ((nov_array *)nested.data)[0].data == ((nov_array *)result.data)[0].data) return 7;
+        \\    ((intptr_t *)((nov_array *)result.data)[0].data)[0] = 88;
+        \\    if (((intptr_t *)((nov_array *)nested.data)[0].data)[0] != 20) return 8;
+        \\    source = nested = (nov_array){{0}}; nov_gc_collect(&nov_rt_heap);
+        \\    r = sorted.data;
+        \\    if (memcmp(r[0].f1.data, "b!", 2) || ((intptr_t *)((nov_array *)r[0].f2.data)[0].data)[0] != 99) return 9;
+        \\    sorted = result = (nov_array){{0}}; nov_gc_collect(&nov_rt_heap);
+        \\    if (nov_rt_heap.live_objects) return 10;
+        \\    nov_gc_pop(&nov_rt_heap, &frame);
+        \\    if (nov_rt_heap.frames) return 11;
+        \\    nov_gc_shutdown(&nov_rt_heap); return 0;
+        \\}}
+    , .{@backingInt(row_type)});
+    defer test_gpa.free(harness);
+    try runApprovedHelperHarness(library, harness, false);
+}
+
+test "array sort actual stdlib source free recursive backing runtime OOM O0 O3" {
+    var row_type: Ir.TypeId = undefined;
+    const library = try emitArraySortSourceFree(test_gpa, &row_type);
+    defer test_gpa.free(library);
+    const harness = try std.fmt.allocPrint(test_gpa,
+        \\typedef nov_record_{d} test_row;
+        \\int main(void) {{
+        \\    nov_rt_heap.collect_every_allocation = 1;
+        \\    nov_array source = nov_make();
+        \\    void **roots[] = {{&source.data}}; nov_gc_roots frame = {{0}};
+        \\    nov_gc_push(&nov_rt_heap, &frame, roots, 1);
+        \\    fail_allocations = 1;
+        \\    (void)nov_nested(((test_row *)source.data)[0].f2); return 2;
+        \\}}
+    , .{@backingInt(row_type)});
+    defer test_gpa.free(harness);
+    try runApprovedHelperHarness(library, harness, true);
+}
+
+test "array sort actual stdlib source free allocating comparator runtime OOM O0 O3" {
+    const library = try emitApprovedHelperSourceFree(test_gpa,
+        \\let std = @import("std")
+        \\@[extern("sort_fail_allocations")]
+        \\let fail: () -> void
+        \\let exercise: () = {
+        \\    let captured = "retained" + " capture"
+        \\    let mut seen: []string = []
+        \\    let result = std.array.sort(@as([]int, [2, 1]), (a: int, b: int) -> bool {
+        \\        @assert(captured == "retained capture")
+        \\        fail()
+        \\        seen += [captured + "!"]
+        \\        a < b
+        \\    })
+        \\}
+    );
+    defer test_gpa.free(library);
+    try runApprovedHelperHarness(library,
+        \\void sort_fail_allocations(void) { fail_allocations = 1; }
+        \\int main(void) {
+        \\    nov_rt_heap.collect_every_allocation = 1;
+        \\    nov_exercise(); return 2;
+        \\}
+    , true);
+}
+
 const array_selection_source_free =
     \\let std = @import("std")
     \\let make: () -> [][][]string = [[["é" + "\0😀"]], [["other" + "!"]]]

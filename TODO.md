@@ -50,6 +50,19 @@ results. See `examples/array-fields.nov`.
 
 ## Current delivered status
 
+Step 1 complete: `std.array.sort(items: []T, less: (T, T) -> bool) -> []T`
+is an ordinary Nov stable insertion sort returning an independent copy. Required
+`less(a, b)` orders a before b (`a < b` ascending, `a > b` descending); ties
+(false both ways) retain source order. All ordinary storable element families
+work with suitable comparisons/keys. Empty/singleton inputs make no comparisons.
+Worst-case O(n²) comparisons/shifts, plus recursive-copy overhead; no builtins or
+optimizations. Source snapshots, eager left-to-right arguments, independent nested
+backing, shared closure environments and natural comparator failure/panic
+propagation retain ordinary language semantics. See `examples/array-sort.nov`
+(nine tests covering boundaries, duplicates/stability, storable types, recursive
+copies, captures, comparison effects and source snapshots). No new string helpers
+or mutable receivers are part of this step; performance work remains **PAUSED**.
+
 `std.string.toBytes(string) -> []u8`, `fromBytes([]u8) ->
 std.Result(string, std.string.Utf8Error)` and public `Utf8Error = enum {
 invalidUtf8, }` are implemented. Both directions copy into independent storage;

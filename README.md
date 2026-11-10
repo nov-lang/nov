@@ -1727,7 +1727,26 @@ Signatures below use `T`/`U` for inferred backtick type variables:
 - `each(items: []T, action: (T) -> void) -> void` visits every element without
   building a result array. A nonvoid callback is an error, not silently discarded.
 
-Callbacks run once per visited element in source order (reverse source order for
+- `sort(items: []T, less: (T, T) -> bool) -> []T` returns an independent stable
+  sorted copy, leaving the source unchanged. The comparator is required:
+  `less(a, b)` means `a` belongs before `b`; `a < b` gives ascending numeric order
+  and `a > b` gives descending order. Supply a consistent strict ordering; elements
+  equivalent in both directions retain their original order.
+
+Sort accepts every ordinary storable array element type with a suitable comparator
+(fields, lengths, computed keys, etc.). It uses ordinary Nov insertion sort:
+O(n²) worst-case comparisons/shifts, O(n) comparisons for already sorted input,
+plus ordinary recursive-copy overhead. Input is visited left-to-right; each item
+is compared against preceding elements right-to-left until a false result. Empty
+and singleton arrays invoke no comparator. Arguments evaluate once left-to-right;
+sorting uses the input snapshot even if comparator construction or calls mutate
+the captured source. Nested backing is independent; closure environments remain
+shared. Comparator failures/panics propagate normally. No builtin, optimization
+or mutable receiver is added. See [`examples/array-sort.nov`](examples/array-sort.nov)
+for a runnable ascending/descending/stability example and nine tests, and
+[`lib/README.md`](lib/README.md#array-helpers) for commands.
+
+For the other helpers, callbacks run once per visited element in source order (reverse source order for
 `findLast`), and never run for empty input. Empty map/filter/take/drop results are
 empty arrays; empty fold returns the seed; empty `any` is false and empty `all` is
 true. All searches return `.none[]` when

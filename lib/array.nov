@@ -21,6 +21,27 @@ let filter: (items: []`T, predicate: (`T) -> bool) -> []`T = {
     result
 }
 
+; Stable insertion sort: O(n²) comparisons/shifts in the worst case.
+; Ordinary value copies may add recursive-copy overhead.
+@[public]
+let sort: (items: []`T, less: (`T, `T) -> bool) -> []`T = {
+    let mut result: []`T = items
+    let mut index: int = 0
+    loop item in items {
+        let mut position: int = index
+        loop position > 0 {
+            if less(item, result[position - 1]) == false {
+                break
+            }
+            result[position] = result[position - 1]
+            position -= 1
+        }
+        result[position] = item
+        index += 1
+    }
+    result
+}
+
 @[public]
 let fold: (items: []`T, initial: `U, combine: (`U, `T) -> `U) -> `U = {
     let mut result: `U = initial
