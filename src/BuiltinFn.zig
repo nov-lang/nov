@@ -20,6 +20,8 @@ pub const Tag = enum {
     min,
     type_info,
     type_of,
+    string_to_bytes,
+    string_from_bytes,
     @"unreachable",
 };
 
@@ -70,6 +72,18 @@ pub const list = std.StaticStringMap(@This()).initComptime(.{
         .{
             .tag = .type_of,
             .param_count = 1,
+        },
+        "@stringToBytes",
+        .{
+            .tag = .string_to_bytes,
+            .param_count = 1,
+            .illegal_outside_function = true,
+        },
+        "@stringFromBytes",
+        .{
+            .tag = .string_from_bytes,
+            .param_count = 1,
+            .illegal_outside_function = true,
         },
         "@unreachable",
         .{

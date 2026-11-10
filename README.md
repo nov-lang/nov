@@ -3198,11 +3198,12 @@ For example, `"é😀x"[1..-1] == "😀"`. Array slicing remains unsupported. Se
 
 For editing, keep the distinction between a mutable binding and mutable storage:
 `s += "more"` produces a new immutable string and rebinds `s`, preserving older
-copies. Agreed future APIs will provide independent string-to-`[]u8` copies and
-validated, recoverable-error byte-buffer-to-string conversion. A separate stdlib
-builder may preserve UTF-8 while appending/editing and produce independent immutable
-snapshots. These conversions and builder are **not implemented**; there is no second
-built-in mutable-string type. Rune decoding through indexing is implemented;
+copies. `std.string.toBytes` makes an independent `[]u8` copy, and
+`std.string.fromBytes` validates bytes and returns a recoverable UTF-8 error or an
+independent immutable string (see [conversions](#standard-library-string-conversions)).
+A separate stdlib builder for UTF-8 editing and independent immutable snapshots
+remains **unimplemented**; there is no second built-in mutable-string type.
+Rune decoding through indexing is implemented;
 forward scalar iteration is also implemented (see [Loop](#loop)); grapheme
 operations remain deferred.
 
@@ -3240,6 +3241,41 @@ String formatting preserves literal tokens and escapes.
 Literals use static read-only bytes with a null GC owner; concatenation results
 have an exact scalar GC backing descriptor. Only managed owner fields are traced,
 never static byte pointers. Temporaries use the same precise root frames as arrays.
+
+### Standard-library string conversions
+
+- `std.string.toBytes(text: string) -> []u8`
+- `std.string.fromBytes(bytes: []u8) -> std.Result(string, std.string.Utf8Error)`
+- `std.string.Utf8Error = enum { invalidUtf8, }`
+
+```nov
+let std = @import("std")
+let bytes = std.string.toBytes("é😀\0")
+@assert(bytes.len == 7) ; byte count, unlike string scalar .len
+let result = std.string.fromBytes(bytes)
+@assert(result.unwrapOr("") == "é😀\0")
+@assert(std.string.fromBytes([0xFF]).isErr())
+```
+
+Both directions copy: changing the returned array cannot alter the source string,
+and changing the source array cannot alter a decoded string. Strings have immutable
+UTF-8 ownership; results survive source rebinding, scope exit and GC churn. Exact
+bytes, including NUL, are preserved without normalization. `fromBytes` fully
+validates UTF-8 in ordinary Nov before calling the low-level primitive; malformed,
+overlong, surrogate, out-of-range and truncated sequences return
+`.err[.invalidUtf8]`, never an invalid-UTF-8 primitive panic. Valid input returns
+`.ok[text]`; allocation failure still panics normally. Use `.!` in a compatible
+Result-returning function or match the result and `Utf8Error`. These ordinary
+wrappers are first-class functions and support `@TypeOf` queries.
+
+The low-level `@stringToBytes(text: string) -> []u8` and
+`@stringFromBytes(bytes: []u8) -> string` intrinsics also copy; the latter **panics
+on invalid UTF-8 in every build mode** rather than returning a Result. Prefer the
+validated public wrapper for arbitrary bytes. These are narrow runtime conversions,
+not general casts or approval of arbitrary compile-time execution; `@as` remains
+expected-type ascription. No builder, normalization or optimization is added.
+See [examples/string-conversions.nov](examples/string-conversions.nov) for exact
+stdout and nine tests, and [lib/README.md](lib/README.md#string-conversions).
 
 ### Standard-library string search
 
@@ -3412,6 +3448,8 @@ TODO
 ### Functions
 - `@import(path: string)`: Import a nov file. See [Visibility](#Visibility) for which declarations gets imported.
 - `@TypeOf(expression)`: Implemented unevaluated compile-time query of an expression's canonical type; see [Type Queries](#type-queries). The operand is typechecked, not executed; the result is not a runtime type value.
+- `@stringToBytes(text: string) -> []u8`: Copy exact UTF-8 bytes, including NUL, into an independent mutable array. Allocation failure panics normally.
+- `@stringFromBytes(bytes: []u8) -> string`: Validate and copy into independently owned immutable UTF-8. Invalid UTF-8 panics in debug and release; use `std.string.fromBytes` for recoverable validation errors. Allocation failure panics normally. Neither intrinsic normalizes text or provides general casts/comptime execution.
 - `@typeInfo(...)`: Proposed type-information reflection; not implemented.
 - `@This()`: Returns the type of the current container
 - `@print(...)`: Output args separated with a space to stdout; returns void. Supports bool, fixed/native integer, f32/f64, raw rune/string and recursive default array/struct/union/enum formatting. Nominal values at any depth prefer an explicit `@[stringify]` method with exact signature `(SelfType) -> string`, called once per encountered value in traversal order and stopping structural recursion. Top-level hooks run immediately after argument evaluation; nested hooks run during traversal. Malformed/inaccessible hooks reject even when nested. Compile-time types emit canonical static name strings. Interpolated strings work like other strings. See the printing contract above.

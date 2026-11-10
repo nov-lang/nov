@@ -915,6 +915,55 @@ test "integer defaults generic argument fallback and pipes roll back under OOM" 
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testIntegerDefaultInference, .{});
 }
 
+fn testStringByteBuiltinInference(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "string-byte-generic.nov",
+        \\let id:(x:`T)->`T=x
+        \\let encode:(x:`T)->`U=@stringToBytes(x)
+        \\let decode:(x:`T)->`U=@stringFromBytes(x)
+        \\let apply:(x:`T,f:(`T)->`U)->`U=f(x)
+        \\let quoted:(x:`T)->@TypeOf(@stringToBytes(x))=@stringToBytes(x)
+        \\let main:()={let a:[]u8=id(@stringToBytes(id("a")))
+        \\let b:string=id(@stringFromBytes(id([97])))
+        \\let c:[]u8=encode("c")
+        \\let d:string=decode([100])
+        \\let e=apply("e",(s)->[]u8 {@stringToBytes(s)})
+        \\let f=apply(a,(bytes)->string {@stringFromBytes(bytes)})
+        \\let local=(s){@stringToBytes(s)}
+        \\let g:[]u8=local("g")
+        \\@println(a,b,c,d,e,f,g,quoted("q"))}
+    );
+    defer module.deinit();
+    errdefer if (module.hasErrors()) {
+        std.debug.print("string byte inference: {any} AST: {any}\n", .{ module.diagnostics.items, module.source.ast.errors });
+    };
+    var sema = try Lowering.lower(&module);
+    defer sema.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+}
+
+test "string byte conversion generic and expected function inference under OOM" {
+    try testStringByteBuiltinInference(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testStringByteBuiltinInference, .{});
+}
+
+test "string byte conversion generic constraints reject inexact types" {
+    for ([_][]const u8{
+        "let encode:(x:`T)->[]u8=@stringToBytes(x)\nlet main:()={@println(encode([1]))}",
+        "let decode:(x:`T)->string=@stringFromBytes(x)\nlet main:()={@println(decode(@as([]u16,[1])))}",
+        "let id:(x:`T)->`T=x\nlet main:()={let b:[]u16=id(@stringToBytes(\"a\"))\n}",
+        "let id:(x:`T)->`T=x\nlet main:()={let b:[]u8=id(@stringFromBytes([97]))\n}",
+    }) |source| {
+        var module = try Module.init(std.testing.allocator, "invalid-string-byte-generic.nov", source);
+        defer module.deinit();
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        try std.testing.expect(module.hasErrors());
+        try std.testing.expect(!sema.lowering_complete);
+    }
+}
+
 fn testTypeOfSignatures(allocator: std.mem.Allocator) !void {
     const source =
         \\let id:(x:`T)->@TypeOf(x)={let copy:@TypeOf(x)=x
@@ -1272,7 +1321,10 @@ const Solver = struct {
             };
             for (self.query_literals.items) |literal| {
                 const operand = root(literal.operand);
-                if (operand.value != .known) continue;
+                if (operand.value != .known) {
+                    if (operand.value != .unknown) try self.fail(.literal_type_mismatch, literal.module.tokenSpan(literal.module.source.ast.firstToken(literal.node)), null);
+                    continue;
+                }
                 if (!try validation.literal(literal.module, literal.node, operand.value.known)) self.failed = true;
             }
             for (self.query_strings.items) |string| if (!try validation.stringSyntax(string.module, string.node)) {
@@ -2855,6 +2907,22 @@ const Solver = struct {
                     return ty;
                 }
                 const callee_name = ast.tokenSlice(ast.firstToken(call.ast.fn_expr));
+                if (ast.nodes.items(.tag)[call.ast.fn_expr] == .builtin_literal and
+                    (std.mem.eql(u8, callee_name, "@stringToBytes") or std.mem.eql(u8, callee_name, "@stringFromBytes")))
+                {
+                    if (call.ast.args.len != 1) {
+                        try self.fail(.argument_count_mismatch, span, null);
+                        return self.term(.unknown, span);
+                    }
+                    const string = try self.ir.internType(.string);
+                    const bytes = try self.ir.internType(.{ .array = try self.ir.internType(.{ .integer = .{ .bits = 8, .signedness = .unsigned } }) });
+                    const to_bytes = std.mem.eql(u8, callee_name, "@stringToBytes");
+                    const operand = try self.fromType(if (to_bytes) string else bytes, span, 0);
+                    const value = try self.expressionExpected(frame, call.ast.args[0], operand, depth + 1);
+                    if (root(value).value == .never) return value;
+                    try self.unify(operand, value, span, 0);
+                    return self.fromType(if (to_bytes) bytes else string, span, 0);
+                }
                 if (self.querying and ((std.mem.eql(u8, callee_name, "@panic") and call.ast.args.len != 1) or (std.mem.eql(u8, callee_name, "@assert") and (call.ast.args.len == 0 or call.ast.args.len > 2)))) {
                     try self.fail(.argument_count_mismatch, span, null);
                     return self.term(.unknown, span);

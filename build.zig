@@ -147,6 +147,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const string_split_tests = b.step("test-cli-string-split", "Run standard-library string split CLI tests");
     addStringSplitCliTests(b, exe, string_split_tests);
     test_step.dependOn(string_split_tests);
+    const string_conversion_tests = b.step("test-cli-string-conversions", "Run UTF-8 string and byte conversion CLI tests");
+    addStringConversionCliTests(b, exe, string_conversion_tests);
+    test_step.dependOn(string_conversion_tests);
     const collection_helper_tests = b.step("test-cli-collection-helpers", "Run string join and array selection CLI tests");
     addCollectionHelperCliTests(b, exe, collection_helper_tests);
     test_step.dependOn(collection_helper_tests);
@@ -3330,6 +3333,147 @@ fn addStringSearchCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_ste
         check.expectStdErrMatch(".nov:");
         check.expectStdErrMatch("error:");
         test_step.dependOn(&check.step);
+    }
+}
+
+fn addStringConversionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    const fixtures = b.addWriteFiles();
+    const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
+    _ = fixtures.add("string-conversions.nov", @embedFile("examples/string-conversions.nov"));
+    const aliases_source =
+        \\let standard = @import("std")
+        \\let direct = @import("lib/string.nov")
+        \\let alternate = @import("lib/./string.nov")
+        \\let result = @import("lib/result.nov")
+        \\let verify: () = {
+        \\    let encode: (string) -> []u8 = direct.toBytes
+        \\    let decode: ([]u8) -> standard.Result(string, alternate.Utf8Error) = alternate.fromBytes
+        \\    let bytes = encode("Aé😀\0")
+        \\    let text: result.Result(string, direct.Utf8Error) = decode(bytes)
+        \\    @assert(text.unwrapOr("bad") == "Aé😀\0" and bytes.len == 8)
+        \\    @assert(standard.string.fromBytes(direct.toBytes("é")).unwrapOr("") == "é")
+        \\    @assert(alternate.fromBytes(standard.string.toBytes("😀")).unwrapOr("") == "😀")
+        \\    @assert(@stringFromBytes(@stringToBytes("a\0é😀")) == "a\0é😀")
+        \\    let empty: []u8 = @stringToBytes("")
+        \\    @assert(@stringFromBytes(empty) == "")
+        \\    match decode([0xFF]) {
+        \\        .ok => @panic("invalid UTF-8 accepted")
+        \\        .err => |error| {
+        \\            let canonical: direct.Utf8Error = error
+        \\            match canonical {
+        \\                .invalidUtf8 => {}
+        \\            }
+        \\        }
+        \\    }
+        \\}
+        \\@[test]
+        \\let imported_aliases_and_canonical_types: () = verify()
+        \\let main: () = verify()
+        \\
+    ;
+    _ = fixtures.add("aliases.nov", aliases_source);
+    for ([_][]const u8{ "string-conversions.nov", "aliases.nov", "lib/string.nov", "lib/std.nov" }) |source| {
+        for ([_]bool{ false, true }) |semantic| {
+            if (!semantic and std.mem.eql(u8, source, "aliases.nov")) continue;
+            const check = b.addRunArtifact(exe);
+            check.step.name = b.fmt("CLI string conversions: {s} {s}", .{ if (semantic) "semantic" else "fmt", source });
+            check.setCwd(fixtures.getDirectory());
+            check.addArgs(if (semantic) &.{ "check", "--semantic", source } else &.{ "fmt", "--check", source });
+            if (semantic) {
+                check.addArg("--lib-dir");
+                check.addDirectoryArg(library);
+            }
+            check.expectExitCode(0);
+            check.expectStdOutEqual("");
+            check.expectStdErrEqual("");
+            test_step.dependOn(&check.step);
+        }
+    }
+    const example_output = "UTF-8 bytes: [65, 195, 169, 240, 159, 152, 128]\nRound trip: Aé😀\nIndependent snapshot: Aé😀\nInvalid UTF-8: Utf8Error.invalidUtf8\nNUL: 3 bytes, 3 scalars\n";
+    const example_tests = "PASS empty_ascii_and_nul\nPASS valid_two_and_three_byte_boundaries\nPASS valid_four_byte_boundaries_and_state_reset\nPASS invalid_leads_and_stray_continuations\nPASS invalid_overlong_surrogate_and_out_of_range\nPASS invalid_continuations_and_truncation\nPASS exact_bytes_no_normalization_and_copy_isolation\nPASS source_scope_and_gc_churn\nPASS propagation_error_matching_and_first_class_wrappers\n9 passed; 0 failed; 9 total\n";
+    const package = b.addWriteFiles();
+    const installed_exe = package.addCopyFile(exe.getEmittedBin(), b.fmt("bin/{s}", .{exe.out_filename}));
+    _ = package.addCopyDirectory(b.path("lib"), "lib/nov", .{});
+    _ = package.add("string-conversions.nov", @embedFile("examples/string-conversions.nov"));
+    _ = package.add("aliases.nov", std.mem.replaceOwned(u8, b.allocator, aliases_source, "lib/", "lib/nov/") catch @panic("OOM"));
+    for ([_]bool{ false, true }) |installed| {
+        for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+            for ([_][]const u8{ "run", "test" }) |command| {
+                for ([_][]const u8{ "string-conversions.nov", "aliases.nov" }) |source| {
+                    const run = if (installed) std.Build.Step.Run.create(b, "CLI string conversions: relocated install") else b.addRunArtifact(exe);
+                    run.step.name = b.fmt("CLI string conversions: {s} {s} {s} (installed={})", .{ command, source, mode, installed });
+                    if (installed) run.addFileArg(installed_exe);
+                    run.setCwd(if (installed) package.getDirectory() else fixtures.getDirectory());
+                    run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+                    run.setEnvironmentVariable("NOV_CC", "");
+                    run.setEnvironmentVariable("CC", "");
+                    run.addArgs(&.{ command, source });
+                    if (mode.len != 0) run.addArg(mode);
+                    if (!installed) {
+                        run.addArg("--lib-dir");
+                        run.addDirectoryArg(library);
+                    }
+                    const is_test = std.mem.eql(u8, command, "test");
+                    const example = std.mem.eql(u8, source, "string-conversions.nov");
+                    run.expectExitCode(0);
+                    run.expectStdOutEqual(if (example) (if (is_test) example_tests else example_output) else if (is_test) "PASS imported_aliases_and_canonical_types\n1 passed; 0 failed; 1 total\n" else "");
+                    run.expectStdErrEqual("");
+                    test_step.dependOn(&run.step);
+                }
+            }
+        }
+    }
+    for ([_][]const u8{ "[0xFF]", "[0xC0, 0x80]", "[0xED, 0xA0, 0x80]", "[0xF4, 0x90, 0x80, 0x80]", "[0xF0, 0x90, 0x80]" }, 0..) |bytes, index| {
+        const source = b.fmt("panic-invalid-utf8-{d}.nov", .{index});
+        _ = fixtures.add(source, b.fmt("let main:()={{let bytes:[]u8={s}\n@println(@stringFromBytes(bytes))\n}}\n", .{bytes}));
+        for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+            const run = b.addRunArtifact(exe);
+            run.step.name = b.fmt("CLI string conversions: invalid UTF-8 {d} {s}", .{ index, mode });
+            run.setCwd(fixtures.getDirectory());
+            run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+            run.setEnvironmentVariable("NOV_CC", "");
+            run.setEnvironmentVariable("CC", "");
+            run.addArgs(&.{ "run", source, "--lib-dir" });
+            run.addDirectoryArg(library);
+            if (mode.len != 0) run.addArg(mode);
+            run.expectExitCode(1);
+            run.expectStdOutEqual("");
+            run.expectStdErrEqual("panic: invalid UTF-8\n");
+            test_step.dependOn(&run.step);
+        }
+    }
+    for ([_]bool{ false, true }) |is_builtin| {
+        for ([_]struct { name: []const u8, encode: bool, args: []const u8 }{
+            .{ .name = "to-int", .encode = true, .args = "1" },
+            .{ .name = "to-byte", .encode = true, .args = "@as(u8,65)" },
+            .{ .name = "to-rune", .encode = true, .args = "'A'" },
+            .{ .name = "to-array", .encode = true, .args = "[1]" },
+            .{ .name = "to-missing", .encode = true, .args = "" },
+            .{ .name = "to-extra", .encode = true, .args = "\"a\",\"b\"" },
+            .{ .name = "from-string", .encode = false, .args = "\"abc\"" },
+            .{ .name = "from-byte", .encode = false, .args = "@as(u8,65)" },
+            .{ .name = "from-rune", .encode = false, .args = "'A'" },
+            .{ .name = "from-int-array", .encode = false, .args = "[@as(int,65)]" },
+            .{ .name = "from-uint-array", .encode = false, .args = "[@as(uint,65)]" },
+            .{ .name = "from-rune-array", .encode = false, .args = "['A']" },
+            .{ .name = "from-float-array", .encode = false, .args = "[1.0]" },
+            .{ .name = "from-missing", .encode = false, .args = "" },
+            .{ .name = "from-extra", .encode = false, .args = "[],[]" },
+        }) |case| {
+            const source = b.fmt("invalid-string-conversion-{s}-{s}.nov", .{ if (is_builtin) "builtin" else "wrapper", case.name });
+            const callee = if (is_builtin) (if (case.encode) "@stringToBytes" else "@stringFromBytes") else if (case.encode) "std.string.toBytes" else "std.string.fromBytes";
+            _ = fixtures.add(source, b.fmt("let std=@import(\"std\")\nlet main:()={{let value={s}({s})\n}}\n", .{ callee, case.args }));
+            const check = b.addRunArtifact(exe);
+            check.step.name = b.fmt("CLI string conversions: reject {s} {s}", .{ callee, case.name });
+            check.setCwd(fixtures.getDirectory());
+            check.addArgs(&.{ "check", "--semantic", source, "--lib-dir" });
+            check.addDirectoryArg(library);
+            check.expectExitCode(1);
+            check.expectStdOutEqual("");
+            check.expectStdErrMatch(".nov:");
+            check.expectStdErrMatch("error:");
+            test_step.dependOn(&check.step);
+        }
     }
 }
 

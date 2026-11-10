@@ -1,5 +1,62 @@
 let std = @import("std.nov")
-let Option = std.Option
+
+@[public]
+let Utf8Error = enum {
+    invalidUtf8,
+}
+
+@[public]
+let toBytes: (text: string) -> []u8 = @stringToBytes(text)
+
+let isValidUtf8: (bytes: []u8) -> bool = {
+    let mut remaining: u8 = 0
+    let mut lower: u8 = 0x80
+    let mut upper: u8 = 0xBF
+    loop byte in bytes {
+        if remaining != 0 {
+            if byte < lower or byte > upper {
+                return false
+            }
+            remaining -= 1
+            lower = 0x80
+            upper = 0xBF
+        } else {
+            if byte <= 0x7F {
+                continue
+            }
+            if byte >= 0xC2 and byte <= 0xDF {
+                remaining = 1
+            } else if byte == 0xE0 {
+                remaining = 2
+                lower = 0xA0
+            } else if byte == 0xED {
+                remaining = 2
+                upper = 0x9F
+            } else if byte >= 0xE1 and byte <= 0xEC or byte >= 0xEE and byte <= 0xEF {
+                remaining = 2
+            } else if byte == 0xF0 {
+                remaining = 3
+                lower = 0x90
+            } else if byte >= 0xF1 and byte <= 0xF3 {
+                remaining = 3
+            } else if byte == 0xF4 {
+                remaining = 3
+                upper = 0x8F
+            } else {
+                return false
+            }
+        }
+    }
+    remaining == 0
+}
+
+@[public]
+let fromBytes: (bytes: []u8) -> std.Result(string, Utf8Error) = {
+    if isValidUtf8(bytes) == false {
+        return .err[ .invalidUtf8 ]
+    }
+    .ok[@stringFromBytes(bytes)]
+}
 
 @[public]
 let startsWith: (text: string, prefix: string) -> bool = {
@@ -29,7 +86,7 @@ let endsWith: (text: string, suffix: string) -> bool = {
 }
 
 @[public]
-let find: (text: string, pattern: string) -> Option(uint) = {
+let find: (text: string, pattern: string) -> std.Option(uint) = {
     if pattern.len == 0 {
         return .some[0]
     }

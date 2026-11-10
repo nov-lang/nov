@@ -2760,6 +2760,19 @@ const Context = struct {
         if (self.module.diagnostics.items.len == start) _ = try self.fail(.unsupported_body_expression, node, null);
     }
 
+    fn stringBytes(self: *Context, node: Ast.Node.Index) ?bool {
+        const ast = &self.module.source.ast;
+        if (ast.nodes.items(.tag)[node] != .builtin_literal) return null;
+        const name = ast.tokenSlice(ast.firstToken(node));
+        if (std.mem.eql(u8, name, "@stringToBytes")) return true;
+        if (std.mem.eql(u8, name, "@stringFromBytes")) return false;
+        return null;
+    }
+
+    fn byteArrayType(self: *Context) Error!Ir.TypeId {
+        return self.ir.internType(.{ .array = try self.ir.internType(.{ .integer = .{ .bits = 8, .signedness = .unsigned } }) });
+    }
+
     fn isPanic(self: *Context, node: Ast.Node.Index) bool {
         return self.module.source.ast.nodes.items(.tag)[node] == .builtin_literal and
             std.mem.eql(u8, self.module.sourceSlice(self.span(node)).?, "@panic");
@@ -3026,6 +3039,10 @@ const Context = struct {
                     defer self.module.diagnostics.shrinkRetainingCapacity(diagnostics_start);
                     break :blk try self.ascribedType(call);
                 }
+                if (self.stringBytes(call.ast.fn_expr)) |to_bytes| {
+                    if (call.ast.args.len != 1) break :blk null;
+                    break :blk .{ .ty = if (to_bytes) try self.byteArrayType() else try self.ir.internType(.string) };
+                }
                 if (self.isAssertion(call.ast.fn_expr) or self.printing(call.ast.fn_expr) != null) break :blk .{ .ty = try self.ir.internType(.void) };
                 if (ast.nodes.items(.tag)[call.ast.fn_expr] == .field_access and try self.staticMethod(call.ast.fn_expr) == null) {
                     const field = ast.nodes.items(.data)[call.ast.fn_expr];
@@ -3285,6 +3302,10 @@ const Context = struct {
                 if (self.isAscription(call.ast.fn_expr)) {
                     try emitter.values.put(emitter.allocator, node, try emitter.value(call.ast.args[1]));
                     return true;
+                }
+                if (self.stringBytes(call.ast.fn_expr)) |to_bytes| {
+                    const value = try emitter.value(call.ast.args[0]);
+                    break :blk if (to_bytes) .{ .string_to_bytes = value } else .{ .bytes_to_string = value };
                 }
                 const args = try emitter.allocator.alloc(Ir.ValueId, call.ast.args.len);
                 for (call.ast.args, args) |arg, *value| value.* = try emitter.value(arg);
@@ -4909,6 +4930,15 @@ const Context = struct {
                         } });
                     }
                     return self.fit(unit, expected, node);
+                }
+                if (self.stringBytes(call.ast.fn_expr)) |to_bytes| {
+                    if (call.ast.args.len != 1) return self.fail(.argument_count_mismatch, node, null);
+                    const string = try self.ir.internType(.string);
+                    const bytes = try self.byteArrayType();
+                    const result = if (to_bytes) bytes else string;
+                    if (try self.expression(call.ast.args[0], .{ .ty = if (to_bytes) string else bytes }, depth + 1) == null) return null;
+                    if (self.terminated) return if (expected) |want| want.ty else result;
+                    return self.fit(result, expected, node);
                 }
                 if (self.isPanic(call.ast.fn_expr)) {
                     if (call.ast.args.len != 1) return self.fail(.argument_count_mismatch, node, null);
@@ -7751,6 +7781,142 @@ test "string scalar indexing terminal base and index operands skip unreachable o
         for (sema.ir.functions.items) |function| {
             for (function.body.?.instructions) |instruction| try std.testing.expect(instruction.op != .array_index);
         }
+    }
+}
+
+fn testStringByteConversions(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "string-byte-conversions.nov",
+        \\let encode:(s:string)->[]u8=@stringToBytes(s)
+        \\let decode:(b:[]u8)->string=@stringFromBytes(b)
+        \\let main:()={let bytes=@stringToBytes("hé\0")
+        \\let text=@stringFromBytes(bytes)
+        \\let empty=@stringFromBytes([])
+        \\@println(text,empty,encode(text),decode(bytes))}
+    );
+    defer module.deinit();
+    var sema = try Lowering.lower(&module);
+    defer sema.deinit();
+    errdefer if (module.hasErrors()) {
+        std.debug.print("string byte conversions: {any}\n", .{module.diagnostics.items});
+    };
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+    var conversions: usize = 0;
+    for (sema.ir.functions.items) |function| {
+        for (function.body.?.instructions, 0..) |instruction, index| {
+            const operand = switch (instruction.op) {
+                .string_to_bytes, .bytes_to_string => |value| value,
+                else => continue,
+            };
+            try std.testing.expect(@backingInt(operand) < index);
+            try std.testing.expect(instruction.span.end > instruction.span.start);
+            conversions += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 5), conversions);
+}
+
+test "string byte conversion builtins lower exact typed copy operations under OOM" {
+    try testStringByteConversions(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testStringByteConversions, .{});
+}
+
+test "string byte conversion builtins reject arity and inexact operands including TypeOf" {
+    for ([_][]const u8{
+        "@stringToBytes()",                "@stringToBytes(\"a\",\"b\")", "@stringFromBytes()",            "@stringFromBytes([],[])",
+        "@stringToBytes(1)",               "@stringToBytes(['a'])",       "@stringFromBytes(\"a\")",       "@stringFromBytes(@as([]u16,[1]))",
+        "@stringFromBytes(@as([]i8,[1]))", "@stringFromBytes(['a'])",     "@stringToBytes(@as([]u8,[1]))", "@stringFromBytes(256)",
+    }, 0..) |expression_text, case_index| {
+        for ([_]bool{ false, true }) |query| {
+            const source = try std.fmt.allocPrint(std.testing.allocator, "let main:()={{@println({s}{s}{s})}}", .{ if (query) "@TypeOf(" else "", expression_text, if (query) ")" else "" });
+            defer std.testing.allocator.free(source);
+            var module = try Module.init(std.testing.allocator, "invalid-string-byte-conversion.nov", source);
+            defer module.deinit();
+            var sema = try Lowering.lower(&module);
+            defer sema.deinit();
+            errdefer std.debug.print("conversion should fail: {s}\n", .{source});
+            try std.testing.expect(module.hasErrors());
+            try std.testing.expect(!sema.lowering_complete);
+            if (case_index < 4) {
+                try std.testing.expectEqual(Module.Diagnostic.Tag.argument_count_mismatch, module.diagnostics.items[0].tag);
+            }
+        }
+    }
+}
+
+test "string byte conversion TypeOf validates without conversions calls captures or loans" {
+    var module = try Module.init(std.testing.allocator, "string-byte-typeof.nov",
+        \\let effect:()->string="effect"
+        \\let main:()={let mut text="a"
+        \\let mut bytes:[]u8=[255]
+        \\let inspect=(){let a:@TypeOf(@stringToBytes(text))=[]
+        \\let b:@TypeOf(@stringFromBytes(bytes))=""
+        \\let c:@TypeOf(@stringToBytes(effect()))=[]
+        \\let invalid:@TypeOf(@stringFromBytes([255,192,128]))=""
+        \\let d:@TypeOf(@stringFromBytes({let p=&bytes
+        \\p.*}))=""
+        \\}
+        \\let p=&bytes
+        \\inspect()
+        \\@println(p.*)}
+    );
+    defer module.deinit();
+    errdefer std.debug.print("conversion TypeOf: {any} AST: {any}\n", .{ module.diagnostics.items, module.source.ast.errors });
+    var sema = try Lowering.lower(&module);
+    defer sema.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+    var calls: usize = 0;
+    for (sema.ir.functions.items) |function| {
+        try std.testing.expectEqual(@as(usize, 0), function.captures.len);
+        if (function.body) |body| for (body.instructions) |instruction| {
+            try std.testing.expect(!instruction.boxed);
+            try std.testing.expect(instruction.op != .string_to_bytes and instruction.op != .bytes_to_string);
+            try std.testing.expect(instruction.op != .capture_value and instruction.op != .capture_cell);
+            if (instruction.op == .call) calls += 1;
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 1), calls);
+}
+
+test "string byte conversion builtins remain forbidden in global initializers" {
+    for ([_][]const u8{
+        "let bytes=@stringToBytes(\"a\")",
+        "let text=@stringFromBytes([97])",
+        "let mut bytes:[]u8=@stringToBytes(\"a\")",
+        "let mut text:string=@stringFromBytes([97])",
+    }) |source| {
+        var module = try Module.init(std.testing.allocator, "global-string-byte-conversion.nov", source);
+        defer module.deinit();
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        try std.testing.expect(module.hasErrors());
+        try std.testing.expect(!sema.lowering_complete);
+        for (sema.ir.functions.items) |function| if (function.body) |body| for (body.instructions) |instruction| {
+            try std.testing.expect(instruction.op != .string_to_bytes and instruction.op != .bytes_to_string);
+        };
+    }
+}
+
+test "string byte conversion terminal operands emit no conversion" {
+    for ([_][]const u8{
+        "let f:()->bool=@stringToBytes(@panic(\"stop\"))",
+        "let f:()->bool=@stringFromBytes(@panic(\"stop\"))",
+        "let f:()->string=@stringFromBytes({return \"done\"})",
+        "let f:()->[]u8=@stringToBytes({return []})",
+    }) |source| {
+        var module = try Module.init(std.testing.allocator, "terminal-string-byte-conversion.nov", source);
+        defer module.deinit();
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expect(sema.lowering_complete);
+        try sema.ir.verify();
+        for (sema.ir.functions.items) |function| if (function.body) |body| for (body.instructions) |instruction| {
+            try std.testing.expect(instruction.op != .string_to_bytes and instruction.op != .bytes_to_string);
+        };
     }
 }
 

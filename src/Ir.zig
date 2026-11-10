@@ -87,6 +87,11 @@ pub const Operation = union(enum) {
     field_store: struct { slot: ValueId, index: u32, value: ValueId, path: []const u32 = &.{} },
     /// Default structural formatting; strings and runes retain their raw UTF8 bytes.
     to_string: ValueId,
+    /// Copy the exact string bytes into independent []u8 storage, including NUL.
+    string_to_bytes: ValueId,
+    /// Strictly validate UTF8, then copy []u8 into independent string storage.
+    /// Malformed input panics even when invoked without frontend validation.
+    bytes_to_string: ValueId,
     array_literal: []const ValueId,
     /// Eager recursive array backing copy, including record fields/elements.
     /// Immutable strings and closure environments remain shared.
@@ -1320,6 +1325,14 @@ fn validateBodyStructure(self: *const Ir, function: Function, body: Body) Verify
                 if (ty != .string) return error.InvalidOperation;
                 const operand = try operandType(body, value, i);
                 if (!try printability.check(self, operand)) return error.InvalidOperation;
+            },
+            .string_to_bytes, .bytes_to_string => |value| {
+                const operand = self.getType(try operandType(body, value, i)).?;
+                const bytes = if (instruction.op == .string_to_bytes) ty else operand;
+                const text = if (instruction.op == .string_to_bytes) operand else ty;
+                if (text != .string or bytes != .array) return error.OperandTypeMismatch;
+                const element = self.getType(bytes.array).?;
+                if (element != .integer or element.integer.bits != 8 or element.integer.signedness != .unsigned) return error.OperandTypeMismatch;
             },
             .array_literal => |elements| {
                 if (ty != .array) return error.InvalidOperation;
@@ -2741,6 +2754,55 @@ test "default printing rejects nested functions ranges and void" {
     var printability: DefaultPrintability = .{};
     defer printability.deinit(ir.allocator);
     try std.testing.expect(!try printability.check(&ir, unit));
+}
+
+test "string byte copies verify exact types prior operands spans and slot isolation" {
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    ir.source_len = 1;
+    const make = TestFunctions.instruction;
+    const string = try ir.internType(.string);
+    const byte = try ir.internType(.{ .integer = .{ .bits = 8, .signedness = .unsigned } });
+    const signed = try ir.internType(.{ .integer = .{ .bits = 8, .signedness = .signed } });
+    const wide = try ir.internType(.{ .integer = .{ .bits = 16, .signedness = .unsigned } });
+    const bytes = try ir.internType(.{ .array = byte });
+    const signature = try ir.internType(.{ .function = .{ .params = &.{string}, .result = string } });
+    const function = try ir.addFunction("copy", signature, .{ .start = 0, .end = 1 });
+    const body = [_]Instruction{
+        make(string, .{ .parameter = 0 }),
+        make(string, .{ .local_slot = @fromBackingInt(0) }),
+        make(bytes, .{ .string_to_bytes = @fromBackingInt(0) }),
+        make(string, .{ .bytes_to_string = @fromBackingInt(2) }),
+    };
+    try ir.setFunctionBody(function, &body, @fromBackingInt(3));
+    const owned = @constCast(ir.functions.items[0].body.?.instructions);
+    for ([_]TypeId{ signed, wide, string, bytes }) |element| {
+        owned[2].ty = try ir.internType(.{ .array = element });
+        try std.testing.expectError(error.OperandTypeMismatch, ir.verify());
+    }
+    owned[2] = body[2];
+    owned[2].ty = string;
+    try std.testing.expectError(error.OperandTypeMismatch, ir.verify());
+    owned[2] = body[2];
+    for ([_]u32{ 1, 2, 99 }) |value| {
+        owned[2].op.string_to_bytes = @fromBackingInt(value);
+        try std.testing.expectError(error.InvalidValueId, ir.verify());
+    }
+    owned[2] = body[2];
+    owned[3].op.bytes_to_string = @fromBackingInt(0);
+    try std.testing.expectError(error.OperandTypeMismatch, ir.verify());
+    for ([_]u32{ 1, 3, 99 }) |value| {
+        owned[3].op.bytes_to_string = @fromBackingInt(value);
+        try std.testing.expectError(error.InvalidValueId, ir.verify());
+    }
+    owned[3] = body[3];
+    owned[3].ty = bytes;
+    try std.testing.expectError(error.OperandTypeMismatch, ir.verify());
+    owned[3] = body[3];
+    owned[3].span.end = 2;
+    try std.testing.expectError(error.InvalidSourceSpan, ir.verify());
+    owned[3] = body[3];
+    try ir.verify();
 }
 
 test "to_string verifies printable prior operands result types spans and slot isolation" {

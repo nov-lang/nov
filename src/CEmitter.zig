@@ -248,6 +248,7 @@ fn write(allocator: std.mem.Allocator, ir: *const Ir, origins: []const ?Origin, 
         try w.writeByte('\n');
         try w.writeAll(@embedFile("runtime/array.h"));
         if (usesStringConcat(ir)) try w.writeAll(@embedFile("runtime/string.h"));
+        if (usesStringByteCopies(ir)) try w.writeAll(@embedFile("runtime/string_bytes.h"));
         try writeStringConversions(ir, w);
     }
     try writeStringScalarRuntime(ir, w);
@@ -427,6 +428,118 @@ fn write(allocator: std.mem.Allocator, ir: *const Ir, origins: []const ?Origin, 
         try writeBody(allocator, ir, root_counts, w, function);
         try w.writeAll("}\n");
     }
+}
+
+fn emitStringByteCopyTest(allocator: std.mem.Allocator) ![]u8 {
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    const string = try ir.internType(.string);
+    const byte = try ir.internType(.{ .integer = .{ .bits = 8, .signedness = .unsigned } });
+    const bytes = try ir.internType(.{ .array = byte });
+    const span: Ir.Span = .{ .start = 0, .end = 0 };
+    const encode_ty = try ir.internType(.{ .function = .{ .params = &.{string}, .result = bytes } });
+    const encode = try ir.addFunction("encode", encode_ty, span);
+    try ir.setFunctionBody(encode, &.{
+        .{ .ty = string, .span = span, .op = .{ .parameter = 0 } },
+        .{ .ty = bytes, .span = span, .op = .{ .string_to_bytes = @fromBackingInt(0) } },
+    }, @fromBackingInt(1));
+    const decode_ty = try ir.internType(.{ .function = .{ .params = &.{bytes}, .result = string } });
+    const decode = try ir.addFunction("decode", decode_ty, span);
+    try ir.setFunctionBody(decode, &.{
+        .{ .ty = bytes, .span = span, .op = .{ .parameter = 0 } },
+        .{ .ty = string, .span = span, .op = .{ .bytes_to_string = @fromBackingInt(0) } },
+    }, @fromBackingInt(1));
+    const roundtrip = try ir.addFunction("roundtrip", decode_ty, span);
+    try ir.setFunctionBody(roundtrip, &.{
+        .{ .ty = bytes, .span = span, .op = .{ .parameter = 0 } },
+        .{ .ty = string, .span = span, .op = .{ .bytes_to_string = @fromBackingInt(0) } },
+        .{ .ty = bytes, .span = span, .op = .{ .string_to_bytes = @fromBackingInt(1) } },
+        .{ .ty = string, .span = span, .op = .{ .bytes_to_string = @fromBackingInt(2) } },
+    }, @fromBackingInt(3));
+    const index = try ir.internType(.{ .integer = .{ .bits = Ir.native_pointer_bits, .signedness = .signed } });
+    const zero = try ir.internConstant(.{ .ty = index, .value = .{ .signed_integer = 0 } });
+    const x = try ir.internConstant(.{ .ty = byte, .value = .{ .unsigned_integer = 'X' } });
+    const edit_ty = try ir.internType(.{ .function = .{ .params = &.{string}, .result = string } });
+    for ([_]bool{ false, true }) |take| {
+        const edit = try ir.addFunction(if (take) "take" else "edit", edit_ty, span);
+        try ir.setFunctionBody(edit, &.{
+            .{ .ty = string, .span = span, .op = .{ .parameter = 0 } },
+            .{ .ty = bytes, .span = span, .op = .{ .string_to_bytes = @fromBackingInt(0) } },
+            .{ .ty = index, .span = span, .op = .{ .constant = zero } },
+            .{ .ty = byte, .span = span, .op = .{ .constant = x } },
+            .{ .ty = bytes, .span = span, .op = .{ .array_set = .{ .array = @fromBackingInt(1), .index = @fromBackingInt(2), .value = @fromBackingInt(3) } } },
+            .{ .ty = string, .span = span, .op = .{ .bytes_to_string = @fromBackingInt(if (take) 4 else 1) } },
+        }, @fromBackingInt(5));
+    }
+    return emit(allocator, &ir, null);
+}
+
+test "string byte copies direct source free IR independent storage strict UTF8 forced GC O0 O3 OOM" {
+    const library = try emitStringByteCopyTest(test_gpa);
+    defer test_gpa.free(library);
+    try runApprovedHelperHarness(library,
+        \\int main(void) {
+        \\    nov_rt_heap.collect_every_allocation = 1;
+        \\    nov_string text = {0}, copy = {0}; nov_array bytes = {0}, other = {0};
+        \\    void **roots[] = {&text.owner, &copy.owner, &bytes.data, &other.data};
+        \\    nov_gc_roots frame = {0}; nov_gc_push(&nov_rt_heap, &frame, roots, 4);
+        \\    static const unsigned char expected[] = {0,0x7f,0xc2,0x80,0xdf,0xbf,0xe0,0xa0,0x80,0xed,0x9f,0xbf,0xee,0x80,0x80,0xef,0xbf,0xbf,0xf0,0x90,0x80,0x80,0xf4,0x8f,0xbf,0xbf,0};
+        \\    bytes = nov_encode((nov_string){NULL, expected, sizeof expected});
+        \\    if (bytes.len != sizeof expected || bytes.cap != bytes.len || memcmp(bytes.data, expected, sizeof expected)) return 1;
+        \\    text = nov_decode(bytes); other = nov_encode(text); copy = nov_roundtrip(bytes);
+        \\    if (text.len != sizeof expected || copy.len != sizeof expected || memcmp(copy.data, expected, sizeof expected)) return 2;
+        \\    if (text.owner == bytes.data || other.data == bytes.data || other.data == text.owner || copy.owner == text.owner) return 3;
+        \\    ((unsigned char *)bytes.data)[0] = 'X'; ((unsigned char *)other.data)[1] = 'Y';
+        \\    if (memcmp(text.data, expected, sizeof expected) || memcmp(copy.data, expected, sizeof expected)) return 4;
+        \\    text = nov_edit(copy);
+        \\    if (text.len != sizeof expected || memcmp(text.data, expected, sizeof expected)) return 9;
+        \\    text = nov_take(copy);
+        \\    if (text.data[0] != 'X' || memcmp(text.data + 1, expected + 1, sizeof expected - 1) || memcmp(copy.data, expected, sizeof expected)) return 10;
+        \\    bytes = other = (nov_array){0}; text = (nov_string){0}; nov_gc_collect(&nov_rt_heap);
+        \\    if (memcmp(copy.data, expected, sizeof expected)) return 5;
+        \\    /* Copy a managed subview, not its owner's prefix or suffix. */
+        \\    text = (nov_string){copy.owner, copy.data + 2, copy.len - 3}; bytes = nov_encode(text);
+        \\    if (bytes.len != sizeof expected - 3 || memcmp(bytes.data, expected + 2, bytes.len)) return 6;
+        \\    fail_allocations = 1;
+        \\    if (nov_encode((nov_string){0}).len || nov_decode((nov_array){0}).len || nov_roundtrip((nov_array){0}).len) return 7;
+        \\    nov_gc_pop(&nov_rt_heap, &frame); nov_gc_collect(&nov_rt_heap);
+        \\    if (nov_rt_heap.frames || nov_rt_heap.live_objects) return 8;
+        \\    nov_gc_shutdown(&nov_rt_heap); return 0;
+        \\}
+    , false);
+    for ([_][]const u8{
+        "int main(void) { fail_allocations=1; (void)nov_encode((nov_string){NULL,(const unsigned char *)\"x\",1}); return 0; }",
+        "int main(void) { nov_array bytes=nov_encode((nov_string){NULL,(const unsigned char *)\"x\",1}); fail_allocations=1; (void)nov_decode(bytes); return 0; }",
+        "int main(void) { (void)nov_encode((nov_string){NULL,NULL,UINTPTR_MAX}); return 0; }",
+    }) |harness| try runApprovedHelperHarness(library, harness, true);
+    // Each malformed input must fail in the primitive, without a library guard.
+    for ([_][]const u8{
+        "0x80",           "0xc0,0x80",           "0xc1,0xbf",           "0xc2",                "0xe0,0x9f,0xbf",
+        "0xed,0xa0,0x80", "0xf0,0x8f,0xbf,0xbf", "0xf4,0x90,0x80,0x80", "0xf5,0x80,0x80,0x80", "0xff",
+        "0xe2,0x28,0xa1", "0xf0,0x90,0x80",
+    }) |bad| {
+        const c = try std.fmt.allocPrint(test_gpa, "{s}\nint main(void) {{ unsigned char bad[] = {{{s}}}; (void)nov_decode((nov_array){{bad,sizeof bad,sizeof bad}}); return 0; }}\n", .{ library, bad });
+        defer test_gpa.free(c);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode|
+            try compileAndRunMode(c, "typedef int nonempty;", 1, "", "panic: invalid UTF-8\n", mode);
+    }
+    try TestAllocations.checkAllAllocationFailures(test_gpa, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const c = try emitStringByteCopyTest(allocator);
+            defer allocator.free(c);
+        }
+    }.run, .{});
+}
+
+fn usesStringByteCopies(ir: *const Ir) bool {
+    for (ir.functions.items) |function| {
+        const body = function.body orelse continue;
+        for (body.instructions) |instruction| switch (instruction.op) {
+            .string_to_bytes, .bytes_to_string => return true,
+            else => {},
+        };
+    }
+    return false;
 }
 
 fn usesElementLayout(ir: *const Ir, element: Ir.TypeId) bool {
@@ -1323,7 +1436,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
             value_used[@backingInt(r.start)] = true;
             value_used[@backingInt(r.end)] = true;
         },
-        .range_start, .range_end, .range_inclusive, .array_clone, .array_len, .iteration_len, .to_string => |value| value_used[@backingInt(value)] = true,
+        .range_start, .range_end, .range_inclusive, .array_clone, .array_len, .iteration_len, .to_string, .string_to_bytes, .bytes_to_string => |value| value_used[@backingInt(value)] = true,
         .string_slice => |r| {
             value_used[@backingInt(r.base)] = true;
             if (r.start) |value| value_used[@backingInt(value)] = true;
@@ -1756,6 +1869,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
                 .constant => |id| try writeConstant(w, ir.getConstant(id).?, ty),
                 .parameter => |index| try w.print("p{d}", .{index}),
                 .local_slot, .local_load => |value| try w.print("v{d}", .{@backingInt(value)}),
+                .bytes_to_string => |value| try w.print("nov_bytes_to_string(v{d})", .{@backingInt(value)}),
                 .to_string => |value| {
                     const source_ty = body.instructions[@backingInt(value)].ty;
                     switch (ir.getType(source_ty).?) {
@@ -1853,7 +1967,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
                 }
             },
             .array_contains => |r| try w.print("nov_array_contains_{d}(v{d}, v{d})", .{ @backingInt(body.instructions[@backingInt(r.value)].ty), @backingInt(r.value), @backingInt(r.array) }),
-            .array_literal, .array_clone, .array_set, .array_append, .to_string, .field_store => unreachable,
+            .array_literal, .array_clone, .array_set, .array_append, .to_string, .string_to_bytes, .bytes_to_string, .field_store => unreachable,
             .constant => |id| try writeConstant(w, ir.constants.items[@backingInt(id)], ty),
             .parameter => |index| try w.print("p{d}", .{index}),
             .local_slot, .local_load => |value| try w.print("v{d}", .{@backingInt(value)}),
@@ -2218,7 +2332,7 @@ const ArrayTransfers = struct {
         for (body.instructions, 0..) |instruction, i| {
             detached[i] = switch (instruction.op) {
                 // These operations either copy or use this same proof for inputs.
-                .array_clone, .array_literal, .array_set, .array_append => true,
+                .array_clone, .array_literal, .array_set, .array_append, .string_to_bytes => true,
                 .record_init => |fields| blk: {
                     for (fields) |field| {
                         if (try ir.needsArrayCopy(body.instructions[@backingInt(field)].ty) and !self.canTake(body, field, i)) break :blk false;
@@ -2326,6 +2440,7 @@ fn writeArrayValue(ir: *const Ir, w: *std.Io.Writer, body: Ir.Body, transfers: A
             }
             return;
         },
+        .string_to_bytes => |value| try w.print("nov_string_to_bytes(v{d})", .{@backingInt(value)}),
         .array_clone => |value| {
             try w.print("nov_copy_{d}(v{d})", .{ @backingInt(instruction.ty), @backingInt(value) });
         },
@@ -9647,6 +9762,166 @@ fn runApprovedHelperHarness(library: []const u8, harness: []const u8, oom: bool)
     defer test_gpa.free(c);
     for ([_][]const u8{ "-O0", "-O3" }) |mode|
         try compileAndRunMode(c, "typedef int nonempty_translation_unit;", if (oom) 1 else 0, "", if (oom) "panic: GC allocation failed\n" else "", mode);
+}
+
+const string_byte_stdlib_source_free =
+    \\let std = @import("std")
+    \\let encode: (text: string) -> []u8 = std.string.toBytes(text)
+    \\let decode: (bytes: []u8) -> string = std.string.fromBytes(bytes).unwrapOr("rejected")
+    \\let accepts: (bytes: []u8) -> bool = match std.string.fromBytes(bytes) {
+    \\    .ok => true
+    \\    .err => |error| match error { .invalidUtf8 => false }
+    \\}
+    \\let retainedText: () -> string = {
+    \\    let bytes = std.string.toBytes("prefix:" + "é😀\0:suffix")
+    \\    std.string.fromBytes(bytes).unwrapOr("bad")
+    \\}
+    \\let retainedBytes: () -> []u8 = {
+    \\    let text = "prefix:" + "é😀\0:suffix"
+    \\    std.string.toBytes(text[7..10])
+    \\}
+;
+
+test "string byte copies actual stdlib source free retained owners subviews forced GC O0 O3 OOM" {
+    const library = try emitApprovedHelperSourceFree(test_gpa, string_byte_stdlib_source_free);
+    defer test_gpa.free(library);
+    try runApprovedHelperHarness(library,
+        \\int main(void) {
+        \\    nov_rt_heap.collect_every_allocation = 1;
+        \\    nov_array bytes = {0}, second = {0}; nov_string text = {0}, snapshot = {0};
+        \\    void **roots[] = {&bytes.data, &second.data, &text.owner, &snapshot.owner};
+        \\    nov_gc_roots frame = {0}; nov_gc_push(&nov_rt_heap, &frame, roots, 4);
+        \\    static const unsigned char expected[] = {0xc3,0xa9,0xf0,0x9f,0x98,0x80,0};
+        \\    bytes = nov_retainedBytes(); text = nov_retainedText();
+        \\    nov_gc_collect(&nov_rt_heap);
+        \\    if (bytes.len != sizeof expected || memcmp(bytes.data, expected, sizeof expected)) return 1;
+        \\    if (text.len != 21 || memcmp(text.data + 7, expected, sizeof expected)) return 2;
+        \\    snapshot = nov_decode(bytes); second = nov_encode(snapshot);
+        \\    if (snapshot.len != sizeof expected || memcmp(snapshot.data, expected, sizeof expected)) return 3;
+        \\    if (snapshot.owner == bytes.data || second.data == bytes.data || second.data == snapshot.owner) return 4;
+        \\    ((unsigned char *)bytes.data)[0] = 0xff; ((unsigned char *)second.data)[0] = 'X';
+        \\    if (nov_accepts(bytes) || memcmp(snapshot.data, expected, sizeof expected)) return 5;
+        \\    nov_string rejected = nov_decode(bytes);
+        \\    if (rejected.len != 8 || memcmp(rejected.data, "rejected", 8)) return 9;
+        \\    text = (nov_string){0}; bytes = second = (nov_array){0}; nov_gc_collect(&nov_rt_heap);
+        \\    if (memcmp(snapshot.data, expected, sizeof expected)) return 6;
+        \\    for (int i = 0; i < 32; ++i) { bytes = nov_encode(snapshot); text = nov_decode(bytes); }
+        \\    fail_allocations = 1;
+        \\    if (nov_encode((nov_string){0}).len || nov_decode((nov_array){0}).len || !nov_accepts((nov_array){0})) return 7;
+        \\    nov_gc_pop(&nov_rt_heap, &frame); nov_gc_collect(&nov_rt_heap);
+        \\    if (nov_rt_heap.frames || nov_rt_heap.live_objects) return 8;
+        \\    nov_gc_shutdown(&nov_rt_heap); return 0;
+        \\}
+    , false);
+    for ([_][]const u8{
+        "int main(void) { fail_allocations=1; (void)nov_encode((nov_string){NULL,(const unsigned char *)\"x\",1}); return 0; }",
+        "int main(void) { nov_array bytes=nov_encode((nov_string){NULL,(const unsigned char *)\"x\",1}); fail_allocations=1; (void)nov_decode(bytes); return 0; }",
+    }) |harness| try runApprovedHelperHarness(library, harness, true);
+}
+
+test "string byte copies actual stdlib differential UTF8 byte boundaries recoverable invalid forced GC O0 O3" {
+    const library = try emitApprovedHelperSourceFree(test_gpa, string_byte_stdlib_source_free);
+    defer test_gpa.free(library);
+    // Probe the same runtime helper used by the builtin. Only its invalid-UTF8
+    // panic is intercepted; the stdlib path retains all real panic behavior.
+    // The helper registers no frames, so a rejected probe can safely longjmp.
+    const marker = "nov_rt_panic(\"invalid UTF-8\")";
+    const runtime = @embedFile("runtime/string_bytes.h");
+    const start = std.mem.indexOf(u8, runtime, "static inline nov_string nov_bytes_to_string").?;
+    const renamed = try std.mem.replaceOwned(u8, test_gpa, runtime[start..], "nov_bytes_to_string", "probe_bytes_to_string");
+    defer test_gpa.free(renamed);
+    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, renamed, marker));
+    const probe = try std.mem.replaceOwned(u8, test_gpa, renamed, marker, "test_invalid_utf8()");
+    defer test_gpa.free(probe);
+    var out = std.Io.Writer.Allocating.init(test_gpa);
+    defer out.deinit();
+    const w = &out.writer;
+    try w.writeAll(
+        \\#include <setjmp.h>
+        \\static jmp_buf utf8_probe;
+        \\static _Noreturn void test_invalid_utf8(void) { longjmp(utf8_probe, 1); }
+        \\
+    );
+    try w.writeAll(library);
+    try w.writeAll(probe);
+    // Independent Zig UTF8 validation supplies an oracle for every lead/second
+    // byte pair at each length, with both continuation-byte extremes as tails.
+    try w.writeAll("\nstatic const unsigned char expected[14][8192] = {\n");
+    for (0..14) |family| {
+        try w.writeAll("{");
+        for (0..8192) |octet| {
+            var mask: u8 = 0;
+            for (0..8) |bit| {
+                const n = octet * 8 + bit;
+                const a: u8 = @intCast(n >> 8);
+                const b: u8 = @intCast(n & 255);
+                const tail: u8 = if (family < 4) 0x80 else 0xbf;
+                const bytes: [6]u8 = switch (family) {
+                    0...5 => .{ a, b, tail, tail, 0, 0 },
+                    6 => .{ 0xe1, a, b, 0, 0, 0 },
+                    7 => .{ 0xed, a, b, 0, 0, 0 },
+                    8 => .{ 0xf0, 0x90, a, b, 0, 0 },
+                    9 => .{ 0xf4, 0x8f, a, b, 0, 0 },
+                    10 => .{ 'A', 0, a, b, 0, 0 },
+                    11 => .{ 0xc2, 0x80, a, b, 0, 0 },
+                    12 => .{ 0xed, 0x9f, 0xbf, a, b, 0 },
+                    13 => .{ 0xf4, 0x8f, 0xbf, 0xbf, a, b },
+                    else => unreachable,
+                };
+                const len = switch (family) {
+                    0...3 => family + 1,
+                    4...5 => family - 1,
+                    6...7 => 3,
+                    8...11 => 4,
+                    12 => 5,
+                    13 => 6,
+                    else => unreachable,
+                };
+                if (std.unicode.utf8ValidateSlice(bytes[0..len])) mask |= @as(u8, 1) << @intCast(bit);
+            }
+            try w.print("{d},", .{mask});
+        }
+        try w.writeAll("},\n");
+    }
+    try w.writeAll(
+        \\};
+        \\static bool strict_accepts(nov_array bytes) {
+        \\    if (setjmp(utf8_probe)) return false;
+        \\    (void)probe_bytes_to_string(bytes);
+        \\    return true;
+        \\}
+        \\int main(void) {
+        \\    nov_rt_heap.collect_every_allocation = 1;
+        \\    nov_array bytes = {0}; void **roots[] = {&bytes.data};
+        \\    nov_gc_roots frame = {0}; nov_gc_push(&nov_rt_heap, &frame, roots, 1);
+        \\    bytes = nov_encode((nov_string){NULL,(const unsigned char *)"abcdef",6});
+        \\    static const unsigned lengths[] = {1,2,3,4,3,4,3,3,4,4,4,4,5,6};
+        \\    for (unsigned family = 0; family < 14; ++family) {
+        \\        bytes.len = lengths[family];
+        \\        for (unsigned n = 0; n < 65536; ++n) {
+        \\            unsigned char *data = (unsigned char *)bytes.data;
+        \\            const unsigned char a = (unsigned char)(n >> 8), b = (unsigned char)n;
+        \\            switch (family) {
+        \\                case 6: case 7: data[0]=family==6?0xe1:0xed; data[1]=a; data[2]=b; break;
+        \\                case 8: case 9: data[0]=family==8?0xf0:0xf4; data[1]=family==8?0x90:0x8f; data[2]=a; data[3]=b; break;
+        \\                case 10: case 11: data[0]=family==10?'A':0xc2; data[1]=family==10?0:0x80; data[2]=a; data[3]=b; break;
+        \\                case 12: data[0]=0xed; data[1]=0x9f; data[2]=0xbf; data[3]=a; data[4]=b; break;
+        \\                case 13: data[0]=0xf4; data[1]=0x8f; data[2]=data[3]=0xbf; data[4]=a; data[5]=b; break;
+        \\                default: data[0]=a; data[1]=b; data[2]=data[3]=family<4?0x80:0xbf; break;
+        \\            }
+        \\            const bool oracle = (expected[family][n >> 3] >> (n & 7)) & 1;
+        \\            if (nov_accepts(bytes) != oracle) return 1;
+        \\            if (strict_accepts(bytes) != oracle) return 2;
+        \\            if (nov_rt_heap.frames != &frame) return 3;
+        \\        }
+        \\    }
+        \\    nov_gc_pop(&nov_rt_heap, &frame); nov_gc_collect(&nov_rt_heap);
+        \\    if (nov_rt_heap.live_objects) return 4;
+        \\    nov_gc_shutdown(&nov_rt_heap); return 0;
+        \\}
+    );
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(out.written(), "typedef int nonempty;", 0, "", "", mode);
 }
 
 const string_join_source_free =

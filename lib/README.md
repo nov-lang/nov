@@ -345,6 +345,49 @@ substantial overhead. Further optimization remains **PAUSED**. See
 and generic callbacks, stable order, empty inputs, left folds, recursive copies,
 shared closure environments and eager argument order.
 
+## String conversions
+
+- `std.string.Utf8Error = enum { invalidUtf8, }`
+- `std.string.toBytes(text: string) -> []u8`
+- `std.string.fromBytes(bytes: []u8) -> std.Result(string, std.string.Utf8Error)`
+
+```nov
+let bytes = std.string.toBytes("é😀\0")
+@assert(bytes.len == 7)
+let text = std.string.fromBytes(bytes).unwrapOr("")
+@assert(text == "é😀\0" and text.len == 3)
+@assert(std.string.fromBytes([0xED, 0xA0, 0x80]).isErr())
+```
+
+`toBytes` copies the exact UTF-8 encoding into independent mutable array storage.
+`fromBytes` first validates the entire input using a private ordinary Nov byte loop,
+then copies valid input into independently owned immutable UTF-8 string storage.
+Empty input, ASCII including NUL, and all Unicode scalars through U+10FFFF are
+accepted. Stray continuations, C0/C1 and F5..FF leads, overlong encodings,
+surrogates, out-of-range scalars, bad continuations and truncation return
+`.err[.invalidUtf8]` without calling the panicking primitive. Valid input returns
+`.ok[text]`. Allocation failure can still panic normally.
+
+Neither direction mutates its input or shares mutable byte storage with it.
+Later array writes cannot change a string, and returned bytes cannot change their
+source string. Results remain valid after source scope exit, rebinding and GC
+churn, including conversion of string slices. NUL is ordinary data; no terminator,
+normalization, case folding or grapheme processing is added. Array `.len` counts
+bytes while string `.len` counts Unicode scalars.
+
+Use `.!` in a function returning a compatible Result to propagate `Utf8Error`, or
+match `.ok`/`.err` and the `.invalidUtf8` enum case. The wrappers are ordinary
+first-class functions usable in function variables and `@TypeOf` queries.
+
+Low-level `@stringToBytes(string) -> []u8` and `@stringFromBytes([]u8) -> string`
+are copying runtime intrinsics. Direct `@stringFromBytes` **panics on invalid
+UTF-8 in all build modes**; arbitrary input should use the recoverable public
+wrapper instead. Allocation failures retain normal panic semantics. These narrow
+conversions do not enable general casts or arbitrary compile-time execution;
+`@as` is still only expected-type ascription. A UTF-8 editing builder and
+performance optimizations remain deferred. See `examples/string-conversions.nov`
+for a runnable example with exact stdout and nine tests.
+
 ## String search
 
 - `std.string.startsWith(text: string, prefix: string) -> bool`
@@ -371,7 +414,7 @@ let index = std.string.find("é😀z", "z")
 These are ordinary Nov functions implemented using existing scalar indexing,
 slices and zip loops. They may repeatedly scan UTF-8; no efficient-search
 complexity is promised yet, and optimization remains paused. They do not add
-mutable strings, byte conversions, normalization or case folding. See
+mutable strings, normalization or case folding; byte conversions are separate APIs above. See
 `examples/string-search.nov` for a runnable example and five tests.
 
 ## String splitting

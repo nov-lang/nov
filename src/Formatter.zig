@@ -234,7 +234,7 @@ fn checkSupported(ast: Ast) !void {
             },
             .builtin_literal => {
                 const name = ast.tokenSlice(main);
-                if (!std.mem.eql(u8, name, "@print") and !std.mem.eql(u8, name, "@println") and !std.mem.eql(u8, name, "@as") and !std.mem.eql(u8, name, "@panic") and !std.mem.eql(u8, name, "@assert") and !std.mem.eql(u8, name, "@This") and !std.mem.eql(u8, name, "@TypeOf") and !std.mem.eql(u8, name, "@import"))
+                if (!std.mem.eql(u8, name, "@print") and !std.mem.eql(u8, name, "@println") and !std.mem.eql(u8, name, "@as") and !std.mem.eql(u8, name, "@panic") and !std.mem.eql(u8, name, "@assert") and !std.mem.eql(u8, name, "@This") and !std.mem.eql(u8, name, "@TypeOf") and !std.mem.eql(u8, name, "@stringToBytes") and !std.mem.eql(u8, name, "@stringFromBytes") and !std.mem.eql(u8, name, "@import"))
                     return error.UnsupportedSyntax;
             },
             .@"break" => if (data.lhs != 0) return error.UnsupportedSyntax,
@@ -967,6 +967,14 @@ test "quoted interpolation formatting preserves nested literal bytes and idempot
     for ([_][]const u8{ "\"{\"a\"}\"", "\"{greet(\"Ada\")}\"", "\"{'é'}\"", "\"{\"nested {\"value\"}\"}\"" }) |literal| {
         try std.testing.expect(std.mem.indexOf(u8, formatted, literal) != null);
     }
+}
+
+test "string byte conversions format nested calls and survive OOM" {
+    try expectFormatted(
+        "let encode:(text:string)->[]u8=@stringToBytes(text)\nlet decode:(bytes:[]u8)->string=@stringFromBytes(bytes)",
+        "let encode: (text: string) -> []u8 = @stringToBytes(text)\nlet decode: (bytes: []u8) -> string = @stringFromBytes(bytes)\n",
+    );
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{"let run:()={let bytes=@stringToBytes(\"é\\0\")\n@println(@stringFromBytes(bytes))}"});
 }
 
 test "TypeOf formatting preserves annotations type arguments and interpolation" {

@@ -458,7 +458,49 @@ strings (and `void *data` for arrays), initialized before frame registration.
 Returning a view pops the frame without an intervening safepoint, just like arrays.
 Immutable literal-only globals require no GC registration or eager initialization.
 The internal C ABI trusts lengths and valid UTF-8; it is not a checked foreign API.
-UTF-8 validation occurs at literal checking, and concatenation preserves it.
+UTF-8 validation occurs at literal checking and byte-to-string conversion;
+concatenation preserves it.
+
+### Copying between strings and bytes
+
+IR `string_to_bytes` (`@stringToBytes`) copies a string's exact byte view into
+independent `[]u8` backing. IR `bytes_to_string` (`@stringFromBytes`) strictly
+validates the entire byte array, then copies it into an independent string owner.
+The helpers in `string_bytes.h` preserve embedded NUL and do not add a terminator,
+normalize Unicode, or reuse input storage. A string subview copies only its view,
+not the owner's prefix or suffix. Empty inputs return empty values without
+allocation or dereferencing their data pointers.
+
+The strict primitive rejects stray continuations, illegal leads, truncated
+sequences, overlong encodings, surrogates, and code points above U+10FFFF with
+`panic: invalid UTF-8`. Validation precedes its output allocation, including for
+direct builtin calls. The public `std.string.fromBytes` first validates in Nov
+and returns `.err[Utf8Error.invalidUtf8]` for malformed input without entering the
+primitive. That recoverable error is not an OOM guarantee: ordinary array-value
+argument/snapshot copies can still allocate and fail before validation.
+
+Each runtime helper allocates at most one exact-length, byte-aligned backing with
+no traced fields; the array result has capacity equal to its length. Array size
+checks and GC allocation overflow/OOM checks apply normally. Generated callers
+root string `owner` or array `data` operands and zero-initialized output slots
+before any allocating operation. There is no safepoint between the helper's
+allocation and installing its returned owner in the rooted output slot. Internal
+C callers must follow the same discipline and must supply valid buffers/lengths;
+UTF-8 checking does not make this a checked foreign-memory API.
+
+Neither conversion can be elided into input storage, even for single-use input.
+A fresh `string_to_bytes` result is ownership evidence for subsequent array
+transfers only under the emitter's existing use-count and control-region proof;
+reused snapshots still require independent backing.
+
+Source-free generated-C tests exercise the actual stdlib at O0/O3 with collection
+on every allocation, retained results, managed subviews, mutation isolation,
+recoverable errors, empty inputs, and OOM. Differential tests compare Nov's
+validator and a test-only panic-catching copy of the strict runtime helper against
+Zig's UTF-8 validator across exhaustive byte-pair and continuation-boundary
+families, including prefixes containing NUL and completed multibyte sequences.
+The ordinary stdlib path keeps its real panic behavior; separate direct-IR tests
+assert the primitive's actual panic text on malformed inputs.
 
 Printing uses checked `fwrite` lengths, including NUL; first printing switches
 Windows stdout to binary mode. The host must not change stdout mode while using

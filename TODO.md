@@ -50,6 +50,20 @@ results. See `examples/array-fields.nov`.
 
 ## Current delivered status
 
+`std.string.toBytes(string) -> []u8`, `fromBytes([]u8) ->
+std.Result(string, std.string.Utf8Error)` and public `Utf8Error = enum {
+invalidUtf8, }` are implemented. Both directions copy into independent storage;
+strings retain immutable UTF-8 owners. Ordinary Nov validation rejects invalid
+leads/continuations, overlong encodings, surrogates, out-of-range scalars and
+truncation before calling `@stringFromBytes`; invalid input returns
+`.err[.invalidUtf8]`. NUL and exact bytes survive without normalization. Low-level
+`@stringToBytes` and `@stringFromBytes` copy; direct `@stringFromBytes` panics on
+invalid UTF-8 in every mode. Allocation failure still panics normally. No general
+casts, arbitrary comptime execution, builder or optimization is introduced. See
+`examples/string-conversions.nov` (nine tests covering boundaries, invalid families,
+copy isolation, source scope/GC churn, propagation, matching and first-class/type
+queries), README.md and lib/README.md.
+
 `std.string.join(parts: []string, separator: string) -> string` is implemented as
 an ordinary Nov loop using existing string `+`. Empty parts arrays return `""`,
 singletons preserve their content, and empty separators concatenate. Separators
@@ -920,13 +934,15 @@ and exact error-output/flush details still need specification. Current executabl
 main remains `() -> void`; neither proposal changes the implementation roadmap yet.
 
 
-## Agreed text-storage design (future APIs)
+## Agreed text-storage design (conversions delivered; builder future)
 
 Keep one immutable, valid-UTF-8 `string` type. `let mut` permits rebinding and `+=`
 creates a new string; it does not permit in-place byte changes. Use mutable `[]u8`
-for unrestricted bytes. Future conversions must copy string bytes into independent
-array storage, and validate UTF-8 when turning arbitrary bytes into a string, with
-a recoverable error on invalid input. These conversions are not implemented.
+for unrestricted bytes. `std.string.toBytes` copies string bytes into independent
+array storage; `std.string.fromBytes` fully validates UTF-8 and copies into an
+immutable string, returning recoverable `Utf8Error.invalidUtf8` on invalid input.
+These conversions are implemented; direct low-level `@stringFromBytes` instead
+panics on invalid UTF-8.
 
 A separate stdlib builder (tentatively `StringBuilder`) should preserve UTF-8 for
 string/rune appends and require valid UTF-8 boundaries for text edits. Producing a
