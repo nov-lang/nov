@@ -1251,6 +1251,37 @@ not runtime expressions or a new compile-time evaluator. See
 [examples/array-defaults.nov](examples/array-defaults.nov) and
 `zig build test-cli-array-defaults`.
 
+#### Last-use copy elimination
+
+Array-bearing values retain independent value semantics. The compiler may
+transfer existing backing instead of recursively copying it when the source
+cannot be observed again:
+
+```nov
+let original = [[1, 2], [3]]
+let forwarded = original
+let consumed = forwarded
+@println(consumed)
+```
+
+This needs no move syntax and never invalidates a binding that the program uses
+later. Live sources retain independent copies. The initial proof handles fresh
+values and final reads of private, unboxed local storage within the same
+conditional/loop execution region. Earlier independent copies and nonescaping
+scalar observations may precede a transfer. Array-bearing struct and active union
+payload storage transfers recursively under the same proof.
+
+Borrowed/global storage, captured mutable cells, escaping projections, unknown
+call/parameter ownership and ambiguous control-flow boundaries retain conservative
+copies. Runtime union validity checks and precise GC roots remain in place;
+function-scope roots are not generally shortened by this optimization. Existing
+argument/index/RHS evaluation order is unchanged. See
+[examples/last-use.nov](examples/last-use.nov) and `zig build test-cli-last-use`.
+
+Copy-on-write is a **deferred, unaccepted proposal**, not the chosen implementation.
+Explicit moves through `@move` are deferred. No clear/truncate, capacity API or
+array/slice redesign is introduced.
+
 #### Mutable method receivers
 
 A nominal struct, union or enum method can declare an exact `&mut SelfType`
@@ -2070,9 +2101,8 @@ let main: () -> void = {
       3}
   @println(a[0], a[-1], a.len) ; 10 23 2
   ```
-- **IMPORTANT tracked cost — optimization PAUSED.** All further optimizations
-  are deferred; continue language features instead. The current
-  implementation eagerly copies storage reads when independent values are needed,
+- **Tracked cost — last-use elimination implemented; broader optimization deferred.**
+  Storage reads retain recursive copies when ownership cannot be transferred,
   including every reachable array backing in record elements. Already-fresh
   temporaries transfer through binding, argument and return boundaries without
   being cloned again. Readonly field and simple-index projections avoid copying
@@ -2083,17 +2113,20 @@ let main: () -> void = {
   and recursively copies only unproven input portions. Its final RHS read uses a
   readonly projection rather than another outer-buffer clone, while LHS pre-RHS
   snapshots and internal snapshots of effectful RHS bases remain. Plain assignment
-  still copies normally. Indexed compounds can reuse
+  can transfer proven last-use backing; otherwise it copies. Indexed compounds can reuse
   a detached snapshot after earlier scalar/length observations in the same execution
   region, avoiding a second backing allocation. Multiple consuming uses, escaping
   projections, later observations and region crossings retain safe copies. Calls,
-  merges and storage reads are not backend ownership evidence. Broader elision, moves/consuming transfers and
-  copy-on-write remain deferred candidates, **not approved designs**;
-  any optimization must preserve value independence, static borrowing and GC safety.
+  merges and arbitrary storage reads are not backend ownership evidence. Final
+  private-local loads can establish ownership under the
+  [last-use proof](#last-use-copy-elimination). Explicit `@move` is deferred;
+  copy-on-write is a deferred **unaccepted proposal**. Other optimizations must
+  preserve value independence, static borrowing and GC safety.
   Append does not yet promise amortized constant time or preserve spare capacity
   across value copies.
   Compiler roots conservatively retain temporary backing until its instruction is
-  reused or the function returns, rather than doing last-use liveness analysis.
+  reused or the function returns; copy elimination does not generally clear roots
+  at logical last use.
 - String/record arrays have independent element storage at ordinary copy boundaries.
   Record fields copy recursively by value, including all nested array backing;
   immutable string backing shares. Indexing

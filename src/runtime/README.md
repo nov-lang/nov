@@ -294,7 +294,7 @@ Imported types and generic aliases use the same path. Array backing still copies
 recursively on ordinary reads, borrowed values produce normal read copies, and
 immutable/mutable closure captures retain their existing snapshot/shared-cell
 rules. Explicit constructors use `Type.[field = value]`; contextual named
-`.[field = value]` keeps the expected type and existing scalar-only defaults.
+`.[field = value]` keeps the expected type and scalar/array literal defaults.
 Anonymous named `.[a = 1]` and positional `.[1, "a"]` values use the same recursive
 copy/rooting and closure-field sharing rules. Structural identity is ordered names
 and canonical exact types, distinct from nominal types. Even homogeneous `.[1, 2]`
@@ -322,11 +322,11 @@ A terminal index/RHS skips the pending store. Borrowing and GC do not introduce
 implicit mutable receivers. Allocation retry, panic, shutdown and immutable-string
 contracts apply unchanged.
 
-### IMPORTANT: recursive-copy costs tracked — optimization PAUSED
+### Last-use transfers and remaining recursive-copy costs
 
-All further optimizations are deferred; continue language features. Copy costs
-remain important tracked work, not the immediate next action. Separately, `defer`
-implementation remains postponed.
+Last-use copy elimination is approved; broader optimizations remain deferred.
+Copy-on-write is an unaccepted proposal, and explicit `@move` remains deferred.
+Separately, `defer` implementation and array API redesign remain postponed.
 
 Eager recursive backing copies are a major performance concern, not an optimized
 ownership strategy. Reads, snapshots and updates may copy entire reachable array
@@ -341,19 +341,31 @@ retains its freshly allocated outer buffer while recursively copying only unprov
 input portions. Append's final RHS read is a rooted readonly projection, avoiding
 an extra outer-buffer clone. Projected backing is not ownership evidence: unproven
 nested portions still copy into the fresh result. The LHS remains a pre-RHS snapshot,
-as do computed RHS bases evaluated before effectful indices. Plain assignment and
-arbitrary RHS block/control-flow evaluation keep their existing copy rules.
+as do computed RHS bases evaluated before effectful indices. Unproven assignments
+and arbitrary RHS block/control-flow evaluation retain recursive copies.
 The proof counts all IR references and checks recursive freshness.
 A detached indexed-update base may have earlier scalar/length observations before
 exactly one consuming array_set, provided all share conditional/loop execution
 regions. Later reads, escaping projections, repeated consuming operands and region
-crossings reject transfer. Calls, merges and storage reads cannot establish ownership. It does not trust lowering
-to have inserted copies in forged IR. Snapshot/conservative-fallback copies remain
-potentially expensive. Broader
-elision, moves/consuming transfers and copy-on-write remain deferred candidates, **not approved
-designs**. Any optimization must preserve observable independence,
-static borrow exclusivity and precise GC/root/OOM safety. No aliasing or COW behavior
-is delivered by this implementation. See `examples/array-fields.nov`.
+crossings reject transfer. Calls, merges and arbitrary storage reads cannot establish
+ownership. It does not trust lowering to have inserted copies in forged IR.
+
+A clone may also transfer at a value's last use. Fresh values and final loads of
+private, unboxed local slots are eligible within matching conditional/loop regions.
+Slot initialization/latest assignment must itself transfer owned backing. Earlier
+raw loads may have only completed independent copies or nonescaping scalar reads;
+other aliases, loans, field writes, mutable captures, future loads and globals
+reject the proof. Unknown C caller parameters stay independent. Recursive record
+and active union backing follow the same rules; strings and closure environments
+retain their existing shared semantics.
+
+Elided copies still run allocation-free payload validity checks, including for
+unused results. The normal rooted destination receives the transferred descriptor
+without an intervening safepoint. Dead source root slots can still retain backing
+until function exit; early root clearing is not implemented. O0/O3 allocation-count,
+forged-alias, forced-GC and OOM tests cover these transfers. Snapshot/conservative
+fallback copies remain potentially expensive. No COW, reference counting, source
+move operator or new array API is delivered. See `examples/last-use.nov`.
 
 Ordinary iteration over a direct unborrowed local array retains a rooted readonly
 backing descriptor, avoiding a recursive source clone. Per-element ordinary copies
@@ -401,7 +413,7 @@ optimization. Bool elements are ordinary C bool objects, not bit-packed.
 
 Typed IR owns literal operand lists and represents clone, len, index, replacement
 and append explicitly, with exact element/index/result types and region privacy.
-Array value boundaries clone; returns transfer freshly copied backing without an
+Array value boundaries clone unless a last-use transfer is proven; returns transfer backing without an
 intervening safepoint after popping the callee frame. The low-level C array helper
 allocates at most one outer backing per call and relies on compiler-rooted inputs;
 recursive generated copies may allocate additional nested backing.
@@ -437,7 +449,7 @@ Managed elements and array-valued record fields use precise element maps and
 recursive generated copies as described above. `examples/storable-arrays.nov` is
 being added; parent validation gates for this expansion remain pending. Existing
 validation descriptions above do not claim that those gates have passed.
-All further optimizations remain paused; `defer` remains postponed. Namespace `use`
+Optimizations beyond approved last-use transfers remain paused; `defer` remains postponed. Namespace `use`
 syntax remains undecided and its unfinished work stashed, not implemented.
 See the main README for delivered source syntax and copy/evaluation contracts.
 

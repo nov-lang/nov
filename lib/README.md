@@ -548,6 +548,13 @@ count boundaries, effects and scope/GC retention.
 
 ## References and library boundaries
 
+Last-use copy elimination may transfer backing from a proven fresh value or final
+private-local read instead of recursively copying it. Observable value independence
+and argument evaluation order are unchanged. Borrowed/global storage, mutable
+captures, unknown caller ownership and ambiguous execution regions remain
+conservative. This is not copy-on-write; COW is a deferred, unaccepted proposal,
+and explicit `@move` is deferred. See `examples/last-use.nov`.
+
 Explicit references are local and call-scoped capabilities, not ordinary
 first-class values. Runtime handles lower to typed C pointers; unit-typed IR
 `reference_parameter` / `reference_argument` capabilities carry their descriptors.

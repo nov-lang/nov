@@ -1,0 +1,65 @@
+let Packet = struct {
+    rows: [][]int,
+}
+
+let main: () = {
+    let original = [1, 2, 3]
+    let forwarded = original
+    let consumed = forwarded
+    @println("Forwarded:", consumed)
+
+    let source = Packet.[ rows = [[1, 2], [3]] ]
+    let mut snapshot = source
+    snapshot.rows[0] = [9]
+    @println("Source:", source.rows)
+    @println("Snapshot:", snapshot.rows)
+}
+
+@[test]
+let final_use_chains_preserve_contents: () = {
+    let original = [[1, 2], [3]]
+    let forwarded = original
+    let consumed = forwarded
+    @assert(consumed[0][0] == 1 and consumed[0][1] == 2)
+    @assert(consumed[1][0] == 3)
+}
+
+@[test]
+let later_uses_keep_independent_values: () = {
+    let source = Packet.[ rows = [[1, 2], [3]] ]
+    let mut snapshot = source
+    let mut row = snapshot.rows[0]
+    row[0] = 9
+    snapshot.rows[0] = row
+    @assert(source.rows[0][0] == 1 and snapshot.rows[0][0] == 9)
+}
+
+@[test]
+let captured_owners_are_not_consumed: () = {
+    let mut source = [1]
+    let read = () -> int {
+        source[0]
+    }
+    let mut snapshot = source
+    snapshot[0] = 9
+    @assert(read() == 1 and snapshot[0] == 9)
+    source[0] = 2
+    @assert(read() == 2 and snapshot[0] == 9)
+}
+
+@[test]
+let repeated_loop_reads_and_borrows_remain_valid: () = {
+    let source = [1, 2]
+    let mut total: int = 0
+    loop _ in 0..3 {
+        let mut snapshot = source
+        snapshot[0] = 9
+        total += snapshot[0]
+    }
+    @assert(total == 27 and source[0] == 1)
+    let mut value = [4]
+    let reference = &value
+    let mut snapshot = reference.*
+    snapshot[0] = 8
+    @assert(reference.*[0] == 4 and snapshot[0] == 8)
+}

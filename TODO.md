@@ -1,12 +1,13 @@
 # TODO
 
-## IMPORTANT: recursive-copy costs tracked — optimization PAUSED
+## Last-use copy elimination; other optimizations deferred
 
-The next copy-strategy implementation awaits the user's choice between
-Swift-style copy-on-write and broader last-use copy elimination. Do not implement
-either before that choice. Explicit moves via `@move` are deferred, as are array
-clear/truncate, capacity APIs and array/slice rework. Preserve delivered
-optimizations and correctness/performance cautions below.
+Last-use copy elimination is approved and implemented for proven fresh values
+and final private-local reads in matching execution regions. Independent value
+semantics remain unchanged; live or unproven sources retain recursive copies.
+Copy-on-write is a deferred **unaccepted proposal**. Explicit moves via `@move`
+are deferred, as are array clear/truncate, capacity APIs and array/slice rework.
+Preserve delivered optimizations and correctness/performance cautions below.
 
 Array-valued struct fields are implemented.
 The copy-depth question is settled: ordinary value boundaries eagerly create
@@ -34,9 +35,14 @@ potentially costly. The current `std.array.map`/`filter` implementations build
 results by repeated append, which can be quadratic; ordinary by-value argument,
 element and accumulator copies add overhead. Track these costs without changing
 the algorithms now; further optimization is **PAUSED**.
-Broader elision, moves/consuming transfers and copy-on-write remain candidates,
-**not approved designs**. Preserve observable value independence, static borrowing and GC safety.
-No further optimization is authorized as the next action.
+The approved last-use pass extends these proofs to private unboxed local storage:
+only its final read may transfer, with no surviving raw aliases, borrows, field
+writes or captured cells. Earlier detached copies and scalar observations are
+allowed. Calls/parameters, globals, projections and ambiguous region crossings
+remain conservative. Runtime validity checks and function-scope GC rooting are
+preserved. See `examples/last-use.nov` and `zig build test-cli-last-use`.
+Broader strategies, explicit moves and copy-on-write remain deferred; copy-on-write
+is specifically unaccepted. Preserve observable independence, borrowing and GC safety.
 Separately, `defer` implementation remains explicitly postponed until the user asks to resume.
 
 Plain/generic acyclic struct array fields support reads, replacement, append and

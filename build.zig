@@ -207,6 +207,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const array_default_tests = b.step("test-cli-array-defaults", "Run array-valued struct default CLI tests");
     addArrayDefaultCliTests(b, exe, array_default_tests);
     test_step.dependOn(array_default_tests);
+    const last_use_tests = b.step("test-cli-last-use", "Run last-use value independence CLI tests");
+    addLastUseCliTests(b, exe, last_use_tests);
+    test_step.dependOn(last_use_tests);
     const array_search_tests = b.step("test-cli-array-search", "Run standard-library array search and traversal CLI tests");
     addArraySearchCliTests(b, exe, array_search_tests);
     test_step.dependOn(array_search_tests);
@@ -4055,6 +4058,36 @@ fn addStringSplitCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step
         check.expectStdErrMatch(".nov:");
         check.expectStdErrMatch("error:");
         test_step.dependOn(&check.step);
+    }
+}
+
+fn addLastUseCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    const fixtures = b.addWriteFiles();
+    _ = fixtures.add("last-use.nov", @embedFile("examples/last-use.nov"));
+    for ([_]bool{ false, true }) |semantic| {
+        const check = b.addRunArtifact(exe);
+        check.setCwd(fixtures.getDirectory());
+        check.addArgs(if (semantic) &.{ "check", "--semantic", "last-use.nov" } else &.{ "fmt", "--check", "last-use.nov" });
+        check.expectExitCode(0);
+        check.expectStdOutEqual("");
+        check.expectStdErrEqual("");
+        test_step.dependOn(&check.step);
+    }
+    for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+        for ([_][]const u8{ "run", "test" }) |command| {
+            const run = b.addRunArtifact(exe);
+            run.step.name = b.fmt("CLI last use: {s} {s}", .{ command, mode });
+            run.setCwd(fixtures.getDirectory());
+            run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+            run.setEnvironmentVariable("NOV_CC", "");
+            run.setEnvironmentVariable("CC", "");
+            run.addArgs(&.{ command, "last-use.nov" });
+            if (mode.len != 0) run.addArg(mode);
+            run.expectExitCode(0);
+            run.expectStdOutEqual(if (std.mem.eql(u8, command, "run")) "Forwarded: [1, 2, 3]\nSource: [[1, 2], [3]]\nSnapshot: [[9], [3]]\n" else "PASS final_use_chains_preserve_contents\nPASS later_uses_keep_independent_values\nPASS captured_owners_are_not_consumed\nPASS repeated_loop_reads_and_borrows_remain_valid\n4 passed; 0 failed; 4 total\n");
+            run.expectStdErrEqual("");
+            test_step.dependOn(&run.step);
+        }
     }
 }
 

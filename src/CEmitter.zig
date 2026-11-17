@@ -1792,7 +1792,11 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
             continue;
         }
         if (instruction.op == .array_clone and ty == .record) {
-            try w.print("    v{d} = nov_copy_{d}(v{d});\n", .{ i, @backingInt(instruction.ty), @backingInt(instruction.op.array_clone) });
+            const value = instruction.op.array_clone;
+            if (transfers.canElideClone(body, value, i))
+                try w.print("    v{d} = nov_check_{d}(v{d});\n", .{ i, @backingInt(instruction.ty), @backingInt(value) })
+            else
+                try w.print("    v{d} = nov_copy_{d}(v{d});\n", .{ i, @backingInt(instruction.ty), @backingInt(value) });
             continue;
         }
         if (instruction.op == .union_payload) {
@@ -2069,7 +2073,9 @@ fn markCopyTypes(allocator: std.mem.Allocator, ir: *const Ir, copied: []bool) st
         const transfers = try ArrayTransfers.init(allocator, ir, body);
         defer transfers.deinit(allocator);
         for (body.instructions, 0..) |instruction, i| switch (instruction.op) {
-            .array_clone => copied[@backingInt(instruction.ty)] = true,
+            .array_clone => |value| if (!transfers.canElideClone(body, value, i)) {
+                copied[@backingInt(instruction.ty)] = true;
+            },
             .array_set => |update| {
                 if (!transfers.canTake(body, update.array, i)) copied[@backingInt(instruction.ty)] = true;
                 const element = ir.getType(instruction.ty).?.array;
@@ -2131,10 +2137,13 @@ fn writePayloadChecks(allocator: std.mem.Allocator, ir: *const Ir, copy_types: [
     _ = markFormattingTypes(ir, checked, converted);
     for (checked, copy_types) |*check, copy| check.* = check.* or copy;
     for (ir.functions.items) |function| {
-        if (function.body == null) continue;
+        const body = function.body orelse continue;
         for (ir.getType(function.ty).?.function.params) |param| {
             if (ir.getType(param).? == .record) checked[@backingInt(param)] = true;
         }
+        for (body.instructions) |instruction| if (instruction.op == .array_clone) {
+            checked[@backingInt(instruction.ty)] = true;
+        };
     }
     var changed = true;
     while (changed) {
@@ -2203,7 +2212,7 @@ fn writePayloadChecks(allocator: std.mem.Allocator, ir: *const Ir, copy_types: [
 }
 
 // Unproven values retain eager recursive copies for independent value storage.
-// Fresh-temp transfers below do not introduce shared backing or COW.
+// Proven transfers below do not introduce shared backing or COW.
 fn writeCopyHelpers(ir: *const Ir, copy_types: []const bool, counts: []const usize, w: *std.Io.Writer) WriteError!void {
     for (ir.types.items, 0..) |_, i| {
         const id: Ir.TypeId = @fromBackingInt(@intCast(i));
@@ -2294,12 +2303,13 @@ fn writeBorrowRead(ir: *const Ir, w: *std.Io.Writer, body: Ir.Body, borrow: Ir.V
 }
 
 // This is a backend proof, not a consuming convention imposed on arbitrary IR.
-// Count every reference (including projections, captures, region yields and the
-// body result), and recognize only constructors whose recursive backing is known.
+// Count every reference, including projections, captures, region yields and the
+// body result. Ownership comes from constructors or proven final private loads.
 const ArrayTransfers = struct {
     ir: *const Ir,
     uses: []usize,
     detached: []bool,
+    last_load: []usize,
 
     fn count(uses: []usize, value: anytype) void {
         const T = @TypeOf(value);
@@ -2327,13 +2337,20 @@ const ArrayTransfers = struct {
         const detached = try allocator.alloc(bool, body.instructions.len);
         errdefer allocator.free(detached);
         @memset(detached, false);
+        const last_load = try allocator.alloc(usize, body.instructions.len);
+        errdefer allocator.free(last_load);
+        @memset(last_load, std.math.maxInt(usize));
         count(uses, body.result);
-        for (body.instructions) |instruction| count(uses, instruction.op);
-        const self: ArrayTransfers = .{ .ir = ir, .uses = uses, .detached = detached };
+        for (body.instructions, 0..) |instruction, i| {
+            count(uses, instruction.op);
+            if (instruction.op == .local_load) last_load[@backingInt(instruction.op.local_load)] = i;
+        }
+        const self: ArrayTransfers = .{ .ir = ir, .uses = uses, .detached = detached, .last_load = last_load };
         for (body.instructions, 0..) |instruction, i| {
             detached[i] = switch (instruction.op) {
                 // These operations either copy or use this same proof for inputs.
                 .array_clone, .array_literal, .array_set, .array_append, .string_to_bytes => true,
+                .local_load => |slot| self.ownsLastLoad(body, slot, i),
                 .record_init => |fields| blk: {
                     for (fields) |field| {
                         if (try ir.needsArrayCopy(body.instructions[@backingInt(field)].ty) and !self.canTake(body, field, i)) break :blk false;
@@ -2355,6 +2372,87 @@ const ArrayTransfers = struct {
     fn deinit(self: ArrayTransfers, allocator: std.mem.Allocator) void {
         allocator.free(self.uses);
         allocator.free(self.detached);
+        allocator.free(self.last_load);
+    }
+
+    fn refersTo(value: anytype, target: Ir.ValueId) bool {
+        const T = @TypeOf(value);
+        if (T == Ir.ValueId) return value == target;
+        switch (@typeInfo(T)) {
+            .@"struct" => |info| inline for (info.field_names) |name| {
+                if (refersTo(@field(value, name), target)) return true;
+            },
+            .@"union" => return switch (value) {
+                inline else => |payload| refersTo(payload, target),
+            },
+            .optional => if (value) |payload| return refersTo(payload, target),
+            .pointer => |info| if (info.size == .slice and info.child == Ir.ValueId) {
+                for (value) |operand| if (operand == target) return true;
+            },
+            else => {},
+        }
+        return false;
+    }
+
+    // Other raw aliases must have disappeared before the transfer. Earlier
+    // clones are independent: a later use necessarily prevents their elision.
+    fn observedBefore(self: ArrayTransfers, body: Ir.Body, value: Ir.ValueId, stop: usize, skip: ?usize) bool {
+        const producer = @backingInt(value);
+        if (body.result == value or !sameLoopRegion(body, producer, stop) or
+            !sameConditionalRegion(body, producer, stop)) return false;
+        for (body.instructions, 0..) |instruction, index| {
+            if (skip == index or !refersTo(instruction.op, value)) continue;
+            if (index <= producer or index >= stop or
+                !sameLoopRegion(body, producer, index) or
+                !sameConditionalRegion(body, producer, index)) return false;
+            switch (instruction.op) {
+                .array_clone, .array_len, .iteration_len => {},
+                .array_index, .field_read, .union_payload => switch (self.ir.getType(instruction.ty).?) {
+                    .integer, .float, .boolean, .rune, .enumeration, .string => {},
+                    else => return false,
+                },
+                else => return false,
+            }
+        }
+        return true;
+    }
+
+    fn canElideClone(self: ArrayTransfers, body: Ir.Body, value: Ir.ValueId, consumer: usize) bool {
+        const producer = @backingInt(value);
+        if (producer >= consumer or !self.detached[producer] or
+            body.instructions[consumer].op != .array_clone or
+            body.instructions[consumer].op.array_clone != value) return false;
+        return self.observedBefore(body, value, consumer, consumer);
+    }
+
+    fn ownsLastLoad(self: ArrayTransfers, body: Ir.Body, slot: Ir.ValueId, load: usize) bool {
+        const index = @backingInt(slot);
+        if (index >= load or self.last_load[index] != load or body.instructions[index].op != .local_slot or
+            body.instructions[index].boxed or !sameLoopRegion(body, index, load) or
+            !sameConditionalRegion(body, index, load)) return false;
+        var stored = body.instructions[index].op.local_slot;
+        var store: usize = index;
+        for (body.instructions, 0..) |instruction, use| {
+            if (!refersTo(instruction.op, slot)) continue;
+            switch (instruction.op) {
+                .local_load => {
+                    if (use > load) return false;
+                    if (use < load and !self.observedBefore(body, @fromBackingInt(@intCast(use)), load, null)) return false;
+                },
+                .local_store => |assignment| {
+                    if (assignment.slot != slot or assignment.value == slot) return false;
+                    if (use < load) {
+                        if (!sameLoopRegion(body, use, load) or !sameConditionalRegion(body, use, load)) return false;
+                        stored = assignment.value;
+                        store = use;
+                    }
+                },
+                // In particular, cells, loans, field mutation and globals are
+                // not proof of uniquely owned storage, even if currently dead.
+                else => return false,
+            }
+        }
+        return self.canTake(body, stored, store);
     }
 
     fn canTake(self: ArrayTransfers, body: Ir.Body, value: Ir.ValueId, consumer: usize) bool {
@@ -2443,7 +2541,10 @@ fn writeArrayValue(ir: *const Ir, w: *std.Io.Writer, body: Ir.Body, transfers: A
         },
         .string_to_bytes => |value| try w.print("nov_string_to_bytes(v{d})", .{@backingInt(value)}),
         .array_clone => |value| {
-            try w.print("nov_copy_{d}(v{d})", .{ @backingInt(instruction.ty), @backingInt(value) });
+            if (transfers.canElideClone(body, value, i))
+                try w.print("nov_check_{d}(v{d})", .{ @backingInt(instruction.ty), @backingInt(value) })
+            else
+                try w.print("nov_copy_{d}(v{d})", .{ @backingInt(instruction.ty), @backingInt(value) });
         },
         .array_set => |r| {
             if (transfers.canTake(body, r.array, i)) try w.print("v{d}", .{@backingInt(r.array)}) else try w.print("nov_copy_{d}(v{d})", .{ @backingInt(instruction.ty), @backingInt(r.array) });
@@ -15181,7 +15282,7 @@ const copy_elision_cases = [_]struct { source: []const u8, allocations: usize, o
     },
     .{
         .source = "let L=struct{a:[]int,}\nlet main:()={let seed=L.[a=[1]]\nlet a=[seed,seed]\n@println(a[0].a[0],a[1].a[0])}",
-        .allocations = 4,
+        .allocations = 3,
         .output = "1 1\n",
     },
     .{
@@ -15206,10 +15307,171 @@ const copy_elision_cases = [_]struct { source: []const u8, allocations: usize, o
     },
     .{
         .source = "let L=struct{a:[]int,}\nlet T=struct{leaf:L,items:[]L,}\nlet U=union{node:T,none,}\nlet main:()={let u=U.node[T.[leaf=L.[a=[1]],items=[L.[a=[2]]]]]\nmatch u {\n.node=>|t|{let mut a=t.items\na+=a\n@println(a.len)}\n.none=>{}\n}}",
-        .allocations = 12,
+        .allocations = 9,
         .output = "2\n",
     },
 };
+
+const last_use_cases = [_]struct { source: []const u8, allocations: usize, output: []const u8 }{
+    .{ .source = "let main:()={let a=[1]\nlet b=a\nlet c=b\n@println(c[0])}", .allocations = 1, .output = "1\n" },
+    .{ .source = "let main:()={let mut a=[1]\nlet b=a\n@println(b[0])}", .allocations = 1, .output = "1\n" },
+    .{ .source = "let main:()={let mut a=[1]\na=[2]\nlet b=a\n@println(b[0])}", .allocations = 2, .output = "2\n" },
+    .{ .source = "let main:()={let a=[1]\nlet mut earlier=a\nlet mut last=a\nearlier[0]=7\nlast[0]=9\n@println(earlier[0],last[0])}", .allocations = 4, .output = "7 9\n" },
+    .{ .source = "let R=struct{values:[][]int,}\nlet main:()={let a=R.[values=[[1],[2]]]\nlet b=a\nlet c=b\n@println(c.values[0][0])}", .allocations = 3, .output = "1\n" },
+    .{ .source = "let R=struct{values:[][]int,}\nlet U=union{some:R,none,}\nlet main:()={let a:U=.some[R.[values=[[1],[2]]]]\nlet b=a\nlet c=b\nlet value=match c{.some=>|r|r.values[0][0]\n.none=>0}\n@println(value)}", .allocations = 3, .output = "1\n" },
+    .{ .source = "let main:()={let a=[1]\nlet mut b=a\nb[0]=9\n@println(a[0],b[0])}", .allocations = 3, .output = "1 9\n" },
+    .{ .source = "let main:()={let mut a=[1]\nlet read=()->int{a[0]}\nlet mut b=a\nb[0]=9\n@println(read(),b[0])}", .allocations = 5, .output = "1 9\n" },
+    .{ .source = "let main:()={let mut a=[1]\nlet p=&a\nlet b=p.*\n@println(b[0])}", .allocations = 2, .output = "1\n" },
+    .{ .source = "let main:()={let a=[1]\nloop _ in 0..2{let b=a\n@println(b[0])}}", .allocations = 3, .output = "1\n1\n" },
+    .{ .source = "let main:()={let a=[1]\nif true{let b=a\n@println(b[0])}}", .allocations = 2, .output = "1\n" },
+    .{ .source = "let identity:(x:[]int)->[]int=x\nlet main:()={let a=[1]\nlet b=identity(a)\n@println(b[0])}", .allocations = 2, .output = "1\n" },
+};
+
+fn testLastUseCounts(start: usize, end: usize) !void {
+    for (last_use_cases[start..end]) |case| {
+        const program = try arrayTestProgram(case.source);
+        defer test_gpa.free(program);
+        const c = try std.mem.concat(test_gpa, u8, &.{
+            "#include <stdlib.h>\n#include <assert.h>\nstatic unsigned allocations, outstanding;\n" ++
+                "static void *test_malloc(size_t n) { void *p=malloc(n); if(p){++allocations;++outstanding;} return p; }\n" ++
+                "static void test_free(void *p) { assert(outstanding); --outstanding; free(p); }\n" ++
+                "#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE test_free\n#define main test_main\n",
+            program,
+            "\n#undef main\nint main(void) { int result=test_main(); assert(!outstanding); printf(\"allocations: %u\\n\",allocations); return result; }\n",
+        });
+        defer test_gpa.free(c);
+        const expected = try std.fmt.allocPrint(test_gpa, "{s}allocations: {d}\n", .{ case.output, case.allocations });
+        defer test_gpa.free(expected);
+        errdefer std.debug.print("last-use source: {s}\n", .{case.source});
+        for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty;", 0, expected, "", mode);
+    }
+}
+
+test "last use copy elimination transfers local chains and overwritten storage" {
+    try testLastUseCounts(0, 4);
+}
+
+test "last use copy elimination preserves recursive snapshots and captured owners" {
+    try testLastUseCounts(4, 8);
+}
+
+test "last use copy elimination keeps borrowed loop branch and caller storage independent" {
+    try testLastUseCounts(8, last_use_cases.len);
+}
+
+test "last use copy elimination rejects forged aliases through another local slot" {
+    var ir = Ir.init(test_gpa);
+    defer ir.deinit();
+    const unit = try ir.internType(.void);
+    const integer = try ir.internType(.{ .integer = .{ .bits = Ir.native_pointer_bits, .signedness = .signed } });
+    const array = try ir.internType(.{ .array = integer });
+    const signature = try ir.internType(.{ .function = .{ .params = &.{}, .result = unit } });
+    const function = try ir.addFunction("main", signature, .{ .start = 0, .end = 0 });
+    const one = try ir.internConstant(.{ .ty = integer, .value = .{ .signed_integer = 1 } });
+    const zero = try ir.internConstant(.{ .ty = integer, .value = .{ .signed_integer = 0 } });
+    const nine = try ir.internConstant(.{ .ty = integer, .value = .{ .signed_integer = 9 } });
+    const V = struct {
+        fn id(index: u32) Ir.ValueId {
+            return @fromBackingInt(index);
+        }
+        fn ins(ty: Ir.TypeId, location: Ir.Span, op: Ir.Operation) Ir.Instruction {
+            return .{ .ty = ty, .span = location, .op = op };
+        }
+    };
+    const span: Ir.Span = .{ .start = 0, .end = 0 };
+    try ir.setFunctionBody(function, &.{
+        V.ins(integer, span, .{ .constant = one }),
+        V.ins(array, span, .{ .array_literal = &.{V.id(0)} }),
+        V.ins(array, span, .{ .local_slot = V.id(1) }),
+        V.ins(array, span, .{ .local_load = V.id(2) }),
+        V.ins(array, span, .{ .local_slot = V.id(3) }),
+        V.ins(array, span, .{ .local_load = V.id(2) }),
+        V.ins(array, span, .{ .array_clone = V.id(5) }),
+        V.ins(integer, span, .{ .constant = zero }),
+        V.ins(integer, span, .{ .constant = nine }),
+        V.ins(array, span, .{ .array_set = .{ .array = V.id(6), .index = V.id(7), .value = V.id(8) } }),
+        V.ins(array, span, .{ .local_load = V.id(4) }),
+        V.ins(integer, span, .{ .array_index = .{ .array = V.id(10), .index = V.id(7) } }),
+        V.ins(unit, span, .{ .print = .{ .args = &.{V.id(11)}, .newline = true } }),
+    }, V.id(12));
+    try ir.verify();
+    const body = ir.functions.items[0].body.?;
+    const transfers = try ArrayTransfers.init(test_gpa, &ir, body);
+    defer transfers.deinit(test_gpa);
+    try std.testing.expect(!transfers.detached[5]);
+    try std.testing.expect(!transfers.canElideClone(body, V.id(5), 6));
+    try testCopyElisionEmissionRuntime(&ir, "1\n");
+}
+
+test "last use copy elimination retains union validity checks even for unused results" {
+    var module = try Module.init(test_gpa, "last-use-checks.nov", "let U=union{some:[]int,none,}\nlet main:()={let a:U=.some[[1]]\nlet b=a\n@println(\"after\")}");
+    defer module.deinit();
+    var lowered = try Lowering.lower(&module);
+    defer lowered.deinit();
+    try std.testing.expect(!module.hasErrors());
+    const body = lowered.ir.functions.items[0].body.?;
+    const transfers = try ArrayTransfers.init(test_gpa, &lowered.ir, body);
+    defer transfers.deinit(test_gpa);
+    var clone: ?usize = null;
+    for (body.instructions, 0..) |instruction, index| {
+        if (instruction.op == .array_clone and transfers.canElideClone(body, instruction.op.array_clone, index)) clone = index;
+    }
+    const index = clone orelse return error.MissingLastUseTransfer;
+    const instruction = body.instructions[index];
+    const line = try std.fmt.allocPrint(test_gpa, "    v{d} = nov_check_{d}(v{d});\n", .{ index, @backingInt(instruction.ty), @backingInt(instruction.op.array_clone) });
+    defer test_gpa.free(line);
+    const injected = try std.fmt.allocPrint(test_gpa, "    v{d}.tag = 99;\n{s}", .{ @backingInt(instruction.op.array_clone), line });
+    defer test_gpa.free(injected);
+    const library = try emit(test_gpa, &lowered.ir, null);
+    defer test_gpa.free(library);
+    try std.testing.expect(std.mem.indexOf(u8, library, line) != null);
+    const changed = try std.mem.replaceOwned(u8, test_gpa, library, line, injected);
+    defer test_gpa.free(changed);
+    const c = try collectingTestProgram(changed);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty;", 1, "", "panic: invalid union tag\n", mode);
+}
+
+test "last use copy elimination keeps unknown C caller array parameters independent" {
+    const library = try emitSource("let copy:(value:[]int)->[]int=value", null);
+    defer test_gpa.free(library);
+    const c = try std.mem.concat(test_gpa, u8, &.{
+        library,
+        \\int main(void) {
+        \\    nov_rt_heap.collect_every_allocation = 1;
+        \\    nov_array input = {0}, output = {0};
+        \\    void **roots[] = {&input.data, &output.data};
+        \\    nov_gc_roots frame = {0}; nov_gc_push(&nov_rt_heap, &frame, roots, 2);
+        \\    const nov_gc_descriptor element = {sizeof(intptr_t), _Alignof(intptr_t), 0, NULL};
+        \\    input = nov_array_new(1, 1, &element);
+        \\    ((intptr_t *)input.data)[0] = 1;
+        \\    output = nov_copy(input);
+        \\    if (input.data == output.data || output.len != 1) return 1;
+        \\    ((intptr_t *)output.data)[0] = 9;
+        \\    if (((intptr_t *)input.data)[0] != 1) return 2;
+        \\    nov_gc_pop(&nov_rt_heap, &frame); nov_gc_collect(&nov_rt_heap);
+        \\    if (nov_rt_heap.frames || nov_rt_heap.live_objects) return 3;
+        \\    nov_gc_shutdown(&nov_rt_heap); return 0;
+        \\}
+    });
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty;", 0, "", "", mode);
+}
+
+test "last use copy elimination emission survives compiler OOM and exact runtime budgets" {
+    const case = last_use_cases[4];
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{case.source});
+    const library = try arrayTestProgram(case.source);
+    defer test_gpa.free(library);
+    for ([_]usize{ case.allocations - 1, case.allocations }) |budget| {
+        const prefix = try std.fmt.allocPrint(test_gpa, "#include <stdlib.h>\nstatic unsigned allocations;\nstatic void *test_malloc(size_t n) {{ if (allocations++ >= {d}) return NULL; return malloc(n); }}\n#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n", .{budget});
+        defer test_gpa.free(prefix);
+        const c = try std.mem.concat(test_gpa, u8, &.{ prefix, library });
+        defer test_gpa.free(c);
+        const success = budget == case.allocations;
+        for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty;", if (success) 0 else 1, if (success) case.output else "", if (success) "" else "panic: GC allocation failed\n", mode);
+    }
+}
 
 test "copy elision allocation counts retain snapshots under forced GC" {
     for (copy_elision_cases) |case| {
