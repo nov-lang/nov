@@ -324,11 +324,15 @@ pub const Constant = struct {
         /// bits with zero upper bits.
         float_bits: u64,
         string: []const u8,
+        /// Pool-only data, materialized into fresh array_literal instructions.
+        /// Children are typed constants interned before this entry.
+        array: []const ConstId,
     };
 };
 
 pub const ValidationError = error{
     InvalidTypeId,
+    InvalidConstId,
     InvalidIntegerWidth,
     InvalidFloatWidth,
     FloatOutOfRange,
@@ -370,7 +374,6 @@ pub const VerifyError = ValidationError || error{
     BorrowConflict,
     InvalidCall,
     InvalidReturn,
-    InvalidConstId,
     InvalidRegion,
     UnreachableInstruction,
 };
@@ -407,8 +410,10 @@ pub fn deinit(self: *Ir) void {
         }
     }
     self.types.deinit(self.allocator);
-    for (self.constants.items) |constant| if (constant.value == .string) {
-        self.allocator.free(constant.value.string);
+    for (self.constants.items) |constant| switch (constant.value) {
+        .string => |bytes| self.allocator.free(bytes),
+        .array => |children| self.allocator.free(children),
+        else => {},
     };
     self.constants.deinit(self.allocator);
     self.source_lengths.deinit(self.allocator);
@@ -726,7 +731,7 @@ pub fn internType(self: *Ir, ty: Type) InternError!TypeId {
 }
 
 pub fn internConstant(self: *Ir, constant: Constant) InternError!ConstId {
-    try self.validateConstant(constant);
+    try self.validateConstant(constant, self.constants.items.len);
     for (self.constants.items, 0..) |existing, i| {
         if (constantEql(existing, constant)) return @fromBackingInt(@intCast(i));
     }
@@ -734,7 +739,11 @@ pub fn internConstant(self: *Ir, constant: Constant) InternError!ConstId {
     const id: ConstId = @fromBackingInt(@intCast(self.constants.items.len));
     try self.constants.ensureUnusedCapacity(self.allocator, 1);
     var owned = constant;
-    if (constant.value == .string) owned.value = .{ .string = try self.allocator.dupe(u8, constant.value.string) };
+    owned.value = switch (constant.value) {
+        .string => |bytes| .{ .string = try self.allocator.dupe(u8, bytes) },
+        .array => |children| .{ .array = try self.allocator.dupe(ConstId, children) },
+        else => constant.value,
+    };
     self.constants.appendAssumeCapacity(owned);
     return id;
 }
@@ -753,7 +762,7 @@ pub fn verify(self: *const Ir) VerifyError!void {
         }
     }
     for (self.constants.items, 0..) |constant, i| {
-        try self.validateConstant(constant);
+        try self.validateConstant(constant, i);
         for (self.constants.items[0..i]) |previous| {
             if (constantEql(previous, constant)) return error.NonCanonicalConstant;
         }
@@ -1495,7 +1504,8 @@ fn validateBodyStructure(self: *const Ir, function: Function, body: Body) Verify
             },
             .constant => |id| {
                 const constant = self.getConstant(id) orelse return error.InvalidConstId;
-                try self.validateConstant(constant);
+                try self.validateConstant(constant, @backingInt(id));
+                if (constant.value == .array) return error.NonConstantType;
                 if (constant.ty != instruction.ty) return error.OperandTypeMismatch;
             },
             .parameter => |index| {
@@ -1661,7 +1671,7 @@ fn validateType(self: *const Ir, ty: Type, before: usize) ValidationError!void {
     }
 }
 
-fn validateConstant(self: *const Ir, constant: Constant) ValidationError!void {
+fn validateConstant(self: *const Ir, constant: Constant, before: usize) ValidationError!void {
     const ty = self.getType(constant.ty) orelse return error.InvalidTypeId;
     try self.validateType(ty, self.types.items.len);
     switch (ty) {
@@ -1688,7 +1698,15 @@ fn validateConstant(self: *const Ir, constant: Constant) ValidationError!void {
             const quiet_mask: u64 = if (bits == 32) 0x00400000 else 0x0008000000000000;
             if (pattern & exponent_mask == exponent_mask and pattern & fraction_mask != 0 and pattern & quiet_mask == 0) return error.FloatOutOfRange;
         },
-        .function, .array, .record, .range, .reference => return error.NonConstantType,
+        .array => |element| {
+            if (constant.value != .array) return error.ConstantTypeMismatch;
+            for (constant.value.array) |child| {
+                if (@backingInt(child) >= before) return error.InvalidConstId;
+                const value = self.getConstant(child) orelse return error.InvalidConstId;
+                if (value.ty != element) return error.ConstantTypeMismatch;
+            }
+        },
+        .function, .record, .range, .reference => return error.NonConstantType,
         .integer => |integer| switch (integer.signedness) {
             .signed => {
                 const value = switch (constant.value) {
@@ -1724,8 +1742,11 @@ pub fn isNativeInteger(ty: Type, signedness: std.builtin.Signedness) bool {
 
 fn constantEql(a: Constant, b: Constant) bool {
     if (a.ty != b.ty or std.meta.activeTag(a.value) != std.meta.activeTag(b.value)) return false;
-    if (a.value == .string) return std.mem.eql(u8, a.value.string, b.value.string);
-    return std.meta.eql(a, b);
+    return switch (a.value) {
+        .string => |bytes| std.mem.eql(u8, bytes, b.value.string),
+        .array => |children| std.mem.eql(ConstId, children, b.value.array),
+        else => std.meta.eql(a, b),
+    };
 }
 
 pub fn isManaged(ty: Type) bool {
@@ -2308,6 +2329,157 @@ test "union IR rejects invalid constructors reads tags and private capture escap
     try ir.verify();
 }
 
+fn testArrayConstantOwnership(allocator: std.mem.Allocator) !void {
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    const text = try ir.internType(.string);
+    const strings = try ir.internType(.{ .array = text });
+    const nested = try ir.internType(.{ .array = strings });
+    const leaf = blk: {
+        const source = try allocator.dupe(u8, "owned é😀");
+        defer allocator.free(source);
+        break :blk try ir.internConstant(.{ .ty = text, .value = .{ .string = source } });
+    };
+    const row = blk: {
+        const children = try allocator.dupe(ConstId, &.{ leaf, leaf });
+        defer allocator.free(children);
+        const count = ir.constants.items.len;
+        break :blk ir.internConstant(.{ .ty = strings, .value = .{ .array = children } }) catch |err| {
+            try std.testing.expectEqual(count, ir.constants.items.len);
+            try ir.verify();
+            return err;
+        };
+    };
+    const rows = blk: {
+        const children = try allocator.dupe(ConstId, &.{row});
+        defer allocator.free(children);
+        const count = ir.constants.items.len;
+        break :blk ir.internConstant(.{ .ty = nested, .value = .{ .array = children } }) catch |err| {
+            try std.testing.expectEqual(count, ir.constants.items.len);
+            try ir.verify();
+            return err;
+        };
+    };
+    try std.testing.expectEqual(row, try ir.internConstant(.{ .ty = strings, .value = .{ .array = &.{ leaf, leaf } } }));
+    try std.testing.expectEqual(rows, try ir.internConstant(.{ .ty = nested, .value = .{ .array = &.{row} } }));
+    const shorter = try ir.internConstant(.{ .ty = strings, .value = .{ .array = &.{leaf} } });
+    try std.testing.expect(shorter != row);
+    const empty = try ir.internConstant(.{ .ty = strings, .value = .{ .array = &.{} } });
+    try std.testing.expectEqual(empty, try ir.internConstant(.{ .ty = strings, .value = .{ .array = &.{} } }));
+    const record = try ir.internType(.{ .record = .{ .identity = 6000, .fields = &.{} } });
+    const span: Span = .{ .start = 0, .end = 0 };
+    try ir.setRecordFields(record, &.{.{ .name = "rows", .ty = nested, .span = span, .default = rows }});
+    try std.testing.expectEqualStrings("owned é😀", ir.getConstant(leaf).?.value.string);
+    try std.testing.expectEqualSlices(ConstId, &.{ leaf, leaf }, ir.getConstant(row).?.value.array);
+    try std.testing.expectEqualSlices(ConstId, &.{row}, ir.getConstant(rows).?.value.array);
+    try ir.verify();
+}
+
+test "array constants own source free nested defaults and survive every OOM" {
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testArrayConstantOwnership, .{});
+}
+
+test "array constants accept empty arrays of every storable element only" {
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    const unit = try ir.internType(.void);
+    const boolean = try ir.internType(.boolean);
+    const integer = try ir.internType(.{ .integer = .{ .signedness = .signed, .bits = 32 } });
+    const rune = try ir.internType(.rune);
+    const text = try ir.internType(.string);
+    const float = try ir.internType(.{ .float = 64 });
+    const enumeration = try ir.internType(.{ .enumeration = .{ .identity = 6001, .name = "Tag", .tags = &.{.{ .name = "one", .span = .{ .start = 0, .end = 0 } }} } });
+    const record = try ir.internType(.{ .record = .{ .identity = 6002, .fields = &.{} } });
+    const tagged = try ir.internType(.{ .record = .{ .identity = 6003, .fields = &.{}, .tagged = true } });
+    const function = try ir.internType(.{ .function = .{ .params = &.{}, .result = unit } });
+    const range = try ir.internType(.{ .range = integer });
+    const array = try ir.internType(.{ .array = integer });
+    var first: ?ConstId = null;
+    for ([_]TypeId{ boolean, integer, rune, text, float, enumeration, record, tagged, function, range, array }) |element| {
+        const ty = try ir.internType(.{ .array = element });
+        const empty = try ir.internConstant(.{ .ty = ty, .value = .{ .array = &.{} } });
+        if (first) |previous| try std.testing.expect(previous != empty);
+        first = empty;
+    }
+    const reference = try ir.internType(.{ .reference = .{ .child = integer, .mutable = false } });
+    for ([_]TypeId{ unit, reference }) |element| {
+        try std.testing.expectError(error.InvalidArrayElement, ir.internType(.{ .array = element }));
+    }
+    for ([_]TypeId{ record, tagged, function, range, reference }) |ty| {
+        try std.testing.expectError(error.NonConstantType, ir.internConstant(.{ .ty = ty, .value = .{ .array = &.{} } }));
+    }
+    try ir.verify();
+}
+
+test "array constants reject mismatched forward cyclic and forged pool references" {
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    const integer = try ir.internType(.{ .integer = .{ .signedness = .signed, .bits = 32 } });
+    const boolean = try ir.internType(.boolean);
+    const array = try ir.internType(.{ .array = integer });
+    const nested = try ir.internType(.{ .array = array });
+    const one = try ir.internConstant(.{ .ty = integer, .value = .{ .signed_integer = 1 } });
+    const two = try ir.internConstant(.{ .ty = integer, .value = .{ .signed_integer = 2 } });
+    const yes = try ir.internConstant(.{ .ty = boolean, .value = .{ .boolean = true } });
+    const count = ir.constants.items.len;
+    try std.testing.expectError(error.ConstantTypeMismatch, ir.internConstant(.{ .ty = array, .value = .void }));
+    try std.testing.expectError(error.ConstantTypeMismatch, ir.internConstant(.{ .ty = integer, .value = .{ .array = &.{} } }));
+    try std.testing.expectError(error.ConstantTypeMismatch, ir.internConstant(.{ .ty = array, .value = .{ .array = &.{yes} } }));
+    try std.testing.expectError(error.ConstantTypeMismatch, ir.internConstant(.{ .ty = nested, .value = .{ .array = &.{one} } }));
+    for ([_]ConstId{ @fromBackingInt(@intCast(count)), @fromBackingInt(std.math.maxInt(u32)) }) |invalid| {
+        try std.testing.expectError(error.InvalidConstId, ir.internConstant(.{ .ty = array, .value = .{ .array = &.{invalid} } }));
+    }
+    try std.testing.expectEqual(count, ir.constants.items.len);
+    const row = try ir.internConstant(.{ .ty = array, .value = .{ .array = &.{ one, two } } });
+    const reversed = try ir.internConstant(.{ .ty = array, .value = .{ .array = &.{ two, one } } });
+    try std.testing.expect(row != reversed);
+    const rows = try ir.internConstant(.{ .ty = nested, .value = .{ .array = &.{row} } });
+    const children = @constCast(ir.getConstant(row).?.value.array);
+    for ([_]ConstId{ row, reversed, rows, @fromBackingInt(std.math.maxInt(u32)) }) |invalid| {
+        children[0] = invalid;
+        try std.testing.expectError(error.InvalidConstId, ir.verify());
+    }
+    children[0] = yes;
+    try std.testing.expectError(error.ConstantTypeMismatch, ir.verify());
+    children[0] = two;
+    children[1] = one;
+    try std.testing.expectError(error.NonCanonicalConstant, ir.verify());
+    children[0] = one;
+    children[1] = two;
+    const original = ir.constants.items[@backingInt(one)].value;
+    ir.constants.items[@backingInt(one)].value = .{ .boolean = true };
+    try std.testing.expectError(error.ConstantTypeMismatch, ir.verify());
+    ir.constants.items[@backingInt(one)].value = original;
+    try ir.verify();
+}
+
+test "array constants are pool only and defaults materialize as ordinary array literals" {
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    const span: Span = .{ .start = 0, .end = 0 };
+    const integer = try ir.internType(.{ .integer = .{ .signedness = .signed, .bits = 32 } });
+    const array = try ir.internType(.{ .array = integer });
+    const nested = try ir.internType(.{ .array = array });
+    const one = try ir.internConstant(.{ .ty = integer, .value = .{ .signed_integer = 1 } });
+    const row = try ir.internConstant(.{ .ty = array, .value = .{ .array = &.{one} } });
+    const rows = try ir.internConstant(.{ .ty = nested, .value = .{ .array = &.{row} } });
+    const signature = try ir.internType(.{ .function = .{ .params = &.{}, .result = nested } });
+    const function = try ir.addFunction("materialize", signature, span);
+    try std.testing.expectError(error.NonConstantType, ir.setFunctionBody(function, &.{.{ .ty = nested, .span = span, .op = .{ .constant = rows } }}, @fromBackingInt(0)));
+    try ir.setFunctionBody(function, &.{
+        .{ .ty = integer, .span = span, .op = .{ .constant = one } },
+        .{ .ty = array, .span = span, .op = .{ .array_literal = &.{@fromBackingInt(0)} } },
+        .{ .ty = nested, .span = span, .op = .{ .array_literal = &.{@fromBackingInt(1)} } },
+    }, @fromBackingInt(2));
+    try ir.verify();
+    const instructions = @constCast(ir.functions.items[@backingInt(function)].body.?.instructions);
+    const original = instructions[0];
+    instructions[0] = .{ .ty = array, .span = span, .op = .{ .constant = row } };
+    try std.testing.expectError(error.NonConstantType, ir.verify());
+    instructions[0] = original;
+    try ir.verify();
+}
+
 test "string constants are canonical owned UTF8 and operations verify exact types" {
     var ir = Ir.init(std.testing.allocator);
     defer ir.deinit();
@@ -2669,7 +2841,7 @@ test "default printing memoizes shared type DAGs for empty arrays and respects h
     try std.testing.expectError(error.InvalidOperation, ir.verify());
 }
 
-test "storable fields exact constructors signatures cycles depth and scalar only defaults" {
+test "storable fields exact constructors signatures cycles depth and unsupported defaults" {
     var ir = Ir.init(std.testing.allocator);
     defer ir.deinit();
     const span: Span = .{ .start = 0, .end = 0 };
@@ -2695,7 +2867,7 @@ test "storable fields exact constructors signatures cycles depth and scalar only
         try std.testing.expectError(error.InvalidOperation, ir.setFunctionBody(f, &.{ins(record, .{ .record_init = &.{} })}, @fromBackingInt(0)));
         try ir.setFunctionBody(f, &.{ ins(field, .{ .parameter = 0 }), ins(record, .{ .record_init = &.{@fromBackingInt(0)} }) }, @fromBackingInt(1));
         try ir.verify();
-        try std.testing.expectError(error.NonConstantType, ir.internConstant(.{ .ty = field, .value = .void }));
+        try std.testing.expectError(if (field == array) error.ConstantTypeMismatch else error.NonConstantType, ir.internConstant(.{ .ty = field, .value = .void }));
         const fields = @constCast(ir.types.items[@backingInt(record)].record.fields);
         fields[0].default = try ir.internConstant(.{ .ty = integer, .value = .{ .signed_integer = 0 } });
         try std.testing.expectError(error.ConstantTypeMismatch, ir.verify());

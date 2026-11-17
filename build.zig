@@ -204,6 +204,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const array_sort_tests = b.step("test-cli-array-sort", "Run standard-library stable array sort CLI tests");
     addArraySortCliTests(b, exe, array_sort_tests);
     test_step.dependOn(array_sort_tests);
+    const array_default_tests = b.step("test-cli-array-defaults", "Run array-valued struct default CLI tests");
+    addArrayDefaultCliTests(b, exe, array_default_tests);
+    test_step.dependOn(array_default_tests);
     const array_search_tests = b.step("test-cli-array-search", "Run standard-library array search and traversal CLI tests");
     addArraySearchCliTests(b, exe, array_search_tests);
     test_step.dependOn(array_search_tests);
@@ -4055,6 +4058,71 @@ fn addStringSplitCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step
     }
 }
 
+fn addArrayDefaultCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    const fixtures = b.addWriteFiles();
+    const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
+    _ = fixtures.add("array-defaults.nov", @embedFile("examples/array-defaults.nov"));
+    _ = fixtures.add("defaults.nov", "@[public]\nlet R=struct{values:[][]string=[[\"é\\0\"],[]],}\n@[public]\nlet Buffer:(T:type)->type=struct{values:[]T=[],}\n");
+    _ = fixtures.add("imported.nov",
+        \\let api=@import("defaults.nov")
+        \\let alias=@import("./defaults.nov")
+        \\let global=api.R.[]
+        \\let Query=@TypeOf(alias.R.[])
+        \\let main:()={let mut a:Query=.[]
+        \\let b=api.R.[]
+        \\a.values[0]=["changed"]
+        \\let buffer=api.Buffer(Query).[]
+        \\@assert(b.values[0][0]=="é\0" and global.values[0][0]=="é\0" and buffer.values.len==0)
+        \\@println("imported defaults independent")}
+    );
+    for ([_][]const u8{ "array-defaults.nov", "imported.nov" }) |source| {
+        const check = b.addRunArtifact(exe);
+        check.setCwd(fixtures.getDirectory());
+        check.addArgs(&.{ "check", "--semantic", source, "--lib-dir" });
+        check.addDirectoryArg(library);
+        check.expectExitCode(0);
+        check.expectStdOutEqual("");
+        check.expectStdErrEqual("");
+        test_step.dependOn(&check.step);
+        for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+            const run = b.addRunArtifact(exe);
+            run.step.name = b.fmt("CLI array defaults: run {s} {s}", .{ source, mode });
+            run.setCwd(fixtures.getDirectory());
+            run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+            run.setEnvironmentVariable("NOV_CC", "");
+            run.setEnvironmentVariable("CC", "");
+            run.addArgs(&.{ "run", source, "--lib-dir" });
+            run.addDirectoryArg(library);
+            if (mode.len != 0) run.addArg(mode);
+            run.expectExitCode(0);
+            run.expectStdOutEqual(if (std.mem.eql(u8, source, "imported.nov")) "imported defaults independent\n" else "First: [65] [changed, second] [[9], [], [3]]\nSecond: [] [first, second] [[1, 2], [], [3]]\nOverride: [custom]\n");
+            run.expectStdErrEqual("");
+            test_step.dependOn(&run.step);
+            if (std.mem.eql(u8, source, "imported.nov")) continue;
+            const tests = b.addRunArtifact(exe);
+            tests.step.name = b.fmt("CLI array defaults: test {s}", .{mode});
+            tests.setCwd(fixtures.getDirectory());
+            tests.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+            tests.setEnvironmentVariable("NOV_CC", "");
+            tests.setEnvironmentVariable("CC", "");
+            tests.addArgs(&.{ "test", source, "--lib-dir" });
+            tests.addDirectoryArg(library);
+            if (mode.len != 0) tests.addArg(mode);
+            tests.expectExitCode(0);
+            tests.expectStdOutEqual("PASS constructions_have_independent_arrays\nPASS explicit_overrides_and_value_copies\nPASS generic_empty_defaults_and_type_queries\nPASS globals_returns_and_closures\n4 passed; 0 failed; 4 total\n");
+            tests.expectStdErrEqual("");
+            test_step.dependOn(&tests.step);
+        }
+    }
+    const format = b.addRunArtifact(exe);
+    format.setCwd(fixtures.getDirectory());
+    format.addArgs(&.{ "fmt", "--check", "array-defaults.nov" });
+    format.expectExitCode(0);
+    format.expectStdOutEqual("");
+    format.expectStdErrEqual("");
+    test_step.dependOn(&format.step);
+}
+
 fn addArraySortCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
     const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
@@ -4770,7 +4838,7 @@ fn addAnonymousStructCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_
         .{ .name = "exact-field-types", .source = "let main:()={let x:@TypeOf(.[a=@as(u8,1)])=.[a=@as(u16,1)]\n}", .diagnostic = "expected type" },
         .{ .name = "nominal-distinct", .source = "let S=struct{a:int,}\nlet main:()={let x=.[a=1]\nlet y:S=x\n}", .diagnostic = "expected type" },
         .{ .name = "homogeneous-not-array", .source = "let main:()={let x=.[1,2]\nlet y:[]int=x\n}", .diagnostic = "expected type" },
-        .{ .name = "aggregate-default", .source = "let S=struct{a:[]int=[1],}\nlet main:()={let x:S=.[]\n}", .diagnostic = "error:" },
+        .{ .name = "computed-array-default", .source = "let S=struct{a:[]int=[1+2],}\nlet main:()={let x:S=.[]\n}", .diagnostic = "error:" },
     }) |case| {
         const source = b.fmt("invalid-anonymous-struct-{s}.nov", .{case.name});
         _ = fixtures.add(source, case.source);

@@ -1852,6 +1852,79 @@ test "numbered fields retain exact writes immutable captures loans and unsupport
     }
 }
 
+test "array defaults materialize nested literals per constructor and skip overrides under OOM" {
+    try testUnionArrayPayloadsOom(
+        \\let Kind=enum{first,last,}
+        \\let R=struct{xs:[][]u8=[[1,255],[],[2]],flags:[]bool=[true,false],runes:[]rune=['é'],floats:[]f32=[-0.0,1.5],text:[]string=["a\\0b","é"],tags:[]Kind=[.last,Kind.first],n:int=7,}
+        \\let make:()->R=R.[]
+        \\let override:()->R=R.[xs=[[3]]]
+        \\let U=union{record:R,empty,}
+        \\let wrap:()->U=.record[R.[]]
+        \\let copies:()={let mut a=R.[]
+        \\let b=R.[]
+        \\a.xs[0]=[9]
+        \\let mut records=[a,b,make()]
+        \\let mut changed=records[1]
+        \\changed.xs[0]=[8]
+        \\records[1]=changed
+        \\let capture=()->R {b}
+        \\@println(a,b,records,capture(),wrap(),override())}
+    );
+}
+
+test "array defaults globals returned records unions and arrays under OOM" {
+    try testUnionArrayPayloadsOom(
+        \\let R=struct{xs:[][]int=[[1],[]],}
+        \\let U=union{record:R,empty,}
+        \\let seed=R.[]
+        \\let copy=seed
+        \\let wrapped:U=.record[R.[]]
+        \\let records:[]R=[R.[],seed]
+        \\let make:()->R=R.[]
+        \\let read:()->int={let mut local=make()
+        \\local.xs[0]=[9]
+        \\seed.xs[0][0]+copy.xs[0][0]+records[0].xs[0][0]}
+    );
+}
+
+test "array defaults generic empty storable elements and readonly constructors under OOM" {
+    try testUnionArrayPayloadsOom(
+        \\let G:(T:type)->type=struct{values:[]T=[],}
+        \\let R=struct{x:int=1,}
+        \\let U=union{x:int,empty,}
+        \\let Range=@TypeOf(0..1)
+        \\let A=@TypeOf(G(R).[])
+        \\let B=@TypeOf(G(U).[])
+        \\let C=@TypeOf(G(()->int).[])
+        \\let D=@TypeOf(G(Range).[])
+        \\let ordinary=struct{values:[][]u16=[[1],[]],}
+        \\let E=@TypeOf(ordinary.[])
+        \\let id:(x:`T)->`T=x
+        \\let make:()->G(R)=G(R).[]
+        \\let main:()={let a=id(G(R).[])
+        \\let b=G(U).[]
+        \\let c=G(()->int).[]
+        \\let d=G(Range).[]
+        \\let e=ordinary.[]
+        \\@println(a,b,e)}
+    );
+}
+
+test "array defaults reject nonliteral leaves and exact type mismatches under OOM" {
+    for ([_]struct { source: []const u8, tag: Module.Diagnostic.Tag }{
+        .{ .source = "let R=struct{xs:[]u8=[256],}", .tag = .literal_out_of_range },
+        .{ .source = "let R=struct{xs:[][]int=[[true]],}", .tag = .literal_type_mismatch },
+        .{ .source = "let R=struct{xs:[]int=[1+2],}", .tag = .invalid_field_default },
+        .{ .source = "let n=1\nlet R=struct{xs:[]int=[n],}", .tag = .invalid_field_default },
+        .{ .source = "let f:()->int=1\nlet R=struct{xs:[]int=[f()],}", .tag = .invalid_field_default },
+        .{ .source = "let A=struct{x:int=1,}\nlet R=struct{xs:[]A=[A.[]],}", .tag = .invalid_field_default },
+        .{ .source = "let R=struct{xs:[]string=[\"{true}\"],}", .tag = .invalid_field_default },
+        .{ .source = "let G:(T:type)->type=struct{xs:[]T=[true],}\nlet R=G(int)", .tag = .literal_type_mismatch },
+        .{ .source = "let R=struct{x:int=[],}", .tag = .literal_type_mismatch },
+        .{ .source = "let R=struct{xs:[]R=[],}", .tag = .record_layout_cycle },
+    }) |case| try testNestedUnionRejected(case.source, case.tag);
+}
+
 fn testUnionArrayPayloadsOom(source: []const u8) !void {
     try testUnionArrayPayloads(std.testing.allocator, source);
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testUnionArrayPayloads, .{source});

@@ -2,8 +2,10 @@
 
 ## IMPORTANT: recursive-copy costs tracked — optimization PAUSED
 
-**Defer ALL further optimizations; continue FEATURES.** Copy costs remain
-important tracked work, not the immediate next action. Preserve delivered
+The next copy-strategy implementation awaits the user's choice between
+Swift-style copy-on-write and broader last-use copy elimination. Do not implement
+either before that choice. Explicit moves via `@move` are deferred, as are array
+clear/truncate, capacity APIs and array/slice rework. Preserve delivered
 optimizations and correctness/performance cautions below.
 
 Array-valued struct fields are implemented.
@@ -49,6 +51,14 @@ captures snapshot recursively; mutable captures share a cell, not ordinary read
 results. See `examples/array-fields.nov`.
 
 ## Current delivered status
+
+Array-valued struct defaults support `[]`, scalar-literal elements and nested
+literal arrays with exact contextual types. Generic `values: []T = []` accepts
+all ordinary storable `T`. Every construction creates independent recursive
+backing; explicit overrides skip unused defaults. Imported/returned/global
+records and unevaluated constructor type queries retain these rules. Defaults
+remain data-only, not computed expressions or general aggregate constructors.
+See `examples/array-defaults.nov` and `zig build test-cli-array-defaults`.
 
 Iteration loops now accept `: continuation`, including arrays, strings, ranges,
 zip and reference iteration. The unit-typed continuation can use current iteration
@@ -179,7 +189,7 @@ examples/anonymous-structs.nov (five tests). Named debug output is unchanged.
 Struct fields support all ordinary storable runtime types, including unions,
 functions/closures and ranges. References, void/type/namespaces and unspecialized
 generic templates remain non-storable, and recursive structural type graphs
-remain rejected. Existing scalar literal defaults are unchanged; no deferred #
+remain rejected. Defaults support scalar and nested array literals; no deferred #
 arguments or new compile-time/default evaluation is implemented. Direct callable
 fields evaluate receiver/callee once before argument effects with no injected
 receiver, taking precedence over method lookup. Noncallable fields do not fall
@@ -665,7 +675,7 @@ Acyclic nested nominal struct fields and mutable-local nested field paths now wo
 including aliases/imports/forward layouts and nested structs as union payloads.
 Value copies have independent struct storage; immutable strings share backing.
 Recursive layouts or depth over 128 aggregate levels diagnose; nested values must
-be supplied explicitly (scalar literal defaults unchanged). C topological layouts
+be supplied explicitly unless covered by scalar/array literal defaults. C topological layouts
 and recursively flattened string-owner roots preserve GC safety. Validation includes
 late generic layouts, forged cycles, deep graphs and zero-root diamond performance.
 See examples/nested-structs.nov and examples/storable-fields.nov. Array, union,
@@ -846,7 +856,7 @@ even homogeneous `.[1, 2]` is not an array. Structural identity uses ordered nam
 and canonical exact types across scopes/modules, and remains distinct from nominal
 types. Named/positional mixing is rejected. Numbered `.0`/`.1` access is supported;
 destructuring remains deferred.
-Contextual named constructors retain existing scalar-only defaults. Anonymous
+Contextual named constructors retain scalar and array literal defaults. Anonymous
 unions/enums remain deferred; union payloads, indexing and slicing are unchanged.
 Nominal debug-print output remains `Name[ field: value ]` / `Empty[]`; anonymous
 output is `.[ a: 1 ]` / `.[1, a]`. See `examples/anonymous-structs.nov` (five tests)

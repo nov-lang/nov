@@ -439,11 +439,15 @@ pub const QueryValidation = struct {
             const id = try scratch.internType(ty);
             std.debug.assert(@backingInt(id) == index);
         }
+        for (source.constants.items, 0..) |constant, index| {
+            const id = try scratch.internConstant(constant);
+            std.debug.assert(@backingInt(id) == index);
+        }
         for (source.types.items, 0..) |ty, index| {
             if (ty != .record) continue;
             const fields = try scratch.allocator.dupe(Ir.Field, ty.record.fields);
             defer scratch.allocator.free(fields);
-            for (fields) |*field| field.default = null;
+
             try scratch.setRecordFields(@fromBackingInt(@intCast(index)), fields);
             scratch.types.items[index].record.anonymous = ty.record.anonymous;
             scratch.types.items[index].record.identity = ty.record.identity;
@@ -2832,10 +2836,21 @@ const Context = struct {
         for (record.record.fields, seen, 0..) |field, supplied, i| {
             if (supplied) continue;
             const default = field.default orelse return self.fail(.missing_field, node, field.span);
-            if (self.emitter) |emitter| values.?[i] = try emitter.append(field.ty, self.irSpan(node), .{ .constant = default });
+            if (self.emitter != null) values.?[i] = try self.materializeDefault(default, node);
         }
         if (self.emitter) |emitter| try emitter.record(node, ty, self.irSpan(node), .{ .record_init = values.? });
         return ty;
+    }
+
+    fn materializeDefault(self: *Context, id: Ir.ConstId, node: Ast.Node.Index) Error!Ir.ValueId {
+        const emitter = self.emitter.?;
+        const constant = self.ir.getConstant(id).?;
+        if (constant.value == .array) {
+            const values = try emitter.allocator.alloc(Ir.ValueId, constant.value.array.len);
+            for (constant.value.array, values) |child, *value| value.* = try self.materializeDefault(child, node);
+            return emitter.append(constant.ty, self.irSpan(node), .{ .array_literal = values });
+        }
+        return emitter.append(constant.ty, self.irSpan(node), .{ .constant = id });
     }
 
     fn diagnoseInitializer(self: *Context, node: Ast.Node.Index) Error!void {

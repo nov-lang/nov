@@ -34,8 +34,8 @@ is. Positional fields use `.0`, `.1`, etc., with compile-time position checks an
 exact-type writes through mutable owners. Nested paths, callable fields and
 explicit `reference.*.0` follow the ordinary field rules. Bracket/dynamic tuple
 indexing, destructuring and mixed named/positional construction remain unsupported.
-Existing scalar-only defaults, recursive array snapshots and closure-field sharing
-remain unchanged. Anonymous unions/enums remain deferred; `.some[value]`, `.none[]`,
+Scalar and array literal defaults, recursive array snapshots and closure-field
+sharing follow the ordinary value rules. Anonymous unions/enums remain deferred; `.some[value]`, `.none[]`,
 array indexing and slicing keep their existing syntax. See
 `examples/anonymous-structs.nov` and `zig build test-cli-anonymous-structs`.
 
@@ -69,8 +69,13 @@ ordinary explicit borrowing/forwarding rules, without permitting reference field
 
 Union-valued fields print recursively with existing converters. Function/range
 fields require an enclosing valid stringify hook to print the whole record.
-Defaults remain restricted to the existing scalar literals—no runtime callbacks,
-aggregate defaults, or deferred `#` compile-time arguments are enabled. Void/type/
+Defaults support scalar literals and nested array literals, including `[]` for
+any storable element type. Nonempty arrays require supported literal leaves;
+computed expressions, callbacks and other aggregate constructors are not enabled.
+Each construction gets independent recursive backing, and explicit overrides skip
+unused defaults. Generic `values: []T = []` works. See `examples/array-defaults.nov`
+and `zig build test-cli-array-defaults`. No deferred `#` compile-time arguments
+are enabled. Void/type/
 namespace/reference fields and recursive type/signature graphs remain unsupported.
 See `examples/storable-fields.nov` for a runnable example and six tests.
 
@@ -623,7 +628,7 @@ Array elements: 10 25
 Generic: after 7
 ```
 
-This adds no builder API, array clear/truncate or new aggregate defaults; deferred
+Method autodereferencing adds no builder API or array clear/truncate; deferred
 builder and optimization work remains paused.
 
 Each reference argument snapshots its target before later argument effects:

@@ -1,0 +1,75 @@
+let std = @import("std")
+
+let Settings = struct {
+    bytes: []u8 = [],
+    labels: []string = ["first", "second"],
+    rows: [][]int = [[1, 2], [], [3]],
+}
+
+let Buffer: (Element: type) -> type = struct {
+    values: []Element = [],
+}
+
+let main: () = {
+    let mut first = Settings.[]
+    let second = Settings.[]
+    first.bytes += [65]
+    first.labels[0] = "changed"
+    first.rows[0] = [9]
+    @println("First:", first.bytes, first.labels, first.rows)
+    @println("Second:", second.bytes, second.labels, second.rows)
+    let custom = Settings.[ labels = ["custom"] ]
+    @println("Override:", custom.labels)
+}
+
+@[test]
+let constructions_have_independent_arrays: () = {
+    let mut first = Settings.[]
+    let second: Settings = .[]
+    first.bytes += [1]
+    first.labels[0] = "changed"
+    let mut row = first.rows[0]
+    row[0] = 9
+    first.rows[0] = row
+    @assert(second.bytes.len == 0 and second.labels[0] == "first")
+    @assert(first.rows[0][0] == 9 and second.rows[0][0] == 1)
+}
+
+@[test]
+let explicit_overrides_and_value_copies: () = {
+    let mut value = Settings.[ labels = ["custom"], rows = [[8]] ]
+    let saved = value
+    value.labels[0] = "changed"
+    value.rows[0] = [9]
+    @assert(saved.labels[0] == "custom" and saved.rows[0][0] == 8)
+    @assert(saved.bytes.len == 0)
+}
+
+@[test]
+let generic_empty_defaults_and_type_queries: () = {
+    let mut numbers = Buffer(uint).[]
+    numbers.values += [1, 2]
+    let empty = Buffer(Settings).[]
+    let callbacks = Buffer(() -> int).[]
+    let intervals = Buffer(@TypeOf(0..1)).[]
+    let outcome = Buffer(std.Option(int)).[]
+    let inferred: @TypeOf(Settings.[]) = .[]
+    @assert(numbers.values.len == 2 and empty.values.len == 0)
+    @assert(callbacks.values.len == 0 and intervals.values.len == 0)
+    @assert(outcome.values.len == 0 and inferred.rows[0][1] == 2)
+}
+
+let initial = Settings.[]
+let make: () -> Settings = Settings.[]
+
+@[test]
+let globals_returns_and_closures: () = {
+    let mut value = make()
+    let capture = () -> Settings {
+        value
+    }
+    value.rows[0] = [7]
+    let captured = capture()
+    @assert(captured.rows[0][0] == 7)
+    @assert(initial.rows[0][0] == 1 and make().rows[0][0] == 1)
+}

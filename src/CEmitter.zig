@@ -1374,6 +1374,7 @@ fn writeConstant(w: *std.Io.Writer, constant: Ir.Constant, ty: Ir.Type) WriteErr
             for (bytes) |byte| try w.print("\\{o:0>3}", .{byte});
             try w.print("\", {d}}}", .{bytes.len});
         },
+        .array => unreachable, // pool-only defaults cannot appear in constant instructions
         .void => unreachable, // void values have no C object
         .boolean => |value| try w.writeAll(if (value) "true" else "false"),
         .float_bits => |bits| try w.print("nov_rt_float_bits_{d}(UINT{d}_C({d}))", .{ ty.float, ty.float, bits }),
@@ -4214,6 +4215,95 @@ const type_reachability_cases = [_]struct { source: []const u8, output: []const 
     \\ @println(copy.rows[0][0].values[0].values[0])}
     , .output = "reachable!\n" },
 };
+
+const array_default_program =
+    \\let R=struct{rows:[][]int=[[1,2],[],[3]],names:[]string=["é\0","tail"],bytes:[]u8=[],}
+    \\let G:(T:type)->type=struct{values:[]T=[],}
+    \\let U=union{value:R,none,}
+    \\let make:()->R=R.[]
+    \\let empty:()->uint={let value=R.[rows=[],names=[],bytes=[]]
+    \\value.rows.len+value.names.len+value.bytes.len}
+    \\let main:()={let mut a=R.[]
+    \\let b=make()
+    \\let captured=()->R{b}
+    \\let mut row=a.rows[0]
+    \\row[0]=9
+    \\a.rows[0]=row
+    \\a.names[0]="changed"
+    \\a.bytes += [65]
+    \\@assert(b.rows[0][0]==1 and b.names[0]=="é\0" and b.bytes.len==0)
+    \\let mut values=[a,b,R.[]]
+    \\let mut changed=values[1]
+    \\changed.rows[0]=[8]
+    \\values[1]=changed
+    \\@assert(values[0].rows[0][0]==9 and values[1].rows[0][0]==8 and values[2].rows[0][0]==1)
+    \\let wrapped:U=.value[R.[]]
+    \\@assert(match wrapped{.value=>|r|r.rows[0][1]==2
+    \\.none=>false})
+    \\let callbacks=G(()->int).[]
+    \\let records=G(R).[]
+    \\let queried:@TypeOf(R.[])=.[]
+    \\@assert(callbacks.values.len==0 and records.values.len==0 and queried.rows[0][0]==1)
+    \\loop i in 0..20{let temporary="allocation:{i}"
+    \\@assert(temporary.len>0)}
+    \\@assert(captured().rows[0][0]==1 and make().rows[0][0]==1)
+    \\@println("defaults independent")}
+;
+
+fn emitArrayDefaultLibrary(allocator: std.mem.Allocator) ![]u8 {
+    var lowered = blk: {
+        var module = try Module.init(allocator, "array-defaults.nov", array_default_program);
+        defer module.deinit();
+        var result = try Lowering.lower(&module);
+        errdefer result.deinit();
+        if (module.hasErrors()) std.debug.print("array default diagnostics: {any}\n", .{module.diagnostics.items});
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expect(result.lowering_complete);
+        break :blk result;
+    };
+    defer lowered.deinit();
+    return emit(allocator, &lowered.ir, null);
+}
+
+fn testArrayDefaultEmissionAllocations(allocator: std.mem.Allocator) !void {
+    allocator.free(try emitArrayDefaultLibrary(allocator));
+}
+
+test "array defaults source free fresh nested arrays closures returned records forced GC O0 O3" {
+    const library = try emitArrayDefaultLibrary(test_gpa);
+    defer test_gpa.free(library);
+    const c = try std.mem.concat(test_gpa, u8, &.{
+        library,
+        \\int main(void) {
+        \\    nov_rt_heap.collect_every_allocation = 1;
+        \\    nov_main();
+        \\    nov_gc_collect(&nov_rt_heap);
+        \\    if (nov_rt_heap.frames || nov_rt_heap.live_objects) return 99;
+        \\    nov_gc_shutdown(&nov_rt_heap);
+        \\    return 0;
+        \\}
+    });
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty;", 0, "defaults independent\n", "", mode);
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayDefaultEmissionAllocations, .{});
+}
+
+test "array defaults runtime OOM and overridden defaults do not allocate O0 O3" {
+    const library = try emitArrayDefaultLibrary(test_gpa);
+    defer test_gpa.free(library);
+    for (0..3) |budget| {
+        const prefix = try std.fmt.allocPrint(test_gpa, "#include <stdlib.h>\nstatic unsigned count;\nstatic void *test_malloc(size_t n) {{ if (count++ >= {d}) return NULL; return malloc(n); }}\n#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n", .{budget});
+        defer test_gpa.free(prefix);
+        const c = try std.mem.concat(test_gpa, u8, &.{ prefix, library, "\nint main(void) { nov_main(); return 0; }\n" });
+        defer test_gpa.free(c);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty;", 1, "", "panic: GC allocation failed\n", mode);
+        if (budget == 0) {
+            const overridden = try std.mem.concat(test_gpa, u8, &.{ prefix, library, "\nint main(void) { if (nov_empty()) return 99; nov_gc_shutdown(&nov_rt_heap); return 0; }\n" });
+            defer test_gpa.free(overridden);
+            for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(overridden, "typedef int nonempty;", 0, "", "", mode);
+        }
+    }
+}
 
 fn emitSourceFreeTypeReachability(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
     var lowered = blk: {

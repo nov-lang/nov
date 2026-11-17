@@ -139,7 +139,7 @@ fn renderModuleWithSources(module: *const Module, compilation: ?*const Compilati
             .unknown_field => try writer.writeAll("unknown container field, method, enum tag or union variant"),
             .invalid_method_receiver => try writer.writeAll("instance method requires a first parameter of the exact receiver container type"),
             .missing_field => if (diagnostic.related) |field| try writer.print("missing required struct field '{s}'", .{(try spanSource(module, compilation, field)).slice(field).?}) else try writer.writeAll("missing required struct field"),
-            .invalid_field_default => try writer.writeAll("struct field default must be a scalar literal of the exact field type; nested structs require explicit values"),
+            .invalid_field_default => try writer.writeAll("struct field default must be an exactly typed scalar or nested array literal; other aggregate values require explicit initialization"),
             .record_layout_cycle => try writer.writeAll("cyclic by-value struct layout"),
             .record_layout_limit => try writer.writeAll("by-value aggregate nesting exceeds the current limit of 128"),
             .invalid_to_string => try writer.writeAll("@[stringify] method must be accessible with exact signature (SelfType) -> string; imported methods require @[public]"),

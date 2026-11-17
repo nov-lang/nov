@@ -93,6 +93,48 @@ pub fn check(module: *Module, ir: *Ir, node: Ast.Node.Index, expected: Ir.TypeId
     }
 }
 
+/// Field defaults admit literal arrays, but ordinary scalar constant checking
+/// must not turn array-valued globals into body `.constant` operations.
+pub fn checkDefault(module: *Module, ir: *Ir, node: Ast.Node.Index, expected: Ir.TypeId, annotation: ?Module.Span) Error!Result {
+    return checkDefaultDepth(module, ir, node, expected, annotation, 0);
+}
+
+fn checkDefaultDepth(module: *Module, ir: *Ir, node: Ast.Node.Index, expected: Ir.TypeId, annotation: ?Module.Span, depth: usize) Error!Result {
+    if (depth >= Ir.max_record_depth) return .not_literal;
+    const ast = &module.source.ast;
+    var current = node;
+    while (true) {
+        var buffer: [2]Ast.Node.Index = undefined;
+        const block = ast.fullBlock(&buffer, current) orelse break;
+        if (ast.firstToken(current) != block.ast.lbrace or block.ast.statements.len != 1) return .not_literal;
+        if (ast.nodes.items(.tag)[block.ast.statements[0]] == .decl) return .not_literal;
+        current = block.ast.statements[0];
+    }
+    const data = ast.nodes.items(.data)[current];
+    switch (ast.nodes.items(.tag)[current]) {
+        .array_init, .array_init_comma, .array_init_two, .array_init_two_comma => {
+            const ty = ir.getType(expected).?;
+            if (ty != .array) return failLiteral(module, .literal_type_mismatch, module.tokenSpan(ast.firstToken(node)), annotation);
+            const buffer = [2]Ast.Node.Index{ data.lhs, data.rhs };
+            const elements = switch (ast.nodes.items(.tag)[current]) {
+                .array_init, .array_init_comma => ast.extra_data[data.lhs..data.rhs],
+                else => buffer[0 .. @as(usize, @intFromBool(data.lhs != 0)) + @as(usize, @intFromBool(data.rhs != 0))],
+            };
+            const constants = try module.allocator.alloc(Ir.ConstId, elements.len);
+            defer module.allocator.free(constants);
+            for (elements, constants) |element, *constant| {
+                switch (try checkDefaultDepth(module, ir, element, ty.array, annotation, depth + 1)) {
+                    .constant => |value| constant.* = value,
+                    .failed => return .failed,
+                    .not_literal => return .not_literal,
+                }
+            }
+            return internLiteral(module, ir, expected, .{ .array = constants }, module.tokenSpan(ast.firstToken(node)), annotation);
+        },
+        else => return check(module, ir, current, expected, annotation),
+    }
+}
+
 /// Also handles the syntactically ambiguous `.tag` in `U.variant[.tag]`.
 /// The union payload context, not lexical value lookup, determines this literal.
 pub fn checkEnumToken(module: *Module, ir: *Ir, token: Ast.TokenIndex, expected: Ir.TypeId, span: Module.Span, annotation: ?Module.Span) Error!Result {

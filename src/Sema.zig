@@ -302,7 +302,7 @@ fn finalizeFieldDefaults(self: *Sema, module: *Module) Error!void {
                     try module.diagnostics.append(module.allocator, .{ .tag = .invalid_field_default, .span = span });
                     break;
                 }
-                const checked = try Literal.check(module, &self.ir, data.rhs, field.ty, field.span);
+                const checked = try Literal.checkDefault(module, &self.ir, data.rhs, field.ty, field.span);
                 switch (checked) {
                     .constant => |constant| @constCast(self.ir.types.items[@backingInt(id)].record.fields)[f].default = constant,
                     .failed => {},

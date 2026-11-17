@@ -48,6 +48,11 @@ pub fn format(allocator: std.mem.Allocator, source: [:0]const u8) ![]u8 {
 }
 
 fn fieldDefaultSupported(ast: Ast, node: Ast.Node.Index) bool {
+    return fieldDefaultSupportedDepth(ast, node, 0);
+}
+
+fn fieldDefaultSupportedDepth(ast: Ast, node: Ast.Node.Index, depth: usize) bool {
+    if (depth >= 128) return false;
     var current = node;
     var buffer: [2]Ast.Node.Index = undefined;
     while (ast.fullBlock(&buffer, current)) |block| {
@@ -55,6 +60,13 @@ fn fieldDefaultSupported(ast: Ast, node: Ast.Node.Index) bool {
         current = block.ast.statements[0];
     }
     const tag = ast.nodes.items(.tag)[current];
+    if (tag == .array_init or tag == .array_init_comma or tag == .array_init_two or tag == .array_init_two_comma) {
+        const data = ast.nodes.items(.data)[current];
+        const children = [2]Ast.Node.Index{ data.lhs, data.rhs };
+        const elements = if (tag == .array_init or tag == .array_init_comma) ast.extra_data[data.lhs..data.rhs] else children[0 .. @as(usize, @intFromBool(data.lhs != 0)) + @as(usize, @intFromBool(data.rhs != 0))];
+        for (elements) |element| if (!fieldDefaultSupportedDepth(ast, element, depth + 1)) return false;
+        return true;
+    }
     if (tag == .negation) return ast.nodes.items(.tag)[ast.nodes.items(.data)[current].rhs] == .number_literal;
     if (tag == .number_literal or tag == .enum_literal or tag == .char_literal) return true;
     if (tag == .field_access) return ast.nodes.items(.tag)[ast.nodes.items(.data)[current].lhs] == .identifier;
@@ -994,6 +1006,12 @@ test "quoted interpolation formatting preserves nested literal bytes and idempot
     for ([_][]const u8{ "\"{\"a\"}\"", "\"{greet(\"Ada\")}\"", "\"{'é'}\"", "\"{\"nested {\"value\"}\"}\"" }) |literal| {
         try std.testing.expect(std.mem.indexOf(u8, formatted, literal) != null);
     }
+}
+
+test "array valued struct defaults format and survive OOM" {
+    const source = "let R=struct{xs:[]u8=[],rows:[][]int=[[1,2],[],[3]],}\nlet G:(T:type)->type=struct{values:[]T=[],}";
+    try expectFormatted(source, "let R = struct {\n    xs: []u8 = [],\n    rows: [][]int = [[1, 2], [], [3]],\n}\nlet G: (T: type) -> type = struct {\n    values: []T = [],\n}\n");
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{source});
 }
 
 test "string byte conversions format nested calls and survive OOM" {

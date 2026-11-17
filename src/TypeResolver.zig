@@ -668,7 +668,7 @@ pub fn completeRecordReadOnly(module: *Module, ir: *Ir, ty: Ir.TypeId) Error!boo
         const token = ast.nodes.items(.main_token)[member];
         const span = owner.tokenSpan(token);
         var default: ?Ir.ConstId = null;
-        if (data.rhs != 0) switch (try Literal.check(owner, ir, data.rhs, field_ty, span)) {
+        if (data.rhs != 0) switch (try Literal.checkDefault(owner, ir, data.rhs, field_ty, span)) {
             .constant => |constant| default = constant,
             .failed => return false,
             .not_literal => {
@@ -739,7 +739,7 @@ fn instantiateArgumentsMode(module: *Module, ir: *Ir, id: Module.DeclId, args: [
         var default: ?Ir.ConstId = null;
         if (data.rhs != 0) {
             if (ft == .record) return diagnose(module, data.rhs, .invalid_field_default);
-            switch (try Literal.check(module, ir, data.rhs, field_ty, span)) {
+            switch (try Literal.checkDefault(module, ir, data.rhs, field_ty, span)) {
                 .constant => |constant| default = constant,
                 .failed => return null,
                 .not_literal => return diagnose(module, data.rhs, .invalid_field_default),

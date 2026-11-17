@@ -1089,9 +1089,12 @@ The delivered subset is deliberately bounded:
   containing a 128-bit field fails C emission with a backend width diagnostic;
   an unused record layout adds no backend requirement or emitted definition.
   Array element restrictions are unchanged. Fields end with a comma. A field may have a literal default of its exact type, with ordinary
-  literal-bound checks. Defaults cannot call functions, compute values, reference
-  globals or interpolate strings. Aggregate defaults are not supported: nested
-  struct and array values must be supplied explicitly. Recursive layouts (including
+  literal-bound checks. Defaults may also be empty or nested array literals;
+  nonempty leaves use the existing bool, integer, float, rune, string and enum
+  literal rules. The field type supplies exact element types, including for `[]`.
+  Defaults cannot call functions, compute values, reference globals or interpolate
+  strings. Struct/union/function/range-valued default elements remain unsupported,
+  but empty arrays of any ordinary storable element type are allowed. Recursive layouts (including
   cycles through array element types) and layouts deeper than 128 aggregate levels
   diagnose, including aliases/imports and late generic instantiations.
   `void`, compile-time `type`, namespaces, unspecialized generic templates and
@@ -1228,6 +1231,26 @@ String byte-data pointers (including static literals) are never traced. The
 current uniform record path installs a GC frame even for scalar-only records;
 this is implementation overhead, not heap allocation of the records themselves.
 
+#### Array-valued field defaults
+
+```nov
+let Buffer = struct {
+    bytes: []u8 = [],
+    labels: []string = ["first", "second"],
+    rows: [][]int = [[1, 2], [], [3]],
+}
+let mut first = Buffer.[]
+let second: Buffer = .[]
+first.rows[0] = [9] ; second.rows[0] remains [1, 2]
+```
+
+Every construction materializes fresh recursive array backing. Explicit fields
+replace their defaults without materializing the unused default. Generic fields
+such as `values: []T = []` follow the same rule. Defaults remain literal data,
+not runtime expressions or a new compile-time evaluator. See
+[examples/array-defaults.nov](examples/array-defaults.nov) and
+`zig build test-cli-array-defaults`.
+
 #### Mutable method receivers
 
 A nominal struct, union or enum method can declare an exact `&mut SelfType`
@@ -1322,8 +1345,8 @@ Existing recursive array-copy and closure-sharing rules apply to anonymous field
 including values produced by generic functions and `std.array.map`.
 
 Contextual named constructors such as `let value: Rectangle = .[width = 3]`
-retain the expected nominal type and fill only its existing scalar literal defaults;
-this does not enable aggregate/computed defaults. Same-name nominal shorthand
+retain the expected nominal type and fill its scalar or array literal defaults;
+this does not enable computed defaults or arbitrary aggregate constructors. Same-name nominal shorthand
 `Rectangle.[width]` uses the same bare-name rule. Anonymous unions and enums remain deferred;
 union constructors `U.tag[payload]` and `.tag[]`, array indexing and slicing are
 unchanged.
@@ -1550,8 +1573,9 @@ otherwise valid type instance; requested methods still undergo full checking.
 This preserves void-payload Result construction/propagation without permitting
 void parameters. Method discovery and specialization are bounded; failed checking
 never exposes partial executable IR. Generic struct fields are resolved for each
-concrete instance, retaining exact nominal identity. Scalar literal defaults are
-checked against concrete field types; aggregate defaults remain unsupported.
+concrete instance, retaining exact nominal identity. Scalar and array literal
+defaults are checked against concrete field types. `values: []T = []` works for
+all ordinary storable `T`; this does not enable computed defaults.
 
 ```nov
 let Box: (T: type) -> type = struct {
@@ -1575,8 +1599,9 @@ value parameters and general compile-time execution remain unsupported.
 
 The following broader stack example remains design-only: `#type` denotes an
 accepted explicit compile-time type argument (implementation deferred), distinct from backtick
-inferred type variables. Aggregate defaults and the proposed general-pointer
-receiver syntax are not delivered; bounded `&mut Self` methods are supported above.
+inferred type variables. General computed defaults and the proposed general-pointer
+receiver syntax are not delivered; literal array defaults and bounded `&mut Self`
+methods are supported above.
 Array fields themselves work. Its historical `*mut` spelling and implicit receiver
 accesses are separate from the explicit safe-reference
 contract and accepted passing/returning/storing roadmap.
