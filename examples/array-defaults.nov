@@ -31,7 +31,7 @@ let constructions_have_independent_arrays: () = {
     let mut row = first.rows[0]
     row[0] = 9
     first.rows[0] = row
-    @assert(second.bytes.len == 0 and second.labels[0] == "first")
+    @assert(@len(second.bytes) == 0 and second.labels[0] == "first")
     @assert(first.rows[0][0] == 9 and second.rows[0][0] == 1)
 }
 
@@ -42,7 +42,7 @@ let explicit_overrides_and_value_copies: () = {
     value.labels[0] = "changed"
     value.rows[0] = [9]
     @assert(saved.labels[0] == "custom" and saved.rows[0][0] == 8)
-    @assert(saved.bytes.len == 0)
+    @assert(@len(saved.bytes) == 0)
 }
 
 @[test]
@@ -54,9 +54,9 @@ let generic_empty_defaults_and_type_queries: () = {
     let intervals = Buffer(@TypeOf(0..1)).[]
     let outcome = Buffer(std.Option(int)).[]
     let inferred: @TypeOf(Settings.[]) = .[]
-    @assert(numbers.values.len == 2 and empty.values.len == 0)
-    @assert(callbacks.values.len == 0 and intervals.values.len == 0)
-    @assert(outcome.values.len == 0 and inferred.rows[0][1] == 2)
+    @assert(@len(numbers.values) == 2 and @len(empty.values) == 0)
+    @assert(@len(callbacks.values) == 0 and @len(intervals.values) == 0)
+    @assert(@len(outcome.values) == 0 and inferred.rows[0][1] == 2)
 }
 
 let initial = Settings.[]

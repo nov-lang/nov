@@ -66,10 +66,10 @@ let typed_empty_no_predicate_calls: () = {
         ).isNone()
     )
     @assert(calls == 0)
-    @assert(std.array.take(empty, 0).len == 0)
-    @assert(std.array.drop(empty, 0).len == 0)
-    @assert(std.array.take(empty, ~@as(uint, 0)).len == 0)
-    @assert(std.array.drop(empty, ~@as(uint, 0)).len == 0)
+    @assert(@len(std.array.take(empty, 0)) == 0)
+    @assert(@len(std.array.drop(empty, 0)) == 0)
+    @assert(@len(std.array.take(empty, ~@as(uint, 0))) == 0)
+    @assert(@len(std.array.drop(empty, ~@as(uint, 0))) == 0)
 }
 
 @[test]
@@ -77,19 +77,19 @@ let take_drop_boundaries_and_order: () = {
     let items: []int = [3, 1, 4, 2]
     let prefix = std.array.take(items, 2)
     let suffix = std.array.drop(items, 2)
-    @assert(prefix.len == 2 and prefix[0] == 3 and prefix[1] == 1)
-    @assert(suffix.len == 2 and suffix[0] == 4 and suffix[1] == 2)
-    @assert(std.array.take(items, 0).len == 0)
-    @assert(std.array.drop(items, 0).len == 4)
-    @assert(std.array.take(items, 4).len == 4)
-    @assert(std.array.drop(items, 4).len == 0)
-    @assert(std.array.take(items, 99).len == 4)
-    @assert(std.array.drop(items, 99).len == 0)
-    @assert(std.array.take(items, ~@as(uint, 0)).len == 4)
-    @assert(std.array.drop(items, ~@as(uint, 0)).len == 0)
+    @assert(@len(prefix) == 2 and prefix[0] == 3 and prefix[1] == 1)
+    @assert(@len(suffix) == 2 and suffix[0] == 4 and suffix[1] == 2)
+    @assert(@len(std.array.take(items, 0)) == 0)
+    @assert(@len(std.array.drop(items, 0)) == 4)
+    @assert(@len(std.array.take(items, 4)) == 4)
+    @assert(@len(std.array.drop(items, 4)) == 0)
+    @assert(@len(std.array.take(items, 99)) == 4)
+    @assert(@len(std.array.drop(items, 99)) == 0)
+    @assert(@len(std.array.take(items, ~@as(uint, 0))) == 4)
+    @assert(@len(std.array.drop(items, ~@as(uint, 0))) == 0)
     @assert(std.array.take(@as([]int, [7]), 1)[0] == 7)
-    @assert(std.array.drop(@as([]int, [7]), 1).len == 0)
-    @assert(items.len == 4 and items[0] == 3 and items[3] == 2)
+    @assert(@len(std.array.drop(@as([]int, [7]), 1)) == 0)
+    @assert(@len(items) == 4 and items[0] == 3 and items[3] == 2)
 }
 
 let check_family: (items: []`T) = {
@@ -97,12 +97,12 @@ let check_family: (items: []`T) = {
         true
     }
     @assert(std.array.findLast(items, yes).isSome())
-    @assert(std.array.take(items, 1).len == 1)
-    @assert(std.array.drop(items, 1).len == items.len - 1)
+    @assert(@len(std.array.take(items, 1)) == 1)
+    @assert(@len(std.array.drop(items, 1)) == @len(items) - 1)
     let empty: []`T = []
     @assert(std.array.findLast(empty, yes).isNone())
-    @assert(std.array.take(empty, 1).len == 0)
-    @assert(std.array.drop(empty, 1).len == 0)
+    @assert(@len(std.array.take(empty, 1)) == 0)
+    @assert(@len(std.array.drop(empty, 1)) == 0)
 }
 
 @[test]
@@ -152,7 +152,7 @@ let recursive_copies_in_both_directions: () = {
     let mut nested: [][]int = [[5, 6]]
     let nestedCopy = std.array.drop(nested, 0)
     nested[0] = [99]
-    @assert(nestedCopy[0][0] == 5 and nestedCopy[0].len == 2)
+    @assert(nestedCopy[0][0] == 5 and @len(nestedCopy[0]) == 2)
     let mut payloads: []Payload = [.row[Row.[ values = [[10]] ]]]
     let kept = std.array.take(payloads, 1)
     payloads[0] = .none[]

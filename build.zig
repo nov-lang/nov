@@ -138,6 +138,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const language_tests = b.step("test-cli-language-tests", "Run test command and assertion language CLI tests");
     addLanguageTestCliTests(b, exe, language_tests);
     test_step.dependOn(language_tests);
+    const len_tests = b.step("test-cli-len", "Run length builtin and removed length property CLI tests");
+    addLenCliTests(b, exe, len_tests);
+    test_step.dependOn(len_tests);
     const string_byte_tests = b.step("test-cli-string-bytes", "Run immutable string scalar indexing CLI tests");
     addStringByteCliTests(b, exe, string_byte_tests);
     test_step.dependOn(string_byte_tests);
@@ -391,7 +394,7 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     _ = fixtures.add("membership-width.nov", "let f: (n: i16, a: []i8) -> bool = n in a\n");
     _ = fixtures.add("membership-string.nov", "let main: () -> void = @println(\"a\" in \"abc\")\n");
     _ = fixtures.add("array-bounds.nov", "let main: () -> void = {let a: []bool = [true]\n@println(a[-2])}\n");
-    _ = fixtures.add("array-compound.nov", "let main: () -> void = {\n    let mut a: []i8 = [127, 10]\n    a[0] += 1\n    a[0] -= 1\n    a[0] *= 2\n    a[0] /= -1\n    a[0] %= 3\n    a[-1] += {\n        a = []\n        5\n    }\n    @println(a[0], a[-1], a.len)\n}\n");
+    _ = fixtures.add("array-compound.nov", "let main: () -> void = {\n    let mut a: []i8 = [127, 10]\n    a[0] += 1\n    a[0] -= 1\n    a[0] *= 2\n    a[0] /= -1\n    a[0] %= 3\n    a[-1] += {\n        a = []\n        5\n    }\n    @println(a[0], a[-1], @len(a))\n}\n");
     _ = fixtures.add("array-bool-compound.nov", "let main: () -> void = {let mut a: []bool = [true]\na[0] += false}\n");
     _ = fixtures.add("array-compound-bounds.nov", "let main: () -> void = {let mut a: []int = []\na[-1] += {@print(true)\nreturn}}\n");
     _ = fixtures.add("array-length-write.nov", "let main: () -> void = {let mut a: []int = []\na.len = 1}\n");
@@ -545,7 +548,7 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         .{ .name = "check membership integer defaults", .args = &.{ "check", "--semantic", "membership-default.nov" }, .exit_code = 0 },
         .{ .name = "reject membership widening", .args = &.{ "emit-c", "membership-width.nov" }, .exit_code = 1, .stderr_match = "expression does not match the expected type" },
         .{ .name = "reject string membership", .args = &.{ "emit-c", "membership-string.nov" }, .exit_code = 1, .stderr_match = "operator is not supported for this operand type" },
-        .{ .name = "reject array length writes", .args = &.{ "emit-c", "array-length-write.nov" }, .exit_code = 1, .stderr_match = "array .len is read-only" },
+        .{ .name = "reject legacy array length writes", .args = &.{ "emit-c", "array-length-write.nov" }, .exit_code = 1, .stderr_match = "assignment target must be a mutable local" },
         .{ .name = "check range search", .args = &.{ "check", "--semantic", "range-search.nov" }, .exit_code = 0 },
         .{ .name = "fmt range search", .args = &.{ "fmt", "--check", "range-search.nov" }, .exit_code = 0 },
         .{ .name = "check inclusive ranges", .args = &.{ "check", "--semantic", "inclusive-range.nov" }, .exit_code = 0 },
@@ -1320,11 +1323,78 @@ fn addClosureCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *s
     }
 }
 
+fn addLenCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    const fixtures = b.addWriteFiles();
+    _ = fixtures.add("len.nov",
+        \\let R = struct {len: uint = 7,}
+        \\let count = @len("é😀\0")
+        \\let empty = @len(@as([]int, []))
+        \\let main: () = {
+        \\    let mut calls: int = 0
+        \\    let make = () -> string {calls += 1
+        \\        "é😀\0"}
+        \\    let mut rows = [[1, 2], [3]]
+        \\    let alias = &rows
+        \\    @assert(@len(alias.*) == 2 and @len(alias.*[0]) == 2)
+        \\    @assert(@len(make()) == count and calls == 1)
+        \\    @assert(@len("é😀\0"[1..]) == 2 and empty == 0)
+        \\    @assert("{@len("é😀")}" == "2")
+        \\    let mut record = R.[]
+        \\    record.len = 9
+        \\    @println(count, empty, calls, record.len)
+        \\}
+        \\
+    );
+    const check = b.addRunArtifact(exe);
+    check.step.name = "CLI len: semantic check";
+    check.setCwd(fixtures.getDirectory());
+    check.addArgs(&.{ "check", "--semantic", "len.nov" });
+    check.expectExitCode(0);
+    check.expectStdOutEqual("");
+    check.expectStdErrEqual("");
+    test_step.dependOn(&check.step);
+    for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+        const run = b.addRunArtifact(exe);
+        run.step.name = b.fmt("CLI len: run ({s})", .{mode});
+        run.setCwd(fixtures.getDirectory());
+        run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+        run.setEnvironmentVariable("NOV_CC", "");
+        run.setEnvironmentVariable("CC", "");
+        run.addArgs(&.{ "run", "len.nov" });
+        if (mode.len != 0) run.addArg(mode);
+        run.expectExitCode(0);
+        run.expectStdOutEqual("3 0 1 9\n");
+        run.expectStdErrEqual("");
+        test_step.dependOn(&run.step);
+    }
+    for ([_]struct { name: []const u8, source: []const u8, diagnostic: []const u8 }{
+        .{ .name = "array-property", .source = "let main:()={let a=[1]\n@println(a.len)}", .diagnostic = "unknown container field" },
+        .{ .name = "string-property", .source = "let main:()=@println(\"é\".len)", .diagnostic = "unknown container field" },
+        .{ .name = "array-property-write", .source = "let main:()={let mut a=[1]\na.len=2}", .diagnostic = "assignment target must be a mutable local" },
+        .{ .name = "string-property-write", .source = "let main:()={let mut s=\"a\"\ns.len=2}", .diagnostic = "assignment target must be a mutable local" },
+        .{ .name = "array-builtin-write", .source = "let main:()={let mut a=[1]\n@len(a)=2}", .diagnostic = "assignment target must be a mutable local" },
+        .{ .name = "string-builtin-write", .source = "let main:()={let mut s=\"a\"\n@len(s)=2}", .diagnostic = "assignment target must be a mutable local" },
+    }) |case| {
+        const source = b.fmt("{s}.nov", .{case.name});
+        _ = fixtures.add(source, case.source);
+        for ([_]bool{ false, true }) |emit| {
+            const run = b.addRunArtifact(exe);
+            run.step.name = b.fmt("CLI len: reject {s} ({s})", .{ case.name, if (emit) "emit-c" else "check" });
+            run.setCwd(fixtures.getDirectory());
+            run.addArgs(if (emit) &.{ "emit-c", source } else &.{ "check", "--semantic", source });
+            run.expectExitCode(1);
+            run.expectStdOutEqual("");
+            run.expectStdErrMatch(case.diagnostic);
+            test_step.dependOn(&run.step);
+        }
+    }
+}
+
 fn addStringByteCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
     _ = fixtures.add("string-bytes.nov", @embedFile("examples/string-bytes.nov"));
     _ = fixtures.add("excluded.nov", "@[test]\nlet excluded: () = @panic(\"test body ran\")\n" ++
-        "let main: () = {let mut text = \"é😀\\0\"\nlet alias = &text\n@assert(alias.*[0] == 'é')\n@assert(alias.*[-2] == '😀')\n@assert(alias.*[-1] == '\\0')\n@assert(alias.*.len == 3)}\n");
+        "let main: () = {let mut text = \"é😀\\0\"\nlet alias = &text\n@assert(alias.*[0] == 'é')\n@assert(alias.*[-2] == '😀')\n@assert(alias.*[-1] == '\\0')\n@assert(@len(alias.*) == 3)}\n");
     for ([_][]const u8{ "fmt", "semantic" }) |mode| {
         const run = b.addRunArtifact(exe);
         run.step.name = b.fmt("CLI string bytes: example {s}", .{mode});
@@ -1408,7 +1478,7 @@ fn addStringSliceCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step
     const fixtures = b.addWriteFiles();
     _ = fixtures.add("string-slices.nov", @embedFile("examples/string-slices.nov"));
     _ = fixtures.add("excluded.nov", "@[test]\nlet excluded: () = @panic(\"test body ran\")\n" ++
-        "let main: () = {let mut text = \"é😀\\0\"\nlet alias = &text\n@assert(alias.*[1..-1] == \"😀\")\n@assert(alias.*[..].len == 3)}\n");
+        "let main: () = {let mut text = \"é😀\\0\"\nlet alias = &text\n@assert(alias.*[1..-1] == \"😀\")\n@assert(@len(alias.*[..]) == 3)}\n");
     for ([_][]const u8{ "fmt", "semantic" }) |mode| {
         const run = b.addRunArtifact(exe);
         run.step.name = b.fmt("CLI string slices: example {s}", .{mode});
@@ -3531,7 +3601,7 @@ fn addStringConversionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test
         \\    let decode: ([]u8) -> standard.Result(string, alternate.Utf8Error) = alternate.fromBytes
         \\    let bytes = encode("Aé😀\0")
         \\    let text: result.Result(string, direct.Utf8Error) = decode(bytes)
-        \\    @assert(text.unwrapOr("bad") == "Aé😀\0" and bytes.len == 8)
+        \\    @assert(text.unwrapOr("bad") == "Aé😀\0" and @len(bytes) == 8)
         \\    @assert(standard.string.fromBytes(direct.toBytes("é")).unwrapOr("") == "é")
         \\    @assert(alternate.fromBytes(standard.string.toBytes("😀")).unwrapOr("") == "😀")
         \\    @assert(@stringFromBytes(@stringToBytes("a\0é😀")) == "a\0é😀")
@@ -3936,7 +4006,7 @@ fn addStringSplitCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step
         \\    let split: (string, string) -> []string = direct.split
         \\    let other = alternate.split
         \\    let fields = split("é😀x\0e\u{301}😀x", "😀x")
-        \\    @assert(fields.len == 3 and fields[0] == "é" and fields[1] == "\0e\u{301}" and fields[2] == "")
+        \\    @assert(@len(fields) == 3 and fields[0] == "é" and fields[1] == "\0e\u{301}" and fields[2] == "")
         \\    @assert(other("aaaaa", "aa")[2] == "a")
         \\    @assert(standard.string.split("", ",")[0] == "")
         \\    @assert(direct.split("a::b", "::")[1] == "b")
@@ -4017,7 +4087,7 @@ fn addStringSplitCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step
             \\        ""
             \\    }}
             \\    let fields = callee()(text(), separator())
-            \\    @println("unreachable", fields.len)
+            \\    @println("unreachable", @len(fields))
             \\}}
             \\
         , .{if (std.mem.eql(u8, name, "empty")) "" else "abc"}));
@@ -4105,7 +4175,7 @@ fn addArrayDefaultCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_ste
         \\let b=api.R.[]
         \\a.values[0]=["changed"]
         \\let buffer=api.Buffer(Query).[]
-        \\@assert(b.values[0][0]=="é\0" and global.values[0][0]=="é\0" and buffer.values.len==0)
+        \\@assert(b.values[0][0]=="é\0" and global.values[0][0]=="é\0" and @len(buffer.values)==0)
         \\@println("imported defaults independent")}
     );
     for ([_][]const u8{ "array-defaults.nov", "imported.nov" }) |source| {

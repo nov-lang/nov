@@ -246,7 +246,7 @@ fn checkSupported(ast: Ast) !void {
             },
             .builtin_literal => {
                 const name = ast.tokenSlice(main);
-                if (!std.mem.eql(u8, name, "@print") and !std.mem.eql(u8, name, "@println") and !std.mem.eql(u8, name, "@as") and !std.mem.eql(u8, name, "@panic") and !std.mem.eql(u8, name, "@assert") and !std.mem.eql(u8, name, "@This") and !std.mem.eql(u8, name, "@TypeOf") and !std.mem.eql(u8, name, "@stringToBytes") and !std.mem.eql(u8, name, "@stringFromBytes") and !std.mem.eql(u8, name, "@import"))
+                if (!std.mem.eql(u8, name, "@print") and !std.mem.eql(u8, name, "@println") and !std.mem.eql(u8, name, "@as") and !std.mem.eql(u8, name, "@panic") and !std.mem.eql(u8, name, "@assert") and !std.mem.eql(u8, name, "@This") and !std.mem.eql(u8, name, "@TypeOf") and !std.mem.eql(u8, name, "@len") and !std.mem.eql(u8, name, "@stringToBytes") and !std.mem.eql(u8, name, "@stringFromBytes") and !std.mem.eql(u8, name, "@import"))
                     return error.UnsupportedSyntax;
             },
             .@"break" => if (data.lhs != 0) return error.UnsupportedSyntax,
@@ -949,7 +949,8 @@ test "executable formatting survives allocation failures" {
 test "scalar arrays render types literals indexing length and direct stores" {
     try expectFormatted("let f:()->void={a[-1]+=1\na[0]-=2\na[0]*=3\na[0]/=4\na[0]%=5}\n", "let f: () -> void = {\n    a[-1] += 1\n    a[0] -= 2\n    a[0] *= 3\n    a[0] /= 4\n    a[0] %= 5\n}\n");
     try expectFormatted("let f:(a:[]int)->[]bool={let mut b:[]bool=[true,false,]\nb[-1]=!a[0] == 0\nb += []\nreturn b}\n", "let f: (a: []int) -> []bool = {\n    let mut b: []bool = [true, false,]\n    b[-1] = !a[0] == 0\n    b += []\n    return b\n}\n");
-    try expectFormatted("let x:[]int=[]\nlet y=[1,2,3,]\nlet n=make()[0] + -a[-1] * a.len\n", "let x: []int = []\nlet y = [1, 2, 3,]\nlet n = make()[0] + -a[-1] * a.len\n");
+    try expectFormatted("let n=@len(\"é\\0😀\")\n", "let n = @len(\"é\\0😀\")\n");
+    try expectFormatted("let x:[]int=[]\nlet y=[1,2,3,]\nlet n=make()[0] + -a[-1] * @len(a)\n", "let x: []int = []\nlet y = [1, 2, 3,]\nlet n = make()[0] + -a[-1] * @len(a)\n");
     for ([_][]const u8{ "bool", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "int", "uint" }) |name| {
         const source = try std.fmt.allocPrintSentinel(std.testing.allocator, "let f:(a:[]{s})->[]{s}=a\n", .{ name, name }, 0);
         defer std.testing.allocator.free(source);
@@ -964,13 +965,13 @@ test "array comments continuations and expanding lists stabilize on the first pa
     try expectFormatted("let x=[{1}]\n", "let x = [\n    {\n        1\n    }\n]\n");
     for ([_][:0]const u8{
         "let f:(a:[]int)->int=a[\n -1]\n",
-        "let f:(a:[]int)->int=a[; index\n -1].len\n",
+        "let f:(a:[]int)->uint=@len(a[; index\n -1])\n",
         "let f:()->[]int=[\n1, ; first\n2 ; before comma\n,3, ; tail\n]\n",
         "let f:()->[]int=[1 + ; operator\n 2,3]\n",
         "let f:(a:[]int)->int=a[0 +\n 1]\n",
         "let f:(a:[]int)->int=a[1 + {2}]\n",
         "let f:(a:[]int)->int=a[{1}]\n",
-        "let f:(a:[]int)->int=a[0].len + -a[-1]\n",
+        "let f:(a:[]int)->uint=@len(a[0]) + -a[-1]\n",
         "let f:()->void={let mut a:[]int= ; literal\n [1,2]\na[-1]= ; store\n 3\na += ; append\n []}\n",
         "let f:()->void={a[; index\n -1] += ; RHS\n {2}\na[0] -= ; subtract\n 1\na[0] *= 2\na[0] /= 3\na[0] %= 4}\n",
         "let f:()->void=call([1,{2}],[])\n",
@@ -983,7 +984,7 @@ test "array comments continuations and expanding lists stabilize on the first pa
 }
 
 fn testArrayAllocationFailures(allocator: std.mem.Allocator) !void {
-    const output = try format(allocator, "let f:(a:[]int)->[]int={let mut b:[]int=[\n1, ; element\n{a[-1]},3,]\nb[0]=a.len\nb[-1] += {a[0]}\nb[0] -= 1\nb[0] *= 2\nb[0] /= 2\nb[0] %= 3\nb += []\nlet found = 1 in b\nlet absent = false in []\nreturn b}\n");
+    const output = try format(allocator, "let f:(a:[]int)->[]int={let mut b:[]int=[\n1, ; element\n{a[-1]},3,]\nb[0]=@len(a)\nb[-1] += {a[0]}\nb[0] -= 1\nb[0] *= 2\nb[0] /= 2\nb[0] %= 3\nb += []\nlet found = 1 in b\nlet absent = false in []\nreturn b}\n");
     defer allocator.free(output);
 }
 

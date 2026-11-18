@@ -359,7 +359,7 @@ be omitted in `let name = expression` and `let mut name = expression` when the
 initializer already determines a supported `bool`, integer (fixed-width or native
 `int`/`uint`), float, rune, string, enum, record/union, range, function-value or array type. Examples include
 `let ready = true`, `let result = value + 1`, `let callback = twice`, and
-`let mut copy = values` for an already typed array. Calls, indexing, `.len`, and
+`let mut copy = values` for an already typed array. Calls, indexing, `@len(value)`, and
 block/conditional results use the same bidirectional rules as other expressions.
 No type is inferred from later uses or from the enclosing function result for a
 local initializer. `let n = 1`, `let n = -1` and `let n = 1 + 2` infer `int`
@@ -613,14 +613,14 @@ loops with optional continuation clauses, conditional-loop `else` and value brea
 returns, unlabeled `break`/`continue`, and direct identifier assignments (`=`, `+=`, `-=`,
 `*=`, `/=`, `%=`). Supported array annotations (including nested `[]T`),
 literals (including empty `[]` and nested literals), indexing (including negative
-indices), `.len` reads, and plain `name[index] = value` stores are also supported.
+indices), `@len(value)` calls, and plain `name[index] = value` stores are also supported.
 Nonempty blocks use four-space indentation. Function parentheses,
 list commas (including trailing commas), precedence, comments, and multiline
 continuations are preserved; no grouping parentheses are invented.
 This is syntax formatting, not semantic validation: existing literal/bitwise/shift
 formatting does not make those forms executable. Array formatting does not check
 expected literal types, scope, mutability, or whether a base is an array; it does
-not extend global initialization rules or add new language semantics. Other members, `.len` writes,
+not extend global initialization rules or add new language semantics. Other members,
 indexed compound stores and stores through computed bases remain unsupported.
 Array slicing, general pointers (beyond bounded local references), other unsupported
 memory/container forms, labels, iterator/other unsupported loop forms, attributes, quoted identifiers,
@@ -863,7 +863,7 @@ constraints. Conflicting signatures are errors; no implicit conversion is introd
 Body inference is deliberately bounded. It gathers constraints from parameter/local
 reads and explicitly typed globals, string/rune/bool literals, boolean operations,
 exact operand relationships for arithmetic/bitwise/comparison operations, array
-indexing/literals, string indexing, known record fields and array/string `.len`,
+indexing/literals, string indexing, known record fields and array/string `@len(value)`,
 block bindings, `if/else`, conditional/unconditional loops, scoped returns and
 breaks, `@as`, supported direct calls and concrete function-value calls. Integer
 literals supply deferred `int` fallback candidates only after exact constraints;
@@ -1123,9 +1123,10 @@ The delivered subset is deliberately bounded:
   constructors infer structural types as described below. Old `MyType[.x = 5]`
   and `MyType[]` constructor spellings are rejected, not compatibility aliases.
 - Read fields with `item.x`, including inside interpolation (`"{self.x}"`). Field
-  lookup is type-directed: a record field named `len` is an ordinary field and
-  does not change array/string `.len`. Assignment, locals, parameters, returns,
-  branches and loop results copy record field values. Array backing is copied
+  lookup is type-directed: a record field named `len` is an ordinary field, read
+  and written with `item.len`. `@len(item)` rejects a record even if it has a `len`
+  field; the builtin accepts only arrays and strings. Assignment, locals,
+  parameters, returns, branches and loop results copy record field values. Array backing is copied
   recursively through nested structs, record-array elements and union record
   payloads, including arrays inside union-valued fields; immutable strings share
   backing, functions share closure environments/captured cells, and ranges copy
@@ -1179,8 +1180,8 @@ The delivered subset is deliberately bounded:
   unchanged; reference receivers follow the rules below. Instance calls also work
   for non-generic unions and enums. Direct `@[noreturn]` method calls terminate
   control flow, including through instance syntax.
-  Existing fields take precedence over method lookup; array/string `.len` is not
-  a method. A bare `item.method` does not create a bound function or closure;
+  Existing fields take precedence over method lookup; array/string `@len(value)` is
+  a builtin, not a method. A bare `item.method` does not create a bound function or closure;
   explicit `Type.method` remains an ordinary unbound function value. Concrete
   generic union instances support these same method calls. Methods with their own
   backtick variables use the bounded instance inference described above.
@@ -1650,17 +1651,7 @@ let Stack: (T: #type) -> type = struct {
     }
 
     @[public]
-    let pop: (self: *mut Self) -> Option(T) = {
-        if self.list.len == 0 {
-            return .none
-        }
-        let value = self.list[self.list.len - 1]
-        self.list.len -= 1
-        return .some[value]
-    }
-
-    @[public]
-    let isEmpty: (self: Self) -> bool = self.list.len == 0
+    let isEmpty: (self: Self) -> bool = @len(self.list) == 0
 }
 ```
 
@@ -1831,7 +1822,7 @@ Signatures below use `T`/`U` for inferred backtick type variables:
 - `find(items: []T, predicate: (T) -> bool) -> Option(T)` returns the first match.
 - `findLast(items: []T, predicate: (T) -> bool) -> Option(T)` visits from the end,
   stopping immediately at the last matching element and returning it by value.
-- `take(items: []T, count: uint) -> []T` keeps the first `min(count, items.len)` elements.
+- `take(items: []T, count: uint) -> []T` keeps the first `min(count, @len(items))` elements.
 - `drop(items: []T, count: uint) -> []T` discards those elements, keeping the remainder.
 - `findIndex(items: []T, predicate: (T) -> bool) -> Option(uint)` returns the first
   matching zero-based index; indices use pointer-sized unsigned `uint`.
@@ -2050,7 +2041,7 @@ let main: () -> void = {
     let original: []int = values
     values[-1] = 30
     values += values
-    @println(original[-1], values[-1], values.len) ; 3 30 6
+    @println(original[-1], values[-1], @len(values)) ; 3 30 6
     values = []
 }
 ```
@@ -2066,8 +2057,12 @@ let main: () -> void = {
   Immutable arrays
   cannot have their elements changed. Parameters are immutable; copy into a
   mutable local to edit them.
-- `.len` has pointer-sized `uint` type. Internal capacity is also pointer-sized
-  `uint`, but is not a source-level field. Indices have native `int` type, with
+- `@len(values)` returns the array element count as native (pointer-sized) `uint`.
+  The builtin accepts exactly one array or string expression, evaluated once;
+  for a string it returns the Unicode scalar count, not bytes or grapheme clusters.
+  The synthetic array/string `.len` properties are removed; use `@len(...)` instead.
+  It does not use record fields or user-defined length protocols. Internal capacity
+  is also pointer-sized `uint`, but is not a source-level field. Indices have native `int` type, with
   `-1` denoting the last element and `-len` the first. Every out-of-bounds access
   (including empty arrays and minimum native `int`) panics with
   `panic: array index out of bounds`, exit 1, identically in debug and release.
@@ -2099,7 +2094,7 @@ let main: () -> void = {
   let mut a: []int = [10, 20]
   a[-1] += {a = [99]
       3}
-  @println(a[0], a[-1], a.len) ; 10 23 2
+  @println(a[0], a[-1], @len(a)) ; 10 23 2
   ```
 - **Tracked cost — last-use elimination implemented; broader optimization deferred.**
   Storage reads retain recursive copies when ownership cannot be transferred,
@@ -2144,8 +2139,9 @@ let main: () -> void = {
   zero-initialized capacity. Record layout dependencies precede array descriptors. Map storage costs
   capacity times managed owner fields; GC never traces static byte pointers.
   See [examples/managed-arrays.nov](examples/managed-arrays.nov).
-- `.len` writes are explicitly rejected: shrinking and especially initialization
-  on length growth remain undesigned. No array equality, concatenation
+- `@len(values)` is a value, not an assignable place. Array clear/truncation APIs
+  and initialization on length growth remain deferred; `values = []` still rebinds
+  a mutable array to an empty value. No array equality, concatenation
   with `+`, slices, pointer elements, general aliases,
   or capacity API is delivered. Array globals support data-only initialization. Bounded value/reference iteration is
   supported (see [Loop](#loop)). The formatter supports
@@ -2328,7 +2324,7 @@ changed.*.score += 1
 - Validity is checked **statically** with control-flow liveness, including branches,
   loop backedges, break/continue, returns and short-circuit paths. While a borrow
   is live, its owner is unavailable for conflicting access. For an array element,
-  the entire owner array is unavailable for direct reads, copies, `.len`,
+  the entire owner array is unavailable for direct reads, copies, `@len(value)`,
   writes, append, replacement or other borrows—even of a different index. Access
   resumes after the last possible reference use on the current path. This first
   implementation is conservatively exclusive even for readonly owners; it does
@@ -2376,7 +2372,7 @@ below remain distinct future design material.
 
 The broader examples below describe future syntax as well as implemented syntax;
 bare integer elements now default to `int`, and bounded [`@TypeOf`](#type-queries) is
-implemented, but writable `.len` and the broader pointer/functional forms shown
+implemented, but array truncation and the broader pointer/functional forms shown
 there are **not** executable features of this subset. Array printing is implemented for recursively printable elements.
 
 Array literals are comma-separated, may span multiple lines, and may have a
@@ -2385,8 +2381,8 @@ trailing comma.
 ```nov
 let mut my_array = [1, 2, 3]
 @TypeOf(my_array) ; returns []int
-; array .len is read-only in the executable subset
-my_array.len == 3 ; true
+; @len returns the array element count
+@len(my_array) == 3 ; true
 my_array[0] == 1 ; true
 my_array[-1] == 3 ; true
 ; append an element
@@ -2395,9 +2391,6 @@ my_array |> @println ; prints [1, 2, 3, 5]
 ; append multiple elements
 my_array += [1, 1, 7]
 my_array |> @println ; prints [1, 2, 3, 5, 1, 1, 7]
-; remove the last element
-my_array.len -= 1
-my_array |> @println ; prints [1, 2, 3, 5, 1, 1]
 my_array = []
 @TypeOf(my_array) ; still return []int
 ; check if an element is in the array
@@ -2408,7 +2401,7 @@ let my_array_of_array = [["Hello", "World!"], ["Bonjour", "Monde!"]]
 
 ; explicit local readonly reference; the immutable owner infers this same type
 let arr_arr: &[][]string = &my_array_of_array
-arr_arr.*.len == 2 ; true
+@len(arr_arr.*) == 2 ; true
 
 ; this is an independent recursive value copy, not a reference copy
 let arr_copy = arr_arr.*
@@ -3317,7 +3310,7 @@ let main: () = {
     let first: rune = text[0] ; 'é'
     let last: rune = text[-1] ; '\0'
     @assert(text[1] == '😀')
-    @assert(text.len == 3)
+    @assert(@len(text) == 3)
     @println("First: {first}", last)
 }
 ```
@@ -3336,7 +3329,7 @@ String slicing supports `text[start..end]`, `text[..end]`, `text[start..]` and
 Unicode scalar offsets; negatives count from the scalar end. An explicit inclusive
 end must name an existing scalar, and is converted to an exclusive boundary by
 adding one **after** normalization. For example, `"é😀x"[0..=1] == "é😀"` and
-`text[..=-1]` includes the last scalar. An explicit inclusive end equal to `.len`
+`text[..=-1]` includes the last scalar. An explicit inclusive end equal to `@len(text)`
 is out of bounds, even for an empty slice.
 
 Omitted bounds default to 0 and the scalar length for either operator:
@@ -3347,7 +3340,7 @@ slice: `"abc"[2..=1] == ""`; further-reversed bounds panic. `""[..=]` is valid,
 but `""[..=0]` panics because no scalar exists at index 0.
 The base, start and end evaluate once, left to right. Slicing returns an immutable,
 allocation-free UTF-8 view sharing the original GC owner, without copying bytes;
-even a small view retains the full allocation. `.len` still counts scalars.
+even a small view retains the full allocation. `@len(text)` still counts Unicode scalars.
 For example, `"é😀x"[1..-1] == "😀"`. Array slicing remains unsupported. See
 [`examples/string-slices.nov`](examples/string-slices.nov).
 
@@ -3362,9 +3355,9 @@ Rune decoding through indexing is implemented;
 forward scalar iteration is also implemented (see [Loop](#loop)); grapheme
 operations remain deferred.
 
-`.len` is the Unicode scalar count as native `uint`, **not byte length or a grapheme
-count**. It scans UTF-8 in O(n) time without allocations. `"é".len` and `"😀".len`
-are both 1; `"e\u{301}".len` is 2 and `"".len` is 0. Literals use the existing escapes (`\n`, `\r`,
+For a `string`, `@len(text)` is the Unicode scalar count as native `uint`, **not byte length or a grapheme
+count**. It scans UTF-8 in O(n) time without allocations. `@len("é")` and `@len("😀")`
+are both 1; `@len("e\u{301}")` is 2 and `@len("")` is 0. Literals use the existing escapes (`\n`, `\r`,
 `\t`, `\\`, `\"`, `\'`, `\0`, `\xNN`, `\u{...}`, `\{`, `\}`). Decoded bytes
 must be valid UTF-8; NUL is valid, including through `\x00` or `\u{0}`. Invalid
 escapes/UTF-8 report source locations. Unescaped `{expression}` interpolates a
@@ -3386,7 +3379,7 @@ let main: () -> void = {
     let mut text = prefix + ", 世界!"
     let shared = identity(text)
     text += " Again!"
-    @println(shared, shared.len, text)
+    @println(shared, @len(shared), text)
 }
 ```
 
@@ -3406,7 +3399,7 @@ never static byte pointers. Temporaries use the same precise root frames as arra
 ```nov
 let std = @import("std")
 let bytes = std.string.toBytes("é😀\0")
-@assert(bytes.len == 7) ; byte count, unlike string scalar .len
+@assert(@len(bytes) == 7) ; byte count, unlike string scalar @len(text)
 let result = std.string.fromBytes(bytes)
 @assert(result.unwrapOr("") == "é😀\0")
 @assert(std.string.fromBytes([0xFF]).isErr())
@@ -3460,7 +3453,7 @@ rescan UTF-8; optimization remains deferred. See
 
 ```nov
 let parts = std.string.split("one::three", ":")
-@assert(parts.len == 3)
+@assert(@len(parts) == 3)
 @assert(parts[0] == "one" and parts[1] == "" and parts[2] == "three")
 ```
 
@@ -3563,7 +3556,7 @@ let describe: (n: int, ready: bool) -> string = "n={n}, ready={ready}"
 ```
 
 Placeholders use the normal expression parser and checker: identifiers, calls
-(including nested calls), scalar operators, array access and `.len` work with the
+(including nested calls), scalar operators, array access and `@len(value)` work with the
 usual type contexts. For example, `"{describe(1, 5, 5)}\n{describe(5, 1, 3)}"`
 uses the callee's parameter types for the numeric arguments. Existing lexical
 scope, no-shadowing and declaration-before-use rules apply; spaces are allowed.
@@ -3618,7 +3611,7 @@ formatting string, but nested hooks can allocate and have user-code effects.
 Concatenation checks length overflow; allocation failure panics. This minimal implementation uses
 successive concatenations (potentially quadratic copied bytes for many chunks),
 not an optimized string builder. Interpolation works independently of printing,
-including equality, `.len`, branch results and returns; globals still require
+including equality, `@len(value)`, branch results and returns; globals still require
 literal initializers, not interpolation or eager evaluation.
 
 The formatter preserves the single literal token, including its chunks, escapes

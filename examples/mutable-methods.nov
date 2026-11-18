@@ -122,8 +122,8 @@ let generic_self_and_method_inference: () = {
     box.set(["after", "tail"])
     let exact: u8 = box.echo(@as(u8, 7))
     @assert(exact == 7 and box.echo(true))
-    @assert(box.value.len == 2 and box.value[0] == "after")
-    @assert(saved.value.len == 1 and saved.value[0] == "before")
+    @assert(@len(box.value) == 2 and box.value[0] == "after")
+    @assert(@len(saved.value) == 1 and saved.value[0] == "before")
 }
 
 @[test]

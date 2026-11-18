@@ -113,7 +113,7 @@ let escaping_closures_aliases_and_snapshots: () = {
     loop n in @as(int, 0)..256 {
         pressure += [[n, n + 1]]
     }
-    @assert(pressure.len == 256 and alias(1) == 1)
+    @assert(@len(pressure) == 256 and alias(1) == 1)
     @assert(saved.run(2) == 3 and roots[0].value.run(3) == 6)
     @assert(counter().run(1) == 1)
     let mut items: []int = [2]

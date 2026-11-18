@@ -1327,8 +1327,8 @@ test "TypeOf validation classifies writable places and local borrow sources unde
     for ([_]Case{
         .{ .expression = "{let a=1\nlet p=&a\np.*=2}", .tag = .immutable_assignment },
         .{ .expression = "{let mut s=\"a\"\ns[0]='x'}", .tag = .unsupported_assignment_target },
-        .{ .expression = "{let mut a=[1]\na.len=2}", .tag = .unsupported_array_length_write },
-        .{ .expression = "{let mut s=\"a\"\ns.len=2}", .tag = .unsupported_array_length_write },
+        .{ .expression = "{let mut a=[1]\n@len(a)=2}", .tag = .unsupported_assignment_target },
+        .{ .expression = "{let mut s=\"a\"\n@len(s)=2}", .tag = .unsupported_assignment_target },
         .{ .expression = "{let s=\"a\"\nlet p=&s[0]\np}", .tag = .unsupported_borrow },
         .{ .expression = "&g", .tag = .unsupported_borrow },
         .{ .expression = "{let a=[1]\nlet p=&a[999]\np}", .tag = null },

@@ -211,7 +211,7 @@ let record_payloads_and_recursive_array_copies: () = {
     let mut copy = mapped.unwrapOr(fallback)
     copy.values[0] = [7]
     @assert(mapped.unwrapOr(fallback).values[0][0] == 1)
-    @assert(propagated.unwrapOr(fallback).values[0].len == 2)
+    @assert(@len(propagated.unwrapOr(fallback).values[0]) == 2)
     @assert(
         match mappedError {
             .ok => false

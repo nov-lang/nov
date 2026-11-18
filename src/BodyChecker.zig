@@ -552,6 +552,7 @@ const Context = struct {
     region: Ast.Node.Index = 0,
     borrow_base: ?Ast.Node.Index = null,
     projection_base: ?Ast.Node.Index = null,
+    len_projection_tails: ?*const std.AutoHashMapUnmanaged(Ast.Node.Index, void) = null,
     reservation: ?*const Reservation = null,
     parent: ?*Context = null,
     template_allocator: ?std.mem.Allocator = null,
@@ -2875,6 +2876,12 @@ const Context = struct {
         if (self.module.diagnostics.items.len == start) _ = try self.fail(.unsupported_body_expression, node, null);
     }
 
+    fn isLen(self: *Context, node: Ast.Node.Index) bool {
+        const ast = &self.module.source.ast;
+        return ast.nodes.items(.tag)[node] == .builtin_literal and
+            std.mem.eql(u8, ast.tokenSlice(ast.firstToken(node)), "@len");
+    }
+
     fn stringBytes(self: *Context, node: Ast.Node.Index) ?bool {
         const ast = &self.module.source.ast;
         if (ast.nodes.items(.tag)[node] != .builtin_literal) return null;
@@ -3060,7 +3067,7 @@ const Context = struct {
                 if (try self.staticMethod(node)) |id| break :blk try self.globalType(id);
                 const base = (try self.probe(data.lhs, depth + 1)) orelse break :blk null;
                 if (self.fieldIndex(base.ty, ast.tokenSlice(data.rhs))) |index| break :blk .{ .ty = self.ir.getType(base.ty).?.record.fields[index].ty };
-                break :blk if (std.mem.eql(u8, ast.tokenSlice(data.rhs), "len")) .{ .ty = try self.ir.internType(.{ .integer = .{ .signedness = .unsigned, .bits = Ir.native_pointer_bits } }) } else null;
+                break :blk null;
             },
             .block, .block_two, .block_newline, .block_two_newline => try self.probeBlock(node, depth),
             .loop_condition, .loop_cont, .loop_else => blk: {
@@ -3153,6 +3160,10 @@ const Context = struct {
                     const diagnostics_start = self.module.diagnostics.items.len;
                     defer self.module.diagnostics.shrinkRetainingCapacity(diagnostics_start);
                     break :blk try self.ascribedType(call);
+                }
+                if (self.isLen(call.ast.fn_expr)) {
+                    if (call.ast.args.len != 1) break :blk null;
+                    break :blk .{ .ty = try self.ir.internType(.{ .integer = .{ .signedness = .unsigned, .bits = Ir.native_pointer_bits } }) };
                 }
                 if (self.stringBytes(call.ast.fn_expr)) |to_bytes| {
                     if (call.ast.args.len != 1) break :blk null;
@@ -3248,10 +3259,44 @@ const Context = struct {
     }
 
     fn copyRead(self: *Context, node: Ast.Node.Index, ty: Ir.TypeId) Error!void {
-        if (self.projection_base == node or !try self.ir.needsArrayCopy(ty)) return;
+        if (self.projection_base == node or
+            (if (self.len_projection_tails) |tails| tails.contains(node) else false) or
+            !try self.ir.needsArrayCopy(ty)) return;
         if (self.emitter) |emitter| {
             const copy = try emitter.append(ty, self.irSpan(node), .{ .array_clone = try emitter.value(node) });
             try emitter.values.put(emitter.allocator, node, copy);
+        }
+    }
+
+    // Only selected results are readonly. Earlier statements and initializers
+    // still snapshot storage, as do bases evaluated before effectful indexes.
+    fn collectLenProjectionTails(self: *Context, tails: *std.AutoHashMapUnmanaged(Ast.Node.Index, void), node: Ast.Node.Index, depth: usize) Error!void {
+        if (depth >= max_recursive_depth) return;
+        try tails.put(self.module.allocator, node, {});
+        const ast = &self.module.source.ast;
+        const data = ast.nodes.items(.data)[node];
+        switch (ast.nodes.items(.tag)[node]) {
+            .block, .block_two, .block_newline, .block_two_newline => {
+                var buffer: [2]Ast.Node.Index = undefined;
+                const statements = ast.fullBlock(&buffer, node).?.ast.statements;
+                if (statements.len != 0 and ast.nodes.items(.tag)[statements[statements.len - 1]] != .decl)
+                    try self.collectLenProjectionTails(tails, statements[statements.len - 1], depth + 1);
+            },
+            .call, .call_one => {
+                const call = ast.fullCall(node).?.ast;
+                if (self.isAscription(call.fn_expr) and call.args.len == 2)
+                    try self.collectLenProjectionTails(tails, call.args[1], depth + 1);
+            },
+            .if_else => {
+                const branch = ast.fullIf(node).?.ast;
+                try self.collectLenProjectionTails(tails, branch.then_expr, depth + 1);
+                try self.collectLenProjectionTails(tails, branch.else_expr, depth + 1);
+            },
+            .field_access => try self.collectLenProjectionTails(tails, data.lhs, depth + 1),
+            .array_access => if (self.inertIndex(data.rhs)) {
+                try self.collectLenProjectionTails(tails, data.lhs, depth + 1);
+            },
+            else => {},
         }
     }
 
@@ -3344,7 +3389,7 @@ const Context = struct {
                 }
                 const base = try emitter.value(data.lhs);
                 if (self.fieldIndex(emitter.instructions.items[@backingInt(base)].ty, ast.tokenSlice(data.rhs))) |index| break :blk .{ .field_read = .{ .base = base, .index = index } };
-                break :blk .{ .array_len = base };
+                return error.InvalidOperation;
             },
             .in => .{ .array_contains = .{ .value = try emitter.value(data.lhs), .array = try emitter.value(data.rhs) } },
             .identifier, .container_field => blk: {
@@ -3418,6 +3463,7 @@ const Context = struct {
                     try emitter.values.put(emitter.allocator, node, try emitter.value(call.ast.args[1]));
                     return true;
                 }
+                if (self.isLen(call.ast.fn_expr)) break :blk .{ .array_len = try emitter.value(call.ast.args[0]) };
                 if (self.stringBytes(call.ast.fn_expr)) |to_bytes| {
                     const value = try emitter.value(call.ast.args[0]);
                     break :blk if (to_bytes) .{ .string_to_bytes = value } else .{ .bytes_to_string = value };
@@ -3446,12 +3492,6 @@ const Context = struct {
         const data = ast.nodes.items(.data)[node];
         const target = ast.nodes.items(.data)[data.lhs];
         const name = ast.tokenSlice(target.rhs);
-        if (std.mem.eql(u8, name, "len")) {
-            if (try self.probe(target.lhs, depth + 1)) |base| {
-                const ty = self.ir.getType(base.ty).?;
-                if (ty == .array or ty == .string) return self.fail(.unsupported_array_length_write, data.lhs, null);
-            }
-        }
         var path_nodes: [Ir.max_record_depth]Ast.Node.Index = undefined;
         var path_len: usize = 0;
         var root = target.lhs;
@@ -4734,10 +4774,7 @@ const Context = struct {
                     return self.fit(array.record.fields[index].ty, expected, node);
                 }
                 if (array != .array and array != .string) return self.fail(.unsupported_body_expression, node, null);
-                if (ast.nodes.items(.tag)[node] == .field_access) {
-                    if (!std.mem.eql(u8, ast.tokenSlice(data.rhs), "len")) return self.fail(.unsupported_body_expression, node, null);
-                    return self.fit(try self.ir.internType(.{ .integer = .{ .signedness = .unsigned, .bits = Ir.native_pointer_bits } }), expected, node);
-                }
+                if (ast.nodes.items(.tag)[node] == .field_access) return self.fail(.unknown_field, node, null);
                 const index = try self.ir.internType(.{ .integer = .{ .signedness = .signed, .bits = Ir.native_pointer_bits } });
                 if (try self.expression(data.rhs, .{ .ty = index }, depth + 1) == null) return null;
                 const element = if (array == .string) try self.ir.internType(.rune) else array.array;
@@ -5111,6 +5148,26 @@ const Context = struct {
                     }
                     return self.fit(unit, expected, node);
                 }
+                if (self.isLen(call.ast.fn_expr)) {
+                    if (call.ast.args.len != 1) return self.fail(.argument_count_mismatch, node, null);
+                    const result = try self.ir.internType(.{ .integer = .{ .signedness = .unsigned, .bits = Ir.native_pointer_bits } });
+                    var tails: std.AutoHashMapUnmanaged(Ast.Node.Index, void) = .empty;
+                    defer tails.deinit(self.module.allocator);
+                    try self.collectLenProjectionTails(&tails, call.ast.args[0], depth + 1);
+                    const previous_base = self.borrow_base;
+                    const previous_tails = self.len_projection_tails;
+                    self.borrow_base = call.ast.args[0];
+                    self.len_projection_tails = &tails;
+                    const operand = blk: {
+                        defer self.borrow_base = previous_base;
+                        defer self.len_projection_tails = previous_tails;
+                        break :blk (try self.projection(call.ast.args[0], null, depth + 1)) orelse return null;
+                    };
+                    if (self.terminated) return if (expected) |want| want.ty else result;
+                    const ty = self.ir.getType(operand).?;
+                    if (ty != .array and ty != .string) return self.fail(.expression_type_mismatch, call.ast.args[0], null);
+                    return self.fit(result, expected, node);
+                }
                 if (self.stringBytes(call.ast.fn_expr)) |to_bytes| {
                     if (call.ast.args.len != 1) return self.fail(.argument_count_mismatch, node, null);
                     const string = try self.ir.internType(.string);
@@ -5218,9 +5275,6 @@ const Context = struct {
                         }
                         return self.fit(function.result, expected, node);
                     }
-                    // Array/string len also shadows method lookup.
-                    if ((container == .array or container == .string) and std.mem.eql(u8, ast.tokenSlice(field.rhs), "len"))
-                        return self.fail(.not_callable, node, null);
                     if (container == .record or container == .enumeration or Module.numericField(ast.tokenSlice(field.rhs))) return self.fail(.unknown_field, call.ast.fn_expr, null);
                     return self.fail(.unsupported_body_expression, call.ast.fn_expr, null);
                 }
@@ -6308,8 +6362,8 @@ test "instance calls diagnose signatures arity exact identity and preserve field
         .{ .source = "let R=struct{let f:(r:R,n:int)->bool=true\n}\nlet main:()={let r=R.[]\nr.f(true)}", .tag = .literal_type_mismatch },
         .{ .source = "let R=struct{}\nlet f:(r:R)->bool=true\nlet main:()={let r=R.[]\nr.f()}", .tag = .unknown_field },
         .{ .source = "let R=struct{f:bool=true,}\nlet main:()={let r=R.[]\nr.f()}", .tag = .not_callable },
-        .{ .source = "let main:()={let s=\"hi\"\ns.len()}", .tag = .not_callable },
-        .{ .source = "let main:()={let a:[]int=[1]\na.len()}", .tag = .not_callable },
+        .{ .source = "let main:()={let s=\"hi\"\ns.len()}", .tag = .unsupported_body_expression },
+        .{ .source = "let main:()={let a:[]int=[1]\na.len()}", .tag = .unsupported_body_expression },
         .{ .source = "let main:()={let s=\"hi\"\ns.close()}", .tag = .unsupported_body_expression },
         .{ .source = "let main:()={let a:[]int=[1]\na.close()}", .tag = .unsupported_body_expression },
         .{ .source = "let R=struct{let f:(r:R)->bool=true\n}\nlet main:()={let r=R.[]\nlet f=r.f\n}", .tag = .unknown_field },
@@ -7228,7 +7282,7 @@ test "printing malformed explicit hooks never falls back" {
 
 test "printing ordinary values is not speculative type resolution" {
     for ([_][]const u8{
-        "let S=struct{x:int,}\nlet f:(value:S,items:[]int)={@println(value.x,items.len,true)\n@println(\"{value.x} {items.len}\")}",
+        "let S=struct{x:int,}\nlet f:(value:S,items:[]int)={@println(value.x,@len(items),true)\n@println(\"{value.x} {@len(items)}\")}",
         "let value=true\nlet main:()=@println(value)",
     }) |source| {
         var module = try Module.init(std.testing.allocator, "value-printing.nov", source);
@@ -7385,7 +7439,7 @@ test "boolean match coverage retains exact bidirectional types scopes and nonboo
         "let f: (b: bool) -> int = match b {false => 1\nfalse | _ => 2}",
         "let f: () -> int = match true {true => 1\n_ => 2}",
         "let f: (b: bool, n: int) -> void = {let x = match b {true => 1\nfalse => n}\n@println(x)}",
-        "let f: (b: bool, a: []int) -> void = {let x = match b {true => []\nfalse => a}\n@println(x.len)}",
+        "let f: (b: bool, a: []int) -> void = {let x = match b {true => []\nfalse => a}\n@println(@len(x))}",
         "let f: (b: bool, n: int) -> void = {let x = match b {true => {return}\nfalse => match b {true => 1\nfalse => n}}\n@println(x)}",
         "let f: () -> int = match {return 7} {true => 1\nfalse => 2}",
     }) |source| {
@@ -7596,7 +7650,7 @@ test "string inference accepts late literals calls lengths and branch context" {
         \\    let mut x = {let y = "a"
         \\        y + s}
         \\    x = if b {id(x)} else {"b"}
-        \\    let length: uint = x.len
+        \\    let length: uint = @len(x)
         \\    @println(length, "", x)
         \\    if b {"prefix"} else {s} + x
         \\}
@@ -7707,7 +7761,7 @@ test "string scalar indexing has exact rune inference through contexts construct
         \\    @assert(text()[1]=='\0')
         \\    @assert(text()[2]=='z')
         \\    @assert(text()[-1]=='z')
-        \\    @println(sum,bytes[0],branch,matched,looped,a[0][1],s.len)
+        \\    @println(sum,bytes[0],branch,matched,looped,a[0][1],@len(s))
         \\    let wrapped:U=U.text[s]
         \\    @println(match wrapped {.text=>|v|v[0]})
         \\    take(inferred)==G(string).[value=s].byte(i)
@@ -8014,6 +8068,32 @@ test "string byte conversion builtins lower exact typed copy operations under OO
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testStringByteConversions, .{});
 }
 
+test "len builtin validates exact operands and removes only synthetic fields" {
+    for ([_][]const u8{
+        "@len()", "@len(\"a\",\"b\")", "@len(1)", "@len(true)", "@len(@as([]u8,[1])[0])", "@len('a')",
+    }) |operand| {
+        for ([_]bool{ false, true }) |query| {
+            const source = try std.fmt.allocPrint(std.testing.allocator, "let f:()={{let n{s}{s}{s}{s}\n}}", .{ if (query) ":@TypeOf(" else "=", operand, if (query) ")" else "", if (query) "=0" else "" });
+            defer std.testing.allocator.free(source);
+            var module = try Module.init(std.testing.allocator, "invalid-len.nov", source);
+            defer module.deinit();
+            var sema = try Lowering.lower(&module);
+            defer sema.deinit();
+            try std.testing.expect(module.hasErrors());
+            try std.testing.expect(!sema.lowering_complete);
+        }
+    }
+    for ([_][]const u8{
+        "let f:(a:[]int)->uint=a.len",       "let f:(s:string)->uint=s.len",
+        "let f:(a:[]int)->@TypeOf(a.len)=0", "let f:(s:string)->@TypeOf(s.len)=0",
+    }) |source| {
+        var module = try Module.init(std.testing.allocator, "removed-len.nov", source);
+        defer module.deinit();
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        try std.testing.expect(module.hasErrors());
+    }
+}
 test "string byte conversion builtins reject arity and inexact operands including TypeOf" {
     for ([_][]const u8{
         "@stringToBytes()",                "@stringToBytes(\"a\",\"b\")", "@stringFromBytes()",            "@stringFromBytes([],[])",
@@ -8514,7 +8594,7 @@ test "conditional loop else results use exact bidirectional types and ignore ter
         \\    let h = loop false {} else {loop true {break "x"} else {"y"}}
         \\    let i = loop {loop false {break} else {break 3}
         \\        break n}
-        \\    @println(a, b, c, d, e[0], f(1), g.len, h, i)
+        \\    @println(a, b, c, d, e[0], f(1), @len(g), h, i)
         \\}
     ;
     var module = try Module.init(std.testing.allocator, "else.nov", source);
@@ -8788,7 +8868,7 @@ test "inferred locals reuse known expression types and nested probe scopes" {
             "let from_global = global\nlet from_param = p\nlet called = other(from_param)\n" ++
             "let sum = 1 + called\nlet mut result = if yes {{1}} else {{sum}}\nresult += 1\n" ++
             "let array: []{s} = [p]\nlet mut copy = array\ncopy[0] = result\n" ++
-            "let size = copy.len\nlet element = copy[0]\n@println(size, element, no, from_global)\n" ++
+            "let size = @len(copy)\nlet element = copy[0]\n@println(size, element, no, from_global)\n" ++
             "let nested = 1 + {{let first = p\nlet second = {{let inner = first\ninner}}\nsecond}}\n" ++
             "@println({{let reused = p\nreused}} == {{let reused = p\nreused}})\n" ++
             "nested\n}}", .{ name, name, name, name });
@@ -8806,7 +8886,7 @@ test "scalar array literals infer known elements bidirectionally across expressi
         const source = try std.fmt.allocPrint(std.testing.allocator, "let global: {s} = 7\nlet id: (x: {s}) -> {s} = x\nlet f: (p: {s}) -> void = {{\n" ++
             "let flags = [true, !false, p == 0]\nlet a = [-0, 1 + 2, global]\n" ++
             "let b = [0, id(p)]\nlet mut c = [0, p]\nc[0] += 1\nlet copy = c\n" ++
-            "let indexed = c[-1]\nlet length = flags.len\n" ++
+            "let indexed = c[-1]\nlet length = @len(flags)\n" ++
             "let nested = 1 + {{let a_local = [0, p]\nlet inner = {{let b_local = [0, a_local[0]]\nb_local[0]}}\ninner}}\n" ++
             "let late = [0, {{let reused = [0, p]\nreused[0]}}]\n" ++
             "let branch = if true {{[1, p]}} else {{[2, 3]}}\n" ++
@@ -8836,7 +8916,7 @@ test "array inference uses exact literal boundaries and expected context" {
             "let take: (a: []{s}) -> void = {{}}\n" ++
             "let out: (p: {s}) -> void = {{let empty: []{s} = []\n" ++
             "let explicit: []{s} = [{s}]\ntake([{s}, p])\n" ++
-            "let branch = if false {{[]}} else {{[p]}}\n@println(empty.len, explicit[0], branch[0])\n}}", .{ case.ty, case.ty, case.literal, case.ty, case.ty, case.ty, case.ty, case.literal, case.literal });
+            "let branch = if false {{[]}} else {{[p]}}\n@println(@len(empty), explicit[0], branch[0])\n}}", .{ case.ty, case.ty, case.literal, case.ty, case.ty, case.ty, case.ty, case.literal, case.literal });
         defer std.testing.allocator.free(source);
         var module = try Module.init(std.testing.allocator, "array-boundaries.nov", source);
         defer module.deinit();
@@ -9324,7 +9404,7 @@ test "iteration validates copies scoped loans source protection and unsupported 
         .{ .body = "let mut s=\"é😀\"\nloop r in s {let n:rune=r\ns=\"other\"\n@println(n)}" },
         .{ .body = "let mut a:[]int=[1]\nloop &x in a {x.* +=1\nlet copy=x.*\n@println(copy)}\na+=[3]" },
         .{ .body = "let a:[]int=[1]\nloop &x in a {@println(x.*)}" },
-        .{ .body = "let a:[]int=[]\nloop _ in a {} else {}\nloop &x in a {} else {@println(a.len)}" },
+        .{ .body = "let a:[]int=[]\nloop _ in a {} else {}\nloop &x in a {} else {@println(@len(a))}" },
         .{ .body = "let mut a:[]int=[1]\nloop &x in a {x.* =loop _ in 0..1 {break x.*+1} else {x.*}}" },
         .{ .body = "let mut a:[]int=[1]\nlet r=&a\nloop x in r.* {@println(x)}" },
         .{ .body = "let a:[]int=[1]\nloop x in a {x=2}", .tag = .immutable_assignment },
@@ -9336,7 +9416,7 @@ test "iteration validates copies scoped loans source protection and unsupported 
         .{ .body = "let mut a:[]int=[1]\nloop x in a {let r=&a[0]\nr.* =2}", .tag = .borrow_conflict },
         .{ .body = "let mut a:[]int=[1]\nloop x in a {loop &y in a {}}", .tag = .borrow_conflict },
         .{ .body = "let mut a:[]int=[1]\nloop &x in a {@println(a[0])}", .tag = .borrow_conflict },
-        .{ .body = "let mut a:[]int=[1]\nloop &x in a {@println(a.len)}", .tag = .borrow_conflict },
+        .{ .body = "let mut a:[]int=[1]\nloop &x in a {@println(@len(a))}", .tag = .borrow_conflict },
         .{ .body = "let mut a:[]int=[1]\nloop &x in a {a=[2]}", .tag = .borrow_conflict },
         .{ .body = "let mut a:[]int=[1]\nloop &x in a {a+=[2]}", .tag = .borrow_conflict },
         .{ .body = "let mut a:[]int=[1]\nloop &x in a {let r=&a[0]\n}", .tag = .borrow_conflict },
@@ -9695,28 +9775,28 @@ test "static integer borrowing types CFG last use and bounded escapes" {
 test "static borrowing structured last use conflicts and bounded escapes" {
     const Case = struct { body: []const u8, diagnostic: ?Module.Diagnostic.Tag = null };
     for ([_]Case{
-        .{ .body = "let r=&a[0]; r.*.x+=1; @println(a.len,a[0].x)" },
-        .{ .body = "let r=&a[0]; if flag {r.*.x+=1} else {@println(a.len)}; @println(a.len)" },
-        .{ .body = "if flag {let r=&a[0]; r.*.x=1} else {let s=&a[0]; s.*.x=2}; @println(a.len)" },
-        .{ .body = "loop i in 0..3 {let r=&a[0]; r.*.x+=1; @println(i,a.len)}" },
-        .{ .body = "let r=&a[0]; loop {r.*.x+=1; break}; @println(a.len)" },
-        .{ .body = "let r=&a[0]; loop {if flag {r.*.x+=1; break} else {@println(a.len); return}}; @println(a.len)" },
+        .{ .body = "let r=&a[0]; r.*.x+=1; @println(@len(a),a[0].x)" },
+        .{ .body = "let r=&a[0]; if flag {r.*.x+=1} else {@println(@len(a))}; @println(@len(a))" },
+        .{ .body = "if flag {let r=&a[0]; r.*.x=1} else {let s=&a[0]; s.*.x=2}; @println(@len(a))" },
+        .{ .body = "loop i in 0..3 {let r=&a[0]; r.*.x+=1; @println(i,@len(a))}" },
+        .{ .body = "let r=&a[0]; loop {r.*.x+=1; break}; @println(@len(a))" },
+        .{ .body = "let r=&a[0]; loop {if flag {r.*.x+=1; break} else {@println(@len(a)); return}}; @println(@len(a))" },
         .{ .body = "let r=&a[0]; let independent=[R.[]]; let copy=independent; r.*.x=copy[0].x" },
-        .{ .body = "let r=&a[0]; loop flag {r.*.x+=1; @println(a.len); break}; @println(a.len)" },
-        .{ .body = "let r=&a[0]; loop flag {if flag {r.*.x+=1; @println(a.len); break} else {return}}" },
-        .{ .body = "let r=&a[0]; loop flag {r.*.x+=1}; @println(a.len)" },
-        .{ .body = "let r=&a[0]; let n:int={loop {r.*.x+=1; break}; @println(a.len); 1}; @println(n)" },
-        .{ .body = "let r=&a[0]; loop {r.*.x+=1; loop {break}; @println(a.len); break}" },
-        .{ .body = "let r=&a[0]; if flag {r.*.x+=1} else {@println(a.len)}; r.*.x+=1", .diagnostic = .borrow_conflict },
-        .{ .body = "let r=&a[0]; loop {r.*.x+=1; loop {@println(a.len); break}; if flag {break}}", .diagnostic = .borrow_conflict },
-        .{ .body = "let r=&a[0]; loop {a.len==1} {r.*.x+=1}", .diagnostic = .borrow_conflict },
-        .{ .body = "let r=&a[0]; loop flag : @println(a.len) {r.*.x+=1}", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[0]; loop flag {r.*.x+=1; @println(@len(a)); break}; @println(@len(a))" },
+        .{ .body = "let r=&a[0]; loop flag {if flag {r.*.x+=1; @println(@len(a)); break} else {return}}" },
+        .{ .body = "let r=&a[0]; loop flag {r.*.x+=1}; @println(@len(a))" },
+        .{ .body = "let r=&a[0]; let n:int={loop {r.*.x+=1; break}; @println(@len(a)); 1}; @println(n)" },
+        .{ .body = "let r=&a[0]; loop {r.*.x+=1; loop {break}; @println(@len(a)); break}" },
+        .{ .body = "let r=&a[0]; if flag {r.*.x+=1} else {@println(@len(a))}; r.*.x+=1", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[0]; loop {r.*.x+=1; loop {@println(@len(a)); break}; if flag {break}}", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[0]; loop {@len(a)==1} {r.*.x+=1}", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[0]; loop flag : @println(@len(a)) {r.*.x+=1}", .diagnostic = .borrow_conflict },
         .{ .body = "let r=&a[0]; let b=flag and {a=[R.[]]; return}; r.*.x=1; @println(b)" },
-        .{ .body = "let r=&a[0]; let b=flag and {r.*.x=1; true}; @println(a.len,b)" },
-        .{ .body = "let r=&a[0]; match flag {true=>r.*.x=1; false=>@println(a.len)}; @println(a.len)" },
-        .{ .body = "let r=&a[0]; match flag {true=>r.*.x=1; false=>@println(a.len)}; r.*.x=2", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[0]; let b=flag and {r.*.x=1; true}; @println(@len(a),b)" },
+        .{ .body = "let r=&a[0]; match flag {true=>r.*.x=1; false=>@println(@len(a))}; @println(@len(a))" },
+        .{ .body = "let r=&a[0]; match flag {true=>r.*.x=1; false=>@println(@len(a))}; r.*.x=2", .diagnostic = .borrow_conflict },
         .{ .body = "let r=&a[0]; return r.*", .diagnostic = .expression_type_mismatch },
-        .{ .body = "let r=&a[0]; @println(a.len); r.*.x=1", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[0]; @println(@len(a)); r.*.x=1", .diagnostic = .borrow_conflict },
         .{ .body = "let r=&a[0]; let b=a; r.*.x=1", .diagnostic = .borrow_conflict },
         .{ .body = "let r=&a[0]; a=[R.[]]; r.*.x=1", .diagnostic = .borrow_conflict },
         .{ .body = "let r=&a[0]; a+=[R.[]]; r.*.x=1", .diagnostic = .borrow_conflict },
@@ -9726,10 +9806,10 @@ test "static borrowing structured last use conflicts and bounded escapes" {
         .{ .body = "let r=&a[0]; r.*.x={a=[R.[]]; 1}", .diagnostic = .borrow_conflict },
         .{ .body = "let r=&a[{a=[R.[]]; 0}]; r.*.x=1", .diagnostic = .borrow_conflict },
         .{ .body = "let r=&a[{a=[R.[]]; return}]; r.*.x=1", .diagnostic = .borrow_conflict },
-        .{ .body = "let r=&a[{@println(a.len); 0}]; r.*.x=1", .diagnostic = .borrow_conflict },
-        .{ .body = "let r=&a[0]; loop {r.*.x+=1; @println(a.len); if flag {break}}", .diagnostic = .borrow_conflict },
-        .{ .body = "let r=&a[0]; loop {r.*.x+=1; if flag {@println(a.len); continue} else {break}}", .diagnostic = .borrow_conflict },
-        .{ .body = "let r=&a[0]; loop {if flag {@println(a.len); continue} else {r.*.x+=1; break}}", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[{@println(@len(a)); 0}]; r.*.x=1", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[0]; loop {r.*.x+=1; @println(@len(a)); if flag {break}}", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[0]; loop {r.*.x+=1; if flag {@println(@len(a)); continue} else {break}}", .diagnostic = .borrow_conflict },
+        .{ .body = "let r=&a[0]; loop {if flag {@println(@len(a)); continue} else {r.*.x+=1; break}}", .diagnostic = .borrow_conflict },
         .{ .body = "let r=&a[0]; let b=flag and {a=[R.[]]; true}; r.*.x=1; @println(b)", .diagnostic = .borrow_conflict },
         .{ .body = "let r=&a[0]; let alias=r.*; alias.x=1", .diagnostic = .immutable_assignment },
         .{ .body = "let r=&a[0]; consume(r.*)" },
@@ -10799,4 +10879,173 @@ test "general borrowing reserves record owners through terminal field assignment
             }
         }
     }
+}
+
+test "len builtin terminal operands emit no length operation" {
+    for ([_][]const u8{
+        "let f:()->bool=@len(@panic(\"stop\"))",
+        "let f:()->string=@len({return \"done\"})",
+        "let f:()->uint=@len(loop {})",
+    }) |source| {
+        var module = try Module.init(std.testing.allocator, "terminal-len.nov", source);
+        defer module.deinit();
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expect(sema.lowering_complete);
+        try sema.ir.verify();
+        for (sema.ir.functions.items) |function| if (function.body) |body| for (body.instructions) |instruction| {
+            try std.testing.expect(instruction.op != .array_len);
+        };
+    }
+}
+
+test "len builtin TypeOf executes no calls captures loans or allocating operands" {
+    var module = try Module.init(std.testing.allocator, "len-typeof.nov",
+        \\let effect:()->[]int=[1]
+        \\let main:()={let mut a:[]int=[1]
+        \\let inspect=(){let n:@TypeOf(@len(effect()))=0
+        \\let m:@TypeOf(@len({let p=&a
+        \\p.*}))=0
+        \\let k:@TypeOf(@len([1,2,3]))=0
+        \\let wrapped:@TypeOf(@len(if true {@as([]int,{effect()})} else {a}))=0
+        \\}
+        \\let p=&a
+        \\inspect()
+        \\@println(p.*)}
+    );
+    defer module.deinit();
+    errdefer std.debug.print("len TypeOf: {any} AST {any}\n", .{ module.diagnostics.items, module.source.ast.errors });
+    var sema = try Lowering.lower(&module);
+    defer sema.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+    var calls: usize = 0;
+    for (sema.ir.functions.items) |function| {
+        try std.testing.expectEqual(@as(usize, 0), function.captures.len);
+        if (function.body) |body| for (body.instructions) |instruction| {
+            try std.testing.expect(instruction.op != .array_len);
+            if (instruction.op == .call) calls += 1;
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 1), calls);
+}
+
+fn testLenTransparentProjections(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "len-transparent.nov",
+        \\let block:(a:[][]int)->uint=@len({a})
+        \\let ascribed:(a:[][]int)->uint=@len(@as([][]int,a))
+        \\let selected:(a:[][]int,b:bool)->uint=@len(if b {a} else {a})
+        \\let nested:(a:[][]int,b:bool)->uint=@len({@as([][]int,if b {{a}} else {{a}})})
+        \\let indexed:(a:[][]int,b:bool)->uint=@len(@as([][]int,if b {{a}} else {{a}})[0])
+        \\let R=struct{items:[][]int,}
+        \\let field:(r:R)->uint=@len(@as(R,{r}).items[0])
+    );
+    defer module.deinit();
+    errdefer if (module.source.ast.errors.len != 0) std.debug.print("len transparent parse: {any}\n", .{module.source.ast.errors});
+    var sema = try Lowering.lower(&module);
+    defer sema.deinit();
+    errdefer if (module.hasErrors()) std.debug.print("len transparent: {any}\n", .{module.diagnostics.items});
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+    var lengths: usize = 0;
+    for (sema.ir.functions.items) |function| if (function.body) |body| for (body.instructions) |instruction| {
+        try std.testing.expect(instruction.op != .array_clone);
+        if (instruction.op == .array_len) lengths += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 6), lengths);
+}
+
+test "len builtin transparent readonly tails avoid recursive copies under OOM" {
+    try testLenTransparentProjections(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testLenTransparentProjections, .{});
+}
+
+test "len builtin readonly tails preserve earlier snapshots and preindex descriptors" {
+    var module = try Module.init(std.testing.allocator, "len-snapshots.nov",
+        \\let snapshot:(input:[][]int)->uint={let mut a=input
+        \\@len({let saved=a
+        \\a[0]=[9,10]
+        \\saved})}
+        \\let earlier:(a:[][]int)->uint=@len({@println(a)
+        \\a})
+        \\let effect:(input:[][]int)->uint={let mut a=input
+        \\@len(@as([][]int,{a})[{a[0]=[9,10]
+        \\0}])}
+    );
+    defer module.deinit();
+    var sema = try Lowering.lower(&module);
+    defer sema.deinit();
+    errdefer std.debug.print("len snapshots: {any}\n", .{module.diagnostics.items});
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+    for (sema.ir.functions.items) |function| {
+        const body = function.body orelse continue;
+        var copies: usize = 0;
+        var mutation: ?usize = null;
+        for (body.instructions, 0..) |instruction, i| switch (instruction.op) {
+            .array_clone => {
+                copies += 1;
+            },
+            .array_set => mutation = i,
+            .array_len => |operand| if (std.mem.eql(u8, function.name, "snapshot")) {
+                const load = body.instructions[@backingInt(operand)].op.local_load;
+                const stored = body.instructions[@backingInt(load)].op.local_slot;
+                try std.testing.expect(body.instructions[@backingInt(stored)].op == .array_clone);
+                try std.testing.expect(@backingInt(stored) < mutation.? and mutation.? < i);
+            },
+            .array_index => |access| {
+                try std.testing.expect(std.mem.eql(u8, function.name, "effect"));
+                try std.testing.expect(body.instructions[@backingInt(access.array)].op == .array_clone);
+                try std.testing.expect(@backingInt(access.array) < mutation.? and mutation.? < i);
+            },
+            else => {},
+        };
+        try std.testing.expectEqual(@as(usize, if (std.mem.eql(u8, function.name, "earlier")) 1 else 3), copies);
+    }
+}
+
+test "len builtin projects inert reads and snapshots effectful indexes once" {
+    var module = try Module.init(std.testing.allocator, "len-projection.nov",
+        \\let inert:(a:[][]int)->uint=@len(a[0])
+        \\let effect:(a:[][]int)->uint=@len(a[{@println("index")
+        \\0}])
+        \\let text:()->string="é\0😀"
+        \\let called:()->uint=@len({@as(string,{text()})})
+        \\let R=struct{len:uint,}
+        \\let field:(r:R)->uint={let mut v=r
+        \\v.len=2
+        \\v.len}
+    );
+    defer module.deinit();
+    var sema = try Lowering.lower(&module);
+    defer sema.deinit();
+    errdefer std.debug.print("len: {any}\n", .{module.diagnostics.items});
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+    var lengths: usize = 0;
+    var copies: usize = 0;
+    var calls: usize = 0;
+    var prints: usize = 0;
+    for (sema.ir.functions.items) |function| if (function.body) |body| for (body.instructions) |instruction| {
+        switch (instruction.op) {
+            .array_len => {
+                lengths += 1;
+                try std.testing.expectEqual(Ir.native_pointer_bits, sema.ir.getType(instruction.ty).?.integer.bits);
+                try std.testing.expect(sema.ir.getType(instruction.ty).?.integer.signedness == .unsigned);
+            },
+            .array_clone => copies += 1,
+            .call => calls += 1,
+            .print => prints += 1,
+            else => {},
+        }
+    };
+    try std.testing.expectEqual(@as(usize, 3), lengths);
+    try std.testing.expectEqual(@as(usize, 1), copies);
+    try std.testing.expectEqual(@as(usize, 1), calls);
+    try std.testing.expectEqual(@as(usize, 1), prints);
 }

@@ -117,12 +117,12 @@ let managed_arrays_records_and_strings: () = {
     append(&words, "tail")
     suffix(&words[0], "!")
     @assert(words[0] == "old!" and words[1] == "tail")
-    @assert(saved.len == 1 and saved[0] == "old")
+    @assert(@len(saved) == 1 and saved[0] == "old")
     let mut record = Record.[ name = "record", values = ["original"] ]
     let snapshot = record
     update(&record)
-    @assert(record.name == "record!" and record.values.len == 2)
-    @assert(snapshot.name == "record" and snapshot.values.len == 1)
+    @assert(record.name == "record!" and @len(record.values) == 2)
+    @assert(snapshot.name == "record" and @len(snapshot.values) == 1)
     let mut other: []string = ["other"]
     swap(&words, &other)
     @assert(words[0] == "other" and other[0] == "old!")
@@ -173,6 +173,6 @@ let argument_order_snapshots_actual_target: () = {
             "tail"
         }
     )
-    @assert(items.*.len == 1 and items.*[0] == "second")
-    @assert(first.len == 2 and first[1] == "tail" and snapshot.len == 1)
+    @assert(@len(items.*) == 1 and items.*[0] == "second")
+    @assert(@len(first) == 2 and first[1] == "tail" and @len(snapshot) == 1)
 }

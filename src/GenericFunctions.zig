@@ -915,6 +915,43 @@ test "integer defaults generic argument fallback and pipes roll back under OOM" 
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testIntegerDefaultInference, .{});
 }
 
+fn testLenBuiltinInference(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "len-inference.nov",
+        \\let length:(xs:[]`T)->uint=@len(xs)
+        \\let inferred:(xs:[]`T)->`U=@len(xs)
+        \\let text:(s:string)->uint=@len(s)
+        \\let main:()={let f=(xs:[]int){@len(xs)}
+        \\@println(length([1]),inferred([true]),text("é\0😀"),f([1]))}
+    );
+    defer module.deinit();
+    var sema = try Lowering.lower(&module);
+    defer sema.deinit();
+    errdefer if (module.hasErrors()) std.debug.print("len inference: {any}\n", .{module.diagnostics.items});
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+}
+
+test "len builtin does not infer string for an unconstrained generic operand" {
+    for ([_][]const u8{
+        "let length:(x:`T)->uint=@len(x)\nlet main:()=@println(length(true))",
+        "let f=(){let length=(x){@len(x)}\n}",
+        "let length:(xs:[]`T)->uint=@len(xs[0])\nlet main:()=@println(length([1]))",
+    }) |source| {
+        var module = try Module.init(std.testing.allocator, "ambiguous-len.nov", source);
+        defer module.deinit();
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        try std.testing.expect(module.hasErrors());
+        try std.testing.expect(!sema.lowering_complete);
+    }
+}
+
+test "len builtin generic array string overloads infer under OOM" {
+    try testLenBuiltinInference(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testLenBuiltinInference, .{});
+}
+
 fn testStringByteBuiltinInference(allocator: std.mem.Allocator) !void {
     var module = try Module.init(allocator, "string-byte-generic.nov",
         \\let id:(x:`T)->`T=x
@@ -1139,8 +1176,9 @@ const Solver = struct {
     query_assignments: std.ArrayList(struct { operand: *Term, module: *Module, node: Ast.Node.Index }) = .empty,
     query_unions: std.ArrayList(struct { payload_type: *Term, module: *Module, node: Ast.Node.Index, payload: Ast.Node.Index, enum_payload: bool }) = .empty,
     query_matches: std.ArrayList(struct { module: *Module, node: Ast.Node.Index, subjects: []const *Term }) = .empty,
+    length_operands: std.ArrayList(*Term) = .empty,
     query_statements: std.ArrayList(struct { operand: *Term, span: Module.Span }) = .empty,
-    query_places: std.ArrayList(struct { operand: *Term, kind: enum { array, record, mutable_reference, borrow_array }, span: Module.Span, length: bool = false }) = .empty,
+    query_places: std.ArrayList(struct { operand: *Term, kind: enum { array, record, mutable_reference, borrow_array }, span: Module.Span }) = .empty,
     analysis: ?*const Sema = null,
     types: []const ?Ir.TypeId = &.{},
     unsupported: ?Module.Span = null,
@@ -1285,6 +1323,11 @@ const Solver = struct {
                 return;
             }
         }
+        for (self.length_operands.items) |operand| {
+            const value = root(operand).value;
+            if (value == .array or value == .never or (value == .known and self.ir.getType(value.known).? == .string)) continue;
+            try self.fail(if (value == .unknown) .generic_function_ambiguous else .expression_type_mismatch, operand.span, null);
+        }
         for (self.query_places.items) |place| {
             const operand = root(place.operand);
             const valid = switch (place.kind) {
@@ -1296,7 +1339,7 @@ const Solver = struct {
                 .borrow_array => .unsupported_borrow,
                 .mutable_reference => .immutable_assignment,
                 .array => .unsupported_assignment_target,
-                .record => if (place.length and (operand.value == .array or (operand.value == .known and self.ir.getType(operand.value.known).? == .string))) .unsupported_array_length_write else .unsupported_assignment_target,
+                .record => .unsupported_assignment_target,
             }, place.span, null);
         }
         for (self.query_statements.items) |statement| {
@@ -2083,9 +2126,8 @@ const Solver = struct {
             if (ty == .record) {
                 if (Module.recordFieldIndex(ty.record, name)) |index| return self.fromType(ty.record.fields[index].ty, span, 0);
             }
-            if (ty == .string and std.mem.eql(u8, name, "len")) return self.fromType(try self.ir.internType(.{ .integer = .{ .signedness = .unsigned, .bits = Ir.native_pointer_bits } }), span, 0);
         }
-        if (base.value == .array and std.mem.eql(u8, name, "len")) return self.fromType(try self.ir.internType(.{ .integer = .{ .signedness = .unsigned, .bits = Ir.native_pointer_bits } }), span, 0);
+
         if (self.querying or numeric) try self.fail(.unknown_field, span, null);
         self.unsupported = self.unsupported orelse span;
         return self.term(.unknown, span);
@@ -2344,11 +2386,10 @@ const Solver = struct {
                 if (base.value != .unknown) {
                     if (ast.nodes.items(.tag)[node] == .array_access and base.value != .array) return self.fail(.unsupported_assignment_target, span, null);
                     if (ast.nodes.items(.tag)[node] == .field_access and base.value != .structural and base.value != .nominal and !(base.value == .known and self.ir.getType(base.value.known).? == .record)) {
-                        const length = std.mem.eql(u8, ast.tokenSlice(data.rhs), "len") and (base.value == .array or (base.value == .known and self.ir.getType(base.value.known).? == .string));
-                        return self.fail(if (length) .unsupported_array_length_write else .unsupported_assignment_target, span, null);
+                        return self.fail(.unsupported_assignment_target, span, null);
                     }
                 }
-                try self.query_places.append(self.allocator, .{ .operand = base, .kind = if (ast.nodes.items(.tag)[node] == .field_access) .record else .array, .span = span, .length = ast.nodes.items(.tag)[node] == .field_access and std.mem.eql(u8, ast.tokenSlice(data.rhs), "len") });
+                try self.query_places.append(self.allocator, .{ .operand = base, .kind = if (ast.nodes.items(.tag)[node] == .field_access) .record else .array, .span = span });
                 try self.writablePlace(frame, data.lhs, depth + 1);
             },
             else => try self.fail(.unsupported_assignment_target, span, null),
@@ -2915,6 +2956,16 @@ const Solver = struct {
                     return ty;
                 }
                 const callee_name = ast.tokenSlice(ast.firstToken(call.ast.fn_expr));
+                if (ast.nodes.items(.tag)[call.ast.fn_expr] == .builtin_literal and std.mem.eql(u8, callee_name, "@len")) {
+                    if (call.ast.args.len != 1) {
+                        try self.fail(.argument_count_mismatch, span, null);
+                        return self.term(.unknown, span);
+                    }
+                    const operand = try self.expression(frame, call.ast.args[0], depth + 1);
+                    if (root(operand).value == .never) return operand;
+                    try self.length_operands.append(self.allocator, operand);
+                    return self.fromType(try self.ir.internType(.{ .integer = .{ .signedness = .unsigned, .bits = Ir.native_pointer_bits } }), span, 0);
+                }
                 if (ast.nodes.items(.tag)[call.ast.fn_expr] == .builtin_literal and
                     (std.mem.eql(u8, callee_name, "@stringToBytes") or std.mem.eql(u8, callee_name, "@stringFromBytes")))
                 {
@@ -4042,7 +4093,7 @@ fn testReviewConstraints(allocator: std.mem.Allocator) !void {
         \\let Box:(T:type)->type=struct{value:T,}
         \\let unwrap:(x:Box(`T))->`U=x.value
         \\let invert:(x:`T)->`U=!x
-        \\let size:(x:`T)->`U=x.len
+        \\let size:(x:`T)->`U=@len(x)
         \\let make:(value:`T)->()->`U=()->`U{value}
         \\let makeNamed:(value:`T)->(bool)->`U={let captured:(ignored:bool)->`U=value
         \\captured}
@@ -4818,11 +4869,11 @@ fn testInferredClosureSignatures(allocator: std.mem.Allocator) !void {
         \\let apply:(f:(`T)->`U,x:`T)->`U=f(x)
         \\let main:()={
         \\let identity=(x){x}
-        \\let length=(x){x.len}
+        \\let length=(x){@len(x)}
         \\let load=(x){x.*}
         \\let number=(){1}
         \\let captured=(){saved}
-        \\let nested=(x){let read=(y){y.len}
+        \\let nested=(x){let read=(y){@len(y)}
         \\read(x)}
         \\let separate=(x,y){y}
         \\let unused=(x){true}
@@ -4962,8 +5013,8 @@ test "inferred closures review readonly layouts forward calls deferred projectio
         .{ .source = "let f=(x:int){return g(x)}\nlet g=(x:int){x+1}", .result = .integer },
         .{ .source = "let g=(){}\nlet f=(){return g()}", .result = .unit },
         .{ .source = "let f=(){return g()}\nlet g=(){}", .result = .unit },
-        .{ .source = "let both:(f:(`T)->`U,g:()->`T)->`U=f(g())\nlet f=(){both((x){x.len},(){\"abc\"})}", .result = .uint },
-        .{ .source = "let both:(g:()->`T,f:(`T)->`U)->`U=f(g())\nlet f=(){both((){\"abc\"},(x){x.len})}", .result = .uint },
+        .{ .source = "let both:(f:(`T)->`U,g:()->`T)->`U=f(g())\nlet f=(){both((x){@len(x)},(){\"abc\"})}", .result = .uint },
+        .{ .source = "let both:(g:()->`T,f:(`T)->`U)->`U=f(g())\nlet f=(){both((){\"abc\"},(x){@len(x)})}", .result = .uint },
         .{ .source = "@[noreturn]\nlet f=(){@panic(\"bad\")}", .result = .unit },
         .{ .source = "let f=(){loop{}}", .result = .unit },
         .{ .source = "let f=(){return f()}", .result = .ambiguous },

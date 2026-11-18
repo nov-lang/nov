@@ -2,7 +2,7 @@
 ; nov test examples/string-slices.nov
 ; String slices are immutable, zero-copy views that keep their GC owner alive.
 ; .. excludes the end; ..= includes an explicit end scalar.
-; Bounds and .len count Unicode scalars, not UTF-8 bytes or grapheme clusters.
+; Bounds and @len(text) count Unicode scalars, not UTF-8 bytes or grapheme clusters.
 ; Only native int bounds are accepted; negative bounds count from the scalar end.
 
 let middle: (text: string) -> string = text[1..-1]
@@ -20,7 +20,7 @@ let main: () = {
     @println(snapshot, text, middle(text))
     let with_nul = "é\0😀"
     @assert(with_nul[1..2] == "\0")
-    @assert(with_nul[..].len == 3)
+    @assert(@len(with_nul[..]) == 3)
 }
 
 @[test]
@@ -46,7 +46,7 @@ let empty_boundaries: () = {
     @assert(text[2..2] == "")
     @assert(text[2..] == "")
     @assert(text[..0] == "")
-    @assert(text[-2..-2].len == 0)
+    @assert(@len(text[-2..-2]) == 0)
     @assert(""[..] == "")
     @assert(""[0..0] == "")
     @assert(""[..0] == "")
@@ -56,13 +56,13 @@ let empty_boundaries: () = {
 @[test]
 let unicode_and_nul: () = {
     let text = "aé😀\0e\u{301}z"
-    @assert(text.len == 7)
+    @assert(@len(text) == 7)
     @assert(text[1..4] == "é😀\0")
-    @assert(text[1..4].len == 3)
+    @assert(@len(text[1..4]) == 3)
     @assert(text[-4..-3] == "\0")
     @assert(text[3..4][0] == '\0')
     @assert(text[4..6] == "e\u{301}")
-    @assert(text[4..6].len == 2)
+    @assert(@len(text[4..6]) == 2)
     @assert(text[1..3][-1] == '😀')
 }
 
@@ -71,11 +71,11 @@ let nested_views: () = {
     let text = "xé😀\0yz"
     let view = text[1..-1]
     @assert(view == "é😀\0y")
-    @assert(view.len == 4)
+    @assert(@len(view) == 4)
     @assert(view[1..-1] == "😀\0")
     @assert(view[..2][1..] == "😀")
     @assert(view[..] == view)
-    @assert(view[4..].len == 0)
+    @assert(@len(view[4..]) == 0)
 }
 
 @[test]
@@ -121,10 +121,10 @@ let retained_owner: () = {
     let stored: []string = [view, nested]
     loop i in 0..2000 {
         let temporary = "allocation:{i}:é😀"
-        @assert(temporary.len > 0)
+        @assert(@len(temporary) > 0)
     }
     @assert(stored[0] == "é😀\0")
     @assert(stored[1] == "😀\0")
-    @assert(nested.len == 2)
+    @assert(@len(nested) == 2)
     @assert(nested[-1] == '\0')
 }

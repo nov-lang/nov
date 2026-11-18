@@ -260,9 +260,9 @@ Signatures here use `T`/`U` for inferred backtick type variables:
   matching element by value.
 - `array.findLast(items: []T, predicate: (T) -> bool) -> Option(T)` visits elements
   from the end and stops at the first match, returning the last matching value.
-- `array.take(items: []T, count: uint) -> []T` returns the first `min(count, items.len)`
+- `array.take(items: []T, count: uint) -> []T` returns the first `min(count, @len(items))`
   elements in source order.
-- `array.drop(items: []T, count: uint) -> []T` discards the first `min(count, items.len)`
+- `array.drop(items: []T, count: uint) -> []T` discards the first `min(count, @len(items))`
   elements and returns the remainder in source order.
 - `array.findIndex(items: []T, predicate: (T) -> bool) -> Option(uint)` returns its
   zero-based, pointer-sized unsigned index.
@@ -387,9 +387,9 @@ shared closure environments and eager argument order.
 
 ```nov
 let bytes = std.string.toBytes("é😀\0")
-@assert(bytes.len == 7)
+@assert(@len(bytes) == 7)
 let text = std.string.fromBytes(bytes).unwrapOr("")
-@assert(text == "é😀\0" and text.len == 3)
+@assert(text == "é😀\0" and @len(text) == 3)
 @assert(std.string.fromBytes([0xED, 0xA0, 0x80]).isErr())
 ```
 
@@ -406,8 +406,11 @@ Neither direction mutates its input or shares mutable byte storage with it.
 Later array writes cannot change a string, and returned bytes cannot change their
 source string. Results remain valid after source scope exit, rebinding and GC
 churn, including conversion of string slices. NUL is ordinary data; no terminator,
-normalization, case folding or grapheme processing is added. Array `.len` counts
-bytes while string `.len` counts Unicode scalars.
+normalization, case folding or grapheme processing is added. `@len(bytes)` counts
+byte elements for a `[]u8` array; other arrays count their elements, not bytes.
+`@len(text)` counts Unicode scalars for a `string`, not bytes or grapheme clusters.
+Both return native `uint`. A real struct field named `len` remains an ordinary
+field; `@len` does not accept records or use user-defined length protocols.
 
 Use `.!` in a function returning a compatible Result to propagate `Utf8Error`, or
 match `.ok`/`.err` and the `.invalidUtf8` enum case. The wrappers are ordinary
@@ -460,7 +463,7 @@ case folding; embedded NUL and multi-scalar separators are supported.
 
 ```nov
 let parts = std.string.split("one::three", ":")
-@assert(parts.len == 3)
+@assert(@len(parts) == 3)
 @assert(parts[0] == "one" and parts[1] == "" and parts[2] == "three")
 ```
 

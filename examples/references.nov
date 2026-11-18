@@ -118,7 +118,7 @@ let arrays_indices_and_iteration: () = {
     let items = &numbers
     items.*[-1] = 4
     items.* += [5]
-    @assert(items.*.len == 4 and items.*[-1] == 5)
+    @assert(@len(items.*) == 4 and items.*[-1] == 5)
     @assert("{@TypeOf(items)}" == "&mut []u8")
     let mut index: int = -2
     let element = &numbers[index]

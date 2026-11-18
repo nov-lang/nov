@@ -28,7 +28,7 @@ let payload_key: (value: Payload) -> int = match value {
 }
 
 let assert_numbers: (actual: []int, expected: []int) = {
-    @assert(actual.len == expected.len)
+    @assert(@len(actual) == @len(expected))
     loop value, wanted in actual, expected {
         @assert(value == wanted)
     }
@@ -42,7 +42,7 @@ let empty_and_singleton_no_comparisons: () = {
         a < b
     }
     let empty: []int = []
-    @assert(std.array.sort(empty, less).len == 0)
+    @assert(@len(std.array.sort(empty, less)) == 0)
     assert_numbers(std.array.sort(@as([]int, [7]), less), [7])
     @assert(calls == 0)
 }
@@ -82,7 +82,7 @@ let strings_runes_and_finite_floats: () = {
     let words = std.array.sort(
         ["pear", "a", "fig", "bb"],
         (a: string, b: string) -> bool {
-            a.len < b.len
+            @len(a) < @len(b)
         }
     )
     @assert(words[0] == "a" and words[1] == "bb" and words[2] == "fig" and words[3] == "pear")
@@ -173,14 +173,14 @@ let nested_arrays_and_records_copy_independently: () = {
     let mut sorted = std.array.sort(
         source,
         (a: []int, b: []int) -> bool {
-            a.len < b.len
+            @len(a) < @len(b)
         }
     )
     let inner = &sorted[0]
     inner.*[0] = 9
     @assert(source[1][0] == 1 and source[0][0] == 3)
     source[0] = [8]
-    @assert(sorted[1][0] == 3 and sorted[1].len == 2)
+    @assert(sorted[1][0] == 3 and @len(sorted[1]) == 2)
     let mut rows = [Row.[ key = 2, name = "two", values = [[2]] ], Row.[ key = 1, name = "one", values = [[1]] ]]
     let mut result = std.array.sort(rows, by_key)
     let mut row = result[0]

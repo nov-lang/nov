@@ -184,7 +184,7 @@ fn renderModuleWithSources(module: *const Module, compilation: ?*const Compilati
             .unsupported_local_declaration => try writer.writeAll("local declarations require a supported value type (void needs an explicit immutable annotation; function parameters need names and types; discards are unsupported)"),
             .immutable_assignment => try writer.writeAll("assignment requires a mutable local"),
             .unsupported_assignment_target => try writer.writeAll("assignment target must be a mutable local, its struct field path, or its scalar-array element"),
-            .unsupported_array_length_write => try writer.writeAll("array .len is read-only in the current subset; length writes and growth initialization are deferred"),
+
             .array_literal_needs_type => try writer.writeAll("array literal needs an expected []T type"),
             .unreachable_code => try writer.writeAll("unreachable statement after terminal control flow"),
             .loop_control_outside_loop => try writer.writeAll("break and continue require an enclosing loop"),
@@ -446,7 +446,7 @@ test "module body diagnostics render messages and optional related notes" {
         .{ .tag = .unsupported_local_declaration, .message = "local declarations require a supported value type (void needs an explicit immutable annotation; function parameters need names and types; discards are unsupported)" },
         .{ .tag = .immutable_assignment, .message = "assignment requires a mutable local", .note = "immutable declaration here" },
         .{ .tag = .unsupported_assignment_target, .message = "assignment target must be a mutable local, its struct field path, or its scalar-array element" },
-        .{ .tag = .unsupported_array_length_write, .message = "array .len is read-only in the current subset; length writes and growth initialization are deferred" },
+
         .{ .tag = .array_literal_needs_type, .message = "array literal needs an expected []T type" },
         .{ .tag = .unused_block_value, .message = "non-final block expression must return void; discarding values is not supported yet" },
         .{ .tag = .unsupported_shadowing, .message = "shadowing is not supported in body analysis yet", .note = "conflicting declaration here" },

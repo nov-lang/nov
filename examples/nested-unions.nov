@@ -72,7 +72,7 @@ let contextual_constructors_and_single_layer_matches: () = {
     }
     @assert(
         match bound {
-            .some => |rows| rows[0][0] == "hello" and rows[1].len == 0
+            .some => |rows| rows[0][0] == "hello" and @len(rows[1]) == 0
             .none => false
         }
     )
@@ -81,7 +81,7 @@ let contextual_constructors_and_single_layer_matches: () = {
     @assert(optional.unwrapOr(.err["missing"]).unwrapOr(0) == 7)
     @assert(result.unwrapOr(.none[]).unwrapOr(0) == 8)
     let innerNone: Outer = .inner[.none[]]
-    @assert(words(innerNone).len == 0)
+    @assert(@len(words(innerNone)) == 0)
 }
 
 @[test]
@@ -173,7 +173,7 @@ let closure_snapshots_and_shared_cells: () = {
     detached[0] = ["changed"]
     @assert(words(snapshot())[0][0] == "first")
     current = .none[]
-    @assert(words(read()).len == 0)
+    @assert(@len(words(read())) == 0)
     @assert(words(snapshot())[0][0] == "first")
 }
 
@@ -203,7 +203,7 @@ let mapping_and_search_produce_nested_unions: () = {
     let found: Option(Outer) = std.array.find(
         items,
         (value) {
-            words(value).len != 0
+            @len(words(value)) != 0
         }
     )
     @assert(words(found.unwrapOr(.none[]))[0][0] == "found")

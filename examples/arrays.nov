@@ -17,13 +17,13 @@ let main: () -> void = {
     let original: []int = numbers
     numbers[-1] = 30
     numbers += numbers
-    @println(original[-1], numbers[2], numbers[-1], numbers.len)
+    @println(original[-1], numbers[2], numbers[-1], @len(numbers))
     let joined: []int = combine(make(4), make(5))
-    @println(joined[0], joined[-1], joined.len)
+    @println(joined[0], joined[-1], @len(joined))
     let flags: []bool = [true, false]
-    @println(flags[-1], flags[0], flags.len)
+    @println(flags[-1], flags[0], @len(flags))
     numbers = []
-    @println(numbers.len)
+    @println(@len(numbers))
     @println(2 in original, 30 in original, 99 in joined, 5 in joined)
     @println(true in flags, false in [true], true in [], 1 in numbers)
 }

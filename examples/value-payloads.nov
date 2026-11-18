@@ -124,7 +124,7 @@ let escaping_shared_cells_and_overwritten_owner: () = {
     loop n in @as(int, 0)..256 {
         pressure += [[n, n + 1]]
     }
-    @assert(owner.isNone() and pressure.len == 256)
+    @assert(owner.isNone() and @len(pressure) == 256)
     let callback = match copy {
         .some => |function| function
         .none => increment

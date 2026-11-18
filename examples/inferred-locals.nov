@@ -22,5 +22,5 @@ let main: () -> void = {
             inner
         }
     )
-    @println(saved, value, original[0], values[0], values.len, ready)
+    @println(saved, value, original[0], values[0], @len(values), ready)
 }

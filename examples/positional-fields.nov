@@ -41,8 +41,8 @@ let snapshots: () = {
     row[0] = 8
     record.0[0] = row
     record.0 += [[4]]
-    @assert(saved.0[0][0] == 1 and saved.0.len == 2)
-    @assert(record.0[0][0] == 8 and record.0.len == 3)
+    @assert(saved.0[0][0] == 1 and @len(saved.0) == 2)
+    @assert(record.0[0][0] == 8 and @len(record.0) == 3)
     let mut extracted = match record.1 {
         .some => |value| value
         .none => [[0]]

@@ -30,8 +30,8 @@ let main: () = {
     let saved = batch
     batch.items[0] += 10
     batch.items += [6]
-    @println("Saved:", saved.items[0], saved.items.len)
-    @println("Updated:", batch.items[0], batch.items.len)
+    @println("Saved:", saved.items[0], @len(saved.items))
+    @println("Updated:", batch.items[0], @len(batch.items))
 }
 
 @[test]
@@ -41,8 +41,8 @@ let field_mutations: () = {
     let saved = batch
     batch.items += [6]
     batch.items[-1] *= 2
-    @assert(saved.items.len == 2 and saved.items[1] == 4)
-    @assert(batch.items.len == 3 and batch.items[2] == 12)
+    @assert(@len(saved.items) == 2 and saved.items[1] == 4)
+    @assert(@len(batch.items) == 3 and batch.items[2] == 12)
     let mut read = batch.items
     read[0] = 99
     @assert(batch.items[0] == 2)
@@ -63,10 +63,10 @@ let recursive_copies: () = {
     records += [leaf(5)]
     current.records = records
     first.values[0] = 99
-    @assert(saved.leaf.values[0] == 1 and saved.leaf.values.len == 2)
-    @assert(saved.records[0].values[0] == 3 and saved.records.len == 1)
+    @assert(saved.leaf.values[0] == 1 and @len(saved.leaf.values) == 2)
+    @assert(saved.records[0].values[0] == 3 and @len(saved.records) == 1)
     @assert(assigned.leaf.values[0] == 1 and assigned.records[0].values[0] == 3)
-    @assert(current.records[0].values[0] == 30 and current.records.len == 2)
+    @assert(current.records[0].values[0] == 30 and @len(current.records) == 2)
     let mut boxed = Batch(Tree).[ items = [current] ]
     current.leaf.values[0] = 20
     let mut item = boxed.items[0]
@@ -151,6 +151,6 @@ let mutation_order_and_record_loans: () = {
     let mut detached = loan.*
     loan.*.leaf.values += [5]
     detached.leaf.values[0] = 99
-    @assert(loan.*.leaf.values.len == 3 and detached.leaf.values.len == 2)
+    @assert(@len(loan.*.leaf.values) == 3 and @len(detached.leaf.values) == 2)
     @assert(loan.*.leaf.values[0] == 1)
 }

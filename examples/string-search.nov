@@ -83,7 +83,7 @@ let views_and_managed_owner_lifetimes: () = {
     source = "different"
     loop i in 0..2000 {
         let temporary = "allocation:{i}:é😀"
-        @assert(temporary.len > 0)
+        @assert(@len(temporary) > 0)
     }
     @assert(std.string.startsWith(stored[0], stored[1]))
     @assert(std.string.endsWith(view, "\0e"))

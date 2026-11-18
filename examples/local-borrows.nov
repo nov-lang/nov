@@ -48,7 +48,7 @@ let main: () = {
     let snapshot = items.*
     items.* += [2]
     items.*[0] = 3
-    @println(numbers[0], numbers.len, snapshot[0])
+    @println(numbers[0], @len(numbers), snapshot[0])
 
     let mut range = 0..2
     let selected = &range

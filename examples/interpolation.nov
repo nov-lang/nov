@@ -15,5 +15,5 @@ let main: () -> void = {
     let yes = true
     let text = "é\0😀"
     let shared = "{text}"
-    @println("\{literal\}: {yes}: {shared}", shared.len)
+    @println("\{literal\}: {yes}: {shared}", @len(shared))
 }

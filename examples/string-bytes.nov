@@ -1,7 +1,7 @@
 ; nov run examples/string-bytes.nov
 ; nov test examples/string-bytes.nov
 ; String indices decode Unicode scalars as runes; negative int indices count from the end.
-; String .len counts scalars, not UTF-8 bytes or grapheme clusters.
+; @len(text) for a string counts scalars, not UTF-8 bytes or grapheme clusters.
 
 let head: (s: string) -> rune = s[0]
 
@@ -15,7 +15,7 @@ let main: () = {
     let last: rune = text[-1]
     @println(first, last)
     let utf8 = "é😀\0"
-    @println(utf8[0], utf8[1], utf8[-1], utf8.len)
+    @println(utf8[0], utf8[1], utf8[-1], @len(utf8))
     let accent: rune = head(utf8)
     @println("Rune: {accent}")
 }
@@ -27,7 +27,7 @@ let ascii_negative: () = {
     @assert(head(text) == 'h')
     @assert(text[first] == 'h')
     @assert(text[-1] == 'o')
-    @assert(text.len == 5)
+    @assert(@len(text) == 5)
     @assert(text[4] == text[-1])
 }
 
@@ -41,11 +41,11 @@ let utf8_nul: () = {
     @assert(text[2] == '\0')
     @assert(text[-2] == '😀')
     @assert(text[-1] == '\0')
-    @assert(text.len == 3)
-    @assert("".len == 0)
-    @assert("é".len == 1)
-    @assert("😀".len == 1)
-    @assert("e\u{301}".len == 2)
+    @assert(@len(text) == 3)
+    @assert(@len("") == 0)
+    @assert(@len("é") == 1)
+    @assert(@len("😀") == 1)
+    @assert(@len("e\u{301}") == 2)
 }
 
 @[test]

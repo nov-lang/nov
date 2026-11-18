@@ -5,6 +5,36 @@ const Sema = @import("Sema.zig");
 const Ir = @import("Ir.zig");
 const Dependencies = @import("Dependencies.zig");
 const BodyChecker = @import("BodyChecker.zig");
+const Lowering = @import("Lowering.zig");
+
+test "len builtin global known data folds Unicode scalars including NUL" {
+    var module = try Module.init(std.testing.allocator, "global-len.nov",
+        \\let n:uint=@len(text)
+        \\let count:uint=@len(items)
+        \\let items:[]int=[1,2]
+        \\let text="é\0😀"
+        \\let main:()=@println(n,count)
+    );
+    defer module.deinit();
+    var sema = try Lowering.lower(&module);
+    defer sema.deinit();
+    errdefer std.debug.print("global len: {any}\n", .{module.diagnostics.items});
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+    var lengths: usize = 0;
+    for (sema.ir.globals.items) |global| {
+        if (!std.mem.eql(u8, global.name, "n") and !std.mem.eql(u8, global.name, "count")) continue;
+        for (sema.ir.getFunction(global.initializer).?.body.?.instructions) |instruction| {
+            try std.testing.expect(instruction.op != .array_len);
+            if (instruction.op == .constant) {
+                const value = sema.ir.getConstant(instruction.op.constant).?.value;
+                if (value == .unsigned_integer and value.unsigned_integer == @as(u128, if (std.mem.eql(u8, global.name, "n")) 3 else 2)) lengths += 1;
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), lengths);
+}
 
 const Ref = struct { module: *Module, id: Module.DeclId };
 const Task = struct { ref: Ref, finish: bool = false, span: ?Module.Span = null };
@@ -107,8 +137,9 @@ pub fn analyze(root: *Module, sema: *Sema) Sema.Error!void {
                         if (data.rhs != 0) try nodes.append(sema.allocator, data.rhs);
                     },
                     .call, .call_one, .call_comma, .call_one_comma => {
-                        const args = ast.fullCall(node).?.ast.args;
-                        try nodes.appendSlice(sema.allocator, args[@min(@as(usize, 1), args.len)..]);
+                        const call = ast.fullCall(node).?.ast;
+                        const is_len = ast.nodes.items(.tag)[call.fn_expr] == .builtin_literal and std.mem.eql(u8, ast.tokenSlice(ast.firstToken(call.fn_expr)), "@len");
+                        try nodes.appendSlice(sema.allocator, call.args[if (is_len) 0 else @min(@as(usize, 1), call.args.len)..]);
                     },
                     .block, .block_two, .block_newline, .block_two_newline => {
                         var buffer: [2]Ast.Node.Index = undefined;

@@ -17,8 +17,8 @@ let array_copies: () = {
     copy[0] = 99
     copy += [8]
     @assert(original[0] == 2, "copy mutation must not change the original")
-    @assert(original.len == 3)
-    @assert(copy[0] == 99 and copy.len == 4)
+    @assert(@len(original) == 3)
+    @assert(copy[0] == 99 and @len(copy) == 4)
 }
 
 @[test]

@@ -313,11 +313,11 @@ test "global data indices slices and lengths match runtime scalar semantics" {
         .{ .expression = "text[-1..=-1]", .expected = .{ .string = "z" } },
         .{ .expression = "text[4..]", .expected = .{ .string = "" } },
         .{ .expression = "\"\"[..]", .expected = .{ .string = "" } },
-        .{ .expression = "values.len", .expected = .{ .unsigned_integer = 3 } },
-        .{ .expression = "empty.len", .expected = .{ .unsigned_integer = 0 } },
-        .{ .expression = "text.len", .expected = .{ .unsigned_integer = 4 } },
-        .{ .expression = "\"\".len", .expected = .{ .unsigned_integer = 0 } },
-        .{ .expression = "text[-3..-1].len", .expected = .{ .unsigned_integer = 2 } },
+        .{ .expression = "@len(values)", .expected = .{ .unsigned_integer = 3 } },
+        .{ .expression = "@len(empty)", .expected = .{ .unsigned_integer = 0 } },
+        .{ .expression = "@len(text)", .expected = .{ .unsigned_integer = 4 } },
+        .{ .expression = "@len(\"\")", .expected = .{ .unsigned_integer = 0 } },
+        .{ .expression = "@len(text[-3..-1])", .expected = .{ .unsigned_integer = 2 } },
     }) |case| {
         const source = try std.mem.concat(std.testing.allocator, u8, &.{ prefix, case.expression });
         defer std.testing.allocator.free(source);
@@ -2243,7 +2243,7 @@ test "field mutation rejects nonlocals immutable bindings unsupported operators 
         .{ .source = "let f:(r:R)={r.x=1}", .tag = .immutable_assignment },
         .{ .source = "let f:()={let r=R.[]\nr.x=1}", .tag = .immutable_assignment },
         .{ .source = "let f:()={R.[].x=1}", .tag = .unsupported_assignment_target },
-        .{ .source = "let f:()={let mut r=R.[]\nr.s.len=1}", .tag = .unsupported_array_length_write },
+        .{ .source = "let f:()={let mut r=R.[]\n@len(r.s)=1}", .tag = .unsupported_assignment_target },
         .{ .source = "let f:()={let mut r=R.[]\nr.x.missing=1}", .tag = .unsupported_assignment_target },
         .{ .source = "let f:()={let mut u:U=.x[1]\nu.x=2}", .tag = .unsupported_assignment_target },
         .{ .source = "let f:()={let mut r=R.[]\nr.missing=1}", .tag = .unknown_field },
@@ -3410,7 +3410,7 @@ test "lowering ownership and source diagnostic rollback survive allocation failu
         "let f: () -> void = loop false {missing}",
         "let f: () -> void = loop true {{break}\n@println(true)}",
         "let f: (a: []int) -> []int = {let mut b: []int = a\nb += b\nb[-1] = 7\nb}",
-        "let f: () -> void = {let mut a: []bool = [true]\na.len = 2}",
+        "let f: () -> void = {let mut a: []bool = [true]\n@len(a) = 2}",
         "let f: () -> void = {let a: []int = [true]\n}",
         "let f: (c: bool) -> void = {let mut a: []int = [1]\na[{a = []\n0}] += if c {return} else {a = [9]\n2}\na[0] -= 1\na[0] *= 3\na[0] /= 2\na[0] %= 5}",
         "let f: () -> void = {let mut a: []bool = [true]\na[0] %= false}",
@@ -4096,7 +4096,7 @@ test "nested records late body recursive generic instances retain source diagnos
 
 test "static integer borrowing forged IR owner kinds exact types paths and source release" {
     var result = blk: {
-        var module = try Module.init(std.testing.allocator, "integer-borrow-ir.nov", "let R=struct{n:int=0,}\nlet f:()={let mut a=[R.[]]\nlet mut flag=true\nlet mut x:int=1\nlet y=&x\ny.*+=1\n@println(x,a.len,flag)}");
+        var module = try Module.init(std.testing.allocator, "integer-borrow-ir.nov", "let R=struct{n:int=0,}\nlet f:()={let mut a=[R.[]]\nlet mut flag=true\nlet mut x:int=1\nlet y=&x\ny.*+=1\n@println(x,@len(a),flag)}");
         defer module.deinit();
         const result = try lower(&module);
         try std.testing.expect(result.lowering_complete);
@@ -4157,7 +4157,7 @@ test "static integer borrowing forged IR owner kinds exact types paths and sourc
 
 test "static borrowing verified capability types owner paths index and regions survive source release" {
     var result = blk: {
-        var module = try Module.init(std.testing.allocator, "borrow-ir.nov", "let A=struct{b:B,}\nlet B=struct{x:int=0,}\nlet f:()={let mut a=[A.[b=B.[]]]\nlet r=&a[0]\nr.*.b.x+=1\n@println(a.len)}");
+        var module = try Module.init(std.testing.allocator, "borrow-ir.nov", "let A=struct{b:B,}\nlet B=struct{x:int=0,}\nlet f:()={let mut a=[A.[b=B.[]]]\nlet r=&a[0]\nr.*.b.x+=1\n@println(@len(a))}");
         defer module.deinit();
         const result = try lower(&module);
         try std.testing.expect(result.lowering_complete);

@@ -2692,8 +2692,8 @@ const positional_fields_program =
     \\ row[0]=8
     \\ record.0[0]=row
     \\ record.0+=[[4]]
-    \\ @assert(saved.0[0][0]==1 and saved.0.len==2)
-    \\ @assert(record.0[0][0]==8 and record.0.len==3)
+    \\ @assert(saved.0[0][0]==1 and @len(saved.0)==2)
+    \\ @assert(record.0[0][0]==8 and @len(record.0)==3)
     \\ let mut extracted=match record.1{.some=>|value|value
     \\ .none=>[[0]]}
     \\ extracted[0]=[7]
@@ -3399,8 +3399,8 @@ test "default aggregate formatting allocating hooks share mutable closure state 
     const source =
         \\let Counter=struct{callbacks:[]()->int,}
         \\let hook:(value:Counter)->string="C{value.callbacks[0]()}"
-        \\let show:(values:[]Counter)=@println(values.len)
-        \\let convert:(values:[]Counter)->string="{values.len}"
+        \\let show:(values:[]Counter)=@println(@len(values))
+        \\let convert:(values:[]Counter)->string="{@len(values)}"
         \\let main:()={
         \\ let mut count:int=0
         \\ let tick=()->int{count+=1
@@ -3824,7 +3824,7 @@ const rune_program =
     \\whole.*[0]='B'
     \\let snapshot=whole.*
     \\whole.*+=['C']
-    \\@println(snapshot.len,whole.*.len,whole.*[0],whole.*[-1])
+    \\@println(@len(snapshot),@len(whole.*),whole.*[0],whole.*[-1])
     \\let element=&a[1]
     \\let old=element.*
     \\element.* ='Q'
@@ -4323,7 +4323,7 @@ const array_default_program =
     \\let U=union{value:R,none,}
     \\let make:()->R=R.[]
     \\let empty:()->uint={let value=R.[rows=[],names=[],bytes=[]]
-    \\value.rows.len+value.names.len+value.bytes.len}
+    \\@len(value.rows)+@len(value.names)+@len(value.bytes)}
     \\let main:()={let mut a=R.[]
     \\let b=make()
     \\let captured=()->R{b}
@@ -4332,7 +4332,7 @@ const array_default_program =
     \\a.rows[0]=row
     \\a.names[0]="changed"
     \\a.bytes += [65]
-    \\@assert(b.rows[0][0]==1 and b.names[0]=="é\0" and b.bytes.len==0)
+    \\@assert(b.rows[0][0]==1 and b.names[0]=="é\0" and @len(b.bytes)==0)
     \\let mut values=[a,b,R.[]]
     \\let mut changed=values[1]
     \\changed.rows[0]=[8]
@@ -4344,9 +4344,9 @@ const array_default_program =
     \\let callbacks=G(()->int).[]
     \\let records=G(R).[]
     \\let queried:@TypeOf(R.[])=.[]
-    \\@assert(callbacks.values.len==0 and records.values.len==0 and queried.rows[0][0]==1)
+    \\@assert(@len(callbacks.values)==0 and @len(records.values)==0 and queried.rows[0][0]==1)
     \\loop i in 0..20{let temporary="allocation:{i}"
-    \\@assert(temporary.len>0)}
+    \\@assert(@len(temporary)>0)}
     \\@assert(captured().rows[0][0]==1 and make().rows[0][0]==1)
     \\@println("defaults independent")}
 ;
@@ -4634,13 +4634,13 @@ const storable_arrays_program =
     \\ let old=snapshot(rows)
     \\ rows[0]=["new"+"!"]
     \\ loop &row in rows {row.*+=["tail"+"!"]}
-    \\ if old[0].len!=0 or old[1][0]!="ab" or rows[0][1]!="tail!" {@panic("nested snapshot")}
+    \\ if @len(old[0])!=0 or old[1][0]!="ab" or rows[0][1]!="tail!" {@panic("nested snapshot")}
     \\ let mut projected=rows[1]
     \\ projected[0]="changed"
     \\ if rows[1][0]!="ab" {@panic("projection copy")}
     \\ let boxed=Box([][]string).[value=rows]
     \\ rows+=[["third"]]
-    \\ if boxed.value.len!=2 or empty[0].len!=0 {@panic("generic array field")}
+    \\ if @len(boxed.value)!=2 or @len(empty[0])!=0 {@panic("generic array field")}
     \\ let mut unions:[]U=[.row[Row.[values=rows]],.text["text"+"!"],.none[]]
     \\ let saved=unions
     \\ unions[0]=.none[]
@@ -4749,7 +4749,7 @@ test "storable arrays precise backing descriptors survive source release" {
 test "storable arrays recursive runtime allocation failures" {
     for ([_][]const u8{
         "let main:()={let a:[][]int=[[1]]\nlet b=a\n@println(b[0][0],a[0][0])}",
-        "let R=struct{a:[][]int,}\nlet U=union{some:R,none,}\nlet main:()={let a:[]U=[.some[R.[a=[[1]]]],.none[]]\nlet b=a\n@println(match b[0] {.some=>|r|r.a[0][0]\n.none=>0},a.len)}",
+        "let R=struct{a:[][]int,}\nlet U=union{some:R,none,}\nlet main:()={let a:[]U=[.some[R.[a=[[1]]]],.none[]]\nlet b=a\n@println(match b[0] {.some=>|r|r.a[0][0]\n.none=>0},@len(a))}",
         "let main:()={let mut n:int=1\nlet f=()->int {n+=1\nn}\nlet a=[f]\nlet b=a\n@println(b[0](),a[0]())}",
     }) |source| {
         const library = try emitSource(source, null);
@@ -4767,8 +4767,8 @@ test "storable arrays recursive runtime allocation failures" {
 
 test "storable arrays forged reused nested and active union payloads detach recursive backing" {
     for ([_]struct { source: []const u8, path: []const u8 }{
-        .{ .source = "let main:()={let seed:[]int=[1]\nlet mut a=[seed,seed]\na[-1]=seed\na+=a\n@println(a.len,seed[0],a[0][0])}", .path = "data" },
-        .{ .source = "let R=struct{a:[]int,}\nlet U=union{some:R,none,}\nlet main:()={let seed:U=.some[R.[a=[1]]]\nlet mut a=[seed,seed]\na[-1]=seed\na+=a\n@println(a.len,match seed {.some=>|r|r.a[0]\n.none=>0},match a[0] {.some=>|r|r.a[0]\n.none=>0})}", .path = "f0.f0.data" },
+        .{ .source = "let main:()={let seed:[]int=[1]\nlet mut a=[seed,seed]\na[-1]=seed\na+=a\n@println(@len(a),seed[0],a[0][0])}", .path = "data" },
+        .{ .source = "let R=struct{a:[]int,}\nlet U=union{some:R,none,}\nlet main:()={let seed:U=.some[R.[a=[1]]]\nlet mut a=[seed,seed]\na[-1]=seed\na+=a\n@println(@len(a),match seed {.some=>|r|r.a[0]\n.none=>0},match a[0] {.some=>|r|r.a[0]\n.none=>0})}", .path = "f0.f0.data" },
     }) |case| {
         var module = try Module.init(test_gpa, "forged-storable.nov", case.source);
         defer module.deinit();
@@ -5186,7 +5186,7 @@ const backtick_program =
     \\let Box:(T:type)->type=struct{value:T,}
     \\let unwrap:(x:Box(`T))->`U=x.value
     \\let invert:(x:`T)->`U=!x
-    \\let size:(x:`T)->`U=x.len
+    \\let size:(x:`T)->`U=@len(x)
     \\let G:(T:type)->type=struct{let id:(x:`U)->`U=x
     \\}
     \\let wrap:(x:`T)->`U=G(uint).id(x)
@@ -8975,14 +8975,53 @@ const array_example =
     \\    let original: []int = numbers
     \\    numbers[-1] = 30
     \\    numbers += numbers
-    \\    @println(original[-1], numbers[2], numbers[-1], numbers.len)
+    \\    @println(original[-1], numbers[2], numbers[-1], @len(numbers))
     \\    let joined: []int = combine(make(4), make(5))
-    \\    @println(joined[0], joined[-1], joined.len)
+    \\    @println(joined[0], joined[-1], @len(joined))
     \\    let flags: []bool = [true, false]
-    \\    @println(flags[-1], flags[0], flags.len)
+    \\    @println(flags[-1], flags[0], @len(flags))
     \\    numbers = []
-    \\    @println(numbers.len)}
+    \\    @println(@len(numbers))}
 ;
+
+test "len builtin readonly wrappers are source free and allocation free under forced GC O0 O3" {
+    const library = try emitSourceFreeTypeReachability(test_gpa,
+        \\let group:(a:[][]int)->uint=@len({a})
+        \\let cast:(a:[][]int)->uint=@len(@as([][]int,a))
+        \\let choose:(a:[][]int,b:bool)->uint=@len(if b{a}else{a})
+        \\let inner:(a:[][]int)->uint=@len({a[0]})
+        \\let text:(s:string)->uint=@len(s)
+    );
+    defer test_gpa.free(library);
+    const c = try std.mem.concat(test_gpa, u8, &.{
+        "#include <stdlib.h>\nstatic int blocked;\nstatic void *test_malloc(size_t n) { return blocked ? NULL : malloc(n); }\n#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n",
+        library,
+        \\int main(void) {
+        \\    nov_rt_heap.collect_every_allocation = 1;
+        \\    nov_array input = {0}, row = {0};
+        \\    void **roots[] = {&input.data, &row.data};
+        \\    nov_gc_roots frame = {0}; nov_gc_push(&nov_rt_heap, &frame, roots, 2);
+        \\    static const size_t offsets[] = {offsetof(nov_array, data)};
+        \\    static const nov_gc_descriptor parent = {sizeof(nov_array), _Alignof(nov_array), 1, offsets};
+        \\    static const nov_gc_descriptor element = {sizeof(intptr_t), _Alignof(intptr_t), 0, NULL};
+        \\    input = nov_array_new(1, 1, &parent);
+        \\    row = nov_array_new(2, 2, &element);
+        \\    ((nov_array *)input.data)[0] = row;
+        \\    blocked = 1;
+        \\    if (nov_group(input) != 1 || nov_cast(input) != 1) return 1;
+        \\    if (nov_choose(input, true) != 1 || nov_choose(input, false) != 1) return 2;
+        \\    if (nov_inner(input) != 2) return 3;
+        \\    nov_string unicode = {NULL, (const unsigned char *)"\xc3\xa9\0\xf0\x9f\x98\x80", 7};
+        \\    if (nov_text(unicode) != 3) return 4;
+        \\    blocked = 0;
+        \\    nov_gc_pop(&nov_rt_heap, &frame); nov_gc_collect(&nov_rt_heap);
+        \\    if (nov_rt_heap.frames || nov_rt_heap.live_objects) return 5;
+        \\    nov_gc_shutdown(&nov_rt_heap); return 0;
+        \\}
+    });
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty;", 0, "", "", mode);
+}
 
 fn arrayTestProgram(source: []const u8) ![]u8 {
     const terminated = try test_gpa.dupeSentinel(u8, source, 0);
@@ -9022,7 +9061,7 @@ const string_example =
     \\    let mut value = greeting + "😀"
     \\    let shared = identity(value)
     \\    value = "new"
-    \\    @println(shared, shared.len, value)
+    \\    @println(shared, @len(shared), value)
     \\    @println(effect("A"), effect("B"))
     \\    let chosen = if false {"skip" + "!"} else {shared}
     \\    @println(chosen, choose(true), choose(false))
@@ -9033,9 +9072,9 @@ const string_example =
     \\        if count == 1 {continue}
     \\        if count == 3 {break}
     \\    }
-    \\    @println(value, "".len, "" + "", "\{literal\}", "\xC3\xA9")
+    \\    @println(value, @len(""), "" + "", "\{literal\}", "\xC3\xA9")
     \\    let a = [true, false]
-    \\    @println(a.len, shared)
+    \\    @println(@len(a), shared)
     \\}
 ;
 const string_output = "hé\x00😀 4 new\nABA! B!\nhé\x00😀 early! late\nnewxxx 0  {literal} é\n2 hé\x00😀\n";
@@ -9111,7 +9150,7 @@ const match_pipes =
     \\    }
     \\    let mut copy = a
     \\    copy[0] = 9
-    \\    @println(a[0], copy[0], a.len)
+    \\    @println(a[0], copy[0], @len(a))
     \\    let picked = match true {true => identity
     \\        _ => identity}
     \\    6 |> picked |> @println
@@ -9215,7 +9254,7 @@ const boolean_match_program =
     \\        false => original}
     \\    chosen[0] = 99
     \\    let later: []int = [14]
-    \\    @println(original[0], chosen[0], chosen.len, later[0])
+    \\    @println(original[0], chosen[0], @len(chosen), later[0])
     \\    let callback = match true {true => identity
     \\        false => identity}
     \\    @println(callback(15))
@@ -9543,8 +9582,8 @@ const append_rhs_cases = [_]struct { source: []const u8, allocations: usize, out
     .{ .source = "let main:()={let mut a:[]int=[1]\nlet b:[]int=[2]\na+=b\n@println(a[0],a[1],b[0])}", .allocations = 4, .output = "1 2 2\n" },
     .{ .source = "let L=struct{a:[]int,b:[]int,}\nlet T=struct{leaf:L,}\nlet main:()={let mut a=[T.[leaf=L.[a=[1],b=[2]]]]\nlet b=[T.[leaf=L.[a=[3],b=[4]]]]\na+=b\n@println(a[0].leaf.a[0],a[1].leaf.b[0],b[0].leaf.a[0])}", .allocations = 12, .output = "1 4 3\n" },
     .{ .source = "let L=struct{a:[]int,}\nlet T=struct{leaf:L,}\nlet main:()={let mut a=T.[leaf=L.[a=[1]]]\nlet b=T.[leaf=L.[a=[2]]]\nlet r=&b\na.leaf.a+=r.*.leaf.a\n@println(a.leaf.a[0],a.leaf.a[1],r.*.leaf.a[0])}", .allocations = 4, .output = "1 2 2\n" },
-    .{ .source = "let L=struct{a:[]int,}\nlet main:()={let mut a=L.[a=[1]]\nlet r=&a\nr.*.a+=r.*.a\n@println(r.*.a.len,r.*.a[0],r.*.a[1])}", .allocations = 3, .output = "2 1 1\n" },
-    .{ .source = "let L=struct{a:[]int,}\nlet main:()={let mut a=[L.[a=[1]]]\nlet r=&a[0]\nr.*.a+=r.*.a\n@println(r.*.a.len,r.*.a[0],r.*.a[1])}", .allocations = 4, .output = "2 1 1\n" },
+    .{ .source = "let L=struct{a:[]int,}\nlet main:()={let mut a=L.[a=[1]]\nlet r=&a\nr.*.a+=r.*.a\n@println(@len(r.*.a),r.*.a[0],r.*.a[1])}", .allocations = 3, .output = "2 1 1\n" },
+    .{ .source = "let L=struct{a:[]int,}\nlet main:()={let mut a=[L.[a=[1]]]\nlet r=&a[0]\nr.*.a+=r.*.a\n@println(@len(r.*.a),r.*.a[0],r.*.a[1])}", .allocations = 4, .output = "2 1 1\n" },
     .{ .source = "let main:()={let a:[]int=[2]\nlet r=&a\nlet mut b:[]int=[1]\nb+=r.*\n@println(b[0],b[1],r.*[0])}", .allocations = 4, .output = "1 2 2\n" },
     .{ .source = "let L=struct{a:[]int,}\nlet main:()={let mut rows=[L.[a=[2]]]\nlet mut a:[]int=[1]\na+=rows[{rows=[L.[a=[9]]]\n0}].a\n@println(a[0],a[1],rows[0].a[0])}", .allocations = 9, .output = "1 2 9\n" },
     .{ .source = "let L=struct{a:[]int,}\nlet select:(a:[]L,n:int)->L=a[n]\nlet main:()={let mut rows=[L.[a=[2]]]\nlet mut a:[]int=[1]\na+=select(rows,{rows=[L.[a=[9]]]\n0}).a\n@println(a[0],a[1],rows[0].a[0])}", .allocations = 10, .output = "1 2 9\n" },
@@ -9834,7 +9873,7 @@ const string_byte_program =
     \\let terminalIndex:()->u8="x"[{return 8}]
     \\let main:()={
     \\    let text="aé€😀\0Z"
-    \\    @println(text[0],text[1],text[2],text[3],text[4],text[5],text.len)
+    \\    @println(text[0],text[1],text[2],text[3],text[4],text[5],@len(text))
     \\    @println(text[-1],text[-2],text[-3],text[-4],text[-5],text[-6])
     \\    let inferred=text[1]
     \\    let bytes:[]rune=[text[2],inferred]
@@ -9894,9 +9933,9 @@ const string_slice_program =
     \\    return -2}
     \\let main:()={
     \\    let view=base()[lower()..=upper()]
-    \\    @println(view,view.len,view[0],view[-2])
+    \\    @println(view,@len(view),view[0],view[-2])
     \\    @println(view[..2],view[2..],view[..][1..3])
-    \\    @println(""[..].len,view[4..].len,view[..0].len,view[-4..-4].len)
+    \\    @println(@len(""[..]),@len(view[4..]),@len(view[..0]),@len(view[-4..-4]))
     \\    let mut text="aé"+"€😀"
     \\    let mut start:int=1
     \\    let snapshot=text[{text="re"+"bound"
@@ -10453,10 +10492,10 @@ const array_sort_source_free =
     \\    let mut seen: []string = []
     \\    let sorted = std.array.sort(items, (a: Row, b: Row) -> bool {
     \\        seen += [a.name + b.name]
-    \\        @assert(captured == "retained comparator" and seen[-1].len == 4)
+    \\        @assert(captured == "retained comparator" and @len(seen[-1]) == 4)
     \\        a.key < b.key
     \\    })
-    \\    @assert(seen.len == 5)
+    \\    @assert(@len(seen) == 5)
     \\    sorted
     \\}
     \\let nested: (items: [][]int) -> [][]int = std.array.sort(items, (a: []int, b: []int) -> bool {a[0] < b[0]})
@@ -10850,9 +10889,9 @@ test "string scalar length is demand only and counts scalars not graphemes or by
         \\let base:()->string={@print("B")
         \\    "é"+"😀"}
         \\let main:()={
-        \\    @println("".len,"\0".len,"e\u{301}".len,"é€😀".len,base().len)
+        \\    @println(@len(""),@len("\0"),@len("e\u{301}"),@len("é€😀"),@len(base()))
         \\    let bytes:[]u8=[195,169]
-        \\    @println(bytes.len,bytes[0])
+        \\    @println(@len(bytes),bytes[0])
         \\}
     );
     defer test_gpa.free(c);
@@ -10862,7 +10901,7 @@ test "string scalar length is demand only and counts scalars not graphemes or by
 }
 
 test "string scalar decoder accepts every UTF8 boundary without allocating" {
-    const c = try emitSource("let at:(s:string,i:int)->rune=s[i]\nlet size:(s:string)->uint=s.len", null);
+    const c = try emitSource("let at:(s:string,i:int)->rune=s[i]\nlet size:(s:string)->uint=@len(s)", null);
     defer test_gpa.free(c);
     const harness =
         \\int main(void) {
@@ -10889,7 +10928,7 @@ test "string scalar decoder accepts every UTF8 boundary without allocating" {
 }
 
 test "string scalar decoder rejects malformed truncated overlong surrogate and out of range UTF8" {
-    const c = try emitSource("let at:(s:string,i:int)->rune=s[i]\nlet size:(s:string)->uint=s.len", null);
+    const c = try emitSource("let at:(s:string,i:int)->rune=s[i]\nlet size:(s:string)->uint=@len(s)", null);
     defer test_gpa.free(c);
     for ([_][]const u8{
         "0x80",                "0xc0,0x80",           "0xc1,0xbf",      "0xc2",                "0xc2,0x41",
@@ -11384,7 +11423,7 @@ const iteration_source_cases = [_]struct { source: []const u8, allocations: usiz
     },
     .{
         // A later loan forces a parameter slot before the loop is lowered.
-        .source = "let scan:(a:[]int)={loop x in a {@print(x)}\nlet r=&a\n@print(r.*.len)}\nlet main:()=scan([1,2])",
+        .source = "let scan:(a:[]int)={loop x in a {@print(x)}\nlet r=&a\n@print(@len(r.*))}\nlet main:()=scan([1,2])",
         .allocations = 1,
         .output = "122",
     },
@@ -11945,7 +11984,7 @@ const range_else_program =
     \\    let from_index = if true {0} else {loop i in 0..2 {break i} else {1}}
     \\    let inferred_outer = loop {loop _ in 1..0 {} else {break identity(12)}}
     \\    let empty_array = loop _ in 0..1 {break []} else {allocate(1)}
-    \\    @println(from_index, inferred_outer, empty_array.len)
+    \\    @println(from_index, inferred_outer, @len(empty_array))
     \\    let mut source: []int = [10, 11]
     \\    let mut broken = loop _ in 0..1 {break source} else {allocate(99)}
     \\    let mut exhausted = loop _ in 2..1 {break allocate(99)} else {source}
@@ -12052,11 +12091,11 @@ const string_interpolation =
     \\    let no = false
     \\    let mut s = prefix + "😀"
     \\    let shared = identity(s)
-    \\    @println("A{yes}:{no}:{n}:\{{s}\}:Z", shared.len, "{true}/{false}")
+    \\    @println("A{yes}:{no}:{n}:\{{s}\}:Z", @len(shared), "{true}/{false}")
     \\    s = "other"
-    \\    @println(shared == prefix + "😀", "{shared}" == shared, "{shared}".len)
+    \\    @println(shared == prefix + "😀", "{shared}" == shared, @len("{shared}"))
     \\    let empty = ""
-    \\    @println("{empty}{empty}" == "", "{prefix}{shared}\0".len)
+    \\    @println("{empty}{empty}" == "", @len("{prefix}{shared}\0"))
     \\    loop n < 16 : n += 1 {
     \\        if n == 0 {continue}
     \\        let text = fizz(n)
@@ -12245,7 +12284,7 @@ const ascription_program =
     \\    let mut a = @as([]int, [1, 2])
     \\    let mut b = @as([]int, a)
     \\    b[0] = 9
-    \\    @println(a[0], b[0], @as([]int, []).len)
+    \\    @println(a[0], b[0], @len(@as([]int, [])))
     \\    let text = "hé" + "!"
     \\    @println("{@as(string, text)}", @as(bool, true))
     \\    @println(@as(int, match true {true => 4
@@ -12348,7 +12387,7 @@ test "expression interpolation reuses calls scopes ordering and rooted temporari
         \\    let n: int = 2
         \\    let bytes = "é\0😀"
         \\    @println("{factory()(argument(1))}/{echo(argument(n + 1))}:{bytes}", echo(4))
-        \\    @println("{join(echo(5), echo(6))}", "{ n + 1 }", "{bytes.len}")
+        \\    @println("{join(echo(5), echo(6))}", "{ n + 1 }", "{@len(bytes)}")
         \\    let a = [true, false]
         \\    @println("{a[0]}:{true and false}")
         \\    let zero: int = 0
@@ -12529,7 +12568,7 @@ const string_compound =
     \\    let mut s = "hé" + "\0"
     \\    let original = id(s)
     \\    s += s
-    \\    @println(s, s.len, original, original.len)
+    \\    @println(s, @len(s), original, @len(original))
     \\    s += {s = "replacement" + "!"
     \\        id("😀" + "\0")}
     \\    @println(s, original)
@@ -12550,7 +12589,7 @@ const string_compound =
     \\    empty += ""
     \\    empty += "é"
     \\    empty += ""
-    \\    @println(empty, empty.len)
+    \\    @println(empty, @len(empty))
     \\}
 ;
 const string_compound_output = "hé\x00hé\x00 6 hé\x00 3\nhé\x00hé\x00😀\x00 hé\x00\ncontinue!tail!\nbreak! 3 returned old!tail hé\x00\né 1\n";
@@ -12687,7 +12726,7 @@ const inferred_example =
     \\    values += [result]
     \\    @println(1 + {let inner = result
     \\        inner})
-    \\    @println(saved, value, original[0], values[0], values.len, ready)
+    \\    @println(saved, value, original[0], values[0], @len(values), ready)
     \\}
 ;
 const inferred_output = "7\n8\n9\n7 8 8 9 3 true\n";
@@ -12714,9 +12753,9 @@ const inferred_arrays =
     \\    a[0] += {let temporary = [0, make(9)[0]]
     \\        temporary[-1]}
     \\    a += [count]
-    \\    @println(original[0], original[1], original[2], count, a[0], a.len)
+    \\    @println(original[0], original[1], original[2], count, a[0], @len(a))
     \\    let flags = [true, false]
-    \\    @println(flags[0], flags[-1], flags.len)
+    \\    @println(flags[0], flags[-1], @len(flags))
     \\    @println(early(true), early(false))
     \\    loop count < 4 {
     \\        count += 1
@@ -12827,14 +12866,14 @@ const array_compound_effects =
     \\        @print(a[0])
     \\        a = []
     \\        scratch[0]}
-    \\    @println(a[0], a[-1], a.len, copy[-1], count)
+    \\    @println(a[0], a[-1], @len(a), copy[-1], count)
     \\    a[-2] += {a[-1] = 99
     \\        a[0] = 80
     \\        2}
     \\    @println(a[0], a[-1])
     \\    a[-1] = {a = [77]
     \\        5}
-    \\    @println(a[0], a[-1], a.len)
+    \\    @println(a[0], a[-1], @len(a))
     \\    let mut n: int = 0
     \\    loop n < 4 {
     \\        n += 1
@@ -12890,7 +12929,7 @@ test "arrays support every approved integer element type" {
     defer source.deinit();
     try source.writer.writeAll("let main: () -> void = {\n");
     for ([_][]const u8{ "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "int", "uint" }) |name| {
-        try source.writer.print("{{let mut a: []{s} = [0, 1,]\na[0] = 2\na += []\n@println(a[0], a[-1], a.len)}}\n", .{name});
+        try source.writer.print("{{let mut a: []{s} = [0, 1,]\na[0] = 2\na += []\n@println(a[0], a[-1], @len(a))}}\n", .{name});
     }
     try source.writer.writeAll("}");
     const c = try arrayTestProgram(source.written());
@@ -12951,7 +12990,7 @@ test "array roots survive nested loops conditional merges early returns and argu
         \\    @println(pair(choose(a, true), choose(b, false)))
         \\    let result: []int = choose(a, true)
         \\    a = []
-        \\    @println(result[-1], a.len)
+        \\    @println(result[-1], @len(a))
         \\    let skipped: bool = false and {let unused: []int = [99]
         \\        unused[0] == 99}
         \\    @println(skipped)
@@ -13106,7 +13145,7 @@ const else_loops =
     \\    a[0] = 9
     \\    a += [5]
     \\    result[-1] = 8
-    \\    @println(a[0], a[-1], a.len, result[0], result[-1])
+    \\    @println(a[0], a[-1], @len(a), result[0], result[-1])
     \\    return loop false {} else {result}
     \\}
     \\let join: (a: string, b: string, c: string) -> string = a + b + c
@@ -13156,7 +13195,7 @@ const else_loops =
     \\    let x = choose(true)
     \\    let y = choose(false)
     \\    let pressure: []int = [99]
-    \\    @println(x[0], x[-1], y[0], y[-1], pressure.len)
+    \\    @println(x[0], x[-1], y[0], y[-1], @len(pressure))
     \\    let mut text = "a" + "b"
     \\    let shared = loop false {} else {text}
     \\    text += "c"
@@ -13205,7 +13244,7 @@ const value_loops =
     \\            snapshot}
     \\    }
     \\    source[0] = 9
-    \\    @println(source[0], source.len)
+    \\    @println(source[0], @len(source))
     \\    return loop {break result}
     \\}
     \\let array_rhs: () -> []int = {
@@ -13213,7 +13252,7 @@ const value_loops =
     \\    let result: []int = loop {source += {break source}}
     \\    source[0] = 99
     \\    source += [13]
-    \\    @println(source[0], source.len)
+    \\    @println(source[0], @len(source))
     \\    result
     \\}
     \\let text: () -> string = {
@@ -13237,13 +13276,13 @@ const value_loops =
     \\    let message = text()
     \\    let shared: string = loop {break message}
     \\    let pressure: []int = [10, 20]
-    \\    @println(result[0], result[1], result[-1], result.len, pressure.len)
+    \\    @println(result[0], result[1], result[-1], @len(result), @len(pressure))
     \\    @println(message, shared)
     \\    let in_rhs: int = 1 + loop {break 2}
     \\    let short = false or loop {break true}
     \\    @println(in_rhs, short)
     \\    let from_rhs = array_rhs()
-    \\    @println(from_rhs[0], from_rhs[-1], from_rhs.len)
+    \\    @println(from_rhs[0], from_rhs[-1], @len(from_rhs))
     \\    let mut ticks: int = 0
     \\    let from_cont: string = loop : {ticks += 1
     \\        let fresh = "x" + "y"
@@ -13345,7 +13384,7 @@ const unconditional_loops =
     \\        if early {return text}
     \\        if n == 3 {break}
     \\    }
-    \\    @println(values.len, values[-1])
+    \\    @println(@len(values), values[-1])
     \\    text
     \\}
     \\let exit: () -> void = loop {return}
@@ -15119,10 +15158,10 @@ const managed_array_program =
     \\let b=a
     \\a[0]="changed"+"!"
     \\a += ["tail"+"!"]
-    \\@println(b[0],a[0],a[-1],a.len,"hé\0😀" in b,"hé"+"\0😀" in b,"hé" in b,"" in b,"missing" in b,"" in [])
+    \\@println(b[0],a[0],a[-1],@len(a),"hé\0😀" in b,"hé"+"\0😀" in b,"hé" in b,"" in b,"missing" in b,"" in [])
     \\a[0]={a=["discard"+"!"]
     \\"snapshot"+"!"}
-    \\@println(a[0],a[-1],a.len,b[-1])
+    \\@println(a[0],a[-1],@len(a),b[-1])
     \\let mut r=copy(append())
     \\let original=r
     \\let mut value=r[0]
@@ -15135,7 +15174,7 @@ const managed_array_program =
     \\@println(original[0].inner.s,original[-1].inner.s,r[-1].inner.s,r[0].inner.s,first.inner.s,r[-1].inner.n,r[-1].k==Kind.second)
     \\r[0]={r=[make("discard")]
     \\make("stored")}
-    \\@println(r[0].inner.s,r[-1].inner.s,r.len,original[0].other)
+    \\@println(r[0].inner.s,r[-1].inner.s,@len(r),original[0].other)
     \\let option:O(Outer)=.some[r[0]]
     \\let result:R(Outer,Outer)=.ok[original[0]]
     \\@println(match option{.some=>|v|v.inner.s
@@ -15144,7 +15183,7 @@ const managed_array_program =
     \\let empty:[]Outer=[]
     \\let empty2:[]string=[]
     \\let again:[]Outer=[]
-    \\@println(empty.len,empty2.len,again.len,terminal().len)
+    \\@println(@len(empty),@len(empty2),@len(again),@len(terminal()))
     \\}
 ;
 const managed_array_output = "hé\x00😀 changed! tail! 5 true true false true false false\nsnapshot! tail! 5 static\na! c! value! a! first! 9 true\nstored! value! 3 other!\nstored! a!\n0 0 0 0\n";
@@ -15168,13 +15207,13 @@ test "managed array literal and indexed stores preserve ordered effects snapshot
         \\@print("I")
         \\0}]={@print("R")
         \\mark("N")}
-        \\@println("",a[0],a[-1],a.len)
+        \\@println("",a[0],a[-1],@len(a))
         \\let mut r=[record("C"),record("D")]
         \\r[{r=[record("X")]
         \\@print("J")
         \\0}]={@print("S")
         \\record("E")}
-        \\@println("",r[0].s,r[-1].s,r.len)
+        \\@println("",r[0].s,r[-1].s,@len(r))
         \\let mut count:int=0
         \\loop count<3{count+=1
         \\let skipped=[mark("L"),{if count==1{continue}
@@ -15226,7 +15265,7 @@ const copy_elision_cases = [_]struct { source: []const u8, allocations: usize, o
         .output = "3\n",
     },
     .{
-        .source = "let A=struct{a:[]int,b:[]int,}\nlet main:()={let a=A.[a=[1],b=[2]]\nlet n=a.a[0]\n@println(n,a.b.len,a.b[-1])}",
+        .source = "let A=struct{a:[]int,b:[]int,}\nlet main:()={let a=A.[a=[1],b=[2]]\nlet n=a.a[0]\n@println(n,@len(a.b),a.b[-1])}",
         .allocations = 2,
         .output = "1 1 2\n",
     },
@@ -15301,12 +15340,12 @@ const copy_elision_cases = [_]struct { source: []const u8, allocations: usize, o
         .output = "1 1\n",
     },
     .{
-        .source = "let L=struct{a:[]int,}\nlet T=struct{leaf:L,items:[]L,}\nlet main:()={let mut a=[T.[leaf=L.[a=[1]],items=[L.[a=[2]]]]]\na+=a\n@println(a.len)}",
+        .source = "let L=struct{a:[]int,}\nlet T=struct{leaf:L,items:[]L,}\nlet main:()={let mut a=[T.[leaf=L.[a=[1]],items=[L.[a=[2]]]]]\na+=a\n@println(@len(a))}",
         .allocations = 12,
         .output = "2\n",
     },
     .{
-        .source = "let L=struct{a:[]int,}\nlet T=struct{leaf:L,items:[]L,}\nlet U=union{node:T,none,}\nlet main:()={let u=U.node[T.[leaf=L.[a=[1]],items=[L.[a=[2]]]]]\nmatch u {\n.node=>|t|{let mut a=t.items\na+=a\n@println(a.len)}\n.none=>{}\n}}",
+        .source = "let L=struct{a:[]int,}\nlet T=struct{leaf:L,items:[]L,}\nlet U=union{node:T,none,}\nlet main:()={let u=U.node[T.[leaf=L.[a=[1]],items=[L.[a=[2]]]]]\nmatch u {\n.node=>|t|{let mut a=t.items\na+=a\n@println(@len(a))}\n.none=>{}\n}}",
         .allocations = 9,
         .output = "2\n",
     },
@@ -15500,7 +15539,7 @@ test "copy elision allocation counts retain snapshots under forced GC" {
 }
 
 test "copy elision forged reused and live storage operands keep independent backing" {
-    var module = try Module.init(test_gpa, "forged-transfers.nov", "let L=struct{a:[]int,}\nlet main:()={let seed=L.[a=[1]]\nlet mut a=[seed,seed]\na[-1]=seed\na+=a\n@println(a.len,seed.a[0],a[0].a[0])}");
+    var module = try Module.init(test_gpa, "forged-transfers.nov", "let L=struct{a:[]int,}\nlet main:()={let seed=L.[a=[1]]\nlet mut a=[seed,seed]\na[-1]=seed\na+=a\n@println(@len(a),seed.a[0],a[0].a[0])}");
     defer module.deinit();
     var sema = try Lowering.lower(&module);
     defer sema.deinit();
@@ -15679,7 +15718,7 @@ fn testTransferTopologyRuntime(ir: *const Ir, take: bool, executions: usize, out
 
 test "copy elision observed snapshots reject forged later reads and escaping projections" {
     for ([_][]const u8{
-        "let main:()={let mut a:[]int=[1]\na[0]+=2\n@println(a[0],a.len)}",
+        "let main:()={let mut a:[]int=[1]\na[0]+=2\n@println(a[0],@len(a))}",
         "let L=struct{a:[]int,}\nlet main:()={let mut a:[]L=[L.[a=[1]]]\nlet before=a[0]\na[0]=L.[a=[2]]\n@println(before.a[0],a[0].a[0])}",
     }, 0..) |source, case| {
         var module = try Module.init(test_gpa, "forged-observation.nov", source);
@@ -16072,7 +16111,7 @@ const array_fields_program =
     \\let mut payload=match u {.some=>|v|v
     \\.none=>tree()}
     \\payload.leaf.values[0]=60
-    \\@println(immutable().leaf.values[0],snapshot().leaf.values[0],read.leaf.values[0],a.leaf.values[0],a.leaf.values[1],a.leaf.values.len)
+    \\@println(immutable().leaf.values[0],snapshot().leaf.values[0],read.leaf.values[0],a.leaf.values[0],a.leaf.values[1],@len(a.leaf.values))
     \\@println(saved.records[0].values[0],a.records[0].values[0],a.records[-1].values[0],boxed.value.leaf.values[0],branch.leaf.values[0],looped.leaf.values[0],payload.leaf.values[0])
     \\}
 ;
@@ -16142,7 +16181,7 @@ test "array fields negative indexed nested store snapshots array but keeps lates
         \\owner.sibling="latest"+" outer"
         \\@print("R")
         \\9}
-        \\@println(owner.inner.values[0],owner.inner.values[1],owner.inner.values[-1],owner.inner.values.len,owner.inner.sibling,owner.sibling)
+        \\@println(owner.inner.values[0],owner.inner.values[1],owner.inner.values[-1],@len(owner.inner.values),owner.inner.sibling,owner.sibling)
         \\@println(saved.inner.values[0],saved.inner.values[-1],saved.inner.sibling,saved.sibling)
         \\}
     );
@@ -16224,13 +16263,13 @@ test "array fields whole record and record element loans preserve ordinary copie
         \\let mut detached=loan.*
         \\loan.*.a += [2]
         \\detached.a[0]=9
-        \\@println(loan.*.a[0],loan.*.a.len,detached.a[0],detached.a.len)
+        \\@println(loan.*.a[0],@len(loan.*.a),detached.a[0],@len(detached.a))
         \\let mut records=[A.[a=[3]]]
         \\let element=&records[0]
         \\let mut old=element.*
         \\element.*.a += [4]
         \\old.a[0]=8
-        \\@println(element.*.a[0],element.*.a.len,old.a[0],old.a.len)
+        \\@println(element.*.a[0],@len(element.*.a),old.a[0],@len(old.a))
         \\}
     );
     defer test_gpa.free(c);
@@ -16254,7 +16293,7 @@ test "array fields insertion replacement and append backing pointers detach at o
         \\let rhs=inserted
         \\inserted += rhs
         \\inserted += inserted
-        \\@println(inserted.len,inserted[0].leaf.values[0],inserted[-1].records[-1].text)
+        \\@println(@len(inserted),inserted[0].leaf.values[0],inserted[-1].records[-1].text)
         \\}
         \\.none=>{}
         \\}
@@ -16760,7 +16799,7 @@ const borrow_snapshot_terminal_program =
     \\        return} else {let r=&a[0]
     \\        r.*.x=7
     \\        [R.[]]}
-    \\    @println("append",a[0].x,a.len)}
+    \\    @println("append",a[0].x,@len(a))}
     \\let update:(stop:bool)={let mut a=[R.[],R.[]]
     \\    a[1]=if stop {let r=&a[0]
     \\        r.*.x=9
@@ -16892,7 +16931,7 @@ const general_borrow_program =
     \\let copy=ra.*
     \\ra.*+=[3]
     \\ra.*[0]+=4
-    \\@println(readArray(ra.*)[0],copy[0],a.len)
+    \\@println(readArray(ra.*)[0],copy[0],@len(a))
     \\let mut flags=[false]
     \\let rf=&flags[0]
     \\rf.* =true

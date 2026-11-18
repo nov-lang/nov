@@ -23,7 +23,7 @@ let map_types_and_generic_callbacks: () = {
             "item {value}"
         }
     )
-    @assert(labels.len == 3 and labels[0] == "item 1" and labels[2] == "item 3")
+    @assert(@len(labels) == 3 and labels[0] == "item 1" and labels[2] == "item 3")
     @assert(calls == 3)
     let identity = (value: `T) -> `T {
         value
@@ -47,7 +47,7 @@ let map_types_and_generic_callbacks: () = {
             "unexpected"
         }
     )
-    @assert(mapped.len == 0 and calls == 3)
+    @assert(@len(mapped) == 0 and calls == 3)
 }
 
 @[test]
@@ -63,7 +63,7 @@ let filter_order_and_exact_calls: () = {
         }
     )
     @assert(calls == 4 and seen == 3142)
-    @assert(selected.len == 2 and selected[0] == 3 and selected[1] == 4)
+    @assert(@len(selected) == 2 and selected[0] == 3 and selected[1] == 4)
     let rejected = std.array.filter(
         @as([]int, [7, 8]),
         (value: int) -> bool {
@@ -71,7 +71,7 @@ let filter_order_and_exact_calls: () = {
             false
         }
     )
-    @assert(rejected.len == 0 and calls == 6)
+    @assert(@len(rejected) == 0 and calls == 6)
     let empty: []int = []
     let none = std.array.filter(
         empty,
@@ -80,7 +80,7 @@ let filter_order_and_exact_calls: () = {
             true
         }
     )
-    @assert(none.len == 0 and calls == 6)
+    @assert(@len(none) == 0 and calls == 6)
 }
 
 @[test]
@@ -132,13 +132,13 @@ let recursive_array_record_and_union_copies: () = {
     changed.values = [[8]]
     mapped[0] = changed
     folded += [row]
-    @assert(selected[0].values[0][0] == 1 and selected[0].values[0].len == 2)
+    @assert(selected[0].values[0][0] == 1 and @len(selected[0].values[0]) == 2)
     @assert(mapped[0].values[0][0] == 8 and source[0].values[0][0] == 9)
-    @assert(folded[0].values[0][0] == 1 and seed.len == 0)
+    @assert(folded[0].values[0][0] == 1 and @len(seed) == 0)
     let mut nested: [][]int = [[4, 5]]
     let copied = std.array.map(nested, identity)
     nested[0] = [99]
-    @assert(copied[0][0] == 4 and copied[0].len == 2)
+    @assert(copied[0][0] == 4 and @len(copied[0]) == 2)
     let payloads: []Payload = [.row[selected[0]], .none[]]
     let mut unions = std.array.map(payloads, identity)
     let kept = std.array.filter(

@@ -73,11 +73,11 @@ let source_snapshots: () = {
     let mut saved = Box([]int).[ value ]
     value[0] = 20
     value += [6]
-    @assert(saved.value[0] == 2 and saved.value.len == 2)
+    @assert(saved.value[0] == 2 and @len(saved.value) == 2)
     saved.value[1] = 40
     @assert(value[1] == 4)
     let again = Box([]int).[ value ]
-    @assert(again.value[0] == 20 and again.value.len == 3)
+    @assert(again.value[0] == 20 and @len(again.value) == 3)
 }
 
 @[test]

@@ -394,6 +394,10 @@ inaccessible marked methods reject rather than falling back. Cross-file converte
 require `@[public]`. An unmarked `toString` is an ordinary callable method, not a
 printing hook.
 
+Source-level `@len(values)` returns an array's element count as native `uint`,
+not its byte size or capacity. It accepts an array or string expression, not a
+record with a field named `len`; real record fields retain ordinary field access.
+
 The array representation uses `nov_array { void *data; uintptr_t len, cap; }`.
 The emitter declares this type for any transitively reachable array type, including
 arrays nested in callback parameter/result signatures. Signature-only callback
@@ -436,7 +440,7 @@ across frames remain requirements. Tests run generated programs with collection
 on **every** allocation, injected allocation failures/retries, strict C11/UBSan,
 -O0 and -O3 bounds checks, argument-order effects, nested loops and early returns.
 
-Writable length (especially growth initialization), array slices/invalidation,
+Array clear/truncation APIs, length growth initialization, array slices/invalidation,
 general pointer elements and managed FFI remain deferred. Local references and
 call-scoped reference parameters are delivered; returning and storing references
 remain accepted but unimplemented, as described above. These are not general
@@ -454,6 +458,10 @@ syntax remains undecided and its unfinished work stashed, not implemented.
 See the main README for delivered source syntax and copy/evaluation contracts.
 
 ## Generated immutable strings
+
+Source-level `@len(text)` for a `string` scans UTF-8 without allocation and returns
+its Unicode scalar count as native `uint`, not bytes or grapheme clusters. The
+internal byte length and real C fields below are unchanged by this source builtin.
 
 `nov_string { void *owner; const unsigned char *data; uintptr_t len; }` separates
 traced ownership from byte access. Literals use read-only static C bytes, explicit

@@ -60,7 +60,7 @@ let fromBytes: (bytes: []u8) -> std.Result(string, Utf8Error) = {
 
 @[public]
 let startsWith: (text: string, prefix: string) -> bool = {
-    if prefix.len > text.len {
+    if @len(prefix) > @len(text) {
         return false
     }
     loop scalar, index in prefix, @as(int, 0).. {
@@ -73,7 +73,7 @@ let startsWith: (text: string, prefix: string) -> bool = {
 
 @[public]
 let endsWith: (text: string, suffix: string) -> bool = {
-    if suffix.len > text.len {
+    if @len(suffix) > @len(text) {
         return false
     }
     loop _, index in suffix, @as(int, 0).. {
@@ -87,7 +87,7 @@ let endsWith: (text: string, suffix: string) -> bool = {
 
 @[public]
 let find: (text: string, pattern: string) -> std.Option(uint) = {
-    if pattern.len == 0 {
+    if @len(pattern) == 0 {
         return .some[0]
     }
     loop _, offset, index in text, @as(int, 0).., 0.. {
@@ -117,7 +117,7 @@ let join: (parts: []string, separator: string) -> string = {
 
 @[public]
 let split: (text: string, separator: string) -> []string = {
-    if separator.len == 0 {
+    if @len(separator) == 0 {
         return [text]
     }
     ; String slices require native int bounds.
@@ -199,7 +199,7 @@ let replace: (text: string, pattern: string, replacement: string) -> string = {
 
 @[public]
 let repeat: (text: string, count: uint) -> string = {
-    if text.len == 0 {
+    if @len(text) == 0 {
         return ""
     }
     let mut result = ""

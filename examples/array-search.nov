@@ -117,7 +117,7 @@ let find_payload_types_and_recursive_copies: () = {
         }
     )
     let mut row = found.unwrapOr(Row.[ values = [] ])
-    @assert(row.values[0][0] == 1 and row.values[0].len == 2)
+    @assert(row.values[0][0] == 1 and @len(row.values[0]) == 2)
     row.values = [[7]]
     @assert(found.unwrapOr(Row.[ values = [] ]).values[0][0] == 1)
     @assert(source[0].values[0][0] == 9)

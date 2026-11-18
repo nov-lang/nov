@@ -545,8 +545,9 @@ arrays, fields, literal matches with catchalls, union payloads and scoped borrow
 arithmetic, ordering, rune ranges or foreign ABI support.
 
 String indexing decodes `rune` with native `int` scalar offsets; negatives count
-scalars from the end. `.len` is native `uint` scalar count, not byte/grapheme count:
-`"é😀\0".len == 3`, `"é😀"[-1] == '😀'`, `"e\u{301}".len == 2`.
+scalars from the end. For a `string`, `@len(text)` returns the Unicode scalar count
+as native `uint`, not the byte or grapheme count:
+`@len("é😀\0") == 3`, `"é😀"[-1] == '😀'`, `@len("e\u{301}") == 2`.
 Both indexing and length scan UTF-8 in O(n), allocating nothing; storage remains
 UTF-8 bytes. See examples/runes.nov and examples/string-bytes.nov (historical name,
 now a Unicode scalar example). String slicing is implemented: `text[start..end]`,
@@ -555,11 +556,11 @@ Bounds are native `int` scalar offsets; negatives count from the scalar end.
 An explicit inclusive end must name an existing scalar, then advances one boundary;
 omitted ends mean through the string end for either operator. After conversion,
 `0 <= start <= exclusive_end <= len` is required; invalid bounds panic in all modes.
-Adjacent reversed inclusive bounds form an empty slice; an explicit end at `.len`
+Adjacent reversed inclusive bounds form an empty slice; an explicit end at `@len(text)`
 or any explicit inclusive end on an empty string rejects. Base/start/end evaluate once,
 left to right. Views are immutable, allocation-free and share the original GC owner
-without copying UTF-8 bytes; small views retain the full allocation. `.len` counts
-scalars. Array slicing remains unsupported. Array/string iteration is supported
+without copying UTF-8 bytes; small views retain the full allocation. `@len(text)` counts
+Unicode scalars. Array slicing remains unsupported. Array/string iteration is supported
 as described below; see examples/string-slices.nov for slicing.
 
 Language tests are executable: `@[test]` marks top-level `() -> void` functions,
@@ -1069,7 +1070,7 @@ implemented; grapheme operations remain deferred.
     Current backslash escapes remain supported behavior; compatibility/deprecation
     rules are undecided.
   - [x] allocation-free O(n) scalar indexing returns exact rune, with int/negative indices and all-mode bounds panics
-  - [x] allocation-free O(n) `.len` counts scalars, not UTF-8 bytes or graphemes
+  - [x] allocation-free O(n) `@len(text)` returns native `uint` and counts Unicode scalars, not UTF-8 bytes or graphemes
   - [x] half-open/inclusive scalar slicing with native int/negative bounds, all-mode panics and allocation-free shared-owner views
   - [x] forward O(n) scalar string iteration (see Loop)
   - ordering, byte-buffer conversions and the UTF-8 builder remain deferred
@@ -1190,9 +1191,11 @@ let myStruct = struct {}
 
 # proposal: add Traits or something similar
 Historical proposals considered name-based overloading, such as `.toString()`
-overriding the default format, `.len` overriding length and `.next()` implementing
-an iterator. These are not implemented name-based protocols: current printing
-requires explicit `@[stringify]`; an unmarked `.toString()` has no special effect.
+overriding the default format and `.next()` implementing an iterator. These are
+not implemented name-based protocols: current printing requires explicit
+`@[stringify]`; an unmarked `.toString()` has no special effect. `@len(value)`
+accepts only arrays and strings, not records or user-defined length protocols.
+A real record field named `len` remains ordinary field access.
 
 I think it's a better idea to uniformize all of that with specific description
 like traits which should make the language easier to understand and read.
@@ -1267,7 +1270,7 @@ operators below remain unapproved proposals.
 
 ```nov
 let forEach: (a: *mut []int, f: (int) -> int) = {
-    for i in 0..a.len {
+    for i in 0..@len(a) {
         a[i] = f(a[i])
     }
 }
@@ -1368,9 +1371,10 @@ if expr |val| {
 Growable `[]T` value arrays now cover all existing storable runtime types under
 the current delivered contract above, with
 pointer-sized uint len/cap, native int negative indexing, independent copies at
-value boundaries, literals (including context-typed empty arrays), read-only
-`.len`, mutable element replacement and self-safe `+=` append. Formatting now
-covers supported array annotations (including nested arrays), literals, indexing, `.len` reads and direct
+value boundaries, literals (including context-typed empty arrays),
+`@len(values)` element counts as native `uint`, mutable element replacement and
+self-safe `+=` append. Formatting now covers supported array annotations (including
+nested arrays), literals, indexing, `@len(value)` calls and direct
 indexed replacement and integer element `+=`, `-=`, `*=`, `/=`, `%=`, with
 token/comment/AST preservation and first-pass idempotence. Integer element compounds
 now execute using one pre-index array snapshot and one index evaluation, reading
@@ -1378,7 +1382,8 @@ the old element before the RHS and replacing the local with the updated snapshot
 afterwards. Plain replacement retains its final-update bounds check; compounds
 check on the pre-RHS read. No new memory forms are introduced. See README's
 executable subset for precise limits and evaluation order. The proposals below
-remain proposals; writable length, array slices, general pointer elements/aliases
+remain proposals; array clear/truncation APIs, length growth initialization,
+array slices, general pointer elements/aliases
 and capacity APIs are still deferred. Safe reference passing is delivered alongside
 local `&T` / `&mut T` references. Returning/storage remain accepted future work;
 reference returns are explicitly postponed pending an escape-lifetime decision.
@@ -1400,7 +1405,7 @@ or mutable-pointee `&mut []T`, with `p.*[i]` access and independent binding `mut
 see the delivered reference contract above. Older `*` / `*mut` sketches below
 remain separate proposals, not current reference syntax.
 
-Arrays don't have methods? (only a .len field)
+Array length uses `@len(values)`, not a synthetic field or method.
 
 TODO:
 - keep arrays like that aka growable size list etc... or move to static array like zig?
@@ -1417,7 +1422,7 @@ TODO:
 
 Approved executable storage contracts supersede the earlier shared-layout proposal:
 arrays have independent scalar backing with native `uint` len/cap; strings share
-immutable UTF-8 byte backing and no exposed capacity; public `.len` scans for the
+immutable UTF-8 byte backing and no exposed capacity; public `@len(text)` scans for the
 native `uint` Unicode scalar count, not the internal byte length.
 See README and src/runtime/README.md for the implemented root/ownership model.
 
@@ -1449,7 +1454,7 @@ proposal, not the executable helper API.
 ; Traditional imperative loop
 let num_list = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 let mut result = 0
-for i in 0..num_list.len {
+for i in 0..@len(num_list) {
     if num_list[i] % 2 == 0 {
         result += num_list[i] * 10
     }
@@ -1625,12 +1630,12 @@ protocol.
   - It's fine to iterate on an array and an iterator at the same time. It will
     panic if the iterator is null when array still has elelemnts and when
     iterator is not null when array as no more elements.
-- use &[], [] and .len operator overloading instead? (no, too complicated and doesn't work for e.g. tokenizer)
+- use &[] and [] operator overloading instead? (no, too complicated and doesn't work for e.g. tokenizer)
   - []: `(*T, int) -> U`
   - &[]: `(*T, int) -> *mut U`
   - this is better than .next() because we know the len and [] op overloading
-    is a cool side effect but it's a pain to have separate [] and .len
-    overloading doesn't make much sense
+    is a cool side effect, but a separate overloadable length protocol
+    doesn't make much sense; `@len` is restricted to arrays and strings
 - use async with yield for iterators
 
 ## Use after realloc / iterator invalidation
@@ -1898,7 +1903,7 @@ let ArrayList: (T: #type) -> type = { ... }
 - Approved strings (implemented; supersedes earlier platform/termination/mutation proposals):
   - Immutable valid UTF-8 on every platform, including Windows; shared storage at
     assignment and call/return boundaries. `let mut` replaces the binding only.
-  - Internal lengths measure UTF-8 bytes; embedded NUL is valid. Public `.len` is
+  - Internal lengths measure UTF-8 bytes; embedded NUL is valid. Public `@len(text)` is
     native `uint` Unicode scalar count, scanned in O(n) without allocation.
   - Literals, `+`, printing, locals, parameters/returns, conditionals and explicitly
     typed immutable literal globals are supported. Concatenation uses rooted GC

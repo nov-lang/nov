@@ -20,7 +20,7 @@ let expectValid: (bytes: []u8, expected: string) = {
     }
     @assert(text == expected)
     let encoded = std.string.toBytes(text)
-    @assert(encoded.len == bytes.len)
+    @assert(@len(encoded) == @len(bytes))
     loop actual, original in encoded, bytes {
         @assert(actual == original)
     }
@@ -49,7 +49,7 @@ let empty_ascii_and_nul: () = {
         byte += 1
     }
     let text = std.string.fromBytes(ascii).unwrapOr("bad")
-    @assert(text.len == 128 and text[0] == '\0' and text[-1] == '\u{7F}')
+    @assert(@len(text) == 128 and text[0] == '\0' and text[-1] == '\u{7F}')
     expectValid(ascii, text)
 }
 
@@ -194,7 +194,7 @@ let source_scope_and_gc_churn: () = {
     loop i in 0..2000 {
         let temporary = std.string.toBytes("allocation:{i}:😀")
         let decoded = std.string.fromBytes(temporary).unwrapOr("")
-        @assert(decoded.len > 0)
+        @assert(@len(decoded) > 0)
     }
     @assert(text == "temporary:é😀\0")
     expectValid(bytes, "é😀\0")
@@ -238,5 +238,5 @@ let main: () = {
         .err => |error| @println("Invalid UTF-8:", error)
     }
     let nul = "a\0b"
-    @println("NUL: {std.string.toBytes(nul).len} bytes, {nul.len} scalars")
+    @println("NUL: {@len(std.string.toBytes(nul))} bytes, {@len(nul)} scalars")
 }

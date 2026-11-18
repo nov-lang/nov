@@ -151,6 +151,10 @@ fn scanInitializer(self: *Dependencies, module: *Module, id: Module.DeclId, work
                     // The type is resolved by Sema, never read as a runtime value.
                     // Even malformed ascriptions must not hide eager value reads.
                     for (call.ast.args[@min(@as(usize, 1), call.ast.args.len)..]) |arg| try work.append(self.allocator, arg);
+                } else if (ast.nodes.items(.tag)[call.ast.fn_expr] == .builtin_literal and
+                    std.mem.eql(u8, ast.tokenSlice(ast.firstToken(call.ast.fn_expr)), "@len"))
+                {
+                    try work.appendSlice(self.allocator, call.ast.args);
                 } else {
                     try module.diagnostics.append(self.allocator, .{ .tag = .unsupported_dependency_expression, .span = span });
                     entry.state = .failed;

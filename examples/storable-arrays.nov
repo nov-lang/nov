@@ -78,7 +78,7 @@ let nested_copies_and_iteration: () = {
     let first = &rows[0]
     first.*[0] = first.*[0] + "!"
     first.* += ["d"]
-    @assert(saved[0][0] == "ab" and saved[0].len == 1)
+    @assert(saved[0][0] == "ab" and @len(saved[0]) == 1)
     @assert(assigned[0][0] == "ab")
     loop row in rows {
         let mut detached = row
@@ -87,8 +87,8 @@ let nested_copies_and_iteration: () = {
     loop &row in rows {
         row.* += ["tail"]
     }
-    @assert(rows[0][0] == "ab!" and rows[0].len == 3)
-    @assert(rows[1].len == 2 and saved[1].len == 1)
+    @assert(rows[0][0] == "ab!" and @len(rows[0]) == 3)
+    @assert(@len(rows[1]) == 2 and @len(saved[1]) == 1)
     let mut indexed = rows[0]
     indexed[0] = "independent"
     @assert(rows[0][0] == "ab!")
