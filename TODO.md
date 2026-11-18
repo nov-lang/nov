@@ -6,7 +6,9 @@ Last-use copy elimination is approved and implemented for proven fresh values
 and final private-local reads in matching execution regions. Independent value
 semantics remain unchanged; live or unproven sources retain recursive copies.
 Copy-on-write is a deferred **unaccepted proposal**. Explicit moves via `@move`
-are deferred, as are array clear/truncate, capacity APIs and array/slice rework.
+are deferred, as are array truncation, capacity APIs and array/slice rework.
+`@clear` is implemented for writable array places, retaining direct-place backing
+and releasing removed managed elements; `+=` still allocates new backing.
 Preserve delivered optimizations and correctness/performance cautions below.
 
 Array-valued struct fields are implemented.
@@ -1397,7 +1399,7 @@ the old element before the RHS and replacing the local with the updated snapshot
 afterwards. Plain replacement retains its final-update bounds check; compounds
 check on the pre-RHS read. No new memory forms are introduced. See README's
 executable subset for precise limits and evaluation order. The proposals below
-remain proposals; array clear/truncation APIs, length growth initialization,
+remain proposals; array truncation APIs, length growth initialization,
 array slices, general pointer elements/aliases
 and capacity APIs are still deferred. Safe reference passing is delivered alongside
 local `&T` / `&mut T` references. Returning/storage remain accepted future work;

@@ -152,6 +152,11 @@ fn scanInitializer(self: *Dependencies, module: *Module, id: Module.DeclId, work
                     // Even malformed ascriptions must not hide eager value reads.
                     for (call.ast.args[@min(@as(usize, 1), call.ast.args.len)..]) |arg| try work.append(self.allocator, arg);
                 } else if (ast.nodes.items(.tag)[call.ast.fn_expr] == .builtin_literal and
+                    std.mem.eql(u8, ast.tokenSlice(ast.firstToken(call.ast.fn_expr)), "@clear"))
+                {
+                    try module.diagnostics.append(self.allocator, .{ .tag = .unsupported_global_initializer, .span = span });
+                    entry.state = .failed;
+                } else if (ast.nodes.items(.tag)[call.ast.fn_expr] == .builtin_literal and
                     std.mem.eql(u8, ast.tokenSlice(ast.firstToken(call.ast.fn_expr)), "@len"))
                 {
                     try work.appendSlice(self.allocator, call.ast.args);
@@ -403,6 +408,23 @@ test "unsupported eager expressions are diagnosed rather than hiding dependencie
     var result = try analyze(&module);
     defer result.deinit();
     try std.testing.expectEqual(Module.Diagnostic.Tag.missing_initializer, module.diagnostics.items[0].tag);
+}
+
+test "clear is nonpure in global initializers" {
+    for ([_][]const u8{
+        "let mut items=[1]\nlet value=@clear(items)",
+        "let mut items=[1]\nlet value=[@clear(items)]",
+        "let mut items=[1]\nlet value=@as(@TypeOf({}),@clear(items))",
+    }) |source| {
+        var module = try Module.init(std.testing.allocator, "clear-global.nov", source);
+        defer module.deinit();
+        var result = try analyze(&module);
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+        try std.testing.expectEqual(Module.Diagnostic.Tag.unsupported_global_initializer, module.diagnostics.items[0].tag);
+        try std.testing.expectEqual(State.failed, result.getState(module.lookup("value").?).?);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+    }
 }
 
 test "aggregate constructors and mutable function literals collect only eager operands" {

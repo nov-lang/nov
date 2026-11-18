@@ -138,6 +138,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const language_tests = b.step("test-cli-language-tests", "Run test command and assertion language CLI tests");
     addLanguageTestCliTests(b, exe, language_tests);
     test_step.dependOn(language_tests);
+    const clear_tests = b.step("test-cli-clear", "Run array clear CLI tests");
+    addClearCliTests(b, exe, clear_tests);
+    test_step.dependOn(clear_tests);
     const len_tests = b.step("test-cli-len", "Run length builtin and removed length property CLI tests");
     addLenCliTests(b, exe, len_tests);
     test_step.dependOn(len_tests);
@@ -1323,6 +1326,40 @@ fn addClosureCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *s
         run.expectStdOutEqual("");
         run.expectStdErrMatch(case.diagnostic);
         test_step.dependOn(&run.step);
+    }
+}
+
+fn addClearCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    const fixtures = b.addWriteFiles();
+    _ = fixtures.add("clear.nov", @embedFile("examples/array-clear.nov"));
+    const check = b.addRunArtifact(exe);
+    check.setCwd(fixtures.getDirectory());
+    check.addArgs(&.{ "check", "--semantic", "clear.nov" });
+    check.expectExitCode(0);
+    check.expectStdOutEqual("");
+    check.expectStdErrEqual("");
+    test_step.dependOn(&check.step);
+    for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+        const run = b.addRunArtifact(exe);
+        run.setCwd(fixtures.getDirectory());
+        run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+        run.setEnvironmentVariable("NOV_CC", "");
+        run.setEnvironmentVariable("CC", "");
+        run.addArgs(&.{ "run", "clear.nov" });
+        if (mode.len != 0) run.addArg(mode);
+        run.expectExitCode(0);
+        run.expectStdOutEqual("Cleared: [], saved: [Ada, Grace]\nNext batch: [Linus]\nNumbers: []\n");
+        run.expectStdErrEqual("");
+        test_step.dependOn(&run.step);
+        const tests = b.addRunArtifact(exe);
+        tests.setCwd(fixtures.getDirectory());
+        tests.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+        tests.setEnvironmentVariable("NOV_CC", "");
+        tests.setEnvironmentVariable("CC", "");
+        tests.addArgs(&.{ "test", "clear.nov" });
+        if (mode.len != 0) tests.addArg(mode);
+        tests.expectExitCode(0);
+        test_step.dependOn(&tests.step);
     }
 }
 

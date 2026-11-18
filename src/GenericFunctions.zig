@@ -1156,6 +1156,137 @@ pub fn queryExpressionInScope(module: *Module, ir: *Ir, node: Ast.Node.Index, bi
     return solver.materialize(result, 0);
 }
 
+fn testClearInference(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "clear-inference.nov",
+        \\let R=struct{items:[]int,}
+        \\let index:()->int=0
+        \\let clear:(p:&mut `T)=@clear(p.*)
+        \\let f:()={let mut r=R.[items=[1]]
+        \\let mut nested=[[1]]
+        \\let q:@TypeOf(@clear(r.items))={}
+        \\let n:@TypeOf(@clear(nested[index()]))={}
+        \\let read=(){let t:@TypeOf(@clear(r.items))={}
+        \\}
+        \\read()
+        \\let mut a=[1]
+        \\let p=&a
+        \\let ref_query:@TypeOf(@clear(p.*))={}
+        \\clear(&a)}
+    );
+    defer module.deinit();
+
+    var result = try Lowering.lower(&module);
+    defer result.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(result.lowering_complete);
+    try result.ir.verify();
+    var clears: usize = 0;
+    var calls: usize = 0;
+    for (result.ir.functions.items) |function| {
+        const body = function.body orelse continue;
+        for (body.instructions) |instruction| switch (instruction.op) {
+            .array_clear => clears += 1,
+            .call => calls += 1,
+            .capture_cell, .capture_value, .array_set => return error.UnexpectedQueryEffect,
+            else => {},
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 1), clears);
+    try std.testing.expectEqual(@as(usize, 2), calls);
+}
+
+test "clear generic inference and field TypeOf are metadata only under OOM" {
+    try testClearInference(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testClearInference, .{});
+}
+
+test "clear query validates mutable array places without executable effects" {
+    var module = try Module.init(std.testing.allocator, "clear-query-engine.nov",
+        \\let mut items:[]int=[1]
+        \\let query=@TypeOf(@clear(items))
+    );
+    defer module.deinit();
+    errdefer std.debug.print("clear query diagnostics: {any}\n", .{module.diagnostics.items});
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    const declaration = module.source.ast.decl(module.getDeclaration(module.lookup("query").?).?.node).ast;
+    const call = module.source.ast.fullCall(declaration.init_node).?;
+    const ty = (try queryExpression(&module, &ir, call.ast.args[0], &.{}, &.{}, &.{})).?;
+    try std.testing.expect(ir.getType(ty).? == .void);
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expectEqual(@as(usize, 0), ir.functions.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ir.local_generic_instances.items.len);
+}
+
+test "clear query and executable storage shapes agree" {
+    const cases = [_]struct { params: []const u8 = "", setup: []const u8 = "", place: []const u8, supported: bool }{
+        .{ .params = "p:&mut R", .place = "p.*.a[0]", .supported = false },
+        .{ .setup = "let mut r=R.[a=[[1]]]\n", .place = "r.a[0]", .supported = true },
+        .{ .setup = "let mut rows=[R.[a=[[1]]]]\n", .place = "rows[0].a", .supported = false },
+        .{ .setup = "let mut rows=[R.[a=[[1]]]]\n", .place = "rows[0].a[0]", .supported = false },
+        .{ .params = "p:&mut R", .place = "p.*.a", .supported = true },
+        .{ .params = "p:&mut [][]int", .place = "p.*[0]", .supported = true },
+    };
+    for (cases) |case| for ([_]bool{ false, true }) |query| {
+        const expression = try std.fmt.allocPrint(std.testing.allocator, "{s}@clear({s}){s}\n", .{ if (query) "let q:@TypeOf(" else "", case.place, if (query) ")={}" else "" });
+        defer std.testing.allocator.free(expression);
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let R=struct{{a:[][]int,}}\nlet f:({s})={{\n{s}{s}}}\n", .{ case.params, case.setup, expression });
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "clear-shape-parity.nov", source);
+        defer module.deinit();
+        try std.testing.expect(!module.hasErrors());
+        var result = try Lowering.lower(&module);
+        defer result.deinit();
+        if (!case.supported) {
+            try std.testing.expect(!result.lowering_complete);
+            try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+            try std.testing.expectEqual(Module.Diagnostic.Tag.unsupported_assignment_target, module.diagnostics.items[0].tag);
+            continue;
+        }
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expect(result.lowering_complete);
+        try result.ir.verify();
+        var clears: usize = 0;
+        for (result.ir.functions.items) |function| {
+            const body = function.body orelse continue;
+            for (body.instructions) |instruction| switch (instruction.op) {
+                .array_clear => clears += 1,
+                .array_set, .borrow_store, .field_store, .capture_cell, .capture_value => if (query) return error.UnexpectedQueryEffect,
+                else => {},
+            };
+        }
+        try std.testing.expectEqual(@as(usize, if (query) 0 else 1), clears);
+    };
+}
+
+test "clear query rejects invalid places types and arity" {
+    const cases = [_]struct { operand: []const u8, diagnostic: Module.Diagnostic.Tag }{
+        .{ .operand = "{let a=[1]\n@clear(a)}", .diagnostic = .immutable_assignment },
+        .{ .operand = "{let mut n=1\n@clear(n)}", .diagnostic = .expression_type_mismatch },
+        .{ .operand = "@clear([1])", .diagnostic = .unsupported_assignment_target },
+        .{ .operand = "{let mut a=[1]\nlet p=&a\n@clear(p)}", .diagnostic = .immutable_assignment },
+        .{ .operand = "{let mut a=[1]\nlet mut p=&a\n@clear(p)}", .diagnostic = .expression_type_mismatch },
+        .{ .operand = "{let a=[1]\nlet p=&a\n@clear(p.*)}", .diagnostic = .immutable_assignment },
+        .{ .operand = "@clear()", .diagnostic = .argument_count_mismatch },
+        .{ .operand = "@clear([1],[2])", .diagnostic = .argument_count_mismatch },
+    };
+    for (cases) |case| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let query=@TypeOf({s})", .{case.operand});
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "clear-query-invalid.nov", source);
+        defer module.deinit();
+        try std.testing.expect(!module.hasErrors());
+        var ir = Ir.init(std.testing.allocator);
+        defer ir.deinit();
+        const declaration = module.source.ast.decl(module.getDeclaration(module.lookup("query").?).?.node).ast;
+        const call = module.source.ast.fullCall(declaration.init_node).?;
+        try std.testing.expectEqual(@as(?Ir.TypeId, null), try queryExpression(&module, &ir, call.ast.args[0], &.{}, &.{}, &.{}));
+        try std.testing.expect(module.diagnostics.items.len != 0);
+        try std.testing.expectEqual(case.diagnostic, module.diagnostics.items[0].tag);
+        try std.testing.expectEqual(@as(usize, 0), ir.functions.items.len);
+    }
+}
+
 const Solver = struct {
     allocator: std.mem.Allocator,
     caller: *Module,
@@ -1178,7 +1309,7 @@ const Solver = struct {
     query_matches: std.ArrayList(struct { module: *Module, node: Ast.Node.Index, subjects: []const *Term }) = .empty,
     length_operands: std.ArrayList(*Term) = .empty,
     query_statements: std.ArrayList(struct { operand: *Term, span: Module.Span }) = .empty,
-    query_places: std.ArrayList(struct { operand: *Term, kind: enum { array, record, mutable_reference, borrow_array }, span: Module.Span }) = .empty,
+    query_places: std.ArrayList(struct { operand: *Term, kind: enum { array, record, mutable_reference, borrow_array, clear_array }, span: Module.Span }) = .empty,
     analysis: ?*const Sema = null,
     types: []const ?Ir.TypeId = &.{},
     unsupported: ?Module.Span = null,
@@ -1331,12 +1462,13 @@ const Solver = struct {
         for (self.query_places.items) |place| {
             const operand = root(place.operand);
             const valid = switch (place.kind) {
-                .array, .borrow_array => operand.value == .array,
+                .array, .borrow_array, .clear_array => operand.value == .array,
                 .record => operand.value == .structural or (operand.value == .nominal and !self.tagged(operand)) or (operand.value == .known and self.ir.getType(operand.value.known).? == .record and !self.ir.getType(operand.value.known).?.record.tagged),
                 .mutable_reference => operand.value == .reference and operand.value.reference.mutable,
             };
             if (!valid) try self.fail(switch (place.kind) {
                 .borrow_array => .unsupported_borrow,
+                .clear_array => .expression_type_mismatch,
                 .mutable_reference => .immutable_assignment,
                 .array => .unsupported_assignment_target,
                 .record => .unsupported_assignment_target,
@@ -2349,6 +2481,27 @@ const Solver = struct {
         return ty;
     }
 
+    fn clearPlace(self: *Solver, frame: *Frame, node: Ast.Node.Index, depth: usize) Ir.BuildError!void {
+        const module = frame.ref.module;
+        const ast = &module.source.ast;
+        const span = module.tokenSpan(ast.firstToken(node));
+        const indexed = ast.nodes.items(.tag)[node] == .array_access;
+        var base = if (indexed) ast.nodes.items(.data)[node].lhs else node;
+        var fields: usize = 0;
+        while (ast.nodes.items(.tag)[base] == .field_access) {
+            if (fields == Ir.max_record_depth) return self.fail(.record_layout_limit, span, null);
+            fields += 1;
+            base = ast.nodes.items(.data)[base].lhs;
+        }
+        // Indexed clears write back the detached array. Borrowed storage only
+        // supports that writeback at its root, not through a record field path.
+        if (indexed and fields != 0 and ast.nodes.items(.tag)[base] == .deref)
+            return self.fail(.unsupported_assignment_target, span, null);
+        if (ast.nodes.items(.tag)[base] != .identifier and ast.nodes.items(.tag)[base] != .deref)
+            return self.fail(.unsupported_assignment_target, span, null);
+        try self.writablePlace(frame, node, depth + 1);
+    }
+
     fn writablePlace(self: *Solver, frame: *Frame, node: Ast.Node.Index, depth: usize) Ir.BuildError!void {
         const module = frame.ref.module;
         const ast = &module.source.ast;
@@ -2956,6 +3109,18 @@ const Solver = struct {
                     return ty;
                 }
                 const callee_name = ast.tokenSlice(ast.firstToken(call.ast.fn_expr));
+                if (ast.nodes.items(.tag)[call.ast.fn_expr] == .builtin_literal and std.mem.eql(u8, callee_name, "@clear")) {
+                    if (call.ast.args.len != 1) {
+                        try self.fail(.argument_count_mismatch, span, null);
+                        return self.term(.unknown, span);
+                    }
+                    const place = call.ast.args[0];
+                    const operand = try self.expression(frame, place, depth + 1);
+                    if (root(operand).value == .never) return operand;
+                    try self.clearPlace(frame, place, depth + 1);
+                    try self.query_places.append(self.allocator, .{ .operand = operand, .kind = .clear_array, .span = module.tokenSpan(ast.firstToken(place)) });
+                    return self.fromType(try self.ir.internType(.void), span, 0);
+                }
                 if (ast.nodes.items(.tag)[call.ast.fn_expr] == .builtin_literal and std.mem.eql(u8, callee_name, "@len")) {
                     if (call.ast.args.len != 1) {
                         try self.fail(.argument_count_mismatch, span, null);

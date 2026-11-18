@@ -531,6 +531,172 @@ test "string byte copies direct source free IR independent storage strict UTF8 f
     }.run, .{});
 }
 
+fn emitArrayClearTest(allocator: std.mem.Allocator, scalar_only: bool) ![]u8 {
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    const span: Ir.Span = .{ .start = 0, .end = 0 };
+    const Test = struct {
+        fn ins(ty: Ir.TypeId, op: Ir.Operation) Ir.Instruction {
+            return .{ .ty = ty, .span = .{ .start = 0, .end = 0 }, .op = op };
+        }
+        fn id(index: u32) Ir.ValueId {
+            return @fromBackingInt(index);
+        }
+    };
+    const ins = Test.ins;
+    const id = Test.id;
+    const unit = try ir.internType(.void);
+    const integer = try ir.internType(.{ .integer = .{ .signedness = .signed, .bits = Ir.native_pointer_bits } });
+    const inner = try ir.internType(.{ .array = integer });
+    const element = if (scalar_only) integer else try ir.internAnonymousRecord(&.{
+        .{ .name = "text", .ty = try ir.internType(.string), .span = span },
+        .{ .name = "child", .ty = inner, .span = span },
+    }, false);
+    const array = try ir.internType(.{ .array = element });
+    const reference = try ir.internType(.{ .reference = .{ .child = array, .mutable = true } });
+    const signature = try ir.internType(.{ .function = .{ .params = &.{reference}, .result = unit } });
+    const direct = try ir.addFunction("cleardirect", signature, span);
+    try ir.setFunctionBody(direct, &.{
+        ins(unit, .{ .reference_parameter = .{ .index = 0, .ty = reference } }),
+        ins(unit, .{ .array_clear = .{ .target = .{ .borrow = id(0) } } }),
+    }, id(1));
+    var nested_type: Ir.TypeId = element;
+    if (!scalar_only) {
+        const wrapper = try ir.internAnonymousRecord(&.{.{ .name = "items", .ty = array, .span = span }}, false);
+        const nested = try ir.internAnonymousRecord(&.{.{ .name = "inner", .ty = wrapper, .span = span }}, false);
+        nested_type = nested;
+        const nested_ref = try ir.internType(.{ .reference = .{ .child = nested, .mutable = true } });
+        const nested_sig = try ir.internType(.{ .function = .{ .params = &.{nested_ref}, .result = unit } });
+        const nested_fn = try ir.addFunction("clearnested", nested_sig, span);
+        try ir.setFunctionBody(nested_fn, &.{
+            ins(unit, .{ .reference_parameter = .{ .index = 0, .ty = nested_ref } }),
+            ins(unit, .{ .array_clear = .{ .target = .{ .borrow = id(0) }, .path = &.{ 0, 0 } } }),
+        }, id(1));
+        const init_sig = try ir.internType(.{ .function = .{ .params = &.{}, .result = array } });
+        const initializer = try ir.addFunction("clearinit", init_sig, span);
+        try ir.setFunctionBody(initializer, &.{ins(array, .{ .array_literal = &.{} })}, id(0));
+        const global = try ir.addGlobal("clearitems", array, span, initializer);
+        const global_sig = try ir.internType(.{ .function = .{ .params = &.{}, .result = unit } });
+        const global_fn = try ir.addFunction("clearglobal", global_sig, span);
+        try ir.setFunctionBody(global_fn, &.{
+            ins(array, .{ .global_slot = global }),
+            ins(unit, .{ .array_clear = .{ .target = .{ .slot = id(0) } } }),
+        }, id(1));
+        const local_sig = try ir.internType(.{ .function = .{ .params = &.{array}, .result = array } });
+        const indexed_fn = try ir.addFunction("clearindexed", local_sig, span);
+        const one = try ir.internConstant(.{ .ty = integer, .value = .{ .signed_integer = 1 } });
+        try ir.setFunctionBody(indexed_fn, &.{
+            ins(array, .{ .parameter = 0 }),
+            ins(array, .{ .local_slot = id(0) }),
+            ins(integer, .{ .constant = one }),
+            ins(unit, .{ .borrow_reserve = id(1) }),
+            ins(unit, .{ .borrow_start = .{ .reservation = id(3), .index = id(2) } }),
+            ins(unit, .{ .array_clear = .{ .target = .{ .borrow = id(4) }, .path = &.{1} } }),
+            ins(array, .{ .local_load = id(1) }),
+        }, id(6));
+        for (0..3) |kind| {
+            const function = try ir.addFunction(([_][]const u8{ "clearslot", "clearraw", "clearloaded" })[kind], local_sig, span);
+            var instructions: std.array_list.Managed(Ir.Instruction) = .init(allocator);
+            defer instructions.deinit();
+            try instructions.appendSlice(&.{ ins(array, .{ .parameter = 0 }), ins(array, .{ .local_slot = id(0) }) });
+            var target: @FieldType(@FieldType(Ir.Operation, "array_clear"), "target") = .{ .slot = id(1) };
+            if (kind != 0) {
+                try instructions.appendSlice(&.{
+                    ins(unit, .{ .borrow_reserve = id(1) }),
+                    ins(unit, .{ .borrow_start = .{ .reservation = id(2), .index = null } }),
+                });
+                target = .{ .borrow = id(3) };
+                if (kind == 2) {
+                    try instructions.appendSlice(&.{ ins(unit, .{ .reference_slot = id(3) }), ins(unit, .{ .reference_load = id(4) }) });
+                    target = .{ .borrow = id(5) };
+                }
+            }
+            try instructions.append(ins(unit, .{ .array_clear = .{ .target = target } }));
+            try instructions.append(ins(array, .{ .local_load = id(1) }));
+            try ir.setFunctionBody(function, instructions.items, id(@intCast(instructions.items.len - 1)));
+        }
+    }
+    const library = try emit(allocator, &ir, null);
+    defer allocator.free(library);
+    return std.fmt.allocPrint(allocator, "{s}\n#define CLEAR_ELEMENT nov_element_{d}\n#define CLEAR_VALUE nov_record_{d}\n#define CLEAR_NESTED nov_record_{d}\n", .{ library, @backingInt(element), @backingInt(element), @backingInt(nested_type) });
+}
+
+test "array_clear reference only scalar descriptor demand no allocation retained capacity O0 O3" {
+    const library = try emitArrayClearTest(test_gpa, true);
+    defer test_gpa.free(library);
+    const driver =
+        \\int main(void) {
+        \\ intptr_t values[]={7,9,42};nov_array a={values,2,3};
+        \\ nov_cleardirect(&a);
+        \\ if(a.data!=values || a.len || a.cap!=3 || values[0] || values[1] || values[2]!=42) return 1;
+        \\ nov_cleardirect(&a);nov_array empty={0};nov_cleardirect(&empty);
+        \\ if(empty.data || empty.len || empty.cap || nov_rt_heap.live_objects) return 2;
+        \\ return 0;
+        \\}
+    ;
+    const c = try std.mem.concat(test_gpa, u8, &.{ library, driver });
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "", "", mode);
+}
+
+test "array_clear source free lvalues retain storage capacity and release managed children O0 O3 OOM" {
+    const library = try emitArrayClearTest(test_gpa, false);
+    defer test_gpa.free(library);
+    const prelude =
+        \\#include <stdlib.h>
+        \\static unsigned clear_allocations;
+        \\static void *clear_malloc(size_t n) { ++clear_allocations; return malloc(n); }
+        \\#define NOV_GC_MALLOC clear_malloc
+        \\#define NOV_GC_FREE free
+    ;
+    const driver =
+        \\int main(void) {
+        \\ nov_array a={0};void **slots[]={&a.data};nov_gc_roots frame={0};
+        \\ nov_gc_push(&nov_rt_heap,&frame,slots,1);nov_rt_heap.collect_every_allocation=1;
+        \\ nov_globals_init();
+        \\ for(unsigned kind=0;kind<6;++kind) {
+        \\  a=nov_array_new(2,5,&CLEAR_ELEMENT);void *backing=a.data;
+        \\  CLEAR_VALUE *values=a.data;
+        \\  const nov_gc_descriptor bytes={3,1,0,NULL};
+        \\  values[0].f0.owner=nov_gc_alloc(&nov_rt_heap,&bytes);
+        \\  values[0].f0.data=values[0].f0.owner;values[0].f0.len=3;
+        \\  const nov_gc_descriptor scalar={sizeof(intptr_t),_Alignof(intptr_t),0,NULL};
+        \\  values[1].f1=nov_array_new(1,2,&scalar);
+        \\  if(nov_rt_heap.live_objects!=3) return 1;
+        \\  unsigned before=clear_allocations;void *child=values[1].f1.data;
+        \\  a=nov_clearindexed(a);
+        \\  if(a.len!=2 || values[1].f1.data!=child || values[1].f1.len || values[1].f1.cap!=2 || clear_allocations!=before) return 7;
+        \\  if(kind==0) nov_cleardirect(&a);
+        \\  if(kind==1) {
+        \\   /* Reconstruct the anonymous nested wrapper without a source AST. */
+        \\   CLEAR_NESTED box={.f0={.f0=a}};nov_clearnested(&box);a=box.f0.f0;
+        \\  }
+        \\  if(kind==2) a=nov_clearslot(a);
+        \\  if(kind==3) a=nov_clearraw(a);
+        \\  if(kind==4) a=nov_clearloaded(a);
+        \\  if(kind==5) { nov_global_0=a;nov_clearglobal();a=nov_global_0;nov_global_0=(nov_array){0}; }
+        \\  if(clear_allocations!=before || a.data!=backing || a.cap!=5 || a.len) return 2;
+        \\  const unsigned char *raw=a.data;
+        \\  for(size_t i=0;i<2*sizeof(CLEAR_VALUE);++i) if(raw[i]) return 3;
+        \\  nov_gc_collect(&nov_rt_heap);
+        \\  if(nov_rt_heap.live_objects!=1) return 4;
+        \\  nov_cleardirect(&a);if(clear_allocations!=before || a.data!=backing || a.cap!=5) return 5;
+        \\  a=(nov_array){0};nov_gc_collect(&nov_rt_heap);if(nov_rt_heap.live_objects) return 6;
+        \\ }
+        \\ nov_gc_pop(&nov_rt_heap,&frame);nov_gc_shutdown(&nov_rt_heap);return 0;
+        \\}
+    ;
+    const c = try std.mem.concat(test_gpa, u8, &.{ prelude, "\n", library, "\n", driver });
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "", "", mode);
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayClearEmission, .{});
+}
+
+fn testArrayClearEmission(allocator: std.mem.Allocator) !void {
+    const c = try emitArrayClearTest(allocator, false);
+    defer allocator.free(c);
+}
+
 fn usesStringByteCopies(ir: *const Ir) bool {
     for (ir.functions.items) |function| {
         const body = function.body orelse continue;
@@ -545,9 +711,17 @@ fn usesStringByteCopies(ir: *const Ir) bool {
 fn usesElementLayout(ir: *const Ir, element: Ir.TypeId) bool {
     for (ir.functions.items) |function| {
         const body = function.body orelse continue;
-        for (body.instructions) |instruction| switch (instruction.op) {
+        for (body.instructions, 0..) |instruction, i| switch (instruction.op) {
             .array_literal, .array_set, .array_append => if (ir.getType(instruction.ty).?.array == element) return true,
             .array_clone => {},
+            .array_clear => |clear| {
+                var ty = switch (clear.target) {
+                    .slot => |slot| body.instructions[@backingInt(slot)].ty,
+                    .borrow => |borrow| ir.borrowElement(body, borrow, i) catch unreachable,
+                };
+                for (clear.path) |index| ty = ir.getType(ty).?.record.fields[index].ty;
+                if (ir.getType(ty).?.array == element) return true;
+            },
             .local_slot => if (instruction.boxed and instruction.ty == element) return true,
             .closure_init => |closure| {
                 for (ir.getFunction(closure.function).?.captures) |capture| if (!capture.mutable and capture.ty == element and ir.getType(element).? != .void) return true;
@@ -708,7 +882,11 @@ fn needsRootFrame(ir: *const Ir, function: Ir.Function) bool {
 
 fn usesManagedRuntime(ir: *const Ir) bool {
     for (ir.globals.items) |global| if (managedType(ir, ir.getType(global.ty).?)) return true;
-    for (ir.functions.items) |function| if (needsRootFrame(ir, function)) return true;
+    for (ir.functions.items) |function| {
+        if (needsRootFrame(ir, function)) return true;
+        const body = function.body orelse continue;
+        for (body.instructions) |instruction| if (instruction.op == .array_clear) return true;
+    }
     return false;
 }
 
@@ -1620,6 +1798,9 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
             value_used[@backingInt(r.lhs)] = true;
             value_used[@backingInt(r.rhs)] = true;
         },
+        .array_clear => |clear| switch (clear.target) {
+            .slot, .borrow => |target| value_used[@backingInt(target)] = true,
+        },
         .borrow_reserve => |slot| value_used[@backingInt(slot)] = true,
         .borrow_start => |start| if (start.index) |index| {
             value_used[@backingInt(index)] = true;
@@ -1698,10 +1879,10 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
 
     const managed = needsRootFrame(ir, function);
     if (usesClosures(ir)) try w.writeAll("    (void)nov_env_element;\n");
+    // Reference-only clear needs runtime helpers but no callee-owned GC roots.
+    // Library hosts own shutdown; keep unused-function warnings portable.
+    if (usesManagedRuntime(ir)) try w.writeAll("    (void)nov_gc_register_globals; (void)nov_gc_unregister_globals; (void)nov_gc_shutdown; (void)nov_gc_push; (void)nov_gc_pop; (void)nov_gc_alloc;\n    (void)nov_array_clone; (void)nov_array_index; (void)nov_array_append; (void)nov_array_clear;\n");
     if (managed) {
-        // The embedded internal API also serves library emission, whose host
-        // owns shutdown. Keep strict C11 unused-function warnings portable.
-        try w.writeAll("    (void)nov_gc_register_globals; (void)nov_gc_unregister_globals; (void)nov_gc_shutdown; (void)nov_gc_pop; (void)nov_gc_alloc;\n    (void)nov_array_clone; (void)nov_array_index; (void)nov_array_append;\n");
         var roots: usize = @intFromBool(function.is_closure);
         if (function.is_closure) try w.writeAll("    (void)nov_env;\n");
         for (body.instructions, 0..) |instruction, i| {
@@ -1885,6 +2066,29 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
                     try w.print("    return v{d};\n", .{@backingInt(value)});
                 } else try w.writeAll("    return;\n");
             } else try w.writeAll("    return;\n");
+            continue;
+        }
+        if (instruction.op == .array_clear) {
+            const clear = instruction.op.array_clear;
+            var target_ty: Ir.TypeId = undefined;
+            try w.writeAll("    nov_array_clear(&(");
+            switch (clear.target) {
+                .slot => |slot| {
+                    target_ty = body.instructions[@backingInt(slot)].ty;
+                    try w.print("v{d}", .{@backingInt(slot)});
+                },
+                .borrow => |borrow| {
+                    target_ty = ir.borrowElement(body, borrow, i) catch unreachable;
+                    try writeBorrowRead(ir, w, body, borrow);
+                },
+            }
+            for (clear.path) |index| {
+                try w.print(".f{d}", .{index});
+                target_ty = ir.getType(target_ty).?.record.fields[index].ty;
+            }
+            try w.writeAll("), ");
+            try writeElementLayout(ir, w, ir.getType(target_ty).?.array);
+            try w.writeAll(");\n");
             continue;
         }
         if (instruction.op == .borrow_reserve) continue;
@@ -2138,7 +2342,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
                 }
             },
             .array_contains => |r| try w.print("nov_array_contains_{d}(v{d}, v{d})", .{ @backingInt(body.instructions[@backingInt(r.value)].ty), @backingInt(r.value), @backingInt(r.array) }),
-            .array_literal, .array_clone, .array_set, .array_append, .to_string, .string_to_bytes, .bytes_to_string, .field_store => unreachable,
+            .array_literal, .array_clone, .array_set, .array_append, .array_clear, .to_string, .string_to_bytes, .bytes_to_string, .field_store => unreachable,
             .constant => |id| try writeConstant(w, ir.constants.items[@backingInt(id)], ty),
             .parameter => |index| try w.print("p{d}", .{index}),
             .local_slot, .local_load => |value| try w.print("v{d}", .{@backingInt(value)}),

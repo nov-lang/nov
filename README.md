@@ -2140,9 +2140,20 @@ let main: () -> void = {
   zero-initialized capacity. Record layout dependencies precede array descriptors. Map storage costs
   capacity times managed owner fields; GC never traces static byte pointers.
   See [examples/managed-arrays.nov](examples/managed-arrays.nov).
-- `@len(values)` is a value, not an assignable place. Array clear/truncation APIs
-  and initialization on length growth remain deferred; `values = []` still rebinds
-  a mutable array to an empty value. No array equality, concatenation
+- `@clear(values)` empties a writable array place and returns `void`. Direct
+  local/global arrays, struct fields and explicit mutable reference pointees
+  (`@clear(p.*)` or `@clear(self.*.items)`) retain their backing storage and capacity
+  without allocating. Removed elements stop retaining managed children; independent
+  value copies are unchanged. Immutable places, temporaries, strings, bare references
+  and conflicting live loans are rejected. Indexed nested arrays use the existing
+  pre-index snapshot/writeback semantics and may copy backing storage. A field of an
+  indexed element, or an indexed field through a borrowed record, is not yet supported.
+  `@TypeOf(@clear(place))` validates the place without executing the mutation or index.
+  See [`examples/array-clear.nov`](examples/array-clear.nov).
+- Retaining capacity does not yet make `+=` reuse it: append still allocates fresh
+  backing. Truncation, capacity APIs and initialization on length growth remain
+  deferred. `@len(values)` is not assignable; `values = []` rebinds a mutable array
+  to an empty value rather than retaining its buffer. No array equality, concatenation
   with `+`, slices, pointer elements, general aliases,
   or capacity API is delivered. Array globals support data-only initialization. Bounded value/reference iteration is
   supported (see [Loop](#loop)). The formatter supports

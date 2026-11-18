@@ -15,6 +15,12 @@ static inline nov_array nov_array_clone(nov_array a, const nov_gc_descriptor *el
     if (a.len) memcpy(b.data, a.data, (size_t)a.len * element->size);
     return b;
 }
+static inline void nov_array_clear(nov_array *a, const nov_gc_descriptor *element) {
+    /* The GC traces capacity, not length. Remove managed children as well as
+     * values, while retaining the backing allocation and its capacity. */
+    if (a->len) memset(a->data, 0, (size_t)a->len * element->size);
+    a->len = 0;
+}
 static inline uintptr_t nov_array_index(nov_array a, intptr_t index) {
     /* Unsigned magnitude handles INTPTR_MIN without signed negation overflow. */
     uintptr_t magnitude = (uintptr_t)0 - (uintptr_t)index;

@@ -41,6 +41,16 @@ NULL, so collection during partial initialization is safe. This promises byte
 zeroes for scalar storage, not default constructors or language-level zero values.
 Survivors never move. Unreachable objects, including cycles, are reclaimed.
 
+`nov_array_clear` mutates the actual array slot (including a borrowed array or
+nested struct field) without allocating. It zeroes all bytes of the old active
+elements, then sets length to zero, retaining the backing pointer and capacity.
+Zeroing is required because repeated GC descriptors trace the entire capacity,
+not just the current length: removed string owners, nested-array backing and
+closure environments must not remain strongly reachable through cleared elements.
+Empty arrays, including NULL-backed arrays, require no memory access. The element
+descriptor must match the backing layout; clearing does not construct defaults,
+resize storage or change append's existing allocation behavior.
+
 ## Root discipline and C boundaries
 
 All root slots must be real, initialized, address-stable `void *` variables.

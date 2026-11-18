@@ -21,6 +21,7 @@ pub const Tag = enum {
     type_info,
     type_of,
     len,
+    clear,
     string_to_bytes,
     string_from_bytes,
     @"unreachable",
@@ -78,6 +79,12 @@ pub const list = std.StaticStringMap(@This()).initComptime(.{
         .{
             .tag = .len,
             .param_count = 1,
+        },
+        "@clear",
+        .{
+            .tag = .clear,
+            .param_count = 1,
+            .illegal_outside_function = true,
         },
         "@stringToBytes",
         .{

@@ -2876,6 +2876,12 @@ const Context = struct {
         if (self.module.diagnostics.items.len == start) _ = try self.fail(.unsupported_body_expression, node, null);
     }
 
+    fn isClear(self: *Context, node: Ast.Node.Index) bool {
+        const ast = &self.module.source.ast;
+        return ast.nodes.items(.tag)[node] == .builtin_literal and
+            std.mem.eql(u8, ast.tokenSlice(ast.firstToken(node)), "@clear");
+    }
+
     fn isLen(self: *Context, node: Ast.Node.Index) bool {
         const ast = &self.module.source.ast;
         return ast.nodes.items(.tag)[node] == .builtin_literal and
@@ -3161,6 +3167,7 @@ const Context = struct {
                     defer self.module.diagnostics.shrinkRetainingCapacity(diagnostics_start);
                     break :blk try self.ascribedType(call);
                 }
+                if (self.isClear(call.ast.fn_expr)) break :blk .{ .ty = try self.ir.internType(.void) };
                 if (self.isLen(call.ast.fn_expr)) {
                     if (call.ast.args.len != 1) break :blk null;
                     break :blk .{ .ty = try self.ir.internType(.{ .integer = .{ .signedness = .unsigned, .bits = Ir.native_pointer_bits } }) };
@@ -3485,6 +3492,104 @@ const Context = struct {
         // aggregate until its selected value is read, without intervening effects.
         if (tag == .identifier or tag == .container_field or tag == .field_access or tag == .array_access or tag == .deref) try self.copyRead(node, ty);
         return true;
+    }
+
+    const ClearPlace = struct {
+        binding: Binding,
+        ty: Ir.TypeId,
+        path: [Ir.max_record_depth]u32 = undefined,
+        len: usize = 0,
+    };
+
+    fn clearStorage(self: *Context, node: Ast.Node.Index) Error!?ClearPlace {
+        const ast = &self.module.source.ast;
+        var nodes: [Ir.max_record_depth]Ast.Node.Index = undefined;
+        var len: usize = 0;
+        var root = node;
+        while (ast.nodes.items(.tag)[root] == .field_access and try self.staticMethod(root) == null) {
+            if (len == nodes.len) {
+                _ = try self.fail(.record_layout_limit, node, null);
+                return null;
+            }
+            nodes[len] = root;
+            len += 1;
+            root = ast.nodes.items(.data)[root].lhs;
+        }
+        const binding = (try self.storageBinding(root)) orelse {
+            _ = try self.fail(.unsupported_assignment_target, node, null);
+            return null;
+        };
+        if (binding.borrowed and ast.nodes.items(.tag)[root] != .deref) {
+            _ = try self.fail(.unsupported_borrow, node, binding.name_span);
+            return null;
+        }
+        if (!binding.mutable) {
+            _ = try self.fail(.immutable_assignment, node, binding.name_span);
+            return null;
+        }
+        if (self.mutationOrigin(binding)) |origin| {
+            _ = try self.fail(.borrow_conflict, node, origin);
+            return null;
+        }
+        var place: ClearPlace = .{ .binding = binding, .ty = binding.known.ty, .len = len };
+        for (0..len) |p| {
+            const access = nodes[len - p - 1];
+            const record = self.ir.getType(place.ty).?;
+            if (record != .record or record.record.tagged) {
+                _ = try self.fail(.unsupported_assignment_target, access, null);
+                return null;
+            }
+            const field = self.fieldIndex(place.ty, ast.tokenSlice(ast.nodes.items(.data)[access].rhs)) orelse {
+                _ = try self.fail(.unknown_field, access, null);
+                return null;
+            };
+            place.path[p] = field;
+            place.ty = record.record.fields[field].ty;
+        }
+        return place;
+    }
+
+    fn clearArray(self: *Context, node: Ast.Node.Index, operand: Ast.Node.Index, expected: ?Known, depth: usize) Error!?Ir.TypeId {
+        const ast = &self.module.source.ast;
+        const unit = try self.ir.internType(.void);
+        // Element writes use the same detached pre-index base as assignment.
+        // No fresh loan is introduced: an effectful index may replace the owner.
+        if (ast.nodes.items(.tag)[operand] == .array_access) {
+            const access = ast.nodes.items(.data)[operand];
+            const place = (try self.clearStorage(access.lhs)) orelse return null;
+            const array = self.ir.getType(place.ty).?;
+            if (array != .array or self.ir.getType(array.array).? != .array)
+                return self.fail(.unsupported_assignment_target, operand, null);
+            if (place.binding.borrowed and place.len != 0)
+                return self.fail(.unsupported_assignment_target, operand, null);
+            const reservation: Reservation = .{ .owner = if (place.binding.loan_owner) |loan| loan.owner else place.binding.name_span, .origin = self.irSpan(node), .parent = self.reservation };
+            const parent = self.reservation;
+            if (place.binding.borrowed) self.reservation = try self.borrowReservations(place.binding, &reservation);
+            defer self.reservation = parent;
+            if (try self.expression(access.lhs, .{ .ty = place.ty }, depth + 1) == null) return null;
+            const index = try self.ir.internType(.{ .integer = .{ .signedness = .signed, .bits = Ir.native_pointer_bits } });
+            if (try self.expression(access.rhs, .{ .ty = index }, depth + 1) == null) return null;
+            if (!self.terminated) if (self.emitter) |emitter| {
+                const element = try emitter.append(array.array, self.irSpan(operand), .{ .array_index = .{ .array = try emitter.value(access.lhs), .index = try emitter.value(access.rhs) } });
+                const slot = try emitter.append(array.array, self.irSpan(operand), .{ .local_slot = element });
+                _ = try emitter.append(unit, self.irSpan(node), .{ .array_clear = .{ .target = .{ .slot = slot } } });
+                const value = try emitter.append(array.array, self.irSpan(operand), .{ .local_load = slot });
+                const updated = try emitter.append(place.ty, self.irSpan(node), .{ .array_set = .{ .array = try emitter.value(access.lhs), .index = try emitter.value(access.rhs), .value = value } });
+                if (place.binding.borrowed) {
+                    try emitter.record(node, unit, self.irSpan(node), .{ .borrow_store = .{ .borrow = place.binding.borrow.?, .value = updated, .path = &.{} } });
+                } else if (place.len != 0) {
+                    try emitter.record(node, unit, self.irSpan(node), .{ .field_store = .{ .slot = place.binding.slot.?, .index = place.path[place.len - 1], .path = try emitter.allocator.dupe(u32, place.path[0 .. place.len - 1]), .value = updated } });
+                } else try emitter.record(node, unit, self.irSpan(node), .{ .local_store = .{ .slot = place.binding.slot.?, .value = updated } });
+            };
+        } else {
+            const place = (try self.clearStorage(operand)) orelse return null;
+            if (self.ir.getType(place.ty).? != .array) return self.fail(.expression_type_mismatch, operand, null);
+            if (self.emitter) |emitter| try emitter.record(node, unit, self.irSpan(node), .{ .array_clear = .{
+                .target = if (place.binding.borrowed) .{ .borrow = place.binding.borrow.? } else .{ .slot = place.binding.slot.? },
+                .path = try emitter.allocator.dupe(u32, place.path[0..place.len]),
+            } });
+        }
+        return self.fit(unit, expected, node);
     }
 
     fn fieldAssignment(self: *Context, node: Ast.Node.Index, expected: ?Known, depth: usize) Error!?Ir.TypeId {
@@ -5148,6 +5253,10 @@ const Context = struct {
                     }
                     return self.fit(unit, expected, node);
                 }
+                if (self.isClear(call.ast.fn_expr)) {
+                    if (call.ast.args.len != 1) return self.fail(.argument_count_mismatch, node, null);
+                    return self.clearArray(node, call.ast.args[0], expected, depth);
+                }
                 if (self.isLen(call.ast.fn_expr)) {
                     if (call.ast.args.len != 1) return self.fail(.argument_count_mismatch, node, null);
                     const result = try self.ir.internType(.{ .integer = .{ .signedness = .unsigned, .bits = Ir.native_pointer_bits } });
@@ -5297,6 +5406,134 @@ const Context = struct {
         }
     }
 };
+
+fn testClearPlaces(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "clear-places.nov",
+        \\let R=struct{bytes:[]u8,}
+        \\let S=struct{inner:R,}
+        \\let mut global=[1]
+        \\let mutate:(self:&mut R)={@clear(self.*.bytes)}
+        \\let whole:(self:&mut []int)={@clear(self.*)}
+        \\let f:()={let mut a=[1,2]
+        \\let mut r=S.[inner=R.[bytes=[1]]]
+        \\let mut nested=[[1],[2]]
+        \\@clear(a)
+        \\@clear(global)
+        \\@clear(r.inner.bytes)
+        \\@clear(nested[{nested=[[3]]
+        \\    0}])}
+    );
+    defer module.deinit();
+    var result = try Lowering.lower(&module);
+    defer result.deinit();
+
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(result.lowering_complete);
+    try result.ir.verify();
+    var clears: usize = 0;
+    var borrows: usize = 0;
+    var nested_paths: usize = 0;
+    var writebacks: usize = 0;
+    for (result.ir.functions.items) |function| {
+        const body = function.body orelse continue;
+        for (body.instructions) |instruction| switch (instruction.op) {
+            .array_clear => |clear| {
+                clears += 1;
+                if (clear.target == .borrow) borrows += 1;
+                if (clear.path.len == 2) nested_paths += 1;
+            },
+            .array_set => |set| {
+                writebacks += 1;
+                const snapshot = body.instructions[@backingInt(set.array)];
+                try std.testing.expect(snapshot.op == .array_clone);
+                try std.testing.expect(@backingInt(set.array) < @backingInt(set.index));
+            },
+            else => {},
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 6), clears);
+    try std.testing.expectEqual(@as(usize, 2), borrows);
+    try std.testing.expectEqual(@as(usize, 1), nested_paths);
+    try std.testing.expectEqual(@as(usize, 1), writebacks);
+}
+
+test "clear writable places retain paths capabilities and index snapshots under OOM" {
+    try testClearPlaces(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testClearPlaces, .{});
+}
+
+test "clear TypeOf validates places without mutations index evaluation loans or captures" {
+    var module = try Module.init(std.testing.allocator, "clear-query.nov",
+        \\let mut global=[1]
+        \\let index:()->int=0
+        \\let f:()={let mut a=[1]
+        \\let mut nested=[[1]]
+        \\let p=&a[0]
+        \\let query:@TypeOf(@clear(a))={}
+        \\let other:@TypeOf(@clear(nested[index()]))={}
+        \\let read=(){let q:@TypeOf(@clear(global))={}
+        \\    let local:@TypeOf(@clear(nested[0]))={}
+        \\}
+        \\@println(p.*)
+        \\read()}
+    );
+    defer module.deinit();
+    var result = try Lowering.lower(&module);
+    defer result.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(result.lowering_complete);
+    try result.ir.verify();
+    var calls: usize = 0;
+    for (result.ir.functions.items) |function| {
+        const body = function.body orelse continue;
+        for (body.instructions) |instruction| switch (instruction.op) {
+            .array_clear, .capture_cell, .capture_value, .array_set => return error.UnexpectedQueryEffect,
+            .call => calls += 1,
+            else => {},
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 1), calls);
+}
+
+test "clear rejects immutable nonarray temporary and bare reference operands" {
+    for ([_][]const u8{
+        "let f:()={let a=[1]\n@clear(a)}",
+        "let a=[1]\nlet f:()={@clear(a)}",
+        "let f:()={let mut n=1\n@clear(n)}",
+        "let f:()={@clear([1])}",
+        "let f:()={let mut a=[1]\nlet p=&a\n@clear(p)}",
+        "let f:(p:&[]int)={@clear(p.*)}",
+        "let f:()={@clear()}",
+        "let f:()={let mut a=[1]\n@clear(a,a)}",
+    }) |source| {
+        var module = try Module.init(std.testing.allocator, "clear-invalid.nov", source);
+        defer module.deinit();
+        var result = try Lowering.lower(&module);
+        defer result.deinit();
+        errdefer std.debug.print("clear invalid source: {s}\n", .{source});
+        try std.testing.expect(module.hasErrors());
+        try std.testing.expect(!result.lowering_complete);
+    }
+    for ([_][]const u8{
+        "let f:()={let a=[1]\nlet q:@TypeOf(@clear(a))={}}",
+        "let f:()={let mut n=1\nlet q:@TypeOf(@clear(n))={}}",
+        "let f:()={let q:@TypeOf(@clear([1]))={}}",
+        "let f:(p:&mut []int)={let q:@TypeOf(@clear(p))={}}",
+    }) |source| {
+        var module = try Module.init(std.testing.allocator, "clear-query-invalid.nov", source);
+        defer module.deinit();
+        var result = Lowering.lower(&module) catch |err| switch (err) {
+            error.InvalidModule => {
+                try std.testing.expect(module.hasErrors());
+                continue;
+            },
+            else => return err,
+        };
+        defer result.deinit();
+        try std.testing.expect(module.hasErrors());
+        try std.testing.expect(!result.lowering_complete);
+    }
+}
 
 fn testGlobalStorage(allocator: std.mem.Allocator) !void {
     var module = try Module.init(allocator, "global-storage.nov",

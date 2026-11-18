@@ -117,6 +117,7 @@ pub const Operation = union(enum) {
     array_contains: struct { value: ValueId, array: ValueId },
     array_set: struct { array: ValueId, index: ValueId, value: ValueId },
     array_append: struct { lhs: ValueId, rhs: ValueId },
+    array_clear: struct { target: union(enum) { slot: ValueId, borrow: ValueId }, path: []const u32 = &.{} },
     /// Terminal control flow, never a value. Its optional operand is body-local.
     return_value: ?ValueId,
     /// Terminal panic with an exact string operand; has no continuing value.
@@ -580,6 +581,7 @@ pub fn setFunctionBody(self: *Ir, id: FunctionId, instructions: []const Instruct
             .array_literal, .record_init => |*elements| elements.* = try self.allocator.dupe(ValueId, elements.*),
             .field_store => |*store| store.path = try self.allocator.dupe(u32, store.path),
             .borrow_store => |*store| store.path = try self.allocator.dupe(u32, store.path),
+            .array_clear => |*clear| clear.path = try self.allocator.dupe(u32, clear.path),
             else => {},
         }
         copied += 1;
@@ -596,6 +598,7 @@ fn freeOperands(self: *Ir, op: Operation) void {
         .array_literal, .record_init => |elements| self.allocator.free(elements),
         .field_store => |store| self.allocator.free(store.path),
         .borrow_store => |store| self.allocator.free(store.path),
+        .array_clear => |clear| self.allocator.free(clear.path),
         else => {},
     }
 }
@@ -1052,6 +1055,10 @@ pub fn borrowConflict(self: *const Ir, body: Body) VerifyError!?BorrowConflict {
             .local_load, .borrow_reserve => |*slot| slot,
             .local_store => |*store| &store.slot,
             .field_store => |*store| &store.slot,
+            .array_clear => |*clear| switch (clear.target) {
+                .slot => |*target| target,
+                .borrow => null,
+            },
             else => null,
         };
         if (slot) |operand| {
@@ -1409,6 +1416,24 @@ fn validateBodyStructure(self: *const Ir, function: Function, body: Body) Verify
                 if (try operandType(body, r.array, i) != instruction.ty or
                     try operandType(body, r.value, i) != ty.array or
                     !isNativeInteger(self.getType(try operandType(body, r.index, i)).?, .signed)) return error.OperandTypeMismatch;
+            },
+            .array_clear => |clear| {
+                if (ty != .void or clear.path.len > max_record_depth) return error.InvalidOperation;
+                var target_ty = switch (clear.target) {
+                    .slot => |slot| try slotType(body, slot, i),
+                    .borrow => |borrow| blk: {
+                        const child = try self.borrowElement(body, borrow, i);
+                        const source = body.instructions[@backingInt(borrow)].op;
+                        if (source == .reference_parameter and !self.getType(source.reference_parameter.ty).?.reference.mutable) return error.InvalidOperation;
+                        break :blk child;
+                    },
+                };
+                for (clear.path) |index| {
+                    const record = self.getType(target_ty) orelse return error.InvalidTypeId;
+                    if (record != .record or record.record.tagged or index >= record.record.fields.len) return error.InvalidOperation;
+                    target_ty = record.record.fields[index].ty;
+                }
+                if (self.getType(target_ty).? != .array) return error.InvalidOperation;
             },
             .array_append => |r| {
                 if (ty != .array) return error.InvalidOperation;
@@ -5822,6 +5847,111 @@ test "range operands and projections cannot escape private branch regions" {
     }
     owned[5] = good[5];
     try t.ir.verify();
+}
+
+fn testArrayClearOwnership(allocator: std.mem.Allocator) !void {
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    const ins = ReferenceTests.ins;
+    const id = ReferenceTests.id;
+    const span: Span = .{ .start = 0, .end = 0 };
+    const unit = try ir.internType(.void);
+    const integer = try ir.internType(.{ .integer = .{ .signedness = .signed, .bits = native_pointer_bits } });
+    const array = try ir.internType(.{ .array = integer });
+    const record = try ir.internAnonymousRecord(&.{.{ .name = "items", .ty = array, .span = span }}, false);
+    const signature = try ir.internType(.{ .function = .{ .params = &.{record}, .result = unit } });
+    const function = try ir.addFunction("clear", signature, span);
+    var path = [_]u32{0};
+    const instructions = [_]Instruction{
+        ins(record, .{ .parameter = 0 }),
+        ins(record, .{ .local_slot = id(0) }),
+        ins(unit, .{ .array_clear = .{ .target = .{ .slot = id(1) }, .path = &path } }),
+        ins(unit, .{ .borrow_reserve = id(1) }),
+        ins(unit, .{ .borrow_start = .{ .reservation = id(3), .index = null } }),
+        ins(unit, .{ .array_clear = .{ .target = .{ .borrow = id(4) }, .path = &path } }),
+        ins(unit, .{ .reference_slot = id(4) }),
+        ins(unit, .{ .reference_load = id(6) }),
+        ins(unit, .{ .array_clear = .{ .target = .{ .borrow = id(7) }, .path = &path } }),
+    };
+    try ir.setFunctionBody(function, &instructions, id(8));
+    path[0] = 999;
+    try ir.verify();
+    const owned = ir.getFunction(function).?.body.?;
+    try std.testing.expectEqual(@as(u32, 0), owned.instructions[2].op.array_clear.path[0]);
+    var bad = instructions;
+    path[0] = 0;
+    bad[2].ty = integer;
+    try std.testing.expectError(error.InvalidOperation, ir.verifyBodyStructure(function, .{ .instructions = &bad, .result = id(8) }));
+    bad = instructions;
+    bad[2].op.array_clear.target = .{ .slot = id(0) };
+    try std.testing.expectError(error.InvalidOperation, ir.verifyBodyStructure(function, .{ .instructions = &bad, .result = id(8) }));
+    bad = instructions;
+    bad[2].op.array_clear.path = &.{};
+    try std.testing.expectError(error.InvalidOperation, ir.verifyBodyStructure(function, .{ .instructions = &bad, .result = id(8) }));
+    bad = instructions;
+    bad[2].op.array_clear.target = .{ .borrow = id(3) };
+    try std.testing.expectError(error.InvalidValueId, ir.verifyBodyStructure(function, .{ .instructions = &bad, .result = id(8) }));
+    bad = instructions;
+    bad[5].op.array_clear.target = .{ .borrow = id(3) };
+    try std.testing.expectError(error.InvalidOperation, ir.verifyBodyStructure(function, .{ .instructions = &bad, .result = id(8) }));
+    bad = instructions;
+    bad[2].op.array_clear.path = &.{ 0, 0 };
+    try std.testing.expectError(error.InvalidOperation, ir.verifyBodyStructure(function, .{ .instructions = &bad, .result = id(8) }));
+    bad = instructions;
+    const long_path: [max_record_depth + 1]u32 = @splat(0);
+    bad[2].op.array_clear.path = &long_path;
+    try std.testing.expectError(error.InvalidOperation, ir.verifyBodyStructure(function, .{ .instructions = &bad, .result = id(8) }));
+    path[0] = 1;
+    try std.testing.expectError(error.InvalidOperation, ir.verifyBodyStructure(function, .{ .instructions = &instructions, .result = id(8) }));
+}
+
+test "array_clear cannot expose private region slots or capabilities" {
+    var t = try ReferenceTests.init(std.testing.allocator);
+    defer t.ir.deinit();
+    const ins = ReferenceTests.ins;
+    const id = ReferenceTests.id;
+    const array = try t.ir.internType(.{ .array = t.integer });
+    var instructions = [_]Instruction{
+        ins(t.boolean, .{ .parameter = 0 }),
+        ins(array, .{ .array_literal = &.{} }),
+        ins(array, .{ .local_slot = id(1) }),
+        ins(t.unit, .{ .borrow_reserve = id(2) }),
+        ins(t.unit, .{ .borrow_start = .{ .reservation = id(3), .index = null } }),
+        ins(t.unit, .{ .array_clear = .{ .target = .{ .borrow = id(4) } } }),
+        ins(t.unit, .{ .constant = t.empty }),
+        ins(t.unit, .{ .branch = .{ .condition = id(0), .then_start = 1, .else_start = 6, .then_value = id(5), .else_value = id(6) } }),
+        ins(t.unit, .{ .array_clear = .{ .target = .{ .slot = id(2) } } }),
+    };
+    try t.ir.verifyBodyStructure(t.function, .{ .instructions = instructions[0..8], .result = id(7) });
+    try std.testing.expectError(error.InvalidValueId, t.ir.verifyBodyStructure(t.function, .{ .instructions = &instructions, .result = id(8) }));
+    instructions[8].op.array_clear.target = .{ .borrow = id(4) };
+    try std.testing.expectError(error.InvalidValueId, t.ir.verifyBodyStructure(t.function, .{ .instructions = &instructions, .result = id(8) }));
+}
+
+test "array_clear owns paths validates storage capabilities and survives every OOM" {
+    try testArrayClearOwnership(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testArrayClearOwnership, .{});
+}
+
+test "array_clear reference parameters require mutable array or struct field targets" {
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    const ins = ReferenceTests.ins;
+    const id = ReferenceTests.id;
+    const span: Span = .{ .start = 0, .end = 0 };
+    const unit = try ir.internType(.void);
+    const integer = try ir.internType(.{ .integer = .{ .signedness = .signed, .bits = native_pointer_bits } });
+    const array = try ir.internType(.{ .array = integer });
+    for ([_]bool{ false, true }) |mutable| {
+        const reference = try ir.internType(.{ .reference = .{ .child = array, .mutable = mutable } });
+        const signature = try ir.internType(.{ .function = .{ .params = &.{reference}, .result = unit } });
+        const function = try ir.addFunction(if (mutable) "mut" else "read", signature, span);
+        const instructions = [_]Instruction{
+            ins(unit, .{ .reference_parameter = .{ .index = 0, .ty = reference } }),
+            ins(unit, .{ .array_clear = .{ .target = .{ .borrow = id(0) } } }),
+        };
+        if (mutable) try ir.setFunctionBody(function, &instructions, id(1)) else try std.testing.expectError(error.InvalidOperation, ir.setFunctionBody(function, &instructions, id(1)));
+    }
 }
 
 const ReferenceTests = struct {

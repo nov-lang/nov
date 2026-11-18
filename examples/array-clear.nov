@@ -1,0 +1,49 @@
+let Batch = struct {
+    items: []string = [],
+
+    let reset: (self: &mut Batch) = {
+        @clear(self.*.items)
+    }
+}
+
+let reset: (items: &mut []`T) = {
+    @clear(items.*)
+}
+
+let main: () = {
+    let mut batch = Batch.[ items = ["Ada", "Grace"] ]
+    let saved = batch
+    batch.reset()
+    @println("Cleared: {batch.items}, saved: {saved.items}")
+
+    batch.items += ["Linus"]
+    @println("Next batch: {batch.items}")
+
+    let mut numbers = [1, 2, 3]
+    reset(&numbers)
+    @println("Numbers: {numbers}")
+}
+
+@[test]
+let clear_preserves_copies_and_permits_reuse: () = {
+    let mut items = ["Ada", "Grace"]
+    let saved = items
+    @clear(items)
+    @assert(@len(items) == 0)
+    @assert(@len(saved) == 2)
+    @assert(saved[0] == "Ada")
+    @clear(items)
+    items += ["Linus"]
+    @assert(@len(items) == 1)
+    @assert(items[0] == "Linus")
+}
+
+@[test]
+let clear_mutable_and_generic_receivers: () = {
+    let mut batch = Batch.[ items = ["Ada"] ]
+    batch.reset()
+    @assert(@len(batch.items) == 0)
+    let mut flags = [true, false]
+    reset(&flags)
+    @assert(@len(flags) == 0)
+}
