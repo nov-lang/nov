@@ -60,6 +60,12 @@ results. See `examples/array-fields.nov`.
 
 ## Current delivered status
 
+Record fields now autodereference named references, including nested reads,
+writes/compounds, callable fields and `@clear(p.items)`. Pointee mutability governs
+writes; reference bindings need not be mutable. Explicit `.*` remains valid.
+Queries validate without effects; bare-reference indexing/length/clear and general
+field borrowing remain outside this convenience. See `examples/mutable-methods.nov`.
+
 Array-valued struct defaults support `[]`, scalar-literal elements and nested
 literal arrays with exact contextual types. Generic `values: []T = []` accepts
 all ordinary storable `T`. Every construction creates independent recursive
@@ -93,7 +99,7 @@ reads/writes/aliases/invalidation reject. Later reference rebinding does not
 redirect a pending call. Generic containers (`Self = @This()`), method-local
 backtick inference and imported public methods preserve exact types and visibility.
 Type queries check receiver places/mutability without runtime borrows, calls,
-mutation or captures. See `examples/mutable-methods.nov` (seven tests), README.md
+mutation or captures. See `examples/mutable-methods.nov` (nine tests), README.md
 and lib/README.md. Library helper signatures are unchanged; no builder, array
 clear/truncate, new defaults or performance work is introduced. Optimization
 remains **PAUSED**.

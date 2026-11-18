@@ -2,7 +2,7 @@ let Batch = struct {
     items: []string = [],
 
     let reset: (self: &mut Batch) = {
-        @clear(self.*.items)
+        @clear(self.items)
     }
 }
 

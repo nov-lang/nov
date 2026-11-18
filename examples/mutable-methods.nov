@@ -7,12 +7,12 @@ let Counter = struct {
 
     @[public]
     let add: (self: &mut Counter, amount: int) = {
-        self.*.value += amount
+        self.value += amount
     }
     @[public]
     let get: (self: Counter) -> int = self.value
     @[public]
-    let read: (self: &Counter) -> int = self.*.value
+    let read: (self: &Counter) -> int = self.value
 }
 
 @[public]
@@ -22,7 +22,7 @@ let Box: (Element: type) -> type = struct {
 
     @[public]
     let set: (self: &mut Self, value: Element) = {
-        self.*.value = value
+        self.value = value
     }
     @[public]
     let echo: (self: &mut Self, input: `T) -> `T = input
@@ -148,4 +148,53 @@ let callable_fields_have_no_implicit_receiver: () = {
     @assert(callable.call(3) == 6)
     let call = callable.call
     @assert(call(4) == 8)
+}
+
+@[test]
+let reference_fields_read_write_and_call: () = {
+    let mut counter = Counter.[ value = 1 ]
+    let p = &counter
+    p.value += 2
+    @assert(p.value == 3 and p.*.value == 3)
+    p.value = 4
+    @assert(counter.value == 4)
+
+    let fixed = Counter.[ value = 7 ]
+    let readonly = &fixed
+    let value: @TypeOf(readonly.value) = readonly.value
+    @assert(value == 7)
+
+    let mut callable = Callable.[ call = twice ]
+    let function = &callable
+    @assert(function.call(3) == 6)
+    let next = (n: int) -> int {
+        n + 1
+    }
+    let result = function.call(
+        {
+            function.call = next
+            3
+        }
+    )
+    @assert(result == 6 and function.call(3) == 4)
+
+    let mut nested = Box(Counter).[ value = Counter.[ value = 1 ] ]
+    let reference = &nested
+    let saved = reference.value
+    reference.value.value += 2
+    @assert(reference.value.value == 3 and saved.value == 1)
+}
+
+@[test]
+let reference_field_target_precedes_rhs_rebinding: () = {
+    let mut first = Counter.[ value = 1 ]
+    let mut second = Counter.[ value = 10 ]
+    let mut p = &first
+    p.value += {
+        p = &second
+        5
+    }
+    @assert(p.value == 10)
+    p.value += 2
+    @assert(first.value == 6 and second.value == 12)
 }

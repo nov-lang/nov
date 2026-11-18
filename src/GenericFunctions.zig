@@ -1156,6 +1156,188 @@ pub fn queryExpressionInScope(module: *Module, ir: *Ir, node: Ast.Node.Index, bi
     return solver.materialize(result, 0);
 }
 
+fn testReferenceFieldQueries(allocator: std.mem.Allocator) !void {
+    const cases = [_]struct { expression: []const u8, mutable: bool = true, integer: bool = false, diagnostic: ?Module.Diagnostic.Tag = null }{
+        .{ .expression = "p.inner.n", .integer = true },
+        .{ .expression = "p.inner.n", .mutable = false, .integer = true },
+        .{ .expression = "p.*.inner.n", .integer = true },
+        .{ .expression = "read(p)", .integer = true },
+        .{ .expression = "read(p)", .mutable = false, .integer = true },
+        .{ .expression = "p.inner.n=2" },
+        .{ .expression = "p.inner.n+=2" },
+        .{ .expression = "@clear(p.items)" },
+        .{ .expression = "@clear(p.*.items)" },
+        .{ .expression = "p.inner.n=2", .mutable = false, .diagnostic = .immutable_assignment },
+        .{ .expression = "p.inner.n+=2", .mutable = false, .diagnostic = .immutable_assignment },
+        .{ .expression = "@clear(p.items)", .mutable = false, .diagnostic = .immutable_assignment },
+        .{ .expression = "@clear(p.rows[0])", .diagnostic = .unsupported_assignment_target },
+        .{ .expression = "p.items[0]=4", .diagnostic = .unsupported_assignment_target },
+        .{ .expression = "p.items[0]+=4", .diagnostic = .unsupported_assignment_target },
+        .{ .expression = "p.*.items[0]=4", .diagnostic = .unsupported_assignment_target },
+        .{ .expression = "p.*.items[0]+=4", .diagnostic = .unsupported_assignment_target },
+        .{ .expression = "@clear(p)", .diagnostic = .immutable_assignment },
+        .{ .expression = "@len(p)", .diagnostic = .expression_type_mismatch },
+        .{ .expression = "p[0]", .diagnostic = .generic_function_conflict },
+        .{ .expression = "{let mut a=[1]\nlet q=&a\nq[0]}", .diagnostic = .generic_function_conflict },
+        .{ .expression = "{let mut a=[1]\nlet q=&a\n@len(q)}", .diagnostic = .expression_type_mismatch },
+        .{ .expression = "{let q=&p.inner.n\n}", .diagnostic = .unsupported_borrow },
+    };
+    for (cases) |case| {
+        const source = try std.fmt.allocPrint(
+            allocator,
+            "let Inner=struct{{n:int,}}\nlet R=struct{{inner:Inner,items:[]int,rows:[][]int,}}\n" ++
+                "let read:(p:&`T)->int=p.inner.n\n" ++
+                "let query=@TypeOf({{let {s}r=R.[inner=Inner.[n=1],items=[1],rows=[[1]]]\nlet p=&r\n{s}}})",
+            .{ if (case.mutable) "mut " else "", case.expression },
+        );
+        defer allocator.free(source);
+        var module = try Module.init(allocator, "reference-field-query.nov", source);
+        defer module.deinit();
+
+        try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
+        var ir = Ir.init(allocator);
+        defer ir.deinit();
+        ir.source_len = @intCast(module.source.ast.source.len);
+        const count = module.declarations.items.len;
+        const declaration = module.source.ast.decl(module.getDeclaration(module.lookup("query").?).?.node).ast;
+        const call = module.source.ast.fullCall(declaration.init_node).?;
+        const ty = try queryExpression(&module, &ir, call.ast.args[0], &.{}, &.{}, &.{});
+        if (case.diagnostic) |diagnostic| {
+            try std.testing.expectEqual(@as(?Ir.TypeId, null), ty);
+            try std.testing.expect(module.diagnostics.items.len != 0);
+            try std.testing.expectEqual(diagnostic, module.diagnostics.items[0].tag);
+        } else {
+            try std.testing.expect(!module.hasErrors());
+            try std.testing.expectEqual(if (case.integer) try BodyChecker.defaultIntegerType(&ir) else try ir.internType(.void), ty.?);
+        }
+        try std.testing.expectEqual(count, module.declarations.items.len);
+        try std.testing.expectEqual(@as(usize, 0), ir.functions.items.len);
+        try std.testing.expectEqual(@as(usize, 0), ir.local_generic_instances.items.len);
+    }
+}
+
+test "reference field queries autoderef readonly and mutable places without effects under OOM" {
+    try testReferenceFieldQueries(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testReferenceFieldQueries, .{});
+}
+
+fn testUnionPayloadFieldQuery(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "union-payload-field-query.nov",
+        \\let U=union{n:int,}
+        \\let query=@TypeOf(U.n[1])
+    );
+    defer module.deinit();
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    ir.source_len = @intCast(module.source.ast.source.len);
+    const count = module.declarations.items.len;
+    const declaration = module.source.ast.decl(module.getDeclaration(module.lookup("query").?).?.node).ast;
+    const call = module.source.ast.fullCall(declaration.init_node).?;
+    const ty = (try queryExpression(&module, &ir, call.ast.args[0], &.{}, &.{}, &.{})).?;
+    try std.testing.expect(!module.hasErrors());
+    const record = ir.getType(ty).?.record;
+    try std.testing.expect(record.tagged);
+    try std.testing.expectEqual(try BodyChecker.defaultIntegerType(&ir), record.fields[0].ty);
+    try std.testing.expect(!record.methods_published);
+    try std.testing.expectEqual(count, module.declarations.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ir.functions.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ir.local_generic_instances.items.len);
+}
+
+test "reference field guard preserves union payload TypeOf queries under OOM" {
+    try testUnionPayloadFieldQuery(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testUnionPayloadFieldQuery, .{});
+}
+
+test "reference field indexed assignment storage shapes match executable access" {
+    const cases = [_]struct { params: []const u8 = "", setup: []const u8 = "", place: []const u8, supported: bool }{
+        .{ .params = "p:&mut R", .place = "p.items[0]", .supported = false },
+        .{ .params = "p:&mut R", .place = "p.*.items[0]", .supported = false },
+        .{ .params = "p:&mut R", .place = "p.inner.items[0]", .supported = false },
+        .{ .params = "p:&mut R", .place = "p.*.inner.items[0]", .supported = false },
+        .{ .params = "p:&mut []int", .place = "p.*[0]", .supported = true },
+        .{ .setup = "let mut r=R.[items=[1],inner=Inner.[items=[1]]]\n", .place = "r.items[0]", .supported = true },
+        .{ .setup = "let mut r=R.[items=[1],inner=Inner.[items=[1]]]\n", .place = "r.inner.items[0]", .supported = true },
+    };
+    for (cases) |case| for ([_][]const u8{ "=", "+=", "-=", "*=", "/=", "%=" }) |op| for ([_]bool{ false, true }) |query| {
+        const source = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "let Inner=struct{{items:[]int,}}\nlet R=struct{{items:[]int,inner:Inner,}}\n" ++
+                "let f:({s})={{\n{s}{s}{{{s}{s}4}}{s}\n}}\n",
+            .{ case.params, case.setup, if (query) "let q:@TypeOf(" else "", case.place, op, if (query) ")={}" else "" },
+        );
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "reference-indexed-assignment-parity.nov", source);
+        defer module.deinit();
+        try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
+        var result = try Lowering.lower(&module);
+        defer result.deinit();
+        if (!case.supported) {
+            try std.testing.expect(!result.lowering_complete);
+            try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+            const diagnostic = module.diagnostics.items[0].tag;
+            if (query) {
+                try std.testing.expectEqual(Module.Diagnostic.Tag.unsupported_assignment_target, diagnostic);
+            } else try std.testing.expect(diagnostic == .unsupported_assignment_target or diagnostic == .unsupported_borrow);
+        } else {
+            try std.testing.expect(!module.hasErrors());
+            try std.testing.expect(result.lowering_complete);
+            try result.ir.verify();
+            if (query) for (result.ir.functions.items) |function| {
+                const body = function.body orelse continue;
+                for (body.instructions) |instruction| switch (instruction.op) {
+                    .array_set, .borrow_store, .field_store, .capture_cell, .capture_value => return error.UnexpectedQueryEffect,
+                    else => {},
+                };
+            };
+        }
+    };
+}
+
+fn testReferenceFieldInference(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "reference-field-inference.nov",
+        \\let Box:(T:type)->type=struct{n:T,items:[]T,}
+        \\let read:(p:&`R)->@TypeOf(p.n)=p.n
+        \\let put:(p:&mut `R,v:@TypeOf(p.n))={p.n=v
+        \\p.n+=v}
+        \\let clear:(p:&mut `R)=@clear(p.items)
+        \\let main:()={let mut r=Box(int).[n=1,items=[1]]
+        \\let p=&r
+        \\let n:int=read(p)
+        \\put(p,n)
+        \\clear(p)
+        \\let fixed=Box(int).[n=2,items=[2]]
+        \\let q=&fixed
+        \\let m:int=read(q)
+        \\let query:@TypeOf({p.n=3
+        \\p.n+=m
+        \\@clear(p.items)})={}
+        \\}
+    );
+    defer module.deinit();
+    var result = try Lowering.lower(&module);
+    defer result.deinit();
+
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(result.lowering_complete);
+    try result.ir.verify();
+    var clears: usize = 0;
+    for (result.ir.functions.items) |function| {
+        const body = function.body orelse continue;
+        for (body.instructions) |instruction| switch (instruction.op) {
+            .array_clear => clears += 1,
+            .capture_cell, .capture_value => return error.UnexpectedQueryEffect,
+            else => {},
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 1), clears);
+}
+
+test "reference field inference matches TypeOf and executable access under OOM" {
+    try testReferenceFieldInference(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testReferenceFieldInference, .{});
+}
+
 fn testClearInference(allocator: std.mem.Allocator) !void {
     var module = try Module.init(allocator, "clear-inference.nov",
         \\let R=struct{items:[]int,}
@@ -1221,6 +1403,8 @@ test "clear query validates mutable array places without executable effects" {
 test "clear query and executable storage shapes agree" {
     const cases = [_]struct { params: []const u8 = "", setup: []const u8 = "", place: []const u8, supported: bool }{
         .{ .params = "p:&mut R", .place = "p.*.a[0]", .supported = false },
+        .{ .params = "p:&mut R", .place = "p.a[0]", .supported = false },
+        .{ .params = "p:&mut R", .place = "p.a", .supported = true },
         .{ .setup = "let mut r=R.[a=[[1]]]\n", .place = "r.a[0]", .supported = true },
         .{ .setup = "let mut rows=[R.[a=[[1]]]]\n", .place = "rows[0].a", .supported = false },
         .{ .setup = "let mut rows=[R.[a=[[1]]]]\n", .place = "rows[0].a[0]", .supported = false },
@@ -2225,7 +2409,13 @@ const Solver = struct {
     }
 
     fn fieldType(self: *Solver, base_value: *Term, name: []const u8, span: Module.Span, depth: usize) Ir.BuildError!*Term {
-        const base = root(base_value);
+        const source = root(base_value);
+        const base = if (source.value == .reference) root(source.value.reference.child) else source;
+        if (source.value == .reference and self.tagged(base)) {
+            if (self.querying) try self.fail(.unsupported_body_expression, span, null);
+            self.unsupported = self.unsupported orelse span;
+            return self.term(.unknown, span);
+        }
         if (base.value == .unknown) {
             const result = try self.term(.unknown, span);
             try self.projections.append(self.allocator, .{ .base = base, .result = result, .name = name, .span = span });
@@ -2493,10 +2683,7 @@ const Solver = struct {
             fields += 1;
             base = ast.nodes.items(.data)[base].lhs;
         }
-        // Indexed clears write back the detached array. Borrowed storage only
-        // supports that writeback at its root, not through a record field path.
-        if (indexed and fields != 0 and ast.nodes.items(.tag)[base] == .deref)
-            return self.fail(.unsupported_assignment_target, span, null);
+
         if (ast.nodes.items(.tag)[base] != .identifier and ast.nodes.items(.tag)[base] != .deref)
             return self.fail(.unsupported_assignment_target, span, null);
         try self.writablePlace(frame, node, depth + 1);
@@ -2535,7 +2722,24 @@ const Solver = struct {
             .field_access, .array_access => {
                 const base_tag = ast.nodes.items(.tag)[data.lhs];
                 if (base_tag != .identifier and base_tag != .field_access and base_tag != .deref) return self.fail(.unsupported_assignment_target, span, null);
-                const base = root(try self.expression(frame, data.lhs, depth + 1));
+                if (ast.nodes.items(.tag)[node] == .array_access and base_tag == .field_access) {
+                    var owner = data.lhs;
+                    var fields: usize = 0;
+                    while (ast.nodes.items(.tag)[owner] == .field_access) {
+                        if (fields == Ir.max_record_depth) return self.fail(.record_layout_limit, span, null);
+                        fields += 1;
+                        owner = ast.nodes.items(.data)[owner].lhs;
+                    }
+                    // Indexed mutations write back the detached array. Borrowed
+                    // storage supports that only at its root, not through fields.
+                    if (ast.nodes.items(.tag)[owner] == .deref or
+                        (ast.nodes.items(.tag)[owner] == .identifier and root(try self.expression(frame, owner, depth + 1)).value == .reference))
+                        return self.fail(.unsupported_assignment_target, span, null);
+                }
+                const source = root(try self.expression(frame, data.lhs, depth + 1));
+                const implicit = ast.nodes.items(.tag)[node] == .field_access and source.value == .reference;
+                if (implicit and base_tag != .identifier) return self.fail(.unsupported_assignment_target, span, null);
+                const base = if (implicit) root(source.value.reference.child) else source;
                 if (base.value != .unknown) {
                     if (ast.nodes.items(.tag)[node] == .array_access and base.value != .array) return self.fail(.unsupported_assignment_target, span, null);
                     if (ast.nodes.items(.tag)[node] == .field_access and base.value != .structural and base.value != .nominal and !(base.value == .known and self.ir.getType(base.value.known).? == .record)) {
@@ -2543,7 +2747,10 @@ const Solver = struct {
                     }
                 }
                 try self.query_places.append(self.allocator, .{ .operand = base, .kind = if (ast.nodes.items(.tag)[node] == .field_access) .record else .array, .span = span });
-                try self.writablePlace(frame, data.lhs, depth + 1);
+                if (implicit) {
+                    if (!source.value.reference.mutable) return self.fail(.immutable_assignment, span, null);
+                    try self.query_places.append(self.allocator, .{ .operand = source, .kind = .mutable_reference, .span = span });
+                } else try self.writablePlace(frame, data.lhs, depth + 1);
             },
             else => try self.fail(.unsupported_assignment_target, span, null),
         }

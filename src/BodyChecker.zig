@@ -1800,9 +1800,10 @@ const Context = struct {
 
         fn fieldType(q: *FlowQuery, ty: Ir.TypeId, name: []const u8) Error!?Known {
             const c = &q.context;
-            const nominal = c.ir.getType(ty).?;
+            const base = c.fieldBaseType(ty);
+            const nominal = c.ir.getType(base).?;
             if (nominal != .record) return null;
-            if (c.fieldIndex(ty, name)) |index| return .{ .ty = nominal.record.fields[index].ty };
+            if (c.fieldIndex(base, name)) |index| return .{ .ty = nominal.record.fields[index].ty };
             if (Module.numericField(name)) return null;
             if (nominal.record.anonymous != .none) return null;
             // Ordinary nominal layouts can still be cold. Read their field
@@ -1814,7 +1815,7 @@ const Context = struct {
             for (ast.fullStruct(ast.decl(container.node).ast.init_node).?) |member| {
                 if (ast.nodes.items(.tag)[member] != .container_field or !std.mem.eql(u8, ast.tokenSlice(ast.firstToken(member)), name)) continue;
                 const type_node = ast.nodes.items(.data)[member].lhs;
-                const field_ty = if (type_node == 0) try c.ir.internType(.void) else (try TypeResolver.resolveInScopeReadOnly(owner, c.ir, type_node, id, if (nominal.record.type_args.len == 0) null else @backingInt(ty), &.{})) orelse return null;
+                const field_ty = if (type_node == 0) try c.ir.internType(.void) else (try TypeResolver.resolveInScopeReadOnly(owner, c.ir, type_node, id, if (nominal.record.type_args.len == 0) null else @backingInt(base), &.{})) orelse return null;
                 return .{ .ty = field_ty };
             }
             return null;
@@ -2501,6 +2502,33 @@ const Context = struct {
         return self.fit(result, expected, node);
     }
 
+    // Field syntax alone may expose a named reference's record child. Keep
+    // indexing and ordinary reference values on their explicit-deref paths.
+    fn fieldBaseType(self: *Context, ty: Ir.TypeId) Ir.TypeId {
+        const nominal = self.ir.getType(ty).?;
+        if (nominal == .reference and self.ir.getType(nominal.reference.child).? == .record)
+            return nominal.reference.child;
+        return ty;
+    }
+
+    fn fieldStorageBinding(self: *Context, root: Ast.Node.Index, access: Ast.Node.Index) Error!?Binding {
+        const binding = (try self.storageBinding(root)) orelse return null;
+        if (self.ir.getType(binding.known.ty).? == .reference and self.fieldBaseType(binding.known.ty) != binding.known.ty)
+            return self.dereferenceOperand(access, root);
+        return binding;
+    }
+
+    fn fieldProjection(self: *Context, node: Ast.Node.Index, depth: usize) Error!?Ir.TypeId {
+        if (try self.probe(node, depth)) |known| {
+            if (self.fieldBaseType(known.ty) != known.ty) {
+                const binding = (try self.dereferenceOperand(node, node)) orelse return null;
+                if (self.emitter) |emitter| try emitter.record(node, binding.known.ty, self.irSpan(node), .{ .borrow_read = binding.borrow.? });
+                return binding.known.ty;
+            }
+        }
+        return self.projection(node, null, depth);
+    }
+
     fn fieldIndex(self: *Context, ty: Ir.TypeId, name: []const u8) ?u32 {
         const record = self.ir.getType(ty).?;
         if (record != .record) return null;
@@ -3072,7 +3100,8 @@ const Context = struct {
                 if (try Literal.qualifiedEnum(self.module, self.ir, node)) |ty| break :blk .{ .ty = ty };
                 if (try self.staticMethod(node)) |id| break :blk try self.globalType(id);
                 const base = (try self.probe(data.lhs, depth + 1)) orelse break :blk null;
-                if (self.fieldIndex(base.ty, ast.tokenSlice(data.rhs))) |index| break :blk .{ .ty = self.ir.getType(base.ty).?.record.fields[index].ty };
+                const record = self.fieldBaseType(base.ty);
+                if (self.fieldIndex(record, ast.tokenSlice(data.rhs))) |index| break :blk .{ .ty = self.ir.getType(record).?.record.fields[index].ty };
                 break :blk null;
             },
             .block, .block_two, .block_newline, .block_two_newline => try self.probeBlock(node, depth),
@@ -3515,11 +3544,11 @@ const Context = struct {
             len += 1;
             root = ast.nodes.items(.data)[root].lhs;
         }
-        const binding = (try self.storageBinding(root)) orelse {
+        const binding = (if (len != 0) try self.fieldStorageBinding(root, nodes[len - 1]) else try self.storageBinding(root)) orelse {
             _ = try self.fail(.unsupported_assignment_target, node, null);
             return null;
         };
-        if (binding.borrowed and ast.nodes.items(.tag)[root] != .deref) {
+        if (binding.borrowed and self.ir.getType(binding.known.ty).? == .reference) {
             _ = try self.fail(.unsupported_borrow, node, binding.name_span);
             return null;
         }
@@ -3606,9 +3635,8 @@ const Context = struct {
             path_len += 1;
             root = ast.nodes.items(.data)[root].lhs;
         }
-        const dereferenced = ast.nodes.items(.tag)[root] == .deref;
-        const binding = (try self.storageBinding(root)) orelse return self.fail(if (ast.nodes.items(.tag)[root] == .identifier) .unknown_name else .unsupported_assignment_target, if (ast.nodes.items(.tag)[root] == .identifier) target.lhs else data.lhs, null);
-        if (binding.borrowed and !dereferenced) return self.fail(.unsupported_borrow, root, binding.name_span);
+        const binding = (try self.fieldStorageBinding(root, root)) orelse return self.fail(if (ast.nodes.items(.tag)[root] == .identifier) .unknown_name else .unsupported_assignment_target, if (ast.nodes.items(.tag)[root] == .identifier) target.lhs else data.lhs, null);
+        if (binding.borrowed and self.ir.getType(binding.known.ty).? == .reference) return self.fail(.unsupported_borrow, root, binding.name_span);
         if (self.mutationOrigin(binding)) |origin| return self.fail(.borrow_conflict, root, origin);
         if (binding.global and !binding.mutable) return self.fail(.immutable_assignment, target.lhs, binding.name_span);
         var record_id = binding.known.ty;
@@ -4864,7 +4892,7 @@ const Context = struct {
                 const previous_base = self.borrow_base;
                 self.borrow_base = if (ast.nodes.items(.tag)[node] == .field_access) data.lhs else null;
                 const project = ast.nodes.items(.tag)[node] == .field_access or self.inertIndex(data.rhs);
-                const base = (if (project) try self.projection(data.lhs, null, depth + 1) else try self.expression(data.lhs, null, depth + 1)) orelse {
+                const base = (if (ast.nodes.items(.tag)[node] == .field_access) try self.fieldProjection(data.lhs, depth + 1) else if (project) try self.projection(data.lhs, null, depth + 1) else try self.expression(data.lhs, null, depth + 1)) orelse {
                     self.borrow_base = previous_base;
                     return null;
                 };
@@ -5319,6 +5347,10 @@ const Context = struct {
                     const receiver = blk: {
                         defer self.borrow_base = previous_base;
                         if (try self.probe(field.lhs, depth + 1)) |known| {
+                            // Function fields are ordinary callees, not methods:
+                            // expose their record before receiver adaptation.
+                            if (self.fieldIndex(self.fieldBaseType(known.ty), ast.tokenSlice(field.rhs)) != null)
+                                break :blk (try self.fieldProjection(field.lhs, depth + 1)) orelse return null;
                             const argument = try self.receiverArgumentType(known.ty, ast.tokenSlice(field.rhs));
                             if (self.ir.getType(argument).? == .reference or
                                 (self.ir.getType(known.ty).? == .reference and self.receiverReference(known.ty, ast.tokenSlice(field.rhs)) != null)) break :blk known.ty;
@@ -5406,6 +5438,177 @@ const Context = struct {
         }
     }
 };
+
+test "field autoderef reads writes nested paths and snapshots" {
+    var module = try Module.init(std.testing.allocator, "field-autoderef.nov",
+        \\let Inner=struct{n:int,items:[]int,}
+        \\let R=struct{inner:Inner,}
+        \\let read:(p:&R)->int=p.inner.n
+        \\let update:(p:&mut R)={p.inner.n=2
+        \\p.inner.n+=3
+        \\p.inner.items+=[4]
+        \\@clear(p.inner.items)
+        \\p.*.inner.n+=1}
+        \\let f:()={let mut r=R.[inner=Inner.[n=1,items=[2]]]
+        \\let p=&r
+        \\let before=p.inner
+        \\let items=p.inner.items
+        \\p.inner.n+=2
+        \\@clear(p.inner.items)
+        \\@println(before.n,items,p.inner.n)}
+        \\let readonly:()={let r=R.[inner=Inner.[n=1,items=[2]]]
+        \\let p=&r
+        \\@println(p.inner.n,p.inner.items[0],@len(p.inner.items))}
+    );
+    defer module.deinit();
+    var result = try Lowering.lower(&module);
+    defer result.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(result.lowering_complete);
+    try result.ir.verify();
+    var stores: usize = 0;
+    var clears: usize = 0;
+    var snapshots: usize = 0;
+    for (result.ir.functions.items) |function| {
+        const body = function.body orelse continue;
+        for (body.instructions) |instruction| switch (instruction.op) {
+            .borrow_store => |store| {
+                try std.testing.expectEqual(@as(usize, 2), store.path.len);
+                stores += 1;
+            },
+            .array_clear => |clear| {
+                try std.testing.expect(clear.target == .borrow);
+                try std.testing.expectEqual(@as(usize, 2), clear.path.len);
+                clears += 1;
+            },
+            .array_clone => snapshots += 1,
+            else => {},
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 5), stores);
+    try std.testing.expectEqual(@as(usize, 2), clears);
+    try std.testing.expect(snapshots >= 2);
+}
+
+test "field autoderef callable fields select before argument effects without receivers" {
+    var module = try Module.init(std.testing.allocator, "field-autoderef-call.nov",
+        \\let R=struct{callback:(int)->int,}
+        \\let Z=struct{callback:()->int,}
+        \\let second:(n:int)->int=n+1
+        \\let readonly:(p:&R)->int=p.callback(3)
+        \\let zero:(p:&Z)->int=p.callback()
+        \\let implicit:(p:&mut R)->int=p.callback({p.callback=second
+        \\4})
+        \\let explicit:(p:&mut R)->int=p.*.callback({p.*.callback=second
+        \\4})
+    );
+    defer module.deinit();
+    var result = try Lowering.lower(&module);
+    defer result.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(result.lowering_complete);
+    try result.ir.verify();
+    var calls: usize = 0;
+    var snapshots: usize = 0;
+    for (result.ir.functions.items) |function| {
+        const body = function.body orelse continue;
+        var store: ?usize = null;
+        for (body.instructions, 0..) |instruction, i| switch (instruction.op) {
+            .borrow_store => store = i,
+            .call => |call| {
+                calls += 1;
+                const selection = body.instructions[@backingInt(call.callee)];
+                try std.testing.expect(selection.op == .field_read);
+                const base = body.instructions[@backingInt(selection.op.field_read.base)];
+                try std.testing.expect(base.op == .borrow_read);
+                const signature = result.ir.getType(selection.ty).?.function;
+                try std.testing.expectEqual(signature.params.len, call.args.len);
+                try std.testing.expectEqual(@as(usize, if (std.mem.eql(u8, function.name, "zero")) 0 else 1), call.args.len);
+                if (store) |mutation| {
+                    snapshots += 1;
+                    try std.testing.expect(@backingInt(call.callee) < mutation);
+                    try std.testing.expect(mutation < @backingInt(call.args[0]));
+                    try std.testing.expect(@backingInt(call.args[0]) < i);
+                }
+            },
+            else => {},
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 4), calls);
+    try std.testing.expectEqual(@as(usize, 2), snapshots);
+}
+
+test "field autoderef TypeOf agrees without emitting effects" {
+    var module = try Module.init(std.testing.allocator, "field-autoderef-query.nov",
+        \\let R=struct{n:int,items:[]int,}
+        \\let f:(p:&mut R)={let n:@TypeOf(p.n)=1
+        \\let items:@TypeOf(p.items)=[2]
+        \\let explicit:@TypeOf(p.*.n)=n
+        \\let write:@TypeOf({p.n=2})={}
+        \\let add:@TypeOf({p.n+=2})={}
+        \\let clear:@TypeOf(@clear(p.items))={}
+        \\@println(n,items,explicit)}
+        \\let read:(p:&R)={let n:@TypeOf(p.n)=1
+        \\@println(n)}
+    );
+    defer module.deinit();
+    errdefer for (module.diagnostics.items) |diagnostic| {
+        std.debug.print("field query: {s} at {d}\n", .{ @tagName(diagnostic.tag), diagnostic.span.start });
+    };
+    var result = try Lowering.lower(&module);
+    defer result.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(result.lowering_complete);
+    try result.ir.verify();
+    for (result.ir.functions.items) |function| {
+        const body = function.body orelse continue;
+        for (body.instructions) |instruction| switch (instruction.op) {
+            .borrow_read, .borrow_store, .reference_load, .array_clear => return error.UnexpectedQueryEffect,
+            else => {},
+        };
+    }
+}
+
+test "field autoderef rejects readonly writes conflicts and reference expansion" {
+    const prefix = "let R=struct{n:int,items:[]int,}\n";
+    for ([_][]const u8{
+        prefix ++ "let f:(p:&R)={p.n=2}",
+        prefix ++ "let f:(p:&R)={p.n+=2}",
+        prefix ++ "let f:(p:&R)={@clear(p.items)}",
+        prefix ++ "let f:()={let mut r=R.[n=1,items=[2]]\nlet mut p:&R=&r\np.n=2}",
+        prefix ++ "let f:(p:&R)={let q:@TypeOf({p.n=2})={}\n}",
+        prefix ++ "let f:(p:&R)={let q:@TypeOf({p.n+=2})={}\n}",
+        prefix ++ "let f:(p:&R)={let q:@TypeOf(@clear(p.items))={}\n}",
+        prefix ++ "let f:(p:&R)->int=p.missing",
+        prefix ++ "let f:(p:&R)={let q:@TypeOf(p.missing)=1\n}",
+        prefix ++ "let f:()={let mut r=R.[n=1,items=[2]]\nlet p=&r\nr.n=3\n@println(p.n)}",
+        prefix ++ "let f:()={let mut r=R.[n=1,items=[2]]\nlet p=&r\n@println(r.n,p.n)}",
+        prefix ++ "let f:()={let mut r=R.[n=1,items=[2]]\nlet p=&r\nlet q=&p.items\n}",
+        prefix ++ "let f:(p:&R)={let escaped=p\n}",
+        "let f:(p:&mut []int)={p[0]=2}",
+        "let f:(p:&[]int)->int=p[0]",
+        "let f:(p:&[]int)->int=@len(p)",
+        "let f:(p:&mut []int)={@clear(p)}",
+        "let f:(p:&[]int)={let q:@TypeOf(p[0])=1\n}",
+        "let f:(p:&[]int)={let q:@TypeOf(@len(p))=1\n}",
+        "let f:(p:&mut []int)={let q:@TypeOf(@clear(p))={}\n}",
+    }) |source| {
+        var module = try Module.init(std.testing.allocator, "field-autoderef-invalid.nov", source);
+        defer module.deinit();
+        errdefer std.debug.print("field autoderef invalid source: {s}\n", .{source});
+        try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
+        var result = Lowering.lower(&module) catch |err| switch (err) {
+            error.InvalidModule => {
+                try std.testing.expect(module.hasErrors());
+                continue;
+            },
+            else => return err,
+        };
+        defer result.deinit();
+        try std.testing.expect(module.hasErrors());
+        try std.testing.expect(!result.lowering_complete);
+    }
+}
 
 fn testClearPlaces(allocator: std.mem.Allocator) !void {
     var module = try Module.init(allocator, "clear-places.nov",
@@ -10666,7 +10869,7 @@ test "automatic method dereference snapshots generic forwarding and queries unde
     }
 }
 
-test "automatic method dereference rejects readonly conflicts fields and escapes under OOM" {
+test "automatic method dereference rejects readonly conflicts and escapes under OOM" {
     const prelude = "let C=struct{value:int,let add:(self:&mut C,n:int)={}\nlet read:(self:&C)->int=self.*.value\n}\n";
     for ([_]struct { source: []const u8, tag: Module.Diagnostic.Tag }{
         .{ .source = prelude ++ "let f:(p:&C)={p.add(1)}", .tag = .immutable_assignment },
@@ -10676,9 +10879,9 @@ test "automatic method dereference rejects readonly conflicts fields and escapes
         .{ .source = prelude ++ "let f:(p:&mut C)={p.add(p.*.value)}", .tag = .borrow_conflict },
         .{ .source = prelude ++ "let f:(p:&mut C)={p.add({p.*.value=2\n1})}", .tag = .borrow_conflict },
         .{ .source = "let C=struct{let add:(self:&mut C,n:`T)={}\n}\nlet f:(p:&C)={let q:@TypeOf(p.add(1))={}\n}", .tag = .immutable_assignment },
-        .{ .source = prelude ++ "let f:(p:&C)->int=p.value", .tag = .unsupported_borrow },
+        .{ .source = prelude ++ "let f:(p:&C)={p.value=1}", .tag = .immutable_assignment },
         .{ .source = prelude ++ "let f:(p:&mut C)->()->int=()->int{p.read()}", .tag = .unsupported_borrow },
-        .{ .source = "let C=struct{callback:()->int,}\nlet f:(p:&C)->int=p.callback()", .tag = .unsupported_body_expression },
+
         .{ .source = "let C=struct{value:int,let add:(self:&mut int)={}\n}\nlet f:(p:&mut C)={p.add()}", .tag = .invalid_method_receiver },
     }) |case| {
         errdefer std.debug.print("automatic method rejection: {s}\n", .{case.source});

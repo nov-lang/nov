@@ -1309,7 +1309,15 @@ local owners, array elements, or reference receivers (including reference
 parameters). Method lookup automatically dereferences a named reference:
 `p.add(2)` is equivalent to `p.*.add(2)`. This also works for readonly and
 by-value methods; by-value methods snapshot the pointee before explicit arguments.
-Ordinary fields and callable fields still require `p.*.field` / `p.*.callback()`.
+Field access also automatically dereferences named references: `p.field` and
+`p.callback()` are equivalent to `p.*.field` and `p.*.callback()`. Callable fields
+receive no implicit receiver. Nested fields, assignments, compound assignments
+and `@clear(p.items)` follow the same rule; writes require a mutable pointee
+(`&mut T`), not a mutable reference binding. Explicit `.*` remains valid.
+Field reads retain ordinary value-copy semantics, and assignment targets/callees
+are selected before RHS/argument effects. `@TypeOf` checks these accesses without
+executing them. This does not extend autodereferencing to bare reference operands
+of indexing, iteration, `@len` or `@clear`; use `p.*` for those.
 `&mut SelfType` requires mutable storage; `&SelfType` also permits immutable local
 owners. Nested field receivers such as `outer.counter.add(2)`, globals,
 temporaries and mutation through readonly references remain rejected. This does
@@ -2142,7 +2150,7 @@ let main: () -> void = {
   See [examples/managed-arrays.nov](examples/managed-arrays.nov).
 - `@clear(values)` empties a writable array place and returns `void`. Direct
   local/global arrays, struct fields and explicit mutable reference pointees
-  (`@clear(p.*)` or `@clear(self.*.items)`) retain their backing storage and capacity
+  (`@clear(p.*)` or `@clear(self.items)`) retain their backing storage and capacity
   without allocating. Removed elements stop retaining managed children; independent
   value copies are unchanged. Immutable places, temporaries, strings, bare references
   and conflicting live loans are rejected. Indexed nested arrays use the existing

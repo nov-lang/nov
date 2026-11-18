@@ -2790,7 +2790,7 @@ fn addMutableMethodCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_st
                 const example = std.mem.eql(u8, source, "mutable-methods.nov");
                 run.expectExitCode(0);
                 run.expectStdOutEqual(if (example)
-                    (if (tests) "PASS local_static_and_value_receivers\nPASS explicit_dereference_and_reference_parameter\nPASS array_element_receiver_evaluates_once\nPASS receiver_target_precedes_argument_rebinding\nPASS generic_self_and_method_inference\nPASS type_queries_do_not_borrow_or_execute\nPASS callable_fields_have_no_implicit_receiver\n7 passed; 0 failed; 7 total\n" else "Counter: 9\nThrough reference: 10\nArray elements: 10 25\nGeneric: after 7\n")
+                    (if (tests) "PASS local_static_and_value_receivers\nPASS explicit_dereference_and_reference_parameter\nPASS array_element_receiver_evaluates_once\nPASS receiver_target_precedes_argument_rebinding\nPASS generic_self_and_method_inference\nPASS type_queries_do_not_borrow_or_execute\nPASS callable_fields_have_no_implicit_receiver\nPASS reference_fields_read_write_and_call\nPASS reference_field_target_precedes_rhs_rebinding\n9 passed; 0 failed; 9 total\n" else "Counter: 9\nThrough reference: 10\nArray elements: 10 25\nGeneric: after 7\n")
                 else if (imported)
                     (if (tests) "PASS imported_public_generic_receivers\n1 passed; 0 failed; 1 total\n" else "")
                 else if (tests)
@@ -2814,8 +2814,8 @@ fn addMutableMethodCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_st
         .{ .name = "readonly-local", .source = counter ++ "let main:()={let c=C.[value=0]\nlet p=&c\np.add(1)}", .diagnostic = immutable },
         .{ .name = "readonly-generic", .source = counter ++ "let f:(p:&C)={let result:int=p.echo(@as(int,1))\n}\nlet main:()={}", .diagnostic = immutable },
         .{ .name = "readonly-query", .source = counter ++ "let f:(p:&C)={let q:@TypeOf(p.add(1))={}\n}\nlet main:()={}", .diagnostic = immutable },
-        .{ .name = "reference-field", .source = counter ++ "let f:(p:&C)->int=p.value\nlet main:()={}", .diagnostic = unsupported },
-        .{ .name = "reference-callable-field", .source = "let C=struct{call:(int)->int,}\nlet f:(p:&C)->int=p.call(1)\nlet main:()={}", .diagnostic = "body checking for this expression is not implemented yet" },
+        .{ .name = "readonly-field-write", .source = counter ++ "let f:(p:&C)={p.value=1}\nlet main:()={}", .diagnostic = immutable },
+        .{ .name = "readonly-field-query", .source = counter ++ "let f:(p:&C)={let q:@TypeOf({p.value+=1})={}\n}\nlet main:()={}", .diagnostic = immutable },
         .{ .name = "private-reference", .source = "let api=@import(\"api.nov\")\nlet Alias=api.Box(u8)\nlet f:(p:&mut Alias)={p.hidden()}\nlet main:()={}", .diagnostic = "body checking for this expression is not implemented yet" },
         .{ .name = "argument-read", .source = counter ++ "let main:()={let mut c=C.[value=0]\nc.add(c.value)}", .diagnostic = conflict },
         .{ .name = "argument-write", .source = counter ++ "let main:()={let mut c=C.[value=0]\nc.add({c.value=3\n1})}", .diagnostic = conflict },
