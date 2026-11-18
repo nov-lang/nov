@@ -194,6 +194,20 @@ inclusivity by value without allocation. Both work as container `map`/`andThen`
 results and `std.array.find` payloads. References are still call-scoped capabilities,
 not storable payloads, and closures cannot capture them.
 
+Use the builtin `@len(range)` to count a finite bounded range, including an
+extracted payload, without iterating or allocating. It returns native `uint`:
+reversed ranges count 0, exclusive ranges count `end - start`, inclusive ranges
+add 1. Signed cross-zero and full narrow-domain counts are supported; full
+inclusive `u8` counts 256, not 0. Counts exceeding native `uint` panic
+`range length overflow` in every mode; known overflowing global initializers
+are compile errors. Endpoints evaluate once left-to-right, and stored, passed
+or returned ranges preserve their bounds. A generic helper
+``let length: (x: `T) -> uint = @len(x)`` works after instantiation for arrays,
+strings and finite ranges; no library overload or length protocol is needed.
+`@TypeOf(@len(...))` remains unevaluated and yields `uint`. Unbounded ranges,
+synthetic `.len` properties and reachable 128-bit backend endpoints are not
+supported. See `examples/range-length.nov`.
+
 Functions and ranges remain unprintable by default, including inside a union or
 array. An enclosing valid `@[stringify]` hook can provide a representation and stop
 structural recursion. Even an empty Option of a callable type needs such a hook

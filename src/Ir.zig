@@ -96,7 +96,7 @@ pub const Operation = union(enum) {
     /// Eager recursive array backing copy, including record fields/elements.
     /// Immutable strings and closure environments remain shared.
     array_clone: ValueId,
-    /// Unicode scalar count for strings; element count for arrays.
+    /// Native unsigned count: string scalars, array elements, or finite range values.
     array_len: ValueId,
     /// Internal nonnegative signed cursor limit: array elements or string bytes.
     iteration_len: ValueId,
@@ -1356,7 +1356,7 @@ fn validateBodyStructure(self: *const Ir, function: Function, body: Body) Verify
             .array_len => |value| {
                 if (!isNativeInteger(ty, .unsigned)) return error.OperandTypeMismatch;
                 const base = self.getType(try operandType(body, value, i)).?;
-                if (base != .array and base != .string) return error.InvalidOperation;
+                if (base != .array and base != .string and base != .range) return error.InvalidOperation;
             },
             .iteration_equal_length => |values| {
                 if (ty != .boolean) return error.OperandTypeMismatch;
@@ -5662,6 +5662,40 @@ test "range values require integer elements exact visible operands and immutable
     try std.testing.expectError(error.InvalidSourceSpan, t.ir.verify());
     owned[1] = good[1];
     try t.ir.verify();
+}
+
+test "range length source free verifier accepts exact endpoints and rejects bad operands and results" {
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    const uint = try ir.internType(.{ .integer = .{ .signedness = .unsigned, .bits = native_pointer_bits } });
+    const sint = try ir.internType(.{ .integer = .{ .signedness = .signed, .bits = native_pointer_bits } });
+    const boolean = try ir.internType(.boolean);
+    const unit = try ir.internType(.void);
+    for ([_]u16{ 8, 16, 32, 64 }) |bits| for ([_]std.builtin.Signedness{ .signed, .unsigned }) |signedness| {
+        const endpoint = try ir.internType(.{ .integer = .{ .signedness = signedness, .bits = bits } });
+        const range = try ir.internType(.{ .range = endpoint });
+        const params = [_]TypeId{ range, endpoint, boolean };
+        const signature = try ir.internType(.{ .function = .{ .params = &params, .result = uint } });
+        const name = try std.fmt.allocPrint(std.testing.allocator, "length_{s}_{d}", .{ @tagName(signedness), bits });
+        defer std.testing.allocator.free(name);
+        const function = try ir.addFunction(name, signature, .{ .start = 0, .end = 0 });
+        var instructions: [4]Instruction = undefined;
+        for (params, 0..) |ty, i| instructions[i] = .{ .ty = ty, .span = .{ .start = 0, .end = 0 }, .op = .{ .parameter = @intCast(i) } };
+        instructions[3] = .{ .ty = uint, .span = .{ .start = 0, .end = 0 }, .op = .{ .array_len = @fromBackingInt(0) } };
+        try ir.setFunctionBody(function, &instructions, @fromBackingInt(3));
+        const owned = @constCast(ir.getFunction(function).?.body.?.instructions);
+        for ([_]TypeId{ sint, boolean, unit }) |bad| {
+            owned[3].ty = bad;
+            try std.testing.expectError(error.OperandTypeMismatch, ir.verify());
+        }
+        owned[3].ty = uint;
+        for ([_]u32{ 1, 2, 3, 99 }) |bad| {
+            owned[3].op.array_len = @fromBackingInt(bad);
+            try std.testing.expectError(if (bad >= 3) error.InvalidValueId else error.InvalidOperation, ir.verify());
+        }
+        owned[3] = instructions[3];
+        try ir.verify();
+    };
 }
 
 test "iteration equal length source free verifier accepts mixed finite sources and rejects forged operands" {

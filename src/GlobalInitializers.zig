@@ -385,6 +385,18 @@ const Evaluator = struct {
             },
             .array_len => |id| blk: {
                 const base = self.get(id);
+                const operand_type = self.ir.getType(self.instructions[@backingInt(id)].ty).?;
+                if (operand_type == .range) {
+                    if (base != .aggregate or base.aggregate.len != 3) return error.InvalidData;
+                    const start = base.aggregate[0];
+                    const end = base.aggregate[1];
+                    const inclusive = base.aggregate[2];
+                    if (start != .scalar or end != .scalar or inclusive != .scalar or inclusive.scalar != .boolean) return error.InvalidData;
+                    const first = try integer(start.scalar);
+                    const last = try integer(end.scalar);
+                    const count: i512 = if (last < first) 0 else last - first + @intFromBool(inclusive.scalar.boolean);
+                    break :blk try integerValue(self.ir.getType(instruction.ty).?.integer, count);
+                }
                 const len = if (base == .aggregate) base.aggregate.len else if (base == .scalar and base.scalar == .string)
                     std.unicode.utf8CountCodepoints(base.scalar.string) catch return error.InvalidData
                 else

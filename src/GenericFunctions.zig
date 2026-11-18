@@ -1325,7 +1325,7 @@ const Solver = struct {
         }
         for (self.length_operands.items) |operand| {
             const value = root(operand).value;
-            if (value == .array or value == .never or (value == .known and self.ir.getType(value.known).? == .string)) continue;
+            if (value == .array or value == .range or value == .never or (value == .known and self.ir.getType(value.known).? == .string)) continue;
             try self.fail(if (value == .unknown) .generic_function_ambiguous else .expression_type_mismatch, operand.span, null);
         }
         for (self.query_places.items) |place| {

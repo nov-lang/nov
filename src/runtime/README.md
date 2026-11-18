@@ -395,8 +395,25 @@ require `@[public]`. An unmarked `toString` is an ordinary callable method, not 
 printing hook.
 
 Source-level `@len(values)` returns an array's element count as native `uint`,
-not its byte size or capacity. It accepts an array or string expression, not a
-record with a field named `len`; real record fields retain ordinary field access.
+not its byte size or capacity. It accepts an array, string or finite bounded
+integer range expression, not a record with a field named `len`; real record
+fields retain ordinary field access. Synthetic `.len` properties stay removed.
+
+For ranges, length is an O(1), allocation-free cardinality calculation returning
+native `uint`, independent of endpoint width. Reversed ranges count 0; otherwise
+exclusive counts are end-start and inclusive counts add 1. Arithmetic must
+handle signed cross-zero spans without signed overflow and widen narrow domains
+before counting (full inclusive u8 is 256). A count exceeding `UINTPTR_MAX`
+panics `range length overflow` in every execution mode, rather than wrapping or
+truncating. Compile-time-known global initializer overflow diagnoses at compile
+time. This count limit does not restrict otherwise valid finite iteration.
+
+The operand evaluates once; inline endpoints evaluate once left-to-right.
+Stored, passed and returned ranges retain their copied bounds/inclusivity, and
+generic length helpers specialize for the concrete operand type. Type-query
+operands are checked but not executed and `@TypeOf(@len(...))` yields native
+`uint`. Unbounded range length is rejected. Semantic 128-bit integers do not
+extend the existing reachable backend width support beyond 8/16/32/64 bits.
 
 The array representation uses `nov_array { void *data; uintptr_t len, cap; }`.
 The emitter declares this type for any transitively reachable array type, including

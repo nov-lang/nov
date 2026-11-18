@@ -712,9 +712,20 @@ fn usesManagedRuntime(ir: *const Ir) bool {
     return false;
 }
 
+fn usesRangeLength(ir: *const Ir) bool {
+    for (ir.functions.items) |function| {
+        const body = function.body orelse continue;
+        for (body.instructions) |instruction| {
+            if (instruction.op == .array_len and ir.getType(body.instructions[@backingInt(instruction.op.array_len)].ty).? == .range) return true;
+        }
+    }
+    return false;
+}
+
 fn writeIterationLengthRuntime(ir: *const Ir, w: *std.Io.Writer) WriteError!void {
+    const lengths = usesRangeLength(ir);
     var used = false;
-    var ranges = false;
+    var ranges = lengths;
     for (ir.functions.items) |function| {
         const body = function.body orelse continue;
         for (body.instructions) |instruction| {
@@ -726,9 +737,9 @@ fn writeIterationLengthRuntime(ir: *const Ir, w: *std.Io.Writer) WriteError!void
             }
         }
     }
-    if (!used) return;
-    try w.writeAll(
-        \\typedef struct { uint64_t low; bool full; } nov_iteration_count;
+    if (!used and !lengths) return;
+    try w.writeAll("typedef struct { uint64_t low; bool full; } nov_iteration_count;\n");
+    if (used) try w.writeAll(
         \\static bool nov_iteration_count_equal(nov_iteration_count lhs, nov_iteration_count rhs) {
         \\    return lhs.low == rhs.low && lhs.full == rhs.full;
         \\}
@@ -740,6 +751,13 @@ fn writeIterationLengthRuntime(ir: *const Ir, w: *std.Io.Writer) WriteError!void
         \\    const uint64_t difference = end - start;
         \\    const bool full = inclusive && difference == UINT64_MAX;
         \\    return (nov_iteration_count){full ? 0 : difference + (uint64_t)inclusive, full};
+        \\}
+        \\
+    );
+    if (lengths) try w.writeAll(
+        \\static uintptr_t nov_range_len(nov_iteration_count count) {
+        \\    if (count.full || count.low > UINTPTR_MAX) nov_rt_panic("range length overflow");
+        \\    return (uintptr_t)count.low;
         \\}
         \\
     );
@@ -876,6 +894,148 @@ test "iteration equal length source free unequal ranges assert upfront without G
     try std.testing.expect(std.mem.indexOf(u8, c, "nov_string_scalar_len") == null);
     for ([_][]const u8{ "-O0", "-O3" }) |mode|
         try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 1, "", "iteration cardinality: assertion failed\n", mode);
+}
+
+fn emitRangeLengthMatrix() ![]u8 {
+    var ir = Ir.init(test_gpa);
+    defer ir.deinit();
+    var t: IterationLengthTest = .{ .ir = &ir };
+    defer t.instructions.deinit(test_gpa);
+    const uint = try ir.internType(.{ .integer = .{ .signedness = .unsigned, .bits = Ir.native_pointer_bits } });
+    const boolean = try ir.internType(.boolean);
+    const unit = try ir.internType(.void);
+    for ([_]u16{ 8, 16, 32, 64 }) |bits| {
+        for ([_]std.builtin.Signedness{ .signed, .unsigned }) |signedness| {
+            const ty = try ir.internType(.{ .integer = .{ .signedness = signedness, .bits = bits } });
+            const minimum: i128 = if (signedness == .signed) -(@as(i128, 1) << @intCast(bits - 1)) else 0;
+            const maximum: i128 = (@as(i128, 1) << @intCast(bits - @intFromBool(signedness == .signed))) - 1;
+            const endpoints = [_]i128{ minimum, minimum + 1, 0, maximum - 1, maximum };
+            for (endpoints) |start| for (endpoints) |end| for ([_]bool{ false, true }) |inclusive| {
+                const count: i128 = if (start > end) 0 else end - start + @intFromBool(inclusive);
+                if (count > std.math.maxInt(usize)) continue;
+                const range = try t.range(ty, start, end, inclusive);
+                const length = try t.append(uint, .{ .array_len = range });
+                const expected = try t.integer(uint, count);
+                const equal = try t.append(boolean, .{ .binary = .{ .op = .eq, .lhs = length, .rhs = expected } });
+                _ = try t.append(unit, .{ .assertion = .{ .condition = equal, .message = null, .location = "range length matrix" } });
+            };
+        }
+    }
+    const result = try t.append(unit, .{ .constant = try ir.internConstant(.{ .ty = unit, .value = .void }) });
+    const signature = try ir.internType(.{ .function = .{ .params = &.{}, .result = unit } });
+    const main = try ir.addFunction("main", signature, .{ .start = 0, .end = 0 });
+    try ir.setFunctionBody(main, t.instructions.items, result);
+    return emitProgram(test_gpa, &ir, null);
+}
+
+test "range length source free width matrix reversed equal cross zero narrow full spans O0 O3 UBSan" {
+    const c = try emitRangeLengthMatrix();
+    defer test_gpa.free(c);
+    try std.testing.expect(std.mem.indexOf(u8, c, "nov_iteration_count_equal") == null);
+    try std.testing.expect(std.mem.indexOf(u8, c, "nov_gc_") == null);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(c, "typedef int nonempty;", 0, "", "", mode);
+}
+
+fn emitRangeLengthLibrary() ![]u8 {
+    var ir = Ir.init(test_gpa);
+    defer ir.deinit();
+    const uint = try ir.internType(.{ .integer = .{ .signedness = .unsigned, .bits = Ir.native_pointer_bits } });
+    const span: Ir.Span = .{ .start = 0, .end = 0 };
+    for ([_]std.builtin.Signedness{ .signed, .unsigned }) |signedness| {
+        const ty = try ir.internType(.{ .integer = .{ .signedness = signedness, .bits = 64 } });
+        const range = try ir.internType(.{ .range = ty });
+        const signature = try ir.internType(.{ .function = .{ .params = &.{ ty, ty }, .result = uint } });
+        for ([_]bool{ false, true }) |inclusive| {
+            const name = try std.fmt.allocPrint(test_gpa, "length_{s}_{s}", .{ @tagName(signedness), if (inclusive) "inclusive" else "exclusive" });
+            defer test_gpa.free(name);
+            const function = try ir.addFunction(name, signature, span);
+            try ir.setExportName(function, name);
+            try ir.setFunctionBody(function, &.{
+                .{ .ty = ty, .span = span, .op = .{ .parameter = 0 } },
+                .{ .ty = ty, .span = span, .op = .{ .parameter = 1 } },
+                .{ .ty = range, .span = span, .op = .{ .range_init = .{ .start = @fromBackingInt(0), .end = @fromBackingInt(1), .inclusive = inclusive } } },
+                .{ .ty = uint, .span = span, .op = .{ .array_len = @fromBackingInt(2) } },
+            }, @fromBackingInt(3));
+        }
+    }
+    return emit(test_gpa, &ir, null);
+}
+
+test "range length source free pure library demand strict C native max and full counter overflow O0 O3 UBSan" {
+    const c = try emitRangeLengthLibrary();
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "nov_gc_", "nov_rt_check", "nov_rt_init_stdout", "nov_iteration_count_equal", "nov_string_" }) |unused|
+        try std.testing.expect(std.mem.indexOf(u8, c, unused) == null);
+    try std.testing.expect(std.mem.indexOf(u8, c, "#include <stdio.h>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, c, "#include <stdlib.h>") != null);
+    const declarations =
+        \\#include <stdint.h>
+        \\#include <assert.h>
+        \\extern uintptr_t length_signed_inclusive(int64_t, int64_t);
+        \\extern uintptr_t length_signed_exclusive(int64_t, int64_t);
+        \\extern uintptr_t length_unsigned_inclusive(uint64_t, uint64_t);
+        \\extern uintptr_t length_unsigned_exclusive(uint64_t, uint64_t);
+        \\
+    ;
+    const success = declarations ++
+        \\int main(void) {
+        \\ assert(length_unsigned_exclusive(0, UINTPTR_MAX) == UINTPTR_MAX);
+        \\ assert(length_unsigned_inclusive(1, UINTPTR_MAX) == UINTPTR_MAX);
+        \\ assert(length_signed_exclusive(-1, 1) == 2);
+        \\ assert(length_signed_inclusive(INT64_MAX, INT64_MIN) == 0);
+        \\#if UINTPTR_MAX == UINT64_MAX
+        \\ assert(length_signed_exclusive(INT64_MIN, INT64_MAX) == UINTPTR_MAX);
+        \\ assert(length_signed_inclusive(INT64_MIN + 1, INT64_MAX) == UINTPTR_MAX);
+        \\#endif
+        \\ return 0;
+        \\}
+    ;
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| {
+        try compileAndRunMode(c, success, 0, "", "", mode);
+        for ([_][]const u8{
+            "length_signed_inclusive(INT64_MIN, INT64_MAX)",
+            "length_unsigned_inclusive(0, UINT64_MAX)",
+            "length_unsigned_inclusive(0, UINTPTR_MAX)",
+        }) |call| {
+            const harness = try std.fmt.allocPrint(test_gpa, "{s}\nint main(void) {{ (void){s}; return 70; }}\n", .{ declarations, call });
+            defer test_gpa.free(harness);
+            try compileAndRunMode(c, harness, 1, "", "panic: range length overflow\n", mode);
+        }
+    }
+}
+
+test "range length source free single evaluation ordered endpoints and TypeOf no fold O0 O3 UBSan" {
+    const library = try emitTypeOfExpressionsSourceFree(test_gpa,
+        \\let endpoint:()->u64={@panic("unevaluated endpoint")}
+        \\let main:()={let mut calls:int=0
+        \\ let n=@len({calls+=1
+        \\ @assert(calls==1)
+        \\ @as(i8,-128)}..={calls+=1
+        \\ @assert(calls==2)
+        \\ @as(i8,127)})
+        \\ @assert(n==256 and calls==2)
+        \\ let q:@TypeOf(@len(@as(u64,0)..=18446744073709551615))=7
+        \\ let r:@TypeOf(@len(endpoint()..=endpoint()))=9
+        \\ @assert(q==7 and r==9 and calls==2)}
+    );
+    defer test_gpa.free(library);
+    const c = try std.mem.concat(test_gpa, u8, &.{ library, "\nint main(void) { nov_main(); return 0; }\n" });
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(c, "typedef int nonempty;", 0, "", "", mode);
+
+    const query = try emitTypeOfExpressionsSourceFree(test_gpa,
+        \\let query:()->uint={let x:@TypeOf(@len(@as(u64,0)..=18446744073709551615))=3
+        \\ x}
+    );
+    defer test_gpa.free(query);
+    for ([_][]const u8{ "nov_range_count", "nov_range_len", "nov_iteration_count", "nov_rt_panic", "#include <stdio.h>", "#include <stdlib.h>" }) |unused|
+        try std.testing.expect(std.mem.indexOf(u8, query, unused) == null);
+    const query_c = try std.mem.concat(test_gpa, u8, &.{ query, "\nint main(void) { return nov_query() == 3 ? 0 : 70; }\n" });
+    defer test_gpa.free(query_c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(query_c, "typedef int nonempty;", 0, "", "", mode);
 }
 
 fn usesStringIndex(ir: *const Ir) bool {
@@ -1147,7 +1307,7 @@ fn usesPrinting(ir: *const Ir) bool {
 
 fn writeRuntime(ir: *const Ir, w: *std.Io.Writer) WriteError!void {
     const printing = usesPrinting(ir);
-    var panic_used = printing or usesManagedRuntime(ir);
+    var panic_used = printing or usesManagedRuntime(ir) or usesRangeLength(ir);
     var source_panic = false;
     var assertion_used = false;
     for (ir.functions.items) |function| {
@@ -1957,10 +2117,16 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
             .iteration_len => |value| try w.print("(v{d}.len > INTPTR_MAX ? (nov_rt_panic(\"iterable too long\"), (intptr_t)0) : (intptr_t)v{d}.len)", .{ @backingInt(value), @backingInt(value) }),
             .string_decode, .string_next => |r| try w.print("nov_string_cursor_{s}(v{d}, v{d})", .{ if (instruction.op == .string_decode) "rune" else "next", @backingInt(r.array), @backingInt(r.index) }),
             .array_len => |value| {
-                if (ir.getType(body.instructions[@backingInt(value)].ty).? == .string)
-                    try w.print("nov_string_scalar_len(v{d})", .{@backingInt(value)})
-                else
-                    try w.print("v{d}.len", .{@backingInt(value)});
+                switch (ir.getType(body.instructions[@backingInt(value)].ty).?) {
+                    .string => try w.print("nov_string_scalar_len(v{d})", .{@backingInt(value)}),
+                    .range => {
+                        try w.writeAll("nov_range_len(");
+                        try writeIterationCount(ir, w, body, value);
+                        try w.writeByte(')');
+                    },
+                    .array => try w.print("v{d}.len", .{@backingInt(value)}),
+                    else => unreachable,
+                }
             },
             .array_index => |r| {
                 if (ir.getType(body.instructions[@backingInt(r.array)].ty).? == .string) {

@@ -141,6 +141,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const len_tests = b.step("test-cli-len", "Run length builtin and removed length property CLI tests");
     addLenCliTests(b, exe, len_tests);
     test_step.dependOn(len_tests);
+    const range_length_tests = b.step("test-cli-range-length", "Run finite range length CLI tests");
+    addRangeLengthCliTests(b, exe, range_length_tests);
+    test_step.dependOn(range_length_tests);
     const string_byte_tests = b.step("test-cli-string-bytes", "Run immutable string scalar indexing CLI tests");
     addStringByteCliTests(b, exe, string_byte_tests);
     test_step.dependOn(string_byte_tests);
@@ -1386,6 +1389,126 @@ fn addLenCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.B
             run.expectStdOutEqual("");
             run.expectStdErrMatch(case.diagnostic);
             test_step.dependOn(&run.step);
+        }
+    }
+}
+
+fn addRangeLengthCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    const fixtures = b.addWriteFiles();
+    _ = fixtures.add("range-length.nov", @embedFile("examples/range-length.nov"));
+    _ = fixtures.add("counts.nov",
+        \\@[public]
+        \\let exclusive: uint = @len(2..5)
+        \\@[public]
+        \\let inclusive: uint = @len(-3..=2)
+        \\@[public]
+        \\let narrow: uint = @len(@as(u8, 0)..=@as(u8, 255))
+        \\@[public]
+        \\let reversed: uint = @len(5..=2)
+        \\@[public]
+        \\let stored = @as(i8, -128)..=@as(i8, 127)
+        \\@[public]
+        \\let stored_count: uint = @len(stored)
+        \\
+    );
+    _ = fixtures.add("imported.nov",
+        \\let counts = @import("counts.nov")
+        \\let folded: uint = counts.exclusive + counts.inclusive + counts.narrow + counts.reversed + counts.stored_count
+        \\let main: () = @println(counts.exclusive, counts.inclusive, counts.narrow, counts.reversed, counts.stored_count, folded)
+        \\
+    );
+    const native_max = std.math.maxInt(usize);
+    const native_min = std.math.minInt(isize);
+    const native_signed_max = std.math.maxInt(isize);
+    // Match the host executable's pointer width, not an optional build target.
+    _ = fixtures.add("boundaries.nov", b.fmt(
+        \\let main: () = {{
+        \\    let lo: int = {d}
+        \\    let hi: int = {d}
+        \\    let top: uint = {d}
+        \\    @assert(@len(lo..hi) == top)
+        \\    @assert(@len(lo..0) == @as(uint, {d}))
+        \\    @assert(@len(hi..=lo) == 0)
+        \\    @assert(@len(top..=top) == 1)
+        \\    @println(@len(lo..hi), @len(0..top))
+        \\}}
+        \\
+    , .{ native_min, native_signed_max, native_max, @as(u128, 1) << (@bitSizeOf(usize) - 1) }));
+    for ([_]struct { source: []const u8, stdout: []const u8 }{
+        .{ .source = "range-length.nov", .stdout = b.fmt("Exclusive: 3 Inclusive: 4\nEmpty: 0 Reversed: 0\nCross zero: 6\nFull u8: 256\nStored generic: 4 Type: u{d}\n", .{@bitSizeOf(usize)}) },
+        .{ .source = "imported.nov", .stdout = "3 6 256 0 256 521\n" },
+        .{ .source = "boundaries.nov", .stdout = b.fmt("{d} {d}\n", .{ native_max, native_max }) },
+    }) |case| {
+        const check = b.addRunArtifact(exe);
+        check.step.name = b.fmt("CLI range length: semantic {s}", .{case.source});
+        check.setCwd(fixtures.getDirectory());
+        check.addArgs(&.{ "check", "--semantic", case.source });
+        check.expectExitCode(0);
+        check.expectStdOutEqual("");
+        check.expectStdErrEqual("");
+        test_step.dependOn(&check.step);
+        for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+            for ([_][]const u8{ "run", "test" }) |command| {
+                if (std.mem.eql(u8, command, "test") and !std.mem.eql(u8, case.source, "range-length.nov")) continue;
+                const run = b.addRunArtifact(exe);
+                run.step.name = b.fmt("CLI range length: {s} {s} ({s})", .{ command, case.source, mode });
+                run.setCwd(fixtures.getDirectory());
+                run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+                run.setEnvironmentVariable("NOV_CC", "");
+                run.setEnvironmentVariable("CC", "");
+                run.addArgs(&.{ command, case.source });
+                if (mode.len != 0) run.addArg(mode);
+                run.expectExitCode(0);
+                run.expectStdOutEqual(if (std.mem.eql(u8, command, "run")) case.stdout else "PASS exclusive_inclusive_empty_and_reversed\nPASS full_narrow_domains_and_native_result\nPASS stored_passed_returned_and_generic\nPASS endpoints_once_left_to_right\nPASS type_queries_do_not_evaluate\n5 passed; 0 failed; 5 total\n");
+                run.expectStdErrEqual("");
+                test_step.dependOn(&run.step);
+            }
+        }
+    }
+    for ([_]struct { name: []const u8, source: []const u8 }{
+        .{ .name = "native-unsigned", .source = b.fmt("let main:()={{let hi:uint={d}\n@println(@len(0..=hi))}}", .{native_max}) },
+        .{ .name = "native-signed", .source = b.fmt("let main:()={{let lo:int={d}\nlet hi:int={d}\n@println(@len(lo..=hi))}}", .{ native_min, native_signed_max }) },
+        .{ .name = "u64-full", .source = "let main:()={let lo:u64=0\nlet hi:u64=18446744073709551615\n@println(@len(lo..=hi))}" },
+        .{ .name = "i64-full", .source = "let main:()={let lo:i64=-9223372036854775808\nlet hi:i64=9223372036854775807\n@println(@len(lo..=hi))}" },
+    }) |case| {
+        const source = b.fmt("overflow-{s}.nov", .{case.name});
+        _ = fixtures.add(source, case.source);
+        for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+            const run = b.addRunArtifact(exe);
+            run.step.name = b.fmt("CLI range length: overflow {s} ({s})", .{ case.name, mode });
+            run.setCwd(fixtures.getDirectory());
+            run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+            run.setEnvironmentVariable("NOV_CC", "");
+            run.setEnvironmentVariable("CC", "");
+            run.addArgs(&.{ "run", source });
+            if (mode.len != 0) run.addArg(mode);
+            run.expectExitCode(1);
+            run.expectStdOutEqual("");
+            run.expectStdErrEqual("panic: range length overflow\n");
+            test_step.dependOn(&run.step);
+        }
+    }
+    for ([_]struct { name: []const u8, source: []const u8, diagnostic: []const u8 }{
+        .{ .name = "unbounded", .source = "let main:()=@println(@len(0..))", .diagnostic = "expected expression" },
+        .{ .name = "nonrange", .source = "let main:()=@println(@len(42))", .diagnostic = "@len" },
+        .{ .name = "record", .source = "let R=struct{len:uint=7,}\nlet main:()=@println(@len(R.[]))", .diagnostic = "@len" },
+        .{ .name = "range-property", .source = "let main:()={let r=0..3\n@println(r.len)}", .diagnostic = "error:" },
+        .{ .name = "global-unsigned-overflow", .source = b.fmt("let count:uint=@len(@as(uint,0)..=@as(uint,{d}))\nlet main:()=@println(count)", .{native_max}), .diagnostic = "error:" },
+        .{ .name = "global-signed-overflow", .source = b.fmt("let count:uint=@len(@as(int,{d})..=@as(int,{d}))\nlet main:()=@println(count)", .{ native_min, native_signed_max }), .diagnostic = "error:" },
+        .{ .name = "global-u64-overflow", .source = "let count:uint=@len(@as(u64,0)..=@as(u64,18446744073709551615))\nlet main:()=@println(count)", .diagnostic = "error:" },
+        .{ .name = "global-i64-overflow", .source = "let count:uint=@len(@as(i64,-9223372036854775808)..=@as(i64,9223372036854775807))\nlet main:()=@println(count)", .diagnostic = "error:" },
+    }) |case| {
+        const source = b.fmt("reject-{s}.nov", .{case.name});
+        _ = fixtures.add(source, case.source);
+        for ([_]bool{ false, true }) |emit| {
+            const check = b.addRunArtifact(exe);
+            check.step.name = b.fmt("CLI range length: reject {s} ({s})", .{ case.name, if (emit) "emit-c" else "check" });
+            check.setCwd(fixtures.getDirectory());
+            check.addArgs(if (emit) &.{ "emit-c", source } else &.{ "check", "--semantic", source });
+            check.expectExitCode(1);
+            check.expectStdOutEqual("");
+            check.expectStdErrMatch(case.diagnostic);
+            test_step.dependOn(&check.step);
         }
     }
 }

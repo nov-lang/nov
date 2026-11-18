@@ -658,6 +658,20 @@ signatures, struct fields, union payloads and data-only globals. Field attribute
 printing/equality/membership and general iterator protocols remain unsupported.
 See examples/range-values.nov. Chained ranges diagnose; slice/match syntax preserved.
 
+`@len` extends existing array/string support to finite bounded integer ranges,
+returning native `uint` in O(1) without allocation or iteration. Reversed ranges
+count 0; exclusive ranges count end-start, inclusive ranges add 1. Signed
+cross-zero counts and full narrow domains are widened correctly (full inclusive
+u8 counts 256). Counts exceeding native uint panic `range length overflow` in
+all modes; compile-time-known global initializer overflow is a compile error.
+Endpoints evaluate once left-to-right; stored/passed/returned ranges and generic
+``length(x: `T) -> uint`` helpers work after instantiation. Type queries remain
+unevaluated, synthetic `.len` stays removed, unbounded @len(0..) is rejected,
+and reachable 128-bit backend widths remain unsupported. See
+examples/range-length.nov and `zig build test-cli-range-length` (also part of
+test-cli) for exact-output default/debug/release, imported folded globals,
+native-width overflow boundaries and negative semantic/emit-c coverage.
+
 Ordinary generic structs are executable alongside generic unions: named type
 parameters, canonical declaration+argument identity through aliases/imports,
 concrete fields/defaults, finite nested instances, direct Box(T).[...] constructors,
@@ -1194,7 +1208,8 @@ Historical proposals considered name-based overloading, such as `.toString()`
 overriding the default format and `.next()` implementing an iterator. These are
 not implemented name-based protocols: current printing requires explicit
 `@[stringify]`; an unmarked `.toString()` has no special effect. `@len(value)`
-accepts only arrays and strings, not records or user-defined length protocols.
+accepts only arrays, strings and finite bounded integer ranges, not records or
+user-defined length protocols.
 A real record field named `len` remains ordinary field access.
 
 I think it's a better idea to uniformize all of that with specific description
@@ -1635,7 +1650,7 @@ protocol.
   - &[]: `(*T, int) -> *mut U`
   - this is better than .next() because we know the len and [] op overloading
     is a cool side effect, but a separate overloadable length protocol
-    doesn't make much sense; `@len` is restricted to arrays and strings
+    doesn't make much sense; `@len` accepts arrays, strings and finite integer ranges
 - use async with yield for iterators
 
 ## Use after realloc / iterator invalidation

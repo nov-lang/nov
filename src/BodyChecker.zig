@@ -5165,7 +5165,7 @@ const Context = struct {
                     };
                     if (self.terminated) return if (expected) |want| want.ty else result;
                     const ty = self.ir.getType(operand).?;
-                    if (ty != .array and ty != .string) return self.fail(.expression_type_mismatch, call.ast.args[0], null);
+                    if (ty != .array and ty != .string and ty != .range) return self.fail(.expression_type_mismatch, call.ast.args[0], null);
                     return self.fit(result, expected, node);
                 }
                 if (self.stringBytes(call.ast.fn_expr)) |to_bytes| {
@@ -11048,4 +11048,270 @@ test "len builtin projects inert reads and snapshots effectful indexes once" {
     try std.testing.expectEqual(@as(usize, 1), copies);
     try std.testing.expectEqual(@as(usize, 1), calls);
     try std.testing.expectEqual(@as(usize, 1), prints);
+}
+
+fn expectRangeLengthUint(ir: *const Ir, id: Ir.TypeId) !void {
+    const ty = ir.getType(id).?;
+    try std.testing.expect(ty == .integer);
+    try std.testing.expectEqual(.unsigned, ty.integer.signedness);
+    try std.testing.expectEqual(Ir.native_pointer_bits, ty.integer.bits);
+}
+
+fn testRangeLengthValues(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "range-len-values.nov",
+        \\let R=@TypeOf(0..1)
+        \\let saved=2..=5
+        \\let returned:()->R=1..4
+        \\let length:(x:`T)->`U=@len(x)
+        \\let forward:(x:`T)->uint=length(x)
+        \\let main:()={let r=returned()
+        \\let f=(x:R){@len(x)}
+        \\let n:uint=length(r)
+        \\let m:uint=f(saved)
+        \\let ranges=[r,saved]
+        \\let p=&r
+        \\let dereferenced=@len(p.*)
+        \\@println(n,m,forward(saved),@len(ranges[0]),@len({r}),@len(if true {r} else {saved}),dereferenced)}
+    );
+    defer module.deinit();
+    var sema = try Lowering.lower(&module);
+    defer sema.deinit();
+    errdefer if (module.hasErrors()) std.debug.print("range len values: {any}\n", .{module.diagnostics.items});
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+    var lengths: usize = 0;
+    for (sema.ir.functions.items) |function| if (function.body) |body| for (body.instructions) |instruction| {
+        if (instruction.op != .array_len) continue;
+        lengths += 1;
+        try expectRangeLengthUint(&sema.ir, instruction.ty);
+        try std.testing.expect(sema.ir.getType(body.instructions[@backingInt(instruction.op.array_len)].ty).? == .range);
+    };
+    try std.testing.expect(lengths >= 5);
+}
+
+test "range len frontend generic stored and returned values under OOM" {
+    @setEvalBranchQuota(400000);
+    try testRangeLengthValues(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testRangeLengthValues, .{});
+}
+
+fn testRangeLengthImports(allocator: std.mem.Allocator) !void {
+    var comp = Compilation.init(allocator);
+    defer comp.deinit();
+    const root = try comp.addSource("/range-len/main.nov",
+        \\let lib=@import("lib.nov")
+        \\let count:uint=@len(lib.saved)
+        \\let main:()={let n:uint=lib.length(lib.returned())
+        \\@println(n,@len(lib.saved),count)}
+    );
+    const library = try comp.addSource("/range-len/lib.nov",
+        \\@[public]
+        \\let saved=@as(i8,-3)..=2
+        \\@[public]
+        \\let returned:()->@TypeOf(saved)=saved
+        \\@[public]
+        \\let length:(x:`T)->uint=@len(x)
+    );
+    const module = comp.getModule(root).?;
+    const local = module.lookup("lib").?;
+    try comp.imports.append(allocator, .{ .declaration = comp.declaration_ids.get(.{ .source = root, .local = local }).?, .target = library, .named = false, .span = module.getDeclaration(local).?.name_span });
+    var sema = try Lowering.lowerCompilation(&comp);
+    defer sema.deinit();
+    errdefer if (comp.hasErrors()) for (comp.modules.items) |failed| std.debug.print("range len imports: {any}\n", .{failed.diagnostics.items});
+    try std.testing.expect(!comp.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+    for (sema.ir.globals.items) |global| {
+        if (!std.mem.eql(u8, global.name, "count")) continue;
+        const body = sema.ir.getFunction(global.initializer).?.body.?;
+        const result = body.instructions[@backingInt(body.result)];
+        try std.testing.expectEqual(@as(u128, 6), sema.ir.getConstant(result.op.constant).?.value.unsigned_integer);
+    }
+}
+
+test "range len frontend imported ranges and global folds under OOM" {
+    @setEvalBranchQuota(400000);
+    try testRangeLengthImports(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testRangeLengthImports, .{});
+}
+
+test "range len frontend exact endpoint types and endpoint evaluation once" {
+    for ([_][]const u8{ "i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "int", "uint" }) |name| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let endpoint:(x:{s})->{s}=x\nlet f:()->uint=@len(endpoint(1)..=endpoint(3))", .{ name, name });
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "range-len-exact.nov", source);
+        defer module.deinit();
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expect(sema.lowering_complete);
+        try sema.ir.verify();
+        var calls: usize = 0;
+        var lengths: usize = 0;
+        var ranges: usize = 0;
+        for (sema.ir.functions.items) |function| if (function.body) |body| for (body.instructions, 0..) |instruction, index| switch (instruction.op) {
+            .call => calls += 1,
+            .range_init => |range| {
+                ranges += 1;
+                const endpoint = sema.ir.getType(instruction.ty).?.range;
+                try std.testing.expectEqual(endpoint, body.instructions[@backingInt(range.start)].ty);
+                try std.testing.expectEqual(endpoint, body.instructions[@backingInt(range.end)].ty);
+                try std.testing.expect(body.instructions[@backingInt(range.start)].op == .call);
+                try std.testing.expect(body.instructions[@backingInt(range.end)].op == .call);
+                try std.testing.expect(@backingInt(range.start) < @backingInt(range.end));
+                try std.testing.expect(@backingInt(range.end) < index);
+            },
+            .array_len => {
+                lengths += 1;
+                try expectRangeLengthUint(&sema.ir, instruction.ty);
+            },
+            else => {},
+        };
+        try std.testing.expectEqual(@as(usize, 2), calls);
+        try std.testing.expectEqual(@as(usize, 1), lengths);
+        try std.testing.expectEqual(@as(usize, 1), ranges);
+    }
+}
+
+test "range len frontend TypeOf full cardinality and effects are unevaluated" {
+    var module = try Module.init(std.testing.allocator, "range-len-typeof.nov",
+        \\let global:@TypeOf(@len(@as(u64,0)..=18446744073709551615))=0
+        \\let endpoint:()->u64={@println("effect")
+        \\1}
+        \\let main:()={let mut n:u64=0
+        \\let q:@TypeOf(@len(@as(u64,0)..=18446744073709551615))=0
+        \\let r:@TypeOf(@len(endpoint()..=endpoint()))=0
+        \\let f=(){let s:@TypeOf(@len({n=1
+        \\n}..=2))=0
+        \\}
+        \\@println(q,r)}
+    );
+    defer module.deinit();
+    var sema = try Lowering.lower(&module);
+    defer sema.deinit();
+    errdefer std.debug.print("range len query: {any}\n", .{module.diagnostics.items});
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+    for (sema.ir.functions.items) |function| {
+        try std.testing.expectEqual(@as(usize, 0), function.captures.len);
+        if (function.body) |body| for (body.instructions) |instruction| switch (instruction.op) {
+            .array_len, .range_init, .call, .local_store, .capture_cell, .capture_value => return error.UnexpectedQueryEffect,
+            else => {},
+        };
+    }
+}
+
+fn testRangeLengthFold(allocator: std.mem.Allocator, expression: []const u8, expected: ?u128) !void {
+    const source = try std.mem.concat(allocator, u8, &.{ "let count:uint=", expression, "\nlet main:()={}" });
+    defer allocator.free(source);
+    var module = try Module.init(allocator, "range-len-fold.nov", source);
+    defer module.deinit();
+    var sema = try Lowering.lower(&module);
+    defer sema.deinit();
+    errdefer if (module.hasErrors()) std.debug.print("range len fold {s}: {any}\n", .{ expression, module.diagnostics.items });
+    if (expected) |count| {
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expect(sema.lowering_complete);
+        try sema.ir.verify();
+        var found = false;
+        for (sema.ir.globals.items) |global| {
+            if (!std.mem.eql(u8, global.name, "count")) continue;
+            found = true;
+            const body = sema.ir.getFunction(global.initializer).?.body.?;
+            for (body.instructions) |instruction| try std.testing.expect(instruction.op != .array_len);
+            const result = body.instructions[@backingInt(body.result)];
+            try expectRangeLengthUint(&sema.ir, result.ty);
+            try std.testing.expectEqual(count, sema.ir.getConstant(result.op.constant).?.value.unsigned_integer);
+        }
+        try std.testing.expect(found);
+    } else {
+        try std.testing.expect(module.hasErrors());
+        try std.testing.expect(!sema.lowering_complete);
+        try std.testing.expectEqual(Module.Diagnostic.Tag.unsupported_global_initializer, module.diagnostics.items[0].tag);
+    }
+}
+
+test "range len frontend global exact cardinalities and legacy aggregate folds" {
+    for ([_]struct { expression: []const u8, count: u128 }{
+        .{ .expression = "@len(2..5)", .count = 3 },
+        .{ .expression = "@len(2..=5)", .count = 4 },
+        .{ .expression = "@len(5..2)", .count = 0 },
+        .{ .expression = "@len(5..=2)", .count = 0 },
+        .{ .expression = "@len(5..5)", .count = 0 },
+        .{ .expression = "@len(5..=5)", .count = 1 },
+        .{ .expression = "@len(-3..2)", .count = 5 },
+        .{ .expression = "@len(-3..=2)", .count = 6 },
+        .{ .expression = "@len(@as(i8,-128)..=127)", .count = 256 },
+        .{ .expression = "@len(@as(u8,0)..=255)", .count = 256 },
+        .{ .expression = "@len(@as(i16,-32768)..=32767)", .count = 65536 },
+        .{ .expression = "@len(@as(u16,0)..=65535)", .count = 65536 },
+        .{ .expression = "@len(@as(u64,18446744073709551615)..=18446744073709551615)", .count = 1 },
+        .{ .expression = "@len(@as(u64,0)..18446744073709551615)", .count = 18446744073709551615 },
+        .{ .expression = "@len(@as(i64,-9223372036854775808)..9223372036854775807)", .count = 18446744073709551615 },
+        .{ .expression = "@len(@as(u64,18446744073709551615)..=0)", .count = 0 },
+        .{ .expression = "@len(@as(i64,9223372036854775807)..=-9223372036854775808)", .count = 0 },
+
+        .{ .expression = "@len([7,8,9])", .count = 3 },
+        .{ .expression = "@len([0..1,0..1,0..1])", .count = 3 },
+        .{ .expression = "@len(\"é\\0😀\")", .count = 3 },
+    }) |case| try testRangeLengthFold(std.testing.allocator, case.expression, if (case.count > std.math.maxInt(usize)) null else case.count);
+}
+
+test "range len frontend global overflow rejects full signed and unsigned cardinality under OOM" {
+    @setEvalBranchQuota(400000);
+    for ([_][]const u8{
+        "@len(@as(u64,0)..=18446744073709551615)",
+        "@len(@as(i64,-9223372036854775808)..=9223372036854775807)",
+    }) |expression| {
+        try testRangeLengthFold(std.testing.allocator, expression, null);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testRangeLengthFold, .{ expression, @as(?u128, null) });
+    }
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testRangeLengthFold, .{ "@len(@as(i8,-128)..=127)", @as(?u128, 256) });
+}
+
+test "range len frontend runtime full cardinality remains an operation even if unreachable" {
+    var module = try Module.init(std.testing.allocator, "range-len-runtime-overflow.nov",
+        \\let f:()->uint=@len(@as(u64,0)..=18446744073709551615)
+        \\let g:()->uint=if false {@len(@as(i64,-9223372036854775808)..=9223372036854775807)} else {0}
+    );
+    defer module.deinit();
+    var sema = try Lowering.lower(&module);
+    defer sema.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+    var lengths: usize = 0;
+    for (sema.ir.functions.items) |function| if (function.body) |body| for (body.instructions) |instruction| {
+        if (instruction.op == .array_len) lengths += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 2), lengths);
+}
+
+test "range len frontend rejects unbounded mismatched and implicit reference operands including queries" {
+    for ([_][]const u8{
+        "let f:()->uint=@len(0..)",
+        "let f:()={let r=0..\n}",
+        "let f:()={let n:@TypeOf(@len(0..))=0\n}",
+        "let f:()->uint=@len(@as(i8,0)..@as(i16,2))",
+        "let f:()->uint=@len(@as(i8,0)..128)",
+        "let f:()->uint=@len(true..false)",
+        "let f:()->uint=@len('a'..'z')",
+        "let f:()={let r=0..2\nlet p=&r\n@len(p)}",
+        "let length:(x:`T)->uint=@len(x)\nlet f:()={let r=0..2\nlength(&r)}",
+        "let f:()={let r=0..2\nlet p=&r\nlet q:@TypeOf(@len(p))=0\n}",
+        "let f:()={let q:@TypeOf(@len(@as(i8,0)..@as(i16,2)))=0\n}",
+        "let f:()->u8=@len(0..2)",
+        "let f:()->int=@len(0..2)",
+    }) |source| {
+        var module = try Module.init(std.testing.allocator, "range-len-invalid.nov", source);
+        defer module.deinit();
+        if (module.hasErrors()) continue;
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        errdefer std.debug.print("range len invalid: {s}\n{any}\n", .{ source, module.diagnostics.items });
+        try std.testing.expect(module.hasErrors());
+        try std.testing.expect(!sema.lowering_complete);
+    }
 }

@@ -863,7 +863,7 @@ constraints. Conflicting signatures are errors; no implicit conversion is introd
 Body inference is deliberately bounded. It gathers constraints from parameter/local
 reads and explicitly typed globals, string/rune/bool literals, boolean operations,
 exact operand relationships for arithmetic/bitwise/comparison operations, array
-indexing/literals, string indexing, known record fields and array/string `@len(value)`,
+indexing/literals, string indexing, known record fields and array/string/finite-range `@len(value)`,
 block bindings, `if/else`, conditional/unconditional loops, scoped returns and
 breaks, `@as`, supported direct calls and concrete function-value calls. Integer
 literals supply deferred `int` fallback candidates only after exact constraints;
@@ -1125,7 +1125,7 @@ The delivered subset is deliberately bounded:
 - Read fields with `item.x`, including inside interpolation (`"{self.x}"`). Field
   lookup is type-directed: a record field named `len` is an ordinary field, read
   and written with `item.len`. `@len(item)` rejects a record even if it has a `len`
-  field; the builtin accepts only arrays and strings. Assignment, locals,
+  field; the builtin accepts only arrays, strings and finite bounded integer ranges. Assignment, locals,
   parameters, returns, branches and loop results copy record field values. Array backing is copied
   recursively through nested structs, record-array elements and union record
   payloads, including arrays inside union-valued fields; immutable strings share
@@ -2058,8 +2058,9 @@ let main: () -> void = {
   cannot have their elements changed. Parameters are immutable; copy into a
   mutable local to edit them.
 - `@len(values)` returns the array element count as native (pointer-sized) `uint`.
-  The builtin accepts exactly one array or string expression, evaluated once;
+  The builtin accepts exactly one array, string or finite bounded integer range expression, evaluated once;
   for a string it returns the Unicode scalar count, not bytes or grapheme clusters.
+  For a range it returns the finite cardinality (see [Range](#range)).
   The synthetic array/string `.len` properties are removed; use `@len(...)` instead.
   It does not use record fields or user-defined length protocols. Internal capacity
   is also pointer-sized `uint`, but is not a source-level field. Indices have native `int` type, with
@@ -2473,6 +2474,26 @@ let main: () = {
   infer range elements, for example `[0..3, 1..=2]`; their bounds and inclusivity
   copy by value with exact endpoint typing and the bound inference rules below.
   Range field access, equality, membership and direct printing are not introduced.
+- `@len(range)` returns the finite cardinality as native (pointer-sized) `uint`,
+  not the endpoint type. Reversed ranges return 0; otherwise `start..end` counts
+  `end - start`, and `start..=end` counts `end - start + 1`. Equal exclusive
+  bounds count 0 and equal inclusive bounds count 1. Signed ranges crossing zero
+  and full narrow domains are supported: `@len(@as(u8, 0)..=@as(u8, 255))`
+  returns 256, without narrowing to `u8`. Counting is O(1) and allocation-free;
+  it does not iterate the range.
+- A count greater than native `uint` panics with `range length overflow` in
+  default, debug and release modes; arithmetic must not wrap or truncate. A
+  compile-time-known overflowing global initializer is a compile error instead.
+  Finite iteration can still be valid even when its count cannot fit `uint`.
+- `@len` evaluates its operand once, including inline endpoints exactly once,
+  left to right. Stored, passed and returned ranges keep the same value semantics.
+  A generic helper ``let length: (x: `T) -> uint = @len(x)`` accepts arrays,
+  strings and finite ranges after instantiation. `@TypeOf(@len(expression))` is
+  an unevaluated query yielding `uint`; endpoints are checked but not executed.
+  Unbounded `@len(0..)` is rejected, no synthetic `.len` property is restored,
+  and reachable 128-bit endpoint types remain unsupported by the backend.
+  See [`examples/range-length.nov`](examples/range-length.nov) for executable
+  examples and tests, including side effects and generic calls.
 - Ordinary range operators bind above assignment and below pipes/other binary
   operators; chaining `a..b..c` is rejected. Existing slice/match syntax is preserved.
 - `..` excludes the upper endpoint. `start >= end` is empty; otherwise increment
@@ -3626,6 +3647,7 @@ TODO
 ## Builtins
 ### Functions
 - `@import(path: string)`: Import a nov file. See [Visibility](#Visibility) for which declarations gets imported.
+- `@len(value) -> uint`: Array element count, string Unicode scalar count, or finite bounded integer range cardinality. Evaluates the operand once; range count overflow panics in every mode (a known global-initializer overflow is a compile error). No record-field protocol or synthetic `.len` property. See [Range](#range).
 - `@TypeOf(expression)`: Implemented unevaluated compile-time query of an expression's canonical type; see [Type Queries](#type-queries). The operand is typechecked, not executed; the result is not a runtime type value.
 - `@stringToBytes(text: string) -> []u8`: Copy exact UTF-8 bytes, including NUL, into an independent mutable array. Allocation failure panics normally.
 - `@stringFromBytes(bytes: []u8) -> string`: Validate and copy into independently owned immutable UTF-8. Invalid UTF-8 panics in debug and release; use `std.string.fromBytes` for recoverable validation errors. Allocation failure panics normally. Neither intrinsic normalizes text or provides general casts/comptime execution.
