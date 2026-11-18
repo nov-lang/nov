@@ -1,0 +1,123 @@
+let std = @import("std")
+let text = std.string
+let Error = text.ParseIntError
+
+let main: () = {
+    @println("Signed:", text.parseInt("-42"))
+    @println("Unsigned:", text.parseUint("+123"))
+    @println("Invalid:", text.parseInt("12px"))
+    @println("Overflow:", text.parseUint("999999999999999999999999999999"))
+}
+
+let signedError: (input: string, expected: Error) -> bool = match text.parseInt(input) {
+    .ok => false
+    .err => |error| error == expected
+}
+let unsignedError: (input: string, expected: Error) -> bool = match text.parseUint(input) {
+    .ok => false
+    .err => |error| error == expected
+}
+
+@[test]
+let decimal_signs_and_leading_zeros: () = {
+    @assert(text.parseInt("42").unwrapOr(0) == 42)
+    @assert(text.parseInt("+0042").unwrapOr(0) == 42)
+    @assert(text.parseInt("-0042").unwrapOr(0) == -42)
+    @assert(text.parseInt("0").unwrapOr(1) == 0)
+    @assert(text.parseInt("-0").unwrapOr(1) == 0)
+    @assert(text.parseUint("0").unwrapOr(1) == 0)
+    @assert(text.parseUint("+0042").unwrapOr(0) == 42)
+    let padded = text.repeat("0", 1000) + "42"
+    @assert(text.parseInt(padded).unwrapOr(0) == 42)
+    @assert(text.parseUint(padded).unwrapOr(0) == 42)
+}
+
+@[test]
+let strict_ascii_input: () = {
+    loop input in ["", "+", "-", " 1", "1 ", "1\n", "1_000", "0x10", "0b10", "1.0", "1e2", "++1", "+-1", "--1", "1+2", "é", "١", "１", "−1", "1\0", "\0"] {
+        @assert(signedError(input, .invalidInput))
+        @assert(unsignedError(input, .invalidInput))
+    }
+    @assert(unsignedError("-1", .invalidInput))
+    @assert(unsignedError("-0", .invalidInput))
+}
+
+@[test]
+let native_signed_limits: () = {
+    let is32 = ~@as(uint, 0) == 4294967295
+    let maxText = if is32 {
+        "2147483647"
+    } else {
+        "9223372036854775807"
+    }
+    let minText = if is32 {
+        "-2147483648"
+    } else {
+        "-9223372036854775808"
+    }
+    let aboveMax = if is32 {
+        "2147483648"
+    } else {
+        "9223372036854775808"
+    }
+    let belowMin = if is32 {
+        "-2147483649"
+    } else {
+        "-9223372036854775809"
+    }
+    let minimum = text.parseInt(minText).unwrapOr(0)
+    let maximum = text.parseInt(maxText).unwrapOr(0)
+    @assert(minimum < 0 and -minimum == minimum)
+    @assert(
+        maximum == -{
+            minimum + 1
+        }
+    )
+    @assert(signedError(aboveMax, .overflow))
+    @assert(signedError("+" + aboveMax, .overflow))
+    @assert(signedError(belowMin, .overflow))
+    @assert(signedError("999999999999999999999999999999", .overflow))
+    @assert(signedError("-999999999999999999999999999999", .overflow))
+}
+
+@[test]
+let native_unsigned_limits: () = {
+    let is32 = ~@as(uint, 0) == 4294967295
+    let maxText = if is32 {
+        "4294967295"
+    } else {
+        "18446744073709551615"
+    }
+    let aboveMax = if is32 {
+        "4294967296"
+    } else {
+        "18446744073709551616"
+    }
+    @assert(text.parseUint(maxText).unwrapOr(0) == ~@as(uint, 0))
+    @assert(text.parseUint("+" + maxText).unwrapOr(0) == ~@as(uint, 0))
+    @assert(unsignedError(aboveMax, .overflow))
+    @assert(unsignedError("999999999999999999999999999999", .overflow))
+}
+
+let parsePair: (left: string, right: string) -> std.Result(int, Error) = {
+    let a = text.parseInt(left).!
+    let b = text.parseInt(right).!
+    .ok[a + b]
+}
+
+@[test]
+let propagation_callbacks_and_queries: () = {
+    @assert(parsePair("12", "-2").unwrapOr(0) == 10)
+    @assert(parsePair("bad", "2").isErr())
+    let numbers = std.array.map(["1", "-2", "3"], text.parseInt)
+    @assert(numbers[1].unwrapOr(0) == -2)
+    let mut calls = 0
+    let input = () -> string {
+        calls += 1
+        "+7"
+    }
+    let query: @TypeOf(text.parseInt(input())) = .ok[0]
+    @assert(calls == 0 and query.isOk())
+    @assert(text.parseInt(input()).unwrapOr(0) == 7 and calls == 1)
+    @assert(text.parseInt(text.trim(" 42 ")).unwrapOr(0) == 42)
+}

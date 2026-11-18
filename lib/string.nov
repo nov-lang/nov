@@ -59,6 +59,105 @@ let fromBytes: (bytes: []u8) -> std.Result(string, Utf8Error) = {
 }
 
 @[public]
+let ParseIntError = enum {
+    invalidInput,
+    overflow,
+}
+
+@[public]
+let parseInt: (text: string) -> std.Result(int, ParseIntError) = {
+    let mut first = true
+    let mut negative = false
+    let mut hasDigits = false
+    let mut value: int = 0
+    loop scalar in text {
+        if first {
+            first = false
+            if scalar == '-' {
+                negative = true
+                continue
+            }
+            if scalar == '+' {
+                continue
+            }
+        }
+        let digit: int = match scalar {
+            '0' => 0
+            '1' => 1
+            '2' => 2
+            '3' => 3
+            '4' => 4
+            '5' => 5
+            '6' => 6
+            '7' => 7
+            '8' => 8
+            '9' => 9
+            _ => return .err[ .invalidInput ]
+        }
+        hasDigits = true
+        ; Negative accumulation includes int's minimum; Nov arithmetic wraps.
+        let scaled = value * 10
+        if scaled / 10 != value {
+            return .err[ .overflow ]
+        }
+        let next = scaled - digit
+        if next > scaled {
+            return .err[ .overflow ]
+        }
+        value = next
+    }
+    if hasDigits == false {
+        return .err[ .invalidInput ]
+    }
+    if negative {
+        return .ok[value]
+    }
+    let positive = -value
+    if positive < 0 {
+        return .err[ .overflow ]
+    }
+    .ok[positive]
+}
+
+@[public]
+let parseUint: (text: string) -> std.Result(uint, ParseIntError) = {
+    let mut first = true
+    let mut hasDigits = false
+    let mut value: uint = 0
+    loop scalar in text {
+        if first {
+            first = false
+            if scalar == '+' {
+                continue
+            }
+        }
+        let digit: uint = match scalar {
+            '0' => 0
+            '1' => 1
+            '2' => 2
+            '3' => 3
+            '4' => 4
+            '5' => 5
+            '6' => 6
+            '7' => 7
+            '8' => 8
+            '9' => 9
+            _ => return .err[ .invalidInput ]
+        }
+        hasDigits = true
+        let available = ~@as(uint, 0) - digit
+        if value > available / 10 {
+            return .err[ .overflow ]
+        }
+        value = value * 10 + digit
+    }
+    if hasDigits == false {
+        return .err[ .invalidInput ]
+    }
+    .ok[value]
+}
+
+@[public]
 let startsWith: (text: string, prefix: string) -> bool = {
     if @len(prefix) > @len(text) {
         return false

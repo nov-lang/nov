@@ -156,6 +156,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const string_slice_tests = b.step("test-cli-string-slices", "Run immutable scalar string slicing CLI tests");
     addStringSliceCliTests(b, exe, string_slice_tests);
     test_step.dependOn(string_slice_tests);
+    const integer_parsing_tests = b.step("test-cli-integer-parsing", "Run strict decimal integer parsing CLI tests");
+    addIntegerParsingCliTests(b, exe, integer_parsing_tests);
+    test_step.dependOn(integer_parsing_tests);
     const string_search_tests = b.step("test-cli-string-search", "Run standard-library string search CLI tests");
     addStringSearchCliTests(b, exe, string_search_tests);
     test_step.dependOn(string_search_tests);
@@ -3699,6 +3702,96 @@ fn addArrayHelperCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step
                 test_step.dependOn(&run.step);
             }
         }
+    }
+}
+
+fn addIntegerParsingCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    const fixtures = b.addWriteFiles();
+    const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
+    _ = fixtures.add("integer-parsing.nov", @embedFile("examples/integer-parsing.nov"));
+    const aliases_source =
+        \\let std=@import("std")
+        \\let direct=@import("lib/string.nov")
+        \\let other=@import("lib/./string.nov")
+        \\let verify:()={let signed:(string)->std.Result(int,other.ParseIntError)=direct.parseInt
+        \\let unsigned:(string)->std.Result(uint,direct.ParseIntError)=std.string.parseUint
+        \\@assert(signed("-42").unwrapOr(0)==-42 and unsigned("+7").unwrapOr(0)==7)
+        \\let result:std.Result(int,direct.ParseIntError)=other.parseInt("bad")
+        \\@assert(match result{.ok=>false
+        \\.err=>|error| error==.invalidInput})}
+        \\let main:()=verify()
+        \\@[test]
+        \\let imported_aliases:()=verify()
+        \\
+    ;
+    _ = fixtures.add("aliases.nov", aliases_source);
+    const package = b.addWriteFiles();
+    const installed_exe = package.addCopyFile(exe.getEmittedBin(), b.fmt("bin/{s}", .{exe.out_filename}));
+    _ = package.addCopyDirectory(b.path("lib"), "lib/nov", .{});
+    _ = package.add("integer-parsing.nov", @embedFile("examples/integer-parsing.nov"));
+    _ = package.add("aliases.nov", std.mem.replaceOwned(u8, b.allocator, aliases_source, "lib/", "lib/nov/") catch @panic("OOM"));
+    for ([_][]const u8{ "integer-parsing.nov", "aliases.nov", "lib/string.nov", "lib/std.nov" }) |source| {
+        const check = b.addRunArtifact(exe);
+        check.setCwd(fixtures.getDirectory());
+        check.addArgs(&.{ "check", "--semantic", source, "--lib-dir" });
+        check.addDirectoryArg(library);
+        check.expectExitCode(0);
+        check.expectStdOutEqual("");
+        check.expectStdErrEqual("");
+        test_step.dependOn(&check.step);
+        if (std.mem.eql(u8, source, "aliases.nov")) continue;
+        const fmt = b.addRunArtifact(exe);
+        fmt.setCwd(fixtures.getDirectory());
+        fmt.addArgs(&.{ "fmt", "--check", source });
+        fmt.expectExitCode(0);
+        fmt.expectStdOutEqual("");
+        fmt.expectStdErrEqual("");
+        test_step.dependOn(&fmt.step);
+    }
+    const output = b.fmt("Signed: Result(i{0d}, ParseIntError).ok[-42]\nUnsigned: Result(u{0d}, ParseIntError).ok[123]\nInvalid: Result(i{0d}, ParseIntError).err[ParseIntError.invalidInput]\nOverflow: Result(u{0d}, ParseIntError).err[ParseIntError.overflow]\n", .{@bitSizeOf(usize)});
+    const tests = "PASS decimal_signs_and_leading_zeros\nPASS strict_ascii_input\nPASS native_signed_limits\nPASS native_unsigned_limits\nPASS propagation_callbacks_and_queries\n5 passed; 0 failed; 5 total\n";
+    for ([_]bool{ false, true }) |installed| {
+        for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+            for ([_][]const u8{ "run", "test" }) |command| {
+                for ([_][]const u8{ "integer-parsing.nov", "aliases.nov" }) |source| {
+                    const run = if (installed) std.Build.Step.Run.create(b, "CLI integer parsing: relocated install") else b.addRunArtifact(exe);
+                    if (installed) run.addFileArg(installed_exe);
+                    run.setCwd(if (installed) package.getDirectory() else fixtures.getDirectory());
+                    run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+                    run.setEnvironmentVariable("NOV_CC", "");
+                    run.setEnvironmentVariable("CC", "");
+                    run.addArgs(&.{ command, source });
+                    if (mode.len != 0) run.addArg(mode);
+                    if (!installed) {
+                        run.addArg("--lib-dir");
+                        run.addDirectoryArg(library);
+                    }
+                    const is_test = std.mem.eql(u8, command, "test");
+                    const example = std.mem.eql(u8, source, "integer-parsing.nov");
+                    run.expectExitCode(0);
+                    run.expectStdOutEqual(if (example) (if (is_test) tests else output) else if (is_test) "PASS imported_aliases\n1 passed; 0 failed; 1 total\n" else "");
+                    run.expectStdErrEqual("");
+                    test_step.dependOn(&run.step);
+                }
+            }
+        }
+    }
+    for ([_][]const u8{
+        "let main:()={let result=std.string.parseInt(42)\n}",
+        "let main:()={let result=std.string.parseUint([49])\n}",
+        "let main:()={let result:std.Result(uint,std.string.ParseIntError)=std.string.parseInt(\"1\")\n}",
+        "let result=std.string.parseInt(\"1\")\nlet main:()={}",
+    }, 0..) |source, i| {
+        const path = b.fmt("bad-parse-{d}.nov", .{i});
+        _ = fixtures.add(path, b.fmt("let std=@import(\"std\")\n{s}", .{source}));
+        const reject = b.addRunArtifact(exe);
+        reject.setCwd(fixtures.getDirectory());
+        reject.addArgs(&.{ "check", "--semantic", path, "--lib-dir" });
+        reject.addDirectoryArg(library);
+        reject.expectExitCode(1);
+        reject.expectStdOutEqual("");
+        reject.expectStdErrMatch("error:");
+        test_step.dependOn(&reject.step);
     }
 }
 

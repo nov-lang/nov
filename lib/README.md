@@ -439,6 +439,19 @@ conversions do not enable general casts or arbitrary compile-time execution;
 performance optimizations remain deferred. See `examples/string-conversions.nov`
 for a runnable example with exact stdout and nine tests.
 
+## Integer parsing
+
+- `std.string.parseInt(string) -> Result(int, std.string.ParseIntError)`
+- `std.string.parseUint(string) -> Result(uint, std.string.ParseIntError)`
+
+Decimal ASCII only, with optional `+` for either function and `-` only for signed
+parsing. Leading zeros are valid. Reject whitespace (use `trim` explicitly), empty
+or sign-only input, separators/prefixes, non-ASCII digits and trailing characters.
+Errors are `.invalidInput` and `.overflow`. Support the full pointer-sized range,
+including minimum signed `int`, without silent wrapping or allocation. No radix,
+fixed-width destination or float parsing API is introduced. See
+`examples/integer-parsing.nov` and `zig build test-cli-integer-parsing`.
+
 ## String search
 
 - `std.string.startsWith(text: string, prefix: string) -> bool`

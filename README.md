@@ -3474,6 +3474,30 @@ expected-type ascription. No builder, normalization or optimization is added.
 See [examples/string-conversions.nov](examples/string-conversions.nov) for exact
 stdout and nine tests, and [lib/README.md](lib/README.md#string-conversions).
 
+### Standard-library integer parsing
+
+`std.string.parseInt(text: string) -> std.Result(int, std.string.ParseIntError)`
+and `parseUint(text: string) -> std.Result(uint, std.string.ParseIntError)` parse
+strict decimal ASCII digits into pointer-sized integers. Signed parsing accepts
+an optional `+` or `-`; unsigned parsing accepts `+` but rejects `-`, including
+`-0`. Leading zeros are allowed. Empty/sign-only input, whitespace, underscores,
+base prefixes, non-ASCII digits and trailing characters are invalid. Use `trim`
+explicitly when desired.
+
+Errors are `.invalidInput` and `.overflow`; successful values never silently wrap.
+The full native range is supported, including minimum signed `int`. Parsing is
+ordinary Nov code, scans once without allocation, and does not modify the input.
+Arbitrary destination widths, radices and float parsing are not implemented.
+
+```nov
+let std = @import("std")
+let value = std.string.parseInt("-42").unwrapOr(0)
+let count = std.string.parseUint("+123")
+```
+
+See [`examples/integer-parsing.nov`](examples/integer-parsing.nov) for error
+matching, `.!` propagation, callbacks and native-boundary tests.
+
 ### Standard-library string search
 
 Import `std` and use its `string` namespace:

@@ -10598,6 +10598,84 @@ fn runApprovedHelperHarness(library: []const u8, harness: []const u8, oom: bool)
         try compileAndRunMode(c, "typedef int nonempty_translation_unit;", if (oom) 1 else 0, "", if (oom) "panic: GC allocation failed\n" else "", mode);
 }
 
+const integer_parsing_stdlib_source_free =
+    \\let std=@import("std")
+    \\let signedAccept:(input:string,expected:int)->bool=match std.string.parseInt(input){
+    \\.ok=>|value| value==expected
+    \\.err=>false}
+    \\let unsignedAccept:(input:string,expected:uint)->bool=match std.string.parseUint(input){
+    \\.ok=>|value| value==expected
+    \\.err=>false}
+    \\let signedReject:(input:string,overflow:bool)->bool=match std.string.parseInt(input){
+    \\.ok=>false
+    \\.err=>|error| if overflow {error==.overflow} else {error==.invalidInput}}
+    \\let unsignedReject:(input:string,overflow:bool)->bool=match std.string.parseUint(input){
+    \\.ok=>false
+    \\.err=>|error| if overflow {error==.overflow} else {error==.invalidInput}}
+    \\let make:()->string="["+"-42"+"]"
+    \\let view:(input:string)->bool=signedAccept(input[1..-1],-42)
+;
+
+test "integer parsing actual stdlib source free native limits differential ASCII no allocation O0 O3" {
+    const library = try emitApprovedHelperSourceFree(test_gpa, integer_parsing_stdlib_source_free);
+    defer test_gpa.free(library);
+    try runApprovedHelperHarness(library,
+        \\#include <inttypes.h>
+        \\static nov_string input(const char *s) { return (nov_string){NULL, (const unsigned char *)s, strlen(s)}; }
+        \\int main(void) {
+        \\    nov_rt_heap.collect_every_allocation = 1;
+        \\    nov_string managed = {0};
+        \\    void **roots[] = {&managed.owner};
+        \\    nov_gc_roots frame = {0}; nov_gc_push(&nov_rt_heap, &frame, roots, 1);
+        \\    managed = nov_make();
+        \\    nov_gc_collect(&nov_rt_heap);
+        \\    fail_allocations = 1;
+        \\    if (!nov_view(managed)) return 1;
+        \\    char buffer[128], negative[130];
+        \\    for (intptr_t n = -10000; n <= 10000; ++n) {
+        \\        (void)snprintf(buffer, sizeof(buffer), "%" PRIdPTR, n);
+        \\        if (!nov_signedAccept(input(buffer), n)) return 2;
+        \\        if (n >= 0 && !nov_unsignedAccept(input(buffer), (uintptr_t)n)) return 3;
+        \\    }
+        \\    for (uintptr_t n = 0; n < 64; ++n) {
+        \\        intptr_t lo = INTPTR_MIN + (intptr_t)n, hi = INTPTR_MAX - (intptr_t)n;
+        \\        (void)snprintf(buffer, sizeof(buffer), "%" PRIdPTR, lo);
+        \\        if (!nov_signedAccept(input(buffer), lo)) return 4;
+        \\        (void)snprintf(buffer, sizeof(buffer), "+%" PRIdPTR, hi);
+        \\        if (!nov_signedAccept(input(buffer), hi)) return 5;
+        \\        (void)snprintf(buffer, sizeof(buffer), "%" PRIuPTR, UINTPTR_MAX - n);
+        \\        if (!nov_unsignedAccept(input(buffer), UINTPTR_MAX - n)) return 6;
+        \\    }
+        \\    (void)snprintf(buffer, sizeof(buffer), "%" PRIuPTR, (uintptr_t)INTPTR_MAX + 1);
+        \\    (void)snprintf(negative, sizeof(negative), "-%s", buffer);
+        \\    if (!nov_signedReject(input(buffer), true) || !nov_signedAccept(input(negative), INTPTR_MIN)) return 7;
+        \\    ++negative[strlen(negative) - 1];
+        \\    if (!nov_signedReject(input(negative), true)) return 8;
+        \\    (void)snprintf(buffer, sizeof(buffer), "%" PRIuPTR, UINTPTR_MAX);
+        \\    ++buffer[strlen(buffer) - 1];
+        \\    if (!nov_unsignedReject(input(buffer), true)) return 9;
+        \\    for (unsigned c = 0; c < 128; ++c) {
+        \\        unsigned char bytes[] = {'1', (unsigned char)c, '2'};
+        \\        nov_string text = {NULL, bytes, sizeof(bytes)};
+        \\        if (c >= '0' && c <= '9') {
+        \\            uintptr_t expected = 102 + (c - '0') * 10;
+        \\            if (!nov_signedAccept(text, (intptr_t)expected) || !nov_unsignedAccept(text, expected)) return 10;
+        \\        } else if (!nov_signedReject(text, false) || !nov_unsignedReject(text, false)) return 11;
+        \\    }
+        \\    const char *invalid[] = {"", "+", "-", " 1", "1 ", "0x10", "1_0", "1.0", "1e2", "++1", "\xc3\xa9", "\xd9\xa1", "\xef\xbc\x91"};
+        \\    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); ++i)
+        \\        if (!nov_signedReject(input(invalid[i]), false) || !nov_unsignedReject(input(invalid[i]), false)) return 12;
+        \\    if (!nov_unsignedReject(input("-0"), false)) return 13;
+        \\    if (!nov_signedReject(input("999999999999999999999999999999"), true)) return 14;
+        \\    memset(buffer, '0', 100); memcpy(buffer + 100, "42", 3);
+        \\    if (!nov_signedAccept(input(buffer), 42) || !nov_unsignedAccept(input(buffer), 42)) return 15;
+        \\    nov_gc_pop(&nov_rt_heap, &frame); nov_gc_collect(&nov_rt_heap);
+        \\    if (nov_rt_heap.frames || nov_rt_heap.live_objects) return 16;
+        \\    nov_gc_shutdown(&nov_rt_heap); return 0;
+        \\}
+    , false);
+}
+
 const string_transform_stdlib_source_free =
     \\let std = @import("std")
     \\let trim: (text: string) -> string = std.string.trim(text)

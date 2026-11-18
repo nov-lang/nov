@@ -60,6 +60,14 @@ results. See `examples/array-fields.nov`.
 
 ## Current delivered status
 
+`std.string.parseInt` / `parseUint` return ordinary `Result(int/uint, ParseIntError)`
+for strict decimal ASCII input. Optional signed `+`/`-`, unsigned `+`, leading zeros;
+no implicit trimming, prefixes/separators or Unicode digits. `.invalidInput` and
+`.overflow` errors cover malformed/out-of-range values, including native minimum
+and maximum boundaries. Single-pass allocation-free Nov implementation, no new
+builtins or conversions. See `examples/integer-parsing.nov` (five tests) and
+`test-cli-integer-parsing`; arbitrary widths/radices and float parsing remain future work.
+
 Array `+` concatenation is implemented for exact matching element types, including
 all ordinary storable elements, contextual empty literals, generic callbacks,
 unevaluated `@TypeOf` and known-data global initializers. Operands evaluate once,
