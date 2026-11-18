@@ -85,7 +85,7 @@ let repeat_count_boundaries_and_exact_content: () = {
 let eager_callee_and_arguments_once_left_to_right: () = {
     let mut events: int = 0
     let mut source = "a😀b"
-    let getReplace = () -> (string, string, string) -> string {
+    let getReplace = () -> (str, str, str) -> str {
         events = events * 10 + 1
         std.string.replace
     }
@@ -122,7 +122,7 @@ let eager_callee_and_arguments_once_left_to_right: () = {
     )
     @assert(events == 123 and empty == "")
     events = 0
-    let getRepeat = () -> (string, uint) -> string {
+    let getRepeat = () -> (str, uint) -> str {
         events = events * 10 + 1
         std.string.repeat
     }
@@ -159,7 +159,7 @@ let eager_callee_and_arguments_once_left_to_right: () = {
     @assert(events == 1 and trimmed == "é")
 }
 
-let retained: () -> []string = {
+let retained: () -> []str = {
     let mut source = "prefix:" + " \u{3000}é😀\0e\u{301}\t:suffix"
     let view = source[7..-7]
     let trimmed = std.string.trim(view)
@@ -187,9 +187,9 @@ let retained_views_and_results_after_scope_and_gc_churn: () = {
     @assert(results[1] == "ée\u{301}\0e\u{301}")
     @assert(results[2] == original + original and results[3] == "")
     @assert(changed == original + "!" and results[0] == original)
-    let trim: (string) -> string = std.string.trim
-    let replace: (string, string, string) -> string = std.string.replace
-    let repeat: (string, uint) -> string = std.string.repeat
+    let trim: (str) -> str = std.string.trim
+    let replace: (str, str, str) -> str = std.string.replace
+    let repeat: (str, uint) -> str = std.string.repeat
     @assert(trim(" x ") == "x" and replace("aba", "a", "!") == "!b!")
     @assert(repeat("x", 2) == "xx")
 }

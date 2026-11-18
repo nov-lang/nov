@@ -8,14 +8,14 @@ let std = @import("std")
 let Result = std.Result
 let Option = std.Option
 let array = std.array
-let text = std.string
+let string = std.string
 ```
 
 `std.nov` is the entry module. It publicly re-exports `Result` from `result.nov`,
 `Option` from `option.nov`, the `array` namespace from `array.nov`, and the
 `string` namespace from `string.nov`. These are
 ordinary library declarations, not compiler builtins or automatically injected
-bare names.
+bare names. String values use the `str` type; the module remains `std.string`.
 
 ## Storable struct fields
 
@@ -45,7 +45,7 @@ standard library's unions, callbacks and ranges:
 ```nov
 let Processor = struct {
     run: (int) -> int,
-    outcome: std.Result([]int, string),
+    outcome: std.Result([]int, str),
     interval: @TypeOf(0..10),
 }
 
@@ -101,7 +101,7 @@ See `examples/storable-fields.nov` for a runnable example and six tests.
 
 Methods specialize on demand. Void success/error payloads remain valid; a method
 whose concrete signature would contain a void parameter cannot be used, following
-Nov's existing parameter rules. For example, `Result(void, string)` can be
+Nov's existing parameter rules. For example, `Result(void, str)` can be
 constructed and propagated without requesting `unwrapOr`.
 
 ## Option
@@ -129,7 +129,7 @@ Option type. Exhaustive matches can capture the `some` payload or handle `none`.
   Result-to-Option and Option-to-Result propagation are rejected.
 
 See `examples/options.nov`: division by zero yields `none` rather than panicking,
-`.!` propagates it from `Option(uint)` into `Option(string)`, and the fallback runs
+`.!` propagates it from `Option(uint)` into `Option(str)`, and the fallback runs
 only for the absent quotient.
 
 ## Array payloads
@@ -158,8 +158,8 @@ including cycles through arrays, reject. See
 Union payloads may themselves be unions, retaining each container's nominal type:
 
 ```nov
-let wrapped: std.Option(std.Result([]int, string)) = .some[.ok[[1, 2]]]
-let nested: std.Result(std.Option(int), string) = .ok[.some[7]]
+let wrapped: std.Option(std.Result([]int, str)) = .some[.ok[[1, 2]]]
+let nested: std.Result(std.Option(int), str) = .ok[.some[7]]
 ```
 
 Match captures yield the inner union as an ordinary value. `.!` processes one
@@ -220,13 +220,13 @@ runnable example and six tests.
 ```nov
 let number: std.Option(int) = .some[21]
 let doubled = number.map((value) { value * 2 })
-let result: std.Result(int, string) = .ok[21]
+let result: std.Result(int, str) = .ok[21]
 let text = result.map((value) { "value:{value}" })
 let error = result.mapErr((message) { "error:{message}" })
 ```
 
 These are ordinary generic methods, also callable statically as
-`Option(int).map(number, callback)` and `Result(int, string).map(result, callback)`.
+`Option(int).map(number, callback)` and `Result(int, str).map(result, callback)`.
 The receiver is evaluated/snapshotted before the callback expression; callback
 construction is eager even when its body will be skipped. Inferred closures,
 ordinary functions, exact expected results and supported generic callbacks use
@@ -396,8 +396,8 @@ shared closure environments and eager argument order.
 ## String conversions
 
 - `std.string.Utf8Error = enum { invalidUtf8, }`
-- `std.string.toBytes(text: string) -> []u8`
-- `std.string.fromBytes(bytes: []u8) -> std.Result(string, std.string.Utf8Error)`
+- `std.string.toBytes(text: str) -> []u8`
+- `std.string.fromBytes(bytes: []u8) -> std.Result(str, std.string.Utf8Error)`
 
 ```nov
 let bytes = std.string.toBytes("é😀\0")
@@ -422,7 +422,7 @@ source string. Results remain valid after source scope exit, rebinding and GC
 churn, including conversion of string slices. NUL is ordinary data; no terminator,
 normalization, case folding or grapheme processing is added. `@len(bytes)` counts
 byte elements for a `[]u8` array; other arrays count their elements, not bytes.
-`@len(text)` counts Unicode scalars for a `string`, not bytes or grapheme clusters.
+`@len(text)` counts Unicode scalars for a `str`, not bytes or grapheme clusters.
 Both return native `uint`. A real struct field named `len` remains an ordinary
 field; `@len` does not accept records or use user-defined length protocols.
 
@@ -430,19 +430,19 @@ Use `.!` in a function returning a compatible Result to propagate `Utf8Error`, o
 match `.ok`/`.err` and the `.invalidUtf8` enum case. The wrappers are ordinary
 first-class functions usable in function variables and `@TypeOf` queries.
 
-Low-level `@stringToBytes(string) -> []u8` and `@stringFromBytes([]u8) -> string`
+Low-level `@stringToBytes(str) -> []u8` and `@stringFromBytes([]u8) -> str`
 are copying runtime intrinsics. Direct `@stringFromBytes` **panics on invalid
 UTF-8 in all build modes**; arbitrary input should use the recoverable public
 wrapper instead. Allocation failures retain normal panic semantics. These narrow
 conversions do not enable general casts or arbitrary compile-time execution;
 `@as` is still only expected-type ascription. A UTF-8 editing builder and
-performance optimizations remain deferred. See `examples/string-conversions.nov`
+performance optimizations remain deferred. See `examples/str-conversions.nov`
 for a runnable example with exact stdout and nine tests.
 
 ## Integer parsing
 
-- `std.string.parseInt(string) -> Result(int, std.string.ParseIntError)`
-- `std.string.parseUint(string) -> Result(uint, std.string.ParseIntError)`
+- `std.string.parseInt(str) -> Result(int, std.string.ParseIntError)`
+- `std.string.parseUint(str) -> Result(uint, std.string.ParseIntError)`
 
 Decimal ASCII only, with optional `+` for either function and `-` only for signed
 parsing. Leading zeros are valid. Reject whitespace (use `trim` explicitly), empty
@@ -454,10 +454,10 @@ fixed-width destination or float parsing API is introduced. See
 
 ## String search
 
-- `std.string.startsWith(text: string, prefix: string) -> bool`
-- `std.string.endsWith(text: string, suffix: string) -> bool`
-- `std.string.find(text: string, pattern: string) -> Option(uint)`
-- `std.string.contains(text: string, pattern: string) -> bool`
+- `std.string.startsWith(text: str, prefix: str) -> bool`
+- `std.string.endsWith(text: str, suffix: str) -> bool`
+- `std.string.find(text: str, pattern: str) -> Option(uint)`
+- `std.string.contains(text: str, pattern: str) -> bool`
 
 Matching is exact and case-sensitive, with no Unicode normalization or grapheme
 matching. `find` returns the first match's zero-based **Unicode scalar index**,
@@ -479,11 +479,11 @@ These are ordinary Nov functions implemented using existing scalar indexing,
 slices and zip loops. They may repeatedly scan UTF-8; no efficient-search
 complexity is promised yet, and optimization remains paused. They do not add
 mutable strings, normalization or case folding; byte conversions are separate APIs above. See
-`examples/string-search.nov` for a runnable example and five tests.
+`examples/str-search.nov` for a runnable example and five tests.
 
 ## String splitting
 
-`std.string.split(text: string, separator: string) -> []string` splits at exact,
+`std.string.split(text: str, separator: str) -> []str` splits at exact,
 non-overlapping occurrences of a nonempty string separator, from left to right.
 Matching is case-sensitive and Unicode-scalar aware, without normalization or
 case folding; embedded NUL and multi-scalar separators are supported.
@@ -499,7 +499,7 @@ a nonempty separator returns `[""]`; no match or an oversized separator returns
 one field containing the whole input. Matches do not overlap: splitting `"aaaaa"`
 by `"aa"` yields `["", "", "a"]`.
 
-An empty separator panics with `string split separator must not be empty` in every
+An empty separator panics with `str split separator must not be empty` in every
 build mode, including when the input is empty. Argument expressions still evaluate
 once in normal left-to-right order before the function checks the separator.
 
@@ -509,11 +509,11 @@ allocates storage and follows ordinary independent array-copy semantics, while
 its string elements continue sharing immutable content. Allocation failure panics
 normally. This initial implementation uses existing scalar indexing/slicing and
 repeated append; efficient-search/growth optimization remains deferred. See
-`examples/string-split.nov` for a runnable example and five tests.
+`examples/str-split.nov` for a runnable example and five tests.
 
 ## String joining
 
-`std.string.join(parts: []string, separator: string) -> string` inserts the
+`std.string.join(parts: []str, separator: str) -> str` inserts the
 separator between parts, never before the first or after the last part. Empty
 input returns `""`; a singleton returns its content unchanged. An empty separator
 concatenates all parts. Empty parts are preserved, so joining `["", "a", ""]` with
@@ -532,13 +532,13 @@ bindings are replaced or leave scope. Allocation failures panic normally.
 
 This is an ordinary Nov loop using existing string `+`, not a compiler builtin
 or optimized builder. Repeated concatenation can be quadratic; optimization stays
-paused. See `examples/string-join.nov` for a runnable example and five tests.
+paused. See `examples/str-join.nov` for a runnable example and five tests.
 
 ## String transforms
 
-- `std.string.trim(text: string) -> string`
-- `std.string.replace(text: string, pattern: string, replacement: string) -> string`
-- `std.string.repeat(text: string, count: uint) -> string`
+- `std.string.trim(text: str) -> str`
+- `std.string.replace(text: str, pattern: str, replacement: str) -> str`
+- `std.string.repeat(text: str, count: uint) -> str`
 
 `trim` removes only leading/trailing Unicode `White_Space`: U+0009–000D,
 U+0020, U+0085, U+00A0, U+1680, U+2000–200A, U+2028, U+2029, U+202F,
@@ -553,7 +553,7 @@ processing. Replacing `"aaaaa"` / `"aa"` with `"X"` yields `"XXa"`; newly insert
 text is not searched again. An empty replacement deletes matches. No match or an
 oversized pattern preserves the input content; empty text yields `""` with a
 nonempty pattern. An empty pattern always panics with
-`string replace pattern must not be empty`, even for empty text, consistently with
+`str replace pattern must not be empty`, even for empty text, consistently with
 `split`'s empty-separator policy.
 
 `repeat` concatenates exactly `count` copies, preserving bytes without
@@ -572,7 +572,7 @@ and results stay valid after source rebinding or scope exit. Allocation failure
 panics normally. These are ordinary Nov helpers: `replace` reuses `split`/`join`,
 and `repeat` loops with existing string `+`. Repeated concatenation can be
 quadratic under current copying; no efficient builder/search or other optimization
-is added. Optimization remains paused. See `examples/string-transform.nov` for
+is added. Optimization remains paused. See `examples/str-transform.nov` for
 exact main stdout and seven tests covering property boundaries, exact matching,
 count boundaries, effects and scope/GC retention.
 
@@ -735,7 +735,7 @@ not automatically expose their methods. Aliases/re-exports and implicit
 be `@[public]` for cross-file printing/interpolation, including nested values.
 Private or malformed marked converters reject rather than falling back to
 structural formatting. The converter may have any name and must be an ordinary
-immutable container method with a body and exact `(SelfType) -> string` signature.
+immutable container method with a body and exact `(SelfType) -> str` signature.
 At most one argument-free `@[stringify]` is allowed per struct/union/enum; ordinary
 methods in generic containers are allowed, but the converter's own generic
 function parameters and `@[noreturn]`/`@[test]`/`@[export]`/`@[extern]` are not.

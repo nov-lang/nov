@@ -54,12 +54,12 @@ let reverse_visit_order_and_shortcircuit: () = {
 
 @[test]
 let typed_empty_no_predicate_calls: () = {
-    let empty: []string = []
+    let empty: []str = []
     let mut calls: int = 0
     @assert(
         std.array.findLast(
             empty,
-            (value: string) -> bool {
+            (value: str) -> bool {
                 calls += 1
                 true
             }

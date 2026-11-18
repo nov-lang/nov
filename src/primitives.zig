@@ -26,7 +26,7 @@ pub const names = std.StaticStringMap(void).initComptime(.{
     .{"i128"},
     .{"int"},
     .{"rune"}, // Unicode scalar, excluding surrogate code points
-    .{"string"},
+    .{"str"},
     .{"true"},
     .{"type"},
     .{"u8"},

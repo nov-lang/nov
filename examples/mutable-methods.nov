@@ -48,7 +48,7 @@ let main: () = {
     let mut counters = [Counter.[ value = 10 ], Counter.[ value = 20 ]]
     counters[-1].add(5)
     @println("Array elements:", counters[0].value, counters[1].value)
-    let mut box = Box(string).[ value = "before" ]
+    let mut box = Box(str).[ value = "before" ]
     box.set("after")
     @println("Generic:", box.value, box.echo(@as(u8, 7)))
 }
@@ -117,7 +117,7 @@ let receiver_target_precedes_argument_rebinding: () = {
 
 @[test]
 let generic_self_and_method_inference: () = {
-    let mut box = Box([]string).[ value = ["before"] ]
+    let mut box = Box([]str).[ value = ["before"] ]
     let saved = box
     box.set(["after", "tail"])
     let exact: u8 = box.echo(@as(u8, 7))

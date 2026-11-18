@@ -96,7 +96,7 @@ let array_copies = () {
 
 @[test]
 let generic_method = () {
-    let box = Box(string).[ value = "captured" ]
+    let box = Box(str).[ value = "captured" ]
     let get = box.bind()
     @assert(get() == "captured")
 }
@@ -104,8 +104,8 @@ let generic_method = () {
 @[test]
 let nested_capture = () {
     let label = "hello" + "!"
-    let factory = () -> () -> string {
-        () -> string {
+    let factory = () -> () -> str {
+        () -> str {
             label
         }
     }

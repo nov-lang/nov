@@ -1,5 +1,5 @@
 let Batch = struct {
-    items: []string = [],
+    items: []str = [],
 
     let reset: (self: &mut Batch) = {
         @clear(self.items)

@@ -664,21 +664,21 @@ fn collectDeclaration(self: *Module, node: Ast.Node.Index, container: ?DeclId) (
 test "stringify metadata selects one arbitrary method per nominal container" {
     const source =
         \\let S=struct{
-        \\let toString:(s:S)->string="ordinary"
+        \\let toString:(s:S)->str="ordinary"
         \\@[stringify]
-        \\let format:(s:S)->string="marked"
+        \\let format:(s:S)->str="marked"
         \\}
         \\let U=union{none,
         \\@[stringify]
-        \\let display:(u:U)->string="union"
+        \\let display:(u:U)->str="union"
         \\}
         \\let E=enum{one,
         \\@[stringify]
-        \\let render:(e:E)->string="enum"
+        \\let render:(e:E)->str="enum"
         \\}
         \\let Box:(T:type)->type=struct{value:T,
         \\@[stringify]
-        \\let format:(b:@This())->string="box"
+        \\let format:(b:@This())->str="box"
         \\}
     ;
     var module = try Module.init(std.testing.allocator, "stringify.nov", source);
@@ -695,23 +695,23 @@ test "stringify metadata selects one arbitrary method per nominal container" {
 
 test "stringify rejects arguments duplicates placement and nonordinary methods" {
     for ([_][]const u8{
-        "@[stringify]\nlet format:(s:int)->string=\"bad\"",
+        "@[stringify]\nlet format:(s:int)->str=\"bad\"",
         "@[stringify]\nlet value=1",
         "@[stringify]\nlet Alias=int",
         "@[stringify]\nlet S=struct{}",
-        "let S=struct{\n@[stringify(1)]\nlet format:(s:S)->string=\"bad\"\n}",
-        "let S=struct{\n@[stringify(1,2)]\nlet format:(s:S)->string=\"bad\"\n}",
-        "let S=struct{\n@[stringify]\n@[stringify]\nlet format:(s:S)->string=\"bad\"\n}",
-        "let S=struct{\n@[stringify]\nlet mut format:(s:S)->string=\"bad\"\n}",
-        "let S=struct{\n@[stringify]\nlet format:(s:S)->string\n}",
+        "let S=struct{\n@[stringify(1)]\nlet format:(s:S)->str=\"bad\"\n}",
+        "let S=struct{\n@[stringify(1,2)]\nlet format:(s:S)->str=\"bad\"\n}",
+        "let S=struct{\n@[stringify]\n@[stringify]\nlet format:(s:S)->str=\"bad\"\n}",
+        "let S=struct{\n@[stringify]\nlet mut format:(s:S)->str=\"bad\"\n}",
+        "let S=struct{\n@[stringify]\nlet format:(s:S)->str\n}",
         "let S=struct{\n@[stringify]\nlet value=1\n}",
         "let S=struct{\n@[stringify]\nlet Alias=int\n}",
-        "let S=struct{\n@[stringify]\nlet format:(s:`T)->string=\"bad\"\n}",
+        "let S=struct{\n@[stringify]\nlet format:(s:`T)->str=\"bad\"\n}",
         "let S=struct{\n@[noreturn]\n@[stringify]\nlet format:(s:S)=loop{}\n}",
         "let S=struct{\n@[stringify]\n@[noreturn]\nlet format:(s:S)=loop{}\n}",
         "let S=struct{\n@[test]\n@[stringify]\nlet format:()={}\n}",
-        "let S=struct{\n@[stringify]\n@[extern]\nlet format:(s:S)->string\n}",
-        "let S=struct{\n@[export]\n@[stringify]\nlet format:(s:S)->string=\"bad\"\n}",
+        "let S=struct{\n@[stringify]\n@[extern]\nlet format:(s:S)->str\n}",
+        "let S=struct{\n@[export]\n@[stringify]\nlet format:(s:S)->str=\"bad\"\n}",
     }) |source| {
         var module = try Module.init(std.testing.allocator, "bad-stringify.nov", source);
         defer module.deinit();
@@ -723,7 +723,7 @@ test "stringify rejects arguments duplicates placement and nonordinary methods" 
         try std.testing.expect(diagnosed);
         try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
     }
-    const duplicate = "let S=struct{\n@[stringify]\nlet first:(s:S)->string=\"first\"\n@[stringify]\nlet second:(s:S)->string=\"second\"\n}";
+    const duplicate = "let S=struct{\n@[stringify]\nlet first:(s:S)->str=\"first\"\n@[stringify]\nlet second:(s:S)->str=\"second\"\n}";
     var module = try Module.init(std.testing.allocator, "duplicate-stringify.nov", duplicate);
     defer module.deinit();
     try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);

@@ -218,7 +218,7 @@ fn checkSupported(ast: Ast) !void {
                 }
                 const name = ast.tokenSlice(ast.firstToken(data.lhs));
                 if (field_tag == .identifier and primitives.isPrimitive(name)) {
-                    const allowed = [_][]const u8{ "void", "bool", "string", "rune", "float", "f32", "f64", "int", "uint", "i8", "i16", "i32", "i64", "i128", "u8", "u16", "u32", "u64", "u128" };
+                    const allowed = [_][]const u8{ "void", "bool", "str", "rune", "float", "f32", "f64", "int", "uint", "i8", "i16", "i32", "i64", "i128", "u8", "u16", "u32", "u64", "u128" };
                     for (allowed) |scalar| {
                         if (std.mem.eql(u8, name, scalar)) break;
                     } else return error.UnsupportedSyntax;
@@ -232,7 +232,7 @@ fn checkSupported(ast: Ast) !void {
                     else => return error.UnsupportedSyntax,
                 }
                 const name = ast.tokenSlice(ast.nodes.items(.main_token)[data.rhs]);
-                const scalar_types = [_][]const u8{ "bool", "string", "rune", "float", "f32", "f64", "i8", "i16", "i32", "i64", "i128", "u8", "u16", "u32", "u64", "u128", "int", "uint" };
+                const scalar_types = [_][]const u8{ "bool", "str", "rune", "float", "f32", "f64", "i8", "i16", "i32", "i64", "i128", "u8", "u16", "u32", "u64", "u128", "int", "uint" };
                 for (scalar_types) |scalar| {
                     if (std.mem.eql(u8, name, scalar)) break;
                 } else if (primitives.isPrimitive(name)) return error.UnsupportedSyntax;
@@ -415,12 +415,12 @@ test "inferred closures format bare parameters callbacks results and comments" {
 }
 
 test "generic union signatures instantiations and propagation format idempotently" {
-    try expectFormatted("let Result:(T:type,E:type)->type=union{ok:T,err:E,}\nlet R=Result(int,string)\nlet f:(r:R)->R=.ok[r.!]", "let Result: (T: type, E: type) -> type = union {\n    ok: T,\n    err: E,\n}\nlet R = Result(int, string)\nlet f: (r: R) -> R = .ok[r.!]\n");
+    try expectFormatted("let Result:(T:type,E:type)->type=union{ok:T,err:E,}\nlet R=Result(int,str)\nlet f:(r:R)->R=.ok[r.!]", "let Result: (T: type, E: type) -> type = union {\n    ok: T,\n    err: E,\n}\nlet R = Result(int, str)\nlet f: (r: R) -> R = .ok[r.!]\n");
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{"let G:(T:type)->type=union{ok:T,err:void,}\nlet R=G(int)\nlet f:(r:R)->R=G(int).ok[r.!]"});
 }
 
 test "unions constructors captures and payloadless variants format idempotently" {
-    try expectFormatted("let U=union{ok:int,err:string,none,}\nlet f:(u:U)->int=match u{.ok=>|v|v\n.err=>0\n.none=>1}\nlet g:()->U=.none[]", "let U = union {\n    ok: int,\n    err: string,\n    none,\n}\nlet f: (u: U) -> int = match u {\n    .ok => |v| v\n    .err => 0\n    .none => 1\n}\nlet g: () -> U = .none[]\n");
+    try expectFormatted("let U=union{ok:int,err:str,none,}\nlet f:(u:U)->int=match u{.ok=>|v|v\n.err=>0\n.none=>1}\nlet g:()->U=.none[]", "let U = union {\n    ok: int,\n    err: str,\n    none,\n}\nlet f: (u: U) -> int = match u {\n    .ok => |v| v\n    .err => 0\n    .none => 1\n}\nlet g: () -> U = .none[]\n");
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{"let U=union{ok:int,none,}\nlet f:(u:U)->int=match u{.ok=>|v|v\n.none=>0}"});
 }
 
@@ -431,7 +431,7 @@ test "test attributes and assert arguments format and survive OOM" {
 
 test "rune annotations arrays defaults escapes and comments format idempotently" {
     try expectFormatted("let R=struct{value:rune='\\xE9',}\nlet f:(xs:[]rune)->rune=xs[0]", "let R = struct {\n    value: rune = '\\xE9',\n}\nlet f: (xs: []rune) -> rune = xs[0]\n");
-    const source = "let Rune=rune\nlet x:Rune='😀' ; scalar\nlet f:(r:rune)->string=\"{r}\"\nlet values:[]rune=['é','\\0','\\u{10FFFF}']";
+    const source = "let Rune=rune\nlet x:Rune='😀' ; scalar\nlet f:(r:rune)->str=\"{r}\"\nlet values:[]rune=['é','\\0','\\u{10FFFF}']";
     const formatted = try format(std.testing.allocator, source);
     defer std.testing.allocator.free(formatted);
     try expectFormatted(source, formatted);
@@ -439,7 +439,7 @@ test "rune annotations arrays defaults escapes and comments format idempotently"
 }
 
 test "string slicing formatter forms chains comments interpolation and OOM" {
-    try expectFormatted("let f:(s:string)->string=s[ 1 .. -1 ][..][0..]", "let f: (s: string) -> string = s[1..-1][..][0..]\n");
+    try expectFormatted("let f:(s:str)->str=s[ 1 .. -1 ][..][0..]", "let f: (s: str) -> str = s[1..-1][..][0..]\n");
     for ([_][:0]const u8{
         "let x=text[..end()]\nlet y=text[start()..]",
         "let x=a[0..2].b\nlet y=a[0..1]",
@@ -470,7 +470,7 @@ test "bitwise syntax roundtrips shared precedence and match alternatives" {
 
 test "string compounds format syntactically without semantic restrictions" {
     try expectFormatted("let f:()->void={let mut s=\"é\\0\"\ns+=s\ns+={s=\"new\"\n\"😀\"}}", "let f: () -> void = {\n    let mut s = \"é\\0\"\n    s += s\n    s += {\n        s = \"new\"\n        \"😀\"\n    }\n}\n");
-    try expectFormatted("let f:(s:string)->void={s+=true\ns-=\"a\"}", "let f: (s: string) -> void = {\n    s += true\n    s -= \"a\"\n}\n");
+    try expectFormatted("let f:(s:str)->void={s+=true\ns-=\"a\"}", "let f: (s: str) -> void = {\n    s += true\n    s -= \"a\"\n}\n");
 }
 
 test "comments before between and after declarations" {
@@ -528,13 +528,13 @@ test "backtick signatures format without changing names or syntax" {
 
 test "string byte indexing formats nested chains comments and arbitrary bases idempotently" {
     try expectFormatted("let x=a[0][1]", "let x = a[0][1]\n");
-    try expectFormatted("let f:(elements:[]string)->u8=elements[0][1]", "let f: (elements: []string) -> u8 = elements[0][1]\n");
+    try expectFormatted("let f:(elements:[]str)->u8=elements[0][1]", "let f: (elements: []str) -> u8 = elements[0][1]\n");
     for ([_][:0]const u8{
-        "let f:(elements:[]string)->u8=elements[ ; element\n0][ ; byte\n-1] ; tail\n",
-        "let text:()->string=\"é\\0z\"\nlet f:()->u8=text()[2]",
+        "let f:(elements:[]str)->u8=elements[ ; element\n0][ ; byte\n-1] ; tail\n",
+        "let text:()->str=\"é\\0z\"\nlet f:()->u8=text()[2]",
         "let f:()->u8=\"é\\0z\"[-1]",
-        "let U=union{text:string,}\nlet f:(s:string)->u8=U.text[s].text[0]",
-        "let f:(elements:[]string)->u8={let alias=&elements\nalias[0][1]}",
+        "let U=union{text:str,}\nlet f:(s:str)->u8=U.text[s].text[0]",
+        "let f:(elements:[]str)->u8={let alias=&elements\nalias[0][1]}",
     }) |source| {
         errdefer std.debug.print("string byte formatter fixture: {s}\n", .{source});
         const result = try format(std.testing.allocator, source);
@@ -655,9 +655,9 @@ test "constructor shorthand formatting preserves tokens comments and structure" 
 test "nominal struct formatting preserves public attributes fields defaults methods constructor comments and interpolation" {
     for ([_][:0]const u8{
         "let R=struct{lo:i128=-170141183460469231731687303715884105728,top:u128=340282366920938463463374607431768211455,}\nlet f:(r:R)={}",
-        "@[public]\nlet R=struct{; open\nx:int=0, ; default\n; next field\ny:string,\n\n@[public]\n@[stringify]\nlet toString:(self:R)->string=\"{self.x}:{self.y}\"\n}\nlet main:()={let r=R.[x=1,y=\"hello\"]\n@println(r)}",
+        "@[public]\nlet R=struct{; open\nx:int=0, ; default\n; next field\ny:str,\n\n@[public]\n@[stringify]\nlet toString:(self:R)->str=\"{self.x}:{self.y}\"\n}\nlet main:()={let r=R.[x=1,y=\"hello\"]\n@println(r)}",
         "let R=struct{\n; empty\n}\nlet main:()={let r=R.[\n; empty constructor\n]\n@println(true)}",
-        "let R=struct{x:string,}\nlet main:()={let r=R.[\nx=\"hello\", ; value\n]\n@println(r.x)}",
+        "let R=struct{x:str,}\nlet main:()={let r=R.[\nx=\"hello\", ; value\n]\n@println(r.x)}",
     }) |source| {
         const result = try format(std.testing.allocator, source);
         defer std.testing.allocator.free(result);
@@ -995,7 +995,7 @@ test "array formatting survives every allocation failure" {
 
 test "quoted interpolation formatting preserves nested literal bytes and idempotence" {
     const source: [:0]const u8 =
-        \\let greet:(name:string)->string="Hello {name}!"
+        \\let greet:(name:str)->str="Hello {name}!"
         \\let main:()={@println("{"a"}","{greet("Ada")}","{'é'}","{"nested {"value"}"}","{"\"\\\u{1f600}"}")}
     ;
     const formatted = try format(std.testing.allocator, source);
@@ -1018,8 +1018,8 @@ test "array valued struct defaults format and survive OOM" {
 
 test "string byte conversions format nested calls and survive OOM" {
     try expectFormatted(
-        "let encode:(text:string)->[]u8=@stringToBytes(text)\nlet decode:(bytes:[]u8)->string=@stringFromBytes(bytes)",
-        "let encode: (text: string) -> []u8 = @stringToBytes(text)\nlet decode: (bytes: []u8) -> string = @stringFromBytes(bytes)\n",
+        "let encode:(text:str)->[]u8=@stringToBytes(text)\nlet decode:(bytes:[]u8)->str=@stringFromBytes(bytes)",
+        "let encode: (text: str) -> []u8 = @stringToBytes(text)\nlet decode: (bytes: []u8) -> str = @stringFromBytes(bytes)\n",
     );
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{"let run:()={let bytes=@stringToBytes(\"é\\0\")\n@println(@stringFromBytes(bytes))}"});
 }
@@ -1032,12 +1032,12 @@ test "TypeOf formatting preserves annotations type arguments and interpolation" 
 }
 
 test "stringify formatting preserves argument free attributes and arbitrary method names" {
-    try expectFormatted("let R=struct{x:int,\n@[public]\n@[stringify]\nlet format:(self:R)->string=\"{self.x}\"\n}", "let R = struct {\n    x: int,\n    @[public]\n    @[stringify]\n    let format: (self: R) -> string = \"{self.x}\"\n}\n");
-    try std.testing.expectError(error.UnsupportedSyntax, format(std.testing.allocator, "let R=struct{@[stringify(1)]\nlet format:(self:R)->string=\"R\"\n}"));
+    try expectFormatted("let R=struct{x:int,\n@[public]\n@[stringify]\nlet format:(self:R)->str=\"{self.x}\"\n}", "let R = struct {\n    x: int,\n    @[public]\n    @[stringify]\n    let format: (self: R) -> str = \"{self.x}\"\n}\n");
+    try std.testing.expectError(error.UnsupportedSyntax, format(std.testing.allocator, "let R=struct{@[stringify(1)]\nlet format:(self:R)->str=\"R\"\n}"));
 }
 
 test "record interpolation formatting preserves captures aliases conversions and allocation cleanup" {
-    const source = "let Alias=Error\nlet Error=struct{s:string,\n@[stringify]\nlet toString:(e:Alias)->string=e.s\n}\nlet U=union{err:Error,}\nlet f:(u:U)=match u{.err=>|err|@panic(\"Error: {err}\")}\nlet g:(e:Alias)->string=\"{e} {Error.toString(e)} {e}\"";
+    const source = "let Alias=Error\nlet Error=struct{s:str,\n@[stringify]\nlet toString:(e:Alias)->str=e.s\n}\nlet U=union{err:Error,}\nlet f:(u:U)=match u{.err=>|err|@panic(\"Error: {err}\")}\nlet g:(e:Alias)->str=\"{e} {Error.toString(e)} {e}\"";
     const formatted = try format(std.testing.allocator, source);
     defer std.testing.allocator.free(formatted);
     try expectFormatted(source, formatted);
@@ -1045,7 +1045,7 @@ test "record interpolation formatting preserves captures aliases conversions and
 }
 
 test "interpolation formatting preserves literal chunks escapes and placeholders" {
-    try expectFormatted("let f:(n:int,s:string)->string=\"é\\{\\}\\0{n}:{s}😀\"", "let f: (n: int, s: string) -> string = \"é\\{\\}\\0{n}:{s}😀\"\n");
+    try expectFormatted("let f:(n:int,s:str)->str=\"é\\{\\}\\0{n}:{s}😀\"", "let f: (n: int, s: str) -> str = \"é\\{\\}\\0{n}:{s}😀\"\n");
 }
 
 test "conditional loop exhaustion formatting preserves tokens comments and structure" {

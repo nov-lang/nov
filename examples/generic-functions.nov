@@ -42,7 +42,7 @@ let main: () = {
     let total: uint = add(1, 2)
     let saved = snapshot("captured")
     @println(first(numbers), add(@as(uint, 1), 2), total, add("hello", "!"))
-    @println(apply(increment, 4), unwrap(Box(string).[ value = "boxed" ]), saved())
+    @println(apply(increment, 4), unwrap(Box(str).[ value = "boxed" ]), saved())
     let cb: (uint) -> uint = identity
     @println(cb(42), @as((uint) -> uint, identity)(43), apply(identity, @as(uint, 44)))
 }
@@ -120,13 +120,13 @@ let stored_contextual_callbacks: () = {
 
 @[test]
 let nominal_box: () = {
-    let nested = Box(Box(string)).[ value = Box(string).[ value = "nested" ] ]
+    let nested = Box(Box(str)).[ value = Box(str).[ value = "nested" ] ]
     @assert(unwrap(unwrap(nested)) == "nested")
 }
 
 @[test]
 let returned_closures_and_array_copies: () = {
-    let mut values: []string = ["before"]
+    let mut values: []str = ["before"]
     let saved = snapshot(values)
     let copied = saved()
     values[0] = "after"

@@ -26,7 +26,7 @@ let Custom = union {
     none,
 
     @[stringify]
-    let format: (value: Custom) -> string = match value {
+    let format: (value: Custom) -> str = match value {
         .function => |callback| "callback:{callback(4)}"
         .range => |range| {
             let mut count = 0
@@ -62,7 +62,7 @@ let callOption: (value: Option(Callback)) -> Option(int) = {
     .some[callback(3)]
 }
 
-let callResult: (value: Result(Callback, string)) -> Result(int, string) = {
+let callResult: (value: Result(Callback, str)) -> Result(int, str) = {
     let callback = value.!
     .ok[callback(4)]
 }
@@ -76,7 +76,7 @@ let sumOption: (value: Option(IntRange)) -> Option(int) = {
     .some[sum]
 }
 
-let nestedLayer: (value: Option(Result(Callback, string))) -> Option(Result(Callback, string)) = {
+let nestedLayer: (value: Option(Result(Callback, str))) -> Option(Result(Callback, str)) = {
     let inner = value.!
     .some[inner]
 }
@@ -84,8 +84,8 @@ let nestedLayer: (value: Option(Result(Callback, string))) -> Option(Result(Call
 @[test]
 let callable_constructors_match_and_propagation: () = {
     let some: Option((int) -> int) = .some[increment]
-    let good: Result(Callback, string) = .ok[increment]
-    let bad: Result(Callback, string) = .err["missing"]
+    let good: Result(Callback, str) = .ok[increment]
+    let bad: Result(Callback, str) = .err["missing"]
     let plain: PlainFnUnion = .function[increment]
     let copy = echo(plain)
     @assert(
@@ -271,7 +271,7 @@ let find_and_map_function_and_range_results: () = {
         }
     )
     @assert(sumOption(mappedRange).unwrapOr(0) == 7)
-    let result: Result(int, string) = .ok[8]
+    let result: Result(int, str) = .ok[8]
     let resultFunction = result.map(
         (base) {
             (n: int) -> int {
@@ -280,10 +280,10 @@ let find_and_map_function_and_range_results: () = {
         }
     )
     @assert(callResult(resultFunction).unwrapOr(0) == 12)
-    let error: Result(int, string) = .err["saved"]
+    let error: Result(int, str) = .err["saved"]
     let errorFunction = error.mapErr(
         (message) {
-            () -> string {
+            () -> str {
                 message
             }
         }

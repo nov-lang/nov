@@ -8,12 +8,12 @@ let Color = enum {
 }
 
 let Row = struct {
-    values: []string,
+    values: []str,
 }
 
 let Payload = union {
     row: Row,
-    text: string,
+    text: str,
     none,
 }
 
@@ -71,9 +71,9 @@ let enum_membership_and_refs: () = {
 
 @[test]
 let nested_copies_and_iteration: () = {
-    let mut rows: [][]string = [["a" + "b"], ["c"]]
+    let mut rows: [][]str = [["a" + "b"], ["c"]]
     let saved = rows
-    let mut assigned: [][]string = []
+    let mut assigned: [][]str = []
     assigned = rows
     let first = &rows[0]
     first.*[0] = first.*[0] + "!"

@@ -5,7 +5,7 @@
 let Rectangle = struct {
     width: int,
     height: int,
-    label: string = "rectangle",
+    label: str = "rectangle",
 }
 
 let Box: (T: type) -> type = struct {

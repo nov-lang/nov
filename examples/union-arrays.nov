@@ -9,7 +9,7 @@ let Result = std.Result
 
 let Payload = union {
     numbers: []int,
-    words: [][]string,
+    words: [][]str,
     none,
 }
 
@@ -30,7 +30,7 @@ let advance: (value: Option([]int)) -> Option([]int) = {
     .some[items]
 }
 
-let forward: (value: Result([]int, []string)) -> Result([]int, []string) = {
+let forward: (value: Result([]int, []str)) -> Result([]int, []str) = {
     let mut items = value.!
     items[0] += 1
     .ok[items]
@@ -61,13 +61,13 @@ let match_and_success_error_propagation: () = {
     let absent: Option([]int) = .none[]
     @assert(advance(present).unwrapOr([])[0] == 4)
     @assert(advance(absent).isNone())
-    let good: Result([]int, []string) = .ok[[5]]
-    let bad: Result([]int, []string) = .err[["bad" + "!"]]
+    let good: Result([]int, []str) = .ok[[5]]
+    let bad: Result([]int, []str) = .err[["bad" + "!"]]
     @assert(forward(good).unwrapOr([])[0] == 6)
     @assert(good.unwrapOr([])[0] == 5)
     let propagated = forward(bad)
     let mut errors = match propagated {
-        .ok => @as([]string, [])
+        .ok => @as([]str, [])
         .err => |items| items
     }
     errors[0] = "changed"
@@ -87,15 +87,15 @@ let match_and_success_error_propagation: () = {
 
 @[test]
 let nested_strings_and_arrays_of_unions: () = {
-    let mut words: [][]string = [["hel" + "lo"], []]
+    let mut words: [][]str = [["hel" + "lo"], []]
     let mut payload: Payload = .words[words]
     let saved = payload
     let items: []Payload = [payload, .numbers[[1, 2]], .none[]]
     words[0] = ["source"]
     let mut extracted = match payload {
         .words => |rows| rows
-        .numbers => @as([][]string, [])
-        .none => @as([][]string, [])
+        .numbers => @as([][]str, [])
+        .none => @as([][]str, [])
     }
     let first = &extracted[0]
     first.*[0] = first.*[0] + "!"
@@ -163,9 +163,9 @@ let mapping_and_finding_arrays: () = {
             }
         ).isNone()
     )
-    let good: Result(int, []string) = .ok[4]
-    let bad: Result(int, []string) = .err[["missing"]]
-    let result: Result([]int, []string) = good.map(
+    let good: Result(int, []str) = .ok[4]
+    let bad: Result(int, []str) = .err[["missing"]]
+    let result: Result([]int, []str) = good.map(
         (value) {
             [value]
         }
@@ -200,11 +200,11 @@ let mapping_and_finding_arrays: () = {
 
 @[test]
 let inactive_payloads_and_storable_elements: () = {
-    let empty: Option([][]string) = .none[]
+    let empty: Option([][]str) = .none[]
     let copy = empty
     @assert(copy.isNone())
-    let good: Result([]int, [][]string) = .ok[[1]]
-    let bad: Result([]int, [][]string) = .err[[["error"]]]
+    let good: Result([]int, [][]str) = .ok[[1]]
+    let bad: Result([]int, [][]str) = .err[[["error"]]]
     @assert(good.unwrapOr([])[0] == 1 and bad.isErr())
 
     let colors: Option([]Color) = .some[[.red, .blue]]
@@ -233,11 +233,11 @@ let main: () = {
     @println("Payloads:", [numbers, words, none])
     let present: Option([]int) = .some[[3]]
     @println("Advanced:", advance(present).unwrapOr([]))
-    let bad: Result([]int, []string) = .err[["missing"]]
+    let bad: Result([]int, []str) = .err[["missing"]]
     @println(
         "Error:",
         match forward(bad) {
-            .ok => @as([]string, [])
+            .ok => @as([]str, [])
             .err => |items| items
         }
     )

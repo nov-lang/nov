@@ -5,7 +5,7 @@ let std = @import("std")
 
 @[test]
 let empty_singleton_and_empty_separator: () = {
-    let empty: []string = []
+    let empty: []str = []
     @assert(std.string.join(empty, ",") == "")
     @assert(std.string.join(empty, "") == "")
     @assert(std.string.join(["only"], "ignored") == "only")
@@ -31,7 +31,7 @@ let exact_utf8_nul_and_no_normalization: () = {
     @assert(std.string.join(["a\0", "\0b"], "\0") == "a\0\0\0b")
 }
 
-let retained_join: () -> string = {
+let retained_join: () -> str = {
     let mut source = "prefix:é😀:suffix"
     let part = source[7..9]
     let mut parts = [part, "e\u{301}"]
@@ -79,6 +79,6 @@ let main: () = {
     @println("Joined:", std.string.join(["red", "green", "blue"], ", "))
     @println("Empty fields:", std.string.join(["", "red", "", "blue", ""], "|"))
     @println("Concatenated:", std.string.join(["é", "😀", "e\u{301}"], ""))
-    let empty: []string = []
+    let empty: []str = []
     @println("Empty: [{std.string.join(empty, ",")}]")
 }

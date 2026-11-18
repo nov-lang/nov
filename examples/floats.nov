@@ -81,6 +81,6 @@ let mutation_copies_and_generic_containers: () = {
     first.* /= 2
     @assert(first.* == 0.625)
 
-    let result: Result(f64, string) = .ok[weighted_mean(samples)]
+    let result: Result(f64, str) = .ok[weighted_mean(samples)]
     @assert(result.unwrapOr(0) == 3)
 }

@@ -3,12 +3,12 @@ let MyInt = int
 @[public]
 let MyType = struct {
     x: MyInt = 0,
-    y: string = "hello",
+    y: str = "hello",
     z: bool,
 
     @[public]
     @[stringify]
-    let toString: (self: MyType) -> string = {
+    let toString: (self: MyType) -> str = {
         "x: {self.x}, y: {self.y}. z: {self.z}"
     }
 }

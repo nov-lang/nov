@@ -947,7 +947,7 @@ fn testLenBuiltinInference(allocator: std.mem.Allocator) !void {
     var module = try Module.init(allocator, "len-inference.nov",
         \\let length:(xs:[]`T)->uint=@len(xs)
         \\let inferred:(xs:[]`T)->`U=@len(xs)
-        \\let text:(s:string)->uint=@len(s)
+        \\let text:(s:str)->uint=@len(s)
         \\let main:()={let f=(xs:[]int){@len(xs)}
         \\@println(length([1]),inferred([true]),text("é\0😀"),f([1]))}
     );
@@ -988,11 +988,11 @@ fn testStringByteBuiltinInference(allocator: std.mem.Allocator) !void {
         \\let apply:(x:`T,f:(`T)->`U)->`U=f(x)
         \\let quoted:(x:`T)->@TypeOf(@stringToBytes(x))=@stringToBytes(x)
         \\let main:()={let a:[]u8=id(@stringToBytes(id("a")))
-        \\let b:string=id(@stringFromBytes(id([97])))
+        \\let b:str=id(@stringFromBytes(id([97])))
         \\let c:[]u8=encode("c")
-        \\let d:string=decode([100])
+        \\let d:str=decode([100])
         \\let e=apply("e",(s)->[]u8 {@stringToBytes(s)})
-        \\let f=apply(a,(bytes)->string {@stringFromBytes(bytes)})
+        \\let f=apply(a,(bytes)->str {@stringFromBytes(bytes)})
         \\let local=(s){@stringToBytes(s)}
         \\let g:[]u8=local("g")
         \\@println(a,b,c,d,e,f,g,quoted("q"))}
@@ -1016,7 +1016,7 @@ test "string byte conversion generic and expected function inference under OOM" 
 test "string byte conversion generic constraints reject inexact types" {
     for ([_][]const u8{
         "let encode:(x:`T)->[]u8=@stringToBytes(x)\nlet main:()={@println(encode([1]))}",
-        "let decode:(x:`T)->string=@stringFromBytes(x)\nlet main:()={@println(decode(@as([]u16,[1])))}",
+        "let decode:(x:`T)->str=@stringFromBytes(x)\nlet main:()={@println(decode(@as([]u16,[1])))}",
         "let id:(x:`T)->`T=x\nlet main:()={let b:[]u16=id(@stringToBytes(\"a\"))\n}",
         "let id:(x:`T)->`T=x\nlet main:()={let b:[]u8=id(@stringFromBytes([97]))\n}",
     }) |source| {
@@ -3810,16 +3810,16 @@ test "union array payloads real std map andThen find and readonly calls under OO
         \\let R=std.Result
         \\let expand:(x:int)->[]int=[x,x+1]
         \\let next:(x:int)->O([]int)=.some[[x]]
-        \\let nextResult:(x:int)->R([]int,[]string)=.ok[[x]]
+        \\let nextResult:(x:int)->R([]int,[]str)=.ok[[x]]
         \\let original:()->O(int)=.some[1]
         \\let inferred:(x:@TypeOf(original().map(expand)))->O([]int)=x
         \\let main:()={
         \\let option=original().map(expand)
         \\let chained=original().andThen(next)
-        \\let result:R(int,[]string)=.ok[1]
+        \\let result:R(int,[]str)=.ok[1]
         \\let mapped=result.map(expand)
         \\let bound=result.andThen(nextResult)
-        \\let remapped=R(int,string).err["bad"].mapErr((s:string)->[]string{[s]})
+        \\let remapped=R(int,str).err["bad"].mapErr((s:str)->[]str{[s]})
         \\let found=std.array.find(@as([][]int,[[1],[2]]),(xs:[]int)->bool{xs[0]==2})
         \\@println(option,chained,mapped,bound,remapped,found,inferred(option))
         \\}
@@ -3882,9 +3882,9 @@ test "nested unions std Option map union outputs and readonly under OOM" {
         \\let std=@import("std")
         \\let O=std.Option
         \\let R=std.Result
-        \\let convert:(x:int)->R(int,string)=.ok[x]
+        \\let convert:(x:int)->R(int,str)=.ok[x]
         \\let make:()->O(int)=.some[1]
-        \\let quoted:(x:@TypeOf(make().map(convert)))->O(R(int,string))=x
+        \\let quoted:(x:@TypeOf(make().map(convert)))->O(R(int,str))=x
         \\let main:()={@println(quoted(make().map(convert)))}
     );
 }
@@ -3895,8 +3895,8 @@ test "nested unions std Result map union outputs under OOM" {
         \\let O=std.Option
         \\let R=std.Result
         \\let convert:(x:int)->O(int)=.some[x]
-        \\let main:()={let x:R(int,string)=.ok[1]
-        \\let nested:R(O(int),string)=x.map(convert)
+        \\let main:()={let x:R(int,str)=.ok[1]
+        \\let nested:R(O(int),str)=x.map(convert)
         \\@println(nested)}
     );
 }
@@ -3906,10 +3906,10 @@ test "nested unions std Option andThen union outputs under OOM" {
         \\let std=@import("std")
         \\let O=std.Option
         \\let R=std.Result
-        \\let next:(x:int)->O(R(int,string))=.some[.ok[x]]
+        \\let next:(x:int)->O(R(int,str))=.some[.ok[x]]
         \\let make:()->O(int)=.some[1]
-        \\let quoted:(x:@TypeOf(make().andThen(next)))->O(R(int,string))=x
-        \\let main:()={let nested:O(R(int,string))=make().andThen(next)
+        \\let quoted:(x:@TypeOf(make().andThen(next)))->O(R(int,str))=x
+        \\let main:()={let nested:O(R(int,str))=make().andThen(next)
         \\@println(quoted(nested))}
     );
 }
@@ -3919,10 +3919,10 @@ test "nested unions std Result andThen union outputs under OOM" {
         \\let std=@import("std")
         \\let O=std.Option
         \\let R=std.Result
-        \\let next:(x:int)->R(O(int),string)=.ok[.some[x]]
-        \\let make:()->R(int,string)=.ok[1]
-        \\let quoted:(x:@TypeOf(make().andThen(next)))->R(O(int),string)=x
-        \\let main:()={let nested:R(O(int),string)=make().andThen(next)
+        \\let next:(x:int)->R(O(int),str)=.ok[.some[x]]
+        \\let make:()->R(int,str)=.ok[1]
+        \\let quoted:(x:@TypeOf(make().andThen(next)))->R(O(int),str)=x
+        \\let main:()={let nested:R(O(int),str)=make().andThen(next)
         \\@println(quoted(nested))}
     );
 }
@@ -3932,9 +3932,9 @@ test "nested unions std Result mapErr union outputs and readonly under OOM" {
         \\let std=@import("std")
         \\let O=std.Option
         \\let R=std.Result
-        \\let convert:(s:string)->O(string)=.some[s]
-        \\let make:()->R(int,string)=.err["bad"]
-        \\let quoted:(x:@TypeOf(make().mapErr(convert)))->R(int,O(string))=x
+        \\let convert:(s:str)->O(str)=.some[s]
+        \\let make:()->R(int,str)=.err["bad"]
+        \\let quoted:(x:@TypeOf(make().mapErr(convert)))->R(int,O(str))=x
         \\let main:()={@println(quoted(make().mapErr(convert)))}
     );
 }
@@ -4124,7 +4124,7 @@ fn imported(allocator: std.mem.Allocator) !void {
         \\let cb:(uint,uint)->uint=alias
         \\let other:(bool)->bool=method
         \\let direct:(bool)->bool=lib.NS.id
-        \\let pubref:(string)->string=lib.id
+        \\let pubref:(str)->str=lib.id
         \\@print(a,b,cb(1,2),other(true),direct(false),pubref("ok"),lib.id("ok"),method(true),lib.NS.id(false))}
     );
     const library = try comp.addSource("/app/lib.nov",
@@ -4504,7 +4504,7 @@ fn testReviewConstraints(allocator: std.mem.Allocator) !void {
         \\let wrap:(x:`T)->`U=G(uint).id(x)
         \\let passthrough:(x:`T)->`T=x
         \\let wrapPlain:(x:`T)->`U=G(uint).plain(1)
-        \\let main:()={let box=Box(string).[value="field"]
+        \\let main:()={let box=Box(str).[value="field"]
         \\let closure=make("captured")
         \\let named=makeNamed("named")
         \\@println(unwrap(box),invert(true),size("abc"),size([true,false]),closure(),wrap("ok"),passthrough(G(uint).plain(7)),wrapPlain("s"),named(false))}

@@ -60,7 +60,7 @@ let call_order: () = {
     let mut count: int = 0
     let prefix = "saved" + "!"
     let mut r = .[
-        (suffix: string) -> string {
+        (suffix: str) -> str {
             count += 1
             prefix + suffix
         },
@@ -69,7 +69,7 @@ let call_order: () = {
     let copy = r
     let result = r.0(
         {
-            r.0 = (suffix: string) -> string {
+            r.0 = (suffix: str) -> str {
                 "replacement" + suffix
             }
             r.1 = 9

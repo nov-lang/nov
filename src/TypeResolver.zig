@@ -326,7 +326,7 @@ fn resolveDepth(module: *Module, ir: *Ir, node: Ast.Node.Index, depth: usize, al
         return diagnose(module, node, .not_a_type);
     }
     if (std.mem.eql(u8, name, "true") or std.mem.eql(u8, name, "false")) return diagnose(module, node, .not_a_type);
-    if (std.mem.eql(u8, name, "string")) return try ir.internType(.string);
+    if (std.mem.eql(u8, name, "str")) return try ir.internType(.string);
     if (std.mem.eql(u8, name, "rune")) return try ir.internType(.rune);
     if (std.mem.eql(u8, name, "bool")) return try ir.internType(.boolean);
     if (std.mem.eql(u8, name, "void")) return try ir.internType(.void);
@@ -812,6 +812,7 @@ test "explicit primitive types have canonical identities and widths" {
         \\let k: u64
         \\let l: u128
         \\let m: rune
+        \\let n: str
     );
     defer module.deinit();
     var ir = Ir.init(std.testing.allocator);
@@ -824,7 +825,7 @@ test "explicit primitive types have canonical identities and widths" {
         .{ .integer = .{ .signedness = .signed, .bits = 128 } },  .{ .integer = .{ .signedness = .unsigned, .bits = 8 } },
         .{ .integer = .{ .signedness = .unsigned, .bits = 16 } }, .{ .integer = .{ .signedness = .unsigned, .bits = 32 } },
         .{ .integer = .{ .signedness = .unsigned, .bits = 64 } }, .{ .integer = .{ .signedness = .unsigned, .bits = 128 } },
-        .rune,
+        .rune,                                                    .string,
     };
     for (module.declarations.items, expected) |declaration, ty| {
         const node = module.source.ast.decl(declaration.node).ast.type_node;
@@ -834,6 +835,29 @@ test "explicit primitive types have canonical identities and widths" {
     }
     try std.testing.expect(!module.hasErrors());
     try ir.verify();
+}
+
+test "str spelling replaces the old primitive while string remains an ordinary alias name" {
+    try std.testing.expect(primitives.isPrimitive("str"));
+    try std.testing.expect(!primitives.isPrimitive("string"));
+    for ([_]bool{ false, true }) |aliased| {
+        var module = try Module.init(std.testing.allocator, "str-name.nov", if (aliased) "let string=str\nlet value:string" else "let value:string");
+        defer module.deinit();
+        var ir = Ir.init(std.testing.allocator);
+        defer ir.deinit();
+        const node = module.source.ast.decl(module.declarations.items[if (aliased) 1 else 0].node).ast.type_node;
+        const ty = try resolve(&module, &ir, node);
+        if (aliased) {
+            try std.testing.expectEqual(try ir.internType(.string), ty.?);
+            try std.testing.expect(!module.hasErrors());
+        } else {
+            try std.testing.expect(ty == null);
+            try std.testing.expectEqual(Module.Diagnostic.Tag.unknown_type, module.diagnostics.items[0].tag);
+        }
+    }
+    const source = "let text:str\nlet items:[]str\nlet f:(text:&mut str)->str";
+    try testResolve(std.testing.allocator, source);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testResolve, .{source});
 }
 
 test "float types aliases and TypeOf globals resolve without evaluating constants" {
@@ -1274,7 +1298,7 @@ test "TypeOf expressions reject invalid operators names arguments and bounded cy
 }
 
 fn testTypeOfValidationCase(allocator: std.mem.Allocator, expression: []const u8, expected: ?Module.Diagnostic.Tag) !void {
-    const source = try std.fmt.allocPrint(allocator, "let g:int=1\nlet E=enum{{one,two,}}\nlet U=union{{a:int,b,e:E,}}\nlet fn_value:()->int=missing\nlet take_ref:(r:&int)->int=missing\nlet no_body:(int:int)->int=missing\nlet R=struct{{let toString:(r:R)->string=missing\n}}\nlet query_result:@TypeOf({s})", .{expression});
+    const source = try std.fmt.allocPrint(allocator, "let g:int=1\nlet E=enum{{one,two,}}\nlet U=union{{a:int,b,e:E,}}\nlet fn_value:()->int=missing\nlet take_ref:(r:&int)->int=missing\nlet no_body:(int:int)->int=missing\nlet R=struct{{let toString:(r:R)->str=missing\n}}\nlet query_result:@TypeOf({s})", .{expression});
     defer allocator.free(source);
     var module = try Module.init(allocator, "typeof-validation.nov", source);
     defer module.deinit();

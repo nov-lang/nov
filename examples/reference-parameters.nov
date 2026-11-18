@@ -31,18 +31,18 @@ let total: (values: &[]int) -> int = {
     }
     result
 }
-let append: (values: &mut []string, value: string) = {
+let append: (values: &mut []str, value: str) = {
     values.* += [value]
 }
 let Record = struct {
-    name: string,
-    values: []string,
+    name: str,
+    values: []str,
 }
 let update: (record: &mut Record) = {
     record.*.name += "!"
     record.*.values += ["new"]
 }
-let suffix: (text: &mut string, ending: string) = {
+let suffix: (text: &mut str, ending: str) = {
     text.* += ending
 }
 let Tools = struct {
@@ -55,7 +55,7 @@ let main: () = {
     add(&a, 2)
     swap(&a, &b)
     @println("Swapped:", a, b, "Sum:", sum(&a, &b))
-    let mut words: []string = ["hello"]
+    let mut words: []str = ["hello"]
     append(&words, "world")
     suffix(&words[0], "!")
     @println("Words:", words)
@@ -112,7 +112,7 @@ let callbacks_closures_forwarding_recursion_and_pipes: () = {
 
 @[test]
 let managed_arrays_records_and_strings: () = {
-    let mut words: []string = ["old"]
+    let mut words: []str = ["old"]
     let saved = words
     append(&words, "tail")
     suffix(&words[0], "!")
@@ -123,7 +123,7 @@ let managed_arrays_records_and_strings: () = {
     update(&record)
     @assert(record.name == "record!" and @len(record.values) == 2)
     @assert(snapshot.name == "record" and @len(snapshot.values) == 1)
-    let mut other: []string = ["other"]
+    let mut other: []str = ["other"]
     swap(&words, &other)
     @assert(words[0] == "other" and other[0] == "old!")
 }
@@ -162,8 +162,8 @@ let argument_order_snapshots_actual_target: () = {
         }
     )
     @assert(text.* == "right" and left == "left!")
-    let mut first: []string = ["first"]
-    let mut second: []string = ["second"]
+    let mut first: []str = ["first"]
+    let mut second: []str = ["second"]
     let snapshot = first
     let mut items = &first
     append(

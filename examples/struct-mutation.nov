@@ -5,7 +5,7 @@ let State = enum {
 
 let Counter = struct {
     count: uint = 0,
-    label: string = "Counter",
+    label: str = "Counter",
     enabled: bool = false,
     state: State = .idle,
 }

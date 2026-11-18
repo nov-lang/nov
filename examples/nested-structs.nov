@@ -1,14 +1,14 @@
 let Location = struct {
-    city: string,
+    city: str,
     visits: uint = 0,
 }
 
 let Profile = struct {
-    name: string,
+    name: str,
     location: Location,
 
     @[stringify]
-    let toString: (self: Profile) -> string = {
+    let toString: (self: Profile) -> str = {
         "{self.name}: {self.location.city} ({self.location.visits})"
     }
 }

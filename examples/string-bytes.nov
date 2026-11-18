@@ -3,7 +3,7 @@
 ; String indices decode Unicode scalars as runes; negative int indices count from the end.
 ; @len(text) for a string counts scalars, not UTF-8 bytes or grapheme clusters.
 
-let head: (s: string) -> rune = s[0]
+let head: (s: str) -> rune = s[0]
 
 let main: () = {
     let mut text = "hello"

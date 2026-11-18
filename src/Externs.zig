@@ -529,7 +529,7 @@ test "extern namespace source free emission and rejected graphs survive every OO
             .{ .library = visible_library, .named = named, .root = exported_root, .export_count = 1, .references = 1 },
             .{ .library = "@[public]\n@[export(\"foreign_identity\")]\nlet visible: (x: i32) -> i32 = x", .named = named, .root = external_root, .export_count = 1, .references = 2 },
             .{ .library = hidden_library, .named = named, .root = "let main: () = @println(lib.hidden(1))", .rejected = true },
-            .{ .library = "@[extern(\"foreign_identity\")]\nlet hidden: (x: string) -> string", .named = named, .rejected = true, .diagnostic = .invalid_extern_signature },
+            .{ .library = "@[extern(\"foreign_identity\")]\nlet hidden: (x: str) -> str", .named = named, .rejected = true, .diagnostic = .invalid_extern_signature },
             .{ .library = visible_library, .named = named, .root = "@[extern(\"foreign_identity\")]\nlet local: (x: bool) -> i32\nlet main: () = {}", .rejected = true, .diagnostic = .conflicting_foreign_signature },
         }) |case| {
             try checkCase(std.testing.allocator, case);

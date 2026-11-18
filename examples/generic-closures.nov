@@ -41,7 +41,7 @@ let verifyDirect: () = {
     @assert(identity(true) and local(false) == false)
     @assert(identity("text") == "text")
     let number: uint = identity(42)
-    let callback: (string) -> string = local
+    let callback: (str) -> str = local
     @assert(number == 42 and callback("typed") == "typed")
     @assert(@as((bool) -> bool, identity)(true))
     @assert(
@@ -78,7 +78,7 @@ let verifyShared: () = {
     }
     let boolean: (bool) -> bool = next
     let again: (bool) -> bool = next
-    let text: (string) -> string = next
+    let text: (str) -> str = next
     @assert(next(@as(int, 7)) == 7 and count == 1)
     @assert(boolean(true) and count == 2)
     @assert(text("shared") == "shared" and count == 3)

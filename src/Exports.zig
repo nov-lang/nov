@@ -251,7 +251,7 @@ test "export namespace accepted and rejected graphs survive allocation failure s
             .{ .library = library, .exports = &exports, .named = named, .root = accepted_root },
             .{ .library = recursive_library, .exports = &recursive_exports, .named = named, .root = "let main: () = @println(lib.wrapper(2))" },
             .{ .library = library, .exports = &exports, .named = named, .root = "let main: () = @println(lib.hidden_exact(1))", .rejected = true },
-            .{ .library = "@[export(\"invalid_abi\")]\nlet unused: (x: string) -> string = x", .named = named, .rejected = true, .diagnostic = .invalid_export_signature },
+            .{ .library = "@[export(\"invalid_abi\")]\nlet unused: (x: str) -> str = x", .named = named, .rejected = true, .diagnostic = .invalid_export_signature },
         }) |case| {
             try checkCase(std.testing.allocator, case);
             try TestAllocations.checkAllAllocationFailures(std.testing.allocator, checkCase, .{case});

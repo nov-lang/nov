@@ -8,7 +8,7 @@ let Count = NativeCount
 let NativeCount = uint
 let Counts = []Count
 let Callback = (Count) -> Count
-let Text = string
+let Text = str
 let Unit = void
 
 let increment: (value: Count) -> Count = value + 1

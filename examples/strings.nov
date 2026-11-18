@@ -1,7 +1,7 @@
 ; Strings are immutable UTF-8, including on Windows.
-let greeting: string = "Hello"
+let greeting: str = "Hello"
 
-let decorate: (text: string) -> string = "[" + text + "]"
+let decorate: (text: str) -> str = "[" + text + "]"
 
 let main: () -> void = {
     let mut text = greeting + ", 世界!"

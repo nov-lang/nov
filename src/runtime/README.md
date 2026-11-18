@@ -398,7 +398,7 @@ syntax. Storage support does not grant equality, membership or printing: enums
 retain exact nominal equality/membership alongside existing scalar/string support;
 functions, unions, records, arrays and ranges reject comparisons/membership. Arrays
 print recursively when their elements are printable, using scalar/default aggregate
-formatting or exact `(SelfType) -> string` container methods marked `@[stringify]`.
+formatting or exact `(SelfType) -> str` container methods marked `@[stringify]`.
 Marked converters override a value at any depth and stop recursion; malformed or
 inaccessible marked methods reject rather than falling back. Cross-file converters
 require `@[public]`. An unmarked `toString` is an ordinary callable method, not a
@@ -486,7 +486,7 @@ See the main README for delivered source syntax and copy/evaluation contracts.
 
 ## Generated immutable strings
 
-Source-level `@len(text)` for a `string` scans UTF-8 without allocation and returns
+Source-level `@len(text)` for a `str` scans UTF-8 without allocation and returns
 its Unicode scalar count as native `uint`, not bytes or grapheme clusters. The
 internal byte length and real C fields below are unchanged by this source builtin.
 

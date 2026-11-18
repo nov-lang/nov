@@ -14,7 +14,7 @@ let Message = union {
     none,
 }
 let Record = struct {
-    label: string,
+    label: str,
     rows: []int,
 }
 

@@ -7,7 +7,7 @@ let contains: (start: uint, end: uint, target: uint) -> bool = loop i in start..
     false
 }
 
-let describe: (start: uint, end: uint, target: uint) -> string = loop i in start..=end {
+let describe: (start: uint, end: uint, target: uint) -> str = loop i in start..=end {
     if i == target {
         break "Found {i}"
     }

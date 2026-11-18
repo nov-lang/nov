@@ -5,7 +5,7 @@
 let identity: (value: `T) -> `T = value
 let identityAlias = identity
 let increment: (value: uint) -> uint = value + 1
-let text: (value: uint) -> string = "value:{value}"
+let text: (value: uint) -> str = "value:{value}"
 let answer: (value: uint) -> `U = 42
 
 let Box: (T: type) -> type = struct {
@@ -41,7 +41,7 @@ let receiver_and_callback: () = {
 @[test]
 let expected_and_argument_constraints: () = {
     let box = Box(uint).[ value = 42 ]
-    let mapped: Box(string) = box.map(text)
+    let mapped: Box(str) = box.map(text)
     let expected: Box(uint) = box.map(answer)
     let selected: uint = box.choose(identity, 0)
     @assert(mapped.value == "value:42" and selected == 42)
@@ -52,9 +52,9 @@ let expected_and_argument_constraints: () = {
 
 @[test]
 let contextual_identity: () = {
-    let box = Box(string).[ value = "unchanged" ]
+    let box = Box(str).[ value = "unchanged" ]
     @assert(box.map(identity).value == "unchanged")
-    let mapped: Box(string) = box.map(identityAlias)
+    let mapped: Box(str) = box.map(identityAlias)
     @assert(mapped.value == box.value)
     @assert(forward(true).value)
 }
@@ -69,8 +69,8 @@ let plain_nominal_and_static: () = {
 
 @[test]
 let byvalue_receiver_snapshot: () = {
-    let mut box = Box([]string).[ value = ["before"] ]
-    let saved: Box([]string) = box.map(
+    let mut box = Box([]str).[ value = ["before"] ]
+    let saved: Box([]str) = box.map(
         {
             box.value[0] = "after"
             identity

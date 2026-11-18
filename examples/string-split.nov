@@ -5,7 +5,7 @@
 
 let std = @import("std")
 
-let expect: (text: string, separator: string, wanted: []string) = {
+let expect: (text: str, separator: str, wanted: []str) = {
     let fields = std.string.split(text, separator)
     @assert(@len(fields) == @len(wanted))
     loop field, expected in fields, wanted {
@@ -50,7 +50,7 @@ let nonoverlap_unicode_nul_and_exact_matching: () = {
     @assert(fields[0][1..] == "😀" and fields[1][1] == '\u{301}')
 }
 
-let retained_fields: () -> []string = {
+let retained_fields: () -> []str = {
     let payload = "é😀::\0e\u{301}::"
     let mut source = "prefix:{payload}:suffix"
     let view = source[7..-7]
@@ -87,7 +87,7 @@ let retained_managed_views_and_array_copies: () = {
 let callee_and_arguments_once_left_to_right: () = {
     let mut events: int = 0
     let mut source = "a😀b"
-    let getSplit = () -> (string, string) -> []string {
+    let getSplit = () -> (str, str) -> []str {
         events = events * 10 + 1
         std.string.split
     }
@@ -105,11 +105,11 @@ let callee_and_arguments_once_left_to_right: () = {
     @assert(events == 123 and source == "replacement")
     @assert(@len(fields) == 2 and fields[0] == "a" and fields[1] == "b")
     events = 0
-    let text = () -> string {
+    let text = () -> str {
         events = events * 10 + 1
         ""
     }
-    let separator = () -> string {
+    let separator = () -> str {
         events = events * 10 + 2
         ","
     }

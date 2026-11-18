@@ -5,7 +5,7 @@ let std = @import("std")
 
 let Row = struct {
     key: int,
-    name: string,
+    name: str,
     values: [][]int,
 }
 
@@ -81,7 +81,7 @@ let stable_struct_keys_and_all_equal: () = {
 let strings_runes_and_finite_floats: () = {
     let words = std.array.sort(
         ["pear", "a", "fig", "bb"],
-        (a: string, b: string) -> bool {
+        (a: str, b: str) -> bool {
             @len(a) < @len(b)
         }
     )

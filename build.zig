@@ -156,6 +156,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const string_slice_tests = b.step("test-cli-string-slices", "Run immutable scalar string slicing CLI tests");
     addStringSliceCliTests(b, exe, string_slice_tests);
     test_step.dependOn(string_slice_tests);
+    const str_tests = b.step("test-cli-str", "Run renamed str type CLI tests");
+    addStrCliTests(b, exe, str_tests);
+    test_step.dependOn(str_tests);
     const integer_parsing_tests = b.step("test-cli-integer-parsing", "Run strict decimal integer parsing CLI tests");
     addIntegerParsingCliTests(b, exe, integer_parsing_tests);
     test_step.dependOn(integer_parsing_tests);
@@ -277,20 +280,20 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         \\let standard = @import("std")
         \\let Result = standard.Result
         \\
-        \\let R = Result(uint, string)
+        \\let R = Result(uint, str)
         \\let eager: () -> uint = { @print("E")
         \\    9 }
-        \\let recover: (error: string) -> uint = { @print("F")
+        \\let recover: (error: str) -> uint = { @print("F")
         \\    7 }
-        \\let text: (error: uint) -> string = "fallback:{error}"
-        \\let unit: () -> Result(void, string) = .ok[]
+        \\let text: (error: uint) -> str = "fallback:{error}"
+        \\let unit: () -> Result(void, str) = .ok[]
         \\let fromUnit: () -> R = { unit().!
         \\    .ok[3] }
         \\let main: () = {
         \\    let good: R = .ok[1]
         \\    let bad: R = .err["missing"]
         \\    @println(good.unwrapOr(eager()), bad.unwrapOr(9), good.unwrapOrElse(recover), bad.unwrapOrElse(recover))
-        \\    @println(Result(string, uint).err[2].unwrapOrElse(text))
+        \\    @println(Result(str, uint).err[2].unwrapOrElse(text))
         \\    @println(fromUnit().unwrapOr(0), match Result(uint, void).err[] {
         \\        .ok => |value| value
         \\        .err => @as(uint, 4)
@@ -318,26 +321,26 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     _ = fixtures.add("interpolation.nov", @embedFile("examples/interpolation.nov"));
     _ = fixtures.add("type-aliases.nov", @embedFile("examples/type-aliases.nov"));
     _ = fixtures.add("type.nov", @embedFile("examples/type.nov"));
-    _ = fixtures.add("enums.nov", "let Kind=enum{not_found,permission_denied,io,\n@[stringify]\nlet toString:(k:Kind)->string=match k{.not_found=>\"not_found\"\n.permission_denied | .io=>\"other\"}\n}\nlet Result:(T:type,E:type)->type=union{ok:T,err:E,}\nlet R=Result(uint,Kind)\nlet Error=struct{kind:Kind=.not_found,message:string,}\nlet fail:()->R=.err[.not_found]\nlet pass:()->R={let n=fail().!\n.ok[n]}\nlet main:()={let e=Error.[message=\"not \"+\"found\"]\n@println(e.kind,e.message,Kind.io!=.not_found,match pass(){.ok=>|n|\"{n}\"\n.err=>|k|\"{k}\"})}");
-    _ = fixtures.add("instance-methods.nov", "let K=enum{x,y,\nlet eql:(a:K,b:K)->bool=a==b\n}\nlet Alias=R\nlet R=struct{s:string,\nlet text:(r:Alias)->string=r.s\n}\nlet main:()={let k=K.x\n@println(Alias.[s=\"hel\"+\"lo\"].text(),k.eql(.x),K.y.eql(k))}");
+    _ = fixtures.add("enums.nov", "let Kind=enum{not_found,permission_denied,io,\n@[stringify]\nlet toString:(k:Kind)->str=match k{.not_found=>\"not_found\"\n.permission_denied | .io=>\"other\"}\n}\nlet Result:(T:type,E:type)->type=union{ok:T,err:E,}\nlet R=Result(uint,Kind)\nlet Error=struct{kind:Kind=.not_found,message:str,}\nlet fail:()->R=.err[.not_found]\nlet pass:()->R={let n=fail().!\n.ok[n]}\nlet main:()={let e=Error.[message=\"not \"+\"found\"]\n@println(e.kind,e.message,Kind.io!=.not_found,match pass(){.ok=>|n|\"{n}\"\n.err=>|k|\"{k}\"})}");
+    _ = fixtures.add("instance-methods.nov", "let K=enum{x,y,\nlet eql:(a:K,b:K)->bool=a==b\n}\nlet Alias=R\nlet R=struct{s:str,\nlet text:(r:Alias)->str=r.s\n}\nlet main:()={let k=K.x\n@println(Alias.[s=\"hel\"+\"lo\"].text(),k.eql(.x),K.y.eql(k))}");
     _ = fixtures.add("instance-signature.nov", "let R=struct{let bad:()->bool=true\n}\nlet main:()=R.[].bad()");
     _ = fixtures.add("enum-missing.nov", "let K=enum{x,y,}\nlet f:(k:K)->bool=match k{.x=>true}");
     _ = fixtures.add("enum-numbered.nov", "let K=enum{x=7,y,}");
     _ = fixtures.add("enum-backing.nov", "let K=enum(u8){x,}");
-    _ = fixtures.add("unions.nov", "let Alias=U\nlet U=union{ok:int,err:string,none,}\nlet describe:(u:Alias)->string=match u{.ok=>|v|\"ok:{v}\"\n.err=>|s|s\n.none=>\"none\"}\nlet main:()={@println(describe(U.ok[7]),describe(.err[\"a\"+\"b\"]),describe(.none[]))}");
+    _ = fixtures.add("unions.nov", "let Alias=U\nlet U=union{ok:int,err:str,none,}\nlet describe:(u:Alias)->str=match u{.ok=>|v|\"ok:{v}\"\n.err=>|s|s\n.none=>\"none\"}\nlet main:()={@println(describe(U.ok[7]),describe(.err[\"a\"+\"b\"]),describe(.none[]))}");
     _ = fixtures.add("union-missing.nov", "let U=union{ok:int,none,}\nlet f:(u:U)->int=match u{.ok=>|n|n}");
     _ = fixtures.add("union-duplicate.nov", "let U=union{ok:int,none,}\nlet f:(u:U)->int=match u{.ok=>0\n.ok=>1\n_=>2}");
     _ = fixtures.add("union-capture.nov", "let U=union{ok:int,none,}\nlet f:(u:U)->int=match u{.ok=>|n|n\n_=>n}");
-    _ = fixtures.add("generic-unions.nov", "let G:(T:type,E:type)->type=union{err:E,ok:T,}\nlet R=G(int,string)\nlet Text=G(string,string)\nlet make:(b:bool)->R={@print(\"M\")\nif b{.ok[7]}else{.err[\"b\"+\"ad\"]}}\nlet wrap:(b:bool)->Text={let n=make(b).!\n.ok[\"{n}\"]}\nlet show:(r:Text)->string=match r{.ok=>|s|s\n.err=>|s|s}\nlet main:()=@println(show(wrap(true)),show(wrap(false)))");
-    _ = fixtures.add("record-payloads.nov", "let G:(T:type,Failure:type)->type=union{ok:T,err:Failure,}\nlet U=union{ok:R,err:E,}\nlet R=struct{s:string,}\nlet E=struct{message:string,}\nlet make:(b:bool)->G(R,E)=if b{.ok[R.[s=\"o\"+\"k\"]]}else{.err[E.[message=\"e\"+\"rr\"]]}\nlet wrap:(b:bool)->G(bool,E)={let r=make(b).!\n.ok[r.s == \"ok\"]}\nlet show:(r:G(bool,E))->string=match r{.ok=>|b|\"{b}\"\n.err=>|e|e.message}\nlet main:()=@println(show(wrap(true)),show(wrap(false)),match U.ok[R.[s=\"record\"]]{.ok=>|r|r.s\n.err=>|e|e.message})");
-    _ = fixtures.add("record-interpolation.nov", "let G:(T:type,E:type)->type=union{ok:T,err:E,}\nlet Error=struct{s:string,\n@[stringify]\nlet toString:(err:Error)->string={@print(\"C\")\nerr.s+\"!\"}\n}\nlet fail:()->G(int,Error)=.err[Error.[s=\"not \"+\"found\"]]\nlet main:()=match fail(){.ok=>@panic(\"bad\")\n.err=>|err|@panic(\"Error: {err}\")}");
-    _ = fixtures.add("record-interpolation-missing.nov", "let R=struct{s:string,}\nlet f:(r:R)->string=\"{r}\"");
+    _ = fixtures.add("generic-unions.nov", "let G:(T:type,E:type)->type=union{err:E,ok:T,}\nlet R=G(int,str)\nlet Text=G(str,str)\nlet make:(b:bool)->R={@print(\"M\")\nif b{.ok[7]}else{.err[\"b\"+\"ad\"]}}\nlet wrap:(b:bool)->Text={let n=make(b).!\n.ok[\"{n}\"]}\nlet show:(r:Text)->str=match r{.ok=>|s|s\n.err=>|s|s}\nlet main:()=@println(show(wrap(true)),show(wrap(false)))");
+    _ = fixtures.add("record-payloads.nov", "let G:(T:type,Failure:type)->type=union{ok:T,err:Failure,}\nlet U=union{ok:R,err:E,}\nlet R=struct{s:str,}\nlet E=struct{message:str,}\nlet make:(b:bool)->G(R,E)=if b{.ok[R.[s=\"o\"+\"k\"]]}else{.err[E.[message=\"e\"+\"rr\"]]}\nlet wrap:(b:bool)->G(bool,E)={let r=make(b).!\n.ok[r.s == \"ok\"]}\nlet show:(r:G(bool,E))->str=match r{.ok=>|b|\"{b}\"\n.err=>|e|e.message}\nlet main:()=@println(show(wrap(true)),show(wrap(false)),match U.ok[R.[s=\"record\"]]{.ok=>|r|r.s\n.err=>|e|e.message})");
+    _ = fixtures.add("record-interpolation.nov", "let G:(T:type,E:type)->type=union{ok:T,err:E,}\nlet Error=struct{s:str,\n@[stringify]\nlet toString:(err:Error)->str={@print(\"C\")\nerr.s+\"!\"}\n}\nlet fail:()->G(int,Error)=.err[Error.[s=\"not \"+\"found\"]]\nlet main:()=match fail(){.ok=>@panic(\"bad\")\n.err=>|err|@panic(\"Error: {err}\")}");
+    _ = fixtures.add("record-interpolation-missing.nov", "let R=struct{s:str,}\nlet f:(r:R)->str=\"{r}\"");
     _ = fixtures.add("wide-record-payload.nov", "let U=union{ok:R,}\nlet R=struct{wide:i128,}\nlet f:(u:U)={}\nlet main:()={}");
     _ = fixtures.add("generic-cycle.nov", "let G:(T:type)->type=union{ok:G(T),}\nlet R=G(int)");
-    _ = fixtures.add("generic-methods.nov", "let Result:(T:type,E:type)->type=union{ok:T,err:E,\nlet Self=@This()\nlet unwrapOr:(self:Self,fallback:T)->T=match self{.ok=>|v|v\n.err=>fallback}\nlet unwrapOrElse:(self:Self,fallback:(E)->T)->T=match self{.ok=>|v|v\n.err=>|e|fallback(e)}\n}\nlet R=Result(int,string)\nlet cb:(e:string)->int={@print(e)\n7}\nlet main:()={let r:R=.err[\"E\"]\n@println(R.unwrapOr(r,3),r.unwrapOrElse(cb))}");
+    _ = fixtures.add("generic-methods.nov", "let Result:(T:type,E:type)->type=union{ok:T,err:E,\nlet Self=@This()\nlet unwrapOr:(self:Self,fallback:T)->T=match self{.ok=>|v|v\n.err=>fallback}\nlet unwrapOrElse:(self:Self,fallback:(E)->T)->T=match self{.ok=>|v|v\n.err=>|e|fallback(e)}\n}\nlet R=Result(int,str)\nlet cb:(e:str)->int={@print(e)\n7}\nlet main:()={let r:R=.err[\"E\"]\n@println(R.unwrapOr(r,3),r.unwrapOrElse(cb))}");
     _ = fixtures.add("generic-method.nov", "let G:(T:type)->type=union{ok:T,\nlet m=1\n}");
-    _ = fixtures.add("propagation-error.nov", "let G:(T:type,E:type)->type=union{ok:T,err:E,}\nlet f:(r:G(int,string))->G(int,bool)=.ok[r.!]");
-    _ = fixtures.add("wide-generic.nov", "let G:(T:type)->type=union{ok:T,err:string,}\nlet f:()->G(i128)=.ok[170141183460469231731687303715884105727]\nlet main:()={}");
+    _ = fixtures.add("propagation-error.nov", "let G:(T:type,E:type)->type=union{ok:T,err:E,}\nlet f:(r:G(int,str))->G(int,bool)=.ok[r.!]");
+    _ = fixtures.add("wide-generic.nov", "let G:(T:type)->type=union{ok:T,err:str,}\nlet f:()->G(i128)=.ok[170141183460469231731687303715884105727]\nlet main:()={}");
     _ = fixtures.add("wide-union.nov", "let U=union{ok:i128,none,}\nlet f:(u:U)={}\nlet main:()={}");
     _ = fixtures.add("wide-record.nov", "let R=struct{x:i128,}\nlet f:(r:R)= {}\nlet main:()={}\n");
     _ = fixtures.add("wide-record-alias.nov", "let Wide=u128\nlet Alias=R\nlet R=struct{x:Wide,}\nlet f:(r:Alias)= {}\nlet main:()={}\n");
@@ -370,10 +373,10 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
         \\let inferred_int = @as(Count, -42)
         \\let annotated_int: Count = @as(int, @as(Count, -42))
         \\let inferred_string = @as(Text, "hé\0")
-        \\let annotated_string: Text = @as(string, @as(Text, "hé\0"))
+        \\let annotated_string: Text = @as(str, @as(Text, "hé\0"))
         \\let Flag = bool
         \\let Count = int
-        \\let Text = string
+        \\let Text = str
         \\let main: () -> void = {
         \\    @println(inferred_bool, annotated_bool, inferred_int, annotated_int)
         \\    @println("{inferred_string}:{annotated_string}")
@@ -383,7 +386,7 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     _ = fixtures.add("annotated-global-mismatch.nov", "let n: uint = @as(int, 1)\n");
     _ = fixtures.add("annotated-global-nesting.nov", "let n: uint = @as(uint, @as(int, 1))\n");
     _ = fixtures.add("annotated-global-bounds.nov", "let n: u8 = @as(u8, 256)\n");
-    _ = fixtures.add("annotated-global-interpolation.nov", "let s: string = @as(string, \"{true}\")\n");
+    _ = fixtures.add("annotated-global-interpolation.nov", "let s: str = @as(str, \"{true}\")\n");
     _ = fixtures.add("global-untyped.nov", "let n = 1\n");
     _ = fixtures.add("global-bounds.nov", "let n = @as(u8, 256)\n");
     _ = fixtures.add("global-call.nov", "let n = @as(int, missing())\n");
@@ -391,13 +394,13 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     _ = fixtures.add("global-type.nov", "let n = @as(Missing, 1)\n");
     _ = fixtures.add("global-nesting.nov", "let n = @as(int, @as(uint, 1))\n");
     _ = fixtures.add("global-block.nov", "let n = @as(int, {1})\n");
-    _ = fixtures.add("global-interpolation.nov", "let n = @as(string, \"{true}\")\n");
+    _ = fixtures.add("global-interpolation.nov", "let n = @as(str, \"{true}\")\n");
     _ = fixtures.add("alias-value.nov", "let Count = uint\nlet f: (n: uint) = {}\nlet main: () = f(Count)\n");
     _ = fixtures.add("alias-cycle.nov", "let A = []B\nlet B = A\n");
     _ = fixtures.add("ascription.nov", "let main: () -> void = {\n    @println(\"{@as(int, 1)}\", @as(uint, 1))\n    let a = @as([]int, [2])\n    @println(a[0])\n}\n");
     _ = fixtures.add("interpolation-format.nov", "let main: () -> void = {let n: int = 1\n@println(\"{n:02}\")}\n");
     _ = fixtures.add("interpolation-name.nov", "let main: () -> void = @println(\"{missing}\")\n");
-    _ = fixtures.add("interpolation-global.nov", "let n: int = 1\nlet text: string = \"{n}\"\n");
+    _ = fixtures.add("interpolation-global.nov", "let n: int = 1\nlet text: str = \"{n}\"\n");
     _ = fixtures.add("inferred-locals.nov", @embedFile("examples/inferred-locals.nov"));
     _ = fixtures.add("inferred-integer.nov", "let main: () -> void = {let n = 1\n@println(n)}\n");
     _ = fixtures.add("inferred-empty-array.nov", "let main: () -> void = {let a = []\n}\n");
@@ -439,7 +442,7 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     _ = fixtures.add("return-invalid.nov", "let main: () -> void = return true\n");
     _ = fixtures.add("return-unreachable.nov", "let main: () -> void = {return @println(true)\n@println(false)}\n");
     _ = fixtures.add("if-invalid.nov", "let main: () -> void = if true {} else {@println(missing)}\n");
-    _ = fixtures.add("source-panic.nov", "let message: () -> string = {@print(\"before\")\n\"hé\\0\" + \"!\"}\n@[noreturn]\nlet stop: (s: string) -> void = @panic(s)\nlet main: () = stop(\"{message()}\")\n");
+    _ = fixtures.add("source-panic.nov", "let message: () -> str = {@print(\"before\")\n\"hé\\0\" + \"!\"}\n@[noreturn]\nlet stop: (s: str) -> void = @panic(s)\nlet main: () = stop(\"{message()}\")\n");
     _ = fixtures.add("panic-program.nov", "let zero: i32 = 0\nlet divide: () -> i32 = 1 / zero\nlet main: () -> void = @println(divide())\n");
 
     const Case = struct {
@@ -638,10 +641,10 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     }
 
     const stdin_cases = [_]struct { source: []const u8, check: bool = false, output: []const u8 = "", diagnostic: ?[]const u8 = null, code: u8 = 0 }{
-        .{ .source = "let f:(r:R)->string=r.next(1).text()", .output = "let f: (r: R) -> string = r.next(1).text()\n" },
+        .{ .source = "let f:(r:R)->str=r.next(1).text()", .output = "let f: (r: R) -> str = r.next(1).text()\n" },
         .{ .source = "let K=enum{not_found,io,}\nlet E=struct{k:K=.not_found,}\nlet f:()->K=K.io", .output = "let K = enum {\n    not_found,\n    io,\n}\nlet E = struct {\n    k: K = .not_found,\n}\nlet f: () -> K = K.io\n" },
-        .{ .source = "let U=union{ok:R,}\nlet R=struct{s:string,}\nlet f:()->U=.ok[R.[s=\"ok\"]]", .output = "let U = union {\n    ok: R,\n}\nlet R = struct {\n    s: string,\n}\nlet f: () -> U = .ok[R.[ s = \"ok\" ]]\n" },
-        .{ .source = "let G:(T:type)->type=union{ok:T,err:string,}\nlet R=G(int)\nlet f:(r:R)->R=.ok[r.!]", .output = "let G: (T: type) -> type = union {\n    ok: T,\n    err: string,\n}\nlet R = G(int)\nlet f: (r: R) -> R = .ok[r.!]\n" },
+        .{ .source = "let U=union{ok:R,}\nlet R=struct{s:str,}\nlet f:()->U=.ok[R.[s=\"ok\"]]", .output = "let U = union {\n    ok: R,\n}\nlet R = struct {\n    s: str,\n}\nlet f: () -> U = .ok[R.[ s = \"ok\" ]]\n" },
+        .{ .source = "let G:(T:type)->type=union{ok:T,err:str,}\nlet R=G(int)\nlet f:(r:R)->R=.ok[r.!]", .output = "let G: (T: type) -> type = union {\n    ok: T,\n    err: str,\n}\nlet R = G(int)\nlet f: (r: R) -> R = .ok[r.!]\n" },
         .{ .source = "let U=union{ok:int,none,}\nlet f:(u:U)->int=match u{.ok=>|v|v\n.none=>0}", .output = "let U = union {\n    ok: int,\n    none,\n}\nlet f: (u: U) -> int = match u {\n    .ok => |v| v\n    .none => 0\n}\n" },
         .{ .source = "let standard=@import(\"std\")\nlet file=@import(\"./a/../file.nov\")", .output = "let standard = @import(\"std\")\nlet file = @import(\"./a/../file.nov\")\n" },
         .{ .source = "let x=1", .output = "let x = 1\n" },
@@ -1433,7 +1436,7 @@ fn addLenCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.B
         \\let empty = @len(@as([]int, []))
         \\let main: () = {
         \\    let mut calls: int = 0
-        \\    let make = () -> string {calls += 1
+        \\    let make = () -> str {calls += 1
         \\        "é😀\0"}
         \\    let mut rows = [[1, 2], [3]]
         \\    let alias = &rows
@@ -1672,9 +1675,9 @@ fn addStringByteCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step:
     const assignment = "assignment target must be a mutable local, its struct field path, or its scalar-array element";
     const borrow = "local references require &local or &localArray[index] and explicit p.* access";
     for ([_]struct { name: []const u8, source: []const u8, diagnostic: []const u8 }{
-        .{ .name = "result-uint", .source = "let byte: (text: string) -> uint = text[0]\n", .diagnostic = mismatch },
-        .{ .name = "result-u8", .source = "let byte: (text: string) -> u8 = text[0]\n", .diagnostic = mismatch },
-        .{ .name = "index-uint", .source = "let scalar: (text: string, index: uint) -> rune = text[index]\n", .diagnostic = mismatch },
+        .{ .name = "result-uint", .source = "let byte: (text: str) -> uint = text[0]\n", .diagnostic = mismatch },
+        .{ .name = "result-u8", .source = "let byte: (text: str) -> u8 = text[0]\n", .diagnostic = mismatch },
+        .{ .name = "index-uint", .source = "let scalar: (text: str, index: uint) -> rune = text[index]\n", .diagnostic = mismatch },
         .{ .name = "equality-integer", .source = "let main: () = @assert(\"a\"[0] == 97)\n", .diagnostic = "literal does not match the annotated type" },
         .{ .name = "write", .source = "let main: () = {let mut text = \"a\"\ntext[0] = 'b'}\n", .diagnostic = assignment },
         .{ .name = "compound", .source = "let main: () = {let mut text = \"a\"\ntext[0] += 1}\n", .diagnostic = assignment },
@@ -1771,17 +1774,17 @@ fn addStringSliceCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step
     const literal = "literal does not match the annotated type";
 
     for ([_]struct { name: []const u8, source: []const u8, diagnostic: []const u8 }{
-        .{ .name = "start-uint", .source = "let f: (s: string, n: uint) -> string = s[n..]\n", .diagnostic = mismatch },
-        .{ .name = "end-uint", .source = "let f: (s: string, n: uint) -> string = s[..n]\n", .diagnostic = mismatch },
-        .{ .name = "start-i8", .source = "let f: (s: string, n: i8) -> string = s[n..]\n", .diagnostic = mismatch },
-        .{ .name = "end-u8", .source = "let f: (s: string, n: u8) -> string = s[..n]\n", .diagnostic = mismatch },
-        .{ .name = "start-rune", .source = "let f: (s: string) -> string = s['a'..]\n", .diagnostic = literal },
-        .{ .name = "end-bool", .source = "let f: (s: string) -> string = s[..true]\n", .diagnostic = literal },
-        .{ .name = "result-rune", .source = "let f: (s: string) -> rune = s[..]\n", .diagnostic = mismatch },
-        .{ .name = "inclusive-end-uint", .source = "let f: (s: string, n: uint) -> string = s[..=n]\n", .diagnostic = mismatch },
-        .{ .name = "inclusive-start-uint", .source = "let f: (s: string, n: uint) -> string = s[n..=]\n", .diagnostic = mismatch },
-        .{ .name = "inclusive-array", .source = "let f: (s: []u8) -> string = s[..=1]\n", .diagnostic = "slicing requires a string value" },
-        .{ .name = "array", .source = "let f: (s: []u8) -> string = s[..]\n", .diagnostic = "slicing requires a string value" },
+        .{ .name = "start-uint", .source = "let f: (s: str, n: uint) -> str = s[n..]\n", .diagnostic = mismatch },
+        .{ .name = "end-uint", .source = "let f: (s: str, n: uint) -> str = s[..n]\n", .diagnostic = mismatch },
+        .{ .name = "start-i8", .source = "let f: (s: str, n: i8) -> str = s[n..]\n", .diagnostic = mismatch },
+        .{ .name = "end-u8", .source = "let f: (s: str, n: u8) -> str = s[..n]\n", .diagnostic = mismatch },
+        .{ .name = "start-rune", .source = "let f: (s: str) -> str = s['a'..]\n", .diagnostic = literal },
+        .{ .name = "end-bool", .source = "let f: (s: str) -> str = s[..true]\n", .diagnostic = literal },
+        .{ .name = "result-rune", .source = "let f: (s: str) -> rune = s[..]\n", .diagnostic = mismatch },
+        .{ .name = "inclusive-end-uint", .source = "let f: (s: str, n: uint) -> str = s[..=n]\n", .diagnostic = mismatch },
+        .{ .name = "inclusive-start-uint", .source = "let f: (s: str, n: uint) -> str = s[n..=]\n", .diagnostic = mismatch },
+        .{ .name = "inclusive-array", .source = "let f: (s: []u8) -> str = s[..=1]\n", .diagnostic = "slicing requires a string value" },
+        .{ .name = "array", .source = "let f: (s: []u8) -> str = s[..]\n", .diagnostic = "slicing requires a string value" },
         .{ .name = "write", .source = "let main: () = {let mut s = \"abc\"\ns[..] = \"x\"}\n", .diagnostic = "assignment target must be a mutable local, its struct field path, or its scalar-array element" },
     }) |case| {
         const source = b.fmt("invalid-{s}.nov", .{case.name});
@@ -1859,7 +1862,7 @@ fn addRuneCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.
         .{ .name = "integer-to-rune", .source = "let value: rune = 97\n" },
         .{ .name = "rune-to-integer", .source = "let value: u32 = 'a'\n" },
         .{ .name = "string-to-rune", .source = "let value: rune = \"a\"\n" },
-        .{ .name = "rune-to-string", .source = "let value: string = 'a'\n" },
+        .{ .name = "rune-to-string", .source = "let value: str = 'a'\n" },
         .{ .name = "argument", .source = "let f: (x: rune) = {}\nlet main: () = f(97)\n" },
         .{ .name = "return", .source = "let f: () -> rune = 97\n" },
         .{ .name = "array", .source = "let main: () = {let values: []rune = [97]}\n" },
@@ -1963,7 +1966,7 @@ fn addLanguageTestCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_ste
         "@[test]\nlet nonzero: () = exit(7)\n" ++
         "@[test]\nlet after: () = {}\n");
     _ = fixtures.add("eager.nov", "let condition: () -> bool = {@print(\"C\")\ntrue}\n" ++
-        "let message: () -> string = {@print(\"M\")\n\"unused\"}\n" ++
+        "let message: () -> str = {@print(\"M\")\n\"unused\"}\n" ++
         "@[test]\nlet eager: () = {let unit: void = @assert(condition(), message())\n@assert(true)\n@print(\"T\")}\n");
     _ = fixtures.add("isolation.nov", "@[extern]\nlet rand: () -> i32\n@[extern]\nlet srand: (seed: u32)\n" ++
         "@[test]\nlet first: () = {let initial = rand()\nsrand(1)\n@assert(rand() == initial)}\n" ++
@@ -2342,7 +2345,7 @@ fn addTypeOfExpressionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test
                 run.expectStdOutEqual(if (std.mem.eql(u8, command, "test"))
                     "PASS literals_calls_fields_and_indices\nPASS arrays_slices_blocks_if_and_match\nPASS operands_do_not_execute_or_store\nPASS references_borrows_and_type_only_captures\nPASS closures_and_inferred_generic_calls\n5 passed; 0 failed; 5 total\n"
                 else
-                    b.fmt("Literals: i{0d} f64 rune\nExpressions: i{0d} i{0d} string\nGeneric: []string\n", .{@bitSizeOf(usize)}));
+                    b.fmt("Literals: i{0d} f64 rune\nExpressions: i{0d} i{0d} str\nGeneric: []str\n", .{@bitSizeOf(usize)}));
                 run.expectStdErrEqual("");
                 test_step.dependOn(&run.step);
             }
@@ -2531,7 +2534,7 @@ fn addGenericFunctionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_
         \\        value
         \\    }
         \\    let typed: (bool) -> bool = local
-        \\    let captured: (string) -> string = closure
+        \\    let captured: (str) -> str = closure
         \\    @assert(local(true) and closure(false) == false and typed(true))
         \\    @assert(captured("local") == "local")
         \\}
@@ -2584,12 +2587,12 @@ fn addGenericFunctionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_
         \\let secret: uint = 100
         \\let apply: (f: (`T) -> `U, x: `T) -> `U = f(x)
         \\let verifyCallbacks: () = {
-        \\    let cb: (string) -> string = library.identity
+        \\    let cb: (str) -> str = library.identity
         \\    let alias: (uint, uint) -> uint = sum
         \\    let ns: (bool) -> bool = method
-        \\    let static: (string, uint) -> string = library.G(uint).call
+        \\    let static: (str, uint) -> str = library.G(uint).call
         \\    let exposed: (bool) -> bool = library.exposed
-        \\    let read: (string) -> uint = library.read
+        \\    let read: (str) -> uint = library.read
         \\    @assert(cb("callback") == "callback" and alias(20, 22) == 42)
         \\    @assert(ns(true) and exposed(true) and read("scope") == 9)
         \\    @assert(static("static", 1) == "static")
@@ -2602,7 +2605,7 @@ fn addGenericFunctionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_
         \\    let a: uint = sum(1, 2)
         \\    let b = library.add(@as(uint, 3), 4)
         \\    let c: uint = same.alias(5, 6)
-        \\    let box: api.Box(string) = library.identity(same.Box(string).[ value = "canonical" ])
+        \\    let box: api.Box(str) = library.identity(same.Box(str).[ value = "canonical" ])
         \\    @println(a, b, c, method(true), library.NS.id(false), box.value)
         \\    @println(library.read("scope"), library.G(uint).call("sibling", 1))
         \\    verifyCallbacks()
@@ -2811,7 +2814,7 @@ fn addMutableMethodCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_st
         \\same.Box(u8).set(&b,3)
         \\let p=&b
         \\p.set(3)
-        \\let result:string=forward(p,"generic")
+        \\let result:str=forward(p,"generic")
         \\@assert(p.echo(result)=="generic" and p.read()==4 and readonly(p)==4)
         \\let fixed=Alias.[value=7]
         \\let r=&fixed
@@ -3109,7 +3112,7 @@ fn addGenericStructCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_st
         \\
         \\    @[public]
         \\    @[stringify]
-        \\    let toString: (self: Self) -> string = "<{self.value}>"
+        \\    let toString: (self: Self) -> str = "<{self.value}>"
         \\}
         \\
     );
@@ -3118,14 +3121,14 @@ fn addGenericStructCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_st
         \\let api = @import("generic-struct-api.nov")
         \\let library = @import("generic-struct-library.nov")
         \\let Box = api.Box
-        \\let B = Box(string)
+        \\let B = Box(str)
         \\
         \\let main: () = {
-        \\    let mut x: B = library.Box(string).[ value = "a" + "b" ]
+        \\    let mut x: B = library.Box(str).[ value = "a" + "b" ]
         \\    let copy = x
         \\    x.value += "!"
         \\    let nested = Box(B).[ value = x ]
-        \\    let values: []Box(string) = [copy, B.make("new" + "!")]
+        \\    let values: []Box(str) = [copy, B.make("new" + "!")]
         \\    @println(nested, values[0].get(), values[1])
         \\}
         \\
@@ -3232,7 +3235,7 @@ fn addUnionArrayCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step:
         .{ .name = "reference-payload", .source = "let U=union{value:&int,}\nlet f:(x:U)={}", .diagnostic = "not supported" },
         .{ .name = "reference-escape", .source = "let bad:()->&int={let mut value=1\n&value}\nlet main:()={}", .diagnostic = "reference" },
         .{ .name = "wrong-array-payload", .source = "let U=union{items:[]int,}\nlet f:()->U=.items[[true]]", .diagnostic = "error:" },
-        .{ .name = "propagation-error-type", .source = "let std=@import(\"std\")\nlet f:(x:std.Result([]int,[]string))->std.Result([]int,[]bool)=.ok[x.!]", .diagnostic = "error:" },
+        .{ .name = "propagation-error-type", .source = "let std=@import(\"std\")\nlet f:(x:std.Result([]int,[]str))->std.Result([]int,[]bool)=.ok[x.!]", .diagnostic = "error:" },
     }) |case| {
         const source = b.fmt("invalid-union-array-{s}.nov", .{case.name});
         _ = fixtures.add(source, case.source);
@@ -3260,11 +3263,11 @@ fn addNestedUnionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step
         \\let api = @import("api.nov")
         \\let verify: () = {
         \\    let value: api.Nested = .some[.ok[7]]
-        \\    let canonical: standard.Option(result.Result(int, string)) = value
-        \\    let direct: option.Option(standard.Result(int, string)) = canonical
+        \\    let canonical: standard.Option(result.Result(int, str)) = value
+        \\    let direct: option.Option(standard.Result(int, str)) = canonical
         \\    @assert(direct.unwrapOr(.err["missing"]).unwrapOr(0) == 7)
         \\    let reverse: api.Reverse = .ok[.some[8]]
-        \\    let same: result.Result(option.Option(int), string) = reverse
+        \\    let same: result.Result(option.Option(int), str) = reverse
         \\    @assert(same.unwrapOr(.none[]).unwrapOr(0) == 8)
         \\}
         \\@[test]
@@ -3277,9 +3280,9 @@ fn addNestedUnionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step
         \\let option = @import("lib/option.nov")
         \\let result = @import("lib/./result.nov")
         \\@[public]
-        \\let Nested = option.Option(standard.Result(int, string))
+        \\let Nested = option.Option(standard.Result(int, str))
         \\@[public]
-        \\let Reverse = result.Result(standard.Option(int), string)
+        \\let Reverse = result.Result(standard.Option(int), str)
         \\
     ;
     _ = fixtures.add("nested-unions.nov", @embedFile("examples/nested-unions.nov"));
@@ -3335,8 +3338,8 @@ fn addNestedUnionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step
         .{ .name = "nominal-inner", .source = "let A=union{some:int,none,}\nlet B=union{some:int,none,}\nlet U=union{inner:A,}\nlet b:B=.some[1]\nlet f:()->U=.inner[b]", .diagnostic = "error:" },
         .{ .name = "nested-error-exact", .source = "let A=union{bad:int,}\nlet B=union{bad:int,}\nlet f:(x:std.Result(int,std.Option(A)))->std.Result(int,std.Option(B))=.ok[x.!]", .diagnostic = "error:" },
         .{ .name = "nested-error-element", .source = "let f:(x:std.Result(int,std.Option(int)))->std.Result(int,std.Option(bool))=.ok[x.!]", .diagnostic = "error:" },
-        .{ .name = "option-to-result", .source = "let f:(x:std.Option(std.Result(int,string)))->std.Result(int,string)=x.!", .diagnostic = "error:" },
-        .{ .name = "result-to-option", .source = "let f:(x:std.Result(std.Option(int),string))->std.Option(int)=x.!", .diagnostic = "error:" },
+        .{ .name = "option-to-result", .source = "let f:(x:std.Option(std.Result(int,str)))->std.Result(int,str)=x.!", .diagnostic = "error:" },
+        .{ .name = "result-to-option", .source = "let f:(x:std.Result(std.Option(int),str))->std.Option(int)=x.!", .diagnostic = "error:" },
         .{ .name = "struct-union-cycle", .source = "let Inner=union{some:S,none,}\nlet S=struct{inner:Inner,}\nlet U=union{record:S,none,}\nlet f:(x:U)={}", .diagnostic = "cyclic" },
         .{ .name = "nested-function-reference", .source = "let Inner=union{value:&()->int,none,}\nlet U=union{inner:Inner,none,}\nlet f:(x:U)={}", .diagnostic = "not supported" },
         .{ .name = "nested-range-reference", .source = "let Inner=union{value:&@TypeOf(1..3),none,}\nlet U=union{inner:Inner,none,}\nlet f:(x:U)={}", .diagnostic = "not supported" },
@@ -3705,6 +3708,66 @@ fn addArrayHelperCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step
     }
 }
 
+fn addStrCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    const fixtures = b.addWriteFiles();
+    const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
+    _ = fixtures.add("str.nov",
+        \\let std=@import("std")
+        \\let Label=struct{value:str,
+        \\@[stringify]
+        \\let render:(self:Label)->str=self.value
+        \\}
+        \\let Keyed=struct{string:str,}
+        \\let main:()={let mut value:str="a"
+        \\let p=&value
+        \\p.*+="b"
+        \\let items:[]str=[p.*]
+        \\@println(str,@TypeOf(value),@TypeOf(p),@TypeOf(items))
+        \\@println(Label.[value=p.*],std.string.parseInt("42").unwrapOr(0))
+        \\let keyed=Keyed.[string="string"]
+        \\@println(keyed.string)}
+        \\
+    );
+    _ = fixtures.add("alias.nov", "let string=str\nlet text:string=\"string\"\nlet main:()=@println(@TypeOf(text),text)\n");
+    for ([_][]const u8{ "str.nov", "alias.nov" }) |source| {
+        const check = b.addRunArtifact(exe);
+        check.setCwd(fixtures.getDirectory());
+        check.addArgs(&.{ "check", "--semantic", source, "--lib-dir" });
+        check.addDirectoryArg(library);
+        check.expectExitCode(0);
+        check.expectStdOutEqual("");
+        check.expectStdErrEqual("");
+        test_step.dependOn(&check.step);
+        for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+            const run = b.addRunArtifact(exe);
+            run.setCwd(fixtures.getDirectory());
+            run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+            run.setEnvironmentVariable("NOV_CC", "");
+            run.setEnvironmentVariable("CC", "");
+            run.addArgs(&.{ "run", source, "--lib-dir" });
+            run.addDirectoryArg(library);
+            if (mode.len != 0) run.addArg(mode);
+            run.expectExitCode(0);
+            run.expectStdOutEqual(if (std.mem.eql(u8, source, "str.nov")) "str str &mut str []str\nab 42\nstring\n" else "str string\n");
+            run.expectStdErrEqual("");
+            test_step.dependOn(&run.step);
+        }
+    }
+    for ([_][]const u8{ "let value:string=\"x\"", "let value:[]string=[]", "let f:(text:string)->str=text" }, 0..) |source, i| {
+        const path = b.fmt("old-string-{d}.nov", .{i});
+        _ = fixtures.add(path, source);
+        for ([_]bool{ false, true }) |emit| {
+            const reject = b.addRunArtifact(exe);
+            reject.setCwd(fixtures.getDirectory());
+            reject.addArgs(if (emit) &.{ "emit-c", path } else &.{ "check", "--semantic", path });
+            reject.expectExitCode(1);
+            reject.expectStdOutEqual("");
+            reject.expectStdErrMatch("unknown type 'string'");
+            test_step.dependOn(&reject.step);
+        }
+    }
+}
+
 fn addIntegerParsingCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     const fixtures = b.addWriteFiles();
     const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
@@ -3713,8 +3776,8 @@ fn addIntegerParsingCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_s
         \\let std=@import("std")
         \\let direct=@import("lib/string.nov")
         \\let other=@import("lib/./string.nov")
-        \\let verify:()={let signed:(string)->std.Result(int,other.ParseIntError)=direct.parseInt
-        \\let unsigned:(string)->std.Result(uint,direct.ParseIntError)=std.string.parseUint
+        \\let verify:()={let signed:(str)->std.Result(int,other.ParseIntError)=direct.parseInt
+        \\let unsigned:(str)->std.Result(uint,direct.ParseIntError)=std.string.parseUint
         \\@assert(signed("-42").unwrapOr(0)==-42 and unsigned("+7").unwrapOr(0)==7)
         \\let result:std.Result(int,direct.ParseIntError)=other.parseInt("bad")
         \\@assert(match result{.ok=>false
@@ -3810,8 +3873,8 @@ fn addStringSearchCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_ste
         \\    let endsWith = other.endsWith
         \\    let find = other.find
         \\    let contains = direct.contains
-        \\    let search: (string, string) -> option.Option(uint) = find
-        \\    let locate: (string, string) -> alternate.Option(uint) = standard.string.find
+        \\    let search: (str, str) -> option.Option(uint) = find
+        \\    let locate: (str, str) -> alternate.Option(uint) = standard.string.find
         \\    let found: standard.Option(uint) = search("é😀z", "😀")
         \\    let index: standard.Option(uint) = locate("banana", "ana")
         \\    @assert(found.unwrapOr(99) == 1 and index.unwrapOr(99) == 1)
@@ -3909,10 +3972,10 @@ fn addStringConversionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test
         \\let alternate = @import("lib/./string.nov")
         \\let result = @import("lib/result.nov")
         \\let verify: () = {
-        \\    let encode: (string) -> []u8 = direct.toBytes
-        \\    let decode: ([]u8) -> standard.Result(string, alternate.Utf8Error) = alternate.fromBytes
+        \\    let encode: (str) -> []u8 = direct.toBytes
+        \\    let decode: ([]u8) -> standard.Result(str, alternate.Utf8Error) = alternate.fromBytes
         \\    let bytes = encode("Aé😀\0")
-        \\    let text: result.Result(string, direct.Utf8Error) = decode(bytes)
+        \\    let text: result.Result(str, direct.Utf8Error) = decode(bytes)
         \\    @assert(text.unwrapOr("bad") == "Aé😀\0" and @len(bytes) == 8)
         \\    @assert(standard.string.fromBytes(direct.toBytes("é")).unwrapOr("") == "é")
         \\    @assert(alternate.fromBytes(standard.string.toBytes("😀")).unwrapOr("") == "😀")
@@ -4049,9 +4112,9 @@ fn addStringTransformCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_
         \\let alternate = @import("lib/./string.nov")
         \\let api = @import("api.nov")
         \\let verify: () = {
-        \\    let trim: (string) -> string = direct.trim
-        \\    let replace: (string, string, string) -> string = alternate.replace
-        \\    let repeat: (string, uint) -> string = api.repeat
+        \\    let trim: (str) -> str = direct.trim
+        \\    let replace: (str, str, str) -> str = alternate.replace
+        \\    let repeat: (str, uint) -> str = api.repeat
         \\    @assert(trim(" \u{3000}é😀\0\t") == "é😀\0")
         \\    @assert(replace("é\0é", "é", "😀") == "😀\0😀")
         \\    @assert(repeat("é\0", 2) == "é\0é\0")
@@ -4147,9 +4210,9 @@ fn addStringTransformCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_
         .{ .name = "repeat-negative", .expression = "std.string.repeat(\"x\",-1)" },
         .{ .name = "repeat-missing", .expression = "std.string.repeat(\"x\")" },
         .{ .name = "repeat-extra", .expression = "std.string.repeat(\"x\",2,3)" },
-        .{ .name = "trim-function", .expression = "@as((string)->uint,std.string.trim)" },
-        .{ .name = "replace-function", .expression = "@as((string,string,rune)->string,std.string.replace)" },
-        .{ .name = "repeat-function", .expression = "@as((string,int)->string,std.string.repeat)" },
+        .{ .name = "trim-function", .expression = "@as((str)->uint,std.string.trim)" },
+        .{ .name = "replace-function", .expression = "@as((str,str,rune)->str,std.string.replace)" },
+        .{ .name = "repeat-function", .expression = "@as((str,int)->str,std.string.repeat)" },
     }) |case| {
         const source = b.fmt("invalid-transform-{s}.nov", .{case.name});
         _ = fixtures.add(source, b.fmt("let std=@import(\"std\")\nlet main:()={{let value={s}\n}}\n", .{case.expression}));
@@ -4168,7 +4231,7 @@ fn addStringTransformCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_
         const source = b.fmt("panic-replace-{d}.nov", .{index});
         _ = fixtures.add(source, b.fmt(
             "let std=@import(\"std\")\n" ++
-                "let callee:()->(string,string,string)->string={{@print(\"C\")\nstd.string.replace}}\n" ++
+                "let callee:()->(str,str,str)->str={{@print(\"C\")\nstd.string.replace}}\n" ++
                 "let verify:()={{let value=callee()({{@print(\"T\")\n{s}}},{{@print(\"P\")\n\"\"}},{{@print(\"R\")\n\"replacement\"}})\n@println(\"unreachable\",value)}}\n" ++
                 "@[test]\nlet empty_pattern:()=verify()\nlet main:()=verify()\n",
             .{text},
@@ -4202,7 +4265,7 @@ fn addCollectionHelperCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test
         \\let arrays = @import("lib/array.nov")
         \\let alternate = @import("lib/./array.nov")
         \\let verify: () = {
-        \\    let join: ([]string, string) -> string = strings.join
+        \\    let join: ([]str, str) -> str = strings.join
         \\    let take: ([]int, uint) -> []int = arrays.take
         \\    let drop: ([]int, uint) -> []int = alternate.drop
         \\    let findLast: ([]int, (int) -> bool) -> std.Option(int) = arrays.findLast
@@ -4315,7 +4378,7 @@ fn addStringSplitCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step
         \\let direct = @import("lib/string.nov")
         \\let alternate = @import("lib/./string.nov")
         \\let verify: () = {
-        \\    let split: (string, string) -> []string = direct.split
+        \\    let split: (str, str) -> []str = direct.split
         \\    let other = alternate.split
         \\    let fields = split("é😀x\0e\u{301}😀x", "😀x")
         \\    @assert(@len(fields) == 3 and fields[0] == "é" and fields[1] == "\0e\u{301}" and fields[2] == "")
@@ -4386,15 +4449,15 @@ fn addStringSplitCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step
         _ = fixtures.add(source, b.fmt(
             \\let std = @import("std")
             \\let main: () = {{
-            \\    let callee = () -> (string, string) -> []string {{
+            \\    let callee = () -> (str, str) -> []str {{
             \\        @println("callee")
             \\        std.string.split
             \\    }}
-            \\    let text = () -> string {{
+            \\    let text = () -> str {{
             \\        @println("text")
             \\        "{s}"
             \\    }}
-            \\    let separator = () -> string {{
+            \\    let separator = () -> str {{
             \\        @println("separator")
             \\        ""
             \\    }}
@@ -4477,7 +4540,7 @@ fn addArrayDefaultCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_ste
     const fixtures = b.addWriteFiles();
     const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
     _ = fixtures.add("array-defaults.nov", @embedFile("examples/array-defaults.nov"));
-    _ = fixtures.add("defaults.nov", "@[public]\nlet R=struct{values:[][]string=[[\"é\\0\"],[]],}\n@[public]\nlet Buffer:(T:type)->type=struct{values:[]T=[],}\n");
+    _ = fixtures.add("defaults.nov", "@[public]\nlet R=struct{values:[][]str=[[\"é\\0\"],[]],}\n@[public]\nlet Buffer:(T:type)->type=struct{values:[]T=[],}\n");
     _ = fixtures.add("imported.nov",
         \\let api=@import("defaults.nov")
         \\let alias=@import("./defaults.nov")
@@ -4845,19 +4908,19 @@ fn addContainerMapCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_ste
         \\let Result = standard.Result
         \\let verify: () = {
         \\    let some: api.IntOption = .some[4]
-        \\    let mapped: standard.Option(string) = Option(int).map(some, (x) { "value:{x}" })
+        \\    let mapped: standard.Option(str) = Option(int).map(some, (x) { "value:{x}" })
         \\    @assert(mapped.unwrapOr("") == "value:4")
         \\    @assert(some.map((x) { x + 1 }).unwrapOr(0) == 5)
-        \\    let good: directResult.Result(int, string) = .ok[4]
+        \\    let good: directResult.Result(int, str) = .ok[4]
         \\    let bad: api.IntResult = .err["bad"]
-        \\    let text: standard.Result(string, string) = Result(int, string).map(good, (x) { "ok:{x}" })
+        \\    let text: standard.Result(str, str) = Result(int, str).map(good, (x) { "ok:{x}" })
         \\    @assert(text.unwrapOr("") == "ok:4")
         \\    let error: directResult.Result(int, int) = bad.mapErr((message) { 7 })
         \\    @assert(match error {
         \\        .ok => false
         \\        .err => |value| value == 7
         \\    })
-        \\    let untouched: standard.Result(int, int) = Result(int, string).mapErr(good, (message) { 9 })
+        \\    let untouched: standard.Result(int, int) = Result(int, str).mapErr(good, (message) { 9 })
         \\    @assert(untouched.unwrapOr(0) == 4)
         \\}
         \\@[test]
@@ -4873,7 +4936,7 @@ fn addContainerMapCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_ste
         \\@[public]
         \\let IntOption = Option(int)
         \\@[public]
-        \\let IntResult = Result(int, string)
+        \\let IntResult = Result(int, str)
         \\
     ;
     _ = fixtures.add("aliases.nov", aliases_source);
@@ -4934,28 +4997,28 @@ fn addContainerMapCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_ste
     }
     for ([_]struct { name: []const u8, source: []const u8, diagnostic: []const u8 }{
         .{ .name = "option-parameter", .source = "let x:std.Option(int)=.some[1]\nlet y=x.map((v:bool)->int{1})", .diagnostic = "constraints require exactly identical types" },
-        .{ .name = "result-parameter", .source = "let x:std.Result(int,string)=.ok[1]\nlet y=x.map((v:bool)->int{1})", .diagnostic = "constraints require exactly identical types" },
-        .{ .name = "error-parameter", .source = "let x:std.Result(int,string)=.err[\"bad\"]\nlet y=x.mapErr((v:bool)->int{1})", .diagnostic = "constraints require exactly identical types" },
+        .{ .name = "result-parameter", .source = "let x:std.Result(int,str)=.ok[1]\nlet y=x.map((v:bool)->int{1})", .diagnostic = "constraints require exactly identical types" },
+        .{ .name = "error-parameter", .source = "let x:std.Result(int,str)=.err[\"bad\"]\nlet y=x.mapErr((v:bool)->int{1})", .diagnostic = "constraints require exactly identical types" },
         .{ .name = "option-output-conflict", .source = "let x:std.Option(int)=.some[1]\nlet y:std.Option(bool)=x.map((v){v+1})", .diagnostic = "error:" },
-        .{ .name = "result-output-conflict", .source = "let x:std.Result(int,string)=.ok[1]\nlet y:std.Result(bool,string)=x.map((v){v+1})", .diagnostic = "error:" },
-        .{ .name = "error-output-conflict", .source = "let x:std.Result(int,string)=.err[\"bad\"]\nlet y:std.Result(int,bool)=x.mapErr((v){7})", .diagnostic = "error:" },
+        .{ .name = "result-output-conflict", .source = "let x:std.Result(int,str)=.ok[1]\nlet y:std.Result(bool,str)=x.map((v){v+1})", .diagnostic = "error:" },
+        .{ .name = "error-output-conflict", .source = "let x:std.Result(int,str)=.err[\"bad\"]\nlet y:std.Result(int,bool)=x.mapErr((v){7})", .diagnostic = "error:" },
         .{ .name = "option-void-input", .source = "let x:std.Option(void)=.some[]\nlet y=x.map(()->int{1})", .diagnostic = "constraints require exactly identical types" },
-        .{ .name = "result-void-input", .source = "let x:std.Result(void,string)=.ok[]\nlet y=x.map(()->int{1})", .diagnostic = "constraints require exactly identical types" },
+        .{ .name = "result-void-input", .source = "let x:std.Result(void,str)=.ok[]\nlet y=x.map(()->int{1})", .diagnostic = "constraints require exactly identical types" },
         .{ .name = "error-void-input", .source = "let x:std.Result(int,void)=.err[]\nlet y=x.mapErr(()->int{1})", .diagnostic = "constraints require exactly identical types" },
         .{ .name = "option-void-parameter", .source = "let x:std.Option(void)=.some[]\nlet y=x.map((v:void)->int{1})", .diagnostic = "void is not a parameter type" },
-        .{ .name = "result-void-parameter", .source = "let x:std.Result(void,string)=.ok[]\nlet y=x.map((v:void)->int{1})", .diagnostic = "void is not a parameter type" },
+        .{ .name = "result-void-parameter", .source = "let x:std.Result(void,str)=.ok[]\nlet y=x.map((v:void)->int{1})", .diagnostic = "void is not a parameter type" },
         .{ .name = "error-void-parameter", .source = "let x:std.Result(int,void)=.err[]\nlet y=x.mapErr((v:void)->int{1})", .diagnostic = "void is not a parameter type" },
 
-        .{ .name = "error-void-success-propagation", .source = "let x:std.Result(void,string)=.ok[]\nlet y=x.mapErr((v){7})", .diagnostic = "[] for void" },
+        .{ .name = "error-void-success-propagation", .source = "let x:std.Result(void,str)=.ok[]\nlet y=x.mapErr((v){7})", .diagnostic = "[] for void" },
         .{ .name = "option-chain-value", .source = "let x:std.Option(int)=.some[1]\nlet y=x.andThen((v){v+1})", .diagnostic = "constraints require exactly identical types" },
-        .{ .name = "result-chain-error", .source = "let x:std.Result(int,string)=.ok[1]\nlet y=x.andThen((v)->std.Result(int,bool){.ok[v]})", .diagnostic = "constraints require exactly identical types" },
-        .{ .name = "result-chain-option", .source = "let x:std.Result(int,string)=.ok[1]\nlet y=x.andThen((v)->std.Option(int){.some[v]})", .diagnostic = "constraints require exactly identical types" },
+        .{ .name = "result-chain-error", .source = "let x:std.Result(int,str)=.ok[1]\nlet y=x.andThen((v)->std.Result(int,bool){.ok[v]})", .diagnostic = "constraints require exactly identical types" },
+        .{ .name = "result-chain-option", .source = "let x:std.Result(int,str)=.ok[1]\nlet y=x.andThen((v)->std.Option(int){.some[v]})", .diagnostic = "constraints require exactly identical types" },
         .{ .name = "option-void-output", .source = "let x:std.Option(int)=.some[1]\nlet y=x.map((v)->void{})", .diagnostic = "[] for void" },
-        .{ .name = "result-void-output", .source = "let x:std.Result(int,string)=.ok[1]\nlet y=x.map((v)->void{})", .diagnostic = "[] for void" },
-        .{ .name = "error-void-output", .source = "let x:std.Result(int,string)=.err[\"bad\"]\nlet y=x.mapErr((v)->void{})", .diagnostic = "[] for void" },
+        .{ .name = "result-void-output", .source = "let x:std.Result(int,str)=.ok[1]\nlet y=x.map((v)->void{})", .diagnostic = "[] for void" },
+        .{ .name = "error-void-output", .source = "let x:std.Result(int,str)=.err[\"bad\"]\nlet y=x.mapErr((v)->void{})", .diagnostic = "[] for void" },
         .{ .name = "option-array-output-conflict", .source = "let x:std.Option(int)=.some[1]\nlet y:std.Option([]bool)=x.map((v){[v]})", .diagnostic = "error:" },
-        .{ .name = "result-reference-output", .source = "let x:std.Result(int,string)=.ok[1]\nlet y=x.map((v)->&int{&v})", .diagnostic = "reference" },
-        .{ .name = "error-reference-output", .source = "let x:std.Result(int,string)=.err[\"bad\"]\nlet y=x.mapErr((v)->&string{&v})", .diagnostic = "reference" },
+        .{ .name = "result-reference-output", .source = "let x:std.Result(int,str)=.ok[1]\nlet y=x.map((v)->&int{&v})", .diagnostic = "reference" },
+        .{ .name = "error-reference-output", .source = "let x:std.Result(int,str)=.err[\"bad\"]\nlet y=x.mapErr((v)->&str{&v})", .diagnostic = "reference" },
     }) |case| {
         const source = b.fmt("invalid-container-map-{s}.nov", .{case.name});
         _ = fixtures.add(source, b.fmt("let std=@import(\"std\")\nlet main:()={{\n{s}\n}}\n", .{case.source}));
@@ -4973,10 +5036,10 @@ fn addContainerMapCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_ste
     }
     for ([_]struct { name: []const u8, receiver: []const u8, method: []const u8, parameter: []const u8, result: []const u8 = "int" }{
         .{ .name = "option", .receiver = "std.Option(int).some[1]", .method = "map", .parameter = "int" },
-        .{ .name = "result", .receiver = "std.Result(int,string).ok[1]", .method = "map", .parameter = "int" },
+        .{ .name = "result", .receiver = "std.Result(int,str).ok[1]", .method = "map", .parameter = "int" },
         .{ .name = "error", .receiver = "std.Result(int,int).err[1]", .method = "mapErr", .parameter = "int" },
         .{ .name = "option-chain", .receiver = "std.Option(int).some[1]", .method = "andThen", .parameter = "int", .result = "std.Option(int)" },
-        .{ .name = "result-chain", .receiver = "std.Result(int,string).ok[1]", .method = "andThen", .parameter = "int", .result = "std.Result(int,string)" },
+        .{ .name = "result-chain", .receiver = "std.Result(int,str).ok[1]", .method = "andThen", .parameter = "int", .result = "std.Result(int,str)" },
     }) |case| {
         const source = b.fmt("panic-container-map-{s}.nov", .{case.name});
         _ = fixtures.add(source, b.fmt("let std=@import(\"std\")\nlet verify:()={{let result={s}.{s}((value:{s})->{s}{{@print(value)\n@panic(\"{s} callback\")}})\n@println(\"unreachable\")}}\n@[test]\nlet callback_panic:()=verify()\nlet main:()=verify()\n", .{ case.receiver, case.method, case.parameter, case.result, case.name }));
@@ -5146,7 +5209,7 @@ fn addPositionalFieldCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_
         .{ .name = "nominal", .source = "let R=struct{a:int,}\nlet main:()={let r=R.[a=1]\n@println(r.0)}" },
         .{ .name = "enum", .source = "let E=enum{a,b,}\nlet main:()={let r:E=.a\n@println(r.0)}" },
         .{ .name = "array", .source = "let main:()={let r=[1,2]\n@println(r.0)}" },
-        .{ .name = "string", .source = "let main:()={let r=\"ab\"\n@println(r.0)}" },
+        .{ .name = "str", .source = "let main:()={let r=\"ab\"\n@println(r.0)}" },
         .{ .name = "tuple-bracket", .source = "let main:()={let r=.[1,2]\n@println(r[0])}" },
         .{ .name = "dynamic-index", .source = "let main:()={let r=.[1,2]\nlet i:int=0\n@println(r[i])}" },
         .{ .name = "field-borrow", .source = "let main:()={let mut r=.[1,2]\nlet p=&r.0\n}", .diagnostic = "local references require &local or &localArray[index]" },
@@ -5224,14 +5287,14 @@ fn addAnonymousStructCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_
             if (std.mem.eql(u8, command, "modules")) {
                 run.setCwd(fixtures.getDirectory());
                 run.addArgs(&.{ "run", "main.nov" });
-                run.expectStdOutEqual(".[ a: 1, label: local ] .[ a: 7, label: module ] .[2, b]\nstruct{ a: i64, label: string } struct{ i64, string }\n");
+                run.expectStdOutEqual(".[ a: 1, label: local ] .[ a: 7, label: module ] .[2, b]\nstruct{ a: i64, label: str } struct{ i64, str }\n");
             } else {
                 run.addArg(command);
                 run.addFileArg(b.path("examples/anonymous-structs.nov"));
                 run.expectStdOutEqual(if (std.mem.eql(u8, command, "test"))
                     "PASS named_contextual_defaults\nPASS structural_shapes_across_scopes\nPASS inferred_positional_values\nPASS snapshots_and_closure_fields\nPASS generic_mapping\n5 passed; 0 failed; 5 total\n"
                 else
-                    ".[ a: 1 ] .[1, a] .[1, 2]\nstruct{ a: i64, label: string } struct{ i64, string }\nRectangle[ width: 3, height: 4 ] Empty[]\n");
+                    ".[ a: 1 ] .[1, a] .[1, 2]\nstruct{ a: i64, label: str } struct{ i64, str }\nRectangle[ width: 3, height: 4 ] Empty[]\n");
             }
             run.addArg("--lib-dir");
             run.addDirectoryArg(b.path("lib"));
@@ -5300,7 +5363,7 @@ fn addConstructorShorthandCliTests(b: *std.Build, exe: *std.Build.Step.Compile, 
     }
     const fixtures = b.addWriteFiles();
     _ = fixtures.add("constructor-order.nov",
-        \\let mark: (label: string, value: int) -> int = { @print(label)
+        \\let mark: (label: str, value: int) -> int = { @print(label)
         \\    value }
         \\let R = struct { first: int = 30, width: int, last: int = 40, height: int, }
         \\let main: () = {
@@ -5355,7 +5418,7 @@ fn addConstructorShorthandCliTests(b: *std.Build, exe: *std.Build.Step.Compile, 
 }
 
 fn addFieldMutationCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step, fixtures: *std.Build.Step.WriteFile) void {
-    _ = fixtures.add("field-library.nov", "@[public]\nlet K = enum { no, yes, }\n@[public]\nlet R = struct { x: int = 1, s: string = \"old\", b: bool = false, k: K = .no, len: uint = 0, }\n");
+    _ = fixtures.add("field-library.nov", "@[public]\nlet K = enum { no, yes, }\n@[public]\nlet R = struct { x: int = 1, s: str = \"old\", b: bool = false, k: K = .no, len: uint = 0, }\n");
     _ = fixtures.add("field-mutation.nov",
         \\let library = @import("field-library.nov")
         \\let Alias = library.R
@@ -5406,7 +5469,7 @@ fn addOptionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *st
     const imports = "let standard = @import(\"std\")\nlet direct = @import(\"library/option.nov\")\nlet alternate = @import(\"library/./option.nov\")\nlet O = standard.Option(int)\n";
     _ = fixtures.add("options.nov", imports ++
         \\let Record = struct {
-        \\    value: string,
+        \\    value: str,
         \\}
         \\let viaFile: (value: O) -> direct.Option(int) = value
         \\let viaAlias: (value: alternate.Option(int)) -> O = value
@@ -5433,16 +5496,16 @@ fn addOptionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *st
         \\    7
         \\}
         \\let flag: () -> bool = true
-        \\let text: () -> string = "lazy"
+        \\let text: () -> str = "lazy"
         \\let record: () -> Record = Record.[ value = "lazy record" ]
         \\let unitCallback: () -> void = @print("unit:")
         \\let unit: (value: standard.Option(void)) -> bool = match value {
         \\    .some => true
         \\    .none => false
         \\}
-        \\let propagate: (value: O) -> standard.Option(string) = .some["value:{value.!}"]
+        \\let propagate: (value: O) -> standard.Option(str) = .some["value:{value.!}"]
         \\let main: () = {
-        \\    @println(propagate(make(true)).unwrapOr("bad"), standard.Option(string).unwrapOr(propagate(make(false)), "none"))
+        \\    @println(propagate(make(true)).unwrapOr("bad"), standard.Option(str).unwrapOr(propagate(make(false)), "none"))
         \\    @println(make(true).unwrapOr(eager()))
         \\    @println(O.unwrapOr(make(false), eager()))
         \\    @println(O.unwrapOrElse(make(true), lazy))
@@ -5451,9 +5514,9 @@ fn addOptionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *st
         \\    let yes: standard.Option(bool) = .some[true]
         \\    let no: direct.Option(bool) = .none[]
         \\    @println(yes.unwrapOr(false), standard.Option(bool).unwrapOr(no, false), no.unwrapOrElse(flag), standard.Option(bool).unwrapOrElse(yes, flag))
-        \\    let word: standard.Option(string) = .some["s" + "ome"]
-        \\    let empty: direct.Option(string) = .none[]
-        \\    @println(word.unwrapOr("bad"), standard.Option(string).unwrapOr(empty, "eager"), empty.unwrapOrElse(text), standard.Option(string).unwrapOrElse(word, text))
+        \\    let word: standard.Option(str) = .some["s" + "ome"]
+        \\    let empty: direct.Option(str) = .none[]
+        \\    @println(word.unwrapOr("bad"), standard.Option(str).unwrapOr(empty, "eager"), empty.unwrapOrElse(text), standard.Option(str).unwrapOrElse(word, text))
         \\    let item: standard.Option(Record) = .some[Record.[ value = "some record" ]]
         \\    let absent: direct.Option(Record) = .none[]
         \\    @println(item.unwrapOr(Record.[ value = "bad" ]).value, standard.Option(Record).unwrapOr(absent, Record.[ value = "eager record" ]).value)
@@ -5471,7 +5534,7 @@ fn addOptionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *st
     _ = fixtures.add("options-example.nov", @embedFile("examples/options.nov"));
     _ = fixtures.add("variant-predicates.nov", imports ++
         \\let Record = struct {
-        \\    text: string,
+        \\    text: str,
         \\}
         \\let R = standard.Result(Record, Record)
         \\let makeOption: (present: bool) -> O = {
@@ -5504,7 +5567,7 @@ fn addOptionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *st
         \\    @println(item.isSome(), standard.Option(Record).none[].isNone())
         \\    @println(standard.Option(void).some[].isSome(), standard.Option(void).none[].isNone())
         \\    @println(standard.Result(void, void).ok[].isOk(), standard.Result(void, void).err[].isErr())
-        \\    @println(standard.Option(bool).some[false].isSome(), standard.Result(bool, string).ok[false].isOk())
+        \\    @println(standard.Option(bool).some[false].isSome(), standard.Result(bool, str).ok[false].isOk())
         \\    @println(ok.unwrapOr(Record.[ text = "fallback" ]).text, err.isErr())
         \\}
         \\
@@ -5589,7 +5652,7 @@ fn addExportCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *st
         }
     }
     _ = fixtures.add("bad-name.nov", "@[export(\"not-a-name\")]\nlet f: () -> i32 = 1\n");
-    _ = fixtures.add("bad-abi.nov", "@[export]\nlet f: (x: string) -> string = x\n");
+    _ = fixtures.add("bad-abi.nov", "@[export]\nlet f: (x: str) -> str = x\n");
     _ = fixtures.add("duplicate.nov", "@[export(\"same\")]\nlet f: () -> i32 = 1\n@[export(\"same\")]\nlet g: () -> i32 = 2\n");
     // Default names are exact too, so this collides with helper's generated name.
     _ = fixtures.add("collision.nov", "let helper: () -> i32 = 1\n@[export]\nlet nov_helper: () -> i32 = 2\n");
@@ -5752,8 +5815,8 @@ fn addExternCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *st
         .{ .name = "argument", .source = "@[extern(1)]\nlet f: ()\n", .diagnostic = "accepts no argument" },
         .{ .name = "arguments", .source = "@[extern(\"a\", \"b\")]\nlet f: ()\n", .diagnostic = "accepts no argument" },
         .{ .name = "duplicate", .source = "@[extern]\n@[extern]\nlet f: ()\n", .diagnostic = "cannot be repeated" },
-        .{ .name = "abi-param", .source = "@[extern]\nlet f: (x: string)\n", .diagnostic = "extern ABI supports only" },
-        .{ .name = "abi-result", .source = "@[extern]\nlet f: () -> string\n", .diagnostic = "extern ABI supports only" },
+        .{ .name = "abi-param", .source = "@[extern]\nlet f: (x: str)\n", .diagnostic = "extern ABI supports only" },
+        .{ .name = "abi-result", .source = "@[extern]\nlet f: () -> str\n", .diagnostic = "extern ABI supports only" },
         .{ .name = "abi-wide", .source = "@[extern]\nlet f: (x: i128)\n", .diagnostic = "extern ABI supports only" },
         .{ .name = "name", .source = "@[extern(\"not-a-name\")]\nlet f: ()\n", .diagnostic = "extern name must be" },
         .{ .name = "export", .source = "@[extern]\n@[export]\nlet f: ()\n", .diagnostic = "cannot be combined" },
@@ -5875,8 +5938,8 @@ fn addImportCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *st
         \\let standard = @import("std")
         \\let left = @import("parts/left.nov")
         \\let right = @import("parts/right.nov")
-        \\let R = standard.Result(uint, string)
-        \\let recover: (error: string) -> uint = { @print(error)
+        \\let R = standard.Result(uint, str)
+        \\let recover: (error: str) -> uint = { @print(error)
         \\    left.value() }
         \\let main: () = {
         \\    let bad: R = .err["fallback:"]
@@ -5970,9 +6033,9 @@ fn addImportCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *st
     _ = fixtures.add("private/library.nov",
         \\let secret:int=7
         \\@[public]
-        \\let Thing=struct{name:string,
+        \\let Thing=struct{name:str,
         \\@[stringify]
-        \\let toString:(self:Thing)->string=self.name
+        \\let toString:(self:Thing)->str=self.name
         \\let get:(self:Thing)->int=secret
         \\@[public]
         \\let report:(self:Thing)=@println(self,self.get())
@@ -6034,7 +6097,7 @@ fn addImportCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *st
     for ([_][]const u8{ "root", "relative", "std", "result" }) |target| {
         const protected = b.addWriteFiles();
         const root_name = b.fmt("protect-{s}.nov", .{target});
-        const root_source = "let imported = @import(\"imported.nov\")\nlet standard = @import(\"std\")\nlet R = standard.Result(uint, string)\nlet main: () = @println(imported.value())\n";
+        const root_source = "let imported = @import(\"imported.nov\")\nlet standard = @import(\"std\")\nlet R = standard.Result(uint, str)\nlet main: () = @println(imported.value())\n";
         const root_file = protected.add(root_name, root_source);
         const imported_source = "@[public]\nlet value: () -> uint = 7\n";
         const imported_file = protected.add("imported.nov", imported_source);
@@ -6589,7 +6652,7 @@ fn addIterationContinuationCliTests(b: *std.Build, exe: *std.Build.Step.Compile,
     const fixtures = b.addWriteFiles();
     const source = "iteration-continuations.nov";
     _ = fixtures.add(source,
-        \\let R = union { ok: int, err: string, }
+        \\let R = union { ok: int, err: str, }
         \\let fail: () -> R = .err["continuation error"]
         \\let propagate: () -> R = {
         \\    loop x in [1] : { let n = fail().!
@@ -6764,7 +6827,7 @@ fn addIterationContinuationCliTests(b: *std.Build, exe: *std.Build.Step.Compile,
         .{ .name = "propagation-error", .body = "let f:(r:R)->S={loop x in [1] : {let n=r.!\n} {}\n.ok[0]}\n", .diagnostic = ".! error payload must exactly match" },
     }) |case| {
         const invalid = b.fmt("invalid-continuation-{s}.nov", .{case.name});
-        _ = fixtures.add(invalid, b.fmt("let R=union{{ok:int,err:string,}}\nlet S=union{{ok:int,err:bool,}}\nlet main:()={{\n{s}\n}}\n", .{case.body}));
+        _ = fixtures.add(invalid, b.fmt("let R=union{{ok:int,err:str,}}\nlet S=union{{ok:int,err:bool,}}\nlet main:()={{\n{s}\n}}\n", .{case.body}));
         const run = b.addRunArtifact(exe);
         run.step.name = b.fmt("CLI iteration continuations: reject {s}", .{case.name});
         run.setCwd(fixtures.getDirectory());
@@ -6920,8 +6983,8 @@ fn addValuePayloadCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_ste
         \\    let extracted = option.Option(api.Callback).unwrapOr(direct, callback)
         \\    @assert(extracted(3) == 4)
         \\    let good: api.FunctionResult = .ok[callback]
-        \\    let same: result.Result((int) -> int, string) = good
-        \\    let function = standard.Result(api.Callback, string).unwrapOr(same, callback)
+        \\    let same: result.Result((int) -> int, str) = good
+        \\    let function = standard.Result(api.Callback, str).unwrapOr(same, callback)
         \\    @assert(function(4) == 5)
         \\    let bounds = 1..4
         \\    let interval: api.RangeOption = .some[bounds]
@@ -6949,7 +7012,7 @@ fn addValuePayloadCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_ste
         \\@[public]
         \\let FunctionOption = option.Option(Callback)
         \\@[public]
-        \\let FunctionResult = result.Result(Callback, string)
+        \\let FunctionResult = result.Result(Callback, str)
         \\@[public]
         \\let RangeOption = standard.Option(Range)
         \\
@@ -7072,7 +7135,7 @@ fn addStorableFieldCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_st
                     run.addDirectoryArg(library);
                 }
                 run.expectExitCode(0);
-                run.expectStdOutEqual(if (execute) (if (std.mem.eql(u8, command, "test")) expected_tests else "Called: 5 5\nCustom: Processor(4)\nReport: Report[ outcome: Result([]i64, string).ok[[1, 2]] ]\n") else "");
+                run.expectStdOutEqual(if (execute) (if (std.mem.eql(u8, command, "test")) expected_tests else "Called: 5 5\nCustom: Processor(4)\nReport: Report[ outcome: Result([]i64, str).ok[[1, 2]] ]\n") else "");
                 run.expectStdErrEqual("");
                 test_step.dependOn(&run.step);
             }
@@ -7096,7 +7159,7 @@ fn addStorableFieldCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_st
         .{ .name = "print-function", .source = "let S=struct{run:()->int,}\nlet f:(s:S)=@println(s)", .diagnostic = "not implemented yet" },
         .{ .name = "print-range", .source = "let S=struct{interval:@TypeOf(0..1),}\nlet f:(s:S)=@println(s)", .diagnostic = "not implemented yet" },
         .{ .name = "extern-record", .source = "let S=struct{run:()->int,}\n@[extern]\nlet foreign:(s:S)\nlet main:()={}", .diagnostic = "extern ABI supports only bool" },
-        .{ .name = "export-record", .source = "let S=struct{value:std.Result([]int,string),}\n@[export]\nlet foreign:(s:S)={}\nlet main:()={}", .diagnostic = "export ABI supports only bool" },
+        .{ .name = "export-record", .source = "let S=struct{value:std.Result([]int,str),}\n@[export]\nlet foreign:(s:S)={}\nlet main:()={}", .diagnostic = "export ABI supports only bool" },
     }) |case| {
         const source = b.fmt("invalid-storable-field-{s}.nov", .{case.name});
         _ = fixtures.add(source, b.fmt("let std=@import(\"std\")\n{s}\n", .{case.source}));

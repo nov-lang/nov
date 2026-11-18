@@ -18,7 +18,7 @@ let map_types_and_generic_callbacks: () = {
     let mut calls: int = 0
     let labels = std.array.map(
         items,
-        (value: int) -> string {
+        (value: int) -> str {
             calls += 1
             "item {value}"
         }
@@ -42,7 +42,7 @@ let map_types_and_generic_callbacks: () = {
     let empty: []int = []
     let mapped = std.array.map(
         empty,
-        (value: int) -> string {
+        (value: int) -> str {
             calls += 1
             "unexpected"
         }
@@ -97,7 +97,7 @@ let fold_left_seed_and_empty: () = {
     let text = std.array.fold(
         @as([]int, [1, 2, 3]),
         "seed",
-        (total: string, value: int) -> string {
+        (total: str, value: int) -> str {
             "({total}-{value})"
         }
     )

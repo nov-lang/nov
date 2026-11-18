@@ -1,4 +1,4 @@
-let fizzBuzz: (n: uint) -> string =
+let fizzBuzz: (n: uint) -> str =
     match n % 3, n % 5 {
         0, 0 => "FizzBuzz"
         0, _ => "Fizz"

@@ -8,7 +8,7 @@ let Color = enum {
 }
 
 let Entry = struct {
-    name: string,
+    name: str,
     scores: []uint,
     color: Color,
 }
@@ -19,10 +19,10 @@ let Message = union {
 }
 
 let Label = struct {
-    value: string,
+    value: str,
 
     @[stringify]
-    let format: (label: Label) -> string = "Label({label.value})"
+    let format: (label: Label) -> str = "Label({label.value})"
 }
 
 let Ints = []int

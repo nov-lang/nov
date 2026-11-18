@@ -60,6 +60,11 @@ results. See `examples/array-fields.nov`.
 
 ## Current delivered status
 
+The immutable UTF-8 type is now `str`, replacing `string` without a built-in alias.
+Annotations, generic arguments, stringify signatures and printed types use `str`.
+The `std.string` namespace, literals and internal string/GC representation are
+unchanged. See `zig build test-cli-str` for migration and legacy-name rejection tests.
+
 `std.string.parseInt` / `parseUint` return ordinary `Result(int/uint, ParseIntError)`
 for strict decimal ASCII input. Optional signed `+`/`-`, unsigned `+`, leading zeros;
 no implicit trimming, prefixes/separators or Unicode digits. `.invalidInput` and
@@ -119,21 +124,21 @@ and lib/README.md. Library helper signatures are unchanged; no builder, array
 clear/truncate, new defaults or performance work is introduced. Optimization
 remains **PAUSED**.
 
-Step 2 complete: `std.string.trim(text: string) -> string`,
-`replace(text: string, pattern: string, replacement: string) -> string` and
-`repeat(text: string, count: uint) -> string` are ordinary Nov functions.
+Step 2 complete: `std.string.trim(text: str) -> str`,
+`replace(text: str, pattern: str, replacement: str) -> str` and
+`repeat(text: str, count: uint) -> str` are ordinary Nov functions.
 `trim` shares the source slice owner and uses scalar-aware native `int` offsets
 without casts. It removes exactly Unicode `White_Space` (U+0009–000D, U+0020,
 U+0085, U+00A0, U+1680, U+2000–200A, U+2028, U+2029, U+202F, U+205F,
 U+3000), not BOM, zero-width characters, NUL or combining marks. `replace`
 reuses split/join for exact case-sensitive, non-overlapping left-to-right matches,
 including NUL, without normalization; empty patterns always panic with
-`string replace pattern must not be empty`, even for empty text. `repeat` uses
+`str replace pattern must not be empty`, even for empty text. `repeat` uses
 existing string concatenation; zero count/empty input returns `""`, and empty
 text skips the loop even for maximum `uint`. All arguments remain eager, once,
 left to right; no callbacks or compiler changes. Current concatenation can copy
 quadratically; performance work remains **PAUSED**. See
-`examples/string-transform.nov` (seven tests and exact stdout), README.md and
+`examples/str-transform.nov` (seven tests and exact stdout), README.md and
 lib/README.md. Mutable receivers are delivered separately in step 3 above.
 
 Step 1 complete: `std.array.sort(items: []T, less: (T, T) -> bool) -> []T`
@@ -149,8 +154,8 @@ propagation retain ordinary language semantics. See `examples/array-sort.nov`
 copies, captures, comparison effects and source snapshots). No new string helpers
 or mutable receivers are part of this step; performance work remains **PAUSED**.
 
-`std.string.toBytes(string) -> []u8`, `fromBytes([]u8) ->
-std.Result(string, std.string.Utf8Error)` and public `Utf8Error = enum {
+`std.string.toBytes(str) -> []u8`, `fromBytes([]u8) ->
+std.Result(str, std.string.Utf8Error)` and public `Utf8Error = enum {
 invalidUtf8, }` are implemented. Both directions copy into independent storage;
 strings retain immutable UTF-8 owners. Ordinary Nov validation rejects invalid
 leads/continuations, overlong encodings, surrogates, out-of-range scalars and
@@ -159,16 +164,16 @@ truncation before calling `@stringFromBytes`; invalid input returns
 `@stringToBytes` and `@stringFromBytes` copy; direct `@stringFromBytes` panics on
 invalid UTF-8 in every mode. Allocation failure still panics normally. No general
 casts, arbitrary comptime execution, builder or optimization is introduced. See
-`examples/string-conversions.nov` (nine tests covering boundaries, invalid families,
+`examples/str-conversions.nov` (nine tests covering boundaries, invalid families,
 copy isolation, source scope/GC churn, propagation, matching and first-class/type
 queries), README.md and lib/README.md.
 
-`std.string.join(parts: []string, separator: string) -> string` is implemented as
+`std.string.join(parts: []str, separator: str) -> str` is implemented as
 an ordinary Nov loop using existing string `+`. Empty parts arrays return `""`,
 singletons preserve their content, and empty separators concatenate. Separators
 appear only between parts, including empty parts. Exact UTF-8 bytes and embedded
 NUL are preserved without normalization. Inputs remain unchanged and results
-retain valid immutable content. See `examples/string-join.nov` (five tests).
+retain valid immutable content. See `examples/str-join.nov` (five tests).
 
 `std.array.findLast`, `take` and `drop` are implemented for all supported storable
 element types. `findLast` evaluates predicates from the end, stopping immediately
@@ -182,7 +187,7 @@ Inputs are not mutated, and arguments remain eager and left-to-right. See
 builtins, reverse iterator, borrowing, extra APIs or optimizations. Repeated string
 concatenation/array append can be quadratic; performance work remains **PAUSED**.
 
-`std.string.split(text, separator) -> []string` is implemented in Nov. Exact,
+`std.string.split(text, separator) -> []str` is implemented in Nov. Exact,
 case-sensitive, non-overlapping Unicode-scalar separator matching preserves
 leading/trailing/adjacent empty fields. Empty input with nonempty separator gives
 one empty field; no match gives the whole input. Empty separator panics in every
@@ -568,7 +573,7 @@ arrays, fields, literal matches with catchalls, union payloads and scoped borrow
 arithmetic, ordering, rune ranges or foreign ABI support.
 
 String indexing decodes `rune` with native `int` scalar offsets; negatives count
-scalars from the end. For a `string`, `@len(text)` returns the Unicode scalar count
+scalars from the end. For a `str`, `@len(text)` returns the Unicode scalar count
 as native `uint`, not the byte or grapheme count:
 `@len("é😀\0") == 3`, `"é😀"[-1] == '😀'`, `@len("e\u{301}") == 2`.
 Both indexing and length scan UTF-8 in O(n), allocating nothing; storage remains
@@ -591,7 +596,7 @@ excluded from normal semantic analysis/emission and not callable as ordinary val
 `nov test file.nov` selects only root-file tests in source order, compiles once and
 runs each in a fresh subprocess, continuing after failures/crashes and reporting a
 summary/nonzero failure status. No main required; supports --cc, --debug/--release
-and --lib-dir. `@assert(bool[, string])` evaluates arguments eagerly once in order,
+and --lib-dir. `@assert(bool[, str])` evaluates arguments eagerly once in order,
 reports source locations, and remains active in all modes. No unwinding/recovery,
 parallel execution, test filters, timeout flags or automatic dependency-test discovery.
 See examples/tests.nov and README.
@@ -704,7 +709,7 @@ Array-valued fields now use recursive independent copies, including concrete arr
 type arguments; contextual named constructors are supported. Value generics and
 general comptime remain deferred.
 
-Growable []string and acyclic nested-record arrays are executable with independent
+Growable []str and acyclic nested-record arrays are executable with independent
 element storage and shared immutable string backing. Index values and replacements,
 append, literal inference, copies/returns and managed owner tracing work. String
 membership compares bytes, including UTF-8/NUL; record membership/equality and
@@ -746,7 +751,7 @@ some payload/none variants, unwrapOr (eager fallback) and unwrapOrElse (zero-arg
 callback invoked only for none). Real-import tests cover identity, exact types,
 scalars/records/void, exhaustive matching, fallback effects and debug/release runs.
 examples/options.nov demonstrates safe division and .! propagation from Option(uint)
-to Option(string). Structural .! accepts exactly some/none with void none, yields
+to Option(str). Structural .! accepts exactly some/none with void none, yields
 some or immediately returns enclosing none. Result behavior is unchanged; crossing
 Option/Result families is rejected. Evaluation is once-only and later effects skip
 on none; no builtin Option or implicit payload wrapping was introduced.
@@ -814,7 +819,7 @@ payload's own type name. Strings/runes are raw UTF-8 without quoting or escaping
 this is debugging output, not source-roundtrip serialization.
 
 Nominal values at every depth prefer an explicit container method marked
-`@[stringify]` with exact signature `(SelfType) -> string`, once per encountered
+`@[stringify]` with exact signature `(SelfType) -> str`, once per encountered
 value in traversal order (array index order, struct declaration order, active union payload). A valid hook
 replaces the value's representation and stops structural recursion, so unsupported
 fields behind that hook are okay. A record payload's own hook overrides flattening:
@@ -828,7 +833,7 @@ No global overload lookup is added.
 with a body, with at most one marked method per struct/union/enum. The function
 name is arbitrary; an unmarked `toString` remains an ordinary callable method and
 has no effect on print/interpolation. Ordinary methods of generic containers are
-allowed and must have the exact concrete `(SelfType) -> string` signature; the
+allowed and must have the exact concrete `(SelfType) -> str` signature; the
 method's own generic function parameters are disallowed. Parameter names are
 unrestricted, and exact type aliases are accepted. Top-level/local functions,
 fields, mutable/bodyless declarations and aliases cannot be marked. It cannot
@@ -914,7 +919,7 @@ constructors evaluate supplied fields once left-to-right, then omitted literal d
 in declaration order. Record value boundaries copy fields; strings share immutable
 storage. Field reads work in interpolation. Container methods support scoped and
 static `Type.method(...)` calls; direct print arguments with explicit
-`@[stringify]` methods of exact signature `(MyType) -> string` call them once
+`@[stringify]` methods of exact signature `(MyType) -> str` call them once
 immediately after evaluation, before the next argument. Without a hook, printable records use named default
 structural formatting; nested fields/elements recursively invoke valid hooks once
 in traversal order, stopping recursion at each override. Only
@@ -1040,7 +1045,7 @@ re-exports remain a separate concern.
 
 Separate entrypoint proposal:
 ```nov
-let main: () -> Result(void, string) = {
+let main: () -> Result(void, str) = {
     .err["error from main"]
 }
 ```
@@ -1052,7 +1057,7 @@ main remains `() -> void`; neither proposal changes the implementation roadmap y
 
 ## Agreed text-storage design (conversions delivered; builder future)
 
-Keep one immutable, valid-UTF-8 `string` type. `let mut` permits rebinding and `+=`
+Keep one immutable, valid-UTF-8 `str` type. `let mut` permits rebinding and `+=`
 creates a new string; it does not permit in-place byte changes. Use mutable `[]u8`
 for unrestricted bytes. `std.string.toBytes` copies string bytes into independent
 array storage; `std.string.fromBytes` fully validates UTF-8 and copies into an
@@ -1254,14 +1259,14 @@ let User = struct {
     @[auto]
     id: Id,
 
-    name: string,
+    name: str,
 
     @[unique]
-    email: string,
+    email: str,
 
     todos: []Todo,
 
-    moto: Option(string),
+    moto: Option(str),
 }
 
 let Todo = struct {
@@ -1275,7 +1280,7 @@ let Todo = struct {
     @[relation(key = user_id, references = id)]
     user: User,
 
-    title: string,
+    title: str,
 }
 ```
 
@@ -1376,7 +1381,7 @@ Problem: invalidating an interior pointer
 @[public]
 let main: () -> !void = {
     let Value = union {
-        s: string,
+        s: str,
         n: uint,
     }
     let mut value = Value.[ n = 42 ]
@@ -1566,7 +1571,7 @@ _ = match [1, 2, 3] {
 
 proposal: match over start/end of string
 ```nov
-let getName: (s: string) -> string = {
+let getName: (s: str) -> str = {
     match s {
         ; "Foo".. => TODO idk
         ; .."Bar" => TODO idk

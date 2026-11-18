@@ -3039,9 +3039,9 @@ const positional_fields_program =
     \\let U=union{some:[][]int,none,}
     \\let id:(value:`T)->`T=value
     \\let first:(value:`T)->@TypeOf(value.0)=value.0
-    \\let factory:()->@TypeOf(.[(x:string)->string{x},0])={
+    \\let factory:()->@TypeOf(.[(x:str)->str{x},0])={
     \\ let prefix="root"+"!"
-    \\ .[(x:string)->string{prefix+x},0]}
+    \\ .[(x:str)->str{prefix+x},0]}
     \\let main:()={
     \\ let mut pair:Pair=.[1,"a"]
     \\ pair.0+=2
@@ -3082,7 +3082,7 @@ const positional_fields_program =
     \\ @assert(copy.0(3)==5 and count==5)
     \\ @assert(r.0(4)==104 and count==5)
     \\ let mut rooted=factory()
-    \\ let text=rooted.0({rooted.0=(x:string)->string{"wrong"+x}
+    \\ let text=rooted.0({rooted.0=(x:str)->str{"wrong"+x}
     \\ "arg"+"!"})
     \\ @assert(text=="root!arg!")
     \\ let mut ranges=.[0..3,7]
@@ -3161,10 +3161,10 @@ test "positional fields source free compiler emitter allocation rollback" {
 
 test "positional fields allocating argument OOM skips call after earlier argument effects O0 O3" {
     const library = try emitPositionalFieldsSourceFree(test_gpa,
-        \\let main:()={let mut r=.[(x:string)->string{@print("C")
+        \\let main:()={let mut r=.[(x:str)->str{@print("C")
         \\ x},0]
         \\ @println(r.0({@print("A")
-        \\ r.0=(x:string)->string{x}
+        \\ r.0=(x:str)->str{x}
         \\ "arg"+"!"}))}
     );
     defer test_gpa.free(library);
@@ -3768,9 +3768,9 @@ test "default aggregate printing shared type DAG empty arrays validates without 
 test "default aggregate formatting allocating hooks share mutable closure state source free GC" {
     const source =
         \\let Counter=struct{callbacks:[]()->int,}
-        \\let hook:(value:Counter)->string="C{value.callbacks[0]()}"
+        \\let hook:(value:Counter)->str="C{value.callbacks[0]()}"
         \\let show:(values:[]Counter)=@println(@len(values))
-        \\let convert:(values:[]Counter)->string="{@len(values)}"
+        \\let convert:(values:[]Counter)->str="{@len(values)}"
         \\let main:()={
         \\ let mut count:int=0
         \\ let tick=()->int{count+=1
@@ -4166,9 +4166,9 @@ const rune_program =
     \\let Option: (T:type)->type = union { none, some:T, }
     \\let Result: (T:type,E:type)->type = union { ok:T, err:E, }
     \\let identity: (r: Rune)->Rune = r
-    \\let effect: (s:string,r:Rune)->Rune = {@print(s)
+    \\let effect: (s:str,r:Rune)->Rune = {@print(s)
     \\r}
-    \\let consume: (a:rune,b:rune)->string = "{a}/{b}"
+    \\let consume: (a:rune,b:rune)->str = "{a}/{b}"
     \\let main: () = {
     \\@println('A',seed,'😀','\u{10ffff}','\0','\n','\t','\'','\\')
     \\let call=identity
@@ -4177,7 +4177,7 @@ const rune_program =
     \\let saved=r
     \\r.value='😀'
     \\let opt:Option(rune)=.some[r.value]
-    \\let res:Result(rune,string)=.ok[saved.value]
+    \\let res:Result(rune,str)=.ok[saved.value]
     \\@println(match opt {
     \\.some=>|v| v
     \\.none=>'x'
@@ -4284,7 +4284,7 @@ test "rune direct printing is allocation free and helpers are demand only" {
     try std.testing.expect(std.mem.indexOf(u8, scalar, "nov_rt_") == null);
     try std.testing.expect(std.mem.indexOf(u8, scalar, "nov_string") == null);
     try compileAndRun(scalar, "int main(void) {return 0;}");
-    const conversion = try emitSource("let f:(r:rune)->string=\"{r}\"", null);
+    const conversion = try emitSource("let f:(r:rune)->str=\"{r}\"", null);
     defer test_gpa.free(conversion);
     try std.testing.expect(std.mem.indexOf(u8, conversion, "nov_string_concat") != null);
     try std.testing.expect(std.mem.indexOf(u8, conversion, "nov_rt_print_rune") == null);
@@ -4323,14 +4323,14 @@ fn emitGlobalTestLibrary(allocator: std.mem.Allocator) ![]u8 {
     var lowered = blk: {
         var module = try Module.init(allocator, "globals.nov",
             \\let E=enum{a,b,}
-            \\let R=struct{s:string,a:[][]int,}
+            \\let R=struct{s:str,a:[][]int,}
             \\let U=union{none,some:R,}
             \\let helper:()->[]int={@print("H")
             \\[3,4]}
             \\let initnumber:()->int={@print("I")
             \\7}
             \\let initarray:()->[]int=helper()
-            \\let initstring:()->string="a"+"b"
+            \\let initstring:()->str="a"+"b"
             \\let initrecord:()->R=R.[s="c"+"d",a=[[5],[6]]]
             \\let initunion:()->U=U.some[R.[s="e"+"f",a=[[8]]]]
             \\let initfunction:()->()->int={let mut n=10
@@ -4519,7 +4519,7 @@ test "global storage scalar only direct entry needs no GC runtime" {
 
 test "global storage source integration nested initializers rooted entry parameters returns and heap reuse" {
     const library = try emitSource(
-        \\let Row=struct{label:string,rows:[][]string,}
+        \\let Row=struct{label:str,rows:[][]str,}
         \\let U=union{none,row:Row,}
         \\let mut count=4
         \\let mut state=Row.[label="record",rows=[["a","b"],["c"]]]
@@ -4528,11 +4528,11 @@ test "global storage source integration nested initializers rooted entry paramet
         \\@[export("global_step")]
         \\let step:()->int={count+=1
         \\callback()}
-        \\let echo:(argument:string)->string={@assert(state.rows[0][1]=="b" and state.rows[1][0]=="c")
+        \\let echo:(argument:str)->str={@assert(state.rows[0][1]=="b" and state.rows[1][0]=="c")
         \\@assert(match variant {.row=>|r|r.label=="union" and r.rows[0][0]=="d" and r.rows[1][1]=="f"
         \\.none=>false})
         \\argument}
-        \\let value:()->string={let saved=state
+        \\let value:()->str={let saved=state
         \\state.rows=[["replaced"]]
         \\saved.rows[1][0]+"!"}
     , null);
@@ -4644,42 +4644,42 @@ fn emitGlobalTestLibraryAllocation(allocator: std.mem.Allocator) !void {
 
 const type_reachability_cases = [_]struct { source: []const u8, output: []const u8 = "" }{
     .{ .source =
-    \\let Row=struct{values:[][]string,}
+    \\let Row=struct{values:[][]str,}
     \\let snapshot:(row:Row)->Row=row
     \\let main:()={}
     },
     .{ .source =
     \\let Outer=struct{rows:[][][]Row,}
     \\let Row=struct{leaf:Leaf,}
-    \\let Leaf=struct{value:string,}
+    \\let Leaf=struct{value:str,}
     \\let snapshot:(row:Outer)->Outer=row
     \\let main:()={}
     },
     .{ .source =
-    \\let Outer=struct{callbacks:[][]([][][]Leaf)->[][][]string,}
-    \\let Leaf=struct{value:string,}
+    \\let Outer=struct{callbacks:[][]([][][]Leaf)->[][][]str,}
+    \\let Leaf=struct{value:str,}
     \\let snapshot:(row:Outer)->Outer=row
     \\let main:()={}
     },
     .{ .source =
-    \\let Outer=struct{rows:[][]Box(Box(string)),}
+    \\let Outer=struct{rows:[][]Box(Box(str)),}
     \\let Box:(T:type)->type=struct{values:[]T,}
     \\let snapshot:(row:Outer)->Outer=row
     \\let main:()={}
     },
     .{ .source =
-    \\let Outer=struct{callbacks:[][]([][][]Leaf)->[][][]string,}
-    \\let Leaf=struct{value:string,}
+    \\let Outer=struct{callbacks:[][]([][][]Leaf)->[][][]str,}
+    \\let Leaf=struct{value:str,}
     \\let snapshot:(row:Outer)->Outer=row
     \\let make:(flag:bool)->()->bool=()->bool {flag}
     \\let main:()={}
     },
     .{ .source =
-    \\let Outer=struct{rows:[][]Box(Box(string)),}
+    \\let Outer=struct{rows:[][]Box(Box(str)),}
     \\let Box:(T:type)->type=struct{values:[]T,}
     \\let snapshot:(row:Outer)->Outer=row
     \\let make:(row:Outer)->()->Outer=()->Outer {snapshot(row)}
-    \\let main:()={let mut row=Outer.[rows=[[Box(Box(string)).[values=[Box(string).[values=["reachable"+"!"]]]]]]]
+    \\let main:()={let mut row=Outer.[rows=[[Box(Box(str)).[values=[Box(str).[values=["reachable"+"!"]]]]]]]
     \\ let captured=make(row)
     \\ row.rows=[]
     \\ let copy=captured()
@@ -4688,7 +4688,7 @@ const type_reachability_cases = [_]struct { source: []const u8, output: []const 
 };
 
 const array_default_program =
-    \\let R=struct{rows:[][]int=[[1,2],[],[3]],names:[]string=["é\0","tail"],bytes:[]u8=[],}
+    \\let R=struct{rows:[][]int=[[1,2],[],[3]],names:[]str=["é\0","tail"],bytes:[]u8=[],}
     \\let G:(T:type)->type=struct{values:[]T=[],}
     \\let U=union{value:R,none,}
     \\let make:()->R=R.[]
@@ -4808,7 +4808,7 @@ const type_of_expressions_program =
     \\ out}
     \\let R=struct{value:int=0,
     \\ @[stringify]
-    \\ let format:(r:R)->string={@panic("TypeOf converter executed")}
+    \\ let format:(r:R)->str={@panic("TypeOf converter executed")}
     \\}
     \\let result:()->@TypeOf(1+2)=7
     \\let update:(owner:&mut int,value:int)={owner.*+=value}
@@ -4866,6 +4866,26 @@ fn emitTypeOfExpressionsSourceFree(allocator: std.mem.Allocator, source: []const
     defer lowered.deinit();
     try lowered.ir.verify();
     return emit(allocator, &lowered.ir, null);
+}
+
+test "str spelling source free canonical printed types converters and literal contents O0 O3" {
+    const library = try emitTypeOfExpressionsSourceFree(test_gpa,
+        \\let Label=struct{value:str,
+        \\@[stringify]
+        \\let format:(self:Label)->str=self.value
+        \\}
+        \\let echo:(value:`T)->`T=value
+        \\let main:()={let mut word:str="string"
+        \\let p=&word
+        \\let values:[]str=[p.*]
+        \\@println(str,@TypeOf(word),@TypeOf(p),@TypeOf(values),@TypeOf(echo(p.*)))
+        \\@println(Label.[value=p.*],values[0])}
+    );
+    defer test_gpa.free(library);
+    const program = try collectingTestProgram(library);
+    defer test_gpa.free(program);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(program, "typedef int nonempty_translation_unit;", 0, "str str &mut str []str str\nstring string\n", "", mode);
 }
 
 test "TypeOf expressions unevaluated calls fields indices slices closures generics borrows source free forced GC O0 O3" {
@@ -4984,12 +5004,12 @@ test "type reachability follows source free range edges discovered through nomin
 const storable_arrays_program =
     \\let E=enum{first,second,}
     \\let Box:(T:type)->type=struct{value:T,}
-    \\let Row=struct{values:[][]string,}
-    \\let U=union{row:Row,text:string,none,}
+    \\let Row=struct{values:[][]str,}
+    \\let U=union{row:Row,text:str,none,}
     \\let inc:(n:int)->int=n+1
     \\let apply:(f:(int)->int,n:int)->int=f(n)
     \\let callbacks:()->[](int)->int=[inc]
-    \\let snapshot:(a:[][]string)->[][]string=a
+    \\let snapshot:(a:[][]str)->[][]str=a
     \\let main:()={
     \\ let mut kinds:[]E=[.first,.second]
     \\ let oldKinds=kinds
@@ -4999,7 +5019,7 @@ const storable_arrays_program =
     \\ let found=E.first in oldKinds
     \\ let absent=E.first in kinds
     \\ if oldKinds[0]!=E.first or !found or absent {@panic("enum equality")}
-    \\ let empty:[][]string=[[],[]]
+    \\ let empty:[][]str=[[],[]]
     \\ let mut rows=[[],["a"+"b"]]
     \\ let old=snapshot(rows)
     \\ rows[0]=["new"+"!"]
@@ -5008,7 +5028,7 @@ const storable_arrays_program =
     \\ let mut projected=rows[1]
     \\ projected[0]="changed"
     \\ if rows[1][0]!="ab" {@panic("projection copy")}
-    \\ let boxed=Box([][]string).[value=rows]
+    \\ let boxed=Box([][]str).[value=rows]
     \\ rows+=[["third"]]
     \\ if @len(boxed.value)!=2 or @len(empty[0])!=0 {@panic("generic array field")}
     \\ let mut unions:[]U=[.row[Row.[values=rows]],.text["text"+"!"],.none[]]
@@ -5216,16 +5236,16 @@ test "storable arrays individual elements retain nominal printing contracts" {
     const source =
         \\let E=enum{first,second,
         \\ @[stringify]
-        \\ let toString:(e:E)->string=if e==E.first {"first"} else {"second"}
+        \\ let toString:(e:E)->str=if e==E.first {"first"} else {"second"}
         \\}
         \\let Alias=E
-        \\let R=struct{s:string,
+        \\let R=struct{s:str,
         \\ @[stringify]
-        \\ let toString:(r:R)->string=r.s+"!"
+        \\ let toString:(r:R)->str=r.s+"!"
         \\}
         \\let U=union{some:R,none,
         \\ @[stringify]
-        \\ let toString:(u:U)->string=match u {.some=>|r|"{r}"
+        \\ let toString:(u:U)->str=match u {.some=>|r|"{r}"
         \\ .none=>"none"}
         \\}
         \\let main:()={let a:[]Alias=[.first,.second]
@@ -5428,7 +5448,7 @@ test "inferred closure small source free compiler allocation rollback" {
 const constructor_shorthand_program =
     \\let Box:(T:type)->type=struct{value:T,}
     \\let Alias=Box([]int)
-    \\let R=struct{value:[]int,label:string,n:int=9,}
+    \\let R=struct{value:[]int,label:str,n:int=9,}
     \\let label="module"
     \\let number:int=7
     \\let N=struct{number:int,}
@@ -5440,7 +5460,7 @@ const constructor_shorthand_program =
     \\ ()->R {if true {R.[value=value,label=text]} else {R.[value=value,label=label]}}}
     \\let main:()={
     \\ let mut value:[]int=[1]
-    \\ let change=()->string {value[0]=2
+    \\ let change=()->str {value[0]=2
     \\ "changed"+"!"}
     \\ let first=R.[value=value,label=change()]
     \\ let second=R.[label=change(),value=value]
@@ -5500,12 +5520,12 @@ test "constructor shorthand runtime OOM uses ordinary array copy failure" {
 
 const closure_types_program =
     \\let K=enum{first,second,}
-    \\let R=struct{s:string,n:int,}
+    \\let R=struct{s:str,n:int,}
     \\let U=union{none,some:R,}
     \\let identity:(n:int)->int=n
-    \\let factory:(s:string, r:R, u:U, a:[]R, flag:bool, rune_value:rune, kind:K, callback:(int)->int)->()->string={
+    \\let factory:(s:str, r:R, u:U, a:[]R, flag:bool, rune_value:rune, kind:K, callback:(int)->int)->()->str={
     \\ let bounds=0..2
-    \\ ()->string {
+    \\ ()->str {
     \\  loop i in bounds {@print(i)}
     \\  @println(flag,rune_value,kind==K.second,callback(r.n),a[0].s)
     \\  match u {
@@ -5519,7 +5539,7 @@ const closure_types_program =
     \\ @println(f())
     \\ let mut s="old"+"!"
     \\ let snapshot=s
-    \\ let nested=()->()->string {()->string {snapshot}}
+    \\ let nested=()->()->str {()->str {snapshot}}
     \\ s="new"+"!"
     \\ let inner=nested()
     \\ @println(inner(),s)
@@ -5528,7 +5548,7 @@ const closure_types_program =
     \\ let saved=target
     \\ target=()->int {2}
     \\ @println(invoke(),saved())
-    \\ let branch=(b:bool)->string {if b {snapshot} else {snapshot+"?"}}
+    \\ let branch=(b:bool)->str {if b {snapshot} else {snapshot+"?"}}
     \\ @println(branch(true),branch(false))
     \\}
 ;
@@ -5582,7 +5602,7 @@ const backtick_program =
     \\let next=cell("old")
     \\let alias=next
     \\@println(next("new"),alias("last"))
-    \\let box=Box(string).[value="field"]
+    \\let box=Box(str).[value="field"]
     \\@println(unwrap(box),invert(true),size("abc"),size([true,false]),wrap("ok"))
     \\@println(fresh,if false {forward(true)} else {true},choose(false,"live"),loopValue("break"))
     \\finish()}
@@ -5658,8 +5678,8 @@ const contextual_backtick_program =
     \\let b:uint=apply(identity,42)
     \\let c:uint=reverse(42,identity)
     \\@println(cb(a),cast(b),slot(c),branch(4),funcs[1](5),method(6,true),result()(7))
-    \\let factory:([][]string)->()->[][]string=make
-    \\let mut rows:[][]string=[["old"+"!"]]
+    \\let factory:([][]str)->()->[][]str=make
+    \\let mut rows:[][]str=[["old"+"!"]]
     \\let saved=factory(rows)
     \\rows[0]=["new"+"!"]
     \\let copy=saved()
@@ -5687,7 +5707,7 @@ test "backtick contextual values source free compiler emitter every allocation f
 test "backtick contextual returned closure exact runtime budgets and forced GC" {
     const library = try emitBacktickProgramSourceFree(test_gpa,
         \\let make:(x:`T)->()->`T=()->`T{x}
-        \\let main:()={let factory:(string)->()->string=make
+        \\let main:()={let factory:(str)->()->str=make
         \\let saved=factory("alive"+"!")
         \\@println(saved())}
     );
@@ -5718,8 +5738,8 @@ fn emitBacktickImportsSourceFree(allocator: std.mem.Allocator) ![]u8 {
             \\let staticForward:(x:`T)->`T=api.NS.stop()
             \\let main:()={let cb:(uint,uint)->uint=alias
             \\let n:uint=cb(1,2)
-            \\let ns:(string)->string=method
-            \\let decorated:(string)->string=api.decorate
+            \\let ns:(str)->str=method
+            \\let decorated:(str)->str=api.decorate
             \\@println(n,api.alias("a","b"),ns("namespace"),decorated("ok"),if false {forward(true)} else {true},if false {staticForward(true)} else {true})}
         );
         const api = try comp.addSource("/app/api.nov",
@@ -5732,7 +5752,7 @@ fn emitBacktickImportsSourceFree(allocator: std.mem.Allocator) ![]u8 {
             \\@[public]
             \\let alias=add
             \\@[public]
-            \\let decorate:(x:`T)->string=prefix+x
+            \\let decorate:(x:`T)->str=prefix+x
             \\@[public]
             \\let NS=struct{
             \\@[public]
@@ -6077,7 +6097,7 @@ test "closures runtime OOM checks cells environments snapshots and allocation fr
             try compileAndRunExpected(c, "typedef int nonempty_translation_unit;", if (limit < needed) 1 else 0, if (limit < needed) "" else "1\n", if (limit < needed) "panic: GC allocation failed\n" else "");
         }
     }
-    const library = try emitSource("let take:(f:()->string)->()->string=f\nlet main:()={let s=\"shared\"\nlet f=()->string {s}\nlet g=take(f)\nlet h=g\n@println(h())}", null);
+    const library = try emitSource("let take:(f:()->str)->()->str=f\nlet main:()={let s=\"shared\"\nlet f=()->str {s}\nlet g=take(f)\nlet h=g\n@println(h())}", null);
     defer test_gpa.free(library);
     const c = try std.mem.concat(test_gpa, u8, &.{ "#include <stdlib.h>\nstatic size_t count;\nstatic void *test_malloc(size_t n) {if(count++ >= 2) return NULL; return malloc(n);}\n#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n", library, "\nint main(void){nov_rt_heap.collect_every_allocation=1;nov_main();nov_gc_collect(&nov_rt_heap);if(nov_rt_heap.frames || nov_rt_heap.live_objects)return 70;nov_gc_shutdown(&nov_rt_heap);return 0;}\n" });
     defer test_gpa.free(c);
@@ -6128,8 +6148,8 @@ test "closures evaluate callees before arguments and retain replaced environment
         \\ @println(apply((value:int)->int {value+1},2))
         \\ @println(() -> int {7}())
         \\ let saved="saved"+"!"
-        \\ let mut target=(suffix:string)->string {saved+suffix}
-        \\ @println(target({target=(suffix:string)->string {"wrong"}
+        \\ let mut target=(suffix:str)->str {saved+suffix}
+        \\ @println(target({target=(suffix:str)->str {"wrong"}
         \\  "?"+"!"}))
         \\ @println(target("ignored"))
         \\ let mut n:int=1
@@ -6146,7 +6166,7 @@ test "closures evaluate callees before arguments and retain replaced environment
 
 test "closures trace shared function cycles and keep propagation scoped" {
     const c = try arrayTestProgram(
-        \\let R=union{ok:int,err:string,}
+        \\let R=union{ok:int,err:str,}
         \\let main=(){
         \\ let mut next:()->int=()->int {0}
         \\ next=()->int {if false {next()} else {7}}
@@ -6231,9 +6251,9 @@ const generic_union_program =
     \\let Result: (T: type, E: type) -> type = union { ok: T, err: E, }
     \\let Apply = Result
     \\let Count = int
-    \\let R = Apply(Count, string)
-    \\let TextResult = Result(string, string)
-    \\let Reversed = union { err: string, ok: bool, }
+    \\let R = Apply(Count, str)
+    \\let TextResult = Result(str, str)
+    \\let Reversed = union { err: str, ok: bool, }
     \\let source: (success: bool) -> R = {
     \\    @print("P")
     \\    if success { .ok[7] } else { .err["er" + "ror"] }
@@ -6247,18 +6267,18 @@ const generic_union_program =
     \\    let n = source(success).!
     \\    .ok[n == 7]
     \\}
-    \\let describe: (r: TextResult) -> string = match r {
+    \\let describe: (r: TextResult) -> str = match r {
     \\    .ok => |s| "ok:" + s
     \\    .err => |s| "err:" + s
     \\}
-    \\let describeBool: (r: Reversed) -> string = match r {
+    \\let describeBool: (r: Reversed) -> str = match r {
     \\    .ok => |b| "bool:{b}"
     \\    .err => |s| "err:" + s
     \\}
     \\let main: () = {
     \\    @println(describe(transform(true)), describe(transform(false)))
     \\    @println(describeBool(boolean(true)), describeBool(boolean(false)))
-    \\    let mut item = Result(string, string).ok["a" + "b"]
+    \\    let mut item = Result(str, str).ok["a" + "b"]
     \\    let copy: TextResult = item
     \\    item = .err["c" + "d"]
     \\    @println(describe(copy), describe(item))
@@ -6269,14 +6289,14 @@ const enum_program =
     \\let Kind=enum{not_found,permission_denied,io,
     \\    @[public]
     \\    @[stringify]
-    \\    let toString:(self:Kind)->string=match self{Alias.not_found=>"not_found"
+    \\    let toString:(self:Kind)->str=match self{Alias.not_found=>"not_found"
     \\        Kind.permission_denied | .io=>"other"}
     \\    let eql:(a:Kind,b:Kind)->bool=a==b
     \\}
     \\let Alias=Kind
     \\let initial=Alias.not_found
     \\let Result:(T:type,E:type)->type=union{ok:T,err:E,}
-    \\let Error=struct{kind:Alias=.not_found,message:string,valid:bool=true,code:uint=7,}
+    \\let Error=struct{kind:Alias=.not_found,message:str,valid:bool=true,code:uint=7,}
     \\let R=Result(uint,Alias)
     \\let S=Result(uint,Error)
     \\let make:()->R=.err[.not_found]
@@ -6298,12 +6318,12 @@ const enum_program =
 ;
 
 const instance_program =
-    \\let text:(r:R)->string="WRONG"
+    \\let text:(r:R)->str="WRONG"
     \\let Alias=R
-    \\let R=struct{s:string,
+    \\let R=struct{s:str,
     \\    let next:(value:Alias,n:int,other:R)->R={@println("method",value.s,n,other.s)
     \\        R.[s=value.s+other.s]}
-    \\    let text:(value:R)->string=value.s
+    \\    let text:(value:R)->str=value.s
     \\    let replace:(value:R)->R={let mut copy=value
     \\        copy=R.[s="changed"]
     \\        copy}
@@ -6312,10 +6332,10 @@ const instance_program =
     \\    let eql:(left:K,right:K)->bool=left==right
     \\}
     \\let U=union{record:R,empty,
-    \\    let text:(value:U)->string=match value{.record=>|r|r.text()
+    \\    let text:(value:U)->str=match value{.record=>|r|r.text()
     \\        .empty=>"empty"}
     \\}
-    \\let make:(label:string)->R={@println(label)
+    \\let make:(label:str)->R={@println(label)
     \\    R.[s=label+"!"]}
     \\let number:()->int={@println("arg")
     \\    7}
@@ -6341,17 +6361,17 @@ test "instance calls preserve once only receiver argument order copies captures 
 
 test "instance calls skip later effects on receiver return panic propagation and terminal args" {
     const prelude =
-        \\let R=struct{s:string="ok",
-        \\    let use:(r:R,n:int)->string=r.s
-        \\    let skip:(r:R,n:int,m:int)->string=r.s
+        \\let R=struct{s:str="ok",
+        \\    let use:(r:R,n:int)->str=r.s
+        \\    let skip:(r:R,n:int,m:int)->str=r.s
         \\    @[noreturn]
         \\    let stop:(r:R)=@panic(r.s+"!")
         \\}
         \\@[noreturn]
         \\let relay:(r:R)=r.stop()
         \\let Result:(T:type,E:type)->type=union{ok:T,err:E,}
-        \\let RR=Result(R,string)
-        \\let RS=Result(string,string)
+        \\let RR=Result(R,str)
+        \\let RS=Result(str,str)
         \\let failed:()->RR=.err["error"]
         \\let arg:()->int={@print("BAD")
         \\    1}
@@ -6359,8 +6379,8 @@ test "instance calls skip later effects on receiver return panic propagation and
         \\    R.[]}
         \\let propagated:()->RS=.ok[failed().!.use(arg())]
         \\let pass:(r:R)->R=r
-        \\let returned:()->string=pass({return "returned"}).use(arg())
-        \\let argument:()->string=receiver().use({return "argument"})
+        \\let returned:()->str=pass({return "returned"}).use(arg())
+        \\let argument:()->str=receiver().use({return "argument"})
         \\let main:()={
         \\    @println(returned())
         \\    @println(argument())
@@ -6402,15 +6422,15 @@ const generic_instance_program =
     \\}
     \\let identity:(x:`T)->`T=x
     \\let make:()->`T=7
-    \\let main:()={let mut r=Box([][]string).[value=[["old"+"!"]]]
+    \\let main:()={let mut r=Box([][]str).[value=[["old"+"!"]]]
     \\let mut count:int=0
-    \\let receiver=()->Box([][]string){count+=1
+    \\let receiver=()->Box([][]str){count+=1
     \\@println("receiver",count)
     \\r}
     \\let change=()->bool {@println("argument")
     \\r.value[0]=["new"+"!"]
     \\true}
-    \\let read=()->string {r.value[0][0]}
+    \\let read=()->str {r.value[0][0]}
     \\let saved=receiver().keep(change)
     \\@println(saved[0][0],read(),count)
     \\let mapped=Box(bool).[value=true].map(identity)
@@ -6499,7 +6519,7 @@ test "backtick instance factory signatures preserve terminal execution source fr
         \\R.[]}
         \\}
         \\let main:()={let label="owned"
-        \\let keep=()->string{label}
+        \\let keep=()->str{label}
         \\R.[].f(true,
     ;
     for ([_][]const u8{ "make().stop()", "{let r=make()\nr.stop()}", "Factory.make().stop()" }) |argument| {
@@ -6541,8 +6561,8 @@ test "backtick instance generated C terminal argument skips later effects and no
 
 test "instance receiver snapshots survive later binding replacement" {
     const source =
-        \\let R=struct{s:string,
-        \\    let join:(r:R,other:R)->string=r.s+other.s
+        \\let R=struct{s:str,
+        \\    let join:(r:R,other:R)->str=r.s+other.s
         \\}
         \\let main:()={let mut r=R.[s="old"+"!"]
         \\    @println(r.join({r=R.[s="new"+"!"]
@@ -6560,7 +6580,7 @@ test "instance calls runtime allocation failures occur at receiver args and meth
         "let main:()=@println(R.[s=\"ab\"].join(\"cd\"))",
     }) |body| {
         const source = try std.mem.concat(test_gpa, u8, &.{
-            "let R=struct{s:string,\nlet join:(r:R,s:string)->string=r.s+s\n}\nlet arg:()->string={@print(\"BAD\")\n\"cd\"}\n", body,
+            "let R=struct{s:str,\nlet join:(r:R,s:str)->str=r.s+s\n}\nlet arg:()->str={@print(\"BAD\")\n\"cd\"}\n", body,
         });
         defer test_gpa.free(source);
         const program = try arrayTestProgram(source);
@@ -6640,10 +6660,10 @@ test "root enum scalars need no GC owners or integer operations" {
 
 test "transitive enum record leaves are reachable through placeholders in every field order" {
     for ([_][]const u8{
-        "k:K,b:bool,n:uint,s:string,",
-        "s:string,k:K,b:bool,n:uint,",
-        "n:uint,s:string,b:bool,k:K,",
-        "b:bool,n:uint,k:K,s:string,",
+        "k:K,b:bool,n:uint,s:str,",
+        "s:str,k:K,b:bool,n:uint,",
+        "n:uint,s:str,b:bool,k:K,",
+        "b:bool,n:uint,k:K,s:str,",
     }) |fields| {
         const source = try std.fmt.allocPrint(test_gpa, "let U=union{{ok:R,}}\nlet R=struct{{{s}}}\nlet K=enum{{x,y,}}\nlet unused:(cb:(U)->void)={{}}\nlet main:()={{}}", .{fields});
         defer test_gpa.free(source);
@@ -6654,7 +6674,7 @@ test "transitive enum record leaves are reachable through placeholders in every 
         for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "void nov_main(void); int main(void) { nov_main(); return 0; }", 0, "", "", mode);
     }
     for ([_][]const u8{ "i128", "u128" }) |width| {
-        const source = try std.fmt.allocPrint(test_gpa, "let U=union{{ok:R,}}\nlet R=struct{{k:K,b:bool,s:string,n:{s},}}\nlet K=enum{{x,}}\nlet unused:(cb:(U)->void)={{}}\nlet main:()={{}}", .{width});
+        const source = try std.fmt.allocPrint(test_gpa, "let U=union{{ok:R,}}\nlet R=struct{{k:K,b:bool,s:str,n:{s},}}\nlet K=enum{{x,}}\nlet unused:(cb:(U)->void)={{}}\nlet main:()={{}}", .{width});
         defer test_gpa.free(source);
         var module = try Module.init(test_gpa, "enum-width.nov", source);
         defer module.deinit();
@@ -6671,20 +6691,20 @@ const record_payload_program =
     \\let Result:(T:type,E:type)->type=union{ok:T,err:E,}
     \\let Apply=Result
     \\let U=union{ok:File,err:Error,none,}
-    \\let File=struct{name:string,extra:string,n:int,valid:bool=true,}
-    \\let Error=struct{message:string,detail:string,code:i8,}
+    \\let File=struct{name:str,extra:str,n:int,valid:bool=true,}
+    \\let Error=struct{message:str,detail:str,code:i8,}
     \\let Alias=File
     \\let Input=Apply(Alias,Error)
     \\let Output=Result(bool,Error)
-    \\let text:(s:string)->string={@print(s)
+    \\let text:(s:str)->str={@print(s)
     \\    s+"!"}
     \\let make:(good:bool)->Input={@print("M")
     \\    if good {.ok[Alias.[extra=text("b"),name=text("a"),n=7]]} else {.err[Error.[message="er"+"ror",detail="de"+"tail",code=-8]]}}
-    \\let use:(r:Alias,later:string)->string="{r.name}:{r.extra}:{r.n}:{r.valid}:"+later
+    \\let use:(r:Alias,later:str)->str="{r.name}:{r.extra}:{r.n}:{r.valid}:"+later
     \\let run:(good:bool)->Output={let file=make(good).!
     \\    @println(use(file,"x"+"y"))
     \\    .ok[file.valid]}
-    \\let show:(r:Output)->string=match r{.ok=>|b|"{b}"
+    \\let show:(r:Output)->str=match r{.ok=>|b|"{b}"
     \\    .err=>|e|"{e.message}:{e.detail}:{e.code}"}
     \\let copy:(u:U)->U=u
     \\let main:()={@println(show(run(true)),show(run(false)))
@@ -6709,7 +6729,7 @@ test "record payloads preserve layout order copies effects propagation captures 
 
 test "record payload inactive storage stays zero when loop temporaries change variants" {
     const library = try emitSource(
-        "let U=union{ok:R,err:R,none,}\nlet R=struct{s:string,t:string,n:int,}\n" ++
+        "let U=union{ok:R,err:R,none,}\nlet R=struct{s:str,t:str,n:int,}\n" ++
             "let make:(which:uint)->U={let mut result:U=.none[]\nloop i in 0..which {result=if i == 0 {.ok[R.[s=\"a\"+\"b\",t=\"c\"+\"d\",n=1]]} else if i == 1 {.err[R.[s=\"e\"+\"f\",t=\"g\"+\"h\",n=2]]} else {.none[]}}\nresult}\nlet copy:(u:U)->U=u",
         null,
     );
@@ -6730,7 +6750,7 @@ test "record payload inactive storage stays zero when loop temporaries change va
 test "record payload width checking follows reverse dependencies and reports leaf source" {
     for ([_][]const u8{ "i128", "u128" }) |width| {
         for ([_]bool{ false, true }) |generic| {
-            const source = try std.fmt.allocPrint(test_gpa, "{s}\nlet R=struct{{wide:{s},s:string,}}\nlet f:(cb:(U)->void)={{}}\nlet main:()={{}}", .{ if (generic) "let G:(T:type)->type=union{ok:T,}\nlet U=G(R)" else "let U=union{ok:R,}", width });
+            const source = try std.fmt.allocPrint(test_gpa, "{s}\nlet R=struct{{wide:{s},s:str,}}\nlet f:(cb:(U)->void)={{}}\nlet main:()={{}}", .{ if (generic) "let G:(T:type)->type=union{ok:T,}\nlet U=G(R)" else "let U=union{ok:R,}", width });
             defer test_gpa.free(source);
             var module = try Module.init(test_gpa, "record-width.nov", source);
             defer module.deinit();
@@ -6751,8 +6771,8 @@ test "record payload width checking follows reverse dependencies and reports lea
 
 const option_propagation_program =
     \\let O:(T:type)->type=union{none,some:T,}
-    \\let Text=union{some:string,none,}
-    \\let Item=struct{s:string,}
+    \\let Text=union{some:str,none,}
+    \\let Item=struct{s:str,}
     \\let Items=union{some:Item,none,}
     \\let make:(yes:bool)->O(int)={@print("M")
     \\if yes{.some[7]}else{.none[]}}
@@ -6816,7 +6836,7 @@ test "Option propagation source free IR and every compiler allocation failure" {
 
 test "Option propagation none skips allocations and some reports runtime OOM" {
     for ([_]bool{ false, true }) |allocate| {
-        const source = try std.fmt.allocPrint(test_gpa, "let O:(T:type)->type=union{{some:T,none,}}\nlet make:()->O(string)={s}\nlet run:()->O(string)=.some[make().!+\"!\"]\nlet main:()=@println(match run(){{.some=>|s|s\n.none=>\"none\"}})", .{if (allocate) ".some[\"a\"+\"b\"]" else ".none[]"});
+        const source = try std.fmt.allocPrint(test_gpa, "let O:(T:type)->type=union{{some:T,none,}}\nlet make:()->O(str)={s}\nlet run:()->O(str)=.some[make().!+\"!\"]\nlet main:()=@println(match run(){{.some=>|s|s\n.none=>\"none\"}})", .{if (allocate) ".some[\"a\"+\"b\"]" else ".none[]"});
         defer test_gpa.free(source);
         const program = try arrayTestProgram(source);
         defer test_gpa.free(program);
@@ -6828,7 +6848,7 @@ test "Option propagation none skips allocations and some reports runtime OOM" {
 
 test "record payload propagation allocates only evaluated strings and handles OOM" {
     for ([_]bool{ false, true }) |allocate| {
-        const source = try std.fmt.allocPrint(test_gpa, "let G:(T:type,E:type)->type=union{{ok:T,err:E,}}\nlet R=struct{{s:string,}}\nlet make:()->G(int,R)=.err[R.[s={s}]]\nlet run:()->G(bool,R)=.ok[make().! == 0]\nlet main:()=@println(match run(){{.ok=>@panic(\"bad\")\n.err=>|r|r.s}})", .{if (allocate) "\"e\"+\"rr\"" else "\"err\""});
+        const source = try std.fmt.allocPrint(test_gpa, "let G:(T:type,E:type)->type=union{{ok:T,err:E,}}\nlet R=struct{{s:str,}}\nlet make:()->G(int,R)=.err[R.[s={s}]]\nlet run:()->G(bool,R)=.ok[make().! == 0]\nlet main:()=@println(match run(){{.ok=>@panic(\"bad\")\n.err=>|r|r.s}})", .{if (allocate) "\"e\"+\"rr\"" else "\"err\""});
         defer test_gpa.free(source);
         const library = try emitSource(source, null);
         defer test_gpa.free(library);
@@ -6843,14 +6863,14 @@ test "record payload propagation allocates only evaluated strings and handles OO
 test "record payload captures stay rooted through terminal panic and skip later effects" {
     const source =
         \\let G:(T:type,E:type)->type=union{ok:T,err:E,}
-        \\let R=struct{s:string,t:string,}
+        \\let R=struct{s:str,t:str,}
         \\let fail:()->G(R,R)={@print("F")
         \\    return .err[R.[s="pa"+"nic",t="mes"+"sage"]]}
-        \\let later:()->string={@print("BAD")
+        \\let later:()->str={@print("BAD")
         \\    "later"}
-        \\let use:(r:R,s:string)->bool=r.s == s
+        \\let use:(r:R,s:str)->bool=r.s == s
         \\let run:()->G(bool,R)=.ok[use(fail().!,later())]
-        \\let suffix:()->string="x"+"y"
+        \\let suffix:()->str="x"+"y"
         \\let main:()=match run(){.ok=>@panic("bad success")
         \\    .err=>|r|@panic("{r.s}:{r.t}:"+suffix())}
     ;
@@ -6877,18 +6897,18 @@ test "record payload IR owns source and emission survives every allocation failu
     const c = try collectingTestProgram(library);
     defer test_gpa.free(c);
     try compileAndRunExpected(c, "typedef int nonempty_translation_unit;", 0, record_payload_output, "");
-    try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{"let G:(T:type)->type=union{ok:T,}\nlet R=struct{s:string,}\nlet main:()={let u=G(R).ok[R.[s=\"a\"+\"b\"]]\n@println(match u{.ok=>|r|r.s})}"});
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{"let G:(T:type)->type=union{ok:T,}\nlet R=struct{s:str,}\nlet main:()={let u=G(R).ok[R.[s=\"a\"+\"b\"]]\n@println(match u{.ok=>|r|r.s})}"});
 }
 
 test "printing uses annotated format but ignores ordinary toString" {
     const source =
         \\let Custom=struct{value:int,
         \\@[stringify]
-        \\let format:(self:Custom)->string="custom:{self.value}"
-        \\let toString:(self:Custom)->string="ordinary custom"
+        \\let format:(self:Custom)->str="custom:{self.value}"
+        \\let toString:(self:Custom)->str="ordinary custom"
         \\}
         \\let Plain=struct{value:int,
-        \\let toString:(self:Plain)->string="ordinary plain"
+        \\let toString:(self:Plain)->str="ordinary plain"
         \\}
         \\let main:()={let custom=Custom.[value=7]
         \\let plain=Plain.[value=8]
@@ -6907,13 +6927,13 @@ test "printing uses annotated format but ignores ordinary toString" {
 
 const record_interpolation_program =
     \\let Alias=R
-    \\let Text=string
-    \\let Leaf=struct{s:string,
+    \\let Text=str
+    \\let Leaf=struct{s:str,
     \\    @[stringify]
-    \\    let toString:(l:Leaf)->string={@print("L")
+    \\    let toString:(l:Leaf)->str={@print("L")
     \\        "leaf:"+l.s}
     \\}
-    \\let R=struct{s:string,t:string,
+    \\let R=struct{s:str,t:str,
     \\    @[stringify]
     \\    let toString:(r:Alias)->Text={@print("R")
     \\        let leaf=Leaf.[s=r.s+"!"]
@@ -6923,9 +6943,9 @@ const record_interpolation_program =
     \\    R.[s="a"+"b",t="c"+"d"]}
     \\let scalar:()->bool={@print("S")
     \\    true}
-    \\let U=union{item:string,none,
+    \\let U=union{item:str,none,
     \\    @[stringify]
-    \\    let toString:(u:U)->string={@print("U")
+    \\    let toString:(u:U)->str={@print("U")
     \\        match u{.item=>|s|"union:"+s
     \\            .none=>"none"}}
     \\}
@@ -6947,9 +6967,9 @@ test "record interpolation reuses print conversions with exact aliases nested al
 test "record interpolation captures errors for panic and keeps nested payload owners rooted" {
     const source =
         \\let G:(T:type,E:type)->type=union{ok:T,err:E,}
-        \\let Error=struct{message:string,detail:string,
+        \\let Error=struct{message:str,detail:str,
         \\    @[stringify]
-        \\    let toString:(err:Error)->string={@print("C")
+        \\    let toString:(err:Error)->str={@print("C")
         \\        "{err.message}: {err.detail}"}
         \\}
         \\let fail:()->G(int,Error)=.err[Error.[message="not "+"found",detail="fi"+"le"]]
@@ -6964,19 +6984,19 @@ test "record interpolation captures errors for panic and keeps nested payload ow
 test "record interpolation skips converters and later placeholders on propagated or terminal paths" {
     const source =
         \\let G:(T:type,E:type)->type=union{ok:T,err:E,}
-        \\let R=struct{s:string,
+        \\let R=struct{s:str,
         \\    @[stringify]
-        \\    let toString:(r:R)->string={@print("BAD-CONVERT")
+        \\    let toString:(r:R)->str={@print("BAD-CONVERT")
         \\        r.s}
         \\}
-        \\let fail:()->G(R,string)={@print("F")
+        \\let fail:()->G(R,str)={@print("F")
         \\    .err["e"+"rr"]}
-        \\let later:()->string={@print("BAD-LATER")
+        \\let later:()->str={@print("BAD-LATER")
         \\    "later"}
-        \\let run:()->G(string,string)=.ok["prefix:{fail().!}:{later()}"]
+        \\let run:()->G(str,str)=.ok["prefix:{fail().!}:{later()}"]
         \\@[noreturn]
         \\let stop:()=@panic("stop")
-        \\let terminal:()->string="{stop()}{missing}"
+        \\let terminal:()->str="{stop()}{missing}"
         \\let main:()={@println(match run(){.ok=>|s|s
         \\    .err=>|s|s})
         \\    @print(terminal())}
@@ -7007,7 +7027,7 @@ test "record interpolation survives source release and every compiler allocation
 
 test "record interpolation conversion allocations fail safely and skipped conversions allocate nothing" {
     for ([_]bool{ false, true }) |convert| {
-        const source = try std.fmt.allocPrint(test_gpa, "let R=struct{{s:string,\n@[stringify]\nlet toString:(r:R)->string=r.s+\"!\"\n}}\nlet main:()={{let r=R.[s=\"ok\"]\n@println(if {s} {{\"{{r}}\"}} else {{\"skip\"}})}}", .{if (convert) "true" else "false"});
+        const source = try std.fmt.allocPrint(test_gpa, "let R=struct{{s:str,\n@[stringify]\nlet toString:(r:R)->str=r.s+\"!\"\n}}\nlet main:()={{let r=R.[s=\"ok\"]\n@println(if {s} {{\"{{r}}\"}} else {{\"skip\"}})}}", .{if (convert) "true" else "false"});
         defer test_gpa.free(source);
         const library = try emitSource(source, null);
         defer test_gpa.free(library);
@@ -7028,42 +7048,42 @@ const generic_struct_program =
     \\let make:(value:T)->Self=Self.[value=value]
     \\let wrap:(self:Self)->Box(Self)=Box(Self).[value=self]
     \\@[stringify]
-    \\let toString:(self:Self)->string="<{self.value}>"
+    \\let toString:(self:Self)->str="<{self.value}>"
     \\let unused:()->T=unknown
     \\}
     \\let Pair:(A:type,B:type)->type=struct{first:A,second:B,}
     \\let Default:(T:type)->type=struct{value:T=7,}
     \\let Kind=enum{first,second,}
-    \\let Flags:(T:type)->type=struct{value:T=.second,enabled:bool=true,text:string="default",}
+    \\let Flags:(T:type)->type=struct{value:T=.second,enabled:bool=true,text:str="default",}
     \\let R:(T:type,E:type)->type=union{ok:T,err:E,}
     \\let O:(T:type)->type=union{some:T,none,}
     \\let Template=Box
     \\let IntBox=Template(int)
     \\let Alias=IntBox
-    \\let Nested=struct{box:Box(Box(string)),}
-    \\let option:(x:O(Box(string)))->O(Box(int))={let value=x.!
+    \\let Nested=struct{box:Box(Box(str)),}
+    \\let option:(x:O(Box(str)))->O(Box(int))={let value=x.!
     \\.some[Box(int).[value=4]]}
-    \\let result:(x:R(Box(string),Box(string)))->R(Box(int),Box(string))={let value=x.!
+    \\let result:(x:R(Box(str),Box(str)))->R(Box(int),Box(str))={let value=x.!
     \\.ok[Box(int).[value=5]]}
     \\let main:()={
     \\let mut a=Box(int).[value=1]
     \\let saved:Alias=a
     \\a.value+=2
     \\let wrapped=a.wrap()
-    \\let mut nested=Nested.[box=Box(Box(string)).[value=Box(string).[value="a"+"b"]]]
+    \\let mut nested=Nested.[box=Box(Box(str)).[value=Box(str).[value="a"+"b"]]]
     \\let original=nested
     \\nested.box.value.value+="!"
-    \\nested.box.value=Box(string).make("new"+"!")
-    \\let pair=Pair(string,int).[second=wrapped.value.forward(),first=nested.box.value.get()]
-    \\let reverse=Pair(int,string).[first=pair.second,second=pair.first]
+    \\nested.box.value=Box(str).make("new"+"!")
+    \\let pair=Pair(str,int).[second=wrapped.value.forward(),first=nested.box.value.get()]
+    \\let reverse=Pair(int,str).[first=pair.second,second=pair.first]
     \\let flags=Flags(Kind).[]
     \\@println(saved.value,a.get(),pair.first,reverse.first,original.box,Default(int).[].value,flags.value==Kind.second,flags.enabled,flags.text)
-    \\let mut arr:[]Box(string)=[Box(string).[value="x"+"y"],nested.box.value]
+    \\let mut arr:[]Box(str)=[Box(str).[value="x"+"y"],nested.box.value]
     \\let copy=arr
-    \\arr[0]=Box(string).[value="z"+"!"]
-    \\arr += [Box(string).[value="tail"+"!"]]
-    \\let ok:O(Box(string))=.some[copy[0]]
-    \\let err:R(Box(string),Box(string))=.err[copy[1]]
+    \\arr[0]=Box(str).[value="z"+"!"]
+    \\arr += [Box(str).[value="tail"+"!"]]
+    \\let ok:O(Box(str))=.some[copy[0]]
+    \\let err:R(Box(str),Box(str))=.err[copy[1]]
     \\@println(copy[0],arr[0],arr[-1],match option(ok){.some=>|v|v.value
     \\.none=>0},match result(err){.ok=>|v|"BAD"
     \\.err=>|v|v.value})
@@ -7108,11 +7128,11 @@ fn testImportedGenericStructs(allocator: std.mem.Allocator) ![]u8 {
             \\let Alias=B
             \\let Kind=enum{wrong,}
             \\let prefix="WRONG"
-            \\let helper:()->string="WRONG"
+            \\let helper:()->str="WRONG"
             \\let main:()={let value:int=3
             \\let x:Alias=library.Box(int).[value=value]
             \\let y:api.Box(int)=B.make(x.value)
-            \\let z=Box(string).make("a"+"b")
+            \\let z=Box(str).make("a"+"b")
             \\@println(x,y,z,z.message(),x.kind==library.Kind.good)
             \\}
         );
@@ -7123,7 +7143,7 @@ fn testImportedGenericStructs(allocator: std.mem.Allocator) ![]u8 {
         );
         const library = try comp.addSource("/lib/box.nov",
             \\let prefix="library:"
-            \\let helper:()->string="helper"
+            \\let helper:()->str="helper"
             \\@[public]
             \\let Kind=enum{good,bad,}
             \\@[public]
@@ -7133,9 +7153,9 @@ fn testImportedGenericStructs(allocator: std.mem.Allocator) ![]u8 {
             \\let make:(value:T)->Self=Self.[value=value]
             \\@[public]
             \\@[stringify]
-            \\let toString:(self:Self)->string="<{self.value}>"
+            \\let toString:(self:Self)->str="<{self.value}>"
             \\@[public]
-            \\let message:(self:Self)->string=prefix+helper()
+            \\let message:(self:Self)->str=prefix+helper()
             \\}
         );
         for ([_]struct { source: Source.Id, name: []const u8, target: Source.Id }{
@@ -7196,7 +7216,7 @@ test "generic structs method worklist handles concrete typed locals void and nor
         \\x.touch()
         \\let y=x.next()
         \\y.touch()
-        \\let stop:()->void=Box(string).stop
+        \\let stop:()->void=Box(str).stop
         \\@println("done")
         \\}
     );
@@ -7217,16 +7237,16 @@ const generic_method_program =
     \\let sibling:(self:Self,fallback:T)->T=unwrapOr(self,fallback)
     \\let recur:(self:Self,fallback:T,n:int)->T=if n == 0 {self.forward(fallback)} else {recur(self,fallback,n - 1)}
     \\@[stringify]
-    \\let toString:(self:Self)->string=match self{.ok=>"ok"
+    \\let toString:(self:Self)->str=match self{.ok=>"ok"
     \\.err=>"err"}
     \\}
     \\let Count=int
-    \\let R=Result(Count,string)
+    \\let R=Result(Count,str)
     \\let Alias=R
-    \\let S=Result(string,int)
-    \\let errorInt:(e:string)->int={@print(e)
+    \\let S=Result(str,int)
+    \\let errorInt:(e:str)->int={@print(e)
     \\41}
-    \\let errorString:(e:int)->string={@print(e)
+    \\let errorString:(e:int)->str={@print(e)
     \\"fall"+"back"}
     \\let make:()->R={@print("R")
     \\.err["E"]}
@@ -7236,7 +7256,7 @@ const generic_method_program =
     \\let ok:R=.ok[3]
     \\let err:Alias=.err["E"]
     \\let text:S=.err[5]
-    \\let cb:(string)->int=errorInt
+    \\let cb:(str)->int=errorInt
     \\let method:(R,int)->int=Alias.unwrapOr
     \\@println(ok.unwrapOr(9)," ",R.unwrapOr(err,8)," ",method(ok,0))
     \\@println(ok.unwrapOrElse(cb)," ",err.unwrapOrElse(cb))
@@ -7279,12 +7299,12 @@ test "generic methods root allocated record payload copies across later argument
         \\let unwrapOr:(self:@This(),fallback:T)->T=match self{.ok=>|v|v
         \\.err=>fallback}
         \\}
-        \\let Pair=struct{s:string,n:int,}
-        \\let R=G(Pair,string)
-        \\let S=G(string,bool)
+        \\let Pair=struct{s:str,n:int,}
+        \\let R=G(Pair,str)
+        \\let S=G(str,bool)
         \\let make:()->R=.ok[Pair.[s="a"+"b",n=7]]
         \\let later:()->Pair=Pair.[s="c"+"d",n=9]
-        \\let consume:(p:Pair,s:string)=@println(p.s,p.n,s)
+        \\let consume:(p:Pair,s:str)=@println(p.s,p.n,s)
         \\let main:()={
         \\let mut original=make()
         \\let copy=original
@@ -7302,12 +7322,12 @@ test "generic methods root allocated record payload copies across later argument
 
 test "generic method terminal branches and noreturn methods retain void annotations" {
     const source =
-        \\let G:(T:type)->type=union{ok:T,err:string,
+        \\let G:(T:type)->type=union{ok:T,err:str,
         \\let Self=@This()
         \\let get:(self:Self)->T=match self{.ok=>|v|{return v}
         \\.err=>|e|@panic(e)}
         \\@[noreturn]
-        \\let halt:(self:Self,message:string)->void=@panic(message)
+        \\let halt:(self:Self,message:str)->void=@panic(message)
         \\let stop:(self:Self)->T={Self.halt(self,"stopped")}
         \\}
         \\let R=G(int)
@@ -7323,7 +7343,7 @@ test "generic method terminal branches and noreturn methods retain void annotati
 
 test "generic callback methods allocate only in selected ordinary bodies and report runtime OOM" {
     for ([_]bool{ false, true }) |allocate| {
-        const source = try std.fmt.allocPrint(test_gpa, "let G:(T:type,E:type)->type=union{{ok:T,err:E,\nlet unwrapOrElse:(self:@This(),fallback:(E)->T)->T=match self{{.ok=>|v|v\n.err=>|e|fallback(e)}}\n}}\nlet R=G(string,string)\nlet cb:(e:string)->string={s}\nlet main:()={{let r:R=.err[\"err\"]\n@println(r.unwrapOrElse(cb))}}", .{if (allocate) "e+\"!\"" else "e"});
+        const source = try std.fmt.allocPrint(test_gpa, "let G:(T:type,E:type)->type=union{{ok:T,err:E,\nlet unwrapOrElse:(self:@This(),fallback:(E)->T)->T=match self{{.ok=>|v|v\n.err=>|e|fallback(e)}}\n}}\nlet R=G(str,str)\nlet cb:(e:str)->str={s}\nlet main:()={{let r:R=.err[\"err\"]\n@println(r.unwrapOrElse(cb))}}", .{if (allocate) "e+\"!\"" else "e"});
         defer test_gpa.free(source);
         const library = try emitSource(source, null);
         defer test_gpa.free(library);
@@ -7346,11 +7366,11 @@ const demand_void_result_program =
     \\let unwrapOrElse:(self:Self,fallback:(E)->T)->T=match self{.ok=>|v|v
     \\.err=>|e|fallback(e)}
     \\}
-    \\let Unit=Result(void,string)
+    \\let Unit=Result(void,str)
     \\let Empty=Result(int,void)
     \\let Both=Result(void,void)
     \\let unit:(b:bool)->Unit=if b{.ok[]}else{.err["err"+"!"]}
-    \\let run:(b:bool)->Result(int,string)={let v:void=unit(b).!
+    \\let run:(b:bool)->Result(int,str)={let v:void=unit(b).!
     \\.ok[2]}
     \\let makeEmpty:(b:bool)->Empty=if b{.ok[5]}else{.err[]}
     \\let remap:(b:bool)->Result(bool,void)=.ok[makeEmpty(b).! == 5]
@@ -7397,14 +7417,14 @@ test "demand generic method body worklist discovers new containers callbacks and
         \\.err=>fallback}
         \\let get:(self:Self,fallback:T)->T=identity(self,fallback)
         \\@[stringify]
-        \\let toString:(self:Self)->string={
+        \\let toString:(self:Self)->str={
         \\let flag:G(bool,E)=.ok[true]
         \\let cb:(G(bool,E),bool)->bool=G(bool,E).get
         \\if cb(flag,false){"yes"+"!"}else{"no"}}
         \\let unused:(x:void)->T=missing
         \\let expand:()->G((T)->T)=G((T)->T).expand()
         \\}
-        \\let R=G(int,string)
+        \\let R=G(int,str)
         \\let main:()={let r:R=.ok[1]
         \\@println("{r}")}
     ;
@@ -7438,14 +7458,14 @@ test "generic unions and structural propagation preserve identities effects and 
 test "generic propagation preserves once only evaluation short circuit returns and void payloads" {
     const source =
         \\let G:(T:type,E:type)->type=union{ok:T,err:E,}
-        \\let R=G(int,string)
+        \\let R=G(int,str)
         \\let read:(b:bool)->R={@print("R")
         \\    if b {.ok[5]} else {.err["e"+"!"]}}
         \\let rhs:()->int={@print("X")
         \\    1}
         \\let sum:(b:bool)->R=.ok[read(b).!+rhs()]
-        \\let lazy:(b:bool)->G(bool,string)=.ok[b and read(false).! == 0]
-        \\let unit:(b:bool)->G(void,string)=if b {.ok[]} else {.err["void"+"!"]}
+        \\let lazy:(b:bool)->G(bool,str)=.ok[b and read(false).! == 0]
+        \\let unit:(b:bool)->G(void,str)=if b {.ok[]} else {.err["void"+"!"]}
         \\let fromUnit:(b:bool)->R={let v:void=unit(b).!
         \\    .ok[2]}
         \\let emptyError:()->G(int,void)=.err[]
@@ -7474,10 +7494,10 @@ test "generic propagation preserves once only evaluation short circuit returns a
 test "generic success string stays rooted across later allocating arguments and loops" {
     const source =
         \\let G:(T:type,E:type)->type=union{err:E,ok:T,}
-        \\let Input=G(string,string)
-        \\let Output=G(int,string)
+        \\let Input=G(str,str)
+        \\let Output=G(int,str)
         \\let make:()->Input=.ok["a"+"b"]
-        \\let use:(s:string,other:string)->string=s+other
+        \\let use:(s:str,other:str)->str=s+other
         \\let run:()->Output={
         \\    let s=make().!
         \\    let n:int=loop{let copy=use(s,"c"+"d")
@@ -7495,7 +7515,7 @@ test "generic success string stays rooted across later allocating arguments and 
 
 test "generic error propagation itself allocates nothing and payload OOM remains checked" {
     for ([_]bool{ false, true }) |allocate| {
-        const source = try std.fmt.allocPrint(test_gpa, "let G:(T:type,E:type)->type=union{{ok:T,err:E,}}\nlet make:()->G(int,string)=.err[{s}]\nlet run:()->G(bool,string)=.ok[make().! == 0]\nlet main:()=@println(match run(){{.ok=>\"bad\"\n.err=>|e|e}})", .{if (allocate) "\"e\"+\"rr\"" else "\"err\""});
+        const source = try std.fmt.allocPrint(test_gpa, "let G:(T:type,E:type)->type=union{{ok:T,err:E,}}\nlet make:()->G(int,str)=.err[{s}]\nlet run:()->G(bool,str)=.ok[make().! == 0]\nlet main:()=@println(match run(){{.ok=>\"bad\"\n.err=>|e|e}})", .{if (allocate) "\"e\"+\"rr\"" else "\"err\""});
         defer test_gpa.free(source);
         const library = try emitSource(source, null);
         defer test_gpa.free(library);
@@ -7528,14 +7548,14 @@ const noreturn_program =
     \\@[noreturn]
     \\let recursive:()=recursive()
     \\@[noreturn]
-    \\let stop:(s:string)->void=@panic(s)
+    \\let stop:(s:str)->void=@panic(s)
     \\@[noreturn]
     \\let spin:()=loop {loop {break}
     \\    continue}
     \\let A=struct{
     \\    @[noreturn]
     \\    @[public]
-    \\    let halt:(s:string)=stop(s)
+    \\    let halt:(s:str)=stop(s)
     \\}
     \\let side:()->int={@print("bad")
     \\    1}
@@ -7597,13 +7617,13 @@ test "direct noreturn calls are terminal in operands branches and argument paths
         \\@[noreturn]
         \\let stop:()=@panic("stop")
         \\@[noreturn]
-        \\let take:(s:string)=@panic(s)
+        \\let take:(s:str)=@panic(s)
         \\let side:()->int={@print("bad")
         \\    9}
         \\let arg:()->int={@print("A")
         \\    1}
         \\let f:(a:int,b:int,c:int)->int=a+b+c
-        \\let returning:()->string=take({return "returned"})
+        \\let returning:()->str=take({return "returned"})
         \\let main:()=
     ;
     for ([_][]const u8{
@@ -7624,7 +7644,7 @@ test "direct noreturn calls are terminal in operands branches and argument paths
 }
 
 const panic_program =
-    \\let message: () -> string = {@print("M")
+    \\let message: () -> str = {@print("M")
     \\    "hé\0" + "!"}
     \\let stop: (b: bool) -> int = match b {
     \\    true => @panic("{message()}")
@@ -7660,15 +7680,15 @@ test "panic literal empty and NUL messages need no allocation" {
 
 test "panic branches operands and terminal arguments preserve selected effects" {
     const prelude =
-        \\let U = union {ok: int, err: string,}
+        \\let U = union {ok: int, err: str,}
         \\let side: () -> int = {@print("bad")
         \\    9}
         \\let arg: () -> int = {@print("A")
         \\    1}
         \\let f: (a: int, b: int, c: int) -> int = a + b + c
         \\let pick: (b: bool) -> int = if b {@panic("stop")} else {arg()}
-        \\let both: (b: bool) -> string = if b {@panic("stop")} else {@panic("other")}
-        \\let returning: () -> string = @panic({return "returned"})
+        \\let both: (b: bool) -> str = if b {@panic("stop")} else {@panic("other")}
+        \\let returning: () -> str = @panic({return "returned"})
         \\let breaking: () -> int = loop {@panic({break 7})}
         \\let continuing: () -> int = {let mut n: int = 0
         \\    loop n < 2 {n += 1
@@ -7743,11 +7763,11 @@ const union_program =
     \\let Alias = U
     \\@[public]
     \\let U = union {
-    \\    ok: int, err: string, none, flag: bool,
+    \\    ok: int, err: str, none, flag: bool,
     \\    @[public]
     \\    @[stringify]
-    \\    let toString: (u: Alias) -> string = describe(u)
-    \\    let describe: (u: U) -> string = match u {
+    \\    let toString: (u: Alias) -> str = describe(u)
+    \\    let describe: (u: U) -> str = match u {
     \\        .ok => |v| "n:{v}"
     \\        .err => |s| s + "!"
     \\        .none => |unit| {let v: void = unit
@@ -7756,7 +7776,7 @@ const union_program =
     \\    }
     \\}
     \\let id: (u: U) -> Alias = u
-    \\let make: () -> string = {@print("S")
+    \\let make: () -> str = {@print("S")
     \\    "hé\0" + "x"}
     \\let choose: (u: U) -> int = match u {
     \\    .ok => |n| n
@@ -7788,7 +7808,7 @@ test "unions preserve nominal copies private captures methods evaluation and for
 }
 
 test "union copies share immutable owners and zero inactive fields" {
-    const library = try emitSource("let U=union{s:string,n:int,none,}\nlet make:()->U=U.s[\"a\"+\"b\"]\nlet copy:(u:U)->U=u\nlet none:()->U=.none[]", null);
+    const library = try emitSource("let U=union{s:str,n:int,none,}\nlet make:()->U=U.s[\"a\"+\"b\"]\nlet copy:(u:U)->U=u\nlet none:()->U=.none[]", null);
     defer test_gpa.free(library);
     const c = try std.mem.concat(test_gpa, u8, &.{ library, "\nint main(void) { nov_rt_heap.collect_every_allocation = 1; " ++
         "nov_record_0 a=nov_make(), b=nov_copy(a), n=nov_none(); " ++
@@ -8311,16 +8331,16 @@ test "nestedunion Option Result captures source free managed arrays forced GC O0
     const source =
         \\let Option:(T:type)->type=union{none,some:T,}
         \\let Result:(T:type,E:type)->type=union{ok:T,err:E,}
-        \\let OR=Option(Result([][]string,string))
-        \\let RO=Result(Option([][]string),string)
+        \\let OR=Option(Result([][]str,str))
+        \\let RO=Result(Option([][]str),str)
         \\let main:()={
         \\ let mut value:OR=.some[.ok[[["a"+"b"]]]]
         \\ let saved=value
         \\ let capture=()->OR {saved}
         \\ let replace=(){value=.none[]}
         \\ let mut rows=match value {.some=>|r|match r {.ok=>|a|a
-        \\ .err=>@as([][]string,[])}
-        \\ .none=>@as([][]string,[])}
+        \\ .err=>@as([][]str,[])}
+        \\ .none=>@as([][]str,[])}
         \\ let row=&rows[0]
         \\ row.*[0]="changed"
         \\ replace()
@@ -8353,7 +8373,7 @@ test "nestedunion Option Result captures source free managed arrays forced GC O0
     const c = try collectingTestProgram(library);
     defer test_gpa.free(c);
     for ([_][]const u8{ "-O0", "-O3" }) |mode|
-        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "[Option(Result([][]string, string)).some[Result([][]string, string).ok[[[ab]]]], Option(Result([][]string, string)).none] Result(Option([][]string), string).ok[Option([][]string).some[[[cd]]]]\n", "", mode);
+        try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, "[Option(Result([][]str, str)).some[Result([][]str, str).ok[[[ab]]]], Option(Result([][]str, str)).none] Result(Option([][]str), str).ok[Option([][]str).some[[[cd]]]]\n", "", mode);
 }
 
 test "nestedunion source free inactive poison no allocation OOM malformed tags O0 O3" {
@@ -8423,7 +8443,7 @@ test "array union payload source free recursive copies precise roots printing fo
 
 test "array union payload captures references and shared closure environments forced GC O0 O3" {
     const source =
-        \\let U=union{some:[][]string,none,}
+        \\let U=union{some:[][]str,none,}
         \\let F=union{some:[]()->int,none,}
         \\let main:()={
         \\ let mut value:U=.some[[["a"+"b"]]]
@@ -8431,7 +8451,7 @@ test "array union payload captures references and shared closure environments fo
         \\ let snapshot=()->U {saved}
         \\ let replace=(){value=.none[]}
         \\ let mut rows=match value {.some=>|a|a
-        \\ .none=>@as([][]string,[])}
+        \\ .none=>@as([][]str,[])}
         \\ let row=&rows[0]
         \\ row.*[0]="changed"
         \\ replace()
@@ -8488,7 +8508,7 @@ test "union payload allocation failure panics but skipped payloads allocate noth
         .{ .body = "let u:U=if true {.none[]} else {.s[\"a\"+\"b\"]}\n@println(match u {.s=>|s|s\n.none=>\"ok\"})", .allocates = false },
         .{ .body = "let u=U.s[\"a\"+\"b\"]\n@println(match u {.s=>|s|s\n.none=>\"ok\"})", .allocates = true },
     }) |case| {
-        const source = try std.fmt.allocPrint(test_gpa, "let U=union{{s:string,none,}}\nlet main:()={{{s}\n}}", .{case.body});
+        const source = try std.fmt.allocPrint(test_gpa, "let U=union{{s:str,none,}}\nlet main:()={{{s}\n}}", .{case.body});
         defer test_gpa.free(source);
         const library = try emitSource(source, null);
         defer test_gpa.free(library);
@@ -8542,7 +8562,7 @@ test "union lowering and emission own source and survive every allocation failur
 const field_mutation =
     \\let K = enum { first, second, }
     \\let Alias = R
-    \\let R = struct { x: i8 = 10, y: int = 0, s: string = "hé\0", b: bool = false, k: K = .first, len: uint = 0, }
+    \\let R = struct { x: i8 = 10, y: int = 0, s: str = "hé\0", b: bool = false, k: K = .first, len: uint = 0, }
     \\let copy: (r: R) -> R = {let mut local = r
     \\    local.x = 99
     \\    local.s += "copy"
@@ -8639,12 +8659,12 @@ const record_program =
     \\let Alias = R
     \\@[public]
     \\let R = struct {
-    \\    s: string = "hé\0",
+    \\    s: str = "hé\0",
     \\    n: int = 0,
     \\    b: bool = false,
     \\    @[public]
     \\    @[stringify]
-    \\    let toString: (self: Alias) -> string = {
+    \\    let toString: (self: Alias) -> str = {
     \\        @print("T")
     \\        "{self.s}:{self.n}:{self.b}"
     \\    }
@@ -8652,7 +8672,7 @@ const record_program =
     \\}
     \\let num: () -> int = {@print("N")
     \\    5}
-    \\let text: () -> string = {@print("S")
+    \\let text: () -> str = {@print("S")
     \\    "hé\0" + "!"}
     \\let main: () = {
     \\    let mut item = Alias.[ n = num(), s = text(), b = true ]
@@ -8691,7 +8711,7 @@ test "record fields defaults methods and C output survive source release and eve
 }
 
 test "record parameters returns and assignments share immutable string backing" {
-    const library = try emitSource("let R = struct { s: string, n: int = 7, }\nlet make: () -> R = R.[s=\"a\"+\"b\"]\nlet share: (r: R) -> R = {let mut copy=r\ncopy=r\ncopy}\n", null);
+    const library = try emitSource("let R = struct { s: str, n: int = 7, }\nlet make: () -> R = R.[s=\"a\"+\"b\"]\nlet share: (r: R) -> R = {let mut copy=r\ncopy=r\ncopy}\n", null);
     defer test_gpa.free(library);
     const c = try std.mem.concat(test_gpa, u8, &.{ library, "\nint main(void) { nov_rt_heap.collect_every_allocation = 1; " ++
         "nov_record_0 a = nov_make(); nov_record_0 b = nov_share(a); " ++
@@ -8757,14 +8777,14 @@ test "record scalar fields cover every supported integer width and literal limit
 test "record scoped forward methods override module homonyms without global printing overloads" {
     const source =
         \\let Alias=R
-        \\let first: (r: R) -> string = "wrong"
+        \\let first: (r: R) -> str = "wrong"
         \\let R=struct { s: Text="right",
         \\ @[stringify]
         \\ let toString: (self: Alias) -> Text = first(self)
-        \\ let first: (self: R) -> string = second(self)
-        \\ let second: (self: R) -> string = self.s+"!"
+        \\ let first: (self: R) -> str = second(self)
+        \\ let second: (self: R) -> str = self.s+"!"
         \\}
-        \\let Text=string
+        \\let Text=str
         \\let main:()={ @println(Alias.[], Alias.first(R.[])) }
     ;
     const c = try arrayTestProgram(source);
@@ -8778,7 +8798,7 @@ test "record constructors and allocating toString report OOM while skipped const
         .{ .body = "let r=R.[s=\"a\"+\"b\"]\n@println(r.s)", .allocates = true },
         .{ .body = "@println(R.[])", .allocates = true },
     }) |case| {
-        const source = try std.fmt.allocPrint(test_gpa, "let R=struct{{s:string=\"ok\",\n@[stringify]\nlet toString:(self:R)->string=self.s+\"!\"\n}}\nlet main:()={{{s}\n}}", .{case.body});
+        const source = try std.fmt.allocPrint(test_gpa, "let R=struct{{s:str=\"ok\",\n@[stringify]\nlet toString:(self:R)->str=self.s+\"!\"\n}}\nlet main:()={{{s}\n}}", .{case.body});
         defer test_gpa.free(source);
         const library = try emitSource(source, null);
         defer test_gpa.free(library);
@@ -8792,11 +8812,11 @@ test "record constructors and allocating toString report OOM while skipped const
 
 test "record string field roots cover branch and loop merges early returns and allocating arguments" {
     const source =
-        \\let R = struct { s: string,
+        \\let R = struct { s: str,
         \\ @[stringify]
-        \\ let toString: (self: R) -> string = self.s + "!"
+        \\ let toString: (self: R) -> str = self.s + "!"
         \\}
-        \\let make: (r: R, text: string) -> R = { @println(text)
+        \\let make: (r: R, text: str) -> R = { @println(text)
         \\ return r }
         \\let main: () = {
         \\ let a = if true { R.[s="a"+"b"] } else { R.[s="unused"+"x"] }
@@ -8841,9 +8861,9 @@ fn emitReferenceRebinding(allocator: std.mem.Allocator, source: []const u8) ![]u
 }
 
 const mutable_method_managed =
-    \\let Inner=struct{rows:[][]string,callback:()->string,}
+    \\let Inner=struct{rows:[][]str,callback:()->str,}
     \\let R=struct{inner:Inner,
-    \\let change:(self:&mut R,suffix:string)={let saved=self.*
+    \\let change:(self:&mut R,suffix:str)={let saved=self.*
     \\self.*.inner.rows=[[self.*.inner.rows[0][0]+suffix]]
     \\@println(saved.inner.rows[0][0],self.*.inner.rows[0][0],saved.inner.callback(),self.*.inner.callback())}
     \\let snapshot:(self:R)->R=self
@@ -8854,10 +8874,10 @@ const mutable_method_managed =
     \\local}
     \\let echo:(self:&mut R,value:`T)->`T=value
     \\}
-    \\let make:(text:string)->R={let captured=text+"!"
-    \\R.[inner=Inner.[rows=[[text+"?"]],callback=()->string{captured}]]}
-    \\let forward:(p:&mut R,s:string)={p.change(s)}
-    \\let effect:()->string={@println("argument")
+    \\let make:(text:str)->R={let captured=text+"!"
+    \\R.[inner=Inner.[rows=[[text+"?"]],callback=()->str{captured}]]}
+    \\let forward:(p:&mut R,s:str)={p.change(s)}
+    \\let effect:()->str={@println("argument")
     \\"x"+"y"}
     \\let main:()={let mut root=make("root")
     \\let frozen=root.snapshot()
@@ -8940,13 +8960,13 @@ test "mutable method receivers source free receiver index once before arguments 
 }
 
 const automatic_method_snapshots =
-    \\let R=struct{rows:[][]string,
-    \\let take:(self:R,n:int)->string=self.rows[0][0]
-    \\let generic:(self:R,n:`T)->string=self.rows[0][0]
-    \\let read:(self:&R)->string=self.*.rows[0][0]
-    \\let set:(self:&mut R,text:string)={self.*.rows=[[text]]}
+    \\let R=struct{rows:[][]str,
+    \\let take:(self:R,n:int)->str=self.rows[0][0]
+    \\let generic:(self:R,n:`T)->str=self.rows[0][0]
+    \\let read:(self:&R)->str=self.*.rows[0][0]
+    \\let set:(self:&mut R,text:str)={self.*.rows=[[text]]}
     \\}
-    \\let forward:(p:&R)->string=p.take(0)
+    \\let forward:(p:&R)->str=p.take(0)
     \\let main:()={let mut a=R.[rows=[["old"+"!"]]]
     \\let mut b=R.[rows=[["other"+"!"]]]
     \\let mut p=&a
@@ -9025,7 +9045,7 @@ test "reference parameters scalar forwarding recursion callbacks argument snapsh
 }
 
 const reference_parameter_managed =
-    \\let R=struct{s:string,values:[][]int,}
+    \\let R=struct{s:str,values:[][]int,}
     \\let update:(p:&mut R)={let frozen=p.*
     \\p.*.s +="x"+"y"
     \\p.*.values=[[9]]
@@ -9033,21 +9053,21 @@ const reference_parameter_managed =
     \\let arrays:(p:&mut [][]int)={let frozen=p.*
     \\p.* =[[8]]
     \\@println(frozen[0][0],p.*[0][0])}
-    \\let text:(p:&mut string)={p.* +="!"+"!"}
+    \\let text:(p:&mut str)={p.* +="!"+"!"}
     \\let invoke:(p:&()->int)->int=p.*()
     \\let main:()={
     \\let mut record=R.[s="a"+"!",values=[[1]]]
     \\update(&record)
     \\let mut rows:[][]int=[[2]]
     \\arrays(&rows)
-    \\let mut strings:[]string=["c"+"!","d"+"!"]
+    \\let mut strings:[]str=["c"+"!","d"+"!"]
     \\text(&strings[-1])
     \\@println(strings[0],strings[1])
     \\let captured:int=7
     \\let f=()->int{captured}
     \\@println(invoke(&f))
     \\let suffix="z"+"!"
-    \\let closure=(p:&mut string){p.* +=suffix}
+    \\let closure=(p:&mut str){p.* +=suffix}
     \\let mut s="e"+"!"
     \\closure(&s)
     \\@println(s)
@@ -9108,14 +9128,14 @@ test "reference parameters generic nested forwarding and function value deep cop
 
 test "reference parameters snapshot raw element pointer before later argument allocation and readonly wrap" {
     const source =
-        \\let effect:()->string={@println("later")
+        \\let effect:()->str={@println("later")
         \\"x"+"y"}
-        \\let append:(p:&mut string,s:string)={p.* +=s}
-        \\let read:(p:&string)->string=p.*
-        \\let forward:(p:&mut string)->string=read(p)
-        \\let fromValue:(s:string)->string=read(&s)
+        \\let append:(p:&mut str,s:str)={p.* +=s}
+        \\let read:(p:&str)->str=p.*
+        \\let forward:(p:&mut str)->str=read(p)
+        \\let fromValue:(s:str)->str=read(&s)
         \\let main:()={
-        \\let mut strings:[]string=["a"+"!","b"+"!"]
+        \\let mut strings:[]str=["a"+"!","b"+"!"]
         \\append(&strings[-1],effect())
         \\@println(forward(&strings[-1]),strings[0])
         \\@println(fromValue("c"+"!"))
@@ -9229,7 +9249,7 @@ test "reference rebinding array elements normalize signed indices once and prese
 }
 
 const reference_rebinding_managed =
-    \\let R=struct{s:string,values:[][]int,}
+    \\let R=struct{s:str,values:[][]int,}
     \\let main:()={
     \\let mut a=R.[s="a"+"!",values=[[1]]]
     \\let mut b=R.[s="b"+"!",values=[[2]]]
@@ -9247,8 +9267,8 @@ const reference_rebinding_managed =
     \\let frozen=array.*
     \\array.* =[[5]]
     \\@println(array.*[0][0],frozen[0][0])
-    \\let mut strings:[]string=["c"+"!","d"+"!"]
-    \\let mut other_strings:[]string=["other"+"!"]
+    \\let mut strings:[]str=["c"+"!","d"+"!"]
+    \\let mut other_strings:[]str=["other"+"!"]
     \\let mut text=&strings[-1]
     \\text.* +={text=&other_strings[0]
     \\"e"+"!"}
@@ -9360,7 +9380,7 @@ test "len builtin readonly wrappers are source free and allocation free under fo
         \\let cast:(a:[][]int)->uint=@len(@as([][]int,a))
         \\let choose:(a:[][]int,b:bool)->uint=@len(if b{a}else{a})
         \\let inner:(a:[][]int)->uint=@len({a[0]})
-        \\let text:(s:string)->uint=@len(s)
+        \\let text:(s:str)->uint=@len(s)
     );
     defer test_gpa.free(library);
     const c = try std.mem.concat(test_gpa, u8, &.{
@@ -9434,7 +9454,7 @@ fn arrayConcatenationTestProgram(source: []const u8) ![]u8 {
 
 test "array concatenation source free recursive copies operand effects and queries forced GC O0 O3" {
     const program = try arrayConcatenationTestProgram(
-        \\let R=struct{items:[]string,}
+        \\let R=struct{items:[]str,}
         \\let U=union{row:R,none,}
         \\let concat:(a:[]`T,b:[]`T)->[]`T=a+b
         \\let stop:()->int={let ignored:[]int={return 7}+{@panic("RHS executed")}
@@ -9508,11 +9528,11 @@ fn collectingTestProgram(library: []const u8) ![]u8 {
 }
 
 const string_example =
-    \\let greeting: string = "hé\0"
-    \\let identity: (s: string) -> string = s
-    \\let effect: (s: string) -> string = {@print(s)
+    \\let greeting: str = "hé\0"
+    \\let identity: (s: str) -> str = s
+    \\let effect: (s: str) -> str = {@print(s)
     \\    s + "!"}
-    \\let choose: (b: bool) -> string = {if b {return "early" + "!"}
+    \\let choose: (b: bool) -> str = {if b {return "early" + "!"}
     \\    "late"}
     \\let main: () -> void = {
     \\    let mut value = greeting + "😀"
@@ -9548,7 +9568,7 @@ const match_pipes =
     \\    0 | 1 => n
     \\    _ => fibo(n - 1) + fibo(n - 2)
     \\}
-    \\let fizz: (n: uint) -> string = match n % 3, n % 5 {
+    \\let fizz: (n: uint) -> str = match n % 3, n % 5 {
     \\    0, 0 => "FizzBuzz"
     \\    0, _ => "Fizz"
     \\    _, 0 => "Buzz"
@@ -9559,7 +9579,7 @@ const match_pipes =
     \\    identity}
     \\let argument: () -> int = {@print("A")
     \\    7}
-    \\let early: (n: int) -> string = match n {
+    \\let early: (n: int) -> str = match n {
     \\    -1 | 0 => {return "early" + "!"}
     \\    _ => "late" + "!"
     \\}
@@ -9673,7 +9693,7 @@ const boolean_match_program =
     \\let identity: (n: int) -> int = n
     \\let subject: (b: Flag) -> Flag = {@print("S")
     \\    b}
-    \\let select: (b: Flag) -> string = match subject(b) {
+    \\let select: (b: Flag) -> str = match subject(b) {
     \\    true => {@print("T")
     \\        "yes" + "!"}
     \\    false => {@print("F")
@@ -10318,8 +10338,8 @@ test "readonly membership source free IR and every compiler allocation failure" 
 
 const string_byte_program =
     \\let Box:(T:type)->type=struct{value:T,}
-    \\let identity:(s:string)->string=s
-    \\let base:()->string={@print("B")
+    \\let identity:(s:str)->str=s
+    \\let base:()->str={@print("B")
     \\    "a"+"é\0Z"}
     \\let index:()->int={let garbage="index"+" allocation"
     \\    @print("I")
@@ -10341,7 +10361,7 @@ const string_byte_program =
     \\        let garbage="collect"+" now"
     \\        0}],owner)
     \\    let array=["a"+"b","c"+"d"]
-    \\    let box=Box(string).[value="e"+"f"]
+    \\    let box=Box(str).[value="e"+"f"]
     \\    let chosen=if true {"i"+"j"}else{"k"+"l"}
     \\    @println(array[-1][gcIndex(-1)],box.value[gcIndex(0)],identity("g"+"h")[gcIndex(1)],chosen[gcIndex(-2)])
     \\    let r=&owner
@@ -10382,7 +10402,7 @@ test "string scalar indexing bounds panic at both optimization levels" {
 }
 
 const string_slice_program =
-    \\let base:()->string={@print("B")
+    \\let base:()->str={@print("B")
     \\    "aé€"+"😀\0z"}
     \\let lower:()->int={@print("L")
     \\    1}
@@ -10430,7 +10450,7 @@ test "string slicing Unicode views order rebind forced GC source free and OOM" {
 }
 
 test "string slicing rejects private region values slots and borrow capabilities" {
-    var module = try Module.init(test_gpa, "invalid-slice-ir.nov", "let f:(flag:bool,n:int)->string={let mut s=if flag {\"a\"}else{\"b\"}\nlet r=&s\nr.*[n..n]}");
+    var module = try Module.init(test_gpa, "invalid-slice-ir.nov", "let f:(flag:bool,n:int)->str={let mut s=if flag {\"a\"}else{\"b\"}\nlet r=&s\nr.*[n..n]}");
     defer module.deinit();
     var sema = try Lowering.lower(&module);
     defer sema.deinit();
@@ -10477,11 +10497,11 @@ fn emitStringSplitSourceFree(allocator: std.mem.Allocator) ![]u8 {
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "split.nov", .data =
         \\let std = @import("std")
-        \\let make: () -> string = "prefix:" + "::é😀::\0e\u{301}:::::suffix"
-        \\let cut: (text: string) -> []string = std.string.split(text[7..-7], "::")
-        \\let copy: (fields: []string) -> []string = fields
-        \\let absent: (text: string) -> []string = std.string.split(text, "missing")
-        \\let oversized: (text: string) -> []string = std.string.split(text, "a much longer separator")
+        \\let make: () -> str = "prefix:" + "::é😀::\0e\u{301}:::::suffix"
+        \\let cut: (text: str) -> []str = std.string.split(text[7..-7], "::")
+        \\let copy: (fields: []str) -> []str = fields
+        \\let absent: (text: str) -> []str = std.string.split(text, "missing")
+        \\let oversized: (text: str) -> []str = std.string.split(text, "a much longer separator")
         \\
     });
     const path = try tmp.dir.realPathFileAlloc(io, "split.nov", allocator);
@@ -10600,20 +10620,20 @@ fn runApprovedHelperHarness(library: []const u8, harness: []const u8, oom: bool)
 
 const integer_parsing_stdlib_source_free =
     \\let std=@import("std")
-    \\let signedAccept:(input:string,expected:int)->bool=match std.string.parseInt(input){
+    \\let signedAccept:(input:str,expected:int)->bool=match std.string.parseInt(input){
     \\.ok=>|value| value==expected
     \\.err=>false}
-    \\let unsignedAccept:(input:string,expected:uint)->bool=match std.string.parseUint(input){
+    \\let unsignedAccept:(input:str,expected:uint)->bool=match std.string.parseUint(input){
     \\.ok=>|value| value==expected
     \\.err=>false}
-    \\let signedReject:(input:string,overflow:bool)->bool=match std.string.parseInt(input){
+    \\let signedReject:(input:str,overflow:bool)->bool=match std.string.parseInt(input){
     \\.ok=>false
     \\.err=>|error| if overflow {error==.overflow} else {error==.invalidInput}}
-    \\let unsignedReject:(input:string,overflow:bool)->bool=match std.string.parseUint(input){
+    \\let unsignedReject:(input:str,overflow:bool)->bool=match std.string.parseUint(input){
     \\.ok=>false
     \\.err=>|error| if overflow {error==.overflow} else {error==.invalidInput}}
-    \\let make:()->string="["+"-42"+"]"
-    \\let view:(input:string)->bool=signedAccept(input[1..-1],-42)
+    \\let make:()->str="["+"-42"+"]"
+    \\let view:(input:str)->bool=signedAccept(input[1..-1],-42)
 ;
 
 test "integer parsing actual stdlib source free native limits differential ASCII no allocation O0 O3" {
@@ -10678,12 +10698,12 @@ test "integer parsing actual stdlib source free native limits differential ASCII
 
 const string_transform_stdlib_source_free =
     \\let std = @import("std")
-    \\let trim: (text: string) -> string = std.string.trim(text)
-    \\let replace: (text: string, pattern: string, replacement: string) -> string = std.string.replace(text, pattern, replacement)
-    \\let repeat: (text: string, count: uint) -> string = std.string.repeat(text, count)
-    \\let make: () -> string = "prefix:" + " \u{3000}é😀\0e\u{301}\t:suffix"
-    \\let white: () -> string = " " + "\u{3000}\t"
-    \\let retained: () -> []string = {
+    \\let trim: (text: str) -> str = std.string.trim(text)
+    \\let replace: (text: str, pattern: str, replacement: str) -> str = std.string.replace(text, pattern, replacement)
+    \\let repeat: (text: str, count: uint) -> str = std.string.repeat(text, count)
+    \\let make: () -> str = "prefix:" + " \u{3000}é😀\0e\u{301}\t:suffix"
+    \\let white: () -> str = " " + "\u{3000}\t"
+    \\let retained: () -> []str = {
     \\    let mut source = make()
     \\    let view = trim(source[7..-7])
     \\    let replaced = replace(view, view[1..2], view[3..])
@@ -10763,7 +10783,7 @@ test "string transform actual stdlib source free empty pattern panic callee argu
         const source = try std.fmt.allocPrint(
             test_gpa,
             "let std=@import(\"std\")\n" ++
-                "let callee:()->(string,string,string)->string={{@print(\"C\")\nstd.string.replace}}\n" ++
+                "let callee:()->(str,str,str)->str={{@print(\"C\")\nstd.string.replace}}\n" ++
                 "let main:()={{let value=callee()({{@print(\"T\")\n{s}}},{{@print(\"P\")\n\"\"}},{{@print(\"R\")\n\"replacement\"}})\n@println(\"unreachable\",value)}}\n",
             .{text},
         );
@@ -10804,13 +10824,13 @@ test "string transform actual stdlib source free replace repeat runtime OOM O0 O
 
 const string_byte_stdlib_source_free =
     \\let std = @import("std")
-    \\let encode: (text: string) -> []u8 = std.string.toBytes(text)
-    \\let decode: (bytes: []u8) -> string = std.string.fromBytes(bytes).unwrapOr("rejected")
+    \\let encode: (text: str) -> []u8 = std.string.toBytes(text)
+    \\let decode: (bytes: []u8) -> str = std.string.fromBytes(bytes).unwrapOr("rejected")
     \\let accepts: (bytes: []u8) -> bool = match std.string.fromBytes(bytes) {
     \\    .ok => true
     \\    .err => |error| match error { .invalidUtf8 => false }
     \\}
-    \\let retainedText: () -> string = {
+    \\let retainedText: () -> str = {
     \\    let bytes = std.string.toBytes("prefix:" + "é😀\0:suffix")
     \\    std.string.fromBytes(bytes).unwrapOr("bad")
     \\}
@@ -10964,10 +10984,10 @@ test "string byte copies actual stdlib differential UTF8 byte boundaries recover
 
 const string_join_source_free =
     \\let std = @import("std")
-    \\let make: () -> string = "prefix:" + "é\0😀:suffix"
-    \\let separator: () -> string = "x" + "€\0y"
-    \\let inputs: (text: string) -> []string = [text[7..-7], text[8..9], ""]
-    \\let join: (parts: []string, sep: string) -> string = std.string.join(parts, sep)
+    \\let make: () -> str = "prefix:" + "é\0😀:suffix"
+    \\let separator: () -> str = "x" + "€\0y"
+    \\let inputs: (text: str) -> []str = [text[7..-7], text[8..9], ""]
+    \\let join: (parts: []str, sep: str) -> str = std.string.join(parts, sep)
 ;
 
 test "approved helpers join actual stdlib source free managed subviews UTF8 NUL forced GC O0 O3" {
@@ -11019,12 +11039,12 @@ test "approved helpers join actual stdlib source free runtime OOM O0 O3" {
 
 const array_sort_source_free =
     \\let std = @import("std")
-    \\let Row = struct {key: int, name: string, values: [][]int,}
+    \\let Row = struct {key: int, name: str, values: [][]int,}
     \\let row: () -> Row = Row.[key = 2, name = "a" + "!", values = [[20]]]
     \\let make: () -> []Row = [row(), Row.[key = 1, name = "b" + "!", values = [[10]]], Row.[key = 2, name = "c" + "!", values = [[21]]], Row.[key = 1, name = "d" + "!", values = [[11]]]]
     \\let sort: (items: []Row) -> []Row = {
     \\    let captured = "retained" + " comparator"
-    \\    let mut seen: []string = []
+    \\    let mut seen: []str = []
     \\    let sorted = std.array.sort(items, (a: Row, b: Row) -> bool {
     \\        seen += [a.name + b.name]
     \\        @assert(captured == "retained comparator" and @len(seen[-1]) == 4)
@@ -11142,7 +11162,7 @@ test "array sort actual stdlib source free allocating comparator runtime OOM O0 
         \\let fail: () -> void
         \\let exercise: () = {
         \\    let captured = "retained" + " capture"
-        \\    let mut seen: []string = []
+        \\    let mut seen: []str = []
         \\    let result = std.array.sort(@as([]int, [2, 1]), (a: int, b: int) -> bool {
         \\        @assert(captured == "retained capture")
         \\        fail()
@@ -11163,9 +11183,9 @@ test "array sort actual stdlib source free allocating comparator runtime OOM O0 
 
 const array_selection_source_free =
     \\let std = @import("std")
-    \\let make: () -> [][][]string = [[["é" + "\0😀"]], [["other" + "!"]]]
-    \\let take: (items: [][][]string, count: uint) -> [][][]string = std.array.take(items, count)
-    \\let drop: (items: [][][]string, count: uint) -> [][][]string = std.array.drop(items, count)
+    \\let make: () -> [][][]str = [[["é" + "\0😀"]], [["other" + "!"]]]
+    \\let take: (items: [][][]str, count: uint) -> [][][]str = std.array.take(items, count)
+    \\let drop: (items: [][][]str, count: uint) -> [][][]str = std.array.drop(items, count)
 ;
 
 fn testApprovedArraySelection(operation: []const u8) !void {
@@ -11249,10 +11269,10 @@ test "approved helpers drop actual stdlib source free runtime OOM O0 O3" {
 
 const array_find_last_source_free =
     \\let std = @import("std")
-    \\let make: () -> [][]string = [["first" + "!"], ["é" + "\0😀"], ["skip" + "!"]]
-    \\let skipped: () -> [][]string = [["skip" + "!"]]
-    \\let choose: (items: [][]string) -> []string = {
-    \\    let found = std.array.findLast(items, (row: []string) -> bool {row[0] != "skip!"})
+    \\let make: () -> [][]str = [["first" + "!"], ["é" + "\0😀"], ["skip" + "!"]]
+    \\let skipped: () -> [][]str = [["skip" + "!"]]
+    \\let choose: (items: [][]str) -> []str = {
+    \\    let found = std.array.findLast(items, (row: []str) -> bool {row[0] != "skip!"})
     \\    let garbage = "force" + " collection"
     \\    match found {.some => |row| row
     \\        .none => []}
@@ -11300,7 +11320,7 @@ test "approved helpers findLast actual stdlib source free payload copy runtime O
 }
 
 test "string slicing managed subviews retain original owner across frame release and GC" {
-    const c = try emitSource("let make:()->string={let s=\"aé\"+\"€😀z\"\ns[1..-1]}\nlet cut:(s:string)->string=s[1..]\nlet empty:(s:string)->string=s[0..0]", null);
+    const c = try emitSource("let make:()->str={let s=\"aé\"+\"€😀z\"\ns[1..-1]}\nlet cut:(s:str)->str=s[1..]\nlet empty:(s:str)->str=s[0..0]", null);
     defer test_gpa.free(c);
     const harness =
         \\int main(void) {
@@ -11359,7 +11379,7 @@ test "string slicing invalid normalized bounds panic in all modes" {
 }
 
 test "string slicing shares owner byte offsets permits NULL empty and allocates nothing" {
-    const c = try emitSource("let cut:(s:string,a:int,b:int)->string=s[a..b]\nlet all:(s:string)->string=s[..]\nlet tail:(s:string,a:int)->string=s[a..]\nlet inclusive:(s:string,a:int,b:int)->string=s[a..=b]\nlet inclusive_all:(s:string)->string=s[..=]", null);
+    const c = try emitSource("let cut:(s:str,a:int,b:int)->str=s[a..b]\nlet all:(s:str)->str=s[..]\nlet tail:(s:str,a:int)->str=s[a..]\nlet inclusive:(s:str,a:int,b:int)->str=s[a..=b]\nlet inclusive_all:(s:str)->str=s[..=]", null);
     defer test_gpa.free(c);
     const program = try std.mem.concat(test_gpa, u8, &.{
         "#include <stdlib.h>\nstatic void *test_malloc(size_t n) { (void)n; return NULL; }\n#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n",
@@ -11397,8 +11417,8 @@ test "string slicing shares owner byte offsets permits NULL empty and allocates 
 test "string scalar indexing helper is opt in and allocation free" {
     for ([_][]const u8{
         "let main:()={}",
-        "let f:(s:string)->string=s",
-        "let f:(a:[]string)->string=a[0]",
+        "let f:(s:str)->str=s",
+        "let f:(a:[]str)->str=a[0]",
         "let f:(a:[]u8)->u8=a[0]",
     }) |source| {
         const c = try emitSource(source, null);
@@ -11406,7 +11426,7 @@ test "string scalar indexing helper is opt in and allocation free" {
         try std.testing.expect(std.mem.indexOf(u8, c, "nov_string_rune_at") == null);
         try compileAndRun(c, "int main(void) { return 0; }");
     }
-    const c = try emitSource("let at:(s:string,i:int)->rune=s[i]", null);
+    const c = try emitSource("let at:(s:str,i:int)->rune=s[i]", null);
     defer test_gpa.free(c);
     const program = try std.mem.concat(test_gpa, u8, &.{
         "#include <stdlib.h>\nstatic void *test_malloc(size_t n) { (void)n; return NULL; }\n#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n",
@@ -11421,7 +11441,7 @@ test "string scalar indexing helper is opt in and allocation free" {
 
 test "string scalar length is demand only and counts scalars not graphemes or bytes" {
     const c = try arrayTestProgram(
-        \\let base:()->string={@print("B")
+        \\let base:()->str={@print("B")
         \\    "é"+"😀"}
         \\let main:()={
         \\    @println(@len(""),@len("\0"),@len("e\u{301}"),@len("é€😀"),@len(base()))
@@ -11436,7 +11456,7 @@ test "string scalar length is demand only and counts scalars not graphemes or by
 }
 
 test "string scalar decoder accepts every UTF8 boundary without allocating" {
-    const c = try emitSource("let at:(s:string,i:int)->rune=s[i]\nlet size:(s:string)->uint=@len(s)", null);
+    const c = try emitSource("let at:(s:str,i:int)->rune=s[i]\nlet size:(s:str)->uint=@len(s)", null);
     defer test_gpa.free(c);
     const harness =
         \\int main(void) {
@@ -11463,7 +11483,7 @@ test "string scalar decoder accepts every UTF8 boundary without allocating" {
 }
 
 test "string scalar decoder rejects malformed truncated overlong surrogate and out of range UTF8" {
-    const c = try emitSource("let at:(s:string,i:int)->rune=s[i]\nlet size:(s:string)->uint=@len(s)", null);
+    const c = try emitSource("let at:(s:str,i:int)->rune=s[i]\nlet size:(s:str)->uint=@len(s)", null);
     defer test_gpa.free(c);
     for ([_][]const u8{
         "0x80",                "0xc0,0x80",           "0xc1,0xbf",      "0xc2",                "0xc2,0x41",
@@ -11547,7 +11567,7 @@ fn importedStringByteProgram(allocator: std.mem.Allocator) ![]u8 {
         var comp = Compilation.init(allocator);
         defer comp.deinit();
         const root = try comp.addSource("/main.nov", "let api=@import(\"api.nov\")\nlet Alias=api.Text\nlet main:()={let s:Alias=api.make()\n@println(s[0],s[-1],api.make()[1])}");
-        const api = try comp.addSource("/api.nov", "@[public]\nlet Text=string\n@[public]\nlet make:()->Text=\"é\"+\"!\"");
+        const api = try comp.addSource("/api.nov", "@[public]\nlet Text=str\n@[public]\nlet make:()->Text=\"é\"+\"!\"");
         const module = comp.getModule(root).?;
         const local = module.lookup("api").?;
         try comp.imports.append(allocator, .{ .declaration = comp.declaration_ids.get(.{ .source = root, .local = local }).?, .target = api, .named = false, .span = module.getDeclaration(local).?.name_span });
@@ -11584,11 +11604,11 @@ const range_program =
     \\    loop _ in a..b {total += 1}
     \\    total
     \\}
-    \\let early: () -> string = {
+    \\let early: () -> str = {
     \\    loop i in 0..5 {if i == 2 {return "ret" + "urn"}}
     \\    "unreachable result"
     \\}
-    \\let mark: (s: string, n: uint) -> uint = {@print(s)
+    \\let mark: (s: str, n: uint) -> uint = {@print(s)
     \\    n}
     \\let main: () = {
     \\    loop i in 0..3 {accept(i)}
@@ -11623,10 +11643,10 @@ const range_program =
 const range_output = "0\n1\n2\n-2\n-1\n0\n4 0 0\nSE0123 1 0\niteration=0!  iteration=0!  0iteration=1!  iteration=1!  iteration=2!  iteration=2!  2 6 return\n";
 
 const iteration_continuation_managed =
-    \\let Row = struct { values: []int, text: string, }
+    \\let Row = struct { values: []int, text: str, }
     \\let exercise: () = {
     \\    let rows = [Row.[values=[1], text="a"+"!"], Row.[values=[2], text="b"+"!"]]
-    \\    let mut seen: []string = []
+    \\    let mut seen: []str = []
     \\    let mut saved: () -> int = () -> int { 0 }
     \\    let mut count: int = 0
     \\    loop row in rows : {
@@ -11730,7 +11750,7 @@ test "iteration continuations source free allocating continuation OOM O0 O3" {
 
 test "iteration continuations source free controls terminal else propagation MAX boundaries O0 O3" {
     const library = try emitReferenceRebinding(test_gpa,
-        \\let R = union { ok: int, err: string, }
+        \\let R = union { ok: int, err: str, }
         \\let fail: () -> R = .err["error"]
         \\let propagate: () -> R = {
         \\    loop x in [1] : { let n = fail().!
@@ -11842,14 +11862,14 @@ test "iteration continuations source free compiler emitter allocation rollback" 
 }
 
 const iteration_program =
-    \\let R=struct{n:int,s:string,}
+    \\let R=struct{n:int,s:str,}
     \\let Nested=struct{inner:R,}
     \\let sum:(a:[]int)->int={let mut n:int=0
     \\    loop &x in a {n+=x.*}
     \\    n}
     \\let produce:()->[]int={@print("once:")
     \\    [@as(int,1),2,3]}
-    \\let first:()->string=loop r in "😀é" {return "{r}"} else {"empty"}
+    \\let first:()->str=loop r in "😀é" {return "{r}"} else {"empty"}
     \\let main:()={
     \\    loop x in produce() {@print(x)}
     \\    @println("")
@@ -12091,7 +12111,7 @@ test "iteration call protection permits disjoint unboxed methods and completed l
         \\    let invoke:(self:R,cb:())={let run=(){cb()}
         \\        run()}
         \\    @[stringify]
-        \\    let toString:(self:R)->string="R"
+        \\    let toString:(self:R)->str="R"
         \\}
         \\let G:(T:type)->type=struct{value:T,
         \\    let invoke:(self:@This(),cb:())=cb()
@@ -12163,7 +12183,7 @@ test "iteration source source free IR survives every compiler allocation failure
 }
 
 test "iteration forward string decoder is linear allocation free and checks malformed input" {
-    const library = try emitSource("let f:(s:string)=loop r in s {@print(r)}", null);
+    const library = try emitSource("let f:(s:str)=loop r in s {@print(r)}", null);
     defer test_gpa.free(library);
     try std.testing.expect(std.mem.indexOf(u8, library, "nov_string_scalar_len") == null);
     try std.testing.expect(std.mem.indexOf(u8, library, "nov_string_rune_at") == null);
@@ -12215,11 +12235,11 @@ test "iteration loop effects preserve return propagation exhaustion and outer co
         \\let refs:(yes:bool)->O(int)={let mut a:[]int=[1,2]
         \\    loop &x in a {x.*+=get(yes).!}
         \\    .some[a[0]+a[1]]}
-        \\let values:(yes:bool)->O(string)={loop r in "é😀" {let n=get(yes).!
+        \\let values:(yes:bool)->O(str)={loop r in "é😀" {let n=get(yes).!
         \\    if n==1 {return .some["{r}"]}}
         \\    .some["empty"]}
         \\let early:()->int=loop x in {return 7} {}
-        \\let copied:()->string={let a=["a"+"b"]
+        \\let copied:()->str={let a=["a"+"b"]
         \\    loop &s in a {return s.*} else {"empty"}}
         \\let main:()={@println(early(),copied())
         \\    @println(match refs(true){.some=>|n|n
@@ -12375,7 +12395,7 @@ test "range allocating bodies report runtime OOM" {
 }
 
 const inclusive_range_program =
-    \\let mark: (s: string, n: uint) -> uint = {@print(s)
+    \\let mark: (s: str, n: uint) -> uint = {@print(s)
     \\    n}
     \\let early: () -> uint = {loop i in 0..=3 {if i == 1 {return i}}
     \\    99}
@@ -12501,7 +12521,7 @@ const range_else_program =
     \\let search: (lo: uint, hi: uint, target: uint) -> bool = loop i in lo..hi {
     \\    if i == target {break true}
     \\} else {false}
-    \\let early: () -> string = loop _ in 0..2 {return "return"} else {"wrong"}
+    \\let early: () -> str = loop _ in 0..2 {return "return"} else {"wrong"}
     \\let outer: () -> int = loop {
     \\    loop _ in 2..1 {} else {break 42}
     \\}
@@ -12610,15 +12630,15 @@ test "range else emitted results outlive source and report allocation failure" {
 }
 
 const string_interpolation =
-    \\let prefix: string = "é\0"
-    \\let fizz: (n: int) -> string = match n % 3, n % 5 {
+    \\let prefix: str = "é\0"
+    \\let fizz: (n: int) -> str = match n % 3, n % 5 {
     \\    0, 0 => "FizzBuzz"
     \\    0, _ => "Fizz"
     \\    _, 0 => "Buzz"
     \\    _ => "{n}"
     \\}
-    \\let identity: (s: string) -> string = "{s}"
-    \\let early: (n: int) -> string = {if n == 0 {return "{n}"}
+    \\let identity: (s: str) -> str = "{s}"
+    \\let early: (n: int) -> str = {if n == 0 {return "{n}"}
     \\    "number={n}"}
     \\let main: () -> void = {
     \\    let mut n: int = 0
@@ -12652,11 +12672,11 @@ const inferred_global_program =
     \\let enabled = true
     \\let disabled = @as(Flag, @as(bool, false))
     \\let prefix = "hé\0"
-    \\let suffix = @as(string, "😀")
+    \\let suffix = @as(str, "😀")
     \\let count = @as(Count, @as(int, -42))
     \\let Count = int
     \\let Flag = bool
-    \\let choose: (b: Flag) -> string = match b {
+    \\let choose: (b: Flag) -> str = match b {
     \\    true => prefix
     \\    false => suffix
     \\}
@@ -12672,10 +12692,10 @@ const annotated_global_program =
     \\let inferred_int = @as(Count, -42)
     \\let annotated_int: Count = @as(int, @as(Count, -42))
     \\let inferred_string = @as(Text, "hé\0")
-    \\let annotated_string: Text = @as(string, @as(Text, "hé\0"))
+    \\let annotated_string: Text = @as(str, @as(Text, "hé\0"))
     \\let Flag = bool
     \\let Count = int
-    \\let Text = string
+    \\let Text = str
     \\let main: () -> void = {
     \\    @println(inferred_bool, annotated_bool, inferred_int, annotated_int)
     \\    @println("{inferred_string}:{annotated_string}")
@@ -12725,7 +12745,7 @@ test "inferred global scalars preserve all native and fixed integer boundaries" 
 }
 
 test "inferred global scalars emit literal strings after releasing source" {
-    var module = try Module.init(test_gpa, "owned-global.nov", "let text = \"hé\\0\\{ok\\}😀\"\nlet wrapped: string = @as(string, \"literal\")\nlet main: () -> void = @println(text, wrapped)");
+    var module = try Module.init(test_gpa, "owned-global.nov", "let text = \"hé\\0\\{ok\\}😀\"\nlet wrapped: str = @as(str, \"literal\")\nlet main: () -> void = @println(text, wrapped)");
     var sema = Lowering.lower(&module) catch |err| {
         module.deinit();
         return err;
@@ -12750,7 +12770,7 @@ const type_alias_program =
     \\let Forward = uint
     \\let Counts = []Count
     \\let Callback = (Count) -> Count
-    \\let Text = string
+    \\let Text = str
     \\let Unit = void
     \\let Flag = bool
     \\let increment: (value: Count) -> Count = {@print("E")
@@ -12821,7 +12841,7 @@ const ascription_program =
     \\    b[0] = 9
     \\    @println(a[0], b[0], @len(@as([]int, [])))
     \\    let text = "hé" + "!"
-    \\    @println("{@as(string, text)}", @as(bool, true))
+    \\    @println("{@as(str, text)}", @as(bool, true))
     \\    @println(@as(int, match true {true => 4
     \\        _ => 5}), @as(int, loop {break 6}))
     \\    loop {
@@ -12864,13 +12884,13 @@ test "ascribed interpolation prints every supported integer boundary" {
 }
 
 const quoted_interpolation_program =
-    \\let greet:(name:string)->string="Hello {name}!"
+    \\let greet:(name:str)->str="Hello {name}!"
     \\let main:()={
     \\@println("{"a"}","{greet("Ada")}","{'{'}{'}'}", "{'é'}")
     \\@println("Nested: {"hello {"world"}"}","{"\u{1f600}\0"}")
     \\@println("Escapes: {"\""} {"\\"}")
     \\let mut count=0
-    \\let next=(text:string)->string{count+=1
+    \\let next=(text:str)->str{count+=1
     \\"{count}:{text}"}
     \\@println("{next("a")}/{next("nested {next("b")}")}",count)
     \\}
@@ -12910,14 +12930,14 @@ test "quoted interpolation executes nested escapes runes and ordered calls with 
 
 test "expression interpolation reuses calls scopes ordering and rooted temporaries" {
     const c = try arrayTestProgram(
-        \\let echo: (n: int) -> string = {@print(n)
+        \\let echo: (n: int) -> str = {@print(n)
         \\    if n == 0 {return "zero"}
         \\    "{n}" + "!"}
         \\let argument: (n: int) -> int = {@print("A")
         \\    n}
-        \\let factory: () -> (int) -> string = {@print("C")
+        \\let factory: () -> (int) -> str = {@print("C")
         \\    echo}
-        \\let join: (a: string, b: string) -> string = a + b
+        \\let join: (a: str, b: str) -> str = a + b
         \\let main: () -> void = {
         \\    let n: int = 2
         \\    let bytes = "é\0😀"
@@ -12975,7 +12995,7 @@ test "interpolation allocations panic on exhaustion while bool and string sharin
     for ([_]struct { source: []const u8, output: []const u8 = "", allocates: bool = true }{
         .{ .source = "let main: () -> void = {let n: int = 1\n@println(\"{n}\")}" },
         .{ .source = "let main: () -> void = {let b = true\n@println(\"value={b}\")}" },
-        .{ .source = "let make: (n: int) -> string = \"{n}\"\nlet main: () -> void = @println(\"{make(42)}\")" },
+        .{ .source = "let make: (n: int) -> str = \"{n}\"\nlet main: () -> void = @println(\"{make(42)}\")" },
         .{ .source = "let yes: () -> bool = true\nlet main: () -> void = @println(\"{yes()}\")", .output = "true\n", .allocates = false },
         .{ .source = "let main: () -> void = {let s = \"é\\0\"\n@println(\"{s}\", \"{false}\")}", .output = "é\x00 false\n", .allocates = false },
     }) |case| {
@@ -12991,7 +13011,7 @@ test "interpolation allocations panic on exhaustion while bool and string sharin
 }
 
 test "interpolation without printing needs only demanded conversion helpers" {
-    const library = try emitSource("let b: (n: bool) -> string = \"{n}\"\nlet s: (text: string) -> string = \"{text}\"\nlet i: (n: int) -> bool = \"{n}\" == \"-42\"", null);
+    const library = try emitSource("let b: (n: bool) -> str = \"{n}\"\nlet s: (text: str) -> str = \"{text}\"\nlet i: (n: int) -> bool = \"{n}\" == \"-42\"", null);
     defer test_gpa.free(library);
     try std.testing.expect(std.mem.indexOf(u8, library, "nov_rt_init_stdout") == null);
     const combined = try std.mem.concat(test_gpa, u8, &.{
@@ -13008,7 +13028,7 @@ test "interpolation without printing needs only demanded conversion helpers" {
     });
     defer test_gpa.free(combined);
     try compileAndRun(combined, "typedef int nonempty_translation_unit;");
-    for ([_][]const u8{ "let f: (n: bool) -> string = \"{n}\"", "let f: (s: string) -> string = \"{s}\"" }) |source| {
+    for ([_][]const u8{ "let f: (n: bool) -> str = \"{n}\"", "let f: (s: str) -> str = \"{s}\"" }) |source| {
         const c = try emitSource(source, null);
         defer test_gpa.free(c);
         try std.testing.expect(std.mem.indexOf(u8, c, "nov_to_string_") == null);
@@ -13018,9 +13038,9 @@ test "interpolation without printing needs only demanded conversion helpers" {
 }
 
 const string_equality =
-    \\let literal: string = "hé\0😀"
-    \\let make: () -> string = "hé\0" + "😀"
-    \\let mark: (s: string) -> string = {@print(s)
+    \\let literal: str = "hé\0😀"
+    \\let make: () -> str = "hé\0" + "😀"
+    \\let mark: (s: str) -> str = {@print(s)
     \\    s + "!"}
     \\let early: () -> bool = make() == {return true
     \\}
@@ -13058,7 +13078,7 @@ test "string equality compares bytes and preserves effects terminal paths format
 }
 
 test "string equality library is allocation free and handles null empty views" {
-    const library = try emitSource("let equal: (a: string, b: string) -> bool = a == b\nlet different: (a: string, b: string) -> bool = a != b", null);
+    const library = try emitSource("let equal: (a: str, b: str) -> bool = a == b\nlet different: (a: str, b: str) -> bool = a != b", null);
     defer test_gpa.free(library);
     try std.testing.expect(std.mem.indexOf(u8, library, "nov_string_concat") == null);
     const c = try std.mem.concat(test_gpa, u8, &.{
@@ -13080,8 +13100,8 @@ test "string equality library is allocation free and handles null empty views" {
 
 test "string equality helper is emitted only on demand" {
     for ([_][]const u8{
-        "let f: (callback: (string) -> bool) -> void = {}",
-        "let f: (s: string) -> string = s",
+        "let f: (callback: (str) -> bool) -> void = {}",
+        "let f: (s: str) -> str = s",
         "let main: () -> void = @println(\"a\" + \"b\")",
     }) |source| {
         const library = try emitSource(source, null);
@@ -13092,9 +13112,9 @@ test "string equality helper is emitted only on demand" {
 }
 
 const string_compound =
-    \\let id: (s: string) -> string = s
-    \\let early: (b: bool) -> string = {
-    \\    let mut s: string = "old" + "!"
+    \\let id: (s: str) -> str = s
+    \\let early: (b: bool) -> str = {
+    \\    let mut s: str = "old" + "!"
     \\    s += if b {s = "returned"
     \\        return s} else {"tail"}
     \\    s
@@ -13136,7 +13156,7 @@ test "string compounds capture before RHS and preserve aliases terminal effects 
 }
 
 test "string parameters returns and assignments share backing without allocation" {
-    const library = try emitSource("let id: (s: string) -> string = {let mut x = s\nx = s\nx}\nlet make: () -> string = \"a\" + \"b\"", null);
+    const library = try emitSource("let id: (s: str) -> str = {let mut x = s\nx = s\nx}\nlet make: () -> str = \"a\" + \"b\"", null);
     defer test_gpa.free(library);
     const c = try std.mem.concat(test_gpa, u8, &.{
         library,
@@ -13177,7 +13197,7 @@ test "string output preserves NUL and checks fwrite and final flush failures" {
 }
 
 test "string callback signatures need declarations but not a managed runtime" {
-    const library = try emitSource("let f: (callback: (string) -> string) -> void = {}", null);
+    const library = try emitSource("let f: (callback: (str) -> str) -> void = {}", null);
     defer test_gpa.free(library);
     try std.testing.expect(std.mem.indexOf(u8, library, "} nov_string;") != null);
     try std.testing.expect(std.mem.indexOf(u8, library, "nov_gc_") == null);
@@ -13210,7 +13230,7 @@ test "generated string and rune programs compile for Windows with binary UTF8 ou
 
 test "lowered strings emit after module and source storage are freed" {
     var sema = blk: {
-        var module = try Module.init(test_gpa, "source-free.nov", "let text: string = \"a\\0é\"\nlet main: () -> void = {let n: int = -42\n@println(\"{text}!\", text == \"a\\0\" + \"é\", \"{n}\")}");
+        var module = try Module.init(test_gpa, "source-free.nov", "let text: str = \"a\\0é\"\nlet main: () -> void = {let n: int = -42\n@println(\"{text}!\", text == \"a\\0\" + \"é\", \"{n}\")}");
         defer module.deinit();
         break :blk try Lowering.lower(&module);
     };
@@ -13228,9 +13248,9 @@ test "string compiler ownership survives every allocation failure" {
 
 test "string length overflow panics before touching invalid backing in both modes" {
     for ([_][]const u8{
-        "let f: (a: string, b: string) -> string = a + b",
-        "let f: (a: string, b: string) -> string = \"{a}{b}\"",
-        "let f: (a: string, b: string) -> string = {let mut s = a\ns += b\ns}",
+        "let f: (a: str, b: str) -> str = a + b",
+        "let f: (a: str, b: str) -> str = \"{a}{b}\"",
+        "let f: (a: str, b: str) -> str = {let mut s = a\ns += b\ns}",
     }) |source| {
         const library = try emitSource(source, null);
         defer test_gpa.free(library);
@@ -13683,7 +13703,7 @@ const else_loops =
     \\    @println(a[0], a[-1], @len(a), result[0], result[-1])
     \\    return loop false {} else {result}
     \\}
-    \\let join: (a: string, b: string, c: string) -> string = a + b + c
+    \\let join: (a: str, b: str, c: str) -> str = a + b + c
     \\let main: () -> void = {
     \\    @println(search(0, 0), search(3, 2), search(2, 2))
     \\    let n: i8 = 42
@@ -13769,7 +13789,7 @@ test "conditional loop else results exhaust break return and target parent contr
 
 const value_loops =
     \\let plus: (n: int) -> int = n + 1
-    \\let join: (a: string, b: string, c: string) -> string = a + b + c
+    \\let join: (a: str, b: str, c: str) -> str = a + b + c
     \\let build_array: () -> []int = {
     \\    let mut source: []int = [3, 4]
     \\    let result: []int = loop : source += [99] {
@@ -13790,9 +13810,9 @@ const value_loops =
     \\    @println(source[0], @len(source))
     \\    result
     \\}
-    \\let text: () -> string = {
+    \\let text: () -> str = {
     \\    let mut source = "a" + "b"
-    \\    let result: string = loop {break source + {source = "c" + "d"
+    \\    let result: str = loop {break source + {source = "c" + "d"
     \\        "e" + "f"}}
     \\    @println(source)
     \\    return loop {break result}
@@ -13809,7 +13829,7 @@ const value_loops =
     \\    @println(source[0], source[-1], copy[0], copy[-1])
     \\    let result = build_array()
     \\    let message = text()
-    \\    let shared: string = loop {break message}
+    \\    let shared: str = loop {break message}
     \\    let pressure: []int = [10, 20]
     \\    @println(result[0], result[1], result[-1], @len(result), @len(pressure))
     \\    @println(message, shared)
@@ -13819,7 +13839,7 @@ const value_loops =
     \\    let from_rhs = array_rhs()
     \\    @println(from_rhs[0], from_rhs[-1], @len(from_rhs))
     \\    let mut ticks: int = 0
-    \\    let from_cont: string = loop : {ticks += 1
+    \\    let from_cont: str = loop : {ticks += 1
     \\        let fresh = "x" + "y"
     \\        if ticks > 10 {return}
     \\        if ticks == 1 {continue}
@@ -13853,9 +13873,9 @@ test "value loops merge scalar function and managed results with every allocatio
 
 test "loop exhaustion strings share backing without allocation and terminal fallbacks pop roots" {
     const library = try emitSource(
-        \\let make: () -> string = "a" + "b"
-        \\let share: (s: string) -> string = loop false {} else {s}
-        \\let early: (s: string) -> string = loop false {} else {return s}
+        \\let make: () -> str = "a" + "b"
+        \\let share: (s: str) -> str = loop false {} else {s}
+        \\let early: (s: str) -> str = loop false {} else {return s}
     , null);
     defer test_gpa.free(library);
     const c = try std.mem.concat(test_gpa, u8, &.{
@@ -13871,8 +13891,8 @@ test "loop exhaustion strings share backing without allocation and terminal fall
 
 test "value loop string breaks share backing without allocating" {
     const library = try emitSource(
-        \\let make: () -> string = loop {break "a" + "b"}
-        \\let share: (s: string) -> string = loop : if true {break s} {continue}
+        \\let make: () -> str = loop {break "a" + "b"}
+        \\let share: (s: str) -> str = loop : if true {break s} {continue}
     , null);
     defer test_gpa.free(library);
     const c = try std.mem.concat(test_gpa, u8, &.{
@@ -13904,7 +13924,7 @@ test "continuation and value loop lowering and emission survive every allocation
 }
 
 const unconditional_loops =
-    \\let build: (early: bool) -> string = {
+    \\let build: (early: bool) -> str = {
     \\    let mut text = ""
     \\    let mut values: []int = []
     \\    let mut n: int = 0
@@ -15024,7 +15044,7 @@ fn compileAndRunCompiler(c_source: []const u8, harness: []const u8, exit_code: u
 
 test "assert eager message evaluation exact bytes source ownership and terminal operands" {
     const cases = [_]struct { source: []const u8, code: u8 = 0, output: []const u8, diagnostic: []const u8 = "" }{
-        .{ .source = "let condition:()->bool={@print(\"C\")\ntrue}\nlet message:()->string={@print(\"M\")\n\"unused\"+\" message\"}\nlet main:()={@assert(condition(),message())\n@print(\"T\")}", .output = "CMT" },
+        .{ .source = "let condition:()->bool={@print(\"C\")\ntrue}\nlet message:()->str={@print(\"M\")\n\"unused\"+\" message\"}\nlet main:()={@assert(condition(),message())\n@print(\"T\")}", .output = "CMT" },
         .{ .source = "let main:()={@print(\"before\")\n@assert(false,\"hé\\0\"+\"!\")}", .code = 1, .output = "before", .diagnostic = "test.nov:2:1: assertion failed: hé\x00!\n" },
         .{ .source = "let main:()={\nlet mut n:int=0\nlet r=&n\n@assert(false,\"{r.*}\")\nn=1\n}", .code = 1, .output = "", .diagnostic = "test.nov:4:1: assertion failed: 0\n" },
         .{ .source = "let main:()={\nlet mut s=\"a\"+\"b\"\nlet r=&s\n@assert(false,{@print(r.*)\n\"message:\"+r.*})\ns=\"after\"\n}", .code = 1, .output = "ab", .diagnostic = "test.nov:4:1: assertion failed: message:ab\n" },
@@ -15131,7 +15151,7 @@ const extern_program =
     \\let putchar: (x: i32) -> i32
     \\let callee: () -> (i32, i32) -> i32 = {@print("C")
     \\    add}
-    \\let arg: (label: string, n: i32) -> i32 = {@print(label)
+    \\let arg: (label: str, n: i32) -> i32 = {@print(label)
     \\    n}
     \\let main: () = {
     \\    foreign_unit()
@@ -15455,9 +15475,9 @@ test "cross source generic reexports retain defining scope under forced GC after
         const root = try comp.addSource("/app/main.nov",
             \\let std=@import("std")
             \\let Result=std.Result
-            \\let R=Result(string,string)
+            \\let R=Result(str,str)
             \\let prefix="WRONG"
-            \\let helper:()->string="WRONG"
+            \\let helper:()->str="WRONG"
             \\let main:()={let mut r:R=.ok["a"+"b"]
             \\    let saved=r
             \\    r=.err["error"]
@@ -15471,7 +15491,7 @@ test "cross source generic reexports retain defining scope under forced GC after
         );
         const library = try comp.addSource("/lib/result.nov",
             \\let prefix="library:"
-            \\let helper:()->string="helper"
+            \\let helper:()->str="helper"
             \\@[public]
             \\let Result:(T:type,E:type)->type=union{ok:T,err:E,
             \\let Self=@This()
@@ -15479,7 +15499,7 @@ test "cross source generic reexports retain defining scope under forced GC after
             \\let unwrapOr:(self:Self,fallback:T)->T=match self{.ok=>|v|v
             \\.err=>fallback}
             \\@[public]
-            \\let message:(self:Self)->string=prefix+helper()
+            \\let message:(self:Self)->str=prefix+helper()
             \\}
         );
         for ([_]struct { source: Source.Id, name: []const u8, target: Source.Id, named: bool }{
@@ -15509,16 +15529,16 @@ const nested_record_program =
     \\let Alias=Deep
     \\let Deep=struct{box:Box,
     \\@[stringify]
-    \\let toString:(r:Deep)->string="{r.box.inner.s}:{r.box.inner.n}:{r.box.other.s}"
+    \\let toString:(r:Deep)->str="{r.box.inner.s}:{r.box.inner.n}:{r.box.other.s}"
     \\}
     \\let Box=struct{inner:Leaf,other:Leaf,}
-    \\let Leaf=struct{s:string,n:int=1,}
+    \\let Leaf=struct{s:str,n:int=1,}
     \\let R:(T:type,E:type)->type=union{ok:T,err:E,}
     \\let O:(T:type)->type=union{some:T,none,}
-    \\let text:(s:string)->string={@print(s)
+    \\let text:(s:str)->str={@print(s)
     \\s+"!"}
-    \\let leaf:(s:string)->Leaf=Leaf.[s=s+"!"]
-    \\let deep:(s:string)->Alias=Alias.[box=Box.[inner=leaf(s),other=leaf("other")]]
+    \\let leaf:(s:str)->Leaf=Leaf.[s=s+"!"]
+    \\let deep:(s:str)->Alias=Alias.[box=Box.[inner=leaf(s),other=leaf("other")]]
     \\let identity:(r:Deep)->Deep=r
     \\let invoke:(cb:(Deep)->Deep,r:Deep)->Deep=cb(r)
     \\let result:(ok:bool)->R(Deep,Deep)=if ok{.ok[deep("ok")]}else{.err[deep("err")]}
@@ -15607,7 +15627,7 @@ test "nested records imported forward diamond identities survive graph release a
             "let mut a=[left.make(),right.make()]\nlet old=a\nlet mut v=a[0]\nv.inner.s=\"array\"+\"!\"\na[-1]=v\n@println(old[-1].inner.s,a[-1].inner.s)}");
         const left = try comp.addSource("/left.nov", "let shared=@import(\"shared.nov\")\n@[public]\nlet Box=shared.Box\n@[public]\nlet make:()->Box=shared.make()");
         const right = try comp.addSource("/right.nov", "let shared=@import(\"shared.nov\")\n@[public]\nlet Box=shared.Box\n@[public]\nlet make:()->Box=shared.make()");
-        const shared = try comp.addSource("/shared.nov", "@[public]\nlet Box=struct{inner:Alias,}\nlet Alias=Leaf\nlet Leaf=struct{s:string,}\n@[public]\nlet make:()->Box=Box.[inner=Alias.[s=\"sha\"+\"red\"]]");
+        const shared = try comp.addSource("/shared.nov", "@[public]\nlet Box=struct{inner:Alias,}\nlet Alias=Leaf\nlet Leaf=struct{s:str,}\n@[public]\nlet make:()->Box=Box.[inner=Alias.[s=\"sha\"+\"red\"]]");
         for ([_]struct { source: Source.Id, name: []const u8, target: Source.Id }{
             .{ .source = root, .name = "left", .target = left },
             .{ .source = root, .name = "right", .target = right },
@@ -15645,7 +15665,7 @@ test "nested records deepest supported declarations compile in dependency order"
     var source = std.Io.Writer.Allocating.init(test_gpa);
     defer source.deinit();
     for (0..Ir.max_record_depth - 1) |i| try source.writer.print("let R{d}=struct{{next:R{d},}}\n", .{ i, i + 1 });
-    try source.writer.print("let R{d}=struct{{s:string,}}\nlet f:(r:R0)={{}}\nlet main:()={{}}", .{Ir.max_record_depth - 1});
+    try source.writer.print("let R{d}=struct{{s:str,}}\nlet f:(r:R0)={{}}\nlet main:()={{}}", .{Ir.max_record_depth - 1});
     const library = try emitSource(source.written(), null);
     defer test_gpa.free(library);
     const c = try collectingTestProgram(library);
@@ -15656,7 +15676,7 @@ test "nested records deepest supported declarations compile in dependency order"
 
 test "nested records propagation shares immutable strings and skips allocations on terminal paths" {
     for ([_]bool{ false, true }) |allocate| {
-        const source = try std.fmt.allocPrint(test_gpa, "let R:(T:type,E:type)->type=union{{ok:T,err:E,}}\nlet Outer=struct{{middle:Middle,}}\nlet Middle=struct{{leaf:Leaf,}}\nlet Leaf=struct{{s:string,}}\n" ++
+        const source = try std.fmt.allocPrint(test_gpa, "let R:(T:type,E:type)->type=union{{ok:T,err:E,}}\nlet Outer=struct{{middle:Middle,}}\nlet Middle=struct{{leaf:Leaf,}}\nlet Leaf=struct{{s:str,}}\n" ++
             "let make:()->R(int,Outer)=.err[Outer.[middle=Middle.[leaf=Leaf.[s={s}]]]]\n" ++
             "let run:()->R(bool,Outer)=.ok[make().! == 0]\nlet main:()=@println(match run(){{.ok=>\"BAD\"\n.err=>|r|r.middle.leaf.s}})", .{if (allocate) "\"e\"+\"rr\"" else "\"err\""});
         defer test_gpa.free(source);
@@ -15674,20 +15694,20 @@ test "nested records propagation shares immutable strings and skips allocations 
 const managed_array_program =
     \\let Kind=enum{first,second,}
     \\let Alias=Outer
-    \\let Outer=struct{inner:Inner,other:string,k:Kind=.first,}
-    \\let Inner=struct{s:string,n:int=1,}
+    \\let Outer=struct{inner:Inner,other:str,k:Kind=.first,}
+    \\let Inner=struct{s:str,n:int=1,}
     \\let O:(T:type)->type=union{some:T,none,}
     \\let R:(T:type,E:type)->type=union{ok:T,err:E,}
-    \\let make:(s:string)->Alias=Alias.[inner=Inner.[s=s+"!"],other="other"+"!"]
-    \\let strings:()->[]string=["hé\0"+"😀","later"+"!","", "static"]
+    \\let make:(s:str)->Alias=Alias.[inner=Inner.[s=s+"!"],other="other"+"!"]
+    \\let strings:()->[]str=["hé\0"+"😀","later"+"!","", "static"]
     \\let records:()->[]Outer=[make("a"),make("b")]
     \\let copy:(a:[]Outer)->[]Outer=a
-    \\let identity:(a:[]string)->[]string=a
+    \\let identity:(a:[]str)->[]str=a
     \\let append:()->[]Outer={let mut a=records()
     \\a += [make("c")]
     \\a += []
     \\a}
-    \\let terminal:()->[]string=["root"+"!",{return []},"BAD"+"!"]
+    \\let terminal:()->[]str=["root"+"!",{return []},"BAD"+"!"]
     \\let main:()={
     \\let mut a=identity(strings())
     \\let b=a
@@ -15716,7 +15736,7 @@ const managed_array_program =
     \\.none=>"BAD"},match result{.ok=>|v|v.inner.s
     \\.err=>|v|v.other})
     \\let empty:[]Outer=[]
-    \\let empty2:[]string=[]
+    \\let empty2:[]str=[]
     \\let again:[]Outer=[]
     \\@println(@len(empty),@len(empty2),@len(again),@len(terminal()))
     \\}
@@ -15732,10 +15752,10 @@ test "managed arrays copy nested record values and share immutable bytes under f
 
 test "managed array literal and indexed stores preserve ordered effects snapshots and terminal paths" {
     const c = try arrayTestProgram(
-        \\let A=struct{s:string,}
-        \\let mark:(s:string)->string={@print(s)
+        \\let A=struct{s:str,}
+        \\let mark:(s:str)->str={@print(s)
         \\s+"!"}
-        \\let record:(s:string)->A=A.[s=mark(s)]
+        \\let record:(s:str)->A=A.[s=mark(s)]
         \\let main:()={
         \\let mut a=[mark("A"),mark("B")]
         \\a[{a=["discard"+"!"]
@@ -16610,7 +16630,7 @@ test "copy elision owns source free IR through every compiler allocation failure
 
 const array_fields_program =
     \\let Box:(T:type)->type=struct{value:T,}
-    \\let Leaf=struct{values:[]int,text:string,}
+    \\let Leaf=struct{values:[]int,text:str,}
     \\let Tree=struct{leaf:Leaf,records:[]Leaf,}
     \\let U=union{some:Tree,none,}
     \\let leaf:(n:int)->Leaf=Leaf.[values=[n,n+1],text="shared"+"!"]
@@ -16661,8 +16681,8 @@ test "array fields recursively detach all value boundaries under forced GC" {
 
 test "array fields two managed union alternatives copy capture and match under forced GC" {
     const c = try arrayTestProgram(
-        \\let Left=struct{values:[]int,text:string,}
-        \\let Right=struct{items:[]Left,extra:[]string,}
+        \\let Left=struct{values:[]int,text:str,}
+        \\let Right=struct{items:[]Left,extra:[]str,}
         \\let U=union{left:Left,right:Right,none,}
         \\let identity:(u:U)->U={let copy=u
         \\return copy}
@@ -16700,9 +16720,9 @@ test "array fields two managed union alternatives copy capture and match under f
 
 test "array fields negative indexed nested store snapshots array but keeps latest siblings" {
     const c = try arrayTestProgram(
-        \\let Inner=struct{values:[]int,sibling:string,}
-        \\let Outer=struct{inner:Inner,sibling:string,}
-        \\let make:(n:int,s:string)->Outer=Outer.[inner=Inner.[values=[n,n+1,n+2],sibling=s+" inner"],sibling=s+" outer"]
+        \\let Inner=struct{values:[]int,sibling:str,}
+        \\let Outer=struct{inner:Inner,sibling:str,}
+        \\let make:(n:int,s:str)->Outer=Outer.[inner=Inner.[values=[n,n+1,n+2],sibling=s+" inner"],sibling=s+" outer"]
         \\let main:()={let mut owner=make(1,"old")
         \\let saved=owner
         \\owner.inner.values[{owner=make(10,"index")
@@ -16727,7 +16747,7 @@ test "array fields negative indexed nested store snapshots array but keeps lates
 
 test "array fields transitive escaping immutable snapshots and shared mutable cells after frame release" {
     const c = try arrayTestProgram(
-        \\let Leaf=struct{values:[]int,text:string,}
+        \\let Leaf=struct{values:[]int,text:str,}
         \\let Record=struct{leaf:Leaf,items:[]Leaf,}
         \\let make:(n:int)->Record=Record.[leaf=Leaf.[values=[n,n+1],text="leaf"+"!"],items=[Leaf.[values=[n+2],text="item"+"!"]]]
         \\let factory:(seed:int)->()->()->Record={
@@ -16814,7 +16834,7 @@ test "array fields whole record and record element loans preserve ordinary copie
 
 test "array fields insertion replacement and append backing pointers detach at operation boundaries" {
     const source =
-        \\let Leaf=struct{values:[]int,text:string,}
+        \\let Leaf=struct{values:[]int,text:str,}
         \\let Tree=struct{leaf:Leaf,records:[]Leaf,}
         \\let Wrapped=union{node:Tree,none,}
         \\let main:()={
@@ -17014,7 +17034,7 @@ test "nested records root enumeration prunes large scalar diamonds beside manage
     defer source.deinit();
     try source.writer.writeAll("let R0=struct{n:int,}\n");
     for (1..31) |i| try source.writer.print("let R{d}=struct{{left:R{d},right:R{d},}}\n", .{ i, i - 1, i - 1 });
-    try source.writer.writeAll("let Mixed=struct{scalar:R30,text:string,}\nlet f:(r:R30,s:string)={let copy=r\n}\nlet g:(r:Mixed)={}\nlet h:(a:[]Mixed)->[]Mixed=a");
+    try source.writer.writeAll("let Mixed=struct{scalar:R30,text:str,}\nlet f:(r:R30,s:str)={let copy=r\n}\nlet g:(r:Mixed)={}\nlet h:(a:[]Mixed)->[]Mixed=a");
     const c = try emitSource(source.written(), null);
     defer test_gpa.free(c);
     try std.testing.expect(std.mem.indexOf(u8, c, "void **nov_roots[] = { &p1.owner, };") != null);
@@ -17195,7 +17215,7 @@ test "reusable range storage does not need a managed runtime" {
 }
 
 const static_borrow_program =
-    \\let Name=struct{text:string,}
+    \\let Name=struct{text:str,}
     \\let G:(T:type)->type=struct{name:T,score:uint=1,enabled:bool=false,small:i8=2,}
     \\let Person=G(Name)
     \\let pick:()->int={@print("I")
@@ -17262,7 +17282,7 @@ test "static borrowing checks bounds once before subsequent effects" {
 }
 
 test "static borrowing string RHS runtime allocation failure follows activation" {
-    const library = try emitSource("let R=struct{s:string,}\nlet main:()={let mut a=[R.[s=\"old\"]]\nlet r=&a[0]\n@print(\"borrowed\")\nr.*.s+=\"!\"}", null);
+    const library = try emitSource("let R=struct{s:str,}\nlet main:()={let mut a=[R.[s=\"old\"]]\nlet r=&a[0]\n@print(\"borrowed\")\nr.*.s+=\"!\"}", null);
     defer test_gpa.free(library);
     const c = try collectingTestProgram(library);
     defer test_gpa.free(c);
@@ -17274,7 +17294,7 @@ test "static borrowing string RHS runtime allocation failure follows activation"
 }
 
 const borrow_snapshot_program =
-    \\let R=struct{x:int=0,s:string="old",}
+    \\let R=struct{x:int=0,s:str="old",}
     \\let main:()={
     \\    let mut a=[R.[],R.[x=1]]
     \\    let before=a
@@ -17420,7 +17440,7 @@ test "explicit local references rebind owners and print static type names O0 O3"
 
 const general_borrow_program =
     \\let E=enum{a,b,}
-    \\let R=struct{s:string,n:int=1,
+    \\let R=struct{s:str,n:int=1,
     \\let change:(self:R)->R={let mut copy=self
     \\copy.n=99
     \\copy}
@@ -17428,11 +17448,11 @@ const general_borrow_program =
     \\let O:(T:type)->type=union{some:T,none,}
     \\let inc:(x:int)->int=x+1
     \\let dec:(x:int)->int=x-1
-    \\let read:(x:string)->string={let r=&x
+    \\let read:(x:str)->str={let r=&x
     \\return r.*}
     \\let readArray:(x:[]int)->[]int={let r=&x
     \\return r.*}
-    \\let option:(x:O(string))->O(string)={let r=&x
+    \\let option:(x:O(str))->O(str)={let r=&x
     \\.some[r.*.!+"!"]}
     \\let main:()={
     \\let mut b=false
@@ -17456,7 +17476,7 @@ const general_borrow_program =
     \\@println(rr.*.change().n,rr.*.n,saved.s)
     \\rr.* =R.[s="new"+"!"]
     \\@println(r.s,r.n)
-    \\let mut o:O(string)=.none[]
+    \\let mut o:O(str)=.none[]
     \\let ro=&o
     \\ro.* =.some["yes"+"!"]
     \\@println(match option(ro.*){.some=>|v|v

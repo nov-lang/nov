@@ -217,7 +217,7 @@ Default formatting recurses through nested aggregates:
 Strings and runes are raw UTF-8, without quotes or escaping, even when nested.
 This is debugging output, not an unambiguous source-roundtrip format. Every nominal
 value, including nested fields, elements and union payloads, prefers its explicit
-`@[stringify]` converter with exact signature `(SelfType) -> string`. Each
+`@[stringify]` converter with exact signature `(SelfType) -> str`. Each
 encountered hook runs exactly once in traversal order: array index order, struct
 declaration order, and the active union payload. A valid
 hook replaces that value's entire representation and stops structural recursion,
@@ -241,9 +241,9 @@ See [`examples/printing.nov`](examples/printing.nov), whose marked converter is 
 Place argument-free `@[stringify]` on an ordinary immutable container method with
 a body. At most one method per struct, union or enum may be marked, and the
 annotation cannot be repeated on that method. Its name is arbitrary; its exact
-signature must be `(SelfType) -> string`, with one by-value parameter of the
+signature must be `(SelfType) -> str`, with one by-value parameter of the
 containing nominal type and an immutable string result. Parameter names are
-unrestricted, and aliases of the exact nominal type and `string` are accepted.
+unrestricted, and aliases of the exact nominal type and `str` are accepted.
 An ordinary method in a generic container is allowed: its signature is checked
 against the concrete container instance. The converter cannot have its own generic
 function parameters or combine `@[stringify]` with `@[noreturn]`, `@[test]`,
@@ -252,12 +252,12 @@ bodyless functions, fields and type aliases cannot be marked.
 
 ```nov
 let Entry = struct {
-    name: string,
+    name: str,
 
     @[stringify]
-    let format: (entry: Entry) -> string = "entry:{entry.name}"
+    let format: (entry: Entry) -> str = "entry:{entry.name}"
 
-    let toString: (entry: Entry) -> string = "ordinary:{entry.name}"
+    let toString: (entry: Entry) -> str = "ordinary:{entry.name}"
 }
 
 let main: () = {
@@ -973,7 +973,7 @@ let add: (T: #type, x: T, y: T) -> T = x + y
 ; it's easy to create a custom function from a generic one
 let addInt: (x: int, y: int) -> int = add(int, x, y)
 addInt(1, 2) ; returns 3
-add(string, "he", "llo") ; returns "hello"
+add(str, "he", "llo") ; returns "hello"
 add(bool, true, false) ; compile error: bool doesn't support `+` operator
 ```
 
@@ -1029,7 +1029,7 @@ names and tags match; module aliases preserve identity.
   propagation with exact error identity. Enum leaves need no GC roots.
 - Static container methods and `@[public]` metadata follow the existing bounded
   container rules. Default printing/interpolation uses `Kind.tag`; an exact
-  container method marked `@[stringify]` with signature `(Kind) -> string`
+  container method marked `@[stringify]` with signature `(Kind) -> str`
   overrides it, including for nested enum values, and runs once per encountered value.
 - Enum instance calls such as `kind.eql(other)` use the value-receiver rules below.
   Enum arrays support exact-type element equality and membership. Explicit numbered
@@ -1081,7 +1081,7 @@ The delivered subset is deliberately bounded:
   aliases work in annotations, method signatures, constructors and static calls.
   Forward module type names and method signatures are supported.
 - Named fields support every ordinary storable runtime type: `bool`, `rune`, integers
-  (including `i128`/`u128` and native `int`/`uint`), floats, immutable `string`, enums,
+  (including `i128`/`u128` and native `int`/`uint`), floats, immutable `str`, enums,
   structs, unions (including Option/Result), arrays, functions/closures and ranges.
   Use existing explicit types or aliases, including `@TypeOf(0..10)` for a range. Semantic checking
   uses the same integer-width and literal-bound rules as scalar values. The C
@@ -1199,10 +1199,10 @@ The delivered subset is deliberately bounded:
   [`examples/storable-fields.nov`](examples/storable-fields.nov).
 - Default printing/interpolation uses `MyType[ field: value, ... ]` (`MyType[]`
   when empty), recursively applying converters to nested fields/elements.
-  An explicit `@[stringify]` container method `(MyType) -> string` overrides the whole
+  An explicit `@[stringify]` container method `(MyType) -> str` overrides the whole
   value at any depth and stops recursion, allowing otherwise unprintable fields
   behind that hook. The parameter name is unrestricted, and aliases of the exact
-  nominal type and `string` are accepted. Wrong signatures or inaccessible explicit
+  nominal type and `str` are accepted. Wrong signatures or inaccessible explicit
   hooks diagnose even when nested; fallback applies only when no hook exists.
   Each encountered hook runs once in traversal order. No global overload lookup is provided.
   The method name is arbitrary; unmarked `toString` methods have no formatting effect.
@@ -1237,7 +1237,7 @@ this is implementation overhead, not heap allocation of the records themselves.
 ```nov
 let Buffer = struct {
     bytes: []u8 = [],
-    labels: []string = ["first", "second"],
+    labels: []str = ["first", "second"],
     rows: [][]int = [[1, 2], [], [3]],
 }
 let mut first = Buffer.[]
@@ -1392,8 +1392,8 @@ union constructors `U.tag[payload]` and `.tag[]`, array indexing and slicing are
 unchanged.
 
 Default output is `.[ a: 1, label: a ]` for named values and `.[1, a]` for positional
-values. Canonical type output is `struct{ a: i64, label: string }` and
-`struct{ i64, string }` on the 64-bit target. Nominal default output remains
+values. Canonical type output is `struct{ a: i64, label: str }` and
+`struct{ i64, str }` on the 64-bit target. Nominal default output remains
 `Rectangle[ width: 3, height: 4 ]` and `Empty[]`, not constructor source syntax.
 See [examples/anonymous-structs.nov](examples/anonymous-structs.nov) and
 `zig build test-cli-anonymous-structs` for five language tests and CLI coverage
@@ -1405,13 +1405,13 @@ The following example still includes deferred container constants.
 Struct is Nov's equivalent of [Product type](https://en.wikipedia.org/wiki/Product_type).
 ```nov
 let MyStruct = struct {
-    name: string,
+    name: str,
     x: float = 1.0,
     y: float = 1.0,
 
     let max = 100.0
 
-    let init: (name: string, x: float, y: float) -> MyStruct = {
+    let init: (name: str, x: float, y: float) -> MyStruct = {
         if x > max or y > max {
             @panic()
         }
@@ -1441,7 +1441,7 @@ let z = [ 10, 20, 30 ]
 
 #### Executable tagged unions
 
-Ordinary module declarations such as `let Value = union { number: int, text: string, empty, }`
+Ordinary module declarations such as `let Value = union { number: int, text: str, empty, }`
 introduce nominal tagged value types. Separate declarations remain distinct; aliases
 preserve identity. The current executable subset supports bool, integer, float, rune, string,
 void, enum, array, nested union, function/closure, range, and existing acyclic nominal
@@ -1464,7 +1464,7 @@ checked semantically through 128 bits, while reachable C layouts require
   checks the active tag in all build modes.
 - Non-generic union methods and `@[public]` use the same bounded container rules
   as structs, including default `Union.tag[payload]`/`Union.tag` printing and exact
-  `@[stringify]` overrides with exact signature `(SelfType) -> string` at any depth.
+  `@[stringify]` overrides with exact signature `(SelfType) -> str` at any depth.
   Default record payloads flatten their fields into `Union.tag[ field: value, ... ]`;
   a record payload hook instead produces
   `Union.tag[ <custom output> ]`. Visibility is metadata only.
@@ -1473,7 +1473,7 @@ checked semantically through 128 bits, while reachable C layouts require
   work with records and aliases. C emits payload record layouts before containing
   unions and roots each nested string owner, with inactive payload fields zeroed.
 - Array payloads include nested arrays and arrays of any existing storable element
-  type. `Option([]int)`, `Result([]string, E)` and `union { values: [][]int, none, }`
+  type. `Option([]int)`, `Result([]str, E)` and `union { values: [][]int, none, }`
   use ordinary constructors, matches, captures, printing and `.!`. Arrays nested
   inside the active payload copy independently; inactive payload fields remain
   zeroed and their arrays are not cloned. Immutable strings share backing and
@@ -1482,7 +1482,7 @@ checked semantically through 128 bits, while reachable C layouts require
   [`examples/union-arrays.nov`](examples/union-arrays.nov).
 - Nested union payloads retain exact nominal types, including `Option(Result(T, E))`
   and `Result(Option(T), E)`. Contextual constructors nest, for example
-  `.some[.ok[[1, 2]]]` under an expected `Option(Result([]int, string))`.
+  `.some[.ok[[1, 2]]]` under an expected `Option(Result([]int, str))`.
   Match or propagate one layer at a time; `.!` does not recursively unwrap or
   convert between Option and Result. Copies recursively detach array backing
   through active tags only. Active tag chains are validated before allocating
@@ -1547,7 +1547,7 @@ let b: Tree = .node[ .value = 0, .left = &leaf, .right = &leaf ]
 ; we can also create an union without explicit enum
 let Number = union {
     raw: int = 0, ; provide a default value for Number.raw
-    text: string,
+    text: str,
 
     ;;; Converts a Number to an int
     let toRaw: (self: Number) -> int = {
@@ -1589,7 +1589,7 @@ let Result: (T: type, E: type) -> type = union {
     ok: T,
     err: E,
 }
-let CountResult = Result(uint, string)
+let CountResult = Result(uint, str)
 ```
 
 `Result` is not a reserved builtin: its name and variant declarations are ordinary
@@ -1713,7 +1713,7 @@ implicit conversion or ordinary return wrapping is introduced. Later operand,
 argument and statement effects are skipped when `none` propagates.
 
 [examples/options.nov](examples/options.nov) uses safe division, propagates from
-`Option(uint)` into `Option(string)` with `.!`, and shows that its lazy fallback
+`Option(uint)` into `Option(str)` with `.!`, and shows that its lazy fallback
 runs only for a missing quotient:
 
 ```text
@@ -1760,7 +1760,7 @@ its body and propagates unchanged.
 let std = @import("std")
 let number: std.Option(int) = .some[21]
 let doubled = number.map((value) { value * 2 })
-let result: std.Result(int, string) = .ok[21]
+let result: std.Result(int, str) = .ok[21]
 let text = result.map((value) { "value:{value}" })
 ```
 
@@ -1979,7 +1979,7 @@ let Result: (T: type, E: type) -> type = union {
     }
 }
 
-let MyResult = Result(int, string)
+let MyResult = Result(int, str)
 let my_value = MyResult.ok[0]
 let my_err: MyResult = .err["my error string"]
 
@@ -2026,7 +2026,7 @@ let prod = a.! * b.! ; will return .none to the calling function since b is .non
 ### Executable array subset
 
 Growable `[]T` arrays support every existing storable runtime type: `bool`,
-`rune`, integers, immutable `string`, nominal enums, finite acyclic records and
+`rune`, integers, immutable `str`, nominal enums, finite acyclic records and
 existing tagged unions, function values (including closures), nested arrays, and
 inferred integer range values. `void` and compile-time `type` are not storable;
 `f32`/`f64` are storable. Semantic integer types extend through 128 bits, but
@@ -2426,17 +2426,17 @@ my_array = []
 6 in my_array ; false
 
 let my_array_of_array = [["Hello", "World!"], ["Bonjour", "Monde!"]]
-@TypeOf(my_array_of_array) ; returns [][]string
+@TypeOf(my_array_of_array) ; returns [][]str
 
 ; explicit local readonly reference; the immutable owner infers this same type
-let arr_arr: &[][]string = &my_array_of_array
+let arr_arr: &[][]str = &my_array_of_array
 @len(arr_arr.*) == 2 ; true
 
 ; this is an independent recursive value copy, not a reference copy
 let arr_copy = arr_arr.*
 
 ; rejected: an immutable owner cannot provide a mutable pointee
-; let arr_error: &mut [][]string = &my_array_of_array
+; let arr_error: &mut [][]str = &my_array_of_array
 
 ; imperative way of printing an array through an explicit dereference
 loop arr in arr_arr.* {
@@ -2460,7 +2460,7 @@ arr_arr.map(|arr| {
 
 ; with monad bind operator
 ; type annotation is optional
-arr_arr >>= |arr: []string| {
+arr_arr >>= |arr: []str| {
     arr >>= |word| word + " " |> @print
     @println()
 }
@@ -2614,7 +2614,7 @@ still require a final catchall (`_` or all positional `_`s); general finite-doma
 exhaustiveness is not implemented.
 
 ```nov
-let classify: (n: uint) -> string = match n % 3, n % 5 {
+let classify: (n: uint) -> str = match n % 3, n % 5 {
     0, 0 => "FizzBuzz"
     0, _ => "Fizz"
     _, 0 => "Buzz"
@@ -2848,7 +2848,7 @@ let nums: []int = [1, 2, 3]
 ```
 
 The executable subset supports membership in scalar `[]T` arrays: `bool`, `rune`,
-`string`, nominal enums, `f32`/`f64`, fixed 8/16/32/64-bit signed/unsigned integers,
+`str`, nominal enums, `f32`/`f64`, fixed 8/16/32/64-bit signed/unsigned integers,
 and native `int`/`uint`. Value and
 element types must match exactly; there is no widening or signedness conversion.
 A known array element type constrains the left literal; a known typed left value
@@ -2881,7 +2881,7 @@ let z += 3 ; compile error, expected `=`
 ## Globals
 
 Immutable module bindings infer `bool` from `true`/`false`, `rune` from single-quoted
-scalar literals and `string` from plain UTF-8 string literals. Integer literals
+scalar literals and `str` from plain UTF-8 string literals. Integer literals
 and literal negation default to `int`; float literals default to native `float`.
 Annotations or `@as` supply context before either fallback:
 
@@ -2971,7 +2971,7 @@ let main: () -> void = {
 Aliases are canonical synonyms, **not distinct newtypes**: `Count` and `uint`
 match exactly, with the same literal bounds, operations and backend restrictions.
 Supported RHS forms are `bool`, `void`, fixed-width integers, `f32`/`f64`, native `int`/`uint`/`float`,
-`rune`, `string`, nominal container types, supported array types and function types, including aliases in nested
+`rune`, `str`, nominal container types, supported array types and function types, including aliases in nested
 parameter/result/array-element positions. Bounded [`@TypeOf`](#type-queries)
 queries are also supported, including `let Count = @TypeOf(global)`.
 Function-type parameters may be unnamed.
@@ -3231,7 +3231,7 @@ nov run examples/fibo.nov --release # 55
 |-----------------------|--------------------|----------------------------------------------|---------------------------------------------------------------------|
 | Assignment            | a = b              | All types                                    | `a` is an identifier and `b` is an expression.                      |
 | Addition              | a + b <br> a += b  | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                                |
-| Concatenation         | a + b <br> a += b  | string <br> [Arrays](#Arrays)                | Strings and arrays: `+`/`+=`                          |
+| Concatenation         | a + b <br> a += b  | `str` <br> [Arrays](#Arrays)                | Strings and arrays: `+`/`+=`                          |
 | Substraction          | a - b <br> a -= b  | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                                |
 | Negation              | -a                 | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                                |
 | Multiplication        | a * b <br> a \*= b | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                                |
@@ -3309,9 +3309,9 @@ let Complex = struct {
     ]
 
     ; explicit print converter; the name is arbitrary
-    ; exact signature must be (T) -> string where T is the container type
+    ; exact signature must be (T) -> str where T is the container type
     @[stringify]
-    let format: (self: Complex) -> string = "{self.re} + i{self.im}"
+    let format: (self: Complex) -> str = "{self.re} + i{self.im}"
 }
 
 let x: Complex = .[ re = 5, im = 3 ]
@@ -3321,7 +3321,12 @@ x + y ; equivalent value: Complex.[ re = 7, im = 10 ]
 
 ## Strings
 
-`string` is immutable, valid UTF-8 on every platform, including Windows. Assignment,
+The type is spelled `str`, replacing the former `string` primitive without a
+compatibility alias. Migrate annotations, type arguments and `@[stringify]`
+results to `str`; printed types and `@TypeOf` use `str` too. The `std.string`
+namespace, string literals and runtime behavior are unchanged.
+
+`str` is immutable, valid UTF-8 on every platform, including Windows. Assignment,
 initialization, parameters and returns share immutable storage; `let mut` allows
 replacing the binding, never changing bytes. `+` concatenates strings, evaluating
 operands once, left to right. For a mutable local, `s += rhs` captures the old string
@@ -3342,12 +3347,12 @@ operand skips the remaining comparison without undoing earlier effects.
 Ordering (`<`, `<=`, `>`, `>=`), other operators (including `-=`, `*=`, `/=` and
 `%=`) and grapheme operations remain deferred. Scalar string iteration is
 supported (see [Loop](#loop)).
-`[]string` and supported record arrays work with independent element storage and
+`[]str` and supported record arrays work with independent element storage and
 shared immutable string backing; nested arrays recursively copy their array backing.
 
 `text[index]` decodes one Unicode scalar as **exactly `rune`**, using a native signed
 `int` index. Indices count scalars, not bytes or graphemes; `-1` is the last scalar. Out-of-bounds access,
-including indexing an empty string, panics with `string index out of bounds` in
+including indexing an empty string, panics with `str index out of bounds` in
 all build modes. No implicit integer widening or index signedness conversion occurs.
 The string and index evaluate once, left to right; the string value is captured
 before index effects can replace its binding or trigger GC. Indexing scans UTF-8
@@ -3370,7 +3375,7 @@ borrows are unsupported, even for `let mut` bindings. Whole-string aliases retai
 the existing borrowing rules. Chained reads such as `strings[0][1]` work for arrays
 of strings; nested arrays separately support chained value reads, not direct
 chained indexed writes. See
-[`examples/string-bytes.nov`](examples/string-bytes.nov), which keeps its historical
+[`examples/str-bytes.nov`](examples/string-bytes.nov), which keeps its historical
 filename but now demonstrates Unicode scalar indexing and length.
 
 String slicing supports `text[start..end]`, `text[..end]`, `text[start..]` and
@@ -3391,7 +3396,7 @@ The base, start and end evaluate once, left to right. Slicing returns an immutab
 allocation-free UTF-8 view sharing the original GC owner, without copying bytes;
 even a small view retains the full allocation. `@len(text)` still counts Unicode scalars.
 For example, `"é😀x"[1..-1] == "😀"`. Array slicing remains unsupported. See
-[`examples/string-slices.nov`](examples/string-slices.nov).
+[`examples/str-slices.nov`](examples/string-slices.nov).
 
 For editing, keep the distinction between a mutable binding and mutable storage:
 `s += "more"` produces a new immutable string and rebinds `s`, preserving older
@@ -3404,7 +3409,7 @@ Rune decoding through indexing is implemented;
 forward scalar iteration is also implemented (see [Loop](#loop)); grapheme
 operations remain deferred.
 
-For a `string`, `@len(text)` is the Unicode scalar count as native `uint`, **not byte length or a grapheme
+For a `str`, `@len(text)` is the Unicode scalar count as native `uint`, **not byte length or a grapheme
 count**. It scans UTF-8 in O(n) time without allocations. `@len("é")` and `@len("😀")`
 are both 1; `@len("e\u{301}")` is 2 and `@len("")` is 0. Literals use the existing escapes (`\n`, `\r`,
 `\t`, `\\`, `\"`, `\'`, `\0`, `\xNN`, `\u{...}`, `\{`, `\}`). Decoded bytes
@@ -3416,14 +3421,14 @@ scalar value, including function calls; use `\{` and `\}` for literal braces.
 NUL, with the same spaces, buffering, checked writes/final flush and panic behavior
 as scalars. Windows stdout is switched to binary mode on the first print to avoid
 newline translation; this is UTF-8 byte output, not UTF-16 console conversion.
-Immutable and mutable string globals support explicit `string` annotations or
+Immutable and mutable string globals support explicit `str` annotations or
 inference from plain literals, under the same compile-time-known data rules as
 other globals. Initializers cannot call runtime functions or read mutable globals.
 Global interpolation remains rejected; move it into a function.
 
 ```nov
-let prefix: string = "Hello"
-let identity: (text: string) -> string = text
+let prefix: str = "Hello"
+let identity: (text: str) -> str = text
 let main: () -> void = {
     let mut text = prefix + ", 世界!"
     let shared = identity(text)
@@ -3441,8 +3446,8 @@ never static byte pointers. Temporaries use the same precise root frames as arra
 
 ### Standard-library string conversions
 
-- `std.string.toBytes(text: string) -> []u8`
-- `std.string.fromBytes(bytes: []u8) -> std.Result(string, std.string.Utf8Error)`
+- `std.string.toBytes(text: str) -> []u8`
+- `std.string.fromBytes(bytes: []u8) -> std.Result(str, std.string.Utf8Error)`
 - `std.string.Utf8Error = enum { invalidUtf8, }`
 
 ```nov
@@ -3465,8 +3470,8 @@ overlong, surrogate, out-of-range and truncated sequences return
 Result-returning function or match the result and `Utf8Error`. These ordinary
 wrappers are first-class functions and support `@TypeOf` queries.
 
-The low-level `@stringToBytes(text: string) -> []u8` and
-`@stringFromBytes(bytes: []u8) -> string` intrinsics also copy; the latter **panics
+The low-level `@stringToBytes(text: str) -> []u8` and
+`@stringFromBytes(bytes: []u8) -> str` intrinsics also copy; the latter **panics
 on invalid UTF-8 in every build mode** rather than returning a Result. Prefer the
 validated public wrapper for arbitrary bytes. These are narrow runtime conversions,
 not general casts or approval of arbitrary compile-time execution; `@as` remains
@@ -3476,8 +3481,8 @@ stdout and nine tests, and [lib/README.md](lib/README.md#string-conversions).
 
 ### Standard-library integer parsing
 
-`std.string.parseInt(text: string) -> std.Result(int, std.string.ParseIntError)`
-and `parseUint(text: string) -> std.Result(uint, std.string.ParseIntError)` parse
+`std.string.parseInt(text: str) -> std.Result(int, std.string.ParseIntError)`
+and `parseUint(text: str) -> std.Result(uint, std.string.ParseIntError)` parse
 strict decimal ASCII digits into pointer-sized integers. Signed parsing accepts
 an optional `+` or `-`; unsigned parsing accepts `+` but rejects `-`, including
 `-0`. Leading zeros are allowed. Empty/sign-only input, whitespace, underscores,
@@ -3517,12 +3522,12 @@ zero, even in an empty string; empty prefixes and suffixes always match.
 These ordinary library functions work with immutable views and use normal eager
 argument evaluation. Their initial scalar-indexing/slicing implementations may
 rescan UTF-8; optimization remains deferred. See
-[`examples/string-search.nov`](examples/string-search.nov) and
+[`examples/str-search.nov`](examples/string-search.nov) and
 [`lib/README.md`](lib/README.md#string-search).
 
 ### Standard-library string splitting
 
-`std.string.split(text, separator)` returns `[]string`, preserving empty fields:
+`std.string.split(text, separator)` returns `[]str`, preserving empty fields:
 
 ```nov
 let parts = std.string.split("one::three", ":")
@@ -3545,7 +3550,7 @@ deferred. See [examples/string-split.nov](examples/string-split.nov) and
 
 ### Standard-library string joining
 
-`std.string.join(parts: []string, separator: string) -> string` inserts a separator
+`std.string.join(parts: []str, separator: str) -> str` inserts a separator
 between consecutive parts. Empty input returns `""`, a singleton returns its
 content, and an empty separator concatenates the parts. Empty parts still delimit
 separators: joining `["", "a", ""]` with `"|"` yields `"|a|"`.
@@ -3565,17 +3570,17 @@ for the runnable example and five tests, and
 
 ### Standard-library string transforms
 
-- `std.string.trim(text: string) -> string` removes leading/trailing Unicode
+- `std.string.trim(text: str) -> str` removes leading/trailing Unicode
   `White_Space`, returning an immutable shared-owner slice. The exact property is
   U+0009–000D, U+0020, U+0085, U+00A0, U+1680, U+2000–200A, U+2028,
   U+2029, U+202F, U+205F and U+3000. Interior whitespace, BOM, zero-width
   characters, NUL and combining marks are preserved.
-- `std.string.replace(text: string, pattern: string, replacement: string) -> string`
+- `std.string.replace(text: str, pattern: str, replacement: str) -> str`
   replaces exact, case-sensitive, non-overlapping matches left to right. UTF-8
   bytes and embedded NUL are preserved, without normalization. An empty replacement
   deletes matches; an empty pattern panics with
-  `string replace pattern must not be empty`, even for empty input.
-- `std.string.repeat(text: string, count: uint) -> string` concatenates `count`
+  `str replace pattern must not be empty`, even for empty input.
+- `std.string.repeat(text: str, count: uint) -> str` concatenates `count`
   copies. Zero count or empty text returns `""`; empty text skips the loop even
   at maximum `uint`.
 
@@ -3597,7 +3602,7 @@ example and seven tests, and [lib/README.md](lib/README.md#string-transforms).
 ## String Interpolation
 
 `"{expression}"` evaluates an expression in the current lexical scope and produces
-an immutable `string`. Placeholders support `bool` (`true`/`false`), signed and
+an immutable `str`. Placeholders support `bool` (`true`/`false`), signed and
 unsigned fixed-width integers (`i8`/`u8` through `i64`/`u64`), native `int`/`uint`
 (exact decimal, including minimum/maximum values), runes (UTF-8 encoded scalars),
 and strings (unchanged bytes).
@@ -3607,7 +3612,7 @@ same recursive default representations as print: `[a, b]`, `Entry[ field: value,
 `Color.tag`. Default record union payloads flatten to `Message.entry[ field: value, ... ]`.
 Strings/runes remain raw, not quoted or escaped. Nominal values at every depth
 prefer an explicit container method marked `@[stringify]` with exact signature
-`(SelfType) -> string`, invoked once in traversal order. A hook overrides the value
+`(SelfType) -> str`, invoked once in traversal order. A hook overrides the value
 and stops recursion; a record
 payload hook produces `Message.entry[ <custom output> ]` rather than flattened
 fields. Malformed/inaccessible hooks reject even when nested, and only a missing
@@ -3625,7 +3630,7 @@ values. Inline `[]int` is outside the existing interpolation parser grammar; use
 type alias instead.
 
 ```nov
-let describe: (n: int, ready: bool) -> string = "n={n}, ready={ready}"
+let describe: (n: int, ready: bool) -> str = "n={n}, ready={ready}"
 ```
 
 Placeholders use the normal expression parser and checker: identifiers, calls
@@ -3642,7 +3647,7 @@ syntax: do not escape their delimiting quotes for the outer string or add an
 extra escaping layer for escaped quotes, backslashes or Unicode escapes.
 
 ```nov
-let greet: (name: string) -> string = "Hello, {name}"
+let greet: (name: str) -> str = "Hello, {name}"
 let main: () = {
     let name = "Ada"
     @println("{"a"}")                 ; a
@@ -3698,19 +3703,19 @@ TODO
 
 ## Builtins
 ### Functions
-- `@import(path: string)`: Import a nov file. See [Visibility](#Visibility) for which declarations gets imported.
+- `@import(path: str)`: Import a nov file. See [Visibility](#Visibility) for which declarations gets imported.
 - `@len(value) -> uint`: Array element count, string Unicode scalar count, or finite bounded integer range cardinality. Evaluates the operand once; range count overflow panics in every mode (a known global-initializer overflow is a compile error). No record-field protocol or synthetic `.len` property. See [Range](#range).
 - `@TypeOf(expression)`: Implemented unevaluated compile-time query of an expression's canonical type; see [Type Queries](#type-queries). The operand is typechecked, not executed; the result is not a runtime type value.
-- `@stringToBytes(text: string) -> []u8`: Copy exact UTF-8 bytes, including NUL, into an independent mutable array. Allocation failure panics normally.
-- `@stringFromBytes(bytes: []u8) -> string`: Validate and copy into independently owned immutable UTF-8. Invalid UTF-8 panics in debug and release; use `std.string.fromBytes` for recoverable validation errors. Allocation failure panics normally. Neither intrinsic normalizes text or provides general casts/comptime execution.
+- `@stringToBytes(text: str) -> []u8`: Copy exact UTF-8 bytes, including NUL, into an independent mutable array. Allocation failure panics normally.
+- `@stringFromBytes(bytes: []u8) -> str`: Validate and copy into independently owned immutable UTF-8. Invalid UTF-8 panics in debug and release; use `std.string.fromBytes` for recoverable validation errors. Allocation failure panics normally. Neither intrinsic normalizes text or provides general casts/comptime execution.
 - `@typeInfo(...)`: Proposed type-information reflection; not implemented.
 - `@This()`: Returns the type of the current container
-- `@print(...)`: Output args separated with a space to stdout; returns void. Supports bool, fixed/native integer, f32/f64, raw rune/string and recursive default array/struct/union/enum formatting. Nominal values at any depth prefer an explicit `@[stringify]` method with exact signature `(SelfType) -> string`, called once per encountered value in traversal order and stopping structural recursion. Top-level hooks run immediately after argument evaluation; nested hooks run during traversal. Malformed/inaccessible hooks reject even when nested. Compile-time types emit canonical static name strings. Interpolated strings work like other strings. See the printing contract above.
+- `@print(...)`: Output args separated with a space to stdout; returns void. Supports bool, fixed/native integer, f32/f64, raw rune/string and recursive default array/struct/union/enum formatting. Nominal values at any depth prefer an explicit `@[stringify]` method with exact signature `(SelfType) -> str`, called once per encountered value in traversal order and stopping structural recursion. Top-level hooks run immediately after argument evaluation; nested hooks run during traversal. Malformed/inaccessible hooks reject even when nested. Compile-time types emit canonical static name strings. Interpolated strings work like other strings. See the printing contract above.
 - `@println(...)`: Same as print with a newline at the end, including with no args.
 - `@fprint(file: File, ...)`: Same as print but output to a specific file. Returns a Result<>.
 <!-- - `@eprint(...)`: Same as print but output to stderr. -->
-<!-- - `@printf(fmt: #string, args: ...)` works like std.fmt.format and print to stdout -->
-- `@panic(s: string)`: A terminal, void-returning builtin following the `@[noreturn]` contract. Evaluate exactly one string argument once, attempt to flush stdout, write `panic: <message>\n` to stderr, then exit with code 1. Messages are length-based UTF-8 bytes, including embedded NUL. No backtrace is produced; debug and release behave identically.
+<!-- - `@printf(fmt: #str, args: ...)` works like std.fmt.format and print to stdout -->
+- `@panic(s: str)`: A terminal, void-returning builtin following the `@[noreturn]` contract. Evaluate exactly one string argument once, attempt to flush stdout, write `panic: <message>\n` to stderr, then exit with code 1. Messages are length-based UTF-8 bytes, including embedded NUL. No backtrace is produced; debug and release behave identically.
 - `@max(a: T, b: T, ...)`: Returns the maximum value between all the supplied arguments
 - `@min(a: T, b: T, ...)`: Returns the minimum value between all the supplied arguments
 - `@dump(expr)`: TODO: https://docs.vlang.io/builtin-functions.html#dumping-expressions-at-runtime
@@ -3873,7 +3878,7 @@ unconditional loops without an owned exit can satisfy this guarantee.
 
 ```nov
 @[noreturn]
-let fail: (message: string) -> void = {
+let fail: (message: str) -> void = {
     @panic(message)
 }
 

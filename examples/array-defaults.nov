@@ -2,7 +2,7 @@ let std = @import("std")
 
 let Settings = struct {
     bytes: []u8 = [],
-    labels: []string = ["first", "second"],
+    labels: []str = ["first", "second"],
     rows: [][]int = [[1, 2], [], [3]],
 }
 

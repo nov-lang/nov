@@ -242,7 +242,7 @@ fn methodLibrary(allocator: std.mem.Allocator, shape: Shape, public_methods: boo
         if (public_methods) "@[public]\n" else "",
         "let get:(self:Self)->int=helper()\n",
         if (public_methods) "@[public]\n" else "",
-        "@[stringify]\nlet toString:(self:Self)->string=\"private\"\n",
+        "@[stringify]\nlet toString:(self:Self)->str=\"private\"\n",
         "@[public]\nlet wrapper:(self:Self)->int=Self.secret()+self.get()\n",
         if (public_methods) "@[public]\n" else "",
         "let unmarked:(self:Self)->int=self.get()\n}\n",
@@ -292,7 +292,7 @@ test "visibility explicit public static receiver extracted and toString methods 
             "let Thing=api.Thing\nlet main:()={let x:", shape.concrete, "=",                                                                                    shape.constructor,
             "\nlet f:()->int=",                         shape.concrete, ".secret\nlet get:(",                                                                   shape.concrete,
             ")->int=",                                  shape.concrete, ".get\nlet text:(",                                                                     shape.concrete,
-            ")->string=",                               shape.concrete, ".toString\n@println(f(),get(x),text(x),x.get(),x.unmarked(),x.toString(),x,\"{x}\")}",
+            ")->str=",                                  shape.concrete, ".toString\n@println(f(),get(x),text(x),x.get(),x.unmarked(),x.toString(),x,\"{x}\")}",
         });
         defer std.testing.allocator.free(root);
         for ([_]bool{ false, true }) |named| try checkCase(std.testing.allocator, .{
@@ -319,7 +319,7 @@ test "visibility private static receiver toString and method extraction stay hid
                 "@println(\"{x}\")",
                 "let f:()->int=TYPE.secret\n@println(f())",
                 "let f:(TYPE)->int=TYPE.get\n@println(f(x))",
-                "let f:(TYPE)->string=TYPE.toString\n@println(f(x))",
+                "let f:(TYPE)->str=TYPE.toString\n@println(f(x))",
             }) |expression| {
                 const call = try std.mem.replaceOwned(u8, std.testing.allocator, expression, "TYPE", shape.concrete);
                 defer std.testing.allocator.free(call);
@@ -344,7 +344,7 @@ test "visibility returned private nominal values retain method visibility" {
         \\let Hidden=struct{value:int,
         \\let get:(self:Hidden)->int=self.value
         \\@[stringify]
-        \\let toString:(self:Hidden)->string="hidden"
+        \\let toString:(self:Hidden)->str="hidden"
         \\@[public]
         \\let visible:(self:Hidden)->int=self.get()
         \\}

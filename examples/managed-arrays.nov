@@ -1,5 +1,5 @@
 let Name = struct {
-    text: string,
+    text: str,
 }
 
 let Person = struct {
@@ -8,7 +8,7 @@ let Person = struct {
 }
 
 let main: () = {
-    let mut names: []string = ["Ada", "Grace"]
+    let mut names: []str = ["Ada", "Grace"]
     let originalNames = names
     names[0] = "Lin" + "us"
     names += ["Edsger"]

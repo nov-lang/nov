@@ -1,7 +1,7 @@
 let std = @import("std")
 let File = std.fs.File
 
-let openFile: (path: string) -> Result(File, File.Error) = {
+let openFile: (path: str) -> Result(File, File.Error) = {
     let file = File.open(path).!
 
     ; the .! operator does the same as

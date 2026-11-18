@@ -14,7 +14,7 @@ let option_variants_and_inferred_results: () = {
     let mut calls = 0
     let some: Option(int) = .some[7]
     let none: Option(int) = .none[]
-    let converted: Option(string) = some.map(
+    let converted: Option(str) = some.map(
         (x) {
             calls += 1
             "value:{x}"
@@ -47,8 +47,8 @@ let option_variants_and_inferred_results: () = {
 
 @[test]
 let result_variants_and_shared_captures: () = {
-    let good: Result(int, string) = .ok[3]
-    let bad: Result(int, string) = .err["missing"]
+    let good: Result(int, str) = .ok[3]
+    let bad: Result(int, str) = .err["missing"]
     let mut calls = 0
     let mut offset = 10
     let convert: (int) -> int = (x) {
@@ -79,7 +79,7 @@ let result_variants_and_shared_captures: () = {
             .err => |error| error == 7
         }
     )
-    let untouched = Result(int, string).mapErr(
+    let untouched = Result(int, str).mapErr(
         good,
         (error) {
             calls += 1
@@ -87,7 +87,7 @@ let result_variants_and_shared_captures: () = {
         }
     )
     @assert(untouched.unwrapOr(0) == 3 and calls == 3)
-    let text = Result(int, string).map(
+    let text = Result(int, str).map(
         good,
         (x) {
             "ok:{x}"
@@ -100,8 +100,8 @@ let result_variants_and_shared_captures: () = {
         }
     )
     let absent: Result(int, void) = .err[]
-    let skipped: Result(string, void) = absent.map(
-        (value) -> string {
+    let skipped: Result(str, void) = absent.map(
+        (value) -> str {
             @panic("void error must skip conversion")
         }
     )
@@ -145,11 +145,11 @@ let eager_receiver_and_callback_construction: () = {
     source = .none[]
     @assert(receiver().map(callback()).isNone())
     @assert(events == 12)
-    let good = () -> Result(int, string) {
+    let good = () -> Result(int, str) {
         events = events * 10 + 1
         .ok[3]
     }
-    let bad = () -> Result(int, string) {
+    let bad = () -> Result(int, str) {
         events = events * 10 + 1
         .err["bad"]
     }
@@ -157,7 +157,7 @@ let eager_receiver_and_callback_construction: () = {
     @assert(good().map(callback()).unwrapOr(0) == 4 and events == 123)
     events = 0
     @assert(bad().map(callback()).isErr() and events == 12)
-    let errorCallback = () -> (string) -> int {
+    let errorCallback = () -> (str) -> int {
         events = events * 10 + 2
         (error) {
             events = events * 10 + 3
@@ -235,8 +235,8 @@ let record_payloads_and_recursive_array_copies: () = {
 @[test]
 let inactive_callbacks_and_chained_maps: () = {
     let none: Option(int) = .none[]
-    let good: Result(int, string) = .ok[5]
-    let bad: Result(int, string) = .err["bad"]
+    let good: Result(int, str) = .ok[5]
+    let bad: Result(int, str) = .err["bad"]
     @assert(
         none.map(
             (x) -> int {
@@ -299,7 +299,7 @@ let chained_container_operations: () = {
     let mut calls = 0
     let present: Option(int) = .some[2]
     let absent: Option(int) = .none[]
-    let next = (value: int) -> Option(string) {
+    let next = (value: int) -> Option(str) {
         calls += 1
         if value > 0 {
             .some["value:{value}"]
@@ -312,9 +312,9 @@ let chained_container_operations: () = {
     let zero: Option(int) = .some[0]
     @assert(Option(int).andThen(zero, next).isNone() and calls == 2)
 
-    let good: Result(int, string) = .ok[2]
-    let bad: Result(int, string) = .err["original"]
-    let step = (value: int) -> Result(string, string) {
+    let good: Result(int, str) = .ok[2]
+    let bad: Result(int, str) = .err["original"]
+    let step = (value: int) -> Result(str, str) {
         calls += 1
         if value > 0 {
             .ok["value:{value}"]
@@ -331,8 +331,8 @@ let chained_container_operations: () = {
             .err => |error| error == "original"
         }
     )
-    let failure: Result(int, string) = .ok[0]
-    let changed = Result(int, string).andThen(failure, step)
+    let failure: Result(int, str) = .ok[0]
+    let changed = Result(int, str).andThen(failure, step)
     @assert(
         match changed {
             .ok => false
@@ -355,8 +355,8 @@ let chained_container_operations: () = {
         }
     )
     @assert(skipped.isErr())
-    let finished: Result(void, string) = good.andThen(
-        (value) -> Result(void, string) {
+    let finished: Result(void, str) = good.andThen(
+        (value) -> Result(void, str) {
             @assert(value == 2)
             .ok[]
         }
@@ -391,8 +391,8 @@ let chained_container_operations: () = {
 let main: () = {
     let some: Option(int) = .some[21]
     let none: Option(int) = .none[]
-    let good: Result(int, string) = .ok[21]
-    let bad: Result(int, string) = .err["missing"]
+    let good: Result(int, str) = .ok[21]
+    let bad: Result(int, str) = .err["missing"]
     @println(
         "Option:",
         some.map(

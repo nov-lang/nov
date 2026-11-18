@@ -2,10 +2,10 @@ let std = @import("std")
 let Result = std.Result
 
 let Entry = struct {
-    name: string,
+    name: str,
     size: uint,
 
-    let describe: (self: Entry) -> string = "{self.name}: {self.size} bytes"
+    let describe: (self: Entry) -> str = "{self.name}: {self.size} bytes"
 }
 
 let ErrorKind = enum {
@@ -15,11 +15,11 @@ let ErrorKind = enum {
 }
 
 let LookupError = struct {
-    name: string,
+    name: str,
     kind: ErrorKind = .not_found,
 
     @[stringify]
-    let toString: (self: LookupError) -> string = {
+    let toString: (self: LookupError) -> str = {
         let message = match self.kind {
             .not_found => "entry not found"
             .permission_denied => "permission denied"
@@ -29,7 +29,7 @@ let LookupError = struct {
     }
 }
 
-let lookup: (name: string) -> Result(Entry, LookupError) = {
+let lookup: (name: str) -> Result(Entry, LookupError) = {
     if name == "readme" {
         .ok[Entry.[ name = name, size = 42 ]]
     } else {
@@ -37,9 +37,9 @@ let lookup: (name: string) -> Result(Entry, LookupError) = {
     }
 }
 
-let describe: (name: string) -> Result(string, LookupError) = .ok[lookup(name).!.describe()]
+let describe: (name: str) -> Result(str, LookupError) = .ok[lookup(name).!.describe()]
 
-let report: (name: string) = {
+let report: (name: str) = {
     let message = match describe(name) {
         .ok => |text| text
         .err => |error| match error.kind {

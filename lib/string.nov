@@ -6,7 +6,7 @@ let Utf8Error = enum {
 }
 
 @[public]
-let toBytes: (text: string) -> []u8 = @stringToBytes(text)
+let toBytes: (text: str) -> []u8 = @stringToBytes(text)
 
 let isValidUtf8: (bytes: []u8) -> bool = {
     let mut remaining: u8 = 0
@@ -51,7 +51,7 @@ let isValidUtf8: (bytes: []u8) -> bool = {
 }
 
 @[public]
-let fromBytes: (bytes: []u8) -> std.Result(string, Utf8Error) = {
+let fromBytes: (bytes: []u8) -> std.Result(str, Utf8Error) = {
     if isValidUtf8(bytes) == false {
         return .err[ .invalidUtf8 ]
     }
@@ -65,7 +65,7 @@ let ParseIntError = enum {
 }
 
 @[public]
-let parseInt: (text: string) -> std.Result(int, ParseIntError) = {
+let parseInt: (text: str) -> std.Result(int, ParseIntError) = {
     let mut first = true
     let mut negative = false
     let mut hasDigits = false
@@ -120,7 +120,7 @@ let parseInt: (text: string) -> std.Result(int, ParseIntError) = {
 }
 
 @[public]
-let parseUint: (text: string) -> std.Result(uint, ParseIntError) = {
+let parseUint: (text: str) -> std.Result(uint, ParseIntError) = {
     let mut first = true
     let mut hasDigits = false
     let mut value: uint = 0
@@ -158,7 +158,7 @@ let parseUint: (text: string) -> std.Result(uint, ParseIntError) = {
 }
 
 @[public]
-let startsWith: (text: string, prefix: string) -> bool = {
+let startsWith: (text: str, prefix: str) -> bool = {
     if @len(prefix) > @len(text) {
         return false
     }
@@ -171,7 +171,7 @@ let startsWith: (text: string, prefix: string) -> bool = {
 }
 
 @[public]
-let endsWith: (text: string, suffix: string) -> bool = {
+let endsWith: (text: str, suffix: str) -> bool = {
     if @len(suffix) > @len(text) {
         return false
     }
@@ -185,7 +185,7 @@ let endsWith: (text: string, suffix: string) -> bool = {
 }
 
 @[public]
-let find: (text: string, pattern: string) -> std.Option(uint) = {
+let find: (text: str, pattern: str) -> std.Option(uint) = {
     if @len(pattern) == 0 {
         return .some[0]
     }
@@ -198,10 +198,10 @@ let find: (text: string, pattern: string) -> std.Option(uint) = {
 }
 
 @[public]
-let contains: (text: string, pattern: string) -> bool = find(text, pattern).isSome()
+let contains: (text: str, pattern: str) -> bool = find(text, pattern).isSome()
 
 @[public]
-let join: (parts: []string, separator: string) -> string = {
+let join: (parts: []str, separator: str) -> str = {
     let mut result = ""
     let mut first = true
     loop part in parts {
@@ -215,7 +215,7 @@ let join: (parts: []string, separator: string) -> string = {
 }
 
 @[public]
-let split: (text: string, separator: string) -> []string = {
+let split: (text: str, separator: str) -> []str = {
     if @len(separator) == 0 {
         return [text]
     }
@@ -224,7 +224,7 @@ let split: (text: string, separator: string) -> []string = {
     loop _ in separator {
         width += 1
     }
-    let mut result: []string = []
+    let mut result: []str = []
     let mut start: int = 0
     loop _, index in text, @as(int, 0).. {
         if index < start {
@@ -271,7 +271,7 @@ let isWhiteSpace: (scalar: rune) -> bool = {
 }
 
 @[public]
-let trim: (text: string) -> string = {
+let trim: (text: str) -> str = {
     let mut start: int = 0
     let mut end: int = 0
     let mut leading = true
@@ -292,12 +292,12 @@ let trim: (text: string) -> string = {
 }
 
 @[public]
-let replace: (text: string, pattern: string, replacement: string) -> string = {
+let replace: (text: str, pattern: str, replacement: str) -> str = {
     join(split(text, pattern), replacement)
 }
 
 @[public]
-let repeat: (text: string, count: uint) -> string = {
+let repeat: (text: str, count: uint) -> str = {
     if @len(text) == 0 {
         return ""
     }

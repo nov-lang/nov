@@ -142,7 +142,7 @@ fn renderModuleWithSources(module: *const Module, compilation: ?*const Compilati
             .invalid_field_default => try writer.writeAll("struct field default must be an exactly typed scalar or nested array literal; other aggregate values require explicit initialization"),
             .record_layout_cycle => try writer.writeAll("cyclic by-value struct layout"),
             .record_layout_limit => try writer.writeAll("by-value aggregate nesting exceeds the current limit of 128"),
-            .invalid_to_string => try writer.writeAll("@[stringify] method must be accessible with exact signature (SelfType) -> string; imported methods require @[public]"),
+            .invalid_to_string => try writer.writeAll("@[stringify] method must be accessible with exact signature (SelfType) -> str; imported methods require @[public]"),
             .invalid_stringify_declaration => try writer.writeAll("@[stringify] requires an ordinary immutable container method with a body, takes no arguments, cannot be repeated, and cannot be combined with test, noreturn, extern or export"),
             .duplicate_stringifier => try writer.writeAll("only one @[stringify] method is allowed per container"),
             .duplicate_name => try writer.print("duplicate declaration '{s}'", .{source.slice(diagnostic.span).?}),
@@ -166,7 +166,7 @@ fn renderModuleWithSources(module: *const Module, compilation: ?*const Compilati
             .invalid_literal => try writer.writeAll("invalid literal; rune literals require exactly one Unicode scalar"),
             .unsupported_literal => try writer.writeAll("this literal is not supported in semantic analysis yet"),
             .invalid_interpolation => try writer.writeAll("expected {expression}; blocks, control flow, comments and format options are unsupported; escape literal braces as \\{ and \\}"),
-            .unsupported_interpolation_type => try writer.writeAll("interpolation requires a bool, integer, float, rune, string, printable array/struct/enum/union, or compile-time type; @[stringify] methods require signature (SelfType) -> string"),
+            .unsupported_interpolation_type => try writer.writeAll("interpolation requires a bool, integer, float, rune, str, printable array/struct/enum/union, or compile-time type; @[stringify] methods require signature (SelfType) -> str"),
             .unsupported_global_interpolation => try writer.writeAll("global strings require literal initializers; move interpolation into a function"),
             .literal_type_mismatch => try writer.writeAll("literal does not match the annotated type"),
             .literal_out_of_range => try writer.print("{s} literal does not fit the annotated type", .{numericLiteralKind(source, diagnostic.span)}),
@@ -200,7 +200,7 @@ fn renderModuleWithSources(module: *const Module, compilation: ?*const Compilati
             .argument_count_mismatch => try writer.writeAll("argument count does not match the function signature"),
             .unresolved_value_type => try writer.writeAll("declaration needs a resolved type before use here"),
             .body_nesting_limit => try writer.writeAll("recursive body checking exceeds the current analysis limit of 128"),
-            .unsupported_global_initializer => try writer.writeAll("inferred globals require immutable integer/float/bool/rune/string literals or @as(T, scalar literal); general global initialization is unsupported"),
+            .unsupported_global_initializer => try writer.writeAll("inferred globals require immutable integer/float/bool/rune/str literals or @as(T, scalar literal); general global initialization is unsupported"),
             .unsupported_lowering => try writer.writeAll("lowering this source form is not implemented yet"),
         }
         try location.renderExcerpt(source.ast.source, diagnostic.span.end - diagnostic.span.start, writer);
@@ -263,7 +263,7 @@ pub fn renderCompilation(compilation: *const Compilation, writer: *std.Io.Writer
         const location = Location.init(source.ast.source, diagnostic.span.start);
         try location.renderPrefix(source.path, "error", writer);
         try writer.writeAll(switch (diagnostic.tag) {
-            .invalid_import => "@import requires one literal string argument and must be the initializer or the base of a qualified member chain in an immutable, unannotated top-level declaration",
+            .invalid_import => "@import requires one literal str argument and must be the initializer or the base of a qualified member chain in an immutable, unannotated top-level declaration",
             .invalid_path => "import requires a relative literal .nov path or the named module 'std'",
             .missing_library => "named import 'std' requires a configured library directory",
             .load_failed => "cannot load imported source",
@@ -455,7 +455,7 @@ test "module body diagnostics render messages and optional related notes" {
         .{ .tag = .not_callable, .message = "expression is not callable", .note = "type specified here" },
         .{ .tag = .unresolved_value_type, .message = "declaration needs a resolved type before use here", .note = "declaration here" },
         .{ .tag = .body_nesting_limit, .message = "recursive body checking exceeds the current analysis limit of 128" },
-        .{ .tag = .unsupported_global_initializer, .message = "inferred globals require immutable integer/float/bool/rune/string literals or @as(T, scalar literal); general global initialization is unsupported" },
+        .{ .tag = .unsupported_global_initializer, .message = "inferred globals require immutable integer/float/bool/rune/str literals or @as(T, scalar literal); general global initialization is unsupported" },
         .{ .tag = .unsupported_lowering, .message = "lowering this source form is not implemented yet" },
     }) |case| {
         for ([_]bool{ true, false }) |with_related| {

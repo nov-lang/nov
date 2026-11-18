@@ -757,7 +757,7 @@ test "export ABI validates resolved aliases native integers and unused signature
         defer sema.deinit();
         try std.testing.expect(!module.hasErrors());
     }
-    for ([_][]const u8{ "i128", "u128", "string", "rune", "[]i32", "() -> i32", "R", "E" }) |ty| {
+    for ([_][]const u8{ "i128", "u128", "str", "rune", "[]i32", "() -> i32", "R", "E" }) |ty| {
         const source = try std.fmt.allocPrint(std.testing.allocator, "let R = struct {{ x: i32, }}\nlet E = enum {{ a, }}\n@[export]\nlet unused: (x: {s}) -> {s} = x", .{ ty, ty });
         defer std.testing.allocator.free(source);
         var module = try Module.init(std.testing.allocator, "abi.nov", source);
@@ -771,7 +771,7 @@ test "export ABI validates resolved aliases native integers and unused signature
     }
     for ([_][]const u8{
         "@[export]\nlet bad: (x: void) = {}",
-        "@[export]\nlet bad: () -> string = \"text\"",
+        "@[export]\nlet bad: () -> str = \"text\"",
         "@[export]\nlet bad: () -> i128 = 0",
         "@[export]\nlet bad: () -> () = {}",
     }) |bad| {
@@ -870,14 +870,14 @@ test "annotated scalar ascriptions match inferred pairs and preserve plain liter
         \\let annotated_bool: Flag = @as(bool, @as(Flag, true))
         \\let inferred_int = @as(Count, @as(int, -42))
         \\let annotated_int: int = @as(Count, @as(int, -42))
-        \\let inferred_string = @as(Text, @as(string, "hé\0"))
-        \\let annotated_string: Text = @as(string, @as(Text, "hé\0"))
+        \\let inferred_string = @as(Text, @as(str, "hé\0"))
+        \\let annotated_string: Text = @as(str, @as(Text, "hé\0"))
         \\let grouped_bool: bool = {{true}}
         \\let grouped_int: int = -{{42}}
-        \\let grouped_string: string = {{"hé\0"}}
+        \\let grouped_string: str = {{"hé\0"}}
         \\let Flag = bool
         \\let Count = int
-        \\let Text = string
+        \\let Text = str
     ;
     var module = try Module.init(std.testing.allocator, "annotated-as.nov", source);
     var sema = analyzeAnnotations(&module) catch |err| {
@@ -907,12 +907,12 @@ test "annotated scalar ascriptions diagnose declared and nested mismatches bound
         .{ .source = "let n: uint = @as(int, 1)", .tag = .expression_type_mismatch },
         .{ .source = "let n: uint = @as(int, @as(uint, 1))", .tag = .expression_type_mismatch },
         .{ .source = "let n: uint = @as(uint, @as(int, 1))", .tag = .expression_type_mismatch },
-        .{ .source = "let s: string = @as(bool, true)", .tag = .expression_type_mismatch },
+        .{ .source = "let s: str = @as(bool, true)", .tag = .expression_type_mismatch },
         .{ .source = "let n: i8 = @as(i8, 128)", .tag = .literal_out_of_range },
         .{ .source = "let n: u8 = @as(u8, @as(u8, -1))", .tag = .literal_out_of_range },
         .{ .source = "let n: int = @as(int, false)", .tag = .literal_type_mismatch },
-        .{ .source = "let s: string = @as(string, @as(string, \"{true}\"))", .tag = .unsupported_global_interpolation },
-        .{ .source = "let s: string = {{\"{true}\"}}", .tag = .unsupported_global_interpolation },
+        .{ .source = "let s: str = @as(str, @as(str, \"{true}\"))", .tag = .unsupported_global_interpolation },
+        .{ .source = "let s: str = {{\"{true}\"}}", .tag = .unsupported_global_interpolation },
         .{ .source = "let n: int = @as(Missing, 1)", .tag = .unknown_type },
         .{ .source = "let n: int = @as(int)", .tag = .argument_count_mismatch },
     }) |case| {
@@ -955,7 +955,7 @@ test "annotated ascriptions keep general global initialization deferred" {
 
 test "inferred globals own canonical scalar constants and keep aliases distinct" {
     var module = try Module.init(std.testing.allocator, "globals.nov", "let yes = true\nlet no = @as(bool, @as(bool, false))\nlet text = \"hé\\0\\{ok\\}\"\n" ++
-        "let wrapped = @as(string, \"owned\")\nlet number = @as(Count, @as(int, -42))\nlet Count = int\nlet pending = 42\nlet chain = yes\nlet block = {true}\nlet mut mutable = true");
+        "let wrapped = @as(str, \"owned\")\nlet number = @as(Count, @as(int, -42))\nlet Count = int\nlet pending = 42\nlet chain = yes\nlet block = {true}\nlet mut mutable = true");
     var sema = analyzeAnnotations(&module) catch |err| {
         module.deinit();
         return err;
@@ -992,17 +992,17 @@ test "inferred global ascriptions diagnose exact types bounds arity and interpol
         .{ .expression = "@as(i8, 128)", .tag = .literal_out_of_range },
         .{ .expression = "@as(u8, -1)", .tag = .literal_out_of_range },
         .{ .expression = "@as(int, @as(uint, 1))", .tag = .expression_type_mismatch },
-        .{ .expression = "@as(bool, @as(string, \"x\"))", .tag = .expression_type_mismatch },
+        .{ .expression = "@as(bool, @as(str, \"x\"))", .tag = .expression_type_mismatch },
         .{ .expression = "@as(int, true)", .tag = .literal_type_mismatch },
         .{ .expression = "@as(bool, 1)", .tag = .literal_type_mismatch },
-        .{ .expression = "@as(string, false)", .tag = .literal_type_mismatch },
+        .{ .expression = "@as(str, false)", .tag = .literal_type_mismatch },
         .{ .expression = "@as(Unknown, 1)", .tag = .unknown_type },
         .{ .expression = "@as(true, 1)", .tag = .not_a_type },
         .{ .expression = "@as()", .tag = .argument_count_mismatch },
         .{ .expression = "@as(int)", .tag = .argument_count_mismatch },
         .{ .expression = "@as(int, 1, 2)", .tag = .argument_count_mismatch },
         .{ .expression = "\"{true}\"", .tag = .unsupported_global_interpolation },
-        .{ .expression = "@as(string, \"{true}\")", .tag = .unsupported_global_interpolation },
+        .{ .expression = "@as(str, \"{true}\")", .tag = .unsupported_global_interpolation },
         .{ .expression = "\"\\xff\"", .tag = .invalid_literal },
     }) |case| {
         const source = try std.fmt.allocPrint(std.testing.allocator, "let value = {s}", .{case.expression});
@@ -1021,7 +1021,7 @@ test "inferred global ascriptions diagnose exact types bounds arity and interpol
 }
 
 test "inferred global constants clean up on every allocation failure" {
-    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{"let yes = true\nlet text = @as(string, \"hé\\0\")\nlet n = @as(Count, @as(int, -42))\nlet Count = int"});
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{"let yes = true\nlet text = @as(str, \"hé\\0\")\nlet n = @as(Count, @as(int, -42))\nlet Count = int"});
 }
 
 test "defaulted global integers check native bounds without overriding explicit contexts" {
@@ -1381,7 +1381,7 @@ test "extern ABI accepts scalar aliases and leaves bodyless signatures external"
         try std.testing.expectEqual(Status.external, sema.getEntry(module.lookup("stop").?).?.status);
         try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
     }
-    for ([_][]const u8{ "i128", "u128", "string", "rune", "[]i32", "() -> i32", "R", "E" }) |ty| {
+    for ([_][]const u8{ "i128", "u128", "str", "rune", "[]i32", "() -> i32", "R", "E" }) |ty| {
         const source = try std.fmt.allocPrint(std.testing.allocator, "let R = struct {{ x: i32, }}\nlet E = enum {{ a, }}\n@[extern]\nlet foreign: (x: {s}) -> {s}", .{ ty, ty });
         defer std.testing.allocator.free(source);
         var module = try Module.init(std.testing.allocator, "extern-abi.nov", source);

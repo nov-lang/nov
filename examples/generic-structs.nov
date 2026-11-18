@@ -7,7 +7,7 @@ let Box: (T: type) -> type = struct {
 }
 
 let main: () = {
-    let mut name = Box(string).[ value = "Ada" ]
+    let mut name = Box(str).[ value = "Ada" ]
     let original = name
     name.value += " Lovelace"
     let names = [name, original]

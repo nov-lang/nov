@@ -558,7 +558,7 @@ test "library emission omits process main and buffers export diagnostics" {
         .{ .source = "@[export]\nlet exact: (x: i32) -> i32 = x\n@[export(\"custom\")]\nlet renamed: (x: bool) -> bool = x\n" },
         .{ .source = "let main: () = {}\n@[export]\nlet exact: () -> u8 = 7\n" },
         .{ .source = "@[export(\"bad-name\")]\nlet f: () -> i32 = 1", .message = "export name must be" },
-        .{ .source = "@[export]\nlet f: (x: string) -> string = x", .message = "export ABI supports only" },
+        .{ .source = "@[export]\nlet f: (x: str) -> str = x", .message = "export ABI supports only" },
         .{ .source = "@[export(\"same\")]\nlet f: () = {}\n@[export(\"same\")]\nlet g: () = {}", .message = "duplicate exported symbol" },
         .{ .source = "let helper: () = {}\n@[export]\nlet nov_helper: () = {}", .message = "export symbol conflicts with a generated function name" },
     };

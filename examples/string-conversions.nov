@@ -9,9 +9,9 @@
 
 let std = @import("std")
 let Utf8Error = std.string.Utf8Error
-let TextResult = std.Result(string, Utf8Error)
+let TextResult = std.Result(str, Utf8Error)
 
-let expectValid: (bytes: []u8, expected: string) = {
+let expectValid: (bytes: []u8, expected: str) = {
     let text = match std.string.fromBytes(bytes) {
         .ok => |value| value
         .err => {
@@ -177,7 +177,7 @@ let exact_bytes_no_normalization_and_copy_isolation: () = {
     @assert(std.string.fromBytes([0x65, 0xCC, 0x81]).unwrapOr("") != "é")
 }
 
-let retainedText: () -> string = {
+let retainedText: () -> str = {
     let bytes = std.string.toBytes("temporary:" + "é😀\0")
     std.string.fromBytes(bytes).unwrapOr("bad")
 }
@@ -207,7 +207,7 @@ let decorate: (bytes: []u8) -> TextResult = {
 
 @[test]
 let propagation_error_matching_and_first_class_wrappers: () = {
-    let encode: (string) -> []u8 = std.string.toBytes
+    let encode: (str) -> []u8 = std.string.toBytes
     let decode: ([]u8) -> TextResult = std.string.fromBytes
     let sameEncode: @TypeOf(std.string.toBytes) = encode
     let sameDecode: @TypeOf(std.string.fromBytes) = decode

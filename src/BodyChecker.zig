@@ -2673,7 +2673,7 @@ const Context = struct {
             .void => "void",
             .boolean => "bool",
             .rune => "rune",
-            .string => "string",
+            .string => "str",
             .integer => |integer| try std.fmt.allocPrint(a, "{s}{d}", .{ if (integer.signedness == .signed) "i" else "u", integer.bits }),
             .float => |bits| try std.fmt.allocPrint(a, "f{d}", .{bits}),
             .array => |element| try std.fmt.allocPrint(a, "[]{s}", .{try self.printedTypeName(element, remaining - 1)}),
@@ -5757,7 +5757,7 @@ fn testGlobalStorage(allocator: std.mem.Allocator) !void {
         \\let one:()->int=1
         \\let two:()->int=2
         \\let mut callback:()->int=one
-        \\let mut text:string="a"+"b"
+        \\let mut text:str="a"+"b"
         \\let main:()->int={
         \\let read=()->int{count+callback()+items[0]+record.n}
         \\count+=1
@@ -6447,14 +6447,14 @@ const flow_query_cases = [_]struct { expression: []const u8, terminal: bool, che
     .{ .expression = "@as(R,{return true}).value", .terminal = true },
     .{ .expression = "@as([]bool,{return true})[unknown]", .terminal = true },
     .{ .expression = "@as([]bool,[true])[{return true}]", .terminal = true },
-    .{ .expression = "@as(string,\"x\")[{return true}..unknown]", .terminal = true },
+    .{ .expression = "@as(str,\"x\")[{return true}..unknown]", .terminal = true },
     .{ .expression = "@as([]bool,[{return true},unknown])", .terminal = true },
     .{ .expression = "@as(S,S.[value={return true},other=unknown])", .terminal = true },
     .{ .expression = "@as(U,U.ok[{return true}])", .terminal = true },
     .{ .expression = "take({return true},unknown)", .terminal = true },
     .{ .expression = "@as((bool)->bool,{return true})(unknown)", .terminal = true },
     .{ .expression = "!stop()", .terminal = true },
-    .{ .expression = "@as(string,\"{stop()}\")", .terminal = true },
+    .{ .expression = "@as(str,\"{stop()}\")", .terminal = true },
     .{ .expression = "loop item in @as([]R,[]) {item.stop()} else{return true}", .terminal = true },
     .{ .expression = "loop{loop{break}\nbreak true}", .terminal = false },
     .{ .expression = "loop{loop false{}else{break true}}", .terminal = false },
@@ -7099,37 +7099,37 @@ test "ascription contextual bounds cover every integer width without conversions
 test "interpolation diagnoses names grammar types scopes and exact source bytes" {
     const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag, token: []const u8 };
     for ([_]Case{
-        .{ .source = "let f: (n: int) -> string = \"{missing}\"", .tag = .unknown_name, .token = "missing" },
-        .{ .source = "let f: () -> string = {let text = \"{text}\"\ntext}", .tag = .unknown_name, .token = "text" },
-        .{ .source = "let f: () -> string = {let text = \"{later}\"\nlet later = true\ntext}", .tag = .unknown_name, .token = "later" },
-        .{ .source = "let f: () -> string = {if true {let hidden = true\n}\n\"{hidden}\"}", .tag = .unknown_name, .token = "hidden" },
-        .{ .source = "let f: (n: int) -> string = \"{}\"", .tag = .invalid_interpolation, .token = "{}" },
-        .{ .source = "let f: (n: int) -> string = \"{n\"", .tag = .invalid_interpolation, .token = "{n" },
+        .{ .source = "let f: (n: int) -> str = \"{missing}\"", .tag = .unknown_name, .token = "missing" },
+        .{ .source = "let f: () -> str = {let text = \"{text}\"\ntext}", .tag = .unknown_name, .token = "text" },
+        .{ .source = "let f: () -> str = {let text = \"{later}\"\nlet later = true\ntext}", .tag = .unknown_name, .token = "later" },
+        .{ .source = "let f: () -> str = {if true {let hidden = true\n}\n\"{hidden}\"}", .tag = .unknown_name, .token = "hidden" },
+        .{ .source = "let f: (n: int) -> str = \"{}\"", .tag = .invalid_interpolation, .token = "{}" },
+        .{ .source = "let f: (n: int) -> str = \"{n\"", .tag = .invalid_interpolation, .token = "{n" },
 
-        .{ .source = "let f: (n: int) -> string = \"}\"", .tag = .invalid_interpolation, .token = "}" },
-        .{ .source = "let f: (n: int) -> string = \"{n:02}\"", .tag = .invalid_interpolation, .token = "{n:02}" },
-        .{ .source = "let f: (n: int) -> string = \"{n()}\"", .tag = .not_callable, .token = "(" },
-        .{ .source = "let f: (n: int) -> string = \"{{n}}\"", .tag = .invalid_interpolation, .token = "{{n}}" },
-        .{ .source = "let f: (n: int) -> string = \"{n + 1.5}\"", .tag = .literal_type_mismatch, .token = "1.5" },
-        .{ .source = "let f: (n: int) -> string = \"{if}\"", .tag = .invalid_interpolation, .token = "{if}" },
+        .{ .source = "let f: (n: int) -> str = \"}\"", .tag = .invalid_interpolation, .token = "}" },
+        .{ .source = "let f: (n: int) -> str = \"{n:02}\"", .tag = .invalid_interpolation, .token = "{n:02}" },
+        .{ .source = "let f: (n: int) -> str = \"{n()}\"", .tag = .not_callable, .token = "(" },
+        .{ .source = "let f: (n: int) -> str = \"{{n}}\"", .tag = .invalid_interpolation, .token = "{{n}}" },
+        .{ .source = "let f: (n: int) -> str = \"{n + 1.5}\"", .tag = .literal_type_mismatch, .token = "1.5" },
+        .{ .source = "let f: (n: int) -> str = \"{if}\"", .tag = .invalid_interpolation, .token = "{if}" },
 
-        .{ .source = "let f: (n: int) -> string = \"{f(n, n)}\"", .tag = .argument_count_mismatch, .token = "(" },
-        .{ .source = "let f: (n: int) -> string = \"é{n + missing}\"", .tag = .unknown_name, .token = "missing" },
-        .{ .source = "let f: (n: int) -> string = \"{f(true)}\"", .tag = .literal_type_mismatch, .token = "true" },
-        .{ .source = "let f: (n: int) -> string = \"{f(\"text\")}\"", .tag = .literal_type_mismatch, .token = "\"text\"" },
-        .{ .source = "let f: (n: int) -> string = \"{f(n); n}\"", .tag = .invalid_interpolation, .token = "{f(n); n}" },
-        .{ .source = "let f: (n: int) -> string = \"{n + (1}\"", .tag = .invalid_interpolation, .token = "{n + (1}" },
-        .{ .source = "let f: (n: int) -> string = \"{f(n) n}\"", .tag = .invalid_interpolation, .token = "{f(n) n}" },
-        .{ .source = "let f: (n: int) -> string = \"{return n}\"", .tag = .invalid_interpolation, .token = "{return n}" },
-        .{ .source = "let f: (n: int) -> string = \"{n}}\"", .tag = .invalid_interpolation, .token = "}" },
-        .{ .source = "let unit: () = {}\nlet f: () -> string = \"{unit()}\"", .tag = .unsupported_interpolation_type, .token = "unit()" },
-        .{ .source = "let f: () -> string = \"{f}\"", .tag = .unsupported_interpolation_type, .token = "f" },
-        .{ .source = "let f: (n: () -> int) -> string = \"{n}\"", .tag = .unsupported_interpolation_type, .token = "n" },
+        .{ .source = "let f: (n: int) -> str = \"{f(n, n)}\"", .tag = .argument_count_mismatch, .token = "(" },
+        .{ .source = "let f: (n: int) -> str = \"é{n + missing}\"", .tag = .unknown_name, .token = "missing" },
+        .{ .source = "let f: (n: int) -> str = \"{f(true)}\"", .tag = .literal_type_mismatch, .token = "true" },
+        .{ .source = "let f: (n: int) -> str = \"{f(\"text\")}\"", .tag = .literal_type_mismatch, .token = "\"text\"" },
+        .{ .source = "let f: (n: int) -> str = \"{f(n); n}\"", .tag = .invalid_interpolation, .token = "{f(n); n}" },
+        .{ .source = "let f: (n: int) -> str = \"{n + (1}\"", .tag = .invalid_interpolation, .token = "{n + (1}" },
+        .{ .source = "let f: (n: int) -> str = \"{f(n) n}\"", .tag = .invalid_interpolation, .token = "{f(n) n}" },
+        .{ .source = "let f: (n: int) -> str = \"{return n}\"", .tag = .invalid_interpolation, .token = "{return n}" },
+        .{ .source = "let f: (n: int) -> str = \"{n}}\"", .tag = .invalid_interpolation, .token = "}" },
+        .{ .source = "let unit: () = {}\nlet f: () -> str = \"{unit()}\"", .tag = .unsupported_interpolation_type, .token = "unit()" },
+        .{ .source = "let f: () -> str = \"{f}\"", .tag = .unsupported_interpolation_type, .token = "f" },
+        .{ .source = "let f: (n: () -> int) -> str = \"{n}\"", .tag = .unsupported_interpolation_type, .token = "n" },
         .{ .source = "let f: (n: int) -> int = \"{n}\"", .tag = .expression_type_mismatch, .token = "\"{n}\"" },
-        .{ .source = "let f: (n: int) -> string = \"{n}a\\xFF\"", .tag = .invalid_literal, .token = "\\" },
-        .{ .source = "let f: (n: int) -> string = \"a\\xFF{n}\"", .tag = .invalid_literal, .token = "\\" },
-        .{ .source = "let f: (n: int) -> string = \"{n}\xff\"", .tag = .invalid_literal, .token = "\xff" },
-        .{ .source = "let f: (n: int) -> string = {let n = true\n\"{n}\"}", .tag = .unsupported_shadowing, .token = "n" },
+        .{ .source = "let f: (n: int) -> str = \"{n}a\\xFF\"", .tag = .invalid_literal, .token = "\\" },
+        .{ .source = "let f: (n: int) -> str = \"a\\xFF{n}\"", .tag = .invalid_literal, .token = "\\" },
+        .{ .source = "let f: (n: int) -> str = \"{n}\xff\"", .tag = .invalid_literal, .token = "\xff" },
+        .{ .source = "let f: (n: int) -> str = {let n = true\n\"{n}\"}", .tag = .unsupported_shadowing, .token = "n" },
     }) |case| {
         var module = try Module.init(std.testing.allocator, "interpolation-error.nov", case.source);
         defer module.deinit();
@@ -7146,7 +7146,7 @@ test "interpolation diagnoses names grammar types scopes and exact source bytes"
 test "printing ignores unannotated toString but ordinary calls still work" {
     const source =
         \\let R=struct{value:int,
-        \\let toString:(r:R)->string="ordinary"
+        \\let toString:(r:R)->str="ordinary"
         \\}
         \\let E=enum{one,
         \\let toString:()->bool=true
@@ -7181,7 +7181,7 @@ test "printing ignores unannotated toString but ordinary calls still work" {
 
 test "printing does not use unannotated toString to hide unprintable fields" {
     for ([_][]const u8{ "@println(r)", "@println([r])", "@println(\"{r}\")" }) |expression| {
-        const source = try std.mem.concat(std.testing.allocator, u8, &.{ "let R=struct{callback:()->int,\nlet toString:(r:R)->string=\"ordinary\"\n}\nlet f:(r:R)=", expression });
+        const source = try std.mem.concat(std.testing.allocator, u8, &.{ "let R=struct{callback:()->int,\nlet toString:(r:R)->str=\"ordinary\"\n}\nlet f:(r:R)=", expression });
         defer std.testing.allocator.free(source);
         var module = try Module.init(std.testing.allocator, "no-hidden-hook.nov", source);
         defer module.deinit();
@@ -7194,9 +7194,9 @@ test "printing does not use unannotated toString to hide unprintable fields" {
 
 test "stringify rejects local and field annotations" {
     for ([_][]const u8{
-        "let f:()={@[stringify]\nlet format:(x:int)->string=\"bad\"\n}",
+        "let f:()={@[stringify]\nlet format:(x:int)->str=\"bad\"\n}",
         "let S=struct{@[stringify]\nx:int,}",
-        "@[stringify()]\nlet f:()->string=\"bad\"",
+        "@[stringify()]\nlet f:()->str=\"bad\"",
     }) |source| {
         var module = try Module.init(std.testing.allocator, "misplaced-stringify.nov", source);
         defer module.deinit();
@@ -7215,11 +7215,11 @@ test "printing structural aggregates and explicit hooks lower" {
         \\let U=union{none,some:R,}
         \\let Hook=struct{value:int,
         \\@[stringify]
-        \\let format:(h:Hook)->string="custom"
+        \\let format:(h:Hook)->str="custom"
         \\}
         \\let HookEnum=enum{one,
         \\@[stringify]
-        \\let toString:(e:HookEnum)->string="enum hook"
+        \\let toString:(e:HookEnum)->str="enum hook"
         \\}
         \\let f:(r:R,u:U,h:Hook,a:[]Hook,e:HookEnum)={
         \\@println(r,u,h,a,e)
@@ -7254,10 +7254,10 @@ fn testNestedFormatting(allocator: std.mem.Allocator) !void {
         \\let Skip=struct{callbacks:[]()->int,}
         \\let Box:(T:type)->type=struct{value:T,skip:Skip,
         \\@[stringify]
-        \\let format:(b:@This())->string="box:{b.value}"
+        \\let format:(b:@This())->str="box:{b.value}"
         \\}
         \\let Alias=Box(bool)
-        \\let Entry=struct{name:string,boxes:[][]Alias,color:Color,}
+        \\let Entry=struct{name:str,boxes:[][]Alias,color:Color,}
         \\let Message=union{entry:Entry,boxed:Alias,none,}
         \\let show:(message:Message)={@println(message)
         \\@println("{message}")}
@@ -7303,9 +7303,9 @@ test "printing nested generic hooks owns metadata and lowers bodies under every 
 
 test "printing nested malformed hooks and backend only hook bodies diagnose" {
     for ([_]struct { hook: []const u8, tag: Module.Diagnostic.Tag }{
-        .{ .hook = "@[stringify]\nlet toString:()->string=\"bad\"", .tag = .invalid_to_string },
+        .{ .hook = "@[stringify]\nlet toString:()->str=\"bad\"", .tag = .invalid_to_string },
         .{ .hook = "@[stringify]\nlet toString:(r:R)->bool=true", .tag = .invalid_to_string },
-        .{ .hook = "@[stringify]\nlet toString:(r:R)->string=missing", .tag = .unknown_name },
+        .{ .hook = "@[stringify]\nlet toString:(r:R)->str=missing", .tag = .unknown_name },
     }) |case| {
         for ([_][]const u8{ "@println(value)", "@println(\"{value}\")" }) |expression| {
             const source = try std.mem.concat(std.testing.allocator, u8, &.{ "let R=struct{\n", case.hook, "\n}\nlet Outer=struct{items:[][]R,}\nlet f:(value:Outer)=", expression });
@@ -7637,16 +7637,16 @@ test "printing imported private hooks never falls back to structural fields" {
         for ([_]Hook{
             .{ .declaration = "", .printable = true },
             .{ .declaration = "let toString:()->bool=true\n", .printable = true },
-            .{ .declaration = "@[stringify]\nlet format:(r:@This())->string=\"redacted\"\n", .printable = false },
-            .{ .declaration = "@[stringify]\nlet toString:()->string=\"malformed\"\n", .printable = false },
-            .{ .declaration = "@[public]\n@[stringify]\nlet format:(r:@This())->string=\"redacted\"\n", .printable = true },
-            .{ .declaration = "@[public]\n@[stringify]\nlet toString:()->string=\"malformed\"\n", .printable = false },
+            .{ .declaration = "@[stringify]\nlet format:(r:@This())->str=\"redacted\"\n", .printable = false },
+            .{ .declaration = "@[stringify]\nlet toString:()->str=\"malformed\"\n", .printable = false },
+            .{ .declaration = "@[public]\n@[stringify]\nlet format:(r:@This())->str=\"redacted\"\n", .printable = true },
+            .{ .declaration = "@[public]\n@[stringify]\nlet toString:()->str=\"malformed\"\n", .printable = false },
         }) |hook| {
             const library_source = try std.mem.concat(std.testing.allocator, u8, &.{
-                "@[public]\n",                     if (generic) "let R:(T:type)->type=struct{secret:T,\n" else "let R=struct{secret:string,\n",
-                hook.declaration,                  "}\n@[public]\nlet make:()->",
-                if (generic) "R(string)" else "R", "=",
-                if (generic) "R(string)" else "R", ".[secret=\"secret\"]\n",
+                "@[public]\n",                  if (generic) "let R:(T:type)->type=struct{secret:T,\n" else "let R=struct{secret:str,\n",
+                hook.declaration,               "}\n@[public]\nlet make:()->",
+                if (generic) "R(str)" else "R", "=",
+                if (generic) "R(str)" else "R", ".[secret=\"secret\"]\n",
             });
             defer std.testing.allocator.free(library_source);
             for ([_][]const u8{
@@ -7658,7 +7658,7 @@ test "printing imported private hooks never falls back to structural fields" {
                 "@println(@as(Message,.item[lib.make()]))",
             }) |expression| {
                 const root_source = try std.mem.concat(std.testing.allocator, u8, &.{
-                    "let lib=@import(\"lib.nov\")\nlet Alias=",                                                if (generic) "lib.R(string)" else "lib.R",
+                    "let lib=@import(\"lib.nov\")\nlet Alias=",                                                if (generic) "lib.R(str)" else "lib.R",
                     "\nlet Outer=struct{items:[][]Alias,}\nlet Message=union{item:Alias,none,}\nlet main:()=", expression,
                 });
                 defer std.testing.allocator.free(root_source);
@@ -7678,7 +7678,7 @@ test "printing imported private hooks never falls back to structural fields" {
                     try sema.ir.verify();
                     var found = false;
                     for (sema.ir.formatting.items) |entry| {
-                        if (!std.mem.eql(u8, entry.display_name, if (generic) "R(string)" else "R")) continue;
+                        if (!std.mem.eql(u8, entry.display_name, if (generic) "R(str)" else "R")) continue;
                         found = true;
                         try std.testing.expectEqual(library, sema.ir.getType(entry.ty).?.record.source);
                         if (std.mem.indexOf(u8, hook.declaration, "@[stringify]") != null) {
@@ -7714,9 +7714,9 @@ test "printing types respects imported namespace visibility" {
 
 test "printing malformed explicit hooks never falls back" {
     for ([_][]const u8{
-        "@[stringify]\nlet toString:()->string=\"bad\"",
+        "@[stringify]\nlet toString:()->str=\"bad\"",
         "@[stringify]\nlet toString:(r:R)->bool=true",
-        "@[stringify]\nlet toString:(r:R,extra:string)->string=extra",
+        "@[stringify]\nlet toString:(r:R,extra:str)->str=extra",
     }) |hook| {
         const source = try std.mem.concat(std.testing.allocator, u8, &.{ "let R=struct{\n", hook, "\n}\nlet main:()=@println(R.[])" });
         defer std.testing.allocator.free(source);
@@ -7747,7 +7747,7 @@ test "printing ordinary values is not speculative type resolution" {
         "let main:()=@println(missing)",
         "let main:()={let x=int\n@println(x)}",
         "let f:(a:[]()->int)=@println(a)",
-        "let f:(a:[]()->int)->string=\"{a}\"",
+        "let f:(a:[]()->int)->str=\"{a}\"",
         "let main:()=@println(@as(int,1)..@as(int,2))",
         "let main:()=@println(@print())",
     }) |source| {
@@ -7762,12 +7762,12 @@ test "printing ordinary values is not speculative type resolution" {
 
 test "record interpolation uses print signature diagnostics at the placeholder source" {
     for ([_]struct { declaration: []const u8, related: bool = false }{
-        .{ .declaration = "let R=struct{s:string,\n@[stringify]\nlet toString:()->string=\"wrong\"\n}", .related = true },
-        .{ .declaration = "let R=struct{s:string,\n@[stringify]\nlet toString:(r:R,extra:string)->string=r.s+extra\n}", .related = true },
-        .{ .declaration = "let R=struct{s:string,\n@[stringify]\nlet toString:(r:R)->bool=true\n}", .related = true },
-        .{ .declaration = "let Other=struct{s:string,}\nlet R=struct{s:string,\n@[stringify]\nlet toString:(r:Other)->string=r.s\n}", .related = true },
+        .{ .declaration = "let R=struct{s:str,\n@[stringify]\nlet toString:()->str=\"wrong\"\n}", .related = true },
+        .{ .declaration = "let R=struct{s:str,\n@[stringify]\nlet toString:(r:R,extra:str)->str=r.s+extra\n}", .related = true },
+        .{ .declaration = "let R=struct{s:str,\n@[stringify]\nlet toString:(r:R)->bool=true\n}", .related = true },
+        .{ .declaration = "let Other=struct{s:str,}\nlet R=struct{s:str,\n@[stringify]\nlet toString:(r:Other)->str=r.s\n}", .related = true },
     }) |case| {
-        const source = try std.mem.concat(std.testing.allocator, u8, &.{ case.declaration, "\nlet Alias=R\nlet f:(r:Alias)->string=\"prefix:{r}\"" });
+        const source = try std.mem.concat(std.testing.allocator, u8, &.{ case.declaration, "\nlet Alias=R\nlet f:(r:Alias)->str=\"prefix:{r}\"" });
         defer std.testing.allocator.free(source);
         var module = try Module.init(std.testing.allocator, "record-interpolation-error.nov", source);
         defer module.deinit();
@@ -7785,7 +7785,7 @@ test "record interpolation uses print signature diagnostics at the placeholder s
 }
 
 test "union constructors captures and coverage diagnose exact scalar boundaries" {
-    const prefix = "let U=union{ok:int,err:string,none,flag:bool,}\n";
+    const prefix = "let U=union{ok:int,err:str,none,flag:bool,}\n";
     const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag };
     for ([_]Case{
         .{ .source = "let f:()->U=.ok[true]", .tag = .literal_type_mismatch },
@@ -7834,7 +7834,7 @@ test "union captures infer branch types without leaking and preserve contextual 
         "let f:(u:U)->int=match u{.ok=>|n|match u{.ok=>|m|n+m\n_=>n}\n_=>0}",
         "let f:(u:U)={let n=match u{.ok=>0\n.err=>0\n.none=>|v|{let unit:void=v\n@as(int,1)}}\n@println(n)}",
     }) |body| {
-        const source = try std.mem.concat(std.testing.allocator, u8, &.{ "let U=union{ok:int,err:string,none,}\n", body });
+        const source = try std.mem.concat(std.testing.allocator, u8, &.{ "let U=union{ok:int,err:str,none,}\n", body });
         defer std.testing.allocator.free(source);
         var module = try Module.init(std.testing.allocator, "union.nov", source);
         defer module.deinit();
@@ -7909,7 +7909,7 @@ test "boolean match coverage retains exact bidirectional types scopes and nonboo
         .{ .source = "let f: (b: bool) -> int = match b {true => {let private: int = 1\nprivate}\nfalse => private}", .tag = .unknown_name },
         .{ .source = "let f: (b: bool) -> int = match b, b {true, true => 1\ntrue, false => 2\nfalse, true => 3\nfalse, false => 4}", .tag = .match_missing_catchall },
         .{ .source = "let f: (n: u8) -> int = match n {0 | 255 => 1}", .tag = .match_missing_catchall },
-        .{ .source = "let f: (s: string) -> int = match s {\"\" => 1}", .tag = .match_missing_catchall },
+        .{ .source = "let f: (s: str) -> int = match s {\"\" => 1}", .tag = .match_missing_catchall },
     }) |case| {
         var module = try Module.init(std.testing.allocator, "bool-match-error.nov", case.source);
         defer module.deinit();
@@ -8015,7 +8015,7 @@ test "bitwise binaries reject floats nonintegers mismatches and literal bounds" 
             .{ .source = "let f: (a: u8, b: i8) -> u8 = a {s} b", .tag = .expression_type_mismatch },
             .{ .source = "let f: (a: i8) -> i16 = a {s} 1", .tag = .expression_type_mismatch },
             .{ .source = "let f: () -> bool = true {s} false", .tag = .operator_not_supported },
-            .{ .source = "let f: () -> string = \"a\" {s} \"b\"", .tag = .operator_not_supported },
+            .{ .source = "let f: () -> str = \"a\" {s} \"b\"", .tag = .operator_not_supported },
             .{ .source = "let f: (a: []int) -> []int = a {s} a", .tag = .operator_not_supported },
             .{ .source = "let f: (a: () -> int) -> int = a {s} a", .tag = .operator_not_supported },
             .{ .source = "let f: (a: int) -> int = match a {{{{0 {s} 1}} => 2\n_ => 3}}", .tag = .unsupported_match_pattern },
@@ -8073,7 +8073,7 @@ test "membership rejects inexact types widening nonscalar elements and nonboolea
         .{ .source = "let f: (a: []int) -> int = 1 in a", .tag = .expression_type_mismatch },
         .{ .source = "let f: () -> bool = true in false", .tag = .operator_not_supported },
         .{ .source = "let f: () -> bool = \"a\" in \"abc\"", .tag = .operator_not_supported },
-        .{ .source = "let A=struct{s:string,}\nlet f: (a: A) -> bool = a in []", .tag = .operator_not_supported },
+        .{ .source = "let A=struct{s:str,}\nlet f: (a: A) -> bool = a in []", .tag = .operator_not_supported },
         .{ .source = "let f: (a: []int) -> bool = a in []", .tag = .operator_not_supported },
         .{ .source = "let f: () -> bool = {} in []", .tag = .operator_not_supported },
         .{ .source = "let f: (a: []int) -> bool = missing in a", .tag = .unknown_name },
@@ -8095,8 +8095,8 @@ test "membership rejects inexact types widening nonscalar elements and nonboolea
 
 test "string inference accepts late literals calls lengths and branch context" {
     var module = try Module.init(std.testing.allocator, "strings.nov",
-        \\let id: (s: string) -> string = s
-        \\let f: (s: string, b: bool) -> string = {
+        \\let id: (s: str) -> str = s
+        \\let f: (s: str, b: bool) -> str = {
         \\    let mut x = {let y = "a"
         \\        y + s}
         \\    x = if b {id(x)} else {"b"}
@@ -8114,9 +8114,9 @@ test "string inference accepts late literals calls lengths and branch context" {
 
 test "string equality infers exact operands and a boolean result" {
     var module = try Module.init(std.testing.allocator, "equality.nov",
-        \\let constant: string = "a"
-        \\let id: (s: string) -> string = s
-        \\let f: (s: string, b: bool) -> bool = {
+        \\let constant: str = "a"
+        \\let id: (s: str) -> str = s
+        \\let f: (s: str, b: bool) -> bool = {
         \\    let same = "a" == "a"
         \\    let different = constant != id(s)
         \\    let branch = if b {s} else {"b"} == "a"
@@ -8138,9 +8138,9 @@ test "string comparisons reject ordered mixed and nonboolean result types" {
         .{ .source = "let f: () -> bool = true != \"a\"", .tag = .literal_type_mismatch },
         .{ .source = "let f: () -> bool = \"a\" == 1", .tag = .literal_type_mismatch },
         .{ .source = "let f: () -> bool = 1 != \"a\"", .tag = .literal_type_mismatch },
-        .{ .source = "let f: (s: string, n: int) -> bool = s == n", .tag = .expression_type_mismatch },
-        .{ .source = "let f: (s: string, n: int) -> bool = n != s", .tag = .expression_type_mismatch },
-        .{ .source = "let f: () -> string = \"a\" == \"b\"", .tag = .expression_type_mismatch },
+        .{ .source = "let f: (s: str, n: int) -> bool = s == n", .tag = .expression_type_mismatch },
+        .{ .source = "let f: (s: str, n: int) -> bool = n != s", .tag = .expression_type_mismatch },
+        .{ .source = "let f: () -> str = \"a\" == \"b\"", .tag = .expression_type_mismatch },
         .{ .source = "let f: () -> bool = \"a\" < \"b\"", .tag = .operator_not_supported },
         .{ .source = "let f: () -> bool = \"a\" <= \"b\"", .tag = .operator_not_supported },
         .{ .source = "let f: () -> bool = \"a\" > \"b\"", .tag = .operator_not_supported },
@@ -8160,8 +8160,8 @@ test "string compounds retain mutability operator and operand diagnostics" {
     const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag };
     for ([_]Case{
         .{ .source = "let f: () -> void = {let s = \"a\"\ns += \"b\"}", .tag = .immutable_assignment },
-        .{ .source = "let f: (s: string) -> void = {s += \"b\"}", .tag = .immutable_assignment },
-        .{ .source = "let s: string = \"a\"\nlet f: () -> void = {s += \"b\"}", .tag = .immutable_assignment },
+        .{ .source = "let f: (s: str) -> void = {s += \"b\"}", .tag = .immutable_assignment },
+        .{ .source = "let s: str = \"a\"\nlet f: () -> void = {s += \"b\"}", .tag = .immutable_assignment },
         .{ .source = "let f: () -> void = {let mut s = \"a\"\ns += true}", .tag = .literal_type_mismatch },
         .{ .source = "let f: (n: int) -> void = {let mut s = \"a\"\ns += n}", .tag = .expression_type_mismatch },
         .{ .source = "let f: () -> void = {let mut s = true\ns += \"a\"}", .tag = .operator_not_supported },
@@ -8177,7 +8177,7 @@ test "string compounds retain mutability operator and operand diagnostics" {
         try std.testing.expect(!sema.lowering_complete);
     }
     for ([_][]const u8{ "-=", "*=", "/=", "%=" }) |op| {
-        const source = try std.fmt.allocPrint(std.testing.allocator, "let f: () -> void = {{let mut s: string = \"a\"\ns {s} \"b\"}}", .{op});
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let f: () -> void = {{let mut s: str = \"a\"\ns {s} \"b\"}}", .{op});
         defer std.testing.allocator.free(source);
         var module = try Module.init(std.testing.allocator, "compound.nov", source);
         defer module.deinit();
@@ -8194,10 +8194,10 @@ test "string scalar indexing has exact rune inference through contexts construct
         \\let G:(T:type)->type=struct{value:T,
         \\    let byte:(self:@This(),i:int)->rune=self.value[i]
         \\}
-        \\let U=union{text:string,}
-        \\let text:()->string="é\0z"
+        \\let U=union{text:str,}
+        \\let text:()->str="é\0z"
         \\let take:(b:rune)->rune=b
-        \\let f:(s:string,a:[]string,i:int,b:bool)->bool={
+        \\let f:(s:str,a:[]str,i:int,b:bool)->bool={
         \\    let inferred=s[i]
         \\    let sum=s[0]
         \\    let bytes=['\0',s[-1],'ÿ']
@@ -8214,7 +8214,7 @@ test "string scalar indexing has exact rune inference through contexts construct
         \\    @println(sum,bytes[0],branch,matched,looped,a[0][1],@len(s))
         \\    let wrapped:U=U.text[s]
         \\    @println(match wrapped {.text=>|v|v[0]})
-        \\    take(inferred)==G(string).[value=s].byte(i)
+        \\    take(inferred)==G(str).[value=s].byte(i)
         \\}
     ;
     var module = try Module.init(std.testing.allocator, "string-byte.nov", source);
@@ -8295,17 +8295,17 @@ test "inline range payloads evaluate bounds once in order before construction un
 
 test "string slicing semantic types inference and rejection" {
     for ([_]struct { source: []const u8, tag: Module.Diagnostic.Tag }{
-        .{ .source = "let f:(s:string,n:uint)->string=s[..=n]", .tag = .expression_type_mismatch },
-        .{ .source = "let f:(s:string)->string=s[true..=]", .tag = .literal_type_mismatch },
-        .{ .source = "let f:(s:[]u8)->string=s[..]", .tag = .string_slice_requires_string },
-        .{ .source = "let f:(s:rune)->string=s[..]", .tag = .string_slice_requires_string },
-        .{ .source = "let f:(s:string,n:uint)->string=s[n..]", .tag = .expression_type_mismatch },
-        .{ .source = "let f:(s:string,n:u8)->string=s[..n]", .tag = .expression_type_mismatch },
-        .{ .source = "let f:(s:string,n:i8)->string=s[n..]", .tag = .expression_type_mismatch },
-        .{ .source = "let f:(s:string)->string=s[..true]", .tag = .literal_type_mismatch },
-        .{ .source = "let f:(s:string)->string=s['a'..]", .tag = .literal_type_mismatch },
-        .{ .source = "let f:(s:string)->rune=s[..]", .tag = .expression_type_mismatch },
-        .{ .source = "let f:(s:string)->[]u8=s[..]", .tag = .expression_type_mismatch },
+        .{ .source = "let f:(s:str,n:uint)->str=s[..=n]", .tag = .expression_type_mismatch },
+        .{ .source = "let f:(s:str)->str=s[true..=]", .tag = .literal_type_mismatch },
+        .{ .source = "let f:(s:[]u8)->str=s[..]", .tag = .string_slice_requires_string },
+        .{ .source = "let f:(s:rune)->str=s[..]", .tag = .string_slice_requires_string },
+        .{ .source = "let f:(s:str,n:uint)->str=s[n..]", .tag = .expression_type_mismatch },
+        .{ .source = "let f:(s:str,n:u8)->str=s[..n]", .tag = .expression_type_mismatch },
+        .{ .source = "let f:(s:str,n:i8)->str=s[n..]", .tag = .expression_type_mismatch },
+        .{ .source = "let f:(s:str)->str=s[..true]", .tag = .literal_type_mismatch },
+        .{ .source = "let f:(s:str)->str=s['a'..]", .tag = .literal_type_mismatch },
+        .{ .source = "let f:(s:str)->rune=s[..]", .tag = .expression_type_mismatch },
+        .{ .source = "let f:(s:str)->[]u8=s[..]", .tag = .expression_type_mismatch },
     }) |case| {
         var module = try Module.init(std.testing.allocator, "slice-error.nov", case.source);
         defer module.deinit();
@@ -8317,10 +8317,10 @@ test "string slicing semantic types inference and rejection" {
     }
     var module = try Module.init(std.testing.allocator, "slice-types.nov",
         \\let G:(T:type)->type=struct{value:T,
-        \\    let cut:(s:G(T))->string=s.value[..]
+        \\    let cut:(s:G(T))->str=s.value[..]
         \\}
-        \\let U=union{text:string,}
-        \\let f:(s:string,b:bool)->string={let alias=&s
+        \\let U=union{text:str,}
+        \\let f:(s:str,b:bool)->str={let alias=&s
         \\    let view=alias.*[..=-1]
         \\    let a=[view,s[1..]]
         \\    let u:U=.text[s[..1]]
@@ -8329,7 +8329,7 @@ test "string slicing semantic types inference and rejection" {
         \\        false=>view}
         \\    let looped=loop {break s[..]}
         \\    @println(a[0],chosen,matched,looped,match u {.text=>|v|v[..]})
-        \\    G(string).[value=s].cut()}
+        \\    G(str).[value=s].cut()}
     );
     defer module.deinit();
     errdefer std.debug.print("slice parse: {any}\n", .{module.source.ast.errors});
@@ -8359,13 +8359,13 @@ test "string slicing semantic types inference and rejection" {
 
 test "string slicing terminal operands skip later bounds and slice IR" {
     for ([_][]const u8{
-        "let f:()->string=@panic(\"stop\")[missing..=missing]",
-        "let f:()->string=\"a\"[{return \"done\"}..=missing]",
-        "let f:()->string=@panic(\"stop\")[missing..missing]",
-        "let f:()->string=\"a\"[{return \"done\"}..missing]",
+        "let f:()->str=@panic(\"stop\")[missing..=missing]",
+        "let f:()->str=\"a\"[{return \"done\"}..=missing]",
+        "let f:()->str=@panic(\"stop\")[missing..missing]",
+        "let f:()->str=\"a\"[{return \"done\"}..missing]",
         "let f:()->bool=\"a\"[0..@panic(\"stop\")]",
-        "let f:()->string=loop {\"a\"[..{break \"done\"}]}",
-        "let f:()->string=loop {\"a\"[{continue}..missing]}",
+        "let f:()->str=loop {\"a\"[..{break \"done\"}]}",
+        "let f:()->str=loop {\"a\"[{continue}..missing]}",
     }) |source| {
         var module = try Module.init(std.testing.allocator, "slice-terminal.nov", source);
         defer module.deinit();
@@ -8382,17 +8382,17 @@ test "string slicing terminal operands skip later bounds and slice IR" {
 test "string scalar indexing rejects nonnative indices and nonrune result contexts" {
     const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag };
     for ([_]Case{
-        .{ .source = "let f:(s:string,i:uint)->rune=s[i]", .tag = .expression_type_mismatch },
-        .{ .source = "let f:(s:string,i:u8)->rune=s[i]", .tag = .expression_type_mismatch },
-        .{ .source = "let f:(s:string,i:i8)->rune=s[i]", .tag = .expression_type_mismatch },
-        .{ .source = "let f:(s:string)->rune=s[true]", .tag = .literal_type_mismatch },
-        .{ .source = "let f:(s:string)->rune=s[\"0\"]", .tag = .literal_type_mismatch },
-        .{ .source = "let f:(s:string)->int=s[0]", .tag = .expression_type_mismatch },
-        .{ .source = "let f:(s:string)->i8=s[0]", .tag = .expression_type_mismatch },
-        .{ .source = "let f:(s:string)->uint=s[0]", .tag = .expression_type_mismatch },
-        .{ .source = "let f:(s:string)->string=s[0]", .tag = .expression_type_mismatch },
-        .{ .source = "let f:(s:string)->bool=s[0]", .tag = .expression_type_mismatch },
-        .{ .source = "let f:(s:string)->u8=s[0]", .tag = .expression_type_mismatch },
+        .{ .source = "let f:(s:str,i:uint)->rune=s[i]", .tag = .expression_type_mismatch },
+        .{ .source = "let f:(s:str,i:u8)->rune=s[i]", .tag = .expression_type_mismatch },
+        .{ .source = "let f:(s:str,i:i8)->rune=s[i]", .tag = .expression_type_mismatch },
+        .{ .source = "let f:(s:str)->rune=s[true]", .tag = .literal_type_mismatch },
+        .{ .source = "let f:(s:str)->rune=s[\"0\"]", .tag = .literal_type_mismatch },
+        .{ .source = "let f:(s:str)->int=s[0]", .tag = .expression_type_mismatch },
+        .{ .source = "let f:(s:str)->i8=s[0]", .tag = .expression_type_mismatch },
+        .{ .source = "let f:(s:str)->uint=s[0]", .tag = .expression_type_mismatch },
+        .{ .source = "let f:(s:str)->str=s[0]", .tag = .expression_type_mismatch },
+        .{ .source = "let f:(s:str)->bool=s[0]", .tag = .expression_type_mismatch },
+        .{ .source = "let f:(s:str)->u8=s[0]", .tag = .expression_type_mismatch },
     }) |case| {
         var module = try Module.init(std.testing.allocator, "string-byte-error.nov", case.source);
         defer module.deinit();
@@ -8406,7 +8406,7 @@ test "string scalar indexing rejects nonnative indices and nonrune result contex
 
 test "string scalar indexing preserves once only left to right evaluation and pre index snapshots" {
     var module = try Module.init(std.testing.allocator, "string-byte-effects.nov",
-        \\let base:()->string={@print("B")
+        \\let base:()->str={@print("B")
         \\    "old"}
         \\let index:()->int={@print("I")
         \\    return -1}
@@ -8460,7 +8460,7 @@ test "string scalar indexing preserves once only left to right evaluation and pr
 test "string scalar indexing terminal base and index operands skip unreachable operations" {
     for ([_][]const u8{
         "let f:()->rune=@panic(\"stop\")[missing]",
-        "let f:()->string=\"a\"[{return \"done\"}]",
+        "let f:()->str=\"a\"[{return \"done\"}]",
         "let f:()->bool=\"a\"[@panic(\"stop\")]",
         "let f:()->rune=loop {\"a\"[{break 'a'}]}",
         "let f:()->rune=loop {\"a\"[{continue}]}",
@@ -8482,8 +8482,8 @@ test "string scalar indexing terminal base and index operands skip unreachable o
 
 fn testStringByteConversions(allocator: std.mem.Allocator) !void {
     var module = try Module.init(allocator, "string-byte-conversions.nov",
-        \\let encode:(s:string)->[]u8=@stringToBytes(s)
-        \\let decode:(b:[]u8)->string=@stringFromBytes(b)
+        \\let encode:(s:str)->[]u8=@stringToBytes(s)
+        \\let decode:(b:[]u8)->str=@stringFromBytes(b)
         \\let main:()={let bytes=@stringToBytes("hé\0")
         \\let text=@stringFromBytes(bytes)
         \\let empty=@stringFromBytes([])
@@ -8534,8 +8534,8 @@ test "len builtin validates exact operands and removes only synthetic fields" {
         }
     }
     for ([_][]const u8{
-        "let f:(a:[]int)->uint=a.len",       "let f:(s:string)->uint=s.len",
-        "let f:(a:[]int)->@TypeOf(a.len)=0", "let f:(s:string)->@TypeOf(s.len)=0",
+        "let f:(a:[]int)->uint=a.len",       "let f:(s:str)->uint=s.len",
+        "let f:(a:[]int)->@TypeOf(a.len)=0", "let f:(s:str)->@TypeOf(s.len)=0",
     }) |source| {
         var module = try Module.init(std.testing.allocator, "removed-len.nov", source);
         defer module.deinit();
@@ -8569,7 +8569,7 @@ test "string byte conversion builtins reject arity and inexact operands includin
 
 test "string byte conversion TypeOf validates without conversions calls captures or loans" {
     var module = try Module.init(std.testing.allocator, "string-byte-typeof.nov",
-        \\let effect:()->string="effect"
+        \\let effect:()->str="effect"
         \\let main:()={let mut text="a"
         \\let mut bytes:[]u8=[255]
         \\let inspect=(){let a:@TypeOf(@stringToBytes(text))=[]
@@ -8608,7 +8608,7 @@ test "string byte conversion builtins remain forbidden in global initializers" {
         "let bytes=@stringToBytes(\"a\")",
         "let text=@stringFromBytes([97])",
         "let mut bytes:[]u8=@stringToBytes(\"a\")",
-        "let mut text:string=@stringFromBytes([97])",
+        "let mut text:str=@stringFromBytes([97])",
     }) |source| {
         var module = try Module.init(std.testing.allocator, "global-string-byte-conversion.nov", source);
         defer module.deinit();
@@ -8626,7 +8626,7 @@ test "string byte conversion terminal operands emit no conversion" {
     for ([_][]const u8{
         "let f:()->bool=@stringToBytes(@panic(\"stop\"))",
         "let f:()->bool=@stringFromBytes(@panic(\"stop\"))",
-        "let f:()->string=@stringFromBytes({return \"done\"})",
+        "let f:()->str=@stringFromBytes({return \"done\"})",
         "let f:()->[]u8=@stringToBytes({return []})",
     }) |source| {
         var module = try Module.init(std.testing.allocator, "terminal-string-byte-conversion.nov", source);
@@ -8644,7 +8644,7 @@ test "string byte conversion terminal operands emit no conversion" {
 
 fn testStringByteAllocationFailures(allocator: std.mem.Allocator) !void {
     var module = try Module.init(allocator, "string-byte-oom.nov",
-        \\let f:(s:string,a:[]string)->rune={let alias=&s
+        \\let f:(s:str,a:[]str)->rune={let alias=&s
         \\    let values=['\0',alias.*[-1],a[0][1]]
         \\    values[0]}
     );
@@ -8698,9 +8698,9 @@ test "strings reject byte mutation ordering and inexact operands" {
         "let f: () -> void = {let mut x = \"a\"\nx.len = 1}",
         "let f: () -> void = {let mut x = \"a\"\nx -= \"b\"}",
         "let f: () -> bool = \"a\" < \"b\"",
-        "let f: () -> string = \"a\" - \"b\"",
-        "let f: () -> string = 1 + \"b\"",
-        "let f: () -> string = \"a\" + 1",
+        "let f: () -> str = \"a\" - \"b\"",
+        "let f: () -> str = 1 + \"b\"",
+        "let f: () -> str = \"a\" + 1",
     }) |source| {
         var module = try Module.init(std.testing.allocator, "unsupported-string.nov", source);
         defer module.deinit();
@@ -8820,15 +8820,15 @@ test "array concatenation rejects unresolved inexact and unsupported operands" {
 
 test "managed arrays reject unsupported payloads nominal mismatches and record membership" {
     for ([_][]const u8{
-        "let A=struct{s:string,}\nlet B=struct{s:string,}\nlet f:(a:A,b:B)={let x=[a,b]\n}",
-        "let A=struct{s:string,}\nlet f:(a:A)->bool=a in [a]",
-        "let A=struct{s:string,}\nlet f:(a:A)->bool=a in []",
-        "let A=struct{s:string,}\nlet f:(a:A)={let mut x=[a]\nx[0]+=a}",
-        "let A=struct{s:string,}\nlet f:(a:A)={let mut x=[a]\nx[0].s=\"bad\"}",
-        "let A=struct{s:string,}\nlet f:(a:A)={let x:[]A=[]\nlet y:[]string=x\n}",
-        "let U=union{s:string,none,}\nlet f:(a:U)->bool=a in [a]",
-        "let f:(a:()->string)->bool=a in [a]",
-        "let f:(a:[]string)->bool=a in [a]",
+        "let A=struct{s:str,}\nlet B=struct{s:str,}\nlet f:(a:A,b:B)={let x=[a,b]\n}",
+        "let A=struct{s:str,}\nlet f:(a:A)->bool=a in [a]",
+        "let A=struct{s:str,}\nlet f:(a:A)->bool=a in []",
+        "let A=struct{s:str,}\nlet f:(a:A)={let mut x=[a]\nx[0]+=a}",
+        "let A=struct{s:str,}\nlet f:(a:A)={let mut x=[a]\nx[0].s=\"bad\"}",
+        "let A=struct{s:str,}\nlet f:(a:A)={let x:[]A=[]\nlet y:[]str=x\n}",
+        "let U=union{s:str,none,}\nlet f:(a:U)->bool=a in [a]",
+        "let f:(a:()->str)->bool=a in [a]",
+        "let f:(a:[]str)->bool=a in [a]",
         "let f:(a:()->int)->bool=a==a",
         "let U=union{none,}\nlet f:(a:U)->bool=a==a",
         "let f:(a:[][]int)={let mut b=a\nb[0][0]=1}",
@@ -8839,9 +8839,9 @@ test "managed arrays reject unsupported payloads nominal mismatches and record m
         "let f:(n:int)->bool={let a=n..n\na in [a]}",
         "let E=enum{a,b,}\nlet F=enum{a,b,}\nlet f:(a:E,b:F)->bool=a in [b]",
         "let E=enum{a,b,}\nlet F=enum{a,b,}\nlet f:(a:E,b:F)->bool=a==b",
-        "let O:(T:type)->type=union{some:T,none,}\nlet f:(a:O(&string))={}",
-        "let R:(T:type,E:type)->type=union{ok:T,err:E,}\nlet f:(a:R([]void,string))={}",
-        "let f:()={let a:[]string=[]\nlet b:[]bool=[]\nlet c:[]string=b\n}",
+        "let O:(T:type)->type=union{some:T,none,}\nlet f:(a:O(&str))={}",
+        "let R:(T:type,E:type)->type=union{ok:T,err:E,}\nlet f:(a:R([]void,str))={}",
+        "let f:()={let a:[]str=[]\nlet b:[]bool=[]\nlet c:[]str=b\n}",
         "let f:()={let a=[\"a\",true]\n}",
     }) |source| {
         var module = try Module.init(std.testing.allocator, "bad-managed-array.nov", source);
@@ -8856,8 +8856,8 @@ test "managed arrays reject unsupported payloads nominal mismatches and record m
 
 test "managed arrays in Option and Result payloads are ordinary runtime values" {
     for ([_][]const u8{
-        "let O:(T:type)->type=union{some:T,none,}\nlet f:(a:O([]string))={}",
-        "let R:(T:type,E:type)->type=union{ok:T,err:E,}\nlet f:(a:R([]string,string))={}",
+        "let O:(T:type)->type=union{some:T,none,}\nlet f:(a:O([]str))={}",
+        "let R:(T:type,E:type)->type=union{ok:T,err:E,}\nlet f:(a:R([]str,str))={}",
     }) |source| {
         var module = try Module.init(std.testing.allocator, "managed-array-payload.nov", source);
         defer module.deinit();
@@ -9615,7 +9615,7 @@ test "rune frontend supports scalar boundaries matches printing and borrows" {
         "let f: () -> bool = {let mut r = 'a'\nr = 'é'\nlet b = &r\nb.* = '😀'\nb.* == '😀'}",
         "let f: () -> rune = {let mut xs: []rune = ['a', 'é']\nxs[0] = '😀'\nlet b = &xs[1]\nb.* = '\\0'\nb.*}",
         "let f: () -> rune = {let xs = ['é', '😀']\nxs[0]}",
-        "let f: (r: rune) -> string = {let value = '😀'\n@println(r, value, '\\xE9')\n\"{r}:{value}\"}",
+        "let f: (r: rune) -> str = {let value = '😀'\n@println(r, value, '\\xE9')\n\"{r}:{value}\"}",
         "let f: () -> bool = 'é' != '😀'",
     }) |source| {
         errdefer std.debug.print("rune frontend fixture: {s}\n", .{source});
@@ -9671,7 +9671,7 @@ test "rune frontend rejects conversions operators ranges and malformed literals"
         .{ .source = "let f: () -> rune = @as(rune, 97)", .tag = .literal_type_mismatch },
         .{ .source = "let f: () -> rune = \"a\"", .tag = .literal_type_mismatch },
         .{ .source = "let f: () -> int = 'a'", .tag = .literal_type_mismatch },
-        .{ .source = "let f: () -> string = 'a'", .tag = .literal_type_mismatch },
+        .{ .source = "let f: () -> str = 'a'", .tag = .literal_type_mismatch },
         .{ .source = "let f: (x: int) -> rune = @as(rune, x)", .tag = .expression_type_mismatch },
         .{ .source = "let f: (r: rune) -> int = @as(int, r)", .tag = .expression_type_mismatch },
         .{ .source = "let f: () -> bool = 'a' == 97", .tag = .literal_type_mismatch },
@@ -9707,7 +9707,7 @@ test "rune frontend rejects conversions operators ranges and malformed literals"
 
 test "rune frontend diagnostics and bodies clean up on every allocation failure" {
     for ([_][]const u8{
-        "let f: (r: rune) -> string = {let value = '😀'\n\"{r}:{value}\"}",
+        "let f: (r: rune) -> str = {let value = '😀'\n\"{r}:{value}\"}",
         "let f: (r: rune) -> rune = match r {'é' => '😀'\n_ => r}",
         "let f: () -> rune = '\\u{D800}'",
     }) |source| try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
@@ -9933,7 +9933,7 @@ test "iteration record loans respect owner mutability and reject capability esca
         .{ .body = "let mut a=[R.[inner=Cell.[n=1,s=\"x\"]]]\nloop &r in a {return &r}", .tag = .unsupported_borrow },
         .{ .body = "let mut a=[R.[inner=Cell.[n=1,s=\"x\"]]]\nloop &r in a {let escaped=[&r]\n}", .tag = .unsupported_borrow },
     }) |case| {
-        const source = try std.fmt.allocPrint(std.testing.allocator, "let Cell=struct{{n:int,s:string,}}\nlet R=struct{{inner:Cell,}}\nlet f:()={{\n{s}\n}}", .{case.body});
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let Cell=struct{{n:int,s:str,}}\nlet R=struct{{inner:Cell,}}\nlet f:()={{\n{s}\n}}", .{case.body});
         defer std.testing.allocator.free(source);
         var module = try Module.init(std.testing.allocator, "iteration-record.nov", source);
         defer module.deinit();
@@ -10027,7 +10027,7 @@ const iteration_call_prelude =
     \\    let nested:(self:R,cb:())={let run=(){cb()}
     \\        run()}
     \\@[stringify]
-    \\    let toString:(self:R)->string="R"
+    \\    let toString:(self:R)->str="R"
     \\    @[noreturn]
     \\    let stop:(self:R,cb:())={cb()
     \\        @panic("stop")}
@@ -10091,7 +10091,7 @@ test "iteration call protection uses final boxing across backedges and child bod
         \\let R=struct{let invoke:(self:R,cb:())={let run=(){cb()}
         \\    run()}
         \\@[stringify]
-        \\    let toString:(self:R)->string="R"
+        \\    let toString:(self:R)->str="R"
         \\}
         \\let G:(T:type)->type=struct{value:T,
         \\    let invoke:(self:@This(),cb:())=cb()
@@ -10406,11 +10406,11 @@ test "general borrowing readonly parameters exact types conflicts and unsupporte
     for ([_]Case{
         .{ .ty = "bool", .init = "true", .replacement = "false" },
         .{ .ty = "int", .init = "@as(int,1)", .replacement = "2" },
-        .{ .ty = "string", .init = "\"a\"+\"b\"", .replacement = "\"c\"" },
+        .{ .ty = "str", .init = "\"a\"+\"b\"", .replacement = "\"c\"" },
         .{ .ty = "E", .init = "E.a", .replacement = ".b" },
         .{ .ty = "R", .init = "R.[s=\"a\"]", .replacement = "R.[s=\"b\"]" },
         .{ .ty = "U", .init = "U.some[\"a\"]", .replacement = ".none[]" },
-        .{ .ty = "G(string)", .init = "G(string).some[\"a\"]", .replacement = ".none[]" },
+        .{ .ty = "G(str)", .init = "G(str).some[\"a\"]", .replacement = ".none[]" },
         .{ .ty = "[]int", .init = "[@as(int,1)]", .replacement = "[2]" },
         .{ .ty = "(int)->int", .init = "inc", .replacement = "inc" },
     }) |case| {
@@ -10425,7 +10425,7 @@ test "general borrowing readonly parameters exact types conflicts and unsupporte
                 else => "let local=x\nlet r=&local\nlet s=&r\nreturn s.*",
             }, if (mode == 1 or mode == 4 or mode == 5) .{case.replacement} else .{});
             defer std.testing.allocator.free(body);
-            const source = try std.fmt.allocPrint(std.testing.allocator, "let E=enum{{a,b,}}\nlet R=struct{{s:string,}}\nlet U=union{{some:string,none,}}\nlet G:(T:type)->type=union{{some:T,none,}}\nlet inc:(x:int)->int=x+1\nlet consume:(v:{s})={{}}\nlet f:(x:{s})->{s}={{{s}\n}}\nlet entry:()={{let v:{s}={s}\nconsume(f(v))}}", .{ case.ty, case.ty, case.ty, body, case.ty, case.init });
+            const source = try std.fmt.allocPrint(std.testing.allocator, "let E=enum{{a,b,}}\nlet R=struct{{s:str,}}\nlet U=union{{some:str,none,}}\nlet G:(T:type)->type=union{{some:T,none,}}\nlet inc:(x:int)->int=x+1\nlet consume:(v:{s})={{}}\nlet f:(x:{s})->{s}={{{s}\n}}\nlet entry:()={{let v:{s}={s}\nconsume(f(v))}}", .{ case.ty, case.ty, case.ty, body, case.ty, case.init });
             defer std.testing.allocator.free(source);
             var module = try Module.init(std.testing.allocator, "general-readonly.nov", source);
             defer module.deinit();
@@ -10461,7 +10461,7 @@ test "general borrowing rejects void nonlocal capabilities wrong exact types and
         .{ .source = "let f:()={let mut x=true\nlet r=&x\nr.* +=true}", .diagnostic = .operator_not_supported },
         .{ .source = "let f:()={let mut x=\"a\"\nlet r=&x\nr.* -=\"b\"}", .diagnostic = .operator_not_supported },
         .{ .source = "let f:()={let x=[true]\nlet r=&x[0]\nr.* =false}", .diagnostic = .immutable_assignment },
-        .{ .source = "let f:(x:[]string)={let r=&x[0]\nr.* +=\"b\"}", .diagnostic = .immutable_assignment },
+        .{ .source = "let f:(x:[]str)={let r=&x[0]\nr.* +=\"b\"}", .diagnostic = .immutable_assignment },
         .{ .source = "let R=struct{n:int=0,}\nlet f:(x:R)={let r=&x\nr.*.n=1}", .diagnostic = .immutable_assignment },
         .{ .source = "let R=struct{n:int=0,}\nlet f:()={let mut x=R.[]\nlet r=&x\nx.n=1\n@println(r.*.n)}", .diagnostic = .borrow_conflict },
         .{ .source = "let f:(x:bool)={let r=&x\n@println(x)\n@println(r.*)}", .diagnostic = .borrow_conflict },
@@ -11440,7 +11440,7 @@ test "general borrowing reserves record owners through terminal field assignment
 test "len builtin terminal operands emit no length operation" {
     for ([_][]const u8{
         "let f:()->bool=@len(@panic(\"stop\"))",
-        "let f:()->string=@len({return \"done\"})",
+        "let f:()->str=@len({return \"done\"})",
         "let f:()->uint=@len(loop {})",
     }) |source| {
         var module = try Module.init(std.testing.allocator, "terminal-len.nov", source);
@@ -11569,8 +11569,8 @@ test "len builtin projects inert reads and snapshots effectful indexes once" {
         \\let inert:(a:[][]int)->uint=@len(a[0])
         \\let effect:(a:[][]int)->uint=@len(a[{@println("index")
         \\0}])
-        \\let text:()->string="é\0😀"
-        \\let called:()->uint=@len({@as(string,{text()})})
+        \\let text:()->str="é\0😀"
+        \\let called:()->uint=@len({@as(str,{text()})})
         \\let R=struct{len:uint,}
         \\let field:(r:R)->uint={let mut v=r
         \\v.len=2

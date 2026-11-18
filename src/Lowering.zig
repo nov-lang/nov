@@ -246,7 +246,7 @@ test "global data initialization rejects startup calls mutable reads and nested 
     for ([_][]const u8{
         "let f: () -> int = 1\nlet mut value: int = f()",
         "let mut source: int = 1\nlet value: []int = [source]",
-        "let value: []string = [\"{true}\"]",
+        "let value: []str = [\"{true}\"]",
         "let mut value = { @println(1)\n1 }",
     }) |source| {
         var module = try Module.init(std.testing.allocator, "global-effects.nov", source);
@@ -485,11 +485,11 @@ const demand_result_source =
 
 test "demand generic methods preserve void payload construction propagation and valid siblings" {
     const source = demand_result_source ++ "\n" ++
-        \\let Unit=Result(void,string)
+        \\let Unit=Result(void,str)
         \\let Empty=Result(int,void)
         \\let Both=Result(void,void)
         \\let unit:(b:bool)->Unit=if b{.ok[]}else{.err["err"]}
-        \\let run:(b:bool)->Result(int,string)={let v:void=unit(b).!
+        \\let run:(b:bool)->Result(int,str)={let v:void=unit(b).!
         \\.ok[2]}
         \\let empty:()->Empty=.err[]
         \\let remap:()->Result(bool,void)=.ok[empty().! == 0]
@@ -525,8 +525,8 @@ test "demand generic methods do not resolve unused signatures bodies or expandin
 
 test "demand generic methods diagnose requested void parameter signatures including function references" {
     for ([_][]const u8{
-        "let R=Result(void,string)\nlet use:()={let f=R.unwrapOr\n}",
-        "let R=Result(void,string)\nlet use:(r:R)=r.unwrapOr({})",
+        "let R=Result(void,str)\nlet use:()={let f=R.unwrapOr\n}",
+        "let R=Result(void,str)\nlet use:(r:R)=r.unwrapOr({})",
         "let R=Result(int,void)\nlet use:()={let f=R.unwrapOrElse\n}",
         "let R=Result(int,void)\nlet use:(r:R)={let f=match true{true=>R.unwrapOrElse\nfalse=>R.unwrapOrElse}\n}",
     }) |body| {
@@ -638,14 +638,14 @@ test "generic structs late cycles expanding type arguments and layout depth reta
 }
 
 test "generic methods reject inexact types leaked bindings and invalid concrete bodies" {
-    const prefix = "let G:(T:type,E:type)->type=union{ok:T,err:E,\nlet Self=@This()\nlet unwrapOr:(self:Self,fallback:T)->T=match self{.ok=>|v|v\n.err=>fallback}\nlet unwrapOrElse:(self:Self,fallback:(E)->T)->T=match self{.ok=>|v|v\n.err=>|e|fallback(e)}\n}\nlet R=G(int,string)\n";
+    const prefix = "let G:(T:type,E:type)->type=union{ok:T,err:E,\nlet Self=@This()\nlet unwrapOr:(self:Self,fallback:T)->T=match self{.ok=>|v|v\n.err=>fallback}\nlet unwrapOrElse:(self:Self,fallback:(E)->T)->T=match self{.ok=>|v|v\n.err=>|e|fallback(e)}\n}\nlet R=G(int,str)\n";
     const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag };
     for ([_]Case{
         .{ .source = "let f:(r:R)->int=r.unwrapOr(true)", .tag = .literal_type_mismatch },
         .{ .source = "let f:(r:R)->int=r.unwrapOr()", .tag = .argument_count_mismatch },
         .{ .source = "let cb:(x:bool)->int=0\nlet f:(r:R)->int=r.unwrapOrElse(cb)", .tag = .expression_type_mismatch },
         .{ .source = "let S=G(int,bool)\nlet f:(s:S)->int=R.unwrapOr(s,0)", .tag = .expression_type_mismatch },
-        .{ .source = "let Other:(T:type,E:type)->type=union{ok:T,err:E,}\nlet f:(s:Other(int,string))->int=R.unwrapOr(s,0)", .tag = .expression_type_mismatch },
+        .{ .source = "let Other:(T:type,E:type)->type=union{ok:T,err:E,}\nlet f:(s:Other(int,str))->int=R.unwrapOr(s,0)", .tag = .expression_type_mismatch },
         .{ .source = "let f:(x:T)={}", .tag = .unknown_type },
         .{ .source = "let f:(x:Self)={}", .tag = .unknown_type },
         .{ .source = "let Bad:(T:type)->type=union{ok:T,\nlet bad:()->T=true\n}\nlet B=Bad(int)\nlet use:()->int=B.bad()", .tag = .literal_type_mismatch },
@@ -653,7 +653,7 @@ test "generic methods reject inexact types leaked bindings and invalid concrete 
         .{ .source = "let Bad:(T:type)->type=union{ok:T,\nlet m:()={let T:int=1\n}\n}\nlet B=Bad(int)\nlet use:()=B.m()", .tag = .unsupported_shadowing },
         .{ .source = "let Bad:(T:type)->type=union{ok:T,\n@[noreturn]\nlet m:()->T=@panic(\"bad\")\n}\nlet B=Bad(int)\nlet use:()=B.m()", .tag = .noreturn_result },
         .{ .source = "let Bad:(T:type)->type=union{ok:T,\n@[stringify]\nlet toString:(self:@This())->T=match self{.ok=>|v|v}\n}\nlet B=Bad(int)\nlet f:(b:B)=@println(b)", .tag = .invalid_to_string },
-        .{ .source = "let A=struct{x:int,}\nlet B=struct{x:int,}\nlet f:(r:G(A,string),b:B)->A=r.unwrapOr(b)", .tag = .expression_type_mismatch },
+        .{ .source = "let A=struct{x:int,}\nlet B=struct{x:int,}\nlet f:(r:G(A,str),b:B)->A=r.unwrapOr(b)", .tag = .expression_type_mismatch },
     }) |case| {
         const source = try std.mem.concat(std.testing.allocator, u8, &.{ prefix, case.source });
         defer std.testing.allocator.free(source);
@@ -697,12 +697,12 @@ test "generic method bodies retain type parameters in annotations ascriptions an
         \\let flag:(self:Self)->G(bool,E)={let result:G(bool,E)=G(bool,E).ok[true]
         \\result}
         \\}
-        \\let R=G(int,string)
-        \\let S=G(string,int)
+        \\let R=G(int,str)
+        \\let S=G(str,int)
         \\let run:(r:R,s:S)->int={let flag=r.flag()
         \\@println(flag.id(true),s.wrap("s").id("t"))
         \\@println("{G(i8,bool).id(G(i8,bool).ok[1],2)}")
-        \\G(int,string).id(r.wrap(1),2)}
+        \\G(int,str).id(r.wrap(1),2)}
     ;
     var module = try Module.init(std.testing.allocator, "method-scope.nov", source);
     defer module.deinit();
@@ -735,8 +735,8 @@ test "generic method tables reset between analyses without changing canonical id
 test "generic union instances canonicalize aliases arguments and nominal declarations" {
     const source = "let G:(T:type,E:type)->type=union{ok:T,err:E,}\n" ++
         "let Other:(T:type,E:type)->type=union{ok:T,err:E,}\n" ++
-        "let Factory=Forward\nlet Forward=G\nlet Count=int\nlet A=Factory(Count,string)\nlet B=G(int,string)\nlet C=G(string,int)\nlet D=Other(int,string)\nlet Alias=A\n" ++
-        "let id:(v:Alias)->B=v\nlet make:()->A=G(int,string).ok[7]";
+        "let Factory=Forward\nlet Forward=G\nlet Count=int\nlet A=Factory(Count,str)\nlet B=G(int,str)\nlet C=G(str,int)\nlet D=Other(int,str)\nlet Alias=A\n" ++
+        "let id:(v:Alias)->B=v\nlet make:()->A=G(int,str).ok[7]";
     var module = try Module.init(std.testing.allocator, "instances.nov", source);
     defer module.deinit();
     var sema = try lower(&module);
@@ -760,7 +760,7 @@ test "generic union instances canonicalize aliases arguments and nominal declara
 test "record payload generic identities canonicalize aliases but preserve nominal distinctions" {
     const source = "let G:(T:type,E:type)->type=union{ok:T,err:E,}\nlet Factory=G\n" ++
         "let A=Factory(Alias,ErrorAlias)\nlet B=G(File,Error)\nlet C=G(Other,Error)\nlet D=G(File,Other)\n" ++
-        "let Alias=File\nlet ErrorAlias=Error\nlet File=struct{s:string,}\nlet Other=struct{s:string,}\nlet Error=struct{s:string,}\n" ++
+        "let Alias=File\nlet ErrorAlias=Error\nlet File=struct{s:str,}\nlet Other=struct{s:str,}\nlet Error=struct{s:str,}\n" ++
         "let id:(a:A)->B=a\nlet make:()->A=.ok[Alias.[s=\"value\"]]";
     var module = try Module.init(std.testing.allocator, "record-identities.nov", source);
     defer module.deinit();
@@ -810,7 +810,7 @@ test "union array payloads typed element layouts under OOM" {
         \\let O:(T:type)->type=union{some:T,none,}
         \\let Kind=enum{first,last,}
         \\let S=struct{values:[]int,}
-        \\let U=union{ints:[]int,bools:[]bool,floats:[]f32,runes:[]rune,strings:[]string,nested:[][]int,records:[]S,unions:[]O(int),enums:[]Kind,functions:[]()->int,ranges:[]@TypeOf(0..1),}
+        \\let U=union{ints:[]int,bools:[]bool,floats:[]f32,runes:[]rune,strings:[]str,nested:[][]int,records:[]S,unions:[]O(int),enums:[]Kind,functions:[]()->int,ranges:[]@TypeOf(0..1),}
     );
 }
 
@@ -837,8 +837,8 @@ test "union array payloads Option and Result propagation under OOM" {
         \\let O:(T:type)->type=union{some:T,none,}
         \\let R:(T:type,E:type)->type=union{ok:T,err:E,}
         \\let option:(o:O([]u8))->O([]u8)=.some[o.!]
-        \\let result:(r:R([]int,[]string))->R([]int,[]string)=.ok[r.!]
-        \\let failure:()->R([]int,[]string)=.err[["bad"]]
+        \\let result:(r:R([]int,[]str))->R([]int,[]str)=.ok[r.!]
+        \\let failure:()->R([]int,[]str)=.err[["bad"]]
     );
 }
 
@@ -857,10 +857,10 @@ test "union array payloads value and type printing under OOM" {
         \\let R:(T:type,E:type)->type=union{ok:T,err:E,}
         \\let Kind=enum{first,last,}
         \\let S=struct{values:[]int,}
-        \\let U=union{ints:[]int,bools:[]bool,floats:[]f32,runes:[]rune,strings:[]string,nested:[][]int,records:[]S,unions:[]O(int),enums:[]Kind,functions:[]()->int,ranges:[]@TypeOf(0..1),}
+        \\let U=union{ints:[]int,bools:[]bool,floats:[]f32,runes:[]rune,strings:[]str,nested:[][]int,records:[]S,unions:[]O(int),enums:[]Kind,functions:[]()->int,ranges:[]@TypeOf(0..1),}
         \\let make:()->O([]u8)=.some[[1,2]]
         \\let empty:()->O([]int)=.some[[]]
-        \\let failure:()->R([]int,[]string)=.err[["bad"]]
+        \\let failure:()->R([]int,[]str)=.err[["bad"]]
         \\let show:()={@println(make(),empty(),failure(),U)}
     );
 }
@@ -969,7 +969,7 @@ test "value payloads enclosing stringify hooks opt out of structural printing un
     try testUnionArrayPayloadsOom(
         \\let U=union{f:()->int,r:@TypeOf(0..1),
         \\@[stringify]
-        \\let toString:(self:@This())->string="opaque"
+        \\let toString:(self:@This())->str="opaque"
         \\}
         \\let main:()={@println(U.f[()->int {1}],U.r[0..=2])}
     );
@@ -980,8 +980,8 @@ test "nested unions contextual constructors and enum payloads under OOM" {
         \\let O:(T:type)->type=union{some:T,none,}
         \\let R:(T:type,E:type)->type=union{ok:T,err:E,}
         \\let Kind=enum{first,last,}
-        \\let make:()->O(R(Kind,string))=.some[.ok[.last]]
-        \\let other:()->R(O(u8),string)=.ok[.some[255]]
+        \\let make:()->O(R(Kind,str))=.some[.ok[.last]]
+        \\let other:()->R(O(u8),str)=.ok[.some[255]]
         \\let empty:()->O(O(int))=.some[.none[]]
     );
 }
@@ -1004,10 +1004,10 @@ test "nested unions generic aliases preserve canonical identities under OOM" {
         \\let R:(T:type,E:type)->type=union{ok:T,err:E,}
         \\let OptionAlias=O
         \\let ResultAlias=R
-        \\let Inner=ResultAlias(u8,string)
+        \\let Inner=ResultAlias(u8,str)
         \\let InnerAlias=Inner
         \\let Outer=OptionAlias(InnerAlias)
-        \\let same:(x:Outer)->O(R(u8,string))=x
+        \\let same:(x:Outer)->O(R(u8,str))=x
         \\let make:()->Outer=Outer.some[InnerAlias.ok[255]]
     );
 }
@@ -1018,11 +1018,11 @@ test "nested unions propagation removes exactly one layer under OOM" {
         \\let R:(T:type,E:type)->type=union{ok:T,err:E,}
         \\let once:(x:O(O(int)))->O(O(int))=.some[x.!]
         \\let twice:(x:O(O(int)))->O(int)=.some[x.!.!]
-        \\let onceResult:(x:R(R(int,string),string))->R(R(int,string),string)=.ok[x.!]
-        \\let twiceResult:(x:R(R(int,string),string))->R(int,string)=.ok[x.!.!]
-        \\let outerResult:(x:R(O(int),string))->R(O(int),string)=.ok[x.!]
-        \\let outerOption:(x:O(R(int,string)))->O(R(int,string))=.some[x.!]
-        \\let error:(x:R(int,O(string)))->R(bool,O(string))=.ok[x.! == 0]
+        \\let onceResult:(x:R(R(int,str),str))->R(R(int,str),str)=.ok[x.!]
+        \\let twiceResult:(x:R(R(int,str),str))->R(int,str)=.ok[x.!.!]
+        \\let outerResult:(x:R(O(int),str))->R(O(int),str)=.ok[x.!]
+        \\let outerOption:(x:O(R(int,str)))->O(R(int,str))=.some[x.!]
+        \\let error:(x:R(int,O(str)))->R(bool,O(str))=.ok[x.! == 0]
     );
 }
 
@@ -1048,9 +1048,9 @@ test "nested unions readonly constructors and contextual calls under OOM" {
         \\let O:(T:type)->type=union{some:T,none,}
         \\let R:(T:type,E:type)->type=union{ok:T,err:E,}
         \\let Kind=enum{first,last,}
-        \\let take:(x:O(R(Kind,string)))->O(R(Kind,string))=x
-        \\let id:(x:@TypeOf(take(.some[.ok[.last]])))->O(R(Kind,string))=x
-        \\let explicit:(x:@TypeOf(O(R(Kind,string)).some[R(Kind,string).ok[.first]]))->O(R(Kind,string))=x
+        \\let take:(x:O(R(Kind,str)))->O(R(Kind,str))=x
+        \\let id:(x:@TypeOf(take(.some[.ok[.last]])))->O(R(Kind,str))=x
+        \\let explicit:(x:@TypeOf(O(R(Kind,str)).some[R(Kind,str).ok[.first]]))->O(R(Kind,str))=x
     );
 }
 
@@ -1059,11 +1059,11 @@ test "nested unions generic constructor inference and tag contexts under OOM" {
         \\let O:(T:type)->type=union{some:T,none,}
         \\let R:(T:type,E:type)->type=union{ok:T,err:E,}
         \\let Kind=enum{first,last,}
-        \\let wrap:(x:`T)->O(R(`T,string))=.some[.ok[x]]
-        \\let tags:(x:`T)->O(R(Kind,string))=.some[.ok[.last]]
-        \\let explicit:(x:`T)->O(R(`T,string))=O(R(`T,string)).some[R(`T,string).ok[x]]
-        \\let take:(x:O(R(Kind,string)),n:`T)->`T=n
-        \\let main:()={let a:O(R(u8,string))=wrap(@as(u8,255))
+        \\let wrap:(x:`T)->O(R(`T,str))=.some[.ok[x]]
+        \\let tags:(x:`T)->O(R(Kind,str))=.some[.ok[.last]]
+        \\let explicit:(x:`T)->O(R(`T,str))=O(R(`T,str)).some[R(`T,str).ok[x]]
+        \\let take:(x:O(R(Kind,str)),n:`T)->`T=n
+        \\let main:()={let a:O(R(u8,str))=wrap(@as(u8,255))
         \\let b=tags(true)
         \\let c=explicit(true)
         \\let n=take(.some[.ok[.first]],1)
@@ -1075,7 +1075,7 @@ test "nested unions readonly rejects missing inner payload" {
     try testNestedUnionRejected(
         \\let O:(T:type)->type=union{some:T,none,}
         \\let R:(T:type,E:type)->type=union{ok:T,err:E,}
-        \\let take:(x:O(R(int,string)))->int=0
+        \\let take:(x:O(R(int,str)))->int=0
         \\let invalid:(x:@TypeOf(take(.some[.ok[]])))={}
     , .invalid_union_constructor);
 }
@@ -1100,8 +1100,8 @@ test "nested unions reject implicit recursive propagation under OOM" {
     , .expression_type_mismatch);
     try testNestedUnionRejected(
         \\let R:(T:type,E:type)->type=union{ok:T,err:E,}
-        \\let A=union{value:string,}
-        \\let B=union{value:string,}
+        \\let A=union{value:str,}
+        \\let B=union{value:str,}
         \\let f:(x:R(int,A))->R(bool,B)=.ok[x.! == 0]
     , .propagation_error_mismatch);
 }
@@ -1311,7 +1311,7 @@ test "nested unions readonly rejects inner enum tag and unexpected payload under
         \\let O:(T:type)->type=union{some:T,none,}
         \\let R:(T:type,E:type)->type=union{ok:T,err:E,}
         \\let Kind=enum{first,last,}
-        \\let take:(x:O(R(Kind,string)))->int=0
+        \\let take:(x:O(R(Kind,str)))->int=0
         \\let invalid:(x:@TypeOf(take(.some[.ok[.missing]])))={}
     , .unknown_field);
     try testNestedUnionRejected(
@@ -1621,7 +1621,7 @@ test "anonymous structs TypeOf contextual fields diagnose source order with nomi
             \\let take:(s:S)->S=s
             \\let f:(q:@TypeOf(take(.[b="wrong",a=unknown])))={}
             ,
-            \\let wrong:string="wrong"
+            \\let wrong:str="wrong"
             \\let take:(s:S)->S=s
             \\let f:(q:@TypeOf(take(.[b=wrong,a=unknown])))={}
             ,
@@ -1855,7 +1855,7 @@ test "numbered fields retain exact writes immutable captures loans and unsupport
 test "array defaults materialize nested literals per constructor and skip overrides under OOM" {
     try testUnionArrayPayloadsOom(
         \\let Kind=enum{first,last,}
-        \\let R=struct{xs:[][]u8=[[1,255],[],[2]],flags:[]bool=[true,false],runes:[]rune=['é'],floats:[]f32=[-0.0,1.5],text:[]string=["a\\0b","é"],tags:[]Kind=[.last,Kind.first],n:int=7,}
+        \\let R=struct{xs:[][]u8=[[1,255],[],[2]],flags:[]bool=[true,false],runes:[]rune=['é'],floats:[]f32=[-0.0,1.5],text:[]str=["a\\0b","é"],tags:[]Kind=[.last,Kind.first],n:int=7,}
         \\let make:()->R=R.[]
         \\let override:()->R=R.[xs=[[3]]]
         \\let U=union{record:R,empty,}
@@ -1918,7 +1918,7 @@ test "array defaults reject nonliteral leaves and exact type mismatches under OO
         .{ .source = "let n=1\nlet R=struct{xs:[]int=[n],}", .tag = .invalid_field_default },
         .{ .source = "let f:()->int=1\nlet R=struct{xs:[]int=[f()],}", .tag = .invalid_field_default },
         .{ .source = "let A=struct{x:int=1,}\nlet R=struct{xs:[]A=[A.[]],}", .tag = .invalid_field_default },
-        .{ .source = "let R=struct{xs:[]string=[\"{true}\"],}", .tag = .invalid_field_default },
+        .{ .source = "let R=struct{xs:[]str=[\"{true}\"],}", .tag = .invalid_field_default },
         .{ .source = "let G:(T:type)->type=struct{xs:[]T=[true],}\nlet R=G(int)", .tag = .literal_type_mismatch },
         .{ .source = "let R=struct{x:int=[],}", .tag = .literal_type_mismatch },
         .{ .source = "let R=struct{xs:[]R=[],}", .tag = .record_layout_cycle },
@@ -2013,7 +2013,7 @@ test "Option propagation accepts structural families exact contexts inference an
     const source =
         \\let O:(T:type)->type=union{none,some:T,}
         \\let A=union{some:u8,none,}
-        \\let B=union{none:void,some:string,}
+        \\let B=union{none:void,some:str,}
         \\let use:(n:u8)->u8=n
         \\let inferred:(o:A)->B={let n=o.!
         \\let sum=1+o.!
@@ -2022,7 +2022,7 @@ test "Option propagation accepts structural families exact contexts inference an
         \\let reverse:(o:O(u8))->A=.some[o.!]
         \\let unit:(o:O(void))->B={o.!
         \\.some["unit"]}
-        \\let returned:(o:O(string))->B={return .some[o.!]}
+        \\let returned:(o:O(str))->B={return .some[o.!]}
     ;
     var module = try Module.init(std.testing.allocator, "option.nov", source);
     defer module.deinit();
@@ -2050,8 +2050,8 @@ test "Option propagation rejects malformed shapes cross families and implicit co
         .{ .source = "let U=union{some:int,err,}\nlet f:(u:U)->O(int)=.some[u.!]", .tag = .invalid_propagation_operand },
         .{ .source = "let U=union{some:int,none:bool,}\nlet f:(o:O(int))->U=.some[o.!]", .tag = .invalid_propagation_return },
         .{ .source = "let U=union{some:int,none,extra,}\nlet f:(o:O(int))->U=.some[o.!]", .tag = .invalid_propagation_return },
-        .{ .source = "let A=struct{s:string,}\nlet B=struct{s:string,}\nlet f:(o:O(A))->O(B)=.some[o.!]", .tag = .expression_type_mismatch },
-        .{ .source = "let A=struct{s:string,}\nlet B=struct{s:string,}\nlet f:(r:R(int,A))->R(int,B)=.ok[r.!]", .tag = .propagation_error_mismatch },
+        .{ .source = "let A=struct{s:str,}\nlet B=struct{s:str,}\nlet f:(o:O(A))->O(B)=.some[o.!]", .tag = .expression_type_mismatch },
+        .{ .source = "let A=struct{s:str,}\nlet B=struct{s:str,}\nlet f:(r:R(int,A))->R(int,B)=.ok[r.!]", .tag = .propagation_error_mismatch },
         .{ .source = "let f:(r:R(int,u8))->R(int,u16)=.ok[r.!]", .tag = .propagation_error_mismatch },
     }) |case| {
         const source = try std.mem.concat(std.testing.allocator, u8, &.{ prefix, case.source });
@@ -2073,15 +2073,15 @@ test "Option propagation rejects malformed shapes cross families and implicit co
 }
 
 test "generic unions and propagation diagnose exact types unsupported forms and cycles under OOM" {
-    const prefix = "let G:(T:type,E:type)->type=union{ok:T,err:E,}\nlet R=G(int,string)\n";
+    const prefix = "let G:(T:type,E:type)->type=union{ok:T,err:E,}\nlet R=G(int,str)\n";
     const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag };
     for ([_]Case{
         .{ .source = "let A=G(int)", .tag = .generic_argument_count },
-        .{ .source = "let A=G(int,string,bool)", .tag = .generic_argument_count },
+        .{ .source = "let A=G(int,str,bool)", .tag = .generic_argument_count },
         .{ .source = "let f:(v:G)={}", .tag = .generic_needs_arguments },
-        .{ .source = "let A=G(true,string)", .tag = .not_a_type },
-        .{ .source = "let A=G(Missing,string)", .tag = .unknown_type },
-        .{ .source = "let Other:(T:type,E:type)->type=union{ok:T,err:E,}\nlet f:()->Other(int,string)=R.ok[1]", .tag = .expression_type_mismatch },
+        .{ .source = "let A=G(true,str)", .tag = .not_a_type },
+        .{ .source = "let A=G(Missing,str)", .tag = .unknown_type },
+        .{ .source = "let Other:(T:type,E:type)->type=union{ok:T,err:E,}\nlet f:()->Other(int,str)=R.ok[1]", .tag = .expression_type_mismatch },
         .{ .source = "let f:()->R=7", .tag = .literal_type_mismatch },
         .{ .source = "let f:()->R={return 7}", .tag = .literal_type_mismatch },
         .{ .source = "let f:(r:R)->int=r.!", .tag = .invalid_propagation_return },
@@ -2090,23 +2090,23 @@ test "generic unions and propagation diagnose exact types unsupported forms and 
         .{ .source = "let f:(r:R)->R=.ok[r.!.!]", .tag = .invalid_propagation_operand },
         .{ .source = "let f:(r:R)->G(int,bool)=.ok[r.!]", .tag = .propagation_error_mismatch },
         .{ .source = "let f:()->R=.ok[true.!]", .tag = .invalid_propagation_operand },
-        .{ .source = "let U=union{ok:int,err:string,extra,}\nlet f:(u:U)->R=.ok[u.!]", .tag = .invalid_propagation_operand },
-        .{ .source = "let U=union{some:int,err:string,}\nlet f:(u:U)->R=.ok[u.!]", .tag = .invalid_propagation_operand },
-        .{ .source = "let f:(r:R)->G(bool,string)=.ok[r.!]", .tag = .expression_type_mismatch },
+        .{ .source = "let U=union{ok:int,err:str,extra,}\nlet f:(u:U)->R=.ok[u.!]", .tag = .invalid_propagation_operand },
+        .{ .source = "let U=union{some:int,err:str,}\nlet f:(u:U)->R=.ok[u.!]", .tag = .invalid_propagation_operand },
+        .{ .source = "let f:(r:R)->G(bool,str)=.ok[r.!]", .tag = .expression_type_mismatch },
         .{ .source = "let Cycle:(T:type)->type=union{ok:Cycle(T),}\nlet X=Cycle(int)", .tag = .generic_cycle },
-        .{ .source = "let Loop=G(Loop,string)", .tag = .type_alias_cycle },
-        .{ .source = "let A=B\nlet B=A\nlet R2=G(A,string)", .tag = .type_alias_cycle },
-        .{ .source = "let A=Missing\nlet R2=G(A,string)", .tag = .unknown_type },
-        .{ .source = "let Apply=G\nlet A=B\nlet B=A\nlet f:()->R=Apply(A,string).ok[1]", .tag = .type_alias_cycle },
+        .{ .source = "let Loop=G(Loop,str)", .tag = .type_alias_cycle },
+        .{ .source = "let A=B\nlet B=A\nlet R2=G(A,str)", .tag = .type_alias_cycle },
+        .{ .source = "let A=Missing\nlet R2=G(A,str)", .tag = .unknown_type },
+        .{ .source = "let Apply=G\nlet A=B\nlet B=A\nlet f:()->R=Apply(A,str).ok[1]", .tag = .type_alias_cycle },
         .{ .source = "let Bad:(T:int)->type=union{ok:T,}", .tag = .invalid_generic_declaration },
         .{ .source = "let Bad:(T:type)->int=union{ok:T,}", .tag = .invalid_generic_declaration },
         .{ .source = "let Bad:(T:type,T:type)->type=union{ok:T,}", .tag = .duplicate_parameter },
         .{ .source = "let Bad:(T:type)->type=union{ok:T,\nlet m=1\n}", .tag = .unsupported_generic_method },
         .{ .source = "let Bad:(T:type)->type=union{ok:T,ok:T,}", .tag = .duplicate_field },
         .{ .source = "let Bad:(T:type)->type=union{ok:T=1,}", .tag = .unsupported_union_default },
-        .{ .source = "let A=G((void)->int,string)", .tag = .invalid_parameter_type },
-        .{ .source = "let A=G(&int,string)", .tag = .unsupported_type },
-        .{ .source = "let f:()={let x={let bad:G((int)->int,string)=R.ok[1]\nbad}\n}", .tag = .expression_type_mismatch },
+        .{ .source = "let A=G((void)->int,str)", .tag = .invalid_parameter_type },
+        .{ .source = "let A=G(&int,str)", .tag = .unsupported_type },
+        .{ .source = "let f:()={let x={let bad:G((int)->int,str)=R.ok[1]\nbad}\n}", .tag = .expression_type_mismatch },
         .{ .source = "let U=union{ok:int,err:bool,}\nlet f:(u:U)->R=.ok[u.!]", .tag = .propagation_error_mismatch },
         .{ .source = "let int:(T:type)->type=union{ok:T,}", .tag = .unsupported_shadowing },
     }) |case| {
@@ -2134,7 +2134,7 @@ test "unsupported union declarations and rejected matches roll back under OOM" {
     for ([_]Case{
         .{ .source = "let U=union{}", .tag = .empty_union },
         .{ .source = "let U=union{ok:int=0,}", .tag = .unsupported_union_default },
-        .{ .source = "let U=union{ok:int,ok:string,}", .tag = .duplicate_field },
+        .{ .source = "let U=union{ok:int,ok:str,}", .tag = .duplicate_field },
         .{ .source = "let U=union{ok:(void)->int,}", .tag = .invalid_parameter_type },
         .{ .source = "let R=struct{n:[][]U,}\nlet U=union{ok:R,}", .tag = .record_layout_cycle },
         .{ .source = "let R=struct{n:U,}\nlet U=union{ok:R,}", .tag = .record_layout_cycle },
@@ -2175,7 +2175,7 @@ test "default printing lowers without nominal hooks or global overload lookup" {
     for ([_][]const u8{
         "let U=union{ok:int,}\nlet f:()=@println(U.ok[1])",
         "let A=struct{x:int,}\nlet f:(a:A)=@println(a)",
-        "let A=struct{x:int,}\nlet toString:(a:A)->string=\"not a method\"\nlet f:(a:A)=@println(a)",
+        "let A=struct{x:int,}\nlet toString:(a:A)->str=\"not a method\"\nlet f:(a:A)=@println(a)",
     }) |source| {
         var module = try Module.init(std.testing.allocator, "default-print.nov", source);
         defer module.deinit();
@@ -2192,9 +2192,9 @@ test "nominal records reject mismatches malformed constructors defaults fields a
     for ([_]Case{
         .{ .source = "let A=struct{x:int,}\nlet B=struct{x:int,}\nlet f:(a:A)->B=a", .tag = .expression_type_mismatch },
 
-        .{ .source = "let A=struct{x:int,\n@[stringify]\nlet toString:(b:B)->string=\"wrong nominal receiver\"\n}\nlet B=struct{x:int,}\nlet f:(a:A)=@println(a)", .tag = .invalid_to_string },
+        .{ .source = "let A=struct{x:int,\n@[stringify]\nlet toString:(b:B)->str=\"wrong nominal receiver\"\n}\nlet B=struct{x:int,}\nlet f:(a:A)=@println(a)", .tag = .invalid_to_string },
         .{ .source = "let A=struct{x:int,\n@[stringify]\nlet toString:(a:A)->bool=true\n}\nlet f:(a:A)=@println(a)", .tag = .invalid_to_string },
-        .{ .source = "let A=struct{x:int,\n@[stringify]\nlet toString:()->string=\"bad\"\n}\nlet f:(a:A)=@println(a)", .tag = .invalid_to_string },
+        .{ .source = "let A=struct{x:int,\n@[stringify]\nlet toString:()->str=\"bad\"\n}\nlet f:(a:A)=@println(a)", .tag = .invalid_to_string },
         .{ .source = "let A=struct{x:int,}\nlet B=struct{x:int,}\nlet f:(a:B)=@println(a)\nlet main:()=f(A.[x=1])", .tag = .expression_type_mismatch },
         .{ .source = "let A=struct{x:int,}\nlet f:()->A=A.[]", .tag = .missing_field },
         .{ .source = "let A=struct{x:int,}\nlet f:()->A=A.[x=1,x=2]", .tag = .duplicate_field },
@@ -2202,7 +2202,7 @@ test "nominal records reject mismatches malformed constructors defaults fields a
         .{ .source = "let A=struct{x:int,}\nlet f:()->A=A.[x=true]", .tag = .literal_type_mismatch },
         .{ .source = "let A=struct{x:i8=128,}", .tag = .literal_out_of_range },
         .{ .source = "let A=struct{x:int=1+2,}", .tag = .invalid_field_default },
-        .{ .source = "let A=struct{x:string=\"{true}\",}", .tag = .invalid_field_default },
+        .{ .source = "let A=struct{x:str=\"{true}\",}", .tag = .invalid_field_default },
         .{ .source = "let A=struct{x:int,x:int,}", .tag = .duplicate_field },
         .{ .source = "let A=struct{x:[][]A,}", .tag = .record_layout_cycle },
         .{ .source = "let A=struct{x:&int,}", .tag = .unsupported_type },
@@ -2237,7 +2237,7 @@ test "nominal records reject mismatches malformed constructors defaults fields a
 }
 
 test "field mutation rejects nonlocals immutable bindings unsupported operators and inexact types" {
-    const prefix = "let K=enum{a,b,}\nlet Other=enum{a,b,}\nlet R=struct{x:i8=0,s:string=\"\",b:bool=false,k:K=.a,}\nlet U=union{x:i8,}\n";
+    const prefix = "let K=enum{a,b,}\nlet Other=enum{a,b,}\nlet R=struct{x:i8=0,s:str=\"\",b:bool=false,k:K=.a,}\nlet U=union{x:i8,}\n";
     const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag };
     for ([_]Case{
         .{ .source = "let f:(r:R)={r.x=1}", .tag = .immutable_assignment },
@@ -2270,7 +2270,7 @@ test "field mutation rejects nonlocals immutable bindings unsupported operators 
 
 test "field stores verify slot identity field bounds exact types prior operands spans and private regions" {
     var module = try Module.init(std.testing.allocator, "field-ir.nov",
-        \\let R=struct{x:int=0,s:string="",}
+        \\let R=struct{x:int=0,s:str="",}
         \\let U=union{x:int,}
         \\let f:()={let mut r=R.[]
         \\    let mut u:U=.x[1]
@@ -2380,10 +2380,10 @@ fn testRejectedMatchAllocations(allocator: std.mem.Allocator, source: []const u8
 
 test "rejected matches and pipes roll back diagnostics on allocation failure" {
     for ([_][]const u8{
-        "let f: (n: int) -> string = \"{missing}\"",
-        "let f: (n: int) -> string = \"{n:02}\"",
-        "let f: (n: int) -> string = \"{n}\\xFF\"",
-        "let f: (n: []() -> int) -> string = \"{n}\"",
+        "let f: (n: int) -> str = \"{missing}\"",
+        "let f: (n: int) -> str = \"{n:02}\"",
+        "let f: (n: int) -> str = \"{n}\\xFF\"",
+        "let f: (n: []() -> int) -> str = \"{n}\"",
         "let f: (n: int) -> int = match n {capture => 1\n_ => 2}",
         "let f: (n: int) -> int = match n {0 => 1}",
         "let f: (n: int) -> int = match n {0 => {let private: int = 1\nprivate}\n_ => true}",
@@ -2439,7 +2439,7 @@ test "bitwise binary operands and spans remain owned after source release" {
 }
 
 test "interpolation chunks and ordered conversions own storage after source release" {
-    var module = try Module.init(std.testing.allocator, "interpolation.nov", "let f: (n: int, s: string) -> string = \"é\\0{n}:{s}/{n}😀\"");
+    var module = try Module.init(std.testing.allocator, "interpolation.nov", "let f: (n: int, s: str) -> str = \"é\\0{n}:{s}/{n}😀\"");
     var sema = lower(&module) catch |err| {
         module.deinit();
         return err;
@@ -2468,7 +2468,7 @@ test "interpolation chunks and ordered conversions own storage after source rele
 }
 
 test "interpolated call IR owns storage after releasing source and fragment tokens" {
-    var module = try Module.init(std.testing.allocator, "calls.nov", "let id: (s: string) -> string = s\nlet add: (a: int, b: int) -> int = a + b\nlet f: (n: int, s: string) -> string = \"é\\0{id(s)}:{add(n, add(1, 2))}😀\"");
+    var module = try Module.init(std.testing.allocator, "calls.nov", "let id: (s: str) -> str = s\nlet add: (a: int, b: int) -> int = a + b\nlet f: (n: int, s: str) -> str = \"é\\0{id(s)}:{add(n, add(1, 2))}😀\"");
     var sema = lower(&module) catch |err| {
         module.deinit();
         return err;
@@ -2485,7 +2485,7 @@ test "interpolated call IR owns storage after releasing source and fragment toke
 }
 
 test "interpolation conversions cannot reference sibling private match values" {
-    var module = try Module.init(std.testing.allocator, "private-interpolation.nov", "let f: (n: int) -> string = match n {0 => \"{n}\"\n_ => \"{n}\"}");
+    var module = try Module.init(std.testing.allocator, "private-interpolation.nov", "let f: (n: int) -> str = match n {0 => \"{n}\"\n_ => \"{n}\"}");
     defer module.deinit();
     var sema = try lower(&module);
     defer sema.deinit();
@@ -2506,7 +2506,7 @@ test "interpolation conversions cannot reference sibling private match values" {
 }
 
 test "interpolation globals remain unsupported nonliteral initializers" {
-    for ([_][]const u8{ "let n: int = 1\nlet text: string = \"{n}\"", "let text: string = {\"{true}\"}" }) |source| {
+    for ([_][]const u8{ "let n: int = 1\nlet text: str = \"{n}\"", "let text: str = {\"{true}\"}" }) |source| {
         var module = try Module.init(std.testing.allocator, "global.nov", source);
         defer module.deinit();
         var sema = try lower(&module);
@@ -2604,7 +2604,7 @@ test "exhaustion controls belong to parent loops and IR outlives the source" {
         \\let g: () -> void = loop true : {} {
         \\    loop false {} else {continue}
         \\}
-        \\let h: () -> string = loop false {} else {return "a" + "b"}
+        \\let h: () -> str = loop false {} else {return "a" + "b"}
     );
     var sema = lower(&module) catch |err| {
         module.deinit();
@@ -2799,8 +2799,8 @@ test "loop continuation regions and value breaks outlive source storage" {
 
 test "string compound reuses binary add with old load before RHS replacement" {
     var module = try Module.init(std.testing.allocator, "compound.nov",
-        \\let rhs: () -> string = "right" + "!"
-        \\let f: (s: string) -> string = {
+        \\let rhs: () -> str = "right" + "!"
+        \\let f: (s: str) -> str = {
         \\    let mut x = s
         \\    x += {x = "replacement"
         \\        rhs()}
@@ -3170,7 +3170,7 @@ test "short-circuit expressions lower explicit conditional RHS regions" {
 }
 
 test "inferred global constants and inline uses outlive source storage" {
-    const source = "let text = @as(string, \"hé\\0\")\nlet n = @as(int, @as(int, -42))\nlet yes = true\nlet f: () -> string = text\nlet g: () -> int = n\nlet h: () -> bool = yes";
+    const source = "let text = @as(str, \"hé\\0\")\nlet n = @as(int, @as(int, -42))\nlet yes = true\nlet f: () -> str = text\nlet g: () -> int = n\nlet h: () -> bool = yes";
     var module = try Module.init(std.testing.allocator, "owned-global.nov", source);
     var sema = lower(&module) catch |err| {
         module.deinit();
@@ -3217,7 +3217,7 @@ test "global initializer boundary rejects runtime effects inexact types and nons
 
         "let value: uint = @as(int, 1)",
         "let value: uint = @as(uint, @as(int, 1))",
-        "let value: string = @as(string, \"{true}\")",
+        "let value: str = @as(str, \"{true}\")",
 
         "let value = @as(void, {})",
 
@@ -3383,10 +3383,10 @@ test "lowering ownership and source diagnostic rollback survive allocation failu
         "",
         "let f: (a: i32, b: i32) -> i32 = a + b\nlet main: () -> i32 = f(1, f(2, 3))",
         "let first: () = {}\nlet last: () -> bool = true and false",
-        "let id: (n: int) -> int = n\nlet f: (n: int) -> string = \"{id(id(n + 1))}:{n}\\0\"",
-        "let f: (n: int) -> string = \"{n + missing}\"",
-        "let f: (n: int) -> string = \"{f(n) n}\"",
-        "let f: (n: int) -> string = \"{f(n + (1)}\"",
+        "let id: (n: int) -> int = n\nlet f: (n: int) -> str = \"{id(id(n + 1))}:{n}\\0\"",
+        "let f: (n: int) -> str = \"{n + missing}\"",
+        "let f: (n: int) -> str = \"{f(n) n}\"",
+        "let f: (n: int) -> str = \"{f(n + (1)}\"",
         "let f: (x: bool) -> bool = x and {let y: bool = x or false\n@println(y)\ny and x}\nlet main: () -> void = @println(f(true), false or f(false))",
         "let f: (x: bool) -> bool = if x {let y: bool = x or false\n@println(y)\ny} else if !x {true and x} else {false}\nlet main: () -> void = {if f(true) {@println(true)}\n}",
         "let f: () -> void = if false {missing} else {}",
@@ -3436,9 +3436,9 @@ fn testImportProgram(allocator: std.mem.Allocator) !Sema {
     const root = try comp.addSource("/app/main.nov",
         \\let std=@import("std")
         \\let Result=std.Result
-        \\let R=Result(string,string)
+        \\let R=Result(str,str)
         \\let prefix="WRONG"
-        \\let helper:()->string="WRONG"
+        \\let helper:()->str="WRONG"
         \\let main:()={let r:R=.ok["value"]
         \\    @println(r.unwrapOr("fallback"),r.label(),std.helper())}
     );
@@ -3447,13 +3447,13 @@ fn testImportProgram(allocator: std.mem.Allocator) !Sema {
         \\@[public]
         \\let Result=result.Result
         \\@[public]
-        \\let helper:()->string=result.helper()
+        \\let helper:()->str=result.helper()
         \\let main:()={}
     );
     const result = try comp.addSource("/lib/result.nov",
         \\let prefix="library:"
         \\@[public]
-        \\let helper:()->string="helper"
+        \\let helper:()->str="helper"
         \\@[public]
         \\let Result:(T:type,E:type)->type=union{ok:T,err:E,
         \\let Self=@This()
@@ -3461,7 +3461,7 @@ fn testImportProgram(allocator: std.mem.Allocator) !Sema {
         \\let unwrapOr:(self:Self,fallback:T)->T=match self{.ok=>|v|v
         \\.err=>fallback}
         \\@[public]
-        \\let label:(self:Self)->string=prefix+helper()
+        \\let label:(self:Self)->str=prefix+helper()
         \\}
     );
     try testImport(&comp, root, "std", entry, true);
@@ -3650,10 +3650,10 @@ test "compilation namespace aliases direct generic applications and repeated dia
         \\let left=@import("left.nov")
         \\let right=@import("right.nov")
         \\let ns=left
-        \\let A=ns.Result(bool,string)
-        \\let B=right.Result(bool,string)
-        \\let C=ns.types.Result(bool,string)
-        \\let main:()={let a:A=left.Result(bool,string).ok[true]
+        \\let A=ns.Result(bool,str)
+        \\let B=right.Result(bool,str)
+        \\let C=ns.types.Result(bool,str)
+        \\let main:()={let a:A=left.Result(bool,str).ok[true]
         \\    let b:B=a
         \\    let c:C=b
         \\    @println(c.get(false))}

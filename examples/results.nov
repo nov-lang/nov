@@ -1,7 +1,7 @@
 let std = @import("std")
 let Result = std.Result
 
-let checkedDouble: (value: uint) -> Result(uint, string) = {
+let checkedDouble: (value: uint) -> Result(uint, str) = {
     if value > 100 {
         .err["value exceeds 100"]
     } else {
@@ -9,7 +9,7 @@ let checkedDouble: (value: uint) -> Result(uint, string) = {
     }
 }
 
-let describe: (value: uint) -> Result(string, string) = {
+let describe: (value: uint) -> Result(str, str) = {
     let doubled = checkedDouble(value).!
     .ok["Doubled: {doubled}"]
 }

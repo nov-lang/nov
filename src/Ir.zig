@@ -2800,7 +2800,7 @@ fn testTypeFormattingOwnership(allocator: std.mem.Allocator) !void {
     try std.testing.expectEqual(formatter, ir.getTypeFormatting(record).?.formatter.?);
     try std.testing.expectEqual(@as(usize, 1), ir.formatting.items.len);
     try ir.verify();
-    try std.testing.expectError(error.InvalidTypeFormatting, ir.setTypeFormatting(string, "string", null));
+    try std.testing.expectError(error.InvalidTypeFormatting, ir.setTypeFormatting(string, "str", null));
     try std.testing.expectError(error.InvalidTypeFormatting, ir.setTypeFormatting(record, "", null));
     try std.testing.expectError(error.InvalidFunctionId, ir.setTypeFormatting(record, "Entry", @fromBackingInt(99)));
     ir.functions.items[@backingInt(formatter)].is_closure = true;

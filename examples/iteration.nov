@@ -5,7 +5,7 @@
 
 let Cell = struct {
     count: int,
-    label: string,
+    label: str,
 }
 let Row = struct {
     cell: Cell,

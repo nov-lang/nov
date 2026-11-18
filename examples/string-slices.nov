@@ -5,8 +5,8 @@
 ; Bounds and @len(text) count Unicode scalars, not UTF-8 bytes or grapheme clusters.
 ; Only native int bounds are accepted; negative bounds count from the scalar end.
 
-let middle: (text: string) -> string = text[1..-1]
-let owned_view: () -> string = {
+let middle: (text: str) -> str = text[1..-1]
+let owned_view: () -> str = {
     let payload = "é😀\0tail"
     let text = "prefix:{payload}:suffix"
     text[7..10]
@@ -118,7 +118,7 @@ let inclusive_bounds: () = {
 let retained_owner: () = {
     let view = owned_view()
     let nested = view[1..=-1]
-    let stored: []string = [view, nested]
+    let stored: []str = [view, nested]
     loop i in 0..2000 {
         let temporary = "allocation:{i}:é😀"
         @assert(@len(temporary) > 0)

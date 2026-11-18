@@ -9,12 +9,12 @@ let divide: (numerator: uint, denominator: uint) -> Option(uint) = {
     }
 }
 
-let describeDivision: (numerator: uint, denominator: uint) -> Option(string) = {
+let describeDivision: (numerator: uint, denominator: uint) -> Option(str) = {
     let quotient = divide(numerator, denominator).!
     .some["{quotient}"]
 }
 
-let fallback: () -> string = {
+let fallback: () -> str = {
     @println("Using fallback")
     "0"
 }

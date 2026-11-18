@@ -16,7 +16,7 @@ let Record = struct {
     value: int = 0,
 
     @[stringify]
-    let format: (value: Record) -> string = {
+    let format: (value: Record) -> str = {
         @panic("TypeOf converter executed")
     }
 }

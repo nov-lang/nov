@@ -282,7 +282,7 @@ fn resolveGraph(self: *Dependencies, module: *Module) std.mem.Allocator.Error!vo
 }
 
 test "global ascriptions skip types but never hide runtime dependencies" {
-    var module = try Module.init(std.testing.allocator, "as-globals.nov", "let n = @as(Count, @as(int, 1))\nlet yes = true\nlet text = @as(string, \"hé\")\nlet Count = int");
+    var module = try Module.init(std.testing.allocator, "as-globals.nov", "let n = @as(Count, @as(int, 1))\nlet yes = true\nlet text = @as(str, \"hé\")\nlet Count = int");
     defer module.deinit();
     var result = try analyze(&module);
     defer result.deinit();
