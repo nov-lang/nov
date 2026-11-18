@@ -60,6 +60,13 @@ results. See `examples/array-fields.nov`.
 
 ## Current delivered status
 
+Array `+` concatenation is implemented for exact matching element types, including
+all ordinary storable elements, contextual empty literals, generic callbacks,
+unevaluated `@TypeOf` and known-data global initializers. Operands evaluate once,
+left to right; recursive value copies remain independent. Existing append runtime
+allocates fresh backing; in-place capacity reuse remains deferred. See
+`examples/array-concat.nov` and `test-cli-array-concat`.
+
 Record fields now autodereference named references, including nested reads,
 writes/compounds, callable fields and `@clear(p.items)`. Pointee mutability governs
 writes; reference bindings need not be mutable. Explicit `.*` remains valid.
@@ -1396,7 +1403,7 @@ the current delivered contract above, with
 pointer-sized uint len/cap, native int negative indexing, independent copies at
 value boundaries, literals (including context-typed empty arrays),
 `@len(values)` element counts as native `uint`, mutable element replacement and
-self-safe `+=` append. Formatting now covers supported array annotations (including
+self-safe `+=` append and nonmutating `+` concatenation. Formatting now covers supported array annotations (including
 nested arrays), literals, indexing, `@len(value)` calls and direct
 indexed replacement and integer element `+=`, `-=`, `*=`, `/=`, `%=`, with
 token/comment/AST preservation and first-pass idempotence. Integer element compounds

@@ -3466,7 +3466,10 @@ const Context = struct {
                 },
                 .operand = try emitter.value(data.rhs),
             } },
-            .add, .sub, .mul, .div, .mod, .bit_and, .bit_or, .bit_xor, .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal => .{ .binary = .{
+            .add, .sub, .mul, .div, .mod, .bit_and, .bit_or, .bit_xor, .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal => if (tag == .add and self.ir.getType(ty).? == .array) .{ .array_append = .{
+                .lhs = try emitter.value(data.lhs),
+                .rhs = try emitter.value(data.rhs),
+            } } else .{ .binary = .{
                 .op = switch (tag) {
                     .add => .add,
                     .sub => .sub,
@@ -5161,14 +5164,21 @@ const Context = struct {
                 return if (self.terminated) (if (expected) |want| want.ty else merged) else merged;
             },
             .add, .sub, .mul, .div, .mod, .bit_and, .bit_or, .bit_xor => {
-                const integer_context = if (hint) |want| (if (self.ir.getType(want.ty).? == .integer or self.ir.getType(want.ty).? == .float) hint else null) else null;
-                const operand = (try self.probe(data.lhs, depth + 1)) orelse (try self.probe(data.rhs, depth + 1)) orelse integer_context orelse return self.missingOperandType(node, data.lhs, data.rhs, expected, depth);
+                const tag = ast.nodes.items(.tag)[node];
+                const operand_context = if (hint) |want| (if (self.ir.getType(want.ty).? == .integer or self.ir.getType(want.ty).? == .float or
+                    (tag == .add and self.ir.getType(want.ty).? == .array)) hint else null) else null;
+                const operand = (try self.probe(data.lhs, depth + 1)) orelse (try self.probe(data.rhs, depth + 1)) orelse operand_context orelse return self.missingOperandType(node, data.lhs, data.rhs, expected, depth);
                 if (self.ir.getType(operand.ty).? != .integer and !(self.ir.getType(operand.ty).? == .float and switch (ast.nodes.items(.tag)[node]) {
                     .add, .sub, .mul, .div => true,
                     else => false,
-                }) and !(self.ir.getType(operand.ty).? == .string and ast.nodes.items(.tag)[node] == .add)) return self.fail(.operator_not_supported, node, operand.annotation);
+                }) and !((self.ir.getType(operand.ty).? == .string or self.ir.getType(operand.ty).? == .array) and tag == .add)) return self.fail(.operator_not_supported, node, operand.annotation);
+                // The left read must detach recursively before any RHS effects.
+                // Append copies the RHS itself; only its final read is projected.
                 const lhs = try self.expression(data.lhs, operand, depth + 1);
-                const rhs = try self.expression(data.rhs, operand, depth + 1);
+                const rhs = if (tag == .add and self.ir.getType(operand.ty).? == .array)
+                    try self.projection(data.rhs, operand, depth + 1)
+                else
+                    try self.expression(data.rhs, operand, depth + 1);
                 if (lhs == null or rhs == null) return null;
                 return self.fit(operand.ty, expected, node);
             },
@@ -8695,6 +8705,112 @@ test "strings reject byte mutation ordering and inexact operands" {
         var module = try Module.init(std.testing.allocator, "unsupported-string.nov", source);
         defer module.deinit();
         if (module.hasErrors()) continue;
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        try std.testing.expect(module.hasErrors());
+        try std.testing.expect(!sema.lowering_complete);
+    }
+}
+
+fn testArrayConcatenation(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "array-concatenation.nov",
+        \\let R=struct{items:[]int,}
+        \\let U=union{some:[]int,none,}
+        \\let left:()->[][]int=[[1]]
+        \\let right:()->[][]int=[[2]]
+        \\let calls:()->[][]int=left()+right()
+        \\let fields:(r:R)->[]int=r.items+{r.items}
+        \\let refs:(p:&mut [][]int)->[][]int=p.*+{p.*=[[9]]
+        \\p.*}
+        \\let query:(p:&mut [][]int)->int={let x:@TypeOf(p.*+{p.*=[[8]]
+        \\p.*})=[]
+        \\0}
+        \\let main:()={let a:[]u8=[]+[]
+        \\let b=[]+[1]+[]
+        \\let c=[1]+[2.5]
+        \\let d:[][]int=[[]]+[[1]]
+        \\let e:[]R=[.[items=[1]]]+[]
+        \\let f:[]U=[.some[[1]]]+[.none[]]
+        \\let g:[]()->int=[()->int{1}]+[]
+        \\let h:[]@TypeOf(0..1)=[0..1]+[]
+        \\}
+    );
+    defer module.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
+    var sema = try Lowering.lower(&module);
+    defer sema.deinit();
+
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(sema.lowering_complete);
+    try sema.ir.verify();
+    var appends: usize = 0;
+    for (sema.ir.functions.items) |function| {
+        const instructions = function.body.?.instructions;
+        for (instructions, 0..) |instruction, i| {
+            if (instruction.op != .array_append) continue;
+            appends += 1;
+            const append = instruction.op.array_append;
+            try std.testing.expect(@backingInt(append.lhs) < @backingInt(append.rhs));
+            try std.testing.expect(@backingInt(append.rhs) < i);
+            try std.testing.expectEqual(instruction.ty, instructions[@backingInt(append.lhs)].ty);
+            try std.testing.expectEqual(instruction.ty, instructions[@backingInt(append.rhs)].ty);
+        }
+        if (std.mem.eql(u8, function.name, "calls")) {
+            var calls: usize = 0;
+            for (instructions) |instruction| {
+                if (instruction.op == .call) calls += 1;
+            }
+            try std.testing.expectEqual(@as(usize, 2), calls);
+        }
+        if (std.mem.eql(u8, function.name, "refs")) {
+            var snapshot: ?usize = null;
+            var store: ?usize = null;
+            for (instructions, 0..) |instruction, i| switch (instruction.op) {
+                .array_clone => if (snapshot == null) {
+                    snapshot = i;
+                },
+                .borrow_store => store = i,
+                .array_append => |append| {
+                    try std.testing.expect(snapshot.? < store.?);
+                    try std.testing.expectEqual(snapshot.?, @as(usize, @backingInt(append.lhs)));
+                },
+                else => {},
+            };
+        }
+        if (std.mem.eql(u8, function.name, "query")) {
+            for (instructions) |instruction| switch (instruction.op) {
+                .array_append, .array_clone, .borrow_store, .borrow_read => return error.UnexpectedQueryEffect,
+                else => {},
+            };
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 12), appends);
+}
+
+test "array concatenation exact contexts snapshots queries and allocation failures" {
+    try testArrayConcatenation(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testArrayConcatenation, .{});
+}
+
+test "array concatenation rejects unresolved inexact and unsupported operands" {
+    for ([_][]const u8{
+        "let f:()={let a=[]+[]\n}",
+        "let f:(a:[]u8,b:[]u16)->[]u8=a+b",
+        "let f:(a:[]int)->[]int=a+1",
+        "let f:(a:[]int)->[]int=1+a",
+        "let f:(a:[]int)->[]int=a+\"x\"",
+        "let f:(a:[]int)->int=a+a",
+        "let f:(a:[]int)->[]int=a-[1]",
+        "let f:(a:[]int)->[]int=a*[1]",
+        "let f:()->[]u8=[]+[256]",
+        "let A=struct{n:int,}\nlet B=struct{n:int,}\nlet f:(a:[]A,b:[]B)->[]A=a+b",
+        "let f:(p:&[]int)->[]int=p+[]",
+        "let f:(a:[]int)->int={let x:@TypeOf(a+[true])=[]\n0}",
+    }) |source| {
+        var module = try Module.init(std.testing.allocator, "bad-array-concatenation.nov", source);
+        defer module.deinit();
+        try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
         var sema = try Lowering.lower(&module);
         defer sema.deinit();
         try std.testing.expect(module.hasErrors());

@@ -138,6 +138,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const language_tests = b.step("test-cli-language-tests", "Run test command and assertion language CLI tests");
     addLanguageTestCliTests(b, exe, language_tests);
     test_step.dependOn(language_tests);
+    const concat_tests = b.step("test-cli-array-concat", "Run array concatenation CLI tests");
+    addArrayConcatCliTests(b, exe, concat_tests);
+    test_step.dependOn(concat_tests);
     const clear_tests = b.step("test-cli-clear", "Run array clear CLI tests");
     addClearCliTests(b, exe, clear_tests);
     test_step.dependOn(clear_tests);
@@ -1326,6 +1329,62 @@ fn addClosureCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *s
         run.expectStdOutEqual("");
         run.expectStdErrMatch(case.diagnostic);
         test_step.dependOn(&run.step);
+    }
+}
+
+fn addArrayConcatCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    const fixtures = b.addWriteFiles();
+    _ = fixtures.add("array-concat.nov", @embedFile("examples/array-concat.nov"));
+    const check = b.addRunArtifact(exe);
+    check.setCwd(fixtures.getDirectory());
+    check.addArgs(&.{ "check", "--semantic", "array-concat.nov" });
+    check.expectExitCode(0);
+    check.expectStdOutEqual("");
+    check.expectStdErrEqual("");
+    test_step.dependOn(&check.step);
+    const fmt = b.addRunArtifact(exe);
+    fmt.setCwd(fixtures.getDirectory());
+    fmt.addArgs(&.{ "fmt", "--check", "array-concat.nov" });
+    fmt.expectExitCode(0);
+    fmt.expectStdOutEqual("");
+    fmt.expectStdErrEqual("");
+    test_step.dependOn(&fmt.step);
+    for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+        for ([_][]const u8{ "run", "test" }) |command| {
+            const run = b.addRunArtifact(exe);
+            run.setCwd(fixtures.getDirectory());
+            run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+            run.setEnvironmentVariable("NOV_CC", "");
+            run.setEnvironmentVariable("CC", "");
+            run.addArgs(&.{ command, "array-concat.nov" });
+            if (mode.len != 0) run.addArg(mode);
+            run.expectExitCode(0);
+            run.expectStdOutEqual(if (std.mem.eql(u8, command, "run"))
+                "Combined: [Ada, Grace, Linus]\nNumbers: [1, 2, 3]\n"
+            else
+                "PASS empty_chained_and_contextual_arrays\nPASS nested_storage_is_independent\nPASS storable_element_types\nPASS operands_snapshot_before_later_effects\nPASS generics_callbacks_and_unevaluated_queries\n5 passed; 0 failed; 5 total\n");
+            run.expectStdErrEqual("");
+            test_step.dependOn(&run.step);
+        }
+    }
+    for ([_][]const u8{
+        "let f:(a:[]u8,b:[]u16)->[]u8=a+b\nlet main:()={}",
+        "let f:(a:[]int)->[]int=a+1\nlet main:()={}",
+        "let f:()={let a=[]+[]\n}\nlet main:()={}",
+        "let f:(a:[]int)={let q:@TypeOf(a+[true])=[]\n}\nlet main:()={}",
+        "let mut a=[1]\nlet bad=a+[2]\nlet main:()={}",
+    }, 0..) |source, i| {
+        const path = b.fmt("bad-concat-{d}.nov", .{i});
+        _ = fixtures.add(path, source);
+        for ([_]bool{ false, true }) |emit| {
+            const reject = b.addRunArtifact(exe);
+            reject.setCwd(fixtures.getDirectory());
+            reject.addArgs(if (emit) &.{ "emit-c", path } else &.{ "check", "--semantic", path });
+            reject.expectExitCode(1);
+            reject.expectStdOutEqual("");
+            reject.expectStdErrMatch("error:");
+            test_step.dependOn(&reject.step);
+        }
     }
 }
 

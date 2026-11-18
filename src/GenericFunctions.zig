@@ -915,6 +915,34 @@ test "integer defaults generic argument fallback and pipes roll back under OOM" 
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testIntegerDefaultInference, .{});
 }
 
+fn testArrayConcatenationInference(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "array-concatenation-inference.nov",
+        \\let concat:(a:[]`T,b:[]`T)->[]`T=a+b
+        \\let inferred:(a:`T,b:`T)->`U=a+b
+        \\let apply:(f:([]`T,[]`T)->[]`T,a:[]`T,b:[]`T)->[]`T=f(a,b)
+        \\let main:()={let a:[]u8=concat([],[1])
+        \\let b=inferred([true],[])
+        \\let c=apply((x,y){x+y},["a"],["b"])
+        \\let join:([]int,[]int)->[]int=concat
+        \\let d=join([1],[2])
+        \\let e:@TypeOf(a+{a})=[]
+        \\let f:@TypeOf([]+[1])=[]
+        \\let g:[]u16=[]+[1]+[2]
+        \\@println(a,b,c,d,e,f,g)}
+    );
+    defer module.deinit();
+    var result = try Lowering.lower(&module);
+    defer result.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(result.lowering_complete);
+    try result.ir.verify();
+}
+
+test "array concatenation generic callback inference and queries under OOM" {
+    try testArrayConcatenationInference(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testArrayConcatenationInference, .{});
+}
+
 fn testLenBuiltinInference(allocator: std.mem.Allocator) !void {
     var module = try Module.init(allocator, "len-inference.nov",
         \\let length:(xs:[]`T)->uint=@len(xs)
@@ -1708,6 +1736,7 @@ const Solver = struct {
         }
         for (self.query_operations.items) |operation| {
             const operand = root(operation.operand);
+            if (operand.value == .array and (operation.tag == .add or operation.tag == .assign_add)) continue;
             if (operand.value != .known) {
                 try self.fail(.operator_not_supported, operation.span, null);
                 continue;

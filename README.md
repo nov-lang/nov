@@ -2075,6 +2075,15 @@ let main: () -> void = {
   `-1` denoting the last element and `-len` the first. Every out-of-bounds access
   (including empty arrays and minimum native `int`) panics with
   `panic: array index out of bounds`, exit 1, identically in debug and release.
+- `left + right` concatenates arrays of the same exact element type into an
+  independent value, without mutating either operand. Nested array storage is
+  independent recursively; immutable strings and closure environments keep their
+  usual sharing rules. Operands evaluate once, left to right, with the left value
+  snapshotted before RHS effects. Empty literals use sibling/result context:
+  `let bytes: []u8 = [] + [1] + [2]`. Two untyped empty arrays remain ambiguous.
+  Generic functions, callbacks, `@TypeOf` and data-only global initializers support
+  the operator. It uses the existing allocating append implementation, not in-place
+  capacity reuse. See [`examples/array-concat.nov`](examples/array-concat.nov).
 - Plain `values[index] = element`, integer element `+=`, `-=`, `*=`, `/=`, `%=`
   and `values += other_array` require a mutable local base (a direct array local or
   a supported nested struct field path).
@@ -2161,8 +2170,8 @@ let main: () -> void = {
 - Retaining capacity does not yet make `+=` reuse it: append still allocates fresh
   backing. Truncation, capacity APIs and initialization on length growth remain
   deferred. `@len(values)` is not assignable; `values = []` rebinds a mutable array
-  to an empty value rather than retaining its buffer. No array equality, concatenation
-  with `+`, slices, pointer elements, general aliases,
+  to an empty value rather than retaining its buffer. No array equality,
+  slices, pointer elements, general aliases,
   or capacity API is delivered. Array globals support data-only initialization. Bounded value/reference iteration is
   supported (see [Loop](#loop)). The formatter supports
   the array syntax described above without extending these semantics.
@@ -3222,7 +3231,7 @@ nov run examples/fibo.nov --release # 55
 |-----------------------|--------------------|----------------------------------------------|---------------------------------------------------------------------|
 | Assignment            | a = b              | All types                                    | `a` is an identifier and `b` is an expression.                      |
 | Addition              | a + b <br> a += b  | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                                |
-| Concatenation         | a + b <br> a += b  | string <br> [Arrays](#Arrays)                | Strings: `+`/`+=`; arrays: `+=` only                          |
+| Concatenation         | a + b <br> a += b  | string <br> [Arrays](#Arrays)                | Strings and arrays: `+`/`+=`                          |
 | Substraction          | a - b <br> a -= b  | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                                |
 | Negation              | -a                 | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                                |
 | Multiplication        | a * b <br> a \*= b | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                                |

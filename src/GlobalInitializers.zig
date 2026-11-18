@@ -6,6 +6,7 @@ const Ir = @import("Ir.zig");
 const Dependencies = @import("Dependencies.zig");
 const BodyChecker = @import("BodyChecker.zig");
 const Lowering = @import("Lowering.zig");
+const TestAllocations = @import("TestAllocations.zig");
 
 test "len builtin global known data folds Unicode scalars including NUL" {
     var module = try Module.init(std.testing.allocator, "global-len.nov",
@@ -34,6 +35,38 @@ test "len builtin global known data folds Unicode scalars including NUL" {
         }
     }
     try std.testing.expectEqual(@as(usize, 2), lengths);
+}
+
+fn testArrayConcatenationData(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "global-array-concat.nov",
+        \\let rows=first+[[2]]
+        \\let first=[[1]]
+        \\let count=@len(rows)
+        \\let empty:[]u8=[]+[]
+        \\let main:()={@assert(count==2 and rows[0][0]==1 and rows[1][0]==2)}
+    );
+    defer module.deinit();
+    var result = try Lowering.lower(&module);
+    defer result.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(result.lowering_complete);
+    try result.ir.verify();
+    var counts: usize = 0;
+    for (result.ir.globals.items) |global| {
+        if (!std.mem.eql(u8, global.name, "count")) continue;
+        const body = result.ir.getFunction(global.initializer).?.body.?;
+        const instruction = body.instructions[@backingInt(body.result)];
+        try std.testing.expect(instruction.op == .constant);
+        const value = result.ir.getConstant(instruction.op.constant).?.value;
+        try std.testing.expect(value == .unsigned_integer and value.unsigned_integer == 2);
+        counts += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), counts);
+}
+
+test "array concatenation validates global known data and folds lengths under OOM" {
+    try testArrayConcatenationData(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testArrayConcatenationData, .{});
 }
 
 const Ref = struct { module: *Module, id: Module.DeclId };
@@ -299,6 +332,16 @@ const Evaluator = struct {
             .global_slot => |id| return self.globals[@backingInt(id)] orelse error.InvalidData,
             .local_load, .array_clone => |id| return self.get(id),
             .record_init, .array_literal => |ids| return self.aggregate(ids),
+            .array_append => |append| {
+                const lhs = self.get(append.lhs);
+                const rhs = self.get(append.rhs);
+                if (lhs != .aggregate or rhs != .aggregate) return error.InvalidData;
+                const len = std.math.add(usize, lhs.aggregate.len, rhs.aggregate.len) catch return error.InvalidData;
+                const data = try self.allocator.alloc(Data, len);
+                @memcpy(data[0..lhs.aggregate.len], lhs.aggregate);
+                @memcpy(data[lhs.aggregate.len..], rhs.aggregate);
+                return .{ .aggregate = data };
+            },
             .field_read => |read| {
                 const base = self.get(read.base);
                 if (base != .aggregate or read.index >= base.aggregate.len) return error.InvalidData;

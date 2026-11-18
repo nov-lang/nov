@@ -9411,6 +9411,93 @@ fn arrayTestProgram(source: []const u8) ![]u8 {
     return collectingTestProgram(library);
 }
 
+fn arrayConcatenationTestProgram(source: []const u8) ![]u8 {
+    var lowered = blk: {
+        var module = try Module.init(test_gpa, "array-concat.nov", source);
+        defer module.deinit();
+        var result = try Lowering.lower(&module);
+        errdefer result.deinit();
+        if (module.hasErrors()) {
+            for (module.source.ast.errors) |err| std.debug.print("concat parse: {any}\n", .{err});
+            for (module.diagnostics.items) |err| std.debug.print("{s}: {s}\n", .{ @tagName(err.tag), module.sourceSlice(err.span) orelse "<invalid span>" });
+        }
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expect(result.lowering_complete);
+        break :blk result;
+    };
+    defer lowered.deinit();
+    try lowered.ir.verify();
+    const library = try emit(test_gpa, &lowered.ir, null);
+    defer test_gpa.free(library);
+    return collectingTestProgram(library);
+}
+
+test "array concatenation source free recursive copies operand effects and queries forced GC O0 O3" {
+    const program = try arrayConcatenationTestProgram(
+        \\let R=struct{items:[]string,}
+        \\let U=union{row:R,none,}
+        \\let concat:(a:[]`T,b:[]`T)->[]`T=a+b
+        \\let stop:()->int={let ignored:[]int={return 7}+{@panic("RHS executed")}
+        \\}
+        \\let main:()={let mut a=[R.[items=["a"+"b"]]]
+        \\let mut b=[R.[items=["c"+"d"]]]
+        \\let mut events=0
+        \\let left=()->[]R{events=events*10+1
+        \\a}
+        \\let right=()->[]R{events=events*10+2
+        \\a=[R.[items=["changed"]]]
+        \\b}
+        \\let result=left()+right()
+        \\@clear(b)
+        \\@assert(events==12 and result[0].items[0]=="ab" and result[1].items[0]=="cd")
+        \\let mut rows=[[1]]
+        \\let p=&rows
+        \\let referenced=p.*+{p.*=[[9]]
+        \\p.*}
+        \\@assert(referenced[0][0]==1 and referenced[1][0]==9)
+        \\let doubled=referenced+referenced
+        \\@assert(doubled[0][0]==1 and doubled[3][0]==9)
+        \\let unions:[]U=[.row[result[0]]]+[.none[]]
+        \\let copied=unions+[]
+        \\@assert(match copied[0]{.row=>|r| r.items[0]=="ab"
+        \\.none=>false})
+        \\let count=(){events+=1
+        \\events}
+        \\let callbacks=[count]+[count]
+        \\@assert(callbacks[0]()==13 and callbacks[1]()==14)
+        \\let ranges=[0..2]+[2..3]
+        \\@assert(@len(ranges[0])==2 and @len(ranges[1])==1)
+        \\let query:@TypeOf(result+{events=99
+        \\result})=[]
+        \\let typed:[]u8=concat([],[7])+[]
+        \\@assert(events==14 and @len(query)==0 and typed[0]==7 and stop()==7)}
+    );
+    defer test_gpa.free(program);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(program, "typedef int nonempty_translation_unit;", 0, "", "", mode);
+}
+
+test "array concatenation compiler emitter allocation failures" {
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testArrayEmissionAllocationFailures, .{
+        "let concat:(a:[]`T,b:[]`T)->[]`T=a+b\nlet main:()={let a=[[1]]\nlet b=concat(a,[[2]])\n@assert(b[0][0]==1 and b[1][0]==2)}",
+    });
+}
+
+test "array concatenation runtime allocation failures preserve panic policy O0 O3" {
+    const program = try arrayConcatenationTestProgram("let main:()={let result=[1]+[2]\n@assert(result[0]==1 and result[1]==2)}");
+    defer test_gpa.free(program);
+    for (0..4) |budget| {
+        const prefix = try std.fmt.allocPrint(test_gpa, "#include <stdlib.h>\nstatic unsigned allocations;\n" ++
+            "static void *test_malloc(size_t n) {{ if (allocations == {d}) return NULL; ++allocations; return malloc(n); }}\n" ++
+            "#define NOV_GC_MALLOC test_malloc\n#define NOV_GC_FREE free\n", .{budget});
+        defer test_gpa.free(prefix);
+        const counted = try std.mem.concat(test_gpa, u8, &.{ prefix, program });
+        defer test_gpa.free(counted);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode|
+            try compileAndRunMode(counted, "typedef int nonempty_translation_unit;", if (budget == 3) 0 else 1, "", if (budget == 3) "" else "panic: GC allocation failed\n", mode);
+    }
+}
+
 fn collectingTestProgram(library: []const u8) ![]u8 {
     return std.mem.concat(test_gpa, u8, &.{
         library,
