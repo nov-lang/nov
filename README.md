@@ -671,8 +671,21 @@ still compile and report `0 passed; 0 failed; 0 total`.
 `--cc`, `--debug`, `--release` and `--lib-dir` use the same compiler and installed-
 stdlib rules as build/run; default C optimization is `-O3`. Processes run sequentially,
 inherit the environment and share the filesystem; this is memory isolation, not a
-sandbox. There is no default timeout or test-filter option in this initial runner.
-Temporary generated files/executables are removed on normal completion and errors.
+sandbox. Temporary generated files/executables are removed on completion and errors.
+
+- `--filter <text>` selects test names containing the case-sensitive substring,
+  retaining source order. An empty filter selects all; no matches is an empty suite.
+  Unselected test signatures/bodies and their semantic demands are ignored, but
+  syntax and attribute errors still diagnose.
+- `--timeout-ms <milliseconds>` sets a positive per-test execution limit (maximum
+  4294967295). A timed-out child is killed and reaped, reported as failed, and the
+  remaining tests continue. Timing uses a monotonic clock with polling up to 10 ms;
+  the limit excludes C compilation and does not manage descendant processes.
+  There is no timeout by default. Both options are test-only.
+
+```sh
+nov test examples/tests.nov --filter array --timeout-ms 20000
+```
 
 [`examples/tests.nov`](examples/tests.nov) covers arithmetic, independent array
 copies and standard-library Option, with commands in its opening comments.

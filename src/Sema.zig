@@ -69,7 +69,7 @@ fn analyzeModuleAnnotations(result: *Sema, module: *Module) Error!void {
         result.entries[result.entryIndex(module, @fromBackingInt(@intCast(i)))] = .{};
     };
     for (module.declarations.items, 0..) |declaration, i| {
-        if (declaration.is_test and !module.testEnabled()) {
+        if (declaration.is_test and !module.testSelected(declaration.name)) {
             result.entries[result.entryIndex(module, @fromBackingInt(@intCast(i)))].status = .ignored;
             continue;
         }
@@ -90,7 +90,7 @@ fn analyzeModuleAnnotations(result: *Sema, module: *Module) Error!void {
     while (i < module.declarations.items.len) : (i += 1) {
         try result.syncEntries(module);
         const declaration = module.declarations.items[i];
-        if (declaration.concrete_type != null or (declaration.is_test and !module.testEnabled())) continue;
+        if (declaration.concrete_type != null or (declaration.is_test and !module.testSelected(declaration.name))) continue;
         const full = module.source.ast.decl(declaration.node);
         const function = if (!full.ast.is_mutable) module.source.ast.declFunction(declaration.node) else null;
         const type_node = if (function) |f| f.proto_node else full.ast.type_node;
@@ -435,7 +435,7 @@ pub fn requestType(self: *Sema, module: *Module, id: Module.DeclId) Ir.BuildErro
     const index = @backingInt(id);
     if (self.entryIndex(module, id) >= self.entries.len) return error.InvalidTypeId;
     const declaration = module.getDeclaration(id).?;
-    if (declaration.is_test and !module.testEnabled()) {
+    if (declaration.is_test and !module.testSelected(declaration.name)) {
         try module.diagnostics.append(module.allocator, .{ .tag = .test_not_callable, .span = declaration.name_span });
         return null;
     }

@@ -135,6 +135,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const extern_tests = b.step("test-cli-extern", "Run extern CLI and separate-TU C ABI tests");
     addExternCliTests(b, exe, extern_tests);
     test_step.dependOn(extern_tests);
+    const test_selection_tests = b.step("test-cli-test-selection", "Run test filtering and timeout CLI tests");
+    addTestSelectionCliTests(b, exe, test_selection_tests);
+    test_step.dependOn(test_selection_tests);
     const language_tests = b.step("test-cli-language-tests", "Run test command and assertion language CLI tests");
     addLanguageTestCliTests(b, exe, language_tests);
     test_step.dependOn(language_tests);
@@ -1944,6 +1947,65 @@ fn addRuneCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.
             run.expectStdErrEqual(case.diagnostic);
             test_step.dependOn(&run.step);
         }
+    }
+}
+
+fn addTestSelectionCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    const fixtures = b.addWriteFiles();
+    _ = fixtures.add("filtered.nov",
+        \\@[test]
+        \\let ignored:(value:Missing)=unknown
+        \\@[test]
+        \\let alpha_fast:()=@println("A")
+        \\@[test]
+        \\let beta_fast:()=@println("B")
+        \\
+    );
+    _ = fixtures.add("timeout.nov", "@[test]\nlet hang:()=loop{}\n@[test]\nlet fast:()=@println(\"fast\")\n");
+    _ = fixtures.add("syntax.nov", "@[test]\nlet ignored:()={let =}\n");
+    for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+        for ([_]struct { path: []const u8, args: []const []const u8, output: []const u8, code: u8 = 0 }{
+            .{ .path = "filtered.nov", .args = &.{ "--filter", "fast", "--timeout-ms", "1000" }, .output = "A\nPASS alpha_fast\nB\nPASS beta_fast\n2 passed; 0 failed; 2 total\n" },
+            .{ .path = "filtered.nov", .args = &.{ "--filter", "ALPHA" }, .output = "0 passed; 0 failed; 0 total\n" },
+            .{ .path = "timeout.nov", .args = &.{ "--filter", "fast" }, .output = "fast\nPASS fast\n1 passed; 0 failed; 1 total\n" },
+            .{ .path = "timeout.nov", .args = &.{ "--timeout-ms", "250" }, .output = "FAIL hang (timeout after 250 ms)\nfast\nPASS fast\n1 passed; 1 failed; 2 total\n", .code = 1 },
+        }) |case| {
+            const run = b.addRunArtifact(exe);
+            run.setCwd(fixtures.getDirectory());
+            run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+            run.setEnvironmentVariable("NOV_CC", "");
+            run.setEnvironmentVariable("CC", "");
+            run.addArgs(&.{ "test", case.path });
+            run.addArgs(case.args);
+            if (mode.len != 0) run.addArg(mode);
+            run.expectExitCode(case.code);
+            run.expectStdOutEqual(case.output);
+            run.expectStdErrEqual("");
+            test_step.dependOn(&run.step);
+        }
+    }
+    for ([_]struct { args: []const []const u8, diagnostic: []const u8 }{
+        .{ .args = &.{ "test", "filtered.nov", "--filter", "ignored" }, .diagnostic = "error:" },
+        .{ .args = &.{ "test", "syntax.nov", "--filter", "not-present" }, .diagnostic = "error:" },
+        .{ .args = &.{ "run", "timeout.nov", "--filter", "fast" }, .diagnostic = "--filter requires the test command" },
+        .{ .args = &.{ "check", "timeout.nov", "--timeout-ms", "100" }, .diagnostic = "--timeout-ms requires the test command" },
+    }) |case| {
+        const reject = b.addRunArtifact(exe);
+        reject.setCwd(fixtures.getDirectory());
+        reject.addArgs(case.args);
+        reject.expectExitCode(1);
+        reject.expectStdOutEqual("");
+        reject.expectStdErrMatch(case.diagnostic);
+        test_step.dependOn(&reject.step);
+    }
+    for ([_][]const u8{ "", "0", "-1", "1.5", "4294967296" }) |raw| {
+        const reject = b.addRunArtifact(exe);
+        reject.setCwd(fixtures.getDirectory());
+        reject.addArgs(&.{ "test", "timeout.nov", "--timeout-ms", raw });
+        reject.expectExitCode(1);
+        reject.expectStdOutEqual("");
+        reject.expectStdErrMatch("--timeout-ms requires a positive decimal integer");
+        test_step.dependOn(&reject.step);
     }
 }
 

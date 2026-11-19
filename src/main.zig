@@ -40,6 +40,8 @@ const params = clap.parseParamsComptime(
     \\--debug                Compile with -O0 -g (build/run/test only).
     \\--release              Compile with -O3 (default; build/run/test only).
     \\--cc <str>             C compiler executable (build/run/test only).
+    \\--filter <str>         Run tests whose names contain this text (test only).
+    \\--timeout-ms <str>     Positive per-test execution timeout in milliseconds (test only).
     \\-o, --output <str>      Output executable path (build only).
     \\<arg>...
     \\
@@ -53,7 +55,7 @@ fn usage(writer: *std.Io.Writer) !void {
         \\       nov emit-c [--library] <file>
         \\       nov [build] <file> [-o|--output <path>] [--cc <executable>] [--debug|--release]
         \\       nov run <file> [--cc <executable>] [--debug|--release]
-        \\       nov test <file> [--cc <executable>] [--debug|--release] [--lib-dir <path>]
+        \\       nov test <file> [--filter <text>] [--timeout-ms <milliseconds>] [--cc <executable>] [--debug|--release] [--lib-dir <path>]
         \\
         \\Check syntax, or the bounded semantic subset with --semantic.
         \\Semantic commands accept --lib-dir; the default is executable-relative ../lib/nov.
@@ -120,6 +122,18 @@ pub fn main(init: std.process.Init) !u8 {
         try stderr.writeAll("error: --debug and --release require the build, run, or test command\n");
         return 1;
     }
+    if (res.args.filter != null and !is_test) {
+        try stderr.writeAll("error: --filter requires the test command\n");
+        return 1;
+    }
+    if (res.args.@"timeout-ms" != null and !is_test) {
+        try stderr.writeAll("error: --timeout-ms requires the test command\n");
+        return 1;
+    }
+    const timeout_ms: ?u32 = if (res.args.@"timeout-ms") |raw| TestRunner.parseTimeout(raw) catch {
+        try stderr.writeAll("error: --timeout-ms requires a positive decimal integer no greater than 4294967295\n");
+        return 1;
+    } else null;
     const mode: Driver.Mode = if (res.args.debug != 0) .debug else .release;
     if (res.args.cc != null and !is_build and !is_run and !is_test) {
         try stderr.writeAll("error: --cc requires the build, run, or test command\n");
@@ -178,7 +192,7 @@ pub fn main(init: std.process.Init) !u8 {
         var buffer: [4096]u8 = undefined;
         var stdout = std.Io.File.stdout().writer(init.io, &buffer);
         defer stdout.interface.flush() catch {};
-        return testFile(init.io, init.gpa, init.environ_map, args[1], res.args.cc, mode, res.args.@"lib-dir", &stdout.interface, stderr) catch |err| {
+        return testFile(init.io, init.gpa, init.environ_map, args[1], res.args.cc, mode, res.args.@"lib-dir", res.args.filter, timeout_ms, &stdout.interface, stderr) catch |err| {
             try stderr.print("{s}: error: {s}\n", .{ args[1], @errorName(err) });
             return 1;
         };
@@ -344,10 +358,12 @@ fn processFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, stder
     return true;
 }
 
-fn testFile(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Environ.Map, path: []const u8, cc: ?[]const u8, mode: Driver.Mode, lib_dir: ?[]const u8, stdout: *std.Io.Writer, stderr: *std.Io.Writer) !u8 {
+fn testFile(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Environ.Map, path: []const u8, cc: ?[]const u8, mode: Driver.Mode, lib_dir: ?[]const u8, filter: ?[]const u8, timeout_ms: ?u32, stdout: *std.Io.Writer, stderr: *std.Io.Writer) !u8 {
     var compilation = try loadCompilation(io, allocator, path, lib_dir);
     defer compilation.deinit();
     return TestRunner.run(io, allocator, &compilation, .{
+        .filter = filter,
+        .timeout_ms = timeout_ms,
         .discovery = .{ .cc = cc, .nov_cc = env.get("NOV_CC"), .env_cc = env.get("CC"), .mode = mode },
         .temp_root = env.get("TMPDIR") orelse env.get("TEMP") orelse (if (builtin.os.tag == .windows) "." else "/tmp"),
     }, stdout, stderr);

@@ -9,8 +9,24 @@ const Ir = @import("Ir.zig");
 
 pub const Options = struct {
     discovery: Driver.Discovery = .{},
+    filter: ?[]const u8 = null,
+    timeout_ms: ?u32 = null,
     temp_root: []const u8 = if (builtin.os.tag == .windows) "." else "/tmp",
 };
+
+pub fn parseTimeout(raw: []const u8) error{InvalidTimeout}!u32 {
+    if (raw.len == 0) return error.InvalidTimeout;
+    for (raw) |byte| if (byte < '0' or byte > '9') return error.InvalidTimeout;
+    const milliseconds = std.fmt.parseInt(u32, raw, 10) catch return error.InvalidTimeout;
+    return if (milliseconds == 0) error.InvalidTimeout else milliseconds;
+}
+
+test "TestRunner timeout parsing accepts only positive bounded decimal milliseconds" {
+    try std.testing.expectEqual(@as(u32, 1), try parseTimeout("001"));
+    try std.testing.expectEqual(@as(u32, 4294967295), try parseTimeout("4294967295"));
+    for ([_][]const u8{ "", "0", "00", "-1", "+1", "1.5", " 1", "1 ", "1_000", "4294967296", "999999999999999999999" }) |raw|
+        try std.testing.expectError(error.InvalidTimeout, parseTimeout(raw));
+}
 
 /// Compile once, then run each root-source test in its own process. Child output
 /// is inherited; process isolation does not isolate filesystem side effects.
@@ -20,9 +36,15 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, comp: *Compilation, options
         return 1;
     }
     const root = comp.getModule(comp.root orelse return error.MissingRoot).?;
+    if (options.timeout_ms == 0) return error.InvalidTimeout;
     const previous_mode = root.tests_enabled;
+    const previous_filter = root.test_filter;
     root.tests_enabled = true;
-    defer root.tests_enabled = previous_mode;
+    root.test_filter = options.filter;
+    defer {
+        root.tests_enabled = previous_mode;
+        root.test_filter = previous_filter;
+    }
     var result = try Lowering.lowerCompilation(comp);
     defer result.deinit();
     if (comp.hasErrors()) {
@@ -35,7 +57,7 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, comp: *Compilation, options
     // Module declarations retain source order; global IDs may include imports
     // and demand-created declarations and must not determine report order.
     for (root.declarations.items, 0..) |declaration, local| {
-        if (!declaration.is_test) continue;
+        if (!declaration.is_test or !root.testSelected(declaration.name)) continue;
         const id = comp.declaration_ids.get(.{ .source = root.source.id, .local = @fromBackingInt(@intCast(local)) }).?;
         const entry = result.getCompilationEntry(id).?;
         try tests.append(allocator, entry.function orelse return error.MissingTestFunction);
@@ -72,8 +94,11 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, comp: *Compilation, options
             continue;
         };
         defer child.kill(io);
-        const term = child.wait(io) catch |err| {
-            try report.print("FAIL {s} (cannot wait: {s})\n", .{ name, @errorName(err) });
+        const term = waitForTest(io, &child, options.timeout_ms) catch |err| {
+            child.kill(io);
+            if (err == error.TestTimedOut) {
+                try report.print("FAIL {s} (timeout after {d} ms)\n", .{ name, options.timeout_ms.? });
+            } else try report.print("FAIL {s} (cannot wait: {s})\n", .{ name, @errorName(err) });
             try report.flush();
             continue;
         };
@@ -93,6 +118,52 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, comp: *Compilation, options
     try report.print("{d} passed; {d} failed; {d} total\n", .{ passed, failed, tests.items.len });
     try report.flush();
     return if (failed == 0) 0 else 1;
+}
+
+fn waitForTest(io: std.Io, child: *std.process.Child, timeout_ms: ?u32) !std.process.Child.Term {
+    const milliseconds = timeout_ms orelse return child.wait(io);
+    const start = std.Io.Clock.awake.now(io);
+    const limit = std.Io.Duration.fromMilliseconds(milliseconds);
+    while (true) {
+        if (try pollTest(io, child)) |term| return term;
+        const elapsed = start.durationTo(std.Io.Clock.awake.now(io));
+        if (elapsed.nanoseconds >= limit.nanoseconds) return error.TestTimedOut;
+        try io.sleep(.{ .nanoseconds = @min(limit.nanoseconds - elapsed.nanoseconds, 10 * std.time.ns_per_ms) }, .awake);
+    }
+}
+
+fn pollTest(io: std.Io, child: *std.process.Child) !?std.process.Child.Term {
+    if (builtin.os.tag == .windows) {
+        const windows = std.os.windows;
+        const immediate: windows.LARGE_INTEGER = 0;
+        return switch (windows.ntdll.NtWaitForSingleObject(child.id.?, .FALSE, &immediate)) {
+            .WAIT_0 => try child.wait(io),
+            .TIMEOUT => null,
+            else => error.ProcessPollFailed,
+        };
+    }
+    // This runner inherits stdout/stderr, ignores stdin and requests no rusage.
+    // Reaping directly therefore leaves no pipes or resource data to clean up.
+    std.debug.assert(child.stdin == null and child.stdout == null and child.stderr == null);
+    std.debug.assert(!child.request_resource_usage_statistics);
+    var status: c_int = 0;
+    const waited = std.posix.system.waitpid(child.id.?, &status, std.posix.W.NOHANG);
+    switch (std.posix.errno(waited)) {
+        .SUCCESS => {},
+        .INTR => return null,
+        else => return error.ProcessPollFailed,
+    }
+    if (waited == 0) return null;
+    const bits: u32 = @bitCast(status);
+    if (std.posix.W.IFEXITED(bits)) {
+        child.id = null;
+        return .{ .exited = std.posix.W.EXITSTATUS(bits) };
+    }
+    if (std.posix.W.IFSIGNALED(bits)) {
+        child.id = null;
+        return .{ .signal = std.posix.W.TERMSIG(bits) };
+    }
+    return .{ .unknown = bits };
 }
 
 fn fakeCompiler(dir: std.Io.Dir, child: []const u8, fail: bool) !void {
@@ -271,6 +342,71 @@ test "TestRunner spawn failures continue and workspace errors restore mode" {
     try std.testing.expect(comp.getModule(comp.root.?).?.tests_enabled);
     var iterator = tmp.dir.iterate();
     while (try iterator.next(io)) |entry| try std.testing.expect(!std.mem.startsWith(u8, entry.name, "nov-"));
+}
+
+test "TestRunner filters before semantic demands preserves order and restores selection" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try fakeCompiler(tmp.dir, "exit 0", false);
+    const root_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root_path);
+    const cc = try tmp.dir.realPathFileAlloc(io, "compiler with spaces;literal", allocator);
+    defer allocator.free(cc);
+    var comp = Compilation.init(allocator);
+    defer comp.deinit();
+    comp.setRoot(try comp.addSource("/filtered.nov", ordered_source ++ "\n@[test]\nlet excluded:(value:Missing)=unknown\n"));
+    const root = comp.getModule(comp.root.?).?;
+    root.tests_enabled = true;
+    root.test_filter = "previous";
+    for ([_]struct { filter: []const u8, output: []const u8 }{
+        .{ .filter = "alpha", .output = "PASS alpha\n1 passed; 0 failed; 1 total\n" },
+        .{ .filter = "a", .output = "PASS zebra\nPASS main\nPASS alpha\n3 passed; 0 failed; 3 total\n" },
+        .{ .filter = "ALPHA", .output = "0 passed; 0 failed; 0 total\n" },
+    }) |case| {
+        var report = std.Io.Writer.Allocating.init(allocator);
+        defer report.deinit();
+        var diagnostics = std.Io.Writer.Allocating.init(allocator);
+        defer diagnostics.deinit();
+        try std.testing.expectEqual(@as(u8, 0), try run(io, allocator, &comp, .{ .filter = case.filter, .temp_root = root_path, .discovery = .{ .cc = cc } }, &report.writer, &diagnostics.writer));
+        try std.testing.expectEqualStrings(case.output, report.written());
+        try std.testing.expectEqualStrings("", diagnostics.written());
+        try std.testing.expect(root.tests_enabled);
+        try std.testing.expectEqualStrings("previous", root.test_filter.?);
+        try expectCleaned(tmp.dir);
+    }
+    root.tests_enabled = false;
+    var ordinary = try Lowering.lowerCompilation(&comp);
+    defer ordinary.deinit();
+    try std.testing.expect(!comp.hasErrors());
+    try std.testing.expectEqual(@as(usize, 0), ordinary.ir.functions.items.len);
+}
+
+test "TestRunner timeout kills and reaps the child then continues subsequent tests" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try fakeCompiler(tmp.dir, "case \"$1\" in 0) while :; do :; done;; 1) exit 0;; 2) exit 7;; esac", false);
+    const root_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root_path);
+    const cc = try tmp.dir.realPathFileAlloc(io, "compiler with spaces;literal", allocator);
+    defer allocator.free(cc);
+    var comp = Compilation.init(allocator);
+    defer comp.deinit();
+    comp.setRoot(try comp.addSource("/timeout.nov", ordered_source));
+    var report = std.Io.Writer.Allocating.init(allocator);
+    defer report.deinit();
+    var diagnostics = std.Io.Writer.Allocating.init(allocator);
+    defer diagnostics.deinit();
+    try std.testing.expectEqual(@as(u8, 1), try run(io, allocator, &comp, .{ .timeout_ms = 250, .temp_root = root_path, .discovery = .{ .cc = cc } }, &report.writer, &diagnostics.writer));
+    try std.testing.expectEqualStrings("FAIL zebra (timeout after 250 ms)\nPASS main\nFAIL alpha (exit 7)\n1 passed; 2 failed; 3 total\n", report.written());
+    try std.testing.expectEqualStrings("", diagnostics.written());
+    try expectFile(tmp.dir, "runs", "0\n1\n2\n");
+    try expectCleaned(tmp.dir);
 }
 
 test "TestRunner rejects frontend semantic and backend errors before compiling and restores mode" {

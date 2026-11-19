@@ -14,6 +14,7 @@ const Module = @This();
 allocator: std.mem.Allocator,
 compilation: ?*Compilation = null,
 tests_enabled: bool = false,
+test_filter: ?[]const u8 = null,
 /// Query-local recursion guard; inference never publishes partial signatures.
 closure_inference_depth: usize = 0,
 closure_inference_stack: [128]Ast.Node.Index = @splat(0),
@@ -330,10 +331,21 @@ pub fn testEnabled(self: *const Module) bool {
     return true;
 }
 
+pub fn testSelected(self: *const Module, name: []const u8) bool {
+    if (!self.testEnabled()) return false;
+    return if (self.test_filter) |filter| std.mem.indexOf(u8, name, filter) != null else true;
+}
+
 /// AST-wide semantic scans must not discover demands inside disabled tests.
 pub fn inDisabledTest(self: *const Module, node: Ast.Node.Index) bool {
-    if (self.testEnabled()) return false;
-    return self.inTest(node, false);
+    if (!self.testEnabled()) return self.inTest(node, false);
+    if (self.test_filter == null or node == 0) return false;
+    const token = self.source.ast.firstToken(node);
+    for (self.declarations.items) |decl| {
+        if (!decl.is_test or self.testSelected(decl.name)) continue;
+        if (token >= self.source.ast.firstToken(decl.node) and token <= self.source.ast.lastToken(decl.node)) return true;
+    }
+    return false;
 }
 
 /// Import discovery ignores entire test declarations in both modes. Imports in

@@ -60,6 +60,12 @@ results. See `examples/array-fields.nov`.
 
 ## Current delivered status
 
+`nov test --filter <text>` selects case-sensitive name substrings before semantic
+checking, in source order. Unselected semantic demands are ignored; syntax/attribute
+validation remains. `--timeout-ms <positive u32>` is an opt-in per-test execution
+limit: kill/reap, report failure, continue; compilation/descendants are not bounded.
+No timeout by default. See `test-cli-test-selection` and `src/TestRunner.zig`.
+
 The immutable UTF-8 type is now `str`, replacing `string` without a built-in alias.
 Annotations, generic arguments, stringify signatures and printed types use `str`.
 The `std.string` namespace, literals and internal string/GC representation are

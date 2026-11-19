@@ -397,7 +397,7 @@ fn resolveValueType(module: *Module, ir: *Ir, node: Ast.Node.Index, env: Environ
         else => return diagnose(module, node, .invalid_type_query_operand),
     };
     const declaration = owner.getDeclaration(id).?;
-    if (declaration.is_type_alias or declaration.is_namespace or declaration.is_generic or declaration.is_generic_function or (declaration.is_test and !owner.testEnabled())) return diagnose(module, node, .not_a_value);
+    if (declaration.is_type_alias or declaration.is_namespace or declaration.is_generic or declaration.is_generic_function or (declaration.is_test and !owner.testSelected(declaration.name))) return diagnose(module, node, .not_a_value);
     // Retain failures as well as successes across sibling queries. An active-path
     // guard alone re-expands a branching cyclic signature exponentially.
     const ref: Compilation.DeclRef = .{ .source = owner.source.id, .local = id };
