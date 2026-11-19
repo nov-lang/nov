@@ -364,6 +364,7 @@ fn aliasCandidate(self: *const Module, id: DeclId) bool {
     const full = self.source.ast.decl(self.getDeclaration(id).?.node).ast;
     if (full.is_mutable or full.type_node != 0 or full.init_node == 0) return false;
     return switch (self.source.ast.nodes.items(.tag)[full.init_node]) {
+        .range => self.source.ast.nodes.items(.data)[full.init_node].lhs == 0,
         .identifier, .field_access, .array_type, .fn_proto, .fn_proto_one, .container_decl, .call, .call_one, .call_comma, .call_one_comma => true,
         else => false,
     };
@@ -440,6 +441,7 @@ pub fn classifyAliases(self: *Module) std.mem.Allocator.Error!void {
             .container_field => if (data[node].lhs != 0) try work.append(self.allocator, data[node].lhs),
             .struct_init => if (data[node].lhs != 0) try work.append(self.allocator, data[node].lhs),
             .fn_proto, .fn_proto_one, .array_type => try work.append(self.allocator, node),
+
             .call, .call_one, .call_comma, .call_one_comma => {
                 const call = self.source.ast.fullCall(node).?;
                 if (std.mem.eql(u8, self.source.ast.tokenSlice(self.source.ast.firstToken(call.ast.fn_expr)), "@as") and call.ast.args.len != 0)
@@ -511,7 +513,7 @@ pub fn classifyAliases(self: *Module) std.mem.Allocator.Error!void {
                     if (!param.inferred) try work.append(self.allocator, param.type_expr);
                 }
                 if (proto.ast.return_type) |result| try work.append(self.allocator, result);
-            } else if (tags[node] == .array_type) {
+            } else if (tags[node] == .array_type or (tags[node] == .range and data[node].lhs == 0)) {
                 try work.append(self.allocator, data[node].rhs);
             } else if (self.source.ast.fullCall(node)) |call| {
                 if (tags[call.ast.fn_expr] == .builtin_literal and std.mem.eql(u8, self.source.ast.tokenSlice(self.source.ast.firstToken(call.ast.fn_expr)), "@TypeOf")) continue;

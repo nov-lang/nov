@@ -1686,6 +1686,7 @@ pub const Node = struct {
         /// main_token is the `&`.
         /// lhs is the `mut` token index if any.
         ref_type,
+
         /// `[]rhs`. lhs is unused.
         array_type,
         /// `lhs[rhs]`.
@@ -1733,6 +1734,8 @@ pub const Node = struct {
         /// rhs can be omitted.
         /// main_token is the `..` or `..=`. lhs is the start expression.
         /// rhs is the end expression, or 0 for `start..` only as a direct loop source.
+        /// In type positions, `..T` has lhs=0 and rhs is the child type.
+        /// Slice bounds and match patterns also use lhs=0 for prefix ranges.
         range,
         /// Iteration over a range, array or string. `RangeLoop[lhs]`, rhs is the final body/else.
         loop_range,

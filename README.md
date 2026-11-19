@@ -195,7 +195,8 @@ let main: () -> void = @println(true, answer())
 This outputs `true -42` followed by a newline. Bare integer literals such as
 `@println(42)` default to signed pointer-sized `int`. Explicit annotations, `@as`,
 call signatures and typed sibling expressions take precedence over that fallback.
-Interpolated strings can be printed like any string. Functions/closures, ranges
+Interpolated strings can be printed like any string. Ranges print as `start..end`
+or `start..=end` with exact signed/unsigned numeric bounds. Functions/closures
 and void values have no default representation; aggregates containing them also
 reject unless a valid enclosing hook overrides that value and stops structural
 recursion. A void union alternative is payloadless and printable. Unspecialized generic templates and namespaces are not
@@ -1096,7 +1097,7 @@ The delivered subset is deliberately bounded:
 - Named fields support every ordinary storable runtime type: `bool`, `rune`, integers
   (including `i128`/`u128` and native `int`/`uint`), floats, immutable `str`, enums,
   structs, unions (including Option/Result), arrays, functions/closures and ranges.
-  Use existing explicit types or aliases, including `@TypeOf(0..10)` for a range. Semantic checking
+  Use existing explicit types or aliases, including `..uint` for a range. Semantic checking
   uses the same integer-width and literal-bound rules as scalar values. The C
   backend still supports only 8/16/32/64-bit integers: a reachable record layout
   containing a 128-bit field fails C emission with a backend width diagnostic;
@@ -1509,13 +1510,14 @@ checked semantically through 128 bits, while reachable C layouts require
   function. Copies share the closure's environment and mutable cells rather than
   recreating captures; inactive environment slots remain zero. Reference capture
   and escape restrictions are unchanged.
-- Range payloads copy start/end/inclusivity by value without allocation. An existing
-  type query can name their exact endpoint type: `let Interval = @TypeOf(0..1)`
-  followed by `Option(Interval)` or `union { interval: Interval, none, }`.
+- Range payloads copy start/end/inclusivity by value without allocation. Source
+  types name the exact integer endpoint type: `let Interval = ..uint`, followed
+  by `Option(Interval)` or `union { interval: Interval, none, }`.
   Inline constructors such as `.interval[0..=3]` are distinguished from string
   slices by the union-variant base; both range endpoints are required.
   Extracted ranges are reusable loop sources under the existing range rules.
-- Functions and ranges have no default printed representation. A union containing
+- Range payloads print recursively as `start..end` or `start..=end`.
+  Functions have no default printed representation. A union containing
   them needs an enclosing valid `@[stringify]` hook, including when its active
   variant is payloadless. Recursive type/signature graphs remain unsupported;
   function-pointer edges do not count as inline storage depth. Structs may also
@@ -2058,12 +2060,12 @@ let prod = a.! * b.! ; will return .none to the calling function since b is .non
 Growable `[]T` arrays support every existing storable runtime type: `bool`,
 `rune`, integers, immutable `str`, nominal enums, finite acyclic records and
 existing tagged unions, function values (including closures), nested arrays, and
-inferred integer range values. `void` and compile-time `type` are not storable;
+integer range values. `void` and compile-time `type` are not storable;
 `f32`/`f64` are storable. Semantic integer types extend through 128 bits, but
 reachable C layouts, including nested elements and function signatures, still
 require 8/16/32/64-bit widths (native `int/uint` retain their pointer-width rules).
-Existing annotation syntax applies in bodies and signatures; ranges have no
-source-level annotation syntax and enter arrays through inference. Literals use an
+Existing annotation syntax applies in bodies and signatures, including `[]..T`
+for arrays of integer ranges. Literals use an
 expected array type when available; otherwise, a known supported element type
 determines the exact element type for the whole literal, even when it
 appears after untyped integer literals. For example, `[true, false]` infers
@@ -2208,8 +2210,9 @@ let main: () -> void = {
   the array syntax described above without extending these semantics.
   Arrays print/interpolate as `[a, b]` when their elements are recursively
   printable, honoring exact nominal `@[stringify]` converters once in index/traversal order.
-  Functions/closures and ranges have no default representation; aggregates
-  containing them need a valid enclosing hook that stops recursion before them.
+  Ranges print their numeric bounds; functions/closures have no default
+  representation. Aggregates containing functions need a valid enclosing hook
+  that stops recursion before them.
   Malformed/inaccessible nested hooks reject rather than falling back.
   See [`examples/storable-arrays.nov`](examples/storable-arrays.nov) for the
   expanded element matrix.
@@ -2524,15 +2527,21 @@ let main: () = {
   and inclusivity. Reassigning a mutable range binding in the body cannot change
   an active loop. Inline bounds use the same construction and snapshot rules.
   The index is not in scope while constructing or selecting the source range.
-- Range type identity depends on the exact integer endpoint type; inclusivity is
-  part of the value. Inferred locals, assignment/copies, and branch/block/loop
-  results can carry ranges, including mixed inclusive/exclusive branches. No new
-  dedicated range type syntax is provided; use a type query such as
-  `let Interval = @TypeOf(0..1)` for exact range annotations in parameters, returns
-  and struct fields or union payloads. Range globals support data-only initialization. Arrays can
-  infer range elements, for example `[0..3, 1..=2]`; their bounds and inclusivity
-  copy by value with exact endpoint typing and the bound inference rules below.
-  Range field access, equality, membership and direct printing are not introduced.
+- The source type `..T` requires an integer endpoint type; inclusivity is part
+  of the value, not its type. `@TypeOf(@as(u8, 0)..1)` prints `..u8`, replacing
+  the old `range(u8)` spelling. Use aliases such as `let Interval = ..u8`,
+  ``..`T`` in generic signatures, and `[]..T` for arrays. Parameters, returns,
+  references, struct fields and union payloads follow existing storage rules;
+  range globals still require data-only initialization. Locals, copies and
+  branch/block/loop results can carry ranges, including mixed inclusive/exclusive
+  branches. Arrays can also infer range elements, for example `[0..3, 1..=2]`.
+  Bounds and inclusivity copy by value with exact endpoint typing.
+- Default printing/interpolation produces `start..end` or `start..=end`, preserving
+  exact signed/unsigned numeric bounds, including integer minima and maxima.
+  Arrays, records and unions print ranges recursively and honor nested
+  `@[stringify]` converters. Range equality and membership remain unsupported;
+  no range fields are introduced. Only finite ranges are values; open `start..`
+  loop followers are unchanged.
 - `@len(range)` returns the finite cardinality as native (pointer-sized) `uint`,
   not the endpoint type. Reversed ranges return 0; otherwise `start..end` counts
   `end - start`, and `start..=end` counts `end - start + 1`. Equal exclusive
@@ -2600,6 +2609,13 @@ exclusive/inclusive searches and overflow-free MAX exhaustion.
 
 See [`examples/range-values.nov`](examples/range-values.nov) for stored bounds
 iterated twice, first to print 0 through 9 and then to compute a sum of 45.
+
+``std.range.toArray(range: ..`T) -> []`T`` materializes a finite range by looping
+and appending ordinary value copies. Empty or descending ranges produce `[]`;
+inclusive extremes use the existing overflow-safe iteration rules. For example,
+`std.range.toArray(@as(u8, 1)..=3)` produces `[1, 2, 3]` of type `[]u8`.
+See [`examples/range-types.nov`](examples/range-types.nov) for usage and five tests
+covering source types, nested printing, materialization and numeric boundaries.
 
 Iteration loops accept an optional `: continuation` before the body:
 

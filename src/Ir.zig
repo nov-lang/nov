@@ -201,7 +201,7 @@ const DefaultPrintability = struct {
             errdefer ir.allocator.free(states);
             const stack = try ir.allocator.alloc(Frame, ir.types.items.len);
             for (ir.types.items, states) |ty, *state| state.* = switch (ty) {
-                .boolean, .integer, .float, .rune, .string, .enumeration => .printable,
+                .boolean, .integer, .float, .rune, .string, .enumeration, .range => .printable,
                 .array, .record => .unknown,
                 else => .unsupported,
             };
@@ -3148,7 +3148,7 @@ test "storable fields exact constructors signatures cycles depth and unsupported
     try ir.verify();
 }
 
-test "default printing rejects nested functions ranges and void" {
+test "default printing accepts nested ranges but rejects functions and void" {
     var ir = Ir.init(std.testing.allocator);
     defer ir.deinit();
     const span: Span = .{ .start = 0, .end = 0 };
@@ -3165,13 +3165,24 @@ test "default printing rejects nested functions ranges and void" {
     const range_record = try ir.internType(.{ .record = .{ .identity = 971, .fields = &.{} } });
     try ir.setRecordFields(function_record, &.{.{ .name = "callable", .ty = function, .span = span }});
     try ir.setRecordFields(range_record, &.{.{ .name = "bounds", .ty = range, .span = span }});
-    for ([_]TypeId{ function, range, functions, ranges, nested_functions, nested_ranges, function_record, range_record }) |id| {
+    for ([_]TypeId{ function, functions, nested_functions, function_record }) |id| {
         ir.clearFunctions();
         const signature = try ir.internType(.{ .function = .{ .params = &.{id}, .result = string } });
         const f = try ir.addFunction("reject", signature, span);
         const parameter: Instruction = .{ .ty = id, .span = span, .op = .{ .parameter = 0 } };
         try std.testing.expectError(error.InvalidOperation, ir.setFunctionBody(f, &.{ parameter, .{ .ty = string, .span = span, .op = .{ .to_string = @fromBackingInt(0) } } }, @fromBackingInt(1)));
         try std.testing.expectError(error.InvalidOperation, ir.setFunctionBody(f, &.{ parameter, .{ .ty = unit, .span = span, .op = .{ .print = .{ .args = &.{@fromBackingInt(0)}, .newline = true } } }, .{ .ty = string, .span = span, .op = .{ .constant = try ir.internConstant(.{ .ty = string, .value = .{ .string = "" } }) } } }, @fromBackingInt(2)));
+    }
+    for ([_]TypeId{ range, ranges, nested_ranges, range_record }) |id| {
+        ir.clearFunctions();
+        const signature = try ir.internType(.{ .function = .{ .params = &.{id}, .result = string } });
+        const f = try ir.addFunction("accept", signature, span);
+        const parameter: Instruction = .{ .ty = id, .span = span, .op = .{ .parameter = 0 } };
+        try ir.setFunctionBody(f, &.{ parameter, .{ .ty = string, .span = span, .op = .{ .to_string = @fromBackingInt(0) } } }, @fromBackingInt(1));
+        try ir.verify();
+        const print = try ir.addFunction("print", signature, span);
+        try ir.setFunctionBody(print, &.{ parameter, .{ .ty = unit, .span = span, .op = .{ .print = .{ .args = &.{@fromBackingInt(0)}, .newline = true } } }, .{ .ty = string, .span = span, .op = .{ .constant = try ir.internConstant(.{ .ty = string, .value = .{ .string = "" } }) } } }, @fromBackingInt(2));
+        try ir.verify();
     }
     var printability: DefaultPrintability = .{};
     defer printability.deinit(ir.allocator);
@@ -3224,6 +3235,30 @@ test "string byte copies verify exact types prior operands spans and slot isolat
     owned[3].span.end = 2;
     try std.testing.expectError(error.InvalidSourceSpan, ir.verify());
     owned[3] = body[3];
+    try ir.verify();
+}
+
+test "range default printability recurses through arrays records and unions" {
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    const integer = try ir.internType(.{ .integer = .{ .signedness = .signed, .bits = 64 } });
+    const range = try ir.internType(.{ .range = integer });
+    const array = try ir.internType(.{ .array = range });
+    const record = try ir.internType(.{ .record = .{ .identity = 0, .fields = &.{} } });
+    const span: Span = .{ .start = 0, .end = 0 };
+    try ir.setRecordFields(record, &.{.{ .name = "ranges", .ty = array, .span = span }});
+    const tagged = try ir.internType(.{ .record = .{ .identity = 1, .tagged = true, .fields = &.{} } });
+    const unit = try ir.internType(.void);
+    try ir.setRecordFields(tagged, &.{
+        .{ .name = "record", .ty = record, .span = span },
+        .{ .name = "range", .ty = range, .span = span },
+        .{ .name = "none", .ty = unit, .span = span },
+    });
+    var printable: DefaultPrintability = .{};
+    defer printable.deinit(ir.allocator);
+    for ([_]TypeId{ tagged, record, array, range }) |ty|
+        try std.testing.expect(try printable.check(&ir, ty));
+    try std.testing.expect(!try printable.check(&ir, unit));
     try ir.verify();
 }
 

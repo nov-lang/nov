@@ -127,6 +127,7 @@ fn checkSupported(ast: Ast) !void {
         .assign_div,
         .assign_mod,
         .array_type,
+
         .ref_type,
         .array_init_two,
         .array_init_two_comma,
@@ -214,7 +215,7 @@ fn checkSupported(ast: Ast) !void {
             .container_field => if (data.lhs != 0) {
                 const field_tag = ast.nodes.items(.tag)[data.lhs];
                 switch (field_tag) {
-                    .identifier, .type_variable, .field_access, .call, .call_one, .array_type, .ref_type, .fn_proto, .fn_proto_one => {},
+                    .identifier, .type_variable, .field_access, .call, .call_one, .array_type, .range, .ref_type, .fn_proto, .fn_proto_one => {},
                     else => return error.UnsupportedSyntax,
                 }
                 const name = ast.tokenSlice(ast.firstToken(data.lhs));
@@ -228,7 +229,7 @@ fn checkSupported(ast: Ast) !void {
             },
             .array_type => {
                 switch (ast.nodes.items(.tag)[data.rhs]) {
-                    .type_variable, .field_access, .call, .call_one, .array_type, .ref_type, .fn_proto, .fn_proto_one => continue,
+                    .type_variable, .field_access, .call, .call_one, .array_type, .range, .ref_type, .fn_proto, .fn_proto_one => continue,
                     .identifier => {},
                     else => return error.UnsupportedSyntax,
                 }
@@ -830,6 +831,15 @@ test "every unsupported AST tag is rejected before rendering" {
             try std.testing.expectError(error.UnsupportedSyntax, checkSupported(ast));
         }
     }
+}
+
+test "source range types format aliases arrays signatures casts and fields" {
+    try expectFormatted("let R=..u8\nlet A=[]..u8\nlet S=struct{r:..u8,}\nlet f:(r:..`T)->[]..`T=[r]\n", "let R = ..u8\nlet A = []..u8\nlet S = struct {\n    r: ..u8,\n}\nlet f: (r: ..`T) -> []..`T = [r]\n");
+    const source = "let f:()={let r=@as(..u8,0..1)\nlet a=[1,2]\nlet s=a[..1]\n}\n";
+    const result = try format(std.testing.allocator, source);
+    defer std.testing.allocator.free(result);
+    try expectFormatted(source, result);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{source});
 }
 
 test "membership formatting preserves syntactic operands and range expressions" {

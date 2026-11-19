@@ -8,14 +8,16 @@ let std = @import("std")
 let Result = std.Result
 let Option = std.Option
 let array = std.array
+let range = std.range
 let string = std.string
 let Operator = std.builtin.Operator
 let trivial = std.trivial
 ```
 
 `std.nov` is the entry module. It publicly re-exports `Result` from `result.nov`,
-`Option` from `option.nov`, the `array` namespace from `array.nov`, and the
-`string` namespace from `string.nov`, and the `builtin` namespace from
+`Option` from `option.nov`, the `array` namespace from `array.nov`, the
+`range` namespace from `range.nov`, the `string` namespace from `string.nov`,
+and the `builtin` namespace from
 `builtin.nov` (including its public `Operator` enum). These are
 ordinary library declarations, not compiler builtins or automatically injected
 bare names. String values use the `str` type; the module remains `std.string`.
@@ -107,8 +109,8 @@ callee once before argument expressions and does not insert a receiver parameter
 fields take lookup precedence over methods. Reference-parameter callbacks retain
 ordinary explicit borrowing/forwarding rules, without permitting reference fields.
 
-Union-valued fields print recursively with existing converters. Function/range
-fields require an enclosing valid stringify hook to print the whole record.
+Union- and range-valued fields print recursively with existing converters.
+Function fields require an enclosing valid stringify hook to print the whole record.
 Defaults support scalar literals and nested array literals, including `[]` for
 any storable element type. Nonempty arrays require supported literal leaves;
 computed expressions, callbacks and other aggregate constructors are not enabled.
@@ -222,7 +224,7 @@ Containers may hold callable values and ranges:
 
 ```nov
 let Callback = (int) -> int
-let Interval = @TypeOf(0..1)
+let Interval = ..uint
 let function: std.Option(Callback) = .some[(value: int) { value + 1 }]
 let range: std.Option(Interval) = .some[0..=3]
 ```
@@ -248,12 +250,33 @@ strings and finite ranges; no library overload or length protocol is needed.
 synthetic `.len` properties and reachable 128-bit backend endpoints are not
 supported. See `examples/range-length.nov`.
 
-Functions and ranges remain unprintable by default, including inside a union or
-array. An enclosing valid `@[stringify]` hook can provide a representation and stop
+Ranges print/interpolate as `start..end` or `start..=end` with exact signed/unsigned
+numeric bounds, including extrema. Array/record/union printing recurses and honors
+nested `@[stringify]` hooks. Functions remain unprintable by default, including
+inside a union or array. An enclosing valid `@[stringify]` hook can provide a representation and stop
 structural recursion. Even an empty Option of a callable type needs such a hook
 for printing. Struct fields may also hold these values directly; recursive structural
 signature graphs remain unsupported. See `examples/value-payloads.nov` for a
 runnable example and six tests.
+
+## Range helpers
+
+The source type `..T` requires integer endpoints: `@TypeOf(@as(u8, 0)..1)` prints
+`..u8`, replacing `range(u8)`. Aliases, ``..`T`` generic signatures, `[]..T`,
+references and fields follow existing storage rules. Only finite ranges are
+values; open loop followers are unchanged. Range equality/membership remain
+unsupported, and no range fields are added.
+
+``std.range.toArray(range: ..`T) -> []`T`` in `range.nov` loops over the range and
+appends ordinary value copies:
+
+```nov
+let values: []u8 = std.range.toArray(@as(u8, 1)..=3) ; [1, 2, 3]
+```
+
+Empty and descending ranges produce empty arrays. Inclusive extrema are safe
+under existing iteration rules; this helper adds no new iteration semantics.
+See [`examples/range-types.nov`](../examples/range-types.nov) for usage and five tests.
 
 ## Container mapping
 

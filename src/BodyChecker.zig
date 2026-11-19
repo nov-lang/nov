@@ -78,6 +78,26 @@ pub fn defaultFloatType(ir: *Ir) Error!Ir.TypeId {
     return ir.internType(.{ .float = Ir.native_float_bits });
 }
 
+/// A soft range default, using the same grouping and negation rules as literal
+/// checking. Failed speculative decodes leave diagnostics to ordinary checking.
+pub fn rangeLiteralDefault(module: *Module, ir: *Ir, node: Ast.Node.Index) Error!?Ir.TypeId {
+    const data = module.source.ast.nodes.items(.data)[node];
+    const diagnostics_start = module.diagnostics.items.len;
+    defer module.diagnostics.shrinkRetainingCapacity(diagnostics_start);
+    var scratch = Ir.init(module.allocator);
+    defer scratch.deinit();
+    const wide = try scratch.internType(.{ .integer = .{ .signedness = .signed, .bits = 128 } });
+    var negative = false;
+    for ([_]Ast.Node.Index{ data.lhs, data.rhs }) |bound| {
+        if (bound == 0) continue;
+        switch (try Literal.check(module, &scratch, bound, wide, null)) {
+            .constant => |id| negative = negative or scratch.getConstant(id).?.value.signed_integer < 0,
+            else => return null,
+        }
+    }
+    return try ir.internType(.{ .integer = .{ .signedness = if (negative) .signed else .unsigned, .bits = Ir.native_pointer_bits } });
+}
+
 /// Checks one function against the complete annotation table. Does not evaluate
 /// operations, choose overflow behavior, or claim other declarations are checked.
 /// Requires the complete, valid annotation table produced by Sema/TypeResolver.
@@ -511,7 +531,7 @@ pub const QueryValidation = struct {
     pub fn printable(self: *QueryValidation, module: *Module, node: Ast.Node.Index, ty: Ir.TypeId) Error!bool {
         const scalar = self.ir.getType(ty).?;
         var context: Context = .{ .module = module, .ir = &self.ir, .types = &.{}, .probing = true };
-        if (scalar != .boolean and scalar != .integer and scalar != .float and scalar != .string and scalar != .rune and scalar != .array and scalar != .record and scalar != .enumeration) {
+        if (scalar != .boolean and scalar != .integer and scalar != .float and scalar != .string and scalar != .rune and scalar != .array and scalar != .range and scalar != .record and scalar != .enumeration) {
             _ = try context.fail(.unsupported_interpolation_type, node, null);
             return false;
         }
@@ -2664,6 +2684,7 @@ const Context = struct {
         switch (nominal) {
             .boolean, .integer, .float, .rune, .string => return true,
             .array => |element| return self.registerPrintable(node, element, visited, false),
+            .range => |element| return self.ir.getType(element).? == .integer,
             .record, .enumeration => {},
             else => {
                 _ = try self.fail(.unsupported_body_expression, node, null);
@@ -2721,7 +2742,7 @@ const Context = struct {
         if (remaining == 0) return false;
         const ast = &self.module.source.ast;
         const tag = ast.nodes.items(.tag)[node];
-        if (tag == .array_type or tag == .fn_proto or tag == .fn_proto_one) return true;
+        if ((tag == .range and ast.nodes.items(.data)[node].lhs == 0) or tag == .array_type or tag == .fn_proto or tag == .fn_proto_one) return true;
         var root = node;
         while (ast.nodes.items(.tag)[root] == .field_access) root = ast.nodes.items(.data)[root].lhs;
         if (ast.nodes.items(.tag)[root] == .identifier) {
@@ -2765,7 +2786,7 @@ const Context = struct {
             .float => |bits| try std.fmt.allocPrint(a, "f{d}", .{bits}),
             .array => |element| try std.fmt.allocPrint(a, "[]{s}", .{try self.printedTypeName(element, remaining - 1)}),
             .reference => |reference| try std.fmt.allocPrint(a, "&{s}{s}", .{ if (reference.mutable) "mut " else "", try self.printedTypeName(reference.child, remaining - 1) }),
-            .range => |element| try std.fmt.allocPrint(a, "range({s})", .{try self.printedTypeName(element, remaining - 1)}),
+            .range => |element| try std.fmt.allocPrint(a, "..{s}", .{try self.printedTypeName(element, remaining - 1)}),
             .function => |function| blk: {
                 var text: []const u8 = "(";
                 for (function.params, 0..) |param, i| text = try std.fmt.allocPrint(a, "{s}{s}{s}", .{ text, if (i == 0) "" else ", ", try self.printedTypeName(param, remaining - 1) });
@@ -3202,17 +3223,19 @@ const Context = struct {
                     (if (loop.else_expr != 0) try self.probe(loop.else_expr, depth + 1) else null);
             },
             .range => blk: {
+                if (data.lhs == 0) break :blk null;
+                // Endpoint defaults are soft: exact range/result context wins,
+                // then range literal signedness, then ordinary expression defaults.
+                const defaulting = self.defaulting;
+                self.defaulting = false;
+                defer self.defaulting = defaulting;
                 var element = (try self.probe(data.lhs, depth + 1)) orelse try self.probe(data.rhs, depth + 1);
-                if (element == null) infer: {
-                    const wide = try self.ir.internType(.{ .integer = .{ .signedness = .signed, .bits = 128 } });
-                    const diagnostics_start = self.module.diagnostics.items.len;
-                    defer self.module.diagnostics.shrinkRetainingCapacity(diagnostics_start);
-                    var negative = false;
-                    for (([_]Ast.Node.Index{ data.lhs, data.rhs })[0..if (data.rhs == 0) @as(usize, 1) else 2]) |bound| switch (try Literal.check(self.module, self.ir, bound, wide, null)) {
-                        .constant => |id| negative = negative or self.ir.getConstant(id).?.value.signed_integer < 0,
-                        else => break :infer,
-                    };
-                    element = .{ .ty = try self.ir.internType(.{ .integer = .{ .signedness = if (negative) .signed else .unsigned, .bits = Ir.native_pointer_bits } }) };
+                if (element == null and defaulting and !self.float_defaults_only) {
+                    if (try rangeLiteralDefault(self.module, self.ir, node)) |ty| element = .{ .ty = ty };
+                }
+                if (element == null and defaulting) {
+                    self.defaulting = true;
+                    element = (try self.probe(data.lhs, depth + 1)) orelse try self.probe(data.rhs, depth + 1);
                 }
                 const known = element orelse break :blk null;
                 if (self.ir.getType(known.ty).? != .integer) break :blk null;
@@ -4278,7 +4301,7 @@ const Context = struct {
                 const ty = (try self.printExpression(embedded, depth + 1)) orelse return null;
                 if (self.terminated) return self.fit(string, expected, node);
                 const scalar = self.ir.getType(ty).?;
-                if (scalar != .boolean and scalar != .integer and scalar != .float and scalar != .string and scalar != .rune and scalar != .array and scalar != .record and scalar != .enumeration) return self.interpolationError(.unsupported_interpolation_type, .{ .source = location.source, .start = location.start + @as(u32, @intCast(start)), .end = location.start + @as(u32, @intCast(offset)) });
+                if (scalar != .boolean and scalar != .integer and scalar != .float and scalar != .string and scalar != .rune and scalar != .array and scalar != .range and scalar != .record and scalar != .enumeration) return self.interpolationError(.unsupported_interpolation_type, .{ .source = location.source, .start = location.start + @as(u32, @intCast(start)), .end = location.start + @as(u32, @intCast(offset)) });
                 if (!try self.convertPrintable(embedded, ty)) return null;
                 if (self.emitter) |emitter| {
                     const converted = try emitter.append(string, self.irSpan(node), .{ .to_string = try emitter.value(embedded) });
@@ -4296,8 +4319,12 @@ const Context = struct {
         const ast = &self.module.source.ast;
         const data = ast.nodes.items(.data)[node];
         const unit = try self.ir.internType(.void);
+        if (data.lhs == 0) return self.fail(.not_a_value, node, null);
         if (data.rhs == 0) return self.fail(.unsupported_iteration, node, null);
         var known = (try self.probe(data.lhs, depth + 1)) orelse try self.probe(data.rhs, depth + 1);
+        if (known == null) if (expected) |context| {
+            if (self.ir.getType(context.ty).? == .range) known = .{ .ty = self.ir.getType(context.ty).?.range, .annotation = context.annotation };
+        };
         if (known == null) {
             if (try self.probeDefault(node, depth + 1)) |range| {
                 if (self.ir.getType(range.ty).? == .range) known = .{ .ty = self.ir.getType(range.ty).?.range };
@@ -4340,7 +4367,9 @@ const Context = struct {
     }
 
     fn iterationElement(self: *Context, node: Ast.Node.Index, depth: usize) Error!?Known {
-        const known = (try self.probe(node, depth)) orelse return null;
+        const ast = &self.module.source.ast;
+        const known = (try self.probe(node, depth)) orelse
+            (if (ast.nodes.items(.tag)[node] == .range) try self.probeDefault(node, depth) else null) orelse return null;
         return switch (self.ir.getType(known.ty).?) {
             .array, .range => |ty| .{ .ty = ty },
             .string => .{ .ty = try self.ir.internType(.rune) },
@@ -5968,6 +5997,165 @@ test "global storage cannot be borrowed or assigned through immutable declaratio
         var module = try Module.init(std.testing.allocator, "global-storage-invalid.nov", source);
         defer module.deinit();
 
+        var result = try Lowering.lower(&module);
+        defer result.deinit();
+        try std.testing.expect(module.hasErrors());
+        try std.testing.expect(!result.lowering_complete);
+    }
+}
+
+test "source range types lower aliases generics arrays closures fields and casts" {
+    const source =
+        \\let R=..u8
+        \\let A=[]..u8
+        \\let Holder=struct{value:R,}
+        \\let Box:(T:type)->type=struct{value:T,}
+        \\let identity:(r:..`T)->..`T=r
+        \\let collect:(r:..`T)->[]..`T=[r]
+        \\let take:(r:R)->R=r
+        \\let main:()={
+        \\let r:R=0..1
+        \\let s=@as(..u8,0..=2)
+        \\let a:A=collect(identity(take(r)))
+        \\let h=Holder.[value=a[0]]
+        \\let b=Box(..u8).[value=h.value]
+        \\let closure:(..u8)->..u8=(x:..u8)->..u8 {let captured:R=b.value
+        \\@println(captured)
+        \\x}
+        \\let result:R=closure(s)
+        \\@println(@TypeOf(@as(u8,0)..1))
+        \\@println(..u8)
+        \\@println([]..u8)
+        \\@println(result)
+        \\@println(a)
+        \\let text="ab"
+        \\let end=1
+        \\let sliced:str=text[..end]
+        \\loop i in 0..1 {@println(i)}
+        \\}
+    ;
+    var module = try Module.init(std.testing.allocator, "source-range-types.nov", source);
+    defer module.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
+    var result = try Lowering.lower(&module);
+    defer result.deinit();
+    if (module.hasErrors()) std.debug.print("source range types: {any}\n", .{module.diagnostics.items});
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(result.lowering_complete);
+    try result.ir.verify();
+    for ([_][]const u8{ "..u8", "[]..u8" }) |expected| {
+        var found = false;
+        for (result.ir.constants.items) |constant| {
+            if (constant.value == .string and std.mem.eql(u8, constant.value.string, expected)) found = true;
+        }
+        try std.testing.expect(found);
+    }
+}
+
+test "grouped range execution and TypeOf share soft defaults through std range toArray" {
+    const allocator = std.testing.allocator;
+    const range_source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "lib/range.nov", allocator, .limited(1024 * 1024));
+    defer allocator.free(range_source);
+    for ([_]struct { expression: []const u8, child: []const u8 }{
+        .{ .expression = "{0}..{2}", .child = "uint" },
+        .{ .expression = "{{0}}..={{2}}", .child = "uint" },
+        .{ .expression = "-{2}..{2}", .child = "int" },
+        .{ .expression = "{-2}..={2}", .child = "int" },
+        .{ .expression = "{9223372036854775808}..={9223372036854775809}", .child = "uint" },
+        .{ .expression = "@as(u8,{0})..{2}", .child = "u8" },
+        .{ .expression = "@as(..i16,{-2}..={3})", .child = "i16" },
+    }) |case| {
+        const source = try std.fmt.allocPrint(
+            allocator,
+            "let std=@import(\"std.nov\")\nlet main:()={{\n" ++
+                "let r={s}\nlet same:@TypeOf({s})=r\nlet exact:..{s}=same\n" ++
+                "let a=std.range.toArray({s})\nlet same_array:@TypeOf(std.range.toArray({s}))=a\nlet exact_array:[]{s}=same_array\n" ++
+                "let context:[]i16=std.range.toArray({{0}}..{{2}})\n" ++
+                "let query:@TypeOf(@as([]i16,std.range.toArray({{0}}..{{2}})))=context\n" ++
+                "@println(same)\n@println(same_array)\n}}\n",
+            .{ case.expression, case.expression, case.child, case.expression, case.expression, case.child },
+        );
+        defer allocator.free(source);
+        var comp = Compilation.init(allocator);
+        defer comp.deinit();
+        const root_source = try comp.addSource("/grouped-range/main.nov", source);
+        const std_source = try comp.addSource("/grouped-range/std.nov", "@[public]\nlet range=@import(\"range.nov\")\n");
+        const range_module = try comp.addSource("/grouped-range/range.nov", range_source);
+        comp.setRoot(root_source);
+        for ([_]struct { owner: @TypeOf(root_source), name: []const u8, target: @TypeOf(root_source) }{
+            .{ .owner = root_source, .name = "std", .target = std_source },
+            .{ .owner = std_source, .name = "range", .target = range_module },
+        }) |edge| {
+            const owner = comp.getModule(edge.owner).?;
+            const local = owner.lookup(edge.name).?;
+            try comp.imports.append(allocator, .{ .declaration = comp.declaration_ids.get(.{ .source = edge.owner, .local = local }).?, .target = edge.target, .named = false, .span = owner.getDeclaration(local).?.name_span });
+        }
+        var result = try Lowering.lowerCompilation(&comp);
+        defer result.deinit();
+        for (comp.modules.items) |owner| for (owner.diagnostics.items) |diagnostic| {
+            std.debug.print("grouped range {s}: {any} at {s}\n", .{ case.expression, diagnostic, owner.sourceSlice(diagnostic.span).? });
+        };
+        try std.testing.expect(!comp.hasErrors());
+        try std.testing.expect(result.lowering_complete);
+        try result.ir.verify();
+    }
+}
+
+test "contextual range literals retain exact endpoints and generic result constraints" {
+    const source =
+        \\let SmallRange=..u8
+        \\let Window=struct{bounds:SmallRange,}
+        \\let toArray:(range:..`T)->[]`T={
+        \\let mut result:[]`T=[]
+        \\loop x in range {result += [x]}
+        \\result}
+        \\let negative:()->..i16=-2..=3
+        \\let positive:()->..u8=0..=3
+        \\let main:()={
+        \\let bounds:SmallRange=0..=3
+        \\let signed:..i16=-2..=3
+        \\let cast=@as(..u8,1..3)
+        \\let windows:[]Window=[Window.[bounds=1..5]]
+        \\let results:[]i16=toArray(-2..=3)
+        \\let empty:[]int=toArray(3..3)
+        \\@assert(toArray(3..3)==@as([]int,[]))
+        \\@assert(toArray(5..2)==@as([]int,[]))
+        \\@assert(toArray(5..=2)==@as([]int,[]))
+        \\let inferred=toArray(0..2)
+        \\let exact:[]uint=inferred
+        \\let typed=toArray(@as(i8,0)..2)
+        \\let exact_typed:[]i8=typed
+        \\loop _, index in "ab", 0.. {let exact_index:uint=index
+        \\}
+        \\}
+    ;
+    var module = try Module.init(std.testing.allocator, "contextual-range.nov", source);
+    defer module.deinit();
+    try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
+    var result = try Lowering.lower(&module);
+    defer result.deinit();
+    for (module.diagnostics.items) |diagnostic| std.debug.print("contextual range: {any} at {s}\n", .{ diagnostic, module.sourceSlice(diagnostic.span).? });
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(result.lowering_complete);
+    try result.ir.verify();
+}
+
+test "source range types reject type values invalid children and runtime aliases" {
+    for ([_][]const u8{
+        "let main:()={let r=..u8\n}",
+        "let main:()={let r:@TypeOf(..u8)=0..1\n}",
+        "let R=0..1\nlet main:(r:R)={}",
+        "let main:()={let r:..bool=false..true\n}",
+        "let bad:(r:..`T)->..`T=r\nlet main:()={let r=bad(true)\n}",
+        "let main:()={let r:..u8=@as(u16,0)..1\n}",
+        "let main:()={let r:..u8=0..256\n}",
+        "let main:()={let r:..u8=-1..2\n}",
+        "let main:()={let r:..u8=0..@as(u16,1)\n}",
+    }) |source| {
+        var module = try Module.init(std.testing.allocator, "invalid-source-range.nov", source);
+        defer module.deinit();
+        try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
         var result = try Lowering.lower(&module);
         defer result.deinit();
         try std.testing.expect(module.hasErrors());
@@ -10294,7 +10482,7 @@ test "reusable range values preserve exact inference and reject unsupported valu
         .{ .body = "{loop i in true {}}", .accepted = false },
         .{ .body = "{let r=0..2\nloop i in r {} else {@println(i)}}", .accepted = false },
         .{ .body = "{let r=0..2\nlet n=42\n}", .accepted = true },
-        .{ .body = "{let r=if true {@as(i8, 0)..2} else {0..2}\n}", .accepted = false },
+        .{ .body = "{let r=if true {@as(i8, 0)..2} else {0..2}\n}", .accepted = true },
         .{ .body = "{let r=0..2\nlet s=r..r\n}", .accepted = false },
         .{ .body = "{let r=1 + 1..3\n}", .accepted = true },
     };

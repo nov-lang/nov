@@ -1069,6 +1069,60 @@ fn testTypeOfSignatures(allocator: std.mem.Allocator) !void {
     try sema.ir.verify();
 }
 
+test "generic range type printing recognizes type syntax during ordinary inference" {
+    var module = try Module.init(std.testing.allocator, "generic-range-print.nov",
+        \\let show:(r:..`T)={@print(..`T)
+        \\@println(..`T,[]..`T,r)
+        \\}
+        \\let main:()={show(@as(..u8,0..1))
+        \\let local:(r:..`T)={@println(..`T)}
+        \\local(@as(..i16,-1..2))
+        \\}
+    );
+    defer module.deinit();
+    var result = try Lowering.lower(&module);
+    defer result.deinit();
+    if (module.hasErrors()) std.debug.print("generic range print: {any}\n", .{module.diagnostics.items});
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(result.lowering_complete);
+    try result.ir.verify();
+    for ([_][]const u8{ "..u8", "[]..u8", "..i16" }) |expected| {
+        var found = false;
+        for (result.ir.constants.items) |constant| {
+            if (constant.value == .string and std.mem.eql(u8, constant.value.string, expected)) found = true;
+        }
+        try std.testing.expect(found);
+    }
+}
+
+fn testGenericRangePrintQuery(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "generic-range-print-query.nov",
+        \\let show:(r:..`T)={@print(..`T)
+        \\@println(..`T,[]..`T,r)
+        \\}
+        \\let query:@TypeOf(show(@as(..u8,0..1)))
+    );
+    defer module.deinit();
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    const declarations = module.declarations.items.len;
+    const query = module.source.ast.decl(module.getDeclaration(module.lookup("query").?).?.node).ast.type_node;
+    const ty = try TypeResolver.resolve(&module, &ir, query);
+    try std.testing.expectEqual(@as(?Ir.TypeId, try ir.internType(.void)), ty);
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expectEqual(declarations, module.declarations.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ir.functions.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ir.constants.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ir.formatting.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ir.local_generic_instances.items.len);
+    try std.testing.expectEqual(@as(usize, 0), module.expression_query_depth);
+}
+
+test "generic range type printing queries remain readonly under OOM" {
+    try testGenericRangePrintQuery(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testGenericRangePrintQuery, .{});
+}
+
 fn testTypeOfProbe(allocator: std.mem.Allocator) !void {
     var module = try Module.init(allocator, "typeof-probe.nov", "let id:(x:`T)->@TypeOf(x)=x");
     defer module.deinit();
@@ -2272,6 +2326,8 @@ const Solver = struct {
                 try self.fail(.unbound_type_variable, span, null);
                 return self.term(.unknown, span);
             },
+            .range => if (ast.nodes.items(.data)[node].lhs == 0 and ast.tokens.items(.tag)[ast.nodes.items(.main_token)[node]] == .period_period)
+                return self.term(.{ .range = try self.typeNode(frame, ast.nodes.items(.data)[node].rhs, depth + 1) }, span),
             .array_type => return self.term(.{ .array = try self.typeNode(frame, ast.nodes.items(.data)[node].rhs, depth + 1) }, span),
             .ref_type => {
                 const data = ast.nodes.items(.data)[node];
@@ -2675,25 +2731,10 @@ const Solver = struct {
         const data = ast.nodes.items(.data)[node];
         const span = module.tokenSpan(ast.firstToken(node));
         const element = try self.term(.unknown, span);
-        var literals = true;
-        var negative = false;
-        for ([_]Ast.Node.Index{ data.lhs, data.rhs }) |bound| {
-            if (bound == 0) continue;
-            const negated = ast.nodes.items(.tag)[bound] == .negation;
-            const literal = if (negated) ast.nodes.items(.data)[bound].rhs else bound;
-            if (ast.nodes.items(.tag)[literal] != .number_literal) {
-                literals = false;
-                continue;
-            }
-            switch (std.zig.parseNumberLiteral(ast.tokenSlice(ast.firstToken(literal)))) {
-                .int => |value| negative = negative or (negated and value != 0),
-                .big_int => negative = negative or negated,
-                else => literals = false,
-            }
-        }
-        // Range literal fallback precedes ordinary integer literal defaults,
-        // but still yields to every exact body or signature constraint.
-        if (literals) try self.defaults.append(self.allocator, .{ .term = element, .ty = try self.ir.internType(.{ .integer = .{ .signedness = if (negative) .signed else .unsigned, .bits = Ir.native_pointer_bits } }) });
+        // Share executable literal decoding, including grouped bounds. This
+        // fallback precedes endpoint defaults but yields to exact constraints.
+        if (try BodyChecker.rangeLiteralDefault(module, self.ir, node)) |ty|
+            try self.defaults.append(self.allocator, .{ .term = element, .ty = ty });
         const start = try self.expression(frame, data.lhs, depth + 1);
         if (root(start).value == .never) return start;
         try self.unify(element, start, span, 0);
@@ -2974,7 +3015,7 @@ const Solver = struct {
         const module = frame.ref.module;
         const ast = &module.source.ast;
         const tag = ast.nodes.items(.tag)[node];
-        var type_syntax = tag == .array_type or tag == .fn_proto or tag == .fn_proto_one or tag == .type_variable;
+        var type_syntax = (tag == .range and ast.nodes.items(.data)[node].lhs == 0) or tag == .array_type or tag == .fn_proto or tag == .fn_proto_one or tag == .type_variable;
         if (tag == .identifier) {
             const name = ast.tokenSlice(ast.firstToken(node));
             type_syntax = primitives.isPrimitive(name);
@@ -3551,6 +3592,10 @@ const Solver = struct {
             .loop_condition, .loop_cont, .loop_else => return self.loopExpression(frame, node, depth + 1),
             .loop_range => return self.iterationExpression(frame, node, depth + 1),
             .range => {
+                if (data.lhs == 0) {
+                    try self.fail(.not_a_value, span, null);
+                    return self.term(.unknown, span);
+                }
                 if (data.rhs == 0) {
                     self.unsupported = self.unsupported orelse span;
                     return self.term(.unknown, span);
@@ -3618,9 +3663,9 @@ const Solver = struct {
                     (std.mem.eql(u8, callee_name, "@panic") or std.mem.eql(u8, callee_name, "@print") or std.mem.eql(u8, callee_name, "@println") or std.mem.eql(u8, callee_name, "@assert")))
                 {
                     for (call.ast.args, 0..) |arg, index| {
-                        const printing = self.querying and (std.mem.eql(u8, callee_name, "@print") or std.mem.eql(u8, callee_name, "@println"));
+                        const printing = std.mem.eql(u8, callee_name, "@print") or std.mem.eql(u8, callee_name, "@println");
                         const value = if (printing) try self.printExpression(frame, arg, depth + 1) else try self.expression(frame, arg, depth + 1);
-                        if (printing) try self.query_printables.append(self.allocator, .{ .operand = value, .module = module, .node = arg, .interpolation = false });
+                        if (printing and self.querying) try self.query_printables.append(self.allocator, .{ .operand = value, .module = module, .node = arg, .interpolation = false });
                         if (root(value).value == .never) return value;
                         if (std.mem.eql(u8, callee_name, "@panic") or std.mem.eql(u8, callee_name, "@assert")) {
                             const ty = try self.ir.internType(if (std.mem.eql(u8, callee_name, "@assert") and index == 0) .boolean else .string);

@@ -382,7 +382,8 @@ fn parseDecl(self: *Parser) Error!Node.Index {
             self.token_tags[self.tok_i + 1] == .r_bracket and
             (self.token_tags[self.tok_i + 2] == .identifier or
                 self.token_tags[self.tok_i + 2] == .l_bracket or
-                self.token_tags[self.tok_i + 2] == .l_paren))
+                self.token_tags[self.tok_i + 2] == .l_paren or
+                self.token_tags[self.tok_i + 2] == .period_period))
             break :blk try self.expectTypeExpr();
         break :blk try self.expectExpr();
     } else null_node;
@@ -1276,6 +1277,18 @@ fn parseCurlySuffixExpr(self: *Parser) Error!Node.Index {
 /// ArrayTypeStart <- LBRACKET RBRACKET
 fn parseTypeExpr(self: *Parser) Error!Node.Index {
     switch (self.token_tags[self.tok_i]) {
+        .period_period => {
+            const token = self.nextToken();
+            switch (self.token_tags[self.tok_i]) {
+                .identifier, .type_variable, .builtin, .l_bracket, .l_paren, .ampersand, .period_period, .keyword_struct, .keyword_union, .keyword_enum => {},
+                else => return self.fail(.expected_type_expr),
+            }
+            return self.addNode(.{
+                .tag = .range,
+                .main_token = token,
+                .data = .{ .lhs = 0, .rhs = try self.expectTypeExpr() },
+            });
+        },
         .ampersand => {
             const token = self.nextToken();
             self.eatNewLines();
@@ -1316,7 +1329,7 @@ fn expectCallArg(self: *Parser) Error!Node.Index {
     // []T is unambiguous in an argument; [] alone remains an array literal.
     // The semantic callee decides whether this argument is a type or a value.
     if (self.token_tags[self.tok_i] == .l_bracket and self.token_tags[self.tok_i + 1] == .r_bracket and
-        (self.token_tags[self.tok_i + 2] == .identifier or self.token_tags[self.tok_i + 2] == .l_bracket or self.token_tags[self.tok_i + 2] == .l_paren))
+        (self.token_tags[self.tok_i + 2] == .identifier or self.token_tags[self.tok_i + 2] == .l_bracket or self.token_tags[self.tok_i + 2] == .l_paren or self.token_tags[self.tok_i + 2] == .period_period))
         return self.expectTypeExpr();
     return self.expectExpr();
 }
@@ -2328,6 +2341,19 @@ test "string slicing parser accessors delimiters and OOM" {
         const range = ast.nodes.items(.data)[node].rhs;
         try std.testing.expectEqualStrings(if (view.start == 0) ".." else if (i == 4) "0" else "1", ast.tokenSlice(ast.firstToken(range)));
     }
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
+}
+
+test "source range types preserve prefix spans and expression range syntax" {
+    const source = "let R=..u8\nlet A=[]..u8\nlet f:(r:..`T)->[]..`T\nlet g:()={let r=@as(..u8,0..1)\nlet a=[1,2]\nlet s=a[..1]\n}\n";
+    var ast = try parse(std.testing.allocator, source);
+    defer ast.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), ast.errors.len);
+    const node = ast.decl(ast.rootDecls()[0]).ast.init_node;
+    try std.testing.expectEqual(Node.Tag.range, ast.nodes.items(.tag)[node]);
+    try std.testing.expectEqual(@as(Node.Index, 0), ast.nodes.items(.data)[node].lhs);
+    try std.testing.expectEqualStrings("..u8", ast.getNodeSource(node));
+    try std.testing.expectEqualStrings("[]..u8", ast.getNodeSource(ast.decl(ast.rootDecls()[1]).ast.init_node));
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testParseAllocationFailures, .{source});
 }
 

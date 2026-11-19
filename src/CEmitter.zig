@@ -2589,7 +2589,7 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
                     switch (ir.getType(source_ty).?) {
                         .string => try w.print("v{d}", .{@backingInt(value)}),
                         .boolean => try w.print("(v{d} ? (nov_string){{NULL, (const unsigned char *)\"true\", 4}} : (nov_string){{NULL, (const unsigned char *)\"false\", 5}})", .{@backingInt(value)}),
-                        .integer, .float, .rune, .array, .record, .enumeration => try w.print("nov_to_string_{d}(v{d})", .{ @backingInt(source_ty), @backingInt(value) }),
+                        .integer, .float, .rune, .array, .record, .enumeration, .range => try w.print("nov_to_string_{d}(v{d})", .{ @backingInt(source_ty), @backingInt(value) }),
                         else => unreachable,
                     }
                 },
@@ -4264,7 +4264,7 @@ fn formatName(ir: *const Ir, ty: Ir.TypeId) []const u8 {
 }
 
 fn aggregateFormattingType(ty: Ir.Type) bool {
-    return ty == .array or ty == .record or ty == .enumeration;
+    return ty == .array or ty == .record or ty == .enumeration or ty == .range;
 }
 
 fn markFormatType(ir: *const Ir, used: []bool, id: Ir.TypeId) void {
@@ -4273,7 +4273,7 @@ fn markFormatType(ir: *const Ir, used: []bool, id: Ir.TypeId) void {
     used[i] = true;
     if (formatHook(ir, id) != null) return;
     switch (ir.getType(id).?) {
-        .array => |element| markFormatType(ir, used, element),
+        .array, .range => |element| markFormatType(ir, used, element),
         .record => |record| for (record.fields) |field| {
             if (ir.getType(field.ty).? != .void) markFormatType(ir, used, field.ty);
         },
@@ -4405,6 +4405,11 @@ fn writeAggregateFormatting(allocator: std.mem.Allocator, ir: *const Ir, counts:
                 \\    nov_format_bytes(sink, bytes, len);
                 \\
             ),
+            .range => |element| {
+                try w.print("    nov_format_{d}(sink, value.start, true);\n", .{@backingInt(element)});
+                try w.writeAll("    nov_format_bytes(sink, (const unsigned char *)(value.inclusive ? \"..=\" : \"..\"), value.inclusive ? 3 : 2);\n");
+                try w.print("    nov_format_{d}(sink, value.end, true);\n", .{@backingInt(element)});
+            },
             .array => |element| {
                 try writeFormatLiteral(w, "[");
                 try w.writeAll("    for (uintptr_t i = 0; i < value.len; ++i) {\n    if (i) {\n");
@@ -4485,7 +4490,7 @@ fn writePrint(ir: *const Ir, w: *std.Io.Writer, body: Ir.Body, print: anytype) W
         if (i != 0) try w.writeAll("    nov_rt_check(fputc(' ', stdout));\n");
         const ty = ir.types.items[@backingInt(body.instructions[@backingInt(arg)].ty)];
         switch (ty) {
-            .array, .record, .enumeration => try w.print("    {{ nov_format_sink sink = {{0}}; sink.streaming = true; nov_format_{d}(&sink, v{d}, true); }}\n", .{ @backingInt(body.instructions[@backingInt(arg)].ty), @backingInt(arg) }),
+            .array, .record, .enumeration, .range => try w.print("    {{ nov_format_sink sink = {{0}}; sink.streaming = true; nov_format_{d}(&sink, v{d}, true); }}\n", .{ @backingInt(body.instructions[@backingInt(arg)].ty), @backingInt(arg) }),
             .float => |bits| try w.print("    {{ char bytes[32]; int len = nov_rt_float_format_{d}(bytes, v{d}); if (fwrite(bytes, 1, (size_t)len, stdout) != (size_t)len) nov_rt_panic(\"stdout write failed\"); }}\n", .{ bits, @backingInt(arg) }),
             .rune => try w.print("    nov_rt_print_rune(v{d});\n", .{@backingInt(arg)}),
             .string => try w.print("    if (v{d}.len && fwrite(v{d}.data, 1, (size_t)v{d}.len, stdout) != (size_t)v{d}.len) nov_rt_panic(\"stdout write failed\");\n", .{ @backingInt(arg), @backingInt(arg), @backingInt(arg), @backingInt(arg) }),
@@ -14995,6 +15000,163 @@ test "emitted C rejects a mismatched native pointer width" {
     defer test_gpa.free(compiled.stderr);
     try std.testing.expect(compiled.term == .exited and compiled.term.exited != 0);
     try std.testing.expect(std.mem.indexOf(u8, compiled.stderr, "Nov requires the native target pointer width") != null);
+}
+
+test "range printing source literals stored runtime bounds and interpolation" {
+    const c = try emitSource(
+        \\let out: (start: i64, end: i64) -> void = {
+        \\    @println(0..10, -10..=20)
+        \\    let bounds: ..i64 = start..=end
+        \\    @println(bounds, "<{bounds}>", [bounds, start..end])
+        \\}
+    , null);
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(c, "#include <stdint.h>\nvoid nov_out(int64_t, int64_t); int main(void) { nov_out(-10, 20); return 0; }", 0, "0..10 -10..=20\n-10..=20 <-10..=20> [-10..=20, -10..20]\n", "", mode);
+}
+
+test "range printing source free all widths empty descending signed unsigned extremes O0 O3 stdout failures" {
+    var ir = Ir.init(test_gpa);
+    defer ir.deinit();
+    var t: IterationLengthTest = .{ .ir = &ir };
+    defer t.instructions.deinit(test_gpa);
+    const unit = try ir.internType(.void);
+    var expected = std.Io.Writer.Allocating.init(test_gpa);
+    defer expected.deinit();
+    var args: [64][1]Ir.ValueId = undefined;
+    var row: usize = 0;
+    for ([_]u16{ 8, 16, 32, 64 }) |bits| {
+        for ([_]std.builtin.Signedness{ .signed, .unsigned }) |signedness| {
+            const ty = try ir.internType(.{ .integer = .{ .signedness = signedness, .bits = bits } });
+            const minimum: i128 = if (signedness == .signed) -(@as(i128, 1) << @intCast(bits - 1)) else 0;
+            const maximum: i128 = (@as(i128, 1) << @intCast(bits - @intFromBool(signedness == .signed))) - 1;
+            for ([_][2]i128{ .{ minimum, maximum }, .{ maximum, minimum }, .{ 0, 0 }, .{ 0, 10 } }) |bounds| {
+                for ([_]bool{ false, true }) |inclusive| {
+                    args[row][0] = try t.range(ty, bounds[0], bounds[1], inclusive);
+                    _ = try t.append(unit, .{ .print = .{ .args = &args[row], .newline = true } });
+                    row += 1;
+                    try expected.writer.print("{d}..{s}{d}\n", .{ bounds[0], if (inclusive) "=" else "", bounds[1] });
+                }
+            }
+        }
+    }
+    const signature = try ir.internType(.{ .function = .{ .params = &.{}, .result = unit } });
+    const main = try ir.addFunction("main", signature, .{ .start = 0, .end = 0 });
+    const result = try t.append(unit, .{ .constant = try ir.internConstant(.{ .ty = unit, .value = .void }) });
+    try ir.setFunctionBody(main, t.instructions.items, result);
+    const c = try emitProgram(test_gpa, &ir, null);
+    defer test_gpa.free(c);
+    try std.testing.expect(std.mem.indexOf(u8, c, "nov_gc_push") == null);
+    try std.testing.expect(std.mem.indexOf(u8, c, "nov_range_count") == null);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(c, "typedef int nonempty;", 0, expected.written(), "", mode);
+    for ([_][]const u8{ "", "-128", "-128.." }, 1..) |output, failed_write| {
+        const prefix = try std.fmt.allocPrint(
+            test_gpa,
+            "#include <stdio.h>\nstatic size_t writes;\nstatic size_t fail_write(const void *p, size_t s, size_t n, FILE *f) {{ if (f == stdout && ++writes == {d}) return 0; return fwrite(p, s, n, f); }}\n#define fwrite fail_write\n",
+            .{failed_write},
+        );
+        defer test_gpa.free(prefix);
+        const failed = try std.mem.concat(test_gpa, u8, &.{ prefix, c });
+        defer test_gpa.free(failed);
+        try compileAndRunExpected(failed, "typedef int nonempty;", 1, output, "panic: stdout write failed\n");
+    }
+    const failed_flush = try std.mem.concat(test_gpa, u8, &.{
+        "#include <stdio.h>\nstatic int fail_flush(FILE *f) { return f == stdout ? EOF : fflush(f); }\n#define fflush fail_flush\n",
+        c,
+    });
+    defer test_gpa.free(failed_flush);
+    try compileAndRunExpected(failed_flush, "typedef int nonempty;", 1, expected.written(), "panic: stdout write failed\n");
+}
+
+test "range printing runtime bounds nested arrays records unions interpolation forced GC O0 O3" {
+    var ir = Ir.init(test_gpa);
+    defer ir.deinit();
+    const span: Ir.Span = .{ .start = 0, .end = 0 };
+    const unit = try ir.internType(.void);
+    const string = try ir.internType(.string);
+    const integer = try ir.internType(.{ .integer = .{ .bits = 64, .signedness = .signed } });
+    const range = try ir.internType(.{ .range = integer });
+    const array = try ir.internType(.{ .array = range });
+    const record = try ir.internType(.{ .record = .{ .identity = 0, .fields = &.{} } });
+    try ir.setRecordFields(record, &.{
+        .{ .name = "bounds", .ty = range, .span = span },
+        .{ .name = "items", .ty = array, .span = span },
+    });
+    const tagged = try ir.internType(.{ .record = .{ .identity = 1, .tagged = true, .fields = &.{} } });
+    try ir.setRecordFields(tagged, &.{
+        .{ .name = "record", .ty = record, .span = span },
+        .{ .name = "range", .ty = range, .span = span },
+    });
+    try ir.setTypeFormatting(record, "Bounds", null);
+    try ir.setTypeFormatting(tagged, "Choice", null);
+    const make = struct {
+        fn instruction(ty: Ir.TypeId, op: Ir.Operation) Ir.Instruction {
+            return .{ .ty = ty, .span = .{ .start = 0, .end = 0 }, .op = op };
+        }
+    }.instruction;
+    for ([_]Ir.TypeId{ range, array, record, tagged }, 0..) |ty, i| {
+        const name = try std.fmt.allocPrint(test_gpa, "show{d}", .{i});
+        defer test_gpa.free(name);
+        const signature = try ir.internType(.{ .function = .{ .params = &.{ty}, .result = unit } });
+        const function = try ir.addFunction(name, signature, span);
+        try ir.setFunctionBody(function, &.{
+            make(ty, .{ .parameter = 0 }),
+            make(unit, .{ .print = .{ .args = &.{@fromBackingInt(0)}, .newline = true } }),
+            make(string, .{ .to_string = @fromBackingInt(0) }),
+            make(string, .{ .constant = try ir.internConstant(.{ .ty = string, .value = .{ .string = "<>" } }) }),
+            make(string, .{ .binary = .{ .op = .add, .lhs = @fromBackingInt(2), .rhs = @fromBackingInt(3) } }),
+            make(unit, .{ .print = .{ .args = &.{@fromBackingInt(4)}, .newline = true } }),
+        }, @fromBackingInt(5));
+    }
+    const next_ty = try ir.internType(.{ .function = .{ .params = &.{}, .result = integer } });
+    const next = try ir.addFunction("next", next_ty, span);
+    try ir.setExternName(next, "next_bound");
+    const runtime_ty = try ir.internType(.{ .function = .{ .params = &.{}, .result = unit } });
+    const runtime = try ir.addFunction("runtime", runtime_ty, span);
+    try ir.setFunctionBody(runtime, &.{
+        make(next_ty, .{ .function_ref = next }),
+        make(integer, .{ .call = .{ .callee = @fromBackingInt(0), .args = &.{} } }),
+        make(integer, .{ .call = .{ .callee = @fromBackingInt(0), .args = &.{} } }),
+        make(range, .{ .range_init = .{ .start = @fromBackingInt(1), .end = @fromBackingInt(2), .inclusive = true } }),
+        make(unit, .{ .print = .{ .args = &.{ @fromBackingInt(3), @fromBackingInt(3) }, .newline = true } }),
+    }, @fromBackingInt(4));
+    const c = try emit(test_gpa, &ir, null);
+    defer test_gpa.free(c);
+    const driver = try std.fmt.allocPrint(test_gpa,
+        \\static int calls;
+        \\int64_t next_bound(void) {{ ++calls; fputc('A' + calls - 1, stdout); return calls == 1 ? -10 : 20; }}
+        \\int main(void) {{
+        \\    nov_rt_heap.collect_every_allocation = 1;
+        \\    nov_runtime(); if (calls != 2) return 2;
+        \\    nov_range_{d} bounds = {{-10, 20, true}};
+        \\    nov_range_{d} items[] = {{{{0, 10, false}}, {{5, -5, false}}}};
+        \\    nov_gc_descriptor element = {{sizeof items[0], _Alignof(nov_range_{d}), 0, NULL}};
+        \\    nov_array array = nov_array_new(2, 2, &element);
+        \\    memcpy(array.data, items, sizeof items);
+        \\    void **roots[] = {{&array.data}};
+        \\    nov_gc_roots frame = {{0}}; nov_gc_push(&nov_rt_heap, &frame, roots, 1);
+        \\    nov_record_{d} record = {{bounds, array}};
+        \\    nov_record_{d} choice = {{0}}; choice.f0 = record;
+        \\    nov_show0(bounds); nov_show1(array); nov_show2(record); nov_show3(choice);
+        \\    choice.tag = 1; choice.f1 = bounds; nov_show3(choice);
+        \\    nov_gc_pop(&nov_rt_heap, &frame);
+        \\    nov_gc_collect(&nov_rt_heap); if (nov_rt_heap.live_objects) return 3;
+        \\    nov_gc_shutdown(&nov_rt_heap); return 0;
+        \\}}
+        \\
+    , .{ @backingInt(range), @backingInt(range), @backingInt(range), @backingInt(record), @backingInt(tagged) });
+    defer test_gpa.free(driver);
+    const executable = try std.mem.concat(test_gpa, u8, &.{ c, driver });
+    defer test_gpa.free(executable);
+    const output = "AB-10..=20 -10..=20\n" ++
+        "-10..=20\n-10..=20<>\n" ++
+        "[0..10, 5..-5]\n[0..10, 5..-5]<>\n" ++
+        "Bounds[ bounds: -10..=20, items: [0..10, 5..-5] ]\nBounds[ bounds: -10..=20, items: [0..10, 5..-5] ]<>\n" ++
+        "Choice.record[ bounds: -10..=20, items: [0..10, 5..-5] ]\nChoice.record[ bounds: -10..=20, items: [0..10, 5..-5] ]<>\n" ++
+        "Choice.range[-10..=20]\nChoice.range[-10..=20]<>\n";
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(executable, "typedef int nonempty;", 0, output, "", mode);
 }
 
 test "printing formats all integer widths boolean spacing and empty calls" {

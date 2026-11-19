@@ -15,3 +15,6 @@ let string = @import("string.nov")
 
 @[public]
 let trivial = @import("trivial.nov")
+
+@[public]
+let range = @import("range.nov")

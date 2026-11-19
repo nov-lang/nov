@@ -160,7 +160,7 @@ fn resolveEnvironmentInner(module: *Module, ir: *Ir, node: Ast.Node.Index, env: 
                     if (!param.inferred) try work.append(module.allocator, .{ .visit = .{ .module = owner, .node = param.type_expr, .depth = visit.depth + 1, .alias_depth = visit.alias_depth, .local = visit.local } });
                 }
                 if (proto.ast.return_type) |result| try work.append(module.allocator, .{ .visit = .{ .module = owner, .node = result, .depth = visit.depth + 1, .alias_depth = visit.alias_depth, .local = visit.local } });
-            } else if (ast.nodes.items(.tag)[visit.node] == .array_type or ast.nodes.items(.tag)[visit.node] == .ref_type) {
+            } else if (ast.nodes.items(.tag)[visit.node] == .array_type or ast.nodes.items(.tag)[visit.node] == .ref_type or (ast.nodes.items(.tag)[visit.node] == .range and ast.nodes.items(.data)[visit.node].lhs == 0)) {
                 try work.append(module.allocator, .{ .visit = .{ .module = owner, .node = ast.nodes.items(.data)[visit.node].rhs, .depth = visit.depth + 1, .alias_depth = visit.alias_depth, .local = visit.local } });
             } else if (ast.fullCall(visit.node)) |call| {
                 if (isTypeOf(ast, call)) continue;
@@ -281,6 +281,13 @@ fn resolveDepth(module: *Module, ir: *Ir, node: Ast.Node.Index, depth: usize, al
         const child = (try resolveDepth(module, ir, data.rhs, depth + 1, aliases, env)) orelse return null;
         if (!Ir.isArrayElement(ir.getType(child).?)) return diagnose(module, node, .unsupported_borrow);
         return try ir.internType(.{ .reference = .{ .child = child, .mutable = data.lhs != 0 } });
+    }
+    if (ast.nodes.items(.tag)[node] == .range and ast.nodes.items(.data)[node].lhs == 0 and
+        ast.tokens.items(.tag)[ast.nodes.items(.main_token)[node]] == .period_period)
+    {
+        const element = (try resolveDepth(module, ir, ast.nodes.items(.data)[node].rhs, depth + 1, aliases, env)) orelse return null;
+        if (ir.getType(element).? != .integer) return diagnose(module, node, .unsupported_type);
+        return try ir.internType(.{ .range = element });
     }
     if (ast.nodes.items(.tag)[node] == .array_type) {
         const element = (try resolveDepth(module, ir, ast.nodes.items(.data)[node].rhs, depth + 1, aliases, env)) orelse return null;
@@ -795,6 +802,35 @@ fn testResolve(allocator: std.mem.Allocator, source: []const u8) !void {
         if (node != 0) _ = try resolve(&module, &ir, node);
     }
     try ir.verify();
+}
+
+test "source range types resolve canonical integer children and reject values" {
+    for ([_][]const u8{ "i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "i128", "u128", "int", "uint" }) |child| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let R=..{s}\nlet a:R\nlet b:[]..{s}\n", .{ child, child });
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "range-types.nov", source);
+        defer module.deinit();
+        var ir = Ir.init(std.testing.allocator);
+        defer ir.deinit();
+        const ty = (try resolve(&module, &ir, testTypeNode(&module, "a"))).?;
+        try std.testing.expectEqual(.integer, std.meta.activeTag(ir.getType(ir.getType(ty).?.range).?));
+        const array = (try resolve(&module, &ir, testTypeNode(&module, "b"))).?;
+        try std.testing.expectEqual(ty, ir.getType(array).?.array);
+        try std.testing.expect(!module.hasErrors());
+        try ir.verify();
+    }
+    for ([_][]const u8{ "..bool", "..f32", "..rune", "..str", "..void", "..[]u8", "....u8", "..&u8", "..()->u8", "..true" }) |expression| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let a:{s}\n", .{expression});
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "invalid-range-type.nov", source);
+        defer module.deinit();
+        var ir = Ir.init(std.testing.allocator);
+        defer ir.deinit();
+        try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
+        try std.testing.expectEqual(null, try resolve(&module, &ir, testTypeNode(&module, "a")));
+        try std.testing.expect(module.hasErrors());
+    }
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testResolve, .{"let R=..u8\nlet a:[]R\nlet f:(..u8)->..u8\n"});
 }
 
 test "explicit primitive types have canonical identities and widths" {

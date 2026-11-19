@@ -264,7 +264,7 @@ and reference-parameter forwarding preserve ordinary call rules. Copies recurse
 through active union arrays, share closure environments/cells, and copy range
 bounds/inclusivity; exact field replacement and supported nested paths work.
 Formatting accepts direct function-type fields; default printability still requires
-an enclosing hook for functions/ranges. See examples/storable-fields.nov (six tests).
+an enclosing hook for functions; ranges print their numeric bounds. See examples/storable-fields.nov (six tests).
 
 Function/closure and range union payloads are supported, completing ordinary
 storable value payload coverage. Callable copies share environments/captured cells;
@@ -273,8 +273,8 @@ one layer before call/iteration. Existing @TypeOf can name a range type, and dir
 inline range constructors are disambiguated from slicing using the variant base;
 omitted endpoints remain invalid. Contextual generic function specialization,
 container maps/chains/find, exact types, active roots/zeroed inactive slots and
-copy behavior are covered. Functions/ranges remain unprintable unless an enclosing
-stringify hook stops recursion. Direct struct fields now support those types;
+copy behavior are covered. Functions remain unprintable unless an enclosing
+stringify hook stops recursion; ranges print recursively. Direct struct fields now support those types;
 reference payloads/escape, recursive layouts and structural signature cycles remain
 unsupported. Function/reference edges do not consume inline-layout depth. See
 examples/value-payloads.nov (six tests).
@@ -555,10 +555,10 @@ example-validation counts are claimed here.
 
 Arrays now support all existing storable runtime types: bool, integer, rune,
 string, enums, finite acyclic records, existing tagged unions, functions/closures,
-nested arrays and inferred integer ranges. `void` and compile-time `type` are not
+nested arrays and integer ranges. `void` and compile-time `type` are not
 storable; `f32`/`f64` are supported. Semantic integers extend through 128 bits;
 reachable backend widths remain 8/16/32/64, including nested layouts and function
-signatures. No new range annotation syntax is added; integer fallback follows the
+signatures. Range arrays can be annotated `[]..T`; integer fallback follows the
 context-first rules above.
 Nested arrays copy recursively independently; tagged union copies detach only
 active payload array backing, including record payloads containing arrays. Existing
@@ -573,9 +573,9 @@ unions, records and nested arrays, with exact nominal identity and recursive
 equality. Arrays now support
 recursive printing/interpolation for printable elements; nested nominal values
 use exact `@[stringify]` converters once in traversal order, overriding their value
-and stopping structural recursion. Functions/closures and ranges have no default
-representation; aggregates containing them need an enclosing valid hook that
-stops recursion. Malformed/inaccessible nested hooks reject.
+and stopping structural recursion. Ranges print their exact numeric bounds.
+Functions/closures have no default representation; aggregates containing them
+need an enclosing valid hook that stops recursion. Malformed/inaccessible nested hooks reject.
 Direct chained indexed/computed writes and `items[i].field` mutation remain
 unsupported. Use a mutable element copy and assign it back, or existing scoped
 stable-owner element loans for supported nested-array updates/replacement. No new
@@ -714,11 +714,20 @@ loop. Locals/copies/assignment and inferred branch/block/loop results work. Incl
 state is per value, endpoint type exact; dedicated literal-bound int/uint rules,
 empty reversed ranges and inclusive-MAX exhaustion remain unchanged. Otherwise
 unconstrained numeric-expression bounds now use int after typed-bound inference. No allocation.
-Inferred arrays of ranges work, copying bounds/inclusivity by value. No new range
-annotation syntax is added, but @TypeOf(0..1) can name an exact range type for
-signatures, struct fields, union payloads and data-only globals. Field attributes,
-printing/equality/membership and general iterator protocols remain unsupported.
+Arrays of ranges copy bounds/inclusivity by value. Source type `..T` requires
+integer endpoints; `@TypeOf(@as(u8, 0)..1)` prints `..u8`, replacing `range(u8)`.
+Aliases, ``..`T`` generic signatures, `[]..T`, references, fields and union payloads
+follow existing storage rules; globals remain data-only. Only finite ranges are
+values; open loop followers are unchanged. Default printing/interpolation uses
+`start..end` or `start..=end` with exact signed/unsigned bounds, including extrema.
+Array/record/union printing recurses and honors nested stringify hooks. No range
+fields, equality/membership or general iterator protocol are introduced.
 See examples/range-values.nov. Chained ranges diagnose; slice/match syntax preserved.
+
+`lib/range.nov` exposes ``std.range.toArray(range: ..`T) -> []`T`` using an ordinary
+loop and append with value copies. Empty/descending ranges yield empty arrays;
+inclusive extremes retain existing overflow-safe iteration. See
+`examples/range-types.nov` (five tests) for types, printing and materialization.
 
 `@len` extends existing array/string support to finite bounded integer ranges,
 returning native `uint` in O(1) without allocation or iteration. Reversed ranges

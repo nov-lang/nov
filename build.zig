@@ -141,6 +141,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const language_tests = b.step("test-cli-language-tests", "Run test command and assertion language CLI tests");
     addLanguageTestCliTests(b, exe, language_tests);
     test_step.dependOn(language_tests);
+    const range_type_tests = b.step("test-cli-range-types", "Run source range type, printing and standard-library conversion CLI tests");
+    addArrayValueHelperCliTests(b, exe, range_type_tests, "range-types.nov", @embedFile("examples/range-types.nov"), "..u8\n0..10\n-10..=20\n1..5\nValues: [1, 2, 3, 4]\n", "PASS range_types_aliases_fields_and_callbacks\nPASS range_printing_and_nested_values\nPASS empty_descending_and_inclusive_ranges\nPASS integer_widths_and_extreme_bounds\nPASS evaluation_snapshots_queries_and_independent_outputs\n5 passed; 0 failed; 5 total\n");
+    test_step.dependOn(range_type_tests);
     const trivial_tests = b.step("test-cli-trivial", "Run standard-library trivial helper CLI tests");
     addArrayValueHelperCliTests(b, exe, trivial_tests, "trivial.nov", @embedFile("examples/trivial.nov"), "Swapped: 2 1\nIdentity: 2\nConstant: 2\nFlipped: 7\n", "PASS swap_scalars\nPASS swap_aggregates_preserves_independence\nPASS identity_values_and_copies\nPASS constant_snapshots_and_shared_closures\nPASS flip_types_argument_order_and_shared_state\nPASS noop_and_unevaluated_queries\n6 passed; 0 failed; 6 total\n");
     test_step.dependOn(trivial_tests);
@@ -5055,7 +5058,7 @@ fn addArraySearchCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step
         .{ .name = "find-array-parameter", .expression = "std.array.find(@as([][]int,[[1]]),(x:int)->bool{true})", .diagnostic = "constraints require exactly identical types" },
         .{ .name = "find-union-reference-payload", .expression = "std.array.find(@as([]Payload,[.none[]]),yes)", .diagnostic = "not supported" },
         .{ .name = "find-function-parameter", .expression = "std.array.find([()->int{1}],(x:int)->bool{true})", .diagnostic = "constraints require exactly identical types" },
-        .{ .name = "find-range-parameter", .expression = "std.array.find([1..3],(x:int)->bool{true})", .diagnostic = "constraints require exactly identical types" },
+        .{ .name = "find-range-parameter", .expression = "std.array.find([1..3],(x:int)->bool{true})", .diagnostic = "expression does not match the expected type" },
         .{ .name = "any-empty", .expression = "std.array.any([],yes)", .diagnostic = "provide typed runtime arguments" },
         .{ .name = "all-empty", .expression = "std.array.all([],yes)", .diagnostic = "provide typed runtime arguments" },
         .{ .name = "find-empty", .expression = "std.array.find([],yes)", .diagnostic = "provide typed runtime arguments" },
@@ -7274,7 +7277,7 @@ fn addValuePayloadCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_ste
         .{ .name = "reference-capture", .source = "let main:()={let mut n=1\nlet view=&n\nlet f:std.Option(()->int)=.some[()->int{view.*}]\n}", .diagnostic = "local references require" },
         .{ .name = "borrow-escape", .source = "let bad:()->std.Option(&int)={let mut n=1\n.some[&n]}", .diagnostic = "not supported" },
         .{ .name = "print-function", .source = "let main:()={let x:std.Option(()->int)=.none[]\n@println(x)}", .diagnostic = "not implemented yet" },
-        .{ .name = "print-range", .source = "let main:()={let bounds=0..1\nlet x:std.Option(@TypeOf(0..1))=.some[bounds]\n@println(x)}", .diagnostic = "not implemented yet" },
+
         .{ .name = "print-nested", .source = "let U=union{value:()->int,none,}\nlet main:()={let x:std.Option(U)=.some[.none[]]\n@println(x)}", .diagnostic = "not implemented yet" },
         .{ .name = "function-reference-value", .source = "let U=union{f:(int)->int,}\nlet bad:(f:(int)->int)->U={let view=&f\n.f[view]}", .diagnostic = "local references require" },
         .{ .name = "range-reference-value", .source = "let U=union{r:@TypeOf(0..1),}\nlet bad:()->U={let range=0..1\n.r[&range]}", .diagnostic = "local references require" },
@@ -7362,7 +7365,7 @@ fn addStorableFieldCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_st
         .{ .name = "range-update", .source = "let S=struct{interval:@TypeOf(0..1),}\nlet f:(s:S,n:int)={let mut copy=s\ncopy.interval=n..n}", .diagnostic = "expected type" },
         .{ .name = "method-field-conflict", .source = "let S=struct{run:(int)->int,let run:(self:S,n:int)->int=n\n}\nlet f:(s:S)->int=s.run(1)", .diagnostic = "duplicate" },
         .{ .name = "print-function", .source = "let S=struct{run:()->int,}\nlet f:(s:S)=@println(s)", .diagnostic = "not implemented yet" },
-        .{ .name = "print-range", .source = "let S=struct{interval:@TypeOf(0..1),}\nlet f:(s:S)=@println(s)", .diagnostic = "not implemented yet" },
+
         .{ .name = "extern-record", .source = "let S=struct{run:()->int,}\n@[extern]\nlet foreign:(s:S)\nlet main:()={}", .diagnostic = "extern ABI supports only bool" },
         .{ .name = "export-record", .source = "let S=struct{value:std.Result([]int,str),}\n@[export]\nlet foreign:(s:S)={}\nlet main:()={}", .diagnostic = "export ABI supports only bool" },
     }) |case| {

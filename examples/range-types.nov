@@ -1,0 +1,119 @@
+let std = @import("std")
+
+let main: () = {
+    @println(@TypeOf(@as(u8, 0)..1))
+    @println(0..10)
+    @println(-10..=20)
+    let x = 1
+    let y = 5
+    @println(x..y)
+    @println("Values:", std.range.toArray(x..y))
+}
+
+let SmallRange = ..u8
+let Window = struct {
+    bounds: SmallRange,
+}
+let Span = union {
+    bounds: ..i16,
+    none,
+}
+
+@[test]
+let range_types_aliases_fields_and_callbacks: () = {
+    let bounds: SmallRange = 0..=3
+    @assert("{@TypeOf(bounds)}" == "..u8")
+    @assert("{@TypeOf([bounds])}" == "[]..u8")
+    let window = Window.[ bounds ]
+    let materialize = (range: ..u8) -> []u8 {
+        std.range.toArray(range)
+    }
+    @assert(materialize(window.bounds) == @as([]u8, [0, 1, 2, 3]))
+    let typed = @as(..u8, 1..3)
+    @assert(std.range.toArray(typed) == @as([]u8, [1, 2]))
+    let mapped = std.array.map([bounds], std.range.toArray)
+    @assert(mapped[0] == @as([]u8, [0, 1, 2, 3]))
+}
+
+@[test]
+let range_printing_and_nested_values: () = {
+    @assert("{0..10}" == "0..10")
+    @assert("{-10..=20}" == "-10..=20")
+    let bounds: ..i16 = -2..=3
+    @assert("{bounds}" == "-2..=3")
+    @assert("{[bounds, bounds]}" == "[-2..=3, -2..=3]")
+    @assert("{Window.[bounds=1..5]}" == "Window[ bounds: 1..5 ]")
+    @assert("{Span.bounds[bounds]}" == "Span.bounds[-2..=3]")
+    @assert("{std.Option(..i16).some[bounds]}" == "Option(..i16).some[-2..=3]")
+}
+
+@[test]
+let empty_descending_and_inclusive_ranges: () = {
+    @assert(std.range.toArray(0..4) == [0, 1, 2, 3])
+    @assert(std.range.toArray(-2..=1) == [-2, -1, 0, 1])
+    @assert(std.range.toArray(3..3) == @as([]int, []))
+    @assert(std.range.toArray(3..=3) == [3])
+    @assert(std.range.toArray(5..2) == @as([]int, []))
+    @assert(std.range.toArray(5..=2) == @as([]int, []))
+    @assert("{5..2}" == "5..2" and "{3..3}" == "3..3")
+}
+
+@[test]
+let integer_widths_and_extreme_bounds: () = {
+    @assert(std.range.toArray(@as(u8, 254)..=255) == @as([]u8, [254, 255]))
+    @assert(std.range.toArray(@as(i8, -128)..-126) == @as([]i8, [-128, -127]))
+    @assert(std.range.toArray(@as(i8, 126)..=127) == @as([]i8, [126, 127]))
+    @assert(std.range.toArray(@as(uint, 4)..6) == @as([]uint, [4, 5]))
+    @assert("{@as(u64, 18446744073709551615)..=18446744073709551615}" == "18446744073709551615..=18446744073709551615")
+    @assert("{@as(i64, -9223372036854775808)..=-9223372036854775808}" == "-9223372036854775808..=-9223372036854775808")
+}
+
+@[test]
+let evaluation_snapshots_queries_and_independent_outputs: () = {
+    let mut calls: uint = 0
+    let next = () -> int {
+        calls += 1
+        @as(int, 1)
+    }
+    let typeQuery: @TypeOf(std.range.toArray(next()..=next())) = []
+    @assert(calls == 0 and @len(typeQuery) == 0)
+    let bounds = next()..=next()
+    @assert(calls == 2 and "{bounds}" == "1..=1" and calls == 2)
+    let mut first = std.range.toArray(bounds)
+    let second = std.range.toArray(bounds)
+    first[0] = 9
+    @assert(first == [9] and second == [1])
+    let grouped: @TypeOf(
+        {
+            0
+        }..{
+            2
+        }
+    ) = {
+        0
+    }..{
+        2
+    }
+    let values: @TypeOf(
+        std.range.toArray(
+            {
+                0
+            }..{
+                2
+            }
+        )
+    ) = std.range.toArray(grouped)
+    @assert(values == @as([]uint, [0, 1]))
+    let large: @TypeOf(
+        {
+            18446744073709551614
+        }..={
+            18446744073709551615
+        }
+    ) = {
+        18446744073709551614
+    }..={
+        18446744073709551615
+    }
+    @assert(@len(std.range.toArray(large)) == 2)
+}
