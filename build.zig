@@ -219,6 +219,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const array_helper_tests = b.step("test-cli-array-helpers", "Run standard-library array helper CLI tests");
     addArrayHelperCliTests(b, exe, array_helper_tests);
     test_step.dependOn(array_helper_tests);
+    const array_flat_map_tests = b.step("test-cli-array-flat-map", "Run standard-library array flatMap CLI tests");
+    addArrayValueHelperCliTests(b, exe, array_flat_map_tests, "array-flat-map.nov", @embedFile("examples/array-flat-map.nov"), "Expanded: [1, 1, 2, 2, 3, 3]\n", "PASS order_empty_results_and_callback_count\nPASS flatten_one_layer_and_recursive_independence\nPASS storable_outputs_and_shared_closures\nPASS snapshots_inference_and_queries\n4 passed; 0 failed; 4 total\n");
+    test_step.dependOn(array_flat_map_tests);
     const array_reverse_tests = b.step("test-cli-array-reverse", "Run standard-library array reverse CLI tests");
     addArrayValueHelperCliTests(b, exe, array_reverse_tests, "array-reverse.nov", @embedFile("examples/array-reverse.nov"), "Reversed: [3, 2, 1]\nOriginal: [1, 2, 3]\n", "PASS order_empty_and_singleton\nPASS recursive_storage_independence\nPASS storable_types_and_shared_closure_cells\nPASS inferred_callback_and_unevaluated_query\n4 passed; 0 failed; 4 total\n");
     test_step.dependOn(array_reverse_tests);

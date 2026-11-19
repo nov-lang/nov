@@ -10618,6 +10618,64 @@ fn runApprovedHelperHarness(library: []const u8, harness: []const u8, oom: bool)
         try compileAndRunMode(c, "typedef int nonempty_translation_unit;", if (oom) 1 else 0, "", if (oom) "panic: GC allocation failed\n" else "", mode);
 }
 
+test "array flatMap actual stdlib source free recursive copies forced GC O0 O3 and runtime OOM" {
+    const library = try emitApprovedHelperSourceFree(test_gpa,
+        \\let std=@import("std")
+        \\let make:()->[][]int=[[1],[2]]
+        \\let duplicate:(items:[][]int)->[][]int=std.array.flatMap(items,(row){[row,row]})
+    );
+    defer test_gpa.free(library);
+    try runApprovedHelperHarness(library,
+        \\int main(void) {
+        \\    nov_rt_heap.collect_every_allocation = 1;
+        \\    nov_array input = {0}, result = {0};
+        \\    void **roots[] = {&input.data, &result.data};
+        \\    nov_gc_roots frame = {0}; nov_gc_push(&nov_rt_heap, &frame, roots, 2);
+        \\    input = nov_make(); result = nov_duplicate(input);
+        \\    nov_array *a = input.data, *b = result.data;
+        \\    if (result.len != 4 || a == b || a[0].data == b[0].data || b[0].data == b[1].data) return 1;
+        \\    ((intptr_t *)a[0].data)[0] = 9; ((intptr_t *)b[0].data)[0] = 8;
+        \\    if (((intptr_t *)b[1].data)[0] != 1 || ((intptr_t *)b[2].data)[0] != 2 || ((intptr_t *)b[3].data)[0] != 2) return 2;
+        \\    input = (nov_array){0}; nov_gc_collect(&nov_rt_heap);
+        \\    b = result.data;
+        \\    if (((intptr_t *)b[1].data)[0] != 1) return 3;
+        \\    fail_allocations = 1;
+        \\    if (nov_duplicate((nov_array){0}).len) return 4;
+        \\    nov_gc_pop(&nov_rt_heap, &frame); nov_gc_collect(&nov_rt_heap);
+        \\    if (nov_rt_heap.frames || nov_rt_heap.live_objects) return 5;
+        \\    nov_gc_shutdown(&nov_rt_heap); return 0;
+        \\}
+    , false);
+    try runApprovedHelperHarness(library,
+        \\int main(void) {
+        \\    nov_array input = {0};
+        \\    void **roots[] = {&input.data};
+        \\    nov_gc_roots frame = {0}; nov_gc_push(&nov_rt_heap, &frame, roots, 1);
+        \\    input = nov_make(); fail_allocations = 1;
+        \\    (void)nov_duplicate(input); return 0;
+        \\}
+    , true);
+}
+
+test "array flatMap callback panic stops traversal after eager argument evaluation O0 O3" {
+    const library = try emitApprovedHelperSourceFree(test_gpa,
+        \\let std=@import("std")
+        \\let items:()->[]int={@print("I")
+        \\[1,2,3]}
+        \\let callback:()->(int)->[]int={@print("C")
+        \\(x:int)->[]int{@print(x)
+        \\if x==2 {@panic("callback stopped")}
+        \\[x]}}
+        \\let main:()={let result=std.array.flatMap(items(),callback())
+        \\@println(result)}
+    );
+    defer test_gpa.free(library);
+    const program = try collectingTestProgram(library);
+    defer test_gpa.free(program);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(program, "typedef int nonempty_translation_unit;", 1, "IC12", "panic: callback stopped\n", mode);
+}
+
 test "array reverse actual stdlib source free recursive copies forced GC O0 O3 and runtime OOM" {
     const library = try emitApprovedHelperSourceFree(test_gpa,
         \\let std=@import("std")

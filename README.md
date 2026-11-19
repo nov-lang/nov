@@ -1787,6 +1787,14 @@ operations remain available through demand specialization. See
 
 #### Array helpers
 
+`std.array.flatMap(items: []T, convert: (T) -> []U) -> []U` flattens callback
+arrays by one layer, retaining source and per-result order. It invokes the callback
+once per element (never for empty input); empty results contribute no elements.
+Arguments are eager and values retain ordinary recursive independence/shared
+closure environments. Callback failure stops traversal. This ordinary Nov helper
+uses existing append behavior, with no new allocation/performance guarantee. See
+[`examples/array-flat-map.nov`](examples/array-flat-map.nov).
+
 `std.array.reverse(items: []T) -> []T` returns a reversed copy without changing
 its input. All storable element types work; nested array storage is independent,
 while immutable strings and closure environments retain their usual sharing.

@@ -263,6 +263,12 @@ aliases, invalid arguments and relocated-install checks.
 Signatures here use `T`/`U` for inferred backtick type variables:
 
 - `array.map(items: []T, convert: (T) -> U) -> []U` converts every element.
+- `array.flatMap(items: []T, convert: (T) -> []U) -> []U` concatenates callback
+  arrays in source order, flattening exactly one layer. Each input invokes the
+  callback once; empty input invokes none, and empty callback arrays add nothing.
+  Arguments remain eager, returned storage is independent recursively, and closure
+  environments remain shared. Existing repeated-append costs still apply. See
+  `examples/array-flat-map.nov` and `zig build test-cli-array-flat-map`.
 - `array.reverse(items: []T) -> []T` returns an independent reversed value,
   including recursive array storage. Empty input stays empty; closures retain shared
   environments. It uses ordinary Nov indexing/append, with the existing copy costs
