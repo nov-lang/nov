@@ -6,6 +6,7 @@ const Tokenizer = @import("Tokenizer.zig");
 const primitives = @import("primitives.zig");
 const Literal = @import("Literal.zig");
 const TypeResolver = @import("TypeResolver.zig");
+const Module = @import("Module.zig");
 
 /// Supports scalar declarations/operators plus function signatures, calls,
 /// local blocks, if/else, loops with optional conditions/continuations, returns,
@@ -242,6 +243,8 @@ fn checkSupported(ast: Ast) !void {
                 const name = ast.tokenSlice(data.lhs);
                 if (std.mem.eql(u8, name, "export") or std.mem.eql(u8, name, "extern")) {
                     if (data.rhs != 0 and ast.nodes.items(.tag)[data.rhs] != .string_literal) return error.UnsupportedSyntax;
+                } else if (std.mem.eql(u8, name, "operator")) {
+                    if (Module.operatorArgument(&ast, data.rhs) == null) return error.UnsupportedSyntax;
                 } else if (data.rhs != 0 or (!std.mem.eql(u8, name, "public") and !std.mem.eql(u8, name, "noreturn") and !std.mem.eql(u8, name, "test") and !std.mem.eql(u8, name, "stringify"))) return error.UnsupportedSyntax;
             },
             .builtin_literal => {
@@ -1029,6 +1032,30 @@ test "TypeOf formatting preserves annotations type arguments and interpolation" 
         "let n=1\nlet T=@TypeOf(n)\nlet f:(x:int)->@TypeOf(x)={let y:[]@TypeOf(x)=[x]\n@println(@TypeOf(y),\"{@TypeOf(x)}\")\nx}",
         "let n = 1\nlet T = @TypeOf(n)\nlet f: (x: int) -> @TypeOf(x) = {\n    let y: []@TypeOf(x) = [x]\n    @println(@TypeOf(y), \"{@TypeOf(x)}\")\n    x\n}\n",
     );
+}
+
+test "operator formatting preserves literal tags qualified syntax comments and OOM" {
+    try expectFormatted("let S=struct{\n@[operator(.equal)]\nlet eq:(a:S,b:S)->bool=true\n}", "let S = struct {\n    @[operator(.equal)]\n    let eq: (a: S, b: S) -> bool = true\n}\n");
+    for (std.meta.tags(Module.Operator)) |operator| {
+        const source = try std.fmt.allocPrintSentinel(std.testing.allocator, "let S=struct{{\n@[operator(.{s})]\nlet eq:(a:S,b:S)->bool=true\n}}", .{@tagName(operator)}, 0);
+        defer std.testing.allocator.free(source);
+        const result = try format(std.testing.allocator, source);
+        defer std.testing.allocator.free(result);
+        try expectFormatted(source, result);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{source});
+    }
+    for ([_][:0]const u8{
+        "let S=struct{\n@[public]\n@[operator(std.builtin.Operator.equal)]\nlet compare:(a:S,b:S)->bool=true\n}",
+        "let S=struct{\n@[operator( ; tag\n.equal, ; comma\n)] ; end\nlet compare:(a:S,b:S)->bool=true\n}",
+    }) |source| {
+        const result = try format(std.testing.allocator, source);
+        defer std.testing.allocator.free(result);
+        try expectFormatted(source, result);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{source});
+    }
+    for ([_][:0]const u8{ "@[operator]\nlet f:()={}", "@[operator(1)]\nlet f:()={}", "@[operator(.unknown)]\nlet f:()={}", "@[operator(.equal,.add)]\nlet f:()={}" }) |source| {
+        try std.testing.expectError(error.UnsupportedSyntax, format(std.testing.allocator, source));
+    }
 }
 
 test "stringify formatting preserves argument free attributes and arbitrary method names" {

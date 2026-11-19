@@ -1,0 +1,21 @@
+@[public]
+let Operator = enum {
+    equal, ; ==
+    less_than, ; <
+    add, ; +
+    sub, ; -
+    mul, ; *
+    div, ; /
+    rem, ; %
+    try, ; .!
+    deref, ; .*
+    deref_mut, ; .* (mutable)
+    index, ; []
+    index_mut, ; [] (mutable)
+    neg, ; - (negation)
+    bit_and, ; &
+    bit_or, ; |
+    bit_xor, ; ^
+    shl, ; <<
+    shr, ; >>
+}

@@ -69,6 +69,240 @@ test "array concatenation validates global known data and folds lengths under OO
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testArrayConcatenationData, .{});
 }
 
+fn expectParsed(module: *const Module) !void {
+    if (module.source.ast.errors.len != 0) {
+        std.debug.print("global initializer parse errors: {any}\nsource:\n{s}\n", .{ module.source.ast.errors, module.source.ast.source });
+    }
+    try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
+}
+
+fn testStructuralEqualityData(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "global-equality.nov",
+        \\let E=enum{one,two,}
+        \\let R=struct{items:[][]int,kind:E,}
+        \\let U=union{none,some:R,number:int,}
+        \\let r=R.[items=[[1,2],[]],kind=.one]
+        \\let u=U.some[r]
+        \\let pass_array=[[1,2],[]]==[[1,2],[]]
+        \\let pass_length=[1]!=[1,2]
+        \\let pass_element=[[1]]!=[[2]]
+        \\let pass_record=r==R.[items=[[1,2],[]],kind=.one]
+        \\let pass_field=r!=R.[items=[[1,2],[]],kind=.two]
+        \\let pass_union=u==U.some[r]
+        \\let pass_payload=u!=U.some[R.[items=[],kind=.one]]
+        \\let pass_tag=U.number[1]!=u
+        \\let pass_void=U.none[]==U.none[]
+        \\let pass_enum=E.one!=E.two
+        \\let pass_zero=[0.0]==[-0.0]
+        \\let pass_float=[1.0]!=[2.0]
+        \\let pass_f32=[@as(f32,0.0)]==[@as(f32,-0.0)]
+        \\let pass_short=false and {[1]==[2]} or true
+        \\let main:()={}
+    );
+    defer module.deinit();
+    try expectParsed(&module);
+    var result = try Lowering.lower(&module);
+    defer result.deinit();
+    if (module.hasErrors()) std.debug.print("global equality: {any}\n", .{module.diagnostics.items});
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(result.lowering_complete);
+    try result.ir.verify();
+    var count: usize = 0;
+    for (result.ir.globals.items) |global| {
+        if (!std.mem.startsWith(u8, global.name, "pass_")) continue;
+        const body = result.ir.getFunction(global.initializer).?.body.?;
+        const instruction = body.instructions[@backingInt(body.result)];
+        // Short-circuit merge instructions intentionally remain in the IR.
+        if (instruction.op == .short_circuit) continue;
+        try std.testing.expect(instruction.op == .constant);
+        const value = result.ir.getConstant(instruction.op.constant).?.value;
+        try std.testing.expect(value == .boolean and value.boolean);
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 13), count);
+}
+
+test "global structural equality known data under OOM" {
+    try testStructuralEqualityData(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testStructuralEqualityData, .{});
+}
+
+test "global structural equality rejects exact type mismatches in frontend" {
+    for ([_][:0]const u8{
+        "let A=struct{x:int,}\nlet B=struct{x:int,}\nlet value=A.[x=1]==B.[x=1]",
+        "let E=enum{one,}\nlet F=enum{one,}\nlet value=E.one==F.one",
+        "let value=[@as(i8,1)]==[@as(i16,1)]",
+        "let value=[@as(f32,1.0)]==[@as(f64,1.0)]",
+        "let a=0..1\nlet b=0..1\nlet value=a==b",
+    }) |source| {
+        var module = try Module.init(std.testing.allocator, "global-equality-types.nov", source);
+        defer module.deinit();
+        try expectParsed(&module);
+        var result = try Lowering.lower(&module);
+        defer result.deinit();
+        try std.testing.expect(module.hasErrors());
+        try std.testing.expect(module.diagnostics.items.len != 0);
+        for (module.diagnostics.items) |diagnostic| {
+            try std.testing.expect(diagnostic.tag != .unsupported_global_initializer);
+            try std.testing.expect(diagnostic.tag != .unsupported_dependency_expression);
+        }
+        try std.testing.expect(!result.lowering_complete);
+    }
+}
+
+test "global structural equality safely skips unreachable hooks" {
+    var module = try Module.init(std.testing.allocator, "global-equality-skipped-hooks.nov",
+        \\let S=struct{x:int,
+        \\@[operator(.equal)]
+        \\let eq:(a:S,b:S)->bool=false
+        \\}
+        \\let U=union{none,some:S,}
+        \\let P=struct{first:int,item:S,}
+        \\let empty:[]S=[]
+        \\let pass_empty=empty==empty
+        \\let pass_length=empty!=[S.[x=1]]
+        \\let pass_tag=U.none[]!=U.some[S.[x=1]]
+        \\let pass_void=U.none[]==U.none[]
+        \\let pass_field=P.[first=1,item=S.[x=1]]!=P.[first=2,item=S.[x=1]]
+        \\let pass_short=true or {S.[x=1]==S.[x=1]}
+        \\let main:()={}
+    );
+    defer module.deinit();
+    try expectParsed(&module);
+    var result = try Lowering.lower(&module);
+    defer result.deinit();
+    if (module.hasErrors()) std.debug.print("global skipped hooks: {any}\n", .{module.diagnostics.items});
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(result.lowering_complete);
+    try result.ir.verify();
+    var count: usize = 0;
+    for (result.ir.globals.items) |global| {
+        if (!std.mem.startsWith(u8, global.name, "pass_") or std.mem.eql(u8, global.name, "pass_short")) continue;
+        const body = result.ir.getFunction(global.initializer).?.body.?;
+        const instruction = body.instructions[@backingInt(body.result)];
+        try std.testing.expect(instruction.op == .constant);
+        const value = result.ir.getConstant(instruction.op.constant).?.value;
+        try std.testing.expect(value == .boolean and value.boolean);
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 5), count);
+}
+
+test "global structural equality membership evaluates known aggregates directly" {
+    // The legacy dependency scanner rejects global `in` before data validation.
+    // Exercise the evaluator directly rather than mistaking that for hook rejection.
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    const span: Ir.Span = .{ .start = 0, .end = 0 };
+    const boolean = try ir.internType(.boolean);
+    const unit = try ir.internType(.void);
+    const integer = try ir.internType(.{ .integer = .{ .bits = 32, .signedness = .signed } });
+    const array = try ir.internType(.{ .array = integer });
+    const record = try ir.internType(.{ .record = .{ .identity = 0, .fields = &.{} } });
+    try ir.setRecordFields(record, &.{.{ .name = "items", .ty = array, .span = span }});
+    const tagged = try ir.internType(.{ .record = .{ .identity = 1, .tagged = true, .fields = &.{} } });
+    try ir.setRecordFields(tagged, &.{ .{ .name = "none", .ty = unit, .span = span }, .{ .name = "some", .ty = record, .span = span } });
+    const one: Data = .{ .scalar = .{ .signed_integer = 1 } };
+    const items: Data = .{ .aggregate = &.{one} };
+    const row: Data = .{ .aggregate = &.{items} };
+    const some: Data = .{ .tagged = .{ .index = 1, .payload = &row } };
+    const none: Data = .{ .tagged = .{ .index = 0, .payload = null } };
+    for ([_]struct { ty: Ir.TypeId, value: Data, other: Data }{
+        .{ .ty = array, .value = items, .other = .{ .aggregate = &.{} } },
+        .{ .ty = record, .value = row, .other = .{ .aggregate = &.{.{ .aggregate = &.{} }} } },
+        .{ .ty = tagged, .value = some, .other = none },
+        .{ .ty = tagged, .value = none, .other = some },
+    }) |case| {
+        const container = try ir.internType(.{ .array = case.ty });
+        const instructions = [_]Ir.Instruction{
+            .{ .ty = case.ty, .span = span, .op = undefined },
+            .{ .ty = container, .span = span, .op = undefined },
+        };
+        var values = [_]Data{ case.value, .{ .aggregate = &.{ case.other, case.value } } };
+        const evaluator: Evaluator = .{ .allocator = std.testing.allocator, .ir = &ir, .globals = &.{}, .values = &values, .instructions = &instructions };
+        const contains: Ir.Instruction = .{ .ty = boolean, .span = span, .op = .{ .array_contains = .{ .value = @fromBackingInt(0), .array = @fromBackingInt(1) } } };
+        try std.testing.expect((try evaluator.evaluate(contains)).scalar.boolean);
+        values[1] = .{ .aggregate = &.{case.other} };
+        try std.testing.expect(!(try evaluator.evaluate(contains)).scalar.boolean);
+        values[1] = .{ .aggregate = &.{} };
+        try std.testing.expect(!(try evaluator.evaluate(contains)).scalar.boolean);
+        if (case.ty == record) {
+            const signature = try ir.internType(.{ .function = .{ .params = &.{ record, record }, .result = boolean } });
+            const hook = try ir.addFunction("equal", signature, span);
+            try ir.setTypeEquality(record, hook);
+            // Empty scans need no comparison; nonempty scans must not bypass the hook.
+            try std.testing.expect(!(try evaluator.evaluate(contains)).scalar.boolean);
+            values[1] = .{ .aggregate = &.{case.value} };
+            try std.testing.expectError(error.InvalidData, evaluator.evaluate(contains));
+            try ir.setTypeEquality(record, null);
+        }
+    }
+}
+
+test "global structural float equality uses IEEE NaN and signed zero semantics" {
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    const boolean = try ir.internType(.boolean);
+    for ([_]u16{ 32, 64 }) |bits| {
+        const float = try ir.internType(.{ .float = bits });
+        const array = try ir.internType(.{ .array = float });
+        var values = [_]Data{ undefined, undefined, undefined };
+        const instructions = [_]Ir.Instruction{
+            .{ .ty = array, .span = .{ .start = 0, .end = 0 }, .op = undefined },
+            .{ .ty = array, .span = .{ .start = 0, .end = 0 }, .op = undefined },
+            .{ .ty = float, .span = .{ .start = 0, .end = 0 }, .op = undefined },
+        };
+        const evaluator: Evaluator = .{ .allocator = std.testing.allocator, .ir = &ir, .globals = &.{}, .values = &values, .instructions = &instructions };
+        for ([_]struct { lhs: u64, rhs: u64, expected: bool }{
+            .{ .lhs = if (bits == 32) 0x7fc00000 else 0x7ff8000000000000, .rhs = if (bits == 32) 0x7fc00000 else 0x7ff8000000000000, .expected = false },
+            .{ .lhs = 0, .rhs = if (bits == 32) 0x80000000 else 0x8000000000000000, .expected = true },
+            .{ .lhs = if (bits == 32) 0x3f800000 else 0x3ff0000000000000, .rhs = 0, .expected = false },
+        }) |case| {
+            const lhs: Data = .{ .scalar = .{ .float_bits = case.lhs } };
+            const rhs: Data = .{ .scalar = .{ .float_bits = case.rhs } };
+            values[0] = .{ .aggregate = &.{lhs} };
+            values[1] = .{ .aggregate = &.{rhs} };
+            values[2] = lhs;
+            for ([_]Ir.BinaryOp{ .eq, .ne }) |op| {
+                const actual = try evaluator.evaluate(.{ .ty = boolean, .span = .{ .start = 0, .end = 0 }, .op = .{ .binary = .{ .op = op, .lhs = @fromBackingInt(0), .rhs = @fromBackingInt(1) } } });
+                try std.testing.expectEqual(if (op == .eq) case.expected else !case.expected, actual.scalar.boolean);
+            }
+            const member = try evaluator.evaluate(.{ .ty = boolean, .span = .{ .start = 0, .end = 0 }, .op = .{ .array_contains = .{ .value = @fromBackingInt(2), .array = @fromBackingInt(1) } } });
+            try std.testing.expectEqual(case.expected, member.scalar.boolean);
+        }
+    }
+}
+
+test "global structural equality never invokes nominal hooks" {
+    for ([_][]const u8{
+        "S.[x=1]==S.[x=1]",
+        "S.[x=1]!=S.[x=2]",
+        "[S.[x=1]]==[S.[x=1]]",
+        "P.[item=S.[x=1]]==P.[item=S.[x=1]]",
+        "U.some[S.[x=1]]==U.some[S.[x=1]]",
+        "E.one==E.one",
+        "V.none[]==V.none[]",
+    }) |expression| {
+        const source = try std.mem.concat(std.testing.allocator, u8, &.{
+            "let S=struct{x:int,\n@[operator(.equal)]\nlet eq:(a:S,b:S)->bool=true\n}\n",
+            "let E=enum{one,\n@[operator(.equal)]\nlet eq:(a:E,b:E)->bool=true\n}\n",
+            "let V=union{none,\n@[operator(.equal)]\nlet eq:(a:V,b:V)->bool=true\n}\n",
+            "let P=struct{item:S,}\nlet U=union{none,some:S,}\nlet value=",
+            expression,
+        });
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "global-equality-hook.nov", source);
+        defer module.deinit();
+        try expectParsed(&module);
+        var result = try Lowering.lower(&module);
+        defer result.deinit();
+        try std.testing.expect(module.hasErrors());
+        if (module.diagnostics.items[0].tag != .unsupported_global_initializer) std.debug.print("global hook expression {s}: {any}\n", .{ expression, module.diagnostics.items });
+        try std.testing.expectEqual(Module.Diagnostic.Tag.unsupported_global_initializer, module.diagnostics.items[0].tag);
+        try std.testing.expect(!result.lowering_complete);
+    }
+}
+
 const Ref = struct { module: *Module, id: Module.DeclId };
 const Task = struct { ref: Ref, finish: bool = false, span: ?Module.Span = null };
 const State = enum { unvisited, visiting, resolved, failed };
@@ -464,7 +698,27 @@ const Evaluator = struct {
                     ~n;
                 break :blk try integerValue(ty, result);
             },
-            .binary => |binary| try self.evaluateBinary(instruction.ty, binary.op, try self.scalar(binary.lhs), try self.scalar(binary.rhs), self.ir.getType(self.instructions[@backingInt(binary.lhs)].ty).?),
+            .binary => |binary| blk: {
+                const ty = self.instructions[@backingInt(binary.lhs)].ty;
+                if (ty != self.instructions[@backingInt(binary.rhs)].ty) return error.InvalidData;
+                if (binary.enum_tag) break :blk try self.evaluateBinary(instruction.ty, binary.op, try self.scalar(binary.lhs), try self.scalar(binary.rhs), self.ir.getType(ty).?);
+                if (binary.op == .eq or binary.op == .ne) {
+                    const equal = try self.dataEqual(ty, self.get(binary.lhs), self.get(binary.rhs));
+                    break :blk .{ .boolean = if (binary.op == .eq) equal else !equal };
+                }
+                break :blk try self.evaluateBinary(instruction.ty, binary.op, try self.scalar(binary.lhs), try self.scalar(binary.rhs), self.ir.getType(ty).?);
+            },
+            .array_contains => |contains| blk: {
+                const ty = self.instructions[@backingInt(contains.value)].ty;
+                const array_type = self.ir.getType(self.instructions[@backingInt(contains.array)].ty).?;
+                if (array_type != .array or array_type.array != ty or !self.ir.hasValueEquality(ty)) return error.InvalidData;
+                const array = self.get(contains.array);
+                if (array != .aggregate) return error.InvalidData;
+                for (array.aggregate) |item| {
+                    if (try self.dataEqual(ty, self.get(contains.value), item)) break :blk .{ .boolean = true };
+                }
+                break :blk .{ .boolean = false };
+            },
             .short_circuit => |short| blk: {
                 const lhs = try self.scalar(short.lhs);
                 if (lhs != .boolean) return error.InvalidData;
@@ -478,6 +732,64 @@ const Evaluator = struct {
             else => return error.InvalidData,
         };
         return .{ .scalar = value };
+    }
+
+    fn dataEqual(self: Evaluator, id: Ir.TypeId, lhs: Data, rhs: Data) (std.mem.Allocator.Error || error{InvalidData})!bool {
+        if (!self.ir.hasValueEquality(id)) return error.InvalidData;
+        // Test before inspecting data: even identical tags or empty nominal
+        // records must use their hook. Children are visited only as needed.
+        if (self.ir.getTypeEquality(id)) |entry| {
+            if (entry.comparator != null) return error.InvalidData;
+        }
+        const ty = self.ir.getType(id) orelse return error.InvalidData;
+        switch (ty) {
+            .array => |child| {
+                if (lhs != .aggregate or rhs != .aggregate) return error.InvalidData;
+                if (lhs.aggregate.len != rhs.aggregate.len) return false;
+                for (lhs.aggregate, rhs.aggregate) |a, b| {
+                    if (!try self.dataEqual(child, a, b)) return false;
+                }
+                return true;
+            },
+            .record => |record| {
+                if (record.tagged) {
+                    if (lhs != .tagged or rhs != .tagged) return error.InvalidData;
+                    if (lhs.tagged.index >= record.fields.len or rhs.tagged.index >= record.fields.len) return error.InvalidData;
+                    if (lhs.tagged.index != rhs.tagged.index) return false;
+                    const child = record.fields[lhs.tagged.index].ty;
+                    if (self.ir.getType(child).? == .void) return true;
+                    return self.dataEqual(child, (lhs.tagged.payload orelse return error.InvalidData).*, (rhs.tagged.payload orelse return error.InvalidData).*);
+                }
+                if (lhs != .aggregate or rhs != .aggregate or lhs.aggregate.len != record.fields.len or rhs.aggregate.len != record.fields.len) return error.InvalidData;
+                for (record.fields, lhs.aggregate, rhs.aggregate) |field, a, b| {
+                    if (!try self.dataEqual(field.ty, a, b)) return false;
+                }
+                return true;
+            },
+            else => {},
+        }
+        if (lhs != .scalar or rhs != .scalar or std.meta.activeTag(lhs.scalar) != std.meta.activeTag(rhs.scalar)) return error.InvalidData;
+        const a = lhs.scalar;
+        const b = rhs.scalar;
+        return switch (ty) {
+            .void => if (a == .void) true else error.InvalidData,
+            .boolean => if (a == .boolean) a.boolean == b.boolean else error.InvalidData,
+            .string => if (a == .string) std.mem.eql(u8, a.string, b.string) else error.InvalidData,
+            .integer, .rune, .enumeration => try integer(a) == try integer(b),
+            .float => |bits| blk: {
+                if (a != .float_bits) return error.InvalidData;
+                // Value equality, not bit equality: NaNs differ and signed zeros agree.
+                if (bits == 32) {
+                    const x: f32 = @bitCast(@as(u32, @intCast(a.float_bits)));
+                    const y: f32 = @bitCast(@as(u32, @intCast(b.float_bits)));
+                    break :blk x == y;
+                }
+                const x: f64 = @bitCast(a.float_bits);
+                const y: f64 = @bitCast(b.float_bits);
+                break :blk x == y;
+            },
+            else => error.InvalidData,
+        };
     }
 
     // Use the wider evaluation integer so even the minimum native signed

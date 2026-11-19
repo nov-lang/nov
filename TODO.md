@@ -60,6 +60,32 @@ results. See `examples/array-fields.nov`.
 
 ## Current delivered status
 
+Structural value equality and explicit nominal equality hooks are delivered.
+`==` / `!=` require exact operand types: arrays compare length then elements,
+records compare fields, unions compare active tags and payloads, and enums compare
+raw tags by default. Nominal structs/unions/enums require exact identity, including
+generic arguments; anonymous records require the same exact structural type.
+Recursive traversal uses nested hooks and short-circuits at the first difference.
+Array membership uses the same equality. Floats retain IEEE semantics (NaN unequal,
+signed zeroes equal), including inside aggregates. Functions/closures, references
+and ranges have no default equality; enclosing nominal hooks can stop structural
+traversal before noncomparable contents.
+
+`@[operator(.equal)]` or a literal qualified canonical
+`std.builtin.Operator.equal` selects an ordinary immutable non-generic nominal
+method with a body and exact `(T, T) -> bool` signature. Generic containers may
+use `@This()` methods. One overload per operator per nominal container is allowed;
+duplicate/malformed attributes and test/noreturn/extern/export combinations reject.
+Qualified arguments must resolve to the canonical builtin enum, not another enum
+with a matching tag. Private visibility is honored; imported hooks require
+`@[public]`, and invalid/inaccessible nested hooks diagnose rather than falling
+back. `!=` negates equality; it has no separate hook. Enum match patterns always
+use raw identity, bypassing hooks. `std.builtin.Operator` exposes exactly `equal`,
+`less_than`, `add`, `sub`, `mul`, `div`, `rem`, `try`, `deref`, `deref_mut`, `index`,
+`index_mut`, `neg`, `bit_and`, `bit_or`, `bit_xor`, `shl`, `shr`; all except `equal`
+are reserved/unimplemented and diagnose unsupported operator overloads. Ordering,
+arithmetic, indexing and compound-assignment overloads remain deferred.
+
 `nov test --filter <text>` selects case-sensitive name substrings before semantic
 checking, in source order. Unselected semantic demands are ignored; syntax/attribute
 validation remains. `--timeout-ms <positive u32>` is an opt-in per-test execution
@@ -541,8 +567,10 @@ reference payloads remain unsupported. Function copies share existing environmen
 than deep-cloning closures; immutable capture snapshots and mutable shared cells
 retain their existing rules. Ranges copy bounds/inclusivity by value.
 
-Enum elements support exact nominal equality/membership. No equality or membership
-is added for functions, unions, records, arrays or ranges. Arrays now support
+Comparable elements support recursive equality/membership, including enums,
+unions, records and nested arrays, with exact nominal identity and recursive
+`@[operator(.equal)]` hooks. Functions, references and ranges have no default
+equality. Arrays now support
 recursive printing/interpolation for printable elements; nested nominal values
 use exact `@[stringify]` converters once in traversal order, overriding their value
 and stopping structural recursion. Functions/closures and ranges have no default
@@ -718,8 +746,9 @@ general comptime remain deferred.
 Growable []str and acyclic nested-record arrays are executable with independent
 element storage and shared immutable string backing. Index values and replacements,
 append, literal inference, copies/returns and managed owner tracing work. String
-membership compares bytes, including UTF-8/NUL; record membership/equality and
-indexed string compounds remain unsupported. Owned expanded GC pointer maps cover
+membership compares bytes, including UTF-8/NUL; record membership/equality now
+uses recursive structural comparison or explicit nominal hooks. Indexed string
+compounds remain unsupported. Owned expanded GC pointer maps cover
 all managed capacity slots, with checked alignment/size/OOM and zeroed owners.
 Nested/enum/union/function/closure and inferred range arrays now work under the
 storable-array contract above; escaping element aliases remain unsupported. Record
@@ -854,8 +883,8 @@ Default printability is recursive: functions/closures, ranges and void values ha
 no default representation, including inside aggregates, unless a valid enclosing
 hook stops recursion before them (void union alternatives are payloadless and okay). Unspecialized generics and namespaces are not runtime
 printable; floats use the round-trip-safe formatting contract above. Bare integer
-literals use ordinary context-first `int` fallback. This adds no builtin, array equality or other
-aggregate operations.
+literals use ordinary context-first `int` fallback. Printing adds no builtin;
+structural aggregate equality is delivered separately above.
 
 Print-context compile-time types work in `@println(int, []int, MyType, (int)->bool)`
 and interpolation such as `{int}`/`{MyType}`. They emit static name strings, not
@@ -989,7 +1018,7 @@ remains deferred; aliases do not add casts or alter the integer fallback rules.
 Next step: add new IR that
 - forward declaration
 - resolve literals
-- desugar operator overloading?
+- additional operator overloads beyond the delivered explicit equality hook
 - have more usage safety than Ast
 - start storing values in a constant pool
 
@@ -1133,7 +1162,7 @@ implemented; grapheme operations remain deferred.
 - add Timer for parsing_time, cod, 2 modes debug & release (ReleaseSafe)egen_time, runnning_time (or use tracy)
 - implement correct leaking allocation to have fast exit time?
 - add `let _ =` or `_ =` to discard the return value of an expression, it's mandatory to not ignore the returned value if it's != void
-- add operator overloading:
+- extend operator overloading beyond delivered `@[operator(.equal)]`:
   - compilation error when trying to use an operator for values of different types
   - compilation error when trying to use an operator that is not defined for the said value
   - `+` binary op is syntaxic sugar for Object.add, or iadd/fadd for int/float
@@ -1438,14 +1467,15 @@ local `&T` / `&mut T` references. Returning/storage remain accepted future work;
 reference returns are explicitly postponed pending an escape-lifetime decision.
 All further optimizations remain paused.
 
-`value in array` membership is delivered for bool, rune, string, enums and supported
-fixed/native integers with exact element types and bidirectional literal context
-before integer fallback (`1 in [1, 2]` and `1 in []` use `int` elements). It returns bool, evaluates left then right once, uses
-readonly RHS projection with required effect snapshots, and scans with typed
-equality and early exit without allocating. Formatter support is syntactic only.
-Functions, unions, records, nested arrays and ranges are storable elements but
-have no comparisons/membership; pointer elements, conversions and general iterator
-protocols remain unsupported.
+`value in array` membership is delivered for all comparable element types,
+including scalars, enums, records, unions and nested arrays, using exact types
+and recursive equality hooks. Bidirectional literal context precedes integer
+fallback (`1 in [1, 2]` and `1 in []` use `int` elements). It returns bool,
+evaluates left then right once, uses readonly RHS projection with required effect
+snapshots, and stops at the first match. Structural scanning does not allocate,
+but user equality hooks may allocate or have side effects. Formatter support is
+syntactic only. Functions/closures, references and ranges have no default equality;
+pointer elements, conversions and general iterator protocols remain unsupported.
 
 Side note about mutability. A constant array cannot be modified in any way, its
 values are constant too. A mutable array can be reassigned/extanded and its
@@ -1729,7 +1759,11 @@ pub fn main() !void {
 ```
 
 # Operator Overloading
-TODO:
+
+Equality hooks and derived `!=` are implemented; see Current delivered status
+and README's Value equality / Operator Overloading sections. All other
+`std.builtin.Operator` tags are reserved/unimplemented. The following are future
+design notes, not executable overloads:
 - `>>=`: `(*T, (*T) -> U) -> U`
 - `[]`: `(*T, int) -> U`
   - probably too complex since we should be able to overload it twice with `U` and `*mut U`

@@ -5,6 +5,7 @@ const Ast = @import("Ast.zig");
 const Module = @import("Module.zig");
 const Source = @import("Source.zig");
 const Compilation = @import("Compilation.zig");
+const TestAllocations = @import("TestAllocations.zig");
 
 const Location = struct {
     start: usize,
@@ -59,6 +60,27 @@ test "compilation diagnostics render related locations and backend leaves from t
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "library.nov:1:5: note:") != null);
     try renderCompilationBackend(&compilation, .{ .reason = .integer_width_unsupported, .function = null, .span = related }, &out.writer);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "library.nov:1:5: error: C backend") != null);
+}
+
+test "operator diagnostics render exact tags and related declarations with OOM coverage" {
+    try testOperatorDiagnostics(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testOperatorDiagnostics, .{});
+}
+
+fn testOperatorDiagnostics(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "operators.nov", "let first=true\nlet second=false");
+    defer module.deinit();
+    const first = module.getDeclaration(module.lookup("first").?).?.name_span;
+    const second = module.getDeclaration(module.lookup("second").?).?.name_span;
+    for ([_]Module.Diagnostic.Tag{ .invalid_operator_declaration, .duplicate_operator, .invalid_operator_signature, .unsupported_operator }) |tag| {
+        try module.diagnostics.append(allocator, .{ .tag = tag, .span = second, .related = if (tag == .duplicate_operator) first else null });
+    }
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+    renderModule(&module, &out.writer) catch return error.OutOfMemory;
+    for ([_][]const u8{ "@[operator(Operator)]", "only one overload per operator", "(SelfType, SelfType) -> bool", "unsupported operator overload", "operators.nov:1:5: note:" }) |text| {
+        try std.testing.expect(std.mem.indexOf(u8, out.written(), text) != null);
+    }
 }
 
 pub fn renderModule(module: *const Module, writer: *std.Io.Writer) !void {
@@ -145,6 +167,10 @@ fn renderModuleWithSources(module: *const Module, compilation: ?*const Compilati
             .invalid_to_string => try writer.writeAll("@[stringify] method must be accessible with exact signature (SelfType) -> str; imported methods require @[public]"),
             .invalid_stringify_declaration => try writer.writeAll("@[stringify] requires an ordinary immutable container method with a body, takes no arguments, cannot be repeated, and cannot be combined with test, noreturn, extern or export"),
             .duplicate_stringifier => try writer.writeAll("only one @[stringify] method is allowed per container"),
+            .invalid_operator_declaration => try writer.writeAll("@[operator(Operator)] requires one literal std.builtin.Operator tag and an ordinary immutable non-generic container method with a body; cannot be repeated or combined with test, noreturn, extern or export"),
+            .duplicate_operator => try writer.writeAll("only one overload per operator is allowed per nominal container"),
+            .invalid_operator_signature => try writer.writeAll("@[operator(.equal)] method must be accessible with exact signature (SelfType, SelfType) -> bool; imported methods require @[public]"),
+            .unsupported_operator => try writer.writeAll("unsupported operator overload; only equal is supported"),
             .duplicate_name => try writer.print("duplicate declaration '{s}'", .{source.slice(diagnostic.span).?}),
             .unknown_name => try writer.print("unknown name '{s}'", .{source.slice(diagnostic.span).?}),
             .unsupported_declaration => try writer.writeAll("unsupported declaration; containers currently allow only function methods"),
@@ -207,6 +233,7 @@ fn renderModuleWithSources(module: *const Module, compilation: ?*const Compilati
         const note: ?[]const u8 = switch (diagnostic.tag) {
             .borrow_conflict, .borrow_escape => "borrow originates here",
             .duplicate_name => "first declaration here",
+            .duplicate_operator => "first overload of this operator here",
             .duplicate_export_name => "first export of this symbol here",
             .conflicting_foreign_signature => "first declaration of this foreign symbol here",
             .value_cycle, .type_alias_cycle => "declaration in this cycle",

@@ -27,6 +27,42 @@ names: std.StringHashMapUnmanaged(DeclId) = .empty,
 
 pub const DeclId = enum(u32) { _ };
 
+/// Keep in sync with lib/builtin.nov.
+pub const Operator = enum {
+    equal,
+    less_than,
+    add,
+    sub,
+    mul,
+    div,
+    rem,
+    @"try",
+    deref,
+    deref_mut,
+    index,
+    index_mut,
+    neg,
+    bit_and,
+    bit_or,
+    bit_xor,
+    shl,
+    shr,
+};
+
+/// Only literal tags are accepted, never calls or computed enum values.
+/// A qualified tag still requires canonical enum identity validation by the caller.
+pub fn operatorArgument(ast: *const Ast, node: Ast.Node.Index) ?Operator {
+    if (node == 0) return null;
+    const tag = ast.nodes.items(.tag)[node];
+    if (tag != .enum_literal and tag != .field_access) return null;
+    if (tag == .field_access) {
+        var base = ast.nodes.items(.data)[node].lhs;
+        while (ast.nodes.items(.tag)[base] == .field_access) base = ast.nodes.items(.data)[base].lhs;
+        if (ast.nodes.items(.tag)[base] != .identifier) return null;
+    }
+    return std.meta.stringToEnum(Operator, ast.tokenSlice(ast.lastToken(node)));
+}
+
 /// Half-open, source-qualified byte range, not a clipped highlight.
 pub const Span = Source.Span;
 
@@ -94,6 +130,11 @@ pub const Declaration = struct {
     public: bool = false,
     noreturn: bool = false,
     stringify: bool = false,
+    operator: ?Operator = null,
+    /// Qualified literal argument in this module's AST. Non-null means the parent
+    /// MUST validate canonical std.builtin.Operator identity before using this
+    /// overload; matching the final tag alone does not establish enum identity.
+    operator_arg: ?Ast.Node.Index = null,
     /// Owned by this module; absent on generic templates and specializations.
     export_name: ?[]const u8 = null,
     /// Owned by this module; only validated top-level bodyless prototypes.
@@ -167,6 +208,10 @@ pub const Diagnostic = struct {
         invalid_to_string,
         invalid_stringify_declaration,
         duplicate_stringifier,
+        invalid_operator_declaration,
+        duplicate_operator,
+        invalid_operator_signature,
+        unsupported_operator,
         invalid_method_receiver,
         unknown_name,
         unsupported_declaration,
@@ -526,6 +571,17 @@ pub fn lookupConcreteStringifier(self: *const Module, container: DeclId, concret
     return null;
 }
 
+/// Returns candidate metadata; qualified operator_arg identity and the concrete
+/// signature must be validated by semantic analysis before invoking the overload.
+pub fn lookupOperator(self: *const Module, container: DeclId, operator: Operator) ?DeclId {
+    return self.lookupConcreteOperator(container, null, operator);
+}
+
+pub fn lookupConcreteOperator(self: *const Module, container: DeclId, concrete_type: ?u32, operator: Operator) ?DeclId {
+    for (self.declarations.items, 0..) |decl, i| if (decl.container == container and decl.concrete_type == concrete_type and decl.operator == operator) return @fromBackingInt(@intCast(i));
+    return null;
+}
+
 /// TypeIds belong to one analysis IR; never reuse specializations in a fresh pass.
 pub fn clearSpecializations(self: *Module) void {
     for (self.declarations.items, 0..) |decl, i| if (decl.concrete_type != null or decl.function_template != null) {
@@ -591,6 +647,9 @@ fn collectDeclaration(self: *Module, node: Ast.Node.Index, container: ?DeclId) (
         var public = false;
         var noreturn_annotation = false;
         var stringify = false;
+        var operator_seen = false;
+        var operator: ?Operator = null;
+        var operator_arg: ?Ast.Node.Index = null;
         var export_name: ?[]const u8 = null;
         errdefer if (export_name) |symbol| self.allocator.free(symbol);
         var extern_name: ?[]const u8 = null;
@@ -601,7 +660,17 @@ fn collectDeclaration(self: *Module, node: Ast.Node.Index, container: ?DeclId) (
             const data = self.source.ast.nodes.items(.data)[attribute];
             const attr_name = self.source.ast.tokenSlice(data.lhs);
             const external = std.mem.eql(u8, attr_name, "extern");
-            if (std.mem.eql(u8, attr_name, "stringify")) {
+            if (std.mem.eql(u8, attr_name, "operator")) {
+                const parsed = if (self.source.ast.nodes.items(.tag)[attribute] == .attr_one) operatorArgument(&self.source.ast, data.rhs) else null;
+                if (operator_seen or parsed == null) {
+                    try self.diagnostics.append(self.allocator, .{ .tag = .invalid_operator_declaration, .span = self.tokenSpan(self.source.ast.firstToken(attribute)) });
+                } else {
+                    operator = parsed;
+                    if (self.source.ast.nodes.items(.tag)[data.rhs] == .field_access) operator_arg = data.rhs;
+                    if (parsed.? != .equal) try self.diagnostics.append(self.allocator, .{ .tag = .unsupported_operator, .span = self.tokenSpan(self.source.ast.lastToken(data.rhs)) });
+                }
+                operator_seen = true;
+            } else if (std.mem.eql(u8, attr_name, "stringify")) {
                 if (stringify or self.source.ast.nodes.items(.tag)[attribute] != .attr_one or data.rhs != 0)
                     try self.diagnostics.append(self.allocator, .{ .tag = .invalid_stringify_declaration, .span = self.tokenSpan(self.source.ast.firstToken(attribute)) });
                 stringify = true;
@@ -669,7 +738,110 @@ fn collectDeclaration(self: *Module, node: Ast.Node.Index, container: ?DeclId) (
                 try self.diagnostics.append(self.allocator, .{ .tag = .duplicate_stringifier, .span = name_span, .related = self.getDeclaration(previous).?.name_span });
             }
         }
-        try self.declarations.append(self.allocator, .{ .stringify = stringify, .is_test = is_test, .name = name, .name_span = name_span, .node = node, .container = container, .is_record = is_record, .is_generic = is_generic, .is_generic_function = is_generic_function, .is_type_alias = is_record or is_this_alias, .public = public, .noreturn = noreturn_annotation, .export_name = export_name, .extern_name = extern_name });
+        if (operator_seen) {
+            if (container == null or declaration.ast.is_mutable or is_record or is_generic or is_generic_function or is_test or noreturn_annotation or export_seen or extern_seen or declaration.ast.init_node == 0 or self.source.ast.declFunction(node) == null) {
+                try self.diagnostics.append(self.allocator, .{ .tag = .invalid_operator_declaration, .span = name_span });
+            } else if (operator) |kind| {
+                if (self.lookupOperator(container.?, kind)) |previous| {
+                    try self.diagnostics.append(self.allocator, .{ .tag = .duplicate_operator, .span = name_span, .related = self.getDeclaration(previous).?.name_span });
+                }
+            }
+        }
+        try self.declarations.append(self.allocator, .{ .operator = operator, .operator_arg = operator_arg, .stringify = stringify, .is_test = is_test, .name = name, .name_span = name_span, .node = node, .container = container, .is_record = is_record, .is_generic = is_generic, .is_generic_function = is_generic_function, .is_type_alias = is_record or is_this_alias, .public = public, .noreturn = noreturn_annotation, .export_name = export_name, .extern_name = extern_name });
+    }
+}
+
+test "operator metadata selects nominal and concrete candidates and defers qualified identity" {
+    const source =
+        "let S=struct{\n@[public]\n@[operator(.equal)]\nlet compare:(a:S,b:S)->bool=true\n}\n" ++
+        "let U=union{none,\n@[operator(.equal)]\nlet compare:(a:U,b:U)->bool=true\n}\n" ++
+        "let E=enum{one,\n@[operator(std.builtin.Operator.equal)]\nlet compare:(a:E,b:E)->bool=true\n}\n" ++
+        "let Box:(T:type)->type=struct{value:T,\n@[operator(.equal)]\nlet compare:(a:@This(),b:@This())->bool=true\n}";
+    var module = try Module.init(std.testing.allocator, "operators.nov", source);
+    defer module.deinit();
+    try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
+    try std.testing.expect(!module.hasErrors());
+    for ([_][]const u8{ "S", "U", "E", "Box" }) |name| {
+        const container = module.lookup(name).?;
+        const method = module.lookupOperator(container, .equal).?;
+        const declaration = module.getDeclaration(method).?;
+        try std.testing.expectEqualStrings("compare", declaration.name);
+        try std.testing.expectEqual(Operator.equal, declaration.operator.?);
+        try std.testing.expectEqual(std.mem.eql(u8, name, "E"), declaration.operator_arg != null);
+        try std.testing.expectEqual(@as(?DeclId, null), module.lookupOperator(container, .add));
+        try std.testing.expectEqual(@as(?DeclId, null), module.lookupConcreteOperator(container, 42, .equal));
+    }
+    const owner = module.lookup("S").?;
+    var specialized = module.getDeclaration(module.lookupOperator(owner, .equal).?).?;
+    specialized.concrete_type = 42;
+    const specialized_id: DeclId = @fromBackingInt(@intCast(module.declarations.items.len));
+    try module.declarations.append(std.testing.allocator, specialized);
+    try std.testing.expectEqual(specialized_id, module.lookupConcreteOperator(owner, 42, .equal).?);
+    module.clearSpecializations();
+    try std.testing.expectEqual(@as(?DeclId, null), module.lookupConcreteOperator(owner, 42, .equal));
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+
+    // A matching tag from another enum is only a candidate, never validated here.
+    var pending = try Module.init(std.testing.allocator, "pending.nov", "let S=struct{\n@[operator(Other.equal)]\nlet eq:(a:S,b:S)->bool=true\n}");
+    defer pending.deinit();
+    const candidate = pending.getDeclaration(pending.lookupOperator(pending.lookup("S").?, .equal).?).?;
+    try std.testing.expectEqualStrings("Other.equal", pending.source.ast.getNodeSource(candidate.operator_arg.?));
+}
+
+test "operator recognizes every tag but only supports equal and reserves each independently" {
+    for (std.meta.tags(Operator)) |operator| {
+        const source = try std.fmt.allocPrintSentinel(std.testing.allocator, "let S=struct{{\n@[operator(.{s})]\nlet method:(a:S,b:S)->bool=true\n}}", .{@tagName(operator)}, 0);
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "operators.nov", source);
+        defer module.deinit();
+        try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
+        try std.testing.expect(module.lookupOperator(module.lookup("S").?, operator) != null);
+        try std.testing.expectEqual(@as(usize, if (operator == .equal) 0 else 1), module.diagnostics.items.len);
+        if (operator != .equal) try std.testing.expectEqual(Diagnostic.Tag.unsupported_operator, module.diagnostics.items[0].tag);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+    }
+    const source = "let S=struct{\n@[operator(.equal)]\nlet first:(a:S,b:S)->bool=true\n@[operator(.add)]\nlet plus:(a:S,b:S)->S=a\n@[operator(.equal)]\nlet second:(a:S,b:S)->bool=false\n}";
+    var module = try Module.init(std.testing.allocator, "duplicate.nov", source);
+    defer module.deinit();
+    try std.testing.expectEqual(@as(usize, 2), module.diagnostics.items.len);
+    const diagnostic = module.diagnostics.items[1];
+    try std.testing.expectEqual(Diagnostic.Tag.duplicate_operator, diagnostic.tag);
+    try std.testing.expectEqualStrings("second", module.sourceSlice(diagnostic.span).?);
+    try std.testing.expectEqualStrings("first", module.sourceSlice(diagnostic.related.?).?);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+}
+
+test "operator rejects malformed attributes placement and nonordinary methods with OOM coverage" {
+    for ([_][]const u8{
+        "@[operator(.equal)]\nlet eq:(a:int,b:int)->bool=true",
+        "@[operator(.equal)]\nlet S=struct{}",
+        "let S=struct{\n@[operator]\nlet eq:(a:S,b:S)->bool=true\n}",
+        "let S=struct{\n@[operator(.unknown)]\nlet eq:(a:S,b:S)->bool=true\n}",
+        "let S=struct{\n@[operator(1)]\nlet eq:(a:S,b:S)->bool=true\n}",
+        "let S=struct{\n@[operator(equal)]\nlet eq:(a:S,b:S)->bool=true\n}",
+        "let S=struct{\n@[operator(get().equal)]\nlet eq:(a:S,b:S)->bool=true\n}",
+        "let S=struct{\n@[operator(.equal,.add)]\nlet eq:(a:S,b:S)->bool=true\n}",
+        "let S=struct{\n@[operator(.equal)]\n@[operator(.equal)]\nlet eq:(a:S,b:S)->bool=true\n}",
+        "let S=struct{\n@[operator(.equal)]\n@[operator(.add)]\nlet eq:(a:S,b:S)->bool=true\n}",
+        "let S=struct{\n@[operator(.equal)]\nlet mut eq:(a:S,b:S)->bool=true\n}",
+        "let S=struct{\n@[operator(.equal)]\nlet eq:(a:S,b:S)->bool\n}",
+        "let S=struct{\n@[operator(.equal)]\nlet eq=1\n}",
+        "let S=struct{\n@[operator(.equal)]\nlet eq:(a:`T,b:`T)->bool=true\n}",
+        "let S=struct{\n@[operator(.equal)]\n@[test]\nlet eq:()={}\n}",
+        "let S=struct{\n@[noreturn]\n@[operator(.equal)]\nlet eq:(a:S)=loop{}\n}",
+        "let S=struct{\n@[operator(.equal)]\n@[noreturn]\nlet eq:(a:S)=loop{}\n}",
+        "let S=struct{\n@[operator(.equal)]\n@[extern]\nlet eq:(a:S,b:S)->bool\n}",
+        "let S=struct{\n@[export]\n@[operator(.equal)]\nlet eq:(a:S,b:S)->bool=true\n}",
+    }) |source| {
+        var module = try Module.init(std.testing.allocator, "bad-operator.nov", source);
+        defer module.deinit();
+        try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
+        var diagnosed = false;
+        for (module.diagnostics.items) |diagnostic| if (diagnostic.tag == .invalid_operator_declaration) {
+            diagnosed = true;
+        };
+        try std.testing.expect(diagnosed);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
     }
 }
 

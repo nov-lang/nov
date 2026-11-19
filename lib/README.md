@@ -9,13 +9,46 @@ let Result = std.Result
 let Option = std.Option
 let array = std.array
 let string = std.string
+let Operator = std.builtin.Operator
 ```
 
 `std.nov` is the entry module. It publicly re-exports `Result` from `result.nov`,
 `Option` from `option.nov`, the `array` namespace from `array.nov`, and the
-`string` namespace from `string.nov`. These are
+`string` namespace from `string.nov`, and the `builtin` namespace from
+`builtin.nov` (including its public `Operator` enum). These are
 ordinary library declarations, not compiler builtins or automatically injected
 bare names. String values use the `str` type; the module remains `std.string`.
+
+## Equality and operator metadata
+
+Arrays compare lengths and then elements recursively. Records compare fields,
+tagged unions compare active tags and payloads, and enums compare tags, with
+exact nominal identity for named types (including generic arguments). Anonymous
+records require the same exact structural type. `!=` negates the same equality
+operation; `value in array` uses it for each candidate, stopping at the first
+match. Strings compare bytes/length, including NUL; floats use IEEE equality
+(NaN unequal even to itself, signed zeroes equal), also when nested.
+Functions/closures, references and ranges have no default equality.
+
+A nominal struct, union or enum can replace its comparison with an ordinary
+immutable non-generic method with a body, marked `@[operator(.equal)]` and typed
+exactly `(T, T) -> bool`. Generic containers may use `@This()` methods. The method
+name is arbitrary. Hooks apply recursively to nested values and membership, and
+can stop traversal before otherwise noncomparable contents. Imported hooks need
+`@[public]`: invalid or inaccessible explicit hooks diagnose rather than falling
+back. Only one overload per operator per nominal container is allowed; the
+attribute takes one literal tag, cannot repeat, and excludes test/noreturn/extern/export.
+Enum match patterns always use raw tag identity, not the hook.
+
+`@[operator(std.builtin.Operator.equal)]` is the qualified form. It must resolve
+to the canonical enum exposed by `std.builtin`; another enum with an `equal` tag
+is not interchangeable. `Operator` declares exactly `equal`, `less_than`, `add`,
+`sub`, `mul`, `div`, `rem`, `try`, `deref`, `deref_mut`, `index`, `index_mut`, `neg`,
+`bit_and`, `bit_or`, `bit_xor`, `shl`, `shr`. Only `equal` is implemented; other
+tags are reserved and diagnose unsupported operator overloads. There is no
+separate inequality hook or delivered arithmetic/ordering/indexing overload.
+See [Value equality](../README.md#value-equality) and
+[Operator Overloading](../README.md#operator-overloading) for the full contract.
 
 ## Storable struct fields
 

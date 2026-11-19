@@ -1,0 +1,163 @@
+let std = @import("std")
+
+let Row = struct {
+    name: str,
+    values: [][]int,
+}
+let Message = union {
+    row: Row,
+    none,
+}
+let Color = enum {
+    red,
+    blue,
+}
+
+let User = struct {
+    id: uint,
+    name: str,
+
+    @[operator(.equal)] ; same as `@[operator(std.builtin.Operator.equal)]`
+    let equal: (left: User, right: User) -> bool = left.id == right.id
+}
+
+let main: () = {
+    @println("Arrays:", [1, 2, 3] == [1, 2, 3])
+    let first = User.[ id = 1, name = "Ada" ]
+    let renamed = User.[ id = 1, name = "Augusta" ]
+    @println("Same user:", first == renamed) ; true, would be false without operator overload
+    @println("Membership:", renamed in [first])
+}
+
+@[test]
+let arrays_nested_values_and_membership: () = {
+    @assert(std.array.reverse([1, 2, 3]) == [3, 2, 1])
+    @assert(std.string.split("a,b", ",") == ["a", "b"])
+    @assert([] == @as([]int, []))
+    @assert([1] != [1, 2] and [1, 2] != [2, 1])
+    @assert([[1], [2, 3]] == [[1], [2, 3]])
+    @assert([1, 2] in [[0], [1, 2]])
+    @assert([1, 2] in @as([][]int, []) == false)
+    @assert(["é", "\0"] == ["\u{e9}", "\0"])
+    @assert(["é"] != ["e\u{301}"])
+}
+
+@[test]
+let records_unions_enums_and_anonymous_values: () = {
+    let first = Row.[ name = "Ada", values = [[1], [2]] ]
+    let second = Row.[ name = "Ada", values = [[1], [2]] ]
+    let changed = Row.[ name = "Ada", values = [[1], [3]] ]
+    @assert(first == second and first != changed)
+    @assert(first in [changed, second])
+    let message: Message = .row[first]
+    @assert(message == Message.row[second])
+    @assert(message != Message.none[])
+    @assert(Message.none[] == Message.none[])
+    @assert([Color.red, .blue] == [Color.red, .blue])
+    @assert(.[ name = "Ada", count = 1 ] == .[ name = "Ada", count = 1 ])
+    @assert(.[ 1, "Ada" ] != .[ 2, "Ada" ])
+}
+
+@[test]
+let overrides_apply_recursively_and_inequality_negates: () = {
+    let a = User.[ id = 7, name = "Ada" ]
+    let b = User.[ id = 7, name = "Grace" ]
+    let c = User.[ id = 8, name = "Ada" ]
+    @assert(a == b and a != c)
+    @assert(
+        {
+            a != b
+        } == false
+    )
+    @assert([a] == [b] and [[a]] == [[b]])
+    @assert(b in [c, a])
+    let success: std.Option(User) = .some[a]
+    @assert(success == std.Option(User).some[b])
+}
+
+let Grouped = enum {
+    red,
+    crimson,
+    blue,
+
+    let isRed: (value: Grouped) -> bool = match value {
+        .red | .crimson => true
+        .blue => false
+    }
+
+    @[operator(.equal)]
+    let equal: (left: Grouped, right: Grouped) -> bool = left.isRed() == right.isRed()
+}
+
+let Outcome = union {
+    value: int,
+    empty,
+
+    @[operator(.equal)]
+    let equal: (left: Outcome, right: Outcome) -> bool = {
+        let number: (item: Outcome) -> int = match item {
+            .value => |value| value
+            .empty => 0
+        }
+        number(left) == number(right)
+    }
+}
+
+@[test]
+let enum_and_union_overrides: () = {
+    @assert(Grouped.red == Grouped.crimson and Grouped.red != Grouped.blue)
+    @assert(Grouped.crimson in [Grouped.red])
+    @assert(Outcome.empty[] == Outcome.value[0])
+    @assert(Outcome.empty[] != Outcome.value[1])
+}
+
+@[test]
+let ieee_float_equality: () = {
+    let zero: f64 = 0.0
+    let nan = zero / zero
+    @assert([zero] == [-zero])
+    @assert([nan] != [nan])
+    @assert(nan in [nan] == false)
+    let wrapped = .[ number = nan ]
+    @assert(wrapped != wrapped)
+}
+
+let Probe = struct {
+    id: int,
+    run: () -> bool,
+
+    @[operator(.equal)]
+    let equal: (left: Probe, right: Probe) -> bool = left.run() and left.id == right.id
+}
+
+@[test]
+let hook_order_shortcircuit_snapshots_and_queries: () = {
+    let mut calls = 0
+    let effect = () -> bool {
+        calls += 1
+        true
+    }
+    let a = Probe.[ id = 1, run = effect ]
+    let b = Probe.[ id = 2, run = effect ]
+    @assert([a, a] != [b, a] and calls == 1)
+    @assert(a in [b, a, a] and calls == 3)
+    let query: @TypeOf(a == b) = false
+    @assert(query == false and calls == 3)
+
+    let mut items = [1]
+    let result = items == {
+        items = [2]
+        [1]
+    }
+    @assert(result and items == [2])
+
+    let mut candidates: []Probe = []
+    let clear = () -> bool {
+        @clear(candidates)
+        true
+    }
+    let needle = Probe.[ id = 1, run = clear ]
+    candidates = [Probe.[ id = 2, run = clear ], needle]
+    @assert(needle in candidates)
+    @assert(@len(candidates) == 0)
+}

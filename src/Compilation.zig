@@ -21,6 +21,8 @@ diagnostics: std.ArrayList(Diagnostic) = .empty,
 ir: Ir,
 root: ?Source.Id = null,
 root_main: ?DeclId = null,
+/// Trusted builtin module, never inferred from an enum's spelling or tags.
+builtin_source: ?Source.Id = null,
 
 pub const DeclId = enum(u32) { _ };
 pub const DeclRef = struct { source: Source.Id, local: Module.DeclId };
@@ -130,6 +132,43 @@ pub fn setRoot(self: *Compilation, id: Source.Id) void {
     const module = self.getModule(id).?;
     self.root = id;
     self.root_main = if (module.lookup("main")) |local| if (!module.getDeclaration(local).?.is_test) self.declaration_ids.get(.{ .source = id, .local = local }) else null else null;
+}
+
+/// Designate the authoritative builtin module for an in-memory compilation.
+/// Filesystem clients should use load, which verifies the configured real path.
+/// This does not load sources or resolve contextual operator literals.
+pub fn setBuiltinSource(self: *Compilation, source: Source.Id) void {
+    std.debug.assert(self.getModule(source) != null);
+    self.builtin_source = source;
+}
+
+/// Accept only the resolved nominal identity of the trusted builtin.Operator.
+/// Reexports and immutable declaration aliases retain that identity. Cyclic or
+/// unresolved aliases fail closed; this query allocates nothing and does no I/O.
+pub fn isBuiltinOperator(self: *const Compilation, source: Source.Id, identity: u32) bool {
+    const builtin = self.getModule(self.builtin_source orelse return false) orelse return false;
+    const local = builtin.lookup("Operator") orelse return false;
+    if (!builtin.getDeclaration(local).?.public) return false;
+    const canonical = self.canonicalDeclaration(.{ .source = builtin.source.id, .local = local }) orelse return false;
+    const owner = self.getModule(canonical.source) orelse return false;
+    const decl = owner.getDeclaration(canonical.local) orelse return false;
+    const ast = &owner.source.ast;
+    const init_node = ast.decl(decl.node).ast.init_node;
+    if (init_node == 0 or ast.tokens.items(.tag)[ast.nodes.items(.main_token)[init_node]] != .keyword_enum) return false;
+    return canonical.source == source and @backingInt(canonical.local) == identity;
+}
+
+fn canonicalDeclaration(self: *const Compilation, initial: DeclRef) ?DeclRef {
+    var ref = initial;
+    for (0..128) |_| {
+        const owner = self.getModule(ref.source) orelse return null;
+        const decl = owner.getDeclaration(ref.local) orelse return null;
+        const full = owner.source.ast.decl(decl.node).ast;
+        if (full.is_mutable or full.type_node != 0 or full.init_node == 0) return null;
+        const next = self.reference(owner, full.init_node) orelse return ref;
+        ref = next;
+    }
+    return null;
 }
 
 pub fn namespace(self: *const Compilation, declaration: DeclId) ?Import {
@@ -272,6 +311,18 @@ pub fn load(allocator: std.mem.Allocator, io: std.Io, path: []const u8, options:
     var completed: std.AutoHashMapUnmanaged(Source.Id, void) = .empty;
     defer completed.deinit(allocator);
     try result.discover(io, root, options, &active, &completed);
+    if (options.lib_dir) |lib_dir| {
+        const builtin_path = try std.fs.path.join(allocator, &.{ lib_dir, "builtin.nov" });
+        defer allocator.free(builtin_path);
+        // Do not implicitly load the library for contextual .equal annotations.
+        // Missing/unreadable builtin files do not invalidate unrelated programs.
+        const canonical = std.Io.Dir.cwd().realPathFileAlloc(io, builtin_path, allocator) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return result,
+        };
+        defer allocator.free(canonical);
+        if (result.paths.get(canonical)) |source| result.setBuiltinSource(source);
+    }
     return result;
 }
 
@@ -367,6 +418,153 @@ fn discover(self: *Compilation, io: std.Io, id: Source.Id, options: Options, act
         if (!visited) try self.discover(io, target, options, active, completed);
     }
     try completed.put(self.allocator, id, {});
+}
+
+const operator_builtin_source = "@[public]\nlet Operator = enum { equal, less_than, }";
+const operator_root_source =
+    \\let standard = @import("std")
+    \\let builtin = standard.builtin
+    \\let Op = builtin.Operator
+    \\let Alias = Op
+    \\let Direct = @import("lib/./builtin.nov").Operator
+    \\let Operator = enum { equal, less_than, }
+;
+
+fn checkBuiltinOperatorAliases(compilation: *Compilation) !void {
+    const TypeResolver = @import("TypeResolver.zig");
+    const root = compilation.getModule(compilation.root.?).?;
+    for (0..2) |_| {
+        try compilation.prepareSemantics();
+        try std.testing.expect(!compilation.hasErrors());
+        for ([_][]const u8{ "Op", "Alias", "Direct", "Operator" }) |name| {
+            const decl = root.getDeclaration(root.lookup(name).?).?;
+            const ty = (try TypeResolver.resolve(root, &compilation.ir, root.source.ast.decl(decl.node).ast.init_node)).?;
+            const enumeration = compilation.ir.getType(ty).?.enumeration;
+            try std.testing.expectEqual(!std.mem.eql(u8, name, "Operator"), compilation.isBuiltinOperator(enumeration.source, enumeration.identity));
+        }
+    }
+    try std.testing.expect(!compilation.isBuiltinOperator(compilation.builtin_source.?, std.math.maxInt(u32)));
+}
+
+fn builtinOperatorMemoryAllocationTest(allocator: std.mem.Allocator) !void {
+    var compilation = Compilation.init(allocator);
+    defer compilation.deinit();
+    const root = try compilation.addSource("/memory/main.nov", operator_root_source);
+    const standard = try compilation.addSource("/memory/lib/std.nov", "@[public]\nlet builtin = @import(\"builtin.nov\")");
+    const builtin = try compilation.addSource("/memory/lib/builtin.nov", operator_builtin_source);
+    compilation.setRoot(root);
+    const owner = compilation.getModule(builtin).?;
+    const identity = @backingInt(owner.lookup("Operator").?);
+    // A matching path/name is not authoritative for an in-memory client.
+    try std.testing.expect(!compilation.isBuiltinOperator(builtin, identity));
+    compilation.setBuiltinSource(builtin);
+    for ([_]struct { source: Source.Id, name: []const u8, target: Source.Id, named: bool = false, inline_import: bool = false }{
+        .{ .source = root, .name = "standard", .target = standard, .named = true },
+        .{ .source = root, .name = "Direct", .target = builtin, .inline_import = true },
+        .{ .source = standard, .name = "builtin", .target = builtin },
+    }) |entry| {
+        const module = compilation.getModule(entry.source).?;
+        const local = module.lookup(entry.name).?;
+        const decl = module.getDeclaration(local).?;
+        const init_node = module.source.ast.decl(decl.node).ast.init_node;
+        try compilation.imports.append(allocator, .{
+            .declaration = compilation.declaration_ids.get(.{ .source = entry.source, .local = local }).?,
+            .node = if (entry.inline_import) module.source.ast.nodes.items(.data)[init_node].lhs else null,
+            .target = entry.target,
+            .named = entry.named,
+            .span = decl.name_span,
+        });
+    }
+    try checkBuiltinOperatorAliases(&compilation);
+}
+
+test "builtin Operator identity requires authority and preserves aliases with OOM" {
+    try builtinOperatorMemoryAllocationTest(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, builtinOperatorMemoryAllocationTest, .{});
+}
+
+test "builtin Operator identity accepts trusted canonical declaration aliases" {
+    for ([_][]const u8{
+        operator_builtin_source,
+        "let Actual = enum { equal, less_than, }\n@[public]\nlet Operator = Actual",
+    }) |text| {
+        var compilation = Compilation.init(std.testing.allocator);
+        defer compilation.deinit();
+        const source = try compilation.addSource("/memory/builtin.nov", text);
+        const module = compilation.getModule(source).?;
+        const identity = @backingInt(module.lookup("Actual") orelse module.lookup("Operator").?);
+        try std.testing.expect(!compilation.isBuiltinOperator(source, identity));
+        compilation.setBuiltinSource(source);
+        try std.testing.expect(compilation.isBuiltinOperator(source, identity));
+        try std.testing.expect(!compilation.isBuiltinOperator(@fromBackingInt(999), identity));
+    }
+}
+
+test "builtin Operator identity fails closed for cycles private and non-enum bindings" {
+    for ([_][]const u8{
+        "@[public]\nlet Operator = Alias\nlet Alias = Operator",
+        "let Operator = enum { equal, less_than, }",
+        "@[public]\nlet Operator = struct { equal: bool, }",
+        "@[public]\nlet mut Operator = enum { equal, less_than, }",
+    }) |text| {
+        var compilation = Compilation.init(std.testing.allocator);
+        defer compilation.deinit();
+        const source = try compilation.addSource("/memory/builtin.nov", text);
+        compilation.setBuiltinSource(source);
+        const module = compilation.getModule(source).?;
+        for (module.declarations.items, 0..) |_, identity| {
+            try std.testing.expect(!compilation.isBuiltinOperator(source, @intCast(identity)));
+        }
+    }
+}
+
+fn builtinOperatorLoaderAllocationTest(allocator: std.mem.Allocator, path: []const u8, lib: []const u8) !void {
+    var compilation = try Compilation.load(allocator, std.testing.io, path, .{ .lib_dir = lib });
+    defer compilation.deinit();
+    try std.testing.expect(compilation.builtin_source != null);
+    try checkBuiltinOperatorAliases(&compilation);
+}
+
+test "builtin Operator loader uses relocated canonical library paths with OOM" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "relocated/lib");
+    try tmp.dir.writeFile(io, .{ .sub_path = "relocated/main.nov", .data = operator_root_source });
+    try tmp.dir.writeFile(io, .{ .sub_path = "relocated/lib/std.nov", .data = "@[public]\nlet builtin = @import(\"./builtin.nov\")\nlet self = @import(\"std\")" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "relocated/lib/builtin.nov", .data = operator_builtin_source });
+    const path = try tmp.dir.realPathFileAlloc(io, "relocated/main.nov", allocator);
+    defer allocator.free(path);
+    const directory = try tmp.dir.realPathFileAlloc(io, "relocated", allocator);
+    defer allocator.free(directory);
+    const lib = try std.fs.path.join(allocator, &.{ directory, "lib", "." });
+    defer allocator.free(lib);
+    try builtinOperatorLoaderAllocationTest(allocator, path, lib);
+    try TestAllocations.checkAllAllocationFailures(allocator, builtinOperatorLoaderAllocationTest, .{ path, lib });
+    // A neighboring builtin.nov is not trusted without a configured library.
+    var unconfigured = try Compilation.load(allocator, io, path, .{});
+    defer unconfigured.deinit();
+    try std.testing.expect(unconfigured.builtin_source == null);
+    // Configuring a library must not load it if no import requires it.
+    try tmp.dir.writeFile(io, .{ .sub_path = "relocated/empty.nov", .data = "let Operator = enum { equal, less_than, }" });
+    const empty_path = try tmp.dir.realPathFileAlloc(io, "relocated/empty.nov", allocator);
+    defer allocator.free(empty_path);
+    var empty = try Compilation.load(allocator, io, empty_path, .{ .lib_dir = lib });
+    defer empty.deinit();
+    try std.testing.expectEqual(@as(usize, 1), empty.modules.items.len);
+    try std.testing.expect(empty.builtin_source == null);
+    try tmp.dir.createDirPath(io, "relocated/counterfeit");
+    try tmp.dir.writeFile(io, .{ .sub_path = "relocated/counterfeit/builtin.nov", .data = operator_builtin_source });
+    try tmp.dir.writeFile(io, .{ .sub_path = "relocated/forged.nov", .data = "let builtin = @import(\"counterfeit/builtin.nov\")" });
+    const forged_path = try tmp.dir.realPathFileAlloc(io, "relocated/forged.nov", allocator);
+    defer allocator.free(forged_path);
+    var forged = try Compilation.load(allocator, io, forged_path, .{ .lib_dir = lib });
+    defer forged.deinit();
+    try std.testing.expect(!forged.hasErrors());
+    try std.testing.expect(forged.builtin_source == null);
+    const counterfeit = forged.getModule(forged.imports.items[0].target).?;
+    try std.testing.expect(!forged.isBuiltinOperator(counterfeit.source.id, @backingInt(counterfeit.lookup("Operator").?)));
 }
 
 test "named std imports require explicit library roots and public metadata" {

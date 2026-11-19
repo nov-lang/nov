@@ -253,23 +253,20 @@ fn write(allocator: std.mem.Allocator, ir: *const Ir, origins: []const ?Origin, 
     }
     try writeStringScalarRuntime(ir, w);
     try writeIterationLengthRuntime(ir, w);
-    if (usesStringEquality(ir)) try w.writeAll(
+    const equal_types = try allocator.alloc(bool, ir.types.items.len);
+    defer allocator.free(equal_types);
+    markEqualityTypes(ir, equal_types);
+    var equal_strings = usesStringEquality(ir);
+    for (ir.types.items, equal_types) |ty, used| if (used and ty == .string) {
+        equal_strings = true;
+    };
+    if (equal_strings) try w.writeAll(
         "#include <string.h>\n" ++
             "static bool nov_string_equal(nov_string a, nov_string b) {\n" ++
             "    return a.len == b.len && (!a.len || memcmp(a.data, b.data, (size_t)a.len) == 0);\n" ++
             "}\n",
     );
-    for (ir.types.items, 0..) |_, t| {
-        const element: Ir.TypeId = @fromBackingInt(@intCast(t));
-        if (!usesArrayContains(ir, element)) continue;
-        try w.print("static bool nov_array_contains_{d}(", .{t});
-        try writeType(ir, w, element);
-        try w.writeAll(" value, nov_array array) {\n    const ");
-        try writeType(ir, w, element);
-        try w.writeAll(" *data = array.data;\n    for (uintptr_t i = 0; i < array.len; ++i) {\n        if (");
-        try w.writeAll(if (ir.getType(element).? == .string) "nov_string_equal(value, data[i])" else "value == data[i]");
-        try w.writeAll(") return true;\n    }\n    return false;\n}\n");
-    }
+
     try writeArithmeticRuntime(ir, w);
     // Nominal placeholders may precede dependencies in either pool direction.
     const declared = try allocator.alloc(bool, ir.types.items.len);
@@ -384,6 +381,7 @@ fn write(allocator: std.mem.Allocator, ir: *const Ir, origins: []const ?Origin, 
         try writeSignature(ir, w, function);
         try w.writeAll(";\n");
     }
+    try writeEquality(ir, equal_types, root_counts, w);
     try writeGlobals(ir, root_counts, w);
     try writeAggregateFormatting(allocator, ir, root_counts, w);
     if (usesClosures(ir)) {
@@ -1491,7 +1489,12 @@ fn writeRuntime(ir: *const Ir, w: *std.Io.Writer) WriteError!void {
     for (ir.functions.items) |function| {
         const body = function.body orelse continue;
         for (body.instructions) |instruction| {
-            if (instruction.op == .binary and ir.getType(instruction.ty).? == .integer and (instruction.op.binary.op == .div or instruction.op.binary.op == .mod)) panic_used = true;
+            if (instruction.op == .binary) {
+                const binary = instruction.op.binary;
+                if (ir.getType(instruction.ty).? == .integer and (binary.op == .div or binary.op == .mod)) panic_used = true;
+                const operand = body.instructions[@backingInt(binary.lhs)].ty;
+                if (!binary.enum_tag and (binary.op == .eq or binary.op == .ne) and ir.getType(operand).? == .enumeration and equalityHook(ir, operand) != null) panic_used = true;
+            }
             if (instruction.op == .panic) source_panic = true;
             if (instruction.op == .assertion) assertion_used = true;
         }
@@ -1730,6 +1733,348 @@ fn writeConstant(w: *std.Io.Writer, constant: Ir.Constant, ty: Ir.Type) WriteErr
                 try w.print("INT{d}_C({d})", .{ integer.bits, value });
             }
         },
+    }
+}
+
+fn emitStructuralEqualityTest(allocator: std.mem.Allocator) ![]u8 {
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    const span: Ir.Span = .{ .start = 0, .end = 0 };
+    const V = struct {
+        fn id(i: u32) Ir.ValueId {
+            return @fromBackingInt(i);
+        }
+        fn ins(ty: Ir.TypeId, op: Ir.Operation) Ir.Instruction {
+            return .{ .ty = ty, .span = .{ .start = 0, .end = 0 }, .op = op };
+        }
+    };
+    const unit = try ir.internType(.void);
+    const boolean = try ir.internType(.boolean);
+    const integer = try ir.internType(.{ .integer = .{ .bits = 32, .signedness = .signed } });
+    const float = try ir.internType(.{ .float = 64 });
+    const text = try ir.internType(.string);
+    const byte = try ir.internType(.{ .integer = .{ .bits = 8, .signedness = .unsigned } });
+    const bytes = try ir.internType(.{ .array = byte });
+    const strings = try ir.internType(.{ .array = text });
+    const rows = try ir.internType(.{ .array = strings });
+    const callback = try ir.internType(.{ .function = .{ .params = &.{ rows, rows }, .result = boolean } });
+    const hooked = try ir.internType(.{ .record = .{ .identity = 0, .fields = &.{} } });
+    try ir.setRecordFields(hooked, &.{ .{ .name = "rows", .ty = rows, .span = span }, .{ .name = "callback", .ty = callback, .span = span } });
+    const record = try ir.internType(.{ .record = .{ .identity = 1, .fields = &.{} } });
+    try ir.setRecordFields(record, &.{ .{ .name = "n", .ty = integer, .span = span }, .{ .name = "rows", .ty = rows, .span = span }, .{ .name = "number", .ty = float, .span = span }, .{ .name = "hooked", .ty = hooked, .span = span } });
+    const tagged = try ir.internType(.{ .record = .{ .identity = 2, .tagged = true, .fields = &.{} } });
+    try ir.setRecordFields(tagged, &.{ .{ .name = "none", .ty = unit, .span = span }, .{ .name = "some", .ty = record, .span = span } });
+    const enumeration = try ir.internType(.{ .enumeration = .{ .identity = 0, .name = "E", .tags = &.{ .{ .name = "a", .span = span }, .{ .name = "b", .span = span } } } });
+    const hook_sig = try ir.internType(.{ .function = .{ .params = &.{ hooked, hooked }, .result = boolean } });
+    const hook = try ir.addFunction("equalityhook", hook_sig, span);
+    const literal = try ir.internConstant(.{ .ty = text, .value = .{ .string = "allocate" } });
+    try ir.setFunctionBody(hook, &.{
+        V.ins(hooked, .{ .parameter = 0 }),                                            V.ins(hooked, .{ .parameter = 1 }),
+        V.ins(text, .{ .constant = literal }),                                         V.ins(bytes, .{ .string_to_bytes = V.id(2) }),
+        V.ins(rows, .{ .field_read = .{ .base = V.id(0), .index = 0 } }),              V.ins(rows, .{ .field_read = .{ .base = V.id(1), .index = 0 } }),
+        V.ins(callback, .{ .field_read = .{ .base = V.id(0), .index = 1 } }),          V.ins(boolean, .{ .call = .{ .callee = V.id(6), .args = &.{ V.id(4), V.id(5) } } }),
+        V.ins(boolean, .{ .binary = .{ .op = .eq, .lhs = V.id(4), .rhs = V.id(5) } }), V.ins(boolean, .{ .short_circuit = .{ .kind = .@"and", .lhs = V.id(7), .rhs_start = 8, .rhs = V.id(8) } }),
+    }, V.id(9));
+    try ir.setTypeEquality(hooked, hook);
+    for ([_]Ir.TypeId{ record, tagged, hooked, enumeration }, [_][]const u8{ "equalrecord", "equaltagged", "equalhooked", "equalenum" }) |ty, name| {
+        const sig = try ir.internType(.{ .function = .{ .params = &.{ ty, ty }, .result = boolean } });
+        const f = try ir.addFunction(name, sig, span);
+        try ir.setFunctionBody(f, &.{ V.ins(ty, .{ .parameter = 0 }), V.ins(ty, .{ .parameter = 1 }), V.ins(boolean, .{ .binary = .{ .op = .eq, .lhs = V.id(0), .rhs = V.id(1) } }) }, V.id(2));
+    }
+    const array = try ir.internType(.{ .array = hooked });
+    const contains_sig = try ir.internType(.{ .function = .{ .params = &.{ hooked, array }, .result = boolean } });
+    const contains = try ir.addFunction("containshooked", contains_sig, span);
+    try ir.setFunctionBody(contains, &.{ V.ins(hooked, .{ .parameter = 0 }), V.ins(array, .{ .parameter = 1 }), V.ins(boolean, .{ .array_contains = .{ .value = V.id(0), .array = V.id(1) } }) }, V.id(2));
+    var aliases = std.Io.Writer.Allocating.init(allocator);
+    defer aliases.deinit();
+    for ([_]Ir.TypeId{ record, tagged, hooked }, [_][]const u8{ "EqualRecord", "EqualTagged", "EqualHooked" }) |ty, name| {
+        try aliases.writer.writeAll("typedef ");
+        try writeType(&ir, &aliases.writer, ty);
+        try aliases.writer.print(" {s};\n", .{name});
+    }
+    try aliases.writer.print("#define EQUAL_STRING nov_element_{d}\n#define EQUAL_ROW nov_element_{d}\n", .{ @backingInt(text), @backingInt(strings) });
+    const library = try emit(allocator, &ir, null);
+    defer allocator.free(library);
+    return std.mem.concat(allocator, u8, &.{ library, aliases.written() });
+}
+
+fn emitRawEnumTagTest(allocator: std.mem.Allocator, ordinary: bool) ![]u8 {
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    const span: Ir.Span = .{ .start = 0, .end = 0 };
+    const boolean = try ir.internType(.boolean);
+    const enumeration = try ir.internType(.{ .enumeration = .{ .identity = 0, .name = "E", .tags = &.{ .{ .name = "a", .span = span }, .{ .name = "b", .span = span } } } });
+    const sig = try ir.internType(.{ .function = .{ .params = &.{ enumeration, enumeration }, .result = boolean } });
+    const hook = try ir.addFunction("rawenumhook", sig, span);
+    const hook_body = [_]Ir.Instruction{
+        .{ .ty = enumeration, .span = span, .op = .{ .parameter = 0 } },
+        .{ .ty = enumeration, .span = span, .op = .{ .parameter = 1 } },
+        .{ .ty = boolean, .span = span, .op = .{ .binary = .{ .op = .ne, .lhs = @fromBackingInt(0), .rhs = @fromBackingInt(1), .enum_tag = true } } },
+    };
+    // Model a hook using enum patterns internally. Raw comparison must not
+    // redispatch to this hook, even after its metadata has been registered.
+    try ir.setTypeEquality(enumeration, hook);
+    try ir.setFunctionBody(hook, &hook_body, @fromBackingInt(2));
+    for ([_]Ir.BinaryOp{ .eq, .ne, .eq }, [_][]const u8{ "rawenumis", "rawenumisnot", "enumvalueis" }, [_]bool{ true, true, false }) |op, name, raw| {
+        if (!raw and !ordinary) continue;
+        const f = try ir.addFunction(name, sig, span);
+        var code = hook_body;
+        code[2].op.binary.op = op;
+        code[2].op.binary.enum_tag = raw;
+        try ir.setFunctionBody(f, &code, @fromBackingInt(2));
+    }
+    return emit(allocator, &ir, null);
+}
+
+fn testRawEnumTagAllocations(allocator: std.mem.Allocator) !void {
+    const c = try emitRawEnumTagTest(allocator, true);
+    allocator.free(c);
+}
+
+test "raw enum tag comparisons bypass hooks avoid recursive dispatch and demand no helpers O0 O3 OOM" {
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testRawEnumTagAllocations, .{});
+    for ([_]bool{ false, true }) |ordinary| {
+        const library = try emitRawEnumTagTest(test_gpa, ordinary);
+        defer test_gpa.free(library);
+        try std.testing.expect(std.mem.indexOf(u8, library, "nov_gc_") == null);
+        if (!ordinary) {
+            try std.testing.expect(std.mem.indexOf(u8, library, "nov_equal_") == null);
+            try std.testing.expect(std.mem.indexOf(u8, library, "nov_rt_panic") == null);
+        }
+        const c = try std.mem.concat(test_gpa, u8, &.{
+            library,
+            "int main(void){if(!nov_rawenumis(0,0) || nov_rawenumis(0,1) || nov_rawenumisnot(1,1) || !nov_rawenumisnot(0,1))return 1;",
+            if (ordinary) "if(nov_enumvalueis(0,0) || !nov_enumvalueis(0,1))return 2;" else "",
+            "return 0;}\n",
+        });
+        defer test_gpa.free(c);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty;", 0, "", "", mode);
+    }
+}
+
+fn emitEnumEqualityTest(allocator: std.mem.Allocator, used: bool) ![]u8 {
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    const span: Ir.Span = .{ .start = 0, .end = 0 };
+    const boolean = try ir.internType(.boolean);
+    const enumeration = try ir.internType(.{ .enumeration = .{ .identity = 0, .name = "E", .tags = &.{ .{ .name = "a", .span = span }, .{ .name = "b", .span = span } } } });
+    const sig = try ir.internType(.{ .function = .{ .params = &.{ enumeration, enumeration }, .result = boolean } });
+    const hook = try ir.addFunction("enumhook", sig, span);
+    const yes = try ir.internConstant(.{ .ty = boolean, .value = .{ .boolean = true } });
+    try ir.setFunctionBody(hook, &.{.{ .ty = boolean, .span = span, .op = .{ .constant = yes } }}, @fromBackingInt(0));
+    try ir.setTypeEquality(enumeration, hook);
+    if (used) for ([_]Ir.BinaryOp{ .eq, .ne }, [_][]const u8{ "enumis", "enumisnot" }) |op, name| {
+        const f = try ir.addFunction(name, sig, span);
+        try ir.setFunctionBody(f, &.{
+            .{ .ty = enumeration, .span = span, .op = .{ .parameter = 0 } },
+            .{ .ty = enumeration, .span = span, .op = .{ .parameter = 1 } },
+            .{ .ty = boolean, .span = span, .op = .{ .binary = .{ .op = op, .lhs = @fromBackingInt(0), .rhs = @fromBackingInt(1) } } },
+        }, @fromBackingInt(2));
+    };
+    return emit(allocator, &ir, null);
+}
+
+test "structural equality scalar enum hook overrides tags ne negates demand only without GC" {
+    const library = try emitEnumEqualityTest(test_gpa, true);
+    defer test_gpa.free(library);
+    try std.testing.expect(std.mem.indexOf(u8, library, "nov_gc_") == null);
+    const c = try std.mem.concat(test_gpa, u8, &.{ library, "int main(void){return !nov_enumis(0,1) || nov_enumisnot(0,1);}\n" });
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty;", 0, "", "", mode);
+    const unused = try emitEnumEqualityTest(test_gpa, false);
+    defer test_gpa.free(unused);
+    try std.testing.expect(std.mem.indexOf(u8, unused, "nov_equal_") == null);
+    try compileAndRun(unused, "int main(void){return 0;}");
+}
+
+fn testStructuralEqualityAllocations(allocator: std.mem.Allocator) !void {
+    const c = emitStructuralEqualityTest(allocator) catch |err| return if (err == error.WriteFailed) error.OutOfMemory else err;
+    allocator.free(c);
+}
+
+test "structural equality source free emitter every compiler OOM" {
+    try TestAllocations.checkAllAllocationFailures(test_gpa, testStructuralEqualityAllocations, .{});
+}
+
+test "structural equality source free recursive arrays hooks short circuit IEEE tags forced GC O0 O3" {
+    const library = try emitStructuralEqualityTest(test_gpa);
+    defer test_gpa.free(library);
+    const prefix = "#include <stdlib.h>\nstatic int blocked;\nstatic void *equal_malloc(size_t n) { return blocked ? NULL : malloc(n); }\n#define NOV_GC_MALLOC equal_malloc\n#define NOV_GC_FREE free\n";
+    const setup =
+        \\static void *equal_original;
+        \\static unsigned equal_calls;
+        \\static bool inspect_equal(nov_array a,nov_array b) {
+        \\ ++equal_calls;
+        \\ if(a.data==equal_original || b.data==equal_original || a.data==b.data)return false;
+        \\ nov_array *x=a.data,*y=b.data,*original=equal_original;
+        \\ if(x[0].data==original[0].data || y[0].data==original[0].data || x[0].data==y[0].data)return false;
+        \\ nov_string *s=x[0].data,*t=y[0].data,*o=original[0].data;
+        \\ if(s[0].owner!=o[0].owner || t[0].owner!=o[0].owner)return false;
+        \\ s[0].len=0;if(t[0].len!=4 || o[0].len!=4)return false;s[0].len=4;
+        \\ return true;
+        \\}
+        \\int main(void) {
+        \\ nov_rt_heap.collect_every_allocation=1;(void)nov_bytes_to_string;
+        \\ EqualRecord a={0},b={0}; nov_array values={0};
+        \\ void **roots[]={&a.f1.data,&a.f3.f0.data,&b.f1.data,&b.f3.f0.data,&values.data};
+        \\ nov_gc_roots frame={0};nov_gc_push(&nov_rt_heap,&frame,roots,5);
+        \\ a.f1=nov_array_new(1,1,&EQUAL_ROW);
+        \\ ((nov_array*)a.f1.data)[0]=nov_array_new(1,1,&EQUAL_STRING);
+        \\ nov_string *s=((nov_array*)a.f1.data)[0].data;
+        \\ const nov_gc_descriptor bytes={4,1,0,NULL};
+        \\ s[0].owner=nov_gc_alloc(&nov_rt_heap,&bytes);s[0].data=s[0].owner;s[0].len=4;
+        \\ memcpy(s[0].owner,"a\0bc",4);
+        \\ a.f3.f0=a.f1;a.f3.f1=inspect_equal;equal_original=a.f1.data;b=a;
+        \\ if(!nov_equalrecord(a,b) || !nov_equalenum(1,1) || nov_equalenum(0,1))return 10;
+        \\ b.f0=1;blocked=1;if(nov_equalrecord(a,b))return 11;blocked=0;b=a;
+        \\ b.f1=nov_array_new(2,3,&EQUAL_ROW);((nov_array*)b.f1.data)[0]=((nov_array*)a.f1.data)[0];
+        \\ blocked=1;if(nov_equalrecord(a,b))return 19;blocked=0;b=a;
+        \\ b.f1=nov_array_new(1,1,&EQUAL_ROW);((nov_array*)b.f1.data)[0]=nov_array_new(1,1,&EQUAL_STRING);
+        \\ ((nov_string*)((nov_array*)b.f1.data)[0].data)[0]=(nov_string){NULL,(const unsigned char*)"a\0bd",4};
+        \\ blocked=1;if(nov_equalrecord(a,b))return 20;blocked=0;b=a;
+        \\ b.f2=-0.0;if(!nov_equalrecord(a,b))return 12;
+        \\ uint64_t nan=UINT64_C(0x7ff8000000000000);memcpy(&b.f2,&nan,sizeof nan);if(nov_equalrecord(b,b))return 13;
+        \\ EqualTagged u={.tag=0},v={.tag=0};memset(&u.f1,0xff,sizeof u.f1);memset(&v.f1,0xff,sizeof v.f1);
+        \\ if(!nov_equaltagged(u,v))return 14;
+        \\ v.tag=1;v.f1=a;if(nov_equaltagged(u,v))return 15;
+        \\ const size_t offsets[]={offsetof(EqualHooked,f0)+offsetof(nov_array,data)};
+        \\ const nov_gc_descriptor element={sizeof(EqualHooked),_Alignof(EqualHooked),1,offsets};
+        \\ values=nov_array_new(2,2,&element);((EqualHooked*)values.data)[0]=a.f3;((EqualHooked*)values.data)[1]=a.f3;
+        \\ unsigned before=equal_calls;if(!nov_containshooked(a.f3,values) || equal_calls!=before+1)return 16;
+        \\ blocked=1;values.len=0;if(nov_containshooked(a.f3,values))return 17;blocked=0;
+    ;
+    const cleanup = "nov_gc_pop(&nov_rt_heap,&frame);nov_gc_collect(&nov_rt_heap);if(nov_rt_heap.live_objects || nov_rt_heap.frames)return 18;nov_gc_shutdown(&nov_rt_heap);return 0;}\n";
+    const c = try std.mem.concat(test_gpa, u8, &.{ prefix, library, setup, cleanup });
+    defer test_gpa.free(c);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(c, "typedef int nonempty;", 0, "", "", mode);
+    const oom = try std.mem.concat(test_gpa, u8, &.{ prefix, library, setup, "blocked=1;(void)nov_equalhooked(a.f3,b.f3);return 0;}\n" });
+    defer test_gpa.free(oom);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode| try compileAndRunMode(oom, "typedef int nonempty;", 1, "", "panic: GC allocation failed\n", mode);
+}
+
+fn equalityHook(ir: *const Ir, id: Ir.TypeId) ?Ir.FunctionId {
+    return if (ir.getTypeEquality(id)) |entry| entry.comparator else null;
+}
+
+fn markEqualityTypes(ir: *const Ir, used: []bool) void {
+    @memset(used, false);
+    for (ir.functions.items) |function| {
+        const body = function.body orelse continue;
+        for (body.instructions) |instruction| switch (instruction.op) {
+            .binary => |b| if (!b.enum_tag and (b.op == .eq or b.op == .ne)) {
+                used[@backingInt(body.instructions[@backingInt(b.lhs)].ty)] = true;
+            },
+            .array_contains => |r| {
+                used[@backingInt(body.instructions[@backingInt(r.value)].ty)] = true;
+            },
+            else => {},
+        };
+    }
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (ir.types.items, used, 0..) |ty, needed, t| {
+            if (!needed or equalityHook(ir, @fromBackingInt(@intCast(t))) != null) continue;
+            switch (ty) {
+                .array => |child| if (!used[@backingInt(child)]) {
+                    used[@backingInt(child)] = true;
+                    changed = true;
+                },
+                .record => |record| for (record.fields) |field| {
+                    if (!used[@backingInt(field.ty)]) {
+                        used[@backingInt(field.ty)] = true;
+                        changed = true;
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+}
+
+fn writeEquality(ir: *const Ir, used: []const bool, counts: []const usize, w: *std.Io.Writer) WriteError!void {
+    for (used, ir.types.items, 0..) |needed, ty, t| {
+        if (!needed or ty == .void) continue;
+        try w.print("static inline bool nov_equal_{d}(", .{t});
+        const id: Ir.TypeId = @fromBackingInt(@intCast(t));
+        try writeType(ir, w, id);
+        try w.writeAll(", ");
+        try writeType(ir, w, id);
+        try w.writeAll(");\n");
+    }
+    for (used, ir.types.items, 0..) |needed, ty, t| {
+        if (!needed or ty == .void) continue;
+        const id: Ir.TypeId = @fromBackingInt(@intCast(t));
+        try w.print("static inline bool nov_equal_{d}(", .{t});
+        try writeType(ir, w, id);
+        try w.writeAll(" p0, ");
+        try writeType(ir, w, id);
+        try w.writeAll(" p1) {\n    bool result = true;\n    (void)p0; (void)p1;\n");
+        // Normalize inactive union storage before enumerating GC roots.
+        if (ty == .record or ty == .array) try w.print("    p0 = nov_check_{d}(p0);\n    p1 = nov_check_{d}(p1);\n", .{ t, t });
+        const hook = equalityHook(ir, id);
+        const snapshot = hook != null and try ir.needsArrayCopy(id);
+        if (snapshot) {
+            try w.writeAll("    ");
+            try writeType(ir, w, id);
+            try w.writeAll(" v0 = p0, v1 = p1;\n");
+        }
+        const rooted = counts[t] != 0;
+        if (rooted) {
+            try w.writeAll("    void **roots[] = {");
+            try writeRoots(ir, counts, w, id, "p", 0);
+            try writeRoots(ir, counts, w, id, "p", 1);
+            if (snapshot) {
+                try writeRoots(ir, counts, w, id, "v", 0);
+                try writeRoots(ir, counts, w, id, "v", 1);
+            }
+            try w.print(" }};\n    nov_gc_roots frame = {{0}};\n    nov_gc_push(&nov_rt_heap, &frame, roots, {d});\n", .{counts[t] * @as(usize, if (snapshot) 4 else 2)});
+        }
+        if (hook) |function| {
+            if (ty == .enumeration) try w.print("    if (p0 >= {d} || p1 >= {d}) nov_rt_panic(\"invalid enum tag\");\n", .{ ty.enumeration.tags.len, ty.enumeration.tags.len });
+            if (snapshot) try w.print("    v0 = nov_copy_{d}(p0);\n    v1 = nov_copy_{d}(p1);\n", .{ t, t });
+            try w.writeAll("    result = ");
+            try writeScopedFunctionName(w, ir.getFunction(function).?);
+            try w.writeAll(if (snapshot) "(v0, v1);\n" else "(p0, p1);\n");
+        } else switch (ty) {
+            .boolean, .integer, .float, .rune, .enumeration => try w.writeAll("    result = p0 == p1;\n"),
+            .string => try w.writeAll("    result = nov_string_equal(p0, p1);\n"),
+            .array => |child| {
+                try w.writeAll("    result = p0.len == p1.len;\n    for (uintptr_t i = 0; result && i < p0.len; ++i) {\n        result = ");
+                try w.print("nov_equal_{d}(((const ", .{@backingInt(child)});
+                try writeType(ir, w, child);
+                try w.writeAll(" *)p0.data)[i], ((const ");
+                try writeType(ir, w, child);
+                try w.writeAll(" *)p1.data)[i]);\n    }\n");
+            },
+            .record => |record| {
+                if (record.tagged) try w.writeAll("    result = p0.tag == p1.tag;\n");
+                for (record.fields, 0..) |field, f| {
+                    if (ir.getType(field.ty).? == .void) continue;
+                    try w.writeAll("    if (result");
+                    if (record.tagged) try w.print(" && p0.tag == {d}", .{f});
+                    try w.print(") result = nov_equal_{d}(p0.f{d}, p1.f{d});\n", .{ @backingInt(field.ty), f, f });
+                }
+            },
+            else => unreachable,
+        }
+        if (rooted) try w.writeAll("    nov_gc_pop(&nov_rt_heap, &frame);\n");
+        try w.writeAll("    return result;\n}\n");
+    }
+    for (ir.types.items, 0..) |_, t| {
+        const id: Ir.TypeId = @fromBackingInt(@intCast(t));
+        if (!usesArrayContains(ir, id)) continue;
+        try w.print("static bool nov_array_contains_{d}(", .{t});
+        try writeType(ir, w, id);
+        try w.writeAll(" p0, nov_array p1) {\n    bool result = false;\n");
+        // The backing owner and needle must survive allocating element hooks.
+        const ty = ir.getType(id).?;
+        if (ty == .record or ty == .array) try w.print("    p0 = nov_check_{d}(p0);\n", .{t});
+        try w.writeAll("    void **roots[] = { &p1.data,");
+        try writeRoots(ir, counts, w, id, "p", 0);
+        try w.print(" }};\n    nov_gc_roots frame = {{0}};\n    nov_gc_push(&nov_rt_heap, &frame, roots, {d});\n    for (uintptr_t i = 0; !result && i < p1.len; ++i) result = nov_equal_{d}(p0, ((const ", .{ counts[t] + 1, t });
+        try writeType(ir, w, id);
+        try w.writeAll(" *)p1.data)[i]);\n    nov_gc_pop(&nov_rt_heap, &frame);\n    return result;\n}\n");
     }
 }
 
@@ -2373,9 +2718,14 @@ fn writeBody(allocator: std.mem.Allocator, ir: *const Ir, root_counts: []const u
             .binary => |binary| arithmetic: {
                 const lhs = @backingInt(binary.lhs);
                 const rhs = @backingInt(binary.rhs);
-                if (ir.getType(body.instructions[lhs].ty).? == .string) {
+                if (binary.enum_tag) {
+                    try w.print("v{d} {s} v{d}", .{ lhs, if (binary.op == .eq) "==" else "!=", rhs });
+                    break :arithmetic;
+                }
+                if (binary.op == .eq or binary.op == .ne) {
                     if (binary.op == .ne) try w.writeByte('!');
-                    try w.print("nov_string_equal(v{d}, v{d})", .{ lhs, rhs });
+                    const operand = body.instructions[lhs].ty;
+                    if (ir.getType(operand).? == .void) try w.writeAll("true") else try w.print("nov_equal_{d}(v{d}, v{d})", .{ @backingInt(operand), lhs, rhs });
                     break :arithmetic;
                 }
                 if (ty == .float) {
@@ -2473,6 +2823,13 @@ fn markCopyTypes(allocator: std.mem.Allocator, ir: *const Ir, copied: []bool) st
         const id: Ir.TypeId = @fromBackingInt(@intCast(t));
         if (used and formatHook(ir, id) != null and try ir.needsArrayCopy(id)) copied[t] = true;
     }
+    const equal = try allocator.alloc(bool, ir.types.items.len);
+    defer allocator.free(equal);
+    markEqualityTypes(ir, equal);
+    for (equal, 0..) |used, t| {
+        const id: Ir.TypeId = @fromBackingInt(@intCast(t));
+        if (used and equalityHook(ir, id) != null and try ir.needsArrayCopy(id)) copied[t] = true;
+    }
     var changed = true;
     while (changed) {
         changed = false;
@@ -2505,6 +2862,8 @@ fn writePayloadChecks(allocator: std.mem.Allocator, ir: *const Ir, copy_types: [
     const converted = try allocator.alloc(bool, ir.types.items.len);
     defer allocator.free(converted);
     _ = markFormattingTypes(ir, checked, converted);
+    markEqualityTypes(ir, converted);
+    for (checked, converted) |*check, equal| check.* = check.* or equal;
     for (checked, copy_types) |*check, copy| check.* = check.* or copy;
     for (ir.functions.items) |function| {
         const body = function.body orelse continue;

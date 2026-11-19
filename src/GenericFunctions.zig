@@ -1170,6 +1170,9 @@ pub fn queryExpressionInScope(module: *Module, ir: *Ir, node: Ast.Node.Index, bi
     }
     for (values) |value| {
         const declaration = if (module.lookup(value.name)) |id| module.getDeclaration(id) else null;
+        // A published specialization is not the type of its generic template.
+        // Keep resolving that name through callTarget with fresh variables.
+        if (declaration) |decl| if (decl.is_generic_function) continue;
         try frame.locals.append(solver.allocator, .{ .name = value.name, .term = try solver.fromType(value.ty, span, 0), .query_global = declaration != null, .mutable = if (declaration) |decl| module.source.ast.decl(decl.node).ast.is_mutable else false });
     }
     for (captures) |capture| try frame.locals.append(solver.allocator, .{ .name = capture.name, .term = try solver.fromType(capture.ty, span, 0), .template = capture.template, .mutable = capture.mutable });
@@ -1366,6 +1369,169 @@ test "reference field inference matches TypeOf and executable access under OOM" 
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testReferenceFieldInference, .{});
 }
 
+fn testStructuralEqualityQuery(allocator: std.mem.Allocator, source: [:0]const u8, valid: bool) !void {
+    var module = try Module.init(allocator, "structural-equality-query.nov", source);
+    defer module.deinit();
+
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    ir.source_len = @intCast(module.source.ast.source.len);
+    if (module.source.ast.errors.len != 0) std.debug.print("invalid equality query source: {s}\n", .{source});
+    try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
+    const declaration_count = module.declarations.items.len;
+    const decl = module.getDeclaration(module.lookup("query").?).?;
+    const node = module.source.ast.decl(decl.node).ast.init_node;
+    const result = try queryExpression(&module, &ir, node, &.{}, &.{}, &.{});
+    if (valid) {
+        if (module.hasErrors()) std.debug.print("equality query diagnostics: {any}\nsource: {s}\n", .{ module.diagnostics.items, source });
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expect(result != null);
+        try std.testing.expect(ir.getType(result.?).? == .boolean);
+    } else {
+        try std.testing.expect(result == null);
+        try std.testing.expect(module.hasErrors());
+    }
+    try std.testing.expectEqual(declaration_count, module.declarations.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ir.functions.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ir.local_generic_instances.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ir.equality.items.len);
+}
+
+test "structural equality solver readonly aggregate inference and hooks under OOM" {
+    for ([_][:0]const u8{
+        "let query=[[1.0]] == [[1.0]]",
+        "let query=[] != [[1]]",
+        "let query=[] == @as([][]int,[])",
+        "let query=[] in @as([][][]int,[])",
+        "let query=@as([]int,[]) in [[]]",
+        "let query={let mut a=[1]\nlet p=&a\np.* == []}",
+        "let query=.[items=[1], flag=true] == .[items=[1], flag=false]",
+        "let S=struct{items:[]int,}\nlet query=.[items=[]] == S.[items=[1]]",
+        "let S=struct{items:[]int,}\nlet query=S.[items=[1]] != .[items=[]]",
+        "let E=enum{one,two,}\nlet query=.one == E.one",
+        "let E=enum{one,two,}\nlet query=[.one] == [E.one]",
+        "let U=union{none,some:[]int,}\nlet query=.some[[]] == U.some[[1]]",
+        "let query=[1] in [[],[1]]",
+        "let S=struct{items:[]int,}\nlet query=.[items=[]] in [S.[items=[1]]]",
+        "let E=enum{one,two,}\nlet query=.one in [E.one]",
+        "let id:(x:`T)->`T=x\nlet query=id([]) == [[1]]",
+        "let Box:(T:type)->type=struct{value:T,}\nlet query=.[value=[]] == Box([]int).[value=[1]]",
+        "let Box:(T:type)->type=struct{value:T,\n@[operator(.equal)]\nlet eq:(a:@This(),b:@This())->bool=unresolved_body\n}\nlet query=[] == @as([]Box(()->int),[])",
+        "let Box:(T:type)->type=struct{value:T,\n@[operator(.equal)]\nlet eq:(a:@This(),b:@This())->bool=unresolved_body\n}\nlet query=@as([]Box(()->int),[]) in [[]]",
+        "let S=struct{callback:()->int,\n@[operator(.equal)]\nlet eq:(a:S,b:S)->bool=unresolved_body\n}\nlet query=[] == @as([]S,[])",
+        "let U=union{none,some:()->int,\n@[operator(.equal)]\nlet eq:(a:U,b:U)->bool=unresolved_body\n}\nlet query=.none == @as(U,.none)",
+        "let E=enum{one,two,\n@[operator(.equal)]\nlet eq:(a:E,b:E)->bool=unresolved_body\n}\nlet query=.one in [E.two]",
+        "let S=struct{callback:()->int,\n@[operator(.equal)]\nlet eq:(a:S,b:S)->bool=true\n}\nlet f:()->int=1\nlet query=[S.[callback=f]] == [S.[callback=f]]",
+        "let S=struct{callback:()->int,\n@[operator(.equal)]\nlet eq:(a:S,b:S)->bool=true\n}\nlet f:()->int=1\nlet query=S.[callback=f] in [S.[callback=f]]",
+    }) |source| {
+        try testStructuralEqualityQuery(std.testing.allocator, source, true);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testStructuralEqualityQuery, .{ source, true });
+    }
+}
+
+test "structural equality solver rejects invalid nested equality and ordering under OOM" {
+    for ([_][:0]const u8{
+        "let query=[] == []",
+        "let query=[] in []",
+        "let query=[] == @as([][]()->int,[])",
+        "let S=struct{callback:()->int,}\nlet query=[] == @as([]S,[])",
+        "let U=union{none,some:()->int,}\nlet query=.none == @as(U,.none)",
+        "let S=struct{x:int,\n@[operator(.equal)]\nlet eq:(a:&S,b:&S)->bool=true\n}\nlet query=[] == @as([]S,[])",
+        "let Other=enum{equal,}\nlet S=struct{x:int,\n@[operator(Other.equal)]\nlet eq:(a:S,b:S)->bool=true\n}\nlet query=[] == @as([]S,[])",
+        "let f:()->int=1\nlet query=[f] == [f]",
+        "let f:()->int=1\nlet query=f in [f]",
+        "let S=struct{callback:()->int,}\nlet f:()->int=1\nlet query=S.[callback=f] == S.[callback=f]",
+        "let query={let x=1\nlet p=&x\np == p}",
+        "let query=[1] < [2]",
+        "let query={let r=1..3\nr == r}",
+        "let query=[1] in [2]",
+        "let E=enum{one,two,}\nlet query=.missing == E.one",
+        "let query=.[x=1] >= .[x=1]",
+        "let A=struct{x:int,}\nlet B=struct{x:int,}\nlet query=A.[x=1] == B.[x=1]",
+        "let A=struct{x:int,}\nlet B=struct{x:int,}\nlet query=A.[x=1] in [B.[x=1]]",
+        "let S=struct{x:int,\n@[operator(.equal)]\nlet eq:(a:S,b:S)->int=1\n}\nlet query=S.[x=1] == S.[x=1]",
+        "let S=struct{x:int,\n@[operator(.equal)]\nlet eq:(a:S)->bool=true\n}\nlet query=S.[x=1] in [S.[x=1]]",
+    }) |source| {
+        try testStructuralEqualityQuery(std.testing.allocator, source, false);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testStructuralEqualityQuery, .{ source, false });
+    }
+}
+
+fn testColdNestedEqualityQuery(allocator: std.mem.Allocator, outer: []const u8, expression: []const u8, hooked: bool) !void {
+    const source = try std.fmt.allocPrintSentinel(allocator, "let Inner=struct{{f:()->int,\n{s}}}\n{s}\nlet query:(a:Outer)->@TypeOf({s})=true", .{
+        if (hooked) "@[operator(.equal)]\nlet equal:(a:Inner,b:Inner)->bool=unresolved_body\n" else "",
+        outer,
+        expression,
+    }, 0);
+    defer allocator.free(source);
+    var module = try Module.init(allocator, "cold-nested-equality-query.nov", source);
+    defer module.deinit();
+    try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    ir.source_len = @intCast(module.source.ast.source.len);
+    const declaration_count = module.declarations.items.len;
+    const id = module.lookup("query").?;
+    // Query the signature directly: constructing values first would warm Inner's
+    // layout and hide incomplete nested-record traversal in the query validator.
+    const ty = try queryFunction(&module, &ir, .{ .module = &module, .id = id }, module.getDeclaration(id).?.name_span);
+    if (hooked) {
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expect(ty != null);
+        const signature = ir.getType(ty.?).?.function;
+        try std.testing.expect(ir.getType(signature.result).? == .boolean);
+    } else {
+        try std.testing.expect(ty == null);
+        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+        try std.testing.expectEqual(Module.Diagnostic.Tag.operator_not_supported, module.diagnostics.items[0].tag);
+    }
+    try std.testing.expectEqual(declaration_count, module.declarations.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ir.functions.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ir.local_generic_instances.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ir.equality.items.len);
+}
+
+test "structural equality signature queries complete cold nested layouts unless hooked under OOM" {
+    for ([_]struct { outer: []const u8, expression: []const u8 }{
+        .{ .outer = "let Outer=struct{x:Inner,}", .expression = "a == a" },
+        .{ .outer = "let Outer=struct{items:[]Inner,}", .expression = "a in [a]" },
+        .{ .outer = "let Outer=union{none,some:Inner,}", .expression = "a == a" },
+    }) |case| {
+        for ([_]bool{ false, true }) |hooked| {
+            try testColdNestedEqualityQuery(std.testing.allocator, case.outer, case.expression, hooked);
+            try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testColdNestedEqualityQuery, .{ case.outer, case.expression, hooked });
+        }
+    }
+}
+
+fn testStructuralEqualityInference(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "structural-equality-inference.nov",
+        \\let Box:(T:type)->type=struct{value:T,}
+        \\let same:(a:`T,b:`T)->bool=a == b
+        \\let different:(a:`T,b:`T)->bool=a != b
+        \\let member:(a:`T,items:[]`T)->bool=a in items
+        \\let identity:(x:`T)->`T=x
+        \\let f:()->bool={let a=Box([]int).[value=[1]]
+        \\let x=same(identity([]),[[1]])
+        \\let y=different(a,Box([]int).[value=[]])
+        \\let z=member(a,[a])
+        \\let t:@TypeOf(same(a,a))=true
+        \\x and y and z and t}
+    );
+    defer module.deinit();
+    var result = try Lowering.lower(&module);
+    defer result.deinit();
+    if (module.hasErrors()) std.debug.print("equality inference diagnostics: {any}\n", .{module.diagnostics.items});
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(result.lowering_complete);
+    try result.ir.verify();
+}
+
+test "structural equality solver generic equality and membership inference under OOM" {
+    try testStructuralEqualityInference(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testStructuralEqualityInference, .{});
+}
+
 fn testClearInference(allocator: std.mem.Allocator) !void {
     var module = try Module.init(allocator, "clear-inference.nov",
         \\let R=struct{items:[]int,}
@@ -1510,7 +1676,7 @@ const Solver = struct {
     read_only: bool = false,
     readonly_layouts: bool = false,
     querying: bool = false,
-    query_operations: std.ArrayList(struct { tag: Ast.Node.Tag, operand: *Term, span: Module.Span }) = .empty,
+    query_operations: std.ArrayList(struct { tag: Ast.Node.Tag, operand: *Term, span: Module.Span, module: *Module, node: Ast.Node.Index }) = .empty,
     query_literals: std.ArrayList(struct { operand: *Term, module: *Module, node: Ast.Node.Index }) = .empty,
     query_strings: std.ArrayList(struct { module: *Module, node: Ast.Node.Index }) = .empty,
     query_printables: std.ArrayList(struct { operand: *Term, module: *Module, node: Ast.Node.Index, interpolation: bool = true }) = .empty,
@@ -1593,6 +1759,7 @@ const Solver = struct {
 
     fn establishedType(self: *Solver, ref: Ref) ?Ir.TypeId {
         if (ref.local != null) return null;
+
         if (self.analysis) |analysis| {
             const index = analysis.entryIndex(ref.module, ref.id);
             if (index < analysis.entries.len) if (analysis.entries[index].type_id) |ty| return ty;
@@ -1691,7 +1858,7 @@ const Solver = struct {
             if (operand.value != .never and (operand.value != .known or self.ir.getType(operand.value.known).? != .void)) try self.fail(.unused_block_value, statement.span, null);
         }
         if (self.failed) return;
-        if (self.query_literals.items.len != 0 or self.query_strings.items.len != 0 or self.query_matches.items.len != 0 or self.query_printables.items.len != 0 or self.query_unions.items.len != 0) {
+        if (self.query_literals.items.len != 0 or self.query_strings.items.len != 0 or self.query_matches.items.len != 0 or self.query_printables.items.len != 0 or self.query_unions.items.len != 0 or self.query_operations.items.len != 0) {
             // Resolve all type metadata before copying the pool. Literal decoding
             // and shared pattern validation then own only disposable constants.
             for (self.query_matches.items) |match| for (match.subjects) |subject| {
@@ -1700,6 +1867,15 @@ const Solver = struct {
             for (self.query_printables.items) |printable| {
                 _ = try self.materialize(printable.operand, 0);
             }
+            for (self.query_operations.items) |operation| switch (operation.tag) {
+                .equal_equal, .bang_equal, .in => {
+                    if (try self.materialize(operation.operand, 0) == null) {
+                        if (!self.failed) try self.fail(.unresolved_value_type, operation.span, null);
+                        return;
+                    }
+                },
+                else => {},
+            };
             var validation = try BodyChecker.QueryValidation.init(self.ir);
             defer validation.deinit();
             for (self.query_unions.items) |constructor| if (constructor.enum_payload) {
@@ -1733,8 +1909,16 @@ const Solver = struct {
                 const valid = if (printable.interpolation) try validation.printable(printable.module, printable.node, ty) else try validation.printArgument(printable.module, printable.node, ty);
                 if (!valid) self.failed = true;
             }
+            for (self.query_operations.items) |operation| switch (operation.tag) {
+                .equal_equal, .bang_equal, .in => {
+                    const ty = (try self.materialize(operation.operand, 0)).?;
+                    if (!try validation.comparable(operation.module, operation.node, ty)) self.failed = true;
+                },
+                else => {},
+            };
         }
         for (self.query_operations.items) |operation| {
+            if (operation.tag == .equal_equal or operation.tag == .bang_equal or operation.tag == .in) continue;
             const operand = root(operation.operand);
             if (operand.value == .array and (operation.tag == .add or operation.tag == .assign_add)) continue;
             if (operand.value != .known) {
@@ -1747,7 +1931,6 @@ const Solver = struct {
                 continue;
             }
             const valid = switch (operation.tag) {
-                .equal_equal, .bang_equal => ty == .integer or ty == .float or ty == .boolean or ty == .rune or ty == .string or ty == .enumeration,
                 .less_than, .greater_than, .less_or_equal, .greater_or_equal => ty == .integer or ty == .float,
                 .bit_not, .bit_and, .bit_or, .bit_xor, .mod, .assign_mod => ty == .integer,
                 .add, .assign_add => ty == .integer or ty == .float or ty == .string,
@@ -2040,6 +2223,7 @@ const Solver = struct {
             },
             else => unreachable,
         };
+
         try self.fail(.generic_function_conflict, y.span, x.span);
     }
 
@@ -2231,6 +2415,7 @@ const Solver = struct {
             try frame.locals.append(self.allocator, .{ .name = capture.name, .term = try self.fromType(capture.ty, ref.span(), 0), .template = capture.template, .mutable = capture.mutable });
         };
         const established = self.establishedType(ref);
+
         const signature_term = if (established) |ty| try self.fromType(ty, ref.span(), depth + 1) else try self.typeNode(&frame, function.proto_node, depth + 1);
         if (self.failed or signature_term.value != .function) return null;
         const f = signature_term.value.function;
@@ -2812,6 +2997,24 @@ const Solver = struct {
         return self.expression(frame, node, depth);
     }
 
+    fn needsOperandContext(ast: *const Ast, node: Ast.Node.Index) bool {
+        return switch (ast.nodes.items(.tag)[node]) {
+            .enum_literal => true,
+            .struct_init => ast.fullStructInit(node).?.type_node == 0,
+            .array_access, .slice, .container_decl_arg => needsOperandContext(ast, ast.nodes.items(.data)[node].lhs),
+            .array_init, .array_init_comma => blk: {
+                const data = ast.nodes.items(.data)[node];
+                for (ast.extra_data[data.lhs..data.rhs]) |item| if (needsOperandContext(ast, item)) break :blk true;
+                break :blk false;
+            },
+            .array_init_two, .array_init_two_comma => blk: {
+                const data = ast.nodes.items(.data)[node];
+                break :blk (data.lhs != 0 and needsOperandContext(ast, data.lhs)) or (data.rhs != 0 and needsOperandContext(ast, data.rhs));
+            },
+            else => false,
+        };
+    }
+
     fn expression(self: *Solver, frame: *Frame, node: Ast.Node.Index, depth: usize) Ir.BuildError!*Term {
         return self.expressionExpected(frame, node, null, depth);
     }
@@ -2902,7 +3105,7 @@ const Solver = struct {
                     }
                 }
             },
-            .enum_literal => if (self.querying) {
+            .enum_literal => {
                 if (expected) |context| {
                     const name = ast.tokenSlice(ast.nodes.items(.main_token)[node]);
                     if (try self.enumTag(context, name, span)) return context;
@@ -3000,7 +3203,7 @@ const Solver = struct {
                 const rhs = try self.expression(frame, data.rhs, depth + 1);
                 if (root(rhs).value == .never) return rhs;
                 if (self.querying) {
-                    if (ast.nodes.items(.tag)[node] != .assign) try self.query_operations.append(self.allocator, .{ .tag = ast.nodes.items(.tag)[node], .operand = lhs, .span = span });
+                    if (ast.nodes.items(.tag)[node] != .assign) try self.query_operations.append(self.allocator, .{ .tag = ast.nodes.items(.tag)[node], .operand = lhs, .span = span, .module = module, .node = node });
                 }
                 try self.unifyArgument(lhs, rhs, span);
                 return self.fromType(try self.ir.internType(.void), span, 0);
@@ -3015,20 +3218,43 @@ const Solver = struct {
                     literal_node = block.ast.statements[0];
                 }
                 if (self.querying and ast.nodes.items(.tag)[node] == .negation and ast.nodes.items(.tag)[literal_node] == .number_literal and self.query_literals.items.len == numbers + 1) self.query_literals.items[numbers].node = node;
-                if (self.querying) try self.query_operations.append(self.allocator, .{ .tag = ast.nodes.items(.tag)[node], .operand = operand, .span = span });
+                if (self.querying) try self.query_operations.append(self.allocator, .{ .tag = ast.nodes.items(.tag)[node], .operand = operand, .span = span, .module = module, .node = node });
                 return operand;
             },
             .add, .sub, .mul, .div, .mod, .bit_and, .bit_or, .bit_xor, .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal => {
-                const lhs = try self.expression(frame, data.lhs, depth + 1);
-                if (root(lhs).value == .never) return lhs;
-                const rhs = try self.expression(frame, data.rhs, depth + 1);
-                if (root(rhs).value == .never) return rhs;
-                try self.unify(lhs, rhs, span, 0);
-                if (self.querying) try self.query_operations.append(self.allocator, .{ .tag = ast.nodes.items(.tag)[node], .operand = lhs, .span = span });
+                const equality = ast.nodes.items(.tag)[node] == .equal_equal or ast.nodes.items(.tag)[node] == .bang_equal;
+                const reverse = equality and needsOperandContext(ast, data.lhs) and !needsOperandContext(ast, data.rhs);
+                const first = try self.expression(frame, if (reverse) data.rhs else data.lhs, depth + 1);
+                if (root(first).value == .never) return first;
+                const second = try self.expressionExpected(frame, if (reverse) data.lhs else data.rhs, if (equality) first else null, depth + 1);
+                if (root(second).value == .never) return second;
+                try self.unify(first, second, span, 0);
+                const lhs = if (reverse) second else first;
+                if (self.querying) try self.query_operations.append(self.allocator, .{ .tag = ast.nodes.items(.tag)[node], .operand = lhs, .span = span, .module = module, .node = node });
                 return switch (ast.nodes.items(.tag)[node]) {
                     .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal => self.fromType(try self.ir.internType(.boolean), span, 0),
                     else => lhs,
                 };
+            },
+            .in => {
+                const reverse = needsOperandContext(ast, data.lhs);
+                const element = try self.term(.unknown, span);
+                const array = try self.term(.{ .array = element }, span);
+                if (reverse) {
+                    const rhs = try self.expressionExpected(frame, data.rhs, array, depth + 1);
+                    if (root(rhs).value == .never) return rhs;
+                    try self.unify(array, rhs, span, 0);
+                }
+                const lhs = try self.expressionExpected(frame, data.lhs, element, depth + 1);
+                if (root(lhs).value == .never) return lhs;
+                try self.unify(element, lhs, span, 0);
+                if (!reverse) {
+                    const rhs = try self.expressionExpected(frame, data.rhs, array, depth + 1);
+                    if (root(rhs).value == .never) return rhs;
+                    try self.unify(array, rhs, span, 0);
+                }
+                if (self.querying) try self.query_operations.append(self.allocator, .{ .tag = .in, .operand = element, .span = span, .module = module, .node = node });
+                return self.fromType(try self.ir.internType(.boolean), span, 0);
             },
             .array_access => {
                 if (try self.constructorType(frame, data.lhs, expected, depth + 1)) |ty|
@@ -3199,14 +3425,15 @@ const Solver = struct {
                 return result;
             },
             .array_init, .array_init_comma, .array_init_two, .array_init_two_comma => {
-                const element = try self.term(.unknown, span);
+                const context = if (expected) |want| root(want) else null;
+                const element = if (context != null and context.?.value == .array) context.?.value.array else try self.term(.unknown, span);
                 const buf = [_]Ast.Node.Index{ data.lhs, data.rhs };
                 const elements = switch (ast.nodes.items(.tag)[node]) {
                     .array_init, .array_init_comma => ast.extra_data[data.lhs..data.rhs],
                     else => buf[0 .. @as(usize, @intFromBool(data.lhs != 0)) + @as(usize, @intFromBool(data.rhs != 0))],
                 };
                 for (elements) |item| {
-                    const value = try self.expression(frame, item, depth + 1);
+                    const value = try self.expressionExpected(frame, item, element, depth + 1);
                     if (root(value).value == .never) return value;
                     try self.unify(element, value, span, 0);
                 }

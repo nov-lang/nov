@@ -1035,7 +1035,7 @@ names and tags match; module aliases preserve identity.
   and `_`. All tags must be covered or a final catchall supplied. Unknown tags and
   wholly covered prongs diagnose with related earlier-pattern notes; partially
   overlapping alternatives retain first-match behavior. Enum patterns do not bind
-  payload captures.
+  payload captures. Patterns always use raw tag identity, bypassing equality hooks.
 - Enum locals, parameters, returns, control-flow results, literal globals, flat
   record fields (including tag defaults), union payloads and generic type arguments
   work with exact nominal typing. `Result(uint, Kind)` supports ordinary `.!`
@@ -1522,8 +1522,9 @@ checked semantically through 128 bits, while reachable C layouts require
   hold functions, unions and ranges under the same storage/copy rules. See
   [`examples/value-payloads.nov`](examples/value-payloads.nov).
 - Explicit tag enums, reference payloads, variant-pattern
-  alternatives, nested destructuring, direct payload field access and union equality
-  remain unsupported. Union globals support data-only initialization.
+  alternatives, nested destructuring and direct payload field access remain
+  unsupported. Union equality compares exact nominal types, then the active tag
+  and payload recursively, unless an explicit equality hook overrides it. Union globals support data-only initialization.
 
 The examples below describe broader design, not additional implemented features.
 
@@ -1571,7 +1572,7 @@ let Number = union {
     }
 
     @[public]
-    @[operator(.@"==")]
+    @[operator(.equal)]
     let eql: (a: Number, b: Number) -> bool = {
         a.toRaw() == b.toRaw()
     }
@@ -1580,11 +1581,11 @@ let Number = union {
 let x = Number.raw[3]
 x.text ; runtime error
 
-; `==` can be used to check the tag of an union and to compare two unions
-; overloading `==` in an union only overload the comparison between two unions,
-; not between the tag
-@println(x == .raw) ; prints true
-@println(x == .text) ; prints false
+; Use match to inspect a union tag without invoking its equality hook.
+@println(match x {
+    .raw => true
+    .text => false
+}) ; prints true
 
 @println(x == .raw[4]) ; prints false
 @println(x == .text["3"]) ; prints true, would have been false if we hadn't overloaded the `==` operator
@@ -1745,8 +1746,9 @@ as an ordinary argument even on success. `unwrapOrElse` evaluates the callback
 value normally but calls its body only on error. Neither requires a Result builtin.
 
 [`lib/std.nov`](lib/std.nov) publicly re-exports Result from `result.nov`, Option
-from `option.nov`, and the `array` namespace from `array.nov`. Examples use real
-imports rather than copied definitions:
+from `option.nov`, the `array` and `string` helper namespaces, and the `builtin`
+namespace containing the public `Operator` enum from `builtin.nov`. Examples use
+real imports rather than copied definitions:
 
 ```nov
 let std = @import("std")
@@ -2176,8 +2178,9 @@ let main: () -> void = {
   Direct `items[index].field` mutation remains unsupported.
 - String membership compares exact UTF-8 bytes/length, including embedded NUL, not
   owner identity. Enum elements support exact nominal equality and membership.
-  Storage support adds no other equality or membership: functions, unions, records,
-  arrays and ranges reject comparisons and membership as element values. Float
+  Nested arrays, records and unions support recursive structural equality and
+  membership when their contents are comparable; nominal equality hooks apply
+  recursively. Functions, references and ranges have no default equality. Float
   elements support IEEE equality/membership and indexed `+= -= *= /=`;
   `%=` remains integer-only and string indexed `+=` is not added.
 - Managed backing allocations own repeated element descriptors and expanded pointer
@@ -2198,8 +2201,8 @@ let main: () -> void = {
 - Retaining capacity does not yet make `+=` reuse it: append still allocates fresh
   backing. Truncation, capacity APIs and initialization on length growth remain
   deferred. `@len(values)` is not assignable; `values = []` rebinds a mutable array
-  to an empty value rather than retaining its buffer. No array equality,
-  slices, pointer elements, general aliases,
+  to an empty value rather than retaining its buffer. Array equality compares
+  lengths and then elements recursively. No slices, pointer elements, general aliases,
   or capacity API is delivered. Array globals support data-only initialization. Bounded value/reference iteration is
   supported (see [Loop](#loop)). The formatter supports
   the array syntax described above without extending these semantics.
@@ -2875,9 +2878,9 @@ let nums: []int = [1, 2, 3]
 @println(5 in nums) ; false
 ```
 
-The executable subset supports membership in scalar `[]T` arrays: `bool`, `rune`,
-`str`, nominal enums, `f32`/`f64`, fixed 8/16/32/64-bit signed/unsigned integers,
-and native `int`/`uint`. Value and
+The executable subset supports membership in `[]T` whenever `T` supports
+[value equality](#value-equality): scalars, nominal enums, nested arrays, records
+and unions with comparable contents or a valid nominal equality hook. Value and
 element types must match exactly; there is no widening or signedness conversion.
 A known array element type constrains the left literal; a known typed left value
 constrains an array literal, including `[]`. Boolean literals provide a known
@@ -2888,12 +2891,15 @@ not itself choose an element type.
 Operands evaluate once, left then right. Membership projects its RHS for a readonly
 scan rather than cloning existing array storage, including array-valued fields and
 permitted readonly borrows. Required snapshots inside effectful computed bases are
-preserved; constructing the RHS can still allocate. The scan itself is an
-allocation-free linear traversal using scalar equality, stopping at the first match. It neither
-mutates nor appends. String elements compare exact bytes, including NUL. Strings
-as containers are unsupported. Functions, unions, records, arrays and ranges have
-no element equality or membership, even though they are storable array elements;
-pointers and iterator protocols remain unsupported.
+preserved; constructing the RHS can still allocate. If comparison can invoke a
+user hook, membership snapshots the RHS instead so hook mutations cannot change
+the candidates being scanned. The scan is a linear traversal using the same recursive equality and hooks as `==`, stopping at the
+first match. Structural comparison itself does not allocate, but user hooks may
+allocate or have side effects. The scan neither mutates nor appends. String
+elements compare exact bytes, including NUL. Strings as containers are unsupported.
+Functions, references and ranges have no default element equality; aggregates
+containing noncomparable values need an enclosing nominal equality hook that
+stops structural traversal. General iterator protocols remain unsupported.
 
 ## Assignment
 ```nov
@@ -3274,8 +3280,8 @@ nov run examples/fibo.nov --release # 55
 | Logical And           | a **and** b        | bool                                         | TODO                                                                |
 | Logical Or            | a **or** b         | bool                                         | TODO                                                                |
 | Boolean Not           | !a                 | bool                                         | TODO                                                                |
-| Equality              | a == b             | All types                                    | TODO                                                                |
-| Inequality            | a != b             | All types                                    | TODO                                                                |
+| Equality              | a == b             | [Comparable values](#value-equality)          | Exact-type structural equality or nominal hook                       |
+| Inequality            | a != b             | [Comparable values](#value-equality)          | Negation of equality                                                 |
 | Greater Than          | a > b              | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                                |
 | Greater or Equal      | a >= b             | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                                |
 | Less Than             | a < b              | [Integers](#Integers) <br> [Floats](#Floats) | TODO                                                                |
@@ -3305,47 +3311,85 @@ or
 = *= /= %= += -=
 ```
 
+## Value equality
+
+`==` and `!=` require exactly matching operand types; there are no implicit
+numeric conversions or comparisons between distinct nominal types. Contextual
+literals may obtain their type from the other operand. Default equality supports:
+
+- `bool`, integers and runes by value; `str` by exact UTF-8 bytes and length,
+  including embedded NUL, not backing-storage identity.
+- `f32`/`f64` using IEEE equality: NaN is unequal to every value, including itself;
+  positive and negative zero compare equal. These rules also apply inside aggregates.
+- Arrays by length first, then corresponding elements recursively in index order.
+- Records by corresponding fields recursively in declaration order. Named structs
+  require the exact nominal type (including generic type arguments), not merely
+  matching layouts; anonymous records require the same exact structural type.
+- Tagged unions by exact nominal type, then active tag and active payload
+  recursively; payloadless alternatives need no payload comparison.
+- Enums by exact nominal type and tag identity.
+
+Structural traversal short-circuits at the first difference. Functions/closures,
+references and ranges have no default equality. An aggregate containing a
+noncomparable field or payload is not structurally comparable unless an enclosing
+valid nominal hook replaces that traversal. Storage support alone does not imply
+equality support. Equality hooks apply recursively to array elements, record
+fields and active union payloads, and to comparisons performed by `value in array`.
+Operands evaluate once, left to right, preserving the left value across RHS
+effects. Hooks may allocate, panic or have side effects; structural traversal
+itself does not allocate. Ordinary by-value snapshots and hook arguments retain
+the existing copy semantics. `!=` is the negation of the same equality operation, not a separate hook.
+
+Enum `match` patterns always compare raw tag identity, bypassing equality hooks.
+A hook cannot change which enum pattern matches, even when the match is inside
+that hook's own body.
+
 ## Operator Overloading
 
-This is a historical proposal, not implemented operator-overloading behavior.
-The proposed operators and automatic derivations below are not delivery claims;
-the executable equality rules are described in their type-specific sections.
-Printing customization is implemented separately through `@[stringify]`, not a
-magic method name. In this proposal, overloading would cover these operators:
-- `+`: (T, T) -> T
-- `-`: (T, T) -> T
-- `*`: (T, T) -> T
-- `/`: (T, T) -> T
-- `%`: (T, T) -> T
-- `<`: (T, T) -> bool
-- `==`: (T, T) -> bool
-
-Note:
-- `==` is automatically generated for all types by the compiler but can be overridden.
-- `!=`, `>`, `<=`, `>=` are automatically generated when `==` and `<` are defined.
-- `+=`, `-=`, `*=`, `/=`, `%=` are automatically generated when the corresponding operator is defined.
+Only equality overloading is implemented. Attach `@[operator(.equal)]` to an
+ordinary immutable, non-generic method with a body on a nominal struct, union or
+enum. The method name is arbitrary; its exact signature must be `(T, T) -> bool`,
+where both parameters are the enclosing concrete type by value, not references.
+Methods on generic containers may use `@This()` for that concrete type. There is
+at most one overload per operator per nominal container. The attribute takes
+exactly one literal tag, cannot be repeated, and cannot be combined with `test`,
+`noreturn`, `extern` or `export`.
 
 ```nov
-let Complex = struct {
-    re: float
-    im: float
+let std = @import("std")
+let Key = struct {
+    value: int,
+    ignored: str,
 
-    @[operator(.@"+")]
-    let add: (self: Complex, other: Complex) -> Complex = .[
-        re = self.re + other.re,
-        im = self.im + other.im,
-    ]
-
-    ; explicit print converter; the name is arbitrary
-    ; exact signature must be (T) -> str where T is the container type
-    @[stringify]
-    let format: (self: Complex) -> str = "{self.re} + i{self.im}"
+    @[public]
+    @[operator(std.builtin.Operator.equal)]
+    let same: (a: Key, b: Key) -> bool = a.value == b.value
 }
-
-let x: Complex = .[ re = 5, im = 3 ]
-let y: Complex = .[ re = 2, im = 7 ]
-x + y ; equivalent value: Complex.[ re = 7, im = 10 ]
+let main: () = {
+    let a = Key.[value = 1, ignored = "first"]
+    let b = Key.[value = 1, ignored = "second"]
+    @println(a == b) ; true
+    @println(a != b) ; false: derived from the same hook
+    @println(a in [b]) ; true: membership uses the same hook
+}
 ```
+
+The contextual `.equal` form and qualified `std.builtin.Operator.equal` form
+select the same operator. Qualified arguments must resolve to the canonical
+`Operator` enum exposed by `std.builtin`; an unrelated enum with an `equal` tag
+is rejected. This is literal tag syntax, not an arbitrary computed expression.
+Private visibility is honored: imported hooks require `@[public]`. An inaccessible
+or incorrectly typed explicit hook diagnoses, including when nested; it does not
+silently fall back to structural equality. Hooks replace default comparison for
+the whole nominal value and remain callable as ordinary methods. Unmarked `eql`
+or `equal` methods have no automatic effect, and there is no global overload lookup.
+
+`std.builtin.Operator` declares exactly these tags: `equal`, `less_than`, `add`,
+`sub`, `mul`, `div`, `rem`, `try`, `deref`, `deref_mut`, `index`, `index_mut`, `neg`,
+`bit_and`, `bit_or`, `bit_xor`, `shl`, `shr`. All except `equal` are reserved and
+unimplemented; using them as overloads diagnoses an unsupported operator overload.
+No ordering, arithmetic, indexing or compound-assignment overloads or automatic
+derivations are delivered. Printing customization remains separate via `@[stringify]`.
 
 ## Strings
 
@@ -3774,7 +3818,7 @@ TODO
 
 ## Attributes
 - `@[deprecated]` - `@[deprecated("message...")]`
-- `@[operator(op)]`: Note that op is an enum for easier parsing.
+- `@[operator(.equal)]`: customize nominal value equality with an exact `(T, T) -> bool` method; see [Operator Overloading](#operator-overloading).
 - `@[pure]`: Mainly for extern functions, a [pure function](https://en.wikipedia.org/wiki/Functional_programming#Pure_functions)
              can only call pure functions but impure functions can call a pure function without issue.
 - `@[extern]` / `@[extern("symbol_name")]`: declare a bodyless external C function.
@@ -3800,8 +3844,9 @@ on ordinary functions and methods may be combined with `@[public]` where support
 Duplicate attributes, arguments, invalid placements and unknown/unsupported
 attributes diagnose. The `extern` and `export` forms described below are supported
 and do not imply `@[public]`. `@[test]` is supported under the separate
-[test-only declaration rules](#testing-nov-code). Other entries in this list remain
-design proposals.
+[test-only declaration rules](#testing-nov-code). `@[stringify]` and
+`@[operator(.equal)]` are supported under their method-specific rules. Other
+entries in this list remain design proposals.
 
 ### C function exports
 

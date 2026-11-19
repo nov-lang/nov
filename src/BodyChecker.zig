@@ -14,6 +14,19 @@ const GenericFunctions = @import("GenericFunctions.zig");
 const isPrimitive = @import("primitives.zig").isPrimitive;
 
 pub const Error = Ir.BuildError;
+pub fn validateOperatorArgument(module: *Module, ir: *Ir, declaration: Module.Declaration) Error!bool {
+    const argument = declaration.operator_arg orelse return true;
+    const base = module.source.ast.nodes.items(.data)[argument].lhs;
+    const resolved = try TypeResolver.resolveInScopeReadOnly(module, ir, base, declaration.container, declaration.concrete_type, declaration.function_bindings);
+    if (resolved) |id| {
+        const ty = ir.getType(id).?;
+        if (ty == .enumeration) if (module.compilation) |comp|
+            if (comp.isBuiltinOperator(ty.enumeration.source, ty.enumeration.identity)) return true;
+    }
+    try module.diagnostics.append(module.allocator, .{ .tag = .invalid_operator_declaration, .span = module.tokenSpan(module.source.ast.firstToken(argument)) });
+    return false;
+}
+
 const Known = struct { ty: Ir.TypeId, annotation: ?Module.Span = null };
 const LocalSpecialization = struct { bindings: []const Module.TypeBinding, ty: Ir.TypeId, function: ?Ir.FunctionId };
 const TemplateCapture = struct { name: []const u8, binding: Binding };
@@ -478,6 +491,13 @@ pub const QueryValidation = struct {
         var visited: Context.PrintableTypes = .empty;
         defer visited.deinit(module.allocator);
         return context.registerPrintable(node, ty, &visited, true);
+    }
+
+    pub fn comparable(self: *QueryValidation, module: *Module, node: Ast.Node.Index, ty: Ir.TypeId) Error!bool {
+        var context: Context = .{ .module = module, .ir = &self.ir, .types = &.{}, .probing = true };
+        var visited: Context.PrintableTypes = .empty;
+        defer visited.deinit(module.allocator);
+        return context.registerComparable(node, ty, &visited);
     }
 
     pub fn enumOperand(self: *QueryValidation, module: *Module, node: Ast.Node.Index, ty: Ir.TypeId) Error!bool {
@@ -1140,6 +1160,22 @@ const Context = struct {
         const identity = if (nominal == .record) nominal.record.identity else nominal.enumeration.identity;
         const owner = if (self.module.compilation) |comp| comp.getModule(source).? else self.module;
         const method = owner.lookupConcreteStringifier(@fromBackingInt(@intCast(identity)), if (nominal == .record and nominal.record.type_args.len != 0) @backingInt(ty) else null) orelse return null;
+        return self.qualify(owner, method);
+    }
+
+    fn nominalEqualityIncludingPrivate(self: *Context, ty: Ir.TypeId) ?Module.DeclId {
+        const nominal = self.ir.getType(ty).?;
+        if (nominal == .record and nominal.record.anonymous != .none) return null;
+        const source = switch (nominal) {
+            .record => nominal.record.source,
+            .enumeration => nominal.enumeration.source,
+            else => return null,
+        };
+        const identity = if (nominal == .record) nominal.record.identity else nominal.enumeration.identity;
+        const owner = if (self.module.compilation) |comp| comp.getModule(source).? else self.module;
+        const concrete = if (nominal == .record and nominal.record.type_args.len != 0) @as(?u32, @backingInt(ty)) else null;
+        const method = owner.lookupConcreteOperator(@fromBackingInt(identity), concrete, .equal) orelse
+            (if (self.probing) owner.lookupOperator(@fromBackingInt(identity), .equal) else null) orelse return null;
         return self.qualify(owner, method);
     }
 
@@ -2570,6 +2606,57 @@ const Context = struct {
     const PrintableHook = struct { method: Module.DeclId, signature: Ir.TypeId };
     const PrintableTypes = std.AutoHashMapUnmanaged(Ir.TypeId, ?PrintableHook);
 
+    fn registerComparable(self: *Context, node: Ast.Node.Index, ty: Ir.TypeId, visited: *PrintableTypes) Error!bool {
+        if (visited.contains(ty)) return true;
+        try visited.put(self.module.allocator, ty, null);
+        const nominal = self.ir.getType(ty).?;
+        switch (nominal) {
+            .boolean, .integer, .float, .rune, .string => return true,
+            .array => |element| return self.registerComparable(node, element, visited),
+            .record, .enumeration => {},
+            else => {
+                _ = try self.fail(.operator_not_supported, node, null);
+                return false;
+            },
+        }
+        if (self.nominalEqualityIncludingPrivate(ty)) |method| {
+            const declaration = self.getDeclaration(method);
+            const owner = self.declarationModule(method);
+            if ((owner.source.id != self.module.source.id and !declaration.public) or declaration.is_generic_function or declaration.noreturn) {
+                _ = try self.fail(.invalid_operator_signature, node, declaration.name_span);
+                return false;
+            }
+            if (!try validateOperatorArgument(owner, self.ir, declaration)) return false;
+            const signature_id = if (self.probing) blk: {
+                const function = owner.source.ast.declFunction(declaration.node) orelse return false;
+                const concrete = if (nominal == .record and nominal.record.type_args.len != 0) @as(?u32, @backingInt(ty)) else declaration.concrete_type;
+                break :blk (try TypeResolver.resolveInScopeReadOnly(owner, self.ir, function.proto_node, declaration.container, concrete, declaration.function_bindings)) orelse return false;
+            } else if (try self.globalType(method)) |known| known.ty else return false;
+            const signature = self.ir.getType(signature_id).?;
+            if (signature != .function or signature.function.params.len != 2 or signature.function.params[0] != ty or signature.function.params[1] != ty or self.ir.getType(signature.function.result).? != .boolean) {
+                _ = try self.fail(.invalid_operator_signature, node, declaration.name_span);
+                return false;
+            }
+            try visited.put(self.module.allocator, ty, .{ .method = method, .signature = signature_id });
+            if (self.emitter) |emitter| {
+                if (!try self.checkCallEffects(node)) return false;
+                const function = emitter.functions[@backingInt(method)] orelse return error.InvalidFunctionId;
+                try self.ir.setTypeEquality(ty, function);
+            }
+            return true;
+        }
+        if (self.emitter != null and !(nominal == .record and nominal.record.anonymous != .none)) try self.ir.setTypeEquality(ty, null);
+        if (nominal == .record) {
+            if (self.probing and !try TypeResolver.completeRecordReadOnly(self.module, self.ir, ty)) return false;
+            const record = self.ir.getType(ty).?.record;
+            for (record.fields) |field| {
+                if (record.tagged and self.ir.getType(field.ty).? == .void) continue;
+                if (!try self.registerComparable(node, field.ty, visited)) return false;
+            }
+        }
+        return true;
+    }
+
     fn registerPrintable(self: *Context, node: Ast.Node.Index, ty: Ir.TypeId, visited: *PrintableTypes, top_level: bool) Error!bool {
         if (visited.contains(ty)) return true;
         try visited.put(self.module.allocator, ty, null);
@@ -3931,7 +4018,7 @@ const Context = struct {
         var value: ?Ir.ValueId = null;
         if (self.emitter) |emitter| {
             value = try emitter.append(if (self.wildcard(node)) boolean else subject.ty, self.irSpan(node), .{ .constant = constant });
-            if (!self.wildcard(node)) value = try emitter.append(boolean, self.irSpan(node), .{ .binary = .{ .op = .eq, .lhs = subject.value.?, .rhs = value.? } });
+            if (!self.wildcard(node)) value = try emitter.append(boolean, self.irSpan(node), .{ .binary = .{ .op = .eq, .lhs = subject.value.?, .rhs = value.?, .enum_tag = self.ir.getType(subject.ty).? == .enumeration } });
         }
         return .{ .ty = boolean, .value = value };
     }
@@ -5186,9 +5273,15 @@ const Context = struct {
                 var right = try self.probe(data.rhs, depth + 1);
                 var left = try self.probe(data.lhs, depth + 1);
                 if (right == null and left == null) {
-                    if (try self.probeNumericPair(data.lhs, data.rhs, depth + 1)) |fallback| {
-                        if (self.ir.getType(fallback.ty).? == .array) right = fallback else left = fallback;
-                    }
+                    const left_default = try self.probeNumericPair(data.lhs, data.lhs, depth + 1);
+                    const right_default = try self.probeNumericPair(data.rhs, data.rhs, depth + 1);
+                    if (left_default != null and self.hasFloatDefault(left_default.?.ty, depth + 1)) {
+                        left = left_default;
+                    } else if (right_default != null and self.hasFloatDefault(right_default.?.ty, depth + 1)) {
+                        right = right_default;
+                    } else if (left_default != null) {
+                        left = left_default;
+                    } else right = right_default;
                 }
                 const element: Known = if (right) |known| blk: {
                     const array = self.ir.getType(known.ty).?;
@@ -5204,22 +5297,31 @@ const Context = struct {
                     if (try self.expression(data.rhs, null, depth + 1) == null) return null;
                     return self.fail(.operator_not_supported, node, null);
                 };
-                if (!Ir.hasEquality(self.ir.getType(element.ty).?)) return self.fail(.operator_not_supported, node, element.annotation);
+                var comparable: PrintableTypes = .empty;
+                defer comparable.deinit(self.module.allocator);
+                if (!try self.registerComparable(node, element.ty, &comparable)) return null;
+                var callbacks = comparable.valueIterator();
+                var has_hook = false;
+                while (callbacks.next()) |hook| has_hook = has_hook or hook.* != null;
                 if (try self.expression(data.lhs, element, depth + 1) == null) return null;
                 const array: Known = .{ .ty = try self.ir.internType(.{ .array = element.ty }), .annotation = element.annotation };
-                // The scan cannot mutate or retain its RHS. Only project the final
-                // read; computed bases still snapshot before intervening effects.
-                if (try self.projection(data.rhs, array, depth + 1) == null) return null;
+                // Hooks can mutate captured owners; retain ordinary snapshots then.
+                if ((if (has_hook) try self.expression(data.rhs, array, depth + 1) else try self.projection(data.rhs, array, depth + 1)) == null) return null;
                 return self.fit(try self.ir.internType(.boolean), expected, node);
             },
             .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal => {
                 const operand = (try self.probe(data.lhs, depth + 1)) orelse (try self.probe(data.rhs, depth + 1)) orelse (try self.probeNumericPair(data.lhs, data.rhs, depth + 1)) orelse return self.missingOperandType(node, data.lhs, data.rhs, null, depth);
                 const ty = self.ir.getType(operand.ty).?;
                 const equality = ast.nodes.items(.tag)[node] == .equal_equal or ast.nodes.items(.tag)[node] == .bang_equal;
-                if (ty != .integer and ty != .float and !((ty == .boolean or ty == .string or ty == .rune or ty == .enumeration) and equality)) return self.fail(.operator_not_supported, node, operand.annotation);
+                if (!equality and ty != .integer and ty != .float) return self.fail(.operator_not_supported, node, operand.annotation);
                 const lhs = try self.expression(data.lhs, operand, depth + 1);
                 const rhs = try self.expression(data.rhs, operand, depth + 1);
                 if (lhs == null or rhs == null) return null;
+                if (equality and !self.terminated) {
+                    var comparable: PrintableTypes = .empty;
+                    defer comparable.deinit(self.module.allocator);
+                    if (!try self.registerComparable(node, operand.ty, &comparable)) return null;
+                }
                 return self.fit(try self.ir.internType(.boolean), expected, node);
             },
             .bool_and, .bool_or, .bool_not => {
@@ -8058,7 +8160,29 @@ test "membership infers exact scalar operands before numeric defaults" {
     }
 }
 
-test "membership rejects inexact types widening nonscalar elements and nonboolean results" {
+test "membership infers exact recursive aggregate operands" {
+    for ([_][]const u8{
+        "let A=struct{s:str,}\nlet f: (a: A) -> bool = a in []",
+        "let A=struct{s:str,}\nlet f:(a:A)->bool=a in [a]",
+        "let f: (a: []int) -> bool = a in []",
+        "let f:(a:[]str)->bool=a in [a]",
+        "let U=union{s:str,none,}\nlet f:(a:U)->bool=a in [a]",
+        "let U=union{none,}\nlet f:(a:U)->bool=a==a",
+        "let A=struct{s:str,rows:[][]int,}\nlet f:(a:A,b:A)->bool=a!=b",
+        "let f:(a:[][]int,b:[][]int)->bool=a==b",
+        "let main: () -> void = {let a: []int = [1]\n@println(a == a)}",
+    }) |source| {
+        var module = try Module.init(std.testing.allocator, "aggregate-membership.nov", source);
+        defer module.deinit();
+        var sema = try Lowering.lower(&module);
+        defer sema.deinit();
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expect(sema.lowering_complete);
+        try sema.ir.verify();
+    }
+}
+
+test "membership rejects inexact types widening unsupported leaves and nonboolean results" {
     const Case = struct { source: []const u8, tag: Module.Diagnostic.Tag };
     for ([_]Case{
         .{ .source = "let f: (a: []int) -> bool = 1.5 in a", .tag = .literal_type_mismatch },
@@ -8073,8 +8197,8 @@ test "membership rejects inexact types widening nonscalar elements and nonboolea
         .{ .source = "let f: (a: []int) -> int = 1 in a", .tag = .expression_type_mismatch },
         .{ .source = "let f: () -> bool = true in false", .tag = .operator_not_supported },
         .{ .source = "let f: () -> bool = \"a\" in \"abc\"", .tag = .operator_not_supported },
-        .{ .source = "let A=struct{s:str,}\nlet f: (a: A) -> bool = a in []", .tag = .operator_not_supported },
-        .{ .source = "let f: (a: []int) -> bool = a in []", .tag = .operator_not_supported },
+        .{ .source = "let A=struct{f:()->bool,}\nlet f: (a: A) -> bool = a in []", .tag = .operator_not_supported },
+        .{ .source = "let f: (a: []()->int) -> bool = a in []", .tag = .operator_not_supported },
         .{ .source = "let f: () -> bool = {} in []", .tag = .operator_not_supported },
         .{ .source = "let f: (a: []int) -> bool = missing in a", .tag = .unknown_name },
         .{ .source = "let f: (n: int) -> bool = n in missing", .tag = .unknown_name },
@@ -8818,19 +8942,19 @@ test "array concatenation rejects unresolved inexact and unsupported operands" {
     }
 }
 
-test "managed arrays reject unsupported payloads nominal mismatches and record membership" {
+test "managed arrays reject unsupported payloads nominal mismatches and equality leaves" {
     for ([_][]const u8{
         "let A=struct{s:str,}\nlet B=struct{s:str,}\nlet f:(a:A,b:B)={let x=[a,b]\n}",
-        "let A=struct{s:str,}\nlet f:(a:A)->bool=a in [a]",
-        "let A=struct{s:str,}\nlet f:(a:A)->bool=a in []",
+        "let A=struct{f:()->bool,}\nlet f:(a:A)->bool=a in [a]",
+        "let A=struct{f:()->bool,}\nlet f:(a:A)->bool=a in []",
         "let A=struct{s:str,}\nlet f:(a:A)={let mut x=[a]\nx[0]+=a}",
         "let A=struct{s:str,}\nlet f:(a:A)={let mut x=[a]\nx[0].s=\"bad\"}",
         "let A=struct{s:str,}\nlet f:(a:A)={let x:[]A=[]\nlet y:[]str=x\n}",
-        "let U=union{s:str,none,}\nlet f:(a:U)->bool=a in [a]",
+        "let U=union{f:()->str,none,}\nlet f:(a:U)->bool=a in [a]",
         "let f:(a:()->str)->bool=a in [a]",
-        "let f:(a:[]str)->bool=a in [a]",
+        "let f:(a:[]()->str)->bool=a in [a]",
         "let f:(a:()->int)->bool=a==a",
-        "let U=union{none,}\nlet f:(a:U)->bool=a==a",
+        "let U=union{f:()->int,none,}\nlet f:(a:U)->bool=a==a",
         "let f:(a:[][]int)={let mut b=a\nb[0][0]=1}",
         "let f:(a:[]()->int)=@println(a[0])",
         "let f:()={let r=0..1\nlet a=[r]\n@println(a[0])}",
@@ -8880,7 +9004,7 @@ test "scalar array deferred and ill typed forms fail closed" {
 
         "let main: () -> void = {let a: []void = []\n}",
         "let main: () -> void = {let a: []int = [1]\n@println(a.cap)}",
-        "let main: () -> void = {let a: []int = [1]\n@println(a == a)}",
+        "let main: () -> void = {let a: []int = [1]\n@println(a < a)}",
         "let main: () -> void = {let a: []int = [1]\n@println(a[0..1])}",
         "let main: () -> void = {let mut a: []int = [1]\na += 2}",
         "let main: () -> void = {let mut a: []int = [1]\na -= [2]}",

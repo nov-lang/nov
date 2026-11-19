@@ -37,7 +37,8 @@ pub const Entry = struct {
 pub const Error = Ir.BuildError || error{InvalidModule};
 
 /// A partial semantic pass: resolves explicit annotations and literal constants,
-/// leaving concrete generic method signatures dormant until referenced.
+/// leaving concrete generic method signatures dormant until referenced, except
+/// operator signatures, which must be valid even when unused.
 /// Deferred entries and signatures are not checked bodies or executable IR.
 /// Owns all output storage; OOM rolls back diagnostics appended to the module.
 pub fn analyzeAnnotations(module: *Module) Error!Sema {
@@ -56,6 +57,7 @@ pub fn analyzeAnnotations(module: *Module) Error!Sema {
     errdefer result.deinit();
     result.ir.source_len = @intCast(module.source.ast.source.len);
     try result.analyzeModuleAnnotations(module);
+    try result.validateOperatorSignatures(module);
     try result.finalizeRecordLayouts(module);
     var exports: std.StringHashMapUnmanaged(ForeignSymbol) = .empty;
     defer exports.deinit(result.allocator);
@@ -71,6 +73,10 @@ fn analyzeModuleAnnotations(result: *Sema, module: *Module) Error!void {
     for (module.declarations.items, 0..) |declaration, i| {
         if (declaration.is_test and !module.testSelected(declaration.name)) {
             result.entries[result.entryIndex(module, @fromBackingInt(@intCast(i)))].status = .ignored;
+            continue;
+        }
+        if (declaration.operator_arg != null and !try BodyChecker.validateOperatorArgument(module, &result.ir, declaration)) {
+            result.entries[result.entryIndex(module, @fromBackingInt(@intCast(i)))].status = .failed;
             continue;
         }
         if (declaration.is_generic or declaration.is_generic_function) {
@@ -201,6 +207,117 @@ fn analyzeModuleAnnotations(result: *Sema, module: *Module) Error!void {
         if (tagged and fields.items.len == 0) try module.diagnostics.append(module.allocator, .{ .tag = .empty_union, .span = declaration.name_span });
         try result.ir.setRecordFields(result.entries[result.entryIndex(module, @fromBackingInt(@intCast(i)))].alias_type.?, fields.items);
     }
+}
+
+fn validateOperatorSignatures(self: *Sema, module: *Module) Error!void {
+    var i: usize = 0;
+    while (i < module.declarations.items.len) : (i += 1) {
+        const declaration = module.declarations.items[i];
+        if (declaration.operator != .equal) continue;
+        const owner = declaration.container orelse continue;
+        if (module.getDeclaration(owner).?.is_generic and declaration.concrete_type == null) continue;
+        try self.syncEntries(module);
+        const index = self.entryIndex(module, @fromBackingInt(@intCast(i)));
+        if (self.entries[index].status == .failed) continue;
+        const ty = self.entries[index].type_id orelse (try TypeResolver.resolveFunction(module, &self.ir, .{ .module = module, .id = @fromBackingInt(@intCast(i)), .analysis = self })) orelse {
+            try self.syncEntries(module);
+            self.entries[index].status = .failed;
+            continue;
+        };
+        try self.syncEntries(module);
+        const receiver: Ir.TypeId = if (declaration.concrete_type) |concrete|
+            @fromBackingInt(concrete)
+        else
+            self.entries[self.entryIndex(module, owner)].alias_type orelse continue;
+        const signature = self.ir.getType(ty).?;
+        if (declaration.is_generic_function or declaration.noreturn or signature != .function or signature.function.params.len != 2 or signature.function.params[0] != receiver or signature.function.params[1] != receiver or self.ir.getType(signature.function.result).? != .boolean) {
+            try module.diagnostics.append(module.allocator, .{ .tag = .invalid_operator_signature, .span = declaration.name_span });
+            self.entries[index].status = .failed;
+            continue;
+        }
+        // Resolving an unused concrete hook must not demand its body.
+        self.entries[index].type_id = ty;
+    }
+}
+
+fn testUnusedOperatorSignature(allocator: std.mem.Allocator, source: []const u8, valid: bool) !void {
+    var module = try Module.init(allocator, "unused-operator.nov", source);
+    defer module.deinit();
+    try std.testing.expect(!module.hasErrors());
+    var sema = try analyzeAnnotations(&module);
+    defer sema.deinit();
+    try std.testing.expectEqual(!valid, module.hasErrors());
+    if (!valid) {
+        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+        try std.testing.expectEqual(Module.Diagnostic.Tag.invalid_operator_signature, module.diagnostics.items[0].tag);
+        try std.testing.expectEqualStrings("equal", module.sourceSlice(module.diagnostics.items[0].span).?);
+    }
+    try std.testing.expectEqual(@as(usize, 0), sema.ir.functions.items.len);
+    try std.testing.expectEqual(@as(usize, 0), sema.ir.equality.items.len);
+}
+
+test "unused operator signatures require exact nominal operands and bool under OOM" {
+    for ([_][]const u8{ "struct{n:int,", "union{none,", "enum{one," }) |container| {
+        for ([_]struct { signature: []const u8, valid: bool }{
+            .{ .signature = "(a:S,b:S)->bool", .valid = true },
+            .{ .signature = "(a:Alias,b:Alias)->Flag", .valid = true },
+            .{ .signature = "(a:@This(),b:@This())->bool", .valid = true },
+            .{ .signature = "()->bool", .valid = false },
+            .{ .signature = "(a:S)->bool", .valid = false },
+            .{ .signature = "(a:S,b:S,c:S)->bool", .valid = false },
+            .{ .signature = "(a:&S,b:&S)->bool", .valid = false },
+            .{ .signature = "(a:Other,b:S)->bool", .valid = false },
+            .{ .signature = "(a:S,b:Other)->bool", .valid = false },
+            .{ .signature = "(a:S,b:S)->int", .valid = false },
+        }) |case| {
+            const source = try std.mem.concat(std.testing.allocator, u8, &.{ "let Other=struct{}\nlet Alias=S\nlet Flag=bool\nlet S=", container, "\n@[operator(.equal)]\nlet equal:", case.signature, "=unresolved_body\n}" });
+            defer std.testing.allocator.free(source);
+            try testUnusedOperatorSignature(std.testing.allocator, source, case.valid);
+            try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testUnusedOperatorSignature, .{ source, case.valid });
+        }
+    }
+}
+
+fn testConcreteOperatorSignature(allocator: std.mem.Allocator, source: []const u8, valid: bool) !void {
+    var module = try Module.init(allocator, "concrete-operator.nov", source);
+    defer module.deinit();
+    try std.testing.expect(!module.hasErrors());
+    var sema = try analyzeFunctions(&module);
+    defer sema.deinit();
+    try std.testing.expectEqual(!valid, module.hasErrors());
+    if (!valid) {
+        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+        try std.testing.expectEqual(Module.Diagnostic.Tag.invalid_operator_signature, module.diagnostics.items[0].tag);
+    }
+}
+
+test "unused operator signatures defer templates but validate concrete hooks without bodies under OOM" {
+    for ([_]struct { source: []const u8, valid: bool }{
+        .{ .source = "let Box:(T:type)->type=struct{value:T,\n@[operator(.equal)]\nlet equal:(a:@This())->T=unresolved_body\n}\nlet main:()={}", .valid = true },
+        .{ .source = "let Box:(T:type)->type=struct{value:T,\n@[operator(.equal)]\nlet equal:(a:@This(),b:@This())->bool=unresolved_body\n}\nlet main:()={let b=Box(int).[value=1]\n}", .valid = true },
+        .{ .source = "let Box:(T:type)->type=struct{value:T,\n@[operator(.equal)]\nlet equal:(a:@This())->bool=true\n}\nlet main:()={let b=Box(int).[value=1]\n}", .valid = false },
+        .{ .source = "let Box:(T:type)->type=struct{value:T,\n@[operator(.equal)]\nlet equal:(a:@This(),b:@This())->T=1\n}\nlet main:()={let b=Box(int).[value=1]\n}", .valid = false },
+        .{ .source = "let Box:(T:type)->type=struct{value:T,\n@[operator(.equal)]\nlet equal:(a:@This(),b:@This())->T=unresolved_body\n}\nlet main:()={let b=Box(bool).[value=true]\n}", .valid = true },
+        .{ .source = "let Box:(T:type)->type=struct{value:T,\n@[operator(.equal)]\nlet equal:(a:@This(),b:@This())->bool=unresolved_body\n}\nlet f:(b:Box(int))={}\nlet main:()={}", .valid = true },
+    }) |case| {
+        try testConcreteOperatorSignature(std.testing.allocator, case.source, case.valid);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testConcreteOperatorSignature, .{ case.source, case.valid });
+    }
+}
+
+test "unused operator signatures validate defining owners across compilation modules" {
+    var comp = Compilation.init(std.testing.allocator);
+    defer comp.deinit();
+    const root = try comp.addSource("/operator-root.nov", "let Root=struct{}\nlet main:()={}");
+    const owner = try comp.addSource("/operator-model.nov", "let S=enum{one,\n@[operator(.equal)]\nlet equal:(a:S,b:S)->int=1\n}");
+    comp.setRoot(root);
+    var sema = try analyzeCompilation(&comp);
+    defer sema.deinit();
+    try std.testing.expect(comp.hasErrors());
+    const module = comp.getModule(owner).?;
+    try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+    try std.testing.expectEqual(Module.Diagnostic.Tag.invalid_operator_signature, module.diagnostics.items[0].tag);
+    try std.testing.expect(!comp.getModule(root).?.hasErrors());
 }
 
 fn foreignScalar(ty: Ir.Type, result: bool) bool {
@@ -345,7 +462,8 @@ pub fn analyzeFunctions(module: *Module) Error!Sema {
         try result.syncEntries(module);
         result.entries[index].status = if (checked) .body_checked else .failed;
     }
-    // Demand checking can add layouts after annotation finalization.
+    // Demand checking can add concrete operators and layouts after annotations.
+    if (!module.hasErrors()) try result.validateOperatorSignatures(module);
     if (!module.hasErrors()) _ = try result.validateRecordLayouts(module);
     return result;
 }
@@ -371,6 +489,7 @@ pub fn analyzeCompilation(comp: *Compilation) Error!Sema {
     }
     if (comp.hasErrors()) return result;
     for (comp.modules.items) |module| try result.analyzeModuleAnnotations(module);
+    for (comp.modules.items) |module| try result.validateOperatorSignatures(module);
     try result.finalizeRecordLayouts(comp.modules.items[0]);
     var exports: std.StringHashMapUnmanaged(ForeignSymbol) = .empty;
     defer exports.deinit(result.allocator);
@@ -396,6 +515,7 @@ pub fn analyzeCompilation(comp: *Compilation) Error!Sema {
         try result.syncEntries(module);
         result.entries[index].status = if (checked) .body_checked else .failed;
     }
+    if (!comp.hasErrors()) for (comp.modules.items) |module| try result.validateOperatorSignatures(module);
     if (!comp.hasErrors()) _ = try result.validateRecordLayouts(comp.modules.items[0]);
     return result;
 }

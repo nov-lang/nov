@@ -18,9 +18,11 @@ functions: std.ArrayList(Function) = .empty,
 globals: std.ArrayList(Global) = .empty,
 /// Owned display names and optional ordinary nominal-to-string functions.
 formatting: std.ArrayList(TypeFormatting) = .empty,
+equality: std.ArrayList(TypeEquality) = .empty,
 
 /// Compile-time canonical demand keys, independent of runtime environments.
 local_generic_instances: std.ArrayList(LocalGenericInstance) = .empty,
+pub const TypeEquality = struct { ty: TypeId, comparator: ?FunctionId = null };
 pub const LocalGenericInstance = struct { span: Span, outer: []const TypeId, arguments: []const TypeId };
 pub const TypeFormatting = struct { ty: TypeId, display_name: []const u8, formatter: ?FunctionId = null };
 
@@ -162,7 +164,8 @@ pub const Operation = union(enum) {
     parameter: u32,
     function_ref: FunctionId,
     unary: struct { op: UnaryOp, operand: ValueId },
-    binary: struct { op: BinaryOp, lhs: ValueId, rhs: ValueId },
+    /// enum_tag compares exact enum discriminants, bypassing equality hooks.
+    binary: struct { op: BinaryOp, lhs: ValueId, rhs: ValueId, enum_tag: bool = false },
     call: struct { callee: ValueId, args: []const ValueId, noreturn: bool = false },
     print: struct { args: []const ValueId, newline: bool },
     /// Instructions [rhs_start, this instruction) form a conditional RHS region.
@@ -356,6 +359,7 @@ pub const VerifyError = ValidationError || error{
     DuplicateGlobalName,
     InvalidFunctionType,
     InvalidTypeFormatting,
+    InvalidTypeEquality,
     InvalidFunctionName,
     DuplicateFunctionName,
     InvalidExportName,
@@ -395,6 +399,7 @@ pub fn deinit(self: *Ir) void {
     self.local_generic_instances.deinit(self.allocator);
     for (self.formatting.items) |entry| self.allocator.free(entry.display_name);
     self.formatting.deinit(self.allocator);
+    self.equality.deinit(self.allocator);
     for (self.types.items) |ty| {
         switch (ty) {
             .record => |record| {
@@ -419,6 +424,36 @@ pub fn deinit(self: *Ir) void {
     self.constants.deinit(self.allocator);
     self.source_lengths.deinit(self.allocator);
     self.* = undefined;
+}
+
+/// Registration may precede comparator body publication. Replacement is atomic.
+pub fn setTypeEquality(self: *Ir, ty: TypeId, comparator: ?FunctionId) BuildError!void {
+    const entry: TypeEquality = .{ .ty = ty, .comparator = comparator };
+    try self.validateTypeEquality(entry);
+    for (self.equality.items) |*existing| {
+        if (existing.ty == ty) {
+            existing.* = entry;
+            return;
+        }
+    }
+    try self.equality.append(self.allocator, entry);
+}
+
+pub fn getTypeEquality(self: *const Ir, ty: TypeId) ?TypeEquality {
+    for (self.equality.items) |entry| if (entry.ty == ty) return entry;
+    return null;
+}
+
+fn validateTypeEquality(self: *const Ir, entry: TypeEquality) VerifyError!void {
+    const ty = self.getType(entry.ty) orelse return error.InvalidTypeId;
+    if (ty != .record and ty != .enumeration) return error.InvalidTypeEquality;
+    if (ty == .record and ty.record.anonymous != .none) return error.InvalidTypeEquality;
+    if (entry.comparator) |id| {
+        const function = self.getFunction(id) orelse return error.InvalidFunctionId;
+        const signature = self.getType(function.ty) orelse return error.InvalidTypeId;
+        if (signature != .function or function.is_closure or function.is_test or function.noreturn) return error.InvalidTypeEquality;
+        if (signature.function.params.len != 2 or signature.function.params[0] != entry.ty or signature.function.params[1] != entry.ty or (self.getType(signature.function.result) orelse return error.InvalidTypeId) != .boolean) return error.InvalidTypeEquality;
+    }
 }
 
 /// Names are copied; registration may precede formatter body publication.
@@ -608,6 +643,7 @@ pub fn clearFunctions(self: *Ir) void {
     for (self.globals.items) |global| self.allocator.free(global.name);
     self.globals.clearRetainingCapacity();
     for (self.formatting.items) |*entry| entry.formatter = null;
+    for (self.equality.items) |*entry| entry.comparator = null;
     for (self.functions.items) |function| {
         self.allocator.free(function.name);
         self.allocator.free(function.captures);
@@ -754,6 +790,10 @@ pub fn internConstant(self: *Ir, constant: Constant) InternError!ConstId {
 /// Checks references, resolved value ranges and canonical identities. Deliberately
 /// simple linear interning/quadratic duplicate checks suit the initial small pool.
 pub fn verify(self: *const Ir) VerifyError!void {
+    for (self.equality.items, 0..) |entry, i| {
+        try self.validateTypeEquality(entry);
+        for (self.equality.items[0..i]) |previous| if (previous.ty == entry.ty) return error.InvalidTypeEquality;
+    }
     for (self.formatting.items, 0..) |entry, i| {
         try self.validateTypeFormatting(entry);
         for (self.formatting.items[0..i]) |previous| if (previous.ty == entry.ty) return error.InvalidTypeFormatting;
@@ -1043,7 +1083,7 @@ pub fn borrowConflict(self: *const Ir, body: Body) VerifyError!?BorrowConflict {
     for (body.instructions) |instruction| {
         if (instruction.op == .borrow_reserve and body.instructions[@backingInt(instruction.op.borrow_reserve)].op == .global_slot) global_borrow = true;
     }
-    if (!global_borrow) return BorrowCheck.check(self.allocator, body);
+    if (!global_borrow) return BorrowCheck.checkWithIr(self.allocator, body, self);
     // Global identities may be materialized repeatedly. Canonicalize storage
     // operands for the CFG checker, and conservatively treat calls as accesses
     // to globals just as they are accesses to hidden captured cells.
@@ -1072,7 +1112,7 @@ pub fn borrowConflict(self: *const Ir, body: Body) VerifyError!?BorrowConflict {
             }
         }
     }
-    return BorrowCheck.check(self.allocator, .{ .instructions = instructions, .result = body.result });
+    return BorrowCheck.checkWithIr(self.allocator, .{ .instructions = instructions, .result = body.result }, self);
 }
 
 /// Raw borrow_start only. Dynamic snapshots do not have a single static owner.
@@ -1409,7 +1449,7 @@ fn validateBodyStructure(self: *const Ir, function: Function, body: Body) Verify
                 const array = self.getType(try operandType(body, r.array, i)).?;
                 if (array != .array) return error.InvalidOperation;
                 if (value != array.array) return error.OperandTypeMismatch;
-                if (!hasEquality(self.getType(value).?)) return error.InvalidOperation;
+                if (!self.hasValueEquality(value)) return error.InvalidOperation;
             },
             .array_set => |r| {
                 if (ty != .array) return error.InvalidOperation;
@@ -1558,13 +1598,16 @@ fn validateBodyStructure(self: *const Ir, function: Function, body: Body) Verify
                 const rhs = try operandType(body, binary.rhs, i);
                 if (lhs != rhs) return error.OperandTypeMismatch;
                 const operand = self.getType(lhs) orelse return error.InvalidTypeId;
+                if (binary.enum_tag and (operand != .enumeration or (binary.op != .eq and binary.op != .ne))) return error.InvalidOperation;
                 switch (binary.op) {
                     .add, .sub, .mul, .div, .mod, .bit_and, .bit_or, .bit_xor => {
                         if (operand != .integer and !(operand == .float and (binary.op == .add or binary.op == .sub or binary.op == .mul or binary.op == .div)) and !(operand == .string and binary.op == .add)) return error.InvalidOperation;
                         if (instruction.ty != lhs) return error.OperandTypeMismatch;
                     },
                     .eq, .ne, .lt, .le, .gt, .ge => {
-                        if (operand != .integer and operand != .float and !((binary.op == .eq or binary.op == .ne) and (operand == .boolean or operand == .rune or operand == .string or operand == .enumeration))) return error.InvalidOperation;
+                        if (binary.op == .eq or binary.op == .ne) {
+                            if (!binary.enum_tag and !self.hasValueEquality(lhs)) return error.InvalidOperation;
+                        } else if (operand != .integer and operand != .float) return error.InvalidOperation;
                         if (ty != .boolean) return error.OperandTypeMismatch;
                     },
                 }
@@ -1828,7 +1871,69 @@ pub fn isArrayElement(ty: Type) bool {
     };
 }
 
-/// Storage support does not imply equality (notably for closures and aggregates).
+/// Structural value equality, with validated nominal hooks terminating traversal.
+/// A bounded success cache avoids expanding common shared layout DAGs, without
+/// allocating during verifier operand checks. The path bound also rejects cycles.
+pub fn hasValueEquality(self: *const Ir, id: TypeId) bool {
+    var cache: [max_record_depth + 1]?TypeId = @splat(null);
+    var next: usize = 0;
+    return self.valueEquality(id, 0, &cache, &next);
+}
+
+fn valueEquality(self: *const Ir, id: TypeId, depth: usize, cache: []?TypeId, next: *usize) bool {
+    const ty = self.getType(id) orelse return false;
+    for (cache) |entry| if (entry == id) return true;
+    if (depth > max_record_depth) return false;
+    if (self.getTypeEquality(id)) |entry| {
+        self.validateTypeEquality(entry) catch return false;
+        if (entry.comparator != null) return true;
+    }
+    switch (ty) {
+        .boolean, .integer, .float, .rune, .string, .enumeration, .void => {},
+        .array => |child| if (!self.valueEquality(child, depth + 1, cache, next)) return false,
+        .record => |record| for (record.fields) |field| {
+            if (!self.valueEquality(field.ty, depth + 1, cache, next)) return false;
+        },
+        else => return false,
+    }
+    cache[next.*] = id;
+    next.* = (next.* + 1) % cache.len;
+    return true;
+}
+
+/// Whether value equality can transitively invoke an ordinary nominal hook.
+/// This is an effect query, not a substitute for type/metadata verification.
+pub fn equalityMayCall(self: *const Ir, id: TypeId) bool {
+    var path: [max_record_depth + 1]TypeId = undefined;
+    var pure: [max_record_depth + 1]?TypeId = @splat(null);
+    var next: usize = 0;
+    return self.valueEqualityMayCall(id, path[0..0], &path, &pure, &next);
+}
+
+fn valueEqualityMayCall(self: *const Ir, id: TypeId, path: []const TypeId, stack: []TypeId, pure: []?TypeId, next: *usize) bool {
+    const ty = self.getType(id) orelse return false;
+    for (path) |ancestor| if (ancestor == id) return false;
+    for (pure) |entry| if (entry == id) return false;
+    if (path.len == stack.len) return false;
+    if (self.getTypeEquality(id)) |entry| {
+        self.validateTypeEquality(entry) catch return false;
+        if (entry.comparator != null) return true;
+    }
+    stack[path.len] = id;
+    const children = stack[0 .. path.len + 1];
+    switch (ty) {
+        .array => |child| if (self.valueEqualityMayCall(child, children, stack, pure, next)) return true,
+        .record => |record| for (record.fields) |field| {
+            if (self.valueEqualityMayCall(field.ty, children, stack, pure, next)) return true;
+        },
+        else => {},
+    }
+    pure[next.*] = id;
+    next.* = (next.* + 1) % pure.len;
+    return false;
+}
+
+/// Legacy scalar-only predicate; storage support does not imply equality.
 pub fn hasEquality(ty: Type) bool {
     return switch (ty) {
         .boolean, .integer, .float, .rune, .string, .enumeration => true,
@@ -2570,6 +2675,62 @@ test "string equality verifier requires exact string operands and boolean result
     try ir.verify();
 }
 
+test "raw enum tag comparisons verify exact enums eq ne and boolean results without source" {
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    const span: Span = .{ .start = 0, .end = 0 };
+    const boolean = try ir.internType(.boolean);
+    const integer = try ir.internType(.{ .integer = .{ .bits = 32, .signedness = .signed } });
+    const float = try ir.internType(.{ .float = 64 });
+    const string = try ir.internType(.string);
+    const enumeration = try ir.internType(.{ .enumeration = .{ .identity = 0, .name = "E", .tags = &.{.{ .name = "a", .span = span }} } });
+    const other = try ir.internType(.{ .enumeration = .{ .identity = 1, .name = "F", .tags = &.{.{ .name = "a", .span = span }} } });
+    const array = try ir.internType(.{ .array = enumeration });
+    const record = try ir.internType(.{ .record = .{ .identity = 0, .fields = &.{} } });
+    const signature = try ir.internType(.{ .function = .{ .params = &.{ enumeration, enumeration }, .result = boolean } });
+    const function = try ir.addFunction("raw", signature, span);
+    var code = [_]Instruction{
+        .{ .ty = enumeration, .span = span, .op = .{ .parameter = 0 } },
+        .{ .ty = enumeration, .span = span, .op = .{ .parameter = 1 } },
+        .{ .ty = boolean, .span = span, .op = .{ .binary = .{ .op = .eq, .lhs = @fromBackingInt(0), .rhs = @fromBackingInt(1), .enum_tag = true } } },
+    };
+    const body: Body = .{ .instructions = &code, .result = @fromBackingInt(2) };
+    for (std.enums.values(BinaryOp)) |op| {
+        code[2].op.binary.op = op;
+        if (op == .eq or op == .ne) {
+            try ir.verifyBodyStructure(function, body);
+        } else try std.testing.expectError(error.InvalidOperation, ir.verifyBodyStructure(function, body));
+    }
+    code[2].op.binary.op = .eq;
+    code[2].ty = integer;
+    try std.testing.expectError(error.OperandTypeMismatch, ir.verifyBodyStructure(function, body));
+    code[2].ty = boolean;
+    try ir.setFunctionBody(function, &code, body.result);
+    try ir.verify();
+    // Verification must also reject a forged raw flag on scalar/aggregate eq.
+    for ([_]TypeId{ boolean, integer, float, string, array, record, signature }) |ty| {
+        ir.clearFunctions();
+        const sig = try ir.internType(.{ .function = .{ .params = &.{ ty, ty }, .result = boolean } });
+        const f = try ir.addFunction("invalidraw", sig, span);
+        code[0].ty = ty;
+        code[1].ty = ty;
+        try std.testing.expectError(error.InvalidOperation, ir.setFunctionBody(f, &code, body.result));
+        code[2].op.binary.enum_tag = false;
+        if (ty != signature) {
+            try ir.setFunctionBody(f, &code, body.result);
+            @constCast(ir.functions.items[@backingInt(f)].body.?.instructions)[2].op.binary.enum_tag = true;
+            try std.testing.expectError(error.InvalidOperation, ir.verify());
+        }
+        code[2].op.binary.enum_tag = true;
+    }
+    ir.clearFunctions();
+    const mismatched = try ir.internType(.{ .function = .{ .params = &.{ enumeration, other }, .result = boolean } });
+    const f = try ir.addFunction("mismatched", mismatched, span);
+    code[0].ty = enumeration;
+    code[1].ty = other;
+    try std.testing.expectError(error.OperandTypeMismatch, ir.setFunctionBody(f, &code, body.result));
+}
+
 test "string scalar indexing verifies exact types and prior visible operands without source" {
     var ir = Ir.init(std.testing.allocator);
     defer ir.deinit();
@@ -2666,7 +2827,7 @@ test "string slicing IR verifies optional native bounds types and prior operands
     try ir.verify();
 }
 
-test "storable arrays source free exact membership and rejected aggregate equality" {
+test "storable arrays source free exact recursive membership and equality" {
     var ir = Ir.init(std.testing.allocator);
     defer ir.deinit();
     const span: Span = .{ .start = 0, .end = 0 };
@@ -2690,10 +2851,12 @@ test "storable arrays source free exact membership and rejected aggregate equali
             .{ .ty = array, .span = span, .op = .{ .parameter = 1 } },
             .{ .ty = boolean, .span = span, .op = .{ .array_contains = .{ .value = @fromBackingInt(0), .array = @fromBackingInt(1) } } },
         };
-        if (element == enumeration) {
+        if (element != function_type and element != range) {
             try ir.setFunctionBody(f, &instructions, @fromBackingInt(2));
             try ir.verify();
             ir.clearFunctions();
+            try std.testing.expectEqual(element == nested, try ir.needsArrayCopy(element));
+            if (element != enumeration) continue;
             const mismatched = try ir.internType(.{ .function = .{ .params = &.{ other_enum, array }, .result = boolean } });
             const wrong = try ir.addFunction("mismatch", mismatched, span);
             instructions[0].ty = other_enum;
@@ -2812,6 +2975,68 @@ fn testTypeFormattingOwnership(allocator: std.mem.Allocator) !void {
     ir.clearFunctions();
     try std.testing.expect(ir.getTypeFormatting(record).?.formatter == null);
     try ir.verify();
+}
+
+fn testTypeEqualityOwnership(allocator: std.mem.Allocator) !void {
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    const span: Span = .{ .start = 0, .end = 0 };
+    const boolean = try ir.internType(.boolean);
+    const unit = try ir.internType(.void);
+    const callback = try ir.internType(.{ .function = .{ .params = &.{}, .result = unit } });
+    const record = try ir.internType(.{ .record = .{ .identity = 0, .fields = &.{} } });
+    try ir.setRecordFields(record, &.{.{ .name = "callback", .ty = callback, .span = span }});
+    const array = try ir.internType(.{ .array = record });
+    const anonymous = try ir.internAnonymousRecord(&.{.{ .name = "callback", .ty = callback, .span = span }}, false);
+    const signature = try ir.internType(.{ .function = .{ .params = &.{ record, record }, .result = boolean } });
+    const hook = try ir.addFunction("compare", signature, span);
+    const yes = try ir.internConstant(.{ .ty = boolean, .value = .{ .boolean = true } });
+    try ir.setFunctionBody(hook, &.{.{ .ty = boolean, .span = span, .op = .{ .constant = yes } }}, @fromBackingInt(0));
+    try std.testing.expect(!ir.hasValueEquality(record));
+    try ir.setTypeEquality(record, null);
+    try ir.setTypeEquality(record, hook);
+    try std.testing.expect(ir.hasValueEquality(array));
+    try std.testing.expect(!hasEquality(ir.getType(record).?));
+    try std.testing.expectError(error.InvalidTypeEquality, ir.setTypeEquality(anonymous, null));
+    try std.testing.expectError(error.InvalidTypeEquality, ir.setTypeEquality(array, hook));
+    try std.testing.expectError(error.InvalidFunctionId, ir.setTypeEquality(record, @fromBackingInt(999)));
+    try std.testing.expectEqual(hook, ir.getTypeEquality(record).?.comparator.?);
+    try ir.verify();
+    ir.functions.items[@backingInt(hook)].noreturn = true;
+    try std.testing.expect(!ir.hasValueEquality(array));
+    try std.testing.expectError(error.InvalidTypeEquality, ir.verify());
+    ir.functions.items[@backingInt(hook)].noreturn = false;
+    ir.functions.items[@backingInt(hook)].is_closure = true;
+    try std.testing.expectError(error.InvalidTypeEquality, ir.verify());
+    ir.functions.items[@backingInt(hook)].is_closure = false;
+    ir.functions.items[@backingInt(hook)].is_test = true;
+    try std.testing.expectError(error.InvalidTypeEquality, ir.verify());
+    ir.functions.items[@backingInt(hook)].is_test = false;
+    for ([_]Type.Function{
+        .{ .params = &.{record}, .result = boolean },
+        .{ .params = &.{ record, boolean }, .result = boolean },
+        .{ .params = &.{ record, record }, .result = unit },
+    }) |wrong| {
+        const bad = try ir.internType(.{ .function = wrong });
+        ir.functions.items[@backingInt(hook)].ty = bad;
+        try std.testing.expectError(error.InvalidTypeEquality, ir.setTypeEquality(record, hook));
+        try std.testing.expectError(error.InvalidTypeEquality, ir.verify());
+        ir.functions.items[@backingInt(hook)].ty = signature;
+    }
+    try ir.equality.append(allocator, ir.equality.items[0]);
+    try std.testing.expectError(error.InvalidTypeEquality, ir.verify());
+    ir.equality.items.len -= 1;
+    ir.equality.items[0].comparator = @fromBackingInt(999);
+    try std.testing.expectError(error.InvalidFunctionId, ir.verify());
+    ir.equality.items[0].comparator = hook;
+    ir.clearFunctions();
+    try std.testing.expect(ir.getTypeEquality(record).?.comparator == null);
+    try std.testing.expect(!ir.hasValueEquality(array));
+    try ir.verify();
+}
+
+test "structural equality nominal metadata source free forged hooks clear and every OOM" {
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testTypeEqualityOwnership, .{});
 }
 
 test "type formatting metadata owns names validates hooks and replaces atomically under OOM" {
@@ -5576,7 +5801,7 @@ test "nested records bounded graph validation rejects forged cycles and deep lay
     try ir.verify();
 }
 
-test "managed array IR owns layouts and rejects forged record equality and payloads" {
+test "managed array IR owns layouts recursive equality and rejects forged payloads" {
     var ir = Ir.init(std.testing.allocator);
     defer ir.deinit();
     const span: Span = .{ .start = 0, .end = 0 };
@@ -5597,9 +5822,11 @@ test "managed array IR owns layouts and rejects forged record equality and paylo
         .{ .ty = array, .span = span, .op = .{ .parameter = 1 } },
         .{ .ty = boolean, .span = span, .op = .{ .array_contains = .{ .value = @fromBackingInt(@intCast(0)), .array = @fromBackingInt(@intCast(1)) } } },
     };
-    try std.testing.expectError(error.InvalidOperation, ir.setFunctionBody(function, &instructions, @fromBackingInt(@intCast(2))));
+    try ir.setFunctionBody(function, &instructions, @fromBackingInt(@intCast(2)));
+    ir.clearFunctions();
+    const replacement = try ir.addFunction("contains", signature, span);
     instructions[2] = .{ .ty = array, .span = span, .op = .{ .array_literal = &.{@fromBackingInt(@intCast(1))} } };
-    try std.testing.expectError(error.OperandTypeMismatch, ir.setFunctionBody(function, &instructions, @fromBackingInt(@intCast(2))));
+    try std.testing.expectError(error.OperandTypeMismatch, ir.setFunctionBody(replacement, &instructions, @fromBackingInt(@intCast(2))));
     // Whole-pool verification still checks an array element's nominal graph.
     ir.types.items[@backingInt(array)] = .{ .array = unit };
     try std.testing.expectError(error.InvalidArrayElement, ir.verify());

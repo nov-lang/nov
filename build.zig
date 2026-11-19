@@ -141,6 +141,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const language_tests = b.step("test-cli-language-tests", "Run test command and assertion language CLI tests");
     addLanguageTestCliTests(b, exe, language_tests);
     test_step.dependOn(language_tests);
+    const equality_tests = b.step("test-cli-equality", "Run structural equality and operator override CLI tests");
+    addEqualityCliTests(b, exe, equality_tests);
+    test_step.dependOn(equality_tests);
     const concat_tests = b.step("test-cli-array-concat", "Run array concatenation CLI tests");
     addArrayConcatCliTests(b, exe, concat_tests);
     test_step.dependOn(concat_tests);
@@ -1344,6 +1347,88 @@ fn addClosureCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *s
         run.expectStdOutEqual("");
         run.expectStdErrMatch(case.diagnostic);
         test_step.dependOn(&run.step);
+    }
+}
+
+fn addEqualityCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    addArrayValueHelperCliTests(b, exe, test_step, "equality.nov", @embedFile("examples/equality.nov"), "Arrays: true\nSame user: true\nMembership: true\n", "PASS arrays_nested_values_and_membership\nPASS records_unions_enums_and_anonymous_values\nPASS overrides_apply_recursively_and_inequality_negates\nPASS enum_and_union_overrides\nPASS ieee_float_equality\nPASS hook_order_shortcircuit_snapshots_and_queries\n6 passed; 0 failed; 6 total\n");
+    const fixtures = b.addWriteFiles();
+    const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
+    _ = fixtures.add("models.nov",
+        \\let std=@import("std")
+        \\@[public]
+        \\let User=struct{id:uint,name:str,
+        \\@[public]
+        \\@[operator(std.builtin.Operator.equal)]
+        \\let same:(a:User,b:User)->bool=a.id==b.id
+        \\}
+        \\@[public]
+        \\let Box:(T:type)->type=struct{value:T,
+        \\@[public]
+        \\@[operator(.equal)]
+        \\let same:(a:@This(),b:@This())->bool=a.value==b.value
+        \\}
+        \\@[public]
+        \\let Secret=struct{id:int,
+        \\@[operator(.equal)]
+        \\let same:(a:Secret,b:Secret)->bool=a.id==b.id
+        \\}
+        \\
+    );
+    _ = fixtures.add("imported.nov",
+        \\let models=@import("models.nov")
+        \\let Alias=models.User
+        \\let equal:(a:`T,b:`T)->bool=a==b
+        \\let main:()={let a=Alias.[id=7,name="Ada"]
+        \\let b=models.User.[id=7,name="Grace"]
+        \\@assert(equal(a,b) and b in [a])
+        \\let first=models.Box([]int).[value=[1,2]]
+        \\let second=models.Box([]int).[value=[1,2]]
+        \\@assert(first==second and first!=models.Box([]int).[value=[2]])
+        \\@println("imported equality")}
+        \\
+    );
+    for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+        const run = b.addRunArtifact(exe);
+        run.setCwd(fixtures.getDirectory());
+        run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+        run.setEnvironmentVariable("NOV_CC", "");
+        run.setEnvironmentVariable("CC", "");
+        run.addArgs(&.{ "run", "imported.nov", "--lib-dir" });
+        run.addDirectoryArg(library);
+        if (mode.len != 0) run.addArg(mode);
+        run.expectExitCode(0);
+        run.expectStdOutEqual("imported equality\n");
+        run.expectStdErrEqual("");
+        test_step.dependOn(&run.step);
+    }
+    for ([_][]const u8{
+        "let main:()={let a:[]u8=[1]\nlet b:[]u16=[1]\n@println(a==b)}",
+        "let main:()={let f=()->int{1}\n@println([f]==[f])}",
+        "let main:()={let mut n=1\nlet p=&n\n@println(p==p)}",
+        "let main:()=@println([0..1]==[0..1])",
+        "let Inner=struct{f:()->int,}\nlet Outer=struct{x:Inner,}\nlet query:(a:Outer)->@TypeOf(a==a)=true\nlet main:()={}",
+        "let S=struct{n:int,\n@[operator(.equal)]\nlet bad:(a:S)->bool=true\n}\nlet main:()=@println(S.[n=1]==S.[n=1])",
+        "let S=struct{n:int,\n@[operator(.equal)]\nlet bad:(a:S,b:S)->int=1\n}\nlet main:()=@println(S.[n=1]==S.[n=1])",
+        "let S=struct{n:int,\n@[operator(.equal)]\nlet bad:(a:S)->int=1\n}\nlet main:()={}",
+        "let Fake=enum{equal,}\nlet S=struct{\n@[operator(Fake.equal)]\nlet bad:(a:S,b:S)->bool=true\n}\nlet main:()={}",
+        "let S=struct{\n@[operator(.add)]\nlet bad:(a:S,b:S)->S=S.[]\n}\nlet main:()={}",
+        "let models=@import(\"models.nov\")\nlet main:()=@println(models.Secret.[id=1]==models.Secret.[id=1])",
+        "let S=struct{f:()->bool,\n@[operator(.equal)]\nlet same:(a:S,b:S)->bool=a.f()\n}\nlet main:()={let mut xs=[1,2]\nlet change=()->bool{xs=[9]\ntrue}\nlet a=S.[f=change]\nloop &x in xs{@assert(a==a)\n@println(x.*)}}",
+    }, 0..) |source, i| {
+        const path = b.fmt("bad-equality-{d}.nov", .{i});
+        _ = fixtures.add(path, source);
+        for ([_]bool{ false, true }) |emit| {
+            const reject = b.addRunArtifact(exe);
+            reject.setCwd(fixtures.getDirectory());
+            reject.addArgs(if (emit) &.{ "emit-c", path } else &.{ "check", "--semantic", path });
+            reject.addArg("--lib-dir");
+            reject.addDirectoryArg(library);
+            reject.expectExitCode(1);
+            reject.expectStdOutEqual("");
+            reject.expectStdErrMatch("error:");
+            test_step.dependOn(&reject.step);
+        }
     }
 }
 
@@ -3471,14 +3556,14 @@ fn addStorableArrayCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_st
         .{ .name = "type", .source = "let f:(a:[]type)={}", .diagnostic = unsupported_type },
         .{ .name = "nested-void", .source = "let f:(a:[][]void)={}", .diagnostic = unsupported_type },
         .{ .name = "function-membership", .source = "let f:(a:()->int)->bool=a in [a]", .diagnostic = unsupported_operator },
-        .{ .name = "union-membership", .source = "let U=union{none,}\nlet f:(a:U)->bool=a in [a]", .diagnostic = unsupported_operator },
-        .{ .name = "record-membership", .source = "let R=struct{n:int,}\nlet f:(a:R)->bool=a in [a]", .diagnostic = unsupported_operator },
-        .{ .name = "nested-membership", .source = "let f:(a:[]int)->bool=a in [a]", .diagnostic = unsupported_operator },
+        .{ .name = "union-membership", .source = "let U=union{callback:()->int,none,}\nlet f:(a:U)->bool=a in [a]", .diagnostic = unsupported_operator },
+        .{ .name = "record-membership", .source = "let R=struct{callback:()->int,}\nlet f:(a:R)->bool=a in [a]", .diagnostic = unsupported_operator },
+        .{ .name = "nested-membership", .source = "let f:(a:[]()->int)->bool=a in [a]", .diagnostic = unsupported_operator },
         .{ .name = "range-membership", .source = "let f:(n:int)->bool={let r=n..n\nr in [r]}", .diagnostic = unsupported_operator },
         .{ .name = "function-equality", .source = "let f:(a:()->int)->bool=a==a", .diagnostic = unsupported_operator },
-        .{ .name = "union-equality", .source = "let U=union{none,}\nlet f:(a:U)->bool=a==a", .diagnostic = unsupported_operator },
-        .{ .name = "record-equality", .source = "let R=struct{n:int,}\nlet f:(a:R)->bool=a==a", .diagnostic = unsupported_operator },
-        .{ .name = "nested-equality", .source = "let f:(a:[][]int)->bool=a==a", .diagnostic = unsupported_operator },
+        .{ .name = "union-equality", .source = "let U=union{callback:()->int,none,}\nlet f:(a:U)->bool=a==a", .diagnostic = unsupported_operator },
+        .{ .name = "record-equality", .source = "let R=struct{callback:()->int,}\nlet f:(a:R)->bool=a==a", .diagnostic = unsupported_operator },
+        .{ .name = "nested-equality", .source = "let f:(a:[][]()->int)->bool=a==a", .diagnostic = unsupported_operator },
         .{ .name = "range-equality", .source = "let f:(n:int)->bool={let r=n..n\nr==r}", .diagnostic = unsupported_operator },
         .{ .name = "enum-nominal", .source = "let E=enum{x,}\nlet F=enum{x,}\nlet f:(a:E,b:F)={let x:[]E=[a,b]\n}", .diagnostic = mismatch },
         .{ .name = "enum-membership-nominal", .source = "let E=enum{x,}\nlet F=enum{x,}\nlet f:(a:E,b:F)->bool=a in [b]", .diagnostic = mismatch },

@@ -7,6 +7,22 @@ const Lowering = @import("Lowering.zig");
 const TestAllocations = @import("TestAllocations.zig");
 
 pub fn check(allocator: std.mem.Allocator, body: Ir.Body) Ir.VerifyError!?Ir.BorrowConflict {
+    return checkWithIr(allocator, body, null);
+}
+
+fn mayCall(body: Ir.Body, instruction: Ir.Instruction, ir: ?*const Ir) bool {
+    if (instruction.op == .call) return true;
+    const metadata = ir orelse return false;
+    const operand: Ir.ValueId = switch (instruction.op) {
+        .binary => |binary| if (!binary.enum_tag and (binary.op == .eq or binary.op == .ne)) binary.lhs else return false,
+        .array_contains => |contains| contains.value,
+        else => return false,
+    };
+    if (@backingInt(operand) >= body.instructions.len) return false;
+    return metadata.equalityMayCall(body.instructions[@backingInt(operand)].ty);
+}
+
+pub fn checkWithIr(allocator: std.mem.Allocator, body: Ir.Body, ir: ?*const Ir) Ir.VerifyError!?Ir.BorrowConflict {
     var has_borrows = false;
     for (body.instructions) |instruction| if (instruction.op == .borrow_reserve or instruction.op == .reference_parameter) {
         has_borrows = true;
@@ -61,7 +77,7 @@ pub fn check(allocator: std.mem.Allocator, body: Ir.Body) Ir.VerifyError!?Ir.Bor
         }
     }
     for (body.instructions) |instruction| if (instruction.op == .reference_slot or instruction.op == .reference_parameter or instruction.op == .reference_argument)
-        return checkReferences(allocator, body, edges);
+        return checkReferences(allocator, body, edges, ir);
     const live = try allocator.alloc(bool, n + 1);
     defer allocator.free(live);
     const active = try allocator.alloc(bool, n + 1);
@@ -115,7 +131,7 @@ pub fn check(allocator: std.mem.Allocator, body: Ir.Body) Ir.VerifyError!?Ir.Bor
             const owner = reservation.op.borrow_reserve;
             // Environments hide cell accesses from the caller's ordinary operands.
             // Until effect summaries exist, a call may touch any captured owner.
-            if (instruction.op == .call and body.instructions[@backingInt(owner)].boxed)
+            if (mayCall(body, instruction, ir) and body.instructions[@backingInt(owner)].boxed)
                 return .{ .access = instruction.span, .origin = reservation.span };
             if (instruction.op == .closure_init) {
                 for (instruction.op.closure_init.captures) |capture| if (capture == owner)
@@ -136,6 +152,137 @@ pub fn check(allocator: std.mem.Allocator, body: Ir.Body) Ir.VerifyError!?Ir.Bor
         }
     }
     return null;
+}
+
+fn testEqualityHookLoans(allocator: std.mem.Allocator) !void {
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    const span: Ir.Span = .{ .start = 0, .end = 0 };
+    const boolean = try ir.internType(.boolean);
+    const integer = try ir.internType(.{ .integer = .{ .bits = 32, .signedness = .signed } });
+    const record = try ir.internType(.{ .record = .{ .identity = 0, .fields = &.{} } });
+    const array = try ir.internType(.{ .array = record });
+    const nested = try ir.internType(.{ .record = .{ .identity = 1, .tagged = true, .fields = &.{} } });
+    try ir.setRecordFields(nested, &.{
+        .{ .name = "items", .ty = array, .span = span },
+        .{ .name = "other", .ty = integer, .span = span },
+    });
+    const plain = try ir.internType(.{ .record = .{ .identity = 2, .fields = &.{} } });
+    const integers = try ir.internType(.{ .array = integer });
+    const enumeration = try ir.internType(.{ .enumeration = .{ .identity = 0, .name = "E", .tags = &.{.{ .name = "a", .span = span }} } });
+    const enum_array = try ir.internType(.{ .array = enumeration });
+    const sig = try ir.internType(.{ .function = .{ .params = &.{ record, record }, .result = boolean } });
+    const hook = try ir.addFunction("equal", sig, span);
+    const enum_sig = try ir.internType(.{ .function = .{ .params = &.{ enumeration, enumeration }, .result = boolean } });
+    const enum_hook = try ir.addFunction("equalenum", enum_sig, span);
+    for ([_]bool{ false, true }) |hooked| {
+        try ir.setTypeEquality(record, if (hooked) hook else null);
+        try ir.setTypeEquality(enumeration, if (hooked) enum_hook else null);
+        for ([_]Ir.TypeId{ record, array, nested, plain, integer, integers, enumeration, enum_array }) |ty| {
+            const calls = hooked and ty != plain and ty != integer and ty != integers;
+            try std.testing.expectEqual(calls, ir.equalityMayCall(ty));
+            for ([_]bool{ false, true }) |references| {
+                for ([_]bool{ false, true }) |global| {
+                    for ([_]Ir.Operation{
+                        .{ .binary = .{ .op = .eq, .lhs = @fromBackingInt(0), .rhs = @fromBackingInt(0) } },
+                        .{ .binary = .{ .op = .ne, .lhs = @fromBackingInt(0), .rhs = @fromBackingInt(0) } },
+                        .{ .array_contains = .{ .value = @fromBackingInt(0), .array = @fromBackingInt(0) } },
+                        .{ .binary = .{ .op = .eq, .lhs = @fromBackingInt(0), .rhs = @fromBackingInt(0), .enum_tag = true } },
+                        .{ .binary = .{ .op = .ne, .lhs = @fromBackingInt(0), .rhs = @fromBackingInt(0), .enum_tag = true } },
+                    }) |op| {
+                        const raw = op == .binary and op.binary.enum_tag;
+                        if (raw and ty != enumeration) continue;
+                        const call_effect = calls and !raw;
+                        const constant: Ir.Operation = .{ .constant = @fromBackingInt(0) };
+                        var code = [_]Ir.Instruction{
+                            .{ .ty = ty, .span = span, .op = constant },
+                            .{ .ty = ty, .span = span, .op = if (global) .{ .global_slot = @fromBackingInt(0) } else .{ .local_slot = @fromBackingInt(0) }, .boxed = true },
+                            .{ .ty = ty, .span = .{ .start = 2, .end = 3 }, .op = .{ .borrow_reserve = @fromBackingInt(1) } },
+                            .{ .ty = ty, .span = span, .op = .{ .borrow_start = .{ .reservation = @fromBackingInt(2), .index = @fromBackingInt(0) } } },
+                            .{ .ty = ty, .span = span, .op = if (references) .{ .reference_slot = @fromBackingInt(3) } else constant },
+                            .{ .ty = boolean, .span = .{ .start = 5, .end = 6 }, .op = op },
+                            .{ .ty = ty, .span = span, .op = if (references) .{ .reference_load = @fromBackingInt(4) } else constant },
+                            .{ .ty = ty, .span = span, .op = .{ .borrow_read = @fromBackingInt(if (references) 6 else 3) } },
+                        };
+                        const body: Ir.Body = .{ .instructions = &code, .result = @fromBackingInt(7) };
+                        try std.testing.expect(try check(allocator, body) == null);
+                        const conflict = try checkWithIr(allocator, body, &ir);
+                        try std.testing.expectEqual(call_effect, conflict != null);
+                        if (conflict) |found| {
+                            try std.testing.expectEqual(code[5].span, found.access);
+                            try std.testing.expectEqual(code[2].span, found.origin);
+                        }
+                        // Globals become boxed in Ir.borrowConflict; locals do not.
+                        code[1].boxed = false;
+                        try std.testing.expect(try checkWithIr(allocator, body, &ir) == null);
+                        try std.testing.expectEqual(call_effect and global, try ir.borrowConflict(body) != null);
+                        code[1].boxed = true;
+                        code[7].op = constant;
+                        code[6].op = constant;
+                        try std.testing.expect(try ir.borrowConflict(body) == null);
+                    }
+                }
+            }
+        }
+    }
+    ir.clearFunctions();
+    try std.testing.expect(!ir.equalityMayCall(nested));
+    try std.testing.expect(!ir.equalityMayCall(@fromBackingInt(999)));
+    // A forged cycle must terminate without hiding a reachable hook.
+    const fields = @constCast(ir.types.items[@backingInt(nested)].record.fields);
+    fields[0].ty = nested;
+    try std.testing.expect(!ir.equalityMayCall(nested));
+    fields[1].ty = array;
+    const restored_hook = try ir.addFunction("restored", sig, span);
+    try ir.setTypeEquality(record, restored_hook);
+    try std.testing.expect(ir.equalityMayCall(nested));
+}
+
+test "equality hooks protect boxed owner loans in both CFG paths globals and every OOM" {
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testEqualityHookLoans, .{});
+}
+
+test "equality hooks reject captured owner replacement through explicit and iteration loans" {
+    const declaration = "let S=struct{f:()->bool,@[operator(.equal)]let eq:(a:S,b:S)->bool=a.f()}\n";
+    for ([_][]const u8{
+        "loop &x in xs {@assert(f())\n@println(x.*)}",
+        "loop &x in xs {@assert(a==a)\n@println(x.*)}",
+        "loop &x in xs {@assert(a!=a)\n@println(x.*)}",
+        "loop &x in xs {@assert([a]==[a])\n@println(x.*)}",
+        "let choices=[a]\nloop &x in xs {@assert(a in choices)\n@println(x.*)}",
+        "let p=&xs[0]\n@assert(a==a)\n@println(p.*)",
+        "let choices=[a]\nlet p=&xs[0]\n@assert(a in choices)\n@println(p.*)",
+    }) |operation| {
+        const source = try std.mem.concat(std.testing.allocator, u8, &.{ declaration, "let main:()={let mut xs=[1,2]\nlet f=()->bool{xs=[9]\ntrue}\nlet a=S.[f=f]\n", operation, "}" });
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "equality-loans.nov", source);
+        defer module.deinit();
+        var result = try Lowering.lower(&module);
+        defer result.deinit();
+        try std.testing.expect(module.hasErrors());
+        try std.testing.expectEqual(Module.Diagnostic.Tag.borrow_conflict, module.diagnostics.items[0].tag);
+        try std.testing.expect(!result.lowering_complete);
+    }
+}
+
+test "equality without hooks preserves boxed loans and hooks respect last uses" {
+    for ([_][]const u8{
+        "let S=struct{f:()->bool,@[operator(.equal)]let eq:(a:S,b:S)->bool=a.f()}\n" ++
+            "let main:()={let mut xs=[1,2]\nlet f=()->bool{xs=[9]\ntrue}\nlet a=S.[f=f]\n" ++
+            "loop &x in xs {@assert(1==1)\n@assert(1!=2)\n@assert(1 in [1,2])\n@assert([1,2]==[1,2])\n@assert(.[n:1]==.[n:1])\n@assert([1] in [[1],[2]])\n@println(x.*)}\n" ++
+            "let p=&xs[0]\n@println(p.*)\n@assert(a==a)}",
+        "let S=struct{f:()->bool,@[operator(.equal)]let eq:(a:S,b:S)->bool=a.f()}\n" ++
+            "let main:()={let mut xs=[1,2]\nlet f=()->bool{true}\nlet a=S.[f=f]\n" ++
+            "loop &x in xs {@assert(a==a)\n@println(x.*)}}",
+    }) |source| {
+        var module = try Module.init(std.testing.allocator, "equality-safe-loans.nov", source);
+        defer module.deinit();
+        var result = try Lowering.lower(&module);
+        defer result.deinit();
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expect(result.lowering_complete);
+        try result.ir.verify();
+    }
 }
 
 fn testIterationContinuationLoans(allocator: std.mem.Allocator) !void {
@@ -296,7 +443,7 @@ const BitRows = struct {
 
 // Forward reaching targets and backward SSA/slot liveness are separate: pushing
 // a snapshot's union of origins backwards through a rebind loses path precision.
-fn checkReferences(allocator: std.mem.Allocator, body: Ir.Body, edges: []const [2]usize) Ir.VerifyError!?Ir.BorrowConflict {
+fn checkReferences(allocator: std.mem.Allocator, body: Ir.Body, edges: []const [2]usize, ir: ?*const Ir) Ir.VerifyError!?Ir.BorrowConflict {
     const n = body.instructions.len;
     const slot_ids = try allocator.alloc(usize, n);
     defer allocator.free(slot_ids);
@@ -481,7 +628,7 @@ fn checkReferences(allocator: std.mem.Allocator, body: Ir.Body, edges: []const [
                 else => null,
             };
             var touches = access != null and access.? == owner;
-            if (instruction.op == .call and body.instructions[@backingInt(owner)].boxed) touches = true;
+            if (mayCall(body, instruction, ir) and body.instructions[@backingInt(owner)].boxed) touches = true;
             if (instruction.op == .closure_init) {
                 for (instruction.op.closure_init.captures) |capture| {
                     if (capture == owner) touches = true;
