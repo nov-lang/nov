@@ -12,3 +12,6 @@ let array = @import("array.nov")
 
 @[public]
 let string = @import("string.nov")
+
+@[public]
+let trivial = @import("trivial.nov")

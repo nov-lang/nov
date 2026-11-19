@@ -1,0 +1,126 @@
+let std = @import("std")
+
+let main: () = {
+    let mut a = 1
+    let mut b = 2
+    std.trivial.swap(&a, &b)
+    @println("Swapped:", a, b)
+    @println("Identity:", std.trivial.identity(a))
+    @println("Constant:", std.trivial.constant(a)())
+    let sub: (x: int, y: int) -> int = x - y
+    let reversed = std.trivial.flip(sub)
+    @println("Flipped:", reversed(3, 10))
+    std.trivial.noop()
+}
+
+@[test]
+let swap_scalars: () = {
+    let mut a: uint = 1
+    let mut b: uint = 2
+    std.trivial.swap(&a, &b)
+    @assert(a == 2 and b == 1)
+    std.trivial.swap(&a, &b)
+    @assert(a == 1 and b == 2)
+    let mut left = "é"
+    let mut right = "😀"
+    std.trivial.swap(&left, &right)
+    @assert(left == "😀" and right == "é")
+    let mut yes = true
+    let mut no = false
+    std.trivial.swap(&yes, &no)
+    @assert(yes == false and no)
+}
+
+let Row = struct {
+    values: []int,
+}
+
+@[test]
+let swap_aggregates_preserves_independence: () = {
+    let mut a = [[1], [2]]
+    let mut b: [][]int = []
+    let saved = a
+    std.trivial.swap(&a, &b)
+    @assert(a == [] and b == saved)
+    b[0] = [9]
+    @assert(saved == [[1], [2]])
+    let mut left = Row.[ values = [1] ]
+    let mut right = Row.[ values = [2, 3] ]
+    let original = left
+    std.trivial.swap(&left, &right)
+    left.values[0] = 8
+    right.values[0] = 9
+    @assert(left.values == [8, 3] and right.values == [9])
+    @assert(original.values == [1])
+    let mut some: std.Option([]int) = .some[[4]]
+    let mut none: std.Option([]int) = .none[]
+    std.trivial.swap(&some, &none)
+    @assert(some.isNone() and none == std.Option([]int).some[[4]])
+}
+
+@[test]
+let identity_values_and_copies: () = {
+    @assert(std.trivial.identity(7) == 7)
+    @assert(std.trivial.identity('é') == 'é')
+    @assert(std.trivial.identity("hello") == "hello")
+    @assert(std.trivial.identity(@as(f64, 1.5)) == 1.5)
+    let mut source = Row.[ values = [1, 2] ]
+    let mut result = std.trivial.identity(source)
+    source.values[0] = 9
+    result.values[1] = 8
+    @assert(source.values == [9, 2] and result.values == [1, 8])
+    @assert(std.array.map([1, 2], std.trivial.identity) == [1, 2])
+}
+
+@[test]
+let constant_snapshots_and_shared_closures: () = {
+    let mut source = [[1], [2]]
+    let get = std.trivial.constant(source)
+    source[0] = [9]
+    let mut first = get()
+    first[1] = [8]
+    @assert(source == [[9], [2]] and first == [[1], [8]])
+    @assert(get() == [[1], [2]] and get() == [[1], [2]])
+    let mut calls = 0
+    let increment = () -> int {
+        calls += 1
+        calls
+    }
+    let callback = std.trivial.constant(increment)
+    @assert(calls == 0)
+    @assert(callback()() == 1 and callback()() == 2)
+    @assert(calls == 2)
+}
+
+@[test]
+let flip_types_argument_order_and_shared_state: () = {
+    let mut calls = 0
+    let format = (label: str, value: uint) -> str {
+        calls += 1
+        "{label}:{value}"
+    }
+    let reversed = std.trivial.flip(format)
+    @assert(calls == 0)
+    @assert(reversed(7, "count") == "count:7" and calls == 1)
+    let restored = std.trivial.flip(reversed)
+    @assert(restored("total", 9) == "total:9" and calls == 2)
+    let sub: (x: int, y: int) -> int = x - y
+    @assert(std.trivial.flip(sub)(3, 10) == 7)
+}
+
+@[test]
+let noop_and_unevaluated_queries: () = {
+    std.trivial.noop()
+    std.trivial.identity(std.trivial.noop)()
+    let mut calls = 0
+    let make = () -> int {
+        calls += 1
+        calls
+    }
+    let query: @TypeOf(std.trivial.identity(make())) = 0
+    let constant: @TypeOf(std.trivial.constant(make())) = () -> int {
+        7
+    }
+    @assert(query == 0 and constant() == 7 and calls == 0)
+    @assert(std.trivial.identity(make()) == 1 and calls == 1)
+}

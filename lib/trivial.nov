@@ -1,0 +1,22 @@
+@[public]
+let swap: (a: &mut `T, b: &mut `T) = {
+    let tmp = a.*
+    a.* = b.*
+    b.* = tmp
+}
+
+@[public]
+let identity: (x: `T) -> `T = x
+
+@[public]
+let constant: (x: `T) -> () -> `T = () {
+    x
+}
+
+@[public]
+let noop: () = {}
+
+@[public]
+let flip: (f: (`A, `B) -> `C) -> (`B, `A) -> `C = (b, a) {
+    f(a, b)
+}

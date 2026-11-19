@@ -141,6 +141,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const language_tests = b.step("test-cli-language-tests", "Run test command and assertion language CLI tests");
     addLanguageTestCliTests(b, exe, language_tests);
     test_step.dependOn(language_tests);
+    const trivial_tests = b.step("test-cli-trivial", "Run standard-library trivial helper CLI tests");
+    addArrayValueHelperCliTests(b, exe, trivial_tests, "trivial.nov", @embedFile("examples/trivial.nov"), "Swapped: 2 1\nIdentity: 2\nConstant: 2\nFlipped: 7\n", "PASS swap_scalars\nPASS swap_aggregates_preserves_independence\nPASS identity_values_and_copies\nPASS constant_snapshots_and_shared_closures\nPASS flip_types_argument_order_and_shared_state\nPASS noop_and_unevaluated_queries\n6 passed; 0 failed; 6 total\n");
+    test_step.dependOn(trivial_tests);
     const equality_tests = b.step("test-cli-equality", "Run structural equality and operator override CLI tests");
     addEqualityCliTests(b, exe, equality_tests);
     test_step.dependOn(equality_tests);

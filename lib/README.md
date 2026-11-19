@@ -10,6 +10,7 @@ let Option = std.Option
 let array = std.array
 let string = std.string
 let Operator = std.builtin.Operator
+let trivial = std.trivial
 ```
 
 `std.nov` is the entry module. It publicly re-exports `Result` from `result.nov`,
@@ -18,6 +19,12 @@ let Operator = std.builtin.Operator
 `builtin.nov` (including its public `Operator` enum). These are
 ordinary library declarations, not compiler builtins or automatically injected
 bare names. String values use the `str` type; the module remains `std.string`.
+
+`std.trivial` provides `swap(&mut T, &mut T)`, `identity(T) -> T`,
+`constant(T) -> () -> T`, `noop()`, and `flip((A, B) -> C) -> (B, A) -> C`.
+Types are inferred at each call. Ordinary value-copy rules apply; `constant`
+captures its argument by value, while copied closures share their captured cells.
+See [`examples/trivial.nov`](../examples/trivial.nov) for usage and tests.
 
 ## Equality and operator metadata
 
