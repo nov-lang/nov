@@ -219,6 +219,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const array_helper_tests = b.step("test-cli-array-helpers", "Run standard-library array helper CLI tests");
     addArrayHelperCliTests(b, exe, array_helper_tests);
     test_step.dependOn(array_helper_tests);
+    const array_reverse_tests = b.step("test-cli-array-reverse", "Run standard-library array reverse CLI tests");
+    addArrayValueHelperCliTests(b, exe, array_reverse_tests, "array-reverse.nov", @embedFile("examples/array-reverse.nov"), "Reversed: [3, 2, 1]\nOriginal: [1, 2, 3]\n", "PASS order_empty_and_singleton\nPASS recursive_storage_independence\nPASS storable_types_and_shared_closure_cells\nPASS inferred_callback_and_unevaluated_query\n4 passed; 0 failed; 4 total\n");
+    test_step.dependOn(array_reverse_tests);
     const array_sort_tests = b.step("test-cli-array-sort", "Run standard-library stable array sort CLI tests");
     addArraySortCliTests(b, exe, array_sort_tests);
     test_step.dependOn(array_sort_tests);
@@ -4599,6 +4602,53 @@ fn addArrayDefaultCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_ste
     format.expectStdOutEqual("");
     format.expectStdErrEqual("");
     test_step.dependOn(&format.step);
+}
+
+fn addArrayValueHelperCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step, name: []const u8, source: []const u8, output: []const u8, tests: []const u8) void {
+    const fixtures = b.addWriteFiles();
+    const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
+    _ = fixtures.add(name, source);
+    const package = b.addWriteFiles();
+    const installed_exe = package.addCopyFile(exe.getEmittedBin(), b.fmt("bin/{s}", .{exe.out_filename}));
+    _ = package.addCopyDirectory(b.path("lib"), "lib/nov", .{});
+    _ = package.add(name, source);
+    const check = b.addRunArtifact(exe);
+    check.setCwd(fixtures.getDirectory());
+    check.addArgs(&.{ "check", "--semantic", name, "--lib-dir" });
+    check.addDirectoryArg(library);
+    check.expectExitCode(0);
+    check.expectStdOutEqual("");
+    check.expectStdErrEqual("");
+    test_step.dependOn(&check.step);
+    const fmt = b.addRunArtifact(exe);
+    fmt.setCwd(fixtures.getDirectory());
+    fmt.addArgs(&.{ "fmt", "--check", name, "lib/array.nov" });
+    fmt.expectExitCode(0);
+    fmt.expectStdOutEqual("");
+    fmt.expectStdErrEqual("");
+    test_step.dependOn(&fmt.step);
+    for ([_]bool{ false, true }) |installed| {
+        for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+            for ([_][]const u8{ "run", "test" }) |command| {
+                const run = if (installed) std.Build.Step.Run.create(b, "CLI array helper: relocated install") else b.addRunArtifact(exe);
+                if (installed) run.addFileArg(installed_exe);
+                run.setCwd(if (installed) package.getDirectory() else fixtures.getDirectory());
+                run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+                run.setEnvironmentVariable("NOV_CC", "");
+                run.setEnvironmentVariable("CC", "");
+                run.addArgs(&.{ command, name });
+                if (mode.len != 0) run.addArg(mode);
+                if (!installed) {
+                    run.addArg("--lib-dir");
+                    run.addDirectoryArg(library);
+                }
+                run.expectExitCode(0);
+                run.expectStdOutEqual(if (std.mem.eql(u8, command, "run")) output else tests);
+                run.expectStdErrEqual("");
+                test_step.dependOn(&run.step);
+            }
+        }
+    }
 }
 
 fn addArraySortCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {

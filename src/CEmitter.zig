@@ -10618,6 +10618,45 @@ fn runApprovedHelperHarness(library: []const u8, harness: []const u8, oom: bool)
         try compileAndRunMode(c, "typedef int nonempty_translation_unit;", if (oom) 1 else 0, "", if (oom) "panic: GC allocation failed\n" else "", mode);
 }
 
+test "array reverse actual stdlib source free recursive copies forced GC O0 O3 and runtime OOM" {
+    const library = try emitApprovedHelperSourceFree(test_gpa,
+        \\let std=@import("std")
+        \\let make:()->[][]int=[[1],[2]]
+        \\let reverse:(items:[][]int)->[][]int=std.array.reverse(items)
+    );
+    defer test_gpa.free(library);
+    try runApprovedHelperHarness(library,
+        \\int main(void) {
+        \\    nov_rt_heap.collect_every_allocation = 1;
+        \\    nov_array input = {0}, result = {0};
+        \\    void **roots[] = {&input.data, &result.data};
+        \\    nov_gc_roots frame = {0}; nov_gc_push(&nov_rt_heap, &frame, roots, 2);
+        \\    input = nov_make(); result = nov_reverse(input);
+        \\    nov_array *a = input.data, *b = result.data;
+        \\    if (result.len != 2 || a == b || a[0].data == b[1].data || a[1].data == b[0].data) return 1;
+        \\    ((int64_t *)a[0].data)[0] = 9;
+        \\    if (((int64_t *)b[1].data)[0] != 1 || ((int64_t *)b[0].data)[0] != 2) return 2;
+        \\    input = (nov_array){0}; nov_gc_collect(&nov_rt_heap);
+        \\    b = result.data;
+        \\    if (((int64_t *)b[1].data)[0] != 1) return 3;
+        \\    fail_allocations = 1;
+        \\    if (nov_reverse((nov_array){0}).len) return 4;
+        \\    nov_gc_pop(&nov_rt_heap, &frame); nov_gc_collect(&nov_rt_heap);
+        \\    if (nov_rt_heap.frames || nov_rt_heap.live_objects) return 5;
+        \\    nov_gc_shutdown(&nov_rt_heap); return 0;
+        \\}
+    , false);
+    try runApprovedHelperHarness(library,
+        \\int main(void) {
+        \\    nov_array input = {0};
+        \\    void **roots[] = {&input.data};
+        \\    nov_gc_roots frame = {0}; nov_gc_push(&nov_rt_heap, &frame, roots, 1);
+        \\    input = nov_make(); fail_allocations = 1;
+        \\    (void)nov_reverse(input); return 0;
+        \\}
+    , true);
+}
+
 const integer_parsing_stdlib_source_free =
     \\let std=@import("std")
     \\let signedAccept:(input:str,expected:int)->bool=match std.string.parseInt(input){

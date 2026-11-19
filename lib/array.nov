@@ -11,6 +11,17 @@ let map: (items: []`T, convert: (`T) -> `U) -> []`U = {
 }
 
 @[public]
+let reverse: (items: []`T) -> []`T = {
+    let mut result: []`T = []
+    let mut index: int = -1
+    loop _ in items {
+        result += [items[index]]
+        index -= 1
+    }
+    result
+}
+
+@[public]
 let filter: (items: []`T, predicate: (`T) -> bool) -> []`T = {
     let mut result: []`T = []
     loop item in items {

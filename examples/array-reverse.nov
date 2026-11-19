@@ -1,0 +1,64 @@
+let std = @import("std")
+
+let main: () = {
+    let items = [1, 2, 3]
+    @println("Reversed:", std.array.reverse(items))
+    @println("Original:", items)
+}
+
+@[test]
+let order_empty_and_singleton: () = {
+    let result = std.array.reverse([1, 2, 3, 4])
+    @assert(result[0] == 4 and result[1] == 3 and result[2] == 2 and result[3] == 1)
+    @assert(@len(std.array.reverse(@as([]int, []))) == 0)
+    @assert(std.array.reverse([7])[0] == 7)
+}
+
+let Row = struct {
+    values: []int,
+}
+
+@[test]
+let recursive_storage_independence: () = {
+    let mut source = [Row.[ values = [1] ], Row.[ values = [2] ]]
+    let mut result = std.array.reverse(source)
+    source[0] = Row.[ values = [9] ]
+    @assert(result[1].values[0] == 1)
+    result[0] = Row.[ values = [8] ]
+    @assert(source[1].values[0] == 2)
+    let nested = std.array.reverse([[1], [2]])
+    @assert(nested[0][0] == 2 and nested[1][0] == 1)
+}
+
+@[test]
+let storable_types_and_shared_closure_cells: () = {
+    let words = std.array.reverse(["é", "😀"])
+    let flags = std.array.reverse([true, false])
+    let ranges = std.array.reverse([0..1, 2..5])
+    let unions: []std.Option([]int) = [.some[[1]], .none[]]
+    let reversed = std.array.reverse(unions)
+    @assert(words[0] == "😀" and flags[0] == false)
+    @assert(@len(ranges[0]) == 3 and reversed[0].isNone())
+    @assert(reversed[1].unwrapOr([])[0] == 1)
+    let mut calls = 0
+    let increment = () -> int {
+        calls += 1
+        calls
+    }
+    let callbacks = std.array.reverse([increment, increment])
+    @assert(callbacks[0]() == 1 and callbacks[1]() == 2)
+}
+
+@[test]
+let inferred_callback_and_unevaluated_query: () = {
+    let rows = std.array.map([[1, 2], [3, 4]], std.array.reverse)
+    @assert(rows[0][0] == 2 and rows[1][0] == 4)
+    let mut calls = 0
+    let make = () -> []int {
+        calls += 1
+        [1, 2]
+    }
+    let query: @TypeOf(std.array.reverse(make())) = []
+    @assert(@len(query) == 0 and calls == 0)
+    @assert(std.array.reverse(make())[0] == 2 and calls == 1)
+}

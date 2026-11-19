@@ -257,12 +257,17 @@ for a runnable example and six tests, including chaining and void outputs.
 
 ## Array helpers
 
-`array.nov` implements twelve public generic functions.
+`array.nov` implements public generic collection helpers.
 Run `zig build test-cli-collection-helpers` for join/selection examples, imported
 aliases, invalid arguments and relocated-install checks.
 Signatures here use `T`/`U` for inferred backtick type variables:
 
 - `array.map(items: []T, convert: (T) -> U) -> []U` converts every element.
+- `array.reverse(items: []T) -> []T` returns an independent reversed value,
+  including recursive array storage. Empty input stays empty; closures retain shared
+  environments. It uses ordinary Nov indexing/append, with the existing copy costs
+  and no in-place capacity reuse. See `examples/array-reverse.nov` and
+  `zig build test-cli-array-reverse`.
 - `array.filter(items: []T, predicate: (T) -> bool) -> []T` keeps matching elements
   in stable source order.
 - `array.fold(items: []T, initial: U, combine: (U, T) -> U) -> U` is a left fold

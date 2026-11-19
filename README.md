@@ -1787,6 +1787,13 @@ operations remain available through demand specialization. See
 
 #### Array helpers
 
+`std.array.reverse(items: []T) -> []T` returns a reversed copy without changing
+its input. All storable element types work; nested array storage is independent,
+while immutable strings and closure environments retain their usual sharing.
+Empty/singleton inputs work. This is ordinary Nov code using existing indexing and
+append, not an in-place operation or new optimization. See
+[`examples/array-reverse.nov`](examples/array-reverse.nov).
+
 [`lib/array.nov`](lib/array.nov) provides public ordinary generic functions through
 `std.array`:
 
