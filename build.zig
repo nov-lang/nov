@@ -4296,11 +4296,11 @@ fn addStringTransformCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_
         test_step.dependOn(&check.step);
     }
     for ([_][]const u8{ "\"text\"", "\"\"" }, 0..) |text, index| {
-        const source = b.fmt("panic-replace-{d}.nov", .{index});
+        const source = b.fmt("empty-pattern-{d}.nov", .{index});
         _ = fixtures.add(source, b.fmt(
             "let std=@import(\"std\")\n" ++
                 "let callee:()->(str,str,str)->str={{@print(\"C\")\nstd.string.replace}}\n" ++
-                "let verify:()={{let value=callee()({{@print(\"T\")\n{s}}},{{@print(\"P\")\n\"\"}},{{@print(\"R\")\n\"replacement\"}})\n@println(\"unreachable\",value)}}\n" ++
+                "let verify:()={{let value=callee()({{@print(\"T\")\n{s}}},{{@print(\"P\")\n\"\"}},{{@print(\"R\")\n\"replacement\"}})\n@println(\"result\",value)}}\n" ++
                 "@[test]\nlet empty_pattern:()=verify()\nlet main:()=verify()\n",
             .{text},
         ));
@@ -4315,9 +4315,10 @@ fn addStringTransformCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_
                 run.addArgs(&.{ command, source, "--lib-dir" });
                 run.addDirectoryArg(library);
                 if (mode.len != 0) run.addArg(mode);
-                run.expectExitCode(1);
-                run.expectStdOutEqual(if (std.mem.eql(u8, command, "test")) "CTPRFAIL empty_pattern (exit 1)\n0 passed; 1 failed; 1 total\n" else "CTPR");
-                run.expectStdErrEqual("panic: string replace pattern must not be empty\n");
+                const output = b.fmt("CTPRresult {s}\n", .{if (index == 0) "text" else ""});
+                run.expectExitCode(0);
+                run.expectStdOutEqual(if (std.mem.eql(u8, command, "test")) b.fmt("{s}PASS empty_pattern\n1 passed; 0 failed; 1 total\n", .{output}) else output);
+                run.expectStdErrEqual("");
                 test_step.dependOn(&run.step);
             }
         }
@@ -4513,7 +4514,7 @@ fn addStringSplitCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step
         }
     }
     for ([_][]const u8{ "nonempty", "empty" }) |name| {
-        const source = b.fmt("panic-{s}.nov", .{name});
+        const source = b.fmt("empty-separator-{s}.nov", .{name});
         _ = fixtures.add(source, b.fmt(
             \\let std = @import("std")
             \\let main: () = {{
@@ -4530,7 +4531,8 @@ fn addStringSplitCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step
             \\        ""
             \\    }}
             \\    let fields = callee()(text(), separator())
-            \\    @println("unreachable", @len(fields))
+            \\    @assert(@len(fields) == 1)
+            \\    @println("fields", @len(fields), fields[0])
             \\}}
             \\
         , .{if (std.mem.eql(u8, name, "empty")) "" else "abc"}));
@@ -4544,9 +4546,9 @@ fn addStringSplitCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step
             run.addArgs(&.{ "run", source, "--lib-dir" });
             run.addDirectoryArg(library);
             if (mode.len != 0) run.addArg(mode);
-            run.expectExitCode(1);
-            run.expectStdOutEqual("callee\ntext\nseparator\n");
-            run.expectStdErrEqual("panic: string split separator must not be empty\n");
+            run.expectExitCode(0);
+            run.expectStdOutEqual(b.fmt("callee\ntext\nseparator\nfields 1 {s}\n", .{if (std.mem.eql(u8, name, "empty")) "" else "abc"}));
+            run.expectStdErrEqual("");
             test_step.dependOn(&run.step);
         }
     }
@@ -5329,7 +5331,7 @@ fn addPositionalFieldCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_
         .{ .name = "dynamic-index", .source = "let main:()={let r=.[1,2]\nlet i:int=0\n@println(r[i])}" },
         .{ .name = "field-borrow", .source = "let main:()={let mut r=.[1,2]\nlet p=&r.0\n}", .diagnostic = "local references require &local or &localArray[index]" },
         .{ .name = "element-borrow", .source = "let main:()={let mut r=.[[1],2]\nlet p=&r.0[0]\n}", .diagnostic = "local references require &local or &localArray[index]" },
-        .{ .name = "implicit-reference", .source = "let main:()={let mut r=.[1,2]\nlet p=&r\n@println(p.0)}" },
+        .{ .name = "readonly-reference-write", .source = "let main:()={let r=.[1,2]\nlet p=&r\np.0=3}", .diagnostic = "assignment requires a mutable local" },
     }) |case| {
         const source = b.fmt("invalid-positional-{s}.nov", .{case.name});
         _ = fixtures.add(source, case.source);
@@ -6428,7 +6430,7 @@ fn addReferenceCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: 
         .{ .name = "nested-scope-rebind", .body = "let mut p=&a\n{let mut inner:u8=0\np=&inner}\np.* = 1", .diagnostic = unsupported },
         .{ .name = "implicit-read", .body = "let p=&a\n@println(p)", .diagnostic = unsupported },
         .{ .name = "implicit-index", .body = "let values:[]u8=[1]\nlet p=&values\n@println(p[0])", .diagnostic = unsupported },
-        .{ .name = "implicit-field", .body = "let value=Cell.[value=1]\nlet p=&value\n@println(p.value)", .diagnostic = unsupported },
+        .{ .name = "readonly-field-write", .body = "let value=Cell.[value=1]\nlet p=&value\np.value=2", .diagnostic = immutable },
         .{ .name = "implicit-call", .body = "let f=()->u8 {1}\nlet p=&f\n@println(p())", .diagnostic = unsupported },
         .{ .name = "copy-reference", .body = "let p=&a\nlet q=p", .diagnostic = unsupported },
         .{ .name = "pass-reference-to-value", .body = "let p=&a\nconsume(p)", .diagnostic = unsupported },

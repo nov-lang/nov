@@ -1,7 +1,7 @@
 ; nov run examples/references.nov
 ; nov test examples/references.nov
 ; &owner infers pointee mutability; let mut independently permits rebinding.
-; Always use p.* to read, write, project, index or call the pointee.
+; Use p.* for pointee operations; named-reference fields/methods autodereference.
 ; References may be passed to reference parameters; see reference-parameters.nov.
 ; Copy p.* for an owned value; p itself cannot be copied, stored or returned.
 ; Rebinding also works through branches, match, blocks and loops; see
@@ -106,8 +106,8 @@ let scalar_and_struct_pointees: () = {
     let mut cell = Cell.[ value = 1 ]
     let record = &cell
     let snapshot = record.*
-    record.*.value += 1
-    @assert(record.*.value == 2 and snapshot.value == 1)
+    record.value += 1
+    @assert(record.value == 2 and record.*.value == 2 and snapshot.value == 1)
     @assert("{@TypeOf(record)}" == "&mut Cell")
 }
 

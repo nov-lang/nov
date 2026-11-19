@@ -64,6 +64,9 @@ let replace_exact_utf8_nul_case_and_normalization: () = {
     @assert(std.string.replace("é", "\u{A9}", "x") == "é")
     @assert(std.string.replace("AaA Straße", "a", "x") == "AxA Strxße")
     @assert(std.string.replace("Straße", "STRASSE", "x") == "Straße")
+    @assert(std.string.replace("", "", "replacement") == "")
+    @assert(std.string.replace("é\0😀", "", "replacement") == "é\0😀")
+    @assert(std.string.replace("text", "", "") == "text")
 }
 
 @[test]

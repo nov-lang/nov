@@ -3380,7 +3380,7 @@ shared immutable string backing; nested arrays recursively copy their array back
 
 `text[index]` decodes one Unicode scalar as **exactly `rune`**, using a native signed
 `int` index. Indices count scalars, not bytes or graphemes; `-1` is the last scalar. Out-of-bounds access,
-including indexing an empty string, panics with `str index out of bounds` in
+including indexing an empty string, panics with `string index out of bounds` in
 all build modes. No implicit integer widening or index signedness conversion occurs.
 The string and index evaluate once, left to right; the string value is captured
 before index effects can replace its binding or trigger GC. Indexing scans UTF-8
@@ -3403,7 +3403,7 @@ borrows are unsupported, even for `let mut` bindings. Whole-string aliases retai
 the existing borrowing rules. Chained reads such as `strings[0][1]` work for arrays
 of strings; nested arrays separately support chained value reads, not direct
 chained indexed writes. See
-[`examples/str-bytes.nov`](examples/string-bytes.nov), which keeps its historical
+[`examples/string-bytes.nov`](examples/string-bytes.nov), which keeps its historical
 filename but now demonstrates Unicode scalar indexing and length.
 
 String slicing supports `text[start..end]`, `text[..end]`, `text[start..]` and
@@ -3424,7 +3424,7 @@ The base, start and end evaluate once, left to right. Slicing returns an immutab
 allocation-free UTF-8 view sharing the original GC owner, without copying bytes;
 even a small view retains the full allocation. `@len(text)` still counts Unicode scalars.
 For example, `"é😀x"[1..-1] == "😀"`. Array slicing remains unsupported. See
-[`examples/str-slices.nov`](examples/string-slices.nov).
+[`examples/string-slices.nov`](examples/string-slices.nov).
 
 For editing, keep the distinction between a mutable binding and mutable storage:
 `s += "more"` produces a new immutable string and rebinds `s`, preserving older
@@ -3550,7 +3550,7 @@ zero, even in an empty string; empty prefixes and suffixes always match.
 These ordinary library functions work with immutable views and use normal eager
 argument evaluation. Their initial scalar-indexing/slicing implementations may
 rescan UTF-8; optimization remains deferred. See
-[`examples/str-search.nov`](examples/string-search.nov) and
+[`examples/string-search.nov`](examples/string-search.nov) and
 [`lib/README.md`](lib/README.md#string-search).
 
 ### Standard-library string splitting
@@ -3567,7 +3567,7 @@ Separators match exactly and non-overlappingly from left to right, including
 Unicode and embedded NUL, without normalization or case folding. Leading,
 trailing and adjacent separators produce empty fields. Empty input with a
 nonempty separator returns `[""]`; no match returns the whole input as one field.
-An empty separator panics in every build mode, even for empty input.
+An empty separator returns `[text]`, including `[""]` for empty input.
 
 The fields are immutable shared-owner slices, not copies of the source bytes;
 the output array allocates and copies independently under normal array semantics.
@@ -3606,8 +3606,8 @@ for the runnable example and five tests, and
 - `std.string.replace(text: str, pattern: str, replacement: str) -> str`
   replaces exact, case-sensitive, non-overlapping matches left to right. UTF-8
   bytes and embedded NUL are preserved, without normalization. An empty replacement
-  deletes matches; an empty pattern panics with
-  `str replace pattern must not be empty`, even for empty input.
+  deletes matches; an empty pattern preserves the input content, including empty
+  input. Arguments still evaluate eagerly.
 - `std.string.repeat(text: str, count: uint) -> str` concatenates `count`
   copies. Zero count or empty text returns `""`; empty text skips the loop even
   at maximum `uint`.

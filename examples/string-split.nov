@@ -24,6 +24,9 @@ let normal_and_preserved_empty_fields: () = {
 
 @[test]
 let empty_text_no_match_and_oversized_separator: () = {
+    expect("", "", [""])
+    expect("abc", "", ["abc"])
+    expect("é\0😀", "", ["é\0😀"])
     expect("", ",", [""])
     expect("", "😀x", [""])
     expect("abc", ",", ["abc"])

@@ -138,13 +138,13 @@ without casts. It removes exactly Unicode `White_Space` (U+0009–000D, U+0020,
 U+0085, U+00A0, U+1680, U+2000–200A, U+2028, U+2029, U+202F, U+205F,
 U+3000), not BOM, zero-width characters, NUL or combining marks. `replace`
 reuses split/join for exact case-sensitive, non-overlapping left-to-right matches,
-including NUL, without normalization; empty patterns always panic with
-`str replace pattern must not be empty`, even for empty text. `repeat` uses
+including NUL, without normalization; empty patterns preserve the input content,
+including empty text. `repeat` uses
 existing string concatenation; zero count/empty input returns `""`, and empty
 text skips the loop even for maximum `uint`. All arguments remain eager, once,
 left to right; no callbacks or compiler changes. Current concatenation can copy
 quadratically; performance work remains **PAUSED**. See
-`examples/str-transform.nov` (seven tests and exact stdout), README.md and
+`examples/string-transform.nov` (seven tests and exact stdout), README.md and
 lib/README.md. Mutable receivers are delivered separately in step 3 above.
 
 Step 1 complete: `std.array.sort(items: []T, less: (T, T) -> bool) -> []T`
@@ -170,7 +170,7 @@ truncation before calling `@stringFromBytes`; invalid input returns
 `@stringToBytes` and `@stringFromBytes` copy; direct `@stringFromBytes` panics on
 invalid UTF-8 in every mode. Allocation failure still panics normally. No general
 casts, arbitrary comptime execution, builder or optimization is introduced. See
-`examples/str-conversions.nov` (nine tests covering boundaries, invalid families,
+`examples/string-conversions.nov` (nine tests covering boundaries, invalid families,
 copy isolation, source scope/GC churn, propagation, matching and first-class/type
 queries), README.md and lib/README.md.
 
@@ -179,7 +179,7 @@ an ordinary Nov loop using existing string `+`. Empty parts arrays return `""`,
 singletons preserve their content, and empty separators concatenate. Separators
 appear only between parts, including empty parts. Exact UTF-8 bytes and embedded
 NUL are preserved without normalization. Inputs remain unchanged and results
-retain valid immutable content. See `examples/str-join.nov` (five tests).
+retain valid immutable content. See `examples/string-join.nov` (five tests).
 
 `std.array.findLast`, `take` and `drop` are implemented for all supported storable
 element types. `findLast` evaluates predicates from the end, stopping immediately
@@ -196,8 +196,8 @@ concatenation/array append can be quadratic; performance work remains **PAUSED**
 `std.string.split(text, separator) -> []str` is implemented in Nov. Exact,
 case-sensitive, non-overlapping Unicode-scalar separator matching preserves
 leading/trailing/adjacent empty fields. Empty input with nonempty separator gives
-one empty field; no match gives the whole input. Empty separator panics in every
-mode. Arguments remain eager and left-to-right. Field contents are zero-copy
+one empty field; no match gives the whole input. Empty separator returns `[text]`,
+including `[""]` for empty text. Arguments remain eager and left-to-right. Field contents are zero-copy
 immutable views with retained owners; output arrays allocate/copy independently.
 Source-free generated-C tests check owner/data identity, forced-GC retention,
 independent array copies and runtime OOM at O0/O3. No compiler semantics,

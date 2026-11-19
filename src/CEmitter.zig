@@ -10502,6 +10502,7 @@ fn emitStringSplitSourceFree(allocator: std.mem.Allocator) ![]u8 {
         \\let copy: (fields: []str) -> []str = fields
         \\let absent: (text: str) -> []str = std.string.split(text, "missing")
         \\let oversized: (text: str) -> []str = std.string.split(text, "a much longer separator")
+        \\let unchanged: (text: str) -> []str = std.string.split(text, "")
         \\
     });
     const path = try tmp.dir.realPathFileAlloc(io, "split.nov", allocator);
@@ -10526,12 +10527,14 @@ test "string split actual stdlib source free owner identity copies forced GC O0 
     const harness =
         \\int main(void) {
         \\    nov_rt_heap.collect_every_allocation = 1;
-        \\    nov_string text = {0}; nov_array fields = {0}, copy = {0}, absent = {0}, oversized = {0};
-        \\    void **roots[] = {&text.owner, &fields.data, &copy.data, &absent.data, &oversized.data};
-        \\    nov_gc_roots frame = {0}; nov_gc_push(&nov_rt_heap, &frame, roots, 5);
+        \\    nov_string text = {0}; nov_array fields = {0}, copy = {0}, absent = {0}, oversized = {0}, unchanged = {0};
+        \\    void **roots[] = {&text.owner, &fields.data, &copy.data, &absent.data, &oversized.data, &unchanged.data};
+        \\    nov_gc_roots frame = {0}; nov_gc_push(&nov_rt_heap, &frame, roots, 6);
         \\    text = nov_make();
-        \\    fields = nov_cut(text);
-        \\    if (!text.owner || fields.len != 5) return 1;
+        \\    fields = nov_cut(text); unchanged = nov_unchanged(text);
+        \\    if (!text.owner || fields.len != 5 || unchanged.len != 1) return 1;
+        \\    nov_string whole = ((nov_string *)unchanged.data)[0];
+        \\    if (whole.owner != text.owner || whole.data != text.data || whole.len != text.len) return 10;
         \\    nov_string *items = fields.data;
         \\    const uintptr_t offsets[] = {7, 9, 17, 23, 25}, lengths[] = {0, 6, 4, 0, 0};
         \\    for (uintptr_t i = 0; i < 5; ++i) {
@@ -10549,7 +10552,7 @@ test "string split actual stdlib source free owner identity copies forced GC O0 
         \\    }
         \\    ((nov_string *)copy.data)[1] = (nov_string){0};
         \\    if (items[1].len != 6) return 7;
-        \\    text = (nov_string){0}; copy = absent = oversized = (nov_array){0};
+        \\    text = (nov_string){0}; copy = absent = oversized = unchanged = (nov_array){0};
         \\    nov_gc_collect(&nov_rt_heap);
         \\    items = fields.data;
         \\    if (items[1].data[0] != 0xc3 || items[1].data[2] != 0xf0 || items[2].data[0] != 0 || items[2].data[2] != 0xcc) return 8;
@@ -10875,13 +10878,13 @@ test "string transform actual stdlib source free retained Unicode NUL subviews f
     , false);
 }
 
-test "string transform actual stdlib source free empty pattern panic callee arguments order O0 O3" {
+test "string transform actual stdlib source free empty pattern identity callee arguments order O0 O3" {
     for ([_][]const u8{ "\"text\"", "\"\"" }) |text| {
         const source = try std.fmt.allocPrint(
             test_gpa,
             "let std=@import(\"std\")\n" ++
                 "let callee:()->(str,str,str)->str={{@print(\"C\")\nstd.string.replace}}\n" ++
-                "let main:()={{let value=callee()({{@print(\"T\")\n{s}}},{{@print(\"P\")\n\"\"}},{{@print(\"R\")\n\"replacement\"}})\n@println(\"unreachable\",value)}}\n",
+                "let main:()={{let value=callee()({{@print(\"T\")\n{s}}},{{@print(\"P\")\n\"\"}},{{@print(\"R\")\n\"replacement\"}})\n@println(\"result\",value)}}\n",
             .{text},
         );
         defer test_gpa.free(source);
@@ -10890,7 +10893,7 @@ test "string transform actual stdlib source free empty pattern panic callee argu
         const c = try collectingTestProgram(library);
         defer test_gpa.free(c);
         for ([_][]const u8{ "-O0", "-O3" }) |mode|
-            try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 1, "CTPR", "panic: string replace pattern must not be empty\n", mode);
+            try compileAndRunMode(c, "typedef int nonempty_translation_unit;", 0, if (std.mem.eql(u8, text, "\"text\"")) "CTPRresult text\n" else "CTPRresult \n", "", mode);
     }
 }
 

@@ -447,7 +447,7 @@ UTF-8 in all build modes**; arbitrary input should use the recoverable public
 wrapper instead. Allocation failures retain normal panic semantics. These narrow
 conversions do not enable general casts or arbitrary compile-time execution;
 `@as` is still only expected-type ascription. A UTF-8 editing builder and
-performance optimizations remain deferred. See `examples/str-conversions.nov`
+performance optimizations remain deferred. See `examples/string-conversions.nov`
 for a runnable example with exact stdout and nine tests.
 
 ## Integer parsing
@@ -490,7 +490,7 @@ These are ordinary Nov functions implemented using existing scalar indexing,
 slices and zip loops. They may repeatedly scan UTF-8; no efficient-search
 complexity is promised yet, and optimization remains paused. They do not add
 mutable strings, normalization or case folding; byte conversions are separate APIs above. See
-`examples/str-search.nov` for a runnable example and five tests.
+`examples/string-search.nov` for a runnable example and five tests.
 
 ## String splitting
 
@@ -510,9 +510,9 @@ a nonempty separator returns `[""]`; no match or an oversized separator returns
 one field containing the whole input. Matches do not overlap: splitting `"aaaaa"`
 by `"aa"` yields `["", "", "a"]`.
 
-An empty separator panics with `str split separator must not be empty` in every
-build mode, including when the input is empty. Argument expressions still evaluate
-once in normal left-to-right order before the function checks the separator.
+An empty separator returns `[text]`, including `[""]` for empty input. Argument
+expressions still evaluate once in normal left-to-right order before the function
+checks the separator.
 
 Fields are immutable, zero-copy string views retaining their original GC owner;
 they remain valid after rebinding or dropping the input binding. The result array
@@ -520,7 +520,7 @@ allocates storage and follows ordinary independent array-copy semantics, while
 its string elements continue sharing immutable content. Allocation failure panics
 normally. This initial implementation uses existing scalar indexing/slicing and
 repeated append; efficient-search/growth optimization remains deferred. See
-`examples/str-split.nov` for a runnable example and five tests.
+`examples/string-split.nov` for a runnable example and five tests.
 
 ## String joining
 
@@ -543,7 +543,7 @@ bindings are replaced or leave scope. Allocation failures panic normally.
 
 This is an ordinary Nov loop using existing string `+`, not a compiler builtin
 or optimized builder. Repeated concatenation can be quadratic; optimization stays
-paused. See `examples/str-join.nov` for a runnable example and five tests.
+paused. See `examples/string-join.nov` for a runnable example and five tests.
 
 ## String transforms
 
@@ -563,9 +563,8 @@ to right, preserving UTF-8 bytes including NUL without normalization or grapheme
 processing. Replacing `"aaaaa"` / `"aa"` with `"X"` yields `"XXa"`; newly inserted
 text is not searched again. An empty replacement deletes matches. No match or an
 oversized pattern preserves the input content; empty text yields `""` with a
-nonempty pattern. An empty pattern always panics with
-`str replace pattern must not be empty`, even for empty text, consistently with
-`split`'s empty-separator policy.
+nonempty pattern. An empty pattern preserves the input content, including empty
+text, consistently with `split`'s empty-separator policy. Arguments remain eager.
 
 `repeat` concatenates exactly `count` copies, preserving bytes without
 normalization. Count zero or empty text returns `""`; empty text returns before
@@ -583,7 +582,7 @@ and results stay valid after source rebinding or scope exit. Allocation failure
 panics normally. These are ordinary Nov helpers: `replace` reuses `split`/`join`,
 and `repeat` loops with existing string `+`. Repeated concatenation can be
 quadratic under current copying; no efficient builder/search or other optimization
-is added. Optimization remains paused. See `examples/str-transform.nov` for
+is added. Optimization remains paused. See `examples/string-transform.nov` for
 exact main stdout and seven tests covering property boundaries, exact matching,
 count boundaries, effects and scope/GC retention.
 

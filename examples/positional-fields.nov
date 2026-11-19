@@ -19,8 +19,8 @@ let projections: () = {
     nested.0.1 = 6
     @assert(nested.0.0 == 4 and nested.0.1 == 6 and nested.1)
     let p = &nested
-    p.*.0.1 += 1
-    @assert(p.*.0.1 == 7)
+    p.0.1 += 1
+    @assert(p.0.1 == 7 and p.*.0.1 == 7)
     let pairs = std.array.map(
         [1, 2],
         (value) {
