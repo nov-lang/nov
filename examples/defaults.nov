@@ -1,0 +1,157 @@
+let std = @import("std")
+
+let Config = struct {
+    count: uint = 3,
+    names: []str = ["Ada"],
+}
+let Holder = struct {
+    config: @TypeOf(@default(Config)),
+}
+
+let main: () = {
+    @println("Number:", @default(int))
+    @println("Config:", @default(Config))
+    let mut items = [1, 2]
+    @println("Taken:", std.trivial.take(&items))
+    @println("Remaining:", items)
+    @println("Option:", @default(std.Option(u8)))
+}
+
+@[test]
+let scalar_array_and_range_defaults: () = {
+    @assert(@default(bool) == false)
+    @assert(@default(i8) == @as(i8, 0) and @default(u64) == @as(u64, 0))
+    @assert(@default(int) == 0 and @default(uint) == 0)
+    @assert(@default(f32) == @as(f32, 0.0) and @default(f64) == 0.0)
+    @assert(@default(rune) == '\0' and @default(str) == "")
+    @assert(@default([]int) == @as([]int, []))
+    @assert(@len(@default([]() -> int)) == 0)
+    @assert("{@default(..i8)}" == "0..0" and @len(@default(..u8)) == 0)
+}
+
+let ConfigAlias = Config
+let Box: (T: type) -> type = struct {
+    items: []T = [],
+}
+
+@[test]
+let declared_defaults_aliases_and_independent_arrays: () = {
+    let mut first = @default(ConfigAlias)
+    let second = @default(Config)
+    @assert(first == Config.[] and second.count == 3)
+    first.names[0] = "Grace"
+    @assert(second.names == ["Ada"] and first.names == ["Grace"])
+    let holder = Holder.[ config = @default(Config) ]
+    @assert(holder.config.names == ["Ada"])
+    @assert(@default(Box(int)).items == @as([]int, []))
+    @assert(@len(@default(Box(() -> int)).items) == 0)
+}
+
+let Override = struct {
+    value: uint = 1,
+
+    @[public]
+    @[default]
+    let create: () -> Override = .[ value = 9 ]
+}
+let Theme = enum {
+    light,
+    dark,
+
+    @[default]
+    let preferred: () -> Theme = .dark
+}
+let Message = union {
+    text: str,
+    empty,
+
+    @[default]
+    let initial: () -> Message = .text["hello"]
+}
+
+@[test]
+let custom_constructors_override_and_select_variants: () = {
+    @assert(Override.[].value == 1)
+    @assert(@default(Override).value == 9)
+    @assert(@default(Theme) == Theme.dark)
+    @assert(@default(Message) == Message.text["hello"])
+    @assert(@default(std.Option(int)).isNone())
+    @assert(@default(std.Option(void)).isNone())
+}
+
+@[test]
+let take_returns_old_values_and_installs_defaults: () = {
+    let mut number: uint = 7
+    @assert(std.trivial.take(&number) == 7 and number == 0)
+    let mut flag = true
+    @assert(std.trivial.take(&flag) and flag == false)
+    let mut text = "hello"
+    @assert(std.trivial.take(&text) == "hello" and text == "")
+    let mut record = @default(Config)
+    record.count = 8
+    let original = std.trivial.take(&record)
+    @assert(original.count == 8 and record == Config.[])
+    let mut custom = Override.[ value = 2 ]
+    @assert(std.trivial.take(&custom).value == 2 and custom.value == 9)
+}
+
+@[test]
+let take_managed_payloads_preserves_independence: () = {
+    let mut items = [[1], [2]]
+    let snapshot = items
+    let mut previous = std.trivial.take(&items)
+    @assert(@len(items) == 0 and previous == [[1], [2]])
+    previous[0] = [9]
+    @assert(snapshot == [[1], [2]])
+    let mut calls = 0
+    let mut option: std.Option(() -> int) = .some[
+        () -> int {
+            calls += 1
+            calls
+        }]
+    let saved = std.trivial.take(&option)
+    @assert(option.isNone() and calls == 0)
+    let value = match saved {
+        .some[callable] => callable()
+        .none => 0
+    }
+    @assert(value == 1 and calls == 1)
+}
+
+let mut constructions: uint = 0
+let Instrumented = struct {
+    value: uint,
+
+    @[public]
+    @[default]
+    let create: () -> Instrumented = {
+        constructions += 1
+        .[ value = constructions ]
+    }
+}
+
+@[test]
+let runtime_factories_and_unevaluated_type_queries: () = {
+    let query: @TypeOf(@default(Instrumented)) = Instrumented.[ value = 99 ]
+    @assert(query.value == 99 and constructions == 0)
+    let first = @default(Instrumented)
+    let second = @default(Instrumented)
+    @assert(first.value == 1 and second.value == 2 and constructions == 2)
+    let mut current = Instrumented.[ value = 99 ]
+    let taken = std.trivial.take(&current)
+    @assert(taken.value == 99 and current.value == 3 and constructions == 3)
+}
+
+let defaultLike: (prototype: `T) -> `T = @default(`T)
+
+@[test]
+let generic_default_inference_and_reference_places: () = {
+    @assert(defaultLike(@as(u8, 9)) == @as(u8, 0))
+    @assert(defaultLike("text") == "")
+    @assert(defaultLike(Override.[ value = 3 ]).value == 9)
+    let defaults = std.array.map([Config.[ count = 8 ], Config.[ count = 9 ]], defaultLike)
+    @assert(defaults == [Config.[], Config.[]])
+    let mut values: []uint = [1, 2]
+    @assert(std.trivial.take(&values[-1]) == 2)
+    @assert(values == @as([]uint, [1, 0]))
+}

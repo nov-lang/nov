@@ -2237,6 +2237,123 @@ test "mixed operator review multiply soft defaults select result independently u
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMixedMultiplyDefaults, .{});
 }
 
+fn testDefaultTypeQuery(allocator: std.mem.Allocator, source: [:0]const u8, valid: bool) !void {
+    var module = try Module.init(allocator, "default-type-query.nov", source);
+    defer module.deinit();
+    try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    ir.source_len = @intCast(module.source.ast.source.len);
+    const count = module.declarations.items.len;
+    const query = module.source.ast.decl(module.getDeclaration(module.lookup("query").?).?.node).ast.init_node;
+    const ty = try queryExpression(&module, &ir, query, &.{}, &.{}, &.{});
+    if (valid) {
+        try std.testing.expect(!module.hasErrors());
+        const expected = module.source.ast.decl(module.getDeclaration(module.lookup("expected").?).?.node).ast.type_node;
+        try std.testing.expectEqual((try TypeResolver.resolveInScopeReadOnly(&module, &ir, expected, null, null, &.{})).?, ty.?);
+    } else {
+        try std.testing.expectEqual(@as(?Ir.TypeId, null), ty);
+        try std.testing.expect(module.hasErrors());
+    }
+    try std.testing.expectEqual(count, module.declarations.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ir.functions.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ir.local_generic_instances.items.len);
+    try std.testing.expectEqual(@as(usize, 0), module.expression_query_depth);
+    for (ir.types.items) |entry| if (entry == .record) {
+        try std.testing.expect(!entry.record.methods_published);
+    };
+    // Readonly layouts retain declared field defaults as type metadata, but
+    // querying @default must not publish any other runtime constants.
+    for (ir.constants.items, 0..) |_, index| {
+        var field_default = false;
+        for (ir.types.items) |entry| if (entry == .record) {
+            for (entry.record.fields) |field| if (field.default) |constant| {
+                if (@backingInt(constant) == index) field_default = true;
+            };
+        };
+        try std.testing.expect(field_default);
+    }
+}
+
+test "default builtin readonly exact scalar aliases generic types and TypeOf" {
+    for ([_][:0]const u8{
+        "let expected:u8\nlet query=@default(u8)",
+        "let expected:i16\nlet query=@default(i16)",
+        "let expected:f32\nlet query=@default(f32)",
+        "let expected:bool\nlet query=@default(bool)",
+        "let expected:rune\nlet query=@default(rune)",
+        "let expected:str\nlet query=@default(str)",
+        "let expected:[]()->int\nlet query=@default([]()->int)",
+        "let expected:..u8\nlet query=@default(..u8)",
+        "let Alias=uint\nlet expected:Alias\nlet query=@default(Alias)",
+        "let Box:(T:type)->type=struct{items:[]T=[],}\nlet expected:Box(u8)\nlet query=@default(Box(u8))",
+        "let touch:()->u8=unresolved_body\nlet expected:u8\nlet query=@default(@TypeOf(touch()))",
+        "let S=struct{n:int=7,}\nlet expected:S\nlet query=@default(S)",
+        "let S=struct{n:int=7,\n@[default]\nlet make:()->S=unresolved_body\n}\nlet expected:S\nlet query=@default(S)",
+        "let S=struct{n:int,\n@[default]\nlet make:()->S=unresolved_body\n}\nlet expected:S\nlet query=@default(S)",
+        "let E=enum{one,two,\n@[default]\nlet make:()->E=unresolved_body\n}\nlet expected:E\nlet query=@default(E)",
+        "let U=union{none,some:int,\n@[default]\nlet make:()->U=unresolved_body\n}\nlet expected:U\nlet query=@default(U)",
+        "let f:(x:`T)->`T=@default(`T)\nlet expected:u8\nlet query=@as(@TypeOf(f(@as(u8,1))),0)",
+    }) |source| try testDefaultTypeQuery(std.testing.allocator, source, true);
+}
+
+test "default builtin readonly rejects unavailable defaults and invalid arity" {
+    for ([_][:0]const u8{
+        "let query=@default()",
+        "let query=@default(int,int)",
+        "let query=@default(()->int)",
+        "let query=@default(&int)",
+        "let query=@default(void)",
+        "let query=@default(type)",
+        "let query=@default(`T)",
+        "let make:()->`T=@default(`T)\nlet query=make()",
+        "let query=@default(1)",
+        "let S=struct{n:int,}\nlet query=@default(S)",
+        "let E=enum{one,two,}\nlet query=@default(E)",
+        "let U=union{none,some:int,}\nlet query=@default(U)",
+        "let f:(x:`T)->@TypeOf(@default(`T))=unresolved_body\nlet E=enum{one,two,}\nlet query=f(E.one)",
+    }) |source| try testDefaultTypeQuery(std.testing.allocator, source, false);
+}
+
+fn testDefaultGenericChecking(allocator: std.mem.Allocator, valid: bool) !void {
+    var module = try Module.init(allocator, "default-generic-checking.nov", "let make:(x:`T)->`T=@default(`T)");
+    defer module.deinit();
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    ir.source_len = @intCast(module.source.ast.source.len);
+    const ref: Ref = .{ .module = &module, .id = module.lookup("make").? };
+    const ty = if (valid) try ir.internType(.{ .integer = .{ .signedness = .unsigned, .bits = 8 } }) else try ir.internType(.{ .function = .{ .params = &.{}, .result = try ir.internType(.void) } });
+    const bindings = try infer(&module, &ir, ref, &.{.{ .ty = ty, .span = ref.span() }}, null, ref.span());
+    defer if (bindings) |items| allocator.free(items);
+    if (valid) {
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expectEqual(ty, bindings.?[0].ty);
+    } else {
+        try std.testing.expect(bindings == null);
+        try std.testing.expect(module.hasErrors());
+    }
+    try std.testing.expectEqual(@as(usize, 1), module.declarations.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ir.functions.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ir.constants.items.len);
+}
+
+test "default builtin ordinary generic checking validates availability under OOM" {
+    for ([_]bool{ false, true }) |valid| {
+        try testDefaultGenericChecking(std.testing.allocator, valid);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testDefaultGenericChecking, .{valid});
+    }
+}
+
+test "default builtin readonly custom metadata and deferred constraints roll back under OOM" {
+    for ([_][:0]const u8{
+        "let S=struct{n:int,\n@[default]\nlet make:()->S=unresolved_body\n}\nlet expected:S\nlet query=@default(S)",
+        "let make:(x:`T)->`T=@default(`T)\nlet apply:(f:(u8)->u8,x:u8)->u8=f(x)\nlet expected:u8\nlet query=apply(make,@as(u8,1))",
+    }) |source| {
+        try testDefaultTypeQuery(std.testing.allocator, source, true);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testDefaultTypeQuery, .{ source, true });
+    }
+}
+
 const Solver = struct {
     allocator: std.mem.Allocator,
     caller: *Module,
@@ -2255,6 +2372,7 @@ const Solver = struct {
     query_strings: std.ArrayList(struct { module: *Module, node: Ast.Node.Index }) = .empty,
     query_printables: std.ArrayList(struct { operand: *Term, module: *Module, node: Ast.Node.Index, interpolation: bool = true }) = .empty,
     query_types: std.ArrayList(*Term) = .empty,
+    default_types: std.ArrayList(struct { operand: *Term, module: *Module, node: Ast.Node.Index }) = .empty,
     query_locals: std.ArrayList(struct { operand: *Term, module: *Module, node: Ast.Node.Index }) = .empty,
     query_assignments: std.ArrayList(struct { operand: *Term, module: *Module, node: Ast.Node.Index }) = .empty,
     query_unions: std.ArrayList(struct { payload_type: *Term, module: *Module, node: Ast.Node.Index, payload: Ast.Node.Index, enum_payload: bool }) = .empty,
@@ -2546,6 +2664,22 @@ const Solver = struct {
         const was_readonly_layouts = self.readonly_layouts;
         self.readonly_layouts = true;
         defer self.readonly_layouts = was_readonly_layouts;
+        for (self.default_types.items) |default| {
+            // Generic type arguments may only become concrete after later
+            // arguments and callback bodies have supplied their constraints.
+            const ty = (try self.materialize(default.operand, 0)) orelse {
+                if (!self.failed) try self.fail(.generic_function_ambiguous, self.call_span, default.operand.span);
+                return;
+            };
+            // Copy the pool only after materializing this requested type. The
+            // validator owns all temporary values and never demands a body.
+            var validation = try BodyChecker.QueryValidation.init(self.ir);
+            defer validation.deinit();
+            if (!try validation.defaultType(default.module, default.node, ty)) {
+                self.failed = true;
+                return;
+            }
+        }
         {
             const was_querying = self.querying;
             self.querying = true;
@@ -4368,6 +4502,15 @@ const Solver = struct {
                     return ty;
                 }
                 const callee_name = ast.tokenSlice(ast.firstToken(call.ast.fn_expr));
+                if (ast.nodes.items(.tag)[call.ast.fn_expr] == .builtin_literal and std.mem.eql(u8, callee_name, "@default")) {
+                    if (call.ast.args.len != 1) {
+                        try self.fail(.argument_count_mismatch, span, null);
+                        return self.term(.unknown, span);
+                    }
+                    const ty = try self.typeNode(frame, call.ast.args[0], depth + 1);
+                    try self.default_types.append(self.allocator, .{ .operand = ty, .module = module, .node = node });
+                    return ty;
+                }
                 if (ast.nodes.items(.tag)[call.ast.fn_expr] == .builtin_literal and std.mem.eql(u8, callee_name, "@clear")) {
                     if (call.ast.args.len != 1) {
                         try self.fail(.argument_count_mismatch, span, null);

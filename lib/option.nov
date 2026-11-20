@@ -6,6 +6,10 @@ let Option: (T: type) -> type = union {
     let Self = @This()
 
     @[public]
+    @[default]
+    let empty: () -> Self = .none[]
+
+    @[public]
     let isSome: (self: Self) -> bool = match self {
         .some => true
         .none => false

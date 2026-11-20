@@ -10985,6 +10985,160 @@ fn runApprovedHelperHarness(library: []const u8, harness: []const u8, oom: bool)
         try compileAndRunMode(c, "typedef int nonempty_translation_unit;", if (oom) 1 else 0, "", if (oom) "panic: GC allocation failed\n" else "", mode);
 }
 
+test "default source free small compiler allocation rollback" {
+    // Exercise factory/default ownership without sweeping stdlib import allocations.
+    const source =
+        \\let Value=struct {
+        \\rows:[][]int,
+        \\@[default]
+        \\let create:()->Value=.[rows=[[3]]]
+        \\}
+        \\let main:()={let value=@default(Value)
+        \\@assert(value.rows==[[3]] and @len(@default([]int))==0)}
+    ;
+    try TestAllocations.checkAllAllocationFailures(test_gpa, struct {
+        fn run(allocator: std.mem.Allocator, text: []const u8) !void {
+            var lowered = blk: {
+                var module = try Module.init(allocator, "defaults.nov", text);
+                defer module.deinit();
+                var result = try Lowering.lower(&module);
+                errdefer result.deinit();
+                try std.testing.expect(!module.hasErrors());
+                try std.testing.expect(result.lowering_complete);
+                break :blk result;
+            };
+            defer lowered.deinit();
+            try lowered.ir.verify();
+            const c = try emitProgram(allocator, &lowered.ir, null);
+            defer allocator.free(c);
+        }
+    }.run, .{source});
+}
+
+test "default take actual stdlib source free fresh backing precise roots forced GC O0 O3 runtime OOM" {
+    const library = try emitApprovedHelperSourceFree(test_gpa,
+        \\let std=@import("std")
+        \\let Config=struct {rows:[][]int=[[3],[4]],}
+        \\let declared:()->[][]int=@default(Config).rows
+        \\let make:()->[][]int=[[1],[2]]
+        \\let takeRows:(input:[][]int)->[][]int={let mut current=input
+        \\let old=std.trivial.take(&current)
+        \\@assert(@len(current)==0)
+        \\old}
+        \\let takeOption:(input:[][]int)->[][][]int={let mut current:std.Option([][]int)=.some[input]
+        \\let snapshot=current
+        \\let old=std.trivial.take(&current)
+        \\@assert(current.isNone())
+        \\let saved=match old {.some[rows]=>rows
+        \\.none=>@as([][]int,[])}
+        \\let retained=match snapshot {.some[rows]=>rows
+        \\.none=>@as([][]int,[])}
+        \\[saved,retained]}
+        \\let empty:()={@assert(@default(int)==0 and @default(bool)==false)
+        \\@assert(@default(str)=="" and @default(f64)==0.0)
+        \\@assert(@len(@default([][]int))==0)
+        \\@assert(@len(@default([]()->int))==0)
+        \\@assert(@default(std.Option([][]int)).isNone())
+        \\let mut rows=@default([][]int)
+        \\@assert(@len(std.trivial.take(&rows))==0 and @len(rows)==0)
+        \\let mut option:std.Option([][]int)=.none[]
+        \\@assert(std.trivial.take(&option).isNone() and option.isNone())}
+    );
+    defer test_gpa.free(library);
+    try runApprovedHelperHarness(library,
+        \\int main(void) {
+        \\    nov_rt_heap.collect_every_allocation = 1;
+        \\    nov_array first = {0}, second = {0}, input = {0}, taken = {0}, options = {0};
+        \\    void **roots[] = {&first.data, &second.data, &input.data, &taken.data, &options.data};
+        \\    nov_gc_roots frame = {0}; nov_gc_push(&nov_rt_heap, &frame, roots, 5);
+        \\    first = nov_declared(); second = nov_declared(); input = nov_make();
+        \\    taken = nov_takeRows(input); options = nov_takeOption(input);
+        \\    if (first.len != 2 || second.len != 2 || taken.len != 2 || options.len != 2) return 1;
+        \\    nov_array *a = first.data, *b = second.data, *src = input.data, *old = taken.data;
+        \\    nov_array *pair = options.data, *saved = pair[0].data, *snapshot = pair[1].data;
+        \\    if (a == b || a[0].data == b[0].data || a[1].data == b[1].data) return 2;
+        \\    if (src == old || src[0].data == old[0].data || src[1].data == old[1].data) return 3;
+        \\    if (saved == snapshot || saved == src || saved[0].data == snapshot[0].data || saved[0].data == src[0].data) return 4;
+        \\    ((intptr_t *)a[0].data)[0] = 8; ((intptr_t *)old[0].data)[0] = 9; ((intptr_t *)saved[1].data)[0] = 10;
+        \\    if (((intptr_t *)b[0].data)[0] != 3 || ((intptr_t *)src[0].data)[0] != 1 || ((intptr_t *)snapshot[1].data)[0] != 2) return 5;
+        \\    input = (nov_array){0}; first = (nov_array){0}; nov_gc_collect(&nov_rt_heap);
+        \\    old = taken.data; pair = options.data; saved = pair[0].data; snapshot = pair[1].data;
+        \\    if (((intptr_t *)old[0].data)[0] != 9 || ((intptr_t *)saved[1].data)[0] != 10 || ((intptr_t *)snapshot[1].data)[0] != 2) return 6;
+        \\    fail_allocations = 1; nov_empty();
+        \\    nov_gc_pop(&nov_rt_heap, &frame); nov_gc_collect(&nov_rt_heap);
+        \\    if (nov_rt_heap.frames || nov_rt_heap.live_objects) return 7;
+        \\    nov_gc_shutdown(&nov_rt_heap); return 0;
+        \\}
+    , false);
+    try runApprovedHelperHarness(library,
+        \\int main(void) { fail_allocations = 1; (void)nov_declared(); return 0; }
+    , true);
+}
+
+test "default take actual stdlib custom allocating factory once stdout panic O0 O3 runtime OOM" {
+    const library = try emitApprovedHelperSourceFree(test_gpa,
+        \\let std=@import("std")
+        \\let Custom=struct {
+        \\rows:[][]int,
+        \\@[public]
+        \\@[default]
+        \\let create:()->Custom={@print("F")
+        \\.[rows=[[4],[5]]]}
+        \\}
+        \\let custom:()->[][]int=@default(Custom).rows
+        \\let takeCustom:(input:[][]int)->[][]int={let mut current:Custom=.[rows=input]
+        \\let old=std.trivial.take(&current)
+        \\@assert(@len(old.rows)==@len(input))
+        \\current.rows}
+        \\let main:()={let query:@TypeOf(@default(Custom))=.[rows=[[99]]]
+        \\@assert(query.rows==[[99]])
+        \\let first=@default(Custom)
+        \\let mut current:Custom=.[rows=[[7],[8]]]
+        \\let old=std.trivial.take(&current)
+        \\@assert(first.rows==[[4],[5]] and current.rows==[[4],[5]] and old.rows==[[7],[8]])
+        \\current.rows[0]=[9]
+        \\@assert(first.rows[0][0]==4 and old.rows[0][0]==7)
+        \\@println(old.rows,current.rows)}
+    );
+    defer test_gpa.free(library);
+    const program = try collectingTestProgram(library);
+    defer test_gpa.free(program);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(program, "typedef int nonempty_translation_unit;", 0, "FF[[7], [8]] [[9], [5]]\n", "", mode);
+    for ([_][]const u8{
+        "int main(void) { fail_allocations = 1; (void)nov_custom(); return 0; }",
+        "int main(void) { fail_allocations = 1; (void)nov_takeCustom((nov_array){0}); return 0; }",
+    }) |harness| {
+        const oom = try std.mem.concat(test_gpa, u8, &.{ approved_helper_allocator, library, harness });
+        defer test_gpa.free(oom);
+        for ([_][]const u8{ "-O0", "-O3" }) |mode|
+            try compileAndRunMode(oom, "typedef int nonempty_translation_unit;", 1, "F", "panic: GC allocation failed\n", mode);
+    }
+}
+
+test "default take actual stdlib factory panic stops take and caller O0 O3" {
+    const library = try emitApprovedHelperSourceFree(test_gpa,
+        \\let std=@import("std")
+        \\let Broken=struct {
+        \\rows:[][]int,
+        \\@[public]
+        \\@[default]
+        \\let create:()->Broken={let retained=[[4],[5]]
+        \\@println("factory",retained)
+        \\@panic("default stopped")}
+        \\}
+        \\let main:()={let mut current:Broken=.[rows=[[7],[8]]]
+        \\@println("before",current.rows)
+        \\let old=std.trivial.take(&current)
+        \\@println("unreachable",old.rows,current.rows)}
+    );
+    defer test_gpa.free(library);
+    const program = try collectingTestProgram(library);
+    defer test_gpa.free(program);
+    for ([_][]const u8{ "-O0", "-O3" }) |mode|
+        try compileAndRunMode(program, "typedef int nonempty_translation_unit;", 1, "before [[7], [8]]\nfactory [[4], [5]]\n", "panic: default stopped\n", mode);
+}
+
 test "trivial replace actual stdlib source free independent backing forced GC O0 O3 and runtime OOM" {
     const library = try emitApprovedHelperSourceFree(test_gpa,
         \\let std=@import("std")

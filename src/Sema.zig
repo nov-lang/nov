@@ -38,7 +38,7 @@ pub const Error = Ir.BuildError || error{InvalidModule};
 
 /// A partial semantic pass: resolves explicit annotations and literal constants,
 /// leaving concrete generic method signatures dormant until referenced, except
-/// operator signatures, which must be valid even when unused.
+/// operator and default constructor signatures, which must be valid even when unused.
 /// Deferred entries and signatures are not checked bodies or executable IR.
 /// Owns all output storage; OOM rolls back diagnostics appended to the module.
 pub fn analyzeAnnotations(module: *Module) Error!Sema {
@@ -58,6 +58,7 @@ pub fn analyzeAnnotations(module: *Module) Error!Sema {
     result.ir.source_len = @intCast(module.source.ast.source.len);
     try result.analyzeModuleAnnotations(module);
     try result.validateOperatorSignatures(module);
+    try result.validateDefaultSignatures(module);
     try result.finalizeRecordLayouts(module);
     var exports: std.StringHashMapUnmanaged(ForeignSymbol) = .empty;
     defer exports.deinit(result.allocator);
@@ -153,7 +154,7 @@ fn analyzeModuleAnnotations(result: *Sema, module: *Module) Error!void {
                 result.entries[result.entryIndex(module, @fromBackingInt(@intCast(i)))].status = .failed;
                 continue;
             }
-            result.entries[result.entryIndex(module, @fromBackingInt(@intCast(i)))].status = if (declaration.extern_name != null) .external else .signature_only;
+            result.entries[result.entryIndex(module, @fromBackingInt(@intCast(i)))].status = if (declaration.extern_name != null) .external else if (declaration.default_constructor) .unrequested else .signature_only;
         } else if (full.ast.init_node != 0) {
             const annotation = module.tokenSpan(module.source.ast.firstToken(full.ast.type_node));
             if (module.source.ast.fullCall(full.ast.init_node) != null) {
@@ -206,6 +207,37 @@ fn analyzeModuleAnnotations(result: *Sema, module: *Module) Error!void {
         }
         if (tagged and fields.items.len == 0) try module.diagnostics.append(module.allocator, .{ .tag = .empty_union, .span = declaration.name_span });
         try result.ir.setRecordFields(result.entries[result.entryIndex(module, @fromBackingInt(@intCast(i)))].alias_type.?, fields.items);
+    }
+}
+
+fn validateDefaultSignatures(self: *Sema, module: *Module) Error!void {
+    var i: usize = 0;
+    while (i < module.declarations.items.len) : (i += 1) {
+        const declaration = module.declarations.items[i];
+        if (!declaration.default_constructor) continue;
+        const owner = declaration.container orelse continue;
+        if (module.getDeclaration(owner).?.is_generic and declaration.concrete_type == null) continue;
+        try self.syncEntries(module);
+        const index = self.entryIndex(module, @fromBackingInt(@intCast(i)));
+        if (self.entries[index].status == .failed) continue;
+        const ty = self.entries[index].type_id orelse (try TypeResolver.resolveFunction(module, &self.ir, .{ .module = module, .id = @fromBackingInt(@intCast(i)), .analysis = self })) orelse {
+            try self.syncEntries(module);
+            self.entries[index].status = .failed;
+            continue;
+        };
+        try self.syncEntries(module);
+        const receiver: Ir.TypeId = if (declaration.concrete_type) |concrete|
+            @fromBackingInt(concrete)
+        else
+            self.entries[self.entryIndex(module, owner)].alias_type orelse continue;
+        const signature = self.ir.getType(ty).?;
+        if (signature != .function or signature.function.params.len != 0 or signature.function.result != receiver) {
+            try module.diagnostics.append(module.allocator, .{ .tag = .invalid_default_signature, .span = declaration.name_span });
+            self.entries[index].status = .failed;
+            continue;
+        }
+        // Signature validation must not demand an unused factory body.
+        self.entries[index].type_id = ty;
     }
 }
 
@@ -267,6 +299,42 @@ fn validateOperatorSignatures(self: *Sema, module: *Module) Error!void {
             self.entries[index].status = .failed;
             break;
         }
+    }
+}
+
+fn testUnusedDefaultSignature(allocator: std.mem.Allocator, source: []const u8, valid: bool) !void {
+    var module = try Module.init(allocator, "unused-default.nov", source);
+    defer module.deinit();
+    try std.testing.expect(!module.hasErrors());
+    var sema = try analyzeFunctions(&module);
+    defer sema.deinit();
+    try std.testing.expectEqual(!valid, module.hasErrors());
+    if (!valid) {
+        try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+        try std.testing.expectEqual(Module.Diagnostic.Tag.invalid_default_signature, module.diagnostics.items[0].tag);
+    }
+    for (module.declarations.items, 0..) |decl, i| {
+        if (!decl.default_constructor) continue;
+        try std.testing.expectEqual(null, sema.entries[sema.entryIndex(&module, @fromBackingInt(@intCast(i)))].function);
+    }
+}
+
+test "default signatures validate exact unused owners and defer templates without bodies under OOM" {
+    for ([_]struct { source: []const u8, valid: bool }{
+        .{ .source = "let S=struct{\n@[default]\nlet make:()->S=unresolved_body\n}", .valid = true },
+        .{ .source = "let S=struct{\n@[default]\nlet make:(x:int)->S=unresolved_body\n}", .valid = false },
+        .{ .source = "let S=struct{\n@[default]\nlet make:()->int=unresolved_body\n}", .valid = false },
+        .{ .source = "let S=struct{\n@[default]\nlet make:()=unresolved_body\n}", .valid = false },
+        .{ .source = "let Alias=S\nlet S=struct{\n@[default]\nlet make:()->Alias=unresolved_body\n}", .valid = true },
+        .{ .source = "let S=struct{}\nlet Other=struct{\n@[default]\nlet make:()->S=unresolved_body\n}", .valid = false },
+        .{ .source = "let E=enum{one,\n@[default]\nlet make:()->E=unresolved_body\n}", .valid = true },
+        .{ .source = "let U=union{none,\n@[default]\nlet make:()->U=unresolved_body\n}", .valid = true },
+        .{ .source = "let Box:(T:type)->type=struct{value:T,\n@[default]\nlet make:()->T=unresolved_body\n}", .valid = true },
+        .{ .source = "let Box:(T:type)->type=struct{value:T,\n@[default]\nlet make:()->@This()=unresolved_body\n}\nlet f:(b:Box(int))={}", .valid = true },
+        .{ .source = "let Box:(T:type)->type=struct{value:T,\n@[default]\nlet make:()->T=unresolved_body\n}\nlet f:(b:Box(int))={}", .valid = false },
+    }) |case| {
+        try testUnusedDefaultSignature(std.testing.allocator, case.source, case.valid);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testUnusedDefaultSignature, .{ case.source, case.valid });
     }
 }
 
@@ -570,6 +638,7 @@ pub fn analyzeFunctions(module: *Module) Error!Sema {
     }
     // Demand checking can add concrete operators and layouts after annotations.
     if (!module.hasErrors()) try result.validateOperatorSignatures(module);
+    if (!module.hasErrors()) try result.validateDefaultSignatures(module);
     if (!module.hasErrors()) _ = try result.validateRecordLayouts(module);
     return result;
 }
@@ -596,6 +665,7 @@ pub fn analyzeCompilation(comp: *Compilation) Error!Sema {
     if (comp.hasErrors()) return result;
     for (comp.modules.items) |module| try result.analyzeModuleAnnotations(module);
     for (comp.modules.items) |module| try result.validateOperatorSignatures(module);
+    for (comp.modules.items) |module| try result.validateDefaultSignatures(module);
     try result.finalizeRecordLayouts(comp.modules.items[0]);
     var exports: std.StringHashMapUnmanaged(ForeignSymbol) = .empty;
     defer exports.deinit(result.allocator);
@@ -622,6 +692,7 @@ pub fn analyzeCompilation(comp: *Compilation) Error!Sema {
         result.entries[index].status = if (checked) .body_checked else .failed;
     }
     if (!comp.hasErrors()) for (comp.modules.items) |module| try result.validateOperatorSignatures(module);
+    if (!comp.hasErrors()) for (comp.modules.items) |module| try result.validateDefaultSignatures(module);
     if (!comp.hasErrors()) _ = try result.validateRecordLayouts(comp.modules.items[0]);
     return result;
 }
@@ -667,7 +738,12 @@ pub fn requestType(self: *Sema, module: *Module, id: Module.DeclId) Ir.BuildErro
     }
     const entry = self.entries[self.entryIndex(module, @fromBackingInt(@intCast(index)))];
     if (entry.status != .unrequested and entry.status != .requested) return entry.type_id;
-    if (declaration.concrete_type == null or declaration.is_type_alias) return null;
+    if (declaration.is_type_alias) return null;
+    if (declaration.default_constructor and entry.type_id != null) {
+        self.entries[self.entryIndex(module, id)].status = .signature_only;
+        return entry.type_id;
+    }
+    if (declaration.concrete_type == null) return null;
     // Failed speculative requests must be retried: probes may discard their
     // diagnostics. The worklist performs a final, non-speculative request too.
     self.entries[self.entryIndex(module, @fromBackingInt(@intCast(index)))].status = .requested;

@@ -148,6 +148,7 @@ pub const Declaration = struct {
     public: bool = false,
     noreturn: bool = false,
     stringify: bool = false,
+    default_constructor: bool = false,
     operator: ?Operator = null,
     /// Qualified literal argument in this module's AST. Non-null means the parent
     /// MUST validate canonical std.builtin.Operator identity before using this
@@ -224,6 +225,10 @@ pub const Diagnostic = struct {
         record_layout_cycle,
         record_layout_limit,
         invalid_to_string,
+        no_default_value,
+        invalid_default_declaration,
+        invalid_default_signature,
+        duplicate_default,
         invalid_stringify_declaration,
         duplicate_stringifier,
         invalid_operator_declaration,
@@ -592,6 +597,15 @@ pub fn lookupConcreteStringifier(self: *const Module, container: DeclId, concret
     return null;
 }
 
+pub fn lookupDefault(self: *const Module, container: DeclId) ?DeclId {
+    return self.lookupConcreteDefault(container, null);
+}
+
+pub fn lookupConcreteDefault(self: *const Module, container: DeclId, concrete_type: ?u32) ?DeclId {
+    for (self.declarations.items, 0..) |decl, i| if (decl.container == container and decl.concrete_type == concrete_type and decl.default_constructor) return @fromBackingInt(@intCast(i));
+    return null;
+}
+
 /// Returns candidate metadata; qualified operator_arg identity and the concrete
 /// signature must be validated by semantic analysis before invoking the overload.
 pub fn lookupOperator(self: *const Module, container: DeclId, operator: Operator) ?DeclId {
@@ -670,6 +684,7 @@ fn collectDeclaration(self: *Module, node: Ast.Node.Index, container: ?DeclId) (
         var public = false;
         var noreturn_annotation = false;
         var stringify = false;
+        var default_constructor = false;
         var operator_seen = false;
         var operator: ?Operator = null;
         var operator_arg: ?Ast.Node.Index = null;
@@ -693,6 +708,10 @@ fn collectDeclaration(self: *Module, node: Ast.Node.Index, container: ?DeclId) (
                     if (!parsed.?.isSupported()) try self.diagnostics.append(self.allocator, .{ .tag = .unsupported_operator, .span = self.tokenSpan(self.source.ast.lastToken(data.rhs)) });
                 }
                 operator_seen = true;
+            } else if (std.mem.eql(u8, attr_name, "default")) {
+                if (default_constructor or self.source.ast.nodes.items(.tag)[attribute] != .attr_one or data.rhs != 0)
+                    try self.diagnostics.append(self.allocator, .{ .tag = .invalid_default_declaration, .span = self.tokenSpan(self.source.ast.firstToken(attribute)) });
+                default_constructor = true;
             } else if (std.mem.eql(u8, attr_name, "stringify")) {
                 if (stringify or self.source.ast.nodes.items(.tag)[attribute] != .attr_one or data.rhs != 0)
                     try self.diagnostics.append(self.allocator, .{ .tag = .invalid_stringify_declaration, .span = self.tokenSpan(self.source.ast.firstToken(attribute)) });
@@ -754,6 +773,13 @@ fn collectDeclaration(self: *Module, node: Ast.Node.Index, container: ?DeclId) (
         }
         if (is_test and (container != null or declaration.ast.is_mutable or is_record or is_generic or is_generic_function or declaration.ast.init_node == 0 or self.source.ast.declFunction(node) == null or export_seen or extern_seen or noreturn_annotation))
             try self.diagnostics.append(self.allocator, .{ .tag = .invalid_test_declaration, .span = name_span });
+        if (default_constructor) {
+            if (container == null or declaration.ast.is_mutable or is_record or is_generic or is_generic_function or is_test or noreturn_annotation or export_seen or extern_seen or stringify or operator_seen or declaration.ast.init_node == 0 or self.source.ast.declFunction(node) == null) {
+                try self.diagnostics.append(self.allocator, .{ .tag = .invalid_default_declaration, .span = name_span });
+            } else if (self.lookupDefault(container.?)) |previous| {
+                try self.diagnostics.append(self.allocator, .{ .tag = .duplicate_default, .span = name_span, .related = self.getDeclaration(previous).?.name_span });
+            }
+        }
         if (stringify) {
             if (container == null or declaration.ast.is_mutable or is_record or is_generic or is_generic_function or is_test or noreturn_annotation or export_seen or extern_seen or declaration.ast.init_node == 0 or self.source.ast.declFunction(node) == null) {
                 try self.diagnostics.append(self.allocator, .{ .tag = .invalid_stringify_declaration, .span = name_span });
@@ -766,8 +792,56 @@ fn collectDeclaration(self: *Module, node: Ast.Node.Index, container: ?DeclId) (
                 try self.diagnostics.append(self.allocator, .{ .tag = .invalid_operator_declaration, .span = name_span });
             }
         }
-        try self.declarations.append(self.allocator, .{ .operator = operator, .operator_arg = operator_arg, .stringify = stringify, .is_test = is_test, .name = name, .name_span = name_span, .node = node, .container = container, .is_record = is_record, .is_generic = is_generic, .is_generic_function = is_generic_function, .is_type_alias = is_record or is_this_alias, .public = public, .noreturn = noreturn_annotation, .export_name = export_name, .extern_name = extern_name });
+        try self.declarations.append(self.allocator, .{ .operator = operator, .operator_arg = operator_arg, .default_constructor = default_constructor, .stringify = stringify, .is_test = is_test, .name = name, .name_span = name_span, .node = node, .container = container, .is_record = is_record, .is_generic = is_generic, .is_generic_function = is_generic_function, .is_type_alias = is_record or is_this_alias, .public = public, .noreturn = noreturn_annotation, .export_name = export_name, .extern_name = extern_name });
     }
+}
+
+test "default metadata selects nominal factories and rejects invalid declarations under OOM" {
+    const valid = "let S=struct{\n@[public]\n@[default]\nlet make:()->S=unresolved\n}\nlet U=union{none,\n@[default]\nlet make:()->U=unresolved\n}\nlet E=enum{one,\n@[default]\nlet make:()->E=unresolved\n}\nlet Box:(T:type)->type=struct{value:T,\n@[default]\nlet make:()->@This()=unresolved\n}";
+    var module = try Module.init(std.testing.allocator, "default.nov", valid);
+    defer module.deinit();
+    try std.testing.expect(!module.hasErrors());
+    for ([_][]const u8{ "S", "U", "E", "Box" }) |name| {
+        const owner = module.lookup(name).?;
+        const factory = module.lookupDefault(owner).?;
+        try std.testing.expect(module.getDeclaration(factory).?.default_constructor);
+        try std.testing.expectEqual(factory, module.lookupConcreteDefault(owner, null).?);
+        try std.testing.expectEqual(null, module.lookupConcreteDefault(owner, 123));
+    }
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{valid});
+    for ([_][]const u8{
+        "@[default]\nlet make:()->int=0",
+        "let S=struct{\n@[default(1)]\nlet make:()->S=unresolved\n}",
+        "let S=struct{\n@[default(1,2)]\nlet make:()->S=unresolved\n}",
+        "let S=struct{\n@[default]\n@[default]\nlet make:()->S=unresolved\n}",
+        "let S=struct{\n@[default]\nlet mut make:()->S=unresolved\n}",
+        "let S=struct{\n@[default]\nlet make:()->S\n}",
+        "let S=struct{\n@[default]\nlet value=1\n}",
+        "let S=struct{\n@[default]\nlet make:(value:`T)->S=unresolved\n}",
+        "let S=struct{\n@[default]\n@[stringify]\nlet make:()->S=unresolved\n}",
+        "let S=struct{\n@[operator(.neg)]\n@[default]\nlet make:()->S=unresolved\n}",
+        "let S=struct{\n@[default]\n@[test]\nlet make:()->S=unresolved\n}",
+        "let S=struct{\n@[noreturn]\n@[default]\nlet make:()->S=unresolved\n}",
+        "let S=struct{\n@[default]\n@[extern]\nlet make:()->S\n}",
+        "let S=struct{\n@[export]\n@[default]\nlet make:()->S=unresolved\n}",
+    }) |source| {
+        var invalid = try Module.init(std.testing.allocator, "invalid-default.nov", source);
+        defer invalid.deinit();
+        try std.testing.expectEqual(@as(usize, 0), invalid.source.ast.errors.len);
+        var diagnosed = false;
+        for (invalid.diagnostics.items) |diagnostic| {
+            if (diagnostic.tag == .invalid_default_declaration) diagnosed = true;
+        }
+        try std.testing.expect(diagnosed);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+    }
+    const duplicate = "let S=struct{\n@[default]\nlet first:()->S=unresolved\n@[default]\nlet second:()->S=unresolved\n}";
+    var invalid = try Module.init(std.testing.allocator, "duplicate-default.nov", duplicate);
+    defer invalid.deinit();
+    try std.testing.expectEqual(@as(usize, 1), invalid.diagnostics.items.len);
+    try std.testing.expectEqual(Diagnostic.Tag.duplicate_default, invalid.diagnostics.items[0].tag);
+    try std.testing.expect(invalid.diagnostics.items[0].related != null);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{duplicate});
 }
 
 test "operator metadata selects nominal and concrete candidates and defers qualified identity" {

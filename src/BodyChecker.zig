@@ -524,6 +524,11 @@ pub const QueryValidation = struct {
         return self.ir.getType(hook.signature).?.function.result;
     }
 
+    pub fn defaultType(self: *QueryValidation, module: *Module, node: Ast.Node.Index, ty: Ir.TypeId) Error!bool {
+        var context: Context = .{ .module = module, .ir = &self.ir, .types = &.{}, .probing = true };
+        return try context.defaultPlan(node, ty) != null;
+    }
+
     pub fn comparable(self: *QueryValidation, module: *Module, node: Ast.Node.Index, ty: Ir.TypeId) Error!bool {
         var context: Context = .{ .module = module, .ir = &self.ir, .types = &.{}, .probing = true };
         var visited: Context.PrintableTypes = .empty;
@@ -2581,6 +2586,109 @@ const Context = struct {
             std.mem.eql(u8, ast.tokenSlice(ast.nodes.items(.main_token)[node]), "@as");
     }
 
+    fn isDefault(self: *Context, node: Ast.Node.Index) bool {
+        const ast = &self.module.source.ast;
+        return ast.nodes.items(.tag)[node] == .builtin_literal and
+            std.mem.eql(u8, ast.tokenSlice(ast.nodes.items(.main_token)[node]), "@default");
+    }
+
+    const DefaultPlan = union(enum) { data, factory: PrintableHook };
+
+    fn defaultPlan(self: *Context, node: Ast.Node.Index, ty: Ir.TypeId) Error!?DefaultPlan {
+        var nominal = self.ir.getType(ty).?;
+        switch (nominal) {
+            .boolean, .integer, .float, .rune, .string, .array, .range => return .data,
+            .record, .enumeration => {},
+            else => {
+                _ = try self.fail(.no_default_value, node, null);
+                return null;
+            },
+        }
+        if (!(nominal == .record and nominal.record.anonymous != .none)) {
+            const source = if (nominal == .record) nominal.record.source else nominal.enumeration.source;
+            const identity = if (nominal == .record) nominal.record.identity else nominal.enumeration.identity;
+            const owner = if (self.module.compilation) |comp| comp.getModule(source).? else self.module;
+            const container: Module.DeclId = @fromBackingInt(identity);
+            const concrete = if (nominal == .record and nominal.record.type_args.len != 0) @as(?u32, @backingInt(ty)) else null;
+            if (!self.probing and concrete != null) {
+                _ = (try TypeResolver.instantiateArguments(owner, self.ir, container, nominal.record.type_args, 0)) orelse return null;
+                nominal = self.ir.getType(ty).?;
+            }
+            const method = owner.lookupConcreteDefault(container, concrete) orelse
+                (if (self.probing and concrete != null) owner.lookupDefault(container) else null);
+            if (method) |id| {
+                const declaration = owner.getDeclaration(id).?;
+                const function = owner.source.ast.declFunction(declaration.node);
+                if ((source != self.module.source.id and !declaration.public) or declaration.is_generic_function or declaration.noreturn or function == null) {
+                    _ = try self.fail(.invalid_default_signature, node, declaration.name_span);
+                    return null;
+                }
+                const qualified = self.qualify(owner, id);
+                const signature_id = if (self.probing)
+                    (try TypeResolver.resolveInScopeReadOnly(owner, self.ir, function.?.proto_node, declaration.container, concrete, declaration.function_bindings)) orelse return null
+                else if (try self.globalType(qualified)) |known| known.ty else return null;
+                const signature = self.ir.getType(signature_id).?;
+                if (signature != .function or signature.function.params.len != 0 or signature.function.result != ty) {
+                    _ = try self.fail(.invalid_default_signature, node, declaration.name_span);
+                    return null;
+                }
+                return .{ .factory = .{ .method = qualified, .signature = signature_id } };
+            }
+        }
+        if (nominal == .record and !nominal.record.tagged) {
+            if (self.probing and !try TypeResolver.completeRecordDefaultsReadOnly(self.module, self.ir, ty)) return null;
+            for (self.ir.getType(ty).?.record.fields) |field| {
+                if (field.default == null) {
+                    _ = try self.fail(.no_default_value, node, field.span);
+                    return null;
+                }
+            }
+            return .data;
+        }
+        _ = try self.fail(.no_default_value, node, null);
+        return null;
+    }
+
+    fn defaultExpression(self: *Context, node: Ast.Node.Index, call: Ast.full.Call, expected: ?Known) Error!?Ir.TypeId {
+        if (call.ast.args.len != 1) return self.fail(.argument_count_mismatch, node, null);
+        const ty = (try self.resolveType(call.ast.args[0])) orelse return null;
+        const plan = (try self.defaultPlan(node, ty)) orelse return null;
+        if (try self.fit(ty, expected, node) == null) return null;
+        if (self.emitter) |emitter| {
+            switch (plan) {
+                .factory => |hook| {
+                    const callee = try emitter.append(hook.signature, self.irSpan(node), .{ .function_ref = emitter.functions[@backingInt(hook.method)] orelse return error.InvalidFunctionId });
+                    if (!try self.emitCall(node, ty, .{ .callee = callee, .args = &.{} })) return null;
+                },
+                .data => switch (self.ir.getType(ty).?) {
+                    .array => try emitter.record(node, ty, self.irSpan(node), .{ .array_literal = &.{} }),
+                    .range => |child| {
+                        const integer = self.ir.getType(child).?.integer;
+                        const zero = try emitter.append(child, self.irSpan(node), .{ .constant = try self.ir.internConstant(.{ .ty = child, .value = if (integer.signedness == .signed) .{ .signed_integer = 0 } else .{ .unsigned_integer = 0 } }) });
+                        try emitter.record(node, ty, self.irSpan(node), .{ .range_init = .{ .start = zero, .end = zero, .inclusive = false } });
+                    },
+                    .record => |record| {
+                        const fields = try emitter.allocator.alloc(Ir.ValueId, record.fields.len);
+                        for (record.fields, fields) |field, *value| value.* = try self.materializeDefault(field.default.?, node);
+                        try emitter.record(node, ty, self.irSpan(node), .{ .record_init = fields });
+                    },
+                    else => |scalar| {
+                        const value: Ir.Constant.Value = switch (scalar) {
+                            .boolean => .{ .boolean = false },
+                            .integer => |integer| if (integer.signedness == .signed) .{ .signed_integer = 0 } else .{ .unsigned_integer = 0 },
+                            .float => .{ .float_bits = 0 },
+                            .rune => .{ .rune = 0 },
+                            .string => .{ .string = "" },
+                            else => unreachable,
+                        };
+                        try emitter.record(node, ty, self.irSpan(node), .{ .constant = try self.ir.internConstant(.{ .ty = ty, .value = value }) });
+                    },
+                },
+            }
+        }
+        return ty;
+    }
+
     fn ascribedType(self: *Context, call: Ast.full.Call) Error!?Known {
         if (call.ast.args.len != 2) return null;
         const node = call.ast.args[0];
@@ -3503,6 +3611,12 @@ const Context = struct {
                     const diagnostics_start = self.module.diagnostics.items.len;
                     defer self.module.diagnostics.shrinkRetainingCapacity(diagnostics_start);
                     break :blk try self.ascribedType(call);
+                }
+                if (self.isDefault(call.ast.fn_expr)) {
+                    if (call.ast.args.len != 1) break :blk null;
+                    const diagnostics_start = self.module.diagnostics.items.len;
+                    defer self.module.diagnostics.shrinkRetainingCapacity(diagnostics_start);
+                    break :blk if (try self.resolveType(call.ast.args[0])) |ty| .{ .ty = ty } else null;
                 }
                 if (self.isClear(call.ast.fn_expr)) break :blk .{ .ty = try self.ir.internType(.void) };
                 if (self.isLen(call.ast.fn_expr)) {
@@ -5634,6 +5748,7 @@ const Context = struct {
                 }
                 if (try self.genericTarget(call.ast.fn_expr)) |ref| return self.genericCall(node, call, ref, expected, depth);
                 if (try self.inferredClosureTarget(call.ast.fn_expr)) |ref| return self.inferredClosureCall(node, call, ref, expected, depth);
+                if (self.isDefault(call.ast.fn_expr)) return self.defaultExpression(node, call, expected);
                 if (self.isAscription(call.ast.fn_expr)) {
                     if (call.ast.args.len != 2) return self.fail(.argument_count_mismatch, node, null);
                     const ascribed = (try self.ascribedType(call)) orelse return null;
@@ -5824,6 +5939,353 @@ const Context = struct {
         }
     }
 };
+
+test "default frontend emits approved primitive array range and declared field values" {
+    var module = try Module.init(std.testing.allocator, "default-values.nov",
+        \\let S=struct{n:int=7,items:[]int=[3],}
+        \\let main:()={
+        \\let a=@default(bool)
+        \\let b=@default(i8)
+        \\let c=@default(u64)
+        \\let native=@default(int)
+        \\let unsigned=@default(uint)
+        \\let d=@default(f32)
+        \\let e=@default(f64)
+        \\let f=@default(rune)
+        \\let g=@default(str)
+        \\let h=@default([]()->int)
+        \\let i=@default(..u8)
+        \\let j=@default(S)
+        \\}
+    );
+    defer module.deinit();
+    var result = try Lowering.lower(&module);
+    defer result.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(result.lowering_complete);
+    try result.ir.verify();
+    var scalars: usize = 0;
+    var arrays: usize = 0;
+    var ranges: usize = 0;
+    var records: usize = 0;
+    for (result.ir.functions.items) |function| {
+        const body = function.body orelse continue;
+        for (body.instructions) |instruction| switch (instruction.op) {
+            .constant => |id| {
+                const constant = result.ir.constants.items[@backingInt(id)];
+                switch (constant.value) {
+                    .boolean => |v| {
+                        try std.testing.expect(!v);
+                        scalars += 1;
+                    },
+                    .signed_integer => |v| {
+                        if (v == 0) scalars += 1;
+                    },
+                    .unsigned_integer => |v| {
+                        try std.testing.expectEqual(@as(u64, 0), v);
+                        scalars += 1;
+                    },
+                    .float_bits => |v| {
+                        try std.testing.expectEqual(@as(u64, 0), v);
+                        scalars += 1;
+                    },
+                    .rune => |v| {
+                        try std.testing.expectEqual(@as(u21, 0), v);
+                        scalars += 1;
+                    },
+                    .string => |v| {
+                        try std.testing.expectEqualStrings("", v);
+                        scalars += 1;
+                    },
+                    else => {},
+                }
+            },
+            .array_literal => |values| {
+                if (values.len == 0) arrays += 1;
+            },
+            .range_init => |range| {
+                try std.testing.expect(!range.inclusive);
+                try std.testing.expectEqual(range.start, range.end);
+                const zero = body.instructions[@backingInt(range.start)].op.constant;
+                try std.testing.expectEqual(@as(u64, 0), result.ir.constants.items[@backingInt(zero)].value.unsigned_integer);
+                ranges += 1;
+            },
+            .record_init => |fields| {
+                try std.testing.expectEqual(@as(usize, 2), fields.len);
+                const n = body.instructions[@backingInt(fields[0])].op.constant;
+                try std.testing.expectEqual(@as(i64, 7), result.ir.constants.items[@backingInt(n)].value.signed_integer);
+                records += 1;
+            },
+            .call => return error.UnexpectedDefaultCall,
+            else => {},
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 10), scalars);
+    try std.testing.expectEqual(@as(usize, 1), arrays);
+    try std.testing.expectEqual(@as(usize, 1), ranges);
+    try std.testing.expectEqual(@as(usize, 1), records);
+}
+
+test "default frontend factories override fields and demand bodies only for runtime use" {
+    for ([_]bool{ false, true }) |runtime| {
+        const prefix =
+            \\let mut count=0
+            \\let S=struct{n:int=7,
+            \\@[default]
+            \\let create:()->S={count+=1
+            \\.[n=9]}
+            \\}
+            \\let E=enum{a,b,
+            \\@[default]
+            \\let create:()->E=.b
+            \\}
+            \\let U=union{value:int,empty,
+            \\@[default]
+            \\let create:()->U=.value[4]
+            \\}
+            \\let main:()={
+        ;
+        const source = try std.mem.concat(std.testing.allocator, u8, &.{ prefix, if (runtime)
+            "\nlet s=@default(S)\nlet e=@default(E)\nlet u=@default(U)\n}"
+        else
+            "\nlet s:@TypeOf(@default(S))=S.[]\nlet e:@TypeOf(@default(E))=E.a\nlet u:@TypeOf(@default(U))=.value[0]\n}" });
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "default-demand.nov", source);
+        defer module.deinit();
+        errdefer for (module.diagnostics.items) |diagnostic| {
+            std.debug.print("default demand runtime={any}: {s} at {d}\n", .{ runtime, @tagName(diagnostic.tag), diagnostic.span.start });
+        };
+        var result = try Lowering.lower(&module);
+        defer result.deinit();
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expect(result.lowering_complete);
+        try result.ir.verify();
+        var calls: usize = 0;
+        var factories: usize = 0;
+        var stores: usize = 0;
+        for (result.ir.functions.items) |function| {
+            if (function.body) |body| {
+                if (std.mem.indexOf(u8, function.name, "create") != null) factories += 1;
+                for (body.instructions) |instruction| switch (instruction.op) {
+                    .call => |call| {
+                        try std.testing.expectEqual(@as(usize, 0), call.args.len);
+                        const callee = body.instructions[@backingInt(call.callee)].op.function_ref;
+                        try std.testing.expect(result.ir.functions.items[@backingInt(callee)].body != null);
+                        calls += 1;
+                    },
+                    .local_store => |store| {
+                        if (body.instructions[@backingInt(store.slot)].op == .global_slot) stores += 1;
+                    },
+                    else => {},
+                };
+            }
+        }
+        try std.testing.expectEqual(@as(usize, if (runtime) 3 else 0), calls);
+        try std.testing.expectEqual(@as(usize, if (runtime) 3 else 0), factories);
+        try std.testing.expectEqual(@as(usize, if (runtime) 1 else 0), stores);
+    }
+}
+
+test "default frontend full source TypeOf completes field defaults in either declaration order" {
+    for ([_][]const u8{
+        "let S=struct{n:int=7,}\nlet Holder=struct{value:@TypeOf(@default(S)),}\n",
+        "let Holder=struct{value:@TypeOf(@default(S)),}\nlet S=struct{n:int=7,}\n",
+    }) |prefix| {
+        const source = try std.mem.concat(std.testing.allocator, u8, &.{ prefix, "let main:()={let holder=Holder.[value=@default(S)]\n}" });
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "default-order.nov", source);
+        defer module.deinit();
+        var result = try Lowering.lower(&module);
+        defer result.deinit();
+        try std.testing.expect(!module.hasErrors());
+        try std.testing.expect(result.lowering_complete);
+        try result.ir.verify();
+    }
+}
+
+test "default frontend rejects unavailable defaults and wrong arity in values and queries" {
+    for ([_][]const u8{
+        "@default()",        "@default(int,int)", "@default(void)", "@default(type)",
+        "@default(()->int)", "@default(&int)",    "@default(S)",    "@default(E)",
+        "@default(U)",
+    }) |expression| {
+        for ([_]bool{ false, true }) |query| {
+            const source = try std.fmt.allocPrint(std.testing.allocator, "let S=struct{{n:int,}}\nlet E=enum{{a,}}\nlet U=union{{a:int,}}\nlet main:()={{let value:@TypeOf({s})=0\n}}", .{expression});
+            defer std.testing.allocator.free(source);
+            const direct = try std.mem.concat(std.testing.allocator, u8, &.{ "let S=struct{n:int,}\nlet E=enum{a,}\nlet U=union{a:int,}\nlet main:()={let value=", expression, "\n}" });
+            defer std.testing.allocator.free(direct);
+            var module = try Module.init(std.testing.allocator, "default-invalid.nov", if (query) source else direct);
+            defer module.deinit();
+            errdefer for (module.diagnostics.items) |diagnostic| {
+                std.debug.print("default invalid {s} query={any}: {s}\n", .{ expression, query, @tagName(diagnostic.tag) });
+            };
+            try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
+            var result = Lowering.lower(&module) catch |err| switch (err) {
+                error.InvalidModule => {
+                    try std.testing.expect(module.hasErrors());
+                    continue;
+                },
+                else => return err,
+            };
+            defer result.deinit();
+            try std.testing.expect(module.hasErrors());
+            try std.testing.expect(!result.lowering_complete);
+            var found = false;
+            for (module.diagnostics.items) |diagnostic| {
+                const expected: Module.Diagnostic.Tag = if (std.mem.eql(u8, expression, "@default(type)") or std.mem.eql(u8, expression, "@default(&int)")) .unsupported_type else if (std.mem.startsWith(u8, expression, "@default()") or std.mem.eql(u8, expression, "@default(int,int)")) .argument_count_mismatch else .no_default_value;
+                if (diagnostic.tag == expected) found = true;
+            }
+            try std.testing.expect(found);
+        }
+    }
+}
+
+test "default frontend read only validation preserves original IR and declaration state" {
+    var module = try Module.init(std.testing.allocator, "default-readonly.nov",
+        \\let S=struct{n:int=7,}
+        \\let R=struct{n:int,
+        \\@[default]
+        \\let create:()->R=missing
+        \\}
+        \\let main:()={let s:@TypeOf(@default(S))=S.[]
+        \\let r:@TypeOf(@default(R))=R.[n=1]
+        \\}
+    );
+    defer module.deinit();
+    var result = try Lowering.lower(&module);
+    defer result.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(result.lowering_complete);
+    try result.ir.verify();
+    const node = module.source.ast.declFunction(module.getDeclaration(module.lookup("main").?).?.node).?.body;
+    const declarations = module.declarations.items.len;
+    const types = result.ir.types.items.len;
+    const constants = result.ir.constants.items.len;
+    const functions = result.ir.functions.items.len;
+    var checked: usize = 0;
+    var validation = try QueryValidation.init(&result.ir);
+    defer validation.deinit();
+    for (result.ir.types.items, 0..) |ty, index| {
+        if (ty != .record or ty.record.anonymous != .none) continue;
+        const fields = ty.record.fields;
+        try std.testing.expect(try validation.defaultType(&module, node, @fromBackingInt(@intCast(index))));
+        try std.testing.expectEqualSlices(Ir.Field, fields, result.ir.types.items[index].record.fields);
+        checked += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), checked);
+    try std.testing.expectEqual(declarations, module.declarations.items.len);
+    try std.testing.expectEqual(types, result.ir.types.items.len);
+    try std.testing.expectEqual(constants, result.ir.constants.items.len);
+    try std.testing.expectEqual(functions, result.ir.functions.items.len);
+    try std.testing.expectEqual(@as(usize, 0), validation.ir.functions.items.len);
+    try std.testing.expectEqual(@as(usize, 0), module.diagnostics.items.len);
+    for (result.ir.functions.items) |function| {
+        if (std.mem.indexOf(u8, function.name, "create") != null) try std.testing.expect(function.body == null);
+        const body = function.body orelse continue;
+        for (body.instructions) |instruction| switch (instruction.op) {
+            .call, .capture_cell, .capture_value, .borrow_store => return error.UnexpectedDefaultQueryEffect,
+            else => {},
+        };
+    }
+}
+
+test "default frontend imported factories require public visibility" {
+    for ([_]bool{ false, true }) |public| {
+        var comp = Compilation.init(std.testing.allocator);
+        defer comp.deinit();
+        const root = try comp.addSource("/app/main.nov", "let lib=@import(\"lib.nov\")\nlet main:()={let value=@default(lib.S)\n}");
+        const source = try std.mem.concat(std.testing.allocator, u8, &.{
+            "@[public]\nlet S=struct{n:int=7,\n", if (public) "@[public]\n" else "", "@[default]\nlet create:()->S=.[n=9]\n}",
+        });
+        defer std.testing.allocator.free(source);
+        const library = try comp.addSource("/app/lib.nov", source);
+        const module = comp.getModule(root).?;
+        const local = module.lookup("lib").?;
+        try comp.imports.append(std.testing.allocator, .{ .declaration = comp.declaration_ids.get(.{ .source = root, .local = local }).?, .target = library, .named = false, .span = module.getDeclaration(local).?.name_span });
+        try comp.prepareSemantics();
+        var result = try Lowering.lowerCompilation(&comp);
+        defer result.deinit();
+        try std.testing.expectEqual(!public, comp.hasErrors());
+        try std.testing.expectEqual(public, result.lowering_complete);
+        if (public) {
+            try result.ir.verify();
+            var calls: usize = 0;
+            for (result.ir.functions.items) |function| {
+                const body = function.body orelse continue;
+                for (body.instructions) |instruction| if (instruction.op == .call) {
+                    const callee = body.instructions[@backingInt(instruction.op.call.callee)].op.function_ref;
+                    try std.testing.expect(result.ir.functions.items[@backingInt(callee)].body != null);
+                    calls += 1;
+                };
+            }
+            try std.testing.expectEqual(@as(usize, 1), calls);
+        } else {
+            try std.testing.expectEqual(Module.Diagnostic.Tag.invalid_default_signature, module.diagnostics.items[0].tag);
+        }
+    }
+}
+
+test "default frontend rejects captured owner callbacks in direct defaults and generic take" {
+    const prefix =
+        \\let noop:()={}
+        \\let mut callback:()=noop
+        \\let S=struct{n:int=7,
+        \\@[default]
+        \\let create:()->S={callback()
+        \\.[]}
+        \\}
+        \\let replace:(dst:&mut `T,src:`T)->`T={let old=dst.*
+        \\dst.*=src
+        \\old}
+        \\let take:(dst:&mut `T)->`T=replace(dst,@default(`T))
+        \\let main:()={let mut items=[S.[]]
+        \\callback=(){@clear(items)}
+    ;
+    for ([_][]const u8{
+        "\nlet loan=&items[0]\nlet value=@default(S)\n@println(loan.n)\n}",
+        "\nlet value=take(&items[0])\n}",
+    }) |suffix| {
+        const source = try std.mem.concat(std.testing.allocator, u8, &.{ prefix, suffix });
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "default-captured-owner.nov", source);
+        defer module.deinit();
+        try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
+        var result = try Lowering.lower(&module);
+        defer result.deinit();
+        try std.testing.expect(module.hasErrors());
+        try std.testing.expect(!result.lowering_complete);
+        var conflict = false;
+        for (module.diagnostics.items) |diagnostic| {
+            if (diagnostic.tag == .borrow_conflict) conflict = true;
+        }
+        try std.testing.expect(conflict);
+    }
+}
+
+fn testDefaultFrontendAllocations(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "default-oom.nov",
+        \\let S=struct{n:int=7,}
+        \\let Holder=struct{value:@TypeOf(@default(S)),}
+        \\let R=struct{@[default]
+        \\let create:()->R=.[]
+        \\}
+        \\let main:()={let h=Holder.[value=@default(S)]
+        \\let r=@default(R)
+        \\let a=@default([]int)
+        \\}
+    );
+    defer module.deinit();
+    var result = try Lowering.lower(&module);
+    defer result.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(result.lowering_complete);
+    try result.ir.verify();
+}
+
+test "default frontend cleans up exhaustive focused allocation failures" {
+    try testDefaultFrontendAllocations(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testDefaultFrontendAllocations, .{});
+}
 
 test "field autoderef reads writes nested paths and snapshots" {
     var module = try Module.init(std.testing.allocator, "field-autoderef.nov",

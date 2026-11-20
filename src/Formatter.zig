@@ -33,6 +33,14 @@ pub fn format(allocator: std.mem.Allocator, source: [:0]const u8) ![]u8 {
     if (std.mem.startsWith(u8, source, "\xEF\xBB\xBF") or
         std.mem.startsWith(u8, source, "#!")) return error.UnsupportedSyntax;
     try checkSupported(ast);
+    for (ast.nodes.items(.tag), ast.nodes.items(.data)) |tag, data| {
+        if (tag == .attr_one and std.mem.eql(u8, ast.tokenSlice(data.lhs), "default")) {
+            var module = try Module.init(allocator, "format.nov", source);
+            defer module.deinit();
+            if (module.hasErrors()) return error.UnsupportedSyntax;
+            break;
+        }
+    }
 
     const rendered = try ast.render(allocator);
     errdefer allocator.free(rendered);
@@ -246,11 +254,11 @@ fn checkSupported(ast: Ast) !void {
                     if (data.rhs != 0 and ast.nodes.items(.tag)[data.rhs] != .string_literal) return error.UnsupportedSyntax;
                 } else if (std.mem.eql(u8, name, "operator")) {
                     if (Module.operatorArgument(&ast, data.rhs) == null) return error.UnsupportedSyntax;
-                } else if (data.rhs != 0 or (!std.mem.eql(u8, name, "public") and !std.mem.eql(u8, name, "noreturn") and !std.mem.eql(u8, name, "test") and !std.mem.eql(u8, name, "stringify"))) return error.UnsupportedSyntax;
+                } else if (data.rhs != 0 or (!std.mem.eql(u8, name, "public") and !std.mem.eql(u8, name, "noreturn") and !std.mem.eql(u8, name, "test") and !std.mem.eql(u8, name, "stringify") and !std.mem.eql(u8, name, "default"))) return error.UnsupportedSyntax;
             },
             .builtin_literal => {
                 const name = ast.tokenSlice(main);
-                if (!std.mem.eql(u8, name, "@print") and !std.mem.eql(u8, name, "@println") and !std.mem.eql(u8, name, "@as") and !std.mem.eql(u8, name, "@panic") and !std.mem.eql(u8, name, "@assert") and !std.mem.eql(u8, name, "@This") and !std.mem.eql(u8, name, "@TypeOf") and !std.mem.eql(u8, name, "@len") and !std.mem.eql(u8, name, "@clear") and !std.mem.eql(u8, name, "@stringToBytes") and !std.mem.eql(u8, name, "@stringFromBytes") and !std.mem.eql(u8, name, "@import"))
+                if (!std.mem.eql(u8, name, "@print") and !std.mem.eql(u8, name, "@println") and !std.mem.eql(u8, name, "@as") and !std.mem.eql(u8, name, "@panic") and !std.mem.eql(u8, name, "@assert") and !std.mem.eql(u8, name, "@This") and !std.mem.eql(u8, name, "@TypeOf") and !std.mem.eql(u8, name, "@len") and !std.mem.eql(u8, name, "@clear") and !std.mem.eql(u8, name, "@stringToBytes") and !std.mem.eql(u8, name, "@stringFromBytes") and !std.mem.eql(u8, name, "@import") and !std.mem.eql(u8, name, "@default"))
                     return error.UnsupportedSyntax;
             },
             .@"break" => if (data.lhs != 0) return error.UnsupportedSyntax,
@@ -1081,6 +1089,30 @@ test "operator formatting preserves literal tags qualified syntax comments and O
     }
     for ([_][:0]const u8{ "@[operator]\nlet f:()={}", "@[operator(1)]\nlet f:()={}", "@[operator(.unknown)]\nlet f:()={}", "@[operator(.equal,.add)]\nlet f:()={}" }) |source| {
         try std.testing.expectError(error.UnsupportedSyntax, format(std.testing.allocator, source));
+    }
+}
+
+test "default formatting preserves factories and rejects invalid annotation placement under OOM" {
+    const source = "let Box:(T:type)->type=struct{value:T,\n@[public]\n@[default]\nlet make:()->@This()=unresolved\n}";
+    const formatted = try format(std.testing.allocator, source);
+    defer std.testing.allocator.free(formatted);
+    try std.testing.expect(std.mem.indexOf(u8, formatted, "@[default]") != null);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testMatchFormatAllocationFailures, .{source});
+    for ([_][:0]const u8{
+        "@[default]\nlet make:()->int=0",
+        "let S=struct{\n@[default(1)]\nlet make:()->S=unresolved\n}",
+        "let S=struct{\n@[default]\n@[default]\nlet make:()->S=unresolved\n}",
+        "let S=struct{\n@[default]\nlet first:()->S=unresolved\n@[default]\nlet second:()->S=unresolved\n}",
+        "let S=struct{\n@[default]\n@[stringify]\nlet make:()->S=unresolved\n}",
+        "let S=struct{\n@[default]\nx:int,\n}",
+        "let f:()={\n@[default]\nlet make:()->int=0\n}",
+    }) |invalid| {
+        if (format(std.testing.allocator, invalid)) |result| {
+            std.testing.allocator.free(result);
+            return error.TestUnexpectedResult;
+        } else |err| {
+            try std.testing.expect(err == error.UnsupportedSyntax or err == error.InvalidSource);
+        }
     }
 }
 

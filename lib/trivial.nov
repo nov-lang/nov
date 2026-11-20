@@ -13,6 +13,9 @@ let replace: (dst: &mut `T, src: `T) -> `T = {
 }
 
 @[public]
+let take: (dst: &mut `T) -> `T = replace(dst, @default(`T))
+
+@[public]
 let identity: (x: `T) -> `T = x
 
 @[public]

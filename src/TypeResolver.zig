@@ -689,6 +689,43 @@ pub fn completeRecordReadOnly(module: *Module, ir: *Ir, ty: Ir.TypeId) Error!boo
     return true;
 }
 
+/// Complete readonly field metadata, including declared defaults on ordinary
+/// layouts populated before Sema finalizes defaults. Existing defaults are reused;
+/// constants belong to the output IR and no methods or bodies are published.
+/// As with resolve, callers requiring rollback must discard their output IR.
+pub fn completeRecordDefaultsReadOnly(module: *Module, ir: *Ir, ty: Ir.TypeId) Error!bool {
+    const record = ir.getType(ty).?.record;
+    if (record.anonymous != .none or record.type_args.len != 0 or record.instance_state == .building) return true;
+    if (!try completeRecordReadOnly(module, ir, ty)) return false;
+    if (record.tagged) return true;
+    const owner = if (module.compilation) |comp| comp.getModule(record.source).? else module;
+    const id: Module.DeclId = @fromBackingInt(record.identity);
+    const ast = &owner.source.ast;
+    const declaration = owner.getDeclaration(id).?;
+    for (ast.fullStruct(ast.decl(declaration.node).ast.init_node).?) |member| {
+        if (ast.nodes.items(.tag)[member] != .container_field) continue;
+        const data = ast.nodes.items(.data)[member];
+        if (data.rhs == 0) continue;
+        const token = ast.nodes.items(.main_token)[member];
+        const index = Module.recordFieldIndex(ir.getType(ty).?.record, ast.tokenSlice(token)) orelse continue;
+        const field = ir.getType(ty).?.record.fields[index];
+        if (field.default != null) continue;
+        if (ir.getType(field.ty).? == .record) {
+            _ = try diagnose(owner, data.rhs, .invalid_field_default);
+            return false;
+        }
+        switch (try Literal.checkDefault(owner, ir, data.rhs, field.ty, field.span)) {
+            .constant => |constant| @constCast(ir.types.items[@backingInt(ty)].record.fields)[index].default = constant,
+            .failed => return false,
+            .not_literal => {
+                _ = try diagnose(owner, data.rhs, .invalid_field_default);
+                return false;
+            },
+        }
+    }
+    return true;
+}
+
 pub fn instantiateArgumentsReadOnly(module: *Module, ir: *Ir, id: Module.DeclId, args: []const Ir.TypeId, expansions: usize) Error!?Ir.TypeId {
     return instantiateArgumentsMode(module, ir, id, args, expansions, false);
 }
@@ -789,6 +826,126 @@ fn instantiateArgumentsMode(module: *Module, ir: *Ir, id: Module.DeclId, args: [
 
 fn testTypeNode(module: *const Module, name: []const u8) Ast.Node.Index {
     return module.source.ast.decl(module.getDeclaration(module.lookup(name).?).?.node).ast.type_node;
+}
+
+fn testReadonlyRecordDefaults(allocator: std.mem.Allocator, populated: bool, reversed: bool) !void {
+    const record_source = "let S=struct{required:int,number:u8=7,rows:[][]int=[[1],[]],text:str=\"owned é\",\n@[default]\nlet make:()->S=unresolved_body\n}\n";
+    const holder_source = "let Holder=struct{value:S,}\n";
+    const source = try std.mem.concat(allocator, u8, if (reversed) &.{ holder_source, record_source } else &.{ record_source, holder_source });
+    defer allocator.free(source);
+    var module = try Module.init(allocator, "readonly-defaults.nov", source);
+    defer module.deinit();
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    ir.source_len = @intCast(module.source.ast.source.len);
+    const id = module.lookup("S").?;
+    const declaration = module.getDeclaration(id).?;
+    const ty = (try resolveInScopeReadOnly(&module, &ir, module.source.ast.decl(declaration.node).ast.init_node, null, null, &.{})).?;
+    if (populated) {
+        var fields: std.ArrayList(Ir.Field) = .empty;
+        defer fields.deinit(allocator);
+        const ast = &module.source.ast;
+        for (ast.fullStruct(ast.decl(declaration.node).ast.init_node).?) |member| {
+            if (ast.nodes.items(.tag)[member] != .container_field) continue;
+            const token = ast.nodes.items(.main_token)[member];
+            try fields.append(allocator, .{
+                .name = ast.tokenSlice(token),
+                .ty = (try resolveInScopeReadOnly(&module, &ir, ast.nodes.items(.data)[member].lhs, id, null, &.{})).?,
+                .span = module.tokenSpan(token),
+            });
+        }
+        try ir.setRecordFields(ty, fields.items);
+    }
+    const count = module.declarations.items.len;
+    try std.testing.expect(try completeRecordDefaultsReadOnly(&module, &ir, ty));
+    const fields = ir.getType(ty).?.record.fields;
+    try std.testing.expectEqual(@as(usize, 4), fields.len);
+    try std.testing.expectEqual(null, fields[0].default);
+    try std.testing.expectEqual(@as(u128, 7), ir.getConstant(fields[1].default.?).?.value.unsigned_integer);
+    const rows = ir.getConstant(fields[2].default.?).?.value.array;
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    const row = ir.getConstant(rows[0]).?.value.array;
+    try std.testing.expectEqual(@as(i128, 1), ir.getConstant(row[0]).?.value.signed_integer);
+    try std.testing.expectEqualStrings("owned é", ir.getConstant(fields[3].default.?).?.value.string);
+    const constant_count = ir.constants.items.len;
+    const type_count = ir.types.items.len;
+    try std.testing.expect(try completeRecordDefaultsReadOnly(&module, &ir, ty));
+    try std.testing.expectEqual(fields.ptr, ir.getType(ty).?.record.fields.ptr);
+    try std.testing.expectEqual(constant_count, ir.constants.items.len);
+    try std.testing.expectEqual(type_count, ir.types.items.len);
+    try std.testing.expectEqual(count, module.declarations.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ir.functions.items.len);
+    try std.testing.expect(!ir.getType(ty).?.record.methods_published);
+    try std.testing.expect(!module.hasErrors());
+    try ir.verify();
+}
+
+test "readonly record defaults complete cold and populated layouts in either source order under OOM" {
+    for ([_]bool{ false, true }) |populated| for ([_]bool{ false, true }) |reversed| {
+        try testReadonlyRecordDefaults(std.testing.allocator, populated, reversed);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testReadonlyRecordDefaults, .{ populated, reversed });
+    };
+}
+
+fn testReadonlyDefaultOwner(allocator: std.mem.Allocator) !void {
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    const ty = block: {
+        var comp = Compilation.init(allocator);
+        defer comp.deinit();
+        const root_id = try comp.addSource("readonly-root.nov", "let Root=struct{}");
+        const owner_id = try comp.addSource("readonly-owner.nov", "let S=struct{text:str=\"retained é\",}");
+        comp.setRoot(root_id);
+        try comp.prepareSemantics();
+        const root = comp.getModule(root_id).?;
+        const owner = comp.getModule(owner_id).?;
+        try ir.source_lengths.appendSlice(allocator, &.{ @intCast(root.source.ast.source.len), @intCast(owner.source.ast.source.len) });
+        const id = owner.lookup("S").?;
+        const record = try ir.internType(.{ .record = .{ .source = owner_id, .identity = @backingInt(id), .fields = &.{} } });
+        const string = try ir.internType(.string);
+        const ast = &owner.source.ast;
+        const member = ast.fullStruct(ast.decl(owner.getDeclaration(id).?.node).ast.init_node).?[0];
+        const span = owner.tokenSpan(ast.nodes.items(.main_token)[member]);
+        try ir.setRecordFields(record, &.{.{ .name = "text", .ty = string, .span = span }});
+        try std.testing.expect(try completeRecordDefaultsReadOnly(root, &ir, record));
+        try std.testing.expect(!comp.hasErrors());
+        break :block record;
+    };
+    const field = ir.getType(ty).?.record.fields[0];
+    try std.testing.expectEqualStrings("text", field.name);
+    try std.testing.expectEqualStrings("retained é", ir.getConstant(field.default.?).?.value.string);
+    try ir.verify();
+}
+
+test "readonly record defaults use defining module and retain metadata after source release under OOM" {
+    try testReadonlyDefaultOwner(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testReadonlyDefaultOwner, .{});
+}
+
+test "readonly record defaults preserve building guards and generic defaults without publication" {
+    var module = try Module.init(std.testing.allocator, "readonly-default-guards.nov", "let S=struct{n:int=1,}\nlet Box:(T:type)->type=struct{items:[]T=[],\n@[default]\nlet make:()->@This()=unresolved_body\n}\nlet value:Box(u8)");
+    defer module.deinit();
+    var ir = Ir.init(std.testing.allocator);
+    defer ir.deinit();
+    ir.source_len = @intCast(module.source.ast.source.len);
+    const id = module.lookup("S").?;
+    const ty = try ir.internType(.{ .record = .{ .source = module.source.id, .identity = @backingInt(id), .fields = &.{}, .instance_state = .building } });
+    try std.testing.expect(try completeRecordDefaultsReadOnly(&module, &ir, ty));
+    try std.testing.expectEqual(@as(usize, 0), ir.getType(ty).?.record.fields.len);
+    try std.testing.expect(ir.getType(ty).?.record.instance_state == .building);
+    try std.testing.expectEqual(@as(usize, 0), ir.constants.items.len);
+    const count = module.declarations.items.len;
+    const generic = (try resolveInScopeReadOnly(&module, &ir, testTypeNode(&module, "value"), null, null, &.{})).?;
+    const fields = ir.getType(generic).?.record.fields;
+    try std.testing.expect(fields[0].default != null);
+    const constant_count = ir.constants.items.len;
+    try std.testing.expect(try completeRecordDefaultsReadOnly(&module, &ir, generic));
+    try std.testing.expectEqual(fields.ptr, ir.getType(generic).?.record.fields.ptr);
+    try std.testing.expectEqual(constant_count, ir.constants.items.len);
+    try std.testing.expectEqual(count, module.declarations.items.len);
+    try std.testing.expect(!ir.getType(generic).?.record.methods_published);
+    try std.testing.expectEqual(@as(usize, 0), ir.functions.items.len);
+    try std.testing.expect(!module.hasErrors());
 }
 
 fn testResolve(allocator: std.mem.Allocator, source: []const u8) !void {

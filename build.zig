@@ -147,6 +147,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const range_type_tests = b.step("test-cli-range-types", "Run source range type, printing and standard-library conversion CLI tests");
     addArrayValueHelperCliTests(b, exe, range_type_tests, "range-types.nov", @embedFile("examples/range-types.nov"), "..u8\n0..10\n-10..=20\n1..5\nValues: [1, 2, 3, 4]\n", "PASS range_types_aliases_fields_and_callbacks\nPASS range_printing_and_nested_values\nPASS empty_descending_and_inclusive_ranges\nPASS integer_widths_and_extreme_bounds\nPASS evaluation_snapshots_queries_and_independent_outputs\n5 passed; 0 failed; 5 total\n");
     test_step.dependOn(range_type_tests);
+    const default_tests = b.step("test-cli-defaults", "Run default values, constructors and generic take CLI tests");
+    addDefaultCliTests(b, exe, default_tests);
+    test_step.dependOn(default_tests);
     const trivial_tests = b.step("test-cli-trivial", "Run standard-library trivial helper CLI tests");
     addTrivialCliTests(b, exe, trivial_tests);
     test_step.dependOn(trivial_tests);
@@ -1362,6 +1365,99 @@ fn addClosureCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *s
         run.expectStdOutEqual("");
         run.expectStdErrMatch(case.diagnostic);
         test_step.dependOn(&run.step);
+    }
+}
+
+fn addDefaultCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    addArrayValueHelperCliTests(b, exe, test_step, "defaults.nov", @embedFile("examples/defaults.nov"), "Number: 0\nConfig: Config[ count: 3, names: [Ada] ]\nTaken: [1, 2]\nRemaining: []\nOption: Option(u8).none\n", "PASS scalar_array_and_range_defaults\nPASS declared_defaults_aliases_and_independent_arrays\nPASS custom_constructors_override_and_select_variants\nPASS take_returns_old_values_and_installs_defaults\nPASS take_managed_payloads_preserves_independence\nPASS runtime_factories_and_unevaluated_type_queries\nPASS generic_default_inference_and_reference_places\n7 passed; 0 failed; 7 total\n");
+    const fixtures = b.addWriteFiles();
+    const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
+    _ = fixtures.add("models.nov",
+        \\@[public]
+        \\let Config=struct{n:int=7,items:[]int=[1,2],}
+        \\@[public]
+        \\let Box:(T:type)->type=struct{items:[]T=[],}
+        \\let mut calls:uint=0
+        \\@[public]
+        \\let callCount:()->uint=calls
+        \\@[public]
+        \\let Created=struct{n:int,
+        \\@[public]
+        \\@[default]
+        \\let make:()->Created={calls+=1
+        \\.[n=4]}
+        \\}
+        \\@[public]
+        \\let Secret=struct{n:int=7,
+        \\@[default]
+        \\let make:()->Secret=.[n=9]
+        \\}
+        \\
+    );
+    _ = fixtures.add("imported.nov",
+        \\let std=@import("std")
+        \\let models=@import("models.nov")
+        \\let Alias=models.Config
+        \\let zero=@default(uint)
+        \\let initial=@default(Alias)
+        \\let box=@default(models.Box(uint))
+        \\let main:()={let value:@TypeOf(@default(Alias))=@default(Alias)
+        \\@assert(zero==0 and value.n==7 and initial.items==[1,2] and @len(box.items)==0)
+        \\let mut custom=models.Created.[n=99]
+        \\let old=std.trivial.take(&custom)
+        \\@assert(old.n==99 and custom.n==4 and models.callCount()==1)
+        \\@println("imported defaults")}
+        \\
+    );
+    for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+        const run = b.addRunArtifact(exe);
+        run.setCwd(fixtures.getDirectory());
+        run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+        run.setEnvironmentVariable("NOV_CC", "");
+        run.setEnvironmentVariable("CC", "");
+        run.addArgs(&.{ "run", "imported.nov", "--lib-dir" });
+        run.addDirectoryArg(library);
+        if (mode.len != 0) run.addArg(mode);
+        run.expectExitCode(0);
+        run.expectStdOutEqual("imported defaults\n");
+        run.expectStdErrEqual("");
+        test_step.dependOn(&run.step);
+    }
+    for ([_][]const u8{
+        "let main:()={let value=@default()\n}",
+        "let main:()={let value=@default(int,int)\n}",
+        "let main:()={let value=@default(1)\n}",
+        "let main:()={let value=@default(void)\n}",
+        "let main:()={let value=@default(()->int)\n}",
+        "let main:()={let mut n:u8=0\nlet reference=&n\nlet value=@default(@TypeOf(reference))\n}",
+        "let Required=struct{n:uint,}\nlet main:()={let value=@default(Required)\n}",
+        "let E=enum{first,}\nlet main:()={let value=@default(E)\n}",
+        "let U=union{none,}\nlet main:()={let value=@default(U)\n}",
+        "let std=@import(\"std\")\nlet main:()={let value=@default(std.Result(int,str))\n}",
+        "let models=@import(\"models.nov\")\nlet Alias=models.Secret\nlet main:()={let value=@default(Alias)\n}",
+        "let models=@import(\"models.nov\")\nlet main:()={let value:@TypeOf(@default(models.Secret))=models.Secret.[]\n}",
+        "@[default]\nlet make:()->int=0\nlet main:()={}",
+        "let S=struct{\n@[default(1)]\nlet make:()->S=S.[]\n}\nlet main:()={}",
+        "let S=struct{\n@[default]\nlet make:()->int=0\n}\nlet main:()={}",
+        "let S=struct{\n@[default]\nlet make:(value:S)->S=value\n}\nlet main:()={}",
+        "let S=struct{\n@[default]\nlet first:()->S=S.[]\n@[default]\nlet second:()->S=S.[]\n}\nlet main:()={}",
+        "let models=@import(\"models.nov\")\nlet value=@default(models.Created)\nlet main:()={}",
+        "let std=@import(\"std\")\nlet Required=struct{n:uint,}\nlet main:()={let mut value=Required.[n=7]\nlet old=std.trivial.take(&value)\n}",
+        "let std=@import(\"std\")\nlet noop:()={}\nlet mut callback:()->void=noop\nlet S=struct{n:int=0,\n@[public]\n@[default]\nlet make:()->S={callback()\nS.[n=99]}\n}\nlet main:()={let mut items=[S.[n=7]]\ncallback=(){items=[]}\nlet old=std.trivial.take(&items[0])\n}",
+    }, 0..) |source, i| {
+        const path = b.fmt("bad-default-{d}.nov", .{i});
+        _ = fixtures.add(path, source);
+        for ([_]bool{ false, true }) |emit| {
+            const reject = b.addRunArtifact(exe);
+            reject.setCwd(fixtures.getDirectory());
+            reject.addArgs(if (emit) &.{ "emit-c", path } else &.{ "check", "--semantic", path });
+            reject.addArg("--lib-dir");
+            reject.addDirectoryArg(library);
+            reject.expectExitCode(1);
+            reject.expectStdOutEqual("");
+            reject.expectStdErrMatch("error:");
+            test_step.dependOn(&reject.step);
+        }
     }
 }
 

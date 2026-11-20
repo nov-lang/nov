@@ -146,10 +146,11 @@ fn scanInitializer(self: *Dependencies, module: *Module, id: Module.DeclId, work
             .call, .call_one, .call_comma, .call_one_comma => {
                 const call = ast.fullCall(node).?;
                 if (ast.nodes.items(.tag)[call.ast.fn_expr] == .builtin_literal and
-                    std.mem.eql(u8, ast.tokenSlice(ast.nodes.items(.main_token)[call.ast.fn_expr]), "@as"))
+                    (std.mem.eql(u8, ast.tokenSlice(ast.nodes.items(.main_token)[call.ast.fn_expr]), "@as") or
+                        std.mem.eql(u8, ast.tokenSlice(ast.nodes.items(.main_token)[call.ast.fn_expr]), "@default")))
                 {
                     // The type is resolved by Sema, never read as a runtime value.
-                    // Even malformed ascriptions must not hide eager value reads.
+                    // Even malformed ascriptions/defaults must not hide extra eager value reads.
                     for (call.ast.args[@min(@as(usize, 1), call.ast.args.len)..]) |arg| try work.append(self.allocator, arg);
                 } else if (ast.nodes.items(.tag)[call.ast.fn_expr] == .builtin_literal and
                     std.mem.eql(u8, ast.tokenSlice(ast.firstToken(call.ast.fn_expr)), "@clear"))
@@ -307,6 +308,38 @@ test "global ascriptions skip types but never hide runtime dependencies" {
         try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
     }
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{module.source.ast.source});
+}
+
+test "global defaults skip aliases generic containers and unevaluated type queries" {
+    const source =
+        \\let Alias=int
+        \\let Box:(T:type)->type=struct{value:T,}
+        \\let a=@default(Alias)
+        \\let b=@default(Box(int))
+        \\let c=@default(@TypeOf(missing()))
+        \\let d=@as(@TypeOf(@default(Alias)),a)
+    ;
+    var module = try Module.init(std.testing.allocator, "default-dependencies.nov", source);
+    defer module.deinit();
+    var result = try analyze(&module);
+    defer result.deinit();
+    try std.testing.expect(!module.hasErrors());
+    for ([_][]const u8{ "a", "b", "c" }) |name| {
+        try std.testing.expectEqual(@as(usize, 0), result.getEdges(module.lookup(name).?).?.len);
+    }
+    try std.testing.expectEqual(@as(usize, 1), result.getEdges(module.lookup("d").?).?.len);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
+    for ([_][]const u8{
+        "let a=@default(int,missing)",
+        "let a=@default(int,a)",
+        "let a=@default(int,f())\nlet f:()->int=1",
+    }) |invalid_source| {
+        var invalid = try Module.init(std.testing.allocator, "invalid-default-dependencies.nov", invalid_source);
+        defer invalid.deinit();
+        var rejected = try analyze(&invalid);
+        defer rejected.deinit();
+        try std.testing.expect(invalid.hasErrors());
+    }
 }
 
 test "defaultable integer globals remain values with literal-only dependencies" {

@@ -62,6 +62,27 @@ test "compilation diagnostics render related locations and backend leaves from t
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "library.nov:1:5: error: C backend") != null);
 }
 
+test "default diagnostics render protocol guidance and duplicate locations under OOM" {
+    try testDefaultDiagnostics(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testDefaultDiagnostics, .{});
+}
+
+fn testDefaultDiagnostics(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "defaults.nov", "let first=true\nlet second=false");
+    defer module.deinit();
+    const first = module.getDeclaration(module.lookup("first").?).?.name_span;
+    const second = module.getDeclaration(module.lookup("second").?).?.name_span;
+    for ([_]Module.Diagnostic.Tag{ .no_default_value, .invalid_default_declaration, .invalid_default_signature, .duplicate_default }) |tag| {
+        try module.diagnostics.append(allocator, .{ .tag = tag, .span = second, .related = if (tag == .duplicate_default) first else null });
+    }
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+    renderModule(&module, &out.writer) catch return error.OutOfMemory;
+    for ([_][]const u8{ "specify struct field defaults or an @[default] constructor", "can only be combined with public", "exact signature () -> Owner", "only one @[default] constructor", "defaults.nov:1:5: note:" }) |text| {
+        try std.testing.expect(std.mem.indexOf(u8, out.written(), text) != null);
+    }
+}
+
 test "operator diagnostics render exact tags and related declarations with OOM coverage" {
     try testOperatorDiagnostics(std.testing.allocator);
     try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testOperatorDiagnostics, .{});
@@ -164,6 +185,10 @@ fn renderModuleWithSources(module: *const Module, compilation: ?*const Compilati
             .invalid_field_default => try writer.writeAll("struct field default must be an exactly typed scalar or nested array literal; other aggregate values require explicit initialization"),
             .record_layout_cycle => try writer.writeAll("cyclic by-value struct layout"),
             .record_layout_limit => try writer.writeAll("by-value aggregate nesting exceeds the current limit of 128"),
+            .no_default_value => try writer.writeAll("type has no default value; specify struct field defaults or an @[default] constructor"),
+            .invalid_default_declaration => try writer.writeAll("@[default] takes no arguments and requires an ordinary immutable non-generic function with a body in a nominal struct, union or enum; it cannot be repeated and can only be combined with public"),
+            .invalid_default_signature => try writer.writeAll("@[default] constructor must have exact signature () -> Owner"),
+            .duplicate_default => try writer.writeAll("only one @[default] constructor is allowed per container"),
             .invalid_to_string => try writer.writeAll("@[stringify] method must be accessible with exact signature (SelfType) -> str; imported methods require @[public]"),
             .invalid_stringify_declaration => try writer.writeAll("@[stringify] requires an ordinary immutable container method with a body, takes no arguments, cannot be repeated, and cannot be combined with test, noreturn, extern or export"),
             .duplicate_stringifier => try writer.writeAll("only one @[stringify] method is allowed per container"),
@@ -235,6 +260,7 @@ fn renderModuleWithSources(module: *const Module, compilation: ?*const Compilati
             .borrow_conflict, .borrow_escape => "borrow originates here",
             .duplicate_name => "first declaration here",
             .duplicate_operator => "first overload with these parameter types here",
+            .duplicate_default => "first @[default] constructor here",
             .ambiguous_operator => "other matching overload is here",
             .duplicate_export_name => "first export of this symbol here",
             .conflicting_foreign_signature => "first declaration of this foreign symbol here",

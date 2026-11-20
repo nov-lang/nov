@@ -23,7 +23,7 @@ ordinary library declarations, not compiler builtins or automatically injected
 bare names. String values use the `str` type; the module remains `std.string`.
 
 `std.trivial` provides `swap(&mut T, &mut T)`, `replace(&mut T, T) -> T`,
-`identity(T) -> T`, `constant(T) -> () -> T`, `noop()`, and
+`take(&mut T) -> T`, `identity(T) -> T`, `constant(T) -> () -> T`, `noop()`, and
 `flip((A, B) -> C) -> (B, A) -> C`.
 Types are inferred at each call. Ordinary value-copy rules apply; `constant`
 captures its argument by value, while copied closures share their captured cells.
@@ -33,6 +33,39 @@ Normal recursive value-copy rules apply to both the returned and stored values;
 function copies retain shared captured cells. Arguments evaluate once, destination
 before replacement; an unevaluated `@TypeOf` query neither borrows nor mutates.
 See [`examples/trivial.nov`](../examples/trivial.nov) for usage and twelve tests.
+
+`take(&value)` returns the old value and installs its inferred type's default.
+Its source is the ordinary wrapper ``replace(dst, @default(`T))``: the destination
+evaluates once, then the default source evaluates before `replace` reads the old
+value or stores the replacement. Factory effects happen before replacement, and
+a factory panic never reaches the store. The destination must be mutable and its
+type must support `@default`. This is not a move: recursive array/record copies
+have independent backing; closure copies still share captured cells.
+
+`@default(T)` supplies `false`, numeric zero, NUL rune, empty string, exact empty
+arrays (even if their elements have no default), and empty exclusive integer
+ranges `0..0`. Struct fallback uses existing declared defaults for every field;
+it does not zero or recursively default missing fields. Nominal structs/enums/
+unions may select one argument-free `@[default]` ordinary immutable non-generic
+method with a body and exact `() -> Owner` signature. Generic containers may use
+concrete owner aliases/`@This()`; the method itself must not be generic. The factory
+overrides struct defaults and supplies enum/union defaults. Cross-module calls
+require `@[public]`; inaccessible factories do not fall back. Duplicate factories,
+invalid signatures/placements, annotation arguments and conflicts with test,
+noreturn, extern, export, stringify or operator annotations reject even when
+unused. Factories may allocate, mutate or panic like ordinary calls.
+
+Readonly `@TypeOf(@default(T))` validates without demanding the factory body,
+running effects or publishing specializations. Global initializers support only
+compile-time-known builtin/declared struct data defaults; any reached custom
+factory call (including Option's) must instead run in `main` or a function called
+from it. `void`, functions, references and metatypes have no default; `std.Result`
+has no automatic default. See [Default values](../README.md#default-values) and
+[`examples/defaults.nov`](../examples/defaults.nov), which contains seven tests.
+
+Future direction only: compiler-recognized protocols may be replaced/generalized
+by a Rust-like trait system, including user-defined annotations. No trait syntax
+or implementation is approved; user-defined annotations are not supported now.
 
 ## Equality and operator metadata
 
@@ -204,6 +237,11 @@ with `Option(uint).some[21]`, or use `.some[21]` / `.none[]` under an expected
 Option type. Exhaustive matches use `.some[value] => ...` to bind the payload
 and `.none => ...` for absence.
 
+- `Option(T).empty()` is public, marked `@[default]`, and has exact signature
+  `() -> Self`, returning `.none[]`. `@default(std.Option(T))` therefore returns
+  `none` without requiring a default for `T`, including void/function payloads.
+  This is an explicit ordinary library factory, not automatic union defaulting;
+  `std.Result` has no automatic default.
 - `value.isSome()` / `value.isNone()` report the active variant as a bool, without
   inspecting or unwrapping its payload. `some[false]` is still present; these methods
   work with void and record payloads too.

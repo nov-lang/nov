@@ -60,6 +60,39 @@ results. See `examples/array-fields.nov`.
 
 ## Current delivered status
 
+`@default(T)`, argument-free `@[default]`, and `std.trivial.take` are delivered.
+Builtin defaults are `false`, numeric zero, NUL rune, empty string, exact empty
+arrays (no element-default requirement), and empty exclusive integer ranges
+`0..0`. Struct fallback uses only existing declared field defaults: every field
+must have one, with no zeroing or recursive defaulting of missing fields and no
+expansion of field-default syntax. A nominal struct/enum/union may mark one
+ordinary immutable non-generic method with a body and exact `() -> Owner`
+signature; generic containers and concrete `@This()` owner aliases are allowed.
+The factory overrides struct defaults and supplies enum/union defaults; variants
+are never chosen implicitly. `void`, functions, references and metatypes have no
+default. `std.Result` has no automatic default. `std.Option(T)` supplies public
+`@[default]` `empty: () -> Self = .none[]`, without requiring a default for `T`.
+
+Factory names are arbitrary. Duplicate factories/annotations, annotation arguments,
+invalid placements/signatures and conflicts with test/noreturn/extern/export/
+stringify/operator annotations reject even when unused. Cross-module factory
+calls require `@[public]`; inaccessible selected factories diagnose without
+struct fallback. Factories are ordinary calls and may allocate, mutate or panic.
+Readonly `@TypeOf(@default(T))` validates availability, signature and visibility
+without demanding the body, running effects or publishing specializations.
+Globals may use compile-time-known builtin/declared struct data defaults, but any
+reached custom factory call requires runtime initialization in `main` or a
+function called from it, including Option's factory.
+
+`std.trivial.take(&value)` wraps ``replace(dst, @default(`T))``. It evaluates the
+destination once and the default source before `replace` reads the old value or
+stores the replacement. It returns the old value under ordinary recursive
+value-copy rules, not move semantics: arrays/records retain independent backing,
+while closure copies share captured cells. A factory panic precedes the store.
+`examples/defaults.nov` contains seven tests covering builtin and declared defaults,
+aliases/generic containers, custom factories, Option, managed-copy independence,
+runtime effects, readonly queries, inferred generics and reference places.
+
 Union match payload bindings use `.variant[name] => expression`, replacing the
 removed `=> |name|` form. Bindings remain immutable, prong-local, by-value and
 single-name; omit brackets to ignore a payload and for payloadless variants.
@@ -1331,6 +1364,13 @@ let myStruct = struct {}
   - overloadable functions: `str()` and `len()`, also `next()`...
 
 # proposal: add Traits or something similar
+
+User-approved future direction (proposal only): compiler-recognized protocols may
+be replaced or generalized with a Rust-like trait system for extensibility,
+including **user-defined annotations**. No trait syntax or implementation has been
+approved, and user-defined annotations do not work today. The ideas below remain
+historical proposals, not accepted syntax or current functionality.
+
 Historical proposals considered name-based overloading, such as `.toString()`
 overriding the default format and `.next()` implementing an iterator. These are
 not implemented name-based protocols: current printing requires explicit

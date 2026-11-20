@@ -1717,6 +1717,11 @@ Use `.some[value]` / `.none[]` under an expected Option type, or qualified
 constructors such as `Option(uint).some[21]`. Matches must cover both variants
 or include a catchall; `some` can capture its exact payload type.
 
+`Option(T).empty()` is a public `@[default]` factory with signature `() -> Self`,
+returning `.none[]`. Thus `@default(std.Option(T))` is `none`, even when `T`
+has no default (including `void` or function payloads). This is an ordinary library
+factory, not automatic union defaulting; `std.Result` has no automatic default.
+
 `isSome()` / `isNone()` test the active variant and return bool without unwrapping
 or inspecting the payload, including for `Option(void)` and `some[false]`.
 
@@ -2960,7 +2965,12 @@ Global `void`, reference storage and borrowing globals are not supported: neithe
 
 Source initializers must be **compile-time-known data**. Literals, immutable data
 dependencies, supported constant operations and aggregate constructors can build
-that data. A function value may be stored without calling it; a closure body may
+that data. `@default(T)` may supply builtin data or existing declared struct
+field defaults, but any reached custom factory call rejects, even if its body
+would return constant data. This includes `std.Option`'s `@[default]` factory;
+call it in `main` or a function called from it instead. Unevaluated
+`@TypeOf(@default(T))` validates without calling the factory.
+A function value may be stored without calling it; a closure body may
 read mutable globals when invoked later. Initializers cannot call user/runtime
 functions or read mutable globals, even if those globals have literal initializers.
 This is not arbitrary compile-time execution. Compiler-generated startup code may
@@ -3126,6 +3136,84 @@ constraints rather than defaulting it prematurely. Broader reflection (`@typeInf
 and member enumeration) remains a proposal. See
 [examples/type-of.nov](examples/type-of.nov) and
 [examples/type-of-expressions.nov](examples/type-of-expressions.nov).
+
+## Default values
+
+`@default(T)` constructs a value of exactly the canonical type `T`, using type
+syntax like `@as` (including aliases and concrete generic container types).
+It takes exactly one type argument; it is not a cast or general zero-initializer.
+
+- `bool` defaults to `false`; integers and floats to zero; `rune` to NUL
+  (`'\0'`); `str` to `""`.
+- Arrays default to an empty array of their exact type. The element type need
+  not have a default: `@default([]() -> int)` is valid.
+- Bounded integer ranges default to the empty exclusive range `0..0`.
+- Structs without an explicit factory use their existing declared field defaults,
+  with independent recursive value copies. Every field must have a declared
+  default, even if its type itself supports `@default`; missing fields are not
+  recursively defaulted or zeroed. This does not broaden field-default syntax.
+- Nominal structs, enums and unions may select an explicit `@[default]` factory.
+  It overrides a struct's declared defaults and is required for enum/union
+  defaults; no variant is selected implicitly.
+- `void`, function types, references and metatypes have no default.
+  `std.Result` has no automatic default. `std.Option(T)` explicitly supplies a
+  factory returning `none`, without requiring a default for `T`.
+
+```nov
+let Config = struct {
+    count: uint = 3,
+    names: []str = ["Ada"],
+}
+let Theme = enum {
+    light,
+    dark,
+
+    @[public]
+    @[default]
+    let preferred: () -> Theme = .dark
+}
+let main: () = {
+    let config = @default(Config)
+    @println(config.count, @default(Theme), @default([]int))
+}
+```
+
+`@[default]` is argument-free and marks one ordinary immutable, non-generic
+method with a body on a nominal struct, enum or union. Its name is arbitrary;
+its signature must be exactly `() -> Owner`, with no receiver or other arguments
+and the exact owning nominal return type. Generic containers are supported: a
+method may return `@This()` or an alias to its concrete owner, but the method
+itself must not be generic. Duplicate factories/annotations, invalid placements,
+arguments and invalid concrete signatures reject even when unused. Combining
+`@[default]` with `@[test]`, `@[noreturn]`, `@[extern]`, `@[export]`,
+`@[stringify]` or `@[operator(...)]` rejects; `@[public]` is allowed.
+
+Factories obey ordinary visibility: cross-module calls require `@[public]`.
+An inaccessible selected factory diagnoses instead of falling back to declared
+struct defaults. A factory is an ordinary call and may allocate, mutate or panic;
+`@default` does not imply purity or compile-time execution. Explicit construction
+such as `Config.[]` still uses declared field defaults, not the factory.
+
+Readonly `@TypeOf(@default(T))` validates default availability, signature and
+visibility without executing or demanding the factory body, producing effects,
+or publishing specializations. Global initializers may use builtin data defaults
+and existing declared struct defaults only where they produce compile-time-known
+data. Any custom factory call reached during initializer evaluation rejects,
+including `std.Option`'s factory; perform such initialization in `main` or a
+function called from it. Unevaluated queries do not call factories.
+
+`std.trivial.take(&value)` returns the old value and replaces it with
+`@default` of its inferred type. It is an ordinary library wrapper around
+``replace(dst, @default(`T))``: the destination evaluates once, then the default
+source evaluates before `replace` reads the old value or stores the replacement.
+Factory effects therefore occur before replacement; a factory that panics never
+reaches the replacement store. This is not a move: ordinary recursive value-copy
+semantics preserve independent array/record backing, while copied closures retain
+shared captured cells. The destination must be mutable and its type defaultable.
+
+See [examples/defaults.nov](examples/defaults.nov) for seven tests covering builtin
+and declared defaults, aliases/generic containers, explicit factories, Option,
+independent managed copies, runtime effects, readonly queries and reference places.
 
 ## Primitive Types
 TODO
@@ -3845,6 +3933,7 @@ TODO
 ### Functions
 - `@import(path: str)`: Import a nov file. See [Visibility](#Visibility) for which declarations gets imported.
 - `@len(value) -> uint`: Array element count, string Unicode scalar count, or finite bounded integer range cardinality. Evaluates the operand once; range count overflow panics in every mode (a known global-initializer overflow is a compile error). No record-field protocol or synthetic `.len` property. See [Range](#range).
+- `@default(T) -> T`: Construct the exact type's builtin/declared default or call its explicit nominal `@[default]` factory. Not general zeroing; see [Default values](#default-values) for unsupported types, visibility and global-initializer restrictions.
 - `@TypeOf(expression)`: Implemented unevaluated compile-time query of an expression's canonical type; see [Type Queries](#type-queries). The operand is typechecked, not executed; the result is not a runtime type value.
 - `@stringToBytes(text: str) -> []u8`: Copy exact UTF-8 bytes, including NUL, into an independent mutable array. Allocation failure panics normally.
 - `@stringFromBytes(bytes: []u8) -> str`: Validate and copy into independently owned immutable UTF-8. Invalid UTF-8 panics in debug and release; use `std.string.fromBytes` for recoverable validation errors. Allocation failure panics normally. Neither intrinsic normalizes text or provides general casts/comptime execution.
@@ -3886,6 +3975,7 @@ TODO
 
 ## Attributes
 - `@[deprecated]` - `@[deprecated("message...")]`
+- `@[default]`: select an argument-free nominal factory with exact `() -> Owner` signature; see [Default values](#default-values).
 - `@[operator(.equal)]`: customize nominal value equality with an exact `(T, T) -> bool` method; see [Operator Overloading](#operator-overloading).
 - `@[pure]`: Mainly for extern functions, a [pure function](https://en.wikipedia.org/wiki/Functional_programming#Pure_functions)
              can only call pure functions but impure functions can call a pure function without issue.
@@ -3913,8 +4003,13 @@ Duplicate attributes, arguments, invalid placements and unknown/unsupported
 attributes diagnose. The `extern` and `export` forms described below are supported
 and do not imply `@[public]`. `@[test]` is supported under the separate
 [test-only declaration rules](#testing-nov-code). `@[stringify]` and
-`@[operator(.equal)]` are supported under their method-specific rules. Other
-entries in this list remain design proposals.
+`@[operator(.equal)]` and `@[default]` are supported under their method-specific
+rules. Other entries in this list remain design proposals.
+
+Future direction (proposal only): compiler-recognized protocols may eventually be
+replaced or generalized by a Rust-like trait system for extensibility, including
+user-defined annotations. No trait syntax or implementation has been approved;
+user-defined annotations are not supported today.
 
 ### C function exports
 

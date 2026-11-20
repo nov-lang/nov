@@ -303,6 +303,117 @@ test "global structural equality never invokes nominal hooks" {
     }
 }
 
+fn testDefaultGlobalData(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "global-default-data.nov",
+        \\let Alias=u8
+        \\let R=struct{items:[][]int=[[1]],number:u8=7,}
+        \\let Box:(T:type)->type=struct{items:[]T=[],}
+        \\let byte:Alias=@default(Alias)
+        \\let flag:bool=@default(bool)
+        \\let text:str=@default(str)
+        \\let scalar:f32=@default(f32)
+        \\let items:[][]int=@default([][]int)
+        \\let range:..u8=@default(..u8)
+        \\let record:R=@default(R)
+        \\let second:R=@default(R)
+        \\let copy:R=record
+        \\let box:Box(u8)=@default(Box(u8))
+        \\let queried:@TypeOf(@default(R))=@default(@TypeOf(record))
+        \\let main:()={}
+    );
+    defer module.deinit();
+    try expectParsed(&module);
+    var result = try Lowering.lower(&module);
+    defer result.deinit();
+    if (module.hasErrors()) std.debug.print("global defaults: {any}\n", .{module.diagnostics.items});
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(result.lowering_complete);
+    try result.ir.verify();
+    var records: usize = 0;
+    for (result.ir.globals.items) |global| {
+        const body = result.ir.getFunction(global.initializer).?.body.?;
+        try std.testing.expectEqual(global.ty, body.instructions[@backingInt(body.result)].ty);
+        for (body.instructions) |instruction| {
+            try std.testing.expect(instruction.op != .call);
+            if (instruction.op == .record_init) records += 1;
+        }
+    }
+    try std.testing.expect(records >= 3);
+}
+
+test "global defaults preserve exact data types and managed construction under OOM" {
+    try testDefaultGlobalData(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testDefaultGlobalData, .{});
+}
+
+test "global defaults reject reached custom factories without struct fallback" {
+    for ([_][]const u8{
+        "@default(S)",
+        "@default(S).value==0",
+        "true and @default(S).value==0",
+    }) |expression| {
+        const source = try std.mem.concat(std.testing.allocator, u8, &.{
+            "let S=struct{value:int=0,\n@[default]\nlet make:()->S=S.[value=9]\n}\nlet value=", expression,
+        });
+        defer std.testing.allocator.free(source);
+        var module = try Module.init(std.testing.allocator, "global-default-factory.nov", source);
+        defer module.deinit();
+        try expectParsed(&module);
+        var result = try Lowering.lower(&module);
+        defer result.deinit();
+        try std.testing.expect(module.hasErrors());
+        try std.testing.expectEqual(Module.Diagnostic.Tag.unsupported_global_initializer, module.diagnostics.items[0].tag);
+        try std.testing.expect(!result.lowering_complete);
+    }
+}
+
+test "global default type query does not publish a custom factory" {
+    var module = try Module.init(std.testing.allocator, "global-default-type-only.nov",
+        \\let S=struct{value:int=0,
+        \\@[default]
+        \\let make:()->S=S.[value=9]
+        \\}
+        \\let Alias=@TypeOf(@default(S))
+        \\let value:Alias=S.[value=1]
+        \\let main:()={}
+    );
+    defer module.deinit();
+    try expectParsed(&module);
+    var result = try Lowering.lower(&module);
+    defer result.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(result.lowering_complete);
+    try result.ir.verify();
+    for (result.ir.functions.items) |function| {
+        try std.testing.expect(!std.mem.eql(u8, function.name, "make"));
+        if (function.body) |body| for (body.instructions) |instruction| {
+            try std.testing.expect(instruction.op != .call);
+        };
+    }
+}
+
+test "global defaults skip unreachable factories and do not publish type queries" {
+    var module = try Module.init(std.testing.allocator, "global-default-query.nov",
+        \\let S=struct{value:int=0,
+        \\@[default]
+        \\let make:()->S=S.[value=9]
+        \\}
+        \\let Alias=@TypeOf(@default(S))
+        \\let no=false and @default(S).value==9
+        \\let yes=true or @default(S).value==9
+        \\let value:Alias=S.[value=1]
+        \\let main:()={}
+    );
+    defer module.deinit();
+    try expectParsed(&module);
+    var result = try Lowering.lower(&module);
+    defer result.deinit();
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(result.lowering_complete);
+    try result.ir.verify();
+    for (result.ir.globals.items) |global| try std.testing.expect(!std.mem.eql(u8, global.name, "Alias"));
+}
+
 const Ref = struct { module: *Module, id: Module.DeclId };
 const Task = struct { ref: Ref, finish: bool = false, span: ?Module.Span = null };
 const State = enum { unvisited, visiting, resolved, failed };
@@ -405,8 +516,12 @@ pub fn analyze(root: *Module, sema: *Sema) Sema.Error!void {
                     },
                     .call, .call_one, .call_comma, .call_one_comma => {
                         const call = ast.fullCall(node).?.ast;
-                        const is_len = ast.nodes.items(.tag)[call.fn_expr] == .builtin_literal and std.mem.eql(u8, ast.tokenSlice(ast.firstToken(call.fn_expr)), "@len");
-                        try nodes.appendSlice(sema.allocator, call.args[if (is_len) 0 else @min(@as(usize, 1), call.args.len)..]);
+                        const type_operand = ast.nodes.items(.tag)[call.fn_expr] == .builtin_literal and
+                            (std.mem.eql(u8, ast.tokenSlice(ast.firstToken(call.fn_expr)), "@as") or
+                                std.mem.eql(u8, ast.tokenSlice(ast.firstToken(call.fn_expr)), "@default"));
+                        // Type queries inside this operand are unevaluated, including
+                        // custom default factories. Only eager operands order globals.
+                        try nodes.appendSlice(sema.allocator, call.args[if (type_operand) @min(@as(usize, 1), call.args.len) else 0..]);
                     },
                     .block, .block_two, .block_newline, .block_two_newline => {
                         var buffer: [2]Ast.Node.Index = undefined;
