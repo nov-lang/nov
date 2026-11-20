@@ -10985,6 +10985,56 @@ fn runApprovedHelperHarness(library: []const u8, harness: []const u8, oom: bool)
         try compileAndRunMode(c, "typedef int nonempty_translation_unit;", if (oom) 1 else 0, "", if (oom) "panic: GC allocation failed\n" else "", mode);
 }
 
+test "trivial replace actual stdlib source free independent backing forced GC O0 O3 and runtime OOM" {
+    const library = try emitApprovedHelperSourceFree(test_gpa,
+        \\let std=@import("std")
+        \\let make:()->[][]int=[[1],[2]]
+        \\let scalar:()->uint={let mut value:uint=7
+        \\let old=std.trivial.replace(&value,9)
+        \\@assert(old==7 and value==9)
+        \\old}
+        \\let replaceRows:(current:[][]int,replacement:[][]int)->[][][]int={let mut value=current
+        \\let old=std.trivial.replace(&value,replacement)
+        \\[old,value]}
+    );
+    defer test_gpa.free(library);
+    try runApprovedHelperHarness(library,
+        \\int main(void) {
+        \\    nov_rt_heap.collect_every_allocation = 1;
+        \\    nov_array input = {0}, replacement = {0}, result = {0};
+        \\    void **roots[] = {&input.data, &replacement.data, &result.data};
+        \\    nov_gc_roots frame = {0}; nov_gc_push(&nov_rt_heap, &frame, roots, 3);
+        \\    input = nov_make(); replacement = nov_make();
+        \\    result = nov_replaceRows(input, replacement);
+        \\    if (result.len != 2) return 1;
+        \\    nov_array *pair = result.data;
+        \\    nov_array *old = pair[0].data, *current = pair[1].data;
+        \\    nov_array *source = input.data, *next = replacement.data;
+        \\    if (old == current || old == source || current == next) return 2;
+        \\    if (old[0].data == current[0].data || old[0].data == source[0].data || current[0].data == next[0].data) return 3;
+        \\    ((intptr_t *)old[0].data)[0] = 8; ((intptr_t *)current[1].data)[0] = 9;
+        \\    if (((intptr_t *)source[0].data)[0] != 1 || ((intptr_t *)next[1].data)[0] != 2) return 4;
+        \\    input = (nov_array){0}; replacement = (nov_array){0}; nov_gc_collect(&nov_rt_heap);
+        \\    pair = result.data; old = pair[0].data; current = pair[1].data;
+        \\    if (((intptr_t *)old[0].data)[0] != 8 || ((intptr_t *)current[1].data)[0] != 9) return 5;
+        \\    fail_allocations = 1;
+        \\    if (nov_scalar() != 7) return 6;
+        \\    nov_gc_pop(&nov_rt_heap, &frame); nov_gc_collect(&nov_rt_heap);
+        \\    if (nov_rt_heap.frames || nov_rt_heap.live_objects) return 7;
+        \\    nov_gc_shutdown(&nov_rt_heap); return 0;
+        \\}
+    , false);
+    try runApprovedHelperHarness(library,
+        \\int main(void) {
+        \\    nov_array input = {0}, replacement = {0};
+        \\    void **roots[] = {&input.data, &replacement.data};
+        \\    nov_gc_roots frame = {0}; nov_gc_push(&nov_rt_heap, &frame, roots, 2);
+        \\    input = nov_make(); replacement = nov_make(); fail_allocations = 1;
+        \\    (void)nov_replaceRows(input, replacement); return 0;
+        \\}
+    , true);
+}
+
 test "array flatMap actual stdlib source free recursive copies forced GC O0 O3 and runtime OOM" {
     const library = try emitApprovedHelperSourceFree(test_gpa,
         \\let std=@import("std")

@@ -148,7 +148,7 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     addArrayValueHelperCliTests(b, exe, range_type_tests, "range-types.nov", @embedFile("examples/range-types.nov"), "..u8\n0..10\n-10..=20\n1..5\nValues: [1, 2, 3, 4]\n", "PASS range_types_aliases_fields_and_callbacks\nPASS range_printing_and_nested_values\nPASS empty_descending_and_inclusive_ranges\nPASS integer_widths_and_extreme_bounds\nPASS evaluation_snapshots_queries_and_independent_outputs\n5 passed; 0 failed; 5 total\n");
     test_step.dependOn(range_type_tests);
     const trivial_tests = b.step("test-cli-trivial", "Run standard-library trivial helper CLI tests");
-    addArrayValueHelperCliTests(b, exe, trivial_tests, "trivial.nov", @embedFile("examples/trivial.nov"), "Swapped: 2 1\nIdentity: 2\nConstant: 2\nFlipped: 7\n", "PASS swap_scalars\nPASS swap_aggregates_preserves_independence\nPASS identity_values_and_copies\nPASS constant_snapshots_and_shared_closures\nPASS flip_types_argument_order_and_shared_state\nPASS noop_and_unevaluated_queries\n6 passed; 0 failed; 6 total\n");
+    addTrivialCliTests(b, exe, trivial_tests);
     test_step.dependOn(trivial_tests);
     const mixed_operator_tests = b.step("test-cli-mixed-operators", "Run exact mixed-signature operator overload CLI tests");
     addMixedOperatorCliTests(b, exe, mixed_operator_tests);
@@ -1362,6 +1362,34 @@ fn addClosureCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *s
         run.expectStdOutEqual("");
         run.expectStdErrMatch(case.diagnostic);
         test_step.dependOn(&run.step);
+    }
+}
+
+fn addTrivialCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    addArrayValueHelperCliTests(b, exe, test_step, "trivial.nov", @embedFile("examples/trivial.nov"), "Swapped: 2 1\nIdentity: 2\nConstant: 2\nFlipped: 7\nReplaced: 2 7\n", "PASS swap_scalars\nPASS swap_aggregates_preserves_independence\nPASS identity_values_and_copies\nPASS constant_snapshots_and_shared_closures\nPASS flip_types_argument_order_and_shared_state\nPASS replace_scalars_preserves_exact_types\nPASS replace_nested_arrays_preserves_independent_storage\nPASS replace_records_and_union_payloads\nPASS replace_functions_share_cells_and_ranges_copy_bounds\nPASS replace_destinations_and_argument_order\nPASS replace_queries_do_not_mutate_or_evaluate_arguments\nPASS noop_and_unevaluated_queries\n12 passed; 0 failed; 12 total\n");
+    const fixtures = b.addWriteFiles();
+    const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
+    for ([_][]const u8{
+        "let n:uint=1\nlet old=std.trivial.replace(&n,2)",
+        "let mut n:u8=1\nlet replacement:u16=2\nlet old=std.trivial.replace(&n,replacement)",
+        "let mut n:uint=1\nlet old=std.trivial.replace(n,2)",
+        "let mut n:uint=1\nlet old=std.trivial.replace(&n)",
+        "let n:uint=1\nlet query:@TypeOf(std.trivial.replace(&n,2))=0",
+        "let mut items=[1]\nlet change=()->[]int{items=[9]\n[2]}\nlet old=std.trivial.replace(&items,change())",
+    }, 0..) |body, i| {
+        const path = b.fmt("bad-trivial-replace-{d}.nov", .{i});
+        _ = fixtures.add(path, b.fmt("let std=@import(\"std\")\nlet main:()={{\n{s}\n}}\n", .{body}));
+        for ([_]bool{ false, true }) |emit| {
+            const reject = b.addRunArtifact(exe);
+            reject.setCwd(fixtures.getDirectory());
+            reject.addArgs(if (emit) &.{ "emit-c", path } else &.{ "check", "--semantic", path });
+            reject.addArg("--lib-dir");
+            reject.addDirectoryArg(library);
+            reject.expectExitCode(1);
+            reject.expectStdOutEqual("");
+            reject.expectStdErrMatch("error:");
+            test_step.dependOn(&reject.step);
+        }
     }
 }
 

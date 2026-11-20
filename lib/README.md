@@ -22,11 +22,17 @@ and the `builtin` namespace from
 ordinary library declarations, not compiler builtins or automatically injected
 bare names. String values use the `str` type; the module remains `std.string`.
 
-`std.trivial` provides `swap(&mut T, &mut T)`, `identity(T) -> T`,
-`constant(T) -> () -> T`, `noop()`, and `flip((A, B) -> C) -> (B, A) -> C`.
+`std.trivial` provides `swap(&mut T, &mut T)`, `replace(&mut T, T) -> T`,
+`identity(T) -> T`, `constant(T) -> () -> T`, `noop()`, and
+`flip((A, B) -> C) -> (B, A) -> C`.
 Types are inferred at each call. Ordinary value-copy rules apply; `constant`
 captures its argument by value, while copied closures share their captured cells.
-See [`examples/trivial.nov`](../examples/trivial.nov) for usage and tests.
+`replace(&value, replacement)` installs the replacement and returns the old value.
+The destination must be mutable and the replacement must match its type exactly.
+Normal recursive value-copy rules apply to both the returned and stored values;
+function copies retain shared captured cells. Arguments evaluate once, destination
+before replacement; an unevaluated `@TypeOf` query neither borrows nor mutates.
+See [`examples/trivial.nov`](../examples/trivial.nov) for usage and twelve tests.
 
 ## Equality and operator metadata
 

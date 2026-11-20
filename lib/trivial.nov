@@ -6,6 +6,13 @@ let swap: (a: &mut `T, b: &mut `T) = {
 }
 
 @[public]
+let replace: (dst: &mut `T, src: `T) -> `T = {
+    let result = dst.*
+    dst.* = src
+    result
+}
+
+@[public]
 let identity: (x: `T) -> `T = x
 
 @[public]
