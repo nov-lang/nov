@@ -82,9 +82,36 @@ with a matching tag. Private visibility is honored; imported hooks require
 back. `!=` negates equality; it has no separate hook. Enum match patterns always
 use raw identity, bypassing hooks. `std.builtin.Operator` exposes exactly `equal`,
 `less_than`, `add`, `sub`, `mul`, `div`, `rem`, `try`, `deref`, `deref_mut`, `index`,
-`index_mut`, `neg`, `bit_and`, `bit_or`, `bit_xor`, `shl`, `shr`; all except `equal`
-are reserved/unimplemented and diagnose unsupported operator overloads. Ordering,
-arithmetic, indexing and compound-assignment overloads remain deferred.
+`index_mut`, `neg`, `bit_and`, `bit_or`, `bit_xor`, `shl`, `shr`.
+
+Operator overloading is in progress beyond equality. Implemented:
+- `less_than(T, T) -> bool`;
+- `add`, `sub`, `mul`, `div`, `rem`, `bit_and`, `bit_or`, `bit_xor`: `(T, T) -> T`;
+- `neg(T) -> T`.
+
+These hooks follow the same ordinary immutable non-generic method-with-body,
+arbitrary-name, canonical-tag and public-visibility rules. `T` is the exact
+owning nominal struct/union/enum; concrete hooks on generic containers may use
+`@This()`. No reference arguments or general mixed operand/result types are
+supported. Invalid concrete signatures reject even when unused.
+
+Only `less_than` is required: `a > b` is `less_than(b, a)`, `a <= b` is
+`!less_than(b, a)`, and `a >= b` is `!less_than(a, b)`; no independent tags exist.
+This boolean-negation derivation is not floating-point partial-order semantics.
+Hook authors are responsible for their order; there is no default structural
+ordering. `+=`, `-=`, `*=`, `/=` and `%=` derive from the corresponding binary
+hooks. Operands evaluate once, left to right; compound assignment preserves the
+pre-RHS LHS value and target snapshots like builtins, and may overwrite an RHS
+reassignment. Hooks are ordinary calls that may allocate, mutate or panic.
+Readonly `@TypeOf` validates without running hooks or publishing specializations.
+Existing equality and membership behavior is unchanged.
+
+`shl`, `shr`, `try`, `deref`, `deref_mut`, `index` and `index_mut` remain reserved
+and unsupported as overloads; no shifts are implemented.
+`examples/operators.nov` has seven tests covering a scalar `Number`, generic
+containers, compound targets, evaluation/snapshots, and enum/union hooks.
+`test-cli-operators` checks all three C modes, relocated stdlib imports and
+semantic/emit-C rejection cases.
 
 `nov test --filter <text>` selects case-sensitive name substrings before semantic
 checking, in source order. Unselected semantic demands are ignored; syntax/attribute
@@ -1027,7 +1054,8 @@ remains deferred; aliases do not add casts or alter the integer fallback rules.
 Next step: add new IR that
 - forward declaration
 - resolve literals
-- additional operator overloads beyond the delivered explicit equality hook
+- remaining operator overloads beyond the implemented equality, ordering,
+  arithmetic, bitwise and negation subset
 - have more usage safety than Ast
 - start storing values in a constant pool
 
@@ -1171,10 +1199,9 @@ implemented; grapheme operations remain deferred.
 - add Timer for parsing_time, cod, 2 modes debug & release (ReleaseSafe)egen_time, runnning_time (or use tracy)
 - implement correct leaking allocation to have fast exit time?
 - add `let _ =` or `_ =` to discard the return value of an expression, it's mandatory to not ignore the returned value if it's != void
-- extend operator overloading beyond delivered `@[operator(.equal)]`:
-  - compilation error when trying to use an operator for values of different types
-  - compilation error when trying to use an operator that is not defined for the said value
-  - `+` binary op is syntaxic sugar for Object.add, or iadd/fadd for int/float
+- extend operator overloading beyond the implemented subset (see Current delivered status):
+  - exact operand types and defined hooks are required by the implemented subset
+  - nominal `+` dispatches to the explicit `@[operator(.add)]` hook, not a method name
   - How to handle string * int?
     - use String.repeat() (how to make it comptime?)
   - Accepted numeric rule (implemented, not a proposal): typed operands must
@@ -1769,15 +1796,17 @@ pub fn main() !void {
 
 # Operator Overloading
 
-Equality hooks and derived `!=` are implemented; see Current delivered status
-and README's Value equality / Operator Overloading sections. All other
-`std.builtin.Operator` tags are reserved/unimplemented. The following are future
-design notes, not executable overloads:
+Equality and derived `!=` remain unchanged. The in-progress implementation also
+supports `less_than` (with derived `>`, `<=`, `>=`), arithmetic/bitwise hooks,
+`neg`, and derived arithmetic compound assignment; see Current delivered status
+and README's Value equality / Operator Overloading sections for exact contracts.
+`shl`, `shr`, `try`, `deref`, `deref_mut`, `index` and `index_mut` remain reserved
+and unsupported; no shifts are implemented. The following are future design
+notes, not executable overloads:
 - `>>=`: `(*T, (*T) -> U) -> U`
 - `[]`: `(*T, int) -> U`
   - probably too complex since we should be able to overload it twice with `U` and `*mut U`
 - `.?`: unwrap...
-- for unary negation `-`, autogen it from `-` operator and `zero` decl?
 
 # C FFI
 

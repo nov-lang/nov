@@ -1,0 +1,238 @@
+let std = @import("std")
+
+let Number = struct {
+    value: int,
+
+    @[operator(.add)]
+    let add: (a: Number, b: Number) -> Number = .[ value = a.value + b.value ]
+    @[operator(.sub)]
+    let sub: (a: Number, b: Number) -> Number = .[ value = a.value - b.value ]
+    @[operator(.mul)]
+    let mul: (a: Number, b: Number) -> Number = .[ value = a.value * b.value ]
+    @[operator(.div)]
+    let div: (a: Number, b: Number) -> Number = .[ value = a.value / b.value ]
+    @[operator(.rem)]
+    let rem: (a: Number, b: Number) -> Number = .[ value = a.value % b.value ]
+    @[operator(.neg)]
+    let neg: (a: Number) -> Number = .[ value = -a.value ]
+    @[operator(.bit_and)]
+    let bitAnd: (a: Number, b: Number) -> Number = .[ value = a.value & b.value ]
+    @[operator(.bit_or)]
+    let bitOr: (a: Number, b: Number) -> Number = .[ value = a.value | b.value ]
+    @[operator(.bit_xor)]
+    let bitXor: (a: Number, b: Number) -> Number = .[ value = a.value ^ b.value ]
+    @[operator(.less_than)]
+    let lessThan: (a: Number, b: Number) -> bool = a.value < b.value
+}
+
+let main: () = {
+    let a = Number.[ value = 12 ]
+    let b = Number.[ value = 5 ]
+    let added = a + b
+    let negative = -b
+    @println("Sum:", added.value)
+    @println("Negative:", negative.value)
+    @println("Ordering:", a > b, a <= b)
+    let mut total = a
+    total += b
+    @println("Compound:", total.value)
+}
+
+@[test]
+let arithmetic_negation_and_bitwise: () = {
+    let a = Number.[ value = 12 ]
+    let b = Number.[ value = 5 ]
+    @assert(a + b == Number.[ value = 17 ] and a - b == Number.[ value = 7 ])
+    @assert(a * b == Number.[ value = 60 ] and a / b == Number.[ value = 2 ])
+    @assert(a % b == Number.[ value = 2 ] and -b == Number.[ value = -5 ])
+    @assert(
+        {
+            a & b
+        } == Number.[ value = 4 ] and {
+            a | b
+        } == Number.[ value = 13 ]
+    )
+    @assert(
+        {
+            a ^ b
+        } == Number.[ value = 9 ]
+    )
+    @assert(a.value == 12 and b.value == 5)
+}
+
+@[test]
+let derived_ordering_and_sort: () = {
+    let a = Number.[ value = 1 ]
+    let b = Number.[ value = 2 ]
+    @assert(a < b and b > a and a <= b and b >= a)
+    @assert(
+        a <= a and a >= a and {
+            a < a
+        } == false
+    )
+    @assert(
+        {
+            a > b
+        } == false and {
+            b <= a
+        } == false and {
+            a >= b
+        } == false
+    )
+    let sorted = std.array.sort(
+        [b, a],
+        (left, right) {
+            left < right
+        }
+    )
+    @assert(sorted == [a, b])
+}
+
+let Holder = struct {
+    number: Number,
+}
+
+@[test]
+let compound_local_field_element_and_reference_targets: () = {
+    let two = Number.[ value = 2 ]
+    let mut value = Number.[ value = 12 ]
+    value += two
+    value -= two
+    value *= two
+    value /= two
+    value %= Number.[ value = 5 ]
+    @assert(value.value == 2)
+    let mut holder = Holder.[ number = Number.[ value = 3 ] ]
+    holder.number += two
+    @assert(holder.number.value == 5)
+    let mut items = [Number.[ value = 4 ]]
+    items[0] *= two
+    @assert(items[0].value == 8)
+    let reference = &value
+    reference.* += two
+    @assert(value.value == 4)
+}
+
+let Bag = struct {
+    values: []int,
+
+    @[operator(.add)]
+    let add: (a: Bag, b: Bag) -> Bag = .[ values = a.values + b.values ]
+}
+
+@[test]
+let snapshots_and_compound_rhs_replacement: () = {
+    let mut left = Bag.[ values = [1] ]
+    let result = left + {
+        left.values[0] = 9
+        Bag.[ values = [2] ]
+    }
+    @assert(result.values == [1, 2] and left.values == [9])
+    left += {
+        left = Bag.[ values = [99] ]
+        Bag.[ values = [3] ]
+    }
+    @assert(left.values == [9, 3])
+    let mut items = [Number.[ value = 4 ]]
+    let mut calls = 0
+    let index = () -> int {
+        calls += 1
+        0
+    }
+    items[index()] += {
+        items = [Number.[ value = 99 ]]
+        Number.[ value = 2 ]
+    }
+    @assert(items[0].value == 6 and calls == 1)
+}
+
+let Box: (T: type) -> type = struct {
+    value: T,
+
+    @[operator(.add)]
+    let add: (a: @This(), b: @This()) -> @This() = .[ value = a.value + b.value ]
+}
+let sum: (a: `T, b: `T) -> `T = a + b
+
+@[test]
+let generic_hooks_inferred_callbacks_and_queries: () = {
+    let first = Box([]int).[ value = [1] ]
+    let second = Box([]int).[ value = [2] ]
+    @assert(sum(first, second).value == [1, 2])
+    let numbers = [Number.[ value = 1 ], Number.[ value = 2 ]]
+    let doubled = std.array.map(
+        numbers,
+        (x) {
+            x + x
+        }
+    )
+    @assert(doubled[0].value == 2 and doubled[1].value == 4)
+    let mut calls = 0
+    let make = () -> Number {
+        calls += 1
+        Number.[ value = calls ]
+    }
+    let query: @TypeOf(make() + make()) = Number.[ value = 0 ]
+    @assert(query.value == 0 and calls == 0)
+    @assert(sum(make(), make()).value == 3 and calls == 2)
+}
+
+let Rank = enum {
+    low,
+    high,
+
+    let weight: (self: Rank) -> int = match self {
+        .low => 0
+        .high => 1
+    }
+    @[operator(.less_than)]
+    let less: (a: Rank, b: Rank) -> bool = a.weight() < b.weight()
+    @[operator(.add)]
+    let add: (a: Rank, b: Rank) -> Rank = b
+    @[operator(.neg)]
+    let neg: (a: Rank) -> Rank = .low
+}
+let Amount = union {
+    value: int,
+    none,
+
+    let number: (self: Amount) -> int = match self {
+        .value => |value| value
+        .none => 0
+    }
+    @[operator(.add)]
+    let add: (a: Amount, b: Amount) -> Amount = .value[a.number() + b.number()]
+    @[operator(.neg)]
+    let neg: (a: Amount) -> Amount = .value[-a.number()]
+}
+
+@[test]
+let enum_union_and_contextual_literals: () = {
+    @assert(Rank.low < Rank.high and Rank.high >= Rank.low)
+    let rank: Rank = .low + .high
+    let negative: Rank = -.high
+    @assert(rank == Rank.high and negative == Rank.low)
+    let query: @TypeOf(@as(Rank, .low + .high)) = .high
+    @assert(query == rank)
+    let amount: Amount = .none[] + .value[3]
+    let negated: Amount = -.value[4]
+    @assert(amount == Amount.value[3] and negated == Amount.value[-4])
+}
+
+@[test]
+let operand_evaluation_precedes_reversed_ordering: () = {
+    let mut seen: []int = []
+    let make = (value: int) -> Number {
+        seen += [value]
+        Number.[ value ]
+    }
+    @assert(make(2) > make(1))
+    @assert(seen == [2, 1])
+    seen = []
+    @assert(
+        {
+            make(2) <= make(1)
+        } == false
+    )
+    @assert(seen == [2, 1])
+}

@@ -78,7 +78,7 @@ fn testOperatorDiagnostics(allocator: std.mem.Allocator) !void {
     var out = std.Io.Writer.Allocating.init(allocator);
     defer out.deinit();
     renderModule(&module, &out.writer) catch return error.OutOfMemory;
-    for ([_][]const u8{ "@[operator(Operator)]", "only one overload per operator", "(SelfType, SelfType) -> bool", "unsupported operator overload", "operators.nov:1:5: note:" }) |text| {
+    for ([_][]const u8{ "@[operator(Operator)]", "only one overload per operator", "(SelfType, SelfType) -> bool", "neg (SelfType) -> SelfType", "unsupported operator overload; shl/shr (shifts)", "supported tags: equal, less_than, add, sub, mul, div, rem, bit_and, bit_or, bit_xor, neg", "operators.nov:1:5: note:" }) |text| {
         try std.testing.expect(std.mem.indexOf(u8, out.written(), text) != null);
     }
 }
@@ -169,8 +169,8 @@ fn renderModuleWithSources(module: *const Module, compilation: ?*const Compilati
             .duplicate_stringifier => try writer.writeAll("only one @[stringify] method is allowed per container"),
             .invalid_operator_declaration => try writer.writeAll("@[operator(Operator)] requires one literal std.builtin.Operator tag and an ordinary immutable non-generic container method with a body; cannot be repeated or combined with test, noreturn, extern or export"),
             .duplicate_operator => try writer.writeAll("only one overload per operator is allowed per nominal container"),
-            .invalid_operator_signature => try writer.writeAll("@[operator(.equal)] method must be accessible with exact signature (SelfType, SelfType) -> bool; imported methods require @[public]"),
-            .unsupported_operator => try writer.writeAll("unsupported operator overload; only equal is supported"),
+            .invalid_operator_signature => try writer.writeAll("@[operator] method must be accessible with exact signature: equal/less_than (SelfType, SelfType) -> bool; add/sub/mul/div/rem/bit_and/bit_or/bit_xor (SelfType, SelfType) -> SelfType; neg (SelfType) -> SelfType; imported methods require @[public]"),
+            .unsupported_operator => try writer.writeAll("unsupported operator overload; shl/shr (shifts), try, deref/deref_mut and index/index_mut are deferred; supported tags: equal, less_than, add, sub, mul, div, rem, bit_and, bit_or, bit_xor, neg"),
             .duplicate_name => try writer.print("duplicate declaration '{s}'", .{source.slice(diagnostic.span).?}),
             .unknown_name => try writer.print("unknown name '{s}'", .{source.slice(diagnostic.span).?}),
             .unsupported_declaration => try writer.writeAll("unsupported declaration; containers currently allow only function methods"),

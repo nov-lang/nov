@@ -147,6 +147,9 @@ fn addCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Buil
     const trivial_tests = b.step("test-cli-trivial", "Run standard-library trivial helper CLI tests");
     addArrayValueHelperCliTests(b, exe, trivial_tests, "trivial.nov", @embedFile("examples/trivial.nov"), "Swapped: 2 1\nIdentity: 2\nConstant: 2\nFlipped: 7\n", "PASS swap_scalars\nPASS swap_aggregates_preserves_independence\nPASS identity_values_and_copies\nPASS constant_snapshots_and_shared_closures\nPASS flip_types_argument_order_and_shared_state\nPASS noop_and_unevaluated_queries\n6 passed; 0 failed; 6 total\n");
     test_step.dependOn(trivial_tests);
+    const operator_tests = b.step("test-cli-operators", "Run nominal operator overload CLI tests");
+    addOperatorCliTests(b, exe, operator_tests);
+    test_step.dependOn(operator_tests);
     const equality_tests = b.step("test-cli-equality", "Run structural equality and operator override CLI tests");
     addEqualityCliTests(b, exe, equality_tests);
     test_step.dependOn(equality_tests);
@@ -1356,6 +1359,77 @@ fn addClosureCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *s
     }
 }
 
+fn addOperatorCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
+    addArrayValueHelperCliTests(b, exe, test_step, "operators.nov", @embedFile("examples/operators.nov"), "Sum: 17\nNegative: -5\nOrdering: true false\nCompound: 17\n", "PASS arithmetic_negation_and_bitwise\nPASS derived_ordering_and_sort\nPASS compound_local_field_element_and_reference_targets\nPASS snapshots_and_compound_rhs_replacement\nPASS generic_hooks_inferred_callbacks_and_queries\nPASS enum_union_and_contextual_literals\nPASS operand_evaluation_precedes_reversed_ordering\n7 passed; 0 failed; 7 total\n");
+    const fixtures = b.addWriteFiles();
+    const library = fixtures.addCopyDirectory(b.path("lib"), "lib", .{});
+    _ = fixtures.add("models.nov",
+        \\let std=@import("std")
+        \\@[public]
+        \\let Value=struct{n:int,
+        \\@[public]
+        \\@[operator(std.builtin.Operator.add)]
+        \\let plus:(a:Value,b:Value)->Value=.[n=a.n+b.n]
+        \\@[public]
+        \\@[operator(.less_than)]
+        \\let less:(a:Value,b:Value)->bool=a.n<b.n
+        \\@[operator(.neg)]
+        \\let neg:(a:Value)->Value=.[n= -a.n]
+        \\}
+        \\
+    );
+    _ = fixtures.add("imported.nov",
+        \\let models=@import("models.nov")
+        \\let Alias=models.Value
+        \\let add:(a:`T,b:`T)->`T=a+b
+        \\let main:()={let a=Alias.[n=1]
+        \\let b=Alias.[n=2]
+        \\let sum=add(a,b)
+        \\@assert(sum.n==3 and a<b and b>=a)
+        \\@println("imported operators")}
+        \\
+    );
+    for ([_][]const u8{ "", "--debug", "--release" }) |mode| {
+        const run = b.addRunArtifact(exe);
+        run.setCwd(fixtures.getDirectory());
+        run.setEnvironmentVariable("PATH", std.fs.path.dirname(b.graph.zig_exe).?);
+        run.setEnvironmentVariable("NOV_CC", "");
+        run.setEnvironmentVariable("CC", "");
+        run.addArgs(&.{ "run", "imported.nov", "--lib-dir" });
+        run.addDirectoryArg(library);
+        if (mode.len != 0) run.addArg(mode);
+        run.expectExitCode(0);
+        run.expectStdOutEqual("imported operators\n");
+        run.expectStdErrEqual("");
+        test_step.dependOn(&run.step);
+    }
+    for ([_][]const u8{
+        "let S=struct{\n@[operator(.add)]\nlet bad:(a:S)->S=a\n}\nlet main:()={}",
+        "let S=struct{\n@[operator(.neg)]\nlet bad:(a:S,b:S)->S=a\n}\nlet main:()={}",
+        "let S=struct{\n@[operator(.less_than)]\nlet bad:(a:S,b:S)->S=a\n}\nlet main:()={}",
+        "let S=struct{\n@[operator(.mul)]\nlet bad:(a:S,b:S)->int=1\n}\nlet main:()={}",
+        "let S=struct{}\nlet main:()={let x=S.[]+S.[]\n}",
+        "let models=@import(\"models.nov\")\nlet main:()={let x= -models.Value.[n=1]\n}",
+        "let models=@import(\"models.nov\")\nlet global=models.Value.[n=1]+models.Value.[n=2]\nlet main:()={}",
+        "let A=struct{\n@[operator(.add)]\nlet plus:(a:A,b:A)->A=a\n}\nlet B=struct{}\nlet main:()={let x=A.[]+B.[]\n}",
+        "let S=struct{f:()->bool,\n@[operator(.add)]\nlet plus:(a:S,b:S)->S=if a.f(){a}else{b}\n}\nlet main:()={let mut xs=[1,2]\nlet change=()->bool{xs=[9]\ntrue}\nlet a=S.[f=change]\nloop &x in xs{let z=a+a\n@println(x.*)}}",
+    }, 0..) |source, i| {
+        const path = b.fmt("bad-operator-{d}.nov", .{i});
+        _ = fixtures.add(path, source);
+        for ([_]bool{ false, true }) |emit| {
+            const reject = b.addRunArtifact(exe);
+            reject.setCwd(fixtures.getDirectory());
+            reject.addArgs(if (emit) &.{ "emit-c", path } else &.{ "check", "--semantic", path });
+            reject.addArg("--lib-dir");
+            reject.addDirectoryArg(library);
+            reject.expectExitCode(1);
+            reject.expectStdOutEqual("");
+            reject.expectStdErrMatch("error:");
+            test_step.dependOn(&reject.step);
+        }
+    }
+}
+
 fn addEqualityCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *std.Build.Step) void {
     addArrayValueHelperCliTests(b, exe, test_step, "equality.nov", @embedFile("examples/equality.nov"), "Arrays: true\nSame user: true\nMembership: true\n", "PASS arrays_nested_values_and_membership\nPASS records_unions_enums_and_anonymous_values\nPASS overrides_apply_recursively_and_inequality_negates\nPASS enum_and_union_overrides\nPASS ieee_float_equality\nPASS hook_order_shortcircuit_snapshots_and_queries\n6 passed; 0 failed; 6 total\n");
     const fixtures = b.addWriteFiles();
@@ -1418,7 +1492,7 @@ fn addEqualityCliTests(b: *std.Build, exe: *std.Build.Step.Compile, test_step: *
         "let S=struct{n:int,\n@[operator(.equal)]\nlet bad:(a:S,b:S)->int=1\n}\nlet main:()=@println(S.[n=1]==S.[n=1])",
         "let S=struct{n:int,\n@[operator(.equal)]\nlet bad:(a:S)->int=1\n}\nlet main:()={}",
         "let Fake=enum{equal,}\nlet S=struct{\n@[operator(Fake.equal)]\nlet bad:(a:S,b:S)->bool=true\n}\nlet main:()={}",
-        "let S=struct{\n@[operator(.add)]\nlet bad:(a:S,b:S)->S=S.[]\n}\nlet main:()={}",
+        "let S=struct{\n@[operator(.index)]\nlet bad:(a:S,b:S)->S=S.[]\n}\nlet main:()={}",
         "let models=@import(\"models.nov\")\nlet main:()=@println(models.Secret.[id=1]==models.Secret.[id=1])",
         "let S=struct{f:()->bool,\n@[operator(.equal)]\nlet same:(a:S,b:S)->bool=a.f()\n}\nlet main:()={let mut xs=[1,2]\nlet change=()->bool{xs=[9]\ntrue}\nlet a=S.[f=change]\nloop &x in xs{@assert(a==a)\n@println(x.*)}}",
     }, 0..) |source, i| {

@@ -53,9 +53,32 @@ Enum match patterns always use raw tag identity, not the hook.
 to the canonical enum exposed by `std.builtin`; another enum with an `equal` tag
 is not interchangeable. `Operator` declares exactly `equal`, `less_than`, `add`,
 `sub`, `mul`, `div`, `rem`, `try`, `deref`, `deref_mut`, `index`, `index_mut`, `neg`,
-`bit_and`, `bit_or`, `bit_xor`, `shl`, `shr`. Only `equal` is implemented; other
-tags are reserved and diagnose unsupported operator overloads. There is no
-separate inequality hook or delivered arithmetic/ordering/indexing overload.
+`bit_and`, `bit_or`, `bit_xor`, `shl`, `shr`.
+
+Overloading is in progress beyond equality: implemented hooks are
+`less_than(T, T) -> bool`, `add`/`sub`/`mul`/`div`/`rem` and
+`bit_and`/`bit_or`/`bit_xor` with `(T, T) -> T`, and `neg(T) -> T`.
+These use the same ordinary immutable non-generic methods with bodies, arbitrary
+names, canonical tags and public visibility rules as equality. `T` must be the
+exact enclosing nominal struct/union/enum, including concrete generic arguments;
+`@This()` is allowed. Reference arguments and general mixed operand/result types
+are not supported. Invalid concrete signatures reject even when unused.
+
+Only `less_than` is needed: `a > b` uses `less_than(b, a)`, `a <= b` uses
+`!less_than(b, a)`, and `a >= b` uses `!less_than(a, b)`, with no independent tags.
+This is boolean-negation derivation, not floating-point partial-order semantics;
+hook authors define the order, and there is no default structural ordering.
+`+=`, `-=`, `*=`, `/=` and `%=` derive from the binary hooks and preserve pre-RHS
+LHS/target snapshots like builtins; their final store may overwrite RHS
+reassignment. Operands evaluate once, left to right. Hooks are ordinary calls
+that may allocate, mutate or panic; readonly `@TypeOf` validates without running
+hooks or publishing specializations. Equality and membership are unchanged.
+
+`shl`, `shr`, `try`, `deref`, `deref_mut`, `index` and `index_mut` remain reserved
+and diagnose unsupported overloads; no shifts are implemented. There is no
+separate inequality hook. See [`examples/operators.nov`](../examples/operators.nov)
+for seven tests covering a scalar `Number`, generics, compound targets,
+evaluation/snapshots, and enum/union hooks.
 See [Value equality](../README.md#value-equality) and
 [Operator Overloading](../README.md#operator-overloading) for the full contract.
 

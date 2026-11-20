@@ -213,7 +213,8 @@ fn validateOperatorSignatures(self: *Sema, module: *Module) Error!void {
     var i: usize = 0;
     while (i < module.declarations.items.len) : (i += 1) {
         const declaration = module.declarations.items[i];
-        if (declaration.operator != .equal) continue;
+        const operator = declaration.operator orelse continue;
+        const arity = operator.arity() orelse continue;
         const owner = declaration.container orelse continue;
         if (module.getDeclaration(owner).?.is_generic and declaration.concrete_type == null) continue;
         try self.syncEntries(module);
@@ -230,7 +231,14 @@ fn validateOperatorSignatures(self: *Sema, module: *Module) Error!void {
         else
             self.entries[self.entryIndex(module, owner)].alias_type orelse continue;
         const signature = self.ir.getType(ty).?;
-        if (declaration.is_generic_function or declaration.noreturn or signature != .function or signature.function.params.len != 2 or signature.function.params[0] != receiver or signature.function.params[1] != receiver or self.ir.getType(signature.function.result).? != .boolean) {
+        const valid_signature = signature == .function and signature.function.params.len == arity and blk: {
+            for (signature.function.params) |param| if (param != receiver) break :blk false;
+            break :blk if (operator.returnsBool())
+                self.ir.getType(signature.function.result).? == .boolean
+            else
+                signature.function.result == receiver;
+        };
+        if (declaration.is_generic_function or declaration.noreturn or !valid_signature) {
             try module.diagnostics.append(module.allocator, .{ .tag = .invalid_operator_signature, .span = declaration.name_span });
             self.entries[index].status = .failed;
             continue;
@@ -256,24 +264,33 @@ fn testUnusedOperatorSignature(allocator: std.mem.Allocator, source: []const u8,
     try std.testing.expectEqual(@as(usize, 0), sema.ir.equality.items.len);
 }
 
-test "unused operator signatures require exact nominal operands and bool under OOM" {
-    for ([_][]const u8{ "struct{n:int,", "union{none,", "enum{one," }) |container| {
-        for ([_]struct { signature: []const u8, valid: bool }{
-            .{ .signature = "(a:S,b:S)->bool", .valid = true },
-            .{ .signature = "(a:Alias,b:Alias)->Flag", .valid = true },
-            .{ .signature = "(a:@This(),b:@This())->bool", .valid = true },
-            .{ .signature = "()->bool", .valid = false },
-            .{ .signature = "(a:S)->bool", .valid = false },
-            .{ .signature = "(a:S,b:S,c:S)->bool", .valid = false },
-            .{ .signature = "(a:&S,b:&S)->bool", .valid = false },
-            .{ .signature = "(a:Other,b:S)->bool", .valid = false },
-            .{ .signature = "(a:S,b:Other)->bool", .valid = false },
-            .{ .signature = "(a:S,b:S)->int", .valid = false },
-        }) |case| {
-            const source = try std.mem.concat(std.testing.allocator, u8, &.{ "let Other=struct{}\nlet Alias=S\nlet Flag=bool\nlet S=", container, "\n@[operator(.equal)]\nlet equal:", case.signature, "=unresolved_body\n}" });
-            defer std.testing.allocator.free(source);
-            try testUnusedOperatorSignature(std.testing.allocator, source, case.valid);
-            try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testUnusedOperatorSignature, .{ source, case.valid });
+test "unused operator signatures require exact nominal operands and results under OOM" {
+    for (std.meta.tags(Module.Operator)) |operator| {
+        if (!operator.isSupported()) continue;
+        for ([_][]const u8{ "struct{n:int,", "union{none,", "enum{one," }) |container| {
+            const unary = operator == .neg;
+            const params = if (unary) "a:S" else "a:S,b:S";
+            const result = if (operator.returnsBool()) "bool" else "S";
+            for ([_]struct { params: []const u8, result: []const u8, valid: bool = false }{
+                .{ .params = params, .result = result, .valid = true },
+                .{ .params = if (unary) "a:Alias" else "a:Alias,b:Alias", .result = "Flag", .valid = true },
+                .{ .params = if (unary) "a:@This()" else "a:@This(),b:@This()", .result = if (operator.returnsBool()) "bool" else "@This()", .valid = true },
+                .{ .params = "", .result = result },
+                .{ .params = if (unary) "a:S,b:S" else "a:S", .result = result },
+                .{ .params = "a:S,b:S,c:S", .result = result },
+                .{ .params = if (unary) "a:&S" else "a:&S,b:&S", .result = result },
+                .{ .params = if (unary) "a:Other" else "a:Other,b:S", .result = result },
+                .{ .params = if (unary) "a:Other" else "a:S,b:Other", .result = result },
+                .{ .params = params, .result = "int" },
+                .{ .params = params, .result = "Other" },
+
+                .{ .params = params, .result = if (operator.returnsBool()) "S" else "bool" },
+            }) |case| {
+                const source = try std.fmt.allocPrint(std.testing.allocator, "let Other=struct{{}}\nlet Alias=S\nlet Flag={s}\nlet S={s}\n@[operator(.{s})]\nlet equal:({s})->{s}=unresolved_body\n}}", .{ result, container, @tagName(operator), case.params, case.result });
+                defer std.testing.allocator.free(source);
+                try testUnusedOperatorSignature(std.testing.allocator, source, case.valid);
+                try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testUnusedOperatorSignature, .{ source, case.valid });
+            }
         }
     }
 }
@@ -305,11 +322,38 @@ test "unused operator signatures defer templates but validate concrete hooks wit
     }
 }
 
+test "unused nominal operator signatures defer templates and validate instantiated hooks under OOM" {
+    for (std.meta.tags(Module.Operator)) |operator| {
+        if (!operator.isSupported()) continue;
+        for ([_]bool{ false, true }) |instantiate| {
+            for ([_]bool{ false, true }) |valid| {
+                const params = if (operator == .neg) "a:@This()" else "a:@This(),b:@This()";
+                const result = if (!valid) "int" else if (operator.returnsBool()) "bool" else "@This()";
+                const source = try std.fmt.allocPrint(std.testing.allocator, "let Box:(T:type)->type=struct{{value:T,\n@[operator(.{s})]\nlet hook:({s})->{s}=unresolved_body\n}}\nlet main:()={{{s}}}", .{ @tagName(operator), params, result, if (instantiate) "let b=Box(int).[value=1]\n" else "" });
+                defer std.testing.allocator.free(source);
+                const expected_valid = !instantiate or valid;
+                try testConcreteOperatorSignature(std.testing.allocator, source, expected_valid);
+                try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testConcreteOperatorSignature, .{ source, expected_valid });
+            }
+        }
+    }
+}
+
 test "unused operator signatures validate defining owners across compilation modules" {
-    var comp = Compilation.init(std.testing.allocator);
+    for (std.meta.tags(Module.Operator)) |operator| {
+        if (!operator.isSupported()) continue;
+        const source = try std.fmt.allocPrint(std.testing.allocator, "let S=enum{{one,\n@[operator(.{s})]\nlet equal:({s})->int=1\n}}", .{ @tagName(operator), if (operator == .neg) "a:S" else "a:S,b:S" });
+        defer std.testing.allocator.free(source);
+        try testOperatorSignatureOwner(std.testing.allocator, source);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testOperatorSignatureOwner, .{source});
+    }
+}
+
+fn testOperatorSignatureOwner(allocator: std.mem.Allocator, source: []const u8) !void {
+    var comp = Compilation.init(allocator);
     defer comp.deinit();
     const root = try comp.addSource("/operator-root.nov", "let Root=struct{}\nlet main:()={}");
-    const owner = try comp.addSource("/operator-model.nov", "let S=enum{one,\n@[operator(.equal)]\nlet equal:(a:S,b:S)->int=1\n}");
+    const owner = try comp.addSource("/operator-model.nov", source);
     comp.setRoot(root);
     var sema = try analyzeCompilation(&comp);
     defer sema.deinit();

@@ -1719,6 +1719,184 @@ test "clear query rejects invalid places types and arity" {
     }
 }
 
+const OperatorQueryResult = enum { nominal, boolean, unit, integer, float, string, invalid };
+
+fn testNominalOperatorQuery(allocator: std.mem.Allocator, source: [:0]const u8, expected: OperatorQueryResult) !void {
+    var module = try Module.init(allocator, "nominal-operator-query.nov", source);
+    defer module.deinit();
+    var ir = Ir.init(allocator);
+    defer ir.deinit();
+    ir.source_len = @intCast(source.len);
+    if (module.source.ast.errors.len != 0) std.debug.print("invalid operator query source: {s}\n", .{source});
+    try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
+    const declarations = module.declarations.items.len;
+    defer std.debug.assert(module.declarations.items.len == declarations);
+    defer std.debug.assert(ir.functions.items.len == 0);
+    defer std.debug.assert(ir.local_generic_instances.items.len == 0);
+    const decl = module.getDeclaration(module.lookup("query").?).?;
+    const node = module.source.ast.decl(decl.node).ast.init_node;
+    const result = try queryExpression(&module, &ir, node, &.{}, &.{}, &.{});
+    if (expected == .invalid) {
+        try std.testing.expect(result == null);
+        try std.testing.expect(module.hasErrors());
+        return;
+    }
+    if (module.hasErrors()) std.debug.print("operator query diagnostics: {any}\nsource: {s}\n", .{ module.diagnostics.items, source });
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(result != null);
+    const ty = ir.getType(result.?).?;
+    try std.testing.expect(switch (expected) {
+        .nominal => ty == .record or ty == .enumeration,
+        .boolean => ty == .boolean,
+        .unit => ty == .void,
+        .integer => ty == .integer,
+        .float => ty == .float,
+        .string => ty == .string,
+        .invalid => unreachable,
+    });
+}
+
+test "nominal operator solver readonly hooks and compound assignments under OOM" {
+    for ([_]struct { hook: []const u8, expression: []const u8, result: OperatorQueryResult = .nominal }{
+        .{ .hook = "add", .expression = "x+x" },
+        .{ .hook = "sub", .expression = "x-x" },
+        .{ .hook = "mul", .expression = "x*x" },
+        .{ .hook = "div", .expression = "x/x" },
+        .{ .hook = "rem", .expression = "x%x" },
+        .{ .hook = "bit_and", .expression = "x & x" },
+        .{ .hook = "bit_or", .expression = "x | x" },
+        .{ .hook = "bit_xor", .expression = "x ^ x" },
+        .{ .hook = "neg", .expression = "let result=-x\nresult" },
+        .{ .hook = "less_than", .expression = "x<x", .result = .boolean },
+        .{ .hook = "less_than", .expression = "x>x", .result = .boolean },
+        .{ .hook = "less_than", .expression = "x<=x", .result = .boolean },
+        .{ .hook = "less_than", .expression = "x>=x", .result = .boolean },
+        .{ .hook = "add", .expression = "x+=x", .result = .unit },
+        .{ .hook = "sub", .expression = "x-=x", .result = .unit },
+        .{ .hook = "mul", .expression = "x*=x", .result = .unit },
+        .{ .hook = "div", .expression = "x/=x", .result = .unit },
+        .{ .hook = "rem", .expression = "x%=x", .result = .unit },
+    }) |case| {
+        const source = try std.fmt.allocPrintSentinel(std.testing.allocator, "let Box:(T:type)->type=struct{{value:T,\n@[operator(.{s})]\nlet hook:(a:@This(){s})->{s}=unresolved_body\n}}\nlet query={{let mut x=Box(int).[value=1]\n{s}}}", .{ case.hook, if (std.mem.eql(u8, case.hook, "neg")) "" else ",b:@This()", if (case.result == .boolean) "bool" else "@This()", case.expression }, 0);
+        defer std.testing.allocator.free(source);
+        try testNominalOperatorQuery(std.testing.allocator, source, case.result);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testNominalOperatorQuery, .{ source, case.result });
+    }
+}
+
+test "nominal operator solver exact signatures unsupported protocols and scalar constraints under OOM" {
+    for ([_]struct { source: [:0]const u8, result: OperatorQueryResult = .invalid }{
+        .{ .source = "let S=struct{x:int,}\nlet query=S.[x=1]+S.[x=2]" },
+        .{ .source = "let S=struct{x:int,\n@[operator(.add)]\nlet hook:(a:&S,b:&S)->S=unresolved\n}\nlet query=S.[x=1]+S.[x=2]" },
+        .{ .source = "let S=struct{x:int,\n@[operator(.add)]\nlet hook:(a:S,b:S)->int=unresolved\n}\nlet query=S.[x=1]+S.[x=2]" },
+        .{ .source = "let S=struct{x:int,\n@[operator(.less_than)]\nlet hook:(a:S,b:S)->S=unresolved\n}\nlet query=S.[x=1]<S.[x=2]" },
+        .{ .source = "let S=struct{x:int,\n@[operator(.neg)]\nlet hook:(a:S,b:S)->S=unresolved\n}\nlet query=-S.[x=1]" },
+        .{ .source = "let Other=enum{add,}\nlet S=struct{x:int,\n@[operator(Other.add)]\nlet hook:(a:S,b:S)->S=unresolved\n}\nlet query=S.[x=1]+S.[x=2]" },
+        .{ .source = "let S=struct{x:int,\n@[operator(.bit_xor)]\nlet hook:(a:S,b:S)->S=unresolved\n}\nlet query=~S.[x=1]" },
+        .{ .source = "let A=struct{x:int,}\nlet B=struct{x:int,}\nlet query=A.[x=1]+B.[x=2]" },
+        .{ .source = "let query=true+false" },
+        .{ .source = "let query=1.0%2.0" },
+        .{ .source = "let query=1.0 & 2.0" },
+        .{ .source = "let query=\"a\" < \"b\"" },
+        .{ .source = "let query=1+2", .result = .integer },
+        .{ .source = "let query=1.0/2.0", .result = .float },
+        .{ .source = "let query=\"a\"+\"b\"", .result = .string },
+    }) |case| {
+        try testNominalOperatorQuery(std.testing.allocator, case.source, case.result);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testNominalOperatorQuery, .{ case.source, case.result });
+    }
+}
+
+test "nominal operator solver readonly TypeOf contextual operands and closure queries under OOM" {
+    for ([_]struct { source: [:0]const u8, result: OperatorQueryResult }{
+        .{ .source = "let E=enum{one,two,\n@[operator(.add)]\nlet hook:(a:E,b:E)->E=unresolved\n}\nlet query=.one+E.two", .result = .nominal },
+        .{ .source = "let E=enum{one,two,\n@[operator(.less_than)]\nlet hook:(a:E,b:E)->bool=unresolved\n}\nlet query=E.one>=.two", .result = .boolean },
+        .{ .source = "let U=union{none,some:int,\n@[operator(.add)]\nlet hook:(a:U,b:U)->U=unresolved\n}\nlet query=U.some[1]+.none", .result = .nominal },
+        .{ .source = "let Box:(T:type)->type=struct{value:T,\n@[operator(.add)]\nlet hook:(a:@This(),b:@This())->@This()=unresolved\n}\nlet query={let x=Box(int).[value=1]\nlet f=(a:Box(int)){a+a}\nf(x)}", .result = .nominal },
+        .{ .source = "let Box:(T:type)->type=struct{value:T,\n@[operator(.add)]\nlet hook:(a:@This(),b:@This())->@This()=unresolved\n}\nlet apply:(f:(`T)->`U,x:`T)->`U=unresolved\nlet query=apply((a){a+a},Box(int).[value=1])", .result = .nominal },
+        .{ .source = "let S=struct{x:int,\n@[operator(.add)]\nlet hook:(a:S,b:S)->S=unresolved\n}\nlet query=@as(@TypeOf(S.[x=1]+S.[x=2]),S.[x=3])", .result = .nominal },
+        .{ .source = "let S=struct{x:int,\n@[operator(.add)]\nlet hook:(a:S,b:S)->int=unresolved\n}\nlet query={let x=S.[x=1]\nlet f=(a:S){a+a}\nf(x)}", .result = .invalid },
+        .{ .source = "let Box:(T:type)->type=struct{value:T,\n@[operator(.add)]\nlet hook:(a:@This(),b:@This())->@This()=unresolved\n}\nlet query=Box(int).[value=1]+Box(bool).[value=true]", .result = .invalid },
+    }) |case| {
+        try testNominalOperatorQuery(std.testing.allocator, case.source, case.result);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testNominalOperatorQuery, .{ case.source, case.result });
+    }
+}
+
+test "nominal operator solver expected results contextualize shorthand operands under OOM" {
+    const payload_source = "let U=union{none,some:int,\n@[operator(.add)]\nlet hook:(a:U,b:U)->U=unresolved\n}\nlet query=@as(@TypeOf(@as(U,.some[1]+.none)),.some[2])";
+    try testNominalOperatorQuery(std.testing.allocator, payload_source, .nominal);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testNominalOperatorQuery, .{ payload_source, OperatorQueryResult.nominal });
+    for ([_]struct { hook: []const u8, expression: []const u8 }{
+        .{ .hook = "add", .expression = ".one+.two" },
+        .{ .hook = "sub", .expression = ".one-.two" },
+        .{ .hook = "mul", .expression = ".one*.two" },
+        .{ .hook = "div", .expression = ".one/.two" },
+        .{ .hook = "rem", .expression = ".one%.two" },
+        .{ .hook = "bit_and", .expression = ".one & .two" },
+        .{ .hook = "bit_or", .expression = ".one | .two" },
+        .{ .hook = "bit_xor", .expression = ".one ^ .two" },
+        .{ .hook = "neg", .expression = "-.one" },
+        .{ .hook = "add", .expression = ".one+.two+.one" },
+    }) |case| {
+        for ([_][]const u8{ "enum{one,two,", "union{one,two," }) |container| {
+            const source = try std.fmt.allocPrintSentinel(std.testing.allocator, "let E={s}\n@[operator(.{s})]\nlet hook:(a:E{s})->E=unresolved\n}}\nlet query=@as(@TypeOf(@as(E,{s})),.one)", .{ container, case.hook, if (std.mem.eql(u8, case.hook, "neg")) "" else ",b:E", case.expression }, 0);
+            defer std.testing.allocator.free(source);
+            try testNominalOperatorQuery(std.testing.allocator, source, .nominal);
+            try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testNominalOperatorQuery, .{ source, OperatorQueryResult.nominal });
+        }
+    }
+    for ([_][:0]const u8{
+        "let E=enum{one,two,\n@[operator(.add)]\nlet hook:(a:E,b:E)->E=unresolved\n}\nlet Other=enum{one,two,\n@[operator(.add)]\nlet hook:(a:Other,b:Other)->Other=unresolved\n}\nlet query=@as(E,Other.one+.two)",
+        "let E=enum{one,two,\n@[operator(.neg)]\nlet hook:(a:E)->E=unresolved\n}\nlet Other=enum{one,two,\n@[operator(.neg)]\nlet hook:(a:Other)->Other=unresolved\n}\nlet query=@as(E,-Other.one)",
+        "let E=enum{one,two,\n@[operator(.add)]\nlet hook:(a:E,b:E)->E=unresolved\n}\nlet query=@as(E,.one+.missing)",
+        "let E=enum{one,two,\n@[operator(.less_than)]\nlet hook:(a:E,b:E)->bool=unresolved\n}\nlet query=@as(E,.one<.two)",
+        "let E=enum{one,two,}\nlet query=@as(E,~.one)",
+    }) |source| {
+        try testNominalOperatorQuery(std.testing.allocator, source, .invalid);
+        try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testNominalOperatorQuery, .{ source, OperatorQueryResult.invalid });
+    }
+}
+
+fn testNominalOperatorInference(allocator: std.mem.Allocator) !void {
+    var module = try Module.init(allocator, "nominal-operator-inference.nov",
+        \\let Box:(T:type)->type=struct{value:T,
+        \\@[operator(.add)]
+        \\let add:(a:@This(),b:@This())->@This()=a
+        \\@[operator(.neg)]
+        \\let neg:(a:@This())->@This()=a
+        \\@[operator(.less_than)]
+        \\let less:(a:@This(),b:@This())->bool=false
+        \\}
+        \\let sum:(a:`T,b:`T)->`T=a+b
+        \\let negative:(a:`T)->`T= -a
+        \\let ordered:(a:`T,b:`T)->bool=a>=b
+        \\let apply:(f:(`T)->`U,x:`T)->`U=f(x)
+        \\let main:()->bool={let mut x=Box(int).[value=1]
+        \\let y=sum(x,x)
+        \\let z=negative(y)
+        \\let inferred=(a:Box(int)){a+a}
+        \\let contextual:(Box(int))->Box(int)=(a){-a}
+        \\let q=apply((a){a+a},x)
+        \\let t:@TypeOf(apply((a){a>=a},x))=true
+        \\let n:@TypeOf(sum(x,x))=x
+        \\x+=inferred(contextual(q))
+        \\ordered(z,n) and t}
+    );
+    defer module.deinit();
+    var result = try Lowering.lower(&module);
+    defer result.deinit();
+    if (module.hasErrors()) std.debug.print("nominal operator inference diagnostics: {any}\n", .{module.diagnostics.items});
+    try std.testing.expect(!module.hasErrors());
+    try std.testing.expect(result.lowering_complete);
+    try result.ir.verify();
+}
+
+test "nominal operator solver generic contextual inferred closures and TypeOf under OOM" {
+    try testNominalOperatorInference(std.testing.allocator);
+    try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testNominalOperatorInference, .{});
+}
+
 const Solver = struct {
     allocator: std.mem.Allocator,
     caller: *Module,
@@ -1833,6 +2011,40 @@ const Solver = struct {
         return if (nominal.value == .nominal) nominal.value.nominal else null;
     }
 
+    fn operatorHook(tag: Ast.Node.Tag) ?Module.Operator {
+        return switch (tag) {
+            .less_than, .greater_than, .less_or_equal, .greater_or_equal => .less_than,
+            .add, .assign_add => .add,
+            .sub, .assign_sub => .sub,
+            .mul, .assign_mul => .mul,
+            .div, .assign_div => .div,
+            .mod, .assign_mod => .rem,
+            .bit_and => .bit_and,
+            .bit_or => .bit_or,
+            .bit_xor => .bit_xor,
+            .negation => .neg,
+            else => null,
+        };
+    }
+
+    fn nominalOperand(self: *Solver, operand: *Term) bool {
+        return switch (root(operand).value) {
+            .nominal => true,
+            .known => |ty| switch (self.ir.getType(ty).?) {
+                .record, .enumeration => true,
+                else => false,
+            },
+            else => false,
+        };
+    }
+
+    fn nominalOperatorContext(self: *Solver, tag: Ast.Node.Tag, expected: ?*Term) ?*Term {
+        const op = operatorHook(tag) orelse return null;
+        if (op == .less_than) return null;
+        const context = expected orelse return null;
+        return if (self.nominalOperand(context)) context else null;
+    }
+
     // Defaults fill only unresolved leaves after all exact constraints. A
     // candidate must never conflict with a contextual type that already won.
     fn applyDefaults(self: *Solver) Ir.BuildError!void {
@@ -1921,15 +2133,15 @@ const Solver = struct {
             for (self.query_printables.items) |printable| {
                 _ = try self.materialize(printable.operand, 0);
             }
-            for (self.query_operations.items) |operation| switch (operation.tag) {
-                .equal_equal, .bang_equal, .in => {
+            for (self.query_operations.items) |operation| {
+                const comparable = operation.tag == .equal_equal or operation.tag == .bang_equal or operation.tag == .in;
+                if (comparable or (operatorHook(operation.tag) != null and self.nominalOperand(operation.operand))) {
                     if (try self.materialize(operation.operand, 0) == null) {
                         if (!self.failed) try self.fail(.unresolved_value_type, operation.span, null);
                         return;
                     }
-                },
-                else => {},
-            };
+                }
+            }
             var validation = try BodyChecker.QueryValidation.init(self.ir);
             defer validation.deinit();
             for (self.query_unions.items) |constructor| if (constructor.enum_payload) {
@@ -1968,11 +2180,17 @@ const Solver = struct {
                     const ty = (try self.materialize(operation.operand, 0)).?;
                     if (!try validation.comparable(operation.module, operation.node, ty)) self.failed = true;
                 },
-                else => {},
+                else => if (operatorHook(operation.tag)) |op| {
+                    if (self.nominalOperand(operation.operand)) {
+                        const ty = (try self.materialize(operation.operand, 0)).?;
+                        if (!try validation.operator(operation.module, operation.node, ty, op)) self.failed = true;
+                    }
+                },
             };
         }
         for (self.query_operations.items) |operation| {
             if (operation.tag == .equal_equal or operation.tag == .bang_equal or operation.tag == .in) continue;
+            if (operatorHook(operation.tag) != null and self.nominalOperand(operation.operand)) continue;
             const operand = root(operation.operand);
             if (operand.value == .array and (operation.tag == .add or operation.tag == .assign_add)) continue;
             if (operand.value != .known) {
@@ -3251,7 +3469,8 @@ const Solver = struct {
             },
             .negation, .bit_not => {
                 const numbers = self.query_literals.items.len;
-                const operand = try self.expression(frame, data.rhs, depth + 1);
+                const context = self.nominalOperatorContext(ast.nodes.items(.tag)[node], expected);
+                const operand = try self.expressionExpected(frame, data.rhs, context, depth + 1);
                 var literal_node = data.rhs;
                 var buffer: [2]Ast.Node.Index = undefined;
                 while (ast.fullBlock(&buffer, literal_node)) |block| {
@@ -3263,11 +3482,11 @@ const Solver = struct {
                 return operand;
             },
             .add, .sub, .mul, .div, .mod, .bit_and, .bit_or, .bit_xor, .equal_equal, .bang_equal, .less_than, .greater_than, .less_or_equal, .greater_or_equal => {
-                const equality = ast.nodes.items(.tag)[node] == .equal_equal or ast.nodes.items(.tag)[node] == .bang_equal;
-                const reverse = equality and needsOperandContext(ast, data.lhs) and !needsOperandContext(ast, data.rhs);
-                const first = try self.expression(frame, if (reverse) data.rhs else data.lhs, depth + 1);
+                const reverse = needsOperandContext(ast, data.lhs) and !needsOperandContext(ast, data.rhs);
+                const context = self.nominalOperatorContext(ast.nodes.items(.tag)[node], expected);
+                const first = try self.expressionExpected(frame, if (reverse) data.rhs else data.lhs, context, depth + 1);
                 if (root(first).value == .never) return first;
-                const second = try self.expressionExpected(frame, if (reverse) data.lhs else data.rhs, if (equality) first else null, depth + 1);
+                const second = try self.expressionExpected(frame, if (reverse) data.lhs else data.rhs, first, depth + 1);
                 if (root(second).value == .never) return second;
                 try self.unify(first, second, span, 0);
                 const lhs = if (reverse) second else first;

@@ -47,6 +47,24 @@ pub const Operator = enum {
     bit_xor,
     shl,
     shr,
+
+    pub fn isSupported(self: Operator) bool {
+        return self.arity() != null;
+    }
+
+    /// Unsupported hooks have no callable signature yet; shifts are deferred.
+    pub fn arity(self: Operator) ?usize {
+        return switch (self) {
+            .equal, .less_than, .add, .sub, .mul, .div, .rem, .bit_and, .bit_or, .bit_xor => 2,
+            .neg => 1,
+            .shl, .shr, .@"try", .deref, .deref_mut, .index, .index_mut => null,
+        };
+    }
+
+    /// Supported comparison hooks return bool; all other supported hooks return SelfType.
+    pub fn returnsBool(self: Operator) bool {
+        return self == .equal or self == .less_than;
+    }
 };
 
 /// Only literal tags are accepted, never calls or computed enum values.
@@ -669,7 +687,7 @@ fn collectDeclaration(self: *Module, node: Ast.Node.Index, container: ?DeclId) (
                 } else {
                     operator = parsed;
                     if (self.source.ast.nodes.items(.tag)[data.rhs] == .field_access) operator_arg = data.rhs;
-                    if (parsed.? != .equal) try self.diagnostics.append(self.allocator, .{ .tag = .unsupported_operator, .span = self.tokenSpan(self.source.ast.lastToken(data.rhs)) });
+                    if (!parsed.?.isSupported()) try self.diagnostics.append(self.allocator, .{ .tag = .unsupported_operator, .span = self.tokenSpan(self.source.ast.lastToken(data.rhs)) });
                 }
                 operator_seen = true;
             } else if (std.mem.eql(u8, attr_name, "stringify")) {
@@ -790,7 +808,7 @@ test "operator metadata selects nominal and concrete candidates and defers quali
     try std.testing.expectEqualStrings("Other.equal", pending.source.ast.getNodeSource(candidate.operator_arg.?));
 }
 
-test "operator recognizes every tag but only supports equal and reserves each independently" {
+test "operator recognizes supported nominal tags and reserves each independently" {
     for (std.meta.tags(Operator)) |operator| {
         const source = try std.fmt.allocPrintSentinel(std.testing.allocator, "let S=struct{{\n@[operator(.{s})]\nlet method:(a:S,b:S)->bool=true\n}}", .{@tagName(operator)}, 0);
         defer std.testing.allocator.free(source);
@@ -798,15 +816,15 @@ test "operator recognizes every tag but only supports equal and reserves each in
         defer module.deinit();
         try std.testing.expectEqual(@as(usize, 0), module.source.ast.errors.len);
         try std.testing.expect(module.lookupOperator(module.lookup("S").?, operator) != null);
-        try std.testing.expectEqual(@as(usize, if (operator == .equal) 0 else 1), module.diagnostics.items.len);
-        if (operator != .equal) try std.testing.expectEqual(Diagnostic.Tag.unsupported_operator, module.diagnostics.items[0].tag);
+        try std.testing.expectEqual(@as(usize, if (operator.isSupported()) 0 else 1), module.diagnostics.items.len);
+        if (!operator.isSupported()) try std.testing.expectEqual(Diagnostic.Tag.unsupported_operator, module.diagnostics.items[0].tag);
         try TestAllocations.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{source});
     }
     const source = "let S=struct{\n@[operator(.equal)]\nlet first:(a:S,b:S)->bool=true\n@[operator(.add)]\nlet plus:(a:S,b:S)->S=a\n@[operator(.equal)]\nlet second:(a:S,b:S)->bool=false\n}";
     var module = try Module.init(std.testing.allocator, "duplicate.nov", source);
     defer module.deinit();
-    try std.testing.expectEqual(@as(usize, 2), module.diagnostics.items.len);
-    const diagnostic = module.diagnostics.items[1];
+    try std.testing.expectEqual(@as(usize, 1), module.diagnostics.items.len);
+    const diagnostic = module.diagnostics.items[0];
     try std.testing.expectEqual(Diagnostic.Tag.duplicate_operator, diagnostic.tag);
     try std.testing.expectEqualStrings("second", module.sourceSlice(diagnostic.span).?);
     try std.testing.expectEqualStrings("first", module.sourceSlice(diagnostic.related.?).?);

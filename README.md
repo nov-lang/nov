@@ -3362,11 +3362,22 @@ that hook's own body.
 
 ## Operator Overloading
 
-Only equality overloading is implemented. Attach `@[operator(.equal)]` to an
-ordinary immutable, non-generic method with a body on a nominal struct, union or
-enum. The method name is arbitrary; its exact signature must be `(T, T) -> bool`,
-where both parameters are the enclosing concrete type by value, not references.
-Methods on generic containers may use `@This()` for that concrete type. There is
+Operator overloading is in progress. Alongside the existing equality hook, the
+implemented subset supports these exact signatures (`T` is the enclosing concrete
+nominal struct, union or enum):
+
+| Tags | Signature | Operators |
+| --- | --- | --- |
+| `equal`, `less_than` | `(T, T) -> bool` | `==`, `<` |
+| `add`, `sub`, `mul`, `div`, `rem` | `(T, T) -> T` | `+`, `-`, `*`, `/`, `%` |
+| `bit_and`, `bit_or`, `bit_xor` | `(T, T) -> T` | `&`, `\|`, `^` |
+| `neg` | `(T) -> T` | unary `-` |
+
+Attach `@[operator(.tag)]` to an ordinary immutable, non-generic method with a
+body. The method name is arbitrary. Generic containers may use `@This()` for
+their concrete hooks. Parameters must be the exact owner type by value, not
+references; there is no general mixed-operand or mixed-result-type overloading.
+Invalid concrete hook signatures reject even when unused. There is
 at most one overload per operator per nominal container. The attribute takes
 exactly one literal tag, cannot be repeated, and cannot be combined with `test`,
 `noreturn`, `extern` or `export`.
@@ -3400,12 +3411,29 @@ silently fall back to structural equality. Hooks replace default comparison for
 the whole nominal value and remain callable as ordinary methods. Unmarked `eql`
 or `equal` methods have no automatic effect, and there is no global overload lookup.
 
+Only `less_than` is required for ordering: `a > b` calls `less_than(b, a)`,
+`a <= b` is `!less_than(b, a)`, and `a >= b` is `!less_than(a, b)`. There are no
+independent tags for these derived comparisons. This boolean-negation derivation
+is not floating-point partial-order semantics: hook authors are responsible for
+the order they define. There is no default structural ordering.
+
+`+=`, `-=`, `*=`, `/=` and `%=` derive from their respective binary hooks.
+Operands evaluate once, left to right. Compound assignment preserves the pre-RHS
+LHS value and target snapshots, with the same semantics as builtins; the final
+store may overwrite an RHS reassignment. Hooks are ordinary calls and may
+allocate, mutate or panic. Readonly `@TypeOf` validates hooks without running them
+or publishing specializations. Equality, derived `!=` and membership retain their
+existing behavior described above.
+
 `std.builtin.Operator` declares exactly these tags: `equal`, `less_than`, `add`,
 `sub`, `mul`, `div`, `rem`, `try`, `deref`, `deref_mut`, `index`, `index_mut`, `neg`,
-`bit_and`, `bit_or`, `bit_xor`, `shl`, `shr`. All except `equal` are reserved and
-unimplemented; using them as overloads diagnoses an unsupported operator overload.
-No ordering, arithmetic, indexing or compound-assignment overloads or automatic
-derivations are delivered. Printing customization remains separate via `@[stringify]`.
+`bit_and`, `bit_or`, `bit_xor`, `shl`, `shr`. `shl`, `shr`, `try`, `deref`,
+`deref_mut`, `index` and `index_mut` remain reserved and unsupported as overloads;
+no shifts are implemented. Printing customization remains separate via `@[stringify]`.
+
+See [`examples/operators.nov`](examples/operators.nov) for seven tests covering a
+scalar `Number`, generic containers, compound targets, evaluation/snapshot
+behavior, and enum/union hooks.
 
 ## Strings
 
